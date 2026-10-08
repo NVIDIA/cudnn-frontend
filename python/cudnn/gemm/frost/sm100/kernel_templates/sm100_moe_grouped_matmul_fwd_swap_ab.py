@@ -14,6 +14,7 @@ from cudnn.gemm.frost.kernel_templates.dynamic_scheduler_counter_initialization 
 )
 from cudnn.gemm.frost.tile_helpers import (
     moe_scatter_row,
+    moe_combine_add,
     tma_scatter4,
     moe_gather_row,
     tma_gather4,
@@ -393,7 +394,6 @@ def _kernel(
         shfl_idx_clamp = 0x1F
         shfl_up_clamp = 0
         lane = cute.arch.lane_idx()
-        gemm_s = cutlass.Int32(N)
         sched_stage = cutlass.Int32(0)
         sched_empty_phase = cutlass.Int32(1)
         bcast_stage = cutlass.Int32(0)
@@ -468,10 +468,7 @@ def _kernel(
                     if visit_idx < num_groups:
                         if my_group != 0:
                             my_begin = cutlass.Int32(first_token_arr[my_group])
-                        if my_group + 1 < num_groups:
-                            my_end = cutlass.Int32(first_token_arr[my_group + 1])
-                        else:
-                            my_end = gemm_s
+                        my_end = cutlass.Int32(first_token_arr[my_group + 1])
                         my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[1]) * clusters_along_m
                     prefix_tiles = my_tiles
                     for delta in (1, 2, 4, 8, 16):
@@ -1501,7 +1498,7 @@ def compile() -> Callable:
 
     fake_first_token_offset = make_fake_compact_tensor(
         offset_cutlass_dtype,
-        (sym_g,),
+        (cute.sym_int64(),),
         stride_order=(0,),
         assumed_align=offset_cutlass_dtype.width // 8,
     )

@@ -103,7 +103,7 @@ def block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale):
     return (b, h_q, rows, cols)
 
 
-def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO, max_total_seq_len_q=None, max_total_seq_len_kv=None, o_block_scale=0):
+def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO, max_total_seq_len_q=None, max_total_seq_len_kv=None, o_block_scale=0, softmax_precision=None):
     graph_fwd = cudnn.pygraph(io_data_type=cudnn_itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 
     use_padding_mask = None
@@ -190,6 +190,10 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
     # Only pass diagonal_alignment if it's not None (pybind11 doesn't accept None for enum types)
     if diag_align is not None:
         sdpa_kwargs['diagonal_alignment'] = diag_align
+    if softmax_precision is not None:
+        # The cc 10.7 f16x2 exponent arm (sdpa/softmax_knobs.py): a python-only op attribute that
+        # makes the node backend-unlowerable, so it is passed only when SET.
+        sdpa_kwargs['softmax_precision'] = softmax_precision
     if o_block_scale:
         # Block-scaled O: the sf_o output (per-(b,h) planes) rides sdpa_fp8 like
         # rng_dump; FP4 O carries E4M3 scales, E4M3 O carries UE8M0 scales.
@@ -773,6 +777,14 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     diag_align = cfg.diag_align if hasattr(cfg, 'diag_align') else None
     with_sink_token = cfg.with_sink_token if hasattr(cfg, 'with_sink_token') else False
     rescale_threshold = cfg.rescale_threshold if hasattr(cfg, 'rescale_threshold') and cfg.rescale_threshold is not None else 4.0
+    # Softmax levers (sdpa/softmax_knobs.py): the f16x2 exponent arm rides sdpa_fp8 as a python-only
+    # op attribute.  The pre-folded scale is declined on per-tensor FP8 by contract -- the kernel folds
+    # descale_q * descale_k into its softmax scale -- so the served-domain mirror never draws it here.
+    softmax_precision = getattr(cfg, 'softmax_precision', None)
+    assert not getattr(cfg, 'attn_scale_prefolded', False), "attn_scale_prefolded is not served on per-tensor FP8 (descale contract): the served-domain mirror must not draw it"
+    # Forward Stats: always with the backward (it consumes them); an inference forward omits them on
+    # an explicit cfg.fwd_stats=False (the stats-less kernel specialization).
+    generate_stats = bool(cfg.is_train or getattr(cfg, 'fwd_stats', None) is not False)
 
     attn_scale = 0.125
 
@@ -809,10 +821,10 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     # Build forward graph (always needed)
     try:
-        graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
+        graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, generate_stats=generate_stats, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
                                        max_total_seq_len_q=max_t_q if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
                                        max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
-                                       o_block_scale=o_block_scale)
+                                       o_block_scale=o_block_scale, softmax_precision=softmax_precision)
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -949,6 +961,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         int(GraphFwdUid.stats): stats_gpu,
         int(GraphFwdUid.o_amax): o_amax_gpu,
     }
+    if not generate_stats:
+        del variant_pack[int(GraphFwdUid.stats)]  # the stats-less forward declares no Stats output
 
     if not is_ragged:
         # Allocations/reference use BSHD; graph declarations use BHSD. Bind
@@ -976,7 +990,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.o_ragged_offset)] = o_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.stats_ragged_offset)] = stats_ragged_offset_gpu
+        if generate_stats:
+            variant_pack[int(GraphFwdUid.stats_ragged_offset)] = stats_ragged_offset_gpu
 
     if with_sink_token:
         variant_pack[int(GraphFwdUid.sink_token)] = sink_token_gpu
@@ -1092,6 +1107,14 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                     # Ragged packs stats differently, so keep softmax there.
                     stats=(None if is_ragged else stats_gpu),
                     return_intermediates=return_intermediates,
+                    # The dS scale pair this harness feeds its graph below (dP_scale_gpu from torch_otype, dP_descale_gpu
+                    # from torch_itype), named so the reference rounds and descales dS exactly where the graph does.  With
+                    # a half output_type the two disagree (scale 1.0, descale 1 / scale_e4m3): graph and reference then
+                    # both carry dQ / dK scaled by 1 / scale_e4m3 from an e4m3 dS rounded at UNIT scale.  Deriving both
+                    # scalars from torch_itype -- the dtype dS is rounded to, the reference's default -- is the pending
+                    # fix for the graph scalars and this mirror TOGETHER; the comparison must not move alone.
+                    dP_scale_dtype=torch_otype,
+                    dP_descale_dtype=torch_itype,
                 )
             dQ_ref, dK_ref, dV_ref, dSink_token_ref, dP_amax, dQ_amax, dK_amax, dV_amax = ref_bwd()
 

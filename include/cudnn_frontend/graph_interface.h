@@ -82,6 +82,13 @@ class Graph : public ICudnn, public INode {
     // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
     // recorded by populate_cuda_graph()/update_cuda_graph() or by stream capture of execute(), holds a
     // reference to this storage (a CUDA user object), so it may outlive this Graph.
+    //
+    // The storage is pageable. Current drivers write a 1-D pageable host-to-device copy of up to 64 KiB
+    // straight into the command stream at launch, so neither execute() nor a CUDA graph replay waits for
+    // prior work; larger pageable copies may stall on the driver's staging buffers. These arrays (one
+    // float per head, one int per batch entry) stay far below that. A much larger one should be uploaded
+    // to device memory once instead, or pinned; pinned memory must then be freed through the deferred
+    // release path, never from the user-object destructor, which may not call CUDA.
     using host_copy_sources_t                                    = std::unordered_map<uid_t, std::vector<float>>;
     std::shared_ptr<host_copy_sources_t const> host_copy_sources = std::make_shared<host_copy_sources_t const>();
     mutable cudnn_frontend::detail::CudaGraphRetainedResource host_copy_sources_retention;
@@ -1239,19 +1246,28 @@ class Graph : public ICudnn, public INode {
         const int maxIterCount = 100;
         const float threshold  = 0.95f;
 
-        auto plan_cmp = [](std::shared_ptr<ExecutionPlan> a, std::shared_ptr<ExecutionPlan> b) {
-            return a->getExecutionTime() < b->getExecutionTime();
+        auto plan_cmp = [this](int64_t a, int64_t b) {
+            return plans.execution_plans[a]->getExecutionTime() < plans.execution_plans[b]->getExecutionTime();
         };
-        std::multiset<std::shared_ptr<ExecutionPlan>, decltype(plan_cmp)> timed_plans(plan_cmp);
+        std::multiset<int64_t, decltype(plan_cmp)> timed_plan_indices(plan_cmp);
 
-        cudaEvent_t start, stop;
-        detail::cuda_event_create(&start);
-        detail::cuda_event_create(&stop);
-        detail::cuda_device_synchronize();
+        // Release events on both successful tuning and any CUDA/cuDNN error.
+        struct TimingEvents {
+            cudaEvent_t start = nullptr;
+            cudaEvent_t stop  = nullptr;
+            ~TimingEvents() {
+                if (start != nullptr) detail::cuda_event_destroy(start);
+                if (stop != nullptr) detail::cuda_event_destroy(stop);
+            }
+        } events;
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_create(&events.start));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_create(&events.stop));
+        _CUDNN_CHECK_CUDA_ERROR(detail::cuda_device_synchronize());
 
         cudaStream_t stream = nullptr;
-        detail::get_stream(handle, &stream);
+        _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
 
+        std::string failure_details;
         uint64_t successful_plan_count = 0;
         for (int64_t i = 0; i < static_cast<int64_t>(plans.execution_plans.size()); i++) {
             if (plans.execution_plans[i] == nullptr) continue;
@@ -1260,25 +1276,29 @@ class Graph : public ICudnn, public INode {
             auto warmup_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
             if (warmup_status.is_bad()) {
                 CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed warmup, skipping.");
+                failure_details += "\nPlan at index " + std::to_string(i) + ": " + warmup_status.get_message();
                 continue;
             }
-            successful_plan_count++;
-            detail::cuda_device_synchronize();
+            _CUDNN_CHECK_CUDA_ERROR(detail::cuda_device_synchronize());
 
+            bool measured = false;
+            std::string last_iteration_error;
             float min_time_ms = std::numeric_limits<float>::max();
             for (int iter = 0; iter < maxIterCount; iter++) {
-                detail::cuda_event_record(start, stream);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_record(events.start, stream));
                 auto iter_status = execute_plan_at_index(handle, tensor_uid_to_pointer_map, workspace, i);
-                detail::cuda_event_record(stop, stream);
-                detail::cuda_event_synchronize(stop);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_record(events.stop, stream));
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_synchronize(events.stop));
 
                 if (iter_status.is_bad()) {
                     CUDNN_FE_LOG_LABEL_ENDL("WARN: Plan " << i << " failed at iter " << iter << ", skipping time.");
+                    last_iteration_error = iter_status.get_message();
                     continue;
                 }
 
                 float time_ms = 0.0f;
-                detail::cuda_event_elapsed_time(&time_ms, start, stop);
+                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_event_elapsed_time(&time_ms, events.start, events.stop));
+                measured      = true;
                 float new_min = std::min(min_time_ms, time_ms);
                 if (time_ms / min_time_ms < threshold) {
                     min_time_ms = new_min;
@@ -1287,26 +1307,32 @@ class Graph : public ICudnn, public INode {
                 }
             }
 
+            if (!measured) {
+                failure_details +=
+                    "\nPlan at index " + std::to_string(i) + ": No successful timed execution. " + last_iteration_error;
+                continue;
+            }
+            successful_plan_count++;
             CUDNN_FE_LOG_LABEL_ENDL("Plan " << plans.execution_plans[i]->getTag() << " took " << std::setw(10)
                                             << min_time_ms);
             plans.execution_plans[i]->setExecutionTime(min_time_ms);
-            timed_plans.insert(plans.execution_plans[i]);
+            timed_plan_indices.insert(i);
         }
 
-        // Re-order plans by measured time, winner at index 0
-        plans.execution_plans.clear();
-        for (auto sorted_plan : timed_plans) {
-            plans.execution_plans.push_back(sorted_plan);
-        }
+        CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
+        // Publish a winner only after a successful measurement. A failed tune
+        // must leave the original plan list and selection available for retry.
+        RETURN_CUDNN_FRONTEND_ERROR_IF(timed_plan_indices.empty(),
+                                       error_code_t::GRAPH_EXECUTION_FAILED,
+                                       "No execution plans were successfully timed." + failure_details);
+
+        // Re-order plans and their metadata by measured time, winner at index 0.
+        plans.reorder_plans(std::vector<int64_t>(timed_plan_indices.begin(), timed_plan_indices.end()));
         plans.candidate = 0;
 
         // Re-prepare OSS slot indices to match the new plan ordering
         apply_oss_slot_indices_to_plans();
 
-        detail::cuda_event_destroy(start);
-        detail::cuda_event_destroy(stop);
-
-        CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
         return {error_code_t::OK, ""};
     }
 
@@ -1440,6 +1466,29 @@ class Graph : public ICudnn, public INode {
 
         CHECK_CUDNN_FRONTEND_ERROR(plans.is_plan_index_executable(plan_index));
 
+        // Every mapping/ordered/raw-pointer entry reaches here. Reject a missing
+        // required workspace before patching workspace-relative addresses or
+        // launching auxiliary kernels. A zero-workspace plan may still use null.
+        if (workspace == nullptr) {
+            int64_t required_workspace = 0;
+#if (CUDNN_VERSION >= 92300)
+            if (!override_uids.empty() && detail::get_backend_version() >= 92300) {
+                CHECK_CUDNN_FRONTEND_ERROR(get_workspace_size_plan_at_index(
+                    handle, plan_index, required_workspace, override_uids, override_shapes, override_strides));
+            } else
+#endif
+            {
+                // Older headers/backends expose only the declared workspace.
+                // Preserve their existing override availability while checking
+                // the scratch requirement that this plan can report.
+                CHECK_CUDNN_FRONTEND_ERROR(get_workspace_size_plan_at_index(plan_index, required_workspace));
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                required_workspace > 0,
+                error_code_t::INVALID_VARIANT_PACK,
+                "Plan requires a " + std::to_string(required_workspace) + "-byte workspace but received null.");
+        }
+
         // Validate n_user matches expected user slot count
         RETURN_CUDNN_FRONTEND_ERROR_IF(n_user != static_cast<int>(varpack_template.user_slots.size()),
                                        error_code_t::INVALID_VARIANT_PACK,
@@ -1485,7 +1534,7 @@ class Graph : public ICudnn, public INode {
         CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
 
         // 5. Dispatch
-        void *engine_workspace = static_cast<char *>(workspace) + fe_workspace_size;
+        void *engine_workspace = workspace == nullptr ? nullptr : static_cast<char *>(workspace) + fe_workspace_size;
 
         if (plan_index == graph::Execution_plan_list::OSS_RMS_NORM_SILU_ENGINE_CANDIDATE) {
             cudaStream_t stream = nullptr;

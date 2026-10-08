@@ -290,7 +290,21 @@ def _build_graph(
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     g.check_support()
     g.build_plans()
-    return g, g.get_workspace_size()
+    # Match the per-call operand list below. Cache only immutable UIDs; buffers
+    # and streams belong to each invocation, for both backend and FROST plans.
+    tensor_uids = [_UIDs.Q, _UIDs.K, _UIDs.V, _UIDs.O]
+    if return_lse:
+        tensor_uids.append(_UIDs.STATS)
+    if has_sinks:
+        tensor_uids.append(_UIDs.SINKS)
+    if is_thd:
+        tensor_uids.extend((_UIDs.SEQ_LEN_Q, _UIDs.SEQ_LEN_KV, _UIDs.RAGGED_Q, _UIDs.RAGGED_O))
+        if return_lse:
+            tensor_uids.append(_UIDs.RAGGED_STATS)
+        tensor_uids.extend((_UIDs.RAGGED_KV, _UIDs.RAGGED_V))
+    elif has_seq_lens:
+        tensor_uids.extend((_UIDs.SEQ_LEN_Q, _UIDs.SEQ_LEN_KV))
+    return g, g.get_workspace_size(), tuple(int(uid) for uid in tensor_uids)
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +432,7 @@ def _sdpa_fwd_impl(
     )
 
     handle = _get_handle(q.device)
-    g, ws = _cached_graph(
+    g, ws, tensor_uids = _cached_graph(
         key,
         lambda: _build_graph(
             handle,
@@ -459,28 +473,25 @@ def _sdpa_fwd_impl(
         stats = torch.empty(B, H_q, S_q, 1, dtype=torch.float32, device=q.device) if return_lse else torch.empty(0, dtype=torch.float32, device=q.device)
     workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
 
-    variant = {int(_UIDs.Q): q, int(_UIDs.K): k, int(_UIDs.V): v, int(_UIDs.O): o}
+    buffers = [q, k, v, o]
     if return_lse:
-        variant[int(_UIDs.STATS)] = stats
+        buffers.append(stats)
     if has_sinks or has_seq_lens:
         from cudnn.sdpa.forward_metadata import prepare_forward_metadata
 
         len_q_col, len_kv_col, sinks_col = prepare_forward_metadata(seq_len_q, seq_len_kv, sinks, B, H_q)
         if has_sinks:
-            variant[int(_UIDs.SINKS)] = sinks_col
+            buffers.append(sinks_col)
     if is_thd:
         # Each ragged offset is an int64 ELEMENT offset using its own tensor's
         # token stride. The shared producer widens prefixes before multiplying.
-        q_roles = (_UIDs.RAGGED_Q, _UIDs.RAGGED_O) + ((_UIDs.RAGGED_STATS,) if return_lse else ())
         q_strides = (q.stride(0), H_q * D_v) + ((H_q,) if return_lse else ())
-        roles = (_UIDs.SEQ_LEN_Q, _UIDs.SEQ_LEN_KV, *q_roles, _UIDs.RAGGED_KV, _UIDs.RAGGED_V)
         metadata = prepare_varlen_metadata(cu_seqlens_q, cu_seqlens_kv, q_strides, (k.stride(0), v.stride(0)))
-        variant.update((int(role), value) for role, value in zip(roles, metadata))
+        buffers.extend(metadata)
     elif has_seq_lens:
-        variant[int(_UIDs.SEQ_LEN_Q)] = len_q_col
-        variant[int(_UIDs.SEQ_LEN_KV)] = len_kv_col
+        buffers.extend((len_q_col, len_kv_col))
 
-    g.execute(variant, workspace, handle=handle)
+    g.execute(buffers, workspace, handle=handle, tensor_uids=tensor_uids)
     return o, stats
 
 
@@ -646,7 +657,24 @@ def _build_bwd_graph(
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     g.check_support()
     g.build_plans()
-    return g, g.get_workspace_size()
+    tensor_uids = [_UIDs.Q, _UIDs.K, _UIDs.V, _UIDs.O, _UIDs.DO, _UIDs.STATS, _UIDs.DQ, _UIDs.DK, _UIDs.DV]
+    if is_thd:
+        # prepare_varlen_metadata returns lengths, Q-prefix products, then
+        # KV-prefix products, in this order.
+        tensor_uids.extend(
+            (
+                _UIDs.SEQ_LEN_Q,
+                _UIDs.SEQ_LEN_KV,
+                _UIDs.RAGGED_Q,
+                _UIDs.RAGGED_O,
+                _UIDs.RAGGED_DQ,
+                _UIDs.RAGGED_KV,
+                _UIDs.RAGGED_V,
+                _UIDs.RAGGED_DK,
+                _UIDs.RAGGED_DV,
+            )
+        )
+    return g, g.get_workspace_size(), tuple(int(uid) for uid in tensor_uids)
 
 
 _lib.define(
@@ -747,7 +775,7 @@ def _sdpa_bwd_dense(
     )
 
     handle = _get_handle(q.device)
-    g, ws = _cached_graph(
+    g, ws, tensor_uids = _cached_graph(
         key,
         lambda: _build_bwd_graph(
             handle,
@@ -785,18 +813,8 @@ def _sdpa_bwd_dense(
     dv = torch.empty_strided((B, H_v, S_kv, D_v), dv_stride, dtype=q.dtype, device=q.device)
     workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
 
-    variant = {
-        int(_UIDs.Q): q,
-        int(_UIDs.K): k,
-        int(_UIDs.V): v,
-        int(_UIDs.O): o,
-        int(_UIDs.DO): grad_out,
-        int(_UIDs.STATS): lse,
-        int(_UIDs.DQ): dq,
-        int(_UIDs.DK): dk,
-        int(_UIDs.DV): dv,
-    }
-    g.execute(variant, workspace, handle=handle)
+    buffers = [q, k, v, o, grad_out, lse, dq, dk, dv]
+    g.execute(buffers, workspace, handle=handle, tensor_uids=tensor_uids)
     return dq, dk, dv
 
 
@@ -926,7 +944,7 @@ def _sdpa_bwd_impl(
     )
 
     handle = _get_handle(q.device)
-    g, ws = _cached_graph(
+    g, ws, tensor_uids = _cached_graph(
         key,
         lambda: _build_bwd_graph(
             handle,
@@ -962,37 +980,16 @@ def _sdpa_bwd_impl(
     dv = torch.empty(T_kv, H_v, D_v, dtype=q.dtype, device=q.device)
     workspace = torch.empty(max(ws, 1), dtype=torch.uint8, device=q.device)
 
-    variant = {
-        int(_UIDs.Q): q,
-        int(_UIDs.K): k,
-        int(_UIDs.V): v,
-        int(_UIDs.O): o,
-        int(_UIDs.DO): grad_out,
-        int(_UIDs.STATS): lse,
-        int(_UIDs.DQ): dq,
-        int(_UIDs.DK): dk,
-        int(_UIDs.DV): dv,
-    }
-    roles = (
-        _UIDs.SEQ_LEN_Q,
-        _UIDs.SEQ_LEN_KV,
-        _UIDs.RAGGED_Q,
-        _UIDs.RAGGED_O,
-        _UIDs.RAGGED_DQ,
-        _UIDs.RAGGED_KV,
-        _UIDs.RAGGED_V,
-        _UIDs.RAGGED_DK,
-        _UIDs.RAGGED_DV,
-    )
+    buffers = [q, k, v, o, grad_out, lse, dq, dk, dv]
     metadata = prepare_varlen_metadata(
         cu_seqlens_q,
         cu_seqlens_kv,
         (q.stride(0), o.stride(0), H_q * D_qk),
         (k.stride(0), v.stride(0), H_k * D_qk, H_v * D_v),
     )
-    variant.update((int(role), value) for role, value in zip(roles, metadata))
+    buffers.extend(metadata)
 
-    g.execute(variant, workspace, handle=handle)
+    g.execute(buffers, workspace, handle=handle, tensor_uids=tensor_uids)
     return dq, dk, dv
 
 

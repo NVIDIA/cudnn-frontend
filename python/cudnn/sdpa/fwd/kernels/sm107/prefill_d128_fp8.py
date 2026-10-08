@@ -169,8 +169,8 @@ from cudnn.frost.tile_dsl.scheduler import (
 from cudnn.frost.tile_dsl.pointwise import (
     opaque_f32_zero,
     fmax_f32,
-    # SM107 fuses the MASK_NONE S load + row-max into one LDTM.STAT
-    # (tmem_load_max_reduction_x64); masked iters keep the software reduction.
+    # SM107 fuses the MASK_NONE S load + row-max into one LDTM.STAT,
+    # (tmem_load_max_reduction_x64); masked iters keep the software reduction.,
     row_max_reduction,
     tmem_load_max_reduction_x64,
     vec_scale_pair,
@@ -179,13 +179,11 @@ from cudnn.frost.tile_dsl.pointwise import (
     e4m3_scale_rcp,
     amax_to_ue8m0_rp,
     row_reduction_pair,
-    fp32_to_fp16,
-    ex2_f16x2,
-    f16x2x2_to_fp8_word,
 )
+from cudnn.frost.tile_dsl import softmax_f16 as _softmax_f16
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -304,7 +302,7 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 # (issue #552) — no length ever reaches the host — and publishes the live unit
 # total + claim counter, so the adapter launches a MACHINE-sized grid rather
 # than the plan-time envelope (issue #618).
-from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_kv_descs_kernel as _build_thd_meta_o_kv_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 _dispatch_decode_initial = _sdpa_h.dispatch_decode_initial
@@ -916,6 +914,10 @@ def _tmaldg_warp_group(
         # GmemTileTma, so every load site below is branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        # Setup publishes immutable packed-total maps for this launch.
+        # Each loader warp acquires both maps before consuming any tile.
+        tma_tensormap_acquire(_k_rt_ptr)
+        tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     else:
@@ -1001,6 +1003,7 @@ def _tmaldg_warp_group(
                 bars.mb_k_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not CFG.THD_VARLEN,
             )
 
             bars.mb_q_empty[1].wait(q_empty_phase, spin=SPIN_RING_WAITS)
@@ -1033,6 +1036,7 @@ def _tmaldg_warp_group(
                 bars.mb_v_full[kv_state.idx].smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                acquire=not CFG.THD_VARLEN,
             )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1050,6 +1054,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_VARLEN,
                 )
 
                 bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
@@ -1063,6 +1068,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_VARLEN,
                 )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
@@ -1152,6 +1158,8 @@ def _tmastg_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
+    # Per-sequence O descriptors stay immutable during this launch.
+    last_o_batch = cutlass.Int32(-1)
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
@@ -1182,7 +1190,10 @@ def _tmastg_warp_group(
                     if batch_idx < n_batch:
                         o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
                         o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0))
-                        tma_store_tile(sO[qs], o_slice)
+                        if batch_idx != last_o_batch:
+                            tma_tensormap_acquire(o_slice.desc_ptr)
+                            last_o_batch = batch_idx
+                        tma_store_tile(sO[qs], o_slice, acquire=False)
                 else:
                     tma_store_tile(
                         sO[qs],
@@ -1243,55 +1254,15 @@ STRIDE_BYTE_OFFSET_PV = 8 * CFG.V_SWZ_BYTES
 NUM_KPHASES_PV = CFG.TILE_N // _MMA_K_FP8
 NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
-# softmax_precision knob (cudnn.data_type.HALF): the exponent runs as MUFU
-# EX2.F16x2 pairs (two exp2 per MUFU op) and P casts straight from f16x2 to
-# the FP8 pair format — no f32 round-trip. Exp args are bounded by
-# RESCALE_THRESHOLD + P_CAST_LOG2_SCALE (= 8, so P <= 2^8 = 256): f16 range
-# is exact there and the satfinite cast never clips (256 < 448 e4m3).
-# Per-tensor FP8 on this sibling only; requested via the softmax_precision
-# knob, default stays the f32 chain.
+# softmax_precision=cudnn.data_type.HALF (TemplateParams.softmax_f16): the exponent runs as MUFU EX2.F16x2
+# pairs and P casts straight from f16x2 to the FP8 pair format (the shared arms in
+# cudnn.frost.tile_dsl.softmax_f16).  Exp args are bounded by RESCALE_THRESHOLD + P_CAST_LOG2_SCALE (= 8, so
+# P <= 2^8 = 256): f16 range is exact there and the satfinite cast never clips (256 < 448 e4m3).  Default stays
+# the f32 chain.  The pre-folded scale is NOT served on per-tensor FP8 (descale_q * descale_k is folded into the
+# softmax scale in-kernel, see _kernel), so there is no SCALE_PREFOLDED arm and no fused shift+convert here.
 SOFTMAX_F16 = int(PARAMS.softmax_f16)
-_FP8_TAG_P = "e4m3" if CFG.DTYPE_QKV == 0 else "e5m2"
-
-
-@cute.jit
-def _f16_exp_chunk(chunk_S, n: cutlass.Constexpr[int] = 64):
-    """SOFTMAX_F16 tail for one ``n``-elem chunk of biased exp-args (f32).
-
-    f32 pairs pack to f16x2 (CVT), the exponent runs as MUFU EX2.F16x2, and P
-    casts straight from f16x2 to the FP8 pair format. Returns the ``n // 4``
-    packed FP8 words in :func:`fp32_to_fp8_pack`'s byte order. No RF row-sum
-    on any path here — Sigma rides the ones-MMA over the packed P, so the
-    quantized-P self-consistency of the f32 path carries over unchanged.
-    Args below f16 range saturate to -inf -> exp2 -> 0, identical to the f32
-    path's underflow. MUFU f16 max relative error is 2^-9.9 (PTX ISA
-    9.7.4.10) — an order below the e4m3 cast noise P absorbs on the next
-    instruction, so the exponent precision never surfaces in O.
-    """
-    elems = [chunk_S[i] for i in range(n)]
-    pairs = [fp32_to_fp16(elems[2 * i], elems[2 * i + 1]) for i in range(n // 2)]
-    p_pairs = [ex2_f16x2(w) for w in pairs]
-    words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
-    return cutlass.Vector.from_elements(tuple(words), cutlass.Int32)
-
-
-@cute.jit
-def _f16_exp_chunk_sum(chunk_S, n: cutlass.Constexpr[int] = 64):
-    """:func:`_f16_exp_chunk` plus the EXACT fp32 row-sum PAIR of P (has_lse only).
-
-    O keeps the f16x2 P this arm exists for; the Stats denominator is a separate fp32
-    ``exp2`` of the SAME biased arguments, so the published LSE is the exact
-    log-sum-exp on this arm too (summing the f16 P instead measured rms 3.6e-4 off it:
-    the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average out).
-    The extra MUFU per element makes HALF + Stats no faster than the f32 chain --
-    it is honored, not degraded; a stats-less HALF graph pays nothing.
-    """
-    elems = [chunk_S[i] for i in range(n)]
-    pairs = [fp32_to_fp16(elems[2 * i], elems[2 * i + 1]) for i in range(n // 2)]
-    p_pairs = [ex2_f16x2(w) for w in pairs]
-    words = [f16x2x2_to_fp8_word(p_pairs[2 * g], p_pairs[2 * g + 1], _FP8_TAG_P) for g in range(n // 4)]
-    p_sum = row_reduction_pair(cute.math.exp2(chunk_S, fastmath=True))
-    return cutlass.Vector.from_elements(tuple(words), cutlass.Int32), p_sum
+_FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
+_FUSED_SHIFT_CVT = False
 
 
 @cute.jit
@@ -1815,9 +1786,9 @@ def _softmax_kv_body(
     # TMEM columns via the ones-MMA (P is read straight from TMEM by the pipe).
     if cutlass.const_expr(SOFTMAX_F16):
         if cutlass.const_expr(has_lse):
-            p_words_0, p_sum_0 = _f16_exp_chunk_sum(chunk_S_0)
+            p_words_0, p_sum_0 = _softmax_f16.f16_exp_chunk_sum(chunk_S_0, _FP8_TAG_P)
         else:
-            p_words_0 = _f16_exp_chunk(chunk_S_0)
+            p_words_0 = _softmax_f16.f16_exp_chunk(chunk_S_0, _FP8_TAG_P)
         nvvm.tcgen05_st(
             "32x32b",
             nvvm.make_tmem_ptr(p_addr_base, cutlass.Int32),
@@ -1838,9 +1809,9 @@ def _softmax_kv_body(
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
         if cutlass.const_expr(SOFTMAX_F16):
             if cutlass.const_expr(has_lse):
-                p_words_1, p_sum_1 = _f16_exp_chunk_sum(chunk_S_1)
+                p_words_1, p_sum_1 = _softmax_f16.f16_exp_chunk_sum(chunk_S_1, _FP8_TAG_P)
             else:
-                p_words_1 = _f16_exp_chunk(chunk_S_1)
+                p_words_1 = _softmax_f16.f16_exp_chunk(chunk_S_1, _FP8_TAG_P)
             nvvm.tcgen05_st(
                 "32x32b",
                 nvvm.make_tmem_ptr(
@@ -2360,7 +2331,7 @@ def _correction_warp_group(
                 row_dead = row_dead | row_trim
 
             # Base-2 Stats; split-KV partials are configured to remain natural.
-            if cutlass.const_expr(CFG.STATS_LOG2):
+            if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
                 lse_val = lse_val * cutlass.Float32(1.4426950408889634)
 
             # cga2 OOB-row guard: cluster Q rows can exceed seqlen_q.
@@ -2381,15 +2352,13 @@ def _correction_warp_group(
                     if _row_valid:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                            lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                            lse_row[head_idx] = lse_val
+                            lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
                         else:
                             if cutlass.const_expr(len(lse_tensor.shape) == 4):
                                 # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                                 lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
                             else:
-                                lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                                lse_row[_cu_q_b + q_row_global] = lse_val
+                                lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
             else:
                 _row_valid = q_row_global < seqlen_q
                 if _row_valid:
@@ -2812,7 +2781,7 @@ def _host(
             cutlass.Int64(o_tensor.stride[1]),
             cutlass.Int32(CGA_TILE_M),
             n_thd_units,
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
         # KV split rides the BATCH axis: z = batch + split*B.  The decode

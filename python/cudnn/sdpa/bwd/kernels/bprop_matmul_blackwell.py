@@ -41,12 +41,81 @@ applied to BOTH.**  The generic template carries the same note.  The diff
 against it is deliberately narrow, so a `diff` against a fresh rendering of
 that config is the intended way to review a change:
   * ``_decode_bh`` and its four call sites;
-  * ``h``/``b`` in place of ``l`` in every TMA coordinate tuple;
+  * ``h``/``b`` in place of ``l`` in every TMA coordinate tuple -- B's head through
+    ``_b_head`` (``h // b_head_group``: the K head that ``b_head_group`` consecutive
+    Q heads share under GQA; the identity at the default 1) and its descriptor's head
+    extent ``n_head // b_head_group``;
   * 4-D descriptors and one extra stride per operand;
   * ``problem_size`` carrying ``(n_head, n_batch)`` and 4 strides per operand.
 
 Everything else in this file is generated output; do not hand-tune it in place
 without making the same change upstream.
+
+THE BLOCK-SCALE ARM (``MatmulTemplateParams.block_scale``, the MXFP8 d256 backward's dK / dQ)
+--------------------------------------------------------------------------------------------
+A = the block-scaled e4m3 dS workspace, B = the columnwise-quantized e4m3 Q / K payload; every 32-element K block of
+either carries an E8M0 scale byte, and the K64 ``tcgen05.mma.block_scale`` (kind MXF8F6F4, BLOCK32, idesc ``k_dim=1``)
+dequantizes both IN the MMA, so the fp32 accumulator is the TRUE-unit gradient and the epilogue is EPI_NONE.  Workspace
+contract (the (b, h) pair decoded exactly like the operands', ``_decode_bh``)::
+
+    dK: out[kv, d] = sum_q  dS[kv, q] Q[q, d]    A = ds_dk  [B, H, S_kv, S_q] K-major (q contiguous)   SFA = sf_ds_dk [B, H, S_kv/128, S_q/128, 512]
+    dQ: out[q, d]  = sum_kv dS[kv, q] K[kv, d]   A = ds_dq  [B, H, S_kv, S_q] read as [q, kv], M-major SFA = sf_ds_dq [B, H, S_q/128, S_kv/128, 512]
+    B  = q_T / k_T [B, S_K, H, D] (D contiguous: N-major); SFB = its columnwise F8_128x4 SF, D-PLANE-major: [D/128 planes][B*H*S_K/128 tiles][512 B]
+
+THD leg of the arm (``block_scale`` + ``thd_varlen``; the MXFP8 d256 backward over packed tokens): A and its atoms ride the
+kv-BLOCKED workspace exactly like the plain THD arm's A, so both SFA atom indices take the sequence's row offset with the
+operand coordinate (dK: M tile ``(coord_m + row_off[b]) / 128``; dQ: K tile ``(coord_k + row_off[b]) / 128``); B's columnwise
+SF is PACKED per sequence in whole 128-token tiles -- sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``,
+NOT at ``cu[b] / 128`` -- and both D planes of a (head, tile) sit together (plane stride one atom, tile stride the
+``planes x 512``-byte slab: ``config_sm100.stage3_thd_sfb_layout``, the view ``_sf_planes_view_thd`` builds; the dense
+D-plane-major view would fetch plane 1 from the wrong place by an S-dependent offset, rules/mma-tma-matrix.md s7).  The TMA
+warp reads the sequence's tile prefix once per tile from the appended ``sf_meta_t`` operand (``[cu_sf_q(B+1) | cu_sf_k(B+1)]``,
+``config_sm100.STAGE3_THD_SF_*``: ``cu_sf_k[b]`` when the reduction runs over kv tokens, ``cu_sf_q[b]`` over q tokens) and the
+SFB coordinate becomes ``(0, plane, cu_sf[b] + k_tile, h, 0)``.  Every line of it is ``const_expr``-folded on ``_THD_MM``
+inside the arm's guards: the dense block-scale rendering is byte-identical.  COVERAGE: the SF-prefix contract and the record
+validation host-side (``test_sdpa_bwd_stage3_block_scale_sm107.py``), the device numerics through the sm107 MXFP8 d256 backward
+row, which renders the leg under its block-scaled dS policy over packed sequences (``test_sdpa_bwd_thd_mxfp8_sm107.py``: packed
+cells under both dS policies against the bf16 chain, GQA, one-sided empty sequences, the capacity tails, rebinding and replay).
+
+The fp8 arm's EPI_QUANT amax fold under THD is gated PER ROW (``row < _thd_c_len``, with the tile's band live and its
+reduction non-empty): a (head, sequence) group walks every M tile of the ENVELOPE grid, so a shorter sequence's spare tiles
+compute foreign products the C descriptor clips -- and the per-tile store predicates do not exclude them (the epilogue
+comment at the fold spells the two cases out).  Dense renderings fold the gate out.
+
+One F8_128x4 atom (128 rows x 4 K-block scales = 512 B, byte ``(r % 32) * 16 + (r // 32) * 4 + c``) is exactly one 128-B
+K stage of one 128-row block, so per K stage the CTA needs its ONE SFA atom and BOTH SFB plane atoms (its accumulator
+spans the pair's full N = 256).
+
+SMEM buffer table (declaration order == ``_smem_layout_bytes``; the operand rings and the epilogue staging keep the
+fork's rows and swizzles):
+
+    buffer     dtype x elems            writer (how)                          reader (how)                                  per-lane stride  swizzle + WHY
+    smem_sfa   uint8 x 6 x 512 @ 2 KiB  TMA, one atom per stage (box 512 B)   UTCCP 32x128b WARPX4 via a tcgen05 SMEM desc  -- (no lane)     NONE: the atom's byte order IS the copy's order (leading 16 B, stride 128 B)
+    smem_sfb   uint8 x 6 x 1024 @ 5 KiB TMA, 2 plane atoms per stage (1 KiB)  2 UTCCPs per stage, one per atom (+512 B)     -- (no lane)     NONE, as above
+    smem_a/b   e4m3 x 6 x 16 KiB        TMA (s128b)                           MMA descriptor (SWIZZLE_128B)                 --               128 B: the descriptor's (job 1), unchanged
+    smem_d     bf16 x 2 x 128 x 64      epilogue lanes `store_swizzled`       TMA store                                     128 B            Swizzle(3, 4, 3) + s128b, unchanged
+
+The SF rings are declared FIRST so every tcgen05 descriptor root (the UTCCP sources included) stays below the 256 KiB
+version-0 line: roots at 2 / 5 / 11 / 107 KiB, total 235 KiB (the Rubin oversized carveout; ``_smem_layout_bytes`` models
+it and the import-time guard raises past the line).
+
+TMEM (one 576-column EXCLUSIVE allocation, alloc and dealloc both pass ``num_tmem_alloc_cols``): columns [0, 512) the two
+256-column accumulator stages as before; [512, 516) SFA -- one 4-column word, ``scale_a``; [516, 524) SFB -- the two plane
+atoms at +0 / +4, ONE ``scale_b`` span the 256-wide instruction reads whole; [524, 576) free.  Refreshed per K stage in the
+tcgen05 pipeline right before the two MMAs that read them (``a_sf_id = b_sf_id = 0`` for k-block 0, ``2`` for k-block 1).
+
+Barrier table delta (every other row of the fork is unchanged; lane arithmetic per row)::
+
+    ab_full[s]   producer TMA_LOAD   init 1   ONE elected lane of the LEADER's TMA warp arms expect_tx per stage: bytes =
+                 (A + B + SFA + SFB) x 2 -- both CTAs' operand AND scale loads land on the leader's mbarrier (cta_group::2
+                 tensor TMA); each CTA's TMA warp issues its own 4 loads (A, B, SFA, SFB) elect-gated: SUM(issuing lanes) = 1
+                 arrive + tx bytes == init 1 + expect_tx.  Consumer: the leader's MMA warp (unchanged wait).
+    ab_empty[s]  producer MMA_COMMIT init ab_empty_count  ONE elected lane's tcgen05.commit after the stage's MMAs -- the
+                 commit tracks the two UTCCPs' SMEM reads as well, so the SF stage is free when the operand stage is.
+    acc_*, clc_*, tmem_dealloc                            unchanged.
+
+Neither the THD leg nor the amax row gate adds a barrier or an SMEM buffer: the SF tile prefix is one GMEM word read by the
+TMA warp per tile (a register), the gate a per-thread select on a register value; the tables above are the whole story.
 """
 
 from __future__ import annotations
@@ -60,9 +129,11 @@ from cudnn.gemm.frost.tile_helpers import (
     tcgen05_alloc as _tcgen05_alloc,
     tcgen05_dealloc as _tcgen05_dealloc,
     tcgen05_mma as _tcgen05_mma,
+    tcgen05_mma_block_scale as _tcgen05_mma_block_scale,
 )
 import cutlass.experimental.cuda.tensor_map as _tma
 import cutlass._mlir_helpers.vector as _cvec
+from cutlass._mlir.dialects import arith
 import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as _cuda
@@ -70,9 +141,10 @@ from cutlass.cute.arch import clc as cute_clc
 
 from cutlass.base_dsl.typing import Pointer
 
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16, DTYPE_FP32
 from cudnn.frost.tile_dsl.pointwise import abs_max_tree, fmax_f32, opaque_f32_zero
-from cudnn.frost.tile_dsl.thd import TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
+from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_ROWS
+from cudnn.frost.tile_dsl.thd import THD_SETUP_THREADS, TENSOR_MAP_QWORDS, emit_clamped_desc, emit_seq_descs
 from cudnn.sdpa.bwd.config_sm100 import (
     CAUSAL_K_HI,
     CAUSAL_K_LO,
@@ -80,8 +152,13 @@ from cudnn.sdpa.bwd.config_sm100 import (
     EPI_DESCALE,
     EPI_NONE,
     EPI_QUANT,
+    STAGE3_BLOCK_SCALE_TMEM_COLS,
+    STAGE3_MX_BLOCK,
+    STAGE3_THD_SF_CU_K_OFF,
+    STAGE3_THD_SF_CU_Q_OFF,
     MatmulTemplateParams,
     matmul_out_dtype,
+    stage3_thd_sfb_layout,
     validate_matmul_params,
 )
 
@@ -98,10 +175,18 @@ _DSL_DTYPES = {DTYPE_BF16: cutlass.BFloat16, DTYPE_FP16: cutlass.Float16, DTYPE_
 _IO_DTYPE = _DSL_DTYPES[int(PARAMS.dtype_qkv)]
 _IS_FP8 = int(PARAMS.dtype_qkv) == DTYPE_E4M3
 _AB_BPE = _IO_DTYPE.width // 8
-# D dtype: the io dtype on the bf16 / fp16 rows; bf16 (DESCALE) or the gradient dtype (QUANT) on the fp8 arm.
-_OUT_DTYPE = _DSL_DTYPES[matmul_out_dtype(PARAMS)]
+# D dtype: the io dtype on the bf16 / fp16 rows; on the fp8 arm the gradient dtype (QUANT) or the fp32 per-Q-head true-unit
+# partial (DESCALE on the per-tensor arm, EPI_NONE on the block-scale arm whose MMA already dequantized: the GQA fold sums it in
+# fp32 and rounds ONCE -- `validate_matmul_params` admits FP32 for exactly those two).  FP32 is an OUTPUT-only code: it never
+# reaches `_IO_DTYPE`.
+_OUT_DTYPE = {**_DSL_DTYPES, DTYPE_FP32: cutlass.Float32}[matmul_out_dtype(PARAMS)]
 _CD_BPE = _OUT_DTYPE.width // 8
 epi_mode = int(getattr(PARAMS, "epi_mode", EPI_NONE))
+# The BLOCK-SCALE (MXFP8) arm of the fp8 rendering: e4m3 A / B whose 32-element K blocks each carry an E8M0 scale byte, dequantized
+# IN the MMA (`tcgen05.mma.block_scale`, kind MXF8F6F4, BLOCK32) so the accumulator is TRUE-unit and the epilogue is EPI_NONE.
+# Everything block-scale is a `const_expr` off this flag; at False the module renders byte-for-byte what it did before the arm
+# existed (the SF geometry below folds to zeros / unused constants, the SF rings, descriptors and copies are not traced).
+_BLOCK_SCALE = bool(getattr(PARAMS, "block_scale", False))
 # The K64 dense-FP8 MMA form (idesc k_dim=1, K=64 e4m3 per instruction) is RUBIN's: on Blackwell it is silently WRONG
 # (uniform ~0.4 |O-ref|, no crash -- rules/mma-tma-matrix.md S1).  This module has no arch at load time, so the guard is
 # the caller's: only the sm107 adapter renders the fp8 arm (`api_dsl_sm107._stage3_params`) and
@@ -114,8 +199,10 @@ class _TileRow(NamedTuple):
     this file's config family (``sm100_matmul`` at ``CONFIG_sm100_{cta_m}x256x128_128x256x32_cluster{m}x{n}_2ctamma``,
     2-CTA MMA 256x256x16, bf16 / fp16, TMA-store epilogue).  Every value is lifted VERBATIM from the upstream
     renderer's output for the named config (``gemm/frost/sm100/compiler._render_tile_constants``) -- do not
-    hand-derive; the fork pins ``epi_n = 64`` (its epilogue hardcodes the 128-byte staging row), 512 non-exclusive
-    TMEM columns and ``fallback_cluster_shape_mnk = None`` on every row, so those stay module constants below.
+    hand-derive; the fork pins ``epi_n = epi_row_elems`` -- ONE staging row of D per lane: 64 elements (128 B at a 2-byte D,
+    64 B at e4m3 out) or 32 at the fp32 DESCALE partial (128 B), derived from ``_CD_BPE`` below rather than read from a
+    table column --, 512 non-exclusive TMEM columns and ``fallback_cluster_shape_mnk = None`` on every row, so those stay
+    module constants below.
 
     A ``NamedTuple``, not a ``@dataclass``: this module runs under ``frost.template_loader`` BEFORE it is registered in
     ``sys.modules``, which a module-scope dataclass decorator needs (see ``MatmulTemplateParams``).
@@ -237,6 +324,18 @@ a_is_m_major = bool(PARAMS.a_is_m_major)
 # so A's blocked-workspace row offset lands on K in the first case and on M in
 # the second, and B's token offset is cu_q in the first and cu_k in the second.
 _THD_MM = bool(getattr(PARAMS, "thd_varlen", False))
+# ... with ONE exception the operand major cannot express: which TOKEN axis the blocked
+# workspace's ROWS are (`MatmulTemplateParams.thd_rows_kv`, appended 2026-10-01; read through
+# getattr like `epi_mode`, so a record built before the field existed renders the q-major
+# workspace it always did).  The row-offset placement above holds in both layouts (the blocked
+# row axis is K for an m-major A and M for a k-major A); the TOKEN side does not: on a kv-major
+# workspace (rows = packed kv tokens, the sm107 d256 chain) the k-major dK GEMM reduces over q
+# tokens and the m-major dQ GEMM over kv tokens -- the opposite pairing.  `_THD_K_IS_KV` =
+# "is this GEMM's K axis the kv token axis": every token-side selection below keys on it.  At
+# the default (q-major rows) it equals `not a_is_m_major`, the pre-field spelling, so the SM100
+# THD renderings are unchanged.
+_THD_ROWS_KV = bool(getattr(PARAMS, "thd_rows_kv", False))
+_THD_K_IS_KV = a_is_m_major == _THD_ROWS_KV
 # This GEMM's OWN descriptor scratch: one clipped output descriptor per
 # sequence, then the packed-total-clamped B operand.  Built in `_host`, which is
 # the only place that knows these descriptors' box, swizzle and dim order -- for
@@ -283,6 +382,16 @@ causal_shift = int(PARAMS.causal_shift)
 # `epi_mode` so a record built before the fields existed renders the one-sided band it always did).
 causal_window = int(getattr(PARAMS, "causal_window", 0))
 causal_diag = bool(getattr(PARAMS, "causal_diag", True))
+# B's head group (`MatmulTemplateParams.b_head_group`, appended 2026-09-30; read through getattr like `epi_mode`, so a record
+# built before the field existed renders B batched per A/C head as it always did).  The (b, h) batch hands A and C the decoded
+# head `h`; B takes `h // b_head_group` (`_b_head`) -- under GQA the K head that `b_head_group` consecutive Q heads share -- and
+# its descriptor's head extent is `n_head // b_head_group` (`_host`).  Every use is `const_expr`-folded at 1.
+b_head_group = int(getattr(PARAMS, "b_head_group", 1))
+# THD + a trimmed causal_mode = the per-sequence K-trim (`MatmulTemplateParams.thd_causal_bottom_right`, appended 2026-10-02;
+# read through getattr like the fields above).  `_THD_TRIM` gates every line of it: a THD rendering at CAUSAL_K_NONE (the
+# SM100 d512 chain's, the sm107 d256 chain's dense one) and every dense rendering trace exactly what they did.
+thd_causal_bottom_right = bool(getattr(PARAMS, "thd_causal_bottom_right", False))
+_THD_TRIM = _THD_MM and causal_mode != CAUSAL_K_NONE
 mma_a_major = 1 if a_is_m_major else 0
 mma_b_major = 1 if b_is_n_major else 0
 ab_stages = _ROW.ab_stages
@@ -313,7 +422,7 @@ mma_size_k = _K_STAGE_BYTES // (mma_inst_shape_mnk[2] * _AB_BPE)  # MMA k-blocks
 ab_tma_swizzle = _tma.TensorMapSwizzle.s128b
 
 # Dtype family: A=f16->MMAf16, B=f16->MMAf16, out=f16 (K_BYTES=128) on the bf16 / fp16 rows (`_IO_DTYPE` is BF16 or FP16
-# per PARAMS.dtype_qkv; the MMA kind is the same); A=e4m3->MMAe4m3, B=e4m3->MMAe4m3, out=bf16 | the gradient dtype
+# per PARAMS.dtype_qkv; the MMA kind is the same); A=e4m3->MMAe4m3, B=e4m3->MMAe4m3, out=fp32 (DESCALE partial) | the gradient dtype (QUANT)
 # (K_BYTES=128) on the fp8 arm.
 ab_dtype = _IO_DTYPE
 cd_dtype = _OUT_DTYPE
@@ -323,11 +432,16 @@ mma_c_dtype = cutlass.Float32
 acc_widen_to_fp32 = False
 ab_tma_dtype = _IO_DTYPE
 mma_kind = nvvm.Tcgen05MMAKind.F8F6F4 if _IS_FP8 else nvvm.Tcgen05MMAKind.F16
-epi_n = 64
-epi_row_elems = 64
-# The epilogue staging row is `epi_row_elems` x the D element: 128 B (bf16 / fp16) or 64 B (e4m3 out).  The lane store's
-# swizzle and the TMA-store descriptor's are ONE unit (rules/frost-tile-dsl.md S5): Swizzle(3, 4, 3) + s128b for the
-# 128-B row, Swizzle(2, 4, 3) + s64b for the 64-B one -- and the lane stride IS the row, so the same XOR spreads the banks.
+# The epilogue drains a tile in `epi_n`-column subtiles, one staging ROW of `epi_row_elems` D elements per lane: 64 elements
+# = 128 B (bf16 / fp16) or 64 B (e4m3 out), 32 elements = 128 B at the fp32 partial (the DESCALE partial or the block-scale arm's
+# EPI_NONE partial; a 64-element fp32 row would be 256 B -- past the 128-B swizzle atom and a 2-way bank conflict per lane).  Same
+# SMEM bytes per stage either way; the fp32
+# arm drains twice the subtiles (8 x 32 at d = 256) and stores twice the bytes, which IS the fp32 partial's cost.
+epi_row_elems = 32 if _CD_BPE == 4 else 64
+epi_n = epi_row_elems
+# The epilogue staging row is `epi_row_elems` x the D element: 128 B (bf16 / fp16 / fp32) or 64 B (e4m3 out).  The per-thread
+# store's swizzle and the TMA-store descriptor's are ONE unit (rules/frost-tile-dsl.md S5): Swizzle(3, 4, 3) + s128b for the
+# 128-B row, Swizzle(2, 4, 3) + s64b for the 64-B one -- and the per-thread stride IS the row, so the same XOR spreads the banks.
 _EPI_ROW_BYTES = epi_row_elems * _CD_BPE
 _EPI_SWIZZLE = {128: cutlass.Swizzle(3, 4, 3), 64: cutlass.Swizzle(2, 4, 3)}[_EPI_ROW_BYTES]
 _EPI_TMA_SWIZZLE = {128: _tma.TensorMapSwizzle.s128b, 64: _tma.TensorMapSwizzle.s64b}[_EPI_ROW_BYTES]
@@ -338,9 +452,46 @@ num_a_operands = 1
 num_b_operands = 1
 gemm_a_idx = (0,)
 gemm_b_idx = (0,)
-num_tmem_alloc_cols = 512
-tmem_alloc_exclusive = False
+num_tmem_alloc_cols = STAGE3_BLOCK_SCALE_TMEM_COLS if _BLOCK_SCALE else 512
+tmem_alloc_exclusive = _BLOCK_SCALE  # the 576-column allocation is the Rubin line's exclusive mode (rules/frost-kernels.md s3)
 acc_stages = _ROW.acc_stages  # mma_size_m x 256 acc cols/stage
+# --- the block-scale arm: scale-factor geometry, DERIVED from the tile row (never a literal) ---------------------------------
+# One E8M0 byte per STAGE3_MX_BLOCK (32) K elements of every A row / B column.  cuDNN's F8_128x4 atom (tile_dsl.sf_layout: 128
+# rows x 4 K-block scales = 512 B, byte (r % 32) * 16 + (r // 32) * 4 + c) covers exactly one 128-B K stage of one 128-row (M)
+# or 128-column (N) block, so per K stage:
+#   SFA  1 atom  -- the CTA's 128 A rows                                             512 B of SMEM, 4 TMEM columns
+#   SFB  num_blocks_n atoms -- the 256 B columns of the PAIR's instruction; each CTA
+#        holds all of them (its own accumulator spans the full N)                  1024 B of SMEM, 8 TMEM columns, ONE scale_b span
+# A K64 instruction consumes sf_scales_per_inst = 2 of the atom's 4 scales, selected by the idesc's a_sf_id / b_sf_id (0, 2), so
+# one UTCCP of each atom serves the stage's num_k_blocks MMAs (sf_insts_per_atom == mma_size_k, asserted below).  The SF TMEM
+# columns sit past the acc_stages accumulator stages: 512 + 4 + 8 = 524 of the 576 exclusive columns.  The UTCCP source
+# descriptor is the F8_128x4 atom itself (leading 16 B, stride 128 B, no swizzle -- the atom order IS the 32x128b copy's order).
+_SF_K_PER_STAGE = cta_tile_mnk[2] // STAGE3_MX_BLOCK  # 4 K-block scales per row per K stage
+sfa_smem_bytes = cta_tile_mnk[0] * _SF_K_PER_STAGE if _BLOCK_SCALE else 0  # 512: (128 rows / 128) atoms x 512 B
+num_blocks_n = mma_inst_shape_mnk[1] // SF_ATOM_ROWS  # 2: 128-column N blocks of the pair's instruction
+sfb_smem_bytes = mma_inst_shape_mnk[1] * _SF_K_PER_STAGE if _BLOCK_SCALE else 0  # 1024: num_blocks_n atoms
+sf_scales_per_inst = mma_inst_shape_mnk[2] // STAGE3_MX_BLOCK  # 2 at K64 (0 on the K16 f16 rows: no 32-block fits an instruction)
+sf_insts_per_atom = SF_ATOM_COLS // sf_scales_per_inst if sf_scales_per_inst else 0  # 2 MMAs share one UTCCP'd atom
+sfa_tmem_cols = mma_size_m * SF_ATOM_COLS  # 4
+sfb_tmem_cols = num_blocks_n * SF_ATOM_COLS  # 8
+_ACC_COLS_PER_STAGE = mma_size_m * (cgrp_tile_mnk[1] // cluster_shape_mnk[1])  # == the kernel's cols_per_acc_stage (256)
+sfa_col_base = acc_stages * _ACC_COLS_PER_STAGE  # 512: first column past the accumulator stages
+sfb_col_base = sfa_col_base + sfa_tmem_cols  # 516
+if _BLOCK_SCALE:
+    if not _IS_FP8 or mma_size_m != 1 or _SF_K_PER_STAGE != SF_ATOM_COLS or sf_insts_per_atom != mma_size_k:
+        raise NotImplementedError(
+            f"{__name__}: the block-scale arm is derived for the fp8 (256, 256) row -- one F8_128x4 atom per 128-B K stage per 128-row block "
+            f"(mma_size_m 1, {SF_ATOM_COLS} scales per stage, {sf_insts_per_atom} K64 MMAs per atom == mma_size_k {mma_size_k}); got "
+            f"fp8={_IS_FP8} mma_size_m={mma_size_m} scales/stage={_SF_K_PER_STAGE}"
+        )
+    if sfb_col_base + sfb_tmem_cols > STAGE3_BLOCK_SCALE_TMEM_COLS:
+        raise NotImplementedError(
+            f"{__name__}: {acc_stages} x {_ACC_COLS_PER_STAGE} accumulator + {sfa_tmem_cols} SFA + {sfb_tmem_cols} SFB TMEM columns exceed the "
+            f"{STAGE3_BLOCK_SCALE_TMEM_COLS}-column exclusive allocation"
+        )
+mma_block_scale_kind = nvvm.MMABlockScaleKind.MXF8F6F4
+scale_vec_size = nvvm.Tcgen05MMABlockScale.BLOCK32
+sf_scale_format = 1  # UE8M0 -- `Tcgen05MxInstrDesc.scale_format`, the block-scale GEMM compiler's encoding for fp8_e8m0 scales
 vec_bytes_epi = int(PARAMS.vec_bytes_epi)
 n_tma_outputs = 1
 moe_aligned_offsets = False
@@ -429,6 +580,11 @@ def _smem_layout_bytes() -> dict:
     place("clc_full_mbar", 8 * CLC_SCHED_STAGES, 8)
     place("clc_empty_mbar", 8 * CLC_SCHED_STAGES, 8)
     ab_bpe = ab_dtype.width // 8
+    if _BLOCK_SCALE:
+        # The scale-factor rings go FIRST: their roots feed the UTCCP's version-0 tcgen05 SMEM descriptor too, and the small rings
+        # ahead keep the big A / B roots far below the 256 KiB line (the block-scale GEMM template's declaration order).
+        place("smem_sfa_0", sfa_smem_bytes * ab_stages, 1024)
+        place("smem_sfb_0", sfb_smem_bytes * ab_stages, 1024)
     for i in range(num_a_operands):
         place(f"smem_a_{i}", cta_tile_mnk[0] * cta_tile_mnk[2] * ab_bpe * ab_stages, 1024)
     for j in range(num_b_operands):
@@ -443,6 +599,7 @@ _smem_layout = _smem_layout_bytes()
 if (
     max(_smem_layout[f"smem_a_{i}"] for i in range(num_a_operands)) >= _SMEM_DESC_V0_LIMIT
     or max(_smem_layout[f"smem_b_{j}"] for j in range(num_b_operands)) >= _SMEM_DESC_V0_LIMIT
+    or (_BLOCK_SCALE and max(_smem_layout["smem_sfa_0"], _smem_layout["smem_sfb_0"]) >= _SMEM_DESC_V0_LIMIT)
 ):
     raise NotImplementedError(
         f"{__name__}: an MMA-operand ring root sits at or past 256 KiB ({_smem_layout}); the version-0 tcgen05 SMEM descriptor "
@@ -504,6 +661,14 @@ def _decode_bh(l, n_head):
 
 
 @cute.jit
+def _b_head(tile_h):
+    """B's head coordinate for the decoded A/C head ``tile_h``: ``tile_h // b_head_group`` -- under GQA the K head that
+    ``b_head_group`` consecutive Q heads share (the dQ GEMM's B over a whole head chunk); the identity at 1, so every
+    rendering that predates the field keeps its coordinate tuple.  Per tile, in the TMA warp: one division per tile."""
+    return tile_h if cutlass.const_expr(b_head_group == 1) else tile_h // cutlass.Int32(b_head_group)
+
+
+@cute.jit
 def _thd_group(meta_t, tile_b, n_batch, num_k_tiles):
     """Per-sequence offsets and k-tile count for one (head, sequence) group.
 
@@ -530,14 +695,108 @@ def _thd_group(meta_t, tile_b, n_batch, num_k_tiles):
     row_off = cutlass.Int32(meta[row0 + tile_b])
     a_k_off = row_off if cutlass.const_expr(a_is_m_major) else cutlass.Int32(0)
     a_m_off = cutlass.Int32(0) if cutlass.const_expr(a_is_m_major) else row_off
-    b_k_off = q_tok if cutlass.const_expr(a_is_m_major) else k_tok
-    k_len = s_q if cutlass.const_expr(a_is_m_major) else s_kv
+    # The token side of the reduction: kv tokens (B at cu_k, s_kv) or q tokens (B at cu_q, s_q) -- see `_THD_K_IS_KV`.
+    b_k_off = k_tok if cutlass.const_expr(_THD_K_IS_KV) else q_tok
+    k_len = s_kv if cutlass.const_expr(_THD_K_IS_KV) else s_q
     nkt = (k_len + cutlass.Int32(cta_tile_mnk[2] - 1)) // cutlass.Int32(cta_tile_mnk[2])
     return a_k_off, a_m_off, b_k_off, nkt
 
 
 @cute.jit
-def _causal_k_range(coord_m_cgrp, num_k_tiles):
+def _thd_shift(meta_t, tile_b, n_batch):
+    """THD: the causal diagonal's offset for sequence ``tile_b`` -- ``s_kv[b] - s_q[b]`` under ``thd_causal_bottom_right``
+    (the kernels' per-sequence bottom-right anchor, ``compute_q_loop_bounds``), 0 for the top-left diagonal.  Reads the two
+    ``(B+1,)`` prefixes of the metadata buffer; the grid is B sequences deep, so ``tile_b < n_batch`` always holds here."""
+    if cutlass.const_expr(not thd_causal_bottom_right):
+        return cutlass.Int32(0)
+    meta = cutlass.make_array_view(meta_t)
+    cu_q0 = n_batch
+    cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
+    s_q = cutlass.Int32(meta[cu_q0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(meta[cu_q0 + tile_b])
+    s_kv = cutlass.Int32(meta[cu_k0 + tile_b + cutlass.Int32(1)]) - cutlass.Int32(meta[cu_k0 + tile_b])
+    return s_kv - s_q
+
+
+@cute.jit
+def _thd_sf_tile_base(sf_meta_t, tile_b, n_batch):
+    """THD leg of the block-scale arm: the first PACKED scale-factor tile of sequence ``tile_b`` on the B (token) side.
+
+    The packed MXFP8 SF convention pads every sequence to whole 128-token tiles, so the tile a sequence's k tile ``k_tile_idx``
+    reads is ``cu_sf[b] + k_tile_idx`` with ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)`` -- never ``cu[b] // 128``, which is short by
+    one tile for every ragged sequence before it (finite, plausible, wrong scales).  ``sf_meta_t`` is the int32
+    ``[cu_sf_q(B+1) | cu_sf_k(B+1)]`` buffer (``config_sm100.STAGE3_THD_SF_*``); which prefix follows the token side of this
+    GEMM's reduction exactly like ``_thd_group``'s ``b_k_off`` (``_THD_K_IS_KV``: kv tokens -> ``cu_sf_k``, q tokens -> ``cu_sf_q``).
+    Called by the TMA warp once per tile, inside the arm's ``const_expr`` guards."""
+    meta = cutlass.make_array_view(sf_meta_t)
+    cu0 = cutlass.Int32(STAGE3_THD_SF_CU_K_OFF(n_batch)) if cutlass.const_expr(_THD_K_IS_KV) else cutlass.Int32(STAGE3_THD_SF_CU_Q_OFF)
+    return cutlass.Int32(meta[cu0 + tile_b])
+
+
+@cute.jit
+def _sf_planes_view_thd(sf, planes: cutlass.Constexpr, tiles, heads: cutlass.Constexpr):
+    """The block-scale arm's SFB view of a PACKED (THD) columnwise F8_128x4 scale tensor -- ``(512 B atom, D planes, packed
+    tiles, H, 1)`` with the byte strides ``config_sm100.stage3_thd_sfb_layout`` spells (plane stride one atom, tile stride the
+    ``planes x 512``-byte slab, the forward's per-sequence-tile-padded convention); ``tiles`` is the bound buffer's packed tile
+    count (host int or traced ``Int32``).  The THD twin of the host's dense D-plane-major view: the kernel's THD SFB coordinate
+    ``(0, plane, cu_sf[b] + k_tile, h, 0)`` is written against THIS layout."""
+    shape, strides = stage3_thd_sfb_layout(planes, tiles, heads, SF_ATOM_BYTES)
+    return cute.make_tensor(sf.iterator, cute.make_layout(shape, stride=strides))
+
+
+@cute.jit
+def _thd_causal_k_range(coord_m_cgrp, nkt, shift):
+    """The THD arm of :func:`_causal_k_range`: the same two-sided band, in SEQUENCE-LOCAL rows.
+
+    Under THD every coordinate the trim works in is the sequence's own: ``m0`` is the cluster M tile inside the sequence
+    (the blocked workspace's ``row_off[b]`` and the packed ``cu_*[b]`` are added to the TMA coordinates AFTER the trim),
+    ``nkt`` is ``ceil(len_b / tk)`` over the sequence's REAL reduction length (``_thd_group``) and ``shift`` is the
+    sequence's diagonal offset (``_thd_shift``: ``s_kv[b] - s_q[b]`` bottom-right, 0 top-left).  The bounds are the dense
+    arm's -- the causal edge rounded outward to ``causal_gran`` (the kernels' 256-row q pair, ``_q_loop_bounds``), the
+    window edge to the k tile -- so every tile read was written by the sequence's own kv blocks (the host tile walk
+    ``test_stage3_thd_band_arithmetic`` and the poisoned-workspace THD tests are the proof).
+
+    Two things differ from the dense arm.  (1) A sequence's lengths are anything: ``shift`` may be NEGATIVE (bottom-right
+    with ``s_q[b] > s_kv[b]``), ``nkt`` may be 0 (an empty reduction side) and, under a top-left window, a q pair may sit
+    past ``s_kv[b] + W`` (no kv block writes it -- the one geometry the dense adapter still zero-fills for).  Every
+    dividend is clamped at 0 before its ``//`` and every bound at ``nkt``.  (2) The range MAY BE EMPTY, and an empty range
+    means "this tile's rows have no kept cell" -- a kv block no query attends, a q pair with no key in its band, an empty
+    reduction -- whose gradient is exactly zero.  The mainloop then runs zero iterations and the epilogue stores zeros
+    through a SELECT keyed on the same range (``_thd_store_live``), never the dense arm's never-empty clamp, which would
+    read a tile the kernel did not write.
+    """
+    blk = cutlass.Int32(causal_gran)
+    tk = cutlass.Int32(cta_tile_mnk[2])
+    m0 = cutlass.Int32(coord_m_cgrp)
+    zero = cutlass.Int32(0)
+    if cutlass.const_expr(causal_mode == CAUSAL_K_LO):
+        # dV / dK: M = kv (one 256-row block of the sequence), K = q tokens of the sequence.
+        k_lo = zero
+        if cutlass.const_expr(causal_diag):
+            lo = cute.math.max(m0 - shift, zero)
+            k_lo = cute.math.min(((lo // blk) * blk) // tk, nkt)
+        k_hi = nkt
+        if cutlass.const_expr(causal_window > 0):
+            hi = cute.math.max(m0 + cutlass.Int32(cgrp_tile_mnk[0]) - shift + cutlass.Int32(causal_window), zero)
+            k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
+        k_hi = cute.math.max(k_hi, k_lo)
+        return k_lo, k_hi
+    # dQ: M = q (a 256-row pair of the sequence), K = kv tokens of the sequence.
+    k_hi = nkt
+    if cutlass.const_expr(causal_diag):
+        hi_raw = m0 + cutlass.Int32(cgrp_tile_mnk[0] - 1) + shift
+        hi = ((cute.math.max(hi_raw, zero) // blk) + cutlass.Int32(1)) * blk
+        k_hi = cute.math.min((hi + tk - cutlass.Int32(1)) // tk, nkt)
+        # The pair's LAST row still has no key (q + shift < 0: bottom-right with s_q > s_kv): no band at all.
+        k_hi = cutlass.Int32(arith.select((hi_raw < zero).ir_value(), zero.ir_value(), k_hi.ir_value()))
+    k_lo = zero
+    if cutlass.const_expr(causal_window > 0):
+        lo = cute.math.max(m0 + shift - cutlass.Int32(causal_window), zero)
+        k_lo = cute.math.min(lo // tk, k_hi)
+    return k_lo, k_hi
+
+
+@cute.jit
+def _causal_k_range(coord_m_cgrp, num_k_tiles, thd_shift=None):
     """``[k_begin, k_end)`` -- the K tiles this cluster M tile reads under the mask band stage 2 wrote.
 
     THE INVARIANT (both kernels, both directions): the GEMM reads exactly the tiles
@@ -605,17 +864,22 @@ def _causal_k_range(coord_m_cgrp, num_k_tiles):
     ``S_q > roundup(S_kv + W, gran)`` -- is the one case the sm107 adapter still
     zero-fills for (``_stage3_needs_zero_fill``).
 
-    Never reached under THD: the adapter renders the packed stage 3 with
-    ``causal_mode=CAUSAL_K_NONE`` even for a causal graph, because every bound
-    here is an ABSOLUTE workspace row and the blocked layout renumbers rows per
-    sequence.  ``validate_matmul_params`` enforces that.  See
-    ``SdpaBwdDslSm100.compile``.
+    Under THD (``_THD_TRIM``) the arm is :func:`_thd_causal_k_range`: the same
+    band in SEQUENCE-LOCAL rows with the sequence's own ``nkt`` and diagonal
+    offset ``thd_shift`` (``_thd_shift``), and an EMPTY range where the tile
+    has no kept cell (the epilogue stores zeros for it).  The SM100 d512 chain
+    renders the same arm for its packed causal graphs (``api_dsl.THD_STAGE3_TRIM``,
+    diagonal edge only) and KEEPS its zero-fill: its 512-row M tile straddles
+    two 256-row stage-2 blocks, so there the trim is the optimization and the
+    fill the correctness (``SdpaBwdDslSm100.compile``).
     """
     # num_k_tiles is Int64 (it derives from the Int64 `k`); normalise so the
     # bounds and the min() / max() below share one numeric type.
     nkt = cutlass.Int32(num_k_tiles)
     if cutlass.const_expr(causal_mode == CAUSAL_K_NONE):
         return cutlass.Int32(0), nkt
+    if cutlass.const_expr(_THD_TRIM):
+        return _thd_causal_k_range(coord_m_cgrp, nkt, thd_shift)
     blk = cutlass.Int32(causal_gran)
     tk = cutlass.Int32(cta_tile_mnk[2])
     m0 = cutlass.Int32(coord_m_cgrp)
@@ -683,6 +947,15 @@ def _bprop_matmul_bh_sm100_kernel(
     epi_descale_1: Optional[cute.Tensor],
     epi_scale_out: Optional[cute.Tensor],
     epi_amax: Optional[cute.Tensor],
+    # The block-scale arm's THD leg: the int32 per-sequence SF TILE prefixes `[cu_sf_q(B+1) | cu_sf_k(B+1)]` the TMA warp's SFB
+    # coordinate takes its tile base from (`_thd_sf_tile_base`); None -- specialized away -- on every dense rendering and on the
+    # plain (non-block-scale) THD arm.  Sits AHEAD of the two tensor maps so those stay the kernel's last two parameters (the
+    # kernel's own order is `_host`'s business; the public, append-only surface is `_host`'s signature).
+    sf_meta_t: Optional[cute.Tensor],
+    # The block-scale arm's scale-factor tensor maps (None-specialized away when PARAMS.block_scale is False): SFA over the A
+    # operand's F8_128x4 atoms, SFB over the D-plane-major columnwise Q / K SF -- both 5-D, built by `_host`.
+    tma_sfa_desc_0: cutlass.GridConstant[_tma.TensorMap],
+    tma_sfb_desc_0: cutlass.GridConstant[_tma.TensorMap],
 ) -> None:
     tma_a_descs = [tma_a_desc_0]
     tma_b_descs = [tma_b_desc_0]
@@ -772,6 +1045,9 @@ def _bprop_matmul_bh_sm100_kernel(
 
             for _ci in cutlass.range_constexpr(n_tma_outputs):
                 nvvm.prefetch_tensormap(tma_c_descs[_ci].get_ptr())
+        if cutlass.const_expr(_BLOCK_SCALE):
+            nvvm.prefetch_tensormap(tma_sfa_desc_0.get_ptr())
+            nvvm.prefetch_tensormap(tma_sfb_desc_0.get_ptr())
 
     init_raw_m = bidx >> _preferred_cluster_m_shift
     init_raw_n = bidy >> _preferred_cluster_n_shift
@@ -846,6 +1122,16 @@ def _bprop_matmul_bh_sm100_kernel(
 
     sA_elems = cta_tile_mnk[0] * cta_tile_mnk[2]
     sB_elems = cta_tile_mnk[1] * cta_tile_mnk[2]
+    if cutlass.const_expr(_BLOCK_SCALE):
+        # SMEM buffer table of the arm (declaration order == `_smem_layout_bytes`; the operand rings and the epilogue staging
+        # keep the fork's rows):
+        #   smem_sfa  uint8 x ab_stages x 512   TMA writes one F8_128x4 atom per stage; the UTCCP (32x128b, WARPX4) reads it through
+        #             a tcgen05 SMEM descriptor (leading 16 B, stride 128 B, NO swizzle: the atom's byte order IS the copy's order)
+        #   smem_sfb  uint8 x ab_stages x 1024  TMA writes num_blocks_n atoms per stage (both D planes of the columnwise SF);
+        #             two UTCCPs per stage read them, one per atom
+        # No lane addresses either buffer, so there is no bank job to do; the swizzle is the descriptor's (none).
+        smem_sfa = cutlass.Array(cutlass.Uint8, sfa_smem_bytes * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
+        smem_sfb = cutlass.Array(cutlass.Uint8, sfb_smem_bytes * ab_stages, space=cutlass.AddressSpace.smem, alignment=1024)
     smem_a_list = [
         cutlass.Array(
             ab_dtype,
@@ -925,6 +1211,12 @@ def _bprop_matmul_bh_sm100_kernel(
         num_tma_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes
     else:
         num_tma_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * 2
+    if cutlass.const_expr(_BLOCK_SCALE):
+        # Barrier table delta of the arm: the stage's SF atoms ride the SAME ab_full[stage] barrier as the operands -- a
+        # cp.async.bulk.tensor at cta_group::2 lands EVERY byte of the pair on the leader's mbarrier, so the leader's one
+        # expect_tx grows by both CTAs' SFA + SFB bytes (the forward's and the MXFP8 backward body's SF routing).  Arrive count
+        # and phase are unchanged: 1 elected expect_tx per stage, consumed by the leader's MMA warp.
+        num_tma_copy_bytes = num_tma_copy_bytes + (sfa_smem_bytes + sfb_smem_bytes) * cta_group
 
     # One descriptor for every MMA instruction of the tile — the CTA tile spans
     # mma_size_m of them, all the same shape.
@@ -1071,7 +1363,8 @@ def _bprop_matmul_bh_sm100_kernel(
                 tile_h_b = cutlass.Int32(0)
                 tile_b_b = cutlass.Int32(0)
             else:
-                tile_h_b = tile_h
+                # B's head follows its head group (`_b_head`: `tile_h // b_head_group`, `tile_h` itself at the default 1).
+                tile_h_b = _b_head(tile_h)
                 tile_b_b = tile_b
 
             _a_k_off, _a_m_off, _b_k_off, _nkt = _thd_group(meta_t, tile_b, n_batch, num_k_tiles)
@@ -1080,7 +1373,15 @@ def _bprop_matmul_bh_sm100_kernel(
                 # reached by the coordinate offsets above, not by this axis.
                 tile_b_a = cutlass.Int32(0)
                 tile_b_b = cutlass.Int32(0)
-            k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt)
+            if cutlass.const_expr(_THD_TRIM):
+                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt, _thd_shift(meta_t, tile_b, n_batch))
+            else:
+                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt)
+            if cutlass.const_expr(_BLOCK_SCALE):
+                # THD leg: B's scale factors are packed per SEQUENCE in whole 128-token tiles, so the sequence's first SF tile is
+                # the prefix `cu_sf[b]` (not `cu[b] // 128`), read once per tile here and added to the k tile at the SFB load.
+                if cutlass.const_expr(_THD_MM):
+                    _sfb_tile_base = _thd_sf_tile_base(sf_meta_t, tile_b, n_batch)
             for k_tile_idx in range(k_begin, k_end):
                 stage = ab_iter % ab_stages
                 if stage == 0 and ab_iter != 0:
@@ -1286,6 +1587,45 @@ def _bprop_matmul_bh_sm100_kernel(
                                     group=_CTA_GROUP,
                                 )
 
+                if cutlass.const_expr(_BLOCK_SCALE):
+                    # This stage's scale-factor atoms, onto the same ab_full[stage] barrier as the operands (tx counted above).
+                    # SFA: the atom of (this CTA's 128-row M block, this K stage) -- coordinates (byte-in-atom, K tile, M tile, h, b)
+                    # over the 5-D atom tensor; the atom order along K and M is the F8_128x4 grid of the A operand's scale matrix.
+                    # SFB: the num_blocks_n D-plane atoms of this K stage -- coordinates (byte-in-atom, first D plane, K tile, h, b),
+                    # the box spanning the planes (the columnwise SF's plane stride grows with S; the descriptor carries it).  The
+                    # first plane is the pair's N base in 128-column planes -- the same base the B operand load advances with
+                    # (tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n, without the pair-member half), so a grid with more
+                    # than one N tile dequantizes each tile with its own planes; the shipped records have one N tile (n == 256).
+                    # THD: A's atoms ride the BLOCKED workspace, so both SFA atom indices take the sequence's row offset exactly as
+                    # the operand coordinates do (dK: M tile `(coord_m + row_off[b]) / 128`; dQ: K tile `(coord_k + row_off[b]) / 128`
+                    # -- `coord_k_a` / `coord_m_a` carry it), and the SFB tile is the sequence's PACKED tile prefix plus its own k
+                    # tile (`_sfb_tile_base`, read per tile above).  Dense keeps the loop's own indices: the ternaries fold and the
+                    # rendering is byte-identical.
+                    _sfa_k_tile = coord_k_a // SF_ATOM_ROWS if cutlass.const_expr(_THD_MM) else k_tile_idx
+                    _sfa_m_tile = coord_m_a // SF_ATOM_ROWS if cutlass.const_expr(_THD_MM) else coord_m_per_cta // SF_ATOM_ROWS
+                    _sfb_k_tile = _sfb_tile_base + k_tile_idx if cutlass.const_expr(_THD_MM) else k_tile_idx
+                    if elect_one:
+                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                            smem_sfa.subview(sfa_smem_bytes * stage),
+                            tma_sfa_desc_0.get_ptr(),
+                            (cutlass.Int32(0), _sfa_k_tile, _sfa_m_tile, tile_h_a, tile_b_a),
+                            ab_full_mbar_ptr.subview(stage),
+                            [],
+                            multicast_mask=tma_mcast_mask_a,
+                            group=_CTA_GROUP,
+                        )
+                    if elect_one:
+                        sfb_plane_base = (tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n) // SF_ATOM_ROWS
+                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                            smem_sfb.subview(sfb_smem_bytes * stage),
+                            tma_sfb_desc_0.get_ptr(),
+                            (cutlass.Int32(0), sfb_plane_base, _sfb_k_tile, tile_h_b, tile_b_b),
+                            ab_full_mbar_ptr.subview(stage),
+                            [],
+                            multicast_mask=tma_mcast_mask_b,
+                            group=_CTA_GROUP,
+                        )
+
                 ab_iter += 1
 
             consumer_stage = tile_iter % CLC_SCHED_STAGES
@@ -1405,6 +1745,44 @@ def _bprop_matmul_bh_sm100_kernel(
                 )
                 for j in range(num_b_operands)
             ]
+            if cutlass.const_expr(_BLOCK_SCALE):
+                # UTCCP source descriptors over the SF rings (the F8_128x4 atom: leading 16 B, stride 128 B, no swizzle), one
+                # Mx instruction descriptor per k-block (sf ids 0 / 2 pick the k-block's two scales out of the atom's four), and
+                # the SF TMEM addresses: SFA one 4-column word, SFB one 8-column span that the 256-wide instruction reads whole
+                # (atom bn of the stage lands at +bn * 4 columns).
+                desc_sfa_root = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_sfa,
+                    leading_byte_offset=16,
+                    stride_byte_offset=128,
+                    layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
+                )
+                desc_sfb_root = cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                    start_address=smem_sfb,
+                    leading_byte_offset=16,
+                    stride_byte_offset=128,
+                    layout=cutlass.experimental.primitives.Tcgen05SmemSwizzle.NONE,
+                )
+                idesc_by_k = [
+                    cutlass.experimental.primitives.Tcgen05MxInstrDesc.build(
+                        a_dtype=mma_a_dtype,
+                        b_dtype=mma_b_dtype,
+                        scale_format=sf_scale_format,
+                        n_dim=mma_inst_shape_mnk[1],
+                        m_dim=mma_inst_shape_mnk[0],
+                        a_major=mma_a_major,
+                        b_major=mma_b_major,
+                        a_sf_id=_kb * sf_scales_per_inst,
+                        b_sf_id=_kb * sf_scales_per_inst,
+                        k_dim=mma_k_dim,
+                    )
+                    for _kb in range(num_k_blocks)
+                ]
+                sfa_tmem_base = (base_row_id << 16) | (base_col_id_root + sfa_col_base)
+                sfb_tmem_base = (base_row_id << 16) | (base_col_id_root + sfb_col_base)
+                sfa_ptr = nvvm.make_tmem_ptr(sfa_tmem_base, cutlass.Float32)
+                sfb_ptr = nvvm.make_tmem_ptr(sfb_tmem_base, cutlass.Float32)
+                sfb_block_ptrs = [nvvm.make_tmem_ptr(sfb_tmem_base + _bn * SF_ATOM_COLS, cutlass.Float32) for _bn in range(num_blocks_n)]
+                _s2t_shape, _s2t_multicast = nvvm.S2TCopyMode.S2T_32x128b_WARPX4
             while is_valid != 0:
                 acc_stage = tile_iter % acc_stages
                 if acc_stage == 0 and tile_iter != 0:
@@ -1439,7 +1817,10 @@ def _bprop_matmul_bh_sm100_kernel(
                 # still counting the kernel-wide tiles would wait for k-blocks
                 # the producer never issues.
                 _, _, _, _nkt_mma = _thd_group(meta_t, tile_b_mma, n_batch, num_k_tiles)
-                k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma)
+                if cutlass.const_expr(_THD_TRIM):
+                    k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma, _thd_shift(meta_t, tile_b_mma, n_batch))
+                else:
+                    k_begin, k_end = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_mma)
                 scale_d = cutlass.Boolean(False)
                 for k_tile_idx in range(k_begin, k_end):
                     stage = ab_iter % ab_stages
@@ -1453,30 +1834,69 @@ def _bprop_matmul_bh_sm100_kernel(
                     ):
                         pass
 
-                    for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                        for g in cutlass.range_constexpr(num_gemms):
-                            desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
-                            desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
-                            for mi in cutlass.range_constexpr(mma_size_m):
-                                # The M sub-block offset is a whole SMEM swizzle atom
-                                # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
-                                # swizzle phase is preserved. B is shared by every M block.
-                                desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
-                                if elect_one:
-                                    _tcgen05_mma(
-                                        mma_kind,
-                                        _CTA_GROUP,
-                                        tmem_addr_mmas[g][mi],
-                                        desc_a,
-                                        desc_b,
-                                        idesc,
-                                        scale_d,
-                                        collector_op=_a_collector_op(g),
-                                        b_collector_op=_b_collector_op(mi),
-                                    )
-                        # Every accumulator sees scale_d=False on exactly the first
-                        # k_block of the tile, so the flip stays outside mi.
-                        scale_d = cutlass.Boolean(True)
+                    if cutlass.const_expr(_BLOCK_SCALE):
+                        # UTCCP this stage's SF atoms into their TMEM columns right before the MMAs that read them (same issuing
+                        # thread, same tcgen05 pipeline: the copies are ordered ahead of the MMAs, and the commit below tracks the
+                        # copies' SMEM reads along with the MMAs', so ab_empty frees the SF stage too); then one block-scale MMA per
+                        # k-block, each reading its 2 of the atom's 4 scales through the idesc's sf ids.  Elect-gated like the dense
+                        # MMA: a tcgen05.cp / tcgen05.mma issues once per executing lane.
+                        desc_sfa_stage = desc_sfa_root.advance_start_address(sfa_smem_bytes * stage)
+                        desc_sfb_stage = desc_sfb_root.advance_start_address(sfb_smem_bytes * stage)
+                        for _bn in cutlass.range_constexpr(num_blocks_n):
+                            if elect_one:
+                                nvvm.tcgen05_cp(
+                                    _s2t_shape,
+                                    sfb_block_ptrs[_bn],
+                                    desc_sfb_stage.advance_start_address(SF_ATOM_BYTES * _bn),
+                                    group=_CTA_GROUP,
+                                    multicast=_s2t_multicast,
+                                )
+                        if elect_one:
+                            nvvm.tcgen05_cp(_s2t_shape, sfa_ptr, desc_sfa_stage, group=_CTA_GROUP, multicast=_s2t_multicast)
+                        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                            desc_a = desc_a_roots[0].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
+                            desc_b = desc_b_roots[0].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
+                            if elect_one:
+                                _tcgen05_mma_block_scale(
+                                    mma_block_scale_kind,
+                                    _CTA_GROUP,
+                                    tmem_addr_mmas[0][0],
+                                    desc_a,
+                                    desc_b,
+                                    idesc_by_k[k_block_idx],
+                                    enable_input_d=scale_d,
+                                    scale_a=sfa_ptr,
+                                    scale_b=sfb_ptr,
+                                    scale_vec_size=scale_vec_size,
+                                    collector_op=_a_collector_op(0),
+                                    b_collector_op=_b_collector_op(0),
+                                )
+                            scale_d = cutlass.Boolean(True)
+                    else:
+                        for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                            for g in cutlass.range_constexpr(num_gemms):
+                                desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
+                                desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
+                                for mi in cutlass.range_constexpr(mma_size_m):
+                                    # The M sub-block offset is a whole SMEM swizzle atom
+                                    # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
+                                    # swizzle phase is preserved. B is shared by every M block.
+                                    desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
+                                    if elect_one:
+                                        _tcgen05_mma(
+                                            mma_kind,
+                                            _CTA_GROUP,
+                                            tmem_addr_mmas[g][mi],
+                                            desc_a,
+                                            desc_b,
+                                            idesc,
+                                            scale_d,
+                                            collector_op=_a_collector_op(g),
+                                            b_collector_op=_b_collector_op(mi),
+                                        )
+                            # Every accumulator sees scale_d=False on exactly the first
+                            # k_block of the tile, so the flip stays outside mi.
+                            scale_d = cutlass.Boolean(True)
 
                     if elect_one:
                         nvvm.tcgen05_commit(
@@ -1629,17 +2049,19 @@ def _bprop_matmul_bh_sm100_kernel(
         # kv rows, dQ writes q rows -- the same choice `_thd_patch_descs_kernel`
         # makes when it bases each sequence's descriptor.
         _thd_meta = cutlass.make_array_view(meta_t) if cutlass.const_expr(_THD_MM) else None
+        # C rows are the M-axis tokens = the side the reduction does NOT run over (`_THD_K_IS_KV`: K over kv tokens ->
+        # C = q rows at cu_q; K over q tokens -> C = kv rows at cu_k).
         _thd_c_cu0 = (
-            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(a_is_m_major) else n_batch)
+            (n_batch if cutlass.const_expr(_THD_K_IS_KV) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
             if cutlass.const_expr(_THD_MM)
             else cutlass.Int32(0)
         )
-        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over S_q
-        # for the m-major dV/dK GEMMs and over S_kv for the k-major dQ one,
-        # exactly opposite to which axis each writes.  Used only to detect a
-        # zero-length reduction; see `_thd_k_len` in the loop.
+        # The A-side (K) prefix is the OTHER one -- `_thd_group` reduces over the
+        # token axis `_THD_K_IS_KV` names, exactly opposite to which axis each
+        # GEMM writes.  Used only to detect a zero-length reduction; see
+        # `_thd_k_len` in the loop.
         _thd_k_cu0 = (
-            (n_batch if cutlass.const_expr(a_is_m_major) else (cutlass.Int32(2) * n_batch + cutlass.Int32(1)))
+            ((cutlass.Int32(2) * n_batch + cutlass.Int32(1)) if cutlass.const_expr(_THD_K_IS_KV) else n_batch)
             if cutlass.const_expr(_THD_MM)
             else cutlass.Int32(0)
         )
@@ -1697,6 +2119,30 @@ def _bprop_matmul_bh_sm100_kernel(
                 if cutlass.const_expr(_THD_MM)
                 else cutlass.Int32(1)
             )
+            # The trimmed THD arm generalises the test: a tile whose K RANGE is empty -- an empty reduction (nkt == 0), a kv
+            # block no query attends, a q pair with no key in its band -- has an unwritten accumulator and a zero gradient.
+            # The same `_causal_k_range` call the producer and the MMA warp made for this tile decides it (`_thd_causal_k_range`).
+            _thd_store_live = cutlass.Boolean(True)
+            if cutlass.const_expr(_THD_TRIM):
+                _, _, _, _nkt_epi = _thd_group(meta_t, tile_b, n_batch, num_k_tiles)
+                _kb_epi, _ke_epi = _causal_k_range(tile_m * cgrp_tile_m_cur, _nkt_epi, _thd_shift(meta_t, tile_b, n_batch))
+                _thd_store_live = _ke_epi > _kb_epi
+            # The EPI_QUANT amax fold's gate under THD: this tile's part (its band live / its reduction non-empty -- the store's own
+            # predicate above), completed PER ROW at the fold by `row < _thd_c_len`.  Dense needs none: a tile's rows past M are
+            # TMA-OOB on A (acc == 0) and fold a harmless 0.  THD differs in two ways, and the per-TILE predicates cover neither:
+            #   * every (head, sequence) group walks ALL the M tiles of the ENVELOPE grid (`_host`: `m` is the longest sequence's
+            #     extent), so a shorter sequence's spare tiles read A rows that are NOT its own -- the next sequence's blocked rows
+            #     (dK: a foreign sequence's live dS), the workspace's slack / capacity tail, or the unwritten q columns past its
+            #     pair-rounded tiles (dQ) -- against ITS OWN packed B rows: a finite, plausible, foreign product in rows the C
+            #     descriptor clips (GLOBAL_DIM[seq] = the sequence's length), so the store never shows it;
+            #   * `_thd_store_live` is the K BAND's emptiness, not the rows' validity: the dense THD arm (CAUSAL_K_NONE) keeps every
+            #     tile live, and the trimmed dQ arm keeps a q pair PAST the sequence's rows live (its band ends at `nkt`, never
+            #     empty for a late pair), so both would fold those foreign accumulators -- `amax_dQ` / `amax_dK` inflated (a NaN
+            #     dropped by `max.f32`, a stale finite product kept) while every stored gradient is exact.
+            # So the fold takes exactly the cells the TMA store writes.  A SELECT on the tree's scalar, never a multiply by zero
+            # (sdpa-invariants s2: the residue may be NaN); folded out of every dense rendering.
+            if cutlass.const_expr(_THD_MM):
+                _thd_fold_live = _thd_store_live if cutlass.const_expr(_THD_TRIM) else (_thd_k_len > cutlass.Int32(0))
             if cutlass.const_expr(epi_dp22):
                 coord_n_c = coord_n_c + (warp_idx // 2) * epi_cols_per_mma_m
 
@@ -1766,25 +2212,40 @@ def _bprop_matmul_bh_sm100_kernel(
                         vec_out = (vec_f32 * epi_d).to(cd_dtype)
                     else:
                         # EPI_QUANT: true value -> amax fold (ternary abs-max tree on max.f32, FMNMX3; never cute.math.max) ->
-                        # * scale_{dQ|dK} -> the gradient dtype.  TMA-OOB rows past M carry acc == 0, so no row gate is needed.
+                        # * scale_{dQ|dK} -> the gradient dtype.  Dense: TMA-OOB rows past M carry acc == 0, so no row gate is
+                        # needed.  THD: the fold is gated per ROW on the store's validity (`_thd_fold_live`, above) -- the spare
+                        # envelope tiles' foreign, clipped rows must not reach amax.
                         _t = vec_f32 * epi_d
                         if cutlass.const_expr(_epi_fold_amax):
-                            epi_amax_tile = fmax_f32(epi_amax_tile, abs_max_tree([_t[_i] for _i in range(subtile_w)]))
+                            _t_amax = abs_max_tree([_t[_i] for _i in range(subtile_w)])
+                            if cutlass.const_expr(_THD_MM):
+                                _row_live = _thd_fold_live & (row < _thd_c_len)
+                                _t_amax = cutlass.Float32(arith.select(_row_live.ir_value(), _t_amax.ir_value(), cutlass.Float32(0.0).ir_value()))
+                            epi_amax_tile = fmax_f32(epi_amax_tile, _t_amax)
                         vec_out = (_t * epi_s).to(cd_dtype)
 
                     epi_stage_idx = (epi_stage_idx + 1) % EPI_SMEM_STAGES
-                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=8192, dtype=cd_dtype)
+                    _tsv_0 = cutlass.Array(base=smem_d_ptr.data_ptr(epi_stage_idx * epi_subtile_elems), shape=epi_subtile_elems, dtype=cd_dtype)
                     # The branch is CTA-uniform (it reads only `tile_b`) and it
                     # wraps the store ALONE -- the fence and the named barrier
                     # below stay outside it, so no path through here can diverge
                     # on a sync.
-                    if cutlass.const_expr(_THD_MM):
-                        if _thd_k_len > cutlass.Int32(0):
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                    if cutlass.const_expr(_THD_TRIM):
+                        if _thd_store_live:
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                         else:
-                            _tsv_0.data_ptr(tidx * 64).store_swizzled(cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(
+                                cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE
+                            )
+                    elif cutlass.const_expr(_THD_MM):
+                        if _thd_k_len > cutlass.Int32(0):
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                        else:
+                            _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(
+                                cutlass.full_like(vec_out, 0.0), alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE
+                            )
                     else:
-                        _tsv_0.data_ptr(tidx * 64).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
+                        _tsv_0.data_ptr(tidx * epi_row_elems).store_swizzled(vec_out, alignment=_EPI_ROW_BYTES, swizzle=_EPI_SWIZZLE)
                     cute.arch.fence_view_async_shared()
                     nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
                     if warp_idx == 0:
@@ -1905,20 +2366,35 @@ def _thd_patch_descs_kernel(
       ``max_total_seq_len`` cannot do this job: it is a maximum, while the row
       that must read zero is ``cu_*[B]``, which changes every step.
 
-    One elected thread; the release fence publishes both to the TMA proxy and
+    Elected warp leaders build disjoint descriptors; each writer publishes to the TMA proxy and
     the kernel boundary orders them before the GEMM reads them.
     """
     tidx, _, _ = cute.arch.thread_idx()
-    if nvvm.elect_sync() and tidx < cutlass.Int32(32):
+    nthreads, _, _ = cute.arch.block_dim()
+    warp = cutlass.Int32(tidx) // cutlass.Int32(32)
+    if nvvm.elect_sync():
         meta = cutlass.make_array_view(meta_t)
         cu_q0 = n_batch
         cu_k0 = cutlass.Int32(2) * n_batch + cutlass.Int32(1)
-        # dV/dK write kv rows and read q tokens; dQ is the mirror.
-        c_cu0 = cu_k0 if cutlass.const_expr(a_is_m_major) else cu_q0
-        b_cu0 = cu_q0 if cutlass.const_expr(a_is_m_major) else cu_k0
-        emit_seq_descs(base_c_desc, desc_words, meta, c_cu0, c_tensor, n_batch, c_row_stride, seq_ord=_THD_MM_SEQ_ORD)
+        # C rows are the side the reduction does not run over, B's tokens the side it does (`_THD_K_IS_KV`): on the q-major
+        # workspace dV/dK write kv rows and read q tokens and dQ is the mirror; the kv-major workspace flips the pairing.
+        c_cu0 = cu_q0 if cutlass.const_expr(_THD_K_IS_KV) else cu_k0
+        b_cu0 = cu_k0 if cutlass.const_expr(_THD_K_IS_KV) else cu_q0
+        emit_seq_descs(
+            base_c_desc,
+            desc_words,
+            meta,
+            c_cu0,
+            c_tensor,
+            n_batch,
+            c_row_stride,
+            seq_ord=_THD_MM_SEQ_ORD,
+            first_batch=warp,
+            batch_step=cutlass.Int32(nthreads) // 32,
+        )
         b_total = cutlass.Int32(meta[b_cu0 + n_batch])
-        emit_clamped_desc(base_b_desc, desc_words, n_batch, b_total, seq_ord=_THD_MM_SEQ_ORD)
+        if warp == cutlass.Int32(0):
+            emit_clamped_desc(base_b_desc, desc_words, n_batch, b_total, seq_ord=_THD_MM_SEQ_ORD)
         nvvm.fence_proxy_release(
             nvvm.MemScope.GPU,
             from_proxy=nvvm.Proxy.GENERIC,
@@ -1929,9 +2405,21 @@ def _thd_patch_descs_kernel(
 _thd_patch_descs_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
-def _require_epi_operands(d0, d1, s_out) -> None:
+def _require_epi_operands(d0, d1, s_out, sfa=None, sfb=None, sf_meta=None) -> None:
     """Trace-time check that the epilogue the rendering carries has its operands (plain Python: the DSL rejects a raise under
-    a staged `if`).  A missing scalar would otherwise surface as a None-specialized load deep in the kernel trace."""
+    a staged `if`).  A missing scalar would otherwise surface as a None-specialized load deep in the kernel trace.  The
+    block-scale arm's two SF tensors are checked the same way (both present iff the rendering block-scales), and its THD leg's
+    `sf_meta_t` (present iff the rendering block-scales AND is THD: a dense block-scale or a plain THD rendering refuses it)."""
+    if _BLOCK_SCALE and (sfa is None or sfb is None or (_THD_MM and sf_meta is None)):
+        raise TypeError(
+            f"{__name__}: block_scale needs sfa_0 (the A operand's F8_128x4 SF atoms) and sfb_0 (the columnwise B SF)"
+            f"{' and, under THD, sf_meta_t (the int32 per-sequence SF tile prefixes [cu_sf_q(B+1) | cu_sf_k(B+1)])' if _THD_MM else ''}; "
+            f"got sfa_0={'None' if sfa is None else 'set'}, sfb_0={'None' if sfb is None else 'set'}, sf_meta_t={'None' if sf_meta is None else 'set'}"
+        )
+    if not _BLOCK_SCALE and (sfa is not None or sfb is not None or sf_meta is not None):
+        raise TypeError(f"{__name__}: this rendering does not block-scale (block_scale=False) but SF operands were passed")
+    if sf_meta is not None and not _THD_MM:
+        raise TypeError(f"{__name__}: sf_meta_t (the per-sequence SF tile prefixes) is the THD leg's operand; this rendering is dense (thd_varlen=False)")
     if epi_mode != EPI_NONE and (d0 is None or d1 is None):
         raise TypeError(f"{__name__}: epi_mode={epi_mode} needs epi_descale_0 and epi_descale_1 (fp32 [1] device tensors); got None")
     if epi_mode == EPI_QUANT and s_out is None:
@@ -1958,8 +2446,19 @@ def _host(
     epi_descale_1: Optional[cute.Tensor] = None,
     epi_scale_out: Optional[cute.Tensor] = None,
     epi_amax: Optional[cute.Tensor] = None,
+    # The block-scale arm's scale factors (TRAILING, defaulted: every earlier call shape is unchanged), uint8 5-D views whose
+    # strides are in BYTES:
+    #   sfa_0  (512 B atom, K tiles, M tiles, H, B)   over the A operand's F8_128x4 atoms [B, H, M/128, K/128, 512]
+    #   sfb_0  (512 B atom, D planes, K tiles, H, B)  over the columnwise B SF, D-plane-major (plane stride = B*H*tiles atoms)
+    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1)
+    sfa_0: Optional[cute.Tensor] = None,
+    sfb_0: Optional[cute.Tensor] = None,
+    # The block-scale arm's THD leg (TRAILING, defaulted): the int32 `[cu_sf_q(B+1) | cu_sf_k(B+1)]` per-sequence SF TILE prefixes
+    # (`config_sm100.STAGE3_THD_SF_META_WORDS(B)` words, `STAGE3_THD_SF_CU_*_OFF`) the TMA warp's SFB coordinate takes its tile
+    # base from; required iff the rendering block-scales under `thd_varlen`, refused otherwise.
+    sf_meta_t: Optional[cute.Tensor] = None,
 ) -> None:
-    _require_epi_operands(epi_descale_0, epi_descale_1, epi_scale_out)
+    _require_epi_operands(epi_descale_0, epi_descale_1, epi_scale_out, sfa_0, sfb_0, sf_meta_t)
     _a_operands = [a_0]
     _b_operands = [b_0]
     m = problem_size[0]
@@ -2022,7 +2521,10 @@ def _host(
     if cutlass.const_expr(matmul_b_batch == 1):
         b_h, b_b = 1, 1
     else:
-        b_h, b_b = n_head, n_batch
+        # B's head extent follows its head group: `n_head // b_head_group` B heads serve `n_head` A/C heads (every A/C head
+        # `h` reads B head `h // b_head_group`, `_b_head`); `n_head` itself at the default 1.
+        b_h = n_head if cutlass.const_expr(b_head_group == 1) else n_head // b_head_group
+        b_b = n_batch
     # THD: `n_batch` is the SEQUENCE count -- it sizes the grid and indexes the
     # metadata -- but the packed operands hold ONE batch element, reached by the
     # coordinate offsets instead.  Describing them as n_batch-deep builds a
@@ -2113,10 +2615,46 @@ def _host(
             out_stride_h_0 * cd_dtype.width // 128,
             out_stride_b_0 * cd_dtype.width // 128,
         ],
-        box_dims=[64, epi_tile_mn[0], 1, 1],
+        box_dims=[epi_row_elems, epi_tile_mn[0], 1, 1],
         swizzle=_EPI_TMA_SWIZZLE,
     )
     tma_c_desc_list = [tma_c_desc_0]
+
+    if cutlass.const_expr(_BLOCK_SCALE):
+        # SF tensor maps -- the 512-B atom is the inner box (read as 256 x u16, the block-scale GEMM template's spelling: a
+        # uint8 inner extent is capped at 256 elements), one atom per (K tile, M tile) for SFA, the num_blocks_n D-plane
+        # atoms of one K tile for SFB.  Strides are the caller's BYTE strides in TMA's 16-byte units; the (h, b) pair is two
+        # coordinates like the operand maps (a head window is a base offset plus the h stride, never a flat b*H + h).
+        _sf_atom_u16 = SF_ATOM_BYTES // 2
+        tma_sfa_desc_0 = _tma.create_tensor_map_tiled(
+            global_address=sfa_0.iterator.toint(),
+            dtype=cutlass.Uint16,
+            global_dims=[_sf_atom_u16, sfa_0.shape[1], sfa_0.shape[2], sfa_0.shape[3], sfa_0.shape[4]],
+            global_strides=[
+                cutlass.Int64(sfa_0.stride[1]) // 16,
+                cutlass.Int64(sfa_0.stride[2]) // 16,
+                cutlass.Int64(sfa_0.stride[3]) // 16,
+                cutlass.Int64(sfa_0.stride[4]) // 16,
+            ],
+            box_dims=[_sf_atom_u16, 1, 1, 1, 1],
+            swizzle=_tma.TensorMapSwizzle.none,
+        )
+        tma_sfb_desc_0 = _tma.create_tensor_map_tiled(
+            global_address=sfb_0.iterator.toint(),
+            dtype=cutlass.Uint16,
+            global_dims=[_sf_atom_u16, sfb_0.shape[1], sfb_0.shape[2], sfb_0.shape[3], sfb_0.shape[4]],
+            global_strides=[
+                cutlass.Int64(sfb_0.stride[1]) // 16,
+                cutlass.Int64(sfb_0.stride[2]) // 16,
+                cutlass.Int64(sfb_0.stride[3]) // 16,
+                cutlass.Int64(sfb_0.stride[4]) // 16,
+            ],
+            box_dims=[_sf_atom_u16, num_blocks_n, 1, 1, 1],
+            swizzle=_tma.TensorMapSwizzle.none,
+        )
+    else:
+        tma_sfa_desc_0 = None
+        tma_sfb_desc_0 = None
 
     cluster_m = cluster_shape_mnk[0]
     cluster_n = cluster_shape_mnk[1]
@@ -2138,7 +2676,7 @@ def _host(
             meta_t,
             n_batch,
             out_stride_m_0,
-        ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
 
     launch = _bprop_matmul_bh_sm100_kernel(
         problem_size[0],
@@ -2159,6 +2697,9 @@ def _host(
         epi_descale_1,
         epi_scale_out,
         epi_amax,
+        sf_meta_t,
+        tma_sfa_desc_0,
+        tma_sfb_desc_0,
     )
     # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
     # the regular one the device groups blocks into when a preferred cluster does

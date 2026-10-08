@@ -488,6 +488,8 @@ class KernelTemplate:
         """``None`` if this template can compile (chain, config); else the first
         stage's rejection reason. Cheapest-first (short-circuits):
         pipeline/graph-type/mainloop → mma-type×arch → tile-config → other."""
+        if chain.has_moe and chain.moe.mode == "combine" and self.pipeline != "sm100":
+            return "MoE COMBINE is supported only by the SM100 pipeline"
         gt = classify_graph_type(chain)
         return (
             self.arch_active_reject()

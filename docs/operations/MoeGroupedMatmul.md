@@ -4,7 +4,7 @@
 
 The MoE Grouped Matmul operation computes a grouped matrix multiplication across experts, as used in Mixture-of-Experts (MoE) layers. Each expert has its own weight matrix, and tokens are routed to experts via `first_token_offset`.
 
-Three routing modes are supported:
+Four routing modes are defined; COMBINE currently requires the FROST SM100 engine:
 
 **None mode** (tokens already routed per expert):
 
@@ -18,18 +18,21 @@ $$\text{Output}[1,\ S \times \text{topK},\ N] = \text{Token}[1,\ S,\ K]\ \times\
 
 $$\text{Output}[1,\ S \times \text{topK},\ N] = \text{Token}[1,\ S \times \text{topK},\ K]\ \times\ \text{Weight}[E,\ K,\ N]$$
 
+**Combine mode** performs FC2, routing-score multiplication, and summation across selected experts, producing `[1, S, N]`. See the FROST COMBINE contract below.
+
 where $E$ = number of experts, $S$ = number of tokens, $K$ = hidden size, $N$ = output (weight) size.
 
 ### Tensor Roles by Mode
 
 | Tensor | Shape | Modes |
 |---|---|---|
-| `Token` | `[1, S*topK, K]` (None/Scatter) or `[1, S, K]` (Gather) | All |
+| `Token` | `[1, S*topK, K]` (None/Scatter/Combine) or `[1, S, K]` (Gather) | All |
 | `Weight` | `[E, K, N]` | All |
-| `FirstTokenOffset` | `[B*E, 1, 1]` (B represents batch size), INT32 | All |
-| `TokenIndex` | `[1, S*topK, 1]`, INT32 | Gather, Scatter |
-| `TokenKs` | `[1, S*topK, 1]`, INT32 | Scatter only |
-| `TopK` | scalar int32 | Scatter only |
+| `FirstTokenOffset` | `[B*E+1, 1, 1]` explicit boundaries; INT32/INT64 | All |
+| `TokenIndex` | `[1, S*topK, 1]`, INT32 | Gather, Scatter, Combine |
+| `TokenKs` | `[1, S*topK, 1]`, INT32 | Scatter, Combine |
+| `TopK` | scalar int32 | Scatter, Combine |
+| `TopKScores` | `[1, S, topK]`, FP32 | Combine only |
 
 ## Support Matrix
 
@@ -42,9 +45,22 @@ The support matrix is based on the latest cuDNN backend.
 
 ### Important Notes
 
-1. `FirstTokenOffset` contains `B * E` starts. The final endpoint is implicit: `TokenIndex.shape[1]` in Gather mode, otherwise `Token.shape[1]`.
+1. Let `G=B*E`. Use `G+1` nondecreasing boundaries starting at zero. Group g spans `[offset[g], offset[g+1])` and uses expert `g % E`. The final boundary may be smaller than the routed capacity (`TokenIndex.shape[1]` in Gather mode, otherwise `Token.shape[1]`); trailing routed rows are unused. In None/Gather mode their output rows remain untouched; in Scatter mode only destinations of used routed rows are written.
+   **E=1 requires at least two boundaries.** FROST supports only explicit boundaries; native backend explicit-offset support requires cuDNN 9.28.0 or newer.
 2. In **Scatter** mode, both `TokenIndex` and `TokenKs` are required, and `top_k` must be explicitly provided.
 3. In **Gather** mode, `TokenIndex` is required.
+
+### Deprecated implicit offsets
+
+The length-G format, which infers the final endpoint from routed capacity, is
+**deprecated**. It remains supported by native engines for E>1 for compatibility;
+FROST declines it. For E>1, length modulo E selects the format: 1 for explicit
+boundaries, 0 for deprecated implicit offsets. No mode parameter is needed.
+
+To migrate, append the old routed-capacity endpoint to the G starts and declare
+`FirstTokenOffset` as `[G+1,1,1]`. This preserves the old group ranges. Use a smaller
+final endpoint when trailing capacity is intentionally unused. This applies to
+both forward and backward APIs.
 
 ### FROST GATHER support
 
@@ -55,8 +71,8 @@ and in the SM120 token-by-weight path. Enable it with
 
 Let `T` be the source token count and `R` the routed row count. Supply token
 `[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
-and INT32 or INT64 `first_token_offset` `[G,1,1]`. The result is `[1,R,N]`.
-Offsets are nondecreasing starts beginning at zero, with implicit endpoint R;
+and INT32 or INT64 `first_token_offset` `[G+1,1,1]`. The result is `[1,R,N]`.
+Offsets are nondecreasing boundaries beginning at zero, with final endpoint <= R;
 group `g` uses expert `g % E`, and empty groups are supported. Each index is a
 source row in `[0,T)`, so repeated source tokens are allowed.
 
@@ -108,9 +124,9 @@ output[0, destination, :] = grouped_result[r, :]
 For `R = S * top_k`, supply token `[1,R,K]`, output `[1,R,N]`, and contiguous
 INT32 `token_index` and `token_ks`, both `[1,R,1]`. The first index is in
 `[0,S)`; `token_ks` is the position within the token's top-k list, in
-`[0,top_k)`. Destinations must be unique and cover the output slots.
+`[0,top_k)`. Destinations of active routed tokens must be unique; unused output slots are left untouched.
 `1 <= top_k <= E`; offsets retain the GATHER/NONE group convention with
-implicit endpoint R and support empty groups. Routing metadata is supplied
+G+1 explicit boundaries and support empty groups. Routing metadata is supplied
 by the caller and may change between executions, including graph replay.
 
 ```python
@@ -135,6 +151,72 @@ weights and reduction across top-k require a subsequent operation to produce
 the final `[1,S,N]` result.
 
 ---
+
+
+### FROST COMBINE support
+
+`cudnn.moe_grouped_matmul_mode.COMBINE` fuses FC2 with weighted scatter-add.
+It is supported only by the opt-in `frost_gemm` SM100 source family, for
+ordinary and block-scaled inputs and both `SWAP_AB=0/1` orientations. Native
+cuDNN engines and the SM120 source family decline this mode.
+
+Let `R` be routed input capacity, `T` the original token count, and `k=top_k`.
+Supply token `[1,R,K]`, weight `[E,K,N]`, contiguous INT32 `token_index` and
+`token_ks` of shape `[1,R,1]`, and compact FP32 `top_k_scores` `[1,T,k]`.
+The scores remain in original token/top-k-slot order. `1 <= k <= E`.
+Offsets retain the explicit `[G+1,1,1]` contract; `R` may include unused
+capacity and need not equal `T*k`.
+
+For each active routed row `r` in group `g`, the operation computes:
+
+```text
+t = token_index[0, r, 0]
+j = token_ks[0, r, 0]
+output[0, t, :] += (token[0, r, :] @ weight[g % E, :, :]) * top_k_scores[0, t, j]
+```
+
+The output is `[1,T,N]`; every execution starts from zero, including empty
+groups and repeated CUDA Graph replays. Out-of-range token/slot indices are
+ignored. Repeated destinations accumulate; destinations without contributions
+are zero. N-major and M-major output layouts, including padding, are supported.
+
+```python
+output = graph.moe_grouped_matmul(
+    fc2_input, fc2_weight, first_token_offset,
+    token_index=token_index, token_ks=token_ks,
+    top_k=top_k, top_k_scores=top_k_scores,
+    mode=cudnn.moe_grouped_matmul_mode.COMBINE,
+)
+output.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+```
+
+GEMM accumulation and score multiplication use FP32. Each weighted contribution
+is converted to the declared output dtype (BF16, FP16, or FP32), and atomic
+addition accumulates in that dtype. Atomic order is unspecified, so results
+are not bitwise deterministic and can differ from an FP32 top-k reduction
+followed by a single output cast. Choose FP32 output when FP32 combining is
+required. Scores are neither normalized nor modified by COMBINE.
+
+The first implementation accepts one grouped GEMM, with optional input
+block-scale dequantization, and one final output. Post-COMBINE pointwise,
+reduction, quantization, and parallel-GEMM fusion are declined: applying those
+operations before summing experts would change the graph's meaning.
+
+The FC2 epilogue issues weighted atomic additions directly to the final output;
+it does not materialize `[T*k,N]` results or launch a separate finalizer.
+For token-by-weight GEMM with contiguous output features, each lane packs up to
+eight BF16/FP16 or four FP32 contributions into a 16-byte vector atomic add.
+The destination address selects narrower accesses when the output pointer or
+row stride is unaligned. Weight-by-token (`SWAP_AB`) and M-major outputs retain
+scalar atomics because adjacent registers do not address adjacent features of
+the same token. Vectorization preserves per-element atomicity and output-dtype
+accumulation.
+Output zeroing uses `cudaMemsetAsync` for contiguous storage and
+`cudaMemset2DAsync` for padded row/column-major storage, preserving padding.
+The execute-time stream orders output memset, the existing scheduler-counter
+initialization kernel, and grouped GEMM. Routing metadata and scores may change
+on graph replay, and runtime token/output extents remain independent of routed
+capacity.
 
 ## MoE Grouped Matmul Forward
 
@@ -190,7 +272,7 @@ output = graph.moe_grouped_matmul(
   - None/Scatter mode: shape `(1, S*topK, K)`
   - Gather mode: shape `(1, S, K)`
 - `weight` (cudnn_tensor): Expert weight data with shape `(E, K, N)`.
-- `first_token_offset` (cudnn_tensor): INT32 tensor of shape `(B*E, 1, 1)`. The $i$-th entry is the index of the first token assigned to expert $i$.
+- `first_token_offset` (cudnn_tensor): INT32/INT64 tensor of shape `(B*E+1, 1, 1)` including the final endpoint. See [deprecated implicit offsets](#deprecated-implicit-offsets) for compatibility.
 - `token_index` (Optional[cudnn_tensor]): INT32 tensor of shape `(1, S*topK, 1)`. Maps each routed slot to a source token index. Required for Gather and Scatter modes.
 - `token_ks` (Optional[cudnn_tensor]): INT32 tensor of shape `(1, S*topK, 1)`. The top-k slot index in `[0, top_k)` for each routed token. Required for Scatter mode.
 - `mode` (cudnn.moe_grouped_matmul_mode): Routing mode — `NONE`, `GATHER`, or `SCATTER`.
@@ -209,7 +291,7 @@ from cudnn.experimental.ops import moe_grouped_matmul
 output = moe_grouped_matmul(
     token,              # (1, M, K) torch.Tensor, fp16 or bf16
     weight,             # (E, K, N) torch.Tensor, column-major inner dims
-    first_token_offset, # (B*E, 1, 1) torch.Tensor, INT32
+    first_token_offset, # (B*E+1, 1, 1) torch.Tensor, INT32
     token_index=None,   # (1, S*topK, 1) INT32; required for gather/scatter
     token_ks=None,      # (1, S*topK, 1) INT32; required for scatter
     mode="none",        # "none", "gather", or "scatter"
@@ -262,10 +344,10 @@ weight_t = graph.tensor(
     data_type=cudnn.data_type.BFLOAT16,
 )
 
-# FirstTokenOffset: [E, 1, 1], INT32
+# FirstTokenOffset: [E+1, 1, 1], INT32, including the final endpoint
 fto_t = graph.tensor(
     name="first_token_offset",
-    dim=[num_experts, 1, 1],
+    dim=[num_experts + 1, 1, 1],
     stride=[1, 1, 1],
     data_type=cudnn.data_type.INT32,
 )
@@ -294,6 +376,9 @@ The backward operation computes the weight gradient $d\text{Weight}$ given the u
 $$d\text{Weight}[E,\ K,\ N] = \text{Token}^T[1,\ S,\ K]\ \times\ d\text{Output}[1,\ S,\ N]$$
 
 per expert, where the per-expert token slices are determined by `FirstTokenOffset`.
+Declare the `dweight` dimensions explicitly when using G+1 boundaries. Backward
+has no weight input from which to recover E; omitted output dimensions retain
+the deprecated implicit format's inference from the offset length.
 
 ### C++ API
 
@@ -330,7 +415,7 @@ dweight = graph.moe_grouped_matmul_bwd(
 **Args:**
 - `doutput` (cudnn_tensor): Upstream gradient with shape `(1, S, N)`, same layout as the forward output.
 - `token` (cudnn_tensor): Forward token activations with shape `(1, S, K)`.
-- `first_token_offset` (cudnn_tensor): INT32 tensor of shape `(B*E, 1, 1)`, same as used in the forward pass.
+- `first_token_offset` (cudnn_tensor): INT32/INT64 tensor of shape `(B*E+1, 1, 1)`, same as used in the forward pass. See [deprecated implicit offsets](#deprecated-implicit-offsets) for compatibility.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal accumulation.
 - `name` (Optional[str]): Name for the operation.
 
@@ -369,10 +454,10 @@ token_t = graph.tensor(
     data_type=cudnn.data_type.BFLOAT16,
 )
 
-# FirstTokenOffset: [E, 1, 1], INT32
+# FirstTokenOffset: [E+1, 1, 1], INT32, including the final endpoint
 fto_t = graph.tensor(
     name="first_token_offset",
-    dim=[num_experts, 1, 1],
+    dim=[num_experts + 1, 1, 1],
     stride=[1, 1, 1],
     data_type=cudnn.data_type.INT32,
 )
@@ -383,7 +468,7 @@ dweight_t = graph.moe_grouped_matmul_bwd(
     name="moe_bwd",
 )
 # dweight: [E, K, N]
-dweight_t.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+dweight_t.set_dim([num_experts, hidden_size, weight_size]).set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
 
 graph.validate()
 graph.build_operation_graph()

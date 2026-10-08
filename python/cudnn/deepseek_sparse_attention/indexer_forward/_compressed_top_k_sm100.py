@@ -351,7 +351,8 @@ def indexer_fwd_compress_topk(
     Args:
         q: BSHD ``(bs, seqlen_q, n_heads_q, head_dim)`` BF16
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` BF16
-        w: BSH  ``(bs, seqlen_q, n_heads_q)`` BF16
+        w: BSH  ``(bs, seqlen_q, n_heads_q)`` BF16 or FP32 for BF16 Q/K;
+            BF16 for MXFP8 Q/K.
         topk: top-k width K
         ratio: compression ratio
         sm_scale: scalar applied to the fp32 head-reduced score (same as
@@ -412,6 +413,8 @@ def indexer_fwd_compress_topk(
     precision = precision.lower()
     if precision not in ("bf16", "mxfp8"):
         raise ValueError(f"precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    if precision == "bf16" and w.dtype == torch.float32 and w.stride(-1) != 1:
+        raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     q, k, w = [_maybe_contiguous(t) for t in (q, k, w)]
     if q.ndim != 4 or k.ndim != 4 or w.ndim != 3:
         raise ValueError("compress-topk expects BSHD q (bs,sq,Hq,D), k (bs,sk,Hkv,D), w (bs,sq,Hq)")
@@ -419,8 +422,8 @@ def indexer_fwd_compress_topk(
         # Match the dense path: reject stray scales (silently ignored otherwise,
         # and they would also pollute the compile cache key).
         raise ValueError("q_scale and k_scale are only valid with precision='mxfp8'")
-    if precision == "bf16" and not (q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and w.dtype == torch.bfloat16):
-        raise TypeError("precision='bf16' requires q, k, w to be bfloat16")
+    if precision == "bf16" and not (q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and w.dtype in (torch.bfloat16, torch.float32)):
+        raise TypeError("precision='bf16' requires bfloat16 q/k and bfloat16 or float32 w")
     if precision == "mxfp8":
         if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
             raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")
@@ -1119,6 +1122,7 @@ def _run_compress_gemm_varlen(
     compile_key = (
         "bf16_varlen_compress",
         q.dtype,
+        w.dtype,
         bs,
         n_heads_kv,
         head_dim,
@@ -1307,8 +1311,10 @@ def _indexer_fwd_compress_topk_thd(
     if k.device != device or w.device != device:
         raise ValueError("q, k, w must be on the same device")
     if precision == "bf16":
-        if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
-            raise TypeError("THD compressed-logits top-k requires q, k, w to be bfloat16")
+        if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or w.dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError("THD compressed-logits top-k requires bfloat16 q/k and bfloat16 or float32 w")
+        if w.dtype == torch.float32 and w.stride(-1) != 1:
+            raise NotImplementedError(f"FP32 w requires unit last stride, got strides {w.stride()}")
     else:
         if q.dtype != torch.float8_e4m3fn or k.dtype != torch.float8_e4m3fn:
             raise TypeError("precision='mxfp8' requires q and k to be torch.float8_e4m3fn")

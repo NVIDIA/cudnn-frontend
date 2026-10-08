@@ -61,8 +61,8 @@ def recommendations(monkeypatch):
 
 @pytest.mark.L0
 def test_known_default_and_opt_in_rows_are_offered(monkeypatch):
-    default_rows = {_SM100, _SM120}
-    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_fp8"}
+    default_rows = {_SM100, _SM120, "sdpa_fwd_prefill_sm107", "sdpa_fwd_prefill_sm90", "sdpa_fwd_prefill_sm100_fp8"}
+    opt_in_rows = {"sdpa_fwd_prefill_sm80", "sdpa_fwd_prefill_sm100_mxfp8", "sdpa_fwd_prefill_sm107_fp8", "sdpa_fwd_prefill_sm107_mxfp8"}
     offered = _FAMILY.offered_ids()
     assert default_rows <= offered.keys()
     assert opt_in_rows.isdisjoint(offered)
@@ -121,12 +121,78 @@ def test_marker_never_reaches_a_ranked_list():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d,s_q", [(128, 4), (256, 4), (512, 4), (512, 64)])
+@pytest.mark.parametrize("d,s_q", [(512, 64), (512, 256)])
 @pytest.mark.parametrize("min_kv", [512, 4096])
 def test_short_query_placement_respects_configured_domain(monkeypatch, d, s_q, min_kv):
-    """Exercise the domain guard without pinning a measured threshold or winner."""
+    """Exercise the d512 prefill domain guard without pinning a measured threshold or winner."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     monkeypatch.setattr(placement, "SHORT_QUERY_MIN_KV_TOKENS", min_kv, raising=False)
     spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
     assert placement.place(spec, _facts(d_qk=d, d_v=d, s_q=s_q, s_kv=min_kv - 1)) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256, 512])
+@pytest.mark.parametrize("s_q", [2, 4, 16])
+@pytest.mark.parametrize("s_kv", [64, 1000, 2047, 8192])
+def test_decode_shaped_rows_lead_at_every_kv_length(d, s_q, s_kv):
+    """Multi-token decode rows (2 <= s_q <= 16) lead the backend whatever the cache
+    length: the backend serves them with a prefill-class engine, the row with its
+    decode tile, and the short-cache gap is the largest (see the module docstring)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    facts = _facts(b=32, h_q=64, h_kv=4, d_qk=d, d_v=d, s_q=s_q, s_kv=s_kv)
+    assert placement.place(spec, facts) == placement.LEAD
+
+
+@pytest.mark.L0
+def test_paged_d512_decode_trails_until_its_decode_tile():
+    """Paged d512 at s_q == 1 runs the role-split prefill tile (no d512 decode tile) and
+    measured behind the backend's paged decode engine, so it TRAILS by default, while the
+    same launch over dense K/V keeps the measured dense-d512 rule (LEAD at these KV tokens
+    in flight); multi-token paged d512 keeps the decode-shaped LEAD and paged d512 prefill
+    stays backend-first like every other paged prefill (the paged d256 THD shard excepted)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    paged = dict(d_qk=512, d_v=512, b=8, h_q=64, h_kv=1, s_kv=4096, has_paged_kv=True, padded=True, page_size=16, causal=False, bottom_right=False)
+    assert placement.place(spec, _facts(s_q=1, **paged)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, **{**paged, "has_paged_kv": False, "page_size": 0})) == placement.LEAD
+    assert placement.place(spec, _facts(s_q=4, **paged)) == placement.LEAD
+    assert placement.place(spec, _facts(s_q=128, **paged)) == placement.TRAIL
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "outside",
+    [
+        None,
+        {"has_paged_kv": False},
+        {"wants_stats": True},
+        {"dtype": cudnn.data_type.HALF},
+        {"d_qk": 192},
+        {"s_q": 63},
+        {"s_kv": 257},
+        {"b": 3},
+        {"device_cc": (10, 3)},
+        {"page_size": 16},
+        {"h_q": 8},
+        {"bottom_right": False},
+        {"window_left": 128},
+    ],
+)
+def test_paged_prefill_placement_stays_inside_configured_domain(monkeypatch, outside):
+    """Synthetic shard bounds check isolation, not measured workload winners."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_HEADS", frozenset({(6, 2)}), raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_PAGE_SIZES", frozenset({32}), raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_MIN_Q", 64, raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_MAX_KV", 256, raising=False)
+    monkeypatch.setattr(placement, "PAGED_D256_PREFILL_MAX_BATCH", 2, raising=False)
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    values = dict(h_q=6, h_kv=2, s_q=128, s_kv=256, d_qk=256, d_v=256, has_paged_kv=True, thd=True, page_size=32)
+    values.update(outside or {})
+    assert placement.place(spec, _facts(**values)) == (placement.TRAIL if outside else placement.LEAD)

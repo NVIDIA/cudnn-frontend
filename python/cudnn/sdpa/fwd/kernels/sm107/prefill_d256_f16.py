@@ -149,7 +149,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -184,6 +184,30 @@ else:
 if CFG.DTYPE_O != CFG.DTYPE_QKV:
     raise NotImplementedError(f"prefill_sdpa_d256_f16: DTYPE_O={CFG.DTYPE_O} != DTYPE_QKV=" f"{CFG.DTYPE_QKV} not yet supported.")
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
+
+# softmax_scale_prefolded (TemplateParams.softmax_scale_prefolded <- the graph's attn_scale_prefolded): the caller
+# multiplied Q by attn_scale * log2(e), so the raw QK^T already sits in the log2 domain.  The softmax then takes the
+# RAW row max and shifts with one FADD2 per pair (reg_S - m) in place of the FFMA2 (reg_S * scale_log2 - m); the
+# ``scale_log2`` runtime argument stays in every signature as a dead operand (the adapter pins it to exactly 1.0 and
+# the kernel never reads it under the fold).  The published Stats are unchanged: the running max and the shifted
+# scores live in the same log2 domain as when the kernel applies the scale, so the correction's LSE / sink fold /
+# inv_sum consume the same values.  Numerically neutral on its own (the per-score multiply by the scale becomes the
+# caller's one rounding of Q); the fused shift+convert it enables is a quantized-kernel arm this body does not carry.
+# Mask sentinel under the fold: a fully-masked tile leaves the raw max exactly at the finite mask sentinel (== NEG_INF),
+# so is_first re-fires on consecutive keyless tiles (alpha = 0) where the scaled path runs alpha = 1 between them; both
+# publish P = exp2(0) = 1 there, the first live tile wipes the accumulator, and a keyless row is overridden by the
+# correction's _kv_empty select -- same O and LSE either way.  The softmax body is inlined four times (dense /
+# left-masked / unmasked interior / right-masked); every copy carries both arms at its max site and its shift site --
+# the source pin in test_sdpa_fwd_dsl_sm107.py counts them.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+# softmax_precision=HALF (TemplateParams.softmax_f16) is a quantized-kernel specialization: on half inputs the f16x2
+# exponent would be a new numerics class (exp input ulp 2^-8 at the rescale threshold; bf16 ex2 is 2^-7), so the config
+# backstop (config_sm107.py _validate_params) declines it before this body loads and the fused arm never exists here.
+# The constants are kept so the cc 10.7 forward kernels expose one lever vocabulary (tests read _k_mod._FUSED_SHIFT_CVT).
+SOFTMAX_F16 = int(PARAMS.softmax_f16)
+if SOFTMAX_F16:
+    raise ValueError("prefill_d256_f16: softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization; half inputs run the f32 exponent")
+_FUSED_SHIFT_CVT = False
 
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
@@ -800,6 +824,10 @@ def _tmaldg_warp_group(
         # branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        # Setup publishes immutable packed-total maps for this launch.
+        # Each loader warp acquires both maps before consuming any tile.
+        tma_tensormap_acquire(_k_rt_ptr)
+        tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     else:
@@ -889,6 +917,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_VARLEN,
                 )
 
                 bars.mb_v_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
@@ -902,6 +931,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not CFG.THD_VARLEN,
                 )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
@@ -1405,7 +1435,10 @@ def _softmax_warp_group(
                     num_elems=CFG.TILE_N,
                 )
                 reg_S = RegTile(reg_S_tile.vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
                 old_total_max = total_max
                 is_first = total_max == NEG_INF
@@ -1419,7 +1452,10 @@ def _softmax_warp_group(
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
 
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 # Chunk 1 cast/store/sum folds out at trace time when N_CHUNKS == 1
                 chunk_S_0 = reg_S[0:CHUNK].vec
@@ -1493,7 +1529,10 @@ def _softmax_warp_group(
                 for m in chunks_max[1:]:
                     current_max_unscaled = cute.math.max(current_max_unscaled, m)
                 reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
                 old_total_max = total_max
                 is_first = total_max == NEG_INF
@@ -1506,7 +1545,10 @@ def _softmax_warp_group(
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 chunk_S_0 = reg_S[0:CHUNK].vec
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1554,7 +1596,10 @@ def _softmax_warp_group(
                     num_elems=CFG.TILE_N,
                 )
                 reg_S = RegTile(reg_S_tile.vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
                 old_total_max = total_max
                 is_first = total_max == NEG_INF
@@ -1567,7 +1612,10 @@ def _softmax_warp_group(
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 chunk_S_0 = reg_S[0:CHUNK].vec
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1638,7 +1686,10 @@ def _softmax_warp_group(
                 for m in chunks_max[1:]:
                     current_max_unscaled = cute.math.max(current_max_unscaled, m)
                 reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
                 old_total_max = total_max
                 is_first = total_max == NEG_INF
@@ -1651,7 +1702,10 @@ def _softmax_warp_group(
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 chunk_S_0 = reg_S[0:CHUNK].vec
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1922,15 +1976,13 @@ def _correction_warp_group(
                     # or head-major rank-3 [1, QH, head_stride].  Serving only the
                     # rank-3 arm transposes every LSE on the common path.
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                        lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                        lse_row[head_idx] = lse_val
+                        lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
                     else:
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
                             # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                             lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                            lse_row[_cu_q_b + q_row_global] = lse_val
+                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
         else:
             if cutlass.const_expr(lse_tensor is not None):
                 if q_row_global < seqlen_q:
@@ -2086,7 +2138,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2320,7 +2372,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),

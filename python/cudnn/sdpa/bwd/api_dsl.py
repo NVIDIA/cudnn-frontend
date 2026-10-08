@@ -391,7 +391,7 @@ class SdpaBwdDslSm120(SdpaBwdDsl):
             f"SdpaBwdDslSm120 requires SM120 or SM121, found SM{self.compute_capability[0]}{self.compute_capability[1]}",
         )
 
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
 
         self.batch_size = int(b)
@@ -886,7 +886,7 @@ def _sm80_thd_backward(
     d_qk, d_v, h_q, h_kv = q.shape[-1], v.shape[-1], q.shape[2], k.shape[2]
     fdqk, fdv = _SM80_BWD_FLAVOR_DIMS[_sm80_bwd_pick_flavor(d_qk, d_v)]
     # Resolve from the user's width before envelope padding (e.g. D=96).
-    if scale_softmax is None or scale_softmax == 0.0:
+    if scale_softmax is None:
         scale_softmax = 1.0 / math.sqrt(d_qk)
     n_seq = cu_q.numel() - 1
     assert n_seq > 0 and cu_k is not None and cu_k.numel() == n_seq + 1, "cu_seqlens_q / cu_seqlens_k length mismatch"
@@ -1327,7 +1327,7 @@ class SdpaBwdDslSm80(SdpaBwdDsl):
             "SM80 BPROP: causal_bottom_right requires is_causal and/or a left window",
         )
 
-        if self.scale_softmax is None or self.scale_softmax == 0.0:
+        if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_qk)
 
         self.batch_size = int(b)
@@ -1762,10 +1762,111 @@ _SM100_KERNEL_DIR = "cudnn/sdpa/bwd/kernels"
 # Stage 2's descriptor scratch: Q / dO / K / V, clamped on device.
 _THD_STAGE2_DESC_SLOTS = 4
 _SM100_STAGE2_FILE = "sm100/bprop_d512_f16.py"
+# The 2x2-datapath twin of stage 2: one fused cta_group::2 pipeline per pair (64 q rows per CTA, both BMMs on every
+# SM, S never leaves the lane's registers) inside the same (4,1,1) cluster, K / V shared across the two pairs by TMA
+# multicast.  Same host ABI, workspace format and LSE / do_dot contract as the role-split file; a SIBLING file so the
+# 4x1 rendering stays byte-identical (its own FROST_SOURCE_DIGEST, its own config record).
+_SM100_STAGE2_FILE_2X2 = "sm100/bprop_d512_f16_2x2.py"
+# Which stage-2 datapath the SM100 d512 chain renders.  False = the cga4x1 role split (what ships).  True = the 2x2 twin
+# (the Rubin d512 bring-up vehicle; on SM100 the A/B gate for a default flip is >= +3 % stage-2 median on BOTH dense and
+# causal at B=1 H=128 S=8192 d=512 bf16, see the twin's docstring).  A module constant read at CALL time (``compile``),
+# not a knob and not an env var: it must never differ per plan.  The DQ_SINGLE_LAUNCH precedent (api_dsl_sm107).
+STAGE2_2X2: bool = False
+# Stage-3 dQ launch shape under GQA (the #1318 ``b_head_group`` arm of the stage-3 template, ported from the cc 10.7 d256
+# chain's ``api_dsl_sm107.DQ_SINGLE_LAUNCH``).  True = ONE dQ GEMM launch per head chunk: the dQ rendering takes
+# ``MatmulTemplateParams.b_head_group = group`` (its B = K is indexed by ``h // group``, the K head the group's Q heads
+# share) over the whole dS chunk and the whole dQ chunk -- what ships.  False = one launch per group MEMBER over every
+# ``group``-th Q head (``b_head_group = 1``; the per-member loop this chain ran before): the bitwise pin's twin (the same
+# k-tile walk per output tile into the same fp32 accumulator, so identical bits) and the A/B base.  At H_q / H_kv = 16 and
+# S = 8K the member launches were sixteen under-one-wave launches of 16 four-CTA clusters on a 37-cluster B200, 128 dQ
+# launches per backward.  MHA (group 1) renders and launches identically either way.  THD keeps the per-member loop
+# whatever this says (this chain's packed dQ host launches per member; the grouped arm's THD leg is the cc 10.7 d256
+# chain's), and so does a budget-limited head chunk that is not a whole number of GQA groups (``_sm100_head_chunk`` may
+# hand out any divisor of H_q; the host then maps each Q head to its own KV head, ``prepared_host``).  A module
+# constant read at CALL time (``compile``), not a knob and not an env var: it
+# must never differ per plan.  Mirrors the host (``prepared_host._dq_launches`` refuses a record that is neither 1 nor the
+# group) through ``_dq_b_head_group``, copied off the rendered record -- ONE source of truth.
+DQ_SINGLE_LAUNCH: bool = True
+# Stage-3 causal K-trim under THD.  True = the packed stage 3 renders the same per-sequence trim the dense path renders
+# (``causal_mode`` LO / HI with the diagonal edge; bottom-right's per-sequence diagonal ``S_kv[b] - S_q[b]`` read by the
+# kernel from the setup launch's metadata, ``MatmulTemplateParams.thd_causal_bottom_right``) -- what ships.  False = the
+# untrimmed rendering this chain used before (``CAUSAL_K_NONE``: every k tile of the group read, masked ones included --
+# measured -20 % whole-backward on the dense path with the trim forced off): the bitwise pin's twin and the A/B base.  A
+# THD graph with a sliding window or a right-band widening keeps the untrimmed rendering either way (the window edge is
+# not taken under THD on this chain: the template's THD arm offers it for the kv-blocked cc 10.7 d256 chain, its
+# per-sequence bound has not been validated on the Q-major (512, 512) rows; and that arm takes no constant shift).
+# The whole-workspace zero-fill stays in both cases (the 512-row cluster M tile straddles two 256-row stage-2 blocks, so
+# the fill is the correctness and the trim the optimization, exactly as on the dense path).  A module constant read at
+# CALL time (``compile``), not a knob and not an env var: it must never differ per plan.
+THD_STAGE3_TRIM: bool = True
 _SM100_MATMUL_FILE = "bprop_matmul_blackwell.py"
+# The Rubin line as ``engines._RUBIN`` spells it (cc 10.7 up to the SM100 line's end): the 2x2 twin's ring levers
+# (8 chunk stages / 2 cast stages / 325 KiB) follow the line, not the one cc that exists today.
+_RUBIN_SM = (107, 119)
+
+
+def _rubin_line(sm: int) -> bool:
+    """True for a device on the Rubin line (``major * 10 + minor`` in ``_RUBIN_SM``)."""
+    return _RUBIN_SM[0] <= sm <= _RUBIN_SM[1]
+
+
 # Workspace budget for S + dS. Above this the head chunk shrinks; the loop then
 # runs more launches over the same total work (plan section 5).
 _SM100_WS_BUDGET_BYTES = 4 << 30
+# THD: the blocked workspace pads every sequence's block to _SM100_WS_BLOCK_ROWS
+# rows, so an equal-length packed plan carries B * 128 more rows per head than
+# the dense plan of the same lengths -- enough to tip the divisor rule at the
+# budget edge (B=1 or B=4 at S=8192: 16 -> 8 heads per chunk, twice the
+# launches for the same work; B=4 S=2048: 64 -> 32).  The budget is therefore
+# charged on the TOKEN rows (the dense plan's row count at equal lengths), and
+# the padding may carry the slab past it by at most budget / this (512 MiB):
+# parity with the dense chunk for equal lengths S >= 1024 (pad fraction
+# 128 / S <= 1/8); beyond that -- many short sequences against a long kv -- the
+# padded slab is charged in full, as before.  `scratch_workspace_bytes` is
+# computed from the chosen chunk either way, so the request stays honest
+# (Rule 8).
+_SM100_WS_THD_PAD_SLACK = 8
+
+# Stage-3 cluster tile by sequence length AND compute capability (`MatmulTemplateParams.cgrp_tile_mn`, the template's
+# `_TILE_ROWS`).  The (512, 512) row (cluster 2x2, A multicast to two pairs, one 512-column accumulator) co-resides 34 four-CTA
+# clusters on the B200 (136 of 148 SMs, `launch__cluster_max_active`); the (512, 256) row (cluster 2x1, the same per-pair
+# 512x256 work and k walk, A read once per N tile instead of multicast) co-resides 74 and keeps every SM busy, and the two are
+# BITWISE twins (`test_stage3_small_s_tile_is_bitwise_the_wide_row`).  MEASURED (B200, 1155 MHz SW power cap, cuDNN 9.26.0.51,
+# DSL 4.7.0, 2026-10-01; in-process round-robin A/B, every arm built once and bitwise-checked, 3 rounds of CUPTI per-event
+# medians per slot, NVML clock sampled, CLEAN slots only): the 2x1 row's residency + wave gain carries where the GEMM is MMA-bound
+# at the full clock -- dense S2K dV/dK/dQ 523/527/525 -> 465/464/464 us (-11.5 %, 84.5 % of peak), dense S4K 1959/1968/1964 ->
+# 1737/1735/1734 us (-11.6 %, 90.5 % of peak), causal S2K 359/363/363 -> 337/340/339 us (-6.4 %), causal S4K 1191/1204/1200 ->
+# 1122/1132/1142 us (-5.6 %), whole backward -4.6 % dense / -2.0..-2.2 % causal; each of these four cells reproduced in THREE
+# CLEAN slots (medians of the per-slot stage-3 deltas -11.2 / -11.2 / -6.4 / -5.9 % for dense S2K / S4K / causal S2K / S4K,
+# every slot within 0.4 % of its cell's median, stage 2 within +-0.2 %) -- and does NOT at S8K (dense +0.1..+0.8 % on
+# stage 3: the row's second DRAM read of A turns a -12 % at base clock into a wash at 1155 MHz; causal +7.5 %, dQ +11.2 %) nor
+# at S32K (dense +24 %, causal +32 %: the 148-SM row drags the power-capped clock of the whole chain), and behind it at S8K the
+# UNCHANGED stage 2 ran +13-15 % slower in three CLEAN slots (mechanism open; absent at S4K, the only chunk boundary the rule
+# serves: stage 2 +0.2 %).  Hence the row is keyed on the PADDED sequence length: (512, 256) up to
+# `_SM100_STAGE3_SMALL_S_MAX`, the (512, 512) row above.  The key is max(S_q_pad, S_kv_pad), not S_kv alone: dV / dK walk K = S_q
+# and dQ walks K = S_kv, every cell had S_q = S_kv, and the memory-side term that undoes the gain grows with the k walk -- a
+# rectangular backward (S_q 32K, S_kv 2K) is unmeasured and takes the shipped row.  S in (4096, 8192) is unmeasured too and
+# takes the shipped row.  The rule is mask-blind by measurement (dense and causal move in the same direction at every S).
+# BSHD only: the THD leg was validated on the (512, 512) row alone.  The causal zero-fill / loose trim apply to both rows alike
+# (neither is causal-tight at 512 M rows, `_causal_k_range`).  COMPUTE CAPABILITY: cc 10.0..10.6 only -- every number above is
+# the B200's (148 SMs, 34 vs 74 resident clusters at 231 KiB/CTA; none of it transfers to another SM count or SMEM carveout),
+# and the cc 10.7 d512 row inherits this `compile`, so it must keep the (512, 512) row until it is measured on its own board.
+# Module constants read at compile time, never knobs or env vars.
+_SM100_STAGE3_SMALL_S_TILE = (512, 256)
+_SM100_STAGE3_SMALL_S_MAX = 4096
+_SM100_STAGE3_SMALL_S_CC = (100, 106)  # inclusive cc range (major * 10 + minor) the (512, 256) row was measured on
+
+
+def _sm100_stage3_cgrp_tile_mn(s_pad: int, thd: bool, cc: tuple) -> tuple:
+    """The stage-3 cluster tile for a backward at this padded max(S_q, S_kv) on a device of compute capability ``cc``
+    (a ``(major, minor)`` pair, the chain's `compute_capability(resolve_device(...))`); see `_SM100_STAGE3_SMALL_S_TILE`.
+    (512, 256) for BSHD at ``s_pad <= _SM100_STAGE3_SMALL_S_MAX`` on cc 10.0..10.6; (512, 512) for every other cc, for THD
+    and for longer sequences.  Mask-blind on purpose (see the constant's comment)."""
+    major, minor = cc
+    lo, hi = _SM100_STAGE3_SMALL_S_CC
+    if lo <= major * 10 + minor <= hi and not thd and s_pad <= _SM100_STAGE3_SMALL_S_MAX:
+        return _SM100_STAGE3_SMALL_S_TILE
+    return (512, 512)
 
 
 def _sm100_kernel_path(fname: str) -> str:
@@ -1793,18 +1894,28 @@ def _sm100_device_clusters(device, cga_m: int) -> int:
     return max(1, _dev.multiprocessor_count(idx) // cga_m)
 
 
-def _sm100_head_chunk_thd(h_q: int, ws_rows: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1) -> int:
+def _sm100_head_chunk_thd(
+    h_q: int, ws_rows: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1, t_rows: Optional[int] = None
+) -> int:
     """``_sm100_head_chunk`` for the BLOCKED workspace.
 
     Same divisor rule, but a head's slab is ``ws_rows * s_kv`` -- packed q
     tokens rather than ``B * S_q_max``, which is where THD's memory win is.
+
+    ``t_rows`` is the packed token capacity (``ws_rows`` minus the block
+    padding).  Given, the budget is charged on it, so an equal-length packed
+    plan gets the dense plan's chunk, and the padded slab may exceed the budget
+    by at most ``budget // _SM100_WS_THD_PAD_SLACK`` (see the constant).
+    Without it the slab is charged in full -- the original rule.
     """
     per_head = 2 * ws_rows * s_kv * bpe
-    cands = [c for c in range(1, h_q + 1) if h_q % c == 0 and c % group == 0]
+    per_head_tokens = per_head if t_rows is None else 2 * min(t_rows, ws_rows) * s_kv * bpe
+    slack = 0 if t_rows is None else budget // _SM100_WS_THD_PAD_SLACK
+    cands = [c for c in range(1, h_q + 1) if h_q % c == 0]
     for c in sorted(cands, reverse=True):
-        if per_head * c <= budget:
+        if per_head_tokens * c <= budget and per_head * c <= budget + slack:
             return c
-    return group
+    return 1
 
 
 def _sm100_head_chunk(b: int, h_q: int, s_q: int, s_kv: int, bpe: int, budget: int = _SM100_WS_BUDGET_BYTES, group: int = 1) -> int:
@@ -1816,13 +1927,15 @@ def _sm100_head_chunk(b: int, h_q: int, s_q: int, s_kv: int, bpe: int, budget: i
     head needs and the size is still honest.
     """
     per_head = 2 * b * s_q * s_kv * bpe
-    # Under GQA the chunk must also be a MULTIPLE OF THE GROUP, so a chunk's Q
-    # heads map onto whole KV heads and the dQ group-slice below stays exact.
-    cands = [c for c in range(1, h_q + 1) if h_q % c == 0 and c % group == 0]
+    # A GQA group may span several chunks: stage 2 maps each global Q head to
+    # its KV head, dK/dV keep one partial per Q head, and the prepared host's
+    # dQ handles non-group-aligned chunks head by head. Requiring whole groups
+    # would break the budget for long-context GQA models (Gemma 4: Hq=16, Hkv=2).
+    cands = [c for c in range(1, h_q + 1) if h_q % c == 0]
     for c in sorted(cands, reverse=True):
         if per_head * c <= budget:
             return c
-    return group
+    return 1
 
 
 class SdpaBwdDslSm100(SdpaBwdDsl):
@@ -1914,6 +2027,10 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         # (MHA) skips both the partial buffers and the reduce entirely.
         self._gqa_group = self.h_q // self.h_kv
         self._qh_chunk = _sm100_head_chunk(self.batch_size, self.h_q, self._sq_pad, self._skv_pad, self._bpe, group=self._gqa_group)
+        # The dQ rendering's B head group (`MatmulTemplateParams.b_head_group`), copied off the record `compile()` builds
+        # so the prepared host launches exactly what was rendered (`prepared_host.host` -> `_dq_launches`): 1 = one dQ
+        # launch per GQA group member (and MHA, and THD), the group = one launch per chunk (`DQ_SINGLE_LAUNCH`).
+        self._dq_b_head_group = 1
         # THD overrides both the workspace shape and the chunk below.
         if self.thd:
             # PACKED [1, T, H, D]: the declared shapes carry the ENVELOPE
@@ -1928,7 +2045,9 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             self._ws_rows_cap = -(-self._ws_rows_cap // _SM100_WS_BLOCK_ROWS) * _SM100_WS_BLOCK_ROWS
             # The head chunk now divides a per-head slab measured in packed rows
             # rather than B * S_max^2 -- the whole point of the blocked layout.
-            self._qh_chunk = _sm100_head_chunk_thd(self.h_q, self._ws_rows_cap, self._skv_pad, self._bpe, group=self._gqa_group)
+            # The budget is charged on the token rows (`t_rows`), so equal
+            # lengths get the dense plan's chunk (see _SM100_WS_THD_PAD_SLACK).
+            self._qh_chunk = _sm100_head_chunk_thd(self.h_q, self._ws_rows_cap, self._skv_pad, self._bpe, group=self._gqa_group, t_rows=self._t_q_cap)
         # Retain the grandfathered dense conversion fallback for layouts that
         # cannot use the native TMA pointer host. It stages compact BSHD buffers
         # from caller workspace, decided here from the declarations. Native
@@ -2053,7 +2172,50 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             total += 2 * ws_align(_kv_rows * self.h_q * self.head_dim_qk * self._bpe)
         return total
 
+    # --- stage-2 template selection -------------------------------------------
+    # The row's name: the spec's, the prepared artifact's symbol (``frost_<name>_prepared``, Rule 6) and the launch
+    # spec's.  A subclass that is its own engine row (the cc 10.7 d512 row, ``api_dsl_sm107_d512``) overrides it.
+    _NAME = "sdpa_bwd_sm100"
+    # The template-module cache tag of this row's stage-2 rendering (``load_template``): one per row, because the tag
+    # keys the cache and the test fixtures spy on it to learn which stage-2 FILE served a plan.
+    _STAGE2_TAG = "sdpa_bwd_sm100_stage2"
+
+    def _stage2_file(self) -> str:
+        """The stage-2 kernel FILE this row renders (relative to ``kernels/``): the 4x1 role split unless the module
+        constant ``STAGE2_2X2`` selects the twin.  A subclass pins its own file here."""
+        return _SM100_STAGE2_FILE_2X2 if STAGE2_2X2 else _SM100_STAGE2_FILE
+
+    def _stage2_record(self, stage2_fields: dict):
+        """The stage-2 template record for ``stage2_fields`` (dtype / mask / THD) on this row and device.
+
+        The 4x1 role split takes the base ``TemplateParams`` exactly as it always did (its PTX md5 is pinned).  The 2x2
+        twin's ring levers follow the device's SMEM: 4 chunk stages / 1 cast stage fit SM100's 227 KiB, 8 / 2 fill the
+        Rubin line's 325 KiB (``_rubin_line``).  The ``TemplateParams2x2`` record is built only on the twin path, so the
+        base record (and its digest) is untouched.  A subclass that always renders one arm overrides this."""
+        from cudnn.sdpa.bwd.config_sm100 import TemplateParams
+
+        if not STAGE2_2X2:
+            return TemplateParams(**stage2_fields)
+        from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2, TemplateParams2x2
+
+        _major, _minor = self._device_cc()
+        _rubin = _rubin_line(_major * 10 + _minor)
+        return TemplateParams2x2(
+            **stage2_fields,
+            stages_kv=8 if _rubin else 4,
+            cast_stages=2 if _rubin else 1,
+            **({"smem_cap_bytes": SM107_USABLE_DYN_SMEM_2X2} if _rubin else {}),
+        )
+
     # --- compilation ---------------------------------------------------------
+    def _device_cc(self) -> tuple:
+        """``(major, minor)`` of the device Q lives on, resolved like the prepared host resolves its ``--gpu-arch``
+        (`prepared_sm100`: `compute_capability(resolve_device(q.device))`).  One seam, so a test can fake the cc the
+        plan-time rules see (`_sm100_stage3_cgrp_tile_mn`, the stage-2 datapath levers) without faking the host's target."""
+        from cudnn.frost.device import compute_capability, resolve_device
+
+        return tuple(compute_capability(resolve_device(self.q_desc.device)))
+
     def compile(self) -> None:
         """Plan-time JIT for the whole chain: stage 2's specialized module plus
         the two stage-3 GEMM specializations (dV/dK share one; dQ needs the other
@@ -2068,23 +2230,24 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
             CAUSAL_K_LO,
             CAUSAL_K_NONE,
             MatmulTemplateParams,
-            TemplateParams,
             vec_bytes_epi_for,
         )
 
         dtype_code = DTYPE_BF16 if self.dtype == torch.bfloat16 else DTYPE_FP16
-        stage2_mod = load_template(
-            _sm100_kernel_path(_SM100_STAGE2_FILE),
-            TemplateParams(
-                dtype_qkv=dtype_code,
-                window_right=(self.window_size_right if self.window_size_right is not None else 0) if self.is_causal else None,
-                window_left=self.window_size_left,
-                bottom_right=self.causal_bottom_right,
-                thd_varlen=self.thd,
-            ),
-            tag="sdpa_bwd_sm100_stage2",
+        stage2_fields = dict(
+            dtype_qkv=dtype_code,
+            window_right=(self.window_size_right if self.window_size_right is not None else 0) if self.is_causal else None,
+            window_left=self.window_size_left,
+            bottom_right=self.causal_bottom_right,
+            thd_varlen=self.thd,
         )
-        gran = stage2_mod.CFG.TILE_M * stage2_mod.CFG.CTA_MMA
+        # The device's compute capability, resolved once per compile (the stage-3 tile rule keys on it; the stage-2
+        # record selection resolves it again inside _stage2_record, the cc 10.7 row's seam).
+        cc = self._device_cc()
+        stage2_mod = load_template(_sm100_kernel_path(self._stage2_file()), self._stage2_record(stage2_fields), tag=self._STAGE2_TAG)
+        # Stage 2's write block = the cluster's q span: 256 on both datapaths (the 2x2 config spells it out; the 4x1
+        # config's TILE_M * CTA_MMA is the same number, read through the default).
+        gran = getattr(stage2_mod.CFG, "CLUSTER_Q_ROWS", stage2_mod.CFG.TILE_M * stage2_mod.CFG.CTA_MMA)
         lo = CAUSAL_K_LO if self.is_causal else CAUSAL_K_NONE
         hi = CAUSAL_K_HI if self.is_causal else CAUSAL_K_NONE
         vec = vec_bytes_epi_for(self.head_dim_qk, self._bpe)
@@ -2108,30 +2271,50 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
         #      block (`gran`, 256), so a per-tile K range cannot exclude the
         #      skipped region at all -- the zero-fill, not the trim, is what
         #      makes the causal path correct. See `_causal_k_range`.
-        #   3. under THD the trim is switched off outright (below), so stage 3
-        #      reads EVERY k tile of the group, skipped ones included.
+        #   3. under THD with a sliding window the trim is switched off outright
+        #      (below), so stage 3 reads EVERY k tile of the group, skipped ones
+        #      included.
         self._zero_ws = self.is_causal
-        # THD renders stage 3 UNTRIMMED, causal or not.  Every bound in
-        # `_causal_k_range` is an ABSOLUTE workspace row, and the blocked layout
-        # renumbers rows per sequence: `m0` arrives block-relative while
-        # `causal_shift` -- a host scalar built from `s_k_max - s_q_max` -- is a
-        # per-sequence quantity a template constant cannot hold.  Since the trim
-        # carries no correctness at the 2x2 cluster config (reason 2 above), the
-        # packed path simply drops it and pays the k-tiles causal would have
-        # skipped; `validate_matmul_params` refuses the combination so this stays
-        # the only way it can be spelled.  Making the trim per-sequence is an
-        # OPTIMIZATION, and a WORTHWHILE one: A/B/A on the dense path with the
-        # trim forced off (this exact code shape) measured -20 % on the whole
-        # backward at B=1 H=128 S=8192 d=512 bf16 causal, ~259 -> ~207 TFLOPS,
-        # every round.  The cost scales with sequence length, so a packed
-        # workload of short sequences pays much less.  Re-trimming needs
-        # `row_off[b]` folded into the bounds and the bottom-right diagonal
-        # threaded per group instead of as the host scalar `shift`.
+        # THD: the trim is PER SEQUENCE, and the same arithmetic as the dense
+        # path's.  Every bound in `_causal_k_range` is a sequence-relative row
+        # once the kernel hands it the tile's M base inside its sequence and the
+        # sequence's own k count (which it already did, `_thd_group`; the blocked
+        # row offset and the packed token base are added to the TMA coordinates
+        # after the range is chosen), and stage 2's THD unit masks a 256-row q
+        # tile of one sequence with that sequence's lengths -- so the written
+        # band per sequence is the dense band with the sequence's diagonal.  The
+        # constant part of the shift (the right-band widening) stays a template
+        # constant; the bottom-right part `S_kv[b] - S_q[b]` is a per-sequence
+        # quantity the kernel reads from the setup launch's metadata
+        # (`MatmulTemplateParams.thd_causal_bottom_right`; the template's THD
+        # arm `_thd_causal_k_range`, which also keeps an EMPTY range for a tile
+        # with no kept cell and stores zeros there).  Measured on the dense
+        # path with the trim forced off (the untrimmed twin's exact code shape):
+        # -20 % on the whole backward at B=1 H=128 S=8192 d=512 bf16 causal,
+        # ~259 -> ~207 TFLOPS, every round; the cost scales with sequence length,
+        # so a packed workload of short sequences pays less.  The window edge is
+        # not taken under THD on this chain (the template offers it for the
+        # kv-blocked cc 10.7 d256 chain; its per-sequence bound has not been
+        # validated on the Q-major (512, 512) rows), and the THD arm takes no
+        # CONSTANT shift (the right-band widening), so a windowed or right-band
+        # packed graph renders UNTRIMMED and pays the k tiles the band skipped.
+        # `THD_STAGE3_TRIM = False` is the
+        # untrimmed twin for every packed causal graph (the bitwise pin).
+        per_seq = False
         if self.thd:
-            lo = hi = CAUSAL_K_NONE
-            shift = 0
+            windowed = self.window_size_left is not None
+            right_band = bool(self.window_size_right)
+            if self.is_causal and THD_STAGE3_TRIM and not windowed and not right_band:
+                shift = 0  # the THD arm takes no constant shift: the diagonal offset is per sequence (thd_causal_bottom_right)
+                per_seq = bool(self.causal_bottom_right)
+            else:
+                lo = hi = CAUSAL_K_NONE
+                shift = 0
         # dtype_qkv must match stage 2's: stage 3 reads the S/dS workspace stage
         # 2 wrote, and stores the gradients in the graph's io dtype.
+        # The cluster tile by padded max(S_q, S_kv) and device cc (`_sm100_stage3_cgrp_tile_mn`): the (512, 256) row on short
+        # BSHD sequences of the SM100 line, the (512, 512) row otherwise -- bitwise twins, so this is a timing choice only.
+        tile = _sm100_stage3_cgrp_tile_mn(max(self._sq_pad, self._skv_pad), self.thd, cc)
         mm_lo = load_template(
             _sm100_kernel_path(_SM100_MATMUL_FILE),
             MatmulTemplateParams(
@@ -2143,23 +2326,34 @@ class SdpaBwdDslSm100(SdpaBwdDsl):
                 vec_bytes_epi=vec,
                 dtype_qkv=dtype_code,
                 thd_varlen=self.thd,
+                thd_causal_bottom_right=per_seq,
+                cgrp_tile_mn=tile,
             ),
             tag="sdpa_bwd_sm100_mm_lo",
         )
-        mm_hi = load_template(
-            _sm100_kernel_path(_SM100_MATMUL_FILE),
-            MatmulTemplateParams(
-                a_is_m_major=False,
-                b_is_n_major=True,
-                causal_mode=hi,
-                causal_gran=gran,
-                causal_shift=shift,
-                vec_bytes_epi=vec,
-                dtype_qkv=dtype_code,
-                thd_varlen=self.thd,
-            ),
-            tag="sdpa_bwd_sm100_mm_hi",
+        # dQ = dS . K under GQA: ONE launch per head chunk when the rendering indexes B = K by `h // group` itself
+        # (`b_head_group = group`, DQ_SINGLE_LAUNCH), else one launch per group member (`b_head_group = 1`).  THD keeps
+        # the per-member loop (this chain's packed dQ host launches per member), and so does a head chunk that is not a
+        # whole number of groups (`_sm100_head_chunk` hands out any divisor of H_q under the budget; the host then maps
+        # each Q head to its own KV head, so the record must say 1 there).
+        # The dense (512, 512) rendering is byte-identical at 1 (every use of the field folds out; the PTX md5 pins).
+        p_hi = MatmulTemplateParams(
+            a_is_m_major=False,
+            b_is_n_major=True,
+            causal_mode=hi,
+            causal_gran=gran,
+            causal_shift=shift,
+            vec_bytes_epi=vec,
+            dtype_qkv=dtype_code,
+            thd_varlen=self.thd,
+            b_head_group=self._gqa_group if (DQ_SINGLE_LAUNCH and self._gqa_group > 1 and not self.thd and self._qh_chunk % self._gqa_group == 0) else 1,
+            thd_causal_bottom_right=per_seq,
+            cgrp_tile_mn=tile,
         )
+        # The host launches dQ the way its rendering indexes B: ONE source of truth, the record (`prepared_host._dq_launches`
+        # refuses a value that is neither 1 nor the group).
+        self._dq_b_head_group = int(p_hi.b_head_group)
+        mm_hi = load_template(_sm100_kernel_path(_SM100_MATMUL_FILE), p_hi, tag="sdpa_bwd_sm100_mm_hi")
         if self._prepared_native:
             from .prepared_sm100 import compile_plan
 

@@ -644,7 +644,9 @@ class PyGraph {
                       cudnn_frontend::DataType_t const& compute_data_type,
                       std::string const& name,
                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+                      std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                      py::object const& max_total_seq_len_q,
+                      py::object const& max_total_seq_len_kv);
 
     // MXFP8 SDPA backward - uses block-wise scale factors (E8M0 with F8_128x4 reordering)
     // return [dQ, dK, dV, amax_dQ, amax_dK, amax_dV]
@@ -681,7 +683,9 @@ class PyGraph {
                         cudnn_frontend::DataType_t const& compute_data_type,
                         std::string const& name,
                         std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token);
+                        std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                        py::object const& max_total_seq_len_q,
+                        py::object const& max_total_seq_len_kv);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& token,
@@ -692,7 +696,8 @@ class PyGraph {
                        cudnn_frontend::MoeGroupedMatmulMode_t const& mode,
                        cudnn_frontend::DataType_t const& compute_data_type,
                        int32_t const& top_k,
-                       std::string const& name);
+                       std::string const& name,
+                       std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> top_k_scores);
 
     std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     moe_grouped_matmul_bwd(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& doutput,
@@ -797,6 +802,18 @@ class PyGraph {
 
     void
     execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index);
+
+    py::object
+    execute_ordered(py::handle schema,
+                    py::handle buffers,
+                    py::handle tensor_uids,
+                    const py::dict& auto_bindings,
+                    py::handle workspace,
+                    py::handle override_uids,
+                    py::handle override_shapes,
+                    py::handle override_strides,
+                    std::intptr_t exec_handle,
+                    int64_t plan_index);
 
     std::vector<BehaviorNote_t>
     get_behavior_notes();

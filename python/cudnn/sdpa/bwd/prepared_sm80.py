@@ -140,7 +140,16 @@ def build_spec(api, d64_module, *, staged=False):
         raise NotImplementedError("SM80 backward requires a positional tvm-ffi entry")
     fn = partial(fn, api._t_q_cap if api.thd else 0, api._t_kv_cap if api.thd else 0, *launch_bounds(api))
     return BwdLaunchSpec(
-        artifact, fn, tuple(operands), workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax, "sdpa_bwd_sm80", length_form=True, roles=roles
+        artifact,
+        fn,
+        tuple(operands),
+        workspace_bytes,
+        int(api.q_desc.device.index or 0),
+        api.scale_softmax,
+        "sdpa_bwd_sm80",
+        length_form=True,
+        roles=roles,
+        native_binding=True,
     )
 
 

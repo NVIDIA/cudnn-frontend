@@ -1,5 +1,7 @@
 # Python-native `cudnn.pygraph` and pluggable execution backends
 
+> Execute-time shape overrides (`override_uids` / `override_shapes` / `override_strides`) are passed directly to native backend plans. Python engines whose compiled plan has `takes_variant_pack=True` receive the normalized override geometry in their `VariantPack`; legacy map-based Python engines reject these overrides before execution. Each engine determines which geometries it supports. See [Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
+
 ## What this is
 
 `cudnn.pygraph` is a Python-native graph class: graph structure (nodes,
@@ -358,7 +360,8 @@ are close.
   adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
   op pattern), so it inherits whatever engine the planner selects. The
   optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
-  rows; `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
+  rows (`x * rsqrt(sum(x * x) + 1e-6)`, forward and backward Jacobian);
+  `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
   `gdn_bwd` on the FROST chunked kernels) serves it through a workspace
   helper kernel (normalized q/k copies + saved inverse norms, with the
   backward Jacobian projection applied in place after the head-group fold),
@@ -441,8 +444,10 @@ are close.
   uneven batch walks the same critical path as an even one (when the
   per-sequence ceilings would overflow the wave the span is recomputed against
   `B * P - (B - 1)` slots). `warmup` (the decay-warmup split-K of
-  `frost/common/split_k.py`) serves the band where the chain has no room, and
-  `uncut` runs one item per (sequence, head). Under
+  `frost/common/split_k.py`) serves the band where the chain has no room for
+  the scalar-gate ops (GDN, GDP); KDA and GDN-2 run that band `uncut`, one
+  item per (sequence, head), because their channel-mixing transition
+  `(I - beta k k^T) Diag(alpha)` admits no gate-only decay bound. Under
   `batch_invariant` the geometry comes from the length rule alone, `P =
   clamp(ceil(total / 8192), 1, 16)` slots per sequence, of which each fills
   `clamp(ceil(len / 8192), 1, P)` on device, `uncut` when `total <= 8192`
@@ -600,6 +605,14 @@ record to the graph; engines read that record back rather than parsing again.
   `has_bias=True` as a fact, never an error; each engine's `Capabilities` row
   does the rejecting in `mismatch()`. A shared parser that starts rejecting
   becomes an if-ladder that must know every kernel.
+- **Caller hints are facts too.** `cudnn.pygraph(..., is_cuda_graph_replay_expected=True)`
+  (keyword-only; `cudnn.graph(...)` forwards it) states that the caller will
+  capture `graph.execute` into a CUDA graph and replay it. The SDPA analyzer
+  records it as `cuda_graph_replay`, and a family's heuristics may then lead
+  with the plan that is fastest on the GPU alone, since per-execute host costs
+  are paid once at capture (the SDPA forward d256 decode tile leads with its
+  split-KV plan instead of listing it as the runner-up). The hint changes no
+  numerics and no support, and it is never forwarded to the backend.
 - **Framework-neutral vocabulary**: `cudnn.data_type`, not `torch.dtype`;
   device from `cudnn.create_device_properties()`, the backend's own descriptor.
   Facts are what every engine of a family reads, so expressing them in one
@@ -740,10 +753,12 @@ only to decline is why `closed_under` existed.
   bug: the record would replay a different kernel after the pick changes.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
-  (`softmax_precision`) is an **op attribute** declared in the op spec's
-  `python_only_attrs`: never forwarded to C++, a SET value makes the node
-  backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
-  a graph fact the capability rows gate on.
+  (`softmax_precision`) or a contract on the inputs (`attn_scale_prefolded`:
+  Q already carries the softmax scale) is an **op attribute** declared in the
+  op spec's `python_only_attrs`: never forwarded to C++, a SET value (a bool
+  attribute set to `False` counts as unset) makes the node backend-unlowerable
+  (`serialize()` and `key()` refuse it), and it surfaces as a graph fact the
+  capability rows gate on.
 
 ### One kernel per layout class, not per shape (SDPA THD)
 
@@ -838,11 +853,27 @@ artifact can never be reused by accident:
   next start-up. Kernels whose in-process object converts raw pointer
   arguments, takes a dataclass argument, or has a default JSON cannot carry
   are not persisted.
+- **One object per kernel per process.** In front of the files sits an
+  in-process memo keyed by the device a build targets, the live CUDA device the
+  compile is issued under (the DSL ties a compiled object's executor to a device
+  context; the two agree unless a handle scoped the build to another GPU), the
+  key, the symbol and the compile options: a second plan over the same
+  kernel in the same process gets the object the first plan got — no trace, no
+  compile, no file touched — whatever the on-disk cache's state. A graph that
+  builds several plans over one kernel, or a test suite that builds one block
+  instance per case, otherwise pays a full JIT per plan (`cute.compile` has no
+  memo of its own; with the on-disk cache off, the gated-attention-block
+  backward suite -- 109 cases -- went from 855 s to 261 s and from 730 to 100
+  compiles on a Rubin development part). A kernel without a key is never
+  memoised; a failed compile is not memoised; `clear_memo()` forgets the
+  objects.
+  `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` turns the memo off — for a
+  test that exercises the reload path itself, or an A/B of the memo.
 - Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
-  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned
-  per process. Bump `_SCHEMA` on any incompatible change.
+  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned /
+  memo_hits per process. Bump `_SCHEMA` on any incompatible change.
 - **Dead environments are retired.** The manifest hashes the package's source,
   so every edited checkout and every CI commit mints an environment directory
   that will never be hit again — a few hundred MB per commit on a runner with a

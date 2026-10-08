@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Prepared FP8 launches rebind device scales and storage through the public graph API."""
 
+import sdpa_binding_reference as binding_reference
+
 import math
 from contextlib import contextmanager
 
@@ -138,8 +140,19 @@ def _case(
         from dataclasses import replace
 
         knobs = replace(chosen.knobs, split_kv=split_kv, sched_policy=0)
-        if arch == "sm100" and (d, dv) == (192, 128) and split_kv > 1:
-            knobs = replace(knobs, cga=2)
+        if split_kv > 1:
+            # The auto plan copied above may run its dense unsplit leg at a CGA
+            # width the split leg does not build at (the SM100 d128 and d192x128
+            # FP8 split legs are cga2-only).  Ask the engine for the split leg's
+            # domain of the flavor this graph lands on -- its exact shape or its
+            # envelope -- instead of listing shapes here.
+            from cudnn.sdpa import graph_analyzer as ga
+            from cudnn.sdpa.fwd import engines
+
+            spec = next(s for s in engines.ENGINE_SPECS if s.name == engine_name(arch=arch, fp8=True))
+            domain = engines.effective_cgas(spec.capabilities, g._facts_for(ga.analyze), split_kv)
+            if domain and knobs.cga not in domain:
+                knobs = replace(knobs, cga=min(domain))
         g.create_execution_plan(chosen.engine_id, knobs)
         g.select_plan(len(g.plans) - 1)
     assert (g.plans[g._plan_index].knobs.split_kv or 1) == split_kv
@@ -291,6 +304,8 @@ def test_prepared_fp8_bounded_batch_override(thd, monkeypatch, d, dv):
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("an override must reuse the artifact"))
     if not thd and plan._prepared.spec.lpt_grid_fixed:
         monkeypatch.setattr(plan._prepared.spec, "fn", lambda *a: pytest.fail("invalid override must not launch"))
+        if plan._prepared.spec.native is not None:
+            monkeypatch.setattr(plan._prepared.spec, "native", cudnn._pybind_module._SdpaDenseBinder(plan._prepared.spec))
         with pytest.raises(ValueError, match="grouped LPT schedule"):
             g.execute(vp, ws, override_uids=uids, override_shapes=shapes, override_strides=strides)
         return
@@ -318,7 +333,7 @@ def test_prepared_fp8_invalid_scalars_do_not_launch(role, kind, monkeypatch):
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("invalid scalar reached the kernel"))
     monkeypatch.setattr(prep._buffers, "memset_zero_async", lambda *a: pytest.fail("invalid scalar mutated output"))
     with pytest.raises(ValueError, match=role):
-        prep.execute_quantized(spec, facts, ws.data_ptr(), None, 0)
+        binding_reference.execute_quantized(spec, facts, ws.data_ptr(), None, 0)
 
 
 @pytest.mark.parametrize("bare", [False, True])
@@ -332,7 +347,7 @@ def test_prepared_fp8_workspace_overlap_is_rejected(bare, monkeypatch):
         facts["q"] = facts["q"]._replace(span=-1)
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("aliased workspace reached the kernel"))
     with pytest.raises(ValueError, match="workspace overlaps"):
-        prep.execute_quantized(spec, facts, facts["q"].ptr, None, 0)
+        binding_reference.execute_quantized(spec, facts, facts["q"].ptr, None, 0)
 
 
 @pytest.mark.parametrize("thd", [False, True])
@@ -350,6 +365,8 @@ def test_prepared_fp8_graph_and_adapter_bind_the_same_frame(thd, monkeypatch, d,
         return original(*args)
 
     monkeypatch.setattr(prepared.spec, "fn", record)
+    if prepared.spec.native is not None:
+        monkeypatch.setattr(prepared.spec, "native", type(prepared.spec.native)(prepared.spec))
     g.execute(vp, ws)
     _check(bufs, thd=thd)
     plan._prepared, plan.takes_variant_pack = None, False
@@ -462,6 +479,8 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
             vp[tensors[name]] = torch.zeros_like(vp[tensors[name]])
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("empty Q must not launch attention"))
+    if spec.native is not None:
+        monkeypatch.setattr(spec, "native", type(spec.native)(spec))
     bufs["amax_o"].fill_(999)
     g.execute(vp, ws)
     torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))

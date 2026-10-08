@@ -42,12 +42,28 @@ thing the in-process object does -- and the caller cannot tell a hit from a
 miss. Kernels whose in-process object converts raw pointer arguments are not
 cached (the reload path has no converter); everything else is.
 
+In front of the files sits an in-process memo: the object ``compile_cached``
+handed out for a ``(target device, live device, cache_key, symbol, options)`` is
+handed out again for the same key in the same process -- no trace, no compile, no
+file touched, whatever the on-disk cache's state (the two devices: the one the
+build bakes its constants for and the CUDA context it is issued under,
+:func:`_memo_device`; they agree unless a handle scoped the build to another
+GPU). A graph that builds several plans over one kernel, or a test suite that
+builds one block instance per case, otherwise pays a full JIT per plan:
+``cute.compile`` has no memo of its own. The compiled
+object is a stateless callable (a plan already shares one across every
+execute), so one per key per process is what every caller wants; a kernel
+without a key is never memoised. ``clear_memo()`` forgets the objects;
+``stats()["memo_hits"]`` counts the hits.
+
 Location: ``CUDNN_FRONTEND_COMPILED_CACHE`` (a directory), else
 ``$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`` (``~/.cache`` when unset).
 ``CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`` turns the cache off;
 ``CUDNN_FRONTEND_COMPILED_CACHE_MAX_BYTES`` caps the root (4 GiB by default, 0 = never
 prune): a process's first write removes whole dead environment directories,
-oldest first, until the root fits. A caller
+oldest first, until the root fits. ``CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0``
+turns the in-process memo off (a test of the reload path wants every call to
+reach the files; an A/B of the memo itself). A caller
 that manages its own workspace (FlashInfer) points :func:`set_cache_dir` at
 it once per process.
 """
@@ -67,12 +83,13 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 _SCHEMA = "v2"  # v2: the record carries the runtime wrapper spec, not a Python signature
 _ENV_DIR = "CUDNN_FRONTEND_COMPILED_CACHE"
 _ENV_DISABLE = "CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"
 _ENV_MAX_BYTES = "CUDNN_FRONTEND_COMPILED_CACHE_MAX_BYTES"
+_ENV_MEMO = "CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO"
 _DEFAULT_MAX_BYTES = 4 * 1024**3  # every environment the root has seen, together
 _OBJECT = "kernel.o"
 _ENTRY = "entry.json"
@@ -83,8 +100,18 @@ _DIGEST_DIR = re.compile(r"[0-9a-f]{24}")  # ... and of an environment / entry d
 _LOG = logging.getLogger("cudnn.frost.compiled_cache")
 _LOCK = threading.Lock()
 _dir_override: Optional[Path] = None
-_stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0, "pruned": 0}
+_stats = {"hits": 0, "misses": 0, "bypassed": 0, "invalid": 0, "export_failed": 0, "pruned": 0, "memo_hits": 0}
 _pruned_this_process = False
+# The in-process memo: (target device, live device, cache_key, symbol, options) -> the object compile_cached handed out
+# for it in THIS process, whatever the files did (a reloaded artifact or the in-process object); the two devices are
+# _memo_device()'s. Guarded by _LOCK like the counters.
+# Deliberately UNBOUNDED. It holds one entry per distinct kernel the process ever compiled, and each entry is the very
+# object the execution plan that asked for it keeps alive for its whole life, so the memo's footprint is the set of distinct
+# kernels, not the number of plans; only once a caller drops a plan does the memo hold anything the process would not
+# otherwise hold (a compiled object: its cubin and host stub, hundreds of KB), until clear_memo() or exit. An LRU cap
+# would need a reuse pattern to evict by and would reintroduce the full recompile the memo exists to avoid; a caller
+# that mints ever-new keys (a sweep over shapes) pays a compile per key anyway and has clear_memo() as the release valve.
+_MEMO: Dict[tuple, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +122,20 @@ _pruned_this_process = False
 def enabled() -> bool:
     """Whether compiled kernels are persisted and reloaded at all."""
     return os.environ.get(_ENV_DISABLE, "0").strip().lower() not in ("1", "true", "yes", "on")
+
+
+def memo_enabled() -> bool:
+    """Whether a kernel compiled once in this process is handed out again for the same key
+    (the default); ``CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0`` turns that off."""
+    return os.environ.get(_ENV_MEMO, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def clear_memo() -> None:
+    """Forget every compiled object the in-process memo holds. The objects callers already
+    hold stay valid; the next ``compile_cached`` of a forgotten key reaches the files (or the
+    compiler) again."""
+    with _LOCK:
+        _MEMO.clear()
 
 
 def set_cache_dir(path) -> None:
@@ -130,7 +171,8 @@ def get_cache_dir() -> Path:
 
 
 def stats() -> Dict[str, int]:
-    """Counters for this process: hits, misses, bypassed (not cacheable), invalid (entry rejected), export_failed, pruned (environment directories removed)."""
+    """Counters for this process: hits, misses, bypassed (not cacheable), invalid (entry rejected), export_failed, pruned (environment
+    directories removed), memo_hits (served from the in-process memo: neither the files nor the compiler were reached)."""
     with _LOCK:
         return dict(_stats)
 
@@ -545,6 +587,31 @@ def positional_entry(compiled: Any) -> Optional[Any]:
         return None
 
 
+def _memo_device() -> Tuple[Optional[int], Optional[int]]:
+    """The two CUDA ordinals a compile issued now is for, both part of the memo key.
+
+    First the device whose constants the object bakes (``current_device()``: a ``build_device()``
+    scope, else the live device) -- SM count, L2 size, SMEM budget -- which is why the on-disk
+    manifest names the device too. Then the live device itself (``ambient_device()``: the CUDA
+    context the compile is issued under, scope or no scope). The DSL documents a compiled
+    object's executor as tied to the device context it was created in, and an engine that
+    builds under a handle's device scope launches under whatever context is current at execute
+    (gemm, conv): a per-build compile never shared one object between a build issued under
+    context 0 and one issued under context 1, so neither may the memo -- a build scoped to
+    device 1 under context 0 and the same build under context 1 are two objects. For an
+    unscoped build the two ordinals agree. ``None`` for an ordinal no CUDA device answers: one
+    slot, like the manifest's "unknown"."""
+    from cudnn.frost import device as _dev
+
+    def ordinal(query) -> Optional[int]:
+        try:
+            return int(query())
+        except Exception:  # noqa: BLE001 -- no CUDA device visible
+            return None
+
+    return ordinal(_dev.current_device), ordinal(_dev.ambient_device)
+
+
 def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: str = "kernel", **kwargs: Any) -> Any:
     """``cute.compile(fn, *args, **kwargs)`` with a persistent object behind it.
 
@@ -552,11 +619,42 @@ def compile_cached(fn: Callable, *args: Any, cache_key: Optional[str], symbol: s
     of its source); ``None`` means "not cacheable" and compiles as before. The
     compile options must include ``--enable-tvm-ffi`` -- that is what makes the
     object exportable and reloadable; other kernels compile as before.
+
+    A second call with the same ``(cache_key, symbol, options)`` for the same
+    device -- the one the build targets AND the live CUDA device it is issued
+    under, :func:`_memo_device` -- in the same process returns the object the
+    first call returned --
+    whatever that was (the reloaded artifact or the in-process object) and
+    whatever the on-disk cache's state -- without re-tracing and without
+    touching the files (``memo_enabled()``); a key of ``None`` is never memoised.
     """
     import cutlass.cute as cute
 
     options = str(kwargs.get("options") or "")
-    if not enabled() or cache_key is None or "--enable-tvm-ffi" not in options:
+    if cache_key is None:
+        _count("bypassed")
+        return cute.compile(fn, *args, **kwargs)
+    memo_key = (*_memo_device(), cache_key, symbol, options) if memo_enabled() else None
+    if memo_key is not None:
+        with _LOCK:
+            memo = _MEMO.get(memo_key)
+        if memo is not None:
+            _count("memo_hits")
+            return memo
+    compiled = _compile_persistent(fn, args, kwargs, cache_key=cache_key, symbol=symbol, options=options)
+    if memo_key is not None:
+        with _LOCK:
+            # Threads that raced on an empty slot each compiled once; every one of them leaves with the
+            # FIRST object stored, so one key means one object for the rest of the process.
+            compiled = _MEMO.setdefault(memo_key, compiled)
+    return compiled
+
+
+def _compile_persistent(fn: Callable, args: tuple, kwargs: Dict[str, Any], *, cache_key: str, symbol: str, options: str) -> Any:
+    """The files behind :func:`compile_cached`: reload the entry for the key, or compile, export and reload it."""
+    import cutlass.cute as cute
+
+    if not enabled() or "--enable-tvm-ffi" not in options:
         _count("bypassed")
         return cute.compile(fn, *args, **kwargs)
     manifest = environment_manifest()

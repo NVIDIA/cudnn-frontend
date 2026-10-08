@@ -118,7 +118,7 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
+L2_NORM_EPS: float = 1.0e-6
 
 
 class KdaPrefillBars(NamedTuple):
@@ -1207,9 +1207,8 @@ def compute0_warp_group(
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
-                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
+                q_inv_norm = cute.math.rsqrt(q_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+                k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
 
             # ---- decay/restore operands: exp2(+-g) applied per key channel -----------
             exp_g_regs = cutlass.Array(cutlass.Float32, dk_halves * 8, alignment=16)
@@ -2196,25 +2195,20 @@ def build_descs_body(
     desc_checkpoint_arr = cute.make_tensor(desc_workspace.iterator + 5 * arr_words, cute.make_layout((arr_words,), stride=(1,)))
 
     if widx == 0:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_q, desc_q_arr, cu_seqlens, q, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_q, desc_q_arr, cu_seqlens, q, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 1:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_k, desc_k_arr, cu_seqlens, k, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 2:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_v, desc_v_arr, cu_seqlens, v, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 3:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_gate, desc_gate_arr, cu_seqlens, gate, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_gate, desc_gate_arr, cu_seqlens, gate, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if widx == 4:
-        if nvvm.elect_sync():
-            emit_seq_descs(base_o, desc_o_arr, cu_seqlens, o, n_batch, 2)
-            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+        emit_seq_descs(base_o, desc_o_arr, cu_seqlens, o, n_batch, 2, lanes=32)
+        nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if cutlass.const_expr(state_checkpoints is not None):
         if widx == 5:
             if nvvm.elect_sync():
@@ -2224,7 +2218,6 @@ def build_descs_body(
 
 @cute.kernel
 def frost_kda_prefill_prologue(
-    order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     num_ctas: cutlass.Constexpr[int],
     tiles_per_head: cutlass.Constexpr[int],
@@ -2242,16 +2235,15 @@ def frost_kda_prefill_prologue(
     gate: cute.Tensor,
     o: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
-    mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor,
     mScheduler: cute.Tensor,
     n_batch: cutlass.Int32,
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
-    """Two-CTA prologue: block 0 LPT-orders the work-item table and zeroes the
-    scheduler rings via :func:`order_body`, block 1 builds the per-batch
-    TMA-descriptor arrays via :func:`build_descs_body`, one warp per array."""
+    """Two-CTA prologue: block 0 synthesizes the uncut work-item table (one item per sequence and head, longest first)
+    and zeroes the scheduler rings via :func:`order_body`, block 1 builds the per-batch TMA-descriptor arrays via
+    :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
         launch_dependent_grids()
@@ -2267,7 +2259,7 @@ def frost_kda_prefill_prologue(
         n_heads_out = n_heads_out * cutlass.Int32(tiles_per_head)
     if bidx == cutlass.Int32(0):
         order_body(
-            order_gen,
+            True,
             b_t,
             ORDER_THREADS,
             ORDER_ELEMENTS,
@@ -2275,7 +2267,7 @@ def frost_kda_prefill_prologue(
             n_heads_out,
             n_heads_out * n_batch,
             cu_seqlens,
-            mStaging,
+            None,
             mCount,
             mWorkItems,
             mScheduler,
@@ -2311,7 +2303,6 @@ def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
     num_ctas: cutlass.Constexpr[int],
-    order_gen: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -2319,7 +2310,6 @@ def prologue(
     o: cute.Tensor,
     state_checkpoints: cute.Tensor | None,
     cu_seqlens: cute.Tensor,
-    work_item_staging: cute.Tensor | None,
     work_count: cute.Tensor,
     work_items: cute.Tensor,
     scheduler_counter: cute.Tensor,
@@ -2328,7 +2318,7 @@ def prologue(
     stream: cuda_driver.CUstream,
     tiles_per_head: cutlass.Constexpr[int] = 1,
 ):
-    """One-launch prologue: LPT-order the work items and build the 6
+    """One-launch prologue: synthesize the uncut work items and build the 6
     per-(batch, head) TMA-descriptor arrays (q, k, v, gate, o,
     state_checkpoints) into ``tensormap_workspace``, one block each."""
     h_q = q.shape[1]
@@ -2371,7 +2361,6 @@ def prologue(
             checkpoint_view, box_dims=(box_elems, d_v_state // tiles_per_head, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle
         )
     frost_kda_prefill_prologue(
-        order_gen,
         b_t,
         num_ctas,
         tiles_per_head,
@@ -2389,7 +2378,6 @@ def prologue(
         gate,
         o,
         state_checkpoints,
-        work_item_staging,
         work_count,
         work_items,
         scheduler_counter,
@@ -2431,7 +2419,7 @@ def host(
     num_sequences = cu_seqlens.shape[0] - 1
 
     # ---- launch ----------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_kda_prefill(
         cfg,
         q_ratio,

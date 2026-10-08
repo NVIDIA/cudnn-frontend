@@ -146,14 +146,33 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     //! and cuDNN releases runtime-compiled kernel code with the plan.
     cudaError_t
     retain_on_cuda_graph(cudaGraph_t graph) const {
+        if (!needs_cuda_graph_retention()) {
+            return cudaSuccess;
+        }
         return cuda_graph_retention.retain_on_graph(graph, [this] { return make_graph_retention_payload(); });
     }
 
     //! Same as retain_on_cuda_graph() for the graph `stream` is capturing into, if any.
     cudaError_t
     retain_on_capturing_stream(cudaStream_t stream) const {
+        if (!needs_cuda_graph_retention()) {
+            // Nothing to retain, but still the moment to release what destroyed graphs of other
+            // plans left queued.
+            return detail::CudaGraphRetainedResource::drain_deferred_releases_on_stream(stream);
+        }
         return cuda_graph_retention.retain_on_capturing_stream(stream,
                                                                [this] { return make_graph_retention_payload(); });
+    }
+
+    //! Whether a CUDA graph recorded from this plan has to keep the plan alive: true for engines that
+    //! compile their kernels at runtime (CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION), whose code is
+    //! released with the plan. Precompiled kernels are part of the cuDNN library, so recording those
+    //! costs no retention (and no capture-status query per execute, unless released
+    //! references are waiting to be freed). Defaults to true until the
+    //! engine's behavior notes are known.
+    bool
+    needs_cuda_graph_retention() const {
+        return runtime_compiled;
     }
 
    private:
@@ -211,6 +230,10 @@ class ExecutionPlan_v8 : public BackendDescriptor {
                                        behavior_notes_vec.data());
         end    = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
         std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
+        runtime_compiled = status != CUDNN_STATUS_SUCCESS ||
+                           std::find(behavior_notes_vec.begin(),
+                                     behavior_notes_vec.begin() + end,
+                                     CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION) != behavior_notes_vec.begin() + end;
         if (static_cast<size_t>(elem_count) < behavior_notes.size())
             std::fill_n(behavior_notes.begin() + static_cast<size_t>(elem_count),
                         behavior_notes.size() - static_cast<size_t>(elem_count),
@@ -329,6 +352,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::vector<cudnnBackendNumericalNote_t> numeric_notes_vec;
     std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> behavior_notes;
     std::vector<cudnnBackendBehaviorNote_t> behavior_notes_vec;
+    bool runtime_compiled = true;  // see needs_cuda_graph_retention()
 
     float execution_time_ms                   = 0.0f;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;

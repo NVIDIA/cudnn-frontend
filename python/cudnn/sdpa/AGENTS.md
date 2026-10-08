@@ -7,14 +7,14 @@ never renumber.
 
 ## Hard rules
 
-**Rule S1 — THD/packed Stats (LSE) must stay packed: token-major or
-head-major, never dense-padded.**
+**Rule S1 — Respect the declared Stats (LSE) packing: packed and explicitly
+padded Stats are different contracts.**
 
-- Consumers read Stats through the same `cu_seqlen` packing as Q/O: TE and
+- Consumers of packed Stats read through the same `cu_seqlen` packing as Q/O: TE and
   Megatron take token-major `(T, H)` (cuDNN's TH1 recipe) natively, FA-style
   callers take head-major `(H, head_stride)`. A dense-padded declaration
   (per-sequence stride) mis-addresses under that packing — it must be
-  rejected at validation time, not silently accepted and mis-read.
+  rejected for a packed Stats declaration, not silently accepted and mis-read.
 - Validate by stride, not by a `thd`/`packed` flag: token-major is
   `stride_h == 1 and stride_s == H`; head-major is `stride_s == 1` with
   `stride_h` the declared head stride, which must cover the **packed token
@@ -33,6 +33,45 @@ head-major, never dense-padded.**
 - Covered by `test_fwd_probe_rejects_invalid_stats_metadata` and the
   `stats_layout`-parametrized THD tests (`test_dsl_sm100_thd_stats` and
   siblings) in `test/python/sdpa/frost/`.
+
+An explicitly padded Stats output is a separate existing forward contract:
+when Stats has no ragged offset, eligible rows with `thd_padded_stats=True` address
+its declared `(B, H, S_max)` strides even when Q/O are THD. FlashInfer prefill's
+padded LSE uses this contract. Do not infer Stats packing from Q/O alone, or
+reinterpret a packed Stats declaration as padded. Preserve the declared
+stream-ordered tail initialization and reject bad bindings before it writes.
+`test_sdpa_native_padded_stats_binding.py` checks this path; native binding
+changes no capability row and does not make padded Stats a backward contract.
+
+Zero packed-Q capacity does not make this a no-write call: the declared padded
+Stats seed still runs. Validate sinks, workspace and paged tables before that
+seed, in both binders. After binding succeeds, execution seeds Stats and skips
+the attention entrypoint when Q is empty. Binding itself remains metadata-only.
+The empty padded Stats regressions in the same test file
+exercise rejection after warmup and verify that output/workspace sentinels survive.
+The padded declaration addresses caller storage: contiguous rank-3/4 carriers
+are valid even when their own axis order differs from the graph's declared
+`(B, H, S_max)` strides. `test_padded_graph_contiguous_storage_uses_declared_strides`
+checks their actual stores, rebinding and replay; do not restrict them to flat
+carriers or confuse them with a mismatched noncontiguous view.
+
+Quantized empty-Q calls also initialize Amax and omitted scalar scratch, even
+without padded Stats. Complete the same checks before those writes; only
+nonquantized calls without padded Stats retain the early no-write return.
+`test_empty_quantized_validates_sink_before_amax` covers FP8/MXFP8, and the
+standalone regression checks real Amax/workspace sentinels and recovery.
+
+Head padding occupies storage, not logical tokens. Check the full observed
+HN storage span separately from the logical descriptor's bounded packed-Q
+coverage; logical `numel` need not count inter-head padding. The detector is
+`test_head_major_padding_separates_logical_rows_from_storage` for both binders.
+
+Under THD PackGQA, setup and decoding count **token** tiles
+(`CGA_TILE_M / PACK_G`), while Stats stores use the unpacked query head.
+Changing only one side misses or aliases rows. The packing/capture tests
+exercise partial groups and protect untouched tails with sentinels.
+A bounded second wave is a plan-time tuning choice; compute its workload
+from packed token tiles, rather than unpacked tiles times all query heads.
 
 **Rule S2 — A change to any FROST SDPA `Capabilities` row updates
 `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` in the same commit.**
@@ -185,6 +224,391 @@ wrapped addresses inside allocated guard storage, so a deliberately narrowed
 control fails numerically without an out-of-bounds access. See
 `TestPreparedSm120Bwd.test_physical_batch_stride_above_int32`.
 
+The COMPACT path is the one without `wide_index`, and it is the one production
+hits. A compact BSHD io tensor past 2^31 ELEMENTS (`B x S x H x D > 2^31`:
+d512 at B2 S32K H128, B1 S64K H72+, B32 S2K H128 -- B8 S8K H128 is the same
+count) is addressed by the chain's `dot_do_o` through
+`((batch * S_Q + q_block * Q_TILE) * H + head) * D_V`, an Int32 product chain
+of `block_idx()` values and static extents that the DSL widens only at the
+byte multiply (`mul.wide.s32 %rd, %r, 2` in the PTX), so every row past 2^31
+elements read 8 GiB below the tensor. Measured 2026-10-01 on the B200: B1 S64K
+H72 / H96 completed with a silently wrong delta (dq error 2-3x the bf16 norm,
+inside a vacuous absolute tolerance), B1 S64K H128 / B2 S32K H128 / B32 S2K
+H128 died with an illegal address -- cuda-gdb on the GPU coredump
+(`CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`; the only sanitizer-free way to name the
+kernel when compute-sanitizer and the driver disagree): `Warp MMU Fault` in
+`cudnn_kernel_dot_do_o_kernel`, grid (16, 128, 32), block (15, 6, 29) = batch
+29 (the first batch whose base passes 2^31 is 16). `dkv_reduce` and
+`fold_quant` carried the same `idx * 8` chain over the GQA partials
+(`B x S x H_q x D`). The fix promotes the block indices BEFORE the multiply
+(`wide_index(batch, o) * S_Q + ...`; `_span_exceeds_int32` for the vector
+indices), the identity below 2^31 -- the small-shape PTX is byte-identical
+(md5 8ad680c0 before and after at B2 S1K H8). Detectors:
+`test_sdpa_bwd_prepared_sm100_wide.py::test_prepared_sm100_compact_io_past_int32_elements`
+(L1, ~77 GiB: the chain's delta region against torch's rowsum on every batch --
+a wrapped read is O(100 %) off -- and dQ/dK/dV of the FIRST and LAST batch
+against fp32; it skips where the memory is not free), and the grep
+`grep -nE "^\s+(base|pos|ws_base|dq_accum_base) = " python/cudnn/sdpa/bwd/kernels/bprop_chain_common.py`:
+every product chain it lists must start from a `wide_index(...)` or an
+`Int64(...)` index. Reference checks that gate a large-span run must be
+RELATIVE to the reference magnitude (`max_err <= rel * max|ref|`; with |dq|
+~3e-5 an absolute 5e-2 passed an all-zero tensor) and must include the LAST
+batch, where the linear offsets are largest. Rendering a kernel host-only for
+a `>= 2^31` geometry and grepping its PTX for `mul.wide.s32` / `cvt.s64.s32`
+on the address path shows the wrap before any GPU run.
+
+**Rule S8 — Hoist tensor-map acquire only over an immutable descriptor lifetime.**
+
+- A setup kernel may publish K/V maps once before attention. Acquire each map
+  in every consuming loader warp before its persistent loop, including both
+  CTAs of a pair, before disabling the per-load acquire. A fence in another
+  CTA is insufficient; cluster or stream ordering does not replace it.
+- Repeat the acquire on every launch and graph replay. A map rewritten or
+  selected inside the loop needs acquisition at the corresponding boundary.
+  Preserve the shared TMA helpers' safe default for other callers.
+- Check fresh bindings and changed device-side lengths after capture, with
+  NaN-filled K/V capacity tails and independent O/LSE references.
+  `test_thd_tensormaps_rebind_and_replay` covers D128, D256 and D512 half with
+  two CTAs and D192/V128 half with both one and two CTAs.
+  `test_quantized_thd_tensormaps_rebind_and_replay` covers D128/D192/D512 FP8
+  and D128/D192 MXFP8, including both E4M3 and E5M2 inputs. The same probe
+  covers all four half/FP8 widths on SM107 (including FP8 D256); unsupported
+  SM107 MXFP8 THD and D192 half single-CTA configurations are skipped.
+- O slabs within one work item share a map. Acquire before the first slab
+  inside the existing live-work guard; retain store commit/wait and pipeline
+  synchronization for every slab. Reuse across work items requires reacquiring
+  whenever the selected batch/map changes. Exercise empty and repeated work items
+  with the existing `thd_over_launched_units_are_dead` and
+  `thd_multi_unit_per_cta` regressions.
+
+## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
+
+Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`
+(`TemplateParams.mma_2x2`), backward stage 2 `bwd/kernels/sm100/bprop_d512_f16_2x2.py` (`config_sm100.CfgBwdD512x2`,
+`TemplateParams2x2`), backward d256 `bwd/kernels/bprop_d256_2x2_f16.py` (engine `sdpa_bwd_sm100_d256`). Each lesson names
+its runnable detector (forward: `test/python/sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py`; backward:
+`test_sdpa_bwd_config_sm100_2x2.py`, `test_sdpa_bwd_dsl_sm100.py`, `test_sdpa_bwd_thd_sm100.py`); add to the list, do not restate.
+
+Shared protocol (both passes):
+
+- **An end-of-kernel ring drain walks the WHOLE ring, never `min(total, stages)` steps.**  A consumer started at
+  `PipelineState.start(phase=1)` passes its first `stages` waits free; at kernel end the releases still pending are those
+  of the slots used LAST, but a `min(total, stages)`-step drain starts at the current index, i.e. at the slots used least
+  recently -- with fewer issues than stages it waits untouched slots (free) and skips the used ones.  On the d512 2x2
+  backward that was the TMEM lifetime: one kv tile at `STAGES_ACC = 2` left slot 0's compute release un-awaited and the
+  MMA warp could `tcgen05.dealloc` while compute warps 1-3 still read (review P1 on #1323).  Walk `range_constexpr(STAGES)`
+  from the current state: unused slots pass at their pre-armed parity, used slots wait their last release.  Detector:
+  `test_sdpa_bwd_dsl_sm100.py::test_ring_drain_walks_every_used_slot` (a pure-Python twin of the protocol over every issue
+  count; the old rule misses every `0 < total < stages`) plus the single-kv-tile GPU cells on both arch lines.
+- **Barriers completed by events from ANOTHER cta_group::2 pair (cross-pair commit multicast, cross-pair TMA
+  complete_tx, a twin's remote arrive) must be waited with a non-blocking `mbarrier.test_wait.parity` poll;
+  `try_wait` -- hinted (`NANOSLEEP.SYNCS`) or hint-less (`wait(spin=True)`, a suspended `TRYWAIT`) -- parks the warp
+  and can miss the wake-up under GPU time-slicing.** Measured on the d512 2x2 backward (2026-10-01): hang within
+  2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
+  (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
+  o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
+  The scheduler payload barrier belongs to the same class on a 4-CTA cluster: the cluster lead completes it by DSMEM
+  `st.async` + complete_tx into every CTA, an outside-pair event for the second pair -- the d512 2x2 backward bodies poll
+  it as a precaution (#1323 round 2). The CI hang that prompted it -- the detector at launch 22/100 -- was later
+  attributed to the detector's OWN negative control wedging the shared GPU (the xdist lesson below), not to this
+  barrier; the poll stays because the event is outside-pair by construction.
+  The poll is two-phase with a PER-KERNEL shape (`wait_poll(mb, phase, tight_iters, sleep_ns)` /
+  `MBarrier(poll=True, poll_tight, poll_sleep_ns)`: `tight_iters` back-to-back tests, then a TIMER `nanosleep(sleep_ns)`
+  between tests; `sleep_ns = 0` is the pure tight loop). A tight loop on the MMA / TMA-LDG warp starves the compute
+  warps sharing its SMSP when the waits are long (the d512 backward ran 2.2x slower with it; it ships 128 / 128), while
+  the forwards' short waits lose nothing to it (both forwards 32 / 128; on the cc 10.7 forward the tight loop and
+  32 / 128 measured within 0.15 % of each other);
+  the timer sleep is `NANOSLEEP`, not the event-sleep `NANOSLEEP.SYNCS`, so the warp still never parks on the barrier.
+  Backward evidence: the heartbeat dump showed one cluster frozen with a follower's
+  TMA-LDG warp still waiting for a release the other three CTAs' copies of the
+  same barrier had completed five chunks earlier; the sleeping `try_wait` (1 ns
+  and 10 ms hints) and the hint-less `try_wait` spin all hung within 2-74
+  time-sliced launches, the poll never did (200/200, 300/300), and nothing was
+  wrong with any count. Backward detectors:
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_survives_gpu_time_slicing` (a 4x1
+  load child + the twin for 100 launches; a hang exits 3 after a 45 s budget)
+  and its negative control
+  `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing`
+  (`TemplateParams2x2.wait_form = 4` = the pre-fix form, `gpu_exclusive`);
+  `test_sdpa_bwd_config_sm100_2x2.py::test_kernel_source_pins` pins
+  `poll=_KV_SHARED` on the three ring wait sites. To localise a future hang,
+  arm `debug_heartbeat` + `debug_dump_addr` (every warp records its barrier,
+  stage, phase, kv_loop and chunk before each wait into a host-pinned buffer;
+  `lane_d512_bprop/fix/hang_dbg.py` decodes it) -- the bounded-wait lever
+  (`debug_wait_ms`) changes the wait's shape and does NOT reproduce this hang.
+  Detectors (test_sdpa_fwd_d512_2x2_sm100.py): `test_two_by_two_cross_pair_waits_poll` (source pin: exactly those
+  barriers poll, the constant is threaded, default on), `test_two_by_two_survives_gpu_time_slicing` (a role-split
+  load child + 100 watchdogged twin launches, exit 3 on a hang) and its `gpu_exclusive` negative control
+  `test_two_by_two_parking_wait_form_under_time_slicing` (pre-fix form; xfail(strict=False) until the forward
+  reproduces the hang -- the backward's `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` does).
+- **A watchdogged detector and the negative control that deliberately WEDGES the GPU must never share a device at
+  the same time: put BOTH in `@pytest.mark.xdist_group(name="gpu_exclusive")`, the repo's convention next to the
+  `gpu_exclusive` marker (which xdist does not enforce by itself).** The CI FROST lane runs 16 workers over 4 GPUs
+  with `--dist loadgroup`; items outside a group are dealt to idle workers in collection order, so two adjacent
+  tests start together and share a GPU one time in four. The d512 backward detector then read its own control's
+  45 s wedge as a hang: pipelines 71863093 (launch 22) and 71991279 (launch 35), the detector at ~63 s = compile
+  + its 45 s budget with the control passing at 60-62 s, against ~25 s in the two green pipelines. Junit durations
+  are the tell. The children print the launch-time history and compute processes on HANG, so
+  a starved launch (ms ... ms, one 45 s wall, neighbours listed) reads differently from a wedged one. The coupling
+  mechanism is NOT the obvious one: on a time-sliced B200 a kernel wedged for 180 s beside the shipped twin did not
+  slow it at all (six 100-launch runs at 0.24 s median, `jobs/c9d07061/tmp/rebase/wedge/run_wedge.sh`, 2026-10-06), so
+  the CI node shares its GPUs differently (concurrent contexts with the wedged clusters holding 136 of 148 SMs is
+  the candidate). Grouping prevents these controls from overlapping on one worker; it does not reserve a GPU against
+  unrelated workers or other jobs. A timeout with grouping enabled still needs diagnosis. The process query enumerates
+  all GPUs: retain GPU UUIDs with the PIDs and the child's `CUDA_VISIBLE_DEVICES`, and correlate them with the runner's
+  device map before attributing a neighbour to the test GPU. The list may include the reporting child; not every row is
+  another process. A bare PID list is not a per-GPU process count, and a failed `nvidia-smi` query must be reported as
+  unavailable rather than an empty device.
+- **Two pairs sharing an operand ring by cross-pair TMA multicast need an
+  `empty` barrier with init = number of PAIRS, released by EVERY pair leader's
+  `tcgen05.commit` with the whole-cluster mask (0xF).** CTA c's multicast lands
+  in CTA c ^ 2's slot too, so a stage is free only when both pairs' MMAs have
+  read it; init 1 lets one pair's producer overwrite bytes the other pair's MMA
+  is still reading -- silent corruption, not a hang. With `group = cta_2` the
+  multicast's `complete_tx` is signalled on the DESTINATION's pair leader
+  (probe `mcast_twin`, 2026-10-01), so ONLY pair leaders arm `expect_tx` (the
+  bytes landing in the pair, from either issuer) and only the leader's MMA warp
+  waits; a follower that arms or waits its own copy under `group = cta_2` hangs.
+  Detectors: `test_sdpa_bwd_config_sm100_2x2.py::test_barrier_counts_and_cluster_span`
+  (`RING_EMPTY_ARRIVERS == CGA_M // CTA_MMA`) and the bitwise twin
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_is_bitwise_the_role_split`
+  (a stale slot is a non-bitwise S / dS workspace).
+- **Chunked K accumulation into one TMEM accumulator is bitwise equal to one
+  long chain** (`accumulate=(c > 0)` over 8 x K=64 == one K=512; probe
+  `ss_slabs` S3, two seeds). Make the twin test `torch.equal` on int16 views,
+  not a tolerance: any difference is a real bug.
+
+Forward (d512 prefill):
+
+- **Every per-row reduction is a HALF-row value until combined with lane r + 64's.** The fp32 D of a 2SM M=128 MMA
+  lands on TMEM lane `(m % 64) + 64 * (n // (N/2))`: warps w and w + 2 hold the same 64 rows, one column half each, so
+  `row_max_reduction` / `ld.red.max` / a row sum on one lane is half the row. Exchange through SMEM + a named barrier
+  before the online-softmax chain, and run the identical scalar chain on both halves so alpha / beta agree bitwise.
+  Detector: `test_two_by_two_directed_numerics[skewed_halves]` (every odd 64-key half scaled by 2^10: the half with
+  the smaller max exponentiates unnormalised without the exchange).
+- **An SMEM slab that a TWIN CTA multicasts into is gated by every DESTINATION's consumer, not the issuer's.** Under
+  `KV_SHARE=2` CTA c's TMA lands bytes in CTA c ^ 2 too; if that slab aliases something the destination still reads
+  (here `sO` over the V ring), the issuer's own `*_empty` wait proves nothing about the destination. Make the gate
+  pair-wide (`mb_o_empty` init `32 x KV_SHARE`, `arrive()` + `arrive_on_peer(cta ^ 2)` from the TMA-STG warp, and
+  drain the last phase before exit so no remote arrive targets an exited CTA). Detector:
+  `test_two_by_two_twin_alias_gate_under_pair_skew` (the test-only `DEBUG_STG_DELAY_US` lever holds pair 0's O store;
+  RED on a per-CTA gate with the twin's V subtile over O subtiles 2, 3, 6, 7; GREEN on the pair-wide one). The natural
+  race is frequency-bounded -- `test_two_by_two_persistent_multi_tile` passed on the racy protocol -- so a
+  multi-tile cell alone is not a detector; the skew lever is.
+- **`mb_o_full` init = the lanes of ONE column half (64), not the warpgroup (128).** Lane (r, h) drains d_v
+  `[256h, +256)`, so an 8 KiB O subtile is published by the 64 lanes of half h only. Detector:
+  `test_config_2x2_pins_and_ledger_formulas` (`O_CHUNK_ARRIVERS == CORR_LANES // 2`, raises on 128) +
+  `test_kernel_source_arrive_sites_match_the_ledger` (arrive-site counts per barrier).
+- **A fixed TMEM column is NOT protected by a ring it rides.** Per-ring-step payload goes in per-SLOT columns (alpha
+  at `384 + s`, tile stats at `386 + 2s`): a fixed stats pair is protected only if the next writer waits the SAME
+  slot's empty, and an EMPTY tile (one ring step) waits the other slot's -- the slow-arm correction then read
+  `final_sum = 0` and published live rows DEAD (sm107 lane, 2026-10-01; reproduced on the SM100 body:
+  `lane_d512_fprop/fix/stair_red_sm100.log`). Detector: `test_two_by_two_stats_ring_slot_race_empty_after_live`.
+- **Dead / trimmed rows are zeroed by a SELECT, never by `o * beta` with beta = 0.** A trimmed row whose Q memory is
+  NaN (poisoned padded tail) carries NaN through S, P and O; `NaN * 0 = NaN` reaches the output. Detector:
+  `test_two_by_two_trimmed_rows_with_nan_inputs_store_zero`.
+- **Cluster-shared K/V needs cluster-UNION tile bounds.** Two pairs sharing one K/V ring must iterate the identical
+  KV range or the shared `k/v_empty` ring deadlocks; `make_sdpa_helpers(kv_shared_cluster=True)` derives the bounds
+  over the cluster's 256 rows and the per-cell mask trims. Detector:
+  `test_two_by_two_causal_512_cluster_union_bounds`.
+- **Forward prepared hosts always use native binding, including a new kernel-template name.**
+  The old name allowlist silently demoted a new d512 twin to Python while numerics still passed.
+  That fallback and allowlist are removed: dense and THD builders construct their native binder
+  unconditionally. A new host ABI must update the native binder and frame-parity tests in the
+  same change. `test_two_by_two_host_slots_match_role_split` checks the d512 ABI;
+  `test_two_by_two_default_plan_binds_natively` and `test_sdpa_native_prefill_binding.py` check
+  default and alternate plans on device. `test_sdpa_binder_ownership.py` prevents restoring
+  production Python forward framing or implicit backward ownership.
+
+Backward (d512 stage 2):
+
+- **The 2x2 D image puts the SAME rows in two warps: warp w holds rows
+  `32 * (w % 2) ..+31` of kv-column half `w // 2`.** A map that swaps the two
+  at the MASK site (`kv_col_base` picks the half) gives correct DENSE output --
+  every random dense accept passes, no mask code is even traced -- and wrong
+  MASKED columns. Detector: a COMPILED mask whose band edge is exactly column
+  64 of a tile for every row, `test_sdpa_bwd_thd_sm100.py::test_graph_thd_kv_len_64_masks_the_upper_column_half`
+  (THD -> `MASK_PADDED`; kv lengths 64 and 192 mask [64, 128) of a tile for
+  both sequences), plus the causal / SWA / bottom-right accepts under the
+  `stage2_datapath` fixture. Proven RED by swapping `col_half` at the
+  `apply_mask_chunk` call (`lane_d512_bprop/fix/RED_lane_map_swap.log`). A
+  dense `S_kv = 96` shape is NOT a detector: dense padding is not served, so
+  it compiles `MASK_NONE` and its 32 tail columns are TMA zero-filled, not
+  masked (that case stays as `test_dense_skv_96_zero_filled_tail`). Never
+  trust a dense-only pass for a lane map.
+- **A tcgen05 SMEM descriptor root AT or past 256 KiB needs `desc_version=1`
+  on EVERY `SmemTile`, and the margin can be exactly zero.** The Rubin arm's
+  last root (`sRingV` stage 7 at 253952) ends at byte 262143 only because the
+  TMA-store-only cast slabs are declared after the rings; one more stage flips
+  the whole module to version 1. Compute the version from the slab list
+  (`desc_version_2x2`), bind it once as a module constant, and pin the slab
+  ORDER -- a version-0 descriptor past the window silently wraps to an
+  untouched buffer (an exactly-zero accumulator). Detectors:
+  `test_descriptor_roots_and_version_per_arm`, `test_kernel_source_pins`
+  (every `SmemTile(` takes `desc_version=DESC_VERSION`).
+- **A per-arch sibling fork of a 2x2 body is pinned to its parent by a
+  CODE-DIFF ALLOWLIST, by import-time refusal of the parent's arm, and by
+  rendering identity -- not by prose.** The cc 10.7 d512 stage-2 fork
+  (`bwd/kernels/sm107/bprop_d512_f16_2x2.py`, parent `sm100/`) differs from its
+  parent in a handful of code lines (the ring-arm default record, the
+  hard-coded `DESC_VERSION` with its `_require`d derivation and zero-margin
+  fact, `SPIN_RING_WAITS` threaded into the one pair-local wait branch);
+  `test_sdpa_bwd_d512_sm107.py::test_fork_code_diff_is_only_the_listed_deltas`
+  blanks strings and comments and asserts every `+` / `-` line matches a listed
+  regex, so a fix landed in ONE sibling fails the test. The fork refuses the
+  parent's arm (and a 9th ring stage) at import
+  (`test_fork_refuses_the_sm100_arm_and_a_ninth_stage`, RED-first: both raise),
+  and at the same parameters its sm_107a PTX md5 EQUALS the parent's
+  (`renderings/md5_stage2_2x2_sm107a.txt`; `wait(spin=False)` and a literal
+  `DESC_VERSION = 0` render identically), which is what makes the on-board
+  `test_fork_is_bitwise_the_sm100_body_at_rubin_params` (`torch.equal` on int16
+  views of dQ / dK / dV and the S / dS workspace) a guarantee rather than a hope.
+  Fork AFTER the parent has run at the new arm (the d512 case: 14 / 14 direct
+  adapter cases on the board first), so every delta is deliberate.
+- **A directly constructed adapter must spell the analyzer's mask
+  conventions; one of them is `window_size_left = diagonal_band_left_bound - 1`**
+  (`graph_analyzer.py`, the `left_bound - 1` line). A hand-built
+  `SdpaBwdDsl*(window_size_left=L)` checked against `_causal_keep(left=L)` is
+  one column off: it reads as cos 0.9996 / max-rel 2-3e-2 on dQ / dK -- inside a
+  5e-2 / 3e-2 `allclose`, outside the suites' 0.9999 / 2e-2 gate -- and looks like
+  a kernel bug on a new arch (the cc 10.7 d512 bring-up's only "failure":
+  9 / 10 direct-adapter cases passed on the board on 2026-10-01 and the SWA case
+  read cos 0.9996 until the convention was applied). Detector: run the same case
+  through the graph API with the engine pinned (`test_sliding_window`); a graph
+  pass with a direct-adapter fail is the convention, not the kernel.
+- **An omitted graph `attn_scale` is 1.0; an adapter's `scale_softmax=None` is 1/sqrt(d).** The backend inserts no
+  scale multiply when `attn_scale` is absent, and the analyzer turns absence into `facts.scale = 1.0`, so None never
+  reaches an adapter from a graph. A graph test that omits the scale needs a 1.0 oracle. When it passed None through,
+  FROST computed 1/sqrt(d) on the same graph: O differed by ~4 and Stats by 48-100 from backend engines 8/10 on B200.
+  Detector: `test_omitted_attn_scale_is_no_scaling` (analyzer) and the `test_default_attn_scale` cases.
+- **The `LDTM` SASS count of the masked (three-range) compute body is a
+  TOOLCHAIN fact, not a kernel fact.** The public DSL 4.7.0 + CUDA 13.3 ptxas
+  keeps three traced range bodies (6 `LDTM`, the SM100 twin's pin); the board's
+  internal DSL 0.3.0 + cuda-39029786 emits two for the same source (4). Pin the
+  per-body count the kernel owes (2 per traced body) against the set a toolchain
+  can produce (`test_fork_sass_pins_sm_107a`: `LDTM in (4, 6)` on the causal arm),
+  never `2 * n_bodies` alone -- and record the toolchain next to the pin.
+- **cuDNN 9.26 builds NO d > 256 backward plan on cc 10.7** (engines 17 and 7
+  decline `d_qk > 128` outside the 192x128 and 256x256 cases; probed 2026-10-01
+  with the FROST opt-in OFF on cuDNN 9.26.0.51 at B1 H8 S2048 dense and causal:
+  `create_execution_plans` raised `cudnnGraphNotSupportedError` both times), so a
+  Rubin-line d512 backward has no FROST-vs-backend A/B -- its perf gate is
+  floor-relative (stage-2 MMA floor 2502 clk per CTA-kv-tile at the board's
+  39.1-clk 2SM M=128 N=128 K=16 rate, stage 3 at 4096 MAC/clk/SM). Probe before
+  planning an A/B: `g.create_execution_plans` raises `cudnnGraphNotSupportedError`
+  with the backend's decline reasons when no engine proposes a plan.
+- **Attribute a floor gap with in-kernel clocks before touching a wait, and
+  quote cycles, not nominal-clock wall time.** Both SM100 d512 stage-2
+  kernels carry a default-off attribution lever (`TemplateParams2x2.debug_clk`
+  on the twin, the sibling record `TemplateParamsDbg.debug_clk` on the 4x1):
+  every mbarrier wait keeps its production form and is bracketed by
+  `%clock64`, the elected lane accumulates per barrier id in the warp's SMEM
+  slice, and each warp dumps 32 x Int64 (waits, blocked counts, issue
+  segments, tiles, and the body's `%globaltimer` span) to a host-pinned buffer
+  at exit. Measured 2026-10-01 (B200, CLEAN slots): the two datapaths wait on
+  DIFFERENT things -- the 4x1's sg0 compute warps are busy ~2850 clk/tile and
+  wait ~1200 on `smem_empty` (a 32 KiB TMA store drains in ~2600 clk), its
+  MMA idles 3100 on `acc_empty`; the twin's MMA waits 2100-2650 on
+  `ring_full` (K/V chunk latency, ~800 of it the cross-pair lock-step:
+  `kv_share 1` measured -6.9 / -10.0 / -9.6 % of stage-2 wall time on dense
+  8K / dense 2K / causal 8K, bitwise -- ONCE per cell as the B arms of an
+  A/B/A series in one slot whose four control arms spread +-1.7 / 0.2 / 0.8 %,
+  so n = 1 per cell, three cells agreeing) while `acc_empty` and
+  `smem_empty` never block (`stages_acc 4` and a two-stage cast are no-ops
+  there) -- a lever that is right for one kernel is a no-op on the other.
+  The body's clk / ns ratio is the SM clock the kernel ACTUALLY ran at:
+  705-820 MHz on sustained S >= 8K backwards while NVML sampled 1155 MHz (the
+  600 W power cap gates cycles; the PLL readout does not move), so a CUPTI
+  "clk per tile at 1155 MHz" overstates cycles by up to 1.6x and the
+  S_kv-scaling of such numbers (5400 -> 6900 -> 7600 clk/tile at 2K / 8K /
+  16K) is the throttle, not kernel work (the bodies are 4860 / 4700 / 4660
+  cycles). Detectors: the default renderings are PTX-identical with the lever
+  off (`test_stage2_default_rendering_ptx_md5_is_unchanged`,
+  `test_stage2_2x2_default_rendering_ptx_md5_is_unchanged`), the armed lever
+  renders different PTX (`test_stage2_{2x2,4x1}_debug_clk_lever_renders_code`),
+  and `test_stage2_{2x2,4x1}_debug_clk_dump_accounts_the_waits` checks every
+  role accumulates exactly the barriers it waits on with bitwise outputs and
+  reads the record layout (the module's `DBG_CLK_*` constants: slot 0 is the
+  body's clk, slot `DBG_CLK_BODY_NS` -- 28 on the twin, 31 on the 4x1 -- its
+  %globaltimer span, so `slot0 / slot28|31` is the SM clock in GHz the body
+  ran at; a decoder is a few lines over those constants and the per-warp
+  `(linear block * 8 + warp) * 32` record offset). The record index is not
+  bounds-checked: the 16 MiB dump holds 8192 CTAs per launch, so assert
+  `grid * 8 * 32 <= DBG_CLK_MAX_WORDS` before arming (both accounting tests
+  do). NCU `--clock-control base` (688 MHz on that box) is the other way to
+  hold the clock -- never compare two wall times without one of the two, and
+  never compare two ARMS run in a fixed order on a power-capped board without
+  an in-run thermal control: the matrix's `4x1, twin` order timed the
+  IDENTICAL stage-3 GEMMs 10-25 % slower in the second arm at S >= 8K.
+
+## Stage-3 GEMM (`bwd/kernels/bprop_matmul_blackwell.py`) perf-method lessons
+
+Measured on the SM100 d512 backward's dV / dK / dQ GEMMs (B200, 148 SMs, 1155 MHz SW power cap, cuDNN 9.26.0.51, DSL 4.7.0,
+2026-10-01; the numbers quoted here are the per-GEMM CUPTI medians of CLEAN in-process round-robin A/B slots, and the constant's
+comment in `bwd/api_dsl.py` carries the full set).  Each lesson names its runnable detector; add to the list, do not restate.
+
+- **Read "residual vs the MMA floor" off the CLOCK RATIO, not off byte counters.**  `ncu --clock-control base` locks the SM
+  clock to base (684 MHz here) and leaves DRAM / L2 at speed, so a kernel that sits at its MMA floor under NCU but takes 1.3x the
+  cycles at the full clock is memory-LATENCY bound (the memory side is 1.69x slower relative to the SMs at 1155 MHz); one whose
+  cycle count is clock-invariant is issue / occupancy bound.  The (512,512) row: 1.09 M cycles per S8K launch under NCU = 96.5 %
+  tensor duty on its 136 active SMs, 1.41 M cycles at 1155 MHz (CUPTI us x NVML MHz) = the whole "1.35x unattributed residual";
+  S2K: 0.595 M vs 0.609 M (1.02x) -- the "S-dependent 14 %" IS this term.  Bytes per FLOP and DRAM % of peak are flat across S,
+  so `dram__bytes_read` alone says "nothing to see".  Detector: `ncu --clock-control base --metrics
+  sm__cycles_elapsed.avg,sm__cycles_active.avg,sm__ctas_launched.sum -k regex:_bprop_matmul_bh_sm100_kernel --launch-skip <two
+  backwards' worth of GEMM launches> --launch-count 3` on the chain, then `elapsed(full) / elapsed(base)` with
+  `elapsed(full) = CUPTI median us x NVML MHz`.
+- **Residency and idle SMs under CLC are direct metrics.**  `launch__cluster_max_active` (Occupancy section) is the co-resident
+  cluster count at the launch's SMEM (34 four-CTA clusters at 231 KiB/CTA, 74 two-CTA), `sm__ctas_launched.sum` is how many CTAs
+  CLC actually launched to serve the grid (136 = 34 x 4), and `sm__ctas_launched.min = 0` means SMs sat idle for the whole launch
+  (12 of 148 on the 2x2 row; 0 on the 2x1 row).  `launch__waves_per_multiprocessor` does not account for clusters (6.92 for a
+  7.53 -> 8-round launch); compute rounds as `tiles / cluster_max_active`.
+- **A structural gain measured at base clock need not survive the full clock.**  The (512,256) row (cluster 2x1, no A multicast,
+  A read twice from DRAM) is -12 % elapsed vs (512,512) under NCU at 684 MHz and +0.1..+0.8 % at 1155 MHz at dense S8K (three
+  CLEAN in-process A/Bs; +7.5 % at causal S8K), while at S2K / S4K -- where the launch is MMA-bound at full clock -- the same
+  -11.5 / -11.6 % (dense) and -6.4 % (causal S2K) appear in every round.  Always close with the full-clock A/B (`bwd_bench.py --ab`
+  in the lane: every arm built once, timed round-robin, bitwise-checked).  Outcome: the SM100 d512 chain keys the row on the
+  padded max(S_q, S_kv) and the device cc (`api_dsl._sm100_stage3_cgrp_tile_mn`, (512,256) for BSHD at <= 4096 on cc 10.0..10.6);
+  detectors `test_sdpa_bwd_dsl_sm100.py::test_stage3_cluster_tile_rule_by_sequence_length`,
+  `::test_stage3_small_s_tile_is_bitwise_the_wide_row` (a spy pins which row each arm loaded; the whole causal family and the
+  4096 / 4224 boundary as served) and `::test_stage3_tile_rule_reads_the_device_cc`.  Behind a (512,256) GEMM at S8K the
+  UNCHANGED stage-2 kernel ran +13-15 % slower in three CLEAN slots (wall == CUPTI sum; per-arm clock mean within 1 % on the
+  dense telemetry slot) -- a chain-level effect no per-kernel metric predicted; measure the whole chain, not the kernel.
+- **A plan-time rule measured on one board needs a compute-capability term, because adapters INHERIT `compile`.**  The cc 10.7
+  d512 row's adapter subclasses `SdpaBwdDslSm100` and overrides `check_support` and the stage-2 file / record only, so a tile
+  rule keyed on S alone in `SdpaBwdDslSm100.compile` would have flipped that row's default on a board where it was never rendered
+  or run (review of the (512,256) rule).  Resolve the cc once per compile through one seam (`SdpaBwdDslSm100._device_cc`, the
+  prepared host's own `compute_capability(resolve_device(q.device))`) and gate on an explicit inclusive range
+  (`_SM100_STAGE3_SMALL_S_CC = (100, 106)`).  Detectors: the faked-cc host pin in the UNGATED suite
+  (the cc 10.7 backward suite's `::test_stage3_tile_rule_keeps_the_wide_row_off_the_sm100_line` -- the SM100 suite is module-gated
+  to SM 10.0..10.6 and never runs on another lane) and the GPU pin that fakes the seam on the board it does run on
+  (`test_sdpa_bwd_dsl_sm100.py::test_stage3_tile_rule_reads_the_device_cc`: `_device_cc` -> (10, 7) must load (512,512)).
+  Grep tripwire for the next rule: `grep -n "compute_capability\|_device_cc" python/cudnn/sdpa/bwd/api_dsl.py` --
+  every plan-time branch on the device must go through the seam.
+- **Two refuted memory-side levers, so nobody re-tries them blind:** (1) a non-power-of-two S / dS workspace row stride
+  (`_skv_pad + 64`, 16 KiB -> 16.1 KiB) is +5 % SLOWER on stage 3 at dense S8K and neutral elsewhere; (2) TMA L2 promotion
+  (`l2_128b` / `l2_256b`) on the A / B operand descriptors is +1-2 % slower.  Both diffs are kept as patches in the lane dir
+  (`kv_stride_pad_lever.patch`, `tma_l2_promotion_lever.patch`) with their detectors; a descriptor hint does not change the kernel
+  PTX (the md5 record stays valid), a carve change does not change the templates either.
+- **Tile-row twins are `torch.equal`, and a bench that draws its own dO per build is not a twin test.**  The (512,256) row is
+  bitwise the (512,512) row (same per-pair work and k walk; the 2x2 row only multicasts A to a second pair), but
+  `bench_baselines.build_bwd` draws a fresh random dO per call, so an unseeded second build "proved" the rows differ by 1e-4.
+  Re-seed before every build you compare.
+- **A pin whose record is local-only has never run.**  The stage-3 PTX md5 pin read `frost_dev/.../md5_develop_sm100a.txt`, absent
+  in every checkout -> it skipped everywhere until the record was committed under `test/python/sdpa/frost/renderings/` with a
+  `dsl=` line (`md5_stage2_4x1_sm100a.txt`, `md5_stage3_sm100a.txt`); `test_stage3_md5_record_is_committed_and_complete` is the
+  tripwire, `ab_stages` 4 -> 3 on the (512,512) row the RED proof.  And a completeness test that compares the record against a
+  HAND-KEPT dict pins whatever the hand remembered: the tile rule made eight renderings default renderings and two were pinned.
+  Derive the expected set from the rule (`_stage3_default_tiles` walks `_sm100_stage3_cgrp_tile_mn` over S x cc per record) so
+  a rule that grows a row demands its renderings.
+- **A hand-set `FROST_SOURCE_DIGEST` must name the record, not just the tag.**  `compiled_cache.template_key` keys a
+  `compile()` on the module digest + the call's plain arguments ONLY; the mask, dtype and every other `TemplateParams` field
+  live in the module.  A test that execs a template itself (`spec_from_file_location` + `FROST_TEMPLATE_PARAMS`) and sets a
+  per-tag digest hands the FIRST load's artifact to every later load of that tag: the causal cells of
+  `test_sdpa_fwd_d512_2x2_sm100.py` (multi-tile, pair-skew) ran the DENSE kernel under a causal reference -- 4096 / 4096
+  cells wrong, LSE ~= log(S_kv), deterministic, and order-dependent under xdist (green when the causal cell compiled first).
+  Fold `sha1(repr(params))` into the digest (`_params_digest`) or leave it unset (uncacheable).  Detector: run the dense and
+  the causal cell of one tag in one process with an empty `XDG_CACHE_HOME`; the second must not inherit the first's LSE.
+
 ## Output initialization regressions
 
 When removing wrapper-side output clears, verify that the prepared chain
@@ -192,6 +616,138 @@ overwrites every element, including masked rows and partial tiles. Poison
 fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
 replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
+
+## Prepared THD launch bounds and setup
+
+Each compiled host contract has one production binder across graph, standalone,
+and staged entry points. Forward and half backward use native binding. Quantized
+backward and standalone compact-GQA backward remain Python until migrated as a
+whole. Backward builders must explicitly choose ownership; omission fails at plan
+construction. A native validation error is never a reason to retry in Python.
+Legacy forward framing exists only in test-only reference modules for differential
+checks; production must not import them. Pure geometry helpers still used by native
+binding stay in production.
+
+Staged forward adapters bind their compact core through the same native binder
+as direct calls. Validate the complete core before any gather, scalar seed, or
+output write; keep alias checks against original carriers as well as workspace
+replacements. The staged half/FP8/MXFP8/SM120 tests forbid Python core binding
+while checking current storage, split outputs and replay. Include legal head-dim
+envelopes: native template ownership must not silently disappear at non-exact
+head dims. `test_half_staged_has_no_execute_allocations_and_replays_current_storage`
+covers those dimensions and the split path.
+
+A cached graph envelope does not describe the current packed allocation.
+Bound its launch using host-known token capacity and effective batch count,
+without reading device lengths or changing the compiled artifact. Replay may
+change the device lengths within that capacity; test the old capture after
+replanning as well as freshly bound calls.
+
+Parallel descriptor setup must fence on every writer that publishes a
+tensor map. Keep prefix construction, remapping, and live-count publication
+ordered by CTA barriers. Check prefix lengths around warp boundaries and
+zero-length sequences (`test_parallel_thd_metadata_matches_lengths_and_normalized_cu`),
+and run racecheck/memcheck before changing this shared setup again.
+
+**One metadata buffer, several persistent-scheduler launches per execute (the
+SM100 d512 backward's `heads // chunk` stage-2 launches): the two scheduler
+words are per LAUNCH.** `live` (`meta[4B+2]`) counts the units ONE launch
+decodes -- `sum_b ceil(s_b / 256) * chunk`, the head extent that launch's kernel
+receives as `n_qh` -- never the plan's head count; and the claim counter
+(`meta[4B+3]`) must be re-seeded to the cluster count before EVERY launch,
+because a launch leaves it at `live + clusters` and an unreset second launch
+finds every claim past the bound, computes only the units its clusters were
+pre-assigned by blockIdx, and stage 3 reads the previous chunk's S/dS for the
+rest (wrong, finite gradients -- cos 0.50 on dQ/dK of 7 of 9 sequences at
+d4b024671, 2026-10-01). The reset rides in the clamp kernel that already
+precedes each stage-2 launch (`_clamp_thd_input_descs`, both stage-2 files),
+so the fix added no launch (Rule 2). The miss is observable only when a launch
+has MORE live units than clusters (SMs // 4 = 37 on a 148-SM part), which is why
+every one-chunk THD test (h <= 4) passed. Detectors
+(`test_sdpa_bwd_thd_sm100.py`):
+`test_graph_thd_forced_head_chunks_match_reference_and_unchunked` (forces
+`_sm100_head_chunk_thd` to 8 / 4 over 12 q-units; per-sequence fp64 and
+bitwise the one-chunk plan) and
+`test_graph_thd_forced_head_chunks_publish_live_and_reseed_the_claim_counter`
+(reads `meta[4B+2] == q_units * chunk` and `meta[4B+3] == live + clusters`
+back out of the executed workspace). A new multi-launch consumer of
+`write_thd_live_and_ctr` owes the same two pins.
+
+**The blocked workspace's padding tips the head-chunk divisor at the budget
+edge.**  Each sequence's block is padded to 128 rows, so an equal-length packed
+plan carries `B * 128` more rows per head than the dense plan of the same
+lengths; charged in full that halved the chunk whenever the dense chunk sat
+exactly on the 4 GiB budget (B=1 / B=4 S=8192: 16 -> 8 / 4 -> 2 heads per
+launch, twice the stage-2 and stage-3 launches for the same work).  The rule
+(`api_dsl._sm100_head_chunk_thd(..., t_rows=)`) charges the budget on the TOKEN
+rows and lets the padded slab overshoot by at most `budget //
+_SM100_WS_THD_PAD_SLACK` (1/8); `scratch_workspace_bytes` is still computed
+from the chosen chunk (Rule 8).  Detectors (`test_sdpa_bwd_thd_sm100.py`):
+`test_thd_head_chunk_matches_dense_at_equal_tile_multiple_lengths` (THD chunk
+== dense chunk at six equal-length shapes, the original rule's halved answers
+pinned, the many-short-sequences cap) and
+`test_graph_thd_launch_count_is_the_promised_chain` (launches per execute from
+a CUPTI trace == `setup + dot [+ zero] + chunks * (clamp + stage 2 + (2 +
+group) * (patch + GEMM)) [+ dkv_reduce]`, per-chunk helpers counted by name --
+the Rule 1-2 pin for this chain).
+
+Compiled-host cache key: `prepared_sm100.compile_plan` keys the host artifact
+on the stage-2 / stage-3 TEMPLATE digests plus `Params`, geometry, regions and
+`sm` -- an edit confined to `kernels/sm100/prepared_host.py`,
+`kernels/thd_helpers.py` or `kernels/bprop_chain_common.py` does not move the
+key and a warm `CUDNN_FRONTEND_COMPILED_CACHE` serves the OLD host. When
+testing such an edit, run with `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` or
+confirm the key moved (the detector pair above fails on the stale host).
+
+**A host lever that changes the launch shape rides in `Params` so the key
+moves with it.** The SM100 d512 dQ GEMM under GQA is ONE launch per head chunk
+(`api_dsl.DQ_SINGLE_LAUNCH`; the stage-3 record's `b_head_group = group`, the
+cc 10.7 d256 chain's #1318 arm) where it used to be one per group MEMBER;
+`prepared_host.Params.dq_b_head_group` (14th, appended) carries the rendered
+record's value into both the compile key and the traced host, so the per-member
+twin (`DQ_SINGLE_LAUNCH = False`) can never be served the shipped artifact, and
+`_dq_launches` refuses a value that is neither 1 nor the group. Detectors
+(`test_sdpa_bwd_dsl_sm100.py`):
+`test_stage3_dq_single_launch_per_chunk_is_bitwise_the_per_member_launches`
+(record spy + CUPTI launch count `3 * chunks` vs `(2 + group) * chunks` + int16
+bitwise dQ / dK / dV vs the twin + fp32 oracle) and
+`test_stage3_dq_launches_pair_every_q_head_with_its_k_head` (the host's
+coordinate arithmetic in plain Python). Two traps the detector hit: the graph's
+`_compiled_plans[i]` is the `_FrostSdpaBwdPlan` wrapper and never exposes the
+adapter, so a test that needs the adapter's facts (`_qh_chunk`,
+`_dq_b_head_group`) captures `self` off a monkeypatched
+`SdpaBwdDslSm100.compile`; and a bare `assert ..., facts_dict` is truncated by
+pytest, so a launch-count pin must spell the measured and expected counts.
+
+**The THD causal K-trim is the dense arithmetic per sequence; keep a host
+twin of the range arithmetic, because its empty-range clamps hide off-by-ones
+no kernel test localizes.** `_thd_causal_k_range` works in sequence-relative
+rows with the sequence's own k count, so `api_dsl.THD_STAGE3_TRIM` renders the
+SM100 chain's packed stage 3 trimmed with the diagonal edge
+(`thd_causal_bottom_right` makes the kernel read the bottom-right
+`S_kv[b] - S_q[b]` per group); the window edge and the right-band widening stay
+untrimmed on that chain (the THD arm takes no constant shift).
+The range may be EMPTY (`nkt == 0`, a one-sided empty sequence; a tile with no
+kept cell) and the kernel stores zeros for it -- a never-empty floor there is
+wrong, and `k_lo = min(k_lo, k_hi)` after a `nkt - 1` floor is not enough: the
+first port of this trim produced `range(-1, 0)`, one iteration at a negative
+k tile, which
+`test_sdpa_bwd_thd_sm100.py::test_thd_trim_covers_every_cell_stage2_writes_per_sequence`
+(`_thd_k_range_twin`, pure Python over random packed lengths, no GPU) caught
+before any kernel ran. Runtime detectors: `test_graph_thd_causal_stage3_is_trimmed_per_sequence`
+(record spy; RED on the untrimmed tree),
+`test_graph_thd_causal_trim_is_bitwise_the_untrimmed_rendering`
+(`THD_STAGE3_TRIM = False` twin, int16 views, both arms on the fp64 reference)
+and `test_graph_thd_causal_matches_dense_bits_at_equal_tile_multiple_lengths`
+(THD vs the dense BSHD graph over the same memory). A template field that must
+leave every existing rendering byte-identical is proven by the PTX md5 list
+`test/python/sdpa/frost/renderings/md5_stage3_sm100a.txt` through its consuming
+test (the probe is a host trace-compile for sm_100a, but the test harness
+still needs a CUDA device: the conftest asserts one and opens a cuDNN handle,
+and the env wrapper re-fills an empty `CUDA_VISIBLE_DEVICES` -- so run it through
+the GPU slot like any other test) -- run it twice from independent processes
+before pinning a new line.
 
 ## Heuristic geometry regressions
 
@@ -201,3 +757,33 @@ public MMA width, and masked KV work depends on the candidate Q span and tile
 alignment. Compare masked bounds with an independent visible-key oracle and
 verify every alternative is rescored, deduplicated and within the candidate
 cap. An exact winning-rank golden alone does not detect stale model inputs.
+
+## Single-CTA packed split scheduler
+
+A one-CTA persistent scheduler publishes locally and releases its local
+barrier; it must not issue a DSMEM async store to a nonexistent peer. A
+consumer must finish reading the whole response before returning its slot
+credit. Source-level vector loads can be scalarized, so the single-CTA THD
+path reads through lane zero and broadcasts before the release. Validate
+repeated waves with Compute Sanitizer racecheck as well as O/Stats tests.
+
+Packed split workspace is bounded by declared packed-Q capacity. Every
+partial store and combine read must use live token coordinates, including
+empty sequences and nonaligned tails. `test_paged_thd_split_capture_lengths_and_stats`
+checks changed device lengths under retained captures and protects tails
+with sentinels; the combine tests poison dead partials with NaNs.
+
+Oversized Q/O backing allocations do not enlarge a split plan's live-Q bound.
+Without an explicit packed-total hint, the split workspace is still bounded by
+`B * S_q`. Clamp the observed extent to that bound before checking logical HN
+coverage and binding descriptors, partial strides or combine arguments; retain
+physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
+changed device lengths and untouched tail canaries in both binding paths.
+
+
+Standalone prepared calls must enter Q's CUDA device before resolving an
+implicit stream or invoking a compiled host, and restore the caller's device on
+success and validation failure. A matching device in buffer metadata alone does
+not set the calling thread's CUDA context. The SM80 regression is
+`test_sm80_direct_standalone_with_another_device_current`: run with two GPUs,
+check the launch context and stream, then verify changed-input graph replay.

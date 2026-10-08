@@ -859,7 +859,9 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                            cudnn_frontend::DataType_t const& compute_data_type,
                            std::string const& name,
                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
+                           std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                           py::object const& max_total_seq_len_q,
+                           py::object const& max_total_seq_len_kv) {
     cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
     py::object actual_right_bound                                 = right_bound;
 
@@ -966,6 +968,13 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
         attributes.set_dsink_token(dSink_token);
     }
 
+    if (!max_total_seq_len_q.is_none()) {
+        attributes.set_max_total_seq_len_q(max_total_seq_len_q.cast<int64_t>());
+    }
+    if (!max_total_seq_len_kv.is_none()) {
+        attributes.set_max_total_seq_len_kv(max_total_seq_len_kv.cast<int64_t>());
+    }
+
     auto [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP] = graph->sdpa_fp8_backward(q,
                                                                                      k,
                                                                                      v,
@@ -1021,7 +1030,9 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
                              cudnn_frontend::DataType_t const& compute_data_type,
                              std::string const& name,
                              std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> sink_token,
-                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token) {
+                             std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> dSink_token,
+                             py::object const& max_total_seq_len_q,
+                             py::object const& max_total_seq_len_kv) {
     cudnn_frontend::DiagonalAlignment_t actual_diagonal_alignment = diagonal_alignment;
     py::object actual_right_bound                                 = right_bound;
 
@@ -1128,6 +1139,13 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
     }
     if (dSink_token) {
         attributes.set_dsink_token(dSink_token);
+    }
+
+    if (!max_total_seq_len_q.is_none()) {
+        attributes.set_max_total_seq_len_q(max_total_seq_len_q.cast<int64_t>());
+    }
+    if (!max_total_seq_len_kv.is_none()) {
+        attributes.set_max_total_seq_len_kv(max_total_seq_len_kv.cast<int64_t>());
     }
 
     // Call the MXFP8 backward
@@ -1538,6 +1556,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("name", ""),
           py::arg_v("sink_token", nullptr),
           py::arg_v("dSink_token", nullptr),
+          py::arg_v("max_total_seq_len_q", py::none()),
+          py::arg_v("max_total_seq_len_kv", py::none()),
           R"pbdoc(
                 Compute the key, query, value gradients of scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1575,6 +1595,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                     name (Optional[str]): The name of the operation.
                     sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Default is None.
                     dSink_token (Optional[cudnn_tensor]): Output tensor for sink token gradient. Default is None.
+                    max_total_seq_len_q (Optional[int]): Packed token total of the ragged Q (and the O / dO / Stats / dQ sharing its token axis). Only valid on a ragged layout. Default is None.
+                    max_total_seq_len_kv (Optional[int]): Packed token total of the ragged K/V (and dK / dV). Only valid on a ragged layout. Default is None.
 
                 Returns:
                     dQ (cudnn_tensor): The query gradient data.
@@ -1620,6 +1642,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg_v("name", ""),
           py::arg_v("sink_token", nullptr),
           py::arg_v("dSink_token", nullptr),
+          py::arg_v("max_total_seq_len_q", py::none()),
+          py::arg_v("max_total_seq_len_kv", py::none()),
           R"pbdoc(
                       Compute the key, query, value gradients of scaled dot product attention with mxfp8 (Microscaling FP8) datatype inputs and outputs.
 
@@ -1656,6 +1680,8 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
                           name (Optional[str]): The name of the operation.
                           sink_token (Optional[cudnn_tensor]): Sink token bias for streaming attention. Shape is (1, h_q, 1, 1), type is float32. Default is None.
                           dSink_token (Optional[cudnn_tensor]): Output tensor for sink token gradient. Shape is (1, h_q, 1, 1), type is float32. Default is None.
+                          max_total_seq_len_q (Optional[int]): Packed token total of the ragged Q (and the O / dO / Stats / dQ sharing its token axis). Only valid on a ragged layout. Default is None.
+                          max_total_seq_len_kv (Optional[int]): Packed token total of the ragged K/V (and dK / dV). Only valid on a ragged layout. Default is None.
 
                       Returns:
                           dQ (cudnn_tensor): The query gradient data.

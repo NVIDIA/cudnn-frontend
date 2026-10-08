@@ -385,6 +385,17 @@ def test_impl_auto_resolves_and_explicit_tma_declines_loudly():
     assert narrow.resolve_impl() == "ldg"
     with pytest.raises(NotImplementedError, match="cannot tile this geometry|needs sm_90"):
         _stage("tma", h_q=4, h_kv=2, d=64, rope=16)[0].resolve_impl()
+    # a geometry no tile fits by HEAD COUNT (tile_rows must divide h_q, be a multiple of h_kv and of the 4 warps; nothing in
+    # 16..1 does for h_q = 20 MHA or h_q = 6 over h_kv = 2): the fit is 0, `auto` resolves to ldg on EVERY arch and check_support
+    # passes -- the TMA validator types tile_rows=0 instead of dividing by it (a ZeroDivisionError no caller caught)
+    for h_q, h_kv in ((20, 20), (6, 2)):
+        wide, _ = _stage("auto", h_q=h_q, h_kv=h_kv)
+        assert wide.resolve_tile_rows() == 0 and wide.resolve_impl() == "ldg", (h_q, h_kv)
+        wide.check_support()
+        with pytest.raises(NotImplementedError, match="cannot tile this geometry|needs sm_90") as ei:
+            _stage("tma", h_q=h_q, h_kv=h_kv)[0].resolve_impl()
+        if "cannot tile" in str(ei.value):  # on sm_90+ the shape is the reason, and it names the head counts
+            assert f"h_q={h_q}" in str(ei.value) and f"h_kv={h_kv}" in str(ei.value), str(ei.value)
 
 
 @pytest.mark.L0
@@ -641,3 +652,97 @@ def test_stage_execute_checks_weights_against_the_geometry_both_ways():
         off.execute(t, kv, w, w, tab, tab)
     with pytest.raises(ValueError, match="together"):
         on.execute(t, kv, w, None, tab, tab)
+
+
+# ---------------------------------------------------------------------------
+# The TMA kernel's e4m3 epilogue (the quantized backward's Q / K rebuild)
+# ---------------------------------------------------------------------------
+
+
+def _fp8_and_tma_available() -> bool:
+    return torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) >= (9, 0)
+
+
+requires_fp8_tma = pytest.mark.skipif(not _fp8_and_tma_available(), reason="the e4m3 epilogue needs the TMA kernel (sm_90+) and the fp8 cvt (sm_89+)")
+
+
+@requires_fp8_tma
+@_QK_NORM
+@pytest.mark.parametrize("t", [64, 1003], ids=["aligned", "k-tail-overshoot"])
+def test_tma_e4m3_epilogue_is_bitwise_the_bf16_output_quantized(qk_norm, t):
+    """``q8`` / ``k8`` of the ``fp8_out`` artifact == the quantize pass over the bf16 artifact's output at the same static scales,
+    BYTE FOR BYTE (the epilogue rounds to bf16 first, then applies the pass's own multiply and cvt), under both arms; the K tail
+    tile that overshoots ``T`` stores nothing past the last token (the NaN poison past the tensor is the allocation's -- here
+    every row of the exact-size tensors is written: no 0x7F survivor); a scale change changes the bytes without a recompile;
+    the compile cache keys on ``fp8_out``."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import compile_qk_norm_rope_tma, run_qk_norm_rope_tma
+    from cudnn.gated_attention_block.kernels.quantize import compile_quantize, run_quantize
+
+    h_q, h_kv, d, rope_dim, tile_rows = 8, 2, 256, 64, 8
+    q, k, w_q, w_k, cos, sin = _make(t, h_q, h_kv, d, rope_dim, torch.bfloat16, seed=51)
+    w_q, w_k = _weights(w_q, w_k, qk_norm)
+    st = torch.cuda.current_stream().cuda_stream
+    kw = dict(dtype=torch.bfloat16, h_q=h_q, h_kv=h_kv, d=d, rope_dim=rope_dim, eps=_EPS, want_rstd=False, tile_rows=tile_rows, apply_norm=qk_norm)
+    r16 = compile_qk_norm_rope_tma(**kw)
+    r8 = compile_qk_norm_rope_tma(**kw, fp8_out=True)
+    assert r8.fp8_out is True and r16.fp8_out is False and r8.compiled is not r16.compiled
+    assert compile_qk_norm_rope_tma(**kw, fp8_out=False).compiled is r16.compiled
+    q16, k16 = torch.empty_like(q), torch.empty_like(k)
+    run_qk_norm_rope_tma(r16, q, k, q16, k16, w_q, w_k, cos, sin, stream=st)
+    sq = torch.tensor([7.0], device="cuda")
+    sk = torch.tensor([0.25], device="cuda")
+    q8 = torch.full((t, h_q, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    k8 = torch.full((t, h_kv, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    run_qk_norm_rope_tma(r8, q, k, None, None, w_q, w_k, cos, sin, stream=st, q8=q8, k8=k8, scale_q=sq, scale_k=sk)
+    torch.cuda.synchronize()
+
+    def _quant(src, scale):
+        dst = torch.empty(src.shape, dtype=torch.float8_e4m3fn, device="cuda")
+        run_quantize(compile_quantize(dtype_in=src.dtype, h=int(src.shape[1]), d=d), src, dst, scale, stream=st)
+        torch.cuda.synchronize()
+        return dst
+
+    assert not (q8.view(torch.uint8) == 0x7F).all(dim=-1).any() and not (k8.view(torch.uint8) == 0x7F).all(dim=-1).any(), "a row kept its poison"
+    assert torch.equal(q8.view(torch.uint8), _quant(q16, sq).view(torch.uint8)), "q8 differs from the quantize pass over the bf16 rebuild"
+    assert torch.equal(k8.view(torch.uint8), _quant(k16, sk).view(torch.uint8)), "k8 differs from the quantize pass over the bf16 rebuild"
+    sq.fill_(14.0)
+    run_qk_norm_rope_tma(r8, q, k, None, None, w_q, w_k, cos, sin, stream=st, q8=q8, k8=k8, scale_q=sq, scale_k=sk)
+    torch.cuda.synchronize()
+    assert torch.equal(q8.view(torch.uint8), _quant(q16, sq).view(torch.uint8)), "the scale is not read from the tensor"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_tma_e4m3_epilogue_contract_is_typed():
+    """``fp8_out`` both directions at execute (Rule 1): the e4m3 outputs and scales REQUIRED on an fp8_out artifact and refused on a
+    bf16 one; ``q_out`` / ``k_out`` refused on an fp8_out artifact; a non-e4m3 / misaligned ``q8``; ``fp8_out`` must be a bool."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import QkNormRopeTmaRecipe, compile_qk_norm_rope_tma, run_qk_norm_rope_tma
+
+    base = dict(compiled=None, h_q=8, h_kv=2, d=256, eps=_EPS, tile_rows=8, stages=2, stages_o=1, threads=128, want_rstd=False, ctas_per_sm=8, apply_norm=True)
+    r16 = QkNormRopeTmaRecipe(**base)
+    r8 = QkNormRopeTmaRecipe(**base, fp8_out=True)
+    assert r16.fp8_out is False
+    t = 4
+    x = torch.empty(t, 8, 256, dtype=torch.bfloat16, device="cuda")
+    kx = torch.empty(t, 2, 256, dtype=torch.bfloat16, device="cuda")
+    w = torch.ones(256, dtype=torch.bfloat16, device="cuda")
+    tab = torch.empty(t, 64, dtype=torch.bfloat16, device="cuda")
+    q8 = torch.empty(t, 8, 256, dtype=torch.float8_e4m3fn, device="cuda")
+    k8 = torch.empty(t, 2, 256, dtype=torch.float8_e4m3fn, device="cuda")
+    sc = torch.ones(1, device="cuda")
+    with pytest.raises(ValueError, match="WITH the e4m3 epilogue .*must all be bound"):
+        run_qk_norm_rope_tma(r8, x, kx, None, None, w, w, tab, tab, stream=0)
+    with pytest.raises(ValueError, match="pass q_out=k_out=None"):
+        run_qk_norm_rope_tma(r8, x, kx, x, kx, w, w, tab, tab, stream=0, q8=q8, k8=k8, scale_q=sc, scale_k=sc)
+    with pytest.raises(ValueError, match="WITHOUT the e4m3 epilogue"):
+        run_qk_norm_rope_tma(r16, x, kx, x, kx, w, w, tab, tab, stream=0, q8=q8, k8=k8, scale_q=sc, scale_k=sc)
+    with pytest.raises(ValueError, match="q8 must be a torch.float8_e4m3fn"):
+        run_qk_norm_rope_tma(r8, x, kx, None, None, w, w, tab, tab, stream=0, q8=x, k8=k8, scale_q=sc, scale_k=sc)
+    with pytest.raises(ValueError, match=r"k8 must be \[T=4, H=2, D=256\]"):
+        run_qk_norm_rope_tma(r8, x, kx, None, None, w, w, tab, tab, stream=0, q8=q8, k8=q8, scale_q=sc, scale_k=sc)
+    with pytest.raises(ValueError, match="scale_k must be a 1-element fp32 CUDA tensor"):
+        run_qk_norm_rope_tma(r8, x, kx, None, None, w, w, tab, tab, stream=0, q8=q8, k8=k8, scale_q=sc, scale_k=torch.ones(1))
+    odd8 = torch.empty(t, 8 * 256 + 8, dtype=torch.float8_e4m3fn, device="cuda")[:, : 8 * 256].view(t, 8, 256)
+    with pytest.raises(ValueError, match=r"q8 \(e4m3\) must be"):
+        run_qk_norm_rope_tma(r8, x, kx, None, None, w, w, tab, tab, stream=0, q8=odd8, k8=k8, scale_q=sc, scale_k=sc)
+    with pytest.raises(ValueError, match="fp8_out must be a bool"):
+        compile_qk_norm_rope_tma(dtype=torch.bfloat16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=_EPS, want_rstd=False, tile_rows=8, fp8_out=1)

@@ -38,6 +38,10 @@ class _UIDs(IntEnum):
     DBIAS = 203
 
 
+_FPROP_UIDS = tuple(map(int, (_UIDs.X, _UIDs.SCALE, _UIDs.BIAS, _UIDs.EPSILON, _UIDs.Y, _UIDs.MEAN, _UIDs.INV_VAR)))
+_BPROP_UIDS = tuple(map(int, (_UIDs.DY, _UIDs.X, _UIDs.SCALE, _UIDs.MEAN, _UIDs.INV_VAR, _UIDs.DX, _UIDs.DSCALE, _UIDs.DBIAS)))
+
+
 def _tensor_key(tensor: torch.Tensor) -> tuple:
     return tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype
 
@@ -205,17 +209,10 @@ def _layernorm_impl_on_device(
     inv_var = torch.empty_like(mean)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
     graph.execute(
-        {
-            int(_UIDs.X): x,
-            int(_UIDs.SCALE): scale,
-            int(_UIDs.BIAS): bias,
-            int(_UIDs.EPSILON): epsilon_tensor(eps),
-            int(_UIDs.Y): y,
-            int(_UIDs.MEAN): mean,
-            int(_UIDs.INV_VAR): inv_var,
-        },
+        (x, scale, bias, epsilon_tensor(eps), y, mean, inv_var),
         workspace,
         handle=handle,
+        tensor_uids=_FPROP_UIDS,
     )
     return y, mean, inv_var
 
@@ -276,18 +273,10 @@ def _layernorm_bwd_impl_on_device(
     dbias = torch.empty_like(dscale)
     workspace = torch.empty(max(workspace_size, 1), dtype=torch.uint8, device=x.device)
     graph.execute(
-        {
-            int(_UIDs.DY): dy,
-            int(_UIDs.X): x,
-            int(_UIDs.SCALE): scale,
-            int(_UIDs.MEAN): mean,
-            int(_UIDs.INV_VAR): inv_var,
-            int(_UIDs.DX): dx,
-            int(_UIDs.DSCALE): dscale,
-            int(_UIDs.DBIAS): dbias,
-        },
+        (dy, x, scale, mean, inv_var, dx, dscale, dbias),
         workspace,
         handle=handle,
+        tensor_uids=_BPROP_UIDS,
     )
     return dx, dscale, dbias
 

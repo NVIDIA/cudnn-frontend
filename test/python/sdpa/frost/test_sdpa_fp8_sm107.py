@@ -89,11 +89,14 @@ def test_sm100_module_unchanged():
 def test_sm107_per_tensor_fp8_native_shapes():
     """INVERTED 2026-09-04: the SM107 port added d256 and d512 per-tensor FP8.
     INVERTED again 2026-09-09: d192xd128 gained its Rubin sibling
-    (sm107/prefill_d192_d128_fp8.py), so both arch lines now carry all four
-    native flavors and the two shape sets are identical."""
+    (sm107/prefill_d192_d128_fp8.py), so both arch lines carry all four d >= 128
+    native flavors.  The SM100 line additionally carries the native d64 leg (the
+    d128 FP8 file at TemplateParams.d_flavor=64); Rubin has no d64 sibling and
+    keeps d64 on the d128 envelope, so the two shape sets differ by exactly that
+    flavor."""
     assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7))
-    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
+    assert _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0)) == _sm100_fp8_shapes(pertensor=True, device_cc=(10, 7)) | {(64, 64)}
     assert (192, 128) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
     assert (256, 256) in _sm100_fp8_shapes(pertensor=True, device_cc=(10, 0))
 
@@ -114,12 +117,17 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
     assert (sm100.sm_lo, sm100.sm_hi) == (100, 106)
     assert (sm107.sm_lo, sm107.sm_hi) == (107, 119)
     # Kernel flavors are row DATA.  FULLY INVERTED 2026-09-09: the Rubin line
-    # now carries all four per-tensor FP8 flavors, d192xd128 included, so the
-    # two rows agree on d_shapes.  They still differ on THD, split-KV, PackGQA
-    # and the scheduler domain -- which is the point of splitting the rows.
-    assert sm100.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    # now carries all four d >= 128 per-tensor FP8 flavors, d192xd128 included.
+    # The native d64 leg (the d128 FP8 file at TemplateParams.d_flavor=64) is
+    # SM100-only -- api_dsl._SM107_FP8_KERNEL_FILES has no (64, 64), so a d64
+    # graph rides the d128 envelope on Rubin and the row must not name a flavor
+    # its split / PackGQA / scheduler domains never build.  The rows still
+    # differ on THD, split-KV, PackGQA and the scheduler domain -- which is the
+    # point of splitting the rows.
+    assert sm100.d_shapes == frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)})
     assert sm107.d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
     assert (192, 128) in sm107.d_shapes
+    assert (64, 64) not in sm107.d_shapes
     # The envelope floors are arch-INDEPENDENT (api_dsl._SM100_FP8_ENVELOPE_FLOORS),
     # so a row that gains a flavor must gain its floor in the same commit --
     # otherwise mismatch() admits a graph check_support kills (contract 8b').
@@ -171,8 +179,11 @@ def test_per_tensor_fp8_rows_split_per_arch_line():
 
 
 def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
-    """A causal per-tensor FP8 graph ranks [LPT_L2, LPT, NATURAL] on the SM100
-    row (the L2-budget rule).  The Rubin d128 flavor claims the same three
+    """A causal per-tensor FP8 graph ranks [LPT, LPT_L2, NATURAL] on the SM100
+    row: the L2-budget rule leads with LPT_L2 only from 8 MiB of K+V per head
+    (heuristics._SM100_D128_LPT_L2_MIN_BYTES), and this head is 1 MiB, so its
+    K/V stays L2-resident under any walk and plain LPT keeps the balance.  The
+    Rubin d128 flavor claims the same three
     policies since 2026-09-14, but these facts have h_q == h_kv -- no K/V
     sharing for LPT_L2 to group -- and a 1.2-wave grid, so the Rubin rule leads
     with plain LPT and keeps the other two as autotune runners (measured on the
@@ -204,14 +215,15 @@ def test_sm107_row_ranks_lpt_first_for_a_few_wave_causal_grid():
     sm100 = caps[engines.engine_name(fp8=True)]
     sm107 = caps[engines.engine_name(arch="sm107", fp8=True)]
 
-    # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, far inside the L2 budget
-    # the SM100 rule groups against, so LPT_L2 leads there.  The Rubin row's
-    # d128 domain is {NATURAL, LPT, LPT_L2} too, but h_q == h_kv: LPT_L2 has
-    # nothing to group, and 1 x 8 x 16 tiles over 106 clusters is 1.2 waves,
-    # so the Rubin rule leads with LPT.  Both rows keep every domain member in
-    # the ranking (autotune), and neither proposes anything outside it.
+    # One head's K+V here is 4096 * 256 * 1 B = 1 MiB, under the SM100 d128 /
+    # d64 rows' 8 MiB floor for LPT_L2's head grouping, so plain LPT leads there
+    # (LPT_L2 stays the first autotune runner).  The Rubin row's d128 domain is
+    # {NATURAL, LPT, LPT_L2} too, but h_q == h_kv: LPT_L2 has nothing to group,
+    # and 1 x 8 x 16 tiles over 106 clusters is 1.2 waves, so the Rubin rule
+    # leads with LPT as well.  Both rows keep every domain member in the ranking
+    # (autotune), and neither proposes anything outside it.
     assert heuristics._sched_points(sm107, facts((10, 7))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
-    assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT_L2, SCHED_LPT, SCHED_NATURAL]
+    assert heuristics._sched_points(sm100, facts((10, 0))) == [SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL]
 
     # Both d128 remap specializations template-LOAD (the decode is correct
     # since #1001 and bit-identical to NATURAL -- the Rubin e2e below).
@@ -561,16 +573,8 @@ def test_sm107_quantized_d512_o_store_levers(pertensor):
     assert "O_EPI_LD_BATCH_FP32 = 64" in code and re.search(r"max\(\s*1,\s*O_EPI_LD_BATCH_FP32 // O_EPI_BLOCK_SIZE\s*\)", code)
 
 
-def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():
-    """config_sm107 permits the split for the ONE Rubin kernel that wires
-    make_split_helpers, and refuses it for every other flavor.
-
-    A blanket refusal contradicted the engine row, which advertises
-    ``split_d_shapes={(128, 128)}`` on the Rubin FP8 row: a long-KV Rubin graph
-    could be handed an automatically proposed split plan and then fail at
-    compile. The gate follows the ROW, not merely whether a body wires
-    SplitHelpers -- d192xd128 FP8 does, but is neither advertised nor carries an
-    o_partial_f32 slot, so it must still decline."""
+def test_sm107_split_is_wired_only_for_supported_flavors():
+    """Config and engine admission agree on the flavors with FP32 partials."""
     from cudnn.sdpa.fwd import config_sm107 as cfg
 
     def tp(**kw):
@@ -578,13 +582,13 @@ def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():
 
     # The wired cell builds.
     cfg.make_cfg_d128(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d192(tp(dtype_qkv=_E4M3, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d128(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
+    cfg.make_cfg_d192(tp(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT))
 
-    # Every other Rubin cell still refuses -- same entry point for the half
-    # d128 and d192 kernels, so the gate cannot key on the flavor string alone.
+    # Wider per-tensor and block-scaled Rubin cells still refuse split.
     unwired = [
-        ("d128 half", cfg.make_cfg_d128, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
         ("d128 mxfp8", cfg.make_cfg_d128_mxfp8, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
-        ("d192", cfg.make_cfg_d192, dict(dtype_qkv=_BF16_OUT, dtype_o=_BF16_OUT)),
         ("d256", cfg.make_cfg_d256, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
         ("d512", cfg.make_cfg_d512, dict(dtype_qkv=_E4M3, dtype_o=_BF16_OUT)),
     ]
@@ -592,6 +596,65 @@ def test_sm107_split_is_wired_only_for_per_tensor_fp8_d128():
         with pytest.raises(ValueError, match="split_kv > 1 is not wired"):
             make(tp(**params))
         assert make(cfg.TemplateParams(**params)) is not None, f"{name}: unsplit must still build"
+
+
+@pytest.mark.parametrize("mask,sq,skv", [("causal", 17, 385), ("bottom_right", 129, 2049), ("window", 513, 1025)])
+def test_sm107_d192_split_masked_tails(mask, sq, skv):
+    """Exercise dead splits, tail tiles and repeated scheduler waves against FP64."""
+    import math
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    torch.manual_seed(192107)
+    b, h, hk, d, dv = 2, 16, 4, 192, 128
+    q, k, v = [
+        (torch.randn(b, seq, heads, dim, device="cuda") * 0.5).to(torch.float8_e4m3fn).transpose(1, 2)
+        for seq, heads, dim in ((sq, h, d), (skv, hk, d), (skv, hk, dv))
+    ]
+    out = torch.empty((b, sq, h, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.empty((b, h, sq), device="cuda")
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=out,
+        sample_lse=lse,
+        pertensor_fp8=True,
+        pack_gqa=False,
+        split_kv=8,
+        cga=2,
+        is_causal=True,
+        causal_bottom_right=mask != "causal",
+        window_size_left=255 if mask == "window" else None,
+        scale_softmax=d**-0.5,
+        stats_log2=True,
+    )
+    assert api.check_support()
+    api.compile()
+    ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    rows = torch.arange(sq, device="cuda")[:, None]
+    cols = torch.arange(skv, device="cuda")[None, :]
+    diagonal = rows + (skv - sq if mask != "causal" else 0)
+    masked = cols > diagonal
+    if mask == "window":
+        masked = masked | (cols < diagonal - 255)
+    for _ in range(2):
+        q.copy_((torch.randn_like(q, dtype=torch.float32) * 0.5).to(q.dtype))
+        ws.fill_(255)
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=out, lse_tensor=lse, workspace=ws)
+        scores = q.double() @ k.double().repeat_interleave(h // hk, dim=1).transpose(-1, -2) / math.sqrt(d)
+        scores.masked_fill_(masked, -float("inf"))
+        ref = scores.softmax(-1) @ v.double().repeat_interleave(h // hk, dim=1)
+        # Use the existing FP8 split budget: P is quantized as well as Q/K/V.
+        # The norm bound also rejects missing/zero output despite a small scale.
+        torch.testing.assert_close(out.double(), ref, atol=0.05, rtol=0.03)
+        assert (out.double() - ref).norm() / ref.norm() < 0.06
+        torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-5, rtol=2e-5)
 
 
 def test_sm107_block_scaled_o_is_wired_only_for_the_d128_kernels():
@@ -768,7 +831,7 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
         on most rows with the quantized sum);
     (2) O is BIT-IDENTICAL with and without Stats -- the row-sum only feeds the
         LSE, Sigma normalizes O in both specializations.
-    The softmax_precision=HALF arm (f16x2 exponent, d128 only) holds the same
+    The softmax_precision=HALF arm (f16x2 exponent, d128 and d192x128) holds the same
     bound: its Stats denominator is a separate fp32 exponent of the same
     arguments (summing its f16 P measured rms 3.6e-4 off the exact value --
     the f16 exp-argument rounding and MUFU EX2.F16x2's 2^-9.9 do not average
@@ -778,8 +841,6 @@ def test_fp8_stats_is_the_exact_softmax_lse(d_qk, d_v, causal, half_softmax):
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
-    if half_softmax and (d_qk, d_v) != (128, 128):
-        pytest.skip("the f16x2 exponent arm lives on the d128 sibling only")
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     precision = _c.data_type.HALF if half_softmax else _c.data_type.FLOAT
@@ -1168,11 +1229,16 @@ def test_fp8_d256_amax_is_the_pre_gate_value():
 # Keep prepared-runtime probes in the explicit SM107 CI entry point.
 import torch
 import test_sdpa_prepared_fp8 as _prepared_fp8_checks
+from test_sdpa_fwd_dsl_sm107 import (
+    test_sm107_half_split_direct_template_stats_base,
+    test_sm107_half_split_masked_tails,
+    test_sm107_half_split_prepared_rebind_capture,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7), reason="SM107 required")
 class TestPreparedSm107Fp8:
-    @pytest.mark.parametrize("d,dv,split", [(128, 128, 1), (192, 128, 1), (256, 256, 1), (512, 512, 1), (128, 128, 4)])
+    @pytest.mark.parametrize("d,dv,split", [(128, 128, 1), (192, 128, 1), (256, 256, 1), (512, 512, 1), (128, 128, 4), (192, 128, 4)])
     @pytest.mark.parametrize("thd", [False, True])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
     def test_sm107_prepared_fp8_routes(self, d, dv, split, thd, dtype):
@@ -1258,36 +1324,41 @@ class TestPreparedSm107Fp8:
     @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
     @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
     @pytest.mark.parametrize("splits", [2, 4])
-    def test_sm107_fp8_split_rebind(self, dtype, output_dtype, splits, monkeypatch):
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_rebind(self, d, dtype, output_dtype, splits, monkeypatch):
         import test_sdpa_prepared_fp8_split as split
 
-        split.test_prepared_fp8_split_rebind("sm107", 128, 128, dtype, output_dtype, splits, monkeypatch)
+        split.test_prepared_fp8_split_rebind("sm107", d, 128, dtype, output_dtype, splits, monkeypatch)
 
     @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-    def test_sm107_fp8_split_capture(self, stats, amax, dtype):
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_capture(self, d, stats, amax, dtype):
         import test_sdpa_prepared_fp8_split as split
 
-        split.test_prepared_fp8_split_capture("sm107", 128, 128, stats, amax, dtype)
+        split.test_prepared_fp8_split_capture("sm107", d, 128, stats, amax, dtype)
 
-    def test_sm107_fp8_split_overrides(self, monkeypatch):
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_overrides(self, d, monkeypatch):
         import test_sdpa_prepared_fp8_split as split
 
-        split.test_prepared_fp8_split_runtime_kv_and_strides("sm107", 128, 128, monkeypatch)
+        split.test_prepared_fp8_split_runtime_kv_and_strides("sm107", d, 128, monkeypatch)
 
     @pytest.mark.gpu_exclusive
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-    def test_sm107_fp8_split_physical_stride_int64(self, dtype):
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_physical_stride_int64(self, d, dtype):
         import test_sdpa_prepared_fp8_split as split
 
-        split.test_prepared_fp8_split_output_stride_int64("sm107", 128, 128, dtype)
+        split.test_prepared_fp8_split_output_stride_int64("sm107", d, 128, dtype)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-    def test_sm107_fp8_split_omitted_scales(self, dtype):
+    @pytest.mark.parametrize("d", [128, 192])
+    def test_sm107_fp8_split_omitted_scales(self, d, dtype):
         import test_sdpa_prepared_fp8_split as split
 
         # The shared SM100 API owns both arch lines and selects SM107 at runtime.
-        split.test_prepared_fp8_split_standalone_default_scales("sm100", 128, 128, dtype)
+        split.test_prepared_fp8_split_standalone_default_scales("sm100", d, 128, dtype)
 
     @pytest.mark.parametrize("d,dv", [(64, 64), (112, 96), (384, 320)])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -1446,3 +1517,58 @@ class TestMixedStagedFp8:
     from test_sdpa_staged_forward_fp8 import test_sm107_d256_staging_preserves_each_native_operand as _mixed_layout
 
     test_mixed_layout = staticmethod(_mixed_layout)
+
+
+@pytest.mark.parametrize("d", [128, 192])
+def test_sm107_fp8_direct_split_keeps_partial_stats_natural(d, monkeypatch):
+    """Bypass adapter flag normalization and check the template/combiner log-base contract."""
+    import math
+    from dataclasses import replace
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    b, h, sq, sk, dv, splits = 1, 2, 16, 512, 128, 4
+    q = torch.full((b, sq, h, d), 0.5, device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2)
+    chunks = torch.arange(sk, device="cuda") // 128 + 1
+    k = (chunks.view(1, sk, 1, 1) * 0.5).expand(b, sk, 1, d).to(q.dtype).contiguous().transpose(1, 2)
+    v = (chunks.view(1, sk, 1, 1) * 0.125).expand(b, sk, 1, dv).to(q.dtype).contiguous().transpose(1, 2)
+    out = torch.empty((b, sq, h, dv), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.empty((b, h, sq), device="cuda")
+    api = SdpaFwdDslSm100(q, k, v, out, lse, pertensor_fp8=True, pack_gqa=False, split_kv=splits, cga=2, stats_log2=True)
+    assert api.check_support()
+    # Direct template callers can set this flag; the ordinary adapter clears it
+    # for partials and would otherwise hide a missing kernel-entry guard.
+    params = replace(api.template_params(), stats_log2=True)
+    monkeypatch.setattr(api, "template_params", lambda: params)
+    api.compile()
+    assert api._k_mod.CFG.STATS_LOG2
+    workspace = torch.full((api.scratch_workspace_bytes(),), 255, device="cuda", dtype=torch.uint8)
+    api.execute(q, k, v, out, lse_tensor=lse, workspace=workspace)
+    offset = api._dense_spec.combine.lse_offset
+    partial_lse = workspace[offset : offset + splits * b * h * sq * 4].view(torch.float32).view(splits, b, h, sq)
+    scores = q.double() @ k.double().repeat_interleave(h, 1).transpose(-1, -2) / math.sqrt(d)
+    for split in range(splits):
+        torch.testing.assert_close(partial_lse[split].double(), scores[..., split * 128 : (split + 1) * 128].logsumexp(-1), atol=2e-4, rtol=2e-5)
+    ref = scores.softmax(-1) @ v.double().repeat_interleave(h, 1)
+    torch.testing.assert_close(out.double(), ref, atol=3e-3, rtol=3e-3)
+    torch.testing.assert_close(lse.double(), scores.logsumexp(-1) * math.log2(math.e), atol=2e-4, rtol=2e-5)
+
+
+@pytest.mark.parametrize("d,pack,accepted", [(128, True, True), (192, False, True), (192, True, False)])
+def test_sm107_fp8_split_standalone_pack_domain(d, pack, accepted):
+    """A divisible GQA group does not make an unvalidated packed flavor eligible."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("SM107 required")
+    q, k, v = [
+        torch.empty((1, s, h, width), device="cuda", dtype=torch.float8_e4m3fn).transpose(1, 2) for s, h, width in ((16, 4, d), (512, 1, d), (512, 1, 128))
+    ]
+    out = torch.empty((1, 16, 4, 128), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    api = SdpaFwdDslSm100(q, k, v, out, pertensor_fp8=True, split_kv=4, pack_gqa=pack, cga=2)
+    if accepted:
+        assert api.check_support()
+    else:
+        with pytest.raises(NotImplementedError, match="PackGQA"):
+            api.check_support()

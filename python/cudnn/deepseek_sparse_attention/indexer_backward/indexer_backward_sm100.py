@@ -408,6 +408,8 @@ class IndexerBackwardSm100:
         self.heads = heads
         self.block_I = block_I
         self.topk = topk
+        # Row and K extents are runtime values; ``total_rows`` only selects the
+        # launch policy below, so one compiled kernel serves every packed shape.
         self.total_seqlen_k = total_seqlen_k
         self.total_rows = total_rows
         self.persistent_grid_size = persistent_grid_size
@@ -624,14 +626,14 @@ class IndexerBackwardSm100:
             gI_desc = cute.make_tensor(
                 mTopkIdx.iterator,
                 cute.make_layout(
-                    (self.total_seqlen_k, self.head_dim_padded),
+                    (cute.size(mK.shape[0]), self.head_dim_padded),
                     stride=(1, 0),
                 ),
             )
             mK_gather = cute.make_tensor(
                 mK.iterator,
                 cute.make_layout(
-                    (self.total_seqlen_k, self.head_dim_padded),
+                    (cute.size(mK.shape[0]), self.head_dim_padded),
                     stride=(self.head_dim_padded, 1),
                 ),
             )
@@ -665,8 +667,7 @@ class IndexerBackwardSm100:
         seqlen = cute.size(mQ.shape[0])
         batch_size = cute.size(mQ.shape[3]) if cute.rank(mQ.shape) > 3 else 1
 
-        grid_rows = min(self.total_rows, self.persistent_grid_size) if self.use_persistent else self.total_rows
-        launch_grid = (grid_rows, 1, 1) if self.use_persistent else (seqlen, batch_size, 1)
+        launch_grid = (cutlass.min(seqlen * batch_size, self.persistent_grid_size), 1, 1) if self.use_persistent else (seqlen, batch_size, 1)
         self.kernel_gemm(
             mQ_tma,
             mW,
@@ -748,6 +749,7 @@ class IndexerBackwardSm100:
             batch_idx = cute.arch.block_idx()[1]
             flat_row_idx = batch_idx * seqlen + seq_idx
         seqlen_k = cute.size(mK.shape[0])
+        total_rows = seqlen * batch_size
 
         # TMA descriptor prefetch (load warp only)
         if warp_idx == self.load_warp_id:
@@ -1174,7 +1176,7 @@ class IndexerBackwardSm100:
             row_stride = cute.arch.grid_dim()[0]
             for next_flat_row in cutlass.range(
                 flat_row_idx + row_stride,
-                self.total_rows,
+                total_rows,
                 row_stride,
             ):
                 next_batch_idx = next_flat_row // seqlen
@@ -1315,6 +1317,7 @@ class IndexerBackwardSm100:
         from ``num_topk_blocks`` so one-, two-, three-, and four-block rows can
         share the same role decomposition without restarting the pipeline.
         """
+        total_rows = seqlen * batch_size
         s_acc_shape = tmma1.partition_shape_C(self.gemm1_tiler[:2])
         s_acc_layout = tmma1.make_fragment_C(s_acc_shape).layout
         dq_acc_shape = tmma3.partition_shape_C(self.gemm3_tiler[:2])
@@ -1409,7 +1412,7 @@ class IndexerBackwardSm100:
             lane_id = tidx % self.WARP_SIZE
             for row in cutlass.range(
                 first_flat_row,
-                self.total_rows,
+                total_rows,
                 row_stride,
             ):
                 it = (row - first_flat_row) // row_stride
@@ -1517,7 +1520,7 @@ class IndexerBackwardSm100:
             )
             for row in cutlass.range(
                 first_flat_row,
-                self.total_rows,
+                total_rows,
                 row_stride,
             ):
                 it = (row - first_flat_row) // row_stride
@@ -1613,7 +1616,7 @@ class IndexerBackwardSm100:
             sdQ_epi_slice = sdQ_epi[None, None, 0]
             for row in cutlass.range(
                 first_flat_row,
-                self.total_rows,
+                total_rows,
                 row_stride,
             ):
                 it = (row - first_flat_row) // row_stride
@@ -1673,7 +1676,7 @@ class IndexerBackwardSm100:
                     mbar + MBAR_ROW_FREE_0 + parity,
                 )
 
-            last_it = (self.total_rows - 1 - first_flat_row) // row_stride
+            last_it = (total_rows - 1 - first_flat_row) // row_stride
             last_parity = last_it & 1
             cute.arch.mbarrier_wait(
                 mbar + MBAR_ROW_FREE_0 + last_parity,
@@ -1688,7 +1691,7 @@ class IndexerBackwardSm100:
             cute.arch.setmaxregister_decrease(self.num_regs_kload)
             for row in cutlass.range(
                 first_flat_row,
-                self.total_rows,
+                total_rows,
                 row_stride,
             ):
                 it = (row - first_flat_row) // row_stride
@@ -1739,7 +1742,7 @@ class IndexerBackwardSm100:
             )
             for row in cutlass.range(
                 first_flat_row,
-                self.total_rows,
+                total_rows,
                 row_stride,
             ):
                 it = (row - first_flat_row) // row_stride
@@ -3424,8 +3427,9 @@ def indexer_backward_sm100(
     block_I=128,
     topk_indices_global: bool = True,
 ):
-    # ``batch``/``seqlen``/``seqlen_k`` specialize the persistent-row schedule
-    # and Gather4 descriptor extent, so they are part of the GEMM compile key.
+    # ``batch``/``seqlen``/``seqlen_k`` are runtime extents (packed training
+    # changes them every step, GitHub #1188). They only select the persistent
+    # launch policy, and that policy -- not the shape -- is in the compile key.
     # ``grad_scale`` remains runtime-only (forwarded into ``score_grad`` as a
     # ``Float32`` at call time), so changing loss scaling does not recompile.
     #
@@ -3822,14 +3826,13 @@ def _build_cute_dsl_kernel(
         True: _make_kernel(True),
     }
     compile_key_base = (
-        batch,
-        seqlen,
-        seqlen_k,
         heads,
         dim,
         topk,
         block_I,
         topk_indices_global,
+        kernel_objects[False].use_persistent,
+        persistent_grid_size,
     )
 
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, enable_score_pdl: bool, current_stream=None):

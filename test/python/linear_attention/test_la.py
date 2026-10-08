@@ -65,6 +65,14 @@ STATE_TOL = {torch.bfloat16: 2e-2, torch.float16: 1e-2}
 BWD_TOL = {torch.bfloat16: 4e-2, torch.float16: 3e-2}
 STATE_GRAD_TOL = 6e-2
 
+L2_NORM_EPS = 1e-6
+
+
+def l2norm_ref(x):
+    """The in-kernel Q/K normalization, ``x * rsqrt(sum(x * x) + L2_NORM_EPS)``."""
+    return x * (x.square().sum(-1, keepdim=True) + L2_NORM_EPS).rsqrt()
+
+
 HEAD_DIMS = [(64, 64), (64, 128), (128, 64), (128, 128)]  # (K, V) pairs every FROST family serves
 WIDE_HEAD_DIMS = [(192, 128), (256, 128)]  # cuTile only
 
@@ -373,8 +381,8 @@ def reference(
     """fp64 reference forward of a case; returns (o, final_state) with V-major states."""
     tensors = dict(case_tensors(case))
     if l2norm:
-        tensors["q"] = F.normalize(case.q.float(), dim=-1)
-        tensors["k"] = F.normalize(case.k.float(), dim=-1)
+        tensors["q"] = l2norm_ref(case.q.float())
+        tensors["k"] = l2norm_ref(case.k.float())
     if v is not None:
         tensors["v"] = v
     kwargs = dict(scale=scale, initial_state=initial_state)
@@ -661,6 +669,16 @@ def test_fwd_qk_l2norm(backend, variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
+def test_fwd_qk_l2norm_small_rows(backend, variant):
+    """Rows whose squared norm sits near L2_NORM_EPS, where the epsilon is not negligible."""
+    case = make_case(variant, torch.bfloat16, T=256)
+    for x in (case.q, case.k):
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    assert_fwd_parity(backend, case, l2norm=True)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
 def test_fwd_strong_decay_varlen(backend, variant):
     case = make_case(variant, torch.bfloat16, seq_lens=[100, 2048, 0, 517], lo=0.1 if variant in SCALAR_GATE_VARIANTS else 0.3)
     assert_fwd_parity(backend, case)
@@ -728,7 +746,7 @@ def assert_bwd_parity(
 
     ref_tensors = dict(ref_leaves)
     if l2norm:
-        ref_tensors["q"], ref_tensors["k"] = F.normalize(ref_leaves["q"], dim=-1), F.normalize(ref_leaves["k"], dim=-1)
+        ref_tensors["q"], ref_tensors["k"] = l2norm_ref(ref_leaves["q"]), l2norm_ref(ref_leaves["k"])
     ref_kwargs = dict(scale=scale, initial_state=state0_ref)
     if beta_guard:
         ref_kwargs["beta_guard"] = True
@@ -896,6 +914,16 @@ def test_bwd_scale(backend, variant):
 def test_bwd_qk_l2norm(backend, variant):
     """dQ/dK must include the in-kernel normalization's own backward."""
     assert_bwd_parity(backend, make_case(variant, torch.bfloat16, T=128), l2norm=True)
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_bwd_qk_l2norm_small_rows(backend, variant):
+    """dQ/dK on rows whose squared norm sits near L2_NORM_EPS, where ``y = x * inv`` is not a unit vector."""
+    case = make_case(variant, torch.bfloat16, T=128)
+    for x in (case.q, case.k):
+        x[:, 0::4] *= 1e-4
+        x[:, 1::4] *= 1e-5
+    assert_bwd_parity(backend, case, l2norm=True)
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -1889,7 +1917,7 @@ def test_beta_sigmoid_backward(backend, variant, beta_dtype, V):
 def beta_guard_trip_fraction(case):
     """Reference sensor trip/fallback fractions on a case with H == HV == HO
     (no head expansion) and log-space gates (no safe_gate)."""
-    kn = F.normalize(case.k.float(), dim=-1).double()
+    kn = l2norm_ref(case.k.float()).double()
     _, unsafe, fallback = beta_guard_reference(kn, case.gates["beta"].double(), case.gates["g"].double().exp(), case.dtype)
     return unsafe.double().mean().item(), fallback.double().mean().item()
 
@@ -4939,3 +4967,18 @@ def test_prep_state_indices_bitwise(backend, variant, padded):
     assert_bitwise("o", o, o_ref)
     assert_bitwise("final_state", pool[slots.long()], fs_ref)
     assert (pool[spare] == 3.14159).all()
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", CHANNEL_VARIANTS)
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+def test_parallel_descriptor_batches(backend, variant, batch, backward):
+    """Every lane publishes its own slots, across warp chunks and empty sequences."""
+    lengths = [[0, 1, 15, 17, 33][i % 5] for i in range(batch)]
+    case = make_case(variant, torch.bfloat16, seq_lens=lengths, H=2, K=64, V=64)
+    if backward:
+        assert_bwd_parity(backend, case)
+    else:
+        assert_fwd_parity(backend, case)

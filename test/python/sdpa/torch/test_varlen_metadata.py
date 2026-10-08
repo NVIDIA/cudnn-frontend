@@ -84,10 +84,18 @@ def test_torch_ops_do_not_rebuild_prefix_casts(backward, monkeypatch):
     observed = []
 
     class Graph:
-        def execute(self, variant, workspace, *, handle):
-            observed.append(variant)
+        def execute(self, buffers, workspace, *, handle, tensor_uids):
+            observed.append(dict(zip(tensor_uids, buffers)))
 
-    monkeypatch.setattr(torch_op, "_cached_graph", lambda *a, **k: (Graph(), 0))
+    uid = torch_op._UIDs
+    uids = [uid.Q, uid.K, uid.V, uid.O]
+    uids += [uid.DO, uid.STATS, uid.DQ, uid.DK, uid.DV] if backward else [uid.STATS]
+    uids += [uid.SEQ_LEN_Q, uid.SEQ_LEN_KV, uid.RAGGED_Q, uid.RAGGED_O]
+    uids += [uid.RAGGED_DQ] if backward else [uid.RAGGED_STATS]
+    uids += [uid.RAGGED_KV, uid.RAGGED_V]
+    if backward:
+        uids += [uid.RAGGED_DK, uid.RAGGED_DV]
+    monkeypatch.setattr(torch_op, "_cached_graph", lambda *a, **k: (Graph(), 0, tuple(uids)))
     monkeypatch.setattr(torch.Tensor, "to", lambda *a, **k: pytest.fail("torch op rebuilt a prefix conversion"))
     kwargs = dict(cu_seqlens_q=cq, cu_seqlens_kv=ck, max_seqlen_q=4, max_seqlen_kv=5)
     if backward:

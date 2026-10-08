@@ -176,7 +176,9 @@ from cudnn.frost.tile_dsl.pointwise import (
     row_max_reduction_64,
     vec_scale_pair,
 )
+from cudnn.frost.tile_dsl import softmax_f16 as _softmax_f16
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
+from cudnn.sdpa.kernels._mxfp8_sf import build_columnwise_sf_desc, build_rowwise_sf_desc, sf_peer_split, sf_tma_rows
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
     tma_store_tile,
@@ -203,6 +205,22 @@ elif CFG.DTYPE_QKV == 1:
     P_STORAGE_DTYPE = cutlass.Float8E5M2
 
 MMA_KIND = nvvm.MMABlockScaleKind.MXF8F6F4
+# softmax_precision=cudnn.data_type.HALF (TemplateParams.softmax_f16): the exponent runs as MUFU EX2.F16x2 on packed
+# pairs and P casts straight from f16x2 to the FP8 pair format (the d128 MXFP8 sibling's arm).  This kernel normalizes O
+# with a REGISTER row-sum (no ones-MMA Sigma), so the stats-less HALF arm sums the f16x2 P words it stores (an HADD2 pair
+# tree: self-consistent with the P the MMA consumes, below the FP8 P noise) and the Stats specialization keeps the EXACT
+# f32 sum for O and the published LSE (honored, not faster).  Default stays the f32 chain.
+SOFTMAX_F16 = int(PARAMS.softmax_f16)
+# softmax_scale_prefolded: the caller multiplied Q by attn_scale * log2(e), so the kernel takes the RAW tile max and
+# shifts by it (no per-score FFMA2 by the scale; scale_log2 stays a dead runtime argument pinned to 1.0).  The published
+# Stats, the sink fold and the LSE consume the same log2-domain max as the scaled chain, so they are unchanged.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+# With BOTH set and no Stats, the shift and the f32->f16 convert fuse into ONE instruction per pair (nvvm sub.packed
+# f16x2 <- f32x2 - f32x2; SASS FHADD2 .FTZ.RZ) on the RAW scores -- softmax_f16.FUSED_SHIFT_CVT_AVAILABLE gates the DSL
+# op; without it the unfused HALF arm runs (same numerics as HALF alone).  The Stats specialization needs the shifted f32
+# scores for the exact denominator and never takes the fused arm.  Tests read this constant by name.
+_FUSED_SHIFT_CVT = bool(SOFTMAX_F16 and SCALE_PREFOLDED and _softmax_f16.FUSED_SHIFT_CVT_AVAILABLE)
+_FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
 SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
 
 
@@ -827,6 +845,7 @@ def _kernel(
             bars=bars,
             sched=sched,
             lse_tensor=lse_tensor,
+            has_lse=lse_tensor is not None,
             amax_o_tensor=amax_o_tensor,
             sinks_tensor=sinks_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
@@ -1083,13 +1102,13 @@ def _tmaldg_warp_group(
     tma_k_sf = GmemTileTma(tma_k_sf_desc)
     tma_v_sf = GmemTileTma(tma_v_sf_desc)
 
-    SF_TMA_ROW_BYTES = 128
-    K_SF_BYTES_PER_PEER = SF_SMEM_SIZE_K // CFG.CTA_MMA
-    V_SF_BYTES_PER_PEER = SF_SMEM_SIZE_V // CFG.CTA_MMA
-    K_SF_ROWS_PER_PEER = K_SF_BYTES_PER_PEER // SF_TMA_ROW_BYTES
-    k_sf_peer_off = cta_in_pair * cutlass.Int32(K_SF_BYTES_PER_PEER)
-    v_sf_peer_off = cta_in_pair * cutlass.Int32(V_SF_BYTES_PER_PEER)
-    k_sf_peer_row = cta_in_pair * cutlass.Int32(K_SF_ROWS_PER_PEER)
+    # cga2 peer split of the K / V SF slabs -- bytes in SMEM, 128-B rows in the
+    # descriptor (sdpa/kernels/_mxfp8_sf.py); the offsets fold to 0 under cga1.
+    K_SF_SPLIT = sf_peer_split(SF_SMEM_SIZE_K, CFG.CTA_MMA)
+    V_SF_SPLIT = sf_peer_split(SF_SMEM_SIZE_V, CFG.CTA_MMA)
+    k_sf_peer_off = cta_in_pair * cutlass.Int32(K_SF_SPLIT.bytes_per_peer)
+    v_sf_peer_off = cta_in_pair * cutlass.Int32(V_SF_SPLIT.bytes_per_peer)
+    k_sf_peer_row = cta_in_pair * cutlass.Int32(K_SF_SPLIT.rows_per_peer)
     # V's SF descriptor is D-plane-major (host), so the peer split is a plane
     # coord, not a row offset (K, being rowwise, keeps the row form).
     v_sf_peer_plane = cta_in_pair * cutlass.Int32(V_SF_PLANES_PER_PEER)
@@ -1732,6 +1751,126 @@ def _mma_warp_group(
 
 
 @cute.jit
+def _softmax_tail(
+    has_lse: cutlass.Constexpr[bool],
+    reg_S_a,
+    reg_S_b,
+    max_a,
+    max_b,
+    scale_log2,
+    total_max,
+    total_sum,
+    p_addr_a,
+    p_addr_b,
+    stats_addr,
+    parity_rt,
+    bars,
+    leader_cta_id,
+):
+    """Per-kv-tile softmax tail shared by the four loop segments (dense, left-masked, unmasked interior,
+    right-masked): running max + alpha publish, the exponent / FP8 cast / P publish of both 64-wide chunks,
+    and the register row-sum update.  Returns ``(total_max, total_sum)``.  Everything arrives as an
+    argument (no closure), which is what lets the tracer call it from inside ``cutlass.range``.
+
+    Compile-time arms:
+
+    * FLOAT (default): f32 ``exp2`` per score, f32 -> FP8 pair cast, f32 register row-sum of the
+      unquantized P -- the chain this kernel always ran, identical with and without Stats.
+    * HALF without Stats: ``f16_exp_chunk_f16sum`` (CVT pairs, MUFU EX2.F16x2, f16x2 -> FP8 cast); O's
+      denominator is the HADD2 pair-tree sum of the SAME f16x2 P words the MMA consumes.  With the
+      pre-folded scale and the fused op available, ``fused_shift_f16_exp_chunk_f16sum`` runs on the RAW
+      scores (shift + convert in one FHADD2 per pair).
+    * HALF with Stats: ``f16_exp_chunk_sum`` -- the f16 P words plus the EXACT f32 row-sum, so O and the
+      published LSE keep the f32 denominator (honored, not faster than FLOAT).
+
+    Under SCALE_PREFOLDED the running max is the RAW tile max (Q already carries attn_scale * log2 e) and
+    the shift is a plain subtract.  A fully-masked tile then leaves the raw max at the finite mask sentinel
+    (== NEG_INF), so is_first re-fires on consecutive keyless tiles (alpha = 0 where the scaled chain ran
+    alpha = 1): the first live tile wipes the accumulator either way and keyless rows are overridden by
+    the correction's _kv_empty select, so O / LSE are unchanged.
+
+    Order: the chunk-a P publish precedes chunk b's exponent (the MMA starts PV on chunk a early) and the
+    ``total_sum`` accumulate follows both publishes, as in the bodies this replaced.  The f16-sum helpers
+    return a chunk's words and its pair-tree sum together, so that tree is traced with the chunk's exponent.
+    """
+    CHUNK = 64
+    NEG_INF = cutlass.Float32(-3.4028235e38)
+    RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        current_max = cute.math.max(max_a, max_b)
+    else:
+        current_max = cute.math.max(max_a, max_b) * scale_log2
+
+    old_total_max = total_max
+    is_first = total_max == NEG_INF
+    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
+    total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
+    exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
+    alpha = cute.math.exp2(exp_input, fastmath=True)
+    new_total_max = total_max
+    alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
+    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    bars.mb_stat_full.arrive()
+
+    if cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse):
+        # Fused arm (stats-less): RAW scores -> FHADD2 (shift + f32->f16 per pair) -> MUFU EX2.F16x2 -> FP8 words,
+        # plus the f16 pair-tree sum of those words.  No shifted f32 copy of the scores exists.
+        p_words_a, p_sum_a = _softmax_f16.fused_shift_f16_exp_chunk_f16sum(reg_S_a, new_total_max, _FP8_TAG_P, CHUNK)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Int32), p_words_a)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+        p_words_b, p_sum_b = _softmax_f16.fused_shift_f16_exp_chunk_f16sum(reg_S_b, new_total_max, _FP8_TAG_P, CHUNK)
+        nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Int32), p_words_b)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    else:
+        if cutlass.const_expr(SCALE_PREFOLDED):
+            reg_S_a = reg_S_a - new_total_max
+            reg_S_b = reg_S_b - new_total_max
+        else:
+            reg_S_a = reg_S_a * scale_log2 - new_total_max
+            reg_S_b = reg_S_b * scale_log2 - new_total_max
+
+        if cutlass.const_expr(SOFTMAX_F16):
+            if cutlass.const_expr(has_lse):
+                p_words_a, p_sum_a = _softmax_f16.f16_exp_chunk_sum(reg_S_a, _FP8_TAG_P, CHUNK)
+            else:
+                p_words_a, p_sum_a = _softmax_f16.f16_exp_chunk_f16sum(reg_S_a, _FP8_TAG_P, CHUNK)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Int32), p_words_a)
+        else:
+            reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
+            p_a_fp8 = reg_P_a.to(STORAGE_DTYPE)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp8)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+        if cutlass.const_expr(SOFTMAX_F16):
+            if cutlass.const_expr(has_lse):
+                p_words_b, p_sum_b = _softmax_f16.f16_exp_chunk_sum(reg_S_b, _FP8_TAG_P, CHUNK)
+            else:
+                p_words_b, p_sum_b = _softmax_f16.f16_exp_chunk_f16sum(reg_S_b, _FP8_TAG_P, CHUNK)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Int32), p_words_b)
+        else:
+            reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
+            p_b_fp8 = reg_P_b.to(STORAGE_DTYPE)
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp8)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
+        if cutlass.const_expr(not SOFTMAX_F16):
+            # FLOAT: the f32 register row-sum of the unquantized P, after both publishes (the chain's original order).
+            p_sum_a = row_reduction_pair_64(reg_P_a)
+            p_sum_b = row_reduction_pair_64(reg_P_b)
+
+    alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
+    total_sum = total_sum * alpha_pair + (p_sum_a + p_sum_b)
+    return total_max, total_sum
+
+
+@cute.jit
 def _softmax_warp_group(
     seqlen_q,
     seqlen_kv,
@@ -1740,6 +1879,9 @@ def _softmax_warp_group(
     bars,
     sched,
     lse_tensor: Optional[cute.Tensor],
+    # Stats requested (lse_tensor is not None), threaded as a compile-time flag: it picks the row-sum source of the
+    # HALF arms in _softmax_tail (exact f32 sum with Stats, f16 pair-tree sum without) and keeps the fused arm stats-less.
+    has_lse: cutlass.Constexpr[bool],
     # FROST's MXFP8 ABI puts amax_o RIGHT AFTER lse (position 9).  None-specialized
     # when compile(has_amax=False): the |o| fold and the atomicMax fold out under
     # const_expr(amax_o_tensor is not None), the way a None lse_tensor folds the
@@ -1758,6 +1900,9 @@ def _softmax_warp_group(
 
     SF_P is the constant 1.0 already in tmem.SF_P (filled once at MMA
     warp start).  3-segment kv loop: LEFT-masked / unmasked / RIGHT-masked.
+    Every segment ends in the ONE shared tail (_softmax_tail: running max,
+    alpha publish, exponent arm, P publish, register row-sum), so the softmax
+    levers (SOFTMAX_F16 / SCALE_PREFOLDED / _FUSED_SHIFT_CVT) exist once.
     """
     nvvm.barrier_cta_sync(barrier_id=1, thread_count=32 * (CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS + 1))
 
@@ -1802,11 +1947,11 @@ def _softmax_warp_group(
         stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
-        # Body inlined (no nested @cute.jit helper) so the DSL tracer can
-        # dispatch through cutlass.range without hitting the closure check.
+        # The per-segment preamble (parity, TMEM addresses, S load, mask, tile max) stays inlined per segment; the
+        # tail is the module-level @cute.jit _softmax_tail, which takes every value as an argument (no closure) so
+        # the tracer dispatches it through cutlass.range.
         CHUNK = 64
         P_COLS_PER_CHUNK = CHUNK // 4  # fp8 packed 4:1 into FP32 cells
-        RESCALE_THRESHOLD = cutlass.Float32(CFG.RESCALE_THRESHOLD)
 
         if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
@@ -1835,39 +1980,22 @@ def _softmax_warp_group(
                 reg_S_b = cutlass.Vector.from_elements(tuple(res_b[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32)
                 max_a = cutlass.Vector.from_elements((res_a[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0]
                 max_b = cutlass.Vector.from_elements((res_b[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0]
-                current_max = cute.math.max(max_a, max_b) * scale_log2
-
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_stat_full.arrive()
-
-                reg_S_a = reg_S_a * scale_log2 - new_total_max
-                reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
-                p_a_fp8 = reg_P_a.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-
-                reg_S_b = reg_S_b * scale_log2 - new_total_max
-                reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
-                p_b_fp8 = reg_P_b.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-
-                sum_a_pair = row_reduction_pair_64(reg_P_a)
-                sum_b_pair = row_reduction_pair_64(reg_P_b)
-                new_p_sum_pair = sum_a_pair + sum_b_pair
-                alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
-                total_sum = total_sum * alpha_pair + new_p_sum_pair
+                total_max, total_sum = _softmax_tail(
+                    has_lse,
+                    reg_S_a,
+                    reg_S_b,
+                    max_a,
+                    max_b,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    p_addr_a,
+                    p_addr_b,
+                    stats_addr,
+                    parity_rt,
+                    bars,
+                    leader_cta_id,
+                )
 
                 bars.mb_stat_empty.wait(stat_empty_phase, spin=SPIN_RING_WAITS)
                 stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
@@ -1923,35 +2051,22 @@ def _softmax_warp_group(
                 )
                 max_a = row_max_reduction_64(reg_S_a)
                 max_b = row_max_reduction_64(reg_S_b)
-                current_max = cute.math.max(max_a, max_b) * scale_log2
-
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_stat_full.arrive()
-                reg_S_a = reg_S_a * scale_log2 - new_total_max
-                reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
-                p_a_fp8 = reg_P_a.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-                reg_S_b = reg_S_b * scale_log2 - new_total_max
-                reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
-                p_b_fp8 = reg_P_b.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-                sum_a_pair = row_reduction_pair_64(reg_P_a)
-                sum_b_pair = row_reduction_pair_64(reg_P_b)
-                alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
-                total_sum = total_sum * alpha_pair + (sum_a_pair + sum_b_pair)
+                total_max, total_sum = _softmax_tail(
+                    has_lse,
+                    reg_S_a,
+                    reg_S_b,
+                    max_a,
+                    max_b,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    p_addr_a,
+                    p_addr_b,
+                    stats_addr,
+                    parity_rt,
+                    bars,
+                    leader_cta_id,
+                )
                 bars.mb_stat_empty.wait(stat_empty_phase, spin=SPIN_RING_WAITS)
                 stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
@@ -1978,35 +2093,22 @@ def _softmax_warp_group(
                 reg_S_b = cutlass.Vector.from_elements(tuple(res_b[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32)
                 max_a = cutlass.Vector.from_elements((res_a[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0]
                 max_b = cutlass.Vector.from_elements((res_b[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0]
-                current_max = cute.math.max(max_a, max_b) * scale_log2
-
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_stat_full.arrive()
-                reg_S_a = reg_S_a * scale_log2 - new_total_max
-                reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
-                p_a_fp8 = reg_P_a.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-                reg_S_b = reg_S_b * scale_log2 - new_total_max
-                reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
-                p_b_fp8 = reg_P_b.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-                sum_a_pair = row_reduction_pair_64(reg_P_a)
-                sum_b_pair = row_reduction_pair_64(reg_P_b)
-                alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
-                total_sum = total_sum * alpha_pair + (sum_a_pair + sum_b_pair)
+                total_max, total_sum = _softmax_tail(
+                    has_lse,
+                    reg_S_a,
+                    reg_S_b,
+                    max_a,
+                    max_b,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    p_addr_a,
+                    p_addr_b,
+                    stats_addr,
+                    parity_rt,
+                    bars,
+                    leader_cta_id,
+                )
                 bars.mb_stat_empty.wait(stat_empty_phase, spin=SPIN_RING_WAITS)
                 stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
@@ -2060,35 +2162,22 @@ def _softmax_warp_group(
                 )
                 max_a = row_max_reduction_64(reg_S_a)
                 max_b = row_max_reduction_64(reg_S_b)
-                current_max = cute.math.max(max_a, max_b) * scale_log2
-
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
-                alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_stat_full.arrive()
-                reg_S_a = reg_S_a * scale_log2 - new_total_max
-                reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
-                p_a_fp8 = reg_P_a.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(0)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-                reg_S_b = reg_S_b * scale_log2 - new_total_max
-                reg_P_b = cute.math.exp2(reg_S_b, fastmath=True)
-                p_b_fp8 = reg_P_b.to(STORAGE_DTYPE)
-                nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_b, cutlass.Float32), p_b_fp8)
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
-                bars.mb_bmm2_ready[parity_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS) + cutlass.Int32(1)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-                sum_a_pair = row_reduction_pair_64(reg_P_a)
-                sum_b_pair = row_reduction_pair_64(reg_P_b)
-                alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
-                total_sum = total_sum * alpha_pair + (sum_a_pair + sum_b_pair)
+                total_max, total_sum = _softmax_tail(
+                    has_lse,
+                    reg_S_a,
+                    reg_S_b,
+                    max_a,
+                    max_b,
+                    scale_log2,
+                    total_max,
+                    total_sum,
+                    p_addr_a,
+                    p_addr_b,
+                    stats_addr,
+                    parity_rt,
+                    bars,
+                    leader_cta_id,
+                )
                 bars.mb_stat_empty.wait(stat_empty_phase, spin=SPIN_RING_WAITS)
                 stat_empty_phase = stat_empty_phase ^ cutlass.Int32(1)
 
@@ -2346,8 +2435,7 @@ def _correction_warp_group(
             if cutlass.const_expr(lse_tensor is not None):
                 if q_row_global < q_row_limit:
                     lse_arr = cutlass.make_array_view(lse_tensor)
-                    lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                    lse_row[_cu_q_b + q_row_global] = lse_val
+                    lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
         else:
             if cutlass.const_expr(lse_tensor is not None):
                 if q_row_global < q_row_limit:
@@ -2614,10 +2702,9 @@ def _host(
     vo_box_o = (1, CFG.TILE_M, 1, _O_GRANU_ELEMS)
     stride_order = (3, 2, 1, 0)
 
-    SF_TMA_ROW_BYTES = 128
-    SF_NUM_ROWS_Q = SF_SMEM_SIZE_Q // SF_TMA_ROW_BYTES
-    SF_NUM_ROWS_K = SF_SMEM_SIZE_K // SF_TMA_ROW_BYTES
-    SF_NUM_ROWS_V = SF_SMEM_SIZE_V // SF_TMA_ROW_BYTES
+    SF_NUM_ROWS_Q = sf_tma_rows(SF_SMEM_SIZE_Q)
+    SF_NUM_ROWS_K = sf_tma_rows(SF_SMEM_SIZE_K)
+    SF_NUM_ROWS_V = sf_tma_rows(SF_SMEM_SIZE_V)
 
     def _tma_swz(byte_w: int):
         return tmap.TensorMapSwizzle.s128b if byte_w == 128 else tmap.TensorMapSwizzle.s64b if byte_w == 64 else tmap.TensorMapSwizzle.s32b
@@ -2688,72 +2775,32 @@ def _host(
     _q_sf_num_tiles = total_q_sf_tiles if cutlass.const_expr(CFG.THD_VARLEN) else sq_sf_tiles
     _kv_sf_num_tiles = total_kv_sf_tiles if cutlass.const_expr(CFG.THD_VARLEN) else skv_sf_tiles
 
-    def _build_sf_desc(sf_tensor, num_tiles, sf_smem_size, num_rows_box, num_heads):
-        sf_base = cutlass.Int64(sf_tensor.iterator.toint())
-        tile_stride_16 = sf_smem_size // 16
-        return tmap.create_tensor_map_tiled(
-            global_address=sf_base,
-            dtype=cutlass.Uint8,
-            global_dims=[
-                SF_TMA_ROW_BYTES,
-                sf_smem_size // SF_TMA_ROW_BYTES,
-                num_tiles,
-                num_heads,
-                _B_SF,
-            ],
-            global_strides=[
-                SF_TMA_ROW_BYTES // 16,
-                tile_stride_16,
-                cutlass.Int64(num_tiles) * tile_stride_16,
-                cutlass.Int64(num_heads) * cutlass.Int64(num_tiles) * tile_stride_16,
-            ],
-            box_dims=[SF_TMA_ROW_BYTES, num_rows_box, 1, 1, 1],
-            swizzle=tmap.TensorMapSwizzle.none,
-            l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
-        )
-
-    tma_q_sf_desc = _build_sf_desc(sf_q_tensor, _q_sf_num_tiles, SF_SMEM_SIZE_Q, SF_NUM_ROWS_Q, QH)
-    tma_k_sf_desc = _build_sf_desc(sf_k_tensor, _kv_sf_num_tiles, SF_SMEM_SIZE_K, SF_NUM_ROWS_K // CFG.CTA_MMA, KH)
-    # V's SF is the COLUMNWISE (transposed-operand) quantization, and its GMEM
-    # layout is NOT the per-tile-contiguous one Q/K use.  The F8_128x4 atom rule
-    # is applied to the transposed scale matrix [D, S/32], so the atom grid is
-    # (D/128) x (b*KH*S/128) laid out ROW-MAJOR -- the D-block index is the
-    # OUTER one, and the SF_NUM_BLOCKS_V D-planes are separated by a whole plane
-    # of `v_sf_groups` atoms, a stride that GROWS WITH S.  Q/K are rowwise:
-    # their atom grid is (b*QH*S/128) x (D/128), so THEIR D-blocks are per-tile
-    # contiguous and _build_sf_desc is right for them.
-    #
-    # At d=128 there is exactly ONE D-plane, so the two layouts coincide -- which
-    # is why the d128 MXFP8 sibling passes with the per-tile form, and why d256
-    # was correct at S=128 (one KV tile => one group) and wrong from S=256 on.
-    # Mirrors sm100/prefill_d256_mxfp8.py's dense/THD stride split.
-    _v_sf_groups = cutlass.Int64(_B_SF) * cutlass.Int64(KH) * _kv_sf_num_tiles
-    if cutlass.const_expr(CFG.THD_VARLEN):
-        # THD packs both D-planes of a (head, sequence tile) contiguously.
-        _v_plane_stride_16 = SF_BYTES_PER_BLOCK // 16
-        _v_tile_stride_16 = SF_SMEM_SIZE_V // 16
-    else:
-        _v_plane_stride_16 = (_v_sf_groups * SF_BYTES_PER_BLOCK) // 16
-        _v_tile_stride_16 = SF_BYTES_PER_BLOCK // 16
-    tma_v_sf_desc = tmap.create_tensor_map_tiled(
-        global_address=cutlass.Int64(sf_v_tensor.iterator.toint()),
-        dtype=cutlass.Uint8,
-        global_dims=[
-            SF_TMA_ROW_BYTES,
-            SF_BYTES_PER_BLOCK // SF_TMA_ROW_BYTES,
-            SF_NUM_BLOCKS_V,
-            _kv_sf_num_tiles,
-            KH * _B_SF,
-        ],
-        global_strides=[
-            SF_TMA_ROW_BYTES // 16,
-            _v_plane_stride_16,
-            _v_tile_stride_16,
-            cutlass.Int64(_kv_sf_num_tiles) * _v_tile_stride_16,
-        ],
-        box_dims=[SF_TMA_ROW_BYTES, SF_BYTES_PER_BLOCK // SF_TMA_ROW_BYTES, V_SF_PLANES_PER_PEER, 1, 1],
-        swizzle=tmap.TensorMapSwizzle.none,
-        l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
+    # SF TMA descriptors (sdpa/kernels/_mxfp8_sf.py).  Q / K are ROWWISE: their
+    # atom grid is per-(b, h, s_tile) contiguous, one tile's slab per box.  V's SF
+    # is the COLUMNWISE (transposed-operand) quantization whose D-plane index is
+    # the OUTER atom index -- the SF_NUM_BLOCKS_V planes of one tile sit a whole
+    # plane of `b * KH * tiles` atoms apart, a stride that GROWS WITH S (dense);
+    # THD packs both planes of a (head, sequence tile) contiguously.  At d=128 the
+    # two layouts coincide (the d128 sibling reads V through the rowwise form);
+    # d256 was correct at S=128 (one KV tile => one group) and wrong from S=256 on
+    # until it took the columnwise form.  Mirrors sm100/prefill_d256_mxfp8.py's
+    # dense/THD stride split.  The box walks V_SF_PLANES_PER_PEER planes per load.
+    tma_q_sf_desc = build_rowwise_sf_desc(
+        sf_q_tensor, num_tiles=_q_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_Q, num_rows_box=SF_NUM_ROWS_Q, num_heads=QH, num_batches=_B_SF
+    )
+    tma_k_sf_desc = build_rowwise_sf_desc(
+        sf_k_tensor, num_tiles=_kv_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_K, num_rows_box=SF_NUM_ROWS_K // CFG.CTA_MMA, num_heads=KH, num_batches=_B_SF
+    )
+    tma_v_sf_desc = build_columnwise_sf_desc(
+        sf_v_tensor,
+        num_tiles=_kv_sf_num_tiles,
+        num_heads=KH,
+        num_batches=_B_SF,
+        num_planes=SF_NUM_BLOCKS_V,
+        planes_per_box=V_SF_PLANES_PER_PEER,
+        sf_bytes_per_block=SF_BYTES_PER_BLOCK,
+        sf_smem_size=SF_SMEM_SIZE_V,
+        thd_varlen=bool(CFG.THD_VARLEN),
     )
 
     rows_per_cluster = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA

@@ -316,6 +316,8 @@ graph.sdpa(
     stats_use_log2=False,                 # Return stats as (max + ln(sum_exp)) * log2(e) instead of max + ln(sum_exp)
     implementation=AUTO,                  # SDPA implementation: AUTO, COMPOSITE, UNIFIED
     unfuse_fma=False,                     # Use unfused mul/add in the softmax computation
+    softmax_precision=None,               # Softmax exponent precision: FLOAT (default) or HALF (FROST FP8 / MXFP8 engines, cc 10.7)
+    attn_scale_prefolded=False,           # Q already carries attn_scale * log2(e); the engine applies no scale (FROST engines, cc 10.7)
     compute_data_type=NOT_SET,            # Computation data type
     name=None,                            # Operation name
 )
@@ -346,6 +348,8 @@ graph.sdpa(
 - `stats_use_log2` (Optional[bool]): If True, `stats` is returned in base 2, $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$, instead of the default natural-log form $\max + \ln(\sum e^{s - \max})$. This is the convention of flash-attention-style kernels (FA2/FA3, TRT-LLM) that fold $\log_2 e$ into the softmax scale, so consumers that mix LSE tensors from several backends (cascade/split-KV merges, speculative decoding) get one convention without an extra elementwise pass. Only affects `stats`; `score_max` and `score_sum_exp` are unchanged, and `sdpa_backward` still expects natural-log stats. Served by the FROST SDPA engines and, on cuDNN 9.27.0+, by both the `UNIFIED` and `COMPOSITE` implementations (`CUDNN_ATTR_OPERATION_SOFTMAX_STATS_LOG2` on the softmax operation descriptor used by both implementations); on older backends both decline it at validation, so only a FROST engine can serve it there.
 - `implementation` (Optional[cudnn.attention_implementation]): SDPA implementation to use. `AUTO` (default), `COMPOSITE`, or `UNIFIED`.
 - `unfuse_fma` (Optional[bool]): Use unfused mul/add in the softmax computation.
+- `softmax_precision` (Optional[cudnn.data_type]): Precision of the softmax exponent and probability path. `None` (the default) is the f32 pipeline every engine runs and leaves the engine choice open. `HALF` asks for the f16x2 exponent arm of the FROST FP8 and MXFP8 forward engines on cc 10.7 (head-dim flavors 128, 192x128, 256 and 512): the exponent runs on packed f16 pairs and P is cast from f16 straight to the FP8 pair format, halving the transcendental work of the softmax warps. Numerics-changing (P moves by about one f16 ulp of the exponent), so it is an op attribute rather than a tuning knob: the cuDNN backend has no field for it, a set value keeps the graph on the python engines (`serialize()` and `key()` refuse it), and an engine without the arm declines instead of degrading. An explicit `FLOAT` is also a set value: it selects the f32 pipeline on the python engines only, so omit the attribute unless that is intended. `stats`, when requested, always come from the exact f32 row sum; on the d256 and d512 FP8 / MXFP8 kernels (which normalize O with a register row sum) a HALF forward without `stats` normalizes O with an f16 pair sum of the stored probabilities instead, so on those flavors O under HALF is not bit-identical with and without `generate_stats` (both within the family bound; d128, d192x128 and the FLOAT pipeline are unaffected). Forward only: `sdpa_backward` declines it. The f16 arm rounds the exponent argument to f16 before the FP8 cast of P, so a probability within one f16 rounding step of an FP8 code midpoint can land one code away from the f32 pipeline's (one E5M2 code is a 25 % step, one E4M3 code 12.5 %); on O that is at most one code step of that key's weight times its V -- rare, bounded, and budgeted by the FP8 test harnesses like the f32 pipeline's own midpoint flips.
+- `attn_scale_prefolded` (Optional[bool]): Declares that Q was already multiplied by `attn_scale * log2(e)` (before quantization for FP8 / MXFP8 inputs), so the engine applies no softmax scale; `attn_scale` must stay unset. Served by the FROST MXFP8 and f16/bf16 forward engines on cc 10.7 (head-dim flavors 128, 192x128, 256 and 512; not over paged KV; not on per-tensor FP8, whose kernels fold the descale factors into the softmax scale). `stats` keep their usual form. On a graph without `stats`, `attn_scale_prefolded=True` together with `softmax_precision=HALF` fuses the per-score shift and the f32-to-f16 convert into one instruction per pair (measured 6-7 % faster on the d128 MXFP8 kernel at 32k context). `False` (or `0`) is the default and counts as unset. Forward only: `sdpa_backward` declines it.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal computation.
 - `name` (Optional[str]): Name for the operation.
 
@@ -563,7 +567,7 @@ SDPA_backward_attributes& set_padding_mask(bool const value);
 SDPA_backward_attributes& set_seq_len_q(std::shared_ptr<Tensor_attributes> value);
 SDPA_backward_attributes& set_seq_len_kv(std::shared_ptr<Tensor_attributes> value);
 
-// the maximum number of sequence tokens for all batches, used for workspace allocation
+// Token-axis capacity bounds, including gaps between sequences, used for workspace allocation
 SDPA_backward_attributes& set_max_total_seq_len_q(int64_t const value);
 SDPA_backward_attributes& set_max_total_seq_len_kv(int64_t const value);
 // ==========================  END     var len options =====================
@@ -631,8 +635,8 @@ graph.sdpa_backward(
     use_padding_mask=False,               # Enable variable sequence length masking
     seq_len_q=None,                       # Per-batch query sequence lengths
     seq_len_kv=None,                      # Per-batch key/value sequence lengths
-    max_total_seq_len_q=None,             # Max total tokens for Q (ragged tensors)
-    max_total_seq_len_kv=None,            # Max total tokens for KV (ragged tensors)
+    max_total_seq_len_q=None,             # Q-side token capacity, including inter-sequence gaps
+    max_total_seq_len_kv=None,            # KV-side token capacity, including inter-sequence gaps
     diagonal_alignment=TOP_LEFT,          # Diagonal alignment (must match forward)
     diagonal_band_left_bound=None,        # Left bound (must match forward)
     diagonal_band_right_bound=None,       # Right bound (must match forward)
@@ -657,8 +661,8 @@ graph.sdpa_backward(
 - `use_padding_mask` (Optional[bool]): Enable variable sequence length masking. Must match forward pass.
 - `seq_len_q` (Optional[cudnn_tensor]): Per-batch query sequence lengths.
 - `seq_len_kv` (Optional[cudnn_tensor]): Per-batch key/value sequence lengths.
-- `max_total_seq_len_q` (Optional[int]): Maximum total sequence tokens for Q when using ragged tensors. Used for workspace allocation. Defaults to $B \times S_q$ if not provided.
-- `max_total_seq_len_kv` (Optional[int]): Maximum total sequence tokens for KV when using ragged tensors. Used for workspace allocation. Defaults to $B \times S_{kv}$ if not provided.
+- `max_total_seq_len_q` (Optional[int]): Token-axis capacity bound for the ragged Q side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by Q, O, dO, Stats and dQ. Defaults to `None` (no explicit packed-capacity bound).
+- `max_total_seq_len_kv` (Optional[int]): Token-axis capacity bound for the ragged K/V side, including gaps between sequences. Used for workspace allocation. The bound must cover the token positions addressed by K, V, dK and dV. Defaults to `None` (no explicit packed-capacity bound).
 - `diagonal_alignment` (Optional[cudnn.diagonal_alignment]): Must match the forward pass.
 - `diagonal_band_left_bound` (Optional[int]): Must match the forward pass.
 - `diagonal_band_right_bound` (Optional[int]): Must match the forward pass.
@@ -675,7 +679,9 @@ graph.sdpa_backward(
 **Important Notes:**
 - The backward operation does NOT support paged attention. K and V must be contiguous tensors.
 - All masking and dropout configurations must exactly match the forward pass to ensure correct gradients.
-- When using ragged tensors, set `max_total_seq_len_q` and `max_total_seq_len_kv` to the maximum total tokens (sum of sequence lengths) for proper workspace allocation.
+- Omitting a bound is not equivalent to explicitly passing $B \times S_q$ or $B \times S_{kv}$. With no bound, the native backward path uses padded intermediate workspace layouts instead of copying ragged offsets into those intermediates. Behavior depends on the engine and backend: the native path discards explicit bounds on cuDNN older than 9.6.0, when a head dimension is not a multiple of 16, and on SM8x/SM12x GPUs with cuDNN 9.18.1 or newer, falling back to padded layouts; some FROST THD backward engines reject graphs that do not declare both totals. Where a bound is kept, it enables packed intermediate layouts and must cover their addressed span.
+- When setting `max_total_seq_len_q` and `max_total_seq_len_kv`, use an upper bound on the **physical token span**, including gaps and any nonzero starting offset. For a fully packed buffer starting at token zero, the sum of sequence lengths suffices. For a partially packed buffer, use at least `max(start_token[b] + seq_len[b])` over all sequences and all tensors on the corresponding side; convert ragged element offsets to token positions using each tensor's layout first.
+- For example, two 128-token sequences beginning at token positions 0 and 256 need a bound of at least **384**, although their lengths sum to 256. Passing 256 can under-allocate intermediate workspace and corrupt gradients or memory. The frontend cannot infer this span while building a graph because ragged offsets reside in device memory.
 
 
 - Python sample: [samples/python/51_sdpa_backward.ipynb](https://github.com/NVIDIA/cudnn-frontend/blob/main/samples/python/51_sdpa_backward.ipynb)
@@ -1070,7 +1076,15 @@ set_attn_scale(float const value);
 
 SDPA_fp8_backward_attributes&
 set_causal_mask(bool const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_q(int64_t const value);
+
+SDPA_fp8_backward_attributes&
+set_max_total_seq_len_kv(int64_t const value);
 ```
+
+`set_max_total_seq_len_q` / `set_max_total_seq_len_kv` declare the packed token totals of a ragged (THD) layout, exactly as on `SDPA_backward_attributes` (see the glossary above); they are accepted only when the Q/K/V/O/dO/Stats or the gradients carry a ragged offset. The same two attributes serve the MXFP8 backward (`sdpa_mxfp8_backward` builds `SDPA_fp8_backward_attributes` too).
 
 #### Python API
 ```
@@ -1094,9 +1108,14 @@ Args:
     scale_dV (cudnn_tensor): Scale factor for value gradient.
     scale_dP (cudnn_tensor): Scale factor for dP gradient.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
+    use_padding_mask (Optional[bool]): Enable variable sequence length masking; on a ragged (THD) layout it is required, with both length tensors. Default is False.
+    seq_len_q (Optional[cudnn_tensor]): Per-batch valid sequence lengths of Q (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
+    seq_len_kv (Optional[cudnn_tensor]): Per-batch valid sequence lengths of K/V (int32, shape (B, 1, 1, 1)). Required with use_padding_mask. Default is None.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
     compute_data_type (Optional[cudnn.data_type]): The data type for computation. Default is NOT_SET.
     name (Optional[str]): The name of the operation.
+    max_total_seq_len_q (Optional[int]): Packed token total of the ragged Q (and the O / dO / Stats / dQ sharing its token axis). Only valid on a ragged layout. Default is None.
+    max_total_seq_len_kv (Optional[int]): Packed token total of the ragged K/V (and dK / dV). Only valid on a ragged layout. Default is None.
 
 Returns:
     dQ (cudnn_tensor): The query gradient data.
@@ -1175,6 +1194,122 @@ Where:
 - $D_{qk}$ is the embedding dimension per head of query and key
 - $D_{v}$ is the embedding dimension per head of value
 
+
+## Execute-Time Shape Overrides
+
+Unified SDPA forward distinguishes the shape a graph **declares** from the shape a
+run **uses**:
+
+| stage | what it says | who sees it |
+|---|---|---|
+| build, `pygraph(is_override_shape_enabled=True)` | the largest extent this graph will ever be asked for | the heuristic, i.e. the plan choice |
+| execute, `override_uids` / `override_shapes` / `override_strides` | the extent **this** run actually uses | the backend, at launch |
+
+The declaration is the envelope the plan is built for, not a promise about any
+one run. One plan can then serve many extents without being rebuilt, which is
+what a serving stack wants when it groups requests into length buckets.
+
+The example requires a frontend compiled against cuDNN >= 9.21 and a cuDNN
+>= 9.23 runtime for the workspace query with overrides. Its 64-row extent is
+from the measured plan below; validate other plans before using that window.
+
+```python
+import cudnn
+import torch
+
+B, H, D = 1, 4, 64
+g = cudnn.pygraph(
+    io_data_type=cudnn.data_type.HALF,
+    intermediate_data_type=cudnn.data_type.FLOAT,
+    compute_data_type=cudnn.data_type.FLOAT,
+    is_override_shape_enabled=True,
+)
+Q = g.tensor(name="q", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+K = g.tensor(name="k", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+V = g.tensor(name="v", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+O, _ = g.sdpa(Q, K, V, is_inference=True, attn_scale=1.0 / (D ** 0.5))
+O.set_output(True).set_data_type(cudnn.data_type.HALF)
+g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+# This run uses 64 of the declared 256 rows. Buffers keep the declared extent.
+q, k, v = (torch.randn(B, H, 256, D, dtype=torch.float16, device="cuda") for _ in range(3))
+o = torch.empty(B, H, 256, D, dtype=torch.float16, device="cuda")
+geometry = [B, H, 64, D]
+strides = [H * 256 * D, 256 * D, D, 1]
+overrides = dict(
+    override_uids=[Q.get_uid(), K.get_uid(), V.get_uid(), O.get_uid()],
+    override_shapes=[geometry, geometry, geometry, geometry],
+    override_strides=[strides, strides, strides, strides],
+)
+# Query for the same geometry passed to execute (cuDNN >= 9.23).
+workspace = torch.empty(g.get_workspace_size(**overrides), dtype=torch.uint8, device="cuda")
+g.execute({Q: q, K: k, V: v, O: o}, workspace, **overrides)
+```
+
+### What an override does and does not do
+
+- **Buffers are sized for the declaration.** An override says how much of a
+  declared buffer this run uses; it neither shrinks the allocation nor re-packs
+  the layout, and the strides describe the declared storage. Allocating only the
+  run's extent leaves the kernel addressing past the buffer.
+- **The plan is chosen at build time.** `override_*` does not re-run the
+  heuristic and does not reselect an engine, so grouping lengths into buckets is
+  the caller's policy rather than something this feature does. Two graphs
+  declared at different extents are two different plans.
+- **It is not `set_dynamic_shape_enabled` / the kernel cache.** That feature
+  reuses compiled kernels across dynamic-shape graphs (see
+  [Dynamic Shapes and Kernel Cache](../utilities/dynamic-kernel-cache.md)); this
+  one keeps a single plan and re-describes its operands per run.
+- **It is not CUDA graph capture/replay.** Overrides are an execute-path
+  argument; capturing a graph populated with a fixed variant pack is a separate
+  contract.
+
+### Boundaries
+
+Measured on an L20 (SM89), cuDNN 9.26, FP16, `B=1 H=4 D=64`, plan
+`eng8_k24=1_k27=0_k38=0_k40=3_k41=1` for prefill and
+`eng8_k24=1_k27=0_k38=0_k40=2_k41=1` for decode. Buffers cover the declared
+extent, or the larger override for the explicitly oversized probe:
+
+| declared | run | result |
+|---|---|---|
+| 256, non-causal | 64 / 128 / 192 / 256 | served, max abs error ~3e-4 (FP16 storage) |
+| 256, causal | 2 / 33 / 64 / 96 / 128 | served, same error |
+| 256, `generate_stats=True` | 64 | served, O and Stats both follow the override |
+| 1 (decode), KV declared 256 | `s_q=1`, `s_kv=64` | served |
+| 256 | `s_q = 1` | **rejected**: `CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE` |
+| 256 | 96 / 160 (non-causal, off the 64-row tile grid) | **not rejected, wrong output** |
+| 256 | 320 (beyond the declaration, with storage and strides for 320 rows) | **not rejected** on the measured plan; outside the declared envelope |
+| any | `override_uids` and `override_shapes` of different length | rejected at variant-pack finalize (`CUDNN_STATUS_BAD_PARAM`) |
+
+These are observations of this platform and plan, not a portable supported-shape
+contract. The tests gate measured overrides and strict xfails on the device,
+runtime version, and selected plan. The oversized probe allocates physical
+storage for every overridden row; an xfail does not make an undersized CUDA
+allocation safe. Acceptance outside the declaration is not a correctness guarantee.
+
+Two consequences for callers:
+
+1. **Decode and prefill are different engine classes.** A declared prefill graph
+   cannot be overridden to `s_q == 1`, and a graph declared at `s_q == 1` should
+   not be expected to serve prefill lengths. Keep one graph per class.
+2. **The legal window is narrower than "anything up to the declaration".** In the
+   non-causal class only multiples of the plan's Q tile were served on the
+   measured configuration; the other lengths produced wrong output without an
+   error. Validate the window you intend to use against your own plan and shapes
+   before relying on it, and prefer run extents that match the declaration's
+   tiling.
+
+The `s_q == 1` boundary and the declared-max-length sensitivity of the heuristic
+(an `eng8` -> `eng10` flip between a declared 128 and 256, and 2.0-2.3x cost on
+4-token rows on B200) were reported in
+[#1087](https://github.com/NVIDIA/cudnn-frontend/issues/1087) for SM100/SM107.
+Those numbers belong to the reporter's platform; the table above is this
+repository's L20 measurement, and on that configuration the plan list did not
+change between a declared 64 and a declared 256. The split-KV note in the same
+report (an override forces the split-KV factor to 1; 1.2-1.6x on low-occupancy
+shapes for the per-batch `seq_len` form) is likewise the reporter's measurement
+and has not been repeated here.
 
 ## FAQs
 

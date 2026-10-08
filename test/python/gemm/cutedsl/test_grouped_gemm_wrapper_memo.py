@@ -199,10 +199,10 @@ TENSOR_M, N_BS, K_BS, L_BS = 2048, 512, 512, 4
 MXFP8 = dict(ab_dtype=torch.float8_e4m3fn, sf_dtype=torch.float8_e8m0fnu, sf_vec_size=32, m_aligned=256)
 
 
-def mxfp8_inputs(group_m_list, l=L_BS, b_major="k"):
+def mxfp8_inputs(group_m_list, l=L_BS, b_major="k", tensor_m=TENSOR_M):
     from gemm.cutedsl.test_grouped_gemm_swiglu_utils import allocate_grouped_gemm_input_tensors
 
-    return allocate_grouped_gemm_input_tensors(n=N_BS, k=K_BS, l=l, group_m_list=group_m_list, permuted_m=TENSOR_M, b_major=b_major, **MXFP8)
+    return allocate_grouped_gemm_input_tensors(n=N_BS, k=K_BS, l=l, group_m_list=group_m_list, permuted_m=tensor_m, b_major=b_major, **MXFP8)
 
 
 def raw_bytes(tensor):
@@ -229,6 +229,11 @@ class CountingMemo(dict):
     """Only a memo miss stores; a hit never writes. `stores` therefore counts misses."""
 
     stores = 0
+
+    def get(self, key, default=None):
+        """Record the actual lookup without depending on the key tuple layout."""
+        self.last_key = key
+        return super().get(key, default)
 
     def __setitem__(self, key, value):
         self.stores += 1
@@ -420,7 +425,7 @@ def test_block_scaled_memo_respects_overlap_margin(monkeypatch, operation):
     for margin in ("0", "8", "0"):
         monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", margin)
         call(inputs)
-        api = next(value[0] for key, value in memo.items() if key[-2] == margin)
+        api = memo[memo.last_key][0]
         assert api._implementation.num_cluster_overlap_margin == int(margin)
         apis.append(api)
     torch.cuda.synchronize()

@@ -28,7 +28,7 @@ TMA_ALIGN_ELEMS = 4  # FP32 output => seqlen_k padded to multiples of 4 (16 B)
 
 
 class IndexerForward(APIBase):
-    """SM100+ BF16 APIBase shell for the shared forward interface.
+    """SM100+ BF16 Q/K APIBase shell with BF16 or FP32 per-head weights.
 
     The backend interface owns lazy compilation and its kernel cache. Hopper
     dispatch uses the direct SM90 wrapper in ``_interface_sm90.py``.
@@ -38,7 +38,7 @@ class IndexerForward(APIBase):
         self,
         sample_q: torch.Tensor,  # (B, S_q, H_q, D) BF16
         sample_k: torch.Tensor,  # (B, S_k, H_kv, D) BF16
-        sample_w: torch.Tensor,  # (B, S_q, H_q) BF16
+        sample_w: torch.Tensor,  # (B, S_q, H_q) BF16 or FP32
         sample_out: torch.Tensor,  # (B, S_q, S_k_padded) FP32
         ratio: int = 4,
         qhead_per_kv_head: Optional[int] = None,
@@ -115,7 +115,9 @@ class IndexerForward(APIBase):
 
         self._check_dtype(self.q_desc, torch.bfloat16, name="Q")
         self._check_dtype(self.k_desc, torch.bfloat16, name="K")
-        self._check_dtype(self.w_desc, torch.bfloat16, name="W")
+        self._check_dtype(self.w_desc, [torch.bfloat16, torch.float32], name="W")
+        if self.w_desc.dtype == torch.float32 and self.w_desc.stride[-1] != 1:
+            raise NotImplementedError(f"FP32 W requires unit last stride, got strides {self.w_desc.stride}")
         self._check_dtype(self.o_desc, torch.float32, name="Out")
 
         self._value_error_if(
@@ -162,6 +164,7 @@ class IndexerForward(APIBase):
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise ValueError("IndexerForward kernel not compiled")
+        self._check_dtype(w, self.w_desc.dtype, name="W")
 
         # APIBase callers provide a TMA-aligned output allocation, while the
         # shared interface describes only the logical K columns. Passing the
@@ -214,6 +217,7 @@ def indexer_forward_wrapper(
 ) -> TupleDict:
     """High-level wrapper. Allocates the output buffer with TMA padding on S_k.
 
+    With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
     Returns ``{'scores': (B, S_q, S_k) FP32}``. The ratio causal mask marks
     positions outside the valid KV range with -inf. ``q_causal_offsets`` may
     specify the global uncompressed token index for each batch/THD segment's
@@ -337,6 +341,7 @@ def indexer_forward_top_k_wrapper(
 ) -> TupleDict:
     """Combined SM100 indexer score generation and Top-K selection API.
 
+    With ``precision='bf16'``, Q/K are BF16 and per-head W may be BF16 or FP32.
     Returns ``{'indices', 'logits', 'softmax'}`` by default, plus ``'lse'``
     when requested. Set ``return_softmax=False`` to return only indices and
     logits. Unlike :func:`indexer_forward_wrapper`, this path never

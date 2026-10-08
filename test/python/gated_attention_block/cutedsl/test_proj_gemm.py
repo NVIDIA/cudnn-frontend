@@ -14,7 +14,9 @@ measured on a backend plan would not be measuring FROST at all.
 """
 
 import dataclasses
+import gc
 import os
+import weakref
 
 import pytest
 import torch
@@ -103,6 +105,166 @@ def test_missing_frost_plan_raises_rather_than_falling_back():
     assert ("sm100 GEMM template family" in why) or ("CUDNN_FRONTEND_ENABLE_FROST_ENGINES" in why) or ("declined this shape" in why)
 
 
+class _FakeJit:
+    """A stand-in for a forced-tile JIT on the ``run_resolved`` route: the two attributes ``_resolved_pack`` keys on (``binding``,
+    ``run_resolved``) and a call log; no ``__call__`` and no ``workspace_bytes`` (the route without a split-K workspace)."""
+
+    binding = object()
+
+    def __init__(self):
+        self.calls = []
+
+    def run_resolved(self, resolved, stream=None, workspace=None):
+        self.calls.append((dict(resolved), stream, workspace))
+
+
+def _plan_with_fake_jit(label, m=8, k=16, n=32):
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan
+
+    # the graph tensors are the pack's keys: three distinct sentinels per plan, exactly as distinct graph tensor objects would be
+    return ProjGemmPlan(graph=None, a=object(), b=object(), c=object(), m=m, k=k, n=n, label=label, jit=_FakeJit())
+
+
+def _counting_resolver(monkeypatch, bound_ids):
+    """Replace the compiler's ``resolve_variant_pack`` (imported lazily inside ``_resolved_pack``) with one that maps each pack
+    key through ``bound_ids`` -- ``{id(bound tensor): buffer}``, the shape the real one returns -- and counts its calls."""
+    import cudnn.gemm.frost.graph_analyzer as ga
+
+    calls = []
+
+    def fake(vp, binding):
+        calls.append(binding)
+        return {bound_ids[k]: buf for k, buf in vp.items()}
+
+    monkeypatch.setattr(ga, "resolve_variant_pack", fake)
+    return calls
+
+
+def test_pack_resolution_is_taken_once_per_plan_and_dies_with_it(monkeypatch):
+    """The forced-tile JIT route resolves the pack's graph-tensor keys to the JIT's bound tensors ONCE per plan (the keys are the
+    plan's own graph tensors) and keeps that resolution on the plan: a second plan resolves its own, a key the entry has not seen
+    re-resolves exactly once more, and a dropped plan leaves NOTHING behind -- its JIT is collectable, and the module holds no
+    table of JITs.  The predecessor kept every JIT ever resolved in a module-level dict keyed by ``id(jit)`` (a strong reference
+    so the id stayed valid, never evicted): every dropped block leaked its four forced-tile JITs, bindings and graph tensors."""
+    from cudnn.gated_attention_block.kernels import proj_gemm
+    from cudnn.gated_attention_block.kernels.proj_gemm import _resolved_pack
+
+    plan, plan2 = _plan_with_fake_jit("p1"), _plan_with_fake_jit("p2")
+    bound = {plan.a: 101, plan.b: 202, plan.c: 303, plan2.a: 111, plan2.b: 222, plan2.c: 333}
+    calls = _counting_resolver(monkeypatch, bound)
+    a, w, out = object(), object(), object()
+    vp = {plan.a: a, plan.b: w, plan.c: out}
+    assert _resolved_pack(plan, vp) == {101: a, 202: w, 303: out}
+    assert len(calls) == 1
+    # the same plan again with fresh buffers: the cached keys, no second resolution; the per-call buffers map through
+    a2, w2, out2 = object(), object(), object()
+    assert _resolved_pack(plan, {plan.a: a2, plan.b: w2, plan.c: out2}) == {101: a2, 202: w2, 303: out2}
+    assert _resolved_pack(plan, vp) == {101: a, 202: w, 303: out} and len(calls) == 1
+    # the second plan resolves ITS keys once (per plan, not per process), and does not disturb the first plan's entry
+    assert _resolved_pack(plan2, {plan2.a: a, plan2.b: w, plan2.c: out}) == {111: a, 222: w, 333: out}
+    assert len(calls) == 2 and _resolved_pack(plan, vp) == {101: a, 202: w, 303: out} and len(calls) == 2
+    # a key the entry has not seen (an alpha bound later) re-resolves exactly once, then the widened entry serves
+    alpha_key, alpha = object(), object()
+    bound[alpha_key] = 404
+    vp_alpha = {**vp, alpha_key: alpha}
+    assert _resolved_pack(plan, vp_alpha) == {101: a, 202: w, 303: out, 404: alpha} and len(calls) == 3
+    assert _resolved_pack(plan, vp_alpha) == {101: a, 202: w, 303: out, 404: alpha} and len(calls) == 3
+    # a JIT swapped under the plan is re-resolved against the new binding (the entry is keyed on the JIT's identity)
+    plan.jit = _FakeJit()
+    assert _resolved_pack(plan, vp) == {101: a, 202: w, 303: out} and len(calls) == 4
+    # nothing without `run_resolved` is resolved (the plain __call__ route)
+    plan2.jit = object()
+    assert _resolved_pack(plan2, vp) is None and len(calls) == 4
+    # dropping the plans drops their JITs -- plan's current one, and plan2's ORIGINAL one, which since the swap above only its slot
+    # holds: no module-level table keeps either (the leak this pins)
+    jit_ref, jit2_ref = weakref.ref(plan.jit), weakref.ref(plan2._resolved_keys[0])
+    del plan, plan2, vp, vp_alpha
+    gc.collect()
+    assert jit_ref() is None and jit2_ref() is None, "a dropped plan's JIT is still reachable -- something outside the plan holds it"
+    assert not hasattr(proj_gemm, "_RESOLVED_KEYS"), "the module-level JIT table is back"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device for the launch-side tensors")
+def test_run_proj_gemm_resolves_the_pack_once_per_plan(monkeypatch):
+    """The same contract through the driver: ``run_proj_gemm`` on a forced-tile plan resolves once, then every launch hands
+    ``run_resolved`` the bound-id-keyed pack over the per-call buffers (the rank-3 views of a / w / out, in that order of ids) and
+    the resolved launch stream; a dropped plan's JIT is collectable afterwards."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan, run_proj_gemm
+
+    plan = _plan_with_fake_jit("drv")
+    calls = _counting_resolver(monkeypatch, {plan.a: 1, plan.b: 2, plan.c: 3})
+    a = torch.zeros(8, 16, dtype=torch.bfloat16, device="cuda")
+    w = torch.zeros(32, 16, dtype=torch.bfloat16, device="cuda")
+    out = torch.zeros(8, 32, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    for _ in range(3):
+        run_proj_gemm(plan, a, w, out, ws)
+    assert len(calls) == 1 and len(plan.jit.calls) == 3
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    for resolved, s, workspace in plan.jit.calls:
+        assert s == stream and workspace is None
+        assert {k: v.data_ptr() for k, v in resolved.items()} == {1: a.data_ptr(), 2: w.data_ptr(), 3: out.data_ptr()}
+        assert all(v.ndim == 3 for v in resolved.values())
+    assert isinstance(plan, ProjGemmPlan) and plan._resolved_keys[0] is plan.jit
+    jit_ref = weakref.ref(plan.jit)
+    del plan
+    gc.collect()
+    assert jit_ref() is None
+
+
+def test_pack_resolution_is_by_role_so_one_tensor_may_be_bound_as_a_and_w(monkeypatch):
+    """The key resolution names the plan's ROLES -- which bound tensor each graph tensor is -- never the identity of a call's
+    buffers: a square projection binds ONE rank-3 tensor as both A and W (``_rank3`` passes rank-3 through unchanged) and the
+    resolved pack still carries both roles.  The predecessor resolved the real pack and inverted it over ``id(buffer)``: the alias
+    collapsed A and W onto one bound id (``run_resolved``: ``KeyError: 'variant pack is missing a buffer for A operand[0]'``) and
+    that two-role mapping was CACHED before the failure, so a distinct-buffer rebind of the same plan failed the same way.  Cold
+    cache under the alias, then the rebind; and the resolver is handed the plan's graph tensors, never this call's buffers."""
+    import cudnn.gemm.frost.graph_analyzer as ga
+    from cudnn.gated_attention_block.kernels.proj_gemm import _resolved_pack
+
+    plan = _plan_with_fake_jit("alias", m=256, k=256, n=256)
+    bound = {plan.a: 101, plan.b: 202, plan.c: 303}
+    seen = []
+
+    def resolver(vp, binding):
+        seen.append((list(vp), list(vp.values())))
+        return {bound[k]: buf for k, buf in vp.items()}
+
+    monkeypatch.setattr(ga, "resolve_variant_pack", resolver)
+    x, out = object(), object()
+    # COLD cache, aliased: the same buffer object under A and under W -> both roles resolved, one resolution
+    assert _resolved_pack(plan, {plan.a: x, plan.b: x, plan.c: out}) == {101: x, 202: x, 303: out}
+    assert len(seen) == 1
+    # the entry taken under the alias serves a distinct-buffer rebind of the SAME plan (the poisoned-cache shape): no re-resolution
+    a2, w2, out2 = object(), object(), object()
+    assert _resolved_pack(plan, {plan.a: a2, plan.b: w2, plan.c: out2}) == {101: a2, 202: w2, 303: out2}
+    assert _resolved_pack(plan, {plan.a: x, plan.b: x, plan.c: out}) == {101: x, 202: x, 303: out}
+    assert len(seen) == 1
+    # the resolver saw the plan's three graph tensors as the keys, and NONE of the call's buffers among the values
+    keys, values = seen[0]
+    assert {id(k) for k in keys} == {id(plan.a), id(plan.b), id(plan.c)}
+    assert all(v is not x and v is not out for v in values)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device for the launch-side tensors")
+def test_run_proj_gemm_hands_run_resolved_both_roles_of_an_aliased_operand(monkeypatch):
+    """The same through the driver: ``run_proj_gemm(plan, x, x, out)`` with a rank-3 ``x`` -- the object ``_rank3`` passes
+    through as A and as W -- hands ``run_resolved`` a pack with ALL THREE bound ids, A and W at ``x``'s pointer; the
+    distinct-buffer launch that follows on the same plan carries its own three.  One resolution serves both."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import run_proj_gemm
+
+    plan = _plan_with_fake_jit("drv-alias", m=256, k=256, n=256)
+    calls = _counting_resolver(monkeypatch, {plan.a: 1, plan.b: 2, plan.c: 3})
+    x, out, a, w, out2 = (torch.zeros(1, 256, 256, dtype=torch.bfloat16, device="cuda") for _ in range(5))
+    ws = torch.empty(1, dtype=torch.uint8, device="cuda")
+    run_proj_gemm(plan, x, x, out, ws)  # COLD cache: one object as A and as W
+    run_proj_gemm(plan, a, w, out2, ws)  # then distinct buffers on the same plan
+    assert len(calls) == 1 and len(plan.jit.calls) == 2
+    ptrs = [{k: v.data_ptr() for k, v in resolved.items()} for resolved, _, _ in plan.jit.calls]
+    assert ptrs[0] == {1: x.data_ptr(), 2: x.data_ptr(), 3: out.data_ptr()}
+    assert ptrs[1] == {1: a.data_ptr(), 2: w.data_ptr(), 3: out2.data_ptr()}
+
+
 # ---------------------------------------------------------------------------
 # Numerics — needs an sm100-family device
 # ---------------------------------------------------------------------------
@@ -144,6 +306,39 @@ def test_rank2_and_rank3_binds_agree():
     _run(plan, a, w, o2)
     _run(plan, a.unsqueeze(0), w.unsqueeze(0), o3)
     torch.testing.assert_close(o2, o3[0], rtol=0, atol=0)
+
+
+@requires_frost_gemm
+def test_square_projection_binds_one_tensor_as_a_and_w_then_rebinds_distinct_buffers():
+    """``x @ x^T`` on the forced-tile JIT route: a square projection binds the SAME rank-3 read-only tensor as A and as W (the
+    object ``_rank3`` passes through for both roles).  Cold cache under the alias -> the result matches torch and is BITWISE the
+    launch over a clone of ``x`` as W (same kernel, same bytes, two objects); then a distinct-buffer launch on the SAME plan
+    matches torch too -- the key resolution taken under the alias is the plan's, not that call's.  Before the role-keyed
+    resolution the aliased launch raised ``KeyError: 'variant pack is missing a buffer for A operand[0]'`` and, the partial
+    mapping cached, so did every launch of the plan after it."""
+    m = k = n = 256
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    x = (torch.randn(1, m, k, device="cuda", dtype=torch.float32) * 0.1).to(dtype)
+    plan = build_proj_gemm(m=m, k=k, n=n, dtype=dtype, label="alias")
+    assert plan.jit is not None, f"the square 256 projection is the forced-tile JIT route this pins; got route={plan.route!r}"
+    out = torch.empty(1, m, n, device="cuda", dtype=dtype)
+    _run(plan, x, x, out)  # COLD cache: one object as A and as W
+    ref = x[0].float() @ x[0].float().T
+    assert torch.isfinite(out.float()).all()
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
+    assert cos > 0.999, f"cos {cos}"
+    ctrl = torch.empty_like(out)
+    _run(plan, x, x.clone(), ctrl)  # two objects, the same bytes
+    torch.testing.assert_close(out, ctrl, rtol=0, atol=0)
+    a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(dtype)
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(dtype)
+    out2 = torch.empty(m, n, device="cuda", dtype=dtype)
+    _run(plan, a, w, out2)  # distinct buffers on the plan whose key resolution was taken under the alias
+    ref2 = torch.nn.functional.linear(a.float(), w.float())
+    assert torch.isfinite(out2.float()).all()
+    cos2 = torch.nn.functional.cosine_similarity(out2.float().flatten(), ref2.flatten(), dim=0).item()
+    assert cos2 > 0.999, f"cos {cos2}"
 
 
 @requires_frost_gemm
