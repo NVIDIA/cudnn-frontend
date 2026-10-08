@@ -1008,7 +1008,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     """engines._thd_decode_leg admits exactly FlashInfer's shape (ragged Q/O/Stats,
     paged, S_q(max) == 1, d128 half, one offset width whose multiplier divides the
     row) and the heuristics then propose the decode tile with PackGQA and a split
-    of at least 2. Multi-token THD has a separate packed split admission."""
+    of at least 2. Multi-token THD also admits the unsplit SM100 prefill tile."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
@@ -1049,14 +1049,16 @@ def test_ragged_q_leg_predicate_and_heuristics():
     mtp = _ragged_paged_facts(s_q=2)
     mtp_plans = _plans(mtp)
     assert mtp_plans and all(engines.mismatch(caps, mtp, p.knobs) is None for p in mtp_plans)
-    # mismatch: cga=1 needs the split; cga=2 is the prefill THD leg (unsplit, unpacked).
+    # Q=1 at cga=1 still needs the decode split; cga=2 serves unsplit THD.
+    # Multi-token SM100 can also use the cga=1 prefill tile without a split.
     K = engines.SdpaFwdKnobs
     assert "split_kv >= 2" in (engines.mismatch(caps, leg, K(cga=1, split_kv=1)) or "")
     assert engines.mismatch(caps, leg, K(cga=1, split_kv=4, pack_gqa=True)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=1)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=2)) is not None, "the prefill THD leg cannot split"
     assert engines.mismatch(caps, mtp, K(cga=1, split_kv=2)) is None
-    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is not None
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is None
+    assert engines.mismatch(caps, _ragged_paged_facts(s_q=2, device_cc=(10, 3)), K(cga=1, split_kv=1)) is not None
     assert engines.mismatch(caps, mtp, K(cga=2, split_kv=1)) is None
 
 
