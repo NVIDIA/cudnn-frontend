@@ -436,22 +436,31 @@ def _spec_without_compiling(monkeypatch, api, builder, entry_name, frames=None):
 def test_thd_serves_the_external_delta():
     """The externally computed delta (``SdpaBwdDslSm107(external_delta=True)``) is SERVED under THD: the plan fact passes
     ``check_support`` with the declared totals; its contract is the PACKED head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout the THD
-    main kernel reads (``external_delta_shape``, ``T_q`` the declared packed total -- the dense ``(B, H_q, S_q_pad)`` form of the same
-    envelope is a different shape and is refused with the packed one named); the THD carve drops its own ``delta`` region exactly
-    (``scratch_workspace_bytes`` shrinks by it) while the default plan keeps it; the launch spec's roles carry the delta as the LAST,
-    appended, standalone-only slot (11, after the two lengths at 9 / 10) on the roles AND the attributes, as the dense roles do.
-    The plan-fact check stays two-directional: a ``delta_tensor`` on the default plan is refused for being given at all, before
-    any device read; a missing one on the external plan is refused as required."""
+    main kernel reads (``external_delta_shape``; ``T_q`` = the plan's token capacity, the declared packed total tightened to the
+    envelope's ``B * S_max`` -- an oversized declaration does not widen the shape, and the refusal names the capacity's shape; the dense
+    ``(B, H_q, S_q_pad)`` form of the same envelope is a different shape and is refused with the packed one named); the THD carve drops
+    its own ``delta`` region exactly (``scratch_workspace_bytes`` shrinks by it) while the default plan keeps it; the launch spec's
+    roles carry the delta as the LAST, appended, standalone-only slot (11, after the two lengths at 9 / 10) on the roles AND the
+    attributes, as the dense roles do.  The plan-fact check stays two-directional: a ``delta_tensor`` on the default plan is refused
+    for being given at all, before any device read; a missing one on the external plan is refused as required."""
     from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES, ATTRIBUTES_F16_THD, EXTERNAL_DELTA_ROLE, ROLES, ROLES_F16, ROLES_F16_THD
     from cudnn.sdpa.fwd.api_dsl import ws_align
 
     totals = dict(max_total_seq_len_q=400, max_total_seq_len_kv=400)
-    h, t_pad = 2, -(-400 // 128) * 128  # the declared packed total, padded to the 128-row q tile
+    h, t_pad = 2, -(-400 // 128) * 128  # the declared packed total (within the envelope's B * S_max = 512, so it IS the capacity), to the q tile
     ext = _thd_adapter(h=h, external_delta=True, **totals)
     assert ext.check_support() and ext.external_delta is True
     api = _thd_adapter(h=h, **totals)
     assert api.check_support() and api.external_delta is False
     assert ext.external_delta_shape == api.external_delta_shape == (1, h, t_pad) == (1, h, -(-ext._t_q_cap // 128) * 128)
+    # an OVERSIZED declaration is tightened to the envelope's B * S_max tokens (``_thd_total``: a MIN) and the contract follows the
+    # capacity, not the declaration: the shape is ceil128(min(B * S_max, declared)) and the refusal names that shape with the reason
+    wide = _thd_adapter(h=h, external_delta=True, max_total_seq_len_q=1000, max_total_seq_len_kv=1000)
+    assert wide.check_support() and wide._t_q_cap == 2 * 256 and wide.external_delta_shape == (1, h, 512)
+    with pytest.raises(
+        ValueError, match=r"= \(1, 2, 512\) tensor \(the PACKED head-major layout .*token capacity \(the declared packed total, tightened to B\*S_max\)"
+    ):
+        wide._check_external_delta(torch.zeros(1, h, -(-1000 // 128) * 128))  # the DECLARATION's shape, fp32 and contiguous
     assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the default THD plan keeps the chain's own delta region"
     assert "delta" not in [name for name, _n, _d in ext._scratch_plan()], "the external plan carves no delta region"
     assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(h * t_pad * 4), "the carve lost exactly the delta region"

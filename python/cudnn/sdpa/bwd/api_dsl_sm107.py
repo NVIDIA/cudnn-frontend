@@ -960,8 +960,9 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         """The delta's contract: what stage 1 writes into the workspace region, and what ``execute(delta_tensor=)`` must carry
         under ``external_delta`` -- fp32, contiguous, 16-B aligned, on the plan's device.  Dense: ``(B, H_q, S_q_pad)``, zeros on
         the pad rows ``[S_q, S_q_pad)``.  THD: the PACKED head-major ``(1, H_q, ceil128(T_q))`` the THD main kernel reads at the
-        packed token index (``T_q`` = the declared packed total, the plan's token capacity), zeros past ``T_q`` -- the dense
-        layout at ``B = 1, S = T_q``."""
+        packed token index, zeros past ``T_q`` -- the dense layout at ``B = 1, S = T_q``.  ``T_q`` is the plan's TOKEN CAPACITY:
+        the declared packed total tightened to the envelope's ``B * S_max`` (``_thd_total``, a MIN), so an oversized declaration
+        does not widen the shape -- the refusal below names the capacity's shape, never the declaration."""
         if self.thd:
             return (1, self.h_q, -(-self._t_q_cap // _SM107_Q_PAD) * _SM107_Q_PAD)
         return (self.batch_size, self.h_q, self._sq_pad)
@@ -988,7 +989,11 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         )
         # The dense message is unchanged word for word (its regex pins); the THD plan names its packed form instead.
         layout, note = (
-            ("[1, H_q, ceil128(T_q)]", "the PACKED head-major layout the THD main kernel reads: T_q = the declared packed total, zeros past T_q")
+            (
+                "[1, H_q, ceil128(T_q)]",
+                "the PACKED head-major layout the THD main kernel reads: T_q = the plan's token capacity (the declared packed total, tightened "
+                "to B*S_max), zeros past T_q",
+            )
             if self.thd
             else ("[B, H_q, S_q_pad]", f"S_q_pad = S_q rounded up to {_SM107_Q_PAD}, zeros past S_q")
         )
