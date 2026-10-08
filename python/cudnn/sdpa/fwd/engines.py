@@ -739,11 +739,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        packed_split = (
-            (2 if knobs.cga is None else knobs.cga) == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1)
-            and (knobs.split_kv or 1) > 1
-            and thd_split_domain(capabilities, facts)
-        )
+        split_cga = knobs.cga if knobs.cga is not None else (1 if (facts.d_qk, facts.d_v) == (64, 64) else 2)
+        packed_split = split_cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
         if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv and not packed_split:
             return "Rubin half PackGQA requires paged KV or D128 packed split"
         if (
@@ -760,12 +757,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
-                "supports_paged_d256_packed_split"
-                if facts.d_v == 256
+                "supports_paged_d64_packed_split"
+                if facts.d_v == 64
                 else (
-                    "supports_paged_packed_split"
-                    if facts.has_paged_kv
-                    else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                    "supports_paged_d256_packed_split"
+                    if facts.d_v == 256
+                    else (
+                        "supports_paged_packed_split"
+                        if facts.has_paged_kv
+                        else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                    )
                 )
             ),
             False,
@@ -836,7 +837,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
-            if facts.thd and not ragged_decode and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes:
+            if (
+                facts.thd
+                and not ragged_decode
+                and not (packed_split and (facts.d_qk, facts.d_v) == (64, 64))
+                and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes
+            ):
                 return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
             if capabilities.is_mxfp8 and facts.o_block_scale:
                 return "PackGQA on the MXFP8 d128 flavor serves a plain (not block-scaled) O only"

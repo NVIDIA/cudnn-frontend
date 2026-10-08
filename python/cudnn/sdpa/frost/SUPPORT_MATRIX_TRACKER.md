@@ -340,7 +340,11 @@ the two legs cannot be told apart by the cga knob, and one template record must
 never name two kernels. `SdpaFwdDslSm100._d64_decode_tile` sets it, mirroring
 `_decode_q_tile` for the d256 tile, and only with the cga knob unset or 1: the
 tile is cga1-only (`make_cfg_d64_decode`), so an explicit `cga=2` selects the
-prefill pipeline instead.
+prefill pipeline instead. Explicit paged THD FP16/BF16 split plans also use
+this native D64 tile on SM100/SM103, with cga1, with or without packed GQA. The shared
+packed partial/combine host supports packed token/head-major Stats; padded
+Stats, sinks and other architectures retain their prior admission. Default
+selection is unchanged.
 
 ᵈᵗ **d128 decode tile (`sm100/decode_d128_f16.py`, f16/bf16).** The (128, 128) flavor of
 `sdpa_fwd_prefill_sm100` has two tiles behind the `TILE_CGA_M` knob: `2` is the prefill

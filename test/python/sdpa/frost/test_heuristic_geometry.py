@@ -258,7 +258,7 @@ def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
 
 
 @requires_dsl
-@pytest.mark.parametrize("overrides", [{"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 64}, {"has_paged_kv": False, "d_qk": 256, "d_v": 256}, {"has_sink": True}])
+@pytest.mark.parametrize("overrides", [{"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 128}, {"has_paged_kv": False, "d_qk": 256, "d_v": 256}, {"has_sink": True}])
 def test_paged_split_public_request_declines_unsupported_geometry(overrides):
     facts = _paged_split_facts(**overrides)
     assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)) is not None
@@ -370,6 +370,52 @@ def test_paged_d256_split_explicit_contract(monkeypatch, splits, cga):
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
     assert mismatch(spec.capabilities, facts, replace(knobs, split_kv=1)) is None
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("splits", [2, 3, 16, 64])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("cga", [None, 1])
+def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packed, cga):
+    """D64 THD uses its native decode tile only for an explicit paged split."""
+    facts = _paged_split_facts(device_cc=device_cc, d_qk=64, d_v=64)
+    knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=packed)
+    assert mismatch(SPEC.capabilities, facts, knobs) is None
+    assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
+    for invalid in (replace(knobs, cga=2), replace(knobs, split_kv=1, pack_gqa=True)):
+        assert mismatch(SPEC.capabilities, facts, invalid) is not None
+    for invalid in (replace(facts, has_paged_kv=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+        assert mismatch(SPEC.capabilities, invalid, knobs) is not None
+    previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
+    monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
+    assert "matching native" in mismatch(SPEC.capabilities, facts, knobs)
+    assert mismatch(SPEC.capabilities, facts, replace(knobs, split_kv=1, pack_gqa=False)) is None
+
+
+@requires_dsl
+@pytest.mark.parametrize("split", [1, 2, 3])
+def test_d64_paged_split_geometry_matches_selected_template(split):
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+
+    facts = _paged_split_facts(d_qk=64, d_v=64, s_q=257)
+    params = TemplateParams(
+        dtype_qkv=DTYPE_BF16,
+        d_flavor=64,
+        cta_mma=1,
+        decode_tile=split > 1,
+        thd_varlen=True,
+        paged_kv=True,
+        page_size=16,
+        seq_kv_lens_present=True,
+        split_kv=split,
+    )
+    mod = _load_sm100_kernel_module((64, 64), params)
+    assert heur._pack_gqa_tile_q(SPEC.capabilities, facts, 128, 1, split_kv=split) == mod.CGA_TILE_M
+    launch = heur._split_launch(SPEC.capabilities, facts, 128, 128, 1, 1, split_kv=split)
+    assert launch.q_tiles == len(range(0, facts.s_q, mod.CGA_TILE_M))
 
 
 @pytest.mark.parametrize("batch,max_q,group", [(1, 129, 1), (2, 129, 1), (3, 17, 8), (3, 33, 4), (4, 9, 16), (3, 0, 4)])
