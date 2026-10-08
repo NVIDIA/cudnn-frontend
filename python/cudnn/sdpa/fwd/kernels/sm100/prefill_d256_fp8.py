@@ -1078,8 +1078,9 @@ def _tmaldg_warp_group(
             )
 
             kv_main_start = cute.math.min(kv_left + cutlass.Int32(2), kv_right)
+            # Not the prologue's names: quack-kernels rewrites `if const_expr(S) and D` process-wide and would carry them in maybe-unset
             for kv_loop in cutlass.range(kv_main_start, kv_right, 1, unroll=1):
-                kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+                kv_row_loop = kv_loop * cutlass.Int32(CFG.TILE_N)
 
                 bars.mb_k_empty[kv_state.idx].wait(kv_state.phase)
                 if cutlass.const_expr(CFG.CTA_MMA == 2):
@@ -1088,7 +1089,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sK[kv_state.idx],
-                    tma_k(cutlass.Int32(0), kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
+                    tma_k(cutlass.Int32(0), kv_row_loop + K_ROW_OFFSET_PEER + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1102,7 +1103,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sV[kv_state.idx],
-                    tma_v(cutlass.Int32(0), kv_row_base + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
+                    tma_v(cutlass.Int32(0), kv_row_loop + kv_seq_off, cutlass.Int32(0), kv_head_idx, tma_batch),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
