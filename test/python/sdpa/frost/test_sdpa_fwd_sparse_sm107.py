@@ -2141,11 +2141,13 @@ def test_decode_form_dead_sequence_partials_are_the_combine_identity():
 
 @requires_rubin
 def test_decode_form_other_sequence_rows_in_the_open_block_are_masked():
-    """The A5 decode row: ``kv_lens = [4098, 2053]`` (``L % 4 != 0``: the open block straddles the length inside the last page) over
-    page-16 pools whose unwritten rows hold the OTHER sequence's tokens -- BITWISE the NaN-filled pools and the dense read, split and
-    unsplit; the oracle over the same tokens with those rows PRESENT (lengths rounded up to the block) is far from the kernel, so the
-    rows carry weight when visible."""
-    B, SKV, kv_lens, S, H, KH, top_k, P = 2, 4160, [4098, 2053], 1, 24, 2, 512, 16
+    """The A5 decode row: ``kv_lens = [98, 37]`` (``L % 4 != 0``: the open block straddles the length inside the last page; SHORT
+    sequences, so the 2-3 rows past the length would weigh ~5 % of the softmax mass if gathered) over page-16 pools whose unwritten
+    rows hold the OTHER sequence's tokens -- BITWISE the NaN-filled pools and the dense read, split and unsplit; the oracle over the
+    same tokens with those rows PRESENT (lengths rounded up to the block end) is far from the kernel, so the rows carry weight when
+    visible.  (The long-sequence paged cells of the ladder are bitwise the dense read too; at 4K visible keys three rows weigh too
+    little for a teeth assertion.)"""
+    B, SKV, kv_lens, S, H, KH, top_k, P = 2, 112, [98, 37], 1, 24, 2, 512, 16
     dtype = torch.bfloat16
     q, k, v, g = _inputs(B, S, H, KH, dtype, 5, SKV=SKV)
     ids, lens = _decode_lists("shuffled", B, S, top_k, kv_lens, g)
@@ -2163,7 +2165,7 @@ def test_decode_form_other_sequence_rows_in_the_open_block_are_masked():
         max_o, max_lse = _check([(out_n[0][0], out_n[0][1])], ref_o, ref_lse)
         _assert_bitwise((out_n[0][0], out_n[0][1]), (out_o[0][0], out_o[0][1]), f"split {split}: NaN-filled vs other-sequence-filled unwritten rows")
         _assert_bitwise((out_n[0][0], out_n[0][1]), (dense[0][0], dense[0][1]), f"split {split}: paged vs dense")
-        vis_o, _, _ = _reference_decode(q, k, v, ids, lens, [4100, 2056], scale, top_k)
+        vis_o, _, _ = _reference_decode(q, k, v, ids, lens, [100, 40], scale, top_k)
         teeth = float((out_n[0][0].float() - vis_o).abs().max())
         assert teeth > ATOL, f"the open block's rows past the length must carry weight when visible (diff {teeth})"
         print(
@@ -2206,15 +2208,18 @@ def test_decode_form_gate_rides_the_epilogue_or_the_combine(split):
 @pytest.mark.parametrize("S_q", [2, 4])
 def test_decode_form_mtp_rows_share_the_step0_list(S_q):
     """``S_q`` rows per sequence sharing the step-0 list (the MTP verify rows; 4 single-token items per (sequence, KV head)):
-    ``kv_lens`` chosen so sequence 0's step-0 row has NO tail (``(L - S_q + 1) % 4 == 0``: its later rows gain the block that
-    completes between ``pos_0`` and ``pos_j`` -- two tail ids at ``S_q = 4``), sequence 1's step-0 row an open tail, sequence 2
-    shorter than the query count (``L = S_q - 1``: row 0 dead, the rest live) -- within the budget vs the oracle anchored at
-    ``pos0``; and the per-row-tail reading (``pos0=None``, which hides the completing block from the row at ``pos_j = 4k + 3``)
-    differs beyond the budget on that row, so the shared-list semantics have teeth.  Split 2 bitwise-compared to split 1 within
-    the derived budget."""
-    B, SKV, H, KH, top_k = 3, 4096, 24, 2, 512
-    kv_lens = [4096 - 1 + S_q - 4, 2051 + S_q, S_q - 1]  # seq 0: (L - S_q + 1) % 4 == 0; seq 1: pos_0 = 2051 (tail of 1 token at step 0)
-    assert (kv_lens[0] - S_q + 1) % 4 == 0 and (kv_lens[1] - S_q + 1) % 4 != 0
+    sequence 0 is SHORT with its step-0 position at ``4k + 2`` (``S_q = 2``) / ``4k + 1`` (``S_q = 4``), so a later row sits at
+    ``pos_j = 4k + 3`` and sees the block that completes between ``pos_0`` and ``pos_j`` (two tail ids at ``S_q = 4``); sequence 1's
+    step-0 row has NO tail (``pos_0 = 2051``: ``(pos_0 + 1) % 4 == 0``) and its later rows gain the completing block; sequence 2 is
+    shorter than the query count (``L = S_q - 1``: row 0 dead, the rest live) -- within the budget vs the oracle anchored at ``pos0``;
+    and the per-row-tail reading (``pos0=None``, which hides the completing block from the row at ``pos_j = 4k + 3``) differs beyond
+    the budget on that row of the short sequence (the hidden block weighs ~4 / 56 of its mass), so the shared-list semantics have
+    teeth.  Split 2 vs split 1 within the derived budget."""
+    B, SKV, H, KH, top_k = 3, 2056, 24, 2, 512
+    pos0_teeth = 54 if S_q == 2 else 53  # 4k + 2 / 4k + 1: the row at 4k + 3 is row 1 / row 2
+    j_teeth = (4 * 13 + 3) - pos0_teeth
+    kv_lens = [pos0_teeth + S_q, 2051 + S_q, S_q - 1]
+    assert (kv_lens[1] - S_q + 1) % 4 == 0 and 0 < j_teeth < S_q
     dtype = torch.bfloat16
     q, k, v, g = _inputs(B, S_q, H, KH, dtype, 13, SKV=SKV)
     ids, lens = _decode_lists("shuffled", B, S_q, top_k, kv_lens, g)
@@ -2223,12 +2228,13 @@ def test_decode_form_mtp_rows_share_the_step0_list(S_q):
     assert torch.isinf(ref_lse[2, :, 0]).all() and torch.isfinite(ref_lse[2, :, 1:]).all(), "the short sequence: row 0 dead (pos_0 < 0), the rest live"
     outs = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=1)
     max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
-    # teeth: the per-row-tail reading differs on sequence 0's last row (pos_j = 4k + 3 at S_q = 4: the completing block hidden)
+    # teeth: the per-row-tail reading differs on the short sequence's 4k + 3 row (the completing block hidden from it)
     alt_o, alt_lse, _ = _reference_decode(q, k, v, ids, lens, kv_lens, scale, top_k, pos0_anchor=False)
-    teeth = float((outs[0][0][0, S_q - 1].float() - alt_o[0, S_q - 1]).abs().max())
-    teeth_lse = float((outs[0][1][0, :, S_q - 1] - alt_lse[0, :, S_q - 1]).abs().max())
-    if S_q == 4:
-        assert teeth > ATOL and teeth_lse > ATOL, f"the shared-list form must differ from the per-row-tail reading on the 4k + 3 row ({teeth} / {teeth_lse})"
+    teeth = float((outs[0][0][0, j_teeth].float() - alt_o[0, j_teeth]).abs().max())
+    teeth_lse = float((outs[0][1][0, :, j_teeth] - alt_lse[0, :, j_teeth]).abs().max())
+    assert teeth > ATOL and teeth_lse > ATOL, f"the shared-list form must differ from the per-row-tail reading on the 4k + 3 row ({teeth} / {teeth_lse})"
+    # the step-0 row of every sequence reads the same under both anchors (no later token has been seen)
+    assert float((outs[0][0][:, 0].float() - alt_o[:, 0]).abs().max()) <= ATOL
     sp = _launch_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=2, launches=1)
     _check([(sp[0][0], sp[0][1])], ref_o, ref_lse)
     live = ~torch.isinf(ref_lse).permute(0, 2, 1)
