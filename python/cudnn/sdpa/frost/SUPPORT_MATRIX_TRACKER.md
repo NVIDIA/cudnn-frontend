@@ -699,7 +699,7 @@ B200, packed 0.53-0.99); other supported THD groups remain available as
 explicit tuning candidates. On SM100/SM103, nonpaged d128 half THD graphs
 with a packed first plan lead the backend unsplit when they are bottom-right
 causal without window, sink or right band, declare KV > 512, and carry at
-least 16384 query rows (b * h_q * s_q) or Q >= 256 at KV >= 1024.
+least 110 query rows (b * h_q * s_q) per SM or Q >= 256 at KV >= 1024.
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
 BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
