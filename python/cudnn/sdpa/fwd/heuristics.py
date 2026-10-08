@@ -107,9 +107,9 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 # FP8 H128 causal, NATURAL = 1.00: LPT 1.00 / 1.16 / 0.93 / 0.87 / 0.92 and
 # LPT_L2 0.90 / - / 1.00 / - / 0.99 at S = 2K / 4K / 8K / 16K / 32K, i.e. LPT
 # pays at 10-19 waves and costs from 39 waves on, LPT_L2 never pays there.
-# 256 = the 2-CTA flavors' q rows per cluster; 106 clusters = the 212-SM part / 2.
+# 256 = the 2-CTA flavors' q rows per cluster; measured on the 212-SM part (106 clusters).
 _SM107_CGA_Q_ROWS = 256
-_SM107_CLUSTERS = 106
+_SM107_MEASURED_SMS = 212
 _SM107_NO_GQA_LPT_MAX_WAVES = 24
 
 # The SM80 kernels' L2 grouping budget is a per-flavor MiB table fed to the
@@ -613,7 +613,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # The bound is the arch LINE, not `>= 107`: the SM120 rows sit at sm_lo=120 and
         # keep the SM100/SM120 L2-budget rule below (the wave-count constants above
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
-        waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
+        waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
     elif causal_ish and _d128_f16_flavor(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
         # One Q cluster per (batch, packed head) unit on the SM100 f16 row's
