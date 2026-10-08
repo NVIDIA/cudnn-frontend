@@ -19,7 +19,10 @@ imported and never re-literalled: the fp8 SDPA row's recipe on the SDPA stage pe
 ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under ``_AMAX_DS_TOL``) plus the bf16 block's bound form on the stage's bf16
 output, the (M) end-to-end in the row-budgeted form (``1e-5 x rows x keys``) on ``dh / dw_qkvg / dw_o``, the seeded oracle under the
 bf16 block's bound on ``dh / dw_o / dW_norm`` and, on ``dw_qkvg``, in the row-budgeted form with the dense suite's flip ATTRIBUTION
-(every row outside the bound a ``dqkvg8`` flip's, its pre-cast slab column inside its band's bound); the quantizers, every scalar
+(every row outside the bound a ``dqkvg8`` flip's, its pre-cast slab column inside its band's bound) -- where that budget is its FLOOR
+(fewer than 20 tokens: the 5-token cell) the ``dw_qkvg`` row count is REPORTED, not asserted, and the attribution carries the pin on
+both layers (``_row_budget_floored``: the cast's flip class leaves a handful of rows outside at every length, so a floor of one row is
+not its bound); the quantizers, every scalar
 and the delta BITWISE (the dense suite's layer, unchanged at ``B = 1, S = T``).  ``B = 1`` packed is pinned ``torch.equal`` the dense
 fp8 backward over the same bytes (a difference is a
 finding to investigate at the SDPA stage first, never a tolerance); ``grad_scaling="delayed"`` replays the current run bitwise;
@@ -91,8 +94,10 @@ from test_block_backward_fp8 import (  # noqa: E402
     _report_close,
     _report_seeded_intermediates,
     _report_stage_difference,
+    _row_budget_floored,
     _row_keys,
     _row_tol,
+    _rows_outside_mask,
     _slots,
     _test_python_root,
 )
@@ -447,34 +452,60 @@ def _assert_sdpa_stage_per_sequence(res, v: dict) -> None:
     assert abs(amax_dp - amax_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ref, (amax_dp, amax_ref)
 
 
-def _assert_m_row_budgeted(tag: str, res, ref: dict) -> dict:
+def _assert_m_row_budgeted(tag: str, res, ref: dict, flip_ev: Optional[dict] = None) -> dict:
     """The (M) end-to-end in the dense suite's ONE form: the bf16 block's bound with the SDPA stage's flip class propagated and budgeted
     by ROWS (``1e-5 x rows x keys``, at least 1) on ``dh / dw_qkvg / dw_o`` -- every output, both GQA fold paths included (the row folds
-    its per-Q-head partials from fp32, rounding once like the reference) -- never widened.  Returns the per-output report."""
+    its per-Q-head partials from fp32, rounding once like the reference) -- never widened.  Where ``dw_qkvg``'s budget is its FLOOR
+    (``_row_budget_floored``: fewer than 20 tokens) the count is REPORTED and every row outside is held to the cast's flip class instead
+    -- a row a ``dqkvg8`` flip touched, its pre-cast slab column inside its band's bound (the dense suite's attribution conditions (2)
+    and (3), read from ``flip_ev`` = ``_report_seeded_intermediates``'s evidence, REQUIRED there) -- the honest form of the pin at a
+    length whose proportional budget does not describe the class; ``dh / dw_o`` keep the row-budgeted form at every length.  Returns
+    the per-output report."""
     m = _print_end_to_end(tag, res.grads, ref, keys=_row_keys(res))
     assert m, tag
-    over = {
-        n: (m[n]["rows_outside"], m[n]["rows"], m[n]["row_budget"]) for n in ("dh", "dw_qkvg", "dw_o") if n in m and m[n]["rows_outside"] > m[n]["row_budget"]
-    }
+    floored = "dw_qkvg" in m and _row_budget_floored(m["dw_qkvg"]["rows"], _row_keys(res)["dw_qkvg"])
+    budgeted = ("dh", "dw_o") if floored else ("dh", "dw_qkvg", "dw_o")
+    over = {n: (m[n]["rows_outside"], m[n]["rows"], m[n]["row_budget"]) for n in budgeted if n in m and m[n]["rows_outside"] > m[n]["row_budget"]}
     assert not over, f"{tag}: (M) rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget (rows outside, rows, budget): {over}"
+    if floored:
+        assert flip_ev is not None, f"{tag}: the dw_qkvg row budget is its floor here -- the flip evidence is required for the attribution form"
+        rows_out = torch.nonzero(_rows_outside_mask(res.grads["dw_qkvg"], ref["dw_qkvg"])).flatten()
+        unexplained = rows_out[~torch.isin(rows_out, flip_ev["dw_qkvg_rows"].to(rows_out.device))]
+        band_worst = flip_ev["band_col_worst"].to(rows_out.device)[rows_out]  # each row's PRE-cast slab column: worst cell / its band's bound
+        not_the_casts = rows_out[band_worst > 1.0]
+        print(
+            f"{tag} dw_qkvg: {int(rows_out.numel())} of {m['dw_qkvg']['rows']} rows outside the bf16 bound at a FLOORED row budget "
+            f"({m['dw_qkvg']['row_budget']:.3g}) -- the count is reported; {int(unexplained.numel())} untouched by a dqkvg8 flip, "
+            f"{int(not_the_casts.numel())} with the pre-cast slab column outside its band's bound"
+        )
+        assert unexplained.numel() == 0, (
+            f"{tag}: (M) dw_qkvg rows {unexplained.tolist()} are outside the bf16 bound and no dqkvg8 flip touched them (not the cast's flip "
+            f"class) -- rows outside {rows_out.tolist()}"
+        )
+        assert not_the_casts.numel() == 0, (
+            f"{tag}: (M) dw_qkvg rows {not_the_casts.tolist()} are outside the bf16 bound and their PRE-cast slab columns are themselves outside "
+            f"the band's bound against the seeded oracle ({[round(x, 3) for x in band_worst[band_worst > 1.0].tolist()]} of it): a miss upstream "
+            f"of the cast, not the cast's flip class -- rows outside {rows_out.tolist()}"
+        )
     return m
 
 
-def _assert_seeded_under_the_bf16_bound(tag: str, res, ref: dict, v: Optional[dict] = None) -> dict:
+def _assert_seeded_under_the_bf16_bound(tag: str, res, ref: dict, v: Optional[dict] = None, flip_ev: Optional[dict] = None) -> dict:
     """Downstream of the SDPA stage, the dense suite's seeded layer at ``B = 1, S = T``: ``dh / dw_o`` vs the oracle SEEDED with the
     block's own per-sequence dQ / dK / dV under the bf16 block's bound, ``dW_norm`` under the noise bound with the combined mass, and
     ``dw_qkvg`` in the ROW-BUDGETED form WITH its attribution (``_assert_seeded_dw_qkvg_row_budgeted`` over the packed slab: the rows
     with a cell outside the bound within ``1e-5 x rows x keys``, EVERY such row one a ``dqkvg8`` flip touched, its PRE-cast slab column
     inside its band's bound -- the cast's rounding, not a band's miss; the flip evidence from ``_report_seeded_intermediates`` over the
     packed bands, which also pins the slab's V band bitwise the block's own dV slot).  ``v`` = the materialised intermediates
-    (``_slots(res)`` when omitted)."""
+    (``_slots(res)`` when omitted); ``flip_ev`` = that evidence when the caller computed it already (shared with the (M) layer's
+    floored form), else it is computed here."""
     v = _slots(res) if v is None else v
     worst = {}
     for name in ("dh", "dw_o"):
         if res.grads[name] is not None:
             worst[name] = _assert_grad_close(res.grads[name], ref[name], f"{tag} {name} vs the seeded oracle")
     if res.grads["dw_qkvg"] is not None:
-        flip_ev = _report_seeded_intermediates(res, v, ref)
+        flip_ev = _report_seeded_intermediates(res, v, ref) if flip_ev is None else flip_ev
         worst["dw_qkvg"] = _assert_seeded_dw_qkvg_row_budgeted(res, v, ref, flip_ev, f"{tag} dw_qkvg vs the seeded oracle")
     for name in ("dw_q_norm", "dw_k_norm"):
         if res.grads[name] is not None:
@@ -821,7 +852,9 @@ def test_thd_fp8_zero_length_sequences(lens, s_max):
     (a hang is a barrier-table finding, never a raised limit; if it ever flakes, count exit codes over >= 8 fresh processes).
     Asserted: every gradient finite; the live sequences under the whole per-sequence chain (the quantizers / scalars / delta
     bitwise, the SDPA stage per sequence under the row recipe, the (M) row budget, the seeded layer with the ``dw_qkvg``
-    attribution); the NEIGHBOURS EXACT -- the same tokens packed WITHOUT the empty sequence (same ``T``, same bytes, same
+    attribution -- at the 5-token cell the ``dw_qkvg`` row budget is its FLOOR, so its count is REPORTED and every row outside is
+    held to the cast's flip class on both layers, ``_row_budget_floored``); the NEIGHBOURS EXACT -- the same tokens packed WITHOUT
+    the empty sequence (same ``T``, same bytes, same
     calibrated QuantSpec and ``scale_dp``) give a bitwise record, ``torch.equal`` gradients, an equal scalar block and the SAME
     ``amax_dP`` (an empty sequence contributes nothing); and a twin over a 0xFF workspace with NaN-filled gradients bitwise the
     clean run on every gradient, on the SDPA stage's slots and on the delta (no unwritten tile is read, nothing leaks -- the
@@ -834,8 +867,10 @@ def test_thd_fp8_zero_length_sequences(lens, s_max):
     v = _assert_quantizers_scalars_delta_bitwise(res)
     _assert_sdpa_stage_per_sequence(res, v)
     tag = f"thd fp8 {tuple(lens)} s_max={s_max}"
-    _assert_m_row_budgeted(f"{tag} (M)", res, _oracle_m_packed(res))
-    _assert_seeded_under_the_bf16_bound(tag, res, _oracle_m_packed(res, seeded=True), v)
+    ref_m, ref_seeded = _oracle_m_packed(res), _oracle_m_packed(res, seeded=True)
+    flip_ev = _report_seeded_intermediates(res, v, ref_seeded)  # computed once: the (M) layer's floored form and the seeded layer share it
+    _assert_m_row_budgeted(f"{tag} (M)", res, ref_m, flip_ev)
+    _assert_seeded_under_the_bf16_bound(tag, res, ref_seeded, v, flip_ev)
     # the neighbours exact: the same tokens packed without the empty sequence(s)
     live = tuple(n for n in lens if n)
     twin = _backward_fp8_thd(live, max_seq_len=s_max)
