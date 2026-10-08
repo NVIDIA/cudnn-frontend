@@ -245,6 +245,60 @@ def _check_all_grads_packed(res) -> dict:
     return worst
 
 
+def _twin_thd(res, *, poison=0xFF, **bwd_kw):
+    """A second PACKED block over the SAME record / dy / inputs as ``res`` (different knobs; the packing's own knobs from the
+    record's form), compiled and run once into a poisoned workspace and NaN-filled gradients; returns ``(blk, ws, grads)`` --
+    the bitwise comparand of ``res`` (the dense suite's ``_twin``, packed)."""
+    inp, cu = res.inp, res.saved.seq_lens_form == "prefix"
+    blk = GatedAttentionBlockBwd(
+        res.dy, res.saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], res.geom, **_thd_kw(res.meta, cu=cu), **bwd_kw
+    )
+    blk.check_support()
+    blk.compile()
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda").fill_(poison)
+    grads = _alloc_grads(blk, fill=float("nan"))
+    _execute_bwd(blk, inp, res.saved, res.dy, grads, ws)
+    torch.cuda.synchronize()
+    return blk, ws, grads
+
+
+def _assert_fused_is_bitwise_the_unfused(res, fused, ws_f, grads_f):
+    """The fused-gate packed block (``fuse_gate_bwd=True``) against the unfused one over the same record: every gradient finite
+    and ``torch.equal``; the ``delta`` the gate backward wrote into the block's own region bitwise the unfused adapter's
+    ``dot_do_o`` region over the WHOLE packed head-major ``[1, H_q, ceil128(T)]`` buffer -- defined at ``sum(lengths) == T``
+    (every packing this module builds), where the zero tail ``[T, ceil128(T))`` is the only pad -- and that tail exactly zero
+    in both; the carve moved: the adapter's scratch shrank by exactly the aligned delta region, the block's own region has
+    the adapter's packed shape, the total within the carve alignment.  Returns ``(d_unfused, d_fused)``."""
+    from cudnn.gated_attention_block.api import _WS_ALIGN as align
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+    from test_block_backward import _adapter_delta
+
+    t = res.meta["t"]
+    assert sum(res.meta["lens"]) == t, "the whole-buffer delta compare is defined at sum(lengths) == T only"
+    assert fused.thd and fused.fuse_gate_bwd and fused._gate_bwd.want_delta and fused._sdpa.external_delta and fused._sdpa._impl.external_delta
+    assert not res.blk.fuse_gate_bwd and not res.blk._sdpa._impl.external_delta
+    for name, ten in grads_f.items():
+        if ten is None:
+            assert res.grads[name] is None, name
+            continue
+        assert torch.isfinite(ten.float()).all(), name
+        d = (ten.float() - res.grads[name].float()).abs().max().item()
+        assert torch.equal(
+            ten, res.grads[name]
+        ), f"{name}: the fused-gate packed block differs from the unfused one (max|diff| {d:.3e}) -- a finding, not a tolerance"
+    d_unfused, d_fused = _adapter_delta(res.blk, res.ws), _adapter_delta(fused, ws_f)
+    t_pad = -(-t // 128) * 128
+    assert d_fused.shape == d_unfused.shape == (1, res.geom.h_q, t_pad)
+    assert torch.isfinite(d_fused).all() and torch.equal(d_fused, d_unfused), "the gate kernel's packed delta is not the chain's own dot_do_o"
+    zeros = torch.zeros_like(d_fused[:, :, t:])
+    assert torch.equal(d_fused[:, :, t:], zeros) and torch.equal(d_unfused[:, :, t:], zeros), "the tail [T, ceil128(T)) of the packed delta is not zero"
+    lay_u, lay_f = res.blk._layout(), fused._layout()
+    assert lay_u.delta == -1 and lay_f.delta >= 0 and lay_f.delta_shape == tuple(fused._sdpa._impl.external_delta_shape) == (1, res.geom.h_q, t_pad)
+    assert lay_u.sdpa_bwd_bytes - lay_f.sdpa_bwd_bytes == ws_align(res.geom.h_q * t_pad * 4), "the adapter's carve lost exactly the delta region"
+    assert abs(lay_f.total_bytes - lay_u.total_bytes) <= 2 * align, (lay_f.total_bytes, lay_u.total_bytes)
+    return d_unfused, d_fused
+
+
 # ---------------------------------------------------------------------------
 # Static pin -- the SDPA backward stage's packed declaration (any CUDA device, no compile)
 # ---------------------------------------------------------------------------
@@ -662,19 +716,89 @@ def test_thd_gqa_bwd(h_kv):
 
 @requires_rubin
 @pytest.mark.parametrize(
+    "dtype, causal, h_kv",
+    [(torch.bfloat16, True, 2), (torch.bfloat16, False, 2), (torch.bfloat16, True, 8), (torch.bfloat16, False, 8), (torch.float16, True, 2)],
+    ids=["bf16-causal-gqa_8_2", "bf16-dense-gqa_8_2", "bf16-causal-mha", "bf16-dense-mha", "fp16-causal-gqa_8_2"],
+)
+def test_thd_fused_gate_bwd_is_bitwise_the_unfused_packed_block(dtype, causal, h_kv):
+    """``fuse_gate_bwd=True`` under THD computes the SAME function as the unfused packed block over the same record
+    (``(300, 128, 200)``, causal and dense, GQA 8/2 and MHA, bf16 and fp16): every gradient ``torch.equal``; the ``delta`` the
+    gate-backward kernel wrote at ``s = T`` into the block's own region is bitwise the unfused adapter's ``dot_do_o`` region over
+    the WHOLE packed head-major ``[1, H_q, ceil128(T)]`` buffer, the zero tail ``[T, ceil128(T))`` included (the packed layout IS
+    the dense one at ``B = 1, S = T``); the fused block's workspace is poisoned first; its adapter carries no ``delta`` region
+    (the carve shrank by exactly that aligned region), the block's own one takes its place, the total within the carve alignment.
+    The unfused arm is held to the per-sequence fp64 oracle, so the fused one is too.  The packed twin of
+    ``test_fused_gate_bwd_is_bitwise_the_unfused_block``."""
+    geom_kw = {**_COMMON, "is_causal": causal, "h_kv": h_kv}
+    res = _backward_thd(geom_kw, _LENS, dtype=dtype)
+    _check_all_grads_packed(res)
+    fused, ws_f, grads_f = _twin_thd(res, fuse_gate_bwd=True)
+    _assert_fused_is_bitwise_the_unfused(res, fused, ws_f, grads_f)
+
+
+@requires_rubin
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+@pytest.mark.parametrize(
     "lens, s_max",
     [((256, 0, 128), 256), ((0, 256, 128), 256), ((5, 0, 0), 5)],
     ids=["middle_empty", "first_empty", "trailing_empties_T5"],
 )
-def test_thd_zero_length_sequence_bwd(lens, s_max):
+def test_thd_zero_length_sequence_bwd(lens, s_max, fuse):
     """Zero-length sequences in the packed backward: ``dh`` of the live sequences exact per sequence, every weight gradient
-    the live sequences' sum (an empty sequence contributes nothing), the gradients finite everywhere."""
+    the live sequences' sum (an empty sequence contributes nothing), the gradients finite everywhere -- and, under
+    ``fuse_gate_bwd``, the fused packed block (poisoned workspace, NaN-filled gradients) BITWISE the unfused one on every
+    gradient and on the delta buffer first: an oracle verdict is then the same for both arms by construction (a
+    dataset-dependent miss on a cell is classified on the unfused arm, never read as the fusion's)."""
     res = _backward_thd(_COMMON, lens, max_seq_len=s_max)
     assert 0 in res.meta["lens"]
+    if fuse:
+        fused, ws_f, grads_f = _twin_thd(res, fuse_gate_bwd=True)
+        _assert_fused_is_bitwise_the_unfused(res, fused, ws_f, grads_f)
     for name, ten in res.grads.items():
         if ten is not None:
             assert torch.isfinite(ten.float()).all(), name
     _check_all_grads_packed(res)
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "lens, s_max, geom_over",
+    [
+        ((5,), 5, {}),
+        ((128,), 128, {}),
+        ((129, 5), 129, {}),
+        ((384,), 384, {}),
+        ((1024,), 1024, {}),
+        ((300, 128, 200), 300, {"is_causal": False}),
+        ((300, 128, 200), 300, {"is_causal": True, "causal_bottom_right": True}),
+        ((300, 128, 200), 300, {"is_causal": True, "window_left": 64}),
+        ((5,), 5, {"h_q": 2, "h_kv": 2}),
+        ((300, 128, 200), 300, {"h_q": 1, "h_kv": 1}),
+    ],
+    ids=[
+        "one_tail_tile_T5",
+        "one_full_tile",
+        "two_tiles_tail_plus_T5",
+        "three_full_tiles",
+        "eight_tiles",
+        "dense",
+        "bottom_right",
+        "swa64",
+        "two_heads_T5",
+        "one_head",
+    ],
+)
+def test_thd_fused_gate_bwd_sweep(lens, s_max, geom_over):
+    """The fused-gate packed block across the degenerate axes: one partial tile and one full 128-row tile of Q / KV, two tiles
+    with a tail, three full tiles (the Q ring depth + 1), eight tiles, every mask arm (dense, causal, bottom-right, a 64-wide
+    window), one or two heads (the smallest ``B*H``) and a 5-token sequence (never 1).  Each cell: the unfused packed block
+    against the per-sequence fp64 oracle, then the fused block (poisoned workspace, NaN-filled gradients) BITWISE the unfused
+    one on every gradient and on the delta buffer with its zero tail, finite everywhere, the carve moved."""
+    geom_kw = {**_COMMON, **geom_over}
+    res = _backward_thd(geom_kw, lens, max_seq_len=s_max)
+    _check_all_grads_packed(res)
+    fused, ws_f, grads_f = _twin_thd(res, fuse_gate_bwd=True)
+    _assert_fused_is_bitwise_the_unfused(res, fused, ws_f, grads_f)
 
 
 @requires_rubin
@@ -685,14 +809,18 @@ def test_thd_ragged_envelope_bwd():
 
 
 @requires_rubin
-def test_thd_b1_bwd_is_bitwise_the_dense_block():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_thd_b1_bwd_is_bitwise_the_dense_block(fuse):
     """``B = 1`` packed ``(512,)`` against the dense ``B=1, S=512`` backward over the same record bytes: every gradient
-    BITWISE (one sequence over the same tiles)."""
+    BITWISE (one sequence over the same tiles) -- under both knob values (the fused packed and the fused dense block are each
+    bitwise their unfused twin, so bitwise each other: the gate backward writes the same delta tensor on both sides)."""
     from test_block_backward import _backward
 
+    kw = {"fuse_gate_bwd": True} if fuse else {}
     t = 512
-    res = _backward_thd(_COMMON, (t,))
-    dense = _backward(dict(_COMMON), batch=1, seq_len=t)
+    res = _backward_thd(_COMMON, (t,), **kw)
+    dense = _backward(dict(_COMMON), batch=1, seq_len=t, **kw)
+    assert res.blk.fuse_gate_bwd is fuse and dense.blk.fuse_gate_bwd is fuse
     for k in ("h", "w_qkvg", "w_o", "cos", "sin"):
         assert torch.equal(dense.inp[k], res.inp[k]), k
     assert (
@@ -708,16 +836,19 @@ def test_thd_b1_bwd_is_bitwise_the_dense_block():
 
 
 @requires_rubin
-def test_thd_uniform_b4_bwd_matches_the_dense_block_per_sequence():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_thd_uniform_b4_bwd_matches_the_dense_block_per_sequence(fuse):
     """Uniform ``B = 4`` packed ``(256,)*4`` against the dense ``B=4, S=256`` backward: the token-wise stage outputs
     (``dh`` rows per sequence, ``dW``) at the dense suite's bounds against the SAME fp64 oracle both are held to; the
     first differing gradient against the dense block is printed (the packed SDPA backward walks its kv-blocked workspace
-    differently)."""
+    differently) -- under both knob values."""
     from test_block_backward import _backward
 
+    kw = {"fuse_gate_bwd": True} if fuse else {}
     s, b = 256, 4
-    res = _backward_thd(_COMMON, (s,) * b)
-    dense = _backward(dict(_COMMON), batch=b, seq_len=s)
+    res = _backward_thd(_COMMON, (s,) * b, **kw)
+    dense = _backward(dict(_COMMON), batch=b, seq_len=s, **kw)
+    assert res.blk.fuse_gate_bwd is fuse and dense.blk.fuse_gate_bwd is fuse
     assert torch.equal(dense.inp["h"].reshape(1, b * s, -1), res.inp["h"]) and torch.equal(dense.dy.reshape(1, b * s, -1), res.dy)
     first_diff = None
     for name, ten in res.grads.items():
@@ -734,12 +865,15 @@ def test_thd_uniform_b4_bwd_matches_the_dense_block_per_sequence():
 
 
 @requires_rubin
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
 @pytest.mark.parametrize("cu_base", [0, 100], ids=["prefix", "prefix_nonzero_base"])
-def test_thd_lengths_and_prefix_forms_are_bitwise_bwd(cu_base):
+def test_thd_lengths_and_prefix_forms_are_bitwise_bwd(cu_base, fuse):
     """On the backward: the same packing through the ``[B]`` lengths and the ``[B+1]`` prefix record (base 0 and base
-    100) gives ``torch.equal`` gradients."""
-    a = _backward_thd(_COMMON, _LENS)
-    b = _backward_thd(_COMMON, _LENS, cu=True, cu_base=cu_base)
+    100) gives ``torch.equal`` gradients -- under both knob values."""
+    kw = {"fuse_gate_bwd": True} if fuse else {}
+    a = _backward_thd(_COMMON, _LENS, **kw)
+    b = _backward_thd(_COMMON, _LENS, cu=True, cu_base=cu_base, **kw)
+    assert a.blk.fuse_gate_bwd is fuse and b.blk.fuse_gate_bwd is fuse
     assert b.saved.seq_lens_form == "prefix" and b.saved.seq_lens.numel() == b.meta["b"] + 1 and int(b.saved.seq_lens[0]) == cu_base
     for name, ten in a.grads.items():
         if ten is not None:
@@ -766,9 +900,11 @@ def test_thd_lse_consumer_reads_the_head_major_record():
 
 
 @requires_rubin
-def test_thd_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
+@pytest.mark.parametrize("base", [{}, {"fuse_gate_bwd": True}], ids=["plain", "on-fuse_gate_bwd"])
+def test_thd_fuse_wgrad_overlap_is_bitwise_the_in_order_block(base):
     """``fuse_wgrad_overlap=True`` under THD: the same launches on the side stream, every gradient ``torch.equal`` the
-    in-order packed block's (workspace poisoned, gradients NaN-filled first)."""
+    in-order packed block's (workspace poisoned, gradients NaN-filled first) -- alone and composed with ``fuse_gate_bwd``
+    (both knobs on, still bitwise the plain packed block)."""
     res = _backward_thd(_COMMON, _LENS)
     on = GatedAttentionBlockBwd(
         res.dy,
@@ -782,6 +918,7 @@ def test_thd_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
         res.geom,
         **_thd_kw(res.meta),
         fuse_wgrad_overlap=True,
+        **base,
     )
     on.check_support()
     on.compile()
@@ -789,7 +926,7 @@ def test_thd_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
     grads = _alloc_grads(on, fill=float("nan"))
     _execute_bwd(on, res.inp, res.saved, res.dy, grads, ws)
     torch.cuda.synchronize()
-    assert on.fuse_wgrad_overlap and on._side is not None
+    assert on.fuse_wgrad_overlap and on._side is not None and on.fuse_gate_bwd is bool(base.get("fuse_gate_bwd", False))
     for name, ten in grads.items():
         if ten is not None:
             assert torch.isfinite(ten).all(), name
@@ -797,10 +934,12 @@ def test_thd_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
 
 
 @requires_rubin
-def test_thd_two_runs_are_bitwise_bwd():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_thd_two_runs_are_bitwise_bwd(fuse):
     """Two executes with the workspace poisoned between (0xFF) and NaN-filled gradients: bitwise equal (the packed
-    chain's metadata / dS workspace included)."""
-    res = _backward_thd(_COMMON, _LENS)
+    chain's metadata / dS workspace included) -- under both knob values."""
+    res = _backward_thd(_COMMON, _LENS, **({"fuse_gate_bwd": True} if fuse else {}))
+    assert res.blk.fuse_gate_bwd is fuse
     res.ws.fill_(0xFF)
     grads2 = _alloc_grads(res.blk, fill=float("nan"))
     _execute_bwd(res.blk, res.inp, res.saved, res.dy, grads2, res.ws)
@@ -812,12 +951,15 @@ def test_thd_two_runs_are_bitwise_bwd():
 
 
 @requires_rubin
-def test_thd_rank2_dy_and_dh_are_the_rank3_backward_bitwise():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_thd_rank2_dy_and_dh_are_the_rank3_backward_bitwise(fuse):
     """``dy`` / ``dh`` / ``cos`` / ``sin`` handed over as ``[T, .]`` -- the rank-2 spelling a packed caller holds, over a record
     whose ``h`` is ``[T, d_model]`` -- through declare / compile / execute: every gradient bitwise the ``[1, T, .]`` block's
-    (the declaration pin alone, ``test_thd_backward_declaration_records_the_knobs``, never ran the rank-2 execute path)."""
-    a = _backward_thd(_COMMON, _LENS)
-    b = _backward_thd(_COMMON, _LENS, rank2=True, memo=False)
+    (the declaration pin alone, ``test_thd_backward_declaration_records_the_knobs``, never ran the rank-2 execute path) --
+    under both knob values."""
+    kw = {"fuse_gate_bwd": True} if fuse else {}
+    a = _backward_thd(_COMMON, _LENS, **kw)
+    b = _backward_thd(_COMMON, _LENS, rank2=True, memo=False, **kw)
     assert b.dy.ndim == 2 and b.saved.h.ndim == 2 and b.inp["cos"].ndim == 2 and b.grads["dh"].ndim == 2
     for name, ten in a.grads.items():
         if ten is None:
@@ -827,14 +969,17 @@ def test_thd_rank2_dy_and_dh_are_the_rank3_backward_bitwise():
 
 
 @requires_rubin
-def test_thd_cuda_graph_replay_with_new_lengths_bwd():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_thd_cuda_graph_replay_with_new_lengths_bwd(fuse):
     """One packed backward captured into a CUDA graph replays bitwise the eager run; a replay over a NEW packing written
     through the captured pointers (the forward re-run eagerly over the new lengths so the record matches; same ``B``,
     ``sum == T``, each ``<= max_seq_len``) equals a fresh eager backward over it -- the setup kernel rebuilds the packed
-    metadata per execute from the device lengths."""
+    metadata per execute from the device lengths -- under both knob values (the gate backward's delta is recomputed per
+    replay through the captured pointers too)."""
     from gated_block_reference import packed_rope_tables
 
-    res = _backward_thd(_COMMON, _LENS, memo=False)
+    res = _backward_thd(_COMMON, _LENS, memo=False, **({"fuse_gate_bwd": True} if fuse else {}))
+    assert res.blk.fuse_gate_bwd is fuse
     blk, inp, saved, dy, g, meta = res.blk, res.inp, res.saved, res.dy, res.geom, res.meta
     ws = torch.empty_like(res.ws)
     grads = _alloc_grads(blk, fill=float("nan"))
@@ -900,16 +1045,20 @@ def test_thd_cuda_graph_replay_with_new_lengths_bwd():
 
 
 @requires_rubin
-def test_thd_workspace_size_is_honest_bwd():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_thd_workspace_size_is_honest_bwd(fuse):
     """``get_workspace_size()`` exact and never exceeded on the packed backward: the tail of a 4096-B-larger buffer
     untouched, no allocation on the hot path, bitwise the memoised gradients; the SDPA backward's packed scratch is the
-    stage's own number; one byte less is a typed ``ValueError``."""
-    res = _backward_thd(_COMMON, _LENS)
+    stage's own number; one byte less is a typed ``ValueError`` -- under both knob values (the block's own ``delta`` region,
+    the adapter's packed ``(1, H_q, ceil128(T))``, exists under ``fuse_gate_bwd`` only)."""
+    res = _backward_thd(_COMMON, _LENS, **({"fuse_gate_bwd": True} if fuse else {}))
     blk = res.blk
     size = blk.get_workspace_size()
     lay = blk._layout()
-    print(f"\nworkspace {size} B; sdpa packed scratch {lay.sdpa_bwd_bytes} B; gemm scratch {lay.gemm_scratch_bytes} B")
-    assert size == lay.total_bytes and lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes() > 0 and lay.delta == -1
+    print(f"\nworkspace {size} B; sdpa packed scratch {lay.sdpa_bwd_bytes} B; gemm scratch {lay.gemm_scratch_bytes} B; delta region {lay.delta}")
+    assert size == lay.total_bytes and lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes() > 0 and (lay.delta == -1) is (not fuse)
+    if fuse:
+        assert lay.delta_shape == tuple(blk._sdpa._impl.external_delta_shape) == (1, res.geom.h_q, -(-res.meta["t"] // 128) * 128)
     ws = torch.full((size + 4096,), 0xAB, dtype=torch.uint8, device="cuda")
     grads = _alloc_grads(blk)
     _execute_bwd(blk, res.inp, res.saved, res.dy, grads, ws)
@@ -937,24 +1086,28 @@ def test_thd_workspace_size_is_honest_bwd():
 
 
 @requires_rubin
-def test_thd_launch_count_is_honest_bwd():
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fuse_gate_bwd"])
+def test_thd_launch_count_is_honest_bwd(fuse):
     """CUPTI kernel records of one packed backward == the launch table recomputed from the adapter's own facts: the block's
-    9 token-wise launches + the packed chain's ``setup + [zero-fill] + dot_do_o + c x (own setup + main + (patch + dK) +
+    9 token-wise launches + the packed chain's ``setup + [zero-fill] + [dot_do_o] + c x (own setup + main + (patch + dK) +
     q x (patch + dQ)) + [dkv_reduce]`` -- the main kernel's THD host issues its own per-chunk setup launch, and every
-    stage-3 GEMM is preceded by a per-sequence descriptor-patch launch; ``q`` is read off the dQ record.  MEASURED on the
-    first run (18 at this geometry: 9 + 1 + 1 + (1 + 1 + 2 + 2) + 1) and recorded; the names are printed; a typed skip
-    when CUPTI records nothing on this node."""
+    stage-3 GEMM is preceded by a per-sequence descriptor-patch launch; ``q`` is read off the dQ record; the ``dot_do_o``
+    term is 0 under ``fuse_gate_bwd`` (the gate backward's delta is the chain's external one).  MEASURED on the first run
+    (18 at this geometry: 9 + 1 + 1 + (1 + 1 + 2 + 2) + 1; 17 under ``fuse_gate_bwd``) and recorded; the names are
+    printed; a typed skip when CUPTI records nothing on this node.  Profiled over ``execute`` ALONE (the buffers exist
+    before the profiled region)."""
     from torch.profiler import ProfilerActivity, profile
 
     from cudnn.sdpa.bwd.kernels.sm107.prepared_host import _dq_launches
 
-    res = _backward_thd(_COMMON, _LENS)
+    res = _backward_thd(_COMMON, _LENS, **({"fuse_gate_bwd": True} if fuse else {}))
     blk, g = res.blk, res.geom
     impl = blk._sdpa._impl
+    assert impl.external_delta is fuse
     grp = g.h_q // g.h_kv
     c = g.h_q // impl._qh_chunk
     dq = _dq_launches(grp, impl._dq_b_head_group)
-    chain = 1 + (1 if impl._zero_ws else 0) + 1 + c * (1 + 1 + 2 + 2 * dq) + (1 if grp > 1 else 0)
+    chain = 1 + (1 if impl._zero_ws else 0) + (0 if impl.external_delta else 1) + c * (1 + 1 + 2 + 2 * dq) + (1 if grp > 1 else 0)
     formula = 9 + chain
     grads = _alloc_grads(blk)
     _execute_bwd(blk, res.inp, res.saved, res.dy, grads, res.ws)
@@ -969,8 +1122,8 @@ def test_thd_launch_count_is_honest_bwd():
     memcpys = [n for n in names if "memcpy" in n.lower()]
     kernels = [n for n in names if n not in memsets and n not in memcpys]
     print(
-        f"\n{len(kernels)} kernels (formula {formula}: 9 block + {chain} chain; c={c}, q={dq}, zero_ws={impl._zero_ws}, grp={grp}), {len(memsets)} memsets, {len(memcpys)} memcpys:\n  "
-        + "\n  ".join(names)
+        f"\n{len(kernels)} kernels (formula {formula}: 9 block + {chain} chain; c={c}, q={dq}, zero_ws={impl._zero_ws}, grp={grp}, external_delta={impl.external_delta}), "
+        f"{len(memsets)} memsets, {len(memcpys)} memcpys:\n  " + "\n  ".join(names)
     )
     assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
     assert len(kernels) == formula, (len(kernels), formula, kernels)
