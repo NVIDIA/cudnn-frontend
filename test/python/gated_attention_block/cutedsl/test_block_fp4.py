@@ -314,8 +314,9 @@ def test_check_declaration_is_the_pre_stage_half_of_check_support():
 @requires_fp4
 def test_fp4_weight_with_fuse_norm_rope_is_served_once_the_fork_arm_lands():
     """Config row 11: ``w_qkvg_dtype=fp4 + fuse_norm_rope`` is SERVED by the fused projection fork's e2m1-B arm -- the
-    fused stage appends ``weight_fp4=True`` to its ``NormRopeFusionParams`` (a NEW compile key; the e4m3 spelling stays
-    byte-identical) and the fork's own gates take over at ``check_support`` (its sm_107a gate on another device).  The
+    fused stage appends ``weight_fp4=True`` to its ``NormRopeFusionParams`` (a NEW compile key; the e4m3 spelling's params --
+    the in-process compile key -- are unchanged) and the fork's own gates take over at ``check_support`` (its sm_107a gate on
+    another device).  The
     feature detection is kept: a checkout WITHOUT the field declines typed (the branch this test was born in), naming
     the e4m3 B and the unfused pipeline."""
     blk = _decl_block_fp4w(**_FUSED)
@@ -339,7 +340,8 @@ def test_fp4_weight_with_fuse_norm_rope_is_served_once_the_fork_arm_lands():
             with pytest.raises(NotImplementedError, match="sm_107a"):  # the fork's own arch gate, past the (lifted) row-11 decline
                 blk._proj.check_support()
     # the e4m3 spelling of the SAME fused block never consults the fp4 arm: its params are the MXFP8 suite's (the appended
-    # field at its default), so the e4m3 compile key is byte-identical to before the arm landed
+    # field at its default), so the e4m3 IN-PROCESS compile key (the params dataclass) is unchanged.  The persistent source digest
+    # of every fused MXFP8 plan changes once with the fork's source (one cold recompile after this lands), e4m3 arm included.
     e4p = mx_suite._decl_block(**_FUSED)._proj.params()
     assert not e4p.weight_fp4 and e4p.quant_mxfp8 and e4p == dataclasses.replace(blk._proj.params(), weight_fp4=False)
 
