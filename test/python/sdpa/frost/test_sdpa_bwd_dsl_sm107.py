@@ -2443,8 +2443,9 @@ def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region(monkey
     assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(2 * 8 * 512 * 4)
     assert (own._b_chunk, own._qh_chunk, own._sq_pad, own._skv_pad) == (ext._b_chunk, ext._qh_chunk, ext._sq_pad, ext._skv_pad)
     e4m3 = torch.float8_e4m3fn
-    # The quantized rows take the flag too (DENSE only; their THD plans decline it): the carve drops ``delta`` under it and the
-    # standalone-only role is appended LAST on both role lists (after the per-batch kv lengths).  The fp8 kernel reads delta in
+    # The quantized rows take the flag too (the dense plans here; their THD plans serve it as well -- test_sdpa_bwd_thd_*_sm107.py):
+    # the carve drops ``delta`` under it and the standalone-only role is appended LAST on both role lists (after the per-batch kv
+    # lengths).  The fp8 kernel reads delta in
     # TRUE units unscaled, so a caller's bf16-derived delta binds AS IS; the mxfp8 delta is the dot of the f16 ports.
     for api_ext, api_own in (
         (_adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3, external_delta=True), _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3)),

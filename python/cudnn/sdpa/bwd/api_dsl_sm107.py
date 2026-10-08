@@ -117,9 +117,10 @@ the standalone twin over torch tensors.  No torch op runs on the execute path.
 construction declares that the caller hands stage 1's result to ``execute(..., delta_tensor=)``:
 a contiguous fp32 tensor of ``external_delta_shape`` -- ``[B, H_q, S_q_pad]`` on a dense plan
 (``S_q_pad`` = ``S_q`` rounded up to the 128-row q tile, zeros past ``S_q``); on a THD plan the
-PACKED head-major ``[1, H_q, ceil128(T_q)]`` the THD main kernel reads (``T_q`` the declared
-packed total, zeros past ``T_q``: the dense layout at ``B = 1, S = T_q``, so a dense producer run
-over the packed tokens writes it as is) -- on the plan's device, 16-B aligned, holding
+PACKED head-major ``[1, H_q, ceil128(T_q)]`` the THD main kernel reads (``T_q`` the plan's token
+capacity -- the declared packed total tightened to the envelope's ``B * S_max``, ``_thd_total`` --,
+zeros past ``T_q``: the dense layout at ``B = 1, S = T_q``, so a dense producer run over the
+packed tokens writes it as is) -- on the plan's device, 16-B aligned, holding
 ``rowsum(dO * O)`` -- the gated attention block's sigmoid-gate backward produces it while it
 already reads O and dO, in ``dot_do_o``'s own reduction order
 (``gated_attention_block/kernels/sigmoid_gate_bwd.py``), so the fused and the unfused block are
@@ -143,9 +144,10 @@ on every row: the kernels read them (``0 * NaN``), and under the MXFP8 row's blo
 32-element q block straddling the pad folds them into the REAL columns' E8M0 scale -- device
 data no host check can see.  The ``o`` / ``descale_o`` (fp8) and ``o_f16`` / ``dO_f16``
 (MXFP8) operands stay required under the flag and are read by nothing (append-only ABI; the
-gated block's training record saves O anyway).  Declined under THD on every row: the THD
-chain's delta is PACKED head-major and computed by its own pre-pass, and no producer emits
-the packed layout yet.
+gated block's training record saves O anyway).  Served under THD on every row in the packed
+form above: the appended, standalone-only ``delta`` slot of each THD launch record
+(``prepared_sm107.ROLES_*_THD``), the THD host viewing a caller's tensor from the plan's token
+capacity exactly as it views its own carved region, and the chain's packed ``dot`` not launched.
 
 FP8 (cuDNN ``sdpa_fp8_backward``): the twelve scalar descales / scales are 1-element
 fp32 DEVICE tensors, read by the kernels -- never folded on the host.  Stage 2 consumes
@@ -1292,8 +1294,9 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         for name, desc in (("k", self.k_desc), ("v", self.v_desc), ("o", self.o_desc), ("dO", self.do_desc)):
             self._value_error_if(desc.dtype != self.dtype, f"{n}: {name} is an FP8 payload and must share Q's dtype {self.dtype}; got {desc.dtype}")
         # Bottom-right causal at a ragged S_q is served: the body takes the REAL q length (``seqlen_q_real``) for the diagonal and
-        # the q-tile trim (``Capabilities.bottom_right_s_q_multiple = 1``).  The external delta is served DENSE (TRUE units,
-        # module doc) and declined under THD by the shared check_support.
+        # the q-tile trim (``Capabilities.bottom_right_s_q_multiple = 1``).  The external delta is served on both forms (TRUE
+        # units, module doc): dense ``[B, H_q, S_q_pad]`` and, under THD, the PACKED head-major ``[1, H_q, ceil128(T_q)]``; the
+        # shared check_support keeps the two-directional plan-fact guard (``_check_external_delta``).
         if self.thd and not self._ds_fp8:
             # The bf16-dS twin upcasts Q / K exactly (e4m3 -> bf16) over COMPACT packed rows -- ``prepared_host._cast_fp8_to_bf16``
             # walks ``T * H * D`` contiguous elements -- so a padded token stride (admitted by the packed-rows rule) would scramble
