@@ -121,9 +121,9 @@ def test_the_n_chunk_pick_keeps_the_one_batch_entry_item_where_both_forms_stream
         assert not c.sm107_pair_item_active(1, s, 4, s, 212, 1, s_kv=s, d_flavor=32), s
         assert c.sm107_pair_item_active(1, s, 4, s, 212, 1, n_chunk_request=8, s_kv=s, d_flavor=32), "a request still selects the pair"
     assert c.sm107_n_chunk_pick(1, 896, 4, 896, 212, 1, s_kv=896, d_flavor=32) >= 2, "S_q 896 is not a multiple of 256: the pair streams"
-    assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1, s_kv=384, d_flavor=32) >= 2, "S_q 384 wastes a quarter of a super-tile: the pair (S14: +30 %)"
+    assert c.sm107_n_chunk_pick(1, 384, 4, 384, 212, 1, s_kv=384, d_flavor=32) >= 2, "S_q 384 wastes a quarter of a super-tile: the pair (+30 % measured)"
     assert c.sm107_n_chunk_pick(1, 1024, 4, 1024, 212, 1, s_kv=1024, d_flavor=64) >= 2, "d64 cga1: no one-batch-entry ring, the pair streams"
-    assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=128, d_flavor=64) == 0, "d64 S_kv 128: the one-batch-entry block fits (S14's guard)"
+    assert c.sm107_n_chunk_pick(1, 256, 4, 256, 212, 1, s_kv=128, d_flavor=64) == 0, "d64 S_kv 128: the one-batch-entry block fits (the resident-block guard)"
 
 
 def test_the_auto_width_takes_the_streamed_fallback_at_the_narrowest_width_whose_ring_fits():
@@ -480,6 +480,10 @@ _CASES = {
     "pair_1024_padded_q_trim": dict(b=4, h=4, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, q_lens=[1024, 300, 0, 1024], kv_lens=[1024, 900, 1024, 0]),
     "pair_1000_tail_tile": dict(b=4, h=2, h_kv=2, s_q=1000, s_kv=1000, n_chunk=2),
     "pair_2048_causal": dict(b=2, h=2, h_kv=2, s_q=2048, s_kv=2048, causal=True, n_chunk=2),
+    # the ring at 32 / 48 kv tiles: the pair item, the knob-less pick (the one-batch-entry ring at S_q % 256 == 0) and a causal 6144
+    "pair_4096_dense": dict(b=2, h=2, h_kv=2, s_q=4096, s_kv=4096, n_chunk=2),
+    "one_batch_entry_pick_4096_dense": dict(b=2, h=2, h_kv=2, s_q=4096, s_kv=4096),
+    "pair_6144_causal": dict(b=2, h=1, h_kv=1, s_q=6144, s_kv=6144, causal=True, n_chunk=2),
     "pair_1024_swa_padded": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=2, causal=True, window_left=256, kv_lens=[1024, 500, 1024, 777]),
     "pair_1024_head_broadcast_bias": dict(b=4, h=4, h_kv=4, s_q=1024, s_kv=1024, bias="1", n_chunk=4),
     "pair_1024_bias_x10": dict(b=4, h=2, h_kv=2, s_q=1024, s_kv=1024, bias_scale=10.0, n_chunk=4),

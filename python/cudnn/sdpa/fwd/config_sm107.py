@@ -491,8 +491,9 @@ def sm107_n_chunk_pick(
     if s_kv is not None and d_flavor is not None and s_q % 256 == 0:
         # A full 256-row super-tile wastes no Q rows and SHARES every K / V tile across its two sub-tiles, where the pair streams them
         # twice; the pair's one advantage -- one resident block amortised over the chunk -- does not outweigh it: the one-batch-entry item
-        # wins wherever a FORM of it fits at this width (its resident block, S14's guard; its streamed ring, S15's -- MEASURED on a 212-SM
-        # cc 10.7 node at the 2376 lock, one process per cell, control pairs <= 0.11 %: S_q = S_kv = 768, d32, sampled 2364 MHz: the
+        # wins wherever a FORM of it fits at this width (its resident block -- the guard's first measured shape, S_q = S_kv = 256 above;
+        # its streamed ring -- MEASURED on a 212-SM cc 10.7 node at the 2376 lock, one process per cell, control pairs <= 0.11 %:
+        # S_q = S_kv = 768, d32, sampled 2364 MHz: the
         # one-batch-entry ring 303.86 us vs the pair's RESIDENT block 330.10 (+8.6 %) vs the pair's ring 332.86; 1024: 675.84 vs the pair's
         # ring 725.49 (+7.3 %); 2048: 5040.62 vs 5389.50 (+6.9 %); 4096 (both at a capped 2160 MHz): 44823.51 vs 47563.59 (+6.1 %)).  At the
         # 64-wide tile's cga1 the one-batch-entry item has no ring (sm107_bias_ring_stages = 0) above its 128-column block, so the pair
