@@ -3935,6 +3935,10 @@ def test_sdpa_paged_sink_fp8_pools_decline_cc107_L0(env_info, form, request, cud
 # s_q == 1 d128 graphs on cc 10.7); the declines stay typed and change neither dtype nor paging.  Seeds 10760-10769.
 
 _P6A_FLAVORS = RandomChoice({(128, 128): 1, (256, 256): 1})
+# page_size % 128 == 0: the power-of-two draw yields 128 / 256, the listed values ride the 50 % high-probability branch
+# verbatim (RandomIntValue returns a listed entry as is), so 384 -- three 128-row tiles per page, the TILES_PER_PAGE the
+# tile_in_page / slot arithmetic and the SF descriptors' num_tiles extent never see at 128 / 256 -- is drawn too.
+_P6A_PAGE_SIZES = RandomBlockSize(min=128, max=256, with_high_probability=[128, 256, 384])
 _P6A_DECODE_MASKS = SlidingWindowMaskGenerator(no_mask=4, causal=3, left_window_only=2, band_around_diag=1)
 _P6A_PREFILL_MASKS = SlidingWindowMaskGenerator(causal=10, left_window_only=5, right_window_only=5, band_around_diag=10, no_mask=10)
 
@@ -3945,7 +3949,7 @@ def _p6a_paged_levers(cfg, rng):
     context, so the seeded geometry is unchanged."""
     cfg.paged_nan_dead_pages = True
     cfg.paged_distinct_v_table = rng.randint(0, 1) == 1
-    cfg.paged_nhd_pool = rng.randint(0, 1) == 1
+    cfg.paged_pool_layout = "nhd" if rng.randint(0, 1) == 1 else None
     if cfg.batches >= 2 and rng.randint(0, 3) == 0:
         cfg.seq_len_kv[0] = min(cfg.s_kv, cfg.block_size * max(1, cfg.s_kv // cfg.block_size))
         cfg.seq_len_kv[1] = 1
@@ -3975,9 +3979,10 @@ def _run_p6a_cell(test, test_no, request, cudnn_handle):
 @_cc107_sweep(128, 10760)
 @pytest.mark.L0
 def test_sdpa_mxfp8_fwd_paged_cc107_L0(env_info, test_no, request, cudnn_handle):
-    """Decode / MTP-shaped (s_q <= 8) MXFP8 pools: d128 / d256, page 128 / 256, GQA groups (1, 8, 2) up to 64/8, e4m3
-    (sink 1:2) / e5m2, f16 / bf16 O, none / causal / BR / SWA / band, padded KV with empty, single-key, partial and
-    whole-page sequences, Stats on / off, HND / NHD, distinct K/V tables, dead-page NaN poison; FLOAT and HALF arms."""
+    """Decode / MTP-shaped (s_q <= 8) MXFP8 pools: d128 / d256, page 128 / 256 / 384 (one, two and three 128-row tiles per
+    page), GQA groups (1, 8, 2) up to 64/8, e4m3 (sink 1:2) / e5m2, f16 / bf16 O, none / causal / BR / SWA / band, padded KV
+    with empty, single-key, partial and whole-page sequences, Stats on / off, HND / NHD, distinct K/V tables, dead-page NaN
+    poison; FLOAT and HALF arms."""
     _require_frost_sm107(_cc107_engine("mxfp8"))
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -3998,7 +4003,7 @@ def test_sdpa_mxfp8_fwd_paged_cc107_L0(env_info, test_no, request, cudnn_handle)
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 1}),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
-        block_size=RandomBlockSize(min=128, max=256, with_high_probability=[128, 256]),
+        block_size=_P6A_PAGE_SIZES,
         fwd_stats=RandomChoice({True: 1, False: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -4011,9 +4016,9 @@ def test_sdpa_mxfp8_fwd_paged_cc107_L0(env_info, test_no, request, cudnn_handle)
 @_cc107_sweep(64, 10761)
 @pytest.mark.L0
 def test_sdpa_mxfp8_fwd_paged_prefill_cc107_L0(env_info, test_no, request, cudnn_handle):
-    """Chunked-prefill-shaped (64 <= s_q <= 512, dense padded-Q trim) MXFP8 pools: the same levers with the dense
-    cc 10.7 mask mix (right windows and bands included), KV 64..8192, batches <= 4, GQA groups up to 32/4; the
-    per-request Q lengths stay U(0, s_q) including zeros (the padded-Q trim is served)."""
+    """Chunked-prefill-shaped (64 <= s_q <= 512, dense padded-Q trim) MXFP8 pools: the same levers (page 128 / 256 / 384)
+    with the dense cc 10.7 mask mix (right windows and bands included), KV 64..8192, batches <= 4, GQA groups up to 32/4;
+    the per-request Q lengths stay U(0, s_q) including zeros (the padded-Q trim is served)."""
     _require_frost_sm107(_cc107_engine("mxfp8"))
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
@@ -4034,7 +4039,7 @@ def test_sdpa_mxfp8_fwd_paged_prefill_cc107_L0(env_info, test_no, request, cudnn
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 1}),
         is_ragged_or_padded_or_full=RandomChoice({"padded": 1}),
         with_sink_token=RandomChoice({True: 1, False: 2}),
-        block_size=RandomBlockSize(min=128, max=256, with_high_probability=[128, 256]),
+        block_size=_P6A_PAGE_SIZES,
         fwd_stats=RandomChoice({True: 1, False: 1}),
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
@@ -4046,7 +4051,8 @@ def test_sdpa_mxfp8_fwd_paged_prefill_cc107_L0(env_info, test_no, request, cudnn
 _TL, _BR = cudnn.diagonal_alignment.TOP_LEFT, cudnn.diagonal_alignment.BOTTOM_RIGHT
 _E4, _E5, _F, _H = torch.float8_e4m3fn, torch.float8_e5m2, cudnn.data_type.FLOAT, cudnn.data_type.HALF
 _Q = [4096, 1, 0, 129, 2049, 4095, 130, 3000]
-# (id, d, b, h_q, h_kv, s_q, s_kv, page, diag, right_bound, left_bound, seq_len_kv, sink, sink_value, nhd, distinct_v, stats, dtype, precision)
+# (id, d, b, h_q, h_kv, s_q, s_kv, page, diag, right_bound, left_bound, seq_len_kv, sink, sink_value, nhd, distinct_v, stats, dtype, precision[, O dtype])
+# -- the optional 20th column is the O dtype (bf16 when absent): the row's e4m3 O over pools is declared as such.
 P6A_PAGED_MXFP8_PINNED_CASES = [
     ("qwen35_decode_d256",                 256, 32, 32, 2,   1, 4096, 128, _TL, None, None, _Q * 4,                                       False, None,   False, True,  True,  _E4, _F),
     ("qwen35_decode_sink_nhd_d256",        256, 32, 32, 2,   1, 4096, 128, _TL, None, None, _Q * 4,                                       True,  None,   True,  True,  False, _E4, _H),
@@ -4065,22 +4071,21 @@ P6A_PAGED_MXFP8_PINNED_CASES = [
     ("smoke_decode_sink_d128_p128",        128,  2,  8, 2,   1,  300, 128, _TL, None, None, [300, 0],                                     True,  None,   False, True,  False, _E4, _F),
     ("smoke_prefill_sink_stats_d256_p256", 256,  1,  8, 2, 256,  700, 256, _BR, 0,    None, [700],                                        True,  None,   True,  False, True,  _E4, _F),
     ("smoke_mtp_swa_nhd_d128_p256",        128,  2, 16, 2,   8, 1024, 256, _BR, 0,    128,  [1024, 129],                                  False, None,   True,  True,  True,  _E5, _F),
+    # three / four 128-row tiles per page (TILES_PER_PAGE the sweeps draw rarely / never), lengths at a page + 1 boundary
+    ("mtp4_sink_stats_d128_page384",       128,  4, 16, 2,   4, 2048, 384, _BR, 0,    None, [2048, 1, 385, 1000],                         True,  None,   False, True,  True,  _E4, _F),
+    ("decode_nhd_half_d256_page512",       256,  4, 16, 2,   1, 4096, 512, _TL, None, None, [4096, 513, 0, 1024],                         False, None,   True,  True,  False, _E4, _H),
+    # e4m3 O over pools, declared as such (the harness keeps bf16 / f16 O in the sweeps)
+    ("e4m3_out_decode_sink_stats_d128",    128,  4, 16, 2,   2, 2048, 128, _BR, 0,    None, [2048, 1, 129, 1000],                         True,  None,   False, True,  True,  _E4, _F, _E4),
+    ("e4m3_out_prefill_nhd_half_d256",     256,  2,  8, 2, 128, 2048, 256, _BR, 0,    None, [2048, 700],                                  False, None,   True,  True,  False, _E4, _H, _E4),
 ]
 
 
-@pytest.mark.parametrize("case", P6A_PAGED_MXFP8_PINNED_CASES, ids=[c[0] for c in P6A_PAGED_MXFP8_PINNED_CASES])
-@pytest.mark.L0
-def test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0(env_info, case, request, cudnn_handle):
-    """Qwen3.5 decode / MTP / chunked prefill and Llama GQA over MXFP8 pools on the cc 10.7 row, sink variants, keyless
-    rows with a dominant (+3) and an absent (-120) sink (O := 0, LSE := sink), empty and single-key sequences, e5m2,
-    HND / NHD, distinct K/V tables, Stats, both softmax arms.  Collected on every lane (the smoke_* cells live here),
-    skipped off cc 10.7 by _require_frost_sm107; strict on cc 10.7."""
-    _require_frost_sm107(_cc107_engine("mxfp8"))
-    (case_id, d, b, h_q, h_kv, s_q, s_kv, page, diag, right_bound, left_bound, seq_len_kv, sink, sink_value, nhd, distinct_v, stats, dtype, precision) = case
-    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
-    test.cfg = ExecConfig(
+def _p6a_pinned_cfg(case):
+    """The ExecConfig of one P6A_PAGED_MXFP8_PINNED_CASES row (19 columns, plus the optional O dtype)."""
+    (case_id, d, b, h_q, h_kv, s_q, s_kv, page, diag, right_bound, left_bound, seq_len_kv, sink, sink_value, nhd, distinct_v, stats, dtype, precision, *rest) = case
+    cfg = ExecConfig(
         data_type=dtype,
-        output_type=torch.bfloat16,
+        output_type=rest[0] if rest else torch.bfloat16,
         rng_data_seed=10762,
         rng_geom_seed=10762,
         is_alibi=False,
@@ -4109,20 +4114,67 @@ def test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0(env_info, case, request, cudnn_han
         seq_len_q=[s_q] * b,
         seq_len_kv=list(seq_len_kv),
         with_sink_token=sink,
-        sink_value=sink_value,
+        sink_token_value=sink_value,
         paged_nan_dead_pages=True,
-        paged_nhd_pool=nhd,
+        paged_pool_layout="nhd" if nhd else None,
         paged_distinct_v_table=distinct_v,
         fwd_stats=stats,
         softmax_precision=precision,
         attn_scale_prefolded=False,
     )
-    test.cfg.fill_derived_fields()
+    cfg.fill_derived_fields()
+    return cfg
+
+
+@_cc107_only
+@pytest.mark.parametrize("case", P6A_PAGED_MXFP8_PINNED_CASES, ids=[c[0] for c in P6A_PAGED_MXFP8_PINNED_CASES])
+@pytest.mark.L0
+def test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0(env_info, case, request, cudnn_handle):
+    """Qwen3.5 decode / MTP / chunked prefill and Llama GQA over MXFP8 pools on the cc 10.7 row, sink variants, keyless
+    rows with a dominant (+3) and an absent (-120) sink (O := 0, LSE := sink), empty and single-key sequences, e5m2,
+    HND / NHD, distinct K/V tables, Stats, both softmax arms, pages of 1 / 2 / 3 / 4 tiles, e4m3 O.  Collected on cc 10.7
+    only (_cc107_only, as the sibling lanes' pins; the tiers' CUDNN_TEST_TIER_ARCH=cc107 override lists the smoke_* cells
+    on any host) and strict there."""
+    _require_frost_sm107(_cc107_engine("mxfp8"))
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p6a_pinned_cfg(case)
     test.showConfig((request.node.name, len(P6A_PAGED_MXFP8_PINNED_CASES)), request)
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
     with _must_run(request):
         _exec_cc107(test, request, cudnn_handle, "mxfp8")
+
+
+# (pinned case, scheduler policy): every policy the row admits over pools -- d128 NATURAL / LPT / LPT_L2, d256 NATURAL.
+_P6A_PLAN_PINS = [("qwen35_mtp4_br_sink_d128", "NATURAL"), ("qwen35_mtp4_br_sink_d128", "LPT"), ("qwen35_mtp4_br_sink_d128", "LPT_L2"), ("qwen35_mtp4_br_d256", "NATURAL")]
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("case_id,policy", _P6A_PLAN_PINS, ids=[f"{c}-{p}" for c, p in _P6A_PLAN_PINS])
+def test_sdpa_mxfp8_paged_cc107_plan_pins_L0(env_info, case_id, policy, request, cudnn_handle):
+    """Explicit plan selection over MXFP8 pools through the harness's shared ``ExecConfig.plan_pin`` (the MXFP8 harness
+    honours it as the f16 one does: the knob set is appended through graph.create_execution_plan and selected strictly, so a
+    decline FAILS and a degraded plan cannot pass): every scheduler policy the row admits over pools -- d128 NATURAL / LPT
+    / LPT_L2 (sink + Stats), d256 NATURAL -- on the Qwen3.5 MTP geometry, each checked against the reference and its Amax_O
+    (test_sdpa_fwd_paged_mxfp8_sm107.py pins the policies' bit-identity; this is the cell the cc 10.7 CI lane runs), the
+    served plan's SCHED_POLICY read back.  Qualification of the knob domain, never a winner."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+
+    engine = _cc107_engine("mxfp8")
+    _require_frost_sm107(engine)
+    value = {"NATURAL": SCHED_NATURAL, "LPT": SCHED_LPT, "LPT_L2": SCHED_LPT_L2}[policy]
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p6a_pinned_cfg(next(c for c in P6A_PAGED_MXFP8_PINNED_CASES if c[0] == case_id))
+    test.cfg.plan_pin = {"engine": engine, "knobs": {"SCHED_POLICY": value}}
+    test.showConfig((request.node.name, len(_P6A_PLAN_PINS)), request)
+    with _must_run(request):
+        _exec_cc107(test, request, cudnn_handle, "mxfp8")
+    if request.config.option.dryrun:
+        return
+    served, knobs = frost_routing.LAST_PLAN
+    assert served == engine and knobs is not None and knobs.sched_policy == value, (policy, frost_routing.LAST_PLAN)
+    print(f"@@@@ P6a plan pin on {engine}: SCHED_POLICY={knobs.sched_policy} TILE_CGA_M={knobs.cga} SPLIT_KV={knobs.split_kv}")
 
 
 def _p6a_pool_graph(*, d=128, d_v=None, page=128, s_q=1, b=2, h=8, kh=2, max_pages=4, thd=False, sink=False, sf_o=False, bhsd_q=False, prefolded=False):
@@ -4209,14 +4261,18 @@ def _p6a_declaration_snapshot(decl):
     return {n: (tuple(t.get_dim()), tuple(t.get_stride()), t.get_data_type()) for n, t in decl.items()}
 
 
+@_cc107_only
 @pytest.mark.parametrize("case", sorted(_P6A_DECLINES))
 @pytest.mark.L0
 def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
-    """Off-contract requests over MXFP8 pools on cc 10.7 are TYPED declines: the row names its reason, the validate / plan
-    sequence raises (the backend has no engine for MXFP8 pools; the python-native validator may speak first), and no
-    tensor's dtype, dims or strides moved -- never a dtype or paging change.  page_64 / thd_queries / d192x128_pools /
-    d512_pools / sf_o_over_pools are RED before the row-aware admission (the reason is the generic 'graph uses paged
-    attention' today); the three controls pin the precedence of the earlier rules."""
+    """Off-contract requests over MXFP8 pools on cc 10.7 are TYPED declines: the row names its reason; the declaration itself
+    is valid (validate / build_operation_graph pass -- an unrelated ValueError there would not be this decline); the decline
+    is the PLANNING error, because the cuDNN backend has no engine for MXFP8 pools and the row proposes nothing, so
+    create_execution_plans raises the typed cudnnGraphNotSupportedError ("no engine ... proposed a plan") with an EMPTY plan
+    list; and no tensor's dtype, dims or strides moved -- never a dtype or paging change.  page_64 / thd_queries /
+    d192x128_pools / d512_pools / sf_o_over_pools are RED before the row-aware admission (the reason is the generic 'graph
+    uses paged attention' today); the three controls pin the precedence of the earlier rules.  (Once the planning error
+    quotes the rows' reasons -- the P1 lane's decline_reasons -- the needle can move onto the error text itself.)"""
     engine = _cc107_engine("mxfp8")
     _require_frost_sm107(engine)
     from cudnn.sdpa.fwd import engines
@@ -4229,33 +4285,50 @@ def test_sdpa_mxfp8_paged_cc107_declines_L0(case, request):
         spec = next(s for s in engines.ENGINE_SPECS if s.name == engine)
         reason = engines.analyze_for(spec, g)[1]
         assert reason is not None and expected in reason, (case, reason)
-        with pytest.raises((cudnn.cudnnGraphNotSupportedError, ValueError)) as ei:
-            g.validate()
-            g.build_operation_graph()
+        g.validate()
+        g.build_operation_graph()
+        with pytest.raises(cudnn.cudnnGraphNotSupportedError) as ei:
             g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-            g.check_support()
-            g.build_plans()
-        names = [g.get_plan_name_at_index(i) for i in range(len(getattr(g, "plans", None) or []))]
-        assert not any(n == engine or n.startswith(engine + "[") for n in names), names
+        assert "no engine" in str(ei.value), (case, str(ei.value))
+        assert g.plans == [], (case, [g.get_plan_name_at_index(i) for i in range(len(g.plans))])
     assert _p6a_declaration_snapshot(decl) == before, str(ei.value)
+    print(f"@@@@ P6a decline ({case}): row: {reason}; planning: {ei.value}")
 
 
+@_cc107_only
 @pytest.mark.L0
 def test_sdpa_mxfp8_paged_cc107_split_with_sink_declines_L0(request):
-    """split_kv > 1 is a knob the cc 10.7 MXFP8 row never serves (and sink + split is declined on every row): on an
-    ACCEPTED sink-over-pools graph SdpaFwdKnobs(split_kv=2) is a typed mismatch, not a degraded split."""
+    """split_kv > 1 over MXFP8 pools on cc 10.7 is a typed knob mismatch, never a degraded split -- on the sink-free graph
+    and on the sink graph alike, because the row wires no split (split_kv_supported=False: "not wired in this engine's
+    lowering"); and INDEPENDENTLY of that flag the sink-aware rule every row shares keeps a sink graph unsplit: with the
+    row's split flag flipped (dataclasses.replace -- the shape a cc 10.7 MXFP8 split-KV change would take) the sink graph
+    is still declined with the "sink-free" reason, so wiring split-KV on this row cannot silently split a sink graph."""
     engine = _cc107_engine("mxfp8")
     _require_frost_sm107(engine)
+    import dataclasses
+
     from cudnn.sdpa.fwd import engines
 
     spec = next(s for s in engines.ENGINE_SPECS if s.name == engine)
-    g, _ = _p6a_pool_graph(sink=True)
+    served = {}
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-        facts, reason = engines.analyze_for(spec, g)
-        assert reason is None, reason  # the unsplit sink-over-pools graph IS served
-        why = engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(split_kv=2))
-        assert why is not None and "split_kv > 1" in why, why
+        for with_sink in (False, True):
+            g, _ = _p6a_pool_graph(sink=with_sink)
+            facts, reason = engines.analyze_for(spec, g)
+            assert reason is None, (with_sink, reason)  # the unsplit graph IS served, with and without the sink
+            served[with_sink] = facts
+    split2 = engines.SdpaFwdKnobs(split_kv=2)
+    assert not spec.capabilities.split_kv_supported  # today's deciding clause is the row's flag ...
+    for with_sink, facts in served.items():
+        why = engines.mismatch(spec.capabilities, facts, split2)
+        assert why is not None and "split_kv > 1 is not wired in this engine's lowering" in why, (with_sink, why)
+    # ... and with that flag flipped the shared sink rule still refuses to split the sink graph (engines.mismatch: the
+    # per-split LSE is the combine weight; a sink graph produces no per-split partials until a sink-aware combine lands).
+    caps_split = dataclasses.replace(spec.capabilities, split_kv_supported=True)
+    why_sink = engines.mismatch(caps_split, served[True], split2)
+    assert why_sink is not None and "sink-free" in why_sink, why_sink
+    print(f"@@@@ P6a split declines: row flag: {why}; sink rule: {why_sink}")
 
 
 # ---- P1: SM107 MXFP8 default provider (graph.sdpa_mxfp8 through the common Graph API, no opt-in flag) ----

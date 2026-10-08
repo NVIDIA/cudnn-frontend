@@ -21,6 +21,7 @@ from .helpers import (
 )
 from .mxfp8_ref import compute_ref, compute_ref_backward
 from .fp8 import BACKEND_AMAX_O_ISSUE, assert_amax_o, assert_close_fp8_grad, block_scaled_o_sf_dims, p_code_step
+from .fp16 import _apply_plan_pin
 from .softmax_knobs import LN2, prefold_factor
 
 # Torch-only MXFP8 block quantization + F8_128x4 swizzle (replicates the
@@ -217,7 +218,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
     # Q, K, V, O tensors: (b, h, s, d) dims, BSHD-physical strides for the draws only the
     # FROST MXFP8 engine serves (a block-scaled O, whose sf_o output has no backend lowering,
     # and paged pools -- HND page pools for K/V, or NHD [num_pages, page, H_kv, D] pools on
-    # ``paged_nhd``: ExecConfig.paged_nhd_pool) and on request (``bshd``: ExecConfig.bshd_layout,
+    # ``paged_nhd``: ExecConfig.paged_pool_layout == "nhd") and on request (``bshd``: ExecConfig.bshd_layout,
     # the sweeps that assert FROST routing); BHSD-physical otherwise.
     bshd = bool(o_block_scale) or is_paged or bool(bshd)
     q_stride = (s_qo * h_q * d_qk, d_qk, h_q * d_qk, 1) if bshd else (h_q * s_qo * d_qk, s_qo * d_qk, d_qk, 1)
@@ -1027,7 +1028,14 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
         cudnn_itype = cudnn.data_type.FP8_E5M2
     else:
         pytest.skip(f"Unsupported input type: {torch_itype}")
-    cudnn_otype = cudnn.data_type.HALF if torch_otype == torch.float16 else cudnn.data_type.BFLOAT16
+    if torch_otype == torch.float16:
+        cudnn_otype = cudnn.data_type.HALF
+    elif torch_otype in (torch.float8_e4m3fn, torch.float8_e5m2) and cfg.is_infer and not o_block_scale:
+        # An FP8 O on the inference path is declared as such (the FROST MXFP8 rows' out_dtypes): the reference is cast
+        # to it below and Amax_O is checked against the stored FP8 O -- not collapsed to a bf16 declaration.
+        cudnn_otype = cudnn.data_type.FP8_E4M3 if torch_otype == torch.float8_e4m3fn else cudnn.data_type.FP8_E5M2
+    else:
+        cudnn_otype = cudnn.data_type.BFLOAT16  # (a block-scaled O: generate_graph_fwd declares the E4M3 / E2M1 container itself)
 
     # Build forward graph
     try:
@@ -1046,13 +1054,14 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
             attn_scale_prefolded=prefolded,
             generate_stats=generate_stats,
             bshd=bshd_layout,
-            paged_nhd=bool(getattr(cfg, "paged_nhd_pool", False)),
+            paged_nhd=getattr(cfg, "paged_pool_layout", None) == "nhd",
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         if plan_pin is not None:
             plan_pin(graph_fwd)
+        _apply_plan_pin(graph_fwd, cfg)  # ExecConfig.plan_pin (shared with the f16 harness): an explicit backend / FROST knob-set selection, strict
         graph_fwd.check_support()
         graph_fwd.build_plans()
         note_frost_routing(graph_fwd, label="mxfp8-fwd")
@@ -1142,7 +1151,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
                     v_pool_fp8[slot_v] = float("nan")
                     sfk_pages[slot_k] = 0xFF
                     sfv_groups[:, slot_v * h_v * m : (slot_v + 1) * h_v * m] = 0xFF
-        if getattr(cfg, "paged_nhd_pool", False):
+        if getattr(cfg, "paged_pool_layout", None) == "nhd":
             # NHD pools: the same [num_pages, H_kv, page, D] dims over (page, head)-major storage -- EXACTLY the strides
             # generate_graph_fwd declares.  Built explicitly rather than by .permute().contiguous(): at H_kv == 1 torch treats
             # the permuted view as already contiguous (no copy), the pool would keep its HND strides, and the native pool
@@ -1162,11 +1171,11 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
             # the per-(b, h) F8_128x4 scale planes are layout-independent.
             q_fp8_d, k_fp8_d, v_fp8_s = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q_fp8_d, k_fp8_d, v_fp8_s))
 
-    # Generate sink_token if needed (ExecConfig.sink_value pins one logit for every head: +3 dominant, -120 absent)
+    # Generate sink_token if needed (ExecConfig.sink_token_value pins one logit for every head: +3 dominant, -120 absent)
     sink_token_gpu = None
     if with_sink_token:
-        if getattr(cfg, "sink_value", None) is not None:
-            sink_token_gpu = torch.full((1, h_q, 1, 1), float(cfg.sink_value), dtype=torch.float32, device="cuda")
+        if getattr(cfg, "sink_token_value", None) is not None:
+            sink_token_gpu = torch.full((1, h_q, 1, 1), float(cfg.sink_token_value), dtype=torch.float32, device="cuda")
         else:
             rng_sink = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed + 1000)
             sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float32, device="cuda", generator=rng_sink) * 0.5

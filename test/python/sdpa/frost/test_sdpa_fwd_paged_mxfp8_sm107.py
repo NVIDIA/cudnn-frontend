@@ -6,9 +6,11 @@ the ``PAGED_KV`` loader of ``sm107/prefill_d128_mxfp8.py`` / ``sm107/prefill_d25
 
 What ``test_mhas_v2.py``'s cc 10.7 paged MXFP8 sweeps and the native-binder replay test do not cover: the Rule 3
 sync-debug gate around ``execute`` on this row over pools, the sched-policy bit-identity under paging (d128: NATURAL /
-LPT / LPT_L2 reorder whole work items, each tile's page walk is unchanged), e5m2-in / e4m3-out with Stats, and the
-plan-time declines on the real device.  Builders, reference and O check are the SM100 suite's (``test_sdpa_fwd_paged_sm100``,
-imported as helpers; its own cells stay pre-Rubin-gated)."""
+LPT / LPT_L2 reorder whole work items, each tile's page walk is unchanged), e5m2-in / e4m3-out with Stats, pages of three
+and four tiles, and the plan-time declines on the real device.  Builders, reference and O check are the SM100 suite's
+(``test_sdpa_fwd_paged_sm100``, imported as helpers; its own cells stay pre-Rubin-gated).  The cc 10.7 CI lane runs an
+explicit file list that does not include this module (its ``test_mhas_v2.py`` twins -- the plan-pin cells per scheduler
+policy and the e4m3-O pins -- do run there); adding it to that list is a maintainers' follow-up."""
 
 import pytest
 import torch
@@ -86,6 +88,15 @@ def test_e5m2_in_e4m3_out_stats_d256():
 def test_prefill_s512_stats_page256_d256():
     """Chunked prefill (s_q 512, bottom-right causal) over 256-row pages: two 128-row tiles per page."""
     _run(2, 8, 2, 256, 8, [1500, 700], True, s_q=512, causal_br=True, stats=True)
+
+
+@pytest.mark.parametrize("P,d,s_q", [(384, 128, 8), (512, 256, 64)], ids=["p384-d128-mtp", "p512-d256-prefill"])
+def test_three_and_four_tiles_per_page(P, d, s_q):
+    """Pages of three (384) and four (512) 128-row tiles -- the TILES_PER_PAGE values the sweeps draw rarely (384) or never
+    (512), so the tile_in_page / slot arithmetic and the SF descriptors' num_tiles extent are exercised beyond 1 / 2: MTP
+    (d128, cga2) and chunked prefill (d256, cga1), bottom-right causal, sink, Stats, V behind its own table, a length one
+    past a tile boundary (513) and one inside the third page (1000)."""
+    _run(2, 8, 2, P, 3, [1000, 513], False, d_qk=d, d_v=d, s_q=s_q, causal_br=True, sink=True, stats=True, separate_v=True)
 
 
 def test_sched_policies_bit_identical_under_paging_d128():
