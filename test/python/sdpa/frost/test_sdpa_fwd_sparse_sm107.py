@@ -40,7 +40,8 @@ two launches bitwise:
   within the budget vs the oracle; the typed declines of the paged form (``page_size`` not a multiple of 4, a missing table or
   length, the table / page size on a dense declaration, every malformed pool stride).
 
-Tolerances are the dense suite's (atol 2e-2 on O and LSE), none added.
+Tolerances: atol 2e-2 on O and LSE, no rtol -- the sparse module's own budget, TIGHTER than the dense sm107 suite's O bar (atol
+5e-2 / rtol 3e-2) and equal to its LSE atol; nothing widened, nothing added.
 """
 
 import hashlib
@@ -60,7 +61,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ORACLE_DIR = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "gated_attention_block", "cutedsl")
 D = 256
 BS = 4  # tokens per selectable block
-ATOL = 2e-2  # the SDPA stage budget of the dense suite -- never widened here
+ATOL = 2e-2  # on O and LSE, no rtol: tighter than the dense sm107 suite's O budget (atol 5e-2 / rtol 3e-2) -- never widened here
 # A directory holding ``layer03_S<S>_block_ids.pt`` (+ ``.sha256`` sidecars): the recorded block-id lists of the released
 # checkpoint's first QSA layer over one 32K-token text.  Unset -> the real-list cells skip.
 INDEX_LISTS_ENV = "CUDNN_FROST_QSA_INDEX_LISTS_DIR"

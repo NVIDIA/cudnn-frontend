@@ -18,7 +18,7 @@ interleaves the four residues, the filler region costs one tile per item.
 
 Rubin tier (``requires_rubin``): the six sequences x the five tail phases, each with two launches.  Pins: no sentinel on any
 row (every item ran and stored), no non-finite output on a row whose query is finite (NaN residue did not travel), dead rows
-``O = 0`` / ``LSE = -inf`` exactly, the live rows within the dense suite's budget (atol 2e-2 on O and LSE -- nothing added),
+``O = 0`` / ``LSE = -inf`` exactly, the live rows within the sparse module's budget (atol 2e-2 on O and LSE, tighter than the dense sm107 suite's 5e-2 on O -- nothing widened),
 and the two launches bitwise.  A 12-fresh-process census of the same cells is a results-tree driver, not a test.
 """
 
@@ -41,7 +41,7 @@ from sparse_item_sequences import (
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
-ATOL = 2e-2  # the SDPA stage budget of the dense suite -- never widened here
+ATOL = 2e-2  # on O and LSE, no rtol: tighter than the dense sm107 suite's O budget (atol 5e-2 / rtol 3e-2) -- never widened here
 _PHASES = [None, 0, 1, 2, 3]
 _PHASE_IDS = ["natural", "tail0", "tail1", "tail2", "tail3"]
 
