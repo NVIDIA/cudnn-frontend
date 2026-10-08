@@ -4233,6 +4233,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_q)
         self._not_implemented_error_if(self.scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
+        # A negative scale is served by negating Q in the kernel and running at |scale| (#1435).
+        self._score_negated = self.scale_softmax < 0
 
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
@@ -4332,6 +4334,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             kv_tile=self.kv_tile,
             pack_gqa=self.pack_gqa,
             split_kv=self.split_kv,
+            negate_scores=self._score_negated,
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8)
         self._dense_spec = self._thd_spec = None
@@ -4438,6 +4441,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         scale_val = self.scale_softmax if scale_softmax is None else float(scale_softmax)
         self._value_error_if(scale_val == 0, _ZERO_SCALE_UNSUPPORTED)
+        self._value_error_if((scale_val < 0) != self._score_negated, "attn_scale sign must match the compiled plan's (#1435)")
+        scale_val = abs(scale_val)
         if getattr(self, "_staged_spec", None) is not None:
             from .prepared_staged_forward import execute as execute_staged
 
