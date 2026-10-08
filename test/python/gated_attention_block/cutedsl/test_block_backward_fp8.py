@@ -1800,12 +1800,13 @@ def test_fp8_reject_bf16_weights_with_quant():
 
 
 @requires_cuda
-def test_fp8_reject_thd_with_quant():
-    """``thd=True`` with ``quant``: dense-only for now (the block's packed quantized arm -- the fp8 row's THD chain, which serves an
-    external delta, reading the gate backward's packed bf16 delta -- is a follow-up) -- declined typed AT DECLARATION, naming BOTH
-    attributes, and the message does NOT tell the caller to build the plan without ``external_delta`` (the adapter's text must never
-    surface here).  Host-side, over placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32
-    ``saved.seq_lens``)."""
+def test_fp8_thd_with_quant_is_served_at_declaration():
+    """``thd=True`` with ``quant=QuantSpec`` CONSTRUCTS (it used to be the typed dense-only decline): the packed per-tensor fp8
+    backward is the dense stage list at ``B = 1, S = T`` with the SDPA stage's packed declaration over the fp8 row -- ``thd``
+    passed through, the envelope ``(num_sequences, max_seq_len)``, ``external_delta=True`` with the adapter's PACKED head-major
+    ``[1, H_q, ceil128(T)]`` delta shape, ``amax_dP`` requested, both packed totals at ``T`` -- read off the declared stage without
+    a compile.  Host-side, over placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32
+    ``saved.seq_lens``); the record's buffers are the packed suite's business (``test_block_thd_backward_fp8.py``)."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     t, dm = 256, _COMMON["d_model"]
     dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")
@@ -1813,10 +1814,36 @@ def test_fp8_reject_thd_with_quant():
     lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
     z = torch.empty(0, device="cuda")
     saved = SavedForBackward(h=h8, gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths")
+    blk = _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=r.spec, thd=True, num_sequences=2, max_seq_len=256)
+    assert blk.thd and blk.quant is r.spec and (blk.batch, blk.seq_len) == (1, t) and (blk.num_sequences, blk.max_seq_len) == (2, 256)
+    st = blk._sdpa
+    assert type(st).__name__ == "_SdpaBwdFp8" and st.thd and (st.num_sequences, st.max_seq_len, st.cu_seqlens) == (2, 256, False)
+    impl = st._ensure_impl()
+    assert impl.thd is True and impl.external_delta is True and impl.seq_kv_lens_present is False and impl.amax_requested == frozenset({"amax_dP"})
+    assert (impl.max_total_seq_len_q, impl.max_total_seq_len_kv) == (t, t)
+    assert tuple(impl.external_delta_shape) == st.delta_shape == (1, r.geom.h_q, -(-t // 128) * 128), "the packed delta: the dense layout at B = 1, S = T"
+    assert tuple(int(x) for x in impl.stats_desc.shape) == (2, r.geom.h_q, 256, 1), "Stats declared over the envelope (B, H_q, S_max, 1)"
+    assert impl.q_desc.dtype == _E4M3 and impl.dq_desc.dtype == torch.bfloat16
+
+
+@requires_cuda
+def test_fp8_reject_thd_with_mxquantspec():
+    """``thd=True`` with an ``MxQuantSpec`` stays the typed dense-only decline AT DECLARATION, naming BOTH attributes (no packed
+    MXFP8 training record exists; the SDPA-layout MX quantizes have no packed per-sequence arm), while the per-tensor fp8 sibling
+    is served packed (the test above).  The message does NOT tell the caller to build the plan without ``external_delta`` (the
+    adapter's text must never surface here)."""
+    r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
+    t, dm = 256, _COMMON["d_model"]
+    dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")
+    h8 = torch.empty(t, dm, dtype=_E4M3, device="cuda")
+    lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
+    z = torch.empty(0, device="cuda")
+    saved = SavedForBackward(h=h8, gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths")
+    mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
     with pytest.raises(ValueError, match="thd") as ei:
-        _declare_then_check(lambda: _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=r.spec, thd=True, num_sequences=2, max_seq_len=256))
+        _declare_then_check(lambda: _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=mx, thd=True, num_sequences=2, max_seq_len=256))
     msg = str(ei.value)
-    assert "quant" in msg, msg
+    assert "MxQuantSpec" in msg and "quant" in msg, msg
     assert "external_delta" not in msg, msg
 
 
