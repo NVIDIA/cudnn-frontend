@@ -1906,6 +1906,12 @@ def _mma_warp_group(
                 old_state = kv_state
                 kv_state = advance(kv_state, CFG.STAGES_KV)
 
+                # HOIST-K: K(kv) landed stages ago; take its full-barrier wait and descriptors off the per-step critical
+                # path by doing them before the PV[sub0] P waits (no softmax dependency involved).
+                bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
+                desc_K = sK[kv_state.idx].desc()
+                desc_K_SF = sK_SF[kv_state.idx].desc()
+
                 bars.mb_v_full[old_state.idx].wait(old_state.phase, spin=SPIN_RING_WAITS)
                 if cutlass.const_expr(CFG.THD_VARLEN):
                     sanitize_mxfp8_thd_v_sf_padding(sV_SF[old_state.idx], kv_loop - cutlass.Int32(1), eff_seqlen_kv)
@@ -1951,9 +1957,7 @@ def _mma_warp_group(
                 # scratch (136/140); wait tile1's softmax LDTM (ONE-behind) so its
                 # read of S_acc_1 completed before the leader-broadcast UTCCP
                 # (cta_group::2 self-fills both CTAs) overwrites it.
-                bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-                desc_K = sK[kv_state.idx].desc()
-                desc_K_SF = sK_SF[kv_state.idx].desc()
+                # (the k_full wait and the K descriptors were hoisted above the PV[sub0] P waits)
                 wait(mb_softmax_ldtm.subview(1), ldtm_phase1)
                 ldtm_phase1 = ldtm_phase1 ^ 1
                 if nvvm.elect_sync():
