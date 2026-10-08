@@ -3,8 +3,9 @@
 
 """Adapter of the Rubin (SM107) index-list SPARSE d256 forward -- ``kernels/sm107/sparse_d256_f16.py``.
 
-Frontend-only: the gated attention block's sparse stage consumes it; no graph form carries a block-index list, so there is
-NO engine row and NO manifest slot (an ``EngineSpec`` whose ``lower`` cannot run is a contract break).  The kernel's claims
+Frontend-only: the gated attention block's sparse stage (``gated_attention_block.api._SparseSdpa``, a geometry declared
+with ``QsaSpec``) consumes it, and it stands alone for a caller with its own Q / K / V; no graph form carries a block-index
+list, so there is NO engine row and NO manifest slot (an ``EngineSpec`` whose ``lower`` cannot run is a contract break).  The kernel's claims
 live in ONE frozen record, :data:`SPARSE_CAPABILITIES`, spelled in the ``Capabilities`` vocabulary where a field exists, and
 :meth:`SparseGqaFwdDslSm107.check_support` is the ENFORCEMENT point: the CuTe DSL version gate first (``sm_107a`` needs the
 public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel module is imported, so a too-old DSL reads as a
@@ -15,7 +16,15 @@ the record field, the config's wired-arm set and the support-matrix tracker in t
 
 The device does the work (Rule 3): lengths, counts, dead items and the tail block are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
-conversion, no allocation, the caller's stream.
+conversion, no allocation, the caller's stream.  The kernel needs NO GMEM scratch (:meth:`SparseGqaFwdDslSm107.scratch_workspace_bytes`
+is 0).
+
+Two ways to bind the operands.  A standalone caller constructs with its tensors and calls ``execute()``; a caller whose
+buffers exist only at execute (the block's workspace views) declares every operand as a :class:`SparseOperandDesc` -- the
+shape, the strides, the dtype, the device -- and hands the tensors to ``execute(q=, k=, ...)``, where each must match its
+declaration exactly (the specialization and the stride contract were validated on the declaration).  ``block_lens`` is the
+one operand whose PRESENCE may differ per call: ``compile(has_block_lens=...)`` builds either variant at plan time and
+``execute`` dispatches on the tensor it is handed -- never a compile on the execute path.
 
 Stride contract (the gather map is TWO-dimensional: the tokens of EVERY batch are its rows, the token's full row its
 columns): the head dim contiguous; the head stride a multiple of 64 elements (a column box start); the token stride a
@@ -82,6 +91,36 @@ _DTYPE_CODE = {"torch.bfloat16": 2, "torch.float16": 3}
 _DTYPE_PUBLIC = {"torch.bfloat16": cudnn.data_type.BFLOAT16, "torch.float16": cudnn.data_type.HALF}
 
 
+@dataclass(frozen=True)
+class SparseOperandDesc:
+    """An operand DECLARED without storage: what a caller hands :class:`SparseGqaFwdDslSm107` at construction when its
+    buffers exist only at execute (the gated attention block's workspace views).  Carries exactly what ``check_support``
+    reads of a tensor -- the shape, the strides, the framework dtype (compared through ``str()``, like a tensor's) and the
+    device -- and refuses to be LAUNCHED (no ``data_ptr``: ``execute`` requires the tensor, by name, never a dereference of
+    nothing)."""
+
+    shape: Tuple[int, ...]
+    strides: Tuple[int, ...]
+    dtype: object
+    device: object = None
+
+    def stride(self) -> Tuple[int, ...]:
+        return tuple(int(x) for x in self.strides)
+
+    def is_contiguous(self) -> bool:
+        expect = 1
+        for n, st in zip(reversed(tuple(self.shape)), reversed(tuple(self.strides))):
+            if int(n) != 1 and int(st) != expect:
+                return False
+            expect *= max(int(n), 1)
+        return True
+
+    def data_ptr(self):
+        raise ValueError(
+            "sparse d256 forward (sm107): this operand was declared as a SparseOperandDesc (no storage); pass the tensor to execute(q=, k=, v=, o=, ...)"
+        )
+
+
 def _shape(t) -> Tuple[int, ...]:
     return tuple(int(x) for x in t.shape)
 
@@ -145,7 +184,8 @@ class SparseGqaFwdDslSm107:
             stats_log2=self.stats_log2,
         )
         self.device_cc = tuple(device_cc) if device_cc is not None else None
-        self._fn = None
+        self._fn = None  # the DECLARED block_lens variant (kept for the standalone path)
+        self._fns = {}  # {has_block_lens: compiled fn} -- both variants may coexist (compile(has_block_lens=))
         self._module = None
         self._B = self._SQ = self._SKV = self._H = self._KH = self._G = 0
         self._dtype_code = 0
@@ -249,9 +289,7 @@ class SparseGqaFwdDslSm107:
         if not ids.is_contiguous():
             raise ValueError("sparse d256 forward (sm107): block_ids must be contiguous (its row stride is the bulk-copy length)")
         if self.block_lens is not None:
-            bl = self.block_lens
-            if str(bl.dtype) != "torch.int32" or _shape(bl) not in ((B, SQ), (B * SQ,)) or not bl.is_contiguous():
-                raise ValueError(f"sparse d256 forward (sm107): block_lens must be a contiguous int32 [B, S_q] / [B x S_q]; got {bl.dtype} {_shape(bl)}")
+            self._check_block_lens_form(self.block_lens, B, SQ)
         if self.seq_kv_lens is not None:
             kl = self.seq_kv_lens
             if str(kl.dtype) != "torch.int32" or _shape(kl) != (B,) or not kl.is_contiguous():
@@ -259,6 +297,20 @@ class SparseGqaFwdDslSm107:
         self._B, self._SQ, self._SKV, self._H, self._KH, self._G = B, SQ, SKV, H, KH, G
         self._dtype_code = _DTYPE_CODE[dt]
         return True
+
+    @staticmethod
+    def _check_block_lens_form(bl, B: int, SQ: int) -> None:
+        if str(bl.dtype) != "torch.int32" or _shape(bl) not in ((B, SQ), (B * SQ,)) or not bl.is_contiguous():
+            raise ValueError(f"sparse d256 forward (sm107): block_lens must be a contiguous int32 [B, S_q] / [B x S_q]; got {bl.dtype} {_shape(bl)}")
+
+    def scratch_workspace_bytes(self) -> int:
+        """Per-execute GMEM scratch beyond the operands: NONE.  The count of a row's list, the open tail block and the dead
+        items are derived on device from the position, ``block_lens`` and ``seq_kv_lens`` (one bounds helper per work item),
+        and the ids rows reach SMEM by a bulk copy straight from the caller's ``block_ids`` -- no per-sequence metadata, no
+        index staging, no split-KV partials.  A caller that folds every engine's scratch into one workspace (the gated
+        attention block) folds a 0 here; the arms that will need scratch (split-KV partials, the paged form's per-sequence
+        descriptors) grow it in the change that lands them."""
+        return 0
 
     # --- compile / execute -----------------------------------------------------------------------------------------------
 
@@ -278,23 +330,83 @@ class SparseGqaFwdDslSm107:
             stats_log2=self.stats_log2,
         )
 
-    def compile(self):
+    def compile(self, has_block_lens: Optional[bool] = None):
         """Load the template for this specialization and compile its pointer ABI (one artifact per (dtype, group, top_k,
-        KV-lens presence, LSE presence, block_lens presence))."""
-        if self._fn is not None:
-            return self._fn
+        KV-lens presence, LSE presence, block_lens presence)).
+
+        ``has_block_lens`` (appended) selects the ``block_lens`` variant explicitly; the default is the declared presence.  A
+        caller whose ``block_lens`` is optional PER CALL compiles both variants at plan time and :meth:`execute` dispatches
+        on the tensor it is handed -- plan-time keys only, never a compile on the execute path."""
+        if has_block_lens is None:
+            has_block_lens = self.block_lens is not None
+        has_block_lens = bool(has_block_lens)
+        fn = self._fns.get(has_block_lens)
+        if fn is not None:
+            return fn
         self.check_support()
-        from cudnn.frost.template_loader import load_template
+        if self._module is None:
+            from cudnn.frost.template_loader import load_template
 
-        params = self.template_params()
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", KERNEL_FILE)
-        self._module = load_template(path, params, tag="sdpa_fwd_sm107_sparse_d256")
-        self._fn = self._module.compile(has_lse=self.lse is not None, has_block_lens=self.block_lens is not None)
-        return self._fn
+            params = self.template_params()
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", KERNEL_FILE)
+            self._module = load_template(path, params, tag="sdpa_fwd_sm107_sparse_d256")
+        fn = self._module.compile(has_lse=self.lse is not None, has_block_lens=has_block_lens)
+        self._fns[has_block_lens] = fn
+        if has_block_lens == (self.block_lens is not None):
+            self._fn = fn
+        return fn
 
-    def execute(self, stream=None):
-        """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation."""
-        fn = self.compile()
+    def _bind(self, name: str, given, declared, *, required: bool):
+        """The tensor a launch uses for ``name``: the one handed to ``execute`` (it must match the declaration in shape,
+        strides and dtype -- a mismatch is a caller bug, refused by name, never a silent re-specialization), else the
+        declared one (which must then be a tensor, not a :class:`SparseOperandDesc`)."""
+        if given is None:
+            if declared is None:
+                if required:
+                    raise ValueError(f"sparse d256 forward (sm107): {name} is required at execute")
+                return None
+            if isinstance(declared, SparseOperandDesc):
+                raise ValueError(f"sparse d256 forward (sm107): {name} was declared as a SparseOperandDesc (no storage); pass the tensor at execute({name}=)")
+            return declared
+        if declared is None:
+            raise ValueError(f"sparse d256 forward (sm107): {name} was not declared (its presence is compiled into the specialization); construct with {name}=")
+        if _shape(given) != _shape(declared) or _strides(given) != _strides(declared) or str(given.dtype) != str(declared.dtype):
+            raise ValueError(
+                f"sparse d256 forward (sm107): {name} at execute must match its declaration -- shape {_shape(declared)} strides {_strides(declared)} "
+                f"{declared.dtype}; got shape {_shape(given)} strides {_strides(given)} {given.dtype}"
+            )
+        return given
+
+    def execute(self, stream=None, *, q=None, k=None, v=None, o=None, lse=None, block_ids=None, block_lens=None, seq_kv_lens=None):
+        """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation.
+
+        The appended keyword operands BIND the launch's tensors in place of the declared ones (a caller whose buffers exist
+        only at execute declares with :class:`SparseOperandDesc` and passes every tensor here); each must match its
+        declaration in shape, strides and dtype exactly.  ``lse`` / ``seq_kv_lens`` keep the declaration's presence (it is
+        compiled in).  ``block_lens`` may differ in PRESENCE per call: a tensor -> the ``has_block_lens`` variant, ``None`` ->
+        the kernel's derived default count -- the variant must have been compiled (:meth:`compile`), never compiled here."""
+        if not self._G:
+            self.check_support()
+        q = self._bind("q", q, self.q, required=True)
+        k = self._bind("k", k, self.k, required=True)
+        v = self._bind("v", v, self.v, required=True)
+        o = self._bind("o", o, self.o, required=True)
+        ids = self._bind("block_ids", block_ids, self.block_ids, required=True)
+        lse = self._bind("lse", lse, self.lse, required=self.lse is not None)
+        seq_kv_lens = self._bind("seq_kv_lens", seq_kv_lens, self.seq_kv_lens, required=self.seq_kv_lens is not None)
+        if block_lens is not None:
+            self._check_block_lens_form(block_lens, self._B, self._SQ)
+            lens = block_lens
+        elif self.block_lens is not None and not isinstance(self.block_lens, SparseOperandDesc):
+            lens = self.block_lens
+        else:
+            lens = None  # declared as a descriptor (or not at all) and not handed over: the derived default count
+        fn = self._fns.get(lens is not None)
+        if fn is None:
+            raise RuntimeError(
+                f"sparse d256 forward (sm107): call compile(has_block_lens={lens is not None}) before execute() -- the {'with' if lens is not None else 'without'}-block_lens "
+                "variant is not compiled (plan-time keys only: nothing compiles on the execute path)"
+            )
         import torch
         import cutlass
         import cuda.bindings.driver as cuda_driver
@@ -308,20 +420,18 @@ class SparseGqaFwdDslSm107:
             return None if t is None else make_ptr(dtype, t.data_ptr(), gmem, assumed_align=align)
 
         if stream is None:
-            stream = cuda_driver.CUstream(torch.cuda.current_stream(self.q.device).cuda_stream)
-        q, k, v, o, lse = self.q, self.k, self.v, self.o, self.lse
-        seq_kv_lens = self.seq_kv_lens
+            stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
         if seq_kv_lens is None:
             # Unread by the kernel (SEQ_KV_LENS_PRESENT = 0): the pointer slot is bound to the ids (a valid address).
-            seq_kv_lens = self.block_ids
+            seq_kv_lens = ids
         fn(
             q_ptr=P(q, half),
             k_ptr=P(k, half),
             v_ptr=P(v, half),
             o_ptr=P(o, half),
             lse_ptr=P(lse, cutlass.Float32, 4),
-            block_ids_ptr=P(self.block_ids, cutlass.Int32, 16),
-            block_lens_ptr=P(self.block_lens, cutlass.Int32, 4),
+            block_ids_ptr=P(ids, cutlass.Int32, 16),
+            block_lens_ptr=P(lens, cutlass.Int32, 4),
             seq_kv_lens_ptr=P(seq_kv_lens, cutlass.Int32, 4),
             problem_size=(self._B, self._H, self._KH, self._SQ, self._SKV),
             q_strides=_strides(q)[:3],
