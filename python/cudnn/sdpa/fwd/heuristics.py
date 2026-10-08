@@ -1037,10 +1037,13 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # twins'): 64/8 b128 q 1 / 4 / 8 KV 2k two-slab cga1 LPT 178-180 us against the cga2 plan's 269-276
         # (the wave rule below prefers cga1: 1024 units), b24 mixed 41 vs 57 us (192 units); 64/4 (GQA16) b128
         # q 4 / 8 129-131 vs 170-172 us, and b24 mixed (96 units: one wave either way) keeps cga2 at 40 vs 42 us.
-        # The SM100 line keeps its measured family (bf16, no sink, GQA 4 / 8, s_q > 1) until measured there.
+        # SM100 automatic single-CTA paged prefill selection remains disabled pending separate qualification: the
+        # explicit device guard keeps this preference on cc 10.7 even once the capability helper admits the two-slab
+        # body on SM100 for explicit candidates (an explicit cga=1 pin is honoured there regardless).
         rubin_paged = _sm107_paged_half(caps, facts)
         prefer = (
             pack_gqa is not False
+            and facts.device_cc == (10, 7)
             and _prefer_thd_pack_gqa(caps, facts)
             and facts.dtype == cudnn.data_type.BFLOAT16
             and facts.bottom_right
