@@ -1152,9 +1152,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "the fused epilogue gate is dense-only (no THD gate descriptor)"
         # The paged PREFILL kernel has no gate; the d256 decode tile's SPLIT applies the
         # gate in its combine over any cache (knobs None = the facts-only question: some
-        # plan -- a split -- rides the tile; a knob set answers for its own split).
-        if facts.has_paged_kv and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _decode_tile_split_kv(knobs)):
-            return "the fused epilogue gate is not wired on the paged-KV flavor (only the d256 decode tile's split applies the gate in its combine)"
+        # plan -- a split -- rides the tile; a knob set answers for its own split).  A
+        # SINK never splits (the shared no-split rule above and in the heuristics), so on a
+        # sink graph the facts-only question is the UNSPLIT one: a paged gated sink graph
+        # has NO plan on this row and is declined here, never admitted at the facts level
+        # with an empty proposal list.
+        _gate_split = _decode_tile_split_kv(knobs)
+        if _gate_split is None and facts.has_sink:
+            _gate_split = 1
+        if facts.has_paged_kv and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _gate_split):
+            return "the fused epilogue gate is not wired on the paged-KV flavor (only the d256 decode tile's split applies the gate in its combine; a sink never splits)"
         if not facts.epilogue_gate_shape_ok:
             return "the gate G must have exactly O's shape (B, H_q, S_q, D_v); a broadcast G is not fused"
         dom = capabilities.epilogue_gate_dtypes if capabilities.epilogue_gate_dtypes is not None else frozenset({facts.dtype})

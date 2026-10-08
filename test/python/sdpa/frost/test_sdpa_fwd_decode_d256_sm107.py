@@ -405,6 +405,17 @@ def test_sm107_row_predicate_and_heuristics_agree_on_the_gated_decode_tile():
         s > 1 for _, s in paged_sets
     ), paged_sets  # 8 units x 32 tiles: the model splits 16 ways; no unsplit gated paged plan exists
     assert _split_points(caps, paged, 128, 128, 2, pack_g=12) == [16]
+    # Paged + gate + SINK: no plan at all on this row -- a sink never splits (the shared no-split rule)
+    # and the paged prefill kernel has no gate -- so the facts-level question is a typed decline too
+    # (never "served" with an empty proposal list), the knob-level split is the sink's own decline, and
+    # the heuristics propose nothing.  The UNGATED paged sink graph stays served (the tile folds the
+    # sink per Q row, unsplit) -- test_sm107_row_and_predicate_agree_on_the_decode_tile pins that.
+    paged_sink = SdpaGraphFacts(**{**base, "has_sink": True})
+    why = engines.mismatch(caps, paged_sink, None)
+    assert why and "paged" in why and "gate" in why and "sink" in why, why
+    assert engines.mismatch(caps, paged_sink, SdpaFwdKnobs(pack_gqa=True, split_kv=2)) is not None
+    assert engines.mismatch(caps, paged_sink, SdpaFwdKnobs(pack_gqa=True, split_kv=1)) is not None
+    assert sets(paged_sink) == []
     # Dense UNPADDED: the same split lead; the unsplit runner-up is the prefill kernel's fused gate, unpacked.
     dense = SdpaGraphFacts(**{**base, "has_paged_kv": False, "page_size": 0, "padded": False})
     assert engines.mismatch(caps, dense, SdpaFwdKnobs(pack_gqa=False, split_kv=1)) is None
