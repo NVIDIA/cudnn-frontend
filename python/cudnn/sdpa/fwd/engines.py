@@ -1037,8 +1037,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
-        if capabilities.sm_lo == 107 and (not facts.thd or facts.has_sink):
-            return "Rubin paged KV requires THD without an attention sink"
+        if capabilities.sm_lo == 107 and not capabilities.is_mxfp8 and not facts.thd:
+            return "Rubin paged KV requires THD queries (dense paged queries are not wired on cc 10.7)"
         # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
         # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
         # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these
@@ -1052,6 +1052,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # runs unsplit. The FP8 kernel's sink fold and its block-scaled O
         # epilogue (sf_o) over pools are not validated, so those two pairs stay
         # declined on the fp8 row.
+        # On cc 10.7 the same composition rides the shared d128 / d256 bodies compiled for sm_107a (the Rubin
+        # paged arm of api_dsl._load_sm100_kernel_module); validated there with packed THD queries (1 / 4 / 8
+        # tokens per request), PackGQA on / off, cga1 / cga2, HND / NHD pools and keyless rows
+        # (test_mhas_v2.py's "P2" block).  Dense (non-THD) paged queries stay declined on cc 10.7.
         if facts.is_mxfp8:
             if facts.page_size % 128 != 0:
                 # A page must hold whole 128-row F8_128x4 SF atoms.
@@ -1310,8 +1314,11 @@ def _sm107_spec() -> EngineSpec:
       the shared combine. Bounded D128 THD and nonpaged D192 THD
       also use the shared single-CTA packed partials. Sink split stays declined.
     - ``pack_gqas``: D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
-    - ``paged_kv``: D128/D256 half THD without sink uses the shared
-      Blackwell paged pipeline, compiled natively for SM107.
+    - ``paged_kv``: D128/D256 half THD -- with or without an attention sink (the
+      per-row epilogue fold; a keyless row stores O := 0 / LSE := sink) -- uses the
+      shared Blackwell paged pipeline, compiled natively for SM107.  Dense (non-THD)
+      paged queries stay declined; sink + split-KV stays declined row-wide (the
+      combine is not sink-aware), so a sink decode graph runs unsplit.
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
       (the f16x2 arm is a quantized-kernel specialization).
     - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the

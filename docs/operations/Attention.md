@@ -391,7 +391,7 @@ graph.sdpa(
     - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
-  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`. On cc 10.7 (SM107) the f16/bf16 row serves paged KV for packed (THD / ragged-Q) queries on the d128 and d256 flavors, with or without `sink_token` -- prefill- and decode-shaped packed batches (per-request Q of 1 / 4 / 8), GQA with PackGQA, HND and NHD pools -- through the paged prefill pipeline; dense (BSHD) paged queries are declined there, and a sink graph is never split on any row.
   - **Offset calculation**:
     - $K_{cache}[b,h,s,d] = K_{container}[page\_table\_k[b,1,s / bs_k, 1], h, s \mod bs_k, d]$
     - $V_{cache}[b,h,s,d] = V_{container}[page\_table\_v[b,1,s / bs_v, 1], h, s \mod bs_v, d]$
