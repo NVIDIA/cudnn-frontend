@@ -635,8 +635,10 @@ def test_the_training_loop_imports_only_from_the_test_tree_and_the_package():
     test_tree = os.path.dirname(os.path.dirname(os.path.dirname(path)))  # <repo>/test/python
     assert os.path.basename(test_tree) == "python" and os.path.basename(os.path.dirname(test_tree)) == "test"
     stdlib = set(sys.stdlib_module_names) | {"__future__"}
-    outside = []
+    outside, absolute = [], []
     for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("/"):
+            absolute.append(node.value)  # an absolute POSIX path literal: a checkout- or host-specific location
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
@@ -652,7 +654,7 @@ def test_the_training_loop_imports_only_from_the_test_tree_and_the_package():
             if not mod_file.startswith(test_tree + os.sep):
                 outside.append((name, mod_file))
     assert not outside, f"imports resolved outside the test tree: {outside}"
-    assert "/home/" not in src and "/tmp/" not in src, "an absolute path in the harness core"
+    assert not absolute, f"absolute path literals in the harness core: {absolute}"
     assert not os.path.basename(path).startswith("test_"), "the helper would be collected as a test module"
 
 
@@ -685,7 +687,9 @@ def test_training_loop_bf16_matches_the_torch_reference_model(deterministic_cubl
     ref = _train(gbt.ARMS["torch-bf16"], keep_grads_at=(0,))
     rtol, atol_frac = _RTOL[torch.bfloat16], _ATOL_FRAC[torch.bfloat16]
     g_f, g_r = frost.kept_grads[0], ref.kept_grads[0]
-    assert set(g_f) == set(g_r) and len(g_f) == 7 * _SMOKE.n_layers + 2
+    assert (
+        set(g_f) == set(g_r) and len(g_f) == 8 * _SMOKE.n_layers + 2
+    )  # per layer ln1 / w_qkvg / w_o / w_q_norm / w_k_norm / ln2 / mlp_w1 / mlp_w2, plus emb / lnf
     worst_block, worst_norm, reported = {}, {}, {}
     for name in sorted(g_f):
         fam = name.split(".")[0]
