@@ -64,8 +64,6 @@ from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
 from frost_test_utils import _is_plan_for, launch_f16, offers_engine, requires_dsl, requires_rubin, select_engine
 from test_sdpa_fwd_decode_d256_sm100 import _pools, _ref, _served_by
 
-pytestmark = [pytest.mark.L0, requires_dsl]
-
 D = 256
 DECODE = "decode_d256_f16"
 PREFILL = "prefill_d256_f16"
@@ -85,6 +83,11 @@ def _dsl_floor_reason():
 
 _DSL_FLOOR_WHY = _dsl_floor_reason()
 requires_sm107_dsl = pytest.mark.skipif(_DSL_FLOOR_WHY is not None, reason=_DSL_FLOOR_WHY or "")
+# Module-wide, built AFTER ``requires_sm107_dsl`` exists: every test here -- the GPU cases and the
+# host-runnable structural pins that import the Rubin module through ``_load`` -- skips (never fails)
+# below the sm_107a DSL floor (Rule 7); the probe that asserts the floor's typed message does so by
+# monkeypatch above the floor, so it skips below it too.
+pytestmark = [pytest.mark.L0, requires_dsl, requires_sm107_dsl]
 
 
 def _gpu(f):
