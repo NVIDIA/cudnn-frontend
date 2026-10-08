@@ -171,10 +171,12 @@ offset is byte-identical (pinned by a frozen layout snapshot):
   nibble = even k; the STORAGE shape is what ``check_support`` checks) with the
   UNCHANGED E8M0 / 32 ``w_qkvg_sf``; stage (1) runs the FROST catalog's MIXED
   block-scale row (``fp8_e4m3 x fp4_e2m1``, E8M0 per 32 on both sides) --
-  the same 9 launches, no new stage, no new slot.  UNFUSED only: the fused
-  MXFP8 projection fork is rendered for an e4m3 B, so ``fuse_norm_rope`` with
-  an e2m1 ``W_qkvg`` is a feature-detected typed ``NotImplementedError``
-  (``NormRopeFusionParams.weight_fp4``), inverting the day the arm lands.
+  the same 9 launches, no new stage, no new slot.  FULLY FUSED too: the fused
+  MXFP8 projection fork's e2m1-B arm (``NormRopeFusionParams.weight_fp4``,
+  feature-detected -- a checkout whose fork lacks the field declines typed)
+  reads the same packed codes and the same blob inside the norm+RoPE+quant
+  epilogue, so ``fuse_norm_rope`` with an e2m1 ``W_qkvg`` is the same 3
+  launches as the e4m3 fused pipeline (inference only, dense only, like it).
 * **fp4 O** (``o_fp4=Fp4Format.NVFP4 | Fp4Format.MXFP4``; ONE enum member =
   e2m1 codes x scale dtype x block, e4m3 / 16 or E8M0 / 32, so an illegal
   pairing cannot be spelled): the per-tensor tail (``quantize_o`` +
@@ -1481,8 +1483,8 @@ class MxQuantSpec:
                      -- the FROST catalog's MIXED block-scale row (``fp8_e4m3 x
                      fp4_e2m1``, E8M0 scales per 32); ``w_qkvg_sf`` is UNCHANGED
                      (the same E8M0 / 32 F8_128x4 blob over ``n_qkvg x d_model``).
-                     Unfused pipeline only: the fused MXFP8 projection fork is
-                     rendered for an e4m3 B (typed decline at ``check_support``).
+                     Served on both pipelines: unfused, and fully fused through
+                     the MXFP8 projection fork's e2m1-B arm (3 launches).
     ``o_fp4``        (appended, default ``None`` = today's per-tensor e4m3 O).  An
                      :class:`Fp4Format` member selects the fp4 OUTPUT mode: the gated
                      O is block-quantized to e2m1 codes + that format's scale blob by
@@ -3566,8 +3568,15 @@ class GatedAttentionBlockFwd(APIBase):
 
         (1)  proj          h8+sf_h, W4+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM, mixed row (fp8_e4m3 x fp4_e2m1, E8M0/32)
 
-    UNFUSED only -- ``fuse_norm_rope`` with an e2m1 ``W_qkvg`` is a typed decline (the fork twin is
-    rendered for an e4m3 B; feature-detected on ``NormRopeFusionParams.weight_fp4``).
+    and FULLY FUSED (``fuse_norm_rope=True, fuse_gate=True``, the SAME 3 launches as the e4m3 fused
+    pipeline: inference only, dense only, ``S % 128 == 0`` at ``B > 1``, ``scale_o == 1.0``) with stage (1)
+    on the fork's e2m1-B arm::
+
+        (1)  proj+norm+rope+quant  h8+sf_h, W4+sf_w -> q8/k8/v8 + sf_q/sf_k/sf_v + gate16   the fused MXFP8 fork, mixed row
+                                   (``NormRopeFusionParams.weight_fp4``: the same packed codes and the same blob; the
+                                   fused stage also checks the packed TMA format's 32-byte base / row-stride rules)
+
+    (feature-detected on ``NormRopeFusionParams.weight_fp4``: a checkout whose fork lacks the field declines typed).
 
     **fp4 O** (``MxQuantSpec.o_fp4 = Fp4Format.NVFP4 | MXFP4`` + an e2m1 ``W_o`` ``[d_model, H_q*D // 2]``
     with its F8_128x4 blob ``sample_w_o_sf`` / ``w_o_sf``): the per-tensor tail of BOTH MXFP8

@@ -433,14 +433,14 @@ def test_fusion_params_offsets_follow_the_layout_contract():
 
 
 def test_qk_norm_knob_is_appended_and_validated():
-    """``qk_norm`` (then ``quant_mxfp8``) are APPENDED with defaults that spell every existing
-    key identically -- a norm-on render's template-loader cache key is unchanged.  Under
+    """``qk_norm`` (then ``quant_mxfp8``, then ``weight_fp4``) are APPENDED with defaults that spell every
+    existing key identically -- a norm-on render's template-loader cache key is unchanged.  Under
     ``qk_norm=False`` there is no rstd to emit and no weight load to delete (``const_w`` has
     no meaning; ``const_cs`` == ``const``); ``off`` and the FP8 fork stay legal."""
     assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True)
     assert NormRopeFusionParams() == NormRopeFusionParams(qk_norm=True, quant_mxfp8=False)
     names = [f.name for f in dataclasses.fields(NormRopeFusionParams)]
-    assert names[-3:] == ["quant_fp8", "qk_norm", "quant_mxfp8"], names  # the FROZEN order (PR-B section 1.5)
+    assert names[-4:] == ["quant_fp8", "qk_norm", "quant_mxfp8", "weight_fp4"], names  # the FROZEN order (PR-B section 1.5; weight_fp4 appended last)
     with pytest.raises(ValueError, match="want_rstd"):
         validate_norm_rope_params(NormRopeFusionParams(qk_norm=False, want_rstd=True))
     with pytest.raises(ValueError, match="const_w"):

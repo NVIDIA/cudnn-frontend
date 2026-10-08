@@ -104,6 +104,9 @@ requires_rubin = pytest.mark.skipif(
     not torch.cuda.is_available() or tuple(torch.cuda.get_device_capability()) != _SM107,
     reason="mma_tile_k_bytes=64 (the 64-byte MMA-instruction K) is SM 10.7 silicon -- kernel_registry.MMA_INST_K64_ARCH_RANGES",
 )
+_FP4 = getattr(torch, "float4_e2m1fn_x2", None)  # the packed e2m1 storage dtype of the fork's e2m1-B arm (NormRopeFusionParams.weight_fp4)
+requires_fp4 = pytest.mark.skipif(_FP4 is None, reason="this torch has no float4_e2m1fn_x2")
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device (the runner's host-side declines bind CUDA tensors)")
 
 
 def mxfp8_quant():
@@ -558,7 +561,15 @@ from cudnn.gated_attention_block.kernels.proj_gemm import (  # noqa: E402
     validate_norm_rope_params,
 )
 from cudnn.gated_attention_block.kernels.quantize_mxfp8 import n_sf_tiles, sf_bytes  # noqa: E402
-from gated_block_reference import apply_partial_rope, build_rope_tables, qk_norm_rope_reference  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    apply_partial_rope,
+    build_rope_tables,
+    fp4_quantize_rowwise_2d,
+    mx_swizzle_sf_rowwise_padded,
+    mx_unswizzle_sf_rowwise,
+    qk_norm_rope_reference,
+    unpack_e2m1,
+)
 
 _E4M3_NAN_BYTE = 0x7F  # e4m3fn NaN; `cvt.rn.satfinite` never produces it, so a surviving byte is a never-written cell
 _E8M0_NAN_BYTE = 0xFF  # E8M0 NaN; a finite block amax never yields it, so a surviving byte is a never-written scale
@@ -826,13 +837,23 @@ def tail_sf_bytes(axis: str, *, batch: int, heads: int, seq_len: int, d: int) ->
 
 
 def test_mxfp8_fusion_params_are_inference_only_and_keep_every_other_key():
-    """``quant_mxfp8`` is the LAST field with a False default: every bf16 / FP8 params key is spelled
-    identically.  Under MXFP8 there is no rstd, no ``off`` arm, and not both quant flags."""
-    assert NormRopeFusionParams() == NormRopeFusionParams(quant_mxfp8=False)
-    assert [f.name for f in dataclasses.fields(NormRopeFusionParams)][-3:] == ["quant_fp8", "qk_norm", "quant_mxfp8"]
+    """``quant_mxfp8`` and, appended after it, ``weight_fp4`` carry False defaults: every bf16 / FP8 / MXFP8 params key is
+    spelled identically.  Under MXFP8 there is no rstd, no ``off`` arm, and not both quant flags; ``weight_fp4`` (the e2m1-B
+    arm) needs ``quant_mxfp8`` and refuses ``quant_fp8``."""
+    assert NormRopeFusionParams() == NormRopeFusionParams(quant_mxfp8=False) == NormRopeFusionParams(weight_fp4=False)
+    assert [f.name for f in dataclasses.fields(NormRopeFusionParams)][-4:] == ["quant_fp8", "qk_norm", "quant_mxfp8", "weight_fp4"]
     p = _fused_mx_params()
     validate_norm_rope_params(p)
     validate_norm_rope_params(_fused_mx_params(qk_norm=False))
+    validate_norm_rope_params(_fused_mx_params(weight_fp4=True))
+    validate_norm_rope_params(_fused_mx_params(weight_fp4=True, qk_norm=False))
+    assert _fused_mx_params(weight_fp4=True) != p and _fused_mx_params(weight_fp4=False) == p  # a NEW compile key, the e4m3 key untouched
+    with pytest.raises(ValueError, match="set quant_mxfp8=True"):
+        validate_norm_rope_params(dataclasses.replace(p, quant_mxfp8=False, weight_fp4=True))
+    with pytest.raises(ValueError, match="weight_fp4 and quant_fp8"):
+        validate_norm_rope_params(dataclasses.replace(p, quant_mxfp8=False, quant_fp8=True, weight_fp4=True))
+    with pytest.raises(ValueError, match="at most one"):
+        validate_norm_rope_params(_fused_mx_params(quant_fp8=True, weight_fp4=True))
     for src in ("ldg", "ldg_early", "const", "const_w", "const_cs"):
         validate_norm_rope_params(_fused_mx_params(norm_source=src))
     with pytest.raises(ValueError, match="want_rstd"):
@@ -1135,3 +1156,385 @@ def test_fused_mxfp8_runner_rejects_wrong_bindings():
         launch(inp_over=dict(a8=inp["a8"].to(torch.bfloat16)))
     with pytest.raises(ValueError, match="qk_norm=True"):
         launch(inp_over=dict(wq=None, wk=None))
+
+
+# ---------------------------------------------------------------------------
+# The e2m1-B arm (NormRopeFusionParams.weight_fp4): an MXFP4 W_qkvg on the SAME fused kernel body
+# ---------------------------------------------------------------------------
+
+
+def mx_fused_inputs_fp4w(batch: int, seq_len: int, k: int, p: NormRopeFusionParams, seed: int = 0) -> tuple:
+    """The e2m1-B arm's inputs and their e4m3 SHADOW twin, sharing everything but the weight's storage.
+
+    ``W_qkvg`` is quantized to MXFP4 (``fp4_quantize_rowwise_2d``: E2M1 codes packed two per byte ``[N, K/2]``, one E8M0
+    scale per 32 along K) and its blob built by the block's own builder (byte-identical to ``blocked_sf``).  Every E2M1
+    value is an e4m3 value exactly, so the SAME values as e4m3 codes with the SAME blob dequantize to the SAME operand
+    (asserted): the e4m3 fork fed the shadow codes and the e2m1 fork fed the packed codes see identical fp32 products in
+    identical order.  Returns ``(inp_fp4, inp_shadow)`` -- identical dicts except ``w8`` (packed ``float4_e2m1fn_x2`` vs
+    the e4m3 shadow); ``proj32`` is the exact fp32 projection of the dequantized operands (TF32 off), for the oracle."""
+    mq = mxfp8_quant()
+    base = mx_fused_inputs(batch, seq_len, k, p, seed=seed)
+    torch.manual_seed(seed + 1)
+    m, n = batch * seq_len, p.n_qkvg
+    w32 = torch.randn(n, k, device="cuda") * 0.02
+    packed, e_w = fp4_quantize_rowwise_2d(w32, "mxfp4")
+    e_w = e_w.to(torch.uint8)  # E8M0 exponent BYTES (the quantizer returns them as integers)
+    blob = mx_swizzle_sf_rowwise_padded(e_w, block=_BLOCK)
+    assert blob.numel() == sf_blob_bytes(n, k) and torch.equal(blob, blocked_sf(e_w)), "the block's blob builder and this suite's agree byte for byte"
+    values = unpack_e2m1(packed)  # fp32 [n, k]
+    shadow = values.to(_FP8).contiguous()
+    assert torch.equal(shadow.float(), values), "E2M1 values are e4m3-exact by construction"
+    e_a = mx_unswizzle_sf_rowwise(base["sf_a"], m, k)  # a8's E8M0 bytes, read back from the padded blob the kernel reads
+    a_s = base["a8"].float() * mq.e8m0_to_float(e_a).repeat_interleave(_BLOCK, 1)
+    w_s = values * mq.e8m0_to_float(e_w).repeat_interleave(_BLOCK, 1)
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        proj32 = a_s @ w_s.t()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    inp_shadow = dict(base, w8=shadow, sf_w=blob, proj32=proj32)
+    inp_fp4 = dict(inp_shadow, w8=packed.contiguous().view(_FP4))
+    assert tuple(inp_fp4["w8"].shape) == (n, k // 2) and inp_fp4["w8"].dtype == _FP4
+    return inp_fp4, inp_shadow
+
+
+def _mx_runner_tensors(p: NormRopeFusionParams, batch: int, seq_len: int, k: int, w8) -> tuple:
+    """Shape-correct, zero-filled runner operands for the host-side decline cells (never launched): the GEMM's two PADDED
+    SF blobs, bf16 norm weights / RoPE tables and the seven sentinel outputs, so every check BEFORE the one under test passes."""
+    m, n = batch * seq_len, p.n_qkvg
+    one = torch.ones(p.d_head, dtype=torch.bfloat16, device="cuda")
+    cos = torch.zeros(m, p.rope_dim, dtype=torch.bfloat16, device="cuda")
+    inp = dict(
+        a8=torch.zeros(m, k, dtype=_FP8, device="cuda"),
+        sf_a=torch.zeros(sf_blob_bytes(m, k), dtype=torch.uint8, device="cuda"),
+        w8=w8,
+        sf_w=torch.zeros(sf_blob_bytes(n, k), dtype=torch.uint8, device="cuda"),
+        wq=one if p.qk_norm else None,
+        wk=one.clone() if p.qk_norm else None,
+        cos=cos,
+        sin=cos.clone(),
+        batch=batch,
+        seq_len=seq_len,
+    )
+    return inp, mx_fused_sentinels(batch, seq_len, p)
+
+
+@requires_cuda
+@requires_fp8
+@requires_fp4
+def test_fused_mxfp4w_runner_declines_typed_before_any_launch():
+    """The e2m1-B arm's runner checks, on hand-built plans whose launch stand-in is ``None`` (so a check that PASSES ends in
+    ``TypeError`` at the launch call, and every decline fires before it, with no device sync).  The dtype rule both ways
+    (the plan's RECORDED ``w_dtype`` and the derived one agree), the uint8 ``.view`` hint, the LOGICAL ``[N, K]`` fp4 tensor,
+    ``K % 128`` (the padded sub-byte TMA format's Tensor-Size rule), a 16-byte- but not 32-byte-aligned base and a padded
+    row stride (its base-address and stride rules, which the descriptor builder cannot check on the fork's dynamic operand)
+    -- and the SAME two views PASS the e4m3 plan's checks (16-byte rules only), which pins the gate as fp4-scoped.  Plus the
+    rule BOTH arms share: a K-strided weight view (two bytes between consecutive codes / columns along K) is refused -- the
+    kernel's tensor maps carry the row and batch strides only, so it would otherwise be read as if contiguous."""
+    p4, p8 = _fused_mx_params(weight_fp4=True), _fused_mx_params()
+    fake4 = FusedProjGemmPlan(params=p4, module=None, launch=None, mxfp8=True)  # w_dtype None -> derived from the params
+    fake4_rec = FusedProjGemmPlan(params=p4, module=None, launch=None, mxfp8=True, w_dtype=_FP4)  # the dtype build_fused_proj_gemm records
+    fake8 = FusedProjGemmPlan(params=p8, module=None, launch=None, mxfp8=True)
+    batch, seq_len, k = 1, 256, 1024
+    n = p4.n_qkvg
+    dev = "cuda"
+    w4 = torch.zeros(n, k // 2, dtype=torch.uint8, device=dev).view(_FP4)
+    w8 = torch.zeros(n, k, dtype=_FP8, device=dev)
+
+    def launch(plan, w, p, k_=k):
+        inp, outs = _mx_runner_tensors(p, batch, seq_len, k_, w)
+        mx_launch(plan, inp, p, outs)
+
+    torch.cuda.set_sync_debug_mode("error")  # every decline is host arithmetic: no sync may hide behind one
+    try:
+        for plan in (fake4, fake4_rec):
+            with pytest.raises(ValueError, match="e2m1 W_qkvg codes") as ei:
+                launch(plan, w8, p4)
+            assert "weight_fp4=True" in str(ei.value) and "float8_e4m3fn" in str(ei.value)
+        with pytest.raises(ValueError, match="e4m3 W_qkvg codes") as ei:
+            launch(fake8, w4, p8)
+        assert "weight_fp4=False" in str(ei.value) and "float4_e2m1fn_x2" in str(ei.value)
+        with pytest.raises(ValueError, match=r"\.view\(torch\.float4_e2m1fn_x2\)"):
+            launch(fake4, w4.view(torch.uint8), p4)
+        with pytest.raises(ValueError, match="twice the data"):
+            launch(fake4, torch.zeros(n, k, dtype=torch.uint8, device=dev).view(_FP4), p4)
+        with pytest.raises(ValueError, match="K % 128"):  # 1056 = 33 x 32 passes the block rule, fails the padded format's
+            launch(fake4, torch.zeros(n, 1056 // 2, dtype=torch.uint8, device=dev).view(_FP4), p4, k_=1056)
+        arena = torch.zeros(n * (k // 2) + 64, dtype=torch.uint8, device=dev)
+        w_off = arena[16 : 16 + n * (k // 2)].view(n, k // 2).view(_FP4)  # 16-byte- but not 32-byte-aligned
+        assert w_off.data_ptr() % 32 == 16
+        with pytest.raises(ValueError, match="32-byte-aligned"):
+            launch(fake4, w_off, p4)
+        w_pad = torch.zeros(n, k // 2 + 16, dtype=torch.uint8, device=dev).view(_FP4)[:, : k // 2]  # K/2 + 16 bytes between rows
+        assert w_pad.stride(0) % 32 == 16 and w_pad.data_ptr() % 32 == 0
+        with pytest.raises(ValueError, match="multiple of 32 bytes"):
+            launch(fake4, w_pad, p4)
+        w4_kstr = torch.zeros(n, k, dtype=torch.uint8, device=dev)[:, ::2].view(_FP4)  # [N, K/2] storage, 2 bytes between codes along K
+        assert tuple(w4_kstr.shape) == (n, k // 2) and w4_kstr.stride(1) == 2 and w4_kstr.data_ptr() % 32 == 0
+        with pytest.raises(ValueError, match="UNIT stride along K"):
+            launch(fake4, w4_kstr, p4)
+        w8_kstr = torch.zeros(n, 2 * k, dtype=_FP8, device=dev)[:, ::2]  # the SAME hole on the e4m3 arm: shape [N, K], stride 2 along K
+        assert tuple(w8_kstr.shape) == (n, k) and w8_kstr.stride(1) == 2
+        with pytest.raises(ValueError, match="UNIT stride along K"):
+            launch(fake8, w8_kstr, p8)
+        # the SAME two views on the e4m3 plan: every check passes (its TMA rules are 16-byte) and the None launch is reached
+        arena8 = torch.zeros(n * k + 64, dtype=torch.uint8, device=dev)
+        w8_off = arena8[16 : 16 + n * k].view(n, k).view(_FP8)
+        w8_pad = torch.zeros(n, k + 16, dtype=_FP8, device=dev)[:, :k]
+        assert w8_off.data_ptr() % 32 == 16 and w8_pad.stride(0) % 32 == 16
+        for w in (w8_off, w8_pad):
+            with pytest.raises(TypeError):
+                launch(fake8, w, p8)
+        with pytest.raises(TypeError):  # the contract spelling passes every fp4 check too
+            launch(fake4, w4, p4)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def _bitwise_report(outs_a: dict, outs_b: dict) -> tuple:
+    """Per-output equality of two fused-fork result sets, with the DISTANCE where they differ (e4m3 ulps for the codes,
+    bf16 ulps for the gate, exponent steps for the SF bytes) -- the number a non-bitwise datapath is REPORTED with."""
+    report, equal = {}, True
+    for key in ("q8", "k8", "v8", "gate16", "sf_q", "sf_k", "sf_v"):
+        a, b = outs_a[key], outs_b[key]
+        if key in ("q8", "k8", "v8"):
+            same = torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+            af, bf = a.float(), b.float()
+            dist = 0.0 if same else ((af - bf).abs() / _e4m3_ulp(torch.maximum(af.abs(), bf.abs()))).max().item()
+            report[key] = dict(equal=same, n_off=int((a.view(torch.uint8) != b.view(torch.uint8)).sum().item()), max_e4m3_ulps=dist)
+        elif key == "gate16":
+            same = torch.equal(a, b)
+            af, bf = a.float(), b.float()
+            dist = 0.0 if same else ((af - bf).abs() / bf16_ulp(torch.maximum(af.abs(), bf.abs()))).max().item()
+            report[key] = dict(equal=same, n_off=int((a != b).sum().item()), max_bf16_ulps=dist)
+        else:
+            same = torch.equal(a, b)
+            report[key] = dict(
+                equal=same, n_off=int((a != b).sum().item()), max_exp_steps=0 if same else int((a.to(torch.int32) - b.to(torch.int32)).abs().max().item())
+            )
+        equal = equal and same
+    return equal, report
+
+
+@requires_rubin
+@requires_fp8
+@requires_fp4
+@pytest.mark.parametrize(
+    "batch, seq_len, qk_norm", [(1, 512, True), (1, 512, False), (2, 256, True)], ids=["b1_s512_norm", "b1_s512_rope_only", "b2_s256_norm"]
+)
+def test_fused_mxfp4w_is_bitwise_the_mxfp8_fork_on_shadow_codes(batch, seq_len, qk_norm):
+    """The pin by construction: the e2m1-B arm fed the packed MXFP4 weight and the e4m3 fork fed the SAME values as e4m3
+    SHADOW codes with the SAME blob issue the same block-scale instructions on the same scale bytes over exactly
+    representable products in the same order, and share the epilogue -- so ``q8 / k8 / v8 / sf_q / sf_k / sf_v / gate16``
+    are expected BITWISE.  A single differing byte localizes the B path: the padded TMA format vs the descriptor, the
+    expect-tx (a race) or the instruction descriptor's B format.  A legitimately different datapath would be REPORTED
+    here with its max ulp / exponent-step distance, never absorbed by a tolerance.  Also: no sentinel survivor on either
+    arm (every byte written), and the e2m1 arm's two launches bit-identical (the first-launch race detector)."""
+    g = _FUSED_GEOM
+    p8 = _fused_mx_params(g, qk_norm=qk_norm)
+    p4 = dataclasses.replace(p8, weight_fp4=True)
+    plan8, plan4 = build_fused_proj_gemm(p8), build_fused_proj_gemm(p4)
+    assert plan4.mxfp8 and plan4.params.weight_fp4 and plan4.w_dtype == _FP4 and plan8.w_dtype == _FP8
+    assert plan4.module is not plan8.module, "weight_fp4 is a NEW compile key"
+    m4, m8 = plan4.module, plan8.module
+    assert m4._W4 and not m8._W4 and m4.b_smem_dtype is not m8.b_smem_dtype and m4.sB_packed_elems == m8.sB_packed_elems
+    assert m4.sB_tma_bytes * 2 == m8.sB_tma_bytes == m8.sB_packed_elems, "the e2m1 B halves the TMA payload, not the SMEM footprint"
+    inp4, inp8 = mx_fused_inputs_fp4w(batch, seq_len, g.d_model, p4)
+    outs8 = mx_fused_sentinels(batch, seq_len, p8)
+    mx_launch(plan8, inp8, p8, outs8)
+    outs4 = mx_fused_sentinels(batch, seq_len, p4)
+    mx_launch(plan4, inp4, p4, outs4)
+    for name, o in (("e4m3 fork on shadow codes", outs8), ("e2m1-B arm", outs4)):
+        surv = mx_fused_survivors(o)
+        assert all(v == 0 for v in surv.values()), f"{name}: sentinel survivors (never-written cells / NaN scale bytes): {surv}"
+    equal, report = _bitwise_report(outs4, outs8)
+    print(f"\n[e2m1-B arm vs the e4m3 fork on shadow codes, b={batch} s={seq_len} qk_norm={qk_norm}] bitwise={equal} {report}")
+    assert equal, f"the e2m1-B arm is NOT bitwise the e4m3 fork on the same dequantized operand -- distances (reported, never widened): {report}"
+    outs4b = mx_fused_sentinels(batch, seq_len, p4)
+    mx_launch(plan4, inp4, p4, outs4b)
+    equal2, report2 = _bitwise_report(outs4b, outs4)
+    assert equal2, f"the e2m1-B arm's two launches differ (a first-launch race: expect-tx / descriptor): {report2}"
+
+
+def _check_fused_stage_vs_oracle(p: NormRopeFusionParams, plan, inp: dict, batch: int, seq_len: int, label: str) -> None:
+    """The fused-stage oracle check of ``test_fused_mxfp8_stage_matches_the_mxfp8_oracle``, on the inputs given: sentinels
+    overwritten, Q / K / V under ``compare_mx``, the gate bf16-of-fp32, the tail rule (pad-row SF bytes 0x00) and the
+    two-launch trick on all seven outputs."""
+    g = _FUSED_GEOM
+    ref = mx_fused_oracle(inp, p)
+    outs = mx_fused_sentinels(batch, seq_len, p)
+    mx_launch(plan, inp, p, outs)
+    surv = mx_fused_survivors(outs)
+    assert all(v == 0 for v in surv.values()), f"{label}: sentinel survivors (never-written cells / NaN scale bytes): {surv}"
+    stats = {}
+    for name, axis, heads in (("Q", "row", g.h_q), ("K", "row", g.h_kv), ("V", "col", g.h_kv)):
+        key8, keysf = {"Q": ("q8", "sf_q"), "K": ("k8", "sf_k"), "V": ("v8", "sf_v")}[name]
+        stats[name] = compare_mx(
+            outs[key8], outs[keysf], ref[key8], ref[keysf], axis=axis, batch=batch, heads=heads, seq_len=seq_len, d=g.d_head, label=f"{label} {name}"
+        )
+    check_bf16_of_fp32(outs["gate16"], ref["gate32"], f"{label} GATE")
+    print(
+        f"\n[{label} b={batch} s={seq_len} qk_norm={p.qk_norm}] "
+        + " | ".join(
+            f"{k}: sf_eq {v['sf_bit_equal_frac']:.6f} ({v['n_sf_off']} off) code_eq {v['code_bit_equal_frac']:.7f} ({v['n_code_off']} off, max {v['code_max_ulps']:.1f} ulp) deq_cos {v['deq_cos']:.7f}"
+            for k, v in stats.items()
+        )
+    )
+    if seq_len % 128:
+        for name, axis, heads in (("sf_q", "row", g.h_q), ("sf_k", "row", g.h_kv), ("sf_v", "col", g.h_kv)):
+            offs = tail_sf_bytes(axis, batch=batch, heads=heads, seq_len=seq_len, d=g.d_head)
+            if offs.numel():
+                pad = outs[name].cpu()[offs]
+                assert int(pad.max().item()) == 0, f"{label} {name}: {int((pad != 0).sum())} pad-row SF bytes are not 0x00 (max {int(pad.max())})"
+    outs2 = mx_fused_sentinels(batch, seq_len, p)
+    mx_launch(plan, inp, p, outs2)
+    for k_ in ("q8", "k8", "v8"):
+        assert torch.equal(outs2[k_].view(torch.uint8), outs[k_].view(torch.uint8)), k_
+    for k_ in ("gate16", "sf_q", "sf_k", "sf_v"):
+        assert torch.equal(outs2[k_], outs[k_]), k_
+
+
+@requires_rubin
+@requires_fp8
+@requires_fp4
+@pytest.mark.parametrize(
+    "batch, seq_len, qk_norm",
+    [(1, 1000, True), (1, 1000, False), (1, 900, True), (1, 256, True), (1, 256, False), (2, 256, True), (2, 384, True)],
+    ids=["m1000_norm", "m1000_rope_only", "m900_norm", "m256_norm", "m256_rope_only", "b2_s256_norm", "b2_s384_norm"],
+)
+def test_fused_mxfp4w_stage_matches_the_mxfp8_oracle(batch, seq_len, qk_norm):
+    """``test_fused_mxfp8_stage_matches_the_mxfp8_oracle``'s matrix on the e2m1-B arm: the SAME oracle (the fp32 chain over
+    the dequantized operands, block-quantized once) at the SAME bars -- an MXFP4 weight changes the operand, not the
+    epilogue's numerics.  Tail tiles, the two-sequence decode, the straddling cluster tile and the sentinels as there."""
+    g = _FUSED_GEOM
+    p = _fused_mx_params(g, qk_norm=qk_norm, weight_fp4=True)
+    plan = build_fused_proj_gemm(p)
+    assert plan.mxfp8 and plan.w_dtype == _FP4
+    inp, _ = mx_fused_inputs_fp4w(batch, seq_len, g.d_model, p)
+    _check_fused_stage_vs_oracle(p, plan, inp, batch, seq_len, "e2m1-B arm")
+
+
+@requires_rubin
+@requires_fp8
+@requires_fp4
+@pytest.mark.parametrize(
+    "batch, seq_len", [(1, 128), (1, 384), (3, 128), (2, 384)], ids=["m128_tail_cta", "m384_tail_cta", "b3_s128_tail_cta", "b2_s384_no_tail_cta"]
+)
+def test_fused_mxfp4w_fully_tail_cta_stores_no_scale_factor_bytes(batch, seq_len):
+    """``test_fused_mxfp8_fully_tail_cta_stores_no_scale_factor_bytes`` on the e2m1-B arm: the fully-tail CTA's gated SF stores
+    are an M-axis fact and B-independent -- no guard byte past any blob may change, every blob matches the oracle."""
+    g = _FUSED_GEOM
+    p = _fused_mx_params(g, weight_fp4=True)
+    plan = build_fused_proj_gemm(p)
+    m = batch * seq_len
+    fully_tail_cta = (m % 256) != 0 and (m % 256) <= 128
+    assert fully_tail_cta == ((batch, seq_len) != (2, 384)), "the case list's fully-tail-CTA classification"
+    inp, _ = mx_fused_inputs_fp4w(batch, seq_len, g.d_model, p)
+    ref = mx_fused_oracle(inp, p)
+    outs = mx_fused_sentinels(batch, seq_len, p)
+    guard = 64 * 1024
+    guarded = {}
+    for name, heads in (("sf_q", g.h_q), ("sf_k", g.h_kv), ("sf_v", g.h_kv)):
+        need = sf_bytes(batch, heads, seq_len, g.d_head)
+        big = torch.full((need + guard,), 0xAA, dtype=torch.uint8, device="cuda")
+        big[:need] = _E8M0_NAN_BYTE
+        outs[name] = big[:need]
+        guarded[name] = big
+    mx_launch(plan, inp, p, outs)
+    surv = mx_fused_survivors(outs)
+    assert all(v == 0 for v in surv.values()), f"sentinel survivors (never-written cells / NaN scale bytes): {surv}"
+    touched = {}
+    for name in ("sf_q", "sf_k", "sf_v"):
+        tail = guarded[name][outs[name].numel() :]
+        hit = tail != 0xAA
+        touched[name] = int(hit.sum().item())
+        assert touched[name] == 0, f"{name}: {touched[name]} guard bytes PAST the blob were written (values {torch.unique(tail[hit]).tolist()})"
+    stats = {}
+    for name, axis, heads in (("Q", "row", g.h_q), ("K", "row", g.h_kv), ("V", "col", g.h_kv)):
+        key8, keysf = {"Q": ("q8", "sf_q"), "K": ("k8", "sf_k"), "V": ("v8", "sf_v")}[name]
+        stats[name] = compare_mx(outs[key8], outs[keysf], ref[key8], ref[keysf], axis=axis, batch=batch, heads=heads, seq_len=seq_len, d=g.d_head, label=name)
+    print(
+        f"\n[e2m1-B arm b={batch} s={seq_len} m={m} fully_tail_cta={fully_tail_cta}] guard bytes touched {touched} | "
+        + " | ".join(f"{k}: sf_eq {v['sf_bit_equal_frac']:.6f} ({v['n_sf_off']} off) code_eq {v['code_bit_equal_frac']:.7f}" for k, v in stats.items())
+    )
+
+
+@requires_rubin
+@requires_fp8
+@requires_fp4
+def test_fused_mxfp4w_matches_the_unfused_mixed_gemm_plus_quantizer():
+    """The e2m1-B arm against the two kernels it replaces on the unfused MXFP4-weight pipeline: ``build_proj_gemm(block_scale=True,
+    w_dtype=float4_e2m1fn_x2)`` (the catalog's MIXED row, the GPU's preferred K width) on the same codes / blobs, [norm +] RoPE
+    on the bf16 slab, then ``quantize_mxfp8``.  Not bit-identical by construction (the unfused chain rounds to bf16 first), so
+    the pins are the SF byte ORDER (>= 99 % of bytes equal) and the dequantized cosine, as for the e4m3 twin."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope import compile_qk_norm_rope, run_qk_norm_rope
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import compile_quantize_mxfp8, run_quantize_mxfp8
+
+    g = _FUSED_GEOM
+    p = _fused_mx_params(g, weight_fp4=True)
+    batch, seq_len = 1, 512
+    m, k, n = batch * seq_len, g.d_model, p.n_qkvg
+    inp, _ = mx_fused_inputs_fp4w(batch, seq_len, k, p, seed=3)
+    plan = build_fused_proj_gemm(p)
+    outs = mx_fused_sentinels(batch, seq_len, p)
+    mx_launch(plan, inp, p, outs)
+    gplan = build_proj_gemm(m=m, k=k, n=n, dtype=_FP8, label="qkv_gate_proj_mx4", block_scale=True, w_dtype=_FP4)
+    assert gplan.w_dtype == _FP4
+    slab = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    ws = torch.empty(gplan.workspace_bytes, dtype=torch.uint8, device="cuda")
+    run_proj_gemm(gplan, inp["a8"], inp["w8"], slab, ws, sf_a=inp["sf_a"], sf_w=inp["sf_w"])
+    torch.cuda.synchronize()
+    o_q, o_g, o_k, o_v = p.offsets
+    stream = torch.cuda.current_stream().cuda_stream
+    d = g.d_head
+    q_src = slab[:, o_q : o_q + g.h_q * d].view(m, g.h_q, d)
+    k_src = slab[:, o_k : o_k + g.h_kv * d].view(m, g.h_kv, d)
+    v_src = slab[:, o_v : o_v + g.h_kv * d].view(m, g.h_kv, d)
+    nr = compile_qk_norm_rope(dtype=torch.bfloat16, h_q=g.h_q, h_kv=g.h_kv, d=d, rope_dim=g.rope_dim, eps=g.qk_norm_eps, want_rstd=False)
+    run_qk_norm_rope(nr, q_src, k_src, q_src, k_src, inp["wq"], inp["wk"], inp["cos"], inp["sin"], stream=stream)
+    q8u = torch.empty(m, g.h_q, d, dtype=_FP8, device="cuda")
+    k8u = torch.empty(m, g.h_kv, d, dtype=_FP8, device="cuda")
+    v8u = torch.empty(m, g.h_kv, d, dtype=_FP8, device="cuda")
+    sfqu = torch.empty(sf_bytes(batch, g.h_q, seq_len, d), dtype=torch.uint8, device="cuda")
+    sfku = torch.empty(sf_bytes(batch, g.h_kv, seq_len, d), dtype=torch.uint8, device="cuda")
+    sfvu = torch.empty(sf_bytes(batch, g.h_kv, seq_len, d), dtype=torch.uint8, device="cuda")
+    rq = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=g.h_q, d=d, axis="row")
+    rk = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=g.h_kv, d=d, axis="row")
+    rv = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=g.h_kv, d=d, axis="col")
+    run_quantize_mxfp8(rq, q_src, q8u, sfqu, batch=batch, seq_len=seq_len, stream=stream)
+    run_quantize_mxfp8(rk, k_src, k8u, sfku, batch=batch, seq_len=seq_len, stream=stream)
+    run_quantize_mxfp8(rv, v_src, v8u, sfvu, batch=batch, seq_len=seq_len, stream=stream)
+    torch.cuda.synchronize()
+    mq = mxfp8_quant()
+    n_tiles = n_sf_tiles(seq_len)
+    s_pad = n_tiles * 128
+    for name, got8, got_sf, ref8, ref_sf, axis, heads in (
+        ("Q", outs["q8"], outs["sf_q"], q8u.view(m, -1), sfqu, "row", g.h_q),
+        ("K", outs["k8"], outs["sf_k"], k8u.view(m, -1), sfku, "row", g.h_kv),
+        ("V", outs["v8"], outs["sf_v"], v8u.view(m, -1), sfvu, "col", g.h_kv),
+    ):
+        sf_eq = (got_sf == ref_sf).float().mean().item()
+        assert sf_eq > 0.99, f"{name}: fused vs unfused SF blobs agree on only {100 * sf_eq:.2f}% of bytes -- a byte-ORDER mismatch, not rounding"
+        if axis == "row":
+            sc = (
+                lambda e: mq.e8m0_to_float(unswizzle_128x4(e, batch * heads * s_pad, d // _BLOCK))
+                .reshape(batch, heads, s_pad, d // _BLOCK)[:, :, :seq_len]
+                .repeat_interleave(_BLOCK, 3)
+                .permute(0, 2, 1, 3)
+                .reshape(m, heads * d)
+            )  # noqa: E731
+        else:
+            sc = (
+                lambda e: mq.e8m0_to_float(unswizzle_128x4(e, d, batch * heads * s_pad // _BLOCK))
+                .reshape(d, batch, heads, s_pad // _BLOCK)
+                .permute(1, 2, 3, 0)
+                .repeat_interleave(_BLOCK, 2)[:, :, :seq_len]
+                .permute(0, 2, 1, 3)
+                .reshape(m, heads * d)
+            )  # noqa: E731
+        deq_f, deq_u = got8.float() * sc(got_sf), ref8.float() * sc(ref_sf)
+        cos_fu = torch.nn.functional.cosine_similarity(deq_f.flatten(), deq_u.flatten(), dim=0).item()
+        print(f"\n[e2m1-B arm fused vs unfused mixed GEMM + quantizer] {name}: sf bytes equal {100 * sf_eq:.3f}%  dequantized cos {cos_fu:.6f}")
+        assert cos_fu > 0.999, f"{name}: fused vs unfused dequantized cos {cos_fu}"
+    check_bf16_of_fp32(outs["gate16"], slab[:, o_g : o_g + g.h_q * d].float(), "GATE vs the unfused bf16 slab")
