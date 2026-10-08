@@ -134,11 +134,14 @@ CONTIG = [
     _case("BN", BN, (8, 128, 14, 14), smoke=True),
     _case("IN", IN, (8, 128, 14, 14)),
     _case("GN g=32", GN, (8, 128, 14, 14), groups=32),
-    # Too few (sample, group) rows to fill the machine: the rowwise kernel is one CTA
-    # per row, so these put 4-16 CTAs on 148 SMs and measured 0.01-0.02 of achievable.
-    # They must take the cluster split instead, which reduces through DSMEM.
-    _case("GN few rows", GN, (2, 256, 56, 56), groups=2, want_fwd="groupnorm_cga_sm100"),
-    _case("IN few rows", IN, (2, 8, 112, 112), want_fwd="groupnorm_cga_sm100"),
+    # Too few (sample, group) rows to fill the machine. The forward was one CTA per
+    # row (4-16 CTAs on 148 SMs, 0.01-0.02 of achievable); the backward was worse --
+    # groupnorm_fast declines on these and the fallback was the original
+    # one-atomic-per-element kernel at 0.00. Both must take the cluster split.
+    _case("GN few rows", GN, (2, 256, 56, 56), groups=2,
+          want_fwd="groupnorm_cga_sm100", want_bwd="groupnorm_cga_sm100"),
+    _case("IN few rows", IN, (2, 8, 112, 112),
+          want_fwd="groupnorm_cga_sm100", want_bwd="groupnorm_cga_sm100"),
 ]
 
 # Channels-last: the three layout-sensitive variants. The GroupNorm entries are picked
