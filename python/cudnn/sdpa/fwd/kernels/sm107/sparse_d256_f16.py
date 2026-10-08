@@ -1041,9 +1041,11 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
 
 # The hot max / min sites of the softmax body are spelled ``ftz=True`` so they lower to FMNMX (fused FMNMX3 in the dependent
 # chains); the bare ``cute.math.max`` default is ``arith.maxnumf`` = a compare + select pair per op (FSETP + FSEL), which was
-# 54 % of the executed softmax instructions on this body's decode twin.  Flushing denormal OPERANDS changes no result: the
-# column max of finite fp32 scores and the clamp ``min(ms_old - ms_new, 0)`` are the same number either way (a score below
-# 2^-126 in magnitude would read as 0 -- its exp2 is 1.0 under both spellings).  MEASURED against the compare-select
+# 54 % of the executed softmax instructions on this body's decode twin.  Numerics: ``ftz`` flushes sub-normal OPERANDS, so the
+# two spellings can differ only where a column max is itself an fp32 sub-normal (|s| < 2^-126) or a signed zero -- O is
+# unchanged there (the exp2 of a flushed sub-normal is 1.0 either way) and LSE moves by at most that sub-normal (<= 1.2e-38,
+# and only with a single live key -- with more, ``m + log(l)`` rounds it away); no measured cell reached it, and O / LSE were
+# BITWISE identical on every one (0 mismatching elements).  MEASURED against the compare-select
 # spelling on a Rubin perf node (212 SMs, 2376 MHz lock, A/B/A x 3 rounds, control pairs <= 0.03 %): +13.4 / +13.4 / +13.5 %
 # at S = 8K / 32K / 128K on recorded layer lists (3369 -> 2971, 3301 -> 2910, 3288 -> 2896 clk per K + V tile pair), the
 # per-tile body -9.9 % (2894 -> 2607 clk steady state), the per-item fixed cost -21 %; O and LSE bitwise identical.
