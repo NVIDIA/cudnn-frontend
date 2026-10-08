@@ -99,6 +99,10 @@ from typing import NamedTuple
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d192_mxfp8
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d192_d128_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/prefill_d128_mxfp8 and sm107/prefill_d256_mxfp8)"
+    )
 CFG, _TMA = make_cfg_d192_mxfp8(PARAMS)
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
