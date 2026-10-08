@@ -2477,7 +2477,8 @@ def _bs_dq_arm(monkeypatch, single, *, hq, hkv, s, causal=False, check=True):
     (the oracle on the arm unless ``check=False``), and what the plan did: the adapter (captured off the row's inherited ``compile``),
     its dQ record's ``b_head_group`` and head chunking, the host trace's ``_dq_launches`` calls (the compiled-plan cache is switched
     off for the arm so the host traces in-process -- a cache HIT would skip the trace the spy watches; the chunk loop is one
-    ``scf.for`` body, so the spy sees the arithmetic once per trace, not once per launch), and the RUNTIME kernel launches of one
+    ``scf.for`` body, so the spy sees the arithmetic once per trace, not once per launch -- the compiled-plan cache AND its in-process
+    memo are switched off for the arm, so every build traces), and the RUNTIME kernel launches of one
     execute from a CUDA-graph capture (the d512 suite's ``_captured_kernel_launches``: every launch a node, nothing runs)."""
     from test_sdpa_bwd_d512_sm107 import _captured_kernel_launches
 
@@ -2486,6 +2487,11 @@ def _bs_dq_arm(monkeypatch, single, *, hq, hkv, s, causal=False, check=True):
 
     monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", single)
     monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    # the host-trace spy below needs a TRACE: the in-process memo in front of the compiled-plan cache hands a plan whose
+    # (device, key, symbol, options) this process already built the first build's object WITHOUT re-tracing the host body, and
+    # `_dq_launches` is called inside that trace -- the arm's cell is the suite's default shape, so an earlier test's plan would
+    # serve it and the spy would see nothing (0 calls, not the 1 per trace this pin asserts)
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
     apis, dq_calls = [], []
     original_compile = sm107.SdpaBwdDslSm107.compile
 
