@@ -119,6 +119,17 @@ def norm_bprop(
         if variant in (NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM) and groupnorm_fast_sm100.eligible(spec, DTYPE_BYTES[io]):
             dx, dgamma, dbeta = groupnorm_fast_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
             return dx.reshape(x.shape), dgamma, dbeta
+        # LN/RMS with a long row: split it across a CGA and reduce c1/c2 through
+        # distributed shared memory, exactly as the forward does. Only past the
+        # measured crossover -- the pipelined kernel below is better for short rows.
+        if variant in (NormVariant.LAYER_NORM, NormVariant.RMS_NORM):
+            from .kernels import layernorm_cga_sm100
+
+            if layernorm_cga_sm100.should_use(spec.M, spec.R, DTYPE_BYTES[io]):
+                dx, dgamma, dbeta = layernorm_cga_sm100.backward(
+                    spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params
+                )
+                return dx.reshape(x.shape), dgamma, dbeta
         dx, dgamma, dbeta = _ROWWISE_KERNEL[variant].backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
         return dx.reshape(x.shape), dgamma, dbeta
 
