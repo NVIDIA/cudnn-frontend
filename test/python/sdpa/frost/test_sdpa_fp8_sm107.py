@@ -484,6 +484,39 @@ def _fp8_facts(**kw):
     return ga.SdpaGraphFacts(**base)
 
 
+def test_sm107_mxfp8_thd_shapes_match_the_row():
+    """The Rubin MXFP8 row's THD shape set is ONE object with the standalone adapter's Rubin THD gate and
+    the config constant (rule 8b'), the config's flavor-name twin spells the same shapes, and mismatch()
+    ADMITS a THD graph exactly at those shapes while DECLINING every other native MXFP8 shape with the
+    typed thd_d_shapes text -- iterating the row's own d_shapes rather than naming a literal, so a
+    widening of either side alone is caught (the FP8 envelope-floor pin's lesson)."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import _SM107_MXFP8_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import _MXFP8_THD_FLAVORS, SM107_MXFP8_THD_SHAPES
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    rubin = caps[engines.engine_name(arch="sm107", mxfp8=True)]
+    assert rubin.thd and rubin.cu_seq_len and rubin.thd_padded_stats
+    assert rubin.thd_d_shapes is SM107_MXFP8_THD_SHAPES
+    assert _SM107_MXFP8_THD_SHAPES is SM107_MXFP8_THD_SHAPES
+    assert SM107_MXFP8_THD_SHAPES <= rubin.d_shapes
+    # The config's flavor-name twin (what _validate_params declines by) names exactly the same shapes.
+    assert {f"sm107 d{dq}{'' if dq == dv else f'xd{dv}'} mxfp8" for dq, dv in SM107_MXFP8_THD_SHAPES} == _MXFP8_THD_FLAVORS
+    # Dense stays served everywhere; THD is admitted exactly at the served shapes and declined, typed, elsewhere.
+    for dq, dv in sorted(rubin.d_shapes):
+        dense = _fp8_facts(is_fp8=False, is_mxfp8=True, dtype=cudnn.data_type.FP8_E4M3, device_cc=(10, 7), d_qk=dq, d_v=dv)
+        assert engines.mismatch(rubin, dense) is None, (dq, dv, engines.mismatch(rubin, dense))
+        thd = _fp8_facts(is_fp8=False, is_mxfp8=True, dtype=cudnn.data_type.FP8_E4M3, device_cc=(10, 7), d_qk=dq, d_v=dv, thd=True)
+        verdict = engines.mismatch(rubin, thd)
+        if (dq, dv) in SM107_MXFP8_THD_SHAPES:
+            assert verdict is None, (dq, dv, verdict)
+        else:
+            assert verdict is not None and "THD (ragged) rides the packed native-tile leg" in verdict, (dq, dv, verdict)
+    # The SM100 row is untouched: THD on all four of its d >= 128 flavors.
+    assert caps[engines.engine_name(mxfp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+
 def test_fp8_envelope_mismatch_rules():
     """Honest eligibility for the fp8 envelope: mismatch() admits dense d80 on
     the d128 rows of both arch lines, enforces d % 16, and keeps THD

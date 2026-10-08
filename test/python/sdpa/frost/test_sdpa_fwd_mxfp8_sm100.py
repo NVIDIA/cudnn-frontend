@@ -34,6 +34,7 @@ import torch
 
 from test_utils import torch_fork_set_rng
 
+from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
 from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, run_sass_probe, sass_probe_source
 
@@ -57,15 +58,36 @@ _ARCH = "sm107" if _SM == 107 else "sm100"
 # Rubin.  It runs at cga2 there and only cga2 -- at cga1 that flavor's four
 # scale-factor tiles start past the 256 KiB version-0 tcgen05 descriptor window
 # -- which the row expresses by leaving (192, 128) on its default cgas={2}, so
-# nothing here needs to say so.  THD is still declined row-wide.
-# THD/varlen is not ported to the Rubin MXFP8 kernels: the setup-kernel call
-# site still speaks the pre-upstream 7-arg contract against a 14-arg helper and
-# the metadata layout differs (3B+2 vs 4B+4), so compile() raises and the row
-# declares thd=False.  Flip to False when the THD port lands.
-_skip_thd_mxfp8_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="THD/varlen not ported to the Rubin MXFP8 kernels (row sets thd=False)",
-)
+# nothing here needs to say so.
+# THD/varlen on the Rubin MXFP8 line is PER SHAPE: the d256 body rides the FROST
+# THD contract with the packed per-sequence-tile-padded scale factors (2026-10-08),
+# the d128 / d192xd128 / d512 bodies still speak the pre-upstream 7-arg setup
+# contract against the 14-arg helper (3B+2 vs 4B+4 metadata), so the row declines
+# them through thd_d_shapes.  The skip reads the row's ONE constant
+# (config_sm107.SM107_MXFP8_THD_SHAPES, rule 8b') so widening the row widens the
+# suite's acceptance sweep with it -- flipping a shape in is a kernel port, never
+# an edit here.
+
+
+def _thd_mxfp8_rubin_skip(d_qk, d_v=None):
+    """Rubin skip for a THD MXFP8 cell at (d_qk, d_v): only the shapes the row's thd_d_shapes leave out."""
+    shape = (d_qk, d_qk if d_v is None else d_v)
+    return pytest.mark.skipif(
+        _SM == 107 and shape not in SM107_MXFP8_THD_SHAPES,
+        reason=f"THD/varlen on the Rubin MXFP8 line serves {sorted(SM107_MXFP8_THD_SHAPES)} only (row thd_d_shapes); {shape} keeps the pre-upstream arm",
+    )
+
+
+_skip_thd_mxfp8_d128_on_rubin = _thd_mxfp8_rubin_skip(128)
+_skip_thd_mxfp8_d192_on_rubin = _thd_mxfp8_rubin_skip(192, 128)
+# The per-d THD cells: one pytest.param per flavor, each carrying its own Rubin skip.
+_D_THD = [pytest.param(d, marks=_thd_mxfp8_rubin_skip(d), id=f"d{d}") for d in (128, 256, 512)]
+_DQK_DV_THD = [
+    pytest.param(dq, dv, marks=_thd_mxfp8_rubin_skip(dq, dv), id=f"d{dq}" if dq == dv else f"d{dq}_d{dv}")
+    for dq, dv in ((128, 128), (192, 128), (256, 256), (512, 512))
+]
+# A finite fp16 sentinel far above any attention output: a cell still holding it was never written.
+_O_SENTINEL = 60000.0
 pytestmark = [requires_blackwell, requires_dsl]
 
 
@@ -1562,9 +1584,16 @@ def _run_thd(
     declare_totals=False,
     d_qk=128,
     d_v=128,
+    sf_slack_tiles=0,
+    o_fill=0.0,
 ):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
-    (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF."""
+    (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF.
+
+    ``sf_slack_tiles`` appends that many ZERO-filled SF tiles per head to each packed SF
+    buffer (the capacity a packed producer hands the row: n_cap >= Σ_b ceil(s_b/128)); the
+    engine derives the tile extent from the byte size, so the live tiles are unchanged.
+    ``o_fill`` pre-fills the O storage (a sentinel exposes rows the kernel never wrote)."""
     import cudnn
 
     dev = "cuda"
@@ -1616,6 +1645,13 @@ def _run_thd(
     sfq_pk = torch.cat(sfq_seqs, dim=1).contiguous()
     sfk_pk = torch.cat(sfk_seqs, dim=1).contiguous()
     sfv_pk = torch.cat(sfv_seqs, dim=1).contiguous()
+    if sf_slack_tiles:
+        # Slack capacity past the live packed total, zero-filled (E8M0 0x00): the kernel's SF
+        # coordinates stay below cu_sf[B], K and V keep equal tile counts (the binder's rule).
+        def _slack(sf):
+            return torch.cat([sf, torch.zeros((sf.shape[0], sf_slack_tiles, sf.shape[2]), dtype=sf.dtype, device=sf.device)], dim=1).contiguous()
+
+        sfq_pk, sfk_pk, sfv_pk = _slack(sfq_pk), _slack(sfk_pk), _slack(sfv_pk)
 
     def _dense_buf(packed, s_max, h, d, dt):
         # Dense-capacity storage; packed tokens in the leading elements (THD
@@ -1633,7 +1669,7 @@ def _run_thd(
     _, k_gpu, stride_k = _dense_buf(k_pk, S_max_kv, H_kv, d_qk, k_pk.dtype)
     _, v_gpu, stride_v = _dense_buf(v_pk, S_max_kv, H_kv, d_v, v_pk.dtype)
     stride_o = (S_max_q * H_q * d_v, d_v, H_q * d_v, 1)
-    o_stor = torch.zeros(B * S_max_q * H_q * d_v, device=dev, dtype=out_dt)
+    o_stor = torch.full((B * S_max_q * H_q * d_v,), o_fill, device=dev, dtype=out_dt)
     o_gpu = o_stor.as_strided((B, H_q, S_max_q, d_v), stride_o)
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
@@ -1767,7 +1803,7 @@ def _run_thd(
     return o_out, o_ref, amax, lse_out
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d128_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_declared_totals():
@@ -1792,7 +1828,7 @@ def test_mxfp8_thd_declared_totals():
     assert torch.equal(o_dec, o_inf), "declaring the packed totals must not change O"
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d128_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
@@ -1805,9 +1841,8 @@ def test_mxfp8_thd(in_key, causal):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
+@pytest.mark.parametrize("d_qk,d_v", _DQK_DV_THD)
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
@@ -1826,13 +1861,14 @@ def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_d256_thd(in_key, causal):
-    """D256 MXFP8 THD uses packed per-sequence SF tiles."""
+    """D256 MXFP8 THD uses packed per-sequence SF tiles.  [160, 96]: a 2-tile sequence, so the second
+    KV tile reads its V scale factors one PACKED (plane-adjacent) slab past the first -- the cell that
+    exposes a plane / tile stride mix-up (LSE exact, O wrong from the second KV tile) on either arch."""
     scale = 1.0 / math.sqrt(256)
     o_out, o_ref, amax, _ = _run_thd(
         [160, 96],
@@ -1850,9 +1886,49 @@ def test_mxfp8_d256_thd(in_key, causal):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("causal", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_sf_slack_capacity(causal):
+    """D256 MXFP8 THD with SF buffers that carry SLACK tiles past the live packed total -- the layout a
+    packed producer hands the row (n_cap >= Σ_b ceil(s_b/128) zero-filled tiles per head) where this
+    suite otherwise binds the EXACT packed layout.  The engine derives the tile extent from the byte
+    size and every kernel SF coordinate stays below cu_sf[B], so O and Amax_O are BITWISE the
+    exact-buffer run (same seed, same draws)."""
+    scale = 1.0 / math.sqrt(256)
+    lens = [160, 96, 300]
+
+    def _run(slack):
+        torch.manual_seed(0)  # each call draws its own inputs -- pin them so the two runs are comparable
+        return _run_thd(lens, lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=causal, d_qk=256, d_v=256, sf_slack_tiles=slack)
+
+    o_exact, o_ref, amax_exact, _ = _run(0)
+    o_slack, _, amax_slack, _ = _run(len(lens))
+    _check(o_exact, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert torch.equal(o_slack, o_exact), "SF slack capacity past the packed total must not change O"
+    assert torch.equal(amax_slack, amax_exact)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_trailing_empty_sequence(causal):
+    """A zero-length sequence LAST ([300, 200, 0]; the existing zero-length cell puts it first or in the
+    middle): cu_sf[B] == cu_sf[B-1], so the slack begins right after the last live tile and the dead-unit
+    path runs with nothing behind it.  O is sentinel-filled before the launch: every live row must be
+    written (no sentinel survives) and match the per-sequence reference, and the NaN-poisoned capacity
+    tail of the inputs must not leak through the clamped K/V maps."""
+    scale = 1.0 / math.sqrt(256)
+    lens = [300, 200, 0]
+    o_out, o_ref, amax, _ = _run_thd(lens, lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=causal, d_qk=256, d_v=256, o_fill=_O_SENTINEL)
+    assert torch.isfinite(o_out.float()).all()
+    assert (o_out.float().abs() < _O_SENTINEL / 2).all(), "a live O row was never written (the sentinel survived)"
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", _D_THD)
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("bottom_right", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1881,9 +1957,8 @@ def test_mxfp8_thd_sliding_window(d, in_key, bottom_right):
     assert lse is not None and torch.isfinite(lse).all()
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cross_gqa(d):
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
@@ -1892,9 +1967,8 @@ def test_mxfp8_thd_cross_gqa(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_sink(d):
     """THD causal + attention sink."""
@@ -1904,9 +1978,8 @@ def test_mxfp8_thd_sink(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_stats(d):
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
@@ -1916,9 +1989,8 @@ def test_mxfp8_thd_stats(d):
     assert lse is not None and torch.isfinite(lse).all()
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_zero_len_kv(d):
     """Zero-length Q and KV sequences (test_mhas_v2 ragged parity): the
@@ -1929,9 +2001,8 @@ def test_mxfp8_thd_zero_len_kv(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
@@ -1951,7 +2022,7 @@ def test_mxfp8_thd_cu_seq_len(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d192_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -1977,7 +2048,7 @@ def test_mxfp8_d192_d128_thd_cross_gqa_stats(in_key):
     assert lse is not None and torch.isfinite(lse).all()
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d192_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", ["causal_br", "swa"])
@@ -2005,9 +2076,8 @@ def test_mxfp8_d192_d128_thd_mask_variants(in_key, mask):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk", [128, 192])
+@pytest.mark.parametrize("d_qk", [pytest.param(128, marks=_thd_mxfp8_rubin_skip(128, 128)), pytest.param(192, marks=_thd_mxfp8_rubin_skip(192, 128))])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_nonfinite_v_sf_padding(d_qk, in_key, monkeypatch):
@@ -2518,7 +2588,7 @@ class TestStagedMxfp8:
     test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d128_on_rubin
 @pytest.mark.L1
 @pytest.mark.parametrize("batch", [33, 129])
 @pytest.mark.parametrize("cu_lens", [False, True])
