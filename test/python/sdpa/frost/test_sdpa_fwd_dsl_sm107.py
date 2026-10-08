@@ -2116,7 +2116,12 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
     Both quantized families use prepared pointer hosts with runtime gate strides.
     Their internal tensor host signatures remain append-only: ``gate_tensor``
-    immediately follows ``stream``; prepared flags may follow."""
+    immediately follows ``stream``; prepared flags may follow.  Ahead of ``stream``
+    the slot ORDER is the pointer host's ABI: ``_mxfp8_host._launch`` passes
+    everything up to ``seq_q_lens_addr`` positionally and, under ``thd_slots``,
+    the three THD length slots right after it (``stream=`` and the flags go by
+    keyword), so those slots are pinned by position on both Rubin d256
+    quantized kernels and on the SM100 MXFP8 twin the same host drives."""
     import inspect
 
     f16, fp8, mxfp8 = _all_gate_kernel_modules()
@@ -2147,10 +2152,21 @@ def test_sm107_gate_kernel_signatures_are_append_only():
         assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
     for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
-    # The MXFP8 kernel's SF totals stay keyword-only-in-effect AFTER seq_q_lens_addr and BEFORE stream;
-    # gate_tensor is the one parameter after stream.
+    # The THD length slots sit RIGHT AFTER seq_q_lens_addr and BEFORE stream: the positional tail the shared
+    # pointer hosts pass (_fp8_host._launch always, _mxfp8_host._launch under thd_slots), so a parameter inserted
+    # ahead of them would swallow the THD lengths.  The MXFP8 kernel reads its SF tile extents off the bound SF
+    # tensors -- the total_*_sf_tiles host parameters its pre-upstream THD arm kept in exactly these slots are
+    # gone (no caller ever passed them; the pointer hosts are the only callers).
+    thd_slots = ["thd_q_lens_tensor", "thd_kv_lens_tensor", "thd_lens_form"]
+    for mod in (fp8, mxfp8):
+        host = list(inspect.signature(mod._host).parameters)
+        at = host.index("seq_q_lens_addr")
+        assert host[at + 1 : at + 4] == thd_slots and host.index("thd_lens_form") < host.index("stream"), (mod.__name__, host[at:])
     mx_host = list(inspect.signature(mxfp8._host).parameters)
-    assert mx_host.index("seq_q_lens_addr") < mx_host.index("total_q_sf_tiles") < mx_host.index("total_kv_sf_tiles") < mx_host.index("stream"), mx_host
+    assert not {"total_q_sf_tiles", "total_kv_sf_tiles"} & set(mx_host), mx_host
+    sm100_mx_host = list(inspect.signature(_load(_D256, rubin=False, **_MXFP8_LOAD_KW)._host).parameters)
+    at = sm100_mx_host.index("seq_q_lens_addr")
+    assert sm100_mx_host[at + 1 : at + 4] == thd_slots, sm100_mx_host[at:]
 
     # Ungated f16: the gate slot is folded out (the fake is None iff CFG.EPILOGUE_GATE == 0).
     off = _load(_D256, rubin=True)
