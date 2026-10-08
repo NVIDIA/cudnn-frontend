@@ -4092,16 +4092,19 @@ def _p3_dense_cfg(*, b, h_q, h_kv, s_q, s_kv, d=128, dtype=torch.bfloat16, causa
 @_cc107_sweep(192, 10731)
 @pytest.mark.L0
 def test_sdpa_fwd_cc107_d128_decode_tile_L0(env_info, test_no, request, cudnn_handle):
-    """The default walk's TILE-FIT CONTRACT on the cc 10.7 half row (issue #1472): a dense d128 (the d64 envelope
+    """The default walk over the decode-tile band of the cc 10.7 half row (issue #1472): a dense d128 (the d64 envelope
     included) half graph whose live rows per packed head fit one 128-row tile -- S_q * pack_g <= 128, every draw here --
-    is served on the shared decode tile (TILE_CGA_M=1, template decode_d128_f16: the SM100 precedent of
-    _exec_sdpa_on_frost(cga=1)), while a FLOAT+fold case (the pre-folded scale is an arm of the Rubin prefill body only)
-    keeps the cga2 prefill tile unpacked with the fold arm compiled.  Decode / MTP draw: batches up to 128, S_q 1..8, GQA
-    groups that divide the tile, MHA, and 96/8 (12 does not divide 128: unpacked, still one tile), f16 / bf16, no mask /
+    is SERVED by the row and matches the reference; which admitted plan the walk ranks first (the shared decode tile
+    at TILE_CGA_M=1 today, heuristics._d128_decode_tile_fits) is a tuning choice pinned by the host contract tests
+    (test_sdpa_fwd_heuristics.py::test_sm107_d128_decode_shaped_sets_ride_the_decode_tile), and each body is pinned
+    explicitly by test_sdpa_fwd_cc107_d128_shared_leg_pins_L0 -- neither the route nor the packing is asserted here.
+    A FLOAT+fold draw (the pre-folded scale is an arm of the Rubin prefill body only: engines.effective_cgas keeps it
+    on cga2 and PackGQA is declined there) can only be served unpacked on the cga2 prefill tile with the fold arm
+    compiled -- an admission contract, asserted.  Decode / MTP draw: batches up to 128, S_q 1..8, GQA groups that
+    divide the tile, MHA, and 96/8 (12 does not divide 128: unpacked, still one tile), f16 / bf16, no mask /
     bottom-right causal / left window, padded (every batch carries all its S_q tokens; keyless rows with a sink write
-    O = 0 / LSE = sink) or full, sink 1:1, Stats 1:1.  The packing of the default walk is a ranking choice and is NOT
-    asserted; sink-free small-batch draws also exercise the decode body's dense split + the shared combine on cc 10.7
-    (the split count is not asserted either)."""
+    O = 0 / LSE = sink) or full, sink 1:1, Stats 1:1; sink-free small-batch draws also exercise the decode body's dense
+    split + the shared combine on cc 10.7 (the split count is not asserted either)."""
     engine = _cc107_engine("half")
     _require_frost_sm107(engine)
 
@@ -4143,7 +4146,7 @@ def test_sdpa_fwd_cc107_d128_decode_tile_L0(env_info, test_no, request, cudnn_ha
             _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=2, template="prefill_d128_f16", knobs={"pack_gqa": False})
             assert frost_routing.LAST_ARMS == "f32+fold", frost_routing.LAST_ARMS
         else:
-            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=1, template="decode_d128_f16")
+            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine)
             assert frost_routing.LAST_ARMS == "f32", frost_routing.LAST_ARMS
 
 
