@@ -1041,7 +1041,8 @@ def test_sm107_d128_decode_shaped_sets_ride_the_decode_tile(sm107_metadata_targe
     """S_q * pack_g <= 128 on the cc 10.7 half row (issue #1472): every proposed set runs the shared decode tile (cga1 --
     the tile-fit contract, as test_sdpa_fwd_decode_d128_sm100 pins on the SM100 row), none splits (the sink), a GQA
     graph lists BOTH packings (admission; which leads is the ranking's business), an MHA graph none packed, and a causal
-    graph keeps an LPT runner behind the one-cluster NATURAL lead (equal-work units; both reachable for autotune)."""
+    graph lists NATURAL and LPT both (which leads follows the measured tables,
+    test_sm107_shared_d128_scheduler_follows_the_measured_tables; both reachable for autotune)."""
     facts = _sm107_d128_facts(**over)
     plans = _sm107_f16_plans(facts)
     assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
@@ -1115,6 +1116,50 @@ def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
     plans = _sm107_f16_plans(facts)
     assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
     assert any(p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, first_sched",
+    [
+        (dict(), SCHED_LPT),
+        (dict(b=1, s_q=1, s_kv=32768), SCHED_LPT),
+        (dict(b=32, s_q=16, s_kv=8192), SCHED_LPT),
+        (dict(b=8, s_q=1, s_kv=1024), 0),
+        (dict(b=8, s_q=4, s_kv=4096, d_qk=64, d_v=64, window_left=128), 0),
+        (dict(h_kv=4, s_q=16, s_kv=2048), 0),
+        (dict(b=2, s_q=4096, s_kv=4096, window_left=1024), 0),
+        (dict(b=2, s_q=4096, s_kv=4096, window_left=1024, has_sink=False), 0),
+    ],
+    ids=[
+        "issue_cell_lpt",
+        "long_cache_b1_lpt",
+        "q16_g8_one_tile_lpt",
+        "short_cache_natural",
+        "swa_decode_natural",
+        "packed_cga2_band_natural",
+        "swa_prefill_natural",
+        "swa_prefill_sink_free_natural",
+    ],
+)
+def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_target, over, first_sched):
+    """The scheduler lead of the cc 10.7 shared dense d128 legs (issue #1472's tables, heuristics._SM107_DECODE_TILE_LPT_MIN_KV
+    and the two cc 10.7 arms of _sched_points): the packed decode tile walks plain LPT first from a 2k cache on; a short
+    cache, a sliding window (on the decode tile and on the packed cga2 prefill body alike) and the one-cluster packed cga2
+    band keep NATURAL first.  The other policy is always listed as a runner and every proposed set stays admissible; the
+    SM100 row's one-cluster NATURAL lead on the same decode shape is untouched."""
+    facts = _sm107_d128_facts(**over)
+    plans = _sm107_f16_plans(facts)
+    first = plans[0].knobs
+    assert first.pack_gqa is True, first
+    assert first.sched_policy == first_sched, [p.knobs for p in plans]
+    other = SCHED_LPT if first_sched == 0 else 0
+    assert any(p.knobs.sched_policy == other for p in plans), [p.knobs for p in plans]
+    sm100 = _facts(
+        b=32, h_q=64, h_kv=4, s_q=4, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, causal=True, bottom_right=True, padded=True, has_paged_kv=True, page_size=16
+    )
+    sm100_plans = [p for p in recommend("A", sm100, {_F16: 20500}) if p.engine_id == 20500]
+    assert sm100_plans and sm100_plans[0].knobs.sched_policy in (None, 0), sm100_plans[0].knobs
 
 
 def _decode_d256_facts(**over):
@@ -1341,6 +1386,33 @@ def test_sm107_dense_d128_gqa_packs_under_a_band_at_prefill_depth(sm107_metadata
     assert plans[0].knobs.pack_gqa is packed_first, [p.knobs for p in plans]
     assert {p.knobs.pack_gqa for p in plans} >= {True, False}, [p.knobs for p in plans]
     assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, first",
+    [
+        (dict(s_q=64), (False, 1)),
+        (dict(s_q=128), (False, 1)),
+        (dict(s_q=256), (True, 2)),
+        (dict(b=8, h_kv=4, s_q=128, s_kv=2048), (False, 1)),
+        (dict(s_q=128, causal=True, bottom_right=True), (True, 2)),
+        (dict(b=128, s_q=8, s_kv=2056), (True, 1)),
+    ],
+    ids=["q64_unpacked_tile", "q128_unpacked_tile", "q256_packed_body", "gqa16_q128_unpacked_tile", "banded_q128_packs", "decode_fit_packs"],
+)
+def test_sm107_mask_free_d128_gqa_rides_the_unpacked_decode_tile_where_only_it_fits(sm107_metadata_target, over, first):
+    """Mask-free cc 10.7 dense d128 GQA (the opt-in order; placement keeps the backend first): when one head's rows fit the
+    shared decode tile while the packed unit overflows it (S_q <= 128 < S_q x G) the unpacked decode tile leads, unsplit
+    (measured 32 us against the packed body's 91 / 98 at b2 64/8 q128 KV 4k); past the tile the packed cga2 body keeps the
+    lead, a band packs first (_sm100_banded_gqa_packs) and a packed unit that fits the tile packs first.  The other packing
+    stays listed."""
+    facts = _sm107_d128_facts(**{**dict(b=2, s_kv=4096, causal=False, bottom_right=False, has_sink=False), **over})
+    plans = _sm107_f16_plans(facts)
+    assert (bool(plans[0].knobs.pack_gqa), plans[0].knobs.cga) == first, [p.knobs for p in plans]
+    if first[1] == 1:
+        assert plans[0].knobs.split_kv in (None, 1), plans[0].knobs  # the decode tile's unsplit leg (its split arms measured slower)
+    assert {bool(p.knobs.pack_gqa) for p in plans} == {True, False}, [p.knobs for p in plans]
 
 
 @pytest.mark.L0

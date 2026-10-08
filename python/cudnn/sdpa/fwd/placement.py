@@ -122,7 +122,15 @@ remain opt-in. Qualification and timing evidence are maintained internally.
   KV 1k / 2k / 4k / 8k / 16k), 0.06-0.30 on the 54 multi-token cells of the 90-cell grid (b 32 / 64 /
   128 x 64/8, 64/4, 32/8 x q 1 / 4 / 8 / 16 x KV 2k / 8k; 32/8 at 0.23-0.30) and 0.06-0.21 on the 36
   multi-token cells of the 9.27 twin (b 32 / 128 x 64/8, 64/4 x q 1 / 4 / 8 / 16 x KV 2k / 8k / 16k;
-  the issue's two cells 0.13 and 0.07 on both libraries); the backend declines ``s_q == 1`` with a sink,
+  the issue's two cells 0.13 and 0.07 on both libraries); the review-fix pass over the band's corners (9.26.0.51, 2026-10-08, another lane's functional run sharing the
+  GPU; ratios against the backend's default plan): the head-dim envelope WITHOUT a window -- d64 64/8 at b 8 / 32 /
+  128 x q 1 / 4 / 8 x KV 2k / 4k 0.06-0.11 (an f16 twin 0.09; the mask-free q = 1 cell FROST-only), d96 (b8 64/8 q4
+  KV 4k, b32 64/4 q16 KV 2k, b32 64/8 q8 KV 8k) 0.10-0.22 -- the 32-unit bound at G = 4 (32/8 b4, 16/4 b8, 4/1 b32,
+  8/2 b16; q 4 / 8; KV 1k-8k) 0.26-0.62 and at G = 8 / 16 there (32/4 b8 q8 0.19; 128/8 b4 q = 1 FROST-only), and
+  the band's f16 / Stats / padded twins at its corners (b8 64/4 q16 KV 1k 0.20 / 0.20 / 0.54; b128 64/8 q8 KV 16k
+  0.13 / 0.13; b128 64/8 q8 KV 8k padded 0.13; b32 64/4 q16 KV 4k Stats + padded 0.27; b8 64/8 q4 KV 4k f16 + Stats
+  0.10; b32 32/8 q8 KV 8k f16 0.24; the b32 q = 1 f16 + Stats decode cell FROST-only) -- the three families above are
+  bf16, Stats-free and unpadded, so these cells are the band's only measurements of those attributes; the backend declines ``s_q == 1`` with a sink,
   so the decode arm names the row's own default (8-695 us across the band). Outside the band (sliding
   window: GPT-OSS d64 SWA 0.45-0.68 but only two cells; GQA 2 / 32, MHA, partial groups, caches past
   16k, fewer units) the backend keeps the lead until measured.

@@ -307,12 +307,17 @@ def test_sm107_sink_decode_shard_stays_inside_its_configured_domain(monkeypatch,
     assert placement.place(spec, _facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
     if outside is None:
         # The plain-decode arm of the same band (s_q == 1 without a mask), the 256-row packed head (16 rows x GQA16: the
-        # packed cga2 prefill body rather than the decode tile), f16, the d64 envelope and the 64-unit / 16k-cache corner.
+        # packed cga2 prefill body rather than the decode tile), f16, the d64 and d96 envelopes, the 64-unit / 16k-cache
+        # corner, and the 32-unit bound at G = 4 with other head counts (16/4 b8, 4/1 b32) -- every one a measured cell
+        # (the module docstring's band and its review-fix corner pass).
         assert placement.place(spec, _facts(**dict(values, causal=False, bottom_right=False, s_q=1))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, s_q=16, h_q=64, h_kv=4))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, dtype=cudnn.data_type.HALF))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, d_qk=64, d_v=64))) == placement.LEAD
+        assert placement.place(spec, _facts(**dict(values, d_qk=96, d_v=96))) == placement.LEAD
         assert placement.place(spec, _facts(**dict(values, b=8, s_kv=16384))) == placement.LEAD
+        assert placement.place(spec, _facts(**dict(values, b=8, h_q=16, h_kv=4, s_q=4))) == placement.LEAD
+        assert placement.place(spec, _facts(**dict(values, b=32, h_q=4, h_kv=1, s_q=4, s_kv=1024))) == placement.LEAD
 
 
 @pytest.mark.L0

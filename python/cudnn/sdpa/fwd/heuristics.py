@@ -112,6 +112,16 @@ _SM100_D128_LPT_L2_MIN_BYTES = 8 * 1024 * 1024
 _SM107_CGA_Q_ROWS = 256
 _SM107_MEASURED_SMS = 212
 _SM107_NO_GQA_LPT_MAX_WAVES = 24
+# cc 10.7 half, the shared d128 DECODE tile (sm100/decode_d128_f16.py compiled for sm_107a, issue #1472) carrying a
+# packed GQA group: plain LPT leads NATURAL from a 2k cache on.  MEASURED on a 216-SM cc 10.7 board (cuDNN 9.26.0.51
+# and 9.27.0.28, CUDA-graph replay, kernel time, every plan of the unified list timed round-robin; the dense sink decode /
+# verify tables, bottom-right causal, no window): LPT / NATURAL median 0.989 over 224 (cell, policy) pairs at KV 2k-16k
+# (LPT more than 3 % ahead in 58, NATURAL in 1), 0.944 at 32k (8 pairs; b1 / b4 64/8 q1 / q8: 153 -> 135 us), parity
+# below 2k (26 pairs, median 1.000, 4 past 3 % each way; b8 64/8 q1 KV 1k 9.3 -> 13.1 us) and NATURAL under a sliding
+# window (GPT-OSS d64 SWA128: 1.05-1.16).  Per-cell exceptions exist both ways (b8 32/4 q8 KV 2k: LPT 1.32x slower;
+# b32 32/8 q8 KV 8k f16: 0.80x), so the other policy stays listed as the runner.  The unpacked (MHA) decode tile
+# measured parity (b128 64/8 unpacked 0.997-1.025) and keeps the Rubin no-GQA wave rule.
+_SM107_DECODE_TILE_LPT_MIN_KV = 2048
 
 # The SM80 kernels' L2 grouping budget is a per-flavor MiB table fed to the
 # template (sched_l2_mib); the adapter owns that table. For POINT ORDERING all
@@ -631,6 +641,33 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
         waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / ((facts.device_sm_count or _SM107_MEASURED_SMS) // 2)
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
+    elif causal_ish and rubin_dense_d128_shared_leg(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
+        # The cc 10.7 half row's shared d128 bodies (issue #1472) measured the one-cluster band their own way, so they
+        # take this arm instead of the SM100 rule below.  Decode tile (S_q x PACK_G <= 128), a packed group, no window
+        # and a cache of at least _SM107_DECODE_TILE_LPT_MIN_KV keys: plain LPT first (the measured 1-6 % median lead,
+        # 11 % at 32k).  Everything else in the band keeps NATURAL first: a short cache (parity; the cells past 3 %
+        # favour NATURAL), a sliding window (every unit's walk IS the window: GPT-OSS d64 SWA128 NATURAL 1.05-1.16
+        # ahead), an unpacked unit (parity), and the packed cga2 prefill body one two-CTA cluster wide (128 < S_q x G
+        # <= 512: 30 (cell, policy) pairs, median 1.013, LPT more than 3 % slower on 9 and never ahead; b128 64/4
+        # q16 KV 1k 63 -> 67 us).  The other policy stays listed as the runner for autotune.
+        if (
+            _d128_decode_tile_fits(caps, facts)
+            and _sm100_pack_g(caps, facts) > 1
+            and facts.window_left is None
+            and int(facts.s_kv) >= _SM107_DECODE_TILE_LPT_MIN_KV
+        ):
+            primary = SCHED_LPT
+        else:
+            primary = SCHED_NATURAL
+    elif causal_ish and rubin_dense_d128_shared_leg(caps, facts) and _sm100_pack_g(caps, facts) > 1 and facts.window_left is not None:
+        # Past one cluster, a sliding window on the packed shared prefill body (a GQA group under a band packs first,
+        # _sm100_banded_gqa_packs): every packed unit walks the same window-bounded range, and the heads-fastest LPT
+        # walk scatters the units that share a K/V window over the KV heads, so NATURAL's adjacent-tile order keeps
+        # the window L2-resident -- MEASURED on the cc 10.7 board (216 SMs, cuDNN 9.26.0.51, CUDA-graph replay, kernel
+        # time): b2 64/8 S4096 window 1024 NATURAL 214 us vs LPT 281 (1.31x; with a sink 215 vs 282), b8 64/8 S2048
+        # window 512 373 vs 385, b1 64/8 S8192 window 2048 379 vs 393.  The unpacked Rubin body (the runner) keeps the
+        # L2-budget rule below.
+        primary = SCHED_NATURAL
     elif causal_ish and _d128_f16_flavor(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
         # One Q cluster per (batch, packed head) unit on the SM100 f16 row's
         # d128 flavor -- S_q * PACK_G <= 512: the decode tile's band
@@ -649,10 +686,10 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # every causal graph.  (d256 32/2 packed at cga2 flips sign between
         # S_q=4 and 8 -- LPT_L2 / LPT / NATURAL 65.9 / 63.3 / 62.1 vs 64.8 /
         # 65.0 / 66.6 us -- so that flavor keeps the rule below until it is
-        # measured on its own.)  Also the cc 10.7 half row since issue #1472
-        # (the same tile and the same equal-work argument; NATURAL 1221 us vs
-        # LPT 1232 us at B128 64/8 Q8 KV2056 on the Rubin prefill tile --
-        # parity, the LPT runner stays for autotune).
+        # measured on its own.)  On the cc 10.7 half row the shared d128 legs
+        # take the arms above; its Rubin prefill body (the pre-folded scale)
+        # keeps this rule -- NATURAL 1221 us vs LPT 1232 us at B128 64/8 Q8
+        # KV2056 unpacked at cga2, parity, the LPT runner stays for autotune.
         primary = SCHED_NATURAL
     elif (
         causal_ish
@@ -859,7 +896,9 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
 #     the one rule behind _d128_decode_tile_fits on the graph path and the
 #     standalone adapter's default in api_dsl.SdpaFwdDslSm100.template_params);
 #   * scheduler: NATURAL first while one cga2 cluster covers the unit -- the
-#     decode tile's band and the band above it up to 512 rows (_sched_points);
+#     decode tile's band and the band above it up to 512 rows (_sched_points;
+#     the cc 10.7 shared legs re-measured that band and lead the packed decode
+#     tile with plain LPT from a 2k cache, _SM107_DECODE_TILE_LPT_MIN_KV);
 #   * split: the wave-cost model sees the true CTA count (ctas_per_tile=1 at
 #     cga1), so a small-batch decode splits finer than the cga2 plan did --
 #     b=8 h=64/4 S_q=1 S_kv=4096 paged bf16, B200 kernel time: SPLIT_KV=4 at
@@ -1046,12 +1085,11 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # (the wave rule below prefers cga1: 1024 units), b24 mixed 41 vs 57 us (192 units); 64/4 (GQA16) b128
         # q 4 / 8 129-131 vs 170-172 us, and b24 mixed (96 units: one wave either way) keeps cga2 at 40 vs 42 us.
         # SM100 automatic single-CTA paged prefill selection remains disabled pending separate qualification: the
-        # explicit device guard keeps this preference on cc 10.7 even once the capability helper admits the two-slab
-        # body on SM100 for explicit candidates (an explicit cga=1 pin is honoured there regardless).
+        # device guard on this branch keeps the preference on cc 10.7 while the capability helper admits the two-slab
+        # body on SM100 for explicit candidates (#1493; an explicit cga=1 pin is honoured there regardless).
         rubin_paged = _sm107_paged_half(caps, facts)
         prefer = (
             pack_gqa is not False
-            and facts.device_cc == (10, 7)
             and _prefer_thd_pack_gqa(caps, facts)
             and facts.dtype == cudnn.data_type.BFLOAT16
             and facts.bottom_right
@@ -1301,6 +1339,21 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
         wins = _ceil_div(facts.s_q * g, tile_q) < _ceil_div(facts.s_q, tile_q) * g
     else:
         wins = _pack_gqa_wins(facts, tile_q)
+        if (
+            wins
+            and rubin_dense_d128_shared_leg(caps, facts)
+            and not (facts.causal or facts.window_left is not None)
+            and facts.s_q <= _D128_DECODE_TILE_ROWS
+            and not _d128_decode_tile_fits(caps, facts, True)
+        ):
+            # Mask-free cc 10.7 dense d128 GQA whose UNPACKED unit fits the shared decode tile while the packed one
+            # overflows it (S_q <= 128 < S_q x G): the unpacked decode tile leads -- MEASURED on the 216-SM cc 10.7
+            # board (cuDNN 9.26.0.51, CUDA-graph replay, kernel time, 2026-10-08): b2 64/8 q128 KV 4k unpacked
+            # decode tile 32.0 us against the packed cga2 body's 90.9 (split 2) / 98.1 (unsplit) and the backend's
+            # 103.7; b2 64/8 q64 KV 4k 31.2 vs 31.9 (the packed body's split-4 arm) and b8 64/4 q128 KV 2k 97.2 vs
+            # 97.3 at parity.  Packing keeps the lead where no unpacked tile fits (b2 64/8 q256 KV 4k: packed 93.9 vs
+            # unpacked 191.2) and under a band (_sm100_banded_gqa_packs below).  The packed set stays listed.
+            wins = False
     if wins or (_sm120_d512_windowed(caps, facts) and not facts.is_fp8) or _sm100_banded_gqa_packs(caps, facts):
         return (True, False)
     return (False, True)
