@@ -29,8 +29,10 @@ finding to investigate at the SDPA stage first, never a tolerance); ``grad_scali
 the launch count is MEASURED (CUPTI) against the formula from the adapter's own facts.
 
 The sweep.  Uniform ``B = 4`` packed vs the dense ``B = 4`` fp8 backward over the same bytes is the SPLIT pin: the token-wise
-stages bitwise, the SDPA-derived ones reported in stage order (the packed forward runs the padded-mask arm, the packed chain
-walks a per-sequence kv-blocked workspace), the gradients kernel-vs-kernel in the row-budgeted form.  Zero-length sequences
+stages bitwise, the SDPA-derived ones reported in stage order -- MEASURED bitwise on every intermediate and gradient at both
+shapes (the padded-mask arm's per-sequence bounds and the per-sequence kv-blocked workspace coincide with the dense tile walk at
+uniform lengths); the split form is the convention, so a reordering of the per-sequence trim or the bounded fold would surface as a
+reported difference -- the gradients kernel-vs-kernel in the row-budgeted form.  Zero-length sequences
 (a middle one, a first one, two trailing ones behind a 5-token sequence; each packing under both mask arms at GQA 8/2, the MHA
 fold path on two of them) run under the suite's ``timeout`` (a zero-length
 sequence is a ``seq_kv_len == 0`` entry for the per-tensor fp8 d256 kernels): finite, the live sequences under the whole
