@@ -200,7 +200,7 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     if (
         facts.has_paged_kv
         and not facts.shape_overrides
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
         and 8 <= facts.b <= 64
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0

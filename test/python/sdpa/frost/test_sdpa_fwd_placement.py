@@ -196,3 +196,33 @@ def test_paged_prefill_placement_stays_inside_configured_domain(monkeypatch, out
     values = dict(h_q=6, h_kv=2, s_q=128, s_kv=256, d_qk=256, d_v=256, has_paged_kv=True, thd=True, page_size=32)
     values.update(outside or {})
     assert placement.place(spec, _facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize(
+    "chooser,decision",
+    [
+        ("_prefer_paged_d256_lpt", True),
+        ("paged_d256_prefix_launch", object()),
+        ("nonpaged_thd_split_choice", (3, True)),
+        ("paged_thd_split_choice", (3, False)),
+    ],
+)
+def test_sm107_placement_consumes_qualified_choices(monkeypatch, dtype, chooser, decision):
+    """A qualified chooser result reaches public placement; no workload winner is fixed."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    for name, empty in (
+        ("_prefer_paged_d256_lpt", False),
+        ("paged_d256_prefix_launch", None),
+        ("nonpaged_thd_split_choice", (1, False)),
+        ("paged_thd_split_choice", (1, False)),
+    ):
+        monkeypatch.setattr(heuristics, name, lambda *args, value=empty: value)
+    monkeypatch.setattr(heuristics, chooser, lambda *args: decision)
+    facts = _facts(device_cc=(10, 7), dtype=dtype)
+    assert placement.place(spec, facts) == placement.LEAD
+    # An architecture-specific choice cannot promote this row on another GPU.
+    assert placement.place(spec, _facts(device_cc=(10, 0), dtype=dtype)) == placement.TRAIL
