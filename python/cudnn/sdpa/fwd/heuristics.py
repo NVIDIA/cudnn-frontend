@@ -60,6 +60,8 @@ from cudnn.frost.tile_dsl.constants import (
 )
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
+    FP8_DUAL_KV_STREAM_MAX_ROWS,
+    fp8_dual_kv_stream_routed,
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
     cga_ctas,
@@ -1382,6 +1384,18 @@ def _sm100_banded_gqa_packs(caps: Capabilities, facts) -> bool:
     return banded and ((caps.sm_lo == 100 and caps.sm_hi < 107) or rubin_dense_d128_shared_leg(caps, facts))
 
 
+def _sm100_fp8_dual_kv_stream(caps: Capabilities, facts, cga: Optional[int]) -> bool:
+    """Mirror of api_dsl.SdpaFwdDslSm100._fp8_dual_kv_stream for the heuristics'
+    row-count model: per-tensor fp8 d128 at cga1 on a dense or paged (not THD)
+    SM100 graph whose S_q x packed heads fit one 128-row Q tile."""
+    if not fp8_dual_kv_stream_routed() or not facts.is_fp8 or facts.is_mxfp8 or facts.thd or cga != 1:
+        return False
+    if not (caps.sm_lo == 100 and caps.sm_hi < 107) or _selected_d_shape(caps, facts) != (128, 128):
+        return False
+    pack_g = facts.h_q // facts.h_kv if _sm100_banded_gqa_packs(caps, facts) or facts.s_q < 256 else 1
+    return facts.s_q * pack_g <= FP8_DUAL_KV_STREAM_MAX_ROWS
+
+
 def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Optional[int] = None, *, split_kv: int = 1) -> int:
     """The Q rows one grid tile covers, for :func:`_pack_gqa_wins`.
 
@@ -1406,8 +1420,12 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
             # pack decision is the same either way (S_q x G <= 128 is < 256).
             return cga_tile_m(64, 1 if cga is None else cga)
         if (facts.is_fp8 or facts.is_mxfp8) and cga == 1:
-            # Quantized d128 prefill at cga1 keeps TILES_Q=2 (256 rows),
-            # unlike the half decode/split tile that cga_tile_m models.
+            # The quantized d128 prefill at cga1 keeps TILES_Q=2 (256 rows), unlike
+            # the half decode/split tile that cga_tile_m models.  The per-tensor
+            # fp8 two-KV-stream decode (api_dsl._fp8_dual_kv_stream) is the
+            # exception: its second sub-tile re-uses the first's rows.
+            if _sm100_fp8_dual_kv_stream(caps, facts, cga):
+                return FP8_DUAL_KV_STREAM_MAX_ROWS
             return 256
         if cga == 1 and supports_paged_prefill_cga1(
             (facts.d_qk, facts.d_v),

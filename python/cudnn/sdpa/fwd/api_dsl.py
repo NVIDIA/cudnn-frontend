@@ -55,6 +55,8 @@ from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epil
 from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as _decode_d256_q_tile_sm107
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
+    FP8_DUAL_KV_STREAM_MAX_ROWS,
+    fp8_dual_kv_stream_routed,
     supports_thd_split,
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
@@ -2515,6 +2517,27 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """
         return self._decode_q_tile_for(self.s_q_max, self.h_q, self.h_kv)
 
+    def _fp8_dual_kv_stream(self) -> bool:
+        """Whether this per-tensor FP8 d128 plan runs its two Q sub-tiles as two KV
+        streams over one 128-row Q tile (TemplateParams.dual_kv_stream).
+
+        The same LOWERING choice as the f16 decode tiles: the decode-shaped step
+        of sm100/prefill_d128_fp8.py is bound by its per-KV-tile chain, not by
+        the MMA, so a 128-row graph gains nothing from the second Q sub-tile's
+        rows and everything from a second KV tile per step.  cga1 only (the pair
+        shares no K/V ring), dense or paged K/V, not THD; off while
+        config_sm100.FP8_DUAL_KV_STREAM_ROUTED is False.
+        """
+        if not fp8_dual_kv_stream_routed() or not (self._fp8 and self._pertensor) or self.thd or self.flavor != (128, 128) or self._device_cc == (10, 7):
+            return False
+        if self.cga != 1:
+            # The width must be NAMED: an unset knob resolves to this flavor's
+            # cga2 default below (template_params), and the pair shares no ring.
+            # The heuristics name cga1 for every dense / paged fp8 d128 plan.
+            return False
+        pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
+        return int(self.s_q_max) * pack_g <= FP8_DUAL_KV_STREAM_MAX_ROWS
+
     def _d64_decode_tile(self) -> bool:
         """Whether this d64 plan lowers onto the 128-row decode tile.
 
@@ -2753,6 +2776,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
         if self._d64_decode_tile():
             params = replace(params, decode_tile=True)
+        if self._fp8_dual_kv_stream():
+            params = replace(params, dual_kv_stream=True)
         elif self._device_cc != (10, 7) and self.flavor == (512, 512) and self._fp8 and not self._pertensor:
             from cudnn.sdpa.fwd.heuristics import select_d512_auto_knobs
 

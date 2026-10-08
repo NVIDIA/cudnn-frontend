@@ -915,7 +915,12 @@ def make_sdpa_helpers(
     # Q super-tiles (TILES_Q * TILE_M-row CTA tiles) per cluster: the unit the blocked NATURAL
     # decode, the LPT q_super expansion, the THD unit decode and the bounds height all share.
     _q_supers_per_cluster = (_cga_m * getattr(CFG, "CGA_N", 1)) if kv_shared_cluster else _cta_mma
-    cga_tile_m = CFG.TILES_Q * CFG.TILE_M * _q_supers_per_cluster
+    # Live Q sub-tiles: TILES_Q, or CfgD128.Q_TILES_LIVE (1) under the two-KV-stream
+    # mode, where sub-tile 1 re-uses sub-tile 0's rows; the Q span, row bases and
+    # bounds follow it.  Read only when that mode is on: the decode-tile configs
+    # inherit CfgD128's field defaults with a TILES_Q of their own.
+    q_tiles_live = CFG.Q_TILES_LIVE if getattr(CFG, "DUAL_KV_STREAM", 0) else CFG.TILES_Q
+    cga_tile_m = q_tiles_live * CFG.TILE_M * _q_supers_per_cluster
     # PackGQA head grouping for the LPT_L2 decode: the grid's head axis is in
     # PACKED heads (QH / PACK_G) and QH_PER_KH // PACK_G of them read one KV
     # head -- 1 under full packing, G / p under partial packing (d128 / d256
@@ -1034,7 +1039,7 @@ def make_sdpa_helpers(
         # Token capacity of one CGA super-tile: TILES_Q * TILE_M rows hold
         # rows / p tokens when packing (CFG.PACK_GQA; ``qh_per_kh`` is the
         # caller's packed group p = HEADS_PER_TILE), else one token per row.
-        tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
+        tokens_per_super = (q_tiles_live * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else q_tiles_live * CFG.TILE_M
         cga_base_super = q_super_idx - cta_in_pair
         q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
         return compute_kv_loop_bounds(
@@ -1074,7 +1079,7 @@ def make_sdpa_helpers(
         """
         b = _bounds_for_tile(q_super_idx, seqlen_q, seqlen_kv, cta_in_pair, qh_per_kh)
         if cutlass.const_expr(int(getattr(CFG, "SEQ_Q_LENS_PRESENT", 0)) == 1):
-            tokens_per_super = (CFG.TILES_Q * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else CFG.TILES_Q * CFG.TILE_M
+            tokens_per_super = (q_tiles_live * CFG.TILE_M) // qh_per_kh if CFG.PACK_GQA else q_tiles_live * CFG.TILE_M
             cga_base_super = q_super_idx - cta_in_pair
             q_row_coord = cga_base_super * cutlass.Int32(tokens_per_super)
             arr = cute.make_tensor(cute.make_ptr(cutlass.Int32, seq_q_lens_addr, cute.AddressSpace.gmem, assumed_align=4), cute.make_layout(1 << 24))

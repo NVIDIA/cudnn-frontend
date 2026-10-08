@@ -46,6 +46,24 @@ from cudnn.frost.tile_dsl.constants import (
 SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
 
+# Whether the adapter routes per-tensor FP8 d128 decode shapes onto the two-KV-
+# stream specialization (TemplateParams.dual_kv_stream); heuristics mirror the
+# predicate through _sm100_fp8_dual_kv_stream.  Measured on B300 (llama 64/8,
+# 128k keys, same node, A/B/A/B): dense b=1 75 -> 63 us, b=8 469 -> 333, b=128
+# 6.85 -> 5.43 ms; paged (page 16) b=1 87 -> 73 us, b=128 5.40 -> 4.19 ms --
+# the latter at the HBM ceiling.  A module attribute so a test can switch it.
+FP8_DUAL_KV_STREAM_ROUTED = True
+# Q rows one 128-row tile holds: the two-stream decode serves S_q x packed heads
+# up to this many rows (one Q tile at cga1).
+FP8_DUAL_KV_STREAM_MAX_ROWS = 128
+
+
+def fp8_dual_kv_stream_routed() -> bool:
+    """Late-bound read of FP8_DUAL_KV_STREAM_ROUTED, so the adapter and the
+    heuristics agree with a test that monkeypatches the module attribute."""
+    return bool(FP8_DUAL_KV_STREAM_ROUTED)
+
+
 @dataclass(frozen=True)
 class TemplateParams:
     """Per-graph compile-time parameters threaded into a kernel template.
@@ -225,6 +243,14 @@ class TemplateParams:
     # cache key, so one record must never name two kernels.  Set by
     # SdpaFwdDslSm100._d64_decode_tile, the twin of _decode_q_tile.
     decode_tile: bool = False
+    # Per-tensor FP8 d128 decode: the two Q sub-tiles of sm100/prefill_d128_fp8.py
+    # become two KV STREAMS over one 128-row Q tile (even KV tiles on sub-tile 0,
+    # odd on sub-tile 1, each with its own running max / sum, merged once in
+    # the epilogue).  Doubles the K/V bytes per pipeline step, which is what the
+    # decode-shaped step -- chain-latency-bound at ~1.1 us a 128-key tile -- is
+    # short of.  cga1, dense or paged, S_q x packed heads <= 128 rows; set by
+    # SdpaFwdDslSm100._fp8_dual_kv_stream.  Consumed by that template only.
+    dual_kv_stream: bool = False
     # Internal specialization of the shared one-Q-tile half pipeline.
     single_q_head_dim: int = 128
     # The graph declares capacity for exactly one sequence. Runtime lengths
@@ -404,6 +430,13 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # The loader routes a decode_tile record to sm100/decode_d128_f16.py at
         # d_flavor=64 (make_cfg_d64_decode); no other template consumes it.
         raise ValueError(f"{flavor}: decode_tile selects the d64 decode tile; this template does not consume it")
+    if k.dual_kv_stream and (flavor != "d128" or k.dtype_qkv > 1 or k.cta_mma != 1 or k.thd_varlen or k.pv_bf16):
+        # Two KV streams over one Q tile: the per-tensor FP8 d128 pipeline at cga1
+        # on a dense or paged graph (sm100/prefill_d128_fp8.py); nothing else
+        # consumes the record (the sibling templates raise on it at import).
+        raise ValueError(
+            f"{flavor}: dual_kv_stream is the per-tensor FP8 d128 cga1 dense/paged decode specialization; got dtype_qkv={k.dtype_qkv} cta_mma={k.cta_mma} thd={k.thd_varlen}"
+        )
     if k.decode_q_tile:
         # The loader routes a decode_q_tile record to sm100/decode_d256_f16.py
         # (make_cfg_d256_decode); a prefill template must never consume one.
@@ -2008,6 +2041,12 @@ class CfgD128:
     TILE_K_HW_BMM2: int = 16
 
     TILES_Q: int = 2
+    # Q sub-tiles that hold LIVE Q rows: TILES_Q, or 1 under DUAL_KV_STREAM, where
+    # sub-tile 1 re-uses sub-tile 0's rows as a second KV stream.  Sizes the
+    # per-CTA Q span (row bases, mask bounds, grid), never the TMEM / SMEM /
+    # barrier structure, which stays TILES_Q wide.
+    Q_TILES_LIVE: int = 2
+    DUAL_KV_STREAM: int = 0
     SCHEDULER_STAGES: int = 2
     STAGES_KV: int = 2
 
@@ -2106,7 +2145,10 @@ def _d128_smem_bytes(cfg) -> int:
     """
     q_slab = cfg.TILE_M * cfg.TILE_K * cfg.BPE
     o_slab = cfg.TILE_M * cfg.TILE_O * cfg.BPE_O // cfg.O_PACK_DIV
-    qo = cfg.TILES_Q * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
+    # Two KV streams over one Q tile: one Q slab and one O slab (the fp8 kernel
+    # never aliases them), while P stays one tile per stream.
+    q_tiles = getattr(cfg, "Q_TILES_LIVE", cfg.TILES_Q) if getattr(cfg, "DUAL_KV_STREAM", 0) else cfg.TILES_Q
+    qo = q_tiles * (max(q_slab, o_slab) if cfg.QO_ALIAS else q_slab + o_slab)
     k = cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.CTA_MMA)
     v = cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N * cfg.BPE_V // cfg.CTA_MMA)
     # The per-tensor FP8 kernel stages P (TILE_M x TILE_N fp8 per Q sub-tile) in SMEM so the next
@@ -2124,9 +2166,18 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.MMA_REGS % 8 == 0 and cfg.CORRECTION_REGS % 8 == 0 and cfg.SOFTMAX_REGS % 8 == 0, "d128: per-role regs must be multiples of 8"),
         (cfg.CGA_M == cfg.CTA_MMA and cfg.CTA_MMA in (1, 2), "d128 SM100: CGA_M must equal CTA_MMA, and CTA_MMA must be 1 (cga1) or 2 (cga2)"),
         (
-            cfg.QO_ALIAS == 1 if cfg.CTA_MMA == 1 else True,
+            cfg.QO_ALIAS == 1 if cfg.CTA_MMA == 1 and not cfg.DUAL_KV_STREAM else True,
             "d128 cga1: QO_ALIAS is mandatory — cga1 doubles per-CTA K/V (no collective MMA to halve it), "
-            "so Q and O must share one slab to stay inside the SMEM cap",
+            "so Q and O must share one slab to stay inside the SMEM cap (the two-stream fp8 decode keeps "
+            "one unaliased Q and O slab and fits through its 1-byte K/V stages)",
+        ),
+        (
+            cfg.Q_TILES_LIVE == (1 if cfg.DUAL_KV_STREAM else cfg.TILES_Q),
+            "d128: Q_TILES_LIVE is TILES_Q, or 1 under DUAL_KV_STREAM (sub-tile 1 is a KV stream, not Q rows)",
+        ),
+        (
+            not cfg.DUAL_KV_STREAM or (_fp8 and cfg.CTA_MMA == 1 and not cfg.THD_VARLEN and not cfg.PV_BF16),
+            "d128: DUAL_KV_STREAM is the per-tensor fp8 cga1 dense/paged decode specialization",
         ),
         (
             _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
@@ -2139,9 +2190,10 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d128 (llama): 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d128 llama: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
         (
-            (cfg.STAGES_KV in (2, 3) if cfg.CTA_MMA == 1 else cfg.STAGES_KV == 4) if _fp8 else cfg.STAGES_KV == 2,
+            (cfg.STAGES_KV == 4 if (cfg.CTA_MMA == 2 or cfg.DUAL_KV_STREAM) else cfg.STAGES_KV in (2, 3)) if _fp8 else cfg.STAGES_KV == 2,
             "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 or 3 at cga1 — "
-            "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
+            "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant; "
+            "the two-stream fp8 decode holds a K/V pair per step and runs 4 at cga1",
         ),
         (
             cfg.TILE_K_HW_BMM1 == (32 if _fp8 else 16) and cfg.TILE_K_HW_BMM2 == (16 if cfg.PV_BF16 else (32 if _fp8 else 16)),
@@ -2196,7 +2248,9 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
         CTA_MMA=params.cta_mma,
         # cga1 has no collective MMA to halve per-CTA K/V, so Q and O must share
         # one slab to stay under the SMEM cap (_validate_cfg_d128 enforces it).
-        QO_ALIAS=1 if params.cta_mma == 1 else 0,
+        QO_ALIAS=1 if params.cta_mma == 1 and not params.dual_kv_stream else 0,
+        Q_TILES_LIVE=1 if params.dual_kv_stream else 2,
+        DUAL_KV_STREAM=int(params.dual_kv_stream),
         Q_SWZ_BYTES=q_swz_bytes(128, b),
         K_SWZ_BYTES=q_swz_bytes(128, b),
         V_SWZ_BYTES=v_swz_bytes(128, params.cta_mma, b_v),
@@ -2214,8 +2268,9 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
         # pushed a cga1 CTA to 237024 B against the 232448 B cap.
         # The MXFP8 kernel takes a THIRD full-width stage at cga1 (cga1_kv_stages=3): Q and O already share a slab
         # there, so 3 x (16 K + 16 V) KiB plus the scale factors still fit, and the deeper prefetch covers the
-        # tile boundary of the short packed GQA legs that run cga1.
-        STAGES_KV=(cga1_kv_stages if params.cta_mma == 1 else 4) if fp8 else 2,
+        # tile boundary of the short packed GQA legs that run cga1.  The two-stream per-tensor fp8 decode holds a
+        # K/V pair per step and runs 4 at cga1.
+        STAGES_KV=(4 if (params.cta_mma == 2 or params.dual_kv_stream) else cga1_kv_stages) if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
@@ -2293,6 +2348,9 @@ class CfgD128Decode(CfgD128):
     QO_ALIAS: int = 1
 
     TILES_Q: int = 1
+    # One live Q tile and no second KV stream: the inherited CfgD128 defaults say 2.
+    Q_TILES_LIVE: int = 1
+    DUAL_KV_STREAM: int = 0
     STAGES_KV: int = 3
 
     SOFTMAX_WARPGROUPS: int = 1
@@ -2325,6 +2383,10 @@ class CfgD128Decode(CfgD128):
 def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
     """Consistency checks on the d128 decode-tile geometry."""
     checks = (
+        (
+            cfg.Q_TILES_LIVE == cfg.TILES_Q == 1 and cfg.DUAL_KV_STREAM == 0,
+            "d128 decode: one live Q tile, no second KV stream (Q_TILES_LIVE / DUAL_KV_STREAM must not inherit CfgD128's defaults)",
+        ),
         (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d128 decode: f16/bf16 only (the fp8 families keep the prefill tile)"),
         (cfg.DTYPE_O == cfg.DTYPE_QKV, "d128 decode: DTYPE_O must equal DTYPE_QKV"),
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d128 decode: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
@@ -2601,6 +2663,9 @@ class CfgD64Decode(CfgD64):
     QO_ALIAS: int = 1
 
     TILES_Q: int = 1
+    # One live Q tile and no second KV stream: the inherited CfgD128 defaults say 2.
+    Q_TILES_LIVE: int = 1
+    DUAL_KV_STREAM: int = 0
     # Three 16 KiB K + 16 KiB V stages (96 KiB of KV in flight).  Six -- the
     # d128 tile's 192 KiB -- was measured 2026-10-08 on a b=128 x 128k-key
     # gpt-oss decode: B200 6.37 -> 6.19 ms (-3 %) but B300 4.99 -> 5.70 ms
@@ -2636,6 +2701,10 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
     128 B at cga1, so every operand still lands on the 128 B atom).
     """
     checks = (
+        (
+            cfg.Q_TILES_LIVE == cfg.TILES_Q == 1 and cfg.DUAL_KV_STREAM == 0,
+            "d64 decode: one live Q tile, no second KV stream (Q_TILES_LIVE / DUAL_KV_STREAM must not inherit CfgD128's defaults)",
+        ),
         (cfg.DTYPE_QKV in (DTYPE_BF16, DTYPE_FP16), "d64 decode: f16/bf16 only"),
         (cfg.DTYPE_O == cfg.DTYPE_QKV, "d64 decode: DTYPE_O must equal DTYPE_QKV"),
         (cfg.MMA_REGS == cfg.TMALDG_REGS == cfg.TMASTG_REGS == cfg.SCHEDULER_REGS, "d64 decode: MMA/TMALDG/TMASTG/SCHEDULER regs must match"),
