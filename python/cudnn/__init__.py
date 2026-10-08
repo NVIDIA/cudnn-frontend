@@ -57,6 +57,11 @@ for _optional_symbol in [
     "gnn_agg_op",
     "gnn_agg_simple_forward",
     "gnn_agg_simple_backward",
+    "gnn_activation_op",
+    "gnn_mha_gat_forward",
+    "gnn_mha_gat_backward",
+    "gnn_mha_gat_v2_forward",
+    "gnn_mha_gat_v2_backward",
     "fft_causal_conv1d_forward",
     "fft_causal_conv1d_backward",
     "long_fft_causal_conv1d_get_buffer_sizes",
@@ -144,7 +149,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.30.0"
+__version__ = "1.31.0"
 
 
 def _tensor(
@@ -286,6 +291,11 @@ _EAGER_PUBLIC_NAMES = (
             "gnn_agg_op",
             "gnn_agg_simple_forward",
             "gnn_agg_simple_backward",
+            "gnn_activation_op",
+            "gnn_mha_gat_forward",
+            "gnn_mha_gat_backward",
+            "gnn_mha_gat_v2_forward",
+            "gnn_mha_gat_v2_backward",
         )
         if symbol in globals()
     ),
@@ -342,6 +352,8 @@ _MOE_EP_OPTIONAL_IMPORTS = {
     "pack_forward_weights",
 }
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
+    "AlignedHCABackward": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
+    "aligned_hca_backward_wrapper": "Install with 'pip install nvidia-cudnn-frontend[cutedsl,triton]' and install a CUDA-enabled torch build",
     "MhcProjectionBackward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "mhc_projection_backward": "Install with pip install 'nvidia-cudnn-frontend[cutile,triton]' 'cuda-tile>=1.5' and install a CUDA-enabled torch build",
     "RopeQDQInplace": "Install with 'pip install nvidia-cudnn-frontend[triton]' and install a CUDA-enabled torch build",
@@ -356,6 +368,8 @@ _OPTIONAL_DEPENDENCY_INSTALL_HINTS = {
 _OPTIONAL_DEPENDENCY_INSTALL_HINTS.update({name: _MOE_EP_INSTALL_HINT for name in _MOE_EP_OPTIONAL_IMPORTS})
 
 _LAZY_OPTIONAL_IMPORTS = {
+    "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
+    "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),
     "tail_rope": (".rope", "tail_rope"),
     "VisionRoPEBackward": (".rope", "VisionRoPEBackward"),
@@ -424,6 +438,8 @@ _LAZY_OPTIONAL_IMPORTS = {
     "Nvfp4AttentionQatBackward": (".sdpa.bwd", "Nvfp4AttentionQatBackward"),
     "nvfp4_attention_qat_backward": (".sdpa.bwd", "nvfp4_attention_qat_backward"),
     "DSA": (".deepseek_sparse_attention", "DSA"),
+    "AlignedHCABackward": (".deepseek_sparse_attention", "AlignedHCABackward"),
+    "aligned_hca_backward_wrapper": (".deepseek_sparse_attention", "aligned_hca_backward_wrapper"),
     "CSA": (".csa", "CSA"),
     "CSACompressorForward": (".csa", "CSACompressorForward"),
     "CSACompressorBackward": (".csa", "CSACompressorBackward"),
@@ -473,6 +489,62 @@ _LAZY_OPTIONAL_IMPORTS = {
     "rmsnorm_rht_amax_wrapper_sm100": (
         ".rmsnorm_rht_amax",
         "rmsnorm_rht_amax_wrapper_sm100",
+    ),
+    "Conv3dRmsNormSiluPadSm100": (
+        ".conv.cutedsl",
+        "Conv3dRmsNormSiluPadSm100",
+    ),
+    "Conv3dRmsNormSiluSm100": (
+        ".conv.cutedsl",
+        "Conv3dRmsNormSiluSm100",
+    ),
+    "Conv3dBiasResidualPadSm100": (
+        ".conv.cutedsl",
+        "Conv3dBiasResidualPadSm100",
+    ),
+    "CausalConv3dWithCacheSm100": (
+        ".conv.cutedsl",
+        "CausalConv3dWithCacheSm100",
+    ),
+    "Conv3dRawSm100": (
+        ".conv.cutedsl",
+        "Conv3dRawSm100",
+    ),
+    "RmsNormSiluPadSm100": (
+        ".conv.cutedsl",
+        "RmsNormSiluPadSm100",
+    ),
+    "pack_conv3d_weight_sm100": (
+        ".conv.cutedsl",
+        "pack_conv3d_weight_sm100",
+    ),
+    "pack_causal_conv3d_weight_sm100": (
+        ".conv.cutedsl",
+        "pack_causal_conv3d_weight_sm100",
+    ),
+    "conv3d_rmsnorm_silu_pad_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_rmsnorm_silu_pad_wrapper_sm100",
+    ),
+    "conv3d_rmsnorm_silu_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_rmsnorm_silu_wrapper_sm100",
+    ),
+    "conv3d_bias_residual_pad_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_bias_residual_pad_wrapper_sm100",
+    ),
+    "causal_conv3d_with_cache_wrapper_sm100": (
+        ".conv.cutedsl",
+        "causal_conv3d_with_cache_wrapper_sm100",
+    ),
+    "conv3d_raw_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_raw_wrapper_sm100",
+    ),
+    "rmsnorm_silu_pad_wrapper_sm100": (
+        ".conv.cutedsl",
+        "rmsnorm_silu_pad_wrapper_sm100",
     ),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
@@ -652,23 +724,17 @@ def __getattr__(name: str) -> Any:
         globals()["Graph"] = _wrapper.Graph
         return globals()[name]
 
-    if name == "ops":
-        # Use importlib rather than "from . import ops" to avoid infinite
+    if name in ("ops", "experimental"):
+        # Use importlib rather than "from . import <name>" to avoid infinite
         # recursion. The cycle:
-        #   1. cudnn.ops accessed → __getattr__("ops") fires
-        #   2. "from . import ops" → _handle_fromlist(cudnn, ["ops"], ...)
-        #   3. _handle_fromlist calls hasattr(cudnn, "ops")
-        #   4. "ops" not in __dict__ yet → __getattr__("ops") again → goto 1
+        #   1. cudnn.<name> accessed → __getattr__("<name>") fires
+        #   2. "from . import <name>" → _handle_fromlist(cudnn, ["<name>"], ...)
+        #   3. _handle_fromlist calls hasattr(cudnn, "<name>")
+        #   4. not in __dict__ yet → __getattr__("<name>") again → goto 1
         # importlib.import_module bypasses _handle_fromlist entirely.
-        _ops = importlib.import_module(".ops", __name__)
-        globals()["ops"] = _ops
-        return _ops
-
-    if name == "experimental":
-        from . import experimental as _experimental
-
-        globals()["experimental"] = _experimental
-        return _experimental
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
 
     if name == "jax":
         # `import cudnn; cudnn.jax.call` works like `import cudnn.jax`.

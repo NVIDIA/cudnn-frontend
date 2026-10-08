@@ -6,6 +6,7 @@ import inspect
 from typing import Type
 
 import cutlass
+from cutlass.base_dsl.typing import Pointer
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.experimental import primitives as nvvm
 import cutlass.cute as cute
@@ -151,6 +152,263 @@ def fp32_to_fp8_pack(values, *, dtype: Type[cutlass.Numeric]):
         read_only_args=list(values),
     )
     return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
+
+
+# ---------------------------------------------------------------------------
+# Rubin's FUSED descale-and-pack: cvt.rn.satfinite.scaled::n1::ue8m0.{e4m3,e5m2}x2.f32
+# (sm_107a only) -- the block-scale quantizers' FMUL-free pack.  Semantics MEASURED on
+# Rubin (cc 10.7, 204 SMs), 2026-09-29, over 2,085,583 (a, b, sf) triples incl. the edge
+# grid (records retained internally):
+#
+#     byte(x, e) = fp8_rn_satfinite( ftz(x) * 2^(127 - e) )     e = the ue8m0 byte, x fp32
+#
+# i.e. THE BYTE IS A DESCALE EXPONENT: pass the block's E8M0 *scale* exponent ``e`` (the
+# byte the dequant multiplies by, ``e8m0_from_amax(...)[1]`` / an ``e8m0_pair`` byte) AS IS
+# and the hardware divides by 2^(e-127) -- exactly ``x * e8m0_rcp(e)`` + ``fp32_to_fp8_pack``
+# minus the multiply.  Byte order is the unscaled instruction's (first source operand ->
+# HIGH byte), so ``cvt lo, $5, $4`` keeps element 0 in the low byte.  Edge behaviour: +-inf
+# and overflow -> +-max (never inf / NaN), NaN -> 0x7f, e = 255 (the e8m0 NaN) -> 0x7f in
+# BOTH bytes whatever the inputs, e = 0 is 2^+127, e = 254 is 2^-127, and an fp32-SUBNORMAL
+# input (0 < |x| < 2^-126) is FLUSHED to +-0 before scaling (the one divergence from the
+# FMUL arm, unobservable for a scale derived from the block's own amax on bf16 / fp16 data).
+# SASS per 16 values (MEASURED, the probe kernel of test_tile_dsl_fp8_pack_scaled.py): 8
+# F2FP.SATFINITE.<FMT>.F32.PACK_AB_MERGE_C.SCALE_BY_C + 4 PRMT that merge the .b8 into the
+# F2FP's C operand -- the ``cvt.u8.u32`` extraction folds into them (0 SHF in the kernel;
+# the standalone instruction probe read 1 SHF.L.U32) -- replace 16 FMUL + 8 unscaled F2FP.
+#
+# THE .b8 SCALE OPERAND HAS A PROVENANCE RULE (MEASURED 2026-09-30, libnvptxcompiler 13.4.46 =
+# the DSL's, and a second standalone ptxas build, target sm_107a):
+#   * a per-lane DATA-derived register assembles: a GMEM / SMEM load (an SF atom the kernel
+#     itself filled, one LDS), ``e8m0_from_amax(abs_max_tree(...))[1]``,
+#     ``e8m0_from_amax(warp_abs_max_f32(x))[1]`` (a CREDUX result);
+#   * a compile-time constant assembles ONLY as the IMMEDIATE of the ``cvt.u8.u32``, and only
+#     in the 16-PACK shape (``cvt.u8.u32 sf, 119;`` feeding the eight lo/hi-merged cvts -> 8
+#     SCALE_BY_C + 4 PRMT + 4 MOV, 0 FMUL): ptxas places the byte with a PRMT there, but for a
+#     LONE ``x2`` cvt (the pair twin, alone or as two merged cvts) it reaches for an
+#     IMAD.SHL of two immediates and ICEs -- so fp32_to_fp8_pack_scaled spells a constant as
+#     the immediate and fp32_to_fp8x2_scaled routes a constant through the FMUL arm.  The
+#     16-pack form is pinned (SASS + device) on this toolchain; should a kernel context ever
+#     ICE on it, feed that call a per-lane LOAD of the byte (an SF atom the kernel fills --
+#     the robust provenance) or fused=False;
+#   * a register ptxas can PROVE constant (``opaque_i32(cutlass.Int32(119))``, ``tid & 0 | 119``,
+#     an ``and 0xff`` / ``mov.b32 {b0..b3}`` / ``cvt.u16`` / ``shl+shr`` / ``shfl.sync.idx`` of one)
+#     or a KERNEL PARAMETER (``ld.param``, warp-uniform) ICEs ptxas -- "(C7907) Missing Mercury
+#     ISA version for instruction MAD::(unidentified subop) on target SM 107"; an immediate in
+#     the SCALED cvt's own operand list is "Arguments mismatch".  The helper cannot see a traced
+#     value's provenance, so the kernel-parameter case is the CALLER's contract, tripwired by
+#     ``test_kernel_parameter_scale_byte_still_ices_ptxas`` (when it passes, relax this rule).
+# ---------------------------------------------------------------------------
+
+# The only target the scaled cvt assembles for.  MEASURED 2026-09-29: libnvptxcompiler 13.4.46 (the DSL's) and a second
+# standalone ptxas accept it for sm_107a and reject it for sm_100a / 103a / 110a / 120a ("Illegal modifier '.scaled::n1::ue8m0'");
+# sm_107f is UNVERIFIED and therefore absent.  Read by the trace-time backstop below -- never a device query in tile_dsl.
+SCALED_FP8_CVT_ARCHS = ("sm_107a",)
+
+
+def _fp8_tag(dtype: Type[cutlass.Numeric], who: str) -> str:
+    if dtype == cutlass.Float8E4M3FN:
+        return "e4m3"
+    if dtype == cutlass.Float8E5M2:
+        return "e5m2"
+    raise TypeError(f"{who}: dtype must be Float8E4M3FN or Float8E5M2, got {dtype}")
+
+
+def _require_scaled_fp8_cvt_target(who: str) -> None:
+    """Trace-time backstop of the ``fused=True`` arm.
+
+    ``fused`` is the API layer's decision -- ``compute_capability(dev) == (10, 7)`` folded into a ``TemplateParams`` flag
+    the consuming kernel reads as a trace-time constant (the ``api_dsl._EXP2_FMA_SPLIT_CC`` idiom); ``tile_dsl`` never
+    queries the device.  What it CAN see is the trace's target (``--gpu-arch`` / ``CUTE_DSL_ARCH`` / the detected part), so
+    a flag set for the wrong part fails HERE, naming the arch and the helper, instead of in ptxas with
+    ``Illegal modifier '.scaled::n1::ue8m0'``.  Needs cutlass-dsl >= 4.8.0 (the first wheel whose ``Arch`` knows
+    ``sm_107a``, AGENTS.md Rule 7): on the 4.7.0 floor no trace can target Rubin, so the arm is unreachable there."""
+    try:
+        from cutlass.base_dsl.dsl import BaseDSL
+
+        arch_name = BaseDSL._get_dsl().get_arch_enum().name
+    except Exception as exc:  # the accessor is DSL-private: if a wheel moves it, fail loud here, never guess the target
+        raise RuntimeError(
+            f"{who}: cannot read the trace's target arch from this cutlass-dsl ({exc!r}); fused=True assembles for "
+            f"{', '.join(SCALED_FP8_CVT_ARCHS)} only -- pass fused=False (the portable FMUL arm) or update this backstop."
+        ) from exc
+    if arch_name not in SCALED_FP8_CVT_ARCHS:
+        raise ValueError(
+            f"{who}: fused=True emits cvt.rn.satfinite.scaled::n1::ue8m0, which assembles for {', '.join(SCALED_FP8_CVT_ARCHS)} only; "
+            f"this trace targets {arch_name}.  `fused` is the API layer's fact (compute_capability(dev) == (10, 7) -> a TemplateParams "
+            f"flag); pass fused=False for the portable FMUL arm."
+        )
+
+
+_E8M0_RCP_MAX_E = 253  # e8m0_rcp's contract: 2^(127 - e) is an fp32 NORMAL for e <= 253
+
+
+def _constant_scale_byte(sf_byte, who: str):
+    """The Python int behind a compile-time-constant ``sf_byte`` -- a plain ``int`` or a ``cutlass.Int32`` still holding its
+    Python value (``cutlass.Int32(119)`` before a traced op touches it) -- or ``None`` for a traced register."""
+    if isinstance(sf_byte, bool):
+        raise TypeError(f"{who}: the scale byte is an E8M0 exponent, not a bool")
+    if isinstance(sf_byte, int):
+        return sf_byte
+    v = getattr(sf_byte, "value", None)
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _scale_byte_operand(sf_byte, *, fused: bool, who: str, const_takes_fmul: bool = False):
+    """``(imm, reg)`` -- exactly one is set.  A compile-time constant (Python int / constant ``Int32``) becomes ``imm``:
+    the fused 16-pack spells it as the ``cvt.u8.u32`` IMMEDIATE (the ONE constant form ptxas assembles -- a
+    register-materialized constant such as ``opaque_i32(...)`` ICEs it, see the header) and the FMUL arm folds ``2^(127 - e)``
+    into one opaque register (``const_takes_fmul``: the caller routes a constant through the FMUL arm even when ``fused`` --
+    the pair twin -- so the ``e <= 253`` contract of :func:`e8m0_rcp` applies).  A traced value stays ``reg`` and MUST be
+    per-lane data (a load, an ``e8m0_from_amax`` byte): a kernel parameter ICEs ptxas and the helper cannot tell it from data
+    (header; the caller's contract)."""
+    const = _constant_scale_byte(sf_byte, who)
+    if const is None:
+        return None, sf_byte
+    if not 0 <= const <= 255:
+        raise ValueError(f"{who}: a constant scale byte must be in [0, 255], got {const}")
+    if const > _E8M0_RCP_MAX_E and (not fused or const_takes_fmul):
+        raise ValueError(f"{who}: a constant byte descales through the FMUL arm (e8m0_rcp), valid for e <= {_E8M0_RCP_MAX_E}; got {const}")
+    return const, None
+
+
+def fp32_to_fp8_pack_scaled(values, sf_byte, *, dtype: Type[cutlass.Numeric], fused: bool):
+    """16 fp32 -> 16 fp8 bytes in four Int32 words (element i in byte i), every element DEscaled by ONE ue8m0 byte:
+
+        byte_i = fp8_rn_satfinite(values[i] * 2^(127 - sf_byte))
+
+    ``sf_byte`` -- the E8M0 exponent in bits [0, 8) (higher bits are dropped by the ``cvt.u8.u32``), one of:
+
+    * a traced ``cutlass.Int32`` that is PER-LANE DATA: a load, or ``e8m0_from_amax(amax)[1]`` / an ``e8m0_pair`` byte
+      AS IT IS (the byte is a DEscale exponent).  NOT a kernel parameter and not a register the assembler can prove
+      constant -- ptxas ICEs on those (C7907, the provenance rule in the header) and the helper cannot tell them from
+      data: the caller's contract, tripwired by ``test_tile_dsl_fp8_pack_scaled.py``;
+    * a Python int (cuDNN's fixed P scale: byte 119 = ``x * 2^8``) or a ``cutlass.Int32(<int>)`` still holding it: the
+      fused arm spells it as the ``cvt.u8.u32`` IMMEDIATE (the one constant form that assembles, and only in this 16-pack
+      shape: 8 SCALE_BY_C + 4 PRMT + 4 MOV per 16 values, 0 FMUL -- header), the FMUL arm folds ``2^(127 - e)`` into one
+      opaque register (``e <= 253``).  A per-lane LOAD of the same byte (an SF atom the kernel fills) is the robust
+      spelling if a kernel context ever ICEs on the immediate.
+
+    ``fused=True`` (cc 10.7 ONLY: the instruction does not assemble for any other target, and the trace-time backstop
+    :func:`_require_scaled_fp8_cvt_target` refuses the arm elsewhere; cutlass-dsl >= 4.8.0, the first wheel that knows
+    ``sm_107a`` -- AGENTS.md Rule 7) emits 8 scaled cvts and NO multiply.  ``fused=False``
+    is the portable spelling, bit-identical for NORMAL fp32 inputs and ``sf_byte <= 253``: one FMUL by :func:`e8m0_rcp`
+    per element + :func:`fp32_to_fp8_pack`.  The two arms differ (both MEASURED on Rubin) only for (1) an
+    fp32-SUBNORMAL input, which the fused op flushes to +-0 and the FMUL arm scales exactly, and (2) ``sf_byte`` in
+    {254, 255}, which the fused arm handles natively (2^-127 / NaN bytes) while :func:`e8m0_rcp` is only valid for
+    ``e <= 253`` -- neither occurs for a block scale derived from a finite amax (``e <= 247`` on bf16 data) applied to the
+    data that produced it.  The caller decides ``fused`` at the API layer from ``compute_capability(dev) == (10, 7)``.
+    """
+    assert len(values) == 16, f"fp32_to_fp8_pack_scaled: expected 16 input values, got {len(values)}"
+    tag = _fp8_tag(dtype, "fp32_to_fp8_pack_scaled")
+    imm, reg = _scale_byte_operand(sf_byte, fused=fused, who="fp32_to_fp8_pack_scaled")
+    if not fused:
+        # 2^(127 - e) = bits((254 - e) << 23) as a register: a folded float immediate reaching the pack's asm would be the
+        # s7 ICE, so a constant e goes through opaque_f32_bits (ptxas re-folds the MOV into the FMULs), a traced e through
+        # e8m0_rcp.
+        rcp = opaque_f32_bits((254 - imm) << 23) if imm is not None else e8m0_rcp(reg)
+        return fp32_to_fp8_pack([v * rcp for v in values], dtype=dtype)
+    _require_scaled_fp8_cvt_target("fp32_to_fp8_pack_scaled")
+    # $0..$3 the four words, $4..$19 the values (element 2j in the LOW byte of pair j: the first source operand is the
+    # high byte), $20 the scale word -- or the constant spelled as the cvt.u8.u32 IMMEDIATE (header: the one constant form
+    # ptxas assembles).  ONE .b8 register serves all eight cvts.
+    sf_src = str(imm) if imm is not None else "$20"
+    u0, u1, u2, u3 = inline_ptx(
+        "{ .reg .b16 lo, hi; .reg .b8 sf;\n"
+        f"cvt.u8.u32 sf, {sf_src};\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 lo, $5,  $4,  sf;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 hi, $7,  $6,  sf;\n"
+        "mov.b32 $0, {lo, hi};\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 lo, $9,  $8,  sf;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 hi, $11, $10, sf;\n"
+        "mov.b32 $1, {lo, hi};\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 lo, $13, $12, sf;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 hi, $15, $14, sf;\n"
+        "mov.b32 $2, {lo, hi};\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 lo, $17, $16, sf;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 hi, $19, $18, sf;\n"
+        "mov.b32 $3, {lo, hi}; }",
+        write_only_types=[cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32],
+        read_only_args=list(values) + ([] if imm is not None else [reg]),
+    )
+    return cutlass.Vector.from_elements((u0, u1, u2, u3), cutlass.Int32)
+
+
+def fp32_to_fp8x2_scaled(lo, hi, sf_byte, *, dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN, fused: bool):
+    """The two-element twin of :func:`fp32_to_fp8x2`: ``low byte = fp8(lo * 2^(127-e))``, ``byte 1 = fp8(hi * 2^(127-e))``
+    as a ``Uint16`` -- for the per-pair pack loops that assemble MMA operands with :func:`pack_fp8x2_pairs`.  Same contract,
+    arms and backstop as :func:`fp32_to_fp8_pack_scaled`, with ONE exception: a compile-time CONSTANT byte takes the FMUL
+    arm even under ``fused=True`` -- a lone scaled cvt with an immediate scale ICEs ptxas (C7907, MEASURED; the header's
+    provenance rule), and the two FMULs by the folded power of two are bit-identical for normal inputs."""
+    tag = _fp8_tag(dtype, "fp32_to_fp8x2_scaled")
+    imm, reg = _scale_byte_operand(sf_byte, fused=fused, who="fp32_to_fp8x2_scaled", const_takes_fmul=True)
+    if not fused or imm is not None:
+        rcp = opaque_f32_bits((254 - imm) << 23) if imm is not None else e8m0_rcp(reg)
+        return fp32_to_fp8x2(lo * rcp, hi * rcp, dtype=dtype)
+    _require_scaled_fp8_cvt_target("fp32_to_fp8x2_scaled")
+    return inline_ptx(
+        "{ .reg .b8 sf; cvt.u8.u32 sf, $3;\n" + f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 $0, $2, $1, sf; " + "}",
+        write_only_types=[cutlass.Uint16],
+        read_only_args=[lo, hi, reg],
+    )
+
+
+def fp32_to_fp8x4_scaled_pairs(values, sf01, sf23, *, dtype: Type[cutlass.Numeric], fused: bool):
+    """4 fp32 -> 4 fp8 bytes in ONE Int32 word (element i in byte i), EVERY element DEscaled by its OWN E8M0 byte:
+
+        byte_0 = fp8(values[0] * 2^(127 - sf01.byte0))   byte_1 = fp8(values[1] * 2^(127 - sf01.byte1))
+        byte_2 = fp8(values[2] * 2^(127 - sf23.byte0))   byte_3 = fp8(values[3] * 2^(127 - sf23.byte1))
+
+    The per-COLUMN twin of :func:`fp32_to_fp8_pack_scaled` -- one exponent per ELEMENT instead of one per 16 -- for a lane that
+    holds one ROW of a tile whose scale blocks run along the OTHER axis (the MXFP8 backward's ``ds_dq``: lane = kv row, the 32-kv
+    block scale is per q column, so each of a lane's 64 values carries a different byte).  ``sf01`` / ``sf23`` are PAIR words as
+    :func:`e8m0_pair` / :func:`e8m0_pair_u` lay them (byte 0 = the even element's exponent, byte 1 = the odd one's, bits 16..31
+    ignored); they MUST be per-lane DATA to ptxas (the header's provenance rule -- a word built from CREDUX / ``abs_max_tree``
+    amaxes assembles; a kernel parameter or a provable constant ICEs ptxas C7907).  What sm_107a ptxas makes of it (MEASURED
+    2026-10-01, standalone sm_107a SASS sweeps of the dq tail): the SASS form ``F2FP...PACK_AB_MERGE_C.SCALE_BY_C Rd, Ra, Rb, Rc`` reads the scale from
+    byte 3 of ``Rc`` and returns ``(Rc << 16) | pack16``, so ptxas chains the two cvts of a pair through ``Rc`` (the second's merge is
+    free) and spends ~3 ops per pair positioning the bytes (a mask, a shift, a ``PRMT``) -- the same count whether the bytes arrive
+    as this 32-bit word, as a 16-bit ``mov.b16`` unpack, as a ``mov.b32`` four-byte unpack, pre-positioned at bits 24..31, or with
+    the even element first; a 4-byte word per four columns costs one extra extraction per word.  ~2.5 instructions per element all
+    in (cvt + positioning + the final ``prmt``), zero fp32 scale builds, zero ``FMUL``.
+
+    ``fused=True`` (cc 10.7 ONLY, :func:`_require_scaled_fp8_cvt_target`): each element takes ONE lone
+    ``cvt.rn.satfinite.scaled::n1::ue8m0`` with BOTH operands the element (the pair twin's shape, so its two result bytes are the
+    same byte) and the four low bytes are merged by one ``prmt`` -- no multiply, no fp32 scale build.  ``fused=False`` is the
+    portable spelling, bit-identical for NORMAL fp32 inputs and bytes ``<= 253``: one FMUL by :func:`e8m0_rcp` of the element's
+    byte + the plain pair cvt (:func:`fp32_to_fp8x2`); the two arms diverge exactly as :func:`fp32_to_fp8_pack_scaled`'s do (an
+    fp32-SUBNORMAL input is flushed by the fused op; a byte in {254, 255} is outside :func:`e8m0_rcp`'s contract).  Element order
+    is the pack's: element 0 in the low byte."""
+    if len(values) != 4:
+        raise ValueError(f"fp32_to_fp8x4_scaled_pairs: expected 4 input values (two per pair word), got {len(values)}")
+    tag = _fp8_tag(dtype, "fp32_to_fp8x4_scaled_pairs")
+    if not fused:
+        pairs = []
+        for i, sf in ((0, sf01), (2, sf23)):
+            r_lo = e8m0_rcp(sf & cutlass.Int32(0xFF))
+            r_hi = e8m0_rcp((sf >> cutlass.Int32(8)) & cutlass.Int32(0xFF))
+            pairs.append(fp32_to_fp8x2(values[i] * r_lo, values[i + 1] * r_hi, dtype=dtype))
+        return pack_u16x2(pairs[0], pairs[1])
+    _require_scaled_fp8_cvt_target("fp32_to_fp8x4_scaled_pairs")
+    # $0 the word, $1..$4 the values, $5 / $6 the pair words.  Both operands of a cvt are the element, so byte 0 of each .b16
+    # result is the element's byte; prmt 0x6420 gathers {t0.b0, t0.b2, t1.b0, t1.b2} = the four low bytes in element order.
+    return inline_ptx(
+        "{ .reg .b8 s0, s1, s2, s3; .reg .b32 u1, u3, t0, t1; .reg .b16 h0, h1, h2, h3;\n"
+        "cvt.u8.u32 s0, $5;\n"
+        "shr.u32 u1, $5, 8;\n"
+        "cvt.u8.u32 s1, u1;\n"
+        "cvt.u8.u32 s2, $6;\n"
+        "shr.u32 u3, $6, 8;\n"
+        "cvt.u8.u32 s3, u3;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 h0, $1, $1, s0;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 h1, $2, $2, s1;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 h2, $3, $3, s2;\n"
+        f"cvt.rn.satfinite.scaled::n1::ue8m0.{tag}x2.f32 h3, $4, $4, s3;\n"
+        "mov.b32 t0, {h0, h1};\n"
+        "mov.b32 t1, {h2, h3};\n"
+        "prmt.b32 $0, t0, t1, 0x6420; }",
+        write_only_types=[cutlass.Int32],
+        read_only_args=list(values) + [sf01, sf23],
+    )
 
 
 def fp32_to_e2m1_pack(values):
@@ -408,13 +666,14 @@ def exp2_emul_pair(x_lo, x_hi):
     row.  On SM100 the MUFU pipe (4 lanes/clk/SMSP) is then the longest single pipe of the
     softmax warps while the FP32 pipe has slack, so evaluating a compile-time subset of the
     columns here (6 packed FP32/INT instructions per PAIR instead of one MUFU per element)
-    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Three sm100
+    shortens the burst.  The cuDNN backend kernel splits its exps the same way.  Four sm100
     prefill kernels consume it, each behind the per-(kind, flavor) cc 10.0 gate of
     ``api_dsl._exp2_fma_split_for`` -- MEASURED vs develop, B200, A/B/A x3, CUPTI medians: the
     d128 MXFP8 kernel (``sm100/prefill_d128_mxfp8.py``, ``_E2E_*``) +7.83 % at B=1 H=24/8 S=16K
     dense (2.217 -> 2.056 ms, together with its Amax_O fold), the d128 per-tensor FP8 kernel
     +4.48 % at S=8K (llama layer, H=64/8), the d192x128 bf16 kernel +1.89 % at S=8K (DSv3 layer,
-    H=128/128).
+    H=128/128), and the d128 bf16 / fp16 kernel on its dense-band builds only (``_E2E_DENSE_BAND``:
+    +4..5 % dense on top of its spinning ring waits, a loss on the causal builds, llama layer).
 
     What it computes (bit for bit the backend's split, all ops ``.ftz``):
 
@@ -524,7 +783,7 @@ def sigmoid_f16x2(logit_pair: cutlass.Int32, input_dtype: cutlass.Constexpr):
     return sigmoid2(logit_vec_f32[0], logit_vec_f32[1])
 
 
-L2_NORM_EPS = 1.0e-12
+L2_NORM_EPS = 1.0e-6
 
 
 @cute.jit
@@ -540,10 +799,8 @@ def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cut
 
 @cute.jit
 def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
-    """Inverse L2 norm with the shared epsilon floor: rows at or below the
-    floor normalize by ``1 / L2_NORM_EPS`` instead of dividing by zero."""
-    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-    return cute.math.rsqrt(cute.math.max(sum_sq, norm_floor_sq), fastmath=True)
+    """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
+    return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
 
 
 @cute.jit
@@ -720,6 +977,56 @@ def e8m0_pair(amax0: cutlass.Float32, amax1: cutlass.Float32, *, inv_max=None):
     return e8m0_rcp(packed & cutlass.Int32(0xFF)), e8m0_rcp((packed >> 8) & cutlass.Int32(0xFF)), packed
 
 
+def e8m0_pair_u(amax0: cutlass.Float32, amax1: cutlass.Float32, inv_max: cutlass.Float32) -> cutlass.Int32:
+    """:func:`e8m0_pair`'s packed bytes for two WARP-UNIFORM amaxes (``redux.sync`` results): ``byte 0 = amax0``'s exponent,
+    ``byte 1 = amax1``'s, bits 16..31 zero -- the same rule, op for op (``amax * inv_max`` rounded to nearest, then ONE
+    ``cvt.rp.satfinite.ue8m0x2.f32``), spelled as ONE packed multiply for the pair.
+
+    A ``redux.sync`` result lands in a uniform register, and on sm_107a ptxas moves it into the vector file before ANY ALU op
+    reads it (``MOV R, UR``, one per amax): a scalar ``FMUL`` by an immediate, by a lane register, a packed ``mul.f32x2``, an LLVM
+    ``fmul`` outside inline asm, the ``cvt.rp`` on the uniform value itself -- 13 spellings, every one 64 moves per 64 columns
+    (standalone sm_107a SASS sweeps, 2026-10-01).  The move is the floor; what this helper saves is the MULTIPLY count: the two
+    moved amaxes form a register PAIR, ``mul.f32x2 {inv, inv} x {amax0, amax1}`` is ONE ``FMUL2`` whose two halves are both
+    consumed by the cvt (32 ``FMUL2`` per 64 columns instead of 64 scalar ``FMUL``; a broadcast ``{amax, amax}`` pair is
+    scalarised by ptxas and gains nothing).  ``inv_max`` must be a VECTOR register ptxas cannot fold into an immediate
+    (:func:`opaque_e4m3_max_rcp_in_lane`, hoisted once per kernel): the packed multiply has no immediate operand form, a foldable
+    constant is re-materialised per use.  Bit-identical to :func:`e8m0_pair` (``mul.rn.f32x2`` is two independent RN fp32
+    multiplies; operand a of the cvt lands in the UPPER byte, so amax1's scale goes first)."""
+    return inline_ptx(
+        "{ .reg .b64 pa, pb, pc; .reg .f32 s0, s1; .reg .b16 lo;\n"
+        "mov.b64 pa, {$1, $1};\n"
+        "mov.b64 pb, {$2, $3};\n"
+        "mul.rn.f32x2 pc, pa, pb;\n"
+        "mov.b64 {s0, s1}, pc;\n"
+        "cvt.rp.satfinite.ue8m0x2.f32 lo, s1, s0;\n"
+        "cvt.u32.u16 $0, lo; }",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[inv_max, amax0, amax1],
+    )
+
+
+def opaque_f32_bits_in_lane(bits: int, seed: cutlass.Float32) -> cutlass.Float32:
+    """The fp32 whose bit pattern is ``bits`` as a VECTOR register ptxas cannot fold into an immediate: ``fma.rn.f32(seed, 0, bits)``
+    on a FINITE runtime ``seed`` (IEEE: ``x * 0`` is not provably 0 for a NaN / inf ``x``, so neither compiler folds it).
+
+    :func:`opaque_f32_bits` only hides the constant from LLVM; ptxas re-folds its ``MOV`` into the consumer as an immediate, which
+    is right for a scalar ``FMUL R, R, imm`` and impossible for the PACKED multiply of :func:`e8m0_pair_u` (``mul.f32x2`` has no
+    immediate operand: a foldable constant is re-materialised per use).  A constant the assembler cannot fold stays in one vector
+    register for the whole kernel.  It does NOT remove the ``MOV R, UR`` of a CREDUX amax -- sm_107a ptxas moves a uniform result
+    into the vector file before any ALU op reads it, in every spelling tried (standalone sm_107a SASS sweeps, 2026-10-01).  One FFMA
+    per call -- hoist it to the kernel prologue."""
+    if not 0 <= int(bits) < (1 << 32):
+        raise ValueError(f"opaque_f32_bits_in_lane: bits must be a 32-bit pattern, got {bits!r}")
+    return inline_ptx(f"fma.rn.f32 $0, $1, 0f00000000, 0f{int(bits):08X};", write_only_types=[cutlass.Float32], read_only_args=[seed])
+
+
+def opaque_e4m3_max_rcp_in_lane(seed: cutlass.Float32) -> cutlass.Float32:
+    """``fp32(1/448)`` as a VECTOR register ptxas cannot fold (:func:`opaque_f32_bits_in_lane`): the ``inv_max`` for a batch of
+    warp-uniform amaxes (:func:`e8m0_pair_u` over CREDUX results).  ``seed`` is any finite per-lane fp32 (its lane
+    id converted); the value is bit-identical to :func:`opaque_e4m3_max_rcp`."""
+    return opaque_f32_bits_in_lane(E8M0_RCP_E4M3_MAX_BITS, seed)
+
+
 # ---------------------------------------------------------------------------
 # FP4 (e2m1) block quantization -- NVFP4 (e2m1 x E4M3 per 16) and MXFP4 (e2m1 x
 # E8M0 per 32).  The four primitives a quantizer composes, hardware-rounded where
@@ -866,3 +1173,44 @@ def abs_max_tree(vals):
             nxt.append(acc)
         elems = nxt
     return elems[0]
+
+
+@cutlass.cute.jit
+def warp_abs_max_f32(x: cutlass.Float32) -> cutlass.Float32:
+    """``max |x|`` over the 32 lanes of the (fully converged) warp in ONE ``redux.sync.max.abs.f32`` (sm_100a+, PTX 8.6;
+    ``cute.arch.warp_redux_sync(x, "fmax", abs=True)``); every lane receives the result.
+
+    The along-kv dS scale of the MXFP8 d=256 backward (one E8M0 per 32 kv ROWS of a q column, lane = kv row) is this
+    reduction once per column; the shuffle twin :func:`warp_abs_max_f32_shfl` is its bit-exact oracle and the fallback
+    for a part without the f32 redux.  Finite and +-inf inputs, signed zeros and fp32 denormals are in contract (bitwise
+    the shuffle tree -- pinned by ``test_tile_dsl_warp_abs_max.py``); NaN is not (a softmax gradient carries none, and
+    ``redux.sync.max.f32`` without ``.NaN`` and ``max.f32`` may treat it alike or not -- unmeasured).  DSL floor (AGENTS.md
+    Rule 7): the ``abs=`` keyword of ``cute.arch.warp_redux_sync`` is the cutlass-dsl 4.8.0 wheel's, the only one this was
+    traced with; a wheel without it takes :func:`warp_abs_max_f32_shfl`."""
+    return cute.arch.warp_redux_sync(x, "fmax", abs=True)
+
+
+@cutlass.cute.jit
+def warp_abs_max_f32_shfl(x: cutlass.Float32) -> cutlass.Float32:
+    """The shuffle-tree twin of :func:`warp_abs_max_f32`: ``|x|`` then five butterfly stages of :func:`fmax_f32`
+    (``shfl.sync.bfly`` 16, 8, 4, 2, 1), so every lane ends with the warp's ``max |x|``."""
+    v = cute.math.abs(x)
+    for i in cutlass.range_constexpr(5):
+        v = fmax_f32(v, cute.arch.shuffle_sync_bfly(v, 1 << i))
+    return v
+
+
+@cutlass.cute.jit
+def atomic_max_f32_bits(slot: cute.Tensor, value: cutlass.Float32) -> None:
+    """``slot[0] = max(slot[0], value)`` for a NON-NEGATIVE fp32 ``value`` through ONE int32 ``atomicMax`` of its bit
+    pattern -- the amax fold of every quantizing epilogue (``sdpa/bwd/kernels/sm107/bprop_d256_fp8.py``, the gated block's
+    gradient amax pass and gate backward).
+
+    Non-negative IEEE fp32 patterns order exactly as int32, so the slot ends at the fp32 max of every value folded into
+    it whatever order the warps arrive in: order-free and bitwise the ``max``.  Contract: ``slot`` is a 1-element fp32
+    tensor (4-byte aligned is enough) the caller ZEROED before the first arrive on the same stream -- ``0.0`` is the pattern
+    ``0x00000000``, the identity of this max, and a poisoned slot is the caller's bug; ``value >= +0.0`` -- a negative pattern
+    (``-0.0`` = ``0x80000000`` included) is a negative int32 and loses every comparison, a NaN pattern (``0x7FC00000``) wins
+    them all.  Call it from ONE lane (lane 0 after :func:`warp_abs_max_f32_shfl` / :func:`warp_abs_max_f32`)."""
+    ptr = Pointer(slot.iterator.raw_ptr(), dtype=cutlass.Int32)
+    nvvm.atomicrmw(nvvm.AtomicOp.MAX, ptr, value.bitcast(cutlass.Int32))

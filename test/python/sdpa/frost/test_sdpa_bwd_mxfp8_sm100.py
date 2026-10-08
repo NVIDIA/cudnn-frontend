@@ -201,6 +201,8 @@ def _run(
     d, dev = _D, "cuda"
     scale = 1.0 / math.sqrt(d)
     q, dO = torch.randn(b, hq, sq, d, device=dev), torch.randn(b, hq, sq, d, device=dev)
+    if omit_scale:  # attn_scale off the graph = no scaling (1.0); pre-scaled Q keeps the logits in their usual range
+        q, scale = q * scale, 1.0
     k, v = torch.randn(b, hkv, skv, d, device=dev), torch.randn(b, hkv, skv, d, device=dev)
     Q, K, V, DO = (_quantize(x, b, h, s, d) for x, h, s in ((q, hq, sq), (k, hkv, skv), (v, hkv, skv), (dO, hq, sq)))
 
@@ -281,25 +283,36 @@ def _run(
         grads = (dq, dk, dv)
         expected = tuple(x.clone() for x in grads)
         replay = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
-            g.execute(pack, ws)
-        for i in range(repeat_outputs):
-            # A zero-initialized output hides stores skipped for fully masked
-            # KV tiles. Exercise both non-finite and finite previous contents,
-            # and both eager and captured execution for each sentinel.
-            for x in grads:
-                x.fill_(float("nan") if i % 4 < 2 else 123.0)
-            if i % 2:
-                replay.replay()
-            else:
+        try:
+            with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
                 g.execute(pack, ws)
-            torch.cuda.synchronize()
-            for got, ref in zip(grads, expected):
-                torch.testing.assert_close(got.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
-            if causal and skv > sq:
-                for got in (dk, dv):
-                    tail = got[:, :, sq:, :]
-                    torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
+            for i in range(repeat_outputs):
+                # A zero-initialized output hides stores skipped for fully masked
+                # KV tiles. Exercise both non-finite and finite previous contents,
+                # and both eager and captured execution for each sentinel.
+                for x in grads:
+                    x.fill_(float("nan") if i % 4 < 2 else 123.0)
+                if i % 2:
+                    replay.replay()
+                else:
+                    g.execute(pack, ws)
+                torch.cuda.synchronize()
+                for got, ref in zip(grads, expected):
+                    torch.testing.assert_close(got.view(torch.int16), ref.view(torch.int16), rtol=0, atol=0)
+                if causal and skv > sq:
+                    for got in (dk, dv):
+                        tail = got[:, :, sq:, :]
+                        torch.testing.assert_close(tail, torch.zeros_like(tail), rtol=0, atol=0)
+        finally:
+            replay.reset()
+
+    # Reuse the independently checked case for prepared-binding regressions.
+    from types import SimpleNamespace
+
+    refs = dict(t, dq=dq_t, dk=dk_t, dv=dv_t)
+    return SimpleNamespace(
+        graph=g, refs=refs, pack=pack, workspace=ws, expected=tuple(x.clone() for x in (dq, dk, dv)), reference=(dq_r, dk_r, dv_r), scale=scale
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -315,7 +328,7 @@ def test_dense(out):
 
 @pytest.mark.L0
 def test_default_attn_scale():
-    """attn_scale is optional on the graph; the engine must default to 1/sqrt(d)."""
+    """attn_scale is optional on the graph; omitting it means no scaling (1.0), the backend's meaning."""
     _run(omit_scale=True)
 
 
@@ -391,8 +404,8 @@ def test_fully_masked_kv_tiles_overwrite_outputs(monkeypatch, out, persistent, b
     The graph adapter normally selects non-persistent scheduling. Force the
     kernel constructor flag here to cover the CLC zero-trip path as well.
     """
-    from cudnn.sdpa.bwd.kernels.bprop_dq_d256_mxfp8_sm100 import BlackwellFmhaBackwardDQ256
-    from cudnn.sdpa.bwd.kernels.bprop_dkdv_d256_mxfp8_sm100 import BlackwellFmhaBackwardDKDV256
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_dq_d256_mxfp8 import BlackwellFmhaBackwardDQ256
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_dkdv_d256_mxfp8 import BlackwellFmhaBackwardDKDV256
 
     def with_schedule(init):
         def wrapped(self, *args, **kwargs):
@@ -427,7 +440,7 @@ def test_workspace_accounts_for_repack_buffers():
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
-    from cudnn.sdpa.bwd.kernels.bprop_sf_repack_mxfp8_sm100 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
+    from cudnn.sdpa.bwd.kernels.sm100.bprop_sf_repack_mxfp8 import SF_LAYOUT_SFA, SF_LAYOUT_SFB, repack_geometry
 
     l = b * hq
     # 4 rowwise-A + 5 rowwise/columnwise-B + 2 columnwise-B buffers (see _sf_plan)

@@ -359,9 +359,10 @@ def _run(
     g.check_support()
     g.build_plans()
     if not stats:
-        # No Stats output: the kernel compiles the LSE store out (has_lse=False)
-        # — no dummy buffer exists at any level, so the dense workspace is 0.
-        assert g.get_workspace_size() == 0
+        # No Stats allocation: prepared scalar-output plans declare only the
+        # quantized scratch words; retained tensor paths need no scratch here.
+        prepared = g._compiled_plans[g._plan_index]._prepared
+        assert g.get_workspace_size() == (128 if prepared is not None else 0)
     vp[o] = Ob
     if amax:
         vp[amax_o] = amax_buf
@@ -384,9 +385,12 @@ def _run(
         # scale, say) is allocated but its fill only captured, so the eager
         # execute below would read it half-initialized (Rule 8; review on #1180).
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
-            g.execute(vp, workspace)
-        torch.cuda.synchronize()
+        try:
+            with torch.cuda.graph(captured):
+                g.execute(vp, workspace)
+            torch.cuda.synchronize()
+        finally:
+            captured.reset()
     g.execute(vp, workspace)
     torch.cuda.synchronize()
 
@@ -541,9 +545,10 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     )
     assert api.check_support()
     api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     with pytest.raises(ValueError, match="without Amax_O"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=torch.empty(1, device=dev, dtype=torch.float32))
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, workspace=workspace)
     torch.cuda.synchronize()
 
     o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
@@ -564,7 +569,8 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     )
     assert api_amax.check_support()
     api_amax.compile()
-    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o)
+    workspace_amax = torch.empty(api_amax.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
+    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o, workspace=workspace_amax)
     torch.cuda.synchronize()
     torch.testing.assert_close(
         amax_o,
@@ -602,6 +608,12 @@ def test_mxfp8_d192_split_kv_publishes_amax_from_combined_output():
         dtype_o=torch.bfloat16,
         split_kv=2,
     )
+
+    if torch.cuda.get_device_capability() == (10, 7):
+        # This SM100 split algorithm is deliberately absent on SM107.
+        with pytest.raises(NotImplementedError, match=r"split_kv > 1 on cc10.7"):
+            api.check_support()
+        return
 
     assert api.check_support()
     api.compile()
@@ -1177,10 +1189,10 @@ def test_mxfp8_d512_strided_stats():
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_stats_less_zero_workspace(in_key):
+def test_mxfp8_stats_less_declared_workspace(in_key):
     """No Stats output: the kernel compiles the LSE store out (has_lse=False),
-    no dummy buffer exists at any level, and the dense graph reports
-    ``get_workspace_size() == 0`` (asserted inside ``_run``). The Amax_O
+    no LSE dummy exists and the graph reports only its declared quantized
+    scratch (asserted inside ``_run``). The Amax_O
     atomicMax write is independent of the LSE and still produced."""
     scale = 1.0 / math.sqrt(128)
     O, O_ref, _ = _run(2, 8, 8, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), stats=False)
@@ -1200,6 +1212,20 @@ def test_mxfp8_masks(in_key, mask):
     scale = 1.0 / math.sqrt(128)
     O, O_ref, _ = _run(B, H, H, S, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask])
     _check(O, O_ref, torch.float16, in_key)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM == 107, reason="the Rubin MXFP8 row has no d64 flavor (exact native shapes only: d_shapes without (64, 64), d_pad_multiple=0)")
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d64_masks(in_key, mask):
+    """The native d64 leg of the d128 MXFP8 kernel (TemplateParams.d_flavor=64,
+    gpt-oss class): every mask family at d_qk = d_v = 64, cga1, half output."""
+    B, H, S = 2, 8, 256
+    scale = 1.0 / math.sqrt(64)
+    O, O_ref, _ = _run(B, H, H, S, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=64, d_v=64)
+    _check(O, O_ref, torch.float16, in_key, d_qk=64)
 
 
 @pytest.mark.L0
@@ -2037,7 +2063,8 @@ def test_mxfp8_stats_log2_every_flavor(d_qk, d_v):
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, scale_softmax=d_qk**-0.5, stats_log2=log2, split_kv=1)
         assert api.check_support()
         api.compile()
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=workspace)
         torch.cuda.synchronize()
         want = expected * (math.log2(math.e) if log2 else 1.0)
         torch.testing.assert_close(lse, torch.full_like(lse, want.item()), atol=1e-4, rtol=1e-4)
@@ -2159,7 +2186,7 @@ _SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
     print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
     print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
     print("E2E_ENABLED", int(mod._E2E_ENABLED))
-    mod.compile(b=1, qh=24, kh=8, sq=16384, skv=16384, has_lse=True)
+    mod.compile_prepared(d_qk=128, d_v=128, has_lse=True)
     """)
 
 # sm_100a counts of the shipped kernel (2026-09-22, PRODUCTION geometry, this probe's shape), all MEASURED on the
@@ -2260,7 +2287,10 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
 # the dense cubin (8 / 48 with the predicated form) and BSSY 8 / SYNCS.ARRIVE 56 on the causal one (15 / 63 with the branch
 # form), MEASURED 2026-09-22 on the trace-compiled cubins: one site taking the other form moves both counts by one.  Exact pins,
 # like the sm107 wait-form pins: deterministic for a given DSL + ptxas, re-pinned deliberately on a toolchain move.
-_CREDIT_ARRIVE_SITES = {(128, 128): 7, (192, 128): 7}  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the two softmax mask arms
+_CREDIT_ARRIVE_SITES = {
+    (128, 128): 6,
+    (192, 128): 7,
+}  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the softmax (d128: one site at the loop top for every mask arm; d192x128: one per mask arm)
 _SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
 _PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0"  # the one spelling both kernels carry: derived, never a literal
 # The module value each mask specialization must resolve to, keyed by the TemplateParams fields that select it.
@@ -2365,7 +2395,7 @@ def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
 @pytest.mark.L0
 @pytest.mark.parametrize("specialization", sorted(_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS))
 def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
-    """On the sm_100a cubin at the production geometry the 7 credit arrives lower to the form the specialization selects: the
+    """On the sm_100a cubin at the production geometry the credit arrives lower to the form the specialization selects: the
     DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 55 exactly; the predicated form reads 8 / 48)
     and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 56; the branch
     form reads 15 / 63), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin
@@ -2434,7 +2464,8 @@ def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
         )
         assert api.check_support()
         api.compile()
-        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=workspace)
         torch.cuda.synchronize()
         outs[with_stats] = out.clone()
     assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested"
@@ -2456,3 +2487,47 @@ def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
     assert (
         err.max().item() <= 1e-4
     ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (the exp2 emulation reads ~6e-6 dense / ~2e-5 causal; a quantized-sum LSE ~1e-3..1e-2)"
+
+
+# Explicit architecture CI entry; wide physical-stride probes remain opt-in L1.
+import test_sdpa_prepared_pv_bf16 as _prepared_pv_bf16_checks
+
+
+class TestPreparedPvBf16:
+    test_rebind_and_replay = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_prepared_rebind_and_replay)
+    test_staged_conversion = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_staged_conversion_omits_dead_operands)
+    test_explicit_no_amax = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_no_amax_flag_with_sample_descriptor)
+
+
+# Retain staged conversion coverage in the explicitly selected architecture CI entry.
+import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
+
+
+@pytest.mark.L0
+class TestStagedMxfp8:
+    test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
+    test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)
+    test_invalid_scales = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_sf_rejects_before_copy)
+    test_wide_stride = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_physical_wide_batch_stride)
+    test_pv_bf16 = staticmethod(_staged_mxfp8_checks.test_staged_pv_bf16_keeps_v_width_and_omits_sf_v)
+    test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
+    test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
+    test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
+
+
+@_skip_thd_mxfp8_on_rubin
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("cu_lens", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_batched_setup(batch, cu_lens):
+    """Parallel setup crosses warp chunks and descriptor-owner strides.
+
+    Zero Q/KV lengths and NaN-poisoned capacity tails exercise prefix publication,
+    per-request O extents, and packed-total K/V clamps together.
+    """
+    q_lens = [([0, 1, 17, 65, 129][i % 5]) for i in range(batch)]
+    kv_lens = [([33, 0, 65, 127, 257][i % 5]) for i in range(batch)]
+    out, ref, amax, _ = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", torch.float16, scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
+    _check(out, ref, torch.float16, "e4m3")
+    assert abs(amax.item() - ref.abs().max().item()) <= 0.03

@@ -1,5 +1,7 @@
 # Python-native `cudnn.pygraph` and pluggable execution backends
 
+> Execute-time shape overrides (`override_uids` / `override_shapes` / `override_strides`) are passed directly to native backend plans. Python engines whose compiled plan has `takes_variant_pack=True` receive the normalized override geometry in their `VariantPack`; legacy map-based Python engines reject these overrides before execution. Each engine determines which geometries it supports. See [Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
+
 ## What this is
 
 `cudnn.pygraph` is a Python-native graph class: graph structure (nodes,
@@ -84,10 +86,48 @@ create_execution_plans([heur_mode.A, ...])                    _pygraph.py
   `build_plan(graph, plan, ctx) → CompiledPlan` (the expensive
   JIT step, once per graph/plan, cached on the graph),
   `CompiledPlan.execute(graph, operands, ExecutionContext)` with explicit
-  handle/stream/workspace. Dynamic-shape overrides are a backend-path feature:
-  a python plan is compiled for the shapes the graph declared, so `execute()`
-  refuses them rather than silently running a different problem. Simple eager
-  engines implement `execute()` only.
+  handle/stream/workspace. Runtime shape/stride overrides are supported by the
+  cuDNN backend and compatible `VariantPack` plans. A legacy uid-map plan rejects
+  overrides rather than silently ignoring them. Simple eager engines implement
+  `execute()` only.
+
+#### Ordered bindings for repeated execution
+
+`graph.execute` accepts either its existing tensor mapping or a tuple/list of
+buffers paired with a `tensor_uids` tuple/list. Both forms use the selected plan,
+workspace, and handle in the same way for the cuDNN backend and Python engines,
+including FROST. There is no additional preparation call:
+
+```python
+# Q, K, V, O are graph tensors; q, k, v, out are runtime buffers.
+uids = (Q.get_uid(), K.get_uid(), V.get_uid(), O.get_uid())
+graph.execute((q, k, v, out), workspace, handle=handle, tensor_uids=uids)
+```
+
+UIDs must be distinct integers, with one UID per buffer; their order need not
+be sorted. As with mappings, buffers for unused UIDs are ignored, explicit
+bindings take precedence over graph-bound inputs, and all required operands
+must be supplied. The parameter name `tensor_dict` is retained for existing
+keyword callers; it accepts the buffer sequence when `tensor_uids` is present.
+`execute_plan_at_index` accepts the same ordered form.
+
+Existing `override_uids`, `override_shapes`, and `override_strides` arguments
+also work with ordered bindings. Supply all three together, using the graph's
+axis order and element units. Each override UID must name an operand, and
+geometry must be supported by the selected plan. This form does not extend an
+engine's supported layouts or dynamic-shape envelope.
+
+FE prepares the graph's binding layout internally and reuses the most recent
+UID/override metadata by value. Changing a list in place is observed on the
+next call. Every execution reads the current buffers and workspace and creates
+its own pointer pack; the cache retains no runtime tensors, addresses, or
+stream. Buffer descriptions, capacity, and device information remain available
+to engine validation. Bare addresses retain the existing caller-responsibility
+contract; use real buffer objects when metadata must be validated.
+
+Buffer and workspace lifetimes remain the caller's responsibility through GPU
+completion, and through all replays of a captured CUDA graph. Changing a later
+call's bindings does not update an already captured graph's addresses.
 
 #### The variant pack is normalized once
 
@@ -294,7 +334,7 @@ are close.
   optional dependency can only surface at build time — without it, a host
   lacking the `cutedsl` extra would lose graphs the backend could have served.
 - The contract is proven end to end without a GPU in
-  `test/python/test_dispatch.py`, with stand-in engines injected through the
+  `test/python/core/test_dispatch.py`, with stand-in engines injected through the
   manifest — the same path production uses. Those engines do no arithmetic:
   what dispatch is responsible for is reaching the engine and resolving the
   caller's buffers, and checking a result against `torch.matmul` would put a
@@ -320,7 +360,8 @@ are close.
   adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
   op pattern), so it inherits whatever engine the planner selects. The
   optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
-  rows; `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
+  rows (`x * rsqrt(sum(x * x) + 1e-6)`, forward and backward Jacobian);
+  `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
   `gdn_bwd` on the FROST chunked kernels) serves it through a workspace
   helper kernel (normalized q/k copies + saved inverse norms, with the
   backward Jacobian projection applied in place after the head-group fold),
@@ -403,8 +444,10 @@ are close.
   uneven batch walks the same critical path as an even one (when the
   per-sequence ceilings would overflow the wave the span is recomputed against
   `B * P - (B - 1)` slots). `warmup` (the decay-warmup split-K of
-  `frost/common/split_k.py`) serves the band where the chain has no room, and
-  `uncut` runs one item per (sequence, head). Under
+  `frost/common/split_k.py`) serves the band where the chain has no room for
+  the scalar-gate ops (GDN, GDP); KDA and GDN-2 run that band `uncut`, one
+  item per (sequence, head), because their channel-mixing transition
+  `(I - beta k k^T) Diag(alpha)` admits no gate-only decay bound. Under
   `batch_invariant` the geometry comes from the length rule alone, `P =
   clamp(ceil(total / 8192), 1, 16)` slots per sequence, of which each fills
   `clamp(ceil(len / 8192), 1, P)` on device, `uncut` when `total <= 8192`
@@ -562,6 +605,14 @@ record to the graph; engines read that record back rather than parsing again.
   `has_bias=True` as a fact, never an error; each engine's `Capabilities` row
   does the rejecting in `mismatch()`. A shared parser that starts rejecting
   becomes an if-ladder that must know every kernel.
+- **Caller hints are facts too.** `cudnn.pygraph(..., is_cuda_graph_replay_expected=True)`
+  (keyword-only; `cudnn.graph(...)` forwards it) states that the caller will
+  capture `graph.execute` into a CUDA graph and replay it. The SDPA analyzer
+  records it as `cuda_graph_replay`, and a family's heuristics may then lead
+  with the plan that is fastest on the GPU alone, since per-execute host costs
+  are paid once at capture (the SDPA forward d256 decode tile leads with its
+  split-KV plan instead of listing it as the runner-up). The hint changes no
+  numerics and no support, and it is never forwarded to the backend.
 - **Framework-neutral vocabulary**: `cudnn.data_type`, not `torch.dtype`;
   device from `cudnn.create_device_properties()`, the backend's own descriptor.
   Facts are what every engine of a family reads, so expressing them in one
@@ -603,7 +654,7 @@ only to decline is why `closed_under` existed.
   `pyproject`'s required dependency deliberately sits below it (`>=4.6.2`),
   since pinning that high would make cudnn-frontend incompatible with anything
   holding the DSL back.
-- `test/python/test_import_boundaries.py` holds all of this, in a fresh
+- `test/python/core/test_import_boundaries.py` holds all of this, in a fresh
   interpreter, measuring the delta against an empty one.
 
 ### Ranking and the one plan list
@@ -702,10 +753,12 @@ only to decline is why `closed_under` existed.
   bug: the record would replay a different kernel after the pick changes.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
-  (`softmax_precision`) is an **op attribute** declared in the op spec's
-  `python_only_attrs`: never forwarded to C++, a SET value makes the node
-  backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
-  a graph fact the capability rows gate on.
+  (`softmax_precision`) or a contract on the inputs (`attn_scale_prefolded`:
+  Q already carries the softmax scale) is an **op attribute** declared in the
+  op spec's `python_only_attrs`: never forwarded to C++, a SET value (a bool
+  attribute set to `False` counts as unset) makes the node backend-unlowerable
+  (`serialize()` and `key()` refuse it), and it surfaces as a graph fact the
+  capability rows gate on.
 
 ### One kernel per layout class, not per shape (SDPA THD)
 
@@ -800,11 +853,27 @@ artifact can never be reused by accident:
   next start-up. Kernels whose in-process object converts raw pointer
   arguments, takes a dataclass argument, or has a default JSON cannot carry
   are not persisted.
+- **One object per kernel per process.** In front of the files sits an
+  in-process memo keyed by the device a build targets, the live CUDA device the
+  compile is issued under (the DSL ties a compiled object's executor to a device
+  context; the two agree unless a handle scoped the build to another GPU), the
+  key, the symbol and the compile options: a second plan over the same
+  kernel in the same process gets the object the first plan got — no trace, no
+  compile, no file touched — whatever the on-disk cache's state. A graph that
+  builds several plans over one kernel, or a test suite that builds one block
+  instance per case, otherwise pays a full JIT per plan (`cute.compile` has no
+  memo of its own; with the on-disk cache off, the gated-attention-block
+  backward suite -- 109 cases -- went from 855 s to 261 s and from 730 to 100
+  compiles on a Rubin development part). A kernel without a key is never
+  memoised; a failed compile is not memoised; `clear_memo()` forgets the
+  objects.
+  `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` turns the memo off — for a
+  test that exercises the reload path itself, or an A/B of the memo.
 - Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
-  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned
-  per process. Bump `_SCHEMA` on any incompatible change.
+  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned /
+  memo_hits per process. Bump `_SCHEMA` on any incompatible change.
 - **Dead environments are retired.** The manifest hashes the package's source,
   so every edited checkout and every CI commit mints an environment directory
   that will never be hit again — a few hundred MB per commit on a runner with a

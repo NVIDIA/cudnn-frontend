@@ -101,6 +101,7 @@ dev = [
     "pybind11[global]>=2.13,<3",
     "pytest",
     "pytest-xdist",
+    "cuda-python",
     "looseversion",
     "black==26.3.1",
     "clang-format==21.1.6",
@@ -133,9 +134,11 @@ include-package-data = true
 version = {attr = "cudnn.__version__"}
 
 [tool.setuptools.package-data]
+"cudnn.sdpa.bwd.compact_gqa" = ["csrc/*.cpp"]
 include = ["**/*"]
 "cudnn.moe_ep._megamoe_backend.cutedsl_src" = [
     "LICENSE.Apache-2.0",
     "VENDOR.md",
 ]
 "cudnn.linear_attention.cake.kernels" = ["*.cu", "SHA256SUMS", "UPSTREAM.md"]
+"cudnn.linear_attention.hopper" = ["cuda_kernels/*.cu"]

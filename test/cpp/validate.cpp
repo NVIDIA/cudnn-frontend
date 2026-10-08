@@ -2,7 +2,9 @@
  * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_message.hpp>
@@ -105,6 +107,165 @@ TEST_CASE("Multiple validation", "[graph][validate]") {
 
     REQUIRE(graph.validate().is_good());
     REQUIRE(graph.validate().is_good());
+}
+
+// ---- validation order for a derived output attribute (#703) ----------------
+//
+// The SDPA forward graph factory creates O with output_tensor(), i.e. as a virtual output that
+// carries no layout, and the node materializes a packed BHSD layout for it during inference.
+// Checking that layout in pre_validate_node() -- which runs before inference -- read "not yet
+// derived" as "invalid" and rejected every graph that left O unset. The node-author rule this
+// pins down lives next to INode::pre_validate_node() in include/cudnn_frontend/node_interface.h.
+namespace {
+namespace fe = cudnn_frontend;
+
+int64_t const kSdpaB = 3;
+int64_t const kSdpaH = 4;
+int64_t const kSdpaS = 128;
+int64_t const kSdpaD = 64;
+
+enum class ODecl {
+    kUndeclared,  // both dim and stride left to inference
+    kDeclared,    // equivalent explicit declaration
+    kDimOnly,     // partial declaration
+    kStrideOnly,  // partial declaration
+    kBadLayout,   // explicit, but the last dimension is strided
+};
+
+struct SdpaCase {
+    std::shared_ptr<fe::graph::Graph> graph;
+    std::shared_ptr<fe::graph::Tensor_attributes> O;
+};
+
+// One graph factory for every case, so that the cases differ only in what the caller declares.
+SdpaCase
+make_sdpa_forward_graph(ODecl o_decl, bool bad_k_stride = false, bool unset_max = false) {
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    std::vector<int64_t> const bhsd          = {kSdpaB, kSdpaH, kSdpaS, kSdpaD};
+    std::vector<int64_t> const packed_stride = {kSdpaH * kSdpaS * kSdpaD, kSdpaS * kSdpaD, kSdpaD, 1};
+    std::vector<int64_t> const sample_stride = {kSdpaH * kSdpaD, kSdpaD, kSdpaB * kSdpaH * kSdpaD, 1};
+    std::vector<int64_t> const bad_stride    = {kSdpaH * kSdpaS * kSdpaD, kSdpaS * kSdpaD, 1, kSdpaS};
+
+    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(bhsd).set_stride(packed_stride));
+    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(bhsd).set_stride(
+        bad_k_stride ? bad_stride : packed_stride));
+    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(bhsd).set_stride(packed_stride));
+
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("sdpa");
+    if (unset_max) {
+        sdpa_options.set_logit_max(graph->tensor(fe::graph::Tensor_attributes().set_name("Max")));
+    }
+
+    auto results = graph->sdpa(Q, K, V, sdpa_options);
+    auto O       = results[0];
+
+    switch (o_decl) {
+        case ODecl::kUndeclared:
+            break;
+        case ODecl::kDeclared:
+            O->set_dim(bhsd).set_stride(sample_stride);
+            break;
+        case ODecl::kDimOnly:
+            O->set_dim(bhsd);
+            break;
+        case ODecl::kStrideOnly:
+            O->set_stride(sample_stride);
+            break;
+        case ODecl::kBadLayout:
+            O->set_dim(bhsd).set_stride(bad_stride);
+            break;
+    }
+
+    return {graph, O};
+}
+}  // namespace
+
+TEST_CASE("SDPA forward validates a derived output layout after inference",
+          "[graph][sdpa][validate][validation_order]") {
+    SECTION("an undeclared O layout is inferred, so validate() succeeds") {
+        auto c = make_sdpa_forward_graph(ODecl::kUndeclared);
+        REQUIRE(c.O->get_dim().empty());
+        REQUIRE(c.O->get_stride().empty());
+
+        REQUIRE(c.graph->validate().is_good());
+
+        // Inference materialized the packed BHSD layout.
+        REQUIRE(c.O->get_dim() == std::vector<int64_t>{kSdpaB, kSdpaH, kSdpaS, kSdpaD});
+        REQUIRE(c.O->get_stride() == std::vector<int64_t>{kSdpaH * kSdpaS * kSdpaD, kSdpaS * kSdpaD, kSdpaD, 1});
+    }
+
+    SECTION("an explicitly declared O layout is not rewritten") {
+        auto c = make_sdpa_forward_graph(ODecl::kDeclared);
+        REQUIRE(c.graph->validate().is_good());
+        REQUIRE(c.O->get_dim() == std::vector<int64_t>{kSdpaB, kSdpaH, kSdpaS, kSdpaD});
+        REQUIRE(c.O->get_stride() == std::vector<int64_t>{kSdpaH * kSdpaD, kSdpaD, kSdpaB * kSdpaH * kSdpaD, 1});
+    }
+
+    SECTION("a partial O declaration is still rejected") {
+        auto dim_only   = make_sdpa_forward_graph(ODecl::kDimOnly);
+        auto dim_status = dim_only.graph->validate();
+        REQUIRE(dim_status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+        REQUIRE(dim_status.get_message().find("output_names::O") != std::string::npos);
+
+        auto stride_only   = make_sdpa_forward_graph(ODecl::kStrideOnly);
+        auto stride_status = stride_only.graph->validate();
+        REQUIRE(stride_status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+        REQUIRE(stride_status.get_message().find("output_names::O") != std::string::npos);
+    }
+
+    SECTION("an explicitly declared unsupported O layout is still rejected") {
+        auto c      = make_sdpa_forward_graph(ODecl::kBadLayout);
+        auto status = c.graph->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+        REQUIRE(status.get_message().find("output_names::O") != std::string::npos);
+    }
+
+    SECTION("a required input with an unsupported layout is still rejected") {
+        auto c      = make_sdpa_forward_graph(ODecl::kUndeclared, true);
+        auto status = c.graph->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+        REQUIRE(status.get_message().find("input_names::K") != std::string::npos);
+    }
+
+    SECTION("repeated validate() stays green and keeps the inferred layout") {
+        auto c = make_sdpa_forward_graph(ODecl::kUndeclared);
+        REQUIRE(c.graph->validate().is_good());
+        auto const once_dim    = c.O->get_dim();
+        auto const once_stride = c.O->get_stride();
+        REQUIRE(c.graph->validate().is_good());
+        REQUIRE(c.graph->validate().is_good());
+        REQUIRE(c.O->get_dim() == once_dim);
+        REQUIRE(c.O->get_stride() == once_stride);
+    }
+
+    SECTION("an optional output the caller left unset is still an error") {
+        auto c      = make_sdpa_forward_graph(ODecl::kDeclared, false, true);
+        auto status = c.graph->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+        REQUIRE(status.get_message().find("Max") != std::string::npos);
+    }
+}
+
+TEST_CASE("SDPA forward derived output layout survives the expand path", "[graph][sdpa][validate][validation_order]") {
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    auto c = make_sdpa_forward_graph(ODecl::kUndeclared);
+    REQUIRE(c.graph->validate().is_good());
+    auto const inferred_dim    = c.O->get_dim();
+    auto const inferred_stride = c.O->get_stride();
+
+    // expand_subtree(): pre -> infer -> expand -> children -> post. The expansion must keep the
+    // layout inference materialized, not replace or re-derive it.
+    REQUIRE(c.graph->build_operation_graph(handle).is_good());
+    REQUIRE(c.O->get_dim() == inferred_dim);
+    REQUIRE(c.O->get_stride() == inferred_stride);
+
+    cudnnDestroy(handle);
 }
 
 TEST_CASE("SDPA block-mask backend support boundary", "[graph][sdpa][validate]") {

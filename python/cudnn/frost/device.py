@@ -66,7 +66,7 @@ def ambient_device() -> int:
     slot, so that is the second rung."""
     drv = _driver()
     if drv is None:
-        raise RuntimeError("cudnn.frost: no CUDA device visible")
+        raise NotImplementedError("cudnn.frost: no CUDA device visible")
     if int(_ck(*drv.cuCtxGetCurrent())) != 0:
         return int(_ck(*drv.cuCtxGetDevice()))
     import cuda.bindings.runtime as rt
@@ -148,7 +148,7 @@ class device_context:
     def __enter__(self):
         self._drv = _driver()
         if self._drv is None:
-            raise RuntimeError("cudnn.frost: no CUDA device visible")
+            raise NotImplementedError("cudnn.frost: no CUDA device visible")
         self._handle = _device_handle(self._device)
         self._previous = _ck(*self._drv.cuCtxGetCurrent())
         _ck(*self._drv.cuCtxSetCurrent(_ck(*self._drv.cuDevicePrimaryCtxRetain(self._handle))))

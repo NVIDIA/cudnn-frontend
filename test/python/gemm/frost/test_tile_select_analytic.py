@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
-from cudnn.gemm.frost.tile_config import as_pipeline, by_name, select_config
+from cudnn.gemm.frost.tile_config import as_mma_tile_k, as_pipeline, by_name, select_config
 
 MS = (1, 4, 16, 32, 64, 96, 128, 129, 256, 512, 1024, 4096)
 NS = (32, 64, 128, 256, 512, 1024, 4096, 8192, 10240)
@@ -767,3 +767,56 @@ def test_a_new_pipeline_must_register_its_hardware_facts():
             tc.as_pipeline(tc.DEFAULT_CONFIG, "sm_fake")
     finally:
         del tc._CONFIG_CLASS_BY_PIPELINE["sm_fake"]
+
+
+def _dense_fp8_chain(M, N, K):
+    chain = _plain_strategy_chain(M=M, N=N, K=K)
+    return replace(chain, matmul=replace(chain.matmul, a_dtype="fp8_e4m3", b_dtype="fp8_e4m3"))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "m,n,k", [(256, 256, 256), (512, 4096, 8192), (1000, 17408, 4096), (4096, 17408, 4096), (16, 32, 256), (129, 10240, 1024), (8192, 8192, 8192)]
+)
+def test_dense_fp8_auto_pick_keeps_the_k_width_select_config_chose(monkeypatch, m, n, k):
+    """The auto path's K-width re-stamp (``preferred_strategy``) must agree with the geometry
+    ``select_config`` picked. On the parts that issue the dense-FP8 64-byte-K MMA, select_config
+    emits it only for a 128-tall CTA in a 2-CTA pair -- the envelope the kernel exists for
+    (``compiler._check_mma_k_dim``: dense K64 needs mma_tile_m == 128 per CTA). Re-stamping K64
+    onto every dense fp8 pick made a small-M pick unrenderable, and since plan_config probes
+    its ONE pick, the whole graph lost its frost_gemm plan (the gated attention block's fp8
+    projection GEMMs on sm_107, 19 CI cases, 2026-09-22)."""
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import dense_k64_envelope, preferred_strategy
+
+    chain = _dense_fp8_chain(m, n, k)
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    pick = select_config(m, n, 1, K=k, b_elem_bytes=1, sm_count=208)
+    config = preferred_strategy(chain, pick)
+    C._check_mma_k_dim(chain, config)  # the ONE pick the auto path probes must be renderable
+    assert config.mma_tile_k_bytes == pick.mma_tile_k_bytes
+    assert config.mma_tile_k_bytes == (64 if dense_k64_envelope(pick) else 32)
+    assert (config.cta_tile_mn, config.cga_size_mn, config.cta_group) == (pick.cta_tile_mn, pick.cga_size_mn, pick.cta_group)
+
+
+@pytest.mark.L0
+def test_dense_fp8_auto_pick_takes_the_64_byte_mma_k_inside_its_envelope(monkeypatch):
+    """The 64-byte-K form is still TAKEN where it belongs (a machine-filling 128-tall pair on
+    sm_107), and never on older Blackwell; a 64-tall pick keeps 32 on both."""
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import dense_k64_envelope, preferred_strategy
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 107)
+    wide = _dense_fp8_chain(8192, 8192, 8192)
+    wide_pick = select_config(8192, 8192, 1, K=8192, b_elem_bytes=1, sm_count=208)
+    assert dense_k64_envelope(wide_pick) and wide_pick.mma_tile_k_bytes == 64
+    assert preferred_strategy(wide, wide_pick).mma_tile_k_bytes == 64
+    small = _dense_fp8_chain(256, 256, 256)
+    small_pick = select_config(256, 256, 1, K=256, b_elem_bytes=1, sm_count=208)
+    assert not dense_k64_envelope(small_pick) and small_pick.mma_tile_k_bytes == 32
+    assert preferred_strategy(small, small_pick).mma_tile_k_bytes == 32
+    # A pick re-stamped to K64 by hand (a forced tile) is still corrected back where the kernel does not exist.
+    assert preferred_strategy(small, as_mma_tile_k(small_pick, 64)).mma_tile_k_bytes == 32
+
+    monkeypatch.setattr(C, "_current_arch", lambda: 100)
+    assert preferred_strategy(wide, select_config(8192, 8192, 1, K=8192, b_elem_bytes=1, sm_count=148)).mma_tile_k_bytes == 32

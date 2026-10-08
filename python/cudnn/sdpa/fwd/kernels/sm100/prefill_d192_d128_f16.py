@@ -118,7 +118,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile
 from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -128,6 +128,7 @@ from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
     MASK_SWA,
 )
+
 from cudnn.block_sparse_attention.csrc.utils.kernel_utils import ex2_emulation_2
 
 _PADDED_CAUSAL = CFG.MASK_FLAGS == (MASK_CAUSAL | MASK_PADDED) and CFG.WINDOW_RIGHT == 0
@@ -610,46 +611,6 @@ def _softmax_next_payload(
         segments[2],
         segments[3],
     )
-
-
-@cute.jit
-def _apply_top_left_causal_mask_chunk(reg_S, q_abs, kv_col_base, N: int = 64):
-    neg_inf = cutlass.Float32(float("-inf"))
-    last_live = q_abs - kv_col_base
-    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
-        # Right-band widening: the causal upper limit sits BAND_RIGHT columns
-        # right of the diagonal (cuDNN diagonal_band_right_bound).
-        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
-    elems = [
-        cutlass.Float32(
-            arith.select(
-                (cutlass.Int32(i) > last_live).ir_value(),
-                neg_inf.ir_value(),
-                reg_S[i].ir_value(),
-            )
-        )
-        for i in range(N)
-    ]
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
-
-
-@cute.jit
-def _apply_bottom_right_causal_mask_chunk(reg_S, q_abs, kv_col_base, causal_diag, N: int = 64):
-    neg_inf = cutlass.Float32(float("-inf"))
-    last_live = q_abs + causal_diag - kv_col_base
-    if cutlass.const_expr(CFG.WINDOW_RIGHT != 0):
-        last_live = last_live + cutlass.Int32(CFG.WINDOW_RIGHT)
-    elems = [
-        cutlass.Float32(
-            arith.select(
-                (cutlass.Int32(i) > last_live).ir_value(),
-                neg_inf.ir_value(),
-                reg_S[i].ir_value(),
-            )
-        )
-        for i in range(N)
-    ]
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
 
 
 @cute.jit
@@ -1205,6 +1166,10 @@ def _tmaldg_warp_group(
         # GmemTileTma, so every load site below stays branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        # Setup publishes immutable packed-total descriptors before this kernel.
+        # Every loader warp, including both CTAs, acquires each map once.
+        tma_tensormap_acquire(_k_rt_ptr)
+        tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     elif cutlass.const_expr(PAGED_KV and paged_hnd):
@@ -1343,6 +1308,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                 )
 
             _wait_mbarrier(mb_q_reload[1], q_empty_phase)
@@ -1395,6 +1361,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
+                    acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                 )
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
@@ -1430,6 +1397,7 @@ def _tmaldg_warp_group(
                         bars.mb_k_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                     )
 
                 _wait_mbarrier(bars.mb_v_empty[kv_state.idx], kv_state.phase)
@@ -1461,6 +1429,7 @@ def _tmaldg_warp_group(
                         bars.mb_v_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                     )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
@@ -1602,7 +1571,8 @@ def _tmastg_warp_group(
                             q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE),
                             cutlass.Int32(0),
                         )
-                        tma_store_tile(sO[qs], o_slice)
+                        # All Q slabs of this work item share an immutable O map.
+                        tma_store_tile(sO[qs], o_slice, acquire=(qs == 0))
                 else:
                     tma_store_tile(
                         sO[qs],
@@ -2106,33 +2076,54 @@ def _softmax_kv_body(
             if cutlass.const_expr(CFG.BOTTOM_RIGHT):
                 mask_q_abs = mask_q_abs + causal_diag
             mask_q_abs = cute.math.min(mask_q_abs, eff_seqlen_kv - cutlass.Int32(1))
+            # Causal + padded as ONE causal edge: kv > min(q (+ diag), seq_kv - 1) masks
+            # exactly the causal OR padded set, so the chunk sees a top-left causal mask
+            # anchored at mask_q_abs (WINDOW_RIGHT == 0 in this arm by _PADDED_CAUSAL).
             chunks_S = [
-                _apply_top_left_causal_mask_chunk(
+                apply_mask_chunk(
                     raw_chunks[c],
                     mask_q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
         elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT == 0):
+            # Top-left causal (+ the compile-time right band, cuDNN diagonal_band_right_bound).
             chunks_S = [
-                _apply_top_left_causal_mask_chunk(
+                apply_mask_chunk(
                     raw_chunks[c],
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
         elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_CAUSAL and CFG.BOTTOM_RIGHT != 0):
+            # Bottom-right causal: the diagonal sits causal_diag = S_kv - S_q columns right of top-left.
             chunks_S = [
-                _apply_bottom_right_causal_mask_chunk(
+                apply_mask_chunk(
                     raw_chunks[c],
                     q_abs,
                     kv_col_base + cutlass.Int32(c * CHUNK),
-                    causal_diag,
+                    eff_seqlen_kv,
+                    0,
+                    MASK_CAUSAL,
                     N=CHUNK,
+                    bottom_right=CFG.BOTTOM_RIGHT,
+                    causal_diag=causal_diag,
+                    mask_value=float("-inf"),
+                    window_right=CFG.WINDOW_RIGHT,
                 )
                 for c in range(N_CHUNKS)
             ]
@@ -2820,16 +2811,14 @@ def _correction_warp_group(
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
                         # token-major packed (T, H)
-                        lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                        lse_row[head_idx] = lse_val
+                        lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
                     else:
                         # head-major packed (1, QH, head_stride)
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
                             # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                             lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                            lse_row[_cu_q_b + q_row_global] = lse_val
+                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
             else:
                 if q_row_global < seqlen_q:
                     lse_arr = cutlass.make_array_view(lse_tensor)
@@ -2956,7 +2945,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -3131,7 +3120,7 @@ def _host(
             thd_lens_form,
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
-            cutlass.Int32(o_tensor.stride[1]),
+            cutlass.Int64(o_tensor.stride[1]),
             cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
             n_thd_units,  # persistent cluster count; also seeds the claim counter
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
@@ -3239,7 +3228,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),

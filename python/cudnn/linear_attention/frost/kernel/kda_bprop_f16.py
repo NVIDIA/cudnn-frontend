@@ -136,7 +136,7 @@ USE_PDL = True
 
 LOG2_E: float = 1.4426950408889634
 DEFAULT_GATE_LOWER_BOUND: float = -5.0
-L2_NORM_EPS: float = 1.0e-12
+L2_NORM_EPS: float = 1.0e-6
 
 
 class KdaBpropBars(NamedTuple):
@@ -1892,9 +1892,8 @@ def compute0_warp_group(
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 4, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 2, 31, kind=nvvm.Shfl.BFLY))
                 k_sum_sq = k_sum_sq + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, k_sum_sq, 1, 31, kind=nvvm.Shfl.BFLY))
-                norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-                q_inv_norm = cute.math.rsqrt(cute.math.max(q_sum_sq, norm_floor_sq), fastmath=True)
-                k_inv_norm = cute.math.rsqrt(cute.math.max(k_sum_sq, norm_floor_sq), fastmath=True)
+                q_inv_norm = cute.math.rsqrt(q_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
+                k_inv_norm = cute.math.rsqrt(k_sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
                 if lane_in_row_group == 0:
                     sNorm_raw[(chunk_serial % cfg.tmem_qk_raw_stages) * (2 * cfg.b_t) + decay_row] = q_inv_norm
                     sNorm_raw[(chunk_serial % cfg.tmem_qk_raw_stages) * (2 * cfg.b_t) + cfg.b_t + decay_row] = k_inv_norm
@@ -3175,7 +3174,6 @@ def build_descs_body(
 @cute.kernel
 def frost_kda_bprop_prologue(
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
     base_q: cutlass.GridConstant[cuda.tensor_map.TensorMap],
     base_k: cutlass.GridConstant[cuda.tensor_map.TensorMap],
@@ -3199,7 +3197,6 @@ def frost_kda_bprop_prologue(
     dv: cute.Tensor,
     dgate: cute.Tensor,
     state_checkpoints: cute.Tensor,
-    mStaging: cute.Tensor | None,
     mCount: cute.Tensor,
     mWorkItems: cute.Tensor | None,
     mScheduler: cute.Tensor | None,
@@ -3207,7 +3204,7 @@ def frost_kda_bprop_prologue(
     checkpoint_every_n: cutlass.Int32,
 ) -> None:
     """Two-CTA prologue. Under ``run_order`` this kernel is the first
-    work-item-table consumer, so block 0 LPT-orders the table and zeroes both
+    work-item-table consumer, so block 0 synthesizes and LPT-orders the uncut table and zeroes both
     consumers' scheduler rings via :func:`order_body`; block 1 builds the
     per-batch TMA-descriptor arrays via :func:`build_descs_body`, one warp
     per array."""
@@ -3225,7 +3222,7 @@ def frost_kda_bprop_prologue(
             sSpread = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=8)
             n_heads_out = cutlass.Int32(gate.shape[1])
             order_body(
-                order_gen,
+                True,
                 b_t,
                 ORDER_THREADS,
                 ORDER_ELEMENTS,
@@ -3233,7 +3230,7 @@ def frost_kda_bprop_prologue(
                 n_heads_out,
                 n_heads_out * n_batch,
                 cu_seqlens,
-                mStaging,
+                None,
                 mCount,
                 mWorkItems,
                 mScheduler,
@@ -3276,7 +3273,6 @@ def prologue(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
     run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -3288,14 +3284,13 @@ def prologue(
     dgate: cute.Tensor,
     state_checkpoints: cute.Tensor,
     cu_seqlens: cute.Tensor,
-    work_item_staging: cute.Tensor | None,
     work_count: cute.Tensor,
     work_items: cute.Tensor | None,
     scheduler_all: cute.Tensor | None,
     tensormap_workspace: cute.Tensor,
     stream: cuda_driver.CUstream,
 ):
-    """One-launch prologue: LPT-order the work items (when ``run_order``) and
+    """One-launch prologue: synthesize and LPT-order the uncut work items (when ``run_order``) and
     build the 10 per-(batch, head) capped TMA-descriptor arrays into
     ``tensormap_workspace`` (sequence-relative coordinates; tail loads
     zero-fill and tail stores clip in hardware)."""
@@ -3345,7 +3340,6 @@ def prologue(
 
     frost_kda_bprop_prologue(
         run_order,
-        order_gen,
         b_t,
         base_q,
         base_k,
@@ -3369,7 +3363,6 @@ def prologue(
         dv,
         dgate,
         state_checkpoints,
-        work_item_staging,
         work_count,
         work_items,
         scheduler_all,
@@ -3408,7 +3401,7 @@ def host(
 
     # ---- launch ----------------------------------------------------------------------
     n_desc = num_sequences
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
     frost_kda_bprop(
         cfg,
         q_ratio,

@@ -156,6 +156,31 @@ def _bounded_aux_prelude(chain: FusionChain, row_bound: str, col_bound: str, on_
     return lines
 
 
+def _scatter_aux_prelude(chain: FusionChain) -> list[str]:
+    """Pointwise nodes consume SCATTER's logical output coordinates."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    row = "row" if swapped else "moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)"
+    col = "moe_scatter_row(token_index, token_ks, col_j + _auxk, group_end, N, moe_top_k)" if swapped else "col_j + _auxk"
+    lines = []
+    for aux in chain.aux_tensors:
+        if aux.bcast_mode == "per_row":
+            idx = _aux_index_expr(aux, row_var=f"cute.math.min(cutlass.Int32({row}), cutlass.Int32(M) - 1)")
+            lines.append(f"{_aux_prefetch_var(aux.name)} = ({_aux_ptr_var(aux.name)} + {idx}).load()")
+        if aux.bcast_mode not in ("per_col", "per_elem"):
+            continue
+        n = aux.name
+        idx = _aux_index_expr(
+            aux, row_var=f"cute.math.min(cutlass.Int32({row}), cutlass.Int32(M) - 1)", col_var=f"cute.math.min(cutlass.Int32({col}), cutlass.Int32(N) - 1)"
+        )
+        lines += [
+            f"_auxt_{n} = cute.make_rmem_tensor(vsize, {DTYPE_TO_CUTLASS[aux.dtype]})",
+            "for _auxk in cutlass.range_constexpr(vsize):",
+            f"    _auxt_{n}[_auxk] = ({_aux_ptr_var(n)} + {idx}).load()",
+            f"_auxv_{n} = _auxt_{n}.load().to_vector()",
+        ]
+    return lines
+
+
 def _aux_load_expr(aux: TensorRef, compute_dtype: Dtype, like_var: str, *, bounded: bool = False) -> str:
     """Expression yielding aux value(s) as a length-`vsize` vector in the op's
     compute dtype, matching ``like_var``'s dtype."""
@@ -653,6 +678,87 @@ def _tap_vec_bytes(chain: FusionChain, dtype: Dtype, dim, stride, vsize: int) ->
     return _tap_store_elems(chain, dtype, dim, stride, vsize) * DTYPE_BYTES[dtype]
 
 
+def _emit_moe_combine_store(tap_idx, i, src, spec, chain, vsize):
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    if not swapped and spec.major == "n":
+        # One lane owns consecutive features for the SAME routed row. Only
+        # those addresses can be packed; swapAB's register vector instead
+        # contains unrelated token destinations and keeps scalar scatter-add.
+        width = min(vsize, 16 // DTYPE_BYTES[spec.dtype])
+        lines = [
+            "if row < group_end:",
+            "    _combine_token = token_index[row]",
+            "    _combine_slot = token_ks[row]",
+            "    if (_combine_token >= 0) & (_combine_token < top_k_scores.shape[0]) & (_combine_slot >= 0) & (_combine_slot < moe_top_k):",
+            "        _combine_scale = top_k_scores[_combine_token, _combine_slot]",
+            f"        _combine_values = {src} * cutlass.full_like({src}, _combine_scale)",
+            f"        _combine_ptr = gC_tap_{tap_idx}_ptr + cutlass.Int64(_combine_token) * out_stride_m_{i} + cutlass.Int64(col_j) * out_stride_n_{i}",
+        ]
+        for e in range(0, vsize, width):
+            lines += [
+                f"        if col_j + {e + width} <= N:",
+                f"            moe_combine_add_vector(_combine_ptr + {e}, _combine_values[{e}:{e + width}], {DTYPE_TO_CUTLASS[spec.dtype]}, {width})",
+            ]
+        return lines
+    lines = []
+    for e in range(vsize):
+        routed = f"col_j + {e}" if swapped else "row"
+        feature = "row" if swapped else f"col_j + {e}"
+        bound = "M" if swapped else "N"
+        offset = (
+            f"cutlass.Int64({feature}) * out_stride_m_{i} + cutlass.Int64(_combine_token) * out_stride_n_{i}"
+            if swapped
+            else f"cutlass.Int64(_combine_token) * out_stride_m_{i} + cutlass.Int64({feature}) * out_stride_n_{i}"
+        )
+        lines += [
+            f"if ({routed} < group_end) & ({feature} < {bound}):",
+            f"    _combine_token = token_index[{routed}]",
+            f"    _combine_slot = token_ks[{routed}]",
+            "    if (_combine_token >= 0) & (_combine_token < top_k_scores.shape[0]) & (_combine_slot >= 0) & (_combine_slot < moe_top_k):",
+            f"        _combine_value = {src}[{e}] * top_k_scores[_combine_token, _combine_slot]",
+            f"        moe_combine_add(gC_tap_{tap_idx}_ptr + {offset}, _combine_value, {DTYPE_TO_CUTLASS[spec.dtype]})",
+        ]
+    return lines
+
+
+def _emit_moe_scatter_store(tap_idx, i, src, spec, chain, vsize, row_pred, col_bound):
+    """Store FC2 fragments into distinct token/top-k slots without atomics."""
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    lines = [f"_scatter_value = {_store_cast_expr(src, spec.dtype)}"]
+    if not swapped:
+        lines.append("_scatter_row = moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)")
+        pred = "_scatter_row < M"
+        if row_pred:
+            pred = f"({row_pred}) & ({pred})"
+        if spec.major == "n":
+            lines += _emit_tap_store(
+                tap_idx,
+                "_scatter_value",
+                spec.dtype,
+                chain,
+                spec.dim,
+                spec.stride,
+                vsize,
+                f"(_scatter_row * out_stride_m_{i} + col_j)",
+                row_pred=pred,
+                converted=True,
+                col_bound=col_bound,
+            )
+            return lines
+    for e in range(vsize):
+        if swapped:
+            lines.append(f"_scatter_col = moe_scatter_row(token_index, token_ks, col_j + {e}, group_end, N, moe_top_k)")
+            pred = "(row < M) & (_scatter_col < N)"
+            offset = f"row * out_stride_m_{i} + _scatter_col * out_stride_n_{i}"
+        else:
+            pred = f"(_scatter_row < M) & (col_j + {e} < N)"
+            offset = f"_scatter_row * out_stride_m_{i} + (col_j + {e}) * out_stride_n_{i}"
+        if row_pred:
+            pred = f"({row_pred}) & ({pred})"
+        lines += [f"if {pred}:", f"    (gC_tap_{tap_idx}_ptr + {offset}).store(_scatter_value[{e}:{e+1}], alignment={DTYPE_BYTES[spec.dtype]})"]
+    return lines
+
+
 def _emit_tap_store(
     tap_idx: int,
     source_var: str,
@@ -771,7 +877,7 @@ def _emit_reduction_atomic(
     `row < M` / `col_j + vsize <= N` from the drain; the TMA arm has neither, so
     it re-applies them here. Each subchunk divides the column boundary alignment,
     so its local fold never mixes real columns with OOB ones. N-grouped MoE
-    uses both the offset-value promise and S, the implicit final endpoint."""
+    uses both the offset-value promise and the token capacity S."""
     body = _emit_reduction_atomic_body(tap_idx, red_idx, red, source_var, chain, vsize)
     if row_pred is None:
         return body
@@ -953,6 +1059,17 @@ def _f8_128x4_row_scale_index_expr(row: str, scale_col: str, n_col_quads: str, *
     return f"{prefix}(({row} // 128) * {n_col_quads} + ({scale_col} // 4)) * 512 + " f"({row} % 32) * 16 + (({row} % 128) // 32) * 4 + ({scale_col} % 4)"
 
 
+def _e8m0_f32(bits: str, *, reciprocal: bool = False) -> str:
+    """Widen a scale or its exact reciprocal without flushing subnormals.
+
+    E8M0 byte 0 is 2**-127; byte 255 is NaN. The reciprocal exponent
+    is 254-byte, with byte 254 producing the FP32 subnormal 2**-127.
+    """
+    exponent = f"(254 - {bits})" if reciprocal else bits
+    special = f"({bits} >= 254)" if reciprocal else f"(({bits} == 0) | ({bits} == 255))"
+    return f"(({exponent} << 23) | ({special}.to(cutlass.Int32) << 22)).bitcast(cutlass.Float32)"
+
+
 def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: str, quant: BlockQuantizeSpec) -> list[str]:
     """Quantize one fp32 scale to ``quant.scale_dtype`` and read the STORED
     value back as fp32 — the data is divided by what was actually written, not
@@ -961,14 +1078,14 @@ def _emit_scale_quantize(p: str, sfx: str, src: str, scale_var: str, back_var: s
     E4M3 round-trips through the DSL ``.to()``. The other two reach the cvt unit
     through the helpers :func:`compiler._quant_device_imports` emits (which
     documents why their ``.to()`` is not usable), and read the byte back as
-    ``byte << 23`` for ue8m0 — a bare exponent, so that IS the fp32, and byte 0
-    is 0.0 — or through the paired widening helper for ue5m3."""
+    the exact exponent encoding for ue8m0, including its minimum scale at
+    byte 0, or through the paired widening helper for ue5m3."""
     scale_dtype = _scale_store_dtype(quant.scale_dtype)
     if quant.scale_dtype == "fp8_e8m0":
         return [
             f"{p}_qb{sfx} = _frost_cvt_f32_to_e8m0_bits({src})",
             f"{scale_var} = (({p}_qb{sfx}).to(cutlass.Int8)).bitcast({scale_dtype})",
-            f"{back_var} = ({p}_qb{sfx} << 23).bitcast(cutlass.Float32)",
+            f"{back_var} = {_e8m0_f32(f'{p}_qb{sfx}')}",
         ]
     if quant.scale_dtype == "fp8_e5m3":
         return [
@@ -1000,9 +1117,9 @@ def _emit_scale_quantize_pair(p: str, a: tuple[str, str, str, str], b: tuple[str
     if quant.scale_dtype == "fp8_e8m0":
         return lines + [
             f"{scalea} = (({p}_qb{sa}).to(cutlass.Int8)).bitcast({scale_dtype})",
-            f"{backa} = ({p}_qb{sa} << 23).bitcast(cutlass.Float32)",
+            f"{backa} = {_e8m0_f32(f'{p}_qb{sa}')}",
             f"{scaleb} = (({p}_qb{sb}).to(cutlass.Int8)).bitcast({scale_dtype})",
-            f"{backb} = ({p}_qb{sb} << 23).bitcast(cutlass.Float32)",
+            f"{backb} = {_e8m0_f32(f'{p}_qb{sb}')}",
         ]
     return lines + [
         f"{scalea} = ({p}_qb{sa}).to({scale_dtype})",
@@ -1092,14 +1209,23 @@ def _emit_block_quant_col(
     # still share one vector reciprocal/min pipeline.  Keeping that pipeline as
     # TensorSSA gives the backend the same four-wide scheduling opportunity as
     # the specialized Rubin epilogue without changing RP/SATFINITE semantics.
-    lines.extend(
-        [
-            f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
-            *(f"    {p}_up4[{i}] = {p}_u{i}" for i in range(4)),
-            f"    {p}_upv = {p}_up4.load()",
-            f"    {p}_iv = cute.math.min(cute.math.rcp({p}_upv, approx=True, ftz=True), " f"cutlass.full_like({p}_upv, cutlass.Float32(3.402823466e38)))",
-        ]
-    )
+    if quant.scale_dtype == "fp8_e8m0":
+        lines.extend(
+            [
+                f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
+                *(f"    {p}_up4[{i}] = {_e8m0_f32(f'{p}_qbb{i}', reciprocal=True)}" for i in range(4)),
+                f"    {p}_iv = {p}_up4.load()",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"    {p}_up4 = cute.make_rmem_tensor(4, cutlass.Float32)",
+                *(f"    {p}_up4[{i}] = {p}_u{i}" for i in range(4)),
+                f"    {p}_upv = {p}_up4.load()",
+                f"    {p}_iv = cute.math.min(cute.math.rcp({p}_upv, approx=True, ftz=True), " f"cutlass.full_like({p}_upv, cutlass.Float32(3.402823466e38)))",
+            ]
+        )
     for lane_in_batch in range(0, 4, 2):
         other = lane_in_batch + 1
         lines.extend(
@@ -1225,7 +1351,10 @@ def _emit_block_quant(
         lines.append(f"{p}_amax{k} = {p}_abs[None, {k}].reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)")
         lines.append(f"{p}_sf{k} = {p}_amax{k} * {p}_rl")
         lines.extend(_emit_scale_quantize(p, str(k), f"{p}_sf{k}", f"{p}_scale{k}", f"{p}_up{k}", quant))
-        lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
+        if quant.scale_dtype == "fp8_e8m0":
+            lines.append(f"{p}_inv{k} = {_e8m0_f32(f'{p}_qb{k}', reciprocal=True)}")
+        else:
+            lines.append(f"{p}_inv{k} = cute.math.min(cute.arch.rcp_approx({p}_up{k}), cutlass.Float32(3.402823466e38))")
         for e in range(0, bs, 2):
             lines.append(
                 f"{p}_out[{base + e}], {p}_out[{base + e + 1}] = cute.arch.mul_packed_f32x2("
@@ -1301,10 +1430,17 @@ def _emit_block_quant(
 
 
 def _tap_fake_shape(tap, chain: FusionChain | None = None) -> str:
+    if chain is not None and chain.has_moe and chain.moe.mode == "combine":
+        return "(sym_m, cute.sym_int(), 1)" if isinstance(chain.moe, MoeSwapAbSpec) else "(cute.sym_int(), sym_n, 1)"
     if tap.is_quant_scale:
         if chain is None or not chain.quants:
             raise AssertionError("quant scale tap requires FusionChain context")
         q = chain.quants[int(tap.source.rsplit("_", 1)[1])]
+        swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        if q.grouped_by_moe and ((q.axis == 1) == swapped):
+            # The scheduler computes the segmented row prefix at runtime.
+            # Capacity belongs to the caller's allocation, not the JIT shape.
+            return "(cute.sym_int64(), cute.sym_int64(), 1)"
         b, m, n = q.scale_dim or (
             chain.matmul.batch,
             chain.matmul.M,
@@ -1415,20 +1551,19 @@ def generate(
     compiler) fix the inner-loop chunk size: each tap stores
     ``vsize = vec_bytes_epi // output_elem_bytes`` elements per chunk."""
     vsize = vec_bytes_epi // output_elem_bytes
+    scatter = chain.has_moe and chain.moe.mode == "scatter"
     row_bound = "group_end" if chain.has_moe and not isinstance(chain.moe, MoeSwapAbSpec) else "M"
     col_bound = "group_end" if isinstance(chain.moe, MoeSwapAbSpec) else "N"
     # aux_views snippet. `row` is defined by the template just before this hook
     # (M-aware: differs for MMA_M=64 vs MMA_M>=128) — we just consume it.
     aux_lines: list[str] = []
+    aux_row = f"cute.math.min(cutlass.Int32(row), cutlass.Int32({row_bound}) - 1)"
     for aux in chain.aux_tensors:
         aux_lines.append(f"{_aux_ptr_var(aux.name)} = {aux.name}.iterator.raw_ptr()")
         if aux.bcast_mode == "scalar":
             aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux)}).load()")
-        elif aux.bcast_mode == "per_row":
-            aux_lines.append(
-                f"{_aux_prefetch_var(aux.name)} = "
-                f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux, row_var=f'cute.math.min(cutlass.Int32(row), cutlass.Int32({row_bound}) - 1)')}).load()"
-            )
+        elif aux.bcast_mode == "per_row" and not scatter:
+            aux_lines.append(f"{_aux_prefetch_var(aux.name)} = " f"({_aux_ptr_var(aux.name)} + {_aux_index_expr(aux, row_var=aux_row)}).load()")
         # per_col / per_elem load inside the inner loop.
 
     aux_views = "\n".join(aux_lines) if aux_lines else "pass"
@@ -1451,12 +1586,12 @@ def generate(
     # Under the packed `lane < 16` layout half the lanes hold nothing, and a
     # reduction's atomic RMW cannot be clipped after the fact.
     store_row_pred = None
-    bounded = on_tma_arm or (isinstance(chain.moe, MoeSwapAbSpec) and bool(chain.quants))
+    bounded = scatter or on_tma_arm or (isinstance(chain.moe, MoeSwapAbSpec) and bool(chain.quants))
     if bounded:
         store_row_pred = f"row < {row_bound}"
         if packed_lanes:
             store_row_pred = f"row_active & ({store_row_pred})"
-    _aux_pre = _bounded_aux_prelude(chain, row_bound, col_bound, bounded)
+    _aux_pre = _scatter_aux_prelude(chain) if scatter else _bounded_aux_prelude(chain, row_bound, col_bound, bounded)
     body_lines: list[str] = tma_vec_bindings + _aux_pre
 
     # Per-op result var name lookup (handles `identity` pass-throughs).
@@ -1501,6 +1636,19 @@ def generate(
             cast_lines, third_in_chain = _compute_cast(third_in_chain, op.compute_dtype, f"{i}_c")
             body_lines.extend(cast_lines)
         lines, cur = _emit_op(op, parent_var, i, aux_loads, other_in_chain, third_in_chain, vsize=vec_bytes_epi // output_elem_bytes)
+        if scatter and op.op == "gen_index":
+            token_axis = 2 if isinstance(chain.moe, MoeSwapAbSpec) else 1
+            if dict(op.attrs).get("axis") == token_axis:
+                if token_axis == 1:
+                    lines = [f"{cur} = cutlass.full_like({parent_var}, cutlass.Float32(moe_scatter_row(token_index, token_ks, row, group_end, M, moe_top_k)))"]
+                else:
+                    lines = [
+                        f"_gi{i} = cute.make_rmem_tensor(vsize, cutlass.Float32)",
+                        "for _sk in cutlass.range_constexpr(vsize):",
+                        f"    _gi{i}[_sk] = cutlass.Float32(moe_scatter_row(token_index, token_ks, col_j + _sk, group_end, N, moe_top_k))",
+                        f"{cur} = _gi{i}.load().to_vector()",
+                    ]
+
         body_lines.extend(lines)
         # Round to the op's out_dtype (no-op for fp32) so every consumer —
         # downstream ops and outputs alike — sees the declared-dtype value.
@@ -1574,6 +1722,12 @@ def generate(
             body_lines.append(tma_out_ready_marker(_tma_j))
             continue
         tap_idx = _tap_of[si]
+        if chain.has_moe and chain.moe.mode == "combine":
+            body_lines.extend(_emit_moe_combine_store(tap_idx, si, src, spec, chain, vsize))
+            continue
+        if chain.has_moe and chain.moe.mode == "scatter":
+            body_lines.extend(_emit_moe_scatter_store(tap_idx, si, src, spec, chain, vsize, store_row_pred, col_bound))
+            continue
         if spec.major == "m":
             body_lines.extend(
                 _emit_mmajor_scatter(tap_idx, si, src, spec.dtype, chain.matmul.batch, vsize, row_pred=store_row_pred, converted=converted, col_bound=col_bound)

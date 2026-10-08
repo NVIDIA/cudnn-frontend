@@ -16,6 +16,8 @@ run them:
 
 - `configs/` - Benchmark configuration files
   - `deepseek_v4.py` - DeepSeek-V4 Flash (H64, K=640) and Pro (H128, K=1152), 2k..32k
+  - `deepseek_v41.py` - DeepSeek-V4.1 Flash (H64, K=640, same per-query gather as V4), 2k..32k
+  - `glm53.py` - GLM-5.3 (H64, d=576/512, K=2048) and GLM-5.3-Flash (H64, NoPE d=512, K=2048), 2k..32k
 - `runner.py` - Configuration-based benchmark runner (one subprocess per case)
 - `benchmark_single_dsa.py` - Single-case worker the runner calls; prints a `RESULT,` line
 - `config_types.py` - `ModelPreset`, `DsaBenchmarkConfig`, `BenchmarkResult`
@@ -87,6 +89,22 @@ indexer-selected prefix whose LSE the forward kernel also emits). Heads: 64
 (Flash) / 128 (Pro). Sequence lengths 2k, 4k, 8k, 16k, 32k with `s_q == s_kv`;
 every query gathers the full top-k, i.e. the per-token upper bound.
 
+`deepseek_v41` (`configs/deepseek_v41.py`): V4.1-Flash keeps the V4 sparse
+core (H=64, shared d=512 record, 512 indexer-selected entries + 128-token
+window, sink); its 2x-compressed / uncompressed pools and cross-layer KV and
+index sharing change what the indexer selects from, not the per-query
+gather, so the preset is V4-Flash's (`K = 640`, `indexer_topk = 512`). Only
+a Flash checkpoint is published.
+
+`glm53` (`configs/glm53.py`): GLM-5.3 (GLM-5.2's architecture) runs
+V3.2-style DSA on the MLA latent: the absorbed query attends a 576-wide
+shared record (512 KV latent + 64 RoPE) and reads the 512 latent channels
+back as V; token top-2048, no window fold, no sink, so `indexer_topk = 0`.
+`glm53_flash`'s sparse layers are NoPE MLA, so the record is 512 wide; its
+indexer selects 512 four-token pools = 2048 raw tokens (the incomplete tail
+pool, <= 3 tokens, is omitted). Like every preset here, the rows are
+gathered as independent random rows, not as 4-row pools.
+
 To add a model, copy `configs/deepseek_v4.py`, edit the `ModelPreset`s
 (`num_q_heads`, `head_dim_qk` in `{512, 576}`, `topk`, `indexer_topk`,
 `has_sink`) and the `DsaBenchmarkConfig` (`seqlens`, `profile_pass`,
@@ -112,6 +130,54 @@ results/<config>/<gpu>/
 - `dsv4_flash: H=64, d=512, K=640 (indexer_topk=512)`; `dsv4_pro: H=128, d=512, K=1152 (indexer_topk=1024)`; bf16, sink + `topk_length`, non-deterministic backward.
 
 ## Single Scripts
+
+### Standalone Indexer Top-K
+
+`benchmark_dsa_indexer_top_k.py` compares `tie_break=0` and `2` with 8K local
+queries, KV=8K/32K/128K/512K, K=1024/2048, FP32 scores, `next_n=1`, and
+`return_val=False`. Causal lengths follow one rank of a single-sequence zigzag
+CP partition: for Q local queries, H=Q/2 and rank r, concatenate lengths
+`[r*H+1, (r+1)*H]` and `[KV-(r+1)*H+1, KV-r*H]`. CP=KV/Q; CP1 naturally
+covers every query. Rank 0 is the default. All local rows are measured without
+extrapolation. The largest default score matrix occupies 16 GiB, plus outputs
+and scratch. Internal scratch row chunks and all their launches are included.
+
+```bash
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --csv topk-random.csv
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --distribution duplicates --csv topk-duplicates.csv
+# An interior rank; CP=128K/8K=16:
+python -m benchmark.dsa.benchmark_dsa_indexer_top_k --tokens 131072 --cp-rank 7
+```
+
+Timing follows the existing [DSA per-call event median](benchmark_single_dsa.py)
+and [CSA graph replay](../csa/bench_csa_compressor.py) patterns: 20 side-stream
+warmup calls before capture, one complete API call per graph, and 50 timed
+replays. Both policies share score/length addresses and alternate measurement
+order. A 256 MiB buffer flushes L2 before each start event, so flush time is
+excluded. Events are primed and reused, following
+[causal-convolution timing](../causal_conv1d_update_sm100.py). Both graphs are
+warmed again after CPU validation. CSV reports every
+sample (milliseconds to six decimal places) and the median; `--warmup` and
+`--samples` control the counts.
+
+Compilation, capture, score generation and sampled CPU references are outside
+timing. `speedup_0_over_2 = time(0) / time(2)`; values below one mean tie policy 2
+is slower. These are selector GPU timings, excluding CPU enqueue overhead and
+score computation. They do not measure CP communication, sparse attention or
+complete DSA forward/training latency. The fixed local matrix does not reproduce
+Megatron's separate front/back calls, smaller score-budget chunks or per-call KV
+cropping.
+
+The reference samples the first/middle/last local rows and the K boundary when
+present in the shard, checking
+causal bounds, uniqueness and the selected set without requiring output order.
+Use `--distribution equal`, `sparse-left` or `sparse-right` for additional tie
+patterns; the sparse cases put k−1 strict winners and two cutoff ties near one
+end of each causal prefix. `--num-queries` must be even and divide every KV
+length, and `--cp-rank` must be valid for every selected case. `--tokens`,
+`--top-k`, `--samples` and `--warmup` can narrow or repeat the workload.
+SM90+ is required; memory admission is an
+estimate and does not guarantee allocation success.
 
 ### Sparse Attention Forward
 

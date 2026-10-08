@@ -126,6 +126,9 @@ navigation:
               - page: GNN simple aggregation
                 path: ../../operations/gnn/agg_simple.md
                 slug: agg_simple
+              - page: GAT and GATv2 attention
+                path: ../../operations/gnn/mha_gat.md
+                slug: mha_gat
       - section: Utilities
         slug: utilities
         contents:
@@ -204,6 +207,9 @@ navigation:
           - page: Fused RMSNorm + SiLU
             path: ../../fe-oss-apis/rmsnorm_silu.md
             slug: rmsnorm_silu
+          - page: Fused Conv3D + Bias + Residual + RMSNorm + SiLU
+            path: ../../fe-oss-apis/conv3d_postops.md
+            slug: conv3d_postops
           - section: Attention (FE-OSS)
             slug: attention
             contents:

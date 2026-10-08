@@ -313,13 +313,19 @@ python/cudnn/
       api_dsl.py                DSL adapters (APIBase). Arch-free filename:
                                 APIs differ by PASS (fwd vs bwd), never by
                                 sm version or head dim
+      config_sm90.py            TemplateParams + the D512 envelope check +
+                                raising validation
       config_sm100.py           TemplateParams + per-geometry Cfg + raising
                                 validation
       config_sm120.py           TemplateParams + supported SM120 tile/layout
                                 vocabulary + raising validation
       kernels/                  one package per ARCH LINE; everything below
                                 an arch package is owned by that arch alone
-        sm100/prefill_d256_f16.py     naming: <phase>_d<dim>_<dtype-family>.py
+        sm90/prefill_d512_f16.py      naming: <phase>_d<dim>_<dtype-family>.py
+                                      the Hopper line's only flavor: one D512
+                                      tile over three warpgroups
+        sm90/_common_hopper.py        SM90-only tile / reduction / softmax helpers
+        sm100/prefill_d256_f16.py
         sm100/decode_d256_f16.py      decode-shaped alternate of the d256 flavor
                                       (S_q x packed heads <= 16 rows; swap-AB tile)
         sm100/prefill_d512_f16.py
@@ -333,8 +339,29 @@ python/cudnn/
         sm120/_common.py              SM120-only warp-level primitives
         _common_blackwell.py      SHARED by sm100/ + sm107/ (cc 100-119), so it
                                   sits ABOVE both rather than inside either
-        thd_helpers.py            SHARED by sm100/ + sm107/ + sm120/
-    bwd/                        future: same shape, its own api_dsl.py
+        thd_helpers.py            SHARED by sm90/ + sm100/ + sm107/ + sm120/
+    bwd/                        same shape, its own api_dsl.py / engines.py /
+                                config_sm*.py
+      kernels/                  one package per ARCH LINE, like fwd/
+        sm80/bprop_f16.py             naming: bprop_d<dim>_<dtype-family>.py
+        sm100/bprop_d512_f16.py       stage 2 of the large-head-dim chain
+        sm100/bprop_dq_d256_mxfp8.py  ported MXFP8 kernel classes (+ dkdv,
+                                      _bprop_mxfp8_*, bprop_sf_repack_mxfp8)
+        sm107/bprop_d256_f16.py       Rubin d256 bf16/fp16 main kernel (dV in
+                                      TMEM, dS to a kv-major GMEM workspace)
+        sm107/bprop_d256_fp8.py       its per-tensor FP8 E4M3 twin (e4m3 dS into
+                                      the fp8 K64 GEMM arm; a bf16-dS twin for A/B)
+        sm120/bprop_f16.py            fused SM120 main kernel
+        sm120/bprop_chain_f16.py      the SM120-only part of its launch chain
+                                      (dq2k, converts)
+        bprop_chain_common.py     SHARED arch-neutral chain kernels (dot,
+                                  GQA reduce, dsink, fold_quant): sm120/
+                                  re-exports them, the sm100 / sm107 chains
+                                  import them
+        bprop_matmul_blackwell.py SHARED stage-3 GEMM: codegen targets span
+                                  SM100/SM103/SM107/SM110, so it sits ABOVE
+                                  the arch packages like _common_blackwell.py
+        thd_helpers.py            SHARED by sm80/ + the sm100 chain
 
   gemm/frost/                   engine.py + graph_analyzer.py + the arch-neutral
                                 layer (recipe, tile_config, kernel_registry ...);
@@ -343,11 +370,15 @@ python/cudnn/
                                 import (arch_family.py picks it from the GPU, or
                                 CUDNN_FRONTEND_GEMM_ARCH_FAMILY)
     sm100/                      compiler.py + epilogue_codegen.py
-                                + kernel_templates/ (sm100_*, sm103_*, _tile_helpers)
+                                + kernel_templates/ (sm100_*, sm103_*)
     sm120/                      compiler.py + epilogue_codegen.py
                                 + kernel_templates/ (sm120_*)
     kernel_templates/           SHARED by both trees (the split-K reduction), so
                                 it sits above them like thd_helpers.py does
+    tile_helpers.py             SHARED device helpers: tile/group mapping, TMA
+                                gather and descriptor operations, plus the
+                                SM100-only tcgen05 compatibility wrappers;
+                                imported directly, never rendered as a kernel
 ```
 
 Two levels under the pass directory, always. **Arch is the one coverage axis
@@ -364,8 +395,8 @@ arch's package (`_common_blackwell.py`, `thd_helpers.py`) — so the directory a
 file sits in always names its only owner, and a file inside `sm107/` can be
 changed without asking who else imports it.
 
-A new reader should be able to list `sdpa/fwd/kernels/*/` and see the whole
-coverage matrix on one screen.
+A new reader should be able to list `sdpa/fwd/kernels/*/` (or
+`sdpa/bwd/kernels/*/`) and see the whole coverage matrix on one screen.
 
 As a layer stack (each layer talks only to its neighbors):
 
@@ -596,6 +627,24 @@ has no replacement. The plumbing that makes a request expressible is in place
 user-facing producer.
 
 **A knob is honored or the engine is ineligible -- never silently degraded.**
+The SM100 half-precision D128/D256 THD decoders honor the existing
+`SCHED_POLICY` values 0/1/2 over the live work list: NATURAL visits ascending Q
+blocks within each head, LPT visits descending Q blocks across heads, and
+LPT_L2 keeps a KV-sharing head group together while reversing its Q blocks.
+The kernel reads current GPU lengths, so the same policy handles full and
+prefix requests under a retained capture without a host length read,
+additional setup launch, or replan.
+
+For D256, Heuristic A prefers LPT only for SM100 BF16 exact-D256 paged THD bottom-right
+causal attention without a left window, single-sequence full-prefill
+envelopes with 8/1 heads at 4K–16K or 16/2 heads at 2K–16K, page size 16/128,
+and no sink or epilogue gate. Requesting Stats does not change this preference.
+That plan keeps LPT when its live lengths become prefix chunks; it does not
+switch policies at the full/prefix boundary. Other D256 THD defaults stay NATURAL.
+The separate D128 THD PackGQA/LPT preference is preserved.
+This changes scheduling within FROST, not engine placement, and adds no new
+scheduler policy value.
+
 If a kernel cannot run the requested scheduler policy, the answer is "this
 engine cannot serve this plan", not "ran with a different policy". A knob
 object of the wrong operation's type is rejected outright.

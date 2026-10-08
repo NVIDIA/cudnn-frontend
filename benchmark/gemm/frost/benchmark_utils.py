@@ -440,12 +440,9 @@ def rand_e8m0(shape, dev):
 
 
 FTO_ALIGNMENT_HELP = (
-    "value for the `alignment_value` attribute on the first_token_offset tensor: a "
-    "promise that every routed-group start is a multiple of it. It lets FROST address "
-    "A / SFA / D through the ORIGINAL TMA descriptors instead of rewriting them per "
-    "group, for every config whose cluster tile M (and, block-scale, 128) divides it. "
-    "'auto' reads the promise off the offsets this bench lays out; 1 (default) makes "
-    "none, i.e. every config keeps the per-group descriptor patch."
+    "value alignment of every group boundary, including the final endpoint. "
+    "FROST skips descriptor updates when this is a multiple of the cluster token tile "
+    "(and 128 for block-scale). 'auto' uses the boundaries' GCD; 1 makes no promise."
 )
 
 
@@ -455,18 +452,12 @@ def add_fto_alignment_arg(parser) -> None:
 
 
 def fto_alignment(spec, offsets) -> int:
-    """Resolve `--fto-alignment` against the offsets the bench actually lays out.
-
-    `auto` is their GCD. An explicit value is CHECKED here because the KERNEL does
-    not check it -- the offsets live on the device, so a false promise is undefined
-    behaviour that silently reads another group's scale factors."""
+    """Validate a value alignment or infer it from all explicit boundaries."""
     vals = [int(v) for v in (offsets.tolist() if hasattr(offsets, "tolist") else offsets)]
     if str(spec).strip().lower() == "auto":
         auto = 0
         for v in vals:
             auto = math.gcd(auto, v)
-        # All-zero (a single routed group) constrains nothing; claim no promise
-        # rather than an arbitrarily large one.
         return auto or 1
     n = int(spec)
     if n < 1:
@@ -482,15 +473,14 @@ def fto_alignment(spec, offsets) -> int:
 
 
 def group_offsets(S: int, E: int) -> torch.Tensor:
-    """Even split, remainder absorbed by the last group: group g starts at
-    g * (S // E). This is the `first_token_offset` tensor."""
-    return torch.arange(E, dtype=torch.int32, device="cuda") * (S // E)
+    """G+1 boundaries; the last group absorbs the remainder and ends at S."""
+    return torch.tensor([g * (S // E) for g in range(E)] + [S], dtype=torch.int32, device="cuda")
 
 
 def even_offsets(S: int, E: int) -> list[int]:
-    """Routed-group start offsets for ``S`` tokens spread as evenly as possible
+    """Routed-group boundaries for ``S`` tokens spread as evenly as possible
     over ``E`` experts — the first ``S % E`` groups take one extra token.
-    ``S=10, E=3`` -> group sizes 4, 3, 3 -> ``[0, 4, 7]``."""
+    ``S=10, E=3`` -> group sizes 4, 3, 3 -> ``[0, 4, 7, 10]``."""
     if E < 1:
         raise ValueError(f"expert count must be >= 1, got {E}")
     base, rem = divmod(S, E)
@@ -498,4 +488,5 @@ def even_offsets(S: int, E: int) -> list[int]:
     for i in range(E):
         offsets.append(start)
         start += base + (1 if i < rem else 0)
+    offsets.append(S)
     return offsets

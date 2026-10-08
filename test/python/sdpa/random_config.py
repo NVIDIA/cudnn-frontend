@@ -94,6 +94,7 @@ class ExecConfig:
         'output_type': torch,
         'diag_align': cudnn.diagonal_alignment,
         'implementation': cudnn.attention_implementation,
+        'softmax_precision': cudnn.data_type,
     }
 
     data_type: torch.dtype = None
@@ -104,6 +105,12 @@ class ExecConfig:
     is_alibi: bool = None
     is_infer: bool = True
     is_paged: bool = False
+    # Paged only: NaN-fill every K/V pool page no per-batch seq_len_kv reaches (a dead
+    # block-table slot), so an engine that dereferences it poisons O. Opt-in because it
+    # is a FROST-kernel promise (TMA-OOB page -1 past the live pages), not the paged
+    # contract: the backend engine loads and masks whole tile-rounded page ranges and
+    # needs finite data there. Set by tests pinned to a FROST paged engine.
+    paged_nan_dead_pages: bool = False
     is_bias: bool = None
     is_block_mask: bool = None
     is_padding: bool = None
@@ -210,6 +217,29 @@ class ExecConfig:
     dropout_prob: float = 0.0
 
     implementation: cudnn.attention_implementation = cudnn.attention_implementation.AUTO
+
+    # Forward softmax levers of the cc 10.7 FROST rows -- python-only op attributes of graph.sdpa /
+    # sdpa_fp8 / sdpa_mxfp8 (served domain: sdpa/softmax_knobs.py).  Appended here (after every
+    # existing field) so the seeded sweeps' RandomizationContext draw order is unchanged.
+    #   softmax_precision    None (= FLOAT, the f32 pipeline) or cudnn.data_type.HALF, the f16x2
+    #                        exponent arm of the quantized (FP8 / MXFP8) kernels.
+    #   attn_scale_prefolded the harness pre-multiplies Q by attn_scale * log2(e) -- in Q's dtype for
+    #                        half inputs, in fp32 before quantization for MXFP8 -- passes
+    #                        attn_scale=None to the op, and runs the reference on that same Q with
+    #                        attn_scale = ln 2 (softmax(ln2 * S_folded) = 2^S_folded).
+    softmax_precision: cudnn.data_type = None
+    attn_scale_prefolded: bool = False
+    # Forward Stats request independent of training.  None = the harness default (fp16: Stats are
+    # produced with the backward only; fp8 / mxfp8: always); True / False = request / omit the
+    # Stats output of an inference forward, so a sweep can draw the Stats and the stats-less
+    # kernel specializations without running a backward.  The backward always has Stats.
+    fwd_stats: bool = None
+    # MXFP8 dense forward only: declare Q/K/V/O BSHD-physical -- the layout the FROST MXFP8 rows
+    # serve.  None = the harness's legacy rule (BSHD for the block-scaled-O and paged draws, which
+    # only FROST serves; BHSD otherwise, which routes the plain draws to the backend); True = always,
+    # so a sweep that asserts FROST routing (the cc 10.7 sweeps) lands every case on the row.
+    # Inference only (the backward graph declares BHSD).
+    bshd_layout: bool = None
 
     @property
     def is_train(self):
@@ -625,10 +655,14 @@ class RandomHiddenDimSize:
         d_v_max: int,
         head_dim_distribution: dict[Any, int],
         with_high_probability: Optional[List[tuple[int, int]]] = None,
+        multiple_of: int = 8,
     ):
 
-        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=8)
-        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=8)
+        # multiple_of: the head-dim granularity of the random draw (8, the default, keeps
+        # every existing seed's sequence; the fp8 graphs need 16, so their sweeps pass 16
+        # rather than skipping the draws the harness would reject).
+        self.d_qk_gen = RandomIntValue(min=d_qk_min, max=d_qk_max, multiple_of=multiple_of)
+        self.d_v_gen = RandomIntValue(min=d_v_min, max=d_v_max, multiple_of=multiple_of)
         self.distribution = RandomChoice(head_dim_distribution)
         self.with_high_probability = with_high_probability
 

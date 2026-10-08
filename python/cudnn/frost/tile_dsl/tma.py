@@ -95,6 +95,77 @@ def tma_load_tile(
 
 
 @cute.jit
+def tma_load_subtiles(
+    smem_tile,
+    gmem_slice,
+    mbar,
+    first: cutlass.Constexpr[int],
+    count: cutlass.Constexpr[int],
+    *,
+    cta_group: int = 1,
+    mcast_mask=None,
+    acquire: cutlass.Constexpr[bool] = True,
+    l2_cache_hint=None,
+):
+    """Issue subtiles ``first .. first + count`` of the tile load :func:`tma_load_tile` issues whole.
+
+    Same op, same operands: subtile ``i`` lands at ``smem_tile.base + i * tma_subtile_stride_elems``
+    from GMEM inner coordinate ``coord_d + i * tma_granu_elems``, one elected lane per subtile,
+    completing on ``mbar``.  The caller splits a tile's subtiles across ISSUERS -- the d512
+    2x2-datapath kernel's twin CTAs each issue half of every K/V sub-chunk with a two-CTA
+    multicast mask, so that every CTA receives the whole sub-chunk while the L2 is read once per
+    pair of pairs -- and the mbarrier accounting stays the receiver's: under ``cta_group=2`` every
+    byte that lands in CTA d completes on the barrier at the same offset in d's PAIR LEADER, whoever
+    issued it (probe mcast_twin, 2026-10-01), so the leader's ``expect_tx`` is the bytes landing in
+    its pair, not the bytes this CTA issues.  ``first + count <= smem_tile.tma_loads_per_tile``.
+    """
+    num_iters = smem_tile.tma_loads_per_tile
+    granu_elems = smem_tile.tma_granu_elems
+    sub_stride = smem_tile.tma_subtile_stride_elems
+    if cutlass.const_expr(first < 0 or count < 1 or first + count > num_iters):
+        raise ValueError(f"tma_load_subtiles: subtiles [{first}, {first + count}) outside the tile's {num_iters}")
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        tma_desc_ptr = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                tma_desc_ptr,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        tma_desc_ptr = gmem_slice.tma_desc.get_ptr()
+    coord_d = gmem_slice.coord_d
+    outer_coords = tuple(gmem_slice.coords[1:])
+    for j in cutlass.range_constexpr(count):
+        i = first + j
+        d = coord_d + cutlass.Int32(i * granu_elems)
+        smem_chunk = smem_tile.base.subview(i * sub_stride)
+        if nvvm.elect_sync():
+            coords = [d] + list(outer_coords)
+            if cutlass.const_expr(cta_group == 1):
+                nvvm.cp_async_bulk_tensor_shared_cta_global(
+                    smem_chunk,
+                    tma_desc_ptr,
+                    coords,
+                    mbar,
+                    l2_cache_hint=l2_cache_hint,
+                )
+            else:
+                nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                    smem_chunk,
+                    tma_desc_ptr,
+                    coords,
+                    mbar,
+                    [],
+                    multicast_mask=mcast_mask,
+                    group=nvvm.CTAGroup.CTA_2,
+                    l2_cache_hint=l2_cache_hint,
+                )
+
+
+@cute.jit
 def tma_store_tile(smem_tile, gmem_slice, *, acquire: cutlass.Constexpr[bool] = True):
     num_iters = smem_tile.tma_loads_per_tile
     granu_elems = smem_tile.tma_granu_elems
@@ -121,6 +192,63 @@ def tma_store_tile(smem_tile, gmem_slice, *, acquire: cutlass.Constexpr[bool] = 
             smem_chunk,
             tuple([d] + list(outer_coords)),
         )
+
+
+@cute.jit
+def tma_store_subtile(smem_tile, gmem_slice, subtile: cutlass.Constexpr[int], *, acquire: cutlass.Constexpr[bool] = False):
+    """Issue ONE subtile of a TMA tile store -- subtile ``subtile`` of the ``smem_tile.tma_loads_per_tile`` that
+    :func:`tma_store_tile` issues back to back -- so a producer can STREAM a tile's store behind the epilogue that fills
+    it: wait the mbarrier that publishes SMEM chunk ``c``, store subtile ``c``, and move on while the later chunks are
+    still being written, instead of parking on every chunk and then queueing the whole tile as one burst in the SM's
+    in-order TMA engine (ahead of the next work item's operand loads).  Same op, same operands as the whole-tile store:
+    subtile ``i`` of ``tma_store_tile(smem_tile, gmem_slice)`` == ``tma_store_subtile(smem_tile, gmem_slice, i)`` -- the
+    GMEM inner coordinate is ``coord_d + i * tma_granu_elems`` and the SMEM source ``base + i * tma_subtile_stride_elems``.
+
+    Gotchas the whole-tile store hides from its caller:
+
+    * ``tma_subtile_stride_elems`` and ``tma_granu_elems`` are in ELEMENTS OF THE ALLOC DTYPE of ``smem_tile`` (the
+      ``SmemTile``'s dtype), not of the tensor the descriptor stores.  A buffer allocated as one dtype and viewed as a
+      narrower one (an aliased Q u O slab written as fp8 O) needs ``BPE_load / BPE_alloc`` folded into the stride when the
+      tile is declared -- the SAME rule as ``tma_store_tile`` / ``tma_load_tile`` (frost-tile-dsl.md s5); the subtile form
+      makes a stride error visible as ONE garbled subtile, not a garbled second half.
+    * ``acquire`` is the runtime-descriptor (THD) GENERIC->TENSORMAP fence: ``tma_store_tile`` issues it ONCE before its
+      subtile loop, so a streamed tile passes ``acquire=True`` on its FIRST subtile only (default False); a
+      ``gmem_slice`` without ``desc_ptr`` (a compile-time ``GmemTileTma``) ignores it.
+    * No elect inside, exactly like ``tma_store_tile``: the caller is one warp (``UTMASTG`` is a warp-uniform op).
+    * Completion rides the bulk group: after the LAST subtile of the tile, ``tma_store_commit()`` +
+      ``tma_store_wait(0)`` ONCE -- ``cp.async.bulk.commit_group`` batches every prior uncommitted bulk op of the thread,
+      so N streamed subtiles form ONE bulk group per tile, the same group count as the whole-tile store.
+    * The producer side is unchanged: the SMEM chunk must be published to the async proxy (``fence_proxy`` + the mbarrier
+      arrive the caller waits) BEFORE its subtile is issued -- the streamed form only moves each subtile's issue point
+      from "after the last chunk" to "after ITS chunk".
+
+    Shipped by the sm107 d512 prefill kernels (``O_STORE_STREAM``): MEASURED there 2026-09-23, mxfp8 bf16-O dense B=1 H_Q=64
+    H_KV=1 S_Q=16K, +16.3 / +16.5 / +5.9 / +0.5 % of time at S_KV = 512 / 1024 / 2048 / 8192 on a 212-SM Rubin part,
+    O / LSE / Amax_O bitwise identical -- the store's TMA-ENGINE occupancy, not its HBM bytes, is the per-work-item cost
+    (deleting the store: +11.2 % @8K; redirecting it to one L2-resident tile: -0.1 %)."""
+    granu_elems = smem_tile.tma_granu_elems
+    sub_stride = smem_tile.tma_subtile_stride_elems
+    coord_d = gmem_slice.coord_d
+    outer_coords = tuple(gmem_slice.coords[1:])
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        tma_desc_ptr = gmem_slice.desc_ptr
+        if cutlass.const_expr(acquire):
+            nvvm.fence_proxy_acquire(
+                nvvm.MemScope.GPU,
+                tma_desc_ptr,
+                128,
+                from_proxy=nvvm.Proxy.GENERIC,
+                to_proxy=nvvm.Proxy.TENSORMAP,
+            )
+    else:
+        tma_desc_ptr = gmem_slice.tma_desc.get_ptr()
+    d = coord_d + cutlass.Int32(subtile * granu_elems)
+    smem_chunk = smem_tile.base.subview(subtile * sub_stride)
+    nvvm.cp_async_bulk_tensor_global_shared_cta(
+        tma_desc_ptr,
+        smem_chunk,
+        tuple([d] + list(outer_coords)),
+    )
 
 
 @cute.jit
