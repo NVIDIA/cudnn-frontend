@@ -416,8 +416,8 @@ else moves:
   e2m1 ``[d_model, N // 2]`` (``torch.float4_e2m1fn_x2``, two codes per byte along N, low
   nibble = even n -- the SAME ``execute`` keyword, its dtype keyed on
   ``MxQuantSpec.w_qkvg_dtype``) with the UNCHANGED E8M0 / 32 blob ``w_qkvg_t_sf``
-  (``sf_blob_bytes(d_model, N)``).  Nothing else changes: the MXFP8 launch census (28 at
-  the test geometry, 27 RoPE-only, 24 MHA -- the table below), the same carve;
+  (``sf_blob_bytes(d_model, N)``).  Nothing else changes: the MXFP8 launch census (15 at
+  the test geometry, 15 RoPE-only, 14 MHA -- the table below), the same carve;
 * **an fp4 ``W_o``** (``o_fp4``; ``scale_o == descale_w_o == 1.0`` by ``MxQuantSpec``'s own rule)
   puts B2 ``dO_gated = dY . W_o^T`` on a block-scale row over the caller's
   ``w_o_t`` -- ``W_o`` re-quantized along ``d_model`` in the format of ``o_fp4``, packed e2m1
