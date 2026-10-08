@@ -2206,12 +2206,34 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # the UNGATED normalised O -- the sdpa node's output, independent of G
             # -- in the O's own units here (there is no scale_o to divide by).
             self._not_implemented_error_if(self.thd, "epilogue gate fusion is dense-only (no THD gate descriptor)")
-            self._not_implemented_error_if(self.paged, "epilogue gate fusion with paged KV is not wired")
+            # The three kernel-side interactions below vanish when the gate rides the split
+            # COMBINE (the d256 decode tile, split_kv > 1: the tile writes un-gated fp32
+            # partials and sm100/split_combine applies sigmoid(G) to the merged value, so
+            # the kernel's gate TMA box, its paged flavor and its packed rows are all
+            # irrelevant); engines.mismatch lifts the same three through
+            # d256_decode_tile_selected(..., split_kv) -- keep them in lockstep.
+            _gate_in_combine = self._gate_in_combine_for(int(s_qo), int(h_qo), int(h_kv))
             self._not_implemented_error_if(
-                self.split_kv > 1,
-                "epilogue gate fusion with split_kv > 1 is not supported: the combine would write the un-gated O",
+                self.paged and not _gate_in_combine,
+                "epilogue gate fusion with paged KV is not wired (the d256 decode tile's split applies the gate in its combine)",
             )
-            self._not_implemented_error_if(self.pack_gqa, "epilogue gate fusion with PackGQA is not wired")
+            self._not_implemented_error_if(
+                self.split_kv > 1 and not _gate_in_combine,
+                "epilogue gate fusion with split_kv > 1 is not supported: the combine would write the un-gated O "
+                "(the d256 decode tile's split applies the gate in its combine)",
+            )
+            self._not_implemented_error_if(
+                self.pack_gqa and not _gate_in_combine,
+                "epilogue gate fusion with PackGQA is not wired (the d256 decode tile's split applies the gate in its combine)",
+            )
+            if _gate_in_combine:
+                # The gated combine is reached through the prepared dense launch only
+                # (the staged path binds the split through the same native binder, which
+                # knows no gate on a split): the operands must bind zero-copy.
+                self._not_implemented_error_if(
+                    not self._can_prepare_dense_layout(),
+                    "the gate-in-combine split (the d256 decode tile) needs Q/K/V layouts the prepared dense launch binds zero-copy (BSHD-physical)",
+                )
             # Only now the request's OWN well-formedness (ValueError), so a
             # caller on another arch line / flavor first hears "not served
             # here", not "wrong gate dtype".  The gate multiplies O
@@ -2311,13 +2333,36 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         (its Rubin paged gate admits the decode-shaped graph the decode tile serves)."""
         if self._fp8 or self.thd or self.flavor != (256, 256):
             return 0
-        if self.gate_desc is not None or self.softmax_scale_prefolded:
-            # Neither is wired on the decode tile (no gate seams; the scale is applied
-            # in-kernel): the d256 prefill kernel serves both (config_sm107's
-            # make_cfg_d256_decode declines such a record as the backstop).
+        if self.softmax_scale_prefolded:
+            # Not wired on the decode tile (the scale is applied in-kernel): the d256
+            # prefill kernel serves it (config_sm107's make_cfg_d256_decode declines
+            # such a record as the backstop).
+            return 0
+        if self.gate_desc is not None and self.split_kv <= 1:
+            # The tile has no gate seams either, so a GATED graph rides it only through a
+            # split: the combine applies ``O *= sigmoid(G)`` to the fp32 merged value
+            # (sm100/split_combine, gate=True -- :meth:`_gate_in_combine`); unsplit, the
+            # d256 prefill kernel's fused epilogue serves the graph as before.
             return 0
         pack_g = (int(h_q) // int(h_kv)) if self.pack_gqa else 1
         return decode_d256_q_tile(int(s_q), pack_g)
+
+    def _gate_in_combine_for(self, s_q: int, h_q: int, h_kv: int) -> bool:
+        """:meth:`_gate_in_combine` on explicit shapes (for ``check_support``, like
+        :meth:`_decode_q_tile_for`)."""
+        return self.gate_desc is not None and self.split_kv > 1 and self._device_cc == (10, 7) and self._decode_q_tile_for(s_q, h_q, h_kv) > 0
+
+    def _gate_in_combine(self) -> bool:
+        """Whether this plan's fused epilogue gate rides the split COMBINE instead of the
+        kernel epilogue: a gated f16/bf16 d256 graph lowered onto the Rubin decode tile
+        with ``split_kv > 1``.  The tile is compiled WITHOUT the gate (it has no gate
+        seams; ``TemplateParams.epilogue_gate`` stays False) and writes its fp32
+        partials as any split does; ``sm100/split_combine.compile_ptr(gate=True)``
+        multiplies the merged fp32 value by ``sigmoid(G)`` before the single cast --
+        FROST's one-rounding convention, the same arithmetic as the fused kernels'
+        epilogue (module docstring there).  ``engines.d256_decode_tile_selected``
+        (its ``split_kv`` argument) is the facts-level twin; keep the two in lockstep."""
+        return self._gate_in_combine_for(self.s_q_max, self.h_q, self.h_kv)
 
     def _decode_q_tile(self) -> int:
         """N extent of the decode tile (config_sm100.decode_d256_q_tile) when this
@@ -2331,8 +2376,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         S_q x packed-heads rows fit the routed 16-wide N tile
         (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the 32-wide tile compiles
         but is issue-bound per CTA and stays unrouted); everything else (THD,
-        quantized, larger S_q, the fused epilogue gate, the pre-folded scale)
-        stays on the prefill tile.  The TILE_CGA_M / SCHED_POLICY knobs describe
+        quantized, larger S_q, the pre-folded scale, the fused epilogue gate at
+        split_kv == 1) stays on the prefill tile.  A GATED graph rides the tile
+        when it splits: the gate moves into the split combine
+        (:meth:`_gate_in_combine`).  The TILE_CGA_M / SCHED_POLICY knobs describe
         the prefill pipeline and are no-ops here (one cta_group::1 CTA per unit,
         nothing to schedule).  engines.d256_decode_tile_selected is the
         facts-level twin; keep the two in lockstep.
@@ -2477,7 +2524,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # output, so a runtime execute() argument cannot silently change
             # the launched kernel.
             emit_amax_o=(not self.pv_bf16) or self.has_amax_o,
-            epilogue_gate=self.gate_desc is not None,
+            # A gate that rides the split COMBINE (the decode tile, _gate_in_combine) is
+            # not the kernel's: the tile has no gate seams and compiles ungated.
+            epilogue_gate=self.gate_desc is not None and not self._gate_in_combine(),
             thd_batch_one=(
                 self.packed_thd_split
                 or (
@@ -2860,6 +2909,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # graph binding allows a larger carrier for an effective batch.
         kv_lens = self._checked_seq_lens(seq_kv_lens, "seq_kv_lens") if seq_kv_lens is not None else None
         q_lens = self._checked_seq_lens(seq_q_lens, "seq_q_lens") if self.seq_q_lens_present else None
+        if spec.combine is not None and spec.combine.gate is not None:
+            # The gate rides the combine (the decode tile's split): bound to the gated
+            # combine entry for this launch, never handed to the native binder (which
+            # knows no gate on a split) -- execute_native_dense_tensors does both.
+            self._logger.debug("gate bound to the split combine (the decode tile has no gate seams)")
         launched = execute_native_dense_tensors(
             spec,
             (
