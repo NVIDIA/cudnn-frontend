@@ -25,7 +25,7 @@ from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
 from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
-from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
 _F16 = "sdpa_fwd_prefill_sm100"
 _OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501}
@@ -474,6 +474,35 @@ def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
     assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **quant)) is None, "dense BSHD stays admitted"
     assert engines.mismatch(sm100, _facts(**thd)) is None
     assert engines.mismatch(sm100, _facts(**paged)) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["A", "FALLBACK"])
+def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm107_metadata_target):
+    """The measured D256 picker says LPT for a masked block-scale graph; the cc 10.7 MXFP8 row claims NATURAL only at
+    (256, 256), so every proposed set must be clamped into that domain -- the FALLBACK block had no entry at all and
+    the A block kept only its NATURAL runner (test_d256_quantized_primary_uses_measured_scheduler keeps the SM100 row's
+    LPT, which that row's domain honours)."""
+    name = engines.engine_name(mxfp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
+    facts = _facts(
+        b=2,
+        h_q=8,
+        h_kv=2,
+        s_q=4096,
+        s_kv=4096,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_mxfp8=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = recommend(kind, facts, {name: 20516})
+    assert plans, f"{kind}: the row admits the graph (mismatch={engines.mismatch(spec.capabilities, facts)!r}) and must propose a set"
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    assert (plans[0].knobs.sched_policy, plans[0].knobs.cga, plans[0].knobs.split_kv) == (SCHED_NATURAL, 1, 1)
 
 
 @pytest.mark.L0
