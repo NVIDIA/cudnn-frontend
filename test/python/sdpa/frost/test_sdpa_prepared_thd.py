@@ -2021,6 +2021,8 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_split_b1", "HN", False, 4),
         ("d128_split_b1_gqa", "NH", True, 3),
         ("d128_gqa8_split_gqa", "HN", True, 3),
+        ("d128_gqa16_split_gqa", "NH", False, 3),
+        ("d128_gqa16_split_gqa", "HN", True, 4),
         ("d128_mha_split", "NH", False, 3),
         ("d256_split", "NH", False, 4),
         ("d256_split", "HN", True, 3),
@@ -2043,7 +2045,9 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         if arch != "sm107":
             pytest.skip("Paged D256 packed split is qualified on SM107")
         d = 256
-    if "_gqa8_" in geometry:
+    if "_gqa16_" in geometry:
+        h, hk = 16, 1
+    elif "_gqa8_" in geometry:
         h, hk = 32, 4
     elif "_mha_" in geometry:
         hk = h
