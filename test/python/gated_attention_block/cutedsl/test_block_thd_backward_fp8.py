@@ -65,7 +65,7 @@ if requirement_error:
 
 pytestmark = pytest.mark.L0
 
-from cudnn.gated_attention_block import GatedAttentionBlockBwd, GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec  # noqa: E402
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec  # noqa: E402
 from cudnn.gated_attention_block.api import MxQuantSpec, _cols, _view  # noqa: E402
 from cudnn.gated_attention_block.api_bwd import _check_saved_record  # noqa: E402
 
@@ -81,7 +81,7 @@ from gated_block_reference import (  # noqa: E402
     quantize_block_inputs,
     sequence_slices,
 )
-from test_block_backward import _KNOBS, _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _cos, _make_dy  # noqa: E402
+from test_block_backward import _KNOBS, _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _make_dy  # noqa: E402
 from test_block_backward_fp8 import (  # noqa: E402
     _E4M3,
     _api_const,
@@ -94,7 +94,6 @@ from test_block_backward_fp8 import (  # noqa: E402
     _dev_scalar,
     _execute_fp8,
     _print_end_to_end,
-    _report_close,
     _report_seeded_intermediates,
     _report_stage_difference,
     _row_budget_floored,
