@@ -502,8 +502,11 @@ class KernelTmemLayout:
 
     # FP8 P is 4:1-packed at the S_acc tails (96 / 224); the lower halves of each
     # S_acc slot (< P) are free for stats + reloaded SF (cuDNN mxfp8 scheme).
-    P0_OFF: int = 64 if CFG.PV_BF16 else 96
-    P1_OFF: int = 192 if CFG.PV_BF16 else 224
+    # Each logical P cross-inplaces the OPPOSITE S_acc tail (the d192 scheme): P0 lives in S_acc_1, P1 in S_acc_0, so
+    # the next QK^T[sub] can be issued before PV[sub] has consumed P[sub] -- the softmax stores P[sub] only after the
+    # other sub-tile's S has been loaded (mb_p_inplace), see _softmax_kv_body / _mma_warp_group.
+    P0_OFF: int = 192 if CFG.PV_BF16 else 224
+    P1_OFF: int = 64 if CFG.PV_BF16 else 96
 
     # Stats on the S_acc heads (col 0 / 128); SF_STATS_OFFSET clears them.
     STATS_OFF: int = 0
@@ -530,10 +533,11 @@ class KernelTmemLayout:
     SF_K1_PRO_OFF: int = 256 + 2 * SF_TMEM_COLS_Q + SF_TMEM_COLS_K  # 268
     # BMM2 SF_P/V per sub-tile (S_acc region + SF_AFTER_P_OFFSET); the existing
     # bmm2_ready wait already proves softmax read all of S_acc, so no extra gate.
-    SF_P0_OFF: int = SF_AFTER_P_OFFSET  # 32
-    SF_V0_OFF: int = SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 36
-    SF_P1_OFF: int = 128 + SF_AFTER_P_OFFSET  # 160
-    SF_V1_OFF: int = 128 + SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 164
+    # BMM2 SF_P/V scratch follows its cross-inplaced P operand (S_acc_1 region for sub0, S_acc_0 for sub1).
+    SF_P0_OFF: int = 128 + SF_AFTER_P_OFFSET  # 160
+    SF_V0_OFF: int = 128 + SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 164
+    SF_P1_OFF: int = SF_AFTER_P_OFFSET  # 32
+    SF_V1_OFF: int = SF_AFTER_P_OFFSET + SF_TMEM_COLS_P  # 36
 
 
 LAYOUT = KernelTmemLayout()
@@ -740,6 +744,14 @@ def _kernel(
     # MMA may reload SF_Q/K into that tile's S_acc scratch (steady-state ping-pong).
     # Leader-waited (P8): both CTAs' softmax arrive_on_leader → init = CTA_MMA.
     mb_softmax_ldtm = cutlass.Array(cutlass.Int64, CFG.TILES_Q, alignment=16, space=cutlass.AddressSpace.smem)
+    # Per-CTA one-way handoffs guarding the cross-inplaced P stores: softmax[sub] publishes one token per KV step once
+    # its four warps have loaded S_acc[sub] into registers; P0 consumes S1 tokens, P1 consumes S0 tokens one phase
+    # later, so the next QK^T[sub0] may issue before the previous PV[sub0] (d192 scheme).
+    mb_p_inplace = cutlass.Array(cutlass.Int64, CFG.TILES_Q, alignment=16, space=cutlass.AddressSpace.smem)
+    # Per-sub-tile "stats(kv) consumed" gate (correction -> leader MMA, one token per steady step): BMM1[sub](kv+1) is
+    # now issued before the PV[sub](kv) waits, so bmm2_ready no longer orders the correction's read of stats(kv) (S_acc
+    # head) before that S overwrite; the MMA waits this token instead (one elected lane per correction warp arrives).
+    mb_stat_read = cutlass.Array(cutlass.Int64, CFG.TILES_Q, alignment=16, space=cutlass.AddressSpace.smem)
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -788,6 +800,8 @@ def _kernel(
                 # Leader-waited (P8): each softmax warp elect-arrives after its own
                 # S_acc LDTM+wait → SOFTMAX_WG_WARPS arrives per CTA × CTA_MMA CTAs.
                 nvvm.mbarrier_init(mb_softmax_ldtm.subview(qs), CFG.SOFTMAX_WG_WARPS * CFG.CTA_MMA)
+                nvvm.mbarrier_init(mb_p_inplace.subview(qs), CFG.SOFTMAX_WG_WARPS)
+                nvvm.mbarrier_init(mb_stat_read.subview(qs), CFG.CORRECTION_WARPS * CFG.CTA_MMA)
             bars.mb_tmem_dealloc.init()
             bars.mb_empty_mainloop.init()
 
@@ -828,6 +842,7 @@ def _kernel(
             bars=bars,
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
+            mb_p_inplace=mb_p_inplace,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             seq_q_lens_addr=seq_q_lens_addr,
             n_q_supers=n_q_supers,
@@ -850,6 +865,7 @@ def _kernel(
             bars=bars,
             sched=sched,
             mb_softmax_ldtm=mb_softmax_ldtm,
+            mb_p_inplace=mb_p_inplace,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
             seq_q_lens_addr=seq_q_lens_addr,
             n_q_supers=n_q_supers,
@@ -869,6 +885,7 @@ def _kernel(
             tmem_ptr_i32=tmem_ptr_i32,
             tidx=tidx,
             bars=bars,
+            mb_stat_read=mb_stat_read,
             sched=sched,
             lse_tensor=lse_tensor,
             amax_o_tensor=amax_o_tensor,
@@ -909,6 +926,7 @@ def _kernel(
                     bars=bars,
                     sched=sched,
                     mb_softmax_ldtm=mb_softmax_ldtm,
+                    mb_stat_read=mb_stat_read,
                     seq_kv_lens_tensor=seq_kv_lens_tensor,
                     seq_q_lens_addr=seq_q_lens_addr,
                     n_q_supers=n_q_supers,
@@ -948,6 +966,7 @@ def _kernel(
                 bars=bars,
                 sched=sched,
                 mb_softmax_ldtm=mb_softmax_ldtm,
+                mb_stat_read=mb_stat_read,
                 seq_kv_lens_tensor=seq_kv_lens_tensor,
                 seq_q_lens_addr=seq_q_lens_addr,
                 n_q_supers=n_q_supers,
@@ -1660,6 +1679,7 @@ def _mma_warp_group(
     bars,
     sched,
     mb_softmax_ldtm,
+    mb_stat_read,
     seq_kv_lens_tensor,
     seq_q_lens_addr,
     n_q_supers,
@@ -1840,6 +1860,8 @@ def _mma_warp_group(
     # phase accumulates across persistent-loop wraps (else: multi-wave deadlock).
     ldtm_phase0 = cutlass.Int32(0)  # consumes softmax[0] arrives (for BMM1[sub1])
     ldtm_phase1 = cutlass.Int32(0)  # consumes softmax[1] arrives (for BMM1[sub0])
+    stat_read_phase0 = cutlass.Int32(0)  # consumes correction's stats_0(kv) reads (for steady BMM1[sub0](kv+1))
+    stat_read_phase1 = cutlass.Int32(0)  # consumes correction's stats_1(kv) reads (for steady BMM1[sub1](kv+1))
     # Stats-consumed gate (one flip per tile per sub-tile): the prologue BMM1
     # overwrites the S_acc HEAD where the PREVIOUS tile's final
     # (total_max, total_sum) stats live until the correction epilogue has read
@@ -1911,6 +1933,21 @@ def _mma_warp_group(
                 bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                 desc_K = sK[kv_state.idx].desc()
                 desc_K_SF = sK_SF[kv_state.idx].desc()
+                # QK^T[sub0](kv) BEFORE PV[sub0](kv-1): P0 lives in S_acc_1's tail, so writing S_acc_0 here is safe
+                # once softmax[1] has loaded the previous S_acc_1 (SF_Q0/K0 scratch sits in its head) -- the next S is
+                # produced while the softmax is still finishing the previous step.
+                # The correction reads stats_0(kv-1) (S_acc_0 head) for every kv-1 > kv_left; that read is no longer
+                # ordered before this S_acc_0 overwrite by the PV[sub0] waits (they now follow), so wait its token here.
+                if kv_loop > kv_left + cutlass.Int32(1):
+                    wait(mb_stat_read.subview(0), stat_read_phase0)
+                    stat_read_phase0 = stat_read_phase0 ^ 1
+                wait(mb_softmax_ldtm.subview(1), ldtm_phase1)
+                ldtm_phase1 = ldtm_phase1 ^ 1
+                if nvvm.elect_sync():
+                    _utccp_bmm1_sf(tmem_SF_Q0, tmem_SF_K0, desc_Q_SF_0, desc_K_SF)
+                mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), tmem_sf_a=tmem_SF_Q0, tmem_sf_b=tmem_SF_K0)
+                if nvvm.elect_sync():
+                    bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
                 bars.mb_v_full[old_state.idx].wait(old_state.phase, spin=SPIN_RING_WAITS)
                 if cutlass.const_expr(CFG.THD_VARLEN):
@@ -1958,15 +1995,22 @@ def _mma_warp_group(
                 # read of S_acc_1 completed before the leader-broadcast UTCCP
                 # (cta_group::2 self-fills both CTAs) overwrites it.
                 # (the k_full wait and the K descriptors were hoisted above the PV[sub0] P waits)
-                wait(mb_softmax_ldtm.subview(1), ldtm_phase1)
-                ldtm_phase1 = ldtm_phase1 ^ 1
-                if nvvm.elect_sync():
-                    _utccp_bmm1_sf(tmem_SF_Q0, tmem_SF_K0, desc_Q_SF_0, desc_K_SF)
-                mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)), tmem_sf_a=tmem_SF_Q0, tmem_sf_b=tmem_SF_K0)
-                if nvvm.elect_sync():
-                    bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
                 # BMM2[sub1] → O_1.  SF_P1/V1 reload into S_acc_1 scratch (160/164).
+                # QK^T[sub1](kv) BEFORE PV[sub1](kv-1): P1 lives in S_acc_0's tail; PV[sub0] above consumed P0 from
+                # S_acc_1's tail, and softmax[0] has loaded this step's S_acc_0 (SF_Q1/K1 scratch in its head).
+                # Same gate for stats_1(kv-1) before this S_acc_1 overwrite.
+                if kv_loop > kv_left + cutlass.Int32(1):
+                    wait(mb_stat_read.subview(1), stat_read_phase1)
+                    stat_read_phase1 = stat_read_phase1 ^ 1
+                wait(mb_softmax_ldtm.subview(0), ldtm_phase0)
+                ldtm_phase0 = ldtm_phase0 ^ 1
+                if nvvm.elect_sync():
+                    _utccp_bmm1_sf(tmem_SF_Q1, tmem_SF_K1, desc_Q_SF_1, desc_K_SF)
+                mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), tmem_sf_a=tmem_SF_Q1, tmem_sf_b=tmem_SF_K1)
+                if nvvm.elect_sync():
+                    bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
+                    bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                 bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 0].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
                 if cutlass.const_expr(not CFG.PV_BF16):
                     if nvvm.elect_sync():
@@ -2003,17 +2047,14 @@ def _mma_warp_group(
                 # BMM1[sub1] next-kv → S_acc_1.  SF_Q1/K1 ping-pong into S_acc_0
                 # scratch (8/12); wait tile0's softmax LDTM (SAME-iter — BMM1[sub0]
                 # above just wrote this iter's S_acc_0, which softmax[0] must read).
-                wait(mb_softmax_ldtm.subview(0), ldtm_phase0)
-                ldtm_phase0 = ldtm_phase0 ^ 1
-                if nvvm.elect_sync():
-                    _utccp_bmm1_sf(tmem_SF_Q1, tmem_SF_K1, desc_Q_SF_1, desc_K_SF)
-                mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)), tmem_sf_a=tmem_SF_Q1, tmem_sf_b=tmem_SF_K1)
-                if nvvm.elect_sync():
-                    bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
-                    bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
                 bmm2_ready_phase = bmm2_ready_phase ^ 1
 
+            # The correction also reads stats(kv_right-1) (when kv_right-1 > kv_left); nothing above waited that token
+            # (the epilogue PV's bmm2_ready wait orders it), so flip in lockstep to keep the parity across tiles.
+            if kv_right > kv_left + cutlass.Int32(1):
+                stat_read_phase0 = stat_read_phase0 ^ 1
+                stat_read_phase1 = stat_read_phase1 ^ 1
             # Epilogue: BMM2 for last kv (always runs — n_kv >= 1).
             if nvvm.elect_sync():
                 for qs in cutlass.range_constexpr(CFG.TILES_Q):
@@ -2159,6 +2200,7 @@ def _softmax_kv_body(
     tmem_ptr_i32,
     bars,
     mb_softmax_ldtm,
+    mb_p_inplace,
     q_abs,
     eff_seqlen_kv,
     eff_seqlen_q,
@@ -2167,9 +2209,11 @@ def _softmax_kv_body(
     total_sum,
     bmm1_phase,
     stat_empty_phase,
+    p_inplace_phase,
+    alpha_addr,
     leader_cta_id,
 ):
-    """Per-iter softmax body — returns (total_max, total_sum, bmm1_phase, stat_empty_phase).
+    """Per-iter softmax body — returns (total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr).
 
     Compile-time apply_mask picks fast HW max (tcgen05.ld.red.f32.max)
     vs slow path (load → apply_mask_chunk → software row_max).  The HW
@@ -2301,6 +2345,7 @@ def _softmax_kv_body(
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
     if nvvm.elect_sync():
         arrive_on_leader(mb_softmax_ldtm.subview(sub_tile_id), leader_cta_id, CFG.CTA_MMA)
+        nvvm.mbarrier_arrive(mb_p_inplace.subview(sub_tile_id))
 
     # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF), as the pre-folded
     # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
@@ -2335,8 +2380,13 @@ def _softmax_kv_body(
     alpha = cute.math.exp2(exp_input, fastmath=True)
     new_total_max = total_max
 
+    # The tile's first alpha is never read (the correction skips the first step's rescale) and nothing orders its
+    # TMEM store before BMM1(kv_first+1) overwrites this S_acc head (the stats-read gate starts at the second step):
+    # alpha_addr is seeded at the tile top with this sub-tile's O slot (dead until PV(kv_first) overwrites it with
+    # accumulate=False) and becomes the stats slot from the second step on -- a loop-carried value, no per-step branch.
     alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
-    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(alpha_addr, cutlass.Float32), alpha_vec)
+    alpha_addr = stats_addr
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_stat_full[sub_tile_id].arrive()
 
@@ -2353,6 +2403,10 @@ def _softmax_kv_body(
         reg_P_a = cute.math.exp2(reg_S_a, fastmath=True)
     sum_a_pair = row_reduction_pair_64(reg_P_a)
     p_a_fp16 = reg_P_a.to(P_STORAGE_DTYPE)
+    # P[sub] lives in the OTHER sub-tile's S_acc tail: store it only once that sub-tile's softmax has loaded its S
+    # (P0 waits S1 tokens; P1 waits S0 tokens one step ahead -- seeded at the tile top).
+    wait(mb_p_inplace.subview(1 - sub_tile_id), p_inplace_phase)
+    p_inplace_phase = p_inplace_phase ^ 1
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_a, cutlass.Float32), p_a_fp16)
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
     bars.mb_bmm2_ready[sub_tile_id * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
@@ -2377,7 +2431,7 @@ def _softmax_kv_body(
     bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
     stat_empty_phase = stat_empty_phase ^ 1
 
-    return total_max, total_sum, bmm1_phase, stat_empty_phase
+    return total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr
 
 
 @cute.jit
@@ -2392,6 +2446,7 @@ def _softmax_warp_group(
     bars,
     sched,
     mb_softmax_ldtm,
+    mb_p_inplace,
     seq_kv_lens_tensor,
     seq_q_lens_addr,
     n_q_supers,
@@ -2414,6 +2469,8 @@ def _softmax_warp_group(
     stats_off = LAYOUT.STATS_OFF + sub_tile_id * LAYOUT.STATS_STRIDE
 
     bmm1_phase = cutlass.Int32(0)
+    p_inplace_phase = cutlass.Int32(0)
+    pv1_done_phase = cutlass.Int32(0)  # parity of the bmm2_done[1] commits seen so far (n per tile, 1 per empty tile)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
     epilogue_state = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
 
@@ -2470,17 +2527,25 @@ def _softmax_warp_group(
         # Bootstrap stat_empty wait lifts the wait out of per-iter critical path.
         bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
         stat_empty_phase = stat_empty_phase ^ 1
+        # Seed P1 one S0 token behind (P1 is stored into S_acc_0's tail only after softmax[0] has loaded the NEXT
+        # step's S_acc_0, which the MMA writes before the PV that consumes P1).  Empty tiles produce no tokens.
+        if bounds.right > bounds.left:
+            if cutlass.const_expr(sub_tile_id == 1):
+                wait(mb_p_inplace.subview(0), p_inplace_phase)
+                p_inplace_phase = p_inplace_phase ^ 1
+        alpha_addr = tmem_ptr_i32.load() + cutlass.Int32((LAYOUT.O0_OFF if sub_tile_id == 0 else LAYOUT.O1_OFF) + CFG.TILE_O - 1)
         # 3-segment kv loop: LEFT-masked / unmasked (fast HW max) / RIGHT-masked.
         # MASK_NONE: bounds collapse so masked sub-loops fold out at trace time.
         if cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
             for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     q_abs,
                     eff_seqlen_kv,
                     eff_seqlen_q,
@@ -2489,17 +2554,20 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
+                    alpha_addr,
                     leader_cta_id,
                 )
         else:
             for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     q_abs,
                     eff_seqlen_kv,
                     eff_seqlen_q,
@@ -2508,16 +2576,19 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
+                    alpha_addr,
                     leader_cta_id,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
                     False,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     q_abs,
                     eff_seqlen_kv,
                     eff_seqlen_q,
@@ -2526,16 +2597,19 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
+                    alpha_addr,
                     leader_cta_id,
                 )
             for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
-                total_max, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body(
+                total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
                     True,
                     sub_tile_id,
                     kv_loop,
                     tmem_ptr_i32,
                     bars,
                     mb_softmax_ldtm,
+                    mb_p_inplace,
                     q_abs,
                     eff_seqlen_kv,
                     eff_seqlen_q,
@@ -2544,6 +2618,8 @@ def _softmax_warp_group(
                     total_sum,
                     bmm1_phase,
                     stat_empty_phase,
+                    p_inplace_phase,
+                    alpha_addr,
                     leader_cta_id,
                 )
 
@@ -2554,6 +2630,19 @@ def _softmax_warp_group(
         stats_vec_epi = cutlass.Vector.from_elements((total_max, total_sum_scalar), cutlass.Float32)
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr_epi, cutlass.Float32), stats_vec_epi)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+        # The last P1 store waited for an S0 token past the tile's last step: softmax[0] publishes it here.  P1(n) lands
+        # on P1(n-1) in S_acc_0's tail, so the token must also prove PV[sub1](n-1) has read it -- only its commit does
+        # (softmax[0]'s own progress orders nothing about PV[sub1]); the (n-1)-th commit of this tile is waited first.
+        n_kv_tile = bounds.right - bounds.left
+        if bounds.right > bounds.left:
+            if cutlass.const_expr(sub_tile_id == 0):
+                if n_kv_tile > cutlass.Int32(1):
+                    bars.mb_bmm2_done[1].wait((pv1_done_phase + n_kv_tile) & cutlass.Int32(1), spin=SPIN_RING_WAITS)
+                if nvvm.elect_sync():
+                    nvvm.mbarrier_arrive(mb_p_inplace.subview(0))
+            pv1_done_phase = (pv1_done_phase + n_kv_tile) & cutlass.Int32(1)
+        else:
+            pv1_done_phase = pv1_done_phase ^ cutlass.Int32(1)
         bars.mb_stat_full[sub_tile_id].arrive()
 
         # make_warp_uniform on scheduler loads keeps payload in uniform regs across back-edge (no STL spill).
@@ -2589,6 +2678,7 @@ def _correction_warp_group(
     tmem_ptr_i32,
     tidx,
     bars,
+    mb_stat_read,
     sched,
     lse_tensor: Optional[cute.Tensor],
     amax_o_tensor: Optional[cute.Tensor],
@@ -2687,6 +2777,9 @@ def _correction_warp_group(
                 )
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 alpha = stats_vec[0]
+                # stats(kv) read: release S_acc[qs]'s head to the MMA's next BMM1[qs] (leader-waited, one lane per warp).
+                if nvvm.elect_sync():
+                    arrive_on_leader(mb_stat_read.subview(qs), leader_cta_id, CFG.CTA_MMA)
 
                 # all_alpha_one ballot skips α-rescale once softmax stops bumping total_max.
                 alpha_is_one = alpha == cutlass.Float32(1.0)
