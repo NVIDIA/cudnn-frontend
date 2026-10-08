@@ -1459,8 +1459,9 @@ def _sm107_spec() -> EngineSpec:
       from ``sm100/decode_d256_f16.py``), with the SM100 tile's whole-group
       PackGQA (24/2: 12 live rows + 4 zero tail rows per unit) and dense / paged
       split-KV -- validated on cc 10.7 against the fp32 reference, paged == dense
-      bitwise, packed == unpacked bitwise, split == unsplit within the combine's
-      fp32 reassociation (test_sdpa_fwd_decode_d256_sm107.py).
+      bitwise, packed == unpacked bitwise, split == unsplit within a derived
+      budget (one output ulp plus the half-precision P quantization term;
+      test_sdpa_fwd_decode_d256_sm107.py).
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
       (the f16x2 arm is a quantized-kernel specialization).
     - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the

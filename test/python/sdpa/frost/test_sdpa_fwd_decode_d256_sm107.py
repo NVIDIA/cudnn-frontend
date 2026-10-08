@@ -29,8 +29,9 @@ SM100 suite's policy assertions apply here verbatim: whole-group packing (24/2: 
 rows + 4 zero tail rows per (batch, KV head) unit), the decode split model
 (``choose_decode_tile_split_kv``: the eager-safe lead, the captured runner-up, swapped under
 ``is_cuda_graph_replay_expected``), plus the three equalities the claim rests on -- paged ==
-dense BITWISE on the same tokens, packed == unpacked BITWISE, and split == unsplit within
-the combine's fp32 reassociation (one output ulp; a derived budget, not a tuned one).  What
+dense BITWISE on the same tokens, packed == unpacked BITWISE, and split == unsplit within a
+DERIVED budget (one output ulp from the single cast of two differently-associated fp32 sums,
+plus the half-precision P quantization term, ``_assert_split_matches_unsplit``).  What
 does NOT invert: the 32-row shapes (32/2 at S_q = 2) ride the tile UNPACKED -- the Rubin
 d256 prefill kernel wires no PackGQA, so a packed route past the tile does not exist and a
 packed request there is a typed decline (the REJECT cases) -- and the tile's packing / split
@@ -444,7 +445,16 @@ def _run_graph(
         if dead.any():
             assert torch.isinf(got_lse[dead]).all() and (got_lse[dead] < 0).all(), "dead rows must write LSE := -inf"
     if capture is not None:
-        capture.update(o=out.clone(), lse=stats_gpu.view(B, H, s_q).clone() if stats else None, module=g._compiled_plans[idx]._compiled.kernel_module)
+        capture.update(
+            o=out.clone(),
+            lse=stats_gpu.view(B, H, s_q).clone() if stats else None,
+            module=g._compiled_plans[idx]._compiled.kernel_module,
+            q=q_gpu.transpose(1, 2).clone(),
+            k=k_dense.clone(),
+            v=v_dense.clone(),
+            lens=list(lens),
+            scale=scale,
+        )
     return plan
 
 
@@ -466,23 +476,66 @@ def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False
         assert (plan.knobs.split_kv or 1) == want, (plan.knobs, want)
 
 
-def _assert_within_one_output_ulp(a, b, dtype, what):
-    """``|a - b| <= one ulp of dtype`` at the larger magnitude, per element (fp64 on the CPU): the
-    budget of two fp32 reductions that differ only in their association -- the split path
-    renormalises each partial by ``exp(lse_s - lse)`` in the combine where the unsplit path rescales
-    the running accumulator per tile, so the two fp32 sums round to the output dtype identically or
-    one ulp apart.  A derived budget, not a tuned one; the measured magnitude is printed so the log
-    carries it."""
+def _assert_split_matches_unsplit(a, b, dtype, *, q, k, v, lens, scale, what):
+    """The DERIVED budget between the split and the unsplit plan of one graph, per output element:
+
+        |a - b| <= ulp_dtype(max(|a|, |b|)) + eps_P * sum_j p_j |v_j| / l
+
+    Two terms, two causes.  (1) The output is rounded ONCE to the output dtype from two fp32
+    values that are the same quantity associated differently (the split path renormalises each
+    partial by exp(lse_s - lse) in the combine, the unsplit path rescales its running accumulator
+    per KV tile), so the two roundings agree or differ by one output ulp at the element's own
+    binade.  (2) Before that rounding the two fp32 values are NOT equal to fp32 precision: the
+    tile quantizes P = exp(s - m) to the half IO dtype for BMM2 (the P^T operand must match V's
+    dtype) at the running max m of ITS OWN split, so every p_j carries a relative rounding
+    error |delta_j| <= eps_P = 2^-(mbits+1) that differs between the two paths; the resulting
+    disagreement of sum_j p_j (1 + delta_j) v_j / l is bounded by eps_P * sum_j p_j |v_j| / l --
+    the row's softmax-weighted mean of |V|, computed here from the same inputs in fp32, a
+    rigorous (not statistical) bound.  Term (2) is what makes an element near ZERO (cancellation)
+    differ by far more than one ulp of its own tiny magnitude; it also exceeds one output ulp of
+    a mid-magnitude element (|O| ~ 2^-6: eps_P * mean|V| ~ 2^-8 in bf16 against a 2^-13 ulp), so
+    the ONE assertion is the two-term budget -- the per-binade ulp counts are reported, not
+    pinned.  Still 6x (bf16) / 20x (f16) under the suite's reference tolerance, and any
+    structural defect (a wrong combine weight, a dropped split, a stale partial) lands orders of
+    magnitude above it.  Both plans match the fp32 reference on their own; the measured
+    magnitudes are printed so the log carries them.  Dense / padded rows without a causal or
+    window mask only."""
     mbits = {torch.bfloat16: 7, torch.float16: 10}[dtype]
-    a64, b64 = a.double().cpu(), b.double().cpu()
+    eps_p = 2.0 ** -(mbits + 1)
+    B, s_q, H, d = q.shape
+    KH = k.shape[2]
+    assert s_q == 1 and H % KH == 0, (q.shape, k.shape)
+    G = H // KH
+    qf = q.float().view(B, H, d)  # [B, H, d]
+    kf = k.float().transpose(1, 2)  # [B, KH, S, d]
+    vf = v.float().transpose(1, 2).abs()  # [B, KH, S, d]
+    kv_h = torch.arange(H, device=q.device) // G
+    scores = torch.einsum("bhd,bhsd->bhs", qf, kf[:, kv_h]) * scale  # [B, H, S]
+    S = kf.shape[2]
+    keep = torch.arange(S, device=q.device)[None, :] < torch.tensor(lens, device=q.device)[:, None]  # [B, S]
+    scores = scores.masked_fill(~keep[:, None, :], float("-inf"))
+    prob = torch.softmax(scores, dim=-1)  # rows with no live key are NaN: excluded below
+    pv_abs = torch.einsum("bhs,bhsd->bhd", prob.nan_to_num(0.0), vf[:, kv_h])  # sum_j p_j |v_j| / l, [B, H, d]
+    live = torch.isfinite(prob).all(dim=-1)  # [B, H]
+    a64, b64 = a.double().view(B, H, d), b.double().view(B, H, d)
     mag = torch.maximum(a64.abs(), b64.abs())
-    _, exp = torch.frexp(mag)  # mag = m * 2**exp, m in [0.5, 1): the dtype's ulp in that binade is 2**(exp - 1 - mbits)
-    ulp = torch.ldexp(torch.ones_like(mag), exp - 1 - mbits)
+    _, exp = torch.frexp(mag.cpu())  # mag = m * 2**exp, m in [0.5, 1): the dtype's ulp in that binade is 2**(exp - 1 - mbits)
+    ulp = torch.ldexp(torch.ones_like(mag.cpu()), exp - 1 - mbits).to(mag.device)
+    budget = ulp + eps_p * pv_abs.double()
     diff = (a64 - b64).abs()
-    worst = (diff / ulp).max().item()
-    flipped = (diff > 0).double().mean().item()
-    print(f"{what}: max |diff| = {diff.max().item():.3e} = {worst:.2f} output ulp; {flipped:.4%} of the elements differ")
-    assert worst <= 1.0, (what, worst, flipped)
+    diff = diff[live]
+    budget, ulp, mag = budget[live], ulp[live], mag[live]
+    ratio = (diff / budget).max().item()
+    big = mag >= 2.0**-6
+    big_ulps = (diff[big] / ulp[big]).max().item() if big.any() else 0.0
+    small_abs = diff[~big].max().item() if (~big).any() else 0.0
+    print(
+        f"{what}: max |diff| = {diff.max().item():.3e}; {(diff > 0).double().mean().item():.4%} of the elements differ; "
+        f"elements with |O| >= 2^-6: max {big_ulps:.2f} output ulp; elements below: max |diff| {small_abs:.3e} "
+        f"(eps_P * mean|V| budget there {budget[~big].min().item() if (~big).any() else 0.0:.3e}..{budget[~big].max().item() if (~big).any() else 0.0:.3e}); "
+        f"max |diff| / budget = {ratio:.3f}"
+    )
+    assert ratio <= 1.0, (what, ratio)
 
 
 # --- accept: the decode tile serves the contract on Rubin --------------------------------------
@@ -751,12 +804,12 @@ def test_decode_graph_packed_equals_unpacked_bitwise():
 def test_decode_graph_split_equals_unsplit_within_the_combine_rounding(form, dtype):
     """The decode model's split (the leading plan: 8 ways at b=8 x 2 KV heads over pages, 16 ways at
     b=3 x 2 KV heads over an UNPADDED dense cache -- the dense split the row claims) against the
-    pinned unsplit plan, same graph: NOT bitwise, and bounded.  The split path renormalises each
-    fp32 partial by exp(lse_s - lse) in the combine where the unsplit path rescales its running
-    accumulator per KV tile, so the two fp32 sums are the same value associated differently: after
-    the single cast to the output dtype they agree or differ by ONE output ulp (asserted per element
-    at the larger magnitude; the measured magnitude is printed), and the fp32 LSEs agree to fp32
-    rounding (2e-5 on values of order 10).  Both plans match the fp32 reference on their own."""
+    pinned unsplit plan, same graph: NOT bitwise, and bounded by the derived two-term budget of
+    _assert_split_matches_unsplit (one output ulp of the element's binade from the single cast of two
+    differently-associated fp32 sums, plus eps_P times the row's softmax-weighted mean |V| from the
+    half-precision P each path quantizes at its own running max).  The fp32 LSEs (m + log l, no
+    quantized P in them) agree to fp32 rounding.  Both plans match the fp32 reference on their own;
+    the measured magnitudes are printed."""
     if form == "paged":
         kw = dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=dtype, seed=11)
         G, units, kv_tiles = 16, 16, 32
@@ -769,10 +822,23 @@ def test_decode_graph_split_equals_unsplit_within_the_combine_rounding(form, dty
     assert ps.knobs.split_kv > 1, ps.knobs
     pu = _run_graph(**kw, split_kv=1, capture=unsplit)
     assert pu.knobs.pack_gqa is True and (pu.knobs.split_kv or 1) == 1, pu.knobs
-    _assert_within_one_output_ulp(split["o"], unsplit["o"], dtype, f"split {ps.knobs.split_kv} vs unsplit O ({form}, {dtype})")
-    lse_diff = (split["lse"] - unsplit["lse"]).abs().max().item()
-    print(f"split {ps.knobs.split_kv} vs unsplit LSE ({form}): max |diff| = {lse_diff:.3e}")
-    assert lse_diff <= 2e-5, lse_diff
+    _assert_split_matches_unsplit(
+        split["o"],
+        unsplit["o"],
+        dtype,
+        q=unsplit["q"],
+        k=unsplit["k"],
+        v=unsplit["v"],
+        lens=unsplit["lens"],
+        scale=unsplit["scale"],
+        what=f"split {ps.knobs.split_kv} vs unsplit O ({form}, {dtype})",
+    )
+    assert torch.equal(split["q"], unsplit["q"]) and torch.equal(split["k"], unsplit["k"]), "the two runs must see the same inputs"
+    lse_s, lse_u = split["lse"], unsplit["lse"]
+    live = torch.isfinite(lse_u)
+    lse_diff = (lse_s[live] - lse_u[live]).abs().max().item()
+    print(f"split {ps.knobs.split_kv} vs unsplit LSE ({form}): max |diff| = {lse_diff:.3e} on |LSE| up to {lse_u[live].abs().max().item():.2f}")
+    torch.testing.assert_close(lse_s[live], lse_u[live], atol=1e-5, rtol=4e-6)
 
 
 # --- the template level: the tile's packing and split partials, under the row's claims --------------

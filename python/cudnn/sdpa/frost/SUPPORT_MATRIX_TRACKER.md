@@ -1105,12 +1105,17 @@ shared no-split rules). Evidence on cc 10.7 (204 SMs, `test_sdpa_fwd_decode_d256
 the SM100 case list re-run with the SM100 policy assertions (packed 8:1 / 16:1 / 32:2 / 12:1,
 split 2 runner-up at the b=32 serving shape, split 8 at b=8, split 16 on the deep-split
 shape, CUDA-graph replay at split 4 under the D2H detector), **paged == dense bitwise** on
-the same tokens, **packed == unpacked bitwise** (24/2), and **split == unsplit within the
-combine's fp32 reassociation** (the per-split renormalisation `exp(lse_s - lse)` reorders the
-fp32 sums: the two O's differ by at most one ulp of the output dtype on a fraction of the
-elements, LSE within fp32 rounding -- pinned as such, never widened). `S_q · G` in (16, 32]
-(the 32-column tile, compiled, unrouted as on SM100), THD queries and the quantized
-families stay on the prefill tiles.
+the same tokens, **packed == unpacked bitwise** (24/2), and **split == unsplit within a
+DERIVED budget**: per element one ulp of the output dtype at its own binade (the single cast
+of two differently-associated fp32 sums -- the combine renormalises each partial by
+`exp(lse_s - lse)`, the unsplit path rescales its running accumulator per tile) plus
+`eps_P · Σ_j p_j |v_j| / l` (the tile quantizes P to the half IO dtype at the running max of
+ITS OWN split, `eps_P = 2^-8` bf16 / `2^-11` f16; the term that lets a near-zero element differ
+by far more than an ulp of its tiny magnitude); measured max |ΔO| = exactly one output ulp of
+the top binade (`2^-9` bf16 / `2^-12` f16 over pages, `2^-11` bf16 on the unpadded dense cache),
+~27-45 % of the elements differ, the fp32 LSE within fp32 rounding -- pinned as the derived
+budget, never widened. `S_q · G` in (16, 32] (the 32-column tile, compiled, unrouted as on
+SM100), THD queries and the quantized families stay on the prefill tiles.
 
 ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
 FP8 E4M3; `python/cudnn/sdpa/bwd/api_dsl_sm107.py`, kernels
