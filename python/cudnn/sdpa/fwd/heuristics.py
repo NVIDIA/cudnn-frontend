@@ -1226,7 +1226,8 @@ def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
         and facts.causal
         and not facts.has_epilogue_gate
         and (facts.d_qk, facts.d_v) in caps.thd_pack_gqa_d_shapes
-        and facts.h_q // facts.h_kv in (4, 8)
+        # Nonpaged SM100 GQA16 packs too: unpacked it ran 1.04-2.58x the backend, packed 0.53-0.99.
+        and facts.h_q // facts.h_kv in ((4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8))
     )
 
 
