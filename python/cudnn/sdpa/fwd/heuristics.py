@@ -1557,7 +1557,9 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     Include batch in the grid estimate so multi-request chunks do not receive
     the split budget of an underfilled single request. Rubin qualification
     covers larger batches and caches using the same first-wave budget;
-    already-filled grids retain the unsplit candidate.
+    already-filled grids retain the unsplit candidate. Blackwell also admits
+    GQA16 and KV lengths through 32K with the same physical-grid score and
+    bounded partial workspace, excluding splits with more waves than partitions.
     """
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
@@ -1571,13 +1573,13 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
-        and facts.h_q // facts.h_kv in (1, 2, 4, 8)
+        and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
         and facts.page_size == 16
         and facts.causal
         and facts.bottom_right
         and facts.window_left is None
         and 64 <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= (32768 if caps.sm_lo == 107 else 16384)
+        and 2048 <= facts.s_kv <= 32768
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
     ):
@@ -1586,7 +1588,16 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         # Packed tiles can remove a partial-wave tail. Preserve first-wave
         # wins; otherwise compare up to three waves. Short loops stay on
         # their first-wave policy to amortize setup and combine.
-        return _d128_thd_split_wave_choice(facts, extra_waves=3 if facts.s_kv >= 4096 else 1)
+        splits, pack = _d128_thd_split_wave_choice(facts, extra_waves=3 if facts.s_kv >= 4096 else 1)
+        if splits > 1 and (facts.s_kv > 16384 or facts.h_q // facts.h_kv == 16):
+            group = facts.h_q // facts.h_kv if pack else 1
+            waves = _ceil_div(_d128_thd_split_units(facts, group) * splits, facts.device_sm_count or 128)
+            # The newly admitted family must not stretch a split over more
+            # waves than partitions. Keep useful three-wave/four-way splits,
+            # but avoid three-wave/two-way tails on smaller GPUs.
+            if waves > splits:
+                return 1, False
+        return splits, pack
     # Keep Rubin's separately qualified first-wave assignments unchanged.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
