@@ -372,6 +372,15 @@ _LAZY_OPTIONAL_IMPORTS = {
     # is itself callable -- `cudnn.triangle_multiplicative_update(...)` works whichever the attribute resolved to
     "triangle_multiplicative_update": (".triangle_multiplicative_update", "triangle_multiplicative_update"),
     "TriangleMultiplicativeUpdateFwd": (".triangle_multiplicative_update", "TriangleMultiplicativeUpdateFwd"),
+    # triangle attention (cuEquivariance's signature; the same callable-package arrangement as the triangle multiplicative update)
+    "triangle_attention": (".triangle_attention", "triangle_attention"),
+    "mask_to_kv_lengths": (".triangle_attention", "mask_to_kv_lengths"),
+    "TriangleAttentionFwd": (".triangle_attention", "TriangleAttentionFwd"),
+    # the gated attention block (its package had no entry here, so `from cudnn import gated_attention_block_forward` failed)
+    "gated_attention_block_forward": (".gated_attention_block", "gated_attention_block_forward"),
+    "gated_attention_block_backward": (".gated_attention_block", "gated_attention_block_backward"),
+    "GatedAttentionBlockFwd": (".gated_attention_block", "GatedAttentionBlockFwd"),
+    "GatedAttentionBlockBwd": (".gated_attention_block", "GatedAttentionBlockBwd"),
     "CompactGqaBackward": (".sdpa.bwd", "CompactGqaBackward"),
     "compact_gqa_backward": (".sdpa.bwd", "compact_gqa_backward"),
     "TailRoPEForward": (".rope", "TailRoPEForward"),

@@ -16,6 +16,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
 - [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output)
 - [Triangle Multiplicative Update (SM107)](triangle_multiplicative_update.md) — the AlphaFold-class outgoing / incoming triangle multiplication as three FROST launches behind cuEquivariance's `triangle_multiplicative_update` signature (bf16)
+- [Triangle Attention (SM107)](triangle_attention.md) — the AlphaFold-class attention with a pair bias and a key mask (right-padded lengths or a dense boolean mask) on the FROST SDPA engine behind cuEquivariance's `triangle_attention` signature (bf16 / fp16, D <= 64)
 - [Tail RoPE + Microscaled QDQ](rope_qdq.md)
 - [Prepared BF16 Tail RoPE](rope_tail.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)

@@ -1,0 +1,177 @@
+# Triangle Attention (SM107)
+
+**This is an experimental API and subject to change.**
+
+## Overview
+
+`cudnn.triangle_attention` is the AlphaFold-class triangle attention (AlphaFold 3 Algorithms 14 and 15: attention over one axis
+of the pair representation with a pair bias on every score and a key mask) behind the signature of
+`cuequivariance_ops_torch.triangle_attention` (pinned to cuequivariance-ops-torch **0.12.0**: the same parameter names, order and
+defaults, so a model switches providers by changing one import).
+
+```text
+q, k, v    (B, N, H, S, D)      bf16 / fp16     o[b, n, h, i] = sum_j softmax_j( scale * <q_i, k_j> + bias[b, h, i, j] ) v_j     over the live keys j
+bias       (B, 1, H, S_q, S_kv) the same dtype  the pair bias of outer entry b, shared by its N rows
+mask       (B, N, 1, 1, S_kv)   bool            a dense key mask (False = the key is masked for every query of that row)      -- or --
+kv_lengths (B, N, 1, 1, 1)      int32           right-padded lengths: keys j < kv_lengths[b, n] are live (never both)
+-> o (B, N, H, S_q, D) in q's dtype
+```
+
+The attention core is **not a new kernel**: it is the shipped `sdpa` graph node served by the FROST engine row
+`sdpa_fwd_prefill_sm107` on its 32- / 64-wide head-dim tiles -- the additive bias held as a resident SMEM row-block (or streamed
+per kv tile above the resident budget), the boolean key mask folded into the kernel's bit-word mask, the right-padded lengths through
+the `seq_len_kv` padding path at zero kernel cost. `cudnn.triangle_attention` is the API layer: it flattens `(B, N)` onto the graph's
+batch axis (the `N` rows of an outer entry share one `[1, H, S_q, S_kv]` bias -- the graph's existing bias broadcast; one launch per
+outer entry), chooses the mask path from the arguments, caches one compiled plan per declaration and launches it on the caller's
+stream. The engine row's `Capabilities` and its `mismatch()` are the source of every typed decline below; the same row serves the graph
+form (`graph.sdpa(q, k, v, bias=..., kv_mask=... / seq_len_kv=...)`) with no wrapper.
+
+**Target: NVIDIA Rubin (SM107, compute capability 10.7) only.** Every other architecture is declined with a typed error
+(`NotImplementedError`), never served slowly. The engine row is opt-in: `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` must be set before
+`import cudnn` (the call declines with that instruction otherwise).
+
+## Mathematics and numerics
+
+For every outer entry `b`, row `n`, head `h` and query `i`, over the keys `j` the mask keeps (all keys without a mask):
+
+```text
+s_j = scale * <q[b, n, h, i], k[b, n, h, j]> + bias[b, 0, h, i, j]       scale = 1 / sqrt(D) unless given
+o   = sum_j softmax_j(s) v[b, n, h, j]
+lse = max_j s_j + log( sum_j exp(s_j - max_j s_j) )                       (fp32, natural log; the class API's optional output)
+```
+
+`k` and `v` may carry fewer heads than `q` (`H_kv` dividing `H`, the GQA fold); the bias may be declared with a head extent of 1
+(broadcast over the heads) and a batch extent of 1 (shared by every outer entry).
+
+Rounding points: the scores accumulate in fp32 (the MMA), the bias enters the fp32 score by one FFMA of `bias * (1 / scale)` before the
+scale multiply (one more fp32 rounding than the eager `s * scale + bias`), the softmax statistics are fp32, `P` is rounded once to the
+io dtype as the second MMA's operand, `o` accumulates in fp32 and is rounded once to the io dtype at the store. **The bias is read in the
+activations' dtype** (bf16 with bf16, fp16 with fp16): the resident block loads the io dtype, so an fp32 bias is **cast once per call by
+the function** (counted, see the layouts section) -- never an fp32 arm of the kernel. `cudnn.triangle_attention.triangle_attention_reference`
+is the fp64 reference with this contract (pass it the bf16 bias the kernel reads). Measured on the test grid (`S` in 64..512 incl. a
+217 tail, `D` in {24, 32, 48, 64}, `B` in {1, 2}, the three mask forms, bf16 and fp16) against that reference: `o` within the engine
+row's own tolerance `atol 5e-2 / rtol 3e-2` (an fp32 accumulation, one 16-bit rounding at the store), the LSE within `1e-4 / 1e-4` --
+the SDPA row's tolerances, not widened for this layer.
+
+### Masked rows: three conventions, documented here, one chosen
+
+A row with **no live key** (a zero `kv_lengths`, a mask row that is all False) is read differently by the three implementations a
+model may have been validated against. This API follows the FROST SDPA invariant for an empty key range; the others are stated so a
+parity test knows what it compares (compare rows **with** keys only):
+
+| implementation | `o` on a row without a live key | `lse` | `max` |
+|---|---|---|---|
+| **`cudnn.triangle_attention`** (both mask forms) | **exactly 0** | **-inf** | **-inf** |
+| cuEquivariance, `kv_lengths` route | 0 (the row is zeroed by a device epilogue) | 0 | 0 |
+| cuEquivariance, dense-mask route | the uniform average of `v` (a finite `-1e9` is folded into the scores) | -1e9 | -1e9 |
+
+So `mask_to_kv_lengths(mask)` -- the conversion of a prefix-shaped mask into lengths -- changes what a fully masked row reads **on
+cuEquivariance** (uniform average -> zeros) and nothing here (both forms read 0 / -inf). Wherever such rows are padding, which the
+models mask out of the loss and of the next layer, the difference is invisible; a model that consumes fully masked rows should be
+checked against the table. The same contract holds in the forward's statistics, so a backward recomputing `P = exp(s - lse)` from the
+published `lse` yields no gradient into masked keys.
+
+## Served today, and the typed declines
+
+| what | served | otherwise |
+|---|---|---|
+| architecture | compute capability 10.7 (Rubin), the FROST engine row `sdpa_fwd_prefill_sm107` with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` | `NotImplementedError` (the instruction / the device found) |
+| dtype | bf16 or fp16 activations, the bias in the same dtype; the function casts an fp32 bias once per call (counted) | `NotImplementedError` |
+| head dim `D` | `D % 8 == 0` and `D <= 64` (the row's 32- and 64-wide tiles; 8 / 16 / 24 -> the 32-wide tile, 40 / 48 / 56 -> the 64-wide one, by TMA zero fill) | `NotImplementedError` quoting the engine (`D = 20`: the 16-byte stride rule; `D = 128`: no bias form on the d128 tile) |
+| `S_q`, `S_kv` | any; a compact bias needs `S_kv % 8 == 0` (the TMA 16-byte row-stride rule) -- the function pads the row otherwise (counted); the bias is resident in SMEM up to the engine's budget per tile (768 kv columns at `D <= 32` for a bias shared by two or more rows of an entry, 384 at `D <= 64`; 384 / 128..256 for a per-entry bias on a single row) and streamed per kv tile above it | `NotImplementedError` quoting the engine where neither bias form fits |
+| `B`, `N`, `H` | any (`B > 1` runs one launch per outer entry; `H_kv` dividing `H`) | `ValueError` on a mismatch |
+| key mask | `mask` (bool, dense -- the in-kernel bit-word path) OR `kv_lengths` (int32, right-padded -- the zero-cost padding path); `mask_to_kv_lengths` converts a prefix-shaped mask | both: `ValueError` (cuEquivariance's rule); a non-bool mask / non-int32 lengths: `ValueError` |
+| `scale` | any positive finite float (default `1 / sqrt(D)`) | `ValueError` |
+| `return_aux` | `False` only: the row max is a side output the engine's bias arm does not store yet (the d128 tile stores it, the small tiles' bias arm declines it) | `NotImplementedError` quoting the engine ("without the score side outputs") |
+| layout | zero-copy on the token-major form (below); every other layout is repacked by the function with a counted copy | the class API: `NotImplementedError` naming the tensor (never a hidden copy) |
+| device | every `execute` tensor on the device the plan was declared on | `ValueError` |
+| autograd | the forward is served under grad mode (a `torch.autograd.Function` that saves `q, k, v, bias, o, lse`); the backward is a later item of this API | `NotImplementedError` from `.backward()` (never a silent zero gradient) |
+
+## Drop-in function
+
+```python
+import cudnn
+from cudnn import triangle_attention, mask_to_kv_lengths   # or: from cuequivariance_torch import triangle_attention
+
+o = triangle_attention(q, k, v, bias, mask=mask, scale=scale)                 # the Boltz-2 / Protenix / OpenFold-3 call, unchanged
+o = triangle_attention(q, k, v, bias, scale=scale, kv_lengths=mask_to_kv_lengths(mask))   # a prefix mask as lengths: the zero-cost path
+```
+
+Signature (cuEquivariance 0.12.0, verbatim; the two keyword-only additions are appended):
+
+```python
+triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, *, kv_lengths=None,
+                   out=None, stream=None) -> torch.Tensor
+```
+
+`out` writes the result into a caller-provided tensor (stable addresses for CUDA-graph users; copied into when it is not in the
+kernel's layout, counted); `stream` is a raw CUDA stream handle the allocations, copies and launches are ordered on (None = torch's
+current stream). The function caches one compiled plan per `(shape, dtype, strides, mask form, outputs, scale)` in the process,
+allocates the output per call (and the plan's workspace when it has one), and launches. Warm a shape once before capturing a
+`torch.cuda.graph` around the call; the captured graph replays the kernel and follows the inputs' contents.
+
+`mask_to_kv_lengths(mask)` returns `(B, N, 1, 1, 1)` int32 lengths when every row of the boolean mask is a prefix (True on `[0, len)`,
+False after), else `None` so the caller falls back to `mask=`. It performs one host synchronisation (the prefix test): call it once per
+mask, not once per layer.
+
+### Layouts: the zero-copy forms and the counted fallbacks
+
+The kernel's TMA descriptors are built from the declared strides, so the layout is part of the plan. Zero-copy:
+
+- **activations** in the **`(B, N, S, H, D)` memory form** presented as `(B, N, H, S, D)` -- the head dim contiguous, the token
+  stride `>= H * head stride`, every stride a 16-byte multiple (a permuted view of a `(B, N, S, H, D)` buffer, compact or padded with
+  gaps; the "layout_left" form the models produce by projecting `z` and permuting);
+- the **bias** head-major with a **contiguous key dim** and 16-byte row strides (`S_kv % 8 == 0`, or a padded row stride);
+- a **contiguous mask / lengths** tensor.
+
+Anything else is repacked by the function with ONE copy per tensor per call, **counted** and announced once per layout
+(`RuntimeWarning` naming the tensor and its strides): `cudnn.triangle_attention.copy_counters()` reports `fallback_copies` and the
+per-kind counts (`q_repack` / `k_repack` / `v_repack`, `o_repack` -- the output copied back into `q`'s own layout when `q` was
+head-major, `bias_repack` -- a non-contiguous key dim or the `S_kv % 8 != 0` pad, `bias_cast` -- an fp32 bias, `mask_repack`,
+`kv_lengths_repack`, `out_copy`); `reset_copy_counters()` clears them. The output follows `q`: a zero-copy `q` yields `o` in the same
+memory form (which is the caller's), a repacked `q` yields `o` in `q`'s own layout. A model on its native layout should read 0
+everywhere except the documented bias pad at `S_kv % 8 != 0`. The prepared class API never copies: a layout it cannot bind is a typed
+decline from `check_support`.
+
+## Prepared class API
+
+```python
+from cudnn.triangle_attention import TriangleAttentionFwd
+
+op = TriangleAttentionFwd(sample_q, sample_k, sample_v, sample_bias, kv_lengths=True, lse=True)   # tensors or TensorDesc declarations
+op.check_support()                       # typed declines (malformed -> ValueError; unserved -> NotImplementedError quoting the engine row)
+op.compile()                             # the FROST row's plan, pinned by name; op.plan_name / op.knobs record what was built
+ws = torch.empty(max(op.get_workspace_size(), 1), dtype=torch.uint8, device=q.device)
+op.execute(q, k, v, bias, kv_lengths, o, lse, None, ws if op.get_workspace_size() else None, stream)   # no allocation, no conversion, no sync
+graph = op.make_cuda_graph(q, k, v, bias, kv_lengths, o, lse, ws)                                  # one graph launch per replay
+```
+
+Constructor flags: `kv_lengths=True` / `mask=True` (the key-mask form; the dense form is passed to `execute(..., mask=mask)`),
+`lse=True` (the fp32 `(B, N, H, S_q)` log-sum-exp), `score_max=True` (declined today, see the table), `scale`, `sample_o` (the output's
+layout; None = the compact `(B, N, S, H, D)` form). `execute` validates every tensor against the declaration -- device, dtype, shape,
+strides, 16-byte alignment, the mask form -- and launches once per outer batch entry (`launches_per_call`). A plan is bound to the
+device it was declared on; declare and compile one per device.
+
+## Performance
+
+The kernel-side numbers of the bias arm (the resident block, the pair work item, the streamed ring; the `D = 32` tile against the
+zero-filled d128 tile) are the SDPA engine row's, recorded in `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md` and
+`python/cudnn/sdpa/AGENTS.md`. The API layer adds the host overhead of one eager call. Its host path: the engine's prepared launch binds
+its argument frame ONCE per plan (the engine's own binder runs on the first call and applies every dtype / layout / alignment / span
+rule of the row); every later call re-checks the tensors against the declaration and refreshes the frame's pointer slots (the geometry
+is the declaration's), then issues the kernel -- so an eager class-API call costs the API's checks plus the launch itself, and the
+drop-in function adds the layout decisions, the plan lookup and the output allocation. The bias / per-key-mask arms of the engine
+have no native (C) binder today, which is why the frame is bound in Python once rather than per call. A benchmark package with the
+host floor as a first-class column (eager CPU wall without a synchronisation vs the captured graph's replay, min and median over
+hundreds of pinned calls) and the comparison against cuEquivariance on Rubin follows this API.
+
+## Tests
+
+`test/python/triangle_attention/cutedsl/test_api.py` (L0): the fp64 reference over the acceptance grid (`S` x `D` x `B` x the three mask
+forms, empty rows on both forms), the head dims served by zero fill, fp16 / GQA / a head-broadcast bias / `S_q != S_kv`, the prefix mask vs
+`kv_lengths` (bitwise), the class API's LSE and the masked-row contract, `B = 2` against the single-entry calls (bitwise), the layout
+fallbacks (head-major activations: 4 counted copies, the output following `q`; the permuted / fp32 / tail bias: 1 counted copy each),
+`out=` / `stream=`, the execute-path contract (no allocation, no synchronisation), CUDA-graph capture and replay, `return_aux` and the
+autograd backward as typed declines, the live rejects, and the GPU-free contract tests (the lazy export in every import order, no torch
+at `import cudnn.triangle_attention`, the signature pin, `mask_to_kv_lengths`, the reference, the declarations declined before any
+device work, the plan-device predicate).
