@@ -492,6 +492,7 @@ def _mma_warp_group(
         n_dim=N_Q,
         m_dim=TILE_N,
         k_dim=0,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
