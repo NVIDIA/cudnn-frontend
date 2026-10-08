@@ -33,15 +33,21 @@ issue-bound and lost to the prefill tile on the S_q = 2 MTP shape).  Even so
 the 32-column tile streams a KV tile 1.6x slower per CTA than the 16-column
 one (2.8 vs 1.75 us; 90 us unsplit at b=32 x 2 KV heads x 4096 keys where the
 prefill tile takes 66 us), so it compiles and is tested at the template level
-but the adapter does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
-its per-CTA issue rate is the open kernel item.
+but the Blackwell adapter does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
+its per-CTA issue rate is the open kernel item here.  The Rubin sibling
+(sm107/decode_d256_f16.py) IS routed onto it, in up to two TOKEN UNITS for a
+packed MTP step (config_sm107.decode_d256_q_tile, measured on cc 10.7).
 P^T is stored to a small swizzled SMEM tile (the B operand of BMM2 is
 MN-major: the N_Q values of one key are contiguous), V is consumed in place
 as an MN-major A operand (d_v contiguous), and O^T accumulates in TMEM with
 lane = d_v (two 128-lane blocks for d_v = 256).
 
 Roles (6 warps at N_Q = 16, 10 at N_Q = 32; cta_group::1, one CTA per
-(KV-head group, batch, split) unit; W = 4 * N_Q / 16 softmax warps):
+(KV-head group, batch, split, TOKEN UNIT) unit -- a token unit is one Q box of
+Q_BOX_TOKENS = N_Q // HEADS_PER_TILE consecutive tokens, and a graph with more
+tokens than one box holds launches ceil(S_q / Q_BOX_TOKENS) units per head
+group, each streaming the unit's KV range once (Q_TOKEN_UNITS; the host entry
+derives the count from the runtime S_q); W = 4 * N_Q / 16 softmax warps):
 
   * warps 0..W-1  softmax + epilogue, 4 warps per 16-column group: thread ==
                   key lane (tidx % 128) for S^T / P^T, == d lane for the O^T
@@ -64,8 +70,9 @@ explicit pointer ABI: extents and Int64 strides are runtime arguments, while
 head dimensions, Stats presence and the paged in-page layout specialize compile().
 
 Not served here (the adapter keeps these on the prefill tile): THD queries,
-S_q * pack_g > 16 rows (N_Q = 32 compiles but is not routed, see above),
-FP8/MXFP8.
+S_q * pack_g > 16 rows on the Blackwell line (N_Q = 32 compiles but is not
+routed there, see above; the body's token-unit axis is exercised by the Rubin
+route), FP8/MXFP8.
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -124,6 +131,14 @@ Q_BOX_TOKENS = N_Q // HEADS_PER_TILE
 Q_BOX_ROWS = Q_BOX_TOKENS * HEADS_PER_TILE
 if Q_BOX_TOKENS < 1:
     raise ValueError(f"decode_d256_f16: the packed head group ({HEADS_PER_TILE}) does not fit the {N_Q}-row Q tile")
+# === Token units === a unit covers Q_BOX_TOKENS consecutive Q tokens of its head group; a graph with more tokens
+# than one Q box holds is cut into ceil(S_q / Q_BOX_TOKENS) TOKEN UNITS per (head group, batch, split), each a CTA
+# that streams the unit's KV range once (MTP: S_q = 4 at 24/2 = two units of two tokens on the 32-column tile).  The
+# host entry derives the unit count from the runtime S_q and widens the grid's x axis by it; the kernel decodes
+# (head group, token unit) from blockIdx.x and offsets every token coordinate (the Q box, the causal / window mask,
+# the O / LSE rows, the padded-Q trim) by the unit's first token.  Declared here for the binders (prepared.py,
+# the direct test driver): a module without the flag covers S_q x HEADS_PER_TILE <= N_Q only.
+Q_TOKEN_UNITS: bool = True
 
 # === Paged KV (same contract as prefill_d256_f16.py) ===
 PAGED_KV = bool(CFG.PAGED_KV)
@@ -239,14 +254,15 @@ def _select_f32(cond, a, b):
 
 
 @cute.jit
-def _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv):
+def _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0):
     """This unit's KV-tile range ``[lo, hi)`` plus the per-batch lengths.
 
     Every role computes it identically (pure function of the same inputs), so
     the barrier handshakes stay in lockstep.  The masks narrow the range the
-    way the prefill tile does (compute_kv_loop_bounds over the tile's token
-    span), the dense padded-Q trim collapses a dead batch to an empty range,
-    and the split chunking mirrors _common_blackwell's _split_chunk.
+    way the prefill tile does (compute_kv_loop_bounds over the unit's token
+    span, which starts at ``tok0`` = the token unit's first Q token), the dense
+    padded-Q trim collapses a dead batch to an empty range, and the split
+    chunking mirrors _common_blackwell's _split_chunk.
     """
     eff_seqlen_kv = seqlen_kv
     if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
@@ -259,7 +275,7 @@ def _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seql
     if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT == 1 and CFG.BOTTOM_RIGHT == 1):
         eff_seqlen_q = cute.math.max(cutlass.Int32(0), cute.math.min(q_len_b, seqlen_q))
     bounds = compute_kv_loop_bounds(
-        cutlass.Int32(0),
+        tok0,
         eff_seqlen_q,
         eff_seqlen_kv,
         CFG.WINDOW_LEFT,
@@ -350,6 +366,7 @@ def _tmaldg_warp_group(
     head_idx,
     batch_idx,
     split_idx,
+    tok0,
     block_table_tensor=None,
     block_table_v_tensor=None,
     paged_hnd: cutlass.Constexpr[bool] = False,
@@ -365,7 +382,7 @@ def _tmaldg_warp_group(
         tma_k = GmemTileTma(tma_k_desc)
         tma_v = GmemTileTma(tma_v_desc)
 
-    lo, hi, eff_seqlen_kv, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv)
+    lo, hi, eff_seqlen_kv, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
     q_head_base = head_idx * cutlass.Int32(HEADS_PER_TILE)
     kv_head_idx = head_idx if cutlass.const_expr(CFG.PACK_GQA) else head_idx // cutlass.Int32(CFG.QH_PER_KH)
@@ -375,7 +392,7 @@ def _tmaldg_warp_group(
 
     if n_tiles > cutlass.Int32(0):
         bars.mb_q_full.arrive(n_bytes=Q_TX_BYTES, pred=nvvm.elect_sync())
-        tma_load_tile(sQ[0], tma_q(cutlass.Int32(0), q_head_base, cutlass.Int32(0), batch_idx), bars.mb_q_full.smem_ptr, cta_group=1)
+        tma_load_tile(sQ[0], tma_q(cutlass.Int32(0), q_head_base, tok0, batch_idx), bars.mb_q_full.smem_ptr, cta_group=1)
 
         # Ring order K(0), K(1), V(0), K(2), V(1), ...: K runs one tile ahead of V, so
         # K(t+2) is issued when V(t-1)'s slot frees (end of iteration t-1) and lands
@@ -423,6 +440,7 @@ def _mma_warp_group(
     seqlen_kv,
     batch_idx,
     split_idx,
+    tok0,
 ):
     tmem_alloc(tmem_ptr_i32, TMEM_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(_BAR_TMEM, 32 * (SOFTMAX_WARPS + 1))
@@ -477,7 +495,7 @@ def _mma_warp_group(
         kind=MMA_KIND,
     )
 
-    lo, hi, _ek, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv)
+    lo, hi, _ek, _eq, _ql = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
 
     # Barrier bookkeeping is arithmetic in the tile index (no loop-carried
@@ -574,6 +592,7 @@ def _softmax_warp_group(
     head_idx,
     batch_idx,
     split_idx,
+    tok0,
     scale_log2: cutlass.Float32,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=32 * (SOFTMAX_WARPS + 1))
@@ -589,7 +608,7 @@ def _softmax_warp_group(
     G = cutlass.Int32(HEADS_PER_TILE)
     tmem_base = tmem_ptr_i32.load()
 
-    lo, hi, eff_seqlen_kv, eff_seqlen_q, q_len_b = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv)
+    lo, hi, eff_seqlen_kv, eff_seqlen_q, q_len_b = _unit_bounds(seq_kv_lens_tensor, seq_q_lens_addr, batch_idx, split_idx, seqlen_q, seqlen_kv, tok0)
     n_tiles = hi - lo
     causal_diag = cutlass.Int32(0)
     if cutlass.const_expr(CFG.BOTTOM_RIGHT):
@@ -620,12 +639,12 @@ def _softmax_warp_group(
 
         key_abs = kv_tile * cutlass.Int32(TILE_N) + lane
         # Per-column (= per Q row) mask in the transposed orientation: the key
-        # is this lane, the Q token is the column's row // G.
+        # index = the thread's lane, the Q token = the unit's first token + the column's row // G.
         s_cols = []
         for j in cutlass.range_constexpr(COLS):
             v = cutlass.Float32(s_raw[j]) * scale_log2
             if cutlass.const_expr(CFG.MASK_FLAGS != 0):
-                q_abs = (col0 + cutlass.Int32(j)) // G
+                q_abs = tok0 + (col0 + cutlass.Int32(j)) // G
                 masked = None
                 if cutlass.const_expr(CFG.MASK_FLAGS & MASK_PADDED):
                     masked = key_abs >= eff_seqlen_kv
@@ -738,7 +757,7 @@ def _softmax_warp_group(
     head_cols = []
     for j in cutlass.range_constexpr(COLS):
         jg = col0 + cutlass.Int32(j)  # the packed Q row this column is
-        tok_j = jg // G
+        tok_j = tok0 + jg // G
         head_j = head_idx * G + (jg % G)
         tok_cols.append(tok_j)
         head_cols.append(head_j)
@@ -771,6 +790,13 @@ def _softmax_warp_group(
             lse_j = _select_f32(row_dead, NEG_INF, lse_j)
             inv_j = _select_f32(row_dead, ZERO, inv_j)
         live_j = tok_j < seqlen_q
+        if cutlass.const_expr(Q_BOX_ROWS < N_Q):
+            # The zero-filled tail rows past the Q box (a head group that does not divide N_Q) decode
+            # to the NEXT unit's first token (jg // G == Q_BOX_TOKENS), a live token whenever another
+            # unit follows: they are never stored -- without this guard a non-last unit's tail
+            # overwrote the next unit's first token (a CTA-order race: 5-14 % of that token's O
+            # elements wrong, which unit's store landed last).
+            live_j = live_j & (jg < cutlass.Int32(Q_BOX_ROWS))
         if cutlass.const_expr(CFG.SEQ_Q_LENS_PRESENT):
             # Dense padded-Q trim: rows past seq_len_q[b] write O := 0 / LSE := -inf,
             # applied AFTER the sink fold (a trimmed row is dead even with a sink).
@@ -833,6 +859,8 @@ def _kernel(
     # Dense padded-Q trim: (B,)-int32 per-batch Q lengths by address; 0 (unread)
     # unless CFG.SEQ_Q_LENS_PRESENT.
     seq_q_lens_addr: cutlass.Int64 = 0,
+    # Token units per (head group, batch, split): ceil(S_q / Q_BOX_TOKENS), derived by the host entry.
+    n_tok_units: cutlass.Int32 = 1,
     # Paged KV: [B, max_pages] int32 page ids for K and V; None unless CFG.PAGED_KV.
     block_table_tensor: Optional[cute.Tensor] = None,
     block_table_v_tensor: Optional[cute.Tensor] = None,
@@ -840,8 +868,10 @@ def _kernel(
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
-    # One CTA per unit: x = KV-head group (packed) or Q head (unpacked), y = batch, z = split.
-    head_idx = cute.arch.block_idx()[0]
+    # One CTA per unit: x = (KV-head group (packed) or Q head (unpacked)) x token unit, y = batch, z = split.
+    # The token unit is the fast index of x, so one group's units are launched together.
+    head_idx = cute.arch.block_idx()[0] // n_tok_units
+    tok0 = (cute.arch.block_idx()[0] % n_tok_units) * cutlass.Int32(Q_BOX_TOKENS)
     batch_idx = cute.arch.block_idx()[1]
     split_idx = cute.arch.block_idx()[2]
 
@@ -949,6 +979,7 @@ def _kernel(
             head_idx=head_idx,
             batch_idx=batch_idx,
             split_idx=split_idx,
+            tok0=tok0,
             scale_log2=scale_softmax_log2,
         )
     elif warp_idx == MMA_WARP_ID:
@@ -965,6 +996,7 @@ def _kernel(
             seqlen_kv=seqlen_kv,
             batch_idx=batch_idx,
             split_idx=split_idx,
+            tok0=tok0,
         )
     elif warp_idx == TMALDG_WARP_ID:
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
@@ -984,6 +1016,7 @@ def _kernel(
             head_idx=head_idx,
             batch_idx=batch_idx,
             split_idx=split_idx,
+            tok0=tok0,
             block_table_tensor=block_table_tensor,
             block_table_v_tensor=block_table_v_tensor,
             paged_hnd=paged_hnd,
@@ -1029,9 +1062,10 @@ def _host(
 ) -> None:
     """Bind the shared explicit SDPA ABI and launch the existing decode kernel.
 
-    The private raw entry assumes validated operands: the compiled GQA ratio and
-    SQ * HEADS_PER_TILE <= N_Q. Graph/adapter calls bind through prepared.py;
-    direct tests use launch_f16, including the 32-row tile not selected by routing.
+    The private raw entry assumes validated operands: the compiled GQA ratio; any
+    SQ (ceil(SQ / Q_BOX_TOKENS) token units per head group, Q_TOKEN_UNITS).  Graph /
+    adapter calls bind through prepared.py; direct tests use launch_f16, including
+    the 32-row tile where the routing does not select it.
     """
     B, QH, KH, SQ, SKV, _ = problem_size
     (
@@ -1107,7 +1141,9 @@ def _host(
     tma_k_desc = _create_tma_desc(k_tensor, box_kv, _tma_swz(CFG.K_SWZ_BYTES), kv_stride_order)
     tma_v_desc = _create_tma_desc(v_tensor, box_kv, _tma_swz(CFG.V_SWZ_BYTES), kv_stride_order)
 
-    grid_shape = (QH // HEADS_PER_TILE, B, SPLIT_KV)
+    # Token units: ceil(SQ / Q_BOX_TOKENS) CTAs per (head group, batch, split), the unit the fast index of x.
+    n_tok_units = (cutlass.Int32(SQ) + cutlass.Int32(Q_BOX_TOKENS - 1)) // cutlass.Int32(Q_BOX_TOKENS)
+    grid_shape = ((QH // HEADS_PER_TILE) * n_tok_units, B, SPLIT_KV)
 
     kernel_args = (
         tma_q_desc,
@@ -1122,6 +1158,7 @@ def _host(
         cutlass.Int32(B),
         scale_softmax_log2,
         seq_q_lens_addr,
+        n_tok_units,
     )
 
     def launch(args, k_table, v_table, hnd, grid, current_stream):

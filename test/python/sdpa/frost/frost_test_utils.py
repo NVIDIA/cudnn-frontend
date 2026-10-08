@@ -238,7 +238,8 @@ def launch_f16(
         cfg = namespace["CFG"]
         if cfg.PACK_GQA and h != kh * cfg.QH_PER_KH:
             raise ValueError(f"PACK_GQA requires H_q == H_kv * {cfg.QH_PER_KH}; got H_q={h}, H_kv={kh}")
-        if "N_Q" in namespace and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
+        # A decode tile with the token-unit axis (Q_TOKEN_UNITS) covers any S_q through ceil(S_q / Q_BOX_TOKENS) units.
+        if "N_Q" in namespace and not namespace.get("Q_TOKEN_UNITS", False) and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
             raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
     if paged:
         skv, n_pages = block_table_tensor.shape[1] * page_size, k.shape[0]

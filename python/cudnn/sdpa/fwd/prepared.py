@@ -651,7 +651,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
     if getattr(cfg, "PACK_GQA", False) and s.qh != s.kh * cfg.QH_PER_KH:
         raise ValueError("cudnn.sdpa: runtime head counts must match the compiled PackGQA ratio")
-    if hasattr(km, "N_Q") and s.s_q_max * km.HEADS_PER_TILE > km.N_Q:
+    # A decode tile with the TOKEN-UNIT axis (Q_TOKEN_UNITS) covers any S_q: its host entry cuts the tokens into
+    # ceil(S_q / Q_BOX_TOKENS) units per head group; a tile without it serves one Q box only.
+    if hasattr(km, "N_Q") and not getattr(km, "Q_TOKEN_UNITS", False) and s.s_q_max * km.HEADS_PER_TILE > km.N_Q:
         raise ValueError(f"cudnn.sdpa: decode query rows exceed the compiled {km.N_Q}-row tile")
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
