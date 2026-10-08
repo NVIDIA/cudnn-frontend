@@ -758,9 +758,12 @@ S_q = S_kv = 384, H = 4, 384 flattened batch rows; a 212-SM cc 10.7 node at the
   additivity: both 81.0 -> 70.9 us (+14 %; `no_instruction` 2.0 -> 0.25) while
   every single-feature arm LOSES at the half tile (plain -12 %, bias -4 %,
   `kv_mask` -10 %). A chooser that scores the bias and the mask as independent
-  costs is wrong by that excess; pick `TILE_N 64` for the combined graph and
-  check the ratio on any new rendering that adds body (a streamed ring, a
-  third operand) before shipping it.
+  costs is wrong by that excess. This is ONE measured cell: at this shape the
+  combined graph's best measured width is `TILE_N 64` (+14 % same-process; the
+  one-batch-entry form +12 %, the additive-vector form +22 %) -- a finding the
+  chooser scores per S / n_chunk / form from its own sweep before any default
+  flips, not a pick to apply elsewhere. Check the ratio on any new rendering
+  that adds body (a streamed ring, a third operand) before shipping it.
 - The default `n_chunk` rule's pick (`sm107_n_chunk_rule`) is one step short at S = 128 (2 vs the measured
   4: 12.8 vs 11.2 us, +15 %) and one past at S = 768 (16 vs 8: 328.9 vs 316.7
   us, +4 %); it is the measured best at 384 and 512. Past ~2.5 items per SM
