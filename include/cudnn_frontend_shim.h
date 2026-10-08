@@ -466,6 +466,26 @@ cuda_event_create(cudaEvent_t *event) {
 }
 
 inline cudaError_t
+cuda_event_create_with_flags(cudaEvent_t *event, unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_event_create_with_flags, cudaEventCreateWithFlags, event, flags);
+}
+
+inline cudaError_t
+cuda_event_query(cudaEvent_t event) {
+    NV_FE_CALL_TO_CUDA(cuda_event_query, cudaEventQuery, event);
+}
+
+inline cudaError_t
+cuda_stream_create_with_flags(cudaStream_t *stream, unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_create_with_flags, cudaStreamCreateWithFlags, stream, flags);
+}
+
+inline cudaError_t
+cuda_set_device(int device) {
+    NV_FE_CALL_TO_CUDA(cuda_set_device, cudaSetDevice, device);
+}
+
+inline cudaError_t
 cuda_event_destroy(cudaEvent_t event) {
     NV_FE_CALL_TO_CUDA(cuda_event_destroy, cudaEventDestroy, event);
 }
