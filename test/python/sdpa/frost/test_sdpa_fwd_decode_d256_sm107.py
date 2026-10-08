@@ -736,6 +736,19 @@ def test_decode_graph_deep_split_empty_ranges():
     assert plan.knobs.split_kv >= (8 if _sm_count() >= 96 else 2), plan.knobs
 
 
+@_gpu
+def test_decode_graph_mha_unpacked_split_recombines():
+    """ONE unpacked graph-path split (the row's split claim reads 'packed or not'): MHA 4/4 at B = 2
+    over a 4096-key table -- 8 units x 32 tiles, which the decode model splits 16 ways, unpacked --
+    recombines to the reference: the kernel / adapter partial-dtype and workspace agreement a
+    template-level split test cannot see, on the unpacked form."""
+    plan = _run_graph(B=2, H=4, KH=4, s_q=1, lens=[4096, 3000], page=16, dtype=torch.bfloat16)
+    _assert_decode_tile_plan(plan, G=1, units=8, kv_tiles=32)
+    assert plan.knobs.pack_gqa is not True and plan.knobs.split_kv >= 2, plan.knobs
+    if _sm_count() in (148, 204, 212):
+        assert plan.knobs.split_kv == 16, plan.knobs
+
+
 # --- the three equalities the row's claim rests on ------------------------------------------------
 
 
@@ -797,21 +810,21 @@ def test_decode_graph_packed_equals_unpacked_bitwise():
 
 @_gpu
 @pytest.mark.parametrize(
-    ("form", "dtype"),
-    [("paged", torch.bfloat16), ("paged", torch.float16), ("dense_unpadded", torch.bfloat16)],
-    ids=["paged_bf16", "paged_f16", "dense_unpadded_bf16"],
+    ("form", "dtype", "page"),
+    [("paged", torch.bfloat16, 16), ("paged", torch.float16, 16), ("paged", torch.bfloat16, 64), ("dense_unpadded", torch.bfloat16, 0)],
+    ids=["paged_bf16", "paged_f16", "paged_page64_HND_bf16", "dense_unpadded_bf16"],
 )
-def test_decode_graph_split_equals_unsplit_within_the_combine_rounding(form, dtype):
-    """The decode model's split (the leading plan: 8 ways at b=8 x 2 KV heads over pages, 16 ways at
-    b=3 x 2 KV heads over an UNPADDED dense cache -- the dense split the row claims) against the
-    pinned unsplit plan, same graph: NOT bitwise, and bounded by the derived two-term budget of
-    _assert_split_matches_unsplit (one output ulp of the element's binade from the single cast of two
-    differently-associated fp32 sums, plus eps_P times the row's softmax-weighted mean |V| from the
-    half-precision P each path quantizes at its own running max).  The fp32 LSEs (m + log l, no
-    quantized P in them) agree to fp32 rounding.  Both plans match the fp32 reference on their own;
-    the measured magnitudes are printed."""
+def test_decode_graph_split_equals_unsplit_within_the_combine_rounding(form, dtype, page):
+    """The decode model's split (the leading plan: 8 ways at b=8 x 2 KV heads over pages -- page 16
+    and page 64 HND -- 16 ways at b=3 x 2 KV heads over an UNPADDED dense cache -- the dense split the
+    row claims) against the pinned unsplit plan, same graph: NOT bitwise, and bounded by the derived
+    two-term budget of _assert_split_matches_unsplit (one output ulp of the element's binade from the
+    single cast of two differently-associated fp32 sums, plus twice eps_P times the row's
+    softmax-weighted mean |V| from the half-precision P each path quantizes at its own running max).
+    The fp32 LSEs (m + log l, no quantized P in them) agree to fp32 rounding.  Both plans match the
+    fp32 reference on their own; the measured magnitudes are printed."""
     if form == "paged":
-        kw = dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=dtype, seed=11)
+        kw = dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=page, hnd=True, dtype=dtype, seed=11)
         G, units, kv_tiles = 16, 16, 32
     else:
         kw = dict(B=3, H=24, KH=2, s_q=1, lens=[4096] * 3, page=0, padded=False, dtype=dtype, seed=13)
