@@ -17,8 +17,9 @@ and the caller's block list ``ids(r)`` (``[T_q, BLOCK_TOPK]`` int32, valid prefi
 
 A listed block strictly past the open one (4 blk >= n_vis) contributes nothing (masked key by key); an entry that lists the
 OPEN block itself (blk == floor(n_vis / 4) with n_vis % 4 != 0) or repeats another entry is attended TWICE -- a duplicate of
-the appended tail / of the other entry (the softmax over the multiset; the list contract forbids both, the host validator
-rejects them); -1 entries at index < count are "no key" (zero rows, -inf) and still cost fabric bytes; entries at index
+the appended tail / of the other entry (the softmax over the multiset; the list contract forbids both -- the library's host
+check is FORM-only and never reads a list, the test tree's ``block_ids_contract_violations`` detector is what rejects them);
+-1 entries at index < count are "no key" (zero rows, -inf) and still cost fabric bytes; entries at index
 >= count are never read, so an extra entry placed at index count is never read either.  count = clamp(block_lens[r], 0,
 n_sel_default) when block_lens is given, else n_sel_default = min(BLOCK_TOPK, floor((p + 1) / 4)) -- a device min / max,
 never a host read.  An empty V(r) (L_b = 0, p < 0, a padded Q row, an empty selection with no tail) lands O = 0 / LSE = -inf
