@@ -927,7 +927,7 @@ lengths. Quantized and backward rows remain opt-in.
 
 SM107 half paged D128 causal THD candidates prefer the existing GQA4/GQA8
 packing, sharing K/V across heads in the same Q tile. Default placement also
-admits the qualified BF16 HND/page16 bottom-right family (B8–64, Hq4–64,
+admits the qualified FP16/BF16 HND/page16 bottom-right family (B8–64, Hq4–64,
 Q64–128, KV2K–32K, fixed declarations, no sink/window/right-band).
 The paged split selector uses the same first-wave budget through B64/KV32K
 on SM107; selected native splits retain priority. Other contracts keep their existing
