@@ -191,7 +191,7 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
         return LEAD
     # A full first wave can still favor FROST even when splitting adds cost.
     # Share the qualified prefix envelope with candidate generation.
-    if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
+    if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts)[0] > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     # The shared paged pipeline also benefits from GQA packing without a
     # split. Large-batch short queries recover unused Q rows without partials.
@@ -293,7 +293,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     # launch. Placement and the concrete split share one bounded rule.
     if paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
-    if nonpaged_thd_split_choice(caps, facts) > 1:
+    if nonpaged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:

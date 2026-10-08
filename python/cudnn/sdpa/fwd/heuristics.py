@@ -1106,6 +1106,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
         if _selected_d_shape(caps, facts) == (64, 64):
+            if cga == 1 and split_kv > 1 and thd_split_domain(caps, facts):
+                return _D64_DECODE_TILE_ROWS
             # The native d64 flavor is a TILES_Q=2 prefill on every row that has
             # it (f16, per-tensor FP8, MXFP8): 256 rows at cga1, the width its
             # rows run (config_sm100.CfgD64; an unset knob means that width, not
@@ -1606,8 +1608,8 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return 1, False
 
 
-def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
-    """Fill the first wave of the 128-row nonpaged tile; one keeps the old choice.
+def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """(split count, packing) for the underfilled nonpaged tile; one keeps the old choice.
 
     B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
     the smaller tile plus splitting beats the wide unsplit tile and backend
@@ -1618,15 +1620,21 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
     D128 FP16/BF16 with integral GQA1..16 on Blackwell, fixed or bounded, with
     or without packed Stats; the same first-wave budget avoids splitting
     already-filled/full-prefill grids. Rubin reuses this budget for its native
-    packed D128 and MLA paths, with the device's actual SM count.
+    packed D128 and MLA paths, with the device's actual SM count. Blackwell
+    D128 counts the CTAs of the actual candidate: a packed CTA holds
+    128 / (H_q/H_kv) tokens of one KV head's group, and a declared
+    ``max_total_seq_len_q`` bounds ragged batches. It also admits Q8..63, where
+    the backend ran 2-16x slower than the split, and may fill a second wave
+    when that shortens waves x KV loop.
     """
     d128 = (facts.d_qk, facts.d_v) == (128, 128)
     if d128:
         # Reuse the MLA launch budget for native half ragged prefixes.
         if caps.sm_lo not in (100, 107) or facts.h_kv <= 0 or facts.h_q % facts.h_kv or facts.h_q // facts.h_kv not in (1, 2, 4, 8, 16):
-            return 1
+            return 1, False
     elif (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
-        return 1
+        return 1, False
+    blackwell_d128 = d128 and caps.sm_lo == 100
     if not (
         thd_split_domain(caps, facts)
         and not facts.has_paged_kv
@@ -1634,7 +1642,7 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
         and (facts.dtype == cudnn.data_type.BFLOAT16 or (d128 and facts.dtype == cudnn.data_type.HALF))
         and 1 <= facts.b <= 4
         and 4 <= facts.h_q <= 64
-        and 64 <= facts.s_q <= 1024
+        and (8 if blackwell_d128 else 64) <= facts.s_q <= 1024
         and 2048 <= facts.s_kv <= 32768
         and 4 * facts.s_q <= facts.s_kv
         and (not facts.causal or facts.bottom_right)
@@ -1642,18 +1650,31 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
         and facts.window_left is None
         and facts.device_sm_count
     ):
-        return 1
-    # This unpacked tile has one physical CTA per 128 query rows. Do not
-    # overfill its first wave: beyond it the extra partials/combine usually
-    # cost more than the shorter loop saves. Four KV tiles per partition
-    # amortize that overhead. Reuse the power-of-two specialization set;
-    # selection uses host graph facts only, never live device lengths.
-    units = facts.b * facts.h_q * _ceil_div(facts.s_q, 128)
+        return 1, False
+    # Do not overfill the wave budget (Blackwell D128 two, else one): beyond it the extra
+    # partials/combine usually cost more than the shorter loop saves. Four KV
+    # tiles per partition amortize that overhead. Reuse the power-of-two
+    # specialization set; selection uses host graph facts only, never live
+    # device lengths.
     kv_tiles = _ceil_div(facts.s_kv, 128)
-    return max(
-        (s for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles) if units * s <= facts.device_sm_count and kv_tiles // s >= 4),
-        default=1,
-    )
+    group = facts.h_q // facts.h_kv
+    budget = facts.device_sm_count * (2 if blackwell_d128 else 1)
+    choices = []
+    for pack in (False, True) if blackwell_d128 and group > 1 else (False,):
+        rows = 128 // group if pack else 128
+        q_tiles = facts.b * _ceil_div(facts.s_q, rows)
+        if blackwell_d128 and facts.max_total_seq_len_q:
+            # Each sequence leaves at most one partial tile.
+            q_tiles = min(q_tiles, (facts.max_total_seq_len_q + facts.b * (rows - 1)) // rows)
+        units = q_tiles * (facts.h_q // group if pack else facts.h_q)
+        for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles):
+            if s > 1 and units * s <= budget and kv_tiles // s >= 4:
+                # Fewest waves x loop, then fewer partials, then unpacked.
+                choices.append((_ceil_div(units * s, facts.device_sm_count) * _ceil_div(kv_tiles, s), s, pack))
+    if not choices:
+        return 1, False
+    _, splits, pack = min(choices)
+    return splits, pack
 
 
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
@@ -1802,9 +1823,11 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
                 sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
             ),
         )
-    nonpaged_splits = nonpaged_thd_split_choice(caps, facts)
+    nonpaged_splits, nonpaged_packed = nonpaged_thd_split_choice(caps, facts)
     if nonpaged_splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
+        unique.insert(
+            0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
+        )
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
