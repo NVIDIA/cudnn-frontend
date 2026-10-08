@@ -65,7 +65,10 @@ cuBLAS call of the process -- the CLI sets it, a test process sets it itself); t
 carries ``row_digest`` = sha256 of its canonical JSON minus ``NONDET_KEYS`` (``wall_ms`` / ``timestamp`` / ``host`` / ``pid``) and
 ``ROW_META_KEYS`` (``replica``), the run
 ``run_digest`` = sha256 over the row digests, and ``grad_sha256`` = sha256 of the bytes of every layer's ``dw_qkvg`` and ``dw_o``.
-Two runs of one arm from one seed must agree on every digest.  Nothing here is a performance number: ``wall_ms`` is informational.
+Two runs of one arm from one seed must agree on every digest.  The digest covers the ``recipe`` dict too, so it changes with the
+harness VERSION at identical numerics (a new recipe knob = a new digest): a comparison across versions or across node classes
+compares ``grad_sha256`` and the numeric keys -- every row key minus ``NUMERIC_COMPARE_IGNORE`` -- never the digest alone.  Nothing
+here is a performance number: ``wall_ms`` is informational.
 
 Data: ``SyntheticTokens`` -- a copy task (``S / 2`` random tokens followed by their copy: the second half is predictable through
 attention only, so the loss on it falls from ``ln V`` toward 0 as the block learns induction) and a second-order Markov chain with a
@@ -137,6 +140,7 @@ __all__ = [
     "GEOMETRIES",
     "GatedBlockFn",
     "NONDET_KEYS",
+    "NUMERIC_COMPARE_IGNORE",
     "ROW_META_KEYS",
     "RunResult",
     "SyntheticTokens",
@@ -154,6 +158,10 @@ _E4M3 = torch.float8_e4m3fn
 _BF16 = torch.bfloat16
 NONDET_KEYS = frozenset({"wall_ms", "timestamp", "host", "pid"})
 ROW_META_KEYS = frozenset({"replica"})  # written into the row AFTER the digest, like the NONDET keys: two replicas of one seed digest equal
+# The digest is keyed to the harness VERSION as well as to the numerics: ``recipe`` (the arm's knobs, which grow with the harness) sits
+# inside it, so two versions digest DIFFERENT at identical numerics.  A cross-version or cross-node-class comparison drops these keys
+# (plus NONDET_KEYS / ROW_META_KEYS) and compares what is left -- ``grad_sha256``, ``loss``, ``grad_norms``, ``quant_scalars``, ... .
+NUMERIC_COMPARE_IGNORE = frozenset({"recipe", "row_digest"})
 DETERMINISTIC_CUBLAS_CONFIGS = (":4096:8", ":16:8")
 _ACTS = ("q", "k", "v", "o")
 _GRAD_NAMES = ("dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")
