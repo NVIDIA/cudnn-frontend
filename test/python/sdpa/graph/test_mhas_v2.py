@@ -3946,6 +3946,70 @@ def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
         g.build_plans()
 
 
+_P3_PAGED_SINK_KV = [2056, 2048, 1025, 513, 300, 129, 128, 16, 15, 1, 0, 1536, 777, 255, 33, 4, 2047, 64, 17, 1024, 2000, 511, 96, 7]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("plan", ["default", "p2n", "u2n", "p1n", "u1n"], ids=lambda x: x)
+@pytest.mark.parametrize("page", [16, 128], ids=lambda p: f"page{p}")
+def test_sdpa_fwd_cc107_paged_thd_sink_plans_L0(env_info, request, cudnn_handle, page, plan):
+    """The paged serving contract (cc 10.7 paged THD queries with an attention sink) under P3's plan pins: the vLLM
+    verify shape (bf16, HND page pools, 64/8 d128, B24 with 1 / 4 / 8 tokens per request, mixed caches up to 2056 keys
+    incl. 0 / 1 / 15 / 16 / 129, bottom-right causal, sinks linspace(7, 10, H_q), Stats).  ``default`` asserts routing
+    and ADMISSION (both packings at cga2 are offered and none splits -- the sink); the pins run every class the row
+    admits there: PackGQA / unpacked at cga2 and at cga1 (the two-slab paged prefill body, supports_paged_prefill_cga1),
+    all on the shared prefill body (template prefill_d128_f16 -- the decode tile has no THD leg).  RED while the row
+    declines paged KV with a sink ("Rubin paged KV requires THD without an attention sink")."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+    cfg = ExecConfig(
+        data_type=torch.bfloat16,
+        rng_data_seed=1472,
+        rng_geom_seed=1472,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=True,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=True,
+        is_cu_seq_len=False,
+        is_ragged=True,
+        is_dropout=False,
+        is_determin=False,
+        batches=24,
+        d_qk=128,
+        d_v=128,
+        s_q=8,
+        s_kv=2056,
+        h_q=64,
+        h_k=8,
+        h_v=8,
+        block_size=page,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT,
+        left_bound=None,
+        right_bound=0,
+        seq_len_q=[1] * 8 + [4] * 8 + [8] * 8,
+        seq_len_kv=list(_P3_PAGED_SINK_KV),
+        with_sink_token=True,
+        softmax_precision=cudnn.data_type.FLOAT,
+        fwd_stats=True,
+    )
+    cfg.fill_derived_fields()
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = cfg
+    test.showConfig((request.node.name, 1), request)
+    sinks = _issue_sinks(64)
+
+    with _must_run(request):
+        if plan == "default":
+            hook = _record_cc107_half_plans()
+            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, template="prefill_d128_f16", plan_hook=hook, tensor_initializer=sinks)
+            assert {(1, 2, 1), (0, 2, 1)} <= hook.offered and all(split == 1 for _, _, split in hook.offered), hook.offered
+        else:
+            hook, knobs, _ = _pin_knobs(plan)
+            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template="prefill_d128_f16", tensor_initializer=sinks)
+
+
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
 @pytest.mark.L0
 @pytest.mark.L1
