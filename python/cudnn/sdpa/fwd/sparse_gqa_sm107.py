@@ -10,9 +10,11 @@ live in ONE frozen record, :data:`SPARSE_CAPABILITIES`, spelled in the ``Capabil
 :meth:`SparseGqaFwdDslSm107.check_support` is the ENFORCEMENT point: the CuTe DSL version gate first (``sm_107a`` needs the
 public 4.8.0 wheel; ``python/cudnn/AGENTS.md`` Rule 7 -- BEFORE the kernel module is imported, so a too-old DSL reads as a
 version problem, never as a ``KeyError`` from inside the DSL), then every field of the record as a typed decline.  Every
-arm the body does not carry yet (THD, the fused epilogue gate, split-KV, bottom-right, a sink, a band, the decode form,
-Q-length trimming, log2 stats, a pure caller list) is declined BY NAME; a later commit that lands an arm flips the record
-field, the config's wired-arm set and the support-matrix tracker in the same change.
+arm the body does not carry yet (the fused epilogue gate, split-KV, bottom-right, a sink, a band, the decode form, Q-length
+trimming of a dense batch, log2 stats, a pure caller list) is declined BY NAME; a later commit that lands an arm flips the
+record field, the config's wired-arm set and the support-matrix tracker in the same change.  THD (packed sequences) and paged
+K / V pools are carried -- ONE of the two per declaration (``thd=True`` with ``paged_kv=True`` is a typed decline: the packed
+sequence's K / V row offset composes with a dense tensor only, never with a page pool); see the two contracts below.
 
 Paged K / V (``paged_kv=True``, the serving read): ``k`` / ``v`` are page POOLS ``[num_pages, H_kv, page_size, D]`` -- HND
 compact, or NHD storage declared through the strides (the dense SDPA adapter's own paged contract) -- addressed through ONE
@@ -44,6 +46,19 @@ multiple of 8 elements (TMA's 16-byte rule); the K / V batch stride EQUAL to ``S
 batch stride has no 2-D row coordinate; Q / O any dense (B, S, H) strides.  ``block_ids``: int32 ``[B, S_q, top_k]`` (or
 ``[B x S_q, top_k]``) CONTIGUOUS -- the row stride is the bulk-copy length; ``block_lens``: int32 ``[B, S_q]`` / ``[B x S_q]``
 contiguous or None; ``seq_kv_lens``: int32 ``[B]`` contiguous or None (its presence is a compile-time specialization).
+
+THD contract (``thd=True``; packed sequences, the kernel's persistent claim-counter form): Q / O ``[1, T_q, H, D]`` and K / V
+``[1, T_kv, H_kv, D]`` with batch extent 1 (``T_q`` / ``T_kv`` are CAPACITIES >= 1: the live totals are device values; the
+rows past them are never touched), the same per-operand stride rules; ``block_ids`` int32 ``[T_q, top_k]`` / ``[1, T_q, top_k]``
+with every id RELATIVE TO ITS SEQUENCE (block ``j`` of sequence ``b`` = its tokens ``[4 j, 4 j + 4)``), ``block_lens`` ``[T_q]``
+/ ``[1, T_q]`` or None, LSE ``(1, H, T_q)`` in any strides; ``seq_q_lens`` AND ``seq_kv_lens`` REQUIRED: int32 contiguous
+per-sequence lengths ``[B]`` -- or cumulative ``[B + 1]`` prefix sums with ``cu_seq_q_lens`` / ``cu_seq_kv_lens`` (normalised on
+device: a prefix sliced from a larger one means the same lengths) -- the sequence count ``B`` is their shape; and a
+``workspace`` of :meth:`SparseGqaFwdDslSm107.scratch_workspace_bytes` bytes (16-byte aligned, on the device) for the THD
+metadata the setup launch writes.  Semantics per sequence ``b`` with Q length ``S_q_b`` and KV length ``S_kv_b``: row ``pos``
+sees ``n_vis = min(pos + 1, S_kv_b)`` tokens (top-left causal); ``S_kv_b = 0`` makes every row of the sequence dead (``O = 0``,
+``LSE = -inf`` stored); ``S_q_b = 0`` contributes no work; a one-sequence packing computes the dense ``B = 1`` function.
+Lengths are device values (Rule 3): the host validates the tensors' FORM only.
 """
 
 from __future__ import annotations
@@ -81,7 +96,7 @@ class SparseCapabilities:
     sink: bool = False
     padded: bool = False  # per-batch Q lengths (the dense padding mask) are not carried ...
     kv_lens: bool = True  # ... per-batch KV lengths are (seq_kv_lens: the tail follows the visible range, a 0 length is a dead row)
-    thd: bool = False
+    thd: bool = True  # packed sequences: cu_seqlens / per-sequence lengths, sequence-relative block ids, the persistent claim counter
     paged_kv: bool = True  # page pools [num_pages, H_kv, page_size, D] (HND compact / NHD by strides) through a (B, max_pages) table; page_size % 4 == 0
     decode: bool = False
     epilogue_gate: bool = False
@@ -131,6 +146,23 @@ class SparseOperandDesc:
         raise ValueError(
             "sparse d256 forward (sm107): this operand was declared as a SparseOperandDesc (no storage); pass the tensor to execute(q=, k=, v=, o=, ...)"
         )
+
+
+_SMS_CACHE: dict = {}
+
+
+def _device_sm_count(device) -> int:
+    """``multi_processor_count`` of ``device``, resolved once per device index (the query costs ~7 us; the THD grid is a
+    plan-time fact of the device, so the first execute pays it and the cache serves every later call)."""
+    import torch  # the framework is the caller's; imported here, never at module import
+
+    key = getattr(device, "index", None)
+    key = torch.cuda.current_device() if key is None else int(key)
+    n = _SMS_CACHE.get(key)
+    if n is None:
+        n = int(torch.cuda.get_device_properties(key).multi_processor_count)
+        _SMS_CACHE[key] = n
+    return n
 
 
 def _shape(t) -> Tuple[int, ...]:
@@ -215,6 +247,9 @@ class SparseGqaFwdDslSm107:
         device_cc: Optional[Tuple[int, int]] = None,
         page_size: int = 0,
         block_table=None,
+        cu_seq_q_lens: bool = False,
+        cu_seq_kv_lens: bool = False,
+        workspace=None,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         self.block_ids, self.block_lens, self.seq_kv_lens = block_ids, block_lens, seq_kv_lens
@@ -226,14 +261,22 @@ class SparseGqaFwdDslSm107:
         self.paged_kv = bool(paged_kv)
         self.page_size = int(page_size)
         self.block_table = block_table
+        # THD (packed sequences): the Q lengths ride ``seq_q_lens`` (REQUIRED there; a dense batch's Q-length trimming is the
+        # unserved ``seq_q_lens`` arm below), the KV lengths ``seq_kv_lens``; each as per-sequence lengths [B] or cumulative
+        # [B + 1] per its ``cu_seq_*_lens`` flag; the metadata lives in the caller's ``workspace``.  THD together with the paged
+        # read is a typed decline in check_support (one of the two arms per declaration).
+        self.thd = bool(thd)
+        self.seq_q_lens = seq_q_lens
+        self.cu_seq_q_lens, self.cu_seq_kv_lens = bool(cu_seq_q_lens), bool(cu_seq_kv_lens)
+        self.workspace = workspace
         self.unserved = dict(
-            thd=bool(thd),
             epilogue_gate=epilogue_gate is not None,
             split_kv=int(split_kv) > 1,
             bottom_right=bool(bottom_right),
             sink=sink is not None,
             sliding_window=window_left is not None or window_right is not None,
-            seq_q_lens=seq_q_lens is not None,
+            seq_q_lens=seq_q_lens is not None and not self.thd,
+            cu_seq_lens=(self.cu_seq_q_lens or self.cu_seq_kv_lens) and not self.thd,
             list_per_sequence=bool(list_per_sequence),
             pure_list=not include_open_block,
             stats_log2=self.stats_log2,
@@ -243,6 +286,8 @@ class SparseGqaFwdDslSm107:
         self._fns = {}  # {has_block_lens: compiled fn} -- both variants may coexist (compile(has_block_lens=))
         self._module = None
         self._B = self._SQ = self._SKV = self._H = self._KH = self._G = 0
+        self._NSEQ = 0  # THD: the number of sequences (the lens tensors' shape); == _B on a dense batch
+        self._n_ctas = 0  # THD: the occupancy-sized grid, resolved once per device at the first execute
         self._dtype_code = 0
         self._paged = None  # the paged arm's derived geometry (set by check_support): num_pages, max_pages, per-operand row terms
 
@@ -295,6 +340,16 @@ class SparseGqaFwdDslSm107:
         if self.lse is not None and str(self.lse.dtype) != "torch.float32":
             raise ValueError(f"sparse d256 forward (sm107): LSE must be float32; got {self.lse.dtype}")
 
+        # the two wired arms are served ONE AT A TIME: under THD the gather row is the sequence's packed row cu_k[b] + 4 blk + r
+        # on a dense [1, T_kv, H_kv, D] tensor, under the paged read the pool row page x rows_per_page + ...; nothing composes
+        # a sequence's row offset with a page pool, so the combination is declined by name until a serving stack asks for it
+        if self.thd and self.paged_kv:
+            raise NotImplementedError(
+                "sparse d256 forward (sm107): thd=True with paged_kv=True is not served -- the packed sequence's K / V row offset (cu_k[b]) composes "
+                "with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool; declare one of the two (the combination lands with its own "
+                "accept cells when a serving stack asks for it)"
+            )
+
         # the paged read's FORM: page_size a positive multiple of the block (the kernel's one-lookup-per-block premise), the
         # table and the KV lengths present; both appended arguments refused on a dense declaration (the mirror image)
         if self.paged_kv:
@@ -316,8 +371,9 @@ class SparseGqaFwdDslSm107:
             if self.page_size:
                 raise ValueError(f"sparse d256 forward (sm107): page_size={self.page_size} given but paged_kv=False (the page size belongs to the paged read)")
 
-        # shapes: (B, S, H, 256) BSHD; one KV head serves H / KH query heads, 1 <= group <= 16; paged: K / V are the pools
-        # [num_pages, H_kv, page_size, 256] (HND compact or NHD by strides) and S_kv is the table's capacity
+        # shapes: (B, S, H, 256) BSHD -- or the packed (1, T, H, 256) under THD; one KV head serves H / KH query heads,
+        # 1 <= group <= 16; paged: K / V are the pools [num_pages, H_kv, page_size, 256] (HND compact or NHD by strides) and
+        # S_kv is the table's capacity
         qs, ks, vs, os_ = _shape(self.q), _shape(self.k), _shape(self.v), _shape(self.o)
         kv_form = "(num_pages, H_kv, page_size, D) -- a page pool" if self.paged_kv else "(B, S, H, D)"
         for name, s in (("Q", qs), ("K", ks), ("V", vs), ("O", os_)):
@@ -346,6 +402,17 @@ class SparseGqaFwdDslSm107:
             Bk, SKV, KH, _ = ks
             if Bk != B:
                 raise ValueError(f"sparse d256 forward (sm107): batch mismatch: Q {qs}, K {ks}")
+        n_seq = B
+        if self.thd:
+            if B != 1:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): thd=True takes PACKED operands with batch extent 1 -- Q / O [1, T_q, H, D], K / V [1, T_kv, H_kv, D]; got Q {qs}, K {ks}"
+                )
+            if SQ < 1 or SKV < 1:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): thd=True needs packed capacities T_q, T_kv >= 1 (a zero-extent tensor map is invalid, not empty); got T_q {SQ}, T_kv {SKV}"
+                )
+            n_seq = self._check_thd_lens_form()
         if H % KH != 0:
             raise ValueError(f"sparse d256 forward (sm107): H_q = {H} must be a multiple of H_kv = {KH}")
         G = H // KH
@@ -391,11 +458,14 @@ class SparseGqaFwdDslSm107:
             raise ValueError("sparse d256 forward (sm107): block_ids must be contiguous (its row stride is the bulk-copy length)")
         if self.block_lens is not None:
             self._check_block_lens_form(self.block_lens, B, SQ)
-        if self.seq_kv_lens is not None:
+        if self.seq_kv_lens is not None and not self.thd:
             kl = self.seq_kv_lens
             if str(kl.dtype) != "torch.int32" or _shape(kl) != (B,) or not kl.is_contiguous():
                 raise ValueError(f"sparse d256 forward (sm107): seq_kv_lens must be a contiguous int32 [B]; got {kl.dtype} {_shape(kl)}")
+        if self.thd and self.workspace is not None:
+            self._check_workspace(self.workspace, n_seq)
         self._B, self._SQ, self._SKV, self._H, self._KH, self._G = B, SQ, SKV, H, KH, G
+        self._NSEQ = n_seq
         self._dtype_code = _DTYPE_CODE[dt]
         return True
 
@@ -404,14 +474,55 @@ class SparseGqaFwdDslSm107:
         if str(bl.dtype) != "torch.int32" or _shape(bl) not in ((B, SQ), (B * SQ,)) or not bl.is_contiguous():
             raise ValueError(f"sparse d256 forward (sm107): block_lens must be a contiguous int32 [B, S_q] / [B x S_q]; got {bl.dtype} {_shape(bl)}")
 
+    def _check_thd_lens_form(self) -> int:
+        """THD: both length tensors present, int32, rank-1, contiguous, agreeing on the sequence count ``B`` (``[B]`` lengths or
+        ``[B + 1]`` prefix sums per ``cu_seq_*_lens``).  Returns ``B``.  The VALUES are device facts the setup launch reads
+        (Rule 3); nothing here dereferences them."""
+        if self.seq_q_lens is None or self.seq_kv_lens is None:
+            raise ValueError(
+                "sparse d256 forward (sm107): thd=True needs seq_q_lens AND seq_kv_lens (int32 per-sequence lengths [B], or cumulative [B + 1] with cu_seq_q_lens / cu_seq_kv_lens)"
+            )
+        counts = []
+        for name, t, cu in (("seq_q_lens", self.seq_q_lens, self.cu_seq_q_lens), ("seq_kv_lens", self.seq_kv_lens, self.cu_seq_kv_lens)):
+            shp = _shape(t)
+            if str(t.dtype) != "torch.int32" or len(shp) != 1 or not t.is_contiguous():
+                raise ValueError(f"sparse d256 forward (sm107): {name} must be a contiguous int32 rank-1 tensor under thd=True; got {t.dtype} {shp}")
+            counts.append(shp[0] - int(cu))
+        if counts[0] < 1 or counts[0] != counts[1]:
+            raise ValueError(
+                f"sparse d256 forward (sm107): seq_q_lens and seq_kv_lens must describe the same B >= 1 sequences ([B] lengths, [B + 1] cumulative); "
+                f"got {counts[0]} and {counts[1]} (cu_seq_q_lens={self.cu_seq_q_lens}, cu_seq_kv_lens={self.cu_seq_kv_lens})"
+            )
+        return counts[0]
+
+    @staticmethod
+    def _thd_meta_bytes(n_seq: int) -> int:
+        from cudnn.frost.tile_dsl.thd import THD_META_WORDS  # the ONE layout source (words = 4 B + 4)
+
+        return -(-(THD_META_WORDS(int(n_seq)) * 4) // 16) * 16
+
+    def _check_workspace(self, ws, n_seq: int) -> None:
+        need = self._thd_meta_bytes(n_seq)
+        nbytes = int(ws.numel()) * int(ws.element_size())
+        if nbytes < need:
+            raise ValueError(f"sparse d256 forward (sm107): thd=True needs a workspace of {need} bytes (scratch_workspace_bytes()); got {nbytes}")
+        if int(ws.data_ptr()) % 16 != 0:
+            raise ValueError(f"sparse d256 forward (sm107): the THD workspace must be 16-byte aligned; got data_ptr=0x{int(ws.data_ptr()):x}")
+
     def scratch_workspace_bytes(self) -> int:
-        """Per-execute GMEM scratch beyond the operands: NONE.  The count of a row's list, the open tail block and the dead
-        items are derived on device from the position, ``block_lens`` and ``seq_kv_lens`` (one bounds helper per work item),
-        and the ids rows reach SMEM by a bulk copy straight from the caller's ``block_ids`` -- no per-sequence metadata, no
-        index staging, no split-KV partials; the paged read walks the caller's ``block_table`` directly (no per-sequence
-        descriptors).  A caller that folds every engine's scratch into one workspace (the gated attention block) folds a 0
-        here; the arm that will need scratch (split-KV partials) grows it in the change that lands it."""
-        return 0
+        """Per-execute GMEM scratch beyond the operands.  Dense (BSHD or paged pools): NONE -- the count of a row's list, the
+        open tail block and the dead items are derived on device from the position, ``block_lens`` and ``seq_kv_lens`` (one
+        bounds helper per work item), and the ids rows reach SMEM by a bulk copy straight from the caller's ``block_ids`` -- no
+        per-sequence metadata, no index staging, no split-KV partials; the paged read walks the caller's ``block_table``
+        directly (no per-sequence descriptors); a caller that folds every engine's scratch into one workspace (the gated
+        attention block) folds a 0 here.  THD: the int32 metadata buffer the setup launch fills (``THD_META_WORDS(B) = 4 B + 4``
+        words, 16-byte rounded: the per-sequence KV lengths, both prefix sums, the live unit total and the claim counter).  The
+        arm that will need more (split-KV partials) grows it in the change that lands it."""
+        if not self.thd:
+            return 0
+        if not self._NSEQ:
+            self.check_support()
+        return self._thd_meta_bytes(self._NSEQ)
 
     # --- compile / execute -----------------------------------------------------------------------------------------------
 
@@ -427,10 +538,11 @@ class SparseGqaFwdDslSm107:
             qh_per_kh=self._G,
             qsa_block_topk=self.top_k,
             qsa_block_size=self.block_size,
-            seq_kv_lens_present=self.seq_kv_lens is not None,
+            seq_kv_lens_present=self.seq_kv_lens is not None or self.thd,
             stats_log2=self.stats_log2,
             paged_kv=self.paged_kv,
             page_size=self.page_size if self.paged_kv else 0,
+            thd_varlen=self.thd,
         )
 
     def compile(self, has_block_lens: Optional[bool] = None):
@@ -480,7 +592,22 @@ class SparseGqaFwdDslSm107:
             )
         return given
 
-    def execute(self, stream=None, *, q=None, k=None, v=None, o=None, lse=None, block_ids=None, block_lens=None, seq_kv_lens=None, block_table=None):
+    def execute(
+        self,
+        stream=None,
+        *,
+        q=None,
+        k=None,
+        v=None,
+        o=None,
+        lse=None,
+        block_ids=None,
+        block_lens=None,
+        seq_kv_lens=None,
+        block_table=None,
+        seq_q_lens=None,
+        workspace=None,
+    ):
         """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation.
 
         The appended keyword operands BIND the launch's tensors in place of the declared ones (a caller whose buffers exist
@@ -488,7 +615,9 @@ class SparseGqaFwdDslSm107:
         declaration in shape, strides and dtype exactly.  ``lse`` / ``seq_kv_lens`` / ``block_table`` keep the declaration's
         presence (it is compiled in; the table exists exactly on a paged declaration).  ``block_lens`` may differ in PRESENCE
         per call: a tensor -> the ``has_block_lens`` variant, ``None`` -> the kernel's derived default count -- the variant
-        must have been compiled (:meth:`compile`), never compiled here."""
+        must have been compiled (:meth:`compile`), never compiled here.  THD: ``seq_q_lens`` binds like the others and
+        ``workspace`` (the metadata buffer, :meth:`scratch_workspace_bytes`, 16-byte aligned) is the one operand that need not
+        match a declaration -- any buffer of at least the size serves."""
         if not self._G:
             self.check_support()
         q = self._bind("q", q, self.q, required=True)
@@ -499,6 +628,13 @@ class SparseGqaFwdDslSm107:
         lse = self._bind("lse", lse, self.lse, required=self.lse is not None)
         seq_kv_lens = self._bind("seq_kv_lens", seq_kv_lens, self.seq_kv_lens, required=self.seq_kv_lens is not None)
         table = self._bind("block_table", block_table, self.block_table, required=self.paged_kv)
+        seq_q_lens = self._bind("seq_q_lens", seq_q_lens, self.seq_q_lens, required=self.thd)
+        ws = None
+        if self.thd:
+            ws = self.workspace if workspace is None else workspace
+            if ws is None or isinstance(ws, SparseOperandDesc):
+                raise ValueError("sparse d256 forward (sm107): thd=True needs the metadata workspace at execute(workspace=) (scratch_workspace_bytes() bytes)")
+            self._check_workspace(ws, self._NSEQ)
         if block_lens is not None:
             self._check_block_lens_form(block_lens, self._B, self._SQ)
             lens = block_lens
@@ -526,9 +662,25 @@ class SparseGqaFwdDslSm107:
 
         if stream is None:
             stream = cuda_driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        if seq_kv_lens is None:
+        thd_kw = dict(thd_q_lens_ptr=None, thd_kv_lens_ptr=None, thd_lens_form=None, n_ctas=None)
+        if self.thd:
+            # The kernel reads the metadata workspace as its ``seq_kv_lens`` tensor (the setup launch fills it from the two
+            # length tensors); the grid is the resident wave (one CTA per SM, never more CTAs than packed units at capacity),
+            # resolved once per device (a ~7 us query kept off the per-call path).
+            if not self._n_ctas:
+                self._n_ctas = max(1, min(self._SQ * self._KH, _device_sm_count(q.device)))
+            thd_kw = dict(
+                thd_q_lens_ptr=P(seq_q_lens, cutlass.Int32, 4),
+                thd_kv_lens_ptr=P(seq_kv_lens, cutlass.Int32, 4),
+                thd_lens_form=cutlass.Int32((1 if self.cu_seq_q_lens else 0) | (2 if self.cu_seq_kv_lens else 0)),
+                n_ctas=cutlass.Int32(self._n_ctas),
+            )
+            meta_ptr = make_ptr(cutlass.Int32, ws.data_ptr(), gmem, assumed_align=16)
+        elif seq_kv_lens is None:
             # Unread by the kernel (SEQ_KV_LENS_PRESENT = 0): the pointer slot is bound to the ids (a valid address).
-            seq_kv_lens = ids
+            meta_ptr = P(ids, cutlass.Int32, 4)
+        else:
+            meta_ptr = P(seq_kv_lens, cutlass.Int32, 4)
         if self.paged_kv:
             # The kernel's (batch, seq, head) stride slots carry (page stride, TOKEN stride, COLUMN head stride) of each pool
             # and paged_geom its row terms -- all derived from the declared strides (the bound tensors match them exactly).
@@ -546,8 +698,8 @@ class SparseGqaFwdDslSm107:
             lse_ptr=P(lse, cutlass.Float32, 4),
             block_ids_ptr=P(ids, cutlass.Int32, 16),
             block_lens_ptr=P(lens, cutlass.Int32, 4),
-            seq_kv_lens_ptr=P(seq_kv_lens, cutlass.Int32, 4),
-            problem_size=(self._B, self._H, self._KH, self._SQ, self._SKV),
+            seq_kv_lens_ptr=meta_ptr,
+            problem_size=(self._NSEQ, self._H, self._KH, self._SQ, self._SKV),
             q_strides=_strides(q)[:3],
             k_strides=k_strides,
             v_strides=v_strides,
@@ -557,4 +709,5 @@ class SparseGqaFwdDslSm107:
             block_table_ptr=P(table, cutlass.Int32, 4),
             paged_geom=paged_geom,
             stream=stream,
+            **thd_kw,
         )

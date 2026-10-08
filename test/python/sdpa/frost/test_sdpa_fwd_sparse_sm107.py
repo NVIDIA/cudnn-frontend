@@ -197,8 +197,21 @@ def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd):
         (lambda o: o.update(top_k=501), NotImplementedError, "top_k"),
         (lambda o: o.update(top_k=516), NotImplementedError, "top_k"),
         (lambda o: o.update(block_size=8), NotImplementedError, "block_size"),
-        (lambda o: o.update(thd=True), NotImplementedError, "thd"),
+        (lambda o: o.update(thd=True), ValueError, "seq_q_lens AND seq_kv_lens"),
+        (lambda o: o.update(thd=True, seq_q_lens=_T((3,), (1,), "torch.int32"), seq_kv_lens=_T((2,), (1,), "torch.int32")), ValueError, "same B"),
+        (lambda o: o.update(thd=True, seq_q_lens=_T((3,), (1,), "torch.int64"), seq_kv_lens=_T((3,), (1,), "torch.int32")), ValueError, "rank-1"),
+        (
+            lambda o: o.update(**_operands(B=2), thd=True, seq_q_lens=_T((2,), (1,), "torch.int32"), seq_kv_lens=_T((2,), (1,), "torch.int32")),
+            ValueError,
+            "batch extent 1",
+        ),
+        (lambda o: o.update(cu_seq_q_lens=True), NotImplementedError, "cu_seq_lens"),
         (lambda o: o.update(**_paged_operands(P=6)), NotImplementedError, "page_size"),  # the paged arm's one typed decline: a block would straddle pages
+        (
+            lambda o: o.update(**_paged_operands(), thd=True, seq_q_lens=_T((1,), (1,), "torch.int32")),
+            NotImplementedError,
+            "thd=True with paged_kv=True",
+        ),  # the two wired arms are served one at a time: the packed sequence's K / V row offset composes with a dense tensor only
         (lambda o: o.update(epilogue_gate=object()), NotImplementedError, "epilogue_gate"),
         (lambda o: o.update(split_kv=2), NotImplementedError, "split_kv"),
         (lambda o: o.update(bottom_right=True), NotImplementedError, "bottom_right"),
@@ -348,6 +361,32 @@ def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration():
         a._bind("block_table", _T((1, 2), (2, 1), "torch.int32"), a.block_table, required=False)
 
 
+def test_adapter_accepts_a_packed_thd_request_and_sizes_its_workspace():
+    """``thd=True`` on packed operands (batch extent 1) with the two length tensors -- per-sequence ``[B]`` or cumulative
+    ``[B + 1]`` per flag -- is served: the params carry ``thd_varlen`` (and the per-batch KV lengths the arm forces), the
+    workspace is the THD metadata (``4 B + 4`` int32 words, 16-byte rounded), and the dense request keeps ``thd_varlen`` off."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    i32 = "torch.int32"
+    for cu_q, cu_kv in ((False, False), (True, False), (False, True), (True, True)):
+        o = _operands(B=1, S=600)
+        o.update(
+            thd=True,
+            seq_q_lens=_T((3 + int(cu_q),), (1,), i32),
+            seq_kv_lens=_T((3 + int(cu_kv),), (1,), i32),
+            cu_seq_q_lens=cu_q,
+            cu_seq_kv_lens=cu_kv,
+        )
+        a = SparseGqaFwdDslSm107(**o)
+        assert a.check_support() is True
+        p = a.template_params()
+        assert p.thd_varlen and p.seq_kv_lens_present and (p.qsa_block_topk, p.qh_per_kh) == (512, 12)
+        assert a.scratch_workspace_bytes() == 64, "THD metadata: (4 x 3 + 4) int32 words = 64 B"
+    # the same operands without thd: no workspace, no THD specialization
+    a = SparseGqaFwdDslSm107(**_operands(B=1, S=600))
+    assert a.check_support() and a.scratch_workspace_bytes() == 0 and not a.template_params().thd_varlen
+
+
 def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1():
     """The gather map is 2-D (tokens of every batch as rows): a batch stride other than S_kv x the token stride has no row
     coordinate -- declined at B >= 2, irrelevant at B == 1."""
@@ -406,6 +445,39 @@ def test_sparse_kernel_source_pins():
     # no per-item tile-index parity anywhere (the decode tile's arithmetic form)
     assert "_kv_slot(" not in code and "// cutlass.Int32(2)) & cutlass.Int32(1)" not in code
     assert "EXPLICIT_ABI = True" in code
+
+
+def test_sparse_kernel_thd_arm_source_pins():
+    """The THD arm's conventions, no GPU: the scheduler form is a ``const_expr`` arm of ``CFG.THD_VARLEN`` (the persistent
+    claim counter vs the CLC loop); a CTA past the live total exits at entry BEFORE any mbarrier init; ONE decode helper
+    turns every payload (the first item included) into the item in every role; the three load sites take their coordinates
+    from it and nothing else (the ids bulk copy ``item_row``, the Q box ``(out_tok, out_batch)``, the gather rows
+    ``kv_row_base`` on the dense arm -- the paged arm's pool row never composes with it: THD x paged is a typed decline) -- no
+    dense ``batch x S`` coordinate survives outside the decode; the metadata offsets come from
+    ``tile_dsl.thd``'s names, never re-literalled; the setup launch precedes the main launch."""
+    code = _code(_kernel_source())
+    i_persist = code.index(
+        "scheduler_warp_loop_persistent(sched, SCHEDULER_STAGES, is_cga_first_cta, seq_kv_lens_tensor, THD_CTR_OFF(n_batch), THD_LIVE_OFF(n_batch), 1, 1)"
+    )
+    arm = code[code.rfind("if cutlass.const_expr(CFG.THD_VARLEN == 1):", 0, i_persist) : i_persist]
+    assert arm and "\ndef " not in arm, "the persistent scheduler is the THD arm of the scheduler warp"
+    assert "scheduler_warp_loop(sched, SCHEDULER_STAGES, is_cga_first_cta, 1)" in code, "the CLC form stays the dense arm"
+    assert code.index("exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, 1)") < code.index(
+        "bars = make_sparse_bars()"
+    ), "the dead-CTA exit precedes every init"
+    assert code.count("= _decode_item(") == 8, "the prologue and the loop bottom of each of the four roles decode through the ONE helper"
+    assert "_decode_payload" not in code
+    assert "tma_q(cutlass.Int32(0), head * cutlass.Int32(G), out_tok, out_batch)" in code
+    assert "ids_base + item_row * cutlass.Int32(BLOCK_TOPK)" in code
+    assert "base = kv_row_base + key0" in code and "base + cutlass.Int32(r)" in code, "the dense arm's gather row is kv_row_base + 4 blk + r"
+    i_dec = code.index("def _decode_item(")
+    i_end = code.index("\ndef ", i_dec + 1)
+    outside = code[:i_dec] + code[i_end:]
+    assert "batch * seqlen_kv" not in outside and "batch * seqlen_q" not in outside, "a dense coordinate outside the decode helper"
+    for name in ("THD_CTR_OFF(n_batch)", "THD_LIVE_OFF(n_batch)", "THD_CU_Q_TOTAL_OFF(n_batch)", "THD_META_WORDS(B)"):
+        assert name in code, name
+    assert re.search(r"4\s*\*\s*n_batch\s*\+\s*[23]\b", code) is None, "the metadata offsets are tile_dsl.thd's, never re-literalled"
+    assert code.index("_build_thd_meta_kernel(") < code.index("    _kernel(\n        tma_q_desc,"), "the setup launch precedes the main launch"
 
 
 def test_sparse_kernel_declares_no_cross_cta_arrive_and_no_cluster_scope():

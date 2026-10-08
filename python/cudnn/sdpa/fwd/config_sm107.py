@@ -1608,7 +1608,12 @@ _REG_FILE_PER_CTA = 65536
 # "paged_kv": the gather warps read K / V from page pools through a (B, max_pages) block table -- one table lookup per
 # 4-token block (PAGE_SIZE % 4 == 0, so a block never straddles a page); the visible range comes from the per-batch KV
 # lengths, which the paged form therefore REQUIRES (SEQ_KV_LENS_PRESENT is forced to 1 below).
-SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv"})
+# "thd_varlen": packed sequences through the persistent claim-counter scheduler, the shared THD metadata layout (seq_kv_lens |
+# cu_q | cu_k | remap | live | ctr) in a caller workspace, sequence-relative block ids (the gather row carries cu_k[b]).
+# The two arms are wired ONE AT A TIME: a record asking for both is refused by the validator below (the packed sequence's K / V
+# row offset cu_k[b] composes with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool) until a serving stack asks
+# for the combination -- it then lands with its own accept cells.
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen"})
 
 
 def sparse_entry_regs(total_warps: int) -> int:
@@ -1974,6 +1979,11 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             (
                 not cfg.THD_VARLEN or cfg.SEQ_KV_LENS_PRESENT == 1,
                 f"{flavor}: THD/varlen must force SEQ_KV_LENS_PRESENT=1, or every sequence attends the whole pack",
+            ),
+            (
+                not (cfg.THD_VARLEN and cfg.PAGED_KV),
+                f"{flavor}: THD x paged is not served -- the packed sequence's K / V row offset (cu_k[b]) composes with a dense [1, T_kv, H_kv, D] "
+                f"tensor only, never with a page pool; one of THD_VARLEN / PAGED_KV per record (the adapter declines the combination by name)",
             ),
             (not cfg.SEQ_Q_LENS_PRESENT or cfg.SEQ_KV_LENS_PRESENT == 1, f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
             (cfg.SCHEDULER_POLICY == SCHED_NATURAL, f"{flavor}: the item scheduler is NATURAL in v1 (LPT needs per-item costs)"),

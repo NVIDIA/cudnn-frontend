@@ -72,7 +72,7 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                                                                                         1 == 1       MMA before the item's first BMM1     0      q_state(2), once per item
     2  mb_q_empty[2]        MMA_COMMIT   warp 12, arrive(cta_group=1, pred=elect_p) once per item after the item's LAST BMM1
                                                                                                         1 == 1       warp 13 before gate(i) / Q(i+2)      1      per item; drained at exit by warp 13
-    3  mb_ids_full[2]       TMA_LOAD     warp 13, arrive(n_bytes=IDS_TX_BYTES, pred=elect_sync()); bulk_copy(sIds[slot], block_ids[row], IDS_TX_BYTES)
+    3  mb_ids_full[2]       TMA_LOAD     warp 13, arrive(n_bytes=IDS_TX_BYTES, pred=elect_sync()); bulk_copy(sIds[slot], block_ids[item_row], IDS_TX_BYTES)
                                          IDS_TX_BYTES = BLOCK_TOPK x 4 (a 16-B multiple); the copy runs for EVERY item, dead ones included
                                                                                                         1 == 1       8 gather + 4 softmax warps, item top 0      ids_state(2), once per item
     4  mb_ids_empty[2]      THREAD       `if elect_sync(): arrive()` from each of the 12 consuming warps after its last read of the slot
@@ -120,9 +120,10 @@ mb_gate_empty x 1; every gather warp waits mb_kv_empty x STAGES_KV -- each with 
 
 THE ONE HELPER ``_item_bounds``: n_tiles, count, has_open, dead and the appended tail block id(s) are computed by ONE pure
 helper at the item-start site of EVERY role that loops over tiles (softmax, MMA, the 8 gather warps, the TMA warp) over the
-same inputs (payload, block_lens pointer, seq lens); nothing about them is staged through SMEM.
+same inputs (the item ``_decode_item`` decoded from the payload -- ONE decode for every role and every item, the CTA's
+first item included -- the block_lens pointer, the seq lens); nothing about them is staged through SMEM.
 
-    pos           = s  (top-left)  |  s + (eff_seqlen_kv_b - eff_seqlen_q_b)  (CFG.BOTTOM_RIGHT)
+    pos           = s  (top-left)  |  s + (eff_seqlen_kv_b - eff_seqlen_q_b)  (CFG.BOTTOM_RIGHT)  |  tok_packed - cu_q[b]  (THD)
     n_sel_default = min(CFG.BLOCK_TOPK, floor((pos + 1) / 4))
     count         = clamp(block_lens[t], 0, n_sel_default)  when given, else n_sel_default
     n_vis         = clamp(min(pos + 1, eff_seqlen_kv_b), 0)     the VISIBLE range (a padded sequence shorter than pos keeps its own tail)
@@ -133,11 +134,41 @@ same inputs (payload, block_lens pointer, seq lens); nothing about them is stage
 A dead item's 32 block ids read as -1 (the gather and softmax lanes SELECT -1 over the loaded word, read at an address
 clamped into the slot), TMA zero-fills and credits the 128 KiB, every lane is masked, l_tot = 0 and the row_dead SELECT lands
 O = 0 / LSE = -inf (no store for a padded Q row) -- every ring advances exactly as on a live item.  A gather ROW coordinate
-is batch x S_kv + 4 blk + r for a live row and -1 (TMA zero-fill, bytes credited) for a -1 block, a block past the batch's
-length and the straddling rows of its last block, so no other batch's row -- or its NaN -- reaches an MMA under P = 0.  Per key lane l of tile i: blk = sIds[32 i + l // 4] (or the tail
-id / -1 by the SELECT), key_abs = 4 blk + l % 4, valid = (blk >= 0) & (key_abs <= pos) & (key_abs < eff_seqlen_kv_b);
+is kv_row_base + 4 blk + r for a live row (kv_row_base = batch x S_kv on the dense map, cu_k[b] under THD) and -1 (TMA
+zero-fill, bytes credited) for a -1 block, a block past the sequence's length and the straddling rows of its last block, so
+no other sequence's row -- or its NaN -- reaches an MMA under P = 0.  Per key lane l of tile i: blk = sIds[32 i + l // 4]
+(or the tail id / -1 by the SELECT), key_abs = 4 blk + l % 4, valid = (blk >= 0) & (key_abs <= pos) & (key_abs < eff_seqlen_kv_b);
 s[l, j] = valid ? s_raw * scale_log2 : -inf for the 16 columns -- the open block's future rows hold REAL keys of other
 tokens, so this mask is mandatory (TMA-OOB zero-fill does not do its job).
+
+THD ARM (CFG.THD_VARLEN; the config forces SEQ_KV_LENS_PRESENT): the operands are PACKED -- Q / O [1, T_q, H, D], K / V
+[1, T_kv, H_kv, D], block_ids [T_q, BLOCK_TOPK] with the block ids RELATIVE TO THE SEQUENCE (block j of sequence b = its
+tokens [4 j, 4 j + 4), i.e. packed rows cu_k[b] + 4 j .. + 3), LSE [1, H, T_q] -- and ``seq_kv_lens`` is the int32 METADATA
+workspace of THD_META_WORDS(B) = 4 B + 4 words the host launches the shared setup kernel (``thd_helpers``) to fill from the
+caller's lengths (per-sequence [B], or cumulative [B + 1] per the lens-form bits), BEFORE the main launch on the same stream:
+
+    [0 .. B-1] = seq_kv_lens   [B .. 2B] = cu_q   [2B+1 .. 3B+1] = cu_k   [3B+2 .. 4B+1] = remap (unread here)
+    [4B+2]     = live = T_live x H_kv, T_live = cu_q[B]   (one unit per packed Q token per KV head)
+    [4B+3]     = ctr  = the persistent claim counter, seeded with the grid size
+
+so eff_seqlen_kv_b = meta[b] is read by the SAME SEQ_KV_LENS_PRESENT path as a dense per-batch length.  The scheduler takes
+the persistent form (``scheduler_warp_loop_persistent``: a unit id from the counter against ``live``, published as the payload
+word (uid, 0, valid, 0) through local SMEM + one elected arrive -- barrier row 13 keeps init ONE_LANE); the grid is
+occupancy-sized (one CTA per SM, at most one per unit), CTA c takes unit c first, and a CTA at or past ``live`` EXITS at entry
+before any mbarrier init, TMEM allocation or credit.  ``_decode_item`` turns a unit id into the item in EVERY role: head =
+uid // T_live, tok_packed = uid % T_live (the token runs fastest: concurrent units are adjacent tokens of one KV head, whose
+lists overlap in L2), the sequence b by a binary search over cu_q (an empty sequence can never hold a token), pos = tok_packed
+- cu_q[b], eff_seqlen_q_b = cu_q[b + 1] - cu_q[b], item_row = tok_packed (the block_ids / block_lens row and the Q / O / LSE
+token coordinate, batch coordinate 0), kv_row_base = cu_k[b].  No per-sequence descriptor exists: the Q map and the gather maps
+span the packed CAPACITIES (T_q / T_kv rows, each >= 1 by the adapter's contract -- a zero extent is an INVALID map) and every
+coordinate stays inside the live totals by construction (tok_packed < T_live; a key past the sequence's length takes row -1).
+Degenerate THD rows: a sequence with Q tokens and S_kv_b = 0 -> every one of its items is dead (one -1 tile; O = 0 / LSE = -inf
+STORED); S_q_b = 0 -> no unit (nothing stored); S_q_b > S_kv_b -> n_vis = min(pos + 1, S_kv_b) (the tail follows the visible
+range); the capacity tail past cu_q[B] is never written and the K / V rows past cu_k[B] are never read; B = 1 packed is the
+same function as dense B = 1, S = T (bitwise: the same gathers in the same order, only the item-to-CTA assignment differs).
+The missed-coordinate signature of a THD port (a dense coordinate on a load: LSE exactly log(S_kv_b), constant across a
+sequence) is excluded by construction -- the three load sites (the ids bulk copy, the Q box, the gather rows) take item_row /
+(out_tok, out_batch) / kv_row_base from ``_decode_item`` and nothing else.
 
 SMEM TABLE (declaration order = address order; descriptor-read operands first so every MMA operand starts below 256 KiB,
 lane-only buffers last so no alignment padding is spent; 1024-B alignment modelled by the config validator)
@@ -160,7 +191,7 @@ lane-only buffers last so no alignment padding is spent; 1024-B alignment modell
                                                                 MN-major A of BMM2 (V^T: LBO 16 KiB between d atoms, SBO 1 KiB)
                                                                                                  n/a          SW128 -- both descriptors read it; the gather
                                                                                                               map writes under the same SW128                24,576; sKV[2] at 155,648 = 152 KiB
-    sIds[2]          4,224    warp 13, ONE cp.async.bulk of IDS_TX_BYTES from block_ids[row]; no STS (slot = IDS_TX_BYTES + 64 B reserve, unread)
+    sIds[2]          4,224    warp 13, ONE cp.async.bulk of IDS_TX_BYTES from block_ids[item_row]; no STS (slot = IDS_TX_BYTES + 64 B reserve, unread)
                                                                 gather warps: ONE uniform LDS.128 of blocks 32 i + 4 w .. + 3; softmax lanes: LDS.32 of
                                                                 block 32 i + lane // 4 (4 adjacent lanes share a word); both clamped into the slot
                                                                                                  4 B          none -- no descriptor reads it and 32 lanes x 4 B
@@ -210,10 +241,12 @@ key" (blk >= 0), bytes still fetched; a block id past the sequence -> key_abs < 
 tensor; a block violating block-causality -> key_abs <= pos (a future block contributes nothing; the open block listed inside
 the count duplicates the tail); duplicates -> counted twice (contract); S_kv = 0 -> dead (one
 tile, no host read); padded Q rows -> dead, no store; B x H > 1 with n_tiles = 1 -> carried states; block_lens out of range
--> clamped on device; B >= 2 / the slab stride -> the ROW coordinate carries b x S, the COLUMN coordinate the head and the
-column offset; one CTA / one item -> cga1 init counts; a paged block whose page is -1 / past the table -> row -1 (zero rows,
-the keys masked by the length); page_size % 4 != 0, top_k outside [4, 512] or % 4 != 0, G > 16 -> typed declines at
-config / check_support.  The denominator floor (1e-30) sits inside the reciprocal and the log only and
+-> clamped on device; B >= 2 / the slab stride -> the ROW coordinate carries b x S (cu_k[b] under THD), the COLUMN
+coordinate the head and the column offset; one CTA / one item -> cga1 init counts; THD: S_kv_b = 0 with Q tokens -> dead items
+stored, S_q_b = 0 -> no unit, the packed capacity tails untouched, a CTA past the live total exits at entry; a paged block whose
+page is -1 / past the table -> row -1 (zero rows, the keys masked by the length); THD x paged -> a typed decline at config /
+check_support (the sequence's row offset composes with a dense tensor only); page_size % 4 != 0, top_k outside [4, 512] or
+% 4 != 0, G > 16 -> typed declines at config / check_support.  The denominator floor (1e-30) sits inside the reciprocal and the log only and
 is always followed by the row_dead SELECT, so neither LSE nor O ever carries it.
 """
 
@@ -264,9 +297,14 @@ from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.tma import TMA_L2_EVICT_LAST, bulk_copy, opaque_i64, tma_gather4, tma_load_tile
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
-from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload, read_tile_id_arrive, scheduler_warp_loop
+from cudnn.frost.tile_dsl.scheduler import Sched, read_clc_payload, read_tile_id_arrive, scheduler_warp_loop, scheduler_warp_loop_persistent
+from cudnn.frost.tile_dsl.thd import THD_CTR_OFF, THD_CU_Q_TOTAL_OFF, THD_LIVE_OFF, THD_META_WORDS, THD_SETUP_THREADS, exit_if_dead_thd_cluster
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16
 from cudnn.sdpa.fwd.kernels._common_blackwell import _bshd, _vec, row_max_for_exp2
+
+# The THD metadata setup launch (per-sequence lengths -> [seq_kv_lens | cu_q | cu_k | remap | live | ctr]) is the shared one of
+# the dense forwards: a second copy of the metadata LAYOUT would be a silent-wrong-answer waiting to happen (tile_dsl/thd.py).
+from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_kernel as _build_thd_meta_kernel
 
 if CFG.DTYPE_QKV == 2:
     STORAGE_DTYPE = cutlass.BFloat16
@@ -415,31 +453,31 @@ def _select_f32(cond, a, b):
 
 
 @cute.jit
-def _item_bounds(tok, batch, block_lens_tensor: Optional[cute.Tensor], seq_kv_lens_tensor, seqlen_q, seqlen_kv):
-    """THE ONE HELPER (header): the item's position, the entries read from its list, the open tail block, the dead flag and
-    the tile count -- computed by EVERY role that loops over tiles from the SAME inputs, nothing staged through SMEM.
+def _item_bounds(pos, batch, item_row, eff_seqlen_q, block_lens_tensor: Optional[cute.Tensor], seq_kv_lens_tensor, seqlen_kv):
+    """THE ONE HELPER (header): the entries read from the item's list, the open tail block, the dead flag and the tile count
+    -- computed by EVERY role that loops over tiles from the SAME inputs (the item ``_decode_item`` handed it: the
+    sequence-relative position ``pos``, the batch / sequence, the flat ``block_ids`` / ``block_lens`` row ``item_row`` and the
+    sequence's Q length ``eff_seqlen_q``), nothing staged through SMEM.
 
-    pos = the token's position (top-left causal; the bottom-right arm is not carried yet); eff_seqlen_kv = seq_kv_lens[b]
-    under SEQ_KV_LENS_PRESENT else the dense extent; n_vis = clamp(min(pos + 1, eff_seqlen_kv), 0): the visible range.
-    n_sel_default = min(BLOCK_TOPK, floor((pos + 1) / BLOCK_SIZE)); count = clamp(block_lens[row], 0, n_sel_default) when the
-    pointer is given (a device min / max, never a host read, never a fault), else n_sel_default.  The open tail block is
+    pos = the token's position within its sequence (top-left causal; the bottom-right arm is not carried yet);
+    eff_seqlen_kv = seq_kv_lens[b] under SEQ_KV_LENS_PRESENT (the THD metadata's first B words are exactly that) else the
+    dense extent; n_vis = clamp(min(pos + 1, eff_seqlen_kv), 0): the visible range.
+    n_sel_default = min(BLOCK_TOPK, floor((pos + 1) / BLOCK_SIZE)); count = clamp(block_lens[item_row], 0, n_sel_default) when
+    the pointer is given (a device min / max, never a host read, never a fault), else n_sel_default.  The open tail block is
     b_open = floor(n_vis / BLOCK_SIZE) when n_vis % BLOCK_SIZE != 0 (the tail of the VISIBLE range, so a padded sequence
     shorter than the position keeps its own tail); the per-lane mask removes its rows past pos / past the length.
     dead = (pos < 0) | (pos >= eff_seqlen_q) | (eff_seqlen_kv == 0) | (count + has_open == 0).
     n_tiles = max(1, ceil((count + has_open) / BLOCKS_PER_TILE)) -- CLAMPED >= 1: a dead item runs ONE tile of -1 rows.
     """
-    pos = tok
     eff_seqlen_kv = seqlen_kv
     if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
         eff_seqlen_kv = cutlass.Int32(cutlass.make_array_view(seq_kv_lens_tensor)[batch])
-    eff_seqlen_q = seqlen_q
     zero = cutlass.Int32(0)
     n_vis = cute.math.max(cute.math.min(pos + cutlass.Int32(1), eff_seqlen_kv), zero)
     n_sel_default = cute.math.min(cutlass.Int32(BLOCK_TOPK), cute.math.max(pos + cutlass.Int32(1), zero) // cutlass.Int32(BLOCK_SIZE))
     count = n_sel_default
     if cutlass.const_expr(block_lens_tensor is not None):
-        row = batch * seqlen_q + tok
-        given = cutlass.Int32(cutlass.make_array_view(block_lens_tensor)[row])
+        given = cutlass.Int32(cutlass.make_array_view(block_lens_tensor)[item_row])
         count = cute.math.min(cute.math.max(given, zero), n_sel_default)
     b_open = n_vis // cutlass.Int32(BLOCK_SIZE)
     has_open = zero
@@ -462,34 +500,85 @@ def _block_id_at(idx, loaded, count, has_open, b_open, dead):
 
 
 @cute.jit
-def _decode_payload(t0, t1):
-    """CLC response -> (token, KV head, batch): the grid is (S_q, H_kv, B), the response packs ctaid.y | ctaid.z << 16."""
-    tok = cute.arch.make_warp_uniform(t0)
-    head = cute.arch.make_warp_uniform(t1 & cutlass.Int32(0xFFFF))
-    batch = cute.arch.make_warp_uniform((t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF))
-    return tok, head, batch
+def _thd_find_batch(meta, n_batch, tok_packed):
+    """The sequence holding packed Q token ``tok_packed``: the LAST ``b`` with ``cu_q[b] <= tok_packed`` -- a binary search over
+    the ``B + 1`` Q prefix sums at ``meta[B .. 2B]`` (an empty sequence has ``cu_q[b] == cu_q[b + 1]`` and can never hold the
+    token, so it is stepped over).  Loop-carried ``lo`` / ``hi`` as SELECTs: ceil(log2(B + 1)) iterations, one LDG each."""
+    cuq0 = n_batch
+    lo = cutlass.Int32(0)
+    hi = n_batch
+    while hi - lo > cutlass.Int32(1):
+        mid = (lo + hi) // cutlass.Int32(2)
+        take = cutlass.Int32(meta[cuq0 + mid]) <= tok_packed
+        lo = _select_i32(take, mid, lo)
+        hi = _select_i32(take, hi, mid)
+    return lo
+
+
+@cute.jit
+def _decode_item(t0, t1, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv):
+    """ONE decode of a work item for EVERY role and EVERY item (the CTA's first item from its grid position, every later one
+    from the scheduler payload) -> ``(pos, head, batch, item_row, kv_row_base, eff_seqlen_q, out_tok, out_batch)``:
+
+    * BSHD (the CLC form): the grid is (S_q, H_kv, B) and the payload packs ``ctaid.x`` / ``ctaid.y | ctaid.z << 16``;
+      ``pos = tok``, ``item_row = batch x S_q + tok`` (the flat ``block_ids`` / ``block_lens`` row), ``kv_row_base =
+      batch x S_kv`` (the gather map's rows are the tokens of every batch), the Q / O / LSE coordinates are ``(tok, batch)``.
+    * THD (the persistent claim-counter form, CFG.THD_VARLEN): the payload is the unit id ``uid`` in ``[0, T_live x H_kv)``
+      with ``T_live = cu_q[B]`` (the metadata's device value): ``head = uid // T_live``, ``tok_packed = uid % T_live`` (the token
+      runs fastest, so adjacent units -- adjacent tokens of one KV head, whose lists overlap -- gather concurrently), the
+      sequence by ``_thd_find_batch``, ``pos = tok_packed - cu_q[b]`` (sequence-relative: the list's block ids are the
+      sequence's own), ``item_row = tok_packed``, ``kv_row_base = cu_k[b]`` (the packed K / V rows of the sequence), the Q / O /
+      LSE coordinates ``(tok_packed, 0)`` on the ``[1, T, H, D]`` operands; ``eff_seqlen_q = cu_q[b + 1] - cu_q[b]``.
+    """
+    if cutlass.const_expr(CFG.THD_VARLEN == 1):
+        meta = cutlass.make_array_view(seq_kv_lens_tensor)
+        uid = cute.arch.make_warp_uniform(t0)
+        t_live = cutlass.Int32(meta[THD_CU_Q_TOTAL_OFF(n_batch)])
+        head = cute.arch.make_warp_uniform(uid // t_live)
+        tok_packed = cute.arch.make_warp_uniform(uid - head * t_live)
+        batch = cute.arch.make_warp_uniform(_thd_find_batch(meta, n_batch, tok_packed))
+        cu_q_b = cutlass.Int32(meta[n_batch + batch])
+        pos = tok_packed - cu_q_b
+        eff_seqlen_q = cutlass.Int32(meta[n_batch + batch + cutlass.Int32(1)]) - cu_q_b
+        item_row = tok_packed
+        kv_row_base = cutlass.Int32(meta[cutlass.Int32(2) * n_batch + cutlass.Int32(1) + batch])
+        out_tok = tok_packed
+        out_batch = cutlass.Int32(0)
+    else:
+        pos = cute.arch.make_warp_uniform(t0)
+        head = cute.arch.make_warp_uniform(t1 & cutlass.Int32(0xFFFF))
+        batch = cute.arch.make_warp_uniform((t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF))
+        eff_seqlen_q = seqlen_q
+        item_row = batch * seqlen_q + pos
+        kv_row_base = batch * seqlen_kv
+        out_tok = pos
+        out_batch = batch
+    return pos, head, batch, item_row, kv_row_base, eff_seqlen_q, out_tok, out_batch
 
 
 # === TMA-LDG warp (13): Q^T and the block list of the NEXT item, one item ahead ===========================================
 
 
 @cute.jit
-def _tma_issue_item(tma_q, sQ, sIds_raw, bars, ids_base, tok, head, batch, seqlen_q, q_idx, q_phase, qe_idx, qe_phase, i_idx, i_phase, ie_idx, ie_phase):
-    """Issue the two loads of one work item: the ``BLOCK_TOPK x 4`` B list row by ONE bulk copy into ``sIds[slot]``
-    (barrier row 3; unconditional -- dead items included, the row exists for every token) and the ``Q^T`` box of the token's
-    G heads into ``sQ[slot]`` (row 1; ``Q_TX_BYTES`` = the BOX bytes).  Each slot is taken only after its ``_empty`` wait
+def _tma_issue_item(
+    tma_q, sQ, sIds_raw, bars, ids_base, item_row, head, out_tok, out_batch, q_idx, q_phase, qe_idx, qe_phase, i_idx, i_phase, ie_idx, ie_phase
+):
+    """Issue the two loads of one work item: the ``BLOCK_TOPK x 4`` B list row ``item_row`` by ONE bulk copy into
+    ``sIds[slot]`` (barrier row 3; unconditional -- dead items included, the row exists for every token) and the ``Q^T`` box
+    of the token's G heads at the Q coordinate ``(out_tok, out_batch)`` into ``sQ[slot]`` (row 1; ``Q_TX_BYTES`` = the BOX
+    bytes).  Both coordinates come from ``_decode_item`` (under THD the packed token row and batch 0: a dense coordinate that
+    survived the port would read batch 0's rows for every sequence).  Each slot is taken only after its ``_empty`` wait
     (rows 2 / 4, pre-armed states).  Returns the four advanced PipelineStates as (idx, phase) pairs."""
-    row = batch * seqlen_q + tok
     # --- the list (row 4 wait -> row 3 arm + copy)
     bars.mb_ids_empty[ie_idx].wait(ie_phase)
     bars.mb_ids_full[i_idx].arrive(n_bytes=IDS_TX_BYTES, pred=nvvm.elect_sync())
     bulk_copy(
-        sIds_raw.subview(i_idx * cutlass.Int32(IDS_SLOT_WORDS)), ids_base + row * cutlass.Int32(BLOCK_TOPK), IDS_TX_BYTES, bars.mb_ids_full[i_idx].smem_ptr
+        sIds_raw.subview(i_idx * cutlass.Int32(IDS_SLOT_WORDS)), ids_base + item_row * cutlass.Int32(BLOCK_TOPK), IDS_TX_BYTES, bars.mb_ids_full[i_idx].smem_ptr
     )
     # --- Q^T (row 2 wait -> row 1 arm + 4 subtiles)
     bars.mb_q_empty[qe_idx].wait(qe_phase)
     bars.mb_q_full[q_idx].arrive(n_bytes=Q_TX_BYTES, pred=nvvm.elect_sync())
-    tma_load_tile(sQ[q_idx], tma_q(cutlass.Int32(0), head * cutlass.Int32(G), tok, batch), bars.mb_q_full[q_idx].smem_ptr, cta_group=1)
+    tma_load_tile(sQ[q_idx], tma_q(cutlass.Int32(0), head * cutlass.Int32(G), out_tok, out_batch), bars.mb_q_full[q_idx].smem_ptr, cta_group=1)
     q_state = advance(PipelineState(idx=q_idx, phase=q_phase), STAGES_Q)
     qe_state = advance(PipelineState(idx=qe_idx, phase=qe_phase), STAGES_Q)
     i_state = advance(PipelineState(idx=i_idx, phase=i_phase), STAGES_IDS)
@@ -498,7 +587,7 @@ def _tma_issue_item(tma_q, sQ, sIds_raw, bars, ids_base, tok, head, batch, seqle
 
 
 @cute.jit
-def _tmaldg_warp_group(tma_q_desc, sQ, sIds_raw, bars, sched, block_ids_tensor, seqlen_q, tok0, head0, batch0):
+def _tmaldg_warp_group(tma_q_desc, sQ, sIds_raw, bars, sched, block_ids_tensor, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv, t0_init, t1_init):
     tma_q = GmemTileTma(tma_q_desc)
     ids_base = Pointer(block_ids_tensor.iterator.raw_ptr(), dtype=cutlass.Int32)
     # Producer states (slot to fill next) and the pre-armed consumer states of the matching _empty rings (P5b: Q(0), Q(1)
@@ -508,17 +597,18 @@ def _tmaldg_warp_group(tma_q_desc, sQ, sIds_raw, bars, sched, block_ids_tensor, 
     i_state = PipelineState.start(phase=0)
     ie_state = PipelineState.start(phase=1)
 
-    # Prologue: the first item's loads (its coordinates are this CTA's grid position).
+    # Prologue: the first item's loads (its coordinates are this CTA's grid position, decoded like every later payload).
+    _pos, head, _batch, item_row, _kvb, _sq, out_tok, out_batch = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     qi, qp, qei, qep, ii, ip, iei, iep = _tma_issue_item(
         tma_q,
         sQ,
         sIds_raw,
         bars,
         ids_base,
-        tok0,
-        head0,
-        batch0,
-        seqlen_q,
+        item_row,
+        head,
+        out_tok,
+        out_batch,
         q_state.idx,
         q_state.phase,
         qe_state.idx,
@@ -541,7 +631,7 @@ def _tmaldg_warp_group(tma_q_desc, sQ, sIds_raw, bars, sched, block_ids_tensor, 
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), 1)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         t0, t1, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
-        tok, head, batch = _decode_payload(t0, t1)
+        _pos, head, _batch, item_row, _kvb, _sq, out_tok, out_batch = _decode_item(t0, t1, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
         is_valid = cute.arch.make_warp_uniform(nxt_v)
         sched_state = advance(sched_state, SCHEDULER_STAGES)
         if is_valid > cutlass.Int32(0):
@@ -551,10 +641,10 @@ def _tmaldg_warp_group(tma_q_desc, sQ, sIds_raw, bars, sched, block_ids_tensor, 
                 sIds_raw,
                 bars,
                 ids_base,
-                tok,
+                item_row,
                 head,
-                batch,
-                seqlen_q,
+                out_tok,
+                out_batch,
                 q_state.idx,
                 q_state.phase,
                 qe_state.idx,
@@ -622,16 +712,18 @@ def _gather_block_pages(blks, block_table_tensor, batch, max_pages, eff_seqlen_k
 
 
 @cute.jit
-def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, batch_rows, rows_per_page, head_rows, eff_seqlen_kv, col_base, hint):
+def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, kv_row_base, rows_per_page, head_rows, eff_seqlen_kv, col_base, hint):
     """ONE warp's share of one K or V stage: BLOCKS_PER_WARP blocks x GATHER_BOXES column boxes = 16 ``tma_gather4`` from
     the ELECTED lane (the caller elects).  Block ``q`` of this warp = quad ``BLOCKS_PER_WARP w + q`` of the tile, landing at
     ``box * 16 KiB + quad * 512 B`` inside the stage -- a 512-B-aligned quad in a 1024-B-aligned sub-box, so the swizzle the
     hardware applies equals a tiled load's (the tile then reads under the dense descriptors).  Row coordinates carry the
-    batch term (``batch x S_kv``, the 2-D map's rows are tokens of every batch) on the dense arm, and on the PAGED arm the
+    item's ``kv_row_base`` (``batch x S_kv`` on the dense map whose rows are the tokens of every batch; ``cu_k[b]`` under THD,
+    the sequence's first packed K / V row -- the block ids are the sequence's own) on the dense arm, and on the PAGED arm the
     pool row ``page x rows_per_page + head_rows + (4 blk) % PAGE_SIZE`` (``pages`` from ``_gather_block_pages``; ``head_rows``
-    = ``head x rows_per_head``, 0 for an NHD pool whose head lives in the column); a ``-1`` block (or page), a block past
-    the batch's length or the straddling rows of its last block take row ``-1`` -> TMA zero-fills and still credits the
-    bytes, so no foreign batch's / sequence's row (or its NaN) ever reaches an MMA under P = 0."""
+    = ``head x rows_per_head``, 0 for an NHD pool whose head lives in the column; ``kv_row_base`` is unread there -- THD x
+    paged is a typed decline); a ``-1`` block (or page), a block past the sequence's length or the straddling rows of its
+    last block take row ``-1`` -> TMA zero-fills and still credits the bytes, so no foreign batch's / sequence's row (or its
+    NaN) ever reaches an MMA under P = 0."""
     stage_off = stage_idx * cutlass.Int32(kvBufferElems)
     quad0 = w * cutlass.Int32(BLOCKS_PER_WARP)
     for q in cutlass.range_constexpr(BLOCKS_PER_WARP):
@@ -643,7 +735,7 @@ def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, batch_rows, row
             base = page * rows_per_page + head_rows + in_page
             live = page >= cutlass.Int32(0)
         else:
-            base = batch_rows + key0
+            base = kv_row_base + key0
             live = blk >= cutlass.Int32(0)
         rows = []
         for r in cutlass.range_constexpr(BLOCK_SIZE):
@@ -679,9 +771,9 @@ def _gather_warp_group(
     k_head_stride,
     v_head_stride,
     w,
-    tok0,
-    head0,
-    batch0,
+    n_batch,
+    t0_init,
+    t1_init,
     block_table_tensor: Optional[cute.Tensor] = None,
     max_pages=None,
     k_rows_per_page=None,
@@ -695,13 +787,14 @@ def _gather_warp_group(
     # CARRIED across items (never recomputed from a per-item tile index -- barrier rows 5 / 6).
     kv_state = PipelineState.start(phase=1)
     ids_state = PipelineState.start(phase=0)
-    tok, head, batch = tok0, head0, batch0
+    pos, head, batch, item_row, kv_row_base, eff_seqlen_q, _ot, _ob = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
     while is_valid > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), 1)
-        pos, count, has_open, b_open, dead, n_tiles, eff_seqlen_kv = _item_bounds(tok, batch, block_lens_tensor, seq_kv_lens_tensor, seqlen_q, seqlen_kv)
-        batch_rows = batch * seqlen_kv
+        pos, count, has_open, b_open, dead, n_tiles, eff_seqlen_kv = _item_bounds(
+            pos, batch, item_row, eff_seqlen_q, block_lens_tensor, seq_kv_lens_tensor, seqlen_kv
+        )
         col_k = head * k_head_stride
         col_v = head * v_head_stride
         # PAGED arm: the per-item row terms of the head (0 for an NHD pool: its head lives in the column coordinate).
@@ -725,7 +818,7 @@ def _gather_warp_group(
                 w,
                 blks_cur,
                 pages_cur,
-                batch_rows,
+                kv_row_base,
                 k_rows_per_page,
                 head_rows_k,
                 eff_seqlen_kv,
@@ -750,7 +843,7 @@ def _gather_warp_group(
                         w,
                         blks_next,
                         pages_next,
-                        batch_rows,
+                        kv_row_base,
                         k_rows_per_page,
                         head_rows_k,
                         eff_seqlen_kv,
@@ -769,7 +862,7 @@ def _gather_warp_group(
                     w,
                     blks_cur,
                     pages_cur,
-                    batch_rows,
+                    kv_row_base,
                     v_rows_per_page,
                     head_rows_v,
                     eff_seqlen_kv,
@@ -788,7 +881,7 @@ def _gather_warp_group(
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         t0, t1, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
-        tok, head, batch = _decode_payload(t0, t1)
+        pos, head, batch, item_row, kv_row_base, eff_seqlen_q, _ot, _ob = _decode_item(t0, t1, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
         is_valid = cute.arch.make_warp_uniform(nxt_v)
         sched_state = advance(sched_state, SCHEDULER_STAGES)
 
@@ -802,7 +895,7 @@ def _gather_warp_group(
 
 
 @cute.jit
-def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tensor, seq_kv_lens_tensor, seqlen_q, seqlen_kv, tok0, head0, batch0):
+def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tensor, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv, t0_init, t1_init):
     tmem_alloc(tmem_ptr_i32, TMEM_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(_BAR_TMEM, BAR_TMEM_THREADS)
 
@@ -867,12 +960,14 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
     p_state = PipelineState.start(phase=0)
     bmm2_state = PipelineState.start(phase=0)
 
-    tok, head, batch = tok0, head0, batch0
+    pos, head, batch, item_row, _kvb, eff_seqlen_q, _ot, _ob = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
     while is_valid > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), 1)
-        pos, count, has_open, b_open, dead, n_tiles, eff_seqlen_kv = _item_bounds(tok, batch, block_lens_tensor, seq_kv_lens_tensor, seqlen_q, seqlen_kv)
+        pos, count, has_open, b_open, dead, n_tiles, eff_seqlen_kv = _item_bounds(
+            pos, batch, item_row, eff_seqlen_q, block_lens_tensor, seq_kv_lens_tensor, seqlen_kv
+        )
 
         bars.mb_q_full[q_state.idx].wait(q_state.phase)
         desc_Q = sQ[q_state.idx].desc()
@@ -933,7 +1028,7 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         t0, t1, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
-        tok, head, batch = _decode_payload(t0, t1)
+        pos, head, batch, item_row, _kvb, eff_seqlen_q, _ot, _ob = _decode_item(t0, t1, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
         is_valid = cute.arch.make_warp_uniform(nxt_v)
         sched_state = advance(sched_state, SCHEDULER_STAGES)
 
@@ -970,11 +1065,11 @@ def _softmax_warp_group(
     lse_tensor: Optional[cute.Tensor],
     block_lens_tensor: Optional[cute.Tensor],
     seq_kv_lens_tensor,
+    n_batch,
     seqlen_q,
     seqlen_kv,
-    tok0,
-    head0,
-    batch0,
+    t0_init,
+    t1_init,
     scale_log2: cutlass.Float32,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=BAR_TMEM_THREADS)
@@ -997,12 +1092,14 @@ def _softmax_warp_group(
     bmm2_state = PipelineState.start(phase=0)
     ids_state = PipelineState.start(phase=0)
 
-    tok, head, batch = tok0, head0, batch0
+    pos, head, batch, item_row, _kvb, eff_seqlen_q, out_tok, out_batch = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
     while is_valid > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), 1)
-        pos, count, has_open, b_open, dead, n_tiles, eff_seqlen_kv = _item_bounds(tok, batch, block_lens_tensor, seq_kv_lens_tensor, seqlen_q, seqlen_kv)
+        pos, count, has_open, b_open, dead, n_tiles, eff_seqlen_kv = _item_bounds(
+            pos, batch, item_row, eff_seqlen_q, block_lens_tensor, seq_kv_lens_tensor, seqlen_kv
+        )
         slot_base = ids_state.idx * cutlass.Int32(IDS_SLOT_WORDS)
         bars.mb_ids_full[ids_state.idx].wait(ids_state.phase)
 
@@ -1144,15 +1241,16 @@ def _softmax_warp_group(
             inv_cols.append(inv_j)
             dead_cols.append(row_dead)
 
-        # Stores: column j = query head (head * G + j) of token tok; the zero tail columns j >= G are never stored, and a
-        # padded Q row (pos past the sequence) stores nothing.
-        live_row = pos < seqlen_q
+        # Stores: column j = query head (head * G + j) of the item's token at its output coordinate (out_tok, out_batch) --
+        # the dense (tok, batch) or the packed (tok_packed, 0) of _decode_item; the zero tail columns j >= G are never stored,
+        # and a padded Q row (pos past the sequence's Q length) stores nothing.
+        live_row = pos < eff_seqlen_q
         head_base = head * cutlass.Int32(G)
         if cutlass.const_expr(lse_tensor is not None):
             lse_arr = cutlass.make_array_view(lse_tensor)
             for j in cutlass.range_constexpr(Q_BOX_ROWS):
                 if (lane == cutlass.Int32(j)) & live_row:
-                    lse_arr[batch, head_base + cutlass.Int32(j), tok] = lse_cols[j]
+                    lse_arr[out_batch, head_base + cutlass.Int32(j), out_tok] = lse_cols[j]
 
         # O[q, d] = O^T[d, q] / l[q]: the thread index is d (and d + 128).
         oo = cutlass.make_array_view(o_tensor)
@@ -1165,13 +1263,13 @@ def _softmax_warp_group(
                 if (d_idx < cutlass.Int32(D_V)) & live_row:
                     for j in cutlass.range_constexpr(Q_BOX_ROWS):
                         val = _select_f32(dead_cols[j], ZERO, cutlass.Float32(o_vals[j]) * inv_cols[j])
-                        o_row = oo[batch, tok, head_base + cutlass.Int32(j), :]
+                        o_row = oo[out_batch, out_tok, head_base + cutlass.Int32(j), :]
                         o_row[d_idx] = val.to(o_tensor.element_type)
 
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
         t0, t1, nxt_v = read_clc_payload(sched, sched_state.idx * cutlass.Int32(8))
-        tok, head, batch = _decode_payload(t0, t1)
+        pos, head, batch, item_row, _kvb, eff_seqlen_q, out_tok, out_batch = _decode_item(t0, t1, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
         is_valid = cute.arch.make_warp_uniform(nxt_v)
         sched_state = advance(sched_state, SCHEDULER_STAGES)
 
@@ -1202,14 +1300,23 @@ def _kernel(
     k_rows_per_head: cutlass.Int32,
     v_rows_per_page: cutlass.Int32,
     v_rows_per_head: cutlass.Int32,
+    n_batch: cutlass.Int32,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
-    # The grid IS the work list: x = query token, y = KV head, z = batch; a CTA's first item is its own position, later
-    # ones come from the CLC scheduler's cancelled CTAs (decoded by _decode_payload with the same (x, y, z) meaning).
+    # BSHD: the grid IS the work list -- x = query token, y = KV head, z = batch; a CTA's first item is its own position, later
+    # ones come from the CLC scheduler's cancelled CTAs.  THD: the grid is occupancy-sized (x = the first unit id, y = z = 0)
+    # and later units come from the device claim counter.  Both forms hand _decode_item the same two payload words.
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+    t0_init = bidx
+    t1_init = bidy | (bidz << cutlass.Int32(16))
+    if cutlass.const_expr(CFG.THD_VARLEN == 1):
+        # A CTA whose first unit id is at or past the live total (meta[4B + 2], the setup launch's device value) has no work:
+        # every thread exits HERE, before any mbarrier init, TMEM allocation or scheduler credit (the occupancy-sized grid may
+        # exceed the packed work; the counter then hands the resident CTAs nothing past the total either).
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, 1)
 
     # SMEM in the header table's order: the descriptor-read operands first (1024-B aligned), the register-addressed buffers last.
     sQ_raw = cutlass.Array(STORAGE_DTYPE, STAGES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
@@ -1337,11 +1444,11 @@ def _kernel(
             lse_tensor=lse_tensor,
             block_lens_tensor=block_lens_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            n_batch=n_batch,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
-            tok0=bidx,
-            head0=bidy,
-            batch0=bidz,
+            t0_init=t0_init,
+            t1_init=t1_init,
             scale_log2=scale_softmax_log2,
         )
     elif warp_idx < GATHER_WARP_BASE + GATHER_WARPS:
@@ -1359,9 +1466,9 @@ def _kernel(
             k_head_stride=k_head_stride,
             v_head_stride=v_head_stride,
             w=warp_idx - cutlass.Int32(GATHER_WARP_BASE),
-            tok0=bidx,
-            head0=bidy,
-            batch0=bidz,
+            n_batch=n_batch,
+            t0_init=t0_init,
+            t1_init=t1_init,
             block_table_tensor=block_table_tensor,
             max_pages=max_pages,
             k_rows_per_page=k_rows_per_page,
@@ -1380,11 +1487,11 @@ def _kernel(
             sched=sched,
             block_lens_tensor=block_lens_tensor,
             seq_kv_lens_tensor=seq_kv_lens_tensor,
+            n_batch=n_batch,
             seqlen_q=seqlen_q,
             seqlen_kv=seqlen_kv,
-            tok0=bidx,
-            head0=bidy,
-            batch0=bidz,
+            t0_init=t0_init,
+            t1_init=t1_init,
         )
     elif warp_idx == TMALDG_WARP_ID:
         nvvm.prefetch_tensormap(tma_q_desc.get_ptr())
@@ -1397,15 +1504,23 @@ def _kernel(
             bars=bars,
             sched=sched,
             block_ids_tensor=block_ids_tensor,
+            seq_kv_lens_tensor=seq_kv_lens_tensor,
+            n_batch=n_batch,
             seqlen_q=seqlen_q,
-            tok0=bidx,
-            head0=bidy,
-            batch0=bidz,
+            seqlen_kv=seqlen_kv,
+            t0_init=t0_init,
+            t1_init=t1_init,
         )
     elif warp_idx == SCHED_WARP_ID:
         cta_id_x = cutlass.Int32(0)
         is_cga_first_cta = cta_id_x == cutlass.Int32(0)
-        scheduler_warp_loop(sched, SCHEDULER_STAGES, is_cga_first_cta, 1)
+        if cutlass.const_expr(CFG.THD_VARLEN == 1):
+            # THD: the persistent form -- units claimed from the device counter at meta[4B + 3] against the live total at
+            # meta[4B + 2] (both written by the setup launch); the payload is (uid, 0, valid, 0) published through local SMEM
+            # and one elected arrive (barrier row 13, init ONE_LANE in both forms).
+            scheduler_warp_loop_persistent(sched, SCHEDULER_STAGES, is_cga_first_cta, seq_kv_lens_tensor, THD_CTR_OFF(n_batch), THD_LIVE_OFF(n_batch), 1, 1)
+        else:
+            scheduler_warp_loop(sched, SCHEDULER_STAGES, is_cga_first_cta, 1)
     # else: the spare warp (15) exits.
 
 
@@ -1434,6 +1549,10 @@ def _host(
     scale_softmax_log2: cutlass.Float32,
     block_table_ptr: Optional[cute.Pointer],
     paged_geom: Tuple[int, int, int, int, int, int],
+    thd_q_lens_ptr: Optional[cute.Pointer] = None,
+    thd_kv_lens_ptr: Optional[cute.Pointer] = None,
+    thd_lens_form: Optional[cutlass.Int32] = None,
+    n_ctas: Optional[cutlass.Int32] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the explicit pointer ABI and launch the sparse core.
@@ -1449,20 +1568,30 @@ def _host(
     (num_pages, max_pages, k rows_per_page, k rows_per_head, v rows_per_page, v rows_per_head); the gather maps' rows are
     the pool's token rows (num_pages x rows_per_page); SKV is the table's capacity (max_pages x PAGE_SIZE), the visible range
     comes from ``seq_kv_lens``.  On the dense arm ``block_table_ptr`` is None and ``paged_geom`` is unread.
+
+    THD (CFG.THD_VARLEN): ``B`` is the number of SEQUENCES and ``SQ`` / ``SKV`` the packed CAPACITIES of the ``[1, T, H, D]``
+    operands (batch extent 1; the live totals are device values); ``seq_kv_lens_ptr`` -> the int32 metadata workspace of
+    ``THD_META_WORDS(B)`` words that the setup launch fills from ``thd_q_lens_ptr`` / ``thd_kv_lens_ptr`` (per-sequence lengths
+    ``[B]``, or cumulative ``[B + 1]`` per ``thd_lens_form`` bit 0 / 1): ``[seq_kv_lens(B) | cu_q(B + 1) | cu_k(B + 1) | remap(B) |
+    live | ctr]``; ``block_ids_ptr`` -> int32 [SQ, BLOCK_TOPK] (one row per packed token); ``n_ctas`` the occupancy-sized grid
+    (one CTA per SM, at most one per unit) that also seeds the claim counter.  THD x paged is never rendered (a validator
+    predicate): under THD ``n_q_batches`` is 1 and the gather maps span the packed capacity ``SKV``.
     """
     B, QH, KH, SQ, SKV = problem_size
     num_pages, max_pages, k_rows_per_page, k_rows_per_head, v_rows_per_page, v_rows_per_head = paged_geom
-    q_tensor = _bshd(q_ptr, B, SQ, QH, TILE_K, q_strides, False)
-    o_tensor = _bshd(o_ptr, B, SQ, QH, TILE_O, o_strides, False)
+    thd = bool(CFG.THD_VARLEN)
+    n_q_batches = 1 if thd else B  # a packed operand has batch extent 1
+    q_tensor = _bshd(q_ptr, B, SQ, QH, TILE_K, q_strides, thd)
+    o_tensor = _bshd(o_ptr, B, SQ, QH, TILE_O, o_strides, thd)
     lse_tensor = None
     if cutlass.const_expr(lse_ptr is not None):
         l0, l1, l2 = lse_strides
-        lse_tensor = cute.make_tensor(lse_ptr, cute.make_layout((B, QH, SQ), stride=(l0, l1, l2)))
-    block_ids_tensor = _vec(block_ids_ptr, B * SQ * BLOCK_TOPK)
+        lse_tensor = cute.make_tensor(lse_ptr, cute.make_layout((n_q_batches, QH, SQ), stride=(l0, l1, l2)))
+    block_ids_tensor = _vec(block_ids_ptr, n_q_batches * SQ * BLOCK_TOPK)
     block_lens_tensor = None
     if cutlass.const_expr(block_lens_ptr is not None):
-        block_lens_tensor = _vec(block_lens_ptr, B * SQ)
-    seq_kv_lens_tensor = _vec(seq_kv_lens_ptr, B)
+        block_lens_tensor = _vec(block_lens_ptr, n_q_batches * SQ)
+    seq_kv_lens_tensor = _vec(seq_kv_lens_ptr, THD_META_WORDS(B) if thd else B)
     block_table_tensor = None
     if cutlass.const_expr(block_table_ptr is not None):
         block_table_tensor = cute.make_tensor(block_table_ptr, cute.make_layout((B, max_pages), stride=(max_pages, 1)))
@@ -1490,7 +1619,7 @@ def _host(
     # the ROW coordinate (batch x SKV + 4 blk + r; page x rows_per_page + head x rows_per_head + (4 blk) % PAGE_SIZE + r).
     def _gather_desc(ptr, strides, rows_per_page):
         _bs, ss, hs = strides
-        rows = cutlass.Int32(num_pages) * cutlass.Int32(rows_per_page) if cutlass.const_expr(PAGED_KV) else cutlass.Int32(B) * cutlass.Int32(SKV)
+        rows = cutlass.Int32(num_pages) * cutlass.Int32(rows_per_page) if cutlass.const_expr(PAGED_KV) else cutlass.Int32(n_q_batches) * cutlass.Int32(SKV)
         inner = (cutlass.Int32(KH) - cutlass.Int32(1)) * cutlass.Int32(hs) + cutlass.Int32(TILE_K)
         return tmap.create_tensor_map_tiled(
             global_address=ptr.toint(),
@@ -1505,9 +1634,28 @@ def _host(
     tma_k_desc = _gather_desc(k_ptr, k_strides, k_rows_per_page)
     tma_v_desc = _gather_desc(v_ptr, v_strides, v_rows_per_page)
 
-    # The grid is the work list: one CTA per (query token, KV head, batch); the CLC scheduler hands cancelled CTAs to the
-    # resident ones (one CTA per SM through the 221 KiB SMEM footprint).
-    grid_shape = (SQ, KH, B)
+    if cutlass.const_expr(CFG.THD_VARLEN):
+        # THD: the setup launch writes the metadata (lengths -> prefix sums, the live unit total T_live x KH with one unit per
+        # packed token per KV head, the claim counter seeded at the grid size) into the workspace the main kernel reads as its
+        # ``seq_kv_lens`` tensor; the grid is occupancy-sized (``n_ctas``), every CTA takes unit blockIdx.x first and then
+        # claims from the counter; a CTA past the live total exits at entry.
+        q_lens_t = _vec(thd_q_lens_ptr, B + 1)
+        kv_lens_t = _vec(thd_kv_lens_ptr, B + 1)
+        _build_thd_meta_kernel(
+            seq_kv_lens_tensor,
+            q_lens_t,
+            kv_lens_t,
+            thd_lens_form,
+            cutlass.Int32(B),
+            cutlass.Int32(KH),
+            cutlass.Int32(1),
+            n_ctas,
+        ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
+        grid_shape = (n_ctas, cutlass.Int32(1), cutlass.Int32(1))
+    else:
+        # The grid is the work list: one CTA per (query token, KV head, batch); the CLC scheduler hands cancelled CTAs to the
+        # resident ones (one CTA per SM through the 221 KiB SMEM footprint).
+        grid_shape = (SQ, KH, B)
     _kernel(
         tma_q_desc,
         tma_k_desc,
@@ -1528,6 +1676,7 @@ def _host(
         cutlass.Int32(k_rows_per_head),
         cutlass.Int32(v_rows_per_page),
         cutlass.Int32(v_rows_per_head),
+        cutlass.Int32(B),
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -1554,6 +1703,7 @@ def compile(  # noqa: A001
         return cute.runtime.make_ptr(dtype, 16, gmem, assumed_align=align)  # fake: type only
 
     i64_3 = (cutlass.Int64(0),) * 3  # stride slots: Int64 leaves, see _host
+    thd = bool(CFG.THD_VARLEN)
     return _compile_cached(
         _host,
         P(STORAGE_DTYPE),
@@ -1573,6 +1723,10 @@ def compile(  # noqa: A001
         cutlass.Float32(0.0),
         P(cutlass.Int32, 4) if PAGED_KV else None,
         (0, 0, 0, 0, 0, 0),
+        P(cutlass.Int32, 4) if thd else None,
+        P(cutlass.Int32, 4) if thd else None,
+        cutlass.Int32(0) if thd else None,
+        cutlass.Int32(0) if thd else None,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,

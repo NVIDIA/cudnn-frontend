@@ -222,6 +222,7 @@ def test_sparse_accepts_the_padding_and_stats_fields():
         (dict(softmax_f16=True), "other kernels' specializations"),
         (dict(sched_policy=1), "sched_policy must be NATURAL"),
         (dict(paged_kv=True, page_size=6, seq_kv_lens_present=True), "multiple of 4"),
+        (dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True), "THD x paged is not served"),  # both arms wired, never together
         (dict(seq_q_lens_present=True), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
         (dict(qsa_block_topk=2), "multiple of 4 in"),
         (dict(qsa_block_topk=516), "multiple of 4 in"),
@@ -268,6 +269,20 @@ def test_sparse_accepts_the_paged_arm(page_size, kv_lens_declared):
     assert (cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.SEQ_KV_LENS_PRESENT) == (1, page_size, 1)
     assert cfg.PAGE_SIZE % cfg.BLOCK_SIZE == 0
     assert dataclasses.replace(cfg, PAGED_KV=0, PAGE_SIZE=0) == dense, "the paged arm changes no other field of the record"
+    _validate_cfg_d256_sparse(cfg)
+
+
+@pytest.mark.parametrize("kv_lens_declared", [True, False], ids=["kv-lens-declared", "kv-lens-forced"])
+def test_sparse_accepts_the_thd_arm(kv_lens_declared):
+    """The thd_varlen arm's accept row (the wired arm; its decline row above skips): THD_VARLEN carried, SEQ_KV_LENS_PRESENT FORCED
+    to 1 whether or not the record declared it (the THD metadata's first B words ARE the per-sequence KV lengths, read by the same
+    path), and the dense record's SMEM / barrier geometry untouched (the arm changes the scheduler form and the item decode, no new
+    ring -- barrier row 13 keeps init ONE_LANE in both forms).  THD together with the paged arm is refused (the RED row below)."""
+    assert "thd_varlen" in SPARSE_D256_WIRED_ARMS
+    cfg, _ = make_cfg_d256_sparse(_sparse(thd_varlen=True, seq_kv_lens_present=kv_lens_declared))
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    assert (cfg.THD_VARLEN, cfg.SEQ_KV_LENS_PRESENT, cfg.PAGED_KV, cfg.PAGE_SIZE) == (1, 1, 0, 0)
+    assert dataclasses.replace(cfg, THD_VARLEN=0) == dense, "the THD arm changes no other field of the record"
     _validate_cfg_d256_sparse(cfg)
 
 
@@ -344,6 +359,7 @@ _RED_ROWS = [
     (dict(PAGE_SIZE=16), "PAGE_SIZE is 0 exactly when"),
     (dict(SPLIT_KV=0), "split_kv must be >= 1"),
     (dict(THD_VARLEN=1), "force SEQ_KV_LENS_PRESENT=1"),
+    (dict(THD_VARLEN=1, PAGED_KV=1, PAGE_SIZE=16, SEQ_KV_LENS_PRESENT=1), "THD x paged is not served"),  # both wired arms, never in one record
     (dict(SEQ_Q_LENS_PRESENT=1), "SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
     (dict(SCHEDULER_POLICY=1), "NATURAL in v1"),
 ]
