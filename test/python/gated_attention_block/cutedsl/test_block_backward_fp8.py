@@ -1805,8 +1805,10 @@ def test_fp8_thd_with_quant_is_served_at_declaration():
     backward is the dense stage list at ``B = 1, S = T`` with the SDPA stage's packed declaration over the fp8 row -- ``thd``
     passed through, the envelope ``(num_sequences, max_seq_len)``, ``external_delta=True`` with the adapter's PACKED head-major
     ``[1, H_q, ceil128(T)]`` delta shape, ``amax_dP`` requested, both packed totals at ``T`` -- read off the declared stage without
-    a compile.  Host-side, over placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32
-    ``saved.seq_lens``); the record's buffers are the packed suite's business (``test_block_thd_backward_fp8.py``)."""
+    a compile and without a device read (the declaration and every assertion run under ``set_sync_debug_mode("error")``: the
+    lengths tensor's presence is the fact, never its values).  Host-side, over placeholders shaped like a packed record
+    (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32 ``saved.seq_lens``); the record's buffers are the packed suite's business
+    (``test_block_thd_backward_fp8.py``)."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     t, dm = 256, _COMMON["d_model"]
     dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")
@@ -1814,16 +1816,21 @@ def test_fp8_thd_with_quant_is_served_at_declaration():
     lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
     z = torch.empty(0, device="cuda")
     saved = SavedForBackward(h=h8, gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths")
-    blk = _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=r.spec, thd=True, num_sequences=2, max_seq_len=256)
-    assert blk.thd and blk.quant is r.spec and (blk.batch, blk.seq_len) == (1, t) and (blk.num_sequences, blk.max_seq_len) == (2, 256)
-    st = blk._sdpa
-    assert type(st).__name__ == "_SdpaBwdFp8" and st.thd and (st.num_sequences, st.max_seq_len, st.cu_seqlens) == (2, 256, False)
-    impl = st._ensure_impl()
-    assert impl.thd is True and impl.external_delta is True and impl.seq_kv_lens_present is False and impl.amax_requested == frozenset({"amax_dP"})
-    assert (impl.max_total_seq_len_q, impl.max_total_seq_len_kv) == (t, t)
-    assert tuple(impl.external_delta_shape) == st.delta_shape == (1, r.geom.h_q, -(-t // 128) * 128), "the packed delta: the dense layout at B = 1, S = T"
-    assert tuple(int(x) for x in impl.stats_desc.shape) == (2, r.geom.h_q, 256, 1), "Stats declared over the envelope (B, H_q, S_max, 1)"
-    assert impl.q_desc.dtype == _E4M3 and impl.dq_desc.dtype == torch.bfloat16
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        blk = _declare_fp8_bwd(dy, saved, r.inp, r.geom, quant=r.spec, thd=True, num_sequences=2, max_seq_len=256)
+        assert blk.thd and blk.quant is r.spec and (blk.batch, blk.seq_len) == (1, t) and (blk.num_sequences, blk.max_seq_len) == (2, 256)
+        st = blk._sdpa
+        assert type(st).__name__ == "_SdpaBwdFp8" and st.thd and (st.num_sequences, st.max_seq_len, st.cu_seqlens) == (2, 256, False)
+        impl = st._ensure_impl()
+        assert impl.thd is True and impl.external_delta is True and impl.seq_kv_lens_present is False and impl.amax_requested == frozenset({"amax_dP"})
+        assert (impl.max_total_seq_len_q, impl.max_total_seq_len_kv) == (t, t)
+        assert tuple(impl.external_delta_shape) == st.delta_shape == (1, r.geom.h_q, -(-t // 128) * 128), "the packed delta: the dense layout at B = 1, S = T"
+        assert tuple(int(x) for x in impl.stats_desc.shape) == (2, r.geom.h_q, 256, 1), "Stats declared over the envelope (B, H_q, S_max, 1)"
+        assert impl.q_desc.dtype == _E4M3 and impl.dq_desc.dtype == torch.bfloat16
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
 
 
 @requires_cuda
