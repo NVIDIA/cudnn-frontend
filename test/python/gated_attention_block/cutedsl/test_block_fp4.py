@@ -1511,3 +1511,222 @@ def test_fp4_o_launch_count_is_nine_unfused_and_four_fused(fmt, fused):
     assert len(kernels) == len(blk._stages) == (4 if fused else 9), (len(kernels), kernels)
     assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
     assert not memsets, f"unexpected memset(s) on the execute path: {memsets}"
+
+
+# ===========================================================================
+# THE e2m1 W_qkvg ARM x THE fp4 O ON THE FULLY FUSED PIPELINE (config row 9 x row 10), THE MEASURED LAUNCH CENSUS, THE SHAPE SWEEP
+# ===========================================================================
+
+
+def _fp4w_o4_inputs(geom_kw, batch, seq_len, fmt):
+    """``_fp4w_inputs`` AND ``_fp4o_inputs`` at once: ``W_qkvg`` re-quantized to MXFP4 (packed E2M1 ``[N, K/2]`` viewed
+    ``float4_e2m1fn_x2`` with its E8M0 / 32 blob under the UNCHANGED key) and ``W_o`` to ``fmt``.  Returns
+    ``(inp, kern, orac, desc)``: ``kern`` is what the block gets, ``orac`` the same dict with the weight's values as e4m3
+    SHADOW codes (the oracle dequantizes exactly the bytes the GEMM reads; ``W_o`` it dequantizes through the fp4 blob itself)."""
+    inp = make_inputs(RefGeometry(**geom_kw), batch=batch, seq_len=seq_len, dtype=torch.bfloat16)
+    kern, desc = quantize_block_inputs_mxfp8(inp, o_fp4=fmt, w_qkvg_fp4=True)
+    assert kern["w_qkvg"].dtype == _FP4 and kern["w_o"].dtype == _FP4 and desc == dict(descale_w_o=1.0)
+    packed = kern["w_qkvg"].view(torch.uint8)
+    values = unpack_e2m1(packed)
+    shadow = values.to(E4M3)
+    assert torch.equal(shadow.float(), values), "E2M1 values are e4m3-exact by construction"
+    assert torch.equal(mx_dequant_rowwise_2d(shadow, kern["w_qkvg_sf"]), fp4_dequant_rowwise_2d(packed, kern["w_qkvg_sf"], "mxfp4"))
+    return inp, kern, dict(kern, w_qkvg=shadow), desc
+
+
+def _run_fp4w_o4_block(geom_kw, batch, seq_len, fmt, *, sentinel: bool = False, **blk_kw):
+    """Declare / check / compile / execute the block with BOTH fp4 modes (``w_qkvg_dtype=float4_e2m1fn_x2`` + ``o_fp4=fmt``);
+    return ``(out, oracle, bf16_ref, blk, kern, spec)``.  ``_run_fp4o_block`` with the e2m1 weight of ``_run_fp4w_block``."""
+    geom = GatedAttentionBlockGeometry(**geom_kw)
+    rg = mx_suite._ref_geom(geom)
+    fused = bool(blk_kw.get("fuse_gate")) and bool(blk_kw.get("fuse_norm_rope"))
+    inp, kern, orac, desc = _fp4w_o4_inputs(geom_kw, batch, seq_len, fmt)
+    spec = MxQuantSpec(**desc, o_fp4=fmt, w_qkvg_dtype=_FP4)
+    ref = gated_attention_block_mxfp8_reference(orac, rg, descale_w_o=1.0, scale_o=1.0, fused=fused, o_fp4=fmt)
+    bf16_ref = gated_attention_block_reference(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], rg).out
+    out = torch.empty(batch, seq_len, geom.d_model, device="cuda", dtype=torch.bfloat16)
+    if sentinel:
+        out.fill_(_SENTINEL)
+    blk = GatedAttentionBlockFwd(
+        kern["h"],
+        kern["w_qkvg"],
+        kern["w_q_norm"],
+        kern["w_k_norm"],
+        kern["cos"],
+        kern["sin"],
+        kern["w_o"],
+        out,
+        geom,
+        quant=spec,
+        sample_h_sf=kern["h_sf"],
+        sample_w_qkvg_sf=kern["w_qkvg_sf"],
+        sample_w_o_sf=kern["w_o_sf"],
+        **blk_kw,
+    )
+    blk.check_support()
+    blk.compile()
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    _execute_fp4o(blk, kern, out, ws)
+    torch.cuda.synchronize()
+    return out, ref, bf16_ref, blk, kern, spec
+
+
+@requires_rubin
+@requires_fp4
+@pytest.mark.parametrize("seq_len, causal", [(1000, True), (1024, False)])
+@pytest.mark.parametrize("fmt", _FMTS, ids=_FMT_IDS)
+def test_mxfp4_weight_with_fp4_o_fused_block_matches_the_fake_quant_oracle(fmt, seq_len, causal):
+    """The COMPOSITION of the two fp4 modes on the fully fused pipeline (4 launches): the fused fork's e2m1-B arm feeds the gated
+    MXFP8 SDPA's bf16-O arm, ``quantize_fp4_o`` and the fp4 x fp4 out projection.  The fake-quant oracle is fed the e4m3 shadow
+    of the e2m1 weight and dequantizes the fp4 ``W_o`` through its blob; sentinel clean, finite, ``cos > 0.99``, the FORMAT FLOOR
+    ``cos(kernel, bf16 ref) >= cos(oracle, bf16 ref) - 0.005`` and a bitwise second execute -- the bars of the two single-mode
+    fused cells.  B=1 at S=1000 (the fused path declines ``S % 128 != 0`` at B > 1), B=2 at S=1024."""
+    _skip_fused_if_twin_missing(True)
+    b = 1 if seq_len % 128 else 2
+    out, ref, bf16_ref, blk, kern, spec = _run_fp4w_o4_block({**_GEOM, "is_causal": causal}, b, seq_len, fmt, sentinel=True, **_FUSED)
+    assert spec.w_qkvg_fp4 and spec.o_fp4 is fmt and blk.mxfp8_fused and [s.name for s in blk._stages] == _FP4_O_FUSED_STAGES
+    assert blk._proj._plan.w_dtype == _FP4 and blk._proj._plan.params.weight_fp4 and blk._proj._plan.mxfp8
+    assert (
+        blk._out_proj._plan.block_scale
+        and blk._out_proj._plan.dtype == blk._out_proj._plan.w_dtype == _FP4
+        and blk._out_proj._plan.block_size == fmt.block_size
+    )
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    c = mx_suite._cos(out, ref)
+    rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
+    c_k, c_o = mx_suite._cos(out, bf16_ref), mx_suite._cos(ref, bf16_ref)
+    print(
+        f"\nmxfp4-weight + {fmt.name} O FUSED block B={b} S={seq_len} causal={causal}: cos(kernel, oracle)={c:.6f} max_rel={rel:.3e} "
+        f"| format floor cos(oracle, bf16)={c_o:.6f} cos(kernel, bf16)={c_k:.6f} | out_proj route={blk._out_proj._plan.route}"
+    )
+    assert c > 0.99, f"mxfp4-weight + {fmt.name} O fused block cos {c}"
+    assert c_k >= c_o - 0.005, f"the kernel sits below the fp4 format floor: cos(kernel, bf16)={c_k} < cos(oracle, bf16)={c_o} - 0.005"
+    out2 = torch.full_like(out, _SENTINEL)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    _execute_fp4o(blk, kern, out2, ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out2, out, rtol=0, atol=0)
+
+
+@requires_rubin
+@requires_fp4
+@pytest.mark.parametrize("o_fp4", [None, Fp4Format.NVFP4], ids=["w4_fused", "w4_nvfp4o_fused"])
+def test_mxfp4_weight_fused_launch_count_is_three_and_four_with_an_nvfp4_o(o_fp4):
+    """One CUDA kernel per stage and NO hidden launch on the fully fused fp4-weight pipeline: 3 (the e2m1-B arm IS the fused
+    projection launch -- no cast, no repack), 4 with an NVFP4 ``O`` (``quantize_fp4_o`` is the one launch the fp4 O adds), no
+    memset, no memcpy.  Profiled on the SECOND execute; typed skip where CUPTI records nothing (the Rubin dev / perf nodes)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    _skip_fused_if_twin_missing(True)
+    if o_fp4 is None:
+        out, _, _, blk, kern, _ = _run_fp4w_block(_GEOM, 1, 512, w_fp4=True, **_FUSED)
+
+        def run(o, ws):
+            mx_suite._execute(blk, kern, o, ws)
+
+    else:
+        out, _, _, blk, kern, _ = _run_fp4w_o4_block(_GEOM, 1, 512, o_fp4, **_FUSED)
+
+        def run(o, ws):
+            _execute_fp4o(blk, kern, o, ws)
+
+    assert blk.mxfp8_fused and blk._proj._plan.w_dtype == _FP4 and blk._proj._plan.params.weight_fp4
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    run(out, ws)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        run(out, ws)
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    if not names:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    memsets = [n for n in names if "memset" in n.lower()]
+    memcpys = [n for n in names if "memcpy" in n.lower()]
+    kernels = [n for n in names if n not in memsets and n not in memcpys]
+    print(f"\nmxfp4-weight fused{'' if o_fp4 is None else ' + ' + o_fp4.name + ' O'} CUDA events:\n  " + "\n  ".join(names))
+    assert len(kernels) == len(blk._stages) == (3 if o_fp4 is None else 4), (len(kernels), kernels)
+    assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
+    assert not memsets, f"unexpected memset(s) on the execute path: {memsets}"
+
+
+_GEOM_MHA_20 = dict(d_model=512, h_q=20, h_kv=20, d_head=256, rope_dim=64)  # MHA (h_q == h_kv): N = 80 x 256
+_GEOM_GQA_6_2 = dict(d_model=512, h_q=6, h_kv=2, d_head=256, rope_dim=64)  # a non-power-of-two h_q: N = 16 x 256
+# The acceptance-sweep shape for the fully fused fp4-weight block, (geometry, batch, seq_len, causal, qk_norm, seq_lens, shadow twin):
+# one KV tile (S=128), several, a ring wrap (S=4096), a tail tile (S=1000 -- B=1 only: the fused path declines S % 128 != 0 at B > 1),
+# a fully-tail CTA (M % 256 == 128), B in {1, 2, 3}, dense + causal, norm + RoPE-only, GQA 8/2 (the test geometry) / 32/2 / 6/2 and
+# MHA 20/20, one DEAD entry (length 0) beside a ragged live one at B >= 2; ``shadow`` also runs the e4m3 fork on shadow codes and
+# pins the block output bitwise.  Asserts: sentinel clean, finite, the oracle cos floor per LIVE entry, the format floor, a bitwise
+# second execute, the dead entry exactly zero; every number is in the log.
+_W4_FUSED_SWEEP = [
+    (_GEOM, 1, 128, True, True, None, False),
+    (_GEOM, 1, 256, False, False, None, False),
+    (_GEOM, 2, 128, False, True, None, False),
+    (_GEOM, 3, 128, True, True, (128, 64, 0), False),
+    (_GEOM, 1, 1000, False, True, None, False),
+    (_GEOM, 2, 1024, True, False, None, False),
+    (_GEOM, 3, 1024, False, True, None, False),
+    (_GEOM, 1, 4096, True, True, None, False),
+    (_GEOM, 2, 4096, False, True, None, False),
+    (_GEOM, 3, 256, True, False, (256, 128, 0), True),
+    (_GEOM_397B, 1, 1024, True, True, None, True),
+    (_GEOM_397B, 1, 256, False, False, None, False),
+    (_GEOM_397B, 2, 128, True, True, (128, 0), False),
+    (_GEOM_MHA_20, 1, 256, True, True, None, True),
+    (_GEOM_MHA_20, 2, 128, False, False, None, False),
+    (_GEOM_MHA_20, 3, 256, True, True, (256, 100, 0), False),
+    (_GEOM_GQA_6_2, 3, 128, True, True, None, True),
+    (_GEOM_GQA_6_2, 1, 1000, False, True, None, False),
+    (_GEOM_GQA_6_2, 2, 256, False, False, (256, 0), False),
+]
+
+
+def _sweep_id(cell) -> str:
+    g, b, s, causal, qk_norm, lens, shadow = cell
+    kind = "mha" if g["h_q"] == g["h_kv"] else "gqa"
+    return (
+        f"{kind}{g['h_q']}_{g['h_kv']}_d{g['d_model']}_b{b}_s{s}_{'causal' if causal else 'dense'}_{'norm' if qk_norm else 'rope'}"
+        f"{'_dead' if lens else ''}{'_shadow' if shadow else ''}"
+    )
+
+
+@requires_rubin
+@requires_fp4
+@pytest.mark.parametrize("cell", _W4_FUSED_SWEEP, ids=[_sweep_id(c) for c in _W4_FUSED_SWEEP])
+def test_mxfp4_weight_fused_block_shape_sweep(cell):
+    """The fully fused fp4-weight block over the acceptance-sweep axes of ``_W4_FUSED_SWEEP`` (the e2m1 B changes the operand, not
+    the M-axis tail / mask / batch handling -- so every one of those arms is driven once through the arm): no sentinel survivor,
+    finite, ``cos > 0.99`` vs the fake-quant oracle per LIVE entry, the FORMAT FLOOR ``cos(kernel, bf16) >= cos(oracle, bf16) - 0.005``
+    over the live entries, a bitwise second execute, a dead entry (``seq_lens[b] == 0``) EXACTLY zero; on the ``shadow`` cells the
+    e4m3 fork fed the same values as shadow codes yields the ``torch.equal`` block output."""
+    geom_kw, b, s, causal, qk_norm, lens, shadow = cell
+    _skip_fused_if_twin_missing(True)
+    gk = {**geom_kw, "is_causal": causal, "qk_norm": qk_norm}
+    seq_lens = torch.tensor(lens, device="cuda", dtype=torch.int32) if lens else None
+    out, ref, bf16_ref, blk, kern, spec = _run_fp4w_block(gk, b, s, w_fp4=True, seq_lens=seq_lens, sentinel=True, **_FUSED)
+    assert blk.mxfp8_fused and len(blk._stages) == 3 and spec.w_qkvg_fp4 and blk._sdpa.seq_lens_present == (lens is not None)
+    assert blk._proj._plan.w_dtype == _FP4 and blk._proj._plan.params.weight_fp4 and blk._proj._plan.params.qk_norm == qk_norm
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    live = [i for i in range(b) if lens is None or lens[i] > 0]
+    for i in range(b):
+        if i not in live:
+            assert (out[i] == 0).all(), f"the dead entry {i} must be EXACTLY zero; max|out[{i}]| = {out[i].abs().max().item()}"
+    cs = [mx_suite._cos(out[i], ref[i]) for i in live]
+    c_k, c_o = mx_suite._cos(out[live], bf16_ref[live]), mx_suite._cos(ref[live], bf16_ref[live])
+    print(
+        f"\n[mxfp4-weight FUSED block sweep {_sweep_id(cell)}] cos(kernel, oracle) per live entry={[f'{c:.6f}' for c in cs]} "
+        f"| format floor cos(oracle, bf16)={c_o:.6f} cos(kernel, bf16)={c_k:.6f}"
+    )
+    assert all(c > 0.99 for c in cs), f"mxfp4-weight fused block cos per entry {cs}"
+    assert c_k >= c_o - 0.005, f"the kernel sits below the fp4 format floor: cos(kernel, bf16)={c_k} < cos(oracle, bf16)={c_o} - 0.005"
+    out2 = torch.full_like(out, _SENTINEL)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    mx_suite._execute(blk, kern, out2, ws, seq_lens=seq_lens)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out2, out, rtol=0, atol=0)
+    if shadow:
+        out8, _, _, blk8, _, spec8 = _run_fp4w_block(gk, b, s, w_fp4=True, shadow=True, seq_lens=seq_lens, sentinel=True, **_FUSED)
+        assert not spec8.w_qkvg_fp4 and blk8._proj._plan.w_dtype == E4M3 and blk8._proj._plan.module is not blk._proj._plan.module
+        assert not (out8 == _SENTINEL).any()
+        torch.testing.assert_close(out, out8, rtol=0, atol=0)
