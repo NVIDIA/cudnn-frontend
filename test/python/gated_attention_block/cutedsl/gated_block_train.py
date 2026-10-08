@@ -42,8 +42,17 @@ The arms (``ARMS``; ``Arm`` spells the recipe knobs):
 * ``torch-bf16`` -- the pure-torch reference block (``gated_attention_block_reference``) under autograd: the control.
 
 The ``delayed`` recipe (``Arm(grad_scaling="delayed")``) hands the backward the caller's ``scale_dy / scale_do / scale_dqkvg``
-(``scale_dy`` alone under MXFP8): the max over the last ``grad_window`` steps' amax of each gradient, or whatever a ``scale_feed``
-callable returns per step and layer -- the replay pin feeds a "current" run's logged scales and gets its gradients back bitwise.
+(``scale_dy`` alone under MXFP8): ``grad_scale_from_amax`` of the max over the last ``grad_window`` steps' amax of each gradient, or
+whatever a ``scale_feed`` callable returns per step and layer -- the replay pin feeds a "current" run's logged scales and gets its
+gradients back bitwise.  Without a feed, step 0 BOOTSTRAPS the histories from discarded backward passes
+(``ConvergenceRun.bootstrap_rungs``): a gradient's published amax is valid only once every scale UPSTREAM of it is -- a unit scale
+flushes a training gradient (amax ~ 1e-3) to zero in e4m3 (subnormal 2^-9) and everything computed from that tensor is garbage -- so
+the rungs run in dependency order, each pass at the scales seeded so far: ``scale_dy`` (dY is the block's input gradient, its amax
+scale-independent), then ``scale_do`` (dO comes from the quantized dY), then ``scale_dp`` (dP from the quantized dO), then
+``scale_dqkvg`` (its dQ / dK from the quantized dS); MXFP8 has ``scale_dy`` alone, and the "current" fp8 arm's ladder is ``scale_dp``
+alone, as before.  A lagged scale has ZERO headroom at margin 0 by construction, so under ``delayed`` ``amax * scale > 448`` on a
+gradient is COUNTED per step, layer and gradient (the row's ``grad_sat``; reported, never asserted); under ``current`` the kernel
+derives every gradient scale from the same step's amax, so the same product is ASSERTED there (a violation is a bug).
 
 Determinism: every random draw -- the init, the data -- is on a CPU ``torch.Generator`` (torch's CUDA Philox lays draws out by SM
 count, so one seed means different tensors on two parts); ``run()`` turns ``torch.use_deterministic_algorithms(True)`` on for its
@@ -543,7 +552,8 @@ class ConvergenceRun:
         self._replay = None  # the fp8 recipe's norm+RoPE replay scratch (nq, nk, rstd_q, rstd_k)
         self.step = -1
         self.calibrating = False
-        self._calib_bwd = False
+        self._calib_bwd = 0  # discarded step-0 backward passes per layer (the bootstrap ladder's rungs); the row logs it as a bool
+        self._grad_sat: Optional[Dict[str, List[bool]]] = None
 
     # -- environment ------------------------------------------------------------------------------------------------------
 
@@ -703,6 +713,22 @@ class ConvergenceRun:
         d = self.bwd.quant_scalars(st.ws_bwd)
         return dict(zip(d.keys(), torch.cat(list(d.values())).tolist()))
 
+    def bootstrap_rungs(self) -> List[str]:
+        """The scales the arm seeds at step 0 from DISCARDED backward passes, in dependency order -- one pass per rung, each at the
+        scales seeded so far (unit elsewhere), because a gradient's published amax is valid only once every scale UPSTREAM of it is:
+        dY's is scale-independent (the block's input gradient), dO's needs ``scale_dy`` (dO is computed from the quantized dY), dP's
+        needs ``scale_do``, dQKVG's needs ``scale_dp`` (its dQ / dK come from the quantized dS).  A unit scale flushes a training
+        gradient (amax ~ 1e-3) to zero in e4m3 (subnormal 2^-9), so a downstream amax read at unit upstream scales is garbage --
+        seeding ``scale_dqkvg`` from it saturates the first logged pass by orders of magnitude.  "current" fp8: ``scale_dp`` alone (the
+        kernel derives the three gradient scales from the same step's amax); "delayed" without a feed: the gradient scales too (fp8:
+        dy, do, dp, dqkvg; MXFP8: dy); a feed supplies them from step 0."""
+        seed = self.arm.grad_scaling == "delayed" and self.scale_feed is None
+        if self.arm.family == "fp8":
+            return (["scale_dy", "scale_do"] if seed else []) + ["scale_dp"] + (["scale_dqkvg"] if seed else [])
+        if self.arm.family == "mxfp8" and seed:
+            return ["scale_dy"]
+        return []
+
     def _backward_layer(self, l: int, dy: torch.Tensor, spec) -> dict:
         st = self.layers[l]
         if self.arm.family == "torch_fn":
@@ -712,22 +738,24 @@ class ConvergenceRun:
             self._declare_bwd(dy, st)
         if spec is not None:
             self.bwd.update_quant_scales(spec)
-        if self.arm.family == "fp8" and self.step == 0:
-            # the step-0 calibration backward: scale_dp = 1.0 (the "delayed" scales 1.0 too, unless a feed gives them), the
-            # gradients discarded, amax_dp -> the calibrated scale_dp of the logged backward (and the gradient amax seed the
-            # "delayed" histories); one host sync, step 0 only
-            st.scale_dp.fill_(1.0)
-            st.scale_dp_host = 1.0
-            self._execute_bwd(st, dy)
-            torch.cuda.synchronize()
-            sc = self._read_scalars(st)
-            st.scale_dp_host = self._next_scale_dp(sc["amax_dp"])
-            st.scale_dp.fill_(st.scale_dp_host)
-            if self.arm.grad_scaling == "delayed" and self.scale_feed is None:
-                for n in self.arm.grad_scale_names:
-                    st.grad_hist[n].append(sc["amax_" + n[len("scale_") :]])
-                self._set_delayed_scales(st, {n: grad_scale_from_amax(max(st.grad_hist[n]), self.arm.margin_log2) for n in self.arm.grad_scale_names})
-            self._calib_bwd = True
+        if self.step == 0:
+            # the step-0 bootstrap ladder (``bootstrap_rungs``): one DISCARDED backward per rung, its published amax seeding that
+            # rung's scale for every later pass; the gradients are overwritten by the logged pass below; one host sync per rung,
+            # step 0 only.  The seeded amax enters the gradient histories through the logged pass's readback, not here.
+            rungs = self.bootstrap_rungs()
+            if rungs and self.arm.family == "fp8":
+                st.scale_dp.fill_(1.0)
+                st.scale_dp_host = 1.0
+            for rung in rungs:
+                self._execute_bwd(st, dy)
+                torch.cuda.synchronize()
+                sc = self._read_scalars(st)
+                if rung == "scale_dp":
+                    st.scale_dp_host = self._next_scale_dp(sc["amax_dp"])
+                    st.scale_dp.fill_(st.scale_dp_host)
+                else:
+                    self._set_delayed_scales(st, {rung: grad_scale_from_amax(sc["amax_" + rung[len("scale_") :]], self.arm.margin_log2)})
+            self._calib_bwd = len(rungs)
         self._execute_bwd(st, dy)
         for name in _GRAD_NAMES:
             st.met[_MET[f"norm_{name}"]] = st.grads[name].float().norm()
@@ -753,11 +781,12 @@ class ConvergenceRun:
     def _set_delayed_scales(self, st: _LayerState, vals: Dict[str, float]) -> None:
         for n, v in vals.items():
             st.grad_scales[n].fill_(float(v))
-        st.grad_scales_host = {n: float(v) for n, v in vals.items()}
+            st.grad_scales_host[n] = float(v)
 
     def _begin_step(self, step: int) -> None:
         self.step = step
-        self._calib_bwd = False
+        self._calib_bwd = 0
+        self._grad_sat = {n: [] for n in self.arm.grad_scale_names} if self.arm.grad_scaling == "delayed" else None
         if self.arm.grad_scaling != "delayed":
             return
         for st in self.layers:
@@ -769,7 +798,7 @@ class ConvergenceRun:
                 self._set_delayed_scales(st, {n: vals[n] for n in self.arm.grad_scale_names})
             elif step > 0:
                 self._set_delayed_scales(st, {n: grad_scale_from_amax(max(st.grad_hist[n]), self.arm.margin_log2) for n in self.arm.grad_scale_names})
-            # step 0 without a feed: the calibration backward seeds the histories and sets the scales
+            # step 0 without a feed: the bootstrap ladder in _backward_layer seeds each scale from a discarded pass (bootstrap_rungs)
 
     def _needs_activation_calibration(self) -> bool:
         return self.arm.family == "fp8" and self.arm.act_window > 0
@@ -809,8 +838,9 @@ class ConvergenceRun:
                 p.grad.mul_(coef)
 
     def _read_back(self) -> Tuple[List[list], Optional[List[Dict[str, float]]]]:
-        """After the step's backward: ONE sync, every layer's metrics and scalar block; the fp8 assertions; the next step's
-        ``scale_dp``; the activation and gradient amax histories."""
+        """After the step's backward: ONE sync, every layer's metrics and scalar block; the gradient-scale check (asserted under
+        "current", counted under "delayed") and the dP check; the next step's ``scale_dp``; the activation and gradient amax
+        histories."""
         torch.cuda.synchronize()
         mets = torch.stack([st.met for st in self.layers]).tolist()
         scalars = None
@@ -819,11 +849,19 @@ class ConvergenceRun:
             for st, met in zip(self.layers, mets):
                 sc = self._read_scalars(st)
                 for n in self.arm.grad_scale_names:
-                    amax = sc["amax_" + n[len("scale_") :]]
-                    if not (amax * sc[n] <= E4M3_MAX) or amax != amax:
-                        raise RuntimeError(
-                            f"step {self.step} layer {st.layer}: amax * {n} = {amax:.6g} * {sc[n]:.6g} > {E4M3_MAX}: the e4m3 gradient would saturate (a bug)"
-                        )
+                    what = n[len("scale_") :]
+                    amax = sc["amax_" + what]
+                    if amax != amax:
+                        raise RuntimeError(f"step {self.step} layer {st.layer}: the published amax of {what} is NaN")
+                    sat = not (amax * sc[n] <= E4M3_MAX)
+                    if self.arm.grad_scaling == "current":
+                        if sat:
+                            raise RuntimeError(
+                                f"step {self.step} layer {st.layer}: amax * {n} = {amax:.6g} * {sc[n]:.6g} > {E4M3_MAX}: the e4m3 gradient would "
+                                f"saturate -- under grad_scaling='current' the kernel derives {n} from this step's amax, so this is a bug"
+                            )
+                    else:
+                        self._grad_sat[n].append(bool(sat))  # the lagged recipe's cost (zero headroom at margin 0): reported, never asserted
                     st.grad_hist[n].append(amax)
                 if self.arm.family == "fp8":
                     prod = sc["amax_dp"] * st.scale_dp_host
@@ -848,7 +886,7 @@ class ConvergenceRun:
             lr=lr,
             grad_norm_total=grad_norm,
             calib_fwd=calib_fwd,
-            calib_bwd=self._calib_bwd,
+            calib_bwd=bool(self._calib_bwd),
             grad_norms={name: [m[_MET[f"norm_{name}"]] for m in mets] for name in _GRAD_NAMES},
             arm=arm.name,
             recipe=dict(
@@ -878,6 +916,7 @@ class ConvergenceRun:
                 row["n_clip"] = {x: [int(round(m[_MET[f"n_clip_{x}"]])) for m in mets] for x in _ACTS}
             if arm.grad_scaling == "delayed":
                 row["given_scales"] = {n: [st.grad_scales_host.get(n) for st in layers] for n in arm.grad_scale_names}
+                row["grad_sat"] = dict(self._grad_sat)  # per gradient scale and layer: amax * scale > 448 this step (reported)
         h = hashlib.sha256()
         for st in layers:
             for ten in self._grad_hash_tensors(st):
@@ -956,7 +995,8 @@ class ConvergenceRun:
                     f.write(json.dumps(row, sort_keys=True) + "\n")
                     f.flush()
                 self.log(
-                    f"[{self.name}] step {step:5d} loss {loss_val:.5f} lr {lr:.3e} |g| {grad_norm:.4f} wall {wall_ms:8.1f} ms{'  (calib fwd)' if calib_fwd else ''}{'  (calib bwd)' if self._calib_bwd else ''}"
+                    f"[{self.name}] step {step:5d} loss {loss_val:.5f} lr {lr:.3e} |g| {grad_norm:.4f} wall {wall_ms:8.1f} ms"
+                    f"{'  (calib fwd)' if calib_fwd else ''}{f'  (calib bwd x{self._calib_bwd} per layer)' if self._calib_bwd else ''}"
                 )
         finally:
             if f is not None:
@@ -973,6 +1013,7 @@ class ConvergenceRun:
             replica=self.replica,
             steps=steps,
             n_rows=len(rows),
+            bootstrap_rungs=self.bootstrap_rungs(),
             run_digest=run_digest(rows),
             first_row_digest=rows[0]["row_digest"] if rows else None,
             last_loss=rows[-1]["loss"] if rows else None,
