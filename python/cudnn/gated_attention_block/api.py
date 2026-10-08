@@ -5082,8 +5082,13 @@ class GatedAttentionBlockFwd(APIBase):
         ``MxQuantSpec``; and the fused fp8 fork's ``[alpha_qkvg, scale_q, scale_k, scale_v]`` vector where it exists) on the
         launch stream -- ``current_stream`` (a raw ``CUstream``), else torch's current stream on the block's device (Rule 5) --
         then ``self.quant = spec``.  Every consumer binds those tensors at ``execute``, so the next execute on that stream runs
-        at the new scales; a CUDA graph that captured an execute replays with the LIVE values (the scalars are read, never
-        baked into the graph).  No allocation, no host readback, no new plan: the training-loop recipe is one call per layer
+        at the new scales, and a CUDA graph that captured an execute of a WARMED-UP block replays with the LIVE values (the
+        scalars are read, never baked into the graph) -- unless the captured execute was the block's FIRST: its one-time scalar
+        write (:meth:`_write_quant_dev`, one fill kernel per value) is captured WITH the capture-time values, so every replay
+        re-writes them and overrides a later eager ``update_quant_scales``.  Run one eager execute on the capture stream before
+        capturing (every capture of the block does), or treat a graph that captured the first execute as pinned to the scales
+        it captured and re-capture after a recalibration.
+        No allocation, no host readback, no new plan: the training-loop recipe is one call per layer
         right before its forward (``descale_h`` / ``descale_w_*`` from the tensors quantized this step, the activation scales
         from the previous step's record), and the same ``spec`` handed to ``GatedAttentionBlockBwd.update_quant_scales`` so the
         backward rebuilds the SDPA operands at the forward's scales.
@@ -5439,7 +5444,9 @@ class GatedAttentionBlockFwd(APIBase):
             # The FIRST execute writes the per-tensor scalars' VALUES on ITS launch stream: compile()'s fills were enqueued on the
             # stream ambient at compile time, which an execute on another stream never waits for -- a first use behind pending
             # ambient work could consume them before the fills landed.  Once per compile(); a later update_quant_scales() writes on
-            # the caller's stream itself.  Nothing under o_fp4 ({}), nothing for bf16 (None).
+            # the caller's stream itself.  Nothing under o_fp4 ({}), nothing for bf16 (None).  A stream capture of this first
+            # execute records these fills WITH their values, so its replays re-write them: warm up before capturing
+            # (update_quant_scales's docstring).
             self._write_quant_dev(self.quant, stream)
             self._quant_dev_on_launch_stream = True
 

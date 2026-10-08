@@ -389,7 +389,11 @@ already holds. `GatedAttentionBlockFwd.update_quant_scales(spec, *, current_stre
 without recompiling: an in-place write of the block's device scalars (the GEMM alphas, the quantize scales, the fp8 SDPA's descales,
 and the fully fused fp8 fork's scale vector) on the launch stream (`current_stream`, else torch's current stream), then
 `blk.quant = spec`; every consumer binds those tensors at `execute`, so the next execute on that stream runs at the new scales, and a
-CUDA graph that captured an execute replays with the live values. `GatedAttentionBlockBwd.update_quant_scales(spec)` is the
+CUDA graph that captured an execute of a warmed-up block replays with the live values -- unless the captured execute was the block's
+first: its one-time scalar write (one fill kernel per value; the first-execute write below) is captured with the capture-time values,
+so every replay re-writes them and overrides a later eager `update_quant_scales`; warm up with one eager execute on the capture stream
+before capturing (as every capture of the block does), or treat such a graph as pinned to the scales it captured and re-capture after
+a recalibration. `GatedAttentionBlockBwd.update_quant_scales(spec)` is the
 backward half: the plan-time constants the next execute's prologue launch stores from its kernel arguments are re-resolved on the
 host (no device write; a CUDA graph captured before the call keeps the old constants -- re-capture after a recalibration). Typed
 refusals, before any write: a block declared without `quant` (`ValueError`), a spec of the other class (`TypeError`), a differing
