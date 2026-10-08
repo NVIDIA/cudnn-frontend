@@ -2624,7 +2624,8 @@ _SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
     # The PRODUCTION geometry from the adapter itself (cga2), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape
     # the split was tuned and measured on (B=1 H=24/8 S=16K dense); the per-cc fields (fused_ldtm_stat, exp2_fma_split)
     # come from the caller as the record api_dsl.template_params() builds for that device.
-    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
+    cta_mma = 2
+    assert cta_mma in supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
     params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, emit_amax_o=True, **params_kw)
     mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=False, rubin=False)
     # MUFU.EX2 the kernel must carry: per softmax body one alpha exp2 plus the non-emulated columns, traced once per
@@ -2902,7 +2903,7 @@ def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
     q8, q_deq, sfq = mx(qf, hq, False)
     k8, k_deq, sfk = mx(kf, hkv, False)
     v8, v_deq, sfv = mx(vf, hkv, True)
-    (cga,) = supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False)
+    cga = max(supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False))
     outs = {}
     lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
     for with_stats in (True, False):

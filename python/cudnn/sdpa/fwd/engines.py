@@ -1531,7 +1531,13 @@ def _sm100_mxfp8_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
-            cgas_by_d_shape=(((64, 64), frozenset({1})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})), ((512, 512), frozenset({1}))),
+            cgas_by_d_shape=(
+                ((64, 64), frozenset({1})),
+                ((128, 128), frozenset({1, 2})),
+                ((192, 128), frozenset({1, 2})),
+                ((256, 256), frozenset({1})),
+                ((512, 512), frozenset({1})),
+            ),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
             # The split path also needs a half-precision O (mismatch's
             # facts x knobs gate).

@@ -41,7 +41,7 @@ from typing import Callable, Optional, Tuple
 from cutlass.experimental import primitives as nvvm
 from cutlass.experimental.primitives import vote_sync, VoteSync
 from cutlass.experimental.cuda import tensor_map as tmap
-from cutlass._mlir.dialects import arith
+from cutlass._mlir.dialects import arith, llvm
 
 import cutlass
 from cutlass.base_dsl.typing import Pointer
@@ -353,6 +353,7 @@ SF_CONST_VALUE = 0x7F
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_split_helpers,
     store_fp32_partial_tile as _store_fp32_partial_tile,
+    store_fp32_partial_tile_coalesced as _store_fp32_partial_tile_coalesced,
     Bars,
     KvLoopBounds,
     make_classic_bars,
@@ -2834,20 +2835,59 @@ def _correction_warp_group(
 
             if cutlass.const_expr(_FP32_PARTIALS):
                 # fp32 partials: the accumulator goes straight to the workspace,
-                # bypassing the SMEM O tile and its TMA store.
-                _store_fp32_partial_tile(
-                    o_partial_f32,
-                    tmem_base_epi,
-                    tmem_O_off,
-                    inv_sum,
-                    row_dead,
-                    _row_valid,
-                    _partial_batch(batch_idx, split_idx, n_batch),
-                    q_row_global,
-                    row_head_idx,
-                    CFG.TILE_O,
-                    O_CHUNK,
-                )
+                # bypassing the SMEM O tile and its TMA store.  The O tile is
+                # therefore idle here and lends each correction warp a
+                # 32 x O_CHUNK fp32 transpose scratch so the store writes whole
+                # lines (store_fp32_partial_tile_coalesced); the slab's 16-byte
+                # alignment is warp-uniform, the element path keeps the rest.
+                _o_part_base = cutlass.Int32(llvm.ptrtoint(cutlass.Int32.mlir_type, sO[qs].base.ir_value()))
+                _o_part_scratch = _o_part_base + (tid_in_wg // cutlass.Int32(32)) * cutlass.Int32(32 * O_CHUNK * 4)
+                _o_part_vec_ok = (o_partial_f32.iterator.toint() & cutlass.Int64(15)) == cutlass.Int64(0)
+                if cutlass.const_expr(o_partial_f32.shape[3] % 4 == 0 and O_CHUNK % 4 == 0 and o_partial_f32.stride[3] == 1):
+                    if _o_part_vec_ok:
+                        _store_fp32_partial_tile_coalesced(
+                            o_partial_f32,
+                            tmem_base_epi,
+                            tmem_O_off,
+                            inv_sum,
+                            row_dead,
+                            _row_valid,
+                            _partial_batch(batch_idx, split_idx, n_batch),
+                            q_row_global,
+                            row_head_idx,
+                            CFG.TILE_O,
+                            O_CHUNK,
+                            _o_part_scratch,
+                            tid_in_wg % cutlass.Int32(32),
+                        )
+                    else:
+                        _store_fp32_partial_tile(
+                            o_partial_f32,
+                            tmem_base_epi,
+                            tmem_O_off,
+                            inv_sum,
+                            row_dead,
+                            _row_valid,
+                            _partial_batch(batch_idx, split_idx, n_batch),
+                            q_row_global,
+                            row_head_idx,
+                            CFG.TILE_O,
+                            O_CHUNK,
+                        )
+                else:
+                    _store_fp32_partial_tile(
+                        o_partial_f32,
+                        tmem_base_epi,
+                        tmem_O_off,
+                        inv_sum,
+                        row_dead,
+                        _row_valid,
+                        _partial_batch(batch_idx, split_idx, n_batch),
+                        q_row_global,
+                        row_head_idx,
+                        CFG.TILE_O,
+                        O_CHUNK,
+                    )
                 bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
             else:
                 if cutlass.const_expr(CFG.EMIT_AMAX_O and amax_o_tensor is not None):
