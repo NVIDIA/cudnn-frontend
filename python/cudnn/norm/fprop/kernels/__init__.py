@@ -25,6 +25,7 @@ from . import (  # noqa: F401
     batchnorm_nchw_sm100,
     batchnorm_nhwc_sm100,
     batchnorm_sm100,
+    groupnorm_cga_sm100,
     groupnorm_nhwc_sm100,
     layernorm_cga_sm100,
     groupnorm_sm100,
