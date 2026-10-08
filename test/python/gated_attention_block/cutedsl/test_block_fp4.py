@@ -312,14 +312,16 @@ def test_check_declaration_is_the_pre_stage_half_of_check_support():
 
 
 @requires_fp4
-def test_fp4_weight_with_fuse_norm_rope_declines_typed_until_the_fork_arm_lands():
-    """Config row 11: ``w_qkvg_dtype=fp4 + fuse_norm_rope`` is a ``NotImplementedError`` from the fused projection's
-    ``check_support`` (and its ``params()`` -- no e4m3-B artifact can be rendered for an e2m1 weight), naming the e4m3 B
-    and the unfused pipeline.  Feature-detected on ``NormRopeFusionParams.weight_fp4``, so this test INVERTS the day
-    the fork arm lands: then the params carry the field and the fork's own gates take over."""
+def test_fp4_weight_with_fuse_norm_rope_is_served_once_the_fork_arm_lands():
+    """Config row 11: ``w_qkvg_dtype=fp4 + fuse_norm_rope`` is SERVED by the fused projection fork's e2m1-B arm -- the
+    fused stage appends ``weight_fp4=True`` to its ``NormRopeFusionParams`` (a NEW compile key; the e4m3 spelling's params --
+    the in-process compile key -- are unchanged) and the fork's own gates take over at ``check_support`` (its sm_107a gate on
+    another device).  The
+    feature detection is kept: a checkout WITHOUT the field declines typed (the branch this test was born in), naming
+    the e4m3 B and the unfused pipeline."""
     blk = _decl_block_fp4w(**_FUSED)
     assert blk.mxfp8_fused and blk._proj.mxfp8 and blk._proj.quant.w_qkvg_fp4
-    if not _fork_has_fp4_arm():
+    if not _fork_has_fp4_arm():  # pragma: no cover -- a checkout without the fork's e2m1-B arm
         with pytest.raises(NotImplementedError, match="e4m3 B") as ei:
             blk.check_support()
         msg = str(ei.value)
@@ -328,13 +330,20 @@ def test_fp4_weight_with_fuse_norm_rope_declines_typed_until_the_fork_arm_lands(
             blk._proj.params()
         with pytest.raises(NotImplementedError, match="e4m3 B"):
             blk._proj.compile()
-    else:  # pragma: no cover -- the fork's e2m1-B arm has landed
-        assert "weight_fp4" in str(blk._proj.params())
+    else:
+        params = blk._proj.params()
+        assert params.weight_fp4 and params.quant_mxfp8 and "weight_fp4=True" in str(params)
+        assert dataclasses.replace(params, weight_fp4=False) == mx_suite._decl_block(**_FUSED)._proj.params(), "only the appended field differs"
         if _cc() == mx_suite._SM107:
             blk._proj.check_support()
-    # the e4m3 spelling of the SAME fused block never consults the fp4 arm (byte-identical params to the MXFP8 suite)
-    e4 = mx_suite._decl_block(**_FUSED)
-    assert "weight_fp4" not in str(e4._proj.params()) and "quant_mxfp8" in str(e4._proj.params())
+        else:
+            with pytest.raises(NotImplementedError, match="sm_107a"):  # the fork's own arch gate, past the (lifted) row-11 decline
+                blk._proj.check_support()
+    # the e4m3 spelling of the SAME fused block never consults the fp4 arm: its params are the MXFP8 suite's (the appended
+    # field at its default), so the e4m3 IN-PROCESS compile key (the params dataclass) is unchanged.  The persistent source digest
+    # of every fused MXFP8 plan changes once with the fork's source (one cold recompile after this lands), e4m3 arm included.
+    e4p = mx_suite._decl_block(**_FUSED)._proj.params()
+    assert not e4p.weight_fp4 and e4p.quant_mxfp8 and e4p == dataclasses.replace(blk._proj.params(), weight_fp4=False)
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +406,7 @@ def _dispatch_trace_fp4w(blk, monkeypatch):
 
                 def _rec(*a, _n=st.name, _m=meth, **k):
                     calls.append((_n, _m))
-                    if _n == _MX_STAGES[0]:
+                    if _n in (_MX_STAGES[0], "qkv_gate_proj_norm_rope"):  # the unfused GEMM stage or the fused fork stage
                         proj_args.append(a)
 
                 monkeypatch.setattr(st, meth, _rec)
@@ -446,19 +455,26 @@ def _fp4w_inputs(geom_kw, batch, seq_len):
     return inp, kern, orac, desc
 
 
-def _run_fp4w_block(geom_kw, batch, seq_len, *, w_fp4: bool, seq_lens=None, sentinel: bool = False, **blk_kw):
+def _run_fp4w_block(geom_kw, batch, seq_len, *, w_fp4: bool, seq_lens=None, sentinel: bool = False, shadow: bool = False, **blk_kw):
     """Declare / check / compile / execute the MXFP8 block with ``w_qkvg_dtype`` spelled explicitly (e4m3 or fp4);
-    return ``(out, oracle, bf16_ref, blk, kern, spec)``.  Mirrors ``test_block_mxfp8._run_mx_block``."""
+    return ``(out, oracle, bf16_ref, blk, kern, spec)``.  Mirrors ``test_block_mxfp8._run_mx_block``, fused knobs included
+    (``scale_o`` pinned to 1.0 and the fused-numerics oracle under ``fuse_gate + fuse_norm_rope``).  ``shadow=True`` (with
+    ``w_fp4``) hands the block the e2m1 weight's VALUES as e4m3 shadow codes with the fp4 blob (``w_qkvg_dtype=e4m3``) --
+    the twin an e2m1-weight run must match bitwise."""
     geom = GatedAttentionBlockGeometry(**geom_kw)
     rg = mx_suite._ref_geom(geom)
+    fused = bool(blk_kw.get("fuse_gate")) and bool(blk_kw.get("fuse_norm_rope"))
     if w_fp4:
         inp, kern, orac, desc = _fp4w_inputs(geom_kw, batch, seq_len)
+        if shadow:
+            kern = orac
     else:
+        assert not shadow, "shadow codes are the e2m1 weight's values; there is no shadow of an e4m3 weight"
         inp, kern, desc = mx_suite._mx_inputs(geom_kw, batch, seq_len)
         orac = kern
-    scale_o = mxfp8_calibrated_scale_o(orac, rg, seq_lens=seq_lens)
-    spec = MxQuantSpec(**desc, scale_o=scale_o, w_qkvg_dtype=_FP4 if w_fp4 else E4M3)
-    ref = gated_attention_block_mxfp8_reference(orac, rg, descale_w_o=spec.descale_w_o, scale_o=spec.scale_o, seq_lens=seq_lens)
+    scale_o = 1.0 if fused else mxfp8_calibrated_scale_o(orac, rg, seq_lens=seq_lens)
+    spec = MxQuantSpec(**desc, scale_o=scale_o, w_qkvg_dtype=_FP4 if (w_fp4 and not shadow) else E4M3)
+    ref = gated_attention_block_mxfp8_reference(orac, rg, descale_w_o=spec.descale_w_o, scale_o=spec.scale_o, seq_lens=seq_lens, fused=fused)
     bf16_ref = gated_attention_block_reference(
         inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], rg, seq_lens=seq_lens
     ).out
@@ -542,6 +558,101 @@ def test_mxfp4_weight_dead_padded_entry_is_exactly_zero():
     assert (out[1] == 0).all(), f"the dead entry must be EXACTLY zero; max|out[1]| = {out[1].abs().max().item()}"
     c = mx_suite._cos(out[0], ref[0])
     print(f"\nmxfp4-weight block dead entry S={s}: live cos={c:.6f}")
+    assert c > 0.99, f"live entry cos {c}"
+
+
+# ---------------------------------------------------------------------------
+# The FULLY FUSED block with an MXFP4 W_qkvg (config row 11, served by the fused fork's e2m1-B arm)
+# ---------------------------------------------------------------------------
+
+
+@requires_fp4
+def test_mxfp4_weight_fused_execute_dispatches_the_three_stages_through_the_mx_runner(monkeypatch):
+    """Row 11 is the fully fused MXFP8 execute body unchanged: projection through ``execute_mxfp8`` (the frozen SF-output
+    runner ABI), the gated SDPA, ``out_proj`` -- three calls -- and the fused stage receives the PACKED e2m1 weight
+    (``float4_e2m1fn_x2 [N, K/2]``, by pointer) and the UNCHANGED E8M0 / 32 blob as its ``w`` / ``sf_w`` arguments, with
+    ``weight_fp4=True`` on its params.  No kernel runs (any CUDA device)."""
+    blk = _decl_block_fp4w(**_FUSED)
+    assert blk.mxfp8_fused and blk._proj.params().weight_fp4
+    calls, w, proj_args = _dispatch_trace_fp4w(blk, monkeypatch)
+    assert calls == [("qkv_gate_proj_norm_rope", "execute_mxfp8"), ("sdpa", "execute"), ("out_proj", "execute")]
+    assert len(proj_args) == 1
+    a = proj_args[0]  # execute_mxfp8(a, sf_a, w, sf_w, q8, k8, v8, gate16, sf_q, sf_k, sf_v, w_q_norm, w_k_norm, cos, sin, *, stream)
+    assert a[2].dtype == _FP4 and a[2].data_ptr() == w.data_ptr() and tuple(a[2].shape) == tuple(w.shape) == (blk.geom.n_qkvg, blk.geom.d_model // 2)
+    assert a[3].dtype == torch.uint8 and a[3].numel() == sf_blob_bytes(blk.geom.n_qkvg, blk.geom.d_model, MXFP4_BLOCK)
+
+
+@requires_fp4
+def test_mxfp4_weight_with_nvfp4_o_fused_execute_dispatches_four_stages(monkeypatch):
+    """The composition of the two fp4 modes on the fully fused pipeline (row 9 x row 10): an MXFP4 ``W_qkvg`` through the
+    fused fork's e2m1-B arm, then the gated SDPA writing bf16 ``O``, ``quantize_fp4_o`` and the fp4 x fp4 out projection --
+    FOUR calls, the fused projection fed the packed weight."""
+    fmt = Fp4Format.NVFP4
+    blk = _decl_block_fp4o(fmt, w_qkvg_fp4=True, **_FUSED)
+    assert blk.mxfp8_fused and blk.quant.w_qkvg_fp4 and blk.quant.o_fp4 is fmt and blk._proj.params().weight_fp4
+    calls, _, _ = _dispatch_trace_fp4o(blk, monkeypatch, fmt, w_qkvg_fp4=True)
+    assert [n for n, _, _, _ in calls] == _FP4_O_FUSED_STAGES and calls[0][1] == "execute_mxfp8"
+    assert calls[0][2][2].dtype == _FP4 and tuple(calls[0][2][2].shape) == (blk.geom.n_qkvg, blk.geom.d_model // 2)
+
+
+@requires_rubin
+@requires_fp4
+@pytest.mark.parametrize("seq_len, causal", [(1000, True), (1024, False)])
+def test_mxfp4_weight_fused_block_matches_the_fake_quant_oracle(seq_len, causal):
+    """The FULLY FUSED block (3 launches) with an MXFP4 ``W_qkvg`` against the fused-numerics oracle fed the e4m3 shadow of the
+    e2m1 weight through the fp4 blob: no sentinel survivor, finite, ``cos > 0.99``, the FORMAT FLOOR
+    ``cos(kernel, bf16 ref) >= cos(oracle, bf16 ref) - 0.005``, a bitwise second execute.  B=1 at S=1000 (the fused path
+    declines ``S % 128 != 0 and B > 1``), B=2 at S=1024."""
+    b = 1 if seq_len % 128 else 2
+    out, ref, bf16_ref, blk, kern, spec = _run_fp4w_block({**_GEOM, "is_causal": causal}, b, seq_len, w_fp4=True, sentinel=True, **_FUSED)
+    assert blk.mxfp8_fused and len(blk._stages) == 3 and spec.scale_o == 1.0 and spec.w_qkvg_fp4
+    assert blk._proj._plan.w_dtype == _FP4 and blk._proj._plan.params.weight_fp4 and blk._proj._plan.mxfp8
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    c = mx_suite._cos(out, ref)
+    rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
+    c_k, c_o = mx_suite._cos(out, bf16_ref), mx_suite._cos(ref, bf16_ref)
+    print(
+        f"\nmxfp4-weight FUSED block B={b} S={seq_len} causal={causal}: cos(kernel, oracle)={c:.6f} max_rel={rel:.3e} "
+        f"| format floor cos(oracle, bf16)={c_o:.6f} cos(kernel, bf16)={c_k:.6f}"
+    )
+    assert c > 0.99, f"mxfp4-weight fused block cos {c}"
+    assert c_k >= c_o - 0.005, f"the kernel sits below the fp4 format floor: cos(kernel, bf16)={c_k} < cos(oracle, bf16)={c_o} - 0.005"
+    out2 = torch.full_like(out, _SENTINEL)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    mx_suite._execute(blk, kern, out2, ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out2, out, rtol=0, atol=0)
+
+
+@requires_rubin
+@requires_fp4
+def test_mxfp4_weight_fused_block_is_bitwise_the_mxfp8_fused_block_on_shadow_codes():
+    """Whole block, by construction: the fused e2m1-B arm fed the packed MXFP4 weight and the fused e4m3 fork fed the same
+    values as e4m3 SHADOW codes with the same blob compute the same stage-1 outputs (the fused-stage suite pins that bitwise),
+    and the SDPA / out projection downstream are identical -- so the block outputs are ``torch.equal``.  A difference is a
+    stage-1 B-path defect, reported, never a tolerance."""
+    gk = {**_GEOM, "is_causal": True}
+    out4, _, _, blk4, _, spec4 = _run_fp4w_block(gk, 2, 256, w_fp4=True, sentinel=True, **_FUSED)
+    out8, _, _, blk8, _, spec8 = _run_fp4w_block(gk, 2, 256, w_fp4=True, shadow=True, sentinel=True, **_FUSED)
+    assert spec4.w_qkvg_fp4 and not spec8.w_qkvg_fp4
+    assert blk4._proj._plan.w_dtype == _FP4 and blk8._proj._plan.w_dtype == E4M3 and blk4._proj._plan.module is not blk8._proj._plan.module
+    assert not (out4 == _SENTINEL).any() and not (out8 == _SENTINEL).any()
+    torch.testing.assert_close(out4, out8, rtol=0, atol=0)
+
+
+@requires_rubin
+@requires_fp4
+def test_mxfp4_weight_fused_dead_padded_entry_is_exactly_zero():
+    """sdpa-invariants S1/S2 through the fully fused fp4-weight block: ``seq_lens=[s, 0]`` -> ``out[1] == 0`` EXACTLY, the
+    live entry on the oracle (S % 128 == 0, so the fused path admits B=2)."""
+    s = 512
+    seq_lens = torch.tensor([s, 0], device="cuda", dtype=torch.int32)
+    out, ref, _, blk, _, _ = _run_fp4w_block({**_GEOM, "is_causal": False}, 2, s, w_fp4=True, seq_lens=seq_lens, sentinel=True, **_FUSED)
+    assert blk.mxfp8_fused and blk._sdpa.seq_lens_present and not (out == _SENTINEL).any() and torch.isfinite(out.float()).all()
+    assert (out[1] == 0).all(), f"the dead entry must be EXACTLY zero; max|out[1]| = {out[1].abs().max().item()}"
+    c = mx_suite._cos(out[0], ref[0])
+    print(f"\nmxfp4-weight FUSED block dead entry S={s}: live cos={c:.6f}")
     assert c > 0.99, f"live entry cos {c}"
 
 
@@ -761,7 +872,7 @@ def test_o_fp4_declaration_wires_the_fp4_quantize_stage_and_the_block_scale_out_
     assert (impl.gate_desc is not None) == fused
     if fused:
         assert impl.gate_desc.dtype == torch.bfloat16 and blk._gate is None and blk._quant_q is None
-        assert "quant_mxfp8" in str(blk._proj.params()) and "weight_fp4" not in str(blk._proj.params())
+        assert blk._proj.params().quant_mxfp8 and not blk._proj.params().weight_fp4  # an e4m3 W_qkvg never sets the fork's e2m1-B arm
     else:
         assert blk._gate is not None and blk._quant_q is not None
 
@@ -769,7 +880,8 @@ def test_o_fp4_declaration_wires_the_fp4_quantize_stage_and_the_block_scale_out_
 @requires_fp4
 def test_o_fp4_with_an_fp4_w_qkvg_is_row_nine():
     """Both fp4 fields together (unfused): the mixed GEMM at stage (1) AND the fp4 tail -- the stage list of row 8, the
-    weight contract per weight (``w_qkvg`` e2m1 by ``w_qkvg_dtype``, ``w_o`` e2m1 by ``o_fp4``), ``w_qkvg_sf`` unchanged."""
+    weight contract per weight (``w_qkvg`` e2m1 by ``w_qkvg_dtype``, ``w_o`` e2m1 by ``o_fp4``), ``w_qkvg_sf`` unchanged.
+    Fully fused, the same two fields are row 11 on top of the fp4 O: served by the fused fork's e2m1-B arm (4 stages)."""
     blk = _decl_block_fp4o(Fp4Format.MXFP4, w_qkvg_fp4=True)
     blk._check_declaration()
     assert blk.quant.w_qkvg_fp4 and blk.o_fp4 is Fp4Format.MXFP4
@@ -779,9 +891,15 @@ def test_o_fp4_with_an_fp4_w_qkvg_is_row_nine():
     blk._proj.check_support()
     blk._out_proj.check_support()
     assert blk._layout() == _decl_block_fp4o(Fp4Format.MXFP4)._layout(), "the fp4 weight adds no slot; the fp4 O's slots are the same"
-    # row 11 stays a typed decline on top of the fp4 O
-    with pytest.raises(NotImplementedError, match="e4m3 B"):
-        _decl_block_fp4o(Fp4Format.MXFP4, w_qkvg_fp4=True, **_FUSED).check_support() if not _fork_has_fp4_arm() else pytest.skip("fork arm landed")
+    # row 11 on top of the fp4 O is SERVED by the fused fork's e2m1-B arm (the composition of the two fp4 modes, fully fused):
+    # the fused projection carries weight_fp4 and its own gates take over (the sm_107a arch gate on another CUDA device)
+    fused = _decl_block_fp4o(Fp4Format.MXFP4, w_qkvg_fp4=True, **_FUSED)
+    assert fused.mxfp8_fused and fused._proj.params().weight_fp4 and [s.name for s in fused._stages] == _FP4_O_FUSED_STAGES
+    if _cc() == mx_suite._SM107:
+        fused.check_support()
+    elif _cc() is not None:
+        with pytest.raises(NotImplementedError, match="sm_107a"):
+            fused._proj.check_support()
 
 
 @requires_fp4
@@ -1164,9 +1282,10 @@ def test_o_fp4_execute_requires_w_o_sf_and_a_block_without_o_fp4_refuses_it(fmt)
 # ---------------------------------------------------------------------------
 
 
-def _dispatch_trace_fp4o(blk, monkeypatch, fmt):
+def _dispatch_trace_fp4o(blk, monkeypatch, fmt, w_qkvg_fp4: bool = False):
     """``mx_suite._dispatch_trace`` for an fp4-O block: every stage's launch replaced by a recorder that keeps the
     positional / keyword arguments; the block's own ``_make_quant_dev`` (``{}``) stands in for ``compile``.
+    ``w_qkvg_fp4`` (appended) hands the e2m1 ``W_qkvg`` in as well (the composition of the two fp4 modes).
     Returns ``[(stage, method, args, kwargs)]`` in call order."""
     lay = blk._layout()
     blk._ws = lay
@@ -1178,7 +1297,7 @@ def _dispatch_trace_fp4o(blk, monkeypatch, fmt):
         for meth in ("execute", "execute_mxfp8", "execute_fp8"):
             if hasattr(st, meth):
                 monkeypatch.setattr(st, meth, lambda *a, _n=st.name, _m=meth, **k: calls.append((_n, _m, a, k)))
-    _, args, hsf, wsf, wosf = _decl_tensors_fp4o(fmt, batch=blk.batch, seq_len=blk.seq_len)
+    _, args, hsf, wsf, wosf = _decl_tensors_fp4o(fmt, batch=blk.batch, seq_len=blk.seq_len, w_qkvg_fp4=w_qkvg_fp4)
     ws = torch.zeros(lay.total_bytes, dtype=torch.uint8, device="cuda")
     blk.execute(*args, ws, h_sf=hsf, w_qkvg_sf=wsf, w_o_sf=wosf)
     return calls, wosf, ws
@@ -1399,3 +1518,225 @@ def test_fp4_o_launch_count_is_nine_unfused_and_four_fused(fmt, fused):
     assert len(kernels) == len(blk._stages) == (4 if fused else 9), (len(kernels), kernels)
     assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
     assert not memsets, f"unexpected memset(s) on the execute path: {memsets}"
+
+
+# ===========================================================================
+# THE e2m1 W_qkvg ARM x THE fp4 O ON THE FULLY FUSED PIPELINE (config row 9 x row 10), THE MEASURED LAUNCH CENSUS, THE SHAPE SWEEP
+# ===========================================================================
+
+
+def _fp4w_o4_inputs(geom_kw, batch, seq_len, fmt):
+    """``_fp4w_inputs`` AND ``_fp4o_inputs`` at once: ``W_qkvg`` re-quantized to MXFP4 (packed E2M1 ``[N, K/2]`` viewed
+    ``float4_e2m1fn_x2`` with its E8M0 / 32 blob under the UNCHANGED key) and ``W_o`` to ``fmt``.  Returns
+    ``(inp, kern, orac, desc)``: ``kern`` is what the block gets, ``orac`` the same dict with the weight's values as e4m3
+    SHADOW codes (the oracle dequantizes exactly the bytes the GEMM reads; ``W_o`` it dequantizes through the fp4 blob itself)."""
+    inp = make_inputs(RefGeometry(**geom_kw), batch=batch, seq_len=seq_len, dtype=torch.bfloat16)
+    kern, desc = quantize_block_inputs_mxfp8(inp, o_fp4=fmt, w_qkvg_fp4=True)
+    assert kern["w_qkvg"].dtype == _FP4 and kern["w_o"].dtype == _FP4 and desc == dict(descale_w_o=1.0)
+    packed = kern["w_qkvg"].view(torch.uint8)
+    values = unpack_e2m1(packed)
+    shadow = values.to(E4M3)
+    assert torch.equal(shadow.float(), values), "E2M1 values are e4m3-exact by construction"
+    assert torch.equal(mx_dequant_rowwise_2d(shadow, kern["w_qkvg_sf"]), fp4_dequant_rowwise_2d(packed, kern["w_qkvg_sf"], "mxfp4"))
+    return inp, kern, dict(kern, w_qkvg=shadow), desc
+
+
+def _run_fp4w_o4_block(geom_kw, batch, seq_len, fmt, *, sentinel: bool = False, **blk_kw):
+    """Declare / check / compile / execute the block with BOTH fp4 modes (``w_qkvg_dtype=float4_e2m1fn_x2`` + ``o_fp4=fmt``);
+    return ``(out, oracle, bf16_ref, blk, kern, spec)``.  ``_run_fp4o_block`` with the e2m1 weight of ``_run_fp4w_block``."""
+    geom = GatedAttentionBlockGeometry(**geom_kw)
+    rg = mx_suite._ref_geom(geom)
+    fused = bool(blk_kw.get("fuse_gate")) and bool(blk_kw.get("fuse_norm_rope"))
+    inp, kern, orac, desc = _fp4w_o4_inputs(geom_kw, batch, seq_len, fmt)
+    spec = MxQuantSpec(**desc, o_fp4=fmt, w_qkvg_dtype=_FP4)
+    ref = gated_attention_block_mxfp8_reference(orac, rg, descale_w_o=1.0, scale_o=1.0, fused=fused, o_fp4=fmt)
+    bf16_ref = gated_attention_block_reference(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], rg).out
+    out = torch.empty(batch, seq_len, geom.d_model, device="cuda", dtype=torch.bfloat16)
+    if sentinel:
+        out.fill_(_SENTINEL)
+    blk = GatedAttentionBlockFwd(
+        kern["h"],
+        kern["w_qkvg"],
+        kern["w_q_norm"],
+        kern["w_k_norm"],
+        kern["cos"],
+        kern["sin"],
+        kern["w_o"],
+        out,
+        geom,
+        quant=spec,
+        sample_h_sf=kern["h_sf"],
+        sample_w_qkvg_sf=kern["w_qkvg_sf"],
+        sample_w_o_sf=kern["w_o_sf"],
+        **blk_kw,
+    )
+    blk.check_support()
+    blk.compile()
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    _execute_fp4o(blk, kern, out, ws)
+    torch.cuda.synchronize()
+    return out, ref, bf16_ref, blk, kern, spec
+
+
+@requires_rubin
+@requires_fp4
+@pytest.mark.parametrize("seq_len, causal", [(1000, True), (1024, False)])
+@pytest.mark.parametrize("fmt", _FMTS, ids=_FMT_IDS)
+def test_mxfp4_weight_with_fp4_o_fused_block_matches_the_fake_quant_oracle(fmt, seq_len, causal):
+    """The COMPOSITION of the two fp4 modes on the fully fused pipeline (4 launches): the fused fork's e2m1-B arm feeds the gated
+    MXFP8 SDPA's bf16-O arm, ``quantize_fp4_o`` and the fp4 x fp4 out projection.  The fake-quant oracle is fed the e4m3 shadow
+    of the e2m1 weight and dequantizes the fp4 ``W_o`` through its blob; sentinel clean, finite, ``cos > 0.99``, the FORMAT FLOOR
+    ``cos(kernel, bf16 ref) >= cos(oracle, bf16 ref) - 0.005`` and a bitwise second execute -- the bars of the two single-mode
+    fused cells.  B=1 at S=1000 (the fused path declines ``S % 128 != 0`` at B > 1), B=2 at S=1024."""
+    _skip_fused_if_twin_missing(True)
+    b = 1 if seq_len % 128 else 2
+    out, ref, bf16_ref, blk, kern, spec = _run_fp4w_o4_block({**_GEOM, "is_causal": causal}, b, seq_len, fmt, sentinel=True, **_FUSED)
+    assert spec.w_qkvg_fp4 and spec.o_fp4 is fmt and blk.mxfp8_fused and [s.name for s in blk._stages] == _FP4_O_FUSED_STAGES
+    assert blk._proj._plan.w_dtype == _FP4 and blk._proj._plan.params.weight_fp4 and blk._proj._plan.mxfp8
+    assert (
+        blk._out_proj._plan.block_scale
+        and blk._out_proj._plan.dtype == blk._out_proj._plan.w_dtype == _FP4
+        and blk._out_proj._plan.block_size == fmt.block_size
+    )
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    c = mx_suite._cos(out, ref)
+    rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
+    c_k, c_o = mx_suite._cos(out, bf16_ref), mx_suite._cos(ref, bf16_ref)
+    print(
+        f"\nmxfp4-weight + {fmt.name} O FUSED block B={b} S={seq_len} causal={causal}: cos(kernel, oracle)={c:.6f} max_rel={rel:.3e} "
+        f"| format floor cos(oracle, bf16)={c_o:.6f} cos(kernel, bf16)={c_k:.6f} | out_proj route={blk._out_proj._plan.route}"
+    )
+    assert c > 0.99, f"mxfp4-weight + {fmt.name} O fused block cos {c}"
+    assert c_k >= c_o - 0.005, f"the kernel sits below the fp4 format floor: cos(kernel, bf16)={c_k} < cos(oracle, bf16)={c_o} - 0.005"
+    out2 = torch.full_like(out, _SENTINEL)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    _execute_fp4o(blk, kern, out2, ws)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out2, out, rtol=0, atol=0)
+
+
+@requires_rubin
+@requires_fp4
+@pytest.mark.parametrize("o_fp4", [None, Fp4Format.NVFP4], ids=["w4_fused", "w4_nvfp4o_fused"])
+def test_mxfp4_weight_fused_launch_count_is_three_and_four_with_an_nvfp4_o(o_fp4):
+    """One CUDA kernel per stage and NO hidden launch on the fully fused fp4-weight pipeline: 3 (the e2m1-B arm IS the fused
+    projection launch -- no cast, no repack), 4 with an NVFP4 ``O`` (``quantize_fp4_o`` is the one launch the fp4 O adds), no
+    memset, no memcpy.  Profiled on the SECOND execute; typed skip where CUPTI records nothing (the Rubin dev / perf nodes)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    _skip_fused_if_twin_missing(True)
+    if o_fp4 is None:
+        out, _, _, blk, kern, _ = _run_fp4w_block(_GEOM, 1, 512, w_fp4=True, **_FUSED)
+
+        def run(o, ws):
+            mx_suite._execute(blk, kern, o, ws)
+
+    else:
+        out, _, _, blk, kern, _ = _run_fp4w_o4_block(_GEOM, 1, 512, o_fp4, **_FUSED)
+
+        def run(o, ws):
+            _execute_fp4o(blk, kern, o, ws)
+
+    assert blk.mxfp8_fused and blk._proj._plan.w_dtype == _FP4 and blk._proj._plan.params.weight_fp4
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    run(out, ws)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        run(out, ws)
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    if not names:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    memsets = [n for n in names if "memset" in n.lower()]
+    memcpys = [n for n in names if "memcpy" in n.lower()]
+    kernels = [n for n in names if n not in memsets and n not in memcpys]
+    print(f"\nmxfp4-weight fused{'' if o_fp4 is None else ' + ' + o_fp4.name + ' O'} CUDA events:\n  " + "\n  ".join(names))
+    assert len(kernels) == len(blk._stages) == (3 if o_fp4 is None else 4), (len(kernels), kernels)
+    assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
+    assert not memsets, f"unexpected memset(s) on the execute path: {memsets}"
+
+
+_GEOM_MHA_20 = dict(d_model=512, h_q=20, h_kv=20, d_head=256, rope_dim=64)  # MHA (h_q == h_kv): N = 80 x 256
+_GEOM_GQA_6_2 = dict(d_model=512, h_q=6, h_kv=2, d_head=256, rope_dim=64)  # a non-power-of-two h_q: N = 16 x 256
+# The acceptance-sweep shape for the fully fused fp4-weight block, (geometry, batch, seq_len, causal, qk_norm, seq_lens, shadow twin):
+# one KV tile (S=128), several, a ring wrap (S=4096), a tail tile (S=1000 -- B=1 only: the fused path declines S % 128 != 0 at B > 1;
+# under a DENSE mask the SDPA row serves an S_kv % 128 != 0 tail only with a padding mask, so those cells carry ``seq_lens``: the full
+# length and a ragged one), a fully-tail CTA (M % 256 == 128), B in {1, 2, 3}, dense + causal, norm + RoPE-only, GQA 8/2 (the test
+# geometry) / 32/2 / 6/2 and MHA 20/20, one DEAD entry (length 0) beside a ragged live one at B >= 2; ``shadow`` also runs the e4m3 fork on shadow codes and
+# pins the block output bitwise.  Asserts: sentinel clean, finite, the oracle cos floor per LIVE entry, the format floor, a bitwise
+# second execute, the dead entry exactly zero; every number is in the log.
+_W4_FUSED_SWEEP = [
+    (_GEOM, 1, 128, True, True, None, False),
+    (_GEOM, 1, 256, False, False, None, False),
+    (_GEOM, 2, 128, False, True, None, False),
+    (_GEOM, 3, 128, True, True, (128, 64, 0), False),
+    (_GEOM, 1, 1000, False, True, (1000,), False),
+    (_GEOM, 2, 1024, True, False, None, False),
+    (_GEOM, 3, 1024, False, True, None, False),
+    (_GEOM, 1, 4096, True, True, None, False),
+    (_GEOM, 2, 4096, False, True, None, False),
+    (_GEOM, 3, 256, True, False, (256, 128, 0), True),
+    (_GEOM_397B, 1, 1024, True, True, None, True),
+    (_GEOM_397B, 1, 256, False, False, None, False),
+    (_GEOM_397B, 2, 128, True, True, (128, 0), False),
+    (_GEOM_MHA_20, 1, 256, True, True, None, True),
+    (_GEOM_MHA_20, 2, 128, False, False, None, False),
+    (_GEOM_MHA_20, 3, 256, True, True, (256, 100, 0), False),
+    (_GEOM_GQA_6_2, 3, 128, True, True, None, True),
+    (_GEOM_GQA_6_2, 1, 1000, False, True, (900,), False),
+    (_GEOM_GQA_6_2, 2, 256, False, False, (256, 0), False),
+    (_GEOM_397B, 3, 256, True, True, (256, 1, 0), False),  # a LENGTH-1 live entry (one live Q row, n_kv = 1 after the trim) beside a dead one
+    (_GEOM_MHA_20, 1, 1000, False, True, (1000,), True),  # MHA, dense tail tile with the padding mask, the shadow twin bitwise
+]
+
+
+def _sweep_id(cell) -> str:
+    g, b, s, causal, qk_norm, lens, shadow = cell
+    kind = "mha" if g["h_q"] == g["h_kv"] else "gqa"
+    return (
+        f"{kind}{g['h_q']}_{g['h_kv']}_d{g['d_model']}_b{b}_s{s}_{'causal' if causal else 'dense'}_{'norm' if qk_norm else 'rope'}"
+        f"{('_dead' if 0 in lens else '_padmask') if lens else ''}{'_shadow' if shadow else ''}"
+    )
+
+
+@requires_rubin
+@requires_fp4
+@pytest.mark.parametrize("cell", _W4_FUSED_SWEEP, ids=[_sweep_id(c) for c in _W4_FUSED_SWEEP])
+def test_mxfp4_weight_fused_block_shape_sweep(cell):
+    """The fully fused fp4-weight block over the acceptance-sweep axes of ``_W4_FUSED_SWEEP`` (the e2m1 B changes the operand, not
+    the M-axis tail / mask / batch handling -- so every one of those arms is driven once through the arm): no sentinel survivor,
+    finite, ``cos > 0.99`` vs the fake-quant oracle per LIVE entry, the FORMAT FLOOR ``cos(kernel, bf16) >= cos(oracle, bf16) - 0.005``
+    over the live entries, a bitwise second execute, a dead entry (``seq_lens[b] == 0``) EXACTLY zero; on the ``shadow`` cells the
+    e4m3 fork fed the same values as shadow codes yields the ``torch.equal`` block output."""
+    geom_kw, b, s, causal, qk_norm, lens, shadow = cell
+    _skip_fused_if_twin_missing(True)
+    gk = {**geom_kw, "is_causal": causal, "qk_norm": qk_norm}
+    seq_lens = torch.tensor(lens, device="cuda", dtype=torch.int32) if lens else None
+    out, ref, bf16_ref, blk, kern, spec = _run_fp4w_block(gk, b, s, w_fp4=True, seq_lens=seq_lens, sentinel=True, **_FUSED)
+    assert blk.mxfp8_fused and len(blk._stages) == 3 and spec.w_qkvg_fp4 and blk._sdpa.seq_lens_present == (lens is not None)
+    assert blk._proj._plan.w_dtype == _FP4 and blk._proj._plan.params.weight_fp4 and blk._proj._plan.params.qk_norm == qk_norm
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    live = [i for i in range(b) if lens is None or lens[i] > 0]
+    for i in range(b):
+        if i not in live:
+            assert (out[i] == 0).all(), f"the dead entry {i} must be EXACTLY zero; max|out[{i}]| = {out[i].abs().max().item()}"
+    cs = [mx_suite._cos(out[i], ref[i]) for i in live]
+    c_k, c_o = mx_suite._cos(out[live], bf16_ref[live]), mx_suite._cos(ref[live], bf16_ref[live])
+    print(
+        f"\n[mxfp4-weight FUSED block sweep {_sweep_id(cell)}] cos(kernel, oracle) per live entry={[f'{c:.6f}' for c in cs]} "
+        f"| format floor cos(oracle, bf16)={c_o:.6f} cos(kernel, bf16)={c_k:.6f}"
+    )
+    assert all(c > 0.99 for c in cs), f"mxfp4-weight fused block cos per entry {cs}"
+    assert c_k >= c_o - 0.005, f"the kernel sits below the fp4 format floor: cos(kernel, bf16)={c_k} < cos(oracle, bf16)={c_o} - 0.005"
+    out2 = torch.full_like(out, _SENTINEL)
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    mx_suite._execute(blk, kern, out2, ws, seq_lens=seq_lens)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out2, out, rtol=0, atol=0)
+    if shadow:
+        out8, _, _, blk8, _, spec8 = _run_fp4w_block(gk, b, s, w_fp4=True, shadow=True, seq_lens=seq_lens, sentinel=True, **_FUSED)
+        assert not spec8.w_qkvg_fp4 and blk8._proj._plan.w_dtype == E4M3 and blk8._proj._plan.module is not blk._proj._plan.module
+        assert not (out8 == _SENTINEL).any()
+        torch.testing.assert_close(out, out8, rtol=0, atol=0)

@@ -774,3 +774,11 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
         src = (kdir / name).read_text()
         assert "make_split_helpers" in src, f"{name}: no longer split-capable; drop it from _SLOTLESS_FLAVORS"
         assert not has_slot(src), f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"
+
+
+@pytest.mark.parametrize("min_tiles", [1, 2, 4])
+def test_candidates_and_choice_respect_a_supplied_min_tiles(min_tiles):
+    for kv_tiles in (1, 3, 16, 17, 512):
+        assert all(kv_tiles // s >= min_tiles for s in split_kv_candidates(sm_count=188, kv_tiles=kv_tiles, min_tiles=min_tiles) if s > 1)
+        s = choose_split_kv(q_tiles=1, heads_q=1, batch=1, kv_tiles=kv_tiles, sm_count=188, combine_rows=8, min_tiles=min_tiles, combine_floor=0.1)
+        assert s == 1 or kv_tiles // s >= min_tiles

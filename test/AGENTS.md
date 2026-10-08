@@ -455,6 +455,17 @@ memo. `test_wrapper_capacity_reuses_artifact_without_disk_cache` is the native
 SM80 detector. When asserting disk-artifact hits, clear the process memo before
 both cache population and reload: otherwise an earlier test can prevent the
 temporary cache from being populated, or a memo hit can bypass the disk counter.
+A test that SPIES a trace-time call (a `monkeypatch` wrapper around a host-side
+helper that runs only while the kernel body is traced) must switch the in-process
+compile memo off as well as the on-disk cache: set
+`CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` next to
+`CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1` (both documented in
+`python/cudnn/frost/compiled_cache.py`). With the memo on, a plan this process has
+already built for the same (device, key, symbol, options) is handed out without a
+new trace, so the spy sees 0 calls instead of the 1 per trace it asserts; the plan
+need not be the test's own: when the arm's cell is the suite's default shape, an
+earlier test's plan serves it. `_bs_dq_arm` in
+`sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py` sets both and is the detector.
 
 A `None` compile sample may still occupy a positional TVM-FFI argument slot.
 When extending a prepared host with a staged-only operand, retain the native
@@ -604,6 +615,14 @@ does not follow it. A subprocess-based GPU test must check architecture in the
 parent before spawning; a `pytest.skip` in a plain Python child exits nonzero.
 Keep genuine child failures failing on supported devices. The half SDPA artifact
 reload detector is re-exported through `TestStagedHalf` and covers this boundary.
+
+Cross-architecture compile probes must select their target explicitly, before
+the DSL is imported in a fresh subprocess, and override an inherited
+`CUTE_DSL_ARCH`. Otherwise a Blackwell/Rubin probe can lower for the runner's
+SM80 GPU and fail in NVVM despite a valid kernel. Disable the compiled cache
+so the probe really compiles. `test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic`
+can be run with `CUTE_DSL_ARCH=sm_80` to check target isolation; only its named
+missing-intrinsic error is a skip, while other compiler failures remain failures.
 
 Gate layout admission must share the adapter's TMA predicate, including batch
 stride alignment for B > 1. A valid head/sequence pitch cannot compensate for

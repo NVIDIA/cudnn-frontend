@@ -251,17 +251,20 @@ def fp4_launch_formula_from_facts(blk) -> int:
 
 
 def test_fp4_launch_formula_reproduces_the_derivations():
-    """Host, no GPU: 28 / 29 at the bitwise cell (w4 / an fp4 W_o), 27 / 28 RoPE-only, 24 / 25 MHA, 43 / 44 at the padded GQA cell."""
+    """Host, no GPU: 15 / 16 at the bitwise cell (w4 / an fp4 W_o), 15 / 16 RoPE-only, 14 / 15 MHA, 30 / 31 at the padded GQA cell --
+    the MXFP8 chain's fused counts (its PROLOGUE / dual-axis dO / EPILOGUE launches) over the row's single-launch block-scale dQ, plus
+    the dY block quantize under an fp4 W_o; the unfused chain over the per-member dQ read 28 / 29, 27 / 28, 24 / 25, 43 / 44, the fused
+    chain over the per-member dQ 18 / 19, 18 / 19, 14 / 15, 33 / 34."""
     want = {
-        ("w4", "s512_causal_b2-norm"): 28,
-        ("o_nvfp4", "s512_causal_b2-norm"): 29,
-        ("w4_o_mxfp4", "s512_causal_b2-norm"): 29,
-        ("w4", "s256_causal_b2_rope-rope_only"): 27,
-        ("o_mxfp4", "s256_causal_b2_rope-rope_only"): 28,
-        ("w4", "s1024_dense_b1_mha-norm"): 24,
-        ("w4_o_nvfp4", "s1024_dense_b1_mha-norm"): 25,
-        ("w4", "s992_causal_b1-norm"): 43,
-        ("o_nvfp4", "s992_causal_b1-norm"): 44,
+        ("w4", "s512_causal_b2-norm"): 15,
+        ("o_nvfp4", "s512_causal_b2-norm"): 16,
+        ("w4_o_mxfp4", "s512_causal_b2-norm"): 16,
+        ("w4", "s256_causal_b2_rope-rope_only"): 15,
+        ("o_mxfp4", "s256_causal_b2_rope-rope_only"): 16,
+        ("w4", "s1024_dense_b1_mha-norm"): 14,
+        ("w4_o_nvfp4", "s1024_dense_b1_mha-norm"): 15,
+        ("w4", "s992_causal_b1-norm"): 30,
+        ("o_nvfp4", "s992_causal_b1-norm"): 31,
     }
     for (cfg_name, cell_id), n in want.items():
         got = fp4_expected_launches(_CFG_BY_NAME[cfg_name], mx_bwd._BY_ID[cell_id])
@@ -1180,7 +1183,7 @@ def test_fp4_workspace_size_is_honest(cfg):
         blk.geom, blk.batch, blk.seq_len, blk.act_dtype, blk.recompute,
         need=dict(dw_o=blk.need_dw_o, dw_norms=blk.need_dw_norms, dw_qkvg=blk.need_dw_qkvg),
         sdpa_bwd_bytes=lay.sdpa_bwd_bytes, gemm_scratch_bytes=lay.gemm_scratch_bytes, n_ctas_q=lay.n_ctas_q, n_ctas_k=lay.n_ctas_k,
-        delta_shape=lay.delta_shape, quant=spec8, amax_partials_n=lay.amax_partials_n,
+        delta_shape=lay.delta_shape, quant=spec8, amax_partials_n=lay.amax_partials_n, mx_prologue_arm=blk.mx_prologue_arm,
     )  # fmt: skip
     for f_ in dataclasses.fields(lay):
         if f_.name not in ("dy_mx8", "sf_dy_mx", "dy4", "sf_dy4", "total_bytes"):
@@ -1319,10 +1322,11 @@ def test_fp4_declaration_constructs_and_the_artifact_rejects_match_the_attribute
     blk = _placeholder_block(cfg)
     names = [type(st).__name__ for st in blk._stages]
     assert names.count("_QuantizeFp4") == (1 if cfg.o_fp4 is Fp4Format.NVFP4 else 0)
-    assert names.count("_QuantizeMxfp8") == 9 + (1 if cfg.o_fp4 is Fp4Format.MXFP4 else 0)
-    assert len(names) == 20 + cfg.extra_launches
+    # the fused MXFP8 chain: ONE standalone quantize stage (the dual-axis dO) + the dY block quantize under an MXFP4 W_o; 11 stages
+    assert names.count("_QuantizeMxfp8") == 1 + (1 if cfg.o_fp4 is Fp4Format.MXFP4 else 0)
+    assert len(names) == 11 + cfg.extra_launches and names[0] == "_MxQuantPrologue" and "_MxQuantEpilogue" in names
     if cfg.o_fp4 is not None:
-        assert names[3] in ("_QuantizeFp4", "_QuantizeMxfp8") and names[4] == "_OutProjDgrad", names[:5]
+        assert names[2] in ("_QuantizeFp4", "_QuantizeMxfp8") and names[3] == "_OutProjDgrad", names[:4]
     b2, b8 = blk._out_proj_dgrad, blk._qkv_gate_dgrad
     assert b2.block_scale == (cfg.o_fp4 is not None) and b8.block_scale and (b8.w_dtype == _FP4) == cfg.w_qkvg_fp4
     assert blk._gate_bwd.want_dy_descale == (cfg.o_fp4 is Fp4Format.NVFP4)

@@ -1341,3 +1341,22 @@ def test_sm107_dense_d128_gqa_packs_under_a_band_at_prefill_depth(sm107_metadata
     assert plans[0].knobs.pack_gqa is packed_first, [p.knobs for p in plans]
     assert {p.knobs.pack_gqa for p in plans} >= {True, False}, [p.knobs for p in plans]
     assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("s_q", [2, 257])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
+    """An admitted unsplit plan uses both prefill slabs; split keeps its own tile."""
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_tile_q
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    facts = _facts(dtype=dtype, device_cc=cc, s_q=s_q, h_q=16, h_kv=4, thd=True, padded=True, has_paged_kv=True, page_size=16)
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=True))
+    if cc == (10, 0):
+        assert reason is None, reason
+        assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=1) == 2 * 128
+    else:
+        assert reason is not None
+    assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=2) == 128

@@ -691,6 +691,7 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         thd=facts.thd,
         paged=facts.has_paged_kv,
         split_kv=split_kv or 1,
+        max_q=facts.s_q,
     ):
         return frozenset({1, 2})
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
@@ -768,10 +769,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
-        # cga1 on the SM100 line's d128 f16/bf16 flavor IS the decode tile
-        # (sm100/decode_d128_f16.py, TILES_Q=1). Paged THD uses the one-query
-        # ragged-Q leg or the native unpacked packed-split host; other ragged
-        # graphs keep the cga2 prefill tile.
+        # D128 half cga1 uses the decode tile for ragged Q=1 and the split
+        # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
+        # Other ragged graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
         split_cga = knobs.cga if knobs.cga is not None else (1 if (facts.d_qk, facts.d_v) == (64, 64) else 2)
@@ -817,13 +817,25 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if (
             knobs.cga == 1
             and facts.thd
-            and not (ragged_decode or packed_split)
+            and not (
+                ragged_decode
+                or packed_split
+                or supports_paged_prefill_cga1(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    split_kv=knobs.split_kv or 1,
+                    max_q=facts.s_q,
+                )
+            )
             and capabilities.sm_lo == 100
             and _selected_d_shape(capabilities, facts) == (128, 128)
         ):
             return (
-                "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or exact D128 with split_kv > 1; "
-                "other THD (ragged) graphs run the cga2 prefill tile"
+                "cga=1 on the d128 flavor supports the decode tile for ragged Q over paged K/V with ragged Stats at S_q == 1, "
+                "exact D128 with split_kv > 1, or the SM100 paged prefill body at S_q > 1; other THD graphs run the cga2 prefill tile"
             )
         if ragged_decode and (knobs.split_kv is None or knobs.split_kv < 2):
             # The ragged final rows exist only through the combine pass.

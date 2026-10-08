@@ -1657,6 +1657,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             thd=self.thd,
             paged=self.paged,
             split_kv=self.split_kv,
+            max_q=int(s_qo),
         )
         # An unsplit Rubin paged request uses the prefill template even at
         # one query token; the split decode leg belongs to the SM100 family.
@@ -2386,7 +2387,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # the launched kernel.
             emit_amax_o=(not self.pv_bf16) or self.has_amax_o,
             epilogue_gate=self.gate_desc is not None,
-            thd_batch_one=self.packed_thd_split and self.batch_size == 1,
+            thd_batch_one=(
+                self.packed_thd_split
+                or (
+                    self.thd
+                    and not self.thd_decode_leg
+                    and not self._fp8
+                    and self.flavor == (128, 128)
+                    # Qualified prefill variants of the shared template.
+                    # Other variants keep their existing compiled record.
+                    and ((self._device_cc == (10, 0) and self.dtype == torch.bfloat16) or (self._device_cc == (10, 7) and self.paged))
+                )
+            )
+            and self.batch_size == 1,
         )
         if self.flavor == (192, 128):
             from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs

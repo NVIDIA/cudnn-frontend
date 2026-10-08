@@ -750,6 +750,243 @@ def test_e8m0_corners_on_device(axis):
         assert code == exp_code, f"{axis} amax={amax}: code 0x{code:02X} != 0x{exp_code:02X}"
 
 
+# ---------------------------------------------------------------------------
+# The DUAL-AXIS arm: rowwise + columnwise from one read (the MXFP8 backward's launch fusion)
+# ---------------------------------------------------------------------------
+
+
+def _launch_dual(src: torch.Tensor, *, batch: int, seq_len: int, h: int, canonical: bool, poison: int = 0xFF):
+    """Compile (cached) the dual arm, poison every destination byte with ``poison``, run, sync.  Returns ``(dst, sf, dst_T, sf_T)``."""
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import compile_quantize_mxfp8_dual, run_quantize_mxfp8_dual
+
+    t = batch * seq_len
+    r = compile_quantize_mxfp8_dual(dtype_in=src.dtype, h=h, d=D, sf_layout=SF_LAYOUT_GEMM if canonical else SF_LAYOUT_SDPA, transposed_second=canonical)
+    dst = torch.full((t, h, D), poison, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    dst_t = torch.full((h * D, t) if canonical else (t, h, D), poison, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    if canonical:
+        sf = torch.full((sf_blob_bytes(t, h * D),), poison, dtype=torch.uint8, device="cuda")
+        sf_t = torch.full((sf_blob_bytes(h * D, t),), poison, dtype=torch.uint8, device="cuda")
+    else:
+        sf = torch.full((sf_bytes(batch, h, seq_len, D),), poison, dtype=torch.uint8, device="cuda")
+        sf_t = torch.full_like(sf, poison)
+    run_quantize_mxfp8_dual(r, src, dst, sf, dst_t, sf_t, batch=batch, seq_len=seq_len, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    return dst, sf, dst_t, sf_t
+
+
+def test_dual_axis_contracts_are_typed():
+    """The dual arm's modes and shapes, typed before any device is touched: the SDPA pair refuses ``transposed_second``, the canonical
+    pair REQUIRES it (the columnwise canonical blob has one form), the column pass needs one thread per ``d``, both SF tiles must
+    burst in parallel, ``moved_bytes_dual`` is one read + two writes."""
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import moved_bytes_dual, validate_dual_mode, validate_dual_shape
+
+    validate_dual_mode(SF_LAYOUT_SDPA, False)
+    validate_dual_mode(SF_LAYOUT_GEMM, True)
+    with pytest.raises(ValueError, match="needs sf_layout='gemm'"):
+        validate_dual_mode(SF_LAYOUT_SDPA, True)
+    with pytest.raises(ValueError, match="needs transposed=True"):
+        validate_dual_mode(SF_LAYOUT_GEMM, False)
+    validate_dual_shape(D, 256)
+    validate_dual_shape(128, 128)
+    validate_dual_shape(512, 512)
+    with pytest.raises(ValueError, match="one thread per d"):
+        validate_dual_shape(D, 128)
+    with pytest.raises(ValueError, match="must divide the 32-token sub-tile"):
+        validate_dual_shape(D, 1024)  # 1024 / 16 = 64 rows per pass > 32
+    assert moved_bytes_dual(1000, 4, D) == 2 * moved_bytes(1000, 4, D) - 1000 * 4 * D * 2  # the second READ is what the fusion saves
+    assert moved_bytes_dual(1000, 4, D, src_elem_bytes=2) == 1000 * 4 * D * 4 + 2 * (1000 * 4 * D // 32)
+    # the recipe's host checks, on a recipe with compiled=None (no device needed beyond the tensors)
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import QuantizeMxfp8DualRecipe, check_dual_operands
+
+    if not torch.cuda.is_available():
+        return
+    t, h = 64, 2
+    src = torch.empty(t, h, D, dtype=torch.bfloat16, device="cuda")
+    dst = torch.empty(t, h, D, dtype=torch.float8_e4m3fn, device="cuda")
+    sf = torch.empty(sf_bytes(1, h, t, D), dtype=torch.uint8, device="cuda")
+    r_sdpa = QuantizeMxfp8DualRecipe(dtype_in=torch.bfloat16, h=h, d=D)
+    assert check_dual_operands(r_sdpa, src, dst, sf, torch.empty_like(dst), torch.empty_like(sf), batch=1, seq_len=t) == (t, h, 0, 0)
+    with pytest.raises(ValueError, match="dst_T must be the compact e4m3"):
+        check_dual_operands(r_sdpa, src, dst, sf, torch.empty(h * D, t, dtype=torch.float8_e4m3fn, device="cuda"), torch.empty_like(sf), batch=1, seq_len=t)
+    with pytest.raises(ValueError, match="sf_T must hold"):
+        check_dual_operands(r_sdpa, src, dst, sf, torch.empty_like(dst), sf[:-16], batch=1, seq_len=t)
+    r_can = QuantizeMxfp8DualRecipe(dtype_in=torch.bfloat16, h=h, d=D, sf_layout=SF_LAYOUT_GEMM, transposed_second=True)
+    blob, blob_t = (
+        torch.empty(sf_blob_bytes(t, h * D), dtype=torch.uint8, device="cuda"),
+        torch.empty(sf_blob_bytes(h * D, t), dtype=torch.uint8, device="cuda"),
+    )
+    dst_t = torch.empty(h * D, t, dtype=torch.float8_e4m3fn, device="cuda")
+    n_c = sf_padded_dims(t, h * D, 32)[1] // 4
+    n_c_t = sf_padded_dims(h * D, t, 32)[1] // 4
+    assert check_dual_operands(r_can, src, dst, blob, dst_t, blob_t, batch=1, seq_len=t) == (t, h, n_c, n_c_t)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        check_dual_operands(
+            r_can,
+            src[:40],
+            dst[:40],
+            torch.empty(sf_blob_bytes(40, h * D), dtype=torch.uint8, device="cuda"),
+            dst_t[:, :40].contiguous(),
+            blob_t,
+            batch=1,
+            seq_len=40,
+        )
+    with pytest.raises(ValueError, match="transposed_second=True: dst_T must be the contiguous"):
+        check_dual_operands(r_can, src, dst, blob, torch.empty_like(dst), blob_t, batch=1, seq_len=t)
+    # the appended per-half flags (the fused epilogue's folded-out halves): a folded-out half passes None and is NOT checked (no
+    # stand-in tensor), a tensor bound to it is refused, a traced half left unbound is refused, both halves folded out is refused; a
+    # folded-out half's atom count comes back 0 (its blob is never sized -- the transposed one needs T % 32 == 0)
+    assert check_dual_operands(r_can, src, dst, blob, None, None, batch=1, seq_len=t, want_col=False) == (t, h, n_c, 0)
+    assert check_dual_operands(r_can, src, None, None, dst_t, blob_t, batch=1, seq_len=t, want_row=False) == (t, h, 0, n_c_t)
+    assert check_dual_operands(r_sdpa, src, None, None, torch.empty_like(dst), torch.empty_like(sf), batch=1, seq_len=t, want_row=False) == (t, h, 0, 0)
+    # a ROWWISE-only canonical launch over a ragged T (the block's dgrad-only cell at T = 1000, need_dw_qkvg=False) is served -- the
+    # transposed blob, which the canonical builder refuses at T % 32 != 0, is never asked for; the same T with the transposed half traced is
+    # the 32-token-block decline
+    t_r = 1000
+    src_r = torch.empty(t_r, h, D, dtype=torch.bfloat16, device="cuda")
+    dst_r = torch.empty(t_r, h, D, dtype=torch.float8_e4m3fn, device="cuda")
+    blob_r = torch.empty(sf_blob_bytes(t_r, h * D), dtype=torch.uint8, device="cuda")
+    n_c_r = sf_padded_dims(t_r, h * D, 32)[1] // 4
+    assert check_dual_operands(r_can, src_r, dst_r, blob_r, None, None, batch=1, seq_len=t_r, want_col=False) == (t_r, h, n_c_r, 0)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        check_dual_operands(r_can, src_r, dst_r, blob_r, torch.empty(h * D, t_r, dtype=torch.float8_e4m3fn, device="cuda"), blob_t, batch=1, seq_len=t_r)
+    with pytest.raises(ValueError, match="dst_T is bound but its half is not traced"):
+        check_dual_operands(r_can, src, dst, blob, dst_t, None, batch=1, seq_len=t, want_col=False)
+    with pytest.raises(ValueError, match="sf must be bound: its half is traced"):
+        check_dual_operands(r_can, src, dst, None, dst_t, blob_t, batch=1, seq_len=t)
+    with pytest.raises(ValueError, match="at least one half"):
+        check_dual_operands(r_can, src, None, None, None, None, batch=1, seq_len=t, want_row=False, want_col=False)
+
+
+_DUAL_SASS_PROBE = textwrap.dedent("""
+    import glob, os, subprocess, sys
+    canonical, dump, cands = sys.argv[1] == "1", sys.argv[2], sys.argv[3:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    import torch
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import COMPILE_OPTIONS, compile_quantize_mxfp8_dual
+    compile_quantize_mxfp8_dual(
+        dtype_in=torch.bfloat16, h=4, d=256, compile_options=COMPILE_OPTIONS + " --gpu-arch sm_107a --keep-cubin",
+        sf_layout="gemm" if canonical else "sdpa", transposed_second=canonical,
+    )
+    cubins = glob.glob(os.path.join(dump, "*.sm_107a.cubin"))
+    if not cubins:
+        print("FAIL no .sm_107a.cubin landed in", dump)
+        sys.exit(3)
+    sass = None
+    for nvd in cands:
+        try:
+            proc = subprocess.run([nvd, "-c", cubins[0]], capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", nvd, "->", repr(exc))
+            continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            sass = proc.stdout.splitlines()
+            print("NVDISASM", nvd)
+            break
+        print("REJECT", nvd, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if sass is None:
+        print("SKIP no nvdisasm candidate decodes sm_107a")
+        sys.exit(0)
+    print("SPILL", sum(1 for ln in sass if "STL" in ln or "LDL" in ln))
+    print("E8M0CVT", sum(1 for ln in sass if "F2FP" in ln and ".E8." in ln and ".RP" in ln))
+    print("STG128", sum(1 for ln in sass if "STG.E.128" in ln))
+    print("STG16", sum(1 for ln in sass if "STG.E.U16" in ln or "STG.E.16" in ln))
+    print("LINES", len(sass))
+    """)
+
+
+@pytest.mark.parametrize("canonical", [False, True], ids=["sdpa-pair", "canonical-pair"])
+def test_dual_axis_sm107_trace_compile_has_no_spills(canonical, tmp_path):
+    """The dual arm compiled for Rubin here (no device match needed), decoded with an nvdisasm that knows sm_107a: STL/LDL must be 0
+    in both modes, the column pass's ``cvt.rp...ue8m0x2`` present, and EVERY payload leaves as 16-byte vectors -- the SDPA pair's
+    columnwise payload included (NO ``STG.E.U16``: the 2-byte-store arm of the standalone columnwise kernel is what the fusion
+    removes from the chain).  SKIPS, never fails, where the DSL predates sm_107a or no nvdisasm decodes it."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / f"quantize_mxfp8_dual_{int(canonical)}"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", _DUAL_SASS_PROBE, "1" if canonical else "0", str(dump), *cands], capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, f"trace-compile failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    if any(ln.startswith("SKIP") for ln in proc.stdout.splitlines()):
+        pytest.skip(f"{[ln for ln in proc.stdout.splitlines() if ln.startswith(('SKIP', 'REJECT'))]}")
+    keys = ("SPILL", "E8M0CVT", "STG128", "STG16", "LINES")
+    stats = {k: int(v) for k, v in (ln.split() for ln in proc.stdout.splitlines() if ln.split() and ln.split()[0] in keys)}
+    print(f"\n[dual canonical={canonical}] sm_107a SASS: {stats}")
+    assert stats["SPILL"] == 0, f"dual canonical={canonical}: {stats['SPILL']} STL/LDL in the sm_107a cubin"
+    assert stats["E8M0CVT"] >= 2 and stats["STG128"] > 1, stats
+    assert stats["STG16"] == 0, f"the dual arm must store every payload as 16-byte vectors, never 2-byte words: {stats}"
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("b, s", [(1, 256), (2, 992), (1, 1000), (2, 1008), (1, 2016)])
+@pytest.mark.parametrize("h", [2, 4])
+def test_dual_axis_sdpa_pair_is_bitwise_the_two_standalone_launches(b, s, h):
+    """``do8 + sf_do`` AND ``do_T8 + sf_do_T`` from ONE read == the standalone rowwise and columnwise SDPA-layout launches, byte for
+    byte, every destination byte 0xFF-POISONED first: every SF byte of every ceil128(S) unit is written (a pad block ``0x00``: the
+    e8m0 of a zeroed block -- 992 / 1000 / 1008 are the ragged tails, 1008 at B = 2 the one where an UNpredicated payload store would
+    land in batch 1's first 16 tokens), and both halves equal the torch oracle through the standalone checks."""
+    torch.manual_seed(1000 * b + s + h)
+    x = torch.randn(b * s, h, D, device="cuda").to(torch.bfloat16)
+    dst, sf, dst_t, sf_t = _launch_dual(x, batch=b, seq_len=s, h=h, canonical=False)
+    row_d, row_sf = _launch(AXIS_ROW, x, batch=b, seq_len=s, h=h)
+    col_d, col_sf = _launch(AXIS_COL, x, batch=b, seq_len=s, h=h)
+    assert torch.equal(dst.view(torch.uint8), row_d.view(torch.uint8)), "the dual arm's rowwise payload differs from the standalone rowwise launch"
+    assert torch.equal(sf, row_sf), "the dual arm's rowwise SF tiles differ from the standalone rowwise launch"
+    assert torch.equal(dst_t.view(torch.uint8), col_d.view(torch.uint8)), "the dual arm's columnwise payload differs from the standalone columnwise launch"
+    assert torch.equal(sf_t, col_sf), "the dual arm's columnwise SF atoms differ from the standalone columnwise launch"
+    _check_against_oracle(AXIS_ROW, x, dst, sf, batch=b, seq_len=s, h=h)
+    _check_against_oracle(AXIS_COL, x, dst_t, sf_t, batch=b, seq_len=s, h=h)
+    tail = _tail_sf_bytes(AXIS_ROW, batch=b, h=h, seq_len=s)
+    if tail:
+        assert int(sf[tail].max().item()) == 0, "a pad row's rowwise SF byte is not 0x00"
+    tail_c = _tail_sf_bytes(AXIS_COL, batch=b, h=h, seq_len=s)
+    if tail_c:
+        assert int(sf_t[tail_c].max().item()) == 0, "a pad block's columnwise SF byte is not 0x00"
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("t", [256, 992, 2016])
+@pytest.mark.parametrize("n", [5120, 17408])
+def test_dual_axis_canonical_pair_is_bitwise_the_two_standalone_launches(t, n):
+    """``dqkvg8 + sf_dqkvg`` (rowwise canonical over ``(T, N)``) AND ``dqkvg_t8 + sf_dqkvg_t`` (the TRANSPOSED ``[N, T]`` store with its
+    canonical blob over ``(N, T)``) from ONE read == the two standalone canonical launches, byte for byte, on 0xFF-poisoned
+    destinations (the pad blocks of the ceil128 units ``0x00``, every blob byte written), and both equal the block reference's padded
+    swizzle through the standalone canonical checks.  ``T % 32 == 0`` throughout (the transposed store's whole-block rule)."""
+    h = n // D
+    torch.manual_seed(t + n)
+    x = torch.randn(t, h, D, device="cuda").to(torch.bfloat16)
+    dst, sf, dst_t, sf_t = _launch_dual(x, batch=1, seq_len=t, h=h, canonical=True)
+    row_d, row_sf = _launch_canonical(AXIS_ROW, x, batch=1, seq_len=t, h=h, transposed=False)
+    col_d, col_sf = _launch_canonical(AXIS_COL, x, batch=1, seq_len=t, h=h, transposed=True)
+    assert torch.equal(dst.view(torch.uint8), row_d.view(torch.uint8)) and torch.equal(
+        sf, row_sf
+    ), "the rowwise canonical half differs from the standalone launch"
+    assert torch.equal(dst_t.view(torch.uint8), col_d.view(torch.uint8)) and torch.equal(
+        sf_t, col_sf
+    ), "the transposed canonical half differs from the standalone launch"
+    _check_canonical(x, dst, sf, transposed=False)
+    _check_canonical(x, dst_t, sf_t, transposed=True)
+
+
+@requires_mx_cvt
+def test_dual_axis_two_launches_are_bitwise_identical_and_match_f16():
+    """Determinism (two launches, both pairs) and the f16 source (the ``f16x2_to_f32`` arm of the staging / row pass)."""
+    torch.manual_seed(77)
+    b, s, h = 2, 1000, 2
+    x = torch.randn(b * s, h, D, device="cuda").to(torch.bfloat16)
+    a = _launch_dual(x, batch=b, seq_len=s, h=h, canonical=False)
+    c = _launch_dual(x, batch=b, seq_len=s, h=h, canonical=False)
+    assert all(torch.equal(p.view(torch.uint8), q.view(torch.uint8)) for p, q in zip(a, c))
+    xf = torch.randn(1 * 992, h, D, device="cuda").to(torch.float16)
+    dst, sf, dst_t, sf_t = _launch_dual(xf, batch=1, seq_len=992, h=h, canonical=False)
+    row_d, row_sf = _launch(AXIS_ROW, xf, batch=1, seq_len=992, h=h)
+    col_d, col_sf = _launch(AXIS_COL, xf, batch=1, seq_len=992, h=h)
+    assert torch.equal(dst.view(torch.uint8), row_d.view(torch.uint8)) and torch.equal(sf, row_sf)
+    assert torch.equal(dst_t.view(torch.uint8), col_d.view(torch.uint8)) and torch.equal(sf_t, col_sf)
+
+
 @requires_mx_cvt
 def test_two_launches_are_bitwise_identical():
     torch.manual_seed(5)

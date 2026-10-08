@@ -177,6 +177,11 @@ _SPLIT_KV_COMBINE_COST = 0.1
 # price meet at 3.5 combine waves (~520 rows on 148 SMs); the fitted sweep
 # (_B300_FIT) starts at 2048 rows, so the floor moves none of its choices.
 _SPLIT_KV_COMBINE_FLOOR = 0.35
+# SM120 (RTX PRO 6000, 188 SMs): a lone CTA walks a KV tile in ~3.7 us at d128, so thinner splits keep
+# paying and a partial costs ~0.05 tile. Fitted on a 161-case decode split ladder (2026-10-08): mean
+# regret 5.3% -> 0.5%, worst 43% -> 21%; any floor in [0.02, 0.1] makes the same choices.
+_SM120_SPLIT_KV_MIN_TILES = 1
+_SM120_SPLIT_KV_COMBINE_FLOOR = 0.1
 
 
 class _SplitKvLaunch(NamedTuple):
@@ -186,7 +191,7 @@ class _SplitKvLaunch(NamedTuple):
     ctas_per_tile: int
 
 
-def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
+def split_kv_candidates(*, sm_count: int, kv_tiles: int, min_tiles: Optional[int] = None) -> List[int]:
     """The splits worth scoring on this device, ascending, always starting at 1.
 
     THE single split-KV list -- what a row can BUILD is a separate boolean
@@ -214,7 +219,7 @@ def split_kv_candidates(*, sm_count: int, kv_tiles: int) -> List[int]:
     if sm_count <= 0 or kv_tiles <= 0:
         return [1]
     hi = 1 << max(0, (sm_count - 1).bit_length())  # 2**ceil(log2(sm_count))
-    hi = min(hi, max(1, kv_tiles // _SPLIT_KV_MIN_TILES))
+    hi = min(hi, max(1, kv_tiles // (min_tiles or _SPLIT_KV_MIN_TILES)))
     out, s = [], 1
     while s <= hi:
         out.append(s)
@@ -233,6 +238,8 @@ def choose_split_kv(
     ctas_per_tile: int = 1,
     candidates: Optional[List[int]] = None,
     unsplit_launch: Optional[_SplitKvLaunch] = None,
+    min_tiles: Optional[int] = None,
+    combine_floor: Optional[float] = None,
 ) -> int:
     """How many KV chunks to cut each Q tile into; 1 = do not split.
 
@@ -310,7 +317,7 @@ def choose_split_kv(
     if kv_tiles <= 1:
         return 1
     if candidates is None:
-        candidates = split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles)
+        candidates = split_kv_candidates(sm_count=sm_count, kv_tiles=kv_tiles, min_tiles=min_tiles)
     # The combine reads every partial of every output row, so its grid is sized
     # by the rows; max(1, ...) because a decode-shaped launch has fewer rows
     # than SMs and still pays one wave.
@@ -318,7 +325,7 @@ def choose_split_kv(
     # ... and that one wave costs no less than a lone block's serial walk of
     # its partials: with fewer rows than the machine holds at once there is
     # nothing to hide the chain behind (_SPLIT_KV_COMBINE_FLOOR).
-    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR)
+    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR if combine_floor is None else combine_floor)
 
     best_split, best_cost = 1, None
     for split in candidates:
@@ -327,7 +334,7 @@ def choose_split_kv(
         # Every split must stay thick enough to amortise its own prologue and
         # epilogue. The chunking hands the remainder to the leading splits, so
         # the THINNEST gets floor(kv_tiles / split) -- that is what must clear.
-        if split > 1 and kv_tiles // split < _SPLIT_KV_MIN_TILES:
+        if split > 1 and kv_tiles // split < (min_tiles or _SPLIT_KV_MIN_TILES):
             continue
         launch = unsplit_launch if split == 1 else split_launch
         base_ctas = launch.q_tiles * launch.heads_q * batch * launch.ctas_per_tile
@@ -1018,13 +1025,14 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
         # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
         return sched_policy, 1
-    if supports_paged_prefill_cga1(
+    if facts.device_cc == (10, 7) and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,
         fp8=facts.is_fp8 or facts.is_mxfp8,
         thd=facts.thd,
         paged=facts.has_paged_kv,
         split_kv=split_kv,
+        max_q=facts.s_q,
     ):
         # A packed query fits the two-slab single-CTA tile at 256 rows.
         # Prefer it only when the two-CTA tile would need another grid wave.
@@ -1157,6 +1165,7 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
             thd=facts.thd,
             paged=facts.has_paged_kv,
             split_kv=split_kv,
+            max_q=facts.s_q,
         ):
             return 256
         return cga_tile_m(128, cga)
@@ -1484,6 +1493,11 @@ def _split_points(
             combine_rows=facts.s_q * facts.h_q * facts.b,
             ctas_per_tile=split_launch.ctas_per_tile,
             unsplit_launch=unsplit_launch,
+            **(
+                dict(min_tiles=_SM120_SPLIT_KV_MIN_TILES, combine_floor=_SM120_SPLIT_KV_COMBINE_FLOOR)
+                if caps.sm_lo == 120 and not (caps.is_fp8 or caps.is_mxfp8)
+                else {}
+            ),
         )
 
     split = _choose(physical=True)

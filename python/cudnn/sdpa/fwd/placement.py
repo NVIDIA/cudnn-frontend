@@ -81,8 +81,13 @@ exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 
 d512 row with a 128-wide GQA group (DeepSeek-V4 "pro", 128 query heads over one KV head) loses
 5-10x at every batch; sliding-window dense squares (gpt_oss 2k x 2k, 8k x 8k) are 1.28-1.48 -> TRAIL
 on those three, LEAD everywhere else.
-The small-batch d512 head-count shortcut was measured only at 128k KV on SM120 too;
-restrict it to that domain as a conservative policy. No new SM120 timing is claimed.
+Re-measured 2026-10-08 against public cuDNN 9.27.0.42 (same part, CUDA-graph replay, 399 cases incl. a
+random hold-out): prefill and ``2 <= s_q <= 16`` still lead (prefill median 0.42, decode-shaped
+0.02-0.45 for d64/d128/d256), but ``s_q == 1`` changed: d64/d128 decode is backend-first at every
+batch (FROST 0.96-3.5x), query groups FROST cannot pack (5, 6, 12) re-read K/V per head (1.5-5.6x),
+and d256 needs 12 KV units -> TRAIL outside those (mean regret over the 399 cases 8.5% -> 2.2%). The
+hold-out informed these bounds, so it is no longer out-of-sample. The d512 one-KV-head shortcut keeps its 128k bound: 32/1 heads won 0.29-0.75 from
+6k KV here but ran 1.31x slower at 6k on an RTX 5090.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -170,6 +175,7 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
+SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
 
 # SM90 f16/bf16 thresholds.
@@ -318,7 +324,11 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
                 return TRAIL
             # one KV head: the b = 1, >=32-query-head win (0.44-0.85) was measured at 128k KV only.
             return LEAD if units >= SM120_SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS) else TRAIL
-        return LEAD if units >= SM120_SQ1_MIN_KV_UNITS else TRAIL
+        group = facts.h_q // max(facts.h_kv, 1)
+        if _selected_d_shape(caps, facts) in ((64, 64), (128, 128)) or group & (group - 1):
+            return TRAIL  # d64/d128 and unpackable groups (5, 6, 12): 0.96-3.5x and 1.5-5.6x on cuDNN 9.27
+        need = SM120_SQ1_D256_MIN_KV_UNITS if _selected_d_shape(caps, facts) == (256, 256) else SM120_SQ1_MIN_KV_UNITS
+        return LEAD if units >= need else TRAIL
     if facts.window_left is not None and facts.s_q == facts.s_kv:
         return TRAIL
     return LEAD

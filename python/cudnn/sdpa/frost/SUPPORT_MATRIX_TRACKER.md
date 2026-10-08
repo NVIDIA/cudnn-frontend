@@ -380,8 +380,12 @@ packing (ᵐ: `HEADS_PER_TILE = PACK_G`, `G / PACK_G` packed heads per KV head),
 + combine, NATURAL
 / LPT / LPT_L2. **THD on the decode tile: the ragged-Q-over-paged-KV leg only** (ʳᵠ:
 ragged Q/O/Stats + page pools at `S_q(max) == 1` — FlashInfer's prefill-style paged graph
-at one token per sequence, nvbug 6607857; every other ragged graph keeps `TILE_CGA_M=2`
-and a pinned 1 declines), fp8 / mxfp8 (no quantized decode tile: their (128, 128) flavors keep
+at one token per sequence, nvbug 6607857). Exact D128 FP16/BF16 paged THD
+prefill at declared `S_q > 1` also accepts an explicit `TILE_CGA_M=1` on cc 10.0:
+it uses the existing two-slab prefill body (256 packed rows), distinct from the
+128-row decode/split tile. Default CGA selection remains unchanged, and cc 10.3
+retains its existing domain. Other unsplit ragged prefill graphs keep `TILE_CGA_M=2`
+and a pinned 1 declines. The decode tile remains unavailable for fp8 / mxfp8 (their (128, 128) flavors keep
 `cgas={2}`, their other flavors their own width), and the d192x128 / d512 f16 flavors
 (no decode tile yet — their decode graphs run the prefill kernel as before; the d256
 f16/bf16 flavor has its own swap-AB decode tile, ᵈ). d64 has its own native decode tile (ᵈ⁶⁴). Measured on B200 (graph path,
@@ -1242,7 +1246,9 @@ block-scaled e4m3 payloads + E8M0 atoms under P-b), the stage-3 GEMMs trimmed PE
 SEQUENCE (P-c: the bf16 renderings over the packed q_T / k_T dequantized EXACTLY to bf16
 per token; P-b: the block-scale arm's THD leg over the kv-blocked payloads + atoms and the
 packed columnwise q_T / k_T scale factors read through per-sequence SF tile prefixes, dQ
-once per GQA group member as on the dense P-b chain), the GQA fold bounded ON DEVICE at
+once per head chunk as on the dense P-b chain -- the block-scale dQ record takes
+`b_head_group` = the GQA group, B and its scale factors indexed by `h // group`, bitwise
+the per-member launches), the GQA fold bounded ON DEVICE at
 `cu_k[B]`. **The seven scale-factor tensors travel PACKED per-sequence-TILE-padded**, the
 forward's convention: per head, every sequence's `ceil(s_b / 128)` F8_128x4 tiles in
 cu_seqlens order (sequence b's tiles start at `cu_sf[b] = Σ_{i<b} ceil(s_i / 128)`, NOT at
