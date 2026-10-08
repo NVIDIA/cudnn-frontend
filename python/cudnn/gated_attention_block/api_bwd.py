@@ -4285,6 +4285,15 @@ class GatedAttentionBlockBwd(APIBase):
         self.need_dw_norms = bool(need_dw_norms)
         if not isinstance(recompute, RecomputePolicy):
             raise TypeError(f"recompute must be a RecomputePolicy, got {type(recompute).__name__}")
+        # Block-sparse attention (geometry.qsa) has no training record: the forward declines save_for_backward under a
+        # QsaSpec, and sparse-attention training (the sparse backward and the indexer loss) is out of scope -- declined
+        # here, typed, before any shape is read, so the four-band unpacks below never meet a five-band geometry.
+        if geometry.qsa is not None:
+            raise NotImplementedError(
+                "GatedAttentionBlockBwd: the geometry declares block-sparse attention (geometry.qsa); sparse-attention training is out of scope "
+                "and the forward writes no sparse training record (save_for_backward is declined under QsaSpec). The backward differentiates "
+                "the dense record only."
+            )
         self.thd = bool(thd)
         self.num_sequences = None if num_sequences is None else int(num_sequences)
         self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
@@ -5094,7 +5103,7 @@ class GatedAttentionBlockBwd(APIBase):
         g, b, s, act = self.geom, self.batch, self.seq_len, self.act_dtype
         t, hd, n, d = b * s, g.h_q * g.d_head, g.n_qkvg, g.d_head
         ws = self._ws
-        o_q, o_g, o_k, o_v = g.qkvg_offsets
+        o_q, o_g, o_k, o_v = g.qkvg_offsets  # the four dense bands: a block-sparse geometry (a fifth band) is declined at declaration
         side = self._side
         v = SimpleNamespace()
         v.do_gated = _view(workspace, ws.do_gated, (t, g.h_q, d), act)
@@ -5640,7 +5649,7 @@ class GatedAttentionBlockBwd(APIBase):
         v = self._workspace_views(workspace)
         do_gated, dqkvg, o_gated, rq, rk, rv, dq, dk, dv = v.do_gated, v.dqkvg, v.o_gated, v.rq, v.rk, v.rv, v.dq, v.dk, v.dv
         plane_q, plane_k, sdpa_ws, gemm_ws, gemm_ws_side, delta = v.plane_q, v.plane_k, v.sdpa_ws, v.gemm_ws, v.gemm_ws_side, v.delta
-        o_q, o_g, o_k, o_v = g.qkvg_offsets
+        o_q, o_g, o_k, o_v = g.qkvg_offsets  # the four dense bands: a block-sparse geometry (a fifth band) is declined at declaration
         q_pre_b = _cols(proj, o_q, g.h_q, d)
         gate_b = _cols(proj, o_g, g.h_q, d)
         k_pre_b = _cols(proj, o_k, g.h_kv, d)

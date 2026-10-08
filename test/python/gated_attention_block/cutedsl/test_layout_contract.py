@@ -60,12 +60,13 @@ def test_no_output_tile_straddles_two_blocks(tile_n):
     g = GEOM_397B
     plan = g.qkvg_tile_plan(tile_n)
     assert len(plan) == g.n_qkvg // tile_n
-    counts = {b: plan.count(b) for b in ProjBlock}
-    for block, width in zip(ProjBlock, g.qkvg_block_widths):
+    counts = {b: plan.count(b) for b in g.qkvg_blocks}
+    for block, width in zip(g.qkvg_blocks, g.qkvg_block_widths):
         assert counts[block] == width // tile_n
-    # Blocks appear as contiguous runs, in ProjBlock order -- not interleaved.
+    # Blocks appear as contiguous runs, in band order -- not interleaved; a geometry without the indexer band has
+    # exactly the four dense bands (ProjBlock itself carries the fifth member for the geometries that declare it).
     runs = [b for i, b in enumerate(plan) if i == 0 or plan[i - 1] != b]
-    assert runs == list(ProjBlock)
+    assert runs == list(g.qkvg_blocks) == [ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V]
 
 
 def test_tile_plan_rejects_a_straddling_tile_size():
@@ -220,10 +221,10 @@ def test_qwen38_family_tile_plans_are_well_defined(geom, n_qkvg, widths, offsets
     """No stage-(1) output tile straddles two of Q / GATE / K / V at any supported TILE_N."""
     plan = geom.qkvg_tile_plan(tile_n)
     assert len(plan) == n_qkvg // tile_n
-    for block, width in zip(ProjBlock, widths):
+    for block, width in zip(geom.qkvg_blocks, widths):
         assert plan.count(block) == width // tile_n
     runs = [b for i, b in enumerate(plan) if i == 0 or plan[i - 1] != b]
-    assert runs == list(ProjBlock)
+    assert runs == list(geom.qkvg_blocks) == [ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V]
 
 
 @pytest.mark.parametrize("geom, n_qkvg, widths, offsets, gqa_ratio, tile_rows", _QWEN38_FAMILY)
@@ -285,6 +286,18 @@ def test_index_band_tile_arithmetic():
     assert len(same_n.qkvg_tile_plan(64)) == 218
     with pytest.raises(ValueError, match="must be positive and divide N=13952"):
         same_n.qkvg_tile_plan(256)
+    # ... and on the REAL five-band geometry, now that one can be declared: the same N through the layout API, the
+    # 64- and 128-column plans well defined (10 / 5 tiles of the band), the 256-column plan the typed refusal.
+    from cudnn.gated_attention_block import QsaSpec
+
+    band = GatedAttentionBlockGeometry(d_model=2560, h_q=24, h_kv=2, d_head=256, rope_dim=64, qsa=QsaSpec(index_band=True))
+    band.validate()
+    assert band.qkvg_blocks == (ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V, ProjBlock.INDEX)
+    assert band.n_qkvg == 13952 and band.qkvg_block_widths == (6144, 6144, 512, 512, INDEX_BAND_COLS)
+    assert band.qkvg_offsets == (0, 6144, 12288, 12800, 13312)
+    assert band.qkvg_tile_plan(64).count(ProjBlock.INDEX) == 10 and band.qkvg_tile_plan(128).count(ProjBlock.INDEX) == 5
+    with pytest.raises(ValueError, match="must be positive and divide N=13952"):
+        band.qkvg_tile_plan(256)
 
 
 def test_no_qsa_geometry_snapshot_is_unchanged():
@@ -305,6 +318,10 @@ def test_no_qsa_geometry_snapshot_is_unchanged():
         "plan_256": tuple(int(b) for b in g.qkvg_tile_plan(256)),
         "first_col": tuple(g.block_for_column(o) for o in g.qkvg_offsets),
         "last_col": tuple(g.block_for_column(o + w - 1) for o, w in zip(g.qkvg_offsets, g.qkvg_block_widths)),
+        "blocks": g.qkvg_blocks,
+        "head_dims": g.qkvg_head_dims,
+        "index_band": g.index_band,
+        "qsa": g.qsa,
     }
     expected = {
         "n_qkvg": 17408,
@@ -319,9 +336,15 @@ def test_no_qsa_geometry_snapshot_is_unchanged():
         "plan_256": (0,) * 32 + (1,) * 32 + (2,) * 2 + (3,) * 2,
         "first_col": ((ProjBlock.Q, 0, 0), (ProjBlock.GATE, 0, 0), (ProjBlock.K, 0, 0), (ProjBlock.V, 0, 0)),
         "last_col": ((ProjBlock.Q, 31, 255), (ProjBlock.GATE, 31, 255), (ProjBlock.K, 1, 255), (ProjBlock.V, 1, 255)),
+        "blocks": (ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V),
+        "head_dims": (256, 256, 256, 256),
+        "index_band": False,
+        "qsa": None,
     }
     assert snapshot == expected
-    assert len(g.qkvg_block_widths) == len(g.qkvg_offsets) == len(g.qkvg_heads) == 4
+    assert len(g.qkvg_block_widths) == len(g.qkvg_offsets) == len(g.qkvg_heads) == len(g.qkvg_blocks) == len(g.qkvg_head_dims) == 4
+    with pytest.raises(ValueError, match="declares no indexer band"):
+        g.index_k_raw_offset
 
 
 # ---------------------------------------------------------------------------

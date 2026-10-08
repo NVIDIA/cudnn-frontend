@@ -336,6 +336,13 @@ _logger = logging.getLogger(__name__)
 #   397B:   0                 8192              16384     16896     17408
 #           |<--- 32 heads -->|<--- 32 heads --->|<- 2 ->|<- 2 ->|
 #
+# A geometry that declares block-sparse attention WITH an indexer band
+# (``GatedAttentionBlockGeometry.qsa.index_band``) appends a FIFTH block,
+# INDEX, below V: ``(index_heads + index_kv_heads) * index_head_dim`` columns
+# (640 at the Flash-Next geometry: 4 indexer query heads then 1 raw key head,
+# 128 each), so N = 13952 there.  Every geometry without it has exactly the
+# four blocks above and the same numbers it always had.
+#
 # Within a block, head ``j`` owns columns ``[j*D, (j+1)*D)``. Q and GATE are
 # adjacent because that is how the model produces them (one double-width
 # ``q_proj``), not for any kernel reason.
@@ -453,18 +460,148 @@ straddles two blocks -- see the alignment invariant above.
 
 
 class ProjBlock(IntEnum):
-    """Which of stage (1)'s four outputs an N column belongs to.
+    """Which of stage (1)'s outputs an N column belongs to.
 
     The values are the block ORDER along N and are part of the layout contract:
     ``qkvg_offsets`` returns them in this order and ``dQKVG`` in the backward
     reuses it, so one wgrad GEMM produces ``dW_qkvg`` in the layout the forward
     consumes.
+
+    ``INDEX`` (appended) is the FIFTH band, present ONLY on a geometry that
+    declares it (``GatedAttentionBlockGeometry.qsa.index_band``): the sparse
+    attention indexer's projection -- its query heads then its single raw key
+    head, ``index_head_dim`` columns each -- below V.  Every geometry without it
+    keeps exactly the four bands, so its layout tuples are what they always
+    were.  A consumer that enumerates the bands iterates ``geometry.qkvg_blocks``
+    (never ``ProjBlock`` itself) and touches ``INDEX`` only when it addresses
+    the indexer columns on purpose: the norm / RoPE / gate / quantize stages and
+    the backward never do.
     """
 
     Q = 0
     GATE = 1
     K = 2
     V = 3
+    INDEX = 4
+
+
+# ---------------------------------------------------------------------------
+# 2a. QsaSpec -- block-sparse attention as a DECLARATION attribute
+# ---------------------------------------------------------------------------
+
+QSA_BLOCK_SIZE = 4
+"""Tokens per selectable KV block: the sparse loader fetches one 4-token block per gather transaction."""
+QSA_TOP_K_MAX = 512
+"""The most blocks a query's list may carry (a 2048-token budget at block size 4): the index staging is sized at it."""
+QSA_TOP_K_ALIGN = 4
+"""The per-query id list is copied in 16-byte units, so ``top_k`` int32 ids must be a multiple of 4."""
+# The sparse core packs the GQA group (query heads per KV head) on its N tile; this is the widest group the v1 body
+# takes.  The sparse adapter's capabilities record becomes the enforcement point (and this block reads the cap off it,
+# never a literal) the moment the core lands; until then the declaration-time decline below carries the same number.
+_N_MAX_SPARSE_V1 = 16
+
+
+@dataclass(frozen=True)
+class QsaSpec:
+    """Block-sparse attention (Qwen Sparse Attention) as the restriction of stage (4): every query attends to the keys
+    of its SELECTED ``block_size``-token blocks AND to the open tail block of its visible range, under the causal mask.
+
+    A DECLARATION ATTRIBUTE, never a knob: it changes the function -- which keys a query sees, who selects them, the
+    ``W_qkvg`` contract -- so a block declared with it is a different plan from the dense block, and no knob value may
+    route around it.  Attached as ``GatedAttentionBlockGeometry.qsa``.  The model provenance (Qwen3.8-Flash-Next: a
+    2048-token budget, block ratio 4, a 4-head x 128 MQA indexer over one raw key head) lives in comments only; the
+    fields are named by op geometry.
+
+    Fields
+    ------
+    block_size
+        Tokens per selectable block.  4 only: the sparse loader fetches one 4-token block per gather transaction;
+        another block size has no loader.
+    top_k
+        Blocks per query the caller's list carries: a multiple of 4 in ``[4, 512]``.  It SIZES the kernel's per-query
+        index staging (every ids byte count is ``top_k x 4``, copied in 16-byte units), so a longer list would be
+        silently truncated and an unaligned one over-read -- both refused by :meth:`validate`.
+    index_source
+        ``"caller"``: ``execute(block_ids=)`` carries the selection -- ``[T, top_k]`` int32, per query the ids of its
+        selected complete blocks (block ``b`` = tokens ``[4b, 4b + 4)`` of the query's own sequence), the valid prefix
+        then ``-1`` padding; ``block_lens`` optional.  ``"indexer"``: the block runs the indexer over its fifth band
+        itself -- a typed decline at declaration until that arm lands.
+    index_band
+        ``W_qkvg`` carries a FIFTH band, ``ProjBlock.INDEX``, of ``(index_heads + index_kv_heads) * index_head_dim``
+        columns below V: the indexer's query heads first, its single raw key head last (the checkpoint's own row
+        order, so the indexer weight concatenates unchanged).  Served on the UNFUSED projection (the FROST GEMM writes
+        the wider slab; :func:`index_k_raw_view` exposes the raw key); the fused projection fork renders 256-column
+        tiles and declines a 640-column band, typed.
+    index_heads, index_kv_heads, index_head_dim, index_norm_eps
+        The indexer's geometry.  They SIZE THE BAND ONLY today and are UNREAD by any kernel -- documented inert; the
+        in-block indexer that scores with them is the follow-up.  ``index_kv_heads`` is 1 (one raw key head, the
+        checkpoint's own validator pins it); ``index_head_dim`` is a multiple of ``QKVG_TILE_ALIGN`` so every indexer
+        head keeps the band tile-aligned.
+
+    Fixed semantics that are deliberately NOT fields: the open tail block is always visible, the causal mask is always
+    applied, and the id dtype is int32 (one legal value; an int64 list is refused at ``execute``).  A dense route below
+    the identity bound (:attr:`identity_bound` visible tokens -- 2051 at the defaults -- below which every query's
+    complete blocks fit the list and a full list reproduces dense causal attention) is a legal performance knob ONLY
+    under ``index_source="indexer"``, where the block derives the selection itself; under caller lists it would ignore
+    the list: numerics-changing, never a knob.
+    """
+
+    block_size: int = QSA_BLOCK_SIZE
+    top_k: int = QSA_TOP_K_MAX
+    index_source: str = "caller"
+    index_band: bool = False
+    index_heads: int = 4
+    index_kv_heads: int = 1
+    index_head_dim: int = 128
+    index_norm_eps: float = 1e-6
+
+    @property
+    def index_band_cols(self) -> int:
+        """Columns of the fifth band when declared: ``(index_heads + index_kv_heads) * index_head_dim`` (640 at the defaults)."""
+        return (int(self.index_heads) + int(self.index_kv_heads)) * int(self.index_head_dim)
+
+    @property
+    def identity_bound(self) -> int:
+        """The largest visible-token count at which every query's complete blocks still fit the list (2051 at the
+        defaults): ``floor(n / block_size) <= top_k`` for every ``n`` up to it, so a full list reproduces dense causal
+        attention exactly; one token more and the oldest complete block of that query is not representable."""
+        return int(self.top_k) * int(self.block_size) + int(self.block_size) - 1
+
+    def validate(self) -> None:
+        """Raise ``ValueError`` on a declaration no stage can express; each message names what the failure would have
+        LOOKED like (the geometry validator's own rule)."""
+        if self.block_size != QSA_BLOCK_SIZE:
+            raise ValueError(
+                f"QsaSpec.block_size must be {QSA_BLOCK_SIZE}: the sparse loader gathers one {QSA_BLOCK_SIZE}-token block per transaction, "
+                f"and block_size={self.block_size} has no loader"
+            )
+        if not (QSA_TOP_K_ALIGN <= self.top_k <= QSA_TOP_K_MAX) or self.top_k % QSA_TOP_K_ALIGN:
+            raise ValueError(
+                f"QsaSpec.top_k must be a multiple of {QSA_TOP_K_ALIGN} in [{QSA_TOP_K_ALIGN}, {QSA_TOP_K_MAX}], got {self.top_k}: the per-query "
+                f"index staging is sized at top_k blocks (at most {QSA_TOP_K_MAX}, the {QSA_TOP_K_MAX * QSA_BLOCK_SIZE}-token budget over "
+                f"{QSA_BLOCK_SIZE}-token blocks) and copied in 16-byte units -- a longer list would be silently truncated, an unaligned one over-read"
+            )
+        if self.index_source not in ("caller", "indexer"):
+            raise ValueError(
+                f"QsaSpec.index_source must be 'caller' (execute(block_ids=) carries the selection) or 'indexer' (the block runs the indexer), "
+                f"got {self.index_source!r}"
+            )
+        if self.index_source == "indexer" and not self.index_band:
+            raise ValueError(
+                "QsaSpec.index_source='indexer' requires index_band=True: the indexer projects its queries and keys from the fifth band of "
+                "W_qkvg; without the band there is nothing to score"
+            )
+        if self.index_heads < 1:
+            raise ValueError(f"QsaSpec.index_heads must be >= 1 (the indexer's query heads), got {self.index_heads}")
+        if self.index_kv_heads != 1:
+            raise ValueError(f"QsaSpec.index_kv_heads must be 1 (one raw key head; the checkpoint's own validator pins it), got {self.index_kv_heads}")
+        if self.index_head_dim < QKVG_TILE_ALIGN or self.index_head_dim % QKVG_TILE_ALIGN:
+            raise ValueError(
+                f"QsaSpec.index_head_dim must be a positive multiple of QKVG_TILE_ALIGN={QKVG_TILE_ALIGN} (every indexer head keeps the fifth band "
+                f"tile-aligned, else a GEMM output tile straddles the band and its neighbour), got {self.index_head_dim}"
+            )
+        if not self.index_norm_eps > 0.0:
+            raise ValueError(f"QsaSpec.index_norm_eps must be > 0, got {self.index_norm_eps}")
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +649,13 @@ class GatedAttentionBlockGeometry:
     # leak a post-eligibility ValueError.
     qk_norm: bool = True
 
+    # APPENDED: block-sparse attention.  None = the dense block.  A QsaSpec changes
+    # the FUNCTION (which keys a query sees, who selects them, the W_qkvg contract --
+    # a fifth band under `index_band`), so it is a declaration attribute, never a
+    # knob, and every layout tuple below grows its fifth entry exactly when the band
+    # is declared.  validate() runs QsaSpec's own rows and the cross-field ones.
+    qsa: Optional[QsaSpec] = None
+
     # -- derived scalars ----------------------------------------------------
 
     @property
@@ -532,18 +676,34 @@ class GatedAttentionBlockGeometry:
     # -- the N-axis map (see "Stage (1) layout" above) ----------------------
 
     @property
-    def qkvg_block_widths(self) -> tuple[int, int, int, int]:
-        """Column count of each block, in ``ProjBlock`` order."""
-        return (
+    def index_band(self) -> bool:
+        """``True`` iff ``W_qkvg`` carries the fifth (indexer) band: ``qsa`` declared with ``index_band``."""
+        return isinstance(self.qsa, QsaSpec) and bool(self.qsa.index_band)
+
+    @property
+    def qkvg_blocks(self) -> tuple[ProjBlock, ...]:
+        """The bands this geometry's ``W_qkvg`` has, in N order: ``(Q, GATE, K, V)``, plus ``INDEX`` iff declared.
+
+        Enumerate THIS, never ``ProjBlock`` itself -- the enum carries the fifth member for every geometry, the band
+        exists only where it is declared.
+        """
+        dense = (ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V)
+        return dense + (ProjBlock.INDEX,) if self.index_band else dense
+
+    @property
+    def qkvg_block_widths(self) -> tuple[int, ...]:
+        """Column count of each band, in ``qkvg_blocks`` order (four entries; five with the indexer band)."""
+        widths = (
             self.h_q * self.d_head,
             self.h_q * self.d_head,
             self.h_kv * self.d_head,
             self.h_kv * self.d_head,
         )
+        return widths + (self.qsa.index_band_cols,) if self.index_band else widths
 
     @property
-    def qkvg_offsets(self) -> tuple[int, int, int, int]:
-        """Starting column of each block, in ``ProjBlock`` order.
+    def qkvg_offsets(self) -> tuple[int, ...]:
+        """Starting column of each band, in ``qkvg_blocks`` order.
 
         **This ordering is API, append-only forever** — it is what a caller
         concatenates its checkpoint weights into, ONCE at load time (never per
@@ -559,25 +719,44 @@ class GatedAttentionBlockGeometry:
 
     @property
     def n_qkv(self) -> int:
-        """``n_qkvg`` minus the GATE band: the e4m3 bytes per token the fused
-        FP8 projection writes across its three COMPACT outputs ``q8`` / ``k8``
-        / ``v8`` (``h_q*d + 2*h_kv*d``).  A width, not a slab: since round 2
-        nothing in the block addresses a ``[T, n_qkv]`` buffer."""
-        return self.n_qkvg - self.h_q * self.d_head
+        """The Q + K + V width (no GATE band, no indexer band): the e4m3 bytes
+        per token the fused FP8 projection writes across its three COMPACT
+        outputs ``q8`` / ``k8`` / ``v8`` (``h_q*d + 2*h_kv*d``).  A width, not a
+        slab: since round 2 nothing in the block addresses a ``[T, n_qkv]``
+        buffer."""
+        w = self.qkvg_block_widths
+        return w[ProjBlock.Q] + w[ProjBlock.K] + w[ProjBlock.V]
 
     @property
-    def qkvg_heads(self) -> tuple[int, int, int, int]:
-        """Head count of each block, in ``ProjBlock`` order."""
-        return (self.h_q, self.h_q, self.h_kv, self.h_kv)
+    def qkvg_heads(self) -> tuple[int, ...]:
+        """Head count of each band, in ``qkvg_blocks`` order (the INDEX band's heads are the indexer's: its query
+        heads plus its raw key head, of ``qkvg_head_dims[INDEX]`` columns each, not ``d_head``)."""
+        heads = (self.h_q, self.h_q, self.h_kv, self.h_kv)
+        return heads + (self.qsa.index_heads + self.qsa.index_kv_heads,) if self.index_band else heads
+
+    @property
+    def qkvg_head_dims(self) -> tuple[int, ...]:
+        """Per-band head dim, in ``qkvg_blocks`` order: ``d_head`` for Q / GATE / K / V, ``index_head_dim`` for INDEX."""
+        dims = (self.d_head,) * 4
+        return dims + (self.qsa.index_head_dim,) if self.index_band else dims
+
+    @property
+    def index_k_raw_offset(self) -> int:
+        """First slab column of the RAW indexer key: the INDEX band's last ``index_kv_heads * index_head_dim`` columns
+        (pre-norm, un-rotated -- what a serving cache keeps for the indexer).  ``ValueError`` without the band."""
+        if not self.index_band:
+            raise ValueError("index_k_raw_offset: this geometry declares no indexer band (GatedAttentionBlockGeometry.qsa.index_band)")
+        return self.qkvg_offsets[ProjBlock.INDEX] + self.qsa.index_heads * self.qsa.index_head_dim
 
     def block_for_column(self, col: int) -> tuple[ProjBlock, int, int]:
-        """``col`` in ``[0, N)`` -> ``(block, head, column within head)``."""
+        """``col`` in ``[0, N)`` -> ``(block, head, column within head)`` -- the head and its width per band
+        (``qkvg_head_dims``: the INDEX band's heads are ``index_head_dim`` wide)."""
         if not 0 <= col < self.n_qkvg:
             raise ValueError(f"column {col} out of range [0, {self.n_qkvg})")
-        for block, (off, width) in enumerate(zip(self.qkvg_offsets, self.qkvg_block_widths)):
+        for block, off, width, hd in zip(self.qkvg_blocks, self.qkvg_offsets, self.qkvg_block_widths, self.qkvg_head_dims):
             if col < off + width:
                 local = col - off
-                return ProjBlock(block), local // self.d_head, local % self.d_head
+                return block, local // hd, local % hd
         raise AssertionError("unreachable: widths sum to n_qkvg")
 
     def qkvg_tile_plan(self, tile_n: int) -> tuple[ProjBlock, ...]:
@@ -611,6 +790,8 @@ class GatedAttentionBlockGeometry:
         message says what the failure would have LOOKED like, because a config
         error that reaches a kernel does not announce itself.
         """
+        if self.qsa is not None and not isinstance(self.qsa, QsaSpec):
+            raise TypeError(f"geometry.qsa must be a QsaSpec or None, got {type(self.qsa).__name__}")
         for label, value in (("d_model", self.d_model), ("h_q", self.h_q), ("h_kv", self.h_kv), ("d_head", self.d_head)):
             if value <= 0:
                 raise ValueError(f"{label} must be > 0, got {value}")
@@ -634,10 +815,10 @@ class GatedAttentionBlockGeometry:
         # straddle two blocks, and the epilogue would have to predicate per
         # column instead of specializing per tile -- which is not a correctness
         # bug today but forecloses the quantization epilogue entirely.
-        for block, width in zip(ProjBlock, self.qkvg_block_widths):
+        for block, width in zip(self.qkvg_blocks, self.qkvg_block_widths):
             if width % QKVG_TILE_ALIGN != 0:
                 raise ValueError(
-                    f"{block.name} block width {width} (= heads * d_head) must be a multiple of QKVG_TILE_ALIGN={QKVG_TILE_ALIGN}, "
+                    f"{block.name} block width {width} (= heads * head dim) must be a multiple of QKVG_TILE_ALIGN={QKVG_TILE_ALIGN}, "
                     f"else a GEMM output tile straddles two of Q/GATE/K/V"
                 )
 
@@ -654,6 +835,27 @@ class GatedAttentionBlockGeometry:
         if self.window_right >= 0 and not self.is_causal:
             raise ValueError("window_right requires is_causal=True (it widens the causal diagonal, it does not create one)")
 
+        # Block-sparse attention: the QsaSpec's own rows, then the cross-field ones.
+        # The selection IS the sparsity, so a window or a bidirectional mask has no
+        # definition under it; the indexer rotates the same leading rope_dim as Q / K.
+        if self.qsa is not None:
+            self.qsa.validate()
+            if self.rope_dim > self.qsa.index_head_dim:
+                raise ValueError(
+                    f"rope_dim ({self.rope_dim}) must be <= QsaSpec.index_head_dim ({self.qsa.index_head_dim}): the indexer rotates the same "
+                    "leading rope_dim of its heads, and a rotation wider than the head has no definition"
+                )
+            if not self.is_causal:
+                raise ValueError(
+                    "QsaSpec requires is_causal=True: block-sparse attention is defined under the causal mask (causal AND selected); a "
+                    "bidirectional sparse block is not a thing the model computes"
+                )
+            if self.window_left != -1 or self.window_right != -1:
+                raise ValueError(
+                    f"QsaSpec has no sliding window (the selection IS the sparsity): window_left / window_right must both be -1, got "
+                    f"{self.window_left} / {self.window_right}"
+                )
+
 
 def build_fused_qkvg_weight(
     w_q_gate: torch.Tensor,
@@ -662,8 +864,9 @@ def build_fused_qkvg_weight(
     geometry: GatedAttentionBlockGeometry,
     *,
     q_gate_layout: Optional[str] = None,
+    index_qk_proj_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Assemble ``W_qkvg [N, d_model]`` from the checkpoint's three matrices.
+    """Assemble ``W_qkvg [N, d_model]`` from the checkpoint's three matrices (four under an indexer band).
 
     **Load time only.** The result is what stage (1) reads; nothing here ever
     runs on the execute path. Loading a HF Qwen checkpoint? Use
@@ -701,6 +904,12 @@ def build_fused_qkvg_weight(
         (``q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)``), so the silent
         default was the trap the paragraph above describes. Pass the layout
         explicitly, or load through :func:`qkvg_from_hf`.
+    index_qk_proj_weight
+        APPENDED.  The indexer projection ``[(index_heads + index_kv_heads) *
+        index_head_dim, d_model]`` of a block-sparse layer -- its query heads
+        then its raw key head, the checkpoint's own row order -- REQUIRED iff
+        ``geometry.qsa.index_band`` (it becomes the fifth band, below V) and
+        REFUSED otherwise (a geometry without the band has exactly four).
     """
     geometry.validate()
     d = geometry.d_head
@@ -733,7 +942,28 @@ def build_fused_qkvg_weight(
     else:
         raise ValueError(f"q_gate_layout must be 'flat' or 'per_head', got {q_gate_layout!r}")
 
-    return torch.cat([w_q, w_gate, w_k, w_v], dim=0).contiguous()
+    bands = [w_q, w_gate, w_k, w_v]
+    if geometry.index_band:
+        q = geometry.qsa
+        if index_qk_proj_weight is None:
+            raise ValueError(
+                f"index_qk_proj_weight is required: geometry.qsa.index_band=True puts a fifth band of {q.index_band_cols} indexer columns "
+                f"([{q.index_heads} query heads | {q.index_kv_heads} raw key head] x {q.index_head_dim}) below V in W_qkvg"
+            )
+        if tuple(index_qk_proj_weight.shape) != (q.index_band_cols, geometry.d_model):
+            raise ValueError(
+                f"index_qk_proj_weight must be [{q.index_band_cols}, {geometry.d_model}] (the indexer's {q.index_heads} query heads then its "
+                f"{q.index_kv_heads} raw key head, {q.index_head_dim} rows each, over d_model), got {tuple(index_qk_proj_weight.shape)}"
+            )
+        if index_qk_proj_weight.dtype != w_q_gate.dtype:
+            raise ValueError(f"index_qk_proj_weight must have the other matrices' dtype {w_q_gate.dtype}, got {index_qk_proj_weight.dtype}")
+        bands.append(index_qk_proj_weight)
+    elif index_qk_proj_weight is not None:
+        raise ValueError(
+            "index_qk_proj_weight: this geometry declares no indexer band, so W_qkvg has exactly the four bands Q | GATE | K | V and the "
+            "indexer projection is not part of it; declare GatedAttentionBlockGeometry(qsa=QsaSpec(index_band=True)) for a fifth band, or pass None"
+        )
+    return torch.cat(bands, dim=0).contiguous()
 
 
 def qkvg_from_hf(
@@ -793,8 +1023,10 @@ def qkvg_from_hf(
     geometry
         The block's geometry; also the source of ``norm_weight_offset``.
     index_qk_proj_weight
-        Reserved for the indexer projection band of a QSA layer; this geometry
-        declares no such band, so only ``None`` is accepted.
+        The indexer projection ``index_qk_proj.weight`` of a block-sparse layer,
+        ``[(index_heads + index_kv_heads) * index_head_dim, d_model]``: REQUIRED
+        iff ``geometry.qsa.index_band`` (appended below V as the fifth band of
+        ``w_qkvg``, rows as the checkpoint stores them), REFUSED otherwise.
     act_dtype
         The block's ACTIVATION dtype (bf16 by default, f16 also served). All
         three results are returned in it, contiguous. A quantized pipeline
@@ -803,18 +1035,17 @@ def qkvg_from_hf(
     """
     if not isinstance(act_dtype, torch.dtype) or not act_dtype.is_floating_point:
         raise ValueError(f"act_dtype must be a floating-point torch dtype (the block's activation dtype), got {act_dtype!r}")
-    if index_qk_proj_weight is not None:
-        raise ValueError(
-            "index_qk_proj_weight: this geometry declares no indexer band, so W_qkvg has exactly the four bands Q | GATE | K | V "
-            "and the indexer projection is not part of it; pass None"
-        )
     offset = float(getattr(geometry, "norm_weight_offset", 0.0))
     if offset not in (0.0, 1.0):
         raise ValueError(
             f"geometry.norm_weight_offset must be 0.0 (the block multiplies by the weight as given, so it receives 1 + w) or 1.0 "
             f"(the block adds the 1 itself, so it receives w); got {offset}"
         )
-    w_qkvg = build_fused_qkvg_weight(q_proj_weight, k_proj_weight, v_proj_weight, geometry, q_gate_layout="per_head").to(act_dtype).contiguous()
+    w_qkvg = (
+        build_fused_qkvg_weight(q_proj_weight, k_proj_weight, v_proj_weight, geometry, q_gate_layout="per_head", index_qk_proj_weight=index_qk_proj_weight)
+        .to(act_dtype)
+        .contiguous()
+    )
 
     norms = []
     for name, w in (("q_norm_weight", q_norm_weight), ("k_norm_weight", k_norm_weight)):
@@ -1396,8 +1627,20 @@ def saved_slab_views(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeome
     the activation dtype -- the slab :class:`GatedAttentionBlockFwd` TMA-stores under ``save_for_backward`` in the
     proj_slab save mode.  A wrong element count, a non-contiguous or a misaligned slab is a typed ``ValueError``.
     """
+    proj, b, s = _slab_2d(proj_slab, geometry, batch, seq_len)
+    d = geometry.d_head
+    # `_cols` gives the [T, h, d] band at token stride n; splitting T into (B, S) is a legal `.view` on it (dim-0 stride n
+    # -> (S*n, n)), so every band keeps proj_slab's storage.  The four DENSE bands only: an indexer band (ProjBlock.INDEX,
+    # a block-sparse geometry) is not part of the training record -- the forward declines save_for_backward under it.
+    dense = (ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V)
+    return tuple(_cols(proj, geometry.qkvg_offsets[blk], geometry.qkvg_heads[blk], d).view(b, s, geometry.qkvg_heads[blk], d) for blk in dense)
+
+
+def _slab_2d(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeometry, batch: int, seq_len: int) -> tuple[torch.Tensor, int, int]:
+    """The stage-(1) slab contract, typed: ``proj_slab`` has ``B*S x n_qkvg`` elements, is contiguous and 16-B aligned.
+    Returns ``(the [T, n_qkvg] view, B, S)`` -- what every band view is cut from."""
     b, s = int(batch), int(seq_len)
-    t, n, d = b * s, geometry.n_qkvg, geometry.d_head
+    t, n = b * s, geometry.n_qkvg
     if proj_slab.numel() != t * n:
         raise ValueError(
             f"proj_slab has {proj_slab.numel()} elements; the stage-(1) slab over B*S={t} tokens x n_qkvg={n} columns is {t * n} "
@@ -1410,10 +1653,28 @@ def saved_slab_views(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeome
         )
     if proj_slab.data_ptr() % 16:
         raise ValueError(f"proj_slab must be 16-byte aligned (the projection GEMM TMA-stores it), got data_ptr={proj_slab.data_ptr():#x}")
-    proj = proj_slab.view(t, n)
-    # `_cols` gives the [T, h, d] band at token stride n; splitting T into (B, S) is a legal `.view` on it (dim-0 stride n
-    # -> (S*n, n)), so every band keeps proj_slab's storage.
-    return tuple(_cols(proj, off, h, d).view(b, s, h, d) for off, h in zip(geometry.qkvg_offsets, geometry.qkvg_heads))
+    return proj_slab.view(t, n), b, s
+
+
+def index_k_raw_view(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeometry, batch: int, seq_len: int) -> torch.Tensor:
+    """The RAW indexer key as a ``[B, S, index_kv_heads, index_head_dim]`` strided VIEW of the stage-(1) slab.
+
+    It is the INDEX band's last ``index_kv_heads * index_head_dim`` columns (``geometry.index_k_raw_offset``), PRE-norm and
+    un-rotated -- exactly what a serving cache keeps for the indexer -- at token stride ``n_qkvg``.  No copy, no allocation:
+    a serving caller keeps ONE projection GEMM and reads the key off the slab the block already wrote
+    (:meth:`GatedAttentionBlockFwd.index_k_raw` locates that slab inside the workspace).  The indexer's query columns sit
+    just before it in the band and are computed and left in place.
+
+    ``proj_slab`` is the ``[B*S, n_qkvg]`` (or ``[B, S, n_qkvg]``) contiguous, 16-B-aligned slab in the activation dtype;
+    the contract of :func:`saved_slab_views` applies (typed ``ValueError``), as does a geometry without the band.
+    """
+    if not geometry.index_band:
+        raise ValueError(
+            "index_k_raw_view: this geometry declares no indexer band (GatedAttentionBlockGeometry.qsa.index_band), so the slab holds no raw indexer key"
+        )
+    proj, b, s = _slab_2d(proj_slab, geometry, batch, seq_len)
+    q = geometry.qsa
+    return _cols(proj, geometry.index_k_raw_offset, q.index_kv_heads, q.index_head_dim).view(b, s, q.index_kv_heads, q.index_head_dim)
 
 
 class _SavedBinding(NamedTuple):
@@ -1458,6 +1719,29 @@ def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str 
             f"geometry.qk_norm=False (RoPE-only Q/K, no RMSNorm) takes no norm weights, but {q_nm} / {k_nm} were given. "
             "Pass None for both, or declare GatedAttentionBlockGeometry(qk_norm=True)."
         )
+
+
+def _check_index_tensor(x, name: str, flat_shape: tuple, dense_shape: tuple, device, *, hint: str = "") -> None:
+    """FORM checks of an index tensor of a block-sparse block (Rule 3: never a value read, never a sync): a contiguous
+    int32 ``torch.Tensor`` on ``device`` of exactly ``flat_shape`` (``[T, ...]``) or ``dense_shape`` (``[B, S, ...]``).
+    Typed ``ValueError`` naming the tensor; an int64 list is refused, not converted (the sparse core reads 32-bit ids and
+    a conversion would be a hot-path copy)."""
+    if not isinstance(x, torch.Tensor):
+        raise ValueError(f"{name} must be a torch.Tensor, got {type(x).__name__}")
+    if x.dtype != torch.int32:
+        why = (
+            " (int64 ids are refused, not converted: the sparse core reads 32-bit ids and a conversion would be a hot-path copy)"
+            if x.dtype == torch.int64
+            else ""
+        )
+        raise ValueError(f"{name} must be int32, got {x.dtype}{why}")
+    shape = tuple(int(n) for n in x.shape)
+    if shape not in (tuple(flat_shape), tuple(dense_shape)):
+        raise ValueError(f"{name} must be {list(flat_shape)} or {list(dense_shape)}, got {list(shape)}{hint}")
+    if not x.is_contiguous():
+        raise ValueError(f"{name} must be contiguous (the sparse core's index staging copies whole rows), got strides {tuple(x.stride())}")
+    if x.device != device:
+        raise ValueError(f"{name} must live on h's device {device}, got {x.device}")
 
 
 _THD_FORM_LENGTHS = "lengths"  # SavedForBackward.seq_lens_form of a THD record whose seq_lens is the [B] int32 lengths
@@ -2620,6 +2904,17 @@ class _FusedQkvProjection(_Stage):
 
         g = self.geom
         # Geometry first, so the declines below read the same on every device.
+        if g.index_band:
+            # The fork classifies every output tile by the band its first column falls in and renders _TILE_N-wide
+            # tiles; a 640-column indexer band is 2.5 of them, so its last tile would straddle the band's end.  The
+            # UNFUSED projection (the FROST GEMM over any N) serves the band; a band padded to whole tiles is the
+            # fork's own later arm, measured before it ships.
+            pad = -(-g.qsa.index_band_cols // self._TILE_N) * self._TILE_N
+            raise NotImplementedError(
+                f"{self.name}: the fused projection renders {self._TILE_N}-column tiles; a {g.qsa.index_band_cols}-column indexer band "
+                f"(geometry.qsa.index_band) is not a whole number of them (N={g.n_qkvg} = {g.n_qkvg / self._TILE_N:g} tiles). Use the "
+                f"unfused projection (fuse_norm_rope=False), or a band padded to {pad} columns once that arm exists."
+            )
         if g.d_head != self._TILE_N:
             raise NotImplementedError(
                 f"{self.name}: the fused epilogue needs one GEMM output tile == one head, i.e. d_head == {self._TILE_N} "
@@ -3620,6 +3915,68 @@ class _Sdpa(_Stage):
         )
 
 
+class _SparseSdpa(_Stage):
+    """(4) under a :class:`QsaSpec`: ``O = softmax(Q K^T * scale + mask) V`` over each query's SELECTED 4-token blocks
+    and its open tail block, causal, GQA-broadcast -- the index-list sparse attention core.
+
+    The core (the Rubin d256 swap-AB body under a gather loader) has not landed in this checkout, so this stage IS the
+    typed decline every sparse request meets at ``check_support``: it names the feature, and it is reached only after
+    every stage ahead of it -- the projection (with the indexer band) and norm + RoPE -- accepted the geometry, which is
+    what makes a declared block's slab usable through those stages today.  The block's declaration-time declines
+    (``GatedAttentionBlockFwd._check_qsa_declaration``) run first, so a request the core will never take as declared
+    (packed sequences, training, a quantized pipeline, the fused gate, a fused projection over the band, the
+    bottom-right diagonal, an fp32 activation, a GQA group wider than the N tile, the in-block indexer, another head
+    dim) hears about THAT feature instead of this one.
+
+    When the core lands this class reads its claims off the sparse adapter's capabilities record (never a literal),
+    declares the adapter at the block's strides, folds the adapter's scratch into the workspace and hands over the
+    block's BSHD views plus the index tensors exactly as :class:`_Sdpa` hands over its operands.
+    """
+
+    name = "sdpa_sparse"
+    _NOT_LANDED = (
+        "the index-list sparse attention core (stage (4) under QsaSpec) has not landed in this checkout: a block declared with "
+        "geometry.qsa is served up to and including its projection (with the indexer band) and norm + RoPE, and this stage declines "
+        "until the core lands. Declare the geometry without qsa for dense attention."
+    )
+
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device,
+        want_lse: bool,
+        seq_lens_present: bool = False,
+        token_stride: int = 0,
+        gate_token_stride: int = 0,
+    ) -> None:
+        self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
+        self.dtype = dtype
+        self.device = device
+        self.want_lse = bool(want_lse)
+        self.seq_lens_present = bool(seq_lens_present)
+        self.token_stride = int(token_stride)
+        self.gate_token_stride = int(gate_token_stride)
+        self._impl = None
+
+    def check_support(self) -> None:
+        raise NotImplementedError(f"{self.name}: {self._NOT_LANDED}")
+
+    def compile(self) -> None:
+        raise RuntimeError(f"{self.name}: call check_support() before compile()")
+
+    def scratch_workspace_bytes(self) -> int:
+        raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
+
+    def execute(self, *args, **kwargs) -> None:
+        raise RuntimeError(f"{self.name}: call compile() before execute()")
+
+
 class _ElementwiseStage(_Stage):
     """Shared body of stages (5) and (3b): one pass over ``[T, H, D]``.
 
@@ -4114,6 +4471,12 @@ class GatedAttentionBlockFwd(APIBase):
                     "max_seq_len and the lengths sum to T; S = 1 is decode, out of the prefill bodies' scope; a smaller product would cap the "
                     f"SDPA backward's packed capacity below T); got num_sequences={self.num_sequences}, max_seq_len={self.max_seq_len}, T={_t}"
                 )
+        # BLOCK-SPARSE ATTENTION (geometry.qsa): the sparse path's declaration-time declines, typed, in one place --
+        # the geometry's own rows (ValueError) and then every pipeline knob the sparse core has no arm for
+        # (NotImplementedError naming the feature) -- so a sparse request hears about its feature, never a knob.
+        self.qsa: Optional[QsaSpec] = geometry.qsa
+        if self.qsa is not None:
+            self._check_qsa_declaration(quant)
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -4218,26 +4581,42 @@ class GatedAttentionBlockFwd(APIBase):
             # bf16: in-place reads the slab at its padded stride; FP8 / MXFP8
             # unfused read the compact e4m3 buffers.  GATE is always a slab column slice.
             sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = (geometry.n_qkvg if self.inplace_qkv else 0) if not fp8 else 0, geometry.n_qkvg, act
-        self._sdpa = _Sdpa(
-            geometry,
-            batch=self.batch,
-            seq_len=self.seq_len,
-            dtype=self.dtype,
-            device=self.device,
-            want_lse=self.return_lse,
-            seq_lens_present=self.seq_lens_present,
-            token_stride=sdpa_token_stride,
-            fuse_gate=self.fuse_gate,
-            gate_token_stride=sdpa_gate_token_stride,
-            o_dtype=sdpa_o_dtype,
-            gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
-            mxfp8=mxfp8,  # pertensor_fp8=False -> the production block-scale kernel; NATURAL read off the MXFP8 row (D5)
-            # THD: the (num_sequences, max_seq_len) envelope, the packed total T = batch * seq_len, the lengths' form.
-            thd=self.thd,
-            num_sequences=self.num_sequences,
-            max_seq_len=self.max_seq_len,
-            cu_seqlens=self.cu_seqlens,
-        )
+        if self.qsa is not None:
+            # Stage (4) under QsaSpec: the index-list sparse core -- built or not built per declaration like every other
+            # stage.  Reads the slab (or the compact buffers) at the SAME strides the dense stage would; declines, typed,
+            # until the core lands (its own docstring).
+            self._sdpa = _SparseSdpa(
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=self.dtype,
+                device=self.device,
+                want_lse=self.return_lse,
+                seq_lens_present=self.seq_lens_present,
+                token_stride=sdpa_token_stride,
+                gate_token_stride=sdpa_gate_token_stride,
+            )
+        else:
+            self._sdpa = _Sdpa(
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=self.dtype,
+                device=self.device,
+                want_lse=self.return_lse,
+                seq_lens_present=self.seq_lens_present,
+                token_stride=sdpa_token_stride,
+                fuse_gate=self.fuse_gate,
+                gate_token_stride=sdpa_gate_token_stride,
+                o_dtype=sdpa_o_dtype,
+                gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
+                mxfp8=mxfp8,  # pertensor_fp8=False -> the production block-scale kernel; NATURAL read off the MXFP8 row (D5)
+                # THD: the (num_sequences, max_seq_len) envelope, the packed total T = batch * seq_len, the lengths' form.
+                thd=self.thd,
+                num_sequences=self.num_sequences,
+                max_seq_len=self.max_seq_len,
+                cu_seqlens=self.cu_seqlens,
+            )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
         self._gate = None if self.fuse_gate else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
@@ -4308,6 +4687,103 @@ class GatedAttentionBlockFwd(APIBase):
             if st is not None
         )
         self._ws = None
+
+    # -- block-sparse attention (QsaSpec) -----------------------------------
+
+    def _check_qsa_declaration(self, quant) -> None:
+        """Every sparse request this block cannot serve, declined at DECLARATION with the feature named: the geometry's
+        own rows first (``validate()``: block size, top_k range, index source, the indexer band, causal, no window --
+        ``ValueError``), then the pipeline knobs the sparse core has no arm for (``NotImplementedError``), in the order
+        a caller is most likely to have asked for them.  Device-free, so a test pins every row on any GPU; the arch gate
+        is the stages' own (``check_support``)."""
+        g = self.geom
+        g.validate()
+        q = g.qsa
+        if self.thd:
+            raise NotImplementedError("QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up")
+        if self.save_for_backward:
+            raise NotImplementedError(
+                "QsaSpec with save_for_backward=True: sparse-attention training (the sparse backward and the indexer loss) is out of scope; the "
+                "block's backward differentiates the dense record only"
+            )
+        if quant is not None:
+            raise NotImplementedError(
+                f"QsaSpec with quant={type(quant).__name__}: the sparse core is bf16 / f16; the quantized pipelines (per-tensor FP8, MXFP8, the "
+                "fp4 modes) have no sparse arm"
+            )
+        if self.fuse_gate:
+            raise NotImplementedError(
+                "QsaSpec with fuse_gate=True: the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch (fuse_gate=False)"
+            )
+        if self.fuse_norm_rope and q.index_band:
+            tile = _FusedQkvProjection._TILE_N
+            raise NotImplementedError(
+                f"QsaSpec(index_band=True) with fuse_norm_rope=True: the fused projection renders {tile}-column tiles; a {q.index_band_cols}-column "
+                f"indexer band is not a whole number of them -- use the unfused projection (fuse_norm_rope=False), or a band padded to "
+                f"{-(-q.index_band_cols // tile) * tile} columns once that arm exists"
+            )
+        if g.causal_bottom_right:
+            raise NotImplementedError(
+                "QsaSpec with causal_bottom_right=True: the bottom-right diagonal (speculative verify rows) arrives with the sparse decode mode; "
+                "the prefill form serves the top-left causal diagonal"
+            )
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(f"QsaSpec needs bf16 / f16 activations (the sparse core's dtypes), got {self.dtype}")
+        if g.gqa_ratio > _N_MAX_SPARSE_V1:
+            raise NotImplementedError(
+                f"QsaSpec needs h_q // h_kv <= {_N_MAX_SPARSE_V1} (the sparse core packs the GQA group on an N tile of at most "
+                f"{_N_MAX_SPARSE_V1} rows), got {g.h_q} // {g.h_kv} = {g.gqa_ratio}"
+            )
+        if q.index_source == "indexer":
+            raise NotImplementedError(
+                "QsaSpec(index_source='indexer'): the in-block indexer is a follow-up; pass the selection as execute(block_ids=) under " "index_source='caller'"
+            )
+        if g.d_head != 256:
+            raise NotImplementedError(f"QsaSpec needs d_head == 256 (the sparse core is the d256 swap-AB body), got d_head={g.d_head}")
+
+    def _check_qsa_execute_args(self, block_ids, block_lens, h: torch.Tensor) -> None:
+        """The index tensors against the declaration -- FORM only (dtype / rank / shape / contiguity / device), never a
+        value and never a sync (Rule 3): a QsaSpec block with caller lists needs ``block_ids``; a dense block refuses
+        them rather than ignoring a list it cannot consume."""
+        if self.qsa is None:
+            if block_ids is not None or block_lens is not None:
+                raise ValueError(
+                    "block_ids / block_lens are the index lists of a block-sparse (QsaSpec) block; this block was declared without geometry.qsa "
+                    "and attends densely -- a list it cannot consume is refused rather than silently ignored"
+                )
+            return
+        if block_ids is None:
+            raise ValueError(
+                "QsaSpec(index_source='caller') needs block_ids at execute: [T, top_k] int32 (or [B, S, top_k]) -- per query the ids of its "
+                f"selected complete {self.qsa.block_size}-token blocks (block b = tokens [{self.qsa.block_size}b, {self.qsa.block_size}b + "
+                f"{self.qsa.block_size}) of the query's own sequence), the valid prefix then -1 padding"
+            )
+        t, top_k = self.batch * self.seq_len, self.qsa.top_k
+        _check_index_tensor(
+            block_ids,
+            "block_ids",
+            (t, top_k),
+            (self.batch, self.seq_len, top_k),
+            h.device,
+            hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form, which this block does not declare)",
+        )
+        if block_lens is not None:
+            _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
+
+    def index_k_raw(self, workspace: torch.Tensor) -> torch.Tensor:
+        """The RAW indexer key the last ``execute`` left in ``workspace``, as a ``[B, S, index_kv_heads, index_head_dim]``
+        VIEW of the stage-(1) slab (:func:`index_k_raw_view` at this block's own slab offset; no copy, no allocation).
+        Valid after an ``execute`` with that workspace until the next one overwrites the slab.  ``ValueError`` on a
+        block whose geometry has no indexer band, or on a workspace too small to hold the slab."""
+        g = self.geom
+        if not g.index_band:
+            raise ValueError("index_k_raw: this block's geometry declares no indexer band (GatedAttentionBlockGeometry.qsa.index_band)")
+        lay = self._layout()
+        t = self.batch * self.seq_len
+        need = lay.proj + t * g.n_qkvg * _itemsize(self.act_dtype)
+        if workspace.numel() < need:
+            raise ValueError(f"workspace is {workspace.numel()} bytes; the stage-(1) slab ends at byte {need}")
+        return index_k_raw_view(_view(workspace, lay.proj, (t, g.n_qkvg), self.act_dtype), g, self.batch, self.seq_len)
 
     # -- support ------------------------------------------------------------
 
@@ -4762,6 +5238,10 @@ class GatedAttentionBlockFwd(APIBase):
         h_sf: Optional[torch.Tensor] = None,  # MXFP8 only (both REQUIRED): the F8_128x4 E8M0 blobs of h and W_qkvg (sample_* byte counts)
         w_qkvg_sf: Optional[torch.Tensor] = None,
         w_o_sf: Optional[torch.Tensor] = None,  # fp4 O only (REQUIRED there): the F8_128x4 blob of the e2m1 W_o (sample_w_o_sf's byte count)
+        # APPENDED (block-sparse attention, geometry.qsa with index_source="caller"): the per-query selection.  REQUIRED there, REFUSED
+        # on a dense block.  Checked for FORM only (dtype / rank / shape / contiguity / device), never read on the host (Rule 3).
+        block_ids: Optional[torch.Tensor] = None,  # [T, top_k] int32 (or [B, S, top_k]): the ids of each query's selected complete blocks, valid prefix then -1
+        block_lens: Optional[torch.Tensor] = None,  # [T] int32 (or [B, S]), optional: the valid-prefix length per query (lowering-only; clamped on device)
     ) -> None:
         """Launch the five stages in pipeline order.
 
@@ -4790,7 +5270,17 @@ class GatedAttentionBlockFwd(APIBase):
         packed ``[T, .]`` (or ``[1, T, .]``) tensors the block was declared with.
         A training record then carries that very tensor as ``saved.seq_lens`` and
         names its form in ``saved.seq_lens_form``.
+
+        ``block_ids`` / ``block_lens`` (appended): REQUIRED under ``geometry.qsa``
+        with ``index_source="caller"`` (``block_ids``; ``block_lens`` optional),
+        REFUSED on a block declared without ``qsa``.  Form checks only -- the ids
+        are device data the sparse core reads (block ``b`` = tokens ``[4b, 4b + 4)``
+        of the query's own sequence, ``-1`` = padding; the open tail block is
+        always visible).
         """
+        # Block-sparse attention: the index tensors are a DECLARATION-vs-argument contract and need no plan, so they are
+        # checked first and the refusal reads the same on every device (Rule 3: form only, never a value, never a sync).
+        self._check_qsa_execute_args(block_ids, block_lens, h)
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
