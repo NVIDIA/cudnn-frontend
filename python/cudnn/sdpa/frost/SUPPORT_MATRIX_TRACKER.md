@@ -959,10 +959,12 @@ record is printed under `measured` in the run's summary) and fails when the inst
 contract through cleanly -- the signal to re-measure and record the
 version), and their d256 / d512 MXFP8 plans fail to build (NVRTC
 compilation failure on both engines, same two backends), so without this row those
-flavors have no provider on cc 10.7. A THD or paged MXFP8 request on this row declines
-with `the cc 10.7 MXFP8 row serves dense BSHD graphs only; THD and paged MXFP8 are not
-wired on cc 10.7`, and a planning error names every side (the backend's text and each
-python engine's reason). The per-tensor FP8 forward row and the backward rows remain
+flavors have no provider on cc 10.7. A THD MXFP8 request on this row declines with
+`the cc 10.7 MXFP8 row serves dense (non-THD) queries only; THD MXFP8 is not wired on cc
+10.7` (paged F8_128x4 pools with dense queries are served -- the paged MXFP8 pools section
+below; a page that is not a multiple of 128 rows declines with `paged MXFP8 KV needs
+page_size to be a multiple of 128`), and a planning error names every side (the backend's
+text and each python engine's reason). The per-tensor FP8 forward row and the backward rows remain
 opt-in.
 
 SM107 half paged D128 causal THD candidates prefer the existing GQA4/GQA8
