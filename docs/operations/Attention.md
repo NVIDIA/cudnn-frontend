@@ -419,9 +419,13 @@ graph.sdpa(
 
 A gated attention tail -- the SDPA output multiplied by the sigmoid of a per-element gate tensor `G` of O's shape,
 `O_gated = O * sigmoid(G)` -- is built as three graph nodes, an `sdpa` (or `sdpa_fp8` / `sdpa_mxfp8`) node followed by
-`sigmoid` and `mul` pointwise nodes on `O`. The Rubin d256 FROST forward engines serve the whole tail fused
-(`sdpa_fwd_prefill_sm107` and `sdpa_fwd_prefill_sm107_mxfp8` by default, `sdpa_fwd_prefill_sm107_fp8` under
-`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`): the gate tile is TMA-staged by the kernel's load warp and applied in the epilogue after the
+`sigmoid` and `mul` pointwise nodes on `O`. The Rubin d256 FROST forward engines serve the whole tail fused when they
+serve the graph: the MXFP8 row (`sdpa_fwd_prefill_sm107_mxfp8`) is offered by default and leads on cc 10.7, so the fused
+tail is its default execution; the half row (`sdpa_fwd_prefill_sm107`) is offered by default but its placement keeps the
+backend first for dense d256 graphs, which then run the tail unfused as the three nodes -- it serves the tail fused when it
+leads the plan list, when the backend declines, or under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; the FP8 row
+(`sdpa_fwd_prefill_sm107_fp8`) serves it under that flag. On the fused path the gate tile is TMA-staged by the kernel's load
+warp and applied in the epilogue after the
 dead-row select, so the gated `O` (and the quantized `O` on the FP8 / MXFP8 rows) is written once. Served today at
 `d_qk = d_v = 256` with a bf16 `G`, dense / unsplit / non-PackGQA / non-paged layouts; any other combination
 falls back to the unfused three-node execution. Two contracts hold on the fused path: `Stats` (LSE) is

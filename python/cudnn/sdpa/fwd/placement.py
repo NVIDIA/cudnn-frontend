@@ -118,13 +118,15 @@ cc 10.7 for every graph the row admits -- dense BSHD, exact d128 / d192x128 / d2
 in, half / FP8 / block-scaled O, every mask, sink, Stats on or off, ``s_q >= 1`` on the prefill bodies.
 A qualification verdict, not a per-shard timing one: the backend's cc 10.7 MXFP8 engines are not a
 qualified alternative. (1) Their Amax_O is wrong on dense MXFP8 graphs (``BACKEND_AMAX_O_ISSUE`` in
-test/python/sdpa/fp8.py, cuDNN 9.26.0.51). (2) Their heuristics crash the process (SIGSEGV inside the
-C++ ``create_execution_plans`` heuristics query, after lowering, validate and build_operation_graph
-completed) while planning any single-query MXFP8 graph without a sink token: dense BSHD and BHSD and
-THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128..2048, batch 1 and 4 --
-measured on a 216-SM cc 10.7 board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink makes
-them plan, and d192x128 / d256 / d512 and paged pools decline cleanly there; ``sdpa/fwd/backend_guard.py``
-keeps the backend out of planning on that domain on every known backend. (3) Their d256 and d512
+test/python/sdpa/fp8.py, cuDNN 9.26.0.51). (2) Their planner crashes the process (SIGSEGV inside the
+C++ plan creation -- the ``create_execution_plans`` heuristics query and the explicit
+``create_execution_plan(engine_id, knobs)`` engine-config path alike -- after lowering, validate and
+build_operation_graph completed) while planning any single-query MXFP8 graph without a sink token: dense
+BSHD and BHSD and THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128..2048, batch
+1 and 4 -- measured on a 216-SM cc 10.7 board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink
+makes them plan, and d192x128 / d256 / d512 and paged pools decline cleanly there;
+``sdpa/fwd/backend_guard.py`` keeps the backend out of planning on that domain on every known backend,
+and an explicit backend pin there is a typed decline. (3) Their d256 and d512
 MXFP8 plans are offered but fail to build on both engines (NVRTC
 ``CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED``, same board, 9.26.0.51 and 9.27.0.28), so without
 this row those two flavors have no provider on cc 10.7. Timing is recorded as evidence, not as the

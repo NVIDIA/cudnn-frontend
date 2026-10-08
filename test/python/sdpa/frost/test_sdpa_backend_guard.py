@@ -251,3 +251,58 @@ def test_multi_query_graph_consults_the_backend(rubin_host, monkeypatch):
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     assert lowered
+
+
+# --- the paths outside the planning sequence that create backend plans (host-only: nothing is built) ---------------
+
+
+def test_explicit_backend_pin_on_a_guarded_graph_is_a_typed_decline(rubin_host, monkeypatch):
+    """create_execution_plan(<backend engine id>, knobs) -- a replayed backend record -- on a guarded graph: the C++
+    engine-config path crashes exactly as the heuristics query does (rc 139 measured on the board), so the append
+    refuses with the guard's text before any C++ lowering; the plan list is unchanged and the row's plans still serve."""
+    monkeypatch.setattr(pygraph, "_lower_backend_graph", lambda self: pytest.fail("the backend must not be lowered for a guarded graph"))
+    g = _mxfp8_graph()
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    before = list(g.plans)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError) as exc:
+        g.create_execution_plan(16, {})  # the backend's eng16 record, as the sibling s_q == 8 contract reports it
+    assert _GUARD in str(exc.value) and _TAIL in str(exc.value), str(exc.value)
+    assert list(g.plans) == before and g._lowered_graph is None
+    assert _GUARD in str(g._backend_declined)
+    assert all(is_python_engine(p.engine_id) for p in g.plans)
+
+
+def test_late_backend_lowering_on_a_guarded_graph_is_a_typed_decline(rubin_host, monkeypatch):
+    """A classic query that lowers the backend late and runs its heuristics (_lower_backend_plan) refuses on a guarded
+    graph instead of running the crashing query."""
+    monkeypatch.setattr(pygraph, "_lower_backend_graph", lambda self: pytest.fail("the backend must not be lowered for a guarded graph"))
+    g = _mxfp8_graph()
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match=_GUARD):
+        g._lower_backend_plan()
+    assert g._lowered_graph is None
+
+
+def test_a_guarded_graph_whose_row_fails_to_build_names_the_guard_in_the_exhaustion_error(rubin_host, monkeypatch):
+    """When every FROST plan of a guarded graph declines at BUILD, the exhaustion error carries the recorded backend
+    decline (the guard's reason) next to the build failures, so the reader sees why no backend plan was on the list."""
+    from cudnn.sdpa.fwd.engine import FrostSdpaFwdEngine
+
+    def declining_build(self, graph, cfg, ctx):
+        raise NotImplementedError(f"{self.name}: stub build decline")
+
+    monkeypatch.setattr(pygraph, "_lower_backend_graph", lambda self: pytest.fail("the backend must not be lowered for a guarded graph"))
+    monkeypatch.setattr(FrostSdpaFwdEngine, "build_plan", declining_build)
+    g = _mxfp8_graph()
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    g.check_support()
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError) as exc:
+        g.build_plans()
+    msg = str(exc.value)
+    assert "no plan in the list could be built" in msg and "stub build decline" in msg and _GUARD in msg, msg
