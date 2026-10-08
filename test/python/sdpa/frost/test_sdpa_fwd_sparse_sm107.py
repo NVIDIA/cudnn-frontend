@@ -38,7 +38,14 @@ two launches bitwise:
   length sitting in that page next to ANOTHER sequence's tokens (or NaN), ``-1`` table entries past the live pages, ids past
   the length / the table, ``block_lens`` present and absent, up to 17 tiles -- BITWISE the dense read of the same tokens and
   within the budget vs the oracle; the typed declines of the paged form (``page_size`` not a multiple of 4, a missing table or
-  length, the table / page size on a dense declaration, every malformed pool stride).
+  length, the table / page size on a dense declaration, every malformed pool stride);
+* the THD arm (``thd=True``: packed ``[1, T, H, D]`` operands, per-sequence or cumulative lengths, sequence-relative block ids,
+  the persistent claim-counter scheduler): every sequence of a packing against ITS OWN reference (the packings [300, 128,
+  200] and [2048, 4096, 6144, 8192], a zero-length sequence at the front / in the middle / trailing, a 5-token sequence, a
+  sequence with Q tokens and no keys -- every row dead, stored exactly -- a ragged ``S_kv_b < S_q_b``, a capacity tail past
+  the packed totals left untouched, ``block_lens`` absent), a one-sequence packing BITWISE the dense ``B = 1, S = T`` run, the
+  cumulative length forms (a prefix sliced from a larger one included) bitwise the lengths form, and on every sequence the
+  missed-coordinate signature of a THD port (``LSE == log(n_vis)`` -- an all-zero K operand) ruled out.
 
 Tolerances: atol 2e-2 on O and LSE, no rtol -- the sparse module's own budget, TIGHTER than the dense sm107 suite's O bar (atol
 5e-2 / rtol 3e-2) and equal to its LSE atol; nothing widened, nothing added.
@@ -1425,3 +1432,210 @@ def test_real_layer_lists(S, dtype):
     assert not torch.isinf(ref_lse).any()
     max_o, max_lse = _check(outs, ref_o, ref_lse)
     print(f"\nreal lists S={S} {dtype}: {int((ids >= 0).sum())} ids, max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+# ============================================================================ Rubin: the THD arm (packed sequences)
+def _cu(lens, base=0):
+    out, acc = [base], base
+    for n in lens:
+        acc += int(n)
+        out.append(acc)
+    return out
+
+
+def _thd_inputs(lens_q, lens_kv, H, KH, dtype, *, top_k=512, list_kind="full", seed=0, extra_cap=0):
+    """Packed operands ``Q [1, T_q, H, D]``, ``K / V [1, T_kv, KH, D]`` (``extra_cap`` unused rows past the packed totals) and
+    the per-row lists built PER SEQUENCE from the oracle's builders with the sequence's own KV length -- the block ids are the
+    sequence's own block numbers; a sequence with no key gets all ``-1`` / count 0; the rows past the totals stay ``-1``."""
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    T_q, T_kv = sum(lens_q), sum(lens_kv)
+    q = torch.randn(1, T_q + extra_cap, H, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    k = torch.randn(1, T_kv + extra_cap, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    v = torch.randn(1, T_kv + extra_cap, KH, D, device=dev, dtype=torch.float32, generator=g).to(dtype)
+    ids = torch.full((T_q + extra_cap, top_k), -1, dtype=torch.int32, device=dev)
+    lens = torch.zeros(T_q + extra_cap, dtype=torch.int32, device=dev)
+    oracle = _oracle()
+    cu_q = _cu(lens_q)
+    for b, (sq, skv) in enumerate(zip(lens_q, lens_kv)):
+        if sq == 0:
+            continue
+        pos = torch.arange(sq, device=dev)[None]
+        kvl = torch.tensor([skv], device=dev, dtype=torch.long)[:, None]
+        if list_kind == "full":
+            ids_b, lens_b = oracle.full_block_ids(pos, top_k, BS, kv_lens=kvl)
+        else:
+            ids_b, lens_b = oracle.random_block_ids(pos, top_k, BS, generator=g, kv_lens=kvl, shuffle=True)
+        ids[cu_q[b] : cu_q[b + 1]] = ids_b[0]
+        lens[cu_q[b] : cu_q[b + 1]] = lens_b[0]
+    return q, k, v, ids.contiguous(), lens.contiguous()
+
+
+def _lens_tensor(lens, cu, base=0):
+    dev = torch.device("cuda")
+    return torch.tensor(_cu(lens, base) if cu else [int(n) for n in lens], device=dev, dtype=torch.int32)
+
+
+def _launch_thd(q, k, v, ids, lens, lens_q, lens_kv, top_k, scale, *, cu_q=False, cu_kv=False, cu_base=0, launches=2):
+    """Sentinel-filled packed O ``[1, T_q, H, D]`` / LSE ``(1, H, T_q)`` per launch through the adapter's THD contract; the
+    metadata workspace sized by the adapter."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    dev = q.device
+    _, T_q, H, _ = q.shape
+    seq_q, seq_kv = _lens_tensor(lens_q, cu_q, cu_base), _lens_tensor(lens_kv, cu_kv, cu_base)
+    sent = _sentinel(q.dtype)
+    outs = []
+    for _ in range(launches):
+        o = torch.full((1, T_q, H, D), sent, device=dev, dtype=q.dtype)
+        lse = torch.full((1, H, T_q), sent, device=dev, dtype=torch.float32)
+        a = SparseGqaFwdDslSm107(
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            lse=lse,
+            block_ids=ids,
+            block_lens=lens,
+            seq_kv_lens=seq_kv,
+            top_k=top_k,
+            scale=scale,
+            thd=True,
+            seq_q_lens=seq_q,
+            cu_seq_q_lens=cu_q,
+            cu_seq_kv_lens=cu_kv,
+        )
+        assert a.check_support()
+        a.compile()  # plan time: the adapter never compiles on the execute path
+        ws = torch.empty(a.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
+        a.execute(stream=_stream(), workspace=ws)
+        torch.cuda.synchronize()
+        outs.append((o, lse))
+    return outs
+
+
+def _check_thd(outs, q, k, v, ids, lens, lens_q, lens_kv, scale, top_k):
+    """Every sequence against ITS OWN reference (its Q rows, its K / V rows, its lists; a dead reference where it has no
+    key) through the standard per-cell assertions; the capacity tail past the packed Q total untouched on every launch;
+    no sequence carries the missed-coordinate signature (``LSE == log(n_vis)`` on most rows = an all-zero K operand, the
+    THD-port class of bug).  Returns (max|dO|, max|dLSE|) over the live rows of every sequence."""
+    (o, lse), *rest = outs
+    sent, sent_o = _sentinel(o.dtype), _stored_sentinel(o.dtype)
+    H = q.shape[2]
+    cu_q, cu_k = _cu(lens_q), _cu(lens_kv)
+    t_live = cu_q[-1]
+    for oo, ll in outs:
+        assert (oo[0, t_live:].float() == sent_o).all() and (ll[0, :, t_live:] == sent).all(), "the capacity tail past the packed Q total was written"
+    max_o = max_lse = 0.0
+    for b, (sq, skv) in enumerate(zip(lens_q, lens_kv)):
+        if sq == 0:
+            continue
+        lo, hi = cu_q[b], cu_q[b + 1]
+        klo, khi = cu_k[b], cu_k[b + 1]
+        ids_b = ids[lo:hi]
+        lens_b = None if lens is None else lens[lo:hi]
+        if skv == 0:
+            ref_o = torch.zeros(1, sq, H, D, device=q.device, dtype=torch.float32)
+            ref_lse = torch.full((1, H, sq), float("-inf"), device=q.device, dtype=torch.float32)
+        else:
+            ref_o, ref_lse = _reference(q[:, lo:hi], k[:, klo:khi], v[:, klo:khi], ids_b, lens_b, [skv], scale, top_k)
+        mo, ml = _check([(oo[:, lo:hi], ll[:, :, lo:hi]) for oo, ll in outs], ref_o, ref_lse)
+        max_o, max_lse = max(max_o, mo), max(max_lse, ml)
+        if skv > 0:
+            pos = torch.arange(sq, device=q.device)
+            sig = torch.log(torch.minimum(pos + 1, torch.full_like(pos, skv)).float())  # the LSE of an all-zero K operand
+            lse_b = lse[0, :, lo:hi]
+            frac = float(((lse_b - sig[None, :]).abs() < 1e-3).float().mean())
+            assert frac < 0.5, f"sequence {b}: LSE == log(n_vis) on {frac:.0%} of the rows -- an all-zero K operand (a dense load coordinate survived the port)"
+            if sq >= 2:
+                assert (lse_b.std(dim=1) > 0).all(), f"sequence {b}: LSE constant across the rows of a head"
+    return max_o, max_lse
+
+
+_THD_PACKINGS = {
+    "three-seqs": dict(lens_q=[300, 128, 200], lens_kv=[300, 128, 200], extra_cap=37),
+    "long-four-shuffled": dict(lens_q=[2048, 4096, 6144, 8192], lens_kv=[2048, 4096, 6144, 8192], list_kind="shuffled"),
+    "empty-front": dict(lens_q=[0, 300, 200], lens_kv=[0, 300, 200]),
+    "empty-middle": dict(lens_q=[300, 0, 200], lens_kv=[300, 0, 200]),
+    "empty-trailing": dict(lens_q=[300, 200, 0], lens_kv=[300, 200, 0], extra_cap=37),
+    "five-token-seq": dict(lens_q=[5, 300, 128], lens_kv=[5, 300, 128]),
+    "tokens-no-keys": dict(lens_q=[300, 128, 200], lens_kv=[300, 0, 200]),
+    "ragged-kv-shorter": dict(lens_q=[300, 128], lens_kv=[257, 128]),
+    "kv-longer-than-q": dict(lens_q=[128, 300], lens_kv=[300, 300]),
+}
+_THD_F16_PACKINGS = ("three-seqs", "five-token-seq", "tokens-no-keys")
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "name, dtype",
+    [pytest.param(n, torch.bfloat16, id=f"{n}-bf16") for n in _THD_PACKINGS] + [pytest.param(n, torch.float16, id=f"{n}-f16") for n in _THD_F16_PACKINGS],
+)
+def test_thd_packing_matches_the_per_sequence_oracle(name, dtype):
+    """Every sequence of the packing against its own reference (sequence-relative lists, the sequence's own K / V rows):
+    the packings [300, 128, 200] (with a 37-row capacity tail) and [2048, 4096, 6144, 8192] (random 512-subsets above the
+    identity bound), a zero-length sequence at the front / in the middle / trailing, a 5-token sequence (never a length-1
+    one), a sequence with Q tokens and NO key (every row dead: O = 0 / LSE = -inf stored exactly, its neighbours intact), a
+    ragged ``S_kv_b < S_q_b`` (the tail follows the visible range) and ``S_kv_b > S_q_b``; two launches bitwise; the
+    capacity tail untouched; no sequence with the missed-coordinate signature."""
+    H, KH, top_k = 24, 2, 512
+    p = _THD_PACKINGS[name]
+    q, k, v, ids, lens = _thd_inputs(
+        p["lens_q"], p["lens_kv"], H, KH, dtype, top_k=top_k, list_kind=p.get("list_kind", "full"), extra_cap=p.get("extra_cap", 0)
+    )
+    scale = 1.0 / math.sqrt(D)
+    outs = _launch_thd(q, k, v, ids, lens, p["lens_q"], p["lens_kv"], top_k, scale)
+    max_o, max_lse = _check_thd(outs, q, k, v, ids, lens, p["lens_q"], p["lens_kv"], scale, top_k)
+    if name == "tokens-no-keys":
+        cu_q = _cu(p["lens_q"])
+        o, lse = outs[0]
+        assert (o[0, cu_q[1] : cu_q[2]] == 0).all() and torch.isneginf(lse[0, :, cu_q[1] : cu_q[2]]).all(), "the keyless sequence is dead on every row"
+    print(f"\nTHD {name} {dtype}: lens_q {p['lens_q']} lens_kv {p['lens_kv']}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} (budget {ATOL})")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_thd_one_sequence_is_bitwise_the_dense_B1_run(dtype):
+    """A one-sequence packing of T tokens computes the dense ``B = 1, S = T`` function BITWISE: the same gathers in the same
+    order under both scheduler forms, only the item-to-CTA assignment differs (a shuffled list, ``block_lens`` given)."""
+    T, H, KH, top_k = 600, 24, 2, 512
+    q, k, v, ids, lens = _thd_inputs([T], [T], H, KH, dtype, top_k=top_k, list_kind="shuffled", seed=3)
+    scale = 1.0 / math.sqrt(D)
+    thd_outs = _launch_thd(q, k, v, ids, lens, [T], [T], top_k, scale)
+    max_o, max_lse = _check_thd(thd_outs, q, k, v, ids, lens, [T], [T], scale, top_k)
+    ((o_d, lse_d),) = _launch(q, k, v, ids.reshape(1, T, top_k), lens.reshape(1, T), None, top_k, scale, launches=1)
+    o_t, lse_t = thd_outs[0]
+    assert torch.equal(o_t, o_d) and torch.equal(lse_t, lse_d), "the packed one-sequence run must be bitwise the dense B = 1 run"
+    print(f"\nTHD one sequence {dtype}: bitwise the dense run; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+def test_thd_cumulative_length_forms_are_bitwise_the_lengths_form():
+    """The lengths form vs the cumulative forms (Q only, KV only, both -- and a cumulative prefix sliced from a larger one,
+    whose first entry the setup normalises away): bitwise equal outputs."""
+    H, KH, top_k = 24, 2, 512
+    lens_q, lens_kv = [300, 128, 200], [300, 0, 200]
+    q, k, v, ids, lens = _thd_inputs(lens_q, lens_kv, H, KH, torch.bfloat16, top_k=top_k, seed=4)
+    scale = 1.0 / math.sqrt(D)
+    base = _launch_thd(q, k, v, ids, lens, lens_q, lens_kv, top_k, scale, launches=1)
+    _check_thd(base, q, k, v, ids, lens, lens_q, lens_kv, scale, top_k)
+    o0, lse0 = base[0]
+    for cu_q, cu_kv, cu_base in ((True, False, 0), (False, True, 0), (True, True, 0), (True, True, 1000)):
+        ((o1, lse1),) = _launch_thd(q, k, v, ids, lens, lens_q, lens_kv, top_k, scale, cu_q=cu_q, cu_kv=cu_kv, cu_base=cu_base, launches=1)
+        assert torch.equal(o0, o1) and torch.equal(lse0, lse1), f"cu_q={cu_q} cu_kv={cu_kv} base={cu_base}: the length form changed the output"
+    print("\nTHD length forms: lengths == cu_q == cu_kv == cu_both == sliced prefix (bitwise)")
+
+
+@requires_rubin
+def test_thd_block_lens_absent_uses_the_derived_count():
+    """``block_lens`` absent under THD: the derived count per row (from the sequence-relative position) -- on full lists
+    bitwise the run with the count given, within the budget vs every sequence's reference."""
+    H, KH, top_k = 24, 2, 512
+    lens_q, lens_kv = [5, 300, 128], [5, 300, 128]
+    q, k, v, ids, lens = _thd_inputs(lens_q, lens_kv, H, KH, torch.bfloat16, top_k=top_k, seed=5)
+    scale = 1.0 / math.sqrt(D)
+    with_lens = _launch_thd(q, k, v, ids, lens, lens_q, lens_kv, top_k, scale, launches=1)
+    without = _launch_thd(q, k, v, ids, None, lens_q, lens_kv, top_k, scale)
+    max_o, max_lse = _check_thd(without, q, k, v, ids, None, lens_q, lens_kv, scale, top_k)
+    assert torch.equal(with_lens[0][0], without[0][0]) and torch.equal(with_lens[0][1], without[0][1])
+    print(f"\nTHD block_lens absent: bitwise the given count; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
