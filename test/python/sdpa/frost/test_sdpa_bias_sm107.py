@@ -12,9 +12,11 @@ is unchanged), then apply the band mask AND the per-key mask word (``kv_mask``: 
 tile) in ONE bit-word pass with the true -inf, so a row whose every key is masked ends the item with ``total_sum == 0`` exactly
 and the correction epilogue SELECTs O = 0 / Stats = -inf.  The block's budget is what the carveout leaves beside the Q / O slabs
 and the K / V ring, in whole 128-column tiles -- 3 at the 32-wide tile (S_kv <= 384), 1 / 2 at the 64-wide one at cga 1 / 2
-(128 / 256), none at d128 -- and every cell above it is a TYPED decline on the row and in the adapter (the streamed form is a
-follow-up).  The bias is ``[1|B, 1|H_q, S_q, S_kv]`` in the Q/K/V dtype with a contiguous key dim and 16-byte strides; the mask
-``[1|B, 1, 1, S_kv]`` BOOLEAN (a python-only ``sdpa`` input the backend has no field for).
+(128 / 256), none at d128 -- and every BIAS cell above it is a TYPED decline on the row and in the adapter (the streamed form is a
+follow-up); the kv_mask ALONE stages nothing in SMEM, so it carries no S_kv budget and the ring-wrap axis (n_kv = 4 / 5 / 8) runs on
+it.  The bias is ``[1|B, 1|H_q, S_q, S_kv]`` in the Q/K/V dtype with a contiguous key dim and 16-byte strides (a COMPACT bias needs
+S_kv % 8 == 0 -- the acceptance-grid cells S = 100 / 217 take a padded row stride, 104 / 224); the mask ``[1|B, 1, 1, S_kv]`` BOOLEAN
+(a python-only ``sdpa`` input the backend has no field for).
 
 Three tiers: (1) CPU contract -- the row's accept / decline table (budgets, dtypes, legs, shapes) and the adapter twin agreeing on
 every cell, the config factory's derived block geometry and raising couplings, the analyzer's bias / kv_mask facts and the
@@ -78,11 +80,13 @@ def _facts(**kw):
     return ga.SdpaGraphFacts(**base)
 
 
-def _bias_kw(b=1, h=4, s_q=256, s_kv=256, dt=None):
+def _bias_kw(b=1, h=4, s_q=256, s_kv=256, dt=None, row=None):
+    """``row`` = a padded row stride (the TMA 16-byte rule at an S_kv % 8 != 0: 224 for S_kv 217, 104 for 100); None = compact."""
     import cudnn
 
     dt = cudnn.data_type.BFLOAT16 if dt is None else dt
-    return dict(has_bias=True, bias_t=_IrTensor(dt), bias_dim=(b, h, s_q, s_kv), bias_stride=(h * s_q * s_kv, s_q * s_kv, s_kv, 1), bias_dtype=dt)
+    row = s_kv if row is None else row
+    return dict(has_bias=True, bias_t=_IrTensor(dt), bias_dim=(b, h, s_q, s_kv), bias_stride=(h * s_q * row, s_q * row, row, 1), bias_dtype=dt)
 
 
 def _mask_kw(b=2, s_kv=256, dt=None):
@@ -150,8 +154,16 @@ _CELLS = [
     ("kv_mask int8", dict(**_mask_kw(dt="INT8")), None, False),
     ("kv_mask + bias", dict(**_bias_kw(), **_mask_kw()), None, True),
     ("kv_mask d128", dict(d_qk=128, d_v=128, **_mask_kw()), None, False),
-    ("kv_mask d64 S256 knob-less: some width holds it (cga2)", dict(d_qk=64, d_v=64, **_mask_kw()), None, True),
-    ("kv_mask S512 over the budget", dict(s_q=512, s_kv=512, **_mask_kw(s_kv=512)), None, False),
+    ("kv_mask d64 S256 knob-less: no block, the tile's own width", dict(d_qk=64, d_v=64, **_mask_kw()), None, True),
+    ("kv_mask d32 S512 above the BIAS budget: served (nothing staged)", dict(s_q=512, s_kv=512, **_mask_kw(s_kv=512)), None, True),
+    ("kv_mask d32 S1024 (n_kv 8)", dict(s_q=1024, s_kv=1024, **_mask_kw(s_kv=1024)), None, True),
+    ("kv_mask d64 S512 cga2 above the bias budget: served", dict(d_qk=64, d_v=64, s_q=512, s_kv=512, **_mask_kw(s_kv=512)), dict(cga=2), True),
+    ("kv_mask + bias S512: the bias carries the budget", dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512), **_mask_kw(s_kv=512)), None, False),
+    ("bias S64: one tile", dict(s_q=64, s_kv=64, **_bias_kw(s_q=64, s_kv=64)), None, True),
+    ("bias S100 compact: S_kv % 8 != 0 is not 16-B strided", dict(s_q=100, s_kv=100, **_bias_kw(s_q=100, s_kv=100)), None, False),
+    ("bias S217 compact (the acceptance-grid customer cell)", dict(s_q=217, s_kv=217, **_bias_kw(s_q=217, s_kv=217)), None, False),
+    ("bias S217 with a padded row stride 224", dict(s_q=217, s_kv=217, **_bias_kw(s_q=217, s_kv=217, row=224)), None, True),
+    ("bias S100 with a padded row stride 104", dict(s_q=100, s_kv=100, **_bias_kw(s_q=100, s_kv=100, row=104)), None, True),
     ("plain d32 (no arm)", dict(), None, True),
 ]
 
@@ -188,15 +200,17 @@ def test_row_accepts_and_declines_the_bias_and_kv_mask(name, fkw, kkw, accept):
 
 
 def test_heuristics_pick_the_narrowest_width_whose_block_holds_s_kv():
-    """The row's knob-less eligibility and the heuristics' width agree (rule 8b'): a d64 bias / kv_mask graph at S_kv 256
-    gets cga2 plans (the 2-tile block) and NO cga1 plan from ``recommend``; at S_kv 128 the tuned cga1 stays; a d32 graph
-    stays on its cga1-only tile; a graph above every width's budget gets no plan at all."""
+    """The row's knob-less eligibility and the heuristics' width agree (rule 8b'): a d64 BIAS graph at S_kv 256 gets cga2
+    plans (the 2-tile block) and NO cga1 plan from ``recommend``; at S_kv 128 the tuned cga1 stays; a d32 graph stays on its
+    cga1-only tile; a bias graph above every width's budget gets no plan at all.  A kv_mask ALONE stages no block: it keeps the
+    tile's own width (cga1) at every S_kv."""
     from cudnn.sdpa.fwd.heuristics import recommend
 
     offered = {_ROW: 20599}
     for fkw, want in (
         (dict(d_qk=64, d_v=64, **_bias_kw()), {2}),
-        (dict(d_qk=64, d_v=64, **_mask_kw()), {2}),
+        (dict(d_qk=64, d_v=64, **_mask_kw()), {1}),
+        (dict(s_q=1024, s_kv=1024, **_mask_kw(s_kv=1024)), {1}),
         (dict(d_qk=64, d_v=64, **_bias_kw(), **_mask_kw()), {2}),
         (dict(d_qk=64, d_v=64, s_q=128, s_kv=128, **_bias_kw(s_q=128, s_kv=128)), {1}),
         (dict(**_bias_kw()), {1}),
@@ -258,7 +272,22 @@ _ADAPTER_CELLS = [
     ("bias + split", dict(bias=(1, 4, 256, 256), split_kv=2), False, None, 0, 0, None),
     ("bias + sink + padded", dict(bias=(1, 4, 256, 256), has_sink=True, seq_kv_lens_present=True), True, (32, 32), 1, 0, 1),
     ("kv_mask", dict(kv_mask=(2, 1, 1, 256)), True, (32, 32), 0, 1, 1),
-    ("kv_mask d64 S256 knob-less: cga2", dict(d=64, kv_mask=(2, 1, 1, 256)), True, (64, 64), 0, 1, 2),
+    ("kv_mask d64 S256 knob-less: no block, cga1", dict(d=64, kv_mask=(2, 1, 1, 256)), True, (64, 64), 0, 1, 1),
+    ("kv_mask d32 S1024 above the bias budget", dict(s_q=1024, s_kv=1024, kv_mask=(2, 1, 1, 1024)), True, (32, 32), 0, 1, 1),
+    ("kv_mask d64 S512 cga2 requested", dict(d=64, s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), cga=2), True, (64, 64), 0, 1, 2),
+    ("kv_mask + bias S512: the bias budget", dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(1, 4, 512, 512)), False, None, 0, 0, None),
+    # (the standalone adapter wants the padding mask for a dense S_kv % 128 != 0 tail; the GRAPH path synthesizes it -- the GPU cells)
+    ("bias S64 one tile (padded)", dict(s_q=64, s_kv=64, bias=(1, 4, 64, 64), seq_kv_lens_present=True), True, (32, 32), 1, 0, 1),
+    ("bias S217 compact", dict(s_q=217, s_kv=217, bias=(1, 4, 217, 217), seq_kv_lens_present=True), False, None, 0, 0, None),
+    (
+        "bias S217 padded row stride 224",
+        dict(s_q=217, s_kv=217, bias=(1, 4, 217, 217), bias_stride=(4 * 217 * 224, 217 * 224, 224, 1), seq_kv_lens_present=True),
+        True,
+        (32, 32),
+        1,
+        0,
+        1,
+    ),
     ("kv_mask + bias", dict(kv_mask=(2, 1, 1, 256), bias=(1, 1, 256, 256)), True, (32, 32), 1, 1, 1),
     ("kv_mask wrong extent", dict(kv_mask=(2, 1, 1, 128)), False, None, 0, 0, None),
     ("kv_mask d128", dict(d=128, kv_mask=(2, 1, 1, 256)), False, None, 0, 0, None),
@@ -686,7 +715,9 @@ def _check(out, ref, *, has_stats=True):
 
 
 # The degenerate-input matrix inside the resident budget (384 kv columns at the 32-wide tile): the KV ring sweep n_kv = 1, 2, 3
-# (the budget edge) with B*H > 1, ONE CTA / one tile in the whole launch, a tail tile (S_kv % 8 == 0 for the bias TMA: 304, 376),
+# (the budget edge) with B*H > 1, ONE CTA / one tile in the whole launch (S_kv 128 and the acceptance grid's 64), a tail tile (S_kv
+# % 8 == 0 for a COMPACT bias TMA: 304, 376; the grid's 217 / 100 with a PADDED row stride 224 / 104 -- the compact form is a typed
+# decline, pinned on a real graph below),
 # the band masks (causal, right band, SWA + padding), GQA, a zero-length KV batch (an EMPTY work item: no bias barrier is touched),
 # a zero-key batch WITH a sink (Stats = sink_logit, O = 0) and the padded-Q trim (bottom-right causal + bias is refused by the
 # graph contract -- `_MASK_ONLY_CASES` carries the bottom-right keyless rows on the kv_mask arm alone); the bias in its four
@@ -717,6 +748,9 @@ _CASES = {
     "d64_dense_256_cga2": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256, d=64, cga=2),
     "d64_causal_256_cga2": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256, d=64, cga=2, causal=True),
     "d24_dense_256": dict(b=2, h=4, h_kv=4, s_q=256, s_kv=256, d=24),
+    "dense_one_tile_64": dict(b=2, h=2, h_kv=2, s_q=64, s_kv=64),
+    "tail_217_padded_stride_bias": dict(b=2, h=2, h_kv=2, s_q=217, s_kv=217, bias_row_stride=224),
+    "causal_tail_100_padded_stride_bias": dict(b=2, h=2, h_kv=2, s_q=100, s_kv=100, causal=True, bias_row_stride=104),
 }
 
 
@@ -725,6 +759,17 @@ _CASES = {
 # with the per-key mask only.
 _MASK_ONLY_CASES = {
     "bottom_right_keyless_sink": dict(b=3, h=8, h_kv=4, s_q=256, s_kv=256, bottom_right=True, q_lens=[256, 129, 0], kv_lens=[200, 256, 128], sink=True),
+}
+
+# The kv_mask ALONE above the BIAS budget: nothing is staged in SMEM, so the -inf masked body runs the ring-wrap axis the bias cells
+# cannot reach (sdpa-invariants s9: n_kv = STAGES_KV = 4, one past it = 5, two wraps = 8 with and without a tail), at the tile's own
+# width (cga1) on the 32- and the 64-wide tile.
+_MASK_RING_CASES = {
+    "dense_nkv4_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512),
+    "causal_nkv5_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640, causal=True),
+    "padded_nkv8_tail_900": dict(b=2, h=2, h_kv=2, s_q=900, s_kv=900, kv_lens=[900, 500]),
+    "dense_nkv8_1024": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024),
+    "d64_dense_nkv4_512": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, d=64),
 }
 
 
@@ -747,7 +792,9 @@ def _case_inputs(case, dtype, *, seed=0, kv_mask_p=None, table=None):
     form = c.get("bias", "h")
     bb = c["b"] if form in ("b", "b1") else 1
     bh = c["h"] if form in ("h", "b") else 1
-    bias = (torch.randn(bb, bh, c["s_q"], c["s_kv"], device="cuda", dtype=torch.float32) * c.get("bias_scale", 1.0)).to(dtype)
+    # A padded row stride (`bias_row_stride`: the TMA 16-byte rule at an S_kv % 8 != 0) makes the bias a strided VIEW; compact otherwise.
+    row = c.get("bias_row_stride", c["s_kv"])
+    bias = (torch.randn(bb, bh, c["s_q"], row, device="cuda", dtype=torch.float32) * c.get("bias_scale", 1.0)).to(dtype)[..., : c["s_kv"]]
     if c.get("neg_fold"):
         # the models' finite key fold: 0 on a live key, -1e9 on a masked one (rounded to the io dtype like the models' bias)
         keep = torch.rand(bb, 1, 1, c["s_kv"], device="cuda") > 0.3
@@ -840,6 +887,19 @@ def test_kv_mask_composes_with_bottom_right_causal_keyless_rows_and_the_sink(cas
 
 
 @requires_rubin
+@pytest.mark.parametrize("case", list(_MASK_RING_CASES))
+def test_kv_mask_alone_serves_any_s_kv_across_the_ring_wrap(case):
+    """The kv_mask ALONE has no resident budget (nothing staged in SMEM): S_kv 512 / 640 / 900 / 1024 = n_kv 4 (the ring depth), 5
+    (one past it), 8 (two wraps; 900 = a tail + right padding) on the -inf masked body, at the tile's own width (cga1), 30 % of the
+    keys False, against the fp64 oracle; two launches bitwise."""
+    q, k, v, kw, _ = _case_inputs(case, torch.bfloat16, kv_mask_p=0.3, table=_MASK_RING_CASES)
+    kw["bias"] = None
+    out = _run(q, k, v, **kw)
+    assert out["knobs"].cga == 1, (case, out["knobs"])
+    _check(out, _ref_of(_MASK_RING_CASES[case], q, k, v, kw))
+
+
+@requires_rubin
 def test_bottom_right_causal_with_a_bias_is_refused_by_the_graph_contract():
     """ONE graph contract for the backend and FROST: bottom-right causal + bias is not a graph (the shared validation), so
     no engine -- the resident block included -- is asked; the case above runs the kv_mask arm alone."""
@@ -896,13 +956,15 @@ def test_identity_bias_zero_and_mask_all_true_is_bitwise_the_plain_kernel(case, 
 
 @requires_rubin
 def test_declines_on_real_graphs():
-    """The typed declines on REAL graphs: a bias above the resident budget and an fp32 bias leave the FROST row out of the plan
-    list (the backend may serve them); a kv_mask the row cannot serve (over the budget, int8) has no engine at all."""
+    """The typed declines on REAL graphs: a bias above the resident budget, an fp32 bias and a COMPACT bias at an S_kv % 8 != 0
+    (217 -- the TMA 16-byte stride rule) leave the FROST row out of the plan list (the backend may serve them), while the SAME
+    S_kv = 217 bias with a padded row stride (224) is served; a kv_mask ALONE above the bias budget (S_kv 512) is served; a kv_mask
+    the row cannot serve (int8) or a kv_mask WITH a bias above the budget has no engine at all (the backend has no kv_mask field)."""
     import cudnn
 
     torch.manual_seed(2)
     d = 32
-    for s, bias_dtype in ((512, torch.bfloat16), (256, torch.float32)):
+    for s, bias_dtype in ((512, torch.bfloat16), (256, torch.float32), (217, torch.bfloat16)):
         q, k, v = (_bhsd(1, 2, s, d, torch.bfloat16) for _ in range(3))
         bias = torch.randn(1, 2, s, s, device="cuda").to(bias_dtype)
         g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), bias=bias)
@@ -912,14 +974,25 @@ def test_declines_on_real_graphs():
         except cudnn.cudnnGraphNotSupportedError:
             names, ours = [], []
         assert not ours, (s, bias_dtype, names)
+    q, k, v = (_bhsd(1, 2, 217, d, torch.bfloat16) for _ in range(3))
+    padded = torch.randn(1, 2, 217, 224, device="cuda").to(torch.bfloat16)[..., :217]
+    g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), bias=padded)
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names, ours = _frost_plans(g)
+    assert ours, ("a padded-stride bias at S_kv 217 is served", names)
     q, k, v = (_bhsd(1, 2, 512, d, torch.bfloat16) for _ in range(3))
     mask = torch.ones(1, 1, 1, 512, device="cuda", dtype=torch.bool)
     g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), kv_mask=mask)
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names, ours = _frost_plans(g)
+    assert ours, ("a kv_mask alone above the bias budget is served", names)
+    bias = torch.randn(1, 2, 512, 512, device="cuda").to(torch.bfloat16)
+    g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), bias=bias, kv_mask=mask)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
         g.create_execution_plans([cudnn.heur_mode.A])
         names, ours = _frost_plans(g)
         assert not ours, names
-        raise cudnn.cudnnGraphNotSupportedError("no FROST plan and the backend has no kv_mask field")
+        raise cudnn.cudnnGraphNotSupportedError("no FROST plan (the bias budget) and the backend has no kv_mask field")
     q, k, v = (_bhsd(1, 2, 256, d, torch.bfloat16) for _ in range(3))
     g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), kv_mask=torch.ones(1, 1, 1, 256, device="cuda", dtype=torch.int8))
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):

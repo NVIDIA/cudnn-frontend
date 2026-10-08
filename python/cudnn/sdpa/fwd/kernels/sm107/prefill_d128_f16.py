@@ -264,6 +264,8 @@ from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 #   config_sm107._validate_bias); the block itself may straddle the line -- no descriptor reads it.
 # kv_mask (CFG.KV_MASK_FORM) stages nothing in SMEM: per kv tile each softmax warp loads 4 mask bytes per lane and assembles
 #   4 keep words by warp ballot (tile_dsl.mask.kv_mask_keep_words), ANDed into the band's keep words inside apply_mask_chunk.
+#   A kv_mask-only rendering therefore carries NO resident budget -- any S_kv, so the ring-wrap axis (n_kv = STAGES_KV, +1, two
+#   wraps) is reachable on this body and validated there; only CFG.BIAS_MODE bounds S_kv.
 #
 # BIAS_PRELOAD_CHUNKS: how many of the step's 64-column bias chunks the softmax lanes load BEFORE the bmm1_done wait (the
 # block is resident, so the fragment has no dependency on BMM1): 0 = after the wait, 1 = chunk 0 under BMM1 and chunk 1 under

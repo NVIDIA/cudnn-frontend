@@ -836,8 +836,9 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # The packed THD split ABI uses the single-Q tile. The existing dense
         # D192 split remains a two-CTA lowering.
         return sched_policy, 1
-    if caps.sm_lo == 107 and selected_shape is not None and ((facts.has_bias and caps.bias_d_shapes is not None) or (facts.has_kv_mask and caps.kv_mask)):
-        # The resident bias / kv_mask block of the Rubin 32- / 64-wide tiles: the NARROWEST width whose block holds S_kv
+    if caps.sm_lo == 107 and selected_shape is not None and facts.has_bias and caps.bias_d_shapes is not None:
+        # The resident bias block of the Rubin 32- / 64-wide tiles (a kv_mask ALONE stages nothing in SMEM -- no block, no
+        # budget -- and takes the flavor's own rule below): the NARROWEST width whose block holds S_kv
         # (config_sm107.sm107_bias_auto_cga -- the arithmetic engines._bias_arm_decline and the adapter read, rule 8b'):
         # a d64 graph at S_kv 256 lands on cga2 (two tiles), S_kv <= 128 keeps the tuned cga1 below.  No width holding it
         # falls through: mismatch() declines every plan of such a graph whatever the pick.

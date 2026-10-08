@@ -289,7 +289,8 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
 # boolean ``kv_mask`` as one 32-bit keep word per 32 kv columns (a warp ballot over byte loads), folded into the bit-word mask.
 # The block is sized from what the carveout leaves after Q / O / K / V at the flavor's ring depth, in whole TILE_N-column
 # tiles: a graph whose KV range needs more tiles than fit is a TYPED decline on the row AND in the adapter (the streamed
-# ring is the follow-up); a width where no tile fits (d128 at either cga) does not serve the bias at all.
+# ring is the follow-up); a width where no tile fits (d128 at either cga) does not serve the bias at all.  The kv_mask ALONE
+# stages nothing in SMEM (byte loads + warp ballots per kv tile) -- no block, no S_kv budget: served at any S_kv.
 BIAS_MODE_NONE, BIAS_MODE_RESIDENT = 0, 1
 KV_MASK_NONE, KV_MASK_BOOL_WORD = 0, 1
 # The bias block's TMA / lane swizzle: the 128-B atom.  BOTH swizzle jobs force it -- the TMA descriptor writes the
@@ -326,7 +327,8 @@ def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int 
 
 def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128) -> Optional[int]:
     """The NARROWEST cga in ``cgas`` whose resident block holds ``s_kv`` (``sm107_bias_resident_s_kv_max``), or ``None``
-    when no width does.  The heuristics' auto pick for a bias / kv_mask graph, the width the standalone adapter lowers
+    when no width does.  The heuristics' auto pick for a BIAS graph (a kv_mask alone stages no block and keeps the flavor's
+    own width rule), the width the standalone adapter lowers
     with when none is requested, and the engine row's knob-less eligibility all read it (rule 8b'): a d64 graph at S_kv
     256 lands on cga2 (two tiles) without a knob, S_kv <= 128 keeps the tuned cga1."""
     for cga in sorted(cgas):

@@ -1464,8 +1464,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         return self._fp8
 
     def _resident_arm_cga(self) -> int:
-        """The width a bias / kv_mask plan runs at: the requested cga, or -- none requested -- the NARROWEST width of the
-        flavor's domain whose resident block holds S_kv (``config_sm107.sm107_bias_auto_cga``, the heuristics' pick, so
+        """The width a BIAS plan runs at (a kv_mask-only plan stages no block and keeps the flavor's own default): the
+        requested cga, or -- none requested -- the NARROWEST width of the flavor's domain whose resident block holds S_kv (``config_sm107.sm107_bias_auto_cga``, the heuristics' pick, so
         a d64 graph at S_kv 256 lands on cga2 whichever path built the plan); 1 when no width holds it, which
         ``check_support`` then declines with the budget.  Read by ``check_support`` and ``template_params`` alike."""
         if self.cga is not None:
@@ -1934,31 +1934,32 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Additive bias / per-key mask: the twin of the engine row's gates (engines._bias_arm_decline; rule 8b)
             # through the SAME constants (rule 8b').  The resident row-block lives in the Rubin f16/bf16 d128 file's
             # 32- / 64-wide tiles: dense, unsplit, unpaged, non-PackGQA, ungated, without the score side outputs,
-            # and at an S_kv whose tiles the carveout holds beside the operands at the plan's cga.
-            _what = "bias" if self.bias_desc is not None else "kv_mask"
+            # and -- with a bias -- at an S_kv whose tiles the carveout holds beside the operands at the plan's cga (the
+            # kv_mask alone stages nothing in SMEM: no block, no S_kv budget).
+            _what = "additive bias" if self.bias_desc is not None else "per-key kv_mask"
             self._not_implemented_error_if(
                 self._device_cc != (10, 7) or self._fp8,
-                f"the additive {_what} is served by the Rubin f16/bf16 engine's 32- / 64-wide tiles only (the resident row-block)",
+                f"the {_what} is served by the Rubin f16/bf16 engine's 32- / 64-wide tiles only",
             )
             self._not_implemented_error_if(
                 self.thd or self.paged or self.split_kv > 1 or bool(self.pack_gqa) or self.gate_desc is not None,
-                f"the additive {_what} is served on dense, unsplit, unpaged, non-PackGQA, ungated plans only",
+                f"the {_what} is served on dense, unsplit, unpaged, non-PackGQA, ungated plans only",
             )
             self._not_implemented_error_if(
                 self.score_max_desc is not None or self.score_sum_exp_desc is not None,
-                f"the additive {_what} and the score side outputs are not wired together (the -inf masked softmax arm publishes no true max)",
+                f"the {_what} and the score side outputs are not wired together (the -inf masked softmax arm publishes no true max)",
             )
             self._not_implemented_error_if(
                 self.flavor not in _SM107_BIAS_D_SHAPES,
-                f"the additive {_what} is wired on the {sorted(_SM107_BIAS_D_SHAPES)} kernel flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
-            )
-            _bias_cga = self._resident_arm_cga()
-            _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga)
-            self._not_implemented_error_if(
-                _s_kv_max == 0 or int(s_kv) > _s_kv_max,
-                f"the resident {_what} block at head-dim tile {self.flavor[0]} / cga {_bias_cga} holds S_kv <= {_s_kv_max}; got {s_kv} (the streamed form is not built)",
+                f"the {_what} is wired on the {sorted(_SM107_BIAS_D_SHAPES)} kernel flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             if self.bias_desc is not None:
+                _bias_cga = self._resident_arm_cga()
+                _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga)
+                self._not_implemented_error_if(
+                    _s_kv_max == 0 or int(s_kv) > _s_kv_max,
+                    f"the resident bias block at head-dim tile {self.flavor[0]} / cga {_bias_cga} holds S_kv <= {_s_kv_max}; got {s_kv} (the streamed form is not built)",
+                )
                 self._check_dtype(self.bias_desc, self.q_desc.dtype, name="bias")
                 _bd, _bs = tuple(int(x) for x in self.bias_desc.shape), tuple(int(x) for x in self.bias_desc.stride)
                 self._value_error_if(
@@ -2418,11 +2419,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # diagonal band. Its decode leg is picked by decode_tile, not cga.
             # The Rubin small tiles (d32 / d64 on the sm107 d128 file) likewise default to cga1 -- their validated width
             # (config_sm107.SM107_SMALL_D_CGAS; at TILE_O = 32 a cga2 V operand would be a 32-byte MN-major atom).
-            # A bias / kv_mask plan without a requested width takes the narrowest one whose resident block holds S_kv
-            # (_resident_arm_cga: the heuristics' pick), not the small tiles' cga1 default.
+            # A BIAS plan without a requested width takes the narrowest one whose resident block holds S_kv
+            # (_resident_arm_cga: the heuristics' pick), not the small tiles' cga1 default; a kv_mask-only plan stages no
+            # block and keeps the tiles' own rule below.
             cta_mma=(
                 self._resident_arm_cga()
-                if (self.bias_desc is not None or self.kv_mask_desc is not None)
+                if self.bias_desc is not None
                 else (
                     (
                         1

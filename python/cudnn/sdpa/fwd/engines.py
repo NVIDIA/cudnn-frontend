@@ -771,25 +771,24 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
 
 def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> Optional[str]:
     """The resident-bias / kv_mask arm's gates (a row with ``bias_d_shapes`` or ``kv_mask``): the legs it does not carry,
-    the flavor the graph selects, the operands' layouts and the S_kv budget of the resident block -- at the plan's cga
+    the flavor the graph selects, the operands' layouts and -- for a graph WITH a bias -- the S_kv budget of the resident
+    block (the kv_mask ALONE stages nothing in SMEM and carries no budget) -- at the plan's cga
     when the knobs carry one, else at ANY width of the flavor's domain (the heuristics' row-level probe: the row serves
     the graph when some width holds the block; ``heuristics._auto_sched_cga`` then picks the narrowest such width through
     ``config_sm107.sm107_bias_auto_cga`` and every proposed plan is re-asked here with its own cga) -- every one a typed
     decline, the twin of the adapter's ``check_support`` (rule 8b)."""
     from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max
 
-    what = "bias" if facts.has_bias else "kv_mask"
+    what = "additive bias" if facts.has_bias else "per-key kv_mask"
     if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp or facts.has_epilogue_gate:
-        return f"the additive {what} is served on dense, unpaged plans without the score side outputs or the epilogue gate (no THD)"
+        return f"the {what} is served on dense, unpaged plans without the score side outputs or the epilogue gate (no THD)"
     if knobs is not None and ((knobs.split_kv or 1) > 1 or knobs.pack_gqa):
-        return f"the additive {what} is served on unsplit, non-PackGQA plans only"
+        return f"the {what} is served on unsplit, non-PackGQA plans only"
     selected = _selected_d_shape(capabilities, facts, knobs)
     shapes = capabilities.bias_d_shapes if capabilities.bias_d_shapes is not None else capabilities.d_shapes
     if selected not in shapes:
         wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(shapes))
-        return (
-            f"the additive {what} is wired on the {wired} kernel flavors only (the resident row-block); head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
-        )
+        return f"the {what} is wired on the {wired} kernel flavors only (the f16/bf16 small tiles); head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
     if facts.has_bias:
         dims, st = facts.bias_dim, facts.bias_stride
         elem = 2
@@ -802,7 +801,10 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
             return f"kv_mask dtype {facts.kv_mask_dtype} not in {sorted(str(d) for d in capabilities.kv_mask_dtypes)}"
         if len(facts.kv_mask_stride) == 4 and facts.kv_mask_stride[3] != 1:
             return f"kv_mask must have its key dim contiguous (stride 1); got strides {facts.kv_mask_stride}"
-    if capabilities.sm_lo != 107:
+    if capabilities.sm_lo != 107 or not facts.has_bias:
+        # The kv_mask ALONE stages nothing in SMEM (4 byte loads + 4 warp ballots per kv tile, folded into the bit-word mask):
+        # no resident block, hence no S_kv budget -- any S_kv is served and the flavor's own width rule applies (validated on
+        # cc 10.7 across the ring wrap, n_kv = 4 / 5 / 8).  Only a graph WITH a bias carries the block's budget below.
         return None
     if knobs is not None and knobs.cga is not None:
         widths = (knobs.cga,)  # the plan's width: the block it gets
@@ -815,7 +817,7 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     if all(s_kv_max == 0 or facts.s_kv > s_kv_max for s_kv_max in budgets.values()):
         held = " / ".join(f"cga {cga}: S_kv <= {s_kv_max}" for cga, s_kv_max in budgets.items())
         return (
-            f"the resident {what} block at head-dim tile {selected[0]} holds {held} (the SMEM left beside the Q/O slabs and the K/V ring); "
+            f"the resident bias block at head-dim tile {selected[0]} holds {held} (the SMEM left beside the Q/O slabs and the K/V ring); "
             f"got S_kv={facts.s_kv} -- the streamed form is not built"
         )
     return None
