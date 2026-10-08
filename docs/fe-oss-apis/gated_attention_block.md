@@ -716,7 +716,7 @@ fp4 modes, `d_model = 4096` (not the 5120 of the tables above; `h_q=32 h_kv=2 d=
 2052 / 1968 at 32K causal / dense -- the lock power-caps at the long shapes), speedup over the same bf16 torch chain (median
 of 5 launch-interleaved rounds x 30 launches, every arm of a row in one process; the MXFP8 FROST control pair within 0.6 % at
 4K-16K and 2.0-2.5 % at dense 32K under the cap). S = 2048 is not quoted: in a ten-arm process that row is a sub-millisecond
-window whose control pair read above 30 %. The dense S = 32768 cells of BOTH fully fused NVFP4 `O` columns read 11-12 %
+window whose control pair read 30-44 %. The dense S = 32768 cells of BOTH fully fused NVFP4 `O` columns read 11-12 %
 slower than their unfused twins -- a standing anomaly of the fused NVFP4 `O` pipeline, independent of the weight format.
 
 Causal:
