@@ -505,14 +505,15 @@ bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg
 
 `gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
 recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, max_seq_len=None, quant=None,
-grad_scaling="current", scale_dp=None, scale_dy=None, scale_do=None, scale_dqkvg=None, ..., grad_scale_margin_log2=0)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+grad_scaling="current", scale_dp=None, scale_dy=None, scale_do=None, scale_dqkvg=None, h_t=None, h_t_sf=None, w_qkvg_t=None,
+w_qkvg_t_sf=None, w_o_t=None, w_o_t_sf=None, grad_scale_margin_log2=0)` allocates the gradients and the workspace on the launch stream (`current_stream`,
 else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
 caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
 `saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached). Under `thd=True` it
 derives `num_sequences` and `cu_seqlens` from the record (`saved.seq_lens.numel()`, `saved.seq_lens_form`) and requires
 `max_seq_len` (a `ValueError` naming it alone otherwise); both, with `max_seq_len`, are part of its cache key. `quant` /
-`grad_scaling` (the quantized backward below) join the key too, and `scale_dp` / `scale_dy` / `scale_do` / `scale_dqkvg` pass
-through to `execute`; the gradients are allocated in `dy`'s dtype (bf16 under `quant`, where `saved.h` and the weights are e4m3 codes).
+`grad_scaling` (the quantized backward below) join the key too, and `scale_dp` / `scale_dy` / `scale_do` / `scale_dqkvg` and the
+transposed artifacts `h_t` / `h_t_sf` / `w_qkvg_t` / `w_qkvg_t_sf` / `w_o_t` / `w_o_t_sf` pass through to `execute`; the gradients are allocated in `dy`'s dtype (bf16 under `quant`, where `saved.h` and the weights are e4m3 codes).
 
 **Packed sequences (THD).** `GatedAttentionBlockBwd(..., thd=True, num_sequences=B, max_seq_len=S_max, cu_seqlens=False)` --
 the forward's four knobs, appended last -- differentiates the packed training record of the section above: `dy` is
