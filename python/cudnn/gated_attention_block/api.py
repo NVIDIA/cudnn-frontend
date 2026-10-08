@@ -289,6 +289,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -403,14 +404,25 @@ _logger = logging.getLogger(__name__)
 #
 # THE CALLER'S SIDE
 # -----------------
-# ``build_fused_qkvg_weight`` assembles ``W_qkvg`` from the three checkpoint
-# matrices ONCE, at load time. It takes ``q_gate_layout`` because the model's
-# own convention for splitting the double-width ``q_proj`` is not something to
-# guess: "flat" chunks ``[..., 2*H_q*D]`` into all-Q then all-GATE, "per_head"
-# views it as ``[..., H_q, 2*D]`` first and chunks the head dim. The two differ
-# by a row permutation of ``q_proj.weight``, and picking wrong is a silent wrong
-# answer -- so it is a parameter, checked by a round-trip test, and never a
-# hot-path conversion either way.
+# ``qkvg_from_hf`` is the documented entry point: it assembles ``W_qkvg`` and
+# the two norm weights from a HF Qwen checkpoint's five tensors ONCE, at load
+# time, applying the two conventions every Qwen checkpoint from Qwen3-Next on
+# shares -- the double-width ``q_proj`` is split PER HEAD (``view(..., H_q,
+# 2*D).chunk(2, dim=-1)``), and the QK-norm weight is zero-centered (applied as
+# ``1 + w``). ``build_fused_qkvg_weight`` is the layout-explicit assembler
+# underneath it. It takes ``q_gate_layout`` because the model's own convention
+# for splitting ``q_proj`` is not something to guess: "flat" chunks
+# ``[..., 2*H_q*D]`` into all-Q then all-GATE, "per_head" views it as
+# ``[..., H_q, 2*D]`` first and chunks the head dim. The two differ by a row
+# permutation of ``q_proj.weight``, and picking wrong is a silent wrong answer
+# -- so it is a parameter, checked by a round-trip test, never a hot-path
+# conversion either way, and an OMITTED layout (which still means "flat")
+# emits a ``FutureWarning`` rather than guessing silently. FutureWarning, not
+# DeprecationWarning: CPython's default filters show a ``DeprecationWarning``
+# only to a ``__main__`` caller, so from a model loader living in a library
+# module -- where every serving stack's model file lives -- it would be
+# dropped unseen, and the wrong gate layout it announces is a finite,
+# plausible, silently wrong output.
 
 
 QKVG_TILE_ALIGN = 64
@@ -643,12 +655,14 @@ def build_fused_qkvg_weight(
     w_v: torch.Tensor,
     geometry: GatedAttentionBlockGeometry,
     *,
-    q_gate_layout: str = "flat",
+    q_gate_layout: Optional[str] = None,
 ) -> torch.Tensor:
     """Assemble ``W_qkvg [N, d_model]`` from the checkpoint's three matrices.
 
     **Load time only.** The result is what stage (1) reads; nothing here ever
-    runs on the execute path.
+    runs on the execute path. Loading a HF Qwen checkpoint? Use
+    :func:`qkvg_from_hf`, which fixes the layout below to the one those
+    checkpoints use and also prepares the two norm weights.
 
     Parameters
     ----------
@@ -671,6 +685,16 @@ def build_fused_qkvg_weight(
         Get this wrong and every gate is applied to the wrong head: the output
         is finite, plausible, and wrong, with no error anywhere. Verify it
         against the model you are loading rather than trusting a default.
+
+        ``None`` (the default) is DEPRECATED: it still means ``"flat"`` so no
+        existing caller changes behaviour, but it emits a ``FutureWarning``
+        -- the deprecation category Python shows under its default warning
+        filters, so a caller inside a library module sees it too, where a
+        ``DeprecationWarning`` is shown only to ``__main__``. Every HF Qwen
+        checkpoint from Qwen3-Next on is ``"per_head"``
+        (``q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)``), so the silent
+        default was the trap the paragraph above describes. Pass the layout
+        explicitly, or load through :func:`qkvg_from_hf`.
     """
     geometry.validate()
     d = geometry.d_head
@@ -684,6 +708,16 @@ def build_fused_qkvg_weight(
         if w.shape[1] != geometry.d_model:
             raise ValueError(f"{name} must have {geometry.d_model} columns (d_model), got {w.shape[1]}")
 
+    if q_gate_layout is None:
+        warnings.warn(
+            "build_fused_qkvg_weight: q_gate_layout was not given and defaults to 'flat' (all Q heads, then all GATE heads). "
+            "HF Qwen checkpoints from Qwen3-Next on split q_proj PER HEAD ([q_h | gate_h]): load those through qkvg_from_hf(...) "
+            "or pass q_gate_layout='per_head'. The implicit default is deprecated; pass the layout explicitly.",
+            # FutureWarning, not DeprecationWarning: the default filters drop a DeprecationWarning raised from library code.
+            FutureWarning,
+            stacklevel=2,
+        )
+        q_gate_layout = "flat"
     if q_gate_layout == "flat":
         w_q, w_gate = w_q_gate[: hq * d], w_q_gate[hq * d :]
     elif q_gate_layout == "per_head":
@@ -694,6 +728,103 @@ def build_fused_qkvg_weight(
         raise ValueError(f"q_gate_layout must be 'flat' or 'per_head', got {q_gate_layout!r}")
 
     return torch.cat([w_q, w_gate, w_k, w_v], dim=0).contiguous()
+
+
+def qkvg_from_hf(
+    q_proj_weight: torch.Tensor,
+    k_proj_weight: torch.Tensor,
+    v_proj_weight: torch.Tensor,
+    q_norm_weight: Optional[torch.Tensor],
+    k_norm_weight: Optional[torch.Tensor],
+    geometry: GatedAttentionBlockGeometry,
+    *,
+    index_qk_proj_weight: Optional[torch.Tensor] = None,
+    act_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(w_qkvg, w_q_norm, w_k_norm)`` for the block from a HF Qwen attention layer's tensors.
+
+    **Load time only** -- the three results are what the block reads on every
+    ``execute``; nothing here runs on the hot path. "From HF" means the two
+    conventions every Qwen checkpoint from Qwen3-Next on shares (Qwen3-Next,
+    Qwen3.5, the Qwen3.8 family), applied here so the caller cannot get them
+    wrong:
+
+    * **The double-width ``q_proj`` is split PER HEAD.** The model computes
+      ``q, gate = q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)``, so the
+      rows of ``q_proj.weight`` are ``[q_0 | gate_0 | q_1 | gate_1 | ...]`` --
+      :func:`build_fused_qkvg_weight` with ``q_gate_layout="per_head"``. The
+      other layout applies every gate to the wrong head with no error anywhere.
+    * **The QK-norm weights are zero-centered.** The model's RMSNorm is
+      ``x * rsqrt(mean(x^2) + eps) * (1 + w)`` with ``w`` initialised to zeros,
+      while the block multiplies by the ``[D]`` vector it is given. The form
+      handed over is DERIVED from the geometry's ``norm_weight_offset`` (0.0
+      when the geometry has no such field): at ``0.0`` the block adds nothing,
+      so it receives ``(1 + w)``; at ``1.0`` the block's norm kernels add the
+      ``1`` themselves in fp32, so it receives ``w`` as is. Deriving it from
+      the same geometry the block is declared with is what keeps the two
+      mechanisms from composing into ``1 + (1 + w)`` -- finite, plausible,
+      wrong -- which is why there is no free-standing argument for it.
+
+    ``(1 + w)`` is formed in fp32 and rounded ONCE into ``act_dtype``. bf16
+    has 8 significand bits, so near 1.0 that rounding is at most ``2^-8`` =
+    0.39 % relative per channel (``2^-11`` = 0.049 % in f16), and a trained
+    ``-2^-9 < w < 2^-8`` rounds to exactly 1.0 (an asymmetric interval: bf16's
+    spacing is ``2^-8`` just below 1.0 and ``2^-7`` just above; f16 loses
+    ``-2^-12 < w < 2^-11``); a systematic per-channel scale error inside the
+    block's accuracy budget but not HF-faithful -- the fp32 in-kernel offset
+    form is the faithful one once a geometry declares it.
+
+    Parameters
+    ----------
+    q_proj_weight
+        ``q_proj.weight``, ``[2*H_q*D, d_model]`` (Q and the output gate, per head).
+    k_proj_weight, v_proj_weight
+        ``k_proj.weight`` / ``v_proj.weight``, ``[H_kv*D, d_model]``.
+    q_norm_weight, k_norm_weight
+        ``q_norm.weight`` / ``k_norm.weight``, ``[D]``, zero-centered; both
+        ``None`` iff ``geometry.qk_norm`` is ``False`` (then the block takes no
+        norm weights and ``None`` is returned in their slots).
+    geometry
+        The block's geometry; also the source of ``norm_weight_offset``.
+    index_qk_proj_weight
+        Reserved for the indexer projection band of a QSA layer; this geometry
+        declares no such band, so only ``None`` is accepted.
+    act_dtype
+        The block's ACTIVATION dtype (bf16 by default, f16 also served). All
+        three results are returned in it, contiguous. A quantized pipeline
+        quantizes the returned ``w_qkvg`` afterwards and keeps the norm weights
+        in this dtype, exactly as the block's descriptor contract requires.
+    """
+    if not isinstance(act_dtype, torch.dtype) or not act_dtype.is_floating_point:
+        raise ValueError(f"act_dtype must be a floating-point torch dtype (the block's activation dtype), got {act_dtype!r}")
+    if index_qk_proj_weight is not None:
+        raise ValueError(
+            "index_qk_proj_weight: this geometry declares no indexer band, so W_qkvg has exactly the four bands Q | GATE | K | V "
+            "and the indexer projection is not part of it; pass None"
+        )
+    offset = float(getattr(geometry, "norm_weight_offset", 0.0))
+    if offset not in (0.0, 1.0):
+        raise ValueError(
+            f"geometry.norm_weight_offset must be 0.0 (the block multiplies by the weight as given, so it receives 1 + w) or 1.0 "
+            f"(the block adds the 1 itself, so it receives w); got {offset}"
+        )
+    w_qkvg = build_fused_qkvg_weight(q_proj_weight, k_proj_weight, v_proj_weight, geometry, q_gate_layout="per_head").to(act_dtype).contiguous()
+
+    norms = []
+    for name, w in (("q_norm_weight", q_norm_weight), ("k_norm_weight", k_norm_weight)):
+        if not geometry.qk_norm:
+            if w is not None:
+                raise ValueError(f"{name}: geometry.qk_norm=False -- the block applies no QK-RMSNorm and takes no norm weights; pass None")
+            norms.append(None)
+            continue
+        if w is None:
+            raise ValueError(f"{name} is required when geometry.qk_norm=True (a zero-centered [d_head] vector; HF Qwen initialises it to zeros)")
+        if tuple(w.shape) != (geometry.d_head,):
+            raise ValueError(f"{name} must be [d_head={geometry.d_head}] (one RMSNorm weight per head dim), got {tuple(w.shape)}")
+        # (1 + w) in fp32 -- the model's own `output * (1.0 + self.weight.float())` -- then ONE rounding into the
+        # activation dtype; at offset 1.0 the kernel adds the 1 in fp32 and `w` travels as is.
+        norms.append(((1.0 + w.float()) if offset == 0.0 else w.float()).to(act_dtype).contiguous())
+    return w_qkvg, norms[0], norms[1]
 
 
 # ---------------------------------------------------------------------------

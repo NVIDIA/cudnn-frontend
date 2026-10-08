@@ -6,7 +6,9 @@
 
 The gated attention block is the first **model-level** FE-OSS API: a set of FROST CuTe-DSL kernels behind one
 Python class, one workspace and one `execute()` call. It implements the gated attention sub-layer used by
-Qwen3.5-style models (the API is named by op geometry, the model is provenance only):
+Qwen3.5- and Qwen3.8-style models (the API is named by op geometry, the model is provenance only; the Qwen3.8
+family's geometries and the bound up to which the block is Qwen3.8-Flash-Next's sparse layer are under
+[Qwen3.8 family / Qwen3.8-Flash-Next](#qwen38-family--qwen38-flash-next)):
 
 ```text
 h [B, S, d_model]                                       (post input-layernorm)
@@ -70,7 +72,7 @@ produced, the backward drops the norm-weight gradients).
 import cudnn
 from cudnn.gated_attention_block import (
     GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec, MxQuantSpec, Fp4Format,
-    build_fused_qkvg_weight, GatedAttentionBlockBwd, RecomputePolicy, SavedForBackward,
+    build_fused_qkvg_weight, qkvg_from_hf, GatedAttentionBlockBwd, RecomputePolicy, SavedForBackward,
 )
 ```
 
@@ -90,15 +92,85 @@ from cudnn.gated_attention_block import (
 | `is_causal` (`True`), `causal_bottom_right` (`False`) | causal mask and its diagonal alignment |
 | `window_left`, `window_right` (`-1`) | sliding window bounds; `-1` = unbounded |
 
+### Qwen3.8 family / Qwen3.8-Flash-Next
+
+The block's math is also the gated attention sub-layer of the Qwen3.8 family (provenance only -- the API stays named by op
+geometry). The five geometries below are pinned in the layout contract (`test_layout_contract.py`: the stage-(1) column map,
+the GQA ratio, the tile plans, the norm kernel's fitted tile) and run end to end against the fp32 oracle on Rubin
+(`test_block_end_to_end.py`, the `qwen38` cells: the unfused bf16 pipeline at all five and the fully fused pipeline at 24 / 2,
+B = 2 for the Flash-Next geometries and B = 1 for the two large siblings, S in {512, 2051}, the weights loaded through
+`qkvg_from_hf`):
+
+| model | `d_model` | `h_q` / `h_kv` | `N` (= `n_qkvg`) | GQA group | stages (2)+(3) kernel |
+|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next, TP 1 | 2560 | 24 / 2 | 13312 | 12 | TMA, 12-row tile |
+| Qwen3.8-Flash-Next, TP 2 | 2560 | 12 / 1 | 6656 | 12 | TMA, 12-row tile |
+| Qwen3.8-Flash-Next, TP 4 | 2560 | 6 / 1 | 3584 | 6 | LDG (no TMA tile fits 6 / 1) |
+| Qwen3.8-27B | 5120 | 24 / 4 | 14336 | 6 | TMA, 12-row tile |
+| Qwen3.8-2.4T-A95B | 8192 | 64 / 4 | 34816 | 16 | TMA, 16-row tile |
+
+All five share `d_head = 256`, `rope_dim = 64`, QK-RMSNorm with zero-centered weights and the per-head `[q_h | gate_h]` split
+of `q_proj` -- load them through `qkvg_from_hf` (next section). The 27B and 2.4T members are dense gated attention: the block
+IS their attention layer at every sequence length it serves (a prefill block: `S = 1` is decode, out of the prefill bodies'
+scope).
+
+**Flash-Next: exact for `<= 2051` visible tokens.** Flash-Next's attention layer is Qwen Sparse Attention (QSA): the same
+gated core restricted, per query, to indexer-selected 4-token blocks under a 2048-token budget -- the top `min(512, n_blocks)`
+complete blocks plus the open tail block, at most `2048 + 4 - 1 = 2051` keys per query. A query that sees `n` tokens has
+`floor(n / 4)` complete blocks, and every one of them is selected when `floor(n / 4) <= 512`, i.e. `n <= 2051`: the selection
+is the identity and causal attention over the visible tokens IS the QSA layer. So for every query with at most 2051 visible
+tokens -- every sequence of up to 2051 tokens -- the dense block computes Flash-Next's attention layer exactly: the same
+function (a sparse evaluation sums the same terms in another order, so the identity holds within the suite's budget, not
+bitwise). Beyond 2051 visible tokens QSA drops the blocks its indexer did not select while this block attends densely -- a
+different function; the indexer and the sparse core are not part of the block today.
+
 ### Weights and tables
 
-- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V`. Build it from separate
-  projection weights with `build_fused_qkvg_weight(w_q_gate, w_k, w_v, geometry, q_gate_layout="flat")`; the
-  block's tile alignment is `QKVG_TILE_ALIGN = 64` columns.
+- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V`; the block's tile alignment
+  is `QKVG_TILE_ALIGN = 64` columns. Build it ONCE at load time, never per call:
+  - **from a HF Qwen checkpoint** (Qwen3-Next, Qwen3.5, the Qwen3.8 family / Flash-Next) with the documented entry
+    point, which also prepares the two QK-norm weights:
+
+    ```python
+    w_qkvg, w_q_norm, w_k_norm = qkvg_from_hf(
+        attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight, attn.q_norm.weight, attn.k_norm.weight, geometry,
+        act_dtype=torch.bfloat16,   # the block's activation dtype; all three results come back in it
+    )
+    ```
+
+    It applies the two conventions those checkpoints share: the double-width `q_proj` is split PER HEAD
+    (`q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)`, i.e. weight rows `[q_0 | gate_0 | q_1 | gate_1 | ...]`), and
+    the QK-norm weights are zero-centered (`x_normed * (1 + w)`, `w` initialised to zeros), so the block -- which
+    multiplies by the vector it is given -- receives `(1 + w)` in the activation dtype (rounding cost below).
+  - **from three matrices with an explicit layout**: `build_fused_qkvg_weight(w_q_gate, w_k, w_v, geometry,
+    q_gate_layout="per_head" | "flat")`. The layout is a property of the checkpoint and is not inferable from the
+    tensor (`"flat"` = all Q heads, then all GATE heads); getting it wrong applies every gate to the wrong head with
+    no error anywhere. Omitting `q_gate_layout` still means `"flat"` but emits a `FutureWarning` (the deprecation
+    category Python shows under its default filters, so a loader in a library module sees it too) -- pass it explicitly.
 - `W_o [d_model, H_q * D]`.
 - `cos`, `sin` `[B, S, rope_dim]` rotary tables in the activation dtype (rotate-half convention on the first
   `rope_dim` dims of every head).
-- `w_q_norm`, `w_k_norm` `[D]` (both `None` iff `geometry.qk_norm` is `False`).
+- `w_q_norm`, `w_k_norm` `[D]` (both `None` iff `geometry.qk_norm` is `False`). The block multiplies the normalised
+  row by this vector as given, so a zero-centered checkpoint weight is handed in as `(1 + w)` (`qkvg_from_hf` does
+  this). Forming `1 + w` in fp32 and rounding it once into the activation dtype costs at most half an ulp at 1.0 per
+  channel -- `2^-8 = 0.39 %` relative in bf16, `2^-11 = 0.049 %` in f16 -- a systematic per-channel scale error
+  inside the block's accuracy budget (`cos >= 0.999` on `out`) but not bit-faithful to the checkpoint -- measured end to
+  end at the five Qwen3.8 family geometries (the `qwen38` cells of `test_block_end_to_end.py`, Rubin, `w ~ N(0, 0.1)`): the
+  block on the rounded weights reads `cos >= 0.99998` against an oracle fed the fp32 `(1 + w)` at every cell (and
+  0.999995-0.999996 unfused / 0.999986-0.999987 fully fused against the oracle fed the same rounded weights). Per
+  channel, for `w ~ N(0, sigma)` (2^18 samples, seed 0, the table `test_rounding_of_a_zero_centered_norm_weight_handed_in_as_one_plus_w` prints; `rel err = |rnd(1 + w) - (1 + w)| / (1 + w)`):
+
+  | sigma of `w` | bf16 max rel err | bf16 mean rel err | bf16 channels rounded to exactly 1.0 | f16 max rel err | f16 mean rel err | f16 channels rounded to exactly 1.0 |
+  |---|---|---|---|---|---|---|
+  | 1e-3 | 0.389 % | 0.078 % | 97.5 % | 0.049 % | 0.018 % | 28.5 % |
+  | 1e-2 | 0.389 % | 0.146 % | 22.9 % | 0.049 % | 0.018 % | 3.0 % |
+  | 1e-1 | 0.389 % | 0.144 % | 2.4 % | 0.049 % | 0.018 % | 0.3 % |
+
+  A trained `-2^-9 < w < 2^-8` is lost entirely in bf16 -- an asymmetric interval, because bf16's spacing is `2^-8`
+  just below 1.0 and `2^-7` just above (f16 loses `-2^-12 < w < 2^-11`); it is the 97.5 % at `sigma = 1e-3` above.
+  The faithful form -- the weight stored as `w`, the `1` added in fp32 inside the norm kernels behind a geometry
+  field `norm_weight_offset = 1.0` -- is a follow-up; `qkvg_from_hf` derives which form to hand over from that same
+  geometry field (absent or `0.0` today), so the two can never compose into `1 + (1 + w)`.
 - MXFP8 only: `h_sf` and `w_qkvg_sf`, the E8M0 scale factors of `h` and `W_qkvg` in cuDNN's F8_128x4 order
   (`uint8` or `float8_e8m0fnu`; byte counts from `cudnn.gated_attention_block.kernels.proj_gemm.sf_blob_bytes`).
 - fp4 weights are **packed e2m1**, dtype `torch.float4_e2m1fn_x2`, stored `[N, K // 2]` -- two codes per byte along
@@ -636,6 +708,12 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 
 ## Requirements and limits
 
+- `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` in the environment BEFORE `import cudnn`: every FROST engine is opt-in, and the
+  block drives them. Without the flag the bf16 / f16 / per-tensor-fp8 projection GEMMs refuse to run -- a `RuntimeError`
+  at `compile()` whose message names the flag (the GEMM plan is built there, not at `check_support()`) -- and the
+  block-scale (MXFP8 / fp4-weight) projections log a warning and take FROST's JIT-only route instead. Neither ever falls
+  back to a cuDNN backend plan, so an unset flag is never a silently slower block. The SDPA stage binds its FROST class
+  directly and does not consult the flag.
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`, head counts the TMA Q / K rebuild tiles),
