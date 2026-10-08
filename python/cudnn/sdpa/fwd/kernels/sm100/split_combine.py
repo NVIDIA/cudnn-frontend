@@ -81,6 +81,113 @@ THREADS = 128
 ROWS_PER_BLOCK = THREADS // 32
 # Splits whose LSE and partial-O rows are loaded up front, before any math.
 G_S = 4
+# Unroll depth of the serial combine's split walks (one warp per row): the
+# loads of this many splits are issued together, so the latency of the
+# dependent walk is paid once per group rather than once per split.  Each walk
+# runs in two legs -- the splits up to the last full group with this unroll,
+# the remaining ``n_splits % _SERIAL_UNROLL`` with the four-wide one -- because
+# a compiler-unrolled loop whose trip count is below its unroll degrades to a
+# serial remainder loop (n_splits = 8 measured 4.2 -> 7.0 us on B300 at a
+# plain unroll of 16), and an explicitly predicated group (clamped index, zero
+# weight past the end) issued its loads serially (d256 x 128 splits 47 -> 80
+# us).  Each unrolled split costs a lane four fp32 loads plus its LSE, inside
+# the serial kernel's register budget.  B300, d128 S_q=16 x 32 splits: 11.0 ->
+# 5.5 us; d256 S_q=4 x 64 splits: 25.0 -> 12.2 us; x 128 splits: 47 -> 21.
+_SERIAL_UNROLL = 16
+_SERIAL_TAIL_UNROLL = 4
+
+
+def _serial_legs(n_splits):
+    """``(n_main, n_splits)``: the end of the last full _SERIAL_UNROLL group."""
+    return n_splits - n_splits % cutlass.Int32(_SERIAL_UNROLL), n_splits
+
+
+def _lean_legs(n_splits):
+    """``(n_main, n_splits)`` for the lean path's tail past the G_S up-front splits:
+    the end of the last full _SERIAL_UNROLL group of ``[G_S, n_splits)``."""
+    return n_splits - (n_splits - cutlass.Int32(G_S)) % cutlass.Int32(_SERIAL_UNROLL), n_splits
+
+
+@cute.jit
+def _accumulate_splits(
+    lo,
+    hi,
+    unroll: cutlass.Constexpr[int],
+    o_partial: cute.Tensor,
+    lse_partial: cute.Tensor,
+    o_base,
+    vec_ok,
+    batch,
+    n_batch,
+    head,
+    q_row,
+    d0,
+    d_v,
+    m_safe,
+    neg_inf,
+    zero,
+    acc0,
+    acc1,
+    acc2,
+    acc3,
+):
+    """One leg of the serial combine's O accumulation over splits ``[lo, hi)``
+    for this lane's four columns ``d0..d0+3``; returns the four accumulators."""
+    op = cutlass.make_array_view(o_partial)
+    lp = cutlass.make_array_view(lse_partial)
+    for s in cutlass.range(lo, hi, 1, unroll=unroll):
+        lse_row = lp[batch + s * n_batch, head, :]
+        lse_s = cutlass.Float32(lse_row[q_row])
+        live = lse_s > neg_inf
+        e = cute.math.exp(lse_s - m_safe, fastmath=True)
+        w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+        e0 = zero
+        e1 = zero
+        e2 = zero
+        e3 = zero
+        # Element loads through the view, each bounded by the row, serve the
+        # half partials (flavors whose split epilogue keeps the staged TMA-store
+        # O path, e.g. d512) and any d_v / base that cannot take aligned 16-byte
+        # loads (legal through the runtime-shape pointer entries); aligned fp32
+        # partials take one 16-byte load per split.
+        if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
+            if vec_ok:
+                idx = cute.crd2idx((batch + s * n_batch, q_row, head, d0), o_partial.layout)
+                v = ld_global_v4(o_base + cutlass.Int64(idx) * 4, cutlass.Float32)
+                e0 = cutlass.Float32(v[0])
+                e1 = cutlass.Float32(v[1])
+                e2 = cutlass.Float32(v[2])
+                e3 = cutlass.Float32(v[3])
+            else:
+                o_row = op[batch + s * n_batch, q_row, head, :]
+                e0 = cutlass.Float32(o_row[d0])
+                if d0 + cutlass.Int32(1) < d_v:
+                    e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
+                if d0 + cutlass.Int32(2) < d_v:
+                    e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
+                if d0 + cutlass.Int32(3) < d_v:
+                    e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
+        else:
+            o_row = op[batch + s * n_batch, q_row, head, :]
+            e0 = cutlass.Float32(o_row[d0])
+            if d0 + cutlass.Int32(1) < d_v:
+                e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
+            if d0 + cutlass.Int32(2) < d_v:
+                e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
+            if d0 + cutlass.Int32(3) < d_v:
+                e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
+        # a dead slot may hold anything, including non-finite values
+        v0 = cutlass.Float32(arith.select(live.ir_value(), e0.ir_value(), zero.ir_value()))
+        v1 = cutlass.Float32(arith.select(live.ir_value(), e1.ir_value(), zero.ir_value()))
+        v2 = cutlass.Float32(arith.select(live.ir_value(), e2.ir_value(), zero.ir_value()))
+        v3 = cutlass.Float32(arith.select(live.ir_value(), e3.ir_value(), zero.ir_value()))
+        acc0 = acc0 + w * v0
+        acc1 = acc1 + w * v1
+        acc2 = acc2 + w * v2
+        acc3 = acc3 + w * v3
+    return acc0, acc1, acc2, acc3
+
+
 # Shared memory of the decode-form combine: the per-warp (max | sum) exchange and
 # the per-lane four-column partial sums of the warps that share a row.
 SMEM_BYTES = (2 * ROWS_PER_BLOCK + ROWS_PER_BLOCK * 32 * 4) * 4 + 64
@@ -260,9 +367,14 @@ def _combine_kernel(
                     m = neg_inf
                     for s in cutlass.range_constexpr(G_S):
                         m = cute.math.max(m, lse_v[s])
-                    # Splits past G_S (rare) extend the max before any weight is formed.
+                    # Splits past G_S extend the max before any weight is formed.  Like the serial
+                    # form's walks, the tail runs _SERIAL_UNROLL deep in two legs (_lean_legs) so the
+                    # loads of many splits are in flight together instead of one L2 round trip each.
                     if n_splits > cutlass.Int32(G_S):
-                        for s in cutlass.range(G_S, n_splits, 1, unroll=1):
+                        n_main, n_all = _lean_legs(n_splits)
+                        for s in cutlass.range(cutlass.Int32(G_S), n_main, 1, unroll=_SERIAL_UNROLL):
+                            m = cute.math.max(m, _ld_global_f32(lse_base + cutlass.Int64(s) * lse_step))
+                        for s in cutlass.range(n_main, n_all, 1, unroll=_SERIAL_TAIL_UNROLL):
                             m = cute.math.max(m, _ld_global_f32(lse_base + cutlass.Int64(s) * lse_step))
                     # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather than
                     # exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
@@ -299,7 +411,24 @@ def _combine_kernel(
                         acc2 = acc2 + w * v2
                         acc3 = acc3 + w * v3
                     if n_splits > cutlass.Int32(G_S):
-                        for s in cutlass.range(G_S, n_splits, 1, unroll=1):
+                        n_main, n_all = _lean_legs(n_splits)
+                        for s in cutlass.range(cutlass.Int32(G_S), n_main, 1, unroll=_SERIAL_UNROLL):
+                            s64 = cutlass.Int64(s)
+                            lse_s = _ld_global_f32(lse_base + s64 * lse_step)
+                            v = ld_global_v4(o_row_base + s64 * o_step, cutlass.Float32)
+                            live = lse_s > neg_inf
+                            e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                            w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                            v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
+                            v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
+                            v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
+                            v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
+                            den = den + w
+                            acc0 = acc0 + w * v0
+                            acc1 = acc1 + w * v1
+                            acc2 = acc2 + w * v2
+                            acc3 = acc3 + w * v3
+                        for s in cutlass.range(n_main, n_all, 1, unroll=_SERIAL_TAIL_UNROLL):
                             s64 = cutlass.Int64(s)
                             lse_s = _ld_global_f32(lse_base + s64 * lse_step)
                             v = ld_global_v4(o_row_base + s64 * o_step, cutlass.Float32)
@@ -392,19 +521,25 @@ def _combine_kernel(
             # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
             # Every lane redundantly walks the (very short) split axis; the values
             # are warp-uniform and hit L1, which is cheaper than staging them.
+            neg_inf = cutlass.Float32(NEG_INF)
+            zero = cutlass.Float32(0.0)
+            n_main, n_all = _serial_legs(n_splits)
             m = cutlass.Float32(NEG_INF)
-            for s in cutlass.range(0, n_splits, 1, unroll=4):
+            for s in cutlass.range(0, n_main, 1, unroll=_SERIAL_UNROLL):
+                lse_row = lp[batch + s * n_batch, head, :]
+                m = cute.math.max(m, cutlass.Float32(lse_row[q_row]))
+            for s in cutlass.range(n_main, n_all, 1, unroll=_SERIAL_TAIL_UNROLL):
                 lse_row = lp[batch + s * n_batch, head, :]
                 m = cute.math.max(m, cutlass.Float32(lse_row[q_row]))
 
             # All splits dead (every row fully masked): emit O := 0 / lse := -inf
             # rather than exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
-            all_dead = m == cutlass.Float32(NEG_INF)
-            m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
             # With a sink the reference max is max(m, sink), which is finite even on a
             # keyless row, and the denominator starts with the sink column's weight
             # exp(sink - M): that row then yields O = 0 and LSE = sink + log(1) = sink,
             # the unsplit kernels' keyless-row contract.
+            all_dead = m == cutlass.Float32(NEG_INF)
+            m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
             den = cutlass.Float32(0.0)
             if cutlass.const_expr(sinks is not None):
                 sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
@@ -417,9 +552,13 @@ def _combine_kernel(
             # arithmetic: 0 * x is NaN for a non-finite x and a fastmath exp(-inf)
             # is only approximately zero.  (Observed: d512 with 5 KV tiles over 8
             # splits produced NaN without the guard.)
-            neg_inf = cutlass.Float32(NEG_INF)
-            zero = cutlass.Float32(0.0)
-            for s in cutlass.range(0, n_splits, 1, unroll=4):
+            for s in cutlass.range(0, n_main, 1, unroll=_SERIAL_UNROLL):
+                lse_row = lp[batch + s * n_batch, head, :]
+                lse_s = cutlass.Float32(lse_row[q_row])
+                live = lse_s > neg_inf
+                e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                den = den + cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+            for s in cutlass.range(n_main, n_all, 1, unroll=_SERIAL_TAIL_UNROLL):
                 lse_row = lp[batch + s * n_batch, head, :]
                 lse_s = cutlass.Float32(lse_row[q_row])
                 live = lse_s > neg_inf
@@ -432,8 +571,10 @@ def _combine_kernel(
             # --- pass 2: O = sum_s w_s O_s / den, accumulated in fp32 ---
             # The partial slab is compact [S*B, S_q, H, d_v]; lane l owns four
             # contiguous columns of every split (one 16-byte load for fp32 partials
-            # when all four are inside the row); the split loop is branch-free and
-            # unrolled so the loads of several splits are in flight together.
+            # when all four are inside the row); the split walk is branch-free and
+            # unrolled _SERIAL_UNROLL deep (two legs, see _serial_legs) so that many
+            # splits' loads are in flight together: four at a time cost one L2
+            # round trip per four splits (0.27 us a split on B300 d128, 11 us at 32).
             o_base = o_partial.iterator.toint()
             # The 16-byte loads need d_v % 4 == 0 (row starts stay 16-byte aligned)
             # and a 16-byte aligned slab base: the pointer entries only promise the
@@ -444,10 +585,14 @@ def _combine_kernel(
             q_scale = cutlass.Float32(1.0)
             if cutlass.const_expr(scale_o is not None):
                 q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
-            # Gate in the combine: the 0.5 handed to the packed multiply must be opaque (a constant
-            # float into inline_ptx ICEs libNVVM).  Hoisted once per row, like the fused kernels do
-            # per tile; traced only on the gated entry, so the plain entries' code is unchanged.
+            # Gate in the combine: sigmoid's two constants fold into the scale
+            # (``h = acc * (inv_den / 2)``: exact, a power-of-two scaling of the
+            # plain output) and into the ``h * t + h`` fma; the 0.5 handed to the
+            # packed multiply must be opaque (a constant float into inline_ptx ICEs
+            # libNVVM).  Hoisted once per row, like the fused kernels do per tile;
+            # traced only on the gated entry, so the plain entries' code is unchanged.
             if cutlass.const_expr(gate is not None):
+                inv_den_half = inv_den * cutlass.Float32(0.5)
                 gate_half = opaque_f32_zero() + cutlass.Float32(0.5)
             for cbase in cutlass.range(0, d_v, 128, unroll=1):
                 d0 = cbase + lane * cutlass.Int32(4)
@@ -456,56 +601,50 @@ def _combine_kernel(
                     acc1 = cutlass.Float32(0.0)
                     acc2 = cutlass.Float32(0.0)
                     acc3 = cutlass.Float32(0.0)
-                    for s in cutlass.range(0, n_splits, 1, unroll=4):
-                        lse_row = lp[batch + s * n_batch, head, :]
-                        lse_s = cutlass.Float32(lse_row[q_row])
-                        live = lse_s > neg_inf
-                        e = cute.math.exp(lse_s - m_safe, fastmath=True)
-                        w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
-                        e0 = zero
-                        e1 = zero
-                        e2 = zero
-                        e3 = zero
-                        # Element loads through the view, each bounded by the row, serve
-                        # the half partials (flavors whose split epilogue keeps the staged
-                        # TMA-store O path, e.g. d512) and any d_v / base that cannot take
-                        # aligned 16-byte loads (legal through the runtime-shape pointer
-                        # entries); aligned fp32 partials take one 16-byte load per split.
-                        if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
-                            if vec_ok:
-                                idx = cute.crd2idx((batch + s * n_batch, q_row, head, d0), o_partial.layout)
-                                v = ld_global_v4(o_base + cutlass.Int64(idx) * 4, cutlass.Float32)
-                                e0 = cutlass.Float32(v[0])
-                                e1 = cutlass.Float32(v[1])
-                                e2 = cutlass.Float32(v[2])
-                                e3 = cutlass.Float32(v[3])
-                            else:
-                                o_row = op[batch + s * n_batch, q_row, head, :]
-                                e0 = cutlass.Float32(o_row[d0])
-                                if d0 + cutlass.Int32(1) < d_v:
-                                    e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
-                                if d0 + cutlass.Int32(2) < d_v:
-                                    e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
-                                if d0 + cutlass.Int32(3) < d_v:
-                                    e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
-                        else:
-                            o_row = op[batch + s * n_batch, q_row, head, :]
-                            e0 = cutlass.Float32(o_row[d0])
-                            if d0 + cutlass.Int32(1) < d_v:
-                                e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
-                            if d0 + cutlass.Int32(2) < d_v:
-                                e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
-                            if d0 + cutlass.Int32(3) < d_v:
-                                e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
-                        # a dead slot may hold anything, including non-finite values
-                        v0 = cutlass.Float32(arith.select(live.ir_value(), e0.ir_value(), zero.ir_value()))
-                        v1 = cutlass.Float32(arith.select(live.ir_value(), e1.ir_value(), zero.ir_value()))
-                        v2 = cutlass.Float32(arith.select(live.ir_value(), e2.ir_value(), zero.ir_value()))
-                        v3 = cutlass.Float32(arith.select(live.ir_value(), e3.ir_value(), zero.ir_value()))
-                        acc0 = acc0 + w * v0
-                        acc1 = acc1 + w * v1
-                        acc2 = acc2 + w * v2
-                        acc3 = acc3 + w * v3
+                    acc0, acc1, acc2, acc3 = _accumulate_splits(
+                        cutlass.Int32(0),
+                        n_main,
+                        _SERIAL_UNROLL,
+                        o_partial,
+                        lse_partial,
+                        o_base,
+                        vec_ok,
+                        batch,
+                        n_batch,
+                        head,
+                        q_row,
+                        d0,
+                        d_v,
+                        m_safe,
+                        neg_inf,
+                        zero,
+                        acc0,
+                        acc1,
+                        acc2,
+                        acc3,
+                    )
+                    acc0, acc1, acc2, acc3 = _accumulate_splits(
+                        n_main,
+                        n_all,
+                        _SERIAL_TAIL_UNROLL,
+                        o_partial,
+                        lse_partial,
+                        o_base,
+                        vec_ok,
+                        batch,
+                        n_batch,
+                        head,
+                        q_row,
+                        d0,
+                        d_v,
+                        m_safe,
+                        neg_inf,
+                        zero,
+                        acc0,
+                        acc1,
+                        acc2,
+                        acc3,
+                    )
                     outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
                     if cutlass.const_expr(gate is not None):
                         # The gated prefill kernels' epilogue arithmetic, verbatim
@@ -514,9 +653,6 @@ def _combine_kernel(
                         # fp32 merged value; then the dead-row SELECT per element,
                         # AFTER the fma -- a dead row is exactly 0 whatever G holds
                         # (a NaN gate times the zero h would be NaN; a select is not).
-                        # sigmoid's 0.5 folds into the scale (``h = acc * (inv_den / 2)``:
-                        # exact, a power-of-two scaling of the plain output).
-                        inv_den_half = inv_den * cutlass.Float32(0.5)
                         gv = cutlass.make_array_view(gate)
                         g0 = cutlass.Float32(gv[batch, q_row, head, d0])
                         g1 = zero
