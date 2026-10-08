@@ -1552,7 +1552,7 @@ def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bo
 
 
 def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
-    """Measured fixed-graph (split count, packing); one keeps the existing plan.
+    """Measured bounded-graph (split count, packing); one keeps the existing plan.
 
     Include batch in the grid estimate so multi-request chunks do not receive
     the split budget of an underfilled single request. Rubin qualification
@@ -1567,7 +1567,6 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         paged_thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
-        and not facts.shape_overrides
         and facts.dtype == cudnn.data_type.BFLOAT16
         and 1 <= facts.b <= (64 if caps.sm_lo == 107 else 4)
         and 4 <= facts.h_q <= 64
