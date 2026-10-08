@@ -1984,17 +1984,25 @@ def _compute_warp_group(
             # Write LSE — under cga2 each sg1 peer writes its half of O+LSE
             # rows (leader = [0:128], peer = [128:256]).  Per-thread row.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
-            # Gated exactly like the LSE write below.
-            if q_row_global < seqlen_q:
+            # ONE row bound for BOTH the LSE write and the amax atomic below.  They must stay tied: amax is an
+            # atomicMax, which only GROWS, so a single row past the sequence's own length folded in permanently
+            # inflates the graph's Amax_O for the whole tensor and no per-row check ever shows it.  Under THD the
+            # bound is the per-sequence Q length S_q_b, not the dense seqlen_q: with that bound the single-query
+            # THD draws of the cc 10.7 FP8 sweep reported Amax_O 2 % to 7x above the O they stored (the tile's
+            # other 127 rows, stale Q, are stored as zero but were still reduced).  Mirrors prefill_d512_mxfp8.
+            q_row_limit = seqlen_q
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                q_row_limit = _s_q_b
+            if q_row_global < q_row_limit:
                 nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
             if cutlass.const_expr(CFG.THD_VARLEN):
                 # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
                 # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
-                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
-                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
-                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < _s_q_b:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         # Written in the CALLER's layout, picked by the STATIC rank compile()
                         # baked in: token-major rank-2 [T, QH] (the DEFAULT) or head-major
@@ -2010,7 +2018,7 @@ def _compute_warp_group(
                                 lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < seqlen_q:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_arr[batch_idx, head_idx, q_row_global] = lse
 
