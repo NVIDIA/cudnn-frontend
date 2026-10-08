@@ -190,7 +190,7 @@ class CompiledGdn:
     plans."""
 
     def __init__(self, node, kernel_module):
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_window, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.gdn_chain_forward_f16 import build_chain_forward, run_chain_forward
         from .kernel.gdn_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
         from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
@@ -249,6 +249,7 @@ class CompiledGdn:
             cadence_tokens=self.checkpoint,
             batch_invariant=self.batch_invariant,
             expand_num=self.expand_num,
+            window=chain_window(reverse=False, split_k=True) if self.expand_num == 1 and not self.overwrite_initial_state else None,
         )
         self.chain = self.pieces > 0
         self.dv_split = (
@@ -509,7 +510,7 @@ class CompiledGdnBwd:
     expanded pack."""
 
     def __init__(self, node, bwd_module, recompute_module):
-        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, chain_window, choose_pieces, piece_table_layout
         from .kernel.gdn_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.gdn_warmup_backward_f16 import build_warmup_backward, run_warmup_backward
         from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
@@ -582,6 +583,7 @@ class CompiledGdnBwd:
             batch_invariant=self.batch_invariant,
             expand_num=self.expand_num,
             reverse=True,
+            window=chain_window(reverse=True, split_k=True) if self.expand_num == 1 and not self.overwrite_initial_state else None,
         )
         self.chain = self.pieces > 0
         self.split = not self.chain and not self.batch_invariant and not self.overwrite_initial_state

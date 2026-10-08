@@ -91,7 +91,18 @@ def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, 
     return min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)))
 
 
-def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False):
+def chain_window(*, reverse, split_k):
+    """``[lo, hi)`` mean tokens per sequence where the chain beat the plan's other schedule on B200 -- split-K (GDN) or
+    uncut (KDA); ``hi`` None is unbounded.  The chain's own passes (summary, state chain, prologue) cost ~50-90 us however
+    short the pieces, which a short sequence does not repay, and split-K beat the chain on every long one."""
+    if split_k:
+        return (0, 4096) if reverse else (0, 0)
+    return (512, None) if reverse else (2048, None)
+
+
+def choose_pieces(
+    *, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False, window=None
+):
     """``(pieces, unit_chunks)`` of one plan, a pure function of shapes shared by forward and backward; ``pieces`` is the
     slot budget per sequence, ``num_seqs * pieces`` the wave the piece table hands out, 0 when the plan does not chain.
     Boundaries are multiples of ``unit_chunks = lcm(expand_num, cadence_chunks)`` chunks.  Without ``batch_invariant`` the
@@ -102,7 +113,8 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
     ``batch_invariant`` the length rule applies: ``clamp(ceil(total / LENGTH_RULE_PIECE_TOKENS), 1, CHAIN_MAX_PIECES)``
     slots, each sequence filling ``ceil(len_b / LENGTH_RULE_PIECE_TOKENS)`` of them on device, so outputs are bitwise the
     same alone and in any batch; a provably one-piece batch runs uncut unless ``compose_tail`` (the summaries chain even
-    then)."""
+    then).  A ``window`` from :func:`chain_window` further limits the non-invariant chain to that range of mean tokens
+    per sequence."""
     b_t = int(b_t)
     expand_num = max(1, int(expand_num))
     cadence_chunks = max(1, int(cadence_tokens) // b_t)
@@ -112,6 +124,11 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
         if pieces == 1 and not compose_tail:
             return 0, unit_chunks
         return pieces, unit_chunks
+    if window is not None:
+        lo, hi = window
+        mean_tokens = int(total_tokens) / max(1, int(num_seqs))
+        if mean_tokens < lo or (hi is not None and mean_tokens >= hi):
+            return 0, unit_chunks
     pieces = piece_budget(
         num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
     )

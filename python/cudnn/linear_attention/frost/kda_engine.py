@@ -128,7 +128,7 @@ class CompiledKda:
         from cuda.bindings.driver import CUstream
 
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
+        from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, chain_window, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.kda_uncut_forward_f16 import build_uncut_forward, run_uncut_forward
         from .common.split_k import WORK_ITEM_FIELDS
@@ -179,6 +179,7 @@ class CompiledKda:
             cadence_tokens=self.checkpoint if self.has_state_checkpoints else 0,
             batch_invariant=self.batch_invariant,
             expand_num=1,
+            window=chain_window(reverse=False, split_k=False),
         )
         self.chain = self.pieces > 0
         self.dv_split = (
@@ -465,7 +466,7 @@ class CompiledKdaBwd:
         from .common.gate_bwd import GATE_BWD_BLOCKS, channel_gate_bwd
         from .common.head_reduce import head_group_reduce
         from .common.host import tensormap_workspace_bytes
-        from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
+        from .common.piece_chain import chain_rows_per_cta, chain_window, choose_pieces, piece_table_layout
         from .kernel.kda_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.kda_uncut_backward_f16 import build_uncut_backward, run_uncut_backward
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks
@@ -526,6 +527,7 @@ class CompiledKdaBwd:
             batch_invariant=self.batch_invariant,
             reverse=True,
             expand_num=1,
+            window=chain_window(reverse=True, split_k=False),
         )
         self.chain = self.pieces > 0
         self.length_rule = self.chain and self.batch_invariant
