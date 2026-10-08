@@ -1800,6 +1800,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             "PackGQA on MXFP8 is wired in the d128 flavor only (the per-CTA SF_Q gather of sm100/prefill_d128_mxfp8.py)",
         )
         if self.pack_gqa:
+            # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row
+            # Q tile over a dense OR paged cache (HEADS_PER_TILE = QH_PER_KH), so a decode-shaped
+            # half d256 graph packs on cc 10.7 whatever its cache form; every other Rubin half
+            # packing rides the paged / packed-split D128 pipelines.  engines.mismatch mirrors this
+            # exemption (d256_decode_tile_selected); keep the two in lockstep.
             # Dense d128 half packs on the shared SM100 prefill body (the loader's packed arm, issue #1472); the pre-folded
             # scale declines on that body below (routing), every other nonpaged half graph stays on the Rubin sibling.
             self._not_implemented_error_if(
@@ -1807,8 +1812,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and not self._fp8
                 and not self.paged
                 and not self.packed_thd_split
-                and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd),
-                "Rubin half PackGQA requires paged KV, the D128 packed split, or a dense D128 GQA graph without the pre-folded scale (the shared SM100 body)",
+                and not (self.flavor == _SM100_DECODE_FLAVOR and not self.thd)
+                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
+                "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (S_q x G <= 16 packed rows)",
             )
             self._not_implemented_error_if(
                 self.thd
@@ -2069,16 +2075,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 not self.paged and not self.packed_thd_split and (self.seq_kv_lens_present or self.seq_q_lens_present),
                 "split_kv > 1 serves unpadded dense graphs only",
             )
-            # Keep the standalone contract aligned with the Rubin engine row.
+            # Keep the standalone contract aligned with the Rubin engine row.  The d256 DECODE tile
+            # (sm107/decode_d256_f16.py) writes the SM100 tile's fp32 split partials into the split-major
+            # workspace that sm100/split_combine reduces, packed or not, over a dense or paged cache -- so a
+            # decode-shaped half d256 graph keeps its split on cc 10.7 (engines.mismatch lifts the same two
+            # rules through d256_decode_tile_selected); the d256 PREFILL kernel's split stays the paged THD
+            # packed split.
+            _rubin_decode_tile = self._device_cc == (10, 7) and self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)) > 0
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
                 and self.pack_gqa
+                and not _rubin_decode_tile
                 and not (self.packed_thd_split or (self._fp8 and self._pertensor and self.flavor == (128, 128)) or self._rubin_shared_dense_leg()),
-                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128, half D128 paged THD, or a dense D128 half graph on the shared SM100 bodies",
+                "split_kv > 1 with PackGQA on cc10.7 requires per-tensor FP8 D128, half D128 paged THD, a dense D128 half graph on the shared SM100 bodies, or the d256 decode tile",
             )
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not (self.packed_thd_split or ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))),
-                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D128 or D192/V128, or half D256 THD",
+                self._device_cc == (10, 7)
+                and not _rubin_decode_tile
+                and not (self.packed_thd_split or ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))),
+                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D128 or D192/V128, half D256 THD, or the d256 decode tile",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
