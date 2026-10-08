@@ -7311,3 +7311,33 @@ def test_packed_sink_combine_counts_virtual_key_once(dtype_name, stats):
                     assert torch.all(lstorage.cpu()[~lused] == -31)
         finally:
             captured.reset()
+
+
+def test_d256_pack_gqa_divisibility_rule_is_exempted_on_the_rubin_decode_tile_only(monkeypatch):
+    """The prefill tiles' PackGQA divisibility rule (``h_q / h_kv`` must divide -- or, under partial
+    PackGQA, share a factor with -- the kernel ``tile_m``) is exempted for a graph the d256 DECODE
+    tile packs whole, and that exemption is the cc 10.7 route's only: ``engines.mismatch`` gates its
+    twin on the Rubin row (``_decode_packs_whole_group``), so the adapter does the same.  An odd group
+    (15/5 = 3 heads per KV head at ``S_q = 1``: 3 packed rows, inside both lines' 16-row tile) is the
+    typed ``ValueError`` it always was on the SM100 line and the served decode-tile form on cc 10.7."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def api():
+        return SdpaFwdDslSm100(
+            _desc((1, 15, 1, 256), torch.bfloat16, "q"),
+            _desc((1, 5, 256, 256), torch.bfloat16, "k"),
+            _desc((1, 5, 256, 256), torch.bfloat16, "v"),
+            _desc((1, 15, 1, 256), torch.bfloat16, "o"),
+            None,
+            pack_gqa=True,
+        )
+
+    _fake_cc(monkeypatch, (10, 0))
+    with pytest.raises(ValueError, match="the kernel tile_m"):
+        api().check_support()
+    _fake_cc(monkeypatch, (10, 7))
+    a = api()
+    assert a.check_support()
+    assert a._decode_q_tile() == 16 and a._decode_q_tile_for(1, 15, 5) == 16

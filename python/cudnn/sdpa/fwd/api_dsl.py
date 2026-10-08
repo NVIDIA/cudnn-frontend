@@ -1853,9 +1853,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # The d256 DECODE tile packs the WHOLE group whenever it fits its Q tile
             # (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the 16-row tile, four
             # tail rows zero-filled; two tokens x 12 heads in the 32-row tile on cc 10.7), so
-            # the prefill tiles' tile_m divisibility rule does not apply to a graph that
-            # lowers onto it (_decode_q_tile_for is non-zero exactly when the line routes
-            # the S_q x G rows onto the tile).
+            # the prefill tiles' tile_m divisibility rule does not apply to a cc 10.7 graph
+            # that lowers onto it (_decode_q_tile_for is non-zero exactly when the line routes
+            # the S_q x G rows onto the tile; engines.mismatch's _decode_packs_whole_group is
+            # the twin -- keep the two in lockstep).  The SM100 line keeps the rule as is: its
+            # partial PackGQA already admits the groups its decode tile takes, and a group the
+            # rule declines there (an odd ratio) stays the typed ValueError it was.
             # On cc 10.7 the (256, 256) packing IS the decode tile (the d256 prefill kernel runs unpacked), so a
             # packed d256 request past its route is the typed decline engines.mismatch gives (not the prefill
             # tiles' divisibility rule, which would name tile_m for a 24/2 group the tile serves at S_q <= 4).
@@ -1864,7 +1867,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 "Rubin half PackGQA at D256 is wired on the decode tile only (a decode-shaped graph: S_q x G packed rows within its routed envelope; the d256 prefill kernel runs unpacked)",
             )
             self._value_error_if(
-                not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial) and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
+                not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial)
+                and not (self._device_cc == (10, 7) and self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))),
                 f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} the kernel tile_m; got h_q/h_kv = {int(h_qo)}/{int(h_kv)}",
             )
         # Block-scaled O (sf_o): per-tensor FP8, d128 flavor, dense/unsplit/unpacked.
