@@ -1011,8 +1011,16 @@ def test_rubin_mxfp8_forward_row_exists():
     INVERTED 2026-09-09: d192xd128 gained a
     Rubin MXFP8 sibling, at cga2 ONLY -- at cga1 that flavor's scale-factor
     tiles start past the 256 KiB version-0 tcgen05 descriptor window.  SM100's
-    row stays capped at cc 10.6."""
+    row stays capped at cc 10.6.
+    INVERTED 2026-10-08: the row serves THD at d256 ONLY -- that body rides the
+    FROST THD contract at cga1 with the packed per-sequence-tile-padded
+    scale-factor layout, so ``thd_d_shapes`` is the config's
+    ``SM107_MXFP8_THD_SHAPES`` (one constant with the standalone wrapper's
+    Rubin THD gate and the config backstop); the d128 / d192xd128 / d512 MXFP8
+    bodies keep the pre-upstream THD arm and stay declined through it.
+    Split-KV and PackGQA stay declined row-wide."""
     from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert caps.is_mxfp8 is True
@@ -1029,8 +1037,16 @@ def test_rubin_mxfp8_forward_row_exists():
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").cgas_by_d_shape != caps.cgas_by_d_shape
     # Exact-native only: the SF tensors are not zero-padded.
     assert caps.d_pad_multiple == 0
-    # The machinery the ported kernels lack stays declined.
-    assert caps.thd is False and caps.split_kv_supported is False
+    # THD at d256 only, on the named SET (never a bare True), with both length forms and
+    # the per-batch padded Stats layout like every other Rubin THD row.  The mismatch()
+    # walk over the row's d_shapes (admit exactly these, decline the rest typed) is
+    # test_sdpa_fp8_sm107.py::test_sm107_mxfp8_thd_shapes_match_the_row.
+    assert caps.thd is True
+    assert caps.thd_d_shapes is SM107_MXFP8_THD_SHAPES
+    assert caps.thd_d_shapes == frozenset({(256, 256)}) and caps.thd_d_shapes < caps.d_shapes
+    assert caps.thd_padded_stats is True and caps.cu_seq_len is True
+    # The machinery the ported kernels lack stays declined: split-KV and PackGQA.
+    assert caps.split_kv_supported is False
     assert caps.pack_gqas == frozenset({False})
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").sm_hi == 106
 
