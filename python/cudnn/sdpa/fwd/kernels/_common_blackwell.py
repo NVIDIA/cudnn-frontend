@@ -349,7 +349,7 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
     )
 
 
-def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1) -> Bars:
+def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1, o_parts: int = 1) -> Bars:
     """The classic pipeline's barrier set.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
@@ -397,7 +397,8 @@ def make_classic_bars(CFG, s_stages: Optional[int] = None, *, epilogue_gate: boo
         mb_stat_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
         mb_stat_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_stats_read=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
-        mb_o_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        # ``o_parts`` > 1: the O slab of each sub-tile is published (and TMA-stored) per column block.
+        mb_o_full=MBarrier(_alloc(CFG.TILES_Q * o_parts), stages=CFG.TILES_Q * o_parts, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_o_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
