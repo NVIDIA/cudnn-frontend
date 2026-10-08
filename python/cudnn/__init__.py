@@ -24,6 +24,7 @@ symbols_to_import = [
     "norm_forward_phase",
     "reduction_mode",
     "behavior_note",
+    "cuda_graph_retention",
     "knob_type",
     "FRONTEND_KNOB_TYPE_BASE",
     "is_frontend_knob_type",

@@ -93,6 +93,9 @@ class Graph : public ICudnn, public INode {
     std::shared_ptr<host_copy_sources_t const> host_copy_sources = std::make_shared<host_copy_sources_t const>();
     mutable cudnn_frontend::detail::CudaGraphRetainedResource host_copy_sources_retention;
 
+    // set_cuda_graph_retention(), if called; see get_cuda_graph_retention().
+    std::optional<CudaGraphRetention_t> cuda_graph_retention;
+
     // Rebuild host_copy_sources from cached_workspace_modifications.
     void
     refresh_host_copy_sources_() {
@@ -367,8 +370,9 @@ class Graph : public ICudnn, public INode {
         char *workspace = static_cast<char *>(fe_workspace);
 
         // If `stream` is being captured, the recorded host-to-device copies read their host sources on every
-        // replay; give the CUDA graph being recorded a reference to them first.
-        if (!host_copy_sources->empty()) {
+        // replay; give the CUDA graph being recorded a reference to them first (unless the application keeps
+        // this graph alive itself: CudaGraphRetention_t::NONE).
+        if (!host_copy_sources->empty() && get_cuda_graph_retention() == CudaGraphRetention_t::PER_GRAPH) {
             _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_capturing_stream(
                 stream, [this]() { return host_copy_sources_payload_(); }));
         }
@@ -680,7 +684,7 @@ class Graph : public ICudnn, public INode {
         //// WORKSPACE HANDLING ////
         ////////////////////////////
         // The memcpy nodes below read their host sources on every launch of the CUDA graph.
-        if (!host_copy_sources->empty()) {
+        if (!host_copy_sources->empty() && get_cuda_graph_retention() == CudaGraphRetention_t::PER_GRAPH) {
             _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_graph(
                 cudnn_cuda_graph, [this]() { return host_copy_sources_payload_(); }));
         }
@@ -841,7 +845,7 @@ class Graph : public ICudnn, public INode {
         //// WORKSPACE HANDLING ////
         /////////////////////////////////
         // The memcpy nodes below read their host sources on every launch of the CUDA graph.
-        if (!host_copy_sources->empty()) {
+        if (!host_copy_sources->empty() && get_cuda_graph_retention() == CudaGraphRetention_t::PER_GRAPH) {
             _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_graph(
                 cudnn_cuda_graph, [this]() { return host_copy_sources_payload_(); }));
         }
@@ -1880,6 +1884,7 @@ class Graph : public ICudnn, public INode {
             "enforce_precompiled requested, but serialized graph has no precompiled execution plan");
 
         auto serialized_plan = j["cudnn_backend_data"];
+        plans.set_cuda_graph_retention(cuda_graph_retention);
         if (device_prop != nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(device_prop, serialized_plan));
         } else {
@@ -1975,6 +1980,24 @@ class Graph : public ICudnn, public INode {
     set_sm_version(int32_t version);
     Graph &
     set_kernel_cache(std::shared_ptr<KernelCache> cache);
+
+    //! How CUDA graphs recorded from this graph keep its execution plans' resources alive (see
+    //! CudaGraphRetention_t). Takes effect for execution plans built afterwards, so call it before
+    //! create_execution_plans()/build_plans() or deserialize(). With cuDNN 9.28+, the setting also applies to
+    //! the backend's retention (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION); with cuDNN 9.27, whose backend
+    //! always retains, CudaGraphRetention_t::NONE only removes the frontend's own references.
+    Graph &
+    set_cuda_graph_retention(CudaGraphRetention_t retention) {
+        cuda_graph_retention = retention;
+        return *this;
+    }
+
+    //! The mode in effect: the one set with set_cuda_graph_retention(), else the CUDNN_CUDA_GRAPH_RETENTION
+    //! environment variable ("per_graph" or "none"), else CudaGraphRetention_t::PER_GRAPH.
+    CudaGraphRetention_t
+    get_cuda_graph_retention() const {
+        return detail::effective_cuda_graph_retention(cuda_graph_retention);
+    }
     Graph &
     set_device_properties(std::shared_ptr<const DeviceProperties> device_prop);
 
@@ -2980,6 +3003,7 @@ Graph::create_execution_plans(std::vector<HeurMode_t> const &mode) {
         plans.set_tag(operation_graph->getTag());
         plans.enqueue_engine_configs(op_graph_to_configs);
         plans.set_kernel_cache(kernel_cache);
+        plans.set_cuda_graph_retention(cuda_graph_retention);
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Querying engine config properties.");
         CHECK_CUDNN_FRONTEND_ERROR(plans.query_properties());

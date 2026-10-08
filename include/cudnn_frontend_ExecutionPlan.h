@@ -172,7 +172,7 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     //! engine's behavior notes are known.
     bool
     needs_cuda_graph_retention() const {
-        return runtime_compiled;
+        return runtime_compiled && retain_for_cuda_graphs;
     }
 
    private:
@@ -352,7 +352,8 @@ class ExecutionPlan_v8 : public BackendDescriptor {
     std::vector<cudnnBackendNumericalNote_t> numeric_notes_vec;
     std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> behavior_notes;
     std::vector<cudnnBackendBehaviorNote_t> behavior_notes_vec;
-    bool runtime_compiled = true;  // see needs_cuda_graph_retention()
+    bool runtime_compiled       = true;  // see needs_cuda_graph_retention()
+    bool retain_for_cuda_graphs = true;  // false under CudaGraphRetention_t::NONE
 
     float execution_time_ms                   = 0.0f;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
@@ -400,6 +401,14 @@ class ExecutionPlanBuilder_v8 {
     auto
     setKernelCache(std::shared_ptr<KernelCache> kernel_cache) -> ExecutionPlanBuilder_v8 & {
         m_execution_plan.kernel_cache = kernel_cache;
+        return *this;
+    }
+
+    //! How CUDA graphs recorded from the plan keep its resources alive (see CudaGraphRetention_t). Unset: the
+    //! CUDNN_CUDA_GRAPH_RETENTION environment variable decides, for the frontend and the backend alike.
+    auto
+    setCudaGraphRetention(std::optional<CudaGraphRetention_t> retention) -> ExecutionPlanBuilder_v8 & {
+        cuda_graph_retention = retention;
         return *this;
     }
 
@@ -475,6 +484,7 @@ class ExecutionPlanBuilder_v8 {
         }
 #endif
         // Finalizing the descriptor
+        apply_cuda_graph_retention_();
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
@@ -603,6 +613,7 @@ class ExecutionPlanBuilder_v8 {
             }
         }
 
+        apply_cuda_graph_retention_();
         status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
         if (status != CUDNN_STATUS_SUCCESS) {
             set_error_and_throw_exception(
@@ -679,6 +690,38 @@ class ExecutionPlanBuilder_v8 {
     operator=(ExecutionPlanBuilder_v8 const &) = delete;
 
    private:
+    std::optional<CudaGraphRetention_t> cuda_graph_retention;
+
+    // Applies the retention mode to the plan: the frontend's own retention, and, when set explicitly and both the
+    // headers and the backend support it (9.28+), the backend's (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION).
+    // Unset, the backend reads CUDNN_CUDA_GRAPH_RETENTION itself. The backend half is best effort: a backend that
+    // rejects the attribute keeps its own default, and the plan is still built.
+    void
+    apply_cuda_graph_retention_() {
+        CudaGraphRetention_t const retention    = detail::effective_cuda_graph_retention(cuda_graph_retention);
+        m_execution_plan.retain_for_cuda_graphs = retention != CudaGraphRetention_t::NONE;
+        if (cuda_graph_retention.has_value() && detail::get_backend_version() >= 92800) {
+            // CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION (CUDNN_TYPE_CUDA_GRAPH_RETENTION) and
+            // CUDNN_CUDA_GRAPH_RETENTION_{PER_GRAPH,NONE}, new in cuDNN 9.28, spelled numerically so that the
+            // frontend builds against any cuDNN 9 headers; a backend without the attribute rejects it below.
+            constexpr int kCudaGraphRetentionAttribute = 408;
+            constexpr int kCudaGraphRetentionType      = 33;
+            int32_t backend_retention                  = retention == CudaGraphRetention_t::NONE ? 1 : 0;
+            auto const status =
+                detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                      static_cast<cudnnBackendAttributeName_t>(kCudaGraphRetentionAttribute),
+                                      static_cast<cudnnBackendAttributeType_t>(kCudaGraphRetentionType),
+                                      1,
+                                      &backend_retention);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                CUDNN_FE_LOG_LABEL_ENDL(
+                    "INFO: The cuDNN backend does not support "
+                    "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION (status "
+                    << status << "); it keeps its default CUDA graph retention.");
+            }
+        }
+    }
+
     ExecutionPlan_v8 m_execution_plan;
     std::shared_ptr<const DeviceProperties> device_properties = nullptr;
 };

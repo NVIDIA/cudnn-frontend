@@ -70,7 +70,8 @@ class PyGraph {
             std::shared_ptr<KernelCache> kernel_cache,
             std::shared_ptr<cudnn_frontend::DeviceProperties> device_properties,
             bool is_dynamic_shape_enabled,
-            bool is_override_shape_enabled)
+            bool is_override_shape_enabled,
+            std::optional<cudnn_frontend::CudaGraphRetention_t> cuda_graph_retention = std::nullopt)
         : graph(std::make_shared<cudnn_frontend::graph::Graph>()) {
         graph->set_compute_data_type(compute_data_type)
             .set_intermediate_data_type(intermediate_data_type)
@@ -92,6 +93,10 @@ class PyGraph {
 
         if (sm_count.is(py::none()) == false) {
             graph->set_sm_count(sm_count.cast<int32_t>());
+        }
+
+        if (cuda_graph_retention.has_value()) {
+            graph->set_cuda_graph_retention(*cuda_graph_retention);
         }
 
         if (sm_version.is(py::none()) == false) {
