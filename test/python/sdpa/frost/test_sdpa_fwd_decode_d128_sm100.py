@@ -29,7 +29,8 @@ Three tiers:
 - Graph API: decode / MTP shapes select the decode tile (partially packed GQA
   groups included), a prefill shape keeps
   the prefill tile, a pinned cga=2 on a decode shape is honored, a chunked-prefill
-  THD graph declines cga=1 while FlashInfer's ragged paged graph at one token per
+  THD graph uses the two-slab cga=1 prefill body on SM100 (declines on SM103),
+  while FlashInfer's ragged paged graph at one token per
   sequence rides the ragged-Q leg (int32 / int64 offsets, an empty sequence, no
   Stats), dense (non-paged) padded decode, a dense MTP graph whose keyless rows
   carry a sink, a small-batch split, and CUDA-graph replay under
@@ -870,8 +871,7 @@ def test_graph_small_batch_decode_splits_kv():
 
 @pytest.mark.L0
 def test_graph_thd_queries_never_get_the_decode_tile():
-    """Ragged (THD) queries over a paged cache: no cga=1 plan is offered for the
-    engine (the decode tile has no THD leg), and a pinned cga=1 declines."""
+    """An explicit single-CTA multi-query THD plan is prefill, never the decode tile."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -923,15 +923,18 @@ def test_graph_thd_queries_never_get_the_decode_tile():
     g = _build()
     g.create_execution_plans([cudnn.heur_mode.A])
     assert offers_engine(g, ENGINE)
-    cgas = {g.plans[i].knobs.cga for i in range(len(g.plans)) if g.get_plan_name_at_index(i).startswith(ENGINE)}
-    assert cgas == {2}, f"THD must stay on the prefill tile; offered cga domain {cgas}"
-    # Pinned cga=1 on the THD graph is a typed decline, not a silent substitution.
+    # SM100 admits the two-slab single-CTA prefill body; SM103 keeps its existing domain.
     g2 = _build()
     g2.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
     g2.select_plan(0)
-    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+    if torch.cuda.get_device_capability() == (10, 0):
         g2.check_support()
         g2.build_plans()
+        assert g2._compiled_plans[0]._compiled.kernel_template == "prefill_d128_f16"
+    else:
+        with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+            g2.check_support()
+            g2.build_plans()
 
 
 # --- the ragged-Q leg: ragged Q/O/Stats over paged K/V at S_q(max) == 1 (nvbug 6607857) ---

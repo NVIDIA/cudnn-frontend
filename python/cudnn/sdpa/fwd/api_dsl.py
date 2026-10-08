@@ -1631,6 +1631,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             thd=self.thd,
             paged=self.paged,
             split_kv=self.split_kv,
+            max_q=int(s_qo),
         )
         # An unsplit Rubin paged request uses the prefill template even at
         # one query token; the split decode leg belongs to the SM100 family.

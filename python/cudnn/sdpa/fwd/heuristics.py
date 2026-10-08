@@ -1012,13 +1012,14 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
         # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
         return sched_policy, 1
-    if supports_paged_prefill_cga1(
+    if facts.device_cc == (10, 7) and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,
         fp8=facts.is_fp8 or facts.is_mxfp8,
         thd=facts.thd,
         paged=facts.has_paged_kv,
         split_kv=split_kv,
+        max_q=facts.s_q,
     ):
         # A packed query fits the two-slab single-CTA tile at 256 rows.
         # Prefer it only when the two-CTA tile would need another grid wave.
@@ -1133,6 +1134,7 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
             thd=facts.thd,
             paged=facts.has_paged_kv,
             split_kv=split_kv,
+            max_q=facts.s_q,
         ):
             return 256
         return cga_tile_m(128, cga)

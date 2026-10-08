@@ -1374,8 +1374,8 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
 def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window, ql, splits, monkeypatch, packed):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
-    if cga == 1 and splits == 1 and arch != "sm107":
-        pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
+    if cga == 1 and splits == 1 and arch != "sm107" and not (torch.cuda.get_device_capability() == (10, 0) and ql > 1):
+        pytest.skip("The unsplit D128 cga1 paged prefill leg requires SM100 Q>1 or SM107")
     if d == 64 and arch == "sm107":
         pytest.skip("Native D64 paged split is qualified on SM100/SM103")
     if d == 256 and splits > 1 and arch != "sm107":
@@ -1917,8 +1917,8 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     rubin = cc == (10, 7)
     if cc not in ((10, 0), (10, 3), (10, 7)) or (rubin and d == 64):
         pytest.skip("Paged LPT requires a qualified SM100/SM103/SM107 flavor")
-    if cga == 1 and not rubin:
-        pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
+    if cga == 1 and cc not in ((10, 0), (10, 7)):
+        pytest.skip("The unsplit D128 cga1 paged prefill leg requires SM100 Q>1 or SM107")
     arch = "sm107" if rubin else "sm100"
     b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -2032,6 +2032,8 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_split_gqa", "NH", False, 2),
         ("d128_split_gqa", "HN", True, 3),
         ("d128_prefill_b1_default_cga_gqa", "HN", True, 1),
+        ("d128_prefill_b1_gqa16_gqa", "HN", True, 1),
+        ("d128_prefill_gqa", "padded", False, 1),
         ("d128_split_b1", "HN", False, 4),
         ("d128_split_b1_gqa", "NH", True, 3),
         ("d128_gqa8_split_gqa", "HN", True, 3),
@@ -2068,6 +2070,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Live-length scheduler is admitted on SM100, SM103 and SM107")
+    if geometry.startswith("d128_prefill") and "_default_cga" not in geometry and torch.cuda.get_device_capability() == (10, 3):
+        pytest.skip("The single-CTA unsplit paged prefill extension is not qualified on SM103")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     if geometry.startswith("d64"):
