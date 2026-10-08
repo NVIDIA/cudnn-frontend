@@ -1653,9 +1653,10 @@ def test_mxfp4_weight_fused_launch_count_is_three_and_four_with_an_nvfp4_o(o_fp4
 _GEOM_MHA_20 = dict(d_model=512, h_q=20, h_kv=20, d_head=256, rope_dim=64)  # MHA (h_q == h_kv): N = 80 x 256
 _GEOM_GQA_6_2 = dict(d_model=512, h_q=6, h_kv=2, d_head=256, rope_dim=64)  # a non-power-of-two h_q: N = 16 x 256
 # The acceptance-sweep shape for the fully fused fp4-weight block, (geometry, batch, seq_len, causal, qk_norm, seq_lens, shadow twin):
-# one KV tile (S=128), several, a ring wrap (S=4096), a tail tile (S=1000 -- B=1 only: the fused path declines S % 128 != 0 at B > 1),
-# a fully-tail CTA (M % 256 == 128), B in {1, 2, 3}, dense + causal, norm + RoPE-only, GQA 8/2 (the test geometry) / 32/2 / 6/2 and
-# MHA 20/20, one DEAD entry (length 0) beside a ragged live one at B >= 2; ``shadow`` also runs the e4m3 fork on shadow codes and
+# one KV tile (S=128), several, a ring wrap (S=4096), a tail tile (S=1000 -- B=1 only: the fused path declines S % 128 != 0 at B > 1;
+# under a DENSE mask the SDPA row serves an S_kv % 128 != 0 tail only with a padding mask, so those cells carry ``seq_lens``: the full
+# length and a ragged one), a fully-tail CTA (M % 256 == 128), B in {1, 2, 3}, dense + causal, norm + RoPE-only, GQA 8/2 (the test
+# geometry) / 32/2 / 6/2 and MHA 20/20, one DEAD entry (length 0) beside a ragged live one at B >= 2; ``shadow`` also runs the e4m3 fork on shadow codes and
 # pins the block output bitwise.  Asserts: sentinel clean, finite, the oracle cos floor per LIVE entry, the format floor, a bitwise
 # second execute, the dead entry exactly zero; every number is in the log.
 _W4_FUSED_SWEEP = [
@@ -1663,7 +1664,7 @@ _W4_FUSED_SWEEP = [
     (_GEOM, 1, 256, False, False, None, False),
     (_GEOM, 2, 128, False, True, None, False),
     (_GEOM, 3, 128, True, True, (128, 64, 0), False),
-    (_GEOM, 1, 1000, False, True, None, False),
+    (_GEOM, 1, 1000, False, True, (1000,), False),
     (_GEOM, 2, 1024, True, False, None, False),
     (_GEOM, 3, 1024, False, True, None, False),
     (_GEOM, 1, 4096, True, True, None, False),
@@ -1676,7 +1677,7 @@ _W4_FUSED_SWEEP = [
     (_GEOM_MHA_20, 2, 128, False, False, None, False),
     (_GEOM_MHA_20, 3, 256, True, True, (256, 100, 0), False),
     (_GEOM_GQA_6_2, 3, 128, True, True, None, True),
-    (_GEOM_GQA_6_2, 1, 1000, False, True, None, False),
+    (_GEOM_GQA_6_2, 1, 1000, False, True, (900,), False),
     (_GEOM_GQA_6_2, 2, 256, False, False, (256, 0), False),
 ]
 
@@ -1686,7 +1687,7 @@ def _sweep_id(cell) -> str:
     kind = "mha" if g["h_q"] == g["h_kv"] else "gqa"
     return (
         f"{kind}{g['h_q']}_{g['h_kv']}_d{g['d_model']}_b{b}_s{s}_{'causal' if causal else 'dense'}_{'norm' if qk_norm else 'rope'}"
-        f"{'_dead' if lens else ''}{'_shadow' if shadow else ''}"
+        f"{('_dead' if 0 in lens else '_padmask') if lens else ''}{'_shadow' if shadow else ''}"
     )
 
 
