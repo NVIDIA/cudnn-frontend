@@ -204,7 +204,14 @@ per_stage = 2 * (M_tile * 40 + 32 * 72)  # padded internal MMA operands
 stages    = 2
 ```
 
-The padded choices require 14,336 / 19,456 / 29,696 bytes. A smaller budget
+For M divisible by 256, N and K divisible by 64, K >= 64, a grid of at least
+one CTA per device SM and a budget of at least 50,176 bytes, the backend can
+instead use M=256. It groups two unchanged K=32 callbacks into a K=64 mainloop
+step, sharing engine barriers across the two tiles. This still allocates only
+dense GEMM operands, with no decoder scratch or packed staging. The callback
+ABI and all-thread participation remain unchanged.
+
+The original padded choices require 14,336 / 19,456 / 29,696 bytes. A smaller budget
 selects a smaller M tile, with an unpadded M=32 fallback at 12,288 bytes.
 The callback still sees a 32x64 output at stride 64 and all 256 CTA threads;
 FORT performs the internal layout conversion afterward. Existing ABI 1
@@ -235,10 +242,13 @@ The ggml sample maps adjacent warp lanes along physical K and accumulates eight
 adjacent output columns for a vector store. This avoids scattered per-byte
 loads across columns and the bank conflicts from scalar K-fastest output stores.
 It keeps the original byte layout and unaligned-input support. The backend
-mainloop now reuses each decoded tile across up to 128 M rows, uses padded
-`ldmatrix` loads and two stages. On an RTX PRO 6000, M=512/N=12288/K=4096 Q4_K
-improved from approximately 15.4 ms to 0.61 ms in a same-harness comparison;
-this is relative to the initial prototype, not a same-GPU llama.cpp comparison.
+mainloop now reuses each decoded tile across up to 256 M rows, uses padded
+`ldmatrix` loads and groups two K slices when the shape and budget permit.
+On an RTX PRO 6000, M=512/N=12288/K=4096 Q4_K initially improved from approximately 15.4 ms to 0.61 ms. The grouped-K upgrade
+now measures about 0.45 ms through the public backend. A matched same-GPU test
+measured llama.cpp MMQ at 0.18 ms, including activation quantization; the two
+paths use different arithmetic contracts and cuDNN still has performance
+headroom. Smaller shapes and constrained budgets retain the earlier kernel.
 See the backend `docs/fort-native-weight-decode.md` for the reproducible
 `nativeWeightDecodePrototype --benchmark` command and remaining limitations.
 
