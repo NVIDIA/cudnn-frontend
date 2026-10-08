@@ -245,6 +245,26 @@ class TemplateParams:
     # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
     # role-split A/B arm).
     mma_2x2: bool = False
+    # Additive attention bias (the graph's ``bias`` operand, ``[1|B, 1|H_q, S_q, S_kv]`` in the io dtype) on the Rubin
+    # f16/bf16 d128-file tiles: 0 = none (every existing record renders byte-identically), 1 = the RESIDENT row-block --
+    # the TMA-LDG warp loads the CTA's ``TILES_Q * TILE_M`` bias rows for its whole KV range into SMEM once per work
+    # item and the softmax warps read their row slice with swizzled lane loads, adding it pre-scale as one FFMA per
+    # score (``s + bias * inv_scale``) before the band mask and the software row max.  A compile-time axis (the SMEM
+    # block, two mbarriers and the masked-path softmax arm fold on it) and therefore part of the module-cache key.
+    # Served by ``sm107/prefill_d128_f16.py`` at the widths whose SMEM holds at least one 128-column block
+    # (``config_sm107.sm107_bias_resident_s_kv_max``); the SM100 line and every other flavor decline it.
+    bias_mode: int = 0
+    # Per-key boolean mask (the python-only ``kv_mask`` input of ``sdpa``, ``[1|B, 1, 1, S_kv]`` BOOLEAN): 0 = none,
+    # 1 = the bit-word form -- each softmax warp assembles one 32-bit keep word per 32 kv columns of the tile by a
+    # warp ballot over byte loads and folds it into the bit-word mask (``tile_dsl.mask.apply_mask_chunk``); a key whose
+    # byte is 0 is masked like a padded one, a row whose every key is masked reads O = 0 / Stats = -inf.  Same kernel
+    # and same serving set as ``bias_mode``; composes with ``seq_kv_lens_present`` and with the bias.
+    kv_mask_form: int = 0
+    # KV tile width of the d128-file softmax (the S-accumulator columns per sub-tile, the K/V ring tile, the P packing
+    # and the softmax chunk count all derive from it).  128 is the value every rendering has run at; 64 traces the
+    # one-chunk arm the kernels already carry and 256 is refused by the TMEM predicate at two sub-tiles -- both are
+    # validated before they are served (the config factory pins ``N_BMM2_CHUNKS x BMM2_CHUNK_SIZE == TILE_N``).
+    tile_n: int = 128
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

@@ -38,6 +38,7 @@ from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_er
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import SM100_SCORE_STATS_SHAPES, SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_thd_split
 from cudnn.sdpa.fwd.config_sm107 import (
+    SM107_BIAS_D_SHAPES,
     SM107_EPILOGUE_GATE_SHAPES,
     SM107_F16_SMALL_D_SHAPES,
     SM107_F16_THD_SHAPES,
@@ -434,6 +435,27 @@ class Capabilities:
     # sm107_f16_tile_width(leg=, cga=), rule 8b').  APPENDED after
     # score_stats_d_shapes (append-only contract above).
     dense_only_d_shapes: frozenset[tuple[int, int]] = frozenset()
+    # Additive bias on the RESIDENT-row-block arm (the Rubin f16/bf16 d128-file
+    # tiles, config_sm107.SM107_BIAS_D_SHAPES) -- beside the row-level ``bias``
+    # flag above: the native shapes whose kernel carries the block (None = every
+    # shape of a ``bias`` row serves it, the SM80 row's semantics), and whether
+    # the bias must be the Q/K/V dtype (the SM80 row also takes fp32; the block
+    # arm loads the io dtype's 16-bit pairs).  The block holds the work item's
+    # ``TILES_Q x TILE_M`` rows x its whole KV range, so the serving set is ALSO
+    # an S_kv budget per (flavor, cga) -- ``mismatch`` asks
+    # ``config_sm107.sm107_bias_resident_s_kv_max`` (one arithmetic with the
+    # adapter and the config factory, rule 8b') and declines above it typed.
+    # Dense, unsplit, unpaged, non-PackGQA, ungated, without the score side
+    # outputs; the bias is ``[1|B, 1|H_q, S_q, S_kv]`` with a contiguous key dim
+    # and 16-byte strides (S_kv % 8 == 0 for a compact bias: the TMA rule).
+    bias_d_shapes: Optional[frozenset] = None
+    bias_io_dtype_only: bool = False
+    # The per-key boolean mask ``kv_mask`` (python-only input: ``[1|B, 1, 1, S_kv]``,
+    # a key with a False entry is masked for every query; a query whose every key
+    # is masked reads O = 0 / Stats = -inf), with the dtype set it is served in.
+    # Served by the same arm as the bias (the same shapes and S_kv-free legs).
+    kv_mask: bool = False
+    kv_mask_dtypes: frozenset = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -615,7 +637,9 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
         return "prepared SM120 does not serve paged KV"
-    if _synth_kv_padding(capabilities, facts) or facts.has_bias:
+    if _synth_kv_padding(capabilities, facts) or (facts.has_bias and capabilities.bias_d_shapes is None):
+        # The resident-block rows bind the bias through the prepared binder (bind_dense validates its runtime geometry);
+        # the SM80 row's bias travels through its own adapter and stays off the prepared path.
         return "prepared overrides cannot use synthesized KV lengths or bias"
     if facts.thd:
         if facts.has_epilogue_gate:
@@ -743,6 +767,58 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         # tile for a decode-shaped graph instead of a candidate mismatch() would decline.
         return frozenset({2})
     return domain
+
+
+def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> Optional[str]:
+    """The resident-bias / kv_mask arm's gates (a row with ``bias_d_shapes`` or ``kv_mask``): the legs it does not carry,
+    the flavor the graph selects, the operands' layouts and the S_kv budget of the resident block -- at the plan's cga
+    when the knobs carry one, else at ANY width of the flavor's domain (the heuristics' row-level probe: the row serves
+    the graph when some width holds the block; ``heuristics._auto_sched_cga`` then picks the narrowest such width through
+    ``config_sm107.sm107_bias_auto_cga`` and every proposed plan is re-asked here with its own cga) -- every one a typed
+    decline, the twin of the adapter's ``check_support`` (rule 8b)."""
+    from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max
+
+    what = "bias" if facts.has_bias else "kv_mask"
+    if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp or facts.has_epilogue_gate:
+        return f"the additive {what} is served on dense, unpaged plans without the score side outputs or the epilogue gate (no THD)"
+    if knobs is not None and ((knobs.split_kv or 1) > 1 or knobs.pack_gqa):
+        return f"the additive {what} is served on unsplit, non-PackGQA plans only"
+    selected = _selected_d_shape(capabilities, facts, knobs)
+    shapes = capabilities.bias_d_shapes if capabilities.bias_d_shapes is not None else capabilities.d_shapes
+    if selected not in shapes:
+        wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(shapes))
+        return (
+            f"the additive {what} is wired on the {wired} kernel flavors only (the resident row-block); head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
+        )
+    if facts.has_bias:
+        dims, st = facts.bias_dim, facts.bias_stride
+        elem = 2
+        if len(st) == 4 and st[3] != 1:
+            return f"the bias must have its key dim contiguous (stride 1); got strides {st}"
+        if len(st) == 4 and any(n > 1 and (s * elem) % 16 for n, s in zip(dims[:3], st[:3])):
+            return f"every live bias stride must be a 16-byte multiple for TMA (S_kv % 8 == 0 for a compact bias); got dims {dims} strides {st}"
+    if facts.has_kv_mask:
+        if facts.kv_mask_dtype not in capabilities.kv_mask_dtypes:
+            return f"kv_mask dtype {facts.kv_mask_dtype} not in {sorted(str(d) for d in capabilities.kv_mask_dtypes)}"
+        if len(facts.kv_mask_stride) == 4 and facts.kv_mask_stride[3] != 1:
+            return f"kv_mask must have its key dim contiguous (stride 1); got strides {facts.kv_mask_stride}"
+    if capabilities.sm_lo != 107:
+        return None
+    if knobs is not None and knobs.cga is not None:
+        widths = (knobs.cga,)  # the plan's width: the block it gets
+    else:
+        # Knob-less (the heuristics' row-level probe, a record without the knob): the row serves the graph when ANY width
+        # of the flavor's domain holds the block; the plan-level call above re-asks with the proposed cga.
+        domain = effective_cgas(capabilities, facts, knobs.split_kv if knobs is not None else None)
+        widths = tuple(sorted(domain)) or (1,)
+    budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga) for cga in widths}
+    if all(s_kv_max == 0 or facts.s_kv > s_kv_max for s_kv_max in budgets.values()):
+        held = " / ".join(f"cga {cga}: S_kv <= {s_kv_max}" for cga, s_kv_max in budgets.items())
+        return (
+            f"the resident {what} block at head-dim tile {selected[0]} holds {held} (the SMEM left beside the Q/O slabs and the K/V ring); "
+            f"got S_kv={facts.s_kv} -- the streamed form is not built"
+        )
+    return None
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[str]:
@@ -973,6 +1049,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         (facts.has_alibi, capabilities.alibi, "ALiBi"),
         (facts.has_block_mask, capabilities.block_mask, "block_mask"),
         (facts.has_rng_dump, capabilities.rng_dump, "rng_dump"),
+        (facts.has_kv_mask, capabilities.kv_mask, "kv_mask"),
         (facts.has_score_max, capabilities.score_max, "score_max output"),
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp output"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
@@ -1113,6 +1190,12 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         bias_dt = facts.bias_t.get_data_type()
         if bias_dt not in (cudnn.data_type.FLOAT, facts.dtype):
             return f"bias dtype {bias_dt} must be fp32 or match the Q/K/V dtype ({facts.dtype})"
+        if capabilities.bias_io_dtype_only and bias_dt != facts.dtype:
+            return f"bias dtype {bias_dt} must match the Q/K/V dtype ({facts.dtype}) on this engine (the resident block loads the io dtype; cast an fp32 bias first)"
+    if (facts.has_bias and capabilities.bias and capabilities.bias_d_shapes is not None) or (facts.has_kv_mask and capabilities.kv_mask):
+        reason = _bias_arm_decline(capabilities, facts, knobs)
+        if reason is not None:
+            return reason
 
     if facts.right_band_widening and facts.right_bound is not None and facts.right_bound < 0:
         return f"negative diagonal_band_right_bound ({facts.right_bound}) is not supported"
@@ -1465,6 +1548,18 @@ def _sm107_spec() -> EngineSpec:
             # domain) is routed past them to the d128 flavor -- see the field's doc and the row
             # docstring.  ONE constant with the adapter's pool (config_sm107, rule 8b').
             dense_only_d_shapes=SM107_F16_SMALL_D_SHAPES,
+            # Additive bias + per-key boolean mask on the small tiles as a RESIDENT SMEM row-block
+            # (the d128 file at BIAS_MODE = 1 / KV_MASK_FORM = 1): bias [1|B, 1|H_q, S_q, S_kv] in the
+            # io dtype, kv_mask [1|B, 1, 1, S_kv] BOOLEAN; dense / unsplit / unpaged / no score
+            # outputs; S_kv up to what the carveout holds beside the operands (3 tiles = 384 at the
+            # 32-wide tile, 1 / 2 tiles = 128 / 256 at the 64-wide one at cga 1 / 2 --
+            # config_sm107.sm107_bias_resident_s_kv_max; the shapes = SM107_BIAS_D_SHAPES, the
+            # d128 tile has no spare).  The adapter's check_support is the twin (rule 8b').
+            bias=True,
+            bias_d_shapes=SM107_BIAS_D_SHAPES,
+            bias_io_dtype_only=True,
+            kv_mask=True,
+            kv_mask_dtypes=frozenset({cudnn.data_type.BOOLEAN}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )
@@ -2216,6 +2311,11 @@ def lower_dsl_prefill(
             if "bias_present" in _ctor_params
             else {}
         ),
+        # The resident-block arm (the DSL adapters): the bias and the per-key mask are plan-time SAMPLES like
+        # sample_lse (their presence is a compile-time arm of the kernel); forwarded only to a constructor that
+        # declares them -- every other row's mismatch declined the operands already.
+        **({"sample_bias": ga.tensor_desc_from_ir(facts.bias_t, name="bias")} if ("sample_bias" in _ctor_params and facts.has_bias) else {}),
+        **({"sample_kv_mask": ga.tensor_desc_from_ir(facts.kv_mask_t, name="kv_mask")} if ("sample_kv_mask" in _ctor_params and facts.has_kv_mask) else {}),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     if facts.shape_overrides:
@@ -2248,7 +2348,7 @@ def lower_dsl_prefill(
     # the backend serves them).
     # (A gated graph on an adapter whose execute() lacks ``gate=`` was declined
     # by _epilogue_gate_ctor_kwargs BEFORE the constructor and the JIT above.)
-    _extra_exec_keys = {"bias_tensor", "gate"} & _exec_params
+    _extra_exec_keys = {"bias_tensor", "gate", "kv_mask_tensor"} & _exec_params
 
     binding = ga.SdpaBinding(
         q=facts.q_t,
@@ -2264,6 +2364,8 @@ def lower_dsl_prefill(
         paged_k_table=facts.paged_k_table_t,
         paged_v_table=facts.paged_v_table_t,
         bias=facts.bias_t,
+        # The per-key boolean mask: a bound operand of a row whose adapter folds it (the Rubin small tiles).
+        kv_mask=facts.kv_mask_t if "kv_mask_tensor" in _extra_exec_keys else None,
         sf_q=facts.sf_q_t,
         sf_k=facts.sf_k_t,
         sf_v=facts.sf_v_t,
@@ -2334,6 +2436,11 @@ def lower_dsl_prefill(
     forward_seq_q = seq_q_lens_present or facts.thd
     bias_src = facts.bias_t if facts.has_bias else None
     forward_bias = bias_src is not None and "bias_tensor" in _extra_exec_keys
+    # The DSL adapters bind the bias through its IR dims / strides (a [1|B, 1|H, S_q, S_kv] view over the caller's storage,
+    # like the gate); the SM80 adapter takes the buffer as handed.
+    lay_bias = _layout(binding.bias) if (forward_bias and "sample_bias" in _ctor_params) else None
+    kv_mask_src = facts.kv_mask_t if (facts.has_kv_mask and "kv_mask_tensor" in _extra_exec_keys) else None
+    lay_kv_mask = _layout(binding.kv_mask) if kv_mask_src is not None else None
     gate_src = facts.epilogue_gate_t if (getattr(facts, "has_epilogue_gate", False) and "gate" in _extra_exec_keys) else None
     lay_gate = _layout(binding.gate) if gate_src is not None else None
     # Score side outputs: the IR tensors are rank-4 (B, H_q, S_q, 1) like Stats; the adapter views the
@@ -2448,7 +2555,11 @@ def lower_dsl_prefill(
         if facts.o_block_scale and execute_kwargs.get("sf_o") is None:
             raise ValueError("cudnn.sdpa: the graph requests the sf_o output but no buffer was provided for it")
         if forward_bias:
-            execute_kwargs["bias_tensor"] = bias_buf  # SM80 feature operand (mismatch admitted it for this row)
+            # The bias operand (mismatch admitted it for this row): the SM80 adapter takes the buffer as handed, the
+            # DSL adapters the IR-shaped view (dims / strides declared on the graph tensor).
+            execute_kwargs["bias_tensor"] = _ir_view(bias_buf, *lay_bias) if lay_bias is not None else bias_buf
+        if kv_mask_src is not None:
+            execute_kwargs["kv_mask_tensor"] = _ir_view(_need(resolved, kv_mask_src, "kv_mask"), *lay_kv_mask)
         if gate_src is not None:
             # Epilogue gate G, reinterpreted through its IR dim/stride like Q/K/V/O.
             execute_kwargs["gate"] = _ir_view(_need(resolved, gate_src, "epilogue gate"), *lay_gate)

@@ -141,7 +141,10 @@ def test_sm107_every_smem_tile_takes_the_module_desc_version(flavor, kind, load_
 # drifting in silently.  Flipping a kernel's constant is the whole experiment; the SASS twin of this check is
 # test_sm107_ring_wait_form_sass_pins.
 _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle wait sites)
-    ("f16", (128, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
+    # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait; +2 ring (bmm1_done / stat_empty of the bias / kv_mask arm's own
+    # kv body, _softmax_kv_body_inf) and +2 ITEM-level idle waits (mb_bias_full in the softmax group, mb_bias_empty in the TMA-LDG
+    # warp -- waited once per work item, the sleeping form by rule) since the resident bias block landed (2026-10-08).
+    ("f16", (128, 128)): (True, 34, 13),
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
@@ -168,7 +171,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
 # POLL_CROSS_PAIR_WAITS is a correctness constant pinned True by the module itself, never the SPIN_RING_WAITS perf lever:
 # (poll-site count, targets).
 _D512_2X2_CROSS_PAIR_WAITS = (10, {"mb_k_empty", "mb_v_empty", "mb_k_full", "mb_v_full", "mb_o_empty"})
-_IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go")
+_IDLE_WAIT_TARGETS = ("mb_tmem_dealloc", "mb_o_full", "mb_tma_o_full", "mb_tmastg_go", "mb_bias_full", "mb_bias_empty")
 
 
 def _wait_sites(code):
@@ -1326,9 +1329,12 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         "sample_scale_o",
         "ragged_divisors",
         "ragged_offsets_int64",
-        # ... then the score side outputs (score_max / score_sum_exp), the newest tail.
+        # ... then the score side outputs (score_max / score_sum_exp) ...
         "sample_score_max",
         "sample_score_sum_exp",
+        # ... then the resident-block operands of the Rubin small tiles (the additive bias, the per-key mask), the newest tail.
+        "sample_bias",
+        "sample_kv_mask",
     ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
@@ -1337,9 +1343,18 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
     assert sig["sample_gate"].default is None and sig["has_amax_o"].default is True
     exec_params = list(inspect.signature(SdpaFwdDslSm100.execute).parameters)
     # Append-only: the ragged-offset operands of the ragged-Q decode leg follow sf_o, then the score side outputs.
-    assert exec_params[-8:] == ["block_table_v", "gate", "sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor"], exec_params[
-        -9:
-    ]
+    assert exec_params[-10:] == [
+        "block_table_v",
+        "gate",
+        "sf_o",
+        "ragged_q",
+        "ragged_o",
+        "ragged_lse",
+        "score_max_tensor",
+        "score_sum_exp_tensor",
+        "bias_tensor",
+        "kv_mask_tensor",
+    ], exec_params[-11:]
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["gate"].default is None
     assert inspect.signature(SdpaFwdDslSm100.execute).parameters["sf_o"].default is None
     assert all(inspect.signature(SdpaFwdDslSm100.execute).parameters[n].default is None for n in ("ragged_q", "ragged_o", "ragged_lse"))

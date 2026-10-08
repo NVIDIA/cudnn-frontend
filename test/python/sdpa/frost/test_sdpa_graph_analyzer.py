@@ -952,9 +952,18 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [
-        n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "score_stats_d_shapes", "dense_only_d_shapes")
-    ]
+    appended = (
+        "pack_gqa_partial_d_shapes",
+        "paged_d_shapes",
+        "thd_pack_gqa_d_shapes",
+        "score_stats_d_shapes",
+        "dense_only_d_shapes",
+        "bias_d_shapes",
+        "bias_io_dtype_only",
+        "kv_mask",
+        "kv_mask_dtypes",
+    )
+    legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
@@ -962,20 +971,16 @@ def test_capabilities_positional_prefix_is_append_only():
     assert caps.thd_pack_gqa_d_shapes == frozenset()
     assert caps.score_stats_d_shapes is None
     assert caps.dense_only_d_shapes == frozenset()
+    assert caps.bias_d_shapes is None and caps.bias_io_dtype_only is False and caps.kv_mask is False and caps.kv_mask_dtypes == frozenset()
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
     legacy_tail = ["pack_gqa_d_shapes", "thd_padded_stats", "epilogue_gate", "epilogue_gate_d_shapes", "epilogue_gate_dtypes"]
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
-    # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == [
-        "pack_gqa_partial_d_shapes",
-        "paged_d_shapes",
-        "thd_pack_gqa_d_shapes",
-        "score_stats_d_shapes",
-        "dense_only_d_shapes",
-    ], names[start:]
+    # ... and every later field is appended after it, in the order it landed (the resident-bias / kv_mask fields of
+    # the Rubin small tiles, 2026-10-08, last).
+    assert names[start + len(legacy_tail) :] == list(appended), names[start:]
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])

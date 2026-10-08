@@ -68,6 +68,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_group_size,
     pack_gqa_supported,
 )
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
@@ -835,6 +836,15 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # The packed THD split ABI uses the single-Q tile. The existing dense
         # D192 split remains a two-CTA lowering.
         return sched_policy, 1
+    if caps.sm_lo == 107 and selected_shape is not None and ((facts.has_bias and caps.bias_d_shapes is not None) or (facts.has_kv_mask and caps.kv_mask)):
+        # The resident bias / kv_mask block of the Rubin 32- / 64-wide tiles: the NARROWEST width whose block holds S_kv
+        # (config_sm107.sm107_bias_auto_cga -- the arithmetic engines._bias_arm_decline and the adapter read, rule 8b'):
+        # a d64 graph at S_kv 256 lands on cga2 (two tiles), S_kv <= 128 keeps the tuned cga1 below.  No width holding it
+        # falls through: mismatch() declines every plan of such a graph whatever the pick.
+        bias_shapes = caps.bias_d_shapes if caps.bias_d_shapes is not None else caps.d_shapes
+        bias_cga = sm107_bias_auto_cga(selected_shape[0], facts.s_kv, domain) if selected_shape in bias_shapes else None
+        if bias_cga is not None:
+            return sched_policy, bias_cga
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # d64 runs cga1 on BOTH legs -- it is the prefill width (the narrow
         # slabs need no collective MMA, and a 512-row cga2 cluster wastes most

@@ -999,7 +999,8 @@ red (2026-09-08).
 | Paged KV (half THD, no sink) | ❌ᵗ (the pre-tile decline) | fp8 envelope · f16/bf16 ❌ᵗ (the pre-tile decline) | ✅ | ❌ | ✅, unsplit | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
 | Optional stats (LSE store compiled out) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — |  —  |
-| Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Bias (additive, `[1\|B, 1\|H_q, S_q, S_kv]` in the Q/K/V dtype; the RESIDENT row-block, dense / unsplit / unpaged, no score outputs)ᵗᵇ | ✅ᵗᵇ S_kv ≤ 384 | ✅ᵗᵇ S_kv ≤ 128 (cga1) / ≤ 256 (cga2) | ❌ (no SMEM for a block) | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Per-key boolean mask (`kv_mask`, a python-only `sdpa` input: `[1\|B, 1, 1, S_kv]` BOOLEAN, False = the key is masked for every query)ᵗᵇ | ✅ᵗᵇ S_kv ≤ 384 | ✅ᵗᵇ S_kv ≤ 128 (cga1) / ≤ 256 (cga2) | ❌ | ❌ | ❌ | ❌ | — |  —  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ ᵗ | ✅ⁱˣ ᵗ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
 | FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | — | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |  —  |
 
@@ -1292,6 +1293,47 @@ record) lands on the 64-wide tile (bitwise the zero-padded D = 64 cga2 run), and
 THD / paged KV / PackGQA at D ≤ 64 keep their PRE-TILE typed declines (exact-shape
 `thd_d_shapes`; Rubin half PackGQA needs paged KV or a D128 packed split) -- "the
 pre-tile decline" in the cells above.  The quantized rows keep the d128 file.
+ᵗᵇ **Additive bias + per-key boolean mask on the 32- / 64-wide tiles -- the
+RESIDENT row-block** (`sm107/prefill_d128_f16.py` at `TemplateParams.bias_mode = 1` /
+`kv_mask_form = 1`; `Capabilities.bias_d_shapes` / `bias_io_dtype_only` /
+`kv_mask` / `kv_mask_dtypes`, the budget `config_sm107.sm107_bias_resident_s_kv_max`,
+one arithmetic for the row, the adapter and the config factory).  A work item (a
+CTA's 256 query rows of one (batch, head)) loads its bias rows x its whole KV range
+into SMEM ONCE (the TMA-LDG warp, after the item's Q / K / V prologue loads, one
+`expect_tx` for the FULL boxes of every tile; `mb_bias_full` / `mb_bias_empty`, two
+item-level barriers), the softmax warps read their row slice with 128-B-swizzled
+lane loads (chunk 0 before the `bmm1_done` wait) and add it to the raw scores
+pre-scale as one packed FFMA per pair (`s + bias / scale`), then apply the band
+mask AND the per-key mask word (`kv_mask`: 4 byte loads + 4 warp ballots per
+128-column tile, no SMEM staging) in one bit-word pass with the true -inf; a
+row whose every key is masked ends with `total_sum == 0` and reads O = 0 /
+Stats = -inf (the empty-row contract, `sdpa-invariants` s1 / s4).  The block's
+budget is what the 320 KiB carveout leaves beside the Q / O slabs and the K / V
+ring, in whole 128-column tiles: 3 at the 32-wide tile (S_kv ≤ 384), 1 / 2 at the
+64-wide one at cga 1 / 2 (128 / 256), none at d128 (its operands sum to 256 KiB).
+A graph no width holds is a TYPED decline on the row and in the adapter (the
+streamed ring is the follow-up); a knob-less graph some width holds is SERVED --
+the heuristics propose the NARROWEST width whose block holds S_kv
+(`config_sm107.sm107_bias_auto_cga`: a d64 graph at S_kv 256 lands on cga2 without
+a knob, S_kv ≤ 128 keeps the tuned cga1), and a requested width is honoured or
+declined, never degraded.  Also declined typed: an fp32 bias (the block
+loads the io dtype's 16-bit pairs: cast first), a bias whose key dim is not
+contiguous or whose live strides are not 16-byte multiples (TMA; S_kv % 8 == 0
+for a compact bias), a non-BOOLEAN kv_mask, THD / paged KV / split-KV / PackGQA /
+the epilogue gate / the score side outputs with either operand.  Composes with
+every dense mask (causal / right band / SWA / padded + padded-Q trim; bottom-right
+causal with the `kv_mask` -- bottom-right causal + `bias` is refused by the ONE
+graph contract's validation, backend and FROST alike), the sink, GQA and optional
+Stats.  Validated on cc 10.7 against an fp64 oracle of `softmax(scale * q.k + bias
++ maskbias)`: n_kv = 1 / 2 / 3 with B*H > 1, one CTA, tail tiles (304 / 376),
+every broadcast form of the bias, bias ~ N(0, 1) x {1, 10} and the models' finite
+-1e9 key fold, a zero-key batch with a sink (Stats = sink_logit), the padded-Q
+trim, the 64-wide tile at cga1 and cga2, a fully masked kv_mask row BITWISE the
+zero-length sequence, bf16 and fp16 -- and the IDENTITY check: bias = 0 and
+kv_mask = all True are BITWISE the plain kernel on O and Stats (the biased
+rendering runs the -inf masked software-max body on every tile).  The no-bias
+renderings are byte-identical to the pre-bias cubin records
+(`test/python/sdpa/frost/renderings/md5_fwd_d128_file_bias_off_sm_107a.txt`).
 ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
 ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` (requested as the
 `sdpa()` op attribute — numerics-changing, so it is a graph fact gated by the
@@ -1842,7 +1884,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. Unsplit THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); exact D128 split THD can use the single-CTA path; d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
-| Bias forward | SM90, SM100, SM107, SM120 |
+| Bias forward | SM90, SM100, SM120; on SM107 every flavor except the f16/bf16 32- / 64-wide tiles, which serve it as a resident row-block up to S_kv 384 / 128 (cga1) / 256 (cga2) together with the per-key `kv_mask` (ᵗᵇ) -- the d128 / d192 / d256 / d512 flavors and S_kv above the block decline (the streamed ring is the follow-up) |
 | Score side outputs (`score_max` / `score_sum_exp`) outside the f16/bf16 d128 prefill flavor — the d192×d128 / d256 / d512 files, the decode tiles (`cga = 1`), THD, paged KV, `split_kv > 1`, the native SM100 d64 flavor, every quantized row | every arch (the d128 f16/bf16 FPROP on SM100 / SM103 / SM107 serves them, ˢᶜ; SM107 d ≤ 64 through its d128 flavor, ᵗ); SM80 / SM90 / SM120 entirely |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | SM107 serves half THD D128/D256 without sink; otherwise every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the f16/bf16 and FP8 d512 flavors, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |

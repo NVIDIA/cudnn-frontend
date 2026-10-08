@@ -408,6 +408,20 @@ graph.sdpa(
 
 - **Stats in base 2** (`stats_use_log2`): Returns `stats` as $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$ rather than the natural-log default. The value is exactly the natural-log stats times $\log_2 e$, so it is a convention switch, not a different quantity; the backward pass is unaffected and continues to take natural-log stats.
 
+#### Per-key boolean mask (`kv_mask`, python engines only)
+
+`kv_mask` is an optional BOOLEAN input tensor of shape $(1 \mid B, 1, 1, S_{kv})$ (one byte per key, contiguous along
+$S_{kv}$; a batch extent of 1 broadcasts one row over the batch): a key whose entry is `False` is excluded from every
+query's softmax, exactly like a key at or past `seq_len_kv`, and composes with the padding mask, every diagonal band
+(bottom-right causal included) and the additive `bias` (the graph contract does not admit bottom-right causal together with
+`bias`). The cuDNN backend has no field for it, so a graph that binds `kv_mask` is served by the python
+engines that fold it (today the SM107 f16/bf16 32- and 64-wide tiles, which also take the additive `bias` as a resident
+SMEM block up to the sequence lengths listed in the support matrix -- the heuristics pick the narrowest cluster width whose
+block holds the sequence); binding it on any other configuration makes the graph
+unsupported rather than silently unmasked. A query whose every key is masked follows this frontend's empty-row convention
+(`O = 0`, `stats = −inf`), not the uniform average an eager finite `−1e9` bias produces — see the conventions paragraph
+below. Masked-key semantics that must match eager finite-bias math exactly are expressed as an additive `bias` instead.
+
 #### Score side outputs (`score_max`, `score_sum_exp`)
 
 The two optional ports expose the operands the softmax statistics are built from, per query row and in natural units:

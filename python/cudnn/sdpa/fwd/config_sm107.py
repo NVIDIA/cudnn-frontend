@@ -278,6 +278,63 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Additive bias (resident row-block) + per-key boolean mask on the d128-file tiles
+# ---------------------------------------------------------------------------
+#
+# ``TemplateParams.bias_mode`` / ``kv_mask_form`` (config_sm100): the sm107 f16/bf16 d128 FILE carries the graph's additive
+# bias as a RESIDENT SMEM row-block -- the TMA-LDG warp fills ``BIAS_BLOCK_ROWS = TILES_Q * TILE_M`` bias rows x the work
+# item's whole KV range once per item, the softmax warps read their row slice with 128-B-swizzled lane loads and add it
+# pre-scale (``s + bias * inv_scale``, one FFMA2 per pair) before the band mask and the software row max -- and the per-key
+# boolean ``kv_mask`` as one 32-bit keep word per 32 kv columns (a warp ballot over byte loads), folded into the bit-word mask.
+# The block is sized from what the carveout leaves after Q / O / K / V at the flavor's ring depth, in whole TILE_N-column
+# tiles: a graph whose KV range needs more tiles than fit is a TYPED decline on the row AND in the adapter (the streamed
+# ring is the follow-up); a width where no tile fits (d128 at either cga) does not serve the bias at all.
+BIAS_MODE_NONE, BIAS_MODE_RESIDENT = 0, 1
+KV_MASK_NONE, KV_MASK_BOOL_WORD = 0, 1
+# The bias block's TMA / lane swizzle: the 128-B atom.  BOTH swizzle jobs force it -- the TMA descriptor writes the
+# block under it (job D) and the softmax lanes read one 128-B row slice each (job L: a per-lane stride that is a multiple
+# of the 128-B bank cycle is a 32-way conflict unswizzled; the 16-B chunk index XOR (row % 8) spreads 8 rows over 8 bank
+# groups -> 4 wavefronts per warp-wide 16-B load = ideal).  ``Swizzle(3, 4, 3)``: MBase + SShift = 7 = log2(128 B).
+BIAS_SWZ_BYTES = 128
+
+
+def sm107_bias_block_rows(tiles_q: int = 2, tile_m: int = 128) -> int:
+    """Rows of the resident bias block = the CTA's Q rows of one work item (both sub-tiles)."""
+    return tiles_q * tile_m
+
+
+def sm107_bias_resident_tiles(tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: int = 128) -> int:
+    """How many ``tile_n``-column bias tiles (``BIAS_BLOCK_ROWS x tile_n`` elements each) the Rubin carveout holds beside
+    the d128 family's Q / O slabs and K / V rings at ``tile_k = tile_o`` and the flavor's ring depth (``_stages_kv_d128``)
+    -- the SAME budget ``_validate_smem`` enforces (320 KiB usable minus the fixed overhead).  0 = no resident block fits.
+    Derived, never a literal: 3 at the 32-wide tile (cga1), 1 / 2 at the 64-wide one (cga1 / cga2), 0 at d128."""
+    b = bpe(dtype_qkv)
+    stages = _stages_kv_d128(dtype_qkv, cta_mma, mxfp8=False, tile_k=tile_k)
+    operands = sdpa_smem_bytes(tile_m, tile_n, tile_k, tile_k, tiles_q, stages, cta_mma, b, b)
+    spare = SMEM_USABLE_BYTES - _SMEM_FIXED_OVERHEAD - operands
+    tile_bytes = sm107_bias_block_rows(tiles_q, tile_m) * tile_n * b
+    return max(0, spare // tile_bytes)
+
+
+def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128) -> int:
+    """The largest S_kv (in whole tiles) whose bias row-block the resident form serves at this width and cga: the work
+    item's KV range is at most ceil(S_kv / tile_n) tiles.  0 = the width serves no bias.  Read by the engine row's
+    mismatch, the adapter's check_support and the config factory (one arithmetic, rule 8b')."""
+    return sm107_bias_resident_tiles(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n) * tile_n
+
+
+def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128) -> Optional[int]:
+    """The NARROWEST cga in ``cgas`` whose resident block holds ``s_kv`` (``sm107_bias_resident_s_kv_max``), or ``None``
+    when no width does.  The heuristics' auto pick for a bias / kv_mask graph, the width the standalone adapter lowers
+    with when none is requested, and the engine row's knob-less eligibility all read it (rule 8b'): a d64 graph at S_kv
+    256 lands on cga2 (two tiles) without a knob, S_kv <= 128 keeps the tuned cga1."""
+    for cga in sorted(cgas):
+        if s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cga, dtype_qkv=dtype_qkv, tile_n=tile_n):
+            return cga
+    return None
+
+
 # The same fact keyed by the config-flavor string `_validate_params` receives
 # (`make_cfg_d256` and `make_cfg_d256_mxfp8`).  Must stay in step with
 # SM107_EPILOGUE_GATE_SHAPES: every dtype family of a listed shape carries the
@@ -712,6 +769,19 @@ class _CfgSm107:
     # passes every bf16-O test and fails only e4m3-O.
     GATE_BPE: int = 2
 
+    # --- additive bias (resident row-block) + per-key boolean mask; d128-file f16/bf16 only.  Every seam in the body
+    # folds on cutlass.const_expr(CFG.BIAS_MODE) / (CFG.KV_MASK_FORM), so 0 / 0 traces the pre-bias instruction stream
+    # byte-for-byte.  BIAS_RESIDENT_TILES / BIAS_BLOCK_ROWS size the SMEM block (sm107_bias_resident_tiles -- what the
+    # carveout leaves after the operands, in whole TILE_N-column tiles); BIAS_EMPTY_ARRIVERS is the mb_bias_empty init
+    # count = the softmax warps (one elected arrive each per work item).
+    BIAS_MODE: int = 0
+    BIAS_RESIDENT_TILES: int = 0
+    BIAS_BLOCK_ROWS: int = 0
+    BIAS_SWZ_BYTES: int = 128
+    BIAS_BOXES_PER_TILE: int = 0
+    BIAS_EMPTY_ARRIVERS: int = 0
+    KV_MASK_FORM: int = 0
+
 
 @dataclass(frozen=True)
 class CfgD128(_CfgSm107):
@@ -943,9 +1013,10 @@ def _validate_dtype_k_step(cfg, flavor: str) -> None:
     )
 
 
-def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0) -> None:
+def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0) -> None:
     """``sf_bytes``: the block-scale kernel's scale-factor slabs (0 on the f16 /
-    per-tensor flavors); named in the message so a reader sees every term."""
+    per-tensor flavors); ``bias_bytes``: the resident bias row-block of the f16 d128-file
+    tiles (0 without the bias); both named in the message so a reader sees every term."""
     gate_bpe = cfg.GATE_BPE if cfg.EPILOGUE_GATE else 0
     gate_kib = (cfg.TILES_Q * cfg.TILE_M * cfg.TILE_O * gate_bpe) // 1024
     used = (
@@ -963,6 +1034,7 @@ def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0) -> No
             gate_bpe=gate_bpe,
             sf_bytes=sf_bytes,
         )
+        + bias_bytes
         + _SMEM_FIXED_OVERHEAD
     )
     if used > SMEM_USABLE_BYTES:
@@ -970,6 +1042,11 @@ def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0) -> No
         sf_term = (
             f" + {sf_bytes // 1024} KiB MXFP8 scale-factor slabs (Q 1 | K {cfg.STAGES_KV}x1 | P 1 (512 B padded) | V {cfg.STAGES_KV}x1)" if sf_bytes else ""
         )
+        if bias_bytes:
+            gate_term += (
+                f" + {bias_bytes // 1024} KiB resident bias block ({getattr(cfg, 'BIAS_RESIDENT_TILES', 0)} tiles x {getattr(cfg, 'BIAS_BLOCK_ROWS', 0)} rows x "
+                f"{cfg.TILE_N} cols x {cfg.BPE} B)"
+            )
         raise ValueError(
             f"{flavor}: SMEM {used // 1024} KiB (Q/K/V/O + {_SMEM_FIXED_OVERHEAD // 1024} KiB fixed{gate_term}{sf_term}) exceeds the "
             f"{SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout at STAGES_KV={cfg.STAGES_KV}, CTA_MMA={cfg.CTA_MMA}"
@@ -1055,6 +1132,120 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
     return 2 * cta_mma
 
 
+# The flavors that serve the bias / kv_mask at SOME validated cga -- DERIVED from the resident budget (the d128 tile has no
+# spare for a block at either cga: its Q / O / K / V sum to 256 KiB).  The engine row's ``bias_d_shapes`` and the adapter
+# read this set (rule 8b').  Defined here, after the ring-depth rule the budget reads.
+SM107_BIAS_D_SHAPES = frozenset(
+    shape
+    for shape in SM107_F16_SMALL_D_SHAPES | {(128, 128)}
+    if any(sm107_bias_resident_tiles(shape[0], cga) > 0 for cga in SM107_SMALL_D_CGAS.get(shape, {2}))
+)
+
+
+def operand_region_end_bytes(cfg) -> int:
+    """Where the descriptor-fed region of a d128-family kernel ENDS: sQ, sO, sK, sV in the body's declaration order, each a
+    1024-B-aligned slab -- the roots every tcgen05 SMEM descriptor is built from.  The lane-read bias block is declared
+    AFTER them, so with this below ``TCGEN05_V0_ADDR_LIMIT`` every descriptor root stays inside the version-0 window
+    whatever the block's size (the block itself may sit past 256 KiB: no descriptor touches it)."""
+    s_q = _align_slab(cfg.TILES_Q * cfg.TILE_M * cfg.TILE_K * cfg.BPE)
+    s_o = _align_slab(cfg.TILES_Q * cfg.TILE_M * cfg.TILE_O * cfg.BPE_O)
+    s_k = _align_slab(cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K // cfg.CTA_MMA) * cfg.BPE)
+    s_v = _align_slab(cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N // cfg.CTA_MMA) * cfg.BPE)
+    return s_q + s_o + s_k + s_v
+
+
+def bias_resident_block_bytes(cfg) -> int:
+    """SMEM bytes of the resident bias block (0 without the bias): ``BIAS_RESIDENT_TILES`` tiles of ``BIAS_BLOCK_ROWS x TILE_N``
+    elements in the io dtype."""
+    return cfg.BIAS_RESIDENT_TILES * cfg.BIAS_BLOCK_ROWS * cfg.TILE_N * cfg.BPE if cfg.BIAS_MODE else 0
+
+
+def _validate_tile_n(cfg, flavor: str) -> None:
+    """The KV tile width and what it couples to (M-2: TILE_N as a Cfg field).  The S accumulator takes TILE_N fp32 columns
+    per sub-tile and P half of them in its tail; with two sub-tiles the TMEM map must still end under the STATS region, so
+    256 is served only at ONE sub-tile -- a predicate, not a comment."""
+    lay = d128_family_tmem_layout(cfg)
+    _check(
+        [
+            (cfg.TILE_N in (64, 128, 256), f"{flavor}: TILE_N must be one of 64 / 128 / 256 (got {cfg.TILE_N})"),
+            (
+                cfg.TILE_N != 256 or cfg.TILES_Q == 1,
+                f"{flavor}: TILE_N = 256 needs ONE softmax sub-tile: {cfg.TILES_Q} sub-tiles x 256 S columns + the O slots + STATS exceed the "
+                f"{lay.TOTAL_COLS}-column TMEM allocation (the body indexes its S / P parity slots per sub-tile)",
+            ),
+            (
+                cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N and cfg.BMM2_CHUNK_SIZE == 64,
+                f"{flavor}: the softmax chunking is TILE_N / 64 chunks of 64 (got {cfg.N_BMM2_CHUNKS} x {cfg.BMM2_CHUNK_SIZE} vs TILE_N={cfg.TILE_N})",
+            ),
+            (
+                lay.O_OFF[-1] + cfg.TILE_O <= lay.STATS_OFF,
+                f"{flavor}: TILES_Q x TILE_N + TILES_Q x TILE_O = {lay.O_OFF[-1] + cfg.TILE_O} TMEM columns must end at or before STATS ({lay.STATS_OFF})",
+            ),
+        ]
+    )
+
+
+def _validate_bias(cfg, flavor: str) -> None:
+    """The resident bias block and the kv_mask word: every coupling of the block to the body, as predicates whose
+    messages name the failure (frost-kernels s5 "bind the couplings"; sdpa-invariants s6)."""
+    if not cfg.BIAS_MODE and not cfg.KV_MASK_FORM:
+        _check(
+            [
+                (cfg.BIAS_RESIDENT_TILES == 0 and cfg.BIAS_BLOCK_ROWS == 0, f"{flavor}: bias geometry fields must be 0 without BIAS_MODE"),
+            ]
+        )
+        return
+    preds = [
+        (cfg.BIAS_MODE in (BIAS_MODE_NONE, BIAS_MODE_RESIDENT), f"{flavor}: BIAS_MODE must be 0 (none) or 1 (resident row-block); got {cfg.BIAS_MODE}"),
+        (cfg.KV_MASK_FORM in (KV_MASK_NONE, KV_MASK_BOOL_WORD), f"{flavor}: KV_MASK_FORM must be 0 (none) or 1 (bit word); got {cfg.KV_MASK_FORM}"),
+        (
+            cfg.BIAS_EMPTY_ARRIVERS == cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_WG_WARPS,
+            f"{flavor}: BIAS_EMPTY_ARRIVERS must equal the softmax warp count {cfg.SOFTMAX_WARPGROUPS * cfg.SOFTMAX_WG_WARPS} (one elected arrive per "
+            f"softmax warp per work item; got {cfg.BIAS_EMPTY_ARRIVERS}) -- an unreachable mbarrier count is a hang at EVERY shape",
+        ),
+        (
+            cfg.DTYPE_QKV in (_DTYPE_BF16, _DTYPE_FP16),
+            f"{flavor}: the bias / kv_mask arms are wired on the f16/bf16 kernel only (dtype_qkv={cfg.DTYPE_QKV})",
+        ),
+        (
+            not (cfg.THD_VARLEN or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.EPILOGUE_GATE),
+            f"{flavor}: the bias / kv_mask arms serve dense, unsplit, unpacked, ungated graphs only",
+        ),
+    ]
+    if cfg.BIAS_MODE:
+        tile_bytes = cfg.BIAS_BLOCK_ROWS * cfg.TILE_N * cfg.BPE
+        preds += [
+            (
+                cfg.BIAS_RESIDENT_TILES >= 1,
+                f"{flavor}: a resident bias block needs at least one {cfg.TILE_N}-column tile (BIAS_RESIDENT_TILES={cfg.BIAS_RESIDENT_TILES})",
+            ),
+            (
+                cfg.BIAS_BLOCK_ROWS == cfg.TILES_Q * cfg.TILE_M,
+                f"{flavor}: BIAS_BLOCK_ROWS must be the work item's Q rows, TILES_Q x TILE_M = {cfg.TILES_Q * cfg.TILE_M} (got {cfg.BIAS_BLOCK_ROWS})",
+            ),
+            (
+                cfg.BIAS_SWZ_BYTES == BIAS_SWZ_BYTES and cfg.BIAS_BOXES_PER_TILE == (cfg.TILE_N * cfg.BPE) // BIAS_SWZ_BYTES,
+                f"{flavor}: the bias block is TMA-written AND lane-read under the 128-B swizzle (BIAS_SWZ_BYTES={cfg.BIAS_SWZ_BYTES}); a tile is "
+                f"TILE_N x BPE / 128 = {(cfg.TILE_N * cfg.BPE) // BIAS_SWZ_BYTES} boxes of 64 columns (got {cfg.BIAS_BOXES_PER_TILE})",
+            ),
+            (
+                cfg.BIAS_BLOCK_ROWS <= 256,
+                f"{flavor}: a TMA box holds at most 256 rows; the block's {cfg.BIAS_BLOCK_ROWS} rows need a per-sub-tile box",
+            ),
+            (
+                operand_region_end_bytes(cfg) <= TCGEN05_V0_ADDR_LIMIT,
+                f"{flavor}: the descriptor-fed sQ / sO / sK / sV region ends at {operand_region_end_bytes(cfg)} B, past the 256 KiB version-0 tcgen05 "
+                f"descriptor window: a root at or above 256 KiB wraps to offset 0 (the accumulator is EXACTLY zero); the bias block is placed after "
+                f"them and may straddle the line, the operands may not",
+            ),
+            (
+                cfg.BIAS_RESIDENT_TILES * tile_bytes <= SMEM_USABLE_BYTES,
+                f"{flavor}: {cfg.BIAS_RESIDENT_TILES} bias tiles x {tile_bytes} B exceed the carveout on their own",
+            ),
+        ]
+    _check(preds)
+
+
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
     # Half and per-tensor FP8 D128/D192 use the shared split protocol.
     # MXFP8 has no split loop yet.
@@ -1074,8 +1265,29 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
     o_div = o_pack_div(dtype_o)
-    tile_n = 128
+    # TILE_N is a Cfg field (TemplateParams.tile_n; 128 on every served record): the quantized siblings keep 128 (their
+    # SF geometry is tied to the 128-column tile), the f16/bf16 file takes 64 / 128 (256 is refused by _validate_tile_n).
+    tile_n = int(getattr(params, "tile_n", 128))
+    if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 64):
+        raise ValueError(f"{flavor}: TILE_N = {tile_n} is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep 128)")
+    bias_mode = int(getattr(params, "bias_mode", 0))
+    kv_mask_form = int(getattr(params, "kv_mask_form", 0))
+    if bias_mode or kv_mask_form:
+        if params.dtype_qkv <= _DTYPE_E5M2 or mxfp8:
+            raise ValueError(f"{flavor}: the additive bias / kv_mask are wired on the f16/bf16 prefill kernel only (dtype_qkv={params.dtype_qkv})")
+        if params.thd_varlen or (params.split_kv or 1) > 1 or params.pack_gqa or params.paged_kv or params.epilogue_gate:
+            raise ValueError(f"{flavor}: the additive bias / kv_mask serve dense, unsplit, unpaged, non-PackGQA, ungated graphs only")
+        if bias_mode not in (BIAS_MODE_NONE, BIAS_MODE_RESIDENT) or kv_mask_form not in (KV_MASK_NONE, KV_MASK_BOOL_WORD):
+            raise ValueError(f"{flavor}: bias_mode must be 0 / 1 (resident row-block) and kv_mask_form 0 / 1 (bit word); got {bias_mode} / {kv_mask_form}")
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
+    bias_tiles = 0
+    if bias_mode == BIAS_MODE_RESIDENT:
+        bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n)
+        if bias_tiles == 0:
+            raise ValueError(
+                f"{flavor}: no resident bias block fits beside the Q / O slabs and the {stages_kv}-deep K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} "
+                f"({SMEM_USABLE_BYTES // 1024} KiB usable); the bias is served on the widths of SM107_BIAS_D_SHAPES={sorted(SM107_BIAS_D_SHAPES)}"
+            )
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
     cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
     if tile_k <= 64:
@@ -1144,6 +1356,13 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         TMASTG_WARP_ID=14,
         SCHED_WARP_ID=15,
         READ_TILE_ARRIVERS=_D128_READ_TILE_ARRIVERS,
+        BIAS_MODE=bias_mode,
+        BIAS_RESIDENT_TILES=bias_tiles,
+        BIAS_BLOCK_ROWS=sm107_bias_block_rows(2, 128) if bias_mode else 0,
+        BIAS_SWZ_BYTES=BIAS_SWZ_BYTES,
+        BIAS_BOXES_PER_TILE=(tile_n * b) // BIAS_SWZ_BYTES if bias_mode else 0,
+        BIAS_EMPTY_ARRIVERS=2 * 4 if (bias_mode or kv_mask_form) else 0,
+        KV_MASK_FORM=kv_mask_form,
     )
 
     _validate_regs(cfg, flavor)
@@ -1151,8 +1370,10 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     _validate_dtype_k_step(cfg, flavor)
     _validate_swizzles(cfg, flavor)
     _validate_head_dim_tile(cfg, flavor)
+    _validate_tile_n(cfg, flavor)
     _validate_masks(cfg, flavor)
-    _validate_smem(cfg, flavor, qo_alias=bool(cfg.QO_ALIAS))
+    _validate_bias(cfg, flavor)
+    _validate_smem(cfg, flavor, qo_alias=bool(cfg.QO_ALIAS), bias_bytes=bias_resident_block_bytes(cfg))
     return cfg, _tma_iters(cfg)
 
 

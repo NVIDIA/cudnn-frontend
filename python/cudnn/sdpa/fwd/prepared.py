@@ -412,7 +412,9 @@ class ThdLaunchSpec:
 _FILLED_AT_BUILD = frozenset(
     "q_strides o_strides k_strides v_strides lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_lens_form o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
-    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides".split()
+    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
+    # The bias / kv_mask slots of the sm107 f16 d128-file host (dense-only arms; a THD plan never requests them).
+    "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()
 )
 _FILLED_PER_CALL = frozenset(
     "q_ptr k_ptr v_ptr o_ptr lse_ptr sinks_ptr meta_ptr o_desc_ptr problem_size k_strides v_strides lse_ext n_pages thd_q_lens_ptr thd_kv_lens_ptr "
@@ -547,6 +549,13 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     put("score_sum_exp_ptr", None)
     put("score_max_strides", (0, 0, 0))
     put("score_sum_exp_strides", (0, 0, 0))
+    # Bias / kv_mask: dense-only slots of the same host; a THD build never binds them (the config factory declines).
+    put("bias_ptr", None)
+    put("bias_strides", (0, 0, 0))
+    put("bias_extents", (1, 1))
+    put("kv_mask_ptr", None)
+    put("kv_mask_batch_stride", 0)
+    put("inv_scale_softmax", 1.0)
     split_slots = {"lse_partial_ptr", "partial_o_strides"} if s.split_workspace is not None else set()
     unfilled = sorted(set(order) - _FILLED_AT_BUILD - _FILLED_PER_CALL - _quant_slots(s.quant) - split_slots)
     if unfilled:
@@ -1152,12 +1161,14 @@ class PreparedThdLaunch:
 _FILLED_AT_BUILD_DENSE = frozenset(
     "lse_strides lse_ext scale_softmax_log2 scale_softmax thd_max_sq n_thd_units seq_q_lens_addr thd_q_lens_ptr thd_kv_lens_ptr thd_lens_form o_partial_ptr "
     "block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr ragged_q_div "
-    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides".split()
+    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
+    "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()
 )
 _FILLED_PER_CALL_DENSE = frozenset(
     "q_ptr k_ptr v_ptr o_ptr q_strides k_strides v_strides o_strides lse_ptr lse_strides sinks_ptr meta_ptr o_desc_ptr problem_size seq_q_lens_addr "
     "o_partial_ptr block_table_ptr block_table_v_ptr table_strides table_v_strides n_pages gate_ptr gate_strides ragged_q_addr stream "
-    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides".split()
+    "score_max_ptr score_sum_exp_ptr score_max_strides score_sum_exp_strides "
+    "bias_ptr bias_strides bias_extents kv_mask_ptr kv_mask_batch_stride inv_scale_softmax".split()
 )
 
 
@@ -1201,6 +1212,11 @@ class DenseLaunchSpec:
         # Score side outputs (score_max / score_sum_exp): dense fp32 (B, QH, SQ) rows bound per call like the Stats.
         "has_score_max",
         "has_score_sum_exp",
+        # Additive bias (the resident row-block arm): compiled in, its dtype string, bound per call like the gate; the
+        # per-key boolean mask likewise.  The python frame is the only binder of either (no native slot).
+        "has_bias",
+        "bias_expect",
+        "has_kv_mask",
         "seq_kv_present",
         "seq_q_present",
         "gate_expect",
@@ -1273,6 +1289,10 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.has_sink = bool(api.has_sink)
     s.has_score_max = getattr(api, "score_max_desc", None) is not None
     s.has_score_sum_exp = getattr(api, "score_sum_exp_desc", None) is not None
+    _bias_desc = getattr(api, "bias_desc", None)
+    s.has_bias = _bias_desc is not None
+    s.bias_expect = str(_bias_desc.dtype).split(".")[-1] if _bias_desc is not None else None
+    s.has_kv_mask = getattr(api, "kv_mask_desc", None) is not None
     s.seq_kv_present, s.seq_q_present = bool(api.seq_kv_lens_present), bool(api.seq_q_lens_present)
     s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
     s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
@@ -1357,6 +1377,14 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     put("score_sum_exp_ptr", None)
     put("score_max_strides", (0, 0, 0))
     put("score_sum_exp_strides", (0, 0, 0))
+    # Bias / kv_mask: None / zero slots in the template; bind_dense fills the requested ones per call (the artifact was
+    # compiled with has_bias / has_kv_mask, so a compiled-in slot without its buffer is a binder error, not a null read).
+    put("bias_ptr", None)
+    put("bias_strides", (0, 0, 0))
+    put("bias_extents", (1, 1))
+    put("kv_mask_ptr", None)
+    put("kv_mask_batch_stride", 0)
+    put("inv_scale_softmax", 1.0 / scale if scale != 0.0 else 1.0)
     put("scale_softmax_log2", scale * math.log2(math.e))
     put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
     put("thd_max_sq", int(api.s_q_max))
@@ -1463,11 +1491,64 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         # predates them (it copies the template's None / zero slots untouched), so a plan that
         # requests them takes bind_dense, which fills the two pointer / stride pairs per call.
         and not (s.has_score_max or s.has_score_sum_exp)
+        # The bias / kv_mask slots likewise bind through the python frame only.
+        and not (s.has_bias or s.has_kv_mask)
     ):
         from cudnn import _pybind_module
 
         s.native = _pybind_module._SdpaDenseBinder(s)
     return s
+
+
+def _bias_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], b: int, s_q: int, s_kv: int):
+    """The additive bias of a dense launch: ``(ptr, (batch, head, row) element strides, (B_b, H_b) extents)``.
+
+    ``[B_b, H_b, S_q, S_kv]`` in the io dtype with ``B_b`` in {1, b} and ``H_b`` in {1, QH} (the broadcast forms the kernel
+    serves by clamping its coordinates), the key dim contiguous, every other live stride a 16-byte multiple (the TMA
+    global-stride rule at 2 B/elem -- ``S_kv % 8 == 0`` for a compact bias), 16-byte aligned base, on the plan's device;
+    a buffer smaller than its geometry claims is rejected."""
+    f = facts.get("bias")
+    if f is None:
+        raise ValueError("cudnn.sdpa: bias_tensor is required by this compiled specialization (constructed with sample_bias)")
+    if f.dtype != spec.bias_expect:
+        raise ValueError(f"cudnn.sdpa: bias: runtime buffer dtype {f.dtype} does not match its declaration ({spec.bias_expect})")
+    _on_plan_device(spec, "bias", f)
+    shape, st = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
+    if len(shape) != 4 or shape[2:] != (s_q, s_kv) or shape[0] not in (1, b) or shape[1] not in (1, spec.qh):
+        raise ValueError(f"cudnn.sdpa: bias must be (1|{b}, 1|{spec.qh}, {s_q}, {s_kv}); got {shape}")
+    if st[3] != 1:
+        raise ValueError(f"cudnn.sdpa: bias must have its key dim contiguous (stride 1); got strides {st}")
+    elem = _buffers.DTYPE_ITEMSIZE[spec.bias_expect]
+    live = [(n, s) for n, s in zip(shape[:3], st[:3]) if n > 1]
+    if any((s * elem) % _ALIGN_TMA for _, s in live) or f.ptr % _ALIGN_TMA:
+        raise ValueError(f"cudnn.sdpa: bias strides {st} and base must be 16-byte multiples (TMA; S_kv % {_ALIGN_TMA // elem} == 0 for a compact bias)")
+    need = 1 + sum((n - 1) * s for n, s in live) + (s_kv - 1)
+    if f.span >= 0 and f.span < need:
+        raise ValueError(f"cudnn.sdpa: bias spans {f.span} elements; its geometry {shape} / {st} needs {need}")
+    strides = tuple(s if n > 1 else 0 for n, s in zip(shape[:3], st[:3]))
+    return f.ptr, strides, (shape[0], shape[1])
+
+
+def _kv_mask_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], b: int, s_kv: int):
+    """The per-key boolean mask of a dense launch: ``(ptr, batch element stride)``.  ``(1|b, 1, 1, S_kv)`` (or the squeezed
+    ``(1|b, S_kv)``) of torch.bool / int8 / uint8 bytes, the key dim contiguous; a batch extent of 1 binds stride 0 (one
+    row broadcast over the batch)."""
+    f = facts.get("kv_mask")
+    if f is None:
+        raise ValueError("cudnn.sdpa: kv_mask_tensor is required by this compiled specialization (constructed with sample_kv_mask)")
+    if f.dtype not in ("bool", "int8", "uint8"):
+        raise ValueError(f"cudnn.sdpa: kv_mask must be a byte mask (torch.bool / int8 / uint8); got {f.dtype}")
+    _on_plan_device(spec, "kv_mask", f)
+    shape, st = tuple(int(x) for x in f.shape), tuple(int(x) for x in f.strides)
+    if len(shape) == 4 and shape[1:3] == (1, 1):
+        shape, st = (shape[0], shape[3]), (st[0], st[3])
+    if len(shape) != 2 or shape[1] != s_kv or shape[0] not in (1, b) or st[1] != 1:
+        raise ValueError(f"cudnn.sdpa: kv_mask must be (1|{b}, 1, 1, {s_kv}) with a contiguous key dim; got shape {f.shape} strides {f.strides}")
+    batch_stride = st[0] if shape[0] > 1 else 0
+    need = (shape[0] - 1) * batch_stride + s_kv
+    if f.span >= 0 and f.span < need:
+        raise ValueError(f"cudnn.sdpa: kv_mask spans {f.span} elements; its geometry needs {need}")
+    return f.ptr, batch_stride
 
 
 def _ragged_offsets_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], name: str, *, required: bool = True) -> Optional[int]:
@@ -1777,6 +1858,15 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
         frame[ix["gate_ptr"]], frame[ix["gate_strides"]] = g.ptr, g.strides
     elif facts.get("gate") is not None:
         raise ValueError("cudnn.sdpa: this specialization was compiled without an epilogue gate")
+    # Additive bias / per-key mask (the resident-block arms): the strict presence contract of the LSE in both directions.
+    if getattr(spec, "has_bias", False):
+        frame[ix["bias_ptr"]], frame[ix["bias_strides"]], frame[ix["bias_extents"]] = _bias_role(spec, facts, b, s_q, s_kv)
+    elif facts.get("bias") is not None:
+        raise ValueError("cudnn.sdpa: this specialization was compiled without a bias; construct the API with sample_bias")
+    if getattr(spec, "has_kv_mask", False):
+        frame[ix["kv_mask_ptr"]], frame[ix["kv_mask_batch_stride"]] = _kv_mask_role(spec, facts, b, s_kv)
+    elif facts.get("kv_mask") is not None:
+        raise ValueError("cudnn.sdpa: this specialization was compiled without a kv_mask; construct the API with sample_kv_mask")
     frame[ix["stream"]] = stream
     return frame
 
@@ -1932,6 +2022,11 @@ class PreparedDenseLaunch:
             uids["block_table_v"] = binding.paged_v_table.get_uid()
         if spec.gate_expect is not None:
             uids["gate"] = gate_src.get_uid()
+        # The resident-block arms: the bias / kv_mask operands of the graph (bound like the gate; bind_dense validates them).
+        if getattr(spec, "has_bias", False):
+            uids["bias"] = binding.bias.get_uid()
+        if getattr(spec, "has_kv_mask", False):
+            uids["kv_mask"] = binding.kv_mask.get_uid()
         if spec.ragged:
             uids["ragged_q"] = binding.ragged_q.get_uid()
             uids["ragged_o"] = binding.ragged_o.get_uid()

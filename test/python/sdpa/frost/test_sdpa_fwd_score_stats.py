@@ -143,9 +143,20 @@ def test_capabilities_field_is_appended():
     from cudnn.sdpa.fwd.engines import Capabilities
 
     names = [f.name for f in fields(Capabilities)]
-    assert names[-3:] == ["thd_pack_gqa_d_shapes", "score_stats_d_shapes", "dense_only_d_shapes"], names[-4:]
+    # ... and the resident-bias / kv_mask fields of the Rubin small tiles (2026-10-08) after THAT.
+    assert names[-7:] == [
+        "thd_pack_gqa_d_shapes",
+        "score_stats_d_shapes",
+        "dense_only_d_shapes",
+        "bias_d_shapes",
+        "bias_io_dtype_only",
+        "kv_mask",
+        "kv_mask_dtypes",
+    ], names[-8:]
     assert Capabilities.__dataclass_fields__["score_stats_d_shapes"].default is None
     assert Capabilities.__dataclass_fields__["dense_only_d_shapes"].default == frozenset()
+    assert Capabilities.__dataclass_fields__["bias_d_shapes"].default is None
+    assert Capabilities.__dataclass_fields__["kv_mask"].default is False
 
 
 def test_adapter_signatures_append_the_score_kwargs():
@@ -153,11 +164,13 @@ def test_adapter_signatures_append_the_score_kwargs():
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDsl, SdpaFwdDslSm100
 
     ctor = inspect.signature(SdpaFwdDsl.__init__).parameters
-    assert list(ctor)[-2:] == ["sample_score_max", "sample_score_sum_exp"]
+    # ... followed by the resident-block operands of the Rubin small tiles (sample_bias / sample_kv_mask, 2026-10-08).
+    assert list(ctor)[-4:] == ["sample_score_max", "sample_score_sum_exp", "sample_bias", "sample_kv_mask"]
     assert ctor["sample_score_max"].default is None and ctor["sample_score_sum_exp"].default is None
     ex = inspect.signature(SdpaFwdDslSm100.execute).parameters
-    assert list(ex)[-2:] == ["score_max_tensor", "score_sum_exp_tensor"]
+    assert list(ex)[-4:] == ["score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"]
     assert ex["score_max_tensor"].default is None and ex["score_sum_exp_tensor"].default is None
+    assert ex["bias_tensor"].default is None and ex["kv_mask_tensor"].default is None
 
 
 def _desc(shape, dtype, name, stride=None):

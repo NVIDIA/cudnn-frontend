@@ -54,6 +54,9 @@ from cudnn.sdpa.fwd.config_sm107 import sm107_small_tile_leg as _sm107_small_til
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SCORE_STATS_SHAPES as _SM107_SCORE_STATS_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_BIAS_D_SHAPES as _SM107_BIAS_D_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max as _sm107_bias_resident_s_kv_max
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga as _sm107_bias_auto_cga
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
@@ -665,8 +668,19 @@ class SdpaFwdDsl(APIBase):
         ragged_offsets_int64: bool = False,
         sample_score_max: Optional[torch.Tensor | TensorDesc] = None,
         sample_score_sum_exp: Optional[torch.Tensor | TensorDesc] = None,
+        sample_bias: Optional[torch.Tensor | TensorDesc] = None,
+        sample_kv_mask: Optional[torch.Tensor | TensorDesc] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
+
+        ``sample_bias`` / ``sample_kv_mask`` (APPENDED, optional): the additive attention bias
+        ``[1|B, 1|H_q, S_q, S_kv]`` in the Q/K/V dtype (added to the scaled scores before the softmax,
+        broadcast over the dims declared 1) and the per-key boolean mask ``[1|B, 1, 1, S_kv]``
+        (``torch.bool``; a False key is masked for every query, a query whose every key is masked reads
+        O = 0 / LSE = -inf).  Plan-time state like ``sample_lse``: their presence is a compile-time arm of
+        the kernel (the resident bias row-block of the Rubin f16/bf16 32- / 64-wide tiles).  Served on
+        dense, unsplit, unpaged plans without the score side outputs, at an S_kv the block holds
+        (``config_sm107.sm107_bias_resident_s_kv_max``); every other selection declines at ``check_support``.
 
         ``sample_score_max`` / ``sample_score_sum_exp`` (APPENDED, optional): the graph's two score
         side outputs -- fp32 ``(B, H_q, S_q[, 1])`` row statistics in natural units, the softmax
@@ -765,6 +779,9 @@ class SdpaFwdDsl(APIBase):
         self.score_max_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_score_max, name="score_max"), 3, "score_max")
         self.score_sum_exp_desc = self._unpad_tensor_to_ndim(self._make_tensor_desc(sample_score_sum_exp, name="score_sum_exp"), 3, "score_sum_exp")
         self._score_strides: dict = {}
+        # Additive bias / per-key boolean mask (the resident-block arm); None = the arm is compiled out.
+        self.bias_desc = self._make_tensor_desc(sample_bias, name="bias")
+        self.kv_mask_desc = self._make_tensor_desc(sample_kv_mask, name="kv_mask")
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
@@ -1446,6 +1463,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         positionally after amax_o: every fp8 / mxfp8 flavor on every arch line."""
         return self._fp8
 
+    def _resident_arm_cga(self) -> int:
+        """The width a bias / kv_mask plan runs at: the requested cga, or -- none requested -- the NARROWEST width of the
+        flavor's domain whose resident block holds S_kv (``config_sm107.sm107_bias_auto_cga``, the heuristics' pick, so
+        a d64 graph at S_kv 256 lands on cga2 whichever path built the plan); 1 when no width holds it, which
+        ``check_support`` then declines with the budget.  Read by ``check_support`` and ``template_params`` alike."""
+        if self.cga is not None:
+            return int(self.cga)
+        if self.flavor not in _SM107_BIAS_D_SHAPES:
+            return 1
+        return _sm107_bias_auto_cga(self.flavor[0], int(self.k_desc.shape[2]), _SM107_SMALL_D_CGAS[self.flavor]) or 1
+
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
@@ -1902,6 +1930,53 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.cga == 1 or (self.cga is None and self.flavor == (64, 64)),
                 "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store (pin cga=2)",
             )
+        if self.bias_desc is not None or self.kv_mask_desc is not None:
+            # Additive bias / per-key mask: the twin of the engine row's gates (engines._bias_arm_decline; rule 8b)
+            # through the SAME constants (rule 8b').  The resident row-block lives in the Rubin f16/bf16 d128 file's
+            # 32- / 64-wide tiles: dense, unsplit, unpaged, non-PackGQA, ungated, without the score side outputs,
+            # and at an S_kv whose tiles the carveout holds beside the operands at the plan's cga.
+            _what = "bias" if self.bias_desc is not None else "kv_mask"
+            self._not_implemented_error_if(
+                self._device_cc != (10, 7) or self._fp8,
+                f"the additive {_what} is served by the Rubin f16/bf16 engine's 32- / 64-wide tiles only (the resident row-block)",
+            )
+            self._not_implemented_error_if(
+                self.thd or self.paged or self.split_kv > 1 or bool(self.pack_gqa) or self.gate_desc is not None,
+                f"the additive {_what} is served on dense, unsplit, unpaged, non-PackGQA, ungated plans only",
+            )
+            self._not_implemented_error_if(
+                self.score_max_desc is not None or self.score_sum_exp_desc is not None,
+                f"the additive {_what} and the score side outputs are not wired together (the -inf masked softmax arm publishes no true max)",
+            )
+            self._not_implemented_error_if(
+                self.flavor not in _SM107_BIAS_D_SHAPES,
+                f"the additive {_what} is wired on the {sorted(_SM107_BIAS_D_SHAPES)} kernel flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+            )
+            _bias_cga = self._resident_arm_cga()
+            _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga)
+            self._not_implemented_error_if(
+                _s_kv_max == 0 or int(s_kv) > _s_kv_max,
+                f"the resident {_what} block at head-dim tile {self.flavor[0]} / cga {_bias_cga} holds S_kv <= {_s_kv_max}; got {s_kv} (the streamed form is not built)",
+            )
+            if self.bias_desc is not None:
+                self._check_dtype(self.bias_desc, self.q_desc.dtype, name="bias")
+                _bd, _bs = tuple(int(x) for x in self.bias_desc.shape), tuple(int(x) for x in self.bias_desc.stride)
+                self._value_error_if(
+                    len(_bd) != 4 or _bd[2:] != (int(s_qo), int(s_kv)) or _bd[0] not in (1, int(b)) or _bd[1] not in (1, int(h_qo)),
+                    f"bias must be (1|B, 1|H_q, S_q, S_kv) = (1|{b}, 1|{h_qo}, {s_qo}, {s_kv}); got {_bd}",
+                )
+                self._value_error_if(_bs[3] != 1, f"bias must have its key dim contiguous (stride 1); got strides {_bs}")
+                self._value_error_if(
+                    any(n > 1 and (s * 2) % 16 for n, s in zip(_bd[:3], _bs[:3])),
+                    f"every live bias stride must be a 16-byte multiple for TMA (S_kv % 8 == 0 for a compact bias); got strides {_bs}",
+                )
+            if self.kv_mask_desc is not None:
+                self._check_dtype(self.kv_mask_desc, [torch.bool, torch.int8, torch.uint8], name="kv_mask")
+                _md, _ms = tuple(int(x) for x in self.kv_mask_desc.shape), tuple(int(x) for x in self.kv_mask_desc.stride)
+                self._value_error_if(
+                    len(_md) != 4 or _md[1:3] != (1, 1) or _md[3] != int(s_kv) or _md[0] not in (1, int(b)) or _ms[3] != 1,
+                    f"kv_mask must be (1|B, 1, 1, S_kv) = (1|{b}, 1, 1, {s_kv}) with a contiguous key dim; got {_md} / {_ms}",
+                )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
         # dtypes and frost constants only.
@@ -2343,18 +2418,27 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # diagonal band. Its decode leg is picked by decode_tile, not cga.
             # The Rubin small tiles (d32 / d64 on the sm107 d128 file) likewise default to cga1 -- their validated width
             # (config_sm107.SM107_SMALL_D_CGAS; at TILE_O = 32 a cga2 V operand would be a 32-byte MN-major atom).
+            # A bias / kv_mask plan without a requested width takes the narrowest one whose resident block holds S_kv
+            # (_resident_arm_cga: the heuristics' pick), not the small tiles' cga1 default.
             cta_mma=(
-                (
-                    1
-                    if (self._fp8 and self.flavor == (256, 256))
-                    or self.flavor == (64, 64)
-                    or (self._device_cc == (10, 7) and self.flavor in _SM107_F16_SMALL_D_SHAPES)
-                    else 2
+                self._resident_arm_cga()
+                if (self.bias_desc is not None or self.kv_mask_desc is not None)
+                else (
+                    (
+                        1
+                        if (self._fp8 and self.flavor == (256, 256))
+                        or self.flavor == (64, 64)
+                        or (self._device_cc == (10, 7) and self.flavor in _SM107_F16_SMALL_D_SHAPES)
+                        else 2
+                    )
+                    if self.cga is None
+                    else self.cga
                 )
-                if self.cga is None
-                else self.cga
             ),
             d_flavor=self.flavor[0] if self.flavor in ((32, 32), (64, 64)) else 128,
+            # The resident-block arms: a compile-time axis of the d128 file (check_support admitted the operands).
+            bias_mode=1 if self.bias_desc is not None else 0,
+            kv_mask_form=1 if self.kv_mask_desc is not None else 0,
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
@@ -2479,6 +2563,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             (self.score_max_desc is not None or self.score_sum_exp_desc is not None) and "has_score_max" not in _kc,
             f"{self.kernel_template}: this kernel template carries no score_max / score_sum_exp store",
         )
+        self._not_implemented_error_if(
+            (self.bias_desc is not None or self.kv_mask_desc is not None) and "has_bias" not in _kc,
+            f"{self.kernel_template}: this kernel template carries no additive-bias / kv_mask arm",
+        )
         # Explicit pointer/int host entry (the f16/bf16 SM100 / SM107 prefill templates): every
         # extent and stride is a runtime argument, so the compile key is layout-only and the
         # dense / THD launches bind pointers through cudnn.sdpa.fwd.prepared.
@@ -2589,6 +2677,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Score side outputs: each store is its own compile-time arm (None folds it out).
             kw["has_score_max"] = self.score_max_desc is not None
             kw["has_score_sum_exp"] = self.score_sum_exp_desc is not None
+        if "has_bias" in accepted:
+            # The bias / kv_mask operand slots of the host entry (the arm itself is the TemplateParams').
+            kw["has_bias"] = self.bias_desc is not None
+            kw["has_kv_mask"] = self.kv_mask_desc is not None
         if "static_lse_strides" in accepted and self.lse_desc is not None and not self.thd and self.split_kv == 1:
             # Plan metadata only. The compiled host retains a generic branch
             # for other legal runtime Stats strides. SM100 D512 half outputs
@@ -2649,6 +2741,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ragged=None,
         score_max=None,
         score_sum_exp=None,
+        bias=None,
+        kv_mask=None,
     ) -> None:
         """Dense (padded) launch through the prepared spec (``prepared.bind_dense``) from this call's
         torch tensors. Conversion plans use the shared staged entry instead; a split writes the
@@ -2681,6 +2775,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 ragged,
                 score_max,
                 score_sum_exp,
+                bias,
+                kv_mask,
             )
 
     def _execute_dense_prepared_on_stream(
@@ -2704,6 +2800,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ragged=None,
         score_max=None,
         score_sum_exp=None,
+        bias=None,
+        kv_mask=None,
     ) -> None:
         from cudnn.sdpa.fwd.prepared import bind_dense, bind_dense_split, execute_native_dense_tensors, facts_of_tensor
 
@@ -2768,6 +2866,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # this python frame is the only path that binds them.
             score_max=facts_of_tensor(score_max),
             score_sum_exp=facts_of_tensor(score_sum_exp),
+            # The resident-block arms (bias / kv_mask) likewise bind through this python frame only.
+            bias=facts_of_tensor(bias),
+            kv_mask=facts_of_tensor(kv_mask),
         )
         if ragged is not None:
             facts.update(ragged_q=facts_of_tensor(ragged[0]), ragged_o=facts_of_tensor(ragged[1]), ragged_lse=facts_of_tensor(ragged[2]))
@@ -2781,6 +2882,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             frame = bind_dense(spec, facts, current_stream, stream_int)
         if scale_softmax_log2 != spec.template[spec.index["scale_softmax_log2"]]:
             frame[spec.index["scale_softmax_log2"]] = scale_softmax_log2
+        if "inv_scale_softmax" in spec.index and scale_softmax_log2 != 0.0:
+            # 1 / softmax_scale for the pre-scale bias add (the bias arm reads it; the slot exists on every host that
+            # carries the arm): derived from this call's scale like scale_softmax_log2, so a per-call scale stays consistent.
+            inv_scale = math.log2(math.e) / scale_softmax_log2
+            if inv_scale != spec.template[spec.index["inv_scale_softmax"]]:
+                frame[spec.index["inv_scale_softmax"]] = inv_scale
         spec.fn(*frame)
         if self.split_kv > 1:
             spec.combine.fn(*combine_args)
@@ -2880,8 +2987,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         ragged_lse: Optional[torch.Tensor] = None,
         score_max_tensor: Optional[torch.Tensor] = None,
         score_sum_exp_tensor: Optional[torch.Tensor] = None,
+        bias_tensor: Optional[torch.Tensor] = None,
+        kv_mask_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Launch the compiled kernel.
+
+        ``bias_tensor`` / ``kv_mask_tensor`` (APPENDED): the additive bias ``[1|B, 1|H_q, S_q, S_kv]`` and the per-key
+        boolean mask ``[1|B, 1, 1, S_kv]`` of a specialization constructed with ``sample_bias`` / ``sample_kv_mask``,
+        bound through (never copied), required iff the matching sample was given (the LSE's presence contract).
 
         ``score_max_tensor`` / ``score_sum_exp_tensor`` (APPENDED): the score side outputs of a
         specialization constructed with ``sample_score_max`` / ``sample_score_sum_exp`` -- fp32
@@ -3045,6 +3158,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             score_max_tensor = self._checked_row_stat_view(score_max_tensor, "score_max_tensor", self._score_strides.get("score_max"))
         if score_sum_exp_tensor is not None:
             score_sum_exp_tensor = self._checked_row_stat_view(score_sum_exp_tensor, "score_sum_exp_tensor", self._score_strides.get("score_sum_exp"))
+        for _name, _desc, _t in (("bias", getattr(self, "bias_desc", None), bias_tensor), ("kv_mask", getattr(self, "kv_mask_desc", None), kv_mask_tensor)):
+            self._value_error_if(
+                _desc is not None and _t is None, f"{_name}_tensor is required by this compiled specialization (constructed with sample_{_name})"
+            )
+            self._value_error_if(_desc is None and _t is not None, f"this specialization was compiled without a {_name}; construct the API with sample_{_name}")
 
         if getattr(self, "_staged_spec", None) is not None:
             from .prepared_staged_forward import execute as execute_staged
@@ -3155,6 +3273,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             ragged=ragged,
             score_max=score_max_tensor,
             score_sum_exp=score_sum_exp_tensor,
+            bias=bias_tensor,
+            kv_mask=kv_mask_tensor,
         )
 
     def _kernel_compile_accepts(self) -> frozenset:
