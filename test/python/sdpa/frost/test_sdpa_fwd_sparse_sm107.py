@@ -1631,9 +1631,9 @@ def _lens_tensor(lens, cu, base=0):
     return torch.tensor(_cu(lens, base) if cu else [int(n) for n in lens], device=dev, dtype=torch.int32)
 
 
-def _launch_thd(q, k, v, ids, lens, lens_q, lens_kv, top_k, scale, *, cu_q=False, cu_kv=False, cu_base=0, launches=2):
+def _launch_thd(q, k, v, ids, lens, lens_q, lens_kv, top_k, scale, *, cu_q=False, cu_kv=False, cu_base=0, launches=2, gate=None):
     """Sentinel-filled packed O ``[1, T_q, H, D]`` / LSE ``(1, H, T_q)`` per launch through the adapter's THD contract; the
-    metadata workspace sized by the adapter."""
+    metadata workspace sized by the adapter.  ``gate`` (appended) = the fused epilogue gate's PACKED operand, O-shaped in Q's dtype."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     dev = q.device
@@ -1659,6 +1659,7 @@ def _launch_thd(q, k, v, ids, lens, lens_q, lens_kv, top_k, scale, *, cu_q=False
             seq_q_lens=seq_q,
             cu_seq_q_lens=cu_q,
             cu_seq_kv_lens=cu_kv,
+            epilogue_gate=gate,
         )
         assert a.check_support()
         a.compile()  # plan time: the adapter never compiles on the execute path
@@ -1930,6 +1931,72 @@ def test_epilogue_gate_matches_the_oracle_and_the_unfused_path_within_one_roundi
     print(
         f"\ngate cell B={B} S={S} H={H}/{KH} {dtype} top_k={top_k} {list_kind}: vs oracle max|dO| {m['max_o']:.5f} max|dLSE| {m['max_lse']:.6f}; "
         f"vs unfused-then-gated max|d| {m['max_d']:.4e} = {m['max_ulp']:.3f} ulp ({m['n_off']} of {m['n']} elements differ); dead rows {m['dead']}"
+    )
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "name, dtype",
+    [
+        pytest.param("three-seqs", torch.bfloat16, id="three-seqs-bf16-capacity-tail"),
+        pytest.param("tokens-no-keys", torch.float16, id="tokens-no-keys-f16-dead-sequence"),
+        pytest.param("small-with-dead-ctas", torch.bfloat16, id="small-with-dead-ctas-bf16"),
+    ],
+)
+def test_epilogue_gate_composes_with_thd_within_one_rounding(name, dtype):
+    """The fused epilogue gate on the PACKED arm (``epilogue_gate=`` the packed ``[1, T_q, H, D]`` gate operand like O -- here the
+    slab's GATE columns at a padded token stride): the gated packed run vs (a) every live sequence's own oracle gated exactly (the
+    sacred budget), (b) the UNGATED packed run's O through the production elementwise gate within ONE rounding of the dtype per
+    live element, (c) the ungated run's LSE BITWISE, (d) a keyless sequence's rows exactly 0 on both, the capacity tail past the
+    packed total untouched, two gated launches bitwise.  The ungated run is held to the per-sequence oracle by ``_check_thd``."""
+    H, KH, top_k = 24, 2, 512
+    p = _THD_PACKINGS[name]
+    q, k, v, ids, lens = _thd_inputs(
+        p["lens_q"], p["lens_kv"], H, KH, dtype, top_k=top_k, list_kind=p.get("list_kind", "full"), extra_cap=p.get("extra_cap", 0), seed=7
+    )
+    T = q.shape[1]
+    g = torch.Generator(device=q.device).manual_seed(0x6A7E)
+    gate_c = (torch.randn(1, T, H, D, device=q.device, dtype=torch.float32, generator=g) * 2.0).to(dtype)
+    slab = torch.zeros(1, T, H * D + 512, device=q.device, dtype=dtype)
+    slab[:, :, : H * D] = gate_c.reshape(1, T, H * D)
+    gate = slab[:, :, : H * D].view(1, T, H, D)  # token stride H*D + 512: the slab's GATE columns, bound with no copy
+    assert gate.stride(1) == H * D + 512
+    scale = 1.0 / math.sqrt(D)
+    outs_f = _launch_thd(q, k, v, ids, lens, p["lens_q"], p["lens_kv"], top_k, scale, gate=gate)
+    outs_u = _launch_thd(q, k, v, ids, lens, p["lens_q"], p["lens_kv"], top_k, scale, launches=1)
+    max_o_u, max_lse_u = _check_thd(outs_u, q, k, v, ids, lens, p["lens_q"], p["lens_kv"], scale, top_k)
+    (o_f, lse_f), (o_u, lse_u) = outs_f[0], outs_u[0]
+    assert torch.equal(lse_f, lse_u), "the gate must not touch the LSE: gated and ungated packed runs publish it bitwise"
+    sent, sent_o = _sentinel(dtype), _stored_sentinel(dtype)
+    cu_q, cu_k = _cu(p["lens_q"]), _cu(p["lens_kv"])
+    t_live = cu_q[-1]
+    for oo, ll in outs_f:
+        assert (oo[0, t_live:].float() == sent_o).all() and (ll[0, :, t_live:] == sent).all(), "the capacity tail past the packed Q total was written"
+    assert torch.equal(outs_f[0][0], outs_f[1][0]) and torch.equal(outs_f[0][1], outs_f[1][1]), "two gated launches must be bitwise"
+    o_ug = _elementwise_gate(o_u[:, :t_live], gate[:, :t_live])
+    dead = torch.isinf(lse_u[0, :, :t_live])  # [H, t_live]
+    if dead.any():
+        assert (o_f[0, :t_live].float().permute(1, 0, 2)[dead] == 0).all() and (
+            o_ug[0].float().permute(1, 0, 2)[dead] == 0
+        ).all(), "a dead row gates to exactly 0"
+    d = (o_f[0, :t_live].float() - o_ug[0].float()).abs()
+    ulps = d.cpu() / _ulp_of(torch.maximum(o_f[0, :t_live].float().abs(), o_ug[0].float().abs()), dtype)
+    max_d, max_ulp, n_off = float(d.max()), float(ulps.max()), int((d > 0).sum())
+    assert max_ulp <= 1.0, f"gated vs unfused-then-gated: {max_ulp:.3f} ulp at the element's magnitude (max|d| {max_d:.3e}); the budget is one rounding"
+    assert max_d <= ATOL
+    max_o = max_lse = 0.0
+    for b, (sq, skv) in enumerate(zip(p["lens_q"], p["lens_kv"])):
+        if sq == 0 or skv == 0:
+            continue  # an empty sequence owns no rows; a keyless one is dead on every row (asserted above)
+        lo, hi, klo, khi = cu_q[b], cu_q[b + 1], cu_k[b], cu_k[b + 1]
+        ref_o, ref_lse = _reference(q[:, lo:hi], k[:, klo:khi], v[:, klo:khi], ids[lo:hi], None if lens is None else lens[lo:hi], [skv], scale, top_k)
+        ref_og = ref_o * torch.sigmoid(gate[:, lo:hi].float())  # the exact sigmoid on the fp32 oracle
+        mo, ml = _check([(oo[:, lo:hi], ll[:, :, lo:hi]) for oo, ll in outs_f], ref_og, ref_lse)
+        max_o, max_lse = max(max_o, mo), max(max_lse, ml)
+    print(
+        f"\nTHD gate {name} {dtype}: lens_q {p['lens_q']} lens_kv {p['lens_kv']}: vs oracle gated max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} "
+        f"(ungated run {max_o_u:.5f} / {max_lse_u:.6f}); vs unfused-then-gated max|d| {max_d:.4e} = {max_ulp:.3f} ulp ({n_off} of {d.numel()} "
+        f"live elements differ); dead rows {int(dead.sum())}; capacity tail {T - t_live} rows untouched"
     )
 
 
