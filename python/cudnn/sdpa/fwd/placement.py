@@ -110,8 +110,8 @@ the 72-case random hold-out that found it).
 
 SM107 half uses the shared paged/nonpaged native THD split selectors and the
 measured packed-GQA paged prefill contract. Selected native splits retain
-priority; other eligible graphs retain the backend first. Quantized Rubin rows
-remain opt-in. Qualification and timing evidence are maintained internally.
+priority; other eligible graphs retain the backend first. The per-tensor FP8
+Rubin row remains opt-in. Qualification and timing evidence are maintained internally.
 
 - dense d128 half (the d64 envelope included) decode / verify WITH an attention sink, bottom-right
   causal ``1 <= s_q <= 16`` or mask-free ``s_q == 1``, GQA 4 / 8 / 16, ``b * h_kv >= 32`` units, caches
@@ -135,7 +135,51 @@ remain opt-in. Qualification and timing evidence are maintained internally.
   window: GPT-OSS d64 SWA 0.45-0.68 but only two cells; GQA 2 / 32, MHA, partial groups, caches past
   16k, fewer units) the backend keeps the lead until measured.
 
-Rows with no measurement (SM80, mxfp8) keep the historical order (LEAD); they are still
+SM107 MXFP8 row (``sdpa_fwd_prefill_sm107_mxfp8``, offered by default since 2026-10): LEAD on exact
+cc 10.7 for every graph the row admits -- dense BSHD, exact d128 / d192x128 / d256 / d512, E4M3 / E5M2
+in, half / FP8 / block-scaled O, every mask, sink, Stats on or off, ``s_q >= 1`` on the prefill bodies.
+A qualification verdict, not a per-shard timing one: the backend's cc 10.7 MXFP8 engines are not a
+qualified alternative. (1) Their Amax_O is wrong on dense MXFP8 graphs (``BACKEND_AMAX_O_ISSUE`` in
+test/python/sdpa/fp8.py, cuDNN 9.26.0.51). (2) Their planner crashes the process (SIGSEGV inside the
+C++ plan creation -- the ``create_execution_plans`` heuristics query and the explicit
+``create_execution_plan(engine_id, knobs)`` engine-config path alike -- after lowering, validate and
+build_operation_graph completed) while planning any single-query MXFP8 graph without a sink token: dense
+BSHD and BHSD and THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128 / 2048 / 4096,
+batch 1 / 2 / 4 -- every d128 contract of the detector's 21-contract matrix, measured on a 216-SM cc 10.7
+board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink makes them plan, and d192x128 / d256 / d512
+and paged pools decline cleanly there; on cuDNN 9.28.0 (the cc 10.7 CI lane) the heuristics plan every
+contract but building the backend's BHSD single-query plan kills the process instead, so no build is clean yet;
+``sdpa/fwd/backend_guard.py`` keeps the backend out of planning on that domain on every known build (the
+detector re-measures the whole matrix through plan, check_support and build on every run of that lane), and
+an explicit backend pin there is a typed decline. (3) Their d256 and d512
+MXFP8 plans are offered but fail to build on both engines (NVRTC
+``CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED``, same board, 9.26.0.51 and 9.27.0.28), so without
+this row those two flavors have no provider on cc 10.7. Timing is evidence, not the criterion -- measured
+2026-10-08 on that board (cuDNN 9.26.0.51; every plan of the flag-less [A, FALLBACK] list on a fresh graph,
+CUDA-graph replay, 7 interleaved rounds of 50 replays after an L2 flush, SM clock 2364-2424 MHz unless
+noted, median us; the harness numerics checks passed on every FROST plan and on every backend plan except
+where Amax_O is named):
+  B2 H8/2 S4096 d128 dense, bf16 O ........ FROST 49.6 vs eng16 49.0 (1.01x)
+  B2 H8/2 S4096 d128 causal ............... FROST 37.6 (LPT_L2; LPT 35.6) vs eng16 30.0 (1.25x)
+  B2 H8/2 S4096 d128 Stats, e4m3 O ........ FROST 52.2 vs eng16 50.5 (1.03x)
+  B2 H8/2 S4096 d192x128 causal, sink ..... FROST 38.2 vs eng16 31.1 (1.23x)
+  B1 H16/4 S8192 d256 causal .............. FROST 125.0; neither backend plan builds (defect 3)
+  B2 H8/8 S4096 d512 dense ................ FROST 92.1; neither backend plan builds (defect 3)
+  B4 H8/2 S_q 1 KV2048 d128 ............... FROST 16.1; the backend is not consulted (defect 2)
+  B4 H8/2 S_q 1 KV2048 d128, sink ......... FROST 16.0 vs eng3 20.0 (0.80x; eng3 reports Amax_O = 0, defect 1), eng16 16.8
+  B64 H8/2 S_q 1 KV4096 d128, sink ........ FROST 113.3 vs eng3 81.5 / eng16 70.1 (1.39x / 1.62x)
+  B128 H32/8 S_q 1 KV2048 d128, sink ...... FROST 766.8 vs eng3 423.3 / eng16 375.8 (1.81x; board at 2256 MHz and falling)
+  B64 H8/2 S_q 8 KV4096 d128 .............. FROST 114.2 vs eng3 81.6 / eng16 69.9 (1.40x / 1.63x)
+  B64 H8/2 S_q 8 KV4096 d128 causal-BR, sink  FROST 129.3 (NATURAL 122.5) vs eng16 91.7 (1.41x)
+Prefill shapes sit at parity to 1.25x of the backend's pick; decode-shaped graphs (S_q <= 8 at large batch)
+run the row's 512-row 2-CTA prefill tile with 1..8 live rows and trail the backend's decode-shaped engines
+by 1.4-1.8x where those plan at all (with a sink token; without one the backend's planner crashes). The
+lead stays a qualification verdict (FROST-first; the backend's plans carry defects 1-3): the gap is a
+kernel follow-up -- an MXFP8 decode tile for cc 10.7, recorded in SUPPORT_MATRIX_TRACKER.md's gaps table
+-- not a backend-relative placement rule. Devices other than exact cc 10.7 (10.8-11.9 are in the row's
+arch range) TRAIL until measured.
+
+Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
 
@@ -215,12 +259,15 @@ def place(spec, facts) -> str:
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
     their measured shard table. The SM107 half row leads for a selected native THD split,
-    qualified packed paged prefill, or dense d128 decode / verify with an attention sink
-    inside its measured band. Every unmeasured row (SM80,
-    mxfp8) keeps the historical order -- those stay opt-in, so the order is only
+    qualified packed paged prefill, or dense d128 decode / verify with an attention sink inside its
+    measured band; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it admits (a
+    qualification verdict, module docstring). Every unmeasured row (SM80, SM100 mxfp8, the fp8 rows of
+    SM107 / SM120) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm107":
         return _place_sm107_f16(spec.capabilities, facts)
+    if spec.name == "sdpa_fwd_prefill_sm107_mxfp8":
+        return _place_sm107_mxfp8(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm100":
         return _place_sm100_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm120":
@@ -288,6 +335,17 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     ):
         return LEAD
     return TRAIL
+
+
+def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
+    """LEAD on exact cc 10.7 for every graph the row admits; TRAIL on any other device.
+
+    A qualification verdict, not a per-shard timing one (module docstring, "SM107 MXFP8 row"): the
+    backend's cc 10.7 MXFP8 engines are not a qualified alternative.  Eligibility stays with
+    ``engines.mismatch`` (dense BSHD, exact native head dims; THD / paged / split / PackGQA decline
+    there) -- nothing is admitted here.  The row's arch range reaches cc 11.9 (``sm_hi``); any part other
+    than the one it was qualified on trails, as the half row does."""
+    return LEAD if facts.device_cc == (10, 7) else TRAIL
 
 
 def _place_sm100_fp8(caps: Capabilities, facts) -> str:

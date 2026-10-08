@@ -282,3 +282,37 @@ def test_the_armed_gate_announces_itself_once_per_test_process():
     out = child.communicate(timeout=900)[0]
     assert child.returncode == 0, out[-2000:]
     assert out.count("[mem-gate] armed by CUDNN_TEST_SHARED_GPU=1") == 1, out[-2000:]
+
+
+# ---- the measured channel (frost_routing.measured -> the controller's terminal summary)
+
+
+@pytest.mark.parametrize("workers", ["0", "2"], ids=["one_process", "xdist"])
+def test_a_measurement_reaches_the_controllers_summary(workers):
+    """frost_routing.measured(key, text) is printed under "measured" in the run's terminal summary -- from the single process and,
+    aggregated through the per-run directory, from an xdist worker -- while the test that took it PASSES (its captured stdout is
+    not in the log).  The child module lives under test/python so this tree's conftest governs it; it is removed afterwards."""
+    tag = f"{os.getpid()}_{workers}"
+    folder = os.path.join(_HERE, f".measured_pin_{tag}")
+    os.makedirs(folder, exist_ok=True)
+    module = os.path.join(folder, "test_measured_pin.py")
+    try:
+        with open(module, "w") as f:
+            f.write(
+                "import frost_routing\n"
+                "import pytest\n"
+                "pytestmark = pytest.mark.L0\n"
+                "def test_records_a_measurement():\n"
+                f"    frost_routing.measured('pin {tag}', 'alpha=crash   beta=planned(3)\\n  gamma=declined')\n"
+                "    print('CAPTURED STDOUT OF A PASSING TEST')\n"
+            )
+        child_env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_XDIST_") and k != "CUDNN_TEST_RUN_ID"}
+        cmd = [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", "-p", "no:cacheprovider", "-p", "no:randomly", "-n", workers, module]
+        child = subprocess.Popen(cmd, cwd=_HERE, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        out = child.communicate(timeout=900)[0]
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    assert child.returncode == 0 and "1 passed" in out, out[-3000:]
+    assert re.search(r"^=+ measured =+$", out, re.M), f"no 'measured' section:\n{out[-3000:]}"
+    assert f"  pin {tag}: alpha=crash beta=planned(3) gamma=declined" in out, out[-3000:]  # one line, whitespace collapsed
+    assert "CAPTURED STDOUT OF A PASSING TEST" not in out, "the channel exists because this line is NOT in the log"
