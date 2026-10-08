@@ -450,3 +450,41 @@ def test_d128_thd_grid_bound_matches_all_ragged_partitions(batch, max_q, group):
         bounded = replace(facts, max_total_seq_len_q=total)
         assert heur._d128_thd_split_units(bounded, group) == worst
     assert heur._d128_thd_split_units(facts, group) == worst
+
+
+@requires_dsl
+@pytest.mark.parametrize(
+    "row,device_cc,sm_count,dtype",
+    [
+        ("sdpa_fwd_prefill_sm120", (12, 0), 188, cudnn.data_type.BFLOAT16),
+        ("sdpa_fwd_prefill_sm120_fp8", (12, 0), 188, cudnn.data_type.FP8_E4M3),
+        ("sdpa_fwd_prefill_sm100", (10, 0), 148, cudnn.data_type.BFLOAT16),
+    ],
+)
+def test_split_chooser_receives_the_row_cost_profile(monkeypatch, row, device_cc, sm_count, dtype):
+    """SM120 half hands its own split floor/coefficient to the shared chooser; FP8 and other rows keep the defaults."""
+    spec = next(s for s in ENGINE_SPECS if s.name == row)
+    seen = []
+    real = heur.choose_split_kv
+    monkeypatch.setattr(heur, "choose_split_kv", lambda **kw: seen.append(kw) or real(**kw))
+    heur._knob_sets(
+        spec,
+        _facts(
+            b=1,
+            h_q=8,
+            h_kv=1,
+            s_q=4,
+            s_kv=8192,
+            causal=True,
+            bottom_right=True,
+            device_cc=device_cc,
+            device_sm_count=sm_count,
+            dtype=dtype,
+            is_fp8=dtype == cudnn.data_type.FP8_E4M3,
+        ),
+    )
+    assert seen
+    sm120 = row == "sdpa_fwd_prefill_sm120"
+    for kw in seen:
+        assert kw.get("min_tiles") == (heur._SM120_SPLIT_KV_MIN_TILES if sm120 else None)
+        assert kw.get("combine_floor") == (heur._SM120_SPLIT_KV_COMBINE_FLOOR if sm120 else None)
