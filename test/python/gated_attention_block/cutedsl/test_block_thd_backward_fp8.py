@@ -750,17 +750,20 @@ def _packed_view_of_dense(name: str, ten: torch.Tensor) -> torch.Tensor:
 
 
 @requires_rubin
-def test_thd_fp8_uniform_b4_bwd_matches_the_dense_fp8_block_per_sequence():
-    """Uniform ``B = 4`` packed ``(128,)*4`` against the dense ``B=4, S=128`` fp8 backward over the SAME bytes (the e4m3 inputs, the
-    QuantSpec, the dy, the packed run's calibrated ``scale_dp``) -- the SPLIT pin: the token-wise stages BITWISE (the record's
-    ``proj_slab`` / ``rstd``; the backward's ``dy8``, the gated ``dO``, ``do8``, the recomputed ``q8 / k8 / v8``: the same launches
-    over the same tokens), the SDPA-derived ones REPORTED in stage order with the first difference named (the packed forward runs
-    the padded-mask arm and the packed chain walks a per-sequence kv-blocked workspace: ``O`` / ``LSE`` / ``out``, hence ``og8`` /
-    ``dG`` / the delta, then ``dq / dk / dv`` and ``dqkvg / dqkvg8``), and the gradients ``dh / dw_qkvg / dw_o`` against the dense
-    block's in the dense suite's row-budgeted form (kernel vs kernel: the (M) budget ``1e-5 x rows x keys``, ``dW_norm`` printed).
-    The packed arm also runs the matrix cell's whole per-sequence chain at this shape -- ``B*H > 1`` with ``n_kv == 1`` on EVERY
-    sequence, the phase-drift shape of the invariants."""
-    s, b = 128, 4
+@pytest.mark.parametrize("s", [128, 256], ids=["one_tile_each", "two_q_tiles_each"])
+def test_thd_fp8_uniform_b4_bwd_matches_the_dense_fp8_block_per_sequence(s):
+    """Uniform ``B = 4`` packed ``(s,)*4`` against the dense ``B=4, S=s`` fp8 backward over the SAME bytes (the e4m3 inputs, the
+    QuantSpec, the dy, the packed run's calibrated ``scale_dp``) at ``s = 128`` (one q tile and one kv block per sequence: the
+    ``B*H > 1`` with ``n_kv == 1`` shape of the invariants) and ``s = 256`` (two q tiles per sequence under the per-sequence stage-3
+    trim) -- the SPLIT pin: the token-wise stages BITWISE (the record's ``proj_slab`` / ``rstd``; the backward's ``dy8``, the gated
+    ``dO``, ``do8``, the recomputed ``q8 / k8 / v8``: the same launches over the same tokens), the SDPA-derived ones REPORTED in
+    stage order with the first difference named -- ``O`` / ``LSE`` / ``out``, the O-dependent ``og8`` / ``dG`` / delta (asserted
+    bitwise whenever the two forwards' O is), then ``dq / dk / dv`` and ``dqkvg / dqkvg8``: whether the packed chain's per-sequence
+    trim and bounded fold reorder anything against the dense chain is MEASURED here, never assumed -- and the gradients ``dh /
+    dw_qkvg / dw_o`` against the dense block's in the dense suite's row-budgeted form (kernel vs kernel: the (M) budget ``1e-5 x
+    rows x keys``, ``dW_norm`` printed).  The pin keeps the split form by convention: a reordering is a reported difference, a
+    budget miss a finding.  The packed arm also runs the matrix cell's whole per-sequence chain at each shape."""
+    b = 4
     res = _backward_fp8_thd((s,) * b, causal=True, h_kv=2)
     g, t = res.geom, b * s
     d = _dense_fp8_run(res, b, s)
@@ -800,11 +803,11 @@ def test_thd_fp8_uniform_b4_bwd_matches_the_dense_fp8_block_per_sequence():
     for name, ten in res.grads.items():
         if ten is not None:
             assert torch.isfinite(ten.float()).all() and torch.isfinite(d.grads[name].float()).all(), name
-    _assert_m_row_budgeted("thd fp8 uniform (128,)*4 vs the dense B=4 fp8 block", res, ref_d)
+    _assert_m_row_budgeted(f"thd fp8 uniform ({s},)*4 vs the dense B=4 fp8 block", res, ref_d)
     # the packed arm under the matrix cell's whole chain at this shape
     v = _assert_quantizers_scalars_delta_bitwise(res)
     _assert_sdpa_stage_per_sequence(res, v)
-    tag = "thd fp8 (128, 128, 128, 128) causal h_kv=2"
+    tag = f"thd fp8 {(s,) * b} causal h_kv=2"
     _assert_m_row_budgeted(f"{tag} (M)", res, _oracle_m_packed(res))
     _assert_seeded_under_the_bf16_bound(tag, res, _oracle_m_packed(res, seeded=True), v)
 
@@ -943,7 +946,9 @@ def test_thd_fp8_cuda_graph_replay_with_new_lengths_and_scale():
     ``scale_dp`` (the new packing's calibrated one) written through the captured scalar equals a fresh eager backward over it and
     is finite: the setup kernel rebuilds the packed metadata per execute from the device lengths, the prologue's scalar init, the
     amax passes and the quantize publishes are device work.  The new packing then passes the per-sequence layers (the quantizers /
-    scalars / delta bitwise, the SDPA stage per sequence under the row recipe, the (M) row budget)."""
+    scalars / delta bitwise, the SDPA stage per sequence under the row recipe, the (M) row budget); a last replay at the DOUBLED
+    ``scale_dp`` through the same captured scalar equals eager at that scale (the scalar is read live even where the new packing's
+    calibrated value coincides with the old one)."""
     res = _backward_fp8_thd(_LENS, memo=False)
     blk, inp, saved, dy, g, meta = res.blk, res.inp, res.saved, res.dy, res.geom, res.meta
     sdp = res.scale_dp_t.clone()
@@ -1021,6 +1026,20 @@ def test_thd_fp8_cuda_graph_replay_with_new_lengths_and_scale():
         v = _assert_quantizers_scalars_delta_bitwise(res2)
         _assert_sdpa_stage_per_sequence(res2, v)
         _assert_m_row_budgeted(f"thd fp8 graph replay over the new packing {new_lens} (M)", res2, _oracle_m_packed(res2))
+        # the captured scalar is live even where the calibrated value coincides: the doubled scale_dp through the same pointer
+        sdp.fill_(new_scale * 2.0)
+        ws.fill_(0xFF)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref2 = _alloc_grads(blk, fill=float("nan"))
+        ws_ref2 = torch.empty_like(ws).fill_(0xFF)
+        _execute_fp8(blk, inp, saved, dy, ref2, ws_ref2, scale_dp=_dev_scalar(new_scale * 2.0))
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.isfinite(ten.float()).all() and torch.equal(ten, ref2[name]), f"{name}: the replay at the doubled scale_dp differs from eager"
+        assert torch.equal(_scalar_block(blk, ws), _scalar_block(blk, ws_ref2)), "the scalar block differs between the replay at the doubled scale_dp and eager"
     finally:  # a graph left to the cyclic GC resets itself inside a later test's capture
         graph.reset()
 
