@@ -243,7 +243,11 @@ def _eligible_graph(chain: FusionChain, profile: "CostProfile") -> bool:
     if chain.ops or chain.aux_tensors:
         if not profile.scalar_scale_epilogue_ok:
             return False
-        if not all(op.op == "mul" for op in chain.ops):
+        # Each op must be a scalar-scale MUL consuming an aux constant: a fan-in
+        # mul (both operands in-chain, no aux) multiplies two chain values and
+        # is not a constant epilogue, so it would break the equal-cost-per-
+        # candidate assumption this relaxation rests on.
+        if not all(op.op == "mul" and op.aux is not None and op.parent_idx_b is None and op.parent_idx_c is None for op in chain.ops):
             return False
         if not all(getattr(t, "bcast_mode", None) == "scalar" for t in chain.aux_tensors):
             return False
@@ -291,6 +295,13 @@ def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DevicePr
     candidates = {baseline: None}
     for swapped, view in ((False, chain), (True, swap_ab(chain))):
         mm = view.matmul
+        if swapped and mm.a_major != "k":
+            # Swapping an n-major-B graph yields an m-major A, which the warp-
+            # scoped kernels do not serve: every such candidate would fail the
+            # probe. Skip the orientation instead of generating doomed picks.
+            # Strict-gate graphs (B k-major) always swap to a k-major A, so
+            # existing architectures never take this branch.
+            continue
         auto = (
             select_config(
                 mm.M,
