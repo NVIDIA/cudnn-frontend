@@ -401,8 +401,9 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined,
   typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor; stage (5) runs as its own launch), the fully
   fused quantized pipelines (`fuse_gate` again, and the fused MXFP8 projection fork decodes `(b, s_tile)` once per
-  128-row GEMM tile, which a packed tile may straddle), the MXFP8 block BACKWARD over a packed record (the row's packed
-  chain takes no external delta yet).
+  128-row GEMM tile, which a packed tile may straddle), the MXFP8 block BACKWARD over a packed record (its SDPA-layout MX
+  quantize stages run the quantizer's dense arm only; the packed record and the packed delta exist, the packed MXFP8
+  backward is a follow-up).
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
 
@@ -756,8 +757,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
-  `fuse_gate`, the fully fused quantized pipelines, `fuse_gate_bwd`, the quantized backwards over a packed record, the
-  packing knobs on a dense block.
+  `fuse_gate`, the fully fused quantized pipelines, the quantized backwards over a packed record, the packing knobs on a
+  dense block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above), the fp4
   modes of the MXFP8 pipeline included; the fully fused quantized pipelines are inference only. The backward is bf16 / fp16

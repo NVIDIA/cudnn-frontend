@@ -401,8 +401,10 @@ is the launch order):
   and the workspace delta are below and in :meth:`GatedAttentionBlockBwd.get_workspace_size`.
 
 Declined (typed, naming the attribute) on top of the fp8 arm's: an e5m2 ``dtype``,
-``thd=True`` with an MxQuantSpec (dense-only: the row's packed chain takes no external
-delta yet; the packed MXFP8 training record the forward writes awaits that arm),
+``thd=True`` with an MxQuantSpec (dense-only: the backward's SDPA-layout MX quantize
+stages run the quantizer's dense arm only -- its packed per-sequence scale-factor arm is
+not wired into them yet, while the packed MXFP8 training record the forward writes and
+the packed head-major delta both exist; the packed MXFP8 backward is a follow-up),
 ``B*S % 32 != 0`` when a projection weight
 gradient is requested, ``scale_dp`` / ``scale_do`` / ``scale_dqkvg`` at ``execute``, an
 artifact given without its need or a need without its artifact, a ``.t()``-view
@@ -3402,8 +3404,8 @@ class _SdpaBwdMxfp8(_Stage):
 
     Declared with ``deterministic=False`` (the row declines ``True``), ``seq_kv_lens_present=False`` (the block declines
     padding first), the geometry's masks exactly as :class:`_SdpaBwd` maps them.  Dense only: the MXFP8 block backward
-    declines ``thd`` at declaration (no packed MXFP8 training record exists, and the SDPA-layout MX quantizes have no packed arm;
-    the per-tensor fp8 sibling :class:`_SdpaBwdFp8` serves the packed record).
+    declines ``thd`` at declaration (its SDPA-layout MX quantizes run the quantizer's dense arm only; the packed MXFP8 training
+    record exists, the packed MXFP8 backward is a follow-up; the per-tensor fp8 sibling :class:`_SdpaBwdFp8` serves the packed record).
     """
 
     name = "sdpa_bwd_mxfp8"
