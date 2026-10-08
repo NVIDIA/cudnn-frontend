@@ -1143,9 +1143,17 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
                     sfk_pages[slot_k] = 0xFF
                     sfv_groups[:, slot_v * h_v * m : (slot_v + 1) * h_v * m] = 0xFF
         if getattr(cfg, "paged_nhd_pool", False):
-            # NHD pools: the same [num_pages, H_kv, page, D] dims over (page, head)-major storage (generate_graph_fwd's strides).
-            k_pool_fp8 = k_pool_fp8.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
-            v_pool_fp8 = v_pool_fp8.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+            # NHD pools: the same [num_pages, H_kv, page, D] dims over (page, head)-major storage -- EXACTLY the strides
+            # generate_graph_fwd declares.  Built explicitly rather than by .permute().contiguous(): at H_kv == 1 torch treats
+            # the permuted view as already contiguous (no copy), the pool would keep its HND strides, and the native pool
+            # binder rejects a binding whose strides disagree with the NHD declaration (even on a size-1 head axis).
+            def _to_nhd(pool):
+                nhd = torch.empty((pool.shape[0], pool.shape[2], pool.shape[1], pool.shape[3]), dtype=pool.dtype, device=pool.device).permute(0, 2, 1, 3)
+                nhd.copy_(pool)
+                return nhd
+
+            k_pool_fp8 = _to_nhd(k_pool_fp8)
+            v_pool_fp8 = _to_nhd(v_pool_fp8)
     else:
         k_fp8_d, sf_k_d_ref, sf_k_d_swizzle, k_fp8_s, sf_k_s_ref, sf_k_s_swizzle = quantize_to_mxfp8(k_f32, b, h_k, s_kv, d_qk, block_size, torch_itype, with_ref=not perf)
         v_fp8_d, sf_v_d_ref, sf_v_d_swizzle, v_fp8_s, sf_v_s_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_f32, b, h_v, s_kv, d_vo, block_size, torch_itype, with_ref=not perf)
