@@ -1096,7 +1096,8 @@ def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE
     token units of ``N // pack_g`` consecutive tokens a (head group, batch,
     split) may be cut into (the kernel's ``Q_TOKEN_UNITS`` axis: each unit
     streams the KV range once more, so a line admits it only where it measured
-    the trade -- 1 everywhere but the Rubin MTP form).  The rule: rows that fit
+    the trade -- 1 everywhere but cc 10.7, which measured the 24/2 MTP form and
+    admits two units for every packed group the tile holds).  The rule: rows that fit
     the 16-column tile ride it in one unit (the KV streamed once, the cheapest
     per-CTA stream); past 16 rows the 32-column tile serves
     ``ceil(s_q / (32 // pack_g))`` units when that count is within the cap and

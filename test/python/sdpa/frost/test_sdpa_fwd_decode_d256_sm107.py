@@ -842,6 +842,50 @@ def test_decode_graph_mtp_32_2_rides_the_32_column_tile_in_one_unit():
 
 
 @_gpu
+@pytest.mark.parametrize("page", [0, 16], ids=["dense_padded", "page16_HND"])
+@pytest.mark.parametrize(
+    ("H", "KH", "s_q", "facts"),
+    [(8, 1, 6, (32, 8, 4, 32, True, 8, 10)), (12, 2, 10, (32, 6, 5, 30, True, 8, 10)), (4, 4, 24, (32, 1, 32, 32, True, 8, 10))],
+    ids=["8to1_sq6_two_units_half_filled", "12to2_sq10_two_units_tail_rows", "mha_sq24_one_wide_unit"],
+)
+def test_decode_graph_token_units_at_the_other_geometries_inside_the_route(H, KH, s_q, facts, page):
+    """The route admits more geometries than the 24/2 steps the MTP perf table measured, and each
+    class needs a GPU cell of its own: 8:1 at S_q = 6 (G = 8 divides the tile: two units of four
+    tokens x 8 heads, the second half-filled, no tail rows -- the liveness guard folds out), 12:2 at
+    S_q = 10 (G = 6: two units of five tokens x 6 heads with TWO zero tail rows per unit -- the
+    tail-row liveness guard's second instance: rows 30 / 31 of unit 0 alias unit 1's first token on
+    heads 0 / 1) and an MHA bottom-right step of 24 tokens (one unit of the 32-column tile, unpacked,
+    24 live rows), over a dense padded and a paged cache with per-batch Q lengths below S_q (the
+    trim across the units; for the two-unit cases one sequence's second unit lies entirely past its
+    Q length and must write O := 0 / LSE := -inf).  Correctness only -- these forms are the same tile
+    with the same stream count per group as the measured 24/2 form, but their perf is not in the
+    table.  The per-batch Q lengths bind the shared no-split rule (unsplit)."""
+    cap = {}
+    plan = _run_graph(
+        B=3, H=H, KH=KH, s_q=s_q, lens=[700, 130, 5], q_lens=[s_q, max(1, s_q - 1), 1], page=page, hnd=True, causal_br=True, dtype=torch.bfloat16, capture=cap
+    )
+    _assert_decode_tile_plan(plan, G=H // KH)
+    assert (plan.knobs.split_kv or 1) == 1, plan.knobs
+    assert _mtp_module_facts(cap["module"]) == facts, _mtp_module_facts(cap["module"])
+
+
+@_gpu
+@pytest.mark.parametrize(("H", "KH", "s_q"), [(8, 1, 6), (12, 2, 10)], ids=["8to1_sq6", "12to2_sq10"])
+def test_decode_graph_token_units_at_the_other_geometries_split_in_token_units(H, KH, s_q):
+    """The split forms of the two-unit geometries above over pages (the form the split rules
+    admit): the plan is packed on the 32-column tile and its split is the decode model's at the
+    token-unit geometry -- B x KH head groups x 2 units, the 32-column tile's cost -- the fp32
+    partials of every token unit (the G = 6 units with their tail rows included) recombined by the
+    shared combine against the reference; pinned to split 4 when the model picks unsplit."""
+    units = 2 * KH * 2
+    plan = _run_graph(B=2, H=H, KH=KH, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16)
+    _assert_decode_tile_plan(plan, G=H // KH, units=units, kv_tiles=32, q_tile=32)
+    if (plan.knobs.split_kv or 1) == 1:
+        plan = _run_graph(B=2, H=H, KH=KH, s_q=s_q, lens=[4000, 1000], page=16, causal_br=True, dtype=torch.bfloat16, split_kv=4)
+        assert (plan.knobs.split_kv or 1) == 4, plan.knobs
+
+
+@_gpu
 def test_decode_graph_sliding_window_bottom_right():
     """Sliding window (left bound) on the bottom-right diagonal, S_q = 1, packed 16:1."""
     _assert_decode_tile_plan(_run_graph(B=2, H=32, KH=2, s_q=1, lens=[700, 130], page=16, causal_br=True, window_left=200), G=16)

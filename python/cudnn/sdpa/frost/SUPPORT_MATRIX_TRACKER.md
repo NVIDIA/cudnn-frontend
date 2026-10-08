@@ -1170,10 +1170,19 @@ units), the split forms at the token-unit geometry, the 32/2 step at `S_q = 2`; 
 == four single-token units of the 16-column tile == the unpacked form BITWISE** (O and LSE), **paged
 == dense bitwise** across the units; the token-unit axis driven at the template level too (two
 units of the 32-column tile, four of the 16-column one, a half-filled second unit at `S_q = 3`,
-unsplit and split 2). The measured form (Rubin cc 10.7, 212 SMs, lock 2376, the MTP table of
-the dense-decode PR): the two-unit 32-column form against the prefill body, the pre-route lead
-(the tile unpacked) and the single-token-unit 16-column form at `B` in {1, 4, 32}, `S_q` in {2, 4},
-the vLLM / SGLang recipe shape (`B = 4`, `next_n = 4`) among the cells.
+unsplit and split 2); the other geometries inside the route -- two token units at `G = 8` (8:1 at
+`S_q = 6`, the second unit half-filled, no tail rows) and at `G = 6` (12:2 at `S_q = 10`, two zero tail
+rows per unit: the tail-row liveness guard's second instance), an MHA bottom-right step of 24 tokens
+in one unit of the 32-column tile -- with per-batch Q lengths below `S_q` (one unit entirely past a
+sequence's Q length), dense padded and paged, and the two-unit ones split by the decode model. The
+measured form (Rubin cc 10.7, 212 SMs, lock 2376, the MTP table of the dense-decode PR): the
+two-unit 32-column form against the prefill body, the pre-route lead (the tile unpacked) and the
+single-token-unit 16-column form at `B` in {1, 4, 32}, `S_q` in {2, 4}, the vLLM / SGLang recipe
+shape (`B = 4`, `next_n = 4`) among the cells. **Measured at the 24/2 geometry only**: the other
+geometries inside the route (an unpacked / MHA step of 17-32 tokens, packed groups at `G != 12` in
+one or two units) are the same tile with the same stream count per (head group, batch, split) and
+carry the correctness cells above, but no perf cell yet -- one per class is owed to the
+dense-decode PR table before any of them is quoted.
 
 ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
 FP8 E4M3; `python/cudnn/sdpa/bwd/api_dsl_sm107.py`, kernels

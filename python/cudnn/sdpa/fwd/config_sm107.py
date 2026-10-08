@@ -1571,10 +1571,17 @@ _D256_DECODE_FLAVOR = "sm107 d256 decode"
 #   * a PACKED group may be cut into up to two TOKEN UNITS of the 32-column tile (the kernel's Q_TOKEN_UNITS
 #     axis: S_q = 4 at 24/2 = two units of two tokens x 12 heads, each streaming the KV range once -- 2x the
 #     KV bytes of a single stream), the MTP step of the 24/2 and 32/2 geometries (S_q <= 4).
-# MEASURED on cc 10.7 (212 SMs, the two-unit 32-column form against the prefill body and against the 16-column
-# tile in four single-token units at B in {1, 4, 32}; test_sdpa_fwd_decode_d256_sm107.py pins the rule and the
-# forms' agreement): the routed envelope is exactly what was measured; past it (a third token unit, an unpacked
-# step above 32 tokens, a group wider than the tile) the d256 prefill kernel serves the graph as before.
+# MEASURED on cc 10.7 (212 SMs) at the 24/2 geometry ONLY -- G = 12: the one-unit 32-column form at S_q = 2 and
+# the two-unit form at S_q = 3 / 4, against the prefill body and against the 16-column tile in single-token
+# units, B in {1, 4, 32}, S_kv 2K..128K.  The envelope is WIDER than that: an unpacked / MHA step of 17-32
+# tokens and a packed group with 16 < S_q x G <= 32 at G != 12 ride one unit of the 32-column tile, and a packed
+# group with ceil(S_q / (32 // G)) = 2 at G in {2, 4, 6, 8, 16, 32} two units of it -- all UNMEASURED on a perf
+# GPU, routed by the same rule because each is the same tile with the same stream count per (head group, batch,
+# split) as the measured form (the byte model does not see G), and each class has a GPU correctness cell in
+# test_sdpa_fwd_decode_d256_sm107.py (the rule, the forms' agreement, the two-unit forms at G = 8 and at G = 6
+# with tail rows, an MHA step of 24 tokens).  A perf cell per class is owed before any of them is quoted.  Past
+# the envelope (a third token unit, an unpacked step above 32 tokens, a group wider than the tile) the d256
+# prefill kernel serves the graph as before.
 D256_DECODE_ROUTED_MAX_Q_ROWS = D256_DECODE_MAX_Q_ROWS
 D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2
 

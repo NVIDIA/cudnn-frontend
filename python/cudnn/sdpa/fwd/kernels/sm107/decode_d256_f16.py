@@ -35,9 +35,10 @@ one (2.8 vs 1.75 us; 90 us unsplit at b=32 x 2 KV heads x 4096 keys where the
 prefill tile takes 66 us), so the Blackwell adapter compiles and tests it at
 the template level but does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
 the Rubin adapter ROUTES it (config_sm107.decode_d256_q_tile, measured on cc 10.7
-against the prefill body): rows in (16, 32] in one unit, and a packed MTP step
-of up to four tokens (24/2: 48 rows) as TWO token units of two tokens x 12 heads
-on the 32-column tile, each streaming the KV range once.
+against the prefill body at the 24/2 geometry; the other geometries inside the
+route ride the same rule unmeasured): rows in (16, 32] in one unit, and a packed
+MTP step of up to four tokens (24/2: 48 rows) as TWO token units of two tokens x
+12 heads on the 32-column tile, each streaming the KV range once.
 P^T is stored to a small swizzled SMEM tile (the B operand of BMM2 is
 MN-major: the N_Q values of one key are contiguous), V is consumed in place
 as an MN-major A operand (d_v contiguous), and O^T accumulates in TMEM with

@@ -36,7 +36,8 @@ prefill tile takes 66 us), so it compiles and is tested at the template level
 but the Blackwell adapter does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
 its per-CTA issue rate is the open kernel item here.  The Rubin sibling
 (sm107/decode_d256_f16.py) IS routed onto it, in up to two TOKEN UNITS for a
-packed MTP step (config_sm107.decode_d256_q_tile, measured on cc 10.7).
+packed MTP step (config_sm107.decode_d256_q_tile, measured on cc 10.7 at the
+24/2 geometry; the other geometries inside that route ride the rule unmeasured).
 P^T is stored to a small swizzled SMEM tile (the B operand of BMM2 is
 MN-major: the N_Q values of one key are contiguous), V is consumed in place
 as an MN-major A operand (d_v contiguous), and O^T accumulates in TMEM with
