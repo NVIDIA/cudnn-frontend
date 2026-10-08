@@ -556,6 +556,12 @@ def _sentinel(dtype):
     return 1.5e30 if dtype == torch.bfloat16 else 6.0e4  # f16 cannot hold 1.5e30; no attention output reaches 6e4
 
 
+def _stored_sentinel(dtype) -> float:
+    """The sentinel AS THE OUTPUT DTYPE STORES IT: 1.5e30 is not a bf16 value (it lands at 1.4954e30), so a detector that
+    compares the output against the Python float never fires on bf16 -- compare against the rounded value instead."""
+    return float(torch.full((), _sentinel(dtype), dtype=dtype).float())
+
+
 def _inputs(B, S, H, KH, dtype, seed=0, SKV=None):
     dev = torch.device("cuda")
     SKV = S if SKV is None else SKV
@@ -605,11 +611,11 @@ def _check(outs, ref_o, ref_lse):
     """The standard assertions of every cell: finite, no sentinel on a live row, dead rows exact, within the budget on live
     rows, two launches bitwise.  Returns (max|dO|, max|dLSE| over live rows)."""
     (o, lse), *rest = outs
-    sent = _sentinel(o.dtype)
+    sent, sent_o = _sentinel(o.dtype), _stored_sentinel(o.dtype)
     of = o.float()
     dead = torch.isinf(ref_lse)  # [B, H, S]
     assert torch.isfinite(of).all(), "non-finite O"
-    assert not (of == sent).any(dim=-1).any(), "a sentinel survived on an output row"
+    assert not (of == sent_o).any(dim=-1).any(), "a sentinel survived on an output row"
     assert not (lse == sent).any(), "a sentinel survived in LSE"
     if dead.any():
         assert torch.isinf(lse[dead]).all() and (lse[dead] < 0).all(), "a dead row's LSE must be -inf exactly"
