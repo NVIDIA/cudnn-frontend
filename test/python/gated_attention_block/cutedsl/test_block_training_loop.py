@@ -27,12 +27,30 @@ What is pinned here:
   ``grad_scale_from_amax(amax, 2)`` bitwise and NOT the margin-0 value, and the default-margin block is bitwise a block declared
   without the attribute.
 
-Accept tests are ``requires_rubin`` (the block targets SM107 only); the refusal tests carry no marker and run on any CUDA device.
-The training-loop tests over the toy decoder join this module next to the pins above.
+And the TRAINING LOOP over the toy decoder of ``gated_block_train`` (the convergence harness core, a tracked helper of this directory):
+
+* the bf16 block as the attention layer of a small decoder vs the pure-torch reference model from one seed: the step-0 master
+  gradients of ``W_qkvg`` / ``W_o`` of every layer within the bf16 backward bound of the accept suite (asserted), the norm-weight
+  gradients under the suite's cosine floor and a worst-cell ceiling of that bound, the per-step losses within a relative bound;
+* three steps of the bf16 and the MXFP8 arm finite, the per-layer lists live (``descale_w_o`` differs between layers), the bf16
+  run with both backward knobs bitwise the default-knob run;
+* the deterministic-replay pin: two runs from one seed digest equal (every row, ``grad_sha256`` included), for the torch control on
+  any CUDA device and for the bf16 / MXFP8 arms on Rubin;
+* the feed-less ``delayed`` gradient recipe bootstraps its scales from a ladder of discarded step-0 passes so that its logged step 0
+  is BITWISE the ``current`` recipe's (fp8 and MXFP8), completes, and collapses no gradient;
+* a CUDA graph that captured an execute of a WARMED-UP block replays with the values a later eager ``update_quant_scales`` wrote,
+  while a graph that captured the block's FIRST execute replays its capture-time scalars (the documented limitation);
+* the harness core imports only from the standard library, torch, the ``cudnn`` package and this test tree.
+
+Accept tests are ``requires_rubin`` (the block targets SM107 only); the refusal tests, the torch-control pin and the import
+detector carry no marker and run on any CUDA device.
 """
 
+import ast
 import dataclasses
+import importlib
 import inspect
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -47,7 +65,6 @@ from cudnn.gated_attention_block import (  # noqa: E402
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
     MxQuantSpec,
-    QuantSpec,
     gated_attention_block_backward,
 )
 from cudnn.gated_attention_block import api_bwd as _api_bwd  # noqa: E402
@@ -56,8 +73,9 @@ from cudnn.gated_attention_block.kernels import quantize as _quantize  # noqa: E
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import gated_block_train as gbt  # noqa: E402
 from gated_block_stream_probe import park_the_default_stream  # noqa: E402
-from test_block_backward import _COMMON, _alloc_grads, _declare_bwd  # noqa: E402
+from test_block_backward import _ATOL_FRAC, _COMMON, _COS_MIN, _RTOL, _alloc_grads, _assert_grad_close, _declare_bwd  # noqa: E402
 from test_block_backward_fp8 import _backward_fp8, _declare_fp8_bwd, _execute_fp8, _f32, _fp8_decl  # noqa: E402
 from test_block_backward_mxfp8 import _backward_mxfp8, _declare_mx_bwd, _execute_mx  # noqa: E402
 from test_block_fp8 import _require_fp8_forks  # noqa: E402
@@ -73,6 +91,20 @@ _FAMILY = pytest.mark.parametrize("family", ["fp8", "mxfp8"])
 _GEOM = dict(_COMMON, qk_norm=True, is_causal=True)  # the smallest accept cell of the quantized suites (norm, GQA 8/2, causal)
 _B, _S = 1, 256
 _API_CONST = _api_bwd.FP8_GRAD_SCALE_MARGIN_LOG2
+
+# The training loop: the accept suites' head geometry at the small model size (2 layers, 2 x 1024 tokens, a 4096 vocabulary), three steps.
+_SMOKE = gbt.GEOMETRIES["smoke"]
+_STEPS = 3
+# The block's norm-weight gradients, model vs model: the suite's own dW_norm bound is a MASS bound over the fp64 oracle's per-row terms,
+# unavailable here, so they are held to the suite's cosine floor plus a worst-cell CEILING of the bf16 bound -- CALIBRATED ONCE (Rubin
+# cc 10.7) from the measured 1.105 / 1.155 (a [D] reduction over T bf16 products whose noise does not shrink with layer 1's 8x smaller
+# max|ref|): 2.0 leaves a 1.7x margin, like the suite's _DW_NORM_NOISE.  Never widen.
+_NORM_W_BOUND_CEIL = 2.0
+# The per-step relative loss difference between the bf16 block model and the torch reference model: CALIBRATED ONCE from the measured
+# 1.44e-5 over three steps (a 7x margin).  Never widen.
+_LOSS_REL_BOUND = 1e-4
+# The row keys a feed-less delayed run's step 0 must share with the current recipe's step 0 (the ladder seeds the kernels' own rule).
+_STEP0_KEYS = ("grad_sha256", "loss", "grad_norm_total", "quant_scalars", "grad_norms", "spec", "scale_dp", "act_amax", "sat", "n_clip")
 
 
 # ---------------------------------------------------------------------------
@@ -533,3 +565,312 @@ def test_grad_scale_margin_reaches_every_quantize_launch(family):
     print(f"{family}: gradients at margin 2 {'differ from' if _grads_differ(m2.grads, base.grads) else 'equal'} the margin-0 block's")
     _assert_grads_equal(m0.grads, base.grads, "the default margin spelled out differs from the block declared without it")
     assert m0.scalars == base.scalars
+
+
+# ---------------------------------------------------------------------------
+# The training loop (gated_block_train): the toy decoder with the block as its attention layer
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def deterministic_cublas(monkeypatch):
+    """The harness runs under ``torch.use_deterministic_algorithms(True)``, which refuses cuBLAS GEMMs unless ``CUBLAS_WORKSPACE_CONFIG``
+    names a deterministic workspace; a process that already names one keeps it, any other gets ``:4096:8`` for the test."""
+    if os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in gbt.DETERMINISTIC_CUBLAS_CONFIGS:
+        monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", gbt.DETERMINISTIC_CUBLAS_CONFIGS[0])
+    return os.environ["CUBLAS_WORKSPACE_CONFIG"]
+
+
+def _train(arm, *, steps=_STEPS, **kw):
+    """``steps`` steps of ``arm`` at the small geometry from seed 0 (``kw`` -> ``run_training``: ``replica``, ``name``, ``keep_grads_at``, ...)."""
+    return gbt.run_training(arm, _SMOKE, steps=steps, seed=0, **kw)
+
+
+def _finite(x) -> bool:
+    if isinstance(x, dict):
+        return all(_finite(v) for v in x.values())
+    if isinstance(x, list):
+        return all(_finite(v) for v in x)
+    return not isinstance(x, float) or math.isfinite(x)
+
+
+def _digested(row: dict) -> str:
+    """The row as the digest sees it (minus the non-deterministic keys and the replica metadata), in the digest's canonical JSON --
+    compared as TEXT, the way the digest compares it: a dict comparison would read the torch arm's documented ``NaN`` block gradient
+    norms as unequal to themselves."""
+    return gbt.canonical_json({k: v for k, v in row.items() if k not in gbt.NONDET_KEYS | gbt.ROW_META_KEYS})
+
+
+def _numeric(row: dict) -> str:
+    """The row minus the digest's version-keyed part too (``NUMERIC_COMPARE_IGNORE``), canonical JSON: what two recipes of one arm agree on."""
+    return gbt.canonical_json({k: v for k, v in row.items() if k not in gbt.NONDET_KEYS | gbt.ROW_META_KEYS | gbt.NUMERIC_COMPARE_IGNORE})
+
+
+def _bound_fraction(got: torch.Tensor, ref: torch.Tensor, rtol: float, atol_frac: float):
+    """The accept suite's bound, read without asserting: ``(worst cell as a fraction of rtol * |ref| + atol_frac * max|ref|, cosine)``."""
+    got64, ref64 = got.detach().double(), ref.detach().double()
+    atol = atol_frac * ref64.abs().max().item()
+    worst = ((got64 - ref64).abs() / (atol + rtol * ref64.abs())).max().item()
+    cos = (got64.flatten() @ ref64.flatten() / (got64.norm() * ref64.norm())).item()
+    return worst, cos
+
+
+def _assert_rows_bitwise(a, b, what: str) -> None:
+    assert a.manifest["run_digest"] == b.manifest["run_digest"], f"{what}: run_digest {a.manifest['run_digest'][:16]} vs {b.manifest['run_digest'][:16]}"
+    assert len(a.rows) == len(b.rows) == _STEPS
+    for ra, rb in zip(a.rows, b.rows):
+        assert ra["row_digest"] == rb["row_digest"] and ra["grad_sha256"] == rb["grad_sha256"], f"{what}: step {ra['step']}"
+        assert _digested(ra) == _digested(rb), f"{what}: step {ra['step']} differs on a digested key"
+        assert "wall_ms" in ra and "wall_ms" in rb  # present, informational, outside the digest
+    assert a.manifest["deterministic_algorithms"] is True and a.manifest["cublas_workspace_config"] in gbt.DETERMINISTIC_CUBLAS_CONFIGS
+
+
+def test_the_training_loop_imports_only_from_the_test_tree_and_the_package():
+    """Host: the harness core is a TRACKED helper of this test tree, so every module it imports is the standard library, torch, the
+    ``cudnn`` package or a sibling of the tree (resolved by import, not by name) -- a helper reaching into an untracked directory
+    imports in ONE checkout only, and a test that imports it would be collected green there while asserting nothing anywhere else.
+    The file carries no absolute path, and it is a helper, not a collected test."""
+    path = os.path.abspath(gbt.__file__)
+    src = open(path, encoding="utf-8").read()
+    test_tree = os.path.dirname(os.path.dirname(os.path.dirname(path)))  # <repo>/test/python
+    assert os.path.basename(test_tree) == "python" and os.path.basename(os.path.dirname(test_tree)) == "test"
+    stdlib = set(sys.stdlib_module_names) | {"__future__"}
+    outside = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0, "no relative imports in a sys.path helper"
+            names = [node.module]
+        else:
+            continue
+        for name in names:
+            top = name.split(".")[0]
+            if top in stdlib or top in ("torch", "cudnn"):
+                continue
+            mod_file = os.path.abspath(importlib.import_module(name).__file__)
+            if not mod_file.startswith(test_tree + os.sep):
+                outside.append((name, mod_file))
+    assert not outside, f"imports resolved outside the test tree: {outside}"
+    assert "/home/" not in src and "/tmp/" not in src, "an absolute path in the harness core"
+    assert not os.path.basename(path).startswith("test_"), "the helper would be collected as a test module"
+
+
+def test_training_loop_torch_control_two_runs_are_bitwise(deterministic_cublas):
+    """Any CUDA device: the pure-torch control arm (the reference block under autograd) trained three steps twice from one seed digests
+    equal -- every row, ``grad_sha256`` included -- and its twin driven through the ``GatedBlockFn`` plumbing (the reference block's
+    output into the layer buffer, its autograd gradients into the gradient buffers) reproduces its losses, learning rates, token counts
+    and total gradient norms bitwise: the trainer plumbing is exercised on hosts that cannot run the block."""
+    a = _train(gbt.ARMS["torch-bf16"])
+    b = _train(gbt.ARMS["torch-bf16"], replica=1)
+    _assert_rows_bitwise(a, b, "torch control")
+    fn = _train(gbt.ARMS["torch-bf16-fn"])
+    for r, s in zip(a.rows, fn.rows):
+        assert (r["loss"], r["lr"], r["tokens_seen"], r["grad_norm_total"]) == (s["loss"], s["lr"], s["tokens_seen"], s["grad_norm_total"]), r["step"]
+        # the torch arm has no block ``dh`` buffer: its ``dh`` norm is the documented NaN; everything else is finite
+        assert all(math.isnan(v) for v in r["grad_norms"]["dh"])
+        assert _finite({k: v for k, v in r.items() if k != "grad_norms"}) and _finite({g: v for g, v in r["grad_norms"].items() if g != "dh"})
+    print(f"torch control: losses {[round(r['loss'], 6) for r in a.rows]} run_digest {a.manifest['run_digest'][:16]} ({deterministic_cublas})")
+
+
+@requires_rubin
+def test_training_loop_bf16_matches_the_torch_reference_model(deterministic_cublas):
+    """Three steps of the bf16 block model and of the torch reference model from ONE seed (same init, data and optimizer): the step-0
+    fp32 master gradients of the block's ``W_qkvg`` / ``W_o`` of every layer within the bf16 backward bound of the accept suite
+    (``_assert_grad_close``: rtol 2^-6, atol 2^-7 * max|ref|, cos >= 0.999 -- the numbers the single-step accept tests hold the backward
+    to), the block's ``W_q_norm`` / ``W_k_norm`` gradients under the suite's cosine floor and a worst-cell ceiling of that bound
+    (``_NORM_W_BOUND_CEIL``), the per-step relative loss difference under ``_LOSS_REL_BOUND``; the model's other parameters' gradients are
+    printed, not asserted."""
+    frost = _train(gbt.ARMS["bf16"], keep_grads_at=(0,))
+    ref = _train(gbt.ARMS["torch-bf16"], keep_grads_at=(0,))
+    rtol, atol_frac = _RTOL[torch.bfloat16], _ATOL_FRAC[torch.bfloat16]
+    g_f, g_r = frost.kept_grads[0], ref.kept_grads[0]
+    assert set(g_f) == set(g_r) and len(g_f) == 7 * _SMOKE.n_layers + 2
+    worst_block, worst_norm, reported = {}, {}, {}
+    for name in sorted(g_f):
+        fam = name.split(".")[0]
+        if fam in ("w_qkvg", "w_o"):
+            worst_block[name] = _assert_grad_close(g_f[name], g_r[name], f"step-0 master gradient {name}", rtol=rtol, atol_frac=atol_frac)
+            continue
+        worst, cos = _bound_fraction(g_f[name], g_r[name], rtol, atol_frac)
+        print(f"step-0 master gradient {name}: worst cell {worst:.3f} of the bf16 bound, cos {cos:.6f}")
+        if fam in ("w_q_norm", "w_k_norm"):
+            worst_norm[name] = worst
+            assert (
+                cos >= _COS_MIN and worst <= _NORM_W_BOUND_CEIL
+            ), f"{name}: worst cell {worst:.3f} of the bf16 bound (ceiling {_NORM_W_BOUND_CEIL}), cos {cos:.6f}"
+        else:
+            reported[name] = (worst, cos)
+    rel = [abs(a["loss"] - b["loss"]) / abs(b["loss"]) for a, b in zip(frost.rows, ref.rows)]
+    print(
+        f"bf16 block vs torch: W_qkvg / W_o worst {max(worst_block.values()):.3f} of the bound; norm weights worst {max(worst_norm.values()):.3f} "
+        f"(ceiling {_NORM_W_BOUND_CEIL}); reported {len(reported)} other parameters, worst {max(w for w, _c in reported.values()):.3f}; "
+        f"losses {[round(r['loss'], 6) for r in frost.rows]} vs {[round(r['loss'], 6) for r in ref.rows]}, max relative difference {max(rel):.3e}"
+    )
+    assert max(rel) <= _LOSS_REL_BOUND, f"loss relative difference {max(rel):.3e} > {_LOSS_REL_BOUND:.0e}"
+
+
+@requires_rubin
+@pytest.mark.parametrize("arm_name", ["bf16", "mxfp8"])
+def test_training_loop_three_steps_bf16_and_mxfp8_finite(arm_name, deterministic_cublas):
+    """Three steps of the arm: every logged value finite, every per-layer list of length ``n_layers``; under MXFP8 the per-layer specs
+    are live (``descale_w_o`` differs between the two layers -- each layer's ``W_o`` has its own amax), ``scale_o`` stays 1.0, no
+    calibration pass runs, and the one gradient scale derived in-kernel keeps ``amax * scale <= 448``; the bf16 run with both
+    performance-only backward knobs (``fuse_gate_bwd`` + ``fuse_wgrad_overlap``) is BITWISE the default-knob run on every numeric key
+    (the knobs sit in the recipe, so the digests differ by construction)."""
+    arm = gbt.ARMS[arm_name]
+    res = _train(arm)
+    L = _SMOKE.n_layers
+    for r in res.rows:
+        assert _finite(r), f"step {r['step']}: a non-finite logged value"
+        assert all(len(v) == L for v in r["grad_norms"].values())
+        assert all(v > 0.0 for vals in r["grad_norms"].values() for v in vals)
+        assert r["calib_fwd"] is False and r["calib_bwd"] is False
+    if arm_name == "mxfp8":
+        for r in res.rows:
+            assert len(r["spec"]["descale_w_o"]) == L and r["spec"]["descale_w_o"][0] != r["spec"]["descale_w_o"][1], r["spec"]
+            assert r["spec"]["scale_o"] == [1.0] * L
+            assert all(len(v) == L for v in r["quant_scalars"].values())
+            for l in range(L):
+                prod = r["quant_scalars"]["amax_dy"][l] * r["quant_scalars"]["scale_dy"][l]
+                assert 0.0 < prod <= 448.0, (r["step"], l, prod)
+        print(f"mxfp8: descale_w_o per step {[r['spec']['descale_w_o'] for r in res.rows]} losses {[round(r['loss'], 6) for r in res.rows]}")
+        return
+    knobs = _train(arm.with_(bwd_knobs=("fuse_gate_bwd", "fuse_wgrad_overlap")), name="bf16_knobs")
+    for r, s in zip(res.rows, knobs.rows):
+        assert r["recipe"] != s["recipe"] and r["row_digest"] != s["row_digest"]
+        assert _numeric(r) == _numeric(s), f"step {r['step']}: the backward knobs moved a numeric key"
+    print(f"bf16: losses {[round(r['loss'], 6) for r in res.rows]}; the knob run bitwise on every numeric key")
+
+
+@requires_rubin
+@pytest.mark.parametrize("arm_name", ["bf16", "mxfp8"])
+def test_training_loop_two_runs_are_bitwise(arm_name, deterministic_cublas):
+    """The deterministic-replay pin: two three-step runs of the arm from one seed (replica 0 and 1) agree on ``run_digest``, on every
+    ``row_digest`` and ``grad_sha256`` and on every digested key; ``wall_ms`` is present and outside the digest; the harness turned
+    ``torch.use_deterministic_algorithms`` on for the run and restored the process's setting."""
+    prev = torch.are_deterministic_algorithms_enabled()
+    a = _train(gbt.ARMS[arm_name])
+    b = _train(gbt.ARMS[arm_name], replica=1)
+    assert torch.are_deterministic_algorithms_enabled() == prev
+    _assert_rows_bitwise(a, b, arm_name)
+    assert a.rows[0]["replica"] == 0 and b.rows[0]["replica"] == 1
+    print(f"{arm_name}: run_digest {a.manifest['run_digest']} x2, last loss {a.rows[-1]['loss']:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("arm_name", ["fp8-recal1", "mxfp8"])
+def test_training_loop_feedless_delayed_step0_is_bitwise_the_current_recipe(arm_name, deterministic_cublas):
+    """``grad_scaling="delayed"`` without a scale feed bootstraps its gradient scales at step 0 from DISCARDED backward passes in
+    dependency order (``bootstrap_rungs``: fp8 ``scale_dy`` -> ``scale_do`` -> ``scale_dp`` -> ``scale_dqkvg``, MXFP8 ``scale_dy``), each
+    seeded by the kernels' own ``grad_scale_from_amax`` over that pass's published amax, so the LOGGED step 0 is BITWISE the ``current``
+    recipe's step 0 (the kernel derives the same rule in-kernel) and the seeded scales are the published ones; the run completes with
+    every block gradient of every layer finite and non-zero (a scale seeded from a flushed pass zeroed a layer's gradients exactly), and
+    the lagged recipe's saturation is counted per step, layer and gradient (``grad_sat``), never asserted."""
+    arm = gbt.ARMS[arm_name]
+    L = _SMOKE.n_layers
+    cur = _train(arm)
+    dl = _train(arm.with_(grad_scaling="delayed"), name=f"{arm_name}_delayed")
+    rungs = ["scale_dy", "scale_do", "scale_dp", "scale_dqkvg"] if arm.family == "fp8" else ["scale_dy"]
+    assert dl.manifest["bootstrap_rungs"] == rungs and cur.manifest["bootstrap_rungs"] == (["scale_dp"] if arm.family == "fp8" else [])
+    assert dl.rows[0]["calib_bwd"] is True and all(r["calib_bwd"] is False for r in dl.rows[1:])
+    differ = [k for k in _STEP0_KEYS if gbt.canonical_json(cur.rows[0].get(k)) != gbt.canonical_json(dl.rows[0].get(k))]
+    assert not differ, f"the feed-less delayed step 0 differs from the current recipe's on {differ}"
+    for n in arm.grad_scale_names:
+        assert dl.rows[0]["given_scales"][n] == dl.rows[0]["quant_scalars"][n], n  # the ladder's seed is what the kernel published
+    assert "given_scales" not in cur.rows[0] and "grad_sat" not in cur.rows[0]
+    for r in dl.rows:
+        assert set(r["grad_sat"]) == set(arm.grad_scale_names) and all(len(v) == L for v in r["grad_sat"].values())
+        for g, vals in r["grad_norms"].items():
+            assert len(vals) == L and all(math.isfinite(v) and v > 0.0 for v in vals), (r["step"], g, vals)
+    sat = {n: sum(r["grad_sat"][n][l] for r in dl.rows for l in range(L)) for n in arm.grad_scale_names}
+    ratios = {
+        g: [round(d["grad_norms"][g][l] / c["grad_norms"][g][l], 4) for d, c in zip(dl.rows, cur.rows) for l in range(L)] for g in cur.rows[0]["grad_norms"]
+    }
+    print(
+        f"{arm_name}: ladder {rungs}; step 0 bitwise the current recipe's; grad_sat counts over {_STEPS} x {L} step-layers {sat} (reported); "
+        f"delayed / current block-gradient norm ratios {ratios}"
+    )
+
+
+@requires_rubin
+@_FAMILY
+def test_update_quant_scales_reaches_a_captured_execute_of_a_warmed_up_block(family):
+    """The two halves of the API's CUDA-graph statement.  (1) A graph that captured an execute of a WARMED-UP block (one eager execute
+    on the capture stream first) replays at ``A`` bitwise, and after an EAGER ``update_quant_scales(B)`` between two replays the next
+    replay is BITWISE the ``out`` (and the record) of a block DECLARED with ``B``: the scalars are read, not baked into the graph.  (2) A
+    graph that captured the block's FIRST execute captures its one-time scalar write with the capture-time values: it replays at ``A``,
+    and after the same eager ``update_quant_scales(B)`` the replay STAYS at ``A`` and re-writes the device scalars to ``A`` -- the
+    documented limitation (warm up before capturing, or re-capture after a recalibration); outside the graph the caller's path still
+    works (an eager update + execute runs at ``B``)."""
+    r = _run_training_quant(_GEOM, _B, _S, family)
+    a = r.spec
+    b = _spec_b(a)
+    blk_b, out_b = _fwd_block_with(r, b, training=True)
+    ws_b = _compile(blk_b)
+    saved_b = _record(r)
+    _execute_fwd(r, blk_b, out_b, ws_b, saved=saved_b)
+    torch.cuda.synchronize()
+    assert not torch.equal(out_b, r.out), "B must move the output, or the pin proves nothing"
+    want_a, want_b = _f32_values(r.blk._quant_dev_values(a)), _f32_values(r.blk._quant_dev_values(b))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    # (1) the warmed-up block
+    out_g, saved_g, ws_g = torch.empty_like(r.out), _record(r), torch.empty_like(r.ws)
+    with torch.cuda.stream(stream):
+        _execute_fwd(r, r.blk, out_g, ws_g, saved=saved_g)  # warm-up on the capture stream
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    assert torch.equal(out_g, r.out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _execute_fwd(r, r.blk, out_g, ws_g, saved=saved_g)
+    out_g.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_g, r.out), "the warmed-up capture does not replay the eager A result"
+    r.blk.update_quant_scales(b)  # eager, on the default stream, between two replays
+    torch.cuda.synchronize()
+    assert _dev_values(r.blk) == want_b
+    out_g.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out_g, out_b
+    ), f"the replay after update_quant_scales(B) is not the B block's out: max {(out_g.float() - out_b.float()).abs().max().item():.3e}"
+    assert torch.equal(saved_g.o, saved_b.o) and torch.equal(saved_g.lse, saved_b.lse), "the record written by the replay differs from the B block's"
+    assert _dev_values(r.blk) == want_b
+    # (2) the FIRST execute captured: the documented limitation
+    blk2, out2 = _fwd_block_with(r, a, training=True)
+    ws2 = _compile(blk2)
+    saved2 = _record(r)
+    torch.cuda.synchronize()
+    assert blk2._quant_dev_on_launch_stream is False
+    graph2 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph2, stream=stream):
+        _execute_fwd(r, blk2, out2, ws2, saved=saved2)
+    assert blk2._quant_dev_on_launch_stream is True, "the one-shot write was not part of the captured first execute"
+    out2.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out2, r.out)
+    blk2.update_quant_scales(b)
+    torch.cuda.synchronize()
+    assert _dev_values(blk2) == want_b
+    out2.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out2, r.out), "a graph that captured the FIRST execute no longer replays its capture-time scales: the documented limitation moved"
+    assert _dev_values(blk2) == want_a, "the replayed one-time write did not re-write the capture-time values"
+    out3 = torch.empty_like(r.out)
+    _execute_fwd(r, blk2, out3, ws2, saved=_record(r))
+    torch.cuda.synchronize()
+    assert torch.equal(out3, r.out)  # an eager execute right after that replay reads the replayed A scalars
+    blk2.update_quant_scales(b)
+    _execute_fwd(r, blk2, out3, ws2, saved=_record(r))
+    torch.cuda.synchronize()
+    assert torch.equal(out3, out_b)  # and the caller's path outside the graph still reaches B

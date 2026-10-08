@@ -51,8 +51,9 @@ whatever a ``scale_feed`` callable returns per step and layer -- the replay pin 
 gradients back bitwise.  Without a feed, step 0 BOOTSTRAPS the histories from discarded backward passes
 (``ConvergenceRun.bootstrap_rungs``): a gradient's published amax is valid only once every scale UPSTREAM of it is -- a unit scale
 flushes a training gradient (amax ~ 1e-3) to zero in e4m3 (subnormal 2^-9) and everything computed from that tensor is garbage -- so
-the rungs run in dependency order, each pass at the scales seeded so far: ``scale_dy`` (dY is the block's input gradient, its amax
-scale-independent), then ``scale_do`` (dO comes from the quantized dY), then ``scale_dp`` (dP from the quantized dO), then
+the rungs run in dependency order, each pass at the scales seeded so far: ``scale_dy`` (dY is the backward's INPUT gradient,
+``dL/dout`` -- nothing quantized precedes it, so its amax is scale-independent; the block's input gradient is ``dh``), then
+``scale_do`` (dO comes from the quantized dY), then ``scale_dp`` (dP from the quantized dO), then
 ``scale_dqkvg`` (its dQ / dK from the quantized dS); MXFP8 has ``scale_dy`` alone, and the "current" fp8 arm's ladder is ``scale_dp``
 alone, as before.  A lagged scale has ZERO headroom at margin 0 by construction, so under ``delayed`` ``amax * scale > 448`` on a
 gradient is COUNTED per step, layer and gradient (the row's ``grad_sat``; reported, never asserted); under ``current`` the kernel
@@ -729,8 +730,9 @@ class ConvergenceRun:
     def bootstrap_rungs(self) -> List[str]:
         """The scales the arm seeds at step 0 from DISCARDED backward passes, in dependency order -- one pass per rung, each at the
         scales seeded so far (unit elsewhere), because a gradient's published amax is valid only once every scale UPSTREAM of it is:
-        dY's is scale-independent (the block's input gradient), dO's needs ``scale_dy`` (dO is computed from the quantized dY), dP's
-        needs ``scale_do``, dQKVG's needs ``scale_dp`` (its dQ / dK come from the quantized dS).  A unit scale flushes a training
+        dY's is scale-independent (dY is the backward's INPUT, ``dL/dout`` -- nothing quantized precedes it; the block's input gradient
+        is ``dh``), dO's needs ``scale_dy`` (dO is computed from the quantized dY), dP's needs ``scale_do``, dQKVG's needs ``scale_dp``
+        (its dQ / dK come from the quantized dS).  A unit scale flushes a training
         gradient (amax ~ 1e-3) to zero in e4m3 (subnormal 2^-9), so a downstream amax read at unit upstream scales is garbage --
         seeding ``scale_dqkvg`` from it saturates the first logged pass by orders of magnitude.  "current" fp8: ``scale_dp`` alone (the
         kernel derives the three gradient scales from the same step's amax); "delayed" without a feed: the gradient scales too (fp8:
@@ -943,8 +945,11 @@ class ConvergenceRun:
         return row
 
     def run(self, steps: int, *, jsonl_path: Optional[str] = None, keep_grads_at: Tuple[int, ...] = ()) -> RunResult:
-        """Train ``steps`` steps; returns the rows (and the fp32 master gradients, pre-clip, of the steps in ``keep_grads_at``).
-        Deterministic algorithms are forced for the duration and restored after."""
+        """Train ``steps`` steps (``steps >= 1``: a run with no step has no row to digest and is refused); returns the rows (and the
+        fp32 master gradients, pre-clip, of the steps in ``keep_grads_at``).  Deterministic algorithms are forced for the duration and
+        restored after."""
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1 (a run with no step has no row to digest), got {steps}")
         self.check_environment()
         prev_det = torch.are_deterministic_algorithms_enabled()
         prev_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -1113,6 +1118,8 @@ def main(argv=None) -> int:
     ap.add_argument("--dp-margin-log2", type=int, default=None, help="fp8: the octaves of headroom of the 'amax' dP rule (Arm.dp_margin_log2)")
     ap.add_argument("--replay-scales-from", default=None, help="a 'current' run's JSONL whose published gradient scales feed this 'delayed' run")
     a = ap.parse_args(argv)
+    if a.steps < 1:
+        ap.error(f"--steps must be >= 1 (a run with no step has no row to digest), got {a.steps}")
 
     import cudnn
 
