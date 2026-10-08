@@ -260,27 +260,33 @@ def frost_qsa_kv_upcast(
         n_blk_vis = (n_vis + cutlass.Int32(BLOCK_SIZE - 1)) // cutlass.Int32(BLOCK_SIZE)  # a block at or past it has no visible row
         ids_row_base = ids_base + ids_row.to(cutlass.Int64) * cutlass.Int64(top_k) * four
 
-        # --- the slot prefix: every warp walks the item's 17 x 32 slots once (one id per lane per step) ---
+        # --- the slot prefix: every warp walks the item's 17 x 32 slots once (one id per lane per step), UNROLLED so a lane's 17 id
+        #     loads are in flight together -- a runtime loop consumed each id in its own iteration and serialized the scan into 17 L2
+        #     round trips before the first copy (MEASURED on the 212-SM perf node: 57.6 -> see the record for the unrolled figure) ---
+        idvs = []
+        for k in cutlass.range_constexpr(UNITS_PER_ITEM):
+            j = cutlass.Int32(k * SLOTS_PER_UNIT) + lane
+            jl = j if j < cutlass.Int32(top_k) else cutlass.Int32(top_k - 1)
+            idvs.append(ld_global(ids_row_base + jl.to(cutlass.Int64) * four, cutlass.Int32))
         before = cutlass.Int32(0)
         after = cutlass.Int32(0)
         my_cnt = cutlass.Int32(0)
         my_blk = cutlass.Int32(-1)
-        for k in cutlass.range(UNITS_PER_ITEM):
-            j = k * cutlass.Int32(SLOTS_PER_UNIT) + lane
-            jl = j if j < cutlass.Int32(top_k) else cutlass.Int32(top_k - 1)
-            idv = ld_global(ids_row_base + jl.to(cutlass.Int64) * four, cutlass.Int32)
+        for k in cutlass.range_constexpr(UNITS_PER_ITEM):
+            j = cutlass.Int32(k * SLOTS_PER_UNIT) + lane
+            kk = cutlass.Int32(k)
             listed = j < count
             tail = (j >= cutlass.Int32(top_k)) & (j < cutlass.Int32(top_k + TAIL_SLOTS))
-            blk = idv if listed else (tail0 + (j - cutlass.Int32(top_k)))
+            blk = idvs[k] if listed else (tail0 + (j - cutlass.Int32(top_k)))
             blk = blk if (listed | tail) else cutlass.Int32(-1)
             inside = (blk >= cutlass.Int32(0)) & (blk < n_blk_vis)
             cnt = n_vis - blk * cutlass.Int32(BLOCK_SIZE)
             cnt = cnt if cnt < cutlass.Int32(BLOCK_SIZE) else cutlass.Int32(BLOCK_SIZE)
             cnt = cnt if inside else cutlass.Int32(0)
-            before = before + (cnt if k < c else cutlass.Int32(0))
-            after = after + (cnt if k > c else cutlass.Int32(0))
-            my_cnt = cnt if k == c else my_cnt
-            my_blk = blk if k == c else my_blk
+            before = before + (cnt if kk < c else cutlass.Int32(0))
+            after = after + (cnt if kk > c else cutlass.Int32(0))
+            my_cnt = cnt if kk == c else my_cnt
+            my_blk = blk if kk == c else my_blk
         unit_base = _warp_sum_i32(before)
         incl = _warp_incl_scan_i32(my_cnt, lane)
         unit_sum = cute.arch.shuffle_sync(incl, 31)
@@ -290,44 +296,56 @@ def frost_qsa_kv_upcast(
         if (c == cutlass.Int32(0)) & (tidx == cutlass.Int32(0)):
             st_global(mKvLenT.iterator.toint() + item64 * four, total, cutlass.Int32)
 
-        # --- the copy: this warp's 8 slots, two per step so eight 16-B loads are in flight per lane ---
+        # --- the copy, phase 1: this warp's 8 slots -- (block, count, destination) by shuffle from the holder and the 8 table words,
+        #     all in flight together (one L2 round trip for the warp's slots, not one per slot pair) ---
         ok_item = ok_base + item64 * ok0 * two
         ov_item = ov_base + item64 * ov0 * two
+        b64 = b.to(cutlass.Int64)
+        max_pages64 = max_pages.to(cutlass.Int64)
+        s_cnt = []
+        s_dst = []
+        s_pidx_ok = []
+        s_inpage = []
+        s_page = []
+        for i in cutlass.range_constexpr(SLOTS_PER_WARP):
+            src_lane = warp * cutlass.Int32(SLOTS_PER_WARP) + cutlass.Int32(i)
+            cnt_s = cute.arch.shuffle_sync(my_cnt, src_lane)
+            blk_s = cute.arch.shuffle_sync(my_blk, src_lane)
+            dst_s = cute.arch.shuffle_sync(my_dst, src_lane)
+            t_blk = blk_s * cutlass.Int32(BLOCK_SIZE)  # the block's first token (blk_s >= 0 whenever cnt_s > 0)
+            pidx = t_blk // cutlass.Int32(page_size)
+            in_page = t_blk - pidx * cutlass.Int32(page_size)
+            pidx_ok = (pidx >= cutlass.Int32(0)) & (pidx < max_pages)
+            pidx_c = pidx if pidx_ok else cutlass.Int32(0)
+            s_page.append(ld_global(table_base + (b64 * max_pages64 + pidx_c.to(cutlass.Int64)) * four, cutlass.Int32))
+            s_cnt.append(cnt_s)
+            s_dst.append(dst_s)
+            s_pidx_ok.append(pidx_ok)
+            s_inpage.append(in_page)
+        # --- the copy, phase 2: two slots per step so eight 16-B loads are in flight per lane; a dead page reads page 0 and stores
+        #     zeros; a row at or past the slot's count is loaded (a real address) and never stored ---
         for i in cutlass.range_constexpr(SLOTS_PER_WARP // 2):
-            cnts = []
-            blks = []
-            dsts = []
             loads_k = []
             loads_v = []
             lives = []
+            poks = []
             for q in cutlass.range_constexpr(2):
-                src_lane = warp * cutlass.Int32(SLOTS_PER_WARP) + cutlass.Int32(2 * i + q)
-                cnt_s = cute.arch.shuffle_sync(my_cnt, src_lane)
-                blk_s = cute.arch.shuffle_sync(my_blk, src_lane)
-                dst_s = cute.arch.shuffle_sync(my_dst, src_lane)
-                t_blk = blk_s * cutlass.Int32(BLOCK_SIZE)  # the block's first token (blk_s >= 0 whenever cnt_s > 0)
-                pidx = t_blk // cutlass.Int32(page_size)
-                in_page = t_blk - pidx * cutlass.Int32(page_size)
-                pidx_ok = (pidx >= cutlass.Int32(0)) & (pidx < max_pages)
-                pidx_c = pidx if pidx_ok else cutlass.Int32(0)
-                page = ld_global(table_base + (b.to(cutlass.Int64) * max_pages.to(cutlass.Int64) + pidx_c.to(cutlass.Int64)) * four, cutlass.Int32)
-                page_ok = pidx_ok & (page >= cutlass.Int32(0)) & (page < P)
-                page_c = (page if page_ok else cutlass.Int32(0)).to(cutlass.Int64)  # a dead page reads page 0 and stores zeros
-                src_k = pk_base + page_c * pk0 + h64 * pk1 + in_page.to(cutlass.Int64) * pk2 + col64
-                src_v = pv_base + page_c * pv0 + h64 * pv1 + in_page.to(cutlass.Int64) * pv2 + col64
+                si = 2 * i + q
+                page = s_page[si]
+                page_ok = s_pidx_ok[si] & (page >= cutlass.Int32(0)) & (page < P)
+                page_c = (page if page_ok else cutlass.Int32(0)).to(cutlass.Int64)
+                src_k = pk_base + page_c * pk0 + h64 * pk1 + s_inpage[si].to(cutlass.Int64) * pk2 + col64
+                src_v = pv_base + page_c * pv0 + h64 * pv1 + s_inpage[si].to(cutlass.Int64) * pv2 + col64
                 for rp in cutlass.range_constexpr(2):
                     row = cutlass.Int32(rp * ROWS_PER_WARP_LOAD) + row_in_pair
                     row64 = row.to(cutlass.Int64)
                     loads_k.append(ld_global_v4(src_k + row64 * pk2, cutlass.Int32))
                     loads_v.append(ld_global_v4(src_v + row64 * pv2, cutlass.Int32))
-                    lives.append(row < cnt_s)
-                cnts.append(cnt_s)
-                blks.append(blk_s)
-                dsts.append(dst_s)
-                pok = page_ok
-                cnts[-1] = pok  # (slot q): page validity rides with the slot
+                    lives.append(row < s_cnt[si])
+                poks.append(page_ok)
             for q in cutlass.range_constexpr(2):
-                page_ok = cnts[q]
+                si = 2 * i + q
+                page_ok = poks[q]
                 for rp in cutlass.range_constexpr(2):
                     idx = 2 * q + rp
                     row = cutlass.Int32(rp * ROWS_PER_WARP_LOAD) + row_in_pair
@@ -345,7 +363,7 @@ def frost_qsa_kv_upcast(
                         v3 = wv[3] if page_ok else z
                         ok_words = _upcast16(k0, k1, k2, k3, k_scale)
                         ov_words = _upcast16(v0, v1, v2, v3, v_scale)
-                        drow = (dsts[q] + row).to(cutlass.Int64)
+                        drow = (s_dst[si] + row).to(cutlass.Int64)
                         dk = ok_item + drow * ok1 * two + col64 * two
                         dv = ov_item + drow * ov1 * two + col64 * two
                         st_global_v4(dk, (ok_words[0], ok_words[1], ok_words[2], ok_words[3]), cutlass.Int32)
