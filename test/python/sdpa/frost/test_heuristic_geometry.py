@@ -204,38 +204,48 @@ def _mla_split_facts(**overrides):
 @requires_dsl
 @pytest.mark.parametrize("wants_stats", [False, True])
 @pytest.mark.parametrize("device_cc", [(10, 0), (10, 3)])
-@pytest.mark.parametrize("d", [128, 192])
-def test_nonpaged_split_choice_transport_and_native_fallback(monkeypatch, wants_stats, device_cc, d):
+@pytest.mark.parametrize("d,packed", [(128, False), (128, True), (192, False)])
+def test_nonpaged_split_choice_transport_and_native_fallback(monkeypatch, wants_stats, device_cc, d, packed):
     """A supplied choice drives both proposals and placement, not a timing golden."""
     from cudnn.sdpa.fwd import placement
 
-    facts = _mla_split_facts(wants_stats=wants_stats, device_cc=device_cc, d_qk=d)
+    facts = _mla_split_facts(wants_stats=wants_stats, device_cc=device_cc, d_qk=d, **({"h_q": 8, "h_kv": 2} if packed else {}))
     with monkeypatch.context() as m:
-        m.setattr(heur, "nonpaged_thd_split_choice", lambda caps, facts: 3)
+        m.setattr(heur, "nonpaged_thd_split_choice", lambda caps, facts: (3, packed))
         selected = heur._knob_sets(SPEC, facts)[0]
-        assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, False)
+        assert (selected.cga, selected.split_kv, selected.pack_gqa) == (1, 3, packed)
         assert mismatch(SPEC.capabilities, facts, selected) is None
         assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.LEAD
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", type("PreviousNativeBinder", (), {}))
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts) == 1
+    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, facts) == (1, False)
     assert all(k.split_kv in (None, 1) for k in heur._knob_sets(SPEC, facts))
     assert placement._place_sm100_f16(SPEC.capabilities, facts) == placement.TRAIL
 
 
 @requires_dsl
-@pytest.mark.parametrize("batch,heads,q,kv", [(1, 4, 64, 32768), (3, 4, 129, 4097), (4, 8, 128, 8192), (1, 64, 512, 8192)])
+@pytest.mark.parametrize(
+    "batch,heads,q,kv", [(1, 4, 64, 32768), (3, 4, 129, 4097), (4, 8, 128, 8192), (1, 64, 512, 8192), (1, 64, 69, 8192), (2, 16, 8, 8192), (4, 32, 37, 16384)]
+)
 @pytest.mark.parametrize("sm_count", [0, 64, 148])
-@pytest.mark.parametrize("d", [128, 192])
-def test_nonpaged_split_choice_obeys_physical_launch_bounds(batch, heads, q, kv, sm_count, d):
-    facts = _mla_split_facts(b=batch, h_q=heads, h_kv=heads, s_q=q, s_kv=kv, device_sm_count=sm_count, d_qk=d)
-    splits = heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)
+@pytest.mark.parametrize("d,group", [(128, 1), (128, 4), (128, 16), (192, 1)])
+@pytest.mark.parametrize("total", [None, "sum"])
+def test_nonpaged_split_choice_obeys_physical_launch_bounds(batch, heads, q, kv, sm_count, d, group, total):
+    h_kv = max(1, heads // group)
+    # A declared token total below b * s_q: the batch is ragged.
+    max_total = batch * q // 2 + 1 if total else None
+    facts = _mla_split_facts(b=batch, h_q=heads, h_kv=h_kv, s_q=q, s_kv=kv, device_sm_count=sm_count, d_qk=d, max_total_seq_len_q=max_total)
+    splits, packed = heur.nonpaged_thd_split_choice(SPEC.capabilities, facts)
     if splits > 1:
-        # Count real 128-row CTAs, including a partial Q tile in every batch.
-        assert batch * heads * len(range(0, q, 128)) * splits <= sm_count
+        # Count physical CTAs: 128 // group packed tokens of one KV head's group, or 128 rows of one Q head,
+        # with at most one partial tile per sequence.
+        g = heads // h_kv if packed else 1
+        tokens = max_total if max_total is not None and d == 128 else batch * q
+        tiles = min(batch * len(range(0, q, 128 // g)), (tokens + batch * (128 // g - 1)) // (128 // g))
+        assert tiles * (heads // g) * splits <= sm_count * (2 if d == 128 else 1)
         assert len(range(0, kv, 128)) // splits >= 4
-        assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=False)) is None
+        assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
     elif not sm_count:
-        assert splits == 1
+        assert (splits, packed) == (1, False)
 
 
 @requires_dsl
@@ -266,7 +276,7 @@ def test_bounded_overrides_use_declared_geometry(batch, heads, q, kv, d, wants_s
     bounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=batch * q)
     assert heur.nonpaged_thd_split_choice(SPEC.capabilities, bounded) == heur.nonpaged_thd_split_choice(SPEC.capabilities, exact)
     unbounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=None)
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, unbounded) == 1
+    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, unbounded) == (1, False)
 
 
 @requires_dsl
@@ -289,6 +299,22 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
     mla = replace(facts, d_qk=192)
     assert mismatch(spec.capabilities, mla, replace(knobs, pack_gqa=False)) is None
+
+
+@requires_dsl
+@pytest.mark.parametrize("batch,h_q,h_kv,q,kv", [(2, 8, 2, 128, 16384), (1, 32, 4, 64, 32768), (4, 16, 16, 257, 8192), (2, 16, 2, 8, 16384)])
+def test_nonpaged_d128_rubin_split_fills_one_unpacked_wave(monkeypatch, batch, h_q, h_kv, q, kv):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204)
+    splits, packed = heur.nonpaged_thd_split_choice(spec.capabilities, facts)
+    if splits > 1:
+        # Rubin's launch budget: unpacked 128-row CTAs, one wave.
+        assert not packed
+        assert batch * len(range(0, q, 128)) * h_q * splits <= 204
+        assert len(range(0, kv, 128)) // splits >= 4
 
 
 @pytest.mark.parametrize("split", [1, 2])
