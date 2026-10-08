@@ -222,16 +222,17 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 _FP8_INIT_KWARGS = ("quant", "grad_scaling")
 _FP8_EXECUTE_KWARGS = ("scale_dp", "scale_dy", "scale_do", "scale_dqkvg")
 _MX_EXECUTE_KWARGS = ("h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf")
+_FP4_EXECUTE_KWARGS = ("w_o_t", "w_o_t_sf")  # the fp4 weight modes' appended pair, after the MXFP8 artifacts
 
 
 def test_the_fp8_surface_is_an_appended_keyword_only_tail():
     """Host, no GPU: the quantized backward's parameters are the LAST parameters of ``__init__``, ``execute`` and the convenience
-    wrapper -- the fp8 tail directly followed by the MXFP8 backward's four appended artifacts on ``execute`` and the wrapper --
-    keyword-only and defaulted, in the declared order (public signatures evolve append-only)."""
+    wrapper -- the fp8 tail directly followed by the MXFP8 backward's four appended artifacts and the fp4 weight modes' two on
+    ``execute`` and the wrapper -- keyword-only and defaulted, in the declared order (public signatures evolve append-only)."""
     for fn, names in (
         (GatedAttentionBlockBwd.__init__, _FP8_INIT_KWARGS),
-        (GatedAttentionBlockBwd.execute, _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS),
-        (gated_attention_block_backward, _FP8_INIT_KWARGS + _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS),
+        (GatedAttentionBlockBwd.execute, _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
+        (gated_attention_block_backward, _FP8_INIT_KWARGS + _FP8_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
     ):
         tail = list(inspect.signature(fn).parameters.values())[-len(names) :]
         assert [p.name for p in tail] == list(names), (fn.__qualname__, [p.name for p in tail])
@@ -1813,13 +1814,16 @@ def test_fp8_reject_thd_with_quant():
 @requires_cuda
 def test_fp8_reject_mxquantspec():
     """An ``MxQuantSpec`` selects the MXFP8 backward (its own arm and its own suite, ``test_block_backward_mxfp8.py``), never the
-    per-tensor fp8 one: the declaration constructs the MXFP8 stage list, and its fp4 weight modes are the typed declines there."""
+    per-tensor fp8 one: the declaration constructs the MXFP8 stage list, and its fp4 weight modes construct that list's fp4 arms
+    (``test_block_backward_fp4.py``) -- an e4m3 ``w_o`` handed to such a block is ``check_support``'s decline, by the weight's name."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
     blk = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx)
     assert isinstance(blk.quant, MxQuantSpec) and blk._prologue is None and blk._epilogue is None and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
-    with pytest.raises(NotImplementedError, match="o_fp4"):
-        _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
+    blk4 = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
+    assert blk4.o_fp4 is Fp4Format.NVFP4 and blk4._out_proj_dgrad.block_scale and blk4._prologue is None and blk4._gate_bwd.want_dy_descale
+    with pytest.raises(ValueError, match="w_o"):
+        blk4.check_support()
 
 
 @requires_cuda

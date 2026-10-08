@@ -848,9 +848,15 @@ def unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
     return torch.stack([lo, hi], dim=-1).flatten(-2)
 
 
-def fp4_quantize_rowwise_2d(x2d: torch.Tensor, fmt) -> Tuple[torch.Tensor, torch.Tensor]:
+def fp4_quantize_rowwise_2d(x2d: torch.Tensor, fmt, global_scale: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
     """``[rows, K]`` -> (packed E2M1 bytes ``[rows, K/2]``, logical scale BYTES ``[rows, K/block]``),
     one scale per ``block`` elements along K.
+
+    ``global_scale`` (appended, default ``1.0`` = the forward's single-level cast): quantize ``fp32(x2d) * global_scale``
+    -- ONE fp32 multiply before the block amax, the kernel's pre-scale slot read (``quantize_fp4.py``, the two-level
+    cast of a GRADIENT: the live power-of-two ``scale_dy`` lifts a raw output gradient above the NVFP4 e4m3 scale floor;
+    the consumer undoes it downstream).  Exact for a power of two; a non-power-of-two value is served too, rounded
+    once on both sides.
 
     MXFP4: ``e = e8m0_ceil(amax * fp32(1/6))`` (TE / cuDNN semantics, exponent rounded UP -- the
     shared ``mxfp8_quant.e8m0_ceil``), ``q = e2m1_rne(x * 2^(127-e))`` (exact power-of-two scaling).
@@ -870,7 +876,10 @@ def fp4_quantize_rowwise_2d(x2d: torch.Tensor, fmt) -> Tuple[torch.Tensor, torch
         # E4M3 scale 0x7F, and every code in the block a fabricated 6.0 -- a bitwise tier comparing the kernel
         # against that would report a CODE mismatch where the finding is "bad input".  Refuse instead.
         raise ValueError(f"{name}: non-finite input is out of the fp4 quantizer's contract")
-    x = x2d.float().reshape(rows, k // block, block)
+    x = x2d.float()
+    if float(global_scale) != 1.0:
+        x = x * torch.tensor(float(global_scale), dtype=torch.float32, device=x.device)  # the kernel's one fp32 multiply before the amax
+    x = x.reshape(rows, k // block, block)
     amax = x.abs().amax(dim=-1)  # [rows, K/block]
     inv_max = torch.tensor(FP4_INV_MAX, dtype=torch.float32, device=x.device)
     if name == "mxfp4":
@@ -904,7 +913,7 @@ def fp4_dequant_rowwise_2d(packed: torch.Tensor, blob: torch.Tensor, fmt, out_dt
     return unpack_e2m1(packed).to(out_dtype) * scale.repeat_interleave(block, dim=-1)
 
 
-def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False) -> Tuple[dict, dict]:
+def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False, w_qkvg_fp4: bool = False) -> Tuple[dict, dict]:
     """``make_inputs`` output -> the same dict with ``h`` / ``w_qkvg`` as e4m3 MXFP8 CODES plus
     their PADDED F8_128x4 blobs ``h_sf`` / ``w_qkvg_sf`` (the block's ``sample_h_sf`` /
     ``sample_w_qkvg_sf`` and execute ``h_sf=`` / ``w_qkvg_sf=``), ``w_o`` per-tensor e4m3 (D1),
@@ -927,38 +936,67 @@ def quantize_block_inputs_mxfp8(inp: dict, *, o_fp4=None, backward: bool = False
     block-quantized otherwise, and the block declines a weight gradient at such a ``T``); ``w_qkvg_t`` /
     ``w_qkvg_t_sf`` are built at every ``T`` (their axes are ``d_model`` and ``N``).
 
+    ``w_qkvg_fp4`` (appended): the MXFP4 weight mode's ``W_qkvg`` instead of the e4m3 one -- packed E2M1 codes ``[N, d_model / 2]``
+    viewed ``float4_e2m1fn_x2`` (``fp4_quantize_rowwise_2d(W, "mxfp4")``, the forward suite's ``_fp4w_inputs``) with its E8M0 / 32
+    blob under the UNCHANGED key ``w_qkvg_sf``; with ``backward=True`` the transposed artifact ``w_qkvg_t`` is then the packed e2m1
+    ``[d_model, N / 2]`` of ``W_qkvg^T`` re-quantized along N in the same format (the SAME key as the e4m3 artifact, its dtype keyed on
+    the mode) with ``w_qkvg_t_sf`` over ``(rows = d_model, K = N)``; and under ``o_fp4`` with ``backward=True`` the dict also carries
+    ``w_o_t`` -- the packed e2m1 ``[H_q*D, d_model / 2]`` of ``W_o^T`` re-quantized along ``d_model`` in ``o_fp4``'s format -- with
+    ``w_o_t_sf`` over ``(rows = H_q*D, K = d_model)`` at that format's block (the fp4 weight modes' backward artifacts: two fake-quants
+    of one master weight along its two axes, the fp4 training recipe).
+
     Norm weights, cos/sin stay bf16 (the block's activation dtype).  Built from an EXISTING
     input dict so a harness can hand the bf16, FP8 and MXFP8 arms the same data."""
     h = inp["h"]
     b, s, dm = h.shape
     h_codes, h_e = mx_quantize_rowwise_2d(h.reshape(b * s, dm))
-    w_codes, w_e = mx_quantize_rowwise_2d(inp["w_qkvg"])
     mx = dict(inp)
     mx["h"] = h_codes.reshape(b, s, dm).contiguous()
     mx["h_sf"] = mx_swizzle_sf_rowwise_padded(h_e)
-    mx["w_qkvg"] = w_codes.contiguous()
-    mx["w_qkvg_sf"] = mx_swizzle_sf_rowwise_padded(w_e)
+    if w_qkvg_fp4:
+        packed_w, w_e = fp4_quantize_rowwise_2d(inp["w_qkvg"].float(), "mxfp4")
+        mx["w_qkvg"] = packed_w.view(torch.float4_e2m1fn_x2)
+        mx["w_qkvg_sf"] = mx_swizzle_sf_rowwise_padded(w_e, MX_BLOCK)
+    else:
+        w_codes, w_e = mx_quantize_rowwise_2d(inp["w_qkvg"])
+        mx["w_qkvg"] = w_codes.contiguous()
+        mx["w_qkvg_sf"] = mx_swizzle_sf_rowwise_padded(w_e)
     if backward:
         # the backward's caller artifacts: the SAME bf16 tensors re-quantized along the OTHER contraction axis, from the bf16
         # values (never a .t() of the forward's codes), each with the blob of ITS OWN orientation
         t = b * s
         n = int(inp["w_qkvg"].shape[0])
-        w_t_codes, w_t_e = mx_quantize_rowwise_2d(inp["w_qkvg"].t().contiguous())  # [dm, N]: blocks along N
-        mx["w_qkvg_t"] = w_t_codes.contiguous()
-        mx["w_qkvg_t_sf"] = mx_swizzle_sf_rowwise_padded(w_t_e)
-        checks = [("w_qkvg_t", mx["w_qkvg_t"], mx["w_qkvg_t_sf"], dm, n)]
+        if w_qkvg_fp4:
+            w_t_packed, w_t_e = fp4_quantize_rowwise_2d(inp["w_qkvg"].t().contiguous().float(), "mxfp4")  # [dm, N]: blocks along N, packed [dm, N/2]
+            mx["w_qkvg_t"] = w_t_packed.view(torch.float4_e2m1fn_x2)
+            mx["w_qkvg_t_sf"] = mx_swizzle_sf_rowwise_padded(w_t_e, MX_BLOCK)
+        else:
+            w_t_codes, w_t_e = mx_quantize_rowwise_2d(inp["w_qkvg"].t().contiguous())  # [dm, N]: blocks along N
+            mx["w_qkvg_t"] = w_t_codes.contiguous()
+            mx["w_qkvg_t_sf"] = mx_swizzle_sf_rowwise_padded(w_t_e)
+        checks = [("w_qkvg_t", mx["w_qkvg_t"], mx["w_qkvg_t_sf"], dm, n, MX_BLOCK)]
         if t % MX_BLOCK == 0:  # the token axis block-quantizes only in whole 32-blocks: no h_t at a ragged T (no weight gradient there)
             h_t_codes, h_t_e = mx_quantize_rowwise_2d(h.reshape(t, dm).t().contiguous())  # [dm, T]: blocks along the tokens
             mx["h_t"] = h_t_codes.contiguous()
             mx["h_t_sf"] = mx_swizzle_sf_rowwise_padded(h_t_e)
-            checks.append(("h_t", mx["h_t"], mx["h_t_sf"], dm, t))
-        for name, codes, blob, rows, k in checks:
-            # self-check of the builder: K-major codes of the stated shape, the blob of the stated orientation's byte count
-            if tuple(codes.shape) != (rows, k) or codes.stride() != (k, 1) or codes.dtype != FP8_E4M3:
-                raise ValueError(f"{name}: expected contiguous e4m3 [{rows}, {k}], got {tuple(codes.shape)} strides {codes.stride()} {codes.dtype}")
-            rows_pad, blocks_pad = mx_sf_padded_dims(rows, k)
+            checks.append(("h_t", mx["h_t"], mx["h_t_sf"], dm, t, MX_BLOCK))
+        if o_fp4 is not None:
+            _, o_block, _ = fp4_format(o_fp4)
+            hd = int(inp["w_o"].shape[1])
+            wo_t_packed, wo_t_e = fp4_quantize_rowwise_2d(inp["w_o"].t().contiguous().float(), o_fp4)  # [HD, dm]: blocks along d_model, packed [HD, dm/2]
+            mx["w_o_t"] = wo_t_packed.view(torch.float4_e2m1fn_x2)
+            mx["w_o_t_sf"] = mx_swizzle_sf_rowwise_padded(wo_t_e, o_block)
+            checks.append(("w_o_t", mx["w_o_t"], mx["w_o_t_sf"], hd, dm, o_block))
+        for name, codes, blob, rows, k, block in checks:
+            # self-check of the builder: K-major codes of the stated shape (packed [rows, K/2] for e2m1), the blob of the stated
+            # orientation's byte count at its block
+            fp4 = codes.dtype == torch.float4_e2m1fn_x2
+            k_store = k // 2 if fp4 else k
+            if tuple(codes.shape) != (rows, k_store) or codes.stride() != (k_store, 1) or codes.dtype not in (FP8_E4M3, torch.float4_e2m1fn_x2):
+                raise ValueError(f"{name}: expected contiguous codes [{rows}, {k_store}], got {tuple(codes.shape)} strides {codes.stride()} {codes.dtype}")
+            rows_pad, blocks_pad = mx_sf_padded_dims(rows, k, block)
             if blob.numel() != rows_pad * blocks_pad:
-                raise ValueError(f"{name}_sf: {blob.numel()} bytes, the padded blob over ({rows}, K={k}) is {rows_pad} x {blocks_pad}")
+                raise ValueError(f"{name}_sf: {blob.numel()} bytes, the padded blob over ({rows}, K={k}) at block {block} is {rows_pad} x {blocks_pad}")
     if o_fp4 is None:
         s_wo = amax_scale(inp["w_o"])
         mx["w_o"] = quant_e4m3(inp["w_o"], s_wo)
@@ -2025,6 +2063,56 @@ class _MxProjection(torch.autograd.Function):
         return dh, dw, None, None, None
 
 
+class _Fp4OutProj(torch.autograd.Function):
+    """The out projection ``O_gated @ W_o^T`` of the MXFP8 block backward under an fp4 ``W_o`` (``MxQuantSpec.o_fp4``) as ONE autograd
+    node -- the two dY points of that arm are DIFFERENT, which a single :class:`_QuantGrad` cannot express.  Forward: the fp64 product
+    of the fp4 STRAIGHT-THROUGH value of the gated O (``og_fp4``: the bf16 ``O_gated`` block-quantized to e2m1 in ``fmt`` and
+    dequantized through its padded blob -- what the forward's fp4 out projection multiplied) and the dequantized e2m1 ``W_o`` leaf.
+    Backward (M), ``g`` ``[T, d_model]`` rounded to bf16 first (the quantize launches read a bf16 dY):
+
+    * B1 ``dW_o = fq_pt(dY)^T @ og8``: the PER-TENSOR e4m3 point at ``scale_dy`` (``quant_e4m3(bf16 g, scale_dy) / scale_dy``) against the
+      gate backward's per-tensor e4m3 ``og8`` (``scale_o = 1`` under ``o_fp4``), dequantized -- the weight gradient stays 8-bit;
+    * B2 ``dO_gated = fq_A(dY) @ deq(w_o_t, w_o_t_sf)``: the BLOCK point of the caller's transposed e2m1 ``W_o`` row -- NVFP4: the
+      TWO-LEVEL cast ``fq_nvfp4(bf16 g, global_scale=scale_dy)`` (the kernel's pre-scale) dequantized through its padded e4m3-per-16
+      blob, the product multiplied by ``1 / scale_dy`` (the gate backward's descale arm; exact for the power-of-two ``scale_dy``);
+      MXFP4: the MX-rowwise e4m3 point (``mx_quantize_rowwise_2d``, E8M0 per 32) against ``deq(w_o_t)``, no scale anywhere.
+
+    Every quantity lands in ``holder``: ``dy8`` (the per-tensor codes ``[T, d_model]``), ``dy4`` / ``dy4_e`` / ``dy4_sf`` (NVFP4: packed
+    e2m1 uint8 ``[T, d_model/2]``, the logical e4m3 scale bytes ``[T, d_model/16]``, the padded blob) or ``dy_mx8`` / ``dy_mx_e`` /
+    ``dy_mx_sf`` (MXFP4: e4m3 codes ``[T, d_model]``, E8M0 bytes ``[T, d_model/32]``, the padded canonical blob) -- the stage-localised
+    bitwise checks' comparands."""
+
+    @staticmethod
+    def forward(ctx, og2d, w_o, og_fp4, og8_deq, deq_w_o_t, scale_dy, fmt_name, holder):
+        ctx.save_for_backward(og8_deq, deq_w_o_t)
+        ctx.scale_dy, ctx.fmt_name, ctx.holder = float(scale_dy), str(fmt_name), holder
+        return og_fp4 @ w_o.t()
+
+    @staticmethod
+    def backward(ctx, g):
+        og8_deq, deq_w_o_t = ctx.saved_tensors
+        mq = _mxfp8_quant()
+        sdy = ctx.scale_dy
+        g16 = g.detach().to(torch.bfloat16).float().contiguous()  # [T, d_model]: the bf16 dY the quantize launches read
+        # B1's point: the per-tensor e4m3 cast at scale_dy, dequantized exactly (alpha_b1 = descale_dy x descale_o, descale_o = 1 under o_fp4)
+        dy8 = quant_e4m3(g16, sdy)
+        g_pt = dy8.to(torch.float64) * (1.0 / sdy)
+        dw_o = g_pt.t() @ og8_deq  # [d_model, H_q*D]
+        # B2's point: the block cast of the caller's e2m1 W_o row
+        if ctx.fmt_name == "nvfp4":
+            packed, e = fp4_quantize_rowwise_2d(g16, "nvfp4", global_scale=sdy)  # the two-level cast: scale_dy x dY, e4m3 scales per 16
+            blob = mx_swizzle_sf_rowwise_padded(e, 16)
+            g_blk = fp4_dequant_rowwise_2d(packed, blob, "nvfp4", out_dtype=torch.float64)  # = the dequantized scale_dy x dY
+            dog = (g_blk @ deq_w_o_t.t()) * (1.0 / sdy)  # the gate backward's descale arm, exact for a power of two
+            ctx.holder.update(dy8=dy8, dy4=packed, dy4_e=e, dy4_sf=blob, dy_mx8=None, dy_mx_e=None, dy_mx_sf=None)
+        else:
+            codes, e = mx_quantize_rowwise_2d(g16)  # MX rowwise: E8M0 per 32 along d_model
+            g_blk = codes.to(torch.float64) * torch.repeat_interleave(mq.e8m0_to_float(e), MX_BLOCK, dim=-1).to(torch.float64)
+            dog = g_blk @ deq_w_o_t.t()
+            ctx.holder.update(dy8=dy8, dy4=None, dy4_e=None, dy4_sf=None, dy_mx8=codes, dy_mx_e=e, dy_mx_sf=mx_swizzle_sf_rowwise_padded(e))
+        return dog, dw_o, None, None, None, None, None, None
+
+
 class _MxSdpaRow(torch.autograd.Function):
     """The SDPA stage of the MXFP8 block backward as ONE autograd node (the sibling of :class:`_Fp8SdpaRow`).
 
@@ -2201,6 +2289,9 @@ def gated_attention_block_mxfp8_bwd_reference(
     fold: str = "kernel",
     fwd_head_chunk: Optional[int] = None,
     bwd_group_chunk: Optional[int] = None,
+    w_o_t: Optional[torch.Tensor] = None,
+    w_o_t_sf: Optional[torch.Tensor] = None,
+    o_fp4=None,
 ) -> dict:
     """The oracle of the MXFP8 block BACKWARD over the MXFP8 training record -- the sibling of
     :func:`gated_attention_block_fp8_bwd_reference` (read its docstring for the shared conventions: the record's ``lse / o / gate``
@@ -2243,6 +2334,25 @@ def gated_attention_block_mxfp8_bwd_reference(
     dO's row-sum, so ``sum_j P_ij dP_ij = delta_i`` holds only to the dO quantization error; fed the same ``delta`` the matrix is
     consistent, and a residual of that size is the contract, not a bug.
 
+    **The fp4 weight modes** (appended: ``w_o_t`` / ``w_o_t_sf`` / ``o_fp4``, and an e2m1 ``inp_mx["w_qkvg"]``).  An MXFP4 ``W_qkvg``
+    (``inp_mx["w_qkvg"]`` packed ``float4_e2m1fn_x2`` ``[N, d_model/2]`` with its E8M0 / 32 ``w_qkvg_sf``) is a leaf dequantized through its
+    blob (:func:`fp4_dequant_rowwise_2d`), and ``w_qkvg_t`` is then the caller's packed e2m1 ``[d_model, N/2]`` (``w_qkvg_t_sf`` E8M0 / 32)
+    dequantized the same way -- the (M) dgrad reads it, never the forward's row-quantized weight: two fake-quants of one master weight
+    along its two axes, the fp4 training recipe's straight-through estimator (the stand-in at ``None`` quantizes the dequantized leaf's
+    transpose to MXFP4).  An fp4 ``W_o`` (``o_fp4`` an ``Fp4Format`` member or its name; ``inp_mx["w_o"]`` packed e2m1 ``[d_model, H_q*D/2]``
+    with ``inp_mx["w_o_sf"]`` in that format; ``spec.scale_o == spec.descale_w_o == 1.0``) makes the forward STE point of the gated O the
+    fp4 one (the bf16 ``O_gated`` block-quantized in ``o_fp4``'s format and dequantized through its padded blob -- what the forward's fp4
+    out projection multiplied, as :func:`gated_attention_block_mxfp8_reference` models it) and the out projection the ONE node
+    :class:`_Fp4OutProj` with the arm's two dY points -- B1 per-tensor e4m3 at ``scale_dy`` against the per-tensor ``og8``, B2 the block
+    cast of the caller's e2m1 ``w_o_t`` row: NVFP4 the TWO-LEVEL cast ``fq_nvfp4(bf16 dY, global_scale=scale_dy)`` with the product
+    descaled by ``1 / scale_dy`` (exactly the kernel chain: the quantize's pre-scale slot read, the gate backward's descale arm), MXFP4 the
+    MX-rowwise e4m3 point.  ``w_o_t`` / ``w_o_t_sf`` (packed e2m1 ``[H_q*D, d_model/2]`` + the blob over ``(H_q*D, d_model)`` at the format's
+    block) are dequantized through their blob; ``None`` quantizes the dequantized ``W_o`` leaf's transpose in ``o_fp4``'s format (the
+    stand-in).  ``modelled=False`` keeps the fp4 forward point and differentiates the out projection in fp64.  The result then also
+    carries ``w_o_t_deq`` (fp64 ``[H_q*D, d_model]``), ``og_fp4`` (the fp4 STE value of the gated O, fp64 ``[T, H_q*D]``), ``o_fp4`` (the
+    format's name) and the dY block point's codes / scale bytes / blob (``dy4`` / ``dy4_e`` / ``dy4_sf`` under NVFP4, ``dy_mx8`` / ``dy_mx_e``
+    / ``dy_mx_sf`` under MXFP4; ``dy8`` the per-tensor codes) under ``modelled=True``.
+
     Returns the fp8 oracle's dict (``dh, dw_qkvg, dw_o, dw_q_norm, dw_k_norm`` fp64; ``dq, dk, dv`` the SDPA stage's bf16-rounded
     outputs in fp64; the bands; the norm noise masses; ``q8 / k8 / v8 / og8 / do8 / delta / lse / o / dq_post / dk_post``) plus:
     ``amax_dp = None`` (no dP scalar on this row), ``q_T8 / k_T8 / do_T8`` (the columnwise codes, ``[B, S, H, D]``), ``sf_q / sf_q_T
@@ -2258,35 +2368,62 @@ def gated_attention_block_mxfp8_bwd_reference(
     n_qkvg = geom.n_qkvg
     if tuple(dy.shape) != (b, s, dm):
         raise ValueError(f"dy must be [B, S, d_model] = {(b, s, dm)}, got {tuple(dy.shape)}")
-    if inp_mx["h"].dtype != FP8_E4M3 or inp_mx["w_qkvg"].dtype != FP8_E4M3 or "h_sf" not in inp_mx or "w_qkvg_sf" not in inp_mx:
-        raise ValueError("the MXFP8 backward oracle takes the MXFP8 input dict: e4m3 h / w_qkvg CODES with their h_sf / w_qkvg_sf blobs")
-    if inp_mx["w_o"].dtype != FP8_E4M3:
-        raise ValueError(f"the MXFP8 backward oracle takes the per-tensor e4m3 w_o (an fp4 W_o is a different oracle), got {inp_mx['w_o'].dtype}")
+    fp4x2 = torch.float4_e2m1fn_x2
+    w_qkvg_fp4 = inp_mx["w_qkvg"].dtype == fp4x2
+    if inp_mx["h"].dtype != FP8_E4M3 or inp_mx["w_qkvg"].dtype not in (FP8_E4M3, fp4x2) or "h_sf" not in inp_mx or "w_qkvg_sf" not in inp_mx:
+        raise ValueError(
+            "the MXFP8 backward oracle takes the MXFP8 input dict: e4m3 h CODES and e4m3 (or, under the MXFP4 weight mode, packed e2m1) w_qkvg "
+            "CODES with their h_sf / w_qkvg_sf blobs"
+        )
+    fmt_name = None if o_fp4 is None else fp4_format(o_fp4)[0]
+    if o_fp4 is None:
+        if inp_mx["w_o"].dtype != FP8_E4M3:
+            raise ValueError(f"the MXFP8 backward oracle takes the per-tensor e4m3 w_o without o_fp4 (an fp4 W_o is the o_fp4 arm), got {inp_mx['w_o'].dtype}")
+        if w_o_t is not None or w_o_t_sf is not None:
+            raise ValueError("w_o_t / w_o_t_sf are the fp4 W_o arm's artifacts (o_fp4); without o_fp4 the out projection is per-tensor e4m3 and reads w_o")
+    else:
+        if inp_mx["w_o"].dtype != fp4x2 or "w_o_sf" not in inp_mx:
+            raise ValueError(f"o_fp4={fmt_name}: the oracle takes the packed e2m1 w_o (float4_e2m1fn_x2) with its w_o_sf blob, got {inp_mx['w_o'].dtype}")
+        if float(spec.scale_o) != 1.0 or float(spec.descale_w_o) != 1.0:
+            raise ValueError(f"o_fp4: a block-scaled O / W_o has no per-tensor scale; got scale_o={spec.scale_o}, descale_w_o={spec.descale_w_o}")
+        if (w_o_t is None) != (w_o_t_sf is None):
+            raise ValueError("w_o_t takes its e2m1 codes AND their scale-factor blob, or neither")
     if fold not in ("kernel", "once"):
         raise ValueError(f"fold must be 'kernel' (the row's fold modelled per gradient) or 'once' (every gradient once-rounded), got {fold!r}")
     if seeded is not None and set(seeded) != {"dq", "dk", "dv"}:
         raise ValueError(f"seeded must be dict(dq=, dk=, dv=), got keys {sorted(seeded)}")
     for name, codes, blob in (("h_t", h_t, h_t_sf), ("w_qkvg_t", w_qkvg_t, w_qkvg_t_sf)):
         if (codes is None) != (blob is None):
-            raise ValueError(f"{name} takes its e4m3 codes AND their scale-factor blob, or neither")
+            raise ValueError(f"{name} takes its codes AND their scale-factor blob, or neither")
     mq = _mxfp8_quant()
 
     def leaf(x):
         return None if x is None else x.detach().to(torch.float64).requires_grad_(True)
 
-    # Exact dequantization in fp64 THROUGH the blobs (a code times a power of two is exact).
+    def as_u8(codes):
+        return codes.view(torch.uint8) if codes.dtype != torch.uint8 else codes
+
+    # Exact dequantization in fp64 THROUGH the blobs (a code times a power of two is exact; an e2m1 value times its e4m3 or E8M0 scale too).
     h_deq = mx_dequant_rowwise_2d(inp_mx["h"].reshape(t, dm), inp_mx["h_sf"])  # [T, dm] fp32
-    w_deq = mx_dequant_rowwise_2d(inp_mx["w_qkvg"], inp_mx["w_qkvg_sf"])  # [N, dm] fp32
+    if w_qkvg_fp4:
+        w_deq = fp4_dequant_rowwise_2d(as_u8(inp_mx["w_qkvg"]), inp_mx["w_qkvg_sf"], "mxfp4")  # [N, dm] fp32: the MXFP4 weight through its blob
+    else:
+        w_deq = mx_dequant_rowwise_2d(inp_mx["w_qkvg"], inp_mx["w_qkvg_sf"])  # [N, dm] fp32
     h = leaf(h_deq.reshape(b, s, dm))
     w_qkvg = leaf(w_deq)
-    w_o = leaf(dequant_e4m3(inp_mx["w_o"], float(spec.descale_w_o)))
+    if o_fp4 is None:
+        w_o_deq = dequant_e4m3(inp_mx["w_o"], float(spec.descale_w_o))
+    else:
+        w_o_deq = fp4_dequant_rowwise_2d(as_u8(inp_mx["w_o"]), inp_mx["w_o_sf"], o_fp4)  # [dm, HD] fp32: the fp4 W_o through its blob
+    w_o = leaf(w_o_deq)
     w_q, w_k = (leaf(inp_mx["w_q_norm"]), leaf(inp_mx["w_k_norm"])) if geom.qk_norm else (None, None)
     cos, sin = inp_mx["cos"].to(torch.float64), inp_mx["sin"].to(torch.float64)
     o_q, o_g, o_k, o_v = geom.offsets
 
     # The caller's transposed artifacts, dequantized through THEIR blobs; the oracle's stand-in quantizes the dequantized leaves along
-    # the transposed axis (tokens for h, N for W_qkvg) exactly as a caller would its bf16 tensors.
-    def deq_t(codes, blob, own_src, rows, k):
+    # the transposed axis (tokens for h, N for W_qkvg, d_model for W_o) exactly as a caller would its bf16 tensors -- in the weight's
+    # own format (e4m3 MX, or the fp4 format of the mode: `fp4_fmt`).
+    def deq_t(codes, blob, own_src, rows, k, fp4_fmt=None):
         if codes is None:
             if k % MX_BLOCK != 0:
                 # No stand-in exists: the transposed axis has no whole 32-element blocks at this k, so the GEMM that would read
@@ -2294,14 +2431,26 @@ def gated_attention_block_mxfp8_bwd_reference(
                 # is not modelled: the oracle returns dw_qkvg=None and no transposed dQKVG quantization, as the dgrad-only block
                 # takes no dw_qkvg buffer at such a T.
                 return None
-            c, e = mx_quantize_rowwise_2d(own_src.detach().float().t().contiguous())
+            src_t = own_src.detach().float().t().contiguous()
+            if fp4_fmt is not None:
+                _, blk, _ = fp4_format(fp4_fmt)
+                packed, e = fp4_quantize_rowwise_2d(src_t, fp4_fmt)
+                return fp4_dequant_rowwise_2d(packed, mx_swizzle_sf_rowwise_padded(e, blk), fp4_fmt, out_dtype=torch.float64).contiguous()
+            c, e = mx_quantize_rowwise_2d(src_t)
             return (c.to(torch.float64) * torch.repeat_interleave(mq.e8m0_to_float(e), MX_BLOCK, dim=-1).to(torch.float64)).contiguous()
+        if fp4_fmt is not None:
+            if codes.dtype not in (fp4x2, torch.uint8) or tuple(codes.shape) != (rows, k // 2):
+                raise ValueError(
+                    f"a transposed e2m1 artifact must be packed [{rows}, {k} // 2] (K-major, two codes per byte), got {codes.dtype} {tuple(codes.shape)}"
+                )
+            return fp4_dequant_rowwise_2d(as_u8(codes), blob, fp4_fmt, out_dtype=torch.float64).contiguous()
         if codes.dtype != FP8_E4M3 or tuple(codes.shape) != (rows, k):
             raise ValueError(f"a transposed artifact must be e4m3 [{rows}, {k}] (K-major), got {codes.dtype} {tuple(codes.shape)}")
         return mx_dequant_rowwise_2d(codes, blob).to(torch.float64).contiguous()
 
     deq_h_t = deq_t(h_t, h_t_sf, h_deq, dm, t)  # [dm, T]
-    deq_w_t = deq_t(w_qkvg_t, w_qkvg_t_sf, w_deq, dm, n_qkvg)  # [dm, N]
+    deq_w_t = deq_t(w_qkvg_t, w_qkvg_t_sf, w_deq, dm, n_qkvg, "mxfp4" if w_qkvg_fp4 else None)  # [dm, N]
+    deq_w_o_t = deq_t(w_o_t, w_o_t_sf, w_o_deq, hq * d, dm, o_fp4) if o_fp4 is not None else None  # [HD, dm]
     holder: dict = {}
     # (1) the projection; the two dQKVG quantization points sit on its GRADIENT (B5+B6 write bf16 bands, the quantize launches read them).
     h2d = h.reshape(t, dm)
@@ -2368,9 +2517,26 @@ def gated_attention_block_mxfp8_bwd_reference(
     # (5) the gate, then the forward's per-tensor og point on the bf16-rounded og (the gate kernel writes bf16 og; quantize_o reads it).
     og = o * torch.sigmoid(gate)
     og_ste, og8 = _ste_e4m3(og, float(spec.scale_o))
-    # (6) the out projection (per-tensor fp8, D1); the dY quantization point sits on the OUTPUT's gradient.
-    out = og_ste.reshape(t, hq * d) @ w_o.t()
-    out_q = _QuantGrad.apply(out, scale_dy) if modelled else out
+    og_fp4 = None
+    if o_fp4 is None:
+        # (6) the out projection (per-tensor fp8, D1); the dY quantization point sits on the OUTPUT's gradient.
+        out = og_ste.reshape(t, hq * d) @ w_o.t()
+        out_q = _QuantGrad.apply(out, scale_dy) if modelled else out
+    else:
+        # (5q') / (6') the fp4 W_o arm: the forward's VALUE is the fp4 fake-quant of the bf16 gated O (the fp4 quantize's input; what the
+        # fp4 out projection multiplied), B1's operand the per-tensor og8 above (scale_o = 1); the two dY points sit on the out
+        # projection's own node (_Fp4OutProj) -- in (U) the fp4 forward point alone, the backward plain fp64.
+        _, o_block, _ = fp4_format(o_fp4)
+        og16 = og.detach().to(torch.bfloat16).float().reshape(t, hq * d)
+        og_packed, og_e = fp4_quantize_rowwise_2d(og16, o_fp4)
+        og_fp4 = fp4_dequant_rowwise_2d(og_packed, mx_swizzle_sf_rowwise_padded(og_e, o_block), o_fp4, out_dtype=torch.float64)
+        og2d = og.reshape(t, hq * d)
+        if modelled:
+            og8_deq = og8.reshape(t, hq * d).to(torch.float64) * (1.0 / float(spec.scale_o))
+            out = _Fp4OutProj.apply(og2d, w_o, og_fp4, og8_deq, deq_w_o_t, float(scale_dy), fmt_name, holder)
+        else:
+            out = (og2d + (og_fp4 - og2d.detach())) @ w_o.t()
+        out_q = out
 
     wanted = [h, w_qkvg, w_o] + ([w_q, w_k] if geom.qk_norm else []) + [q_pre, k_pre, gate, v, o, q, k]
     # allow_unused only where the wgrad is not modelled (deq_h_t None): w_qkvg then receives no gradient and dw_qkvg reads None
@@ -2429,6 +2595,9 @@ def gated_attention_block_mxfp8_bwd_reference(
         h_t_deq=deq_h_t,
         w_qkvg_t_deq=deq_w_t,
         fold=fold,
+        w_o_t_deq=deq_w_o_t,
+        og_fp4=og_fp4,
+        o_fp4=fmt_name,
     )
     if modelled:
         res.update(
@@ -2441,4 +2610,7 @@ def gated_attention_block_mxfp8_bwd_reference(
         )
     else:
         res.update(dqkvg8=None, dqkvg_e=None, dqkvg_t8=None, dqkvg_t_e=None, dqkvg_sf=None, dqkvg_t_sf=None)
+    # the fp4 W_o arm's dY block point (the _Fp4OutProj node's record; None without o_fp4 or under modelled=False)
+    for key in ("dy8", "dy4", "dy4_e", "dy4_sf", "dy_mx8", "dy_mx_e", "dy_mx_sf"):
+        res[key] = holder.get(key)
     return res

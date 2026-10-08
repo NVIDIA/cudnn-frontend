@@ -276,17 +276,18 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 _QUANT_INIT_KWARGS = ("quant", "grad_scaling")
 _QUANT_EXECUTE_KWARGS = ("scale_dp", "scale_dy", "scale_do", "scale_dqkvg")
 _MX_EXECUTE_KWARGS = ("h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf")
+_FP4_EXECUTE_KWARGS = ("w_o_t", "w_o_t_sf")  # the fp4 weight modes' appended pair (test_block_backward_fp4.py), after the MXFP8 artifacts
 _ARTIFACTS = _MX_EXECUTE_KWARGS
 
 
 def test_the_mxfp8_surface_is_an_appended_keyword_only_tail():
-    """Host, no GPU: the MXFP8 backward's four artifacts are the LAST parameters of ``execute`` and of the convenience wrapper,
-    after the fp8 tail, keyword-only and defaulted, in the declared order (public signatures evolve append-only); ``__init__``'s
-    tail is the fp8 one (the type of ``quant`` widened, nothing appended)."""
+    """Host, no GPU: the MXFP8 backward's four artifacts follow the fp8 tail on ``execute`` and on the convenience wrapper, and the fp4
+    weight modes' two (``w_o_t`` / ``w_o_t_sf``) are the LAST parameters -- keyword-only and defaulted, in the declared order (public
+    signatures evolve append-only); ``__init__``'s tail is the fp8 one (the type of ``quant`` widened, nothing appended)."""
     for fn, names in (
         (GatedAttentionBlockBwd.__init__, _QUANT_INIT_KWARGS),
-        (GatedAttentionBlockBwd.execute, _QUANT_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS),
-        (gated_attention_block_backward, _QUANT_INIT_KWARGS + _QUANT_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS),
+        (GatedAttentionBlockBwd.execute, _QUANT_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
+        (gated_attention_block_backward, _QUANT_INIT_KWARGS + _QUANT_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
     ):
         tail = list(inspect.signature(fn).parameters.values())[-len(names) :]
         assert [p.name for p in tail] == list(names), (fn.__qualname__, [p.name for p in tail])
@@ -2016,8 +2017,10 @@ def _declare_then_check(make):
 @requires_cuda
 def test_mxfp8_rejects_match_the_attribute_names():
     """Every typed decline of the MXFP8 backward matched by ATTRIBUTE NAME (the prose is pinned in ``test_block_backward.py``):
-    ``thd`` with an MxQuantSpec, the fp4 modes (``w_qkvg_dtype`` / ``o_fp4``), e5m2 codes, an fp16 ``dy``, bf16 weights with an MxQuantSpec, the
-    ``B*S % 32`` rule under ``need_dw_qkvg`` (served without), padding, ``fuse_wgrad_overlap`` without a wgrad, ``need_*`` both ways."""
+    ``thd`` with an MxQuantSpec, an e4m3 weight under the fp4 weight modes (``w_qkvg`` under an e2m1 ``w_qkvg_dtype``, ``w_o`` under ``o_fp4``:
+    the modes themselves construct -- their backward is ``test_block_backward_fp4.py``'s), e5m2 codes, an fp16 ``dy``, bf16 weights with an
+    MxQuantSpec, the ``B*S % 32`` rule under ``need_dw_qkvg`` (served without), padding, ``fuse_wgrad_overlap`` without a wgrad, ``need_*``
+    both ways."""
     from cudnn.gated_attention_block.api import Fp4Format
 
     b, s = 1, 256
@@ -2031,10 +2034,10 @@ def test_mxfp8_rejects_match_the_attribute_names():
             max_seq_len=128,
             saved_replace=dict(seq_lens=torch.tensor([128, 128], dtype=torch.int32, device="cuda"), seq_lens_form="lengths"),
         )
-    with pytest.raises(NotImplementedError, match="w_qkvg_dtype"):
-        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, w_qkvg_dtype=torch.float4_e2m1fn_x2))
-    with pytest.raises(NotImplementedError, match="o_fp4"):
-        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
+    with pytest.raises(ValueError, match="w_qkvg"):  # the MXFP4 weight mode constructs; its e4m3 w_qkvg is the weight-dtype decline
+        _declare_then_check(lambda: _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, w_qkvg_dtype=torch.float4_e2m1fn_x2)).blk)
+    with pytest.raises(ValueError, match="w_o"):  # the fp4 O mode constructs; its e4m3 w_o is the weight-dtype decline
+        _declare_then_check(lambda: _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4)).blk)
     with pytest.raises(NotImplementedError, match="MxQuantSpec|e5m2"):
         _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, dtype=torch.float8_e5m2))
     with pytest.raises(ValueError, match="dy|bfloat16"):
