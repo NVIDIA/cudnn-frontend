@@ -397,12 +397,19 @@ def _ln_bwd_pipe_kernel(
             row = row + stride
         # flush register partials -> [ctas, C] (compute warps only)
         pbase = cutlass.Int64(bid) * C
+        # 128-bit stores rather than one STG.32 per element: the [ctas, C] partials are
+        # fp32 and C is large, so this flush is a real fraction of the kernel.
+        NSEG: cutlass.Constexpr = V // 4
         for it in cutlass.range_constexpr(ldgs):
             col0 = (it * tpr + tid) * V
-            for e in cutlass.range_constexpr(V):
-                mDGp[pbase + (col0 + e)] = dgp[it * V + e]
+            for h in cutlass.range_constexpr(NSEG):
+                gseg = cutlass.Vector.from_elements(
+                    tuple(dgp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+                nvvm.store_ext(gseg, mDGp.iterator + (pbase + col0 + h * 4))
                 if cutlass.const_expr(has_beta):
-                    mDBp[pbase + (col0 + e)] = dbp[it * V + e]
+                    bseg = cutlass.Vector.from_elements(
+                        tuple(dbp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+                    nvvm.store_ext(bseg, mDBp.iterator + (pbase + col0 + h * 4))
 
 
 @cute.kernel

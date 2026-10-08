@@ -76,6 +76,16 @@ _CGA_MIN_C = 32768
 _CGA_MIN_C_FEW_ROWS = 16384
 _FEW_ROWS = 128
 
+# Measured and rejected while tuning this kernel, so they are not re-tried:
+#   * BT 512 / 1024 (fewer per-column partial registers per thread) -- WORSE
+#     (0.14 -> 0.12 / 0.10 at D=32768). Register pressure is not the limiter.
+#   * more clusters (8-64 x SM/CGA) -- monotonically WORSE; the [parts, C] partials
+#     grow with the cluster count and outweigh the added parallelism. 4x is the peak.
+#   * fewer clusters (down to SM/CGA/16) -- also worse, losing more parallelism than
+#     it saves in partials. The default sits on the optimum of that trade-off.
+#   * CGA=16 (non-portable cluster) -- launches, but 0.27 -> 0.14 at D=131072.
+# What DID matter was how the partials are stored; see the flush at the end.
+
 
 @cute.jit
 def _block_sum2(v1, v2, tid, red, bt: cutlass.Constexpr):
@@ -245,12 +255,21 @@ def _ln_bwd_cga_kernel(
 
     # ---- flush per-column partials: the cluster writes one whole [C] row ----
     pbase = cutlass.Int64(cl) * C + c0
+    # 128-bit stores, not one STG.32 per element. The partials are [parts, C] fp32 and
+    # C is large on this path, so a scalar flush issues V stores per vector where V/4
+    # do -- and the flush is a large fraction of the kernel: removing dgamma entirely
+    # takes it from 0.18 to 0.33, so how these land matters.
+    NSEG: cutlass.Constexpr = V // 4
     for k in cutlass.range_constexpr(VPT):
         off = (tid + k * BT) * V
-        for e in cutlass.range_constexpr(V):
-            mDGp[pbase + off + e] = dg[k * V + e]
+        for h in cutlass.range_constexpr(NSEG):
+            gseg = cutlass.Vector.from_elements(
+                tuple(dg[k * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+            nvvm.store_ext(gseg, mDGp.iterator + (pbase + off + h * 4))
             if cutlass.const_expr(has_beta):
-                mDBp[pbase + off + e] = db[k * V + e]
+                bseg = cutlass.Vector.from_elements(
+                    tuple(db[k * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+                nvvm.store_ext(bseg, mDBp.iterator + (pbase + off + h * 4))
 
 
 @cute.jit
