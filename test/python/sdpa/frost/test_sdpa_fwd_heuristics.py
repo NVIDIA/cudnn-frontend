@@ -1048,6 +1048,33 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
     # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)
+    # The ONE exception: a DECODE-shaped gated half graph (S_q x G <= 16 packed rows) splits on the d256 decode
+    # tile, whose combine applies the gate -- the split proposal LEADS, floored at 2, packed; an unsplit set stays
+    # unpacked (the prefill kernel's fused epilogue) and exists on a dense cache only.  The decode suite pins the
+    # full contract; here the proposal helpers and the admissibility of every emitted set.
+    decode = dict(
+        gated,
+        dtype=cudnn.data_type.BFLOAT16,
+        epilogue_gate_dtype=cudnn.data_type.BFLOAT16,
+        s_q=1,
+        s_kv=4096,
+        b=4,
+        h_q=24,
+        h_kv=2,
+        causal=False,
+        device_sm_count=204,
+    )
+    for cache in (dict(has_paged_kv=True, page_size=16, padded=True), dict(padded=False)):
+        f = _facts(**decode, **cache)
+        assert _pack_gqa_eligible(row, f, 128, 2) and not _pack_gqa_eligible(row, f, 128, 1) and _pack_gqa_eligible(row, f, 128), cache  # None = some plan
+        points = _split_points(row, f, 128, 128, 2, pack_g=12)
+        assert points[0] >= 2 and (1 in points) == (not f.has_paged_kv), (cache, points)
+        plans = recommend("A", f, _RUBIN_OFFERED)
+        assert plans and plans[0].knobs.pack_gqa is True and plans[0].knobs.split_kv >= 2, [p.knobs for p in plans]
+        for p in plans:
+            assert engines.mismatch(row, f, p.knobs) is None, (cache, p.knobs, engines.mismatch(row, f, p.knobs))
+            assert not (p.knobs.pack_gqa and (p.knobs.split_kv or 1) == 1), p.knobs
+        assert any((p.knobs.split_kv or 1) == 1 for p in plans) == (not f.has_paged_kv), [p.knobs for p in plans]
 
 
 # --- cc 10.7 dense d128 half: the shared decode tile and PackGQA (issue #1472) --------------------------------------

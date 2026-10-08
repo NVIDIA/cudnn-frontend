@@ -2001,6 +2001,22 @@ def test_sm107_gate_declines_the_interactions():
         assert engines.mismatch(caps, facts) is None, row
         for knobs in (SdpaFwdKnobs(split_kv=2), SdpaFwdKnobs(pack_gqa=True)):
             assert engines.mismatch(caps, facts, knobs) is not None, (row, knobs)
+    # The ONE exception, half row only: a DECODE-shaped gated graph (S_q x G <= 16 packed rows) splits on the
+    # d256 decode tile, whose combine applies the gate -- packed or not, paged or dense; its UNSPLIT form keeps
+    # the prefill kernel (dense only, unpacked).  test_sdpa_fwd_decode_d256_sm107 carries the full contract.
+    decode = _gate_facts(
+        h_kv=2, s_q=1, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, epilogue_gate_dtype=cudnn.data_type.BFLOAT16
+    )  # dense UNPADDED: the one dense form a split rides
+    assert engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=2, pack_gqa=True)) is None
+    assert engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=2)) is None
+    assert engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=1)) is None  # the prefill kernel's fused epilogue
+    why = engines.mismatch(f16, decode, SdpaFwdKnobs(split_kv=1, pack_gqa=True))
+    assert why is not None and "decode tile" in why, why
+    decode_paged = _gate_facts(h_kv=2, s_q=1, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, epilogue_gate_dtype=cudnn.data_type.BFLOAT16, **paged)
+    assert engines.mismatch(f16, decode_paged) is None and engines.mismatch(f16, decode_paged, SdpaFwdKnobs(split_kv=2, pack_gqa=True)) is None
+    why = engines.mismatch(f16, decode_paged, SdpaFwdKnobs(split_kv=1))
+    assert why is not None and "paged" in why and "gate" in why, why
+    assert engines.mismatch(fp8, _fp8_gate_facts(h_kv=2, s_q=1, s_kv=4096), SdpaFwdKnobs(split_kv=2)) is not None, "the quantized rows keep the gate unsplit"
     # A broadcast G / an undeclared O_v are DECLINES (legal graphs for the backend), never facts.invalid.
     why = engines.mismatch(f16, _gate_facts(epilogue_gate_shape_ok=False))
     assert why is not None and "shape" in why, why

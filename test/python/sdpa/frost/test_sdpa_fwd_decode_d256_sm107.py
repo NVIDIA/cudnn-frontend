@@ -299,14 +299,100 @@ def test_sm107_row_and_predicate_agree_on_the_decode_tile():
     assert engines.d256_decode_tile_selected(caps, f, 1) and engines.d256_decode_tile_selected(caps, f, 12)
     assert engines.mismatch(caps, f, None) is None
     assert engines.mismatch(caps, SdpaGraphFacts(**{**base, "has_sink": True}), None) is None
-    for change in (dict(s_q=17), dict(thd=True), dict(has_epilogue_gate=True), dict(attn_scale_prefolded=True), dict(d_qk=128, d_v=128)):
+    for change in (dict(s_q=17), dict(thd=True), dict(attn_scale_prefolded=True), dict(d_qk=128, d_v=128)):
         g = SdpaGraphFacts(**{**base, **change})
         assert not engines.d256_decode_tile_selected(caps, g, 1), change
+    # The fused-gate tail: selected through a SPLIT only (the gate rides the split combine; the
+    # tile has no gate seams), so an unsplit set is not the tile's and the facts-only question says yes.
+    gated = SdpaGraphFacts(**{**base, "has_epilogue_gate": True, "epilogue_gate_dtype": cudnn.data_type.BFLOAT16})
+    assert engines.d256_decode_tile_selected(caps, gated, 12) and engines.d256_decode_tile_selected(caps, gated, 12, split_kv=2)
+    assert not engines.d256_decode_tile_selected(caps, gated, 12, split_kv=1)
     for change in (dict(s_q=64), dict(d_qk=128, d_v=128)):
         g = SdpaGraphFacts(**{**base, **change})
         reason = engines.mismatch(caps, g, None)
         assert reason and "Rubin paged KV requires THD" in reason, (change, reason)
     assert not engines.d256_decode_tile_selected(caps, SdpaGraphFacts(**{**base, "s_q": 2}), 16)  # 32 packed rows: the unrouted tile
+
+
+def test_sm107_row_predicate_and_heuristics_agree_on_the_gated_decode_tile():
+    """The gate-in-combine contract at the facts level, on the Rubin row: a GATED decode-shaped half
+    d256 graph (the ``mul(O_v, sigmoid(G))`` tail) is served on the decode tile through its SPLIT --
+    the tile has no gate seams, the split combine applies the gate -- packed or not, paged or dense;
+    its unsplit form is the d256 PREFILL kernel's fused epilogue (dense only: the paged prefill kernel
+    has no gate), so mismatch admits exactly the sets the lowering runs and the heuristics propose
+    exactly those (rule 4: never a declined set): the decode model's split floored at 2 leads, packed
+    12:1; a paged gated graph lists no unsplit set at all; a padded dense cache (no split) keeps the
+    fused prefill kernel; a prefill-shaped gated graph keeps the old contract (unsplit, unpacked)."""
+    import cudnn
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible, _pack_gqa_group, _split_points, recommend
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _engine())
+    fam = next(r for r in MANIFEST if r.factory == "FrostSdpaFwdEngines")
+    offered = {_engine(): fam.engine_id + fam.slots[_engine()].slot}
+    base = dict(
+        b=4,
+        h_q=24,
+        h_kv=2,
+        s_q=1,
+        s_kv=4096,
+        d_qk=D,
+        d_v=D,
+        dtype=cudnn.data_type.BFLOAT16,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        device_cc=(10, 7),
+        device_sm_count=204,
+        has_epilogue_gate=True,
+        epilogue_gate_dtype=cudnn.data_type.BFLOAT16,
+    )
+
+    def sets(f):
+        out = [p.knobs for p in recommend("A", f, offered) if p.engine_id == offered[_engine()]]
+        for k in out:
+            assert engines.mismatch(caps, f, k) is None, (k, engines.mismatch(caps, f, k))
+        return [(k.pack_gqa is True, k.split_kv or 1) for k in out]
+
+    paged = SdpaGraphFacts(**base)
+    assert engines.mismatch(caps, paged, None) is None
+    assert engines.mismatch(caps, paged, SdpaFwdKnobs(pack_gqa=True, split_kv=2)) is None
+    assert engines.mismatch(caps, paged, SdpaFwdKnobs(pack_gqa=False, split_kv=4)) is None
+    why = engines.mismatch(caps, paged, SdpaFwdKnobs(pack_gqa=False, split_kv=1))
+    assert why and "paged" in why and "gate" in why and "combine" in why, why  # the paged prefill kernel has no gate
+    why = engines.mismatch(caps, paged, SdpaFwdKnobs(pack_gqa=True, split_kv=1))
+    assert why and "decode tile" in why, why
+    assert _pack_gqa_eligible(caps, paged, 128, 2) and not _pack_gqa_eligible(caps, paged, 128, 1) and _pack_gqa_group(caps, paged, 128, True, 2) == 12
+    paged_sets = sets(paged)
+    assert paged_sets[0] == (True, 16) and all(
+        s > 1 for _, s in paged_sets
+    ), paged_sets  # 8 units x 32 tiles: the model splits 16 ways; no unsplit gated paged plan exists
+    assert _split_points(caps, paged, 128, 128, 2, pack_g=12) == [16]
+    # Dense UNPADDED: the same split lead; the unsplit runner-up is the prefill kernel's fused gate, unpacked.
+    dense = SdpaGraphFacts(**{**base, "has_paged_kv": False, "page_size": 0, "padded": False})
+    assert engines.mismatch(caps, dense, SdpaFwdKnobs(pack_gqa=False, split_kv=1)) is None
+    why = engines.mismatch(caps, dense, SdpaFwdKnobs(pack_gqa=True, split_kv=1))
+    assert why and "decode tile" in why, why  # a packed unsplit gated plan does not exist on this row
+    dense_sets = sets(dense)
+    assert dense_sets[0] == (True, 16) and (False, 1) in dense_sets and (True, 1) not in dense_sets, dense_sets
+    assert _split_points(caps, dense, 128, 128, 2, pack_g=12) == [16, 1]
+    # Dense PADDED: the shared no-split rule holds, so the gated graph keeps the fused prefill kernel.
+    padded_dense = SdpaGraphFacts(**{**base, "has_paged_kv": False, "page_size": 0})
+    assert sets(padded_dense) == [(False, 1)]
+    # The serving shape (b=32 x 2 KV heads, 32 tiles), whose ungated leading plan is UNSPLIT: gated, the leading plan is split 2.
+    serving = SdpaGraphFacts(**{**base, "b": 32, "h_q": 32})
+    assert sets(serving)[0] == (True, 2), sets(serving)
+    assert sets(SdpaGraphFacts(**{**base, "b": 32, "h_q": 32, "has_epilogue_gate": False}))[0] == (True, 1)
+    # Prefill-shaped gated graphs keep the old contract: unsplit, unpacked; paged + gate past the tile is declined.
+    prefill = SdpaGraphFacts(**{**base, "s_q": 512, "s_kv": 512, "has_paged_kv": False, "page_size": 0, "padded": False})
+    assert sets(prefill) == [(False, 1)]
+    why = engines.mismatch(caps, prefill, SdpaFwdKnobs(split_kv=2))
+    assert why and "gate" in why, why
+    why = engines.mismatch(caps, SdpaGraphFacts(**{**base, "s_q": 512}), None)
+    assert why and "paged" in why and "gate" in why, why
 
 
 # --- the graph path on a Rubin GPU -------------------------------------------------------------
@@ -337,6 +423,7 @@ def _run_graph(
     pack_gqa=None,
     padded=True,
     capture=None,
+    gate=None,
 ):
     """Build cuDNN's paged (``page`` > 0) or dense SDPA graph -- padded (per-batch
     ``seq_len_kv`` / ``seq_len_q``, the default) or, with ``padded=False`` on a dense cache
@@ -348,7 +435,13 @@ def _run_graph(
     suite's fp32 reference.  Returns the pinned plan (its knobs are what the row-contract
     tests read); ``capture`` (a dict) additionally receives the fp32 ``o`` ([B, S_q, H, d]),
     the ``lse`` ([B, H, S_q], or None) and the kernel ``module`` the executor loaded, for
-    the bitwise comparisons."""
+    the bitwise comparisons.
+
+    ``gate``: None = the plain sdpa graph; ``"random"`` = the fused epilogue-gate TAIL
+    (``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)``, ``cudnn._sdpa_tail``) with a +-2 sigma
+    G in the IO dtype; a number = that gate logit on every element (+-1e4: an exactly
+    saturated sigmoid, 0: exactly one half).  The reference is then multiplied by
+    ``sigmoid(G)`` in fp32; the captured ``gate`` is the BSHD fp32 G."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
 
@@ -360,6 +453,11 @@ def _run_graph(
     q_gpu = torch.randn(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)  # BHSD strides over a BSHD buffer
     k_dense = torch.randn(B, S, KH, d, device=dev, dtype=dtype)
     v_dense = torch.randn(B, S, KH, d, device=dev, dtype=dtype)
+    gate_gpu = None
+    if gate is not None:
+        gate_gpu = (
+            (torch.randn(B, s_q, H, d, device=dev) * 2.0 if gate == "random" else torch.full((B, s_q, H, d), float(gate), device=dev)).to(dtype).transpose(1, 2)
+        )
     o_gpu = torch.empty(B, s_q, H, d, device=dev, dtype=dtype).transpose(1, 2)
     seq_kv = torch.tensor(lens, dtype=torch.int32, device=dev)
     seq_q = torch.tensor(q_lens if q_lens is not None else [s_q] * B, dtype=torch.int32, device=dev)
@@ -397,6 +495,14 @@ def _run_graph(
         sink_t = g.tensor_like(sink_gpu)
         kw["sink_token"] = sink_t
     o, st = g.sdpa(**kw)
+    gt = None
+    if gate_gpu is not None:
+        # The three-node gate tail: the sdpa output stays VIRTUAL but declared (dim + stride),
+        # the mul output is the graph's real O (docs/operations/Attention.md, "Fused epilogue gate").
+        o.set_dim(q_gpu.shape).set_stride(q_gpu.stride())
+        gt = g.tensor_like(gate_gpu)
+        o = g.mul(a=o, b=g.sigmoid(input=gt, name="sig"), name="gated")
+        o.set_data_type(io)
     o.set_output(True).set_dim(q_gpu.shape).set_stride(q_gpu.stride())
     stats_gpu = None
     if stats:
@@ -420,6 +526,8 @@ def _run_graph(
         vp[st] = stats_gpu
     if sinks is not None:
         vp[sink_t] = sink_gpu
+    if gt is not None:
+        vp[gt] = gate_gpu
     # Rule 3: the execute path reads the per-batch lengths and page tables on
     # device; any blocking D2H here is a bug, not a slow path.
     torch.cuda.set_sync_debug_mode("error")
@@ -432,6 +540,13 @@ def _run_graph(
     ref_o, ref_lse = _ref(
         q_gpu.transpose(1, 2), k_dense, v_dense, lens, q_lens, scale, causal_br=causal_br, window_left=window_left, window_right=window_right, sinks=sinks
     )
+    gate_f32 = None
+    if gate_gpu is not None:
+        # The reference gates its fp32 O (the gated prefill kernels' and the combine's
+        # convention: one rounding, of O32 * sigmoid(G)); the suite tolerance absorbs the
+        # one-ulp difference to a reference that would round O to the IO dtype first.
+        gate_f32 = gate_gpu.transpose(1, 2).float()
+        ref_o = ref_o * torch.sigmoid(gate_f32)
     out = o_gpu.transpose(1, 2).float()
     assert not torch.isnan(out).any(), "NaN in O"
     torch.testing.assert_close(out, ref_o, atol=2e-2 if dtype == torch.float16 else 5e-2, rtol=0)
@@ -454,6 +569,7 @@ def _run_graph(
             v=v_dense.clone(),
             lens=list(lens),
             scale=scale,
+            gate=gate_f32.clone() if gate_f32 is not None else None,
         )
     return plan
 
@@ -462,24 +578,39 @@ def _sm_count():
     return torch.cuda.get_device_properties(0).multi_processor_count
 
 
-def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False):
+def _assert_decode_tile_plan(plan, *, G, units=None, kv_tiles=None, replay=False, gated=False):
     """The SM100 suite's policy on the Rubin row, now that it claims PackGQA + split-KV on the tile
     (the inversion of the former unpacked / unsplit pin): the plan is PACKED exactly when there is a
     group to pack (``G > 1``; MHA stays the bit-exact unpacked fold) and, for a shape the decode split
     model governs (``units`` x ``kv_tiles`` given: an unmasked, sink-free paged or unpadded cache), its
     split is that model's eager-safe choice -- the captured optimum under ``replay`` -- at THIS part's
     SM count.  Shapes the shared no-split rules bind (a padded dense cache, a sink, per-batch Q lengths)
-    pass no model inputs and are pinned unsplit by their caller."""
+    pass no model inputs and are pinned unsplit by their caller.  ``gated``: the graph carries the
+    fused-gate tail, which rides the tile through its split only (the combine applies the gate), so
+    the model's "do not split" reads as the smallest split, 2."""
     assert (plan.knobs.pack_gqa is True) == (G > 1), (G, plan.knobs)
     if units is not None:
         want = choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=_sm_count(), **({"launch_cost": 0.0} if replay else {}))
+        if gated:
+            want = max(want, 2)
         assert (plan.knobs.split_kv or 1) == want, (plan.knobs, want)
 
 
-def _assert_split_matches_unsplit(a, b, dtype, *, q, k, v, lens, scale, what):
+def _ulp(mag, mbits):
+    """The output dtype's ulp at each element's own binade (``mag`` fp64, non-negative), floored at the
+    dtype's SUBNORMAL step: f16 (10 mantissa bits, min normal 2^-14) spaces every value below 6.1e-5 by
+    2^-24, bf16 (7 bits, min normal 2^-126) by 2^-133 -- a cancellation element of O at 1e-5 is an f16
+    subnormal, and its one-ulp rounding flip is 6e-8, not the 1e-8 the normal-range formula would say."""
+    _, exp = torch.frexp(mag.cpu())  # mag = m * 2**exp, m in [0.5, 1): the dtype's ulp in that binade is 2**(exp - 1 - mbits)
+    emin = {7: -126, 10: -14}[mbits]
+    ulp = torch.ldexp(torch.ones_like(mag.cpu()), exp - 1 - mbits)
+    return torch.clamp(ulp, min=2.0 ** (emin - mbits)).to(mag.device)
+
+
+def _assert_split_matches_unsplit(a, b, dtype, *, q, k, v, lens, scale, what, gate=None):
     """The DERIVED budget between the split and the unsplit plan of one graph, per output element:
 
-        |a - b| <= ulp_dtype(max(|a|, |b|)) + eps_P * sum_j p_j |v_j| / l
+        |a - b| <= ulp_dtype(max(|a|, |b|)) + sigmoid(g) * 2 * eps_P * sum_j p_j |v_j| / l
 
     Two terms, two causes.  (1) The output is rounded ONCE to the output dtype from two fp32
     values that are the same quantity associated differently (the split path renormalises each
@@ -488,18 +619,23 @@ def _assert_split_matches_unsplit(a, b, dtype, *, q, k, v, lens, scale, what):
     binade.  (2) Before that rounding the two fp32 values are NOT equal to fp32 precision: the
     tile quantizes P = exp(s - m) to the half IO dtype for BMM2 (the P^T operand must match V's
     dtype) at the running max m of ITS OWN split, so every p_j carries a relative rounding
-    error |delta_j| <= eps_P = 2^-(mbits+1) that differs between the two paths; the resulting
-    disagreement of sum_j p_j (1 + delta_j) v_j / l is bounded by eps_P * sum_j p_j |v_j| / l --
-    the row's softmax-weighted mean of |V|, computed here from the same inputs in fp32, a
-    rigorous (not statistical) bound.  Term (2) is what makes an element near ZERO (cancellation)
-    differ by far more than one ulp of its own tiny magnitude; it also exceeds one output ulp of
-    a mid-magnitude element (|O| ~ 2^-6: eps_P * mean|V| ~ 2^-8 in bf16 against a 2^-13 ulp), so
-    the ONE assertion is the two-term budget -- the per-binade ulp counts are reported, not
-    pinned.  Still 6x (bf16) / 20x (f16) under the suite's reference tolerance, and any
-    structural defect (a wrong combine weight, a dropped split, a stale partial) lands orders of
-    magnitude above it.  Both plans match the fp32 reference on their own; the measured
+    error |delta_j| <= eps_P = 2^-(mbits+1) that differs between the two paths; each path's
+    sum_j p_j (1 + delta_j) v_j / l sits within eps_P * sum_j p_j |v_j| / l of the exact value,
+    so their DIFFERENCE is within TWICE that -- the row's softmax-weighted mean of |V|, computed
+    here from the same inputs in fp32, a rigorous (not statistical) bound on the two-path
+    difference (one eps_P would bound each path alone).  Term (2) is what makes an element near
+    ZERO (cancellation) differ by far more than one ulp of its own tiny magnitude; it also exceeds
+    one output ulp of a mid-magnitude element (|O| ~ 2^-6: eps_P * mean|V| ~ 2^-8 in bf16 against
+    a 2^-13 ulp), so the ONE assertion is the two-term budget -- the per-binade ulp counts are
+    reported, not pinned.  Still 6x (bf16) / 20x (f16) under the suite's reference tolerance, and
+    any structural defect (a wrong combine weight, a dropped split, a stale partial) lands orders
+    of magnitude above it.  Both plans match the fp32 reference on their own; the measured
     magnitudes are printed so the log carries them.  Dense / padded rows without a causal or
-    window mask only."""
+    window mask only.
+
+    ``gate`` (the fp32 BSHD G of a GATED graph): both paths multiply their fp32 value by the
+    SAME sigmoid(G) -- the same MUFU.TANH arithmetic on the same input -- before the single
+    rounding, so term (2) scales by sigmoid(g) per element and term (1) is unchanged."""
     mbits = {torch.bfloat16: 7, torch.float16: 10}[dtype]
     eps_p = 2.0 ** -(mbits + 1)
     B, s_q, H, d = q.shape
@@ -519,9 +655,9 @@ def _assert_split_matches_unsplit(a, b, dtype, *, q, k, v, lens, scale, what):
     live = torch.isfinite(prob).all(dim=-1)  # [B, H]
     a64, b64 = a.double().view(B, H, d), b.double().view(B, H, d)
     mag = torch.maximum(a64.abs(), b64.abs())
-    _, exp = torch.frexp(mag.cpu())  # mag = m * 2**exp, m in [0.5, 1): the dtype's ulp in that binade is 2**(exp - 1 - mbits)
-    ulp = torch.ldexp(torch.ones_like(mag.cpu()), exp - 1 - mbits).to(mag.device)
-    budget = ulp + eps_p * pv_abs.double()
+    ulp = _ulp(mag, mbits)
+    weight = torch.sigmoid(gate.double().view(B, H, d)) if gate is not None else 1.0
+    budget = ulp + weight * (2.0 * eps_p) * pv_abs.double()
     diff = (a64 - b64).abs()
     diff = diff[live]
     budget, ulp, mag = budget[live], ulp[live], mag[live]
@@ -1280,6 +1416,321 @@ def test_decode_adapter_cuda_graph_replay_no_host_sync():
             ref_o, ref_lse = _ref(q_gpu.transpose(1, 2), k_dense, v_dense, new_lens, None, scale)
             live = ~torch.isinf(ref_lse)
             torch.testing.assert_close(o_gpu.transpose(1, 2).float(), ref_o, atol=2e-2, rtol=0)
+            torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()
+
+
+# --- the gate in the combine: a GATED graph rides the tile through its split -------------------------
+#
+# The decode tile has no epilogue-gate seams (config_sm107.make_cfg_d256_decode refuses the record),
+# so a graph with the fused-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`` rode the d256
+# PREFILL kernel's fused epilogue -- unsplit, unpacked, dense only.  Now its SPLIT rides the tile: the
+# tile writes its fp32 partials as any split does and the shared combine applies ``O *= sigmoid(G)``
+# to the merged fp32 value before the single cast (``sm100/split_combine`` ``gate=True``, the fused
+# kernels' own ``h * tanh(g / 2) + h`` arithmetic -- FROST's one-rounding convention; vLLM's split
+# merge and the gated attention block's torch reference round the merged O to the IO dtype BEFORE the
+# fp32 gate).  At split_kv == 1 the gated graph keeps the prefill kernel (``api_dsl._gate_in_combine``,
+# ``engines.d256_decode_tile_selected(..., split_kv)``, the heuristics' floor of 2).
+
+
+@_gpu
+def test_decode_graph_gated_qwen_24_2_splits_with_the_gate_in_the_combine():
+    """The acceptance rule, gated: the Qwen 24/2 geometry WITH the fused-gate tail over pages leads
+    on the DECODE tile, packed 12:1, split by the decode model floored at 2 (8 units x 32 tiles: 16
+    ways), the module compiled UNGATED (TemplateParams.epilogue_gate False: the tile has no gate
+    seams) and the gate applied by the split combine; O matches the gated fp32 reference, LSE the
+    plain one, and a keyless batch's rows are EXACTLY 0 under a random gate."""
+    cap = {}
+    plan = _run_graph(B=4, H=24, KH=2, s_q=1, lens=[4096, 130, 0, 1024], page=16, dtype=torch.bfloat16, gate="random", capture=cap)
+    _assert_decode_tile_plan(plan, G=12, units=8, kv_tiles=32, gated=True)
+    assert plan.knobs.split_kv >= 2, plan.knobs
+    mod = cap["module"]
+    assert mod.__file__.endswith("/sm107/decode_d256_f16.py"), mod.__name__
+    assert (mod.HEADS_PER_TILE, mod.CFG.SPLIT_KV, mod.PARAMS.epilogue_gate) == (12, plan.knobs.split_kv, False), (
+        mod.HEADS_PER_TILE,
+        mod.CFG.SPLIT_KV,
+        mod.PARAMS,
+    )
+    assert (cap["o"][2] == 0).all(), "the keyless batch must be EXACTLY zero (a SELECT after the gate fma, never residue times a gate)"
+    assert torch.isneginf(cap["lse"][2]).all()
+
+
+@_gpu
+@pytest.mark.parametrize(
+    ("dtype", "page", "hnd"),
+    [(torch.bfloat16, 16, True), (torch.float16, 64, False)],
+    ids=["paged16_HND_bf16", "paged64_NHD_f16"],
+)
+def test_decode_graph_gated_paged_split_matches_the_reference(dtype, page, hnd):
+    """The gated split over PAGES (the serving form; the paged prefill kernel has no gate, so this is
+    the one gated paged plan the row has): b=8 x 2 KV heads over mixed lengths incl. 0 and 1, page 16
+    HND and page 64 NHD, packed 16:1, the model's split; O matches the gated reference, the keyless
+    batch is exactly 0 and the 1-key batch gates one key's row."""
+    cap = {}
+    plan = _run_graph(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 0, 300, 77], page=page, hnd=hnd, dtype=dtype, gate="random", capture=cap)
+    _assert_decode_tile_plan(plan, G=16, units=16, kv_tiles=32, gated=True)
+    assert plan.knobs.split_kv >= 2 and cap["module"].PARAMS.epilogue_gate is False, (plan.knobs, cap["module"].PARAMS)
+    assert (cap["o"][5] == 0).all() and torch.isneginf(cap["lse"][5]).all(), "the keyless batch: exactly 0 / -inf under a random gate"
+
+
+@_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_decode_graph_gated_split_matches_the_fused_unsplit_gate_within_the_budget(dtype):
+    """THE acceptance: split + gate-in-combine (the decode tile) against the UNSPLIT fused gate (the
+    d256 prefill kernel's epilogue, the same graph pinned split_kv=1 -- a different kernel; a dense
+    UNPADDED cache, the one form both plans serve: the paged prefill kernel has no gate), same inputs,
+    same G.  Both apply the same sigmoid(G) arithmetic (fmul2 / tanh.approx / ffma2) to their fp32
+    value before the single cast, so the gated difference is the attention's own: the derived
+    two-term budget of _assert_split_matches_unsplit with term (2) scaled by sigmoid(g) -- one output
+    ulp of the element's binade from the single rounding of two differently-associated sums, plus
+    sigmoid(g) x 2 eps_P x the row's softmax-weighted mean |V| from the half-precision P each kernel
+    quantizes at its own running max.  The exact max |dO| is printed (the record).  LSE is gate-free
+    on both kernels and agrees to a few fp32 ulps (two summation orders of one fp32 log-sum-exp)."""
+    kw = dict(B=3, H=24, KH=2, s_q=1, lens=[4096] * 3, page=0, padded=False, dtype=dtype, seed=29)
+    split, fused = {}, {}
+    ps = _run_graph(**kw, gate="random", capture=split)
+    _assert_decode_tile_plan(ps, G=12, units=6, kv_tiles=32, gated=True)
+    assert ps.knobs.split_kv >= 2 and split["module"].PARAMS.epilogue_gate is False, (ps.knobs, split["module"].PARAMS)
+    pu = _run_graph(**kw, gate="random", split_kv=1, expect=PREFILL, capture=fused)
+    assert pu.knobs.pack_gqa is not True and (pu.knobs.split_kv or 1) == 1 and fused["module"].PARAMS.epilogue_gate is True, (pu.knobs, fused["module"].PARAMS)
+    assert (
+        torch.equal(split["q"], fused["q"]) and torch.equal(split["k"], fused["k"]) and torch.equal(split["gate"], fused["gate"])
+    ), "the two plans must see the same inputs"
+    _assert_split_matches_unsplit(
+        split["o"],
+        fused["o"],
+        dtype,
+        q=fused["q"],
+        k=fused["k"],
+        v=fused["v"],
+        lens=fused["lens"],
+        scale=fused["scale"],
+        gate=fused["gate"],
+        what=f"gate-in-combine split {ps.knobs.split_kv} (decode tile) vs the fused unsplit gate (prefill kernel) O (dense unpadded, {dtype})",
+    )
+    lse_s, lse_u = split["lse"], fused["lse"]
+    live = torch.isfinite(lse_u)
+    lse_diff = (lse_s[live] - lse_u[live]).abs().max().item()
+    print(
+        f"gate-in-combine split {ps.knobs.split_kv} vs fused unsplit LSE (dense unpadded): max |diff| = {lse_diff:.3e} on |LSE| up to {lse_u[live].abs().max().item():.2f}"
+    )
+    torch.testing.assert_close(lse_s[live], lse_u[live], atol=5e-5, rtol=1e-5)
+
+
+@_gpu
+def test_decode_graph_gate_in_combine_is_bitwise_the_ungated_plan_at_exact_sigmoids():
+    """Bitwise against the unfused gate-after-combine reference WHERE THE ARITHMETIC IS IDENTICAL: the
+    same split plan without the gate tail loads the same ungated module and so computes the same fp32
+    merged value; sigmoid(+1e4) == 1, sigmoid(0) == 1/2 and sigmoid(-1e4) == 0 are exact in the
+    combine's tanh form (tanh.approx saturates to +-1 and tanh(0) == 0; ``h * t + h`` with h the
+    half-scaled value) and in the reference, and a power-of-two scaling commutes with the rounding,
+    so the gated O is BITWISE the ungated O, the ungated O times one half, and exactly 0.  LSE is
+    bitwise the ungated LSE in all three: the gate never touches the partials."""
+    kw = dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=torch.bfloat16, seed=17)
+    plain = {}
+    pp = _run_graph(**kw, capture=plain)
+    _assert_decode_tile_plan(pp, G=16, units=16, kv_tiles=32)
+    assert pp.knobs.split_kv > 1, pp.knobs
+    for logit, want in ((1e4, plain["o"]), (0.0, plain["o"] * 0.5), (-1e4, torch.zeros_like(plain["o"]))):
+        cap = {}
+        pg = _run_graph(**kw, gate=logit, split_kv=pp.knobs.split_kv, capture=cap)
+        assert pg.knobs.split_kv == pp.knobs.split_kv and pg.knobs.pack_gqa is True, (pg.knobs, pp.knobs)
+        assert cap["module"].__file__ == plain["module"].__file__ and cap["module"].PARAMS == plain["module"].PARAMS, "one ungated module serves both plans"
+        assert torch.equal(cap["o"], want), f"gate logit {logit}: max |diff| {(cap['o'] - want).abs().max().item():.3e}"
+        assert torch.equal(cap["lse"], plain["lse"]), f"gate logit {logit}: the LSE must not depend on the gate"
+
+
+@_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_decode_graph_gate_in_combine_vs_the_unfused_gate_after_combine_reference(dtype):
+    """Where the arithmetic is NOT identical the budget is stated: the unfused references (vLLM's
+    split merge, the gated attention block's torch reference) round the merged O to the IO dtype
+    BEFORE the fp32 gate and round again after it; this pass rounds ONCE.  Per element, with b the
+    ungated plan's O (the same merged value, rounded) and r = round(b * sigmoid(g)):
+
+        |a - r| <= ulp(max(|a|, |r|)) + sigmoid(g) * ulp(|b|) / 2 + |b| * 2^-11
+
+    -- the two final roundings, the intermediate rounding the reference carries (at most half an ulp
+    of the merged value, scaled by the gate; ulp(O32) <= ulp(b)), and the approximate tanh behind the
+    combine's sigmoid (tanh.approx.f32: max relative error 2^-11 per the PTX ISA, i.e. 2^-12 on the
+    sigmoid, doubled here as margin); ulp() is the dtype's, floored at its subnormal step (an f16 O
+    element near zero IS subnormal).  Rigorous given that tanh bound; the measured ratio is printed."""
+    kw = dict(B=8, H=32, KH=2, s_q=1, lens=[4096, 4000, 129, 1, 2048, 4096, 300, 77], page=16, dtype=dtype, seed=19)
+    plain, gated = {}, {}
+    pp = _run_graph(**kw, capture=plain)
+    pg = _run_graph(**kw, gate="random", split_kv=pp.knobs.split_kv, capture=gated)
+    assert pg.knobs.split_kv == pp.knobs.split_kv > 1, (pg.knobs, pp.knobs)
+    mbits = {torch.bfloat16: 7, torch.float16: 10}[dtype]
+    b = plain["o"].double()
+    s = torch.sigmoid(gated["gate"].double())
+    r = (plain["o"] * torch.sigmoid(gated["gate"])).to(dtype).double()  # the unfused convention: the IO-dtype O, the fp32 gate, the IO dtype again
+    a = gated["o"].double()
+    live = torch.isfinite(plain["lse"]).transpose(1, 2).unsqueeze(-1).expand_as(a)  # [B, S_q, H, d]
+    budget = _ulp(torch.maximum(a.abs(), r.abs()), mbits) + s * _ulp(b.abs(), mbits) * 0.5 + b.abs() * 2.0**-11
+    diff = (a - r).abs()
+    ratios = torch.where(live, diff / budget, torch.zeros_like(diff))
+    ratio = ratios.max().item()
+    worst = ratios.argmax()
+    big = live & (b.abs() >= 0.5)  # where the output rounding (<= ulp(a) / 2, <= 2^-(mbits + 2) of |b|) cannot hide the sigmoid's own deviation
+    implied = ((a / b) - s).abs()[big].max().item() if big.any() else float("nan")
+    print(
+        f"gate-in-combine vs the unfused gate-after-combine reference ({dtype}): max |diff| = {diff[live].max().item():.3e}, "
+        f"{(diff[live] > 0).double().mean().item():.4%} of the elements differ, max |diff| / budget = {ratio:.3f}; "
+        f"worst element: a={a.flatten()[worst].item():.6e} r={r.flatten()[worst].item():.6e} b={b.flatten()[worst].item():.6e} "
+        f"g={gated['gate'].double().flatten()[worst].item():.4f} s={s.flatten()[worst].item():.6f} budget={budget.flatten()[worst].item():.3e}; "
+        f"max |a/b - sigmoid(g)| over |b| >= 0.5: {implied:.3e}"
+    )
+    assert ratio <= 1.0, ratio
+    assert (a[~live] == 0).all(), "dead rows: exactly 0 on both"
+
+
+@_gpu
+def test_decode_graph_gated_packed_equals_unpacked_bitwise():
+    """24/2 gated over pages: the packed gated split (12 live rows per unit) and the unpacked gated
+    split (one live row per unit) at the SAME split compute each row's softmax over the same tiles in
+    the same order and gate the same merged value, so O and LSE are BITWISE equal (the ungated pin,
+    gated)."""
+    kw = dict(B=3, H=24, KH=2, s_q=1, lens=[1000, 129, 640], page=32, dtype=torch.bfloat16, seed=5)
+    packed, unpacked = {}, {}
+    pp = _run_graph(**kw, gate="random", pack_gqa=True, capture=packed)
+    _assert_decode_tile_plan(pp, G=12, units=6, kv_tiles=8, gated=True)
+    pu = _run_graph(**kw, gate="random", pack_gqa=False, split_kv=pp.knobs.split_kv, capture=unpacked)
+    assert pp.knobs.pack_gqa is True and pu.knobs.pack_gqa is not True and pu.knobs.split_kv == pp.knobs.split_kv >= 2, (pp.knobs, pu.knobs)
+    assert (packed["module"].HEADS_PER_TILE, unpacked["module"].HEADS_PER_TILE) == (12, 1)
+    assert torch.equal(packed["o"], unpacked["o"]), f"packed != unpacked: max |diff| {(packed['o'] - unpacked['o']).abs().max().item():.3e}"
+    assert torch.equal(packed["lse"], unpacked["lse"])
+
+
+@_gpu
+def test_decode_adapter_gate_rides_the_combine_on_the_tile_only():
+    """The standalone adapter's twin of the row's gate-in-combine claim (rule 8b): ACCEPT -- a gated
+    decode-shaped d256 graph with split_kv >= 2 lowers onto the decode tile (dense unpadded or paged,
+    packed or not), its template record UNGATED and the gate marked for the combine; at split_kv == 1
+    the same dense graph keeps the d256 prefill kernel's fused epilogue (record gated, the tile not
+    selected).  REJECT (typed, naming the combine) -- the gate at split 1 over pages, PackGQA with the
+    gate unsplit, a gated split past the tile (17 MHA rows, 32 packed rows)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    def api(*, s_q, H, KH, pack, split=1, page=0, seq_lens=True):
+        B, S = 2, 256
+        dtype = torch.bfloat16
+        q_gpu = torch.randn(B, s_q, H, D, device="cuda", dtype=dtype).transpose(1, 2)
+        if page:
+            k_dense = torch.randn(B, S, KH, D, device="cuda", dtype=dtype)
+            k_c, v_c, _ = _pools(k_dense, k_dense, page, True, seed=1)
+            paged_kw = dict(paged_page_size=page, paged_max_seq_len_kv=S)
+        else:
+            k_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+            v_c = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+            paged_kw = {}
+        a = SdpaFwdDslSm100(
+            sample_q=q_gpu,
+            sample_k=k_c,
+            sample_v=v_c,
+            sample_o=torch.empty_like(q_gpu),
+            sample_lse=torch.empty(B, H, s_q, device="cuda", dtype=torch.float32),
+            seq_kv_lens_present=seq_lens,
+            pack_gqa=pack,
+            split_kv=split,
+            sample_gate=torch.empty_like(q_gpu),
+            **paged_kw,
+        )
+        a.check_support()
+        return a
+
+    a = api(s_q=1, H=24, KH=2, pack=True, split=2, seq_lens=False)  # dense unpadded, packed, split: the tile, gate in the combine
+    assert a._decode_q_tile() == 16 and a._gate_in_combine() and a.template_params().epilogue_gate is False
+    a = api(s_q=1, H=24, KH=2, pack=True, split=4, page=16)  # paged, packed, split: the tile
+    assert a._decode_q_tile() == 16 and a._gate_in_combine() and a.template_params().epilogue_gate is False
+    a = api(s_q=16, H=4, KH=4, pack=False, split=4, page=16)  # 16 MHA rows unpacked, paged, split: the tile
+    assert a._decode_q_tile() == 16 and a._gate_in_combine() and a.template_params().epilogue_gate is False
+    a = api(s_q=1, H=24, KH=2, pack=False, split=1, seq_lens=False)  # dense, unsplit: the prefill kernel's fused epilogue
+    assert a._decode_q_tile() == 0 and not a._gate_in_combine() and a.template_params().epilogue_gate is True
+    with pytest.raises(NotImplementedError, match="paged"):
+        api(s_q=1, H=24, KH=2, pack=False, split=1, page=16)  # the paged prefill kernel has no gate; unsplit, the tile does not serve it
+    with pytest.raises(NotImplementedError, match="PackGQA"):
+        api(s_q=1, H=24, KH=2, pack=True, split=1, seq_lens=False)  # a packed unsplit gated plan exists on no Rubin kernel
+    with pytest.raises(NotImplementedError, match="split_kv"):
+        api(s_q=17, H=4, KH=4, pack=False, split=2, seq_lens=False)  # 17 MHA rows: past the tile, the prefill kernel has no dense split
+    with pytest.raises(NotImplementedError, match="decode tile|PackGQA"):
+        api(s_q=2, H=32, KH=2, pack=True, split=2, page=16)  # 32 packed rows: the unrouted tile; no Rubin d256 kernel packs them
+
+
+@_gpu
+def test_decode_adapter_gated_split_cuda_graph_replay_no_host_sync():
+    """The standalone adapter with ``sample_gate`` on the decode tile's split (packed 16:1, split 4
+    over pages): the two launches -- the ungated tile's partials, the GATED combine -- capture once
+    under the D2H detector (Rule 3) and replay with changed seq_lens AND changed gate CONTENT (G's
+    address is bound at capture, its values read at replay), matching the gated reference each time."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, P, S = 8, 32, 2, 16, 1024
+    dev, dtype = "cuda", torch.float16
+    torch.manual_seed(2)
+    k_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    v_dense = torch.randn(B, S, KH, D, device=dev, dtype=dtype)
+    k_c, v_c, bt4 = _pools(k_dense, v_dense, P, False, seed=2)
+    bt = bt4.view(B, -1)
+    q_gpu = torch.randn(B, 1, H, D, device=dev, dtype=dtype).transpose(1, 2)
+    gate_gpu = (torch.randn(B, 1, H, D, device=dev) * 2.0).to(dtype).transpose(1, 2)
+    o_gpu = torch.empty(B, 1, H, D, device=dev, dtype=dtype).transpose(1, 2)
+    lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
+    seq_lens = torch.full((B,), 1000, dtype=torch.int32, device=dev)
+    seq_q = torch.ones(B, dtype=torch.int32, device=dev)
+    api = SdpaFwdDslSm100(
+        sample_q=q_gpu,
+        sample_k=k_c,
+        sample_v=v_c,
+        sample_o=o_gpu,
+        sample_lse=lse,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        paged_page_size=P,
+        paged_max_seq_len_kv=S,
+        split_kv=4,
+        pack_gqa=True,
+        sample_gate=gate_gpu,
+    )
+    api.check_support()
+    api.compile()
+    assert api.kernel_template == DECODE and api._gate_in_combine() and api._k_mod.PARAMS.epilogue_gate is False
+    assert api.split_kv == 4 and api._k_mod.CFG.SPLIT_KV == 4 and api._k_mod.HEADS_PER_TILE == 16
+    assert api._dense_spec.gate_expect is None and api._dense_spec.combine.gate is not None, "the gate is the combine's, not the binder's"
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+    kw = dict(lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws, gate=gate_gpu)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        api.execute(q_gpu, k_c, v_c, o_gpu, **kw)
+    torch.cuda.synchronize()
+    first = o_gpu.clone()
+    with torch.cuda.stream(s):
+        api.execute(q_gpu, k_c, v_c, o_gpu, **kw)
+    torch.cuda.synchronize()
+    assert torch.equal(o_gpu, first), "two-launch delta on the gated O"
+    g = torch.cuda.CUDAGraph()
+    try:
+        prev = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, **kw)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        scale = 1.0 / math.sqrt(D)
+        gen = torch.Generator(device=dev).manual_seed(33)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            gate_gpu.copy_((torch.randn(B, 1, H, D, device=dev, generator=gen) * 2.0).to(dtype).transpose(1, 2))
+            g.replay()
+            torch.cuda.synchronize()
+            ref_o, ref_lse = _ref(q_gpu.transpose(1, 2), k_dense, v_dense, new_lens, None, scale)
+            ref_o = ref_o * torch.sigmoid(gate_gpu.transpose(1, 2).float())
+            live = ~torch.isinf(ref_lse)  # [B, H, 1]
+            torch.testing.assert_close(o_gpu.transpose(1, 2).float(), ref_o, atol=2e-2, rtol=0)
+            dead = (~live).view(B, 1, H)  # the [B, S_q=1, H] rows of the BSHD output
+            if dead.any():
+                assert (o_gpu.transpose(1, 2)[dead].float() == 0).all(), "a keyless row must be EXACTLY 0 under the gate, every replay"
             torch.testing.assert_close(lse.view(B, H, 1)[live], ref_lse[live], atol=5e-3, rtol=0)
     finally:
         g.reset()
