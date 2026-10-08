@@ -3301,6 +3301,8 @@ def _correction_warp_group(
                                 if _sfo_r < _sfo_rows_pad:
                                     _sf_ptr.store(cutlass.Int8(_zero_i))
                 else:
+                    _zero_f = cutlass.Float32(0.0)
+                    _zero_out = cutlass.Vector.from_elements(tuple(cutlass.Float32(0.0) for _ in range(O_CHUNK)), cutlass.Float32).to(OUT_STORAGE_DTYPE)
                     for chunk_idx in cutlass.range_constexpr(N_CHUNKS_O):
                         o_addr = tmem_base_epi + cutlass.Int32(tmem_O_off + chunk_idx * O_CHUNK)
                         o_chunk = nvvm.tcgen05_ld(
@@ -3309,31 +3311,39 @@ def _correction_warp_group(
                             num=O_CHUNK,
                         )
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                        o_scaled = o_chunk * inv_sum
-                        # Dead-row sanitize: an empty mainloop never writes O TMEM,
-                        # so o_chunk is garbage (possibly NaN) and `* inv_sum(=0)`
-                        # cannot zero it — select 0 explicitly (keeps amax_o clean).
-                        _zero_f = cutlass.Float32(0.0)
-                        o_scaled = cutlass.Vector.from_elements(
-                            tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
-                            cutlass.Float32,
-                        )
-                        if cutlass.const_expr(CFG.EMIT_AMAX_O and amax_o_tensor is not None):
-                            for _i in cutlass.range_constexpr(O_CHUNK):
-                                _e = o_scaled[_i]
-                                _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))  # FMNMX3, not compare+select (see _E2E_FREQ block)
-                        o_out = o_scaled.to(OUT_STORAGE_DTYPE)
-
                         col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
                         block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
                         block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
                         smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
-
                         smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
-                        # Gate FIRST SMEM store (not earlier TMEM-load loop) — keeps load/FFMA/cast overlapped with prior TMA-STG drain.
+                        # Gate FIRST SMEM store (not earlier TMEM-load loop) -- keeps load/FFMA/cast overlapped with prior TMA-STG drain.
                         if chunk_idx == 0:
                             bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
-                        smem_ptr.store_swizzled(o_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                        if cutlass.const_expr(FUSED_LDTM_STAT or (CFG.EMIT_AMAX_O and amax_o_tensor is not None)):
+                            o_scaled = o_chunk * inv_sum
+                            # Dead-row sanitize: an empty mainloop never writes O TMEM, so o_chunk is garbage (possibly
+                            # NaN) and `* inv_sum(=0)` cannot zero it -- select 0 explicitly (keeps amax_o clean).
+                            o_scaled = cutlass.Vector.from_elements(
+                                tuple(cutlass.Float32(arith.select(row_dead.ir_value(), _zero_f.ir_value(), o_scaled[i].ir_value())) for i in range(O_CHUNK)),
+                                cutlass.Float32,
+                            )
+                            if cutlass.const_expr(CFG.EMIT_AMAX_O and amax_o_tensor is not None):
+                                for _i in cutlass.range_constexpr(O_CHUNK):
+                                    _e = o_scaled[_i]
+                                    _amax_o_local = fmax_f32(_amax_o_local, cute.math.abs(_e))  # FMNMX3, not compare+select (see _E2E_FREQ block)
+                            o_out = o_scaled.to(OUT_STORAGE_DTYPE)
+                            smem_ptr.store_swizzled(o_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                        else:
+                            # cc 10.0: the softmax warps are issue-bound and share the schedulers with these warps,
+                            # so the per-element dead-row select becomes a zero-store branch (uniform for every warp
+                            # without a dead row).  cc 10.3 keeps the select path: its drain is bound by the TMEM
+                            # reads, and a per-lane branch around the swizzled store faulted there.
+                            if row_dead:
+                                smem_ptr.store_swizzled(_zero_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                            else:
+                                o_scaled = o_chunk * inv_sum
+                                o_out = o_scaled.to(OUT_STORAGE_DTYPE)
+                                smem_ptr.store_swizzled(o_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
                         if cutlass.const_expr(O_STORE_PARTS > 1 and ((chunk_idx + 1) * O_CHUNK) % D_BLOCK_SIZE == 0):
                             # This column block is complete in SMEM: publish it to the async proxy and let the
                             # TMA-STG warp store it while the next block is still being converted.
