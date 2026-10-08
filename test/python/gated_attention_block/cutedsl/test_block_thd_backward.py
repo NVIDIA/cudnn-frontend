@@ -16,8 +16,10 @@ The oracle is ``test_block_backward._fp64_oracle`` PER SEQUENCE on fp64 slices o
 SUM over the sequences; the ``dW_norm`` noise bound's ``mass`` is ``sqrt(sum_i mass_i^2)`` (the terms are the union of the
 sequences' rows).  Tolerances are the dense backward suite's (``_RTOL`` / ``_ATOL_FRAC`` / the ``dW_norm`` noise bound),
 never widened.  Degenerate packings are first-class: zero-length sequences at every position, a 5-token sequence (never
-a 1-token one), tail tiles, the three GQA fold paths.  ``fuse_gate_bwd`` is a typed decline under THD (the packed chain's
-delta has no external producer yet); ``fuse_wgrad_overlap`` is served and pinned bitwise the in-order block.
+a 1-token one), tail tiles, the three GQA fold paths.  ``fuse_gate_bwd`` is SERVED under THD -- the gate backward's dense
+delta arm at ``B = 1, S = T`` writes the packed head-major ``[1, H_q, ceil128(T)]`` delta the packed chain reads, so the fused
+packed block is pinned BITWISE the unfused one (every gradient, the delta buffer with its zero tail, the carve moved, one launch
+fewer); ``fuse_wgrad_overlap`` is served and pinned bitwise the in-order block.
 
 Accept tests are ``requires_rubin``; the reject tests build CUDA tensors for a DECLARED backward (``requires_cuda``, no
 compile) under ``set_sync_debug_mode("error")``; the static pin of the SDPA backward stage's packed declaration runs on any
@@ -249,18 +251,40 @@ def _check_all_grads_packed(res) -> dict:
 
 
 @requires_cuda
+@pytest.mark.parametrize("external", [False, True], ids=["own_delta", "external_delta"])
 @pytest.mark.parametrize("cu", [False, True], ids=["lengths", "prefix"])
-def test_thd_sdpa_bwd_stage_declares_the_packed_chain(cu):
+def test_thd_sdpa_bwd_stage_declares_the_packed_chain(cu, external):
     """The SDPA backward stage under THD declares ``thd=True`` with both packed totals ``T``, the envelope descriptors
     ``(B, H, S_max, D)`` with ``(B, H_q, S_max, 1)`` Stats, ``thd_stats_token_major=False`` with
     ``thd_stats_head_stride == _thd_lse_head_stride(T)`` (the forward's packing, imported -- never a literal T),
-    ``external_delta=False`` (the packed chain's own ``dot_do_o``) and no ``seq_kv_lens_present``.  The adapter's
-    constructor touches no device."""
+    ``external_delta`` passed THROUGH (``False``: the packed chain's own ``dot_do_o``; ``True`` -- ``fuse_gate_bwd`` -- the
+    adapter's packed delta ``(1, H_q, ceil128(T))``, no ``delta`` in its carve, the carve smaller by exactly that aligned
+    region) and no ``seq_kv_lens_present``.  The adapter's constructor touches no device."""
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
     g = GatedAttentionBlockGeometry(**_COMMON)
     b, s_max, t = 3, 300, 628
-    st = _SdpaBwd(g, batch=1, seq_len=t, dtype=torch.bfloat16, device=torch.device("cuda"), thd=True, num_sequences=b, max_seq_len=s_max, cu_seqlens=cu)
+    t_pad = -(-t // 128) * 128
+    mk = lambda ext: _SdpaBwd(  # noqa: E731
+        g,
+        batch=1,
+        seq_len=t,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+        external_delta=ext,
+        thd=True,
+        num_sequences=b,
+        max_seq_len=s_max,
+        cu_seqlens=cu,
+    )
+    st = mk(external)
     impl = st._build_impl()
-    assert impl.thd is True and impl.external_delta is False and impl.seq_kv_lens_present is False
+    assert impl.thd is True and impl.external_delta is external and impl.seq_kv_lens_present is False
+    assert tuple(impl.external_delta_shape) == st.delta_shape == (1, g.h_q, t_pad), "the packed delta: the dense layout at B = 1, S = T"
+    assert ("delta" in [n for n, _n, _d in impl._scratch_plan()]) is (not external)
+    if external:
+        own = mk(False)
+        assert own.scratch_workspace_bytes() - st.scratch_workspace_bytes() == ws_align(g.h_q * t_pad * 4), "the carve lost exactly the delta region"
     assert impl.max_total_seq_len_q == t and impl.max_total_seq_len_kv == t
     assert impl.thd_stats_token_major is False and impl.thd_stats_head_stride == _thd_lse_head_stride(t) == t
     assert tuple(impl.stats_desc.shape) == (b, g.h_q, s_max, 1)
@@ -308,13 +332,21 @@ def test_thd_backward_declaration_records_the_knobs():
 
 
 @requires_cuda
-def test_thd_declines_fuse_gate_bwd():
-    """``fuse_gate_bwd=True`` under THD is a typed ``NotImplementedError`` at ``check_support`` -- the packed chain
-    computes its delta in the head-major ``[1, H_q, ceil128(T_q)]`` layout and the gate-backward kernel has no packed
-    delta arm -- naming the knob to pass instead."""
+def test_thd_serves_fuse_gate_bwd():
+    """``fuse_gate_bwd=True`` under THD is SERVED: the declared packed backward carries the knob, its gate-backward stage wants
+    the delta, its SDPA stage is the packed chain with ``external_delta=True`` and the adapter's packed delta shape
+    ``(1, H_q, ceil128(T))`` -- the dense ``[B, H_q, S_pad]`` layout at ``B = 1, S = T``, which is what the gate backward writes at
+    ``s = T`` -- and ``check_support`` passes on the healthy record up to the arch gate (no ``fuse_gate_bwd`` decline exists under
+    ``thd`` any more).  Host-side, no compile."""
     res = _declare_bwd_thd(fuse_gate_bwd=True)
-    with _no_device_sync(), pytest.raises(NotImplementedError, match="fuse_gate_bwd=True is dense-only"):
-        res.blk.check_support()
+    blk, t = res.blk, res.meta["t"]
+    assert blk.thd and blk.fuse_gate_bwd and blk._gate_bwd.want_delta and blk._sdpa.thd and blk._sdpa.external_delta
+    impl = blk._sdpa._build_impl()
+    assert impl.thd is True and impl.external_delta is True
+    assert tuple(impl.external_delta_shape) == blk._sdpa.delta_shape == (1, res.geom.h_q, -(-t // 128) * 128)
+    if _cc() != _SM107:
+        with _no_device_sync(), pytest.raises(NotImplementedError, match="Rubin"):
+            blk.check_support()
 
 
 @requires_cuda
@@ -962,7 +994,8 @@ def test_thd_execute_lengths_must_be_the_record_tensor():
 @requires_rubin
 def test_thd_convenience_wrapper_caches_per_packing_declaration():
     """Two wrapper calls differing only in ``max_seq_len`` (or in the record's form) build two blocks -- the cache key
-    carries the packing facts -- and the wrapper's gradients equal the class's bitwise."""
+    carries the packing facts -- and the wrapper's gradients equal the class's bitwise; ``fuse_gate_bwd`` passes through,
+    is SERVED under ``thd`` (the gradients stay bitwise) and is in the key."""
     res = _backward_thd(_COMMON, _LENS)
     inp, saved, g = res.inp, res.saved, res.geom
     leaves = dict(h=saved.h, w_qkvg=inp["w_qkvg"], w_o=inp["w_o"], w_q_norm=inp["w_q_norm"], w_k_norm=inp["w_k_norm"])
@@ -997,21 +1030,27 @@ def test_thd_convenience_wrapper_caches_per_packing_declaration():
             res.dy, saved, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], g, thd=True, max_seq_len=res.meta["max_seq_len"]
         )
         assert len(_BWD_CACHE) == n0 + 2, "a repeated declaration must hit the cache"
-        with pytest.raises(NotImplementedError, match="fuse_gate_bwd=True is dense-only"):
-            gated_attention_block_backward(
-                res.dy,
-                saved,
-                inp["w_qkvg"],
-                inp["w_q_norm"],
-                inp["w_k_norm"],
-                inp["cos"],
-                inp["sin"],
-                inp["w_o"],
-                g,
-                thd=True,
-                max_seq_len=res.meta["max_seq_len"],
-                fuse_gate_bwd=True,
-            )
+        # fuse_gate_bwd passes through and is SERVED under thd: a third cache entry (the knob is in the key) whose gradients are
+        # bitwise the class's unfused ones (the packed fused block's own pin is test_thd_fused_gate_bwd_is_bitwise_the_unfused_packed_block)
+        out3 = gated_attention_block_backward(
+            res.dy,
+            saved,
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"],
+            g,
+            thd=True,
+            max_seq_len=res.meta["max_seq_len"],
+            fuse_gate_bwd=True,
+        )
+        torch.cuda.synchronize()
+        assert len(_BWD_CACHE) == n0 + 3, "fuse_gate_bwd is not in the wrapper's cache key"
+        for name, ten in res.grads.items():
+            if ten is not None:
+                assert torch.equal(out3[name], ten), f"{name}: the wrapper's fused-gate packed block differs from the class's unfused one"
     finally:
         for ten in leaves.values():
             ten.requires_grad_(False)
