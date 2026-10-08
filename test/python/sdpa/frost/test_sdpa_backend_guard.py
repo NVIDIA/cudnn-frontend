@@ -48,14 +48,24 @@ def _facts(**over):
 
 
 @pytest.fixture
-def rubin_host(monkeypatch):
-    """A cc 10.7 device with the sm_107a DSL target, a cuDNN 9.26 backend and the flag deleted, modelled on any host."""
+def crashing_backend(monkeypatch):
+    """A cuDNN 9.26.0 backend -- below SQ1_MXFP8_PLANNING_CRASH_FIXED_IN, so the guard is armed -- modelled on any host.  The
+    guard reads ``cudnn.backend_version()`` at call time; the CI lanes run cuDNN 9.28, where it is lifted by design, so every
+    test of the ARMED guard pins the version instead of inheriting the installed library's (test_version_bound covers the
+    boundary itself)."""
+    monkeypatch.setattr(cudnn, "backend_version", lambda: 92600)
+    monkeypatch.setattr(cudnn, "backend_version_string", lambda: "9.26.0")
+
+
+@pytest.fixture
+def rubin_host(crashing_backend, monkeypatch):
+    """A cc 10.7 device with the sm_107a DSL target, the cuDNN 9.26 backend of ``crashing_backend`` and the flag deleted,
+    modelled on any host."""
     from cudnn.frost import buffers
 
     monkeypatch.setattr(graph_analyzer, "_device_cc", lambda: (10, 7))
     monkeypatch.setattr(graph_analyzer, "_device_sm_count", lambda: 216)
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    monkeypatch.setattr(cudnn, "backend_version", lambda: 92600)
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
 
 
@@ -111,10 +121,10 @@ def _plan_names(g):
 # --- the pure function on synthetic facts ---------------------------------------------------------------------------
 
 
-def test_guard_names_the_backend_and_the_reason_on_the_measured_domain():
+def test_guard_names_the_backend_and_the_reason_on_the_measured_domain(crashing_backend):
     reason = backend_guard(None, _facts())
     assert reason is not None
-    assert _GUARD in reason and _TAIL in reason and cudnn.backend_version_string() in reason
+    assert _GUARD in reason and _TAIL in reason and "cuDNN 9.26.0 " in reason
 
 
 @pytest.mark.parametrize(
@@ -134,7 +144,7 @@ def test_guard_names_the_backend_and_the_reason_on_the_measured_domain():
     ],
     ids=lambda over: ",".join(f"{k}={v}" for k, v in over.items()) or "base",
 )
-def test_every_single_query_mxfp8_graph_without_a_sink_is_guarded(over):
+def test_every_single_query_mxfp8_graph_without_a_sink_is_guarded(crashing_backend, over):
     """The measured crash domain: dense and THD, Stats on or off, every O dtype, both inputs, every head dim alike."""
     assert backend_guard(None, _facts(**over)) is not None
 
@@ -158,10 +168,11 @@ def test_every_single_query_mxfp8_graph_without_a_sink_is_guarded(over):
     ],
     ids=lambda over: ",".join(f"{k}={v}" for k, v in over.items()),
 )
-def test_one_deviation_from_the_domain_lets_the_backend_be_consulted(over):
-    """Outside the measured domain the backend is queried as usual: more than one query row, a sink token (the backend
-    plans), paged pools (the backend's own C++ validate declines them first), another device, per-tensor FP8 or half
-    graphs, backward graphs, malformed graphs."""
+def test_one_deviation_from_the_domain_lets_the_backend_be_consulted(crashing_backend, over):
+    """Outside the measured domain the backend is queried as usual -- with the guard ARMED (a crashing backend), so the
+    deviation is what lets it through: more than one query row, a sink token (the backend plans), paged pools (the
+    backend's own C++ validate declines them first), another device, per-tensor FP8 or half graphs, backward graphs,
+    malformed graphs."""
     assert backend_guard(None, _facts(**over)) is None
 
 
@@ -170,6 +181,8 @@ def test_no_facts_no_guard():
 
 
 def test_version_bound(monkeypatch):
+    """The recorded fix version is the exact boundary: armed one below it, lifted at it (and the installed library's own
+    version decides for a real graph -- the lanes' cuDNN 9.28 is above the record, a 9.26 box below it)."""
     if SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is None:
         # Every known build crashes: a future version number does not lift the guard until one is measured clean.
         monkeypatch.setattr(cudnn, "backend_version", lambda: 99999)
