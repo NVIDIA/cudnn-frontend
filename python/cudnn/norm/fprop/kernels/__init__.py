@@ -7,6 +7,7 @@ One entry module per flavor; the shared cp.async row staging + block reduction
 live in :mod:`_common_sm100`.
 
     layernorm_sm100     LayerNorm  (also the shared LN/RMS reduce-last-dim kernel)
+    layernorm_cga_sm100 LN/RMS with one row split across a CGA (DSMEM reduction, large C)
     rmsnorm_sm100       RMSNorm    (LayerNorm kernel, has_mean=False)
     groupnorm_sm100     GroupNorm  (shared row-wise kernel, affine c=(r%gps)*cpg+j//span)
     instancenorm_sm100  InstanceNorm (GroupNorm with num_groups=C)
@@ -25,6 +26,7 @@ from . import (  # noqa: F401
     batchnorm_nhwc_sm100,
     batchnorm_sm100,
     groupnorm_nhwc_sm100,
+    layernorm_cga_sm100,
     groupnorm_sm100,
     instancenorm_nhwc_sm100,
     instancenorm_sm100,
