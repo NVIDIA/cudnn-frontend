@@ -285,6 +285,11 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
 
 
+def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
+    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+
+
 def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
@@ -379,17 +384,20 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
         if k.thd_varlen and not (
-            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8 and k.split_kv > 1)
-            or (
-                flavor == "d128"
-                and not fp8
-                and (
-                    ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1)
-                    or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+            not fp8
+            and (
+                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and k.split_kv > 1)
+                or (
+                    flavor == "d128"
+                    and (
+                        ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1)
+                        or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                    )
                 )
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
             )
         ):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, or paged half d64 cga1 split")
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, or paged half d256 cga2 unsplit")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats

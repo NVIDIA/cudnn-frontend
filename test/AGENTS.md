@@ -278,6 +278,15 @@ containers (CI) set `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`, while pip torch uses
 IEEE fp32. A test that relies on the default passes in CI and fails locally,
 where `test_gemm_swiglu.py` had 64 such failures.
 
+### Sanitizer diagnostic controls
+
+Keep kernel-launch dumps separate from the pass/fail sanitizer invocation.
+Some Compute Sanitizer builds count each `--dump-kernel-launches` record in
+`ERROR SUMMARY` and apply `--error-exitcode` even to a valid kernel. Check a
+valid-memory control with and without that option before diagnosing a kernel
+error from the count alone. Use a known-bad memory/race canary to verify the
+detector, and retain a normal run of the real capture test without launch dumps.
+
 ### CUDA Graph test lifetimes
 
 Explicitly reset a test-owned CUDA Graph after replay verification, using a

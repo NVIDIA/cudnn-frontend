@@ -36,7 +36,13 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_paged_prefill_cga1, supports_thd_split
+from cudnn.sdpa.fwd.config_sm100 import (
+    SM100_THD_PACK_GQA_SHAPES,
+    pack_gqa_supported,
+    supports_paged_prefill_cga1,
+    supports_paged_d256_pack_gqa,
+    supports_thd_split,
+)
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -838,6 +844,21 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
             if (
+                capabilities.sm_lo == 107
+                and not (capabilities.is_fp8 or capabilities.is_mxfp8)
+                and _selected_d_shape(capabilities, facts) == (256, 256)
+                and not supports_paged_d256_pack_gqa(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                    split_kv=knobs.split_kv or 1,
+                )
+            ):
+                return "SM107 D256 PackGQA requires exact paged half THD with CGA2 and no split"
+            if (
                 facts.thd
                 and not ragged_decode
                 and not (packed_split and (facts.d_qk, facts.d_v) == (64, 64))
@@ -1288,7 +1309,7 @@ def _sm107_spec() -> EngineSpec:
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
       the shared combine. Bounded D128 THD and nonpaged D192 THD
       also use the shared single-CTA packed partials. Sink split stays declined.
-    - ``pack_gqas``: D128 paged THD and nonpaged split THD use the shared half pipeline.
+    - ``pack_gqas``: D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD without sink uses the shared
       Blackwell paged pipeline, compiled natively for SM107.
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
@@ -1342,8 +1363,8 @@ def _sm107_spec() -> EngineSpec:
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
             attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             pack_gqas=frozenset({False, True}),
-            pack_gqa_d_shapes=frozenset({(128, 128)}),
-            thd_pack_gqa_d_shapes=frozenset({(128, 128)}),
+            pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
+            thd_pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
             split_kv_supported=True,
             split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.

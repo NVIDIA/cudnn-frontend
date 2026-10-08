@@ -54,6 +54,7 @@ from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epil
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
     supports_paged_prefill_cga1,
+    supports_paged_d256_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
@@ -1764,6 +1765,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd
                 and not self.thd_decode_leg
                 and not (self.packed_thd_split and int(d_qk) in (64, 128))
+                and not supports_paged_d256_pack_gqa(
+                    (int(d_qk), int(d_v)),
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                )
                 and not (
                     (self._device_cc != (10, 7) or self.paged)
                     and not self._fp8
@@ -1771,7 +1781,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and (self.cga in (None, 2) or paged_prefill_cga1)
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit or cga1 split; Rubin paged KV also admits cga1 unsplit",
+                "THD PackGQA requires half D128 cga2 unsplit/cga1 split, Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
