@@ -1556,8 +1556,8 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     the split budget of an underfilled single request. Rubin qualification
     covers larger batches and caches using the same first-wave budget;
     already-filled grids retain the unsplit candidate. Blackwell also admits
-    GQA16 and KV lengths through 32K, using the same packed-grid wave budget
-    and bounded partial workspace as the existing GQA1/2/4/8 prefix family.
+    GQA16 and KV lengths through 32K with the same physical-grid score and
+    bounded partial workspace, limiting this new domain to two waves.
     """
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
@@ -1586,7 +1586,13 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         # Packed tiles can remove a partial-wave tail. Preserve first-wave
         # wins; otherwise compare up to three waves. Short loops stay on
         # their first-wave policy to amortize setup and combine.
-        return _d128_thd_split_wave_choice(facts, extra_waves=3 if facts.s_kv >= 4096 else 1)
+        extra_waves = 3 if facts.s_kv >= 4096 else 1
+        if facts.s_kv > 16384 or facts.h_q // facts.h_kv == 16:
+            # The newly admitted long-cache/GQA16 family is qualified through
+            # two physical waves. A third wave can lose to the prior unsplit
+            # choice on smaller GPUs even when waves x loop prefers a split.
+            extra_waves = min(extra_waves, 2)
+        return _d128_thd_split_wave_choice(facts, extra_waves=extra_waves)
     # Keep Rubin's separately qualified first-wave assignments unchanged.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
