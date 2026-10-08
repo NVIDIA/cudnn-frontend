@@ -338,6 +338,16 @@ DSL satisfies your kernel.**
   must slice by the lengths recorded during extraction, rather than assuming
   one value per field. Static coordinates can contribute zero values, too.
   `test_cutlass_schedulers.py` checks these round trips on real MLIR values.
+- **The installed DSL's preprocessor may be patched by a co-resident library.**
+  quack-kernels (>= 0.6.2, pinned by vLLM and SGLang, and present in the CI
+  test image) replaces `DSLPreprocessor.visit_If` process-wide on
+  `import quack`. It rewrites `if const_expr(S) and D: ... else: body` into a
+  constexpr `if` that holds a copy of `body`, so a name assigned in `body`
+  becomes function-scoped. If a later dynamic loop reassigns that name, the
+  loop carries it as maybe-unset (`TYPE_UNSTABLE_JOIN ... None on one path`)
+  whenever `S` is true. Give such loop-local names their own spelling.
+  Detector: rerun the kernel's tests with quack imported first (for example,
+  a `-p` plugin that does `import quack`).
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
