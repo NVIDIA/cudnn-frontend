@@ -1686,6 +1686,8 @@ _W4_FUSED_SWEEP = [
     (_GEOM_GQA_6_2, 3, 128, True, True, None, True),
     (_GEOM_GQA_6_2, 1, 1000, False, True, (900,), False),
     (_GEOM_GQA_6_2, 2, 256, False, False, (256, 0), False),
+    (_GEOM_397B, 3, 256, True, True, (256, 1, 0), False),  # a LENGTH-1 live entry (one live Q row, n_kv = 1 after the trim) beside a dead one
+    (_GEOM_MHA_20, 1, 1000, False, True, (1000,), True),  # MHA, dense tail tile with the padding mask, the shadow twin bitwise
 ]
 
 
