@@ -42,10 +42,28 @@ by the SDPA's TMA descriptors, so a wrong order is numerically wrong and never a
 * Adapter ``_reshape_sf`` binds by STORAGE order and checks only
   ``numel == b*h*n_tiles*sf_smem_size`` -- the ``torch.equal`` test against the oracle
   is the only guard on the byte order.
+* **GEMM-canonical** (``sf_layout="gemm"``), consumer ``build_proj_gemm``'s SFA / SFB
+  declaration (``proj_gemm.sf_padded_dims``): the PADDED F8_128x4 blob over the
+  ``[rows, K]`` matrix with the BATCH FOLDED INTO THE ROWS -- atom ``(r_tile, c_atom)``
+  at ``(r_tile * n_c_atoms + c_atom) * 512`` with ``n_c_atoms = ceil((K/32)/4)``,
+  inside ``(r%32)*16 + (r//32)*4 + c%4``; pad rows / pad blocks ``0x00``;
+  ``numel == sf_blob_bytes(rows, K)``.  Rowwise: ``(rows, K) = (T, H*D)`` (the
+  ``[T, H, D]`` view of a ``[T, N]`` slab: the block-scale dgrad's A operand);
+  transposed columnwise (``transposed=True``, needs ``axis="col"``):
+  ``(rows, K) = (H*D, T)`` over the PHYSICALLY TRANSPOSED e4m3 ``[H*D, T]`` output
+  (the block-scale wgrad's A operand) -- the columnwise GEMM blob has NO other form:
+  ``validate_mode`` rejects ``axis="col", sf_layout="gemm"`` without ``transposed=True``
+  (the kernel lays those atoms out over ``(H*D, T)`` whatever the flag says, so a blob
+  sized over ``(T, H*D)`` would be overrun).  Host twin ``sf_byte_canonical``; oracle
+  ``gated_block_reference.mx_swizzle_sf_rowwise_padded``.  The byte count is
+  SYMMETRIC in ``(rows, K)`` (``ceil128(rows) * ceil128(K) / 32``), so no host check
+  sees a blob's orientation -- the bitwise tests are the guard.
 
 Grid ``(B*H, ceil(S/128))``: one CTA owns one SF unit (Q/K: one 1024-B tile = 2 atoms;
-V: 2 atoms in 2 D-planes).  The SF bytes are staged in a ``4*D``-byte SMEM tile, one
-``bar.sync``, then ``D/4`` lanes burst them out 16 B each.
+V: 2 atoms in 2 D-planes); under the canonical layout the batch folds into the rows and
+the grid is ``(H, ceil(T/128))``.  The SF bytes are staged in a ``4*D``-byte SMEM tile, one
+``bar.sync``, then ``D/4`` lanes burst them out 16 B each -- the same tile and the same one
+barrier in every mode (the canonical modes change only the burst's global atom base).
 
 * **Rowwise arm** (``axis="row"``): ``quantize.py``'s mapping -- a lane moves 16
   elements (two ``ld.global.v4`` of bf16 in, one ``st.global.v4`` of e4m3 out), so
@@ -56,7 +74,20 @@ V: 2 atoms in 2 D-planes).  The SF bytes are staged in a ``4*D``-byte SMEM tile,
   (lane = 2 adjacent d), so per token the warp reads 128 B contiguous with one
   ``ld.global.b32`` and writes 64 B with ``st.global.b16`` -- 64 live fp32 + 2 amax
   per lane, one ``e8m0_pair`` cvt for both.  The 2-byte stores are the accepted v1
-  cost (about a third of a ``v4`` store's efficiency); measure before changing.
+  cost of the SDPA layout, MEASURED against the transposed arm below on the same
+  bytes: 0.2407 ms vs 0.0730 ms per launch over a ``[8192, 17408]`` bf16 source
+  (412 MiB moved; 1.8 vs 5.9 TB/s; the rowwise arm 0.0555 ms, 7.8 TB/s) on Rubin
+  (cc 10.7, 204 SMs, SM clock locked at 2376 MHz; 3 rounds x 50 launches, CUDA
+  events, slots shuffled per round) -- the 16-byte store form is 3.3x faster, so a
+  columnwise consumer that can take the ``[N, T]`` orientation should; the SDPA's
+  D-plane-major ``[T, H, D]`` layout cannot and keeps the 2-byte stores.
+  **Transposed** (``transposed=True``): the same lane holds the 32 tokens of ONE
+  output row ``n = h*D + d`` of the ``[H*D, T]`` matrix -- 32 CONTIGUOUS bytes at
+  ``n*T + t0`` -- so the data leaves as two ``st.global.v4`` per column per lane
+  instead of 32 ``st.global.b16``; ``T % 32 == 0`` is required (a 32-token block is
+  then entirely live or entirely padding, and every store 16-byte aligned).  The
+  canonical rowwise arm costs what the SDPA rowwise arm costs (0.0556 vs 0.0555 ms,
+  the same launch).
 * **Tail rows** (``s >= S`` in the last tile): the load is clamped to a valid row
   and the value zeroed (rowwise: the block amax is zeroed), the data store is
   skipped, and the SF byte is WRITTEN as ``0x00`` -- an unwritten byte would be
@@ -82,11 +113,16 @@ from cudnn.frost.tile_dsl.pointwise import abs_max_tree, e8m0_from_amax, e8m0_pa
 from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_COLS, SF_ATOM_ROWS, sf_atom_byte, sf_atom_offset
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global_v4
 
+from .proj_gemm import sf_blob_bytes, sf_padded_dims
 from .qk_norm_rope import fake_rowmajor_dynamic_token_stride
 
 AXIS_ROW = "row"  # Q/K: 32-element blocks along D (the BMM1 contraction)
 AXIS_COL = "col"  # V:   32-element blocks along S (the BMM2 contraction)
 AXES = (AXIS_ROW, AXIS_COL)
+
+SF_LAYOUT_SDPA = "sdpa"  # per-(b, h, 128-row tile) rowwise / D-plane-major columnwise: the SDPA's SF TMA descriptors (module docstring)
+SF_LAYOUT_GEMM = "gemm"  # cuDNN's canonical F8_128x4 blob over the [rows, K] matrix, batch folded into the rows: build_proj_gemm's SFA / SFB
+SF_LAYOUTS = (SF_LAYOUT_SDPA, SF_LAYOUT_GEMM)
 
 SF_BLOCK = 32  # elements per E8M0 scale
 SF_TILE_ROWS = SF_ATOM_ROWS  # 128 rows of an F8_128x4 atom == the SDPA's Q / KV tile height
@@ -157,6 +193,46 @@ def sf_byte_columnwise(b: int, h: int, s: int, d_idx: int, *, n_heads: int, n_ti
     return sf_atom_byte(dm, (s % SF_TILE_ROWS) // SF_BLOCK, base=plane * (v_sf_groups * SF_ATOM_BYTES) + tile * SF_ATOM_BYTES)
 
 
+def canonical_atoms_per_band(k: int) -> int:
+    """Atoms per 128-row band of the canonical blob over ``K = k``: ``ceil((K/32)/4)`` -- the device's ``n_c_atoms``
+    (one source: ``proj_gemm.sf_padded_dims``)."""
+    return sf_padded_dims(SF_ATOM_ROWS, k, SF_BLOCK)[1] // SF_ATOM_COLS
+
+
+def sf_byte_canonical(row: int, k_block: int, *, k: int) -> int:
+    """Absolute byte of scale ``(row, k_block)`` in the GEMM-canonical blob over ``[rows, K = k]``:
+    ``(row // 128) * n_c_atoms * 512 + sf_atom_offset(row % 128, k_block)`` -- the host twin of the device's atom-base
+    arithmetic (both modes: ``row`` is the token for the rowwise blob, the output row ``n`` for the transposed one)."""
+    return (row // SF_ATOM_ROWS) * canonical_atoms_per_band(k) * SF_ATOM_BYTES + sf_atom_offset(row % SF_ATOM_ROWS, k_block)
+
+
+def validate_mode(axis: str, sf_layout: str, transposed: bool) -> None:
+    """The (axis, sf_layout, transposed) contract, typed both ways: ``transposed`` is the columnwise arm's GEMM-canonical
+    store and nothing else."""
+    if axis not in AXES:
+        raise ValueError(f"axis must be one of {AXES} ('row' for Q/K, 'col' for V), got {axis!r}")
+    if sf_layout not in SF_LAYOUTS:
+        raise ValueError(
+            f"sf_layout must be one of {SF_LAYOUTS} ('sdpa': the SDPA's per-tile / D-plane-major SF; 'gemm': the canonical blob), got {sf_layout!r}"
+        )
+    if not isinstance(transposed, bool):
+        raise ValueError(f"transposed must be a bool, got {transposed!r}")
+    if transposed and axis != AXIS_COL:
+        raise ValueError(f"transposed=True is the columnwise arm's [H*D, T] store (32-token blocks along T): it needs axis='col', got axis={axis!r}")
+    if transposed and sf_layout != SF_LAYOUT_GEMM:
+        raise ValueError(f"transposed=True writes the block-scale GEMM's A operand: it needs sf_layout='gemm', got sf_layout={sf_layout!r}")
+    if axis == AXIS_COL and sf_layout == SF_LAYOUT_GEMM and not transposed:
+        # The columnwise GEMM-canonical arm exists only as the transposed [H*D, T] store: its scale atoms are laid out over
+        # (rows = H*D, K = T) by the kernel whatever `transposed` says, while a non-transposed blob is sized over (rows = T, K = H*D)
+        # -- accepting the pair would write scales past the end of the SF buffer (reproduced in review: T=128, H=2, D=256 stores
+        # reach byte 6655 of a 2048-byte blob).  The SDPA's columnwise V scales are the sf_layout='sdpa' arm.
+        raise ValueError(
+            "axis='col' with sf_layout='gemm' is served only as the transposed [H*D, T] store: it needs transposed=True "
+            "(the columnwise scale atoms are laid out over rows = H*D, K = T, and a non-transposed blob is sized over rows = T, K = H*D); "
+            "the SDPA's columnwise V scales are sf_layout='sdpa'"
+        )
+
+
 def validate_shape(d: int, threads_per_cta: int, axis: str) -> None:
     """Raise ``ValueError`` on any geometry this kernel cannot address (never an assert)."""
     if axis not in AXES:
@@ -204,18 +280,22 @@ def st_global_b16(addr, value):
 @cute.kernel
 def frost_quantize_mxfp8(
     mSrc: cute.Tensor,  # [T, H, D] bf16/f16, own token stride (slab slice or compact), head stride D
-    mDst: cute.Tensor,  # [T, H, D] e4m3, own token stride (compact in the block), head stride D
-    mSf: cute.Tensor,  # [B*H*ceil(S/128)*4*D] uint8, F8_128x4 order per the module docstring
+    mDst: cute.Tensor,  # [T, H, D] e4m3, own token stride (compact in the block), head stride D -- or the contiguous [H*D, T] matrix (transposed)
+    mSf: cute.Tensor,  # [B*H*ceil(S/128)*4*D] uint8, F8_128x4 order per the module docstring (sf_blob_bytes(rows, K) bytes under sf_gemm)
     seq_len: cutlass.Int32,
     n_tiles: cutlass.Int32,  # ceil(S/128) == gridDim.y
     v_sf_groups: cutlass.Int32,  # B*H*n_tiles: the columnwise D-plane stride in atoms (unused rowwise)
+    n_c_atoms: cutlass.Int32,  # APPENDED: atoms per 128-row band of the canonical blob, ceil((K/32)/4) (sf_gemm only; 0 under the SDPA layouts)
     h: cutlass.Constexpr[int],
     d: cutlass.Constexpr[int],
     axis_col: cutlass.Constexpr[bool],
     threads_per_cta: cutlass.Constexpr[int],
+    sf_gemm: cutlass.Constexpr[bool],  # APPENDED: the GEMM-canonical SF blob over [rows, K] (the host folds the batch into the rows: n_bh == H)
+    transposed: cutlass.Constexpr[bool],  # APPENDED: the columnwise arm's [H*D, T] store (sf_gemm and axis_col)
 ) -> None:
     tile_bytes = cutlass.const_expr(sf_tile_bytes(d))
     burst_lanes = cutlass.const_expr(tile_bytes // SF_BURST_BYTES)
+    head_atoms = cutlass.const_expr(d // SF_TILE_ROWS)  # D/128: one head's atoms along K (rowwise) == its 128-row bands of the [H*D, T] matrix
     sSF = cutlass.Array(cutlass.Uint8, tile_bytes, alignment=16, space=cutlass.AddressSpace.smem)
 
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
@@ -227,9 +307,16 @@ def frost_quantize_mxfp8(
     tok0 = b * seq_len  # token index of this batch's row 0
     last = seq_len - cutlass.Int32(1)  # tail rows clamp their LOADS here (never past the tensor)
     src_tok_stride = cutlass.Int64(mSrc.stride[0]) * cutlass.Int64(2)
-    dst_tok_stride = cutlass.Int64(mDst.stride[0])
     src_base = mSrc.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(mSrc.stride[1]) * cutlass.Int64(2)
-    dst_base = mDst.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(mDst.stride[1])
+    # Destination addressing.  [T, H, D]: token stride = the row pitch, head offset = head * D (stride[1]), d at +1.
+    # Transposed [H*D, T] (strides (T, 1)): token stride 1, this head's first row n0 = head * D at head * D * T, d at + d * T.
+    dst_tok_stride = cutlass.Int64(mDst.stride[1]) if cutlass.const_expr(transposed) else cutlass.Int64(mDst.stride[0])
+    dst_d_stride = cutlass.Int64(mDst.stride[0]) if cutlass.const_expr(transposed) else cutlass.Int64(1)
+    dst_base = (
+        mDst.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(d) * dst_d_stride
+        if cutlass.const_expr(transposed)
+        else mDst.iterator.toint() + head.to(cutlass.Int64) * cutlass.Int64(mDst.stride[1])
+    )
 
     if cutlass.const_expr(not axis_col):
         # ---- ROWWISE (Q/K): 32-element blocks along D --------------------------------
@@ -295,7 +382,11 @@ def frost_quantize_mxfp8(
             # a tail token's load is redirected to the batch's last row and its word zeroed.
             src_addr = src_base + (tok0 + s_blk).to(cutlass.Int64) * src_tok_stride + d0.to(cutlass.Int64) * cutlass.Int64(2)
             src_last = src_base + (tok0 + last).to(cutlass.Int64) * src_tok_stride + d0.to(cutlass.Int64) * cutlass.Int64(2)
-            dst_addr = dst_base + (tok0 + s_blk).to(cutlass.Int64) * dst_tok_stride + d0.to(cutlass.Int64)
+            dst_addr = (
+                dst_base + (tok0 + s_blk).to(cutlass.Int64) * dst_tok_stride + d0.to(cutlass.Int64) * dst_d_stride
+                if cutlass.const_expr(transposed)
+                else dst_base + (tok0 + s_blk).to(cutlass.Int64) * dst_tok_stride + d0.to(cutlass.Int64)
+            )
             words = []
             valids = []
             dsts = []
@@ -304,9 +395,10 @@ def frost_quantize_mxfp8(
                 w = ld_global(src_addr if valid else src_last, cutlass.Int32)
                 words.append(w if valid else cutlass.Int32(0))  # tail token: contributes 0 to the block amax
                 valids.append(valid)
-                dsts.append(dst_addr)
                 src_addr = src_addr + src_tok_stride
-                dst_addr = dst_addr + dst_tok_stride
+                if cutlass.const_expr(not transposed):
+                    dsts.append(dst_addr)
+                    dst_addr = dst_addr + dst_tok_stride
             los = []
             his = []
             for t in cutlass.range_constexpr(COL_TOKENS_PER_UNIT):
@@ -314,9 +406,28 @@ def frost_quantize_mxfp8(
                 los.append(lo)
                 his.append(hi)
             rcp0, rcp1, sf_pair = e8m0_pair(abs_max_tree(los), abs_max_tree(his))
-            for t in cutlass.range_constexpr(COL_TOKENS_PER_UNIT):
-                if valids[t]:
-                    st_global_b16(dsts[t], fp32_to_fp8x2(los[t] * rcp0, his[t] * rcp1))
+            if cutlass.const_expr(transposed):
+                # [H*D, T]: each lane owns two output rows n = head*D + d0 and n + 1, whose 32 tokens are 32 CONTIGUOUS bytes
+                # at n*T + t_blk*32 -- two st.global.v4 per row (fp32_to_fp8_pack: the same cvt.rn.satfinite.e4m3x2 as the b16
+                # path, byte i = token i).  T % 32 == 0 (run_) makes every 32-token block entirely live or entirely padding
+                # (n_valid >= 32 or <= 0, warp-uniform), so one branch covers the block; a pad block stores nothing and its SF
+                # byte is 0x00 from the zeroed words.
+                if valids[0]:
+                    for half in cutlass.range_constexpr(COL_TOKENS_PER_UNIT // ELEMS_PER_LANE):
+                        lo_scaled = []
+                        hi_scaled = []
+                        for t in cutlass.range_constexpr(ELEMS_PER_LANE):
+                            lo_scaled.append(los[half * ELEMS_PER_LANE + t] * rcp0)
+                            hi_scaled.append(his[half * ELEMS_PER_LANE + t] * rcp1)
+                        p_lo = fp32_to_fp8_pack(lo_scaled, dtype=cutlass.Float8E4M3FN)
+                        p_hi = fp32_to_fp8_pack(hi_scaled, dtype=cutlass.Float8E4M3FN)
+                        half_off = cutlass.Int64(half * ELEMS_PER_LANE)
+                        st_global_v4(dst_addr + half_off, [p_lo[0], p_lo[1], p_lo[2], p_lo[3]], cutlass.Int32)
+                        st_global_v4(dst_addr + dst_d_stride + half_off, [p_hi[0], p_hi[1], p_hi[2], p_hi[3]], cutlass.Int32)
+            else:
+                for t in cutlass.range_constexpr(COL_TOKENS_PER_UNIT):
+                    if valids[t]:
+                        st_global_b16(dsts[t], fp32_to_fp8x2(los[t] * rcp0, his[t] * rcp1))
             # SF SMEM bytes: plane p = d//128 at p*512 + ((d%128)%32)*16 + ((d%128)//32)*4 + tb (sf_layout); d0+1 sits 16 B after d0.
             plane = d0 // cutlass.Int32(SF_TILE_ROWS)
             dm = d0 % cutlass.Int32(SF_TILE_ROWS)
@@ -331,7 +442,22 @@ def frost_quantize_mxfp8(
         words4 = sSF.load(smem_off, vector_size=SF_BURST_BYTES, alignment=16).bitcast(cutlass.Int32)
         tile_idx = (bh * n_tiles + s_tile).to(cutlass.Int64)
         sf_base = mSf.iterator.toint()
-        if cutlass.const_expr(not axis_col):
+        if cutlass.const_expr(sf_gemm):
+            # GEMM-canonical: atom (r_tile, c_atom) of the padded [rows, K] blob at (r_tile * n_c_atoms + c_atom) * 512, the batch
+            # folded into the rows (b == 0, s_tile indexes T).  Only the atom BASE differs from the SDPA layouts; the SMEM staging
+            # (sf_atom_offset / sf_atom_byte) is the same bytes in the same atom-local order.
+            if cutlass.const_expr(not axis_col):
+                # rowwise over (rows = T, K = H*D): this CTA's D/128 atoms are c_atom = head*D/128 .. +D/128-1, contiguous = the 4*D tile.
+                atom0 = s_tile.to(cutlass.Int64) * n_c_atoms.to(cutlass.Int64) + (head * cutlass.Int32(head_atoms)).to(cutlass.Int64)
+                gaddr = sf_base + atom0 * cutlass.Int64(SF_ATOM_BYTES) + smem_off.to(cutlass.Int64)
+            else:
+                # transposed over (rows = H*D, K = T): plane p (rows n = head*D + p*128 ..) is row tile head*D/128 + p, the 128 tokens
+                # of this CTA are the 4 blocks of column atom s_tile.
+                burst_plane = (tidx // cutlass.Int32(SF_ATOM_BYTES // SF_BURST_BYTES)).to(cutlass.Int64)
+                burst_within = ((tidx % cutlass.Int32(SF_ATOM_BYTES // SF_BURST_BYTES)) * cutlass.Int32(SF_BURST_BYTES)).to(cutlass.Int64)
+                atom = ((head * cutlass.Int32(head_atoms)).to(cutlass.Int64) + burst_plane) * n_c_atoms.to(cutlass.Int64) + s_tile.to(cutlass.Int64)
+                gaddr = sf_base + atom * cutlass.Int64(SF_ATOM_BYTES) + burst_within
+        elif cutlass.const_expr(not axis_col):
             # Q/K: the tile is 4*D contiguous bytes.
             gaddr = sf_base + tile_idx * cutlass.Int64(tile_bytes) + smem_off.to(cutlass.Int64)
         else:
@@ -353,13 +479,16 @@ def quantize_mxfp8_launch(
     n_tiles: cutlass.Int32,
     v_sf_groups: cutlass.Int32,
     n_bh: cutlass.Int32,
+    n_c_atoms: cutlass.Int32,
     h: cutlass.Constexpr[int],
     d: cutlass.Constexpr[int],
     axis_col: cutlass.Constexpr[bool],
     threads_per_cta: cutlass.Constexpr[int],
+    sf_gemm: cutlass.Constexpr[bool],
+    transposed: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    frost_quantize_mxfp8(src, dst, sf, seq_len, n_tiles, v_sf_groups, h, d, axis_col, threads_per_cta).launch(
+    frost_quantize_mxfp8(src, dst, sf, seq_len, n_tiles, v_sf_groups, n_c_atoms, h, d, axis_col, threads_per_cta, sf_gemm, transposed).launch(
         grid=(n_bh, n_tiles, 1), block=(threads_per_cta, 1, 1), stream=stream
     )
 
@@ -381,17 +510,34 @@ class QuantizeMxfp8Recipe:
     axis: str  # "row" (Q/K: 32-blocks along D) | "col" (V: 32-blocks along S)
     compiled: object = None
     threads_per_cta: int = DEFAULT_THREADS_PER_CTA
+    sf_layout: str = SF_LAYOUT_SDPA  # APPENDED: "sdpa" (the SDPA descriptors' order) | "gemm" (the canonical blob, batch folded into the rows)
+    transposed: bool = False  # APPENDED: the columnwise arm's physically transposed [H*D, T] store (needs axis="col", sf_layout="gemm")
 
 
 def compile_quantize_mxfp8(
-    *, dtype_in, h: int, d: int, axis: str, threads_per_cta: int = DEFAULT_THREADS_PER_CTA, compile_options: str = COMPILE_OPTIONS
+    *,
+    dtype_in,
+    h: int,
+    d: int,
+    axis: str,
+    threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
+    compile_options: str = COMPILE_OPTIONS,
+    sf_layout: str = SF_LAYOUT_SDPA,
+    transposed: bool = False,
 ) -> QuantizeMxfp8Recipe:
     """Build from SHAPES ALONE -- no allocation, no launch.  E4M3 codes + E8M0 SF only.
 
     ``compile_options`` is a dev knob: ``"--enable-tvm-ffi --gpu-arch sm_107a"`` trace-compiles for
     Rubin on any box (the SASS spill check); production leaves the default.
+
+    ``sf_layout`` (appended; default = today's artifact): ``"sdpa"`` writes the SDPA descriptors' SF order,
+    ``"gemm"`` the GEMM-canonical F8_128x4 blob over the ``[rows, K]`` matrix with the batch folded into the
+    rows -- ``(T, H*D)`` rowwise, ``(H*D, T)`` with ``transposed=True`` (module docstring).  ``transposed``
+    (appended) needs ``axis="col"`` and ``sf_layout="gemm"``: the columnwise arm stores the e4m3 codes
+    PHYSICALLY TRANSPOSED as the contiguous ``[H*D, T]`` matrix (the block-scale wgrad's A operand).
     """
     global _FAKE_STREAM
+    validate_mode(axis, sf_layout, transposed)
     validate_shape(d, threads_per_cta, axis)
     if dtype_in not in (torch.bfloat16, torch.float16):
         raise ValueError(f"quantize_mxfp8 serves bf16/f16 sources only, got {dtype_in}")
@@ -403,13 +549,19 @@ def compile_quantize_mxfp8(
         _FAKE_STREAM = make_fake_stream(use_tvm_ffi_env_stream=False)
 
     axis_col = axis == AXIS_COL
-    key = (str(dtype_in), int(h), int(d), axis, int(threads_per_cta), compile_options, current_device())
+    sf_gemm = sf_layout == SF_LAYOUT_GEMM
+    # today's key is the prefix; the two appended fields keep the default artifact's entry where it was
+    key = (str(dtype_in), int(h), int(d), axis, int(threads_per_cta), compile_options, current_device(), sf_layout, bool(transposed))
     if key not in compiled_cache:
         tok = cute.sym_int()
         # Source: a column slice of the projection slab (token stride N_qkvg) or compact;
-        # destination: compact in the block but kept symbolic so one artifact serves both.
+        # destination: compact in the block but kept symbolic so one artifact serves both -- or, transposed, the
+        # contiguous [H*D, T] matrix (row pitch T symbolic: one artifact serves every T).
         src = fake_rowmajor_dynamic_token_stride(dtype_in, tok, h, d)
-        dst = cute.runtime.make_fake_tensor(dtype=cutlass.Float8E4M3FN, shape=(tok, h, d), stride=(cute.sym_int(), d, 1), assumed_align=16)
+        if transposed:
+            dst = cute.runtime.make_fake_tensor(dtype=cutlass.Float8E4M3FN, shape=(h * d, tok), stride=(cute.sym_int(), 1), assumed_align=16)
+        else:
+            dst = cute.runtime.make_fake_tensor(dtype=cutlass.Float8E4M3FN, shape=(tok, h, d), stride=(cute.sym_int(), d, 1), assumed_align=16)
         sf = cute.runtime.make_fake_tensor(dtype=_convert_to_cutlass_data_type(torch.uint8), shape=(cute.sym_int(),), stride=(1,), assumed_align=16)
         compiled_cache[key] = cute.compile(
             quantize_mxfp8_launch,
@@ -420,41 +572,80 @@ def compile_quantize_mxfp8(
             cutlass.Int32(0),  # n_tiles     )
             cutlass.Int32(0),  # v_sf_groups )
             cutlass.Int32(0),  # n_bh        )
+            cutlass.Int32(0),  # n_c_atoms   )
             int(h),
             int(d),
             bool(axis_col),
             int(threads_per_cta),
+            bool(sf_gemm),
+            bool(transposed),
             _FAKE_STREAM,
             options=compile_options,
         )
-    return QuantizeMxfp8Recipe(dtype_in=dtype_in, h=int(h), d=int(d), axis=axis, compiled=compiled_cache[key], threads_per_cta=int(threads_per_cta))
+    return QuantizeMxfp8Recipe(
+        dtype_in=dtype_in,
+        h=int(h),
+        d=int(d),
+        axis=axis,
+        compiled=compiled_cache[key],
+        threads_per_cta=int(threads_per_cta),
+        sf_layout=sf_layout,
+        transposed=bool(transposed),
+    )
 
 
 def run_quantize_mxfp8(r: QuantizeMxfp8Recipe, src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, batch: int, seq_len: int, stream) -> None:
     """Launch.  ``src`` ``[T, H, D]`` bf16/f16 (strided ok), ``dst`` ``[T, H, D]`` ``float8_e4m3fn`` compact,
     ``sf`` uint8 with ``numel == B*H*ceil(S/128)*4*D`` (any shape, contiguous), ``T == batch * seq_len``.
 
+    Under ``sf_layout="gemm"`` the batch folds into the rows: ``sf.numel() == proj_gemm.sf_blob_bytes(rows, K)``
+    with ``(rows, K) = (T, H*D)`` rowwise / ``(H*D, T)`` transposed -- never the SDPA count.  Under
+    ``transposed=True`` ``dst`` is the CONTIGUOUS e4m3 ``[H*D, T]`` matrix (strides ``(T, 1)``) and
+    ``T % 32 == 0`` (whole 32-token blocks; a ragged ``T`` is a typed error).  Every check both ways.
+
     Cheap host checks only; every one of them guards a wild write or a silent wrong
     answer at the tvm-ffi boundary, which reports neither.
     """
     if r.compiled is None:
         raise ValueError("recipe was not built by compile_quantize_mxfp8")
+    gemm = r.sf_layout == SF_LAYOUT_GEMM
     if src.dtype != r.dtype_in:
         raise ValueError(f"src is {src.dtype} but this artifact was compiled for {r.dtype_in}")
     if dst.dtype != torch.float8_e4m3fn:
         raise ValueError(f"dst must be torch.float8_e4m3fn, got {dst.dtype}")
-    for name, ten in (("src", src), ("dst", dst)):
-        if ten.ndim != 3 or int(ten.shape[1]) != r.h or int(ten.shape[2]) != r.d:
-            raise ValueError(f"{name} must be [T, H={r.h}, D={r.d}], got {tuple(ten.shape)}")
-        if ten.stride(2) != 1 or ten.stride(1) != r.d:
-            raise ValueError(f"{name} must have head stride D={r.d} and element stride 1 (a column slice of the slab or compact), got strides {ten.stride()}")
     if batch <= 0 or seq_len <= 0:
         raise ValueError(f"batch and seq_len must be positive, got batch={batch} seq_len={seq_len}")
     t = int(src.shape[0])
-    if t != batch * seq_len or int(dst.shape[0]) != t:
-        raise ValueError(f"T must equal batch*seq_len for src and dst: src T={t}, dst T={int(dst.shape[0])}, batch*seq_len={batch * seq_len}")
-    if (src.stride(0) * 2) % 16 or dst.stride(0) % 16:
-        raise ValueError(f"token strides must keep every row 16-byte aligned: src {src.stride(0)} elems (bf16/f16), dst {dst.stride(0)} elems (fp8)")
+    if src.ndim != 3 or int(src.shape[1]) != r.h or int(src.shape[2]) != r.d:
+        raise ValueError(f"src must be [T, H={r.h}, D={r.d}], got {tuple(src.shape)}")
+    if src.stride(2) != 1 or src.stride(1) != r.d:
+        raise ValueError(f"src must have head stride D={r.d} and element stride 1 (a column slice of the slab or compact), got strides {src.stride()}")
+    if t != batch * seq_len:
+        raise ValueError(f"T must equal batch*seq_len: src T={t}, batch*seq_len={batch * seq_len}")
+    if (src.stride(0) * 2) % 16:
+        raise ValueError(f"token strides must keep every row 16-byte aligned: src {src.stride(0)} elems (bf16/f16)")
+    if r.transposed:
+        # the physically transposed [H*D, T] e4m3 matrix: K = T contiguous (the block-scale GEMM's K-major A operand)
+        n_rows = r.h * r.d
+        if dst.ndim != 2 or tuple(dst.shape) != (n_rows, t) or not dst.is_contiguous():
+            raise ValueError(
+                f"this artifact is transposed=True: dst must be the contiguous [H*D={n_rows}, T={t}] float8_e4m3fn matrix (strides ({t}, 1)), "
+                f"got shape {tuple(dst.shape)} strides {dst.stride()}"
+            )
+        if t % SF_BLOCK:
+            raise ValueError(
+                f"the transposed quantization writes whole {SF_BLOCK}-token blocks (32 contiguous e4m3 codes per column): "
+                f"T = batch*seq_len must be a multiple of {SF_BLOCK}, got T={t}"
+            )
+    else:
+        if dst.ndim != 3 or int(dst.shape[1]) != r.h or int(dst.shape[2]) != r.d:
+            raise ValueError(f"dst must be [T, H={r.h}, D={r.d}] (this artifact is transposed=False), got {tuple(dst.shape)}")
+        if dst.stride(2) != 1 or dst.stride(1) != r.d:
+            raise ValueError(f"dst must have head stride D={r.d} and element stride 1 (compact), got strides {dst.stride()}")
+        if int(dst.shape[0]) != t:
+            raise ValueError(f"T must equal batch*seq_len for src and dst: src T={t}, dst T={int(dst.shape[0])}, batch*seq_len={batch * seq_len}")
+        if dst.stride(0) % 16:
+            raise ValueError(f"token strides must keep every row 16-byte aligned: dst {dst.stride(0)} elems (fp8)")
     for name, ten in (("src", src), ("dst", dst)):
         if not ten.is_cuda:
             raise ValueError(f"{name} must be a CUDA tensor, got device {ten.device}")
@@ -466,23 +657,41 @@ def run_quantize_mxfp8(r: QuantizeMxfp8Recipe, src: torch.Tensor, dst: torch.Ten
         raise ValueError(f"sf must be torch.uint8 (E8M0 bytes in F8_128x4 order), got {sf.dtype}")
     if not sf.is_contiguous() or not sf.is_cuda:
         raise ValueError("sf must be a contiguous CUDA tensor")
-    need = sf_bytes(batch, r.h, seq_len, r.d)
-    if sf.numel() != need:
-        raise ValueError(f"sf must hold B*H*ceil(S/128)*{sf_tile_bytes(r.d)} = {need} bytes for batch={batch} H={r.h} S={seq_len} D={r.d}, got {sf.numel()}")
+    if gemm:
+        rows, k = (r.h * r.d, t) if r.transposed else (t, r.h * r.d)
+        need = sf_blob_bytes(rows, k, SF_BLOCK)
+        if sf.numel() != need:
+            raise ValueError(
+                f"sf must be the padded F8_128x4 blob of sf_blob_bytes(rows={rows}, K={k}) = {need} bytes (sf_layout='gemm', "
+                f"{'transposed: (H*D, T)' if r.transposed else 'rowwise: (T, H*D)'}; the batch folds into the rows), got {sf.numel()}"
+            )
+    else:
+        need = sf_bytes(batch, r.h, seq_len, r.d)
+        if sf.numel() != need:
+            raise ValueError(
+                f"sf must hold B*H*ceil(S/128)*{sf_tile_bytes(r.d)} = {need} bytes for batch={batch} H={r.h} S={seq_len} D={r.d}, got {sf.numel()}"
+            )
     if sf.data_ptr() % 16:
         raise ValueError("sf must be 16-byte aligned (the SF tile leaves SMEM as 16-byte bursts)")
     if not (src.device == dst.device == sf.device):
         raise ValueError(f"src, dst and sf must live on one device, got {src.device}, {dst.device}, {sf.device}")
-    tiles = n_sf_tiles(seq_len)
-    n_bh = batch * r.h
+    if gemm:
+        # the batch folds into the rows: ONE sequence of T rows x H heads -> grid (H, ceil(T/128)); the atoms per 128-row band
+        # of the padded blob come from the one source (proj_gemm.sf_padded_dims), never a literal
+        launch_seq, launch_bh = t, r.h
+        n_c_atoms = sf_padded_dims(rows, k, SF_BLOCK)[1] // SF_ATOM_COLS
+    else:
+        launch_seq, launch_bh, n_c_atoms = seq_len, batch * r.h, 0
+    tiles = n_sf_tiles(launch_seq)
     r.compiled(
         src,
         dst,
         sf.view(-1),
-        cutlass.Int32(seq_len),
+        cutlass.Int32(launch_seq),
         cutlass.Int32(tiles),
-        cutlass.Int32(n_bh * tiles),
-        cutlass.Int32(n_bh),
+        cutlass.Int32(launch_bh * tiles),
+        cutlass.Int32(launch_bh),
+        cutlass.Int32(n_c_atoms),
         cuda.CUstream(int(stream)),
     )
 

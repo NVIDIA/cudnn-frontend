@@ -35,6 +35,13 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   this and the d256 rule rely on split-KV: an ``s_kv`` off the KV tile cannot split, and unsplit
   small launches lose (b = 3, h_kv = 1, kv 12000: 1.98x d512; 12 units: 2.03x d256), so those need
   16 units (d512) or 32 (d256).
+- ``s_q == 1``, PAGED d512 (the d512 kernel's PAGED_KV specialization, #1093): no d512 decode
+  tile exists, so the role-split prefill tile serves it and loses to the backend's paged decode
+  engine on the FlashInfer shape (B200, public cuDNN 9.26.0.51, this tree, CUDA-graph replay,
+  kernel time, 2026-10-07; b = 8, 64/1 and 64/8 heads, page 16, bf16, mixed KV <= 4096:
+  77.8 vs 65.1 us and 136.9 vs 102.5 us) -> TRAIL; the
+  dense d512 rule above was fitted on dense K/V and does not transfer. Multi-token paged d512
+  keeps the decode-shaped LEAD (the backend's multi-token path is prefill-class there too).
 - ``s_q == 1``, d256: ``units = b * h_kv``; ``units >= 32`` wins 0.52-0.95, ``4 <= units < 32`` wins
   once ``units * s_kv >= 2**16`` (0.74-0.97), fewer units lose up to 128k (1.07-2.9).
 - ``s_q == 1``, d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x) -> TRAIL.
@@ -52,10 +59,10 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   B4 Q2k/KV16k; a 32k endpoint at 16/2 uses HND/page128. Independent B2/B3 full/chunk and
   irregular-length controls confirm the bounded interpolation below. This is a cuDNN route improvement, not a uniform win over
   FA4/TRTLLM. Keep unmeasured graph features and larger declarations backend-first.
-- paged THD, exact d128 BF16, B1..4 with 4..64 query heads and integral GQA1/2/4/8:
-  prepared single-CTA split plans cover bounded short-query/long-cache work.
-  The shared split rule below owns the measured shape/layout limits; no-Stats
-  graphs lead the backend only when that rule actually selects splitting.
+- paged THD, exact d128 BF16, B1..4 with 4..64 query heads and integral GQA1/2/4/8/16:
+  prepared single-CTA split plans cover Q64..1024 and KV2K..32K, with or without
+  packed Stats. The shared split rule below owns the measured shape/layout
+  limits; graphs lead the backend only when that rule selects splitting.
 - nonpaged THD, exact d192/v128 BF16 with equal Q/KV head counts: the shared
   nonpaged split rule bounds the measured short-query/long-cache shard. Its
   single-CTA split leads the backend with or without packed Stats. Exact
@@ -176,12 +183,15 @@ def place(spec, facts) -> str:
 
 
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
+    from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
     if facts.device_cc != (10, 7):
         return TRAIL
-    # Reuse candidate generation's launch budget for the native packed split.
-    if nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
+    if _prefer_paged_d256_lpt(facts):
+        return LEAD
+    # A full first wave can still favor FROST even when splitting adds cost.
+    # Share the qualified prefix envelope with candidate generation.
+    if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts)[0] > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     # The shared paged pipeline also benefits from GQA packing without a
     # split. Large-batch short queries recover unused Q rows without partials.
@@ -190,7 +200,7 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     if (
         facts.has_paged_kv
         and not facts.shape_overrides
-        and facts.dtype == cudnn.data_type.BFLOAT16
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
         and 8 <= facts.b <= 64
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
@@ -281,9 +291,9 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
 
     # The prepared single-CTA split removes the underfilled paged D128
     # launch. Placement and the concrete split share one bounded rule.
-    if not facts.wants_stats and paged_thd_split_choice(caps, facts)[0] > 1:
+    if paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
-    if nonpaged_thd_split_choice(caps, facts) > 1:
+    if nonpaged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     dense = not facts.thd
     if dense and 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
@@ -291,6 +301,11 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     flavor = _selected_d_shape(caps, facts)
     if dense and facts.s_q == 1:
         units = facts.b * facts.h_kv
+        if facts.has_paged_kv and flavor == (512, 512):
+            # Paged d512 decode runs the role-split PREFILL tile (no d512 decode tile yet) and measures
+            # behind the backend's paged decode engine (module docstring: 77.8 vs 65.1 us
+            # at 64/1); the dense d512 rule below was fitted on dense K/V. TRAIL until the tile lands.
+            return TRAIL
         if flavor in ((256, 256), (512, 512)) and _synth_kv_padding(caps, facts):
             # S_kv off the KV tile cannot split; unsplit small launches lose (b3 h_kv=1: 1.98x d512, d256 12 units: 2.03x).
             return LEAD if units >= (SQ1_D512_UNSPLIT_MIN_UNITS if flavor == (512, 512) else SQ1_MIN_KV_UNITS) else TRAIL

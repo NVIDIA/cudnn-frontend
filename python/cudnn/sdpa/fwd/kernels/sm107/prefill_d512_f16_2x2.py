@@ -24,6 +24,10 @@ it is the review surface) with the Rubin deltas of the design (section 13), re-p
   * TMEM: one 512-column cta_group::2 allocation (388 used) -- the 576-col ``is_exclusive`` form is not needed.
   * TILE_K_HW stays 16 for f16/bf16 (config_sm107.tile_k_hw; the K=64 2-chunk form is the FP8 QMMA path).
 The O_STORE_STREAM / O_EPI_PIPELINE / CORR_READY_BEFORE_DONE levers are module constants here too (both arms trace).
+Softmax lever, per plan from TemplateParams: ``SCALE_PREFOLDED`` (softmax_scale_prefolded / graph.sdpa
+``attn_scale_prefolded``) -- Q carries attn_scale * log2 e, so the softmax takes the RAW row max and shifts with
+S - m (two const_expr sites in ``_softmax_kv_iter``; the scaled chain stays the default and ``scale_softmax_log2``
+stays in every signature).  The f16x2 exponent arm (softmax_f16) is a quantized-kernel specialization: declined here.
 
 ONE pipeline per CTA on ``tcgen05.mma.cta_group::2`` with collective M = 128 = 64 Q rows per
 CTA, every CTA running TMA-LDG(Q,K,V) + BMM1 + softmax + BMM2 + correction + epilogue + TMA-STG
@@ -198,6 +202,19 @@ else:
     raise ValueError(f"prefill_sdpa_d512_f16_2x2 (SM100): DTYPE_QKV={CFG.DTYPE_QKV} not supported (BF16=2 / FP16=3 only)")
 P_STORAGE_DTYPE = STORAGE_DTYPE
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
+
+# softmax_scale_prefolded (graph.sdpa ``attn_scale_prefolded``): the caller multiplied Q by attn_scale * log2(e), so the
+# raw QK^T already sits in the log2 domain.  The softmax then takes the RAW row max (no FMUL by scale_log2) and shifts
+# with S - m (an FADD2 for the FFMA2) -- two const_expr sites in _softmax_kv_iter; nothing else moves: the published
+# Stats, the sink fold, the dead-row select and the RESCALE_THRESHOLD compare consume the log2-domain max they consumed
+# before.  Numerically neutral by construction: under the contract the adapter pins scale_log2 to exactly 1.0, so the
+# elided multiplies were exact identities (``scale_softmax_log2`` stays in every signature as a dead runtime argument --
+# the direct-ABI oracle launches the fold with a garbage value and expects the scaled chain's bits).  Both softmax arms
+# mask with true -inf, so a fully-masked iteration leaves the raw max at -inf exactly as the scaled chain does.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+# softmax_precision=HALF (TemplateParams.softmax_f16) is a quantized-kernel arm; the half kernels keep the f32 exponent.
+# config_sm107 declines it before this file loads -- the guard keeps the request from ever tracing the default chain.
+_require(not PARAMS.softmax_f16, "softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization; half inputs run the f32 exponent")
 
 # ---------------------------------------------------------------------------- module-constant levers
 # (measured per kernel, never knobs: a value must not differ per plan)
@@ -1102,6 +1119,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -1361,7 +1379,12 @@ def _softmax_kv_iter(
     nvvm.barrier_cta_sync(barrier_id=8, thread_count=CFG.SOFTMAX_LANES)
     other_max = sXchgMax.subview(xchg_other).load()
     current_max_raw = cute.math.max(half_max, other_max, ftz=True)
-    current_max = current_max_raw * scale_log2  # -inf when the whole iteration is masked
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Pre-folded scale: Q carries attn_scale * log2 e, so the raw max IS the log2-domain max (-inf when the whole
+        # iteration is masked, exactly as below: both arms mask with true -inf).
+        current_max = current_max_raw
+    else:
+        current_max = current_max_raw * scale_log2  # -inf when the whole iteration is masked
 
     # total_max starts at -inf: a live iteration always clears the threshold, a fully-masked one never
     # does (-inf - x = -inf or NaN; ordered > is false for both).
@@ -1380,7 +1403,10 @@ def _softmax_kv_iter(
     stat_state = advance(stat_state, STAT_STAGES)
 
     # P for this lane's 64 columns -> sP[parity] subtile h, row r.
-    reg_P = cute.math.exp2(reg_S * scale_log2 - total_max_safe, fastmath=True)
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        reg_P = cute.math.exp2(reg_S - total_max_safe, fastmath=True)  # raw scores are log2-domain: the shift alone (FADD2)
+    else:
+        reg_P = cute.math.exp2(reg_S * scale_log2 - total_max_safe, fastmath=True)
     alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
     total_sum_vec = total_sum_vec * alpha_pair + row_reduction_pair(reg_P)
     reg_P_half = reg_P.to(P_STORAGE_DTYPE)

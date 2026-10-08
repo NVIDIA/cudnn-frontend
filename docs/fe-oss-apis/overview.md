@@ -12,7 +12,6 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Causal Conv1d](causal_conv1d.md) and [Decode Update](causal_conv1d_update.md)
 - [FLA Integration Shims](fla.md)
 - [Kimi Delta Attention in JAX](kda_jax.md)
-- [KDA graph Q/K normalization](kda_normalization.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
 - [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output)

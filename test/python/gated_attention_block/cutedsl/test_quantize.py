@@ -17,6 +17,10 @@ pinned against the CPU formula (``grad_scale_from_amax``) on sm_89+.
 """
 
 import math
+import os
+import subprocess
+import sys
+import textwrap
 from fractions import Fraction
 
 import numpy as np
@@ -617,6 +621,93 @@ def test_init_scalars_stores_the_plan_time_constants_from_its_arguments(consts):
     with pytest.raises(ValueError, match="descale_dp_out lies inside"):
         run_init_scalars(r, slots, scale_dp, slots[slot0 : slot0 + 1], consts, stream=st)
     assert torch.equal(slots[slot0 : slot0 + n_consts], torch.tensor(np.array(other, dtype=np.float32), device="cuda")), "a refused call launched"
+
+
+@requires_cuda
+def test_init_scalars_without_a_dp_scale():
+    """``compile_init_scalars(n, const_slot0, n_consts, descale_dp=False)`` -- the arm of a pipeline whose attention backward
+    has no dP scalar: 15 NaN-poisoned slots -> exact 0 and the constants stored BITWISE, with NO reciprocal anywhere (every
+    slot below the constants is 0, nothing outside ``n_slots`` is touched); the artifact is keyed apart from the dividing one
+    and its defaults keep the old constructions; the contract is typed BOTH ways -- a ``scale_dp`` / ``descale_dp_out`` handed
+    to the non-dividing artifact is refused (nothing would read or write them), the dividing artifact refuses their absence,
+    and a refused call launches nothing."""
+    consts = (3.0, 2.0**-7, 7.25, 1.0 / 3.0, 256.0, 2.0**-8, 1.0)
+    n_consts, slot0, n_slots = len(consts), 15, 15 + len(consts)
+    block = torch.full((64,), float("nan"), device="cuda", dtype=torch.float32)
+    slots = block[:n_slots]
+    r = compile_init_scalars(n_slots, slot0, n_consts, descale_dp=False)
+    assert r.descale_dp is False and (r.n_slots, r.const_slot0, r.n_consts) == (n_slots, slot0, n_consts)
+    assert compile_init_scalars(n_slots, slot0, n_consts, descale_dp=False).compiled is r.compiled
+    dividing = compile_init_scalars(n_slots, slot0, n_consts)
+    assert dividing.descale_dp is True and dividing.compiled is not r.compiled, "descale_dp is part of the artifact key"
+    assert InitScalarsRecipe(compiled=None, n_slots=3).descale_dp is True, "the appended field defaults to today's artifact"
+    st = torch.cuda.current_stream().cuda_stream
+    run_init_scalars(r, slots, consts=consts, stream=st)
+    torch.cuda.synchronize()
+    want = torch.tensor(np.array(consts, dtype=np.float32), device="cuda")
+    assert torch.equal(slots[:slot0], torch.zeros(slot0, device="cuda")), "every slot below the constants is zero: no reciprocal landed anywhere"
+    assert torch.equal(slots[slot0 : slot0 + n_consts].view(torch.int32), want.view(torch.int32)), (slots[slot0:].tolist(), consts)
+    assert torch.isnan(block[n_slots:]).all(), "the launch wrote past its n_slots"
+    r0 = compile_init_scalars(15, descale_dp=False)  # the plain artifact: zeroing only
+    slots15 = block[:15]
+    slots15.fill_(float("nan"))
+    run_init_scalars(r0, slots15, stream=st)
+    torch.cuda.synchronize()
+    assert torch.equal(slots15, torch.zeros(15, device="cuda"))
+    scale_dp = torch.tensor([4.0], device="cuda", dtype=torch.float32)
+    outside = torch.full((1,), float("nan"), device="cuda", dtype=torch.float32)
+    slots.fill_(float("nan"))
+    with pytest.raises(ValueError, match="descale_dp=False"):
+        run_init_scalars(r, slots, scale_dp, outside, consts, stream=st)
+    with pytest.raises(ValueError, match="descale_dp=False"):
+        run_init_scalars(r, slots, descale_dp_out=outside, consts=consts, stream=st)
+    with pytest.raises(ValueError, match="pass scale_dp= and descale_dp_out="):
+        run_init_scalars(dividing, slots, consts=consts, stream=st)
+    with pytest.raises(ValueError, match="pass scale_dp= and descale_dp_out="):
+        run_init_scalars(dividing, slots, scale_dp, None, consts, stream=st)
+    with pytest.raises(ValueError, match="descale_dp must be a bool"):
+        compile_init_scalars(15, descale_dp=1)
+    torch.cuda.synchronize()
+    assert torch.isnan(slots).all() and torch.isnan(outside).all(), "a refused call launched"
+    run_init_scalars(dividing, slots, scale_dp, slots[14:15], consts, stream=st)  # today's positional form, unchanged
+    torch.cuda.synchronize()
+    assert slots[14].item() == 0.25 and torch.equal(slots[:14], torch.zeros(14, device="cuda"))
+
+
+_GATE_BWD_TRIPLE_PROBE = textwrap.dedent("""
+    import torch
+    import cudnn.gated_attention_block.kernels.sigmoid_gate_bwd as sgb
+    # the e4m3 arm's compile-time gate names the CURRENT device (Rule 7); this is a trace-compile for sm_107a on whatever box runs it
+    sgb.require_fp8_cvt = lambda who: None
+    r = sgb.compile_sigmoid_gate_bwd(
+        dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False, has_delta=True, og_fp8=True, has_amax_do=False, has_amax_dg=False
+    )
+    print("TRACED", r.og_fp8, r.has_delta, r.has_amax_do, r.has_amax_dg, r.n_ctas_cap)
+    """)
+
+
+def _sm107a_known_to_the_dsl() -> bool:
+    try:
+        from cutlass.base_dsl.enums import Arch
+
+        Arch.from_string("sm_107a")
+        return True
+    except Exception:
+        return False
+
+
+def test_gate_bwd_fp8_arm_traces_without_the_amax_folds(tmp_path):
+    """The gate backward's recipe of a BLOCK-SCALED pipeline -- ``og_fp8=True`` with the ``delta`` output and NEITHER amax
+    fold (no per-tensor dO / dQKVG amax exists there) -- traces and compiles for sm_107a: the e4m3 O_gated arm must not lean
+    on the folds' SMEM array or their partials.  The gate backward has no compile-options knob, so the arch comes from
+    ``CUTE_DSL_ARCH`` in a subprocess (read at the first cutlass import); the per-device fp8 gate is stood down there.
+    SKIPS (never fails) where the DSL predates ``sm_107a``."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    env = dict(os.environ, CUTE_DSL_ARCH="sm_107a", CUTE_DSL_DUMP_DIR=str(tmp_path))
+    proc = subprocess.run([sys.executable, "-c", _GATE_BWD_TRIPLE_PROBE], env=env, capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"the recipe triple did not trace-compile:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    assert "TRACED True True False False 0" in proc.stdout, proc.stdout[-500:]
 
 
 def _amax_arm_run(x, h, d, *, margin, consts):

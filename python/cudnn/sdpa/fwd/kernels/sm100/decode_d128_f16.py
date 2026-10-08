@@ -213,7 +213,7 @@ CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
 THD_PERSISTENT = True
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster
-from cudnn.sdpa.fwd.kernels.sm100.split_combine import _host_ptr_packed
+from cudnn.sdpa.fwd.kernels._thd_split_host import host as _host_thd_split, compile_host as _compile_thd_split_host
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 
@@ -1070,6 +1070,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -2205,149 +2206,16 @@ EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument l
 LSE_KINDS = ("token", "head", "padded") if CFG.THD_VARLEN and SPLIT_KV == 1 else ("dense",)
 
 
-@cute.jit
-def _host_thd_split(
-    q_ptr: cute.Pointer,
-    k_ptr: cute.Pointer,
-    v_ptr: cute.Pointer,
-    o_ptr: cute.Pointer,
-    lse_ptr: Optional[cute.Pointer],
-    sinks_ptr: cute.Pointer,
-    meta_ptr: cute.Pointer,
-    o_desc_ptr: cute.Pointer,
-    problem_size: Tuple[int, int, int, int, int, int],
-    q_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    k_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int64,
-    scale_softmax_log2: cutlass.Float32,
-    n_thd_units: cutlass.Int32,
-    thd_q_lens_ptr: cute.Pointer,
-    thd_kv_lens_ptr: cute.Pointer,
-    thd_lens_form: cutlass.Int32,
-    o_partial_ptr: cute.Pointer,
-    lse_partial_ptr: cute.Pointer,
-    partial_o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_kind: cutlass.Constexpr[str],
-    block_table_ptr: Optional[cute.Pointer],
-    block_table_v_ptr: Optional[cute.Pointer],
-    table_strides: Tuple[cutlass.Int64, cutlass.Int64],
-    n_pages: cutlass.Int32,
-    paged_hnd: cutlass.Constexpr[bool],
-    stream: _cuda_driver.CUstream = None,
-) -> None:
-    """One prepared host owns setup, split attention and final packed combine.
-
-    The caller reserves bounded partial storage once. The native binder supplies
-    compact partial-O strides: deriving TMA strides in this nested host fails
-    the DSL 4.7.0 lowering. The live prefix total stays on the device and bounds
-    the combine. Partial Stats always use natural logs.
-    """
-    b, qh, _kh, tq, _tkv, _ = problem_size
-    tokens, heads = cutlass.Int64(tq), cutlass.Int64(qh)
-    _host(
-        q_ptr,
-        k_ptr,
-        v_ptr,
-        o_partial_ptr,
-        lse_partial_ptr,
-        sinks_ptr,
-        meta_ptr,
-        o_desc_ptr,
-        problem_size,
-        q_strides,
-        k_strides,
-        v_strides,
-        partial_o_strides,
-        (heads * tokens, tokens, cutlass.Int64(1)),
-        cutlass.Int32(tq),
-        scale_softmax_log2,
-        n_thd_units,
-        cutlass.Int64(0),
-        thd_q_lens_ptr,
-        thd_kv_lens_ptr,
-        thd_lens_form,
-        o_partial_ptr,
-        block_table_ptr,
-        block_table_v_ptr,
-        table_strides,
-        n_pages,
-        cutlass.Int64(0),
-        cutlass.Int64(1),
-        CFG.TILE_K,
-        CFG.TILE_O,
-        "dense",
-        paged_hnd,
-        False,
-        stream,
-    )
-    final_stats_strides = (
-        (cutlass.Int64(0), cutlass.Int64(lse_ext), cutlass.Int64(1)) if cutlass.const_expr(lse_kind == "head") else (cutlass.Int64(0), cutlass.Int64(1), heads)
-    )
-    _host_ptr_packed(
-        o_partial_ptr,
-        lse_partial_ptr,
-        o_ptr,
-        lse_ptr,
-        (1, qh, tq, 128),
-        cutlass.Int32(SPLIT_KV),
-        (cutlass.Int64(0), o_strides[1], o_strides[2], cutlass.Int64(1)),
-        final_stats_strides,
-        meta_ptr + cutlass.Int64(2) * cutlass.Int64(b),
-        bool(CFG.STATS_LOG2),
-        stream,
-    )
-
-
 @lru_cache(maxsize=None)
 def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
-    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 128 and (CFG.TILE_K == 128 or (CFG.TILE_K == 192 and not PAGED_KV and not CFG.PACK_GQA))):
-        raise ValueError("packed split requires D128 or unpacked nonpaged D192 THD")
-    if lse_kind not in ("head", "token"):
-        raise ValueError("prepared packed split Stats must be head- or token-major")
-    cache_key = _template_key(globals(), locals(), "compile_thd_split")
-
-    def P(dtype, align=16):
-        return cute.runtime.make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
-
-    i32, strides = cutlass.Int32(0), (cutlass.Int64(0),) * 3
-    return _compile_cached(
-        _host_thd_split,
-        P(STORAGE_DTYPE),
-        P(STORAGE_DTYPE),
-        P(STORAGE_DTYPE),
-        P(STORAGE_DTYPE),
-        P(cutlass.Float32, 4) if has_lse else None,
-        P(cutlass.Float32),
-        P(cutlass.Int32),
-        P(cutlass.Int64),
-        (0, 0, 0, 0, 0, 0),
-        strides,
-        strides,
-        strides,
-        strides,
-        cutlass.Int64(0),
-        cutlass.Float32(0),
-        i32,
-        P(cutlass.Int32, 4),
-        P(cutlass.Int32, 4),
-        i32,
-        P(cutlass.Float32),
-        P(cutlass.Float32, 4),
-        strides,
-        lse_kind,
-        P(cutlass.Int32, 4) if PAGED_KV else None,
-        P(cutlass.Int32, 4) if PAGED_KV else None,
-        (cutlass.Int64(0), cutlass.Int64(0)),
-        i32,
-        paged_hnd,
-        stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
-        options="--enable-tvm-ffi",
-        cache_key=cache_key,
-        symbol="frost_sdpa_fwd_thd_split",
+    supported_shape = (CFG.TILE_K == CFG.TILE_O == 64 and PAGED_KV) or (
+        CFG.TILE_O == 128 and (CFG.TILE_K == 128 or (CFG.TILE_K == 192 and not PAGED_KV and not CFG.PACK_GQA))
     )
+    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and supported_shape):
+        raise ValueError("packed split requires paged D64, D128, or unpacked nonpaged D192 THD")
+    cache_key = _template_key(globals(), locals(), "compile_thd_split")
+    return _compile_thd_split_host(_host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=True)
 
 
 @lru_cache(maxsize=None)

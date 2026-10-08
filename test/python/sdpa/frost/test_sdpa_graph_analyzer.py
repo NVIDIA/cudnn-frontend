@@ -868,13 +868,103 @@ def test_softmax_precision_is_an_op_attribute_not_a_knob():
     g_bad = _mk_softmax_precision_graph(_c.data_type.DOUBLE)
     assert "softmax_precision must be" in (ga.analyze(g_bad).invalid or "")
     assert not _eligible(g_bad)
-    # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable.
+    # The attribute never reaches the cuDNN backend: a SET value makes the node backend-unlowerable --
+    # an explicit FLOAT included (it selects the f32 pipeline ON the python engines; None leaves the
+    # engine choice open, as Attention.md documents).
     assert g_half._unlowerable_node() is not None
+    assert _mk_softmax_precision_graph(_c.data_type.FLOAT)._unlowerable_node() is not None
     assert _mk_softmax_precision_graph(None)._unlowerable_node() is None
     # serialize() is the backend format, which has no field for the attribute:
     # refused rather than emitted as (and later executed as) the f32 pipeline.
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="serialize"):
         g_half.serialize()
+
+
+def _mk_prefolded_graph(flag, attn_scale=None):
+    g = _mk_graph()
+    q, k, v, dims, strides = _mk_qkv(g)
+    kw = {} if attn_scale is None else {"attn_scale": attn_scale}
+    o, _ = g.sdpa(name="s", q=q, k=k, v=v, is_inference=True, use_causal_mask=True, attn_scale_prefolded=flag, **kw)
+    _finish_output(o, dims, strides)
+    return g
+
+
+def test_attn_scale_prefolded_is_an_op_attribute_not_a_knob(monkeypatch):
+    """sdpa(attn_scale_prefolded=True) states a contract on Q (it already carries attn_scale * log2 e,
+    the engine applies no softmax scale), so it is a graph FACT the capability rows gate on -- never
+    a tuning axis, and never degraded to the scaled chain (that would scale twice)."""
+    import dataclasses
+
+    monkeypatch.setattr(ga, "_device_cc", lambda: (10, 7))  # the rows that carry the arm are the cc 10.7 ones
+    specs = {s.name: s for s in engines.ENGINE_SPECS}
+    assert "attn_scale_prefolded" not in engines.SdpaFwdKnobs.__dataclass_fields__
+    g = _mk_prefolded_graph(True)
+    facts = _facts(g)
+    assert facts.attn_scale_prefolded is True and facts.scale is None and not facts.dynamic_scale
+    # Served by the rows claiming the arm for the SELECTED flavor (the cc 10.7 half row at d512 here), by no other.
+    served = _eligible(g)
+    assert "sdpa_fwd_prefill_sm107" in served
+    assert all(specs[n].capabilities.attn_scale_prefolded_d_shapes is not None for n in served), served
+    # False is the default: the same eligibility as no request, and the node stays backend-lowerable.
+    g_false = _mk_prefolded_graph(False)
+    assert ga.analyze(g_false).attn_scale_prefolded is False
+    assert _eligible(g_false) == _eligible(_mk_prefolded_graph(None))
+    assert g_false._unlowerable_node() is None
+    # True: the backend has no field for it -> backend-unlowerable, serialize() refused (as softmax_precision).
+    assert g._unlowerable_node() is not None
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="serialize"):
+        g.serialize()
+    # attn_scale alongside the fold is a malformed request (the scale would be applied twice or dropped).
+    g_bad = _mk_prefolded_graph(True, attn_scale=0.1)
+    assert "leave attn_scale unset" in (ga.analyze(g_bad).invalid or "")
+    assert not _eligible(g_bad)
+    # ... keyed on the kwarg being PASSED, not on its value: an explicit 1.0 is still a double-scale request, while
+    # an omitted attn_scale (which _extract_facts reports as the backend's 1.0) is the fold's contract.
+    assert "leave attn_scale unset" in (ga.analyze(_mk_prefolded_graph(True, attn_scale=1.0)).invalid or "")
+    assert ga.analyze(_mk_prefolded_graph(False)).scale == 1.0
+    assert "must be a bool" in (ga.analyze(_mk_prefolded_graph("yes")).invalid or "")
+    # Bool-likes from config files are coerced on both halves of the contract: 0 is unset (lowerable,
+    # same eligibility), 1 is the fold (python engines only).
+    g_zero, g_one = _mk_prefolded_graph(0), _mk_prefolded_graph(1)
+    assert g_zero._unlowerable_node() is None and ga.analyze(g_zero).attn_scale_prefolded is False
+    assert g_one._unlowerable_node() is not None and ga.analyze(g_one).attn_scale_prefolded is True
+    # Forward-only: the backward recomputes P from the forward's unscaled contract, so a backward
+    # node that sets either attribute is a malformed request (python-only there too, never a pybind
+    # TypeError), and no backward row serves it.
+    g_bwd = _mk_bwd_graph(attn_scale_prefolded=True)
+    assert g_bwd._unlowerable_node() is not None
+    assert "forward-only" in (ga.analyze(g_bwd).invalid or "")
+    assert not _eligible(g_bwd)
+    g_bwd_half = _mk_bwd_graph(softmax_precision=cudnn.data_type.HALF)
+    assert g_bwd_half._unlowerable_node() is not None and "forward-only" in (ga.analyze(g_bwd_half).invalid or "")
+    # ... while every false-valued default representation leaves a backward graph exactly as it was: lowerable,
+    # valid, and with the same eligibility as no attribute at all (the flag is normalized before the check).
+    import numpy as np
+
+    plain_bwd = _mk_bwd_graph()
+    for falsy in (None, False, 0, np.bool_(False)):
+        g_bwd_default = _mk_bwd_graph(attn_scale_prefolded=falsy)
+        assert g_bwd_default._unlowerable_node() is None, repr(falsy)
+        assert ga.analyze(g_bwd_default).invalid == ga.analyze(plain_bwd).invalid, repr(falsy)
+        assert _eligible(g_bwd_default) == _eligible(plain_bwd), repr(falsy)
+    assert "must be a bool" in (ga.analyze(_mk_bwd_graph(attn_scale_prefolded="yes")).invalid or "")
+    # the forward side accepts the numpy representations the same way
+    assert ga.analyze(_mk_prefolded_graph(np.bool_(True))).attn_scale_prefolded is True
+    assert ga.analyze(_mk_prefolded_graph(np.bool_(False))).attn_scale_prefolded is False
+    # Row claims: the MXFP8 and half rows carry the arm in every flavor; per-tensor FP8 never does (the
+    # kernel folds descale_q * descale_k into the softmax scale, so the fold is a contract fork there).
+    every = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+    assert specs["sdpa_fwd_prefill_sm107"].capabilities.attn_scale_prefolded_d_shapes == every
+    assert specs["sdpa_fwd_prefill_sm107_mxfp8"].capabilities.attn_scale_prefolded_d_shapes == every
+    assert specs["sdpa_fwd_prefill_sm107_fp8"].capabilities.attn_scale_prefolded_d_shapes is None
+    assert "not wired" in engines.mismatch(specs["sdpa_fwd_prefill_sm107_fp8"].capabilities, facts)
+    # Routing declines on a claiming row: the paged-KV bodies and the single-CTA half THD legs apply the
+    # scale in-kernel (api_dsl._load_sm100_kernel_module), so the fold must never reach them.
+    half = specs["sdpa_fwd_prefill_sm107"].capabilities
+    assert engines.mismatch(half, facts) is None
+    assert "paged" in engines.mismatch(half, dataclasses.replace(facts, has_paged_kv=True))
+    thd192 = dataclasses.replace(facts, thd=True, d_qk=192, d_v=128)
+    assert engines.mismatch(half, thd192, engines.SdpaFwdKnobs(cga=1)) is not None
 
 
 def test_knob_request_lpt_sched_is_in_domain():
@@ -998,7 +1088,7 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    appended = ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "zero_scale"]
+    appended = ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "zero_scale", "attn_scale_prefolded_d_shapes"]
     legacy_order = [n for n in names if n not in appended]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
@@ -1006,6 +1096,7 @@ def test_capabilities_positional_prefix_is_append_only():
     assert caps.paged_d_shapes is None
     assert caps.thd_pack_gqa_d_shapes == frozenset()
     assert caps.zero_scale is False
+    assert caps.attn_scale_prefolded_d_shapes is None
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -1994,8 +2085,12 @@ def test_paged_facts_declared_max_seq_len_and_single_table():
 def test_paged_probe_declines():
     assert not _eligible(_mk_paged_graph(page_size=48)), "page_size must divide 128 or be a multiple of it"
     assert engines.engine_name() in _eligible(_mk_paged_graph(d=192)), "d=192 rides the d256 flavor envelope"
-    assert not _eligible(_mk_paged_graph(d=512)), "paged KV rides the d128 / d192x128 / d256 flavors only"
-    assert not _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, which carries no PAGED_KV specialization"
+    # Inverted when the d512 flavor was wired (kept, not deleted); d=384 rides its (256, 512]
+    # envelope, (512, 128) selects d512 zero-padded on V, d=576 (absorbed MLA) has no envelope.
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=512)), "paged KV is wired on the d512 flavor"
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=512, d_v=128)), "(512, 128) selects the d512 flavor, zero-padded on V"
+    assert engines.engine_name() in _eligible(_mk_paged_graph(d=384)), "d=384 rides the d512 flavor envelope"
+    assert not _eligible(_mk_paged_graph(d=576)), "no kernel-flavor envelope covers d_qk=576"
     assert not _eligible(_mk_paged_graph(padding=False)), "paged KV needs the padding mask (per-batch KV lengths)"
     # Lifted decline: the sink is an epilogue fold, orthogonal to the paged loader.
     facts = _facts(_mk_paged_graph(sink=True))

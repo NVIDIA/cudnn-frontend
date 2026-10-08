@@ -228,14 +228,12 @@ class KdaCuTileEngine(BaseEngine):
     behavior_notes = (behavior_note.RUNTIME_COMPILATION,)
 
     def check_support(self, graph: "pygraph") -> None:
-        facts = graph._facts_for(analyze)
-        if facts is not None and facts.qk_l2norm_additive_epsilon is not None:
-            raise NotImplementedError("KdaCuTileEngine: qk_l2norm_additive_epsilon is not supported")
         try:
             from .kernels.kda import chunk_kda  # noqa: F401 — availability probe: ImportError = decline
         except ImportError as exc:
             raise NotImplementedError(f"KdaCuTileEngine requires the cuda.tile runtime: {exc}") from exc
 
+        facts = graph._facts_for(analyze)
         cutile_la_gate("KdaCuTileEngine", facts, "KDA", facts.g_dtype if facts is not None else None)
         if facts.gate_domain != "log":
             raise NotImplementedError("KdaCuTileEngine: gate_domain='linear' has no cuTile path (the FROST KDA engine serves it)")

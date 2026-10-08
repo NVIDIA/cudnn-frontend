@@ -81,6 +81,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, CfgD512X2, make_cfg_d512
 # 2 = bring-up / bitwise-twin arm) is a second loader-style global, NOT a knob: a test that wants
 # the 2-CTA arm execs this file with it set, exactly as the loader sets FROST_TEMPLATE_PARAMS.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(mma_2x2=True))
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d512_f16_2x2_sm100: paged_kv is not wired on the 2x2 datapath (the PAGED_KV specialization lives in the role-split sm100/prefill_d512_f16 kernel, which the adapter routes paged d512 graphs onto)"
+    )
 CGA_M_ARM: int = int(globals().get("FROST_D512_2X2_CGA_M", 4))
 # TEST-ONLY skew lever, same loader-style channel (default 0 = compiled out, the shipped cubin is unchanged; never a
 # knob): the TMA-STG warp of PAIR 0 (cta_id_x < 2) nanosleeps ~this many microseconds after its first O subtile is
@@ -1058,6 +1062,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,

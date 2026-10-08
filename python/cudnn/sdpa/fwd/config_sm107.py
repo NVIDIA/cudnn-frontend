@@ -194,6 +194,21 @@ SM107_EPILOGUE_GATE_SHAPES = frozenset({(256, 256)})
 # seams, and only those flavors may load with epilogue_gate=True.
 _EPILOGUE_GATE_FLAVORS = frozenset({"sm107 d256", "sm107 d256 mxfp8"})
 
+# Softmax levers (TemplateParams.softmax_f16 / softmax_scale_prefolded), per FLAVOR: a kernel port flips its
+# flavor in, and _validate_params declines everything else so an unlisted flavor can never trace the default
+# chain under the request (a silent no-op -- the failure the backstop exists for).
+#   softmax_f16 -- the f16x2 exponent arm (softmax_precision=HALF): a QUANTIZED-kernel specialization; the listed
+#     flavors carry it for FP8 / MXFP8 inputs and never for half inputs (the half kernels run the f32 exponent).
+#   softmax_scale_prefolded -- the caller pre-multiplied Q by attn_scale * log2 e and the kernel traces no per-score
+#     scale: wired in the MXFP8 and half bodies of the listed flavors.  Per-tensor FP8 keeps folding
+#     descale_q * descale_k into the softmax scale in-kernel, so the fold is declined there whatever the flavor.
+SM107_SOFTMAX_F16_FLAVORS = frozenset(
+    {"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512", "sm107 d128 mxfp8", "sm107 d192xd128 mxfp8", "sm107 d256 mxfp8", "sm107 d512 mxfp8"}
+)
+SM107_SCALE_PREFOLDED_FLAVORS = frozenset(
+    {"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512", "sm107 d128 mxfp8", "sm107 d192xd128 mxfp8", "sm107 d256 mxfp8", "sm107 d512 mxfp8"}
+)
+
 
 def epilogue_gate_layout_declarable(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int = 2) -> bool:
     """Whether a logical BHSD gate ``G`` binds ZERO-COPY on the Rubin d256 gated
@@ -463,6 +478,19 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) serves dense, unsplit, unpacked graphs only")
     if k.dtype_qkv > _DTYPE_E5M2 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires dtype_o == dtype_qkv; got dtype_o={dtype_o}")
+    quantized = k.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
+    if k.softmax_f16:
+        if not quantized:
+            raise ValueError(f"{flavor}: softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization (half inputs run the f32 exponent)")
+        if flavor not in SM107_SOFTMAX_F16_FLAVORS:
+            raise ValueError(f"{flavor}: softmax_f16 is wired on {sorted(SM107_SOFTMAX_F16_FLAVORS)} only")
+    if k.softmax_scale_prefolded:
+        if quantized and not flavor.endswith(" mxfp8"):
+            raise ValueError(
+                f"{flavor}: softmax_scale_prefolded is not served on per-tensor FP8 (the kernel folds descale_q * descale_k into the softmax scale)"
+            )
+        if flavor not in SM107_SCALE_PREFOLDED_FLAVORS:
+            raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on {sorted(SM107_SCALE_PREFOLDED_FLAVORS)} only")
     if k.sched_policy not in (None, SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"{flavor}: sched_policy must be NATURAL/LPT/LPT_L2 or None (got {k.sched_policy})")
     if k.qh_per_kh < 1:
@@ -838,13 +866,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     # mxfp8); the d192xd128 siblings share this config family but not the epilogue.
     block_scaled_o_wired = tile_k == 128 and tile_o == 128
     _validate_params(flavor, params, split_wired=split_wired, block_scaled_o_wired=block_scaled_o_wired)
-    # The f16x2-exponent arm and the pre-folded-scale arm live in the d128 MXFP8 kernel body (and the
-    # per-tensor FP8 sibling carries the f16x2 exponent on its own); the d192xd128 kernels share this
-    # config family but not those arms, so a flavor-name test would let them through to a silent no-op.
-    if params.softmax_f16 and mxfp8 and tile_k != 128:
-        raise ValueError(f"{flavor}: softmax_f16 on MXFP8 is wired on the d128 kernel only")
-    if params.softmax_scale_prefolded and not (mxfp8 and tile_k == 128):
-        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
+    # softmax_f16 / softmax_scale_prefolded: per-flavor backstops in _validate_params (SM107_*_FLAVORS).
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -977,8 +999,6 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
-    if params.softmax_scale_prefolded:
-        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
     b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
@@ -1206,8 +1226,6 @@ _D512_READ_TILE_ARRIVERS = (
 
 def _make_cfg_d512_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
     _validate_params(flavor, params)
-    if params.softmax_scale_prefolded:
-        raise ValueError(f"{flavor}: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
     if params.cta_mma != _D512_CTA_MMA:
         raise ValueError(f"{flavor}: the role-split pipeline is cga4x1 / CTA_MMA=2 only (got cta_mma={params.cta_mma})")
     dtype_o = resolve_dtype_o(params)
@@ -1382,10 +1400,9 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     # The Rubin record guard keys its THD allowlist by FLAVOR NAME (_F16_THD_FLAVORS holds "sm107 d512"): the 2x2 sibling
     # carries the same ported setup-kernel call sites as the role-split d512 body, so it is validated under that name.
     _validate_params("sm107 d512", params)
-    if params.softmax_scale_prefolded:
-        raise ValueError("d512 2x2: softmax_scale_prefolded is wired on the d128 MXFP8 kernel only")
-    # The 2x2 record's own domain (d512 only, half inputs, unpaged, whole-group PackGQA) is stated ONCE, in config_sm100.
-    _validate_params_sm100("d512", params)
+    # The 2x2 record's own domain (d512 only, half inputs, unpaged, whole-group PackGQA) is stated ONCE, in config_sm100;
+    # the pre-folded scale is this twin's own arm (the cc 10.0 line keeps declining it).
+    _validate_params_sm100("d512", params, scale_prefolded_wired=True)
     if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: BF16/FP16 inputs only")
     if params.cta_mma != 2:

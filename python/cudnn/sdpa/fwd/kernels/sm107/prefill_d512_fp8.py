@@ -25,7 +25,11 @@ Pipeline shape (cluster (4, 1, 1) = two cga2 sub-groups):
 FP8 deltas vs d512_f16 (CFG fields DTYPE_QKV-driven via sdpa_config_dsv4.py):
   - STAGES_KV = 3, XFER_STAGES = 4 (BPE=1 fits more stages in 327 KiB).
   - TILE_K_HW_BMM1/2 ∈ {32, 64}; MMA_KIND = F8F6F4.
-  - P stays FP8-typed (P_STORAGE_DTYPE).
+  - P stays FP8-typed (P_STORAGE_DTYPE).  softmax_precision=HALF (SOFTMAX_F16)
+    runs the exponent as MUFU EX2.F16x2 and casts f16x2 -> FP8 pairs; the
+    stats-less build sums the f16 P words for O's denominator, a build with
+    Stats keeps the exact f32 sum.  The pre-folded softmax scale is not
+    served: descale_q * descale_k is folded into the scale in-kernel.
   - BMM2_V_NBLOCK_ADVANCE = TILE_N * V_SWZ_BYTES (NO BPE factor at FP8 —
     per-CTA V inner = (TILE_O/CTA_MMA)*BPE = 256*1 = 256 B = 2 swz lines).
   - DTYPE_O independent of DTYPE_QKV: E4M3 / E5M2 / BF16 / FP16 (BPE_O ∈ {1, 2}).
@@ -78,6 +82,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.tma import cp_async_bulk_shared_cluster_shared_cta
@@ -214,6 +219,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     vec_scale_pair,
     fp32_to_fp8_pack,
 )
+from cudnn.frost.tile_dsl import softmax_f16 as _softmax_f16
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.tma import (
@@ -380,6 +386,21 @@ if P_ROW_BYTES % 8 or P_BLOCK_BYTES % 1024 or (pXferElems * CFG.BPE) % 1024:
 # Streaming-softmax constants.
 NEG_INF_F32 = cutlass.Float32(-3.4028235e38)
 RESCALE_THRESHOLD_F32 = cutlass.Float32(CFG.RESCALE_THRESHOLD)
+# softmax_precision=HALF (TemplateParams.softmax_f16): the exponent runs as MUFU EX2.F16x2 on packed pairs and P casts
+# straight from f16x2 to the FP8 pair format (``tile_dsl.softmax_f16``, shared with the other quantized kernels).  This
+# kernel has no ones-MMA row-sum column -- O's denominator is the register row-sum of sg0 -- so the stats-less HALF build
+# sums the f16x2 P words it stores (an HADD2 pair tree, self-consistent with the P the BMM2 consumes, below the FP8 P
+# noise), while a build with Stats keeps the EXACT f32 denominator for the published LSE (a second, f32 exp2 of the shifted
+# scores: honored, not faster).  The per-score FFMA2 shift stays on every arm: the per-tensor descale_q * descale_k fold
+# rides in scale_log2 (see _kernel), which is why the pre-folded softmax scale is not served on this kernel and no fused
+# shift+convert arm exists here (``_FUSED_SHIFT_CVT`` is the module-constant contract the lever tests read).
+SOFTMAX_F16 = int(PARAMS.softmax_f16)
+_FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
+_FUSED_SHIFT_CVT = False
+if PARAMS.softmax_scale_prefolded:
+    raise ValueError(
+        "prefill_d512_fp8: softmax_scale_prefolded is not served on per-tensor FP8 (descale_q * descale_k is folded into the softmax scale in-kernel)"
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -684,7 +705,7 @@ def _kernel(
     _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
-    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
     o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     # ------------------------------------------------------------------
@@ -963,6 +984,8 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 sg0_mcast_mask=sg0_mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
         else:
             _mma_warp_non_leader(
@@ -1071,6 +1094,7 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 @cute.jit
 def _sg0_softmax_kv_iter(
     apply_mask: cutlass.Constexpr[bool],
+    has_lse: cutlass.Constexpr[bool],  # Stats requested: the HALF arm keeps the exact f32 row-sum (see SOFTMAX_F16)
     kv_loop,
     # State (threaded, returned updated):
     sg0_xfer_state,
@@ -1174,13 +1198,11 @@ def _sg0_softmax_kv_iter(
     )
     alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max; then exp2.  Keep the FP32
-    # RegTile (slice via .vec slicing) and cast each chunk to FP8 inside the
-    # P_TMA_ITERS loop — RegTile(Float8E4M3FN) is illegal at JIT, but slicing
-    # the FP32 RegTile then casting the slice is fine (per d256_fp8 pattern).
+    # reg_S = reg_S * scale_log2 - total_max (one FFMA2 per pair -- the per-tensor descale fold rides in scale_log2, so
+    # there is no pre-folded arm here); then exp2 and the FP8 pack.  Keep the FP32 RegTile (slice via .vec slicing) and
+    # cast each chunk to FP8 inside the P_TMA_ITERS loop — RegTile(Float8E4M3FN) is illegal at JIT, but slicing the FP32
+    # RegTile then casting the slice is fine (per d256_fp8 pattern).
     reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
-    reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
-    reg_P_tile = RegTile(reg_P_fp32, size=CFG.TILE_N)
 
     # ---- Write P[tid, :] to SMEM xfer ring slot[parity] (K1 swizzle hoist + K2 fp8 pack) ----
     # K1: the Swizzle(3,4,3) XOR term of every 16-B vector of this lane's P row is LOOP-INVARIANT: the swizzle XORs bits
@@ -1196,23 +1218,56 @@ def _sg0_softmax_kv_iter(
     # `Vector.to(Float8E4M3FN)` on the RegTile slice, whose lowering re-packed the last word of the slice through 7 PRMT +
     # LOP3.  The words are BITCAST to the storage dtype (a value cast would convert the integers) and stored as 16-B vectors.
     p_xfer_slot = sP_xfer_raw.subview(cur_parity_S * cutlass.Int32(pXferElems))
-    for chunk in cutlass.range_constexpr(P_TMA_ITERS):
-        chunk_P_fp32 = reg_P_tile[chunk * P_D_BLOCK : (chunk + 1) * P_D_BLOCK].vec
-        for k in cutlass.range_constexpr(P_VECS_PER_CHUNK):
-            vals = []
-            for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
-                vals.append(chunk_P_fp32[k * P_ELEMS_PER_VEC + i])
-            vec_fp8 = fp32_to_fp8_pack(vals, dtype=P_STORAGE_DTYPE).bitcast(P_STORAGE_DTYPE)
-            dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
-            dst.store(vec_fp8, alignment=P_VEC_BYTES)
+    if cutlass.const_expr(SOFTMAX_F16):
+        # HALF arm: per 16-B P vector the 16 shifted f32 scores pack to f16x2 (CVT), the exponent runs as MUFU EX2.F16x2
+        # and the pairs cast straight from f16x2 to the FP8 pair format -- the same Vector[Int32, 4] in fp32_to_fp8_pack's
+        # byte order, so the bitcast + 16-B store (K1 / K2), the SMEM layout and the DSMEM ship below are untouched.  The
+        # 64 f16x2 P words of the row are gathered for the stats-less row-sum.
+        reg_S_scaled_tile = RegTile(reg_S_scaled, size=CFG.TILE_N)
+        p_pairs = []
+        for chunk in cutlass.range_constexpr(P_TMA_ITERS):
+            chunk_S_scaled = reg_S_scaled_tile[chunk * P_D_BLOCK : (chunk + 1) * P_D_BLOCK].vec
+            for k in cutlass.range_constexpr(P_VECS_PER_CHUNK):
+                vals = []
+                for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
+                    vals.append(chunk_S_scaled[k * P_ELEMS_PER_VEC + i])
+                fp8_words, unit_pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC)
+                p_pairs.extend(unit_pairs)
+                vec_fp8 = cutlass.Vector.from_elements(tuple(fp8_words), cutlass.Int32).bitcast(P_STORAGE_DTYPE)
+                dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
+                dst.store(vec_fp8, alignment=P_VEC_BYTES)
+        if cutlass.const_expr(has_lse):
+            # Stats requested: the published LSE keeps the EXACT f32 denominator -- the f32 exp2 of the shifted scores
+            # and the f32 pair reduction, as on the f32 chain (honored, not faster).  The 128 scores stay live across
+            # this second exponent (the f32 chain's exp2 is in place), which costs this build 8 spilled registers in the
+            # softmax warps (sm_107a, dense: REG 255 / STACK 32, 8 STL + 8 LDL; the stats-less arm and the f32 chain
+            # spill nothing).  Chunking the exponent per 64 scores read the same 8, per 16 scores 26: ptxas hoists the
+            # independent MUFUs regardless, so the row form stays.
+            iter_sum_pair = row_reduction_pair(cute.math.exp2(reg_S_scaled, fastmath=True))
+        else:
+            # Stats-less: O's denominator is the f16 pair-tree sum of the SAME P words the BMM2 consumes.
+            iter_sum_pair = _softmax_f16.f16_pairs_sum_pair(p_pairs)
+    else:
+        reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
+        reg_P_tile = RegTile(reg_P_fp32, size=CFG.TILE_N)
+        for chunk in cutlass.range_constexpr(P_TMA_ITERS):
+            chunk_P_fp32 = reg_P_tile[chunk * P_D_BLOCK : (chunk + 1) * P_D_BLOCK].vec
+            for k in cutlass.range_constexpr(P_VECS_PER_CHUNK):
+                vals = []
+                for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
+                    vals.append(chunk_P_fp32[k * P_ELEMS_PER_VEC + i])
+                vec_fp8 = fp32_to_fp8_pack(vals, dtype=P_STORAGE_DTYPE).bitcast(P_STORAGE_DTYPE)
+                dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
+                dst.store(vec_fp8, alignment=P_VEC_BYTES)
+        # Software row-sum of the f32 P (no ones-MMA Sigma column on this kernel).
+        iter_sum_pair = row_reduction_pair(reg_P_fp32)
 
     # ---- Write alpha[tid] (FP32) to alpha xfer slot[parity] (K4: per-lane row base hoisted per work item) ----
     alpha_slot = alpha_row_base.subview(cur_parity_S * cutlass.Int32(CFG.TILE_M))
     alpha_slot.store(alpha)
 
-    # Update total_sum = total_sum * alpha + row_reduction(reg_P).
+    # Update total_sum = total_sum * alpha + row_sum(P).
     alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
-    iter_sum_pair = row_reduction_pair(reg_P_fp32)
     total_sum_vec = total_sum_vec * alpha_pair + iter_sum_pair
 
     # Fence SMEM→async; sync the 4 compute warps so all 128 rows of
@@ -1479,6 +1534,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_left, kv_right, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             False,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -1504,6 +1560,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_left, kv_unmasked_lo, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             True,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -1528,6 +1585,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_unmasked_lo, kv_unmasked_hi, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             False,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -1552,6 +1610,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_unmasked_hi, kv_right, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             True,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -1928,17 +1987,25 @@ def _compute_warp_group(
             # Write LSE — under cga2 each sg1 peer writes its half of O+LSE
             # rows (leader = [0:128], peer = [128:256]).  Per-thread row.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
-            # Gated exactly like the LSE write below.
-            if q_row_global < seqlen_q:
+            # ONE row bound for BOTH the LSE write and the amax atomic below.  They must stay tied: amax is an
+            # atomicMax, which only GROWS, so a single row past the sequence's own length folded in permanently
+            # inflates the graph's Amax_O for the whole tensor and no per-row check ever shows it.  Under THD the
+            # bound is the per-sequence Q length S_q_b, not the dense seqlen_q: with that bound the single-query
+            # THD draws of the cc 10.7 FP8 sweep reported Amax_O 2 % to 7x above the O they stored (the tile's
+            # other 127 rows, stale Q, are stored as zero but were still reduced).  Mirrors prefill_d512_mxfp8.
+            q_row_limit = seqlen_q
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                q_row_limit = _s_q_b
+            if q_row_global < q_row_limit:
                 nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
             if cutlass.const_expr(CFG.THD_VARLEN):
                 # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
                 # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
-                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
-                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
-                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < _s_q_b:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         # Written in the CALLER's layout, picked by the STATIC rank compile()
                         # baked in: token-major rank-2 [T, QH] (the DEFAULT) or head-major
@@ -1954,7 +2021,7 @@ def _compute_warp_group(
                                 lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < seqlen_q:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_arr[batch_idx, head_idx, q_row_global] = lse
 
@@ -2030,6 +2097,8 @@ def _mma_warp_group(
     mcast_mask,
     sg0_mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     """MMA warp leader — sg-conditional BMM1 (sg0 leader) or BMM2 (sg1 leader).
 
@@ -2077,7 +2146,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,

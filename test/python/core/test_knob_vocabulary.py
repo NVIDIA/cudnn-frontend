@@ -177,6 +177,9 @@ def test_sdpa_fwd_knobs_round_trip():
     # is the sdpa(softmax_precision=) op attribute, not a SdpaFwdKnobs field
     assert "softmax_precision" not in SdpaFwdKnobs.__dataclass_fields__
     assert not hasattr(kt, "SOFTMAX_PRECISION")
+    # ... nor is the pre-folded attention scale: sdpa(attn_scale_prefolded=True) is a contract on Q
+    assert "attn_scale_prefolded" not in SdpaFwdKnobs.__dataclass_fields__
+    assert not hasattr(kt, "ATTN_SCALE_PREFOLDED")
     # unset fields do not appear; integer keys (a persisted record) are accepted
     assert SdpaFwdKnobs(tile_m=64).to_public() == {kt.TILE_M: 64}
     assert SdpaFwdKnobs.from_public({int(kt.TILE_M): 64, int(kt.PACK_GQA): 0}) == SdpaFwdKnobs(tile_m=64, pack_gqa=False)

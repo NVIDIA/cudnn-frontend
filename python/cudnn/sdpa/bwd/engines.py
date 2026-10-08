@@ -574,7 +574,7 @@ def _thd_ctor_facts(facts: "ga.SdpaGraphFacts", stats_geom) -> dict:
     """The THD plan-time facts every sm107-line adapter constructor takes, derived ONCE for the three lowerings: ``thd``, the
     caller-declared packed token totals (under THD they SIZE the blocked S/dS workspace, which ``scratch_workspace_bytes()``
     has to answer at build time -- why ``mismatch()`` requires them there) and the packed Stats packing, read off the ragged
-    declaration exactly as the forward reads it (``fwd/prepared.py``, ``bind_thd``): token-major ``(T, H)`` -- cuDNN's ragged-Stats
+    declaration exactly as the forward reads it (native forward THD binding): token-major ``(T, H)`` -- cuDNN's ragged-Stats
     recipe -- or head-major ``(1, QH, head_stride)``, which is what the FROST forward emits natively (``mismatch()`` has already
     rejected anything that is neither).  Off a dense graph every fact is its default."""
     thd = facts.thd

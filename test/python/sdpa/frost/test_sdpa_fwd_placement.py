@@ -148,6 +148,23 @@ def test_decode_shaped_rows_lead_at_every_kv_length(d, s_q, s_kv):
 
 
 @pytest.mark.L0
+def test_paged_d512_decode_trails_until_its_decode_tile():
+    """Paged d512 at s_q == 1 runs the role-split prefill tile (no d512 decode tile) and
+    measured behind the backend's paged decode engine, so it TRAILS by default, while the
+    same launch over dense K/V keeps the measured dense-d512 rule (LEAD at these KV tokens
+    in flight); multi-token paged d512 keeps the decode-shaped LEAD and paged d512 prefill
+    stays backend-first like every other paged prefill (the paged d256 THD shard excepted)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == _SM100)
+    paged = dict(d_qk=512, d_v=512, b=8, h_q=64, h_kv=1, s_kv=4096, has_paged_kv=True, padded=True, page_size=16, causal=False, bottom_right=False)
+    assert placement.place(spec, _facts(s_q=1, **paged)) == placement.TRAIL
+    assert placement.place(spec, _facts(s_q=1, **{**paged, "has_paged_kv": False, "page_size": 0})) == placement.LEAD
+    assert placement.place(spec, _facts(s_q=4, **paged)) == placement.LEAD
+    assert placement.place(spec, _facts(s_q=128, **paged)) == placement.TRAIL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "outside",
     [
@@ -179,3 +196,33 @@ def test_paged_prefill_placement_stays_inside_configured_domain(monkeypatch, out
     values = dict(h_q=6, h_kv=2, s_q=128, s_kv=256, d_qk=256, d_v=256, has_paged_kv=True, thd=True, page_size=32)
     values.update(outside or {})
     assert placement.place(spec, _facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize(
+    "chooser,decision",
+    [
+        ("_prefer_paged_d256_lpt", True),
+        ("paged_d256_prefix_launch", object()),
+        ("nonpaged_thd_split_choice", (3, True)),
+        ("paged_thd_split_choice", (3, False)),
+    ],
+)
+def test_sm107_placement_consumes_qualified_choices(monkeypatch, dtype, chooser, decision):
+    """A qualified chooser result reaches public placement; no workload winner is fixed."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    for name, empty in (
+        ("_prefer_paged_d256_lpt", False),
+        ("paged_d256_prefix_launch", None),
+        ("nonpaged_thd_split_choice", (1, False)),
+        ("paged_thd_split_choice", (1, False)),
+    ):
+        monkeypatch.setattr(heuristics, name, lambda *args, value=empty: value)
+    monkeypatch.setattr(heuristics, chooser, lambda *args: decision)
+    facts = _facts(device_cc=(10, 7), dtype=dtype)
+    assert placement.place(spec, facts) == placement.LEAD
+    # An architecture-specific choice cannot promote this row on another GPU.
+    assert placement.place(spec, _facts(device_cc=(10, 0), dtype=dtype)) == placement.TRAIL

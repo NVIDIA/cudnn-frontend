@@ -36,7 +36,13 @@ import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
-from cudnn.sdpa.fwd.config_sm100 import SM100_THD_PACK_GQA_SHAPES, pack_gqa_supported, supports_paged_prefill_cga1, supports_thd_split
+from cudnn.sdpa.fwd.config_sm100 import (
+    SM100_THD_PACK_GQA_SHAPES,
+    pack_gqa_supported,
+    supports_paged_prefill_cga1,
+    supports_paged_d256_pack_gqa,
+    supports_thd_split,
+)
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
@@ -98,7 +104,7 @@ class SdpaFwdKnobs:
 
     Knobs are performance-only: every value computes the same function, so an
     autotuner may pick any of them. The softmax accumulator precision (the
-    Rubin f16x2 exponent arm) changes numerics and is therefore NOT a knob: it
+    cc 10.7 f16x2 exponent arm) changes numerics and is therefore NOT a knob: it
     is the ``sdpa(..., softmax_precision=)`` op attribute, read from the graph
     into ``SdpaGraphFacts.softmax_precision`` and gated by each row's
     ``Capabilities.softmax_precisions`` in :func:`mismatch`.
@@ -335,7 +341,7 @@ class Capabilities:
     split_d_shapes: Optional[frozenset] = None
     # Softmax-precision domain (cudnn.data_type values). Empty = unserved.
     # Arch-dependent membership (the f16x2 exponent arm exists only in the
-    # SM107 sibling kernel) is expressed by SPLITTING the row per arch line —
+    # cc 10.7 quantized kernels) is expressed by SPLITTING the row per arch line —
     # each row declares exactly what its own lowering carries — not by a
     # knob x arch notch here.
     softmax_precisions: frozenset[int] = frozenset()
@@ -395,6 +401,15 @@ class Capabilities:
     # attn_scale = 0. The SM100/SM107/SM120 kernels fold the scale into exp2 after an unscaled, -inf-masked
     # running max, which a zero scale turns into NaN (#1435); SM80 and SM90 specialize on the scale's sign. Appended last.
     zero_scale: bool = False
+    # Shapes whose kernel flavors carry the pre-folded-scale arm (the op attribute
+    # sdpa(attn_scale_prefolded=True): Q carries attn_scale * log2(e), the kernel
+    # traces no per-score scale).  None = unserved (the default: a row opts in).
+    # Matched on the flavor the lowering SELECTS (_selected_d_shape), like
+    # paged_d_shapes.  The paged-KV bodies and the single-CTA half THD legs
+    # (packed split / D192 single-Q) run bodies without the arm and are declined
+    # by rule in mismatch().  APPENDED after zero_scale (append-only
+    # contract above; the same test pins it).
+    attn_scale_prefolded_d_shapes: Optional[frozenset] = None
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -518,7 +533,7 @@ def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
 
 
 def paged_thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
-    """The paged subset used by the existing D128 automatic split rule."""
+    """The paged subset of the bounded THD split contract."""
     return facts.has_paged_kv and thd_split_domain(capabilities, facts)
 
 
@@ -662,7 +677,7 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     ):
         return frozenset({1, 2})
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
-        return frozenset({1})
+        return frozenset({2 if (facts.d_qk, facts.d_v) == (256, 256) else 1})
     if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):
         return frozenset({1, 2})
     domain = capabilities.cgas
@@ -698,6 +713,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
         # honored only by a row whose lowering carries that arm — never degraded.
         return f"requested softmax_precision={facts.softmax_precision} is outside this engine's domain {sorted(capabilities.softmax_precisions, key=int)}"
+    if facts.attn_scale_prefolded:
+        # The op attribute sdpa(attn_scale_prefolded=True): Q already carries
+        # attn_scale * log2(e) and the kernel must trace no per-score scale --
+        # served only by a row whose SELECTED flavor carries that arm, never
+        # degraded to the scaled chain (that would scale twice).
+        if capabilities.attn_scale_prefolded_d_shapes is None:
+            return "attn_scale_prefolded (Q pre-multiplied by attn_scale * log2 e) is not wired in this engine's kernels"
+        if facts.has_paged_kv:
+            return "attn_scale_prefolded is not wired in the paged-KV kernel bodies"
+        if _selected_d_shape(capabilities, facts) not in capabilities.attn_scale_prefolded_d_shapes:
+            return (
+                f"attn_scale_prefolded is wired only in the {sorted(capabilities.attn_scale_prefolded_d_shapes)} kernel flavors; "
+                f"graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
+            )
     if knobs is not None:
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
@@ -716,15 +745,35 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        packed_split = knobs.cga == 1 and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
+        split_cga = knobs.cga if knobs.cga is not None else (1 if (facts.d_qk, facts.d_v) == (64, 64) else 2)
+        packed_split = split_cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
         if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and knobs.pack_gqa and not facts.has_paged_kv and not packed_split:
             return "Rubin half PackGQA requires paged KV or D128 packed split"
+        if (
+            facts.attn_scale_prefolded
+            and capabilities.sm_lo == 107
+            and not (facts.is_fp8 or facts.is_mxfp8)
+            and knobs.cga == 1
+            and facts.thd
+            and (packed_split or _selected_d_shape(capabilities, facts) == (192, 128))
+        ):
+            # These two legs load the single-CTA half body (api_dsl._load_sm100_kernel_module), which
+            # applies the scale in-kernel; the cga2 prefill body of the same flavor serves the fold.
+            return "attn_scale_prefolded is not wired in the single-CTA half THD legs (packed split / D192 single-Q)"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
-                "supports_paged_packed_split"
-                if facts.has_paged_kv
-                else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                "supports_paged_d64_packed_split"
+                if facts.d_v == 64
+                else (
+                    "supports_paged_d256_packed_split"
+                    if facts.d_v == 256
+                    else (
+                        "supports_paged_packed_split"
+                        if facts.has_paged_kv
+                        else ("supports_nonpaged_d128_packed_split" if facts.d_qk == 128 else "supports_nonpaged_packed_split")
+                    )
+                )
             ),
             False,
         ):
@@ -757,15 +806,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # do not produce per-split partials). Declined HERE so a split
             # request never reaches a kernel that cannot honor it.
             # Paged KV is padded by construction and its split composes with
-            # the per-batch lengths (the decode path — B*H_kv is far below
-            # the SM count), so it is exempt from the padded exclusion.
+            # the per-batch lengths (the decode lever when B*H_kv leaves the
+            # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
                 or facts.has_sink
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native D128 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native D128, nonpaged D192, or SM107 paged D256 packed split"
             if _synth_kv_padding(capabilities, facts):
                 # The lowering would serve this ragged S_kv through the padded
                 # kernel path (synthesized per-batch KV lengths) — the same
@@ -782,6 +831,8 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # (64, 64) "fits" (128, 128) and admits a split the d64 kernel
             # cannot serve, so the plan would clear eligibility and then die in
             # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
+            if capabilities.sm_lo == 107 and _selected_d_shape(capabilities, facts) == (256, 256) and not packed_split:
+                return "SM107 D256 split is qualified only for paged half THD"
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
@@ -792,7 +843,27 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
-            if facts.thd and not ragged_decode and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes:
+            if (
+                capabilities.sm_lo == 107
+                and not (capabilities.is_fp8 or capabilities.is_mxfp8)
+                and _selected_d_shape(capabilities, facts) == (256, 256)
+                and not supports_paged_d256_pack_gqa(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                    split_kv=knobs.split_kv or 1,
+                )
+            ):
+                return "SM107 D256 PackGQA requires exact paged half THD with CGA2 and no split"
+            if (
+                facts.thd
+                and not ragged_decode
+                and not (packed_split and (facts.d_qk, facts.d_v) == (64, 64))
+                and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes
+            ):
                 return "PackGQA is not supported for this THD/ragged flavor (except the decode tile's ragged-Q leg)"
             if capabilities.is_mxfp8 and facts.o_block_scale:
                 return "PackGQA on the MXFP8 d128 flavor serves a plain (not block-scaled) O only"
@@ -1130,21 +1201,25 @@ def _sm100_spec() -> EngineSpec:
             swa=True,
             padded=True,
             # Paged KV caches (paged_attention_k/v_table + seq_len_kv) on the
-            # d128 / d192x128 / d256 flavors: block-table indirection on the
-            # K/V TMA loads, HND and NHD page layouts, K and V pools of
-            # different row widths (d192x128), KV split + combine (mismatch()
-            # holds the padded / page-geometry conditions; paged_d_shapes below
-            # names the wired flavors — the d512 kernel carries no PAGED_KV
-            # specialization yet). Decode shapes on the d128 flavor ride the
-            # decode tile (TILE_CGA_M=1, below); d192x128 has no decode tile
-            # yet, so its paged decode runs the prefill geometry (one live row
-            # per 128-row Q tile), measured behind the backend's paged decode
-            # plan (B200, b=32, S_q=1, page 16, bf16: 32/32 MHA 788.7 us vs
-            # 476.9 us, 32/8 GQA 275.8 vs 199.6 us -- the tracker's gaps
-            # table). A d192x128 decode tile is the follow-up, as the d128
-            # tile was: parity is a kernel's job, not an ordering rule's.
+            # d128 / d192x128 / d256 / d512 flavors: block-table indirection on
+            # the K/V TMA loads, HND and NHD page layouts, K and V pools of
+            # different row widths (d192x128, and the d512 envelope's
+            # straddling pairs), KV split + combine (mismatch() holds the
+            # padded / page-geometry conditions; paged_d_shapes below names the
+            # wired flavors -- on d512 the role-split loader issues the K boxes
+            # from the sub-group 0 CTAs and the V boxes from the sub-group 1
+            # CTAs). Decode shapes on the d128 flavor ride the decode tile
+            # (TILE_CGA_M=1, below); d192x128 and d512 have no decode tile
+            # yet, so their paged decode runs the prefill geometry (one live
+            # row per 128-row Q tile), measured behind the backend's paged
+            # decode plan (B200, page 16, bf16: d192x128 b=32 S_q=1 32/32 MHA
+            # 788.7 us vs 476.9 us, 32/8 GQA 275.8 vs 199.6 us; d512 b=8 S_q=1
+            # 64/1 77.8 vs 65.1 us -- the tracker's gaps table;
+            # sdpa/fwd/placement.py keeps the backend first for paged d512
+            # S_q == 1 by default). Decode tiles for both are the follow-up, as
+            # the d128 tile was: parity is a kernel's job, not an ordering rule's.
             paged_kv=True,
-            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
+            paged_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
             sink=True,
             stats=True,
             stats_log2=True,
@@ -1234,11 +1309,14 @@ def _sm107_spec() -> EngineSpec:
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
       the shared combine. Bounded D128 THD and nonpaged D192 THD
       also use the shared single-CTA packed partials. Sink split stays declined.
-    - ``pack_gqas``: D128 paged THD and nonpaged split THD use the shared half pipeline.
+    - ``pack_gqas``: D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD without sink uses the shared
       Blackwell paged pipeline, compiled natively for SM107.
-    - ``softmax_precisions``: the f16x2 exponent arm lives only in the d128 FP8
-      sibling.
+    - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
+      (the f16x2 arm is a quantized-kernel specialization).
+    - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the
+      pre-folded-scale arm (raw running max, plain subtract shift); the paged
+      bodies and the single-CTA THD legs apply the scale in-kernel and decline.
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107",
@@ -1280,11 +1358,15 @@ def _sm107_spec() -> EngineSpec:
             cu_seq_len=True,
             paged_kv=True,
             paged_d_shapes=frozenset({(128, 128), (256, 256)}),
+            # FLOAT only: the half kernels run the f32 exponent (a HALF request declines here, never
+            # in the adapter); the pre-folded scale is a neutral arm of every half prefill body.
+            softmax_precisions=frozenset({cudnn.data_type.FLOAT}),
+            attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             pack_gqas=frozenset({False, True}),
-            pack_gqa_d_shapes=frozenset({(128, 128)}),
-            thd_pack_gqa_d_shapes=frozenset({(128, 128)}),
+            pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
+            thd_pack_gqa_d_shapes=frozenset({(128, 128), (256, 256)}),
             split_kv_supported=True,
-            split_d_shapes=frozenset({(128, 128), (192, 128)}),
+            split_d_shapes=frozenset({(128, 128), (192, 128), (256, 256)}),
             # NATURAL row-wide; LPT advertised PER D-SHAPE for what is validated.
             #
             # The old note here said the ported decode "does not honor
@@ -1421,9 +1503,11 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
       and the descales are scalars so no per-column plumbing is affected.
       THD keeps native dims (thd_d_shapes: the packed THD compile key
       carries no head-dim entries).
-    - softmax_precisions: the f16x2 exponent arm lives only in the SM107
-      sibling kernel, so only that row admits HALF. FLOAT is the pipeline
-      every flavor already runs.
+    - softmax_precisions: the f16x2 exponent arm lives in the cc 10.7 sibling
+      kernels (every per-tensor FP8 flavor), so only that row admits HALF.
+      FLOAT is the pipeline every flavor already runs.  The pre-folded scale is
+      not served on per-tensor FP8: the kernels fold descale_q * descale_k into
+      the softmax scale in-kernel.
     - thd_d_shapes: all SM100 native flavors carry the
       write_thd_meta THD leg; the SM107 row carries all four of its per-tensor
       FP8 siblings (config_sm107.SM107_FP8_THD_SHAPES: d128, d192xd128, d256
@@ -1645,9 +1729,10 @@ def _sm100_fp8_spec(*, arch: str = "sm100") -> EngineSpec:
                 else (((64, 64), frozenset({1})), ((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((256, 256), frozenset({1})))
             ),
             split_cgas_by_d_shape=(() if rubin_row else (((64, 64), frozenset({1})), ((128, 128), frozenset({2})), ((192, 128), frozenset({2})))),
-            # f16x2-softmax arm: only the SM107 sibling kernel carries the
-            # path (MUFU EX2.F16x2 exists below cc10.7 but no other file wires
-            # it). FLOAT is the f32 pipeline every flavor already runs.
+            # f16x2-softmax arm: only the cc 10.7 sibling kernels carry the
+            # path, in every per-tensor FP8 flavor (MUFU EX2.F16x2 exists below
+            # cc10.7 but no other file wires it). FLOAT is the f32 pipeline
+            # every flavor already runs.
             softmax_precisions=(frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}) if rubin_row else frozenset({cudnn.data_type.FLOAT})),
             split_kv_supported=True,
             split_d_shapes=(frozenset({(128, 128), (192, 128)}) if rubin_row else frozenset({(64, 64), (128, 128), (192, 128), (256, 256)})),
@@ -1722,9 +1807,11 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # the d128 MXFP8 kernel; the adapter declines the wider flavors.
             o_block_scales=frozenset({0, 16, 32}),
             is_mxfp8=True,
-            # f16x2-exponent arm (softmax_precision=HALF): the d128 MXFP8 kernel carries the per-tensor
-            # sibling's path; the adapter declines it on the wider flavors.  FLOAT is the f32 pipeline.
+            # f16x2-exponent arm (softmax_precision=HALF) and the pre-folded scale (attn_scale_prefolded,
+            # fused with the f16 arm on stats-less graphs): every MXFP8 flavor carries both.  FLOAT is the
+            # f32 pipeline.
             softmax_precisions=frozenset({cudnn.data_type.FLOAT, cudnn.data_type.HALF}),
+            attn_scale_prefolded_d_shapes=frozenset({(128, 128), (192, 128), (256, 256), (512, 512)}),
             causal=True,
             bottom_right=True,
             right_band_widening=True,
@@ -1999,7 +2086,7 @@ def lower_dsl_prefill(
         causal_bottom_right=facts.bottom_right,
         window_size_left=facts.window_left,
         window_size_right=(facts.right_bound if facts.right_band_widening else None),
-        scale_softmax=facts.scale,
+        scale_softmax=None if facts.attn_scale_prefolded else facts.scale,  # the fold: Q carries the scale
         seq_kv_lens_present=facts.padded or synth_kv_padding,
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
         # enabled whenever a dense padded graph carries per-batch Q lengths.
@@ -2054,6 +2141,9 @@ def lower_dsl_prefill(
         pack_gqa=knobs.pack_gqa if knobs is not None else None,
         split_kv=knobs.split_kv if knobs is not None else None,
         softmax_precision=facts.softmax_precision,  # op attribute (None = the f32 pipeline)
+        # Op attribute attn_scale_prefolded -> the adapter's softmax_scale_prefolded (the row's
+        # attn_scale_prefolded_d_shapes claim gated it; every forward adapter declares the kwarg).
+        softmax_scale_prefolded=facts.attn_scale_prefolded,
         # Epilogue gate (sample_gate=) and the Amax_O fold-out (has_amax_o=):
         # feature-detected on the adapter's constructor, see the helper.
         **_epilogue_gate_ctor_kwargs(facts, _ctor_params, _exec_params, spec.name),
@@ -2079,6 +2169,8 @@ def lower_dsl_prefill(
     # The template file that serves this plan (e.g. "prefill_d256_f16" vs the
     # decode-shaped "decode_d256_f16"), when the adapter records one.
     kernel_template = getattr(api, "kernel_template", None)
+    # ... and the softmax arms that template traced (api_dsl.softmax_arms_of), when the adapter records them.
+    softmax_arms = getattr(api, "softmax_arms", None)
 
     # Workspace requirement for the compiled geometry: every per-execute scratch
     # buffer is carved from the CALLER's workspace, so its size is fixed here at
@@ -2260,7 +2352,7 @@ def lower_dsl_prefill(
             # Stats-less graphs bind lse_tensor=None: every adapter here is
             # lse_optional (the kernel compiles the LSE store out) — no dummy.
             lse_tensor=resolved.get(id_stats) if id_stats is not None else None,
-            scale_softmax=facts.scale,
+            scale_softmax=None if facts.attn_scale_prefolded else facts.scale,  # the fold: Q carries the scale
             sinks=_need(resolved, sink_src, "sink_token") if sink_src is not None else None,
             seq_kv_lens=seq_kv_buf,
             seq_q_lens=seq_q_buf if forward_seq_q else None,
@@ -2318,6 +2410,7 @@ def lower_dsl_prefill(
     _execute.workspace_bytes = total_workspace_bytes
     _execute.binding = binding
     _execute.kernel_template = kernel_template
+    _execute.softmax_arms = softmax_arms
     _execute.execute_resolved = _execute_by_tensor
     _execute.prepared = None
     if getattr(api, "_sm80_spec", None) is not None:

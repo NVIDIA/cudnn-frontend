@@ -262,19 +262,23 @@ class SdpaThdBinder {
             neg_inf_    = spec.attr("neg_inf");
         }
         if (py::hasattr(spec, "split_workspace") && !spec.attr("split_workspace").is_none()) {
-            const auto split = spec.attr("split_workspace").cast<std::array<int64_t, 4>>();
-            splits_          = split[0];
-            split_capacity_  = split[1];
-            off_partial_o_   = split[2];
-            off_partial_lse_ = split[3];
+            const auto split       = spec.attr("split_workspace").cast<std::array<int64_t, 4>>();
+            splits_                = split[0];
+            split_capacity_        = split[1];
+            off_partial_o_         = split[2];
+            off_partial_lse_       = split[3];
+            const int64_t split_dq = integer(spec, "d_qk"), split_dv = integer(spec, "d_v");
+            const bool d64_split = paged_ && cga_tile_m_ == 128 && split_dq == 64 && split_dv == 64;
+            const bool d128_split =
+                cga_tile_m_ == 128 && split_dv == 128 && (split_dq == 128 || (!paged_ && split_dq == 192));
+            const bool d256_split = paged_ && cga_tile_m_ == 256 && split_dq == 256 && split_dv == 256;
             if (has_sink_ || splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX ||
                 off_partial_o_ < 0 || off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 ||
-                cga_tile_m_ != 128 || (integer(spec, "d_qk") != 128 && (paged_ || integer(spec, "d_qk") != 192)) ||
-                integer(spec, "d_v") != 128)
+                !(d64_split || d128_split || d256_split))
                 invalid("invalid prepared packed split geometry");
             const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
             if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
-                off_partial_lse_ < add(off_partial_o_, multiply(partial_rows, 128 * 4)) ||
+                off_partial_lse_ < add(off_partial_o_, multiply(partial_rows, multiply(split_dv, 4))) ||
                 integer(spec, "scratch_bytes") < add(off_partial_lse_, multiply(partial_rows, 4)))
                 invalid("packed split workspace regions overlap or exceed the reservation");
         }
@@ -486,8 +490,9 @@ class SdpaThdBinder {
         if (splits_ > 1) {
             put(frame, OPartialPtr, py::int_(add(workspace, off_partial_o_)));
             put(frame, LSEPartialPtr, py::int_(add(workspace, off_partial_lse_)));
-            const int64_t row = multiply(qh_, 128);
-            put(frame, PartialOStrides, py::make_tuple(multiply(tq, row), row, 128));
+            const int64_t dv  = declarations_[V][1];
+            const int64_t row = multiply(qh_, dv);
+            put(frame, PartialOStrides, py::make_tuple(multiply(tq, row), row, dv));
         }
         put(frame, Stream, std::move(stream));
         if (!scale.is_none()) put(frame, ScaleSoftmaxLog2, std::move(scale));
@@ -790,6 +795,8 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_property_readonly_static("supports_stats_stride_override", [](py::object) { return true; })
         .def_property_readonly_static("supports_paged_packed_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_paged_d64_packed_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_paged_d256_packed_split", [](py::object) { return true; })
         .def_property_readonly_static("supports_nonpaged_packed_split", [](py::object) { return true; })
         .def_property_readonly_static("supports_nonpaged_d128_packed_split", [](py::object) { return true; })
         .def("bind",

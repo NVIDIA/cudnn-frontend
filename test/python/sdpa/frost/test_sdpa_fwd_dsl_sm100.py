@@ -316,8 +316,10 @@ def _run_dsl_graph(
     pack_gqa=None,
     return_stats=False,
     stats_layout="contiguous",
+    want_cga=None,
 ):
-    """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD)."""
+    """Build the graph, opt into the matching FROST DSL engine, execute, return O (BHSD).
+    ``want_cga`` asserts the cluster width the heuristics led with for this graph."""
     import cudnn
 
     b, h_q, s_q, _ = q_gpu.shape
@@ -357,7 +359,9 @@ def _run_dsl_graph(
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
-    _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
+    plan = _select_engine(g, engine_name(arch=_ARCH), pack_gqa=pack_gqa)
+    if want_cga is not None:
+        assert plan.knobs.cga == want_cga, f"expected the heuristics to lead with cga={want_cga}; got {plan.knobs}"
     g.check_support()
     g.build_plans()
     vp[o] = o_gpu
@@ -482,6 +486,76 @@ def test_dsl_sm100_zero_attn_scale_is_refused():
     api.compile()
     with pytest.raises(ValueError, match="#1435"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=0.0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "d,d_v", [(512, 512), (256, 256), (192, 128), (128, 128), (64, 64)], ids=["dsv4_d512", "qwen_d256", "mla_d192_d128", "llama_d128", "gptoss_d64"]
+)
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("mask", ["none", "causal", "padded_sink_bottom_right"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_negative_attn_scale(dtype, d, d_v, mask):
+    """A negative attn_scale negates S in BMM1 (a_negate) and runs at |scale|, so the raw-score max and the -inf
+    mask fill stay valid; before #1435 every masked case returned NaN."""
+    _require_dsl()
+    b, h, s_q, s_kv = 2, 4, 192, 320
+    scale = -0.7 / math.sqrt(d)
+    q, k, v = _bhsd(b, h, s_q, d, dtype), _bhsd(b, h, s_kv, d, dtype), _bhsd(b, h, s_kv, d_v, dtype)
+    kw, ref = {}, {}
+    if mask == "causal":
+        kw, ref = dict(sdpa_kwargs=dict(use_causal_mask=True)), dict(is_causal=True)
+    elif mask == "padded_sink_bottom_right":
+        lq = torch.tensor([150, 192], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+        lk = torch.tensor([200, 320], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+        sink = torch.randn(1, h, 1, 1, device="cuda", dtype=torch.float32)
+        kw = dict(sdpa_kwargs=dict(use_causal_mask_bottom_right=True), seq_len_q=lq, seq_len_kv=lk, sink=sink)
+        ref = dict(is_causal=True, bottom_right=True, seq_q_lens=lq, seq_kv_lens=lk, sinks=sink.flatten())
+    o, stats = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, return_stats=True, **{"sdpa_kwargs": {}, **kw})
+    o_ref, stats_ref = _ref_sdpa_full(q, k, v, scale=scale, return_stats=True, **ref)
+    if mask == "padded_sink_bottom_right":
+        live = (torch.arange(s_q, device="cuda").view(1, 1, s_q) < lq.view(b, 1, 1)).unsqueeze(-1)
+        o, o_ref = o * live, o_ref * live
+    assert not o.isnan().any()
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(stats.squeeze(-1), stats_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["llama_d128", "qwen_d256"])
+@pytest.mark.parametrize("s_q", [1, 4])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_decode_negative_attn_scale(d, s_q):
+    """The decode kernels (d128 tile, d256 swapped-operand BMM1) at a negative scale, with a ragged KV tail (#1435)."""
+    _require_dsl()
+    b, h, s_kv = 2, 8, 333
+    scale = -0.7 / math.sqrt(d)
+    q, k, v = _bhsd(b, h, s_q, d, torch.bfloat16), _bhsd(b, h, s_kv, d, torch.bfloat16), _bhsd(b, h, s_kv, d, torch.bfloat16)
+    lk = torch.tensor([200, 333], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    o = _run_dsl_graph(q, k, v, scale=scale, dtype=torch.bfloat16, sdpa_kwargs=dict(use_causal_mask_bottom_right=True), seq_len_kv=lk)
+    o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, bottom_right=True, seq_kv_lens=lk)
+    assert not o.isnan().any()
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+def test_dsl_sm100_execute_scale_sign_must_match_the_plan():
+    """The scale's sign is compiled into BMM1, so an execute-time scale of the other sign is refused."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, h, s, d = 1, 2, 256, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.bfloat16) for _ in range(3))
+    o = torch.empty_like(q)
+    for planned, other in ((d**-0.5, -(d**-0.5)), (-(d**-0.5), d**-0.5)):
+        api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, scale_softmax=planned)
+        assert api.check_support()
+        api.compile()
+        with pytest.raises(ValueError, match="sign"):
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=other)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=2 * planned)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o, _ref_sdpa_full(q, k, v, scale=2 * planned), atol=5e-2, rtol=3e-2)
 
 
 def _require_free_gib(gib):
@@ -1023,6 +1097,56 @@ def test_dsl_sm100_keyless_rows_very_negative_sink(d_qk, d_v, stats_use_log2):
     torch.testing.assert_close(lse[keyless], torch.full_like(lse[keyless], want), atol=1e-4, rtol=0)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
     torch.testing.assert_close(lse[~keyless], lse_ref[~keyless], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM == 107, reason="the cc 10.7 f16 row keeps d128 on cga2 (no measured cga1 configuration there)")
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_d128_decode_shaped_cga1_sink_swa(dtype):
+    """Decode-shaped d128 (MTP S_q=4, GQA 64:8 packed, b=8: 32 rows per unit):
+    the heuristics lead with cga1 -- the d128 decode tile -- and here it runs under
+    bottom-right causal + sliding window + attention sink + per-batch KV lengths
+    (incl. lengths below S_q, whose keyless rows hold the sink's mass alone) on a
+    dense padded graph: every epilogue and mask feature of the decode band in one
+    graph, with the exact LSE contract (sink = the keyless rows' whole mass)."""
+    _require_dsl()
+    b, h_q, h_kv, s_q, s_kv, d, W = 8, 64, 8, 4, 2048, 128, 300
+    scale = 1.0 / math.sqrt(d)
+    q = _bhsd(b, h_q, s_q, d, dtype)
+    k = _bhsd(b, h_kv, s_kv, d, dtype)
+    v = _bhsd(b, h_kv, s_kv, d, dtype)
+    sink = torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+    seq_len_q = torch.full((b, 1, 1, 1), s_q, dtype=torch.int32, device="cuda")
+    seq_len_kv = torch.tensor([2048, 1, 3, 5, 700, 2047, 129, 1024], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
+    o, lse = _run_dsl_graph(
+        q,
+        k,
+        v,
+        scale=scale,
+        dtype=dtype,
+        sdpa_kwargs=dict(use_causal_mask_bottom_right=True, sliding_window_length=W + 1),
+        seq_len_kv=seq_len_kv,
+        seq_len_q=seq_len_q,
+        sink=sink,
+        want_cga=1,
+        return_stats=True,
+    )
+    o_ref, lse_ref = _ref_sdpa_full(
+        q,
+        k,
+        v,
+        scale=scale,
+        is_causal=True,
+        bottom_right=True,
+        swa_window=W,
+        seq_q_lens=seq_len_q,
+        seq_kv_lens=seq_len_kv,
+        sinks=sink.flatten(),
+        return_stats=True,
+    )
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.view(b, h_q, s_q), lse_ref, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.L0
@@ -1961,16 +2085,20 @@ def _run_dsl_thd_graph(
     pack_gqa=None,
     capture=False,
     on_graph=None,
+    sdpa_kwargs=None,
 ):
     """Build + execute a packed THD/varlen graph; returns the flat packed O
     storage buffer — plus, with ``check_stats``, the flat Stats storage and
     the padded token capacity of its head-major head stride.  ``on_graph``
     (callable) sees the built graph before execute (served-template asserts).
+    ``sdpa_kwargs`` are merged into the ``g.sdpa`` call last (extra op attributes,
+    e.g. ``attn_scale_prefolded=True`` together with ``scale=None``).
 
     ``stats_layout`` selects the ragged Stats declaration: ``token_major``
     (``[t, h]``, sequence stride ``h_q``) or ``head_major`` (``[h, t]``,
     sequence stride 1 with a padded token-capacity head stride —
-    FlashAttention's ``softmax_lse`` layout)."""
+    FlashAttention's ``softmax_lse`` layout).  ``sdpa_kwargs`` (dict) adds
+    graph.sdpa attributes on top of the mask / scale ones built here."""
     import cudnn
 
     dev = "cuda"
@@ -2024,6 +2152,8 @@ def _run_dsl_thd_graph(
     else:
         kw.update(seq_len_q=sq, seq_len_kv=skv)
     kw.update(_mask_graph_kwargs(mask))
+    if sdpa_kwargs:
+        kw.update(sdpa_kwargs)  # extra graph.sdpa attributes (e.g. attn_scale_prefolded=True with scale=None)
     vp = {tq: q_gpu, tk: k_gpu, tv: v_gpu, sq: (cuq_t if cu_lens else slq), skv: (cuk_t if cu_lens else slk), qro: ro_q, kro: ro_k, vro: ro_k, oro: ro_q}
     if sink is not None:
         st = g.tensor_like(sink)

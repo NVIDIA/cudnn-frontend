@@ -360,7 +360,8 @@ are close.
   adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
   op pattern), so it inherits whatever engine the planner selects. The
   optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
-  rows; `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
+  rows (`x * rsqrt(sum(x * x) + 1e-6)`, forward and backward Jacobian);
+  `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
   `gdn_bwd` on the FROST chunked kernels) serves it through a workspace
   helper kernel (normalized q/k copies + saved inverse norms, with the
   backward Jacobian projection applied in place after the head-group fold),
@@ -752,10 +753,12 @@ only to decline is why `closed_under` existed.
   bug: the record would replay a different kernel after the pick changes.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
-  (`softmax_precision`) is an **op attribute** declared in the op spec's
-  `python_only_attrs`: never forwarded to C++, a SET value makes the node
-  backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
-  a graph fact the capability rows gate on.
+  (`softmax_precision`) or a contract on the inputs (`attn_scale_prefolded`:
+  Q already carries the softmax scale) is an **op attribute** declared in the
+  op spec's `python_only_attrs`: never forwarded to C++, a SET value (a bool
+  attribute set to `False` counts as unset) makes the node backend-unlowerable
+  (`serialize()` and `key()` refuse it), and it surfaces as a graph fact the
+  capability rows gate on.
 
 ### One kernel per layout class, not per shape (SDPA THD)
 
@@ -850,11 +853,27 @@ artifact can never be reused by accident:
   next start-up. Kernels whose in-process object converts raw pointer
   arguments, takes a dataclass argument, or has a default JSON cannot carry
   are not persisted.
+- **One object per kernel per process.** In front of the files sits an
+  in-process memo keyed by the device a build targets, the live CUDA device the
+  compile is issued under (the DSL ties a compiled object's executor to a device
+  context; the two agree unless a handle scoped the build to another GPU), the
+  key, the symbol and the compile options: a second plan over the same
+  kernel in the same process gets the object the first plan got — no trace, no
+  compile, no file touched — whatever the on-disk cache's state. A graph that
+  builds several plans over one kernel, or a test suite that builds one block
+  instance per case, otherwise pays a full JIT per plan (`cute.compile` has no
+  memo of its own; with the on-disk cache off, the gated-attention-block
+  backward suite -- 109 cases -- went from 855 s to 261 s and from 730 to 100
+  compiles on a Rubin development part). A kernel without a key is never
+  memoised; a failed compile is not memoised; `clear_memo()` forgets the
+  objects.
+  `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` turns the memo off — for a
+  test that exercises the reload path itself, or an A/B of the memo.
 - Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
-  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned
-  per process. Bump `_SCHEMA` on any incompatible change.
+  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned /
+  memo_hits per process. Bump `_SCHEMA` on any incompatible change.
 - **Dead environments are retired.** The manifest hashes the package's source,
   so every edited checkout and every CI commit mints an environment directory
   that will never be hit again — a few hundred MB per commit on a runner with a

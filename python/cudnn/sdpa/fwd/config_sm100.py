@@ -70,7 +70,7 @@ class TemplateParams:
       dishonest, not that a user erred.
     """
 
-    dtype_qkv: int = DTYPE_FP16  # E4M3/E5M2 (0/1, d128 MXFP8 only) or BF16/FP16 (2/3)
+    dtype_qkv: int = DTYPE_FP16  # E4M3/E5M2 (0/1, the quantized kernels) or BF16/FP16 (2/3)
     dtype_o: int = -1  # output dtype (0..3); -1 = inherit dtype_qkv. MXFP8 writes BF16/FP16.
     # The mask is ONE diagonal band (the model FlashAttention / CUTLASS FMHA /
     # the analyzer facts all share): per-side OFFSETS from the diagonal, None =
@@ -169,16 +169,18 @@ class TemplateParams:
     exp2_fma_split: bool = False
     # sdpa(softmax_precision=cudnn.data_type.HALF) op attribute: exponent + P-cast run as
     # f16x2 pairs (MUFU EX2.F16x2 + cvt.rn.satfinite.*x2.f16x2) instead of
-    # scalar f32 ex2. Per-tensor FP8 on the SM107 sibling kernel only — the
-    # exp arguments are bounded (<= RESCALE_THRESHOLD + P_CAST_LOG2_SCALE),
-    # so f16 range is exact where it matters and P quantizes to FP8 either way.
+    # scalar f32 ex2. The cc 10.7 FP8 / MXFP8 kernels (every flavor; see
+    # config_sm107.SM107_SOFTMAX_F16_FLAVORS) — the exp arguments are bounded
+    # (<= RESCALE_THRESHOLD [+ P_CAST_LOG2_SCALE on per-tensor FP8]), so f16
+    # range is exact where it matters and P quantizes to FP8 either way.
     softmax_f16: bool = False
     # The caller has already multiplied Q by attn_scale * log2(e): the kernel runs exp2(S - m) on the
     # raw QK^T (no per-score FFMA2 by the scale) and, together with softmax_f16, fuses the shift and the
     # f32->f16 convert into one instruction per pair.  The published Stats are unchanged -- the running
     # max and the scores are in the same log2 domain as when the kernel applies the scale itself.
-    # Served by the cc 10.7 d128 MXFP8 kernel; the cc 10.0 / 10.3 line and every other cc 10.7 flavor decline
-    # it at config time (and the adapters of the other architectures at check_support).
+    # Served by the cc 10.7 MXFP8 and f16/bf16 kernels (config_sm107.SM107_SCALE_PREFOLDED_FLAVORS); per-tensor
+    # FP8 declines it (the kernel folds descale_q * descale_k into the softmax scale), as do the cc 10.0 / 10.3
+    # line at config time and the adapters of the other architectures at check_support.
     softmax_scale_prefolded: bool = False
     # Paged KV cache (FlashInfer / vLLM decode contract): K/V are page pools
     # indexed through a per-batch ``block_table`` [B, max_pages] int32, and
@@ -235,6 +237,9 @@ class TemplateParams:
     # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
     # role-split A/B arm).
     mma_2x2: bool = False
+    # attn_scale < 0: BMM1 negates Q (tcgen05 a_negate), so the kernel's raw-score max, masks and exp2 run on -S at
+    # |attn_scale| (#1435). APPEND-ONLY, default False.
+    negate_scores: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -242,7 +247,7 @@ class TemplateParams:
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
 # d192x128 kernel, whose K and V pools differ in row width). engines'
 # ``paged_d_shapes`` and the adapter's check_support name the same set.
-_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256"})
+_PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no
 # SM100 kernel body reads CFG.EPILOGUE_GATE, so a module loaded with the flag on
@@ -263,13 +268,18 @@ _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
 
 
 def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
-    """Packed partials for D128 or nonpaged D192/V128 half attention."""
+    """Packed half partials for the explicitly wired native head geometries."""
     return (
         device_cc in ((10, 0), (10, 3), (10, 7))
         and not fp8
         and thd
         and not padded_stats
-        and ((d_shape == (128, 128) and max_q > (1 if paged else 0)) or (not paged and d_shape == (192, 128) and max_q > 0))
+        and (
+            (device_cc in ((10, 0), (10, 3)) and paged and d_shape == (64, 64) and max_q > 0)
+            or (d_shape == (128, 128) and max_q > (1 if paged else 0))
+            or (not paged and d_shape == (192, 128) and max_q > 0)
+            or (device_cc == (10, 7) and paged and d_shape == (256, 256) and max_q > 0)
+        )
     )
 
 
@@ -278,7 +288,12 @@ def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
 
 
-def _validate_params(flavor: str, k: TemplateParams) -> None:
+def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
+    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
+
+
+def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
@@ -286,8 +301,10 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
         raise ValueError(f"{flavor}: softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization (f16/bf16 softmax already runs the f32 pipeline)")
-    if k.softmax_scale_prefolded:
-        raise ValueError(f"{flavor}: softmax_scale_prefolded is served by the cc 10.7 d128 MXFP8 kernel only (this line applies the scale in-kernel)")
+    if k.softmax_scale_prefolded and not scale_prefolded_wired:
+        # The cc 10.7 kernels carry the arm (config_sm107.SM107_SCALE_PREFOLDED_FLAVORS; the d512 2x2 twin
+        # validates here with the flag); this line's bodies apply the scale in-kernel.
+        raise ValueError(f"{flavor}: softmax_scale_prefolded is served by the cc 10.7 kernels only (this line applies the scale in-kernel)")
     if k.pv_bf16 and (not fp8 or flavor not in ("d128", "d192")):
         raise ValueError(f"{flavor}: pv_bf16 is an experimental MXFP8 D128/D192 specialization")
     dtype_o = k.dtype_qkv if k.dtype_o < 0 else k.dtype_o
@@ -349,10 +366,14 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
-            flavor == "d128"
-            and k.cta_mma == 1
-            and not fp8
-            and (k.single_q_head_dim == 128 or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
+            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
+            or (flavor == "d256" and k.cta_mma == 2 and k.paged_kv and not fp8 and not k.pack_gqa)
+            or (
+                flavor == "d128"
+                and k.cta_mma == 1
+                and not fp8
+                and (k.single_q_head_dim == 128 or (k.single_q_head_dim == 192 and not k.paged_kv and not k.pack_gqa))
+            )
         ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
         if k.has_sink:
@@ -366,13 +387,20 @@ def _validate_params(flavor: str, k: TemplateParams) -> None:
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
         if k.thd_varlen and not (
-            flavor == "d128"
-            and not fp8
+            not fp8
             and (
-                ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and k.split_kv > 1)
+                or (
+                    flavor == "d128"
+                    and (
+                        ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1)
+                        or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                    )
+                )
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
             )
         ):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 split")
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, or paged half d256 cga2 unsplit")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
@@ -1296,6 +1324,10 @@ class CfgD512:
     # the pack size with the GQA ratio would mis-mask MTP rows.
     PACK_G: int = 1
 
+    # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+
 
 def _validate_cfg_d512(cfg: CfgD512) -> None:
     """Consistency checks on the (mostly hardcoded) d512 geometry."""
@@ -1337,6 +1369,11 @@ def _validate_cfg_d512(cfg: CfgD512) -> None:
         (
             cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16) if _fp8 else cfg.DTYPE_O == cfg.DTYPE_QKV,
             "d512: DTYPE_O must equal DTYPE_QKV for half input; fp8 allows an independent output dtype",
+        ),
+        (not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1, "d512: paged KV requires per-batch KV lengths"),
+        (
+            not cfg.PAGED_KV or (cfg.PAGE_SIZE >= 8 and cfg.PAGE_SIZE % 8 == 0 and (128 % cfg.PAGE_SIZE == 0 or cfg.PAGE_SIZE % 128 == 0)),
+            f"d512: page_size must be a multiple of 8 that divides the 128-row KV tile or is a multiple of it; got {cfg.PAGE_SIZE}",
         ),
     )
     for ok, msg in checks:
@@ -1388,6 +1425,8 @@ def make_cfg_d512(params: TemplateParams) -> Tuple[CfgD512, TmaIters]:
         PACK_GQA=int(params.pack_gqa),
         QH_PER_KH=int(params.qh_per_kh),
         PACK_G=_pack_g(params, CfgD512.TILE_M, partial=False),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size),
     )
     _validate_cfg_d512(cfg)
     return cfg, _tma_iters(cfg)
@@ -2456,7 +2495,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d64 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64 decode: f16 K=16 MMA phases"),
-        (cfg.THD_VARLEN == 0, "d64 decode: dense graphs only"),
+        (not cfg.THD_VARLEN or (cfg.SPLIT_KV > 1 and cfg.PAGED_KV), "d64 decode: THD requires paged split"),
         (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64 decode: BMM2 chunking is TILE_N-derived"),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
@@ -2478,13 +2517,14 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         raise ValueError(f"d64 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d64 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen:
-        raise ValueError("d64 decode: THD/varlen is not wired on the decode tile (dense graphs only)")
+    if params.thd_varlen and not (params.split_kv > 1 and params.paged_kv):
+        raise ValueError("d64 decode: THD requires paged split")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d64 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD64Decode(
+        THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,

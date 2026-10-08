@@ -159,6 +159,23 @@ _SPLIT_KV_CTA_COST = 21.0
 # [0.04, 0.155] -- every value in it makes the same 12 choices. 0.1 is that
 # plateau's midpoint, so it is the value furthest from flipping either way.
 _SPLIT_KV_COMBINE_COST = 0.1
+# What ONE partial costs a combine block that has nothing to hide behind, in
+# units of one KV tile of main-kernel work. sm100/split_combine runs one block
+# per output row and walks the split axis three times per block with a
+# dependent global load per step (``unroll=1``), so a block is a latency chain
+# ~3 s loads long. The per-WAVE coefficient above absorbed the blocks/SM that
+# overlap such chains -- which presumes enough rows to fill them. A launch with
+# FEWER rows than the machine holds at once (decode: S_q * H_q * B in the tens
+# or hundreds, at most one block per SM) overlaps nothing, and its one round
+# costs what a lone block costs however the wave count reads. Measured on B200
+# (d128 bf16 paged, kernel time along a split ladder whose grid stays inside
+# one wave, so only the loop and combine terms move): 0.60 us per partial
+# against 1.69 us per KV tile at b=1 h=64/4 S_q=1 S_kv=32k (splits 8/16/32:
+# 69.5/47.2/43.2 us) and 0.64 against 1.86 us at b=1 h=16/2 (splits 16/32/64:
+# 44.5/39.8/52.7 us) -- 0.35 and 0.34 KV tiles. The floor and the per-wave
+# price meet at 3.5 combine waves (~520 rows on 148 SMs); the fitted sweep
+# (_B300_FIT) starts at 2048 rows, so the floor moves none of its choices.
+_SPLIT_KV_COMBINE_FLOOR = 0.35
 
 
 class _SplitKvLaunch(NamedTuple):
@@ -231,8 +248,10 @@ def choose_split_kv(
 
         waves(s)      = ceil(base_ctas * s / sm_count)      # main grid
         combine_waves = ceil(combine_rows / sm_count)       # combine grid, NO s
-        cost(s)       = waves(s)      * (ceil(kv_tiles / s) + CTA_COST)
-                      + combine_waves * (s * COMBINE_COST)
+        per_partial   = max(combine_waves * COMBINE_COST, COMBINE_FLOOR)
+        cost(1)       = waves(1)      * (kv_tiles + CTA_COST)        # one kernel
+        cost(s > 1)   = waves(s)      * (ceil(kv_tiles / s) + CTA_COST)
+                      + s * per_partial
 
     CTA_COST is what a tile re-pays whatever its loop length, so it sits INSIDE
     the wave term -- once per CTA-tile, not once per split.  COMBINE_COST is
@@ -240,6 +259,27 @@ def choose_split_kv(
     (sm100/split_combine), one block per output row and independent of ``s`` --
     only the per-block work grows with ``s``, since each block reduces ``s``
     partials.  Hence ``combine_rows`` (= S_q * H_q * B) and not ``base_ctas``.
+    COMBINE_FLOOR is the least a partial can cost: what one block pays for one
+    step of its serial split walk when there are too few rows for the blocks
+    to hide each other's latency (_SPLIT_KV_COMBINE_FLOOR).  Without it a
+    few-unit launch -- b=1, a handful of KV heads, a long KV -- read the
+    combine as nearly free and split until the wave was full: b=1 h=16/2
+    S_q=1 S_kv=32k at cga1 (2 units, 256 KV tiles, 16 rows) took 64 splits at
+    50.8 us where 32 measure 39.7 us (B200); b=1 h=64/4 S_q=1 S_kv=4k took 16
+    at 22.3 us where 8 measure 20.3 us.  The floor prices those extra partials
+    at what they cost and leaves every launch with 3.5 or more combine waves
+    exactly as it was.
+    The unsplit leg runs the classic single-pass kernel and NO combine, so it
+    carries no combine term at all.  It used to be charged one (``s = 1`` in
+    the formula above), which under-priced the combine a split adds by exactly
+    one combine wave-set -- invisible on the fitted shapes (512 KV tiles, where
+    that is < 3% of the loop term), decisive on a 4k KV with many output rows:
+    b=8 h=32/8 S_q=64 S_kv=4096 paged, 16384 combine rows, split 2 modelled
+    8% cheaper than unsplit and measured 11% slower (B200, 75.0 vs 67.6 us);
+    dense b=4 h=32/8 S_q=128 S_kv=4096 causal, split 2 measured 155.5 us
+    against 120.2 us unsplit.  Where the combine is one wave (decode: b=8
+    h=64/4 S_q=1, 512 rows) the term is 0.1 tile and nothing moves: cga1 with
+    SPLIT_KV=4 stays at 27.5 us against 63.6 us unsplit.
 
     Why the combine term matters: ``s`` reaches the first term ONLY through
     ``waves(s)``, a step function.  Between wave boundaries a larger split is
@@ -274,6 +314,10 @@ def choose_split_kv(
     # by the rows; max(1, ...) because a decode-shaped launch has fewer rows
     # than SMs and still pays one wave.
     combine_waves = max(1, _ceil_div(max(0, combine_rows), sm_count))
+    # ... and that one wave costs no less than a lone block's serial walk of
+    # its partials: with fewer rows than the machine holds at once there is
+    # nothing to hide the chain behind (_SPLIT_KV_COMBINE_FLOOR).
+    per_partial = max(combine_waves * _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR)
 
     best_split, best_cost = 1, None
     for split in candidates:
@@ -287,7 +331,9 @@ def choose_split_kv(
         launch = unsplit_launch if split == 1 else split_launch
         base_ctas = launch.q_tiles * launch.heads_q * batch * launch.ctas_per_tile
         waves = _ceil_div(base_ctas * split, sm_count)
-        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine_waves * split * _SPLIT_KV_COMBINE_COST
+        # No combine runs unsplit: the single-pass kernel writes O itself.
+        combine = split * per_partial if split > 1 else 0.0
+        cost = waves * (_ceil_div(launch.kv_tiles, split) + _SPLIT_KV_CTA_COST) + combine
         if best_cost is None or cost < best_cost:
             best_split, best_cost = split, cost
     return best_split
@@ -479,6 +525,27 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
+def _prefer_paged_d256_lpt(facts) -> bool:
+    """Qualified full-prefill envelopes; current lengths may change after capture."""
+    return (
+        facts.device_cc in ((10, 0), (10, 7))
+        and facts.thd
+        and facts.has_paged_kv
+        and facts.bottom_right
+        and facts.causal
+        and facts.window_left is None
+        and (facts.right_bound or 0) == 0
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and (facts.d_qk, facts.d_v) == (256, 256)
+        and facts.b == 1
+        and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
+        and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
+        and facts.s_q == facts.s_kv
+        and facts.page_size in (16, 128)
+        and not (facts.has_sink or facts.has_epilogue_gate)
+    )
+
+
 def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
     """Ordered scheduler-policy candidates.
 
@@ -514,27 +581,7 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
                 # still uses current lengths when a cached full-prefill plan
                 # replays a prefix chunk, including tiny Q and low TP heads.
                 primary = SCHED_LPT
-            # Measured B200 D256 full-prefill envelopes. Runtime lengths may still
-            # become prefix chunks after capture; LPT keeps ordering live rows.
-            # Keep mixed batches and 32K envelopes on the existing default.
-            elif (
-                SCHED_LPT in domain
-                and facts.device_cc == (10, 0)
-                and facts.has_paged_kv
-                and facts.bottom_right
-                and facts.causal
-                and facts.window_left is None
-                and (facts.right_bound or 0) == 0
-                and facts.dtype == cudnn.data_type.BFLOAT16
-                and (facts.d_qk, facts.d_v) == (256, 256)
-                and facts.b == 1
-                and (facts.h_q, facts.h_kv) in ((8, 1), (16, 2))
-                and (4096 if facts.h_q == 8 else 2048) <= facts.s_q <= 16384
-                and facts.s_q == facts.s_kv
-                and facts.page_size in (16, 128)
-                and not (facts.has_sink or facts.has_epilogue_gate)
-            ):
-                # Packed Stats use the same measured full/prefix scheduling.
+            elif SCHED_LPT in domain and _prefer_paged_d256_lpt(facts):
                 primary = SCHED_LPT
             return [primary] + sorted(domain - {primary})
         return [SCHED_NATURAL]
@@ -568,21 +615,40 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # are Rubin's cluster count and CGA rows, unmeasured on GeForce Blackwell).
         waves = (int(facts.b) * int(facts.h_q) * -(-int(facts.s_q) // _SM107_CGA_Q_ROWS)) / _SM107_CLUSTERS
         primary = SCHED_LPT if waves <= _SM107_NO_GQA_LPT_MAX_WAVES else SCHED_NATURAL
+    elif causal_ish and _d128_f16_flavor(caps, facts) and _q_clusters_per_unit(caps, facts, None) == 1:
+        # One Q cluster per (batch, packed head) unit on the SM100 f16 row's
+        # d128 flavor -- S_q * PACK_G <= 512: the decode tile's band
+        # (S_q * PACK_G <= 128, one 128-row tile per unit -- decode and MTP)
+        # and the one-cga2-cluster band above it (a chunk or speculative burst
+        # of up to 512 / PACK_G tokens on the prefill tile).  Every unit walks
+        # the same per-batch KV range with the same static tile weight, so LPT
+        # has nothing to balance; LPT_L2's head grouping groups nothing when
+        # the packed head IS the KV head (only the G / PACK_G packed heads of a
+        # partially packed group).  Measured on B200 (S_kv=4096 paged, bf16,
+        # bottom-right causal, kernel time): b=32 H=64/4 S_q=4 on the prefill
+        # tile NATURAL 120.0 us vs LPT_L2 125.4 us (the decode tile keeps the
+        # order); b=8 H=32/8 S_q=128 (512 rows, one cga2 cluster) NATURAL 62.9
+        # us vs LPT_L2 65.3 us.  One row more restores the L2-budget rule
+        # below.  The LPT variants stay behind as runners for autotune, as on
+        # every causal graph.  (d256 32/2 packed at cga2 flips sign between
+        # S_q=4 and 8 -- LPT_L2 / LPT / NATURAL 65.9 / 63.3 / 62.1 vs 64.8 /
+        # 65.0 / 66.6 us -- so that flavor keeps the rule below until it is
+        # measured on its own.)
+        primary = SCHED_NATURAL
     elif (
         causal_ish
         and caps.sm_lo == 100
         and not (facts.is_fp8 or facts.is_mxfp8)
-        and _selected_d_shape(caps, facts) in ((128, 128), (64, 64))
+        and _selected_d_shape(caps, facts) == (64, 64)
         and 1 in effective_cgas(caps, facts)
         and _d128_decode_tile_fits(caps, facts)
     ):
-        # The d128 decode tile (bottom-right causal MTP, S_q * PACK_G <= 128):
-        # one Q tile per (packed head, batch), so every unit walks the same
-        # per-batch KV range and LPT has nothing to balance; LPT_L2's head
-        # grouping groups nothing when the packed head IS the KV head (only
-        # the G / PACK_G packed heads of a partially packed group).  Measured on
-        # B200 (b=32, H=64/4, S_q=4, S_kv=4096, page 16): NATURAL 120.0 us vs
-        # LPT_L2 125.4 us on the prefill tile; the decode tile keeps the order.
+        # The d64 f16 decode tile (bottom-right causal MTP, S_q * PACK_G <= 128,
+        # api_dsl._D64_DECODE_TILE_ROWS): one Q tile per (packed head, batch),
+        # so every unit walks the same per-batch KV range and LPT has nothing
+        # to balance -- the d128 decode band's reasoning above, on the flavor
+        # whose prefill runs 256-row cga1 CTAs rather than cga2 clusters; its
+        # band above the decode tile is unmeasured and keeps the L2-budget rule.
         primary = SCHED_NATURAL
     elif causal_ish and caps.sm_lo == 100 and facts.is_mxfp8 and _selected_d_shape(caps, facts) == (128, 128):
         # SM100 d128 MXFP8 (sm100/prefill_d128_mxfp8.py): plain LPT beats the L2-budget
@@ -760,6 +826,96 @@ def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
     return params.sched_policy, 1
 
 
+# --- d128 decode-shaped launches (SM100-line f16/bf16) ----------------------
+#
+# The SM100 f16 row's (128, 128) flavor has two tiles behind TILE_CGA_M
+# (_d128_decode_tile_fits below): cga1 IS the decode tile -- one independent
+# 128-row CTA per (batch, packed head) unit, sm100/decode_d128_f16.py -- and
+# cga2 the prefill pipeline, 512 rows per cluster.  The rules here measure a
+# unit by its live rows, S_q * PACK_G -- the kernel's packed subgroup (the
+# whole GQA group when it divides the tile, its largest divisor that does
+# under partial PackGQA, 96/8 -> 4; 1 unpacked), not the raw ratio G:
+#
+#   * width: cga1 while one decode tile covers the unit (select_d128_auto_cga,
+#     the one rule behind _d128_decode_tile_fits on the graph path and the
+#     standalone adapter's default in api_dsl.SdpaFwdDslSm100.template_params);
+#   * scheduler: NATURAL first while one cga2 cluster covers the unit -- the
+#     decode tile's band and the band above it up to 512 rows (_sched_points);
+#   * split: the wave-cost model sees the true CTA count (ctas_per_tile=1 at
+#     cga1), so a small-batch decode splits finer than the cga2 plan did --
+#     b=8 h=64/4 S_q=1 S_kv=4096 paged bf16, B200 kernel time: SPLIT_KV=4 at
+#     27.5 us where the cga2 plan split in two at 39.1 us -- and choose_split_kv
+#     carries two corrections that band exposed at its edges.  The unsplit leg
+#     pays no combine, so a many-row chunk no longer splits (b=8 h=32/8 S_q=64
+#     paged bottom-right, 16384 combine rows: split 2 measured 75.0 us against
+#     67.6 us unsplit; dense b=4 h=32/8 S_q=128 causal at cga2: 155.5 vs 120.2
+#     us), and a lone combine block's serial walk over its partials is priced
+#     at its latency floor, so a few-unit b=1 launch stops one power of two
+#     short of the full wave (h=16/2 S_kv=32768: split 32 at 39.7 us where 64
+#     measured 50.8; h=64/4 S_kv=4096: split 8 at 20.3 us where 16 measured
+#     22.3).  Neither correction is d128's alone: the floor moves the d256
+#     paged b=1 h=64/4 S_q=1 S_kv=4096 lead from split 16 (29.8 us) to 8
+#     (24.5 us), and the unsplit-leg accounting the d256 / d192x128 2k-KV chunk
+#     leads (choose_split_kv's docstring).
+#
+# Provenance: the split-model numbers above were measured on the d128 prefill
+# kernel's cga1 configuration (one 256-row Q/O-aliased CTA per unit), the
+# width the graph path led with before the decode tile took over TILE_CGA_M=1
+# (PR #1094).  The model's inputs are unchanged on the decode tile (one CTA
+# per unit, 128-row KV tiles, the shared sm100/split_combine), so the choices
+# carry over; the floor is expressed in KV tiles of MAIN-kernel time, and a
+# decode-tile KV tile may run faster than the prefill kernel's, so a
+# re-measurement on the decode tile could only raise it.
+_D128_SHAPE = (128, 128)
+
+
+def _d128_f16_flavor(caps: Capabilities, facts) -> bool:
+    """The d128 flavor of the SM100 f16 row -- the one half-precision row whose
+    (128, 128) cga domain holds two tiles (cga1 the decode tile, cga2 the
+    prefill pipeline); the fp8 / mxfp8 rows and the cc 10.7 f16 row keep d128 on
+    the row-wide cga2 (``caps.sm_lo == 100`` names the cc 10.0-10.6 range)."""
+    return (
+        caps.sm_lo == 100
+        and _selected_d_shape(caps, facts) == _D128_SHAPE
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and any(shape == _D128_SHAPE for shape, _ in caps.cgas_by_d_shape)
+    )
+
+
+def _sm100_pack_g(caps: Capabilities, facts) -> int:
+    """The heads a packed set folds into one Q tile row-group -- the kernel's
+    ``Cfg.PACK_G`` (:func:`_pack_gqa_group`: the whole ratio G when it divides
+    the tile, its largest divisor that does under partial PackGQA, 96/8 -> 4);
+    1 when the row cannot pack this graph (MHA, THD, an epilogue gate, or a
+    ratio with no factor in common with the tile). A (batch, packed head) unit
+    holds ``S_q * PACK_G`` live rows, so this -- not the raw ratio -- is what
+    the one-cluster scheduler rule measures the unit by."""
+    return _pack_gqa_group(caps, facts, 128, _pack_gqa_eligible(caps, facts, 128))
+
+
+def _q_clusters_per_unit(caps: Capabilities, facts, cga: Optional[int]) -> int:
+    """Q clusters one (batch, packed head) unit launches at cluster width ``cga``
+    (``None`` = the flavor's default width, the cga2 prefill cluster)."""
+    return _ceil_div(facts.s_q * _sm100_pack_g(caps, facts), _pack_gqa_tile_q(caps, facts, 128, cga))
+
+
+def select_d128_auto_cga(*, s_q: int, pack_g: int, thd: bool, thd_decode_leg: bool = False) -> int:
+    """The d128 f16 cluster width for a unit of ``S_q * pack_g`` live rows:
+    cga1 -- the decode tile -- when one of its 128-row tiles covers them
+    (``cga_tile_m(128, 1)``, config_sm100.CfgD128Decode), cga2 -- the prefill
+    pipeline -- otherwise.  A ragged (THD) graph keeps cga2 unless it rides the
+    decode tile's ragged-Q leg (``thd_decode_leg``: S_q(max) == 1 over paged
+    KV, engines._thd_decode_leg); the prefill tile's THD_VARLEN leg is the only
+    other ragged form, and engines.mismatch / api_dsl.check_support decline a
+    pinned cga1 there.  The one rule behind the graph path
+    (:func:`_d128_decode_tile_fits`, which derives ``pack_g`` from the
+    candidate's packing) and the standalone adapter's default width
+    (api_dsl.SdpaFwdDslSm100.template_params)."""
+    if thd and not thd_decode_leg:
+        return 2
+    return 1 if s_q * pack_g <= cga_tile_m(128, 1) else 2
+
+
 def _sm100_params_from_facts(facts, *, split_kv: int, sched_policy: int) -> Sm100TemplateParams:
     dtype_codes = {
         cudnn.data_type.FP8_E4M3: DTYPE_E4M3,
@@ -813,14 +969,15 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     tile's second sub-tile is live and cga2's collective MMA halves per-CTA K/V
     traffic, so the rule stops there rather than at a measured crossover.
     """
-    if facts.thd and not _thd_decode_leg(caps, facts):
+    thd_decode_leg = bool(facts.thd and _thd_decode_leg(caps, facts))
+    if facts.thd and not thd_decode_leg:
         return False
     if pack_gqa is None:
         pack_gqa = _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS)
     # The kernel's HEADS_PER_TILE for this leg (1 unpacked): the launch the
     # split model sees, and the rows one unit really carries.
     pack_g = _pack_gqa_group(caps, facts, _D128_DECODE_TILE_ROWS, pack_gqa)
-    return facts.s_q * pack_g <= _D128_DECODE_TILE_ROWS
+    return select_d128_auto_cga(s_q=facts.s_q, pack_g=pack_g, thd=facts.thd, thd_decode_leg=thd_decode_leg) == 1
 
 
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
@@ -949,6 +1106,8 @@ def _pack_gqa_tile_q(caps: Capabilities, facts, tile_m: Optional[int], cga: Opti
         return tile_m or 128
     if facts.d_qk <= 128 and facts.d_v <= 128:
         if _selected_d_shape(caps, facts) == (64, 64):
+            if cga == 1 and split_kv > 1 and thd_split_domain(caps, facts):
+                return _D64_DECODE_TILE_ROWS
             # The native d64 flavor is a TILES_Q=2 prefill on every row that has
             # it (f16, per-tensor FP8, MXFP8): 256 rows at cga1, the width its
             # rows run (config_sm100.CfgD64; an unset knob means that width, not
@@ -1315,53 +1474,76 @@ def _split_points(
 # ---------------------------------------------------------------------------
 
 
-def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
-    """Measured fixed-graph (split count, packing); one keeps the existing plan.
-
-    Include batch in the grid estimate so multi-request chunks do not receive
-    the split budget of an underfilled single request. Rubin qualification
-    covers larger batches and caches using the same first-wave budget;
-    already-filled grids retain the unsplit candidate.
-    """
+def paged_d256_prefix_launch(caps: Capabilities, facts) -> Optional[_SplitKvLaunch]:
+    """Qualified two-CTA prefix geometry, shared by placement and split choice."""
     if not (
-        paged_thd_split_domain(caps, facts)
-        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
-        and not facts.shape_overrides
-        and facts.dtype == cudnn.data_type.BFLOAT16
-        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else 4)
+        caps.sm_lo == 107
+        and (facts.d_qk, facts.d_v) == (256, 256)
+        and paged_thd_split_domain(caps, facts)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_d256_packed_split", False)
+        and facts.dtype in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16)
+        and facts.b >= 1
         and 4 <= facts.h_q <= 64
         and facts.h_kv > 0
         and facts.h_q % facts.h_kv == 0
-        and facts.h_q // facts.h_kv in (1, 2, 4, 8)
-        and facts.page_size == 16
+        and facts.h_q // facts.h_kv in (1, 2, 4, 8, 16)
+        and facts.page_size in (16, 128)
         and facts.causal
         and facts.bottom_right
+        and not facts.right_band_widening
         and facts.window_left is None
         and 64 <= facts.s_q <= 1024
-        and 2048 <= facts.s_kv <= (32768 if caps.sm_lo == 107 else 16384)
-        and facts.k_t is not None
-        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+        and 2048 <= facts.s_kv <= 32768
+        and facts.s_kv >= 4 * facts.s_q
+        and facts.device_sm_count
     ):
-        return 1, False
-    # Preserve every first-wave choice. When neither packed geometry can
-    # split within it, SM100's single-CTA path can still beat the wider
-    # unsplit pipeline in two waves. Account for both waves' longest loops;
-    # more waves add partial traffic without validated benefit here. Keep
-    # the shorter 2K loops on their existing policy to amortize the combine.
+        return None
+    launch = _split_launch(caps, facts, 128, 128, 2, 1, split_kv=2)
+    units = facts.b * launch.heads_q * launch.q_tiles
+    resident = facts.device_sm_count // launch.ctas_per_tile
+    return launch if units <= resident else None
+
+
+def _paged_d256_thd_split_choice(caps: Capabilities, facts) -> int:
+    launch = paged_d256_prefix_launch(caps, facts)
+    if launch is None:
+        return 1
+    units = facts.b * launch.heads_q * launch.q_tiles
+    resident = facts.device_sm_count // launch.ctas_per_tile
+    # Budget four KV tiles per partition on average, bounding partial traffic.
+    # A declared envelope is conservative: never read live lengths to refine it.
+    budget = min(16, max(1, resident // units), max(1, launch.kv_tiles // 4))
+    return _ceil_div(launch.kv_tiles, _ceil_div(launch.kv_tiles, budget))
+
+
+def _d128_thd_split_units(facts, pack_g: int) -> int:
+    """Bound actual token tiles, including a partial tile per live sequence."""
+    token_rows = 128 // pack_g
+    tiles = facts.b * _ceil_div(facts.s_q, token_rows)
+    total = facts.max_total_seq_len_q
+    if total is not None:
+        # Each nonempty sequence buys its first tile with one token; every
+        # additional tile needs token_rows more. This uses declared capacity,
+        # never runtime device lengths, and remains valid for any ragged split.
+        nonempty = min(facts.b, max(0, total))
+        tiles = min(tiles, nonempty + max(0, total - nonempty) // token_rows)
+    return tiles * (facts.h_q // pack_g)
+
+
+def _d128_thd_split_wave_choice(facts, *, extra_waves: int = 1) -> Tuple[int, bool]:
+    """Score the physical packed/unpacked grids, preserving first-wave wins."""
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
-    for max_waves in ((1, 2) if caps.sm_lo == 100 and facts.s_kv >= 4096 else (1,)):
+    for waves in ((1, extra_waves) if extra_waves > 1 else (1,)):
         choices = []
-        for pack in (False, True):
+        for pack in ((False, True) if facts.h_q != facts.h_kv else (False,)):
             group = facts.h_q // facts.h_kv if pack else 1
-            units = facts.b * _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
-            # Keep four KV tiles per partition to amortize setup/combine.
-            budget = min(16, max(1, max_waves * sm_count // units), max(1, kv_tiles // 4))
-            loop_tiles = _ceil_div(kv_tiles, budget)
-            splits = _ceil_div(kv_tiles, loop_tiles)
-            if splits > 1:
-                work = _ceil_div(units * splits, sm_count) * loop_tiles
-                # Equal loop work prefers fewer partials, then unpacked.
+            units = _d128_thd_split_units(facts, group)
+            if not units:
+                continue
+            budget = min(16, waves * sm_count // units, kv_tiles // 4)
+            for splits in range(2, budget + 1):
+                work = _ceil_div(units * splits, sm_count) * _ceil_div(kv_tiles, splits)
                 choices.append((work, splits, pack))
         if choices:
             _, splits, pack = min(choices)
@@ -1369,8 +1551,76 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return 1, False
 
 
-def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
-    """Fill the first wave of the 128-row nonpaged tile; one keeps the old choice.
+def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """Measured fixed-graph (split count, packing); one keeps the existing plan.
+
+    Include batch in the grid estimate so multi-request chunks do not receive
+    the split budget of an underfilled single request. Rubin qualification
+    covers larger batches and caches using the same first-wave budget;
+    already-filled grids retain the unsplit candidate. Blackwell also admits
+    GQA16 and KV lengths through 32K with the same physical-grid score and
+    bounded partial workspace, excluding splits with more waves than partitions.
+    """
+    if (facts.d_qk, facts.d_v) == (256, 256):
+        return _paged_d256_thd_split_choice(caps, facts), False
+    if not (
+        paged_thd_split_domain(caps, facts)
+        and (facts.d_qk, facts.d_v) == (128, 128)
+        and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
+        and not facts.shape_overrides
+        and facts.dtype == cudnn.data_type.BFLOAT16
+        and 1 <= facts.b <= (64 if caps.sm_lo == 107 else 4)
+        and 4 <= facts.h_q <= 64
+        and facts.h_kv > 0
+        and facts.h_q % facts.h_kv == 0
+        and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
+        and facts.page_size == 16
+        and facts.causal
+        and facts.bottom_right
+        and facts.window_left is None
+        and 64 <= facts.s_q <= 1024
+        and 2048 <= facts.s_kv <= 32768
+        and facts.k_t is not None
+        and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
+    ):
+        return 1, False
+    if caps.sm_lo == 100:
+        # Packed tiles can remove a partial-wave tail. Preserve first-wave
+        # wins; otherwise compare up to three waves. Short loops stay on
+        # their first-wave policy to amortize setup and combine.
+        splits, pack = _d128_thd_split_wave_choice(facts, extra_waves=3 if facts.s_kv >= 4096 else 1)
+        if splits > 1 and (facts.s_kv > 16384 or facts.h_q // facts.h_kv == 16):
+            group = facts.h_q // facts.h_kv if pack else 1
+            waves = _ceil_div(_d128_thd_split_units(facts, group) * splits, facts.device_sm_count or 128)
+            # The newly admitted family must not stretch a split over more
+            # waves than partitions. Keep useful three-wave/four-way splits,
+            # but avoid three-wave/two-way tails on smaller GPUs.
+            if waves > splits:
+                return 1, False
+        return splits, pack
+    # Keep Rubin's separately qualified first-wave assignments unchanged.
+    kv_tiles = _ceil_div(facts.s_kv, 128)
+    sm_count = facts.device_sm_count or 128
+    choices = []
+    for pack in (False, True):
+        group = facts.h_q // facts.h_kv if pack else 1
+        units = facts.b * _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+        # Keep four KV tiles per partition to amortize setup/combine.
+        budget = min(16, max(1, sm_count // units), max(1, kv_tiles // 4))
+        loop_tiles = _ceil_div(kv_tiles, budget)
+        splits = _ceil_div(kv_tiles, loop_tiles)
+        if splits > 1:
+            work = _ceil_div(units * splits, sm_count) * loop_tiles
+            # Equal loop work prefers fewer partials, then unpacked.
+            choices.append((work, splits, pack))
+    if choices:
+        _, splits, pack = min(choices)
+        return splits, pack
+    return 1, False
+
+
+def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
+    """(split count, packing) for the underfilled nonpaged tile; one keeps the old choice.
 
     B200 / released cuDNN 9.26, BF16 THD, Hq=Hkv, Q64..1024/KV2K..32K:
     the smaller tile plus splitting beats the wide unsplit tile and backend
@@ -1381,15 +1631,21 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
     D128 FP16/BF16 with integral GQA1..16 on Blackwell, fixed or bounded, with
     or without packed Stats; the same first-wave budget avoids splitting
     already-filled/full-prefill grids. Rubin reuses this budget for its native
-    packed D128 and MLA paths, with the device's actual SM count.
+    packed D128 and MLA paths, with the device's actual SM count. Blackwell
+    D128 counts the CTAs of the actual candidate: a packed CTA holds
+    128 / (H_q/H_kv) tokens of one KV head's group, and a declared
+    ``max_total_seq_len_q`` bounds ragged batches. It also admits Q8..63, where
+    the backend ran 2-16x slower than the split, and may fill a second wave
+    when that shortens waves x KV loop.
     """
     d128 = (facts.d_qk, facts.d_v) == (128, 128)
     if d128:
         # Reuse the MLA launch budget for native half ragged prefixes.
         if caps.sm_lo not in (100, 107) or facts.h_kv <= 0 or facts.h_q % facts.h_kv or facts.h_q // facts.h_kv not in (1, 2, 4, 8, 16):
-            return 1
+            return 1, False
     elif (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
-        return 1
+        return 1, False
+    blackwell_d128 = d128 and caps.sm_lo == 100
     if not (
         thd_split_domain(caps, facts)
         and not facts.has_paged_kv
@@ -1397,7 +1653,7 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
         and (facts.dtype == cudnn.data_type.BFLOAT16 or (d128 and facts.dtype == cudnn.data_type.HALF))
         and 1 <= facts.b <= 4
         and 4 <= facts.h_q <= 64
-        and 64 <= facts.s_q <= 1024
+        and (8 if blackwell_d128 else 64) <= facts.s_q <= 1024
         and 2048 <= facts.s_kv <= 32768
         and 4 * facts.s_q <= facts.s_kv
         and (not facts.causal or facts.bottom_right)
@@ -1405,18 +1661,31 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> int:
         and facts.window_left is None
         and facts.device_sm_count
     ):
-        return 1
-    # This unpacked tile has one physical CTA per 128 query rows. Do not
-    # overfill its first wave: beyond it the extra partials/combine usually
-    # cost more than the shorter loop saves. Four KV tiles per partition
-    # amortize that overhead. Reuse the power-of-two specialization set;
-    # selection uses host graph facts only, never live device lengths.
-    units = facts.b * facts.h_q * _ceil_div(facts.s_q, 128)
+        return 1, False
+    # Do not overfill the wave budget (Blackwell D128 two, else one): beyond it the extra
+    # partials/combine usually cost more than the shorter loop saves. Four KV
+    # tiles per partition amortize that overhead. Reuse the power-of-two
+    # specialization set; selection uses host graph facts only, never live
+    # device lengths.
     kv_tiles = _ceil_div(facts.s_kv, 128)
-    return max(
-        (s for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles) if units * s <= facts.device_sm_count and kv_tiles // s >= 4),
-        default=1,
-    )
+    group = facts.h_q // facts.h_kv
+    budget = facts.device_sm_count * (2 if blackwell_d128 else 1)
+    choices = []
+    for pack in (False, True) if blackwell_d128 and group > 1 else (False,):
+        rows = 128 // group if pack else 128
+        q_tiles = facts.b * _ceil_div(facts.s_q, rows)
+        if blackwell_d128 and facts.max_total_seq_len_q:
+            # Each sequence leaves at most one partial tile.
+            q_tiles = min(q_tiles, (facts.max_total_seq_len_q + facts.b * (rows - 1)) // rows)
+        units = q_tiles * (facts.h_q // group if pack else facts.h_q)
+        for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles):
+            if s > 1 and units * s <= budget and kv_tiles // s >= 4:
+                # Fewest waves x loop, then fewer partials, then unpacked.
+                choices.append((_ceil_div(units * s, facts.device_sm_count) * _ceil_div(kv_tiles, s), s, pack))
+    if not choices:
+        return 1, False
+    _, splits, pack = min(choices)
+    return splits, pack
 
 
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
@@ -1555,10 +1824,21 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             unique.append(knobs)
     splits, packed = paged_thd_split_choice(caps, facts)
     if splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=packed, split_kv=splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
-    nonpaged_splits = nonpaged_thd_split_choice(caps, facts)
+        unique.insert(
+            0,
+            replace(
+                base,
+                cga=_sole(effective_cgas(caps, facts, splits)),
+                pack_gqa=packed,
+                split_kv=splits,
+                sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT,
+            ),
+        )
+    nonpaged_splits, nonpaged_packed = nonpaged_thd_split_choice(caps, facts)
     if nonpaged_splits > 1:
-        unique.insert(0, replace(base, cga=1, pack_gqa=False, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT))
+        unique.insert(
+            0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
+        )
     return unique[:_MAX_SETS_PER_ENGINE]
 
 
