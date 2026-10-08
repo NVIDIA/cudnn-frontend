@@ -294,6 +294,37 @@ def test_epilogue_is_bitwise_the_standalone_launches(want_dw, halves, t):
         assert torch.equal(dw_q_f, dw_q_s) and torch.equal(dw_k_f, dw_k_s), "the two-columns-per-block reduce is not the (8, 128) reduce's fixed-order sum"
 
 
+@requires_mx_tma
+def test_epilogue_reduce_grid_is_derived_from_the_block_size():
+    """The reduce arm sums ``cols = threads_per_cta // REDUCE_LANES`` columns per block, so its grid is ``ceil(2 d / cols)`` blocks over
+    the ``2 d`` columns (d Q, then d K): ``2 d`` at 128 threads, ``d`` at the default 256, ``d / 2`` at 512 -- ``epilogue_grid`` DERIVES
+    it from the recipe's block size.  Pinned on the launch that exposed a grid of ``d`` blocks at EVERY block size: at 128 threads (one
+    column per block) it covered the Q half only and ``dW_k_norm`` kept its initial bytes.  Q partials all ones over 3 rows and K
+    partials all 2 over 5 rows make the sums 3 and 10 exactly, on outputs initialised to -777; the default 256-thread artifact on the
+    same planes is bitwise the 128-thread one (the per-column chain never depends on ``cols``)."""
+    d, t = 128, 128
+    n_cols = 2 * d
+    pq = torch.ones(3, d, device="cuda")
+    pk = torch.full((5, d), 2.0, device="cuda")
+    src = torch.zeros(t, n_cols // d, d, dtype=torch.bfloat16, device="cuda")  # the cast arm is folded out: src pins T only
+    st = _stream()
+    got = {}
+    for threads in (128, F.EPILOGUE_THREADS):
+        re = F.compile_mxfp8_bwd_epilogue(dtype=torch.bfloat16, n_cols=n_cols, d=d, want_dw=True, want_row=False, want_col=False, threads_per_cta=threads)
+        dw_q = torch.full((d,), -777.0, device="cuda")
+        dw_k = torch.full((d,), -777.0, device="cuda")
+        F.run_mxfp8_bwd_epilogue(re, plane_q=pq, plane_k=pk, dw_q=dw_q, dw_k=dw_k, src=src, dst=None, sf=None, dst_t=None, sf_t=None, stream=st)
+        torch.cuda.synchronize()
+        assert torch.equal(dw_q, torch.full((d,), 3.0, device="cuda")), f"{threads} threads: dW_q_norm = {dw_q[:4].tolist()} ..., expected 3.0"
+        assert torch.equal(
+            dw_k, torch.full((d,), 10.0, device="cuda")
+        ), f"{threads} threads: dW_k_norm = {dw_k[:4].tolist()} ..., expected 10.0 (the K half's reduce blocks were never launched)"
+        cols = threads // NB.REDUCE_LANES
+        assert F.epilogue_grid(re, t) == (-(-2 * d // cols), 0), f"{threads} threads: {cols} column(s) per block need {-(-2 * d // cols)} reduce blocks"
+        got[threads] = (dw_q, dw_k)
+    assert all(torch.equal(a, b) for a, b in zip(got[128], got[F.EPILOGUE_THREADS]))
+
+
 @requires_cuda
 def test_fused_launch_contracts_are_typed():
     """Compile-time refusals (the dY view's head count, the init job's constant range, the MX geometry, an epilogue with nothing to
@@ -347,6 +378,9 @@ def test_fused_launch_contracts_are_typed():
         and F.epilogue_grid(re._replace(want_dw=False), 128) == (0, h)
         and F.epilogue_grid(re_c._replace(want_col=False), 128) == (0, 0)
     )
+    # the reduce grid follows the block size: cols = threads // REDUCE_LANES columns per block over the 2 d columns
+    assert F.epilogue_grid(re._replace(threads=512), 1000) == (d // 2, h * 8)
+    assert F.epilogue_grid(re._replace(d=128, h=8, threads=128), 128) == (256, 8) and F.epilogue_grid(re._replace(d=128, h=8), 128) == (128, 8)
     rp = F.Mxfp8BwdPrologueRecipe(
         compiled=None,
         dtype=torch.bfloat16,

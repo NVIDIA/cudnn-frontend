@@ -33,10 +33,11 @@ touches a slot.  The partials are written unconditionally (one per amax CTA).  N
 
 **Epilogue** (``frost_mxfp8_bwd_epilogue``; after the norm backward; 256 threads; grid = ``n_red + n_cast``)::
 
-    blocks [0, n_red)                 dW_norm reduce       columns 2 blk, 2 blk + 1 of class (2 blk) // d: the fixed-order sum of the partial planes
-                                                           (qk_norm_rope_bwd.dw_reduce_column at (cols, lanes) = (2, 128): the per-column chain
-                                                           never depends on cols, so it is the standalone (8, 128) reduce's sum, bitwise); n_red =
-                                                           d, or 0 without dW
+    blocks [0, n_red)                 dW_norm reduce       columns cols blk .. cols blk + cols - 1 of class (cols blk) // d: the fixed-order sum of
+                                                           the partial planes (qk_norm_rope_bwd.dw_reduce_column at (cols, lanes) = (threads // 128,
+                                                           128) = (2, 128) at the 256-thread default: the per-column chain never depends on cols, so
+                                                           it is the standalone (8, 128) reduce's sum, bitwise); n_red = ceil(2 d / cols) blocks
+                                                           (epilogue_reduce_blocks: d at 256 threads, 2 d at 128, d / 2 at 512), or 0 without dW
     blocks [n_red, n_red + n_cast)    dqkvg DUAL-AXIS cast one block per (h = N / D, 128-token unit): dqkvg8 [T, N] + the canonical blob over (T, N)
                                                            (need_dh: the block-scale dgrad's A) AND dqkvg_t8 [N, T] + the canonical blob over (N, T)
                                                            (need_dw_qkvg: the block-scale wgrad's A) from ONE read (quantize_mxfp8_dual_body at
@@ -145,6 +146,22 @@ _FAKE_STREAM = None
 PROLOGUE_THREADS = DEFAULT_THREADS_PER_CTA  # 128: the rebuild body's block (every prologue job's own)
 EPILOGUE_THREADS = 256  # the dual-axis body's block; the reduce runs at (cols, lanes) = (EPILOGUE_THREADS // REDUCE_LANES, REDUCE_LANES)
 
+
+def epilogue_reduce_cols(threads_per_cta: int) -> int:
+    """Columns per reduce block: the reduce arm's thread mapping is ``(cols, lanes) = (threads_per_cta // REDUCE_LANES, REDUCE_LANES)``
+    (2 at the 256-thread default) -- the kernel body and the grid read the same function."""
+    return int(threads_per_cta) // REDUCE_LANES
+
+
+def epilogue_reduce_blocks(d: int, threads_per_cta: int) -> int:
+    """``n_red``: the reduce blocks that cover the ``2 d`` columns (``d`` Q columns, then ``d`` K columns) at ``epilogue_reduce_cols``
+    columns each -- ``ceil(2 d / cols)``, DERIVED from the block size: ``d`` at the default 256 threads, ``2 d`` at 128 (one column per
+    block), ``d / 2`` at 512.  A grid of ``d`` blocks at every block size covered the Q half only at 128 threads and left ``dW_k_norm``
+    unwritten.  Every block size the dual-axis cast accepts divides ``2 d`` exactly; a column past ``2 d`` would idle in the body's
+    ``col < d`` guard anyway."""
+    return -(-2 * int(d) // epilogue_reduce_cols(threads_per_cta))
+
+
 __all__ = [
     "EPILOGUE_THREADS",
     "Mxfp8BwdEpilogueRecipe",
@@ -153,6 +170,8 @@ __all__ = [
     "compile_mxfp8_bwd_epilogue",
     "compile_mxfp8_bwd_prologue",
     "epilogue_grid",
+    "epilogue_reduce_blocks",
+    "epilogue_reduce_cols",
     "prologue_grid",
     "run_mxfp8_bwd_epilogue",
     "run_mxfp8_bwd_prologue",
@@ -859,7 +878,7 @@ def frost_mxfp8_bwd_epilogue(
     # -- runtime geometry --
     n_q: cutlass.Int32,
     n_k: cutlass.Int32,
-    n_red: cutlass.Int32,  # d (the 2 d columns, two per block), or 0
+    n_red: cutlass.Int32,  # epilogue_reduce_blocks(d, threads_per_cta): the 2 d columns at cols per block (d at 256 threads), or 0
     n_tokens: cutlass.Int32,  # T (the batch folds into the rows under the canonical layout)
     n_t_tiles: cutlass.Int32,  # ceil(T / 128)
     n_c_atoms: cutlass.Int32,  # atoms per 128-row band of the (T, N) blob
@@ -874,7 +893,7 @@ def frost_mxfp8_bwd_epilogue(
 ) -> None:
     """Block-range dispatch over the two jobs (module docstring)."""
     want_dw = cutlass.const_expr(mPq is not None)
-    cols = cutlass.const_expr(threads_per_cta // REDUCE_LANES)  # 2 at 256 threads: two columns per reduce block
+    cols = cutlass.const_expr(epilogue_reduce_cols(threads_per_cta))  # columns per reduce block: 2 at 256 threads (the grid is derived from the same)
     # the reduce arm's combine array (lanes x cols words); the dual body's staging tile, scale array and two SF tiles
     sPart = cutlass.Array(cutlass.Float32, threads_per_cta, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(want_dw) else None
     sStage = cutlass.Array(cutlass.Int32, SF_BLOCK * d // 2, alignment=16, space=cutlass.AddressSpace.smem)
@@ -885,7 +904,7 @@ def frost_mxfp8_bwd_epilogue(
     cta = cutlass.Int32(cute.arch.block_idx()[0])
     if cta < n_red:
         if cutlass.const_expr(want_dw):
-            # thread (l, j) = (tidx % lanes, tidx // lanes) sums column 2 * blk + j; the 2 d columns are d Q columns then d K columns
+            # thread (l, j) = (tidx % lanes, tidx // lanes) sums column cols * blk + j; the 2 d columns are d Q columns then d K columns
             l_row = tidx % cutlass.Int32(REDUCE_LANES)
             j = tidx // cutlass.Int32(REDUCE_LANES)
             col_all = cta * cutlass.Int32(cols) + j
@@ -1005,8 +1024,9 @@ def compile_mxfp8_bwd_epilogue(
     threads_per_cta: int = EPILOGUE_THREADS,
 ) -> Mxfp8BwdEpilogueRecipe:
     """Build from SHAPES ALONE.  ``n_cols`` is the dqkvg slab's width ``N`` (``N % d == 0``); ``want_dw`` traces the reduce arm
-    (``n_red = d`` blocks of two columns at ``lanes = REDUCE_LANES``: ``threads_per_cta`` must be a multiple of ``REDUCE_LANES`` so the
-    per-column chain is the standalone reduce's); ``want_row`` / ``want_col`` trace the two halves of the dual-axis cast (at least one
+    (``n_red = epilogue_reduce_blocks(d, threads_per_cta)`` blocks of ``threads_per_cta // REDUCE_LANES`` columns at ``lanes =
+    REDUCE_LANES``: ``threads_per_cta`` must be a multiple of ``REDUCE_LANES`` so the per-column chain is the standalone reduce's);
+    ``want_row`` / ``want_col`` trace the two halves of the dual-axis cast (at least one
     of the three jobs).  Needs the fp8 ``cvt`` (sm_89+) and ``cvt.rp.satfinite.ue8m0x2`` (sm_100+; declined by name)."""
     if n_cols % d != 0:
         raise ValueError(f"n_cols={n_cols} must be a multiple of d_head={d}: dqkvg is quantized through a [T, N / D, D] view")
@@ -1079,12 +1099,13 @@ def compile_mxfp8_bwd_epilogue(
 
 
 def epilogue_grid(r: Mxfp8BwdEpilogueRecipe, t: int) -> tuple:
-    """``(n_red, n_cast)`` for ``t`` tokens -- the two job widths of the launch (its grid is their sum): ``d`` reduce blocks of two
-    columns under ``want_dw`` (0 otherwise) and the cast blocks ``(N / D) * ceil(T / 128)`` (one per (h, 128-token unit); 0 when
-    neither half is traced)."""
+    """``(n_red, n_cast)`` for ``t`` tokens -- the two job widths of the launch (its grid is their sum): the reduce blocks
+    ``epilogue_reduce_blocks(d, threads)`` under ``want_dw`` (``ceil(2 d / cols)`` over the ``2 d`` columns at ``cols = threads //
+    REDUCE_LANES`` per block -- ``d`` at the 256-thread default; 0 otherwise) and the cast blocks ``(N / D) * ceil(T / 128)`` (one per
+    (h, 128-token unit); 0 when neither half is traced)."""
     t = int(t)
     n_cast = r.h * n_sf_tiles(t) if (r.want_row or r.want_col) else 0
-    return (r.d if r.want_dw else 0), n_cast
+    return (epilogue_reduce_blocks(r.d, r.threads) if r.want_dw else 0), n_cast
 
 
 def epilogue_moved_bytes(r: Mxfp8BwdEpilogueRecipe, t: int, n_plane_rows: int) -> int:
