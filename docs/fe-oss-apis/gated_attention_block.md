@@ -548,8 +548,8 @@ same way: the unfused chain over the row's per-member dQ measured 28 / 27 / 24 /
 chain over the single-launch dQ 25 / 24 / 24 / 25 and 40 / 38 / 38 / 32, the fused chain over the per-member dQ 18 / 18 / 14 / 30 and
 33 / 32 / 28 / 25. Measured on Rubin cc 10.7 (212 SMs, locked clocks, CUPTI device time, the 397B geometry at S = 8K) the PROLOGUE runs
 in 0.099 ms against the eight launches it replaces at 0.184 (+85 %), the dual-axis `dO` launch in 0.042 against 0.116 (+178 %), the
-EPILOGUE in 0.088 against 0.122 (+39 %); the PROLOGUE reads its own bytes at 3.7 TB/s against the per-tensor fp8 prologue's 6.3 TB/s on
-its (its two-pass 32-token tile is resident 5-6 CTAs per SM against the shipped tile's 14), which is why the workspace carve is keyed on
+EPILOGUE in 0.088 against 0.122 (+39 %); the PROLOGUE reads its own bytes at 3.7 TB/s against the per-tensor fp8 prologue's 6.3 TB/s
+(its two-pass 32-token tile is resident 5-6 CTAs per SM against the shipped tile's 14), which is why the workspace carve is keyed on
 the prologue's ARM (`mx_prologue_arm`): the alternative arm that keeps the bf16 TMA store and quantizes `q_T` / `k_T` from the bf16
 buffers by a dual-axis launch carves the two bf16 rebuild regions again and changes nothing else. Under GQA the MXFP8 SDPA backward folds its per-Q-head dK partials in fp32
 and rounds the sum once, like the reference, while its per-Q-head dV partials are bf16 (the kernel stores them from its epilogue;
