@@ -4433,7 +4433,7 @@ def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monk
     import torch
 
     _fake_cc(monkeypatch, (10, 7))
-    common = dict(d=128, d_v=128, dtype=torch.bfloat16, with_gate=False, h=8, h_kv=2, s=64)
+    common = dict(d=128, d_v=128, dtype=torch.bfloat16, with_gate=False, h=8, h_kv=2, s=128)
     api = _gate_api(**common, cga=1)
     assert api.check_support() and api.template_params().cta_mma == 1
     api = _gate_api(**common, cga=2, pack_gqa=True)

@@ -634,7 +634,10 @@ def _sched_points(caps: Capabilities, facts) -> List[Optional[int]]:
         # every causal graph.  (d256 32/2 packed at cga2 flips sign between
         # S_q=4 and 8 -- LPT_L2 / LPT / NATURAL 65.9 / 63.3 / 62.1 vs 64.8 /
         # 65.0 / 66.6 us -- so that flavor keeps the rule below until it is
-        # measured on its own.)
+        # measured on its own.)  Also the cc 10.7 half row since issue #1472
+        # (the same tile and the same equal-work argument; NATURAL 1221 us vs
+        # LPT 1232 us at B128 64/8 Q8 KV2056 on the Rubin prefill tile --
+        # parity, the LPT runner stays for autotune).
         primary = SCHED_NATURAL
     elif (
         causal_ish
@@ -871,12 +874,13 @@ _D128_SHAPE = (128, 128)
 
 
 def _d128_f16_flavor(caps: Capabilities, facts) -> bool:
-    """The d128 flavor of the SM100 f16 row -- the one half-precision row whose
-    (128, 128) cga domain holds two tiles (cga1 the decode tile, cga2 the
-    prefill pipeline); the fp8 / mxfp8 rows and the cc 10.7 f16 row keep d128 on
-    the row-wide cga2 (``caps.sm_lo == 100`` names the cc 10.0-10.6 range)."""
+    """The d128 flavor of the half-precision rows whose (128, 128) cga domain
+    holds two tiles (cga1 the decode tile, cga2 the prefill pipeline): the SM100
+    f16 row and, since issue #1472, the cc 10.7 f16 row (the shared tile compiled
+    for cc 10.7); the fp8 / mxfp8 rows keep d128 on the row-wide cga2
+    (``caps.sm_lo == 100`` names the cc 10.0-10.6 range, 107 the cc 10.7+ line)."""
     return (
-        caps.sm_lo == 100
+        caps.sm_lo in (100, 107)
         and _selected_d_shape(caps, facts) == _D128_SHAPE
         and not (facts.is_fp8 or facts.is_mxfp8)
         and any(shape == _D128_SHAPE for shape, _ in caps.cgas_by_d_shape)
@@ -1039,7 +1043,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         )
         return sched_policy, 1 if prefer else 2
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
-        # The f16 SM100 row: cga1 = the decode tile when one of its 128-row
+        # The f16 SM100 and cc 10.7 rows: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
         return sched_policy, (1 if _d128_decode_tile_fits(caps, facts, pack_gqa) else 2)
     if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
@@ -1159,7 +1163,7 @@ def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int) -> bool:
     (sm100/decode_d256_f16.py) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``:
     the (256, 256) flavor, half inputs, dense (not THD), S_q x packed heads
     within the tile's N extent, ``pack_g`` being the DECODE tile's group
-    (:func:`_decode_tile_pack_g`).  Rubin has its own row (no decode tile)."""
+    (:func:`_decode_tile_pack_g`).  Rubin has its own row (no d256 decode tile)."""
     return (
         caps.sm_lo == 100
         and caps.sm_hi < 107

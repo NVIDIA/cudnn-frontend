@@ -494,8 +494,9 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     ragged offset on device as its row coordinate over the packed Q view, and
     always splits the KV walk so the combine pass -- not the kernel -- places
     the final O / Stats rows at their ragged offsets. Hence the shape of the
-    predicate: the (128, 128) half flavor on the Blackwell line (Rubin has no
-    decode tile), S_q(max) == 1, PAGED K/V (a ragged K/V needs the THD leg's
+    predicate: the (128, 128) half flavor on the Blackwell line (the ragged-Q
+    leg is not wired on cc 10.7, whose dense d128 graphs ride the same tile
+    through TILE_CGA_M=1 since issue #1472), S_q(max) == 1, PAGED K/V (a ragged K/V needs the THD leg's
     clamped descriptors), ragged Stats when Stats are requested (a per-batch
     padded Stats has no ragged base to place rows at), int32 offsets whose
     multiplier divides the row, per-batch ``seq_len_kv`` (the dense kernel's
@@ -696,6 +697,18 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         return frozenset({2 if (facts.d_qk, facts.d_v) == (256, 256) else 1})
     if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):
         return frozenset({1, 2})
+    if (
+        capabilities.sm_lo == 107
+        and selected == (128, 128)
+        and not (capabilities.is_fp8 or capabilities.is_mxfp8)
+        and not rubin_dense_d128_shared_leg(capabilities, facts)
+    ):
+        # cc 10.7 half row: the (128, 128) cga1 entry of cgas_by_d_shape names the shared SM100 DECODE tile compiled for
+        # cc 10.7 (issue #1472), a DENSE half leg (rubin_dense_d128_shared_leg): a ragged graph outside the single-CTA
+        # legs above keeps the cga2 prefill pipeline (the tile has no THD_VARLEN leg), dense paged queries are not wired
+        # on cc 10.7, the pre-folded scale lives in the Rubin sibling only, and quantized facts never ride this row.
+        # Narrow the DOMAIN so neither a proposal nor a pin reaches the tile.
+        return frozenset({2})
     domain = capabilities.cgas
     if selected is not None:
         for shape, shape_domain in capabilities.cgas_by_d_shape:
@@ -1332,16 +1345,17 @@ def _sm107_spec() -> EngineSpec:
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
       the shared combine. Bounded D128 THD and nonpaged D192 THD
       also use the shared single-CTA packed partials. Sink split stays declined.
-    - ``pack_gqas``: D128 dense GQA graphs (the shared SM100 prefill body at cga2 compiled for cc 10.7 -- the Rubin
-      sibling carries no PACK_GQA arm; not with the pre-folded scale; issue #1472), D128 paged/nonpaged split THD and
-      D256 paged unsplit THD use the shared half pipeline.
+    - ``pack_gqas``: D128 dense GQA graphs (the shared SM100 d128 bodies compiled for cc 10.7: the prefill body at
+      cga2, the decode tile at cga1 -- the Rubin sibling carries no PACK_GQA arm; not with the pre-folded scale;
+      issue #1472), D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD without sink uses the shared
       Blackwell paged pipeline, compiled natively for SM107.
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
       (the f16x2 arm is a quantized-kernel specialization).
     - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the
       pre-folded-scale arm (raw running max, plain subtract shift); the paged
-      bodies and the single-CTA THD legs apply the scale in-kernel and decline.
+      bodies, the single-CTA THD legs and the shared dense D128 legs (decode
+      tile, dense PackGQA) apply the scale in-kernel and decline.
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107",
@@ -1429,6 +1443,11 @@ def _sm107_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
+            # (128, 128) half carries two tiles behind TILE_CGA_M on cc 10.7 as on the SM100 row: cga2 = the Rubin prefill
+            # pipeline (sm107/prefill_d128_f16.py; a packed set runs the shared SM100 prefill body), cga1 = the shared 128-row
+            # decode tile (sm100/decode_d128_f16.py compiled for cc 10.7, issue #1472).  Dense graphs only: effective_cgas
+            # keeps THD, dense paged and the pre-folded scale on cga2.  A split rides either width (no split_cgas entry).
+            cgas_by_d_shape=(((128, 128), frozenset({1, 2})),),
             # Fused epilogue gate (O := O * sigmoid(G)) on the d256 kernel,
             # f16 AND bf16 (G in Q's dtype).  EXACT (256, 256) only -- the
             # gate tile does not ride the head-dim envelope.  The standalone

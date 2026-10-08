@@ -514,10 +514,10 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         return (1, 2)
     if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
         return (1,)
-    if device_cc != (10, 7) and not fp8 and flavor == _SM100_DECODE_FLAVOR:
-        # cga1 on the d128 f16/bf16 flavor selects the DECODE tile
-        # (sm100/decode_d128_f16.py); dense graphs only -- check_support
-        # declines it for THD, mirroring engines.mismatch.
+    if not fp8 and flavor == _SM100_DECODE_FLAVOR:
+        # cga1 on the d128 f16/bf16 flavor selects the DECODE tile (sm100/decode_d128_f16.py) on the SM100 line and,
+        # since issue #1472, on cc 10.7 (the same body compiled for sm_107a, inside the version-0 descriptor window);
+        # dense graphs only -- check_support declines it for THD, mirroring engines.mismatch / effective_cgas.
         return (1, 2)
     return (2,)
 
@@ -554,8 +554,8 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     """Load one SM100-family module for the selected flavor and quantization
     path. Rubin uses its SM107 siblings except for the shared half packed
     split and paged pipelines, whose SMEM fits the version-0 descriptor window,
-    and, on dense (128, 128) half graphs, the shared d128 prefill body under
-    PackGQA (issue #1472)."""
+    and, on dense (128, 128) half graphs, the shared d128 decode tile at cga1
+    and the shared d128 prefill body under PackGQA (issue #1472)."""
 
     tag = _flavor_tag(flavor)
     if (
@@ -571,6 +571,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
     if rubin and not fp8 and params.paged_kv and flavor in ((128, 128), (256, 256)):
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
+    if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen and not params.paged_kv and not params.ragged_q:
+        # Dense d128 half at TILE_CGA_M=1 on cc 10.7: the shared 128-row DECODE tile (CfgD128Decode, 224 KiB, inside the
+        # version-0 descriptor window) -- the dense twin of the single-CTA THD leg above (issue #1472).  THD_VARLEN at cga1
+        # is the two-slab paged prefill (above) or the single-Q split (above); never this body.
+        return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_decode")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.pack_gqa and not params.thd_varlen and not params.paged_kv:
         # Dense packed d128 half at cga2 on cc 10.7: the shared SM100 prefill body (CfgD128 at cga2, 192 KiB) carries the
         # PACK_GQA arm and the row_head_idx sink fold the Rubin sibling lacks (issue #1472); unpacked cga2 stays on the
@@ -1696,8 +1701,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         arch_error = cutedsl_arch_requirement_error(self._device_cc)
         self._not_implemented_error_if(arch_error is not None, arch_error)
-        # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode; Rubin has
-        # no decode tile; its admitted unsplit cga1 leg uses the prefill template.
+        # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode not wired on cc 10.7 (its dense d128 graphs ride that
+        # tile through TILE_CGA_M=1 since issue #1472); the admitted unsplit paged cga1 THD leg uses the two-slab prefill template.
         self._not_implemented_error_if(
             self.thd_decode_leg and self._device_cc == (10, 7),
             "the d128 decode tile's ragged-Q leg is not wired on cc10.7 (Rubin); THD graphs keep the prefill tile there",
@@ -2448,6 +2453,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # in lockstep; a requested cga was honored verbatim in the params.
             # (thd_decode_leg is False here: the ragged-Q leg needs cga == 1
             # requested, so a ragged graph with no width keeps the prefill tile.)
+            # cc 10.7 keeps cga2 as the STANDALONE default width on this flavor (the graph heuristics, which always pass
+            # an explicit cga, pick the shared decode tile there -- issue #1472); an explicit cga=1 is honoured through
+            # supported_cgas_for.
             params = replace(
                 params,
                 cta_mma=select_d128_auto_cga(
