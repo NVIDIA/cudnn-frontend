@@ -3586,6 +3586,13 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     cfg.is_paged = True
     cfg.paged_nan_dead_pages = True
     cfg.paged_pool_layout = "nhd" if rng.random() < 0.5 else "hnd"   # drawn AFTER the context: geometry unchanged
+    if cfg.ragged_stats_layout == "head_major" and cfg.batches * cfg.s_q < cfg.total_q:
+        # The native THD binder bounds a head-major Stats declaration by the declared packed-Q capacity: the
+        # harness declares (b, h, s_q, 1) logical Stats dims over the [h, t] buffer, and when b * s_q falls short
+        # of the 64-rounded capacity t_q that declaration is one the row does not serve.  Keep such draws
+        # token-major (deterministic, no rng consumed; the geometry is unchanged).
+        cfg.ragged_stats_layout = "token_major"
+        cfg.stride_stats = get_strides_from_layout(cfg.shape_stats, "bshd")
     _assign_cc107_knob_set(cfg, test_no, "half")
     test.showConfig(test_no, request)
     with _must_run(request):
@@ -3682,7 +3689,12 @@ def _p2_planned_graph(cfg, cudnn_handle):
     graph, _ = fp16_harness.create_forward_graph(cfg, tensors, cudnn_handle, plan=False)
     graph.validate()
     graph.build_operation_graph()
-    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    except cudnn.cudnnGraphNotSupportedError as e:
+        # An EMPTY list raises here (the python-only attribute keeps the backend out and the row proposes nothing);
+        # the graph is frozen with its facts attached, so the cell can still append and pin its own plan.
+        print(f"@@@@ no engine proposed a plan ({e}); the cell pins its own")
     return graph, tensors
 
 
@@ -3708,8 +3720,9 @@ def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn
     graph.create_execution_plan(engine_id, {**knobs, cudnn.knob_type.SPLIT_KV: 2, cudnn.knob_type.TILE_CGA_M: 2})
     graph.select_plan(graph.get_execution_plan_count() - 1)
     graph.check_support()   # facts-level: paged THD + sink IS served
-    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="sink-free"):
+    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="sink-free") as decline:
         graph.build_plans()   # knob-level: the pinned split is the typed decline
+    print(f"@@@@ P2 split decline: {decline.value}")
 
 
 @pytest.mark.L0
@@ -3724,8 +3737,9 @@ def test_sdpa_paged_sink_dense_queries_decline_cc107_L0(env_info, request, cudnn
     engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_cc107_engine("half")]
     graph.create_execution_plan(engine_id, {})
     graph.select_plan(graph.get_execution_plan_count() - 1)
-    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="Rubin paged KV requires THD queries"):
+    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="Rubin paged KV requires THD queries") as decline:
         graph.check_support()
+    print(f"@@@@ P2 dense decline: {decline.value}")
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
