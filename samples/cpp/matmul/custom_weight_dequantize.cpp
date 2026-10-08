@@ -9,11 +9,13 @@
 #include <cuda_bf16.h>
 #include <nvrtc.h>
 #include "../utils/helpers.h"
+#include "weight_dequantize/ggml_decode.h"
+#include "weight_dequantize/ggml_fixture.h"
 
 namespace {
 // Customer-supplied CUDA C++ defines both the narrow numerical type and its
 // scaling scheme. The backend supplies the ABI types and conversion helper.
-constexpr char source[]         = R"CUDA(
+constexpr char source[] = R"CUDA(
 __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
     const void* const* auxiliary, void*, void*, FortWeightDecodeValue* output) {
     const int bits=int(t.constants[0]), scaling=int(t.constants[1]);
@@ -38,59 +40,6 @@ __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
     }
 }
 )CUDA";
-constexpr char managed_source[] = R"CUDA(
-// Engine-loaded bytes describe storage only. This function supplies the signed
-// numerical interpretation (or a custom nonlinear codebook) and scaling scheme.
-__device__ FortWeightDecodeValue scaled_value(const FortWeightDecodeTileV2& t,
-    const void* const* auxiliary, unsigned code, int row, int col) {
-    const int bits=t.storage_bits, scaling=int(t.constants[1]);
-    const long long k=t.k_begin+row, n=t.n_begin+col;
-    const long long block_k=t.constants[2], block_n=t.constants[3];
-    const long long blocks_n=(t.full_n+block_n-1)/block_n;
-    const int value=int(code)-((code & (1u<<(bits-1))) ? (1<<bits) : 0);
-    float weight=float(value);
-    if (t.constant_count > 4 && t.constants[4]) {
-        // A second numerical interpretation with identical physical transport.
-        const float codebook[4]={-1.25f,-0.125f,0.5f,2.0f};
-        weight=codebook[code & 3];
-    }
-    if (scaling & 2) weight *= static_cast<const float*>(auxiliary[0])[(k/block_k)*blocks_n+n/block_n];
-    if (scaling & 1) weight *= static_cast<const float*>(auxiliary[1])[0];
-    return fort_weight_decode_from_float(weight);
-}
-// TMA supplies a ready, immutable shared tile. Only valid logical values are
-// interpreted; row padding may contain arbitrary codes with nonzero meanings.
-__device__ void decode(const FortWeightDecodeTileV2& t, FortWeightDecodeSharedTileV2 input,
-    const void* const* auxiliary, void* cta_scratch, void* stage_scratch, FortWeightDecodeValue* output) {
-    // Optional user scratch is disjoint from engine-managed input and barriers.
-    // Tests with 256-byte reservations poison it before reading the packed tile.
-    if (cta_scratch) static_cast<unsigned char*>(cta_scratch)[t.thread_id]=0x5a;
-    if (stage_scratch) static_cast<unsigned char*>(stage_scratch)[t.thread_id]=0xa5;
-    __syncthreads();
-    for (int i=t.thread_id; i<t.tile_k*t.tile_n; i+=t.thread_count) {
-        const int row=i/t.tile_n, col=i%t.tile_n;
-        if (row>=t.valid_k || col>=t.valid_n) continue;
-        const int bit=col*t.storage_bits;
-        const unsigned code=(input.data[row*input.row_stride_bytes+bit/8] >> (bit%8)) & ((1u<<t.storage_bits)-1);
-        output[row*t.output_stride+col]=scaled_value(t,auxiliary,code,row,col);
-    }
-}
-// VECTOR_256 supplies one by-value register fragment per thread. Inactive
-// threads still call this entry (value_count==0), permitting uniform CTA barriers.
-__device__ void decode(const FortWeightDecodeTileV2& t, FortWeightDecodeFragmentV2 input,
-    const void* const* auxiliary, void* cta_scratch, void* stage_scratch, FortWeightDecodeValue* output) {
-    // Optional user scratch is disjoint from engine-managed input and barriers.
-    // Tests with 256-byte reservations poison it before reading the packed tile.
-    if (cta_scratch) static_cast<unsigned char*>(cta_scratch)[t.thread_id]=0x5a;
-    if (stage_scratch) static_cast<unsigned char*>(stage_scratch)[t.thread_id]=0xa5;
-    __syncthreads();
-    for (int i=0; i<input.value_count; ++i) {
-        const int bit=(input.code_offset+i)*t.storage_bits;
-        const unsigned code=(input.words[bit/32] >> (bit%32)) & ((1u<<t.storage_bits)-1);
-        output[input.k*t.output_stride+input.n+i]=scaled_value(t,auxiliary,code,input.k,input.n+i);
-    }
-}
-)CUDA";
 }  // namespace
 
 TEST_CASE("Custom weight dequantization matmul", "[matmul][weight_dequantize][graph]") {
@@ -107,22 +56,16 @@ TEST_CASE("Custom weight dequantization matmul", "[matmul][weight_dequantize][gr
         SKIP("Runtime library lacks experimental weight-dequantization descriptors");
     REQUIRE(cudnnBackendDestroyDescriptor(probe) == CUDNN_STATUS_SUCCESS);
 
-    auto load_mode = GENERATE(0, 1, 2);
-#if CUDNN_WEIGHT_DECODE_ABI_VERSION < 2
-    if (load_mode) SKIP("Managed loads require ABI 2 headers");
-#endif
-    if (load_mode == 2 && major * 1000 + minor * 10 < 12090) SKIP("VECTOR_256 requires NVRTC 12.9 or newer");
     auto bits    = GENERATE(8, 4, 2);
     auto scaling = GENERATE(1, 2, 3);  // global, block, block followed by global
     auto bf16    = GENERATE(false, true);
-    CAPTURE(bits, scaling, bf16, load_mode);
+    CAPTURE(bits, scaling, bf16);
     constexpr int64_t m = 37, k = 83, n = 75, lda = 88, block_k = 24, block_n = 20;
-    constexpr int64_t blocks_n     = (n + block_n - 1) / block_n;
-    constexpr int64_t scale_count  = ((k + block_k - 1) / block_k) * blocks_n;
-    const int64_t row_stride_bytes = ((n + 63) / 64 * (64 * bits / 8) + 31) / 32 * 32;
-    int64_t byte_count             = load_mode ? k * row_stride_bytes : (k * n * bits + 7) / 8;
-    auto dtype                     = bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
-    auto encode                    = [bf16](float x) -> unsigned short {
+    constexpr int64_t blocks_n    = (n + block_n - 1) / block_n;
+    constexpr int64_t scale_count = ((k + block_k - 1) / block_k) * blocks_n;
+    int64_t byte_count            = (k * n * bits + 7) / 8;
+    auto dtype                    = bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
+    auto encode                   = [bf16](float x) -> unsigned short {
         return bf16 ? __bfloat16_as_ushort(__float2bfloat16(x)) : __half_as_ushort(__float2half(x));
     };
     auto to_float = [bf16](unsigned short x) -> float {
@@ -149,16 +92,8 @@ TEST_CASE("Custom weight dequantization matmul", "[matmul][weight_dequantize][gr
                                          .set_dim({1, 1, 1})
                                          .set_stride({1, 1, 1})
                                          .set_data_type(fe::DataType_t::FLOAT));
-    auto program      = fe::graph::Weight_dequantize_program()
-                       .set_source(load_mode ? managed_source : source)
-                       .set_entry("decode")
-                       .set_constants({bits, scaling, block_k, block_n});
-    if (load_mode)
-        program.set_abi_version(2)
-            .set_load_mode(load_mode)
-            .set_storage_bits(bits)
-            .set_row_stride_bytes(row_stride_bytes)
-            .set_input_alignment(32);
+    auto program      = fe::graph::Weight_dequantize_program().set_source(source).set_entry("decode").set_constants(
+        {bits, scaling, block_k, block_n});
     // No decoder scratch is necessary for these conversions. The logical B is
     // virtual: the engine produces tiles directly in shared memory for MMA.
     auto b =
@@ -196,10 +131,9 @@ TEST_CASE("Custom weight dequantization matmul", "[matmul][weight_dequantize][gr
     std::vector<int> original(k * n);
     std::vector<uint8_t> bytes(byte_count, 0);
     for (int64_t i = 0; i < k * n; ++i) {
-        original[i]             = int((i * 13 + i / 7) % (1 << bits)) - (1 << (bits - 1));
-        unsigned code           = unsigned(original[i]) & ((1u << bits) - 1);
-        const int64_t bit_index = load_mode ? (i / n) * row_stride_bytes * 8 + (i % n) * bits : i * bits;
-        bytes[bit_index / 8] |= code << (bit_index % 8);
+        original[i]   = int((i * 13 + i / 7) % (1 << bits)) - (1 << (bits - 1));
+        unsigned code = unsigned(original[i]) & ((1u << bits) - 1);
+        bytes[i * bits / 8] |= code << ((i * bits) % 8);
     }
     Surface<unsigned short> a_gpu(a_host.size(), 0);
     Surface<uint8_t> w_gpu(bytes.size(), 0);
@@ -236,5 +170,96 @@ TEST_CASE("Custom weight dequantization matmul", "[matmul][weight_dequantize][gr
                 REQUIRE(std::abs(double(value) - expected) <= 0.005 + 0.005 * std::abs(expected));
             }
     }
+#endif
+}
+
+// Original ggml blocks: decoder owns every load, including embedded scales and
+// the IQ1_S grid. These examples do not repack or materialize a dense B tensor.
+TEST_CASE("Custom weight dequantization ggml blocks", "[matmul][weight_dequantize][graph]") {
+    namespace fe = cudnn_frontend;
+#if !defined(CUDNN_WEIGHT_DECODE_ABI_VERSION) || CUDNN_WEIGHT_DECODE_ABI_VERSION < 1
+    SKIP("Build with the experimental weight-dequantization backend headers");
+#else
+    if (get_compute_capability() != 120) SKIP("Prototype supports SM120 only");
+    cudnnBackendDescriptor_t probe = nullptr;
+    if (cudnnBackendCreateDescriptor(CUDNN_BACKEND_WEIGHT_DECODE_DESCRIPTOR, &probe) != CUDNN_STATUS_SUCCESS)
+        SKIP("Runtime library lacks experimental weight-dequantization descriptors");
+    REQUIRE(cudnnBackendDestroyDescriptor(probe) == CUDNN_STATUS_SUCCESS);
+    auto format     = GENERATE(4, 6, 1);  // Q4_K, Q6_K, IQ1_S
+    auto bf16       = GENERATE(false, true);
+    auto identity   = GENERATE(false, true);
+    const int64_t m = identity ? 256 : 37, k = identity ? 256 : 515, n = identity ? 64 : 75;
+    const int64_t lda = (k + 7) / 8 * 8;
+    CAPTURE(format, bf16, identity);
+    GgmlWeightFixture fixture(format, k, n);
+    auto dtype = bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
+    auto round = [bf16](float x) -> float {
+        return bf16 ? __bfloat162float(__float2bfloat16(x)) : __half2float(__float2half(x));
+    };
+    fe::graph::Graph graph;
+    graph.set_io_data_type(dtype).set_intermediate_data_type(dtype).set_compute_data_type(fe::DataType_t::FLOAT);
+    auto vector = [&](int64_t uid, int64_t count, fe::DataType_t type) {
+        return graph.tensor(fe::graph::Tensor_attributes()
+                                .set_uid(uid)
+                                .set_dim({1, 1, count})
+                                .set_stride({count, count, 1})
+                                .set_data_type(type));
+    };
+    auto w = vector(2, fixture.packed.size(), fe::DataType_t::UINT8);
+    w->set_alignment(1);
+    std::vector<std::shared_ptr<fe::graph::Tensor_attributes> > aux;
+    if (format == 1) aux.push_back(vector(5, fixture.codebook.size(), fe::DataType_t::FLOAT));
+    // Bytewise field reads permit an unaligned packed base. The FLOAT grid
+    // still requires natural alignment, which the engine checks separately.
+    auto program = fe::graph::Weight_dequantize_program()
+                       .set_source(ggml_decode_source)
+                       .set_entry("decode")
+                       .set_constants({format})
+                       .set_input_alignment(1);
+    auto b = graph.weight_dequantize(w, aux, fe::graph::Weight_dequantize_attributes().set_program(program));
+    b->set_dim({1, k, n}).set_data_type(dtype);
+    auto a = graph.tensor(fe::graph::Tensor_attributes().set_uid(1).set_dim({1, m, k}).set_stride({m * lda, lda, 1}));
+    auto c = graph.matmul(a, b, fe::graph::Matmul_attributes());
+    c->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_uid(4);
+    REQUIRE(graph.validate().is_good());
+    auto owner = create_cudnn_handle();
+    REQUIRE(graph.build_operation_graph(*owner).is_good());
+    REQUIRE(graph.create_execution_plan(10, {}).is_good());
+    REQUIRE(graph.check_support().is_good());
+    REQUIRE(graph.build_plans().is_good());
+    REQUIRE(graph.get_workspace_size() == 0);
+    std::vector<unsigned short> ah(m * lda, 0);
+    std::vector<float> af(m * k);
+    for (int64_t r = 0; r < m; ++r)
+        for (int64_t j = 0; j < k; ++j) {
+            float value   = identity ? float(r == j) : float((r * 7 + j * 3) % 17 - 8) / 16;
+            af[r * k + j] = round(value);
+            ah[r * lda + j] =
+                bf16 ? __bfloat16_as_ushort(__float2bfloat16(value)) : __half_as_ushort(__float2half(value));
+        }
+    for (auto& value : fixture.expected) value = round(value);
+    Surface<unsigned short> ag(ah.size(), 0);
+    Surface<uint8_t> wg(fixture.packed.size() + 1, 0);
+    Surface<float> grid(fixture.codebook.size(), 0), cg(m * n, 0);
+    CUDA_CHECK(cudaMemcpy(ag.devPtr, ah.data(), ah.size() * 2, cudaMemcpyHostToDevice));
+    // Deliberately offset the allocation: no engine-imposed vector-load alignment.
+    CUDA_CHECK(cudaMemcpy(wg.devPtr + 1, fixture.packed.data(), fixture.packed.size(), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(grid.devPtr, fixture.codebook.data(), fixture.codebook.size() * 4, cudaMemcpyHostToDevice));
+    std::unordered_map<int64_t, void*> bindings{{1, ag.devPtr}, {2, wg.devPtr + 1}, {4, cg.devPtr}};
+    if (format == 1) bindings[5] = grid.devPtr;
+    REQUIRE(graph.execute(*owner, bindings, nullptr).is_good());
+    std::vector<float> actual(m * n);
+    CUDA_CHECK(cudaMemcpy(actual.data(), cg.devPtr, actual.size() * 4, cudaMemcpyDeviceToHost));
+    for (int64_t r = 0; r < m; ++r)
+        for (int64_t col = 0; col < n; ++col) {
+            double expected = 0;
+            for (int64_t j = 0; j < k; ++j) expected += double(af[r * k + j]) * fixture.expected[j * n + col];
+            const float value = actual[r * n + col];
+            REQUIRE(std::isfinite(value));
+            if (identity)
+                REQUIRE(value == expected);
+            else
+                REQUIRE(std::abs(double(value) - expected) <= 0.005 + 0.005 * std::abs(expected));
+        }
 #endif
 }

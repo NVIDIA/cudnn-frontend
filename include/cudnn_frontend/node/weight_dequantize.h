@@ -34,25 +34,15 @@ class WeightDequantizeNode : public NodeCRTP<WeightDequantizeNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(!valid_entry,
                                        error_code_t::INVALID_VALUE,
                                        "Weight dequantization entry must be an unqualified ASCII identifier");
-        RETURN_CUDNN_FRONTEND_ERROR_IF((p.abi_version != 1 && p.abi_version != 2) || p.tile_shape.size() != 2 ||
-                                           p.tile_shape[0] <= 0 || p.tile_shape[1] <= 0,
-                                       error_code_t::INVALID_VALUE,
-                                       "Invalid weight dequantization ABI or tile shape");
-        RETURN_CUDNN_FRONTEND_ERROR_IF(p.cta_smem_bytes < 0 || p.cta_smem_bytes > 1024 * 1024 ||
-                                           p.stage_smem_bytes < 0 || p.stage_smem_bytes > 1024 * 1024 ||
-                                           p.input_alignment <= 0 || p.input_alignment > 256 ||
-                                           (p.input_alignment & (p.input_alignment - 1)) || p.constants.size() > 64,
-                                       error_code_t::INVALID_VALUE,
-                                       "Invalid weight dequantization resources or constants");
         RETURN_CUDNN_FRONTEND_ERROR_IF(
-            p.load_mode < 0 || p.load_mode > 2 ||
-                (p.abi_version == 1 && (p.load_mode || p.storage_bits || p.row_stride_bytes)) ||
-                (p.abi_version == 2 &&
-                 (p.load_mode == 0 || (p.storage_bits != 2 && p.storage_bits != 4 && p.storage_bits != 8) ||
-                  p.row_stride_bytes <= 0 || p.row_stride_bytes > INT32_MAX || p.row_stride_bytes % 32 ||
-                  p.input_alignment < 32)),
+            p.abi_version != 1 || p.tile_shape.size() != 2 || p.tile_shape[0] <= 0 || p.tile_shape[1] <= 0,
             error_code_t::INVALID_VALUE,
-            "Managed loads require ABI 2, mode TMA_BULK or VECTOR_256, 2/4/8 bits, and 32-byte aligned rows/inputs");
+            "Invalid weight dequantization ABI or tile shape");
+        RETURN_CUDNN_FRONTEND_ERROR_IF(p.cta_smem_bytes != 0 || p.stage_smem_bytes != 0 || p.input_alignment <= 0 ||
+                                           p.input_alignment > 256 || (p.input_alignment & (p.input_alignment - 1)) ||
+                                           p.constants.size() > 64,
+                                       error_code_t::INVALID_VALUE,
+                                       "Milestone 1 requires zero decoder scratch and valid alignment/constants");
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.auxiliary_count < 0 || attributes.auxiliary_count > 8,
                                        error_code_t::INVALID_VALUE,
                                        "Weight dequantization accepts zero to eight auxiliaries");
@@ -78,30 +68,12 @@ class WeightDequantizeNode : public NodeCRTP<WeightDequantizeNode> {
                 y->get_dim()[1] > INT32_MAX || y->get_dim()[2] > INT32_MAX,
             error_code_t::INVALID_VALUE,
             "Set the logical weight shape [1,K,N] explicitly; it cannot be inferred from bytes");
-        if (p.load_mode != 0) {
-            auto const& w             = attributes.inputs.at(Weight_dequantize_attributes::input_names::WEIGHTS);
-            auto const& dim           = w->get_dim();
-            auto const& stride        = w->get_stride();
-            const int64_t minimum_row = ((y->get_dim()[2] + 63) / 64 * (64 * p.storage_bits / 8) + 31) / 32 * 32;
-            RETURN_CUDNN_FRONTEND_ERROR_IF(
-                dim.size() != 3 || dim[0] != 1 || dim[1] != 1 || dim[2] <= 0 || stride.size() != 3 || stride[2] != 1 ||
-                    stride[1] < dim[2] || stride[0] < stride[1] ||
-                    (w->get_data_type() != DataType_t::UINT8 && w->get_data_type() != DataType_t::INT8) ||
-                    p.row_stride_bytes < minimum_row || y->get_dim()[1] > dim[2] / p.row_stride_bytes,
-                error_code_t::INVALID_VALUE,
-                "Managed weight storage must be a byte vector containing every padded K row");
-        }
         return {error_code_t::OK, ""};
     }
 
     error_t
     infer_properties_node() override final {
         attributes.fill_from_context(context);
-        // input_alignment is an explicit caller promise for all physical inputs.
-        // Carry it into backend tensor descriptors as well as the program; the
-        // backend checks actual variant-pack addresses on every execution.
-        for (auto const& input : attributes.inputs)
-            input.second->set_alignment(std::max(input.second->get_alignment(), attributes.program.input_alignment));
         auto y          = attributes.outputs.at(Weight_dequantize_attributes::output_names::Y);
         auto const& dim = y->get_dim();
         if (y->get_stride().empty()) y->set_stride({dim[1] * dim[2], dim[2], 1});
@@ -133,11 +105,6 @@ class WeightDequantizeNode : public NodeCRTP<WeightDequantizeNode> {
         NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(
             92800,
             (error_t{error_code_t::GRAPH_NOT_SUPPORTED, "Weight dequantization requires the prototype backend"}));
-#if CUDNN_WEIGHT_DECODE_ABI_VERSION < 2
-        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.program.abi_version == 2,
-                                       error_code_t::GRAPH_NOT_SUPPORTED,
-                                       "Managed weight loads require CUDNN_WEIGHT_DECODE_ABI_VERSION >= 2 headers");
-#endif
         auto program = make_shared_backend_pointer(CUDNN_BACKEND_WEIGHT_DECODE_DESCRIPTOR);
         RETURN_CUDNN_FRONTEND_ERROR_IF(!program->is_good(),
                                        error_code_t::GRAPH_NOT_SUPPORTED,
@@ -159,16 +126,6 @@ class WeightDequantizeNode : public NodeCRTP<WeightDequantizeNode> {
             set(CUDNN_ATTR_WEIGHT_DECODE_STAGE_SMEM_BYTES, CUDNN_TYPE_INT64, 1, &p.stage_smem_bytes));
         _CUDNN_CHECK_CUDNN_ERROR(
             set(CUDNN_ATTR_WEIGHT_DECODE_INPUT_ALIGNMENT, CUDNN_TYPE_INT64, 1, &p.input_alignment));
-#if CUDNN_WEIGHT_DECODE_ABI_VERSION >= 2
-        // Do not send new attributes for ABI 1: old prototype libraries still
-        // support that unchanged contract, even with newer frontend headers.
-        if (p.abi_version == 2) {
-            _CUDNN_CHECK_CUDNN_ERROR(set(CUDNN_ATTR_WEIGHT_DECODE_LOAD_MODE, CUDNN_TYPE_INT64, 1, &p.load_mode));
-            _CUDNN_CHECK_CUDNN_ERROR(set(CUDNN_ATTR_WEIGHT_DECODE_STORAGE_BITS, CUDNN_TYPE_INT64, 1, &p.storage_bits));
-            _CUDNN_CHECK_CUDNN_ERROR(
-                set(CUDNN_ATTR_WEIGHT_DECODE_ROW_STRIDE_BYTES, CUDNN_TYPE_INT64, 1, &p.row_stride_bytes));
-        }
-#endif
         if (!p.constants.empty())
             _CUDNN_CHECK_CUDNN_ERROR(
                 set(CUDNN_ATTR_WEIGHT_DECODE_CONSTANTS, CUDNN_TYPE_INT64, p.constants.size(), p.constants.data()));

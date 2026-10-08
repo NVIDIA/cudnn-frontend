@@ -3090,42 +3090,22 @@ class Weight_dequantize_program {
     std::string entry;
     int64_t abi_version             = 1;
     std::vector<int64_t> tile_shape = {32, 64};
-    int64_t cta_smem_bytes          = 0;
-    int64_t stage_smem_bytes        = 0;
-    int64_t input_alignment         = 16;
+    // Reserved at zero in milestone 1; packed weights and metadata are loaded by the decoder.
+    int64_t cta_smem_bytes   = 0;
+    int64_t stage_smem_bytes = 0;
+    int64_t input_alignment  = 16;
     std::vector<int64_t> constants;
-    // Physical transport only; customer source still defines numerical meaning.
-    static constexpr int64_t DECODER = 0, TMA_BULK = 1, VECTOR_256 = 2;
-    int64_t load_mode = DECODER, storage_bits = 0, row_stride_bytes = 0;
 #ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(Weight_dequantize_program,
-                                                source,
-                                                entry,
-                                                abi_version,
-                                                tile_shape,
-                                                cta_smem_bytes,
-                                                stage_smem_bytes,
-                                                input_alignment,
-                                                constants,
-                                                load_mode,
-                                                storage_bits,
-                                                row_stride_bytes)
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Weight_dequantize_program,
+                                   source,
+                                   entry,
+                                   abi_version,
+                                   tile_shape,
+                                   cta_smem_bytes,
+                                   stage_smem_bytes,
+                                   input_alignment,
+                                   constants)
 #endif
-    Weight_dequantize_program&
-    set_load_mode(int64_t value) {
-        load_mode = value;
-        return *this;
-    }
-    Weight_dequantize_program&
-    set_storage_bits(int64_t value) {
-        storage_bits = value;
-        return *this;
-    }
-    Weight_dequantize_program&
-    set_row_stride_bytes(int64_t value) {
-        row_stride_bytes = value;
-        return *this;
-    }
     Weight_dequantize_program&
     set_source(std::string const& value) {
         source = value;
