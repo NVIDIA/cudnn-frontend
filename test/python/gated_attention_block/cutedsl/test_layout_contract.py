@@ -402,6 +402,23 @@ def test_qkvg_from_hf_equals_build_fused_qkvg_weight_per_head_bitwise():
     assert torch.equal(w_qkvg, build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head"))
 
 
+def test_per_head_split_takes_a_non_contiguous_q_proj_weight():
+    """A column-sliced shard or a transposed view of ``q_proj.weight`` is a legitimate load-time input: the per-head
+    ``view(H_q, 2*D, d_model)`` only SPLITS the row axis, which is stride-agnostic (a split dimension inherits the
+    parent's stride; only a MERGE across non-contiguous dimensions would need ``.reshape``), so neither form needs
+    ``.contiguous()`` first and both give the contiguous result bitwise -- through the assembler and through the loader."""
+    g = GEOM_SMALL
+    w_qg, w_k, w_v = _small_hf_weights(g)
+    ref = build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head")
+    transposed = w_qg.t().contiguous().t()  # strides (1, rows)
+    sliced = torch.cat([w_qg, w_qg], dim=1)[:, : g.d_model]  # a column slice of a wider tensor
+    w_n = torch.zeros(g.d_head)
+    for w in (transposed, sliced):
+        assert not w.is_contiguous() and torch.equal(w, w_qg)
+        assert torch.equal(build_fused_qkvg_weight(w, w_k, w_v, g, q_gate_layout="per_head"), ref)
+        assert torch.equal(qkvg_from_hf(w, w_k, w_v, w_n, w_n, g, act_dtype=torch.float32)[0], ref)
+
+
 @pytest.mark.parametrize("offset", [0.0, 1.0])
 def test_qkvg_from_hf_norm_form_is_derived_from_the_geometry(offset):
     """fp32, both offsets: the block's multiply by the handed weight equals the model's ``(1 + w)`` RMSNorm bitwise
