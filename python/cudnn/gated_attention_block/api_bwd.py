@@ -253,8 +253,8 @@ constants for the same reason.  Declined (typed, at declaration, naming the
 attribute): an ``MxQuantSpec`` (the MXFP8 backward is a follow-up), e5m2 codes,
 an fp16 ``dy`` (the quantized backward is bf16), the record's ``h`` or the weights
 in the wrong dtype BOTH ways, ``thd=True`` with ``quant`` (dense-only for now:
-the fp8 row's packed chain takes no external delta -- a THD arm follows once the
-gate backward emits the packed delta), and a geometry whose Q / K rebuild only
+the block's packed fp8 arm -- the row's THD chain reading the gate backward's
+packed bf16 delta -- is a follow-up), and a geometry whose Q / K rebuild only
 the LDG norm + RoPE kernel can tile (the fused prologue runs the TMA kernel, whose
 ``tile_rows`` must divide ``h_q``, be a multiple of ``h_kv`` and of its 4 warps --
 nothing in 1..16 does for ``h_q = 20`` MHA or ``h_q = 6`` over ``h_kv = 2``;
@@ -394,8 +394,8 @@ is the launch order):
   and the workspace delta are below and in :meth:`GatedAttentionBlockBwd.get_workspace_size`.
 
 Declined (typed, naming the attribute) on top of the fp8 arm's: an e5m2 ``dtype``,
-``thd=True`` with an MxQuantSpec (dense-only: the row's packed chain takes no external
-delta, and no packed MXFP8 record exists), ``B*S % 32 != 0`` when a projection weight
+``thd=True`` with an MxQuantSpec (dense-only: no packed MXFP8 training record exists, and the
+SDPA-layout MX quantizes are dense-only), ``B*S % 32 != 0`` when a projection weight
 gradient is requested, ``scale_dp`` / ``scale_do`` / ``scale_dqkvg`` at ``execute``, an
 artifact given without its need or a need without its artifact, a ``.t()``-view
 artifact, a wrong blob byte count or dtype, an artifact in the wrong dtype for its
@@ -486,6 +486,7 @@ shipped default), ``g`` under the per-group-member twin; all ``need_*`` True)::
                                           fuse_gate_bwd: no dot_do_o (external_delta) -> 2 + c*(2+q)
                                           thd: the packed chain -- 2 + c*(2 + 2*(1+q)) + dkv_reduce (g > 1): setup + dot_do_o + c x [the main kernel's own setup + main + (descriptor patch + GEMM) x (1 + q)]
                                           thd + fuse_gate_bwd: 1 + c*(2 + 2*(1+q)) + dkv_reduce (g > 1) -- no dot_do_o (the gate backward's delta at s = T IS the packed one)
+                                          (MEASURED: 17 kernels at the test geometry, three sequences -- the 18 below less dot_do_o)
                                           [+ 1 zero-fill on the untrimmed / wide-tile twins only]; no pads, no fold copy-outs
                                           (MEASURED: 18 kernels for the whole backward at the test geometry, three sequences)
     7   B5+B6 qk_norm_rope_bwd          1
