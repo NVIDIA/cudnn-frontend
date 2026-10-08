@@ -391,12 +391,18 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   unfused pipeline (`QuantSpec`; inference and training -- a packed FP8 training forward writes the same bf16 record at
   `(1, T)` as the dense quantized training forward, with `saved.h` the e4m3 `h`; the packed per-tensor fp8 backward
   (`quant=QuantSpec`) differentiates it as written, the packed bf16 backward given the dequantized bf16 `h` and weights,
-  exactly as on the dense side), `fuse_norm_rope` (bf16 /
-  fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined, typed:
-  `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
-  stage (5) runs as its own launch), MXFP8 and the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale
-  quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid), the fully fused quantized
-  pipelines.
+  exactly as on the dense side), the MXFP8 unfused
+  pipeline (`MxQuantSpec`, the fp4 modes `w_qkvg_dtype` / `o_fp4` included; inference and training, the same bf16 record
+  at `(1, T)`): its three `quantize_mxfp8` stages run their PACKED arm and write the Rubin d256 MXFP8 SDPA's
+  per-sequence-tile-padded scale-factor layout -- per head the tiles of every sequence in `cu_seqlens` order, V's two
+  D-planes adjacent inside a tile, the slot sized at the capacity `H * ((T + 127 * B) // 128) * 1024` bytes (the only
+  carve difference to the dense `B=1, S=T` block; slack tiles and pad bytes `0x00`), each tile's sequence resolved on
+  device from the lengths tensor (no cap on `B`; at `B = 1` the packed block is bitwise the dense one); `fuse_norm_rope`
+  (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined,
+  typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor; stage (5) runs as its own launch), the fully
+  fused quantized pipelines (`fuse_gate` again, and the fused MXFP8 projection fork decodes `(b, s_tile)` once per
+  128-row GEMM tile, which a packed tile may straddle), the MXFP8 block BACKWARD over a packed record (the row's packed
+  chain takes no external delta yet).
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
 
@@ -657,9 +663,8 @@ dS: two e4m3 payloads plus their E8M0 atoms, `2 + 2/32` bytes per element; under
 partials). Determinism: no atomic anywhere on the MXFP8 chain -- the one amax (`dY`) is a max over per-CTA partials, the row's GQA
 fold is a fixed-order reduce, the block-scale GEMMs are deterministic -- so two executes are bitwise equal under every knob set.
 `fuse_gate_bwd` is accepted and inert (the fused delta is mandatory); `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after
-the operands and blobs they read are written). Declined (typed, naming the attribute) on top of the per-tensor fp8 arm's: `thd=True` with an MxQuantSpec (dense-only; no packed
-MXFP8 training record exists and the SDPA-layout MX quantizes have no packed per-sequence arm -- the per-tensor fp8 backward is
-served packed), `B*S % 32 != 0` when a projection weight gradient is requested -- the weight-gradient GEMM contracts over the
+the operands and blobs they read are written). Declined (typed, naming the attribute) on top of the per-tensor fp8 arm's: `thd=True` with an MxQuantSpec (dense-only: the
+backward's SDPA-layout MX quantize stages run the quantizer's dense arm only; the packed MXFP8 record the forward writes and the packed head-major delta both exist, the packed MXFP8 backward is a follow-up -- the per-tensor fp8 backward is served packed), `B*S % 32 != 0` when a projection weight gradient is requested -- the weight-gradient GEMM contracts over the
 token axis through one E8M0 scale per 32-element K block, and the transposed quantize writes whole 32-token blocks -- (pass
 `need_dw_qkvg=False`, pad or batch the sequence to a multiple of 32, or run the per-tensor fp8 backward, whose weight gradients take
 no block scales; the data gradients `dh` / `dW_o` are served at any `T`), an artifact given without its need or a need without its
@@ -742,16 +747,17 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
   `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` is differentiated like any other record: the
   forward's SDPA row masks its KV tail in-kernel (#1520); causal covers the tail.
-- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward, inference and
-  training, and the per-tensor fp8 BACKWARD over its packed record as written (`quant=QuantSpec` with the packing knobs: the
-  fp8 SDPA row's THD chain reading the gate backward's packed delta, every other stage token-wise at `B = 1, S = T`); the packed
-  bf16 backward takes that record with the dequantized `h` and weights (a record handed to it with its e4m3 `h` is the same
-  typed decline as on the dense side, after the packed-length checks);
-  `fuse_norm_rope` (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
+- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 and MXFP8 unfused forwards (the
+  fp4 modes included), inference and training, and the per-tensor fp8 BACKWARD over its packed record as written
+  (`quant=QuantSpec` with the packing knobs: the fp8 SDPA row's THD chain reading the gate backward's packed delta, every
+  other stage token-wise at `B = 1, S = T`); the packed bf16 backward takes a packed quantized record with the dequantized
+  `h` and weights (a record handed to it with its e4m3 `h` is the same typed decline as on the dense side, after the
+  packed-length checks); `fuse_norm_rope` (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
   tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
-  `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, the packing knobs on a dense block.
+  `fuse_gate`, the fully fused quantized pipelines, `fuse_gate_bwd`, the quantized backwards over a packed record, the
+  packing knobs on a dense block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above), the fp4
   modes of the MXFP8 pipeline included; the fully fused quantized pipelines are inference only. The backward is bf16 / fp16
