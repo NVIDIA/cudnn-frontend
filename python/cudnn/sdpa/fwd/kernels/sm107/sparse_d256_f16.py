@@ -1043,7 +1043,10 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
 # chains); the bare ``cute.math.max`` default is ``arith.maxnumf`` = a compare + select pair per op (FSETP + FSEL), which was
 # 54 % of the executed softmax instructions on this body's decode twin.  Flushing denormal OPERANDS changes no result: the
 # column max of finite fp32 scores and the clamp ``min(ms_old - ms_new, 0)`` are the same number either way (a score below
-# 2^-126 in magnitude would read as 0 -- its exp2 is 1.0 under both spellings).
+# 2^-126 in magnitude would read as 0 -- its exp2 is 1.0 under both spellings).  MEASURED against the compare-select
+# spelling on a Rubin perf node (212 SMs, 2376 MHz lock, A/B/A x 3 rounds, control pairs <= 0.03 %): +13.4 / +13.4 / +13.5 %
+# at S = 8K / 32K / 128K on recorded layer lists (3369 -> 2971, 3301 -> 2910, 3288 -> 2896 clk per K + V tile pair), the
+# per-tile body -9.9 % (2894 -> 2607 clk steady state), the per-item fixed cost -21 %; O and LSE bitwise identical.
 @cute.jit
 def _warp_reduce_max(x):
     for off in cutlass.range_constexpr(5):
