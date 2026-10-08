@@ -415,7 +415,12 @@ _logger = logging.getLogger(__name__)
 # permutation of ``q_proj.weight``, and picking wrong is a silent wrong answer
 # -- so it is a parameter, checked by a round-trip test, never a hot-path
 # conversion either way, and an OMITTED layout (which still means "flat")
-# raises a ``DeprecationWarning`` rather than guessing silently.
+# emits a ``FutureWarning`` rather than guessing silently. FutureWarning, not
+# DeprecationWarning: CPython's default filters show a ``DeprecationWarning``
+# only to a ``__main__`` caller, so from a model loader living in a library
+# module -- where every serving stack's model file lives -- it would be
+# dropped unseen, and the wrong gate layout it announces is a finite,
+# plausible, silently wrong output.
 
 
 QKVG_TILE_ALIGN = 64
@@ -680,11 +685,14 @@ def build_fused_qkvg_weight(
         against the model you are loading rather than trusting a default.
 
         ``None`` (the default) is DEPRECATED: it still means ``"flat"`` so no
-        existing caller changes behaviour, but it raises a
-        ``DeprecationWarning`` -- every HF Qwen checkpoint from Qwen3-Next on
-        is ``"per_head"`` (``q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)``),
-        so the silent default was the trap the paragraph above describes.
-        Pass the layout explicitly, or load through :func:`qkvg_from_hf`.
+        existing caller changes behaviour, but it emits a ``FutureWarning``
+        -- the deprecation category Python shows under its default warning
+        filters, so a caller inside a library module sees it too, where a
+        ``DeprecationWarning`` is shown only to ``__main__``. Every HF Qwen
+        checkpoint from Qwen3-Next on is ``"per_head"``
+        (``q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)``), so the silent
+        default was the trap the paragraph above describes. Pass the layout
+        explicitly, or load through :func:`qkvg_from_hf`.
     """
     geometry.validate()
     d = geometry.d_head
@@ -703,7 +711,8 @@ def build_fused_qkvg_weight(
             "build_fused_qkvg_weight: q_gate_layout was not given and defaults to 'flat' (all Q heads, then all GATE heads). "
             "HF Qwen checkpoints from Qwen3-Next on split q_proj PER HEAD ([q_h | gate_h]): load those through qkvg_from_hf(...) "
             "or pass q_gate_layout='per_head'. The implicit default is deprecated; pass the layout explicitly.",
-            DeprecationWarning,
+            # FutureWarning, not DeprecationWarning: the default filters drop a DeprecationWarning raised from library code.
+            FutureWarning,
             stacklevel=2,
         )
         q_gate_layout = "flat"

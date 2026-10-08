@@ -441,11 +441,11 @@ def test_qkvg_from_hf_rejects():
 
 
 def test_build_fused_qkvg_weight_warns_when_q_gate_layout_is_omitted():
-    """The omitted layout still means "flat" (no caller changes behaviour) but is announced; an explicit layout and
-    the HF loader are silent."""
+    """The omitted layout still means "flat" (no caller changes behaviour) but is announced with a ``FutureWarning``;
+    an explicit layout and the HF loader are silent."""
     g = GEOM_SMALL
     w_qg, w_k, w_v = _small_hf_weights(g)
-    with pytest.warns(DeprecationWarning, match="q_gate_layout"):
+    with pytest.warns(FutureWarning, match="q_gate_layout"):
         implicit = build_fused_qkvg_weight(w_qg, w_k, w_v, g)
     assert torch.equal(implicit, build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="flat"))
     with warnings.catch_warnings():
@@ -453,6 +453,31 @@ def test_build_fused_qkvg_weight_warns_when_q_gate_layout_is_omitted():
         build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="flat")
         build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head")
         qkvg_from_hf(w_qg, w_k, w_v, torch.zeros(g.d_head), torch.zeros(g.d_head), g)
+
+
+def test_omitted_q_gate_layout_warning_is_shown_under_pythons_default_filters():
+    """The announcement has to reach a model loader that lives in a LIBRARY module -- a serving stack's model file is
+    never ``__main__``. CPython's default filter set shows a ``DeprecationWarning`` only when ``__main__`` is the
+    caller and silences every other one, so the omission is announced with a ``FutureWarning``, the deprecation
+    category meant for end users and shown under the defaults. Re-created in-process: the default filters, the call
+    from this (non-``__main__``) module, exactly one warning recorded -- and a ``DeprecationWarning`` emitted beside it
+    is dropped, which is what the record would have been had the warning kept that category."""
+    g = GEOM_SMALL
+    w_qg, w_k, w_v = _small_hf_weights(g)
+    assert __name__ != "__main__"
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.resetwarnings()
+        # CPython's defaults: default::DeprecationWarning:__main__, ignore::DeprecationWarning, ignore::PendingDeprecationWarning,
+        # ignore::ImportWarning, ignore::ResourceWarning; every other category takes the "default" (show once) action.
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
+        warnings.filterwarnings("ignore", category=ImportWarning)
+        warnings.filterwarnings("ignore", category=ResourceWarning)
+        warnings.filterwarnings("default", category=DeprecationWarning, module="__main__")
+        build_fused_qkvg_weight(w_qg, w_k, w_v, g)
+        warnings.warn("a DeprecationWarning from a library module is dropped by the same filters", DeprecationWarning, stacklevel=1)
+    assert [w.category for w in recorded] == [FutureWarning]
+    assert "q_gate_layout" in str(recorded[0].message)
 
 
 def test_rounding_of_a_zero_centered_norm_weight_handed_in_as_one_plus_w():

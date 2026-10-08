@@ -144,8 +144,8 @@ different function; the indexer and the sparse core are not part of the block to
   - **from three matrices with an explicit layout**: `build_fused_qkvg_weight(w_q_gate, w_k, w_v, geometry,
     q_gate_layout="per_head" | "flat")`. The layout is a property of the checkpoint and is not inferable from the
     tensor (`"flat"` = all Q heads, then all GATE heads); getting it wrong applies every gate to the wrong head with
-    no error anywhere. Omitting `q_gate_layout` still means `"flat"` but raises a `DeprecationWarning` -- pass it
-    explicitly.
+    no error anywhere. Omitting `q_gate_layout` still means `"flat"` but emits a `FutureWarning` (the deprecation
+    category Python shows under its default filters, so a loader in a library module sees it too) -- pass it explicitly.
 - `W_o [d_model, H_q * D]`.
 - `cos`, `sin` `[B, S, rope_dim]` rotary tables in the activation dtype (rotate-half convention on the first
   `rope_dim` dims of every head).
