@@ -38,6 +38,7 @@ from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_er
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import (
     SM100_THD_PACK_GQA_SHAPES,
+    decode_d256_q_tile,
     pack_gqa_supported,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
@@ -523,6 +524,33 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     # One offset width for every ragged operand (the kernels compile one read width).
     widths = {t.ragged_offset.get_data_type() for t in (facts.q_t, facts.o_t) + ((facts.stats_t,) if facts.stats_t is not None else ())}
     return len(widths) == 1
+
+
+def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", pack_g: int = 1) -> bool:
+    """Whether the f16/bf16 row lowers this graph onto the d256 DECODE tile -- the
+    swap-AB tile, ``sm100/decode_d256_f16.py`` on the Blackwell row and
+    ``sm107/decode_d256_f16.py`` on the Rubin row -- the facts-level twin of
+    ``SdpaFwdDslSm100._decode_q_tile`` (and of the heuristics' cost-model gate):
+    half inputs, dense (not THD) queries, the (256, 256) flavor, no fused epilogue
+    gate and no pre-folded scale (neither is wired on the decode tile), and
+    ``S_q x pack_g`` packed Q rows within the routed N extent
+    (``config_sm100.decode_d256_q_tile``; ``pack_g`` is the decode tile's WHOLE-group
+    packing when the plan packs, else 1).  Keep the three in lockstep."""
+    return (
+        capabilities.sm_lo in (100, 107)
+        and capabilities.sm_hi <= _BLACKWELL[1]
+        and not (facts.is_fp8 or facts.is_mxfp8)
+        and not facts.thd
+        and not facts.has_epilogue_gate
+        and not facts.attn_scale_prefolded
+        and _selected_d_shape(capabilities, facts) == (256, 256)
+        and decode_d256_q_tile(facts.s_q, pack_g) > 0
+    )
+
+
+def _decode_tile_pack_g(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> int:
+    """The decode tile's packing for a knob set: the whole GQA ratio when it packs, else 1."""
+    return (facts.h_q // facts.h_kv) if (knobs is not None and knobs.pack_gqa and facts.h_kv) else 1
 
 
 def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
@@ -1099,8 +1127,19 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             return "declare dim AND stride on the sdpa node's virtual O (set_dim/set_stride) -- the classic frontend requires it and FROST binds the mul output as O"
 
     if facts.has_paged_kv:
-        if capabilities.sm_lo == 107 and not capabilities.is_mxfp8 and not facts.thd:
-            return "Rubin paged KV requires THD queries (dense paged queries are not wired on cc 10.7)"
+        # The paged PREFILL pipeline on cc 10.7 is qualified for THD queries (with or without an
+        # attention sink -- the per-row sink fold); the d256 DECODE tile (sm107/decode_d256_f16.py)
+        # walks the block table itself and folds the sink per Q row, so a decode-shaped half d256
+        # graph is served paged whatever its THD-ness or sink.  Dense (non-THD) paged queries are
+        # otherwise not wired on cc 10.7; the MXFP8 row answers through its own flags above.
+        # api_dsl.check_support mirrors this (rule 8b).
+        if (
+            capabilities.sm_lo == 107
+            and not capabilities.is_mxfp8
+            and not facts.thd
+            and not d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs))
+        ):
+            return "Rubin paged KV requires THD queries or a decode-shaped half D256 graph (the decode tile); dense paged queries are not wired on cc 10.7 otherwise"
         # Served by the PAGED_KV specialization of the f16/bf16 kernels on the
         # flavors in paged_d_shapes and of the d128 per-tensor FP8 kernel (the
         # fp8 row's paged_d_shapes; config_sm100._validate_params mirrors these
@@ -1380,9 +1419,16 @@ def _sm107_spec() -> EngineSpec:
       issue #1472), D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD -- with or without an attention sink (the
       per-row epilogue fold; a keyless row stores O := 0 / LSE := sink) -- uses the
-      shared Blackwell paged pipeline, compiled natively for SM107.  Dense (non-THD)
-      paged queries stay declined; sink + split-KV stays declined row-wide (the
-      combine is not sink-aware), so a sink decode graph runs unsplit.
+      shared Blackwell paged pipeline, compiled natively for SM107; sink + split-KV stays
+      declined row-wide (the combine is not sink-aware), so a sink decode graph runs unsplit.
+      Dense (non-THD) paged queries stay declined EXCEPT a DECODE-shaped half d256 graph
+      (dense Q, ``S_q x G <= 16`` packed rows, sink or not), which rides the d256 decode
+      tile ``sm107/decode_d256_f16.py`` instead (``d256_decode_tile_selected``), which
+      walks the block table itself.
+    - ``decode``: stated, not inherited -- ``S_q == 1`` is served on every
+      flavor, and on d256 it is the decode tile above (the swap-AB body ported
+      from ``sm100/decode_d256_f16.py``; PackGQA at d256 and the dense split
+      stay declined on this row until they are validated on the tile).
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
       (the f16x2 arm is a quantized-kernel specialization).
     - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the
@@ -1429,6 +1475,7 @@ def _sm107_spec() -> EngineSpec:
             cu_seq_len=True,
             paged_kv=True,
             paged_d_shapes=frozenset({(128, 128), (256, 256)}),
+            decode=True,  # stated, not inherited: S_q == 1 is served; on d256 by the decode tile (see the docstring)
             # FLOAT only: the half kernels run the f32 exponent (a HALF request declines here, never
             # in the adapter); the pre-folded scale is a neutral arm of every half prefill body.
             softmax_precisions=frozenset({cudnn.data_type.FLOAT}),

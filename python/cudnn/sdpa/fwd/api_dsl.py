@@ -159,6 +159,13 @@ _D64_DECODE_TILE_ROWS = 128
 _SM100_DECODE_KERNEL_FILES = {
     (256, 256): "sm100/decode_d256_f16.py",
 }
+# The Rubin (cc 10.7) sibling of the d256 decode tile: the same swap-AB body under
+# config_sm107.make_cfg_d256_decode (the Rubin SMEM-carveout and descriptor-window
+# validators, the module's DESC_VERSION / SPIN_RING_WAITS constants).  Selected by the
+# same record field; _decode_q_tile routes both arch lines.
+_SM107_DECODE_KERNEL_FILES = {
+    (256, 256): "sm107/decode_d256_f16.py",
+}
 # DTYPE_* codes: E4M3=0, E5M2=1, BF16=2, FP16=3. FP8 inputs (0/1) route to the
 # FP8 kernel families; the output dtype is encoded the same way.
 _SM100_DTYPE_QKV_CODE = {
@@ -560,6 +567,11 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     and the shared d128 prefill body under PackGQA (issue #1472)."""
 
     tag = _flavor_tag(flavor)
+    if rubin and not fp8 and getattr(params, "decode_q_tile", 0):
+        # Decode-shaped d256 f16/bf16 graphs on cc 10.7: the Rubin twin of the swap-AB
+        # tile (the record field routes, exactly as on the SM100 arm below).  It serves
+        # the paged contract natively, so it precedes the shared paged-prefill arm.
+        return _load_kernel_template(_SM107_DECODE_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_decode_{tag}")
     if (
         rubin
         and not fp8
@@ -1824,8 +1836,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
             # other flavor / quantization keeps the full-ratio contract.
             _partial = not self._fp8 and self._device_cc != (10, 7) and self.flavor in _SM100_PARTIAL_PACK_GQA_FLAVORS
+            # The d256 DECODE tile packs the WHOLE group whenever it fits its 16-row Q
+            # tile (HEADS_PER_TILE = QH_PER_KH; 24/2 puts its 12 heads in the tile, four
+            # tail rows zero-filled), so the prefill tiles' tile_m divisibility rule does
+            # not apply to a graph that lowers onto it (_decode_q_tile_for is non-zero
+            # exactly when S_q x G rows fit the routed tile).
             self._value_error_if(
-                not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial),
+                not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial) and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
                 f"PackGQA requires h_q/h_kv to {'share a factor with' if _partial else 'divide'} the kernel tile_m; got h_q/h_kv = {int(h_qo)}/{int(h_kv)}",
             )
         # Block-scaled O (sf_o): per-tensor FP8, d128 flavor, dense/unsplit/unpacked.
@@ -1969,10 +1986,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # (the shared SM100 bodies), MXFP8 pools serve dense queries on d128 / d256
             # (the sm107 siblings' own PAGED_KV loader); per-tensor FP8 pools and dense
             # half queries are not wired (engines.mismatch's Rubin clause is the twin).
+            # The d256 DECODE tile (sm107/decode_d256_f16.py) walks the block table itself and
+            # folds the sink per Q row, so a decode-shaped half d256 graph is served paged on
+            # cc 10.7 whatever its THD-ness or sink -- the same exception engines.mismatch makes
+            # (d256_decode_tile_selected); the paged PREFILL pipeline keeps its THD-only scope.
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
-                and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256))),
-                "Rubin paged KV serves half THD queries and MXFP8 pools on D128/D256 (per-tensor FP8 pools and dense half queries are not wired)",
+                and ((self._fp8 and self._pertensor) or (not self._fp8 and not self.thd) or self.flavor not in ((128, 128), (256, 256)))
+                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
+                "Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256, and decode-shaped half D256 graphs on the decode tile (per-tensor FP8 pools and other dense half queries are not wired)",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd,
@@ -2261,9 +2283,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._logger.debug("check_support completed successfully")
         return True
 
+    def _decode_q_tile_for(self, s_q: int, h_q: int, h_kv: int) -> int:
+        """:meth:`_decode_q_tile` on explicit shapes -- for ``check_support``, which
+        reads the sample shapes before it records ``s_q_max`` / ``h_q`` / ``h_kv``
+        (its Rubin paged gate admits the decode-shaped graph the decode tile serves)."""
+        if self._fp8 or self.thd or self.flavor != (256, 256):
+            return 0
+        if self.gate_desc is not None or self.softmax_scale_prefolded:
+            # Neither is wired on the decode tile (no gate seams; the scale is applied
+            # in-kernel): the d256 prefill kernel serves both (config_sm107's
+            # make_cfg_d256_decode declines such a record as the backstop).
+            return 0
+        pack_g = (int(h_q) // int(h_kv)) if self.pack_gqa else 1
+        return decode_d256_q_tile(int(s_q), pack_g)
+
     def _decode_q_tile(self) -> int:
         """N extent of the decode tile (config_sm100.decode_d256_q_tile) when this
-        plan lowers onto sm100/decode_d256_f16.py, else 0 (the prefill tile).
+        plan lowers onto the d256 decode tile -- sm100/decode_d256_f16.py on the
+        Blackwell line, sm107/decode_d256_f16.py on cc 10.7 -- else 0 (the prefill tile).
 
         A LOWERING choice, like the flavor pick: the decode tile serves the same
         graph contract as prefill_d256_f16 (paged / dense, padding, causal
@@ -2272,14 +2309,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         S_q x packed-heads rows fit the routed 16-wide N tile
         (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS: the 32-wide tile compiles
         but is issue-bound per CTA and stays unrouted); everything else (THD,
-        quantized, Rubin, larger S_q) stays on the prefill tile.  The
-        TILE_CGA_M / SCHED_POLICY knobs describe the prefill pipeline and are
-        no-ops here (one cta_group::1 CTA per unit, nothing to schedule).
+        quantized, larger S_q, the fused epilogue gate, the pre-folded scale)
+        stays on the prefill tile.  The TILE_CGA_M / SCHED_POLICY knobs describe
+        the prefill pipeline and are no-ops here (one cta_group::1 CTA per unit,
+        nothing to schedule).  engines.d256_decode_tile_selected is the
+        facts-level twin; keep the two in lockstep.
         """
-        if self._fp8 or self.thd or self.flavor != (256, 256) or self._device_cc == (10, 7):
-            return 0
-        pack_g = (self.h_q // self.h_kv) if self.pack_gqa else 1
-        return decode_d256_q_tile(self.s_q_max, pack_g)
+        return self._decode_q_tile_for(self.s_q_max, self.h_q, self.h_kv)
 
     def _d64_decode_tile(self) -> bool:
         """Whether this d64 plan lowers onto the 128-row decode tile.

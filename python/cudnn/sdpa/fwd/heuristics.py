@@ -80,6 +80,7 @@ from cudnn.sdpa.fwd.engines import (
     _selected_d_shape,
     _synth_kv_padding,
     _thd_decode_leg,
+    d256_decode_tile_selected,
     effective_cgas,
     effective_sched_policies,
     mismatch,
@@ -1245,20 +1246,14 @@ def _sm120_d512_windowed(caps: Capabilities, facts) -> bool:
 
 
 def _d256_decode_tile_selected(caps: Capabilities, facts, pack_g: int) -> bool:
-    """Whether the SM100 f16/bf16 row lowers this graph onto the d256 decode tile
-    (sm100/decode_d256_f16.py) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``:
-    the (256, 256) flavor, half inputs, dense (not THD), S_q x packed heads
-    within the tile's N extent, ``pack_g`` being the DECODE tile's group
-    (:func:`_decode_tile_pack_g`).  Rubin has its own row (no d256 decode tile)."""
-    return (
-        caps.sm_lo == 100
-        and caps.sm_hi < 107
-        and not facts.is_fp8
-        and not facts.is_mxfp8
-        and not facts.thd
-        and _selected_d_shape(caps, facts) == (256, 256)
-        and decode_d256_q_tile(facts.s_q, pack_g) > 0
-    )
+    """Whether the f16/bf16 row lowers this graph onto the d256 decode tile
+    (sm100/decode_d256_f16.py on the Blackwell row, sm107/decode_d256_f16.py on
+    the Rubin row) -- the twin of ``SdpaFwdDslSm100._decode_q_tile``: the
+    (256, 256) flavor, half inputs, dense (not THD), no gate / pre-folded scale,
+    S_q x packed heads within the tile's N extent, ``pack_g`` being the DECODE
+    tile's group (:func:`_decode_tile_pack_g`).  ONE definition for the three
+    consumers: ``engines.d256_decode_tile_selected``."""
+    return d256_decode_tile_selected(caps, facts, pack_g)
 
 
 def _decode_tile_pack_g(facts, pack_g: int) -> int:
@@ -1284,9 +1279,16 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int) -> bool:
     THD prefill packs only on a flavor advertising token-unit worklists and
     packed-head Stats stores; the decode tile's ragged-Q leg remains separate.
     cc 10.7 half packs dense D128 on the shared SM100 bodies (issue #1472); its
-    other nonpaged half graphs stay unpacked."""
+    other nonpaged half graphs stay unpacked.
+    The row's per-flavor wiring (``pack_gqa_d_shapes``) is honoured here as
+    ``mismatch()`` honours it: a packed proposal on a flavor the row keeps
+    unpacked would only be declined there, and when the base leg is a split the
+    unpacked alternative is never emitted, so the engine would offer NOTHING
+    (the Rubin half row at d256, once its paged decode-shaped graphs reached
+    the heuristics)."""
     return (
         True in caps.pack_gqas
+        and (caps.pack_gqa_d_shapes is None or _selected_d_shape(caps, facts) in caps.pack_gqa_d_shapes)
         and not (caps.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and not facts.has_paged_kv and not rubin_dense_d128_shared_leg(caps, facts))
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not facts.has_epilogue_gate
