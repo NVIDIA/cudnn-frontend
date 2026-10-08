@@ -2601,6 +2601,11 @@ class CfgD64Decode(CfgD64):
     QO_ALIAS: int = 1
 
     TILES_Q: int = 1
+    # Three 16 KiB K + 16 KiB V stages (96 KiB of KV in flight).  Six -- the
+    # d128 tile's 192 KiB -- was measured 2026-10-08 on a b=128 x 128k-key
+    # gpt-oss decode: B200 6.37 -> 6.19 ms (-3 %) but B300 4.99 -> 5.70 ms
+    # (+14 %), so the narrow tile keeps 3; B200's 66 % of HBM against B300's
+    # 86 % on this shape is not a ring-depth problem.
     STAGES_KV: int = 3
 
     SOFTMAX_WARPGROUPS: int = 1

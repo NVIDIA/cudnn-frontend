@@ -16,7 +16,7 @@ import pytest
 
 from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
 from frost_test_utils import requires_dsl
-from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_decode_tile_split_kv, choose_split_kv, split_kv_candidates
+from cudnn.sdpa.fwd.heuristics import _SERIAL_COMBINE_MIN_SQ, _SPLIT_KV_MIN_TILES, choose_decode_tile_split_kv, choose_split_kv, split_kv_candidates
 
 # Pure arithmetic — no device, no kernel build — so every case is L0.
 pytestmark = pytest.mark.L0
@@ -526,6 +526,79 @@ def test_lone_combine_blocks_pay_the_latency_floor():
     assert _SPLIT_KV_COMBINE_FLOOR <= -(-(_FIT_S_Q * 4) // B200_SMS) * _SPLIT_KV_COMBINE_COST
 
 
+# d128 cga1, 8/2 heads packed 4:1 (one 128-row Q tile for 16 queries, 2 KV-head
+# CTAs), the 16-query verify step of a speculative decode, 148 SMs.  Measured
+# with pinned splits on B200 after the serial combine's 16-deep walk, main +
+# combine in us:
+#   2048 keys:  split 4 12.5, split 8 11.8            (combine 3.4 / 4.1)
+#   8192 keys:  split 8 17.2, split 32 14.1           (combine 4.1 / 5.4)
+# Before the deep walk (0.27 us a split) the serial combine made split 32 at
+# 8192 keys 28 % slower than split 8 (19.0 against 14.8 us on B300).
+_SERIAL_Q16 = dict(q_tiles=1, heads_q=2, batch=1, sm_count=148, ctas_per_tile=1, combine_rows=16 * 8)
+
+
+def test_serial_combine_bounds_the_split_depth():
+    """S_q = 16 runs the serial combine, whose per-split latency the per-row
+    term cannot see.  With the term the long launch stays inside the measured
+    16-32 band and the short one keeps its measured split 8; the term is small
+    enough (the walk is 16 deep) not to push either below its optimum."""
+    assert choose_split_kv(kv_tiles=64, serial_combine=True, **_SERIAL_Q16) in (16, 32)
+    assert choose_split_kv(kv_tiles=16, serial_combine=True, **_SERIAL_Q16) == 8
+    # The per-row model alone never prices the walk: the term can only lower the pick.
+    assert choose_split_kv(kv_tiles=64, serial_combine=True, **_SERIAL_Q16) <= choose_split_kv(kv_tiles=64, **_SERIAL_Q16)
+
+
+def test_serial_combine_term_grows_with_kv_but_never_runs_away():
+    """Longer KV still earns more splits -- the main kernel's saving grows --
+    but the serial walk caps the depth below the 128-split pick the per-row
+    model made at 128k keys for a 3-query, 1-KV-head launch, where 64 and 128
+    splits measured alike (d64, B200: 27.4 us) and 32 lost (37.3 us)."""
+    tp8_q3 = dict(q_tiles=1, heads_q=1, batch=1, sm_count=148, ctas_per_tile=1, combine_rows=3 * 4)
+    got = [choose_split_kv(kv_tiles=-(-kv // 128), serial_combine=True, **tp8_q3) for kv in (8192, 32768, 131072)]
+    assert all(a <= b for a, b in zip(got, got[1:])), got
+    assert 32 <= got[-1] <= 64, got
+    assert choose_split_kv(kv_tiles=1024, **tp8_q3) > got[-1]
+
+
+def test_serial_combine_term_leaves_decode_and_saturated_launches_alone():
+    """The decode form (S_q <= 2) is priced by the per-row term alone, so the
+    flag must not move a one-row launch; and a launch already past the SM
+    count (b=128 x 8 KV-head CTAs) never split anyway, so the serial term
+    cannot change what it does."""
+    one_row = dict(q_tiles=1, heads_q=2, batch=1, kv_tiles=64, sm_count=148, ctas_per_tile=1, combine_rows=8)
+    assert choose_split_kv(**one_row) == choose_split_kv(serial_combine=False, **one_row)
+    full = dict(q_tiles=1, heads_q=8, batch=128, kv_tiles=64, sm_count=148, ctas_per_tile=1, combine_rows=16 * 32 * 128)
+    assert choose_split_kv(**full) == choose_split_kv(serial_combine=True, **full) == 1
+    # No combine runs at split 1, so the serial term never makes unsplit dearer.
+    assert choose_split_kv(kv_tiles=1, serial_combine=True, **_SERIAL_Q16) == 1
+
+
+def test_serial_combine_quantized_tile_pays_less_per_split():
+    """The per-tensor fp8 d128 tile is MMA-bound on a decode shape, ~3x the
+    bf16 decode tile's time per KV tile, so one split of serial combine is a
+    third as many tile units and the quantized pick is never below the bf16
+    one.  Pinned on tp8 b=1 q=3 at 128k keys (1 KV head, 1024 tiles): fp8
+    main 17 + combine 20 us at 64 splits against 46 us at 32 (B300)."""
+    from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_SERIAL_COMBINE_COST, _SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED
+
+    assert 0 < _SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED < _SPLIT_KV_SERIAL_COMBINE_COST
+    tp8_q3 = dict(q_tiles=1, heads_q=1, batch=1, kv_tiles=1024, sm_count=148, ctas_per_tile=1, combine_rows=3 * 8)
+    bf16 = choose_split_kv(serial_combine=True, **tp8_q3)
+    fp8 = choose_split_kv(serial_combine=True, serial_combine_cost=_SPLIT_KV_SERIAL_COMBINE_COST_QUANTIZED, **tp8_q3)
+    assert 32 <= bf16 <= fp8 == 64, (bf16, fp8)
+    assert fp8 <= choose_split_kv(**tp8_q3)
+
+
+@requires_dsl
+def test_serial_combine_threshold_matches_the_kernel_routing():
+    """The model's S_q threshold must be the one sm100/split_combine routes
+    on: ``SQ <= ROWS_PER_BLOCK // 2`` takes the decode form, everything above
+    the serial one."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    assert _SERIAL_COMBINE_MIN_SQ == split_combine.ROWS_PER_BLOCK // 2 + 1
+
+
 # --- the d256 decode tile's own model ----------------------------------------
 #
 # sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,
@@ -626,21 +699,49 @@ def test_decode_tile_batch_one_prices_every_partial_of_the_combine(monkeypatch):
     combine, 2376 MHz lock): kv 4K 16 (14.6 us), kv 32K 32 (24.1), kv 128K 64
     (41.6); 8 units (batch 4) x 128K 16 (96.8). Without the term the model took
     64 at kv 32K (26.0 us measured) and 64 at kv 128K with the old combine
-    (68.3 us against 61.1 at 32)."""
-    assert _decode_tile(2, 4096, sm_count=212) == 16
-    assert _decode_tile(2, 32768, sm_count=212) == 32
-    assert _decode_tile(2, 131072, sm_count=212) == 64
-    assert _decode_tile(8, 131072, sm_count=212) == 16
-    # the captured caller (no launch term) keeps the same splits at these shapes
-    assert _decode_tile(2, 32768, sm_count=212, launch_cost=0.0) == 32
-    assert _decode_tile(2, 131072, sm_count=212, launch_cost=0.0) == 64
-    # the per-partial term is what decides: with it at 0 the model runs to 64 at kv 32K and 128K (the flat per-wave combine price
-    # makes every finer split free once the loop term stops paying for it -- the 40 us combine measured behind a 12 us kernel)
+    (68.3 us against 61.1 at 32).  The cc 10.7 row prices every partial at that
+    measured rate whatever the combine's form (decode_tile_combine_per_partial); the
+    Blackwell line carries its own fit."""
     import cudnn.sdpa.fwd.heuristics as heur
 
+    def rubin(units, s_kv, **kw):
+        return _decode_tile(units, s_kv, sm_count=212, per_split=heur._DECODE_TILE_COMBINE_PER_PARTIAL, **kw)
+
+    assert rubin(2, 4096) == 16
+    assert rubin(2, 32768) == 32
+    assert rubin(2, 131072) == 64
+    assert rubin(8, 131072) == 16
+    # the captured caller (no launch term) keeps the same splits at these shapes
+    assert rubin(2, 32768, launch_cost=0.0) == 32
+    assert rubin(2, 131072, launch_cost=0.0) == 64
+    # the per-partial term is what decides: with it at 0 the model runs to 64 at kv 32K and 128K (the flat per-wave combine price
+    # makes every finer split free once the loop term stops paying for it -- the 40 us combine measured behind a 12 us kernel)
     monkeypatch.setattr(heur, "_DECODE_TILE_COMBINE_PER_PARTIAL", 0.0)
-    assert _decode_tile(2, 32768, sm_count=212) == 64
-    assert _decode_tile(2, 131072, sm_count=212) == 64
+    assert rubin(2, 32768) == 64
+    assert rubin(2, 131072) == 64
+
+
+def test_decode_tile_serial_combine_bounds_the_split_depth():
+    """One KV head at 128k keys (1024 tiles, 1 unit): with no per-split term the
+    model took 128 splits at every S_q.  At S_q >= 3 the serial combine pays
+    ~0.45 us a split, so the 128-split pass alone was ~60 of the measured 72 us
+    (qwen3.5-tp8 b=1 q=4 on B300, 1.5x behind the best flashinfer backend).
+    The serial term caps it; the decode form's smaller term still lets the
+    one-row launch split deep, and the saturated serving shape is untouched."""
+    serial = _decode_tile(1, 131072, serial_combine=True)
+    decode = _decode_tile(1, 131072)
+    assert serial <= 64, serial
+    assert decode >= serial, (decode, serial)
+    assert decode >= 32, decode
+    assert _decode_tile(64, 4096, serial_combine=True) == 1
+    assert _decode_tile(2, 2048, serial_combine=True) == _decode_tile(2, 2048) == 8
+
+
+@pytest.mark.parametrize("units", [1, 2, 8])
+def test_decode_tile_serial_combine_never_splits_more(units):
+    """Pricing the serial walk can only lower the split, never raise it."""
+    for s_kv in (2048, 8192, 32768, 131072):
+        assert _decode_tile(units, s_kv, serial_combine=True) <= _decode_tile(units, s_kv)
 
 
 def test_decode_tile_degenerate_inputs_do_not_split():
