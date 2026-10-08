@@ -1386,7 +1386,7 @@ def _sm107_fp8_spec() -> EngineSpec:
     amax folds on them, so the adapter serves ``seq_kv_lens_present=True`` +
     ``execute(seq_kv_lens=)`` on the standalone surface (the K / V rows past a length
     must be finite), and takes a caller's TRUE-unit delta under ``external_delta=True``
-    (dense plans; ``api_dsl_sm107`` module doc).
+    (dense and THD plans; ``api_dsl_sm107`` module doc).
 
     THD / ragged is served on the packed path exactly as on the half row (the same
     kv-blocked workspace, metadata, claim counter and per-sequence clipped stores, in

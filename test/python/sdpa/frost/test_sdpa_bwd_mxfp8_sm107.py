@@ -2611,7 +2611,8 @@ def test_unserved_amax_graph_declines_typed_end_to_end():
 #
 # The MXFP8 row's twins of the half suite's ``_run_adapter`` cells over ``_Quant`` operands: ``SdpaBwdDslSm107Mxfp8(seq_kv_lens_present=True)``
 # against ``mxfp8_ref.compute_ref_backward`` composing the SAME per-batch lengths INSIDE itself (``padding=``: slicing a quantized operand
-# per batch entry would re-block its columnwise 1x32 scale factors), the appended ``external_delta`` plan fact (DENSE only; the delta is
+# per batch entry would re-block its columnwise 1x32 scale factors), the appended ``external_delta`` plan fact (the dense plans here,
+# the THD twins in test_sdpa_bwd_thd_mxfp8_sm107.py; the delta is
 # the dot of the bf16 ``o_f16`` / ``dO_f16`` ports, so a caller's tensor is BITWISE the row's own pre-pass when it holds the same fp32
 # values), and bottom-right at a ragged S_q through the graph (served now).  The K / V rows past a batch entry's kv length hold FINITE
 # data in every cell (the finite-data contract of the per-batch arm); a NaN pad in the delta is the contract's, not the kernel's, to
@@ -3125,7 +3126,7 @@ def test_mxfp8_gqa_dk_partials_are_fp32_on_the_block_scale_chain_and_dv_bf16(mon
         "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "seq_kv_present", "external_delta",
     ]  # fmt: skip
     assert list(inspect.signature(ph.compile_host_mxfp8_thd).parameters) == [
-        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy",
+        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "external_delta",
     ]  # fmt: skip
 
 
