@@ -248,6 +248,12 @@ sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_ragged_L0[test1]	graph suite TH
 sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_paged_L0[test1]	graph suite paged
 sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_fwd_L0[test1]	graph suite fp8 fwd
 sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_bwd_L0[test1]	graph suite fp8 bwd
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[keyless_rows_d128_4x1_sink_m120_stats-frost]	paged THD + sink | d128 keyless rows O=0 / LSE=sink at -120 | Stats | dead pages NaN
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[keyless_rows_d256_4x1_sink_m120_stats-frost]	paged THD + sink | d256 keyless rows O=0 / LSE=sink at -120 | Stats | dead pages NaN
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[vllm_verify_d128_64x8_p16-frost]	paged THD + sink | d128 | Q 1/4/8 packed | HND page 16 | bf16 | FROST pinned
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[decode_q1_d128_64x8_p16-default]	paged THD + sink | d128 | s_q=1 | default common-API walk (no opt-in flag)
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d128-cga1-pack1-64x8]	paged THD + sink | d128 cga1 two-slab + PackGQA explicit pin
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga2-pack1-32x2]	paged THD + sink | d256 cga2 + PackGQA explicit pin
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_batch_of_two_padded_lse[legacy_offsets]	rule: first L0 cell of test_ragged_prefill_batch_of_two_padded_lse
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_single_sequence_padded_lse_rows[d128_causal-legacy_offsets]	rule: first L0 cell of test_ragged_prefill_single_sequence_padded_lse_rows
 sdpa/frost/test_fp4_pointwise_primitives.py::test_e2m1_rne_emulation_matches_the_torchao_port	rule: first L0 cell of test_e2m1_rne_emulation_matches_the_torchao_port

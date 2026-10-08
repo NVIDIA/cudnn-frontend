@@ -538,7 +538,7 @@ def _require_frost_fp8_paged_leads():
         pytest.skip("paged FP8 is backend-first without CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1: this test asserts FROST routing")
 
 
-def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None, template=None):
+def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None, template=None, tensor_checker=None):
     """exec_sdpa, then assert the FROST engine served the graph: the harness
     tallies the serving engine in frost_routing after build_plans, and a FROST
     decline silently falls through to the native backend, so a green run alone
@@ -549,7 +549,8 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     prefill pipeline, so a test that means the d128 decode tile asserts the
     tile, not just the engine; ``template`` pins the kernel template the plan
     lowered onto -- the SM100 d256 flavor lowers onto decode_d256_f16 or
-    prefill_d256_f16, tallied as "frost:<engine>:<template>"."""
+    prefill_d256_f16, tallied as "frost:<engine>:<template>".  ``tensor_checker`` is forwarded to exec_sdpa (an
+    exact check on the outputs before the tolerance compare)."""
     keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
     before = [frost_routing.snapshot().get(k, 0) for k in keys]
     # The assertion is "FROST served it": opt FROST in for the call so the placement
@@ -557,7 +558,7 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     # the backend -- the routing, not the default winner, is under test here.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-        exec_sdpa(cfg, request, cudnn_handle)
+        exec_sdpa(cfg, request, cudnn_handle, tensor_checker=tensor_checker)
     after  = [frost_routing.snapshot().get(k, 0) for k in keys]
     for key, b, a in zip(keys, before, after):
         assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
@@ -2570,8 +2571,8 @@ def test_sdpa_fwd_paged_decode_tile_frost_L0(env_info, test_no, request, cudnn_h
     not (96/8: G=12 packs 4 -- partial PackGQA -- with three packed heads per KV
     head) and MQA, d in
     {64, 128} (d64 rides the d128 envelope), page sizes 16..128, no mask /
-    bottom-right causal / sliding window. No sink: paged + sink is declined by the
-    FROST row today (a separate change). Asserts the decode tile served the graph.
+    bottom-right causal / sliding window. No sink draw here: the decode tile's sink
+    arm is pinned by test_sdpa_paged_decode_sink_* above. Asserts the decode tile served the graph.
     """
     _require_frost_sm100()
 
@@ -2918,7 +2919,7 @@ def test_sdpa_fwd_paged_decode_d256_frost_L0(env_info, test_no, request, cudnn_h
         diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT : 1, cudnn.diagonal_alignment.BOTTOM_RIGHT : 2}),
         is_ragged_or_padded_or_full=RandomChoice({"padded" : 1}),
         block_size=RandomBlockSize(min=16, max=128, with_high_probability=[16,32,64,128]),
-        with_sink_token=RandomChoice({False : 1}),  # paged + sink stays declined by the engine row
+        with_sink_token=RandomChoice({False : 1}),  # the paged d256 sink arm is pinned above (test_sdpa_paged_decode_sink_d256_frost_L0)
     ) as randomization_ctx:
         test.cfg = randomization_ctx(rng, data_seed, geom_seed)
 
@@ -3110,7 +3111,10 @@ def _device_is_cc107():
     return 107 <= major * 10 + minor <= 119
 
 
-_CC107_DEVICE = _device_is_cc107()
+# Collection gate of the cc 10.7-only functions: the device, or CUDNN_TEST_TIER_ARCH=cc107 (the tiers' override,
+# tiers/README.md), so test_tiers.py and `--collect-only` can list the cc 10.7 SMOKE cells on any host; the in-test
+# _require_frost_sm107 gate still skips them on a run device that is not cc 10.7.
+_CC107_DEVICE = _device_is_cc107() or os.environ.get("CUDNN_TEST_TIER_ARCH", "").strip().lower() == "cc107"
 
 
 def _cc107_engine(family):
@@ -3158,6 +3162,13 @@ def _cc107_sweep(base_count, rng_seed):
             return fn
         return pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=base_count * _CC107_SWEEP_MULT, rng_seed=rng_seed), ids=lambda p: f"test{p[0]}")(fn)
     return decorate
+
+
+def _cc107_only(fn):
+    """A cc 10.7-only (non-sweep) function: not collected off a cc 10.7 device, as _cc107_sweep."""
+    if not _CC107_DEVICE:
+        fn.__test__ = False
+    return fn
 
 
 def _cc107_bshd_dense_strides(cfg, rng):
@@ -3334,8 +3345,9 @@ def test_sdpa_sq1_cc107_half_L0(env_info, test_no, request, cudnn_handle):
 @_cc107_sweep(384, 10703)
 @pytest.mark.L0
 def test_sdpa_fwd_paged_cc107_half_L0(env_info, test_no, request, cudnn_handle):
-    """Paged KV on the cc 10.7 row -- half d128 / d256 with ragged (THD) Q and no sink, the one paged
-    form that row serves (through the shared Blackwell paged bodies): test_sdpa_fwd_paged_L0's
+    """Paged KV on the cc 10.7 row -- half d128 / d256 with ragged (THD) Q, the paged form that row serves
+    (through the shared Blackwell paged bodies; sink-free here -- the sink draw lives in
+    test_sdpa_fwd_paged_thd_sink_cc107_half_L0): test_sdpa_fwd_paged_L0's
     prefill-shaped draw (s_q <= 64) over power-of-two page sizes 8..1024 (the paged contract: a
     multiple of 8 dividing the 128-row KV tile, or a multiple of the tile), Stats on / off.  The
     paged bodies apply the scale in-kernel, so the knob set is FLOAT throughout; routing is still
@@ -3465,6 +3477,445 @@ def test_sdpa_mxfp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
     _exec_cc107(test, request, cudnn_handle, "mxfp8")
+
+
+# ---- P2: SM107 paged THD + sink (paged half attention with sinks for packed serving queries) ----
+#
+# The cc 10.7 half row serves paged KV through the shared Blackwell d128 / d256 bodies compiled for sm_107a
+# (api_dsl._load_sm100_kernel_module's Rubin paged arm, module tag sdpa_fwd_sm107_<d>_paged; the executor's
+# kernel_template is the file stem "prefill_d128_f16" / "prefill_d256_f16", which a PAGED graph on cc 10.7 reaches
+# through that arm only -- the cc 10.7 siblings raise on paged_kv at module scope -- so the stem is the pinned stand-in
+# for the loader's module tag until a cc 10.7-native paged body exists, when the pin must move to the tag).  Those
+# bodies carry the
+# paged-validated sink fold: a keyless row stores O := 0 / LSE := sink, sinks are indexed per packed query head, so
+# PackGQA composes.  Before this block the row declined every paged graph with a sink on cc 10.7; the cuDNN 9.26
+# backend serves paged THD + sink at s_q >= 2 and has no engine for a sink at s_q == 1, so paged decode with sinks
+# had no plan at all through the common API.  Every must-serve cell is strict (_must_run); sink x split-KV stays
+# declined on every row; no cell pins a plan-list order or a heuristic winner (placement and tuning: issue #1472).
+
+_P2_KV24 = [4096, 4095, 4000, 3073, 2048, 1025, 1000, 513, 512, 300, 257, 129, 128, 65, 17, 16, 15, 1, 0, 2047, 1536, 777, 255, 33]
+_P2_Q148 = [1] * 8 + [4] * 8 + [8] * 8
+_P2_TEMPLATE = {128: "prefill_d128_f16", 256: "prefill_d256_f16"}
+
+
+def _require_p2_env():
+    """Environment gates BEFORE the strict block: zero-length entries need cuDNN >= 9.25; the row must be offered
+    on a cc 10.7 device with a DSL that targets sm_107a (_require_frost_sm107)."""
+    if cudnn.backend_version() < 92500:
+        pytest.skip("zero sequence length SDPA requires cuDNN 9.25.0 or higher")
+    _require_frost_sm107(_cc107_engine("half"))
+
+
+def _p2_cfg(*, dtype, d, h_q, h_kv, b, s_q, seq_len_q, s_kv, seq_len_kv, page, left_bound=None, right_bound=0,
+            diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT, stats=False, stats_layout="token_major", pool="hnd",
+            sink=None, poison=True, ragged=True, seed=10720, with_sink=True, cu_seq_len=False, declare_total=False, stats_log2=False):
+    cfg = ExecConfig(
+        data_type=dtype, rng_data_seed=seed, rng_geom_seed=seed, is_alibi=False, is_infer=True, is_paged=True,
+        paged_nan_dead_pages=poison, is_bias=False, is_block_mask=False, is_padding=True, is_cu_seq_len=cu_seq_len,
+        is_ragged=ragged, is_dropout=False, is_determin=False, batches=b, d_qk=d, d_v=d, s_q=s_q, s_kv=s_kv,
+        h_q=h_q, h_k=h_kv, h_v=h_kv, block_size=page, diag_align=diag_align, left_bound=left_bound,
+        right_bound=right_bound, seq_len_q=list(seq_len_q), seq_len_kv=list(seq_len_kv), with_sink_token=with_sink,
+        fwd_stats=stats, ragged_stats_layout=stats_layout if ragged else None, paged_pool_layout=pool,
+        sink_token_value=sink, with_stats_log2=stats_log2, declare_total_seq_len=declare_total,
+        implementation=cudnn.attention_implementation.AUTO,
+    )
+    if ragged and stats_layout == "head_major":
+        from sdpa.random_config import packed_token_capacity
+        t_q = packed_token_capacity(cfg.seq_len_q)
+        cfg.stride_stats = (h_q * t_q, t_q, 1, 1)   # [h, t] packed Stats, as RandomizationContext derives it
+    cfg.fill_derived_fields()
+    if not ragged:
+        _cc107_bshd_dense_strides(cfg, random.Random(seed))   # the row serves BSHD-physical dense Q / O only
+    return cfg
+
+
+def _p2_keyless_rows(cfg):
+    """Packed token indices of the rows that see NO key under the cell's mask -- a request with an empty cache; under
+    bottom-right causal (right_bound 0) the first len_q - len_kv rows of a request whose cache is shorter than its query
+    count; under top-left causal with a left window the rows whose window ends past the cache.  Such a row holds the
+    sink's mass alone and its contract is exact: O := 0, LSE := sink (the kernels SELECT both; see the sink fold in
+    sm100/prefill_d128_f16.py)."""
+    rows, base = [], 0
+    bottom_right = cfg.diag_align == cudnn.diagonal_alignment.BOTTOM_RIGHT
+    for len_q, len_kv in zip(cfg.seq_len_q, cfg.seq_len_kv):
+        if len_kv == 0:
+            keyless = range(len_q)
+        elif cfg.right_bound == 0 and bottom_right:
+            keyless = range(max(0, len_q - len_kv))
+        elif cfg.right_bound == 0 and cfg.left_bound is not None:
+            keyless = [i for i in range(len_q) if i - cfg.left_bound > len_kv - 1]
+        else:
+            keyless = ()
+        rows.extend(base + i for i in keyless)
+        base += len_q
+    return rows
+
+
+def _p2_exact_keyless_checker(cfg):
+    """exec_sdpa tensor_checker asserting the keyless rows BIT-EXACT (torch.equal) before the tolerance compare: O == 0
+    on every head and, with natural-log Stats, LSE == the head's sink logit (base-2 Stats scale the sink and are left
+    to the tolerance compare).  None when the cell has no keyless row."""
+    rows = _p2_keyless_rows(cfg)
+    if not rows:
+        return None
+    from sdpa.fp16 import TensorUid
+    shown = f"{rows[:8]}{'...' if len(rows) > 8 else ''}"
+
+    def check(tensors):
+        idx = torch.tensor(rows, device="cuda", dtype=torch.int64)
+        o = tensors[TensorUid.o][idx]
+        assert torch.equal(o, torch.zeros_like(o)), f"keyless rows {shown}: O must be exactly 0 (the sink holds the row's whole mass)"
+        with_lse = tensors.get(TensorUid.stats) is not None and not cfg.with_stats_log2
+        if with_lse:
+            lse = tensors[TensorUid.stats][idx]
+            sink = tensors[TensorUid.sink_token].reshape(1, -1, 1).expand_as(lse)
+            assert torch.equal(lse, sink), f"keyless rows {shown}: LSE must be exactly the head's sink logit"
+        print(f"@@@@ P2 keyless rows exact: {len(rows)} row(s) O == 0" + (" and LSE == sink" if with_lse else ""))
+
+    return check
+
+
+def _p2_frost(cfg, request, cudnn_handle, *, cga=None, pin=None):
+    """Run strictly on the cc 10.7 half row: an explicit softmax_precision=FLOAT (the f32 pipeline the row runs
+    anyway) keeps the graph on the python engines as the sibling cc 10.7 sweeps do, so a FROST decline is the
+    failure text instead of a backend fallback; _exec_sdpa_on_frost pins the row and the shared paged template;
+    _must_run turns a WAIVED skip into a failure.  ``pin`` appends + selects one explicit knob set
+    (ExecConfig.plan_pin); the cell's keyless rows are asserted bit-exact (_p2_exact_keyless_checker).  Returns the
+    served plan's knobs (asserted unsplit, never a winner)."""
+    engine = _cc107_engine("half")
+    cfg.softmax_precision = cudnn.data_type.FLOAT
+    if pin is not None:
+        cfg.plan_pin = {"engine": engine, "knobs": pin}
+    with _must_run(request):
+        _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=cga, template=_P2_TEMPLATE[cfg.d_qk], tensor_checker=_p2_exact_keyless_checker(cfg))
+    if request.config.option.dryrun:
+        return None
+    served, knobs = frost_routing.LAST_PLAN
+    assert served == engine and knobs is not None, frost_routing.LAST_PLAN
+    assert knobs.split_kv in (None, 1), f"sink x split-KV is declined on every row, yet the served plan was {knobs}"
+    print(f"@@@@ P2 plan on {engine}: TILE_CGA_M={knobs.cga} PACK_GQA={knobs.pack_gqa} SCHED_POLICY={knobs.sched_policy}")
+    return knobs
+
+
+def _p2_default(cfg, request, cudnn_handle):
+    """The user's route: graph.sdpa through the common plan walk with NO opt-in flag and NO python-only attribute,
+    so the backend is planned too and placement decides (Rule 9: both routes through the same caller code;
+    outputs asserted, the serving engine only printed)."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+        with _must_run(request):
+            exec_sdpa(cfg, request, cudnn_handle)
+    if not request.config.option.dryrun:
+        print(f"@@@@ P2 default walk served by {frost_routing.LAST_PLAN[0] or 'the cuDNN backend'}")
+
+
+@_cc107_sweep(192, 10720)
+@pytest.mark.L0
+def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn_handle):
+    """Paged KV on the cc 10.7 half row with the attention sink DRAWN 1:1: ragged (THD) Q over d128 / d256 pools; a
+    decode / verification arm (even cases: s_q <= 8, per-request query counts U(0, s_q) so 0 / 1 / 4 / 8-token
+    requests mix in one packed batch, b <= 16) and a chunked-prefill arm (odd cases: s_q 64..256, b <= 8); GQA groups
+    8 / 16 / MQA / MHA / 12 (12 cannot pack: unpacked); page sizes 8..1024; bottom-right (or top-left) causal / left
+    window / right band / band around the diagonal / no mask; the per-batch lengths as seq_len_q/kv or as the cu_seq_len
+    (B+1 prefix-sum) form 3:1, the packed totals declared (max_total_seq_len_q/kv) 1:4; Stats off / token-major /
+    head-major (head-major on single-request batches only where the logical rows reach the packed capacity -- the b == 1
+    guard below and test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0); HND / NHD pools; dead pool pages
+    NaN-poisoned; f16:bf16 1:2.  The sink-free half is the control (served before this change); every case is strict
+    and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph is unsplit."""
+    _require_p2_env()
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+    rng = random.Random(geom_seed)
+    decode_arm = test_no[0] % 2 == 0
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=16, with_high_probability=[4, 8, 16]) if decode_arm else RandomBatchSize(min=1, max=8, with_high_probability=[1, 4]),
+        s_q_s_kv=(RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=16, s_kv_max=8192, s_q_distribution={"s_q=1": 1, "s_q=random": 3})
+                  if decode_arm else
+                  RandomSequenceLength(s_q_min=64, s_q_max=256, s_kv_min=64, s_kv_max=8192, s_q_distribution={"s_q=random": 3, "s_q=s_kv": 1, "s_q>s_kv": 1})),
+        d_qk_d_v=RandomChoice({(128, 128): 1, (256, 256): 1}),
+        head_count=RandomChoice({(64, 8, 8): 3, (64, 4, 4): 2, (32, 2, 2): 2, (16, 1, 1): 1, (8, 8, 8): 1, (48, 4, 4): 1}),
+        data_type=RandomChoice({torch.float16: 1, torch.bfloat16: 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=3, left_window_only=1, right_window_only=1, band_around_diag=1, no_mask=1),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.TOP_LEFT: 1, cudnn.diagonal_alignment.BOTTOM_RIGHT: 2}),
+        is_ragged_or_padded_or_full=RandomChoice({"ragged": 3, "cu_ragged": 1}),
+        block_size=RandomBlockSize(min=8, max=1024, with_high_probability=[16, 64, 128]),
+        with_sink_token=RandomChoice({True: 1, False: 1}),
+        fwd_stats=RandomChoice({True: 1, False: 1}),
+        ragged_stats_layout=RandomChoice({"token_major": 1, "head_major": 1}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+    cfg = test.cfg
+    if cfg.right_bound is None:   # bottom-right alignment needs a causal upper bound (as test_sdpa_sq1_cc107_half_L0)
+        cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
+    cfg.is_paged = True
+    cfg.paged_nan_dead_pages = True
+    cfg.paged_pool_layout = "nhd" if rng.random() < 0.5 else "hnd"   # drawn AFTER the context: geometry unchanged
+    cfg.declare_total_seq_len = rng.random() < 0.25   # also after the context: the packed totals declared (max_total_seq_len_q/kv)
+    if cfg.ragged_stats_layout == "head_major" and cfg.batches == 1 and cfg.s_q < cfg.total_q:
+        # A single-request batch declaring head-major Stats (1, h, s_q, 1) over the capacity-strided [h, t_q] buffer
+        # with s_q below the 64-rounded packed capacity t_q: check_support accepts it (it checks the packing only) and
+        # the native THD binder rejects it at execute ("head-major lse_tensor logical shape must cover bounded packed
+        # Q": the declaration's logical rows are bounded against the packed-Q capacity) -- a pre-existing, sink-
+        # independent gap on every THD leg, pinned by test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0 (strict
+        # xfail) and named in the tracker's Gaps table.  Only b == 1 trips it: the binder re-describes the harness's
+        # [h, t_q] buffer as the declared dims only when that declaration fits the buffer, which is the single-request
+        # case; multi-request head-major draws stay head-major and serve.  Keep the b == 1 draw token-major
+        # (deterministic, no rng consumed; the geometry is unchanged).
+        cfg.ragged_stats_layout = "token_major"
+        cfg.stride_stats = get_strides_from_layout(cfg.shape_stats, "bshd")
+    _assign_cc107_knob_set(cfg, test_no, "half")
+    test.showConfig(test_no, request)
+    with _must_run(request):
+        _exec_cc107(test, request, cudnn_handle, "half")
+    if cfg.with_sink_token and not request.config.option.dryrun:
+        assert frost_routing.LAST_PLAN[1].split_kv in (None, 1), frost_routing.LAST_PLAN
+
+
+_P2_PINNED = [
+    # kwargs of _p2_cfg plus "id"; every case runs as a "frost" (row pinned) and a "default" (flag-free common-API) twin.
+    dict(id="vllm_verify_d128_64x8_p16", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16),
+    dict(id="vllm_verify_d128_64x8_p128_stats", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=128, stats=True),
+    dict(id="vllm_verify_d128_64x4_p16_nhd", dtype=torch.bfloat16, d=128, h_q=64, h_kv=4, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, pool="nhd"),
+    dict(id="vllm_verify_d128_64x8_p16_fp16_stats_hm", dtype=torch.float16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, stats_layout="head_major"),
+    dict(id="vllm_verify_d256_32x2_p16", dtype=torch.bfloat16, d=256, h_q=32, h_kv=2, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16),
+    dict(id="vllm_verify_d256_32x2_p128_stats_nhd", dtype=torch.bfloat16, d=256, h_q=32, h_kv=2, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=128, stats=True, pool="nhd"),
+    dict(id="decode_q1_d128_64x8_p16", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=1, seq_len_q=[1] * 24, s_kv=4096, seq_len_kv=_P2_KV24, page=16),
+    dict(id="decode_q1_d128_64x8_p128_stats_nhd", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=1, seq_len_q=[1] * 24, s_kv=4096, seq_len_kv=_P2_KV24, page=128, stats=True, pool="nhd"),
+    dict(id="decode_q1_d256_32x2_p16_stats", dtype=torch.bfloat16, d=256, h_q=32, h_kv=2, b=24, s_q=1, seq_len_q=[1] * 24, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True),
+    dict(id="no_mask_q1_d128_64x8_p16_tl", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=1, seq_len_q=[1] * 24, s_kv=4096, seq_len_kv=_P2_KV24, page=16, right_bound=None, diag_align=cudnn.diagonal_alignment.TOP_LEFT),
+    dict(id="left_window128_d128_64x8_p16", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, left_bound=128),
+    dict(id="top_left_window128_d128_64x8_p64_fp16", dtype=torch.float16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=64, left_bound=128, diag_align=cudnn.diagonal_alignment.TOP_LEFT),
+    dict(id="gpt_oss_shaped_q1_window128_d128_64x8_sink10", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=4, s_q=1, seq_len_q=[1] * 4, s_kv=2048, seq_len_kv=[2048, 1337, 129, 16], page=16, left_bound=128, stats=True, sink=10.0),
+    dict(id="chunked_prefill_d128_32x8_p16_stats", dtype=torch.bfloat16, d=128, h_q=32, h_kv=8, b=4, s_q=128, seq_len_q=[128, 77, 1, 128], s_kv=4096, seq_len_kv=[4096, 3000, 129, 128], page=16, stats=True),
+    dict(id="chunked_prefill_d256_16x2_p64_fp16_nhd", dtype=torch.float16, d=256, h_q=16, h_kv=2, b=4, s_q=128, seq_len_q=[128, 77, 1, 128], s_kv=4096, seq_len_kv=[4096, 3000, 129, 128], page=64, pool="nhd"),
+    dict(id="mha_zero_q_d128_16x16_p16", dtype=torch.bfloat16, d=128, h_q=16, h_kv=16, b=8, s_q=8, seq_len_q=[1, 0, 4, 8, 0, 1, 4, 8], s_kv=2048, seq_len_kv=[2048, 2048, 1, 0, 16, 17, 128, 129], page=16),
+    dict(id="keyless_rows_d128_4x1_sink_m120_stats", dtype=torch.bfloat16, d=128, h_q=4, h_kv=1, b=2, s_q=4, seq_len_q=[4, 4], s_kv=128, seq_len_kv=[1, 128], page=16, stats=True, sink=-120.0),
+    dict(id="keyless_rows_d128_4x1_sink_m5_fp16_stats_nhd", dtype=torch.float16, d=128, h_q=4, h_kv=1, b=2, s_q=4, seq_len_q=[4, 4], s_kv=128, seq_len_kv=[1, 128], page=16, stats=True, pool="nhd", sink=-5.0),
+    dict(id="keyless_rows_d128_4x1_sink_p3", dtype=torch.bfloat16, d=128, h_q=4, h_kv=1, b=2, s_q=4, seq_len_q=[4, 4], s_kv=128, seq_len_kv=[1, 128], page=16, sink=3.0),
+    dict(id="keyless_rows_d128_4x1_sink_p10_stats", dtype=torch.bfloat16, d=128, h_q=4, h_kv=1, b=2, s_q=4, seq_len_q=[4, 4], s_kv=128, seq_len_kv=[1, 128], page=16, stats=True, sink=10.0),
+    dict(id="keyless_rows_d256_4x1_sink_m120_stats", dtype=torch.bfloat16, d=256, h_q=4, h_kv=1, b=2, s_q=4, seq_len_q=[4, 4], s_kv=128, seq_len_kv=[1, 128], page=16, stats=True, sink=-120.0),
+    dict(id="keyless_rows_d256_4x1_sink_p3_p128_nhd", dtype=torch.bfloat16, d=256, h_q=4, h_kv=1, b=2, s_q=4, seq_len_q=[4, 4], s_kv=128, seq_len_kv=[1, 128], page=128, pool="nhd", sink=3.0),
+    dict(id="decode_q1_d128_64x8_p16_stats_hm", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=1, seq_len_q=[1] * 24, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, stats_layout="head_major"),
+    dict(id="vllm_verify_d128_64x8_p16_cu_seq_len", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, cu_seq_len=True),
+    dict(id="vllm_verify_d128_64x8_p16_bounded_stats_hm", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, stats_layout="head_major", declare_total=True),
+    dict(id="vllm_verify_d256_32x2_p128_cu_seq_len_bounded_stats", dtype=torch.bfloat16, d=256, h_q=32, h_kv=2, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=128, stats=True, cu_seq_len=True, declare_total=True),
+    dict(id="vllm_verify_d128_64x8_p16_stats_log2", dtype=torch.bfloat16, d=128, h_q=64, h_kv=8, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, stats_log2=True),
+    dict(id="vllm_verify_d128_16x4_p16_stats_nhd", dtype=torch.bfloat16, d=128, h_q=16, h_kv=4, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, pool="nhd"),
+]
+_P2_PINNED_CELLS = [pytest.param(case, route, id=f"{case['id']}-{route}") for case in _P2_PINNED for route in ("frost", "default")]
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("case,route", _P2_PINNED_CELLS)
+def test_sdpa_paged_thd_sink_verify_cc107_pinned_L0(env_info, case, route, request, cudnn_handle):
+    """Serving-shaped paged verify / decode / chunked-prefill graphs with a sink on cc 10.7, pinned so a bisect lands
+    on one config: ragged Q over page pools (per-batch lengths, or the cu_seq_len prefix-sum form, with or without the
+    packed totals declared), bottom-right (or top-left) causal, mixed per-batch KV lengths (tile and page boundaries, a
+    partial last page, one-key and empty caches -> keyless rows: O := 0, LSE := sink, asserted bit-exact on the frost
+    route), per-request query counts 1 / 4 / 8 (and 0) in one packed batch, Stats off / token-major / head-major /
+    base-2 (head-major on these multi-request batches; the single-request declaration below the packed capacity is
+    the detector cell below), HND and NHD pools, f16 / bf16, a left window, GQA 8 / 16 / 4, sink logits at the fold's
+    far ends.  Dead pool pages are NaN-poisoned on BOTH routes (neither provider reads a dead table slot).
+    route="frost": the row must serve it on the shared paged body (template pinned); route="default": the flag-free
+    common-API walk must run and be right (backend or row, whichever placement picks -- printed, not asserted)."""
+    _require_p2_env()
+    kwargs = dict(case)
+    kwargs.pop("id")
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p2_cfg(**kwargs)
+    if route == "frost":
+        test.cfg.softmax_precision = cudnn.data_type.FLOAT   # the route's attribute (as _p2_frost sets it), printed into the repro
+    test.showConfig((request.node.name, len(_P2_PINNED_CELLS)), request)
+    if route == "frost":
+        _p2_frost(test.cfg, request, cudnn_handle)
+    else:
+        _p2_default(test.cfg, request, cudnn_handle)
+
+
+_P2_PINS = [  # d, TILE_CGA_M, PACK_GQA, h_q, h_kv -- every cluster width x packing the sink contract admits
+    (128, 2, 0, 64, 8), (128, 2, 1, 64, 8), (128, 1, 0, 64, 8), (128, 1, 1, 64, 8), (128, 2, 1, 32, 2), (128, 2, 1, 16, 4), (128, 1, 1, 16, 4),
+    (256, 2, 0, 32, 2), (256, 2, 1, 32, 2), (256, 2, 1, 16, 4),
+]
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("d,cga,pack,h_q,h_kv", _P2_PINS, ids=[f"d{d}-cga{c}-pack{p}-{hq}x{hk}" for d, c, p, hq, hk in _P2_PINS])
+def test_sdpa_paged_thd_sink_plan_pins_cc107_L0(env_info, d, cga, pack, h_q, h_kv, request, cudnn_handle):
+    """Explicit knob admission with a sink (not a winner pin): d128 cga2 and the cga1 two-slab body x PackGQA
+    (groups 4, 8 and 16), d256 cga2 x PackGQA (groups 16 and 4), all unsplit, on the verify geometry with Stats.  Each
+    set is appended through graph.create_execution_plan and selected strictly, so a decline FAILS and a degraded plan
+    cannot pass; TILE_CGA_M / PACK_GQA are read back from the served plan.  The default heuristics never propose
+    cga1 with a sink -- a user can still pin it, so it is qualified here (whether to prefer it: issue #1472)."""
+    _require_p2_env()
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p2_cfg(dtype=torch.bfloat16, d=d, h_q=h_q, h_kv=h_kv, b=24, s_q=8, seq_len_q=_P2_Q148, s_kv=4096, seq_len_kv=_P2_KV24, page=16, stats=True, seed=10722 + 10 * cga + pack)
+    pin = {"TILE_CGA_M": cga, "PACK_GQA": pack, "SPLIT_KV": 1}
+    # The route and the pin are part of the case: set before showConfig so the repro string replays them.
+    test.cfg.softmax_precision = cudnn.data_type.FLOAT
+    test.cfg.plan_pin = {"engine": _cc107_engine("half"), "knobs": pin}
+    test.showConfig((request.node.name, len(_P2_PINS)), request)
+    knobs = _p2_frost(test.cfg, request, cudnn_handle, cga=cga, pin=pin)
+    if knobs is not None:
+        assert bool(knobs.pack_gqa) == bool(pack) and knobs.cga == cga, knobs
+
+
+def _p2_planned_graph(cfg, cudnn_handle):
+    """The harness's forward graph, declared by create_forward_graph(plan=False) and planned HERE, so a cell can pin
+    a plan and assert the typed decline the harness would otherwise report as a FAIL.  Returns the tensors too
+    (keep them alive while the graph is used)."""
+    from sdpa import fp16 as fp16_harness
+    fp16_harness.validate_config(cfg)
+    rng = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed)
+    _, tensors, _, _ = fp16_harness.allocate_tensors(cfg, rng)
+    graph, _ = fp16_harness.create_forward_graph(cfg, tensors, cudnn_handle, plan=False)
+    graph.validate()
+    graph.build_operation_graph()
+    try:
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    except cudnn.cudnnGraphNotSupportedError as e:
+        # An EMPTY list raises here (the python-only attribute keeps the backend out and the row proposes nothing);
+        # the graph is frozen with its facts attached, so the cell can still append and pin its own plan.
+        print(f"@@@@ no engine proposed a plan ({e}); the cell pins its own")
+    return graph, tensors
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256])
+def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn_handle):
+    """Sink x split-KV stays declined on the paged THD leg (sm100/split_combine has no sink fold): every plan the row
+    proposes for a paged THD + sink graph is unsplit, and pinning SPLIT_KV=2 on its own proposal through
+    create_execution_plan is a typed decline at build, never a degraded plan.  (TILE_CGA_M=2 is the row's cluster
+    domain under a split; a cga1 pin would decline on the cga domain first and mask the reason under test.)"""
+    _require_p2_env()
+    cfg = _p2_cfg(dtype=torch.bfloat16, d=d, h_q=32, h_kv=8, b=4, s_q=8, seq_len_q=[1, 4, 8, 8], s_kv=4096, seq_len_kv=[4096, 2048, 129, 16], page=16)
+    cfg.softmax_precision = cudnn.data_type.FLOAT   # python engines only: the plan list is the row's proposals
+    graph, _tensors = _p2_planned_graph(cfg, cudnn_handle)
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+    want = _cc107_engine("half")
+    names = [graph.get_plan_name_at_index(i) for i in range(graph.get_execution_plan_count())]
+    ours = [i for i, name in enumerate(names) if name == want or name.startswith(want + "[")]
+    assert ours, f"the row must propose a plan for paged THD + sink on cc 10.7; plans: {names}"
+    for i in ours:
+        assert SdpaFwdKnobs.from_public(graph.get_engine_and_knobs_at_index(i)[1]).split_kv in (None, 1), names[i]
+    engine_id, knobs = graph.get_engine_and_knobs_at_index(ours[0])
+    graph.create_execution_plan(engine_id, {**knobs, cudnn.knob_type.SPLIT_KV: 2, cudnn.knob_type.TILE_CGA_M: 2})
+    graph.select_plan(graph.get_execution_plan_count() - 1)
+    graph.check_support()   # facts-level: paged THD + sink IS served
+    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="sink-free") as decline:
+        graph.build_plans()   # knob-level: the pinned split is the typed decline
+    print(f"@@@@ P2 split decline: {decline.value}")
+
+
+@_cc107_only
+@pytest.mark.L0
+def test_sdpa_paged_sink_dense_queries_decline_cc107_L0(env_info, request, cudnn_handle):
+    """The lift is THD-only: dense (BSHD, padded) paged half queries with a sink on cc 10.7 keep a typed decline naming
+    the THD requirement (pinned by engine id through create_execution_plan, so the row -- not the walk -- answers)."""
+    _require_p2_env()
+    cfg = _p2_cfg(dtype=torch.bfloat16, d=128, h_q=32, h_kv=8, b=4, s_q=8, seq_len_q=[1, 4, 8, 8], s_kv=4096, seq_len_kv=[4096, 2048, 129, 16], page=16, ragged=False, poison=False)
+    cfg.softmax_precision = cudnn.data_type.FLOAT
+    graph, _tensors = _p2_planned_graph(cfg, cudnn_handle)
+    from cudnn.engines.manifest import MANIFEST
+    engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_cc107_engine("half")]
+    graph.create_execution_plan(engine_id, {})
+    graph.select_plan(graph.get_execution_plan_count() - 1)
+    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="Rubin paged KV requires THD queries") as decline:
+        graph.check_support()
+    print(f"@@@@ P2 dense decline: {decline.value}")
+
+
+# The first MULT=4 sweep failure (test340): d256 64/8, one 4-token request in a packed batch of ONE, s_q 5, page 128,
+# head-major Stats over the 64-token capacity -- the single-request head-major declaration the native THD binder rejects.
+_P2_HEAD_MAJOR_B1 = dict(dtype=torch.bfloat16, d=256, h_q=64, h_kv=8, b=1, s_q=5, seq_len_q=[4], s_kv=1731, seq_len_kv=[889], page=128,
+                         right_bound=None, diag_align=cudnn.diagonal_alignment.TOP_LEFT, stats=True, stats_layout="head_major")
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("with_sink", [True, False], ids=["sink", "no_sink"])
+@pytest.mark.xfail(strict=True, raises=ValueError, reason="single-request head-major packed Stats below the packed-Q capacity: accepted at check_support, rejected by the native THD binder at execute (SUPPORT_MATRIX_TRACKER.md, Gaps)")
+def test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0(env_info, with_sink, request, cudnn_handle):
+    """Detector (strict xfail) for a pre-existing, sink-independent Rule 2 gap on every THD leg: a single-request (b == 1)
+    packed batch declaring head-major Stats (1, h, s_q, 1) over a capacity-strided [h, t_q] buffer with s_q < t_q passes
+    check_support and build_plans (the row serves it, unsplit) and the first execute raises ``ValueError: cudnn.sdpa:
+    head-major lse_tensor logical shape must cover bounded packed Q`` -- the native THD binder bounds the declaration's
+    logical rows against the packed-Q capacity, and at execute no plan-walk fallback is possible.  Same failure on
+    develop with the sink removed and on nonpaged THD; the token-major twin and every multi-request head-major
+    declaration serve.  RED -> fixed when check_support pre-declines the declaration (then make this a typed-decline
+    cell) or the binder bounds against the logical rows (then make it a must-serve cell)."""
+    _require_p2_env()
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p2_cfg(**_P2_HEAD_MAJOR_B1, with_sink=with_sink)
+    test.cfg.softmax_precision = cudnn.data_type.FLOAT
+    test.showConfig((request.node.name, 2), request)
+    _p2_frost(test.cfg, request, cudnn_handle)
+
+
+def _p2_fp8_pools_graph(form):
+    """graph.sdpa_fp8 over paged K/V pools with a sink (per-tensor FP8 E4M3 in, bf16 O; d128 32/8, b 4, s_q 8, KV 4096, page
+    16, bottom-right causal), queries packed ("thd": Q / O carry ragged offsets, the pools stay dense -- the paged THD form
+    sdpa.fp16 declares) or dense.  Declared here because the fp8 harness's builder cannot spell ragged Q over paged pools
+    (its paged and ragged branches both declare the per-batch length tensors); the operands follow it otherwise: BSHD
+    queries, [pages, H, page, D] pools, row-major (b, 1, pages, 1) block tables, scalar (de)scales, the FLOAT softmax."""
+    b, h_q, h_kv, s_q, s_kv, d, page = 4, 32, 8, 8, 4096, 128, 16
+    e4m3, f32, i32, i64 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FLOAT, cudnn.data_type.INT32, cudnn.data_type.INT64
+    table = (s_kv + page - 1) // page
+    g = cudnn.pygraph(io_data_type=e4m3, intermediate_data_type=f32, compute_data_type=f32)
+    q = g.tensor(dim=(b, h_q, s_q, d), stride=(s_q * h_q * d, d, h_q * d, 1), data_type=e4m3)
+    k = g.tensor(dim=(table * b, h_kv, page, d), stride=(page * h_kv * d, page * d, d, 1), data_type=e4m3)
+    v = g.tensor(dim=(table * b, h_kv, page, d), stride=(page * h_kv * d, page * d, d, 1), data_type=e4m3)
+    k_table = g.tensor(dim=(b, 1, table, 1), stride=(table, table, 1, 1), data_type=i32)
+    v_table = g.tensor(dim=(b, 1, table, 1), stride=(table, table, 1, 1), data_type=i32)
+    seq_q = g.tensor(dim=(b,), stride=(1,), data_type=i32)
+    seq_kv = g.tensor(dim=(b,), stride=(1,), data_type=i32)
+    if form == "thd":
+        q.set_ragged_offset(g.tensor(dim=(b + 1,), stride=(1,), data_type=i64))
+    scalars = [g.tensor(dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=f32) for _ in range(6)]
+    sink = g.tensor(dim=(1, h_q, 1, 1), stride=(h_q, 1, 1, 1), data_type=f32)
+    o, _stats, _amax_s, amax_o = g.sdpa_fp8(
+        q=q, k=k, v=v, descale_q=scalars[0], descale_k=scalars[1], descale_v=scalars[2], scale_s=scalars[3], descale_s=scalars[4], scale_o=scalars[5],
+        generate_stats=False, attn_scale=0.125, use_causal_mask=False, use_padding_mask=True, seq_len_q=seq_q, seq_len_kv=seq_kv,
+        paged_attention_k_table=k_table, paged_attention_v_table=v_table, paged_attention_max_seq_len_kv=s_kv,
+        right_bound=0, diagonal_alignment=cudnn.diagonal_alignment.BOTTOM_RIGHT, sink_token=sink, softmax_precision=cudnn.data_type.FLOAT,
+    )
+    o.set_output(True).set_dim((b, h_q, s_q, d)).set_stride((s_q * h_q * d, d, h_q * d, 1)).set_data_type(cudnn.data_type.BFLOAT16)
+    if form == "thd":
+        o.set_ragged_offset(g.tensor(dim=(b + 1,), stride=(1,), data_type=i64))
+    amax_o.set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(f32)
+    return g
+
+
+@_cc107_only
+@pytest.mark.L0
+@pytest.mark.parametrize("form", ["thd", "dense"])
+def test_sdpa_paged_sink_fp8_pools_decline_cc107_L0(env_info, form, request, cudnn_handle):
+    """The lift is the HALF row's: per-tensor FP8 pools with a sink (graph.sdpa_fp8 over paged K/V, packed THD or dense
+    queries, _p2_fp8_pools_graph) keep a typed decline on cc 10.7 at the GRAPH level -- the cc 10.7 FP8 row has no paged
+    capability (its `paged_kv = not rubin_row`) -- pinned by engine id through create_execution_plan so the row, not the
+    walk, answers (test_sdpa_fwd_dsl_sm107.py::test_sm107_fp8_paged_sink_declines is the host-only facts twin).  The
+    explicit FLOAT softmax keeps the backend out of planning (as the quantized cc 10.7 sweeps do), so the walk proposes
+    nothing and the pinned plan's check_support is the only answer."""
+    _require_p2_env()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")   # the cc 10.7 FP8 row is opt-in: offered so the pin can name it
+        graph = _p2_fp8_pools_graph(form)
+        graph.validate()
+        graph.build_operation_graph()
+        try:
+            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        except cudnn.cudnnGraphNotSupportedError as e:
+            print(f"@@@@ no engine proposed a plan ({e}); the cell pins its own")
+        from cudnn.engines.manifest import MANIFEST
+        engine_id = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()[_cc107_engine("fp8")]
+        graph.create_execution_plan(engine_id, {})
+        graph.select_plan(graph.get_execution_plan_count() - 1)
+        with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="paged") as decline:
+            graph.check_support()
+    print(f"@@@@ P2 fp8 pools decline ({form}): {decline.value}")
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")
