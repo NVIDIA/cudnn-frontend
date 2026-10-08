@@ -605,6 +605,14 @@ parent before spawning; a `pytest.skip` in a plain Python child exits nonzero.
 Keep genuine child failures failing on supported devices. The half SDPA artifact
 reload detector is re-exported through `TestStagedHalf` and covers this boundary.
 
+Cross-architecture compile probes must select their target explicitly, before
+the DSL is imported in a fresh subprocess, and override an inherited
+`CUTE_DSL_ARCH`. Otherwise a Blackwell/Rubin probe can lower for the runner's
+SM80 GPU and fail in NVVM despite a valid kernel. Disable the compiled cache
+so the probe really compiles. `test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic`
+can be run with `CUTE_DSL_ARCH=sm_80` to check target isolation; only its named
+missing-intrinsic error is a skip, while other compiler failures remain failures.
+
 Gate layout admission must share the adapter's TMA predicate, including batch
 stride alignment for B > 1. A valid head/sequence pitch cannot compensate for
 an unaligned batch pitch. `test_gate_batch_stride_alignment` covers FP8, half
