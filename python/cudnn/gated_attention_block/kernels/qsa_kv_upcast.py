@@ -296,7 +296,7 @@ def frost_qsa_kv_upcast(
         if (c == cutlass.Int32(0)) & (tidx == cutlass.Int32(0)):
             st_global(mKvLenT.iterator.toint() + item64 * four, total, cutlass.Int32)
 
-        # --- the copy, phase 1: this warp's 8 slots -- (block, count, destination) by shuffle from the holder and the 8 table words,
+        # --- the copy, first the setup: this warp's 8 slots -- (block, count, destination) by shuffle from the holder and the 8 table words,
         #     all in flight together (one L2 round trip for the warp's slots, not one per slot pair) ---
         ok_item = ok_base + item64 * ok0 * two
         ov_item = ov_base + item64 * ov0 * two
@@ -322,7 +322,7 @@ def frost_qsa_kv_upcast(
             s_dst.append(dst_s)
             s_pidx_ok.append(pidx_ok)
             s_inpage.append(in_page)
-        # --- the copy, phase 2: two slots per step so eight 16-B loads are in flight per lane; a dead page reads page 0 and stores
+        # --- the copy, then the rows: two slots per step so eight 16-B loads are in flight per lane; a dead page reads page 0 and stores
         #     zeros; a row at or past the slot's count is loaded (a real address) and never stored ---
         for i in cutlass.range_constexpr(SLOTS_PER_WARP // 2):
             loads_k = []
