@@ -25,10 +25,24 @@ fp8 backward over the same bytes (a difference is a
 finding to investigate at the SDPA stage first, never a tolerance); ``grad_scaling="delayed"`` replays the current run bitwise;
 the launch count is MEASURED (CUPTI) against the formula from the adapter's own facts.
 
+The sweep.  Uniform ``B = 4`` packed vs the dense ``B = 4`` fp8 backward over the same bytes is the SPLIT pin: the token-wise
+stages bitwise, the SDPA-derived ones reported in stage order (the packed forward runs the padded-mask arm, the packed chain
+walks a per-sequence kv-blocked workspace), the gradients kernel-vs-kernel in the row-budgeted form.  Zero-length sequences
+(a middle one, a first one, two trailing ones behind a 5-token sequence) run under the suite's ``timeout`` (a zero-length
+sequence is a ``seq_kv_len == 0`` entry for the per-tensor fp8 d256 kernels): finite, the live sequences under the whole
+per-sequence chain, every gradient and ``amax_dP`` ``torch.equal`` the same tokens packed WITHOUT the empty sequence, and a
+twin over a 0xFF workspace with NaN-filled gradients bitwise the clean run (no unwritten tile is read, nothing leaks).  The
+dense fp8 suite's contracts hold packed: two executes and a fresh block bitwise under every knob set, ``fuse_wgrad_overlap``
+and ``fuse_gate_bwd`` (inert under quant) bitwise, the lengths and the prefix record forms bitwise, a CUDA graph replaying
+bitwise -- over a NEW packing and a NEW ``scale_dp`` written through the captured pointers too -- and the workspace size exact
+(every e4m3 region and the delta written in full, nothing allocated on the execute path).  The remaining rejects are typed
+before any device read.
+
 Accept tests are ``requires_rubin``; the host tests build CUDA tensors for a DECLARED backward (``requires_cuda``, no compile).
 """
 
 import dataclasses
+import gc
 import os
 import sys
 from types import SimpleNamespace
@@ -51,8 +65,17 @@ from cudnn.gated_attention_block.api_bwd import _check_saved_record  # noqa: E40
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from gated_block_reference import RefGeometry, gated_attention_block_fp8_bwd_reference, make_packed_inputs, quantize_block_inputs, sequence_slices  # noqa: E402
-from test_block_backward import _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _cos, _make_dy  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    RefGeometry,
+    assert_packing_contract,
+    cu_seqlens_of,
+    gated_attention_block_fp8_bwd_reference,
+    make_packed_inputs,
+    packed_rope_tables,
+    quantize_block_inputs,
+    sequence_slices,
+)
+from test_block_backward import _KNOBS, _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _cos, _make_dy  # noqa: E402
 from test_block_backward_fp8 import (  # noqa: E402
     _E4M3,
     _api_const,
@@ -60,6 +83,7 @@ from test_block_backward_fp8 import (  # noqa: E402
     _assert_seeded_dw_qkvg_row_budgeted,
     _calibrated_scale_dp,
     _declare_fp8_bwd,
+    _declare_then_check,
     _delta,
     _dev_scalar,
     _execute_fp8,
@@ -169,18 +193,64 @@ def _backward_fp8_thd(lens=_LENS, *, causal=True, h_kv=2, grad_scaling="current"
     return res
 
 
-def _twin_fp8_thd(res, *, poison=0xFF, grad_scaling=None, scales=None, **bwd_kw):
+def _twin_fp8_thd(res, *, poison=0xFF, grad_scaling=None, scales=None, saved=None, cu=False, **bwd_kw):
     """A second packed fp8 block over the SAME record / dy / inputs / scale_dp as ``res`` (different knobs or recipe), compiled and
-    run once into a poisoned workspace and NaN-filled gradients; returns ``(blk, ws, grads)`` -- the bitwise comparand of ``res``."""
-    blk = _declare_fp8_bwd(res.dy, res.saved, res.inp, res.geom, quant=res.spec, grad_scaling=grad_scaling or res.grad_scaling, **_thd_kw(res.meta), **bwd_kw)
+    run once into a poisoned workspace and NaN-filled gradients; returns ``(blk, ws, grads)`` -- the bitwise comparand of ``res``.
+    ``saved`` (appended) substitutes a record over the same bytes (the prefix form of the same packing), ``cu`` the matching
+    ``cu_seqlens`` constructor fact."""
+    saved = res.saved if saved is None else saved
+    blk = _declare_fp8_bwd(
+        res.dy, saved, res.inp, res.geom, quant=res.spec, grad_scaling=grad_scaling or res.grad_scaling, **_thd_kw(res.meta, cu=cu), **bwd_kw
+    )
     blk.check_support()
     blk.compile()
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda").fill_(poison)
     grads = _alloc_grads(blk, fill=float("nan"))
     scale_ts = {k: _dev_scalar(v) for k, v in (scales or {}).items()} if scales is not None else res.scale_ts
-    _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws, scale_dp=res.scale_dp_t, **scale_ts)
+    _execute_fp8(blk, res.inp, saved, res.dy, grads, ws, scale_dp=res.scale_dp_t, **scale_ts)
     torch.cuda.synchronize()
     return blk, ws, grads
+
+
+def _dense_fp8_run(res, b: int, s: int):
+    """The DENSE per-tensor fp8 training forward and backward at ``(b, s)`` over the SAME bytes as the packed run ``res``
+    (``b * s == T``): the e4m3 inputs viewed ``[b, s, .]`` -- at uniform lengths the packed per-token RoPE tables, positions
+    restarting at every sequence, ARE the dense ``[b, s, rope]`` table -- the QuantSpec, the packed run's ``dy`` and its calibrated
+    ``scale_dp``; the backward into a 0xFF workspace and NaN-filled gradients.  Returns the forward block and workspace, the dense
+    record and output, the backward block, workspace and gradients."""
+    inp8, spec, g, t = res.inp, res.spec, res.geom, b * s
+    assert t == res.seq_len, (b, s, res.seq_len)
+    inp_d = dict(inp8, h=inp8["h"].view(b, s, g.d_model), cos=inp8["cos"].view(b, s, -1), sin=inp8["sin"].view(b, s, -1))
+    out_d = torch.empty(b, s, g.d_model, device="cuda", dtype=torch.bfloat16)
+    fwd = GatedAttentionBlockFwd(
+        inp_d["h"],
+        inp_d["w_qkvg"],
+        inp_d["w_q_norm"],
+        inp_d["w_k_norm"],
+        inp_d["cos"],
+        inp_d["sin"],
+        inp_d["w_o"],
+        out_d,
+        g,
+        quant=spec,
+        save_for_backward=True,
+    )
+    saved = _alloc_saved(g, inp_d, b, s, save_mode="proj_slab", act_dtype=torch.bfloat16)
+    fwd.check_support()
+    fwd.compile()
+    ws_f = torch.empty(fwd.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    fwd.execute(inp_d["h"], inp_d["w_qkvg"], inp_d["w_q_norm"], inp_d["w_k_norm"], inp_d["cos"], inp_d["sin"], inp_d["w_o"], out_d, ws_f, saved=saved)
+    torch.cuda.synchronize()
+    dy_d = res.dy.view(b, s, -1)
+    blk = _declare_fp8_bwd(dy_d, saved, inp_d, g, quant=spec)
+    assert not blk.thd and (blk.batch, blk.seq_len) == (b, s)
+    blk.check_support()
+    blk.compile()
+    ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda").fill_(0xFF)
+    grads = _alloc_grads(blk, fill=float("nan"))
+    _execute_fp8(blk, inp_d, saved, dy_d, grads, ws, scale_dp=res.scale_dp_t)
+    torch.cuda.synchronize()
+    return SimpleNamespace(fwd=fwd, ws_f=ws_f, saved=saved, out=out_d, inp=inp_d, blk=blk, ws=ws, grads=grads)
 
 
 def _scalar_block(blk, ws) -> torch.Tensor:
@@ -566,18 +636,10 @@ def test_thd_fp8_b1_bwd_is_bitwise_the_dense_fp8_block():
     tolerance."""
     t = 512
     res = _backward_fp8_thd((t,), causal=True, h_kv=2)
-    inp8, spec, g = res.inp, res.spec, res.geom
-    # --- the dense fp8 TRAINING forward over the same e4m3 inputs and spec ---------------------------------------------------
-    out_d = torch.empty(1, t, g.d_model, device="cuda", dtype=torch.bfloat16)
-    fwd_d = GatedAttentionBlockFwd(
-        inp8["h"], inp8["w_qkvg"], inp8["w_q_norm"], inp8["w_k_norm"], inp8["cos"], inp8["sin"], inp8["w_o"], out_d, g, quant=spec, save_for_backward=True
-    )
-    saved_d = _alloc_saved(g, inp8, 1, t, save_mode="proj_slab", act_dtype=torch.bfloat16)
-    fwd_d.check_support()
-    fwd_d.compile()
-    ws_fd = torch.empty(fwd_d.get_workspace_size(), dtype=torch.uint8, device="cuda")
-    fwd_d.execute(inp8["h"], inp8["w_qkvg"], inp8["w_q_norm"], inp8["w_k_norm"], inp8["cos"], inp8["sin"], inp8["w_o"], out_d, ws_fd, saved=saved_d)
-    torch.cuda.synchronize()
+    g = res.geom
+    # --- the dense fp8 TRAINING forward + backward over the same e4m3 inputs, spec, dy and scale_dp -------------------------
+    dn = _dense_fp8_run(res, 1, t)
+    out_d, saved_d, ws_fd, fwd_d, blk_d, ws_d, grads_d = dn.out, dn.saved, dn.ws_f, dn.fwd, dn.blk, dn.ws, dn.grads
     assert torch.equal(out_d, res.out), "the forward output differs between packed B=1 and dense"
     for name, a, b_ in (("proj_slab", res.saved.proj_slab, saved_d.proj_slab), ("o", res.saved.o, saved_d.o), ("lse", res.saved.lse, saved_d.lse)):
         assert torch.equal(a, b_), f"saved.{name}: the packed B=1 training record differs from the dense one"
@@ -590,15 +652,7 @@ def test_thd_fp8_b1_bwd_is_bitwise_the_dense_fp8_block():
             a = _view(res.fwd.ws, off_p, (t, h, g.d_head), _E4M3).view(torch.uint8)
             b_ = _view(ws_fd, off_d, (t, h, g.d_head), _E4M3).view(torch.uint8)
             assert torch.equal(a, b_), f"forward {name}: the packed B=1 forward's codes differ from the dense forward's"
-    # --- the dense fp8 backward: the same dy, the packed run's calibrated scale_dp, a poisoned workspace -----------------------
-    blk_d = _declare_fp8_bwd(res.dy, saved_d, inp8, g, quant=spec)
-    assert not blk_d.thd
-    blk_d.check_support()
-    blk_d.compile()
-    ws_d = torch.empty(blk_d.get_workspace_size(), dtype=torch.uint8, device="cuda").fill_(0xFF)
-    grads_d = _alloc_grads(blk_d, fill=float("nan"))
-    _execute_fp8(blk_d, inp8, saved_d, res.dy, grads_d, ws_d, scale_dp=res.scale_dp_t)
-    torch.cuda.synchronize()
+    # --- the dense fp8 backward (the same dy, the packed run's calibrated scale_dp, a poisoned workspace), stage by stage ------
     v_p, v_d = _slots(res), _slots(SimpleNamespace(blk=blk_d, ws=ws_d, geom=g))
     first_diff = None
     # the stage order of the backward: the pre-SDPA intermediates, the SDPA stage's outputs, then everything downstream
@@ -670,3 +724,401 @@ def test_thd_fp8_launch_count_is_honest():
     assert not memcpys, f"a hidden copy on the execute path: {memcpys}"
     assert not memsets, f"a hidden memset on the execute path (the scalar init and the row's fills are kernels): {memsets}"
     assert len(kernels) == formula, (len(kernels), formula, kernels)
+
+
+# ---------------------------------------------------------------------------
+# The sweep -- the split pin, zero-length sequences over poisoned buffers, the contracts, the remaining rejects
+# ---------------------------------------------------------------------------
+
+_KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
+_EMPTY_CELLS = pytest.mark.parametrize(
+    "lens, s_max", [((300, 0, 200), 300), ((0, 256, 128), 256), ((5, 0, 0), 5)], ids=["middle_empty", "first_empty", "trailing_empties_T5"]
+)
+# The backward's intermediates split by what they depend on: the token-wise ones (the same launches over the same tokens: bitwise
+# between a uniform packing and the dense block) and the ones that read the forward's O (bitwise exactly when the two forwards' O
+# is); everything downstream of the SDPA backward (``dq / dk / dv``, ``dqkvg / dqkvg8``, the gradients) is reported or budgeted.
+_TOKEN_WISE = ("dy8", "do", "do8", "q8", "k8", "v8")
+_O_DEPENDENT = ("og8", "dg", "delta")
+
+
+def _packed_view_of_dense(name: str, ten: torch.Tensor) -> torch.Tensor:
+    """A dense block's ``[B, ...]`` tensor in the packed arm's element order: ``saved.lse`` / ``delta`` are ``[B, H_q, S]`` and the
+    packed arm's ``[1, H_q, T]`` is head-major, so they permute; everything else flattens its batch axis onto the token axis."""
+    if name in ("saved.lse", "delta"):
+        return ten.permute(1, 0, 2).reshape(1, ten.shape[1], -1)
+    return ten.reshape(1, -1, *ten.shape[2:])
+
+
+@requires_rubin
+def test_thd_fp8_uniform_b4_bwd_matches_the_dense_fp8_block_per_sequence():
+    """Uniform ``B = 4`` packed ``(128,)*4`` against the dense ``B=4, S=128`` fp8 backward over the SAME bytes (the e4m3 inputs, the
+    QuantSpec, the dy, the packed run's calibrated ``scale_dp``) -- the SPLIT pin: the token-wise stages BITWISE (the record's
+    ``proj_slab`` / ``rstd``; the backward's ``dy8``, the gated ``dO``, ``do8``, the recomputed ``q8 / k8 / v8``: the same launches
+    over the same tokens), the SDPA-derived ones REPORTED in stage order with the first difference named (the packed forward runs
+    the padded-mask arm and the packed chain walks a per-sequence kv-blocked workspace: ``O`` / ``LSE`` / ``out``, hence ``og8`` /
+    ``dG`` / the delta, then ``dq / dk / dv`` and ``dqkvg / dqkvg8``), and the gradients ``dh / dw_qkvg / dw_o`` against the dense
+    block's in the dense suite's row-budgeted form (kernel vs kernel: the (M) budget ``1e-5 x rows x keys``, ``dW_norm`` printed).
+    The packed arm also runs the matrix cell's whole per-sequence chain at this shape -- ``B*H > 1`` with ``n_kv == 1`` on EVERY
+    sequence, the phase-drift shape of the invariants."""
+    s, b = 128, 4
+    res = _backward_fp8_thd((s,) * b, causal=True, h_kv=2)
+    g, t = res.geom, b * s
+    d = _dense_fp8_run(res, b, s)
+    assert torch.equal(d.saved.proj_slab, res.saved.proj_slab), "proj_slab differs: the token-wise stage-(1) GEMM is not the same launch"
+    if g.qk_norm:
+        assert torch.equal(res.saved.rstd_q, d.saved.rstd_q.reshape(1, t, -1)) and torch.equal(res.saved.rstd_k, d.saved.rstd_k.reshape(1, t, -1))
+    report = []
+
+    def verdict(name, a, b_):
+        same = torch.equal(a.view(torch.uint8), b_.view(torch.uint8)) if a.dtype == _E4M3 else torch.equal(a, b_)
+        md = 0.0 if same else (a.float() - b_.float()).abs().max().item()
+        report.append((name, same, md))
+        print(f"{name}: {'bitwise' if same else f'DIFFERS (max|diff| {md:.3e})'} (packed uniform B=4 vs dense B=4)")
+        return same
+
+    verdict("saved.o", res.saved.o, _packed_view_of_dense("saved.o", d.saved.o))
+    verdict("saved.lse", res.saved.lse, _packed_view_of_dense("saved.lse", d.saved.lse))
+    verdict("out", res.out, d.out.reshape(1, t, -1))
+    v_p, v_d = _slots(res), _slots(SimpleNamespace(blk=d.blk, ws=d.ws, geom=g))
+    for name in ("dy8", "do", "do8", "og8", "q8", "k8", "v8", "dg", "dq", "dk", "dv", "dqkvg", "dqkvg8"):
+        a, b_ = v_p[name], v_d[name]
+        if a is None or b_ is None:
+            assert a is None and b_ is None, name
+            continue
+        same = verdict(name, a, b_)
+        if name in _TOKEN_WISE:
+            assert same, f"{name}: a token-wise stage differs between the packed uniform B=4 and the dense B=4 fp8 backward -- a finding, not a tolerance"
+    delta_d = _view(d.ws, d.blk._layout().delta, tuple(d.blk._sdpa.delta_shape), torch.float32)
+    verdict("delta", _delta(res), _packed_view_of_dense("delta", delta_d))
+    o_same = report[0][1]
+    for name, same, _md in report:
+        if name in _O_DEPENDENT and o_same:
+            assert same, f"{name}: the two forwards' O is bitwise, so this O-dependent token-wise stage must be too -- a finding, not a tolerance"
+    first = next(((n, md) for n, same, md in report if not same), None)
+    print(f"\nuniform B=4 vs dense: first SDPA-derived difference {first} (None = bitwise)")
+    ref_d = {k: (ten.reshape(res.grads[k].shape).double() if ten is not None else None) for k, ten in d.grads.items()}
+    for name, ten in res.grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten.float()).all() and torch.isfinite(d.grads[name].float()).all(), name
+    _assert_m_row_budgeted("thd fp8 uniform (128,)*4 vs the dense B=4 fp8 block", res, ref_d)
+    # the packed arm under the matrix cell's whole chain at this shape
+    v = _assert_quantizers_scalars_delta_bitwise(res)
+    _assert_sdpa_stage_per_sequence(res, v)
+    tag = "thd fp8 (128, 128, 128, 128) causal h_kv=2"
+    _assert_m_row_budgeted(f"{tag} (M)", res, _oracle_m_packed(res))
+    _assert_seeded_under_the_bf16_bound(tag, res, _oracle_m_packed(res, seeded=True), v)
+
+
+@requires_rubin
+@_EMPTY_CELLS
+def test_thd_fp8_zero_length_sequences(lens, s_max):
+    """Zero-length sequences in the packed fp8 backward -- a middle one ``(300, 0, 200)``, a first one ``(0, 256, 128)``, two
+    trailing ones behind a 5-token sequence ``(5, 0, 0)`` at ``S_max = 5`` (the shortest legal sequence; never 1).  A zero-length
+    sequence is a ``seq_kv_len == 0`` entry for the per-tensor fp8 d256 kernels, so the cell runs under the suite's ``timeout``
+    (a hang is a barrier-table finding, never a raised limit; if it ever flakes, count exit codes over >= 8 fresh processes).
+    Asserted: every gradient finite; the live sequences under the whole per-sequence chain (the quantizers / scalars / delta
+    bitwise, the SDPA stage per sequence under the row recipe, the (M) row budget, the seeded layer with the ``dw_qkvg``
+    attribution); the NEIGHBOURS EXACT -- the same tokens packed WITHOUT the empty sequence (same ``T``, same bytes, same
+    calibrated QuantSpec and ``scale_dp``) give a bitwise record, ``torch.equal`` gradients, an equal scalar block and the SAME
+    ``amax_dP`` (an empty sequence contributes nothing); and a twin over a 0xFF workspace with NaN-filled gradients bitwise the
+    clean run on every gradient, on the SDPA stage's slots and on the delta (no unwritten tile is read, nothing leaks -- the
+    unwritten-tile hazard of the per-sequence stage-3 trim)."""
+    res = _backward_fp8_thd(lens, max_seq_len=s_max)
+    assert 0 in res.lens and res.blk.thd and res.blk._sdpa._impl.external_delta is True
+    for name, ten in res.grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten.float()).all(), f"{name}: non-finite cells"
+    v = _assert_quantizers_scalars_delta_bitwise(res)
+    _assert_sdpa_stage_per_sequence(res, v)
+    tag = f"thd fp8 {tuple(lens)} s_max={s_max}"
+    _assert_m_row_budgeted(f"{tag} (M)", res, _oracle_m_packed(res))
+    _assert_seeded_under_the_bf16_bound(tag, res, _oracle_m_packed(res, seeded=True), v)
+    # the neighbours exact: the same tokens packed without the empty sequence(s)
+    live = tuple(n for n in lens if n)
+    twin = _backward_fp8_thd(live, max_seq_len=s_max)
+    assert twin.spec == res.spec and twin.scale_dp == res.scale_dp, (twin.spec, res.spec, twin.scale_dp, res.scale_dp)
+    assert torch.equal(twin.inp["h"].view(torch.uint8), res.inp["h"].view(torch.uint8)) and torch.equal(twin.dy, res.dy)
+    for name, a, b_ in (("proj_slab", res.saved.proj_slab, twin.saved.proj_slab), ("o", res.saved.o, twin.saved.o), ("lse", res.saved.lse, twin.saved.lse)):
+        assert torch.equal(a, b_), f"saved.{name}: the empty sequence changed the live sequences' record -- a finding, not a tolerance"
+    assert res.scalars["amax_dp"] == twin.scalars["amax_dp"], f"amax_dP changed by the empty sequence: {res.scalars['amax_dp']} vs {twin.scalars['amax_dp']}"
+    assert torch.equal(_scalar_block(res.blk, res.ws), _scalar_block(twin.blk, twin.ws)), "the scalar block differs with the empty sequence"
+    for name, ten in res.grads.items():
+        if ten is not None:
+            md = (ten.float() - twin.grads[name].float()).abs().max().item()
+            assert torch.equal(
+                ten, twin.grads[name]
+            ), f"{name}: the empty sequence changed a live sequence's gradient (max|diff| {md:.3e}) -- a finding, not a tolerance"
+    # the poisoned twin: 0xFF workspace, NaN-filled gradients
+    blk_p, ws_p, grads_p = _twin_fp8_thd(res)
+    for name, ten in grads_p.items():
+        if ten is not None:
+            assert torch.isfinite(ten.float()).all(), f"{name}: non-finite cells over a poisoned workspace"
+            assert torch.equal(ten, res.grads[name]), f"{name}: the poisoned twin differs from the clean run"
+    poisoned = SimpleNamespace(blk=blk_p, ws=ws_p, geom=res.geom)
+    v_pz = _slots(poisoned)
+    for name in ("dq", "dk", "dv"):
+        assert torch.isfinite(v_pz[name].float()).all() and torch.equal(v_pz[name], v[name]), f"{name}: the SDPA stage's slot differs over a poisoned workspace"
+    assert torch.equal(_delta(poisoned), _delta(res)) and torch.equal(_scalar_block(blk_p, ws_p), _scalar_block(res.blk, res.ws))
+
+
+@requires_rubin
+@_KNOB_SETS
+def test_thd_fp8_two_runs_are_bitwise(knobs):
+    """Two executes of the SAME packed fp8 block over the same record / dy / scale_dp -- the second into a workspace poisoned 0xFF and
+    NaN-filled gradients -- are ``torch.equal`` on every gradient AND on the scalar block, and so is a FRESH block over the same
+    record (compiled anew, poisoned the same way), under every knob set (``fuse_gate_bwd`` is inert under quant; ``fuse_wgrad_overlap``
+    moves B1 / B7 to the side stream): the packed chain's metadata and dS workspace included, nothing an execute reads survives from
+    the previous one."""
+    res = _backward_fp8_thd(_LENS, **knobs)
+    assert res.blk.fuse_wgrad_overlap is bool(knobs.get("fuse_wgrad_overlap", False)) and res.blk.fuse_gate_bwd is bool(knobs.get("fuse_gate_bwd", False))
+    sb1 = _scalar_block(res.blk, res.ws).clone()
+    ws2 = torch.empty_like(res.ws).fill_(0xFF)
+    grads2 = _alloc_grads(res.blk, fill=float("nan"))
+    _execute_fp8(res.blk, res.inp, res.saved, res.dy, grads2, ws2, scale_dp=res.scale_dp_t, **res.scale_ts)
+    torch.cuda.synchronize()
+    for name, ten in grads2.items():
+        if ten is not None:
+            assert torch.isfinite(ten.float()).all() and torch.equal(
+                ten, res.grads[name]
+            ), f"{name}: a second execute of the same packed block differs (knobs={knobs})"
+    assert torch.equal(_scalar_block(res.blk, ws2), sb1), "the scalar block differs between two executes of one packed block"
+    blk, ws, grads = _twin_fp8_thd(res, **knobs)
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten.float()).all() and torch.equal(ten, res.grads[name]), f"{name}: two packed runs differ (knobs={knobs})"
+    assert torch.equal(_scalar_block(blk, ws), sb1), "the scalar block differs between two packed runs"
+
+
+@requires_rubin
+def test_thd_fp8_fuse_wgrad_overlap_is_bitwise_the_in_order_block():
+    """``fuse_wgrad_overlap=True`` under THD is a scheduling knob: the side stream exists, every gradient and the scalar block
+    ``torch.equal`` the in-order packed block's over the same record (the workspace poisoned, the gradients NaN-filled first)."""
+    res = _backward_fp8_thd(_LENS)
+    blk, ws, grads = _twin_fp8_thd(res, fuse_wgrad_overlap=True)
+    assert blk.thd and blk.fuse_wgrad_overlap and blk._side is not None
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten.float()).all() and torch.equal(ten, res.grads[name]), f"{name}: fuse_wgrad_overlap differs from the in-order packed block"
+    assert torch.equal(_scalar_block(blk, ws), _scalar_block(res.blk, res.ws))
+
+
+@requires_rubin
+def test_thd_fp8_fuse_gate_bwd_is_inert_under_quant():
+    """The external delta is MANDATORY under quant, so ``fuse_gate_bwd`` has no second arm packed either: both values construct, the
+    stage's adapter carries ``external_delta=True`` either way, and the gradients, the scalar block and the delta region are
+    ``torch.equal``."""
+    res = _backward_fp8_thd(_LENS)
+    assert not res.blk.fuse_gate_bwd and res.blk._sdpa._impl.external_delta is True
+    blk, ws, grads = _twin_fp8_thd(res, fuse_gate_bwd=True)
+    assert blk.fuse_gate_bwd and blk._sdpa._impl.external_delta is True
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), f"{name}: fuse_gate_bwd changed the packed gradients under quant"
+    assert torch.equal(_scalar_block(blk, ws), _scalar_block(res.blk, res.ws)) and torch.equal(_delta(SimpleNamespace(blk=blk, ws=ws)), _delta(res))
+
+
+@requires_rubin
+@pytest.mark.parametrize("cu_base", [0, 100], ids=["prefix", "prefix_nonzero_base"])
+def test_thd_fp8_lengths_and_prefix_forms_are_bitwise(cu_base):
+    """The same packing through the ``[B]`` lengths record and the ``[B+1]`` prefix record (base 0 and base 100: a prefix tensor
+    sliced from a larger one) gives ``torch.equal`` gradients and an equal scalar block; the prefix block declares ``cu_seqlens`` on
+    the block and on the fp8 SDPA stage."""
+    res = _backward_fp8_thd(_LENS)
+    cu_t = torch.tensor(cu_seqlens_of(res.lens, base=cu_base), dtype=torch.int32, device="cuda")
+    assert_packing_contract(cu_t, res.seq_len, res.meta["max_seq_len"], res.meta["b"], cu=True)
+    saved_cu = dataclasses.replace(res.saved, seq_lens=cu_t, seq_lens_form="prefix")
+    blk, ws, grads = _twin_fp8_thd(res, saved=saved_cu, cu=True)
+    assert blk.thd and blk.cu_seqlens and blk._sdpa.cu_seqlens and saved_cu.seq_lens_form == "prefix" and cu_t.numel() == res.meta["b"] + 1
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten.float()).all() and torch.equal(ten, res.grads[name]), f"{name} differs between the lengths and the prefix form"
+    assert torch.equal(_scalar_block(blk, ws), _scalar_block(res.blk, res.ws)), "the scalar block differs between the lengths and the prefix form"
+
+
+@requires_rubin
+def test_thd_fp8_cuda_graph_replay_with_new_lengths_and_scale():
+    """One packed fp8 backward captured into a CUDA graph on a side torch stream replays bitwise the eager run (the capture itself
+    launches nothing); a replay over a NEW packing -- new lengths and RoPE tables written through the record's own tensors, the
+    forward re-run eagerly over them so the record matches (same ``B``, ``sum == T``, each ``<= max_seq_len``) -- and a NEW
+    ``scale_dp`` (the new packing's calibrated one) written through the captured scalar equals a fresh eager backward over it and
+    is finite: the setup kernel rebuilds the packed metadata per execute from the device lengths, the prologue's scalar init, the
+    amax passes and the quantize publishes are device work.  The new packing then passes the per-sequence layers (the quantizers /
+    scalars / delta bitwise, the SDPA stage per sequence under the row recipe, the (M) row budget)."""
+    res = _backward_fp8_thd(_LENS, memo=False)
+    blk, inp, saved, dy, g, meta = res.blk, res.inp, res.saved, res.dy, res.geom, res.meta
+    sdp = res.scale_dp_t.clone()
+    ws = torch.empty_like(res.ws)
+    grads = _alloc_grads(blk, fill=float("nan"))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _execute_fp8(blk, inp, saved, dy, grads, ws, scale_dp=sdp)  # warm-up on the capture stream
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for ten in grads.values():
+        if ten is not None:
+            ten.fill_(float("nan"))
+    ws.fill_(0xFF)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            _execute_fp8(blk, inp, saved, dy, grads, ws, scale_dp=sdp)
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.isnan(ten).all(), f"{name}: the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.equal(ten, res.grads[name]), f"{name}: the replay differs from the eager run"
+        assert torch.equal(_scalar_block(blk, ws), _scalar_block(res.blk, res.ws)), "the scalar block differs between the replay and the eager run"
+        # a new packing through the captured pointers: new tables + lengths, the forward re-run eagerly into the same record
+        new_lens = [200, 300, 128]
+        assert_packing_contract(new_lens, meta["t"], meta["max_seq_len"], meta["b"])
+        cos2, sin2 = packed_rope_tables(new_lens, g.rope_dim, base=RefGeometry(**res.geom_kw).rope_base)
+        inp["cos"].copy_(cos2.view_as(inp["cos"]))
+        inp["sin"].copy_(sin2.view_as(inp["sin"]))
+        assert saved.seq_lens is res.fwd.seq_lens
+        res.fwd.seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32, device="cuda"))
+        res.fwd.blk.execute(
+            inp["h"],
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"],
+            res.out,
+            res.fwd.ws,
+            seq_lens=res.fwd.seq_lens,
+            saved=saved,
+        )
+        torch.cuda.synchronize()
+        # the new packing's calibrated scale_dp (the chart recipe over one eager run at 1.0 into scratch buffers), through the captured scalar
+        ws_cal = torch.empty_like(ws)
+        _execute_fp8(blk, inp, saved, dy, _alloc_grads(blk), ws_cal, scale_dp=_dev_scalar(1.0))
+        new_scale = _calibrated_scale_dp(blk, ws_cal)
+        print(f"\nnew packing {new_lens}: scale_dp {res.scale_dp:g} -> {new_scale:g}")
+        sdp.fill_(new_scale)
+        ws.fill_(0xFF)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = _alloc_grads(blk, fill=float("nan"))
+        ws_ref = torch.empty_like(ws).fill_(0xFF)
+        _execute_fp8(blk, inp, saved, dy, ref, ws_ref, scale_dp=_dev_scalar(new_scale))
+        torch.cuda.synchronize()
+        for name, ten in grads.items():
+            if ten is not None:
+                assert torch.isfinite(ten.float()).all() and torch.equal(ten, ref[name]), f"{name}: the replay over the new packing differs from eager"
+        assert torch.equal(_scalar_block(blk, ws), _scalar_block(blk, ws_ref)), "the scalar block differs between the replay over the new packing and eager"
+        res2 = SimpleNamespace(**vars(res))
+        res2.ws, res2.grads, res2.lens, res2.meta = ws, grads, new_lens, dict(meta, lens=new_lens)
+        res2.scale_dp, res2.scale_dp_t = float(new_scale), sdp
+        res2.scalars = {k: float(x.item()) for k, x in blk.quant_scalars(ws).items()}
+        v = _assert_quantizers_scalars_delta_bitwise(res2)
+        _assert_sdpa_stage_per_sequence(res2, v)
+        _assert_m_row_budgeted(f"thd fp8 graph replay over the new packing {new_lens} (M)", res2, _oracle_m_packed(res2))
+    finally:  # a graph left to the cyclic GC resets itself inside a later test's capture
+        graph.reset()
+
+
+@requires_rubin
+@_KNOB_SETS
+def test_thd_fp8_workspace_size_is_honest(knobs):
+    """``get_workspace_size()`` is exact and never exceeded on the packed fp8 backward: the carve (every quant region present, aligned,
+    the scalar block) + the fp8 adapter's PACKED scratch (``scratch_workspace_bytes()``; the block's own ``delta`` region ALWAYS
+    present under quant with the adapter's packed ``(1, H_q, ceil128(T))`` shape, ``fuse_gate_bwd`` or not) + the GEMM scratch (the
+    max over the four K64 fp8 plans); a buffer 4096 B larger keeps its tail untouched; two executes allocate nothing; every e4m3
+    region is WRITTEN in full (no 0xFF byte survives), and so are the fp32 delta region -- its zero tail included -- and the scalar
+    block; one byte less is a typed ``ValueError``; bitwise the memoised gradients -- under every knob set."""
+    from cudnn.gated_attention_block.api import _WS_ALIGN
+
+    res = _backward_fp8_thd(_LENS, **knobs)
+    blk, g, t = res.blk, res.geom, res.seq_len
+    size = blk.get_workspace_size()
+    lay = blk._layout()
+    t_pad = -(-t // 128) * 128
+    print(
+        f"\nworkspace {size} B; sdpa packed scratch {lay.sdpa_bwd_bytes} B; gemm scratch {lay.gemm_scratch_bytes} B; delta region {lay.delta} (knobs {knobs})"
+    )
+    assert size == lay.total_bytes and size % _WS_ALIGN == 0
+    assert lay.sdpa_bwd_bytes == blk._sdpa.scratch_workspace_bytes() > 0
+    assert lay.delta >= 0 and lay.delta_shape == tuple(blk._sdpa._impl.external_delta_shape) == (1, g.h_q, t_pad), "the packed delta region: always under quant"
+    assert (
+        lay.quant_scalars >= 0
+        and lay.quant_scalars % 256 == 0
+        and lay.o_gated == -1
+        and lay.recompute_v == -1
+        and lay.recompute == -1
+        and lay.recompute_k == -1
+    )
+    plans = blk.gemm_plans
+    assert len(plans) == 4 and all(p.mma_tile_k_bytes == 64 and p.has_alpha for p in plans.values())
+    assert lay.gemm_scratch_bytes == max(p.workspace_bytes for p in plans.values()) >= 1
+    for name in ("dy8", "do8", "q8", "k8", "v8", "dqkvg8"):
+        assert getattr(lay, name) >= 0 and getattr(lay, name) % _WS_ALIGN == 0, name
+    ws = torch.full((size + 4096,), 0xFF, dtype=torch.uint8, device="cuda")
+    grads = _alloc_grads(blk)
+    _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws[:size], scale_dp=res.scale_dp_t, **res.scale_ts)
+    torch.cuda.synchronize()
+    # The allocation pin in the caching allocator's COUNTER form: the cumulative allocation count cannot be lowered by an unrelated
+    # release and still rises for a temporary the execute frees before returning; the allocator peak is the second witness.
+    gc.collect()
+    live = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    n0 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws[:size], scale_dp=res.scale_dp_t, **res.scale_ts)
+    _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws[:size], scale_dp=res.scale_dp_t, **res.scale_ts)
+    torch.cuda.synchronize()
+    n1 = torch.cuda.memory_stats()["allocation.all.allocated"]
+    peak = torch.cuda.max_memory_allocated()
+    assert n1 == n0, f"the packed fp8 backward made {n1 - n0} CUDA allocation(s) on the execute path (allocation.all.allocated {n0} -> {n1})"
+    assert peak <= live, f"a temporary on the packed fp8 backward's execute path: the allocator peak rose from {live} to {peak} bytes"
+    assert torch.equal(ws[size:], torch.full((4096,), 0xFF, dtype=torch.uint8, device="cuda")), "bytes past get_workspace_size() were written"
+    for name, ten in grads.items():
+        if ten is not None:
+            assert torch.equal(ten, res.grads[name]), name
+    sb = _view(ws[:size], lay.quant_scalars, (len(_api_const("QUANT_SCALAR_SLOTS")),), torch.float32)
+    assert torch.isfinite(sb).all(), "a scalar slot was never written (0xFF = NaN)"
+    d = g.d_head
+    regions = dict(dy8=(lay.dy8, t * g.d_model), do8=(lay.do8, t * g.h_q * d), q8=(lay.q8, t * g.h_q * d), k8=(lay.k8, t * g.h_kv * d))
+    regions.update(v8=(lay.v8, t * g.h_kv * d), dqkvg8=(lay.dqkvg8, t * g.n_qkvg))
+    if lay.og8 >= 0:
+        regions["og8"] = (lay.og8, t * g.h_q * d)
+    for name, (off, nbytes) in regions.items():
+        survivors = int((ws[off : off + nbytes] == 0xFF).sum())
+        assert survivors == 0, f"{name}: {survivors} of {nbytes} e4m3 bytes still hold the 0xFF poison -- never written"
+    delta = _view(ws[:size], lay.delta, lay.delta_shape, torch.float32)
+    assert torch.isfinite(delta).all(), "a delta element (the zero tail included) was never written (0xFFFFFFFF = NaN)"
+    assert torch.equal(delta[:, :, t:], torch.zeros_like(delta[:, :, t:])), "the tail [T, ceil128(T)) of the packed delta is not zero"
+    with pytest.raises(ValueError, match="workspace is"):
+        _execute_fp8(blk, res.inp, res.saved, res.dy, grads, ws[: size - 1], scale_dp=res.scale_dp_t, **res.scale_ts)
+
+
+@requires_cuda
+def test_thd_fp8_rejects_are_typed_before_any_device_read():
+    """The remaining rejects of the packed fp8 backward -- each the dense decline, reached through the SAME code path under ``thd``,
+    before any device read: an fp16 ``dy`` under ``quant`` (the quantized record is bf16) names ``dy``; a bf16 ``saved.h`` under
+    ``quant`` through the BLOCK names the e4m3 codes the quantized forward's record carries; an e5m2 ``QuantSpec`` surfaces the
+    spec's own decline; ``need_*`` all False leaves no work.  The declarations' inputs are drawn outside the sync guard, every
+    decline fires inside it."""
+    r = _declare_fp8_thd_bwd()
+    t, g = r.meta["t"], r.geom
+    dy16 = r.dy.to(torch.float16)
+    deq_h = torch.empty(1, t, g.d_model, dtype=torch.bfloat16, device="cuda")
+    e5 = dataclasses.replace(r.spec, dtype=torch.float8_e5m2)
+    kw = dict(quant=r.spec, **_thd_kw(r.meta))
+    with _no_device_sync():
+        with pytest.raises((ValueError, NotImplementedError), match="dy"):
+            _declare_then_check(lambda: _declare_fp8_bwd(dy16, r.saved, r.inp, g, **kw))
+        with pytest.raises(ValueError, match="e4m3 codes"):
+            _declare_then_check(lambda: _declare_fp8_bwd(r.dy, dataclasses.replace(r.saved, h=deq_h), r.inp, g, **kw))
+        with pytest.raises(NotImplementedError, match="QuantSpec|e5m2|quant"):
+            _declare_then_check(lambda: _declare_fp8_bwd(r.dy, r.saved, r.inp, g, quant=e5, **_thd_kw(r.meta)))
+        with pytest.raises(ValueError, match="need_dh"):
+            _declare_then_check(
+                lambda: _declare_fp8_bwd(r.dy, r.saved, r.inp, g, need_dh=False, need_dw_qkvg=False, need_dw_o=False, need_dw_norms=False, **kw)
+            )
