@@ -190,6 +190,9 @@ def _frost_plan_index(names) -> Optional[int]:
 # kernel decodes ``(b, s_tile)`` per 128-row tile), and DECLINES (typed
 # ``NotImplementedError``) ``seq_len % 128 != 0 and batch > 1`` -- a GEMM tile would
 # straddle two sequences; the unfused path serves that shape.
+# ``NormRopeFusionParams.weight_fp4`` selects that fork's e2m1-B arm -- an MXFP4 ``W_qkvg``
+# (packed ``[N, K // 2]`` codes, the UNCHANGED E8M0 / 32 blob) on the SAME runner ABI; the
+# runner then also checks the padded sub-byte TMA format's K / base-address / row-stride rules.
 
 
 @dataclass(frozen=True)
@@ -249,6 +252,18 @@ class NormRopeFusionParams:
     ``gate16`` and the three ``sf_q / sf_k / sf_v`` blobs.  Inference only
     (``want_rstd`` False), no ``"off"`` arm, exclusive with ``quant_fp8``; launched
     with :func:`run_fused_proj_gemm_mxfp8`.
+
+    ``weight_fp4`` (appended after ``quant_mxfp8``; default False so every existing key is
+    spelled identically) selects the e2m1-B arm of the MXFP8 fork: ``W_qkvg`` arrives as
+    packed e2m1 codes (``torch.float4_e2m1fn_x2``, two per byte along K, storage
+    ``[N, K // 2]``) with the UNCHANGED E8M0 / 32 scale-factor blob -- the block-scale
+    catalog's MIXED row (e4m3 A x e2m1 B) rendered into the SAME template at
+    ``mma_tile_k_bytes=32``, i.e. the padded E2M1 SMEM form: the fork's B-side constants
+    change (the B dtypes, a ``Uint8`` B SMEM ring of the same footprint, the B TMA
+    descriptor's padded sub-byte format, half the B expect-tx bytes), nothing in the kernel
+    body.  Needs ``quant_mxfp8=True``; exclusive with ``quant_fp8``.  An NVFP4 ``W_qkvg``
+    (e4m3 scales per 16) is not expressible here: the catalog has no mixed row with e4m3
+    scales, so ``weight_fp4`` means MXFP4 exactly.  Same runner (:func:`run_fused_proj_gemm_mxfp8`).
     """
 
     d_head: int = 256
@@ -261,6 +276,9 @@ class NormRopeFusionParams:
     quant_fp8: bool = False  # the FP8 fork (e4m3 in, e4m3 Q/K/V + bf16 GATE out); appended, bf16 keys unchanged
     qk_norm: bool = True  # False: RoPE-only epilogue (no pass A / rsqrt / weight loads / rstd); appended, keys unchanged
     quant_mxfp8: bool = False  # the MXFP8 fork twin (block-scale rendering, PR-B section 3.1); appended, keys unchanged
+    weight_fp4: bool = (
+        False  # e2m1 W_qkvg (torch.float4_e2m1fn_x2) on the MXFP8 fork: the catalog's mixed row at K32, the padded E2M1 SMEM form; appended, keys unchanged
+    )
 
     @property
     def offsets(self) -> tuple[int, int, int, int]:
@@ -338,6 +356,17 @@ def validate_norm_rope_params(p: NormRopeFusionParams) -> None:
             raise ValueError(
                 "quant_mxfp8: norm_source='off' has no meaning on the MXFP8 fork (no single bf16 slab to degenerate to); use 'const' for the floor"
             )
+    if p.weight_fp4:
+        if p.quant_fp8:
+            raise ValueError(
+                "weight_fp4 and quant_fp8 name two different forks: the e2m1 W_qkvg arm belongs to the MXFP8 fork (quant_mxfp8=True); "
+                "the per-tensor FP8 fork takes e4m3 operands only"
+            )
+        if not p.quant_mxfp8:
+            raise ValueError(
+                "weight_fp4 (an e2m1 W_qkvg with the E8M0 / 32 scale-factor blob) is an arm of the MXFP8 fork only; set quant_mxfp8=True "
+                "-- the bf16 fork has no fp4 operand"
+            )
 
 
 _FUSED_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proj_gemm_norm_rope.py")
@@ -354,6 +383,10 @@ class FusedProjGemmPlan:
     launch: Any  # the cute-compiled ``_host``
     fp8: bool = False  # True: the FP8 fork; launch with ``run_fused_proj_gemm_fp8`` (q8/k8/v8/gate16 + qscal)
     mxfp8: bool = False  # True: the MXFP8 fork twin; launch with ``run_fused_proj_gemm_mxfp8`` (q8/k8/v8/gate16 + sf_q/sf_k/sf_v)
+    # W's STORAGE dtype the MXFP8 artifact was compiled for -- torch.float8_e4m3fn, or torch.float4_e2m1fn_x2 under
+    # ``params.weight_fp4`` -- so the runner checks the PLAN it is handed, not a re-derivation; None on the other two
+    # forks and on a hand-built plan (then derived from the params).
+    w_dtype: Any = None
 
     @property
     def workspace_bytes(self) -> int:
@@ -372,8 +405,9 @@ def build_fused_proj_gemm(params: NormRopeFusionParams) -> FusedProjGemmPlan:
 
     validate_norm_rope_params(params)
     if params.quant_mxfp8:
+        w_dtype = _fused_mx_w_dtype_of_params(params)  # a typed decline on a torch without the fp4 storage dtype, BEFORE the template loads
         mod = load_template(_FUSED_TEMPLATE_MXFP8, params, tag="proj_gemm_norm_rope_mxfp8")
-        return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), mxfp8=True)
+        return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), mxfp8=True, w_dtype=w_dtype)
     if params.quant_fp8:
         mod = load_template(_FUSED_TEMPLATE_FP8, params, tag="proj_gemm_norm_rope_fp8")
         return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), fp8=True)
@@ -621,6 +655,16 @@ def run_fused_proj_gemm_mxfp8(
     128-row GEMM tile would straddle two sequences and the kernel's once-per-tile
     ``(b, s_tile)`` decode would be wrong for part of it.  The unfused block-scale path
     (``build_proj_gemm(block_scale=True)`` + ``quantize_mxfp8``) serves that shape.
+
+    **The e2m1 ``W_qkvg`` arm** (``plan.params.weight_fp4``; ``plan.w_dtype`` is ``torch.float4_e2m1fn_x2``): ``w8`` is
+    the PACKED ``[N, K // 2]`` storage -- two codes per byte along K; a uint8 blob is declined with the
+    ``.view(torch.float4_e2m1fn_x2)`` hint, a LOGICAL ``[N, K]`` fp4 tensor by name -- and ``sf_w`` the UNCHANGED
+    E8M0 / 32 blob over the LOGICAL ``K`` (read off ``a8``).  Typed ``ValueError``s before any launch: an e4m3
+    ``w8`` on an e2m1 plan and the reverse; ``K % 128 != 0``; a weight base address that is not 32-byte aligned;
+    a row stride that is not a multiple of 32 bytes.  The last three are the padded sub-byte TMA format's own
+    rules, which the descriptor builder checks on STATIC operands only -- the fork's weight descriptor carries a
+    symbolic K, a dynamic base and symbolic strides, so unchecked they would surface as a malformed tensor map
+    at launch (an illegal-instruction error), never as a decline.
     """
     from cuda.bindings import driver as cuda
 
@@ -640,16 +684,52 @@ def run_fused_proj_gemm_mxfp8(
     q3, k3, v3, g3 = _rank3(out_q8, "out_q8"), _rank3(out_k8, "out_k8"), _rank3(out_v8, "out_v8"), _rank3(out_gate16, "out_gate16")
     m, k = int(a3.shape[1]), int(a3.shape[2])
     n = int(w3.shape[1])
-    if _FP8_E4M3 is None or a8.dtype != _FP8_E4M3 or w8.dtype != _FP8_E4M3:
-        raise ValueError(f"the MXFP8 fused projection takes e4m3 codes, got a8 {a8.dtype}, w8 {w8.dtype}")
+    w_dtype = _fused_mx_w_dtype(plan)  # e4m3, or the packed e2m1 storage dtype under params.weight_fp4
+    fp4_w = _is_fp4(w_dtype)
+    if _FP8_E4M3 is None or a8.dtype != _FP8_E4M3:
+        raise ValueError(f"the MXFP8 fused projection takes e4m3 activation codes, got a8 {a8.dtype}")
+    if w8.dtype != w_dtype:
+        hint = " -- e2m1 codes travel as torch.float4_e2m1fn_x2: .view(torch.float4_e2m1fn_x2) the uint8 storage" if fp4_w and w8.dtype == torch.uint8 else ""
+        raise ValueError(
+            f"this MXFP8 fused projection was compiled for {_dtype_word(w_dtype)} W_qkvg codes (NormRopeFusionParams.weight_fp4={p.weight_fp4}), "
+            f"got w8 {w8.dtype}; refusing to reinterpret the bytes{hint}"
+        )
     if m != batch * seq_len:
         raise ValueError(f"M must equal batch*seq_len: a8 has M={m}, batch*seq_len={batch * seq_len}")
     if n != p.n_qkvg:
         raise ValueError(f"the fused projection classifies tiles for N={p.n_qkvg} (Q|GATE|K|V at {p.offsets}); the weight has N={n}")
-    if int(w3.shape[2]) != k:
-        raise ValueError(f"shape mismatch: a8 {tuple(a3.shape)}, w8 {tuple(w3.shape)}")
+    k_store = storage_k(k, w_dtype)  # the STORAGE extent along K: K/2 bytes for packed e2m1 codes, K for e4m3
+    if int(w3.shape[2]) != k_store:
+        if fp4_w and int(w3.shape[2]) == k:
+            raise ValueError(
+                f"w8 is fp4 storage {tuple(w8.shape)} -- two e2m1 codes per byte along K -- so its last extent must be K/2 = {k_store} for the "
+                f"K={k} read off a8, not {k} (a LOGICAL [N, K] fp4 tensor holds twice the data)"
+            )
+        raise ValueError(f"shape mismatch: a8 {tuple(a3.shape)} (K={k}), w8 {tuple(w3.shape)} (a {_dtype_word(w_dtype)} weight stores K as {k_store} elements)")
     if k % 32:
         raise ValueError(f"the block-scale GEMM needs K % 32 == 0 (one E8M0 scale per 32-element block), got K={k}")
+    if fp4_w:
+        # The e2m1 B is read through the PADDED sub-byte TMA format (64-byte boxes expanded to 128-byte SMEM rows).  Its three
+        # tensor-map rules are checked by the descriptor builder on STATIC operands only; the fork's weight descriptor carries a
+        # symbolic K, a dynamic base address and symbolic strides, so a violation would surface as a malformed tensor map at launch
+        # (an illegal-instruction error), not as a typed decline.  Check them here, in STORAGE bytes (one byte = one
+        # float4_e2m1fn_x2 element).  A contiguous [N, K // 2] weight with K % 128 == 0 satisfies the stride rule by construction;
+        # only a padded-row view, or a 16-byte-but-not-32-byte-aligned view of a larger buffer, can trip the last two.
+        if k % 128:
+            raise ValueError(
+                f"the e2m1 W_qkvg arm needs K % 128 == 0 (the padded sub-byte TMA format's Tensor-Size[0] rule: whole 64-byte = 128-code rows), got K={k}"
+            )
+        if w8.data_ptr() % 32:
+            raise ValueError(
+                "the e2m1 W_qkvg arm needs a 32-byte-aligned weight base address (the padded sub-byte TMA format's rule; 16-byte alignment is not "
+                f"enough), got data_ptr() % 32 = {w8.data_ptr() % 32}"
+            )
+        row_stride_bytes = int(w3.stride(1))  # elements of float4_e2m1fn_x2 == storage bytes
+        if row_stride_bytes % 32:
+            raise ValueError(
+                "the e2m1 W_qkvg arm needs every weight row stride to be a multiple of 32 bytes (the padded sub-byte TMA format's rule), got "
+                f"{row_stride_bytes} bytes between rows (a padded-row view of a wider buffer)"
+            )
     _check_fused_outputs(
         m,
         (
@@ -793,6 +873,21 @@ def storage_k(k: int, dtype) -> int:
     codes (``torch.float4_e2m1fn_x2``, two per byte), ``k`` for every 1- or 2-byte dtype -- and for ``None`` (a hand-built plan
     without dtypes declares the logical extent)."""
     return k // FP4_CODES_PER_BYTE if _is_fp4(dtype) else k
+
+
+def _fused_mx_w_dtype_of_params(p: NormRopeFusionParams):
+    """W's STORAGE dtype of the MXFP8 fork specialized for ``p``: ``torch.float4_e2m1fn_x2`` under ``weight_fp4`` (a typed
+    ``NotImplementedError`` on a torch without that dtype -- the arm's operand cannot be bound), else ``torch.float8_e4m3fn``."""
+    if p.weight_fp4:
+        if _FP4_X2 is None:
+            raise NotImplementedError("NormRopeFusionParams.weight_fp4 needs torch.float4_e2m1fn_x2 (the packed e2m1 storage dtype) and this torch has none")
+        return _FP4_X2
+    return _FP8_E4M3
+
+
+def _fused_mx_w_dtype(plan: FusedProjGemmPlan):
+    """The W dtype recorded on an MXFP8 fused plan; a hand-built plan (``w_dtype=None``) derives it from its params."""
+    return plan.w_dtype if plan.w_dtype is not None else _fused_mx_w_dtype_of_params(plan.params)
 
 
 def _w_dtype_of(plan: "ProjGemmPlan"):
