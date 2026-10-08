@@ -126,6 +126,16 @@ def norm_fprop(
 
         # Warp-per-row kernel for LN/RMS when the row fits the register budget.
         if variant in _WARP_VARIANTS:
+            # A long row first: one CTA per row caps parallelism and has to stage the
+            # whole row, so past ~16K elements splitting it across a CGA -- each CTA
+            # reducing its slice, then a reduction through distributed shared memory --
+            # beats it by 2-4x. See layernorm_cga_sm100 for the measured crossover.
+            from .kernels import layernorm_cga_sm100
+
+            if layernorm_cga_sm100.should_use(spec.M, spec.R, DTYPE_BYTES[io]):
+                y2, mean, rstd = layernorm_cga_sm100.forward(spec, x2d, gamma, beta, eps=eps, params=params)
+                return y2.reshape(x.shape), mean, rstd
+
             wcfg = make_warp_cfg(params, spec.M)
             if wcfg is not None:
                 from .kernels import layernorm_warp_sm100

@@ -112,20 +112,25 @@ LN, RMS = NormVariant.LAYER_NORM, NormVariant.RMS_NORM
 GN, IN, BN = NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM, NormVariant.BATCH_NORM
 
 
-def _case(label, variant, shape, *, cl=False, ns=None, groups=None, has_beta=True, want=None, smoke=False):
+def _case(label, variant, shape, *, cl=False, ns=None, groups=None, has_beta=True,
+          want=None, want_fwd=None, want_bwd=None, smoke=False):
     return dict(label=label, variant=variant, shape=shape, cl=cl, ns=ns,
-                groups=groups, has_beta=has_beta, want=want, smoke=smoke)
+                groups=groups, has_beta=has_beta, smoke=smoke,
+                want_fwd=want_fwd or want, want_bwd=want_bwd or want)
 
 
 # Contiguous: every variant, so all five flavors are covered fprop + bprop.
-# The D=65536 LayerNorm pins the shared-memory guard -- that row exceeds what the
-# warp kernels can stage, so it must route to the streaming fallback rather than
-# failing to launch.
 CONTIG = [
     _case("LN 2D", LN, (256, 1024), ns=[1024], smoke=True),
     _case("RMS 2D", RMS, (256, 1024), ns=[1024], has_beta=False, smoke=True),
     _case("LN 4D ns=[H,W]", LN, (8, 128, 14, 14), ns=[14, 14]),
-    _case("LN oversized row", LN, (64, 65536), ns=[65536]),
+    # A row too long for one CTA to stage. It must route to the CGA split, which
+    # reduces across a cluster through distributed shared memory -- NOT fail to
+    # launch (it used to), and not silently drop to the streaming fallback (0.17 of
+    # achievable against the split's 0.68). The backward has no CGA path yet.
+    _case("LN long row CGA", LN, (64, 65536), ns=[65536], want_fwd="layernorm_cga_sm100"),
+    _case("RMS long row CGA", RMS, (64, 65536), ns=[65536], has_beta=False,
+          want_fwd="layernorm_cga_sm100"),
     _case("BN", BN, (8, 128, 14, 14), smoke=True),
     _case("IN", IN, (8, 128, 14, 14)),
     _case("GN g=32", GN, (8, 128, 14, 14), groups=32),
@@ -301,10 +306,10 @@ def _check_case(c, dtypes=DTYPES):
         ok &= _flag("dx layout", dx.is_contiguous(memory_format=fmt), "matches input")
 
         used = seen["fwd"] + seen["bwd"]
-        if c["want"]:
-            ok &= _flag("fwd kernel", c["want"] in seen["fwd"], f"{seen['fwd']} want {c['want']}")
-            ok &= _flag("bwd kernel", c["want"] in seen["bwd"], f"{seen['bwd']} want {c['want']}")
-        else:
+        for slot, want in (("fwd", c["want_fwd"]), ("bwd", c["want_bwd"])):
+            if want:
+                ok &= _flag(f"{slot} kernel", want in seen[slot], f"{seen[slot]} want {want}")
+        if not (c["want_fwd"] or c["want_bwd"]):
             nhwc = [k for k in used if k.endswith("_nhwc_sm100")]
             ok &= _flag("kernel", not nhwc, f"contiguous input stayed off NHWC kernels: {used}")
     return ok
