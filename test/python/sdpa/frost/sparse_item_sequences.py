@@ -269,6 +269,7 @@ def run_sparse_forward(wl: ItemSequenceWorkList, o: torch.Tensor, lse: torch.Ten
         q=wl.q, k=wl.k, v=wl.v, o=o, lse=lse, block_ids=wl.block_ids, block_lens=wl.block_lens, seq_kv_lens=wl.seq_kv_lens, top_k=wl.top_k, scale=scale
     )
     assert a.check_support()
+    a.compile()  # plan time: the adapter never compiles on the execute path (the declared block_lens presence selects the variant)
     a.execute(stream=stream)
     torch.cuda.synchronize()
 
