@@ -4410,10 +4410,11 @@ def test_sdpa_fwd_cc107_paged_thd_sink_plans_L0(env_info, request, cudnn_handle,
     """The paged serving contract (cc 10.7 paged THD queries with an attention sink) under P3's plan pins: the vLLM
     verify shape (bf16, HND page pools, 64/8 d128, B24 with 1 / 4 / 8 tokens per request, mixed caches up to 2056 keys
     incl. 0 / 1 / 15 / 16 / 129, bottom-right causal, sinks linspace(7, 10, H_q), Stats).  ``default`` asserts routing
-    and ADMISSION (both packings at cga2 are offered and none splits -- the sink); the pins run every class the row
-    admits there: PackGQA / unpacked at cga2 and at cga1 (the two-slab paged prefill body, supports_paged_prefill_cga1),
-    all on the shared prefill body (template prefill_d128_f16 -- the decode tile has no THD leg).  RED while the row
-    declines paged KV with a sink ("Rubin paged KV requires THD without an attention sink")."""
+    and ADMISSION (the packed set at the two-slab cga1 width -- the serving plan the paged table measured for 192 units,
+    with or without the sink -- and an unpacked runner are offered, none splits -- the sink); the pins run every class
+    the row admits there: PackGQA / unpacked at cga2 and at cga1 (the two-slab paged prefill body,
+    supports_paged_prefill_cga1), all on the shared prefill body (template prefill_d128_f16 -- the decode tile has no THD
+    leg).  RED while the row declines paged KV with a sink ("Rubin paged KV requires THD without an attention sink")."""
     engine = _cc107_engine("half")
     _require_frost_sm107(engine)
     cfg = ExecConfig(
@@ -4458,7 +4459,8 @@ def test_sdpa_fwd_cc107_paged_thd_sink_plans_L0(env_info, request, cudnn_handle,
         if plan == "default":
             hook = _record_cc107_half_plans()
             _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, template="prefill_d128_f16", plan_hook=hook, tensor_initializer=sinks)
-            assert {(1, 2, 1), (0, 2, 1)} <= hook.offered and all(split == 1 for _, _, split in hook.offered), hook.offered
+            assert (1, 1, 1) in hook.offered and any(pack == 0 for pack, _, _ in hook.offered), hook.offered
+            assert all(split == 1 for _, _, split in hook.offered), hook.offered
         else:
             hook, knobs, _ = _pin_knobs(plan)
             _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template="prefill_d128_f16", tensor_initializer=sinks)
