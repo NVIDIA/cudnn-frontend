@@ -348,7 +348,8 @@ def test_update_quant_scales_under_o_fp4_records_the_spec():
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
 def test_update_quant_scales_is_stream_ordered(family, how):
     """The default stream is parked behind a long spin; ``update_quant_scales(B)`` -- on the ambient side stream, or with the side stream
-    passed as ``current_stream`` -- and the execute that follows run on the side stream, the workspace is zeroed right after.  A write
+    passed as ``current_stream`` while the ambient stream stays the parked default stream (the handle alone carries the side stream)
+    -- and the execute that follows run on the side stream, the workspace is zeroed right after.  A write
     that escaped to the default stream would land LATE (after the execute consumed the old scalars) and the result would differ from
     the eager ``B`` result, which it must equal BITWISE."""
     import cuda.bindings.driver as cuda_drv
@@ -366,11 +367,20 @@ def test_update_quant_scales_is_stream_ordered(family, how):
     ws2 = torch.zeros_like(r.ws)
     torch.cuda.synchronize()
     park_the_default_stream()
-    with torch.cuda.stream(side):
-        cs = None if how == "ambient" else cuda_drv.CUstream(side.cuda_stream)
+    if how == "ambient":
+        with torch.cuda.stream(side):
+            r.blk.update_quant_scales(b)
+            _execute_fwd(r, r.blk, out2, ws2, saved=saved2)
+            ws2.zero_()
+    else:
+        # STRICT: the ambient stream stays the (parked) default stream and the side stream reaches the API through the handle
+        # alone -- an update or a stage that used torch's current stream would land on the parked stream, late
+        assert torch.cuda.current_stream() == torch.cuda.default_stream()
+        cs = cuda_drv.CUstream(side.cuda_stream)
         r.blk.update_quant_scales(b, current_stream=cs)
         _execute_fwd(r, r.blk, out2, ws2, saved=saved2, current_stream=cs)
-        ws2.zero_()
+        with torch.cuda.stream(side):
+            ws2.zero_()
     torch.cuda.synchronize()
     assert torch.equal(out2, out_b), f"the update or a stage escaped the caller's stream ({how})"
     assert torch.equal(saved2.o, saved_b.o) and torch.equal(saved2.lse, saved_b.lse), f"the record written on the side stream differs ({how})"
@@ -383,7 +393,8 @@ def test_first_execute_writes_the_scales_on_its_launch_stream(family, how, tmp_p
     """``compile()`` fills the device scalars on whatever stream is ambient then; the FIRST execute writes their VALUES again on ITS
     launch stream, so a block compiled on one stream and first executed on another reads what its execution stream wrote.  Pinned
     without a timing window: the compile-time values are POISONED to NaN (synchronously) after ``compile()`` and the first execute runs
-    on a side stream (ambient, or explicit) -- its output is bitwise the synchronised run's and the scalars read back as ``spec``'s.
+    on a side stream (ambient, or explicit with the ambient stream left at the default stream) -- its output is bitwise the
+    synchronised run's and the scalars read back as ``spec``'s.
     The write is one-shot per compile: a second poison is NOT repaired by the second execute (``update_quant_scales`` is the caller's
     path to a new value), which pins where the write sits.  With CUPTI available, every device-side record of the first execute ran on
     ONE stream (the fills included)."""
@@ -402,10 +413,15 @@ def test_first_execute_writes_the_scales_on_its_launch_stream(family, how, tmp_p
     torch.cuda.synchronize()
     assert all(v != v for v in _dev_values(blk).values()), "the poison did not land"
     side = torch.cuda.Stream()
-    cs = None if how == "ambient" else cuda_drv.CUstream(side.cuda_stream)
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        with torch.cuda.stream(side):
-            _execute_fwd(ref, blk, out, ws, saved=saved, current_stream=cs)
+        if how == "ambient":
+            with torch.cuda.stream(side):
+                _execute_fwd(ref, blk, out, ws, saved=saved)
+        else:
+            # STRICT: the ambient stream stays the default stream and the side stream reaches execute through the handle alone,
+            # so a fill or a stage that used torch's current stream shows up as a SECOND stream in the trace below
+            assert torch.cuda.current_stream() == torch.cuda.default_stream()
+            _execute_fwd(ref, blk, out, ws, saved=saved, current_stream=cuda_drv.CUstream(side.cuda_stream))
         side.synchronize()
     torch.cuda.synchronize()
     assert torch.equal(out, ref.out), f"the first execute on the side stream read the poisoned compile-time scalars ({how})"
