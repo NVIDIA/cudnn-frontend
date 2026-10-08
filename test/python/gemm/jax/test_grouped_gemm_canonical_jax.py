@@ -347,6 +347,46 @@ def test_jax_namespace_rejects_mixed_frameworks_and_missing_alpha(backward):
         wrapper(**inputs)
 
 
+@pytest.mark.parametrize(
+    "module,name,replacement",
+    [
+        ("cudnn.jax", "grouped_gemm_swiglu", "grouped_gemm_glu_jax_sm100"),
+        ("cudnn", "grouped_gemm_swiglu_wrapper_sm100", "grouped_gemm_glu_wrapper_sm100"),
+        ("cudnn.torch", "grouped_gemm_swiglu", "grouped_gemm_glu_wrapper_sm100"),
+        ("cudnn", "GroupedGemmSwigluSm100", "GroupedGemmGluSm100"),
+    ],
+)
+def test_standalone_swiglu_apis_warn_deprecated_once(module, name, replacement):
+    import importlib
+    import warnings
+    from cudnn._deprecation import reset_deprecation_warnings
+
+    api = getattr(importlib.import_module(module), name)
+    reset_deprecation_warnings()
+    # The warning fires before argument binding, so a bare call is enough.
+    with pytest.warns(DeprecationWarning, match=replacement), pytest.raises(TypeError):
+        api()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        with pytest.raises(TypeError):
+            api()
+
+
+def test_deprecated_swiglu_wrapper_warns_only_for_itself():
+    skip_unless_sm100()
+    import warnings
+    import cudnn
+    from cudnn._deprecation import reset_deprecation_warnings
+
+    inputs = {name: jnp.asarray(array) for name, array in problem(False, 1, True, False).items()}
+    reset_deprecation_warnings()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cudnn.grouped_gemm_swiglu_wrapper_sm100(**inputs, d_dtype=ml_dtypes.float8_e4m3fn, sf_vec_size=32)
+    messages = [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert len(messages) == 1 and messages[0].startswith("grouped_gemm_swiglu_wrapper_sm100")
+
+
 def test_no_separate_public_jax_entry_points():
     import cudnn
 

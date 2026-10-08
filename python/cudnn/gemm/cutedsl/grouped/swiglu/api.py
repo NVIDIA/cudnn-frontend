@@ -16,6 +16,7 @@ from typing import Tuple, Optional
 
 import cutlass
 
+from cudnn._deprecation import deprecated
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import TupleDict
 from cudnn.tensor_adapter import detect_framework, framework_dtype
@@ -31,6 +32,7 @@ _JAX_SF_LAYOUT_ERROR = (
 )
 
 
+@deprecated('GroupedGemmSwigluSm100 is deprecated; use GroupedGemmGluSm100 with act_func="swiglu" instead')
 class GroupedGemmSwigluSm100(GroupedGemmGluBlockScaledAPI):
     """API class for Grouped GEMM SwiGLU forward operation on SM100+ GPUs.
 
@@ -195,6 +197,10 @@ _logger = logging.getLogger(__name__)
 _cache_of_GroupedGemmSwigluSm100Objects = {}
 
 
+@deprecated(
+    "grouped_gemm_swiglu_wrapper_sm100 (cudnn.torch.grouped_gemm_swiglu) is deprecated; "
+    'use grouped_gemm_glu_wrapper_sm100 with act_func="swiglu" and generate_c=True instead'
+)
 def grouped_gemm_swiglu_wrapper_sm100(
     a_tensor: torch.Tensor,
     b_tensor: torch.Tensor,
