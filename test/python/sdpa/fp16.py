@@ -405,7 +405,8 @@ def create_forward_graph(cfg, tensors, cudnn_handle, plan=True, plan_hook=None):
     harness's WAIVED skip; ``plan=False`` returns the declared, un-planned graph for a caller that plans
     itself (a decline cell asserting the typed reason).  ``plan_hook(graph)`` runs after
     ``cfg.plan_pin`` and before check_support: a test-side plan pin (graph.create_execution_plan +
-    select_plan, strict) or a recorder of the offered plan list."""
+    select_plan, strict) or a recorder of the offered plan list (``hook.pins = False`` keeps the
+    default walk's WAIVED skip for it; a pin's decline FAILS the case)."""
     cudnn_dtype = convert_to_cudnn_type(cfg.data_type)
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -547,20 +548,29 @@ def create_forward_graph(cfg, tensors, cudnn_handle, plan=True, plan_hook=None):
             stats.set_ragged_offset(stats_ragged_offset)
 
     if plan:
+        # A pin is strict: once ``cfg.plan_pin`` or a pinning ``plan_hook`` selected a plan, a decline is a FAIL, never
+        # the WAIVED skip of the default walk (so a ``--repro`` replay of a pinned config cannot look green); a hook
+        # that only records the offered plans says so with ``hook.pins = False``.
+        pinned = False
         try:
             graph.validate()
             graph.build_operation_graph()
             graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
             _apply_plan_pin(graph, cfg)
+            pinned = bool(getattr(cfg, "plan_pin", None))
             if plan_hook is not None:
                 # Test-side plan pin: append / select an explicit plan (strict -- a declined pin raises in check_support / build_plans).
                 plan_hook(graph)
+                pinned = pinned or bool(getattr(plan_hook, "pins", True))
             graph.check_support()
             graph.build_plans()
             # FROST auto-selection resolved at build_plans (first eligible engine,
             # native fallback on build failure); tally the outcome.
             note_frost_routing(graph, label="fp16-fwd")
         except cudnn.cudnnGraphNotSupportedError as e:
+            if pinned:
+                print(f"@@@@ Overall result: FAILED, the pinned plan declined. {e}")
+                pytest.fail(f"pinned plan declined (a pin is strict): {e}", pytrace=False)
             print(f"@@@@ Overall result: WAIVED, not supported forward graph. {e}")
             pytest.skip("not supported forward graph")
         except Exception as e:

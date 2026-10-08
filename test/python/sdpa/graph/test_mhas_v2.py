@@ -3997,6 +3997,7 @@ def _record_cc107_half_plans():
     def hook(graph):
         hook.offered = _cc107_half_plan_sets(graph)
     hook.offered = None
+    hook.pins = False  # records only: a decline of the default walk stays the harness's WAIVED skip (_must_run fails it)
     return hook
 
 
@@ -4014,6 +4015,7 @@ def _pin_cc107_half_plan(*, cga, pack_gqa, split_kv=1, sched=0):
         )
         graph.select_plan(graph.get_execution_plan_count() - 1)
     hook.offered = None
+    hook.pins = True  # strict: a decline of the pinned plan FAILS the case in sdpa.fp16.create_forward_graph
     return hook
 
 
