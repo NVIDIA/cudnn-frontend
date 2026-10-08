@@ -14,11 +14,70 @@
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #ifdef _WIN32
+#include <cuda_runtime_api.h>
+#if CUDART_VERSION < 13000 || CUDART_VERSION >= 14000
+#error "cuDNN Frontend dynamic loading on Windows requires CUDA 13 headers and a CUDA 13 runtime"
+#endif
 #define NOMINMAX
 #include <windows.h>
-#define dlerror() static_cast<UINT_PTR>(GetLastError())
-#define dlopen(x, y) LoadLibrary(x)
-#define dlsym(x, y) GetProcAddress(x, y)
+#include <string>
+
+namespace cudnn_frontend::detail {
+inline const char *
+windows_dlerror() {
+    const auto code = GetLastError();
+    SetLastError(ERROR_SUCCESS);
+    if (code == ERROR_SUCCESS) {
+        return nullptr;
+    }
+    static thread_local std::string message;
+    message = "Windows error " + std::to_string(code);
+    return message.c_str();
+}
+
+inline HMODULE
+windows_dlopen(const char *name) {
+    // DEFAULT_DIRS includes directories registered by Python's
+    // os.add_dll_directory(). The legacy search is retained as a fallback for
+    // callers that supply their CUDA installation through PATH.
+    DWORD flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    std::string full_path;
+    const char *library = name;
+    if (std::string(name).find_first_of("\\/:") != std::string::npos) {
+        const DWORD size = GetFullPathNameA(name, 0, nullptr, nullptr);
+        if (size) {
+            full_path.resize(size);
+            const DWORD written = GetFullPathNameA(name, size, full_path.data(), nullptr);
+            if (written && written < size) {
+                full_path.resize(written);
+                library = full_path.c_str();
+                flags |= LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
+            }
+        }
+    }
+    auto handle = LoadLibraryExA(library, nullptr, flags);
+    if (!handle) {
+        handle = LoadLibraryA(name);
+    }
+    if (handle) {
+        SetLastError(ERROR_SUCCESS);
+    }
+    return handle;
+}
+
+inline FARPROC
+windows_dlsym(HMODULE handle, const char *name) {
+    auto symbol = GetProcAddress(handle, name);
+    if (symbol) {
+        SetLastError(ERROR_SUCCESS);
+    }
+    return symbol;
+}
+}  // namespace cudnn_frontend::detail
+
+#define dlerror() cudnn_frontend::detail::windows_dlerror()
+#define dlopen(x, y) cudnn_frontend::detail::windows_dlopen(x)
+#define dlsym(x, y) cudnn_frontend::detail::windows_dlsym(x, y)
 #define dlclose(x) FreeLibrary(x)
 #else
 #include <dlfcn.h>
@@ -102,6 +161,32 @@ load_cuda_so() {
     return handle;
 }
 
+#ifdef _WIN32
+inline HMODULE
+validate_cuda13_runtime(HMODULE handle, const char *library) {
+    // CUDA 13 graph wrappers use CUDA 13 signatures. Symbol names alone do not
+    // distinguish those signatures from the incompatible CUDA 12 entry points.
+    dlerror();
+    auto symbol       = dlsym(handle, "cudaRuntimeGetVersion");
+    const char *error = reinterpret_cast<const char *>(dlerror());
+    if (!symbol || error) {
+        const std::string message = "Cannot validate CUDA 13 runtime " + std::string(library) + ": " +
+                                    std::string(error ? error : "cudaRuntimeGetVersion unavailable");
+        dlclose(handle);
+        throw std::runtime_error(message);
+    }
+    int version = 0;
+    auto status = reinterpret_cast<decltype(&cudaRuntimeGetVersion)>(symbol)(&version);
+    if (status != cudaSuccess || version / 1000 != 13) {
+        dlclose(handle);
+        throw std::runtime_error("CUDA 13 runtime required; " + std::string(library) + " reported version " +
+                                 std::to_string(version) + " (cudaRuntimeGetVersion status " +
+                                 std::to_string(static_cast<int>(status)) + ")");
+    }
+    return handle;
+}
+#endif
+
 inline HMODULE
 load_cudart_so() {
     // Clear any existing error
@@ -113,7 +198,7 @@ load_cudart_so() {
     // search path. In such cases the automatic detection below warns about the ambiguity
     // (see below) and falls back to the first match. Setting CUDNN_FRONTEND_CUDART_LIB_NAME
     // to the desired library name (or path), e.g. "libcudart.so.13", bypasses the detection
-    // and loads exactly that library.
+    // and loads exactly that library. On Windows, overrides must also report CUDA 13.
     const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
     if (user_lib) {
         if (user_lib[0] != '\0') {
@@ -123,23 +208,28 @@ load_cudart_so() {
                     "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
                     std::string(user_lib) + "): " + last_dl_error());
             }
+#ifdef _WIN32
+            return validate_cuda13_runtime(handle, user_lib);
+#else
             return handle;
+#endif
         }
     }
 
-    // List of potential libcudart libraries (Adding major version to support python package)
 #ifdef _WIN32
-    // Only the runtime matching the compiled CUDA major is ABI-compatible with the versioned
-    // entry points below (e.g. cudaStreamGetCaptureInfo), so there is no cross-major fallback.
-#if CUDART_VERSION >= 13000
-    constexpr const char *libs[] = {"cudart64_13.dll"};
+    // Windows dynamic loading currently supports CUDA 13 only.
+    constexpr const char *library = "cudart64_13.dll";
+    HMODULE handle                = dlopen(library, RTLD_NOW);
+    const char *error             = reinterpret_cast<const char *>(dlerror());
+    if (!handle || error) {
+        throw std::runtime_error("CUDA 13 runtime unavailable: unable to load " + std::string(library) + ": " +
+                                 std::string(error ? error : "Unknown error"));
+    }
+    return validate_cuda13_runtime(handle, library);
 #else
-    constexpr const char *libs[] = {"cudart64_12.dll"};
-#endif
-#else
+    // List of potential libcudart libraries (Adding major version to support python package)
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
-#endif
-    constexpr size_t num_libs = sizeof(libs) / sizeof(libs[0]);
+    constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
 
     HMODULE lib_handle = nullptr;
     int loaded_index   = -1;
@@ -176,6 +266,7 @@ load_cudart_so() {
     }
 
     return lib_handle;
+#endif
 }
 
 inline void *
