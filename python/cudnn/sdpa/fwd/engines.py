@@ -415,6 +415,25 @@ class Capabilities:
     # (config_sm100 / config_sm107.SM10x_SCORE_STATS_SHAPES, rule 8b').  APPENDED
     # after thd_pack_gqa_d_shapes (append-only contract above).
     score_stats_d_shapes: Optional[frozenset] = None
+    # Shapes that carry the row's DENSE leg only -- the Rubin 32- / 64-wide
+    # tiles of the f16/bf16 d128 file (config_sm107.SM107_F16_SMALL_D_SHAPES).
+    # ``_selected_d_shape`` takes such a shape only for a graph that asks for
+    # nothing beyond that leg: no THD, no paged KV, no split_kv > 1, no
+    # PackGQA, no score side outputs, and a cga (when requested) inside the
+    # shape's cgas_by_d_shape domain.  Any other graph walks PAST it to the
+    # next covering shape -- the d128 flavor it rode before the tile existed,
+    # where those legs are wired and validated -- instead of a decline, so a
+    # new native tile never withdraws a graph the row served through the
+    # envelope, and a persisted autotune record keeps working (a cga2 request
+    # at D <= 32 lands on the 64-wide tile, the smallest covering shape
+    # validated at that width).  Empty on every other row: their native shapes
+    # either carry a leg or decline it (the SM100 native d64's split / score
+    # declines describe THAT kernel; the row never served d64 through an
+    # envelope, so there is no route to fall back to).  The standalone adapter
+    # walks the same predicate (config_sm107.sm107_small_tile_leg /
+    # sm107_f16_tile_width(leg=, cga=), rule 8b').  APPENDED after
+    # score_stats_d_shapes (append-only contract above).
+    dense_only_d_shapes: frozenset[tuple[int, int]] = frozenset()
 
 
 def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
@@ -632,11 +651,25 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     return None
 
 
-def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> Optional[tuple[int, int]]:
+def _beyond_dense_leg(facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> bool:
+    """Whether the graph asks for a leg beyond the dense one a ``dense_only_d_shapes`` tile carries: THD, paged KV, the
+    score side outputs (graph facts), split_kv > 1 or PackGQA (knobs).  The twin of ``config_sm107.sm107_small_tile_leg``."""
+    if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp:
+        return True
+    return knobs is not None and ((knobs.split_kv or 1) > 1 or bool(knobs.pack_gqa))
+
+
+def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> Optional[tuple[int, int]]:
     """Smallest native flavor whose envelope covers this graph -- honouring the
     per-shape envelope floors, so the knob domains (cga, split) describe the
     flavor the lowering will actually pick (api_dsl._pick_flavor walks the same
-    floors). An exact native shape is always its own selection."""
+    floors). An exact native shape is always its own selection -- except a
+    ``dense_only_d_shapes`` tile, which is taken only for a graph on the dense
+    leg (``_beyond_dense_leg`` False) at a cga inside its domain (``knobs.cga``
+    unset or in ``cgas_by_d_shape``); otherwise the walk continues to the next
+    covering shape, the route the graph took before the tile existed.  Callers
+    that know the knobs pass them (``mismatch``, ``effective_cgas``); a
+    knob-less call sees the graph-fact legs only."""
 
     floors = dict(capabilities.d_envelope_floors)
     covering = [
@@ -644,6 +677,15 @@ def _selected_d_shape(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") ->
         for shape in capabilities.d_shapes
         if facts.d_qk <= shape[0] and facts.d_v <= shape[1] and ((facts.d_qk, facts.d_v) == shape or min(facts.d_qk, facts.d_v) > floors.get(shape, 0))
     ]
+    if capabilities.dense_only_d_shapes:
+        beyond = _beyond_dense_leg(facts, knobs)
+        cga = knobs.cga if knobs is not None else None
+        domains = dict(capabilities.cgas_by_d_shape)
+        covering = [
+            shape
+            for shape in covering
+            if shape not in capabilities.dense_only_d_shapes or (not beyond and (cga is None or cga in domains.get(shape, capabilities.cgas)))
+        ]
     return min(covering, key=lambda shape: (shape[0], shape[1])) if covering else None
 
 
@@ -653,14 +695,16 @@ def pack_gqa_partial(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> 
     return capabilities.pack_gqa_partial_d_shapes is not None and _selected_d_shape(capabilities, facts) in capabilities.pack_gqa_partial_d_shapes
 
 
-def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> frozenset[int]:
+def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
     """Scheduler domain of the native flavor the lowering will pick.
 
     Row-wide `sched_policies` is the floor; a `sched_policies_by_d_shape` entry
     for the selected flavor replaces it. That is what lets one Rubin row serve a
-    d256 kernel that honours LPT next to flavors that do not.
+    d256 kernel that honours LPT next to flavors that do not.  ``knobs`` (when
+    the caller has them) route a dense-only tile's non-dense legs to the flavor
+    that carries them (``_selected_d_shape``).
     """
-    selected = _selected_d_shape(capabilities, facts)
+    selected = _selected_d_shape(capabilities, facts, knobs)
     if selected is not None:
         for shape, shape_domain in capabilities.sched_policies_by_d_shape:
             if shape == selected:
@@ -668,10 +712,16 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     return capabilities.sched_policies
 
 
-def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
-    """CGA domain of the native flavor and split leg selected by the graph."""
+def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None, cga: Optional[int] = None) -> frozenset[int]:
+    """CGA domain of the native flavor and split leg selected by the graph.
 
-    selected = _selected_d_shape(capabilities, facts)
+    ``cga`` is the REQUESTED width when the caller validates one (``mismatch``):
+    on a row with ``dense_only_d_shapes`` the flavor a request lands on depends
+    on it (a cga2 request at D <= 32 selects the 64-wide tile, not the
+    cga1-only 32-wide one), so the domain returned is that flavor's.  Without
+    it (the heuristics' auto pick) the domain is the dense selection's."""
+
+    selected = _selected_d_shape(capabilities, facts, SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None)
     if (split_kv or 1) > 1 and thd_split_domain(capabilities, facts):
         return frozenset({1})
     if capabilities.sm_lo == 107 and thd_split_domain(capabilities, facts) and not facts.has_paged_kv and selected == (192, 128):
@@ -718,10 +768,10 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if not isinstance(knobs, SdpaFwdKnobs):
             return f"knob request is a {type(knobs).__name__}, not SdpaFwdKnobs — wrong operation's vocabulary"
         for value, domain, label in (
-            (knobs.sched_policy, effective_sched_policies(capabilities, facts), "sched_policy"),
+            (knobs.sched_policy, effective_sched_policies(capabilities, facts, knobs), "sched_policy"),
             (knobs.tile_m, capabilities.tile_ms, "tile_m"),
             (knobs.tile_n, capabilities.tile_ns, "tile_n"),
-            (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv), "cga"),
+            (knobs.cga, effective_cgas(capabilities, facts, knobs.split_kv, knobs.cga), "cga"),
             (knobs.pack_gqa, capabilities.pack_gqas, "pack_gqa"),
         ):
             if value is not None and value not in domain:
@@ -750,7 +800,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and facts.thd
             and not (ragged_decode or packed_split)
             and capabilities.sm_lo == 100
-            and _selected_d_shape(capabilities, facts) == (128, 128)
+            and _selected_d_shape(capabilities, facts, knobs) == (128, 128)
         ):
             return (
                 "cga=1 on the d128 flavor selects the decode tile, which serves ragged Q over paged K/V with ragged Stats at S_q == 1, or exact D128 with split_kv > 1; "
@@ -798,14 +848,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # (64, 64) "fits" (128, 128) and admits a split the d64 kernel
             # cannot serve, so the plan would clear eligibility and then die in
             # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
-            if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
+            # With the knobs: a dense-only tile (the Rubin d32 / d64) is walked
+            # past, so a split graph at D <= 64 selects the d128 flavor it
+            # rode before the tiles -- served, not declined.
+            if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts, knobs) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:
             # _selected_d_shape, not the raw dims: the FP8 rows carry
             # d_pad_multiple=16, so an inexact graph (D=112) lowers onto the
             # smallest covering NATIVE flavor (d128) -- which is the kernel
             # whose PackGQA wiring the set is describing.
-            if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
+            if _selected_d_shape(capabilities, facts, knobs) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa:
             if facts.thd and not ragged_decode and (facts.d_qk, facts.d_v) not in capabilities.thd_pack_gqa_d_shapes:
@@ -947,7 +1000,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         if facts.has_paged_kv:
             return "score_max / score_sum_exp are not wired on the paged-KV flavors"
         if capabilities.score_stats_d_shapes is not None:
-            selected = _selected_d_shape(capabilities, facts)
+            # The ports are graph facts, so even a knob-less selection walks past a dense-only tile: a Rubin
+            # d24 / d64 graph with the outputs selects the d128 flavor that stores them (its pre-tile route).
+            selected = _selected_d_shape(capabilities, facts, knobs)
             if selected not in capabilities.score_stats_d_shapes:
                 wired = ", ".join(f"d{sq}" if sq == sv else f"d{sq}x{sv}" for sq, sv in sorted(capabilities.score_stats_d_shapes))
                 return f"score_max / score_sum_exp are wired on the {wired} kernel flavors only; head dims ({facts.d_qk}, {facts.d_v}) select {selected}"
@@ -1295,11 +1350,16 @@ def _sm107_spec() -> EngineSpec:
     (the TMA 16-byte global-stride rule at 2 B/elem) is a typed decline, never
     a padded copy.  The small tiles serve the dense feature set (causal /
     bottom-right / right band / SWA / padded / sink / GQA / Stats) at the
-    validated widths of ``SM107_SMALL_D_CGAS``; THD, split-KV, paged KV,
-    PackGQA and the score side outputs stay on the shapes that carry them
-    (``thd_d_shapes`` / ``split_d_shapes`` / ``paged_d_shapes`` /
-    ``pack_gqa_d_shapes`` / ``score_stats_d_shapes`` -- each a typed decline on
-    the small tiles).
+    validated widths of ``SM107_SMALL_D_CGAS`` -- and ONLY that
+    (``dense_only_d_shapes``): a graph that asks for THD, split-KV, paged KV,
+    PackGQA, the score side outputs or a cga outside the tile's domain is
+    selected PAST the small tiles onto the d128 flavor it rode before they
+    existed (zero-filled to 128, where ``thd_d_shapes`` / ``split_d_shapes`` /
+    ``paged_d_shapes`` / ``pack_gqa_d_shapes`` / ``score_stats_d_shapes`` and
+    the cga2 domain apply exactly as before), so the tiles withdraw nothing the
+    row served: split-KV and the score outputs at D <= 64 stay served on d128,
+    a cga2 request at D <= 32 lands on the 64-wide tile, and THD / paged /
+    PackGQA at D <= 64 keep their pre-tile typed declines (exact-shape legs).
     """
     return EngineSpec(
         name="sdpa_fwd_prefill_sm107",
@@ -1395,10 +1455,16 @@ def _sm107_spec() -> EngineSpec:
             epilogue_gate_d_shapes=SM107_EPILOGUE_GATE_SHAPES,
             # Score side outputs (score_max / score_sum_exp): the Rubin d128 f16/bf16 prefill kernel
             # stores them from its correction epilogue (dense / unsplit / unpaged); the other flavors
-            # decline until their files carry the store (the set is the claim, rule 8b').
+            # decline until their files carry the store (the set is the claim, rule 8b').  A d <= 64
+            # graph with the outputs selects the d128 flavor (dense_only_d_shapes below), as before
+            # the small tiles.
             score_max=True,
             score_sum_exp=True,
             score_stats_d_shapes=SM107_SCORE_STATS_SHAPES,
+            # The small tiles carry the dense leg only: every other leg (and a cga outside the tile's
+            # domain) is routed past them to the d128 flavor -- see the field's doc and the row
+            # docstring.  ONE constant with the adapter's pool (config_sm107, rule 8b').
+            dense_only_d_shapes=SM107_F16_SMALL_D_SHAPES,
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM100),
     )

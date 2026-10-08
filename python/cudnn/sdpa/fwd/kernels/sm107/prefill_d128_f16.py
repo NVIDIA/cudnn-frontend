@@ -16,10 +16,12 @@ by hand:
   2. **TMA descriptors.** ``create_tensor_map_tiled_from_tensor`` became
      ``..._from_view`` — a signature change, not a rename.
 
-Geometry is FROST's ``make_cfg_d128`` as-is. the pre-upstream helper would give
-STAGES_KV = 2*CTA_MMA (4 at cga2) where FROST gives 2; the deeper ring is a
-PERF lever and this port is for FUNCTIONAL coverage first, so it is deliberately
-not taken here.
+Geometry is FROST's ``make_cfg_d128`` as-is for the 128-wide tile: the
+pre-upstream helper would give STAGES_KV = 2*CTA_MMA (4 at cga2) where FROST
+gives 2; the deeper ring is a PERF lever and this port was for FUNCTIONAL
+coverage first, so it is deliberately not taken on d128.  The 32- and 64-wide
+tiles below run STAGES_KV = 4 at cga1 (``config_sm107._stages_kv_d128``, the
+SM100 d64 precedent -- inherited, not A/B'd).
 
 **Head-dim tile flavors (``TemplateParams.d_flavor`` in {32, 64, 128}).**  One
 body, three ``Cfg`` geometries: ``make_cfg_d32`` / ``make_cfg_d64`` /

@@ -828,7 +828,9 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     the graph-level question.  The other flavors' rules ignore it."""
     caps = spec.capabilities
     domain = effective_cgas(caps, facts, split_kv)
-    selected_shape = _selected_d_shape(caps, facts)
+    # The leg's knobs ride along: on a row with dense-only tiles (the Rubin d32 / d64) a split or packed leg at D <= 64
+    # selects the d128 flavor, so the rule below reasons about the shape that leg actually lands on.
+    selected_shape = _selected_d_shape(caps, facts, SdpaFwdKnobs(split_kv=split_kv, pack_gqa=pack_gqa))
     if selected_shape == (192, 128) and (split_kv or 1) > 1 and domain == frozenset({1}):
         # The packed THD split ABI uses the single-Q tile. The existing dense
         # D192 split remains a two-CTA lowering.

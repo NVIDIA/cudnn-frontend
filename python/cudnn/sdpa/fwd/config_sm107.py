@@ -108,6 +108,7 @@ __all__ = [
     "SM107_F16_SMALL_D_SHAPES",
     "SM107_SMALL_D_CGAS",
     "sm107_f16_tile_width",
+    "sm107_small_tile_leg",
     "D128FamilyTmemLayout",
     "d128_family_tmem_layout",
     "epilogue_gate_layout_declarable",
@@ -214,27 +215,65 @@ SM107_SCORE_STATS_SHAPES = frozenset({(128, 128)})
 # global-stride rule at 2 B/elem.  The two small shapes are the ROW's native flavors next to d128 (one constant for the
 # engine row's d_shapes / cga domain, the adapter's kernel-file map and the tests -- rule 8b'); D > 128 belongs to the
 # d192 / d256 / d512 rows.
+#
+# The small tiles carry the row's DENSE leg only (causal / bottom-right / right band / SWA / padded / sink / GQA / Stats, at
+# the cga widths of SM107_SMALL_D_CGAS).  A graph that asks for a leg beyond it -- THD, paged KV, split-KV, PackGQA, the
+# score side outputs (``sm107_small_tile_leg``) -- or for a cga outside the tile's domain is NOT declined: the pick walks
+# PAST the small tiles to the next covering width, i.e. the d128 flavor the graph rode before the tiles existed (zero-filled
+# to 128, where those legs are wired and validated), so nothing the row served before the tiles is withdrawn.  The engine
+# row says it as ``Capabilities.dense_only_d_shapes``; the adapter's flavor pool and ``sm107_f16_tile_width(leg=, cga=)``
+# are the twins (rule 8b').  Serving a leg natively on a small tile = validating it there and taking the tile out of that set.
 SM107_HEAD_DIM_TILE_WIDTHS = (32, 64, 128)
 SM107_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
 # cga widths the small tiles are VALIDATED at (the engine row's ``cgas_by_d_shape`` reads this; the factory refuses a width
 # outside it).  cga1 is the default: the narrow slabs need no collective MMA to halve K/V, and a 512-row cga2 cluster wastes
 # 25-50 % of its Q rows at the S = 256-384 crops these tiles exist for.  At TILE_O = 32 a cga2 V operand would be 16 columns
-# = a 32-byte MN-major swizzle atom, which no shipped kernel runs -- declined until measured.
+# = a 32-byte MN-major swizzle atom, which no shipped kernel runs -- declined until measured (a cga2 request at D <= 32 lands
+# on the 64-wide tile, the smallest covering one validated at that width).
 SM107_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
 
 
-def sm107_f16_tile_width(d_qk: int, d_v: int) -> Optional[int]:
+def sm107_small_tile_leg(
+    *, thd: bool = False, paged: bool = False, split_kv: Optional[int] = 1, pack_gqa: Optional[bool] = False, score_stats: bool = False
+) -> Optional[str]:
+    """The leg a graph asks for BEYOND the dense one the Rubin small head-dim tiles carry -- ``"THD"``, ``"paged KV"``,
+    ``"split-KV"``, ``"PackGQA"`` or ``"score side outputs"`` -- or ``None`` for a graph on the dense leg.  A non-None leg
+    routes the graph past the small tiles onto the d128 flavor (the pre-tile route); the engine row spells the same predicate
+    on its graph facts and knobs (``engines._selected_d_shape`` over ``Capabilities.dense_only_d_shapes``), the adapter calls
+    this one, and the tests assert the two agree on every (D, leg) cell (rule 8b')."""
+    if thd:
+        return "THD"
+    if paged:
+        return "paged KV"
+    if (split_kv or 1) > 1:
+        return "split-KV"
+    if pack_gqa:
+        return "PackGQA"
+    if score_stats:
+        return "score side outputs"
+    return None
+
+
+def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga: Optional[int] = None) -> Optional[int]:
     """The head-dim tile width the Rubin f16/bf16 row serves ``(d_qk, d_v)`` on: the smallest of
     :data:`SM107_HEAD_DIM_TILE_WIDTHS` covering both -- 8 / 16 / 24 -> 32, 40 / 48 / 56 -> 64, 72..120 -> 128, and 32 / 64 /
     128 native -- or ``None`` when no width covers them (D > 128: the d192 / d256 / d512 rows) or a dim is not a multiple of 8
-    (the TMA 16-byte global-stride rule at 2 B/elem: a typed decline, never a padded copy).  The engine row (``d_shapes`` and the
-    envelope walk of ``engines._selected_d_shape``) and the adapter (``api_dsl._pick_flavor`` over its Rubin pool) implement the
-    SAME pick; the tests assert the three agree for every served D (rule 8b')."""
+    (the TMA 16-byte global-stride rule at 2 B/elem: a typed decline, never a padded copy).
+
+    ``leg`` (:func:`sm107_small_tile_leg`) and ``cga`` make the pick feature-aware: a small tile is taken only for a graph on
+    the dense leg (``leg is None``) at a cga inside :data:`SM107_SMALL_D_CGAS` (or unset); otherwise the walk continues to the
+    next covering width -- a split-KV / score-output graph at D <= 64 lands on 128 (its pre-tile route), a cga2 request at
+    D <= 32 on 64.  The engine row (``d_shapes`` + ``dense_only_d_shapes``, the envelope walk of ``engines._selected_d_shape``)
+    and the adapter (``api_dsl._pick_flavor`` over its Rubin pool) implement the SAME pick; the tests assert the three agree for
+    every served D and every leg (rule 8b')."""
     d = max(int(d_qk), int(d_v))
     if min(int(d_qk), int(d_v)) <= 0 or int(d_qk) % 8 or int(d_v) % 8:
         return None
     for width in SM107_HEAD_DIM_TILE_WIDTHS:
         if d <= width:
+            small = (width, width) in SM107_F16_SMALL_D_SHAPES
+            if small and (leg is not None or (cga is not None and cga not in SM107_SMALL_D_CGAS[(width, width)])):
+                continue
             return width
     return None
 
@@ -1120,13 +1159,16 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
 def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
     """The 32-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim
     <= 32 with D % 8 == 0 (8 / 16 / 24 / 32) by TMA zero fill; cga1 (SM107_SMALL_D_CGAS); dense / causal / bottom-right /
-    SWA / padded / sink / GQA like d128; THD, split-KV, paged KV, PackGQA and the score side outputs are typed declines."""
+    SWA / padded / sink / GQA like d128.  THD, split-KV, paged KV, PackGQA and the score side outputs are NOT wired on the
+    tile: the row routes a graph asking for them onto the d128 flavor (``engines.Capabilities.dense_only_d_shapes``), and this
+    factory refuses the THD record for the flavor."""
     return _make_cfg_d128_family(params, flavor="sm107 d32", tile_k=32, tile_o=32, mxfp8=False)
 
 
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
     """The 64-wide head-dim tile of ``sm107/prefill_d128_f16.py`` (``TemplateParams.d_flavor=64``): every f16/bf16 head dim in
-    (32, 64] with D % 8 == 0 (40 / 48 / 56 / 64) by TMA zero fill; the same feature set and declines as ``make_cfg_d32``."""
+    (32, 64] with D % 8 == 0 (40 / 48 / 56 / 64) by TMA zero fill; the same feature set and routing as ``make_cfg_d32`` (cga1
+    and cga2)."""
     return _make_cfg_d128_family(params, flavor="sm107 d64", tile_k=64, tile_o=64, mxfp8=False)
 
 

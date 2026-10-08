@@ -980,7 +980,7 @@ red (2026-09-08).
 | **Layout** | | | |  | | | |  |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
 | Arbitrary dense stride order (`dense_flex`) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌ᵇ³  |
-| THD / ragged (packed varlen) | ❌ᵗ | f16 ❌ᵗ · fp8 ❌ⁱⁱ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ✅ᵇ · mxfp8 ✅ᵐˣ (the quantized rows standalone and graph: the `sdpa_fp8_backward` / `sdpa_mxfp8_backward` nodes carry `max_total_seq_len_q/kv`; a ragged quantized graph without them — or through a pybind extension built before the attribute, which cannot declare them — is a typed decline) |  ❌ᵇ³  |
+| THD / ragged (packed varlen) | ❌ᵗ (the pre-tile decline) | f16 ❌ᵗ (the pre-tile decline) · fp8 ❌ⁱⁱ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | f16 ✅ᵇ · fp8 ✅ᵇ · mxfp8 ✅ᵐˣ (the quantized rows standalone and graph: the `sdpa_fp8_backward` / `sdpa_mxfp8_backward` nodes carry `max_total_seq_len_q/kv`; a ragged quantized graph without them — or through a pybind extension built before the attribute, which cannot declare them — is a typed decline) |  ❌ᵇ³  |
 | `cu_seq_len_q/kv` prefix sums (THD only) | ❌ᵗ | ❌ᵗ ⁱⁱ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ✅ᶻ | ❌ʲ (the backward node has no such port; the standalone adapter takes `(B+1,)` prefixes) |  ❌ʲ  |
 | **Masks / features** | | | |  | | | |  |
 | Causal (top-left) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
@@ -992,11 +992,11 @@ red (2026-09-08).
 | Dense padded-Q trim (O:=0, LSE:=−inf) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Base-2 stats (`stats_use_log2`) | ✅ᵗ | ✅ᵗ | ❔ | ❔ | ❔ | ❔ | — |  —  |
-| Score side outputs (`score_max` / `score_sum_exp`; dense / unsplit / unpaged, the cga2 prefill tile)ˢᶜ | ❌ᵗ | ❌ᵗ | ✅ f16/bf16 | ❌ | ❌ | ❌ | — |  —  |
+| Score side outputs (`score_max` / `score_sum_exp`; dense / unsplit / unpaged, the cga2 prefill tile)ˢᶜ | ✅ via the d128 flavorᵗ | ✅ via the d128 flavorᵗ | ✅ f16/bf16 | ❌ | ❌ | ❌ | — |  —  |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
-| PackGQA | ❌ᵗ | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ❌ | ❌ | — |  —  |
-| Split-KV | ❌ᵗ | per-tensor fp8, envelopeᵛⁱⁱ · f16/bf16 ❌ᵗ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |  —  |
-| Paged KV (half THD, no sink) | ❌ᵗ | fp8 envelope · f16/bf16 ❌ᵗ | ✅ | ❌ | ✅, unsplit | ❌ | — | — |
+| PackGQA | ❌ᵗ (the pre-tile decline) | fp8 only (f16/bf16: the pre-tile decline)ᵗ | fp8; half paged THD / nonpaged split THD | ❌ | ❌ | ❌ | — |  —  |
+| Split-KV | f16/bf16 via the d128 flavorᵗ (envelopeᵛⁱⁱ) | per-tensor fp8, envelopeᵛⁱⁱ · f16/bf16 via the d128 flavorᵗ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | ❌ᵛⁱⁱ | ❌ᵛⁱⁱ | — |  —  |
+| Paged KV (half THD, no sink) | ❌ᵗ (the pre-tile decline) | fp8 envelope · f16/bf16 ❌ᵗ (the pre-tile decline) | ✅ | ❌ | ✅, unsplit | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
 | Optional stats (LSE store compiled out) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
@@ -1280,11 +1280,18 @@ accumulator, 96 / 192 KiB of SMEM at cga1.  Validated on cc 10.7 against an fp64
 oracle at D ∈ {8, 16, 24, 32, 40, 48, 56, 64}: dense n_kv = 1 .. 8 (the ring depth
 4 and 5), tail tiles, a zero-length KV batch, causal / bottom-right / right band /
 SWA / padded (+ padded-Q trim) / sink / GQA, base-2 and optional Stats, and the
-bitwise pin D = 24 vs an explicitly zero-padded D = 32 (48 vs 64).  THD, split-KV,
-paged KV, PackGQA and the score side outputs are typed declines on these tiles
-(their legs are unvalidated there; the shapes that carry them are the row's
-`thd_d_shapes` / `split_d_shapes` / `paged_d_shapes` / `pack_gqa_d_shapes` /
-`score_stats_d_shapes`); the quantized rows keep the d128 file.
+bitwise pin D = 24 vs an explicitly zero-padded D = 32 (48 vs 64).  The tiles
+carry the DENSE leg only (`Capabilities.dense_only_d_shapes`): a graph that asks
+for split-KV, the score side outputs, THD, paged KV, PackGQA or a cga outside the
+tile's domain is selected PAST them onto the d128 flavor it rode before the tiles
+existed (zero-filled to 128), so nothing the row served before them is withdrawn
+-- split-KV and the score outputs at D ≤ 64 stay served on d128 (`split_d_shapes`
+/ `score_stats_d_shapes` name it; validated on cc 10.7 at D = 24 / 64 against the
+oracle, 2026-10-08), a cga2 request at D ≤ 32 (the pre-tile `TILE_CGA_M = 2`
+record) lands on the 64-wide tile (bitwise the zero-padded D = 64 cga2 run), and
+THD / paged KV / PackGQA at D ≤ 64 keep their PRE-TILE typed declines (exact-shape
+`thd_d_shapes`; Rubin half PackGQA needs paged KV or a D128 packed split) -- "the
+pre-tile decline" in the cells above.  The quantized rows keep the d128 file.
 ⁱⁱ `thd_d_shapes={(128,128)}` on the FP8 row is exact — d=64 THD is declined.
 ⁱⁱⁱ **Accepted, not validated.** `softmax_precision=HALF` (requested as the
 `sdpa()` op attribute — numerics-changing, so it is a graph fact gated by the
@@ -1836,7 +1843,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
 | Bias forward | SM90, SM100, SM107, SM120 |
-| Score side outputs (`score_max` / `score_sum_exp`) outside the f16/bf16 d128 prefill flavor — the d192×d128 / d256 / d512 files, the decode tiles (`cga = 1`), THD, paged KV, `split_kv > 1`, the native SM100 d64 flavor, every quantized row | every arch (the d128 f16/bf16 FPROP on SM100 / SM103 / SM107 serves them, ˢᶜ); SM80 / SM90 / SM120 entirely |
+| Score side outputs (`score_max` / `score_sum_exp`) outside the f16/bf16 d128 prefill flavor — the d192×d128 / d256 / d512 files, the decode tiles (`cga = 1`), THD, paged KV, `split_kv > 1`, the native SM100 d64 flavor, every quantized row | every arch (the d128 f16/bf16 FPROP on SM100 / SM103 / SM107 serves them, ˢᶜ; SM107 d ≤ 64 through its d128 flavor, ᵗ); SM80 / SM90 / SM120 entirely |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
 | Paged KV cache | SM107 serves half THD D128/D256 without sink; otherwise every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the f16/bf16 and FP8 d512 flavors, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged (see the SM107 table) |

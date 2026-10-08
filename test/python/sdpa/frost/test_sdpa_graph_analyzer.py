@@ -952,13 +952,16 @@ def test_capabilities_positional_prefix_is_append_only():
             return f.default_factory()
         return required[name]
 
-    legacy_order = [n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "score_stats_d_shapes")]
+    legacy_order = [
+        n for n in names if n not in ("pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "score_stats_d_shapes", "dense_only_d_shapes")
+    ]
     caps = engines.Capabilities(*[legacy_value(n) for n in legacy_order])
     assert caps.thd_padded_stats is True
     assert caps.pack_gqa_partial_d_shapes is None
     assert caps.paged_d_shapes is None
     assert caps.thd_pack_gqa_d_shapes == frozenset()
     assert caps.score_stats_d_shapes is None
+    assert caps.dense_only_d_shapes == frozenset()
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -966,7 +969,13 @@ def test_capabilities_positional_prefix_is_append_only():
     start = names.index("pack_gqa_d_shapes")
     assert names[start : start + len(legacy_tail)] == legacy_tail, names[start:]
     # ... and every later field is appended after it, in the order it landed.
-    assert names[start + len(legacy_tail) :] == ["pack_gqa_partial_d_shapes", "paged_d_shapes", "thd_pack_gqa_d_shapes", "score_stats_d_shapes"], names[start:]
+    assert names[start + len(legacy_tail) :] == [
+        "pack_gqa_partial_d_shapes",
+        "paged_d_shapes",
+        "thd_pack_gqa_d_shapes",
+        "score_stats_d_shapes",
+        "dense_only_d_shapes",
+    ], names[start:]
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])

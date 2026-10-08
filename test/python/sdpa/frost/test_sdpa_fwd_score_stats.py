@@ -111,10 +111,18 @@ def test_mismatch_accepts_and_rejects(row):
     assert "dense graphs only" in reason(thd=True, packed_layout=True)
     assert "paged-KV" in reason(has_paged_kv=True, padded=True, page_size=128)
     assert "wired on the d128" in reason(d_qk=256, d_v=256)
-    # The native d64 flavor is the same file at d_flavor=64 on BOTH lines (Rubin since the small head-dim tiles landed; a d64
-    # graph used to ride the d128 envelope there) but is not validated with the outputs: not claimed.
-    assert "wired on the d128" in reason(d_qk=64, d_v=64)
-    assert "wired on the d128" in reason(d_qk=24, d_v=24), "a small head dim lands on a native small tile on both lines (d64 on SM100, d32 on Rubin)"
+    if row == "sdpa_fwd_prefill_sm100":
+        # The native d64 flavor is the same file at d_flavor=64 but is not validated with the outputs: not claimed.
+        assert "wired on the d128" in reason(d_qk=64, d_v=64)
+        assert "wired on the d128" in reason(d_qk=24, d_v=24), "Blackwell's smallest flavor is its native d64"
+    else:
+        # RE-INVERTED 2026-10-08: on Rubin a d64 / d24 graph WITH the outputs rides the d128 envelope, i.e. the kernel that
+        # carries the store, exactly as before the small head-dim tiles -- the tiles carry the dense leg only
+        # (engines.Capabilities.dense_only_d_shapes), so a graph asking for the ports is selected past them.
+        for d in (64, 24):
+            assert reason(d_qk=d, d_v=d) is None, (d, reason(d_qk=d, d_v=d))
+            assert engines._selected_d_shape(caps, _facts(device_cc=cc, d_qk=d, d_v=d)) == (128, 128), d
+            assert engines._selected_d_shape(caps, _facts(device_cc=cc, d_qk=d, d_v=d, has_score_max=False, has_score_sum_exp=False)) != (128, 128), d
     assert "split_kv > 1" in reason(SdpaFwdKnobs(split_kv=2))
     assert "cga" in reason(SdpaFwdKnobs(cga=1))
     assert reason(SdpaFwdKnobs(cga=2, split_kv=1)) is None
@@ -130,12 +138,14 @@ def test_mismatch_accepts_and_rejects(row):
 
 
 def test_capabilities_field_is_appended():
-    """``score_stats_d_shapes`` is the newest tail of the append-only Capabilities record."""
+    """``score_stats_d_shapes`` was appended after ``thd_pack_gqa_d_shapes``; the Rubin small-tile routing field
+    ``dense_only_d_shapes`` (2026-10-08) is appended after it -- the append-only Capabilities record."""
     from cudnn.sdpa.fwd.engines import Capabilities
 
     names = [f.name for f in fields(Capabilities)]
-    assert names[-2:] == ["thd_pack_gqa_d_shapes", "score_stats_d_shapes"], names[-3:]
+    assert names[-3:] == ["thd_pack_gqa_d_shapes", "score_stats_d_shapes", "dense_only_d_shapes"], names[-4:]
     assert Capabilities.__dataclass_fields__["score_stats_d_shapes"].default is None
+    assert Capabilities.__dataclass_fields__["dense_only_d_shapes"].default == frozenset()
 
 
 def test_adapter_signatures_append_the_score_kwargs():
@@ -235,8 +245,16 @@ def test_adapter_check_support_declines_typed(monkeypatch, cc):
     for d, d_v in ((192, 128), (256, 256), (512, 512)):
         with pytest.raises(NotImplementedError, match="wired in"):
             _api(d=d, d_v=d_v).check_support()
-    with pytest.raises(NotImplementedError, match="wired in"):
-        _api(d=64).check_support()  # the native d64 flavor (both lines): not claimed
+    if cc == (10, 0):
+        with pytest.raises(NotImplementedError, match="wired in"):
+            _api(d=64).check_support()  # the native d64 flavor: not claimed
+    else:
+        # RE-INVERTED 2026-10-08: Rubin routes a d64 graph WITH the outputs past its dense-only 64-wide tile onto the d128
+        # envelope, the kernel with the store (the pre-tile route); without them the same graph takes the 64-wide tile.
+        api64 = _api(d=64)
+        assert api64.check_support() and api64.flavor == (128, 128)
+        plain64 = _api(d=64, score_max=False, score_sum_exp=False)
+        assert plain64.check_support() and plain64.flavor == (64, 64)
     with pytest.raises(NotImplementedError, match="split"):
         _api(split_kv=2).check_support()
     with pytest.raises((ValueError, NotImplementedError), match="cga"):
