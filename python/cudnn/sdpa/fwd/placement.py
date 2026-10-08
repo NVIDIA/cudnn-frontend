@@ -183,14 +183,15 @@ def place(spec, facts) -> str:
 
 
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
+    from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
     if facts.device_cc != (10, 7):
         return TRAIL
     if _prefer_paged_d256_lpt(facts):
         return LEAD
-    # Reuse candidate generation's launch budget for the native packed split.
-    if nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
+    # A full first wave can still favor FROST even when splitting adds cost.
+    # Share the qualified prefix envelope with candidate generation.
+    if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts) > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
     # The shared paged pipeline also benefits from GQA packing without a
     # split. Large-batch short queries recover unused Q rows without partials.
