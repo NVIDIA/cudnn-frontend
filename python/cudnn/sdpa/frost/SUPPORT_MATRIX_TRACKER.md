@@ -1541,8 +1541,17 @@ which the native binder derives from the buffer's byte size, so a producer may h
 zero-filled slack tiles past the live total and every kernel coordinate stays below
 `cu_sf[B]`; both length forms (`cu_seq_len`); the dense cubin is byte-identical before
 and after the port. Validated on Rubin (cc 10.7) through the SM100 MXFP8 THD suite's
-d256 cells, which the per-shape Rubin skip now admits; counts in the PR). **Still
-declined: MXFP8 THD at d128 / d192×d128 / d512** — those bodies keep the pre-upstream
+d256 cells, which the per-shape Rubin skip now admits -- 36 THD cells green at the
+suite's unchanged tolerances (E4M3 + E5M2; none / causal / bottom-right / sliding-window;
+sink; GQA and MQA; both length forms; zero-length sequences first, middle and last;
+scale-factor slack capacity bitwise the exact buffer; Stats VALUES in the token-major,
+head-major and per-batch padded layouts; per-sequence attribution for one to three
+sequences; a single-unit launch; the multi-unit claim loop) plus the 3 Rubin decline cells
+at the unported shapes, the 25 THD prepared-launch cells of the SM107 entry point
+(`TestPreparedSm107Mxfp8`: routes, rebind, capture, SF storage order, one bound frame, no
+allocation or sync, the packed-SF binder's typed declines), and the dense d256 surface
+unchanged-green (37 suite cells + 24 dense prepared cells) on a byte-identical cubin).
+**Still declined: MXFP8 THD at d128 / d192×d128 / d512** — those bodies keep the pre-upstream
 7-arg setup call and the `total_*_sf_tiles` host kwargs the prepared pointer host
 never passes, so the row declines them through `thd_d_shapes` rather than
 half-serving.
