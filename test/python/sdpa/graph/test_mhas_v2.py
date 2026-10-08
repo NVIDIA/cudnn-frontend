@@ -3125,16 +3125,20 @@ def _cc107_engine(family):
 
 def _frost_sm107_unavailable_reason(engine):
     """Why the cc 10.7 FROST row ``engine`` would NOT serve a graph here, or None when it would: a
-    cc 10.7-11.9 device, the row offered by the manifest once FROST is opted in (the half and MXFP8 rows are
-    offered by default, the per-tensor FP8 row answers to the flag; the lever sweeps opt in per call, so the
-    check opts in too -- it asks whether the row EXISTS here; the default-walk tests assert the flag-less
-    order separately) and a CuTe DSL at the FROST floor."""
+    cc 10.7-11.9 device, the row offered by the manifest -- asked flag-less first (the half and MXFP8 rows are
+    default candidates), then with CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1 for the rows that answer to the flag
+    (the per-tensor FP8 row; the lever sweeps opt in per call) -- and a CuTe DSL at the FROST floor.  This asks
+    whether the row EXISTS here; whether it is offered BY DEFAULT is the separate contract of
+    _require_frost_sm107_default (the default-walk / pin / decline tests)."""
     major, minor = torch.cuda.get_device_capability()
     if not (107 <= major * 10 + minor <= 119):
         return f"{engine} serves cc 10.7-11.9 only; device is cc {major}.{minor}"
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+        mp.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
         offered = _frost_engines_enabled(engine)
+        if not offered:
+            mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+            offered = _frost_engines_enabled(engine)
     if not offered:
         return f"{engine} is not offered by the manifest even with CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1"
     from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
@@ -3969,7 +3973,7 @@ def test_sdpa_mxfp8_fwd_default_walk_cc107_L0(env_info, test_no, request, cudnn_
     softmax arm.  RED before the flip: the backend serves every BSHD draw and the s_q == 1 cells without a sink take the
     xdist worker down."""
     engine = _cc107_engine("mxfp8")
-    _require_frost_sm107(engine)
+    _require_frost_sm107_default(engine)  # a manifest regression back to opt-in reads as ONE named failure, not a routing tally
 
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
 
@@ -4026,7 +4030,9 @@ _P1_PIN_GRAPHS = {
     "d128_causal_sink": dict(d=128, s=1024, b=2, h_q=8, h_kv=2, causal=True, sink=True, backend_builds=True),
     "d256_dense": dict(d=256, s=1024, b=2, h_q=8, h_kv=2, causal=False, sink=False, backend_builds=False),
 }
-_P1_BACKEND_BUILD_FAILURE = ("COMPILATION_FAILED", "could not be built")
+# The measured per-plan signature of the backend's d256 / d512 build failure (the strict pin re-raises the plan's own
+# text) and the walk-exhaustion header a barred walk raises when every backend entry failed to build.
+_P1_BACKEND_BUILD_FAILURE = ("COMPILATION_FAILED", "no plan in the list could be built")
 _P1_PINS = ("backend_first", "frost_by_name", "frost_replay", "deselect_frost")
 _P1_PIN_CELLS = [(g, p) for g in _P1_PIN_GRAPHS for p in _P1_PINS]
 
@@ -4240,7 +4246,7 @@ _P1_ROW_BSHD = "Q/K/V/O must be BSHD-physical"
 _P1_BACKEND_PAGED = "MXFP8 SDPA over paged K/V caches is not supported by the cuDNN backend."
 _P1_GUARD = "backend heuristics crash while planning single-query MXFP8 SDPA graphs on cc 10.7"
 _P1_GUARD_TAIL = "the backend is not consulted for this graph"
-_P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason)
+_P1_DECLINE_CASES = {  # id: (graph kwargs, expectation, the row's reason -- unread once the expectation is "frost")
     "paged_page64":  (dict(page=64, sq=8),                 "decline",      _P1_ROW_GAP),
     "paged_page128": (dict(page=128, sq=8),                "decline",      _P1_ROW_GAP),   # P6a flips this one value to "frost"
     "thd":           (dict(thd=True),                      "frost_absent", _P1_ROW_GAP),   # the backend may plan THD MXFP8; it NaNs / hangs at execute, so never executed
@@ -4257,9 +4263,11 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
     """Unsupported cc 10.7 MXFP8 requests decline with a typed error naming the row's reason (and the backend's when it
     declines too); no tensor's dtype / dims / strides and no paging is re-declared on the way; nothing is executed.
     ``decline``: planning raises with both reasons.  ``frost_absent``: the backend may legitimately claim the graph, so
-    the row's absence and its reason (graph-level check_support) are asserted and nothing runs.  ``guard``: below the
-    fixed backend the frontend answers without consulting (or lowering for) the backend; at or above it the backend may
-    serve the BHSD graph."""
+    the row's absence and its reason (graph-level check_support) are asserted and nothing runs; when planning declines
+    the error names the row's reason too.  ``guard``: below the fixed backend the frontend answers without consulting
+    (or lowering for) the backend; at or above it the backend may serve the BHSD graph.  ``frost``: the row serves the
+    request (the P6a hand-off for paged 128 pools, one value in the table): its check_support passes, the flag-less plan
+    list carries the row, nothing runs."""
     import re
     from cudnn.engines import manifest
     try:
@@ -4277,6 +4285,15 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
         before = snap()
         row = next((e for e in manifest.engines_for(g) if e.name == frost), None)
         assert row is not None, f"{frost} is not offered flag-less"
+        if expectation == "frost":
+            row.check_support(g)  # the row admits the graph: no NotImplementedError
+            g.validate()
+            g.build_operation_graph()
+            g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            names = [g.get_plan_name_at_index(i) for i in range(g.get_execution_plan_count())]
+            assert any(n == frost or n.startswith(frost + "[") for n in names), names
+            assert snap() == before, "planning must not re-declare any tensor"
+            return
         error = None
         try:
             g.validate()
@@ -4294,7 +4311,9 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
             assert row_reason in msg and _P1_BACKEND_PAGED in msg and "python engines declined:" in msg, msg
         elif expectation == "frost_absent":
             if error is not None:
-                assert isinstance(error, cudnn.cudnnGraphNotSupportedError) and (row_reason in str(error) or case == "d200"), error
+                # Both sides named: the backend's own text and, through decline_reasons, the row's reason (d200 / d224:
+                # the backend's head-dim validator and the row's exact-shape clause).
+                assert isinstance(error, cudnn.cudnnGraphNotSupportedError) and row_reason in str(error), error
             else:
                 assert names and all(_p1_is_backend_plan(g, i) for i in range(len(names))), names
         else:  # guard
@@ -4307,6 +4326,82 @@ def test_sdpa_mxfp8_cc107_unsupported_requests_decline_L0(case, request):
                 g.check_support()
                 g.build_plans()  # a backend plan builds without buffers; nothing is executed
         assert snap() == before, "a decline must not re-declare any tensor"
+
+
+# The guard's version bound (sdpa/fwd/backend_guard.py: SQ1_MXFP8_PLANNING_CRASH_FIXED_IN) is a measurement; this detector
+# keeps it current.  One interpreter per contract with the guard DISABLED inside it (the constant set to 0, so backend_guard()
+# answers None) and the installed backend asked through the ordinary [A, FALLBACK] walk; a crash is rc 139 / -11 of that
+# process, never of the test runner.  The sink contract is the control: every known backend plans it (3 plans), which proves
+# the probe reaches the backend heuristics at all.
+_P1_CRASH_CONTROL = dict(sq=1, stats=False, sink=True)
+_P1_CRASH_MATRIX = {
+    "dense_sq1": dict(sq=1, stats=False),
+    "dense_sq1_stats": dict(sq=1, stats=True),
+    "thd_sq1": dict(sq=1, thd=True, stats=False),
+    "bhsd_sq1": dict(sq=1, bshd=False, stats=False),
+}
+_P1_CRASH_PROBE = """
+import os, sys
+os.environ.pop("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", None)
+sys.path[:0] = {paths!r}
+import cudnn
+import cudnn.sdpa.fwd.backend_guard as guard_module
+guard_module.SQ1_MXFP8_PLANNING_CRASH_FIXED_IN = 0  # the guard disabled: the backend heuristics are consulted
+import test_mhas_v2 as harness
+g, _ = harness._p1_mxfp8_graph(**{kwargs!r})
+g.validate()
+g.build_operation_graph()
+try:
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+except cudnn.cudnnGraphNotSupportedError as e:
+    print("DECLINED", str(e)[:300])
+else:
+    print("PLANNED", g.get_execution_plan_count(), "plans; backend_declined:", g._backend_declined)
+"""
+
+
+def _p1_crash_probe(kwargs, timeout=900):
+    """Run one contract of the trigger matrix in its own interpreter: (returncode, the last output lines)."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = [here, os.path.dirname(os.path.dirname(here))]  # this module; test/python (the sdpa harness, frost_routing)
+    script = _P1_CRASH_PROBE.format(paths=paths, kwargs=kwargs)
+    p = subprocess.run([sys.executable, "-c", script], cwd=paths[1], capture_output=True, text=True, timeout=timeout)
+    lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip() and "RuntimeWarning" not in l and "AttrBuilder" not in l]
+    return p.returncode, "\n".join(lines[-6:])
+
+
+@_cc107_only
+@pytest.mark.L0
+def test_sdpa_mxfp8_cc107_backend_planning_crash_guard_is_current_L0(request):
+    """The backend guard's version bound is a measurement, kept current here: with the guard disabled in a subprocess, the
+    installed cuDNN backend plans the single-query MXFP8 trigger matrix one interpreter per contract.  Below the recorded
+    fix version (or while none is known) at least one contract must take its process down -- a backend that plans every
+    contract cleanly means SQ1_MXFP8_PLANNING_CRASH_FIXED_IN is stale and this test FAILS with the version to record (the
+    re-measure procedure sits next to the constant).  At or above the recorded version every contract must plan or
+    decline cleanly.  cc 10.7 only, about a minute (one interpreter per contract); kept in the FULL tier because it is the
+    tripwire that retires the guard."""
+    from cudnn.sdpa.fwd.backend_guard import SQ1_MXFP8_PLANNING_CRASH_FIXED_IN as fixed_in
+    if not _device_is_cc107():
+        pytest.skip("the backend planning crash is a cc 10.7 measurement")
+    if request.config.option.dryrun:
+        pytest.skip("dry run mode")
+    rc, tail = _p1_crash_probe(_P1_CRASH_CONTROL)
+    assert rc == 0 and "PLANNED" in tail, f"the sink control must plan on the backend (rc {rc}):\n{tail}"
+    results = {name: _p1_crash_probe(kw) for name, kw in _P1_CRASH_MATRIX.items()}
+    summary = {name: (rc, tail.splitlines()[-1] if tail else "") for name, (rc, tail) in results.items()}
+    crashed = sorted(name for name, (rc, _) in results.items() if rc in (139, -11))
+    errored = {name: tail for name, (rc, tail) in results.items() if rc not in (0, 139, -11)}
+    assert not errored, f"probe error(s), neither a plan nor a crash: {errored}"
+    version = cudnn.backend_version_string()
+    if fixed_in is None or cudnn.backend_version() < fixed_in:
+        assert crashed, (
+            f"cuDNN {version} planned every contract of the single-query MXFP8 trigger matrix cleanly: "
+            f"SQ1_MXFP8_PLANNING_CRASH_FIXED_IN={fixed_in} is stale -- re-measure the whole matrix per sdpa/fwd/backend_guard.py "
+            f"and record {cudnn.backend_version()}; per contract: {summary}"
+        )
+    else:
+        assert not crashed, f"cuDNN {version} still crashes {crashed}: SQ1_MXFP8_PLANNING_CRASH_FIXED_IN={fixed_in} names a build that is not clean; per contract: {summary}"
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")

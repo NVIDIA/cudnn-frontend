@@ -26,6 +26,9 @@ carries a tier and moving a cell is a one-line edit of a list:
 - `smoke_<arch>_code_paths.tsv` -- the code path each SMOKE cell stands for (one line per listed id; the reviewer's aid).
 
 Lines are node ids relative to `test/python` (what `pytest --collect-only -q` prints from there); `#` starts a comment.
+The cc 10.7 sweep cells of `test_mhas_v2.py` (the `_cc107_sweep` functions) are defined at the default `MHAS_CC107_MULT`
+(4): the case count is part of every seed, so `[test1]` draws another geometry under a different multiplier -- a SMOKE cell
+there names the default-multiplier draw.
 `test_tiers.py` (L0) asserts that every listed id still collects and that `-m smoke` / `-m nightly_only` select exactly the
 listed cells, so a renamed or re-parametrized test cannot silently drop out of a tier -- rename the id in the list in the
 same commit.

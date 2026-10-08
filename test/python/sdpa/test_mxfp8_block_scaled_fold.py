@@ -82,9 +82,30 @@ def test_fp4_needs_the_packed_dtype():
 
 def test_default_engines_enabled_follows_the_manifest(monkeypatch):
     """The default admission follows the manifest, not the raw flag: the cc 10.7 row is a default candidate (offered
-    with the flag deleted), the SM100 row still answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES."""
+    with the flag deleted), the SM100 row still answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES.  The sm_107a DSL target
+    is modelled as present (test/AGENTS.md: SM107 metadata tests run on every lane; the public 4.7.0 wheel lacks it)."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
     assert _draw(32, sm=107, engines_enabled=None) == 32
     assert _draw(32, sm=100, engines_enabled=None) == 0
     monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
     assert _draw(32, sm=100, engines_enabled=None) == 32
+
+
+def test_cc107_default_admission_needs_the_sm_107a_dsl_target(monkeypatch):
+    """Rule 7: on cc 10.7 the row declines through cutedsl_arch_requirement_error when the installed CuTe DSL lacks the
+    sm_107a target (the public 4.7.0 wheel), so the mirror folds the draw there -- an admitted draw that is declined fails
+    the test, where develop ran the backend on the folded draw."""
+    from cudnn.frost import buffers
+
+    monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    assert _draw(32, sm=107, engines_enabled=None) == 0
+    assert _draw(16, sm=107, engines_enabled=None) == 0
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    assert _draw(32, sm=107, engines_enabled=None) == 32
+    # The explicit admission knob (the pins above) is not second-guessed: it names the engine state the caller modelled.
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    assert _draw(32, sm=107, engines_enabled=True) == 32
