@@ -771,7 +771,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         assert (why is None) == (d_v == 128), (d_qk, d_v, why)
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
-    assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+    # THD nonpaged d128 unsplit has no packed leg (dense d128 packs on the shared SM100 body since issue #1472, below).
+    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
 
     for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
         facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
@@ -786,6 +787,30 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
         assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
+
+
+def test_sm107_dense_d128_shared_legs_admission():
+    """Issue #1472: the cc 10.7 half row admits the shared SM100 d128 bodies on DENSE d128 half graphs -- PackGQA (the
+    shared prefill body at cga2) and cga1 (the shared decode tile) -- and keeps every other leg where it was: the
+    pre-folded scale stays on the Rubin body (its arm is not in the shared bodies), dense d256 PackGQA stays declined,
+    THD nonpaged keeps the cga2 prefill pipeline, and the standalone cga domain mirrors the row (keep the three in
+    lockstep).  An MHA PackGQA pin is the bit-exact unpacked fold (PACK_G = 1), honorable as on the SM100 row; the
+    heuristics never propose it."""
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    pack, cga1 = engines.SdpaFwdKnobs(pack_gqa=True), engines.SdpaFwdKnobs(cga=1)
+    assert engines.mismatch(caps, _f16_facts(h_kv=2), pack) is None
+    assert engines.mismatch(caps, _f16_facts(h_kv=2, d_qk=64, d_v=64), pack) is None, "the d64 envelope rides the same bodies"
+    assert engines.mismatch(caps, _f16_facts(), pack) is None, "MHA: PACK_G = 1, the bit-exact unpacked fold (SM100 parity)"
+    assert "pre-folded" in engines.mismatch(caps, _f16_facts(h_kv=2, attn_scale_prefolded=True), pack)
+    assert engines.mismatch(caps, _f16_facts(h_kv=2, d_qk=256, d_v=256), pack) is not None
+    assert engines.mismatch(caps, _f16_facts(h_kv=2, s_q=4), cga1) is None
+    assert engines.mismatch(caps, _f16_facts(s_q=4), cga1) is None, "MHA rides the decode tile unpacked"
+    assert "outside this engine's domain" in engines.mismatch(caps, _f16_facts(h_kv=2, thd=True, padded=True), cga1)
+    assert "outside this engine's domain" in engines.mismatch(caps, _f16_facts(h_kv=2, attn_scale_prefolded=True), cga1)
+    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
 
 
 @pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
@@ -4379,6 +4404,46 @@ def test_prefolded_scale_declines_the_single_cta_half_legs_on_the_adapter(monkey
     for (d, d_v), kw in (((192, 128), dict(cga=1, split_kv=1)), ((128, 128), dict(cga=1, split_kv=2))):
         plain = dict(common, softmax_scale_prefolded=False)
         assert _gate_api(d=d, d_v=d_v, **plain, **kw).check_support(), (d, d_v, kw)
+
+
+@requires_dsl
+def test_rubin_dense_d128_legs_load_the_shared_sm100_bodies():
+    """The loader's two dense cc 10.7 arms (issue #1472): dense d128 half at cta_mma=1 -> the shared DECODE tile
+    (sm100/decode_d128_f16.py, packed or not), dense packed d128 half at cga2 -> the shared SM100 prefill body, dense
+    unpacked cga2 -> the Rubin sibling, and the paged THD cga1 unsplit leg -> the shared prefill body (the two-slab paged
+    prefill, never the tile)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+
+    def where(**params):
+        mod = _load_sm100_kernel_module((128, 128), TemplateParams(dtype_qkv=DTYPE_BF16, **params), rubin=True)
+        return os.path.basename(os.path.dirname(mod.__file__)), os.path.basename(mod.__file__)
+
+    assert where(cta_mma=1) == ("sm100", "decode_d128_f16.py")
+    assert where(cta_mma=1, pack_gqa=True, qh_per_kh=8) == ("sm100", "decode_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("sm100", "prefill_d128_f16.py")
+    assert where(cta_mma=2) == ("sm107", "prefill_d128_f16.py")
+    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm100", "prefill_d128_f16.py")
+
+
+def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monkeypatch):
+    """Adapter twins of the dense cc 10.7 legs (CPU-side, the device pinned to cc 10.7): dense d128 half at cga=1 and
+    PackGQA at cga2 are ADMITTED (template_params carries the width / packing verbatim) and both DECLINE the pre-folded
+    scale (the shared bodies apply the scale in-kernel: a typed NotImplementedError, so the plan walk moves to the Rubin
+    cga2 body, which keeps the fold), while THD (ragged) at cga=1 keeps the existing decode-tile decline."""
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    common = dict(d=128, d_v=128, dtype=torch.bfloat16, with_gate=False, h=8, h_kv=2, s=64)
+    api = _gate_api(**common, cga=1)
+    assert api.check_support() and api.template_params().cta_mma == 1
+    api = _gate_api(**common, cga=2, pack_gqa=True)
+    assert api.check_support() and api.template_params().pack_gqa is True and api.template_params().cta_mma == 2
+    for kw in (dict(cga=1), dict(cga=2, pack_gqa=True)):
+        with pytest.raises(NotImplementedError, match="apply the scale in-kernel"):
+            _gate_api(**common, softmax_scale_prefolded=True, scale_softmax=None, **kw).check_support()
+    assert _gate_api(**common, cga=2, softmax_scale_prefolded=True, scale_softmax=None).check_support(), "the Rubin cga2 body keeps the fold"
+    with pytest.raises(NotImplementedError, match="decode tile"):
+        _gate_api(**common, thd=True, seq_kv_lens_present=True, cga=1, split_kv=1).check_support()
 
 
 def test_softmax_arms_tag_reads_the_module_constants_and_the_stats_gate():

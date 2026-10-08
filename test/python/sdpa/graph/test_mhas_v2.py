@@ -538,7 +538,7 @@ def _require_frost_fp8_paged_leads():
         pytest.skip("paged FP8 is backend-first without CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1: this test asserts FROST routing")
 
 
-def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None, template=None):
+def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm100", cga=None, template=None, plan_hook=None, knobs=None, tensor_initializer=None):
     """exec_sdpa, then assert the FROST engine served the graph: the harness
     tallies the serving engine in frost_routing after build_plans, and a FROST
     decline silently falls through to the native backend, so a green run alone
@@ -549,7 +549,15 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     prefill pipeline, so a test that means the d128 decode tile asserts the
     tile, not just the engine; ``template`` pins the kernel template the plan
     lowered onto -- the SM100 d256 flavor lowers onto decode_d256_f16 or
-    prefill_d256_f16, tallied as "frost:<engine>:<template>"."""
+    prefill_d256_f16, tallied as "frost:<engine>:<template>".  ``plan_hook``
+    reaches the graph between create_execution_plans and check_support
+    (sdpa.fp16.exec_sdpa): a test-side plan pin (graph.create_execution_plan +
+    select_plan, strict) or a recorder of the offered plan list.  ``knobs``
+    asserts the SERVED plan's public knobs (SdpaFwdKnobs fields: sched_policy,
+    tile_m, tile_n, cga, pack_gqa, split_kv) -- used together with a ``plan_hook``
+    pin, where the pin is the contract and never the heuristic's winner, or for a
+    tile-fit contract (cga=1 / pack_gqa=False on an MHA graph).
+    ``tensor_initializer`` is exec_sdpa's (a sink-value override, for one)."""
     keys   = [f"frost:{engine}"] + ([f"frost:{engine}:{template}"] if template else [])
     before = [frost_routing.snapshot().get(k, 0) for k in keys]
     # The assertion is "FROST served it": opt FROST in for the call so the placement
@@ -557,13 +565,19 @@ def _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine="sdpa_fwd_prefill_sm1
     # the backend -- the routing, not the default winner, is under test here.
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
-        exec_sdpa(cfg, request, cudnn_handle)
+        exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=tensor_initializer, plan_hook=plan_hook)
     after  = [frost_routing.snapshot().get(k, 0) for k in keys]
     for key, b, a in zip(keys, before, after):
         assert a == b + 1, f"expected {key!r} to serve this graph; routing tally: {frost_routing.snapshot()}"
     if cga is not None:
-        served, knobs = frost_routing.LAST_PLAN
-        assert served == engine and knobs is not None and knobs.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {knobs}"
+        served, got = frost_routing.LAST_PLAN
+        assert served == engine and got is not None and got.cga == cga, f"expected TILE_CGA_M={cga} on {engine!r}, got {served} {got}"
+    if knobs is not None:
+        served, got = frost_routing.LAST_PLAN
+        assert served == engine and got is not None, f"expected {knobs} on {engine!r}, got {served} {got}"
+        for name, want in knobs.items():
+            have = getattr(got, name)
+            assert (bool(have) if isinstance(want, bool) else have) == want, f"expected {name}={want} on {engine!r}, got {got}"
 
 
 @pytest.mark.parametrize("test_no", generate_test_seeds(num_tests=64, rng_seed=2004), ids=lambda p: f"test{p[0]}")
@@ -3293,8 +3307,8 @@ def test_sdpa_fwd_cc107_half_L0(env_info, test_no, request, cudnn_handle):
 @_cc107_sweep(256, 10702)
 @pytest.mark.L0
 def test_sdpa_sq1_cc107_half_L0(env_info, test_no, request, cudnn_handle):
-    """Half decode on the cc 10.7 row (no decode tile there: s_q == 1 and the MTP s_q <= 4 run the
-    prefill bodies, split-KV on d128 / d192x128): test_sdpa_random_sq1_L0's draw over the four exact
+    """Half decode on the cc 10.7 row (dense d128 rides the shared decode tile since issue #1472; the other
+    flavors and THD run the prefill bodies, split-KV on d128 / d192x128): test_sdpa_random_sq1_L0's draw over the four exact
     flavors, ragged (packed THD) / padded / full, a causal draw for the MTP rows, Stats on / off;
     knob sets {FLOAT, FLOAT+fold} (THD (192, 128): FLOAT only)."""
     _require_frost_sm107(_cc107_engine("half"))
@@ -3465,6 +3479,471 @@ def test_sdpa_mxfp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
     if request.node.name in test.blocked_tests:
         pytest.skip(f"blocked test: {request.node.name}")
     _exec_cc107(test, request, cudnn_handle, "mxfp8")
+
+
+# # =====================================================================
+# # ---- P3: cc 10.7 decode-shaped sink plans (issue #1472) ----
+# # =====================================================================
+#
+# Issue #1472: dense BF16 d128 GQA graphs with an attention sink under bottom-right causal masking at decode / verify
+# depth (B128 64/8 Q8 KV2056) ran the cc 10.7 half row's 512-row two-CTA prefill tile UNPACKED: one (batch, q-head) unit
+# per 2-CTA cluster with 8 live rows, the KV head re-streamed once per query head.  The row now lowers dense d128 half
+# graphs (the d64 envelope included; not with the pre-folded scale) onto the shared SM100 d128 bodies compiled for
+# cc 10.7: the 128-row DECODE tile at TILE_CGA_M=1 (sm100/decode_d128_f16.py) and the prefill body under PackGQA at
+# cga2 (sm100/prefill_d128_f16.py).  The cells below assert the CONTRACT through the common graph API (test/AGENTS.md:
+# outputs and declines, never a workload winner): the tile-fit rule S_q * pack_g <= 128 names the served width (the
+# SM100 precedent, _exec_sdpa_on_frost(cga=1)); explicit pins (graph.create_execution_plan + select_plan, strict) prove
+# every newly admitted plan class against the fp32 reference; admission is asserted through
+# get_engine_and_knobs_at_index, never rank; and the one pair that stays declined -- an attention sink with split-KV
+# (the shared combine is not sink-aware) -- is pinned.  cc 10.7 only (the row is the cc 10.7 half row).
+
+_P3_PINS = {
+    "p1n": dict(cga=1, pack_gqa=True, split_kv=1, sched=0),
+    "p1l": dict(cga=1, pack_gqa=True, split_kv=1, sched=1),
+    "u1n": dict(cga=1, pack_gqa=False, split_kv=1, sched=0),
+    "u1l": dict(cga=1, pack_gqa=False, split_kv=1, sched=1),
+    "p2n": dict(cga=2, pack_gqa=True, split_kv=1, sched=0),
+    "p2l": dict(cga=2, pack_gqa=True, split_kv=1, sched=1),
+    "u2n": dict(cga=2, pack_gqa=False, split_kv=1, sched=0),
+    "u2l": dict(cga=2, pack_gqa=False, split_kv=1, sched=1),
+    "p1s2": dict(cga=1, pack_gqa=True, split_kv=2, sched=0),
+    "p1s4": dict(cga=1, pack_gqa=True, split_kv=4, sched=0),
+    "u1s2": dict(cga=1, pack_gqa=False, split_kv=2, sched=0),
+    "p2s2": dict(cga=2, pack_gqa=True, split_kv=2, sched=0),
+    "u2s2": dict(cga=2, pack_gqa=False, split_kv=2, sched=0),
+}
+
+
+def _cc107_half_engine_id():
+    """The cc 10.7 half row's engine id from the manifest (what create_execution_plan replays a pin on)."""
+    from cudnn.engines import manifest
+    family = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
+    return family.engine_id + family.slots[_cc107_engine("half")].slot
+
+
+def _cc107_half_plan_sets(graph):
+    """{(PACK_GQA, TILE_CGA_M, SPLIT_KV)} of the cc 10.7 half row's entries in the ranked plan list -- ADMISSION, read
+    through get_engine_and_knobs_at_index, never rank."""
+    from cudnn.engines.engine_ids import is_python_engine
+    kt, engine, out = cudnn.knob_type, _cc107_engine("half"), set()
+    for i in range(graph.get_execution_plan_count()):
+        if not is_python_engine(graph.plans[i].engine_id):
+            continue
+        name = graph.get_plan_name_at_index(i)
+        if name != engine and not name.startswith(engine + "["):
+            continue
+        _, knobs = graph.get_engine_and_knobs_at_index(i)
+        public = {int(k): int(v) for k, v in knobs.items()}
+        out.add((public.get(int(kt.PACK_GQA), 0), public.get(int(kt.TILE_CGA_M), 2), public.get(int(kt.SPLIT_KV), 1)))
+    return out
+
+
+def _record_cc107_half_plans():
+    """A plan_hook that only RECORDS the row's offered knob sets (``hook.offered``); the default walk serves the graph."""
+    def hook(graph):
+        hook.offered = _cc107_half_plan_sets(graph)
+    hook.offered = None
+    return hook
+
+
+def _pin_cc107_half_plan(*, cga, pack_gqa, split_kv=1, sched=0):
+    """A plan_hook that appends an EXPLICIT cc 10.7 half plan (TILE 128x128 with the given width / packing / split /
+    scheduler) through graph.create_execution_plan and pins it with select_plan -- strict, so a declined set fails the
+    harness build instead of walking on to another plan.  The pin is the contract under test, never the heuristic's
+    winner; ``hook.offered`` still records the default walk's sets."""
+    kt = cudnn.knob_type
+    def hook(graph):
+        hook.offered = _cc107_half_plan_sets(graph)
+        graph.create_execution_plan(
+            _cc107_half_engine_id(),
+            {kt.TILE_M: 128, kt.TILE_N: 128, kt.TILE_CGA_M: cga, kt.SCHED_POLICY: sched, kt.SPLIT_KV: split_kv, kt.PACK_GQA: int(pack_gqa)},
+        )
+        graph.select_plan(graph.get_execution_plan_count() - 1)
+    hook.offered = None
+    return hook
+
+
+def _pin_knobs(name):
+    """(plan_hook, knobs=, template=) for a _P3_PINS entry: the served plan must carry exactly the pinned knobs on the
+    tile its width names (cga1 = the shared decode tile; cga2 = a prefill body -- the Rubin one unpacked, the shared
+    SM100 one packed: both share the file stem, so the pack_gqa knob plus the numerics are the evidence for the shared
+    body, and test_sdpa_fwd_dsl_sm107.py pins the loader's file choice)."""
+    pin = _P3_PINS[name]
+    hook = _pin_cc107_half_plan(**pin)
+    knobs = dict(cga=pin["cga"], pack_gqa=pin["pack_gqa"], split_kv=pin["split_kv"], sched_policy=pin["sched"])
+    return hook, knobs, ("decode_d128_f16" if pin["cga"] == 1 else "prefill_d128_f16")
+
+
+def _issue_sinks(h_q):
+    """tensor_initializer: the issue's per-head sinks linspace(7, 10, H_q) (the harness draws N(0, 0.5) otherwise)."""
+    from sdpa.fp16 import TensorUid
+    def init(tensors, rng):
+        sink = tensors[TensorUid.sink_token]
+        sink.copy_(torch.linspace(7.0, 10.0, h_q, device=sink.device, dtype=torch.float32).reshape(1, h_q, 1, 1))
+    return init
+
+
+def _const_sink(value):
+    """tensor_initializer: one sink logit for every head (the -120 that once underflowed the keyless-row fold, +3, -5)."""
+    from sdpa.fp16 import TensorUid
+    def init(tensors, rng):
+        tensors[TensorUid.sink_token].fill_(float(value))
+    return init
+
+
+def _p3_dense_cfg(*, b, h_q, h_kv, s_q, s_kv, d=128, dtype=torch.bfloat16, causal=True, sink=True, stats=False, seq_len_q=None, seq_len_kv=None, left_bound=None, seed=1472):
+    """A dense BSHD cc 10.7 half ExecConfig (the dense MTP sink keyless-rows literal above, re-strided for the cc 10.7
+    row): ONE causal spelling (diag_align=BOTTOM_RIGHT, right_bound=0; TOP_LEFT and no bound otherwise), per-batch lengths
+    when given (every batch carries all its S_q tokens unless seq_len_q says otherwise), the sink on, Stats optional, and an
+    explicit softmax_precision=FLOAT so the graph never consults the backend during planning (_assign_cc107_knob_set)."""
+    padded = bool(seq_len_kv) or bool(seq_len_q)
+    cfg = ExecConfig(
+        data_type=dtype,
+        rng_data_seed=seed,
+        rng_geom_seed=seed,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=padded,
+        is_cu_seq_len=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=b,
+        d_qk=d,
+        d_v=d,
+        s_q=s_q,
+        s_kv=s_kv,
+        h_q=h_q,
+        h_k=h_kv,
+        h_v=h_kv,
+        diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT if causal else cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=left_bound,
+        right_bound=0 if causal else None,
+        seq_len_q=list(seq_len_q) if seq_len_q else ([s_q] * b if padded else []),
+        seq_len_kv=list(seq_len_kv) if seq_len_kv else ([s_kv] * b if padded else []),
+        with_sink_token=sink,
+        softmax_precision=cudnn.data_type.FLOAT,
+        fwd_stats=stats,
+    )
+    cfg.fill_derived_fields()
+    _cc107_bshd_dense_strides(cfg, random.Random(seed))
+    return cfg
+
+
+@_cc107_sweep(192, 10731)
+@pytest.mark.L0
+def test_sdpa_fwd_cc107_d128_decode_tile_L0(env_info, test_no, request, cudnn_handle):
+    """The default walk's TILE-FIT CONTRACT on the cc 10.7 half row (issue #1472): a dense d128 (the d64 envelope
+    included) half graph whose live rows per packed head fit one 128-row tile -- S_q * pack_g <= 128, every draw here --
+    is served on the shared decode tile (TILE_CGA_M=1, template decode_d128_f16: the SM100 precedent of
+    _exec_sdpa_on_frost(cga=1)), while a FLOAT+fold case (the pre-folded scale is an arm of the Rubin prefill body only)
+    keeps the cga2 prefill tile unpacked with the fold arm compiled.  Decode / MTP draw: batches up to 128, S_q 1..8, GQA
+    groups that divide the tile, MHA, and 96/8 (12 does not divide 128: unpacked, still one tile), f16 / bf16, no mask /
+    bottom-right causal / left window, padded (every batch carries all its S_q tokens; keyless rows with a sink write
+    O = 0 / LSE = sink) or full, sink 1:1, Stats 1:1.  The packing of the default walk is a ranking choice and is NOT
+    asserted; sink-free small-batch draws also exercise the decode body's dense split + the shared combine on cc 10.7
+    (the split count is not asserted either)."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=128, with_high_probability=[1, 32, 128]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=8, s_kv_min=16, s_kv_max=8192, s_q_distribution={"s_q=1":1, "s_q=random":1}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=64, d_qk_max=128, d_v_min=64, d_v_max=128, head_dim_distribution={"d_qk=d_v":1}, with_high_probability=[(64,64), (128,128)]),
+        head_count=RandomChoice({(64, 8, 8) : 3, (64, 4, 4) : 3, (32, 8, 8) : 2, (16, 16, 16) : 1, (8, 8, 8) : 1, (64, 16, 16) : 1, (96, 8, 8) : 1}),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=4, left_window_only=2, no_mask=4),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded" : 1, "full" : 1}),
+        with_sink_token=RandomChoice({True : 1, False : 1}),
+        fwd_stats=RandomChoice({True : 1, False : 1}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    cfg = test.cfg
+    # Bottom-right alignment needs a causal upper bound; a no-mask draw is plain decode and stays top-left.
+    if cfg.right_bound is None:
+        cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
+    if cfg.is_padding:
+        cfg.seq_len_q = [cfg.s_q] * cfg.batches  # decode / MTP: every batch carries all its query tokens
+    _cc107_bshd_dense_strides(cfg, rng)
+    fold = test_no[0] % 4 == 0
+    cfg.softmax_precision = cudnn.data_type.FLOAT
+    cfg.attn_scale_prefolded = fold
+    test.showConfig(test_no, request)
+
+    with _must_run(request):
+        if fold:
+            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=2, template="prefill_d128_f16", knobs={"pack_gqa": False})
+            assert frost_routing.LAST_ARMS == "f32+fold", frost_routing.LAST_ARMS
+        else:
+            _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=1, template="decode_d128_f16")
+            assert frost_routing.LAST_ARMS == "f32", frost_routing.LAST_ARMS
+
+
+@_cc107_sweep(128, 10732)
+@pytest.mark.L0
+def test_sdpa_fwd_cc107_d128_shared_leg_pins_L0(env_info, test_no, request, cudnn_handle):
+    """Numerics of every plan class the cc 10.7 half row admits on dense d128 half graphs since issue #1472, through
+    EXPLICIT pins (graph.create_execution_plan + select_plan; strict): the decode tile (cga1) packed / unpacked under
+    NATURAL and LPT, PackGQA at cga2 on the shared prefill body, and -- sink-free, full, KV a tile multiple -- the dense
+    split on both tiles (packed cga1 split 2 / 4, unpacked cga1 split 2, packed and unpacked cga2 split 2: the shared
+    combine on cc 10.7).  The draw picks the variant by case index among those its geometry admits (a packed cga1 pin
+    needs S_q * G <= 128, an unpacked one S_q <= 128 -- a larger pin fails at the compiled 128-row tile,
+    prepared.build_dense_spec; a split needs at least as many KV tiles).  Exact d128, b 1..32, S_q 1..256, S_kv
+    128..8192, GQA 4 / 8 / 16 / MHA, f16 / bf16, causal / left window / no mask, padded / full, sink 1:1, Stats 1:1;
+    FLOAT softmax (no fold: the shared bodies apply the scale in-kernel)."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+
+    geom_seed = abs(hash(test_no))
+    data_seed = test_no[2]
+
+    rng = random.Random(geom_seed)
+
+    with RandomizationContext(
+        batches=RandomBatchSize(min=1, max=32, with_high_probability=[1, 8]),
+        s_q_s_kv = RandomSequenceLength(s_q_min=1, s_q_max=256, s_kv_min=128, s_kv_max=8192, s_q_distribution={"s_q=random":1}),
+        d_qk_d_v=RandomHiddenDimSize(d_qk_min=128, d_qk_max=128, d_v_min=128, d_v_max=128, head_dim_distribution={"d_qk=d_v":1}),
+        head_count=RandomChoice({(64, 8, 8) : 2, (64, 4, 4) : 2, (32, 8, 8) : 2, (16, 16, 16) : 1, (8, 2, 2) : 1, (8, 8, 8) : 1}),
+        data_type=RandomChoice({torch.float16 : 1, torch.bfloat16 : 2}),
+        with_sliding_mask=SlidingWindowMaskGenerator(causal=3, left_window_only=1, no_mask=2),
+        diag_align=RandomChoice({cudnn.diagonal_alignment.BOTTOM_RIGHT : 1}),
+        is_ragged_or_padded_or_full=RandomChoice({"padded" : 1, "full" : 2}),
+        with_sink_token=RandomChoice({True : 1, False : 1}),
+        fwd_stats=RandomChoice({True : 1, False : 1}),
+    ) as randomization_ctx:
+        test.cfg = randomization_ctx(rng, data_seed, geom_seed)
+
+    cfg = test.cfg
+    if cfg.right_bound is None:
+        cfg.diag_align = cudnn.diagonal_alignment.TOP_LEFT
+    _cc107_bshd_dense_strides(cfg, rng)
+    cfg.softmax_precision = cudnn.data_type.FLOAT
+    group = cfg.h_q // cfg.h_k
+    packable = group > 1 and 128 % group == 0
+    fit_packed = cfg.s_q * group <= 128
+    fit_unpacked = cfg.s_q <= 128
+    kv_tiles = cfg.s_kv // 128
+    splittable = not cfg.with_sink_token and not cfg.is_padding and cfg.s_kv % 128 == 0
+    variants = [
+        ("p1n", packable and fit_packed),
+        ("p1l", packable and fit_packed),
+        ("u1n", fit_unpacked),
+        ("u1l", fit_unpacked),
+        ("p2n", packable),
+        ("p2l", packable),
+        ("u2l", True),
+        ("p1s2", packable and fit_packed and splittable and kv_tiles >= 2),
+        ("p1s4", packable and fit_packed and splittable and kv_tiles >= 4),
+        ("u1s2", fit_unpacked and splittable and kv_tiles >= 2),
+        ("p2s2", packable and splittable and kv_tiles >= 2),
+        ("u2s2", splittable and kv_tiles >= 2),
+    ]
+    admissible = [name for name, ok in variants if ok]
+    name = admissible[test_no[0] % len(admissible)]
+    hook, knobs, template = _pin_knobs(name)
+    print(f"@@@@ P3 explicit pin {name}: {_P3_PINS[name]} (admissible: {admissible})")
+    test.showConfig(test_no, request)
+
+    with _must_run(request):
+        _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template=template)
+
+
+_P3_ISSUE_SHAPES = {
+    "b128_64x8_q8_kv2056": dict(b=128, h_q=64, h_kv=8, s_q=8, s_kv=2056),
+    "b128_64x4_q4_kv2052": dict(b=128, h_q=64, h_kv=4, s_q=4, s_kv=2052),
+    "b1_64x4_q512_kv512": dict(b=1, h_q=64, h_kv=4, s_q=512, s_kv=512),
+}
+_P3_SINK_VERIFY_CASES = (
+    [("b128_64x8_q8_kv2056", plan, False) for plan in ("default", "p1n", "p1l", "u1n", "p2n", "u2n")]
+    + [("b128_64x8_q8_kv2056", plan, True) for plan in ("default", "p1n")]
+    + [("b128_64x4_q4_kv2052", plan, False) for plan in ("default", "p1n", "p1l", "u1n", "p2n", "u2n")]
+    + [("b1_64x4_q512_kv512", plan, False) for plan in ("default", "u2l", "p2l")]
+)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape,plan,stats", _P3_SINK_VERIFY_CASES, ids=lambda x: x if isinstance(x, str) else ("stats" if x else "nostats"))
+def test_sdpa_fwd_cc107_sink_verify_pinned_L0(env_info, request, cudnn_handle, shape, plan, stats):
+    """The issue #1472 cells (bf16, dense BSHD, bottom-right causal, sinks linspace(7, 10, H_q)) on the cc 10.7 half
+    row.  ``default``: the default walk's tile-fit contract -- the two B128 verify shapes (64 / 128 live rows per packed
+    KV head) are served on the shared decode tile (TILE_CGA_M=1) and the row OFFERS both the packed and the unpacked cga1
+    set (admission, not rank); the B1 Q512 prefill-shaped cell keeps cga2 and offers both packings there.  The other
+    plans are EXPLICIT pins of every class the row admits on the shape: decode tile packed NATURAL / LPT and unpacked,
+    PackGQA at cga2 on the shared prefill body, the unpacked cga2 Rubin body; the Stats twin runs the first shape's
+    default and packed decode-tile plans with the LSE checked too."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+    geo = _P3_ISSUE_SHAPES[shape]
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p3_dense_cfg(**geo, stats=stats)
+    test.showConfig((request.node.name, 1), request)
+    sinks = _issue_sinks(geo["h_q"])
+
+    with _must_run(request):
+        if plan == "default":
+            hook = _record_cc107_half_plans()
+            if geo["s_q"] * (geo["h_q"] // geo["h_kv"]) <= 128:
+                _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, cga=1, template="decode_d128_f16", plan_hook=hook, tensor_initializer=sinks)
+                assert {(1, 1, 1), (0, 1, 1)} <= hook.offered, hook.offered
+            else:
+                _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, plan_hook=hook, tensor_initializer=sinks)
+                assert {(0, 2, 1), (1, 2, 1)} <= hook.offered, hook.offered
+        else:
+            hook, knobs, template = _pin_knobs(plan)
+            _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template=template, tensor_initializer=sinks)
+
+
+_P3_KEYLESS_CASES = {
+    "g4_sink_default": dict(h_q=4, h_kv=1, sink=None, seq_len_q=[4, 4]),
+    "g8_sink_minus120": dict(h_q=8, h_kv=1, sink=-120.0, seq_len_q=[4, 4]),
+    "g16_sink_plus3": dict(h_q=16, h_kv=1, sink=3.0, seq_len_q=[4, 4]),
+    "mha_sink_minus5": dict(h_q=1, h_kv=1, sink=-5.0, seq_len_q=[4, 4]),
+    "g4_padded_trim": dict(h_q=4, h_kv=1, sink=None, seq_len_q=[2, 4]),
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("case", sorted(_P3_KEYLESS_CASES))
+def test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0(env_info, request, cudnn_handle, case):
+    """The keyless-row sink contract on the shared decode tile, cc 10.7 (the SM100 dense MTP geometry above): bf16,
+    dense padded KV (declared 128), d128, s_q=4 under bottom-right causal with right_bound=0, one batch holding a single
+    live key -- three of its four rows have no key, so the sink is their whole mass and O must be 0 with LSE = sink --
+    and one with all 128 keys; Stats on.  Groups 4 / 8 / 16 pack on the tile, MHA rides it unpacked; the -120 sink that
+    once underflowed the fold (exp(sink - max) -> 0 in fp32), +3 and -5 pin the magnitude independence; the padded-Q
+    trim keeps precedence over the sink (trimmed rows O = 0 / LSE = -inf).  The fp32 reference seeds keyless rows as
+    m = sink, l = 1."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+    c = _P3_KEYLESS_CASES[case]
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p3_dense_cfg(b=2, h_q=c["h_q"], h_kv=c["h_kv"], s_q=4, s_kv=128, stats=True, seq_len_q=c["seq_len_q"], seq_len_kv=[1, 128], seed=1094)
+    test.showConfig((request.node.name, 1), request)
+    init = _const_sink(c["sink"]) if c["sink"] is not None else None
+
+    with _must_run(request):
+        _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, cga=1, template="decode_d128_f16", tensor_initializer=init)
+
+
+_P3_ENVELOPE_CASES = {
+    # GPT-OSS: d64 through the d128 envelope, 64/8, MTP depth 4, a left window of 128 keys, mixed per-batch caches incl. one live key
+    "gpt_oss_d64_sink_swa": dict(cfg=dict(b=4, h_q=64, h_kv=8, s_q=4, s_kv=4096, d=64, left_bound=128, stats=True, seq_len_q=[4] * 4, seq_len_kv=[4096, 4095, 129, 1]), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
+    "mha_q8_sink": dict(cfg=dict(b=8, h_q=8, h_kv=8, s_q=8, s_kv=2048), pin=None, cga=1, knobs=dict(pack_gqa=False), template="decode_d128_f16"),
+    "fp16_b64_q8_kv8192": dict(cfg=dict(b=64, h_q=64, h_kv=8, s_q=8, s_kv=8192, dtype=torch.float16), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
+    "mha_decode_small": dict(cfg=dict(b=1, h_q=4, h_kv=4, s_q=1, s_kv=128, causal=False, stats=True), pin=None, cga=1, knobs=None, template="decode_d128_f16"),
+    "packed_cga2_small": dict(cfg=dict(b=1, h_q=8, h_kv=2, s_q=64, s_kv=256), pin="p2n", cga=None, knobs=dict(cga=2, pack_gqa=True), template="prefill_d128_f16"),
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("case", sorted(_P3_ENVELOPE_CASES))
+def test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0(env_info, request, cudnn_handle, case):
+    """Pinned cells at the edges of the dense d128 contract on cc 10.7 (issue #1472): the GPT-OSS geometry (d64 through
+    the d128 envelope, 64/8, left window 128, bottom-right causal, mixed caches incl. a single live key, Stats) on the
+    decode tile; an MHA verify graph (8/8, S_q 8) riding the tile unpacked; an fp16 B64 verify graph over an 8k cache;
+    the smallest decode graph with Stats and no mask (SMOKE); and the smallest PackGQA pin at cga2 on the shared prefill
+    body (8/2, S_q 64: 256 rows per unit, past the tile; SMOKE)."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+    c = _P3_ENVELOPE_CASES[case]
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p3_dense_cfg(**c["cfg"])
+    test.showConfig((request.node.name, 1), request)
+    hook = _pin_cc107_half_plan(**_P3_PINS[c["pin"]]) if c["pin"] else None
+
+    with _must_run(request):
+        _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, cga=c["cga"], template=c["template"], plan_hook=hook, knobs=c["knobs"])
+
+
+_P3_SPLIT_SHAPES = {
+    "b1_64x8_q1_kv16384": dict(b=1, h_q=64, h_kv=8, s_q=1, s_kv=16384),
+    "b4_64x8_q8_kv32768": dict(b=4, h_q=64, h_kv=8, s_q=8, s_kv=32768),
+    "b1_64x8_q32_kv16384": dict(b=1, h_q=64, h_kv=8, s_q=32, s_kv=16384),  # 32 x 8 = 256 packed rows: past the tile
+}
+_P3_SPLIT_CASES = [
+    ("b1_64x8_q1_kv16384", "p1s2"),
+    ("b1_64x8_q1_kv16384", "p1s4"),
+    ("b1_64x8_q1_kv16384", "u1s2"),
+    ("b1_64x8_q1_kv16384", "default"),
+    ("b4_64x8_q8_kv32768", "p1s4"),
+    ("b4_64x8_q8_kv32768", "default"),
+    ("b1_64x8_q32_kv16384", "p2s2"),
+    ("b1_64x8_q32_kv16384", "default"),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape,plan", _P3_SPLIT_CASES, ids=lambda x: x)
+def test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0(env_info, request, cudnn_handle, shape, plan):
+    """Sink-free small-batch long-KV decode on cc 10.7 (bf16, dense, bottom-right causal, Stats on): the row admits a
+    split on BOTH shared bodies -- packed cga1 split 2 / 4 and unpacked cga1 split 2 on the decode tile, packed cga2
+    split 2 on the shared prefill body (the adapter's cc 10.7 split + PackGQA clause is lifted for the shared dense legs:
+    a heuristic-listed packed split must build, honored-or-never-listed) -- each pinned explicitly and checked against
+    the fp32 reference incl. the recombined LSE (Rule S4: natural-log partials).  ``default`` asserts routing only (the
+    split count is the wave model's choice, not a contract)."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p3_dense_cfg(**_P3_SPLIT_SHAPES[shape], sink=False, stats=True)
+    test.showConfig((request.node.name, 1), request)
+
+    with _must_run(request):
+        if plan == "default":
+            _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine)
+        else:
+            hook, knobs, template = _pin_knobs(plan)
+            _exec_sdpa_on_frost(test.cfg, request, cudnn_handle, engine=engine, plan_hook=hook, knobs=knobs, template=template)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("shape", ["b128_64x8_q8_kv2056", "b4_32x8_q4_kv1024"], ids=lambda x: x)
+def test_sdpa_fwd_cc107_sink_split_declines_L0(request, cudnn_handle, shape):
+    """Lever D's boundary, pinned: with an attention sink the cc 10.7 half row offers the decode tile packed and
+    unpacked (admission through get_engine_and_knobs_at_index) and NO split set, and an explicit sink + split pin is a
+    typed decline naming the sink-free contract (the shared combine folds no sink; a split would count it once per
+    partition).  A direct graph.sdpa graph (bf16 BSHD, bottom-right causal, sinks linspace(7, 10, H_q))."""
+    engine = _cc107_engine("half")
+    _require_frost_sm107(engine)
+    b, h_q, h_kv, s_q, s_kv = dict(b128_64x8_q8_kv2056=(128, 64, 8, 8, 2056), b4_32x8_q4_kv1024=(4, 32, 8, 4, 1024))[shape]
+    d, kt = 128, cudnn.knob_type
+    torch.manual_seed(1472)
+    q, k, v = [torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for h, s in ((h_q, s_q), (h_kv, s_kv), (h_kv, s_kv))]
+    o = torch.empty(b, s_q, h_q, d, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    sink = torch.linspace(7.0, 10.0, h_q, device="cuda", dtype=torch.float32).reshape(1, h_q, 1, 1)
+    cudnn.set_stream(handle=cudnn_handle, stream=torch.cuda.current_stream().cuda_stream)
+
+    def build():
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
+        q_t, k_t, v_t, s_t = [g.tensor_like(x) for x in (q, k, v, sink)]
+        o_t, _ = g.sdpa(q=q_t, k=k_t, v=v_t, attn_scale=d ** -0.5, generate_stats=False, use_causal_mask_bottom_right=True, sink_token=s_t)
+        o_t.set_output(True).set_dim(list(o.shape)).set_stride(list(o.stride())).set_data_type(cudnn.data_type.BFLOAT16)
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        return g
+
+    offered = _cc107_half_plan_sets(build())
+    assert {(1, 1, 1), (0, 1, 1)} <= offered, offered
+    assert all(split == 1 for _, _, split in offered), offered
+    g = build()
+    g.create_execution_plan(_cc107_half_engine_id(), {kt.PACK_GQA: 1, kt.TILE_CGA_M: 1, kt.SPLIT_KV: 2, kt.SCHED_POLICY: 0, kt.TILE_M: 128, kt.TILE_N: 128})
+    g.select_plan(g.get_execution_plan_count() - 1)
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="sink-free"):
+        g.check_support()
+        g.build_plans()
 
 
 @pytest.mark.skipif("not config.getoption('--repro')", reason="used with '--repro' only")

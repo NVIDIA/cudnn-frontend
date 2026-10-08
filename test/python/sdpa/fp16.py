@@ -354,7 +354,7 @@ def allocate_tensors(cfg, rng_data_gen, perf=False):
     return allocs, tensors, max_t_q, max_t_kv
 
 
-def create_forward_graph(cfg, tensors, cudnn_handle):
+def create_forward_graph(cfg, tensors, cudnn_handle, plan_hook=None):
     cudnn_dtype = convert_to_cudnn_type(cfg.data_type)
     stream = torch.cuda.current_stream().cuda_stream
     cudnn.set_stream(handle=cudnn_handle, stream=stream)
@@ -499,6 +499,9 @@ def create_forward_graph(cfg, tensors, cudnn_handle):
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        if plan_hook is not None:
+            # Test-side plan pin: append / select an explicit plan (strict -- a declined pin raises in check_support / build_plans).
+            plan_hook(graph)
         graph.check_support()
         graph.build_plans()
         # FROST auto-selection resolved at build_plans (first eligible engine,
@@ -1008,7 +1011,7 @@ def cleanup_tensors(allocs):
     torch.cuda.empty_cache()
 
 
-def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checker=None):
+def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checker=None, plan_hook=None):
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
 
@@ -1020,7 +1023,7 @@ def exec_sdpa(cfg, request, cudnn_handle, tensor_initializer=None, tensor_checke
     if tensor_initializer is not None:
         tensor_initializer(tensors, rng_data_gen)
 
-    fwd_graph, fwd_pack = create_forward_graph(cfg, tensors, cudnn_handle)
+    fwd_graph, fwd_pack = create_forward_graph(cfg, tensors, cudnn_handle, plan_hook=plan_hook)
     bwd_graph, bwd_pack = create_backward_graph(cfg, tensors, cudnn_handle, max_t_q, max_t_kv) if cfg.is_train else (None, None)
 
     execute_graph(fwd_graph, fwd_pack, allocs, tensors, cudnn_handle, request, label="Forward")
