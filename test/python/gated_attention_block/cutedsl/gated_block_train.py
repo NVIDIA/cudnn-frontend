@@ -30,10 +30,14 @@ The arms (``ARMS``; ``Arm`` spells the recipe knobs):
   current), the activation scales ``scale_q / scale_k / scale_v / scale_o`` RECALIBRATED every step from the previous step's record
   (window 1: ``scale_x = grad_scale_from_amax(amax_x(t - 1), margin)`` -- the kernels' own power-of-two rule, zero headroom), the
   gradient scales derived in-kernel ("current"), ``scale_dp`` from the previous step's ``amax_dp`` through the kernels' own rule
-  ``grad_scale_from_amax(amax_dp, dp_margin_log2)`` (``Arm.dp_scale_rule="amax"``, four octaves of headroom by default: the product
-  ``amax_dp * scale_dp`` lands in (14, 28], the band the SDPA suites' ``get_fp8_scale_factor`` gives for an ``amax_dp >= 0.0625``;
-  that helper itself is ``dp_scale_rule="helper"`` -- its ``epsilon`` floor caps the scale at 512 once ``amax_dp`` is below 0.0625,
-  which a mean-reduced loss reaches at once: the e4m3 dS then sits in the subnormal range and the dQ / dK-fed gradients collapse).
+  ``grad_scale_from_amax(amax_dp, dp_margin_log2)`` (``Arm.dp_scale_rule="amax"``, four octaves of headroom by default).  Two
+  products, not one: the LAGGED ``amax_dp(t - 1) * scale_dp(t)`` lands in (14, 28] BY CONSTRUCTION (the band the SDPA suites'
+  ``get_fp8_scale_factor`` gives for an ``amax_dp >= 0.0625``); the SAME-STEP ``amax_dp(t) * scale_dp(t)`` -- what sets the e4m3 dS
+  resolution and what the ``<= 448`` check reads -- is off it by the step's ``amax_dp`` growth and is only REPORTED (derivable from
+  the row's ``quant_scalars.amax_dp`` x ``scale_dp``; 1.8 .. 80 measured over a 300-step synthetic smoke run, so the four octaves
+  are what absorb an early-training 3x step-over-step growth; a > 16x growth aborts the run, a detector).  The helper itself is
+  ``dp_scale_rule="helper"`` -- its ``epsilon`` floor caps the scale at 512 once ``amax_dp`` is below 0.0625, which a mean-reduced
+  loss reaches at once: the e4m3 dS then sits in the subnormal range and the dQ / dK-fed gradients collapse.
   Step 0 runs one calibration forward at unit activation scales (discarded; it yields the amax) and one
   discarded backward at ``scale_dp = 1.0`` (it yields ``amax_dp``), so the LOGGED step 0 already runs calibrated -- marked
   ``calib_fwd`` / ``calib_bwd`` in its row.  The lagged recipe saturates silently where an activation's amax grows into the top of
@@ -246,8 +250,9 @@ class Arm:
     (fp8): the activation amax window of the forward recipe -- 1 recalibrates from the previous step, 0 keeps unit activation
     scales.  ``bwd_knobs``: performance-only backward knobs, bitwise the default.  ``dp_scale_rule`` / ``dp_margin_log2`` (fp8): how the next
     step's ``scale_dp`` follows this step's ``amax_dp`` -- ``"amax"`` = ``grad_scale_from_amax(amax_dp, dp_margin_log2)`` (the kernels'
-    rule; the product in ``(448 / 2**(m+1), 448 / 2**m]``), ``"helper"`` = the SDPA suites' ``get_fp8_scale_factor`` (a 512 cap below
-    ``amax_dp = 0.0625``)."""
+    rule: the LAGGED product ``amax_dp(t) * scale_dp(t + 1)`` in ``(448 / 2**(m+1), 448 / 2**m]`` by construction; the same-step
+    ``amax_dp(t + 1) * scale_dp(t + 1)`` is off it by the step's amax growth and only reported), ``"helper"`` = the SDPA suites'
+    ``get_fp8_scale_factor`` (a 512 cap below ``amax_dp = 0.0625``)."""
 
     name: str
     family: Optional[str]
