@@ -270,6 +270,14 @@ class TemplateParams:
     # knob, ``config_sm107.SM107_TILE_NS_BY_D_SHAPE``) and 256 is refused by the TMEM predicate at two sub-tiles -- the
     # config factory pins ``N_BMM2_CHUNKS x BMM2_CHUNK_SIZE == TILE_N``.
     tile_n: int = 128
+    # The (n, n+1) PAIR work item of the resident-bias arm (``bias_mode = 1`` on the Rubin f16/bf16 d128-file tiles): 0 = the
+    # item is a 256-row Q super-tile of ONE batch entry (every existing record renders byte-identically); n >= 1 = a work item
+    # is (a 128-row q tile, a head, a CHUNK of up to n consecutive entries of the flattened batch axis), the two softmax
+    # sub-tiles are rows (nb, nb + 1) of the SAME q tile, and the bias row-block (now 128 rows) is loaded ONCE per item and
+    # read by every step of the chunk -- the per-item fixed cost and the bias feed divided by n.  Needs a batch-broadcast
+    # bias ([1, 1|H, S_q, S_kv]: two rows share one block), cta_mma = 1 and a top-left band (config_sm107._validate_bias).
+    # A compile-time axis (the block rows, the grid decode, the pair's ring protocol fold on it), hence a cache-key field.
+    n_chunk: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

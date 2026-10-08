@@ -68,7 +68,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_group_size,
     pack_gqa_supported,
 )
-from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga, sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
@@ -843,7 +843,11 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # a d64 graph at S_kv 256 lands on cga2 (two tiles), S_kv <= 128 keeps the tuned cga1 below.  No width holding it
         # falls through: mismatch() declines every plan of such a graph whatever the pick.
         bias_shapes = caps.bias_d_shapes if caps.bias_d_shapes is not None else caps.d_shapes
-        bias_cga = sm107_bias_auto_cga(selected_shape[0], facts.s_kv, domain) if selected_shape in bias_shapes else None
+        # The (n, n+1) pair item (a batch-broadcast bias on >= 2 rows, cga1) holds twice the kv columns of the 256-row item --
+        # the width pick evaluates the block of the form each width would run (config_sm107.sm107_bias_pair_form).
+        _bias_b = facts.bias_dim[0] if len(facts.bias_dim) == 4 else 1
+        _pair = sm107_pair_item_active(_bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, 1, s_kv=facts.s_kv, d_flavor=selected_shape[0])
+        bias_cga = sm107_bias_auto_cga(selected_shape[0], facts.s_kv, domain, pair=_pair) if selected_shape in bias_shapes else None
         if bias_cga is not None:
             return sched_policy, bias_cga
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):

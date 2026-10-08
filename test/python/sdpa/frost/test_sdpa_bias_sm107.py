@@ -128,12 +128,18 @@ def test_row_claims_the_bias_on_the_derived_shapes_and_budgets():
 _CELLS = [
     ("bias d32 S256", dict(**_bias_kw()), None, True),
     ("bias d32 S384 = the 3-tile budget", dict(s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), None, True),
-    ("bias d32 S512 over the budget", dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), None, False),
+    # S14: a batch-broadcast bias on >= 2 flattened rows runs the (n, n+1) PAIR item (a 128-row block, twice the kv columns: 768 / 384
+    # at d32 / d64 cga1); a per-batch bias [B, ., S, S] or a single row keeps the one-batch-entry item and ITS budget (384 / 128 / 256).
+    ("bias d32 S512: the pair item's 6-tile block", dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), None, True),
+    ("per-batch bias d32 S512 over the 3-tile budget", dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512)), None, False),
+    ("one-row bias d32 S512 over the 3-tile budget", dict(b=1, s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), None, False),
     ("bias d64 S128 cga1", dict(d_qk=64, d_v=64, s_q=128, s_kv=128, **_bias_kw(s_q=128, s_kv=128)), None, True),
-    ("bias d64 S256 cga1 over the 1-tile budget", dict(d_qk=64, d_v=64, **_bias_kw()), dict(cga=1), False),
+    ("bias d64 S256 cga1: the pair item's 3-tile block", dict(d_qk=64, d_v=64, **_bias_kw()), dict(cga=1), True),
+    ("per-batch bias d64 S256 cga1 over the 1-tile budget", dict(d_qk=64, d_v=64, **_bias_kw(b=2)), dict(cga=1), False),
     ("bias d64 S256 cga2 (2 tiles)", dict(d_qk=64, d_v=64, **_bias_kw()), dict(cga=2), True),
-    ("bias d64 S256 knob-less: some width holds it (cga2)", dict(d_qk=64, d_v=64, **_bias_kw()), None, True),
-    ("bias d64 S384 over both widths' budgets", dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), None, False),
+    ("bias d64 S256 knob-less: some width holds it (cga1 pair; cga2 one-batch-entry)", dict(d_qk=64, d_v=64, **_bias_kw()), None, True),
+    ("bias d64 S384: the pair item's 3-tile block at cga1", dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), None, True),
+    ("per-batch bias d64 S384 over both widths' budgets", dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(b=2, s_q=384, s_kv=384)), None, False),
     ("bias d128: no block fits", dict(d_qk=128, d_v=128, **_bias_kw()), None, False),
     ("bias d24 rides the 32-wide tile", dict(d_qk=24, d_v=24, **_bias_kw()), None, True),
     ("fp32 bias", dict(**_bias_kw(dt="FLOAT")), None, False),
@@ -160,7 +166,18 @@ _CELLS = [
     ("kv_mask d32 S512 above the BIAS budget: served (nothing staged)", dict(s_q=512, s_kv=512, **_mask_kw(s_kv=512)), None, True),
     ("kv_mask d32 S1024 (n_kv 8)", dict(s_q=1024, s_kv=1024, **_mask_kw(s_kv=1024)), None, True),
     ("kv_mask d64 S512 cga2 above the bias budget: served", dict(d_qk=64, d_v=64, s_q=512, s_kv=512, **_mask_kw(s_kv=512)), dict(cga=2), True),
-    ("kv_mask + bias S512: the bias carries the budget", dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512), **_mask_kw(s_kv=512)), None, False),
+    (
+        "kv_mask + bias S512: the bias carries the budget (the pair item holds 512)",
+        dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512), **_mask_kw(s_kv=512)),
+        None,
+        True,
+    ),
+    (
+        "kv_mask + per-batch bias S512: over the one-batch-entry budget",
+        dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512), **_mask_kw(s_kv=512)),
+        None,
+        False,
+    ),
     ("bias S64: one tile", dict(s_q=64, s_kv=64, **_bias_kw(s_q=64, s_kv=64)), None, True),
     ("bias S100 compact: S_kv % 8 != 0 is not 16-B strided", dict(s_q=100, s_kv=100, **_bias_kw(s_q=100, s_kv=100)), None, False),
     ("bias S217 compact (the acceptance-grid customer cell)", dict(s_q=217, s_kv=217, **_bias_kw(s_q=217, s_kv=217)), None, False),
@@ -202,23 +219,27 @@ def test_row_accepts_and_declines_the_bias_and_kv_mask(name, fkw, kkw, accept):
 
 
 def test_heuristics_pick_the_narrowest_width_whose_block_holds_s_kv():
-    """The row's knob-less eligibility and the heuristics' width agree (rule 8b'): a d64 BIAS graph at S_kv 256 gets cga2
-    plans (the 2-tile block) and NO cga1 plan from ``recommend``; at S_kv 128 the tuned cga1 stays; a d32 graph stays on its
-    cga1-only tile; a bias graph above every width's budget gets no plan at all.  A kv_mask ALONE stages no block: it keeps the
-    tile's own width (cga1) at every S_kv."""
+    """The row's knob-less eligibility and the heuristics' width agree (rule 8b'): a d64 PER-BATCH bias graph at S_kv 256 gets cga2
+    plans (the one-batch-entry item's 2-tile block) and NO cga1 plan from ``recommend``, while a batch-BROADCAST bias at the same
+    shape runs the (n, n+1) pair item on cga1 (its 128-row block holds 384 there -- S14); at S_kv 128 the tuned cga1 stays; a d32
+    graph stays on its cga1-only tile; a per-batch bias above every width's budget gets no plan at all.  A kv_mask ALONE stages no
+    block: it keeps the tile's own width (cga1) at every S_kv."""
     from cudnn.sdpa.fwd.heuristics import recommend
 
     offered = {_ROW: 20599}
     for fkw, want in (
-        (dict(d_qk=64, d_v=64, **_bias_kw()), {2}),
+        (dict(d_qk=64, d_v=64, **_bias_kw(b=2)), {2}),
+        (dict(d_qk=64, d_v=64, **_bias_kw()), {1}),
         (dict(d_qk=64, d_v=64, **_mask_kw()), {1}),
         (dict(s_q=1024, s_kv=1024, **_mask_kw(s_kv=1024)), {1}),
-        (dict(d_qk=64, d_v=64, **_bias_kw(), **_mask_kw()), {2}),
+        (dict(d_qk=64, d_v=64, **_bias_kw(b=2), **_mask_kw()), {2}),
+        (dict(d_qk=64, d_v=64, **_bias_kw(), **_mask_kw()), {1}),
         (dict(d_qk=64, d_v=64, s_q=128, s_kv=128, **_bias_kw(s_q=128, s_kv=128)), {1}),
         (dict(**_bias_kw()), {1}),
         (dict(s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), {1}),
-        (dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(s_q=384, s_kv=384)), set()),
-        (dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), set()),
+        (dict(d_qk=64, d_v=64, s_q=384, s_kv=384, **_bias_kw(b=2, s_q=384, s_kv=384)), set()),
+        (dict(s_q=512, s_kv=512, **_bias_kw(b=2, s_q=512, s_kv=512)), set()),
+        (dict(s_q=512, s_kv=512, **_bias_kw(s_q=512, s_kv=512)), {1}),
     ):
         plans = recommend("A", _facts(device_sm_count=204, **_resolve_dtypes(fkw)), offered)
         assert {p.knobs.cga for p in plans} == want, (fkw, [p.knobs for p in plans])
@@ -260,12 +281,17 @@ def _api(d=32, *, s_q=256, s_kv=256, b=2, h=4, h_kv=None, dtype=torch.bfloat16, 
 _ADAPTER_CELLS = [
     ("bias d32 S256", dict(bias=(1, 4, 256, 256)), True, (32, 32), 1, 0, 1),
     ("bias d32 S384", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (32, 32), 1, 0, 1),
-    ("bias d32 S512", dict(s_q=512, s_kv=512, bias=(1, 4, 512, 512)), False, None, 0, 0, None),
+    # S14: a batch-broadcast bias on >= 2 rows lowers the (n, n+1) pair item (128-row block, cga1); a per-batch bias keeps the old cells.
+    ("bias d32 S512: the pair item", dict(s_q=512, s_kv=512, bias=(1, 4, 512, 512)), True, (32, 32), 1, 0, 1),
+    ("per-batch bias d32 S512 over the 3-tile budget", dict(s_q=512, s_kv=512, bias=(2, 4, 512, 512)), False, None, 0, 0, None),
     ("bias d64 S128", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 1),
-    ("bias d64 S256 cga1", dict(d=64, bias=(1, 4, 256, 256), cga=1), False, None, 0, 0, None),
+    ("bias d64 S256 cga1: the pair item", dict(d=64, bias=(1, 4, 256, 256), cga=1), True, (64, 64), 1, 0, 1),
+    ("per-batch bias d64 S256 cga1 over the 1-tile budget", dict(d=64, bias=(2, 4, 256, 256), cga=1), False, None, 0, 0, None),
     ("bias d64 S256 cga2", dict(d=64, bias=(1, 4, 256, 256), cga=2), True, (64, 64), 1, 0, 2),
-    ("bias d64 S256 knob-less: the adapter lowers at cga2", dict(d=64, bias=(1, 4, 256, 256)), True, (64, 64), 1, 0, 2),
-    ("bias d64 S384 over both widths", dict(d=64, s_q=384, s_kv=384, bias=(1, 4, 384, 384)), False, None, 0, 0, None),
+    ("bias d64 S256 knob-less: the adapter lowers the pair item at cga1", dict(d=64, bias=(1, 4, 256, 256)), True, (64, 64), 1, 0, 1),
+    ("per-batch bias d64 S256 knob-less: the adapter lowers at cga2", dict(d=64, bias=(2, 4, 256, 256)), True, (64, 64), 1, 0, 2),
+    ("bias d64 S384: the pair item at cga1", dict(d=64, s_q=384, s_kv=384, bias=(1, 4, 384, 384)), True, (64, 64), 1, 0, 1),
+    ("per-batch bias d64 S384 over both widths", dict(d=64, s_q=384, s_kv=384, bias=(2, 4, 384, 384)), False, None, 0, 0, None),
     ("bias d128", dict(d=128, bias=(1, 4, 256, 256)), False, None, 0, 0, None),
     ("bias d32 cga2 lands on the 64-wide tile (2 tiles)", dict(bias=(1, 4, 256, 256), cga=2), True, (64, 64), 1, 0, 2),
     ("fp32 bias", dict(bias=(1, 4, 256, 256), bias_dtype=torch.float32), False, None, 0, 0, None),
@@ -277,7 +303,16 @@ _ADAPTER_CELLS = [
     ("kv_mask d64 S256 knob-less: no block, cga1", dict(d=64, kv_mask=(2, 1, 1, 256)), True, (64, 64), 0, 1, 1),
     ("kv_mask d32 S1024 above the bias budget", dict(s_q=1024, s_kv=1024, kv_mask=(2, 1, 1, 1024)), True, (32, 32), 0, 1, 1),
     ("kv_mask d64 S512 cga2 requested", dict(d=64, s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), cga=2), True, (64, 64), 0, 1, 2),
-    ("kv_mask + bias S512: the bias budget", dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(1, 4, 512, 512)), False, None, 0, 0, None),
+    ("kv_mask + bias S512: the pair item holds it", dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(1, 4, 512, 512)), True, (32, 32), 1, 1, 1),
+    (
+        "kv_mask + per-batch bias S512: over the one-batch-entry budget",
+        dict(s_q=512, s_kv=512, kv_mask=(2, 1, 1, 512), bias=(2, 4, 512, 512)),
+        False,
+        None,
+        0,
+        0,
+        None,
+    ),
     # (the standalone adapter wants the padding mask for a dense S_kv % 128 != 0 tail; the GRAPH path synthesizes it -- the GPU cells)
     ("bias S64 one tile (padded)", dict(s_q=64, s_kv=64, bias=(1, 4, 64, 64), seq_kv_lens_present=True), True, (32, 32), 1, 0, 1),
     ("bias S217 compact", dict(s_q=217, s_kv=217, bias=(1, 4, 217, 217), seq_kv_lens_present=True), False, None, 0, 0, None),
@@ -373,7 +408,7 @@ def test_template_params_and_capabilities_are_appended():
 
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-3:] == ["bias_mode", "kv_mask_form", "tile_n"]
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-4:] == ["bias_mode", "kv_mask_form", "tile_n", "n_chunk"]  # S14 appended n_chunk
     # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
     assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
 

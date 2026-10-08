@@ -801,7 +801,7 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     the graph when some width holds the block; ``heuristics._auto_sched_cga`` then picks the narrowest such width through
     ``config_sm107.sm107_bias_auto_cga`` and every proposed plan is re-asked here with its own cga) -- every one a typed
     decline, the twin of the adapter's ``check_support`` (rule 8b)."""
-    from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max
+    from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max, sm107_pair_item_active
 
     what = "additive bias" if facts.has_bias else "per-key kv_mask"
     if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp or facts.has_epilogue_gate:
@@ -848,11 +848,20 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         # of the flavor's domain holds the block; the plan-level call above re-asks with the proposed cga.
         domain = effective_cgas(capabilities, facts, knobs.split_kv if knobs is not None else None)
         widths = tuple(sorted(domain)) or (1,)
-    budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga) for cga in widths}
+    # The block of the FORM the plan would run (config_sm107.sm107_bias_pair_form): a batch-broadcast bias on >= 2 flattened
+    # rows at cga1 runs the (n, n+1) pair item whose 128-row block holds twice the kv columns (768 / 384 at d32 / d64); a
+    # per-batch bias, a single row or a cga2 plan keeps the one-batch-entry item's 256-row block (384 / 128 / 256).
+    _bias_b = facts.bias_dim[0] if len(facts.bias_dim) == 4 else 1
+    _pair = {
+        cga: sm107_pair_item_active(_bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, cga, s_kv=facts.s_kv, d_flavor=selected[0])
+        for cga in widths
+    }
+    budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga, pair=_pair[cga]) for cga in widths}
     if all(s_kv_max == 0 or facts.s_kv > s_kv_max for s_kv_max in budgets.values()):
         held = " / ".join(f"cga {cga}: S_kv <= {s_kv_max}" for cga, s_kv_max in budgets.items())
         return (
-            f"the resident bias block at head-dim tile {selected[0]} holds {held} (the SMEM left beside the Q/O slabs and the K/V ring); "
+            f"the resident bias block at head-dim tile {selected[0]} holds {held} (the SMEM left beside the Q/O slabs and the K/V ring; "
+            f"{'the (n, n+1) pair item' if any(_pair.values()) else 'the one-batch-entry item'}); "
             f"got S_kv={facts.s_kv} -- the streamed form is not built"
         )
     return None

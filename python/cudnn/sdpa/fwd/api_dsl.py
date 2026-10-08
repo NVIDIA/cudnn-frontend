@@ -62,6 +62,9 @@ from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_GRANULE_ELEMS as _KV_MA
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD as _KV_MASK_BOOL_WORD
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_16 as _KV_MASK_ADDITIVE_16
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_F32 as _KV_MASK_ADDITIVE_F32
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_pair_form as _sm107_bias_pair_form
+from cudnn.sdpa.fwd.config_sm107 import sm107_n_chunk_pick as _sm107_n_chunk_pick
+from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
@@ -675,8 +678,16 @@ class SdpaFwdDsl(APIBase):
         sample_score_sum_exp: Optional[torch.Tensor | TensorDesc] = None,
         sample_bias: Optional[torch.Tensor | TensorDesc] = None,
         sample_kv_mask: Optional[torch.Tensor | TensorDesc] = None,
+        n_chunk: Optional[int] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
+
+        ``n_chunk`` (APPENDED, optional; the resident-bias arm): the chunk length of the (n, n+1) PAIR work item -- a
+        work item is (a 128-row q tile, a head, up to ``n_chunk`` consecutive entries of the flattened batch axis), the
+        two softmax sub-tiles are rows n / n + 1 of that q tile and the bias row-block is loaded once per item.  None =
+        the heuristics' pick (``config_sm107.sm107_n_chunk_pick``: 0 = the one-batch-entry item unless the bias is
+        batch-broadcast on >= 2 rows at cga1); an explicit value >= 1 is honored on a plan that qualifies for the pair
+        item and declined typed otherwise.  Performance-only (every value computes the same function).
 
         ``sample_bias`` / ``sample_kv_mask`` (APPENDED, optional): the additive attention bias
         ``[1|B, 1|H_q, S_q, S_kv]`` in the Q/K/V dtype (added to the scaled scores before the softmax,
@@ -787,6 +798,7 @@ class SdpaFwdDsl(APIBase):
         # Additive bias / per-key boolean mask (the resident-block arm); None = the arm is compiled out.
         self.bias_desc = self._make_tensor_desc(sample_bias, name="bias")
         self.kv_mask_desc = self._make_tensor_desc(sample_kv_mask, name="kv_mask")
+        self.n_chunk = None if n_chunk is None else int(n_chunk)
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
@@ -1468,6 +1480,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         positionally after amax_o: every fp8 / mxfp8 flavor on every arch line."""
         return self._fp8
 
+    def _resident_arm_pair_eligible(self) -> bool:
+        """Whether this BIAS plan qualifies for the (n, n+1) pair work item at cga1: a batch-broadcast bias on >= 2
+        flattened rows (``config_sm107.sm107_bias_pair_form``, the engine row's and the heuristics' predicate)."""
+        if self.bias_desc is None or self.n_chunk == 0:  # an explicit n_chunk=0 keeps the one-batch-entry item (and ITS budget)
+            return False
+        b, h_qo, s_qo, _ = (int(x) for x in self.q_desc.shape)
+        # the form predicate AND a chunk length >= 1 (the request, else the rule / the sweep seam): the budget of the item that RUNS
+        return _sm107_pair_item_active(
+            int(self.bias_desc.shape[0]),
+            b,
+            h_qo,
+            s_qo,
+            _device_sm_count(self.q_desc.device),
+            1,
+            self.n_chunk,
+            s_kv=int(self.k_desc.shape[2]),
+            d_flavor=self.flavor[0],
+        )
+
     def _kv_mask_form(self) -> int:
         """``TemplateParams.kv_mask_form`` of this plan from the kv_mask sample's dtype: 0 without one; the bit word for a
         byte mask (bool / int8 / uint8); the additive vector in the io dtype's 16-bit pairs or in fp32 (check_support
@@ -1482,12 +1513,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """The width a BIAS plan runs at (a kv_mask-only plan stages no block and keeps the flavor's own default): the
         requested cga, or -- none requested -- the NARROWEST width of the flavor's domain whose resident block holds S_kv (``config_sm107.sm107_bias_auto_cga``, the heuristics' pick, so
         a d64 graph at S_kv 256 lands on cga2 whichever path built the plan); 1 when no width holds it, which
-        ``check_support`` then declines with the budget.  Read by ``check_support`` and ``template_params`` alike."""
+        ``check_support`` then declines with the budget.  Read by ``check_support`` and ``template_params`` alike.
+        The pair item's 128-row block is evaluated at cga1 when the plan qualifies for it (``_resident_arm_pair_eligible``)."""
         if self.cga is not None:
             return int(self.cga)
         if self.flavor not in _SM107_BIAS_D_SHAPES:
             return 1
-        return _sm107_bias_auto_cga(self.flavor[0], int(self.k_desc.shape[2]), _SM107_SMALL_D_CGAS[self.flavor]) or 1
+        return _sm107_bias_auto_cga(self.flavor[0], int(self.k_desc.shape[2]), _SM107_SMALL_D_CGAS[self.flavor], pair=self._resident_arm_pair_eligible()) or 1
+
+    def _resident_arm_n_chunk(self) -> int:
+        """The ``TemplateParams.n_chunk`` of this plan: 0 off the pair item; the request when the caller made one (validated by
+        ``check_support``); else the heuristics' pick at this device's SM count (``config_sm107.sm107_n_chunk_pick``)."""
+        if not self._resident_arm_pair_eligible() or self._resident_arm_cga() != 1:
+            return 0
+        if self.n_chunk is not None:
+            return int(self.n_chunk)
+        b, h_qo, s_qo, _ = (int(x) for x in self.q_desc.shape)
+        return _sm107_n_chunk_pick(
+            int(self.bias_desc.shape[0]), b, h_qo, s_qo, _device_sm_count(self.q_desc.device), 1, s_kv=int(self.k_desc.shape[2]), d_flavor=self.flavor[0]
+        )
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -1945,6 +1989,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.cga == 1 or (self.cga is None and self.flavor == (64, 64)),
                 "score_max / score_sum_exp are stored by the 2-CTA prefill tile; cga=1 selects a tile without the store (pin cga=2)",
             )
+        if self.bias_desc is None:
+            # n_chunk is the resident-bias arm's work-item form (the (n, n+1) pair item): typed decline on a plan without a bias.
+            self._not_implemented_error_if(
+                self.n_chunk is not None and self.n_chunk >= 1, "n_chunk is the resident-bias arm's work-item form; this plan has no bias"
+            )
         if self.bias_desc is not None or self.kv_mask_desc is not None:
             # Additive bias / per-key mask: the twin of the engine row's gates (engines._bias_arm_decline; rule 8b)
             # through the SAME constants (rule 8b').  The resident row-block lives in the Rubin f16/bf16 d128 file's
@@ -1970,11 +2019,26 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             if self.bias_desc is not None:
                 _bias_cga = self._resident_arm_cga()
-                _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga)
+                _pair = self._resident_arm_pair_eligible() and _bias_cga == 1  # the item that RUNS (its block's budget)
+                _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga, pair=_pair)
                 self._not_implemented_error_if(
                     _s_kv_max == 0 or int(s_kv) > _s_kv_max,
-                    f"the resident bias block at head-dim tile {self.flavor[0]} / cga {_bias_cga} holds S_kv <= {_s_kv_max}; got {s_kv} (the streamed form is not built)",
+                    f"the resident bias block at head-dim tile {self.flavor[0]} / cga {_bias_cga} ({'the (n, n+1) pair item' if _pair else 'the one-batch-entry item'}) "
+                    f"holds S_kv <= {_s_kv_max}; got {s_kv} (the streamed form is not built)",
                 )
+                # An explicit n_chunk is honored on a plan that runs the pair item and declined typed elsewhere (never degraded).
+                self._not_implemented_error_if(
+                    self.n_chunk is not None and self.n_chunk >= 1 and not _pair,
+                    f"n_chunk={self.n_chunk} is the (n, n+1) pair work item: it needs a batch-broadcast bias ([1, 1|H, S_q, S_kv]; got batch extent "
+                    f"{int(self.bias_desc.shape[0])}), >= 2 flattened batch rows (got {int(b)}) and cga 1 (got {_bias_cga})",
+                )
+                self._value_error_if(self.n_chunk is not None and self.n_chunk < 0, f"n_chunk must be >= 0; got {self.n_chunk}")
+                if _pair and self.n_chunk != 0:
+                    _n_chunks = -(-int(b) // max(1, self._resident_arm_n_chunk()))
+                    self._not_implemented_error_if(
+                        _n_chunks > 65535,
+                        f"the pair item's chunk index rides the 16-bit batch field of the scheduler payload: ceil(B / n_chunk) = {_n_chunks} > 65535",
+                    )
                 self._check_dtype(self.bias_desc, self.q_desc.dtype, name="bias")
                 _bd, _bs = tuple(int(x) for x in self.bias_desc.shape), tuple(int(x) for x in self.bias_desc.stride)
                 self._value_error_if(
@@ -2471,6 +2535,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             kv_mask_form=self._kv_mask_form(),
             # The KV tile width (the TILE_N knob): 128 on every record so far, 64 on the Rubin small tiles (check_support validated it).
             tile_n=self.tile_n if self.tile_n is not None else 128,
+            # The (n, n+1) pair item's chunk length (0 = the one-batch-entry item): the request, else the heuristics' pick.
+            n_chunk=self._resident_arm_n_chunk(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

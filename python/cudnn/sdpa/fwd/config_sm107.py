@@ -314,41 +314,128 @@ SM107_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozens
 BIAS_SWZ_BYTES = 128
 
 
-def sm107_bias_block_rows(tiles_q: int = 2, tile_m: int = 128) -> int:
-    """Rows of the resident bias block = the CTA's Q rows of one work item (both sub-tiles)."""
-    return tiles_q * tile_m
+def sm107_bias_block_rows(tiles_q: int = 2, tile_m: int = 128, *, pair: bool = False) -> int:
+    """Rows of the resident bias block = the Q rows one work item's softmax sub-tiles READ: ``tiles_q x tile_m`` on the
+    one-batch-entry item (both sub-tiles are rows of one 256-row super-tile), ``tile_m`` on the (n, n+1) PAIR item
+    (``TemplateParams.n_chunk >= 1``: the two sub-tiles are rows n / n + 1 of the SAME 128-row q tile and share the block)."""
+    return tile_m if pair else tiles_q * tile_m
 
 
-def sm107_bias_resident_tiles(tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: int = 128) -> int:
+def sm107_bias_pair_form(bias_batch_extent: int, b_flat: int, cta_mma: int) -> bool:
+    """Whether a BIAS plan runs the (n, n+1) PAIR work item (``TemplateParams.n_chunk >= 1``) rather than S13's
+    one-batch-entry item: the bias must be batch-BROADCAST (two rows of one chunk read ONE block; a per-batch bias
+    ``[B, ., S_q, S_kv]`` keeps the 256-row item), the flattened batch must hold at least two rows (a single row would run a
+    dead sub-tile on every item) and the plan runs cga1 (a collective MMA cannot span two rows).  ONE predicate for the
+    engine row, the heuristics and the adapter (rule 8b')."""
+    return int(bias_batch_extent) == 1 and int(b_flat) >= 2 and int(cta_mma) == 1
+
+
+def sm107_bias_resident_tiles(
+    tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: int = 128, pair: bool = False
+) -> int:
     """How many ``tile_n``-column bias tiles (``BIAS_BLOCK_ROWS x tile_n`` elements each) the Rubin carveout holds beside
     the d128 family's Q / O slabs and K / V rings at ``tile_k = tile_o`` and the flavor's ring depth (``_stages_kv_d128``)
     -- the SAME budget ``_validate_smem`` enforces (320 KiB usable minus the fixed overhead).  0 = no resident block fits.
-    Derived, never a literal: 3 at the 32-wide tile (cga1), 1 / 2 at the 64-wide one (cga1 / cga2), 0 at d128."""
+    Derived, never a literal: 3 at the 32-wide tile (cga1), 1 / 2 at the 64-wide one (cga1 / cga2), 0 at d128 on the
+    256-row item; the PAIR item's 128-row block (``pair=True``) holds twice as many -- 6 at the 32-wide tile, 3 at the
+    64-wide one (cga1)."""
     b = bpe(dtype_qkv)
     stages = _stages_kv_d128(dtype_qkv, cta_mma, mxfp8=False, tile_k=tile_k)
     operands = sdpa_smem_bytes(tile_m, tile_n, tile_k, tile_k, tiles_q, stages, cta_mma, b, b)
     spare = SMEM_USABLE_BYTES - _SMEM_FIXED_OVERHEAD - operands
-    tile_bytes = sm107_bias_block_rows(tiles_q, tile_m) * tile_n * b
+    tile_bytes = sm107_bias_block_rows(tiles_q, tile_m, pair=pair) * tile_n * b
     return max(0, spare // tile_bytes)
 
 
-def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128) -> int:
+def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False) -> int:
     """The largest S_kv (in whole tiles) whose bias row-block the resident form serves at this width and cga: the work
-    item's KV range is at most ceil(S_kv / tile_n) tiles.  0 = the width serves no bias.  Read by the engine row's
-    mismatch, the adapter's check_support and the config factory (one arithmetic, rule 8b')."""
-    return sm107_bias_resident_tiles(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n) * tile_n
+    item's KV range is at most ceil(S_kv / tile_n) tiles.  0 = the width serves no bias.  ``pair``: the (n, n+1) item's
+    128-row block (``sm107_bias_pair_form``).  Read by the engine row's mismatch, the adapter's check_support and the config
+    factory (one arithmetic, rule 8b')."""
+    return sm107_bias_resident_tiles(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair) * tile_n
 
 
-def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128) -> Optional[int]:
+def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False) -> Optional[int]:
     """The NARROWEST cga in ``cgas`` whose resident block holds ``s_kv`` (``sm107_bias_resident_s_kv_max``), or ``None``
     when no width does.  The heuristics' auto pick for a BIAS graph (a kv_mask alone stages no block and keeps the flavor's
     own width rule), the width the standalone adapter lowers
     with when none is requested, and the engine row's knob-less eligibility all read it (rule 8b'): a d64 graph at S_kv
-    256 lands on cga2 (two tiles) without a knob, S_kv <= 128 keeps the tuned cga1."""
+    256 lands on cga2 (two tiles) without a knob, S_kv <= 128 keeps the tuned cga1.  ``pair`` = the graph qualifies for the
+    (n, n+1) item (a batch-broadcast bias on >= 2 rows): the 128-row block is evaluated at cga1 only (the pair runs cga1), the
+    256-row one at every other width."""
     for cga in sorted(cgas):
-        if s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cga, dtype_qkv=dtype_qkv, tile_n=tile_n):
+        if s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cga, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1):
             return cga
     return None
+
+
+def sm107_n_chunk_rule(b_flat: int, h_q: int, s_q: int, sm_count: int, *, tile_m: int = 128, waves: int = 3) -> int:
+    """The default chunk length of the (n, n+1) PAIR item: the largest power of two ``<= h_q * ceil(s_q / tile_m) * b_flat /
+    (waves * sm_count)`` (the ">= 3 waves" reading of the plan's parallelism-vs-amortisation trade), clamped to
+    ``[2, b_flat]`` and EVEN (an odd chunk runs a dead sub-tile on its last step).  ``sm_count`` 0 / None = 148.  Returns 0
+    (the one-batch-entry item) when ``b_flat < 2``."""
+    if b_flat < 2:
+        return 0
+    sms = int(sm_count) if sm_count else 148
+    items = h_q * (-(-s_q // tile_m)) * b_flat
+    n = 1
+    while n * 2 <= items // (waves * sms):
+        n *= 2
+    n = max(2, min(n, b_flat))
+    if n % 2:
+        n -= 1
+    return max(2, n)
+
+
+# A process-local seam for the sweep drivers and tests ONLY (None = the rule above): the (n, n+1) item's chunk length is a
+# performance axis of the frontend band (an autotune knob, append-only in knobs.h) once BOTH pybind extensions carry the enum
+# member; until that rebuild the graph path cannot carry it, so a sweep pins the pick here.  Never configuration.
+SM107_N_CHUNK_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm107_n_chunk_pick(
+    bias_batch_extent: int, b_flat: int, h_q: int, s_q: int, sm_count: int, cta_mma: int, *, s_kv: Optional[int] = None, d_flavor: Optional[int] = None
+) -> int:
+    """The ``TemplateParams.n_chunk`` a knob-less BIAS plan gets: 0 unless :func:`sm107_bias_pair_form` holds, else the
+    sweep override (0 = the one-batch-entry item, for its A/B arm) or :func:`sm107_n_chunk_rule` -- behind ONE measured guard:
+    at ``s_q % 256 == 0`` with ``s_kv`` inside the one-batch-entry block's budget the 256-row super-tile wastes no Q rows and its
+    two sub-tiles SHARE every K / V tile, where the pair streams them twice, so the one-batch-entry item is the faster form
+    (S_q = S_kv = 256, d32: 25.30 vs 26.50 us at n_chunk 2, 26.53 at 4 -- a 212-SM cc 10.7 node at the 2376 MHz lock); the pair
+    wins where a super-tile would be partly empty (S_q 128: +30.6 %, 384: +29.4 %) or where only its block holds S_kv (512+).
+    ``s_kv`` / ``d_flavor`` None skips the guard (callers that pin the form through the override or a request never reach it)."""
+    if not sm107_bias_pair_form(bias_batch_extent, b_flat, cta_mma):
+        return 0
+    if SM107_N_CHUNK_OVERRIDE_FOR_SWEEPS is not None:
+        return max(0, int(SM107_N_CHUNK_OVERRIDE_FOR_SWEEPS))
+    if s_kv is not None and d_flavor is not None and s_q % 256 == 0 and s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma):
+        return 0
+    return sm107_n_chunk_rule(b_flat, h_q, s_q, sm_count)
+
+
+def sm107_pair_item_active(
+    bias_batch_extent: int,
+    b_flat: int,
+    h_q: int,
+    s_q: int,
+    sm_count: int,
+    cta_mma: int,
+    n_chunk_request=None,
+    *,
+    s_kv: Optional[int] = None,
+    d_flavor: Optional[int] = None,
+) -> bool:
+    """Whether a BIAS plan RUNS the (n, n+1) pair item -- the form predicate AND a chunk length of at least 1 (the request when
+    the caller made one, else :func:`sm107_n_chunk_pick`; 0 from either = the one-batch-entry item).  THE predicate the engine
+    row, the heuristics and the adapter evaluate the budget of (rule 8b'): a plan must never be admitted on the 128-row block's
+    budget and built on the 256-row block."""
+    if not sm107_bias_pair_form(bias_batch_extent, b_flat, cta_mma):
+        return False
+    n = (
+        int(n_chunk_request)
+        if n_chunk_request is not None
+        else sm107_n_chunk_pick(bias_batch_extent, b_flat, h_q, s_q, sm_count, cta_mma, s_kv=s_kv, d_flavor=d_flavor)
+    )
+    return n >= 1
 
 
 # The same fact keyed by the config-flavor string `_validate_params` receives
@@ -797,6 +884,10 @@ class _CfgSm107:
     BIAS_BOXES_PER_TILE: int = 0
     BIAS_EMPTY_ARRIVERS: int = 0
     KV_MASK_FORM: int = 0
+    # The (n, n+1) PAIR work item (TemplateParams.n_chunk): 0 = the one-batch-entry item; n >= 1 = a work item is (a 128-row
+    # q tile, a head, a chunk of up to n consecutive flattened-batch rows), the two sub-tiles rows (nb, nb+1) of that q tile
+    # sharing the 128-row bias block (BIAS_BLOCK_ROWS = TILE_M).  Every seam folds on cutlass.const_expr(CFG.N_CHUNK > 0).
+    N_CHUNK: int = 0
 
 
 @dataclass(frozen=True)
@@ -1239,8 +1330,33 @@ def _validate_bias(cfg, flavor: str) -> None:
                 f"{flavor}: a resident bias block needs at least one {cfg.TILE_N}-column tile (BIAS_RESIDENT_TILES={cfg.BIAS_RESIDENT_TILES})",
             ),
             (
-                cfg.BIAS_BLOCK_ROWS == cfg.TILES_Q * cfg.TILE_M,
-                f"{flavor}: BIAS_BLOCK_ROWS must be the work item's Q rows, TILES_Q x TILE_M = {cfg.TILES_Q * cfg.TILE_M} (got {cfg.BIAS_BLOCK_ROWS})",
+                cfg.BIAS_BLOCK_ROWS == (cfg.TILE_M if cfg.N_CHUNK > 0 else cfg.TILES_Q * cfg.TILE_M),
+                f"{flavor}: BIAS_BLOCK_ROWS must be the Q rows the work item's sub-tiles READ: TILE_M = {cfg.TILE_M} on the (n, n+1) pair item "
+                f"(N_CHUNK={cfg.N_CHUNK} > 0: both sub-tiles are rows of ONE q tile and share the block -- a 256-row block would feed row n's bias "
+                f"into row n + 1's sub-tile, finite and wrong, no crash), TILES_Q x TILE_M = {cfg.TILES_Q * cfg.TILE_M} on the one-batch-entry item "
+                f"(got {cfg.BIAS_BLOCK_ROWS})",
+            ),
+            (
+                cfg.N_CHUNK >= 0,
+                f"{flavor}: N_CHUNK must be >= 0 (0 = the one-batch-entry item; got {cfg.N_CHUNK})",
+            ),
+            (
+                cfg.N_CHUNK == 0 or cfg.CTA_MMA == 1,
+                f"{flavor}: the (n, n+1) pair item runs cga1 only (CTA_MMA={cfg.CTA_MMA}): a cta_group::2 collective MMA shares K across both CTAs' rows, "
+                f"and rows n / n + 1 are DIFFERENT batch entries with different K / V",
+            ),
+            (
+                cfg.N_CHUNK == 0 or cfg.TILES_Q == 2,
+                f"{flavor}: the pair item is the two-sub-tile pipeline (TILES_Q={cfg.TILES_Q}): sub-tile qs is row n + qs of the chunk",
+            ),
+            (
+                cfg.N_CHUNK == 0 or not cfg.BOTTOM_RIGHT,
+                f"{flavor}: the pair item's per-step KV range is the UNION of two rows' top-left bands (monotone in the KV length); the bottom-right "
+                f"diagonal differs per row -- not served (the graph contract refuses bottom-right causal with a bias anyway)",
+            ),
+            (
+                cfg.N_CHUNK == 0 or not (cfg.THD_VARLEN or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.EPILOGUE_GATE),
+                f"{flavor}: the pair item is the dense, unsplit, non-PackGQA, ungated arm (the bias arm's own gates)",
             ),
             (
                 cfg.BIAS_SWZ_BYTES == BIAS_SWZ_BYTES and cfg.BIAS_BOXES_PER_TILE == (cfg.TILE_N * cfg.BPE) // BIAS_SWZ_BYTES,
@@ -1303,9 +1419,15 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
                 f"got {bias_mode} / {kv_mask_form}"
             )
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
+    # The (n, n+1) pair item (TemplateParams.n_chunk, appended; read through getattr so a record without the field renders
+    # the one-batch-entry item): a 128-row block, cga1, the bias arm only -- _validate_bias pins the couplings.
+    n_chunk = int(getattr(params, "n_chunk", 0))
+    pair = n_chunk > 0
+    if pair and bias_mode != BIAS_MODE_RESIDENT:
+        raise ValueError(f"{flavor}: n_chunk={n_chunk} is the (n, n+1) pair item of the resident BIAS arm; it needs bias_mode=1 (got {bias_mode})")
     bias_tiles = 0
     if bias_mode == BIAS_MODE_RESIDENT:
-        bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n)
+        bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair)
         if bias_tiles == 0:
             raise ValueError(
                 f"{flavor}: no resident bias block fits beside the Q / O slabs and the {stages_kv}-deep K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} "
@@ -1381,11 +1503,12 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         READ_TILE_ARRIVERS=_D128_READ_TILE_ARRIVERS,
         BIAS_MODE=bias_mode,
         BIAS_RESIDENT_TILES=bias_tiles,
-        BIAS_BLOCK_ROWS=sm107_bias_block_rows(2, 128) if bias_mode else 0,
+        BIAS_BLOCK_ROWS=sm107_bias_block_rows(2, 128, pair=pair) if bias_mode else 0,
         BIAS_SWZ_BYTES=BIAS_SWZ_BYTES,
         BIAS_BOXES_PER_TILE=(tile_n * b) // BIAS_SWZ_BYTES if bias_mode else 0,
         BIAS_EMPTY_ARRIVERS=2 * 4 if (bias_mode or kv_mask_form) else 0,
         KV_MASK_FORM=kv_mask_form,
+        N_CHUNK=n_chunk,
     )
 
     _validate_regs(cfg, flavor)

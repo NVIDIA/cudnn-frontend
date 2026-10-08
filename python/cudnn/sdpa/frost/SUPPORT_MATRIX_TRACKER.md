@@ -999,7 +999,7 @@ red (2026-09-08).
 | Paged KV (half THD, no sink) | ❌ᵗ (the pre-tile decline) | fp8 envelope · f16/bf16 ❌ᵗ (the pre-tile decline) | ✅ | ❌ | ✅, unsplit | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
 | Optional stats (LSE store compiled out) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — |  —  |
-| Bias (additive, `[1\|B, 1\|H_q, S_q, S_kv]` in the Q/K/V dtype; the RESIDENT row-block, dense / unsplit / unpaged, no score outputs)ᵗᵇ | ✅ᵗᵇ S_kv ≤ 384 | ✅ᵗᵇ S_kv ≤ 128 (cga1) / ≤ 256 (cga2) | ❌ (no SMEM for a block) | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Bias (additive, `[1\|B, 1\|H_q, S_q, S_kv]` in the Q/K/V dtype; the RESIDENT row-block, dense / unsplit / unpaged, no score outputs)ᵗᵇ | ✅ᵗᵇ S_kv ≤ 768 for a batch-broadcast bias on ≥ 2 flattened rows (the (n, n+1) pair work item, a 128-row block); ≤ 384 for a per-batch bias | ✅ᵗᵇ S_kv ≤ 384 (the pair item, cga1); a per-batch bias ≤ 128 (cga1) / ≤ 256 (cga2) | ❌ (no SMEM for a block) | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Per-key mask (`kv_mask`, a python-only `sdpa` input `[1\|B, 1, 1, S_kv]`: BOOLEAN = the bit word, False = the key is masked for every query; the Q/K/V dtype or FLOAT = an ADDITIVE per-key vector folded pre-scale like the bias, S_kv % 8 == 0, 16-byte strides)ᵗᵇ | ✅ᵗᵇ any S_kv (nothing staged in SMEM; validated to n_kv = 8; both forms) | ✅ᵗᵇ any S_kv (cga1; cga2 on request; both forms) | ❌ | ❌ | ❌ | ❌ | — |  —  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ ᵗ | ✅ⁱˣ ᵗ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
 | FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | — | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |  —  |
@@ -1311,6 +1311,21 @@ Stats = -inf (the empty-row contract, `sdpa-invariants` s1 / s4).  The block's
 budget is what the 320 KiB carveout leaves beside the Q / O slabs and the K / V
 ring, in whole 128-column tiles: 3 at the 32-wide tile (S_kv ≤ 384), 1 / 2 at the
 64-wide one at cga 1 / 2 (128 / 256), none at d128 (its operands sum to 256 KiB).
+**The (n, n+1) PAIR work item** (`TemplateParams.n_chunk >= 1`, the heuristics' pick for a
+batch-BROADCAST bias `[1, 1|H, S_q, S_kv]` on >= 2 flattened batch rows at cga1): a work
+item is (a 128-row q tile, a head, a chunk of up to `n_chunk` consecutive batch rows), the
+two softmax sub-tiles are rows nb / nb + 1 of that q tile and share ONE 128-row block loaded
+once per item -- the block holds twice the kv columns (6 tiles = S_kv ≤ 768 at the 32-wide
+tile, 3 = ≤ 384 at the 64-wide one) and the per-item fixed cost is paid once per chunk; O and
+Stats are BITWISE the one-batch-entry item's (every row's kv loop runs the same tiles in the
+same order) and bitwise across `n_chunk` values; a per-batch bias, a single row or a requested
+cga2 keep the one-batch-entry item and its budget (`config_sm107.sm107_bias_pair_form`, the
+rule `sm107_n_chunk_rule`: the largest power of two ≤ H · ceil(S_q / 128) · B / (3 · SMs), even,
+in [2, B]).  Validated on cc 10.7 against the fp64 oracle: n_chunk 1 / 2 / 4 / 8 / N, one chunk,
+the odd tail chunk (a dead sub-tile stores nothing), S_kv 304 / 512 / 768 (the 6-tile edge),
+a zero-length row and the padded-Q trim inside a chunk, mixed per-row lengths, SWA + causal,
+the kv_mask composed, the 64-wide tile at 256 / 384.  Not a public knob yet: the frontend-band
+enum member needs both pybind extensions rebuilt (the standalone adapter takes `n_chunk=`).
 A graph no width holds is a TYPED decline on the row and in the adapter (the
 streamed ring is the follow-up); a knob-less graph some width holds is SERVED --
 the heuristics propose the NARROWEST width whose block holds S_kv
