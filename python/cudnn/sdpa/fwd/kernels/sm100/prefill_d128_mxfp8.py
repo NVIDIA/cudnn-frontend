@@ -157,6 +157,7 @@ from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
     tma_store_tile,
+    tma_store_subtile,
     tma_store_commit,
     tma_store_wait,
     bulk_copy,
@@ -464,6 +465,10 @@ SPLIT_KV = _split_h.SPLIT_KV
 # A split writes fp32 partials, replacing the SMEM/TMA O path rather than
 # widening it; the combine performs the only cast to O's dtype.
 _FP32_PARTIALS = SPLIT_KV > 1
+# Plain (non block-scaled, unsplit) O is published and TMA-stored per swizzle-width column block (64 bf16 columns):
+# each block's cp.async.bulk.tensor leaves the SM's in-order TMA engine while the correction still converts the
+# next block, instead of the whole 64 KiB tile queueing at the end ahead of the next tile's Q / K / V loads.
+O_STORE_PARTS = TMA_O_ITERS_HOST if (CFG.O_BLOCK_SCALE == 0 and SPLIT_KV == 1) else 1
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
 
 PAGED_KV = bool(CFG.PAGED_KV)
@@ -725,7 +730,7 @@ def _kernel(
             layout=SMEM_LAYOUT_SF,
         )
 
-    bars = make_classic_bars(CFG, q_full_arrivers=(CFG.CTA_MMA if CFG.PACK_GQA else 1))
+    bars = make_classic_bars(CFG, q_full_arrivers=(CFG.CTA_MMA if CFG.PACK_GQA else 1), o_parts=O_STORE_PARTS)
 
     # SM100 mxfp8-only cross-CTA barrier (not in the shared Bars NamedTuple):
     # softmax[sub] signals "S_acc[sub] LDTM into registers is done" so the leader
@@ -763,7 +768,8 @@ def _kernel(
                 bars.mb_stat_full[qs].init()
                 bars.mb_stat_empty[qs].init()
                 bars.mb_stats_read[qs].init()
-                bars.mb_o_full[qs].init()
+                for _p in cutlass.range_constexpr(O_STORE_PARTS):
+                    bars.mb_o_full[qs * O_STORE_PARTS + _p].init()
                 bars.mb_o_empty[qs].init()
                 for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
                     bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + c].init()
@@ -1522,6 +1528,28 @@ def _tmastg_warp_group(
         o_batch = _partial_batch(batch_idx, split_idx, n_batch)
 
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
+            if cutlass.const_expr(O_STORE_PARTS > 1):
+                # Streamed: wait for each column block as the correction publishes it and issue its subtile store
+                # right away (tma_store_subtile); one bulk group per sub-tile, waited once below.
+                for _p in cutlass.range_constexpr(O_STORE_PARTS):
+                    bars.mb_o_full[qs * O_STORE_PARTS + _p].wait(o_full_phase)
+                    if cutlass.const_expr(CFG.THD_VARLEN):
+                        if batch_idx < n_batch:
+                            o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                            o_slice = tma_slice_runtime_desc(
+                                o_desc_ptr, cutlass.Int32(0), head_idx, q_row_base + cutlass.Int32(qs * CFG.TILE_M), cutlass.Int32(0)
+                            )
+                            tma_store_subtile(sO[qs], o_slice, _p, acquire=(qs == 0 and _p == 0))
+                    else:
+                        tma_store_subtile(
+                            sO[qs],
+                            tma_o(cutlass.Int32(0), head_idx * cutlass.Int32(HEADS_PER_TILE), q_row_base + cutlass.Int32(qs * TOKENS_PER_TILE), o_batch),
+                            _p,
+                        )
+                tma_store_commit()
+                tma_store_wait(0)
+                bars.mb_o_empty[qs].arrive()
+                continue
             bars.mb_o_full[qs].wait(o_full_phase)
             # fp32 partials wrote the workspace directly, so nothing is staged
             # to copy.  Skip ONLY the store: the arrive below and any QO_ALIAS
@@ -2586,7 +2614,12 @@ def _correction_warp_group(
     tid_in_wg = tid_raw - cutlass.Int32(CFG.CORR_WARP_BASE * 32)
 
     # O_CHUNK=16 keeps live range short enough to avoid spilling (O_CHUNK=32 spilled correction regs).
-    O_CHUNK = 16
+    # 32-column TMEM reads halve the serialized tcgen05.ld round trips of the O drain (cuDNN reads 32-column blocks)
+    # -- on cc 10.0 only: MEASURED B200 llama causal 2k/4k/8k -1.3/-0.4/-0.2 %, dense 2k -1.2 %; B300 (cc 10.3,
+    # FUSED_LDTM_STAT) causal +4.4/+5.6/+6.1 % (grows with S: a per-step cost on that part), so it keeps 16.  The
+    # block-scaled O epilogue addresses its 16-wide scale blocks per chunk and keeps 16; so does the d64 leg (TILE_O=64:
+    # two 32-column chunks measured +1.5..2.4 % on gpt_oss, B200).
+    O_CHUNK = 16 if (CFG.O_BLOCK_SCALE > 0 or CFG.TILE_O < 128 or FUSED_LDTM_STAT) else 32
     N_CHUNKS_O = CFG.TILE_O // O_CHUNK
     # D_BLOCK_SIZE must use O_SWZ_B not V_SWZ_B — fp8 V drops to Swz64B while half O stays Swz128B.
     # Sized in BPE_O so it stays consistent with the BPE_O-derived O_SWZ_BYTES (BF16/FP16 O).
@@ -2963,6 +2996,11 @@ def _correction_warp_group(
                         if chunk_idx == 0:
                             bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
                         smem_ptr.store_swizzled(o_out, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                        if cutlass.const_expr(O_STORE_PARTS > 1 and ((chunk_idx + 1) * O_CHUNK) % D_BLOCK_SIZE == 0):
+                            # This column block is complete in SMEM: publish it to the async proxy and let the
+                            # TMA-STG warp store it while the next block is still being converted.
+                            nvvm.fence_proxy("async.shared", space="cta")
+                            bars.mb_o_full[qs * O_STORE_PARTS + block_idx_const].arrive()
 
                 # One atomic per valid row (invalid/OOB rows must not poison the global amax).
                 #
@@ -2980,7 +3018,8 @@ def _correction_warp_group(
 
             # The next tile's prologue also parks SF_Q/K in O_0's head, so release it only after O is read.
             bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
-            bars.mb_o_full[qs].arrive()
+            if cutlass.const_expr(O_STORE_PARTS == 1):
+                bars.mb_o_full[qs].arrive()
 
         stat_full_phase = stat_full_phase ^ 1
         o_empty_phase = o_empty_phase ^ 1
