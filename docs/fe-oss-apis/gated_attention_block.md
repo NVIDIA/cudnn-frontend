@@ -41,8 +41,8 @@ so they are unspellable on the bf16 and per-tensor FP8 pipelines rather than dec
 | bf16 / fp16 | `h`, weights and `cos`/`sin` in bf16 or fp16, `quant=None` | 5 stages, 5 launches (4 with `inplace_qkv`) |
 | FP8, per-tensor static scales | e4m3 `h` / `W_qkvg` / `W_o` and a `QuantSpec` | unfused: FP8 projections with the descale folded into the epilogue, bf16 norm+RoPE, two quantize passes (Q/K/V, gated O), the Rubin per-tensor FP8 SDPA and an FP8 out projection (9 launches); fully fused: 3 launches |
 | MXFP8, per-32-element E8M0 block scales | e4m3 `h` / `W_qkvg` codes, the two scale-factor blobs (`h_sf`, `w_qkvg_sf`) and an `MxQuantSpec` | unfused: block-scale projection GEMM, bf16 norm+RoPE, MXFP8 quantize (Q/K rowwise, V columnwise), the Rubin d256 MXFP8 SDPA, per-tensor quantize of O, FP8 out projection (9 stages); fully fused: 3 launches |
-| MXFP8 with **MXFP4 weights** (unfused only) | `MxQuantSpec(w_qkvg_dtype=torch.float4_e2m1fn_x2)` and an e2m1 `W_qkvg [N, d_model // 2]`; `h`, `h_sf` and `w_qkvg_sf` unchanged | the MXFP8 unfused pipeline with stage (1) on the catalog's mixed MXFP8 x MXFP4 block-scale row (E8M0 scales per 32 on both sides) -- the same 9 launches; `fuse_norm_rope` is a typed decline (the fused projection fork is rendered for an e4m3 B) |
-| MXFP8 with **fp4 O** (`NVFP4` or `MXFP4`) | `MxQuantSpec(o_fp4=Fp4Format.NVFP4 \| Fp4Format.MXFP4)`, an e2m1 `W_o [d_model, H_q * D // 2]` of the SAME format and its scale blob (`sample_w_o_sf` / `w_o_sf`) | the per-tensor tail is replaced: one `quantize_fp4` launch writes the gated `O` as e2m1 codes plus the out projection's scale blob, and stage (6) becomes the fp4 x fp4 block-scale GEMM (no per-tensor scale on either side). Unfused: 9 launches (`quantize_fp4` takes the per-tensor quantize's place); fully fused: **4 launches** (the gated MXFP8 SDPA writes bf16 `O`, then `quantize_fp4`, then the fp4 out projection). Composes with the MXFP4 weights on the unfused pipeline |
+| MXFP8 with **MXFP4 weights** | `MxQuantSpec(w_qkvg_dtype=torch.float4_e2m1fn_x2)` and an e2m1 `W_qkvg [N, d_model // 2]`; `h`, `h_sf` and `w_qkvg_sf` unchanged | unfused: the MXFP8 pipeline with stage (1) on the catalog's mixed MXFP8 x MXFP4 block-scale row (E8M0 scales per 32 on both sides) -- the same 9 launches; fully fused: the same **3 launches**, the fused projection fork's e2m1-B arm reading the packed codes and the unchanged blob inside its norm+RoPE+quant epilogue (dense only, like the MXFP8 fused pipeline) |
+| MXFP8 with **fp4 O** (`NVFP4` or `MXFP4`) | `MxQuantSpec(o_fp4=Fp4Format.NVFP4 \| Fp4Format.MXFP4)`, an e2m1 `W_o [d_model, H_q * D // 2]` of the SAME format and its scale blob (`sample_w_o_sf` / `w_o_sf`) | the per-tensor tail is replaced: one `quantize_fp4` launch writes the gated `O` as e2m1 codes plus the out projection's scale blob, and stage (6) becomes the fp4 x fp4 block-scale GEMM (no per-tensor scale on either side). Unfused: 9 launches (`quantize_fp4` takes the per-tensor quantize's place); fully fused: **4 launches** (the gated MXFP8 SDPA writes bf16 `O`, then `quantize_fp4`, then the fp4 out projection). Composes with the MXFP4 weights on both pipelines (fully fused: the e2m1-B projection fork + the fp4 tail, 4 launches) |
 
 ### Fusion knobs
 
@@ -106,7 +106,11 @@ from cudnn.gated_attention_block import (
   `[d_model, H_q * D // 2]` for `W_o`); a logical `[N, K]` fp4 tensor, or `uint8` storage, is a typed `ValueError`
   (torch can `.view(torch.float4_e2m1fn_x2)` packed bytes but cannot cast to fp4).
   - MXFP4 `W_qkvg` (`MxQuantSpec.w_qkvg_dtype=torch.float4_e2m1fn_x2`): `w_qkvg_sf` is UNCHANGED -- the same E8M0 /
-    32 F8_128x4 blob over `n_qkvg x d_model` as for e4m3 codes.
+    32 F8_128x4 blob over `n_qkvg x d_model` as for e4m3 codes. The fused projection fork reads the same `[N, d_model // 2]`
+    storage and the same blob through the packed sub-byte TMA format, whose rules the fused stage checks before any launch
+    (typed `ValueError`): the fused pipeline's `d_model % 128 == 0`, a 32-byte-aligned weight base address and a row stride
+    that is a multiple of 32 bytes (a contiguous `[N, d_model // 2]` weight satisfies both; a 16-byte-aligned slice of a
+    larger buffer or a padded-row view does not), and -- on both arms -- a unit stride along K.
   - fp4 `W_o` (`MxQuantSpec.o_fp4`): its scale blob `w_o_sf` is in the SAME format as `O` -- `float8_e4m3fn` scales per
     16 for `Fp4Format.NVFP4`, `float8_e8m0fnu` per 32 for `Fp4Format.MXFP4` (either as `uint8` or as that dtype),
     `sf_blob_bytes(d_model, H_q * D, block)` bytes in F8_128x4 order (padded to whole 128-row x 4-block atoms; pad
@@ -675,9 +679,10 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   by `GatedAttentionBlockBwd(quant=MxQuantSpec)` over the caller's transposed e2m1 artifacts; no global per-tensor scale in
   either fp4 format (`scale_o == descale_w_o == 1.0` under `o_fp4`); `d_head % (4 * block) == 0` under `o_fp4`
   (whole 4-block scale words per head: 64 for NVFP4, 128 for MXFP4; `d_head = 256` passes both); the MXFP4
-  `W_qkvg` runs on the unfused pipeline only -- `fuse_norm_rope` with an e2m1 `W_qkvg` is a typed
-  `NotImplementedError` (the fused MXFP8 projection fork is rendered for an e4m3 B). `h` stays e4m3 (an fp4 `h` is
-  not served), and an fp4 `W_o` with an e4m3 `O` is not a served pairing.
+  `W_qkvg` is served on both pipelines -- fully fused through the MXFP8 projection fork's e2m1-B arm
+  (`NormRopeFusionParams.weight_fp4`, feature-detected: a checkout whose fork lacks the field declines typed) under the
+  fused pipeline's own rules (inference only, dense only, `S % 128 == 0` at `B > 1`, `scale_o == 1.0`). `h` stays e4m3
+  (an fp4 `h` is not served), and an fp4 `W_o` with an e4m3 `O` is not a served pairing.
 
 ## Performance
 
