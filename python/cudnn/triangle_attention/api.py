@@ -58,6 +58,7 @@ import torch
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
 
 #: The cuEquivariance release whose ``triangle_attention`` signature (names, order, defaults) this module mirrors.
 CUEQ_SIGNATURE_VERSION = "0.12.0"
@@ -70,7 +71,6 @@ _ELEM_BYTES = 2  # bf16 / fp16
 _TMA_ALIGN = 16  # the TMA-read operands (q, k, v, bias, o): the binder's `_ALIGN_TMA`
 _ALIGN_WORD = 4  # the int32 lengths and the fp32 lse: the binder's `_ALIGN_F32` (`prepared.lens`, `_dense_lse`)
 _ALIGN_BYTE = 1  # the boolean key mask: the kernel loads ONE BYTE per lane (`tile_dsl.mask.kv_mask_keep_words`) -- no alignment rule
-_Q_LENS_ALIGN = 256  # the Q-side lengths region of the kv_lengths form starts at this boundary after the plan's own workspace bytes
 _FROST_ENV = "CUDNN_FRONTEND_ENABLE_FROST_ENGINES"
 _DTYPES = (torch.bfloat16, torch.float16)
 _dense_bind_strides = None  # the engine's layout predicate, imported on first use
@@ -132,6 +132,28 @@ def _stream_int(stream, device) -> int:
         return int(stream)
     except TypeError:
         return int(stream.getPtr())
+
+
+# ---------------------------------------------------------------------------
+# The caller's workspace -- the SDPA adapters' recipe (`ws_align` chunks dealt in order by `WorkspaceCarver`), never a local carve
+# ---------------------------------------------------------------------------
+def workspace_bytes(plan_bytes: int, n_q_lens: int) -> int:
+    """Bytes ``execute`` needs: the plan's own ``plan_bytes`` and, on the ``kv_lengths`` form (``n_q_lens > 0``), ``n_q_lens`` int32
+    words for the Q-side lengths -- two chunks of the SDPA adapters' shared carve (``ws_align``: 128-byte chunks dealt in order), so the
+    lengths start at ``ws_align(plan_bytes)``.  The other forms need exactly the plan's own bytes."""
+    if n_q_lens <= 0:
+        return int(plan_bytes)
+    return ws_align(plan_bytes) + ws_align(_ALIGN_WORD * int(n_q_lens))
+
+
+def carve_workspace(workspace, plan_bytes: int, n_q_lens: int, owner: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(the plan's own chunk or None, the Q-side lengths as an int32 view or None)`` carved from the caller's ``workspace`` by the
+    shared ``WorkspaceCarver`` -- a missing, undersized, non-tensor or misaligned buffer raises ITS error (the SDPA adapters' text; its
+    base rule is 16-byte alignment, which a torch allocation satisfies, while the lengths' reader needs 4)."""
+    carver = WorkspaceCarver(workspace, workspace_bytes(plan_bytes, n_q_lens), owner)
+    plan_ws = carver.take(int(plan_bytes), torch.uint8) if plan_bytes else None
+    q_lens = carver.take(int(n_q_lens), torch.int32) if n_q_lens > 0 else None
+    return plan_ws, q_lens
 
 
 # ---------------------------------------------------------------------------
@@ -229,9 +251,8 @@ class TriangleAttentionFwd(APIBase):
         self._plan_index: Optional[int] = None
         self._handle = None
         self._uids: Tuple[int, ...] = ()
-        self._workspace_bytes = 0  # what execute needs: the plan's own bytes (+ the Q-side lengths region on the kv_lengths form)
+        self._workspace_bytes = 0  # what execute needs: the plan's own bytes (+ the Q-side lengths chunk on the kv_lengths form)
         self._plan_workspace_bytes = 0
-        self._q_lens_offset = 0
         self.plan_name: Optional[str] = None
         self.knobs: Optional[dict] = None
 
@@ -245,6 +266,11 @@ class TriangleAttentionFwd(APIBase):
     def launches_per_call(self) -> int:
         """Kernel launches per ``execute``: one per outer batch entry (the bias of entry ``b`` is broadcast over its ``N`` rows)."""
         return self.batch
+
+    @property
+    def _n_q_lens(self) -> int:
+        """The int32 words of Q-side lengths the caller's workspace carries: ``N`` on the ``kv_lengths`` form, else 0."""
+        return self.n if self.mask_form == "kv_lengths" else 0
 
     def check_support(self) -> bool:
         """Typed declines: malformed declarations first (``ValueError``), then the serving envelope -- dtype, arch, the DSL, the FROST
@@ -396,7 +422,7 @@ class TriangleAttentionFwd(APIBase):
             g.build_plans()
             self._plan_workspace_bytes = int(g.get_workspace_size())
             self._handle = cudnn.create_handle()
-        self._q_lens_offset, self._workspace_bytes = self.workspace_layout(self._plan_workspace_bytes, self.n if self.mask_form == "kv_lengths" else 0)
+        self._workspace_bytes = workspace_bytes(self._plan_workspace_bytes, self._n_q_lens)
         _engine_id, record = g.get_engine_and_knobs_at_index(self._plan_index)
         self.knobs = dict(record) if record else {}
         self._uids = tuple(t.uid for t in self._order)
@@ -421,20 +447,11 @@ class TriangleAttentionFwd(APIBase):
         )
         self._compiled_kernel = g
 
-    @staticmethod
-    def workspace_layout(plan_bytes: int, n_q_lens: int) -> Tuple[int, int]:
-        """``(offset of the Q-side lengths region, total bytes)`` of the workspace ``execute`` needs: the plan's own ``plan_bytes`` first,
-        then -- when ``n_q_lens > 0`` (the ``kv_lengths`` form) -- ``n_q_lens`` int32 words at the next 256-byte boundary."""
-        if n_q_lens <= 0:
-            return int(plan_bytes), int(plan_bytes)
-        offset = -(-int(plan_bytes) // _Q_LENS_ALIGN) * _Q_LENS_ALIGN
-        return offset, offset + _ALIGN_WORD * int(n_q_lens)
-
     def get_workspace_size(self) -> int:
         """Bytes of the workspace ``execute`` needs: the plan's own requirement (0 on most declarations; the dense-mask form at an
         ``S_kv`` that is not a multiple of the kv tile carries the engine's synthesized padding lengths) plus, on the ``kv_lengths`` form,
-        ``N`` int32 words at a 256-byte offset for the Q-side lengths the graph's padding contract requires -- ``execute`` writes ``S_q``
-        there on its stream before the launches (:meth:`workspace_layout`)."""
+        ``N`` int32 words for the Q-side lengths the graph's padding contract requires -- ``execute`` writes ``S_q`` there on its stream
+        before the launches.  Sized and carved by the SDPA adapters' shared recipe (:func:`workspace_bytes`, :func:`carve_workspace`)."""
         if self._compiled_kernel is None:
             raise RuntimeError("compile() must run before get_workspace_size()")
         return self._workspace_bytes
@@ -502,25 +519,16 @@ class TriangleAttentionFwd(APIBase):
             raise ValueError("this plan was declared with lse=False; lse must be None (declare lse=True to request it)")
         if score_max is not None:
             raise ValueError("score_max is not served by this plan (the engine row declines the row-max side output on the bias arm)")
-        if self._workspace_bytes:
-            if (
-                not isinstance(workspace, torch.Tensor)
-                or workspace.dtype != torch.uint8
-                or workspace.numel() < self._workspace_bytes
-                or not workspace.is_contiguous()
-            ):
+        if self._workspace_bytes and isinstance(workspace, torch.Tensor):
+            # A missing, undersized, non-tensor or misaligned workspace raises the shared carver's own error (carve_workspace, at
+            # execute); the two facts the carver does not check are the buffer's device (the plan's) and its contiguity (the chunks
+            # are views of the caller's bytes -- a strided buffer would be carved on a copy).
+            if workspace.device.type != "cuda" or workspace.device.index != self.device_index:
+                raise ValueError(f"workspace lives on {workspace.device}; this plan was declared on cuda:{self.device_index} and its kernel is loaded there")
+            if not workspace.is_contiguous():
                 raise ValueError(
-                    f"workspace must be a contiguous uint8 tensor of at least get_workspace_size() = {self._workspace_bytes} bytes"
-                    + (
-                        " (the kv_lengths form writes the Q-side lengths the graph's padding contract requires into it)"
-                        if self.mask_form == "kv_lengths"
-                        else ""
-                    )
+                    f"workspace must be contiguous (its chunks are carved as views of the caller's bytes), got strides {tuple(workspace.stride())}"
                 )
-            if workspace.device != q.device:
-                raise ValueError(f"workspace must live on q's device {q.device}, got {workspace.device}")
-            if workspace.data_ptr() % _TMA_ALIGN:
-                raise ValueError(f"workspace must be {_TMA_ALIGN}-byte aligned (its base address is {workspace.data_ptr() % _TMA_ALIGN} bytes past one)")
         if o.data_ptr() in (q.data_ptr(), k.data_ptr(), v.data_ptr()):
             raise ValueError("o must not alias q, k or v")
 
@@ -553,54 +561,49 @@ class TriangleAttentionFwd(APIBase):
             raise RuntimeError("compile() must run before execute()")
         self._check_execute_args(q, k, v, bias, kv_lengths, o, lse, score_max, workspace, mask)
         stream_int = _stream_int(current_stream, self.device)
-        if self.mask_form == "kv_lengths":
-            self._write_q_lengths(workspace, stream_int)
+        plan_ws = q_lens = None
+        if self._workspace_bytes:
+            plan_ws, q_lens = carve_workspace(workspace, self._plan_workspace_bytes, self._n_q_lens, type(self).__name__)
+        if q_lens is not None:
+            self._write_q_lengths(q_lens, stream_int)
         if self._fast_spec is not None:
-            self._execute_frames(q, k, v, bias, kv_lengths, mask, o, lse, workspace, stream_int)
+            self._execute_frames(q, k, v, bias, kv_lengths, mask, o, lse, q_lens, stream_int)
         else:
-            self._execute_graph(q, k, v, bias, kv_lengths, mask, o, lse, workspace, stream_int)
+            self._execute_graph(q, k, v, bias, kv_lengths, mask, o, lse, plan_ws, q_lens, stream_int)
 
-    def _write_q_lengths(self, workspace, stream_int: int) -> None:
-        """The ``kv_lengths`` form: fill the ``N`` int32 Q-side lengths in the caller's workspace with ``S_q`` on the execute stream (one
-        driver memset; no allocation, no host synchronisation) -- the graph's padding contract requires a Q-side length tensor and the
-        kernel bounds the live Q rows by it; every Q row of a triangle-attention call is live."""
+    def _write_q_lengths(self, q_lens: torch.Tensor, stream_int: int) -> None:
+        """The ``kv_lengths`` form: fill the carved ``N`` int32 Q-side lengths with ``S_q`` on the execute stream (one driver memset; no
+        allocation, no host synchronisation) -- the graph's padding contract requires a Q-side length tensor and the kernel bounds the
+        live Q rows by it; every Q row of a triangle-attention call is live."""
         from cudnn._device import ensure_current_context
         from cudnn.frost.buffers import fill_word_async
 
         ensure_current_context(stream_int, self.device_index)
-        fill_word_async(workspace.data_ptr() + self._q_lens_offset, self.n, self.s_q, stream_int)
+        fill_word_async(q_lens.data_ptr(), self.n, self.s_q, stream_int)
 
-    def _q_lengths_view(self, workspace) -> torch.Tensor:
-        """The ``(N, 1, 1, 1)`` int32 view of the workspace region holding the Q-side lengths (the graph path's variant-pack operand)."""
-        off = self._q_lens_offset
-        try:
-            return workspace[off : off + _ALIGN_WORD * self.n].view(torch.int32).view(self.n, 1, 1, 1)
-        except RuntimeError as error:  # a uint8 view at a storage offset that is not a multiple of 4 cannot be read as int32
-            raise ValueError(f"workspace must start at a storage offset that is a multiple of {_ALIGN_WORD} bytes: {error}") from error
-
-    def _entry_views(self, q, k, v, bias, kv_lengths, mask, o, lse, b: int, workspace=None) -> list:
-        """The per-entry buffers in the graph's operand order (the declaration's 4-D geometry); with ``workspace`` the ``kv_lengths``
-        form's Q-side lengths view follows the KV lengths (the graph path), without it the role is bound from the pointer (the frame path)."""
+    def _entry_views(self, q, k, v, bias, kv_lengths, mask, o, lse, b: int, q_lens=None) -> list:
+        """The per-entry buffers in the graph's operand order (the declaration's 4-D geometry); with ``q_lens`` (the carved Q-side
+        lengths) the ``kv_lengths`` form's ``(N, 1, 1, 1)`` view follows the KV lengths (the graph path), without it the role is bound
+        from the carved view's facts (the frame path)."""
         bufs = [q[b], k[b], v[b], bias[0] if self.bias_broadcast_batch else bias[b]]
         if self.mask_form == "mask":
             bufs.append(mask[b])
         elif self.mask_form == "kv_lengths":
             bufs.append(kv_lengths[b])
-            if workspace is not None:
-                bufs.append(self._q_lengths_view(workspace))
+            if q_lens is not None:
+                bufs.append(q_lens.view(self.n, 1, 1, 1))
         bufs.append(o[b])
         if self.want_lse:
             bufs.append(lse[b])
         return bufs
 
-    def _execute_graph(self, q, k, v, bias, kv_lengths, mask, o, lse, workspace, stream_int: int) -> None:
+    def _execute_graph(self, q, k, v, bias, kv_lengths, mask, o, lse, plan_ws, q_lens, stream_int: int) -> None:
         import cudnn
 
         cudnn.set_stream(self._handle, stream_int)
         g, handle, uids = self._compiled_kernel, self._handle, self._uids
-        ws = workspace if self._plan_workspace_bytes else None
         for b in range(self.batch):
-            g.execute(tuple(self._entry_views(q, k, v, bias, kv_lengths, mask, o, lse, b, workspace)), ws, handle, tensor_uids=uids)
+            g.execute(tuple(self._entry_views(q, k, v, bias, kv_lengths, mask, o, lse, b, q_lens)), plan_ws, handle, tensor_uids=uids)
 
     # The engine's frame slots the per-call pointers land in, by role: (slot name, element bytes of the buffer).
     _PTR_SLOTS = (
@@ -615,10 +618,10 @@ class TriangleAttentionFwd(APIBase):
         ("lse", "lse_ptr", 4),
     )
 
-    def _bind_frame(self, q, k, v, bias, kv_lengths, mask, o, lse, workspace, cu_stream, stream_int: int) -> None:
+    def _bind_frame(self, q, k, v, bias, kv_lengths, mask, o, lse, q_lens, cu_stream, stream_int: int) -> None:
         """The first call: the engine's binder validates entry 0's operands and builds the argument frame; the pointer slots and
         each role's per-entry byte step are recorded for every later call.  The ``kv_lengths`` form's Q-side lengths role is the
-        workspace region (its facts built from the pointer: ``N`` contiguous int32 words), shared by every entry."""
+        carved workspace chunk (``q_lens``: ``N`` contiguous int32 words, its facts read like any operand's), shared by every entry."""
         from cudnn.sdpa.fwd import prepared as prep
 
         bufs = self._entry_views(q, k, v, bias, kv_lengths, mask, o, lse, 0)
@@ -631,9 +634,8 @@ class TriangleAttentionFwd(APIBase):
         if self.want_lse:
             roles.append("lse")
         facts = {role: prep.facts_of_tensor(t) for role, t in zip(roles, bufs)}
-        if self.mask_form == "kv_lengths":
-            ptr = workspace.data_ptr() + self._q_lens_offset
-            facts["seq_q_lens"] = prep.BufferFacts(ptr, "int32", (prep._DLPACK_CUDA, self.device_index), self.n, (self.n,), (1,))
+        if q_lens is not None:
+            facts["seq_q_lens"] = prep.facts_of_tensor(q_lens)
         spec = self._fast_spec
         frame = prep.bind_dense(spec, facts, cu_stream, stream_int)
         ix = spec.index
@@ -653,19 +655,19 @@ class TriangleAttentionFwd(APIBase):
         self._frame_slots = tuple(slots)
         self._frame_stream_slot = ix["stream"]
 
-    def _execute_frames(self, q, k, v, bias, kv_lengths, mask, o, lse, workspace, stream_int: int) -> None:
+    def _execute_frames(self, q, k, v, bias, kv_lengths, mask, o, lse, q_lens, stream_int: int) -> None:
         from cudnn._device import ensure_current_context
 
         ensure_current_context(stream_int, self.device_index)
         cu_stream = self._compiled_plan._stream_handle(stream_int)
         if self._frame is None:
-            self._bind_frame(q, k, v, bias, kv_lengths, mask, o, lse, workspace, cu_stream, stream_int)
+            self._bind_frame(q, k, v, bias, kv_lengths, mask, o, lse, q_lens, cu_stream, stream_int)
         base = {"q": q.data_ptr(), "k": k.data_ptr(), "v": v.data_ptr(), "o": o.data_ptr(), "bias": bias.data_ptr()}
         if mask is not None:
             base["kv_mask"] = mask.data_ptr()
         if kv_lengths is not None:
             base["seq_kv_lens"] = kv_lengths.data_ptr()
-            base["seq_q_lens"] = workspace.data_ptr() + self._q_lens_offset
+            base["seq_q_lens"] = q_lens.data_ptr()
         if lse is not None:
             base["lse"] = lse.data_ptr()
         steps = {

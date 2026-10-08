@@ -621,12 +621,24 @@ def test_out_and_stream_arguments():
     assert torch.equal(got, base)
 
 
-def test_workspace_layout_puts_the_q_lengths_after_the_plans_bytes():
-    """GPU-free: the kv_lengths form's Q-side lengths region (N int32 words) starts at the 256-byte boundary after the plan's own bytes;
-    the other forms need exactly the plan's bytes."""
-    layout = tapi.TriangleAttentionFwd.workspace_layout
-    assert layout(0, 0) == (0, 0) and layout(1024, 0) == (1024, 1024)
-    assert layout(0, 217) == (0, 868) and layout(100, 217) == (256, 256 + 868) and layout(256, 5) == (256, 276) and layout(257, 1) == (512, 516)
+def test_workspace_is_sized_and_carved_by_the_sdpa_adapters_recipe():
+    """GPU-free: the kv_lengths form's Q-side lengths are the second chunk of the SDPA adapters' shared carve (`ws_align` 128-byte chunks,
+    `WorkspaceCarver`), so they start at `ws_align(plan bytes)`; the other forms need exactly the plan's bytes; a missing or short buffer
+    raises the shared carver's own error (never a local variant)."""
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    wb = tapi.workspace_bytes
+    assert wb(0, 0) == 0 and wb(1024, 0) == 1024
+    assert wb(0, 217) == ws_align(4 * 217) == 896 and wb(100, 217) == 128 + 896 and wb(256, 5) == 256 + 128 and wb(257, 1) == 384 + 128
+    buf = torch.empty(wb(100, 217), dtype=torch.uint8)  # a CPU buffer: the carve is a pure view arithmetic
+    plan_ws, q_lens = tapi.carve_workspace(buf, 100, 217, "TriangleAttentionFwd")
+    assert plan_ws.dtype == torch.uint8 and plan_ws.numel() == 100 and plan_ws.data_ptr() == buf.data_ptr()
+    assert q_lens.dtype == torch.int32 and tuple(q_lens.shape) == (217,) and q_lens.data_ptr() - buf.data_ptr() == 128
+    assert tapi.carve_workspace(buf[:896], 0, 217, "TriangleAttentionFwd")[1].data_ptr() == buf.data_ptr()  # no plan bytes: the lengths lead
+    with pytest.raises(ValueError, match=r"TriangleAttentionFwd requires a 1024-byte workspace but execute\(\) received none"):
+        tapi.carve_workspace(None, 100, 217, "TriangleAttentionFwd")
+    with pytest.raises(ValueError, match="requires a 1024-byte workspace; the provided buffer has only 1000 bytes"):
+        tapi.carve_workspace(buf[:1000], 100, 217, "TriangleAttentionFwd")
 
 
 @requires_rubin
@@ -642,7 +654,7 @@ def test_execute_allocates_nothing_and_never_synchronizes(form):
     plan.check_support()
     plan.compile()
     if form == "kv_lengths":
-        assert plan.get_workspace_size() == tapi.TriangleAttentionFwd.workspace_layout(plan._plan_workspace_bytes, s)[1] >= 4 * s
+        assert plan.get_workspace_size() == tapi.workspace_bytes(plan._plan_workspace_bytes, s) >= 4 * s
     o = tapi._bshd_empty(*q.shape, q.dtype, q.device)
     ws = torch.empty(max(plan.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     plan.execute(q, k, v, bias, lengths, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
@@ -657,8 +669,8 @@ def test_execute_allocates_nothing_and_never_synchronizes(form):
     torch.cuda.synchronize()
     _check(o, _reference(q, k, v, bias, mask=mask, kv_lengths=lengths))
     if form == "kv_lengths":
-        off = plan._q_lens_offset
-        assert (ws[off : off + 4 * s].view(torch.int32) == s).all(), "the Q-side lengths region must hold S_q on every entry"
+        _plan_ws, q_lens = tapi.carve_workspace(ws, plan._plan_workspace_bytes, s, "TriangleAttentionFwd")  # the same carve execute ran
+        assert (q_lens == s).all(), "the Q-side lengths chunk must hold S_q on every entry"
         assert (o[0, 4] == 0).all()
 
 
@@ -777,10 +789,12 @@ def test_rejects_on_a_live_device_are_typed():
         plan.execute(q, k, v, bias, None, o)
     with pytest.raises(ValueError, match="never allocates"):
         plan.execute(q, k, v, bias, lengths, None)
-    with pytest.raises(ValueError, match="workspace must be"):  # the kv_lengths form carries the Q-side lengths in the caller's workspace
+    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace but execute\(\) received none"):  # the shared carver's error
         plan.execute(q, k, v, bias, lengths, o)
-    with pytest.raises(ValueError, match="workspace must be"):
+    with pytest.raises(ValueError, match="16-byte aligned"):  # the shared carver's base rule (the lengths' reader needs 4; a torch allocation is 512)
         plan.execute(q, k, v, bias, lengths, o, None, None, torch.empty(plan.get_workspace_size() + 8, dtype=torch.uint8, device="cuda")[8:])
+    with pytest.raises(ValueError, match="contiguous"):  # the one check the carver leaves to the API: a strided buffer would be carved on a copy
+        plan.execute(q, k, v, bias, lengths, o, None, None, torch.empty(2 * plan.get_workspace_size(), dtype=torch.uint8, device="cuda")[::2])
     with pytest.raises(ValueError, match="strides"):
         plan.execute(q.contiguous(), k, v, bias, lengths, o)
     with pytest.raises(ValueError, match="lse=False"):

@@ -156,11 +156,13 @@ strides, the base alignment each operand's reader needs (16 bytes for the TMA-re
 int32 lengths and the fp32 `lse`, none for the byte mask), the mask form -- and launches once per outer batch entry
 (`launches_per_call`). A plan is bound to the device it was declared on; declare and compile one per device. The prepared API owns
 no device memory. The graph's padding contract takes a length tensor on both sides and the kernel bounds the live Q rows by `seq_len_q`;
-every Q row of a triangle-attention call is live, so on the `kv_lengths` form `get_workspace_size()` adds `N` int32 words (at a 256-byte
-offset after the plan's own bytes, `TriangleAttentionFwd.workspace_layout`) that `execute` fills with `S_q` on its stream before the
-launches -- one driver memset, stream-ordered, a memset node in a captured CUDA graph. Nothing is allocated at build or at execute, and no
-per-plan tensor exists to be released at garbage-collection time inside someone else's capture; the drop-in function allocates that
-workspace per call.
+every Q row of a triangle-attention call is live, so on the `kv_lengths` form `get_workspace_size()` adds `N` int32 words that `execute`
+fills with `S_q` on its stream before the launches -- one driver memset, stream-ordered, a memset node in a captured CUDA graph. The
+workspace is sized and carved by the SDPA adapters' shared recipe (`ws_align` 128-byte chunks dealt in order by `WorkspaceCarver`: the
+plan's own bytes first, the lengths next); a missing, undersized or misaligned buffer raises the carver's own error -- its base rule is
+16-byte alignment, which a torch allocation satisfies (the lengths' reader itself needs 4) -- and the buffer must be contiguous and on the
+plan's device. Nothing is allocated at build or at execute, and no per-plan tensor exists to be released at garbage-collection time inside
+someone else's capture; the drop-in function allocates that workspace per call.
 
 ## Performance
 
@@ -185,6 +187,7 @@ single-entry slices of a `B = 2` batch at `S = 217` on both surfaces (`mask[1:]`
 fallbacks (head-major activations: 4 counted copies, the output following `q`; the permuted / fp32 / tail bias: 1 counted copy each),
 `out=` / `stream=`, the execute-path contract (no allocation, no synchronisation; on both key-mask forms), CUDA-graph capture and
 replay (the `kv_lengths` form's workspace fill replaying and following new lengths), `return_aux` and the autograd backward as typed
-declines, the live rejects (a `kv_lengths` plan without its workspace), and the GPU-free contract tests (the workspace layout, the lazy
+declines, the live rejects (a `kv_lengths` plan without its workspace, a misaligned and a strided one), and the GPU-free contract tests (the
+workspace sizing and carve by the shared SDPA recipe, the lazy
 export in every import order, no torch at `import cudnn.triangle_attention`, the signature pin, `mask_to_kv_lengths`, the reference, the
 declarations declined before any device work, the plan-device predicate).
