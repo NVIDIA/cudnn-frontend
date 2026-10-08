@@ -1542,6 +1542,27 @@ def test_mxfp8_dense_padding(in_key, causal):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@torch_fork_set_rng(seed=0)
+def test_masked_leading_tile_with_live_keys_behind_it(d):
+    """Q 65 x KV 193, bottom-right causal with left bound 34 at attn_scale 1: rows 33..64 see a fully masked FIRST KV tile
+    and their legal keys only in the second.  At |attn_scale * log2 e| >= 1 the scaled mask sentinel overflows to -inf and
+    the online softmax's shift read -inf - (-inf) = NaN for those rows (the #1481 / #1488 reviews' native reproduction on
+    cc 10.7, 65,536 nonfinite O elements at d256; the scale-1/16 twin was finite): the tile max is clamped to the finite
+    sentinel now.  Dequantized Q / K / V = 0.5, so O is exactly 0.5 wherever a row has a legal key and only a NaN / inf can
+    fail this cell.  Paged twin: test_sdpa_fwd_paged_mxfp8_sm107.py::test_masked_leading_tile_with_live_keys_behind_it."""
+    from unittest.mock import patch
+
+    with patch.object(torch, "randn", side_effect=lambda *a, **kw: torch.ones(*a, **kw)):
+        O, O_ref, _ = _run_rect(
+            1, 8, 65, 193, "e5m2", torch.float16, scale=1.0, sdpa_kwargs=dict(use_causal_mask_bottom_right=True, diagonal_band_left_bound=34), d_qk=d, d_v=d
+        )
+    assert torch.isfinite(O.float()).all(), "NaN / inf in O: the masked leading tile poisoned rows with legal keys behind it"
+    assert torch.isfinite(O_ref).all()
+    _check(O, O_ref, torch.float16, "e5m2", d_qk=d)
+
+
 def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     """Per-sequence MXFP8 quantization for the THD packing.
 

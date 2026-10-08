@@ -134,3 +134,38 @@ def test_declines_off_contract():
     assert not _offers(64, d_qk=128, d_v=128), "F8_128x4 pools hold whole 128-row SF atoms: page_size 64 is off-contract"
     assert not _offers(128, d_qk=192, d_v=128), "the d192x128 pools are a follow-up on cc 10.7"
     assert not _offers(128, d_qk=512, d_v=512), "the d512 pools are a follow-up on cc 10.7"
+
+
+@pytest.mark.parametrize("sink", [False, True], ids=["nosink", "sink"])
+@pytest.mark.parametrize("P,d", [(128, 256), (256, 256), (128, 128)], ids=["p128-d256", "p256-d256", "p128-d128"])
+def test_masked_leading_tile_with_live_keys_behind_it(P, d, sink):
+    """Q 65 x valid KV 193, bottom-right causal with left bound 34, attn_scale 1 (so |attn_scale * log2 e| >= 1), E5M2 in /
+    f16 out, NHD pools: rows 33..64 see a fully masked FIRST KV tile and their legal keys only in the second one.  The
+    scaled mask sentinel of that tile overflowed to -inf, the first tile's select seeded the running max with it and every
+    later shift read -inf - (-inf) = NaN -- 65,536 nonfinite O elements at d256 (with a sink also 256 nonfinite Stats),
+    while the scale-1/16 twin and the unwindowed sink control were finite (the #1481 review's native reproduction).  The
+    four cc 10.7 MXFP8 bodies now clamp the scaled tile max to the finite sentinel, as the pre-folded arm always did.
+    Dequantized Q / K / V = 0.5, so O is exactly 0.5 on every row with a legal key: only a NaN / inf (or a wrong LSE) can
+    fail this cell, never FP8 rounding.  Dense twin: test_sdpa_fwd_mxfp8_sm100.py::test_masked_leading_tile_with_live_keys_behind_it."""
+    from unittest.mock import patch
+
+    with patch.object(torch, "randn", side_effect=lambda *a, **kw: torch.ones(*a, **kw)):
+        _run(
+            1,
+            8,
+            2,
+            P,
+            4,
+            [193],
+            False,
+            s_q=65,
+            causal_br=True,
+            window_left=34,
+            sink=sink,
+            stats=True,
+            in_key="e5m2",
+            out_dt=torch.float16,
+            d_qk=d,
+            d_v=d,
+            attn_scale=1.0,
+        )

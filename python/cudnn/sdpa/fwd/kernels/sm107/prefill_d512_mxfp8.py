@@ -1348,7 +1348,12 @@ def _sg0_softmax_kv_iter(
         # _row_empty select -- same O either way.
         current_max = current_max_raw
     else:
-        current_max = current_max_raw * scale_log2
+        # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF_F32), as the pre-folded
+        # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
+        # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
+        # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
+        # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves.
+        current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)
 
     # Online softmax (RESCALE_THRESHOLD skip).
     old_total_max = total_max

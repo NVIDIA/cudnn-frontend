@@ -2195,6 +2195,19 @@ the prepared gate, `compile_prepared`, the config rule's `thd_varlen` raise), an
 binder frame-parity tests green. **Stage 3**: the same loader on `prefill_d192_d128_mxfp8.py` /
 `prefill_d512_mxfp8.py`, `paged_d_shapes` and `_PAGED_KV_FLAVORS_SM107` extended, the guards flipped.
 
+**Masked leading tile (review finding on this PR, fixed here)** -- at `|attn_scale * log2 e| >= 1` the
+scaled max of a fully masked KV tile overflowed the finite mask sentinel to -inf, the first tile's select
+seeded the running max with it and every later shift read `-inf - (-inf)` = NaN for each row whose legal
+keys sit behind that tile (a left window at attn_scale 1: Q 65 x KV 193, bottom-right causal, left bound
+34 -> 65,536 nonfinite O elements at d256, with a sink also 256 nonfinite Stats; the scale-1/16 twin was
+finite); the same arithmetic was reported on the THD route in #1488.  The four cc 10.7 MXFP8 bodies now
+clamp the scaled tile max to the sentinel -- the state the pre-folded arm always produced -- so a masked
+tile contributes exp2(-inf) = 0 and the next live tile re-seeds the max.  Regression cells with constant
+dequantized inputs (O exactly 0.5 on every row with a legal key): over pools (page 128 / 256 x d128 / d256
+x sink on / off, Stats on) `test_sdpa_fwd_paged_mxfp8_sm107.py::test_masked_leading_tile_with_live_keys_behind_it`
+and the dense twin in `test_sdpa_fwd_mxfp8_sm100.py`.  The SM100 d128 / d192x128 MXFP8 bodies carry the
+same scaled-max line (follow-up, with #1488).
+
 **Measured note (R15)** -- qwen35_decode (b32, 32/2 heads, KV 4096, page 128, s_q 1, e4m3, bf16 O),
 the row's default plan over pools (the prefill tile) vs the dense MXFP8 graph of the same logical shape,
 d128 and d256, on w2u1g-lc-0614 (cc 10.7, 216 SMs; `time_paged_mxfp8_decode.py` under the board's

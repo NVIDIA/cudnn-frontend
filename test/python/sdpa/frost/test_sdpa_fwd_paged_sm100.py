@@ -2339,13 +2339,14 @@ def _build_mxfp8(
     poison_dead_pages=True,
     q_bhsd=False,
     mixed_layout=False,
+    attn_scale=None,
 ):
-    """-> (graph, variant pack, O, Stats, amax, reference inputs)."""
+    """-> (graph, variant pack, O, Stats, amax, reference inputs).  ``attn_scale`` None = 1 / sqrt(d_qk)."""
     import cudnn
 
     dev = "cuda"
     fp8 = _FP8[in_key]
-    scale = 1.0 / math.sqrt(d_qk)
+    scale = 1.0 / math.sqrt(d_qk) if attn_scale is None else float(attn_scale)
     pools = _pools_mxfp8(B, KH, P, max_pages, hnd, fp8, d_qk=d_qk, d_v=d_v, separate_v=separate_v, batch_inner=batch_inner)
     if mixed_layout:  # HND K pool next to an NHD V pool
         pools["v_c"] = pools["v_c"].permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3) if hnd else pools["v_c"].contiguous()

@@ -4428,7 +4428,7 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             1,
             "current_max = cute.math.max(max_a, max_b)\n",
             "reg_S_a = reg_S_a - new_total_max",
-            "current_max = cute.math.max(max_a, max_b) * scale_log2",
+            "current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)",
             "reg_S_a = reg_S_a * scale_log2 - new_total_max",
         ),
         (
@@ -4438,7 +4438,7 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             2,
             "current_max = current_max_raw\n",
             "reg_S_tile.vec - total_max",
-            "current_max = current_max_raw * scale_log2",
+            "current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)",
             "reg_S_tile.vec * scale_log2 - total_max",
         ),
     ],
