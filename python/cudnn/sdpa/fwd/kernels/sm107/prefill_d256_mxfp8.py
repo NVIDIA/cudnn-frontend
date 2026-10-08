@@ -421,6 +421,16 @@ V_SF_EXPECT_BYTES = SF_SMEM_SIZE_V * CFG.CTA_MMA
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128
 
 CGA_TILE_M = CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA
+# THD launches a PERSISTENT grid that pulls units from the device-bounded claim
+# counter (scheduler_warp_loop_persistent below), not the CLC envelope: the
+# adapter caps the launch at min(envelope, SMs / CGA_SIZE) and the setup kernel
+# publishes the live unit total the claims stop at.  The declaration is what
+# arms that cap -- a body that runs the claim loop WITHOUT it is launched at the
+# full plan-time envelope, the counter starts at or past the live total, and no
+# CTA ever claims a second unit (the claim loop is then dead code and every
+# unit past the live total is a dead initial unit).  Read by the adapter only:
+# the cubin is unchanged by it.
+THD_PERSISTENT = True
 
 # lpt_q_tiles_in_cga_units=True is REQUIRED under any non-NATURAL scheduler:
 # the LPT linearization needs q_tiles in CGA units (n_q_supers // CTA_MMA).
@@ -523,8 +533,10 @@ assert LAYOUT.SF_V_OFF + SF_TMEM_COLS_V <= LAYOUT.STATS_OFF, "TMEM SF region col
 #     config's 21 at cga2.  The live count is the config's, and only it.)
 # dead-unit path (no mbar): batch_idx == n_batch, the sentinel the shared
 #     _thd_decode returns for the over-launched persistent grid's units
-#     u >= live (the adapter sizes units = min(envelope, resident)); the
-#     persistent loop's valid = 0 handout ends each CTA.  Every role runs the
+#     u >= live (THD_PERSISTENT = True above: the adapter sizes the grid at
+#     units = min(envelope, resident), so initial units are dead only while
+#     the live total is below the resident CTA count); the persistent loop's
+#     valid = 0 handout ends each CTA.  Every role runs the
 #     SAME iteration protocol as a live unit: _resolve_seqlen_kv(meta,
 #     n_batch, ...) reads meta[n_batch] = cu_q[0] = 0, so _bounds_for_tile
 #     yields an EMPTY KV range -- this IS the s_kv = 0 sequence path
