@@ -2883,6 +2883,13 @@ def _host(
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
+    # Paged KV (PAGED_KV): the (B, max_pages) int32 block tables of K and V, passed by KEYWORD by the prepared host
+    # (_mxfp8_host._launch, which every SM107 MXFP8 execution goes through); None folds the page walk out.  Keyword-only
+    # in effect: they sit after the three THD length slots (the last parameters that host passes positionally) and
+    # BEFORE stream, like the SM100 hosts, so gate_tensor stays the first parameter after stream (the append-only pin
+    # test_sm107_gate_kernel_signatures_are_append_only, which also pins the THD slots right after seq_q_lens_addr).
+    block_table_tensor: Optional[cute.Tensor] = None,
+    block_table_v_tensor: Optional[cute.Tensor] = None,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
     # sm107/prefill_d128_fp8.py sibling does.
@@ -2900,11 +2907,6 @@ def _host(
     # (_mxfp8_host._launch), and without the kwarg the FIRST prepared THD launch
     # dies with a bare TypeError the dense suite never sees.
     prepared: cutlass.Constexpr[bool] = False,
-    # Paged KV (PAGED_KV): the (B, max_pages) int32 block tables of K and V, passed by KEYWORD by the prepared host
-    # (_mxfp8_host._launch, which every SM107 MXFP8 execution goes through); None folds the page walk out.  Appended
-    # LAST so no existing positional moves.
-    block_table_tensor: Optional[cute.Tensor] = None,
-    block_table_v_tensor: Optional[cute.Tensor] = None,
 ) -> None:
     """MXFP8 host launcher — builds TMA descriptors for Q/K/V/O + SF tensors.
 
