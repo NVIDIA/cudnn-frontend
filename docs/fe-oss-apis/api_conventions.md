@@ -24,8 +24,10 @@ is part of the API pruning plan, not this document.
    (`_sm90`, `_sm100`, `Sm100`, ...) or an implementation technology (`_dsl`,
    `_cutedsl`, `_frost`, `_triton`, ...). The API dispatches internally, and an
    unsupported configuration fails `check_support()` with a clear error.
-4. **Use namespaces for framework variants.** A JAX or PyTorch variant uses the
-   same name under `cudnn.jax` or `cudnn.torch`, not a `_jax` or `_torch` suffix.
+4. **No framework namespaces for kernels.** Do not add kernel APIs under
+   `cudnn.jax` or `cudnn.torch`. The PyTorch API takes the plain name, and a JAX
+   variant appends `_jax`. Existing `cudnn.jax` / `cudnn.torch` kernel exports
+   keep working until the API pruning plan retires them.
 
 ## Examples
 
@@ -37,4 +39,6 @@ is part of the API pruning plan, not this document.
 | `sdpa_fwd_wrapper_dsl_sm100` | `sdpa_forward` |
 | `HSTUFwdSm100` / `HSTUBwdSm100` | `HSTUForward` / `HSTUBackward` |
 | `FlexAttentionBwd` | `FlexAttentionBackward` |
-| `grouped_gemm_glu_jax_sm100` | `cudnn.jax.grouped_gemm_glu` |
+| `grouped_gemm_glu_jax_sm100` | `grouped_gemm_glu_jax` |
+| `cudnn.jax.kimi_delta_attention_fwd` | `kimi_delta_attention_forward_jax` |
+| `cudnn.torch.block_sparse_attention_forward` | `block_sparse_attention_forward` |
