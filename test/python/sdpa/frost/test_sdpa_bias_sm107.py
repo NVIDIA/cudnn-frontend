@@ -247,8 +247,16 @@ def test_heuristics_pick_the_narrowest_width_whose_block_holds_s_kv():
 
 
 def _desc(shape, dtype, name, stride=None):
+    """A standalone-adapter descriptor.  The ACTIVATIONS (``q`` / ``k`` / ``v`` / ``o``, shape (B, H, S, D)) default to the row's
+    envelope, BSHD-physical (stride order 3, 1, 2, 0) -- the layout the prepared launch binds zero-copy, so the adapter cells are the
+    row's twin; a (B, H, S, D)-contiguous activation would take the adapter's staging-copy path, which carries neither the bias nor the
+    kv_mask and is therefore a typed decline in ``check_support`` with a resident-arm operand bound.  Every other tensor (the bias, the
+    kv_mask, the lengths) defaults to its contiguous strides."""
     from cudnn.api_base import TensorDesc
 
+    if stride is None and name in ("q", "k", "v", "o") and len(shape) == 4:
+        b, h, s, d = (int(x) for x in shape)
+        stride = (s * h * d, d, h * d, 1)
     stride = tuple(int(x) for x in torch.empty(shape).stride()) if stride is None else tuple(stride)
     return TensorDesc(
         dtype=dtype, shape=tuple(shape), stride=stride, stride_order=TensorDesc._compute_stride_order(tuple(shape), stride), device="cuda", name=name

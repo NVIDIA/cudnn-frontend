@@ -1129,9 +1129,42 @@ def test_sm107_small_tile_row_accepts_the_bias_and_kv_mask_in_their_served_forms
             assert engines.mismatch(caps, _facts(g)) is None, (dt, strides)
             assert _eligible(g) == {_SM107_F16_ROW}, (dt, strides)
     g = _mk_small_d_graph(
+        bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16), kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.BFLOAT16)
+    )
+    assert _eligible(g) == {_SM107_F16_ROW}, "the io-dtype vector together with the bias (the fast path)"
+    # The fp32 vector WITH the bias: its 128-wide rendering spills on the softmax role (MEASURED -- the rendering pins of
+    # test_sdpa_bias_tile_n_additive_sm107.py), so the form is served at TILE_N 64 only: the knob-less probe accepts (the heuristics pick
+    # 64 for it, heuristics._resident_arm_tile_n), the TILE_N 64 knob accepts, an EXPLICIT 128 is a typed decline naming the two routes.
+    g = _mk_small_d_graph(
         bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16), kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.FLOAT)
     )
+    assert engines.mismatch(caps, _facts(g)) is None
     assert _eligible(g) == {_SM107_F16_ROW}
+    assert engines.mismatch(caps, _facts(g), engines.SdpaFwdKnobs(tile_n=64)) is None
+    why = engines.mismatch(caps, _facts(g), engines.SdpaFwdKnobs(tile_n=128))
+    assert why is not None and "TILE_N 64" in why and "fp32" in why, why
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _SM107_F16_ROW)
+    assert heur._resident_arm_tile_n(spec, _facts(g), 128) == 64, "the heuristics' pick for the form"
+    plain = _mk_small_d_graph(bias=((1, H, S, S), _compact((1, H, S, S)), cudnn.data_type.BFLOAT16))
+    assert heur._resident_arm_tile_n(spec, _facts(plain), 128) == 128, "every other plan keeps its default"
+    # A Q/K/V/O layout the prepared launch cannot bind zero-copy (a 72-byte head stride) with a resident-arm operand bound: the row
+    # declines at plan time (the staging-copy executor carries neither the bias nor the kv_mask -- it used to fail at EXECUTE time).
+    g = _mk_small_d_graph(kv_mask=((B, 1, 1, S), _compact((B, 1, 1, S)), cudnn.data_type.BOOLEAN))
+    f = _facts(g)
+    assert engines._resident_arm_layout_decline(f) is None, "a compact BSHD-physical graph binds without a copy"
+    d, dt = 32, cudnn.data_type.BFLOAT16
+    pad = cudnn.pygraph(io_data_type=dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    st = (S * H * (d + 4), d + 4, H * (d + 4), 1)  # a head stride of d + 4 bf16 = 72 bytes: BSHD-physical, not a 16-byte multiple
+    pq = pad.tensor(dim=(B, H, S, d), stride=st, data_type=dt, name="q")
+    pk = pad.tensor(dim=(B, H, S, d), stride=st, data_type=dt, name="k")
+    pv = pad.tensor(dim=(B, H, S, d), stride=st, data_type=dt, name="v")
+    pm = pad.tensor(dim=(B, 1, 1, S), stride=_compact((B, 1, 1, S)), data_type=cudnn.data_type.BOOLEAN, name="kv_mask")
+    po, _ = pad.sdpa(name="s", q=pq, k=pk, v=pv, attn_scale=0.1, is_inference=True, kv_mask=pm)
+    _finish_output(po, (B, H, S, d), (S * H * d, d, H * d, 1), dtype=dt)
+    why = engines.mismatch(caps, _facts(pad))
+    assert why is not None and "prepared launch" in why and "bind without a copy" in why, why
 
 
 def test_additive_kv_mask_needs_a_whole_granule_extent(monkeypatch):

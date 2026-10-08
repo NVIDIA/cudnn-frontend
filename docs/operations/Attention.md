@@ -420,7 +420,10 @@ batch extent of 1 broadcasts one row over the batch) in one of two forms:
   (`s·scale + v`, the eager models' finite `−1e9` fold applied as a VALUE), so a key at `−1e9` contributes `exp(−1e9) = 0`
   while a row whose every key is `−1e9` is the uniform average of V, exactly as in eager math; a `−inf` entry reproduces the
   BOOLEAN form. The vector is read as 16-byte granules: $S_{kv}$ must be a multiple of 8 and a batch stride a 16-byte
-  multiple (a 16-bit vector must be the Q/K/V dtype; cast an fp16 vector for a bf16 graph).
+  multiple (a 16-bit vector must be the Q/K/V dtype; cast an fp16 vector for a bf16 graph). An fp32 vector together with the
+  additive `bias` runs the 64-wide KV tile only: the heuristics pick `TILE_N = 64` for that pair (its 128-wide rendering spills on
+  the softmax role), an explicit `TILE_N = 128` request is declined typed rather than degraded, and casting the fp32 mask to the
+  Q/K/V dtype is the fast path.
 
 Both forms compose with the padding mask, every diagonal band (bottom-right causal included) and the additive `bias` (the
 graph contract does not admit bottom-right causal together with `bias`). The cuDNN backend has no field for `kv_mask`, so a

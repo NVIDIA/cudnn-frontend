@@ -58,6 +58,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_BIAS_D_SHAPES as _SM107_BIAS_D_SHA
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max as _sm107_bias_resident_s_kv_max
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga as _sm107_bias_auto_cga
 from cudnn.sdpa.fwd.config_sm107 import SM107_TILE_NS_BY_D_SHAPE as _SM107_TILE_NS_BY_D_SHAPE
+from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N as _SM107_FP32_VECTOR_WITH_BIAS_TILE_N
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_GRANULE_ELEMS as _KV_MASK_ADDITIVE_GRANULE_ELEMS
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD as _KV_MASK_BOOL_WORD
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_16 as _KV_MASK_ADDITIVE_16
@@ -1509,6 +1510,22 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return _KV_MASK_BOOL_WORD
         return _KV_MASK_ADDITIVE_F32 if self.kv_mask_desc.dtype == torch.float32 else _KV_MASK_ADDITIVE_16
 
+    def _effective_tile_n(self) -> int:
+        """The KV tile width this plan renders: the request, else 128 -- except the small tiles' fp32 ADDITIVE kv_mask vector TOGETHER
+        WITH a bias, whose only served width is 64 (``config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N``: the 128-wide rendering spills on
+        the softmax role; the heuristics pick 64 for the same form).  ``check_support`` declines an explicit 128 for it typed."""
+        if self.tile_n is not None:
+            return int(self.tile_n)
+        if (
+            self.bias_desc is not None
+            and self.kv_mask_desc is not None
+            and self._kv_mask_form() == _KV_MASK_ADDITIVE_F32
+            and self.flavor in dict(_SM107_TILE_NS_BY_D_SHAPE)
+            and self._device_cc == (10, 7)
+        ):
+            return _SM107_FP32_VECTOR_WITH_BIAS_TILE_N
+        return 128
+
     def _resident_arm_cga(self) -> int:
         """The width a BIAS plan runs at (a kv_mask-only plan stages no block and keeps the flavor's own default): the
         requested cga, or -- none requested -- the NARROWEST width of the flavor's domain whose resident block holds S_kv (``config_sm107.sm107_bias_auto_cga``, the heuristics' pick, so
@@ -1995,6 +2012,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.n_chunk is not None and self.n_chunk >= 1, "n_chunk is the resident-bias arm's work-item form; this plan has no bias"
             )
         if self.bias_desc is not None or self.kv_mask_desc is not None:
+            # The resident-block arms bind through the PREPARED launch only: the staging-copy executor (a layout TMA cannot bind
+            # zero-copy) forwards neither operand, so that path is a typed decline here, never an execute-time error (the engine
+            # row's _resident_arm_layout_decline is the twin, rule 8b).
+            self._value_error_if(
+                not self._fp8 and not self._can_prepare_dense_layout(),
+                "the additive bias / kv_mask arms bind through the prepared launch only: Q/K/V/O need 16-byte-aligned BSHD-physical strides "
+                "that bind without a copy (the staging-copy path does not carry these operands)",
+            )
             # Additive bias / per-key mask: the twin of the engine row's gates (engines._bias_arm_decline; rule 8b)
             # through the SAME constants (rule 8b').  The resident row-block lives in the Rubin f16/bf16 d128 file's
             # 32- / 64-wide tiles: dense, unsplit, unpaged, non-PackGQA, ungated, without the score side outputs,
@@ -2069,6 +2094,17 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     self._value_error_if(
                         _md[0] > 1 and (_ms[0] * _elem) % 16 != 0,
                         f"an additive kv_mask vector's batch stride must be a 16-byte multiple; got strides {_ms}",
+                    )
+                    # The fp32 vector WITH a bias is served at tile_n 64 only (the adapter's default for the form, _effective_tile_n):
+                    # its 128-wide rendering spills on the softmax role (config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N carries the
+                    # measured counts; the engine row's _bias_arm_decline is the twin, rule 8b) -- an explicit 128 is declined typed.
+                    self._value_error_if(
+                        self.bias_desc is not None
+                        and self._kv_mask_form() == _KV_MASK_ADDITIVE_F32
+                        and self._effective_tile_n() != _SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
+                        f"an fp32 additive kv_mask together with a bias is served at tile_n={_SM107_FP32_VECTOR_WITH_BIAS_TILE_N} (the default for "
+                        f"this form) or as a vector in the Q/K/V dtype ({self.q_desc.dtype}; cast the fp32 mask on the host): the 128-wide rendering "
+                        f"spills on the softmax role; got tile_n={self.tile_n}",
                     )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
@@ -2534,7 +2570,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             bias_mode=1 if self.bias_desc is not None else 0,
             kv_mask_form=self._kv_mask_form(),
             # The KV tile width (the TILE_N knob): 128 on every record so far, 64 on the Rubin small tiles (check_support validated it).
-            tile_n=self.tile_n if self.tile_n is not None else 128,
+            tile_n=self._effective_tile_n(),
             # The (n, n+1) pair item's chunk length (0 = the one-batch-entry item): the request, else the heuristics' pick.
             n_chunk=self._resident_arm_n_chunk(),
             fused_ldtm_stat=fused_ldtm_stat,

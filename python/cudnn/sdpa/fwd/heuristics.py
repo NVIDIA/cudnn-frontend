@@ -68,7 +68,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     pack_gqa_group_size,
     pack_gqa_supported,
 )
-from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga, sm107_pair_item_active
+from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
@@ -823,6 +823,20 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     return facts.s_q * pack_g <= _D128_DECODE_TILE_ROWS
 
 
+def _resident_arm_tile_n(spec: EngineSpec, facts, default: Optional[int]) -> Optional[int]:
+    """The KV tile width of a small-tile plan that folds an fp32 ADDITIVE kv_mask vector TOGETHER WITH a bias: 64, the only width
+    that serves the pair (``config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N``; the 128-wide rendering spills on the softmax role and
+    ``engines._bias_arm_decline`` refuses an explicit 128 typed) -- the ``sm107_bias_auto_cga`` idiom for the other knob of the form.
+    Every other plan keeps ``default``."""
+    import cudnn
+
+    caps = spec.capabilities
+    if caps.sm_lo != 107 or not (facts.has_bias and facts.has_kv_mask and facts.kv_mask_dtype == cudnn.data_type.FLOAT):
+        return default
+    domain = dict(caps.tile_ns_by_d_shape).get(_selected_d_shape(caps, facts, None), caps.tile_ns)
+    return SM107_FP32_VECTOR_WITH_BIAS_TILE_N if SM107_FP32_VECTOR_WITH_BIAS_TILE_N in domain else default
+
+
 def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int, pack_gqa: Optional[bool] = None) -> tuple[int, Optional[int]]:
     """``pack_gqa`` is the candidate's packing where the width depends on it
     (the d128 f16 SM100 flavor, :func:`_d128_decode_tile_fits`); ``None`` asks
@@ -1450,7 +1464,7 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         return SdpaFwdKnobs(
             sched_policy=sched_policy,
             tile_m=base_tile[0],
-            tile_n=base_tile[1],
+            tile_n=_resident_arm_tile_n(spec, facts, base_tile[1]),
             cga=cga,
             pack_gqa=pack_gqa,
             split_kv=split_value,
@@ -1557,7 +1571,7 @@ def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:
     return SdpaFwdKnobs(
         sched_policy=sched_policy,
         tile_m=min(caps.tile_ms, default=None),
-        tile_n=min(caps.tile_ns, default=None),
+        tile_n=_resident_arm_tile_n(spec, facts, min(caps.tile_ns, default=None)),
         cga=cga,
         pack_gqa=pack_gqa,
         split_kv=1,  # the fallback never splits: least-demanding means one kernel, no partial workspace

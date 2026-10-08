@@ -307,6 +307,13 @@ KV_MASK_ADDITIVE_GRANULE_ELEMS = 8
 # 128; 256 is refused by _validate_tile_n at two sub-tiles (2 x 256 S columns + the O slots + STATS exceed the 576-column TMEM).
 # The engine row's per-shape knob domain (Capabilities.tile_ns_by_d_shape) and the adapter's check_support read this ONE constant.
 SM107_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
+# The KV tile width an fp32 ADDITIVE kv_mask vector TOGETHER WITH a bias is served at on the small tiles: 64, and only 64.  The
+# 128-wide rendering of that pair spills on the softmax role (MEASURED, sm_107a, cutlass-dsl 4.8.0: STL / LDL 23 / 27 causal, 15 / 15
+# padded, 16 / 16 at d64 cga2 -- the sixteen 16-byte granules of a 64-column fp32 chunk are 64 registers beside the second chunk's
+# 128 live scores; BIAS_PRELOAD_CHUNKS = 0 leaves the counts unchanged, a streamed granule fold makes them worse), where the io-dtype
+# vector packs two values per register and stays at the bit word's count and the 64-wide tile (64 live scores) fits again.  Read by
+# the heuristics' pick, the engine row's gate (a requested 128 is a typed decline, never a degraded plan) and the adapter's default.
+SM107_FP32_VECTOR_WITH_BIAS_TILE_N = 64
 # The bias block's TMA / lane swizzle: the 128-B atom.  BOTH swizzle jobs force it -- the TMA descriptor writes the
 # block under it (job D) and the softmax lanes read one 128-B row slice each (job L: a per-lane stride that is a multiple
 # of the 128-B bank cycle is a 32-way conflict unswizzled; the 16-B chunk index XOR (row % 8) spreads 8 rows over 8 bank

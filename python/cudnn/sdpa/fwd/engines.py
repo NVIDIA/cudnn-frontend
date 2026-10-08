@@ -46,6 +46,7 @@ from cudnn.sdpa.fwd.config_sm107 import (
     SM107_FP8_THD_SHAPES,
     SM107_SCORE_STATS_SHAPES,
     SM107_SMALL_D_CGAS,
+    SM107_FP32_VECTOR_WITH_BIAS_TILE_N,
     SM107_TILE_NS_BY_D_SHAPE,
 )
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
@@ -793,6 +794,28 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     return domain
 
 
+def _resident_arm_layout_decline(facts: "ga.SdpaGraphFacts") -> Optional[str]:
+    """The resident-block arms (bias / kv_mask) bind their operands through the PREPARED launch only: the adapter's staging-copy
+    executor (``prepared_staged_forward``, the path a Q/K/V/O layout TMA cannot bind zero-copy takes) forwards neither the bias nor the
+    kv_mask, so such a graph used to BUILD and then fail at EXECUTE time (``kv_mask_tensor is required by this compiled specialization``
+    on a 72-byte head stride, 2026-10-08).  A layout the prepared launch cannot bind is therefore declined HERE, typed and early, with
+    the lowering's own admission arithmetic (``_prepared_decline_reason`` -> ``config_sm100.dense_bind_strides``); a fact set without
+    declared operands (a pure-fact probe) is not judged -- the adapter's ``check_support`` is the twin on real descriptors (rule 8b)."""
+    from cudnn.graph_types import storage_geometry
+    from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
+
+    for name, t in (("Q", facts.q_t), ("K", facts.k_t), ("V", facts.v_t), ("O", facts.o_t)):
+        if t is None or not (hasattr(t, "get_dim") and hasattr(t, "get_stride") and hasattr(t, "get_data_type")):
+            continue
+        geometry = storage_geometry(t.get_dim(), t.get_stride(), t.get_data_type())
+        if geometry is None or dense_bind_strides(*geometry, 2) is None:
+            return (
+                f"the resident-block arms (bias / kv_mask) bind through the prepared launch only, and {name}'s layout (dim {tuple(t.get_dim())}, "
+                f"strides {tuple(t.get_stride())}) does not bind without a copy: 16-byte-aligned BSHD-physical strides are required"
+            )
+    return None
+
+
 def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs]) -> Optional[str]:
     """The resident-bias / kv_mask arm's gates (a row with ``bias_d_shapes`` or ``kv_mask``): the legs it does not carry,
     the flavor the graph selects, the operands' layouts and -- for a graph WITH a bias -- the S_kv budget of the resident
@@ -808,6 +831,9 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         return f"the {what} is served on dense, unpaged plans without the score side outputs or the epilogue gate (no THD)"
     if knobs is not None and ((knobs.split_kv or 1) > 1 or knobs.pack_gqa):
         return f"the {what} is served on unsplit, non-PackGQA plans only"
+    layout_why = _resident_arm_layout_decline(facts)
+    if layout_why is not None:
+        return layout_why
     selected = _selected_d_shape(capabilities, facts, knobs)
     shapes = capabilities.bias_d_shapes if capabilities.bias_d_shapes is not None else capabilities.d_shapes
     if selected not in shapes:
@@ -836,6 +862,19 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
             elem = ga._ELEM_BYTES.get(facts.kv_mask_dtype, 2)
             if len(facts.kv_mask_stride) == 4 and len(facts.kv_mask_dim) == 4 and facts.kv_mask_dim[0] > 1 and (facts.kv_mask_stride[0] * elem) % 16:
                 return f"an additive kv_mask vector's batch stride must be a 16-byte multiple; got strides {facts.kv_mask_stride}"
+            if facts.has_bias and facts.kv_mask_dtype == cudnn.data_type.FLOAT:
+                # The fp32 vector WITH a bias is served at TILE_N 64 only (config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N: the 128-wide
+                # rendering spills on the softmax role -- the measured counts sit on the constant).  The heuristics propose 64 for this
+                # form (heuristics._resident_arm_tile_n) and the adapter defaults to it, so a knob-less plan and a record without the knob
+                # run the served width; an EXPLICIT 128 is a typed decline, never a degraded plan.  The adapter's check_support is the
+                # twin (rule 8b); the rendering pins of test_sdpa_bias_tile_n_additive_sm107.py carry the counts.
+                _tile_n = knobs.tile_n if knobs is not None and knobs.tile_n is not None else SM107_FP32_VECTOR_WITH_BIAS_TILE_N
+                if _tile_n != SM107_FP32_VECTOR_WITH_BIAS_TILE_N:
+                    return (
+                        f"an fp32 additive kv_mask together with a bias is served at TILE_N {SM107_FP32_VECTOR_WITH_BIAS_TILE_N} (the heuristics' pick; "
+                        f"the TILE_N knob) or as a vector in the Q/K/V dtype ({facts.dtype}; cast the fp32 mask on the host): the 128-wide rendering "
+                        f"spills on the softmax role; got TILE_N {_tile_n}"
+                    )
     if capabilities.sm_lo != 107 or not facts.has_bias:
         # The kv_mask ALONE stages nothing in SMEM (4 byte loads + 4 warp ballots per kv tile, folded into the bit-word mask):
         # no resident block, hence no S_kv budget -- any S_kv is served and the flavor's own width rule applies (validated on
@@ -1597,7 +1636,9 @@ def _sm107_spec() -> EngineSpec:
             # Additive bias + per-key mask on the small tiles as a RESIDENT SMEM row-block
             # (the d128 file at BIAS_MODE = 1 / KV_MASK_FORM = 1 / 2 / 3): bias [1|B, 1|H_q, S_q, S_kv] in
             # the io dtype, kv_mask [1|B, 1, 1, S_kv] BOOLEAN (the bit word) or an ADDITIVE vector in
-            # the io dtype / fp32 (folded pre-scale like the bias; S_kv % 8 == 0, 16-byte strides);
+            # the io dtype / fp32 (folded pre-scale like the bias; S_kv % 8 == 0, 16-byte strides; the fp32
+            # vector WITH a bias at TILE_N 64 only -- the heuristics' pick for that form, a requested 128 a
+            # typed decline: its rendering spills, config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N);
             # dense / unsplit / unpaged / no score outputs; a BIAS at an S_kv up to what the carveout
             # holds beside the operands (3 tiles = 384 at the 32-wide tile, 1 / 2 tiles = 128 / 256 at
             # the 64-wide one at cga 1 / 2 -- config_sm107.sm107_bias_resident_s_kv_max at the default

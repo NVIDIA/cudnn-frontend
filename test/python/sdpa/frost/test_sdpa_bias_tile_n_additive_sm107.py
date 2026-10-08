@@ -18,21 +18,23 @@
   granule loads -- nothing staged in SMEM, no barrier row, the bit word's lane ledger untouched.  The models' finite -1e9
   fold is preserved as a VALUE (a fully -1e9 row is the uniform average of V, not the empty-row contract); a -inf vector
   reproduces the BOOLEAN form BITWISE.  Typed declines: a 16-bit vector that is not the Q/K/V dtype, S_kv % 8 != 0, a batch
-  stride that is not a 16-byte multiple.
-* **Strided outer axes**: the activations' ``dense_flex`` envelope (BHSD-contiguous, BSHD-physical, a 16-byte padded head
-  stride) with the arm on, a bias in a permuted outer order (``[B, S_q, H, S_kv]``-physical) or with a padded row stride, a
-  kv_mask with a padded batch stride -- graph FACTS the row judges and the kernels address through the declared strides
-  (TMA descriptors from the caller's 4-D strides, the granule loads from the batch stride): no reshape, no copy; a
-  non-16-byte stride is a typed decline on a real graph.
+  stride that is not a 16-byte multiple, and an EXPLICIT TILE_N 128 for the fp32 vector WITH a bias (that rendering spills on the
+  softmax role -- the measured counts are the pins below; the heuristics and the adapter run that form at TILE_N 64, its only served
+  width, and the io-dtype vector is the fast path).
+* **Strided outer axes**: the activations stay in the row's ``bshd`` envelope (Q/K/V/O BSHD-physical, a 16-byte padded head
+  stride included; a (B, H, S, D)-CONTIGUOUS activation is the row's pre-existing typed decline, pinned below -- the
+  ``dense_flex`` envelope is the SM100 line's, not this row's) with the arm on, a bias in a permuted outer order
+  (``[B, S_q, H, S_kv]``-physical) or with a padded row stride, a kv_mask with a padded batch stride -- graph FACTS the row
+  judges and the kernels address through the declared strides (TMA descriptors from the caller's 4-D strides, the granule
+  loads from the batch stride): no reshape, no copy; a non-16-byte stride is a typed decline on a real graph.
 """
 
 import math
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from frost_test_utils import assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
+from frost_test_utils import SPILL_TOLERANCE, assert_no_new_spills, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
 from test_sdpa_bias_sm107 import (  # noqa: F401  (the two fixtures are re-exported so they apply here too)
     _PROBE_BODY,
     _RECORD_ARMS,
@@ -130,6 +132,13 @@ def _cells():
         ("additive fp16 vector on a bf16 graph", dict(**_add_kw(dt=DT.HALF)), None, False),
         ("additive fp16 vector on an fp16 graph", dict(dtype=DT.HALF, dtype_o=DT.HALF, **_add_kw(dt=DT.HALF)), None, True),
         ("additive bf16 vector + bias", dict(**_bias_kw(), **_add_kw()), None, True),
+        # the fp32 vector WITH a bias: the 128-wide rendering spills on the softmax role (MEASURED, the pins below) -> served at
+        # TILE_N 64 only -- the heuristics' pick and the adapter's default for the form (a knob-less probe accepts), an EXPLICIT 128
+        # a typed decline (never degraded); the fp32 vector ALONE serves at 128
+        ("additive fp32 vector + bias (knob-less: the heuristics pick TILE_N 64)", dict(**_bias_kw(), **_add_kw(dt=DT.FLOAT)), None, True),
+        ("additive fp32 vector + bias, TILE_N 128 requested (the spilling rendering)", dict(**_bias_kw(), **_add_kw(dt=DT.FLOAT)), dict(tile_n=128), False),
+        ("additive fp32 vector + bias at TILE_N 64", dict(**_bias_kw(), **_add_kw(dt=DT.FLOAT)), dict(tile_n=64), True),
+        ("additive bf16 vector + bias at TILE_N 128 (the io-dtype fast path)", dict(**_bias_kw(), **_add_kw()), dict(tile_n=128), True),
         ("additive bf16 vector S_kv 1024 (no budget)", dict(s_q=1024, s_kv=1024, **_add_kw(s_kv=1024)), None, True),
         ("additive bf16 vector S_kv 100 (not whole granules)", dict(s_q=100, s_kv=100, **_add_kw(s_kv=100)), None, False),
         ("additive bf16 vector, padded 16-byte batch stride 320", dict(**_add_kw(stride0=320)), None, True),
@@ -195,6 +204,19 @@ _ADAPTER_CELLS = [
     ("tile_n 64 bias at S_kv 448 (the 64-wide block's 7 tiles; both gates ask at 128)", dict(s_q=448, s_kv=448, tile_n=64, bias=(1, 4, 448, 448)), False, None),
     ("additive bf16 vector", dict(kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.bfloat16), True, (128, 2, 1)),
     ("additive fp32 vector", dict(kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32), True, (128, 3, 1)),
+    (
+        "additive fp32 vector + bias (no tile_n: the adapter's default for the form is 64)",
+        dict(bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32),
+        True,
+        (64, 3, 1),
+    ),
+    (
+        "additive fp32 vector + bias + tile_n 128 (the spilling rendering)",
+        dict(tile_n=128, bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32),
+        False,
+        None,
+    ),
+    ("additive fp32 vector + bias + tile_n 64", dict(tile_n=64, bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32), True, (64, 3, 1)),
     ("additive fp16 vector on a bf16 graph", dict(kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float16), False, None),
     ("additive fp16 vector on an fp16 graph", dict(dtype=torch.float16, kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float16), True, (128, 2, 1)),
     ("additive bf16 vector + bias + tile_n 64", dict(tile_n=64, bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.bfloat16), True, (64, 2, 1)),
@@ -274,9 +296,15 @@ def test_tile_n_64_renderings_fold_to_one_chunk_and_keep_the_split_and_the_spill
 # The fp32 vector WITH the bias at TILE_N 128 spills (MEASURED on this branch's toolchain, cutlass-dsl 4.8.0 + the CUDA 13.5 ptxas,
 # sm_107a): the sixteen 128-bit granule loads of a 64-column chunk are 64 fp32 registers beside the 128 live S values, the 32
 # pre-loaded bias words and the band words -- over the softmax role's 192 -- where the io-dtype form packs two values per register
-# and stays at the bit word's count.  Pinned as the measured BOUNDS (SPILL_TOLERANCE above them, the regression detector), never
-# "no spills": the io-dtype vector is the fast path (cast an fp32 mask on the host), TILE_N 64 halves the live S and the fp32 form
-# fits again (no new spills there).  The lever to try: BIAS_PRELOAD_CHUNKS = 0 on these arms.
+# and stays at the bit word's count.  Neither named lever moves it (MEASURED, same toolchain): BIAS_PRELOAD_CHUNKS = 0 leaves
+# 23 / 27, 15 / 15 and 16 / 16 unchanged (the peak is the SECOND chunk's, after the pre-load is consumed) and a streamed
+# one-granule-at-a-time fold makes it WORSE (37 / 40, 25 / 25, 38 / 38 -- ptxas hoists the loads anyway).  So the rendering is NOT
+# SERVED: the heuristics pick TILE_N 64 for the fp32 vector WITH a bias and the adapter defaults to it (64 live S: 3 / 3 padded = the
+# base), the row and the adapter decline an EXPLICIT 128 typed (`engines._bias_arm_decline` / `check_support`), and the io-dtype vector
+# stays the fast path (cast on the host).  The
+# three renderings stay pinned here as the decline's REASON, from both sides: no more spills than measured (the upper bound, the
+# regression detector) and still MORE than the bit-word twin plus the tolerance (the lower bound) -- when a toolchain stops
+# spilling here, this test says so and the decline can be lifted.
 _FP32_BIAS_SPILL_PINS = {(32, 1, False): {"STL": 23, "LDL": 27}, (32, 1, True): {"STL": 15, "LDL": 15}, (64, 2, True): {"STL": 16, "LDL": 16}}
 _ADDITIVE_ARMS = [
     # (d, cta, extra, the bool-form twin's extra) -- the additive rendering is pinned against the SAME arm with kv_mask_form = 1
@@ -298,6 +326,9 @@ _ADDITIVE_ARMS = [
     (32, 1, {"kv_mask_form": 3, "bias_mode": 1, "window_right": 0}, {"kv_mask_form": 1, "bias_mode": 1, "window_right": 0}),
     (32, 1, {"kv_mask_form": 3, "bias_mode": 1, "seq_kv_lens_present": True}, {"kv_mask_form": 1, "bias_mode": 1, "seq_kv_lens_present": True}),
     (64, 2, {"kv_mask_form": 3, "bias_mode": 1, "seq_kv_lens_present": True}, {"kv_mask_form": 1, "bias_mode": 1, "seq_kv_lens_present": True}),
+    # the additive form at d64 cga1 (served; no rendering existed before): the fp32 vector alone, the io-dtype vector with the bias
+    (64, 1, {"kv_mask_form": 3}, {"kv_mask_form": 1}),
+    (64, 1, {"kv_mask_form": 2, "bias_mode": 1}, {"kv_mask_form": 1, "bias_mode": 1}),
 ]
 _ADDITIVE_IDS = [
     "d32_add16",
@@ -308,6 +339,8 @@ _ADDITIVE_IDS = [
     "d32_addf32_bias_causal",
     "d32_addf32_bias_padded",
     "d64_addf32_bias_cga2_padded",
+    "d64_addf32_cga1",
+    "d64_add16_bias_cga1",
 ]
 
 
@@ -325,11 +358,17 @@ def test_additive_kv_mask_renderings_fold_the_vector_as_packed_ffma_from_128_bit
     assert probe.cubin_md5 != base.cubin_md5
     assert probe.stats["USETMAXREG"] > 0 and probe.stats["CGAERRBAR"] == 0, probe.stats
     pins = base.stats
-    if extra["kv_mask_form"] == 3 and extra.get("bias_mode") and extra.get("tile_n", 128) == 128:
+    unserved = extra["kv_mask_form"] == 3 and extra.get("bias_mode") and extra.get("tile_n", 128) == 128
+    if unserved:
         pins = _FP32_BIAS_SPILL_PINS[(d, cta, bool(extra.get("seq_kv_lens_present")))]
     assert_no_new_spills(
         probe.stats, pins, tag=f"additive d{d} cga{cta} {sorted(extra)} vs {'the measured fp32 bound' if pins is not base.stats else 'the bit word'}: "
     )
+    if unserved:
+        assert probe.stats["STL"] > base.stats["STL"] + SPILL_TOLERANCE, (
+            f"the fp32 + bias rendering at TILE_N 128 no longer spills beyond the bit word ({probe.stats['STL']} vs {base.stats['STL']} STL): "
+            "the typed decline in engines._bias_arm_decline / SdpaFwdDslSm100.check_support can be lifted"
+        )
     assert probe.stats["FFMA2"] > base.stats["FFMA2"], (probe.stats, base.stats)
     assert probe.stats["LDG_128"] > 0, probe.stats
     assert probe.stats["VOTE"] < base.stats["VOTE"], (probe.stats, base.stats)
@@ -338,9 +377,26 @@ def test_additive_kv_mask_renderings_fold_the_vector_as_packed_ffma_from_128_bit
 # --------------------------------------------------------------------------- tier 3: GPU cells (a Rubin device)
 
 
+def _executed_tile_n(g, idx):
+    """The KV tile width the EXECUTED plan was compiled with -- never the record the test asked for, so a 64-wide cell is evidenced by
+    the rendering that ran, not inferred from the adapter tier.  Read from the compiled kernel module's own ``CFG.TILE_N`` through the
+    prepared launch spec (``prepared.DenseLaunchSpec.tile_n``); a plan the lowering built WITHOUT a prepared launch (one KV tile, S_kv
+    64) exposes the adapter it compiled through the executor closure, whose ``template_params().tile_n`` is the width the kernel
+    module was loaded with (``_load_sm100_kernel_module((d, d), params)``)."""
+    plan = g._compiled_plans[idx]
+    spec = getattr(getattr(plan, "_prepared", None), "spec", None)
+    if spec is not None and hasattr(spec, "tile_n"):
+        return int(spec.tile_n)
+    cells = getattr(plan._compiled, "__closure__", None) or ()
+    api = next((c.cell_contents for c in cells if type(c.cell_contents).__name__.startswith("SdpaFwdDsl")), None)
+    assert api is not None, f"the compiled plan carries neither a prepared launch spec nor the adapter it compiled: {type(plan).__name__}"
+    return int(api.template_params().tile_n)
+
+
 def _run2(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, cga=None, tile_n=None):
     """``test_sdpa_bias_sm107._run`` with the TILE_N knob: build the graph, pin the Rubin f16 row (a cga and / or a TILE_N through
-    the public autotune record), launch TWICE on sentinel-filled outputs (the two-launch delta) and return O, Stats, the knobs."""
+    the public autotune record), launch TWICE on sentinel-filled outputs (the two-launch delta) and return O, Stats, the plan's OWN
+    knob record and the width the compiled kernel actually carries (``executed_tile_n``)."""
     import cudnn
 
     g, vp, o, o_gpu, stats_gpu = _build(
@@ -364,7 +420,10 @@ def _run2(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_
     g.check_support()
     g.build_plans()
     knobs = g.plans[idx].knobs
-    assert knobs.tile_n in (None, want_tile_n) and knobs.cga == want_cga, (knobs, want_tile_n, want_cga)
+    assert knobs.tile_n == want_tile_n and knobs.cga == want_cga, (knobs, want_tile_n, want_cga)
+    # The EXECUTED rendering's width from the compiled kernel's CFG (a knob-less plan runs the row's default 128).
+    executed_tile_n = _executed_tile_n(g, idx)
+    assert executed_tile_n == (want_tile_n if want_tile_n is not None else 128), (executed_tile_n, want_tile_n, knobs)
     vp[o] = o_gpu
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
 
@@ -379,7 +438,7 @@ def _run2(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_
     o1, st1 = launch()
     o2, st2 = launch()
     assert torch.equal(o1, o2) and (st1 is None or torch.equal(st1, st2)), "two-launch delta on O / Stats"
-    return dict(o=o_gpu, stats=stats_gpu, knobs=SimpleNamespace(cga=want_cga, tile_n=want_tile_n), names=names)
+    return dict(o=o_gpu, stats=stats_gpu, knobs=knobs, executed_tile_n=executed_tile_n, names=names)
 
 
 def _ref_add(q, k, v, *, scale, bias=None, add=None, kv_mask=None, causal=False, seq_kv_lens=None):
@@ -439,7 +498,8 @@ def _inputs(c, dtype=torch.bfloat16, *, seed=0):
     form = c.get("add")
     if form is not None:
         vdt = torch.float32 if form == "f32" else dtype
-        fill = float("-inf") if form == "inf" else -1e9
+        # the finite fold: -1e9 where the dtype holds it (fp32, bf16), the dtype's most negative finite value where it does not (fp16: 65504)
+        fill = float("-inf") if form == "inf" else (-1e9 if torch.finfo(vdt).max > 1e9 else float(torch.finfo(vdt).min))
         vec = torch.where(keep, torch.zeros((), device="cuda", dtype=vdt), torch.full((), fill, device="cuda", dtype=vdt))
         if form == "full":
             vec[1] = -1e9  # batch 1: every key -1e9 -> the eager uniform average, NOT the empty-row contract
@@ -492,6 +552,7 @@ _T64_CASES = {
     "t64_both_causal_padded_384": dict(s=384, h=2, bias=True, mask=True, causal=True, kv_lens=[384, 300]),
     "t64_d64_both_128_cga1": dict(d=64, s=128, bias=True, mask=True),
     "t64_d64_both_256_cga2": dict(d=64, s=256, h=2, bias=True, mask=True, cga=2),
+    "t64_f16_both_256": dict(s=256, bias=True, mask=True, io=torch.float16),  # the 64-wide rendering on an fp16 graph
 }
 
 
@@ -502,10 +563,13 @@ def test_tile_n_64_cells_match_the_fp64_oracle_and_the_128_wide_rendering(case):
     rows exactly 0 / -inf, two launches bitwise -- and within the same tolerance of the 128-wide rendering of the same graph
     (never bitwise: the online softmax combines its chunk sums in a different order)."""
     c = _T64_CASES[case]
-    out64, ref, _ = _run_cell(c, torch.bfloat16, tile_n=64)
+    io = c.get("io", torch.bfloat16)
+    out64, ref, _ = _run_cell(c, io, tile_n=64)
     assert out64["knobs"].tile_n == 64 and out64["knobs"].cga == c.get("cga", 1), out64["knobs"]
+    assert out64["executed_tile_n"] == 64, "the compiled kernel of the executed plan must carry TILE_N 64"
     _check(out64, ref)
-    out128, _, _ = _run_cell(c, torch.bfloat16, tile_n=128)
+    out128, _, _ = _run_cell(c, io, tile_n=128)
+    assert out128["executed_tile_n"] == 128
     live = ~ref["empty"]
     torch.testing.assert_close(out64["o"][live].double(), out128["o"][live].double(), **_TOL_O)
     torch.testing.assert_close(out64["stats"].squeeze(-1)[live].double(), out128["stats"].squeeze(-1)[live].double(), **_TOL_LSE)
@@ -553,7 +617,10 @@ _ADD_CASES = {
     "add_bf16_256": dict(s=256, add="bf16"),
     "add_f32_256": dict(s=256, add="f32"),
     "add_bf16_bias_384": dict(s=384, h=2, add="bf16", bias=True),
-    "add_f32_bias_causal_384": dict(s=384, h=2, add="f32", bias=True, causal=True),
+    "add_f32_bias_causal_384": dict(s=384, h=2, add="f32", bias=True, causal=True),  # the fp32 + bias form: the heuristics pick TILE_N 64
+    "add_f32_bias_causal_t64_384": dict(s=384, h=2, add="f32", bias=True, causal=True, tile_n=64),  # ... and the explicit knob
+    "add_f32_d64_128_cga1": dict(d=64, s=128, add="f32"),
+    "add_bf16_bias_d64_128_cga1": dict(d=64, s=128, add="bf16", bias=True),
     "add_bf16_padded_384": dict(s=384, h=2, add="bf16", kv_lens=[384, 200]),
     "add_bf16_512_nkv4": dict(s=512, h=2, add="bf16"),
     "add_bf16_t64_256": dict(s=256, add="bf16", tile_n=64),
@@ -570,7 +637,39 @@ def test_additive_kv_mask_matches_the_fp64_oracle_with_the_vector_folded_in_fp32
     c = _ADD_CASES[case]
     out, ref, _ = _run_cell(c, torch.bfloat16, tile_n=c.get("tile_n"))
     assert out["knobs"].cga == c.get("cga", 1)
+    # the fp32 vector WITH a bias runs the 64-wide rendering whether the knob is given or the heuristics pick it
+    assert out["executed_tile_n"] == c.get("tile_n", 64 if (c.get("add") == "f32" and c.get("bias")) else 128), (case, out["knobs"])
     _check(out, ref)
+
+
+@requires_rubin
+def test_fp32_additive_vector_with_a_bias_runs_tile_n_64_and_declines_an_explicit_128():
+    """The fp32 vector WITH a bias: the heuristics' plan carries TILE_N 64 (the only served width of the form), the EXECUTED kernel's
+    CFG.TILE_N is 64, and a record asking TILE_N 128 (the spilling rendering) is refused at plan creation with the two served routes
+    named -- never degraded."""
+    import cudnn
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines
+
+    q, k, v, kw = _inputs(dict(s=256, add="f32", bias=True), torch.bfloat16)
+    out = _run2(q, k, v, scale=kw["scale"], bias=kw["bias"], kv_mask=kw["add"])
+    assert out["knobs"].tile_n == 64 and out["executed_tile_n"] == 64, out["knobs"]
+    g, *_ = _build(q, k, v, scale=kw["scale"], bias=kw["bias"], kv_mask=kw["add"])
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names, ours = _frost_plans(g)
+    assert ours and all("TILE_N=64" in names[i] for i in ours), names
+    engine_id, record = g.get_engine_and_knobs_at_index(ours[0])
+    record = dict(record)
+    record[cudnn.knob_type.TILE_N] = 128
+    with pytest.raises(Exception) as excinfo:
+        g.create_execution_plan(engine_id, record)
+        g.select_plan(g.get_execution_plan_count() - 1)
+        g.check_support()
+        g.build_plans()
+    assert "TILE_N 64" in str(excinfo.value) or "tile_n=64" in str(excinfo.value) or "spills" in str(excinfo.value), str(excinfo.value)[:400]
+    why = engines.mismatch(_caps(), ga.analyze(g), engines.SdpaFwdKnobs(tile_n=128))
+    assert why is not None and "TILE_N 64" in why and "fp32" in why, why
+    assert engines.mismatch(_caps(), ga.analyze(g)) is None, "the knob-less probe accepts: the heuristics pick the served width"
 
 
 @requires_rubin
@@ -604,7 +703,8 @@ def test_additive_fully_masked_row_is_the_eager_uniform_average_not_the_empty_ro
     uniform = v[1].double().mean(dim=-2, keepdim=True).expand(-1, s, -1)  # (H, S_q, D): every row the mean of V over the keys
     torch.testing.assert_close(out["o"][1].double(), uniform, atol=5e-2, rtol=3e-2)
     lse1 = out["stats"][1].squeeze(-1).double()
-    assert torch.isfinite(lse1).all() and ((lse1 - (-1e9 + math.log(s))).abs() < 512).all(), "Stats ~ -1e9 + ln(S_kv): the finite fold, not -inf"
+    folded = kw["add"][1].flatten()[0].double().item()  # the vector's VALUE in its dtype: bf16(-1e9) = -998244352, what the kernel folds
+    assert torch.isfinite(lse1).all() and ((lse1 - (folded + math.log(s))).abs() < 512).all(), f"Stats ~ {folded} + ln(S_kv): the finite fold, not -inf"
     ref = _ref_add(q, k, v, scale=kw["scale"], add=kw["add"])
     torch.testing.assert_close(out["o"][0].double(), ref["o"][0], **_TOL_O)
     torch.testing.assert_close(out["stats"][0].squeeze(-1).double(), ref["lse"][0], **_TOL_LSE)
@@ -659,23 +759,77 @@ def test_bhsd_contiguous_activations_are_the_rows_pre_existing_typed_decline():
     assert why is not None and "BSHD" in why, why
 
 
+def _no_frost_service(g):
+    """Assert the graph is NOT served by the FROST row and say where the typed decline fell: at plan-list time (no FROST plan, or no
+    plan at all) or at check_support / build time (the plan list offered the row, the build refused it).  A plan that BUILDS fails
+    the test -- the kernel must never run on these operands."""
+    import cudnn
+
+    try:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        return f"list: {exc}"
+    names, ours = _frost_plans(g)
+    if not ours:
+        return f"list: no FROST plan in {names}"
+    g.select_plan(ours[0])
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError, RuntimeError)) as excinfo:
+        g.check_support()
+        g.build_plans()
+    return f"build: {excinfo.value}"
+
+
+@requires_rubin
+@pytest.mark.parametrize("arm", ["both", "mask"])
+def test_one_kv_tile_of_64_with_the_resident_arms_is_served_or_declined_typed(arm):
+    """S_kv = 64 at TILE_N 64 (one KV tile, the acceptance grid's 64) with the bias + bool mask / the mask alone: the plan is either
+    SERVED through the prepared launch (then O / Stats match the oracle, two launches bitwise, the executed CFG.TILE_N reads 64) or it
+    is a TYPED decline at list / check_support / build time -- never a plan that builds and fails at execute (the staging-copy path
+    carries neither resident-arm operand).  The outcome is recorded by the assertion message, not assumed."""
+    import cudnn
+
+    c = dict(s=64, bias=arm == "both", mask=True)
+    q, k, v, kw = _inputs(c, torch.bfloat16)
+    g, vp, o, o_gpu, stats_gpu = _build(q, k, v, scale=kw["scale"], bias=kw["bias"], kv_mask=kw["kv_mask"])
+    try:
+        g.create_execution_plans([cudnn.heur_mode.A])
+        names, ours = _frost_plans(g)
+    except cudnn.cudnnGraphNotSupportedError as exc:
+        pytest.skip(f"S_kv 64 + TILE_N 64 + {arm}: a typed decline at list time -- {exc}")
+    if not ours:
+        pytest.skip(f"S_kv 64 + TILE_N 64 + {arm}: no FROST plan at list time ({names})")
+    try:
+        out = _run_cell(c, torch.bfloat16, tile_n=64)
+    except (cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError) as exc:
+        assert "prepared" in str(exc) or "domain" in str(exc) or "TILE_N" in str(exc), f"an untyped decline: {exc}"
+        pytest.skip(f"S_kv 64 + TILE_N 64 + {arm}: a typed decline at plan creation / build -- {str(exc)[:200]}")
+    res, ref, _ = out
+    assert res["executed_tile_n"] == 64
+    _check(res, ref)
+
+
 @requires_rubin
 def test_non_16_byte_outer_strides_are_typed_declines_on_real_graphs():
     """A head stride of D + 4 bf16 (72 B) on Q/K/V/O, a bias row stride of S + 4 and an additive vector with a 260-element
-    batch stride are not TMA / granule addressable: with the python-only kv_mask bound no engine serves them (a typed
-    error at plan creation), and the bias / activation forms leave the FROST row out of the plan list."""
+    batch stride are not TMA / granule addressable: with the python-only kv_mask bound no engine serves them, and the bias /
+    activation forms leave the FROST row out -- a typed decline at plan-list time or at check_support / build time, never a
+    launch (``_no_frost_service`` reports where)."""
     import cudnn
 
     d, s = 32, 256
-    # (a) a non-16-byte head stride with the kv_mask bound: no engine at all
+    # (a) a non-16-byte head stride with the kv_mask bound: no engine serves it -- the row declines it at plan-LIST time (the resident
+    # arms bind through the prepared launch only; the staging-copy path does not carry the kv_mask, so a plan that built there used to
+    # fail at EXECUTE time with "kv_mask_tensor is required by this compiled specialization")
     q, k, v = (torch.randn(2, s, 4, d + 4, device="cuda", dtype=torch.bfloat16)[..., :d].transpose(1, 2) for _ in range(3))
     mask = torch.ones(2, 1, 1, s, device="cuda", dtype=torch.bool)
     g, *_ = _build(q, k, v, scale=1.0 / math.sqrt(d), kv_mask=mask)
-    with pytest.raises(cudnn.cudnnGraphNotSupportedError):
-        g.create_execution_plans([cudnn.heur_mode.A])
-        names, ours = _frost_plans(g)
-        assert not ours, names
-        raise cudnn.cudnnGraphNotSupportedError("no FROST plan for a 72-byte head stride and the backend has no kv_mask field")
+    where = _no_frost_service(g)
+    assert where.startswith("list:"), where
+    from cudnn.sdpa import graph_analyzer as ga
+    from cudnn.sdpa.fwd import engines
+
+    why = engines.mismatch(_caps(), ga.analyze(g))
+    assert why is not None and "prepared launch" in why and "bind without a copy" in why, why
     # (b) a bias with a row stride of S + 4: the FROST row is out (the backend may serve it)
     q, k, v = (_bhsd(2, 4, s, d, torch.bfloat16) for _ in range(3))
     bias = torch.randn(1, 4, s, s + 4, device="cuda", dtype=torch.bfloat16)[..., :s]

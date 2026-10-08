@@ -1000,7 +1000,7 @@ red (2026-09-08).
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | ❌ | f16/bf16 ✅ · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
 | Optional stats (LSE store compiled out) | ✅ᵗ | ✅ᵗ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias (additive, `[1\|B, 1\|H_q, S_q, S_kv]` in the Q/K/V dtype; the RESIDENT row-block, dense / unsplit / unpaged, no score outputs)ᵗᵇ | ✅ᵗᵇ S_kv ≤ 768 for a batch-broadcast bias on ≥ 2 flattened rows (the (n, n+1) pair work item, a 128-row block); ≤ 384 for a per-batch bias | ✅ᵗᵇ S_kv ≤ 384 (the pair item, cga1); a per-batch bias ≤ 128 (cga1) / ≤ 256 (cga2) | ❌ (no SMEM for a block) | ❌ | ❌ | ❌ | ❌ |  ❌  |
-| Per-key mask (`kv_mask`, a python-only `sdpa` input `[1\|B, 1, 1, S_kv]`: BOOLEAN = the bit word, False = the key is masked for every query; the Q/K/V dtype or FLOAT = an ADDITIVE per-key vector folded pre-scale like the bias, S_kv % 8 == 0, 16-byte strides)ᵗᵇ | ✅ᵗᵇ any S_kv (nothing staged in SMEM; validated to n_kv = 8; both forms) | ✅ᵗᵇ any S_kv (cga1; cga2 on request; both forms) | ❌ | ❌ | ❌ | ❌ | — |  —  |
+| Per-key mask (`kv_mask`, a python-only `sdpa` input `[1\|B, 1, 1, S_kv]`: BOOLEAN = the bit word, False = the key is masked for every query; the Q/K/V dtype or FLOAT = an ADDITIVE per-key vector folded pre-scale like the bias, S_kv % 8 == 0, 16-byte strides)ᵗᵇ | ✅ᵗᵇ any S_kv (nothing staged in SMEM; the bit word validated to n_kv = 8, the additive forms to n_kv = 4; an fp32 vector WITH a bias runs TILE_N 64, the heuristics' pick) | ✅ᵗᵇ any S_kv (cga1; cga2 on request; both forms) | ❌ | ❌ | ❌ | ❌ | — |  —  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ ᵗ | ✅ⁱˣ ᵗ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
 | FP16 softmax accumulate (`sdpa(softmax_precision=HALF)` op attribute) | — | ❔ⁱⁱⁱ | fp8 only (Rubin f16x2 arm) | fp8 only (same body as d128) | ❌ | ❌ | — |  —  |
 
@@ -1344,27 +1344,43 @@ declines for a compact bias and SERVED with a padded row stride, 104 / 224,
 validated at both; a wrapper that owns the bias allocation pads the stride), a
 a kv_mask in a dtype the arm has no form for (int8 / uint8 on the graph path, a 16-bit vector that is not the
 Q/K/V dtype), an ADDITIVE kv_mask vector at S_kv % 8 != 0 or with a batch stride that is not a 16-byte multiple (its
-16-byte granule loads), THD / paged KV / split-KV / PackGQA /
+16-byte granule loads), an EXPLICIT TILE_N 128 for an fp32 additive vector TOGETHER WITH a bias (that rendering spills on the softmax
+role -- STL / LDL 23 / 27 causal, 15 / 15 padded, 16 / 16 at d64 cga2, sm_107a; neither `BIAS_PRELOAD_CHUNKS = 0` nor a streamed granule
+fold moves it -- so the form is served at TILE_N 64 only, where it fits again: the heuristics pick 64 for it and the adapter defaults to
+it (`config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N`), a requested 128 declines typed, never degraded; the io-dtype vector is the fast
+path), THD / paged KV / split-KV / PackGQA /
 the epilogue gate / the score side outputs with either operand.  **The additive kv_mask forms** (`kv_mask_form = 2` /
 `3`: the io dtype's 16-bit pairs / fp32, 2026-10-08): the same softmax body loads the tile's 64-column slice of the
 vector as warp-uniform 16-byte granules (nothing staged in SMEM, no barrier row -- the lane ledger of the bit-word
 form is the ledger of every form) and folds it into the raw scores pre-scale exactly like the bias (one packed FFMA
 per pair, after the bias add, before the band mask), so the models' finite -1e9 fold is preserved as a VALUE: a key at
 -1e9 contributes exp(-1e9) = 0, a row whose every key is -1e9 is the uniform average of V (eager math), a -inf vector
-value reproduces the bit word bitwise.  Validated on cc 10.7 against the fp64 oracle with the vector applied in fp32:
-bf16 and fp32 vectors alone, with the bias, under causal, at n_kv = 4 and at TILE_N 64, the -inf image BITWISE the
-BOOLEAN form, a -1e9 row the uniform average, a padded 16-byte batch stride; typed declines for an fp16 vector on a
-bf16 graph, S_kv 100, a 260-element batch stride.  **TILE_N 64** (the `TILE_N` knob, `Capabilities.tile_ns_by_d_shape`
+value reproduces the bit word bitwise.  Validated on cc 10.7 against the fp64 oracle with the vector applied in fp32 (the
+module's GPU tier): bf16 and fp32 vectors alone (S_kv 256; the fp32 one also at d64 cga1 and cga2), the bf16 vector with the bias
+(384) and under a padded tail, the fp32 vector with the bias at TILE_N 64 under causal (384; its only served width with a bias),
+across the ring wrap (n_kv 4, S_kv 512), at TILE_N 64 (256), with a padded 16-byte batch stride, an fp16 vector on an fp16 graph;
+the -inf image BITWISE the BOOLEAN kernel's O / Stats (alone, with the bias, at TILE_N 64, through the ring wrap); a fully -1e9 row
+the eager uniform average (Stats ~ bf16(-1e9) + ln S_kv: the kernel folds the vector's VALUE) while the BOOLEAN all-False twin keeps
+O = 0 / Stats = -inf; typed declines on real graphs for an fp16 vector on a bf16 graph, S_kv 100, a 260-element batch stride, an
+EXPLICIT TILE_N 128 for the fp32 vector WITH a bias, and a 72-byte Q / K / V / O head stride with a kv_mask (at plan time).  **TILE_N 64** (the `TILE_N` knob, `Capabilities.tile_ns_by_d_shape`
 = `config_sm107.SM107_TILE_NS_BY_D_SHAPE`: {64, 128} on the 32- / 64-wide tiles, 128 on the d128 rendering; 256 refused
 by the TMEM predicate at two sub-tiles): the one-chunk softmax arm trace-compiled (USETMAXREG 7, REG 128, STL / LDL = the
 128-wide base per mask arm) and validated on cc 10.7 at n_kv = 1 / 2 / 4 / 6 (S_kv 64 .. 384), plain / bias / bool and
-additive kv_mask / causal, d64 at cga1 and cga2; the heuristics' default width stays 128 (a knob, never the pick), and
+additive kv_mask / causal / a padded tail, d64 at cga1 and cga2, a bias + bool-mask cell on an fp16 graph -- the EXECUTED plan's
+compiled `CFG.TILE_N` read back as 64 on every cell, O / Stats within the f16 tolerance of the 128-wide rendering of the same graph,
+bias = 0 / mask = all-true / additive = 0 BITWISE the plain 64-wide kernel; one KV tile (S_kv 64) with the bias + bool mask and with
+the mask alone served (the engine's legacy executor binding through the adapter's own prepared binder); 12 fresh processes of the
+bias + bool-mask cell at n_kv 6 (ok 12 / hang 0 / other 0) and of the fp32 + bias cell at the heuristics' TILE_N 64 (ok 12 / 0 / 0); the heuristics' default width stays 128 (a knob, never the pick), and
 every budget above is asked at TILE_N 128 (the 64-wide ring holds one more tile -- 448 / 320 / 384 -- which the
-standalone adapter's TILE_N 64 record serves and the row's gate does not yet claim).  **Strided outer axes**: the Q /
-K / V / O `dense_flex` envelope (any B / H / S stride order, 16-byte padded head strides), a bias in any outer stride
-order (`[B, S_q, H, S_kv]`-physical) or with a padded row stride and a kv_mask with a padded batch stride are graph FACTS
-the row judges (the TMA / granule rules above) and the kernels address through their declared strides -- no reshape, no
-copy; a non-16-byte stride is a typed decline.  Composes with
+standalone adapter's TILE_N 64 record serves and the row's gate does not yet claim).  **Strided outer axes**: the row's
+activation envelope stays `bshd` (Q / K / V / O BSHD-physical, 16-byte padded head strides included; a (B, H, S, D)-contiguous
+activation is the row's pre-existing typed decline "must be BSHD-physical" -- the `dense_flex` envelope is the SM100 line's,
+not this row's); a bias in any outer stride order (`[B, S_q, H, S_kv]`-physical) or with a padded row stride and a kv_mask
+with a padded batch stride are graph FACTS the row judges (the TMA / granule rules above) and the kernels address through
+their declared strides -- no reshape, no copy; a non-16-byte stride is a typed decline.  **The resident arms bind through the
+PREPARED launch only** (2026-10-08): a Q / K / V / O layout the prepared launch cannot bind zero-copy (a 72-byte head stride) is a typed
+decline at plan time for a graph with a bias or a kv_mask (`engines._resident_arm_layout_decline`, the lowering's own `dense_bind_strides`
+admission) -- the staging-copy executor forwards neither operand, so such a plan used to build and fail at execute time.  Composes with
 every dense mask (causal / right band / SWA / padded + padded-Q trim; bottom-right
 causal with the `kv_mask` -- bottom-right causal + `bias` is refused by the ONE
 graph contract's validation, backend and FROST alike), the sink, GQA and optional
