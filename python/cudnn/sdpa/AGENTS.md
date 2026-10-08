@@ -743,6 +743,42 @@ changes the plan the graph builds and its eligibility. Set it only through
 the pick's output (`test_n_chunk_override_seam_is_read_by_the_pick`), not on
 the seam's name.
 
+Measured facts the small-tile bias heuristics must honour (bf16, D = 32,
+S_q = S_kv = 384, H = 4, 384 flattened batch rows; a 212-SM cc 10.7 node at the
+2376 MHz lock, 100 x 3 graph-replay rounds, control pair within 0.2 %):
+
+- A graph with BOTH a bias and a bool `kv_mask` is superadditive on the
+  128-wide tile: plain 46.3 us, bias +10.0, `kv_mask` +20.0, both +34.7 (the
+  sum + 15 %; the one-batch-entry item + 21 %). The mechanism is the
+  instruction cache: the combined softmax body is ~3480 hot SASS instructions
+  against ~3050 for either feature alone, and the warp-stall ratio
+  `smsp__average_warps_issue_stalled_no_instruction_per_issue_active` jumps
+  0.5 -> 2.0 while every other reason stays put and the instruction count
+  stays sub-additive. `TILE_N = 64` halves the unrolled body and restores
+  additivity: both 81.0 -> 70.9 us (+14 %; `no_instruction` 2.0 -> 0.25) while
+  every single-feature arm LOSES at the half tile (plain -12 %, bias -4 %,
+  `kv_mask` -10 %). A chooser that scores the bias and the mask as independent
+  costs is wrong by that excess; pick `TILE_N 64` for the combined graph and
+  check the ratio on any new rendering that adds body (a streamed ring, a
+  third operand) before shipping it.
+- The default `n_chunk` rule's pick (`sm107_n_chunk_rule`) is one step short at S = 128 (2 vs the measured
+  4: 12.8 vs 11.2 us, +15 %) and one past at S = 768 (16 vs 8: 328.9 vs 316.7
+  us, +4 %); it is the measured best at 384 and 512. Past ~2.5 items per SM
+  every chunk length loses to the wave tail (`n_chunk = N` 13-16x).
+- The item-boundary bubble of the resident block is 0.13 / 0.23-0.33 /
+  0.36-0.56 us per item at S = 384 / 512 / 768 (it grows with the block bytes:
+  the exposed tail of the per-item fill), 0.8-1.3 % of the cell at the rule's
+  pick -- not a lever. The pair item's gain over the one-batch-entry item is
+  the 256-row super-tile's q-row waste (25 % at S = 384), not the bubble: per
+  computed 128 x 128 sub-tile step the two forms cost the same.
+- `BIAS_PRELOAD_CHUNKS` 1 -> 0 (no bias chunk loaded before the `bmm1_done`
+  wait) is +1.7..+1.9 % on the pair item and +3 % on the one-batch-entry item;
+  2 is -1 %. The row read hides in place on the issue-bound small tile.
+- The ADDITIVE bf16 `kv_mask` vector costs twice the bool word's increment
+  (+85 % vs +43 % over plain): the per-pair FFMA2 + unpack is the cost, the
+  ballots are not (0.8 % of the bool arm's stall samples). Keep the bool word
+  the default where the caller can give one.
+
 ## Single-CTA packed split scheduler
 
 A one-CTA persistent scheduler publishes locally and releases its local
