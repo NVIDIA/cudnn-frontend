@@ -862,6 +862,10 @@ QUANT_SCALARS_BYTES: int = 256  # the region (256-B aligned; len(QUANT_SCALAR_SL
 # `_plan_bwd_workspace` pins the equality so the first mismatched edit raises at declaration instead.
 QUANT_SCALAR_STRIDE: int = 4
 _GRAD_SCALING = ("current", "delayed")  # GatedAttentionBlockBwd(grad_scaling=): a DECLARATION attribute (numerics-changing), never a knob
+# GatedAttentionBlockBwd(grad_scale_margin_log2=): the "current" recipe's headroom under the e4m3 maximum, in octaves -- a DECLARATION
+# attribute like grad_scaling (it moves the e4m3 rounding points; a compile-time constant of the quantize artifacts, never a slot or a
+# knob).  [0, 8]: eight octaves already drop the e4m3 grid's top eight binades of range for nothing a gradient needs.
+_GRAD_SCALE_MARGIN_LOG2_MAX: int = 8
 # The MMA-instruction K width of every e4m3 backward GEMM stage (B1 / B2 / B7 / B8): the 64-byte form is the measured one for
 # the dense fp8 GEMMs of this backward (+5.6 .. +16.3 % over K32 at S = 2K .. 32K on B2's shape) and is passed EXPLICITLY --
 # never derived from the dtype here or in the driver, so the forward's fp8 plans stay at their pinned K32.
@@ -2268,11 +2272,23 @@ class _QuantEpilogue(_Stage):
     name = "fp8_bwd_epilogue"
 
     def __init__(
-        self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, want_dw: bool, grad_scaling: str, n_alpha: int
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        want_dw: bool,
+        grad_scaling: str,
+        n_alpha: int,
+        margin_log2: int = FP8_GRAD_SCALE_MARGIN_LOG2,
     ) -> None:
         """Record the declaration: ``want_dw`` = the dW_norm reduce job exists (``need_dw_norms``), ``grad_scaling`` picks the dqkvg
         quantize's scale source (``"current"``: from the reduced amax; ``"delayed"``: the caller's slot), ``n_alpha`` the alpha products
-        the quantize publishes (``alpha_b7`` / ``alpha_b8``).  Validation is ``check_support``'s, the artifact ``compile``'s."""
+        the quantize publishes (``alpha_b7`` / ``alpha_b8``), ``margin_log2`` (appended) the "current" recipe's power-of-two headroom
+        (``GatedAttentionBlockBwd.grad_scale_margin_log2``; the module constant by default, so the artifact of every existing caller is
+        unchanged -- the margin is a compile-time constant of the fused epilogue's quantize arm, keyed like its other knobs).
+        Validation is ``check_support``'s, the artifact ``compile``'s."""
         if grad_scaling not in _GRAD_SCALING:
             raise ValueError(f"{self.name}: grad_scaling must be one of {_GRAD_SCALING}, got {grad_scaling!r}")
         self.geom = geometry
@@ -2282,6 +2298,7 @@ class _QuantEpilogue(_Stage):
         self.grad_scaling = grad_scaling
         self.scale_src = "amax" if grad_scaling == "current" else "given"
         self.n_alpha = int(n_alpha)
+        self.margin_log2 = int(margin_log2)
         self._recipe = None
 
     def check_support(self) -> None:
@@ -2306,7 +2323,7 @@ class _QuantEpilogue(_Stage):
             want_dw=self.want_dw,
             scale_src=self.scale_src,
             n_alpha=self.n_alpha,
-            margin_log2=FP8_GRAD_SCALE_MARGIN_LOG2,
+            margin_log2=self.margin_log2,
             threads_per_cta=_ELEMENTWISE_THREADS,
         )
 
@@ -4268,6 +4285,14 @@ class GatedAttentionBlockBwd(APIBase):
         # through quant_scalars() for the caller's next-step update.  Under an MxQuantSpec it governs the ONE per-tensor gradient
         # of that pipeline, dY (dO and dQKVG carry their 32-blocks' E8M0 scales): "delayed" takes execute(scale_dy=) alone.
         grad_scaling: str = "current",
+        # APPENDED (the gradient-scale margin; keyword-only, defaulted, LAST): the "current" recipe's headroom under the e4m3 maximum,
+        # in octaves -- scale = 2**(floor(log2(448 / amax)) - grad_scale_margin_log2) in EVERY gradient quantize (dY, dO and dQKVG on
+        # the per-tensor fp8 chain; dY alone under an MxQuantSpec).  A DECLARATION ATTRIBUTE like grad_scaling: it moves the e4m3
+        # rounding points, and it is a compile-time constant of the quantize artifacts (a different artifact per value), so it is
+        # neither a knob nor a scalar slot.  An int in [0, 8]; the module constant FP8_GRAD_SCALE_MARGIN_LOG2 (0) by default, so every
+        # existing caller traces the same artifacts.  Refused non-default without quant (nothing is quantized) and under
+        # grad_scaling="delayed" (the caller's scales carry their own headroom there).  quant_scalars() publishes the scales that ran.
+        grad_scale_margin_log2: int = FP8_GRAD_SCALE_MARGIN_LOG2,
     ):
         super().__init__()
         self._warn_experimental_api()
@@ -4340,6 +4365,26 @@ class GatedAttentionBlockBwd(APIBase):
                 f"grad_scaling={grad_scaling!r} is an attribute of the quantized backward (quant=QuantSpec / MxQuantSpec): a bf16 / fp16 block quantizes no "
                 f"gradient and takes the default {_GRAD_SCALING[0]!r} only"
             )
+        if (
+            isinstance(grad_scale_margin_log2, bool)
+            or not isinstance(grad_scale_margin_log2, int)
+            or not (0 <= grad_scale_margin_log2 <= _GRAD_SCALE_MARGIN_LOG2_MAX)
+        ):
+            raise ValueError(
+                f"grad_scale_margin_log2 must be an int in [0, {_GRAD_SCALE_MARGIN_LOG2_MAX}] (the 'current' recipe's power-of-two headroom under the "
+                f"e4m3 maximum: scale = 2**(floor(log2(448 / amax)) - margin)), got {grad_scale_margin_log2!r}"
+            )
+        if quant is None and grad_scale_margin_log2 != FP8_GRAD_SCALE_MARGIN_LOG2:
+            raise ValueError(
+                f"grad_scale_margin_log2={grad_scale_margin_log2!r} is an attribute of the quantized backward (quant=QuantSpec / MxQuantSpec): a bf16 / "
+                f"fp16 block quantizes no gradient and takes the default {FP8_GRAD_SCALE_MARGIN_LOG2!r} only"
+            )
+        if grad_scaling != _GRAD_SCALING[0] and grad_scale_margin_log2 != FP8_GRAD_SCALE_MARGIN_LOG2:
+            raise ValueError(
+                f"grad_scale_margin_log2={grad_scale_margin_log2!r} with grad_scaling={grad_scaling!r}: the margin belongs to the 'current' recipe (the "
+                f"scale is derived on device from this step's amax); under 'delayed' the caller's scale_dy / scale_do / scale_dqkvg carry their own "
+                f"headroom -- pass the default {FP8_GRAD_SCALE_MARGIN_LOG2!r}"
+            )
         if self.thd and isinstance(quant, MxQuantSpec):
             # At construction, right after the THD shape facts and BEFORE any stage is built, so the decline names the block's
             # own attributes.  Independent of the record's content, so a placeholder record (no proj_slab yet) gets this answer
@@ -4356,6 +4401,7 @@ class GatedAttentionBlockBwd(APIBase):
             )
         self.quant: Optional[Union[QuantSpec, MxQuantSpec]] = quant
         self.grad_scaling = grad_scaling
+        self.grad_scale_margin_log2 = int(grad_scale_margin_log2)
         # The code dtype of saved.h and of the e4m3 weights under quant (the quant spec's `dtype`), the activation dtype otherwise -- the GEMM
         # operand dtype every MN-major rule below is spelled in.
         self.w_dtype = quant.dtype if quant is not None else self.act_dtype
@@ -4488,6 +4534,7 @@ class GatedAttentionBlockBwd(APIBase):
             n_alpha=2,
             own_amax=False,
             amax_src="partials",
+            margin_log2=self.grad_scale_margin_log2,
         )
         self._out_proj_dgrad = _OutProjDgrad(m=t, k=dm, n=hd, dtype=e4, label="out_proj_dgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True)
         self._gate_bwd = _SigmoidGateBwd(
@@ -4495,7 +4542,17 @@ class GatedAttentionBlockBwd(APIBase):
         )
         # the dO amax: B3's per-CTA partials, reduced here and published
         self._quant_do = _QuantizeGrad(
-            g, batch=b, seq_len=s, dtype_in=act, heads=g.h_q, name="quantize_do", grad_scaling=gs, n_alpha=0, own_amax=False, amax_src="partials"
+            g,
+            batch=b,
+            seq_len=s,
+            dtype_in=act,
+            heads=g.h_q,
+            name="quantize_do",
+            grad_scaling=gs,
+            n_alpha=0,
+            own_amax=False,
+            amax_src="partials",
+            margin_log2=self.grad_scale_margin_log2,
         )
         self._out_proj_wgrad = (
             _OutProjWgrad(m=dm, k=t, n=hd, dtype=e4, label="out_proj_wgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dw_o else None
@@ -4516,7 +4573,9 @@ class GatedAttentionBlockBwd(APIBase):
             cu_seqlens=self.cu_seqlens,
         )
         self._norm_bwd = _QkNormRopeBwd(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms, want_amax=True)
-        self._epilogue = _QuantEpilogue(g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms, grad_scaling=gs, n_alpha=2)
+        self._epilogue = _QuantEpilogue(
+            g, batch=b, seq_len=s, dtype=act, want_dw=self.need_dw_norms, grad_scaling=gs, n_alpha=2, margin_log2=self.grad_scale_margin_log2
+        )
         self._qkv_gate_wgrad = (
             _QkvGateWgrad(m=n, k=t, n=dm, dtype=e4, label="qkv_gate_wgrad", mma_tile_k_bytes=k64, out_dtype=act, alpha=True) if self.need_dw_qkvg else None
         )
@@ -4607,6 +4666,7 @@ class GatedAttentionBlockBwd(APIBase):
             n_alpha=2,
             own_amax=False,
             amax_src="partials",
+            margin_log2=self.grad_scale_margin_log2,
         )
         # 2b. (fp4 W_o only) the BLOCK quantization of dY the out-projection dgrad reads, right after the per-tensor quantize published
         #     scale_dy on this stream: MXFP4 -> the MX-rowwise e4m3 dY viewed [T, d_model / D, D] with its GEMM-canonical E8M0 blob (the
@@ -5313,6 +5373,44 @@ class GatedAttentionBlockBwd(APIBase):
             raise RuntimeError("call compile() before quant_scalars() (the scalar block is a region of the compiled carve)")
         self._check_workspace(workspace)
         return {name: self._scalar(workspace, name) for name in QUANT_SCALAR_SLOTS}
+
+    def update_quant_scales(self, spec: Union[QuantSpec, MxQuantSpec]) -> None:
+        """Re-point a COMPILED quantized backward's plan-time constants at ``spec`` without recompiling: ``self.quant = spec`` and
+        ``self._quant_vals`` re-resolved (:meth:`_quant_const_values`) -- the host floats the NEXT execute's prologue launch stores
+        into the scalar block from its kernel arguments (``QUANT_CONST_SLOTS``), stream-ordered by construction and with no device
+        write here.  So the SDPA operands ``q8 / k8 / v8`` are rebuilt at the forward's CURRENT ``scale_q / scale_k / scale_v``, B3's
+        ``og8`` at its ``scale_o``, and the GEMM alphas at its ``descale_h / descale_w_qkvg / descale_w_o`` -- the training-loop
+        recipe: the same ``spec`` the forward of that layer and step ran at, applied right before its backward's ``execute``
+        (``GatedAttentionBlockFwd.update_quant_scales`` is the forward half).  A CUDA graph captured BEFORE the call keeps the old
+        constants (they are kernel arguments of the captured launch); re-capture after a recalibration.
+
+        Typed refusals, before anything changes: a block declared without ``quant`` (``ValueError``); a spec of the other class
+        (``TypeError``: the two classes select different chains); a differing plan fact -- ``dtype``, and under MXFP8 ``block_size``
+        / ``w_qkvg_dtype`` / ``o_fp4`` -- (``ValueError`` naming the field: those select the kernels, the artifacts and the carve);
+        ``spec``'s own ``validate()`` exactly as the declaration applied it (a zero / inf / NaN scale is its own ``ValueError``);
+        a block not yet compiled (``RuntimeError``)."""
+        if self.quant is None:
+            raise ValueError(
+                "update_quant_scales() belongs to the quantized backward (quant=QuantSpec / MxQuantSpec): this block was declared without quant and "
+                "holds no plan-time constant to update"
+            )
+        if type(spec) is not type(self.quant):
+            raise TypeError(
+                f"update_quant_scales(): spec must be a {type(self.quant).__name__}, the class this block was declared with (QuantSpec and "
+                f"MxQuantSpec select different chains), got {type(spec).__name__}"
+            )
+        for name in ("dtype", "block_size", "w_qkvg_dtype", "o_fp4") if isinstance(self.quant, MxQuantSpec) else ("dtype",):
+            if getattr(spec, name) != getattr(self.quant, name):
+                raise ValueError(
+                    f"update_quant_scales(): {type(spec).__name__}.{name} is a plan fact (it selects the kernels, the artifacts and the carve): "
+                    f"declared {getattr(self.quant, name)!r}, got {getattr(spec, name)!r}; only the scales may change -- declare a new block for a "
+                    f"new {name}"
+                )
+        spec.validate()  # the declaration's own call: e5m2 codes a typed NotImplementedError, a non-positive scale a ValueError
+        if self._ws is None:
+            raise RuntimeError("call compile() before update_quant_scales(): the plan-time constants it re-resolves are resolved there")
+        self.quant = spec
+        self._quant_vals = self._quant_const_values()
 
     # -- compile ------------------------------------------------------------
 
@@ -6406,6 +6504,7 @@ def gated_attention_block_backward(
     w_qkvg_t_sf: Optional[torch.Tensor] = None,
     w_o_t: Optional[torch.Tensor] = None,
     w_o_t_sf: Optional[torch.Tensor] = None,
+    grad_scale_margin_log2: int = FP8_GRAD_SCALE_MARGIN_LOG2,
 ) -> TupleDict:
     """Allocate gradients + workspace, cache the compiled block, and run it.
 
@@ -6463,6 +6562,9 @@ def gated_attention_block_backward(
     declaration), their bytes never do.  ``w_o_t`` / ``w_o_t_sf`` (appended): the
     fp4 weight modes' transposed e2m1 ``W_o`` with its blob, required iff
     ``MxQuantSpec.o_fp4`` -- the same pass-through, the same key rule.
+    ``grad_scale_margin_log2`` (appended): the quantized backward's gradient-scale
+    margin, a declaration attribute like ``grad_scaling`` -- handed to the class
+    and part of the cache key (a different margin is a different compiled block).
     """
     need_dh = bool(saved.h.requires_grad)
     need_dw_qkvg = bool(w_qkvg.requires_grad)
@@ -6521,6 +6623,7 @@ def gated_attention_block_backward(
         # a wrong-typed quant misses the cache and reaches the class's typed decline (its key is its type name)
         (type(quant).__name__, dataclasses.astuple(quant)) if dataclasses.is_dataclass(quant) and not isinstance(quant, type) else (type(quant).__name__,),
         grad_scaling,
+        grad_scale_margin_log2,
         # the MXFP8 (and fp4) artifacts' PRESENCE (never their bytes): which of the six the caller handed over
         tuple(x is not None for x in (h_t, h_t_sf, w_qkvg_t, w_qkvg_t_sf, w_o_t, w_o_t_sf)),
     )
@@ -6550,6 +6653,7 @@ def gated_attention_block_backward(
             cu_seqlens=cu_seqlens,
             quant=quant,
             grad_scaling=grad_scaling,
+            grad_scale_margin_log2=grad_scale_margin_log2,
         )
         blk.check_support()
         blk.compile()
