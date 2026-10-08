@@ -189,7 +189,8 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
                        softmax_precision=None,
                        attn_scale_prefolded=False,
                        generate_stats=True,
-                       bshd=False):
+                       bshd=False,
+                       paged_nhd=False):
     # Compute padded dimensions for F8_128x4 scale factors
     s_q_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
@@ -215,13 +216,14 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
 
     # Q, K, V, O tensors: (b, h, s, d) dims, BSHD-physical strides for the draws only the
     # FROST MXFP8 engine serves (a block-scaled O, whose sf_o output has no backend lowering,
-    # and paged pools -- HND page pools for K/V) and on request (``bshd``: ExecConfig.bshd_layout,
+    # and paged pools -- HND page pools for K/V, or NHD [num_pages, page, H_kv, D] pools on
+    # ``paged_nhd``: ExecConfig.paged_nhd_pool) and on request (``bshd``: ExecConfig.bshd_layout,
     # the sweeps that assert FROST routing); BHSD-physical otherwise.
     bshd = bool(o_block_scale) or is_paged or bool(bshd)
     q_stride = (s_qo * h_q * d_qk, d_qk, h_q * d_qk, 1) if bshd else (h_q * s_qo * d_qk, s_qo * d_qk, d_qk, 1)
     o_stride = (s_qo * h_q * d_vo, d_vo, h_q * d_vo, 1) if bshd else (h_q * s_qo * d_vo, s_qo * d_vo, d_vo, 1)
-    k_stride = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1) if (bshd and not is_paged) else (h_k * s_kv_rows * d_qk, s_kv_rows * d_qk, d_qk, 1)
-    v_stride = (s_kv * h_v * d_vo, d_vo, h_v * d_vo, 1) if (bshd and not is_paged) else (h_v * s_kv_rows * d_vo, s_kv_rows * d_vo, d_vo, 1)
+    k_stride = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1) if (bshd and not is_paged) else ((s_kv_rows * h_k * d_qk, d_qk, h_k * d_qk, 1) if (is_paged and paged_nhd) else (h_k * s_kv_rows * d_qk, s_kv_rows * d_qk, d_qk, 1))
+    v_stride = (s_kv * h_v * d_vo, d_vo, h_v * d_vo, 1) if (bshd and not is_paged) else ((s_kv_rows * h_v * d_vo, d_vo, h_v * d_vo, 1) if (is_paged and paged_nhd) else (h_v * s_kv_rows * d_vo, s_kv_rows * d_vo, d_vo, 1))
     q = graph.tensor(
         uid=GraphFwdUid.q,
         dim=(b, h_q, s_qo, d_qk),
@@ -1044,6 +1046,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
             attn_scale_prefolded=prefolded,
             generate_stats=generate_stats,
             bshd=bshd_layout,
+            paged_nhd=bool(getattr(cfg, "paged_nhd_pool", False)),
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
@@ -1100,15 +1103,49 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
             return torch.cat(pool.chunk(nblocks, dim=0), dim=2)[:, :, :s_kv].contiguous()
 
         k_pool_fp8, sf_k_pool_ref, sf_k_d_swizzle, *_ = quantize_to_mxfp8(_to_pool(k_f32), num_pages, h_k, paged_block_size, d_qk, block_size, torch_itype, with_ref=not perf)
-        _, _, _, v_pool_fp8, sf_v_pool_ref, sf_v_s_swizzle = quantize_to_mxfp8(_to_pool(v_f32), num_pages, h_v, paged_block_size, d_vo, block_size, torch_itype, with_ref=not perf)
+        # V: optionally behind its OWN pool permutation -- pool slot v_slot[i] holds logical page i (= p*b + batch).  V is
+        # quantized in PHYSICAL slot order, so the plane-major SF bytes come out right for the physical pool and no byte
+        # surgery is needed (quantization is page-local: each page's values are the same in any slot).
+        v_slot = torch.arange(num_pages, device="cuda")
+        if getattr(cfg, "paged_distinct_v_table", False):
+            v_slot = torch.randperm(num_pages, generator=torch.Generator().manual_seed(int(cfg.rng_geom_seed or 0) + 7)).to("cuda")
+        v_pool_logical = _to_pool(v_f32)
+        v_pool_in = torch.empty_like(v_pool_logical)
+        v_pool_in[v_slot] = v_pool_logical
+        _, _, _, v_pool_fp8, sf_v_pool_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_pool_in, num_pages, h_v, paged_block_size, d_vo, block_size, torch_itype, with_ref=not perf)
         k_fp8_d = _to_dense(k_pool_fp8)
-        v_fp8_s = _to_dense(v_pool_fp8)
+        v_fp8_s = _to_dense(v_pool_fp8[v_slot])
         sf_k_d_ref = sf_v_s_ref = None
         if not perf:
             sf_k_d_ref = _to_dense(sf_k_pool_ref.reshape(num_pages, h_k, paged_block_size, d_qk)).reshape(b * h_k, s_kv, d_qk)
-            sf_v_s_ref = _to_dense(sf_v_pool_ref.reshape(num_pages, h_v, paged_block_size, d_vo)).reshape(b * h_v, s_kv, d_vo)
+            sf_v_s_ref = _to_dense(sf_v_pool_ref.reshape(num_pages, h_v, paged_block_size, d_vo)[v_slot]).reshape(b * h_v, s_kv, d_vo)
         block_table_gpu = torch.empty((b, 1, nblocks, 1), device="cuda", dtype=torch.int32)
         block_table_gpu.copy_(torch.arange(num_pages, device="cuda", dtype=torch.int32).reshape(nblocks, 1, b, 1).transpose(0, 2))
+        # The logical page id (K's slot) -> V's physical slot; the identity without the lever (one table bound twice).
+        block_table_v_gpu = v_slot.to(torch.int32)[block_table_gpu.long()] if getattr(cfg, "paged_distinct_v_table", False) else block_table_gpu
+        if getattr(cfg, "paged_nan_dead_pages", False):
+            # Dead pool pages (no per-batch length reaches them): NaN data, 0xFF (E8M0 NaN) scales -- the kernel promises
+            # TMA-OOB page -1 there (mirror of fp8.create_paged_container_and_block_table's opt-in poison).  The dense
+            # reference operands above are already extracted, so only the bound pools are poisoned.  K SF: one slab of
+            # h_k * (page / 128) F8_128x4 atom sets per page; V SF: D-plane-major ACROSS THE POOL, group (page*KH + head)*m + tile.
+            m = paged_block_size // 128
+            planes = ceil_div(d_vo, 128)
+            sfk_pages = sf_k_d_swizzle.view(torch.uint8).reshape(num_pages, -1)
+            sfv_groups = sf_v_s_swizzle.view(torch.uint8).reshape(planes, num_pages * h_v * m, -1)
+            assert sfk_pages.data_ptr() == sf_k_d_swizzle.data_ptr() and sfv_groups.data_ptr() == sf_v_s_swizzle.data_ptr(), "SF views must alias the bound bytes"
+            v_slot_list = v_slot.tolist()
+            for bi, L in enumerate(seq_len_kv_list):
+                for p in range(ceil_div(int(L), paged_block_size), nblocks):
+                    slot_k = p * b + bi
+                    slot_v = v_slot_list[slot_k]
+                    k_pool_fp8[slot_k] = float("nan")
+                    v_pool_fp8[slot_v] = float("nan")
+                    sfk_pages[slot_k] = 0xFF
+                    sfv_groups[:, slot_v * h_v * m : (slot_v + 1) * h_v * m] = 0xFF
+        if getattr(cfg, "paged_nhd_pool", False):
+            # NHD pools: the same [num_pages, H_kv, page, D] dims over (page, head)-major storage (generate_graph_fwd's strides).
+            k_pool_fp8 = k_pool_fp8.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+            v_pool_fp8 = v_pool_fp8.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
     else:
         k_fp8_d, sf_k_d_ref, sf_k_d_swizzle, k_fp8_s, sf_k_s_ref, sf_k_s_swizzle = quantize_to_mxfp8(k_f32, b, h_k, s_kv, d_qk, block_size, torch_itype, with_ref=not perf)
         v_fp8_d, sf_v_d_ref, sf_v_d_swizzle, v_fp8_s, sf_v_s_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_f32, b, h_v, s_kv, d_vo, block_size, torch_itype, with_ref=not perf)
@@ -1117,11 +1154,14 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
             # the per-(b, h) F8_128x4 scale planes are layout-independent.
             q_fp8_d, k_fp8_d, v_fp8_s = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q_fp8_d, k_fp8_d, v_fp8_s))
 
-    # Generate sink_token if needed
+    # Generate sink_token if needed (ExecConfig.sink_value pins one logit for every head: +3 dominant, -120 absent)
     sink_token_gpu = None
     if with_sink_token:
-        rng_sink = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed + 1000)
-        sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float32, device="cuda", generator=rng_sink) * 0.5
+        if getattr(cfg, "sink_value", None) is not None:
+            sink_token_gpu = torch.full((1, h_q, 1, 1), float(cfg.sink_value), dtype=torch.float32, device="cuda")
+        else:
+            rng_sink = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed + 1000)
+            sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float32, device="cuda", generator=rng_sink) * 0.5
 
     # Allocate output tensors
     if o_block_scale == 16:
@@ -1185,7 +1225,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
         variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = block_table_gpu
-        variant_pack[int(GraphFwdUid.v_block_table)] = block_table_gpu
+        variant_pack[int(GraphFwdUid.v_block_table)] = block_table_v_gpu
 
     # Execute
     workspace = torch.empty(max(graph_fwd.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
