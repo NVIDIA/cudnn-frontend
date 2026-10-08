@@ -12,6 +12,27 @@ special case.
 
 One block per (q_row, head, batch); the block's threads stride over d_v, and
 each thread walks the split axis in registers.
+
+Gate in the combine (``compile_ptr(gate=True)``, the dense half entry only): a
+split launch of a kernel that has no epilogue-gate seams -- the d256 decode
+tile -- carries the graph's ``mul(O_v, sigmoid(G))`` tail HERE.  The gate is
+applied to the fp32 MERGED value, before the single cast to the output dtype,
+with the arithmetic the gated prefill kernels use in their epilogue
+(``_common_blackwell.gate_epilogue_pairs``): ``h = acc * (inv_den / 2)`` and
+``O = h * tanh(g / 2) + h`` (one FMUL2, one MUFU.TANH per element, one FFMA2),
+the dead-row SELECT per element AFTER the fma (``sdpa-invariants.md`` section 2:
+never a multiply by zero, a gate value is never trusted on a dead row).  So the
+rounding convention is FROST's: ONE rounding, of ``O32 * sigmoid(G)``, exactly
+what the fused epilogue does -- a gated split plan and a gated unsplit plan of
+the same graph differ only by the summation order of the attention itself.  The
+unfused references round the merged O to the output dtype BEFORE the fp32 gate
+and round again after it (vLLM's split merge, and the gated attention block's
+torch reference, which gates the output-dtype O): two roundings, so they differ
+from this pass by up to one output ulp plus the approximate tanh.  LSE / Stats
+never see the gate (the partial LSEs are gate-free and the final one is their
+log-sum-exp).  The gate is read element-wise through the caller's BSHD strides
+(no layout constraint of its own; the engine rows keep the zero-copy rule the
+fused kernels need so one G declaration serves both paths).
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -28,6 +49,7 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
+from cudnn.frost.tile_dsl.pointwise import ffma2, fmul2, opaque_f32_zero
 from cudnn.frost.tile_dsl.tma import ld_global_v4
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
@@ -102,6 +124,11 @@ def _combine_kernel(
     # short buffer or a bad offset can never store outside the caller's bytes.
     ragged_o_cap: cutlass.Int32 = 0,
     ragged_lse_cap: cutlass.Int32 = 0,
+    # The gate G of the graph's ``mul(O_v, sigmoid(G))`` tail, [B, S_q, H, D] in
+    # the caller's strides (the dense placement only), applied to the fp32 merged
+    # value before the single cast -- see the module docstring.  None
+    # (None-specialized) is the plain reduction; its traced code is unchanged.
+    gate: Optional[cute.Tensor] = None,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx % cutlass.Int32(32)
@@ -191,6 +218,15 @@ def _combine_kernel(
         q_scale = cutlass.Float32(1.0)
         if cutlass.const_expr(scale_o is not None):
             q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+        # Gate in the combine: sigmoid's two constants fold into the scale
+        # (``h = acc * (inv_den / 2)``: exact, a power-of-two scaling of the
+        # plain output) and into the ``h * t + h`` fma; the 0.5 handed to the
+        # packed multiply must be opaque (a constant float into inline_ptx ICEs
+        # libNVVM).  Hoisted once per row, like the fused kernels do per tile;
+        # traced only on the gated entry, so the plain entries' code is unchanged.
+        if cutlass.const_expr(gate is not None):
+            inv_den_half = inv_den * cutlass.Float32(0.5)
+            gate_half = opaque_f32_zero() + cutlass.Float32(0.5)
         for cbase in cutlass.range(0, d_v, 128, unroll=1):
             d0 = cbase + lane * cutlass.Int32(4)
             if d0 < d_v:
@@ -249,6 +285,42 @@ def _combine_kernel(
                     acc2 = acc2 + w * v2
                     acc3 = acc3 + w * v3
                 outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
+                if cutlass.const_expr(gate is not None):
+                    # The gated prefill kernels' epilogue arithmetic, verbatim
+                    # (_common_blackwell.gate_epilogue_pairs): per pair one
+                    # FMUL2 (g / 2), two MUFU.TANH, one FFMA2 (h * t + h), on the
+                    # fp32 merged value; then the dead-row SELECT per element,
+                    # AFTER the fma -- a dead row is exactly 0 whatever G holds
+                    # (a NaN gate times the zero h would be NaN; a select is not).
+                    gv = cutlass.make_array_view(gate)
+                    g0 = cutlass.Float32(gv[batch, q_row, head, d0])
+                    g1 = zero
+                    g2 = zero
+                    g3 = zero
+                    if d0 + cutlass.Int32(1) < d_v:
+                        g1 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(1)])
+                    if d0 + cutlass.Int32(2) < d_v:
+                        g2 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(2)])
+                    if d0 + cutlass.Int32(3) < d_v:
+                        g3 = cutlass.Float32(gv[batch, q_row, head, d0 + cutlass.Int32(3)])
+                    h0 = acc0 * inv_den_half
+                    h1 = acc1 * inv_den_half
+                    h2 = acc2 * inv_den_half
+                    h3 = acc3 * inv_den_half
+                    s0, s1 = fmul2(g0, g1, gate_half, gate_half)
+                    s2, s3 = fmul2(g2, g3, gate_half, gate_half)
+                    t0 = cute.math.tanh(s0, approx=True)
+                    t1 = cute.math.tanh(s1, approx=True)
+                    t2 = cute.math.tanh(s2, approx=True)
+                    t3 = cute.math.tanh(s3, approx=True)
+                    y0, y1 = ffma2(t0, t1, h0, h1, h0, h1)
+                    y2, y3 = ffma2(t2, t3, h2, h3, h2, h3)
+                    outs = (
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y0.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y1.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y2.ir_value())),
+                        cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), y3.ir_value())),
+                    )
                 for i in cutlass.range_constexpr(4):
                     o_val = outs[i]
                     if cutlass.const_expr(amax_o is not None):
@@ -410,11 +482,12 @@ def _launch_combine(
     ragged_lse: Optional[cute.Tensor],
     ragged_divs: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     ragged_caps: Tuple[cutlass.Int32, cutlass.Int32],
+    gate: Optional[cute.Tensor],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    """One launch for both ABIs: dense placement (ragged tensors None) or the
+    """One launch for every ABI: dense placement (ragged tensors None) or the
     ragged-Q leg's placement at the offsets, bounded by the (O, Stats) packed
-    token capacities."""
+    token capacities; ``gate`` (dense placement only) is the gated entry's G."""
     B, H, SQ, D = problem_size
     # Lane l reads columns 4l..4l+3 of the compact fp32 partial rows as one
     # 16-byte load when d_v % 4 == 0 and the slab is 16-byte aligned; any other
@@ -440,6 +513,7 @@ def _launch_combine(
         cutlass.Int64(ragged_divs[2]),
         cutlass.Int32(ragged_caps[0]),
         cutlass.Int32(ragged_caps[1]),
+        gate,
     ).launch(
         grid=((SQ + ROWS_PER_BLOCK - 1) // ROWS_PER_BLOCK, H, B),
         block=[THREADS, 1, 1],
@@ -470,7 +544,35 @@ def _host_ptr(
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
-    _launch_combine(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+    _launch_combine(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, stream)
+
+
+@cute.jit
+def _host_ptr_gated(
+    o_partial_ptr: cute.Pointer,
+    lse_partial_ptr: cute.Pointer,
+    o_out_ptr: cute.Pointer,
+    lse_out_ptr: Optional[cute.Pointer],
+    problem_size: Tuple[int, int, int, int],
+    n_splits: cutlass.Int32,
+    o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    gate_ptr: cute.Pointer,
+    gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
+    stats_log2: cutlass.Constexpr[bool],
+    stream: _cuda_driver.CUstream = None,
+) -> None:
+    """:func:`_host_ptr` plus the gate: ``gate_ptr`` / ``gate_strides`` describe G
+    as a ``[B, S_q, H, D_v]`` view in BSHD stride order (like ``o_strides``), read
+    element-wise -- the dense placement's gate-in-combine ABI (a split launch of
+    a kernel without epilogue-gate seams, the d256 decode tile).  The dense
+    entry's positional ABI stays exactly what its callers pass."""
+    o_partial, lse_partial, o_out, lse_out = _ptr_operands(
+        o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
+    )
+    B, H, SQ, D = problem_size
+    gate = cute.make_tensor(gate_ptr, cute.make_layout((B, SQ, H, D), stride=gate_strides))
+    _launch_combine(o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), gate, stream)
 
 
 @cute.jit
@@ -532,7 +634,9 @@ def _host_ptr_quantized(
     scale_o = None
     if cutlass.const_expr(has_scale_o):
         scale_o = cute.make_tensor(scale_o_ptr, cute.make_layout((1,), stride=(1,)))
-    _launch_combine(o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), stream)
+    _launch_combine(
+        o_partial, lse_partial, o_out, lse_out, amax_o, scale_o, problem_size, n_splits, stats_log2, None, None, None, (1, 1, 1), (0, 0), None, stream
+    )
     if cutlass.const_expr(amax_o_ptr is not None and not has_scale_o and scale_o_ptr is not None):
         _unscale_amax_kernel(amax_o_ptr, scale_o_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
@@ -572,7 +676,22 @@ def _host_ptr_ragged(
     if cutlass.const_expr(ragged_lse_ptr is not None):
         ragged_lse = cute.make_tensor(ragged_lse_ptr, cute.make_layout((n_off,), stride=(1,)))
     _launch_combine(
-        o_partial, lse_partial, o_out, lse_out, None, None, problem_size, n_splits, stats_log2, ragged_q, ragged_o, ragged_lse, ragged_divs, ragged_caps, stream
+        o_partial,
+        lse_partial,
+        o_out,
+        lse_out,
+        None,
+        None,
+        problem_size,
+        n_splits,
+        stats_log2,
+        ragged_q,
+        ragged_o,
+        ragged_lse,
+        ragged_divs,
+        ragged_caps,
+        None,
+        stream,
     )
 
 
@@ -605,6 +724,8 @@ def compile_ptr(
     has_scale_o_input: bool = True,
     packed: bool = False,
     has_sink: bool = False,
+    gate: bool = False,
+    dtype_gate: Optional[str] = None,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -619,6 +740,10 @@ def compile_ptr(
     pointers; half and ragged entries keep their existing positional ABI.
     ``has_scale_o_input=False`` removes the scalar input and Amax unscale
     launch for MXFP8. Per-tensor FP8 retains both by default.
+    ``gate=True`` (dense half launches only; ``dtype_gate`` "f16" / "bf16" names
+    G's dtype) is the gate-in-combine entry: the dense ABI plus G's pointer and
+    its four BSHD strides appended -- see the module docstring for the
+    numerics it fixes.
     """
     if dtype_o not in ("f16", "bf16", "e4m3", "e5m2") or dtype_partial not in ("f16", "bf16", "f32"):
         raise ValueError("prepared split combine requires half/FP8 O and f16/bf16/f32 partials")
@@ -634,6 +759,12 @@ def compile_ptr(
         raise ValueError("sink-aware combine requires packed half partials")
     if ragged_i64 and not ragged:
         raise ValueError("ragged_i64 is a ragged specialization")
+    if gate and (ragged or quantized or packed):
+        raise ValueError("the gate-in-combine entry serves dense half split launches (no ragged placement, no quantized O, no packed partials)")
+    if gate and dtype_gate not in ("f16", "bf16"):
+        raise ValueError("the gate-in-combine entry needs dtype_gate 'f16' or 'bf16' (the gate G is a half tensor of O's shape)")
+    if dtype_gate is not None and not gate:
+        raise ValueError("dtype_gate is a gate=True specialization")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
     gmem = cute.AddressSpace.gmem
 
@@ -659,6 +790,10 @@ def compile_ptr(
         # dense entry's positional ABI stays exactly what its callers pass.
         off_t = cutlass.Int64 if ragged_i64 else cutlass.Int32
         entry, extra = _host_ptr_ragged, (P(off_t), P(off_t), P(off_t) if has_lse else None, (cutlass.Int64(1),) * 3, (cutlass.Int32(0),) * 2)
+    elif gate:
+        # The gate-in-combine entry appends G's pointer and BSHD strides; the
+        # dense entry's positional ABI stays exactly what its callers pass.
+        entry, extra = _host_ptr_gated, (P(_ELEM[dtype_gate]), (cutlass.Int64(0),) * 4)
     else:
         entry, extra = _host_ptr, ()
     return _compile_cached(
