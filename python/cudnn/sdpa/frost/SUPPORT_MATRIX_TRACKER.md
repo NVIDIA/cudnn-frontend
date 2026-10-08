@@ -90,8 +90,9 @@ three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
 SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
-operand; graph eligibility is unchanged. Synthesized KV-tail padding, conversion
-layouts and bias continue to decline runtime shape/stride overrides. Existing
+operand; graph eligibility is unchanged. Conversion layouts and bias continue to
+decline runtime shape/stride overrides; a mask-free `S_kv` off the KV tile takes them
+through the KV-tail mask (#1425). Existing
 conversion layouts use staged copies around a prepared compact plan;
 explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
@@ -472,8 +473,8 @@ with them; it pays when `B * H_kv` leaves SMs idle) and recombined by
 `split_combine_sm100`, which on the FP8 row also owns the `Amax_O` of the recombined O.
 The declared `paged_attention_max_seq_len_kv` only sizes that cost model — a maximum
 that is not a multiple of the 128-row KV tile (FlashInfer passes its true max verbatim,
-e.g. 4000) does not withhold the split, unlike a mask-free dense `S_kv`, which rides
-synthesized KV-tail padding the split cannot. Decode-shaped d128 units
+e.g. 4000) does not withhold the split, unlike a mask-free dense `S_kv` off the tile, which rides
+the KV-tail mask the split cannot. Decode-shaped d128 units
 (`S_q * PACK_G <= 128`, one decode tile's Q rowsᵈᵗ) launch one CTA per `(batch, packed
 head)` unit on the plain scheduler; the packed head holds `PACK_G` Q heads — the KV
 head's whole group when it divides the tile, its largest divisor that doesᵐ, a single Q
@@ -618,7 +619,7 @@ S_q <= 16; `config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS`) -- lower onto a swap-AB
 tile: KV tokens on the MMA M axis (128 keys per tile), the 16 Q rows on N, one
 cta_group::1 CTA per (KV-head group, batch, split), softmax reducing over TMEM
 lanes (4 warps per 16 Q columns), P^T through a swizzled SMEM tile, O^T in TMEM.
-Dense padded, dense unpadded (synthesized KV tail) and paged caches, every mask
+Dense padded, dense unpadded (KV-tail mask) and paged caches, every mask
 the d256 row serves (padding / top-left and bottom-right causal / SWA / right
 band, dense padded-Q trim), sink (dense), Stats natural or base-2, KV split
 partials for `split_combine_sm100`. THD, fp8/mxfp8 and `S_q * G > 16` stay on the
@@ -730,8 +731,8 @@ graph is declined rather than routed onto it at >2× zero-padding cost.
 MXFP8 uses the packed per-sequence tile-padded scale-factor layout.
 ⁴ Every SM100 / SM103 flavor carries the `SEQ_Q_LENS_PRESENT` epilogue trim (f16, per-tensor FP8 and MXFP8 alike, #1037).
 ⁵ Every forward kernel trims dense padded Q natively; there is no `dense_seq_q_trim` capability any more -- a graph with per-batch Q lengths compiles the trim specialization on every row.
-⁶ Served through the padded path with synthesized full-length KV lengths, or
-natively when the causal band covers the KV tail.
+⁶ Served through the KV-tail mask (the padded mask compiled against the scalar
+`S_kv`, no lengths buffer; #1425), or natively when the causal band covers the KV tail.
 ⁷ **d=64 is NATIVE on SM100/SM103 for every forward dtype.** `_SM100_FLAVORS`
 leads with `(64, 64)`, so `_pick_flavor(64, 64)` returns `(64, 64)`: an f16/bf16
 graph compiles `sm100/prefill_d128_f16.py`, a per-tensor FP8 graph
@@ -1587,10 +1588,10 @@ column was measured on `w2u1g-lc-0030` (cc 10.7) by
 `test_sdpa_fwd_{fp8,mxfp8}_sm100.py`, whose dense d192 cases stopped skipping on
 Rubin in the same commit — 31 passed, and the 18 that still skip are the
 PackGQA and THD families this line declines per-feature, not per-shape.
-ⁱˣ Served through the padded path with synthesized full-length KV lengths
-(`skv_tail_via_padding`). REQUIRED, not an optimization: with no mask the
-kernel's KV loop bound is a floor division, so an un-synthesized ragged `S_kv`
-would silently drop the tail tile.
+ⁱˣ Served through the KV-tail mask (`skv_tail_via_padding`: the padded mask
+compiled against the scalar `S_kv`, #1425). REQUIRED, not an optimization: with
+no mask the kernel's KV loop bound is a floor division, so an unmasked ragged
+`S_kv` would silently drop the tail tile.
 
 **Scheduler policy — `SCHED_LPT` now served on the f16 (256, 256) Rubin
 flavor; NATURAL elsewhere.**

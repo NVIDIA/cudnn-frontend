@@ -2199,20 +2199,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # OOB but only *masks* those columns on the padded / causal paths. A
         # ragged S_kv is safe when a padding mask carries the real lengths, or
         # when the causal diagonal provably covers the tail (kv >= S_kv implies
-        # kv > q for every query row). Otherwise the tail columns leak into
-        # the softmax and the output is silently wrong.
+        # kv > q for every query row). Otherwise the plan compiles the padded
+        # mask against the scalar S_kv (kv_tail_mask, #1425).
+        self._kv_tail_mask = False
         if int(s_kv) % _SM100_TILE_N != 0:
             # A right-widened band pushes the last unmasked column to
             # (S_q - 1) + R (top-left) or (S_kv - 1) + R (bottom-right), so the
             # KV tail is only provably masked when it stays below S_kv.
             _br = int(self.window_size_right or 0)
             causal_covers_tail = self.is_causal and ((self.causal_bottom_right and _br == 0) or (not self.causal_bottom_right and int(s_qo) + _br <= int(s_kv)))
+            self._kv_tail_mask = not (self.seq_kv_lens_present or causal_covers_tail)
             self._value_error_if(
-                not (self.seq_kv_lens_present or causal_covers_tail),
-                f"S_kv ({s_kv}) must be a multiple of {_SM100_TILE_N} unless a "
-                f"padding mask (seq_len_kv) is provided or the causal mask "
-                f"covers the KV tail — the tail is otherwise unmasked on "
-                f"SM100 DSL",
+                self._kv_tail_mask and (self.split_kv or 1) > 1,
+                f"S_kv ({s_kv}) is not a multiple of {_SM100_TILE_N}: split-KV needs a padding mask (seq_len_kv) or a causal mask covering the KV tail",
             )
 
         if self.scale_softmax is None:
@@ -2363,6 +2362,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             stats_log2=self.stats_log2 and (self.split_kv == 1 or self.packed_thd_split),
             seq_kv_lens_present=self.seq_kv_lens_present,
             seq_q_lens_present=self.seq_q_lens_present,
+            kv_tail_mask=getattr(self, "_kv_tail_mask", False),
             sched_policy=sched_policy,
             # The ragged-Q decode leg is a mode of the dense decode tile, not
             # the prefill tile's THD_VARLEN leg (mutually exclusive params).
@@ -2817,8 +2817,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
         Fixed by the compiled geometry (call after ``check_support()``); 0 when
         the path allocates nothing per execute. This is the api-level share of
-        a FROST executor's ``workspace_bytes`` (the engine lowering adds its
-        own chunks — synthesized seq_len_kv — on top; see
+        a FROST executor's ``workspace_bytes`` (see
         ``engines.lower_dsl_prefill``). When ``execute()`` is called WITHOUT a
         workspace, legacy standalone paths allocate their scratch internally.
         Prepared FP8 requires this workspace for standalone calls too: it

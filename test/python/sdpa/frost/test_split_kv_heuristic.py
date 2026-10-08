@@ -256,8 +256,8 @@ def _facts():
 
 def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     """A ragged S_kv on a skv_tail_via_padding row is served through the
-    padded kernel path (synthesized per-batch KV lengths) — the one path the
-    split cannot ride. The gate must mirror lower_dsl_prefill's predicate so
+    kernel's KV-tail mask (kv_tail_mask, #1425) — the one path the split
+    cannot ride. The gate must mirror the adapter's predicate so
     the plan is never listed, not declined at build."""
     from cudnn.sdpa import graph_analyzer as ga
 

@@ -240,6 +240,9 @@ class TemplateParams:
     # attn_scale < 0: BMM1 negates Q (tcgen05 a_negate), so the kernel's raw-score max, masks and exp2 run on -S at
     # |attn_scale| (#1435). APPEND-ONLY, default False.
     negate_scores: bool = False
+    # A dense S_kv off the KV tile with no mask covering the tail: compile the padded mask against the scalar
+    # S_kv, with no per-batch lengths buffer (MASK_PADDED without SEQ_KV_LENS_PRESENT; #1425).
+    kv_tail_mask: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -466,7 +469,7 @@ def _mask_flags_from(params: TemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.thd_varlen or params.seq_kv_lens_present:
+    if params.thd_varlen or params.seq_kv_lens_present or params.kv_tail_mask:
         flags |= MASK_PADDED
     return flags
 
@@ -2667,7 +2670,7 @@ def canonicalize_d192_lowering(
     window_right = params.window_right
 
     template_window_right = window_right
-    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
+    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present and not params.kv_tail_mask:
         # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
         # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
         # right band no sequence reaches.  The band is a compile-time
