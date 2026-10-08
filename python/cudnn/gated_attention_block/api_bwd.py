@@ -258,14 +258,15 @@ rounding of dO, the delta contract above).  The MXFP8 backward stays dense (belo
 the gradients are rounded at (a knob is performance-only -- the same function
 under any value).  ``FP8_SCALE_S_LOG2`` / ``FP8_GRAD_SCALE_MARGIN_LOG2`` are module
 constants for the same reason.  Declined (typed, at declaration, naming the
-attribute): an ``MxQuantSpec`` (the MXFP8 backward is a follow-up), e5m2 codes,
-an fp16 ``dy`` (the quantized backward is bf16), the record's ``h`` or the weights
-in the wrong dtype BOTH ways, and a geometry whose Q / K rebuild only
-the LDG norm + RoPE kernel can tile (the fused prologue runs the TMA kernel, whose
-``tile_rows`` must divide ``h_q``, be a multiple of ``h_kv`` and of its 4 warps --
-nothing in 1..16 does for ``h_q = 20`` MHA or ``h_q = 6`` over ``h_kv = 2``;
-declined by the prologue stage at ``check_support``, naming the LDG kernel, while
-the bf16 backward serves such a geometry through it).  There is NO ``B*S`` rule: the two
+attribute; an ``MxQuantSpec`` is no decline -- it selects the MXFP8 backward,
+below): e5m2 codes, an fp16 ``dy`` (the quantized backward is bf16), the record's
+``h`` or the weights in the wrong dtype BOTH ways, and a geometry whose Q / K
+rebuild only the LDG norm + RoPE kernel can tile (the fused prologue runs the TMA
+kernel, whose ``tile_rows`` must divide ``h_q``, be a multiple of ``h_kv`` and of
+its 4 warps -- nothing in 1..16 does for ``h_q = 20`` MHA or ``h_q = 6`` over
+``h_kv = 2``; declined by the prologue stage at ``check_support``, naming the LDG
+kernel, while the bf16 backward serves such a geometry through it).  There is NO
+``B*S`` rule: the two
 weight-gradient GEMMs contract over the token axis with MN-major e4m3 operands
 (an M-major A, an N-major B), and the TMA 16-byte contiguous-extent rule binds
 an operand's CONTIGUOUS axis only, so a ragged token count (S = 1000 at B = 1)
