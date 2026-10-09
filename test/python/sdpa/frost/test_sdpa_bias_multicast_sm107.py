@@ -513,17 +513,27 @@ _CASES = {
     "nkv8_S1024_b10_short_tail_and_padded": dict(b=10, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3),
     "nkv8_S1024_b8_causal": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3, causal=True),
     "nkv8_S1024_b8_2_stages": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, n_chunk=4, mode=3, stages=2),
-    "nkv8_S1000_tail_tile_b8": dict(b=8, h=2, h_kv=2, s_q=1000, s_kv=1000, n_chunk=4, mode=3),
     "nkv16_S2048_b6_causal_n2": dict(b=6, h=2, h_kv=2, s_q=2048, s_kv=2048, n_chunk=2, mode=3, causal=True),
     "head_broadcast_bias_S1024_b8": dict(b=8, h=4, h_kv=4, s_q=1024, s_kv=1024, bias="1", n_chunk=4, mode=3),
     "d64_nkv8_S1024_b8": dict(b=8, h=2, h_kv=2, s_q=1024, s_kv=1024, d=64, n_chunk=4, mode=3),
     "d64_nkv4_S512_b6_short_live_peer_causal": dict(b=6, h=2, h_kv=2, s_q=512, s_kv=512, d=64, n_chunk=4, mode=3, causal=True),
+    # the D 64 twin of the resident-block comparison: the pair item's 128-row block holds S_kv <= 384 at D 64 (sm107_bias_resident_s_kv_max),
+    # so the "where it fits" cell sits at S 384; the S 512 cell above runs the ring forms only
+    "d64_nkv3_S384_b6_short_live_peer_causal": dict(b=6, h=2, h_kv=2, s_q=384, s_kv=384, d=64, n_chunk=4, mode=3, causal=True),
     "pick_n_chunk_S896_b8": dict(b=8, h=2, h_kv=2, s_q=896, s_kv=896, mode=3),  # the heuristics' chunk pick (the pair at S_q % 256 != 0), the seam's form
 }
 
 
-def _case_inputs(case, dtype, *, kv_mask_p=None):
-    return _s13._case_inputs(case, dtype, kv_mask_p=kv_mask_p, table=_CASES)
+# Cells the multicast form DECLINES by its own contract (global lengths only): the harness serves a dense S_kv % 128 != 0 tail through the
+# padding path (per-batch lengths synthesised at build, test_sdpa_bias_sm107._build), which the form's typed decline refuses -- the cga1 ring
+# (bias_mode 2) serves the same cell.  Not in _CASES: a decline is pinned as a decline, never run as an oracle cell.
+_DECLINED_CASES = {
+    "nkv8_S1000_tail_tile_b8": dict(b=8, h=2, h_kv=2, s_q=1000, s_kv=1000, n_chunk=4, mode=3),
+}
+
+
+def _case_inputs(case, dtype, *, kv_mask_p=None, table=None):
+    return _s13._case_inputs(case, dtype, kv_mask_p=kv_mask_p, table=_CASES if table is None else table)
 
 
 def _run(q, k, v, kw, c, _pins, *, mode=None, stages=None, n_chunk=None):
@@ -580,14 +590,30 @@ def test_multicast_is_bitwise_the_cga1_ring(case, _pins):
 
 
 @requires_rubin
-@pytest.mark.parametrize("case", ["nkv3_S384_b8_even", "nkv4_S512_b8_even", "d64_nkv4_S512_b6_short_live_peer_causal"])
+@pytest.mark.parametrize("case", ["nkv3_S384_b8_even", "nkv4_S512_b8_even", "d64_nkv3_S384_b6_short_live_peer_causal"])
 def test_multicast_is_bitwise_the_resident_block_where_it_fits(case, _pins):
+    """Where the pair item's resident block holds S_kv (D 32: <= 768, D 64: <= 384 at the 128-wide tile), the multicast ring's O / Stats are
+    BITWISE the block's -- the same bias words through the same FFMA; only the staging differs."""
     c = _CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16)
     mcast = _run(q, k, v, kw, c, _pins, mode=_MCAST)
     _s13._check(mcast, ref)
     resident = _run(q, k, v, kw, c, _pins, mode=1)
     assert torch.equal(mcast["o"], resident["o"]) and torch.equal(mcast["stats"], resident["stats"]), f"{case}: the multicast ring differs from the block"
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_DECLINED_CASES))
+def test_multicast_declines_the_padded_dense_tail_the_cga1_ring_serves(case, _pins):
+    """A dense S_kv % 128 != 0 tail reaches the standalone adapter with per-batch lengths (the harness pads it), which the multicast form
+    declines TYPED (global lengths only: one kv-tile sequence for both CTAs of the cluster); the cga1 ring (bias_mode 2) serves the very
+    same inputs and matches the fp64 oracle."""
+    c = _DECLINED_CASES[case]
+    q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, table=_DECLINED_CASES)
+    with pytest.raises((NotImplementedError, RuntimeError), match=r"global lengths|per-batch lengths|no unsplit"):
+        _run(q, k, v, kw, c, _pins, mode=_MCAST)
+    ring = _run(q, k, v, kw, c, _pins, mode=2)
+    _s13._check(ring, ref)
 
 
 @requires_rubin
