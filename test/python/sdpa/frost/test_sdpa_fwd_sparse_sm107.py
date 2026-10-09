@@ -264,6 +264,18 @@ def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged):
     assert (b.template_params().bottom_right, b.template_params().qsa_list_per_sequence) == (True, False)
 
 
+def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
+    """A negative attn_scale is SERVED by the sparse core, not declined: the adapter keeps the sign (``scale`` is what the kernel
+    multiplies every raw score by before its column max) and never raises the dense line's ``TemplateParams.negate_scores``
+    (BMM1 negating Q at |scale|), which the sparse body does not consume -- so neither path drops the sign.  The Rubin cell
+    ``test_a_negative_attn_scale_is_served_by_the_signed_scale`` runs the function; this is the host half of that claim."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    a = SparseGqaFwdDslSm107(**_operands(), scale=-0.0625)
+    assert a.check_support() and a.scale == -0.0625
+    assert a.template_params().negate_scores is False, "the sparse adapter passes the signed scale; negate_scores is the dense line's"
+
+
 @pytest.mark.parametrize(
     "mutate, exc, word",
     [
@@ -873,10 +885,10 @@ def _check(outs, ref_o, ref_lse):
     return max_o, max_lse
 
 
-def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=True, seed=0):
+def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=True, seed=0, scale=None):
     q, k, v, g = _inputs(B, S, H, KH, dtype, seed)
     ids, lens = _lists(list_kind, B, S, top_k, g, kv_lens)
-    scale = 1.0 / math.sqrt(D)
+    scale = (1.0 / math.sqrt(D)) if scale is None else float(scale)  # appended: a cell may pass the SIGNED scale it wants served
     outs = _launch(q, k, v, ids, lens if block_lens else None, kv_lens, top_k, scale)
     ref_o, ref_lse = _reference(q, k, v, ids, lens if block_lens else None, kv_lens, scale, top_k)
     return _check(outs, ref_o, ref_lse)
@@ -1307,6 +1319,25 @@ def test_small_top_k_lists(top_k, block_lens):
     """``CFG.BLOCK_TOPK`` in {4, 64}: a 16-B id row (one quad per tile), a random subset per row; with and without the count."""
     max_o, max_lse = _run_cell(B=1, S=300, H=24, KH=2, dtype=torch.bfloat16, top_k=top_k, list_kind="shuffled", block_lens=block_lens)
     print(f"\ntop_k={top_k} block_lens={block_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_a_negative_attn_scale_is_served_by_the_signed_scale(dtype):
+    """``attn_scale = -1 / sqrt(D)``: the kernel multiplies every raw score by the SIGNED scale before the column max, so the
+    function is the reference's softmax over the negated scores within the module's budget -- an ACCEPT cell, not a decline (the
+    dense line serves the same request through ``negate_scores``; the sparse adapter passes the sign through).  Teeth: the same
+    operands at +scale give a different O, so the sign provably reached the kernel."""
+    scale = -1.0 / math.sqrt(D)
+    max_o, max_lse = _run_cell(B=1, S=300, H=24, KH=2, dtype=dtype, top_k=512, list_kind="shuffled", seed=11, scale=scale)
+    q, k, v, g = _inputs(1, 300, 24, 2, dtype, 11)
+    ids, lens = _lists("shuffled", 1, 300, 512, g)
+    ((o_neg, lse_neg),) = _launch(q, k, v, ids, lens, None, 512, scale, launches=1)
+    ((o_pos, lse_pos),) = _launch(q, k, v, ids, lens, None, 512, -scale, launches=1)
+    assert float((o_neg.float() - o_pos.float()).abs().max()) > 10 * ATOL and not torch.equal(lse_neg, lse_pos), "the sign must reach the kernel"
+    print(
+        f"\nnegative attn_scale {dtype}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} (budget {ATOL}); |O(-s) - O(+s)| {float((o_neg.float() - o_pos.float()).abs().max()):.4f}"
+    )
 
 
 @requires_rubin

@@ -292,6 +292,9 @@ class SparseGqaFwdDslSm107:
         # Q's dtype at its own (batch, seq, head) strides -- validated in check_support, compiled in as TemplateParams.epilogue_gate.
         self.gate = epilogue_gate
         self.top_k, self.block_size = int(top_k), int(block_size)
+        # The softmax scale is handed to the kernel SIGNED (as scale x log2 e): the body multiplies every raw score by it BEFORE the
+        # column max, so a negative attn_scale is served as is -- the dense line's TemplateParams.negate_scores (BMM1 negates Q and
+        # the softmax runs at |scale|) is never raised by this adapter and the sparse body does not consume it.
         self.scale = (1.0 / math.sqrt(_D)) if scale is None else float(scale)
         self.stats_log2 = bool(stats_log2)
         # The paged read (appended): k / v are page pools, block_table the (B, max_pages) table, page_size the pool's tokens
