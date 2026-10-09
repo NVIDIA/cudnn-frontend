@@ -4341,10 +4341,10 @@ _D192_MXFP8_KEYLESS_ARMS = [("half", True, False), ("half", True, True), ("float
 @pytest.mark.parametrize("precision, prefolded, with_stats", _D192_MXFP8_KEYLESS_ARMS)
 def test_mxfp8_d192x128_prefolded_scale_keeps_the_keyless_row_select(precision, prefolded, with_stats, causal_br, window_left, n_keyless):
     """Under the pre-folded scale a fully-masked KV tile leaves the raw row max exactly at the finite mask sentinel
-    (== NEG_INF), so the online-max bootstrap re-fires on every consecutive keyless tile (alpha = 0; P = exp2(0) = 1,
-    also through the fused FHADD2 of NEG_INF - NEG_INF).  Those rows must be overridden by the correction warp's
-    keyless geometry select -- O exactly 0, LSE exactly -inf -- with every live row of the same CGA tile still at the
-    oracle (no NaN residue).  Both keyless shapes the dense d192x128 kernel can form, on the fused build, the
+    (== NEG_INF); the running-max step selects such a tile out of the row's state on every consecutive keyless tile
+    (total_max kept at the sentinel, alpha = 1, a shift of 0 -> P = 0, also through the fused FHADD2 arm), so a keyless
+    row ends at (NEG_INF, 0).  Those rows must be overridden by the correction warp's keyless geometry select -- O exactly
+    0, LSE exactly -inf -- with every live row of the same CGA tile still at the oracle (no NaN residue).  Both keyless shapes the dense d192x128 kernel can form, on the fused build, the
     Stats-unfused HALF build and the FLOAT fold build."""
     import math
 
@@ -4391,6 +4391,45 @@ def test_mxfp8_d192x128_prefolded_scale_keeps_the_keyless_row_select(precision, 
         assert torch.isneginf(lse[:, :, keyless]).all(), "keyless rows publish LSE = -inf"
         assert torch.isfinite(lse[:, :, live]).all(), "unwritten LSE rows"
         lse_err = (lse[:, :, live].double() - ref_lse[:, :, live]).abs().max().item()
+        assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+@pytest.mark.parametrize(
+    "precision, prefolded", [("float", False), ("half", False), ("half", True), ("float", True)], ids=["float", "half", "half+fold", "float+fold"]
+)
+def test_mxfp8_d192x128_masked_leading_tile_keeps_rows_with_later_keys_finite(precision, prefolded, with_stats):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys, on the d192x128 MXFP8 kernel (the d128
+    MXFP8 body): top-left causal with a 34-key band at S = 256 (rows 161..255: no key in tile 0, 34 keys in tile 1) at
+    attn_scale 1, on both chains and both exponent arms.  The scaled chain clamps the tile max to the finite sentinel and the
+    fold keeps the raw one, so both took the sentinel as the running max and published P = 1 per masked column (also through
+    the fused FHADD2 arm), wiped only by alpha = 0 at the next live tile; the running-max step now selects the dead tile out of
+    the state (total_max kept, alpha = 1, P = 0).  All-ones operands: a flat softmax (O = V exactly) on every live row, the
+    float64 oracle of the dequantized inputs each chain saw (Stats within 1e-4 natural)."""
+    import math
+    from unittest.mock import patch
+
+    import torch
+
+    _requires_cc107()
+    b, hq, hkv, s, d_qk, d_v = 1, 8, 2, 256, 192, 128
+    attn_scale = 1.0
+    with patch.object(torch, "randn", side_effect=lambda *a, **k: torch.ones(*a, **k)):
+        (q8, sfq, dq), (k8, sfk, dk), (v8, sfv, dv) = _mxfp8_prefold_inputs(b, hq, hkv, s, d_qk, d_v, attn_scale * math.log2(math.e) if prefolded else 1.0)
+    _, out, lse = _run_mxfp8_d192x128_levers(
+        q8, k8, v8, sfq, sfk, sfv, precision=precision, prefolded=prefolded, with_stats=with_stats, attn_scale=attn_scale, is_causal=True, window_size_left=33
+    )
+    masked = _dense_mask(s, s, causal=True, window_left=33)
+    ref, ref_lse = _mxfp8_lever_reference(dq, dk, dv, hq, hkv, math.log(2.0) if prefolded else attn_scale, masked)
+    assert torch.isfinite(ref_lse).all(), "geometry: every row keeps 34 keys"
+    assert torch.isfinite(out).all(), f"{int((~torch.isfinite(out)).sum())} non-finite / unwritten O cells"
+    scale = ref.abs().max().item()
+    err = (out.double() - ref).abs().max().item()
+    assert err <= 0.1 * scale, f"O max err {err} vs oracle (scale {scale})"
+    if with_stats:
+        assert torch.isfinite(lse).all(), f"{int((~torch.isfinite(lse)).sum())} non-finite / unwritten LSE rows"
+        lse_err = (lse.double() - ref_lse).abs().max().item()
         assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
@@ -4451,9 +4490,9 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             {},
             2,
             1,
-            "current_max = cute.math.max(max_a, max_b)\n",
+            "current_max = raw_max\n",
             "reg_S_a = reg_S_a - new_total_max",
-            "current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)",
+            "current_max = cute.math.max(raw_max * scale_log2, NEG_INF)",
             "reg_S_a = reg_S_a * scale_log2 - new_total_max",
         ),
         (
