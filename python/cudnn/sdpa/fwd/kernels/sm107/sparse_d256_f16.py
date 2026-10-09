@@ -50,8 +50,9 @@ WARP MAP (16 warps = 512 threads; every warpgroup is role-homogeneous because ``
     warp 12     WG3    MMA issue (+ tmem_alloc / dealloc once per CTA): 4 commits per tile (s_full, kv_empty[K], bmm2_done,
                        kv_empty[V]) + 1 per item (q_empty)
     warp 13     WG3    TMA-LDG: Q^T(i+1) (4 subtiles, Q_TX_BYTES = the BOX bytes), the BLOCK_TOPK x 4 B ids bulk copy of
-                       item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; drains mb_q_empty /
-                       mb_ids_empty / mb_gate_empty at exit
+                       item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; exit drains PER ARM:
+                       mb_ids_empty x STAGES_IDS always; ungated mb_q_empty x STAGES_Q; gated mb_gate_empty x (STAGES_GATE + 1)
+                       (every mb_q_empty commit is consumed by its item's gate load -- nothing of row 2 is left to drain)
     warp 14     WG3    scheduler (scheduler_warp_loop for BSHD; the persistent claim-counter form for THD) -- never credits
     warp 15     WG3    spare: passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one in the body)
 
@@ -88,7 +89,10 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                          Q_TX_BYTES = Q_BOX_ROWS x TILE_K x BPE = G x 512 B (6144 at G=12; the BOX, never the 8 KiB slot)
                                                                                                         1 == 1       MMA before the item's first BMM1     0      q_state(2), once per item
     2  mb_q_empty[2]        MMA_COMMIT   warp 12, arrive(cta_group=1, pred=elect_p) once per item after the item's LAST BMM1
-                                                                                                        1 == 1       warp 13 before gate(i) / Q(i+2)      1      per item; drained at exit by warp 13
+                                                                                                        1 == 1       warp 13 before gate(i) / Q(i+2)      1 | 0  per item.  UNGATED: the pre-armed qe_state (start 1) waits
+                                                                                                                                                                 before Q(j), the last STAGES_Q commits drained at exit.  GATED: the
+                                                                                                                                                                 wait-then-arrive qg_state (start 0) consumes commit i before gate(i);
+                                                                                                                                                                 n commits, n waits -- no drain (the slot's WAR gate for Q(i+2) is row 12)
     3  mb_ids_full[2]       TMA_LOAD     warp 13, arrive(n_bytes=IDS_TX_BYTES, pred=elect_sync()); bulk_copy(sIds[slot], block_ids[item_row], IDS_TX_BYTES)
                                          IDS_TX_BYTES = BLOCK_TOPK x 4 (a 16-B multiple); the copy runs for EVERY item, dead ones included
                                          (item_row = the token's flat row, or the SEQUENCE under CFG.LIST_PER_SEQUENCE: one row copied by every item of it)
