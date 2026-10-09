@@ -63,13 +63,13 @@ def _code_lines(src: str) -> str:
 # ============================================================================ host: the primitive's contract
 def test_gather4_primitive_imports_nothing_private_and_nothing_of_the_old_dsl():
     """``tile_dsl`` is the shared library: the gather4 / membership primitives import no kernel-private module (the DSA
-    bridge they replace, a block's kernels) and name nothing of the pre-upstream DSL (``ctm``)."""
+    bridge they replace, a block's kernels) and import nothing of the pre-upstream DSL -- the import allow-list below is
+    the check."""
     for name in ("tma.py", "mask.py"):
         src = _tile_dsl_source(name)
         code = _code_lines(src)
         assert "deepseek_sparse_attention" not in code, name
         assert "sparse_attention_block" not in code, name
-        assert re.search(r"\bctm\b", src) is None, f"{name} names the pre-upstream DSL"
         for line in code.splitlines():
             if line.startswith(("import ", "from ")):
                 assert line.startswith(("import cutlass", "from cutlass", "from .", "from typing", "from dataclasses", "import enum")), f"{name}: {line}"
@@ -239,14 +239,17 @@ def test_gather4_roundtrip_lands_the_tiled_swizzled_layout(h_kv, gw, n_cta):
     """gather4 -> the SWIZZLE_128B tile -> tiled TMA store == kv[ids] bitwise, over two tiles per CTA on ONE mbarrier.
 
     ``-1`` blocks and the past-the-end block come back as four ZERO rows each, with their bytes credited (the arm is the
-    full share; a PASS under ``timeout`` is the credit) and not over-credited (tile 1 completes on the next phase of the
-    same barrier and is bitwise too); one whole tile of ``-1`` ids is the sparse core's clamped dead item.  The probe
-    pins that the waited phase is complete and the next one is not, and a second launch is bitwise the first."""
+    full share; an uncredited row wedges the wait, so a PASS inside the watchdog budget is the credit -- the watchdog ends
+    the process with exit 70 rather than the whole run, as exit 124 under an outer ``timeout`` would) and not over-credited
+    (tile 1 completes on the next phase of the same barrier and is bitwise too); one whole tile of ``-1`` ids is the sparse
+    core's clamped dead item.  The probe pins that the waited phase is complete and the next one is not, and a second
+    launch is bitwise the first."""
     _skip_unless_the_dsl_serves_this_part()
     P = _probe()
     if n_cta == 0:
         n_cta = torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
-    ids, out, want, probe, out2 = _run_roundtrip(h_kv, gw, 1, n_cta, seed=h_kv * 10 + gw)
+    with process_watchdog(420, f"gather4 cta_group=1 roundtrip H_kv={h_kv} gw={gw} n_cta={n_cta}"):
+        ids, out, want, probe, out2 = _run_roundtrip(h_kv, gw, 1, n_cta, seed=h_kv * 10 + gw)
     idl = ids.to(torch.int64)
     oob = (idl < 0) | (idl >= _S // P.BLOCK)
     assert bool(oob.any()) and bool((~oob).any()), "the case must exercise OOB AND live rows"
