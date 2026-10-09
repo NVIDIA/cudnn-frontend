@@ -359,6 +359,37 @@ def sm107_bias_preload_chunks(tile_n: int) -> int:
     return SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N.get(int(tile_n), 1)
 
 
+# The padded TAIL form of the PLAIN padded body on the small tiles (TemplateParams.padded_tail_form; MASK_FLAGS == MASK_PADDED alone):
+# 0 = the legacy form -- the tail kv tile runs the SOFTWARE-max masked body as a SECOND loop beside the HW-max body, so the 128-wide
+# rendering carries two full softmax bodies per warp group (4139 vs 2776 SASS instructions on the d32 bf16 rendering, HOST
+# trace-compile for sm_107a) and outgrows the per-SM instruction cache -- the padding leg's measured pathology (S 217 plain 25.9 us vs
+# 15.4 for the DENSE S 256 cell and 19.6 for the same shape WITH a kv_mask, whose -inf body is one body); 1 = the PRE-MASKED tail --
+# one loop, the HW-max body on every tile, and on the tail tile the softmax warp first rewrites its sub-tile's out-of-range S
+# columns as -inf in TMEM (a plain load, the bit-word PADDED mask, a store, one tcgen05.wait::st) so the fused max load observes
+# them masked.  Default 0 until the A/B on an exclusive Rubin GPU; a flip is a commit with the numbers.
+SM107_PADDED_TAIL_FORM_DEFAULT = 0
+PADDED_TAIL_FORMS = frozenset({0, 1})
+# PRIVATE, process-local sweep seam (the ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` rules: ``monkeypatch.setattr`` in a test or a sweep driver
+# that resets it to None; never a plan path, an import or a config): pins the padded tail form a knob-less ELIGIBLE plan gets.
+_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm107_padded_tail_form_pick(
+    d_flavor: int, *, padded: bool, has_bias: bool, has_kv_mask: bool, causal: bool = False, swa: bool = False, request: Optional[int] = None
+) -> int:
+    """The ``TemplateParams.padded_tail_form`` of a plan on the Rubin small tiles: 0 off the eligible set (a dense S_kv at a tile
+    multiple, a bias or a kv_mask -- whose -inf body is ONE body already -- a causal / SWA band, the d128 flavor); on it ``request``
+    when the caller made one (the adapter's ``padded_tail_form=``, validated there: honoured or declined, never degraded), else the
+    sweep seam, else :data:`SM107_PADDED_TAIL_FORM_DEFAULT`."""
+    if not padded or has_bias or has_kv_mask or causal or swa or int(d_flavor) not in (32, 64):
+        return 0
+    if request is not None:
+        return int(request)
+    if _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS is not None:
+        return int(_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS)
+    return SM107_PADDED_TAIL_FORM_DEFAULT
+
+
 def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: bool, padded: bool = False, request: Optional[int] = None, domain=None) -> int:
     """The ``TemplateParams.tile_n`` a knob-less plan on the Rubin 32- / 64-wide tiles gets (the table above): ``request`` when the
     caller made one (the ``TILE_N`` knob / the adapter's ``tile_n=``: honoured or declined by the row / adapter, never degraded);
@@ -1106,6 +1137,11 @@ class _CfgSm107:
 
     # --- graph-derived features
     MASK_FLAGS: int = MASK_NONE
+    # The padded tail form (TemplateParams.padded_tail_form; the f16/bf16 small tiles' PLAIN padded body, MASK_FLAGS == MASK_PADDED
+    # alone): 0 = the legacy second (software-max) body for the tail kv tile, 1 = the pre-masked tail (one HW-max body; the tail
+    # tile's out-of-range S columns rewritten as -inf in TMEM before the fused max load).  Every kernel seam folds on
+    # cutlass.const_expr(CFG.PADDED_TAIL_FORM == 1); the factory refuses 1 off the eligible set (sm107_padded_tail_form_pick).
+    PADDED_TAIL_FORM: int = 0
     WINDOW_LEFT: int = 0
     WINDOW_RIGHT: int = 0
     BOTTOM_RIGHT: int = 0
@@ -1517,6 +1553,16 @@ def _validate_masks(cfg, flavor: str) -> None:
                 not (cfg.THD_VARLEN and not cfg.SEQ_KV_LENS_PRESENT),
                 f"{flavor}: THD/varlen must force SEQ_KV_LENS_PRESENT=1, or every sequence attends the whole pack",
             ),
+            (
+                not (
+                    int(getattr(cfg, "PADDED_TAIL_FORM", 0)) == 1
+                    and (cfg.MASK_FLAGS != MASK_PADDED or int(getattr(cfg, "BIAS_MODE", 0)) or int(getattr(cfg, "KV_MASK_FORM", 0)))
+                ),
+                f"{flavor}: PADDED_TAIL_FORM=1 (the pre-masked tail) needs MASK_FLAGS == MASK_PADDED alone and no bias / kv_mask -- its single HW-max "
+                f"loop has no masked segment for a band, and the -inf arms are one body already (got MASK_FLAGS={cfg.MASK_FLAGS}, "
+                f"BIAS_MODE={getattr(cfg, 'BIAS_MODE', 0)}, KV_MASK_FORM={getattr(cfg, 'KV_MASK_FORM', 0)}); a band's masked tail silently kept "
+                f"would read -inf on no column and the HW max would see the padding",
+            ),
         ]
     )
 
@@ -1812,6 +1858,18 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
                 f"K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} ({SMEM_USABLE_BYTES // 1024} KiB usable)"
             )
     mask_flags, win_l, win_r, bottom_right, has_sink = _band_fields(params)
+    # The padded tail form (TemplateParams.padded_tail_form, appended; read through getattr so a record without the field renders the
+    # legacy tail body): the pre-masked tail serves the f16/bf16 small tiles' PLAIN padded body only -- a band has masked segments on
+    # both sides, the bias / kv_mask arms run the -inf body (one body already), the d128 flavor keeps its own rendering.
+    padded_tail_form = int(getattr(params, "padded_tail_form", 0))
+    if padded_tail_form not in PADDED_TAIL_FORMS:
+        raise ValueError(f"{flavor}: padded_tail_form must be 0 (the legacy tail body) or 1 (the pre-masked tail); got {padded_tail_form}")
+    if padded_tail_form == 1 and (mask_flags != MASK_PADDED or bias_mode or kv_mask_form or tile_k > 64 or mxfp8 or params.dtype_qkv <= _DTYPE_E5M2):
+        raise ValueError(
+            f"{flavor}: padded_tail_form=1 (the pre-masked tail) is wired on the f16/bf16 32- / 64-wide tiles' PLAIN padded body only "
+            f"(MASK_FLAGS == MASK_PADDED alone, no bias / kv_mask); got MASK_FLAGS={mask_flags}, bias_mode={bias_mode}, kv_mask_form={kv_mask_form}, "
+            f"TILE_K={tile_k}, dtype_qkv={params.dtype_qkv}"
+        )
     cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
     if tile_k <= 64:
         # The small tiles are the f16/bf16 kernel's: the quantized d128 files keep TILE_K = 128 (their k_dim / SF geometry
@@ -1855,6 +1913,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         CORRECTION_REGS=88,
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         MASK_FLAGS=mask_flags,
+        PADDED_TAIL_FORM=padded_tail_form,
         WINDOW_LEFT=win_l,
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,

@@ -69,7 +69,6 @@ def test_tile_n_and_kv_mask_form_constants_are_shared_by_row_adapter_and_factory
     ring halves in bytes) -- the budgets every row / adapter gate asks at TILE_N 128 are therefore conservative at 64."""
     import cudnn
     from cudnn.sdpa.fwd import config_sm107 as c
-    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     caps = _caps()
     assert caps.tile_ns_by_d_shape == c.SM107_TILE_NS_BY_D_SHAPE == (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
@@ -873,3 +872,205 @@ def test_non_16_byte_outer_strides_are_typed_declines_on_real_graphs():
         names, ours = _frost_plans(g)
         assert not ours, names
         raise cudnn.cudnnGraphNotSupportedError("no FROST plan for an additive vector at S_kv 100")
+
+
+# --------------------------------------------------------------------------- the PLAIN padded body's tail form (TemplateParams.padded_tail_form)
+#
+# The padding leg's measured pathology: at TILE_N 128 the padded PLAIN rendering runs the tail kv tile through a SECOND, software-max
+# softmax body beside the HW-max body (two full bodies per warp group -- 4139 vs 2776 SASS instructions on the d32 bf16 rendering, over
+# the per-SM instruction-cache cliff), so an S_kv off the tile multiple costs MORE than the dense next size up and more than the same
+# shape WITH a kv_mask (whose -inf body is one body).  Form 1 = the pre-masked tail: ONE loop with the HW-max body, the tail tile's
+# out-of-range S columns rewritten as -inf in TMEM before the fused max load.  The pins: the eligibility (one arithmetic for the
+# config pick, the factory and the adapter), the typed declines, the rendering (one body: the dense rendering's exp count, no
+# software row max, the bit-word pre-mask, no new spills), and the GPU cells against the fp64 oracle and the legacy form.
+
+
+def test_padded_tail_form_pick_is_one_arithmetic_with_the_factory():
+    """``sm107_padded_tail_form_pick`` returns 0 off the PLAIN padded small-tile body (dense, a bias, a kv_mask, a band, d128) whatever
+    the request or the seam say; on it the request wins over the seam, the seam over the default; and the factory refuses form 1 on
+    exactly the shapes the pick returns 0 for (a band, a bias, a kv_mask, the d128 flavor) while rendering form 0 / 1 on the eligible one."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg_mod
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import (
+        PADDED_TAIL_FORMS,
+        SM107_PADDED_TAIL_FORM_DEFAULT,
+        make_cfg_d32,
+        make_cfg_d64,
+        make_cfg_d128,
+        sm107_padded_tail_form_pick,
+    )
+
+    assert SM107_PADDED_TAIL_FORM_DEFAULT in PADDED_TAIL_FORMS
+    for d in (32, 64):
+        assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False) == SM107_PADDED_TAIL_FORM_DEFAULT
+        assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False, request=1) == 1
+        assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False, request=0) == 0
+        for off in (dict(padded=False), dict(has_bias=True), dict(has_kv_mask=True), dict(causal=True), dict(swa=True)):
+            kw = dict(padded=True, has_bias=False, has_kv_mask=False)
+            kw.update(off)
+            assert sm107_padded_tail_form_pick(d, request=1, **kw) == 0, (d, off)
+    assert sm107_padded_tail_form_pick(128, padded=True, has_bias=False, has_kv_mask=False, request=1) == 0
+    saved = cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS
+    try:
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 1
+        assert sm107_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False) == 1
+        assert sm107_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False, request=0) == 0
+        assert sm107_padded_tail_form_pick(32, padded=False, has_bias=False, has_kv_mask=False) == 0
+    finally:
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved
+    base = dict(cta_mma=1, dtype_qkv=2, seq_kv_lens_present=True)
+    for form in (0, 1):
+        cfg, _ = make_cfg_d32(TemplateParams(**base, padded_tail_form=form))
+        assert cfg.PADDED_TAIL_FORM == form and cfg.MASK_FLAGS == 1
+    cfg, _ = make_cfg_d64(TemplateParams(**{**base, "cta_mma": 2}, padded_tail_form=1))
+    assert cfg.PADDED_TAIL_FORM == 1
+    assert make_cfg_d32(TemplateParams(cta_mma=1, dtype_qkv=2))[0].PADDED_TAIL_FORM == 0  # a record without the field renders the legacy form
+    for bad in (
+        dict(cta_mma=1, dtype_qkv=2, padded_tail_form=1),  # dense: no padded tail
+        dict(**base, window_right=0, padded_tail_form=1),  # a causal band
+        dict(**base, bias_mode=1, padded_tail_form=1),  # the bias arm (-inf body)
+        dict(**base, kv_mask_form=1, padded_tail_form=1),  # the kv_mask arm (-inf body)
+        dict(**base, padded_tail_form=2),  # not a form
+    ):
+        with pytest.raises(ValueError, match="padded_tail_form"):
+            make_cfg_d32(TemplateParams(**bad))
+    with pytest.raises(ValueError, match="padded_tail_form"):
+        make_cfg_d128(TemplateParams(**base, padded_tail_form=1))
+
+
+_PADDED_TAIL_ADAPTER_CELLS = [
+    # (name, adapter kwargs, accept?, the TemplateParams.padded_tail_form of the record)
+    ("padded d32, form 1 requested", dict(s_q=217, s_kv=217, seq_kv_lens_present=True, padded_tail_form=1), True, 1),
+    ("padded d32, form 0 requested", dict(s_q=217, s_kv=217, seq_kv_lens_present=True, padded_tail_form=0), True, 0),
+    ("padded d64 cga2, form 1 requested", dict(d=64, s_q=300, s_kv=300, cga=2, seq_kv_lens_present=True, padded_tail_form=1), True, 1),
+    ("dense d32, form 1 requested", dict(padded_tail_form=1), False, None),
+    ("padded d32 + bias, form 1 requested", dict(s_q=224, s_kv=224, seq_kv_lens_present=True, bias=(1, 4, 224, 224), padded_tail_form=1), False, None),
+    ("padded d32 + kv_mask, form 1 requested", dict(s_q=217, s_kv=217, seq_kv_lens_present=True, kv_mask=(2, 1, 1, 217), padded_tail_form=1), False, None),
+    ("padded d32 causal, form 1 requested", dict(s_q=217, s_kv=217, seq_kv_lens_present=True, is_causal=True, padded_tail_form=1), False, None),
+    ("padded d128, form 1 requested", dict(d=128, s_q=217, s_kv=217, seq_kv_lens_present=True, padded_tail_form=1), False, None),
+    ("padded d32, form 2 requested", dict(s_q=217, s_kv=217, seq_kv_lens_present=True, padded_tail_form=2), False, None),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("name, kw, accept, record", _PADDED_TAIL_ADAPTER_CELLS, ids=[c[0] for c in _PADDED_TAIL_ADAPTER_CELLS])
+def test_adapter_padded_tail_form_requests_are_honoured_or_declined_typed(name, kw, accept, record):
+    """A ``padded_tail_form=`` request is honoured on the PLAIN padded small-tile plan (the record carries it) and declined typed
+    everywhere else (a dense S_kv, a bias, a kv_mask, a band, the d128 flavor, a value outside 0 / 1) -- never degraded."""
+    if not accept:
+        with pytest.raises((NotImplementedError, ValueError), match="padded_tail_form"):
+            _api2(**kw).check_support()
+        return
+    api = _api2(**kw)
+    assert api.check_support() is True, name
+    assert api.template_params().padded_tail_form == record, (name, api.template_params())
+
+
+@requires_rubin
+def test_adapter_padded_tail_form_default_is_the_config_pick():
+    """Without a request the adapter's record carries the config pick (the default constant, or the sweep seam when a driver pins it);
+    the seam never reaches an ineligible plan."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg_mod
+    from cudnn.sdpa.fwd.config_sm107 import SM107_PADDED_TAIL_FORM_DEFAULT
+
+    api = _api2(s_q=217, s_kv=217, seq_kv_lens_present=True)
+    assert api.check_support() is True
+    assert api.template_params().padded_tail_form == SM107_PADDED_TAIL_FORM_DEFAULT
+    saved = cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS
+    try:
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 1
+        api = _api2(s_q=217, s_kv=217, seq_kv_lens_present=True)
+        assert api.check_support() is True
+        assert api.template_params().padded_tail_form == 1
+        api = _api2(s_q=217, s_kv=217, seq_kv_lens_present=True, kv_mask=(2, 1, 1, 217))
+        assert api.check_support() is True
+        assert api.template_params().padded_tail_form == 0, "the seam must not reach the kv_mask (-inf body) plan"
+    finally:
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved
+
+
+@pytest.mark.parametrize(
+    "d, cta, tile_n",
+    [(32, 1, 128), (32, 1, 64), (64, 2, 128)],
+    ids=["d32_t128", "d32_t64", "d64_cga2_t128"],
+)
+def test_padded_tail_form_1_rendering_has_one_softmax_body(tmp_path, d, cta, tile_n):
+    """The pre-masked tail rendering traced for sm_107a carries ONE softmax body per warp group: its exp count equals the DENSE
+    rendering's of the same width (the legacy padded rendering carries twice as many -- the second, software-max body), it has NO
+    software row max (FMNMX3 0), the bit-word pre-mask (R2P > 0), the register split, no cluster drain, and spills no more than
+    the legacy padded rendering; and it is a different cubin from both."""
+    base_arm = {32: "d32_padded_bf16", 64: "d64_padded_bf16_cga2"}[d]
+    dense_arm = {32: "d32_dense_bf16", 64: "d64_dense_bf16"}[d]
+    legacy = dict(_RECORD_ARMS[base_arm])
+    legacy.update({"__d": d, "cta_mma": cta, "dtype_qkv": 2, "tile_n": tile_n})
+    dense = dict(_RECORD_ARMS[dense_arm])
+    dense.update({"__d": d, "cta_mma": cta, "dtype_qkv": 2, "tile_n": tile_n})
+    form1 = dict(legacy)
+    form1["padded_tail_form"] = 1
+    p_legacy = _probe(tmp_path, legacy, f"tail0_{d}_{cta}_{tile_n}")
+    p_dense = _probe(tmp_path, dense, f"dense_{d}_{cta}_{tile_n}")
+    p_form1 = _probe(tmp_path, form1, f"tail1_{d}_{cta}_{tile_n}")
+    assert len({p_legacy.cubin_md5, p_dense.cubin_md5, p_form1.cubin_md5}) == 3
+    assert p_form1.stats["MUFU_EX2"] == p_dense.stats["MUFU_EX2"], (p_form1.stats, p_dense.stats)
+    assert p_legacy.stats["MUFU_EX2"] >= 2 * p_dense.stats["MUFU_EX2"] - 8, (p_legacy.stats, p_dense.stats)
+    assert p_form1.stats["FMNMX3"] == 0 and p_form1.stats["R2P"] > 0, p_form1.stats
+    assert p_form1.stats["USETMAXREG"] > 0 and p_form1.stats["CGAERRBAR"] == 0, p_form1.stats
+    assert_no_new_spills(p_form1.stats, p_legacy.stats, tag=f"padded_tail_form 1 d{d} cga{cta} TILE_N {tile_n} vs the legacy tail: ")
+
+
+# The padded tail cells: a partial 128-wide tail (89 / 72 / 44 / 66 / 88 valid columns of the last tile), per-batch lengths with
+# a FULL tile for one entry (the pre-mask must fire on the ragged entry only), a one-tile shape, d64 at cga2, the 64-wide tile.
+_PADDED_TAIL_CASES = {
+    "tail_217": dict(s=217),
+    "tail_200_B2_lens": dict(s=256, kv_lens=[200, 256]),
+    "tail_300": dict(s=300, h=2),
+    "tail_450": dict(s=450, h=2),
+    "tail_one_tile_100": dict(s=100),
+    "tail_d64_300_cga2": dict(d=64, s=300, h=2, cga=2),
+    "tail_t64_217": dict(s=217, tile_n=64),
+    "tail_f16_217": dict(s=217, io=torch.float16),
+}
+
+
+def _executed_padded_tail_form(g, idx):
+    """The ``padded_tail_form`` the EXECUTED plan's kernel module was loaded with, read like ``_executed_tile_n`` from the adapter the
+    compiled plan carries (the prepared launch spec does not record it); None when the plan exposes no adapter."""
+    plan = g._compiled_plans[idx]
+    cells = getattr(plan._compiled, "__closure__", None) or ()
+    api = next((c.cell_contents for c in cells if type(c.cell_contents).__name__.startswith("SdpaFwdDsl")), None)
+    return None if api is None else int(api.template_params().padded_tail_form)
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_PADDED_TAIL_CASES))
+def test_padded_tail_form_1_cells_match_the_fp64_oracle_and_the_legacy_tail(case):
+    """Every PLAIN padded cell under the pre-masked tail (the sweep seam pins form 1 for the plan): O / Stats against the fp64 oracle,
+    keyless rows exactly 0 / -inf, two launches bitwise -- and against the legacy tail form of the same graph within the oracle
+    tolerance (the same online softmax over the same -inf-masked scores; the HW and the software row max agree exactly, so the
+    forms are expected bitwise -- asserted at the oracle tolerance, the bitwise equality recorded)."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg_mod
+
+    c = _PADDED_TAIL_CASES[case]
+    io = c.get("io", torch.bfloat16)
+    tile_n = c.get("tile_n")
+    s = c["s"]
+    cc = dict(c)
+    cc.pop("tile_n", None)
+    cc.pop("io", None)
+    if "kv_lens" not in cc:
+        cc["kv_lens"] = [s] * 2  # the SAME per-batch lengths the engine synthesises for an S_kv off the tile multiple
+    saved = cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS
+    try:
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 1
+        out1, ref, _ = _run_cell(cc, io, tile_n=tile_n)
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 0
+        out0, _, _ = _run_cell(cc, io, tile_n=tile_n)
+    finally:
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved
+    _check(out1, ref)
+    _check(out0, ref)
+    live = ~ref["empty"]
+    torch.testing.assert_close(out1["o"][live].double(), out0["o"][live].double(), **_TOL_O)
+    torch.testing.assert_close(out1["stats"].squeeze(-1)[live].double(), out0["stats"].squeeze(-1)[live].double(), **_TOL_LSE)
+    bitwise = torch.equal(out1["o"], out0["o"]) and torch.equal(out1["stats"], out0["stats"])
+    print(f"\n{case}: pre-masked tail vs legacy tail bitwise={bitwise}")

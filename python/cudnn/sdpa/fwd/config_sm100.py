@@ -286,6 +286,14 @@ class TemplateParams:
     # ``config_sm107.sm107_bias_stages_pick``); 2 / 3 = a request.  Meaningless (and must be 0) on ``bias_mode`` 0 / 1.  A
     # compile-time axis (the ring's SMEM extent and its two mbarrier rings fold on it), hence a cache-key field; APPENDED.
     bias_stages: int = 0
+    # The PADDED tail form of the PLAIN padded kv loop on the Rubin f16/bf16 32- / 64-wide tiles (MASK_FLAGS == MASK_PADDED alone: per-batch
+    # KV lengths or an S_kv that is not a tile multiple, no bias / kv_mask): 0 = the tail kv tile runs the SOFTWARE-max masked body as a
+    # second loop beside the HW-max body (a second full softmax body per warp group -- the 128-wide rendering outgrows the per-SM
+    # instruction cache, the padding leg's measured pathology); 1 = the PRE-MASKED tail: one loop, the HW-max body on every tile, and on
+    # the tail tile the softmax warp first rewrites its sub-tile's out-of-range S columns as -inf in TMEM
+    # (``config_sm107.sm107_padded_tail_form_pick``).  A compile-time axis of the kv loop, hence a cache-key field; 0 on every other
+    # rendering (the factory refuses 1 off the eligible set).  APPENDED.
+    padded_tail_form: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

@@ -380,6 +380,16 @@ _KV_MASK_ADD = CFG.KV_MASK_FORM in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32)
 # The kv_mask operand's element type at the tvm-ffi boundary: bytes for the bit word, the io dtype / fp32 for the additive vector.
 KV_MASK_DTYPE = cutlass.Int8 if _KV_MASK_BOOL else (cutlass.Float32 if CFG.KV_MASK_FORM == KV_MASK_ADDITIVE_F32 else STORAGE_DTYPE)
 _INF_MASK_ARM = _BIAS_ARM or _KV_MASK_ARM
+# The PRE-MASKED padded tail (CFG.PADDED_TAIL_FORM == 1; TemplateParams.padded_tail_form; the PLAIN padded body, MASK_FLAGS == MASK_PADDED
+# alone -- the config factory refuses it with a band, a bias or a kv_mask): ONE kv loop over the whole range with the HW-max body
+# (`_softmax_kv_body(apply_mask=False)`); on the tail kv tile the softmax warp first rewrites its sub-tile's out-of-range S columns as
+# -inf in TMEM (`_premask_padded_tail`) so the fused `tcgen05.ld.red.max` observes them masked.  The legacy form (0) runs the tail tile
+# through a SECOND, software-max body (`_softmax_kv_body(apply_mask=True)`) -- two full softmax bodies per warp group, 4139 vs 2776 SASS
+# instructions on the d32 bf16 rendering (HOST trace-compile for sm_107a), over the per-SM instruction-cache cliff: the padding leg's
+# measured pathology (S 217 plain 25.9 us vs 15.4 for the DENSE S 256 cell, and 19.6 for the same shape WITH a kv_mask, whose -inf body
+# is one body).  No barrier row changes: the pre-mask sits inside the body between the `mb_bmm1_done` wait and the P store, on the
+# calling thread's own S columns (the MMA writes S[qs] again only for the next BMM1, after this body's `mb_bmm2_ready`).
+_PADDED_TAIL_PREMASK = CFG.PADDED_TAIL_FORM == 1
 # === The (n, n+1) PAIR work item (CFG.N_CHUNK > 0; TemplateParams.n_chunk) ===
 #
 # A work item is (a TILE_M-row q tile, a head, a CHUNK of up to N_CHUNK consecutive entries nb of the flattened batch axis);
@@ -2410,6 +2420,35 @@ def _mma_item_pair(
 
 
 @cute.jit
+def _premask_padded_tail(s_addr_base, q_abs, kv_loop, eff_seqlen_kv):
+    """CFG.PADDED_TAIL_FORM == 1, the tail kv tile only: rewrite this thread's out-of-range S columns (kv >= eff_seqlen_kv) as -inf in
+    TMEM so the HW-max body's fused ``tcgen05.ld.red.max`` observes them masked -- per 64-column chunk that holds such columns
+    (``eff_seqlen_kv - kv_col_base < (c + 1) * 64``, warp-uniform), a plain 32x32b load, the bit-word PADDED mask
+    (``apply_mask_chunk`` with the TRUE -inf), the store back; one ``tcgen05.wait::st`` orders the stores before the body's load.  Same
+    S slot, same thread; the tail tile always holds >= 1 valid column (``right = ceil(len / TILE_N)``), so the HW row max stays finite
+    = the max over the valid columns, exactly the masked body's software max.  A masked column's ``exp2(-inf * scale - max)`` is +0,
+    the P the legacy masked body ships; the row sum counts 0 for it."""
+    CHUNK = CFG.BMM2_CHUNK_SIZE
+    kv_col_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+    n_valid = eff_seqlen_kv - kv_col_base  # 1 .. TILE_N - 1 on the tail tile
+    for c in cutlass.range_constexpr(CFG.N_BMM2_CHUNKS):
+        if n_valid < cutlass.Int32((c + 1) * CHUNK):
+            raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK)
+            masked = apply_mask_chunk(
+                raw,
+                q_abs,
+                kv_col_base + cutlass.Int32(c * CHUNK),
+                eff_seqlen_kv,
+                0,
+                MASK_PADDED,
+                N=CHUNK,
+                mask_value=float("-inf"),
+            )
+            nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), masked)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+
+
+@cute.jit
 def _softmax_kv_body(
     apply_mask: bool,
     sub_tile_id: int,
@@ -2427,6 +2466,7 @@ def _softmax_kv_body(
     leader_cta_id,
     true_max,
     track_true_max: bool = False,
+    tail_premask=None,
 ):
     """Per-iter kv body for the softmax warp group.
 
@@ -2434,6 +2474,11 @@ def _softmax_kv_body(
     apply_mask=False uses fused tcgen05.ld.red.f32.max (HW row-max);
     apply_mask=True uses tcgen05.ld + apply_mask_chunk + software row-max
     (HW max can't observe NEG_INFINITY written after the load).
+
+    ``tail_premask`` (CFG.PADDED_TAIL_FORM == 1 only; None = off, folded): a warp-uniform runtime
+    predicate -- this iteration is the padded TAIL kv tile, whose out-of-range S columns the thread
+    rewrites as -inf in TMEM (``_premask_padded_tail``) before the fused max load, so the HW-max
+    body serves the tail too and the rendering carries ONE softmax body per warp group.
 
     ``true_max`` is the row's TRUE running max (scaled units), carried beside the
     threshold-skipped reference ``total_max`` and updated only when
@@ -2505,6 +2550,11 @@ def _softmax_kv_body(
         for m in chunks_max[1:]:
             current_max_unscaled = cute.math.max(current_max_unscaled, m)
     else:
+        if cutlass.const_expr(_PADDED_TAIL_PREMASK and tail_premask is not None):
+            # The pre-masked tail (CFG.PADDED_TAIL_FORM == 1): on the tail kv tile the out-of-range S columns become -inf in TMEM
+            # before the fused max load below; every other tile runs the dense body untouched (a warp-uniform branch).
+            if tail_premask:
+                _premask_padded_tail(s_addr_base, q_abs, kv_loop, eff_seqlen_kv)
         reg_S_tile, current_max_unscaled = tmem_load_max_reduction_tile(
             s_addr_base,
             num_elems=CFG.TILE_N,
@@ -2990,6 +3040,31 @@ def _softmax_warp_group(
                         # warp; THREAD arrives have no pred= path, so the elect is a branch).
                         if nvvm.elect_sync():
                             bars.mb_bias_empty.arrive()
+            elif cutlass.const_expr(_PADDED_TAIL_PREMASK):
+                # The pre-masked tail (CFG.PADDED_TAIL_FORM == 1; MASK_FLAGS == MASK_PADDED alone, so left == unmasked_lo == 0): ONE loop
+                # over the whole range with the HW-max body; the tail tile (kv_loop >= unmasked_hi -- the last tile when this batch
+                # entry's S_kv is not a tile multiple, never otherwise) pre-masks its out-of-range S columns in TMEM.  One softmax body
+                # per warp group in the rendering; the legacy 3-segment form below carries a second, software-max body for the tail.
+                for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                    total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
+                        False,
+                        sub_tile_id,
+                        kv_loop,
+                        tmem_ptr_i32,
+                        bars,
+                        q_abs,
+                        eff_seqlen_kv,
+                        eff_seqlen_q,
+                        scale_log2,
+                        total_max,
+                        total_sum,
+                        bmm1_phase,
+                        stat_empty_phase,
+                        leader_cta_id,
+                        true_max,
+                        track_true_max,
+                        tail_premask=kv_loop >= bounds.unmasked_hi,
+                    )
             elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
                 for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
