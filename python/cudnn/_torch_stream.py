@@ -68,12 +68,13 @@ def as_torch_stream(stream, device=None):
     """
     import torch
 
-    handle = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
-    _reject_per_thread_stream(handle)
     if isinstance(stream, torch.cuda.Stream):
         if device is not None and stream.device != torch.device("cuda", _device_index(torch, device)):
             raise ValueError(f"stream must be on cuda:{_device_index(torch, device)}, got {stream.device}")
+        _reject_per_thread_stream(stream.cuda_stream)
         return stream
+    handle = int(stream)
+    _reject_per_thread_stream(handle)
     default = torch.cuda.default_stream(device)
     if handle in DEFAULT_STREAM_HANDLES or handle == default.cuda_stream:
         return default

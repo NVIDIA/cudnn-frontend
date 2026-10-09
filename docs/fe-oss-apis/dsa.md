@@ -728,9 +728,9 @@ the complete wrapper on the target shape when those properties are required.
   is overwritten otherwise). The wrapper's per-call workspace makes its calls
   independent; it additionally keys its plan cache on the CUDA device and on
   the **resolved** stream (`stream` when given, otherwise
-  `torch.cuda.current_stream()` at call time; plus the calling thread's id
-  for `cudaStreamPerThread`, the value 2 in every thread), so one cached
-  plan's executes are stream-ordered. Users driving `IndexerBackward`
+  `torch.cuda.current_stream()` at call time), so one cached plan's executes
+  are stream-ordered. `cudaStreamPerThread` is rejected; use a concrete
+  stream for each host thread. Users driving `IndexerBackward`
   objects directly may share one object across streams and devices as long
   as each in-flight execute has its own workspace.
 - **Local top-k ids** (`topk_indices_global=False`) are masked against the

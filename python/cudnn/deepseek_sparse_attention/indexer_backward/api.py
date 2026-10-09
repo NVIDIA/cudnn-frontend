@@ -20,7 +20,6 @@ carved from the caller's workspace (``scratch_workspace_bytes()`` /
 from __future__ import annotations
 
 import math
-import threading
 from typing import Optional
 
 import torch
@@ -52,13 +51,6 @@ from .indexer_backward_sm90 import indexer_backward_sm90
 # request-or-fail on non-SM100) and the enum can grow new backends without
 # overloading a boolean. It is part of the wrapper plan-cache key.
 INDEXER_BACKWARD_BACKENDS = ("default", "sm100_v2")
-
-# CUDA's magic per-thread default-stream handle (``cudaStreamPerThread`` /
-# ``CU_STREAM_PER_THREAD``): the integer 2 in every host thread, each time
-# denoting that thread's own stream. Handles 0 and 1 (the legacy default
-# stream) are global rather than per-thread, so this is the only handle value
-# that needs a thread discriminator in the plan-cache key.
-_CUDA_STREAM_PER_THREAD = 2
 
 
 def _validate_indexer_backward_backend(backend: str) -> None:
@@ -972,26 +964,12 @@ def indexer_backward_wrapper(
     # the launch stream). Keying the raw argument would map every
     # ``stream=None`` call onto one cache entry even when the callers sit in
     # different ``torch.cuda.stream(...)`` contexts. Two caveats on the
-    # handle: (a) handles are not unique across devices — the legacy default
-    # stream is handle 0 on every device — so ``index_q.device`` above stays
-    # load-bearing and is what keeps per-device plans apart; (b) CUDA's magic
-    # handles are not unique across host threads either — ``cudaStreamPerThread``
-    # is the integer 2 in every thread while denoting a different stream in
-    # each. The handle itself carries no thread information, but the caller
-    # does: that value means "the calling thread's own stream" by definition, so
-    # the calling thread's id is exactly the missing discriminator and is
-    # appended to the key for that one value. Real handles (and 0 / 1, which are
-    # global rather than per-thread) are keyed as-is, so threads that share a
-    # real stream keep sharing one plan, as they should.
-    # ``threading.get_ident()`` is only unique among live threads — an id can
-    # be reused after its thread exits — which is harmless here: that thread's
-    # per-thread stream died with it, so nothing can still be running on the
-    # plan the reused id reaches.
+    # handle: handles are not unique across devices, so index_q.device stays
+    # part of the key. Torch interop rejects CUstream(2) before this point;
+    # callers needing per-thread execution use concrete torch streams.
     stream_key = None
     if backend == "sm100_v2":
         stream_key = int(_resolve_stream(stream))
-        if stream_key == _CUDA_STREAM_PER_THREAD:
-            stream_key = (stream_key, threading.get_ident())
     key = (
         index_q.device,
         index_q.dtype,

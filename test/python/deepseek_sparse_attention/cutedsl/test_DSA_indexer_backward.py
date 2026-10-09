@@ -1811,37 +1811,22 @@ def test_DSA_indexer_backward_wrapper_v2_stream_none_ambient_streams(
 @pytest.mark.L1
 @torch_fork_set_rng(seed=0)
 @with_dsa_indexer_backward_params
-def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
+@pytest.mark.parametrize("stream_kind", ["explicit", "per_thread"])
+def test_DSA_indexer_backward_wrapper_v2_two_threads(
     dtype,
     acc_dtype,
     head_dim,
     qhead_per_kv_head,
     block_I,
     request,
+    stream_kind,
 ):
-    """Two host threads passing ``cudaStreamPerThread`` explicitly must not
-    share one plan.
+    """Concrete per-thread streams use independent plans; CUstream(2) is rejected.
 
-    ``cudaStreamPerThread`` is the integer 2 in every host thread, each time
-    denoting that thread's own stream, so the handle alone cannot tell the two
-    streams apart -- but the caller can: that handle means "the calling
-    thread's stream" by definition, so the wrapper appends the calling thread's
-    id to the key for that one value. Without it both threads land on one plan
-    (the ticket counter is per-call workspace now, so this is the stream-
-    ordering invariant of the cache key, not device-state ownership).
-
-    This is the explicit-handle twin of the ``stream=None`` ambient-stream test
-    above and asserts the same invariant: one plan per resolved stream. Two
-    implementation details of the test matter. The threads are held alive across
-    the whole measured window by a barrier, because ``threading.get_ident()`` is
-    only unique among *live* threads and Python does hand a dead thread's id to
-    a later one. Their wrapper calls are serialized with a lock, so what is
-    asserted is the cache key and not the thread-safety of first-call
-    compilation.
-
-    ``s_q``/``S_k``/topk together are deliberately different from every other
-    v2 test's, so this test's plan-cache keys cannot collide with theirs
-    regardless of test order."""
+    Keep both threads alive throughout the test so their identities differ.
+    Compile once before the threaded phase, then serialize wrapper entry to
+    isolate stream identity and rejection from first-call compilation races.
+    """
     try:
         from cudnn import DSA
         from cuda.bindings import driver as cuda
@@ -1898,8 +1883,15 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
         try:
             barrier.wait()  # both threads alive before any id is observed
             with serialize:
-                results[lane_id] = (threading.get_ident(), call(per_thread_stream))
-                torch.cuda.synchronize()
+                if stream_kind == "per_thread":
+                    with pytest.raises(ValueError, match="cudaStreamPerThread"):
+                        call(per_thread_stream)
+                    results[lane_id] = (threading.get_ident(), None)
+                else:
+                    concrete = torch.cuda.Stream()
+                    with torch.cuda.stream(concrete):
+                        results[lane_id] = (threading.get_ident(), call(concrete.cuda_stream))
+                    concrete.synchronize()
             barrier.wait()  # still alive, so neither id can have been recycled
         except BaseException as exc:  # surfaced in the main thread below
             errors[lane_id] = exc
@@ -1914,12 +1906,10 @@ def test_DSA_indexer_backward_wrapper_v2_stream_per_thread_two_threads(
     assert len({ident for ident, _ in results.values()}) == 2, "test setup: the two worker threads must have distinct live ids"
 
     added = set(cache.keys()) - keys_before
-    assert len(added) == 2, (
-        "two host threads passing cudaStreamPerThread must key two separate plans "
-        "(the handle is the integer 2 in both threads but denotes a different stream in each, "
-        "and the per-plan ticket counter cannot be shared across concurrent streams); "
-        f"got {len(added)} new plan-cache entries"
-    )
+    if stream_kind == "per_thread":
+        assert not added, "rejected PTDS calls must not populate the plan cache"
+        return
+    assert len(added) == 2, f"two concrete streams must key separate plans, got {len(added)} new entries"
 
     # Correctness guard on the keyed path: d_index_q / d_weights are
     # deterministic, so each thread must reproduce the main-thread reference
