@@ -19,7 +19,8 @@ imported and never re-literalled: the fp8 SDPA row's recipe on the SDPA stage pe
 ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under ``_AMAX_DS_TOL``) plus the bf16 block's bound form on the stage's bf16
 output, the (M) end-to-end in the row-budgeted form (``1e-5 x rows x keys``) on ``dh / dw_qkvg / dw_o``, the seeded oracle under the
 bf16 block's bound on ``dh / dw_o / dW_norm`` and, on ``dw_qkvg``, in the row-budgeted form with the dense suite's flip ATTRIBUTION
-(every row outside the bound a ``dqkvg8`` flip's, its pre-cast slab column inside its band's bound) -- where that budget is its FLOOR
+(every row outside the bound a ``dqkvg8`` flip's, its pre-cast slab column inside its band's bound, and -- the magnitude guard -- the whole ``dW_qkvg`` within the GEMM suite's bound
+of its own dequantized codes) -- where that budget is its FLOOR
 (fewer than 20 tokens: the 5-token cell) the ``dw_qkvg`` row count is REPORTED, not asserted, and the attribution carries the pin on
 both layers (``_row_budget_floored``: the cast's flip class leaves a handful of rows outside at every length, so a floor of one row is
 not its bound); the quantizers, every scalar
@@ -85,6 +86,7 @@ from test_block_backward import _KNOBS, _alloc_grads, _assert_dw_norm_close, _as
 from test_block_backward_fp8 import (  # noqa: E402
     _E4M3,
     _api_const,
+    _assert_dw_qkvg_floor_guard,
     _assert_quantizers_scalars_delta_bitwise,
     _assert_seeded_dw_qkvg_row_budgeted,
     _calibrated_scale_dp,
@@ -93,6 +95,7 @@ from test_block_backward_fp8 import (  # noqa: E402
     _delta,
     _dev_scalar,
     _execute_fp8,
+    _floored_flip_fixture,
     _print_end_to_end,
     _report_seeded_intermediates,
     _report_stage_difference,
@@ -454,15 +457,17 @@ def _assert_sdpa_stage_per_sequence(res, v: dict) -> None:
     assert abs(amax_dp - amax_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ref, (amax_dp, amax_ref)
 
 
-def _assert_m_row_budgeted(tag: str, res, ref: dict, flip_ev: Optional[dict] = None) -> dict:
+def _assert_m_row_budgeted(tag: str, res, ref: dict, flip_ev: Optional[dict] = None, v: Optional[dict] = None) -> dict:
     """The (M) end-to-end in the dense suite's ONE form: the bf16 block's bound with the SDPA stage's flip class propagated and budgeted
     by ROWS (``1e-5 x rows x keys``, at least 1) on ``dh / dw_qkvg / dw_o`` -- every output, both GQA fold paths included (the row folds
     its per-Q-head partials from fp32, rounding once like the reference) -- never widened.  Where ``dw_qkvg``'s budget is its FLOOR
     (``_row_budget_floored``: fewer than 20 tokens) the count is REPORTED and every row outside is held to the cast's flip class instead
     -- a row a ``dqkvg8`` flip touched, its pre-cast slab column inside its band's bound (the dense suite's attribution conditions (2)
-    and (3), read from ``flip_ev`` = ``_report_seeded_intermediates``'s evidence, REQUIRED there) -- the honest form of the pin at a
-    length whose proportional budget does not describe the class; ``dh / dw_o`` keep the row-budgeted form at every length.  Returns
-    the per-output report."""
+    and (3), read from ``flip_ev`` = ``_report_seeded_intermediates``'s evidence, REQUIRED there) AND to the dense suite's magnitude guard
+    (4): the whole ``dW_qkvg`` within the GEMM suite's bound of ``dqkvg8^T . h8`` on the block's own codes (``v`` = the intermediates,
+    REQUIRED there; ``_assert_dw_qkvg_floor_guard`` -- the residual form needs the oracle's codes and is the seeded layer's) -- the honest
+    form of the pin at a length whose proportional budget does not describe the class; ``dh / dw_o`` keep the row-budgeted form at every
+    length.  Returns the per-output report."""
     m = _print_end_to_end(tag, res.grads, ref, keys=_row_keys(res))
     assert m, tag
     floored = "dw_qkvg" in m and _row_budget_floored(m["dw_qkvg"]["rows"], _row_keys(res)["dw_qkvg"])
@@ -489,6 +494,8 @@ def _assert_m_row_budgeted(tag: str, res, ref: dict, flip_ev: Optional[dict] = N
             f"the band's bound against the seeded oracle ({[round(x, 3) for x in band_worst[band_worst > 1.0].tolist()]} of it): a miss upstream "
             f"of the cast, not the cast's flip class -- rows outside {rows_out.tolist()}"
         )
+        assert v is not None, f"{tag}: the dw_qkvg row budget is its floor here -- the block's dqkvg8 codes are required for the magnitude guard"
+        _assert_dw_qkvg_floor_guard(res, v, res.grads["dw_qkvg"], rows_out, None, f"{tag} dw_qkvg")
     return m
 
 
@@ -614,6 +621,22 @@ def test_thd_fp8_backward_declines_an_mxquantspec():
     msg = str(ei.value)
     assert "MxQuantSpec" in msg and "QuantSpec" in msg and "scale-factor" in msg, msg
     assert "external_delta" not in msg, msg
+
+
+def test_thd_fp8_floored_m_form_guard_rejects_a_corrupted_row():
+    """The (M) layer's tiny-``T`` form has the dense suite's magnitude guard (host, no device): on ``_floored_flip_fixture``'s inputs --
+    two legitimate single-step ``dqkvg8`` flips, exactly their two ``dW_qkvg`` rows outside the bf16 bound at a row budget of one --
+    ``_assert_m_row_budgeted`` passes with the block's codes handed in, REQUIRES them at the floor, and REJECTS the same inputs with the
+    two flip-touched rows replaced by 1e6 (the GEMM bound on the block's own codes), which the attribution conditions alone accept."""
+    res, v, ref, flip_ev = _floored_flip_fixture()
+    assert _row_budget_floored(res.grads["dw_qkvg"].shape[0], _row_keys(res)["dw_qkvg"]), "the fixture must sit at the floor"
+    _assert_m_row_budgeted("floor control (M)", res, ref, flip_ev, v=v)
+    with pytest.raises(AssertionError, match="codes are required"):
+        _assert_m_row_budgeted("floor control (M) without the codes", res, ref, flip_ev)
+    bad = SimpleNamespace(**{**vars(res), "grads": {"dw_qkvg": res.grads["dw_qkvg"].clone()}})
+    bad.grads["dw_qkvg"][[7, 4000]] = 1e6
+    with pytest.raises(AssertionError, match="magnitude guard"):
+        _assert_m_row_budgeted("floor mutant (M)", bad, ref, flip_ev, v=v)
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +911,7 @@ def test_thd_fp8_zero_length_sequences(lens, s_max, causal, h_kv):
     tag = f"thd fp8 {tuple(lens)} s_max={s_max} {'causal' if causal else 'dense'} h_kv={h_kv}"
     ref_m, ref_seeded = _oracle_m_packed(res), _oracle_m_packed(res, seeded=True)
     flip_ev = _report_seeded_intermediates(res, v, ref_seeded)  # computed once: the (M) layer's floored form and the seeded layer share it
-    _assert_m_row_budgeted(f"{tag} (M)", res, ref_m, flip_ev)
+    _assert_m_row_budgeted(f"{tag} (M)", res, ref_m, flip_ev, v=v)
     _assert_seeded_under_the_bf16_bound(tag, res, ref_seeded, v, flip_ev)
     # the neighbours exact: the same tokens packed without the empty sequence(s)
     live = tuple(n for n in lens if n)
