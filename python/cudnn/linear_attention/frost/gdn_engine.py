@@ -86,12 +86,15 @@ def gdn_support_gates(engine: str, facts) -> None:
             raise NotImplementedError(f"{engine}: 'dG' must match 'g' ({facts.g_dtype}), got {facts.dg_dtype}")
         if facts.do_dtype not in io + (None,):
             raise NotImplementedError(f"{engine}: 'dO' must be fp16/bf16, got {facts.do_dtype}")
-        if facts.io_dtype is not None and facts.state_checkpoints_dtype not in (facts.io_dtype, None):
-            raise NotImplementedError(f"{engine}: 'state_checkpoints' must match the io dtype")
+        # one chunk is 64 expanded tokens; coarser checkpoints seed FP32 recomputation, dense ones feed backward
+        if checkpoint > 64 and facts.state_checkpoints_dtype not in (cudnn.data_type.FLOAT, None):
+            raise NotImplementedError(f"{engine}: recompute checkpoints must be fp32")
+        if checkpoint <= 64 and facts.io_dtype is not None and facts.state_checkpoints_dtype not in (facts.io_dtype, None):
+            raise NotImplementedError(f"{engine}: dense backward checkpoint operands must match the io dtype")
         if facts.dbeta_dtype not in (facts.beta_dtype, None):
             raise NotImplementedError(f"{engine}: 'dBeta' must match 'beta' ({facts.beta_dtype}), got {facts.dbeta_dtype}")
-    elif facts.io_dtype is not None and facts.state_checkpoints_out_dtype not in (facts.io_dtype, None):
-        raise NotImplementedError(f"{engine}: 'state_checkpoints' must match the io dtype")
+    elif facts.state_checkpoints_out_dtype not in (cudnn.data_type.FLOAT, None):
+        raise NotImplementedError(f"{engine}: 'state_checkpoints' must be fp32")
 
 
 class GdnFrostEngine(BaseEngine):
