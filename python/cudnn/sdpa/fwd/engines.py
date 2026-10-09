@@ -826,7 +826,8 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     ``config_sm107.sm107_bias_auto_cga`` and every proposed plan is re-asked here with its own cga) -- every one a typed
     decline, the twin of the adapter's ``check_support`` (rule 8b)."""
     from cudnn.sdpa.fwd.config_sm107 import sm107_softmax_wgs_pick
-    from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE, sm107_bias_mode_pick, sm107_bias_resident_s_kv_max, sm107_pair_item_active, sm107_tile_n_pick
+    from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE, BIAS_MODE_STREAMED_MULTICAST, sm107_bias_mode_pick, sm107_bias_resident_s_kv_max
+    from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active, sm107_tile_n_pick
 
     what = "additive bias" if facts.has_bias else "per-key kv_mask"
     if facts.thd or facts.has_paged_kv or facts.has_score_max or facts.has_score_sum_exp or facts.has_epilogue_gate:
@@ -934,6 +935,14 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         for cga in widths
     }
     modes = {cga: sm107_bias_mode_pick(selected[0], cga, facts.s_kv, pair=_pair[cga], tiles_q=_wgs[cga]) for cga in widths}
+    if any(mode == BIAS_MODE_STREAMED_MULTICAST for mode in modes.values()):
+        # The multicast bias ring (bias_mode 3, a request-only form: the pick returns it through the test seam / the adapter's request):
+        # ONE kv-tile sequence streamed to both CTAs of a cluster, so the two chunks' step bounds must be the same function of (q tile,
+        # S_q, S_kv) -- per-batch lengths break that lockstep; the chunk pairing rides the NATURAL payload (the config validator pins both).
+        if facts.padded or facts.seq_q_trim:
+            return "the multicast bias ring (bias_mode 3) streams one kv-tile sequence to both CTAs of a cluster; per-batch lengths are served by the cga1 ring only"
+        if knobs is not None and knobs.sched_policy is not None and knobs.sched_policy != SCHED_NATURAL:
+            return f"the multicast bias ring (bias_mode 3) pairs chunks through the NATURAL scheduler's payload; got sched_policy={knobs.sched_policy}"
     if all(mode == BIAS_MODE_NONE for mode in modes.values()):
         budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga, pair=_pair[cga], tiles_q=_wgs[cga]) for cga in widths}
         held = " / ".join(f"cga {cga}: S_kv <= {s_kv_max}" for cga, s_kv_max in budgets.items())

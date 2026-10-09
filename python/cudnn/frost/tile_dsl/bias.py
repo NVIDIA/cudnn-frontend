@@ -45,7 +45,7 @@ from cutlass.experimental import primitives as nvvm
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 
 from .pointwise import f16x2_to_f32, ffma2, fmax_f32, opaque_i32
-from .tma import tma_load_tile
+from .tma import tma_load_tile, tma_load_tile_multicast
 
 # The TMA swizzle atom the block is written and read under (bytes per swizzled row of one box).
 BIAS_SWZ_BYTES = 128
@@ -135,6 +135,23 @@ def issue_bias_ring_tile(sBias_stage, tma_bias, mb_full_stage, tile_bytes: cutla
     every kv-tile path (prologue and mainloop of both item forms) -- the lockstep the ring's P14 statement rests on."""
     mb_full_stage.arrive(n_bytes=cutlass.Int32(tile_bytes), pred=nvvm.elect_sync())
     tma_load_tile(sBias_stage, tma_bias(kv_tile * cutlass.Int32(tile_n), q_row, head, batch), mb_full_stage.smem_ptr, cta_group=1)
+
+
+@cute.jit
+def issue_bias_ring_tile_multicast(
+    sBias_stage, tma_bias, mb_full_stage, tile_bytes: cutlass.Constexpr[int], tile_n: cutlass.Constexpr[int], kv_tile, q_row, head, batch, is_issuer, mcast_mask
+):
+    """The MULTICAST form of :func:`issue_bias_ring_tile` (``CFG.BIAS_MODE == 3``, the ``streamed_multicast`` ring): a cluster of
+    independent CTAs that read the SAME bias tile sequence.  EVERY CTA's TMA-LDG warp arms ITS OWN ``mb_full_stage`` with ONE tile's
+    FULL boxes (one elected lane; 1 == the ONE_LANE init on every CTA); only the CTA with ``is_issuer`` (a warp-uniform runtime
+    predicate: cluster rank 0) queues the tile's boxes as a cta_group::1 ``.multicast::cluster`` load whose bytes land in ring stage
+    ``sBias_stage`` of EVERY CTA in ``mcast_mask`` and complete each CTA's own barrier at the same offset
+    (:func:`tile_dsl.tma.tma_load_tile_multicast`).  The caller waits the stage's ``mb_bias_ring_empty`` -- whose count includes the
+    PEER CTA's softmax releases, so no CTA re-arms a stage the other still reads -- BEFORE this and advances its ``PipelineState``
+    AFTER it, on every CTA in lockstep (the issuer's fill sequence IS every CTA's arm sequence)."""
+    mb_full_stage.arrive(n_bytes=cutlass.Int32(tile_bytes), pred=nvvm.elect_sync())
+    if is_issuer:
+        tma_load_tile_multicast(sBias_stage, tma_bias(kv_tile * cutlass.Int32(tile_n), q_row, head, batch), mb_full_stage.smem_ptr, mcast_mask)
 
 
 def bias_chunk_smem_offset(gg: BiasBlockGeometry, tile_idx, chunk: int, row) -> cutlass.Int32:

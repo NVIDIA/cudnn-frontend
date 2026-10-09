@@ -85,7 +85,7 @@ def test_ring_depth_and_mode_pick_are_derived():
     it where a ring fits, 0 where neither form fits."""
     from cudnn.sdpa.fwd import config_sm107 as c
 
-    assert c.BIAS_MODES == {0, 1, 2} and c.BIAS_RING_STAGES == (2, 3)
+    assert c.BIAS_MODES == {0, 1, 2, 3} and c.BIAS_RING_STAGES == (2, 3)  # 3 = the ring's cluster-multicast form (test_sdpa_bias_multicast_sm107.py)
     for (d, cga, pair), stages in _RING.items():
         assert c.sm107_bias_ring_stages(d, cga, pair=pair) == stages, (d, cga, pair)
         tiles = c.sm107_bias_resident_tiles(d, cga, pair=pair)
@@ -102,7 +102,10 @@ def test_ring_depth_and_mode_pick_are_derived():
         # a REQUEST is honoured where that form fits and 0 elsewhere -- never degraded to the other form
         assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair, request=2) == (c.BIAS_MODE_STREAMED if stages else c.BIAS_MODE_NONE)
         assert c.sm107_bias_mode_pick(d, cga, s_res + 128, pair=pair, request=1) == c.BIAS_MODE_NONE
-        assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair, request=3) == c.BIAS_MODE_NONE
+        # the multicast form (3) is the PAIR item's cga1 ring on request; nowhere else
+        assert c.sm107_bias_mode_pick(d, cga, s_res, pair=pair, request=3) == (
+            c.BIAS_MODE_STREAMED_MULTICAST if (pair and cga == 1 and stages) else c.BIAS_MODE_NONE
+        )
         # the depth pick: the request in the domain and fitting, else the derived deepest for the pair item and 2 for the one-batch-entry
         # item (the measured pick: its 3-stage ring is +1.5..+3.6 % slower); a request that does not fit is 0
         assert c.sm107_bias_stages_pick(d, cga, pair=pair) == (stages if pair else min(stages, c.SM107_ONE_BATCH_ENTRY_RING_STAGES))
@@ -240,7 +243,8 @@ def test_config_factory_derives_the_ring_and_raises_on_each_coupling():
             ("STAGES_BIAS", 1, "stages"),
             ("BIAS_RESIDENT_TILES", 1, "no resident block"),
             ("BIAS_EMPTY_ARRIVERS", 4, "softmax warp count"),
-            ("BIAS_MODE", 3, "BIAS_MODE must be"),
+            ("BIAS_MODE", 4, "BIAS_MODE must be"),
+            ("BIAS_MODE", 3, "BIAS_MCAST_CTAS must be 2"),  # the multicast form needs its cluster extent (test_sdpa_bias_multicast_sm107.py)
         ):
             with pytest.raises(ValueError, match=re.escape(word)):
                 c._validate_bias(dataclasses.replace(cfg, **{field: value}), "probe")
@@ -275,7 +279,7 @@ _ADAPTER_CELLS = [
     (dict(s_q=896, s_kv=896, bias="h", bias_mode=1), False, None, None, None),
     (dict(s_q=384, s_kv=384, bias="h", bias_stages=2), False, None, None, None),
     (dict(s_q=896, s_kv=896, bias="h", bias_stages=4), False, None, None, None),
-    (dict(s_q=896, s_kv=896, bias="h", bias_mode=3), False, None, None, None),
+    (dict(s_q=896, s_kv=896, bias="h", bias_mode=3), True, 3, 3, 1),  # the ring's cluster-multicast form on the pair (test_sdpa_bias_multicast_sm107.py)
     (dict(d=64, s_q=1024, s_kv=1024, bias="h"), True, 2, 3, 1),
     (dict(d=64, s_q=512, s_kv=512, bias="b"), True, 2, 2, 2),
     (dict(d=64, s_q=512, s_kv=512, bias="b", cga=2), True, 2, 2, 2),
@@ -299,7 +303,7 @@ _ADAPTER_CELLS = [
         "d32_S896_resident_requested_declines",
         "d32_S384_stages_on_a_resident_plan_declines",
         "d32_S896_stages_4_declines",
-        "d32_S896_mode_3_declines",
+        "d32_S896_mode_3_multicast",
         "d64_S1024_pair_ring",
         "d64_S512_per_batch_knobless_cga2",
         "d64_S512_per_batch_cga2",
@@ -347,17 +351,19 @@ def test_kernel_carries_the_streamed_ring_as_one_const_expr_axis():
     read and ONE elected release after the last word in the softmax body, the state advanced once per kv tile by each caller, the two
     ring rows initialised stage by stage, the resident rows folded on their own guard."""
     src = _KERNEL.read_text()
-    assert "_BIAS_RESIDENT = CFG.BIAS_MODE == BIAS_MODE_RESIDENT" in src and "_BIAS_STREAMED = CFG.BIAS_MODE == BIAS_MODE_STREAMED" in src
+    # _BIAS_STREAMED names BOTH ring forms (the cga1 ring and its cluster-multicast form, test_sdpa_bias_multicast_sm107.py); the
+    # multicast-only seams fold on _BIAS_MCAST and add ONE fill site (the ghost loop), one ring wait, one release and two advances.
+    assert "_BIAS_RESIDENT = CFG.BIAS_MODE == BIAS_MODE_RESIDENT" in src and "_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES" in src
     assert "def _bias_ring_fill(" in src
-    assert src.count("bias_ring_state = _bias_ring_fill(") == 4, "one fill per kv tile on the four kv-tile paths"
-    assert src.count("bars.mb_bias_ring_full[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)") == 1
+    assert src.count("bias_ring_state = _bias_ring_fill(") == 5, "one fill per kv tile on the four kv-tile paths + the multicast ghost loop"
+    assert src.count("bars.mb_bias_ring_full[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)") == 2
     assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)") == 1
-    assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()") == 1
-    assert src.count("bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)") == 2 and src.count("return advance(bias_ring_state, CFG.STAGES_BIAS)") == 1
+    assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()") == 2
+    assert src.count("bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)") == 4 and src.count("return advance(bias_ring_state, CFG.STAGES_BIAS)") == 1
     assert "for bs in cutlass.range_constexpr(CFG.STAGES_BIAS):" in src
+    # the bias barriers ride the factory's appended keywords; the multi-line call carries the S / P slot ring and the multicast ring's release count
     assert (
-        "make_classic_bars(CFG, s_stages=CFG.TILES_Q * CFG.S_SLOTS, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)"
-        in src
+        "s_stages=CFG.TILES_Q * CFG.S_SLOTS,\n        bias_resident=_BIAS_RESIDENT,\n        bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0," in src
     )
     assert "n_tiles=bias_smem_tiles(CFG)" in src
     assert "if cutlass.const_expr(_BIAS_ARM):\n                if item_live:" not in src, "the item-level rows fold on the RESIDENT guard"

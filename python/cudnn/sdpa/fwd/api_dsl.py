@@ -66,6 +66,7 @@ from cudnn.sdpa.fwd.config_sm107 import KV_MASK_ADDITIVE_F32 as _KV_MASK_ADDITIV
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_pair_form as _sm107_bias_pair_form
 from cudnn.sdpa.fwd.config_sm107 import sm107_n_chunk_pick as _sm107_n_chunk_pick
 from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE as _BIAS_MODE_NONE, BIAS_MODE_RESIDENT as _BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED as _BIAS_MODE_STREAMED
+from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_STREAMED_MULTICAST as _BIAS_MODE_STREAMED_MULTICAST, BIAS_STREAMED_MODES as _BIAS_STREAMED_MODES
 from cudnn.sdpa.fwd.config_sm107 import BIAS_RING_STAGES as _BIAS_RING_STAGES
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_mode_pick as _sm107_bias_mode_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_stages_pick as _sm107_bias_stages_pick
@@ -1656,7 +1657,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _resident_arm_bias_stages(self) -> int:
         """The ``TemplateParams.bias_stages`` of this plan: 0 off the streamed ring; else the request (``bias_stages=``, validated by
         ``check_support``) or the derived deepest ring (``config_sm107.sm107_bias_stages_pick``)."""
-        if self._resident_arm_bias_mode() != _BIAS_MODE_STREAMED:
+        if self._resident_arm_bias_mode() not in _BIAS_STREAMED_MODES:
             return 0
         _cga = self._resident_arm_cga()
         return _sm107_bias_stages_pick(
@@ -2299,10 +2300,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"tile_n {self._effective_tile_n()}, cga {_bias_cga})",
                 )
                 self._value_error_if(
-                    self.bias_mode is not None and self.bias_mode not in (_BIAS_MODE_RESIDENT, _BIAS_MODE_STREAMED),
-                    f"bias_mode must be 1 (the resident block) or 2 (the streamed ring); got {self.bias_mode}",
+                    self.bias_mode is not None and self.bias_mode not in (_BIAS_MODE_RESIDENT, _BIAS_MODE_STREAMED, _BIAS_MODE_STREAMED_MULTICAST),
+                    f"bias_mode must be 1 (the resident block), 2 (the streamed ring) or 3 (the streamed ring, cluster multicast); got {self.bias_mode}",
+                )
+                self._not_implemented_error_if(
+                    self.bias_mode == _BIAS_MODE_STREAMED_MULTICAST and not _pair,
+                    f"bias_mode=3 (the multicast bias ring) is the (n, n+1) pair item's form: it needs a batch-broadcast bias on >= 2 flattened rows "
+                    f"at cga 1 (this plan runs {_item} at cga {_bias_cga})",
                 )
                 _mode = self._resident_arm_bias_mode()
+                if _mode == _BIAS_MODE_STREAMED_MULTICAST:
+                    # The multicast ring (a request, or the test seam): the PAIR item's ring at cga1 run as a cluster of two independent CTAs
+                    # along the chunk axis that read ONE bias tile sequence -- a form, never a degraded plan: typed declines for what breaks
+                    # the lockstep (the config validator pins the same couplings; this is the row's twin, rule 8b).
+                    self._not_implemented_error_if(
+                        self.seq_kv_lens_present or self.seq_q_lens_present,
+                        "bias_mode=3 (the multicast bias ring) streams ONE kv-tile sequence to both CTAs of a cluster: per-batch lengths "
+                        "(seq_kv_lens_present / seq_q_lens_present) would make the two chunks' sequences differ -- served with global lengths only",
+                    )
+                    self._not_implemented_error_if(
+                        self.sched_policy is not None and self.sched_policy != SCHED_NATURAL,
+                        f"bias_mode=3 (the multicast bias ring) pairs chunks through the NATURAL scheduler's payload; got sched_policy={self.sched_policy}",
+                    )
                 self._not_implemented_error_if(
                     _mode == _BIAS_MODE_NONE,
                     (
@@ -2318,11 +2337,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"bias_stages must be one of {sorted(_BIAS_RING_STAGES)} (the streamed ring's depth); got {self.bias_stages}",
                 )
                 self._not_implemented_error_if(
-                    self.bias_stages is not None and _mode != _BIAS_MODE_STREAMED,
-                    f"bias_stages={self.bias_stages} is the STREAMED ring's depth; this plan runs the resident block (bias_mode 1) -- request bias_mode=2",
+                    self.bias_stages is not None and _mode not in _BIAS_STREAMED_MODES,
+                    f"bias_stages={self.bias_stages} is the STREAMED ring's depth; this plan runs the resident block (bias_mode 1) -- request bias_mode=2 / 3",
                 )
                 self._not_implemented_error_if(
-                    _mode == _BIAS_MODE_STREAMED and self._resident_arm_bias_stages() == 0,
+                    _mode in _BIAS_STREAMED_MODES and self._resident_arm_bias_stages() == 0,
                     f"a {self.bias_stages}-stage streamed bias ring does not fit at head-dim tile {self.flavor[0]} / cga {_bias_cga} ({_item}) beside the operands",
                 )
                 # An explicit n_chunk is honored on a plan that runs the pair item and declined typed elsewhere (never degraded).

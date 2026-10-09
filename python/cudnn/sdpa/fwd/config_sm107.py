@@ -308,7 +308,21 @@ def sm107_f16_tile_width(d_qk: int, d_v: int, *, leg: Optional[str] = None, cga:
 # TYPED decline on the row AND in the adapter.  The kv_mask ALONE stages nothing in SMEM (byte loads + warp ballots per kv
 # tile) -- no block, no S_kv budget: served at any S_kv.
 BIAS_MODE_NONE, BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED = 0, 1, 2
-BIAS_MODES = frozenset({BIAS_MODE_NONE, BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED})
+# The streamed ring's MULTICAST form (``bias_mode = 3``, the (n, n+1) PAIR item only): the kernel launches a cluster of TWO
+# INDEPENDENT CTAs along the grid's chunk axis (cluster (1, 1, 2); CTA_MMA / CGA_M / CGA_N stay 1 -- no collective MMA, no shared K / V),
+# which decode the SAME (q tile, head) and ADJACENT chunks (c, c + 1) and therefore read the SAME bias tile sequence; the rank-0 CTA
+# issues every kv tile's bias boxes ONCE as a cta_group::1 ``.multicast::cluster`` TMA load whose bytes land at the same SMEM offset in
+# both CTAs and complete each CTA's OWN ``mb_bias_ring_full`` (every CTA arms its own), and every stage is released to BOTH CTAs'
+# ``mb_bias_ring_empty`` (init 2 x BIAS_EMPTY_ARRIVERS).  The L2 -> SMEM bias feed of the pair item is halved.  Served with GLOBAL
+# lengths only (no per-row lengths: the two CTAs' kv-tile sequences must be identical) under the NATURAL scheduler; a request-only
+# form until its A/B says otherwise (``sm107_bias_mode_pick`` never picks it by itself).
+BIAS_MODE_STREAMED_MULTICAST = 3
+BIAS_MODES = frozenset({BIAS_MODE_NONE, BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED, BIAS_MODE_STREAMED_MULTICAST})
+# The two forms that stream ONE bias tile per kv tile through the STAGES_BIAS-deep ring (the multicast form is the ring with a
+# cluster-wide issue): every "is this the ring" seam reads this set, never ``== BIAS_MODE_STREAMED``.
+BIAS_STREAMED_MODES = frozenset({BIAS_MODE_STREAMED, BIAS_MODE_STREAMED_MULTICAST})
+# The multicast ring's cluster extent along the chunk axis = its TMA multicast fan-out = the factor on the ring's release count.
+BIAS_MCAST_CTAS = 2
 # The streamed ring's depth domain: 2 or 3 stages (plan: "a 2-3-stage bias ring").  Deeper buys nothing the K/V ring's own
 # lookahead does not already bound (the pair item streams 2 kv tiles ahead); shallower than 2 is no ring.
 BIAS_RING_STAGES = (2, 3)
@@ -867,6 +881,10 @@ def sm107_bias_mode_pick(
             return BIAS_MODE_RESIDENT if resident_ok else BIAS_MODE_NONE
         if want == BIAS_MODE_STREAMED:
             return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
+        if want == BIAS_MODE_STREAMED_MULTICAST:
+            # The multicast ring is the PAIR item's ring at cga1 (two independent CTAs sharing one bias tile sequence): the same
+            # SMEM ring must fit, the item must be the pair (the one-batch-entry item's two CTAs would read different bias rows).
+            return BIAS_MODE_STREAMED_MULTICAST if (ring_ok and pair and int(cta_mma) == 1) else BIAS_MODE_NONE
         return BIAS_MODE_NONE
     if ring_ok and not pair and int(cta_mma) == 1 and int(d_flavor) in SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS and int(s_kv) > SM107_SMALL_TILE_N_DEFAULT:
         return BIAS_MODE_STREAMED  # measured at 2 and 3 kv tiles; one tile keeps the block (nothing to overlap)
@@ -1528,6 +1546,11 @@ class _CfgSm107:
     # and every role walks a depth-2 PipelineState cursor over the slots, advanced once per non-empty kv tile.  A pure overlap knob:
     # the same MMAs and softmax steps in the same order -- O and Stats are BITWISE the one-slot kernel's.
     S_SLOTS: int = 1
+    # The streamed ring's MULTICAST form (BIAS_MODE == 3): the launch's cluster extent along the grid's CHUNK axis (cluster (1, 1, 2)) =
+    # the bias TMA's multicast fan-out = the factor on mb_bias_ring_empty's release count (each CTA's ring is released by BOTH CTAs'
+    # softmax warps).  1 on every other BIAS_MODE (cluster (CTA_MMA, 1, 1), the collective geometry).  The kernel's CGA_SIZE (the
+    # scheduler credit fan-out and the mb_read_tile_id count) multiplies by it; CGA_M / CGA_N / CTA_MMA stay 1 on this form.
+    BIAS_MCAST_CTAS: int = 1
 
 
 @dataclass(frozen=True)
@@ -1835,7 +1858,7 @@ def _validate_smem(cfg, flavor: str, *, qo_alias: bool, sf_bytes: int = 0, bias_
             f" + {sf_bytes // 1024} KiB MXFP8 scale-factor slabs (Q 1 | K {cfg.STAGES_KV}x1 | P 1 (512 B padded) | V {cfg.STAGES_KV}x1)" if sf_bytes else ""
         )
         if bias_bytes:
-            _streamed = getattr(cfg, "BIAS_MODE", 0) == BIAS_MODE_STREAMED
+            _streamed = getattr(cfg, "BIAS_MODE", 0) in BIAS_STREAMED_MODES
             gate_term += (
                 f" + {bias_bytes // 1024} KiB {'streamed bias ring' if _streamed else 'resident bias block'} "
                 f"({getattr(cfg, 'STAGES_BIAS', 0) if _streamed else getattr(cfg, 'BIAS_RESIDENT_TILES', 0)} {'stages' if _streamed else 'tiles'} x "
@@ -2017,11 +2040,12 @@ def operand_region_end_bytes(cfg) -> int:
 
 def bias_smem_tiles(cfg) -> int:
     """The bias block's SMEM extent in ``BIAS_BLOCK_ROWS x TILE_N`` tiles, by FORM: ``BIAS_RESIDENT_TILES`` on the resident block
-    (BIAS_MODE 1), ``STAGES_BIAS`` on the streamed ring (BIAS_MODE 2), 0 without the bias.  The kernel hands this to
-    ``tile_dsl.bias.bias_block_geometry(n_tiles=)`` so the TMA box count, the expect_tx and the lane offsets stay one arithmetic."""
+    (BIAS_MODE 1), ``STAGES_BIAS`` on the streamed ring (BIAS_MODE 2) and its multicast form (BIAS_MODE 3: the same per-CTA ring), 0
+    without the bias.  The kernel hands this to ``tile_dsl.bias.bias_block_geometry(n_tiles=)`` so the TMA box count, the expect_tx
+    and the per-thread read offsets stay one arithmetic."""
     if cfg.BIAS_MODE == BIAS_MODE_RESIDENT:
         return cfg.BIAS_RESIDENT_TILES
-    if cfg.BIAS_MODE == BIAS_MODE_STREAMED:
+    if cfg.BIAS_MODE in BIAS_STREAMED_MODES:
         return cfg.STAGES_BIAS
     return 0
 
@@ -2086,7 +2110,10 @@ def _validate_bias(cfg, flavor: str) -> None:
     if not cfg.BIAS_MODE and not cfg.KV_MASK_FORM:
         _check(
             [
-                (cfg.BIAS_RESIDENT_TILES == 0 and cfg.BIAS_BLOCK_ROWS == 0, f"{flavor}: bias geometry fields must be 0 without BIAS_MODE"),
+                (
+                    cfg.BIAS_RESIDENT_TILES == 0 and cfg.BIAS_BLOCK_ROWS == 0 and cfg.STAGES_BIAS == 0 and cfg.BIAS_MCAST_CTAS == 1,
+                    f"{flavor}: bias geometry fields must be 0 (BIAS_MCAST_CTAS 1) without BIAS_MODE",
+                ),
                 (
                     cfg.BIAS_MAX_FORM == BIAS_MAX_SOFTWARE,
                     f"{flavor}: BIAS_MAX_FORM={cfg.BIAS_MAX_FORM} names a row-max form of the bias / kv_mask body; this config has neither arm",
@@ -2095,7 +2122,10 @@ def _validate_bias(cfg, flavor: str) -> None:
         )
         return
     preds = [
-        (cfg.BIAS_MODE in BIAS_MODES, f"{flavor}: BIAS_MODE must be 0 (none), 1 (resident row-block) or 2 (streamed ring); got {cfg.BIAS_MODE}"),
+        (
+            cfg.BIAS_MODE in BIAS_MODES,
+            f"{flavor}: BIAS_MODE must be 0 (none), 1 (resident row-block), 2 (streamed ring) or 3 (streamed ring, cluster multicast); got {cfg.BIAS_MODE}",
+        ),
         (
             cfg.KV_MASK_FORM in KV_MASK_FORMS,
             f"{flavor}: KV_MASK_FORM must be 0 (none), 1 (bit word), 2 (additive io-dtype vector) or 3 (additive fp32 vector); got {cfg.KV_MASK_FORM}",
@@ -2133,10 +2163,38 @@ def _validate_bias(cfg, flavor: str) -> None:
                 f"STAGES_BIAS={cfg.STAGES_BIAS})",
             ),
             (
-                cfg.BIAS_MODE != BIAS_MODE_STREAMED or (cfg.STAGES_BIAS in BIAS_RING_STAGES and cfg.BIAS_RESIDENT_TILES == 0),
+                cfg.BIAS_MODE not in BIAS_STREAMED_MODES or (cfg.STAGES_BIAS in BIAS_RING_STAGES and cfg.BIAS_RESIDENT_TILES == 0),
                 f"{flavor}: the streamed bias ring is {sorted(BIAS_RING_STAGES)} stages of one {cfg.TILE_N}-column tile and holds no resident block "
                 f"(STAGES_BIAS={cfg.STAGES_BIAS}, BIAS_RESIDENT_TILES={cfg.BIAS_RESIDENT_TILES}); the TMA-LDG side pre-arms STAGES_BIAS fills and the "
                 f"softmax side advances the same count -- the two sides read ONE Cfg field",
+            ),
+            # The MULTICAST ring (BIAS_MODE 3): a cluster of two independent CTAs along the chunk axis that share one bias tile sequence.
+            (
+                (cfg.BIAS_MCAST_CTAS == BIAS_MCAST_CTAS) == (cfg.BIAS_MODE == BIAS_MODE_STREAMED_MULTICAST) and cfg.BIAS_MCAST_CTAS in (1, BIAS_MCAST_CTAS),
+                f"{flavor}: BIAS_MCAST_CTAS must be {BIAS_MCAST_CTAS} on the multicast ring (BIAS_MODE 3) and 1 on every other form (got BIAS_MCAST_CTAS="
+                f"{cfg.BIAS_MCAST_CTAS}, BIAS_MODE={cfg.BIAS_MODE}): it is the launch's cluster extent along the chunk axis, the TMA multicast fan-out "
+                f"and the factor on the ring's release count at once -- a mismatch launches a cluster the body does not credit (a hang at EVERY shape)",
+            ),
+            (
+                cfg.BIAS_MODE != BIAS_MODE_STREAMED_MULTICAST or cfg.N_CHUNK > 0,
+                f"{flavor}: the multicast bias ring is the (n, n+1) PAIR item's (N_CHUNK={cfg.N_CHUNK}): only the pair item's two CTAs of a cluster read "
+                f"the SAME 128-row bias tile sequence (same q tile, same head, adjacent chunks); the one-batch-entry item's CTAs read different rows",
+            ),
+            (
+                cfg.BIAS_MODE != BIAS_MODE_STREAMED_MULTICAST or (cfg.CTA_MMA == 1 and cfg.CGA_M == 1 and cfg.CGA_N == 1),
+                f"{flavor}: the multicast bias ring runs two INDEPENDENT CTAs (CTA_MMA={cfg.CTA_MMA}, CGA_M={cfg.CGA_M}, CGA_N={cfg.CGA_N} must be 1): no "
+                f"collective MMA, no shared K / V ring -- every collective-geometry count stays its cga1 value",
+            ),
+            (
+                cfg.BIAS_MODE != BIAS_MODE_STREAMED_MULTICAST or cfg.SCHEDULER_POLICY == SCHED_NATURAL,
+                f"{flavor}: the multicast bias ring pairs chunks (c, c + 1) through the NATURAL payload's batch field (SCHEDULER_POLICY="
+                f"{cfg.SCHEDULER_POLICY}); the LPT decodes carry no cluster-rank arm",
+            ),
+            (
+                cfg.BIAS_MODE != BIAS_MODE_STREAMED_MULTICAST or (cfg.SEQ_KV_LENS_PRESENT == 0 and cfg.SEQ_Q_LENS_PRESENT == 0),
+                f"{flavor}: the multicast bias ring streams ONE kv-tile sequence to both CTAs of a cluster, so their step bounds must be the same "
+                f"function of (q tile, S_q, S_kv): per-row lengths (SEQ_KV_LENS_PRESENT={cfg.SEQ_KV_LENS_PRESENT}, SEQ_Q_LENS_PRESENT="
+                f"{cfg.SEQ_Q_LENS_PRESENT}) would make the two chunks' sequences differ -- served with global lengths only",
             ),
             (
                 cfg.BIAS_BLOCK_ROWS == (cfg.TILE_M if cfg.N_CHUNK > 0 else cfg.TILES_Q * cfg.TILE_M),
@@ -2189,7 +2247,12 @@ def _validate_bias(cfg, flavor: str) -> None:
             ),
         ]
     else:
-        preds += [(cfg.STAGES_BIAS == 0 and cfg.BIAS_RESIDENT_TILES == 0, f"{flavor}: bias geometry fields must be 0 without BIAS_MODE")]
+        preds += [
+            (
+                cfg.STAGES_BIAS == 0 and cfg.BIAS_RESIDENT_TILES == 0 and cfg.BIAS_MCAST_CTAS == 1,
+                f"{flavor}: bias geometry fields must be 0 (BIAS_MCAST_CTAS 1) without BIAS_MODE",
+            )
+        ]
     _check(preds)
 
 
@@ -2300,8 +2363,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
             raise ValueError(f"{flavor}: the additive bias / kv_mask serve dense, unsplit, unpaged, non-PackGQA, ungated graphs only")
         if bias_mode not in BIAS_MODES or kv_mask_form not in KV_MASK_FORMS:
             raise ValueError(
-                f"{flavor}: bias_mode must be 0 / 1 (resident row-block) / 2 (streamed ring) and kv_mask_form 0 / 1 (bit word) / 2 / 3 (additive "
-                f"io-dtype / fp32 vector); got {bias_mode} / {kv_mask_form}"
+                f"{flavor}: bias_mode must be 0 / 1 (resident row-block) / 2 (streamed ring) / 3 (streamed ring, cluster multicast) and kv_mask_form "
+                f"0 / 1 (bit word) / 2 / 3 (additive io-dtype / fp32 vector); got {bias_mode} / {kv_mask_form}"
             )
     stages_kv = _stages_kv_d128(params.dtype_qkv, cta_mma, mxfp8=mxfp8, tile_k=tile_k)
     # The (n, n+1) pair item (TemplateParams.n_chunk, appended; read through getattr so a record without the field renders
@@ -2311,8 +2374,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     if pair and bias_mode == BIAS_MODE_NONE:
         raise ValueError(f"{flavor}: n_chunk={n_chunk} is the (n, n+1) pair item of the BIAS arm; it needs bias_mode=1 / 2 (got {bias_mode})")
     bias_stages_req = int(getattr(params, "bias_stages", 0))
-    if bias_stages_req and bias_mode != BIAS_MODE_STREAMED:
-        raise ValueError(f"{flavor}: bias_stages={bias_stages_req} is the STREAMED ring's depth; it needs bias_mode=2 (got {bias_mode})")
+    if bias_stages_req and bias_mode not in BIAS_STREAMED_MODES:
+        raise ValueError(f"{flavor}: bias_stages={bias_stages_req} is the STREAMED ring's depth; it needs bias_mode=2 / 3 (got {bias_mode})")
     # The Q tile height (TILE_M): 128 on every flavor but the f16/bf16 small tiles, where the private seam may pin 64 (the TILE_M = 64
     # lever; ``_tile_m_d128`` is the ONE helper the budgets below read too, so the Q / O slabs, the block rows and the budgets agree).
     tile_m = _tile_m_d128(tile_k) if (tile_k <= 64 and params.dtype_qkv > _DTYPE_E5M2 and not mxfp8) else 128
@@ -2359,7 +2422,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
                 f"{flavor}: no resident bias block fits beside the Q / O slabs and the {stages_kv}-deep K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} "
                 f"({SMEM_USABLE_BYTES // 1024} KiB usable); the bias is served on the widths of SM107_BIAS_D_SHAPES={sorted(SM107_BIAS_D_SHAPES)}"
             )
-    elif bias_mode == BIAS_MODE_STREAMED:
+    elif bias_mode in BIAS_STREAMED_MODES:
         stages_bias = sm107_bias_stages_pick(
             tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair, request=bias_stages_req, tiles_q=softmax_wgs
         )
@@ -2478,6 +2541,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         STAGES_BIAS=stages_bias,
         BIAS_MAX_FORM=bias_max_form,
         S_SLOTS=s_slots,
+        # The multicast ring's cluster extent along the chunk axis (its fan-out); 1 everywhere else -- _validate_bias pins the coupling.
+        BIAS_MCAST_CTAS=BIAS_MCAST_CTAS if bias_mode == BIAS_MODE_STREAMED_MULTICAST else 1,
     )
 
     _validate_regs(cfg, flavor)

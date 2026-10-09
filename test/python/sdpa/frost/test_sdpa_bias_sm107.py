@@ -415,8 +415,8 @@ def test_config_factory_derives_the_block_and_raises_on_each_coupling():
         c.make_cfg_d32(TemplateParams(dtype_qkv=0, cta_mma=1, bias_mode=1))
     with pytest.raises(ValueError, match="dense, unsplit"):
         c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=1, pack_gqa=True, qh_per_kh=2))
-    with pytest.raises(ValueError, match="bias_mode must be 0 / 1"):  # 2 is the streamed ring (test_sdpa_bias_streamed_sm107.py); 3 is nothing
-        c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=3))
+    with pytest.raises(ValueError, match="bias_mode must be 0 / 1"):  # 2 is the streamed ring, 3 its cluster-multicast form (their own modules); 4 is nothing
+        c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=4))
     # TILE_N as a Cfg field (M-2): 64 traces the one-chunk arm, 256 is refused by the TMEM predicate at two sub-tiles.
     cfg64, _ = c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, tile_n=64))
     assert cfg64.TILE_N == 64 and cfg64.N_BMM2_CHUNKS == 1 and cfg64.BMM2_CHUNK_SIZE == 64
@@ -522,9 +522,9 @@ def test_kernel_module_constants_and_mask_sites():
     assert cfg107.SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N == {128: 0, 64: 1}
     assert [cfg107.sm107_bias_preload_chunks(w) for w in (128, 64, 256)] == [0, 1, 1]
     assert all(cfg107.sm107_bias_preload_chunks(w) in (0, 1, 2) for w in (32, 64, 128, 256))
+    # the bias barriers ride the factory's appended keywords; the multi-line call carries the S / P slot ring and the multicast ring's release count
     assert (
-        "make_classic_bars(CFG, s_stages=CFG.TILES_Q * CFG.S_SLOTS, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)"
-        in src
+        "s_stages=CFG.TILES_Q * CFG.S_SLOTS,\n        bias_resident=_BIAS_RESIDENT,\n        bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0," in src
     )
     assert "form=" not in "".join(ln for ln in src.splitlines() if "apply_mask_chunk(" in ln)
     assert 'mask_value=float("-inf")' in src and "row_max_for_exp2(total_max)" in src

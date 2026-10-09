@@ -102,7 +102,15 @@ from dataclasses import dataclass
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32
-from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED, BIAS_RING_STAGES, bias_smem_tiles, sm107_bias_preload_chunks
+from cudnn.sdpa.fwd.config_sm107 import (
+    BIAS_MODE_RESIDENT,
+    BIAS_MODE_STREAMED,
+    BIAS_MODE_STREAMED_MULTICAST,
+    BIAS_STREAMED_MODES,
+    BIAS_RING_STAGES,
+    bias_smem_tiles,
+    sm107_bias_preload_chunks,
+)
 from cudnn.sdpa.fwd.config_sm107 import BIAS_MAX_HW_UPPER_BOUND
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
@@ -291,6 +299,7 @@ from cudnn.frost.tile_dsl.bias import (
     bias_block_geometry,
     issue_bias_block_load,
     issue_bias_ring_tile,
+    issue_bias_ring_tile_multicast,
     load_bias_row_chunk,
     bias_fma_chunk,
     additive_vec_granules,
@@ -355,6 +364,35 @@ from cudnn.frost.tile_dsl.pointwise import fmax_f32 as _fmax_f32, tmem_load_max_
 #   own ring for its own rows) -> P15 adds no drain.  No accumulator parity is indexed from this ring: STAGES_BIAS is a pure
 #   latency knob (2 or 3; config_sm107.BIAS_RING_STAGES).  SMEM: the ring is declared where the resident block is (LAST), the
 #   same 128-B swizzle for the same two reasons; the operand region is untouched (DESC_VERSION 0).
+# THE MULTICAST RING (CFG.BIAS_MODE == 3, TemplateParams.bias_mode = 3; the PAIR item at cga1 only): the SAME per-CTA ring, launched
+#   as a cluster of TWO INDEPENDENT CTAs along the grid's CHUNK axis (cluster (1, 1, CFG.BIAS_MCAST_CTAS = 2); grid z = the chunk
+#   count rounded up to even; CTA_MMA / CGA_M / CGA_N stay 1 -- no collective MMA, no shared K / V).  Both CTAs decode the SAME
+#   (q tile, head) and ADJACENT chunks (c, c + 1): chunk = (payload batch field & ~1) + cluster rank (`_mcast_chunk`), so they read
+#   the SAME bias tile sequence; the rank-0 CTA issues every kv tile's bias boxes ONCE as a cta_group::1 .multicast::cluster load
+#   (tile_dsl.tma.tma_load_tile_multicast, ctaMask 0b11) whose bytes land at the same SMEM offset in BOTH CTAs and complete each
+#   CTA's OWN mb_bias_ring_full at the same offset.  Rows, per CTA per phase:
+#   mb_bias_ring_full[s]   TMA_LOAD / LOCAL / STAGES_BIAS.  Producer: THIS CTA's TMA-LDG warp arms its own stage once per fill of the
+#                          LEADER's chunk (``arrive(n_bytes=biasTileBytes, pred=elect_sync())`` -> 1 lane == init ONE_LANE); the
+#                          bytes come from the leader's multicast whichever CTA this is (a complete_tx landing before the own arm
+#                          leaves the tx-count transiently negative -- permitted; at most ONE fill per stage is in flight).
+#                          Consumer: both softmax warpgroups of THIS CTA, per fill (real steps inside the kv body, ghost steps in
+#                          the ring-only loop below).
+#   mb_bias_ring_empty[s]  THREAD + relaxed cluster arrive / LOCAL / STAGES_BIAS.  Producer: every softmax warp of THIS CTA
+#                          (``if elect_sync(): arrive()`` -> 8) AND every softmax warp of the PEER CTA
+#                          (``arrive_on_peer(rank ^ 1, pred=elect_sync())`` -> 8) once per fill after the stage's last word is
+#                          consumed: 8 + 8 = 16 == init BIAS_EMPTY_ARRIVERS x BIAS_MCAST_CTAS (make_classic_bars(bias_ring_empty_arrivers)).
+#                          Consumer: THIS CTA's TMA-LDG warp before re-arming the stage (the leader: before the multicast overwrites
+#                          a stage EITHER CTA still reads; the peer: its arming stays <= STAGES_BIAS fills ahead of the slower
+#                          CTA's consumption, so the tx-count never leaves one tile).  State PipelineState.start(1), pre-armed.
+#   mb_read_tile_id[2]     init READ_TILE_ARRIVERS_TOTAL = (8 + 4 + 1 + 1) x CGA_SIZE + CGA_SIZE // CTA_MMA = 28 + 2 = 30: BOTH CTAs'
+#                          MMA warps run and credit (CTA_MMA 1), each of the 15 warps per CTA lands one arrive on every CTA.
+#   P4: the cluster fence (cga_arrive / cga_wait) after the init block is TAKEN on this form -- a peer's cluster arrive onto an
+#   un-initialised mbar is the P4 launch failure.  P14: an EMPTY step has zero kv tiles on BOTH CTAs (the SAME item bounds: GLOBAL
+#   lengths only, pinned by config_sm107._validate_bias); a PADDED chunk (an odd chunk count) or a SHORTER tail chunk runs the
+#   ring-only GHOST handshake for every leader fill beyond its own steps (`_mcast_ghost_tiles`: the TMA-LDG arms, the softmax waits
+#   and releases), so both rings flip in lockstep and the 16-count waits complete.  P15: both TMA-LDG warps DRAIN their _empty ring
+#   after the persistent loop (STAGES_BIAS waits), so every peer release has landed before the receiving CTA exits; the peer
+#   waits _full for every leader fill, so the bytes have landed before it exits.  No cga bookend.  SMEM / TMEM: unchanged.
 # kv_mask (CFG.KV_MASK_FORM) stages nothing in SMEM: per kv tile each softmax warp loads 4 mask bytes per lane and assembles
 #   4 keep words by warp ballot (tile_dsl.mask.kv_mask_keep_words), ANDed into the band's keep words inside apply_mask_chunk.
 #   A kv_mask-only rendering therefore carries NO resident budget -- any S_kv, so the ring-wrap axis (n_kv = STAGES_KV, +1, two
@@ -384,7 +422,9 @@ _BIAS_ARM = bool(CFG.BIAS_MODE)
 # The bias FORM: the resident block (the two item-level rows R1 / R2) or the streamed ring (the two ring rows S1 / S2); every
 # form-specific seam folds on one of these two, every shared seam on _BIAS_ARM.
 _BIAS_RESIDENT = CFG.BIAS_MODE == BIAS_MODE_RESIDENT
-_BIAS_STREAMED = CFG.BIAS_MODE == BIAS_MODE_STREAMED
+_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES
+# The ring's MULTICAST form (BIAS_MODE 3): every multicast-only seam folds on this one; the ring seams above stay on _BIAS_STREAMED.
+_BIAS_MCAST = CFG.BIAS_MODE == BIAS_MODE_STREAMED_MULTICAST
 _KV_MASK_ARM = bool(CFG.KV_MASK_FORM)
 _KV_MASK_BOOL = CFG.KV_MASK_FORM == KV_MASK_BOOL_WORD
 _KV_MASK_ADD = CFG.KV_MASK_FORM in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32)
@@ -479,15 +519,25 @@ if _BIAS_STREAMED and CFG.STAGES_BIAS not in BIAS_RING_STAGES:
     # side pre-arms STAGES_BIAS fills and the softmax side advances the same count -- both read CFG.STAGES_BIAS).
     raise ValueError(f"prefill_d128_f16_sm107: the streamed bias ring is {sorted(BIAS_RING_STAGES)} stages deep (CFG.STAGES_BIAS={CFG.STAGES_BIAS})")
 if _BIAS_ARM and (_BIAS_RESIDENT == _BIAS_STREAMED):
-    raise ValueError(f"prefill_d128_f16_sm107: CFG.BIAS_MODE={CFG.BIAS_MODE} is neither the resident block (1) nor the streamed ring (2)")
+    raise ValueError(f"prefill_d128_f16_sm107: CFG.BIAS_MODE={CFG.BIAS_MODE} is neither the resident block (1) nor the streamed ring (2 / 3)")
 if _HW_UPPER_MAX and not _INF_MASK_ARM:
     raise ValueError("prefill_d128_f16_sm107: CFG.BIAS_MAX_FORM=1 is the row-max form of the bias / kv_mask body; this config has neither arm")
 if _HW_UPPER_MAX and _KV_MASK_ADD:
     # config_sm107._validate_bias pins the same coupling; the kernel's own backstop: the additive vector has no per-tile max to bound,
     # so the upper bound could sit BELOW the true row max (P > 1, an overflowing exp2 at a large positive vector).
     raise ValueError(f"prefill_d128_f16_sm107: CFG.BIAS_MAX_FORM=1 is served with the bit-word kv_mask or none (KV_MASK_FORM={CFG.KV_MASK_FORM})")
+if _BIAS_MCAST != (CFG.BIAS_MCAST_CTAS == 2) or CFG.BIAS_MCAST_CTAS not in (1, 2):
+    # config_sm107._validate_bias pins the same coupling; the kernel's own backstop (the cluster extent, the multicast fan-out and the
+    # ring's release count are ONE number).
+    raise ValueError(f"prefill_d128_f16_sm107: CFG.BIAS_MCAST_CTAS={CFG.BIAS_MCAST_CTAS} must be 2 on the multicast ring (BIAS_MODE 3) and 1 otherwise")
+if _BIAS_MCAST and not (
+    CFG.N_CHUNK > 0 and CFG.CTA_MMA == 1 and CFG.CGA_M == 1 and CFG.CGA_N == 1 and CFG.SEQ_KV_LENS_PRESENT == 0 and CFG.SEQ_Q_LENS_PRESENT == 0
+):
+    raise ValueError("prefill_d128_f16_sm107: the multicast bias ring (CFG.BIAS_MODE == 3) is the (n, n+1) pair item at cga1 with GLOBAL lengths only")
 
-CGA_SIZE = CFG.CGA_M * CFG.CGA_N
+# The launch's cluster CTA count: the collective geometry (CGA_M x CGA_N) times the multicast ring's chunk-axis extent (1 everywhere but
+# BIAS_MODE 3, where the collective geometry is 1 x 1): the scheduler credit's fan-out and the mb_read_tile_id count read it.
+CGA_SIZE = CFG.CGA_M * CFG.CGA_N * CFG.BIAS_MCAST_CTAS
 
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_2 if CFG.CTA_MMA == 2 else nvvm.CTAGroup.CTA_1
 
@@ -800,6 +850,26 @@ def _pair_step_bounds(q_tile_idx, seqlen_q, seqlen_kv, seq_kv_lens_tensor, seq_q
     return b
 
 
+@cute.jit
+def _mcast_chunk(chunk_field, bias_mcast_rank):
+    """The multicast ring's chunk decode (CFG.BIAS_MODE == 3): the two CTAs of a cluster take ADJACENT chunks (c, c + 1), c even -- the
+    cancelled cluster's FIRST CTA's batch field (even) plus this CTA's rank; the initial blockIdx.z (already this CTA's own, = first +
+    rank) maps to itself through the same floor-then-add (the cga2 x-decode's formula applied to the batch field)."""
+    return (chunk_field & cutlass.Int32(~1 & 0xFFFFFFFF)) + bias_mcast_rank
+
+
+@cute.jit
+def _mcast_ghost_tiles(chunk_idx, bias_mcast_rank, n_rows_total, item_b):
+    """The multicast ring's GHOST fills of this CTA's item: the LEADER chunk (chunk_idx - rank) fills n_steps(leader) x n_tiles bias tiles
+    into BOTH CTAs' rings; this CTA's own steps consume n_steps(own) x n_tiles of them (n_steps(own) <= 0 on the PADDED chunk of an odd
+    chunk count; < n_steps(leader) on a shorter tail chunk), the rest it must still arm / wait / release so both rings stay in lockstep
+    (P14) -- every step's kv range is the ITEM range (global lengths only, pinned by the validator).  0 on the leader."""
+    _n0_l, _ne_l, steps_leader = _pair_item_rows(chunk_idx - bias_mcast_rank, n_rows_total)
+    _n0, _ne, steps_own = _pair_item_rows(chunk_idx, n_rows_total)
+    ghost_steps = steps_leader - cute.math.max(steps_own, cutlass.Int32(0))
+    return cute.math.max(ghost_steps, cutlass.Int32(0)) * cute.math.max(item_b.right - item_b.left, cutlass.Int32(0))
+
+
 # === Kernel ===
 
 
@@ -947,7 +1017,14 @@ def _kernel(
     )
 
     # s_stages = the S / P slot ring the bmm1_done / bmm2_ready handshakes run over: TILES_Q x S_SLOTS (= TILES_Q, today's default, at one slot).
-    bars = make_classic_bars(CFG, s_stages=CFG.TILES_Q * CFG.S_SLOTS, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)
+    bars = make_classic_bars(
+        CFG,
+        s_stages=CFG.TILES_Q * CFG.S_SLOTS,
+        bias_resident=_BIAS_RESIDENT,
+        bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0,
+        # the multicast ring's stages are released by BOTH CTAs' softmax warps (8 own + 8 peer = 16); 8 x 1 on the cga1 ring
+        bias_ring_empty_arrivers=CFG.BIAS_EMPTY_ARRIVERS * CFG.BIAS_MCAST_CTAS if _BIAS_STREAMED else None,
+    )
 
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, alignment=16, space=cutlass.AddressSpace.smem)
 
@@ -964,7 +1041,9 @@ def _kernel(
     )
 
     # Scheduler mbar arrive count — stays kernel-local (sched is NOT in Bars).
-    READ_TILE_ARRIVERS_TOTAL = ((CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS) + CFG.CORRECTION_WARPS + 1 + 1) * CGA_SIZE + (CFG.CGA_M // CFG.CTA_MMA)
+    # (softmax + correction + TMA-LDG + TMA-STG warps) x the cluster's CTAs + the MMA warps that run the loop (one per CTA_MMA CTAs of
+    # the cluster: CGA_SIZE // CTA_MMA == CGA_M // CTA_MMA on every collective geometry, 2 on the multicast ring's two independent CTAs).
+    READ_TILE_ARRIVERS_TOTAL = ((CFG.SOFTMAX_WARPGROUPS * CFG.SOFTMAX_WG_WARPS) + CFG.CORRECTION_WARPS + 1 + 1) * CGA_SIZE + (CGA_SIZE // CFG.CTA_MMA)
 
     if warp_idx == 0:
         if nvvm.elect_sync():
@@ -1012,8 +1091,8 @@ def _kernel(
     nvvm.fence_mbarrier_init()
     nvvm.barrier_cta_sync()
 
-    # P4: cluster fence gates cga2 cross-CTA arrive_on_peer on peer init.
-    if cutlass.const_expr(CFG.CTA_MMA == 2):
+    # P4: cluster fence gates cga2 cross-CTA arrive_on_peer on peer init -- and the multicast ring's peer releases (BIAS_MODE 3).
+    if cutlass.const_expr(CFG.CTA_MMA == 2 or _BIAS_MCAST):
         cga_arrive()
         cga_wait()
 
@@ -1027,6 +1106,9 @@ def _kernel(
     # cga2 routing strips bit-24 so bytes land on leader's mbar.
     tma_mcast_mask = (cutlass.Int16(1) << cta_in_pair) if cutlass.const_expr(CFG.CTA_MMA == 2) else cutlass.Int16(0)
     is_leader = cta_in_pair == cutlass.Int32(0)
+    # The multicast ring's cluster rank (BIAS_MODE 3: cluster (1, 1, 2) along the chunk axis; rank 0 issues the bias TMA).  None on every
+    # other rendering (never traced); the collective-geometry values above keep their cga1 values on this form.
+    bias_mcast_rank = cute.arch.block_idx_in_cluster() if cutlass.const_expr(_BIAS_MCAST) else None
 
     # === Per-warp role dispatch ===
     if warp_idx >= CFG.SOFTMAX_WG0_BASE and warp_idx < CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS:
@@ -1052,6 +1134,7 @@ def _kernel(
             kv_mask_tensor=kv_mask_tensor,
             inv_scale=inv_scale_softmax,
             n_rows_total=n_rows_total,
+            bias_mcast_rank=bias_mcast_rank,
         )
 
     elif warp_idx >= CFG.SOFTMAX_WG1_BASE and warp_idx < CFG.SOFTMAX_WG1_BASE + CFG.SOFTMAX_WG_WARPS * (CFG.SOFTMAX_WARPGROUPS - 1):
@@ -1081,6 +1164,7 @@ def _kernel(
                     kv_mask_tensor=kv_mask_tensor,
                     inv_scale=inv_scale_softmax,
                     n_rows_total=n_rows_total,
+                    bias_mcast_rank=bias_mcast_rank,
                 )
             else:
                 _softmax_warp_group(
@@ -1104,6 +1188,7 @@ def _kernel(
                     kv_mask_tensor=kv_mask_tensor,
                     inv_scale=inv_scale_softmax,
                     n_rows_total=n_rows_total,
+                    bias_mcast_rank=bias_mcast_rank,
                 )
         else:
             _softmax_warp_group(
@@ -1127,6 +1212,7 @@ def _kernel(
                 kv_mask_tensor=kv_mask_tensor,
                 inv_scale=inv_scale_softmax,
                 n_rows_total=n_rows_total,
+                bias_mcast_rank=bias_mcast_rank,
             )
 
     elif warp_idx >= CFG.CORR_WARP_BASE and warp_idx < CFG.CORR_WARP_BASE + CFG.CORRECTION_WARPS:
@@ -1153,6 +1239,7 @@ def _kernel(
             score_max_tensor=score_max_tensor,
             score_sum_exp_tensor=score_sum_exp_tensor,
             n_rows_total=n_rows_total,
+            bias_mcast_rank=bias_mcast_rank,
         )
 
     elif warp_idx == CFG.MMA_WARP_ID:
@@ -1197,6 +1284,7 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
                 n_rows_total=n_rows_total,
+                bias_mcast_rank=bias_mcast_rank,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1232,6 +1320,7 @@ def _kernel(
             bias_b_extent=bias_b_extent,
             bias_h_extent=bias_h_extent,
             n_rows_total=n_rows_total,
+            bias_mcast_rank=bias_mcast_rank,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -1249,13 +1338,14 @@ def _kernel(
             seq_q_lens_addr=seq_q_lens_addr,
             o_desc_words=o_desc_words,
             n_rows_total=n_rows_total,
+            bias_mcast_rank=bias_mcast_rank,
         )
 
     else:  # warp_idx == CFG.SCHED_WARP_ID
         nvvm.setmaxregister(CFG.OTHER_REGS, nvvm.SetMaxRegisterAction.DECREASE)
         # try_cancel.multicast::cluster::all — only (0,0,0) CTA issues; at cga1
         # cta_id_x == 0 always, so flag is 1 unconditionally.
-        is_cga_first_cta = cta_id_x == cutlass.Int32(0)
+        is_cga_first_cta = (bias_mcast_rank == cutlass.Int32(0)) if cutlass.const_expr(_BIAS_MCAST) else (cta_id_x == cutlass.Int32(0))
         if cutlass.const_expr(CFG.THD_VARLEN):
             # THD: PERSISTENT grid + a device-bounded claim counter, so no unit
             # past the live total is ever handed out.  The counter and the live
@@ -1289,24 +1379,44 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
-def _bias_ring_fill(sBias, tma_bias, bars, bias_ring_state, kv_tile, q_row, bias_head, bias_batch):
+def _bias_ring_fill(sBias, tma_bias, bars, bias_ring_state, kv_tile, q_row, bias_head, bias_batch, bias_mcast_rank=None):
     """TMA-LDG warp, once per kv tile of the STREAMED ring (CFG.BIAS_MODE == 2): wait the stage's release
     (``mb_bias_ring_empty[idx]``, pre-armed for the first STAGES_BIAS fills), arm + queue ONE bias tile into the stage
     (``tile_dsl.bias.issue_bias_ring_tile``: one elected expect_tx of the tile's FULL boxes, cta_group=1), advance.  Called from
     EVERY kv-tile path (the prologue and the mainloop of both item forms) exactly once per kv tile -- the lockstep with the
-    softmax side's per-tile wait / release that the ring's P14 statement rests on.  Returns the advanced state."""
+    softmax side's per-tile wait / release that the ring's P14 statement rests on.  Returns the advanced state.
+
+    The MULTICAST ring (CFG.BIAS_MODE == 3; ``bias_mcast_rank`` = this CTA's cluster rank): the wait is on THIS CTA's ring (released
+    by both CTAs' softmax warps, 16 == init), EVERY CTA arms its own stage, and only rank 0 issues the tile -- as one cta_group::1
+    ``.multicast::cluster`` load into both CTAs' stage (tile_dsl.bias.issue_bias_ring_tile_multicast).  Called once per fill of the
+    LEADER's chunk on every CTA (the ghost fills of a padded / shorter chunk included), the lockstep the multicast rests on."""
     bars.mb_bias_ring_empty[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)
-    issue_bias_ring_tile(
-        sBias[bias_ring_state.idx],
-        tma_bias,
-        bars.mb_bias_ring_full[bias_ring_state.idx],
-        _BIAS_GG.tile_bytes,
-        CFG.TILE_N,
-        kv_tile,
-        q_row,
-        bias_head,
-        bias_batch,
-    )
+    if cutlass.const_expr(_BIAS_MCAST):
+        issue_bias_ring_tile_multicast(
+            sBias[bias_ring_state.idx],
+            tma_bias,
+            bars.mb_bias_ring_full[bias_ring_state.idx],
+            _BIAS_GG.tile_bytes,
+            CFG.TILE_N,
+            kv_tile,
+            q_row,
+            bias_head,
+            bias_batch,
+            bias_mcast_rank == cutlass.Int32(0),
+            cutlass.Int16((1 << CFG.BIAS_MCAST_CTAS) - 1),
+        )
+    else:
+        issue_bias_ring_tile(
+            sBias[bias_ring_state.idx],
+            tma_bias,
+            bars.mb_bias_ring_full[bias_ring_state.idx],
+            _BIAS_GG.tile_bytes,
+            CFG.TILE_N,
+            kv_tile,
+            q_row,
+            bias_head,
+            bias_batch,
+        )
     return advance(bias_ring_state, CFG.STAGES_BIAS)
 
 
@@ -1338,6 +1448,7 @@ def _tmaldg_warp_group(
     bias_b_extent=None,
     bias_h_extent=None,
     n_rows_total=None,
+    bias_mcast_rank=None,
 ):
     """Unified TMA-LDG warp — cga1 / cga2 x MASK_NONE / PADDED / CAUSAL / SWA.
 
@@ -1428,7 +1539,9 @@ def _tmaldg_warp_group(
 
     if cutlass.const_expr(_PAIR_ARM):
         # The (n, n+1) pair item (CFG.N_CHUNK > 0): the same persistent loop over scheduler items, each item a chunk of
-        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).
+        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).  The multicast
+        # ring (BIAS_MODE 3): the chunk is this CTA's rank-adjusted one (`_mcast_chunk`), a Python ternary off the arm.
+        batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
             kv_state, q_empty_phase, bias_empty_phase, bias_ring_state = _tmaldg_item_pair(
@@ -1458,6 +1571,7 @@ def _tmaldg_warp_group(
                 sBias,
                 bias_b_extent,
                 bias_h_extent,
+                bias_mcast_rank=bias_mcast_rank,
             )
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
             wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
@@ -1474,6 +1588,7 @@ def _tmaldg_warp_group(
                 n_batch,
                 seq_kv_lens_tensor,
             )
+            batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
             is_valid_tile = nxt_v & cutlass.Int32(1)
             sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
             kv_head_idx = cute.arch.make_warp_uniform(head_idx // qh_per_kh)
@@ -1664,6 +1779,14 @@ def _tmaldg_warp_group(
             bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
             kv_state = advance(kv_state, CFG.STAGES_KV)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    # P15 (the multicast ring): the PEER's softmax warps release every stage of THIS CTA's ring with a cluster arrive; drain the
+    # last STAGES_BIAS fills' releases (the pre-armed phases of never-filled stages pass) so no peer arrive lands on a torn-down
+    # CTA.  Whole-tile idle waits (the sleeping form), like the cga2 drain above.
+    if cutlass.const_expr(_BIAS_MCAST):
+        for _bs in cutlass.range_constexpr(CFG.STAGES_BIAS):
+            bars.mb_bias_ring_empty[bias_ring_state.idx].wait(bias_ring_state.phase)
+            bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 @cute.jit
@@ -1694,6 +1817,7 @@ def _tmaldg_item_pair(
     sBias,
     bias_b_extent,
     bias_h_extent,
+    bias_mcast_rank=None,
 ):
     """One (n, n+1) pair work item of the TMA-LDG warp (CFG.N_CHUNK > 0; cga1).
 
@@ -1751,7 +1875,7 @@ def _tmaldg_item_pair(
             if cutlass.const_expr(_BIAS_STREAMED):
                 # The streamed ring: the step's first kv tile's bias tile (every sub-tile reads it), after the K loads, before V.
                 bias_ring_state = _bias_ring_fill(
-                    sBias, tma_bias, bars, bias_ring_state, kv_left, q_row, bias_head, cute.math.min(rows[0], bias_b_extent - cutlass.Int32(1))
+                    sBias, tma_bias, bars, bias_ring_state, kv_left, q_row, bias_head, cute.math.min(rows[0], bias_b_extent - cutlass.Int32(1)), bias_mcast_rank
                 )
 
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
@@ -1812,7 +1936,15 @@ def _tmaldg_item_pair(
                 if cutlass.const_expr(_BIAS_STREAMED):
                     # The streamed ring: this kv tile's bias tile (one per kv tile, after the K loads, before the V loads).
                     bias_ring_state = _bias_ring_fill(
-                        sBias, tma_bias, bars, bias_ring_state, kv_loop, q_row, bias_head, cute.math.min(rows[0], bias_b_extent - cutlass.Int32(1))
+                        sBias,
+                        tma_bias,
+                        bars,
+                        bias_ring_state,
+                        kv_loop,
+                        q_row,
+                        bias_head,
+                        cute.math.min(rows[0], bias_b_extent - cutlass.Int32(1)),
+                        bias_mcast_rank,
                     )
 
                 for qs in cutlass.range_constexpr(CFG.TILES_Q):
@@ -1827,6 +1959,13 @@ def _tmaldg_item_pair(
                         mcast_mask=tma_mcast_mask,
                     )
                 kv_state = advance(states[-1], CFG.STAGES_KV)
+    if cutlass.const_expr(_BIAS_MCAST):
+        # The multicast ring's GHOST fills (P14): the leader's chunk fills more tiles than this CTA's own steps consume (a PADDED chunk
+        # of an odd chunk count, a SHORTER tail chunk) -- arm every one of them (no issue: this CTA is never the leader when the count
+        # is > 0) so this ring's _full / _empty phases stay in lockstep with the leader's fills; the softmax runs the same count.
+        ghost_tiles = _mcast_ghost_tiles(chunk_idx, bias_mcast_rank, n_rows_total, item_b)
+        for _g in cutlass.range(cutlass.Int32(0), ghost_tiles, 1, unroll=1):
+            bias_ring_state = _bias_ring_fill(sBias, tma_bias, bars, bias_ring_state, item_b.left, q_row, bias_head, cutlass.Int32(0), bias_mcast_rank)
     return kv_state, q_empty_phase, bias_empty_phase, bias_ring_state
 
 
@@ -1847,6 +1986,7 @@ def _tmastg_warp_group(
     seq_q_lens_addr,
     o_desc_words,
     n_rows_total=None,
+    bias_mcast_rank=None,
 ):
     """Persistent O-store warp.  First tile from blockIdx; subsequent tiles
     via scheduler warp's clusterlaunchcontrol.try_cancel.async.
@@ -1875,7 +2015,9 @@ def _tmastg_warp_group(
     last_o_batch = cutlass.Int32(-1)
     if cutlass.const_expr(_PAIR_ARM):
         # The (n, n+1) pair item (CFG.N_CHUNK > 0): the same persistent loop over scheduler items, each item a chunk of
-        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).
+        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).  The multicast
+        # ring (BIAS_MODE 3): the chunk is this CTA's rank-adjusted one (`_mcast_chunk`), a Python ternary off the arm.
+        batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
             o_full_phase = _tmastg_item_pair(tma_o, sO, bars, q_super_idx, head_idx, batch_idx, n_rows_total, o_full_phase)
@@ -1893,6 +2035,7 @@ def _tmastg_warp_group(
                 n_batch,
                 seq_kv_lens_tensor,
             )
+            batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
             is_valid_tile = nxt_v & cutlass.Int32(1)
             sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
     else:
@@ -2062,6 +2205,7 @@ def _mma_warp_group(
     mcast_mask,
     cta_in_pair,
     n_rows_total=None,
+    bias_mcast_rank=None,
 ):
     """Unified MMA warp — cga1 / cga2-leader x MASK_NONE / PADDED / CAUSAL / SWA,
     spill-free in CFG.OTHER_REGS (40).  Non-leader under cga2 uses _mma_warp_quiet.
@@ -2163,7 +2307,9 @@ def _mma_warp_group(
 
     if cutlass.const_expr(_PAIR_ARM):
         # The (n, n+1) pair item (CFG.N_CHUNK > 0): the same persistent loop over scheduler items, each item a chunk of
-        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).
+        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).  The multicast
+        # ring (BIAS_MODE 3): the chunk is this CTA's rank-adjusted one (`_mcast_chunk`), a Python ternary off the arm.
+        batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
             if cutlass.const_expr(not _S2):
@@ -2229,6 +2375,7 @@ def _mma_warp_group(
                 n_batch,
                 seq_kv_lens_tensor,
             )
+            batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
             is_valid_tile = nxt_v & cutlass.Int32(1)
             sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
     else:
@@ -3137,6 +3284,7 @@ def _softmax_kv_body_inf(
     kv_mask_tensor,
     bias_ring_state=None,
     s_idx=None,
+    bias_mcast_rank=None,
 ):
     """The per-iter kv body of the BIAS / KV_MASK arms (CFG.BIAS_MODE or CFG.KV_MASK_FORM): every kv tile takes this path.
 
@@ -3269,6 +3417,10 @@ def _softmax_kv_body_inf(
         # THREAD arrives have no pred= path, so the elect is a branch).
         if nvvm.elect_sync():
             bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()
+        if cutlass.const_expr(_BIAS_MCAST):
+            # ... and to the PEER CTA's ring (the multicast landed the same tile in both): one elected relaxed cluster arrive per warp
+            # (8 peer + 8 own = 16 == init); a count-only credit after the words were consumed in program order.
+            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync())
     reg_S_vec = vec_concat(chunks_S)
     if cutlass.const_expr(_HW_UPPER_MAX):
         # The UPPER BOUND of this iteration's true row max, in the exp2 argument's units: max_k S_raw * scale_log2 (the hardware max,
@@ -3384,6 +3536,7 @@ def _softmax_warp_group(
     kv_mask_tensor=None,
     inv_scale=None,
     n_rows_total=None,
+    bias_mcast_rank=None,
 ):
     """Softmax warp group (one of two): online softmax per kv iter.
 
@@ -3462,7 +3615,9 @@ def _softmax_warp_group(
 
     if cutlass.const_expr(_PAIR_ARM):
         # The (n, n+1) pair item (CFG.N_CHUNK > 0): the same persistent loop over scheduler items, each item a chunk of
-        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).
+        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).  The multicast
+        # ring (BIAS_MODE 3): the chunk is this CTA's rank-adjusted one (`_mcast_chunk`), a Python ternary off the arm.
+        batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
             _r = _softmax_item_pair(
@@ -3488,6 +3643,7 @@ def _softmax_warp_group(
                 bias_full_phase,
                 bias_ring_state,
                 s_idx,
+                bias_mcast_rank=bias_mcast_rank,
             )
             bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase, bias_ring_state = _r[:5]
             if cutlass.const_expr(_S2):
@@ -3506,6 +3662,7 @@ def _softmax_warp_group(
                 n_batch,
                 seq_kv_lens_tensor,
             )
+            batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
             is_valid_tile = nxt_v & cutlass.Int32(1)
             sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
     else:
@@ -3782,6 +3939,7 @@ def _softmax_item_pair(
     bias_full_phase,
     bias_ring_state,
     s_idx=None,
+    bias_mcast_rank=None,
 ):
     """One (n, n+1) pair work item of a softmax warp group (CFG.N_CHUNK > 0): this sub-tile is row rows[sub_tile_id] of every
     step (two sub-tiles on the pair item, three with the third softmax warp group); the resident block is waited ONCE per live item before step 0 and released ONCE after the last step (the SAME
@@ -3844,6 +4002,7 @@ def _softmax_item_pair(
                 kv_mask_tensor,
                 bias_ring_state,
                 s_idx,
+                bias_mcast_rank=bias_mcast_rank,
             )
             total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _r[:5]
             if cutlass.const_expr(_S2):
@@ -3863,6 +4022,18 @@ def _softmax_item_pair(
             # The block's LAST read of this item is behind us: release it to the TMA-LDG warp (one lane per warp).
             if nvvm.elect_sync():
                 bars.mb_bias_empty.arrive()
+    if cutlass.const_expr(_BIAS_MCAST):
+        # The multicast ring's GHOST tiles (P14): the leader's chunk filled more tiles than this CTA's own steps read (a PADDED chunk of
+        # an odd chunk count, a SHORTER tail chunk) -- wait each one (the bytes land in this ring too) and release it to BOTH rings, so
+        # the leader's 16-count waits complete and both rings stay in lockstep; the same count the TMA-LDG warp arms.  Per-fill ring
+        # waits (the spin constant), like the body's.
+        ghost_tiles = _mcast_ghost_tiles(chunk_idx, bias_mcast_rank, n_rows_total, item_b)
+        for _g in cutlass.range(cutlass.Int32(0), ghost_tiles, 1, unroll=1):
+            bars.mb_bias_ring_full[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)
+            if nvvm.elect_sync():
+                bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()
+            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync())
+            bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)
     return (bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase, bias_ring_state) + (() if s_idx is None else (s_idx,))
 
 
@@ -3896,6 +4067,7 @@ def _correction_warp_group(
     score_max_tensor: Optional[cute.Tensor] = None,
     score_sum_exp_tensor: Optional[cute.Tensor] = None,
     n_rows_total=None,
+    bias_mcast_rank=None,
 ):
     """Correction warp group: 4 warps x 32 lanes = 128 lanes, 1 lane per O row.
 
@@ -3954,7 +4126,9 @@ def _correction_warp_group(
 
     if cutlass.const_expr(_PAIR_ARM):
         # The (n, n+1) pair item (CFG.N_CHUNK > 0): the same persistent loop over scheduler items, each item a chunk of
-        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).
+        # row pairs (`_*_item_pair`); the per-item decode is the shared scheduler payload (q tile, head, chunk).  The multicast
+        # ring (BIAS_MODE 3): the chunk is this CTA's rank-adjusted one (`_mcast_chunk`), a Python ternary off the arm.
+        batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
             _r = _corr_item_pair(
@@ -3995,6 +4169,7 @@ def _correction_warp_group(
                 n_batch,
                 seq_kv_lens_tensor,
             )
+            batch_idx = _mcast_chunk(batch_idx, bias_mcast_rank) if cutlass.const_expr(_BIAS_MCAST) else batch_idx
             is_valid_tile = nxt_v & cutlass.Int32(1)
             sched_state = advance(sched_state, CFG.SCHEDULER_STAGES)
     else:
@@ -4750,6 +4925,9 @@ def _host(
     grid_q_supers = ((SQ + CFG.TILE_M - 1) // CFG.TILE_M) if cutlass.const_expr(_PAIR_ARM) else (q_clusters * CFG.CTA_MMA)
     q_supers = grid_q_supers
     sched_batch = ((B + CFG.N_CHUNK - 1) // CFG.N_CHUNK) if cutlass.const_expr(_PAIR_ARM) else B
+    # The multicast ring: a cluster of BIAS_MCAST_CTAS CTAs along the chunk axis, so the chunk count rounds up to its multiple (the
+    # padded chunk's CTA runs the ring-only ghost handshake).
+    sched_batch = (-(-sched_batch // CFG.BIAS_MCAST_CTAS)) * CFG.BIAS_MCAST_CTAS if cutlass.const_expr(_BIAS_MCAST) else sched_batch
     n_rows_total_arg = cutlass.Int32(B) if cutlass.const_expr(_PAIR_ARM) else None
     if cutlass.const_expr(CFG.THD_VARLEN):
         # THD: build the per-batch O descriptor array (reuse tma_o_desc over the
@@ -4821,7 +4999,7 @@ def _host(
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
-        cluster=(CFG.CTA_MMA, 1, 1),
+        cluster=(CFG.CTA_MMA, 1, CFG.BIAS_MCAST_CTAS),
         stream=stream,
     )
 

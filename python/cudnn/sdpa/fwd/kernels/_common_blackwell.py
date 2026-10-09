@@ -376,7 +376,14 @@ def make_d512_2x2_bars(CFG, *, N_O_CHUNKS: int, STAT_STAGES: int = 2, cross_pair
 
 
 def make_classic_bars(
-    CFG, s_stages: Optional[int] = None, *, epilogue_gate: bool = False, q_full_arrivers: int = 1, bias_resident: bool = False, bias_ring_stages: int = 0
+    CFG,
+    s_stages: Optional[int] = None,
+    *,
+    epilogue_gate: bool = False,
+    q_full_arrivers: int = 1,
+    bias_resident: bool = False,
+    bias_ring_stages: int = 0,
+    bias_ring_empty_arrivers: Optional[int] = None,
 ) -> Bars:
     """The classic pipeline's barrier set.
 
@@ -401,11 +408,19 @@ def make_classic_bars(
     for the softmax warps' per-kv-tile elected release).  0 (every other caller)
     leaves them None.  A kernel passes one of ``bias_resident`` / ``bias_ring_stages``,
     never both: the two bias forms fold on ``CFG.BIAS_MODE``.
+
+    ``bias_ring_empty_arrivers`` (appended): the ``mb_bias_ring_empty`` init count when it is NOT the CTA's own softmax
+    warps alone -- the ``streamed_multicast`` ring (``CFG.BIAS_MODE == 3``) releases every stage from BOTH CTAs of the
+    cluster (one elected local arrive + one elected relaxed cluster arrive per softmax warp), so each CTA's ring counts
+    ``BIAS_EMPTY_ARRIVERS x 2`` per phase.  None (every other caller) = ``CFG.BIAS_EMPTY_ARRIVERS``.
     """
     if bias_resident and bias_ring_stages:
         raise ValueError("make_classic_bars: bias_resident and bias_ring_stages are the two bias FORMS (CFG.BIAS_MODE 1 / 2); pass one")
     if bias_ring_stages < 0:
         raise ValueError(f"make_classic_bars: bias_ring_stages must be >= 0 (got {bias_ring_stages})")
+    if bias_ring_empty_arrivers is not None and (not bias_ring_stages or int(bias_ring_empty_arrivers) < 1):
+        raise ValueError(f"make_classic_bars: bias_ring_empty_arrivers={bias_ring_empty_arrivers} needs a ring (bias_ring_stages={bias_ring_stages}) and >= 1")
+    ring_empty_count = CFG.BIAS_EMPTY_ARRIVERS if bias_ring_empty_arrivers is None else int(bias_ring_empty_arrivers)
     # ``epilogue_gate``: same two LOCAL gate barriers as make_d256_bars (table
     # there); no classic (d128/d192) kernel passes True yet, so today every
     # caller gets None and traces unchanged.  The init counts (ONE_LANE /
@@ -469,9 +484,7 @@ def make_classic_bars(
             MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if bias_ring_stages else None
         ),
         mb_bias_ring_empty=(
-            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=CFG.BIAS_EMPTY_ARRIVERS, producer=Producer.THREAD)
-            if bias_ring_stages
-            else None
+            MBarrier(_alloc(bias_ring_stages), stages=bias_ring_stages, init_count=ring_empty_count, producer=Producer.THREAD) if bias_ring_stages else None
         ),
     )
 
