@@ -257,7 +257,7 @@ the kernel that reads it).
   flagged in review on PR #517.
 - **A raw stream handle never goes straight into `torch.cuda.ExternalStream`.**
   Every eager caller on torch's default stream hands us a default-stream
-  sentinel (`0`, `cudaStreamLegacy` = 1, `cudaStreamPerThread` = 2), and torch
+  legacy sentinel (`0`, `cudaStreamLegacy` = 1), and torch
   before PR pytorch/pytorch#183258 (in v2.13.0; NGC 26.06 and torch <= 2.12
   lack it) returns a fresh NON-BLOCKING pool stream for `ExternalStream(0)`.
   Torch work issued in that context is unordered with a kernel launched on
@@ -265,7 +265,7 @@ the kernel that reads it).
   test passes; under xdist load the kernel reads stale conversion buffers and
   a staged output is copied back before it is written (the qa sm90
   `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
-  Map the sentinels and torch's own default stream to
+  Map the legacy sentinels and torch's own default stream to
   `torch.cuda.default_stream(device)`, the current stream to itself, and only a
   genuine side stream to `ExternalStream(handle, device=device)`. The one
   implementation is `cudnn._torch_stream` (`as_torch_stream`, `stream_context`,
@@ -430,8 +430,18 @@ tensor.record_stream(as_torch_stream(ctx.stream, device))
 ```
 Never call `torch.cuda.ExternalStream` / `get_stream_from_external` directly.
 `stream_context(None)` is a no-op; a handle equal to torch's current stream is
-a no-op via the raw-handle fast path; `0`/`1`/`2` and torch's default stream
-resolve to `torch.cuda.default_stream(device)`.
+a no-op via the raw-handle fast path; `0`/`1` and torch's default stream
+resolve to `torch.cuda.default_stream(device)`. `CUstream(2)` is a per-thread
+stream, NOT the legacy default. Torch interop rejects this sentinel: a cache
+key or allocator stream record based on `(device, 2)` aliases distinct host
+threads, and mapping it to the legacy default misorders scratch lifetimes.
+Use a concrete `torch.cuda.Stream` or its raw handle. The rejection must happen
+before the raw-current-stream shortcut too. Detector:
+`core/cutedsl/test_torch_stream_sentinels.py`. When staging a caller tensor,
+record its storage on the consuming stream even when `stream=None`: the caller
+may have entered a side-stream context after allocating it elsewhere. Use
+`contiguous_on_stream` / `copy_into_on_stream`; `core/cutedsl/test_torch_stream_staging.py`
+checks both explicit and implicit current streams with allocator reuse controls.
 
 **R2 — execute needs scratch (metadata, on-device descriptors, an output the
 kernel always writes but the graph did not request, staging for a dead-but-

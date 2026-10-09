@@ -42,6 +42,9 @@ except (ImportError, OSError):
 
 import cudnn
 
+# Caller-owned DSA plan contracts: host-sync and compile-allocation detectors.
+from rule8_detector import _execute_never_blocks_the_host, compile_allocates_nothing  # noqa: E402,F401
+
 # cudart via cuda-python instead of torch: torch is optional, and startup must
 # not create a CUDA context so per-worker CUDA_VISIBLE_DEVICES routing works.
 import cuda.bindings.driver as cuda_driver

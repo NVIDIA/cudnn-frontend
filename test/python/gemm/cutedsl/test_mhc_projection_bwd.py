@@ -229,6 +229,12 @@ def test_mhc_projection_wrapper_normalizes_raw_stream(monkeypatch, stream_kind):
 
     monkeypatch.setattr(api, "_wrapper_plan", lambda device: Plan())
     with torch.cuda.stream(caller):
+        if stream_kind == "per_thread":
+            with pytest.raises(ValueError, match="cudaStreamPerThread"):
+                api.mhc_projection_backward(x, x, x, x, x, allow_tf32=True, current_stream=requested)
+            assert not allocations and not launches
+            assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream
+            return
         result = api.mhc_projection_backward(x, x, x, x, x, allow_tf32=True, current_stream=requested)
         assert result["dx"].shape == x.shape
         assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream
