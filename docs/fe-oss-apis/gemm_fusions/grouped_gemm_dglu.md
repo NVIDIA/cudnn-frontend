@@ -206,7 +206,7 @@ The block-scaled backend performs:
 
 ### Shapes
 
-### Canonical layouts
+#### Canonical layouts
 
 The block-scaled wrapper and API class also accept contiguous A `(M, K)`, C `(M, 2N)`,
 prob and dprob `(M,)`, dense B `(L, N, K)` (or N-major `(L, K, N)` with `b_major="n"`,
@@ -719,7 +719,7 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 ### Layouts and Strides
 
 - `A` must be **K-major**
-- `B` must be **K-major** (dense) or K/N-major (discrete). Must be K-major for FP4.
+- `B` must be **K-major** (dense; canonical `(L, K, N)` with `b_major="n"` is also accepted) or K/N-major (discrete). Must be K-major for FP4.
 - `C`, `D_row`, `D_col` must be **N-major**
 - All tensors must be **16-byte aligned** along the contiguous dimension
 

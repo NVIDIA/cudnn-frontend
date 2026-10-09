@@ -61,6 +61,14 @@ def normalize_b(tensor, n_major=False):
     return False, tensor
 
 
+def b_nkl(tensor, b_major="k"):
+    """(n, k, l) of a weight tensor in kernel-facing or canonical layout."""
+    if not is_canonical_b(tensor):
+        return tuple(tensor.shape)
+    l, x, y = tensor.shape
+    return (y, x, l) if b_major == "n" else (x, y, l)
+
+
 def normalize_prob(tensor):
     """(is_canonical, kernel-facing (m, 1, 1) view) for a per-row tensor."""
     if tensor is not None and tensor.ndim == 1:

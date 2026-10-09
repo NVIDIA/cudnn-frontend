@@ -36,6 +36,7 @@ from .grouped_gemm_quant import (
 from ..moe_utils import MoEWeightMode
 from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg, wrapper_operand_meta, block_scaled_sfd_tensors, row_major_layout
 from ..canonical import (
+    b_nkl,
     check_canonical_contiguous,
     check_packed_sf,
     normalize_mx,
@@ -1657,10 +1658,7 @@ def grouped_gemm_quant_wrapper_sm100(
     valid_m, k_physical = a_tensor.shape[:2]
     if is_dense:
         weight_mode = MoEWeightMode.DENSE
-        if is_canonical_b(b_tensor):
-            l, n_out = (b_tensor.shape[0], b_tensor.shape[2]) if b_major == "n" else b_tensor.shape[:2]
-        else:
-            n_out, _, l = b_tensor.shape
+        n_out, _, l = b_nkl(b_tensor, b_major)
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_out, l):
             raise ValueError(f"bias_tensor must have shape {(n_out, l)}, got {tuple(bias_tensor.shape)}")
     else:

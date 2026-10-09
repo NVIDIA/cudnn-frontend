@@ -270,8 +270,8 @@ def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tup
         return None
     tensor_shape = get_shape(tensor)
     tensor_stride = canonicalize_unit_dim_strides(tensor_shape, get_strides(tensor))
-    rank = len(tensor_shape)
-    shape = tuple(None if index in dynamic_dims or index - rank in dynamic_dims else int(value) for index, value in enumerate(tensor_shape))
+    dynamic = {dim % len(tensor_shape) for dim in dynamic_dims}
+    shape = tuple(None if index in dynamic else int(value) for index, value in enumerate(tensor_shape))
     stride = tuple(int(value) for value in tensor_stride)
     layout = stride if exact_stride else tuple(index for index, _ in sorted(enumerate(stride), key=lambda item: (item[1], tensor_shape[item[0]])))
     return (shape, layout, _convert_to_cutlass_data_type(tensor.dtype), get_device(tensor))

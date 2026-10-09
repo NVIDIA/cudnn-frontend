@@ -33,7 +33,7 @@ from ..backend_utils import (
     wrapper_operand_meta,
     wrapper_workspace,
 )
-from ..canonical import check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
+from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf, normalize_prob
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -633,10 +633,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
 
     if is_dense:
         weight_mode = MoEWeightMode.DENSE
-        if is_canonical_b(b_tensor):
-            l, n_weight = (b_tensor.shape[0], b_tensor.shape[2]) if b_major == "n" else b_tensor.shape[:2]
-        else:
-            n_weight, _, l = b_tensor.shape
+        n_weight, _, l = b_nkl(b_tensor, b_major)
     else:
         weight_mode = MoEWeightMode.DISCRETE
         _require_pointer_tensor(b_ptrs, "b_ptrs")
@@ -692,6 +689,11 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         return static_shape_suffix, stride_signature, tensor.dtype
 
     use_full_dynamic = is_dense and os.environ.get("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0"
+    sfa_signature = (
+        dynamic_tensor_signature(sfa_tensor)
+        if use_full_dynamic or is_flat_sf(sfa_tensor)
+        else dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,))
+    )
 
     if is_dense:
         cache_key = (
@@ -710,11 +712,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             stride_order(a_tensor),
             stride_order(b_tensor),
             stride_order(c_tensor),
-            *(
-                dynamic_tensor_signature(sfa_tensor)
-                if use_full_dynamic or is_flat_sf(sfa_tensor)
-                else dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,))
-            ),
+            *sfa_signature,
             *tensor_signature(alpha_tensor),
             *tensor_signature(beta_tensor),
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
@@ -753,11 +751,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             b_shape,
             b_dtype,
             *dynamic_m_tensor_signature(c_tensor, tuple(c_tensor.shape[1:]), dynamic_stride_dims=(2,)),
-            *(
-                dynamic_tensor_signature(sfa_tensor)
-                if is_flat_sf(sfa_tensor)
-                else dynamic_m_tensor_signature(sfa_tensor, (sfa_tensor.shape[4], 1) if sfa_tensor is not None else None, dynamic_stride_dims=(5,))
-            ),
+            *sfa_signature,
             *tensor_signature(alpha_tensor),
             *tensor_signature(beta_tensor),
             *dynamic_m_tensor_signature(prob_tensor, (1, 1)),
@@ -972,8 +966,7 @@ def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_db
     if dprob_slots is not None:
         from ..dsrelu.api import _reduce_dprob_slots
 
-        dprob = call.dprob_tensor
-        _reduce_dprob_slots(dprob_slots, dprob.view(-1, 1, 1) if dprob.ndim == 1 else dprob, call.current_stream)
+        _reduce_dprob_slots(dprob_slots, normalize_prob(call.dprob_tensor)[1], call.current_stream)
     return outputs
 
 
@@ -1026,12 +1019,7 @@ def _normalize_dglu_call(
         b_full_shape = get_shape(call.b_tensor)
         if len(b_full_shape) != 3:
             raise ValueError(f"b_tensor must have shape (n, k, experts), got {b_full_shape}")
-        if not is_canonical_b(call.b_tensor):
-            n_weight, b_k, num_experts = b_full_shape
-        elif call.b_major == "n":
-            num_experts, b_k, n_weight = b_full_shape
-        else:
-            num_experts, n_weight, b_k = b_full_shape
+        n_weight, b_k, num_experts = b_nkl(call.b_tensor, call.b_major)
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
         defining_b_dtype = call.b_tensor.dtype
