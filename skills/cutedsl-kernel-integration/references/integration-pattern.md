@@ -62,7 +62,7 @@ Follow the closest template instead of inventing a new lifecycle.
   - Implement `compile()` for the CuTeDSL kernel compile path.
   - Implement `execute(...)` for preallocated runtime inputs/outputs and stream handling.
 - Wrapper API:
-  - Use a Pythonic function named after the operation, following `docs/fe-oss-apis/api_conventions.md`.
+  - Name each function `<op_name>_<framework>_<direction>`, following `docs/fe-oss-apis/api_conventions.md`.
   - Allocate output tensors for common use.
   - Reuse the existing template's cache strategy when applicable.
   - Return `cudnn.api_base.TupleDict` so callers can use both key access and tuple unpacking.
@@ -70,7 +70,7 @@ Follow the closest template instead of inventing a new lifecycle.
   - For SDPA backward wrappers, return gradients with stable keys such as `dq_tensor`, `dk_tensor`, and `dv_tensor`; make wrapper-owned workspace allocation, zeroing, and reuse explicit.
   - For paired forward/backward kernels, expose sibling APIs with shared internal helpers instead of merging incompatible public contracts.
 - `__init__.py`:
-  - Export the public class and wrapper.
+  - Export the public functions, not the `APIBase` class.
   - Keep `__all__` complete and explicit.
 
 Use existing helpers from `api_base.py`, `datatypes.py`, and family utility modules before adding new helpers.

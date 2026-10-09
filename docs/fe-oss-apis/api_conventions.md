@@ -1,44 +1,51 @@
 # Python API Naming Conventions
 
-These rules apply to every **new** public Python API: any name that is added to
-`test/python/api_index/api_index.txt`. Existing names keep working; renaming them
-is part of the API pruning plan, not this document.
+These rules apply to every **new** public op API: any op name added to
+`test/python/api_index/api_index.txt`. The graph API (`cudnn.pygraph` and its
+enums) is out of scope. Existing names keep working; renaming them is part of
+the API pruning plan, not this document.
 
-## Terms
+## Name pattern
 
-- **Implementation**: the `APIBase` subclass that checks support, compiles, and
-  executes a kernel.
-- **Wrapper**: the top-level framework API that wraps an implementation as a
-  framework op. It takes framework tensors, allocates outputs, reuses compiled
-  implementations, and returns the results. "Wrapper" names this role; it is not
-  part of the API name.
+```
+cudnn.<op_name>_<framework>_<direction>
+```
+
+- `<op_name>`: the operation in snake_case, such as `grouped_gemm_swiglu` or `sdpa`.
+- `<framework>`: `torch`, `jax`, or `standalone` (no PyTorch or JAX dependency).
+- `<direction>`: `forward` or `backward`. Every op has a direction, including an
+  op without a backward.
+
+Each name is a function exported from the top-level `cudnn` package.
 
 ## Rules
 
-1. **Name the operation, not the role.** Do not put `wrapper` in a public name.
-   The wrapper is `<op>` and its implementation is `<Op>`.
-2. **Spell out the direction.** Use `_forward` / `_backward` in function names
-   and `Forward` / `Backward` in class names. Do not use `_fwd`, `_bwd`, `Fwd`,
-   or `Bwd`. An op without a backward takes no direction suffix.
-3. **Keep implementation details out of names.** Do not add an architecture
-   (`_sm90`, `_sm100`, `Sm100`, ...) or an implementation technology (`_dsl`,
-   `_cutedsl`, `_frost`, `_triton`, ...). The API dispatches internally, and an
-   unsupported configuration fails `check_support()` with a clear error.
-4. **No framework namespaces for kernels.** Do not add kernel APIs under
-   `cudnn.jax` or `cudnn.torch`. The PyTorch API takes the plain name, and a JAX
-   variant appends `_jax`. Existing `cudnn.jax` / `cudnn.torch` kernel exports
-   keep working until the API pruning plan retires them.
+1. **Functions only.** Do not export op classes. The `APIBase` subclass and its
+   `check_support()`, `compile()`, and `execute()` are internal. Exported op
+   classes such as `GroupedGemmSwigluSm100` are legacy.
+2. **No `wrapper` in names.** The function is the framework op; `wrapper` adds
+   nothing.
+3. **Spell out the direction.** Use `forward` / `backward`, never `fwd` / `bwd`.
+4. **Keep implementation details out of names.** Do not add an architecture
+   (`sm90`, `sm100`, ...) or an implementation technology (`dsl`, `cutedsl`,
+   `frost`, `triton`, ...). The function dispatches internally and raises a
+   clear error for an unsupported configuration.
+5. **No namespaces for ops.** Do not add op APIs under `cudnn.torch`,
+   `cudnn.jax`, or an op package such as `cudnn.gemm`; the framework is part of
+   the name. Existing exports keep working until the API pruning plan retires
+   them.
 
 ## Examples
 
 | Existing name | New API name |
 | --- | --- |
-| `grouped_gemm_swiglu_wrapper_sm100` | `grouped_gemm_swiglu` |
-| `GroupedGemmSwigluSm100` | `GroupedGemmSwiglu` |
-| `sparse_attention_backward_wrapper` | `sparse_attention_backward` |
-| `sdpa_fwd_wrapper_dsl_sm100` | `sdpa_forward` |
-| `HSTUFwdSm100` / `HSTUBwdSm100` | `HSTUForward` / `HSTUBackward` |
-| `FlexAttentionBwd` | `FlexAttentionBackward` |
-| `grouped_gemm_glu_jax_sm100` | `grouped_gemm_glu_jax` |
-| `cudnn.jax.kimi_delta_attention_fwd` | `kimi_delta_attention_forward_jax` |
-| `cudnn.torch.block_sparse_attention_forward` | `block_sparse_attention_forward` |
+| `cudnn.gemm.cutedsl.grouped.grouped_gemm_swiglu_wrapper_sm100` | `cudnn.grouped_gemm_swiglu_torch_forward` |
+| `cudnn.gemm.cutedsl.grouped.GroupedGemmSwigluSm100` | none; use `cudnn.grouped_gemm_swiglu_torch_forward` |
+| `cudnn.gemm.cutedsl.grouped.grouped_gemm_glu_jax_sm100` | `cudnn.grouped_gemm_glu_jax_forward` |
+| `cudnn.sdpa.fwd.sdpa_fwd_wrapper_dsl_sm100` | `cudnn.sdpa_torch_forward` |
+| `cudnn.deepseek_sparse_attention.sparse_attention_backward_wrapper` | `cudnn.sparse_attention_torch_backward` |
+| `cudnn.flex_attention.FlexAttentionBwd` | `cudnn.flex_attention_torch_backward` |
+| `cudnn.rmsnorm_rht_amax.rmsnorm_rht_amax_wrapper_sm100` | `cudnn.rmsnorm_rht_amax_torch_forward` |
+| `cudnn.torch.block_sparse_attention_forward` | `cudnn.block_sparse_attention_torch_forward` |
+| `cudnn.jax.block_sparse_attention_forward` | `cudnn.block_sparse_attention_jax_forward` |
+| `cudnn.jax.kimi_delta_attention_fwd` | `cudnn.kimi_delta_attention_jax_forward` |
