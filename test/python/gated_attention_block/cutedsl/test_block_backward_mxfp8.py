@@ -267,7 +267,7 @@ from test_block_backward_fp8 import (  # noqa: E402
     _rows_outside_mask,
     _test_python_root,
 )
-from test_block_training_forward import _alloc_saved, _dense_tail_declined, _run_training_quant  # noqa: E402
+from test_block_training_forward import _alloc_saved, _run_training_quant  # noqa: E402
 
 _SM107 = (10, 7)
 _E4M3 = torch.float8_e4m3fn
@@ -2029,6 +2029,7 @@ def test_mxfp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_
         blk.check_support()
         ws = torch.empty_like(res.ws).fill_(0xFF)
         grads = _alloc_grads(res.blk, fill=float("nan"))
+        gc.collect()  # an earlier test's cyclic garbage freed mid-compile() moves the counter down (PR #1522, sm107 CI)
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
@@ -2077,9 +2078,14 @@ def test_mxfp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_
 
 
 @requires_rubin
-def test_mxfp8_dense_tail_has_no_record():
-    """A dense ``S % 128 != 0`` has no MXFP8 record to run a backward over: the quantized forward declines it typed."""
-    _dense_tail_declined({**_COMMON, "qk_norm": True, "is_causal": False}, 1, 992, "mxfp8")
+def test_mxfp8_dense_tail_backward_is_finite_and_quantizes_bitwise():
+    """A dense ``S % 128 != 0`` has an MXFP8 record: the forward masks the KV tail in-kernel (kv_tail_mask, #1520), so the
+    backward runs over it -- every gradient finite and the bitwise layer of the matrix cells, as the launch-only cells."""
+    res = _cell_backward(_Cell("s992_dense_b1", 992, False, 1, 2, True, note="dense KV tail: the forward's kv_tail_mask record"))
+    for name, ten in res.grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), f"s992_dense_b1: {name} has non-finite cells"
+    _assert_quantizers_scalars_delta_bitwise(res)
 
 
 # ---------------------------------------------------------------------------
@@ -2201,7 +2207,7 @@ def test_the_matrix_declares_what_the_module_says():
     delayed cell shares the bitwise cell's geometry, the two launch-count-only cells reach arms no matrix cell does, the stage list
     the matrix declares against is the module's, and the (M) layer is a plain assertion on every cell once switched on (no xfail)."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
-        assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
+        assert c.causal or c.s % 128 == 0, f"{c.id}: the matrix keeps a dense S % 128 != 0 out (s992_dense_b1 covers it)"
         assert c.need_dw_qkvg is False or c.t % 32 == 0, c.id
     ragged = [c for c in _CELLS if c.t % 32]
     assert [c.id for c in ragged] == ["s1000_causal_b1_dgrad_only-norm"] and not ragged[0].need_dw_qkvg and ragged[0].need_dw_o

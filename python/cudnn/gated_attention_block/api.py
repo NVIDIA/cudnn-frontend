@@ -3384,7 +3384,7 @@ class _Sdpa(_Stage):
         if tuple(cc) != _SM107_CC:
             raise NotImplementedError(f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only for now; found SM{cc[0]}{cc[1]}")
         self._impl = self._build_impl()
-        # The adapter's own contract check: the dense S % 128 decline and the
+        # The adapter's own contract check: the dense S % 128 split-KV decline and the
         # FP8 envelope, the gate descriptor's shape / dtype / TMA-expressible
         # stride, and the standalone twins of the rows' gate claims (arch,
         # head dims, MXFP8, THD, paged, split, PackGQA -- engine-contract § 8b).

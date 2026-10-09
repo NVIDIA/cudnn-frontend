@@ -41,8 +41,8 @@ printed on every cell, never widened again:
   S=256, B=1): dh 0.50, dW_qkvg 0.56, dW_o 0.45 of the bound, cos 1.000000; its dW_norm ``|diff| / mass``
   0.0019-0.0023 (8x below bf16's, the same three bits), 0.05-0.06 of the noise bound.
 
-A DENSE ``S % 128 != 0`` has no training record: the FORWARD's SDPA row declines it typed (its KV tail would be
-unmasked on the SM100 DSL), so the two dense S=1000 cells of the S sweep pin that decline instead of a gradient.
+A DENSE ``S % 128 != 0`` is a training record like any other: the FORWARD's SDPA row masks the KV tail in-kernel
+(kv_tail_mask, #1520), so the two dense S=1000 cells of the S sweep differentiate it against fp64 autograd.
 
 ``fuse_wgrad_overlap`` (the two weight-gradient GEMMs on a block-owned side stream, forked / joined through events) is a
 SCHEDULING knob: the same launches, so it is pinned by bitwise equality with the in-order block (bf16 / fp16 x dense /
@@ -418,15 +418,9 @@ def test_gradients_match_fp64_autograd(qk_norm, causal, seq_len):
     the test geometry, B=2, norm | rope_only x causal | dense x S in {256 (one kv block), 1000 (S % 128 != 0: the
     adapter's padded staging), 2048}. The magnitudes are printed; the bounds are the module's, never widened.
 
-    A DENSE ``S % 128 != 0`` has no training record to differentiate: the FORWARD's SDPA row declines it typed (its KV
-    tail would be unmasked on the SM100 DSL: "S_kv (1000) must be a multiple of 128 unless a padding mask ... or the
-    causal mask covers the KV tail"), so those two cells pin the forward's decline instead of skipping (rejections are
-    asserted, not skipped); the causal S=1000 cells run the adapter's padded launches."""
+    A DENSE ``S % 128 != 0`` is differentiated like the rest: the FORWARD's SDPA row masks its KV tail in-kernel
+    (kv_tail_mask, #1520); the S=1000 cells, causal and dense, run the adapter's padded launches."""
     geom_kw = {**_COMMON, "qk_norm": qk_norm, "is_causal": causal}
-    if not causal and seq_len % 128:
-        with pytest.raises(ValueError, match="multiple of 128"):
-            _backward(geom_kw, batch=2, seq_len=seq_len)
-        return
     res = _backward(geom_kw, batch=2, seq_len=seq_len)
     worst = _check_all_grads(res)
     assert (res.grads["dw_q_norm"] is None) == (not qk_norm)

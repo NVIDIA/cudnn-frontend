@@ -199,7 +199,7 @@ from test_block_backward import (  # noqa: E402
     _declare_bwd,
     _make_dy,
 )
-from test_block_training_forward import _alloc_saved, _declare_quant, _dense_tail_declined, _dequantized_bf16_inputs, _run_training_quant  # noqa: E402
+from test_block_training_forward import _alloc_saved, _declare_quant, _dequantized_bf16_inputs, _run_training_quant  # noqa: E402
 
 _SM107 = (10, 7)
 _E4M3 = torch.float8_e4m3fn
@@ -1722,10 +1722,14 @@ def test_fp8_execute_scalar_contracts_are_typed():
 
 
 @requires_rubin
-def test_fp8_dense_tail_has_no_record():
-    """A dense ``S % 128 != 0`` has no quantized record to run a backward over: the quantized forward declines it typed at
-    ``check_support`` (no padding mask and no causal mask covering the KV tail) -- the complement of the padded causal cells."""
-    _dense_tail_declined({**_COMMON, "qk_norm": True, "is_causal": False}, 1, 992, "fp8")
+def test_fp8_dense_tail_backward_is_finite_and_quantizes_bitwise():
+    """A dense ``S % 128 != 0`` has a quantized record: the forward masks the KV tail in-kernel (kv_tail_mask, #1520), so the
+    backward runs over it -- every gradient finite and the bitwise layer of the matrix cells, as the launch-only cells."""
+    res = _cell_backward(_Cell("s992_dense_b1", 992, False, 1, 2, True, note="dense KV tail: the forward's kv_tail_mask record"))
+    for name, ten in res.grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), f"s992_dense_b1: {name} has non-finite cells"
+    _assert_quantizers_scalars_delta_bitwise(res)
 
 
 # ---------------------------------------------------------------------------
@@ -1951,7 +1955,7 @@ def test_the_matrix_declares_what_the_module_says():
     runs at ``scale_dp = 1.0``; the (M) GQA layer's parametrization is the 13 GQA matrix cells (the fold is a GQA mechanism: no MHA
     cell), every one a PLAIN assertion -- the fold rounds once, so no cell carries an ``xfail``."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
-        assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
+        assert c.causal or c.s % 128 == 0, f"{c.id}: the matrix keeps a dense S % 128 != 0 out (s992_dense_b1 covers it)"
     for c in _LAUNCH_ONLY_CELLS:  # launch-count arms the matrix does not reach, and nothing it already runs
         assert c.causal and c.id not in {m.id for m in _CELLS}, c.id
     pad_mha, kv_only = _BY_ID["s992_causal_b1_mha-norm"], _BY_ID["s384_causal_b1-norm"]
@@ -2117,6 +2121,7 @@ def test_fp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_wr
         blk.check_support()
         ws = torch.empty_like(res.ws).fill_(0xFF)
         grads = _alloc_grads(res.blk, fill=float("nan"))
+        gc.collect()  # an earlier test's cyclic garbage freed mid-compile() moves the counter down (PR #1522, sm107 CI)
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
