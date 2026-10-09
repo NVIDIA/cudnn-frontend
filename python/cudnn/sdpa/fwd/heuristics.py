@@ -1759,7 +1759,7 @@ def _split_points(
     # fold, and a gated graph's split (the gate rides its combine) carries no sink.
     if (
         (facts.thd and not ragged_decode)
-        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate))
+        or (facts.has_sink and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or not (caps.sm_lo == 100 and caps.sm_hi < 107)))
         or (facts.padded and not facts.has_paged_kv)
         or facts.seq_q_trim
     ):

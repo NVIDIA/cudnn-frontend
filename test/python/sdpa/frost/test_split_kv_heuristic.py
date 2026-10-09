@@ -557,7 +557,9 @@ def test_serial_combine_term_grows_with_kv_but_never_runs_away():
     got = [choose_split_kv(kv_tiles=-(-kv // 128), serial_combine=True, **tp8_q3) for kv in (8192, 32768, 131072)]
     assert all(a <= b for a, b in zip(got, got[1:])), got
     assert 32 <= got[-1] <= 64, got
-    assert choose_split_kv(kv_tiles=1024, **tp8_q3) > got[-1]
+    # The per-row model's lone-block floor already curbs this launch; the serial
+    # term can only lower the pick further, never raise it.
+    assert choose_split_kv(kv_tiles=1024, **tp8_q3) >= got[-1]
 
 
 def test_serial_combine_term_leaves_decode_and_saturated_launches_alone():

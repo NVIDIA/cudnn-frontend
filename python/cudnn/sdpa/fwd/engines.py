@@ -1023,15 +1023,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
-                # Half flavors fold the sink once in the combine; the FP8 epilogues
-                # still fold it per tile, a gated split's combine carries no sink, and
-                # the packed THD split carries one only where thd_split_domain admits
-                # it (supports_paged_split_sink).
-                or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate))
+                # The SM100 half flavors write sink-free partials and fold the sink
+                # once in the combine; the FP8 epilogues and the Rubin kernels still
+                # fold it per tile, a gated split's combine carries no sink, and the
+                # packed THD split carries one only where thd_split_domain admits it
+                # (supports_paged_split_sink).
+                or (facts.has_sink and not packed_split and (facts.is_fp8 or facts.is_mxfp8 or facts.has_epilogue_gate or capabilities.sm_lo != 100))
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves dense graphs (sinks on the half flavors), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
+                return "split_kv > 1 serves sink-free dense graphs (a sink splits on the SM100 half flavors only), the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
                 (facts.d_qk, facts.d_v),
                 device_cc=facts.device_cc,
