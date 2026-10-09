@@ -9,8 +9,10 @@ launched as a CLUSTER of two INDEPENDENT CTAs along the grid's chunk axis (clust
 collective MMA, no shared K / V ring).  The two CTAs decode the SAME (q tile, head) and ADJACENT chunks (c, c + 1), so they read the
 SAME bias tile sequence: the rank-0 CTA issues every tile's boxes ONCE as a cta_group::1 ``.multicast::cluster`` TMA load whose bytes
 land at the same SMEM offset in both CTAs and complete each CTA's OWN ``mb_bias_ring_full`` (every CTA arms its own), and every stage is
-released to BOTH CTAs' ``mb_bias_ring_empty`` (init 2 x the softmax warps = 16: one elected local arrive + one elected relaxed cluster
-arrive per softmax warp).  A PADDED chunk (an odd chunk count) or a SHORTER tail chunk runs the ring-only GHOST handshake for every fill
+released to BOTH CTAs' ``mb_bias_ring_empty`` (init 2 x the softmax warps = 16: one elected local arrive + one elected ``.release.cta``
+cluster arrive per softmax warp -- a READ-then-credit across CTAs takes the release form, never the relaxed one: the credit must be
+ordered after the thread's generic loads of the stage it frees; same SASS on sm_107a, no drain).  A PADDED chunk (an odd chunk count) or a
+SHORTER tail chunk runs the ring-only GHOST handshake for every fill
 the leader issues beyond its own steps, so both rings stay in lockstep.  The L2 -> SMEM bias feed of the pair item is halved; O / Stats
 are BITWISE the cga1 ring's (same tiles, same order, same FFMA).  Served with GLOBAL lengths only (per-row lengths would make the two
 chunks' kv-tile sequences differ) under the NATURAL scheduler; a REQUEST-ONLY form (the adapter's ``bias_mode=3`` / the test seam):
@@ -208,7 +210,11 @@ def test_cfg_is_appended_and_the_kernel_carries_the_multicast_ring_as_one_const_
     ), "5 roles x (initial + payload)"
     assert src.count("bias_ring_state = _bias_ring_fill(") == 5, "the four kv-tile paths + the TMA-LDG ghost loop"
     assert src.count("ghost_tiles = _mcast_ghost_tiles(chunk_idx, bias_mcast_rank, n_rows_total, item_b)") == 2, "the TMA-LDG and the softmax ghost loops"
-    assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync())") == 2
+    assert (
+        src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync(), release_cta=True)")
+        == 2
+    ), "the kv body's and the ghost loop's peer credit, both in the .release.cta form (a read-then-credit across CTAs)"
+    assert "arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync())" not in src, "a relaxed peer credit on the ring"
     assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()") == 2, "the kv body's own release + the ghost loop's"
     assert "issue_bias_ring_tile_multicast(" in src and "bias_mcast_rank == cutlass.Int32(0)" in src
     assert "cluster=(CFG.CTA_MMA, 1, CFG.BIAS_MCAST_CTAS)" in src
@@ -401,7 +407,8 @@ def test_streamed_renderings_are_byte_identical_to_their_record(tmp_path, arm):
 )
 def test_multicast_renderings_keep_the_split_no_drain_and_the_predicated_issue(tmp_path, d, extra, stages):
     """Each multicast rendering traced for sm_107a keeps the per-role register split (USETMAXREG > 0), no cluster-scope drain (no CGAERRBAR,
-    no MEMBAR.ALL.GPU: the peer release is the RELAXED cluster arrive), spills no more than the cga1 ring's rendering of the same arm, carries
+    no MEMBAR.ALL.GPU: the peer release is the .release.cta cluster arrive, never .release.cluster), spills no more than the cga1 ring's
+    rendering of the same arm, carries
     the packed bias add and the software row max, the bit-word form under a mask, a cluster of 2 and the ring's depth -- and ONE more
     bias-issue site than the cga1 ring (the ghost fill), each site predicated by rank, not duplicated: UTMALDG grows by exactly the boxes
     of one tile."""
@@ -442,6 +449,7 @@ pats = {
     "LOCAL_TMA": r"cp\.async\.bulk\.tensor\.\dd\.shared::cta\.global\.tile\.mbarrier::complete_tx::bytes",
     "CTARANK": r"%cluster_ctarank",
     "RELAXED_CLUSTER_ARRIVE": r"mbarrier\.arrive\.relaxed\.cluster\.shared::cluster\.b64",
+    "RELEASE_CTA_CLUSTER_ARRIVE": r"mbarrier\.arrive\.release\.cta\.shared::cluster\.b64",
     "RELEASE_CLUSTER": r"mbarrier\.arrive\.release\.cluster",
     "CLUSTER_BARRIER": r"barrier\.cluster\.(arrive|wait)",
 }
@@ -456,7 +464,8 @@ def test_ptx_carries_the_cta_group_1_multicast_form_on_the_multicast_rendering_o
     ``.multicast::cluster`` form (the bytes and the complete_tx land on EVERY destination CTA's own barrier), never a ``cta_group::2``
     token (the form whose bytes land on the pair leader only -- a peer waiting its own barrier under it hangs); exactly the fill
     sites x the boxes of a tile (3 sites: the prologue, the mainloop, the ghost loop); the cluster rank is read; the peer release is
-    the relaxed cluster arrive; a cluster barrier pair exists.  The cga1 ring's rendering carries none of them."""
+    the .release.cta cluster arrive (a READ-then-credit across CTAs: zero relaxed cluster arrives, zero .release.cluster); a cluster
+    barrier pair exists.  The cga1 ring's rendering carries none of them."""
     from frost_test_utils import arch_known_to_the_dsl
 
     if not arch_known_to_the_dsl("sm_107a"):
@@ -470,10 +479,16 @@ def test_ptx_carries_the_cta_group_1_multicast_form_on_the_multicast_rendering_o
     boxes = next(int(ln.split()[1]) for ln in proc.stdout.splitlines() if ln.startswith("BIAS_BOXES_PER_TILE "))
     assert got["CTA_GROUP2"] == 0, got
     if mode == _MCAST:
-        assert got["MCAST"] == 3 * boxes and got["CTARANK"] == 1 and got["RELAXED_CLUSTER_ARRIVE"] == 4 and got["CLUSTER_BARRIER"] == 2, got
-        assert got["RELEASE_CLUSTER"] == 0, got
+        assert got["MCAST"] == 3 * boxes and got["CTARANK"] == 1 and got["CLUSTER_BARRIER"] == 2, got
+        # The ring's peer credit is the .release.cta cluster arrive (a READ-then-credit across CTAs: ordered after the thread's generic
+        # loads of the stage it frees), NEVER the relaxed one, and never .release.cluster (a GPU-scope drain per arrive).  The count:
+        # the scheduler credit's 6 sites (read_tile_id_arrive at CGA_SIZE 2 emits the SAME instruction; the pre-fix rendering carried
+        # exactly those 6 beside 4 relaxed peer credits) + the kv body's and the ghost loop's peer credit x the two softmax warp-group
+        # instantiations = 10.
+        assert got["RELAXED_CLUSTER_ARRIVE"] == 0 and got["RELEASE_CTA_CLUSTER_ARRIVE"] == 6 + 4 and got["RELEASE_CLUSTER"] == 0, got
     else:
-        assert got["MCAST"] == 0 and got["CTARANK"] == 0 and got["RELAXED_CLUSTER_ARRIVE"] == 0 and got["CLUSTER_BARRIER"] == 0, got
+        assert got["MCAST"] == 0 and got["CTARANK"] == 0 and got["CLUSTER_BARRIER"] == 0, got
+        assert got["RELAXED_CLUSTER_ARRIVE"] == 0 and got["RELEASE_CTA_CLUSTER_ARRIVE"] == 0 and got["RELEASE_CLUSTER"] == 0, got
     assert got["LOCAL_TMA"] > 0, got
 
 

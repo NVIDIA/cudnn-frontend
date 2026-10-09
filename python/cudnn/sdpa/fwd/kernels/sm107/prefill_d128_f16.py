@@ -377,10 +377,16 @@ from cudnn.frost.tile_dsl.pointwise import fmax_f32 as _fmax_f32, tmem_load_max_
 #                          leaves the tx-count transiently negative -- permitted; at most ONE fill per stage is in flight).
 #                          Consumer: both softmax warpgroups of THIS CTA, per fill (real steps inside the kv body, ghost steps in
 #                          the ring-only loop below).
-#   mb_bias_ring_empty[s]  THREAD + relaxed cluster arrive / LOCAL / STAGES_BIAS.  Producer: every softmax warp of THIS CTA
+#   mb_bias_ring_empty[s]  THREAD + .release.cta cluster arrive / LOCAL / STAGES_BIAS.  Producer: every softmax warp of THIS CTA
 #                          (``if elect_sync(): arrive()`` -> 8) AND every softmax warp of the PEER CTA
-#                          (``arrive_on_peer(rank ^ 1, pred=elect_sync())`` -> 8) once per fill after the stage's last word is
-#                          consumed: 8 + 8 = 16 == init BIAS_EMPTY_ARRIVERS x BIAS_MCAST_CTAS (make_classic_bars(bias_ring_empty_arrivers)).
+#                          (``arrive_on_peer(rank ^ 1, pred=elect_sync(), release_cta=True)`` -> 8) once per fill after the stage's
+#                          last word is consumed: 8 + 8 = 16 == init BIAS_EMPTY_ARRIVERS x BIAS_MCAST_CTAS
+#                          (make_classic_bars(bias_ring_empty_arrivers)).  FORM (P1 / P13): the peer credit is a READ-then-credit
+#                          across CTAs -- it lets the leader's next multicast overwrite the stage this thread just read with generic
+#                          ld.shared -- so it is the ``.release.cta.shared::cluster`` arrive (the scheduler credit's form; same SASS
+#                          as the relaxed arrive on sm_107a, no CGAERRBAR / MEMBAR.ALL.GPU), never the relaxed one (a relaxed
+#                          arrive does not order the thread's prior loads before the credit becomes visible) and never
+#                          ``.release.cluster`` (a GPU-scope drain per arrive).
 #                          Consumer: THIS CTA's TMA-LDG warp before re-arming the stage (the leader: before the multicast overwrites
 #                          a stage EITHER CTA still reads; the peer: its arming stays <= STAGES_BIAS fills ahead of the slower
 #                          CTA's consumption, so the tx-count never leaves one tile).  State PipelineState.start(1), pre-armed.
@@ -3418,9 +3424,13 @@ def _softmax_kv_body_inf(
         if nvvm.elect_sync():
             bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()
         if cutlass.const_expr(_BIAS_MCAST):
-            # ... and to the PEER CTA's ring (the multicast landed the same tile in both): one elected relaxed cluster arrive per warp
-            # (8 peer + 8 own = 16 == init); a count-only credit after the words were consumed in program order.
-            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync())
+            # ... and to the PEER CTA's ring (the multicast landed the same tile in both): one elected .release.cta cluster arrive per
+            # warp (8 peer + 8 own = 16 == init).  RELEASE, not relaxed: this credit lets the LEADER's next multicast overwrite the
+            # stage THIS thread has just read with generic ld.shared (load_bias_row_chunk, the pre-loaded chunks included), and a relaxed
+            # arrive does not order the thread's prior loads before the credit is visible (ptxas may hoist it above an independent LDS --
+            # the tcgen05_wait(LOAD) arrive-between-loads shape).  The CTA-scope release orders this thread's own loads at no cost: the
+            # scheduler credit's form (same SASS as the relaxed arrive on sm_107a, no CGAERRBAR); never .release.cluster (a GPU drain).
+            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync(), release_cta=True)
     reg_S_vec = vec_concat(chunks_S)
     if cutlass.const_expr(_HW_UPPER_MAX):
         # The UPPER BOUND of this iteration's true row max, in the exp2 argument's units: max_k S_raw * scale_log2 (the hardware max,
@@ -4032,7 +4042,9 @@ def _softmax_item_pair(
             bars.mb_bias_ring_full[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)
             if nvvm.elect_sync():
                 bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()
-            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync())
+            # The peer credit in the SAME form as the kv body's (.release.cta): one arrive form per ring row, so the leader's refill
+            # is ordered after this CTA's _full wait on every path that credits it.
+            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive_on_peer(bias_mcast_rank ^ cutlass.Int32(1), pred=nvvm.elect_sync(), release_cta=True)
             bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)
     return (bmm1_phase, stat_empty_phase, epilogue_state, bias_full_phase, bias_ring_state) + (() if s_idx is None else (s_idx,))
 
