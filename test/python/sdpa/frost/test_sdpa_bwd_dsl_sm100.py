@@ -1648,6 +1648,20 @@ _STAGE2_SASS_PROBE = _textwrap.dedent(r"""
     if nvd is None:
         print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
     sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    # THD also emits a descriptor helper. Count only the main stage-2 kernel:
+    # the helper's required GPU fence is not a drain in the attention loop.
+    sections, current = {}, None
+    for line in sass:
+        match = re.match(r'\s*\.section\s+\.text\.([^,\s]+)', line)
+        if match:
+            current = match.group(1)
+            sections[current] = []
+        if current is not None:
+            sections[current].append(line)
+    main = [lines for name, lines in sections.items() if name.startswith("cudnn_kernel__kernel_")]
+    assert len(main) == 1, f"expected one stage-2 main kernel, got {list(sections)}"
+    print("SASS_FUNCTIONS", list(sections))
+    sass = main[0]
     def cnt(*subs):
         return sum(1 for ln in sass if all(sb in ln for sb in subs))
     for key, subs in json.loads(%(counts)r).items():
@@ -1697,8 +1711,7 @@ def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
     assert expect["DESC_VERSION"] == 0 and expect["CLUSTER_Q_ROWS"] == 256 and expect["N_CHUNKS"] == 8
     # USETMAXREG is 0 here as on the 4x1 sibling: ptxas C7508 drops every setmaxregister of these 8-warp d512 bodies (it
     # cannot determine the entry count) -- recorded, not required; the 12-warp sm107 bodies pin > 0 (see that file).
-    # THD also emits the descriptor-preparation kernel, with one GPU fence.
-    assert st["MEMBAR_GPU"] == int(arm == "thd") and st["CGAERRBAR"] == 0, st
+    assert st["MEMBAR_GPU"] == 0 and st["CGAERRBAR"] == 0, st
     assert st["UBLKCP"] == 0, f"no DSMEM bulk copy survives the fusion: {st}"
     assert st["LDTM"] == 2 * n_compute_bodies, f"two tcgen05.ld (S_acc, dS_acc) per compute kv body: {st}"
     assert st["UTCHMMA"] == 64, f"8 chunks x 4 k-steps x 2 BMMs in the one MMA kv body: {st}"
