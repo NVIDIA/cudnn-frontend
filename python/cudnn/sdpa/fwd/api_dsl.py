@@ -1863,8 +1863,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # packed d256 request past its route is the typed decline engines.mismatch gives (not the prefill
             # tiles' divisibility rule, which would name tile_m for a 24/2 group the tile serves at S_q <= 4).
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not self._fp8 and self.flavor == (256, 256) and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin half PackGQA at D256 is wired on the decode tile only (a decode-shaped graph: S_q x G packed rows within its routed envelope; the d256 prefill kernel runs unpacked)",
+                self._device_cc == (10, 7)
+                and not self._fp8
+                and self.flavor == (256, 256)
+                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
+                and not supports_paged_d256_pack_gqa(
+                    (int(d_qk), int(d_v)),
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                ),
+                "Rubin half PackGQA at D256 is wired on the decode tile (a decode-shaped dense graph: S_q x G packed rows within its routed envelope) and on the paged half THD prefill (CGA2, unsplit) only; the dense d256 prefill kernel runs unpacked",
             )
             self._value_error_if(
                 not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial)

@@ -185,6 +185,9 @@ _F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm
 # same two shapes; half paged graphs never load an sm107 file (api_dsl._load_sm100_kernel_module routes them to the
 # SM100 bodies).  _validate_params declines every other flavor, and each unwired MXFP8 kernel file refuses paged_kv at
 # module scope as well.  A page holds whole 128-row F8_128x4 SF atom sets, so page_size is a multiple of the KV tile.
+# One cc 10.7 HALF kernel reads pools natively and validates its OWN record (it never passes through _validate_params,
+# so this set does not name it): sm107/decode_d256_f16.py (make_cfg_d256_decode -- the decode-shaped dense-Q d256
+# route, the SM100 decode record re-validated for Rubin).
 _PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128 mxfp8", "sm107 d256 mxfp8"})
 
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the

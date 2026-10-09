@@ -980,12 +980,27 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # whose PackGQA wiring the set is describing.
             if _selected_d_shape(capabilities, facts) not in capabilities.pack_gqa_d_shapes:
                 return f"pack_gqa is wired only in the {sorted(capabilities.pack_gqa_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
-            # On the Rubin half row the (256, 256) entry IS the decode tile: the d256 prefill kernel runs
-            # unpacked, so a packed d256 graph is honorable exactly when its whole group rides the decode
-            # tile.  The heuristics' _pack_gqa_eligible proposes under the same predicate -- a proposal
+            # On the Rubin half row the (256, 256) entry is the decode tile and the paged THD d256 prefill
+            # (CGA2, unsplit): the dense d256 prefill kernel runs unpacked, so a packed dense d256 graph is
+            # honorable exactly when its whole group rides the decode tile.  The heuristics' _pack_gqa_eligible
+            # proposes under the same predicate -- a proposal
             # declined here would leave the engine offering NOTHING whenever its base leg splits.
-            if capabilities.sm_lo == 107 and not (facts.is_fp8 or facts.is_mxfp8) and _selected_d_shape(capabilities, facts) == (256, 256) and not decode_tile:
-                return "Rubin half PackGQA at D256 is wired on the decode tile only (a decode-shaped graph: S_q x G packed rows within its routed envelope; the d256 prefill kernel runs unpacked)"
+            if (
+                capabilities.sm_lo == 107
+                and not (facts.is_fp8 or facts.is_mxfp8)
+                and _selected_d_shape(capabilities, facts) == (256, 256)
+                and not decode_tile
+                and not supports_paged_d256_pack_gqa(
+                    (facts.d_qk, facts.d_v),
+                    device_cc=facts.device_cc,
+                    fp8=facts.is_fp8 or facts.is_mxfp8,
+                    thd=facts.thd,
+                    paged=facts.has_paged_kv,
+                    cga=knobs.cga,
+                    split_kv=knobs.split_kv or 1,
+                )
+            ):
+                return "Rubin half PackGQA at D256 is wired on the decode tile (a decode-shaped dense graph: S_q x G packed rows within its routed envelope) and on the paged half THD prefill (CGA2, unsplit) only; the dense d256 prefill kernel runs unpacked"
         if knobs.pack_gqa:
             if (
                 capabilities.sm_lo == 107
@@ -1000,8 +1015,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                     cga=knobs.cga,
                     split_kv=knobs.split_kv or 1,
                 )
+                and not decode_tile
             ):
-                return "SM107 D256 PackGQA requires exact paged half THD with CGA2 and no split"
+                return "SM107 D256 PackGQA requires exact paged half THD with CGA2 and no split, or the d256 decode tile (a decode-shaped dense graph: S_q x G packed rows within its routed envelope)"
             if (
                 facts.thd
                 and not ragged_decode
