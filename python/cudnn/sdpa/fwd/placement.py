@@ -69,12 +69,14 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   d128/v128 BF16 Blackwell prefixes without Stats reuse this first-wave rule
   for integral GQA1/2/4/8 and fixed graphs (B200, released cuDNN 9.27).
   The existing order remains when there is no first-wave split to use.
-- nonpaged THD, d128 half, bottom-right causal GQA4/8/16 without window, sink or right band (the
+- nonpaged THD, d128 half, bottom-right causal GQA2/4/8/16 without window, sink or right band (the
   groups whose first plan is packed): unsplit
   FROST leads at KV > 512 with b * h_q * s_q >= 110 query rows per SM, or Q >= 256 at KV >= 1024 (B200,
   cuDNN 9.27, 2026-10-08: 90 qualifying cases, 0.44-1.00 warm, median 0.89; one cold 1.10 at warm 0.99;
   a 68-SM SM100: 19 of 31 small launches lead at 0.40-0.95, none slower; B300: 48 leads at 0.25-0.95).
-  Smaller launches lost up to 1.54x; GQA1/2 and non-causal graphs (unpacked) keep the backend first.
+  Smaller launches lost up to 1.54x; GQA1 and non-causal graphs (unpacked) keep the backend first.
+  GQA2 (packed since 2026-10-09) also needs KV >= 4096: B300, 72 cases, packed 0.53-0.97 there; on a
+  1-2k cache large batches lost up to 1.26x.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
@@ -219,10 +221,11 @@ D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q f
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
 CHUNKED_MIN_KV_TOKENS = 4096
 THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
+THD_PACKED_GQA2_MIN_KV_TOKENS = 4096  # GQA2 packs two heads a tile: large batches on a 1-2k cache lost up to 1.26x
 # Small unsplit packed launches lose to the backend (KV 576-1024 below ~110 query rows per SM: up to
 # 1.43x on B200 and a 68-SM SM100); 8192 rows lost on B200 (148 SMs) and won 0.71-0.89 on 68 SMs.
-THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # b * h_q * s_q per SM
-THD_PACKED_LONG_Q = 256  # ... except long sequences: Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
+THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # h_q * (b * s_q, or a smaller declared token total) per SM
+THD_PACKED_LONG_Q = 256  # ... except long sequences (by declared total / b): Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
 THD_PACKED_LONG_Q_MIN_KV = 1024
 CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
 
@@ -489,12 +492,17 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and not (facts.has_sink or facts.right_band_widening)
         and facts.s_kv > THD_PACKED_MIN_KV_TOKENS
         and (
-            facts.b * facts.h_q * facts.s_q >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
-            or (facts.s_q >= THD_PACKED_LONG_Q and facts.s_kv >= THD_PACKED_LONG_Q_MIN_KV)
+            facts.h_q * min(facts.b * facts.s_q, facts.max_total_seq_len_q or facts.b * facts.s_q)
+            >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
+            or (
+                min(facts.s_q, -(-(facts.max_total_seq_len_q or facts.b * facts.s_q) // facts.b)) >= THD_PACKED_LONG_Q
+                and facts.s_kv >= THD_PACKED_LONG_Q_MIN_KV
+            )
         )
+        and (facts.h_q != 2 * facts.h_kv or facts.s_kv >= THD_PACKED_GQA2_MIN_KV_TOKENS)
         and _prefer_thd_pack_gqa(caps, facts)
     ):
-        return LEAD  # unsplit packed causal GQA4/8/16
+        return LEAD  # unsplit packed causal GQA2/4/8/16
     if facts.thd or facts.has_paged_kv or facts.window_left is not None:
         return TRAIL
     if flavor == (512, 512):  # exact or envelope-served (d320-d448: 0.32-0.65)

@@ -713,12 +713,15 @@ lengths, empty sequences and CUDA Graph replay with poisoned outputs.
 `test_paged_graph_thd_pack_gqa` covers HND/NHD pools and partial groups;
 the padded-Stats stride test compares packed and unpacked plans in all
 storage orders. Heuristics prefer packing for causal THD with GQA4/GQA8, and
-GQA16 on nonpaged SM100/SM103 (unpacked GQA16 ran 1.04-2.58x the backend on
-B200, packed 0.53-0.99); other supported THD groups remain available as
+GQA2 and GQA16 on nonpaged SM100/SM103 (unpacked GQA16 ran 1.04-2.58x the backend on
+B200, packed 0.53-0.99; packed GQA2 matched or beat unpacked on 72 B300 cases); other supported THD groups remain available as
 explicit tuning candidates. On SM100/SM103, nonpaged d128 half THD graphs
 with a packed first plan lead the backend unsplit when they are bottom-right
 causal without window, sink or right band, declare KV > 512, and carry at
-least 110 query rows (b * h_q * s_q) per SM or Q >= 256 at KV >= 1024.
+least 110 query rows per SM or Q >= 256 at KV >= 1024; GQA2 also needs KV >= 4096.
+Both query gates use a declared `max_total_seq_len_q` when it is smaller than
+b * s_q: rows are h_q * min(b * s_q, total), and the Q >= 256 test uses the
+per-sequence mean of the total.
 
 ¹ **Reads as: on a quantized (fp8/mxfp8) graph in this column, O may be FP16,
 BF16, E4M3 or E5M2.** It does NOT mean an f16/bf16 graph may convert O — the f16
