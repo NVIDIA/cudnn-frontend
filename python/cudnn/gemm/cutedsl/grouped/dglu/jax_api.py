@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""JAX-native (XLA custom call) entry point for the BF16 SM100 grouped GEMM dGLU
-backward (discrete weight mode), built on :func:`cudnn.jax.call`.
+"""JAX-native grouped GEMM dGLU: dense MXFP8 on Blackwell/Rubin and BF16
+discrete weights, built on :func:`cudnn.jax.call`.
 
-BF16 backend and discrete mode only: dense mode's expert-outermost strided B has
-no row-major JAX equivalent, and the block-scaled backend's MMA-interleaved
-scale-factor layouts cannot be presented as row-major JAX arrays. The per-expert
+Also supports canonical dense MXFP8 inputs through the shared dGLU wrapper,
+with row-major A/C, expert-outermost B and packed E8M0 scale buffers. The per-expert
 weight pointers travel as a regular device array whose *values* are raw addresses
 — the referenced weight buffers are not visible to XLA, so the caller must keep
 them alive (and unmoved) across every execution of the traced computation.
@@ -41,12 +40,6 @@ from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
 _kernel_cache: dict = {}
 
 _output_dtypes = (cutlass.BFloat16, cutlass.Float16, cutlass.Float32)
-
-_JAX_BLOCK_SCALED_ERROR = (
-    "the block-scaled grouped GEMM dGLU backend is not expressible as JAX arrays "
-    "(its scale-factor tensors use an MMA-interleaved layout with no row-major equivalent); "
-    "only the BF16 backend supports JAX inputs"
-)
 
 
 @cute.jit
@@ -107,9 +100,9 @@ def grouped_gemm_dglu_jax_sm100(
     padded_offsets: Any,
     alpha_tensor: Any,
     beta_tensor: Any,
-    b_ptrs: Any,
-    n: int,
-    prob_tensor: Any,
+    b_ptrs: Any = None,
+    n: Optional[int] = None,
+    prob_tensor: Any = None,
     d_dtype: Any = cutlass.BFloat16,
     acc_dtype: Any = cutlass.Float32,
     mma_tiler_mn: Tuple[int, int] = (256, 256),
@@ -119,8 +112,25 @@ def grouped_gemm_dglu_jax_sm100(
     linear_offset: Optional[float] = None,
     generate_dbias: bool = False,
     use_dynamic_sched: bool = False,
-) -> Tuple[Any, Any, Optional[Any]]:
-    """BF16 grouped GEMM dGLU backward (discrete weights) as an XLA custom call.
+    *,
+    b_tensor: Any = None,
+    sfa_tensor: Any = None,
+    sfb_tensor: Any = None,
+    norm_const_tensor: Any = None,
+    discrete_col_sfd: bool = False,
+    geglu_alpha: float = 1.702,
+    glu_clamp_max: float = 7.0,
+    glu_clamp_min: float = -7.0,
+) -> Any:
+    """Grouped GEMM dGLU backward as an XLA custom call.
+
+    With b_tensor: dense MXFP8 A (m,k), B (experts,n,k), saved C (m,2n),
+    packed E8M0 scales and prob (m,). Returns the shared wrapper's TupleDict.
+    Uses the Rubin dGLU kernel on SM107 and the Blackwell kernel otherwise.
+    d_dtype must be e4m3; act_func is dswiglu or dgeglu. dprob is allocated
+    and zero-initialized by XLA. dbias and dynamic scheduling are unsupported.
+
+    With b_ptrs: BF16 discrete weights.
 
     Same contract as the eager wrapper's BF16 discrete mode: A ``(m, k, 1)`` k-major
     C-contiguous bfloat16, C ``(m, 2n, 1)`` n-major forward pre-activations,
@@ -136,6 +146,43 @@ def grouped_gemm_dglu_jax_sm100(
     zero-initialized buffers, matching the eager contract of a caller-zeroed
     ``dprob``).
     """
+    if b_tensor is not None:
+        unsupported = {
+            "b_ptrs": b_ptrs is not None,
+            "n": n is not None,
+            "acc_dtype": _convert_to_cutlass_data_type(acc_dtype) is not cutlass.Float32,
+            "vector_f32": vector_f32,
+            "use_dynamic_sched": use_dynamic_sched,
+            "generate_dbias": generate_dbias,
+        }
+        for name, rejected in unsupported.items():
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        from .jax_blockscaled_api import blockscaled_dglu_jax
+
+        return blockscaled_dglu_jax(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            norm_const_tensor=norm_const_tensor,
+            d_dtype=d_dtype,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            act_func=act_func,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+        )
+    if any(t is not None for t in (sfa_tensor, sfb_tensor, norm_const_tensor)):
+        raise ValueError("BF16 discrete weights do not take scale tensors; pass b_tensor for canonical MXFP8")
     d_dtype = _convert_to_cutlass_data_type(d_dtype)
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
 
@@ -145,7 +192,7 @@ def grouped_gemm_dglu_jax_sm100(
     if m % 256 != 0:
         raise ValueError(f"a_tensor M dimension must be 256-aligned, got {m}")
     if _convert_to_cutlass_data_type(a_tensor.dtype) is not cutlass.BFloat16:
-        raise ValueError(f"a_tensor must have dtype bfloat16, got {a_tensor.dtype}; " + _JAX_BLOCK_SCALED_ERROR)
+        raise ValueError(f"BF16 discrete a_tensor must have dtype bfloat16, got {a_tensor.dtype}; use b_tensor for dense MXFP8")
     if n is None or n <= 0 or n % 32 != 0:
         raise ValueError(f"n must be positive and divisible by 32, got {n}")
     two_n = 2 * n
@@ -153,7 +200,7 @@ def grouped_gemm_dglu_jax_sm100(
         raise ValueError(f"c_tensor must have shape ({m}, {two_n}, 1), got {tuple(c_tensor.shape)}")
     c_dtype = _convert_to_cutlass_data_type(c_tensor.dtype)
     if c_dtype not in _output_dtypes or d_dtype not in _output_dtypes:
-        raise ValueError(f"c_tensor/d_dtype must be BF16, FP16, or FP32, got {c_dtype}/{d_dtype}; " + _JAX_BLOCK_SCALED_ERROR)
+        raise ValueError(f"BF16 discrete c_tensor/d_dtype must be BF16, FP16, or FP32, got {c_dtype}/{d_dtype}")
     if acc_dtype is not cutlass.Float32:
         raise ValueError(f"acc_dtype must be float32, got {acc_dtype}")
     if act_func not in ("dswiglu", "dgeglu"):

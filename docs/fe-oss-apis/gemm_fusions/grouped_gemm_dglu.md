@@ -4,9 +4,43 @@
 
 ## JAX support
 
-Supports **JAX arrays** on the BF16 backend in discrete weight mode (dswiglu and dgeglu), including `generate_dbias=True` and caller-provided zero-initialized `dprob`. Dense `b_tensor` and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
+### Dense MXFP8 (Blackwell and Rubin)
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_dglu_jax_sm100` (built on `cudnn.jax.call`; discrete mode): `dprob` and (with `generate_dbias=True`) `dbias` come back as bridge-managed zero-initialized accumulator outputs — no caller-zeroed buffers, no manual synchronization. The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+`grouped_gemm_dglu_wrapper_sm100` accepts JAX arrays and dispatches to the
+jittable `grouped_gemm_dglu_jax_sm100` entry point. Dense MXFP8 selects the same
+kernels as PyTorch: `BlockScaledMoEGroupedGemmDgluDbiasKernel` on Blackwell
+and `BlockScaledMoEGroupedGemmDgluKernel` on Rubin (SM107).
+
+Use canonical row-major `A (M,K)`, `B (experts,N,K)`, `C (M,2N)`,
+`prob (M,)`, and packed E8M0 scale buffers (uint8 is accepted). A/B must have
+matching FP8 types; C is BF16/FP16; output `d_dtype` is E4M3 and
+`sf_vec_size=32`. `alpha`/`beta` are `(experts,)` FP32 and `norm_const` is
+`(1,)` FP32. Offsets are `(experts,)` int32 cumulative 256-aligned ends.
+The caller must provide valid device offsets; tracing does not read them
+back to the host. All operand layouts are adapted through metadata views.
+
+This path supports `act_func="dswiglu"` or `"dgeglu"`, static dense scheduling,
+and `discrete_col_sfd`. The shared wrapper returns a `TupleDict` containing
+`d_row_tensor`, `d_col_tensor`, `dprob_tensor`, `dbias_tensor=None`,
+`amax_tensor=None`, `sfd_row_tensor`, and `sfd_col_tensor`.
+Only `dprob` is initialized to zero by XLA, because the kernel accumulates
+partial row sums with atomic additions. Pass `dprob_tensor=None` to the wrapper.
+The FP8 gradient and scale outputs are not initialized.
+
+Dense JAX currently rejects pointer weights, dbias generation, deterministic
+reduction, dynamic scheduling, FP4, dSiTU-GLU, and output rounding to input dtype.
+Both eager JAX execution and `jax.jit`/CUDA command-buffer replay use the XLA
+custom call; no host synchronization is required.
+
+### Discrete BF16
+
+The original BF16 discrete JAX contract remains available (dswiglu and dgeglu),
+including `generate_dbias=True`. The eager wrapper uses the CUDA legacy default
+stream with caller-zeroed dprob: synchronize inputs and outputs and keep weight
+arrays alive. For jitted programs use `grouped_gemm_dglu_jax_sm100` with `b_ptrs`
+and `n`: dprob/dbias are bridge-managed zero-initialized accumulator outputs.
+The per-expert buffers referenced by `b_ptrs` must stay alive and unmoved across
+every execution. This entry retains its original three-element tuple result.
 
 ## Overview
 
