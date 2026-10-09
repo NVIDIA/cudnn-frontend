@@ -254,6 +254,11 @@ sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[vllm
 sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[decode_q1_d128_64x8_p16-default]	paged THD + sink | d128 | s_q=1 | default common-API walk (no opt-in flag)
 sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d128-cga1-pack1-64x8]	paged THD + sink | d128 cga1 two-slab + PackGQA explicit pin
 sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga2-pack1-32x2]	paged THD + sink | d256 cga2 + PackGQA explicit pin
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0[g4_sink_default]	cc 10.7 half | d128 | dense padded | bf16 | sink + keyless rows + Stats | shared decode tile (TILE_CGA_M=1, PackGQA)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[mha_decode_small]	cc 10.7 half | d128 | dense | bf16 | sink | shared decode tile, unpacked (MHA)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[packed_cga2_small]	cc 10.7 half | d128 | dense | bf16 | sink | PackGQA at cga2 on the shared prefill body
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q1_kv16384-u1s2]	cc 10.7 half | d128 | dense | bf16 | sink-free decode | the shared decode tile's SPLIT arm (unpacked cga1, split 2) + the shared combine | Stats (Rule S4)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q32_kv16384-p2s2]	cc 10.7 half | d128 | dense | bf16 | sink-free | PackGQA at cga2 on the shared prefill body, split 2 + the shared combine | Stats
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0[test1]	graph suite cc 10.7 MXFP8 default plan walk (flag deleted): the row serves, the backend is planned and ranked behind
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-frost_replay]	graph API explicit selection: create_execution_plan replay of the row's (engine_id, knobs) record
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-backend_first]	graph API explicit selection: backend cc 10.7 MXFP8 engine pinned (Amax_O xfails only when the backend's Amax_O is wrong for the graph)

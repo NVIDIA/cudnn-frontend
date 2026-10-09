@@ -1100,7 +1100,9 @@ def test_dsl_sm100_keyless_rows_very_negative_sink(d_qk, d_v, stats_use_log2):
 
 
 @pytest.mark.L0
-@pytest.mark.skipif(_SM == 107, reason="the cc 10.7 f16 row keeps d128 on cga2 (no measured cga1 configuration there)")
+@pytest.mark.skipif(
+    _SM == 107, reason="the SM100 standalone default width; on cc 10.7 the graph path serves the decode tile since issue #1472 (test_mhas_v2.py's P3 block)"
+)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_d128_decode_shaped_cga1_sink_swa(dtype):

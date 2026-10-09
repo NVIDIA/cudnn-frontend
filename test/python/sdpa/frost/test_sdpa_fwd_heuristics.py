@@ -1050,6 +1050,171 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)
 
 
+# --- cc 10.7 dense d128 half: the shared decode tile and PackGQA (issue #1472) --------------------------------------
+
+
+def _sm107_d128_facts(**over):
+    """Issue #1472's verify cell on cc 10.7: dense bf16 d128 64/8 at S_q 8 over a 2056-token cache, bottom-right
+    causal, an attention sink, 216 SMs (the board the levers were measured on)."""
+    base = dict(
+        b=128,
+        h_q=64,
+        h_kv=8,
+        s_q=8,
+        s_kv=2056,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_sink=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    base.update(over)
+    return _facts(**base)
+
+
+def _sm107_f16_plans(facts):
+    """The cc 10.7 half row's proposals for ``facts``, each re-admitted by mismatch() (honored-or-never-listed)."""
+    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+    assert plans, "the cc 10.7 half row must serve this graph"
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans), [p.knobs for p in plans]
+    return plans
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [dict(), dict(h_kv=4, s_q=4, s_kv=2052), dict(s_q=1, causal=False, bottom_right=False), dict(s_q=16, h_kv=16), dict(padded=True), dict(h_q=8, h_kv=8)],
+    ids=["issue_64_8_q8", "issue_64_4_q4", "plain_decode_q1", "q16_g4_one_tile", "padded_mtp", "mha_q8"],
+)
+def test_sm107_d128_decode_shaped_sets_ride_the_decode_tile(sm107_metadata_target, over):
+    """S_q * pack_g <= 128 on the cc 10.7 half row (issue #1472): every proposed set runs the shared decode tile (cga1 --
+    the tile-fit contract, as test_sdpa_fwd_decode_d128_sm100 pins on the SM100 row), none splits (the sink), a GQA
+    graph lists BOTH packings (admission; which leads is the ranking's business), an MHA graph none packed, and a causal
+    graph lists NATURAL and LPT both (which leads follows the measured tables,
+    test_sm107_shared_d128_scheduler_follows_the_measured_tables; both reachable for autotune)."""
+    facts = _sm107_d128_facts(**over)
+    plans = _sm107_f16_plans(facts)
+    assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
+    assert all((p.knobs.split_kv or 1) == 1 for p in plans), [p.knobs for p in plans]
+    packings = {bool(p.knobs.pack_gqa) for p in plans}
+    assert packings == ({True, False} if facts.h_q != facts.h_kv else {False}), [p.knobs for p in plans]
+    scheds = {p.knobs.sched_policy for p in plans}
+    assert 0 in scheds, scheds  # SCHED_NATURAL
+    if facts.causal:
+        assert SCHED_LPT in scheds, scheds
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [512, 129], ids=["q512", "q129"])
+def test_sm107_d128_prefill_shaped_sets_keep_cga2(sm107_metadata_target, s_q):
+    """Above one decode tile's rows on every leg (129 rows overflow the unpacked tile too) the cc 10.7 half row keeps the
+    cga2 prefill width throughout and still lists a packed set (the shared SM100 prefill body) next to the unpacked
+    Rubin body."""
+    plans = _sm107_f16_plans(_sm107_d128_facts(b=1, h_kv=4, s_q=s_q, s_kv=max(512, s_q)))
+    assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+    assert {bool(p.knobs.pack_gqa) for p in plans} == {True, False}, [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_sm107_d128_prefolded_graphs_keep_the_native_body(sm107_metadata_target):
+    """The pre-folded scale (attn_scale_prefolded) is an arm of the Rubin prefill body only -- the shared SM100 bodies
+    apply the scale in-kernel -- so a pre-folded dense d128 graph keeps the cga2 domain, proposes no packed set, and an
+    explicit cga=1 or PackGQA pin is a typed decline (the heuristics never propose them; the cc 10.7 lever sweeps'
+    FLOAT+fold cases keep their plan)."""
+    from cudnn.sdpa.fwd.engines import effective_cgas
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    facts = _sm107_d128_facts(attn_scale_prefolded=True)
+    assert effective_cgas(spec.capabilities, facts) == frozenset({2})
+    plans = _sm107_f16_plans(facts)
+    assert all(p.knobs.cga == 2 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=1))
+    assert "pre-folded" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+@pytest.mark.L0
+def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
+    """Explicit pins on the cc 10.7 half row (issue #1472): dense d128 half admits cga=1 (the shared decode tile) and
+    cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too); a group that
+    does not (96/8) is declined with the divisibility reason, dense d256 keeps its paged-THD-only PackGQA, THD nonpaged
+    keeps the cga2 prefill pipeline (cga=1 outside its domain, no packed leg), and dense PAGED queries -- not wired on
+    cc 10.7 -- never see the tile."""
+    from cudnn.sdpa.fwd.engines import effective_cgas
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    pack = engines.SdpaFwdKnobs(pack_gqa=True)
+    for cga in (1, 2):
+        assert engines.mismatch(caps, _sm107_d128_facts(), engines.SdpaFwdKnobs(cga=cga)) is None, cga
+    for h_kv in (16, 8, 4):
+        assert engines.mismatch(caps, _sm107_d128_facts(h_kv=h_kv), pack) is None, h_kv
+    assert engines.mismatch(caps, _sm107_d128_facts(d_qk=64, d_v=64), pack) is None
+    assert "divide" in engines.mismatch(caps, _sm107_d128_facts(h_q=96, h_kv=8), pack)
+    assert engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256), pack) is not None
+    thd = _sm107_d128_facts(thd=True, padded=True)
+    assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
+    assert engines.mismatch(caps, thd, pack) is not None
+    assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
+
+
+@pytest.mark.L0
+def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
+    """Sink-free small-batch long-KV decode on cc 10.7 (b=1, 64/8, S_q 1, 32k keys, no mask): the proposals ride the
+    decode tile, a packed set is among them, and every set -- the split ones included (the shared dense combine on
+    cc 10.7) -- passes mismatch().  The split COUNT is the wave model's choice and is not asserted."""
+    facts = _sm107_d128_facts(b=1, s_q=1, s_kv=32768, causal=False, bottom_right=False, has_sink=False)
+    plans = _sm107_f16_plans(facts)
+    assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
+    assert any(p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, first_sched",
+    [
+        (dict(), SCHED_LPT),
+        (dict(b=1, s_q=1, s_kv=32768), SCHED_LPT),
+        (dict(b=32, s_q=16, s_kv=8192), SCHED_LPT),
+        (dict(b=8, s_q=1, s_kv=1024), 0),
+        (dict(b=8, s_q=4, s_kv=4096, d_qk=64, d_v=64, window_left=128), 0),
+        (dict(h_kv=4, s_q=16, s_kv=2048), 0),
+        (dict(b=2, s_q=4096, s_kv=4096, window_left=1024), 0),
+        (dict(b=2, s_q=4096, s_kv=4096, window_left=1024, has_sink=False), 0),
+    ],
+    ids=[
+        "issue_cell_lpt",
+        "long_cache_b1_lpt",
+        "q16_g8_one_tile_lpt",
+        "short_cache_natural",
+        "swa_decode_natural",
+        "packed_cga2_band_natural",
+        "swa_prefill_natural",
+        "swa_prefill_sink_free_natural",
+    ],
+)
+def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_target, over, first_sched):
+    """The scheduler lead of the cc 10.7 shared dense d128 legs (issue #1472's tables, heuristics._SM107_DECODE_TILE_LPT_MIN_KV
+    and the two cc 10.7 arms of _sched_points): the packed decode tile walks plain LPT first from a 2k cache on; a short
+    cache, a sliding window (on the decode tile and on the packed cga2 prefill body alike) and the one-cluster packed cga2
+    band keep NATURAL first.  The other policy is always listed as a runner and every proposed set stays admissible; the
+    SM100 row's one-cluster NATURAL lead on the same decode shape is untouched."""
+    facts = _sm107_d128_facts(**over)
+    plans = _sm107_f16_plans(facts)
+    first = plans[0].knobs
+    assert first.pack_gqa is True, first
+    assert first.sched_policy == first_sched, [p.knobs for p in plans]
+    other = SCHED_LPT if first_sched == 0 else 0
+    assert any(p.knobs.sched_policy == other for p in plans), [p.knobs for p in plans]
+    sm100 = _facts(
+        b=32, h_q=64, h_kv=4, s_q=4, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, causal=True, bottom_right=True, padded=True, has_paged_kv=True, page_size=16
+    )
+    sm100_plans = [p for p in recommend("A", sm100, {_F16: 20500}) if p.engine_id == 20500]
+    assert sm100_plans and sm100_plans[0].knobs.sched_policy in (None, 0), sm100_plans[0].knobs
+
+
 def _decode_d256_facts(**over):
     """Qwen3.5 decode as served: 32/2 heads (packed 16:1), d=256, S_q=1, paged
     (page 16) over a 4096-key table, on a 148-SM SM100 part."""
@@ -1169,6 +1334,138 @@ def test_quantized_thd_proposals_are_admissible(quant):
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
     plans = recommend("A", facts, {name: 20501 if quant == "fp8" else 20510})
     assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
+
+
+def _sm107_paged_thd_facts(**over):
+    """The paged THD + sink serving contract on cc 10.7 (issue #1472's paged table): packed queries over page-16 HND pools,
+    bottom-right causal, 2056-token caches, b128 64/8 with four tokens per request."""
+    base = dict(
+        b=128,
+        h_q=64,
+        h_kv=8,
+        s_q=4,
+        s_kv=2056,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_sink=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, cga",
+    [
+        (dict(), 1),
+        (dict(s_q=1), 1),
+        (dict(s_q=8), 1),
+        (dict(has_sink=False), 1),
+        (dict(h_kv=4), 1),
+        (dict(b=24, h_kv=4, s_q=8), 2),
+        (dict(dtype=cudnn.data_type.HALF), 2),
+        (dict(page_size=128), 1),
+    ],
+    ids=["b128_64_8_q4_sink", "q1_sink", "q8_sink", "sink_free", "gqa16_b128", "gqa16_b24_one_wave", "f16_keeps_cga2", "page128"],
+)
+def test_sm107_paged_thd_sink_sets_pack_and_order_like_their_sink_free_twins(sm107_metadata_target, over, cga):
+    """The cc 10.7 paged THD plan ordering measured with and without an attention sink (issue #1472's paged table): the
+    first proposal packs the group (GQA 8 and 16 alike), walks the live tiles LPT, and takes the two-slab cga1 tile where
+    the wave rule prefers it (b128: 1024 / 512 units over 216 SMs) -- cga2 where one wave fits either way (b24 64/4: 96
+    units) or outside the measured bf16 family (f16).  A sink changes none of that (the sink cells ranked like their
+    sink-free twins), and every proposed set stays admissible."""
+    from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, _sm107_paged_half
+
+    facts = _sm107_paged_thd_facts(**over)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert _sm107_paged_half(spec.capabilities, facts) and _prefer_thd_pack_gqa(spec.capabilities, facts)
+    plans = _sm107_f16_plans(facts)
+    first = plans[0].knobs
+    assert first.pack_gqa is True, first
+    assert first.sched_policy == SCHED_LPT, first
+    assert first.cga == cga, first
+    assert first.split_kv in (None, 1), first
+    # the unpacked set stays listed as a runner (autotune), never first
+    assert any(p.knobs.pack_gqa is False for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_sm107_paged_thd_rules_do_not_move_the_sm100_row():
+    """The cc 10.7 paged measurements widen nothing on the SM100 line: paged GQA16 stays unpacked-first there, a sink keeps
+    the NATURAL lead and the cga2 width (its own measured family, #1468 / PR #1469's domain)."""
+    from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, _sm107_paged_half
+
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    sm100 = dict(device_cc=(10, 0), device_sm_count=148)
+    gqa16 = _sm107_paged_thd_facts(h_kv=4, has_sink=False, **sm100)
+    assert not _sm107_paged_half(caps, gqa16) and not _prefer_thd_pack_gqa(caps, gqa16)
+    sink = _sm107_paged_thd_facts(**sm100)
+    plans = [p for p in recommend("A", sink, {_F16: 20500}) if p.engine_id == 20500]
+    assert plans and all(engines.mismatch(caps, sink, p.knobs) is None for p in plans)
+    assert plans[0].knobs.sched_policy in (None, 0) and plans[0].knobs.cga == 2, plans[0].knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, packed_first",
+    [
+        (dict(), True),
+        (dict(b=4, h_kv=4, s_q=1024, s_kv=1024), True),
+        (dict(b=1, h_q=32, s_q=4096, s_kv=4096), True),
+        (dict(b=1, h_kv=4, s_q=512, s_kv=512, has_sink=False), True),
+        (dict(causal=False, bottom_right=False), False),
+        (dict(h_q=8, h_kv=8), None),
+    ],
+    ids=["b2_64_8_s2048", "b4_64_4_s1024", "b1_32_8_s4096", "b1_64_4_s512_sink_free", "no_band", "mha"],
+)
+def test_sm107_dense_d128_gqa_packs_under_a_band_at_prefill_depth(sm107_metadata_target, over, packed_first):
+    """The cc 10.7 shared dense d128 leg packs a GQA group under a diagonal band at any S_q (the SM100 rule,
+    heuristics._sm100_banded_gqa_packs, measured on cc 10.7 at S 512-4096: packed 6-16 % ahead of the unpacked Rubin
+    tile, with and without a sink); a mask-free graph keeps the unpacked lead, an MHA graph proposes no packed set."""
+    facts = _sm107_d128_facts(**{**dict(b=2, s_q=2048, s_kv=2048), **over})
+    plans = _sm107_f16_plans(facts)
+    if packed_first is None:
+        assert all(p.knobs.pack_gqa is not True for p in plans), [p.knobs for p in plans]
+        return
+    assert plans[0].knobs.pack_gqa is packed_first, [p.knobs for p in plans]
+    assert {p.knobs.pack_gqa for p in plans} >= {True, False}, [p.knobs for p in plans]
+    assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, first",
+    [
+        (dict(s_q=64), (False, 1)),
+        (dict(s_q=128), (False, 1)),
+        (dict(s_q=256), (True, 2)),
+        (dict(b=8, h_kv=4, s_q=128, s_kv=2048), (False, 1)),
+        (dict(s_q=128, causal=True, bottom_right=True), (True, 2)),
+        (dict(b=128, s_q=8, s_kv=2056), (True, 1)),
+    ],
+    ids=["q64_unpacked_tile", "q128_unpacked_tile", "q256_packed_body", "gqa16_q128_unpacked_tile", "banded_q128_packs", "decode_fit_packs"],
+)
+def test_sm107_mask_free_d128_gqa_rides_the_unpacked_decode_tile_where_only_it_fits(sm107_metadata_target, over, first):
+    """Mask-free cc 10.7 dense d128 GQA (the opt-in order; placement keeps the backend first): when one head's rows fit the
+    shared decode tile while the packed unit overflows it (S_q <= 128 < S_q x G) the unpacked decode tile leads, unsplit
+    (measured 32 us against the packed body's 91 / 98 at b2 64/8 q128 KV 4k); past the tile the packed cga2 body keeps the
+    lead, a band packs first (_sm100_banded_gqa_packs) and a packed unit that fits the tile packs first.  The other packing
+    stays listed."""
+    facts = _sm107_d128_facts(**{**dict(b=2, s_kv=4096, causal=False, bottom_right=False, has_sink=False), **over})
+    plans = _sm107_f16_plans(facts)
+    assert (bool(plans[0].knobs.pack_gqa), plans[0].knobs.cga) == first, [p.knobs for p in plans]
+    if first[1] == 1:
+        assert plans[0].knobs.split_kv in (None, 1), plans[0].knobs  # the decode tile's unsplit leg (its split arms measured slower)
+    assert {bool(p.knobs.pack_gqa) for p in plans} == {True, False}, [p.knobs for p in plans]
 
 
 @pytest.mark.L0
