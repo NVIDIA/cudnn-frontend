@@ -20,17 +20,27 @@ __device__ float read_half(const unsigned char* p) {
     asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(h));
     return value;
 }
-// Read eight Q4_K code bytes. Aligned allocations use two word loads;
-// byte reads retain correctness for a caller with a smaller alignment promise.
+// Read eight Q4_K code bytes. Use one 64-bit transaction when aligned,
+// two 32-bit loads for a four-byte-aligned address, and byte loads otherwise.
+// Every path stays within the original code array, even for a logical K tail.
 __device__ __forceinline__ void read_q4_codes(const unsigned char* p, unsigned (&v)[2]) {
     if (reinterpret_cast<unsigned long long>(p) & 3) {
         #pragma unroll
         for (int i = 0; i < 8; ++i) v[i/4] |= unsigned(p[i]) << ((i%4)*8);
     } else {
         const auto* words = reinterpret_cast<const unsigned*>(p);
-        v[0] = words[0];
-        v[1] = words[1];
+        if ((reinterpret_cast<unsigned long long>(p) & 7) == 0) {
+            asm("ld.global.v2.u32 {%0,%1}, [%2];" : "=r"(v[0]), "=r"(v[1]) : "l"(p));
+        } else {
+            v[0] = words[0];
+            v[1] = words[1];
+        }
     }
+}
+__device__ float half_bits(unsigned short h) {
+    float value;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(h));
+    return value;
 }
 struct __align__(16) DecodeVector { unsigned words[4]; };
 __device__ void decode_q4_words(const FortWeightDecodeTileV1& t, const void* storage,
@@ -53,13 +63,30 @@ __device__ void decode_q4_words(const FortWeightDecodeTileV1& t, const void* sto
         const auto* block = static_cast<const unsigned char*>(storage)
             + (n*((t.full_k+255)/256) + t.k_begin/256)*144;
         const int group = r0/32;
-        const auto* scales = block + 4;
-        const unsigned sc = group < 4 ? (scales[group]&63)
-            : ((scales[group+4]&15) | ((scales[group-4]>>6)<<4));
-        const unsigned mn = group < 4 ? (scales[group+4]&63)
-            : ((scales[group+4]>>4) | ((scales[group]>>6)<<4));
-        scale = read_half(block)*float(sc);
-        minimum = read_half(block+2)*float(mn);
+        // d, dmin and the twelve scale/minimum bytes occupy one 16-byte
+        // prefix. Aligned blocks need one vector load instead of several
+        // dependent byte loads. A 144-byte block stride preserves alignment.
+        if ((reinterpret_cast<unsigned long long>(block) & 15) == 0) {
+            unsigned h, s0, s1, s2;
+            asm("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(h),"=r"(s0),"=r"(s1),"=r"(s2) : "l"(block));
+            // s0/s1 hold low six bits for groups 0..3 and upper two bits
+            // for groups 4..7; s2 supplies the latter groups' low nibbles.
+            const int shift = (group & 3)*8;
+            const unsigned x = s0 >> shift, y = s1 >> shift, z = s2 >> shift;
+            const unsigned sc = group < 4 ? (x & 63) : ((z & 15) | ((x >> 6 & 3) << 4));
+            const unsigned mn = group < 4 ? (y & 63) : ((z >> 4 & 15) | ((y >> 6 & 3) << 4));
+            scale = half_bits(static_cast<unsigned short>(h))*float(sc);
+            minimum = half_bits(static_cast<unsigned short>(h >> 16))*float(mn);
+        } else {
+            const auto* scales = block + 4;
+            const unsigned sc = group < 4 ? (scales[group]&63)
+                : ((scales[group+4]&15) | ((scales[group-4]>>6)<<4));
+            const unsigned mn = group < 4 ? (scales[group+4]&63)
+                : ((scales[group+4]>>4) | ((scales[group]>>6)<<4));
+            scale = read_half(block)*float(sc);
+            minimum = read_half(block+2)*float(mn);
+        }
         read_q4_codes(block+16+(r0/64)*32+r0%32, codes);
     }
     FortWeightDecodeValue decoded[8] = {};
@@ -74,24 +101,34 @@ __device__ void decode_q4_words(const FortWeightDecodeTileV1& t, const void* sto
     // the value index. Now each lane owns eight adjacent N values at one K,
     // suitable for a 16-byte shared store. Every lane, including tail lanes,
     // must participate in all shuffles; invalid values above remain zero.
+    DecodeVector values{};
     #pragma unroll
-    for (int bit = 0; bit < 3; ++bit) {
+    for (int j = 0; j < 4; ++j)
+        values.words[j] = unsigned(decoded[2*j]) | (unsigned(decoded[2*j+1]) << 16);
+    // Keep two FP16/BF16 bit patterns per register throughout the transpose.
+    // First swap halfwords across lane bit 2; byte selectors 0x3276/0x5410
+    // preserve the untouched half and take the other half from the partner.
+    // Then exchange whole words across lane bits 3 and 4. This uses eight
+    // shuffles rather than twelve, without converting or rounding the values.
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const unsigned other = __shfl_xor_sync(0xffffffffu, values.words[j], 4);
+        values.words[j] = __byte_perm(values.words[j], other, (lane & 4) ? 0x3276 : 0x5410);
+    }
+    #pragma unroll
+    for (int bit = 0; bit < 2; ++bit) {
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            if ((i & (1<<bit)) == 0) {
-                const int other = i | (1<<bit);
-                const bool high = lane & (1<<(bit+2));
+        for (int i = 0; i < 4; ++i) {
+            if ((i & (1 << bit)) == 0) {
+                const int other = i | (1 << bit);
+                const bool high = lane & (1 << (bit+3));
                 const unsigned value = __shfl_xor_sync(0xffffffffu,
-                    unsigned(high ? decoded[i] : decoded[other]), 1<<(bit+2));
-                if (high) decoded[i] = value;
-                else decoded[other] = value;
+                    high ? values.words[i] : values.words[other], 1 << (bit+3));
+                if (high) values.words[i] = value;
+                else values.words[other] = value;
             }
         }
     }
-    DecodeVector values{};
-    #pragma unroll
-    for (int j = 0; j < 8; ++j)
-        values.words[j/2] |= unsigned(decoded[j]) << ((j%2)*16);
     const int row = (lane%4)*8 + lane/4;
     *reinterpret_cast<DecodeVector*>(output + row*t.output_stride + base) = values;
 }

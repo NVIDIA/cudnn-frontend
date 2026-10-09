@@ -308,16 +308,18 @@ The same source string can be passed to Python's `graph.weight_dequantize`.
 
 Physical row n contains ceil(K/256) complete blocks along K and produces logical
 B[:,n]. Bytewise metadata loads avoid extra padding for the 210/50-byte block
-strides. Q4_K now reads eight consecutive code bytes per lane with aligned word
-loads when possible, then reuses the local scale/minimum for eight weights. A
-warp register transpose turns these into adjacent N values for vector shared
-stores. Unaligned bases use a byte-load fallback, with no read beyond the
-complete physical block. Tail lanes participate in every shuffle and carry
-zero values. Q6_K/IQ1_S retain K-coalesced byte loads. For very wide Q6_K matrices
-(N >= 65536), lane-independent block and bit-plane calculations improve the
-measured output-head cases. Smaller Q6_K matrices and IQ1_S keep their original
-addressing, which performed better in the broader sweep. These optimizations are customer example code;
-the engine still has no knowledge of ggml formats.
+strides. Q4_K reads its 16-byte metadata prefix and eight-byte code runs with
+vector loads when the addresses permit, and reuses the local scale/minimum for
+eight weights. Unaligned addresses use word or byte fallbacks without stronger
+alignment requirements or reads past a complete physical block. A warp register
+transpose turns the decoded values into adjacent N values for vector shared
+stores. Tail lanes participate in every shuffle and carry zero values.
+For very wide Q6_K matrices (N >= 65536), lane-independent block and bit-plane
+calculations improve the measured output-head cases. Smaller Q6_K matrices
+retain their original addressing, which performed better in the broader sweep.
+IQ1_S also decodes eight values per lane, using the grid loads described below.
+These optimizations are customer example code; the engine has no knowledge
+of ggml formats.
 The sample sets both the program input_alignment and the weight tensor
 alignment to 1 and tests a deliberately unaligned weight base. This does not relax the natural alignment of auxiliary FLOAT tensors.
 
@@ -558,3 +560,120 @@ source snapshots and sanitizer/resource logs. For example:
 `bash /tmp/cudnn-dequant-upgrade5/run-compare.sh 2 14336 4096 iq1`.
 Other GPUs and Windows were not measured in this increment. The reviews
 remain draft prototypes; engine-owned staging is still milestone (b).
+
+## Q4_K vector metadata and packed transpose (2026-10-09)
+
+This increment optimizes the supplied customer Q4_K decoder. The previous
+pushed baseline is backend `561d0b26e` / frontend `eead6319`. The FORT mainloop,
+planner, public API and ABI 1 contract are unchanged. Use the revised example
+source when building a new plan; existing saved binaries keep their old code.
+
+For a 16-byte-aligned Q4_K block, one 16-byte global load reads both FP16
+superblock coefficients and all twelve local scale/minimum bytes. The decoder
+extracts the selected group's six-bit scale and minimum from those registers.
+An aligned eight-byte code run uses one 64-bit load; four-byte-aligned runs use
+two word loads, and other addresses use byte loads. Metadata has its original
+byte-load fallback. All reads stay inside the original complete 144-byte block,
+including logical K tails; the program still promises only byte alignment.
+
+The Q4_K register transpose now keeps two decoded halfwords per 32-bit register.
+Four byte permutations and eight warp shuffles replace twelve shuffles plus
+halfword selections. This rearranges FP16/BF16 bit patterns without changing
+numerical values. Every warp lane participates, including invalid tail lanes.
+IQ1_S keeps its previous transpose: applying this change there regressed one
+large-M case in the broader sweep and was discarded. Q6_K is unchanged.
+No additional shared memory, decoder scratch or execution workspace is added.
+
+All 198 supplied spreadsheet cases pass on ultra's RTX PRO 6000 Blackwell
+Server GPUs (SM120, 188 SMs, CUDA/NVRTC 13.4). No final sweep case regressed by
+more than 10% against the previous local sweep. Controls below are medians of
+three independent processes per version, alternating old/new order on the
+same GPU. Times are microseconds:
+
+| Format / shape | M | N | K | Previous us | Updated us | llama.cpp us | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Llama q4 | 1 | 4096 | 14336 | 85.6 | 54.4 | 10.0 | 1.57x |
+| Llama q4 | 1 | 14336 | 4096 | 85.8 | 56.0 | 11.9 | 1.53x |
+| Llama q4 | 32 | 14336 | 4096 | 97.4 | 67.6 | 27.7 | 1.44x |
+| Llama q4 | 512 | 14336 | 4096 | 450.4 | 385.5 | 210.0 | 1.17x |
+| Llama q4 | 512 | 4096 | 14336 | 480.8 | 390.4 | 212.9 | 1.23x |
+| Llama q4 | 2048 | 1024 | 4096 | 160.1 | 122.2 | 78.6 | 1.31x |
+| Tail q4 | 37 | 75 | 512 | 14.4 | 14.3 | 17.8 | 1.01x |
+| Llama iq1 | 2 | 14336 | 4096 | 78.5 | 78.5 | 9.6 | 1.00x |
+| Llama iq1 | 512 | 14336 | 4096 | 435.4 | 435.4 | 213.9 | 1.00x |
+| Qwen head q6 | 1 | 248320 | 2048 | 535.4 | 535.4 | 276.2 | 1.00x |
+
+The worst remaining model-shape ratio is 8.50x cuDNN/llama.cpp
+(iq1_s, M=1, N=4096, K=14336). The gains are specific
+to the updated example source, and performance parity is still not reached.
+These are synthetic fixtures at Llama3.1-8B and Qwen3.6-35B-A3B dimensions,
+not end-to-end model, real routed-MoE or tokens/s measurements.
+
+The comparison uses 11 alternating cuDNN/llama.cpp rounds of 20 dependent
+CUDA-graph operations, with three warmup replays per timed side. Both cuDNN
+phases and llama.cpp quantization/fixup are included; compilation/allocation/
+reference work is excluded. Inputs/caches are reused and clocks are unlocked.
+Timing jobs do not overlap on a GPU. llama.cpp is pinned to
+`08246a28f6000100433d297c4e037c02e9d2d464`.
+
+cuDNN timings use FP16 decoded weights and activations with FP32 accumulation;
+BF16 is also supported and correctness-tested. The production llama.cpp graph
+selects MMVQ (`mul_mat_vec_q`) for the measured M=1 cases, with Q8_1 activation
+quantization and integer dot products (DP4A for Q4_K). Larger cases select MMQ
+with INT8 MMA. The baseline therefore is not exclusively an MMQ comparison.
+Kernel names for every case are retained in the logs. No activation
+quantization or integer arithmetic has been added to the cuDNN contract.
+
+Every packed weight matches ggml's CPU decoder. Full outputs pass finiteness
+and NRMSE checks against FP64 unrounded-weight GEMM; 256 sampled outputs also
+pass the FP16-rounded-weight contract at atol=rtol=0.005. These checks do not
+establish model-level accuracy. Error metrics accompany every timing.
+
+Full backend integration, frontend C++ samples (1,734,318 assertions in two
+cases) and all 45 Python tests pass. Existing identity GEMMs check every
+rounded Q4_K weight and all eight metadata groups, in FP16 and BF16. New
+packed-base offsets 0/1/2/3/4/8/12/15/16 exercise every vector/word/byte branch
+and exact allocation ends with a partial logical block. Compute Sanitizer
+reports zero ggml/pipeline memcheck errors, zero pipeline race hazards or
+warnings, and zero ggml synchronization errors.
+
+Actual backend CUBIN resources, with the runtime's dynamic-SMEM opt-in:
+
+| Kernel / example | Registers/thread | Operand SMEM | Theoretical CTAs/SM |
+| --- | ---: | ---: | ---: |
+| Split M16 Q4_K | 38 | 11,776 B | 6 |
+| Split M32 Q4_K | 40 | 14,336 B | 6 |
+| Grouped M256 Q4_K | 124 | 50,176 B | 2 |
+| Split M16 IQ1_S | 40 | 11,776 B | 6 |
+| Grouped M256 IQ1_S | 122 | 50,176 B | 2 |
+
+All five inspected kernels have zero local/stack bytes and no LDL, STL or CALL
+instructions. CUDA also reserves 1 KiB per CTA. Arbitrary customer decoders can
+have different resource use. Hardware counters remain unavailable
+(`ERR_NVGPUCTRPERM`); diagnosis uses controlled experiments and binary inspection.
+
+Additional investigation, kept outside the implementation: for Q4_K
+M=1/N=4096/K=14336, the same mainloop with a zero-output decoder takes about
+19 us, while a transposing FP16-passthrough decoder takes about 75 us. These
+are diagnostic workloads with different memory traffic, not additive stall
+measurements. Grouping more K tiles did not provide a broad win because the
+larger operand allocation reduced residency.
+
+A scratch GEMV using a decoder that returns thread-local contiguous values
+reached about 23-25 us on the two large M=1 Q4_K FFN shapes, using 32 values
+per thread and FP32 FMA. It rounds decoded weights to FP16 and does not
+quantize activations. Longer vectors reuse metadata and avoid the shared-tile
+exchange; at M=8 and M=16 scalar FMA loses its advantage. This is an exploratory
+standalone result, not the reviewed cuDNN implementation: it requires a
+separate opt-in callback contract and has only selected-shape FP16/cuBLAS
+validation. It has not passed the full backend/frontend/BF16/lifecycle suite
+or the three-process llama.cpp comparison. No register-output ABI is exposed.
+The evidence supports a dedicated very-small-M path as the next investigation.
+
+Complete evidence and reproduction are in `/tmp/cudnn-dequant-upgrade6` on ultra:
+`README.txt`, `matrix/comparison.csv`,
+`matrix/2026-10-08-cudnn-dequant-all-q4-vector.xlsx`, `controls/summary.json`,
+final source snapshots, CUBINs and sanitizer logs. For example:
+`bash /tmp/cudnn-dequant-upgrade6/run-compare.sh 1 4096 14336 q4`.
+Other GPUs and Windows were not measured. Engine-owned packed staging remains
+milestone (b), and both reviews remain draft prototypes.
