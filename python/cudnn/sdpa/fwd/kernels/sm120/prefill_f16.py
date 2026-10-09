@@ -1081,6 +1081,9 @@ class SM120FusedMultiHeadAttentionForward:
 
             # Load Q into registers.
             q_regs = self.load_q_tile(basic_params)
+            if cutlass.const_expr(PARAMS.negate_scores):  # attn_scale < 0; the host passes |attn_scale| (#1435)
+                for i in cutlass.range_constexpr(self.qk_d_frags * 4):
+                    q_regs[i] = q_regs[i] ^ cutlass.Int32(-2147450880)  # 0x80008000: every element's sign bit
 
             # Main attention loop.
             mask_steps = 1
@@ -1225,11 +1228,9 @@ class SM120FusedMultiHeadAttentionForward:
                                     # per-batch padded Stats (B, H, s_max), no ragged offsets
                                     lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
                                 elif cutlass.const_expr(self.thd_lse_head_major):
-                                    lse_row = lse_arr[_lse_head, :]
-                                    lse_row[q_row_base + lse_q_idx] = lse_out
+                                    lse_arr[_lse_head, q_row_base + lse_q_idx] = lse_out
                                 else:
-                                    lse_row = lse_arr[q_row_base + lse_q_idx, :]
-                                    lse_row[_lse_head] = lse_out
+                                    lse_arr[q_row_base + lse_q_idx, _lse_head] = lse_out
                         else:
                             # Rows at/past this batch's Q length trim to -inf.
                             if lse_q_idx >= seqlen_q:

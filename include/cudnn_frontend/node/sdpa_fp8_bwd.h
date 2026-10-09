@@ -189,6 +189,12 @@ class SDPAFP8BackwardNode : public NodeCRTP<SDPAFP8BackwardNode> {
                                        error_code_t::GRAPH_NOT_SUPPORTED,
                                        "sdpa fp8 backward with THD is not supported on Hopper architecture.");
 
+        // validate options for max_total_seq_len (mirrors SDPA_backward_attributes)
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            (attributes.max_total_seq_len_q.has_value() || attributes.max_total_seq_len_kv.has_value()) && !is_ragged,
+            error_code_t::GRAPH_NOT_SUPPORTED,
+            "max_total_seq_len_q/kv is only supported with packed (ragged) layout");
+
         // Pre-9.26 backward bug on ragged graphs with a sink token
         auto const& sink_it  = attributes.inputs.find(input_names::SINK_TOKEN);
         bool const has_sink  = (sink_it != attributes.inputs.end() && sink_it->second != nullptr);

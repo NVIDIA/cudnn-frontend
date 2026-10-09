@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -1057,6 +1058,45 @@ read_native_buffer_sequence(const py::sequence &buffers) {
     return py::make_tuple(py::cast(std::move(pack)), unread);
 }
 
+// Metadata already observed by a Python adapter (including caller-workspace
+// slices). Import the complete pack in one crossing, preserving each producer's
+// span separately from its effective geometry. No buffer is read or retained.
+std::unique_ptr<VariantPackNative>
+native_pack_from_facts(const py::dict &facts,
+                       const py::sequence &roles,
+                       const py::dict &dtypes,
+                       const py::dict &itemsize) {
+    const auto names = py::tuple(roles);
+    const auto count = names.size();
+    auto pack        = std::make_unique<VariantPackNative>(count);
+    for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
+        auto role = names[i];
+        if (!facts.contains(role) || facts[role].is_none()) continue;
+        auto fact = facts[role].cast<py::tuple>();
+        if (fact.size() != 6)
+            throw py::value_error("buffer facts require pointer, dtype, device, span, shape and strides");
+        const auto dtype = fact[1];
+        const auto type  = dtypes.contains(dtype) ? dtypes[dtype].cast<py::tuple>() : py::make_tuple(0, 0);
+        const auto width = itemsize.contains(dtype) ? itemsize[dtype].cast<int64_t>() : 1;
+        const auto span  = fact[3].cast<int64_t>();
+        if (width <= 0 || (span >= 0 && span > std::numeric_limits<int64_t>::max() / width))
+            throw py::value_error("observed storage bytes must fit in int64");
+        const auto device = fact[2].cast<py::tuple>();
+        if (device.size() != 2) throw py::value_error("buffer facts require device type and ordinal");
+        pack->set_operand(i,
+                          fact[0].cast<int64_t>(),
+                          fact[4].cast<std::vector<int64_t>>(),
+                          fact[5].cast<std::vector<int64_t>>(),
+                          type[0].cast<int>(),
+                          type[1].cast<int>(),
+                          1,
+                          span < 0 ? -1 : span * width,
+                          device[0].cast<int>(),
+                          device[1].cast<int>());
+    }
+    return pack;
+}
+
 NativeExecutionBindings
 read_native_execution_bindings(py::handle object) {
     const auto &pack = object.cast<const VariantPackNative &>();
@@ -1290,6 +1330,19 @@ class OrderedBindingSchema {
     }
 };
 
+py::tuple
+read_ordered_binding(py::handle schema,
+                     py::handle buffers,
+                     py::handle tensor_uids,
+                     const py::dict &auto_bindings,
+                     py::handle workspace,
+                     py::handle override_uids,
+                     py::handle override_shapes,
+                     py::handle override_strides) {
+    return schema.cast<OrderedBindingSchema &>().read(
+        buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+}
+
 // A workspace carve, planned once: the regions are fixed when the engine
 // builds and only the base pointer arrives per execute.
 class WorkspaceCarve {
@@ -1317,15 +1370,20 @@ class WorkspaceCarve {
     }
 
     std::vector<OperandBuffer *>
-    carve(int64_t base, int64_t nbytes, int32_t device_id) const {
+    carve(int64_t base, std::optional<int64_t> nbytes, int32_t device_id) const {
+        if (nbytes && *nbytes < 0) throw py::value_error(owner_ + ": workspace capacity must be nonnegative or None");
+        // Validate every region before creating owned views. None is the only
+        // unknown capacity; a measured zero-byte view cannot hold any scratch.
+        for (size_t i = 0; i < protos_.size(); i++) {
+            if (nbytes && ends_[i] > *nbytes) {
+                throw py::value_error(owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
+                                      std::to_string(ends_[i]) + ") exceeds the " + std::to_string(*nbytes) +
+                                      "-byte buffer (sizing bug)");
+            }
+        }
         std::vector<OperandBuffer *> out;
         out.reserve(protos_.size());
         for (size_t i = 0; i < protos_.size(); i++) {
-            if (nbytes != 0 && ends_[i] > nbytes) {  // 0 = size unknown (bare address)
-                throw py::value_error(owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
-                                      std::to_string(ends_[i]) + ") exceeds the " + std::to_string(nbytes) +
-                                      "-byte buffer (sizing bug)");
-            }
             Operand operand = protos_[i];
             operand.data    = reinterpret_cast<void *>(base + offsets_[i]);
             out.push_back(new OperandBuffer(std::move(operand), device_id));
@@ -1423,6 +1481,12 @@ capsule built in python.
           "A DLPack producer over memory the caller did not supply -- a workspace carve.");
 
     m.def("_read_buffer_sequence", &read_native_buffer_sequence, py::arg("buffers"));
+    m.def("_native_pack_from_facts",
+          &native_pack_from_facts,
+          py::arg("facts"),
+          py::arg("roles"),
+          py::arg("dtypes"),
+          py::arg("itemsize"));
 
     m.def("read_buffer_extent",
           &read_buffer_extent,
@@ -1535,6 +1599,10 @@ its parts.
             return py::make_tuple(ok, offender);
         });
     init_sdpa_thd_binding(m);
+    init_sdpa_dense_binding(m);
+    init_sdpa_bwd_binding(m);
+    init_sdpa_sm80_binding(m);
+    init_sdpa_sm80_thd_binding(m);
 }
 
 }  // namespace python_bindings

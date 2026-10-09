@@ -2,6 +2,11 @@
 
 **This is an experimental API and subject to change.**
 
+Torch-facing calls accept the ordinary default stream or a concrete
+`torch.cuda.Stream` / raw stream handle. The special `CUstream(2)` per-thread
+default sentinel is rejected by Torch interop: it cannot safely represent an
+allocator stream identity across host threads. Use a concrete stream instead.
+
 ## Overview
 
 The DeepSeek Sparse Attention (DSA) module integrates a set of CuTe-DSL
@@ -431,12 +436,23 @@ with variable per-row effective length.
 - **Outputs** — tuple `(indices, values)` (values is `None` when
   `return_val=False`). Use `return_val=False` when only the indices are
   consumed, so no values output buffer is allocated or written.
-- **Constraints** — SM90+, `top_k ≤ 2048`
+- **Tie policy** — `tie_break=0` (default) permits arbitrary cutoff ties;
+  `1` prefers smaller source-column indices and `2` prefers larger indices.
+  The selected set follows this policy, but output order remains unspecified.
+  Ties use equal radix keys: `+0` ranks before `-0`, as in the existing kernel;
+  NaN ordering is unspecified. The policy matches FlashInfer/CCCL unsorted
+  Top-K selection and applies only to this standalone API.
+- **Cost** — nonzero tie policies scan source columns inside the selection
+  kernel only when equal cutoff keys compete for the remaining slots. The
+  scan stops once enough ties are found; no extra kernel, device allocation,
+  or host synchronization is introduced. The default specialization retains
+  the existing selection path.
+- **Constraints** — SM90+, `0 < top_k ≤ 2048`
 
 ```python
 result = DSA.indexer_top_k_wrapper(
     scores.reshape(-1, scores.shape[-1]),
-    seq_lens, top_k=512,
+    seq_lens, top_k=512, tie_break=2,  # prefer later columns on ties
 )
 indices, values = result["indices"], result["values"]
 ```

@@ -42,6 +42,8 @@ TENSOR_MAP_ALIGN = 128
 TENSOR_MAP_BIT21 = 1 << 21  # qword 1: encoder's "tensor >= 128 KiB" flag; tensormap.replace does not update it (issue #1013)
 
 THD_META_WORDS = lambda b: 4 * b + 4  # noqa: E731
+THD_CU_K_TOTAL_OFF = lambda b: 3 * b + 1  # noqa: E731   cu_k[B]: the live packed kv total (cu_q occupies [B, 2B], cu_k [2B+1, 3B+1])
+THD_CU_Q_TOTAL_OFF = lambda b: 2 * b  # noqa: E731   cu_q[B]: the live packed q total (the last word of cu_q; a packed dQ fold's row limit)
 THD_REMAP_OFF = lambda b: 3 * b + 2  # noqa: E731
 THD_LIVE_OFF = lambda b: 4 * b + 2  # noqa: E731   live unit total (device-computed)
 THD_CTR_OFF = lambda b: 4 * b + 3  # noqa: E731    persistent-scheduler claim counter
@@ -66,11 +68,34 @@ THD_BWD_META_WORDS = lambda b: 5 * b + 5  # noqa: E731
 #   [ ...the forward layout... | pad | maps((B+3) * TENSOR_MAP_QWORDS int64) ]
 THD_MAPS_OFF = lambda b: -(-THD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
 THD_MAPS_META_WORDS = lambda b: THD_MAPS_OFF(b) + (b + 3) * TENSOR_MAP_QWORDS * 2  # noqa: E731
+# The BACKWARD twin: ``n_maps`` tensor maps after the backward layout (``row_off`` included) on the
+# next ``TENSOR_MAP_ALIGN`` boundary -- for a backward main kernel whose launch ABI has no descriptor
+# operand either (the sm107 d256 backward: five packed-total-clamped input maps + one clipped dV map
+# per sequence ride inside its metadata buffer).
+#
+#   [ ...the backward layout... | pad | maps(n_maps * TENSOR_MAP_QWORDS int64) ]
+THD_BWD_MAPS_OFF = lambda b: -(-THD_BWD_META_WORDS(b) * 4 // TENSOR_MAP_ALIGN) * TENSOR_MAP_ALIGN // 4  # noqa: E731   int32 words
+THD_BWD_MAPS_META_WORDS = lambda b, n_maps: THD_BWD_MAPS_OFF(b) + n_maps * TENSOR_MAP_QWORDS * 2  # noqa: E731
 
 # Threads for a THD setup launch. Callers write metadata on an elected thread
 # or cooperating warps; batch-remap ranking is parallel over batches. Larger
 # batches loop over the same block (B > THD_SETUP_THREADS is supported).
 THD_SETUP_THREADS = 256
+
+
+@cute.jit
+def exit_if_dead_thd_cluster(meta_t, n_batch: cutlass.Int32, cga_m: int) -> None:
+    """All threads of a dead cluster exit before TMEM allocation or barriers.
+
+    The setup launch publishes the live work count. Every CTA in a cluster
+    has the same unit id, including role-split clusters, so this predicate is
+    cluster-uniform. Call at kernel entry, before acquiring any shared resource.
+    Empty initial units must not enter the producer/consumer barrier pipeline.
+    """
+    meta = cutlass.make_array_view(meta_t)
+    uid = cute.arch.block_idx()[0] // cutlass.Int32(cga_m)
+    if uid >= cutlass.Int32(meta[THD_LIVE_OFF(n_batch)]):
+        nvvm.exit()
 
 
 @cute.jit
@@ -176,11 +201,16 @@ def write_thd_prefix_warp(
 
 
 @cute.jit
-def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32) -> None:
+def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0=None) -> None:
     """Fill ``row_off(B+1)``: where each sequence's block starts in a ragged,
     row-BLOCKED workspace, plus the total at ``row_off[B]``.
 
-    ``row_off[b] = SUM_{i<b} ceil(s_q[i] / gran) * gran``.  Rounding each block
+    ``row_off[b] = SUM_{i<b} ceil(s[i] / gran) * gran`` over the lengths of the
+    ``(B+1,)`` prefix at ``cu0`` inside ``meta`` -- the Q prefix by default (the
+    SM100 d512 backward blocks its S/dS workspace over packed Q tokens), the KV
+    prefix (``cu0 = 2B+1``) for a consumer whose unit is a kv block (the sm107
+    d256 backward's kv-major workspace).  ``row_off`` is over whichever axis
+    the consumer blocks.  Rounding each block
     UP is what keeps a sequence's tail tile inside its own block: at an
     unrounded offset the tail would overlap the next sequence's first rows and
     quietly corrupt them.
@@ -212,7 +242,7 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32) -> 
     wrote); callers run it on the same elected thread, where program order
     suffices.
     """
-    cuq0 = n_batch
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
     off0 = cutlass.Int32(4) * n_batch + cutlass.Int32(4)
     run = cutlass.Int32(0)
     for b in cutlass.range(0, n_batch, 1, unroll=1):
@@ -257,14 +287,18 @@ def write_thd_live_and_ctr(
     unit_rows: cutlass.Int32,
     n_ctas: cutlass.Int32,
     tidx: cutlass.Int32,
+    splits: cutlass.Constexpr[int] = 1,
+    cu0=None,
 ) -> None:
     """Publish the live-unit total and seed the persistent claim counter.
 
-    A unit is ``unit_rows`` Q rows of one head of one sequence, so
-    ``live = SUM_b ceil(s_q[b] / unit_rows) * n_qh`` — which the host cannot
-    know without a D2H (issue #552), hence the kernel reading its own bound
-    from here.  The counter starts at ``n_ctas``: cluster ``c`` takes unit ``c``
-    from its blockIdx, then pulls from the counter.
+    A unit is ``unit_rows`` rows of one head of one sequence along the prefix
+    at ``cu0`` -- Q rows by default (``cu0 = B``, the forward and the SM100 d512
+    backward), kv rows for a consumer whose unit is a kv block (``cu0 = 2B+1``,
+    the sm107 d256 backward) -- so ``live = SUM_b ceil(s[b] / unit_rows) * n_qh``,
+    which the host cannot know without a D2H (issue #552), hence the kernel
+    reading its own bound from here.  The counter starts at ``n_ctas``: cluster
+    ``c`` takes unit ``c`` from its blockIdx, then pulls from the counter.
 
     Leaving these two words unwritten hands out units off uninitialized
     workspace — an illegal-instruction fault, not a silent wrong answer.
@@ -275,23 +309,24 @@ def write_thd_live_and_ctr(
     disagree with ``tidx == 0`` and leave both words unwritten. The caller must
     have barriered after the prefix writes so ``cu_seqlens_q`` is visible.
     """
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
     if n_batch <= cutlass.Int32(1):
         if tidx == cutlass.Int32(0):
             live = cutlass.Int32(0)
             if n_batch == cutlass.Int32(1):
-                s_b = cutlass.Int32(meta[n_batch + cutlass.Int32(1)]) - cutlass.Int32(meta[n_batch])
+                s_b = cutlass.Int32(meta[cuq0 + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0])
                 live = ((s_b + unit_rows - cutlass.Int32(1)) // unit_rows) * n_qh
-            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live * cutlass.Int32(splits)
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
     elif tidx < cutlass.Int32(32):
         live = cutlass.Int32(0)
         for b in cutlass.range(tidx, n_batch, 32, unroll=1):
-            s_b = cutlass.Int32(meta[n_batch + b + cutlass.Int32(1)]) - cutlass.Int32(meta[n_batch + b])
+            s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
             live = live + ((s_b + unit_rows - cutlass.Int32(1)) // unit_rows) * n_qh
         for i in cutlass.range_constexpr(5):
             live = live + cute.arch.shuffle_sync_bfly(live, 1 << i)
         if tidx == cutlass.Int32(0):
-            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live
+            meta[cutlass.Int32(4) * n_batch + cutlass.Int32(2)] = live * cutlass.Int32(splits)
             meta[cutlass.Int32(4) * n_batch + cutlass.Int32(3)] = n_ctas
 
 
@@ -303,20 +338,26 @@ def thd_decode_unit(
     n_qh: cutlass.Int32,
     q_tile: cutlass.Int32,
     reverse_rows: bool,
+    cu0=None,
 ) -> tuple:
     """Map a linear unit id to ``(q_tile_idx, batch, head)`` through ``batch_remap``.
 
-    A unit is ``q_tile`` rows of one head of one sequence.  Sequences are walked
-    LONGEST FIRST (the remap), and the head is the major axis within a sequence
-    so consecutive units sweep the Q tiles of a single head — those share a K/V
-    head, which is what keeps the claim order L2-friendly.  ``reverse_rows``
-    walks a sequence's tiles from the diagonal back, putting the causal-heavy
-    tiles first.
+    A unit is ``q_tile`` rows of one head of one sequence along the prefix at
+    ``cu0`` -- the Q prefix by default; the KV prefix (``cu0 = 2B+1``) for a
+    consumer whose unit is a kv block, where the returned tile index is the
+    sequence-local kv block (the sm107 d256 backward).  The count per sequence
+    must be the one :func:`write_thd_live_and_ctr` published from the SAME prefix.
+    Sequences are walked LONGEST FIRST (the remap, by descending Q length: a kv
+    block's cost is its sequence's q-tile count, so that is the LPT order for kv
+    units too), and the head is the major axis within a sequence so consecutive
+    units sweep the tiles of a single head — those share a K/V head, which is
+    what keeps the claim order L2-friendly.  ``reverse_rows`` walks a sequence's
+    tiles from the diagonal back, putting the causal-heavy tiles first.
 
     A uid past the live total keeps ``batch == n_batch``; the caller is expected
     to bound uid against the live count instead of relying on that sentinel.
     """
-    cuq0 = n_batch
+    cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
     remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
     f_batch = n_batch
     f_head = cutlass.Int32(0)
@@ -475,9 +516,52 @@ def emit_clamped_desc(
     nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=seq_ord)
 
 
+# --- caller-buffer token origins (issue #737) -------------------------------
+# A ragged port's sequence b starts at element ``ro[b] * M`` of its buffer (M
+# the port's ragged_offset_multiplier).  FROST engines take whole-token offsets
+# as a supported-input precondition, so that is token ``ro[b] * M // ts`` (ts
+# the port's token stride in elements).  Origins are a separate Int64
+# ``[rows, B]`` array, one row per port a path materializes; they never replace
+# the compact cu_seqlens above, which keep addressing internal packed buffers.
+
+
+@cute.jit
+def write_thd_port_origins(
+    org,
+    ro,
+    row: cutlass.Constexpr[int],
+    mult: cutlass.Constexpr[int],
+    ts: cutlass.Constexpr[int],
+    n_batch: cutlass.Int32,
+    tid: cutlass.Int32,
+    nthreads: cutlass.Int32,
+) -> None:
+    """``org[row, b] = ro[b] * mult // ts`` for this thread's batches (strided by
+    ``nthreads``).  ``org`` is the Int64 origins tensor; ``ro`` the bound offset
+    tensor (Int32 or Int64).  Arithmetic is Int64 throughout."""
+    org_p = cutlass.make_array_view(org).data_ptr() + cutlass.Int64(row) * cutlass.Int64(org.stride[0])
+    ro_p = cutlass.make_array_view(ro).data_ptr()
+    for b in cutlass.range(tid, n_batch, nthreads, unroll=1):
+        v = cutlass.Int64(Pointer(ro_p + b, dtype=ro.element_type).load())
+        Pointer(org_p + b, dtype=cutlass.Int64).store((v * cutlass.Int64(mult)) // cutlass.Int64(ts))
+
+
+@cute.jit
+def thd_port_origin(org, row: cutlass.Constexpr[int], b: cutlass.Int32, compact: cutlass.Int32) -> cutlass.Int64:
+    """Token origin of sequence ``b`` in a port's buffer: the materialized origin
+    when ``row >= 0``, else the compact prefix ``compact`` (a port bound without
+    offsets, or an internal buffer; ``org`` is then never read)."""
+    origin = cutlass.Int64(compact)
+    if cutlass.const_expr(row >= 0):
+        origin = Pointer(cutlass.make_array_view(org).data_ptr() + cutlass.Int64(row) * cutlass.Int64(org.stride[0]) + b, dtype=cutlass.Int64).load()
+    return origin
+
+
 __all__ = [
     "TENSOR_MAP_ALIGN",
     "TENSOR_MAP_QWORDS",
+    "THD_BWD_MAPS_META_WORDS",
+    "THD_BWD_MAPS_OFF",
     "THD_BWD_META_WORDS",
     "THD_CTR_OFF",
     "THD_LIVE_OFF",
@@ -489,12 +573,15 @@ __all__ = [
     "THD_SETUP_THREADS",
     "emit_clamped_desc",
     "emit_seq_descs",
+    "exit_if_dead_thd_cluster",
     "set_tensor_map_bit21",
     "thd_claim_next",
     "thd_decode_unit",
+    "thd_port_origin",
     "write_thd_batch_remap",
     "write_thd_live_and_ctr",
     "write_thd_meta",
     "write_thd_prefix_warp",
+    "write_thd_port_origins",
     "write_thd_row_offsets",
 ]

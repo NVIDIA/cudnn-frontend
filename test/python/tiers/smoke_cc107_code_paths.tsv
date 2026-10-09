@@ -1,0 +1,359 @@
+nodeid	code_path
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-dense-bf16-llama_d128]	f16 fwd | d128 | dense | bf16 | graph API
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-fp16-llama_d128]	f16 fwd | d128 | causal | fp16
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-causal-bf16-qwen_d256]	f16 fwd | d256 | causal
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_sdpa_fwd_dsl_sm100_graph_api[role_split-dense-bf16-dsv4_d512]	f16 fwd | d512 role-split | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_d192_d128[dense-bf16]	f16 fwd | d192x128 | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_d192_d128[causal-fp16]	f16 fwd | d192x128 | causal
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_causal_swa[role_split-bf16-llama_d128]	mask arm: causal + SWA
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_causal_bottom_right[role_split-fp16-llama_d128]	mask arm: bottom-right causal
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_band_right_partial_kv_tile[role_split-llama]	mask arm: right band, partial KV tile
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_padded[role_split-bf16-llama_d128]	padded (per-batch lengths)
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_sink[role_split-bf16-llama_d128]	sink
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_gqa[role_split-bf16-llama_d128]	GQA
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_dense_gqa_ratios[role_split-g2-d192_d128]	GQA ratio on the d192x128 flavor
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_thd[role_split-bf16-llama_d128]	THD | d128
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_thd[role_split-bf16-qwen_d256]	THD | d256
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_thd_cross[role_split-fp16-llama_d128]	THD cross attention
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_thd_stats[role_split-llama_d128-token_major]	THD stats token-major
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_thd_d128_runs_on_every_arch_line[swa-head_major]	THD stats head-major + SWA (every arch line)
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_strided_stats[log2]	stats_use_log2 epilogue arm
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_decode_sink[d128_sq1_unpacked]	decode-shaped S_q=1 + sink
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_bottom_right_keyless_rows[role_split-nosink-llama_d128]	keyless rows contract (LSE=-inf, O=0)
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_empty_tiles_between_live_tiles_multiwave[role_split-kv_zero-llama_d128]	empty KV tiles between live tiles
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_combo[role_split-llama-bf16-mha-nosink-dense-band]	mask arm: band
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_combo[role_split-llama-bf16-mha-nosink-dense-band_br]	mask arm: band bottom-right
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_combo[role_split-llama-bf16-mha-nosink-dense-band_swa]	mask arm: band + SWA
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_combo[role_split-llama-bf16-mha-nosink-dense-swa_br]	mask arm: SWA bottom-right
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_combo[role_split-llama-fp16-gqa-sink-thd-swa_br]	THD x GQA x sink x swa_br
+sdpa/frost/test_sdpa_fwd_dsl_sm100.py::test_dsl_sm100_combo[role_split-dsv4-bf16-gqa-nosink-thd-causal]	THD on d512 causal
+sdpa/frost/test_sdpa_fwd_d512_2x2_sm107.py::test_two_by_two_graph_api[causal-bf16-float]	d512 2x2 twin (cc 10.7 sibling) | causal
+sdpa/frost/test_sdpa_fwd_d512_2x2_sm107.py::test_two_by_two_graph_api[dense-fp16-float]	d512 2x2 twin | dense
+sdpa/frost/test_sdpa_fwd_d512_2x2_sm107.py::test_two_by_two_graph_api[dense-bf16-fold]	d512 2x2 twin | pre-folded softmax scale (SCALE_PREFOLDED arm, graph attn_scale_prefolded) | dense | bf16
+sdpa/frost/test_sdpa_fwd_d512_2x2_sm107.py::test_two_by_two_thd[bf16-float]	d512 2x2 twin | THD
+sdpa/frost/test_sdpa_fwd_d512_2x2_sm107.py::test_two_by_two_mask_family[swa]	d512 2x2 twin | SWA
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_d512_correction_handoff_under_mixed_rescale[bf16-dense-scale0.5]	d512 correction hand-off | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_d512_correction_handoff_under_mixed_rescale[bf16-causal_br_swa129-scale1]	d512 correction hand-off | causal_br + SWA
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_half_split_prepared_rebind_capture[False-False-bfloat16-128-128]	half split-KV d128 prepared/capture
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_half_split_masked_tails[causal-17-385-bfloat16-192]	half split-KV d192 masked tail
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_gate_matches_the_fp32_oracle[bf16-dense-512]	d256 epilogue gate f16
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_gate_dead_padded_entry_is_exactly_zero[bf16]	gate x padded dead entry
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_gate_lse_is_bitwise_independent_of_the_gate	gate leaves LSE untouched
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_f16_accepts_the_measured_feature_set[feature0]	capability row probe (host)
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_half_prefolded_scale_matches_the_oracle[128-128-bfloat16-dense-stats-split1]	f16 fwd d128 | pre-folded softmax scale (SCALE_PREFOLDED arm; fold + unfolded legs vs the float64 oracle) | dense | bf16 | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_half_prefolded_scale_matches_the_oracle[192-128-float16-dense-stats-split1]	f16 fwd d192x128 | pre-folded softmax scale | dense | fp16 | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_half_prefolded_scale_matches_the_oracle[128-128-float16-dense-stats-split2]	f16 fwd d128 | pre-folded softmax scale through the split-KV combine (scale-free fp32 partials) | dense | fp16
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d256_half_prefolded_scale_matches_the_oracle[bf16-dense-stats]	f16 fwd d256 | pre-folded softmax scale (all four softmax copies; dead runtime scale poisoned) | dense | bf16 | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d512_half_prefolded_scale_matches_the_oracle[bf16-dense-stats]	f16 fwd d512 role-split | pre-folded softmax scale | dense | bf16 | Stats
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_masks[none-e4m3]	fp8 fwd d128 | dense | e4m3
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_masks[causal-e5m2]	fp8 fwd d128 | causal | e5m2
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_masks[swa-e4m3]	fp8 fwd | SWA
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_masks[causal_br-e4m3]	fp8 fwd | bottom-right
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d192_d128_masks[none]	fp8 fwd d192x128
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d256_masks[none-e4m3]	fp8 fwd d256
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d512_masks[none-e4m3]	fp8 fwd d512 dense
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d512_masks[causal-e4m3]	fp8 fwd d512 causal
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_output_dtypes[e4m3-e4m3]	fp8 out e4m3 + amax
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_output_dtypes[e5m2-fp16]	fp8 out fp16
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_sink[e4m3]	fp8 sink
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_gqa[e4m3]	fp8 GQA
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_padding[True-e4m3]	fp8 padded causal
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_bottom_right_rectangular	fp8 bottom-right rectangular
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_pack_gqa_ratios[d128-g2]	fp8 PackGQA d128 (the only Rubin pack flavor)
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_thd[False-e4m3]	fp8 THD dense
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_thd[True-e5m2]	fp8 THD causal e5m2
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d256_thd[True-e4m3]	fp8 THD d256
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_thd_sliding_window[False-e4m3-d128]	fp8 THD SWA
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_thd_zero_len_kv[d128]	fp8 THD zero-length KV
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_d192_d128_leading_zero_length_kv[e4m3-fp8-sink]	fp8 empty leading KV + sink
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_dense_q_trim_bottom_right[br_band-d128]	fp8 q-trim bottom-right band
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_block_scaled_output[mxfp8-none-token_major]	fp8 -> block-scaled (mxfp8) output
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_block_scaled_output[nvfp4-causal-planes]	fp8 -> block-scaled (nvfp4) output
+sdpa/frost/test_sdpa_fwd_fp8_sm100.py::test_fp8_graph_stats_use_log2[causal]	fp8 stats log2
+sdpa/frost/test_sdpa_fp8_sm107.py::test_fp8_stats_is_the_exact_softmax_lse[f32-exp-dense-128-128]	exact fp32 LSE (Sigma bug tripwire)
+sdpa/frost/test_sdpa_fp8_sm107.py::test_fp8_softmax_f16_e2e	softmax_precision=HALF fp8 arm
+sdpa/frost/test_sdpa_fp8_sm107.py::test_sm107_split_matches_unsplit_on_rubin	fp8 split-KV d128 on Rubin
+sdpa/frost/test_sdpa_fp8_sm107.py::test_sm107_d192_split_masked_tails[causal-17-385]	fp8 split d192 masked tail
+sdpa/frost/test_sdpa_fp8_sm107.py::test_fp8_lpt_is_bit_identical_to_natural_on_the_claimed_flavors[False-1-1024-128-128]	LPT scheduler arm == NATURAL
+sdpa/frost/test_sdpa_fp8_sm107.py::test_fp8_d256_gate_matches_the_e4m3_oracle[bf16]	fp8 d256 epilogue gate
+sdpa/frost/test_sdpa_fp8_sm107.py::test_fp8_d256_amax_is_the_pre_gate_value	gate x Amax_O contract
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Fp8::test_sm107_fp8_rebind[output_dtype0-128-128-dtype0-False-False-False]	prepared fp8 rebind
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Fp8::test_sm107_fp8_rebind[output_dtype0-128-128-dtype0-False-False-True]	prepared fp8 rebind THD
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Fp8::test_sm107_fp8_capture[dtype0-128-128-False]	prepared fp8 CUDA-graph capture
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Fp8::test_sm107_fp8_split_rebind[128-2-output_dtype0-dtype0]	prepared fp8 split rebind
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Fp8::test_sm107_fp8_dense_envelopes[dtype0-112-96]	fp8 dense envelope (TMA zero-pad)
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Mxfp8::test_sm107_mxfp8_rebind[output_dtype0-128-128-dtype0-False-False]	prepared mxfp8 rebind
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedSm107Mxfp8::test_sm107_mxfp8_capture[dtype0-128-128]	prepared mxfp8 capture
+sdpa/frost/test_sdpa_fp8_sm107.py::TestPreparedBlockOutput::test_rebind_and_replay[False-False-dtype0-16-False-True]	prepared block-scaled output replay
+sdpa/frost/test_sdpa_fp8_sm107.py::TestStagedSm107Mxfp8::test_fp8_output[1-128-128]	staged mxfp8 fp8 output
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[none-e4m3]	mxfp8 fwd d128 dense
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[causal-e5m2]	mxfp8 fwd d128 causal e5m2
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[swa-e4m3]	mxfp8 SWA
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_masks[causal_br-e4m3]	mxfp8 bottom-right
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d192_d128[none-e4m3]	mxfp8 d192x128
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d256_masks[none-e4m3]	mxfp8 d256
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d512_masks[causal-e4m3]	mxfp8 d512
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_output_dtypes[e4m3-e4m3]	mxfp8 out e4m3
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_sink[e4m3]	mxfp8 sink
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_gqa[e4m3]	mxfp8 GQA
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_dense_padding[True-e4m3]	mxfp8 padded
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_dense_q_trim_bottom_right[br_band-d128]	mxfp8 q-trim bottom-right band
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_block_scaled_output[nvfp4-none-planes]	mxfp8 -> nvfp4 output
+sdpa/frost/test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d256_leading_zero_length_kv[fp16-nosink]	mxfp8 empty leading KV
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_stats_is_the_exact_softmax_lse[dense-128-128]	exact fp32 LSE on the mxfp8 row
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle[half-True-False-1-8-2-1024-False]	mxfp8 fwd d128 | HALF + pre-folded scale, stats-less (fused FHADD2 arm) | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle[half-False-False-1-8-2-1024-True]	mxfp8 fwd d128 | softmax_precision=HALF alone (f16x2 exponent; exact f32 sum with Stats) | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_half_softmax_and_prefolded_scale_match_the_oracle[float-True-False-1-8-2-1024-True]	mxfp8 fwd d128 | FLOAT + pre-folded scale (raw max, plain shift) | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_d192x128_half_softmax_and_prefolded_scale_match_the_oracle[half-False-e4m3-dense-True]	mxfp8 fwd d192x128 | HALF alone | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_d192x128_half_softmax_and_prefolded_scale_match_the_oracle[half-True-e4m3-dense-False]	mxfp8 fwd d192x128 | HALF + pre-folded scale, stats-less = the fused FHADD2 shift+convert arm | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_d192x128_half_softmax_and_prefolded_scale_match_the_oracle[float-True-e4m3-dense-True]	mxfp8 fwd d192x128 | FLOAT + pre-folded scale | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d256_mxfp8_softmax_levers_match_the_oracle[half-dense-stats]	mxfp8 fwd d256 | HALF alone | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d256_mxfp8_softmax_levers_match_the_oracle[half-prefolded-dense-nostats]	mxfp8 fwd d256 | HALF + pre-folded scale, stats-less (fused FHADD2 arm) | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d256_mxfp8_softmax_levers_match_the_oracle[float-prefolded-dense-stats]	mxfp8 fwd d256 | FLOAT + pre-folded scale | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d512_mxfp8_softmax_levers_match_the_oracle[half-dense-stats]	mxfp8 fwd d512 | HALF alone | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d512_mxfp8_softmax_levers_match_the_oracle[half+fold-dense-nostats]	mxfp8 fwd d512 | HALF + pre-folded scale, stats-less (fused FHADD2 arm) | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d512_mxfp8_softmax_levers_match_the_oracle[float+fold-dense-stats]	mxfp8 fwd d512 | FLOAT + pre-folded scale | dense | Stats
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_d512_mxfp8_softmax_levers_match_the_oracle_e5m2[half-nostats]	mxfp8 fwd | HALF on e5m2 inputs: the e5m2 pair tag of the f16x2 -> FP8 P cast (shared helpers, one kernel) | dense
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_mxfp8_sched_policies_are_bit_identical_to_natural[False-1-8-2-1024-128-128]	mxfp8 LPT/LPT_L2 == NATURAL
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_mxfp8_gate_matches_the_dequant_oracle[e4m3-bf16-dense-512]	mxfp8 d256 epilogue gate
+sdpa/frost/test_sdpa_fwd_dsl_sm107.py::test_sm107_mxfp8_gate_amax_is_a_compile_time_fact[bf16]	mxfp8 gate amax fact
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_dense[bf16]	bwd f16 d256 | dense
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_causal_dtypes[fp16]	bwd f16 | causal fp16
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_causal_bottom_right	bwd | bottom-right
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_causal_bottom_right_ragged_s_q	bwd | bottom-right ragged S_q
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_sliding_window	bwd | SWA (two-sided stage-3 trim)
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_gqa[r2]	bwd | GQA fold
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_non_tile_multiple_seqlens[257-129]	bwd | tail tiles
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_adapter_per_batch_kv_lengths[bf16-causal]	bwd | per-batch KV lengths
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_external_delta_is_bitwise_the_chains_own_pre_pass[aligned-bf16]	bwd | external delta
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_prepared_sm107_rebind_stream_and_replay[False-bf16]	bwd | prepared rebind + replay
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_twox2_twin_accepts_on_rubin[dense-p1]	bwd 2x2 twin profile 1
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_twox2_twin_accepts_on_rubin[causal-p2]	bwd 2x2 twin profile 2
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_stage3_single_launch_dq_is_bitwise_the_per_member_launches[gqa32-2-causal-1024]	stage-3 dQ single launch (GQA)
+sdpa/frost/test_sdpa_bwd_dsl_sm107.py::test_two_launches_are_bitwise_and_race_free[bf16]	two-launch race probe
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_graph_thd_self_attention[bf16]	bwd THD | self
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_graph_thd_causal[bf16]	bwd THD | causal
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_graph_thd_gqa[gqa_group2]	bwd THD | GQA
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_graph_thd_causal_bottom_right	bwd THD | bottom-right
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_graph_thd_causal_swa	bwd THD | SWA
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_graph_thd_zero_length_sequence	bwd THD | empty sequence
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_graph_thd_cross_attention	bwd THD | cross
+sdpa/frost/test_sdpa_bwd_thd_sm107.py::test_prepared_thd_rebind_lengths_and_replay[False-token_major]	bwd THD | prepared replay
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_dense[bf16-ds-bf16-grads]	bwd fp8 | dense | bf16 dS ring
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_dense[e4m3-ds-e4m3-grads]	bwd fp8 | dense | e4m3 dS ring, e4m3 grads
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_causal[bf16-ds-bf16-grads]	bwd fp8 | causal
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_causal_bottom_right_rectangular[bf16-ds]	bwd fp8 | bottom-right
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_sliding_window[bf16-ds]	bwd fp8 | SWA
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_gqa[bf16-ds-r2]	bwd fp8 | GQA (fp32 partial fold)
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_fp8_adapter_per_batch_kv_lengths[bf16-ds-causal]	bwd fp8 | per-batch KV lengths
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_prepared_fp8_rebind_stream_and_replay	bwd fp8 | prepared replay
+sdpa/frost/test_sdpa_bwd_fp8_sm107.py::test_prepared_fp8_binds_only_the_requested_amax[dP]	bwd fp8 | amax binding
+sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_thd_fp8_self_attention[bf16-ds]	bwd fp8 THD | self
+sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_thd_fp8_causal[bf16-ds]	bwd fp8 THD | causal
+sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_thd_fp8_gqa[gqa_group2]	bwd fp8 THD | GQA
+sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_thd_fp8_zero_length_sequence	bwd fp8 THD | empty sequence
+sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_thd_fp8_causal_bottom_right	bwd fp8 THD | bottom-right
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_dense[P-b]	bwd mxfp8 | dense | P-b policy
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_dense[P-c]	bwd mxfp8 | dense | P-c policy
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_causal[P-b]	bwd mxfp8 | causal
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_gqa[P-c]	bwd mxfp8 | GQA
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_mqa	bwd mxfp8 | MQA
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_sliding_window	bwd mxfp8 | SWA
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_causal_bottom_right_rectangular	bwd mxfp8 | bottom-right
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_adapter_per_batch_kv_lengths[P-b-causal]	bwd mxfp8 | per-batch KV lengths
+sdpa/frost/test_sdpa_bwd_mxfp8_sm107.py::test_cuda_graph_replay_is_bitwise_over_poisoned_outputs[P-b]	bwd mxfp8 | graph replay
+sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_thd_mxfp8_self_attention[P-b]	bwd mxfp8 THD | self
+sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_thd_mxfp8_causal[P-c]	bwd mxfp8 THD | causal
+sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_thd_mxfp8_gqa[gqa_group2]	bwd mxfp8 THD | GQA
+sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_thd_mxfp8_zero_length_sequence	bwd mxfp8 THD | empty sequence
+sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_thd_mxfp8_causal_bottom_right	bwd mxfp8 THD | bottom-right
+sdpa/frost/test_sdpa_bwd_stage3_block_scale_sm107.py::test_block_scale_gemm_matches_the_dequantized_fp64_reference[dK-Kmajor-B1H2Sq512Skv512]	stage-3 block-scale dK
+sdpa/frost/test_sdpa_bwd_stage3_block_scale_sm107.py::test_block_scale_gemm_matches_the_dequantized_fp64_reference[dQ-Mmajor-B1H2Sq512Skv512]	stage-3 block-scale dQ
+sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_dense[bf16]	bwd d512 (cc 10.7 fork) | dense
+sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_causal_dtypes[fp16]	bwd d512 | causal
+sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_sliding_window	bwd d512 | SWA
+sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_right_band_widening	bwd d512 | right band
+sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_gqa_mqa[r2]	bwd d512 | GQA
+sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_head_dim_band[384]	bwd d512 | envelope d=384
+sdpa/frost/test_sdpa_bwd_d512_sm107.py::test_non_tile_multiple_seqlens[257-129]	bwd d512 | tail tiles
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_matches_the_fp32_oracle[256-norm]	block fwd bf16 | S=256 | qk_norm
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_non_causal_arm	block fwd | dense arm
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_fully_fused_block_matches_the_fp32_oracle[256]	block fwd | fully fused
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_fuse_norm_rope_matches_the_fp32_oracle[256-norm]	block fwd | fused norm+rope
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_fuse_gate_matches_the_fp32_oracle_causal[256-norm]	block fwd | fused gate
+gated_attention_block/cutedsl/test_block_end_to_end.py::test_dead_rows_do_not_poison_the_gate	block fwd | padded dead rows
+gated_attention_block/cutedsl/test_block_fp8.py::test_fp8_block_matches_the_fake_quant_oracle[256-False-norm]	block fwd fp8 unfused
+gated_attention_block/cutedsl/test_block_fp8.py::test_fp8_fused_block_matches_the_fake_quant_oracle[1000-True-norm]	block fwd fp8 fused
+gated_attention_block/cutedsl/test_block_fp8.py::test_fp8_dead_padded_entry_is_exactly_zero[fused]	block fwd fp8 padded
+gated_attention_block/cutedsl/test_block_mxfp8.py::test_mxfp8_block_matches_the_fake_quant_oracle[256-True]	block fwd mxfp8 unfused
+gated_attention_block/cutedsl/test_block_mxfp8.py::test_mxfp8_fused_block_matches_the_fake_quant_oracle[1000-True]	block fwd mxfp8 fused
+gated_attention_block/cutedsl/test_block_fp4.py::test_mxfp4_weight_block_matches_the_fake_quant_oracle[256-True]	block fwd | mxfp4 W_qkvg
+gated_attention_block/cutedsl/test_block_fp4.py::test_fp4_o_block_matches_the_fake_quant_oracle[MXFP4-unfused-256-True]	block fwd | O fp4 (MXFP4)
+gated_attention_block/cutedsl/test_block_fp4.py::test_fp4_o_block_matches_the_fake_quant_oracle[NVFP4-fused-256-True]	block fwd | O fp4 (NVFP4) fused
+gated_attention_block/cutedsl/test_block_thd.py::test_thd_matches_the_per_sequence_oracle[out_of_place]	block fwd THD
+gated_attention_block/cutedsl/test_block_thd.py::test_thd_mask_arms[swa]	block fwd THD | SWA
+gated_attention_block/cutedsl/test_block_thd.py::test_thd_mask_arms[bottom_right]	block fwd THD | bottom-right
+gated_attention_block/cutedsl/test_block_thd.py::test_thd_gqa[gqa_8_2]	block fwd THD | GQA
+gated_attention_block/cutedsl/test_block_thd.py::test_thd_zero_length_sequence[first_empty]	block fwd THD | empty sequence
+gated_attention_block/cutedsl/test_block_thd.py::test_thd_fp8_unfused_matches_the_fake_quant_oracle	block fwd THD fp8
+gated_attention_block/cutedsl/test_block_training_forward.py::test_saved_set_matches_the_oracle[proj_slab-norm]	training fwd bf16 | saved set
+gated_attention_block/cutedsl/test_block_training_forward.py::test_quantized_training_forward_is_bitwise_the_inference_block[s256_causal_b1-norm-fp8]	training fwd fp8
+gated_attention_block/cutedsl/test_block_training_forward.py::test_quantized_training_forward_is_bitwise_the_inference_block[s256_causal_b1-norm-mxfp8]	training fwd mxfp8
+gated_attention_block/cutedsl/test_block_backward.py::test_gradients_match_fp64_autograd[norm-causal-256]	block bwd bf16 | causal | qk_norm
+gated_attention_block/cutedsl/test_block_backward.py::test_gradients_match_fp64_autograd[rope_only-dense-256]	block bwd bf16 | dense | rope-only
+gated_attention_block/cutedsl/test_block_backward.py::test_gqa_ratio_and_batch[1-2]	block bwd | GQA
+gated_attention_block/cutedsl/test_block_backward.py::test_fused_gate_bwd_is_bitwise_the_unfused_block[bf16-causal-b1]	block bwd | fuse_gate_bwd
+gated_attention_block/cutedsl/test_block_backward.py::test_fuse_wgrad_overlap_is_bitwise_the_in_order_block[bf16-causal-b1-on-fuse_gate_bwd]	block bwd | fuse_wgrad_overlap
+gated_attention_block/cutedsl/test_block_backward.py::test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle[causal-fp8]	block bwd over fp8 record
+gated_attention_block/cutedsl/test_block_backward.py::test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle[causal-mxfp8]	block bwd over mxfp8 record
+gated_attention_block/cutedsl/test_block_backward_fp8.py::test_fp8_end_to_end_vs_the_oracles[s256_causal_b1-norm]	block bwd fp8 end-to-end
+gated_attention_block/cutedsl/test_block_backward_fp8.py::test_fp8_stage_localised_bounds[s256_dense_b1-norm]	block bwd fp8 stage-localised
+gated_attention_block/cutedsl/test_block_backward_fp8.py::test_fp8_two_runs_are_bitwise[both]	block bwd fp8 determinism
+gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_sdpa_bwd_fp8_stage_matches_the_row_reference[B1-S256-H8x2-causal]	fp8 sdpa bwd stage
+gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_fp8_gemm_stage_execute_matches_fp64_with_a_slot_alpha[B1_dw_o]	fp8 GEMM stage
+gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gradients_match_fp64_autograd[causal-norm]	block bwd THD
+gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gqa_bwd[gqa_8_2]	block bwd THD | GQA
+gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_zero_length_sequence_bwd[first_empty-unfused]	block bwd THD | empty sequence
+gated_attention_block/cutedsl/test_proj_gemm.py::test_matches_torch_linear[1024-4096-2176-dtype0]	proj GEMM bf16
+gated_attention_block/cutedsl/test_proj_gemm.py::test_fused_stage_matches_the_fp32_oracle[256-norm]	proj GEMM fused norm+rope stage
+gated_attention_block/cutedsl/test_proj_gemm.py::test_fp8_matmul_with_alpha_matches_fp32_reference[256-256-256]	proj GEMM fp8 + alpha
+gated_attention_block/cutedsl/test_proj_gemm.py::test_fused_fp8_stage_matches_the_e4m3_oracle[256-norm]	proj GEMM fused fp8 stage
+gated_attention_block/cutedsl/test_proj_gemm_bwd.py::test_wgrad_matches_fp64[B1_dw_o-test-T2048-bfloat16]	wgrad GEMM bf16
+gated_attention_block/cutedsl/test_proj_gemm_bwd.py::test_dgrad_matches_fp64[B2_do_gated-test-T2048-bfloat16]	dgrad GEMM bf16
+gated_attention_block/cutedsl/test_proj_gemm_bwd.py::test_fp8_mn_major_matches_fp64_on_cc107[B1_dw_o-test-T2048-K64]	fp8 MN-major wgrad K64
+gated_attention_block/cutedsl/test_proj_gemm_bwd.py::test_block_scale_transposed_drivers_match_fp64[B7_dw_qkvg-397B-T2048]	block-scale transposed wgrad
+gated_attention_block/cutedsl/test_proj_gemm_mxfp8.py::test_block_scale_matches_fake_quant_with_distinctive_scales[small]	mxfp8 proj GEMM
+gated_attention_block/cutedsl/test_proj_gemm_mxfp8.py::test_fused_mxfp8_stage_matches_the_mxfp8_oracle[b2_s256_norm]	fused mxfp8 stage
+gated_attention_block/cutedsl/test_proj_gemm_fp4.py::test_fp4_pairs_match_fake_quant_at_the_blocks_shapes[nvfp4-1000-8192-4096-k_default]	fp4 proj GEMM pair
+gated_attention_block/cutedsl/test_qk_norm_rope.py::test_matches_the_fused_oracle[64-2-2-64-16-dtype0-norm]	qk norm+rope fwd
+gated_attention_block/cutedsl/test_qk_norm_rope.py::test_ldg_and_tma_are_bit_identical[norm]	qk norm+rope TMA impl
+gated_attention_block/cutedsl/test_qk_norm_rope_bwd.py::test_norm_rope_bwd_matches_fp64_autograd[64-2-2-64-16-bf16-norm]	qk norm+rope bwd
+gated_attention_block/cutedsl/test_quantize.py::test_compact_source_is_bit_exact_vs_torch[1000-2-dtype0]	fp8 quantize
+gated_attention_block/cutedsl/test_quantize.py::test_amax_is_bitwise_the_fp32_max_of_abs[1-2-64-bf16]	amax kernel
+gated_attention_block/cutedsl/test_quantize_mxfp8.py::test_compact_source_is_bit_exact_vs_oracle[q-128-1]	mxfp8 quantize rowwise
+gated_attention_block/cutedsl/test_quantize_mxfp8.py::test_compact_source_is_bit_exact_vs_oracle[v-128-1]	mxfp8 quantize columnwise (V)
+gated_attention_block/cutedsl/test_quantize_fp4.py::test_bit_exact_vs_oracle[nvfp4-128]	fp4 quantize
+gated_attention_block/cutedsl/test_sdpa_stage_sm107.py::test_matches_the_fp32_oracle_causal[dtype0-256]	sdpa stage
+gated_attention_block/cutedsl/test_sdpa_stage_sm107.py::test_gate_stage_matches_the_fp32_oracle[512]	gated sdpa stage
+gated_attention_block/cutedsl/test_sigmoid_gate_bwd.py::test_gate_bwd_matches_fp64_autograd[37-4-128-og-bf16]	sigmoid gate bwd
+gated_attention_block/cutedsl/test_sigmoid_gate_bwd.py::test_gate_bwd_fp8_og_is_bitwise_the_forward_quantize_o[37-4-128-s1]	gate bwd fp8 oG
+gated_attention_block/cutedsl/test_elementwise.py::test_sigmoid_gate_matches_torch[37-4-128-dtype0]	elementwise gate
+gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_prologue_is_bitwise_the_standalone_launches[1000-norm]	fused fp8 bwd prologue
+gated_attention_block/cutedsl/test_fp8_bwd_fused.py::test_epilogue_is_bitwise_the_standalone_launches[amax-cast-only]	fused fp8 bwd epilogue
+sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test1]	graph suite fwd (FROST-routed where claimed)
+sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test1]	graph suite bwd
+sdpa/graph/test_mhas_v2.py::test_sdpa_random_sq1_L0[test1]	graph suite decode
+sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_ragged_L0[test1]	graph suite THD fwd
+sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_ragged_L0[test1]	graph suite THD bwd
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_paged_L0[test1]	graph suite paged
+sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_fwd_L0[test1]	graph suite fp8 fwd
+sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_bwd_L0[test1]	graph suite fp8 bwd
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[keyless_rows_d128_4x1_sink_m120_stats-frost]	paged THD + sink | d128 keyless rows O=0 / LSE=sink at -120 | Stats | dead pages NaN
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[keyless_rows_d256_4x1_sink_m120_stats-frost]	paged THD + sink | d256 keyless rows O=0 / LSE=sink at -120 | Stats | dead pages NaN
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[vllm_verify_d128_64x8_p16-frost]	paged THD + sink | d128 | Q 1/4/8 packed | HND page 16 | bf16 | FROST pinned
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[decode_q1_d128_64x8_p16-default]	paged THD + sink | d128 | s_q=1 | default common-API walk (no opt-in flag)
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d128-cga1-pack1-64x8]	paged THD + sink | d128 cga1 two-slab + PackGQA explicit pin
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga2-pack1-32x2]	paged THD + sink | d256 cga2 + PackGQA explicit pin
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0[g4_sink_default]	cc 10.7 half | d128 | dense padded | bf16 | sink + keyless rows + Stats | shared decode tile (TILE_CGA_M=1, PackGQA)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[mha_decode_small]	cc 10.7 half | d128 | dense | bf16 | sink | shared decode tile, unpacked (MHA)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[packed_cga2_small]	cc 10.7 half | d128 | dense | bf16 | sink | PackGQA at cga2 on the shared prefill body
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q1_kv16384-u1s2]	cc 10.7 half | d128 | dense | bf16 | sink-free decode | the shared decode tile's SPLIT arm (unpacked cga1, split 2) + the shared combine | Stats (Rule S4)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q32_kv16384-p2s2]	cc 10.7 half | d128 | dense | bf16 | sink-free | PackGQA at cga2 on the shared prefill body, split 2 + the shared combine | Stats
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0[test1]	graph suite cc 10.7 MXFP8 default plan walk (flag deleted): the row serves, the backend is planned and ranked behind
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-frost_replay]	graph API explicit selection: create_execution_plan replay of the row's (engine_id, knobs) record
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-backend_first]	graph API explicit selection: backend cc 10.7 MXFP8 engine pinned (Amax_O xfails only when the backend's Amax_O is wrong for the graph)
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_decode_sink_d128_p128]	mxfp8 pools | d128 (cga2) | page 128 | decode s_q 1 | sink | HND | distinct K/V tables | dead-page poison | FLOAT | graph API
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_prefill_sink_stats_d256_p256]	mxfp8 pools | d256 (cga1, columnwise V SF plane-major) | page 256 | prefill s_q 256 BR | sink | NHD | Stats | FLOAT
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_mtp_swa_nhd_d128_p256]	mxfp8 pools | d128 | page 256 (2 tiles per page) | MTP s_q 8 BR + left window | e5m2 | NHD | distinct tables | Stats | FLOAT
+sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_batch_of_two_padded_lse[legacy_offsets]	rule: first L0 cell of test_ragged_prefill_batch_of_two_padded_lse
+sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_single_sequence_padded_lse_rows[d128_causal-legacy_offsets]	rule: first L0 cell of test_ragged_prefill_single_sequence_padded_lse_rows
+sdpa/frost/test_fp4_pointwise_primitives.py::test_e2m1_rne_emulation_matches_the_torchao_port	rule: first L0 cell of test_e2m1_rne_emulation_matches_the_torchao_port
+sdpa/frost/test_heuristic_geometry.py::test_d512_model_counts_all_roles_in_split_and_unsplit	rule: first L0 cell of test_d512_model_counts_all_roles_in_split_and_unsplit
+sdpa/frost/test_heuristic_geometry.py::test_each_geometry_runner_recomputes_split_and_obeys_cap	rule: first L0 cell of test_each_geometry_runner_recomputes_split_and_obeys_cap
+sdpa/frost/test_mxfp8_sf_desc_shared.py::test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_shared_module[sm107/prefill_d192_d128_mxfp8.py]	rule: first L0 cell of test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_shared_module
+sdpa/frost/test_mxfp8_sf_desc_shared.py::test_peer_split_of_the_forwards_slabs	rule: first L0 cell of test_peer_split_of_the_forwards_slabs
+sdpa/frost/test_sdpa_build_all.py::test_build_all_preserves_selection_and_executes_both_providers[backend]	rule: first L0 cell of test_build_all_preserves_selection_and_executes_both_providers
+sdpa/frost/test_sdpa_bwd_config_sm100_2x2.py::test_make_bwd_decode_reads_the_span_through_getattr_defaults	rule: first L0 cell of test_make_bwd_decode_reads_the_span_through_getattr_defaults
+sdpa/frost/test_sdpa_bwd_config_sm107.py::test_accepts_every_scheduler_policy_and_has_sink[0-f16]	rule: first L0 cell of test_accepts_every_scheduler_policy_and_has_sink
+sdpa/frost/test_sdpa_bwd_config_sm107.py::test_admits_thd_varlen_on_the_quantized_families[fp8]	rule: first L0 cell of test_admits_thd_varlen_on_the_quantized_families
+sdpa/frost/test_sdpa_bwd_d256_sm100.py::test_mbarrier_ledger_matches_the_config	rule: first L0 cell of test_mbarrier_ledger_matches_the_config
+sdpa/frost/test_sdpa_bwd_d256_sm100.py::test_padding_mask_follows_the_padded_claim	rule: first L0 cell of test_padding_mask_follows_the_padded_claim
+sdpa/frost/test_sdpa_compiled_cache_gpu.py::test_second_process_reloads_the_sdpa_forward_kernel	rule: first L0 cell of test_second_process_reloads_the_sdpa_forward_kernel
+sdpa/frost/test_sdpa_dense_binding_geometry.py::test_dense_geometry_distinguishes_tma_from_plain_output	rule: first L0 cell of test_dense_geometry_distinguishes_tma_from_plain_output
+sdpa/frost/test_sdpa_dense_binding_geometry.py::test_dense_geometry_keeps_plan_envelope_in_key[change0]	rule: first L0 cell of test_dense_geometry_keeps_plan_envelope_in_key
+sdpa/frost/test_sdpa_frontend_integration.py::test_default_plan_runs_and_matches_torch	rule: first L0 cell of test_default_plan_runs_and_matches_torch
+sdpa/frost/test_sdpa_frontend_integration.py::test_select_dsl_engine_runs_and_matches_torch	rule: first L0 cell of test_select_dsl_engine_runs_and_matches_torch
+sdpa/frost/test_sdpa_fwd_api_contract.py::test_hybrid_execute_elides_v_scale_factor_dummy	rule: first L0 cell of test_hybrid_execute_elides_v_scale_factor_dummy
+sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py::test_twin_declines_split_and_g128	rule: first L0 cell of test_twin_declines_split_and_g128
+sdpa/frost/test_sdpa_fwd_d512_2x2_sm100.py::test_two_by_two_causal_512_cluster_union_bounds	rule: first L0 cell of test_two_by_two_causal_512_cluster_union_bounds
+sdpa/frost/test_sdpa_fwd_heuristics.py::test_d128_mxfp8_causal_primary_uses_measured_scheduler	rule: first L0 cell of test_d128_mxfp8_causal_primary_uses_measured_scheduler
+sdpa/frost/test_sdpa_fwd_heuristics.py::test_decode_tile_model_counts_the_whole_packed_group	rule: first L0 cell of test_decode_tile_model_counts_the_whole_packed_group
+sdpa/frost/test_sdpa_fwd_placement.py::test_decode_shaped_rows_lead_at_every_kv_length[1000-16-128]	rule: first L0 cell of test_decode_shaped_rows_lead_at_every_kv_length
+sdpa/frost/test_sdpa_fwd_placement.py::test_paged_prefill_placement_stays_inside_configured_domain[None]	rule: first L0 cell of test_paged_prefill_placement_stays_inside_configured_domain
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_causal_split_requires_the_natural_scheduler	rule: first L0 cell of test_sm120_causal_split_requires_the_natural_scheduler
+sdpa/frost/test_sdpa_fwd_split_kv_sm120.py::test_sm120_d512_split_recombines_o_and_lse	rule: first L0 cell of test_sm120_d512_split_recombines_o_and_lse
+sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_dsink_fact	rule: first L0 cell of test_bwd_dsink_fact
+sdpa/frost/test_sdpa_graph_analyzer.py::test_bwd_engines_registered	rule: first L0 cell of test_bwd_engines_registered
+sdpa/frost/test_sdpa_native_arch_binding.py::test_arch_native_graph_fresh_storage_overrides_and_replay[cc18-128-128-65-bfloat16]	rule: first L0 cell of test_arch_native_graph_fresh_storage_overrides_and_replay
+sdpa/frost/test_sdpa_native_arch_binding.py::test_sm107_dense_only_host_cannot_bind_paged_plan	rule: first L0 cell of test_sm107_dense_only_host_cannot_bind_paged_plan
+sdpa/frost/test_sdpa_native_block_output_binding.py::test_block_output_native_graph_fresh_buffers_and_replay[False-16-False-True]	rule: first L0 cell of test_block_output_native_graph_fresh_buffers_and_replay
+sdpa/frost/test_sdpa_native_bwd_binding.py::test_actual_backward_host_frames_match_python[ordinary-False-bfloat16-sm100]	rule: first L0 cell of test_actual_backward_host_frames_match_python
+sdpa/frost/test_sdpa_native_bwd_binding.py::test_backward_frames_do_not_share_runtime_storage	rule: first L0 cell of test_backward_frames_do_not_share_runtime_storage
+sdpa/frost/test_sdpa_native_dense_binding.py::test_native_decode_new_flavors_keep_int64_table_stride[256]	rule: first L0 cell of test_native_decode_new_flavors_keep_int64_table_stride
+sdpa/frost/test_sdpa_native_dense_binding.py::test_native_decode_query_overrides_respect_plan_specialization[None]	rule: first L0 cell of test_native_decode_query_overrides_respect_plan_specialization
+sdpa/frost/test_sdpa_native_fp8_binding.py::test_native_fp8_graph_rebinds_scales_and_replays[128-128-1-output0]	rule: first L0 cell of test_native_fp8_graph_rebinds_scales_and_replays
+sdpa/frost/test_sdpa_native_fp8_binding.py::test_native_fp8_matches_actual_host_and_python[128-128-1-float8_e4m3fn-bfloat16]	rule: first L0 cell of test_native_fp8_matches_actual_host_and_python
+sdpa/frost/test_sdpa_native_gate_binding.py::test_native_gate_fresh_buffers_and_changed_replay[False-bfloat16]	rule: first L0 cell of test_native_gate_fresh_buffers_and_changed_replay
+sdpa/frost/test_sdpa_native_mxfp8_binding.py::test_mxfp8_native_graph_rebind_and_capture[output0-128-128-False-1]	rule: first L0 cell of test_mxfp8_native_graph_rebind_and_capture
+sdpa/frost/test_sdpa_native_padded_stats_binding.py::test_empty_padded_standalone_rejection_does_not_write[cpu_sink-False]	rule: first L0 cell of test_empty_padded_standalone_rejection_does_not_write
+sdpa/frost/test_sdpa_native_padded_stats_binding.py::test_empty_padded_stats_revalidates_before_initializing[cpu_sink-False-False]	rule: first L0 cell of test_empty_padded_stats_revalidates_before_initializing
+sdpa/frost/test_sdpa_native_prefill_binding.py::test_prefill_graph_fresh_storage_padding_overrides_and_replay[bfloat16-1-128-128-False]	rule: first L0 cell of test_prefill_graph_fresh_storage_padding_overrides_and_replay
+sdpa/frost/test_sdpa_native_prefill_binding.py::test_prefill_graph_native_sinks[128-128-False]	rule: first L0 cell of test_prefill_graph_native_sinks
+sdpa/frost/test_sdpa_native_ragged_decode_binding.py::test_ragged_frames_match_python_and_rebind_every_port[3-HN-False-bfloat16]	rule: first L0 cell of test_ragged_frames_match_python_and_rebind_every_port
+sdpa/frost/test_sdpa_native_ragged_decode_binding.py::test_ragged_graph_independent_origins_fresh_buffers_and_replay[HN-False-False]	rule: first L0 cell of test_ragged_graph_independent_origins_fresh_buffers_and_replay
+sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_contiguous_shapes_and_dead_strides[shape0-strides0-False-False]	rule: first L0 cell of test_sink_contiguous_shapes_and_dead_strides
+sdpa/frost/test_sdpa_native_sink_binding.py::test_sink_native_graph_rebind_and_replay[bfloat16-128-1-False]	rule: first L0 cell of test_sink_native_graph_rebind_and_replay
+sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_envelopes_fresh_storage_and_replay[bfloat16-1-128-128]	rule: first L0 cell of test_sm120_native_graph_envelopes_fresh_storage_and_replay
+sdpa/frost/test_sdpa_native_sm120_binding.py::test_sm120_native_graph_sinks[248-256]	rule: first L0 cell of test_sm120_native_graph_sinks
+sdpa/frost/test_sdpa_native_sm80_binding.py::test_sm80_actual_host_frame_matches_python[0.125-False--0.5-0-False-bfloat16]	rule: first L0 cell of test_sm80_actual_host_frame_matches_python
+sdpa/frost/test_sdpa_native_sm90_binding.py::test_dense_permutation_frames_match_python[False-permutation0-bfloat16]	rule: first L0 cell of test_dense_permutation_frames_match_python
+sdpa/frost/test_sdpa_native_sm90_binding.py::test_thd_fixed_batch_and_tensor_map_alignment	rule: first L0 cell of test_thd_fixed_batch_and_tensor_map_alignment
+sdpa/frost/test_sdpa_native_split_binding.py::test_native_split_frames_match_python_and_rebind[2-128-1-False-False-False-False-bfloat16]	rule: first L0 cell of test_native_split_frames_match_python_and_rebind
+sdpa/frost/test_sdpa_native_split_binding.py::test_native_split_graph_rebinds_workspace_and_replays[128-1-bfloat16-False]	rule: first L0 cell of test_native_split_graph_rebinds_workspace_and_replays
+sdpa/frost/test_sdpa_native_thd_binding.py::test_native_matches_python_contract[3-HN-bfloat16]	rule: first L0 cell of test_native_matches_python_contract
+sdpa/frost/test_sdpa_native_thd_binding.py::test_native_nonpaged_host_does_not_require_paged_slots	rule: first L0 cell of test_native_nonpaged_host_does_not_require_paged_slots
+sdpa/frost/test_sdpa_native_thd_fp8_binding.py::test_thd_fp8_actual_host_frames_and_current_pointers[bfloat16-float8_e4m3fn-128-128-sm100]	rule: first L0 cell of test_thd_fp8_actual_host_frames_and_current_pointers
+sdpa/frost/test_sdpa_native_thd_fp8_binding.py::test_thd_fp8_native_graph_current_scales_and_replay[output0-128-128-sm100]	rule: first L0 cell of test_thd_fp8_native_graph_current_scales_and_replay
+sdpa/frost/test_sdpa_paged_binding.py::test_paged_cached_geometry_checks_current_storage[pool_span-k]	rule: first L0 cell of test_paged_cached_geometry_checks_current_storage
+sdpa/frost/test_sdpa_paged_binding.py::test_paged_pool_invalid_runtime_geometry[empty-k-False-bfloat16]	rule: first L0 cell of test_paged_pool_invalid_runtime_geometry
+sdpa/frost/test_sdpa_prepared_block_output.py::test_block_scaled_mxfp8_scale_presence_matches_compilation[False]	rule: first L0 cell of test_block_scaled_mxfp8_scale_presence_matches_compilation
+sdpa/frost/test_sdpa_prepared_block_output.py::test_block_scaled_prepared_rebind_and_replay[False-False-dtype0-16-False-True]	rule: first L0 cell of test_block_scaled_prepared_rebind_and_replay
+sdpa/frost/test_sdpa_prepared_geometry.py::test_dense_geometry_cache_is_bounded_and_safe_across_layouts	rule: first L0 cell of test_dense_geometry_cache_is_bounded_and_safe_across_layouts
+sdpa/frost/test_sdpa_prepared_geometry.py::test_dense_geometry_cache_keys_shape_strides_and_element_width	rule: first L0 cell of test_dense_geometry_cache_keys_shape_strides_and_element_width
+sdpa/frost/test_sdpa_prepared_pv_bf16.py::test_pv_bf16_prepared_rebind_and_replay[False-False-dtype0-128]	rule: first L0 cell of test_pv_bf16_prepared_rebind_and_replay
+sdpa/frost/test_sdpa_prepared_quantized_gate.py::test_quantized_gate_prepared_rebind_and_replay[False-False-output_dtype0-False]	rule: first L0 cell of test_quantized_gate_prepared_rebind_and_replay
+sdpa/frost/test_sdpa_prepared_thd.py::test_d128_nonpaged_thd_split_capture[2-HN-False-False-True-1-dtype0]	rule: first L0 cell of test_d128_nonpaged_thd_split_capture
+sdpa/frost/test_sdpa_prepared_thd.py::test_dense_layout_rule_covers_every_tma_global_stride_and_the_lse_aliasing	rule: first L0 cell of test_dense_layout_rule_covers_every_tma_global_stride_and_the_lse_aliasing
+sdpa/frost/test_sdpa_python_validate.py::test_alibi_requires_causal	rule: first L0 cell of test_alibi_requires_causal
+sdpa/frost/test_sdpa_python_validate.py::test_bottom_right_causal_with_bias	rule: first L0 cell of test_bottom_right_causal_with_bias
+sdpa/frost/test_sdpa_sm80_packed_init.py::test_initializer_rebinds_counts_and_preserves_guards[2]	rule: first L0 cell of test_initializer_rebinds_counts_and_preserves_guards
+sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_block_output_matches_native_graph[dtype0-16]	rule: first L0 cell of test_staged_block_output_matches_native_graph
+sdpa/frost/test_sdpa_staged_forward_fp8.py::test_staged_paged_qo_preserves_kv_pool_views[1-False]	rule: first L0 cell of test_staged_paged_qo_preserves_kv_pool_views
+sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_has_no_execute_allocations_and_replays_current_storage[1-dtype0-128-128]	rule: first L0 cell of test_half_staged_has_no_execute_allocations_and_replays_current_storage
+sdpa/frost/test_sdpa_staged_forward_half.py::test_half_staged_preserves_native_operands_and_split_output[1-converted0]	rule: first L0 cell of test_half_staged_preserves_native_operands_and_split_output
+sdpa/frost/test_sdpa_staged_forward_mxfp8.py::test_mxfp8_staged_block_output_matches_native_graph[dtype0-16]	rule: first L0 cell of test_mxfp8_staged_block_output_matches_native_graph
+sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_quantized_thd_tensormaps_rebind_and_replay[e4m3-d128_fp8]	rule: first L0 cell of test_quantized_thd_tensormaps_rebind_and_replay
+sdpa/frost/test_sdpa_thd_tensormap_acquire.py::test_thd_tensormaps_rebind_and_replay[bf16-d128_cga2]	rule: first L0 cell of test_thd_tensormaps_rebind_and_replay
+sdpa/frost/test_sdpa_torch_varlen_metadata.py::test_frost_torch_auxiliary_metadata_rebind_and_replay[False-lengths]	rule: first L0 cell of test_frost_torch_auxiliary_metadata_rebind_and_replay
+sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d128_f16_folds_the_split_out_of_the_band_builds[causal]	rule: first L0 cell of test_d128_f16_folds_the_split_out_of_the_band_builds
+sdpa/frost/test_sm100_exp2_split_arch_gate.py::test_d192_f16_keeps_its_causal_tail_emulation_under_the_gate[cc100_on]	rule: first L0 cell of test_d192_f16_keeps_its_causal_tail_emulation_under_the_gate
+sdpa/frost/test_sm100_mask_form.py::test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain[sm100]	rule: first L0 cell of test_sm100_d192_dense_fp8_window_sentinel_is_inside_the_bits_domain
+sdpa/frost/test_split_kv_heuristic.py::test_bigger_batch_needs_less_split	rule: first L0 cell of test_bigger_batch_needs_less_split
+sdpa/frost/test_split_kv_heuristic.py::test_chip_already_full_does_not_split	rule: first L0 cell of test_chip_already_full_does_not_split
+sdpa/frost/test_tile_dsl_exp2_emul.py::test_exp2_emul_pair_matches_the_model_bitwise_on_device	rule: first L0 cell of test_exp2_emul_pair_matches_the_model_bitwise_on_device
+sdpa/frost/test_tile_dsl_fp8_pack_scaled.py::test_every_assembling_provenance_matches_the_descale_oracle_on_device[amax]	rule: first L0 cell of test_every_assembling_provenance_matches_the_descale_oracle_on_device
+sdpa/frost/test_tile_dsl_fp8_pack_scaled.py::test_fused_and_unfused_arms_match_each_other_and_the_descale_oracle[e4m3]	rule: first L0 cell of test_fused_and_unfused_arms_match_each_other_and_the_descale_oracle
+sdpa/frost/test_tile_dsl_fp8_x4_scaled_pairs.py::test_pairs_and_payload_match_the_shipped_rule_and_the_oracle_on_device	rule: first L0 cell of test_pairs_and_payload_match_the_shipped_rule_and_the_oracle_on_device
+sdpa/frost/test_tile_dsl_q_loop_bounds.py::test_q_loop_bounds_match_reference[m0-W0-br0-R0-tq64-512x512]	rule: first L0 cell of test_q_loop_bounds_match_reference
+sdpa/frost/test_tile_dsl_sf_layout.py::test_atom_offset_matches_the_oracle_swizzle[128-4]	rule: first L0 cell of test_atom_offset_matches_the_oracle_swizzle
+sdpa/frost/test_tile_dsl_sf_layout.py::test_helper_traces_on_int32_and_matches_the_host[16]	rule: first L0 cell of test_helper_traces_on_int32_and_matches_the_host

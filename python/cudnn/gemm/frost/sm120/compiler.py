@@ -3258,6 +3258,8 @@ def _check_executable(chain: FusionChain) -> None:
     """
     if any(red.mode == "norm2" for red in chain.reductions):
         raise NotImplementedError("a norm2 reduction takes a square root after the kernel, which is a device operation this engine does not own")
+    if chain.has_moe and chain.moe.mode == "combine":
+        raise NotImplementedError("MoE COMBINE is supported only by the FROST SM100 source family")
     if chain.has_moe and chain.moe.mode == "scatter":
         if chain.quants or chain.reductions:
             raise NotImplementedError("MoE SCATTER currently supports dense pointwise outputs without quantization or reduction")
@@ -3320,6 +3322,14 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     )
     if slices <= 1:
         return config
+    # Snap to the largest power of two <= the bound. Measured on the weekly
+    # exhaustive sweep: when the wave arithmetic lands on an odd slice count,
+    # the best power-of-two split of the same geometry matches it within noise
+    # (several such layers prefer the shallower or even the unsplit form), so
+    # the odd split buys nothing while sitting outside the validated axis.
+    slices = 1 << (slices.bit_length() - 1)
+    if slices <= 1:
+        return config
     return replace(config, split_k_slices=slices)
 
 
@@ -3371,6 +3381,8 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
         force_cta_group=force_cta_group,
         m_is_group_average=chain.moe is not None,
+        _pipeline="sm120",
+        _batch=chain.matmul.batch,
     )
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is
@@ -3971,11 +3983,6 @@ class CompiledMoeGemm:
                 raise ValueError(
                     f"MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, self.chain, (S, N, K))}; " f"got {tuple(t.shape)}"
                 )
-        # The caller's workspace (one 128-byte tensormap slot per patched descriptor per CTA), carved
-        # BEFORE the reduction outputs are seeded: a missing workspace raises with every buffer untouched.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
-        # num_experts = weight batch (E); num_groups = first_token_offset len
-        # (BxE, may exceed E; group g uses expert g % E). From runtime tensors.
         num_experts = int(weight.shape[0])
         num_groups = _moe_num_groups(first_token_offset, num_experts)
         _initialize_reduction_outputs(self.chain, outputs, stream)
@@ -4008,7 +4015,9 @@ class CompiledMoeGemm:
             (_wrap_raw_tensor(ci) if (spec.is_reduction or spec.is_quant_scale) else _maybe_wrap_layout(ci, _LEADING_DIM_C))
             for spec, ci in zip(outputs_spec, c_perms)
         ]
-        # The template's host zeroes the scheduler counter before its launch; the workspace was validated above.
+        # Tensormap workspace: one 128-byte slot per CTA per patched descriptor.
+        # The template's host zeroes the scheduler counter before its launch.
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -4106,9 +4115,6 @@ class CompiledMoeGemm:
                 raise ValueError(
                     f"multi-GEMM MoE output {spec.source!r} must have shape " f"{_expected_output_shape(spec, chain, (S, N, K))}; got {tuple(ci.shape)}"
                 )
-        # The caller's workspace (one 128-byte tensormap slot per patched descriptor per CTA), carved
-        # BEFORE the reduction outputs are seeded: a missing workspace raises with every buffer untouched.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         num_experts = int(b_slots[0].shape[0])
         num_groups = _moe_num_groups(first_token_offset, num_experts)
         _initialize_reduction_outputs(chain, outs, stream)
@@ -4138,7 +4144,9 @@ class CompiledMoeGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the number of groups); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
-        # The template's host zeroes the scheduler counter before its launch; the workspace was validated above.
+        # Workspace: one 128-B tensormap slot per patched descriptor per CTA.
+        # The template's host zeroes the scheduler counter before its launch.
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         return self._launchable(
             problem_size,
             first_token_offset,
@@ -4266,11 +4274,9 @@ class CompiledMoeBlockScaleGemm:
         128-aligned); the scheduler tracks each group's start SF-block.
       * ``output`` — (1, S, N) row-major.
 
-    The per-CTA A-descriptor workspace is the CALLER's (``workspace_bytes`` sizes
-    it, ``execute(workspace=)`` passes it; a call without one is a contract error,
-    Rule 8); its size follows the FIXED persistent grid (shape-independent), so
-    one buffer serves every problem size (override-shape needs no workspace
-    accounting)."""
+    The per-CTA A-descriptor workspace is allocated/owned here; its size follows
+    the FIXED persistent grid (shape-independent), so one allocation serves every
+    problem size (override-shape needs no workspace accounting)."""
 
     chain: FusionChain
     config: TileConfig
@@ -4308,7 +4314,8 @@ class CompiledMoeBlockScaleGemm:
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA dynamic-descriptor workspace (16 int64/slot, 128-byte
         aligned). ``n_slots`` covers every dynamic descriptor. Carved from the
-        CALLER's buffer; a call without one is a contract error (Rule 8)."""
+        CALLER's buffer when execute() supplied one; otherwise from one this plan
+        owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
             raise ValueError(
                 f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
@@ -4369,9 +4376,6 @@ class CompiledMoeBlockScaleGemm:
         )
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
-        # The caller's workspace (one 128-byte tensormap slot per patched descriptor per CTA), carved
-        # BEFORE the reduction outputs are seeded: a missing workspace raises with every buffer untouched.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         _initialize_reduction_outputs(self.chain, outputs, stream)
         # Permute to inner-plane layouts (batch last). The host rebuilds SF
         # descriptors from .iterator, so the SF permute just preserves the base ptr.
@@ -4408,6 +4412,7 @@ class CompiledMoeBlockScaleGemm:
             sf_args.append(_maybe_wrap_layout(sfa.permute(1, 2, 0), _LEADING_DIM_AUX))
         if sfb is not None:
             sf_args.append(_maybe_wrap_layout(sfb.permute(1, 2, 0), _LEADING_DIM_AUX))
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,
@@ -4548,9 +4553,6 @@ class CompiledMoeBlockScaleGemm:
         )
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
-        # The caller's workspace (one 128-byte tensormap slot per patched descriptor per CTA), carved
-        # BEFORE the reduction outputs are seeded: a missing workspace raises with every buffer untouched.
-        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         _initialize_reduction_outputs(chain, outs, stream)
         a0, b0 = a_slots[0][0], b_slots[0][0]
         a_stride_perms = [t.permute(1, 2, 0) for (t, _sf) in a_slots]
@@ -4585,6 +4587,7 @@ class CompiledMoeBlockScaleGemm:
                     f"per-group aux {ref.name!r} must be rank-3 with leading dim " f"{num_groups} (the number of groups); got shape {tuple(t.shape)}"
                 )
         aux = tuple(_maybe_wrap_layout(_reshape_aux_to_fake(t, ref), _LEADING_DIM_AUX) for ref, t in zip(chain.aux_tensors, aux))
+        workspace = self._make_workspace(self._grid_ctas * self._desc_slots_per_cta + _MOE_SCHED_COUNTER_SLOTS, workspace)
         _moe_reset_sched_counter(workspace, self._grid_ctas * self._desc_slots_per_cta, stream)
         return self._launchable(
             problem_size,

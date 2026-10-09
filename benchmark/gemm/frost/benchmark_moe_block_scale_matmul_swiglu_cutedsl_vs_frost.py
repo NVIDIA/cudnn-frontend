@@ -154,12 +154,10 @@ def _build_cutedsl(s, combo, mma_tiler, cluster, dynamic_sched, vector_f32):
     if not api.check_support():
         raise ValueError("check_support() returned False")
     api.compile()
-    # execute() carves its scratch from a caller-owned workspace (recipe R2): one buffer, outside the timed loop.
-    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=_DEV)
-    return api, workspace
+    return api
 
 
-def _cutedsl_launch(api, workspace, s, stream):
+def _cutedsl_launch(api, s, stream):
     api.execute(
         a_tensor=s["a"],
         c_tensor=s["c"],
@@ -175,7 +173,6 @@ def _cutedsl_launch(api, workspace, s, stream):
         amax_tensor=s["amax"],
         norm_const_tensor=s["norm_const"],
         current_stream=stream,
-        workspace=workspace,
     )
 
 
@@ -454,20 +451,20 @@ def main() -> int:
                 print(f"  > {label} ...", flush=True)
             t0 = time.time()
             try:
-                api, ws = _build_cutedsl(wset, args.combo, mma, cluster, dyn, vecf32)
+                api = _build_cutedsl(wset, args.combo, mma, cluster, dyn, vecf32)
             except (ValueError, NotImplementedError, RuntimeError) as e:
                 print(f"  {label:52s} UNSUPPORTED: {type(e).__name__}: {str(e)[:60]}")
                 continue
             try:
-                _cutedsl_launch(api, ws, wset, stream)
+                _cutedsl_launch(api, wset, stream)
                 torch.cuda.synchronize()
             except Exception as e:  # noqa: BLE001
                 print(f"  {label:52s} LAUNCH FAIL: {type(e).__name__}: {str(e)[:60]}")
                 continue
             jit = time.time() - t0
             ms = bu.time_ms(
-                bu.rotating(lambda s, _a=api, _w=ws: _cutedsl_launch(_a, _w, s, stream), pool),
-                lambda _a=api, _w=ws: _cutedsl_launch(_a, _w, wset, stream),
+                bu.rotating(lambda s, _a=api: _cutedsl_launch(_a, s, stream), pool),
+                lambda _a=api: _cutedsl_launch(_a, wset, stream),
                 warmup=args.warmup,
                 iters=args.iters,
                 timing=args.timing,

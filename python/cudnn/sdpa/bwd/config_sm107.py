@@ -92,6 +92,7 @@ from cudnn.frost.tile_dsl.constants import (
     DTYPE_E4M3,
     DTYPE_E5M2,
     DTYPE_FP16,
+    DTYPE_FP32,
     MASK_CAUSAL,
     MASK_NONE,
     MASK_PADDED,
@@ -153,6 +154,7 @@ __all__ = [
     "ds_workspace_bytes",
     "sf_workspace_bytes",
     "launch_grid",
+    "thd_units_upper_bound",
 ]
 
 
@@ -308,8 +310,13 @@ class TemplateParams(_BwdTemplateParams):
     ``window_left`` set => SWA), ``bottom_right``, ``seq_kv_lens_present``,
     ``seq_q_lens_present``, ``thd_varlen``, ``sched_policy``, ``xfer_halves``.
     ``xfer_halves`` is a d512 role-split tuning knob with no counterpart in
-    these bodies and is INERT here.  ``seq_q_lens_present`` and ``thd_varlen``
-    are rejected (not implemented in v1).
+    these bodies and is INERT here.  ``seq_q_lens_present`` is rejected (no
+    body threads a per-batch Q length on the DENSE path); ``thd_varlen`` is
+    served by all three bodies (packed ``[1, T, H, D]`` operands, a kv-blocked
+    dS workspace, per-sequence lengths from the metadata buffer -- the module
+    docs of ``sm107/bprop_d256_f16.py`` / ``bprop_d256_fp8.py`` /
+    ``bprop_d256_mxfp8.py``; the MXFP8 body over packed per-sequence-tile-padded
+    scale factors).
 
     A plain :class:`cudnn.sdpa.bwd.config_sm100.TemplateParams` is also
     accepted by :func:`make_cfg_d256_bwd` (the two extras default).
@@ -352,10 +359,20 @@ class TemplateParams(_BwdTemplateParams):
     # under P-c), the dS ring depth and the payload / SF staging slabs.
     # Numerics-changing: a per-graph compile-time constant, never a knob.
     ds_sf_policy: int = -1
+    # --- the 2x2-datapath body (``kernels/bprop_d256_2x2_f16.py``, config ``bwd/config_d256_2x2``) ---------------
+    # 0 = the shipped 4x1 bodies (this module's ``make_cfg_d256_bwd``; REJECTED != 0 there -- a 4x1 body never
+    # reads it, so a non-zero value would be a claim it cannot honour); 1 = the SM100 profile (one 64-row sub-block per
+    # CTA, the ``sdpa_bwd_sm100_d256`` row); 2 = the Rubin interleaved profile (two sub-blocks per CTA, the
+    # ``api_dsl_sm107.BWD_D256_2X2`` twin).  Appended last so every positional caller keeps working; it rides
+    # ``repr(params)`` into the template digest, so the 4x1 renderings' PTX is unchanged while their compiled-plan
+    # cache key moves once.
+    datapath_2x2_profile: int = 0
 
 
 def bpe(dtype: int) -> int:
-    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2."""
+    """Bytes per storage element: FP8 codes 1, BF16 / FP16 2, the output-only DTYPE_FP32 4."""
+    if dtype == DTYPE_FP32:
+        return 4
     return 1 if dtype <= DTYPE_E5M2 else 2
 
 
@@ -471,6 +488,16 @@ class CfgBwdD256:
     HAS_SINK: int = 0  # informational only (no main-kernel effect)
     # FROST-only: per-batch kv lengths are threaded (MASK_PADDED).
     SEQ_KV_LENS_PRESENT: int = 0
+    # FROST-only: THD / varlen (all three bodies; the MXFP8 body also stages packed per-sequence-tile-padded
+    # scale factors).  Packed [1, T, H, D] operands addressed through
+    # packed-total-clamped runtime descriptors, per-sequence lengths and the kv-blocked dS
+    # workspace row offsets from the metadata buffer, a device claim counter in place of CLC,
+    # the q-pad band in the transposed mask (MASK_PADDED is set).  Folds out at 0.
+    THD_VARLEN: int = 0
+    # The kv-blocked THD workspace's row granularity = the pair's kv block (TILE_M * CTA_MMA):
+    # every dS / dV byte a (sequence, kv block, head) unit writes lands in rows its sequence
+    # owns, so no store needs a skip predicate (the setup launch's ``ws_gran`` / ``cga_tile_m``).
+    WS_BLOCK_ROWS: int = 256
 
     L2_SIZE_MIB: int = 60
     SCHEDULER_POLICY: int = SCHED_NATURAL  # 0/1/2 = natural-3D / lpt / lpt_l2 (flat 1-D grid)
@@ -927,7 +954,11 @@ def smem_layout(cfg: CfgBwdD256) -> Tuple[SmemSlab, ...]:
       Q ring 3 x 16 = 48 KiB | dO ring 48 | dO_dv ring 48 | K 32 + V 32 = 64
       (the dV staging ALIASES it post-loop: max(K + V, dV @ BPE_O)) | stats 2 |
       dS ring 3 x 16 (e4m3, the shipped DTYPE_DS) = 48  -> 258 KiB; the bf16-dS
-      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.
+      twin's ring is 3 x 32 = 96 -> 306 KiB.  Every root < 208 KiB.  At
+      ``DTYPE_O = FP32`` (the GQA fold's per-Q-head dV partial) the alias slab is
+      the 128 KiB fp32 dV staging: 322 KiB with the e4m3 ring (1 KiB under the
+      325 KiB usable), 370 with the bf16-dS twin's -- which is why the twin keeps
+      bf16 partials; the roots are unchanged (K / V sit at the slab's start).
 
     f16 body (``sQ | sdO | sCombined[sdOdv_s0 | K | V] | sStats | sdS``):
       Q ring 2 x 32 = 64 | dO ring 64 | dO_dv stage 0 32 + K 64 + V 64 = 160
@@ -1155,12 +1186,20 @@ def _check(preds) -> None:
             raise ValueError(msg)
 
 
-def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> None:
+def _validate_params(flavor: str, family: str, params: _BwdTemplateParams, datapath_2x2: bool = False) -> None:
     """Guard the record a Rubin d256 backward body can express.  Every raise
-    here must also be a Capabilities decline -- reaching it is an engine-row bug."""
+    here must also be a Capabilities decline -- reaching it is an engine-row bug.
+    ``datapath_2x2`` is passed by ``config_d256_2x2.make_cfg_d256_2x2`` alone (it validates the profile itself); the
+    4x1 families reject any non-zero ``datapath_2x2_profile``."""
     dtype_o = getattr(params, "dtype_o", -1)
     dtype_ds = getattr(params, "dtype_ds", -1)
     ds_sf_policy = getattr(params, "ds_sf_policy", -1)
+    profile_2x2 = getattr(params, "datapath_2x2_profile", 0)
+    if not datapath_2x2 and profile_2x2 != 0:
+        raise ValueError(
+            f"{flavor}: datapath_2x2_profile={profile_2x2} selects the 2x2-datapath body (kernels/bprop_d256_2x2_f16.py, config_d256_2x2.make_cfg_d256_2x2); "
+            f"the 4x1 bodies render profile 0 only and would silently ignore it"
+        )
     if params.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be a tile_dsl DTYPE_* code (E4M3=0 E5M2=1 BF16=2 FP16=3); got {params.dtype_qkv}")
     if family != FAMILY_MXFP8:
@@ -1224,10 +1263,11 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
                 f"{flavor}: the fp8 body is E4M3-only (dtype_qkv={DTYPE_E4M3}); got {params.dtype_qkv}"
                 + (" -- E5M2 is not implemented in this body" if params.dtype_qkv == DTYPE_E5M2 else " -- a half-precision io belongs to the f16 body")
             )
-        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16):
+        if dtype_o not in (-1, DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32):
             raise ValueError(
                 f"{flavor}: dtype_o must be -1 (inherit -> E4M3, the fp8 graph contract), DTYPE_E4M3, DTYPE_BF16 or DTYPE_FP16 "
-                f"(the pre-quantization output for the bitwise A/B); got {dtype_o}"
+                f"(the pre-quantization output for the bitwise A/B) or DTYPE_FP32 (the per-Q-head dV_true partial a GQA fold sums in fp32 and "
+                f"rounds ONCE; fits the 327 KiB cap with the e4m3 dS ring only); got {dtype_o}"
             )
     else:
         if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
@@ -1257,8 +1297,19 @@ def _validate_params(flavor: str, family: str, params: _BwdTemplateParams) -> No
     # --- padding / THD ------------------------------------------------------------
     if params.seq_q_lens_present:
         raise ValueError(f"{flavor}: seq_q_lens_present is not implemented -- the body threads only the per-batch kv length (seq_kv_lens)")
-    if params.thd_varlen:
-        raise ValueError(f"{flavor}: thd_varlen is not implemented -- this body has no THD/varlen leg (dense BSHD only)")
+    # thd_varlen is admitted for every family: all three bodies carry the THD arm (packed operands, the metadata buffer,
+    # the device claim counter; the MXFP8 body also the packed per-sequence-tile-padded scale factors).
+    if params.thd_varlen and (params.seq_kv_lens_present or params.seq_q_lens_present):
+        raise ValueError(
+            f"{flavor}: thd_varlen is mutually exclusive with seq_kv_lens_present / seq_q_lens_present -- THD carries its per-sequence "
+            f"lengths in the metadata buffer (two sources of truth for the same fact drift apart)"
+        )
+    if params.thd_varlen and params.sched_policy != SCHED_NATURAL:
+        raise ValueError(
+            f"{flavor}: thd_varlen requires sched_policy NATURAL (0): the THD work list is a device claim counter over "
+            f"(sequence, kv block, head) units walked longest-sequence-first by the metadata's batch_remap; the LPT / LPT_L2 flat-grid "
+            f"decodes address the dense envelope; got {params.sched_policy}"
+        )
     # --- schedule -----------------------------------------------------------------
     if params.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
         raise ValueError(f"{flavor}: sched_policy must be one of NATURAL/LPT/LPT_L2 (0/1/2); got {params.sched_policy}")
@@ -1270,7 +1321,10 @@ def _mask_flags_from(params: _BwdTemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.seq_kv_lens_present:
+    if params.seq_kv_lens_present or params.thd_varlen:
+        # THD is padded BY CONSTRUCTION: every sequence has its own S_q / S_kv, so the kv tail
+        # rows (row_dead) and the q pad columns (the THD q band) take the per-cell mask exactly
+        # as a padding mask does; the lengths come from the metadata buffer instead.
         flags |= MASK_PADDED
     return flags
 
@@ -1449,8 +1503,9 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                         f"DTYPE_DS={cfg.DTYPE_DS} -- a workspace dtype the GEMM arm does not read is silent garbage gradients",
                     ),
                     (
-                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16),
-                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract) or BF16/FP16 (pre-quantization output); got {cfg.DTYPE_O}",
+                        cfg.DTYPE_O in (DTYPE_E4M3, DTYPE_BF16, DTYPE_FP16, DTYPE_FP32),
+                        f"{flavor}: DTYPE_O must be E4M3 (the fp8 graph contract), BF16/FP16 (pre-quantization output) or FP32 (the GQA fold's "
+                        f"per-Q-head dV_true partial, rounded once by the fold); got {cfg.DTYPE_O}",
                     ),
                     (
                         cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS == tm.TOTAL_COLS,
@@ -1566,9 +1621,23 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 f"{flavor}: MASK_SWA <=> SWA_WINDOW > 0 (got MASK_FLAGS={cfg.MASK_FLAGS}, SWA_WINDOW={cfg.SWA_WINDOW})",
             ),
             (
-                bool(cfg.MASK_FLAGS & MASK_PADDED) == bool(cfg.SEQ_KV_LENS_PRESENT),
-                f"{flavor}: MASK_PADDED <=> SEQ_KV_LENS_PRESENT (got MASK_FLAGS={cfg.MASK_FLAGS}, SEQ_KV_LENS_PRESENT={cfg.SEQ_KV_LENS_PRESENT}); a padded mask without the "
-                f"per-batch kv lengths masks against the padded total and every sequence attends the whole pad",
+                bool(cfg.MASK_FLAGS & MASK_PADDED) == bool(cfg.SEQ_KV_LENS_PRESENT or cfg.THD_VARLEN),
+                f"{flavor}: MASK_PADDED <=> (SEQ_KV_LENS_PRESENT or THD_VARLEN) (got MASK_FLAGS={cfg.MASK_FLAGS}, SEQ_KV_LENS_PRESENT={cfg.SEQ_KV_LENS_PRESENT}, "
+                f"THD_VARLEN={cfg.THD_VARLEN}); a padded mask without the per-batch kv lengths masks against the padded total and every sequence attends "
+                f"the whole pad",
+            ),
+            (
+                not (cfg.THD_VARLEN and cfg.SEQ_KV_LENS_PRESENT),
+                f"{flavor}: THD_VARLEN and SEQ_KV_LENS_PRESENT are mutually exclusive (THD reads its lengths from the metadata buffer)",
+            ),
+            (
+                not cfg.THD_VARLEN or cfg.SCHEDULER_POLICY == SCHED_NATURAL,
+                f"{flavor}: THD_VARLEN requires SCHEDULER_POLICY NATURAL (the device claim counter walks the metadata's unit list)",
+            ),
+            (
+                cfg.WS_BLOCK_ROWS == cfg.TILE_M * cfg.CTA_MMA,
+                f"{flavor}: WS_BLOCK_ROWS ({cfg.WS_BLOCK_ROWS}) must be the pair's kv block (TILE_M * CTA_MMA = {cfg.TILE_M * cfg.CTA_MMA}): the THD "
+                f"dS / dV stores carry no skip predicate because every unit's 256-row store box lies wholly inside its sequence's block",
             ),
             (cfg.SCHEDULER_POLICY in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2), f"{flavor}: SCHEDULER_POLICY must be 0/1/2"),
             (
@@ -1969,6 +2038,8 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         CAUSAL_BOTTOM_RIGHT=int(params.bottom_right),
         HAS_SINK=int(getattr(params, "has_sink", False)),
         SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
+        THD_VARLEN=int(params.thd_varlen),
+        WS_BLOCK_ROWS=tile_m * cta_mma,
         L2_SIZE_MIB=60,
         SCHEDULER_POLICY=params.sched_policy,
         TOTAL_WARPS=12,
@@ -2068,12 +2139,28 @@ def sf_workspace_bytes(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_q_pad: int,
     return batch * qh_chunk * (s_kv_pad // SF_ATOM_ROWS) * (s_q_pad // SF_ATOM_ROWS) * SF_ATOM_BYTES
 
 
-def launch_grid(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_kv_pad: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+def launch_grid(cfg: CfgBwdD256, batch: int, qh_chunk: int, s_kv_pad: int, thd_units: int = 0) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
     """``(grid, cluster)`` for one launch: natural = ``(kv_blocks * CGA_M, qh_chunk, B)``;
-    LPT / LPT_L2 = the flat 1-D grid the body's tile decode expects."""
+    LPT / LPT_L2 = the flat 1-D grid the body's tile decode expects; THD (``cfg.THD_VARLEN``,
+    ``thd_units`` appended) = the occupancy-sized persistent grid ``(thd_units * CGA_M, 1, 1)``
+    the device claim counter hands units out to (:func:`thd_units_upper_bound`)."""
+    if cfg.THD_VARLEN:
+        if thd_units < 1:
+            raise ValueError(f"sm107 bwd d256: a THD launch needs thd_units >= 1 (the persistent grid's cluster count); got {thd_units}")
+        return (thd_units * cfg.CGA_M, 1, 1), (cfg.CGA_M, cfg.CGA_N, 1)
     kv_blocks = -(-s_kv_pad // kv_pad_rows(cfg))
     if cfg.SCHEDULER_POLICY == SCHED_NATURAL:
         grid = (kv_blocks * cfg.CGA_M, qh_chunk, batch)
     else:
         grid = (kv_blocks * qh_chunk * batch * cfg.CGA_M, 1, 1)
     return grid, (cfg.CGA_M, cfg.CGA_N, 1)
+
+
+def thd_units_upper_bound(cfg: CfgBwdD256, t_kv_cap: int, batch: int, qh_chunk: int) -> int:
+    """An UPPER bound on the THD launch's live units: ``(ceil(t_kv_cap / kv block) + B) * qh_chunk`` -- every sequence's
+    kv blocks (its own ceil can add at most one block per sequence over the packed total's) times the heads of one
+    launch.  The grid is ``min(this, the device's cluster count)``; a cluster whose first unit is at or past the device
+    live total runs ONE forced fully-masked tile (dead initial units are legal: the body's degenerate-input contract)."""
+    if t_kv_cap < 0 or batch < 1 or qh_chunk < 1:
+        raise ValueError(f"sm107 bwd d256: thd_units_upper_bound needs t_kv_cap >= 0, batch >= 1, qh_chunk >= 1; got {t_kv_cap}, {batch}, {qh_chunk}")
+    return max(1, (-(-t_kv_cap // kv_pad_rows(cfg)) + batch) * qh_chunk)

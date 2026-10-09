@@ -74,6 +74,11 @@ class IndexerTopK(APIBase):
     rows receive no kernel writes and ``out_indices`` keeps whatever the
     caller stored there.
 
+    ``tie_break`` is 0 (arbitrary), 1 (smaller source-column index), or 2
+    (larger source-column index) among equal radix keys. It does not sort the
+    output. Signed zeros remain distinct (+0 before -0); NaN ordering is
+    unspecified.
+
     Memory contract (Rule 8)
     ------------------------
     The class owns no device memory. ``execute()`` writes into the caller's
@@ -93,6 +98,7 @@ class IndexerTopK(APIBase):
         next_n: int = 1,
         return_val: bool = True,
         num_copy_bits: int = 256,
+        tie_break: int = 0,
     ):
         super().__init__()
         self.input_desc = self._make_tensor_desc(sample_input_values, name="input_values")
@@ -103,6 +109,7 @@ class IndexerTopK(APIBase):
         self.num_copy_bits = int(num_copy_bits)
         self._buffer_dims = None
         self._scratch_bytes = None
+        self.tie_break = tie_break
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -120,6 +127,8 @@ class IndexerTopK(APIBase):
             self.top_k <= 0 or self.top_k > 2048,
             f"top_k must be in (0, 2048], got {self.top_k}",
         )
+
+        self._value_error_if(self.tie_break not in (0, 1, 2), "tie_break must be 0 (none), 1 (small), or 2 (large)")
 
         # Enforce the kernel's n_rows == batch_size * next_n invariant
         # up-front so misuse surfaces here rather than as silently-empty
@@ -173,15 +182,17 @@ class IndexerTopK(APIBase):
                 self.next_n,
                 return_val=self.return_val,
                 num_copy_bits=self.num_copy_bits,
+                tie_break=self.tie_break,
             )
 
     def execute(
         self,
         input_values: torch.Tensor,
         seq_lens: torch.Tensor,
+        current_stream: Optional[cuda.CUstream] = None,
+        *,
         out_indices: torch.Tensor,
         out_values: Optional[torch.Tensor] = None,
-        current_stream: Optional[cuda.CUstream] = None,
         workspace: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Launch into the caller's ``out_indices`` / ``out_values``; returns them.
@@ -241,6 +252,7 @@ def indexer_top_k_wrapper(
     return_val: bool = True,
     num_copy_bits: int = 256,
     stream: Optional[cuda.CUstream] = None,
+    tie_break: int = 0,
 ) -> TupleDict:
     """High-level wrapper returning ``{'indices', 'values'}``.
 
@@ -257,6 +269,12 @@ def indexer_top_k_wrapper(
     per call, on ``stream``; use the class API with caller-owned buffers to
     avoid the allocations. Strided ``input_values`` / ``seq_lens`` are copied
     contiguous here (the class declines them in ``check_support()``).
+
+    ``tie_break`` chooses among equal radix keys at the cutoff: 0 (arbitrary,
+    default), 1 (smaller source-column index), or 2 (larger source-column index).
+    Output order remains unspecified. Signed zeros retain their existing radix
+    ordering (+0 before -0); NaN ordering is unspecified.
+
     """
     # R1 staging: the originals are record_stream'ed on `stream` before they are rebound.
     input_values = contiguous_on_stream(input_values, stream, input_values.device)
@@ -270,6 +288,7 @@ def indexer_top_k_wrapper(
         int(next_n),
         bool(return_val),
         int(num_copy_bits),
+        tie_break,
     )
     obj = _cache_of_IndexerTopKObjects.get(cache_key)
     if obj is None:
@@ -280,6 +299,7 @@ def indexer_top_k_wrapper(
             next_n=next_n,
             return_val=return_val,
             num_copy_bits=num_copy_bits,
+            tie_break=tie_break,
         )
         assert obj.check_support()
         obj.compile()
@@ -292,7 +312,7 @@ def indexer_top_k_wrapper(
         indices = torch.empty(n_rows, top_k, dtype=torch.int32, device=device)
         values = torch.empty(n_rows, top_k, dtype=input_values.dtype, device=device) if return_val else None
         workspace = torch.empty(obj.scratch_workspace_bytes(), dtype=torch.uint8, device=device)
-        obj.execute(input_values, seq_lens, indices, values, current_stream=stream, workspace=workspace)
+        obj.execute(input_values, seq_lens, out_indices=indices, out_values=values, current_stream=stream, workspace=workspace)
     return TupleDict(indices=indices, values=values)
 
 

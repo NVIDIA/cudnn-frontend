@@ -38,6 +38,8 @@ _SM100_MXFP8 = "SdpaBwdDslSm100Mxfp8"
 _SM107 = "SdpaBwdDslSm107"
 _SM107_FP8 = "SdpaBwdDslSm107Fp8"
 _SM107_MXFP8 = "SdpaBwdDslSm107Mxfp8"
+_SM100_D256 = "SdpaBwdDslSm100D256"
+_SM107_D512 = "SdpaBwdDslSm107D512"
 
 
 def _adapter(name: str):
@@ -52,6 +54,16 @@ def _adapter(name: str):
         from cudnn.sdpa.bwd import api_dsl_sm107
 
         return getattr(api_dsl_sm107, name)
+    if name == _SM100_D256:
+        # The SM100 d=256 half row: the Rubin half chain's adapter over the 2x2-datapath body.
+        from cudnn.sdpa.bwd import api_dsl_sm100_d256
+
+        return api_dsl_sm100_d256.SdpaBwdDslSm100D256
+    if name == _SM107_D512:
+        # The cc 10.7 d512 half row: the SM100 large-head-dim chain's adapter over the cc 10.7 2x2-datapath stage 2.
+        from cudnn.sdpa.bwd import api_dsl_sm107_d512
+
+        return api_dsl_sm107_d512.SdpaBwdDslSm107D512
     from cudnn.sdpa.bwd import api_dsl
 
     return getattr(api_dsl, name)
@@ -245,6 +257,12 @@ class Capabilities:
     # THD ports may be head-interleaved (head stride >= D, a multiple of 8
     # elements); rows without it require head stride == D.
     thd_head_stride: bool = False
+    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435).
+    zero_scale: bool = False
+    # THD caller buffers are addressed at the bound ragged offsets (per-port
+    # token origins, whole tokens by precondition), not at prefix(lengths).
+    # Appended last: Capabilities is positional-append-only.
+    thd_ragged_offsets: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -349,6 +367,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.has_score_max, capabilities.score_max, "score_max"),
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
+        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
         (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
@@ -555,6 +574,33 @@ def build(spec: EngineSpec, graph, knobs: Optional[SdpaBwdKnobs] = None):
     return spec.lower(spec, facts, knobs)
 
 
+def _thd_ctor_facts(facts: "ga.SdpaGraphFacts", stats_geom) -> dict:
+    """The THD plan-time facts every sm107-line adapter constructor takes, derived ONCE for the three lowerings: ``thd``, the
+    caller-declared packed token totals (under THD they SIZE the blocked S/dS workspace, which ``scratch_workspace_bytes()``
+    has to answer at build time -- why ``mismatch()`` requires them there) and the packed Stats packing, read off the ragged
+    declaration exactly as the forward reads it (native forward THD binding): token-major ``(T, H)`` -- cuDNN's ragged-Stats
+    recipe -- or head-major ``(1, QH, head_stride)``, which is what the FROST forward emits natively (``mismatch()`` has already
+    rejected anything that is neither).  Off a dense graph every fact is its default."""
+    thd = facts.thd
+    stats_stride_h, stats_stride_s = (int(stats_geom[1][1]), int(stats_geom[1][2])) if thd else (0, 0)
+    stats_token_major = thd and ga.thd_stats_packing(stats_stride_h, stats_stride_s, facts.h_q) == "token_major"
+    return {
+        "thd": thd,
+        "max_total_seq_len_q": facts.max_total_seq_len_q,
+        "max_total_seq_len_kv": facts.max_total_seq_len_kv,
+        "thd_stats_token_major": stats_token_major,
+        "thd_stats_head_stride": stats_stride_h if (thd and not stats_token_major) else 0,
+    }
+
+
+def _length_bindings(facts: "ga.SdpaGraphFacts") -> dict:
+    """The per-side length operands of a ``SdpaBinding``: a ragged graph always carries them (its lengths ARE the mask), and
+    so does a dense padded one; ``None`` on an unpadded dense graph.  NOT the ``(B+1,)`` prefix-sum form -- ``cu_seq_len_q/kv``
+    exists only on the FORWARD attributes, so ``facts.has_cu_seq_len`` is always False here (the standalone adapters read
+    either form, telling them apart at execute from ``numel() == B + 1``)."""
+    return {"seq_len_kv": facts.seq_kv_t if facts.padded else None, "seq_len_q": facts.seq_q_t if facts.padded else None}
+
+
 def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any = None, api_type: str = _SM120):
     """Lower the selected SDPA backward engine through its DSL adapter.
 
@@ -606,21 +652,16 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     # this becomes a one-line pick and a `cu_seq_len=True` row -- with an accept
     # test, which cannot be written today. Verified 2026-09-03 against
     # python/pygraph/sdpa.cpp and graph_properties.h.
-    seq_kv_t = facts.seq_kv_t if facts.padded else None
-    seq_q_t = facts.seq_q_t if facts.padded else None
+    lengths = _length_bindings(facts)
+    seq_kv_t, seq_q_t = lengths["seq_len_kv"], lengths["seq_len_q"]
     # THD carries its lengths through the setup launch's metadata buffer, not
     # as a compiled-in padding mask, so the *_present specialization flags stay
     # off there (the adapter refuses them under THD) while the buffers still
-    # flow to execute.
-    thd = facts.thd
-    # Packed Stats packing, read off the ragged declaration exactly as the
-    # forward reads it (fwd/prepared.py, `bind_thd`): token-major (T, H)
-    # -- cuDNN's ragged-Stats recipe -- or head-major (1, QH, head_stride),
-    # which is what the FROST forward emits natively. mismatch() has already
-    # rejected anything that is neither.
-    stats_stride_h, stats_stride_s = (int(stats_geom[1][1]), int(stats_geom[1][2])) if thd else (0, 0)
-    stats_token_major = thd and ga.thd_stats_packing(stats_stride_h, stats_stride_s, facts.h_q) == "token_major"
-    stats_head_stride = stats_stride_h if (thd and not stats_token_major) else 0
+    # flow to execute.  The THD plan-time facts (`_thd_ctor_facts`) are shared
+    # with the quantized lowerings.
+    thd_facts = _thd_ctor_facts(facts, stats_geom)
+    thd = thd_facts["thd"]
+    stats_token_major, stats_head_stride = thd_facts["thd_stats_token_major"], thd_facts["thd_stats_head_stride"]
     # Sink ports: geometry straight from the IR tensors (fp32 (1, H_q, 1, 1)).
     sink_geom = (tuple(facts.sink_t.get_dim()), tuple(facts.sink_t.get_stride())) if facts.has_sink else None
     dsink_geom = (tuple(facts.dsink_t.get_dim()), tuple(facts.dsink_t.get_stride())) if facts.has_dsink else None
@@ -628,22 +669,37 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
     adapter_cls = _adapter(api_type)
+    # Bound ragged offsets, read on device by rows that declare it: per port,
+    # the IR tensor's offset tensor, dtype and multiplier.
+    _ragged = {}
+    if thd and spec.capabilities.thd_ragged_offsets:
+        _ro_dtypes = {cudnn.data_type.INT32: torch.int32, cudnn.data_type.INT64: torch.int64}
+        for port, t in (
+            ("q", facts.q_t),
+            ("k", facts.k_t),
+            ("v", facts.v_t),
+            ("o", facts.o_t),
+            ("do", facts.do_t),
+            ("dq", facts.dq_t),
+            ("dk", facts.dk_t),
+            ("dv", facts.dv_t),
+            ("stats", facts.stats_t),
+        ):
+            ro = getattr(t, "ragged_offset", None) if t is not None else None
+            if ro is not None:
+                if ro.get_data_type() not in _ro_dtypes:
+                    raise NotImplementedError(f"{port} ragged offset must be INT32 or INT64; got {ro.get_data_type()}")
+                _ragged[port] = (ro, _ro_dtypes[ro.get_data_type()], int(getattr(t, "ragged_offset_multiplier", 1) or 1))
     # SM80-only plan-time facts, forwarded only to adapters declaring them.
     _extra_ctor = {
         # THD / ragged (base-ctor parameters, so every adapter declares them;
         # they stay off for the rows whose Capabilities decline THD).
-        "thd": thd,
-        # Caller-declared packed token totals. Under THD they SIZE the blocked
-        # S/dS workspace, which scratch_workspace_bytes() has to answer at
-        # build time -- which is why mismatch() requires them there.
-        "max_total_seq_len_q": facts.max_total_seq_len_q,
-        "max_total_seq_len_kv": facts.max_total_seq_len_kv,
-        "thd_stats_token_major": stats_token_major,
-        "thd_stats_head_stride": stats_head_stride,
+        **thd_facts,
         "has_bias": facts.has_bias,
         "bias_is_fp32": (facts.bias_t.get_data_type() == cudnn.data_type.FLOAT) if facts.bias_t is not None else True,
         "bias_batch": int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1,
         "has_rope": False,  # RoPE-fused multi-node graphs never reach the analyzer
+        "thd_ragged_offsets": {port: (dtype, mult) for port, (_, dtype, mult) in _ragged.items()},
     }
     _extra_ctor = {k: v for k, v in _extra_ctor.items() if k in inspect.signature(adapter_cls.__init__).parameters}
     api = adapter_cls(
@@ -697,6 +753,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dsink=facts.dsink_t if facts.has_dsink else None,
         bias=facts.bias_t if facts.has_bias else None,
         dbias=facts.dbias_t if facts.has_dbias else None,
+        **{"ragged_" + port: ro for port, (ro, _, _) in _ragged.items()},
     )
 
     # Every adapter that records a prepared spec is launched through it (SM120, SM100, SM80 native, SM107); the
@@ -808,6 +865,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             # engine plan passes ctx.stream); None keeps the adapter's
             # torch-current-stream fallback.
             current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
+            **({"thd_ragged_offsets": {port: resolved[id(ro)].reshape(-1) for port, (ro, _, _) in _ragged.items()}} if _ragged else {}),
         )
         return None
 
@@ -839,14 +897,16 @@ def _sm80_spec() -> EngineSpec:
     launch, Stats read in either packed packing, declared totals sizing
     the carved scratch -- hence ``thd_declared_totals``).  Deterministic dQ,
     sinks, GQA, the causal family and head-dim envelope padding all ride it;
-    bias / dBias is dense-only (a path property, see mismatch()).  As on every
-    FROST THD row the packed addressing is ``prefix(lengths) x token stride``
-    and the bound ragged-offset values are not read: sequences must be
-    adjacent (padded THD with inter-sequence gaps is issue #737).
+    bias / dBias is dense-only (a path property, see mismatch()).  The
+    setup launch also reads every port's bound ragged offsets into per-port
+    token origins (``thd_ragged_offsets``), so padded THD with gaps between
+    sequences (TE's ``cu_seqlens_padded``) is served; whole-token offsets are
+    a supported-input precondition.
     """
     return EngineSpec(
         name="sdpa_bwd_sm80",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=80,
             sm_hi=80,
             d=frozenset({256}),
@@ -872,6 +932,7 @@ def _sm80_spec() -> EngineSpec:
             # than any packed buffer.
             thd_declared_totals=True,
             thd_head_stride=True,
+            thd_ragged_offsets=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
             # The kernels READ the declared stats strides natively (the
@@ -929,6 +990,7 @@ def _sm100_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=100,
             sm_hi=103,
             d=frozenset({512}),
@@ -1010,6 +1072,7 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         )
 
     fp8, half = facts.dtype, facts.dtype_o
+    stats_geom = (tuple(facts.stats_t.get_dim()), tuple(facts.stats_t.get_stride()))
     api = _adapter(api_type)(
         sample_q=_port_desc("q", fp8, facts.q_t),
         sample_k=_port_desc("k", fp8, facts.k_t),
@@ -1041,8 +1104,15 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
-        seq_kv_lens_present=facts.padded,
-        seq_q_lens_present=facts.padded,
+        # Derived like the f16 lowering's (a padded graph carries both length tensors; THD routes its lengths through the
+        # setup metadata, not the compiled-in padding mask).  Unreachable while the row's `Capabilities.padded` is False --
+        # eligibility declines a padded graph before lowering -- and the adapter's typed decline backstops the arm no body
+        # threads (per-batch Q lengths).
+        seq_kv_lens_present=(facts.seq_kv_t is not None) and facts.padded and not facts.thd,
+        seq_q_lens_present=(facts.seq_q_t is not None) and facts.padded and not facts.thd,
+        # The THD plan-time facts, shared with the half lowering (one derivation, one constructor contract; the SM100 MXFP8 row
+        # declines THD at eligibility, the SM107 one serves it).
+        **_thd_ctor_facts(facts, stats_geom),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -1058,6 +1128,8 @@ def lower_dsl_bwd_mxfp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested:
         dq=facts.dq_t,
         dk=facts.dk_t,
         dv=facts.dv_t,
+        # The per-side lengths of a ragged (or padded) graph: the THD spec binds them at its slots 9 / 10.
+        **_length_bindings(facts),
         q_T=facts.q_T_t,
         k_T=facts.k_T_t,
         dO_T=facts.dO_T_t,
@@ -1137,13 +1209,40 @@ def _sm107_spec() -> EngineSpec:
     tail masked).  Dense, top-left and bottom-right causal, sliding window (left),
     MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats.
 
-    Declined for now, each asserted by a test: dense padding masks (the kernel
-    threads a uniform length), sink / dSink, bias / dBias, right-band widening,
-    THD, decode shapes, ``dense_flex`` layouts, and ``deterministic`` -- the
-    chain has no atomics and a two-run bitwise test exists, but the claim waits
-    on the bring-up sweep (plan Q4).  The bf16 d256 graph has a native backend
-    competitor (engine 17, which forces its own deterministic flag): pin the
-    engine when validating or measuring this row.
+    THD / ragged is served on the packed path (bf16 / fp16 only): Q/K/V/O/dO and
+    the gradients are PACKED ``[1, T, H, D]`` (packed BSHD rows; a padded token
+    stride is served as declared), the per-sequence ``seq_len_q/kv`` arrive as
+    ``(B,)`` tensors (the backward node has no ``cu_seq_len_*`` port) and a setup
+    launch builds the metadata on device -- no host cumsum.  The dS workspace is
+    BLOCKED over packed KV tokens (each sequence owns a 256-row-aligned block, the
+    kernel's kv block, so no store needs a skip predicate; q columns uniform at the
+    padded q envelope), the kernel reads the packed operands through descriptors
+    clamped to the live packed totals (a NaN capacity tail is TMA-OOB zero), masks
+    each sequence's kv tail and q pad columns (its own lengths, the bottom-right
+    diagonal ``S_kv[b] - S_q[b]`` included) and stores dV through per-sequence
+    clipped descriptors; stage 3 renders the dense path's two-sided K-trim PER SEQUENCE
+    (``thd_rows_kv`` + ``thd_causal_bottom_right``: every bound from the sequence's own
+    lengths and diagonal, a tile whose band is empty stored as exact zeros), so the
+    blocked workspace is never zero-filled.  Both packed Stats layouts the forward emits
+    are read.  GQA / MQA via per-Q-head dK/dV partials over the packed kv axis plus the
+    shared fold, bounded on device at the live kv total (dQ once per head chunk:
+    ``b_head_group`` = the group).  Degenerate sequences are exact: an empty-KV
+    sequence gets no unit and zero dQ, an empty-Q sequence zero dK / dV.  Required:
+    ``max_total_seq_len_q/kv`` (``scratch_workspace_bytes()`` is a build-time function;
+    the blocked row count comes from the packed totals).
+
+    Declined for now, each asserted by a test: graph padding masks -- a graph
+    padding mask carries ``seq_len_q`` AND ``seq_len_kv`` by construction (the
+    frontend requires both) and the body threads no per-batch Q length on the DENSE
+    path, so the graph form is declined rather than served while ignoring the q
+    lengths; the body DOES read per-batch kv lengths, which the adapter serves on its
+    standalone surface (``seq_kv_lens_present=True`` + ``execute(seq_kv_lens=)``,
+    ``api_dsl_sm107`` module doc; the quantized rows serve the same surface) -- sink /
+    dSink, bias / dBias, right-band widening, decode shapes,
+    ``dense_flex`` layouts, and ``deterministic`` -- the chain has no atomics and a two-run
+    bitwise test exists, but the claim waits on the bring-up sweep (plan Q4).  The bf16
+    d256 graph has a native backend competitor (engine 17, which forces its own
+    deterministic flag): pin the engine when validating or measuring this row.
 
     A prepared launch: ``compile()`` builds one pointer-host artifact for the whole
     chain (``bwd/prepared_sm107.py``, ``kernels/sm107/prepared_host.py``) and the graph
@@ -1152,6 +1251,7 @@ def _sm107_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1161,6 +1261,15 @@ def _sm107_spec() -> EngineSpec:
             causal=True,
             bottom_right=True,
             swa=True,
+            # THD / ragged on the packed path (bf16 / fp16): packed [1, T, H, D] operands through packed-total-clamped runtime
+            # descriptors, a kv-BLOCKED dS workspace (every sequence's block padded to the kernel's 256-row kv block), per-sequence
+            # lengths and the device claim counter from a setup launch's metadata, stage 3 trimmed PER SEQUENCE over the blocked
+            # rows (no workspace zero-fill) with per-sequence clipped output descriptors, GQA via per-Q-head partials over the
+            # packed kv axis and one dQ launch per head chunk.  Requires the declared totals (the blocked workspace is sized at
+            # build time) and packed BSHD rows; the fp8 and MXFP8 rows carry the same leg (the MXFP8 row over packed
+            # per-sequence-tile-padded scale factors).
+            thd=True,
+            thd_declared_totals=True,
             decode=False,  # prefill bodies: a 128-row q tile per iteration
             layouts=frozenset({"bshd"}),
         ),
@@ -1215,10 +1324,17 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
         scale_softmax=facts.scale,
         tile_m=requested.tile_m if requested is not None else None,
         tile_n=requested.tile_n if requested is not None else None,
-        seq_kv_lens_present=facts.padded,
-        seq_q_lens_present=facts.padded,
+        # Derived like the f16 lowering's (a padded graph carries both length tensors; THD routes its lengths through the
+        # setup metadata, not the compiled-in padding mask).  Unreachable while the row's `Capabilities.padded` is False --
+        # eligibility declines a padded graph before lowering -- and the adapter's typed decline backstops the arm no body
+        # threads (per-batch Q lengths).
+        seq_kv_lens_present=(facts.seq_kv_t is not None) and facts.padded and not facts.thd,
+        seq_q_lens_present=(facts.seq_q_t is not None) and facts.padded and not facts.thd,
         # A plan fact: which amax pointers the prepared artifact binds (None-specialized otherwise).
         amax_requested=tuple(name for name, t in amaxes.items() if t is not None),
+        # The THD plan-time facts, shared with the half lowering: a ragged fp8 graph (both totals declared on the node) reaches
+        # check_support as a THD plan and lowers onto the packed fp8 chain (`prepared_sm107.compile_plan_fp8_thd`).
+        **_thd_ctor_facts(facts, stats_geom),
     )
     api.check_support()  # raises ValueError / NotImplementedError if unsupported
     api.compile()
@@ -1251,6 +1367,9 @@ def lower_dsl_bwd_fp8(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: A
         dq=facts.dq_t,
         dk=facts.dk_t,
         dv=facts.dv_t,
+        # The per-side lengths of a ragged (or padded) graph: the THD spec (`prepared_sm107.ATTRIBUTES_FP8_THD`) binds them at
+        # its slots 9 / 10; on a dense plan they are None and the dense spec's appended `seq_len_kv` slot stays unbound.
+        **_length_bindings(facts),
         **scalars,
         **{name: t for name, t in amaxes.items() if t is not None},
     )
@@ -1290,21 +1409,33 @@ def _sm107_fp8_spec() -> EngineSpec:
 
     E4M3 payloads only (no E5M2 body); otherwise the half row's envelope and
     declines, plus: O must be an FP8 payload of Q's dtype and the gradient triple
-    must share one dtype (analyzer facts ``uniform_dtype`` / ``uniform_out_dtype``),
-    and **bottom-right causal needs ``S_q % 128 == 0``** -- the fp8 body's ABI has
-    no ``seqlen_q_real`` (the f16 body's has), so it derives the bottom-right
-    diagonal and the q-tile trim from the PADDED q extent; a ragged S_q would be
-    served silently wrong by ``pad - S_q`` rows, so the row declines it
-    (``bottom_right_s_q_multiple=128``; the adapter backstops).  A ragged S_kv is
-    fine (the kernel's kv term is the runtime real length).
+    must share one dtype (analyzer facts ``uniform_dtype`` / ``uniform_out_dtype``).
+    The body takes the REAL lengths on its ABI (``seqlen_q_real`` / ``seqlen_kv_real``),
+    so bottom-right causal is served at ANY S_q / S_kv (``bottom_right_s_q_multiple=1``,
+    as the half row); it reads per-batch kv lengths under its padded arm and gates its
+    amax folds on them, so the adapter serves ``seq_kv_lens_present=True`` +
+    ``execute(seq_kv_lens=)`` on the standalone surface (the K / V rows past a length
+    must be finite), and takes a caller's TRUE-unit delta under ``external_delta=True``
+    (dense and THD plans; ``api_dsl_sm107`` module doc).
 
-    A prepared launch like the half row (``prepared_sm107.compile_plan_fp8``): the
-    scalars and the requested amax outputs are roles of the spec; an amax the graph
-    left virtual is None-specialized out of the artifact.
+    THD / ragged is served on the packed path exactly as on the half row (the same
+    kv-blocked workspace, metadata, claim counter and per-sequence clipped stores, in
+    e4m3; the fp8 K64 stage-3 arm trimmed per sequence with its descale / quantize
+    epilogue; the fold + quantize passes bounded on device at the live totals; every amax
+    the max over the packed LIVE region, one ``scale_dP`` per packed batch) and requires
+    the declared totals (``thd_declared_totals``): the ``sdpa_fp8_backward`` node and its
+    binding carry ``max_total_seq_len_q/kv`` (trailing keywords); a ragged fp8 graph without
+    them -- or through a pybind extension built before the attribute, which cannot declare
+    them -- is a typed decline at eligibility.
+
+    A prepared launch like the half row (``prepared_sm107.compile_plan_fp8`` /
+    ``compile_plan_fp8_thd``): the scalars and the requested amax outputs are roles of
+    the launch spec; an amax the graph left virtual is None-specialized out of the artifact.
     """
     return EngineSpec(
         name="sdpa_bwd_sm107_fp8",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1317,10 +1448,14 @@ def _sm107_fp8_spec() -> EngineSpec:
             causal=True,
             bottom_right=True,
             swa=True,
+            # THD / ragged on the packed e4m3 path (the half row's mechanism; the fold + quantize passes bounded at the live
+            # totals, every amax over the live region).  Requires the declared totals: the blocked workspace is sized at build time.
+            thd=True,
+            thd_declared_totals=True,
             decode=False,
             layouts=frozenset({"bshd"}),
-            # == api_dsl_sm107._SM107_Q_PAD (the body's q tile); pinned equal by test_sdpa_bwd_fp8_sm107.py.
-            bottom_right_s_q_multiple=128,
+            # The body takes the REAL q length (``seqlen_q_real``) for the bottom-right diagonal and the q-tile trim: any S_q.
+            bottom_right_s_q_multiple=1,
         ),
         lower=partial(lower_dsl_bwd_fp8, api_type=_SM107_FP8),
     )
@@ -1358,26 +1493,48 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     LSE), BSHD-physical layout, MHA / GQA / MQA, any S_q / S_kv (padded: zero-filled
     staging of the payloads AND of the scale-factor pads -- the producer's SF pad bytes
     are undefined and the kernel reads them), dense / top-left causal / bottom-right
-    causal (``S_q % 128 == 0``, as the fp8 row: the body derives the diagonal from its
-    padded S_q) / sliding window (left).  Wider than the SM100 MXFP8 row (bottom-right,
-    SWA) and the sole provider of this graph on Rubin: cuDNN 9.27 has no MXFP8 d=256
-    backward kernel on smVersion 1070 (verified 2026-09-29: a typed decline at plan creation).
+    causal at ANY S_q (the body derives the diagonal from ``seqlen_q_real``;
+    ``bottom_right_s_q_multiple=1``) / sliding window (left); per-batch kv lengths
+    (``seq_kv_lens_present=True`` + ``execute(seq_kv_lens=)``, the K / V rows past a length
+    and their scale-factor atoms finite) and a caller's delta (``external_delta=True``,
+    bitwise the row's own dot over the f16 ports) on the standalone surface, as on the
+    sibling rows.  Wider than the SM100 MXFP8 row (bottom-right, SWA) and the sole provider of this graph on Rubin:
+    cuDNN 9.27 has no MXFP8 d=256 backward kernel on smVersion 1070 (verified
+    2026-09-29: a typed decline at plan creation).
 
     Declined, each asserted by a test: fp16 gradients (both chains' stage-3 GEMMs write
     bf16; the fp16 arm is a follow-up), E5M2, ``amax_dQ / dK / dV`` requested
     as real outputs (no amax in the MXFP8 row -- the backend's canonical
     graph shape declares them, the parity gap is documented in the tracker), a
-    ``p_scale_log2`` other than 8, dense padding masks, sink / dSink, bias / dBias,
-    right-band widening, THD, ``dense_flex``, decode shapes, and
-    ``use_deterministic_algorithm`` (no atomics anywhere in the chain; the claim waits on
-    the two-run sweep, as on the sibling rows).
+    ``p_scale_log2`` other than 8, the graph padding mask (it carries ``seq_len_q``, which
+    no body threads), sink / dSink, bias / dBias, right-band widening, ``dense_flex``,
+    decode shapes, and ``use_deterministic_algorithm`` (no atomics anywhere in the chain;
+    the claim waits on the two-run sweep, as on the sibling rows).
 
-    A prepared launch like the siblings (``prepared_sm107.compile_plan_mxfp8``): the
-    four extra payloads bind by geometry, the seven SF tensors as opaque byte blobs.
+    THD / ragged is served on the packed path as on the sibling rows (the same kv-blocked
+    workspace, metadata, claim counter and per-sequence clipped stores; the stage-3 GEMMs
+    trimmed per sequence -- the bf16 renderings over the exactly dequantized packed q_T /
+    k_T under P-c, the block-scale arm's THD leg under P-b with dQ once per GQA group
+    member; the GQA fold bounded on device at the live kv total) with the seven
+    scale-factor tensors PACKED per-sequence-TILE-padded (the forward's convention: per
+    head, every sequence's ``ceil(s_b / 128)`` tiles in cu_seqlens order; the live tile
+    count is derived per call from the bound buffer's byte size, one count per side) and
+    the five SF tensors whose pad positions are read re-staged per execute with their pad
+    bytes zeroed from the device prefixes.  Requires the declared totals
+    (``thd_declared_totals``): the ``sdpa_mxfp8_backward`` node and its binding carry
+    ``max_total_seq_len_q/kv`` (trailing keywords); a ragged MXFP8 graph without them -- or
+    through a pybind extension built before the attribute, which cannot declare them -- is a
+    typed decline at eligibility.  Stats comes from the caller (no Rubin MXFP8 THD forward row
+    feeds it yet).
+
+    A prepared launch like the siblings (``prepared_sm107.compile_plan_mxfp8`` /
+    ``compile_plan_mxfp8_thd``): the four extra payloads bind by geometry, the seven SF
+    tensors as opaque byte blobs (packed per-tile blobs under THD).
     """
     return EngineSpec(
         name="sdpa_bwd_sm107_mxfp8",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1392,17 +1549,117 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             causal=True,
             bottom_right=True,
             swa=True,
+            # THD / ragged on the packed path (the half row's mechanism over packed per-sequence-tile-padded scale factors; the
+            # five hazard SF tensors re-staged with their pads zeroed per execute).  Requires the declared totals: the blocked
+            # workspace and the SF staging copies are sized at build time.
+            thd=True,
+            thd_declared_totals=True,
             decode=False,
             deterministic=False,
             layouts=frozenset({"bshd"}),
-            # == api_dsl_sm107._SM107_Q_PAD: the body derives the bottom-right diagonal from its padded S_q (as the fp8 body).
-            bottom_right_s_q_multiple=128,
+            # The body derives the bottom-right diagonal from ``seqlen_q_real`` (as the other two bodies): any S_q.
+            bottom_right_s_q_multiple=1,
         ),
         lower=partial(lower_dsl_bwd_mxfp8, api_type=_SM107_MXFP8),
     )
 
 
-ENGINE_SPECS = (_sm120_spec(), _sm80_spec(), _sm100_spec(), _sm100_mxfp8_spec(), _sm107_spec(), _sm107_fp8_spec(), _sm107_mxfp8_spec())
+def _sm100_d256_spec() -> EngineSpec:
+    """SM100 / SM103 (cc 10.0-10.6) d=256 bf16 / fp16 backward row (``api_dsl_sm100_d256.SdpaBwdDslSm100D256``).
+
+    The Rubin half chain (``_sm107_spec``: dot -> main kernel with dV in TMEM and a kv-major dS workspace -> the two
+    ``bprop_matmul_blackwell`` GEMMs at the (256, 256) tile -> the GQA fold) over the **2x2-datapath** main kernel
+    ``kernels/bprop_d256_2x2_f16.py`` at profile 1: ``tcgen05.mma.cta_group::2`` with the collective M = 128 (64 kv rows per
+    CTA, a 128-row kv block per cga2 pair), every operand an SMEM SS operand, 512 non-exclusive TMEM columns and 210 KiB
+    of SMEM -- the footprint that lets a bf16 d=256 backward exist on SM100 at all (the 4x1 body needs Rubin's 576
+    columns / 327 KiB).  The kv WRITE PAIR stays 256 rows (``STAGE3_GRAN_ROWS``), so the stage-3 renderings and the
+    no-zero-fill contract are the Rubin row's.
+
+    Exact ``d_qk == d_v == 256``, any S_q / S_kv (padded to 128 / 256 and masked), dense, top-left and bottom-right causal,
+    sliding window (left), MHA / GQA / MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined, each asserted
+    by a test (``test_sdpa_bwd_d256_sm100.py``): dense padding masks, sink / dSink, bias / dBias, right-band widening, THD,
+    decode shapes, ``dense_flex``, ``deterministic``.  ``sm_hi = 106`` like the SM100 MXFP8 row: 107+ is the native Rubin
+    row's.  The native competitor on this box is cuDNN backend ENGINE 5 (``eng5_k14=3_k24=2_k27=0_k38=0_k40=3_k41=2``, the
+    FORT flash_bprop 128x128x256 cga2x1x1 chain) -- opt_in, and every test / benchmark pins the FROST plan by name.
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm100_d256",
+        capabilities=Capabilities(
+            zero_scale=True,
+            sm_lo=100,
+            sm_hi=106,
+            d=frozenset({256}),
+            d_envelope=False,
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            gqa=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            decode=False,  # prefill body: a 128-row q tile per iteration
+            layouts=frozenset({"bshd"}),
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM100_D256),
+    )
+
+
+def _sm107_d512_spec() -> EngineSpec:
+    """cc 10.7 (the Rubin-line, 107 <= SM <= 119) d in (256, 512] bf16 / fp16 backward row (``api_dsl_sm107_d512.SdpaBwdDslSm107D512``).
+
+    The SM100 large-head-dim chain (``_sm100_spec``: dot -> stage-2 S / dS workspaces -> the three ``bprop_matmul_blackwell``
+    GEMMs at the (512, 512) tile -> the GQA fold) with stage 2 ALWAYS the **2x2-datapath** body
+    ``kernels/sm107/bprop_d512_f16_2x2.py`` at the cc 10.7 ring arm: two independent ``tcgen05.mma.cta_group::2`` pairs per
+    (4,1,1) cluster, 64 q rows per CTA, both BMMs as SMEM SS operands, an 8-stage K / V chunk ring (SM100: 4) and two cast
+    stages (SM100: 1) filling 320 of the line's 325 KiB usable SMEM, 256 TMEM columns, descriptor version 0 at zero margin.
+    Its own row rather than a widened ``sdpa_bwd_sm100`` because Capabilities cannot vary per cc inside one row: the 4x1 role
+    split that row renders by default was never run on this line, and the twin here is unconditional (``api_dsl.STAGE2_2X2``
+    does not reach it).  No backend competitor: cuDNN 9.26 builds no d > 256 backward plan on cc 10.7 (probed 2026-10-01).
+
+    The SM100 row's envelope: d in (256, 512], multiples of 8 (TMA 16-byte innermost extent at 2 B/elem), any S_q / S_kv (padded
+    to 256 / 128 and masked), dense, top-left and bottom-right causal, right-band widening, sliding window (left), MHA / GQA /
+    MQA, BSHD-physical io, contiguous fp32 Stats, bf16 / fp16.  Declined on day one, each asserted by a test
+    (``test_sdpa_bwd_d512_sm107.py``) and flipped only with a board-run accept + tracker line: THD / ragged (the SM100 row
+    serves it; the packed path has not run on cc 10.7), ``dense_flex`` staging layouts, dense padding masks, sink / dSink,
+    bias / dBias, deterministic, decode.
+
+    Rule 7: the public DSL 4.7.0 lacks ``sm_107a``; the adapter's ``check_support`` declines through
+    ``cutedsl_arch_requirement_error`` first.  A prepared launch like the SM100 row (``prepared_sm100.compile_plan``, symbol
+    ``frost_sdpa_bwd_sm107_d512_prepared``).
+    """
+    return EngineSpec(
+        name="sdpa_bwd_sm107_d512",
+        capabilities=Capabilities(
+            zero_scale=True,
+            sm_lo=_RUBIN[0],
+            sm_hi=_RUBIN[1],
+            d=frozenset({512}),
+            d_envelope=True,
+            d_pad_multiple=8,
+            d_envelope_floor=256,  # <= 256 belongs to the d256 rows (sdpa_bwd_sm107 on this line)
+            dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            right_band_widening=True,
+            gqa=True,  # per-Q-head dK/dV partials + the shared dkv_reduce group fold
+            decode=False,  # prefill chain: a 256-row q cluster per stage-2 work item
+            layouts=frozenset({"bshd"}),  # dense_flex staging is the SM100 row's claim; unvalidated on cc 10.7
+        ),
+        lower=partial(lower_dsl_bwd, api_type=_SM107_D512),
+    )
+
+
+# Append-only: a row's position in this tuple is its rank in the ranked plan list, never its id (the manifest slot is).
+ENGINE_SPECS = (
+    _sm120_spec(),
+    _sm80_spec(),
+    _sm100_spec(),
+    _sm100_mxfp8_spec(),
+    _sm107_spec(),
+    _sm107_fp8_spec(),
+    _sm107_mxfp8_spec(),
+    _sm100_d256_spec(),
+    _sm107_d512_spec(),
+)
 
 __all__ = [
     "ENGINE_SPECS",

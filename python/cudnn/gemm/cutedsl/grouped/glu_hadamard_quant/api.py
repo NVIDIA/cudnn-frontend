@@ -19,13 +19,11 @@ from cuda.bindings import driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cute.runtime import make_fake_stream
+from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type, is_power_of_2
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.frost.workspace import Workspace, align_up
 
-from ..backend_utils import allocate_wrapper_workspace, retain_workspace
 from ..moe_utils import MoEWeightMode
 from .rht_utils import HADAMARD_SIZE
 from .moe_blockscaled_grouped_gemm_glu_hadamard_quant import BlockScaledMoEGroupedGemmGluHadamardQuantKernel
@@ -183,36 +181,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         self.glu_limit = glu_limit
         self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else BlockScaledMoEGroupedGemmGluHadamardQuantKernel
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-        self._kernel_obj = None
-
-    def _kernel_instance(self):
-        if self._kernel_obj is None:
-            kernel_kwargs = dict(
-                sf_vec_size=self.sf_vec_size,
-                acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
-                use_2cta_instrs=self.use_2cta_instrs,
-                mma_tiler_mn=self.mma_tiler_mn,
-                cluster_shape_mn=self.cluster_shape_mn,
-                vectorized_f32=self.vector_f32,
-                expert_cnt=self.expert_cnt,
-                weight_mode=self.weight_mode,
-                use_dynamic_sched=self.use_dynamic_sched,
-                act_func=self.act_func,
-                enable_bias=self.bias_desc is not None,
-                rht_rowwise=self.rht_rowwise if self.generate_rht else False,
-                rht_per_expert=self.rht_per_expert if self.generate_rht else False,
-                glu_alpha=self.glu_alpha,
-                glu_limit=self.glu_limit,
-            )
-            if self.sf_fp8_dtype_override == "e5m3":
-                kernel_kwargs["sf_fp8_dtype_override"] = self.sf_fp8_dtype_override
-            self._kernel_obj = self._kernel(**kernel_kwargs)
-        return self._kernel_obj
-
-    def scratch_workspace_bytes(self) -> int:
-        """Caller-provided scratch (TMA descriptor slots + scheduler counter) ``execute()`` carves (recipe R2)."""
-        self._ensure_support_checked()
-        return max(align_up(self._kernel_instance().get_workspace_bytes(), 128), 128)
+        self._workspace = None
 
     def check_support(self) -> bool:
         import torch
@@ -419,22 +388,43 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         return True
 
     def compile(self) -> None:
+        import torch
+
         self._ensure_support_checked()
         if self._compiled_kernel is not None:
             return
         if self.a_desc.shape[0] == 0:
             return
 
-        kernel = self._kernel_instance()
+        kernel_kwargs = dict(
+            sf_vec_size=self.sf_vec_size,
+            acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
+            use_2cta_instrs=self.use_2cta_instrs,
+            mma_tiler_mn=self.mma_tiler_mn,
+            cluster_shape_mn=self.cluster_shape_mn,
+            vectorized_f32=self.vector_f32,
+            expert_cnt=self.expert_cnt,
+            weight_mode=self.weight_mode,
+            use_dynamic_sched=self.use_dynamic_sched,
+            act_func=self.act_func,
+            enable_bias=self.bias_desc is not None,
+            rht_rowwise=self.rht_rowwise if self.generate_rht else False,
+            rht_per_expert=self.rht_per_expert if self.generate_rht else False,
+            glu_alpha=self.glu_alpha,
+            glu_limit=self.glu_limit,
+        )
+        if self.sf_fp8_dtype_override == "e5m3":
+            kernel_kwargs["sf_fp8_dtype_override"] = self.sf_fp8_dtype_override
+        kernel = self._kernel(**kernel_kwargs)
 
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
         max_active_clusters -= self.num_cluster_overlap_margin
         self._value_error_if(max_active_clusters <= 0, "max_active_clusters must be > 0 after overlap margin")
+        self._workspace = torch.empty(max(kernel.get_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
-        # Compile-time placeholders carry type and alignment only; execute() passes the caller's addresses.
-        gmem = cute.AddressSpace.gmem
-        fake_workspace_ptr = cute.runtime.make_ptr(cutlass.Uint8, 128, gmem, assumed_align=128)
+        fake_workspace_ptr = cute.runtime.nullptr(dtype=cutlass.Uint8, assumed_align=128)
+        cached_workspace_ptr = from_dlpack(self._workspace, assumed_align=128).iterator
 
         valid_m = cute.sym_int(divisibility=self.m_aligned)
         tensor_m_128 = cute.sym_int()
@@ -525,12 +515,14 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 n_compile, k_compile, _ = self.b_shape
             b_major_arg = OperandMajorMode.K if self.b_major == "k" else OperandMajorMode.MN
             b_stride_size = k_compile if self.b_major == "k" else n_compile
-            b_cute_arg = cute.runtime.make_ptr(cutlass.Int64, 16, gmem, assumed_align=8)
-            sfb_cute_arg = cute.runtime.make_ptr(cutlass.Int64, 16, gmem, assumed_align=8)
+            b_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
+            sfb_ptrs_placeholder = torch.empty((self.expert_cnt,), dtype=torch.int64, device="cuda")
+            b_cute_arg = from_dlpack(b_ptrs_placeholder, assumed_align=8).iterator
+            sfb_cute_arg = from_dlpack(sfb_ptrs_placeholder, assumed_align=8).iterator
             n_arg = cutlass.Int32(n_compile)
             k_arg = cutlass.Int32(k_compile)
             b_stride_arg = cutlass.Int64(b_stride_size)
-            workspace_arg = fake_workspace_ptr
+            workspace_arg = cached_workspace_ptr
             self._n = n_compile
             self._k = k_compile
             self._b_stride_size = b_stride_size
@@ -585,7 +577,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 bias_tensor: Optional[torch.Tensor],
                 norm_const: float,
                 rht_norm_const: float,
-                workspace_ptr: int,
                 stream: cuda.CUstream,
             ) -> None:
                 compiled_kernel(
@@ -596,7 +587,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                     cutlass.Int32(0),
                     cutlass.Int32(0),
                     cutlass.Int64(0),
-                    workspace_ptr,
+                    cached_workspace_ptr,
                     c_tensor,
                     d_tensor,
                     sfd_tensor,
@@ -634,7 +625,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 bias_tensor: Optional[torch.Tensor],
                 norm_const: float,
                 rht_norm_const: float,
-                workspace_ptr: int,
                 stream: cuda.CUstream,
             ) -> None:
                 compiled_kernel(
@@ -645,7 +635,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                     cached_n,
                     cached_k,
                     cached_b_stride,
-                    workspace_ptr,
+                    cached_workspace_ptr,
                     c_tensor,
                     d_tensor,
                     sfd_tensor,
@@ -685,11 +675,7 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
         norm_const: float = 1.0,
         rht_norm_const: float = 1.0,
         current_stream: Optional[cuda.CUstream] = None,
-        *,
-        workspace=None,
     ) -> None:
-        """Run the compiled kernel; ``workspace`` is a device buffer of at least
-        ``scratch_workspace_bytes()`` bytes, 128-byte aligned, that the launch carves (recipe R2)."""
         import torch
 
         self._ensure_support_checked()
@@ -717,9 +703,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 raise ValueError("sfrht_colwise_tensor must be provided when colwise RHT output is enabled")
             rht_tensor = rht_colwise_tensor
             sfrht_tensor = sfrht_colwise_tensor
-        nbytes = self.scratch_workspace_bytes()
-        ws_view = Workspace(workspace, nbytes, type(self).__name__).take(nbytes, "uint8")
-        retain_workspace(self, workspace, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             if b_tensor is None or sfb_tensor is None:
@@ -740,7 +723,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 bias_tensor,
                 norm_const,
                 rht_norm_const,
-                ws_view.data_ptr(),
                 current_stream,
             )
         else:
@@ -762,7 +744,6 @@ class GroupedGemmGluHadamardQuantSm100(APIBase):
                 bias_tensor,
                 norm_const,
                 rht_norm_const,
-                ws_view.data_ptr(),
                 current_stream,
             )
 
@@ -1013,7 +994,6 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
         api.compile()
         _cache_of_GroupedGemmGluHadamardQuantSm100Objects[cache_key] = api
 
-    workspace = allocate_wrapper_workspace("torch", api.scratch_workspace_bytes(), a_tensor.device, current_stream)
     if is_dense:
         api.execute(
             a_tensor=a_tensor,
@@ -1034,7 +1014,6 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
             norm_const=norm_const,
             rht_norm_const=rht_norm_const,
             current_stream=current_stream,
-            workspace=workspace,
         )
     else:
         api.execute(
@@ -1056,7 +1035,6 @@ def grouped_gemm_glu_hadamard_quant_wrapper_sm100(
             norm_const=norm_const,
             rht_norm_const=rht_norm_const,
             current_stream=current_stream,
-            workspace=workspace,
         )
     return TupleDict(
         c_tensor=c_tensor,

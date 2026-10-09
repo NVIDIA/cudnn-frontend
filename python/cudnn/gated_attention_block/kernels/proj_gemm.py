@@ -104,13 +104,26 @@ of every view before binding, on both routes (a typed ``ValueError`` naming the
 operand and both strides). All four backward GEMMs take
 the FORCED ``..._cluster2x1_2ctamma`` tile (every ``n`` is ``d_model`` or
 ``h_q*d_head``, both ``% 256 == 0``); its MN-major rendering on cc 10.7 is pinned
-by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107``. The
-appended ``split_k`` kwarg (0 / 1 / S >= 2) is documented on :func:`build_proj_gemm`.
+by ``test_proj_gemm_bwd.py::test_forced_tile_renders_mn_major_on_cc107`` (bf16) and
+``test_fp8_mn_major_matches_fp64_on_cc107`` (e4m3, K32 and K64 -- the triples in
+:data:`FP8_MN_MAJOR_VALIDATED`). The appended ``split_k`` kwarg (0 / 1 / S >= 2) is
+documented on :func:`build_proj_gemm`.
+
+**The QUANTIZED backward's GEMMs** ride the same drivers: per-tensor e4m3 operands take
+the MN-major renderings above with the descale product bound as the ``[1, 1, 1]`` fp32
+``alpha`` epilogue (:func:`device_alpha` writes it into the caller's workspace slot on the
+launch stream), and the 64-byte MMA K form when the stage asks for it explicitly
+(``mma_tile_k_bytes=64``; the forward's plans stay at K32).  Block-scale (MXFP8) operands
+keep every operand K-major -- the TE "columnwise" artifacts ``dQKVG^T [N, T]`` / ``h^T [dm, T]``
+with their F8_128x4 scale factors along T -- through :func:`run_wgrad_gemm_block_scale`
+/ :func:`run_dgrad_gemm_block_scale`, which are the forward's K-major binding at the
+backward's shapes (``block_scale=True`` needs ``K % 32 == 0``, so a token-axis wgrad needs
+``T % 32 == 0``: a typed decline at plan time).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 from typing import Any, Optional
@@ -177,6 +190,9 @@ def _frost_plan_index(names) -> Optional[int]:
 # kernel decodes ``(b, s_tile)`` per 128-row tile), and DECLINES (typed
 # ``NotImplementedError``) ``seq_len % 128 != 0 and batch > 1`` -- a GEMM tile would
 # straddle two sequences; the unfused path serves that shape.
+# ``NormRopeFusionParams.weight_fp4`` selects that fork's e2m1-B arm -- an MXFP4 ``W_qkvg``
+# (packed ``[N, K // 2]`` codes, the UNCHANGED E8M0 / 32 blob) on the SAME runner ABI; the
+# runner then also checks the padded sub-byte TMA format's K / base-address / row-stride rules.
 
 
 @dataclass(frozen=True)
@@ -236,6 +252,18 @@ class NormRopeFusionParams:
     ``gate16`` and the three ``sf_q / sf_k / sf_v`` blobs.  Inference only
     (``want_rstd`` False), no ``"off"`` arm, exclusive with ``quant_fp8``; launched
     with :func:`run_fused_proj_gemm_mxfp8`.
+
+    ``weight_fp4`` (appended after ``quant_mxfp8``; default False so every existing key is
+    spelled identically) selects the e2m1-B arm of the MXFP8 fork: ``W_qkvg`` arrives as
+    packed e2m1 codes (``torch.float4_e2m1fn_x2``, two per byte along K, storage
+    ``[N, K // 2]``) with the UNCHANGED E8M0 / 32 scale-factor blob -- the block-scale
+    catalog's MIXED row (e4m3 A x e2m1 B) rendered into the SAME template at
+    ``mma_tile_k_bytes=32``, i.e. the padded E2M1 SMEM form: the fork's B-side constants
+    change (the B dtypes, a ``Uint8`` B SMEM ring of the same footprint, the B TMA
+    descriptor's padded sub-byte format, half the B expect-tx bytes), nothing in the kernel
+    body.  Needs ``quant_mxfp8=True``; exclusive with ``quant_fp8``.  An NVFP4 ``W_qkvg``
+    (e4m3 scales per 16) is not expressible here: the catalog has no mixed row with e4m3
+    scales, so ``weight_fp4`` means MXFP4 exactly.  Same runner (:func:`run_fused_proj_gemm_mxfp8`).
     """
 
     d_head: int = 256
@@ -248,6 +276,9 @@ class NormRopeFusionParams:
     quant_fp8: bool = False  # the FP8 fork (e4m3 in, e4m3 Q/K/V + bf16 GATE out); appended, bf16 keys unchanged
     qk_norm: bool = True  # False: RoPE-only epilogue (no pass A / rsqrt / weight loads / rstd); appended, keys unchanged
     quant_mxfp8: bool = False  # the MXFP8 fork twin (block-scale rendering, PR-B section 3.1); appended, keys unchanged
+    weight_fp4: bool = (
+        False  # e2m1 W_qkvg (torch.float4_e2m1fn_x2) on the MXFP8 fork: the catalog's mixed row at K32, the padded E2M1 SMEM form; appended, keys unchanged
+    )
 
     @property
     def offsets(self) -> tuple[int, int, int, int]:
@@ -325,6 +356,17 @@ def validate_norm_rope_params(p: NormRopeFusionParams) -> None:
             raise ValueError(
                 "quant_mxfp8: norm_source='off' has no meaning on the MXFP8 fork (no single bf16 slab to degenerate to); use 'const' for the floor"
             )
+    if p.weight_fp4:
+        if p.quant_fp8:
+            raise ValueError(
+                "weight_fp4 and quant_fp8 name two different forks: the e2m1 W_qkvg arm belongs to the MXFP8 fork (quant_mxfp8=True); "
+                "the per-tensor FP8 fork takes e4m3 operands only"
+            )
+        if not p.quant_mxfp8:
+            raise ValueError(
+                "weight_fp4 (an e2m1 W_qkvg with the E8M0 / 32 scale-factor blob) is an arm of the MXFP8 fork only; set quant_mxfp8=True "
+                "-- the bf16 fork has no fp4 operand"
+            )
 
 
 _FUSED_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proj_gemm_norm_rope.py")
@@ -341,6 +383,10 @@ class FusedProjGemmPlan:
     launch: Any  # the cute-compiled ``_host``
     fp8: bool = False  # True: the FP8 fork; launch with ``run_fused_proj_gemm_fp8`` (q8/k8/v8/gate16 + qscal)
     mxfp8: bool = False  # True: the MXFP8 fork twin; launch with ``run_fused_proj_gemm_mxfp8`` (q8/k8/v8/gate16 + sf_q/sf_k/sf_v)
+    # W's STORAGE dtype the MXFP8 artifact was compiled for -- torch.float8_e4m3fn, or torch.float4_e2m1fn_x2 under
+    # ``params.weight_fp4`` -- so the runner checks the PLAN it is handed, not a re-derivation; None on the other two
+    # forks and on a hand-built plan (then derived from the params).
+    w_dtype: Any = None
 
     @property
     def workspace_bytes(self) -> int:
@@ -359,8 +405,9 @@ def build_fused_proj_gemm(params: NormRopeFusionParams) -> FusedProjGemmPlan:
 
     validate_norm_rope_params(params)
     if params.quant_mxfp8:
+        w_dtype = _fused_mx_w_dtype_of_params(params)  # a typed decline on a torch without the fp4 storage dtype, BEFORE the template loads
         mod = load_template(_FUSED_TEMPLATE_MXFP8, params, tag="proj_gemm_norm_rope_mxfp8")
-        return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), mxfp8=True)
+        return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), mxfp8=True, w_dtype=w_dtype)
     if params.quant_fp8:
         mod = load_template(_FUSED_TEMPLATE_FP8, params, tag="proj_gemm_norm_rope_fp8")
         return FusedProjGemmPlan(params=params, module=mod, launch=mod.compile(), fp8=True)
@@ -576,7 +623,7 @@ def run_fused_proj_gemm_mxfp8(
     plan: FusedProjGemmPlan,
     a8: torch.Tensor,  # [M, K]        e4m3 codes (rank-2, or a rank-3 [1, M, K] view), M == batch * seq_len
     sf_a: torch.Tensor,  # F8_128x4 E8M0 blob of a8 over its M rows: sf_blob_bytes(M, K) bytes, uint8 / float8_e8m0fnu
-    w8: torch.Tensor,  # [N_qkvg, K]   e4m3 codes (checkpoint layout, read transposed)
+    w8: torch.Tensor,  # [N_qkvg, K]   e4m3 codes, or packed e2m1 codes [N_qkvg, K // 2] under params.weight_fp4 (checkpoint layout, read transposed)
     sf_w: torch.Tensor,  # F8_128x4 E8M0 blob of w8 over its N rows: sf_blob_bytes(N, K) bytes
     out_q8: torch.Tensor,  # [M, h_q*d]   e4m3 contiguous (== compact BSHD [B, S, h_q, d])
     out_k8: torch.Tensor,  # [M, h_kv*d]  e4m3 contiguous
@@ -608,6 +655,16 @@ def run_fused_proj_gemm_mxfp8(
     128-row GEMM tile would straddle two sequences and the kernel's once-per-tile
     ``(b, s_tile)`` decode would be wrong for part of it.  The unfused block-scale path
     (``build_proj_gemm(block_scale=True)`` + ``quantize_mxfp8``) serves that shape.
+
+    **The e2m1 ``W_qkvg`` arm** (``plan.params.weight_fp4``; ``plan.w_dtype`` is ``torch.float4_e2m1fn_x2``): ``w8`` is
+    the PACKED ``[N, K // 2]`` storage -- two codes per byte along K; a uint8 blob is declined with the
+    ``.view(torch.float4_e2m1fn_x2)`` hint, a LOGICAL ``[N, K]`` fp4 tensor by name -- and ``sf_w`` the UNCHANGED
+    E8M0 / 32 blob over the LOGICAL ``K`` (read off ``a8``).  Typed ``ValueError``s before any launch: an e4m3
+    ``w8`` on an e2m1 plan and the reverse; ``K % 128 != 0``; a weight base address that is not 32-byte aligned;
+    a row stride that is not a multiple of 32 bytes.  The last three are the padded sub-byte TMA format's own
+    rules, which the descriptor builder checks on STATIC operands only -- the fork's weight descriptor carries a
+    symbolic K, a dynamic base and symbolic strides, so unchecked they would surface as a malformed tensor map
+    at launch (an illegal-instruction error), never as a decline.
     """
     from cuda.bindings import driver as cuda
 
@@ -627,16 +684,61 @@ def run_fused_proj_gemm_mxfp8(
     q3, k3, v3, g3 = _rank3(out_q8, "out_q8"), _rank3(out_k8, "out_k8"), _rank3(out_v8, "out_v8"), _rank3(out_gate16, "out_gate16")
     m, k = int(a3.shape[1]), int(a3.shape[2])
     n = int(w3.shape[1])
-    if _FP8_E4M3 is None or a8.dtype != _FP8_E4M3 or w8.dtype != _FP8_E4M3:
-        raise ValueError(f"the MXFP8 fused projection takes e4m3 codes, got a8 {a8.dtype}, w8 {w8.dtype}")
+    w_dtype = _fused_mx_w_dtype(plan)  # e4m3, or the packed e2m1 storage dtype under params.weight_fp4
+    fp4_w = _is_fp4(w_dtype)
+    if _FP8_E4M3 is None or a8.dtype != _FP8_E4M3:
+        raise ValueError(f"the MXFP8 fused projection takes e4m3 codes for the activation, got a8 {a8.dtype}")
+    if w8.dtype != w_dtype:
+        hint = " -- e2m1 codes travel as torch.float4_e2m1fn_x2: .view(torch.float4_e2m1fn_x2) the uint8 storage" if fp4_w and w8.dtype == torch.uint8 else ""
+        raise ValueError(
+            f"this MXFP8 fused projection was compiled for {_dtype_word(w_dtype)} W_qkvg codes (NormRopeFusionParams.weight_fp4={p.weight_fp4}), "
+            f"got w8 {w8.dtype}; refusing to reinterpret the bytes{hint}"
+        )
     if m != batch * seq_len:
         raise ValueError(f"M must equal batch*seq_len: a8 has M={m}, batch*seq_len={batch * seq_len}")
     if n != p.n_qkvg:
         raise ValueError(f"the fused projection classifies tiles for N={p.n_qkvg} (Q|GATE|K|V at {p.offsets}); the weight has N={n}")
-    if int(w3.shape[2]) != k:
-        raise ValueError(f"shape mismatch: a8 {tuple(a3.shape)}, w8 {tuple(w3.shape)}")
+    k_store = storage_k(k, w_dtype)  # the STORAGE extent along K: K/2 bytes for packed e2m1 codes, K for e4m3
+    if int(w3.shape[2]) != k_store:
+        if fp4_w and int(w3.shape[2]) == k:
+            raise ValueError(
+                f"w8 is fp4 storage {tuple(w8.shape)} -- two e2m1 codes per byte along K -- so its last extent must be K/2 = {k_store} for the "
+                f"K={k} read off a8, not {k} (a LOGICAL [N, K] fp4 tensor holds twice the data)"
+            )
+        raise ValueError(f"shape mismatch: a8 {tuple(a3.shape)} (K={k}), w8 {tuple(w3.shape)} (a {_dtype_word(w_dtype)} weight stores K as {k_store} elements)")
+    if int(a3.stride(2)) != 1 or int(w3.stride(2)) != 1:
+        # Both operands are K-major: the kernel's tensor maps carry the ROW and BATCH strides only (the K stride is one element by
+        # construction), so a K-strided view (a transposed [K, N] checkpoint viewed .t(), an every-other-column slice) would be read
+        # as if contiguous -- silent wrong output on either arm.  Refuse it here, typed, like the shape checks above.
+        raise ValueError(
+            "the fused projection reads a8 and w8 K-major with a UNIT stride along K (its tensor maps carry the row and batch strides only, "
+            f"so a K-strided view would be read as if it were contiguous): got a8 strides {tuple(int(s) for s in a3.stride())}, "
+            f"w8 strides {tuple(int(s) for s in w3.stride())}"
+        )
     if k % 32:
         raise ValueError(f"the block-scale GEMM needs K % 32 == 0 (one E8M0 scale per 32-element block), got K={k}")
+    if fp4_w:
+        # The e2m1 B is read through the PADDED sub-byte TMA format (64-byte boxes expanded to 128-byte SMEM rows).  Its three
+        # tensor-map rules are checked by the descriptor builder on STATIC operands only; the fork's weight descriptor carries a
+        # symbolic K, a dynamic base address and symbolic strides, so a violation would surface as a malformed tensor map at launch
+        # (an illegal-instruction error), not as a typed decline.  Check them here, in STORAGE bytes (one byte = one
+        # float4_e2m1fn_x2 element).  A contiguous [N, K // 2] weight with K % 128 == 0 satisfies the stride rule by construction;
+        # only a padded-row view, or a 16-byte-but-not-32-byte-aligned view of a larger buffer, can trip the last two.
+        if k % 128:
+            raise ValueError(
+                f"the e2m1 W_qkvg arm needs K % 128 == 0 (the padded sub-byte TMA format's Tensor-Size[0] rule: whole 64-byte = 128-code rows), got K={k}"
+            )
+        if w8.data_ptr() % 32:
+            raise ValueError(
+                "the e2m1 W_qkvg arm needs a 32-byte-aligned weight base address (the padded sub-byte TMA format's rule; 16-byte alignment is not "
+                f"enough), got data_ptr() % 32 = {w8.data_ptr() % 32}"
+            )
+        row_stride_bytes = int(w3.stride(1))  # elements of float4_e2m1fn_x2 == storage bytes
+        if row_stride_bytes % 32:
+            raise ValueError(
+                "the e2m1 W_qkvg arm needs every weight row stride to be a multiple of 32 bytes (the padded sub-byte TMA format's rule), got "
+                f"{row_stride_bytes} bytes between rows (a padded-row view of a wider buffer)"
+            )
     _check_fused_outputs(
         m,
         (
@@ -735,11 +837,72 @@ def _is_fp8(dtype: torch.dtype) -> bool:
     return _FP8_E4M3 is not None and dtype == _FP8_E4M3
 
 
+# The (dtype, a_major, b_major) triples whose fp8 MN-major rendering this driver ADMITS -- a table, never a
+# blanket lift.  Each row was validated on cc 10.7 at the block's forced tile in BOTH MMA K forms (32 and 64
+# bytes) against an fp64 reference of the dequantized e4m3 products under test_proj_gemm_bwd.py's bf16-output
+# bound (rtol 2^-7, atol rtol*max|ref|), with a two-launch bitwise check and a sentinel-filled output:
+#
+#   (e4m3, "m", "n")   the wgrads  dW = dY^T @ X   (B1 dW_o, B7 dW_qkvg)   -- M-major A, N-major B
+#   (e4m3, "k", "n")   the dgrads  dX = dY @ W     (B2 dO_gated, B8 dh)    -- N-major B
+#
+# `test_fp8_mn_major_matches_fp64_on_cc107` is the pin; `test_fp8_mn_major_outside_the_table_is_a_typed_decline`
+# inverts it.  An fp8 major outside the table (an M-major A against a K-major B, nobody's GEMM) and a MIXED fp8
+# dtype pair stay typed NotImplementedErrors.  Both e4m3 at every triple: the driver's only fp8 dtype (_is_fp8).
+# The rows hold at the tile they were validated at and nowhere else: `build_proj_gemm` admits an fp8 MN-major triple only
+# when the plan takes the forced tile (`_FORCED_TILE_NAME`) on the FROST JIT -- an N that 256 does not divide (the
+# heuristic's tile), another explicit `tile_config`, or `pin_frost=False` (no JIT) is the same typed decline, naming the tile;
+# so is a forced compile the compiler refuses (never the graph-heuristic fallback the bf16 plans take).
+# "Another explicit tile_config" includes the forced tile's own K64 twin named as `tile_config`: the 64-byte form is reached
+# through `mma_tile_k_bytes=64` ONLY (the one spelling the device cells validated), never by its config name.
+FP8_MN_MAJOR_VALIDATED: frozenset = frozenset({(_FP8_E4M3, "m", "n"), (_FP8_E4M3, "k", "n")}) if _FP8_E4M3 is not None else frozenset()
+
+
+def _fp8_mn_major_menu() -> str:
+    """The admitted fp8 MN-major triples (``FP8_MN_MAJOR_VALIDATED``) spelled for the decline's message --
+    ``(e4m3, a_major='m', b_major='n'), ...`` ordered by majors -- or ``none`` on a torch without e4m3."""
+    return (
+        ", ".join(f"({_dtype_word(dt)}, a_major={am!r}, b_major={bm!r})" for dt, am, bm in sorted(FP8_MN_MAJOR_VALIDATED, key=lambda t: (t[1], t[2]))) or "none"
+    )
+
+
 def _is_fp4(dtype: torch.dtype) -> bool:
     """``torch.float4_e2m1fn_x2`` -- the ONLY fp4 storage dtype the driver accepts.  A uint8 blob
     holding packed e2m1 codes is declined with the ``.view(torch.float4_e2m1fn_x2)`` hint (torch
     2.13 can VIEW but not cast to fp4), so the dtype carries the packing through every check."""
     return _FP4_X2 is not None and dtype == _FP4_X2
+
+
+# Two e2m1 codes per byte: the packing factor of ``torch.float4_e2m1fn_x2`` storage along K (low nibble = even k).  ONE source for
+# every "K/2" of this module (``_check_operand``, ``storage_k`` -> the block-scale drivers' K-major checks) and of ``quantize_fp4``.
+FP4_CODES_PER_BYTE = 2
+
+
+def storage_k(k: int, dtype) -> int:
+    """The STORAGE extent along K of a K-major operand of ``dtype`` whose LOGICAL K is ``k``: ``k // FP4_CODES_PER_BYTE`` for e2m1
+    codes (``torch.float4_e2m1fn_x2``, two per byte), ``k`` for every 1- or 2-byte dtype -- and for ``None`` (a hand-built plan
+    without dtypes declares the logical extent)."""
+    return k // FP4_CODES_PER_BYTE if _is_fp4(dtype) else k
+
+
+def _fused_mx_w_dtype_of_params(p: NormRopeFusionParams):
+    """W's STORAGE dtype of the MXFP8 fork specialized for ``p``: ``torch.float4_e2m1fn_x2`` under ``weight_fp4`` (a typed
+    ``NotImplementedError`` on a torch without that dtype -- the arm's operand cannot be bound), else ``torch.float8_e4m3fn``."""
+    if p.weight_fp4:
+        if _FP4_X2 is None:
+            raise NotImplementedError("NormRopeFusionParams.weight_fp4 needs torch.float4_e2m1fn_x2 (the packed e2m1 storage dtype) and this torch has none")
+        return _FP4_X2
+    return _FP8_E4M3
+
+
+def _fused_mx_w_dtype(plan: FusedProjGemmPlan):
+    """The W dtype recorded on an MXFP8 fused plan; a hand-built plan (``w_dtype=None``) derives it from its params."""
+    return plan.w_dtype if plan.w_dtype is not None else _fused_mx_w_dtype_of_params(plan.params)
+
+
+def _w_dtype_of(plan: "ProjGemmPlan"):
+    """W's dtype as declared at build time: ``w_dtype`` when built with a per-weight dtype, else ``dtype`` (``None`` on
+    a hand-built plan without dtypes, which checks nothing)."""
+    return plan.w_dtype if plan.w_dtype is not None else plan.dtype
 
 
 def _cudnn_dtype(dtype: torch.dtype):
@@ -935,6 +1098,13 @@ class ProjGemmPlan:
     a_major: str = "k"
     b_major: str = "k"
     split_k: int = 0
+    # The forced-tile JIT route's pack resolution (`_resolved_pack`): `(jit, {id(graph tensor key): id(bound tensor)})`, taken
+    # once BY ROLE (the graph tensors the plan declares, never the buffers of a call) and OWNED BY THE PLAN, so it lives exactly
+    # as long as the JIT it describes.  A cache slot, not a plan fact: no constructor argument (init=False), outside eq / repr.
+    # Its predecessor was a module-level table keyed by `id(plan.jit)` that held a strong reference to every JIT ever resolved
+    # (to keep the id valid) and never evicted -- every dropped block left its four forced-tile JITs, their bindings and graph
+    # tensors alive for the life of the process.
+    _resolved_keys: Any = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def has_alpha(self) -> bool:
@@ -979,6 +1149,12 @@ class ProjGemmPlan:
 # (M, N, K) grid -- that needs a measured sweep, not a drive-by edit. So the
 # block names a config for the shape it owns, and the upstream fix is filed
 # separately.
+# The block's forced tile: a 256-wide N tile, a 128-tall CTA in a 2-CTA pair, the catalog's K=32 spelling.  The 64-byte MMA
+# K form is the same geometry through `tile_config.as_mma_tile_k`, reached ONLY by an explicit `mma_tile_k_bytes=64`; the fp8
+# MN-major table (`FP8_MN_MAJOR_VALIDATED`) is admitted at this tile and nowhere else.
+_FORCED_TILE_NAME = "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+
+
 def _forced_tile_config(n: int) -> Optional[str]:
     """A catalog config whose N tile DIVIDES ``n``, or None to take the heuristic.
 
@@ -986,7 +1162,7 @@ def _forced_tile_config(n: int) -> Optional[str]:
     Anything else falls through to the scorer rather than guessing.
     """
     if n % 256 == 0:
-        return "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+        return _FORCED_TILE_NAME
     return None
 
 
@@ -1027,10 +1203,13 @@ def build_proj_gemm(
     ``[1, 1, 1]`` fp32 graph tensor bound at execute (``run_proj_gemm(...,
     alpha=)``); the FROST engine recognises the ``[1,1,1]`` broadcast as its
     "scalar" fusion mode, so it is one fused epilogue, not a second kernel.
-    The dense FP8 path runs the K=32 MMA form on Rubin (``mma_tile_k_bytes=32``,
-    the ``preferred_mma_tile_k_bytes`` default for non-block-scale graphs) --
-    half the Rubin 2xFP8 rate -- which is why the plan records the resolved tile
-    config and its ``mma_tile_k_bytes`` for the perf table to state.
+    A FORCED dense FP8 tile runs the K=32 MMA form (the named config's own width;
+    half the Rubin 2xFP8 rate) unless ``mma_tile_k_bytes=64`` asks for the 64-byte
+    form EXPLICITLY -- the quantized backward's GEMM stage does, the forward's plans
+    stay at K32 (pinned by ``test_proj_gemm_bwd.py::test_forward_fp8_gemm_plans_stay_k32``)
+    -- which is why the plan records the resolved tile config and its
+    ``mma_tile_k_bytes`` for the perf table to state.  The knob is never keyed on the
+    dtype here: ``_forced_tile_config(n)`` stays dtype-agnostic.
 
     **Block-scale (MXFP8) inputs.** ``block_scale=True`` (e4m3 ``dtype`` required,
     ``alpha`` must be False -- the E8M0 dequant is exact and happens IN the MMA,
@@ -1053,10 +1232,17 @@ def build_proj_gemm(
 
     Without ``mma_tile_k_bytes`` a FORCED block-scale tile follows the engine's
     ``preferred_mma_tile_k_bytes`` (64 on SM 10.7, else the named config's 32).
-    ``mma_tile_k_bytes`` (block-scale only; 32 or 64) re-targets the resolved
-    config's MMA-instruction K width through ``tile_config.as_mma_tile_k`` --
-    PR-B decision D15: the width is A/B'd, never assumed.  ``None`` keeps the
-    config's own width (the named 256-wide config is the K=32 form).
+    ``mma_tile_k_bytes`` (8-bit operands only -- block-scale, and dense e4m3 since the
+    backward GEMM drivers; 32 or 64) re-targets the resolved config's MMA-instruction
+    K width through ``tile_config.as_mma_tile_k`` -- the width is A/B'd, never
+    assumed.  ``None`` keeps the config's own width (the named 256-wide config is the
+    K=32 form; a block-scale forced tile follows the engine's preference, below).  On a
+    bf16 / f16 dense GEMM the knob is a ``ValueError`` (one MMA K width exists), and with
+    ``pin_frost=False`` it is one too (no JIT to re-target -- a knob is honoured or
+    refused, never dropped).  The dense 64-byte form exists for a 128-tall CTA in a
+    2-CTA pair on SM 10.7-class silicon (``kernel_registry.dense_k64_envelope``); the
+    forced 256-wide tile qualifies, and a shape that resolves elsewhere surfaces the
+    compiler's own typed decline.
 
     **fp4 (E2M1) operands -- block-scale only.** ``w_dtype`` (default: ``dtype``)
     names W's dtype separately from A's, so stage (1) can run the catalog's MIXED
@@ -1086,13 +1272,27 @@ def build_proj_gemm(
     UN-transposed row-major weight -- :func:`run_wgrad_gemm` / :func:`run_dgrad_gemm`
     build the views and refuse a mismatch.  The TMA 16-byte contiguous-extent rule
     now falls on the MN extent (``M % (16/BPE)`` for an M-major A, ``N % (16/BPE)``
-    for an N-major B) and is a typed ``ValueError`` HERE, before any graph exists.
-    Served on the dense bf16 / f16 path only: the block-scale rows lay their
-    scale-factor blobs over K-major operand rows and are refused with a non-K major
-    (``ValueError``), and an fp8 (e4m3) operand with a non-K major is a typed
-    ``NotImplementedError`` until the quantized backward (its own fp8 GEMM drivers)
-    measures that rendering on cc 10.7 -- the forward's fp8 plans keep the K-major
-    defaults and are untouched.
+    for an N-major B) and is a typed ``ValueError`` HERE, before any graph exists; the
+    fp8 ``K % 16`` rule stays on the operands whose contiguous axis IS K (the forward's
+    two, a dgrad's A), so a wgrad's ragged ``K = T`` is admitted -- validated on the
+    device at ``T = 4104`` in both MMA K forms, like the bf16 twins.
+    Served on the dense path: bf16 / f16 at any major, and e4m3 at exactly the
+    ``(dtype, a_major, b_major)`` triples of :data:`FP8_MN_MAJOR_VALIDATED` -- the wgrad
+    (``"m", "n"``) and dgrad (``"k", "n"``) renderings, validated on cc 10.7 at the forced
+    tile in both MMA K forms against an fp64 reference of the dequantized e4m3 products
+    (the bf16 twin's bound, a two-launch bitwise check, a sentinel-filled output); any
+    other fp8 major, and a MIXED fp8 dtype pair, is a typed ``NotImplementedError`` naming
+    the table -- and the table holds at that tile ONLY: an fp8 MN-major plan whose N 256
+    does not divide (the heuristic's tile), an explicit ``tile_config`` other than the
+    forced one, or ``pin_frost=False`` (the graph route, no JIT) is the same typed
+    ``NotImplementedError``, naming the tile -- and so is a forced compile the compiler
+    refuses: the graph-heuristic fallback the bf16 / f16 and K-major fp8 plans take would
+    run the table at a tile nobody validated, so it is refused with the compiler's decline
+    chained, never a silent route change.  The block-scale rows lay their scale-factor blobs over K-major operand
+    rows and are refused with a non-K major (``ValueError``) -- the backward keeps every
+    block-scale operand K-major (the transposed "columnwise" artifacts) and binds them
+    through :func:`run_wgrad_gemm_block_scale` / :func:`run_dgrad_gemm_block_scale`.
+    The forward's fp8 plans keep the K-major defaults and are untouched.
 
     **``split_k`` -- three values.** ``0`` (default) is the driver's pick:
     the FORCED tile's catalog ``split_k_slices=1`` on the JIT route -- the heuristic's
@@ -1128,17 +1328,58 @@ def build_proj_gemm(
             f"{label}: split_k={split_k} pins a FROST JIT config and cannot be combined with pin_frost=False (the deselected-FROST graph route "
             "has no JIT to pin, so the knob would be silently dropped)"
         )
+    if mma_tile_k_bytes is not None:
+        # The MMA K width's contract, checked ONCE and up front for the block-scale and the dense path alike, so an invalid
+        # value is always named as such whatever else the call combines it with.  (1) 32 or 64, the tcgen05 MMA K widths.
+        # (2) An 8-bit knob: e4m3 operands issue the 32- or 64-byte form (the 64-byte one is the backward GEMM stage's
+        # explicit request; the forward's plans never pass it and stay at the named config's 32), a bf16 / f16 GEMM has
+        # one width, so the knob is refused rather than ignored.  (3) The width lives on a FROST JIT config, which
+        # pin_frost=False never builds -- a knob is honoured or refused, never silently dropped.
+        if mma_tile_k_bytes not in (32, 64):
+            raise ValueError(f"{label}: mma_tile_k_bytes must be None, 32 or 64 (the tcgen05 MMA K widths), got {mma_tile_k_bytes!r}")
+        if not block_scale and not (_is_fp8(dtype) or _is_fp4(dtype) or _is_fp4(w_dtype)):
+            raise ValueError(
+                f"{label}: mma_tile_k_bytes is a knob of the 8-bit MMA paths (block-scale, and dense e4m3); a dense {dtype} GEMM issues one "
+                "MMA K width -- pass None"
+            )
+        if not pin_frost:
+            raise ValueError(
+                f"{label}: mma_tile_k_bytes={mma_tile_k_bytes} re-targets a FROST JIT config and cannot be combined with pin_frost=False (the "
+                "deselected-FROST graph route has no JIT to re-target, so the knob would be silently dropped)"
+            )
     if (a_major != "k" or b_major != "k") and (block_scale or _is_fp4(dtype) or _is_fp4(w_dtype)):
         raise ValueError(
             f"{label}: M-major A / N-major B are served on the dense path only (got a_major={a_major!r}, b_major={b_major!r} with "
             f"block_scale={block_scale}, dtype={dtype}, w_dtype={w_dtype}); the block-scale rows' F8_128x4 scale-factor blobs are laid out over K-major operand rows"
         )
-    if (a_major != "k" or b_major != "k") and (_is_fp8(dtype) or _is_fp8(w_dtype)):
+    if (
+        (a_major != "k" or b_major != "k")
+        and (_is_fp8(dtype) or _is_fp8(w_dtype))
+        and (w_dtype != dtype or (dtype, a_major, b_major) not in FP8_MN_MAJOR_VALIDATED)
+    ):
+        # A TABLE of validated renderings, never a blanket lift: each admitted triple ran on cc 10.7 against the
+        # fp64 reference at the forced tile (K32 and K64).  Everything else is declined by name.
         raise NotImplementedError(
-            f"{label}: an fp8 (e4m3) operand with a_major={a_major!r}, b_major={b_major!r} is not served by this driver yet (dtype={dtype}, "
-            f"w_dtype={w_dtype}): the MN-major fp8 rendering is unmeasured on cc 10.7 and the quantized backward lands its own fp8 GEMM drivers; "
-            "use bf16 / f16 operands here, or the K-major defaults"
+            f"{label}: an fp8 (e4m3) operand with a_major={a_major!r}, b_major={b_major!r} (dtype={dtype}, w_dtype={w_dtype}) is not a rendering "
+            f"this driver has validated on cc 10.7; the validated (dtype, a_major, b_major) triples are {_fp8_mn_major_menu()} -- "
+            "use one of them, bf16 / f16 operands, or the K-major defaults"
         )
+    if (a_major != "k" or b_major != "k") and _is_fp8(dtype):
+        # The table holds at the ONE tile its rows were validated at: the forced 256-wide config on the FROST JIT (K32, and
+        # K64 through mma_tile_k_bytes=64).  An N the forced tile does not divide resolves to the heuristic's tile, an
+        # explicit other tile_config renders a tile nobody validated, and pin_frost=False builds no JIT at all; the compiler
+        # itself admits any 8-bit MN-major tile whose slices are 128-element multiples, so the driver declines these by name.
+        resolved = _forced_tile_config(n) if tile_config == "auto" else tile_config
+        if not pin_frost or resolved != _FORCED_TILE_NAME:
+            where = "the graph heuristic's tile" if resolved is None else f"the tile {resolved!r}"
+            if not pin_frost:
+                where += " on the graph route (no JIT)"
+            raise NotImplementedError(
+                f"{label}: the fp8 (e4m3) a_major={a_major!r}, b_major={b_major!r} rendering is validated at the forced tile "
+                f"{_FORCED_TILE_NAME!r} on the FROST JIT only (K32, and K64 through mma_tile_k_bytes=64); n={n}, tile_config={tile_config!r}, "
+                f"pin_frost={pin_frost} resolves to {where} -- use an N that 256 divides, or name that K32 tile_config explicitly, with "
+                "pin_frost=True; the K64 form is reached through mma_tile_k_bytes=64 only, never by its config name"
+            )
     if split_k and block_scale:
         raise ValueError(
             f"{label}: split_k={split_k} on the block-scale GEMM is not served by this driver (its reducer is verified on the dense path only); use split_k=0"
@@ -1155,8 +1396,6 @@ def build_proj_gemm(
             raise ValueError(
                 f"{label}: block_scale=True needs K % 32 == 0 (one E8M0 scale per 32-element block, or two E4M3 ones; the fp4 TMA rule), got K={k}"
             )
-        if mma_tile_k_bytes not in (None, 32, 64):
-            raise ValueError(f"{label}: mma_tile_k_bytes must be None, 32 or 64 (the tcgen05 MMA K widths), got {mma_tile_k_bytes!r}")
         if isinstance(tile_config, str) and tile_config != "auto" and not tile_config.startswith("CONFIG_sm100_"):
             # The sm103 block-scale template declares its rings A, B, SFA, SFB, so on Rubin's 327 KiB
             # budget its scale-factor roots cross the 256 KiB tcgen05-descriptor line and the kernel
@@ -1173,8 +1412,6 @@ def build_proj_gemm(
             )
         if w_dtype != dtype:
             raise ValueError(f"{label}: the dense GEMM takes one operand dtype (A {dtype} vs W {w_dtype}); mixed dtypes exist only as block-scale rows")
-        if mma_tile_k_bytes is not None:
-            raise ValueError(f"{label}: mma_tile_k_bytes is a block-scale knob (D15); the dense path keeps the engine's preferred width")
         if sf_dtype is None:
             sf_dtype = cudnn.data_type.FP8_E8M0
     # The op-recording hook the JIT-only route reads the graph through is installed by this
@@ -1187,9 +1424,14 @@ def build_proj_gemm(
             raise ValueError(f"{label}: {lbl} must be > 0, got {v}")
     fp8 = _is_fp8(dtype)
     fp4_a, fp4_w = _is_fp4(dtype), _is_fp4(w_dtype)
-    if fp8 and k % 16:
-        # TMA's 16-byte contiguous-extent rule at 1 B/elem (compiler._tma_alignment_reject).
-        raise ValueError(f"{label}: FP8 operands need K % 16 == 0 (16-byte TMA rule at 1 B/elem), got K={k}")
+    if fp8 and k % 16 and (a_major == "k" or b_major == "k"):
+        # TMA's 16-byte contiguous-extent rule at 1 B/elem (compiler._tma_alignment_reject), on the operands whose
+        # CONTIGUOUS axis is K: the forward's two, a dgrad's A.  A wgrad (M-major A, N-major B) has no K-contiguous
+        # operand -- its rule fell on M / N above (`_check_mn_major_tma_rule`) and its ragged K = T tail is TMA
+        # zero-fill, as for the bf16 twins; the device cells run it at T = 4104 (32 CTA K tiles of 128 e4m3 elements
+        # plus an 8-element tail) in both MMA K forms, so the rule is scoped rather than blanket.
+        which = " and ".join(f"{op} ({mj}-major)" for op, mj in (("A", a_major), ("B", b_major)) if mj == "k")
+        raise ValueError(f"{label}: FP8 operands need K % 16 == 0 (16-byte TMA rule at 1 B/elem on {which}: K is its contiguous axis), got K={k}")
     if out_dtype is None:
         out_dtype = torch.bfloat16 if (fp8 or fp4_a) else dtype
     out_dt = _cudnn_dtype(out_dtype)
@@ -1328,10 +1570,12 @@ def build_proj_gemm(
     # graph is still built above -- it is what gets analyzed, and it keeps
     # `workspace_bytes` and the plan-name pin honest.  A block-scale plan under
     # `pin_frost` ALWAYS takes the JIT (forced name, else the auto pick) so one
-    # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.
+    # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.  So does
+    # an explicit `mma_tile_k_bytes`: the width lives on a JIT config, and a dense shape
+    # outside the forced tile's N would otherwise drop the knob on the graph route.
     name = _forced_tile_config(n) if tile_config == "auto" else tile_config
     pinned_split = split_k >= 1  # split_k=1 pins ONE slice (and refuses the fallback); S >= 2 splits
-    if pin_frost and (name or block_scale or pinned_split):
+    if pin_frost and (name or block_scale or pinned_split or mma_tile_k_bytes is not None):
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
         from cudnn.gemm.frost.tile_config import as_mma_tile_k, by_name
 
@@ -1358,9 +1602,16 @@ def build_proj_gemm(
             from dataclasses import replace
 
             cfg = replace(cfg, split_k_slices=split_k)
+        # A forced compile the compiler refuses is a FALLBACK to the graph heuristic -- not a failure -- only where the plan's
+        # contract allows one: an implicit tile (tile_config="auto"), the driver's own slice count (split_k=0), no explicit MMA
+        # K width, and a dense bf16 / f16 or K-major fp8 GEMM.  Everything else is a typed REFUSAL, never a silent route change:
+        # an explicit request (tile_config, mma_tile_k_bytes) and the block-scale path surface the compiler's own reason; a
+        # pinned split refuses the fallback as SplitKPinRefused; an admitted fp8 MN-major triple (FP8_MN_MAJOR_VALIDATED)
+        # refuses it with the admission's own NotImplementedError -- the table is validated at the forced tile on the FROST
+        # JIT only, and the graph heuristic's tile is not that tile.
         try:
             compiled = jit_from_cudnn_graph(g, config=cfg)
-        except Exception as exc:  # a config this shape cannot take is a FALLBACK, not a failure
+        except Exception as exc:
             if tile_config != "auto" or block_scale or mma_tile_k_bytes is not None:
                 raise  # explicit requests (and the block-scale path, which has no graph fallback) surface their reason
             if pinned_split:
@@ -1369,6 +1620,15 @@ def build_proj_gemm(
                 raise SplitKPinRefused(
                     f"{label}: split_k={split_k} pins the JIT at {cfg.name!r}; its compile was refused ({type(exc).__name__}: {str(exc)[:300]}) "
                     "and the graph-heuristic fallback is refused too (it would change the tile config, the route and the slice count)"
+                ) from exc
+            if (dtype, a_major, b_major) in FP8_MN_MAJOR_VALIDATED:
+                # The admission above holds the table at the forced tile on the FROST JIT only; the fallback would run e4m3
+                # MN-major operands at the heuristic's tile (on cc 10.7 also its K64 MMA form), which nobody validated.
+                raise NotImplementedError(
+                    f"{label}: the fp8 (e4m3) a_major={a_major!r}, b_major={b_major!r} rendering is validated at the forced tile {name!r} on the "
+                    f"FROST JIT only (K32, and K64 through mma_tile_k_bytes=64), and that compile was refused ({type(exc).__name__}: {str(exc)[:300]}); "
+                    "the graph heuristic's tile is not validated for e4m3 MN-major operands, so the fallback the bf16 / f16 and K-major fp8 plans "
+                    "take is refused too"
                 ) from exc
             compiled = None
             # WARNING, not DEBUG (like the block-scale twin above): the fallback changes the tile config, the
@@ -1462,7 +1722,7 @@ def run_proj_gemm(
     backward drivers alike.
     """
     _check_operand(plan, a, "a", plan.dtype)
-    _check_operand(plan, w, "w", plan.w_dtype if plan.w_dtype is not None else plan.dtype)
+    _check_operand(plan, w, "w", _w_dtype_of(plan))
     # The OUTPUT too: the graph carries C's dtype and the kernel's stores use it, so a same-size f16
     # buffer on a bf16 plan would hold bf16 bit patterns (wrong values, no error) and a narrower one
     # (an e4m3 slab) would be overrun by 2-byte stores.  Shared by the forward and both backward
@@ -1511,6 +1771,13 @@ def run_proj_gemm(
         vp[plan.alpha] = alpha3
     if plan.jit is not None:
         need = int(getattr(plan.jit, "workspace_bytes", 0) or 0)
+        # The pack's KEY -> bound-tensor resolution (`resolve_variant_pack`: four dicts over the binding per call) is a plan-time
+        # fact -- the keys are the plan's own graph tensors, i.e. its ROLES -- so it is taken ONCE per plan (kept on it,
+        # `plan._resolved_keys`) over the graph tensors themselves, never over this call's buffers (one read-only tensor may be
+        # bound as both A and W), and the per-call pack maps straight to `{id(bound): buffer}` for `run_resolved`, the same launch
+        # path `__call__` takes after resolving.  This driver sits on the host-bound path of the fp8 block backward at short
+        # sequences.
+        resolved = _resolved_pack(plan, vp)
         if need:
             # Split-K partials: the JIT carves them out of the CALLER's workspace (never allocates).
             # `Workspace` validates presence, contiguity, size and 128-B alignment and raises with
@@ -1519,9 +1786,15 @@ def run_proj_gemm(
             # alignment passes every other check and reaches the launch boundary as a bogus pointer.
             from cudnn.frost.workspace import Workspace
 
-            plan.jit(vp, stream=stream, workspace=Workspace(workspace, need, plan.label, device=out.device.index))
-        else:
+            ws_obj = Workspace(workspace, need, plan.label, device=out.device.index)
+            if resolved is None:
+                plan.jit(vp, stream=stream, workspace=ws_obj)
+            else:
+                plan.jit.run_resolved(resolved, stream=stream, workspace=ws_obj)
+        elif resolved is None:
             plan.jit(vp, stream=stream)
+        else:
+            plan.jit.run_resolved(resolved, stream=stream)
         return
     if plan.route == "jit-only":
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
@@ -1530,6 +1803,44 @@ def run_proj_gemm(
     if handle is None:
         handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)
+
+
+def _resolved_pack(plan: ProjGemmPlan, vp: dict) -> Optional[dict]:
+    """``{id(bound tensor): buffer}`` for the JIT's ``run_resolved`` from the graph-tensor-keyed pack.
+
+    The KEY resolution -- which of the JIT's bound tensors each graph tensor of the pack names -- is a property of the plan's
+    ROLES (``plan.a`` / ``plan.b`` / ``plan.c`` / ``plan.sfa`` / ``plan.sfb`` / ``plan.alpha`` are the roles the compiled plan
+    declares), so it is taken once per plan through the compiler's own ``resolve_variant_pack`` (the two routes agree on every
+    key) over a PROBE pack that binds every graph tensor to ITSELF -- ``{graph tensor: graph tensor}`` comes back as
+    ``{id(bound tensor): graph tensor}``, no buffer involved -- and kept ON THE PLAN (``plan._resolved_keys``, whose lifetime is
+    the JIT's own: a dropped plan takes its JIT, binding and graph tensors with it; nothing module-level holds them).  Per call
+    only a dict over the pack's buffers.  A key the entry has not seen, or a JIT swapped under the plan, re-resolves.  ``None``
+    for a JIT without ``run_resolved`` (the caller takes the plain ``__call__`` route).
+
+    Never derive the roles from the BUFFERS.  The predecessor resolved the real pack and inverted it over ``id(buffer)``, which
+    assumes every role holds a distinct Python object; a square projection legally binds ONE read-only rank-3 tensor as both A
+    and W (``_rank3`` passes rank-3 through unchanged), the inversion kept one of the two roles, ``run_resolved`` raised
+    ``KeyError: 'variant pack is missing a buffer for A operand[0]'`` -- and the two-role mapping had been cached before the
+    failure, so a later call with distinct buffers on the same plan failed the same way."""
+    jit = plan.jit
+    if not hasattr(jit, "run_resolved") or getattr(jit, "binding", None) is None:
+        return None
+    entry = plan._resolved_keys
+    if entry is None or entry[0] is not jit or any(id(k) not in entry[1] for k in vp):
+        from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
+
+        roles = resolve_variant_pack({k: k for k in vp}, jit.binding)  # {id(bound tensor): graph tensor} -- the roles themselves
+        keys = {id(k): bid for bid, k in roles.items()}
+        if len(keys) != len(vp):
+            # Two graph tensors of the pack named ONE bound tensor of the binding: a mapping the per-call pack cannot express.
+            # Refused here, never cached as the partial mapping that would fail every later launch of this plan.
+            raise RuntimeError(
+                f"{plan.label}: {len(vp)} variant-pack keys resolved to {len(keys)} bound tensors of the JIT's binding; "
+                "the plan's graph tensors are not one-to-one with the roles its JIT binds"
+            )
+        entry = plan._resolved_keys = (jit, keys)
+    km = entry[1]
+    return {km[id(k)]: buf for k, buf in vp.items()}
 
 
 def _check_operand(plan: ProjGemmPlan, t: Optional[torch.Tensor], name: str, expect: Any) -> None:
@@ -1545,10 +1856,10 @@ def _check_operand(plan: ProjGemmPlan, t: Optional[torch.Tensor], name: str, exp
             else ""
         )
         raise ValueError(f"{plan.label}: {name} is {t.dtype} but this plan was built for {expect}; refusing to reinterpret the bytes{hint}")
-    if _is_fp4(expect) and int(t.shape[-1]) * 2 != plan.k:
+    if _is_fp4(expect) and int(t.shape[-1]) * FP4_CODES_PER_BYTE != plan.k:
         raise ValueError(
-            f"{plan.label}: {name} is fp4 storage {tuple(t.shape)} -- two e2m1 codes per byte along K -- so its last extent must be K/2 = {plan.k // 2}, "
-            f"not {int(t.shape[-1])} (a LOGICAL [.., K] fp4 tensor holds twice the data the graph declared)"
+            f"{plan.label}: {name} is fp4 storage {tuple(t.shape)} -- two e2m1 codes per byte along K -- so its last extent must be K/2 = "
+            f"{plan.k // FP4_CODES_PER_BYTE}, not {int(t.shape[-1])} (a LOGICAL [.., K] fp4 tensor holds twice the data the graph declared)"
         )
 
 
@@ -1722,6 +2033,7 @@ def run_wgrad_gemm(
     handle: Optional[Any] = None,
     *,
     stream=None,
+    alpha: Optional[torch.Tensor] = None,
 ) -> None:
     """``dW[rows, cols] = dy_like[T, rows]^T @ x[T, cols]`` -- ``nn.Linear``'s weight gradient
     (B1 ``dW_o = dY^T @ O_gated``, B7 ``dW_qkvg = dQKVG^T @ h``).
@@ -1736,7 +2048,10 @@ def run_wgrad_gemm(
     and both strides -- the graph fallback would read the declared strides with no check, and
     the JIT re-labels B into kernel order only on an exact match; a column slice of a
     wider slab is refused, not reinterpreted).
-    ``stream`` / ``handle`` as :func:`run_proj_gemm` (Rule 5: one launch stream)."""
+    ``stream`` / ``handle`` as :func:`run_proj_gemm` (Rule 5: one launch stream).
+    ``alpha`` (appended): the per-tensor fp8 plan's ``[1, 1, 1]`` fp32 descale product --
+    required when the plan was built with ``alpha=True``, refused otherwise, exactly as
+    :func:`run_proj_gemm` spells it; :func:`device_alpha` writes it into the caller's slot."""
     if (plan.a_major, plan.b_major) != ("m", "n"):
         raise ValueError(
             f"{plan.label}: run_wgrad_gemm binds A = dy_like^T (M-major) and B = x (N-major), but this plan was built with "
@@ -1748,7 +2063,7 @@ def run_wgrad_gemm(
     _check_view_against_declaration(plan, "A", "dy_like^T", a3)
     _check_view_against_declaration(plan, "B", "x", b3)
     _check_output_view(plan, "dw", c3)
-    run_proj_gemm(plan, a3, b3, c3, workspace, handle, stream=stream)
+    run_proj_gemm(plan, a3, b3, c3, workspace, handle, alpha=alpha, stream=stream)
 
 
 def run_dgrad_gemm(
@@ -1760,6 +2075,7 @@ def run_dgrad_gemm(
     handle: Optional[Any] = None,
     *,
     stream=None,
+    alpha: Optional[torch.Tensor] = None,
 ) -> None:
     """``dX[T, N] = dy_like[T, K] @ w[K, N]`` with ``w`` the UN-transposed row-major weight --
     ``nn.Linear``'s input gradient (B2 ``dO_gated = dY @ W_o``, B8 ``dh = dQKVG @ W_qkvg``).
@@ -1768,7 +2084,8 @@ def run_dgrad_gemm(
     ``A = dy_like.unsqueeze(0)`` (``[1, T, K]`` row-major), ``B = w.unsqueeze(0)`` (== the
     declared ``[1, K, N]`` stride ``[K*N, N, 1]``: the weight exactly as the checkpoint holds
     it, ``[out_features, in_features]`` for the forward's ``x @ W^T``) and ``C = dx.unsqueeze(0)``
-    -- views only, with the same declaration check as :func:`run_wgrad_gemm`."""
+    -- views only, with the same declaration check as :func:`run_wgrad_gemm`.  ``alpha``
+    (appended) as there: the fp8 plan's descale product, required iff ``alpha=True``."""
     if (plan.a_major, plan.b_major) != ("k", "n"):
         raise ValueError(
             f"{plan.label}: run_dgrad_gemm binds A = dy_like (K-major) and B = w (N-major, the un-transposed row-major weight), but this plan "
@@ -1780,4 +2097,211 @@ def run_dgrad_gemm(
     _check_view_against_declaration(plan, "A", "dy_like", a3)
     _check_view_against_declaration(plan, "B", "w", b3)
     _check_output_view(plan, "dx", c3)
-    run_proj_gemm(plan, a3, b3, c3, workspace, handle, stream=stream)
+    run_proj_gemm(plan, a3, b3, c3, workspace, handle, alpha=alpha, stream=stream)
+
+
+# ---------------------------------------------------------------------------
+# The QUANTIZED backward: the device alpha slot, and the K-major block-scale drivers (B7 / B8 under MXFP8)
+# ---------------------------------------------------------------------------
+
+
+def _check_scalar(label: str, name: str, t: torch.Tensor, device) -> torch.Tensor:
+    """``t`` is a 1-element fp32 CUDA tensor on ``device`` (the alpha slot's), else a typed ``ValueError`` naming ``name``;
+    returns its ``[1]`` view -- a view, never a copy -- for the device-side multiply."""
+    if not isinstance(t, torch.Tensor) or t.numel() != 1 or t.dtype != torch.float32 or not t.is_cuda:
+        raise ValueError(
+            f"{label}: {name} must be a 1-element fp32 CUDA tensor (a slot of the caller's workspace, or a plan-time constant), got "
+            f"{type(t).__name__}{' ' + str(tuple(t.shape)) + ' ' + str(t.dtype) + ' on ' + str(t.device) if isinstance(t, torch.Tensor) else ''}"
+        )
+    if t.device != device:
+        raise ValueError(f"{label}: {name} is on {t.device} but the alpha slot is on {device}; every scalar of one GEMM lives on the launch device")
+    return t.reshape(1)  # one element is always contiguous: a view, never a copy
+
+
+def device_alpha(
+    alpha_out: torch.Tensor,
+    descale_a: torch.Tensor,
+    descale_b: torch.Tensor,
+    scale_out: Optional[torch.Tensor] = None,
+    *,
+    stream=None,
+    label: str = "proj_gemm",
+) -> torch.Tensor:
+    """``alpha_out[:] = descale_a * descale_b`` (``* scale_out`` when a quantized output wants it) ON THE DEVICE,
+    on the launch stream; returns the ``[1, 1, 1]`` fp32 view :func:`run_proj_gemm` binds as the fp8 plan's
+    ``alpha`` epilogue.
+
+    The contract of the quantized backward's descale products (B1 ``descale_dY * (1 / scale_o)``, B2
+    ``descale_dY * descale_w_o``, B7 ``descale_dQKVG * descale_h``, B8 ``descale_dQKVG * descale_w_qkvg``):
+
+    * ``alpha_out`` is the CALLER's slot -- one fp32 element of a workspace region the caller carved at plan
+      time (a view into it is fine; the write is in place and the returned view aliases it), so nothing is
+      allocated per execute (Rule 1) and a CUDA-graph capture sees stable pointers;
+    * every input is a 1-element fp32 CUDA tensor on the slot's device -- a plan-time constant or another
+      slot a quantize kernel wrote this step (the "current" recipe's device-side scales) -- and is READ on
+      the device: no ``.item()``, no host round trip, no host-side float ever reaches the product;
+    * the two multiplies run under ``stream`` (a raw ``CUstream`` int or a ``torch.cuda.Stream``; ``None`` =
+      torch's current stream on the slot's device) -- the SAME launch stream the GEMM takes (Rule 5), so a
+      scale written by an earlier kernel on that stream is ordered before the product, and the product
+      before the GEMM that reads it.
+
+    Numerics: one fp32 product (two with ``scale_out``), rounded to nearest -- the same value a host-side
+    ``descale_a * descale_b`` in fp32 would give, so the oracle may compute it either way.
+    """
+    from cudnn._torch_stream import stream_context
+
+    if not isinstance(alpha_out, torch.Tensor) or alpha_out.numel() != 1 or alpha_out.dtype != torch.float32 or not alpha_out.is_cuda:
+        raise ValueError(
+            f"{label}: alpha_out must be a 1-element fp32 CUDA tensor -- the caller's workspace slot the GEMM's alpha epilogue reads -- got "
+            f"{type(alpha_out).__name__}{' ' + str(tuple(alpha_out.shape)) + ' ' + str(alpha_out.dtype) + ' on ' + str(alpha_out.device) if isinstance(alpha_out, torch.Tensor) else ''}"
+        )
+    dev = alpha_out.device
+    out1 = alpha_out.reshape(1)
+    a1 = _check_scalar(label, "descale_a", descale_a, dev)
+    b1 = _check_scalar(label, "descale_b", descale_b, dev)
+    s1 = _check_scalar(label, "scale_out", scale_out, dev) if scale_out is not None else None
+    with stream_context(stream, dev):
+        torch.mul(a1, b1, out=out1)
+        if s1 is not None:
+            out1.mul_(s1)
+    return alpha_out.reshape(1, 1, 1)
+
+
+def _check_k_major_block_scale_plan(plan: ProjGemmPlan, driver: str) -> None:
+    """The block-scale drivers' plan gate: ``plan`` was built with ``block_scale=True`` at the K-major defaults, else a
+    typed ``ValueError`` naming ``driver`` (a dense plan has no dequant; the block-scale rows take no other major)."""
+    if not plan.block_scale:
+        raise ValueError(f"{plan.label}: {driver} serves block-scale plans (build_proj_gemm(block_scale=True)); this plan has no block-scale dequant")
+    if (plan.a_major, plan.b_major) != ("k", "k"):
+        raise ValueError(
+            f"{plan.label}: {driver} binds K-major TRANSPOSED operands (the block-scale rows take no other major), but this plan was built with "
+            f"a_major={plan.a_major!r}, b_major={plan.b_major!r}; build it with the K-major defaults"
+        )
+
+
+def _check_k_major_operand(plan: ProjGemmPlan, what: str, t: torch.Tensor, rows: int, k: int, expect: Any = None) -> torch.Tensor:
+    """``t`` is the contiguous row-major ``[rows, k]`` storage the plan declared (a transposed artifact as the caller
+    STORES it -- never ``.t()`` of a row-major ``[k, rows]``, whose stride-1 axis would be the wrong one).
+
+    ``expect`` (appended; ``None`` = no dtype check and the LOGICAL extent, as a hand-built plan without dtypes declares it): the
+    dtype this side was built for.  The dtype is checked FIRST, by :func:`_check_operand` -- a mismatch is its typed
+    refusal, with the ``.view(torch.float4_e2m1fn_x2)`` hint for uint8 codes handed to an e2m1 side, and a LOGICAL ``[rows, k]``
+    fp4 tensor its "last extent must be K/2" refusal -- and an e2m1 ``expect`` makes the declared storage the PACKED
+    ``[rows, k // 2]`` (:func:`storage_k`: two codes per byte along K, low nibble = even k), so the shape and the strides are
+    checked against the bytes the caller holds: the ``_check_operand`` rule of :func:`run_proj_gemm`, applied to the K-major extent
+    and the row stride here, for either operand of either block-scale driver (both are packed under the NVFP4 x NVFP4 row)."""
+    t = _rank2(t, plan.label, what)
+    if expect is not None:
+        _check_operand(plan, t, what, expect)  # the dtype (+ the view hint) and, for e2m1 codes, ``shape[-1] * 2 == K``
+    k_store = storage_k(k, expect)
+    packed = f" -- the PACKED e2m1 storage, {FP4_CODES_PER_BYTE} codes per byte along K={k}" if _is_fp4(expect) else ""
+    shape, stride = tuple(int(x) for x in t.shape), tuple(int(x) for x in t.stride())
+    if shape != (rows, k_store):
+        raise ValueError(f"{plan.label}: {what} has shape {shape}; this plan declared it as the K-major [{rows}, {k_store}] (rows x K, K contiguous{packed})")
+    if stride != (k_store, 1):
+        raise ValueError(
+            f"{plan.label}: {what} has strides {stride} but this plan declared a contiguous row-major [{rows}, {k_store}] (strides {(k_store, 1)}{packed}): "
+            "the block-scale rows read K-major operands whose F8_128x4 scale factors run along K -- hand the driver the transposed storage itself, "
+            "not a view of the un-transposed tensor and not a slice of a wider slab"
+        )
+    return t
+
+
+def _check_driver_sf_blob(plan: ProjGemmPlan, name: str, sf: Optional[torch.Tensor], rows: int, of_what: str) -> None:
+    """The block-scale drivers' scale-factor gate, by the DRIVER's keyword: a missing ``sf_dy_t`` / ``sf_x_t`` /
+    ``sf_dy`` / ``sf_w_t`` is named as such (``run_proj_gemm``'s own gate would name its ``sf_a`` / ``sf_w``), with
+    the operand it scales and the byte count it needs; dtype, device, alignment and size are ``_sf_view``'s checks
+    under the same name.  ``run_proj_gemm`` re-derives the bound views when it launches (views, never copies)."""
+    if sf is None:
+        raise ValueError(
+            f"{plan.label}: this plan was built with block_scale=True; pass {name}= (the padded F8_128x4 scale-factor blob of {of_what}, "
+            f"{sf_blob_bytes(rows, plan.k, plan.block_size)} bytes for {rows} rows x K={plan.k}). No silent 1.0 (Rule 1)."
+        )
+    _sf_view(plan, sf, name, rows)
+
+
+def run_wgrad_gemm_block_scale(
+    plan: ProjGemmPlan,
+    dy_t: torch.Tensor,
+    x_t: torch.Tensor,
+    dw: torch.Tensor,
+    workspace: torch.Tensor,
+    handle: Optional[Any] = None,
+    *,
+    sf_dy_t: torch.Tensor,
+    sf_x_t: torch.Tensor,
+    stream=None,
+) -> None:
+    """``dW[rows, cols] = dy_t[rows, T] @ x_t[cols, T]^T`` -- ``nn.Linear``'s weight gradient over block-scaled operands
+    that are BOTH K-major transposed artifacts (B7 ``dW_qkvg = dQKVG^T @ h``: ``dy_t`` is the quantizer's transposed
+    ``dQKVG^T [N, T]`` with its scale factors along T, ``x_t`` the caller's TE "columnwise" ``h^T [dm, T]`` with its
+    ``h_t_sf``).
+
+    ``plan`` was built with ``block_scale=True`` and the K-major defaults: ``m=rows, k=T, n=cols`` -- the forward's own
+    declaration (``A [m, k]`` row-major, ``W [n, k]`` row-major read transposed) at the backward's shapes, so the binding
+    is the forward's proven one (:func:`run_proj_gemm` with ``a=dy_t, w=x_t``), and the contraction over tokens needs
+    ``T % 32 == 0`` (whole scale blocks along K -- ``build_proj_gemm`` declines a ragged T at plan time, typed).  The rows
+    this driver binds are :func:`block_scale_pairing`'s: the block's weight gradients run the **MXFP8 x MXFP8** row (e4m3
+    codes on both sides, one E8M0 scale per 32 tokens) under every quantized mode -- the fp4 weight modes keep their weight
+    gradients 8-bit -- and an e2m1 side (the **mixed** e4m3 x e2m1 row at E8M0 per 32, the **NVFP4 x NVFP4** row at e4m3
+    per 16) takes the same binding under the packed-storage rule below.  ``sf_dy_t`` / ``sf_x_t`` are the PADDED F8_128x4
+    blobs over ``rows`` x ``T`` and ``cols`` x ``T`` at its ``block_size`` (``sf_blob_bytes``), both required (Rule
+    1: no silent unit scale) and checked HERE under these keywords (a missing or wrong-sized blob is a ``ValueError``
+    naming ``sf_dy_t`` / ``sf_x_t``, the operand it scales and the byte count).  Every operand is checked against the
+    declaration BEFORE the launch: its dtype (its ``dtype`` / ``w_dtype``; uint8 bytes handed to an e2m1 side get
+    the ``.view(torch.float4_e2m1fn_x2)`` hint), contiguous row-major ``[rows, T]`` / ``[cols, T]`` storage -- for an e2m1
+    side the PACKED ``[.., T // 2]`` (two codes per byte along K, low nibble = even k; a LOGICAL ``[.., T]`` fp4 tensor is
+    refused as holding twice the data) -- where a ``.t()`` view of the un-transposed tensor, or a slice of a wider slab, is
+    a typed ``ValueError`` naming the operand and both strides, and a contiguous ``[rows, cols]`` output.  There is no
+    ``alpha`` (the block dequant is exact and happens in the MMA) and no ``split_k`` (refused at plan time)."""
+    _check_k_major_block_scale_plan(plan, "run_wgrad_gemm_block_scale")
+    a = _check_k_major_operand(plan, "dy_t (dy_like^T, [rows, T])", dy_t, plan.m, plan.k, expect=plan.dtype)
+    w = _check_k_major_operand(plan, "x_t (x^T, [cols, T])", x_t, plan.n, plan.k, expect=_w_dtype_of(plan))
+    _check_output_view(plan, "dw", _rank2(dw, plan.label, "dw").unsqueeze(0))
+    _check_driver_sf_blob(plan, "sf_dy_t", sf_dy_t, plan.m, "dy_t over its rows x T")
+    _check_driver_sf_blob(plan, "sf_x_t", sf_x_t, plan.n, "x_t over its cols x T")
+    run_proj_gemm(plan, a, w, dw, workspace, handle, sf_a=sf_dy_t, sf_w=sf_x_t, stream=stream)
+
+
+def run_dgrad_gemm_block_scale(
+    plan: ProjGemmPlan,
+    dy_like: torch.Tensor,
+    w_t: torch.Tensor,
+    dx: torch.Tensor,
+    workspace: torch.Tensor,
+    handle: Optional[Any] = None,
+    *,
+    sf_dy: torch.Tensor,
+    sf_w_t: torch.Tensor,
+    stream=None,
+) -> None:
+    """``dX[T, N] = dy_like[T, K] @ w_t[N, K]^T`` -- ``nn.Linear``'s input gradient over block-scaled operands with the
+    weight TRANSPOSED into K-major storage (``w_t`` = ``W^T`` re-quantized along the contraction axis by the caller, once
+    per weight update, with its blob).  Three rows, each the forward's own rendering at the dgrad's ``(m, k, n)``
+    (:func:`block_scale_pairing`):
+
+    * **MXFP8 x MXFP8** (``dtype = w_dtype = e4m3``, E8M0 per 32): B8 ``dh = dQKVG @ W_qkvg`` -- ``dy_like`` the rowwise
+      ``dQKVG [T, N]`` with its scale factors along N, ``w_t`` the caller's ``W_qkvg^T [dm, N]`` with ``w_qkvg_t_sf``;
+    * **the mixed row** (``dtype = e4m3``, ``w_dtype = torch.float4_e2m1fn_x2``, E8M0 per 32 on both sides): B8 under an
+      MXFP4 ``W_qkvg`` -- ``w_t`` the e2m1 ``W_qkvg^T`` stored PACKED ``[dm, N // 2]`` with its E8M0 blob over ``(dm, N)`` --
+      and B2 ``dO_gated = dY @ W_o`` under an MXFP4 ``W_o`` -- ``dy_like`` an MX-rowwise e4m3 ``dY [T, dm]``, ``w_t`` the e2m1
+      ``W_o^T`` packed ``[HD, dm // 2]``;
+    * **NVFP4 x NVFP4** (``dtype = w_dtype = torch.float4_e2m1fn_x2``, ``block_size = 16``, e4m3 scales): B2 under an NVFP4
+      ``W_o`` -- ``dy_like`` the NVFP4 cast of ``dY`` packed ``[T, dm // 2]`` with its e4m3 blob over ``(T, dm)``, ``w_t`` the
+      e2m1 ``W_o^T`` packed ``[HD, dm // 2]`` with its e4m3 blob over ``(HD, dm)`` -- BOTH operands packed.
+
+    ``plan``: ``block_scale=True``, K-major defaults, ``m=T, k=K, n=N`` -- again the forward's declaration, so ``w_t`` is
+    bound exactly as the forward binds its ``[N, K]`` weight.  ``sf_dy`` / ``sf_w_t``: the PADDED F8_128x4 blobs over ``T``
+    x ``K`` and ``N`` x ``K`` at its ``block_size`` (16 for NVFP4), checked here under these keywords.  Operand
+    checks as :func:`run_wgrad_gemm_block_scale`: the dtype per side (uint8 codes handed to an e2m1 side get the
+    ``.view(torch.float4_e2m1fn_x2)`` hint), contiguous row-major storage at the DECLARED extent -- ``[T, K]`` / ``[N, K]``,
+    or the PACKED ``[.., K // 2]`` for an e2m1 side (a LOGICAL ``[.., K]`` fp4 tensor is a typed refusal: twice the data) --
+    a ``.t()`` view or a slab slice refused by name with both strides, a contiguous ``[T, N]`` output; no ``alpha``, no
+    ``split_k``."""
+    _check_k_major_block_scale_plan(plan, "run_dgrad_gemm_block_scale")
+    a = _check_k_major_operand(plan, "dy_like ([T, K])", dy_like, plan.m, plan.k, expect=plan.dtype)
+    w = _check_k_major_operand(plan, "w_t (w^T, [N, K])", w_t, plan.n, plan.k, expect=_w_dtype_of(plan))
+    _check_output_view(plan, "dx", _rank2(dx, plan.label, "dx").unsqueeze(0))
+    _check_driver_sf_blob(plan, "sf_dy", sf_dy, plan.m, "dy_like over its T rows x K")
+    _check_driver_sf_blob(plan, "sf_w_t", sf_w_t, plan.n, "w_t over its N rows x K")
+    run_proj_gemm(plan, a, w, dx, workspace, handle, sf_a=sf_dy, sf_w=sf_w_t, stream=stream)

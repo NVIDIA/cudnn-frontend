@@ -26,7 +26,6 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from ..backend_utils import allocate_wrapper_workspace
 from ..moe_utils import MoEWeightMode
 
 __all__ = ["GroupedGemmBf16API"]
@@ -84,12 +83,6 @@ class GroupedGemmSm100(APIBase):
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
 
-    def scratch_workspace_bytes(self) -> int:
-        """Bytes of caller-owned, 128-byte-aligned scratch ``execute(workspace=)`` requires."""
-        if self._implementation is None:
-            self.check_support()
-        return self._implementation.scratch_workspace_bytes()
-
     def execute(
         self,
         a_tensor: torch.Tensor,
@@ -102,8 +95,6 @@ class GroupedGemmSm100(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
-        *,
-        workspace: Any = None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -118,7 +109,6 @@ class GroupedGemmSm100(APIBase):
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
             current_stream=current_stream,
-            workspace=workspace,
         )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
@@ -366,7 +356,6 @@ def grouped_gemm_wrapper_sm100(
                 bias_tensor=bias_tensor,
                 prob_tensor=prob_tensor,
                 current_stream=current_stream,
-                workspace=allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(), a_tensor.device, current_stream),
             )
             return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
 
@@ -503,7 +492,6 @@ def grouped_gemm_wrapper_sm100(
         bias_tensor=bias_tensor,
         prob_tensor=prob_tensor,
         current_stream=current_stream,
-        workspace=allocate_wrapper_workspace(framework, op.scratch_workspace_bytes(), a_tensor.device, current_stream),
     )
     return TupleDict(
         d_tensor=d_tensor,

@@ -58,7 +58,7 @@ def test_every_covered_directory_exists():
 def test_detector_arms_the_frontend_api_directories_only():
     from rule8_detector import TEST_ROOT, covered
 
-    assert covered(TEST_ROOT / "gemm" / "cutedsl" / "test_x.py")
-    assert covered(TEST_ROOT / "gemm" / "jax" / "test_x.py")
+    assert covered(TEST_ROOT / "deepseek_sparse_attention" / "cutedsl" / "test_x.py")
+    assert not covered(TEST_ROOT / "gemm" / "jax" / "test_x.py")
     assert not covered(TEST_ROOT / "sdpa" / "frost" / "test_x.py")
     assert not covered(TEST_ROOT / "test_x.py")

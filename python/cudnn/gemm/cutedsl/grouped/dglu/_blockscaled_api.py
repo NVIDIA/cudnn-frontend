@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from .moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 from ..moe_utils import MoEWeightMode
-from ..backend_utils import rubin_single_group_offsets_kwarg, retain_workspace
+from ..backend_utils import rubin_single_group_offsets_kwarg
 from cuda.bindings import driver as cuda
 import math
 import os
@@ -741,8 +741,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         # ---- Disabled configurations ----
         self._not_implemented_error_if(
-            self._deterministic and (self._is_rubin_kernel or self.dbias_desc is not None or self.weight_mode != MoEWeightMode.DENSE),
-            "deterministic dprob is implemented only for the SM100 dense kernel without dbias",
+            self._deterministic and (self._is_rubin_kernel or self.dbias_desc is not None),
+            "deterministic dprob is implemented only for the SM100 kernel without dbias",
         )
         self._not_implemented_error_if(
             self.dbias_desc is None and self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,
@@ -1383,7 +1383,6 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
             amax_tensor=amax_tensor,
             norm_const_tensor=norm_const_tensor,
         )
-        retain_workspace(self, workspace, current_stream)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             self._compiled_kernel(

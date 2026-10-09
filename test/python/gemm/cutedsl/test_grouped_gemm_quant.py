@@ -12,7 +12,6 @@ Used for FC2 (forward down-projection) and dFC1 (backward FC1 GEMMs).
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
-from gemm.cutedsl._workspace import ws
 from core.cutedsl.test_fe_api_utils import DYNAMIC_SHAPES_M_VALUES
 from gemm.cutedsl.test_grouped_gemm_swiglu_utils import (
     allocate_grouped_gemm_input_tensors,
@@ -811,6 +810,7 @@ def _test_grouped_gemm_quant_wrapper_dynamic_m_cache_behavior(
         monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
 
     grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+    grouped_gemm_quant_api._quant_wrapper_memo.clear()
 
     compile_count = {"value": 0}
     original_compile = grouped_gemm_quant_api.GroupedGemmQuantSm100.compile
@@ -878,6 +878,7 @@ def _test_grouped_gemm_quant_wrapper_dynamic_m_cache_behavior(
     finally:
         cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
         grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+        grouped_gemm_quant_api._quant_wrapper_memo.clear()
 
     return compile_count["value"], cache_entries
 
@@ -896,6 +897,7 @@ def _test_grouped_gemm_quant_wrapper_dynamic_nk_cache_behavior(
 
     monkeypatch.setenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1")
     grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+    grouped_gemm_quant_api._quant_wrapper_memo.clear()
 
     compile_count = {"value": 0}
     original_compile = grouped_gemm_quant_api.GroupedGemmQuantSm100.compile
@@ -962,6 +964,7 @@ def _test_grouped_gemm_quant_wrapper_dynamic_nk_cache_behavior(
     finally:
         cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
         grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+        grouped_gemm_quant_api._quant_wrapper_memo.clear()
 
     return compile_count["value"], cache_entries
 
@@ -986,6 +989,7 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
 
     monkeypatch.delenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", raising=False)
     grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+    grouped_gemm_quant_api._quant_wrapper_memo.clear()
 
     compile_count = {"value": 0}
     original_compile = grouped_gemm_quant_api.GroupedGemmQuantSm100.compile
@@ -1066,6 +1070,7 @@ def _test_grouped_gemm_quant_discrete_wrapper_dynamic_m_cache_behavior(
     finally:
         cache_entries = len(grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects)
         grouped_gemm_quant_api._cache_of_GroupedGemmQuantSm100Objects.clear()
+        grouped_gemm_quant_api._quant_wrapper_memo.clear()
 
     return compile_count["value"], cache_entries
 
@@ -1193,7 +1198,6 @@ def _test_grouped_gemm_quant_compile_execute(
         row_scale_tensor=inputs.get("row_scale_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=stream,
-        workspace=ws(api),
     )
 
     check_ref_grouped_gemm_quant(
@@ -1441,7 +1445,6 @@ def _test_grouped_gemm_quant_discrete_compile_execute(
         prob_tensor=inputs["prob_tensor"],
         row_scale_tensor=inputs.get("row_scale_tensor"),
         current_stream=stream,
-        workspace=ws(api),
     )
 
     _check_ref_grouped_gemm_quant_discrete(

@@ -1124,7 +1124,11 @@ class SM120FusedMultiHeadAttentionForward:
         """
         # Raw-score maxima bound P only for a nonnegative multiplier. Fold
         # its sign into Q once per unit, including the device Q/K descales.
-        negate_q = softmax_scale_log2 < 0.0
+        if cutlass.const_expr(PARAMS.negate_scores):
+            # attn_scale < 0 arrives as |attn_scale| (#1435); a negative descale product still flips at run time.
+            negate_q = softmax_scale_log2 > 0.0
+        else:
+            negate_q = softmax_scale_log2 < 0.0
         softmax_scale_log2 = cute.math.abs(softmax_scale_log2)
         q_seq_idx = q_tile_idx * (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile)
 
@@ -1493,11 +1497,9 @@ class SM120FusedMultiHeadAttentionForward:
                                 # per-batch padded Stats (B, H, s_max), no ragged offsets
                                 lse_arr[batch_idx, _lse_head, lse_q_idx] = lse_out
                             elif cutlass.const_expr(self.thd_lse_head_major):
-                                lse_row = lse_arr[_lse_head, :]
-                                lse_row[q_row_base + lse_q_idx] = lse_out
+                                lse_arr[_lse_head, q_row_base + lse_q_idx] = lse_out
                             else:
-                                lse_row = lse_arr[q_row_base + lse_q_idx, :]
-                                lse_row[_lse_head] = lse_out
+                                lse_arr[q_row_base + lse_q_idx, _lse_head] = lse_out
                     else:
                         # Rows at/past this batch's Q length trim to -inf.
                         if lse_q_idx >= seqlen_q:

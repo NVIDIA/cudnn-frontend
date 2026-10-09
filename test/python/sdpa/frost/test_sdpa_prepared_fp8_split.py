@@ -169,13 +169,13 @@ def test_prepared_fp8_split_standalone_default_scales(arch, d, dv, output_dtype)
         bufs[name] = (torch.randn(b, seq, heads, dim, device="cuda") * 0.4).to(torch.float8_e4m3fn).transpose(1, 2)
     bufs["o"] = torch.empty((b, sq, hq, dv), device="cuda", dtype=output_dtype).transpose(1, 2)
     bufs["amax_o"] = torch.empty(1, device="cuda")
-    api_type = SdpaFwdDslSm100 if arch == "sm100" else SdpaFwdDslSm120
+    api_type = SdpaFwdDslSm100 if arch in ("sm100", "sm107") else SdpaFwdDslSm120
     api = api_type(
         **{"sample_" + name: bufs[name] for name in ("q", "k", "v", "o")},
         pertensor_fp8=True,
         pack_gqa=False,
         split_kv=4,
-        **({"cga": 2} if arch == "sm100" and d == 192 else {}),
+        **({"cga": 2} if arch in ("sm100", "sm107") and d == 192 else {}),
     )
     assert api.check_support()
     size = api.scratch_workspace_bytes()

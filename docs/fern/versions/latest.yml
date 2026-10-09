@@ -207,6 +207,9 @@ navigation:
           - page: Fused RMSNorm + SiLU
             path: ../../fe-oss-apis/rmsnorm_silu.md
             slug: rmsnorm_silu
+          - page: Fused Conv3D + Bias + Residual + RMSNorm + SiLU
+            path: ../../fe-oss-apis/conv3d_postops.md
+            slug: conv3d_postops
           - section: Attention (FE-OSS)
             slug: attention
             contents:

@@ -1129,6 +1129,24 @@ def get_tma_atom_kind(atom_sm_cnt: cutlass.Int32, mcast: cutlass.Boolean) -> Uni
 # ---------------------------------------------------------------------------
 
 
+def _target_needs_shuffle_amax():
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    arch = CuTeDSL._get_dsl().get_arch_enum()
+    return (int(arch.major), int(arch.minor)) == (11, 0)
+
+
+@cute.jit
+def warp_amax_with_nan(value):
+    # SM110 cannot assemble redux.f32. Keep the original path on other targets.
+    if cutlass.const_expr(_target_needs_shuffle_amax()):
+        for shift in cutlass.range_constexpr(5):
+            value = cute.arch.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift), nan=True)
+    else:
+        value = cute.arch.warp_redux_sync(value=value, kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True)
+    return value
+
+
 @cute.jit
 def amax_reduction_per_thread(vec_fp32, amax_fp32):
     """Per-thread amax reduction over an FP32 register fragment."""

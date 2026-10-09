@@ -149,7 +149,7 @@ def destroy_handle(handle):
 
 from .datatypes import _library_type, _is_torch_tensor
 
-__version__ = "1.31.0"
+__version__ = "1.32.0"
 
 
 def _tensor(
@@ -490,6 +490,62 @@ _LAZY_OPTIONAL_IMPORTS = {
         ".rmsnorm_rht_amax",
         "rmsnorm_rht_amax_wrapper_sm100",
     ),
+    "Conv3dRmsNormSiluPadSm100": (
+        ".conv.cutedsl",
+        "Conv3dRmsNormSiluPadSm100",
+    ),
+    "Conv3dRmsNormSiluSm100": (
+        ".conv.cutedsl",
+        "Conv3dRmsNormSiluSm100",
+    ),
+    "Conv3dBiasResidualPadSm100": (
+        ".conv.cutedsl",
+        "Conv3dBiasResidualPadSm100",
+    ),
+    "CausalConv3dWithCacheSm100": (
+        ".conv.cutedsl",
+        "CausalConv3dWithCacheSm100",
+    ),
+    "Conv3dRawSm100": (
+        ".conv.cutedsl",
+        "Conv3dRawSm100",
+    ),
+    "RmsNormSiluPadSm100": (
+        ".conv.cutedsl",
+        "RmsNormSiluPadSm100",
+    ),
+    "pack_conv3d_weight_sm100": (
+        ".conv.cutedsl",
+        "pack_conv3d_weight_sm100",
+    ),
+    "pack_causal_conv3d_weight_sm100": (
+        ".conv.cutedsl",
+        "pack_causal_conv3d_weight_sm100",
+    ),
+    "conv3d_rmsnorm_silu_pad_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_rmsnorm_silu_pad_wrapper_sm100",
+    ),
+    "conv3d_rmsnorm_silu_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_rmsnorm_silu_wrapper_sm100",
+    ),
+    "conv3d_bias_residual_pad_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_bias_residual_pad_wrapper_sm100",
+    ),
+    "causal_conv3d_with_cache_wrapper_sm100": (
+        ".conv.cutedsl",
+        "causal_conv3d_with_cache_wrapper_sm100",
+    ),
+    "conv3d_raw_wrapper_sm100": (
+        ".conv.cutedsl",
+        "conv3d_raw_wrapper_sm100",
+    ),
+    "rmsnorm_silu_pad_wrapper_sm100": (
+        ".conv.cutedsl",
+        "rmsnorm_silu_pad_wrapper_sm100",
+    ),
     "grouped_gemm": (".gemm.cutedsl.grouped", None),
     "GroupedGemmSm100": (".gemm.cutedsl.grouped", "GroupedGemmSm100"),
     "grouped_gemm_wrapper_sm100": (
@@ -582,7 +638,6 @@ _LAZY_OPTIONAL_IMPORTS = {
         ".gemm.cutedsl.grouped",
         "grouped_gemm_wgrad_wrapper_sm100",
     ),
-    "wgrad_expert_ptrs": (".gemm.cutedsl.grouped.wgrad", "wgrad_expert_ptrs"),
     "discrete_grouped_gemm": (".gemm.cutedsl.discrete_grouped", None),
     "DiscreteGroupedGemmSwigluSm100": (
         ".gemm.cutedsl.discrete_grouped",

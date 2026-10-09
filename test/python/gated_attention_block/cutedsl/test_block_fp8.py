@@ -240,10 +240,22 @@ def test_quantspec_with_bf16_h_is_refused():
         GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, geom, quant=_SPEC)
 
 
-def test_fp8_declines_training():
-    """FP8 is inference-only (no q_pre/k_pre/pre-gate O contract under quantization)."""
-    with pytest.raises(NotImplementedError, match="inference-only"):
-        _decl_block(quant=_SPEC, save_for_backward=True, inplace_qkv=False)
+def test_fp8_unfused_trains_and_the_fused_fork_stays_declined():
+    """INVERTED from ``test_fp8_declines_training`` (2026-10-01): the UNFUSED FP8 pipeline accepts ``save_for_backward`` --
+    the same 7-stage list, with compact bf16 Q/K reserved so norm+RoPE runs OUT of place and the slab keeps the record's
+    PRE-norm bands (``test_block_training_forward.py`` pins the routing and the record).  The fully fused fork writes no
+    slab and no pre-gate O: its knobs' own training guards fire, typed, naming the knob; a single knob stays the
+    both-or-neither decline."""
+    blk = _decl_block(quant=_SPEC, save_for_backward=True, inplace_qkv=False)
+    assert blk.save_for_backward and blk.return_lse and not blk.inplace_qkv and not blk.fp8_fused
+    assert [s.name for s in blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "quantize_q", "quantize_kv", "sdpa", "sigmoid_gate", "out_proj"]
+    assert blk._norm_rope.want_rstd is True
+    lay = blk._layout()
+    assert lay.q >= 0 and lay.k >= 0 and lay.v == -1 and lay.proj == -1 and lay.o == -1 and lay.o_gated >= 0 and lay.q8 >= 0 and lay.o8 >= 0
+    with pytest.raises(ValueError, match="incompatible with save_for_backward"):
+        _decl_block(quant=_SPEC, save_for_backward=True, **_FUSED)
+    with pytest.raises(NotImplementedError, match="fuse_norm_rope"):
+        _decl_block(quant=_SPEC, save_for_backward=True, fuse_gate=True)
 
 
 def test_fp8_accepts_both_fusions():

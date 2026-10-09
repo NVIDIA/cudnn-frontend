@@ -124,9 +124,24 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
                          sf_q_ref, sf_q_t_ref, sf_k_ref, sf_k_t_ref, sf_v_ref, sf_dO_ref, sf_dO_t_ref,
                          torch_itype=torch.float8_e4m3fn, torch_otype=torch.bfloat16,
                          left_bound=None, right_bound=None, diag_align=None, sink_token=None,
-                         stats=None, quantize_ds=True):
+                         stats=None, quantize_ds=True, padding=None, delta=None):
     """
     Compute backward pass reference for MXFP8 SDPA.
+
+    ``delta`` (appended LAST, default None = the row-sum of the bf16 ``o_f16`` / ``dO_f16`` ports computed
+    here, byte-identical to the behaviour before the hook existed): an fp32 ``[b, h_q, s_q]`` (or
+    ``[b, h_q, s_q, 1]``) tensor replaces that row-sum -- the SAME delta a kernel consumed when a producer
+    handed it one (``external_delta``), so the reference composes the kernel's conditions instead of
+    recomputing them (sdpa-invariants, section 8).  The MXFP8 row's own pre-pass is exactly this row-sum
+    of the bf16 ports, so a producer forming it in that order hands over a tensor bitwise the default.
+
+    ``padding`` (appended, default None = dense) is ``(seq_len_q, seq_len_kv)`` per batch entry,
+    the ``fp8_ref.compute_ref_backward`` spelling: keys at or past ``seq_len_kv[b]`` and query
+    rows at or past ``seq_len_q[b]`` are masked, and a bottom-right diagonal is anchored per
+    batch entry at ``seq_len_kv[b] - seq_len_q[b]`` (what a kernel reading per-batch kv lengths
+    does).  Composing the lengths INSIDE the reference keeps every 1x32 block of the quantized
+    operands intact; slicing the operands per batch entry would re-block the columnwise scale
+    factors and no longer be the kernel's quantization.
 
     If sink_token is provided, the virtual sink is included in softmax normalization
     and dSink_token is computed: dS_sink = -p_sink * D (no attn_scale), then summed
@@ -171,7 +186,7 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
     # Dequantize for dS^T @ Q_T -> dK: S-scale for Q_T
     q_t_dq = _dequant(q_t_fp8, sf_q_t_ref)
 
-    mask = _ScoreMask(b, h_q, s_q, s_kv, bias=None, block_mask=None, is_alibi=False, padding=None,
+    mask = _ScoreMask(b, h_q, s_q, s_kv, bias=None, block_mask=None, is_alibi=False, padding=padding,
                       diag_align=diag_align, left_bound=left_bound, right_bound=right_bound, device=device)
     sink = sink_token.float().reshape(1, h_q, 1, 1).expand(b, h_q, s_q, 1) if sink_token is not None else None
 
@@ -187,8 +202,13 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
             m_old = m_new
         lse = m_old + torch.log(l_old)
 
-    # Use BF16 inputs for D
-    D = (o_f16.float() * dO_f16.float()).reshape(b, h_q, s_q, d_vo).sum(dim=-1, keepdim=True)
+    # Use BF16 inputs for D -- or the caller's delta (the kernel's, under an external delta)
+    if delta is None:
+        D = (o_f16.float() * dO_f16.float()).reshape(b, h_q, s_q, d_vo).sum(dim=-1, keepdim=True)
+    else:
+        if delta.numel() != b * h_q * s_q:
+            raise ValueError(f"delta must hold b*h_q*s_q = {b}*{h_q}*{s_q} values ([b, h_q, s_q] or [b, h_q, s_q, 1]); got shape {tuple(delta.shape)}")
+        D = delta.float().reshape(b, h_q, s_q, 1).to(device)
 
     from .mxfp8 import quantize_to_mxfp8
     _log2e = math.log2(math.e)
@@ -217,6 +237,8 @@ def compute_ref_backward(q_fp8, q_t_fp8, k_fp8, k_t_fp8, v_fp8, o_f16, dO_f16, d
         else:
             p = torch.exp(s_raw * attn_scale - lse).nan_to_num().float()
 
+        if mask.q_row_mask is not None:
+            p = p.masked_fill(mask.q_row_mask, 0.0)
         p_fp8 = (p * 256.0).to(torch_itype).float() * (1.0 / 256.0)
 
         # dO @ V -> dP

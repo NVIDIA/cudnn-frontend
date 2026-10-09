@@ -56,7 +56,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
 from cutlass.base_dsl.typing import Pointer
 import cuda.bindings.driver as _cuda_driver
 
@@ -67,6 +67,10 @@ from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d512
 # the all-defaults config, which is FP16 — not a dtype this file serves — so the
 # standalone default pins E4M3 in / E4M3 out.  The loader always overrides it.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(dtype_qkv=0, dtype_o=0))
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d512_fp8_sm100: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d512_f16, sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
+    )
 CFG, _TMA = make_cfg_d512(PARAMS)
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
@@ -614,7 +618,7 @@ def _kernel(
     _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = _scale_or_one(scale_o_t)
-    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
     o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     sg_id = cta_id_x // cutlass.Int32(CFG.CTA_MMA)
@@ -736,6 +740,8 @@ def _kernel(
                 cta_in_pair=cta_in_pair,
                 leader_cta_id=leader_cta_id,
                 qh_per_kh=qh_per_kh,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
         else:
             _mma_warp_non_leader(
@@ -1477,16 +1483,14 @@ def _compute_warp_group(
                     lse_arr = cutlass.make_array_view(lse_tensor)
                     if cutlass.const_expr(len(lse_tensor.shape) == 2):
                         # token-major packed (T, H)
-                        lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                        lse_row[head_idx] = lse
+                        lse_arr[_cu_q_b + q_row_global, head_idx] = lse
                     else:
                         # head-major packed (1, QH, head_stride)
                         if cutlass.const_expr(len(lse_tensor.shape) == 4):
                             # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                             lse_arr[batch_idx, head_idx, q_row_global, 0] = lse
                         else:
-                            lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                            lse_row[_cu_q_b + q_row_global] = lse
+                            lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if _row_valid:
                     lse_arr = cutlass.make_array_view(lse_tensor)
@@ -1571,6 +1575,8 @@ def _mma_warp_group(
     cta_in_pair,
     leader_cta_id,
     qh_per_kh,
+    descale_q_t,
+    descale_k_t,
 ):
     tmem_alloc(tmem_ptr_i32, LAYOUT.TOTAL_COLS, CTA_GROUP_KIND)
     nvvm.barrier_cta_arrive(1, 32 * (CFG.SOFTMAX_WG_WARPS + 1))
@@ -1592,7 +1598,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=_BMM1_K_DIM,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
         a_dtype=STORAGE_DTYPE,

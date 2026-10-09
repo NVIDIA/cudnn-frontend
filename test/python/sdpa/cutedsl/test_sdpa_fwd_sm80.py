@@ -134,6 +134,128 @@ def test_sdpa_fwd_sm80_wrapper(dtype, d_qk, d_v, mask, gqa):
     assert lse.dtype == torch.float32
 
 
+def _run_sm80_fwd(q, k, v, *, scheduler, is_causal=False, causal_bottom_right=False, window=-1, strided_lse=False, seq_kv_lens=None, sinks=None, bias=None):
+    """One SdpaFwdDslSm80 plan + execute into NaN-prefilled O and LSE, so a
+    tile no CTA writes stays NaN instead of passing as stale memory.  Returns
+    the adapter too, for the resolved flavor and LPT_L2 budget."""
+    from cudnn.sdpa.fwd import SdpaFwdDslSm80
+
+    b, h_q, s_q, _ = q.shape
+    o = torch.full((b, s_q, h_q, v.shape[-1]), float("nan"), dtype=q.dtype, device=q.device).permute(0, 2, 1, 3)
+    if strided_lse:
+        # One unused float after every row: exercises the stride-aware LSE store.
+        lse = torch.full((2 * b * h_q * s_q,), float("nan"), dtype=torch.float32, device=q.device).as_strided((b, h_q, s_q), (2 * h_q * s_q, 2 * s_q, 2))
+    else:
+        lse = torch.full((b, h_q, s_q), float("nan"), dtype=torch.float32, device=q.device)
+    api = SdpaFwdDslSm80(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=is_causal,
+        causal_bottom_right=causal_bottom_right,
+        window_size_left=(window if window >= 0 else None),
+        window_size_right=(0 if window >= 0 else None),
+        scale_softmax=1.0 / math.sqrt(q.shape[-1]),
+        seq_kv_lens_present=seq_kv_lens is not None,
+        has_sink=sinks is not None,
+        scheduler=scheduler,
+        bias_present=bias is not None,
+    )
+    api.check_support()
+    api.compile()
+    # Both twins must reach the kernel through the native pointer launch
+    # (prepared_sm80.native_layouts), not the staged-copy plan.
+    assert api._sm80_spec is not None, "expected the native prepared SM80 launch, got the staged-copy plan"
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sinks=sinks, seq_kv_lens=seq_kv_lens, bias_tensor=bias)
+    torch.cuda.synchronize()
+    return o, lse, api
+
+
+# LPT_L2 short last block (S from _L2_SHORT_LAST_BLOCK_S): 3 KV groups, 2 per
+# block, so the last block holds 1.
+_L2_SHORT_LAST_BLOCK_CASE = ("l2_short_last_block", 1, 12, 3, None, None, {"is_causal": True})
+
+# (id, b, h_q, h_kv, s_q, s_kv, features).  G = 4 with h_kv >= 2 wherever
+# possible: MQA maps every Q head to KV head 0, so it cannot catch a wrong
+# head mapping on its own.
+_GQA_BITWISE_CASES = [
+    ("sq1", 2, 8, 2, 1, 1024, {}),
+    ("causal_tl_sq2", 2, 8, 2, 2, 1024, {"is_causal": True}),
+    ("causal_br_sq256", 2, 8, 2, 256, 1024, {"is_causal": True, "causal_bottom_right": True}),
+    ("causal_sq1024", 2, 8, 2, 1024, 1024, {"is_causal": True}),
+    ("mqa_causal", 2, 8, 1, 1024, 1024, {"is_causal": True}),
+    ("swa", 2, 8, 2, 1024, 1024, {"is_causal": True, "window": 128}),
+    ("padded_kv", 2, 8, 2, 256, 1024, {"seq_kv_lens": (1024, 700)}),
+    ("sink", 2, 8, 2, 1024, 1024, {"is_causal": True, "sink": True}),
+    ("bias", 2, 8, 2, 256, 1024, {"bias": True}),
+    ("strided_lse", 2, 8, 2, 1024, 1024, {"is_causal": True, "strided_lse": True}),
+    _L2_SHORT_LAST_BLOCK_CASE,
+]
+
+# SKV at which one K+V group (SKV * 2 * d * 2 bytes) is half the flavor's
+# causal L2 budget: llama 16 MiB at d=128, qwen 8 MiB at d=256.
+_L2_SHORT_LAST_BLOCK_S = {128: 16384, 256: 4096}
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("scheduler", ["natural", "lpt", "lpt_l2"])
+@pytest.mark.parametrize("case", _GQA_BITWISE_CASES, ids=[c[0] for c in _GQA_BITWISE_CASES])
+@torch_fork_set_rng(seed=0)
+def test_sdpa_fwd_sm80_native_gqa_matches_expanded_bitwise(case, scheduler, d):
+    """Native dense GQA (K/V bound at H_kv heads; the kernel maps Q head h to
+    KV head h // (H_q // H_kv)) must be BITWISE equal to the same inputs with
+    K/V pre-expanded to H_q heads and run as MHA.  Both twins load the same
+    template module; H_kv only enters the tile decode and the K/V head
+    offset, so every tile runs the same MMA/softmax sequence and only which
+    CTA serves which tile changes.  Every scheduler is pinned, since LPT_L2
+    packs H_q // H_kv Q heads into each (batch, KV head) group; d=128 and
+    d=256 cover both kernel files (prefill_f16 / prefill_d256_f16)."""
+    name, b, h_q, h_kv, s_q, s_kv, feat = case
+    if s_q is None:
+        s_q = s_kv = _L2_SHORT_LAST_BLOCK_S[d]
+    rep = h_q // h_kv
+    dev = "cuda"
+    q = _bshd_randn(b, h_q, s_q, d, dtype=torch.float16, device=dev)
+    k = _bshd_randn(b, h_kv, s_kv, d, dtype=torch.float16, device=dev)
+    v = _bshd_randn(b, h_kv, s_kv, d, dtype=torch.float16, device=dev)
+    # The MHA twin, same BSHD-physical layout: its head j is KV head j // rep.
+    k_mha = k.transpose(1, 2).repeat_interleave(rep, dim=2).transpose(1, 2)
+    v_mha = v.transpose(1, 2).repeat_interleave(rep, dim=2).transpose(1, 2)
+    kw = dict(
+        is_causal=feat.get("is_causal", False),
+        causal_bottom_right=feat.get("causal_bottom_right", False),
+        window=feat.get("window", -1),
+        strided_lse=feat.get("strided_lse", False),
+        seq_kv_lens=(torch.tensor(feat["seq_kv_lens"], dtype=torch.int32, device=dev) if "seq_kv_lens" in feat else None),
+        sinks=(torch.randn(h_q, dtype=torch.float32, device=dev) if feat.get("sink") else None),
+        bias=(torch.randn(1, h_q, s_q, s_kv, dtype=torch.float16, device=dev) if feat.get("bias") else None),
+    )
+    o_gqa, lse_gqa, api = _run_sm80_fwd(q, k, v, scheduler=scheduler, **kw)
+    o_mha, lse_mha, _ = _run_sm80_fwd(q, k_mha, v_mha, scheduler=scheduler, **kw)
+
+    if name == _L2_SHORT_LAST_BLOCK_CASE[0] and scheduler == "lpt_l2":
+        # Pin the premise with the kernel's own LPT_L2 sizing: K+V bytes per
+        # (batch, KV head) group at the flavor width against the plan's budget.
+        per_group = s_kv * (api.flavor_d_qk + api.flavor_d_v) * 2
+        per_block = (api.sched_l2_mib << 20) // per_group
+        assert (per_block, (b * h_kv) % per_block) == (2, 1), f"{b * h_kv} KV groups at {per_block} per block no longer leave a short last block"
+    assert not torch.isnan(o_gqa).any() and not torch.isnan(lse_gqa).any(), "native GQA left O/LSE entries unwritten"
+    assert torch.equal(o_gqa, o_mha), f"O differs from the pre-expanded MHA run (max |diff| {(o_gqa.float() - o_mha.float()).abs().max().item()})"
+    assert torch.equal(lse_gqa, lse_mha), f"LSE differs from the pre-expanded MHA run (max |diff| {(lse_gqa - lse_mha).abs().max().item()})"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+def test_sdpa_fwd_sm80_native_gqa_lpt_l2_short_last_block(d):
+    """L0 slice of the bitwise sweep above: the LPT_L2 decode's short last
+    block under GQA, on both kernel files.  The L0 GQA cases elsewhere fit
+    every KV group in one block, so none reaches that branch."""
+    test_sdpa_fwd_sm80_native_gqa_matches_expanded_bitwise(_L2_SHORT_LAST_BLOCK_CASE, "lpt_l2", d)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("d", [64, 256], ids=["generic-kernel", "d256-kernel"])
 @pytest.mark.parametrize("s_q", [128, 100], ids=["tile-aligned", "unaligned"])
@@ -192,30 +314,6 @@ def test_sdpa_fwd_sm80_check_support_rejections():
     api = SdpaFwdDslSm80(sample_q=q64, sample_k=q64, sample_v=q64, sample_o=q64, sample_lse=lse64)
     with pytest.raises(ValueError, match="dtype"):
         api.check_support()
-
-
-@pytest.mark.L0
-@pytest.mark.no_workspace_shim
-@torch_fork_set_rng(seed=0)
-def test_sdpa_fwd_sm80_gqa_staging_requires_a_workspace():
-    """R2: the GQA head expansion stages K/V in the caller's workspace; a direct
-    adapter caller that passes none gets the contract error, never a hidden
-    allocation (``sdpa_fwd_wrapper_sm80`` allocates ``scratch_workspace_bytes()``
-    per call and passes it)."""
-    from cudnn.sdpa.fwd import SdpaFwdDslSm80
-
-    b, h_q, h_kv, s, d = 1, 8, 2, 128, 128
-    q = _bshd_randn(b, h_q, s, d, dtype=torch.float16, device="cuda")
-    k = _bshd_randn(b, h_kv, s, d, dtype=torch.float16, device="cuda")
-    v = _bshd_randn(b, h_kv, s, d, dtype=torch.float16, device="cuda")
-    o = torch.empty((b, s, h_q, d), dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
-    lse = torch.empty((b, h_q, s), dtype=torch.float32, device="cuda")
-    api = SdpaFwdDslSm80(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse)
-    assert api.check_support()
-    api.compile()
-    assert api.scratch_workspace_bytes() > 0
-    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
 
 
 @pytest.mark.L1

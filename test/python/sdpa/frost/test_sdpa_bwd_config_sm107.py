@@ -205,9 +205,9 @@ def test_template_params_extend_append_only():
     base = [f.name for f in dataclasses.fields(BaseTemplateParams)]
     ours = [f.name for f in dataclasses.fields(TemplateParams)]
     assert ours[: len(base)] == base
-    assert ours[len(base) :] == ["dtype_o", "dtype_ds", "has_sink", "scaled_fp8_pack", "mask_q_pad", "ds_sf_policy"]
+    assert ours[len(base) :] == ["dtype_o", "dtype_ds", "has_sink", "scaled_fp8_pack", "mask_q_pad", "ds_sf_policy", "datapath_2x2_profile"]
     defaults = {f.name: f.default for f in dataclasses.fields(TemplateParams)}
-    assert (defaults["scaled_fp8_pack"], defaults["mask_q_pad"], defaults["ds_sf_policy"]) == (False, False, -1)
+    assert (defaults["scaled_fp8_pack"], defaults["mask_q_pad"], defaults["ds_sf_policy"], defaults["datapath_2x2_profile"]) == (False, False, -1, 0)
 
 
 @pytest.mark.parametrize("family", _FAMILIES)
@@ -260,7 +260,8 @@ def test_accepts_every_scheduler_policy_and_has_sink(family, policy):
         (FAMILY_F16, dict(window_right=64), r"window_right must be 0 when set.*Right-band widening"),
         (FAMILY_FP8, dict(bottom_right=True), r"bottom_right alignment requires a causal band"),
         (FAMILY_F16, dict(seq_q_lens_present=True, seq_kv_lens_present=True), r"seq_q_lens_present is not implemented"),
-        (FAMILY_FP8, dict(thd_varlen=True), r"thd_varlen is not implemented"),
+        (FAMILY_FP8, dict(thd_varlen=True, seq_kv_lens_present=True), r"thd_varlen is mutually exclusive with seq_kv_lens_present"),
+        (FAMILY_FP8, dict(thd_varlen=True, sched_policy=1), r"thd_varlen requires sched_policy NATURAL"),
         (FAMILY_F16, dict(sched_policy=3), r"sched_policy must be one of NATURAL/LPT/LPT_L2"),
         # the MXFP8 record: E4M3 payloads, half gradients, a policy-consistent dS dtype
         (FAMILY_MXFP8, dict(dtype_qkv=DTYPE_E5M2), r"MXFP8 body takes E4M3 payloads.*E5M2 payloads are not implemented"),
@@ -291,7 +292,8 @@ def test_accepts_every_scheduler_policy_and_has_sink(family, policy):
         (FAMILY_MXFP8, dict(window_right=64), r"window_right must be 0 when set.*Right-band widening"),
         (FAMILY_MXFP8, dict(bottom_right=True), r"bottom_right alignment requires a causal band"),
         (FAMILY_MXFP8, dict(seq_q_lens_present=True, seq_kv_lens_present=True), r"seq_q_lens_present is not implemented"),
-        (FAMILY_MXFP8, dict(thd_varlen=True), r"thd_varlen is not implemented"),
+        (FAMILY_MXFP8, dict(thd_varlen=True, seq_kv_lens_present=True), r"thd_varlen is mutually exclusive with seq_kv_lens_present"),
+        (FAMILY_MXFP8, dict(thd_varlen=True, sched_policy=1), r"thd_varlen requires sched_policy NATURAL"),
         (FAMILY_MXFP8, dict(sched_policy=3), r"sched_policy must be one of NATURAL/LPT/LPT_L2"),
         # the MXFP8-only record fields are rejected, not ignored, on the other two bodies
         (FAMILY_FP8, dict(ds_sf_policy=DS_SF_P_A), r"ds_sf_policy is the MXFP8 family's.*write no dS scale factors"),
@@ -305,6 +307,18 @@ def test_accepts_every_scheduler_policy_and_has_sink(family, policy):
 def test_rejects_a_record_the_body_cannot_express(family, params, match):
     with pytest.raises(ValueError, match=match):
         _cfg(family, **params)
+
+
+@pytest.mark.parametrize("family", (FAMILY_FP8, FAMILY_MXFP8))
+def test_admits_thd_varlen_on_the_quantized_families(family):
+    """The THD record is admitted on the fp8 and MXFP8 bodies (inverted from the ``thd_varlen is not implemented`` rejects the two
+    families used to carry): ``THD_VARLEN`` set, the padded mask by construction, the lengths from the metadata buffer -- and the
+    family-neutral predicates still fire (mutual exclusion with the dense length flags, NATURAL scheduling: the reject table)."""
+    cfg = _cfg(family, thd_varlen=True)
+    assert cfg.THD_VARLEN == 1 and cfg.SEQ_KV_LENS_PRESENT == 0
+    assert cfg.MASK_FLAGS & MASK_PADDED, "THD is padded by construction (per-sequence kv tails and q pad columns take the per-cell mask)"
+    assert cfg.SCHEDULER_POLICY == SCHED_NATURAL
+    assert _cfg(family).THD_VARLEN == 0, "the dense record is untouched"
 
 
 def test_rejects_an_unknown_family():
@@ -360,7 +374,7 @@ _SHARED_CFG_REJECTS = [
     # masks
     (dict(CAUSAL_BOTTOM_RIGHT=1), r"bottom-right alignment requires a causal band"),
     (dict(SWA_WINDOW=64), r"MASK_SWA <=> SWA_WINDOW > 0"),
-    (dict(SEQ_KV_LENS_PRESENT=1), r"MASK_PADDED <=> SEQ_KV_LENS_PRESENT.*attends the whole pad"),
+    (dict(SEQ_KV_LENS_PRESENT=1), r"MASK_PADDED <=> \(SEQ_KV_LENS_PRESENT or THD_VARLEN\).*attends the whole pad"),
     (dict(SCHEDULER_POLICY=5), r"SCHEDULER_POLICY must be 0/1/2"),
 ]
 

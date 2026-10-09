@@ -38,7 +38,7 @@ def _case(d=96, dv=96, dtype=torch.bfloat16, pad=1, features=False, batch=2):
         bias_fp32=features,
     )
     assert api.check_support()
-    return api, SimpleNamespace(bufs=tensors, features=features, causal=False)
+    return api, SimpleNamespace(bufs=tensors, features=features, causal=False, scale=d**-0.5)
 
 
 def _execute(api, case, workspace, stream=None):
@@ -62,6 +62,7 @@ def test_prepared_copy_avoids_torch_staging_and_replays(d, dv, pad, dtype, featu
     api, case = _case(d, dv, dtype, pad, features)
     required = api.scratch_workspace_bytes()
     api.compile()
+    assert api._sm80_copy_spec.core.native is not None
     workspace = torch.empty(required, device="cuda", dtype=torch.uint8)
     _execute(api, case, workspace)
     _check(case)
@@ -240,7 +241,6 @@ def test_prepared_copies_follow_current_or_explicit_stream(explicit, monkeypatch
     _check(case)
 
 
-@pytest.mark.no_workspace_shim
 @pytest.mark.parametrize("bad", ["missing", "short", "unaligned", "noncontiguous", "alias_q", "alias_stats"])
 def test_workspace_rejected_before_copy(bad, monkeypatch):
     from cudnn.sdpa.fwd import prepared_staged_sm80

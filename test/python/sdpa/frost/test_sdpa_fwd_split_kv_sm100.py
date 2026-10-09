@@ -372,6 +372,18 @@ def test_split_kv_and_cta_mma_flavor_gating():
         else:
             with pytest.raises(ValueError, match="cta_mma is not selectable"):
                 f(TemplateParams(cta_mma=1))
+    # The d512 2x2-datapath record (TemplateParams.mma_2x2): make_cfg_d512 dispatches on the field -- the default
+    # record keeps the role-split CfgD512; mma_2x2=True builds the CfgD512X2 and still honours split_kv (the fp32-partials
+    # arm is in the kernel body; the ADAPTER twin keeps split plans on the role split in phase 1 -- see
+    # test_sdpa_fwd_d512_2x2_sm100.test_twin_declines_split_and_g128).
+    from cudnn.sdpa.fwd.config_sm100 import CfgD512, CfgD512X2
+
+    assert isinstance(make_cfg_d512(TemplateParams())[0], CfgD512) and not isinstance(make_cfg_d512(TemplateParams())[0], CfgD512X2)
+    cfg_2x2 = make_cfg_d512(TemplateParams(mma_2x2=True))[0]
+    assert isinstance(cfg_2x2, CfgD512X2) and cfg_2x2.SPLIT_KV == 1 and cfg_2x2.TILE_M == 64
+    assert make_cfg_d512(TemplateParams(mma_2x2=True, split_kv=4))[0].SPLIT_KV == 4
+    with pytest.raises(ValueError, match="cta_mma is not selectable"):
+        make_cfg_d512(TemplateParams(mma_2x2=True, cta_mma=1))
 
 
 # --- empty-split coverage across every f16 flavor -------------------------
@@ -1217,36 +1229,16 @@ def test_api_does_not_split_a_full_chip():
 
 
 @pytest.mark.L0
-def test_api_split_carves_the_partials_from_the_workspace():
-    """The split-major partials live in the caller's workspace (R2), and the
-    recombined answer matches fp32."""
-    result = _api_case(1, 8, 1, 512, 16384, workspace=True, split_kv=2)
-    assert result.split == 2 and result.workspace_bytes > 0
-    assert (result.output - result.reference).abs().max().item() <= 2e-2
-
-
-@pytest.mark.L0
-def test_api_split_native_layout_carves_from_the_workspace():
+@pytest.mark.parametrize("workspace", [True, False], ids=["carved", "standalone"])
+def test_api_split_with_and_without_workspace(workspace):
+    """Direct split calls require scratch; allocation belongs to the caller."""
+    if not workspace:
+        with pytest.raises(ValueError, match="workspace"):
+            _api_case(1, 8, 1, 512, 16384, workspace=False, native=True)
+        return
     result = _api_case(1, 8, 1, 512, 16384, workspace=True, native=True)
-    assert result.split > 1 and result.workspace_bytes > 0
-
-
-@pytest.mark.L0
-@pytest.mark.no_workspace_shim
-def test_api_split_native_layout_requires_a_workspace():
-    """Native layouts keep no standalone split-scratch fallback either (R2)."""
-    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace but execute\(\) received none"):
-        _api_case(1, 8, 1, 512, 16384, workspace=False, native=True)
-
-
-@pytest.mark.L0
-@pytest.mark.no_workspace_shim
-def test_api_split_requires_a_workspace():
-    """A direct caller that passes no workspace gets the R2 contract error --
-    the adapter never allocates the partials itself (the suite's autouse shim
-    is off here)."""
-    with pytest.raises(ValueError, match=r"requires (a \d+-byte|contiguous) workspace"):
-        _api_case(1, 8, 1, 512, 16384, workspace=False, split_kv=2)
+    assert result.split > 1
+    assert (result.output - result.reference).abs().max().item() <= 2e-2
 
 
 @pytest.mark.L0

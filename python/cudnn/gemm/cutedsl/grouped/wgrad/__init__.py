@@ -5,7 +5,6 @@ from .api import (
     GroupedGemmWgradSm100,
     get_grouped_gemm_wgrad_workspace_size_sm100,
     grouped_gemm_wgrad_wrapper_sm100,
-    wgrad_expert_ptrs,
 )
 
 __all__ = [
@@ -13,7 +12,6 @@ __all__ = [
     "get_grouped_gemm_wgrad_workspace_size_sm100",
     "grouped_gemm_wgrad_wrapper_sm100",
     "grouped_gemm_wgrad_jax_sm100",
-    "wgrad_expert_ptrs",
 ]
 
 

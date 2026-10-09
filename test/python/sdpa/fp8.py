@@ -29,6 +29,7 @@ from .helpers import (
     note_frost_routing,
 )
 from .random_config import packed_token_capacity
+from .fp16 import _apply_plan_pin
 
 # fmt: off
 
@@ -103,7 +104,7 @@ def block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale):
     return (b, h_q, rows, cols)
 
 
-def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO, max_total_seq_len_q=None, max_total_seq_len_kv=None, o_block_scale=0):
+def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=False, generate_stats=True, left_bound=None, right_bound=None, diag_align=None, with_sink_token=False, is_cu_seq_len=False, with_ragged_offset_multiplier=False, implementation=cudnn.attention_implementation.AUTO, max_total_seq_len_q=None, max_total_seq_len_kv=None, o_block_scale=0, softmax_precision=None):
     graph_fwd = cudnn.pygraph(io_data_type=cudnn_itype, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
 
     use_padding_mask = None
@@ -190,6 +191,10 @@ def generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d
     # Only pass diagonal_alignment if it's not None (pybind11 doesn't accept None for enum types)
     if diag_align is not None:
         sdpa_kwargs['diagonal_alignment'] = diag_align
+    if softmax_precision is not None:
+        # The cc 10.7 f16x2 exponent arm (sdpa/softmax_knobs.py): a python-only op attribute that
+        # makes the node backend-unlowerable, so it is passed only when SET.
+        sdpa_kwargs['softmax_precision'] = softmax_precision
     if o_block_scale:
         # Block-scaled O: the sf_o output (per-(b,h) planes) rides sdpa_fp8 like
         # rng_dump; FP4 O carries E4M3 scales, E4M3 O carries UE8M0 scales.
@@ -674,6 +679,69 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
     return fits
 
 
+def p_code_step(torch_itype):
+    """One code of the FP8 format P is stored in, relative to the value: 2 mantissa bits (E5M2) = 25 %, 3 (E4M3) = 12.5 %."""
+    return 0.25 if torch_itype == torch.float8_e5m2 else 0.125
+
+
+# The cuDNN backend's quantized forwards (9.26.0.51) write Amax_O = 0 on a non-zero O, or a value above the max |O|
+# they stored, on some dense MXFP8 graphs (fp16 / bf16 O, with and without a sink), and a non-zero Amax_O on a paged
+# FP8 graph whose every query row is dead.  The FROST engines are held to the contract below; a graph
+# the backend served is xfailed on this check only, so the finding stays visible without failing the lane.
+BACKEND_AMAX_O_ISSUE = "cuDNN backend Amax_O (observed 9.26.0.51): 0 on a non-zero O, or above the stored max |O| -- backend finding, FROST engines are held to the contract"
+
+
+def assert_amax_o(amax_o_gpu, o_amax_ref, *, torch_itype, torch_otype, o_gpu=None, saturated=False, tag="Amax_O", known_issue=None):
+    """The graph's ``Amax_O`` output against the reference and against the kernel's own stored O.
+
+    ``Amax_O`` is the max |O| of the normalised attention output before the cast to O's dtype and before any
+    global output scale (the FP8 row's ``scale_o``; the FP4 global scale of a block-scaled O): the value a delayed-
+    scaling recipe feeds the next step's ``scale_o`` from.  Two facts pin it:
+
+    * ``o_amax_ref`` -- the reference's fp32 amax of the same quantity.  The kernel and the reference quantize P
+      independently, so a P value at an FP8 code midpoint can land one code apart; one flipped code on one key moves
+      an O element by at most one code step of that key's weight (<= 1) times |v|, i.e. the largest element by at
+      most one code step of itself: ``|Amax_O - o_amax_ref| <= p_code_step(torch_itype) * o_amax_ref`` (12.5 % E4M3 /
+      25 % E5M2).  Relative, with a 1e-6 absolute floor only: a doubled or zeroed low-amplitude O fails.
+    * ``o_gpu`` -- the kernel's stored O in Amax_O's units (descaled where the graph applied ``scale_o``), dead rows
+      zeroed.  The stored values are the SAME fp32 values the kernel reduced, rounded once to ``torch_otype``: the two
+      agree within half a code spacing of that dtype at the max element.  ``saturated`` (per-tensor FP8: the stored
+      O was clamped at the format's top code, the scale having been built from the reference amax) drops the upper
+      bound only -- the stored O can never exceed the kernel's own amax beyond rounding.
+
+    A never-written output fails the finiteness check (the harnesses prefill the buffer with NaN); an output left at
+    a reset value (0) fails against both facts; an amax taken from the wrong quantity (a partial, a dead row, a pre-
+    normalisation accumulator) fails the stored-O fact even where it happens to stay inside the reference bound.
+
+    ``known_issue``: a reason string for a graph served by an engine with a KNOWN Amax_O defect (``BACKEND_AMAX_O_ISSUE``
+    when ``graph.selected_engine is None``); a failing check then xfails the test with that reason instead of failing
+    it.  A passing check passes as usual, so a fixed engine needs no change here."""
+    try:
+        amax_o = float(amax_o_gpu.detach().float().reshape(-1)[0].item())
+        assert math.isfinite(amax_o) and amax_o >= 0.0, f"{tag}: the graph wrote {amax_o!r} (NaN = never written)"
+        step = p_code_step(torch_itype)
+        tol_ref = step * o_amax_ref + 1e-6
+        print(f"{tag}: gpu={amax_o:.6e} ref(fp32)={o_amax_ref:.6e} diff={abs(amax_o - o_amax_ref):.2e} tol={tol_ref:.2e} (one P code step of the reference amax)")
+        assert abs(amax_o - o_amax_ref) <= tol_ref, (
+            f"{tag}: |{amax_o:.6g} - reference {o_amax_ref:.6g}| = {abs(amax_o - o_amax_ref):.3g} exceeds one P code step of the reference amax ({tol_ref:.3g})"
+        )
+        if o_gpu is not None:
+            max_o = o_gpu.detach().float().abs().max().item()
+            half_spacing = torch.finfo(torch_otype).eps / 2  # half a code spacing of O's dtype, relative, at the max element
+            slack = half_spacing * max(amax_o, max_o) + 1e-6
+            assert max_o <= amax_o + slack, f"{tag}: the stored O reaches {max_o:.6g} but the kernel reported Amax_O = {amax_o:.6g} (beyond {torch_otype} rounding {slack:.2g})"
+            if not saturated:
+                assert amax_o <= max_o + slack, (
+                    f"{tag}: the kernel reported Amax_O = {amax_o:.6g} but its stored O reaches only {max_o:.6g} (beyond {torch_otype} rounding {slack:.2g}): "
+                    f"the amax was not taken from the values that were stored"
+                )
+    except AssertionError as exc:
+        if known_issue is None:
+            raise
+        print(f"%%%% {tag}: {exc}")
+        pytest.xfail(f"{known_issue}: {exc}")
+
+
 def create_paged_container_and_block_table(tensor, block_size, seq_lens=None):
     """Page a dense [B, H, S, D] tensor: container [B*blocks, H, block_size, D] (page p of
     batch b at pool index p*B + b) + a row-major (B, 1, blocks, 1) int32 table.
@@ -773,6 +841,14 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
     diag_align = cfg.diag_align if hasattr(cfg, 'diag_align') else None
     with_sink_token = cfg.with_sink_token if hasattr(cfg, 'with_sink_token') else False
     rescale_threshold = cfg.rescale_threshold if hasattr(cfg, 'rescale_threshold') and cfg.rescale_threshold is not None else 4.0
+    # Softmax levers (sdpa/softmax_knobs.py): the f16x2 exponent arm rides sdpa_fp8 as a python-only
+    # op attribute.  The pre-folded scale is declined on per-tensor FP8 by contract -- the kernel folds
+    # descale_q * descale_k into its softmax scale -- so the served-domain mirror never draws it here.
+    softmax_precision = getattr(cfg, 'softmax_precision', None)
+    assert not getattr(cfg, 'attn_scale_prefolded', False), "attn_scale_prefolded is not served on per-tensor FP8 (descale contract): the served-domain mirror must not draw it"
+    # Forward Stats: always with the backward (it consumes them); an inference forward omits them on
+    # an explicit cfg.fwd_stats=False (the stats-less kernel specialization).
+    generate_stats = bool(cfg.is_train or getattr(cfg, 'fwd_stats', None) is not False)
 
     attn_scale = 0.125
 
@@ -809,13 +885,14 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
 
     # Build forward graph (always needed)
     try:
-        graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
+        graph_fwd = generate_graph_fwd(cudnn_itype, cudnn_otype, b, h_q, h_k, h_v, s_qo, s_kv, d_qk, d_vo, attn_scale, block_size, is_ragged=is_ragged, generate_stats=generate_stats, left_bound=left_bound, right_bound=right_bound, diag_align=diag_align, with_sink_token=with_sink_token, is_cu_seq_len=is_cu_seq_len, with_ragged_offset_multiplier=with_ragged_offset_multiplier, implementation=cfg.implementation,
                                        max_total_seq_len_q=max_t_q if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
                                        max_total_seq_len_kv=max_t_kv if (is_ragged and getattr(cfg, "declare_total_seq_len", False)) else None,
-                                       o_block_scale=o_block_scale)
+                                       o_block_scale=o_block_scale, softmax_precision=softmax_precision)
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        _apply_plan_pin(graph_fwd, cfg)  # ExecConfig.plan_pin (shared with the f16 harness): an explicit backend / FROST knob-set selection, strict
         graph_fwd.check_support()
         graph_fwd.build_plans()
         note_frost_routing(graph_fwd, label="fp8-fwd")
@@ -949,6 +1026,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         int(GraphFwdUid.stats): stats_gpu,
         int(GraphFwdUid.o_amax): o_amax_gpu,
     }
+    if not generate_stats:
+        del variant_pack[int(GraphFwdUid.stats)]  # the stats-less forward declares no Stats output
 
     if not is_ragged:
         # Allocations/reference use BSHD; graph declarations use BHSD. Bind
@@ -976,7 +1055,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         variant_pack[int(GraphFwdUid.k_ragged_offset)] = k_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.v_ragged_offset)] = v_ragged_offset_gpu
         variant_pack[int(GraphFwdUid.o_ragged_offset)] = o_ragged_offset_gpu
-        variant_pack[int(GraphFwdUid.stats_ragged_offset)] = stats_ragged_offset_gpu
+        if generate_stats:
+            variant_pack[int(GraphFwdUid.stats_ragged_offset)] = stats_ragged_offset_gpu
 
     if with_sink_token:
         variant_pack[int(GraphFwdUid.sink_token)] = sink_token_gpu
@@ -990,6 +1070,8 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         profile_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
     graph_fwd.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
+    # Amax_O on a backend-served graph: a known backend defect xfails that check only (see BACKEND_AMAX_O_ISSUE).
+    amax_known_issue = BACKEND_AMAX_O_ISSUE if getattr(graph_fwd, "selected_engine", None) is None else None
 
     # Compare forward output
     if not perf and o_block_scale:
@@ -1018,6 +1100,9 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         floor = (ref_q - o_ref_scaled).abs().max().item()
         atol = max((0.125 if torch_itype == torch.float8_e5m2 else 0.08) * o_scale_val, 3.0 * floor)
         assert_close_fp8_grad(o_deq, o_ref_scaled, atol, 0.2, tag="O(block-scaled)", keys=s_kv)
+        # Amax_O: the pre-scale amax in O's units (the kernel divides its global scale back out).  The stored O is
+        # block-quantized, so only the reference fact applies.
+        assert_amax_o(o_amax_gpu, o_amax, torch_itype=torch_itype, torch_otype=torch_otype, known_issue=amax_known_issue)
     elif not perf:
         if is_ragged:
             o_ref_comp = convert_uniform_to_packed(torch.einsum("bshd->bhsd", o_ref), seq_len_q_ref, max_t_q)
@@ -1047,6 +1132,11 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         fwd_intermediates = None if is_ragged else (lambda selection: ref_fwd(return_intermediates=selection)[3])
         assert_close_fp8_grad(o_gpu_float, o_ref_float, atol, rtol, tag="O", keys=s_kv, operand=v_gen, flip_unit=s_descale_gpu.item(),
                               intermediates=fwd_intermediates, fp8_dtype=torch_itype, out_dtype=torch_otype)
+        # Amax_O: the pre-scale fp32 amax (compute_ref's o_amax is that same quantity), and the kernel's own stored O
+        # descaled back to those units (dead rows zeroed above).  The scale was built from the reference amax, so a
+        # kernel O above it saturates at the format's top code: that only drops the upper bound of the stored-O fact.
+        saturated = o_gpu.detach().float().abs().max().item() >= torch.finfo(torch_otype).max
+        assert_amax_o(o_amax_gpu, o_amax, torch_itype=torch_itype, torch_otype=torch_otype, o_gpu=o_gpu_float, saturated=saturated, known_issue=amax_known_issue)
 
     # Backward pass
     if not cfg.is_infer:
@@ -1092,6 +1182,14 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
                     # Ragged packs stats differently, so keep softmax there.
                     stats=(None if is_ragged else stats_gpu),
                     return_intermediates=return_intermediates,
+                    # The dS scale pair this harness feeds its graph below (dP_scale_gpu from torch_otype, dP_descale_gpu
+                    # from torch_itype), named so the reference rounds and descales dS exactly where the graph does.  With
+                    # a half output_type the two disagree (scale 1.0, descale 1 / scale_e4m3): graph and reference then
+                    # both carry dQ / dK scaled by 1 / scale_e4m3 from an e4m3 dS rounded at UNIT scale.  Deriving both
+                    # scalars from torch_itype -- the dtype dS is rounded to, the reference's default -- is the pending
+                    # fix for the graph scalars and this mirror TOGETHER; the comparison must not move alone.
+                    dP_scale_dtype=torch_otype,
+                    dP_descale_dtype=torch_itype,
                 )
             dQ_ref, dK_ref, dV_ref, dSink_token_ref, dP_amax, dQ_amax, dK_amax, dV_amax = ref_bwd()
 

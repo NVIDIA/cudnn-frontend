@@ -6,7 +6,7 @@
 
 Supports **JAX arrays** on the BF16 backend in discrete weight mode (swiglu and geglu): `b_ptrs` as a packed little-endian uint8 pointer array (8 bytes per pointer; int64 accepted with jax x64 mode), outputs allocated as n-major C-contiguous `jnp` arrays. Dense `b_tensor` (expert-outermost strides), column-major `bias_tensor`, and the block-scaled backend (MMA-interleaved scale-factor layouts) are not expressible as JAX arrays and raise clear errors. The wrapper is eager, on the CUDA legacy default stream: `block_until_ready` inputs, synchronize before reading outputs; keep weight arrays alive until the kernel completes.
 
-For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_glu_jax_sm100` (built on `cudnn.jax.call`; discrete mode, no bias, `b_major="k"`): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, no manual synchronization needed. `linear_offset` is a compile-time constant (each distinct value compiles a new specialization). The `padded_offsets` values and `b_ptrs` entries follow the device-data contract in the BF16 section, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
+For jitted JAX programs use the `jax.jit`-compatible XLA custom-call entry point `grouped_gemm_glu_jax_sm100` (built on `cudnn.jax.call`; discrete mode, no bias, `b_major="k"`): outputs are fresh XLA-managed arrays with rows at/past `padded_offsets[-1]` zero-filled, no manual synchronization needed. `linear_offset` is a compile-time constant (each distinct value compiles a new specialization). Under tracing the `padded_offsets` *values* cannot be host-validated, and the per-expert weight buffers behind `b_ptrs` must stay alive and unmoved across every execution of the traced computation.
 
 ## Overview
 
@@ -64,16 +64,6 @@ experts, BF16 uses:
 - `C`: `(M, N, 1)`, stride `(N, 1, M*N)`;
 - `D`: `(M, N/2, 1)`, stride `(N/2, 1, M*N/2)`.
 
-`padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
-reads them on device, and neither `check_support()` nor `execute()` copies them to
-the host (a blocking read would serialize the launch stream and is illegal under
-CUDA-graph capture). Malformed values (a decreasing or unaligned offset, a last
-offset outside `(0, M]`, a null or misaligned pointer) are
-undefined behaviour, as for any raw-pointer interface. Set
-`CUDNN_FE_GROUPED_GEMM_VALIDATE_DEVICE_VALUES=1` (read once at import) to turn on
-blocking debug checks of those values at `execute()`; that mode raises
-`RuntimeError` when the launch stream is capturing instead of syncing.
-
 For expert `g`, first compute
 
 $$
@@ -99,12 +89,6 @@ $$
 `C`/`D` may be BF16, FP16, or FP32. `N` is divisible by 64. The pointer-array
 tensor is stream-recorded; every pointed allocation must remain alive and
 unchanged until the launch stream completes.
-
-Class-API `execute()` requires `workspace=`, a caller-owned, contiguous,
-128-byte-aligned device buffer of at least `op.scratch_workspace_bytes()` bytes
-(never 0); the API allocates nothing and the wrapper allocates it per call on the
-launch stream. See the workspace contract in [grouped_gemm.md](grouped_gemm.md).
-`sample_padded_offsets` may be a metadata-only `cudnn.api_base.TensorDesc`.
 
 The wrapper return order is exactly `c_tensor`, `d_tensor`, `d_col_tensor`,
 `amax_tensor`, `sfd_row_tensor`, `sfd_col_tensor`. On BF16,
@@ -308,12 +292,10 @@ op = cudnn.GroupedGemmGluSm100(
 )
 assert op.check_support()
 op.compile()
-workspace = torch.empty(op.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 op.execute(
     a_tensor=a, c_tensor=c, d_tensor=d, sfa_tensor=None,
     padded_offsets=padded_offsets, alpha_tensor=alpha,
     b_tensor=b, sfb_tensor=None, prob_tensor=prob,
-    workspace=workspace,
 )
 ```
 
@@ -433,7 +415,6 @@ api = GroupedGemmGluSm100(
 )
 assert api.check_support()
 api.compile()
-workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_tensor=d,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
@@ -441,7 +422,6 @@ api.execute(
     d_col_tensor=d_col, sfd_row_tensor=sfd_row, sfd_col_tensor=sfd_col,
     amax_tensor=amax, norm_const_tensor=norm_const, prob_tensor=prob,
     current_stream=stream,
-    workspace=workspace,
 )
 ```
 
@@ -468,14 +448,12 @@ api = GroupedGemmGluSm100(
 )
 assert api.check_support()
 api.compile()
-workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=a.device)
 api.execute(
     a_tensor=a, c_tensor=c, d_tensor=d,
     sfa_tensor=sfa, padded_offsets=padded_offsets, alpha_tensor=alpha,
     b_ptrs=b_ptrs, sfb_ptrs=sfb_ptrs,
     d_col_tensor=d_col, prob_tensor=prob,
     current_stream=stream,
-    workspace=workspace,
 )
 ```
 
@@ -532,7 +510,7 @@ Providing both or neither raises `ValueError`.
 - `acc_dtype`: Must be `torch.float32`
 - `mma_tiler_mn`: Kernel tile size `(TILE_M, TILE_N)`. Default: `(256, 256)`
   - `TILE_M ∈ {128, 256}`
-  - `TILE_N = 256`
+  - `TILE_N = 256`; dense block-scaled weights on SM100 also accept `TILE_N = 128`
 - `cluster_shape_mn`: Thread Block cluster shape. Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 - `sf_vec_size`: Scale factor vector size. `{16, 32}`. Default: `16`
 - `vector_f32`: Enable packed f32 operations. Default: `False`
@@ -599,7 +577,7 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 - `N` must be divisible by 64 (two consecutive 32-column blocks for GLU pairing)
 - Expert count must be `<= 1024`
 - Each group's M dimension is aligned to `m_aligned` (256)
-- All supported kernel configurations require `mma_tiler_mn[1] == 256`
+- Bias, discrete weights, and Rubin require `mma_tiler_mn[1] == 256`
 - `use_single_group_runtime_offsets=True` is supported only by the block-scaled
   kernel with exactly one expert. In this mode the kernel derives
   `padded_offsets[0]` from runtime `A.shape[0]` and does not load its value from
@@ -615,3 +593,88 @@ Returns a `TupleDict` (dictionary + tuple unpacking):
 ## Usage Examples
 
 For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_glu.py` (dense mode, unified API) and `test/python/gemm/cutedsl/test_discrete_grouped_gemm_swiglu.py` (discrete mode).
+
+### Natural layouts for block-scaled GLU
+
+The unified GLU wrapper also accepts row-major `A (m, k)`, contiguous
+`B (experts, n, k)`, and contiguous `prob (m,)`. Each operand may independently
+use its natural or legacy representation. BF16-input GLU retains its legacy
+layout contract.
+
+`SFA` and `SFB` may be contiguous buffers of any rank with the exact packed
+element count. These buffers must already contain the MMA-tiled scale bytes
+in physical storage order; ordinary row-major logical scale values are not
+accepted as a substitute.
+
+A two-dimensional `A` selects two-dimensional `C`, `D`, and `D_col` outputs.
+Output scales are contiguous physical buffers with shape
+`(1, ceil(rows / 128), ceil(ceil(cols / sf_vec_size) / 4), 32, 4, 4)`;
+row scales use `(rows, cols) = (m, n / 2)` and column scales swap those dimensions.
+Canonical operands bind directly to their compiled signatures. Kernel-facing
+views are reconstructed at compile time, without per-execution tensor views,
+copies, or repacking. `grouped_gemm_glu_wrapper_sm100.supports_canonical_layouts`
+allows consumers to detect this support without relying on a development version.
+
+### Prepared execution
+
+`prepare_grouped_gemm` compiles an operation once without executing a GEMM.
+It supports dense canonical MXFP8 E4M3 A/B with E8M0 packed scales, nonzero M,
+and n-major outputs. GLU requires BF16/FP16 C and E4M3 D; quant requires
+BF16/FP16 D with `generate_amax=False`.
+
+```python
+from cudnn.gemm.cutedsl.grouped.prepared import prepare_grouped_gemm
+
+kwargs = dict(
+    a_tensor=a, b_tensor=b, sfa_tensor=sfa, sfb_tensor=sfb,
+    padded_offsets=padded_offsets, alpha_tensor=alpha,
+    norm_const_tensor=norm_const, prob_tensor=prob,
+    c_dtype=torch.bfloat16, d_dtype=torch.float8_e4m3fn,
+    sf_vec_size=32, act_func="swiglu", use_dynamic_sched=True,
+)
+plan = prepare_grouped_gemm("glu", **kwargs)
+outputs = plan.run(**kwargs)
+```
+
+Preparation fixes tensor shapes other than the routed row count M, strides,
+dtypes, devices, optional-operand presence, scalar configuration, and
+environment specialization. Each `run` receives the current tensor operands,
+including current routing offsets, and may change M (A, prob, and the SFA
+buffer size); outputs follow the call's M without recompiling. Preparation does
+not retain sample inputs. Tensor values and addresses may change. Prepare
+another plan when other metadata or configuration changes.
+
+Each plan belongs to its preparation CUDA stream. That stream must be current
+during preparation and execution; use separate plans for other streams. Plans
+with the same configuration on one stream share one compiled kernel and its
+workspace. `run(check=True)` validates the contract by default.
+`check=False` skips metadata/configuration checks and the current-PyTorch-stream
+check: the caller must guarantee all those invariants and ordered execution
+on the preparation stream. It does not permit concurrent use of a plan.
+
+With `reuse_row_outputs=True`, GLU retains only `d_tensor` and
+`sfd_row_tensor` as scratch. The next call with the same M overwrites them, so queue all their
+consumers before that call on the same stream, joining other-stream consumers
+first. Retaining a returned dictionary does not preserve those row outputs.
+C, D_col, and SFD_col receive fresh storage on every call for backward consumers.
+Without this option, outputs are fresh. Explicit `outputs={name: tensor}`
+arguments supply caller-owned buffers with matching output metadata and
+caller-managed lifetimes.
+
+### Caller-owned scheduler counter
+
+For dense block-scaled calls with `use_dynamic_sched=True`, optionally pass
+`scheduler_counter_tensor`: a nonempty contiguous one-dimensional CUDA int32
+tensor on A's device. The kernel uses its first element. Initialize that element
+to zero **before every launch**, on the execution stream, and retain the buffer
+until execution completes. Its value after execution is not reusable as an
+initial value. Separate overlapping invocations and GEMMs need distinct counters.
+
+The wrapper and prepared API accept `scheduler_counter_tensor`; the class API
+accepts `sample_scheduler_counter` at construction and
+`scheduler_counter_tensor` at execution, with matching optional presence.
+Omitting it preserves internal initialization. Supplying it bypasses the
+internal counter-initialization launch, allowing existing caller preparation
+work to write the zero. A standalone `counter.zero_()` still adds a launch.
+Detect support with
+`grouped_gemm_glu_wrapper_sm100.supports_external_scheduler_counter`.

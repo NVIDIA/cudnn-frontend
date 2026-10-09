@@ -271,6 +271,30 @@ else:
     )
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
 
+# softmax_scale_prefolded (graph.sdpa attn_scale_prefolded=True -> TemplateParams.softmax_scale_prefolded): the caller
+# multiplied Q by attn_scale * log2(e), so the raw QK^T already sits in the log2 domain and the softmax traces no
+# per-score scale -- the running max is the RAW tile max and the shift is `reg_S - m` (an FADD2 for the FFMA2 of the
+# scaled chain; numerically neutral, the adapter pins scale_softmax_log2 to exactly 1.0 and the kernel ignores the
+# argument).  Everything downstream of the shift -- alpha, the register row-sum, the (ell, max) ship to sg1, the sink
+# fold, the LSE and STATS_LOG2 -- consumes the log2-domain max and is unchanged.  A fully-masked tile leaves the raw
+# max exactly at the finite mask sentinel (== NEG_INF_F32), so is_first re-fires on consecutive keyless tiles
+# (alpha = 0 where the scaled chain runs alpha = 1 between them); both publish P = exp2(0) = 1 there, the first live
+# tile wipes the accumulator with alpha = 0 either way, and a row with no live key at all is overridden by the
+# epilogue's _row_empty geometry select.  The sentinel is never multiplied under the fold, so the scaled-sentinel
+# overflow of the other chain (-FLT_MAX * scale_log2 -> -inf, P = NaN) cannot occur here.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+if SCALE_PREFOLDED and IS_TF32:
+    raise ValueError(
+        "prefill_sdpa_d512_f16 (cc 10.7): softmax_scale_prefolded is wired for the BF16 / FP16 variants only (the TF32 variant applies the scale in-kernel)"
+    )
+# softmax_f16 (softmax_precision=HALF) is a quantized-kernel specialization: this body stores P in the input half
+# format straight off the f32 exponent, so it carries no f16x2 exponent arm and the fused shift + convert never traces.
+# The config backstop declines the knob for half inputs; the import-time check keeps a stale record from tracing the
+# default chain under the request (a silent no-op).
+if PARAMS.softmax_f16:
+    raise ValueError("prefill_sdpa_d512_f16 (cc 10.7): softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization (half inputs run the f32 exponent)")
+_FUSED_SHIFT_CVT = False
+
 
 # ----------------------------------------------------------------------------
 # Derived constants — mirror prefill_sdpa_d512_f16.cu:130-152.
@@ -1110,7 +1134,11 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
-    current_max = current_max_raw * scale_log2
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Raw-domain max: Q carries attn_scale * log2(e) (SCALE_PREFOLDED, module header).
+        current_max = current_max_raw
+    else:
+        current_max = current_max_raw * scale_log2
 
     # All-thread DSMEM arrive on sg0 leader's mb_s_acc_empty (P11) —
     # doubles as the tmem_load_fence cross-warp sync.
@@ -1136,8 +1164,11 @@ def _sg0_softmax_kv_iter(
     )
     alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max; then exp2.
-    reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+    # reg_S = reg_S * scale_log2 - total_max (pre-folded scale: reg_S - total_max); then exp2.
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        reg_S_scaled = reg_S_tile.vec - total_max
+    else:
+        reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
     reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
     reg_P_half_vec = reg_P_fp32.to(P_STORAGE_DTYPE)
     reg_P_half = RegTile(reg_P_half_vec, size=CFG.TILE_N)
@@ -1883,15 +1914,13 @@ def _compute_warp_group(
                         # rank-3 [1, QH, head_stride].  Serving only the rank-3 arm
                         # transposes every LSE on the common path.
                         if cutlass.const_expr(len(lse_tensor.shape) == 2):
-                            lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                            lse_row[head_idx] = lse
+                            lse_arr[_cu_q_b + q_row_global, head_idx] = lse
                         else:
                             if cutlass.const_expr(len(lse_tensor.shape) == 4):
                                 # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
                                 lse_arr[batch_idx, head_idx, q_row_global, 0] = lse
                             else:
-                                lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                                lse_row[_cu_q_b + q_row_global] = lse
+                                lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
                     if q_row_global < seqlen_q:
@@ -2013,6 +2042,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(
@@ -2719,7 +2749,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2964,7 +2994,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),

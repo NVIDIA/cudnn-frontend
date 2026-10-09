@@ -488,6 +488,8 @@ class KernelTemplate:
         """``None`` if this template can compile (chain, config); else the first
         stage's rejection reason. Cheapest-first (short-circuits):
         pipeline/graph-type/mainloop → mma-type×arch → tile-config → other."""
+        if chain.has_moe and chain.moe.mode == "combine" and self.pipeline != "sm100":
+            return "MoE COMBINE is supported only by the SM100 pipeline"
         gt = classify_graph_type(chain)
         return (
             self.arch_active_reject()
@@ -795,6 +797,13 @@ def preferred_strategy(chain: FusionChain, config: TileConfig) -> TileConfig:
     (``CONFIG_sm100_64x32x128_64x32x64_cluster2x4_2ctamma`` ->
     ``plain FP8 mma_tile_k_bytes=64 requires mma_tile_m=128 per CTA``)."""
     pipeline = preferred_pipeline(chain)
+    if config.pipeline == "sm120" and pipeline != "sm120":
+        # sm120 is warp-scoped MMA: its geometries (16x16 warp pairs) have no
+        # cluster-family equivalent, and the sm120 compiler only plans for
+        # sm120 silicon in production. A cross-family preference here can only
+        # mean this module is being driven off-device (unit tests on another
+        # runner), where the conversion is unrepresentable -- keep the family.
+        pipeline = config.pipeline
     k_bytes = preferred_mma_tile_k_bytes(chain)
     if k_bytes == 64 and not chain.has_block_scale and not dense_k64_envelope(config):
         k_bytes = 32

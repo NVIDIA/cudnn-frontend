@@ -20,8 +20,9 @@ from .helpers import (
     note_frost_routing,
 )
 from .mxfp8_ref import compute_ref, compute_ref_backward
-from .fp8 import assert_close_fp8_grad, block_scaled_o_sf_dims
-from cudnn.engines.manifest import opt_in_engines_enabled
+from .fp8 import BACKEND_AMAX_O_ISSUE, assert_amax_o, assert_close_fp8_grad, block_scaled_o_sf_dims, p_code_step
+from .fp16 import _apply_plan_pin
+from .softmax_knobs import LN2, prefold_factor
 
 # Torch-only MXFP8 block quantization + F8_128x4 swizzle (replicates the
 # TransformerEngine MXFP8Quantizer / tex.swizzle_scales_for_gemm_ semantics —
@@ -129,6 +130,22 @@ def compare_amax(actual, expected, rtol=0.02, tag="amax"):
     print(f"amax: gpu={amax_gpu:.6e}, ref={amax_ref:.6e}, diff={amax_diff:.2e}, tol={amax_atol:.2e} for '{tag}'")
     return amax_diff < amax_atol
 
+def assert_o_within_one_p_code_flip(o_cmp, o_ref, atol, rtol, *, v_absmax, torch_itype, tag):
+    """Magnitude cap for the budgeted O compare (assert_close_fp8_grad): its element-count branch admits a few elements
+    with NO bound on their deviation, so cap every element first.  The kernel and the reference quantize P independently
+    and a P*16 at an FP8 code midpoint lands one code apart; one flipped code on one key moves an O element by at most
+    one code step of that key's weight (<= 1) times |v| -- so no element may deviate by more than the elementwise
+    tolerance plus one P code step times max |v|.  Non-finite values fail (NaN compares false)."""
+    step = p_code_step(torch_itype)
+    actual, expected = o_cmp.detach().float(), o_ref.detach().float()
+    diff = (actual - expected).abs()
+    over = ~(diff <= atol + rtol * expected.abs() + step * v_absmax)
+    assert not bool(over.any()), (
+        f"{tag}: {int(over.sum().item())} element(s) beyond one P code flip: max |diff| {diff.max().item():.4f} > "
+        f"{atol} + {rtol} x |ref| + {step} x max|v| {v_absmax:.3g}"
+    )
+
+
 def compute_mxfp8_scale_dims(s, d, block_size=32):
     """
     Compute scale tensor dimensions for MXFP8.
@@ -169,7 +186,12 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
                        with_unfuse_fma=False,
                        implementation=cudnn.attention_implementation.AUTO,
                        o_block_scale=0,
-                       paged_block_size=0):
+                       paged_block_size=0,
+                       softmax_precision=None,
+                       attn_scale_prefolded=False,
+                       generate_stats=True,
+                       bshd=False,
+                       paged_nhd=False):
     # Compute padded dimensions for F8_128x4 scale factors
     s_q_padded = ceil_div(s_qo, 128) * 128
     s_kv_padded = ceil_div(s_kv, 128) * 128
@@ -195,12 +217,14 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
 
     # Q, K, V, O tensors: (b, h, s, d) dims, BSHD-physical strides for the draws only the
     # FROST MXFP8 engine serves (a block-scaled O, whose sf_o output has no backend lowering,
-    # and paged pools -- HND page pools for K/V); BHSD-physical otherwise.
-    bshd = bool(o_block_scale) or is_paged
+    # and paged pools -- HND page pools for K/V, or NHD [num_pages, page, H_kv, D] pools on
+    # ``paged_nhd``: ExecConfig.paged_pool_layout == "nhd") and on request (``bshd``: ExecConfig.bshd_layout,
+    # the sweeps that assert FROST routing); BHSD-physical otherwise.
+    bshd = bool(o_block_scale) or is_paged or bool(bshd)
     q_stride = (s_qo * h_q * d_qk, d_qk, h_q * d_qk, 1) if bshd else (h_q * s_qo * d_qk, s_qo * d_qk, d_qk, 1)
     o_stride = (s_qo * h_q * d_vo, d_vo, h_q * d_vo, 1) if bshd else (h_q * s_qo * d_vo, s_qo * d_vo, d_vo, 1)
-    k_stride = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1) if (bshd and not is_paged) else (h_k * s_kv_rows * d_qk, s_kv_rows * d_qk, d_qk, 1)
-    v_stride = (s_kv * h_v * d_vo, d_vo, h_v * d_vo, 1) if (bshd and not is_paged) else (h_v * s_kv_rows * d_vo, s_kv_rows * d_vo, d_vo, 1)
+    k_stride = (s_kv * h_k * d_qk, d_qk, h_k * d_qk, 1) if (bshd and not is_paged) else ((s_kv_rows * h_k * d_qk, d_qk, h_k * d_qk, 1) if (is_paged and paged_nhd) else (h_k * s_kv_rows * d_qk, s_kv_rows * d_qk, d_qk, 1))
+    v_stride = (s_kv * h_v * d_vo, d_vo, h_v * d_vo, 1) if (bshd and not is_paged) else ((s_kv_rows * h_v * d_vo, d_vo, h_v * d_vo, 1) if (is_paged and paged_nhd) else (h_v * s_kv_rows * d_vo, s_kv_rows * d_vo, d_vo, 1))
     q = graph.tensor(
         uid=GraphFwdUid.q,
         dim=(b, h_q, s_qo, d_qk),
@@ -274,7 +298,7 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         q=q, k=k, v=v,
         descale_q=sf_q, descale_k=sf_k, descale_v=sf_v,
         attn_scale=attn_scale,
-        generate_stats=True,
+        generate_stats=generate_stats,
         diagonal_alignment=diag_align if diag_align is not None else cudnn.diagonal_alignment.TOP_LEFT,
         diagonal_band_left_bound=left_bound,
         diagonal_band_right_bound=right_bound,
@@ -283,6 +307,14 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
         implementation=implementation,
         **paged_kwargs,
     )
+    # The cc 10.7 softmax levers (sdpa/softmax_knobs.py) are python-only op attributes that make the
+    # node backend-unlowerable, so each is passed only when SET.  Under the fold the caller passes
+    # attn_scale=None: Q already carries attn_scale * log2(e).
+    if softmax_precision is not None:
+        sdpa_kwargs['softmax_precision'] = softmax_precision
+    if attn_scale_prefolded:
+        assert attn_scale is None, "attn_scale_prefolded: leave attn_scale unset (Q carries attn_scale * log2 e)"
+        sdpa_kwargs['attn_scale_prefolded'] = True
     if o_block_scale:
         # Block-scaled O: the sf_o output (per-(b, h) F8_128x4 planes) rides
         # sdpa_mxfp8 the way it rides sdpa_fp8. FP4 O carries E4M3 scales per
@@ -301,7 +333,8 @@ def generate_graph_fwd(b, h_q, h_k, h_v,
 
     # Set output tensor properties
     o.set_uid(GraphFwdUid.o).set_output(True).set_dim((b, h_q, s_qo, d_vo)).set_stride(o_stride).set_data_type(cudnn_otype)
-    stats.set_uid(GraphFwdUid.stats).set_output(True).set_dim((b, h_q, s_qo, 1)).set_stride((h_q * s_qo, s_qo, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
+    if generate_stats:
+        stats.set_uid(GraphFwdUid.stats).set_output(True).set_dim((b, h_q, s_qo, 1)).set_stride((h_q * s_qo, s_qo, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
     amax_o.set_uid(GraphFwdUid.o_amax).set_output(True).set_dim((1, 1, 1, 1)).set_stride((1, 1, 1, 1)).set_data_type(cudnn.data_type.FLOAT)
 
     return graph
@@ -565,6 +598,13 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
     diag_align = getattr(cfg, 'diag_align', None)
     with_sink_token = getattr(cfg, 'with_sink_token', False)
     rescale_threshold = cfg.rescale_threshold if cfg.rescale_threshold is not None else 4.0
+    # Softmax levers (see exec_sdpa_mxfp8): wired for completeness -- the cc 10.7 MXFP8 row serves no
+    # THD, so the served-domain mirror never draws a non-default set here.  The THD twin always
+    # requests Stats (the packed token-major Stats contract is part of what it tests).
+    softmax_precision = getattr(cfg, 'softmax_precision', None)
+    prefolded = bool(getattr(cfg, 'attn_scale_prefolded', False))
+    attn_scale_graph = None if prefolded else attn_scale
+    attn_scale_ref = LN2 if prefolded else attn_scale
 
     torch_itype = cfg.data_type or torch.float8_e4m3fn
     torch_otype = cfg.output_type or torch.bfloat16
@@ -608,6 +648,8 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
             # keep a few q rows in the deeply-negative-score regime; must run
             # before quantization (same contract as the dense path)
             inject_negative_score_rows(q_f32, k_f32, rng_data, attn_scale=attn_scale)
+        if prefolded:
+            q_f32.mul_(prefold_factor(attn_scale))  # pre-folded contract, before quantization (no rng)
         q8, dqq, sfq = _quantize_seq(q_f32, h_q, s_q_i, d_qk, torch_itype, block_size, columnwise=False)
         k8, dqk, sfk = _quantize_seq(k_f32, h_k, s_kv_i, d_qk, torch_itype, block_size, columnwise=False)
         v8, dqv, sfv = _quantize_seq(v_f32, h_v, s_kv_i, d_vo, torch_itype, block_size, columnwise=True)
@@ -647,7 +689,7 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
 
     o_stor = torch.full((max_t_q * h_q * d_vo,), float("nan"), device="cuda", dtype=torch.float32).to(torch_otype)
     stats_stor = torch.full((max_t_q * h_q,), float("nan"), dtype=torch.float32, device="cuda")
-    amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
+    amax_o_gpu = torch.full((1, 1, 1, 1), float("nan"), dtype=torch.float32, device="cuda")  # NaN: never-written is visible
 
     stride_q = (s_q_max * h_q * d_qk, d_qk, h_q * d_qk, 1)
     stride_k = (s_kv_max * h_k * d_qk, d_qk, h_k * d_qk, 1)
@@ -694,7 +736,7 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         sdpa_kwargs = dict(
             q=tq, k=tk, v=tv,
             descale_q=sf_q_t, descale_k=sf_k_t, descale_v=sf_v_t,
-            attn_scale=attn_scale,
+            attn_scale=attn_scale_graph,
             generate_stats=True,
             use_padding_mask=True,
             diagonal_alignment=diag_align if diag_align is not None else cudnn.diagonal_alignment.TOP_LEFT,
@@ -703,6 +745,10 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
             unfuse_fma=getattr(cfg, 'with_unfuse_fma', False),
             implementation=cfg.implementation,
         )
+        if softmax_precision is not None:
+            sdpa_kwargs["softmax_precision"] = softmax_precision  # python-only op attribute: pass only when SET
+        if prefolded:
+            sdpa_kwargs["attn_scale_prefolded"] = True
         if cfg.is_cu_seq_len:
             sdpa_kwargs.update(cu_seq_len_q=len_q_t, cu_seq_len_kv=len_kv_t)
         else:
@@ -786,19 +832,27 @@ def exec_sdpa_mxfp8_thd(cfg, request, cudnn_handle):
         if seq_len_kv[i] == 0:
             err += compare_tensors(o_rows, torch.zeros_like(o_rows, dtype=torch.float32), 0.0, 0.0, f"output[seq{i}, dead]")
             continue
-        o_ref, stats_ref = compute_ref(
+        o_ref32, stats_ref = compute_ref(
             q8_seqs[i], k8_seqs[i], v8_seqs[i],
-            dqq_seqs[i], dqk_seqs[i], dqv_seqs[i], attn_scale,
-            torch_itype=torch_itype, output_type=torch_otype,
+            dqq_seqs[i], dqk_seqs[i], dqv_seqs[i], attn_scale_ref,
+            torch_itype=torch_itype, output_type=torch.float32,
             left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
             sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
-        amax_ref = max(amax_ref, o_ref.abs().max().item())
+        o_ref = o_ref32.to(torch_otype).float()  # what compute_ref(output_type=torch_otype) returns
+        amax_ref = max(amax_ref, o_ref32.abs().max().item())  # the pre-cast fp32 amax, Amax_O's quantity
         # [1,h,s,d] -> packed [s,h,d]; [1,h,s,1] -> [s,h]
-        err += compare_tensors(o_rows, o_ref.squeeze(0).permute(1, 0, 2).float(), 0.12, 0.20, f"output[seq{i}]")
+        # O: the fp8 harness's midpoint-flip budget (assert_close_fp8_grad) -- the kernel and the reference quantize
+        # P independently, so a P*16 within ~1e-6 (f32 chain) or one f16 ulp (softmax_precision=HALF, whose exponent
+        # argument is rounded to f16 first) of an FP8 code midpoint lands one code apart (25 % of P in e5m2) and moves
+        # the fed O row by one code step x |v|; rare, bounded, not a defect.  Stats keep the strict compare.
+        o_ref_rows = o_ref.squeeze(0).permute(1, 0, 2).float()
+        assert_o_within_one_p_code_flip(o_rows, o_ref_rows, 0.12, 0.20, v_absmax=dqv_seqs[i].float().abs().max().item(), torch_itype=torch_itype, tag=f"output[seq{i}]")
+        assert_close_fp8_grad(o_rows, o_ref_rows, 0.12, 0.20, tag=f"output[seq{i}]", keys=int(seq_len_kv[i]))
         err += compare_tensors(lse_out[lo:hi], stats_ref.squeeze(0).squeeze(-1).permute(1, 0), 0.05, 0.05, f"stats[seq{i}]")
     assert err == 0, f"THD mismatch: {err} elements differ"
-    amax_diff = abs(amax_o_gpu.item() - amax_ref)
-    assert amax_diff <= 0.02 * max(amax_ref, 1.0), f"amax mismatch: gpu={amax_o_gpu.item():.6e} ref={amax_ref:.6e}"
+    # Amax_O over the packed live tokens (dead rows are exact 0 on both sides, checked above): the fp32 reference amax
+    # and the kernel's own stored O.  THD is FROST-only here (the backend fallback skipped above), so no waiver.
+    assert_amax_o(amax_o_gpu, amax_ref, torch_itype=torch_itype, torch_otype=torch_otype, o_gpu=o_out)
 
 
 def _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align):
@@ -827,19 +881,45 @@ def _mxfp8_block_scaled_engine_covers(sm):
     )
 
 
+def _mxfp8_frost_row_offered(sm):
+    """Whether the manifest OFFERS a FROST MXFP8 forward row covering ``sm`` in this process (the SM107 row is a
+    default candidate; the SM100 row answers to CUDNN_FRONTEND_ENABLE_FROST_ENGINES) AND that row can admit a graph
+    on this device: on cc 10.7 the row additionally needs a CuTe DSL build with the sm_107a target
+    (python/cudnn/AGENTS.md Rule 7 -- the public 4.7.0 wheel lacks it, and the row then declines through
+    ``cutedsl_arch_requirement_error``), so the mirror requires it too.  sf_o has no backend lowering, so a draw is
+    admitted only where a row that can serve it is actually on offer; an admitted draw the row declines is a FAILURE."""
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.sdpa.fwd import engines
+
+    offered = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd").offered_ids()
+    if not any(
+        s.name in offered and s.capabilities.is_mxfp8 and s.capabilities.phase == "prefill" and s.capabilities.sm_lo <= sm <= s.capabilities.sm_hi
+        for s in engines.ENGINE_SPECS
+    ):
+        return False
+    if sm == 107:
+        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state
+
+        if not cutedsl_state()[0]:
+            return False  # no DSL at all: the row declines before the target question is asked
+        return cutedsl_arch_requirement_error((10, 7)) is None
+    return True
+
+
 def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fma, d_qk, d_vo, s_qo, s_kv, right_bound, diag_align, engines_enabled=None, has_fp4=None):
     """The ``o_block_scale`` a drawn config actually runs with: the draw itself where
     the FROST d128 MXFP8 epilogue serves it, else 0 (a plain MXFP8 forward).
 
     Mirrors the engine's rules, so a draw admitted here and then declined is a
-    FAILURE, not a waive: an MXFP8 engine row for this arch (and the opt-in FROST
-    engines enabled), a dense unpaged inference forward, no backend-only
-    ``unfuse_fma``, d_qk = d_v = 128, a KV tail that is a whole 128-tile or covered
-    by the causal band, and the packed FP4 dtype for the NVFP4 mode. Pure function
-    (``sm`` = 10 * major + minor); ``test_mxfp8_block_scaled_fold.py`` pins it."""
+    FAILURE, not a waive: an MXFP8 engine row for this arch (and a FROST MXFP8
+    forward row covering the arch OFFERED by the manifest -- by default on cc 10.7,
+    with the opt-in flag on cc 10.0-10.6), a dense unpaged inference forward, no
+    backend-only ``unfuse_fma``, d_qk = d_v = 128, a KV tail that is a whole 128-tile
+    or covered by the causal band, and the packed FP4 dtype for the NVFP4 mode. Pure
+    function (``sm`` = 10 * major + minor); ``test_mxfp8_block_scaled_fold.py`` pins it."""
     if not o_block_scale:
         return 0
-    engines_enabled = opt_in_engines_enabled() if engines_enabled is None else engines_enabled
+    engines_enabled = _mxfp8_frost_row_offered(sm) if engines_enabled is None else engines_enabled
     has_fp4 = hasattr(torch, "float4_e2m1fn_x2") if has_fp4 is None else has_fp4
     if not (
         engines_enabled
@@ -857,8 +937,13 @@ def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fm
     return o_block_scale
 
 
-def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
-    """Execute MXFP8 SDPA test."""
+def exec_sdpa_mxfp8(cfg, request, cudnn_handle, *, plan_pin=None):
+    """Execute MXFP8 SDPA test.
+
+    ``plan_pin``: ``callable(graph)`` run on the dense forward graph after ``create_execution_plans`` and before
+    ``check_support`` (select_plan / create_execution_plan / deselect_engines for the explicit-selection tests); it
+    must raise through ``pytest.fail``, not ``assert``, because the build block below turns a plain exception into
+    "Error building ..."; the THD twin ignores it."""
     if request.config.option.dryrun:
         pytest.skip("dry run mode")
     if getattr(cfg, 'is_ragged', False):
@@ -882,9 +967,25 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     with_sink_token = getattr(cfg, 'with_sink_token', False)
     with_unfuse_fma = getattr(cfg, 'with_unfuse_fma', False)
     rescale_threshold = cfg.rescale_threshold if hasattr(cfg, 'rescale_threshold') and cfg.rescale_threshold is not None else 4.0
+    # Softmax levers (sdpa/softmax_knobs.py).  Under the fold the fp32 Q is pre-multiplied by
+    # attn_scale * log2(e) BEFORE quantization (after inject_negative_score_rows, which needs the
+    # unfolded scale), the op gets attn_scale=None, and the reference evaluates
+    # softmax(ln2 * S_folded) = 2^S_folded on that same quantized Q.
+    softmax_precision = getattr(cfg, 'softmax_precision', None)
+    prefolded = bool(getattr(cfg, 'attn_scale_prefolded', False))
+    attn_scale_graph = None if prefolded else attn_scale
+    attn_scale_ref = LN2 if prefolded else attn_scale
+    # Forward Stats: always with the backward (it consumes them); an inference forward omits them on
+    # an explicit cfg.fwd_stats=False (the stats-less kernel specialization).
+    generate_stats = bool(cfg.is_train or getattr(cfg, 'fwd_stats', None) is not False)
 
     is_paged = bool(getattr(cfg, "is_paged", False))
     paged_block_size = int(cfg.block_size) if is_paged else 0
+    # BSHD-physical Q/K/V/O: the FROST MXFP8 rows' layout.  Legacy rule: the block-scaled-O and paged
+    # draws (below); cfg.bshd_layout asks for it on every dense forward (inference only: the backward
+    # graph declares BHSD).
+    bshd_layout = bool(getattr(cfg, "bshd_layout", False))
+    assert not bshd_layout or cfg.is_infer, "bshd_layout is forward-only (the MXFP8 backward graph declares BHSD)"
     if is_paged:
         assert cfg.is_infer, "paged MXFP8 is forward-only"
         # A padded draw carries per-batch lengths; a full one binds every batch at its maximum.
@@ -927,13 +1028,20 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         cudnn_itype = cudnn.data_type.FP8_E5M2
     else:
         pytest.skip(f"Unsupported input type: {torch_itype}")
-    cudnn_otype = cudnn.data_type.HALF if torch_otype == torch.float16 else cudnn.data_type.BFLOAT16
+    if torch_otype == torch.float16:
+        cudnn_otype = cudnn.data_type.HALF
+    elif torch_otype in (torch.float8_e4m3fn, torch.float8_e5m2) and cfg.is_infer and not o_block_scale:
+        # An FP8 O on the inference path is declared as such (the FROST MXFP8 rows' out_dtypes): the reference is cast
+        # to it below and Amax_O is checked against the stored FP8 O -- not collapsed to a bf16 declaration.
+        cudnn_otype = cudnn.data_type.FP8_E4M3 if torch_otype == torch.float8_e4m3fn else cudnn.data_type.FP8_E5M2
+    else:
+        cudnn_otype = cudnn.data_type.BFLOAT16  # (a block-scaled O: generate_graph_fwd declares the E4M3 / E2M1 container itself)
 
     # Build forward graph
     try:
         graph_fwd = generate_graph_fwd(
             b, h_q, h_k, h_v,
-            s_qo, s_kv, d_qk, d_vo, attn_scale,
+            s_qo, s_kv, d_qk, d_vo, attn_scale_graph,
             block_size,
             cudnn_itype, cudnn_otype,
             left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
@@ -942,10 +1050,18 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             implementation=cfg.implementation,
             o_block_scale=o_block_scale,
             paged_block_size=paged_block_size,
+            softmax_precision=softmax_precision,
+            attn_scale_prefolded=prefolded,
+            generate_stats=generate_stats,
+            bshd=bshd_layout,
+            paged_nhd=getattr(cfg, "paged_pool_layout", None) == "nhd",
         )
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        if plan_pin is not None:
+            plan_pin(graph_fwd)
+        _apply_plan_pin(graph_fwd, cfg)  # ExecConfig.plan_pin (shared with the f16 harness): an explicit backend / FROST knob-set selection, strict
         graph_fwd.check_support()
         graph_fwd.build_plans()
         note_frost_routing(graph_fwd, label="mxfp8-fwd")
@@ -972,6 +1088,10 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         # keep at least a few q rows in the deeply-negative-score regime (see
         # inject_negative_score_rows); must run before mxfp8 quantization
         inject_negative_score_rows(q_f32, k_f32, rng_data, attn_scale=attn_scale)
+    if prefolded:
+        # The pre-folded contract: the fp32 Q carries attn_scale * log2(e) before its block
+        # quantization, so the kernel's raw QK^T is a log2-domain score (no rng consumed here).
+        q_f32.mul_(prefold_factor(attn_scale))
     v_f32 = torch.empty(b, h_v, s_kv, d_vo, dtype=torch.float32, device="cuda")
     fill_sparse_small_int(v_f32, rng_data, sparsity=0.8, abs_max=2)
 
@@ -992,34 +1112,81 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             return torch.cat(pool.chunk(nblocks, dim=0), dim=2)[:, :, :s_kv].contiguous()
 
         k_pool_fp8, sf_k_pool_ref, sf_k_d_swizzle, *_ = quantize_to_mxfp8(_to_pool(k_f32), num_pages, h_k, paged_block_size, d_qk, block_size, torch_itype, with_ref=not perf)
-        _, _, _, v_pool_fp8, sf_v_pool_ref, sf_v_s_swizzle = quantize_to_mxfp8(_to_pool(v_f32), num_pages, h_v, paged_block_size, d_vo, block_size, torch_itype, with_ref=not perf)
+        # V: optionally behind its OWN pool permutation -- pool slot v_slot[i] holds logical page i (= p*b + batch).  V is
+        # quantized in PHYSICAL slot order, so the plane-major SF bytes come out right for the physical pool and no byte
+        # surgery is needed (quantization is page-local: each page's values are the same in any slot).
+        v_slot = torch.arange(num_pages, device="cuda")
+        if getattr(cfg, "paged_distinct_v_table", False):
+            v_slot = torch.randperm(num_pages, generator=torch.Generator().manual_seed(int(cfg.rng_geom_seed or 0) + 7)).to("cuda")
+        v_pool_logical = _to_pool(v_f32)
+        v_pool_in = torch.empty_like(v_pool_logical)
+        v_pool_in[v_slot] = v_pool_logical
+        _, _, _, v_pool_fp8, sf_v_pool_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_pool_in, num_pages, h_v, paged_block_size, d_vo, block_size, torch_itype, with_ref=not perf)
         k_fp8_d = _to_dense(k_pool_fp8)
-        v_fp8_s = _to_dense(v_pool_fp8)
+        v_fp8_s = _to_dense(v_pool_fp8[v_slot])
         sf_k_d_ref = sf_v_s_ref = None
         if not perf:
             sf_k_d_ref = _to_dense(sf_k_pool_ref.reshape(num_pages, h_k, paged_block_size, d_qk)).reshape(b * h_k, s_kv, d_qk)
-            sf_v_s_ref = _to_dense(sf_v_pool_ref.reshape(num_pages, h_v, paged_block_size, d_vo)).reshape(b * h_v, s_kv, d_vo)
+            sf_v_s_ref = _to_dense(sf_v_pool_ref.reshape(num_pages, h_v, paged_block_size, d_vo)[v_slot]).reshape(b * h_v, s_kv, d_vo)
         block_table_gpu = torch.empty((b, 1, nblocks, 1), device="cuda", dtype=torch.int32)
         block_table_gpu.copy_(torch.arange(num_pages, device="cuda", dtype=torch.int32).reshape(nblocks, 1, b, 1).transpose(0, 2))
+        # The logical page id (K's slot) -> V's physical slot; the identity without the lever (one table bound twice).
+        block_table_v_gpu = v_slot.to(torch.int32)[block_table_gpu.long()] if getattr(cfg, "paged_distinct_v_table", False) else block_table_gpu
+        if getattr(cfg, "paged_nan_dead_pages", False):
+            # Dead pool pages (no per-batch length reaches them): NaN data, 0xFF (E8M0 NaN) scales -- the kernel promises
+            # TMA-OOB page -1 there (mirror of fp8.create_paged_container_and_block_table's opt-in poison).  The dense
+            # reference operands above are already extracted, so only the bound pools are poisoned.  K SF: one slab of
+            # h_k * (page / 128) F8_128x4 atom sets per page; V SF: D-plane-major ACROSS THE POOL, group (page*KH + head)*m + tile.
+            m = paged_block_size // 128
+            planes = ceil_div(d_vo, 128)
+            sfk_pages = sf_k_d_swizzle.view(torch.uint8).reshape(num_pages, -1)
+            sfv_groups = sf_v_s_swizzle.view(torch.uint8).reshape(planes, num_pages * h_v * m, -1)
+            assert sfk_pages.data_ptr() == sf_k_d_swizzle.data_ptr() and sfv_groups.data_ptr() == sf_v_s_swizzle.data_ptr(), "SF views must alias the bound bytes"
+            v_slot_list = v_slot.tolist()
+            for bi, L in enumerate(seq_len_kv_list):
+                for p in range(ceil_div(int(L), paged_block_size), nblocks):
+                    slot_k = p * b + bi
+                    slot_v = v_slot_list[slot_k]
+                    k_pool_fp8[slot_k] = float("nan")
+                    v_pool_fp8[slot_v] = float("nan")
+                    sfk_pages[slot_k] = 0xFF
+                    sfv_groups[:, slot_v * h_v * m : (slot_v + 1) * h_v * m] = 0xFF
+        if getattr(cfg, "paged_pool_layout", None) == "nhd":
+            # NHD pools: the same [num_pages, H_kv, page, D] dims over (page, head)-major storage -- EXACTLY the strides
+            # generate_graph_fwd declares.  Built explicitly rather than by .permute().contiguous(): at H_kv == 1 torch treats
+            # the permuted view as already contiguous (no copy), the pool would keep its HND strides, and the native pool
+            # binder rejects a binding whose strides disagree with the NHD declaration (even on a size-1 head axis).
+            def _to_nhd(pool):
+                nhd = torch.empty((pool.shape[0], pool.shape[2], pool.shape[1], pool.shape[3]), dtype=pool.dtype, device=pool.device).permute(0, 2, 1, 3)
+                nhd.copy_(pool)
+                return nhd
+
+            k_pool_fp8 = _to_nhd(k_pool_fp8)
+            v_pool_fp8 = _to_nhd(v_pool_fp8)
     else:
         k_fp8_d, sf_k_d_ref, sf_k_d_swizzle, k_fp8_s, sf_k_s_ref, sf_k_s_swizzle = quantize_to_mxfp8(k_f32, b, h_k, s_kv, d_qk, block_size, torch_itype, with_ref=not perf)
         v_fp8_d, sf_v_d_ref, sf_v_d_swizzle, v_fp8_s, sf_v_s_ref, sf_v_s_swizzle = quantize_to_mxfp8(v_f32, b, h_v, s_kv, d_vo, block_size, torch_itype, with_ref=not perf)
-        if o_block_scale:
+        if o_block_scale or bshd_layout:
             # The graph declared BSHD-physical Q/K/V for this draw (see generate_graph_fwd);
             # the per-(b, h) F8_128x4 scale planes are layout-independent.
             q_fp8_d, k_fp8_d, v_fp8_s = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q_fp8_d, k_fp8_d, v_fp8_s))
 
-    # Generate sink_token if needed
+    # Generate sink_token if needed (ExecConfig.sink_token_value pins one logit for every head: +3 dominant, -120 absent)
     sink_token_gpu = None
     if with_sink_token:
-        rng_sink = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed + 1000)
-        sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float32, device="cuda", generator=rng_sink) * 0.5
+        if getattr(cfg, "sink_token_value", None) is not None:
+            sink_token_gpu = torch.full((1, h_q, 1, 1), float(cfg.sink_token_value), dtype=torch.float32, device="cuda")
+        else:
+            rng_sink = torch.Generator(device="cuda").manual_seed(cfg.rng_data_seed + 1000)
+            sink_token_gpu = torch.randn((1, h_q, 1, 1), dtype=torch.float32, device="cuda", generator=rng_sink) * 0.5
 
     # Allocate output tensors
     if o_block_scale == 16:
         o_gpu = torch.full((b, s_qo, h_q, d_vo // 2), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float4_e2m1fn_x2).transpose(1, 2)
     elif o_block_scale:
         o_gpu = torch.full((b, s_qo, h_q, d_vo), float('nan'), dtype=torch_otype, device="cuda").transpose(1, 2)
+    elif bshd_layout:
+        o_gpu = torch.empty(b, s_qo, h_q, d_vo, dtype=torch_otype, device="cuda").transpose(1, 2)  # BSHD-physical, as the graph declares
     else:
         o_gpu = torch.empty(b, h_q, s_qo, d_vo, dtype=torch_otype, device="cuda")
     if is_paged:  # BSHD-physical Q/O, as the graph declares
@@ -1029,7 +1196,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
     if is_paged:  # NaN, so a padded row the kernel skips cannot pass the O := 0 / LSE := -inf checks
         o_gpu.fill_(float("nan"))
         stats_gpu.fill_(float("nan"))
-    amax_o_gpu = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
+    amax_o_gpu = torch.full((1, 1, 1, 1), float("nan"), dtype=torch.float32, device="cuda")  # NaN: never-written is visible
 
     sf_o_gpu = scale_o_gpu = None
     o_ref32 = stats_ref32 = None
@@ -1038,7 +1205,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         sf_o_gpu = torch.full(block_scaled_o_sf_dims(b, h_q, s_qo, d_vo, o_block_scale), 0xAA, dtype=torch.uint8, device="cuda")
         if not perf:
             # fp32 reference up front: the FP4 global scale is set from its amax.
-            o_ref32, stats_ref32 = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale,
+            o_ref32, stats_ref32 = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale_ref,
                                                torch_itype=torch_itype, output_type=torch.float32,
                                                left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
                                                sink_token=sink_token_gpu, rescale_threshold=rescale_threshold)
@@ -1061,6 +1228,8 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         int(GraphFwdUid.stats): stats_gpu,
         int(GraphFwdUid.o_amax): amax_o_gpu,
     }
+    if not generate_stats:
+        del variant_pack[int(GraphFwdUid.stats)]  # the stats-less forward declares no Stats output
     if with_sink_token:
         variant_pack[int(GraphFwdUid.sink_token)] = sink_token_gpu
     if o_block_scale:
@@ -1073,7 +1242,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         variant_pack[int(GraphFwdUid.kv_seq_len)] = torch.tensor(seq_len_kv_list, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.q_seq_len)] = torch.tensor(seq_len_q_list, device="cuda", dtype=torch.int32)
         variant_pack[int(GraphFwdUid.k_block_table)] = block_table_gpu
-        variant_pack[int(GraphFwdUid.v_block_table)] = block_table_gpu
+        variant_pack[int(GraphFwdUid.v_block_table)] = block_table_v_gpu
 
     # Execute
     workspace = torch.empty(max(graph_fwd.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
@@ -1084,6 +1253,8 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         profile_execution(graph_fwd.execute, variant_pack, workspace, cudnn_handle)
     graph_fwd.execute(variant_pack, workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
+    # Amax_O on a backend-served graph: a known backend defect xfails that check only (see BACKEND_AMAX_O_ISSUE).
+    amax_known_issue = BACKEND_AMAX_O_ISSUE if getattr(graph_fwd, "selected_engine", None) is None else None
 
     o_f16 = o_gpu
     stats_bwd = stats_gpu
@@ -1106,17 +1277,21 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         floor = (ref_q - o_ref_scaled).abs().max().item()
         atol = max((0.125 if torch_itype == torch.float8_e5m2 else 0.12) * o_scale_val, 3.0 * floor)
         assert_close_fp8_grad(o_deq, o_ref_scaled, atol, 0.2, tag="O(block-scaled)", keys=s_kv)
-        error = compare_tensors(stats_gpu, stats_ref, 0.05, 0.05, "stats")
-        assert error == 0, f"stats mismatch: {error} elements differ"
-        assert compare_amax(amax_o_gpu, o_ref, rtol=0.05, tag="amax(block-scaled, pre-scale)"), "Amax mismatch: 1 element differs"
+        if generate_stats:
+            error = compare_tensors(stats_gpu, stats_ref, 0.05, 0.05, "stats")
+            assert error == 0, f"stats mismatch: {error} elements differ"
+        # Amax_O: the pre-scale amax in O's units (the API divides the FP4 global scale back out); the stored O is
+        # block-quantized, so only the reference fact applies.
+        assert_amax_o(amax_o_gpu, o_ref32.abs().max().item(), torch_itype=torch_itype, torch_otype=torch_otype, tag="Amax_O(block-scaled, pre-scale)", known_issue=amax_known_issue)
     elif not perf:
         padding = None
         if is_paged:
             padding = (torch.tensor(seq_len_q_list, device="cuda", dtype=torch.int32), torch.tensor(seq_len_kv_list, device="cuda", dtype=torch.int32))
-        o_ref, stats_ref = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale,
-                                       torch_itype=torch_itype, output_type=torch_otype,
-                                       left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
-                                       sink_token=sink_token_gpu, rescale_threshold=rescale_threshold, padding=padding)
+        o_ref32, stats_ref = compute_ref(q_fp8_d, k_fp8_d, v_fp8_s, sf_q_d_ref, sf_k_d_ref, sf_v_s_ref, attn_scale_ref,
+                                         torch_itype=torch_itype, output_type=torch.float32,
+                                         left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
+                                         sink_token=sink_token_gpu, rescale_threshold=rescale_threshold, padding=padding)
+        o_ref = o_ref32.to(torch_otype).float()  # what compute_ref(output_type=torch_otype) returns
         o_f16 = o_ref.to(torch.bfloat16)
         stats_bwd = stats_ref
         o_cmp, stats_cmp = o_gpu, stats_gpu
@@ -1125,22 +1300,24 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             # then compare the live rows against the reference.
             dead_q = (torch.arange(s_qo, device="cuda")[None, :] >= padding[0][:, None]).view(b, 1, s_qo, 1)
             assert not o_gpu.float()[dead_q.expand(b, h_q, s_qo, d_vo)].any(), "padded query rows must write O := 0"
-            assert torch.isneginf(stats_gpu[dead_q.expand(b, h_q, s_qo, 1)]).all(), "padded query rows must write LSE := -inf"
+            if generate_stats:
+                assert torch.isneginf(stats_gpu[dead_q.expand(b, h_q, s_qo, 1)]).all(), "padded query rows must write LSE := -inf"
             o_ref = o_ref.masked_fill(dead_q, 0)
+            o_ref32 = o_ref32.masked_fill(dead_q, 0)
             stats_cmp = stats_gpu.masked_fill(dead_q, 0)
             stats_ref = stats_ref.masked_fill(dead_q, 0)
-        for actual, expected, atol, rtol, name in (
-            (o_cmp, o_ref, 0.12, 0.20, "output"),
-            (stats_cmp, stats_ref, 0.05, 0.05, "stats"),
-        ):
-            error = compare_tensors(actual, expected, atol, rtol, name)
-            assert error == 0, f"{name} mismatch: {error} elements differ"
-        if is_paged:
-            # A split plan rounds P against each split's own max, not the reference's single running max, so max|O|
-            # only gets the elementwise budget above. Amax_O is the max |O| the kernel wrote, before the cast to O's dtype.
-            assert compare_amax(amax_o_gpu, o_cmp, rtol=torch.finfo(torch_otype).eps, tag="amax(graph output)"), "Amax_O mismatch"
-        else:
-            assert compare_amax(o_cmp, o_ref, rtol=0.05, tag="amax"), "Amax mismatch: 1 element differs"
+        # O: the fp8 harness's midpoint-flip budget (assert_close_fp8_grad; see the THD compare above) -- a P*16 at an FP8
+        # code midpoint rounds to different codes on the two sides (one f16 ulp of the exponent argument under
+        # softmax_precision=HALF: CI cc 10.7 e5m2 d512 row with P*16 = 9.0076 -> codes 8 vs 10, O off by 0.16 where
+        # the two live keys cancel); the budget is 1e-5 of the elements or the row cap.  Stats keep the strict compare.
+        assert_o_within_one_p_code_flip(o_cmp, o_ref, 0.12, 0.20, v_absmax=v_f32.abs().max().item(), torch_itype=torch_itype, tag="output")
+        assert_close_fp8_grad(o_cmp, o_ref, 0.12, 0.20, tag="output", keys=s_kv)
+        if generate_stats:
+            error = compare_tensors(stats_cmp, stats_ref, 0.05, 0.05, "stats")
+            assert error == 0, f"stats mismatch: {error} elements differ"
+        # Amax_O: the max |O| the kernel wrote before the cast to O's dtype -- against the fp32 reference (one P code
+        # step) and against the kernel's own stored O (its dtype's rounding); the paged dead rows are zero on both.
+        assert_amax_o(amax_o_gpu, o_ref32.abs().max().item(), torch_itype=torch_itype, torch_otype=torch_otype, o_gpu=o_cmp, known_issue=amax_known_issue)
 
     if not cfg.is_infer:
         dO_f32 = torch.empty(b, h_q, s_qo, d_vo, dtype=torch.float32, device="cuda")
@@ -1153,7 +1330,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
         try:
             graph_bwd = generate_graph_bwd(
                 b, h_q, h_k, h_v,
-                s_qo, s_kv, d_qk, d_vo, attn_scale,
+                s_qo, s_kv, d_qk, d_vo, attn_scale_ref,
                 deterministic, block_size,
                 cudnn_itype, cudnn_otype,
                 left_bound=left_bound, right_bound=right_bound, diag_align=diag_align,
@@ -1261,7 +1438,7 @@ def exec_sdpa_mxfp8(cfg, request, cudnn_handle):
             dQ_ref, dK_ref, dV_ref, dSink_token_ref = compute_ref_backward(
                 q_fp8_d, q_fp8_s, k_fp8_d, k_fp8_s, v_fp8_d,
                 o_f16, dO_f16, dO_fp8_d, dO_fp8_s,
-                attn_scale,
+                attn_scale_ref,
                 sf_q_d_ref, sf_q_s_ref, sf_k_d_ref, sf_k_s_ref, sf_v_d_ref,
                 sf_dO_d_ref, sf_dO_s_ref,
                 torch_itype=torch_itype, torch_otype=torch_otype,

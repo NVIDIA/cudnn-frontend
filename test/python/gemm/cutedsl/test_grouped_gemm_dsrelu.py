@@ -13,13 +13,13 @@ import contextlib
 import torch
 import pytest
 from test_utils import torch_fork_set_rng, assert_bitwise_runs, bitwise_bits
-from gemm.cutedsl._workspace import ws
 from gemm.cutedsl.test_grouped_gemm_dsrelu_utils import (
     run_grouped_gemm_dsrelu_ref,
     with_grouped_gemm_dsrelu_params_fp4,
     with_grouped_gemm_dsrelu_params_fp8,
     allocate_grouped_gemm_dsrelu_tensors,
     allocate_grouped_gemm_input_tensors,
+    assert_close_quantized,
     check_ref_grouped_gemm_dsrelu,
     grouped_gemm_dsrelu_init,
 )
@@ -869,7 +869,6 @@ def test_grouped_gemm_dsrelu_deterministic_class_api(request):
         sfd_col_tensor=expected["sfd_col_tensor"],
         norm_const_tensor=inputs.get("norm_const_tensor"),
         current_stream=stream,
-        workspace=ws(op),
     )
     # Both accumulate onto the output, so the zeroed buffers above end up holding the result --
     # no copy_ needed, and the same semantics the kernel has when the flag is off.
@@ -954,6 +953,18 @@ def test_grouped_gemm_dsrelu_deterministic_dbias_zero_tokens(request):
     assert outputs["dbias_tensor"].dtype == torch.bfloat16
     assert torch.count_nonzero(outputs["dbias_tensor"]).item() == 0
     assert outputs["dprob_tensor"].shape[1:] == (1, 1)
+
+
+@pytest.mark.L0
+def test_assert_close_quantized_accepts_only_midpoint_ties():
+    """A one-ulp disagreement passes only where the unrounded value sits on the midpoint between the two codes."""
+    expected = torch.tensor([112.0, 112.0, 40.0])
+    unrounded = torch.tensor([107.99999, 110.0, 40.0])
+    assert_close_quantized(torch.tensor([104.0, 112.0, 40.0]), expected, unrounded, atol=1e-1, rtol=1e-2)
+    with pytest.raises(AssertionError):
+        assert_close_quantized(torch.tensor([112.0, 104.0, 40.0]), expected, unrounded, atol=1e-1, rtol=1e-2)
+    with pytest.raises(AssertionError):
+        assert_close_quantized(torch.tensor([104.0, 112.0, 40.0]), expected, None, atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.L1
@@ -1300,7 +1311,6 @@ def test_grouped_gemm_dsrelu_discrete_compile_execute(request, ab_dtype, c_dtype
         norm_const_tensor=inputs.get("norm_const_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
-        workspace=ws(api),
     )
 
     torch.cuda.synchronize()
@@ -1531,7 +1541,6 @@ def _test_grouped_gemm_dsrelu_compile_execute(
         norm_const_tensor=inputs.get("norm_const_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=stream,
-        workspace=ws(api),
     )
 
     torch.cuda.synchronize()

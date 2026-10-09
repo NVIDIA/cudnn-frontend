@@ -252,6 +252,8 @@ def _run(
     block_scaled_o=None,
     sf_o_layout="planes",
     scale_o=1.0,
+    negate_q: bool = False,
+    negative_descale_q: bool = False,
 ):
     """Append-only knobs (PR-A): ``gate`` (a bf16 BHSD-logical tensor of O's shape)
     adds the epilogue-gate tail ``sdpa(virtual O_v) -> sigmoid(G) -> mul`` and
@@ -263,11 +265,16 @@ def _run(
 
     dev = "cuda"
     Qf = torch.randn(B, H_q, S_q, d_qk, device=dev) * 0.5
+    if negate_q:
+        Qf = -Qf
     Kf = torch.randn(B, H_kv, S_kv, d_qk, device=dev) * 0.5
     Vf = torch.randn(B, H_kv, S_kv, d_v, device=dev) * 0.5
     Q8, dq = _quant(Qf, in_key)
     K8, dk = _quant(Kf, in_key)
     V8, dv = _quant(Vf, in_key)
+    if negative_descale_q:
+        # Same dequantized Q, with a negative descale_q * descale_k on the device.
+        Q8, dq = (-Q8.float()).to(Q8.dtype), -dq
 
     def bshd(x8):
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
@@ -1640,31 +1647,6 @@ _THD_CASES = [
 
 
 @pytest.mark.L0
-@pytest.mark.no_workspace_shim
-@torch_fork_set_rng(seed=0)
-def test_fp8_thd_execute_requires_a_workspace():
-    """R2 on the FP8 THD arm (``_thd_pack``): scratch is carved from the
-    caller's workspace; a direct caller that passes none gets the contract
-    error, never a hidden allocation (the suite's autouse shim is off here)."""
-    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-
-    b, h, s, d = 2, 4, 128, 128
-    dev = "cuda"
-    q8, dq = _quant(torch.randn(b, s, h, d, device=dev) * 0.5, "e4m3")
-    q = q8.permute(0, 2, 1, 3)  # logical BHSD over compact BSHD storage (the packed THD contract)
-    k, v = q.clone(), q.clone()
-    o = torch.empty(b, s, h, d, device=dev, dtype=torch.float16).permute(0, 2, 1, 3)
-    dsc = torch.tensor([dq], dtype=torch.float32, device=dev)
-    api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, pertensor_fp8=True, dtype_o=torch.float16, thd=True)
-    assert api.check_support()
-    api.compile()
-    assert api.scratch_workspace_bytes() > 0
-    lens = torch.full((b,), s, dtype=torch.int32, device=dev)
-    with pytest.raises(ValueError, match=r"requires a \d+-byte workspace"):
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, descale_q=dsc, descale_k=dsc, descale_v=dsc, seq_q_lens=lens, seq_kv_lens=lens)
-
-
-@pytest.mark.L0
 @pytest.mark.parametrize(("causal", "in_key"), _THD_CASES)
 @torch_fork_set_rng(seed=0)
 def test_fp8_thd(in_key, causal):
@@ -2423,3 +2405,40 @@ def test_fp8_thd_batched_setup(batch, cu_lens):
     kv_lens = [([33, 0, 65, 127, 257][i % 5]) for i in range(batch)]
     out = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
     _check(out[0], out[1], torch.float16, "e4m3", out[2], out[3])
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_fp8_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale negates S in BMM1 (a_negate) and runs at |scale| (#1435). FP8 negation is exact, so the
+    result must be bit-identical to the positive scale on -Q; this does not depend on the fp32 reference's edge."""
+    scale = 0.7 / math.sqrt(d_qk)
+    runs = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        runs.append(_run(2, 8, 8, 256, 256, "e4m3", torch.float16, scale=sign * scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negate_q=sign > 0))
+    neg, pos = runs
+    assert not neg.output.isnan().any()
+    assert torch.equal(neg.output, pos.output)
+    assert neg.amax == pos.amax
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_sign", [-1.0, 1.0], ids=["neg_scale", "pos_scale"])
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_fp8_negative_descale_product(scale_sign, d_qk, d_v, mask):
+    """A negative device descale_q * descale_k flips BMM1's sign on the device, for either plan sign (#1435). The same
+    dequantized Q with a positive descale is the bit-exact reference."""
+    scale = scale_sign * 0.7 / math.sqrt(d_qk)
+    runs = []
+    for negative_descale_q in (True, False):
+        torch.manual_seed(0)
+        runs.append(
+            _run(1, 2, 1, 17, 65, "e4m3", torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negative_descale_q=negative_descale_q)
+        )
+    flipped, plain = runs
+    assert not flipped.output.isnan().any()
+    assert torch.equal(flipped.output, plain.output)
+    assert flipped.amax == plain.amax

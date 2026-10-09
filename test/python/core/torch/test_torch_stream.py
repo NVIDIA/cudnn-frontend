@@ -3,7 +3,7 @@
 
 """``cudnn._torch_stream``: the one place a raw stream handle becomes a torch stream (Rule 5).
 
-Default-stream sentinels (0, cudaStreamLegacy, cudaStreamPerThread) and torch's own
+Legacy default-stream sentinels (0, cudaStreamLegacy) and torch's own
 default stream map to ``torch.cuda.default_stream``; torch's current stream maps to
 itself; only a genuine side stream is wrapped in ``torch.cuda.ExternalStream``.
 """
@@ -72,42 +72,3 @@ def test_torch_stream_on_another_device_is_rejected():
     other = torch.cuda.Stream(device=1)
     with pytest.raises(ValueError, match="must be on cuda:0"):
         as_torch_stream(other, torch.device("cuda", 0))
-
-
-@pytest.mark.parametrize("handle", sorted(DEFAULT_STREAM_HANDLES) + ["default_stream", "side_stream"])
-def test_stream_context_enters_the_requested_device(handle):
-    """With cuda:0 current, a launch on cuda:1 runs its torch work there, implicit-device allocations included,
-    even though the default-stream handle is the same value on both devices."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("needs two devices")
-    with torch.cuda.device(0):
-        if handle == "default_stream":
-            handle = torch.cuda.default_stream(1)
-        elif handle == "side_stream":
-            handle = torch.cuda.Stream(device=1)
-        expected = handle.cuda_stream if isinstance(handle, torch.cuda.Stream) else torch.cuda.default_stream(1).cuda_stream
-        with stream_context(handle, torch.device("cuda", 1)):
-            assert torch.cuda.current_device() == 1
-            assert torch.empty(1, device="cuda").device == torch.device("cuda", 1)
-            assert torch.cuda.current_stream().cuda_stream == expected
-        assert torch.cuda.current_device() == 0
-
-
-def test_stream_context_follows_a_stream_on_another_device():
-    if torch.cuda.device_count() < 2:
-        pytest.skip("needs two devices")
-    with torch.cuda.device(0):
-        for stream in (torch.cuda.default_stream(1), torch.cuda.Stream(device=1)):
-            with stream_context(stream):
-                assert torch.cuda.current_device() == 1
-                assert torch.cuda.current_stream() == stream
-            assert torch.cuda.current_device() == 0
-
-
-@pytest.mark.parametrize("which", ["default", "side"])
-def test_stream_context_rejects_a_stream_on_another_device(which):
-    if torch.cuda.device_count() < 2:
-        pytest.skip("needs two devices")
-    other = torch.cuda.default_stream(1) if which == "default" else torch.cuda.Stream(device=1)
-    with torch.cuda.device(0), pytest.raises(ValueError, match="must be on cuda:0"):
-        stream_context(other, torch.device("cuda", 0))

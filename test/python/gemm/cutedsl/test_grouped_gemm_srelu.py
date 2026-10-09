@@ -13,7 +13,6 @@ Reference: continugous_blockscaled_grouped_gemm_srelu_quant_fusion.py
 import torch
 import pytest
 from test_utils import torch_fork_set_rng
-from gemm.cutedsl._workspace import ws
 from gemm.cutedsl.test_grouped_gemm_srelu_utils import (
     grouped_gemm_srelu_init,
     with_grouped_gemm_srelu_params_fp4,
@@ -456,7 +455,6 @@ def test_grouped_gemm_srelu_discrete_compile_execute(request, ab_dtype, c_dtype,
         prob_tensor=inputs.get("prob_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
-        workspace=ws(api),
     )
 
     torch.cuda.synchronize()
@@ -652,7 +650,6 @@ def _test_grouped_gemm_srelu_compile_execute(
         prob_tensor=inputs.get("prob_tensor"),
         amax_tensor=outputs.get("amax_tensor"),
         current_stream=stream,
-        workspace=ws(api),
     )
 
     check_ref_grouped_gemm_srelu(

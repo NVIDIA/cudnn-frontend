@@ -47,8 +47,15 @@ def _delayed_copy_then_release(stage):
 
 
 @pytest.mark.L0
-def test_contiguous_on_stream_keeps_the_released_original_alive_until_the_copy_runs():
-    staged, expected, _ = _delayed_copy_then_release(lambda view, side: contiguous_on_stream(view, side.cuda_stream, view.device))
+@pytest.mark.parametrize("explicit_stream", [True, False])
+def test_contiguous_on_stream_keeps_the_released_original_alive_until_the_copy_runs(explicit_stream):
+    def stage(view, side):
+        if explicit_stream:
+            return contiguous_on_stream(view, side.cuda_stream, view.device)
+        with torch.cuda.stream(side):
+            return contiguous_on_stream(view, None, view.device)
+
+    staged, expected, _ = _delayed_copy_then_release(stage)
     assert torch.equal(staged, expected)
 
 
@@ -79,12 +86,12 @@ def test_bare_contiguous_under_a_side_stream_context_reads_the_reused_block():
 
 
 @pytest.mark.L0
-def test_staging_helpers_pass_through_and_noop_on_the_current_stream():
+def test_staging_helpers_passthrough_and_current_stream_recording():
     t = torch.empty(4, 8, device="cuda")
     assert contiguous_on_stream(None, None) is None
     assert contiguous_on_stream(t, None) is t
     assert contiguous_on_stream(t, torch.cuda.current_stream().cuda_stream, t.device) is t
-    record_streams((None, t), None)  # no stream: nothing to record
+    record_streams((None, t), None)  # recorded on the current stream; None tensors are ignored
     record_streams((t,), torch.cuda.current_stream(), t.device)  # recorded (the allocation stream may differ)
     copy = contiguous_on_stream(t.t(), None)
     assert copy.is_contiguous() and copy.shape == (8, 4)
@@ -114,8 +121,16 @@ def _delayed_copy_back_then_release(copy_back):
 
 
 @pytest.mark.L0
-def test_copy_into_on_stream_never_writes_into_the_released_destinations_new_owner():
-    other, _ = _delayed_copy_back_then_release(lambda dst, src, side: copy_into_on_stream(dst, src, side.cuda_stream, dst.device))
+@pytest.mark.parametrize("explicit_stream", [True, False])
+def test_copy_into_on_stream_never_writes_into_the_released_destinations_new_owner(explicit_stream):
+    def copy_back(dst, src, side):
+        if explicit_stream:
+            copy_into_on_stream(dst, src, side.cuda_stream, dst.device)
+        else:
+            with torch.cuda.stream(side):
+                copy_into_on_stream(dst, src, None, dst.device)
+
+    other, _ = _delayed_copy_back_then_release(copy_back)
     assert torch.all(other == -1.0)
 
 
