@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Full MegaMoE (multi-rank) mxfp8 dGLU training-backward kernel."""
 
+from collections.abc import Mapping
+from enum import Enum
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal, Optional, Tuple, Type
 
@@ -13,7 +15,6 @@ from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int32, Int64
 
 from ......api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
-from ......dgrad_config import DGRAD_UNSPECIFIED, resolve_dgrad_config
 from ......helpers.device_workspace import DeviceWorkspace
 from ......helpers.smem_workspace import SmemWorkspace
 from ......helpers.utils import ceil_div, round_up
@@ -27,6 +28,14 @@ from ..fwd_glu.glu_mxfp8_fc12_extension import (
     discrete_weight_descriptor_workspace_size,
 )
 from .dglu_mxfp8_fc12_kernel import Sm107Mxfp8DgluDfc21Kernel
+
+
+class _Unspecified(Enum):
+    VALUE = "unspecified"
+
+
+# Omission must remain distinct from explicit False or None when switches expand.
+_UNSPECIFIED = _Unspecified.VALUE
 
 
 _AB_DTYPE_TO_QUANT_KIND = {cutlass.Float8E4M3FN: QuantKind.mxfp8_e4m3, cutlass.Float8E5M2: QuantKind.mxfp8_e5m2}
@@ -150,7 +159,11 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             + ("_cleary2tail1" if self.clear_grad_y2_stale_tail else "")
             + (f"_y2ctas{self.num_ctas_grad_y2_col_quant}" if self.num_ctas_grad_y2_col_quant != 2368 else "")
             + (f"_dfc1mg{self.dfc1_m_group}" if self.dfc1_m_group != 1 else "")
-            + ("_inputdedup_rank_batched_expert" if self.token_comm.input_dedup_mode != "off" else "")
+            + ("_inputdedup_rank_batched_rows" if self.token_comm.input_dedup_mode != "off" else "")
+            + (f"_tpad{self.token_padding_block}_sfpad{self.sf_padding_block}"
+               if (self.token_padding_block, self.sf_padding_block) != (128, 128) else "")
+            + (f"_cluster{self.cluster_shape_mn[0]}x{self.cluster_shape_mn[1]}"
+               if tuple(self.cluster_shape_mn) != (2, 1) else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -272,6 +285,120 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
 
         return load_module(path, enable_tvm_ffi=True)[_aot_symbol_prefix]
 
+    @staticmethod
+    def _resolve_tuning(problem: Mapping, implementation: Mapping) -> dict:
+        """Expand compatibility switches and validate explicit construction knobs.
+
+        Both from_kwargs and descriptor callers use this host-only step. Explicit
+        values, including False and None, override the selected defaults; requested
+        outputs and problem dimensions remain caller-owned.
+        """
+        explicit = {k: v for k, v in implementation.items() if v is not _UNSPECIFIED}
+        # Keep legacy disabled spellings readable; active experiments are archived.
+        for key, default in (
+            ("phase_interleave_defer_linear1_until_input_ready", False),
+            ("prefetch_tma_descriptors", False),
+            ("dfc1_weight_l2_prefetch_depth", 0),
+        ):
+            value = explicit.pop(key, default)
+            if type(value) is not type(default):
+                raise TypeError(f"{key} must be {type(default).__name__}")
+            if value != default:
+                raise NotImplementedError(f"{key} is an archived experiment")
+        enabled = explicit.pop("enable_dgrad_optimizations", False)
+        if type(enabled) is not bool:
+            raise TypeError("enable_dgrad_optimizations must be bool")
+        legacy_schedule = explicit.pop("dgrad_schedule", None)
+        if legacy_schedule not in (None, "baseline", "optimized"):
+            raise ValueError(f"unsupported dgrad_schedule={legacy_schedule!r}")
+        if enabled and legacy_schedule == "baseline":
+            raise ValueError("dgrad_schedule='baseline' conflicts with enable_dgrad_optimizations=True")
+
+        rolling = enabled or legacy_schedule == "optimized"
+        resolved = dict(
+            load_balance_mode="atomic_counter" if rolling else "static",
+            force_static_sched=True,
+            clc_bundle_size=None,
+            num_sched_stages=2 if enabled else None,
+            token_back_mode="epi_warps",
+            epi_flag_batch=(4, 2) if enabled else (1, 1),
+            flag_batch=1,
+            token_in_async_flags=enabled,
+            token_in_transfer_warp_count=4,
+            schedule_mode="phase_interleave" if rolling else "grouped",
+            dfc2_subtile_publish=rolling,
+            dfc2_c_pipe_stages=2 if rolling else 1,
+            dfc2_d_pipe_stages=1,
+            dfc2_acc_early_release=rolling,
+            phase_interleave_prologue_tiles=0 if rolling else None,
+            phase_interleave_defer_consumers_until_full=rolling,
+            phase_interleave_fuse_ready_probe_and_producer_claim=rolling,
+            use_scaled_cvt=enabled,
+            num_ctas_grad_y2_col_quant=2368,
+            input_dedup_mode="rank" if enabled else "off",
+            dfc1_m_group=16 if enabled else 1,
+        )
+        preset = {}
+        if enabled:
+            resolved["group_hint"] = explicit["launch_cluster_count"]
+            # Record overrides of the compatibility preset without treating
+            # baseline-only defaults or caller-requested outputs as preset fields.
+            preset = {key: resolved[key] for key in (
+                "load_balance_mode", "schedule_mode", "dfc2_subtile_publish",
+                "dfc2_c_pipe_stages", "dfc2_d_pipe_stages", "dfc2_acc_early_release",
+                "phase_interleave_prologue_tiles", "phase_interleave_defer_consumers_until_full",
+                "phase_interleave_fuse_ready_probe_and_producer_claim", "num_sched_stages",
+                "group_hint", "epi_flag_batch", "flag_batch", "token_in_async_flags",
+                "token_in_transfer_warp_count", "token_back_mode", "input_dedup_mode",
+                "dfc1_m_group", "use_scaled_cvt",
+            )}
+            if explicit.get("enable_grad_y2_col_quant", False):
+                resolved["num_ctas_grad_y2_col_quant"] = -1
+                preset["num_ctas_grad_y2_col_quant"] = -1
+        # None is the explicit spelling of the hardware-resident group count.
+        if explicit.get("group_hint", _UNSPECIFIED) is None:
+            explicit["group_hint"] = explicit["launch_cluster_count"]
+        resolved.update(explicit)
+        resolved["epi_flag_batch"] = tuple(resolved["epi_flag_batch"]) if resolved["epi_flag_batch"] is not None else (1, 1)
+
+        if type(resolved["token_in_async_flags"]) is not bool:
+            raise TypeError("token_in_async_flags must be bool")
+        if resolved["token_in_async_flags"] and resolved["flag_batch"] != 1:
+            raise ValueError("asynchronous token-in flags require flag_batch=1")
+        transfer_warps = resolved["token_in_transfer_warp_count"]
+        if type(transfer_warps) is not int or not 1 <= transfer_warps <= 32:
+            raise ValueError("token_in_transfer_warp_count must be an integer in [1, 32]")
+
+        rolling = resolved["schedule_mode"] == "phase_interleave"
+        if rolling and resolved["load_balance_mode"] != "atomic_counter":
+            raise ValueError("phase_interleave requires atomic_counter")
+        if not rolling and (resolved["phase_interleave_prologue_tiles"] is not None
+                            or resolved["phase_interleave_defer_consumers_until_full"]
+                            or resolved["phase_interleave_fuse_ready_probe_and_producer_claim"]):
+            raise ValueError("phase-interleave options require schedule_mode='phase_interleave'")
+        if resolved["dfc1_m_group"] not in (1, 16) or type(resolved["dfc1_m_group"]) is not int:
+            raise ValueError("dfc1_m_group must be 1 or 16")
+        if resolved["dfc1_m_group"] != 1 and not rolling:
+            raise ValueError("M16 traversal requires phase_interleave")
+        if resolved["input_dedup_mode"] not in ("off", "rank"):
+            raise ValueError("input_dedup_mode must be 'off' or 'rank'")
+        if resolved["num_ctas_grad_y2_col_quant"] == -1 and not resolved.get("enable_grad_y2_col_quant", False):
+            raise ValueError("automatic grad_y2 grid requires enable_grad_y2_col_quant=True")
+        if resolved["dfc2_subtile_publish"]:
+            extent = problem["intermediate_gateup_size"]
+            tile_n = resolved["mma_tiler_mnk"][1]
+            bits = 2 if resolved["use_2cta_instrs"] else 1
+            if extent <= 0 or extent % tile_n or extent // tile_n * bits > 30:
+                raise ValueError("dfc2_subtile_publish requires aligned N and at most 30 ready-mask bits")
+
+        overrides = {k: v for k, v in explicit.items() if k in preset and v != preset[k]}
+        resolved["enable_dgrad_optimizations"] = enabled
+        resolved["dgrad_optimization_profile"] = (
+            "ds3_ep4_v1_custom" if overrides else "ds3_ep4_v1"
+        ) if enabled else (legacy_schedule or "explicit")
+        resolved["dgrad_optimization_overrides"] = overrides
+        return resolved
+
     @classmethod
     def from_kwargs(
         cls,
@@ -282,11 +409,11 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         group_hint: int,
         token_padding_block: int,
         sf_padding_block: int,
-        load_balance_mode: str = DGRAD_UNSPECIFIED,
+        load_balance_mode: str = _UNSPECIFIED,
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
         force_static_sched: bool = True,
         clc_bundle_size: Optional[int] = None,
-        num_sched_stages: Optional[int] = DGRAD_UNSPECIFIED,
+        num_sched_stages: Optional[int] = _UNSPECIFIED,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         sf_vec_size: int = 32,
@@ -302,7 +429,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         data_token_capacity: Optional[int] = None,
         fc2_in_kernel_topk_reduce: bool = False,
         token_back_mode: Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] = "epi_warps",
-        epi_flag_batch: Optional[Tuple[int, int]] = DGRAD_UNSPECIFIED,
+        epi_flag_batch: Optional[Tuple[int, int]] = _UNSPECIFIED,
         flag_batch: int = 1,
         token_in_transfer_warp_count: int = 4,
         combine_format: Optional[CombineFormat] = None,
@@ -311,25 +438,25 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         dfc2_recompute: bool = False,
         dfc2_col_output: bool = False,
         enable_grad_y2_col_quant: bool = False,
-        num_ctas_grad_y2_col_quant: int = DGRAD_UNSPECIFIED,
-        use_scaled_cvt: bool = DGRAD_UNSPECIFIED,
-        schedule_mode: Literal["grouped", "phase_interleave"] = DGRAD_UNSPECIFIED,
-        dfc2_subtile_publish: bool = DGRAD_UNSPECIFIED,
-        dfc2_c_pipe_stages: int = DGRAD_UNSPECIFIED,
+        num_ctas_grad_y2_col_quant: int = _UNSPECIFIED,
+        use_scaled_cvt: bool = _UNSPECIFIED,
+        schedule_mode: Literal["grouped", "phase_interleave"] = _UNSPECIFIED,
+        dfc2_subtile_publish: bool = _UNSPECIFIED,
+        dfc2_c_pipe_stages: int = _UNSPECIFIED,
         dfc2_d_pipe_stages: int = 1,
-        dfc2_acc_early_release: bool = DGRAD_UNSPECIFIED,
-        phase_interleave_prologue_tiles: Optional[int] = DGRAD_UNSPECIFIED,
-        phase_interleave_defer_consumers_until_full: bool = DGRAD_UNSPECIFIED,
-        phase_interleave_fuse_ready_probe_and_producer_claim: bool = DGRAD_UNSPECIFIED,
+        dfc2_acc_early_release: bool = _UNSPECIFIED,
+        phase_interleave_prologue_tiles: Optional[int] = _UNSPECIFIED,
+        phase_interleave_defer_consumers_until_full: bool = _UNSPECIFIED,
+        phase_interleave_fuse_ready_probe_and_producer_claim: bool = _UNSPECIFIED,
         phase_interleave_defer_linear1_until_input_ready: bool = False,
         prefetch_tma_descriptors: bool = False,
         dfc1_weight_l2_prefetch_depth: int = 0,
         weight_storage_mode: WeightStorageMode = "contiguous",
         enable_dgrad_optimizations: bool = False,
-        input_dedup_mode: str = DGRAD_UNSPECIFIED,
-        dfc1_m_group: int = DGRAD_UNSPECIFIED,
+        input_dedup_mode: str = _UNSPECIFIED,
+        dfc1_m_group: int = _UNSPECIFIED,
         dgrad_schedule: Optional[str] = None,
-        token_in_async_flags: bool = DGRAD_UNSPECIFIED,
+        token_in_async_flags: bool = _UNSPECIFIED,
     ) -> "Sm107MegaMoEMxfp8DgluKernel":
         """Build the ``(ProblemDesc, ImplDesc)`` pair from the legacy flat signature."""
         if static_expert_shape is None:
@@ -413,7 +540,7 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         return cls(problem_desc, impl_desc)
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
-        resolved = resolve_dgrad_config(problem_desc, impl_desc)
+        resolved = self._resolve_tuning(problem_desc, impl_desc)
         self.resolved_dgrad_config = MappingProxyType(resolved)
         self.enable_dgrad_optimizations = resolved["enable_dgrad_optimizations"]
         self.input_dedup_mode = resolved["input_dedup_mode"]
@@ -489,13 +616,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             raise ValueError("fc2_in_kernel_topk_reduce requires a non-quantized (bf16) combine.")
         if token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
-        if type(token_in_transfer_warp_count) is not int or token_in_transfer_warp_count != 4:
-            raise ValueError("token_in_transfer_warp_count must be 4; five-warp experiments are archived.")
-        if schedule_mode == "phase_interleave" and token_back_mode != "epi_warps":
-            raise ValueError(
-                "MegaMoE phase_interleave is validated only with "
-                "token_back_mode='epi_warps'."
-            )
+        if type(token_in_transfer_warp_count) is not int or not 1 <= token_in_transfer_warp_count <= 32:
+            raise ValueError("token_in_transfer_warp_count must be an integer in [1, 32]")
         if ab_dtype not in _AB_DTYPE_TO_QUANT_KIND:
             raise ValueError(f"ab_dtype {ab_dtype} has no mxfp8 QuantKind.")
 
@@ -539,10 +661,9 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         # --- Warp topology (realigned for next's TokenCommDeterministic). ---
         # Dispatch owns a contiguous block beginning at warp 8.  TokenComm derives
         # the local transfer index with ``thread_idx % transfer_thread_count``;
-        # even when five warps start at thread 256 this is a permutation of [0, 5),
-        # so all per-warp stages and barrier participants remain one-to-one.  The
-        # dGLU c_load warp does not use that index and lives immediately above the
-        # transfer block (warp 12 for the default four-warps, 13 for five-warps).
+        # any contiguous transfer block gives a permutation of its local warp
+        # indices, preserving per-warp stages and barrier participants. The dGLU
+        # c_load warp sits immediately above the communication warps.
         self.enable_token_comm = True
         self.token_comm_supports_dfc2_subtile_publish = True
         self.token_in_transfer_warp_count = token_in_transfer_warp_count
@@ -554,8 +675,8 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
         # epilogue, built later in _setup_attributes(), fires the fc2_done counter for
         # the standalone / reuse_dispatch token-back warps.  Without this the dedicated
         # token-back warps spin forever on fc2_done < target and the block-wide
-        # sync_threads() in kernel_tail deadlocks (M09/M10/M14/M15 hang).  epi_warps is
-        # unaffected (it peer-writes grad_x directly and never reads fc2_done).
+        # sync_threads() in kernel_tail deadlocks. epi_warps peer-writes grad_x;
+        # quantized combine still uses the communication path to return SFs.
         self.token_back_by_dispatch = token_back_by_dispatch
         self.token_back_standalone = token_back_by_dispatch and token_back_mode == "standalone_warps"
         self.token_back_warp_id = (
@@ -577,24 +698,40 @@ class Sm107MegaMoEMxfp8DgluKernel(Sm107Mxfp8DgluDfc21Kernel, KernelClass):
             else self.dispatch_warp_id[-1] + 1
         )
 
-        # Register re-balance for the mega warp layout.  The base kernel sizes
-        # ``epi_reg_cnt`` (256) for the lean 9-warp dGLU; mega adds the configured
-        # dispatch warps (+4 token-back if standalone) and the dedicated c_load warp, so the
-        # per-CTA register file can no longer grant 256 regs to all 4 epilogue warps
-        # -- the epilogue warpgroup then stalls forever inside
-        # ``warpgroup_reg_alloc`` and the mma/tmem barrier deadlocks.  Mirror the
-        # legacy mega dGLU (megamoe_kernel_mxfp8_dglu.py:181-184).
-        self.epi_reg_cnt = 168 if self.token_back_standalone else 200
         self.threads_per_cta = 32 * (
-            len(self.epilogue_warp_id)  # 4  (warps 0-3)
-            + 1  # mma      (warp 4)
-            + 1  # tma_a    (warp 5)
-            + 1  # tma_b    (warp 6)
-            + 1  # sched    (warp 7)
-            + len(self.dispatch_warp_id)  # 4 or 5 (begins at warp 8)
-            + num_token_back_warps  # 4 iff standalone_warps in the supported topology
-            + 1  # c_load immediately above the communication warps
+            len(self.epilogue_warp_id)  # warps 0-3
+            + 4  # MMA, TMA-A, TMA-B, scheduler
+            + len(self.dispatch_warp_id)
+            + num_token_back_warps
+            + 1  # c_load
         )
+        if self.threads_per_cta > 1024:
+            raise ValueError("communication warp topology exceeds 1024 threads per CTA")
+
+        # Register allocation is limited by the fullest of four SM subpartitions.
+        # Each has 16K registers, or 512 registers per lane across its warps.
+        # Round the launch allowance down to the setmaxnreg granularity. Only
+        # actual CTA warps contribute to its register pool; an incomplete final
+        # warpgroup does not donate registers from its absent warps.
+        num_warps = self.threads_per_cta // 32
+        max_warps_per_partition = (num_warps + 3) // 4
+        entry_regs = min(256, (512 // max_warps_per_partition // 8) * 8)
+        if entry_regs < self.task_reg_cnt:
+            raise ValueError(
+                "communication warp topology leaves only "
+                f"{entry_regs} launch registers per thread; task warps need "
+                f"{self.task_reg_cnt}"
+            )
+        # One epilogue warp occupies each partition. Budget against the least
+        # populated partition, whose task warps donate the fewest registers.
+        # Preserve the existing 200/168 targets whenever this pool permits them.
+        min_warps_per_partition = num_warps // 4
+        epi_register_limit = (
+            entry_regs + (min_warps_per_partition - 1)
+            * (entry_regs - self.task_reg_cnt)
+        )
+        preferred_epi_regs = 168 if self.token_back_standalone else 200
+        self.epi_reg_cnt = min(preferred_epi_regs, epi_register_limit // 8 * 8)
 
         # --- MegaMoE constants. ---
         self.world_size = world_size

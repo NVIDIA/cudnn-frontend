@@ -1553,7 +1553,8 @@ class DgluMxfp8Epilogue:
             cur_dfc2_tile_n_idx = work_tile_info.tile_n_idx
             cur_fc2_expert_idx = work_tile_info.expert_idx
 
-            work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(not self._dfc2_subtile_publish):
+                work_tile_info = sched_consumer.consume_work()
 
             if cur_was_linear1:
                 cute.arch.cp_async_bulk_commit_group()
@@ -1563,8 +1564,8 @@ class DgluMxfp8Epilogue:
 
             task_tile_boundary_bar.arrive_and_wait()
 
-            if cur_was_linear1:
-                if cutlass.const_expr(self._dfc2_subtile_publish):
+            if cutlass.const_expr(self._dfc2_subtile_publish):
+                if cur_was_linear1:
                     # One dFC2 N256 task makes one dFC1 K512 chunk visible.
                     # Both CTAs publish independent bits after all task stores
                     # have drained and the task-boundary fence/barrier above.
@@ -1588,6 +1589,14 @@ class DgluMxfp8Epilogue:
                             scope="gpu",
                         )
 
+                # Publish completed producers before waiting for another
+                # descriptor: full-ready admission can withhold that descriptor
+                # until this very ready bit becomes visible. Waiting first
+                # creates a cycle when the remaining producers drain.
+                work_tile_info = sched_consumer.consume_work()
+
+            if cur_was_linear1:
+                if cutlass.const_expr(self._dfc2_subtile_publish):
                     # Suppress the legacy completion ADD but still advance the
                     # batched flag tracker's phase/flush state.
                     flag_tracker = flag_tracker.accumulate(
