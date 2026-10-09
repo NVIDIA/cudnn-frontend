@@ -7,7 +7,8 @@ With two S / P slots per softmax sub-tile the MMA warp issues BMM1(k + 1) of bot
 core runs it while the softmax warps are still on S(k) (``sm107/prefill_d128_f16.py`` at ``d_flavor`` 32 / 64; the ``sm100/decode_d128_f16.py``
 two-slot precedent).  Every role walks a depth-2 ``PipelineState`` cursor over the slots, advanced once per non-empty kv tile; the same MMAs and
 softmax steps run in the same order, so O and Stats are BITWISE the one-slot kernel's -- a pure overlap lever.  The switch is a TemplateParams
-FIELD (appended, default 1): the template-module cache keys on the record alone, so a module-level seam read at module-exec time would hand a
+FIELD (appended, default 1; the knob-less pick ``config_sm107.sm107_s_slots_pick`` is the MEASURED rule: 2 on the plain body at TILE_N 64, 1 on
+every other form): the template-module cache keys on the record alone, so a module-level seam read at module-exec time would hand a
 second plan with the same record the FIRST module (an in-process A/B compares the base with itself); ``config_sm107.sm107_s_slots_pick`` puts
 the sweep seam's value INTO the record.  Tiers: CPU contract (the TMEM map gains the slot axis at 2 and is untouched at 1, the typed raises off
 the domain -- TILE_N 128, d128, a quantized dtype, 3 slots -- the pick, two records -> two modules), host rendering pins (sm_107a trace-compile:
@@ -58,7 +59,7 @@ def _pins(monkeypatch):
 # --------------------------------------------------------------------------- tier 1: CPU contract
 
 
-def test_the_field_is_appended_the_seam_is_private_and_the_derived_count_is_one():
+def test_the_field_is_appended_the_seam_is_private_and_the_record_default_is_one():
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
@@ -70,8 +71,30 @@ def test_the_field_is_appended_the_seam_is_private_and_the_derived_count_is_one(
     assert c._CfgSm107.S_SLOTS == 1
     for d in (32, 64):
         for tile_n in (64, 128):
-            assert c.sm107_s_slots_pick(d, tile_n) == 1
-    assert c.sm107_s_slots_pick(32, 64, request=2) == 2
+            assert c.sm107_s_slots_pick(d, tile_n, has_bias=True, has_kv_mask=True) == 1
+    assert c.sm107_s_slots_pick(32, 64, request=2) == 2 and c.sm107_s_slots_pick(32, 64, request=1) == 1
+
+
+def test_the_measured_default_is_two_slots_on_the_plain_tile_n_64_body_only():
+    """The knob-less pick is the measured rule (``sm107_s_slots_pick``'s docstring carries the cells): two slots on the plain body (no bias,
+    no kv_mask) at TILE_N 64 of the f16/bf16 32- / 64-wide tiles -- the served pick at ``s_kv % 128`` in 1..64 (S 300: d32 +4.33 %, d64
+    +6.63 %) and the public TILE_N 64 knob (+8.4..+11.9 %) -- and one slot on every form that lost or was not measured: a bias + kv_mask
+    (-0.69..-5.93 %), a bias alone (mixed), a kv_mask alone (unmeasured), TILE_N 128 (no TMEM fit), the quantized dtypes and d128 (not
+    wired).  The adapter threads the graph facts in (``_s_slots``); a caller without them gets the plain rule."""
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    for d in (32, 64):
+        assert c.sm107_s_slots_pick(d, 64) == 2, d
+        assert c.sm107_s_slots_pick(d, 64, has_bias=False, has_kv_mask=False) == 2, d
+        assert c.sm107_s_slots_pick(d, 128) == 1, "TILE_N 128: 2 x 2 x 128 + O leaves no room for STATS"
+        assert c.sm107_s_slots_pick(d, 64, has_bias=True) == 1, "bias alone: mixed sign, one slot"
+        assert c.sm107_s_slots_pick(d, 64, has_kv_mask=True) == 1, "kv_mask alone: unmeasured, one slot"
+        assert c.sm107_s_slots_pick(d, 64, has_bias=True, has_kv_mask=True) == 1, "bias + kv_mask: a loss on every cell"
+        assert c.sm107_s_slots_pick(d, 64, dtype_qkv=0) == 1 and c.sm107_s_slots_pick(d, 64, dtype_qkv=1) == 1, "fp8: not wired"
+    assert c.sm107_s_slots_pick(128, 64) == 1, "d128: not wired"
+    assert c.sm107_s_slots_pick(32, 64, request=1, has_bias=False) == 1, "a request passes verbatim"
+    # the served cell's width rule and the slot rule compose: S 300 plain -> TILE_N 64 -> 2 slots; S 384 plain -> 128 -> 1
+    assert c.sm107_tile_n_pick(32, 300, has_bias=False, has_kv_mask=False) == 64 and c.sm107_tile_n_pick(32, 384, has_bias=False, has_kv_mask=False) == 128
 
 
 def test_the_seam_lands_in_the_record_verbatim(_pins):
@@ -82,7 +105,7 @@ def test_the_seam_lands_in_the_record_verbatim(_pins):
     _pins(s_slots=2)
     assert c.sm107_s_slots_pick(32, 64) == 2 and c.sm107_s_slots_pick(32, 128) == 2 and c.sm107_s_slots_pick(64, 64) == 2
     _pins(s_slots=None)
-    assert c.sm107_s_slots_pick(32, 64) == 1
+    assert c.sm107_s_slots_pick(32, 64, has_bias=True) == 1 and c.sm107_s_slots_pick(32, 64) == 2
 
 
 @pytest.mark.parametrize("d", [32, 64])
@@ -304,15 +327,20 @@ _CASES = {
 }
 # The plain cells also cover the dead-sub-tile QUIET body (the default where S_q % 256 is in 1..128 on the one-batch-entry item: S 384 /
 # 300 / 640), which walks the SAME slot cursor as the live bodies; S 300 adds the padded tail (TILE_N 64 keeps the legacy software-max
-# tail body) and the cga2 cell the non-leader CTA's dead sub-tiles + the leader-collected bmm2_ready counts.
+# tail body) and the cga2 cell the non-leader CTA's dead sub-tiles + the leader-collected bmm2_ready counts.  ``knob_tile_n`` None = the
+# SERVED pick (no TILE_N knob: the width rule's ``s_kv % 128`` in 1..64 lands on 64 and the slot rule on 2 -- the measured default's own
+# cells, S 300 dense and with per-batch KV lengths), else the public TILE_N 64 knob.
 _PLAIN_T64_CASES = {
     "plain_t64_nkv3_192": dict(b=2, h=2, h_kv=2, s_q=192, s_kv=192),
     "plain_t64_nkv8_512_causal": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, causal=True),
     "plain_t64_384_quiet": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),
     "plain_t64_300_quiet_padded_tail": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300),
+    "plain_300_served_pick": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, knob_tile_n=None),
+    "plain_300_served_pick_kv_lens": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, kv_lens=[300, 200], knob_tile_n=None),
     "plain_t64_640_quiet_causal": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640, causal=True),
     "plain_t64_384_quiet_cga2": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, cga=2),
     "d64_plain_t64_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, d=64),
+    "d64_plain_300_served_pick": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, d=64, knob_tile_n=None),
 }
 
 
@@ -381,16 +409,23 @@ def test_two_slots_match_the_fp64_oracle_and_are_bitwise_one_slot(case, _pins):
 @requires_rubin
 @pytest.mark.parametrize("case", list(_PLAIN_T64_CASES))
 def test_two_slots_on_the_plain_tile_n_64_body(case, _pins):
-    """The plain (no bias, no mask) body at TILE_N 64 through the public knob: the oracle sees a zero bias (s + 0 == s exactly); the quiet
-    cells run the dead sub-tile's QUIET body with two slots (the cursor threaded through it), S 300 the padded legacy tail."""
+    """The plain (no bias, no mask) body at TILE_N 64 -- through the public knob, or the served pick itself at S 300 (``knob_tile_n`` None:
+    the width rule lands on 64 and the measured slot rule on 2 with NO pin at all): the oracle sees a zero bias (s + 0 == s exactly); the
+    quiet cells run the dead sub-tile's QUIET body with two slots (the cursor threaded through it), S 300 the padded legacy tail, the
+    kv_lens cell the per-batch-length arm.  The knob-less plan (the default = two slots here) is BITWISE the one-slot kernel pinned
+    through the seam."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg107
+
     c = _PLAIN_T64_CASES[case]
+    tile_n = c.get("knob_tile_n", 64)
+    assert cfg107.sm107_s_slots_pick(c.get("d", 32), 64) == 2, "the measured default the knob-less arm below renders"
     q, k, v, kw, ref = _s13._case_inputs(case, torch.bfloat16, table=_PLAIN_T64_CASES)
     ref = _s13._ref_of(c, q, k, v, {**kw, "bias": torch.zeros_like(kw["bias"])})
     kw = {**kw, "bias": None}
-    two = _run(q, k, v, kw, c, _pins, s_slots=2, tile_n=64)
+    two = _run(q, k, v, kw, c, _pins, s_slots=None, tile_n=tile_n)
     _s13._check(two, ref)
-    one = _run(q, k, v, kw, c, _pins, s_slots=None, tile_n=64)
-    assert torch.equal(two["o"], one["o"]) and torch.equal(two["stats"], one["stats"]), f"{case}: S_SLOTS 2 differs from 1"
+    one = _run(q, k, v, kw, c, _pins, s_slots=1, tile_n=tile_n)
+    assert torch.equal(two["o"], one["o"]) and torch.equal(two["stats"], one["stats"]), f"{case}: S_SLOTS 2 (the default) differs from 1"
 
 
 @requires_rubin

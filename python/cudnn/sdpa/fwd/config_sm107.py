@@ -796,7 +796,8 @@ def sm107_softmax_wgs_pick(
 
 # ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` (same rules as the three seams above) pins the S / P TMEM slot count per softmax sub-tile of the
 # 32- / 64-wide f16/bf16 tiles at TILE_N 64 (``TemplateParams.s_slots``; :data:`SMALL_D_S_SLOTS`): 2 = the double-buffered S (the MMA
-# warp issues BMM1(k + 1) into the free slot ahead of BMM2(k)), None = the derived count (1).  Read by :func:`sm107_s_slots_pick`, which
+# warp issues BMM1(k + 1) into the free slot ahead of BMM2(k)), None = the derived count (the measured rule of :func:`sm107_s_slots_pick`:
+# 2 on the plain body at TILE_N 64, 1 everywhere else).  Read by :func:`sm107_s_slots_pick`, which
 # the adapter calls when it builds the record -- the value lands IN the TemplateParams, so the template-module cache (keyed on the
 # record alone) and the compiled-plan cache both see two kernels for the two counts; a pinned value is returned VERBATIM, so a plan
 # outside the arm's domain (TILE_N 128, d128, a quantized dtype) is a typed factory raise, never a silent one-slot rendering under a
@@ -808,15 +809,31 @@ _S_SLOTS_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 SMALL_D_S_SLOTS = frozenset({1, 2})
 
 
-def sm107_s_slots_pick(d_flavor: int, tile_n: int, *, dtype_qkv: int = _DTYPE_BF16, request: Optional[int] = None) -> int:
+def sm107_s_slots_pick(
+    d_flavor: int, tile_n: int, *, dtype_qkv: int = _DTYPE_BF16, request: Optional[int] = None, has_bias: bool = False, has_kv_mask: bool = False
+) -> int:
     """The ``TemplateParams.s_slots`` a knob-less plan gets: ``request`` when the caller made one (returned verbatim; the factory
-    validates it), else the sweep seam ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` (verbatim, see its note), else 1.  The derived count is 1 on
-    every shape until the double-buffered S is MEASURED a win on the cells the heuristics serve (the TILE_N 64 bias + kv_mask forms);
-    the arguments name the domain the measurement is keyed on and are what a future rule reads."""
+    validates it), else the sweep seam ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` (verbatim, see its note), else the MEASURED rule: **2 on the
+    PLAIN body (no bias, no kv_mask) at TILE_N 64** of the f16/bf16 32- / 64-wide tiles, 1 everywhere else.  Measured (bf16, B 1, a 212-SM
+    cc 10.7 perf node at the 2376 MHz lock, 100 x 3 graph-replay rounds, both slot counts in ONE process with a control twin, the kernel-only
+    CUPTI time agreeing on every cell; speed-up = t(1 slot) / t(2 slots) - 1): the plain body WINS on every TILE_N 64 cell -- the served
+    pick (``sm107_tile_n_pick`` (d): ``s_kv % 128`` in 1..64) at S 300: d32 +4.33 % (40.11 -> 38.45 us), d64 +6.63 % (47.10 -> 44.18 us,
+    duty-cycled); through the public TILE_N 64 knob at S 384 / 1024 (d32) +9.53 / +8.44 % and S 384 / 512 (d64) +11.88 / +11.46 % -- the
+    second slot lets the MMA warp issue BMM1(k + 1) of both sub-tiles ahead of BMM2(k), and the plain softmax body is the one short enough
+    for the tensor pipe to be the wait (the gain GROWS on the dead-sub-tile quiet body: S 384 d32 +4.11 % on the kv tile body before it ->
+    +9.53 % on it).  The bias + kv_mask TILE_N 64 forms LOSE on every cell (d32 S 384 / 1024 -1.67 / -5.93 %, d64 S 384 / 512 -0.69 /
+    -0.98 %: the biased softmax body is the longer stage, so the earlier BMM1 only competes with BMM2 for the tensor pipe and the slot
+    cursor's extra ring stages cost their waits), bias alone is MIXED (d32 S 384 -0.19 % inside the band, S 1024 -2.87 %; d64 S 384
+    +1.41 %), a kv_mask alone is unmeasured: those keep one slot.  The causal and per-batch-length plain forms at TILE_N 64 run the
+    two-slot body too (bitwise the one-slot kernel on O and Stats, verified; their perf is unmeasured -- the rule follows the FORM, which
+    is what the MMA issue order sees).  ``has_bias`` / ``has_kv_mask`` are the adapter's graph facts; a caller that does not pass them
+    (the sweep) gets the plain rule."""
     if request is not None:
         return int(request)
     if _S_SLOTS_OVERRIDE_FOR_SWEEPS is not None:
         return int(_S_SLOTS_OVERRIDE_FOR_SWEEPS)
+    if int(tile_n) == SM107_SMALL_TILE_N_NARROW and int(d_flavor) in (32, 64) and int(dtype_qkv) > _DTYPE_E5M2 and not has_bias and not has_kv_mask:
+        return 2
     return 1
 
 

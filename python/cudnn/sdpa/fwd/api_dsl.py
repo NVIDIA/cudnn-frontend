@@ -1647,10 +1647,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _s_slots(self) -> int:
         """The ``TemplateParams.s_slots`` of this plan: 1 everywhere but the Rubin 32- / 64-wide f16/bf16 tiles, where
-        ``config_sm107.sm107_s_slots_pick`` decides (the derived 1 until the double-buffered S is measured a default; the sweep seam's
-        value verbatim, which the factory validates against TILE_N 64 and the TMEM fit)."""
+        ``config_sm107.sm107_s_slots_pick`` decides (the MEASURED rule: 2 on the plain body -- no bias, no kv_mask -- at TILE_N 64, 1 on
+        every other form; the sweep seam's value verbatim, which the factory validates against TILE_N 64 and the TMEM fit)."""
         if self.flavor in _SM107_F16_SMALL_D_SHAPES and self._device_cc == (10, 7) and not self._fp8:
-            return _sm107_s_slots_pick(self.flavor[0], self._effective_tile_n())
+            return _sm107_s_slots_pick(self.flavor[0], self._effective_tile_n(), has_bias=self.bias_desc is not None, has_kv_mask=self.kv_mask_desc is not None)
         return 1
 
     def _resident_arm_bias_stages(self) -> int:
@@ -2877,7 +2877,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # The softmax warp-group count (2 = every record so far; 3 = the third softmax warp group of the TILE_N-64 pair item, an experiment).
             softmax_wgs=self._resident_arm_softmax_wgs(),
             # The S / P TMEM slot count per sub-tile (1 on every record but the Rubin small tiles' double-buffered S at TILE_N 64):
-            # config_sm107.sm107_s_slots_pick -- the derived 1, or the sweep seam's value verbatim (a typed factory raise off its domain).
+            # config_sm107.sm107_s_slots_pick -- the measured rule (2 on the plain TILE_N 64 body, else 1), or the sweep seam's value verbatim
+            # (a typed factory raise off its domain).
             s_slots=self._s_slots(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
