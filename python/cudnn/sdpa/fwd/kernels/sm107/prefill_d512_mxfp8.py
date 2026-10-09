@@ -265,6 +265,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     compute_kv_loop_bounds,
     lpt_tile_coords,
     make_sdpa_helpers,
+    running_max_step_finite_sentinel,
 )
 
 # ----------------------------------------------------------------------------
@@ -1340,40 +1341,27 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
+    # current_max_raw is the tile's RAW row max -- exactly NEG_INF_F32 (the finite mask sentinel) iff every column of this
+    # tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.
     if cutlass.const_expr(SCALE_PREFOLDED):
-        # Raw-domain max (Q carries attn_scale * log2(e)).  A fully-masked tile leaves it exactly at the finite mask
-        # sentinel (== NEG_INF_F32), so is_first re-fires on consecutive keyless tiles (alpha = 0) where the scaled
-        # path runs alpha = 1 between them; both publish P = exp2(0) = 1 there, the first live tile wipes the
-        # accumulator (sg1's rescale multiplies a finite O by 0), and keyless rows are overridden by the epilogue's
-        # _row_empty select -- same O either way.
+        # Raw-domain max (Q carries attn_scale * log2(e)).
         current_max = current_max_raw
     else:
-        # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF_F32), as the pre-folded
-        # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
-        # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
-        # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
-        # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves.
+        # The scaled max of a fully-masked tile is clamped to the finite sentinel (== NEG_INF_F32): at |attn_scale * log2 e| >= 1
+        # the product overflows to -inf.  The dead-tile select below keys on current_max_raw, not on this value; the clamp
+        # predates it and is kept as is, so the dense (MASK_NONE) cubin stays byte-identical.
         current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)
 
-    # Online softmax (RESCALE_THRESHOLD skip).
-    old_total_max = total_max
-    is_first = total_max == NEG_INF_F32
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD_F32)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF_F32, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that and under the pre-folded scale every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF_F32, 0) and is published by the
+    # epilogue's _row_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_raw, current_max, total_max, NEG_INF_F32, RESCALE_THRESHOLD_F32, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF_F32.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
 
     # ---- Write P[tid, :] to SMEM xfer ring slot[parity] (K1 swizzle hoist + K2 fp8 pack) ----
     # K1: the Swizzle(3,4,3) XOR term of every 16-B vector of this lane's P row is LOOP-INVARIANT: the swizzle XORs bits
@@ -1402,9 +1390,9 @@ def _sg0_softmax_kv_iter(
             src_tile = reg_S_tile
         else:
             if cutlass.const_expr(SCALE_PREFOLDED):
-                reg_S_shifted = reg_S_tile.vec - total_max
+                reg_S_shifted = reg_S_tile.vec - new_total_max
             else:
-                reg_S_shifted = reg_S_tile.vec * scale_log2 - total_max
+                reg_S_shifted = reg_S_tile.vec * scale_log2 - new_total_max
             src_tile = RegTile(reg_S_shifted, size=CFG.TILE_N)
         p_pairs = []
         for chunk in cutlass.range_constexpr(P_TMA_ITERS):
@@ -1414,7 +1402,7 @@ def _sg0_softmax_kv_iter(
                 for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
                     vals.append(chunk_vals[k * P_ELEMS_PER_VEC + i])
                 if cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse):
-                    words, pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC, fused_m=total_max)
+                    words, pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC, fused_m=new_total_max)
                 else:
                     words, pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC)
                 p_pairs.extend(pairs)
@@ -1430,13 +1418,14 @@ def _sg0_softmax_kv_iter(
             # the P the BMM2 consumes).
             iter_sum_pair = _softmax_f16.f16_pairs_sum_pair(p_pairs)
     else:
-        # f32 chain: reg_S = reg_S * scale_log2 - total_max (S - total_max under the fold); then exp2.  Keep the
+        # f32 chain: reg_S = reg_S * scale_log2 - new_total_max (S - new_total_max under the fold; 0 on a dead leading
+        # tile, whose columns then land at exp2(sentinel) = +0); then exp2.  Keep the
         # FP32 RegTile (slice via .vec slicing) and cast each 16-elem unit to FP8 -- RegTile(Float8E4M3FN) is
         # illegal at JIT, but slicing the FP32 RegTile then casting the slice is fine (per d256_fp8 pattern).
         if cutlass.const_expr(SCALE_PREFOLDED):
-            reg_S_scaled = reg_S_tile.vec - total_max
+            reg_S_scaled = reg_S_tile.vec - new_total_max
         else:
-            reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+            reg_S_scaled = reg_S_tile.vec * scale_log2 - new_total_max
         reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
         reg_P_tile = RegTile(reg_P_fp32, size=CFG.TILE_N)
         for chunk in cutlass.range_constexpr(P_TMA_ITERS):

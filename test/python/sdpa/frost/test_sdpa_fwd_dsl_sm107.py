@@ -4491,9 +4491,9 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             3,
             2,
             "current_max = current_max_raw\n",
-            "reg_S_tile.vec - total_max",
+            "reg_S_tile.vec - new_total_max",
             "current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)",
-            "reg_S_tile.vec * scale_log2 - total_max",
+            "reg_S_tile.vec * scale_log2 - new_total_max",
         ),
     ],
     ids=["d192x128", "d512"],
@@ -4895,7 +4895,7 @@ def test_d512_mxfp8_softmax_lever_constants_and_call_sites(dtype_qkv, f16, prefo
     assert {c.group(1) for c in calls} == {"True", "False"}
     # the arms are the shared helpers, consumed per 16-elem unit; the exact-sum Stats leg and the f16 pair sum both exist
     for marker in (
-        "_softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC, fused_m=total_max)",
+        "_softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC, fused_m=new_total_max)",
         "_softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC)",
         "_softmax_f16.f16_pairs_sum_pair(p_pairs)",
         "row_reduction_pair(cute.math.exp2(reg_S_shifted, fastmath=True))",
@@ -4929,14 +4929,15 @@ _D512_LEVER_MASKS = {
     "causal": (True, False, None),
     "causal_br": (True, True, None),
     "causal_br_swa200": (True, True, 200),
+    "causal_swa33": (True, False, 33),  # top-left + a 34-key band: rows >= 161 of a 256-row problem see KV tile 0 fully masked
 }
 
 
-def _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, fp8_dtype, b, hq, hkv, s_q, s_kv):
+def _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, fp8_dtype, b, hq, hkv, s_q, s_kv, attn_scale=None):
     """One (arm, Stats, mask, FP8 member) build of the d512 MXFP8 kernel against the float64 oracle of the
     DEQUANTIZED inputs: every O cell written and within 0.1 * max|ref|, every LSE row written and within 1e-4
     (natural log -- every Stats leg of this kernel uses the exact f32 sum), keyless rows O = 0 / LSE = -inf.
-    Returns the kernel module the adapter compiled."""
+    ``attn_scale`` defaults to d ** -0.5.  Returns the kernel module the adapter compiled."""
     import math
 
     import torch
@@ -4945,7 +4946,7 @@ def _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, fp8_dtype, b,
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
     d = 512
-    attn_scale = d**-0.5
+    attn_scale = d**-0.5 if attn_scale is None else attn_scale
     dev = "cuda"
     causal, bottom_right, window_left = _D512_LEVER_MASKS[mask]
     prefold_scale = attn_scale * math.log2(math.e) if prefolded else 1.0
@@ -5067,16 +5068,40 @@ def test_d512_mxfp8_softmax_levers_match_the_oracle_e5m2(precision, prefolded, w
 )
 def test_d512_mxfp8_softmax_levers_keyless_rows(mask, precision, prefolded, with_stats):
     """Keyless rows and fully-masked tiles under the levers.  Bottom-right causal with s_kv = s_q - 64: rows 0..63 hold
-    no key INSIDE a live Q tile, so their tiles run the mask sentinel through the arm (under the fold the raw max IS
-    the sentinel: is_first re-fires on every tile, P = 1 across it, so the row ends with ell = 128 rather than 0) and
-    the epilogue's geometry select must publish O = 0 / LSE = -inf regardless.  The 200-wide left band additionally
-    gives live rows a fully-masked FIRST tile (is_first re-fires on the
-    next live tile, alpha = 0) and fully-masked trailing tiles (P = 0 under a finite running max) on every arm; the
-    ragged s_kv tail is covered by the diagonal.  Live rows match the oracle."""
+    no key INSIDE a live Q tile, so their tiles run the mask sentinel through the arm (the running-max step selects every
+    one of them out of the row's state: alpha = 1, P = 0, the row ends at (sentinel, 0)) and the epilogue's geometry
+    select must publish O = 0 / LSE = -inf regardless.  The 200-wide left band additionally gives live rows a
+    fully-masked FIRST tile (selected out the same way; the first live tile starts the online softmax) and fully-masked
+    trailing tiles (P = 0 under a finite running max) on every arm; the ragged s_kv tail is covered by the diagonal.
+    Live rows match the oracle."""
     import torch
 
     _d512_lever_board_only()
     mod = _d512_mxfp8_lever_case(precision, prefolded, with_stats, mask, torch.float8_e4m3fn, 1, 4, 1, 1024, 960)
+    _assert_d512_fused_gate(mod, precision, prefolded)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "precision, prefolded, with_stats",
+    [("float", False, True), ("half", False, False), ("half", True, False), ("float", True, True)],
+    ids=["float-stats", "half-nostats", "half+fold-nostats", "float+fold-stats"],
+)
+def test_d512_mxfp8_masked_leading_tile_keeps_rows_with_later_keys_finite(precision, prefolded, with_stats):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys, on the d512 MXFP8 role-split kernel:
+    top-left causal with a 34-key band at S = 256 (rows 161..255: no key in tile 0, their 34 keys in tile 1) at attn_scale 1,
+    on every softmax arm -- the f32 chain, HALF (f16x2 exponent), HALF + fold (the fused shift + convert when stats-less) and
+    FLOAT + fold.  The scaled chain clamps the tile max to the finite sentinel and the fold keeps the raw one, so both took the
+    sentinel as the running max and published P = 1 per masked column, mass that only alpha = 0 at the next live tile wiped;
+    the running-max step now selects the dead tile out of the state (total_max kept, alpha = 1, P = 0).  The all-ones draw
+    makes every live row's softmax flat (O = V exactly), so the cells are deterministic; the module's own oracle judges them."""
+    from unittest.mock import patch
+
+    import torch
+
+    _d512_lever_board_only()
+    with patch.object(torch, "randn", side_effect=lambda *a, **k: torch.ones(*a, **k)):
+        mod = _d512_mxfp8_lever_case(precision, prefolded, with_stats, "causal_swa33", torch.float8_e4m3fn, 1, 4, 1, 256, 256, attn_scale=1.0)
     _assert_d512_fused_gate(mod, precision, prefolded)
 
 
