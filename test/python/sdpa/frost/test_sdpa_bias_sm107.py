@@ -748,9 +748,10 @@ def _frost_plans(g):
     return names, [i for i, n in enumerate(names) if n == _ROW or n.startswith(_ROW + "[")]
 
 
-def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, cga=None):
-    """Build the graph, pin the Rubin f16 row (optionally a cga through the public autotune record), launch TWICE on
-    sentinel-filled outputs (the two-launch delta) and return O, Stats and the plan's knobs."""
+def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_kv=None, seq_len_q=None, sink=None, stats=True, cga=None, tile_n=None):
+    """Build the graph, pin the Rubin f16 row (optionally a cga and / or a KV tile width through the public autotune record;
+    ``tile_n=None`` keeps the heuristics' pick), launch TWICE on sentinel-filled outputs (the two-launch delta) and return O,
+    Stats and the plan's knobs (``knobs.tile_n`` = the width the executed plan carries)."""
     import cudnn
 
     g, vp, o, o_gpu, stats_gpu = _build(
@@ -760,17 +761,24 @@ def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_k
     names, ours = _frost_plans(g)
     idx = next((i for i in ours if g.plans[i].knobs.split_kv in (None, 1)), None)
     assert idx is not None, f"no unsplit {_ROW} plan in {names}"
-    picked_cga = g.plans[idx].knobs.cga
-    if cga is not None and picked_cga != cga:
+    picked = g.plans[idx].knobs
+    picked_cga, picked_tile_n = picked.cga, picked.tile_n
+    want_cga = picked_cga if cga is None else cga
+    want_tile_n = picked_tile_n if tile_n is None else tile_n
+    if (want_cga, want_tile_n) != (picked_cga, picked_tile_n):
         engine_id, record = g.get_engine_and_knobs_at_index(idx)
         record = dict(record)
-        record[cudnn.knob_type.TILE_CGA_M] = cga
+        if want_cga != picked_cga:
+            record[cudnn.knob_type.TILE_CGA_M] = want_cga
+        if want_tile_n != picked_tile_n:
+            record[cudnn.knob_type.TILE_N] = want_tile_n
         g.create_execution_plan(engine_id, record)
         idx = g.get_execution_plan_count() - 1
-        picked_cga = cga
+        picked_cga, picked_tile_n = want_cga, want_tile_n
     g.select_plan(idx)
     g.check_support()
     g.build_plans()
+    assert (g.plans[idx].knobs.cga, g.plans[idx].knobs.tile_n) == (picked_cga, picked_tile_n), (g.plans[idx].knobs, picked_cga, picked_tile_n)
     vp[o] = o_gpu
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
 
@@ -785,7 +793,7 @@ def _run(q, k, v, *, scale, bias=None, kv_mask=None, sdpa_kwargs=None, seq_len_k
     o1, st1 = launch()
     o2, st2 = launch()
     assert torch.equal(o1, o2) and (st1 is None or torch.equal(st1, st2)), "two-launch delta on O / Stats"
-    return dict(o=o_gpu, stats=stats_gpu, knobs=SimpleNamespace(cga=picked_cga), names=names)
+    return dict(o=o_gpu, stats=stats_gpu, knobs=SimpleNamespace(cga=picked_cga, tile_n=picked_tile_n), names=names)
 
 
 def _check(out, ref, *, has_stats=True):
@@ -1029,16 +1037,35 @@ def test_kv_mask_fully_masked_row_equals_the_zero_length_sequence():
 def test_identity_bias_zero_and_mask_all_true_is_bitwise_the_plain_kernel(case, dtype):
     """bias = 0 and kv_mask = all True change no value: the biased rendering (the -inf masked body on every tile, the software
     row max, fma(0, 1/scale, s) == s, a keep word of all ones) is BITWISE the plain kernel on O and Stats -- as is each arm
-    alone."""
+    alone -- at the KV tile width the arm RUNS.  Every arm runs knob-less, so the heuristics' width table decides its rendering
+    (``config_sm107.sm107_tile_n_pick``: the narrow tile for a bias WITH a mask on every case here, for a bias alone on the padding
+    leg and for either arm alone at one 128-wide kv tile; 128 otherwise), and the plain twin is pinned to THAT width through the
+    public record: the 64- and the 128-wide renderings reduce the row in a different number of steps, so the identity is a property
+    of one rendering, never a cross-width claim (a plain 128 vs a biased 64 differ in the last bits of O and Stats)."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg107
+
     q, k, v, kw, _ = _case_inputs(case, dtype)
     c = _CASES[case]
-    plain = _run(q, k, v, **{**kw, "bias": None, "kv_mask": None})
+    plain_by_width = {}
+
+    def plain_at(width):
+        if width not in plain_by_width:
+            plain_by_width[width] = _run(q, k, v, **{**kw, "bias": None, "kv_mask": None}, tile_n=width)
+            assert plain_by_width[width]["knobs"].tile_n == width, plain_by_width[width]["knobs"]
+        return plain_by_width[width]
+
+    def table_pick(has_bias, has_kv_mask):
+        return cfg107.sm107_tile_n_pick(c.get("d", 32), c["s_kv"], has_bias=has_bias, has_kv_mask=has_kv_mask, padded="kv_lens" in c)
+
     zero = torch.zeros(1, 1, c["s_q"], c["s_kv"], device="cuda", dtype=dtype)
     ones = torch.ones(c["b"], 1, 1, c["s_kv"], device="cuda", dtype=torch.bool)
     for label, b_arg, m_arg in (("bias=0 + mask=all-true", zero, ones), ("bias=0", zero, None), ("mask=all-true", None, ones)):
         out = _run(q, k, v, **{**kw, "bias": b_arg, "kv_mask": m_arg})
-        assert torch.equal(out["o"], plain["o"]), f"{label}: O differs from the plain kernel"
-        assert torch.equal(out["stats"], plain["stats"]), f"{label}: Stats differ from the plain kernel"
+        width = out["knobs"].tile_n
+        assert width == table_pick(b_arg is not None, m_arg is not None), (label, out["knobs"])
+        plain = plain_at(width)
+        assert torch.equal(out["o"], plain["o"]), f"{label} at TILE_N {width}: O differs from the plain kernel"
+        assert torch.equal(out["stats"], plain["stats"]), f"{label} at TILE_N {width}: Stats differ from the plain kernel"
 
 
 @requires_rubin

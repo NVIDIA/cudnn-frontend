@@ -634,11 +634,21 @@ _ADD_CASES = {
 def test_additive_kv_mask_matches_the_fp64_oracle_with_the_vector_folded_in_fp32(case):
     """The additive vector (-1e9 on 30 % of the keys, 0 elsewhere) folded like the eager models fold it: O / Stats against the
     fp64 oracle with the fp32 add, keyless rows (none here: a -1e9 key is finite) absent, two launches bitwise."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg107
+
     c = _ADD_CASES[case]
     out, ref, _ = _run_cell(c, torch.bfloat16, tile_n=c.get("tile_n"))
     assert out["knobs"].cga == c.get("cga", 1)
-    # the fp32 vector WITH a bias runs the 64-wide rendering whether the knob is given or the heuristics pick it
-    assert out["executed_tile_n"] == c.get("tile_n", 64 if (c.get("add") == "f32" and c.get("bias")) else 128), (case, out["knobs"])
+    # A knob-less cell runs the width the heuristics' table picks -- ONE arithmetic, ``config_sm107.sm107_tile_n_pick`` (the vector
+    # travels as the graph's kv_mask: the narrow tile for a bias WITH a mask of any dtype and for a mask alone at one 128-wide kv
+    # tile, 128 elsewhere; test_sdpa_heuristics_small_tile_sm107.py pins the table itself) -- and the fp32 vector WITH a bias has ONE
+    # served width, 64, whether the knob is given or the table picks it.
+    want = c.get("tile_n")
+    if want is None:
+        want = cfg107.sm107_tile_n_pick(c.get("d", 32), c["s"], has_bias=bool(c.get("bias")), has_kv_mask=True, padded="kv_lens" in c)
+    if c.get("add") == "f32" and c.get("bias"):
+        assert want == cfg107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N == 64, (case, want)
+    assert out["executed_tile_n"] == want, (case, want, out["knobs"])
     _check(out, ref)
 
 
