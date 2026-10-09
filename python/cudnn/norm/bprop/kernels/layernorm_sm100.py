@@ -908,8 +908,11 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     import torch
 
     wcfg = _bwd_pipe_cfg(spec.M, DTYPE_BYTES[params.io_dtype])
-    if wcfg is not None and wcfg[1] == 1 and not spec.has_mean and (spec.R % 2 == 0):
-        # tiny C (single warp per row) RMS: multi-row tiling beats the per-row pipeline
+    if wcfg is not None and wcfg[1] == 1 and not spec.has_mean and (spec.R % 2 == 0) and not has_beta:
+        # tiny C (single warp per row) RMS: multi-row tiling beats the per-row pipeline.
+        # Only without beta -- this path returns dgamma alone, and selecting it for a
+        # bias-carrying RMSNorm silently dropped dbeta to None (the caller then saw an
+        # unwritten gradient, not an error). RMSNorm with bias is legal in cuDNN.
         return _backward_tiled(spec, dy2d, x2d, gamma, rstd, params=params, wcfg=wcfg)
     if wcfg is not None and _pipe_bwd_eligible(spec.M, wcfg[1], wcfg[2], wcfg[3], spec.R, has_beta, DTYPE_BYTES[params.io_dtype]):
         return _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params, wcfg=wcfg)

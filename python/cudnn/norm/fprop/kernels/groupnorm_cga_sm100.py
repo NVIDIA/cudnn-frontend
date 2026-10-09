@@ -321,7 +321,10 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None):
         cutlass.Int32(spec.gamma_inner_span),
     )
     ce = (M, NVEC, CGA, _BT, V, PER, KC, it_ty, et, float(M), float(eps), bool(spec.has_mean), has_beta, R * CGA)
-    key = (params.io_dtype, M, R, CGA, KC, bool(spec.has_mean), has_beta)
+    # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
+    # change epsilon without rebuilding the graph (it is a pass-by-value operand),
+    # and a key without it silently replays the kernel compiled for the old value.
+    key = (params.io_dtype, M, R, CGA, KC, bool(spec.has_mean), has_beta, float(eps))
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_gn_fwd_cga_host, *args, *ce)

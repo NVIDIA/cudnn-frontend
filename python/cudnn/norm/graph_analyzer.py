@@ -89,13 +89,14 @@ class NormGraphFacts:
     normalized_shape: Optional[tuple] = None  # LayerNorm/RMSNorm
     num_groups: Optional[int] = None  # GroupNorm
     dtype: Optional[torch.dtype] = None  # X dtype
-    uniform_dtype: bool = True  # DY dtype equals X's (backward)
+    uniform_dtype: bool = True  # scale/bias (and DY) share X's dtype; stats are always fp32
 
     # requested features / scalars
     has_beta: bool = False
     has_mean: bool = True
     training: bool = True
     eps: float = 1e-5
+    eps_t: Any = None
     momentum: float = 0.1
     wants_running_stats: bool = False
 
@@ -210,6 +211,12 @@ def _extract_facts(node: Any) -> NormGraphFacts:
         sshape = tuple(d for d in tuple(scale.get_dim()) if d != 1)
         normalized_shape = sshape or x_shape[-1:]
 
+    # epsilon is an input TENSOR on a cuDNN graph, not a node param: reading it from
+    # params alone silently yields the 1e-5 default for every graph that passes a
+    # different value, and the normalization is then quietly wrong everywhere
+    # (eps=1e-3 showed up as a ~0.5% error across 89% of elements). The tensor is
+    # carried through to the lowering, which reads its value at execute time.
+    eps_t = _port(inputs, "epsilon", "EPSILON", "eps")
     eps = params.get("epsilon")
     eps = float(eps) if eps is not None else 1e-5
     momentum = params.get("momentum")
@@ -218,9 +225,14 @@ def _extract_facts(node: Any) -> NormGraphFacts:
     dy = _port(inputs, "grad", "DY", "dy") if phase == "bprop" else None
     if phase == "bprop" and dy is None:
         return _invalid("backward norm node missing grad (DY) input")
-    uniform = True
+    # "uniform" must cover every operand the kernels read at the I/O dtype, not just
+    # DY. cuDNN lets a caller pass fp32 scale/bias alongside a bf16 input -- the torch
+    # custom ops do exactly that -- and these kernels read gamma/beta AS the I/O dtype,
+    # so an fp32 buffer read as bf16 is garbage (measured 14.6 absolute error, 91% of
+    # elements). mean/inv_var are excluded: they are fp32 by definition.
+    uniform = all(_DTYPE_FROM_CUDNN.get(t.get_data_type()) == x_dtype for t in (scale, bias) if t is not None)
     if dy is not None:
-        uniform = _DTYPE_FROM_CUDNN.get(dy.get_data_type()) == x_dtype
+        uniform = uniform and _DTYPE_FROM_CUDNN.get(dy.get_data_type()) == x_dtype
 
     # mean / inv_variance are node OUTPUTS in forward (training) and node INPUTS
     # in backward. cuDNN spells the fwd output ``inv_var`` and the bwd input
@@ -255,6 +267,7 @@ def _extract_facts(node: Any) -> NormGraphFacts:
         has_mean=HAS_MEAN[variant],
         training=training,
         eps=eps,
+        eps_t=eps_t,
         momentum=momentum,
         wants_running_stats=(run_mean is not None and run_var is not None),
         device_cc=_device_cc(),

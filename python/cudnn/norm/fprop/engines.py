@@ -130,6 +130,7 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             "inv_var": facts.inv_var_t,
             "run_mean": facts.run_mean_t,
             "run_var": facts.run_var_t,
+            "epsilon": facts.eps_t,
         }
     )
 
@@ -140,12 +141,13 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
         beta = resolved.get(id(facts.bias_t)) if facts.bias_t is not None else None
         rm = resolved.get(id(facts.run_mean_t)) if facts.run_mean_t is not None else None
         rv = resolved.get(id(facts.run_var_t)) if facts.run_var_t is not None else None
+        eps = _eps_value(resolved.get(id(facts.eps_t)) if facts.eps_t is not None else None, facts.eps)
         y, mean, rstd = norm_fprop(
             facts.variant,
             x,
             gamma,
             beta,
-            eps=facts.eps,
+            eps=eps,
             normalized_shape=facts.normalized_shape,
             num_groups=facts.num_groups,
             momentum=facts.momentum,
@@ -161,6 +163,24 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
         return None
 
     return _execute
+
+
+def _eps_value(buf, fallback):
+    """The graph's epsilon, read from its bound buffer.
+
+    cuDNN takes epsilon as a host scalar, so this is a host read of host memory and
+    not the device read Rule 3 bans. A device-resident epsilon would need that read,
+    so it is refused at check time instead (see the engine's decline) rather than
+    silently normalised with the wrong value.
+    """
+    if buf is None:
+        return fallback
+    if hasattr(buf, "device") and buf.device.type != "cpu":
+        return fallback
+    try:
+        return float(buf.reshape(-1)[0].item())
+    except Exception:
+        return fallback
 
 
 def _copy_into(buf, src):

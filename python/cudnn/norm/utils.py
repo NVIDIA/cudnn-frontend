@@ -15,7 +15,17 @@ from cutlass.cute.runtime import from_dlpack
 
 
 def dyn(t):
-    """Wrap a torch tensor as a dynamic-layout cute tensor (16-byte aligned)."""
+    """Wrap a torch tensor as a dynamic-layout cute tensor (16-byte aligned).
+
+    Detaches first when the tensor is on an autograd tape: ``__dlpack__`` refuses
+    to export one that requires grad (``BufferError: Can't export tensors that
+    require gradient``), and a caller handing a graph a parameter straight out of
+    a module hits exactly that. ``detach()`` shares storage, so an output written
+    through the detached alias still lands in the caller's buffer, and these
+    kernels compute their gradients explicitly -- there is no tape to preserve.
+    """
+    if t.requires_grad:
+        t = t.detach()
     return from_dlpack(t, assumed_align=16).mark_layout_dynamic()
 
 

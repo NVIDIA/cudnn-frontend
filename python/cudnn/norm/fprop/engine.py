@@ -56,6 +56,11 @@ class FrostNormFwdEngine(BaseEngine):
         facts = analyze_for(graph)
         if facts is None:
             return "graph is not a single norm node this engine serves"
+        if not facts.uniform_dtype:
+            # These kernels read scale/bias/DY at the I/O dtype; a mixed-precision
+            # graph would be read wrong rather than merely be slow.
+            return "scale/bias/DY must share the input dtype; mixed-precision parameters are not supported"
+
         return mismatch(self._spec.capabilities, facts, knobs)
 
     def check_support(self, graph) -> None:
