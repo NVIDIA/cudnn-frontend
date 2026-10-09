@@ -8,12 +8,15 @@ the API pruning plan, not this document.
 ## Name pattern
 
 ```
-cudnn.<op_name>_<direction>        # PyTorch
-cudnn.<op_name>_jax_<direction>    # JAX
+cudnn.<op_name>_<direction>               # PyTorch
+cudnn.<op_name>_jax_<direction>           # JAX
+cudnn.<op_name>_standalone_<direction>    # no framework
 ```
 
 - `<op_name>`: the operation in snake_case, such as `grouped_gemm_swiglu` or `sdpa`.
 - `jax`: marks the JAX variant. The PyTorch variant has no framework token.
+- `standalone`: marks the framework-free variant, which takes raw device
+  pointers and a stream instead of framework tensors.
 - `<direction>`: `forward` or `backward`. Every op has a direction, including an
   op without a backward.
 
@@ -50,3 +53,4 @@ Each name is a function exported from the top-level `cudnn` package.
 | `cudnn.torch.block_sparse_attention_forward` | `cudnn.block_sparse_attention_forward` |
 | `cudnn.jax.block_sparse_attention_forward` | `cudnn.block_sparse_attention_jax_forward` |
 | `cudnn.jax.kimi_delta_attention_fwd` | `cudnn.kimi_delta_attention_jax_forward` |
+| `cudnn.causal_conv1d_forward` (raw pointers) | `cudnn.causal_conv1d_standalone_forward` |
