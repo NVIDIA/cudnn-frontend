@@ -21,7 +21,11 @@ pre-upstream helper would give STAGES_KV = 2*CTA_MMA (4 at cga2) where FROST
 gives 2; the deeper ring is a PERF lever and this port was for FUNCTIONAL
 coverage first, so it is deliberately not taken on d128.  The 32- and 64-wide
 tiles below run STAGES_KV = 4 at cga1 (``config_sm107._stages_kv_d128``, the
-SM100 d64 precedent -- inherited, not A/B'd).
+SM100 d64 precedent); the depth is a Cfg field the body is generic over (no
+accumulator parity is indexed from the K / V ring; ``PipelineState.advance``
+runs index and phase over any depth on both sides, the pair item's two tiles
+per kv step included), validated at 2 / 3 / 4 (``config_sm107.SMALL_D_STAGES_KV``)
+and pinned for an A/B through ``config_sm107._STAGES_KV_OVERRIDE_FOR_SWEEPS``.
 
 **Head-dim tile flavors (``TemplateParams.d_flavor`` in {32, 64, 128}).**  One
 body, three ``Cfg`` geometries: ``make_cfg_d32`` / ``make_cfg_d64`` /

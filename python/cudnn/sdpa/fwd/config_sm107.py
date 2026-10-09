@@ -107,6 +107,7 @@ __all__ = [
     "SM107_HEAD_DIM_TILE_WIDTHS",
     "SM107_F16_SMALL_D_SHAPES",
     "SM107_SMALL_D_CGAS",
+    "SMALL_D_STAGES_KV",
     "sm107_f16_tile_width",
     "sm107_small_tile_leg",
     "D128FamilyTmemLayout",
@@ -443,6 +444,14 @@ def sm107_bias_ring_stages(
 # mismatch, the heuristics' width pick and the adapter), so neither is configuration nor part of the public surface.
 _BIAS_MODE_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 _BIAS_STAGES_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+# ``_STAGES_KV_OVERRIDE_FOR_SWEEPS`` (same rules) pins the K / V ring depth of the 32- / 64-wide f16/bf16 tiles (``_stages_kv_d128``,
+# the small-tile branch; 2 / 3 / 4 = :data:`SMALL_D_STAGES_KV`): the A/B arm of the ring-depth lever.  Read by the ONE helper every
+# budget and the factory call, so a pinned depth moves the bias budgets with it (a shallower ring frees SMEM for the resident block /
+# a deeper bias ring).  None = the derived depth (4).
+_STAGES_KV_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+# The K / V ring depths the small-tile body is validated at (SMEM fit at every width in SM107_SMALL_D_CGAS, the ring-wrap axis
+# n_kv = depth / depth + 1 / two wraps of the fresh-process census).  The validator pins cfg.STAGES_KV to this set on the small tiles.
+SMALL_D_STAGES_KV = frozenset({2, 3, 4})
 
 
 # The ONE-BATCH-ENTRY item at the 32-wide tile's cga1 STREAMS its bias wherever its ring fits, resident budget or not: the 256-row
@@ -1235,6 +1244,12 @@ def _validate_head_dim_tile(cfg, flavor: str) -> None:
                 f"{flavor}: the d128 family serves TILE_K == TILE_O (32/64/128) or the d192xd128 pair (got {cfg.TILE_K}/{cfg.TILE_O})",
             ),
             (
+                cfg.TILE_K > 64 or cfg.STAGES_KV in SMALL_D_STAGES_KV,
+                f"{flavor}: the 32- / 64-wide tiles' K / V ring is validated at STAGES_KV in {sorted(SMALL_D_STAGES_KV)} (got {cfg.STAGES_KV}); the body is "
+                f"depth-generic but the SMEM fit and the ring-wrap census hold for these depths only -- a depth of 1 serialises every kv tile behind "
+                f"its own BMM1 and a depth above 4 was never run",
+            ),
+            (
                 cfg.TILE_K % cfg.TILE_K_HW_BMM1 == 0 and cfg.TILE_O % 16 == 0,
                 f"{flavor}: TILE_K must be whole BMM1 k-steps of {cfg.TILE_K_HW_BMM1} and TILE_O a multiple of the correction warps' 16-column O chunk",
             ),
@@ -1455,7 +1470,21 @@ def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -
         # The small head-dim tiles (TILE_K = TILE_O in {32, 64}): a quarter / half of d128's slabs, so a 4-deep ring is
         # 96 / 192 KiB at cga1 (64 / 128 KiB at cga2), inside the carveout at either width, and 4 is the depth the SM100 d64
         # flavor runs (its ncu read long_scoreboard as the dominant stall).  A perf lever, not a body constraint (the ring
-        # is depth-generic; the body indexes no accumulator parity from it) -- the small-D sweep re-measures it.
+        # is depth-generic; the body indexes no accumulator parity from it; ``PipelineState.advance`` runs the index and the
+        # phase over any depth >= 1 on both the TMA-LDG and the MMA side, the pair item's two tiles per kv step included).
+        # ``_STAGES_KV_OVERRIDE_FOR_SWEEPS`` (2 / 3 / 4, the depths the SMEM validator and the body were validated at) pins
+        # the depth for the A/B of the small-tile knob sweep; it is read HERE so the bias budgets (``sm107_bias_resident_tiles``
+        # / ``sm107_bias_ring_stages``, which call this helper) and the factory see ONE depth (rule 8b').  Measured on a
+        # 212-SM cc 10.7 node at the 2376 MHz lock (bf16, graph replay, control pair; the knob sweep's A/B/A): see the
+        # STAGES_KV row of the small-tile heuristics notes before moving the default.
+        if _STAGES_KV_OVERRIDE_FOR_SWEEPS is not None:
+            want = int(_STAGES_KV_OVERRIDE_FOR_SWEEPS)
+            if want not in SMALL_D_STAGES_KV:
+                raise ValueError(
+                    f"_STAGES_KV_OVERRIDE_FOR_SWEEPS={want}: the 32- / 64-wide tiles' K / V ring is validated at {sorted(SMALL_D_STAGES_KV)} stages "
+                    f"(SMEM fit + the ring-wrap axis of the fresh-process census); a depth outside it is unvalidated, not merely slow"
+                )
+            return want
         return 4
     return 2 * cta_mma
 
