@@ -171,12 +171,12 @@ def test_decode_cfg_accepts_the_decode_geometry_and_rejects_the_rest():
 
 
 @pytest.mark.L0
-def test_standalone_cga_domain_admits_cga1_on_d128_f16_only():
+def test_standalone_cga_domain_cga1_is_a_decode_tile_only_on_d128_f16():
     """The adapter's twin of the engine row's domain (keep the three in lockstep).
     cga1 on the d128 f16/bf16 flavor IS the decode tile; the quantized families
-    have no decode tile -- per-tensor FP8 d128 also builds at cga1, but as its
-    256-row prefill CTA (the dense unsplit leg the heuristics run there), and
-    MXFP8 d128 keeps the cga2 pair."""
+    have no decode tile -- per-tensor FP8 d128 and MXFP8 d128 also build at cga1,
+    but as their 256-row prefill CTA (the legs heuristics._auto_sched_cga sends
+    there), never as a decode tile."""
     from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
 
     assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 0)) == (1, 2)
