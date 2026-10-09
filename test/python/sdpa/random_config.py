@@ -255,6 +255,11 @@ class ExecConfig:
     # graph.create_execution_plan and selects it.  A pin is strict: a decline of the pinned plan
     # FAILS the case (it never degrades to another plan).  Plain dict, so --repro replays the pin.
     plan_pin: dict = None
+    # Paged MXFP8 harness lever (sdpa/mxfp8.py, forward / inference; set AFTER the RandomizationContext so no seed
+    # moves): V pages live at a different pool permutation than K's and bind their OWN block table (proves per-page
+    # SF_V addressing rather than contiguous-pool luck).  The MXFP8 harness reads paged_pool_layout ("nhd") and
+    # sink_token_value above as the f16 harness does.
+    paged_distinct_v_table: bool = False
 
     @property
     def is_train(self):

@@ -163,7 +163,7 @@ sdpa/frost/test_sdpa_bwd_stage3_block_scale_sm107.py::test_block_scale_thd_leg_s
 sdpa/frost/test_sdpa_bwd_staged_copy_sm100.py::test_staged_execute_uses_prepared_copies[dtype0]
 sdpa/frost/test_sdpa_bwd_staged_sm100.py::test_staged_rebind_stream_capture[roles0-264-4-False-dtype0]
 sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_capabilities_claim_thd_and_a_ragged_bottom_right
-sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_fp8_thd_declines_the_external_delta
+sdpa/frost/test_sdpa_bwd_thd_fp8_sm107.py::test_fp8_thd_serves_the_external_delta
 sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_capabilities_claim_thd_with_declared_totals
 sdpa/frost/test_sdpa_bwd_thd_mxfp8_sm107.py::test_graph_thd_mxfp8_backend_replay_takes_the_totals
 sdpa/frost/test_sdpa_bwd_thd_setup_sm100.py::test_parallel_bwd_setup_prefixes[128-0-0]
