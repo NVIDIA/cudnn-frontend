@@ -687,7 +687,9 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         seen = set()
         for floor, bb, direction, override in rows:
             assert floor in floors and bb in th.BATCH_BUCKETS and direction in (None, "outgoing", "incoming")
-            axes = [a for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "k_block") if getattr(override, a) is not None]
+            axes = [
+                a for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "k_block", "ln_pass_form", "epi_math") if getattr(override, a) is not None
+            ]
             assert len(axes) == 1, (width, floor, bb, direction, axes)
             for d in (("outgoing", "incoming") if direction is None else (direction,)):
                 assert (floor, bb, d, axes[0]) not in seen, "two refinements override one axis of one cell"
@@ -717,6 +719,19 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     assert th.recommend(384, 256, 4, "incoming").k_block == 128 and th.recommend(640, 128, 1).k_block == 128  # N mod 256 in 1..128: fewer rows at 128
     assert th.recommend(300, 128, 1).k_block == 128 and th.recommend(400, 128, 1).k_block == 256  # 400: 512 rows per bi either way -> the rule's 256
     assert th.recommend(768, 128, 1).k_block == 256 and th.recommend(217, 128, 1).k_block == 256  # multiples of 256 and N < 256 keep the rule
+    # the two substrate forms (bitwise the register / scalar rendering): c = 256 runs the rolled re-read LayerNorm form + the packed epilogue on
+    # every bucket (the K = 256 register residency was the whole story); c = 128 runs the packed epilogue everywhere and the rolled form where it
+    # measured ahead of the packed-only pick (N 256 at B = 1, N 384, N 512 at B >= 4, N >= 1024), the register form elsewhere
+    for n in (33, 128, 217, 256, 384, 512, 768, 1024, 4096):
+        for b in (1, 4):
+            assert th.recommend(n, 256, b).ln_pass_form == "smem_rolled" and th.recommend(n, 256, b).epi_math == "packed", (n, b)
+            assert th.recommend(n, 128, b).epi_math == "packed", (n, b)
+    assert th.recommend(256, 128, 1).ln_pass_form == th.recommend(384, 128, 1).ln_pass_form == th.recommend(384, 128, 4).ln_pass_form == "smem_rolled"
+    assert th.recommend(1024, 128, 1).ln_pass_form == th.recommend(1024, 128, 4).ln_pass_form == th.recommend(4096, 128, 1).ln_pass_form == "smem_rolled"
+    assert th.recommend(256, 128, 4).ln_pass_form == "registers" and th.recommend(512, 128, 4).ln_pass_form == "smem_rolled"  # the batch-keyed LN forms
+    for n in (33, 128, 217, 512, 768):
+        assert th.recommend(n, 128, 1).ln_pass_form == "registers", n
+    assert th.recommend(768, 128, 4).ln_pass_form == th.recommend(128, 128, 4).ln_pass_form == th.recommend(217, 128, 4).ln_pass_form == "registers"
     from dataclasses import replace
 
     base = th.recommend(512, 128, 1)
@@ -729,10 +744,14 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     )  # keeps pair-A4 / major / transpose
     assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs()) == base  # an empty record changes nothing
     assert th.resolve(512, 128, 1, "outgoing") == base
-    full = th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4, k_block=128)
+    full = th.TriMulKnobs(
+        k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4, k_block=128, ln_pass_form="smem", epi_math="scalar"
+    )
     assert full.is_complete() and th.resolve(512, 128, 1, "outgoing", knobs=full) == full  # a complete record replaces every axis
     four = th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4)
-    assert not four.is_complete() and th.resolve(512, 128, 1, "outgoing", knobs=four) == replace(four, k_block=256)  # the row tile from the rule
+    assert not four.is_complete() and th.resolve(512, 128, 1, "outgoing", knobs=four) == replace(
+        four, k_block=256, ln_pass_form=base.ln_pass_form, epi_math=base.epi_math
+    )  # the row tile from the rule, the two forms from the table
     assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4), k2_tile=k2.SMALL_N_TILE_CONFIG) == replace(
         base, clc_stages=4, k2_tile=k2.SMALL_N_TILE_CONFIG
     )
@@ -744,6 +763,8 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         (dict(k_block=96), "k_block"),
         (dict(k_block=32), "k_block"),  # the projection stage alone would admit it; the output stage's MN-major box needs >= 64
         (dict(k_block=True), "k_block"),
+        (dict(ln_pass_form="rows"), "ln_pass_form"),
+        (dict(epi_math="vector"), "epi_math"),
     ):
         with pytest.raises(ValueError, match=axis):
             th.validate_knobs(th.TriMulKnobs(**bad))

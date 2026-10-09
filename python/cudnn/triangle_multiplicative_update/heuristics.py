@@ -62,10 +62,6 @@ BATCH_BUCKETS: Tuple[int, ...] = (1, 4)
 DEFAULT_K1_PASS_ORDER = "interleaved"
 DEFAULT_K3_PROLOGUE = "mn_major"
 DEFAULT_CLC_STAGES = 2
-#: The substrate forms every bucket pick carries today (the substrate's own defaults): the re-read / packed forms are selectable through
-#: ``TriMulKnobs(ln_pass_form=..., epi_math=...)`` and flip here per width only with a measured A/B/A on the perf-node class.
-_LN_FORM_DEFAULT = "registers"
-_EPI_MATH_DEFAULT = "scalar"
 
 
 @dataclass(frozen=True)
@@ -130,24 +126,51 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 # wins +1.3..+1.5 % once the ring is 1 deep and the output prologue is the transpose form (interleaved had won +4 % standalone at the 2-deep ring),
 # and at N <= 128 the transpose prologue adds +3.1..+4.3 % on top of the 1-CTA tile (three of four cells decisive, the fourth +0.84 % under a 1.19 %
 # control spread -- adopted by judgment).
+#
+# The two substrate FORMS (the LayerNorm pass form and the epilogue arithmetic form; both bitwise the register / scalar rendering) were measured as
+# a separate pass on the two LayerNorm-prologue kernels STANDALONE (the projection stage K1 and the output stage K3, graph replay, 100-400 x 3,
+# control pair, every arm bitwise equal to the base) over N in {128, 217, 256, 384, 512, 768, 1024} x B in {1, 4} per width; the per-width signs:
+#   c = 256: the row RE-READ with ROLLED chunk loops (``ln_pass_form="smem_rolled"``) is the whole register-residency story -- K1 +178..+199 %
+#            and K3 +140..+146 % over the register form on every N >= 256 cell of both passes (K1 N = 512: 682 -> 232 us; the K = 256 renderings
+#            spilled 240 / 241 and 499 / 504 words per lane, the rolled form 0 / 0 at REG 112-114), and the packed epilogue ON TOP of it adds
+#            +1.4..+2.3 % (K1) / +0.4..+0.9 % (K3) more, outside every such cell's control spread -- although packed ALONE loses 1.1..2.9 % against
+#            the register form (the epilogue is not the binding stage until the spills are gone).  Every c = 256 pick: rolled + packed.
+#   c = 128: the packed epilogue (``epi_math="packed"``) wins or ties on every cell of both kernels (K1 +4.8..+37 %; K3 +2.0..+11.9 % with two
+#            neutral cells, +0.0 / -0.1 % at N 217 / 384 B = 1 on the second pass: no spills here, half the ALU issue of the gated epilogue); the
+#            rolled re-read form is a per-BUCKET sign on K1 (K3 runs the transpose prologue at c = 128, under which the substrate serves the
+#            register form only, so the knob reaches the projection stage alone): over the packed-only pick it is +3.7 / +3.7 % at N = 256 B = 1
+#            (-1.8 / -1.7 % at B = 4: the refinement below), +17.1 / +12.4 % at N = 384 B = 1 (the second pass at the 128-row tile the API runs
+#            there) and +9.7 / +2.1 % at B = 4, -1.8 / -1.4 % at N = 512 B = 1 (+0.7 / +0.7 % at B = 4: the second refinement below), +0.1 /
+#            +0.1 % at N = 768 (neutral: the register form stays) and +0.68 / +0.66 % at N = 1024 B = 1 (the 0.5 % threshold met only barely)
+#            with +1.3 % at B = 4 (both cells of the bucket, two passes: the rolled form), and a LOSS of 3.8 / 4.0 and 8.6 / 6.5 % at N = 217 /
+#            128 (three SMEM passes with nothing to buy) -- two passes on two nodes of the class, the same sign on every cell.  The unrolled re-read form
+#            ("smem") is not in the table: -4.5..-12.7 % at c = 128 and a third of the rolled form's gain at c = 256 (its normalise pass
+#            still spills half).
+def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str) -> TriMulKnobs:
+    """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`)."""
+    return TriMulKnobs(
+        k2_tile=k2_tile, k1_pass_order=k1_pass_order, k3_prologue=k3_prologue, clc_stages=clc_stages, ln_pass_form=ln_pass_form, epi_math=epi_math
+    )
+
+
 _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     128: (
-        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "transpose", 1, "smem_rolled", "packed")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed")),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 1, "smem_rolled", "packed")),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 2, "smem_rolled", "packed")),
+        (129, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed")),
+        (0, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed")),
     ),
     256: (
-        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
-        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=2, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
+        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
+        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled", "packed")),
     ),
 }
 
@@ -159,8 +182,14 @@ _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
 #   c = 128, N <= 128, B = 1, incoming:       ring depth 1   +1.87 % (as base +1.75 %; the outgoing twin -0.34 %, B = 4 -0.5..-0.6 %)
 #   c = 128, 256 <= N < 384, B >= 4:          ring depth 1   +1.95 / +1.87 % (as base +1.97 / +2.01 %; B = 1 loses 1.5 %), and ON TOP of it
 #                                             pass-MAJOR K1  +1.26 / +1.33 % (the ring-depth interaction of the N >= 512 buckets: at depth 1 the
-#                                             adjacent-pass order loses what the shared x read gains; at depth 2 the two orders tied)
+#                                             adjacent-pass order loses what the shared x read gains; at depth 2 the two orders tied), and the
+#                                             REGISTER LN form: the rolled re-read form loses 1.8 / 1.7 % against the packed-only pick on
+#                                             this cell (standalone K1, two passes; the same work as N = 512 B = 1, where it loses 1.8 / 1.4 %)
+#                                             while B = 1 gains 3.7 / 3.7 %
 #   c = 128, 384 <= N < 512, B = 1:           ring depth 4   +1.02 / +1.04 % (as base +0.93 / +1.04 %; B = 4 loses 1.9 %)
+#   c = 128, 512 <= N < 768, B >= 4:          ROLLED LN form +0.7 / +0.7 % over the packed-only pick (standalone K1, two passes; B = 1 loses
+#                                             1.8 / 1.4 % -- the sign follows the amount of work: 512 x 4 computes the rows of 1024 x 1, where
+#                                             the rolled form wins too)
 #   c = 256, N <= 128, B >= 4:                ring depth 1   +0.53 / +0.57 % (as base +0.59 / +0.71 %; B = 1 loses 3.4 %)
 # Not adopted: the 1-CTA tile with B multicast at c = 128, 256 <= N < 384, B = 1 -- +0.5..+0.6 % over the pair tile as an arm in three passes but
 # +0.26 % inside a 0.53 % control spread when measured as the base (a light-load cell at the 2352 MHz step); the pair tile stays, the residue is
@@ -170,7 +199,9 @@ _REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]
         (0, 1, "incoming", TriMulKnobs(clc_stages=1)),
         (256, 4, None, TriMulKnobs(clc_stages=1)),
         (256, 4, None, TriMulKnobs(k1_pass_order="major")),
+        (256, 4, None, TriMulKnobs(ln_pass_form="registers")),
         (384, 1, None, TriMulKnobs(clc_stages=4)),
+        (512, 4, None, TriMulKnobs(ln_pass_form="smem_rolled")),
     ),
     256: ((0, 4, None, TriMulKnobs(clc_stages=1)),),
 }

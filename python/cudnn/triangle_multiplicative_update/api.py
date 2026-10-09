@@ -26,7 +26,7 @@ Served today: Rubin (SM107, compute capability 10.7), bf16, ``c_z == c in {128, 
 direction needs ``N % 8 == 0``), the forward only.  ``c_z = 384`` is withdrawn: its sm_107a renderings spill through a 1.7 KB stack per
 thread (the LayerNorm row held in registers) and no oracle cell covers them -- it returns with a rendering free of that residency and an
 accept test per direction.  Performance knobs (the contraction tile, the projection stage's tile order, the output stage's prologue form,
-the scheduler ring depth, the two LayerNorm-prologue stages' row tile ``k_block``) come from :mod:`.heuristics` -- the measured defaults per geometry -- and may be overridden per plan; every
+the scheduler ring depth, the two LayerNorm-prologue stages' row tile ``k_block``, their LayerNorm pass form and epilogue arithmetic form) come from :mod:`.heuristics` -- the measured defaults per geometry -- and may be overridden per plan; every
 value of every domain computes the same function.  Everything else is a typed decline (``NotImplementedError`` for a valid-but-unserved
 declaration, ``ValueError`` for a malformed one), never a silent slow path -- including autograd: no backward is registered yet, so a call
 under grad mode with an input or parameter that ``requires_grad`` raises ``NotImplementedError`` instead of returning a tensor without a
@@ -460,7 +460,10 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                     eps=self.eps,
                     a0_prologue=self.knobs.k3_prologue,
                     clc_stages=self.knobs.clc_stages,
-                    ln_pass_form=self.knobs.ln_pass_form,
+                    # the re-read LayerNorm forms re-read the MN-major operand in every pass, which the transpose prologue's K-major writes
+                    # would overwrite (a typed decline of the substrate): under `transpose` the output stage keeps the register form and the
+                    # knob's value serves the projection stage alone
+                    ln_pass_form=(self.knobs.ln_pass_form if self.knobs.k3_prologue == "mn_major" else "registers"),
                     epi_math=self.knobs.epi_math,
                 ),
                 self.device_index,
