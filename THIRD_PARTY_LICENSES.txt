@@ -200,14 +200,14 @@ system, for the Python bindings' tensor-exchange interface.
 License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 
 -------------------------------------------------------------------------------
-8. pybind11
-   https://github.com/pybind/pybind11
+8. nanobind
+   https://github.com/wjakob/nanobind
 
-Build-time dependency (v2.13.6) used to build the Python bindings.
+Build-time dependency (v3.0.1 or newer 3.x) used to build the Python bindings.
 
 License: BSD-style 3-Clause License
 
-Copyright (c) 2016 Wenzel Jakob <wenzel.jakob@epfl.ch>, All rights reserved.
+Copyright (c) 2022 Wenzel Jakob <wenzel.jakob@epfl.ch>, All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

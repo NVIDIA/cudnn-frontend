@@ -4,7 +4,7 @@
 #include "sdpa_fixed_binding.h"
 #include <array>
 
-namespace py = pybind11;
+namespace py = nanobind;
 namespace cudnn_frontend {
 namespace python_bindings {
 namespace {
@@ -77,13 +77,13 @@ class SdpaSm80ThdBinder : private FixedSdpaOperands {
 
    public:
     explicit SdpaSm80ThdBinder(const py::object &spec)
-        : FixedSdpaOperands("sdpa_fwd_sm80_thd", spec.attr("device_index").cast<int64_t>()),
+        : FixedSdpaOperands("sdpa_fwd_sm80_thd", py::cast<int64_t>(spec.attr("device_index"))),
           fn_(spec.attr("fn")),
           owner_(spec.attr("artifact")),
-          n_seq_(spec.attr("n_seq").cast<int64_t>()),
-          has_sink_(spec.attr("has_sink").cast<bool>()) {
-        const auto heads = spec.attr("heads").cast<std::array<int64_t, 2>>();
-        const auto dims  = spec.attr("dimensions").cast<std::array<int64_t, 2>>();
+          n_seq_(py::cast<int64_t>(spec.attr("n_seq"))),
+          has_sink_(py::cast<bool>(spec.attr("has_sink"))) {
+        const auto heads = py::cast<std::array<int64_t, 2>>(spec.attr("heads"));
+        const auto dims  = py::cast<std::array<int64_t, 2>>(spec.attr("dimensions"));
         h_               = heads[0];
         h_kv_            = heads[1];
         d_qk_            = dims[0];
@@ -91,16 +91,16 @@ class SdpaSm80ThdBinder : private FixedSdpaOperands {
         if (h_ <= 0 || h_kv_ <= 0 || h_ % h_kv_ || d_qk_ <= 0 || d_v_ <= 0 || n_seq_ <= 0 ||
             n_seq_ == std::numeric_limits<int64_t>::max())
             invalid("invalid immutable packed geometry");
-        const auto dtype = spec.attr("dtype").cast<std::string>();
+        const auto dtype = py::cast<std::string>(spec.attr("dtype"));
         if (dtype != "float16" && dtype != "bfloat16") invalid("packed input requires half dtype");
         for (const auto &name : {"q", "k", "v", "o"}) operands_.push_back(operand(name, dtype, 16));
         operands_.push_back(operand("stats", "float32", 4));
-        const auto prefixes = spec.attr("prefix_dtypes").cast<std::array<std::string, 2>>();
+        const auto prefixes = py::cast<std::array<std::string, 2>>(spec.attr("prefix_dtypes"));
         for (size_t i = 0; i < 2; ++i) {
             if (prefixes[i] != "int32" && prefixes[i] != "int64") invalid("prefix dtype requires int32 or int64");
             operands_.push_back(operand(i == 0 ? "cu_q" : "cu_k", prefixes[i], prefixes[i] == "int32" ? 4 : 8));
         }
-        const auto sink = spec.attr("sink_dtype").cast<std::string>();
+        const auto sink = py::cast<std::string>(spec.attr("sink_dtype"));
         if (sink != "float16" && sink != "bfloat16" && sink != "float32") invalid("invalid sink dtype");
         operands_.push_back(operand("sink", sink, sink == "float32" ? 4 : 2));
     }
@@ -110,7 +110,7 @@ class SdpaSm80ThdBinder : private FixedSdpaOperands {
         if (max_sq <= 0 || right_bound < 0 || right_bound > INT32_MAX) invalid("invalid query bound or right window");
         if (scale == 0.0) {
             PyErr_SetString(PyExc_ZeroDivisionError, "float division by zero");
-            throw py::error_already_set();
+            throw py::python_error();
         }
         const auto facts = read_native_operand_views(pack, {0, 1, 2, 3, 4, 5, 6, 7});
         std::array<std::vector<int64_t>, 8> stride;
@@ -147,29 +147,29 @@ class SdpaSm80ThdBinder : private FixedSdpaOperands {
         if ((tq > 1 && stride[3][1] != row) || (h_ > 1 && stride[3][2] != d_v_) ||
             (tq > 0 && h_ > 1 && stride[4][1] != tq) || (tq > 1 && stride[4][2] != 1))
             invalid("packed O and Stats must have their compact output layouts");
-        py::tuple frame(22);
+        py::list frame;
         for (size_t i = 0; i < 8; ++i)
-            frame[i] = i == 7 && !has_sink_ ? py::none() : py::object(py::int_(facts[i].pointer));
-        frame[8]  = py::int_(tq);
-        frame[9]  = py::int_(tkv);
-        frame[10] = py::int_(max_sq);
+            frame.append(i == 7 && !has_sink_ ? py::none() : py::object(py::int_(facts[i].pointer)));
+        frame.append(py::int_(tq));
+        frame.append(py::int_(tkv));
+        frame.append(py::int_(max_sq));
         for (size_t i = 0; i < 3; ++i) {
-            frame[11 + i * 2] = py::int_(stride[i][1]);
-            frame[12 + i * 2] = py::int_(stride[i][2]);
+            frame.append(py::int_(stride[i][1]));
+            frame.append(py::int_(stride[i][2]));
         }
-        frame[17] = py::float_(scale * 1.4426950408889634);
-        frame[18] = py::float_(1.0 / scale);
-        frame[19] = py::int_(right_bound);
-        frame[20] = py::make_tuple(stride[5][0], stride[6][0], has_sink_ ? stride[7][0] : 1);
-        frame[21] = py::int_(stream);
-        return frame;
+        frame.append(py::float_(scale * 1.4426950408889634));
+        frame.append(py::float_(1.0 / scale));
+        frame.append(py::int_(right_bound));
+        frame.append(py::make_tuple(stride[5][0], stride[6][0], has_sink_ ? stride[7][0] : 1));
+        frame.append(py::int_(stream));
+        return py::tuple(frame);
     }
 
     void
     execute(py::handle pack, int64_t max_sq, double scale, int64_t right_bound, int64_t stream) const {
         const auto frame = bind(pack, max_sq, scale, right_bound, stream);
-        auto result      = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
-        if (!result) throw py::error_already_set();
+        auto result      = py::steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
+        if (!result) throw py::python_error();
     }
 };
 }  // namespace

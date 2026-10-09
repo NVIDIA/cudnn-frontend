@@ -10,7 +10,10 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <pybind11/stl.h>
+
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 namespace cudnn_frontend {
 namespace python_bindings {
@@ -19,10 +22,10 @@ namespace python_bindings {
 // tile sizes/host slots are retained; addresses, capacities and devices are current.
 class SdpaMxScaleBinding {
    public:
-    explicit SdpaMxScaleBinding(const pybind11::object &spec) {
-        sizes_ = spec.attr("quant").attr("sf_sizes").cast<std::vector<int64_t>>();
+    explicit SdpaMxScaleBinding(const nanobind::object &spec) {
+        sizes_ = nanobind::cast<std::vector<int64_t>>(spec.attr("quant").attr("sf_sizes"));
         if (sizes_.size() != 2 && sizes_.size() != 3) invalid("MXFP8 requires two or three input scale factors");
-        const auto order = spec.attr("order").cast<std::vector<std::string>>();
+        const auto order = nanobind::cast<std::vector<std::string>>(spec.attr("order"));
         for (size_t i = 0; i < names_.size(); ++i) {
             const auto found = std::find(order.begin(), order.end(), names_[i]);
             if (found == order.end()) invalid("MXFP8 host is missing " + std::string(names_[i]));
@@ -30,14 +33,16 @@ class SdpaMxScaleBinding {
         }
         for (auto size : sizes_)
             if (size <= 0) invalid("MXFP8 tile size must be positive");
-        device_ = spec.attr("device_index").cast<int64_t>();
-        heads_  = {spec.attr("qh").cast<int64_t>(), spec.attr("kh").cast<int64_t>(), spec.attr("kh").cast<int64_t>()};
+        device_ = nanobind::cast<int64_t>(spec.attr("device_index"));
+        heads_  = {nanobind::cast<int64_t>(spec.attr("qh")),
+                   nanobind::cast<int64_t>(spec.attr("kh")),
+                   nanobind::cast<int64_t>(spec.attr("kh"))};
     }
 
     void
     bind(const std::vector<NativeOperandView> &facts,
          size_t first_sf,
-         pybind11::tuple *frame,
+         nanobind::list *frame,
          bool packed,
          bool paged,
          int64_t batch,
@@ -48,7 +53,7 @@ class SdpaMxScaleBinding {
         if (sizes_.size() == 2) {
             if (packed || paged) invalid("PV-BF16 scale binding requires dense operands");
             if (facts[first_sf + 2].filled) invalid("PV-BF16 does not consume sf_v");
-            if (frame) (*frame)[indices_[2]] = pybind11::none();
+            if (frame) (*frame)[indices_[2]] = nanobind::none();
         }
         for (size_t i = 0; i < sizes_.size(); ++i) {
             const auto &f = facts[first_sf + i];
@@ -79,11 +84,11 @@ class SdpaMxScaleBinding {
             }
             if (count > std::numeric_limits<int32_t>::max()) invalid("MXFP8 tile count exceeds Int32");
             tiles[i] = std::max<int64_t>(1, count);
-            if (frame) (*frame)[indices_[i]] = pybind11::int_(bytes ? f.pointer : 0);
+            if (frame) (*frame)[indices_[i]] = nanobind::int_(bytes ? f.pointer : 0);
         }
         if (sizes_.size() == 3 && tiles[1] != tiles[2])
             invalid("MXFP8 K/V scales must have the same packed tile count");
-        if (frame) (*frame)[indices_[3]] = pybind11::make_tuple(tiles[0], tiles[1], tiles[2]);
+        if (frame) (*frame)[indices_[3]] = nanobind::make_tuple(tiles[0], tiles[1], tiles[2]);
     }
 
     static int64_t
@@ -94,7 +99,7 @@ class SdpaMxScaleBinding {
    private:
     [[noreturn]] static void
     invalid(const std::string &message) {
-        throw pybind11::value_error("cudnn.sdpa: " + message);
+        throw nanobind::value_error(("cudnn.sdpa: " + message).c_str());
     }
     static int64_t
     multiply(int64_t a, int64_t b) {

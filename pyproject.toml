@@ -98,7 +98,7 @@ triton = [
 dev = [
     "jupyter",
     "numpy",
-    "pybind11[global]>=2.13,<3",
+    "nanobind>=3.0.1,<4",
     "pytest",
     "pytest-xdist",
     "cuda-python",
@@ -122,7 +122,9 @@ jax = [
 ]
 
 [build-system]
-requires = ["setuptools>=64", "cmake>=3.18", "ninja==1.11.1.1", "pybind11[global]>=2.13,<3"]
+# nanobind 3.x matches the project's Python 3.10 minimum.
+# 3.0.0 was yanked for incorrectly advertising Python 3.9 support.
+requires = ["setuptools>=64", "cmake>=3.26", "ninja==1.11.1.1", "nanobind>=3.0.1,<4"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

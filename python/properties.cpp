@@ -7,16 +7,15 @@
 #include <optional>
 #include <unordered_map>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
-#include "pybind11/complex.h"
-#include "pybind11/functional.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "cudnn_frontend.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend {
 
@@ -248,19 +247,18 @@ init_properties(py::module_& m) {
         .value("VIEW_ONLY", cudnn_frontend::ReshapeMode_t::VIEW_ONLY)
         .value("LOGICAL", cudnn_frontend::ReshapeMode_t::LOGICAL);
 
-    py::class_<cudnn_frontend::graph::Tensor_attributes, std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(
-        m, "tensor")
+    py::class_<cudnn_frontend::graph::Tensor_attributes>(m, "tensor")
         .def(py::init<>())
         .def("get_name", &cudnn_frontend::graph::Tensor_attributes::get_name)
-        .def("set_name", &cudnn_frontend::graph::Tensor_attributes::set_name)
+        .def("set_name", &cudnn_frontend::graph::Tensor_attributes::set_name, py::rv_policy::reference)
         .def("get_data_type", &cudnn_frontend::graph::Tensor_attributes::get_data_type)
-        .def("_set_data_type", &cudnn_frontend::graph::Tensor_attributes::set_data_type)
+        .def("_set_data_type", &cudnn_frontend::graph::Tensor_attributes::set_data_type, py::rv_policy::reference)
         .def("get_dim", &cudnn_frontend::graph::Tensor_attributes::get_dim)
-        .def("set_dim", &cudnn_frontend::graph::Tensor_attributes::set_dim)
+        .def("set_dim", &cudnn_frontend::graph::Tensor_attributes::set_dim, py::rv_policy::reference)
         .def("get_stride", &cudnn_frontend::graph::Tensor_attributes::get_stride)
-        .def("set_stride", &cudnn_frontend::graph::Tensor_attributes::set_stride)
+        .def("set_stride", &cudnn_frontend::graph::Tensor_attributes::set_stride, py::rv_policy::reference)
         .def("get_is_virtual", &cudnn_frontend::graph::Tensor_attributes::get_is_virtual)
-        .def("set_is_virtual", &cudnn_frontend::graph::Tensor_attributes::set_is_virtual)
+        .def("set_is_virtual", &cudnn_frontend::graph::Tensor_attributes::set_is_virtual, py::rv_policy::reference)
         .def(
             "set_output",
             [](cudnn_frontend::graph::Tensor_attributes& self,
@@ -268,30 +266,33 @@ init_properties(py::module_& m) {
                 self.set_is_virtual(!is_output);
                 return self;
             },
-            py::return_value_policy::reference)  // NOTICE THATS ITS JUST ANOTHER NAME FOR SET_IS_VIRTUAL
+            py::rv_policy::reference)  // NOTICE THATS ITS JUST ANOTHER NAME FOR SET_IS_VIRTUAL
         .def("get_is_pass_by_value", &cudnn_frontend::graph::Tensor_attributes::get_is_pass_by_value)
-        .def("set_is_pass_by_value", &cudnn_frontend::graph::Tensor_attributes::set_is_pass_by_value)
+        .def("set_is_pass_by_value",
+             &cudnn_frontend::graph::Tensor_attributes::set_is_pass_by_value,
+             py::rv_policy::reference)
         .def("get_has_compile_time_constant", &cudnn_frontend::graph::Tensor_attributes::get_has_compile_time_constant)
         .def("get_uid", &cudnn_frontend::graph::Tensor_attributes::get_uid)
-        .def("set_uid", &cudnn_frontend::graph::Tensor_attributes::set_uid)
+        .def("set_uid", &cudnn_frontend::graph::Tensor_attributes::set_uid, py::rv_policy::reference)
         .def("get_reordering_type", &cudnn_frontend::graph::Tensor_attributes::get_reordering_type)
         .def("set_reordering_type",
              &cudnn_frontend::graph::Tensor_attributes::set_reordering_type,
-             py::return_value_policy::reference)
+             py::rv_policy::reference)
         .def("get_alignment", &cudnn_frontend::graph::Tensor_attributes::get_alignment)
-        .def("set_alignment",
-             &cudnn_frontend::graph::Tensor_attributes::set_alignment,
-             py::return_value_policy::reference)
+        .def("set_alignment", &cudnn_frontend::graph::Tensor_attributes::set_alignment, py::rv_policy::reference)
         .def("get_vector_count", &cudnn_frontend::graph::Tensor_attributes::get_vector_count)
         .def("get_vector_dimension", &cudnn_frontend::graph::Tensor_attributes::get_vector_dimension)
         .def("set_vector_count_and_dimension",
              &cudnn_frontend::graph::Tensor_attributes::set_vector_count_and_dimension,
-             py::return_value_policy::reference)
-        .def("set_ragged_offset", &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset)
+             py::rv_policy::reference)
+        .def("set_ragged_offset",
+             &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset,
+             py::arg("ragged_offset").none(),
+             py::rv_policy::reference)
         .def("get_ragged_offset_multiplier", &cudnn_frontend::graph::Tensor_attributes::get_ragged_offset_multiplier)
         .def("set_ragged_offset_multiplier",
              &cudnn_frontend::graph::Tensor_attributes::set_ragged_offset_multiplier,
-             py::return_value_policy::reference)
+             py::rv_policy::reference)
         .def("__repr__", [](cudnn_frontend::graph::Tensor_attributes const& props) {
             std::ostringstream out;
             out << json{props};
@@ -350,16 +351,16 @@ init_properties(py::module_& m) {
         py::arg("knob_type"),
         "True for knobs in the frontend-only band (>= FRONTEND_KNOB_TYPE_BASE); they have no backend counterpart.");
 
-    py::class_<cudnn_frontend::Knob, std::shared_ptr<cudnn_frontend::Knob>>(m, "knob")
+    py::class_<cudnn_frontend::Knob>(m, "knob")
         .def(py::init<cudnn_frontend::KnobType_t, int64_t, int64_t, int64_t>(),
-             py::arg_v("knob_type", cudnn_frontend::KnobType_t::NOT_SET),
-             py::arg_v("max_value", py::none()),
-             py::arg_v("min_value", py::none()),
-             py::arg_v("stride", py::none()))
-        .def_readonly("type", &cudnn_frontend::Knob::type)
-        .def_readonly("max_value", &cudnn_frontend::Knob::maxValue)
-        .def_readonly("min_value", &cudnn_frontend::Knob::minValue)
-        .def_readonly("stride", &cudnn_frontend::Knob::stride)
+             py::arg("knob_type") = cudnn_frontend::KnobType_t::NOT_SET,
+             py::arg("max_value") = py::none(),
+             py::arg("min_value") = py::none(),
+             py::arg("stride")    = py::none())
+        .def_ro("type", &cudnn_frontend::Knob::type)
+        .def_ro("max_value", &cudnn_frontend::Knob::maxValue)
+        .def_ro("min_value", &cudnn_frontend::Knob::minValue)
+        .def_ro("stride", &cudnn_frontend::Knob::stride)
         .def("__repr__", [](cudnn_frontend::Knob const& knob) {
             std::stringstream ss;
             json j;
@@ -373,7 +374,7 @@ init_properties(py::module_& m) {
 
     m.def("get_last_error_string", &get_last_error_string);
 
-    py::class_<cudnn_frontend::KernelCache, std::shared_ptr<cudnn_frontend::KernelCache>>(m, "kernel_cache")
+    py::class_<cudnn_frontend::KernelCache>(m, "kernel_cache")
         .def("serialize", &kernel_cache_to_json_helper)
         .def("deserialize", &kernel_cache_from_json_helper)
         .def("revision",
@@ -405,8 +406,7 @@ init_properties(py::module_& m) {
              )pbdoc");
     m.def("create_kernel_cache", &create_kernel_cache_helper);
 
-    py::class_<cudnn_frontend::DeviceProperties, std::shared_ptr<cudnn_frontend::DeviceProperties>>(m,
-                                                                                                    "device_properties")
+    py::class_<cudnn_frontend::DeviceProperties>(m, "device_properties")
         .def("serialize", &serialize_device_properties_helper);
     m.def(
         "create_device_properties",
@@ -495,22 +495,3 @@ init_properties(py::module_& m) {
 
 }  // namespace python_bindings
 }  // namespace cudnn_frontend
-
-// namespace pybind11 {
-//     namespace detail {
-//     template <> struct type_caster<std::shared_ptr<cudnn_frontend::KernelCache>> {
-//     public:
-//         PYBIND11_TYPE_CASTER(std::shared_ptr<cudnn_frontend::KernelCache>, _("KernelCachePtr"));
-
-//         bool load(handle , bool) {
-//             return false; // Prevent Python -> C++ conversion
-//         }
-
-//         static handle cast(std::shared_ptr<cudnn_frontend::KernelCache> src, return_value_policy, handle) {
-//             if (!src) return none().release();
-//             return capsule(new std::shared_ptr<cudnn_frontend::KernelCache>(std::move(src)),
-//                            [](void *ptr) { delete static_cast<std::shared_ptr<cudnn_frontend::KernelCache>*>(ptr);
-//                            }).release();
-//         }
-//     };
-// }} // namespace pybind11::detail

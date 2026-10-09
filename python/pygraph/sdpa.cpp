@@ -5,15 +5,17 @@
 
 #include <utility>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/function.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 
 #include "cudnn_frontend.h"
 #include "pygraph.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend::python_bindings {
 
@@ -87,7 +89,7 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     // Set generate_stats
     if (!generate_stats.is_none()) {
         if (py::isinstance<py::bool_>(generate_stats)) {
-            attributes.set_generate_stats(generate_stats.cast<bool>());
+            attributes.set_generate_stats(py::cast<bool>(generate_stats));
         } else {
             throw std::runtime_error("generate_stats must be a bool.");
         }
@@ -107,29 +109,30 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
     if (!paged_attention_max_seq_len_kv.is_none()) {
         if (py::isinstance<py::int_>(paged_attention_max_seq_len_kv)) {
-            attributes.set_paged_attention_max_seq_len_kv(paged_attention_max_seq_len_kv.cast<int>());
+            attributes.set_paged_attention_max_seq_len_kv(py::cast<int>(paged_attention_max_seq_len_kv));
         } else {
             throw std::runtime_error("paged_attention_max_seq_len_kv must be an int (or None)");
         }
     }
 
     if (!max_total_seq_len_q.is_none()) {
-        int64_t const max_total_seq_len_q_value = max_total_seq_len_q.cast<int64_t>();
+        int64_t const max_total_seq_len_q_value = py::cast<int64_t>(max_total_seq_len_q);
         attributes.set_max_total_seq_len_q(max_total_seq_len_q_value);
     }
 
     if (!max_total_seq_len_kv.is_none()) {
-        int64_t const max_total_seq_len_kv_value = max_total_seq_len_kv.cast<int64_t>();
+        int64_t const max_total_seq_len_kv_value = py::cast<int64_t>(max_total_seq_len_kv);
         attributes.set_max_total_seq_len_kv(max_total_seq_len_kv_value);
     }
 
     // Set attn_scale
     if (!attn_scale.is_none()) {
         if (py::isinstance<py::float_>(attn_scale)) {
-            auto const attn_scale_value = attn_scale.cast<float>();
+            auto const attn_scale_value = py::cast<float>(attn_scale);
             attributes.set_attn_scale(attn_scale_value);
         } else {
-            auto const attn_scale_tensor = attn_scale.cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const attn_scale_tensor =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(attn_scale);
             if (!attn_scale_tensor) {
                 throw std::runtime_error("attn_scale must be a cudnn_tensor or float.");
             }
@@ -141,7 +144,7 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     // Note: previously fp16 only, newly enabled for fp8
     if (!left_bound.is_none()) {
         if (py::isinstance<py::int_>(left_bound)) {
-            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+            attributes.set_diagonal_band_left_bound(py::cast<int64_t>(left_bound));
         } else {
             throw std::runtime_error("diagonal_band_left_bound must be an int (or None)");
         }
@@ -149,7 +152,7 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
     if (!right_bound.is_none()) {
         if (py::isinstance<py::int_>(right_bound)) {
-            attributes.set_diagonal_band_right_bound(right_bound.cast<int64_t>());
+            attributes.set_diagonal_band_right_bound(py::cast<int64_t>(right_bound));
         } else {
             throw std::runtime_error("diagonal_band_right_bound must be an int (or None)");
         }
@@ -157,16 +160,16 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
     // Set dropout
     if (!dropout.is_none()) {
-        py::tuple dropout_tuple = dropout.cast<py::tuple>();
+        py::tuple dropout_tuple = py::cast<py::tuple>(dropout);
         if ((!dropout_tuple) || (dropout_tuple.size() != 3 && dropout_tuple.size() != 2)) {
             throw std::runtime_error(
                 "dropout must be a tuple of (float probability, a seed tensor, and an offset tensor) or (mask "
                 "tensor, scale tensor)");
         }
         if (py::isinstance<py::float_>(dropout_tuple[0])) {
-            auto const probability = dropout_tuple[0].cast<float>();
-            auto const seed        = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const offset      = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const probability = py::cast<float>(dropout_tuple[0]);
+            auto const seed   = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
+            auto const offset = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[2]);
 
             if (!seed) {
                 throw std::runtime_error("dropout seed must be a cudnn_tensor.");
@@ -179,12 +182,12 @@ PyGraph::sdpa_internal(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                 attributes.set_rng_dump(rng_dump);
             }
         } else {
-            auto const mask = dropout_tuple[0].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const mask = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[0]);
             if (!mask) {
                 throw std::runtime_error("dropout mask must be a cudnn_tensor.");
             }
 
-            auto const scale = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const scale = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
             if (!scale) {
                 throw std::runtime_error("dropout scale must be a cudnn_tensor.");
             }
@@ -299,7 +302,7 @@ PyGraph::sdpa(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
     }
     if (!is_inference.is_none()) {
         if (py::isinstance<py::bool_>(is_inference)) {
-            actual_generate_stats = py::bool_(!is_inference.cast<bool>());
+            actual_generate_stats = py::bool_(!py::cast<bool>(is_inference));
         } else {
             throw std::runtime_error("is_inference must be a bool.");
         }
@@ -440,14 +443,15 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
         attributes.set_dsink_token(dSink_token);
     }
 
-    py::object cudnn_tensor_type = py::module_::import("cudnn").attr("tensor");
+    py::object cudnn_tensor_type = py::module_::import_("cudnn").attr("tensor");
 
     if (!attn_scale.is_none()) {
         if (py::isinstance<py::float_>(attn_scale)) {
-            auto const attn_scale_value = attn_scale.cast<float>();
+            auto const attn_scale_value = py::cast<float>(attn_scale);
             attributes.set_attn_scale(attn_scale_value);
         } else {
-            auto const attn_scale_tensor = attn_scale.cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const attn_scale_tensor =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(attn_scale);
             if (!attn_scale_tensor) {
                 throw std::runtime_error("attn_scale must be a cudnn_tensor or float.");
             }
@@ -456,18 +460,18 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
     }
 
     if (!max_total_seq_len_q.is_none()) {
-        int64_t const max_total_seq_len_q_value = max_total_seq_len_q.cast<int64_t>();
+        int64_t const max_total_seq_len_q_value = py::cast<int64_t>(max_total_seq_len_q);
         attributes.set_max_total_seq_len_q(max_total_seq_len_q_value);
     }
 
     if (!max_total_seq_len_kv.is_none()) {
-        int64_t const max_total_seq_len_kv_value = max_total_seq_len_kv.cast<int64_t>();
+        int64_t const max_total_seq_len_kv_value = py::cast<int64_t>(max_total_seq_len_kv);
         attributes.set_max_total_seq_len_kv(max_total_seq_len_kv_value);
     }
 
     if (!sliding_window.is_none()) {
         if (py::isinstance<py::int_>(sliding_window)) {
-            int sliding_window_value = sliding_window.cast<int64_t>();
+            int sliding_window_value = py::cast<int64_t>(sliding_window);
             attributes.set_diagonal_band_left_bound(sliding_window_value);
         } else {
             throw std::runtime_error("sliding window must be an int (or None)");
@@ -476,7 +480,7 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
     if (!left_bound.is_none()) {
         if (py::isinstance<py::int_>(left_bound)) {
-            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+            attributes.set_diagonal_band_left_bound(py::cast<int64_t>(left_bound));
         } else {
             throw std::runtime_error("diagonal_band_left_bound must be an int (or None)");
         }
@@ -484,7 +488,7 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
     if (!right_bound.is_none()) {
         if (py::isinstance<py::int_>(right_bound)) {
-            attributes.set_diagonal_band_right_bound(right_bound.cast<int64_t>());
+            attributes.set_diagonal_band_right_bound(py::cast<int64_t>(right_bound));
         } else {
             throw std::runtime_error("diagonal_band_right_bound must be an int (or None)");
         }
@@ -496,7 +500,7 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
                 "dropout must be a tuple of (float probability, a seed tensor"
                 ", and an offset tensor) or (mask tensor, scale tensor)");
         }
-        py::tuple dropout_tuple = dropout.cast<py::tuple>();
+        py::tuple dropout_tuple = py::cast<py::tuple>(dropout);
         if (dropout_tuple.size() != 3) {
             throw std::runtime_error(
                 "dropout must be a tuple of (float probability, a seed tensor"
@@ -505,9 +509,9 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
 
         if (py::isinstance<py::float_>(dropout_tuple[0]) && py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
             py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
-            auto const probability = dropout_tuple[0].cast<float>();
-            auto const seed        = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const offset      = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const probability = py::cast<float>(dropout_tuple[0]);
+            auto const seed   = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
+            auto const offset = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[2]);
             attributes.set_dropout(probability, seed, offset);
             if (rng_dump) {
                 attributes.set_rng_dump(rng_dump);
@@ -515,9 +519,10 @@ PyGraph::sdpa_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>
         } else if (py::isinstance(dropout_tuple[0], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
-            auto const mask      = dropout_tuple[0].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const scale     = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const scale_inv = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const mask  = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[0]);
+            auto const scale = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
+            auto const scale_inv =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[2]);
             attributes.set_dropout(mask, scale, scale_inv);
         } else {
             throw std::runtime_error(
@@ -591,7 +596,7 @@ PyGraph::sdpa_fp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q,
     }
     if (!is_inference.is_none()) {
         if (py::isinstance<py::bool_>(is_inference)) {
-            actual_generate_stats = py::bool_(!is_inference.cast<bool>());
+            actual_generate_stats = py::bool_(!py::cast<bool>(is_inference));
         } else {
             throw std::runtime_error("is_inference must be a bool.");
         }
@@ -719,11 +724,11 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
     }
 
     if (!max_total_seq_len_q.is_none()) {
-        attributes.set_max_total_seq_len_q(max_total_seq_len_q.cast<int64_t>());
+        attributes.set_max_total_seq_len_q(py::cast<int64_t>(max_total_seq_len_q));
     }
 
     if (!max_total_seq_len_kv.is_none()) {
-        attributes.set_max_total_seq_len_kv(max_total_seq_len_kv.cast<int64_t>());
+        attributes.set_max_total_seq_len_kv(py::cast<int64_t>(max_total_seq_len_kv));
     }
 
     if (paged_attention_k_table) {
@@ -734,7 +739,7 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
     }
     if (!paged_attention_max_seq_len_kv.is_none()) {
         if (py::isinstance<py::int_>(paged_attention_max_seq_len_kv)) {
-            attributes.set_paged_attention_max_seq_len_kv(paged_attention_max_seq_len_kv.cast<int>());
+            attributes.set_paged_attention_max_seq_len_kv(py::cast<int>(paged_attention_max_seq_len_kv));
         } else {
             throw std::runtime_error("paged_attention_max_seq_len_kv must be an int (or None)");
         }
@@ -772,7 +777,7 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
     // Set diagonal masking bounds
     if (!left_bound.is_none()) {
         if (py::isinstance<py::int_>(left_bound)) {
-            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+            attributes.set_diagonal_band_left_bound(py::cast<int64_t>(left_bound));
         } else {
             throw std::runtime_error("diagonal_band_left_bound must be an int (or None)");
         }
@@ -780,7 +785,7 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
 
     if (!actual_right_bound.is_none()) {
         if (py::isinstance<py::int_>(actual_right_bound)) {
-            attributes.set_diagonal_band_right_bound(actual_right_bound.cast<int64_t>());
+            attributes.set_diagonal_band_right_bound(py::cast<int64_t>(actual_right_bound));
         } else {
             throw std::runtime_error("diagonal_band_right_bound must be an int (or None)");
         }
@@ -789,7 +794,7 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
     // Set generate_stats
     if (!generate_stats.is_none()) {
         if (py::isinstance<py::bool_>(generate_stats)) {
-            attributes.set_generate_stats(generate_stats.cast<bool>());
+            attributes.set_generate_stats(py::cast<bool>(generate_stats));
         } else {
             throw std::runtime_error("generate_stats must be a bool.");
         }
@@ -800,10 +805,11 @@ PyGraph::sdpa_mxfp8(std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>& q
     // Set attn_scale
     if (!attn_scale.is_none()) {
         if (py::isinstance<py::float_>(attn_scale)) {
-            auto const attn_scale_value = attn_scale.cast<float>();
+            auto const attn_scale_value = py::cast<float>(attn_scale);
             attributes.set_attn_scale(attn_scale_value);
         } else {
-            auto const attn_scale_tensor = attn_scale.cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const attn_scale_tensor =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(attn_scale);
             if (!attn_scale_tensor) {
                 throw std::runtime_error("attn_scale must be a cudnn_tensor or float.");
             }
@@ -899,7 +905,7 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
 
     if (!left_bound.is_none()) {
         if (py::isinstance<py::int_>(left_bound)) {
-            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+            attributes.set_diagonal_band_left_bound(py::cast<int64_t>(left_bound));
         } else {
             throw std::runtime_error("left_bound must be an int (or None)");
         }
@@ -907,7 +913,7 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
 
     if (!actual_right_bound.is_none()) {
         if (py::isinstance<py::int_>(actual_right_bound)) {
-            attributes.set_diagonal_band_right_bound(actual_right_bound.cast<int64_t>());
+            attributes.set_diagonal_band_right_bound(py::cast<int64_t>(actual_right_bound));
         } else {
             throw std::runtime_error("right_bound must be an int (or None)");
         }
@@ -915,10 +921,11 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
 
     if (!attn_scale.is_none()) {
         if (py::isinstance<py::float_>(attn_scale)) {
-            auto const attn_scale_value = attn_scale.cast<float>();
+            auto const attn_scale_value = py::cast<float>(attn_scale);
             attributes.set_attn_scale(attn_scale_value);
         } else {
-            auto const attn_scale_tensor = attn_scale.cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const attn_scale_tensor =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(attn_scale);
             if (!attn_scale_tensor) {
                 throw std::runtime_error("attn_scale must be a cudnn_tensor or float.");
             }
@@ -926,7 +933,7 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
         }
     }
 
-    py::object cudnn_tensor_type = py::module_::import("cudnn").attr("tensor");
+    py::object cudnn_tensor_type = py::module_::import_("cudnn").attr("tensor");
 
     if (!dropout.is_none()) {
         if (!py::isinstance<py::tuple>(dropout)) {
@@ -934,7 +941,7 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
                 "dropout must be a tuple of (float probability, a seed tensor"
                 ", and an offset tensor) or (mask tensor, scale tensor)");
         }
-        py::tuple dropout_tuple = dropout.cast<py::tuple>();
+        py::tuple dropout_tuple = py::cast<py::tuple>(dropout);
         if (dropout_tuple.size() != 3) {
             throw std::runtime_error(
                 "dropout must be a tuple of (float probability, a seed tensor"
@@ -943,16 +950,17 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
 
         if (py::isinstance<py::float_>(dropout_tuple[0]) && py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
             py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
-            auto const probability = dropout_tuple[0].cast<float>();
-            auto const seed        = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const offset      = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const probability = py::cast<float>(dropout_tuple[0]);
+            auto const seed   = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
+            auto const offset = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[2]);
             attributes.set_dropout(probability, seed, offset);
         } else if (py::isinstance(dropout_tuple[0], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
-            auto const mask      = dropout_tuple[0].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const scale     = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const scale_inv = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const mask  = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[0]);
+            auto const scale = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
+            auto const scale_inv =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[2]);
             attributes.set_dropout(mask, scale, scale_inv);
         } else {
             throw std::runtime_error(
@@ -969,10 +977,10 @@ PyGraph::sdpa_fp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attribu
     }
 
     if (!max_total_seq_len_q.is_none()) {
-        attributes.set_max_total_seq_len_q(max_total_seq_len_q.cast<int64_t>());
+        attributes.set_max_total_seq_len_q(py::cast<int64_t>(max_total_seq_len_q));
     }
     if (!max_total_seq_len_kv.is_none()) {
-        attributes.set_max_total_seq_len_kv(max_total_seq_len_kv.cast<int64_t>());
+        attributes.set_max_total_seq_len_kv(py::cast<int64_t>(max_total_seq_len_kv));
     }
 
     auto [dQ, dK, dV, amax_dQ, amax_dK, amax_dV, amax_dP] = graph->sdpa_fp8_backward(q,
@@ -1070,7 +1078,7 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
 
     if (!left_bound.is_none()) {
         if (py::isinstance<py::int_>(left_bound)) {
-            attributes.set_diagonal_band_left_bound(left_bound.cast<int64_t>());
+            attributes.set_diagonal_band_left_bound(py::cast<int64_t>(left_bound));
         } else {
             throw std::runtime_error("left_bound must be an int (or None)");
         }
@@ -1078,7 +1086,7 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
 
     if (!actual_right_bound.is_none()) {
         if (py::isinstance<py::int_>(actual_right_bound)) {
-            attributes.set_diagonal_band_right_bound(actual_right_bound.cast<int64_t>());
+            attributes.set_diagonal_band_right_bound(py::cast<int64_t>(actual_right_bound));
         } else {
             throw std::runtime_error("right_bound must be an int (or None)");
         }
@@ -1087,10 +1095,11 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
     // Set attn_scale
     if (!attn_scale.is_none()) {
         if (py::isinstance<py::float_>(attn_scale)) {
-            auto const attn_scale_value = attn_scale.cast<float>();
+            auto const attn_scale_value = py::cast<float>(attn_scale);
             attributes.set_attn_scale(attn_scale_value);
         } else {
-            auto const attn_scale_tensor = attn_scale.cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const attn_scale_tensor =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(attn_scale);
             if (!attn_scale_tensor) {
                 throw std::runtime_error("attn_scale must be a cudnn_tensor or float.");
             }
@@ -1098,7 +1107,7 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
         }
     }
 
-    py::object cudnn_tensor_type = py::module_::import("cudnn").attr("tensor");
+    py::object cudnn_tensor_type = py::module_::import_("cudnn").attr("tensor");
 
     if (!dropout.is_none()) {
         if (!py::isinstance<py::tuple>(dropout)) {
@@ -1106,7 +1115,7 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
                 "dropout must be a tuple of (float probability, a seed tensor"
                 ", and an offset tensor) or (mask tensor, scale tensor)");
         }
-        py::tuple dropout_tuple = dropout.cast<py::tuple>();
+        py::tuple dropout_tuple = py::cast<py::tuple>(dropout);
         if (dropout_tuple.size() != 3) {
             throw std::runtime_error(
                 "dropout must be a tuple of (float probability, a seed tensor"
@@ -1115,16 +1124,17 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
 
         if (py::isinstance<py::float_>(dropout_tuple[0]) && py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
             py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
-            auto const probability = dropout_tuple[0].cast<float>();
-            auto const seed        = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const offset      = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const probability = py::cast<float>(dropout_tuple[0]);
+            auto const seed   = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
+            auto const offset = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[2]);
             attributes.set_dropout(probability, seed, offset);
         } else if (py::isinstance(dropout_tuple[0], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[1], cudnn_tensor_type) &&
                    py::isinstance(dropout_tuple[2], cudnn_tensor_type)) {
-            auto const mask      = dropout_tuple[0].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const scale     = dropout_tuple[1].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
-            auto const scale_inv = dropout_tuple[2].cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>();
+            auto const mask  = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[0]);
+            auto const scale = py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[1]);
+            auto const scale_inv =
+                py::cast<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(dropout_tuple[2]);
             attributes.set_dropout(mask, scale, scale_inv);
         } else {
             throw std::runtime_error(
@@ -1142,10 +1152,10 @@ PyGraph::sdpa_mxfp8_backward(std::shared_ptr<cudnn_frontend::graph::Tensor_attri
     }
 
     if (!max_total_seq_len_q.is_none()) {
-        attributes.set_max_total_seq_len_q(max_total_seq_len_q.cast<int64_t>());
+        attributes.set_max_total_seq_len_q(py::cast<int64_t>(max_total_seq_len_q));
     }
     if (!max_total_seq_len_kv.is_none()) {
-        attributes.set_max_total_seq_len_kv(max_total_seq_len_kv.cast<int64_t>());
+        attributes.set_max_total_seq_len_kv(py::cast<int64_t>(max_total_seq_len_kv));
     }
 
     // Call the MXFP8 backward
@@ -1180,39 +1190,39 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("q"),
           py::arg("k"),
           py::arg("v"),
-          py::arg_v("is_inference", py::none()),
-          py::arg_v("attn_scale", py::none()),
-          py::arg_v("bias", nullptr),
-          py::arg_v("block_mask", nullptr),
-          py::arg_v("use_alibi_mask", false),
-          py::arg_v("use_padding_mask", false),
-          py::arg_v("seq_len_q", nullptr),
-          py::arg_v("seq_len_kv", nullptr),
-          py::arg_v("use_causal_mask", false),
-          py::arg_v("use_causal_mask_bottom_right", false),
-          py::arg_v("sliding_window_length", py::none()),
-          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
-          py::arg_v("diagonal_band_left_bound", py::none()),
-          py::arg_v("diagonal_band_right_bound", py::none()),
-          py::arg_v("dropout", py::none()),
-          py::arg_v("rng_dump", nullptr),
-          py::arg_v("paged_attention_k_table", py::none()),
-          py::arg_v("paged_attention_v_table", py::none()),
-          py::arg_v("paged_attention_max_seq_len_kv", py::none()),
-          py::arg_v("max_total_seq_len_q", py::none()),
-          py::arg_v("max_total_seq_len_kv", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
-          py::arg_v("score_mod", std::nullopt),
-          py::arg_v("generate_stats", py::none()),
-          py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
-          py::arg_v("score_max", nullptr),
-          py::arg_v("score_sum_exp", nullptr),
-          py::arg_v("sink_token", nullptr),
-          py::arg_v("unfuse_fma", false),
-          py::arg_v("cu_seq_len_q", nullptr),
-          py::arg_v("cu_seq_len_kv", nullptr),
-          py::arg_v("stats_use_log2", false),
+          py::arg("is_inference")                   = py::none(),
+          py::arg("attn_scale")                     = py::none(),
+          py::arg("bias")                           = py::none(),
+          py::arg("block_mask")                     = py::none(),
+          py::arg("use_alibi_mask")                 = false,
+          py::arg("use_padding_mask")               = false,
+          py::arg("seq_len_q")                      = py::none(),
+          py::arg("seq_len_kv")                     = py::none(),
+          py::arg("use_causal_mask")                = false,
+          py::arg("use_causal_mask_bottom_right")   = false,
+          py::arg("sliding_window_length")          = py::none(),
+          py::arg("diagonal_alignment")             = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT,
+          py::arg("diagonal_band_left_bound")       = py::none(),
+          py::arg("diagonal_band_right_bound")      = py::none(),
+          py::arg("dropout")                        = py::none(),
+          py::arg("rng_dump")                       = py::none(),
+          py::arg("paged_attention_k_table")        = py::none(),
+          py::arg("paged_attention_v_table")        = py::none(),
+          py::arg("paged_attention_max_seq_len_kv") = py::none(),
+          py::arg("max_total_seq_len_q")            = py::none(),
+          py::arg("max_total_seq_len_kv")           = py::none(),
+          py::arg("compute_data_type")              = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")                           = "",
+          py::arg("score_mod")                      = std::nullopt,
+          py::arg("generate_stats")                 = py::none(),
+          py::arg("implementation")                 = cudnn_frontend::AttentionImplementation_t::AUTO,
+          py::arg("score_max")                      = py::none(),
+          py::arg("score_sum_exp")                  = py::none(),
+          py::arg("sink_token")                     = py::none(),
+          py::arg("unfuse_fma")                     = false,
+          py::arg("cu_seq_len_q")                   = py::none(),
+          py::arg("cu_seq_len_kv")                  = py::none(),
+          py::arg("stats_use_log2")                 = false,
           R"pbdoc(
                 Perform scaled dot product attention.
 
@@ -1271,30 +1281,30 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("o"),
           py::arg("dO"),
           py::arg("stats"),
-          py::arg_v("attn_scale", py::none()),
-          py::arg_v("bias", nullptr),
-          py::arg_v("dBias", nullptr),
-          py::arg_v("use_alibi_mask", false),
-          py::arg_v("use_padding_mask", false),
-          py::arg_v("seq_len_q", nullptr),
-          py::arg_v("seq_len_kv", nullptr),
-          py::arg_v("max_total_seq_len_q", py::none()),
-          py::arg_v("max_total_seq_len_kv", py::none()),
-          py::arg_v("use_causal_mask", false),
-          py::arg_v("use_causal_mask_bottom_right", false),
-          py::arg_v("sliding_window_length", py::none()),
-          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
-          py::arg_v("diagonal_band_left_bound", py::none()),
-          py::arg_v("diagonal_band_right_bound", py::none()),
-          py::arg_v("dropout", py::none()),
-          py::arg_v("rng_dump", nullptr),
-          py::arg_v("use_deterministic_algorithm", false),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
-          py::arg_v("score_mod", std::nullopt),
-          py::arg_v("score_mod_bprop", std::nullopt),
-          py::arg_v("sink_token", nullptr),
-          py::arg_v("dSink_token", nullptr),
+          py::arg("attn_scale")                   = py::none(),
+          py::arg("bias")                         = py::none(),
+          py::arg("dBias")                        = py::none(),
+          py::arg("use_alibi_mask")               = false,
+          py::arg("use_padding_mask")             = false,
+          py::arg("seq_len_q")                    = py::none(),
+          py::arg("seq_len_kv")                   = py::none(),
+          py::arg("max_total_seq_len_q")          = py::none(),
+          py::arg("max_total_seq_len_kv")         = py::none(),
+          py::arg("use_causal_mask")              = false,
+          py::arg("use_causal_mask_bottom_right") = false,
+          py::arg("sliding_window_length")        = py::none(),
+          py::arg("diagonal_alignment")           = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT,
+          py::arg("diagonal_band_left_bound")     = py::none(),
+          py::arg("diagonal_band_right_bound")    = py::none(),
+          py::arg("dropout")                      = py::none(),
+          py::arg("rng_dump")                     = py::none(),
+          py::arg("use_deterministic_algorithm")  = false,
+          py::arg("compute_data_type")            = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")                         = "",
+          py::arg("score_mod")                    = std::nullopt,
+          py::arg("score_mod_bprop")              = std::nullopt,
+          py::arg("sink_token")                   = py::none(),
+          py::arg("dSink_token")                  = py::none(),
           R"pbdoc(
                 Compute the key, query, value gradients of scaled dot product attention.
 
@@ -1348,38 +1358,38 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("descale_s"),
           py::arg("scale_s"),
           py::arg("scale_o"),
-          py::arg_v("is_inference", py::none()),
-          py::arg_v("attn_scale", py::none()),
-          py::arg_v("bias", nullptr),
-          py::arg_v("use_alibi_mask", false),
-          py::arg_v("use_padding_mask", false),
-          py::arg_v("seq_len_q", nullptr),
-          py::arg_v("seq_len_kv", nullptr),
-          py::arg_v("use_causal_mask", false),
-          py::arg_v("use_causal_mask_bottom_right", false),
-          py::arg_v("sliding_window", py::none()),
-          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
-          py::arg_v("left_bound", py::none()),
-          py::arg_v("right_bound", py::none()),
-          py::arg_v("dropout", py::none()),
-          py::arg_v("rng_dump", nullptr),
-          py::arg_v("paged_attention_k_table", nullptr),
-          py::arg_v("paged_attention_v_table", nullptr),
-          py::arg_v("paged_attention_max_seq_len_kv", py::none()),
-          py::arg_v("max_total_seq_len_q", py::none()),
-          py::arg_v("max_total_seq_len_kv", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
-          py::arg_v("fn", std::nullopt),
-          py::arg_v("generate_stats", py::none()),
-          py::arg_v("score_max", nullptr),
-          py::arg_v("score_sum_exp", nullptr),
-          py::arg_v("sink_token", nullptr),
-          py::arg_v("unfuse_fma", false),
-          py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
-          py::arg_v("cu_seq_len_q", nullptr),
-          py::arg_v("cu_seq_len_kv", nullptr),
-          py::arg_v("stats_use_log2", false),
+          py::arg("is_inference")                   = py::none(),
+          py::arg("attn_scale")                     = py::none(),
+          py::arg("bias")                           = py::none(),
+          py::arg("use_alibi_mask")                 = false,
+          py::arg("use_padding_mask")               = false,
+          py::arg("seq_len_q")                      = py::none(),
+          py::arg("seq_len_kv")                     = py::none(),
+          py::arg("use_causal_mask")                = false,
+          py::arg("use_causal_mask_bottom_right")   = false,
+          py::arg("sliding_window")                 = py::none(),
+          py::arg("diagonal_alignment")             = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT,
+          py::arg("left_bound")                     = py::none(),
+          py::arg("right_bound")                    = py::none(),
+          py::arg("dropout")                        = py::none(),
+          py::arg("rng_dump")                       = py::none(),
+          py::arg("paged_attention_k_table")        = py::none(),
+          py::arg("paged_attention_v_table")        = py::none(),
+          py::arg("paged_attention_max_seq_len_kv") = py::none(),
+          py::arg("max_total_seq_len_q")            = py::none(),
+          py::arg("max_total_seq_len_kv")           = py::none(),
+          py::arg("compute_data_type")              = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")                           = "",
+          py::arg("fn")                             = std::nullopt,
+          py::arg("generate_stats")                 = py::none(),
+          py::arg("score_max")                      = py::none(),
+          py::arg("score_sum_exp")                  = py::none(),
+          py::arg("sink_token")                     = py::none(),
+          py::arg("unfuse_fma")                     = false,
+          py::arg("implementation")                 = cudnn_frontend::AttentionImplementation_t::AUTO,
+          py::arg("cu_seq_len_q")                   = py::none(),
+          py::arg("cu_seq_len_kv")                  = py::none(),
+          py::arg("stats_use_log2")                 = false,
           R"pbdoc(
                 Perform scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1445,28 +1455,28 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("descale_q"),
           py::arg("descale_k"),
           py::arg("descale_v"),
-          py::arg_v("attn_scale", py::none()),
-          py::arg_v("use_causal_mask", false),
-          py::arg_v("use_causal_mask_bottom_right", false),
-          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
-          py::arg_v("diagonal_band_left_bound", py::none()),
-          py::arg_v("diagonal_band_right_bound", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("attn_scale")                   = py::none(),
+          py::arg("use_causal_mask")              = false,
+          py::arg("use_causal_mask_bottom_right") = false,
+          py::arg("diagonal_alignment")           = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT,
+          py::arg("diagonal_band_left_bound")     = py::none(),
+          py::arg("diagonal_band_right_bound")    = py::none(),
+          py::arg("compute_data_type")            = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")                         = "",
           py::arg("generate_stats"),
-          py::arg_v("sink_token", nullptr),
-          py::arg_v("unfuse_fma", false),
-          py::arg_v("implementation", cudnn_frontend::AttentionImplementation_t::AUTO),
-          py::arg_v("use_padding_mask", false),
-          py::arg_v("seq_len_q", nullptr),
-          py::arg_v("seq_len_kv", nullptr),
-          py::arg_v("max_total_seq_len_q", py::none()),
-          py::arg_v("max_total_seq_len_kv", py::none()),
-          py::arg_v("cu_seq_len_q", nullptr),
-          py::arg_v("cu_seq_len_kv", nullptr),
-          py::arg_v("paged_attention_k_table", nullptr),
-          py::arg_v("paged_attention_v_table", nullptr),
-          py::arg_v("paged_attention_max_seq_len_kv", py::none()),
+          py::arg("sink_token")                     = py::none(),
+          py::arg("unfuse_fma")                     = false,
+          py::arg("implementation")                 = cudnn_frontend::AttentionImplementation_t::AUTO,
+          py::arg("use_padding_mask")               = false,
+          py::arg("seq_len_q")                      = py::none(),
+          py::arg("seq_len_kv")                     = py::none(),
+          py::arg("max_total_seq_len_q")            = py::none(),
+          py::arg("max_total_seq_len_kv")           = py::none(),
+          py::arg("cu_seq_len_q")                   = py::none(),
+          py::arg("cu_seq_len_kv")                  = py::none(),
+          py::arg("paged_attention_k_table")        = py::none(),
+          py::arg("paged_attention_v_table")        = py::none(),
+          py::arg("paged_attention_max_seq_len_kv") = py::none(),
           R"pbdoc(
                 Perform MXFP8 (Microscaling FP8) scaled dot product attention.
 
@@ -1541,23 +1551,23 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("scale_dK"),
           py::arg("scale_dV"),
           py::arg("scale_dP"),
-          py::arg_v("attn_scale", py::none()),
-          py::arg_v("use_padding_mask", false),
-          py::arg_v("seq_len_q", nullptr),
-          py::arg_v("seq_len_kv", nullptr),
-          py::arg_v("use_causal_mask", false),
-          py::arg_v("use_causal_mask_bottom_right", false),
-          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
-          py::arg_v("left_bound", py::none()),
-          py::arg_v("right_bound", py::none()),
-          py::arg_v("use_deterministic_algorithm", false),
-          py::arg_v("dropout", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
-          py::arg_v("sink_token", nullptr),
-          py::arg_v("dSink_token", nullptr),
-          py::arg_v("max_total_seq_len_q", py::none()),
-          py::arg_v("max_total_seq_len_kv", py::none()),
+          py::arg("attn_scale")                   = py::none(),
+          py::arg("use_padding_mask")             = false,
+          py::arg("seq_len_q")                    = py::none(),
+          py::arg("seq_len_kv")                   = py::none(),
+          py::arg("use_causal_mask")              = false,
+          py::arg("use_causal_mask_bottom_right") = false,
+          py::arg("diagonal_alignment")           = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT,
+          py::arg("left_bound")                   = py::none(),
+          py::arg("right_bound")                  = py::none(),
+          py::arg("use_deterministic_algorithm")  = false,
+          py::arg("dropout")                      = py::none(),
+          py::arg("compute_data_type")            = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")                         = "",
+          py::arg("sink_token")                   = py::none(),
+          py::arg("dSink_token")                  = py::none(),
+          py::arg("max_total_seq_len_q")          = py::none(),
+          py::arg("max_total_seq_len_kv")         = py::none(),
           R"pbdoc(
                 Compute the key, query, value gradients of scaled dot product attention with fp8 datatype inputs and outputs.
 
@@ -1627,23 +1637,23 @@ init_pygraph_sdpa_submodule(py::class_<PyGraph>& m) {
           py::arg("descale_v"),
           py::arg("descale_dO"),
           py::arg("descale_dO_T"),
-          py::arg_v("attn_scale", py::none()),
-          py::arg_v("use_padding_mask", false),
-          py::arg_v("seq_len_q", nullptr),
-          py::arg_v("seq_len_kv", nullptr),
-          py::arg_v("use_causal_mask", false),
-          py::arg_v("use_causal_mask_bottom_right", false),
-          py::arg_v("diagonal_alignment", cudnn_frontend::DiagonalAlignment_t::TOP_LEFT),
-          py::arg_v("left_bound", py::none()),
-          py::arg_v("right_bound", py::none()),
-          py::arg_v("use_deterministic_algorithm", false),
-          py::arg_v("dropout", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
-          py::arg_v("sink_token", nullptr),
-          py::arg_v("dSink_token", nullptr),
-          py::arg_v("max_total_seq_len_q", py::none()),
-          py::arg_v("max_total_seq_len_kv", py::none()),
+          py::arg("attn_scale")                   = py::none(),
+          py::arg("use_padding_mask")             = false,
+          py::arg("seq_len_q")                    = py::none(),
+          py::arg("seq_len_kv")                   = py::none(),
+          py::arg("use_causal_mask")              = false,
+          py::arg("use_causal_mask_bottom_right") = false,
+          py::arg("diagonal_alignment")           = cudnn_frontend::DiagonalAlignment_t::TOP_LEFT,
+          py::arg("left_bound")                   = py::none(),
+          py::arg("right_bound")                  = py::none(),
+          py::arg("use_deterministic_algorithm")  = false,
+          py::arg("dropout")                      = py::none(),
+          py::arg("compute_data_type")            = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")                         = "",
+          py::arg("sink_token")                   = py::none(),
+          py::arg("dSink_token")                  = py::none(),
+          py::arg("max_total_seq_len_q")          = py::none(),
+          py::arg("max_total_seq_len_kv")         = py::none(),
           R"pbdoc(
                       Compute the key, query, value gradients of scaled dot product attention with mxfp8 (Microscaling FP8) datatype inputs and outputs.
 
