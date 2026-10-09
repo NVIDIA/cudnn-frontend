@@ -303,6 +303,18 @@ class TemplateParams:
     # ping-pong alone (``config_sm107.sm107_dead_subtile_quiet_pick``).  A compile-time axis of the kv loop, hence a cache-key field;
     # 0 on every other rendering (the factory refuses 1 with a bias, on the pair item, on PackGQA / THD / the gated epilogue).  APPENDED.
     dead_subtile_quiet: int = 0
+    # The ROW-MAX FORM of the bias / kv_mask softmax body (the -inf masked body of the Rubin f16/bf16 d128-file tiles): 0 = the
+    # SOFTWARE row max over the biased, masked scores (every existing record renders byte-identically); 1 = the HARDWARE UPPER
+    # BOUND -- the fused ``tcgen05.ld.red...max`` over the RAW scores (the plain body's own load) plus the thread's row max of the
+    # bias tile in the packed 16-bit domain: ``max_k S + max_k bias >= max_k (S + bias)``, so the online softmax runs on an upper
+    # bound of the true row max (valid for stability: P <= 2^RESCALE_THRESHOLD as before; the LSE and O are shift-invariant), the
+    # exps shrink by at most the row's RAW score range inside the tile (tens of log2 units against the fp32 flush at -126), and the
+    # software max tree leaves the post-load critical path.  Served with ``bias_mode`` / ``kv_mask_form`` 1 only (an additive
+    # kv_mask vector has no cheap per-tile max); the score side outputs stay on the software arm (the bias arms decline them).  The record
+    # field defaults to 0; the ADAPTER picks the measured per-form default for a plan that requests none (``config_sm107.
+    # sm107_bias_max_form_default``: 1 on the kv_mask-only form, 0 with a bias).  A compile-time axis (the body folds on it), hence a
+    # cache-key field; APPENDED.
+    bias_max_form: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

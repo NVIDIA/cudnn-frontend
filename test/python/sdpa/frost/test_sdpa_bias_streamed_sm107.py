@@ -333,7 +333,9 @@ def test_template_params_cfg_and_bars_are_appended():
     from cudnn.sdpa.fwd.kernels._common_blackwell import Bars
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
-    assert fields[-2:] == ["n_chunk", "bias_stages"] and TemplateParams().bias_stages == 0, "append-only; 0 renders every existing record byte-identically"
+    assert (
+        fields[-5:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form"] and TemplateParams().bias_stages == 0
+    ), "append-only; 0 renders every existing record byte-identically"
     assert c._CfgSm107.STAGES_BIAS == 0
     assert Bars._fields[-2:] == ("mb_bias_ring_full", "mb_bias_ring_empty") and Bars._field_defaults["mb_bias_ring_full"] is None
 

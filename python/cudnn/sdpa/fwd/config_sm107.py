@@ -308,6 +308,14 @@ BIAS_RING_STAGES = (2, 3)
 # additive form stages anything in SMEM or adds a barrier row: the bool word's byte loads become 16-byte granule loads.
 KV_MASK_NONE, KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32 = 0, 1, 2, 3
 KV_MASK_FORMS = frozenset({KV_MASK_NONE, KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32})
+# The ROW-MAX FORM of the bias / kv_mask softmax body (``TemplateParams.bias_max_form`` -> ``CFG.BIAS_MAX_FORM``): 0 = the SOFTWARE row max
+# over the biased, -inf-masked scores (the S13' body as built); 1 = the HARDWARE UPPER BOUND -- the fused ``tcgen05.ld.red...max`` of the plain
+# body over the RAW scores plus the thread's per-ROW bias-tile max (packed ``max.bf16x2`` / ``max.f16x2`` over the words the FFMA reads), the
+# online softmax on ``max_k S + max_k bias >= max_k (S + bias)``.  Per ROW, never the block scalar: the per-row bound's slack is the row's RAW
+# score range inside the tile (bias range irrelevant); a block scalar's slack is ``max_block bias - max_row bias``, unbounded for a row-structured
+# (masked) bias.  Served with the bit-word kv_mask or none: the additive vector (forms 2 / 3) has no cheap per-tile max -> a typed decline.
+BIAS_MAX_SOFTWARE, BIAS_MAX_HW_UPPER_BOUND = 0, 1
+BIAS_MAX_FORMS = frozenset({BIAS_MAX_SOFTWARE, BIAS_MAX_HW_UPPER_BOUND})
 # The additive vector's extent and strides are whole 16-byte granules (8 halves / 4 floats; the 16-bit form is the stricter one,
 # applied to both so the rule reads the same for every dtype): the tail granule is CLAMPED to the last in-bounds one in-kernel.
 KV_MASK_ADDITIVE_GRANULE_ELEMS = 8
@@ -636,6 +644,51 @@ def _tile_m_d128(tile_k: int) -> int:
             )
         return want
     return 128
+
+
+# The row-max FORM seam (same rules): pins ``TemplateParams.bias_max_form`` of a knob-less plan (0 = software, 1 = the hardware upper bound);
+# the A/B driver's ``hw`` / ``sw`` arms.  Read by :func:`sm107_bias_max_form_pick` only.  NOT part of :func:`sweep_seam_state`: unlike the
+# ring-depth / tile-height seams it moves a RECORD field (the adapter writes the pick into ``TemplateParams.bias_max_form``), so two
+# renderings that differ only by this seam already key different template modules and compiled-plan artifacts.
+_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm107_bias_max_form_default(bias_mode: int, kv_mask_form: int) -> int:
+    """The MEASURED default row-max form of a bias / kv_mask plan that requests none -- per FORM, never one constant:
+
+    * the kv_mask-ONLY form (the bit word, no bias) runs the HARDWARE UPPER BOUND: there the bound is the fused raw max alone, nothing is
+      added per step, and it recovers a third of the -inf body's cost over the plain kernel -- **+6.1..+14.8 %** on seven cells (bf16, D 32 at
+      S 256 / 384 / 512 / 768 / 1024 with one batch entry and S 384 with four, D 64 at S 384 / 768; +11.4 % at the 384 cell, +14.8 % at 1024),
+      every cell outside its control-pair spread by more than ten times; a 212-SM cc 10.7 perf node at the 2376 MHz lock (sampled busy median
+      0.5 % under it, no power-cap event), 100 x 3 CUDA-graph replay, the two forms interleaved in ONE process, the fp64 oracle on both;
+    * every form WITH a bias keeps the SOFTWARE tree: the per-step packed per-row bias-tile max (63 ``max.bf16x2`` per 128 columns per thread
+      plus the early second read of the non-pre-loaded chunk) costs about twice what the removed tree saves -- **-4.9..-12.2 %** on nine
+      cells (both item forms, the resident block and the streamed ring, with and without the kv_mask, D 32 / 64, S 384 / 768 / 1024).  The
+      bias row max has to come from OUTSIDE the per-step path (a per-item reduction over the resident block, or a once-per-execute row-max
+      pre-pass over the bias) before those arms can collect the kv_mask-only gain; recorded, not built;
+    * a plan without either arm has no -inf body: the software value (the field is meaningless there and the factory pins it to 0).
+
+    The adapter's pick (:func:`sm107_bias_max_form_pick`) applies this unless a request or the sweep seam overrides it; the record field
+    itself (``TemplateParams.bias_max_form``) still defaults to 0, so a record without the field renders byte-identically."""
+    if kv_mask_form == KV_MASK_BOOL_WORD and not bias_mode:
+        return BIAS_MAX_HW_UPPER_BOUND
+    return BIAS_MAX_SOFTWARE
+
+
+def sm107_bias_max_form_pick(bias_mode: int, kv_mask_form: int, *, request: Optional[int] = None) -> int:
+    """The ``TemplateParams.bias_max_form`` of a bias / kv_mask plan: ``request`` when the caller made one (honoured here, validated by the
+    factory / the adapter's check_support: an additive kv_mask or a plan without either arm is a typed decline, never a degraded form); else
+    the sweep seam (``_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS``, DEGRADED to the software form where the hardware bound is not served -- no arm, an
+    additive vector -- because a pinned default must never produce an invalid record); else the measured per-form default
+    (:func:`sm107_bias_max_form_default`)."""
+    if request is not None:
+        return int(request)
+    if _BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS is not None:
+        want = int(_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS)
+        if want == BIAS_MAX_HW_UPPER_BOUND and (not (bias_mode or kv_mask_form) or kv_mask_form in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32)):
+            return BIAS_MAX_SOFTWARE
+        return want
+    return sm107_bias_max_form_default(bias_mode, kv_mask_form)
 
 
 # The ONE-BATCH-ENTRY item at the 32-wide tile's cga1 STREAMS its bias wherever its ring fits, resident budget or not: the 256-row
@@ -1310,6 +1363,9 @@ class _CfgSm107:
     # 0 on BIAS_MODE 0 / 1 (the resident block sizes itself by BIAS_RESIDENT_TILES).  A pure latency knob: no accumulator
     # parity is indexed from this ring.
     STAGES_BIAS: int = 0
+    # The row-max form of the -inf body (TemplateParams.bias_max_form): 0 = the software max tree, 1 = the hardware upper bound
+    # (BIAS_MAX_HW_UPPER_BOUND).  Pure instruction-stream axis: no barrier, no SMEM, no accumulator parity depends on it.
+    BIAS_MAX_FORM: int = 0
 
 
 @dataclass(frozen=True)
@@ -1809,6 +1865,10 @@ def _validate_bias(cfg, flavor: str) -> None:
         _check(
             [
                 (cfg.BIAS_RESIDENT_TILES == 0 and cfg.BIAS_BLOCK_ROWS == 0, f"{flavor}: bias geometry fields must be 0 without BIAS_MODE"),
+                (
+                    cfg.BIAS_MAX_FORM == BIAS_MAX_SOFTWARE,
+                    f"{flavor}: BIAS_MAX_FORM={cfg.BIAS_MAX_FORM} names a row-max form of the bias / kv_mask body; this config has neither arm",
+                ),
             ]
         )
         return
@@ -1830,6 +1890,16 @@ def _validate_bias(cfg, flavor: str) -> None:
         (
             not (cfg.THD_VARLEN or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.EPILOGUE_GATE),
             f"{flavor}: the bias / kv_mask arms serve dense, unsplit, unpacked, ungated graphs only",
+        ),
+        (
+            cfg.BIAS_MAX_FORM in BIAS_MAX_FORMS,
+            f"{flavor}: BIAS_MAX_FORM must be 0 (the software row max) or 1 (the hardware upper bound); got {cfg.BIAS_MAX_FORM}",
+        ),
+        (
+            cfg.BIAS_MAX_FORM != BIAS_MAX_HW_UPPER_BOUND or cfg.KV_MASK_FORM in (KV_MASK_NONE, KV_MASK_BOOL_WORD),
+            f"{flavor}: the hardware upper-bound row max (BIAS_MAX_FORM=1) bounds the bias tile and ignores the bit-word mask; an additive kv_mask "
+            f"vector (KV_MASK_FORM={cfg.KV_MASK_FORM}) is unbounded by it -- the body would run a max BELOW the true row max: P > 1, an overflowing "
+            f"exp2 at a large positive vector",
         ),
     ]
     if cfg.BIAS_MODE:
@@ -1950,6 +2020,21 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     # The Q tile height (TILE_M): 128 on every flavor but the f16/bf16 small tiles, where the private seam may pin 64 (the TILE_M = 64
     # lever; ``_tile_m_d128`` is the ONE helper the budgets below read too, so the Q / O slabs, the block rows and the budgets agree).
     tile_m = _tile_m_d128(tile_k) if (tile_k <= 64 and params.dtype_qkv > _DTYPE_E5M2 and not mxfp8) else 128
+    # The row-max form (appended; a record without the field renders the software tree): the hardware upper bound needs an arm whose body it
+    # replaces and a kv_mask it can bound (none or the bit word) -- the additive vector is a typed decline here and in the adapter.
+    bias_max_form = int(getattr(params, "bias_max_form", 0))
+    if bias_max_form not in BIAS_MAX_FORMS:
+        raise ValueError(f"{flavor}: bias_max_form must be 0 (the software row max) or 1 (the hardware upper bound); got {bias_max_form}")
+    if bias_max_form == BIAS_MAX_HW_UPPER_BOUND:
+        if not (bias_mode or kv_mask_form):
+            raise ValueError(
+                f"{flavor}: bias_max_form=1 is the row-max form of the bias / kv_mask body; this record has neither arm (bias_mode=0, kv_mask_form=0)"
+            )
+        if kv_mask_form in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32):
+            raise ValueError(
+                f"{flavor}: bias_max_form=1 (the hardware upper-bound row max) is served with the bit-word kv_mask or none; the additive kv_mask vector "
+                f"(kv_mask_form={kv_mask_form}) has no per-tile max to bound -- keep bias_max_form=0 with it"
+            )
     bias_tiles = 0
     stages_bias = 0
     if bias_mode == BIAS_MODE_RESIDENT:
@@ -2072,6 +2157,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         KV_MASK_FORM=kv_mask_form,
         N_CHUNK=n_chunk,
         STAGES_BIAS=stages_bias,
+        BIAS_MAX_FORM=bias_max_form,
     )
 
     _validate_regs(cfg, flavor)

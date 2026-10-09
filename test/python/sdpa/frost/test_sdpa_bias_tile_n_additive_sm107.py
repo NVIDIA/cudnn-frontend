@@ -690,9 +690,15 @@ def test_additive_kv_mask_fp16_vector_on_an_fp16_graph():
 
 
 @requires_rubin
-def test_additive_minus_inf_image_is_bitwise_the_boolean_form():
+def test_additive_minus_inf_image_is_bitwise_the_boolean_form(monkeypatch):
     """A -inf / 0 vector is the bit word's image: ``fma(-inf, 1/scale, s) = -inf`` lands exactly where the keep word's select
-    puts -inf, so O and Stats are BITWISE the BOOLEAN form (alone, with the bias, at TILE_N 64, through the ring wrap)."""
+    puts -inf, so O and Stats are BITWISE the BOOLEAN form (alone, with the bias, at TILE_N 64, through the ring wrap) -- under the
+    SAME row-max form: the boolean kv_mask-only plan's default is the hardware upper-bound max (``bias_max_form`` 1, a different m per
+    step: equal within rounding, not bitwise), which the additive vector cannot take (a typed decline), so both are pinned to the
+    software tree here through the sweep seam."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg107
+
+    monkeypatch.setattr(cfg107, "_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS", 0)
     for c in (dict(s=256, add="inf"), dict(s=384, h=2, add="inf", bias=True), dict(s=256, add="inf", tile_n=64), dict(s=512, h=2, add="inf")):
         q, k, v, kw = _inputs(c, torch.bfloat16)
         add = _run2(q, k, v, scale=kw["scale"], bias=kw["bias"], kv_mask=kw["add"], tile_n=c.get("tile_n"))

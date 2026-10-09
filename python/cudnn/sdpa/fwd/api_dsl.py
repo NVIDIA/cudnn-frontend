@@ -72,6 +72,8 @@ from cudnn.sdpa.fwd.config_sm107 import sm107_bias_stages_pick as _sm107_bias_st
 from cudnn.sdpa.fwd.config_sm107 import sm107_padded_tail_form_pick as _sm107_padded_tail_form_pick, PADDED_TAIL_FORMS as _PADDED_TAIL_FORMS
 from cudnn.sdpa.fwd.config_sm107 import sm107_dead_subtile_quiet_pick as _sm107_dead_subtile_quiet_pick, DEAD_SUBTILE_QUIET_FORMS as _DEAD_SUBTILE_QUIET_FORMS
 from cudnn.sdpa.fwd.config_sm107 import _tile_m_d128 as _sm107_tile_m_d128
+from cudnn.sdpa.fwd.config_sm107 import BIAS_MAX_HW_UPPER_BOUND as _BIAS_MAX_HW_UPPER_BOUND, BIAS_MAX_FORMS as _BIAS_MAX_FORMS
+from cudnn.sdpa.fwd.config_sm107 import sm107_bias_max_form_pick as _sm107_bias_max_form_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
@@ -696,6 +698,7 @@ class SdpaFwdDsl(APIBase):
         bias_stages: Optional[int] = None,
         padded_tail_form: Optional[int] = None,
         dead_subtile_quiet: Optional[int] = None,
+        bias_max_form: Optional[int] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -705,6 +708,13 @@ class SdpaFwdDsl(APIBase):
         the heuristics' pick (``config_sm107.sm107_n_chunk_pick``: 0 = the one-batch-entry item unless the bias is
         batch-broadcast on >= 2 rows at cga1); an explicit value >= 1 is honored on a plan that qualifies for the pair
         item and declined typed otherwise.  Performance-only (every value computes the same function).
+
+        ``bias_max_form`` (APPENDED, optional): the ROW-MAX FORM of the bias / kv_mask softmax body -- 0 = the software row max over
+        the biased, masked scores, 1 = the hardware upper bound (the fused ``tcgen05.ld.red...max`` over the raw scores plus the thread's
+        per-row bias-tile max; any m >= the true row max is valid for the online softmax).  None = the pick
+        (``config_sm107.sm107_bias_max_form_pick``: the measured per-form default of ``sm107_bias_max_form_default`` -- 1 on the
+        kv_mask-only form, 0 with a bias); 1 is honoured with a bias and / or a boolean kv_mask and declined typed with an additive
+        kv_mask vector or without either arm.  Performance-only (the same function, within fp32 rounding of the exp2 arguments).
 
         ``sample_bias`` / ``sample_kv_mask`` (APPENDED, optional): the additive attention bias
         ``[1|B, 1|H_q, S_q, S_kv]`` in the Q/K/V dtype (added to the scaled scores before the softmax,
@@ -834,6 +844,8 @@ class SdpaFwdDsl(APIBase):
         # (TemplateParams.dead_subtile_quiet): None = the pick (config_sm107.sm107_dead_subtile_quiet_pick), 0 / 1 = a request honoured on
         # the eligible plan (the 32- / 64-wide f16/bf16 tiles, no bias, no PackGQA / THD / gate) and declined typed elsewhere.
         self.dead_subtile_quiet = None if dead_subtile_quiet is None else int(dead_subtile_quiet)
+        # The row-max form (APPENDED): None = the pick, 0 / 1 = a request (check_support validates it against the arms this plan carries).
+        self.bias_max_form = None if bias_max_form is None else int(bias_max_form)
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
@@ -1680,6 +1692,13 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             tile_m=_sm107_tile_m_d128(self.flavor[0]),
         )
 
+    def _resident_arm_bias_max_form(self) -> int:
+        """The ``TemplateParams.bias_max_form`` of this plan: the request (``bias_max_form=``, validated by ``check_support``), else the
+        pick (``config_sm107.sm107_bias_max_form_pick``: the sweep seam degraded to the software max where the hardware bound is not
+        served -- no arm, an additive vector -- else the measured per-form default: the hardware bound on the kv_mask-only form, the
+        software tree with a bias); 0 on a plan without either arm."""
+        return _sm107_bias_max_form_pick(self._resident_arm_bias_mode(), self._kv_mask_form(), request=self.bias_max_form)
+
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
 
@@ -2284,6 +2303,23 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                         f"this form) or as a vector in the Q/K/V dtype ({self.q_desc.dtype}; cast the fp32 mask on the host): the 128-wide rendering "
                         f"spills on the softmax role; got tile_n={self.tile_n}",
                     )
+        # The row-max FORM of the bias / kv_mask body (bias_max_form, APPENDED): a request is honoured where the hardware upper bound is
+        # served (a bias and / or the boolean kv_mask) and declined typed elsewhere, never degraded (config_sm107.sm107_bias_max_form_pick
+        # degrades only the DEFAULT; the config factory pins the same couplings).
+        if self.bias_max_form is not None:
+            self._value_error_if(
+                self.bias_max_form not in _BIAS_MAX_FORMS,
+                f"bias_max_form must be 0 (the software row max) or 1 (the hardware upper-bound row max); got {self.bias_max_form}",
+            )
+            self._not_implemented_error_if(
+                self.bias_max_form == _BIAS_MAX_HW_UPPER_BOUND and self.bias_desc is None and self.kv_mask_desc is None,
+                "bias_max_form=1 is the row-max form of the bias / kv_mask softmax body; this plan carries neither a bias nor a kv_mask",
+            )
+            self._not_implemented_error_if(
+                self.bias_max_form == _BIAS_MAX_HW_UPPER_BOUND and self.kv_mask_desc is not None and self._kv_mask_form() != _KV_MASK_BOOL_WORD,
+                "bias_max_form=1 (the hardware upper-bound row max) is served with a boolean kv_mask or none: an additive kv_mask vector has no "
+                "per-tile max to bound -- keep bias_max_form=0 with it",
+            )
         # softmax_precision values are cudnn.data_type (the knob vocabulary
         # fixed by #692); imported locally — this file otherwise speaks torch
         # dtypes and frost constants only.
@@ -2759,6 +2795,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # The dead-sub-tile quiet body of the one-batch-entry item (0 = the full body on a dead sub-tile, 1 = the quiet body): the
             # request, else the pick; 0 on every other rendering.
             dead_subtile_quiet=self._dead_subtile_quiet(),
+            # The row-max form of the bias / kv_mask body (0 = the software tree, 1 = the hardware upper bound): the request, else the pick.
+            bias_max_form=self._resident_arm_bias_max_form(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

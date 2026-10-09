@@ -42,7 +42,9 @@ import cutlass.cute as cute
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 
-from .pointwise import f16x2_to_f32, ffma2
+from cutlass.cute.arch.nvvm_wrappers import inline_ptx
+
+from .pointwise import f16x2_to_f32, ffma2, fmax_f32, opaque_i32
 from .tma import tma_load_tile
 
 # The TMA swizzle atom the block is written and read under (bytes per swizzled row of one box).
@@ -142,13 +144,23 @@ def bias_chunk_smem_offset(gg: BiasBlockGeometry, tile_idx, chunk: int, row) -> 
     return tile_idx * cutlass.Int32(gg.tile_elems) + cutlass.Int32(chunk * gg.subtile_stride_elems) + row * cutlass.Int32(gg.granu_elems)
 
 
-def load_bias_row_chunk(sBias_base, gg: BiasBlockGeometry, tile_idx, chunk: int, row):
+def load_bias_row_chunk(sBias_base, gg: BiasBlockGeometry, tile_idx, chunk: int, row, *, opaque_offset: bool = False):
     """Trace-time helper: one lane's 64-column bias row slice as the 32 packed 16-bit PAIRS it is stored as
     (a ``Vector[Int32, 32]``), through ONE swizzled 128-byte load (the full swizzle period: 8 x 16-byte granules,
     each XOR-remapped by the row).  Kept packed: :func:`bias_fma_chunk` unpacks each pair with a 2-op shift /
     convert right where it is consumed, which is cheaper than a 64-element ``.to(Float32)`` and keeps the
-    pre-loaded fragment at 32 registers across the ``bmm1_done`` wait."""
+    pre-loaded fragment at 32 registers across the ``bmm1_done`` wait.
+
+    ``opaque_offset``: the SAME slice through an address the compiler cannot prove equal to another load's (an identity
+    ``mov.b32`` on the offset) -- a SECOND read of a chunk whose first read must stay separate.  The hardware upper-bound
+    row-max form reads a non-pre-loaded chunk twice: once EARLY (ahead of the ``bmm1_done`` wait) for its packed row max,
+    the 32 words discarded right after the tree, and once late for the FFMA; one shared load would make the compiler hoist
+    the FFMA's 32 words next to the early tree and hold them across both TMEM chunks (measured on the sm_107a rendering:
+    STL / LDL 37 / 44 against the software form's 3 / 3 at the 128-wide tile).  SMEM read bandwidth is not the binding
+    term of these bodies (ncu: the 16-B ideal wavefronts per shared load); the registers are."""
     off = bias_chunk_smem_offset(gg, tile_idx, chunk, row)
+    if opaque_offset:
+        off = opaque_i32(off)
     vec = sBias_base.subview(off).data_ptr().load_swizzled(gg.smem_swizzle, gg.swz_bytes, count=gg.granu_elems)
     return vec.bitcast(cutlass.Int32)
 
@@ -173,6 +185,48 @@ def bias_fma_chunk(raw_chunk, bias_words, inv_scale, n: int, *, dtype):
         elems.append(s_lo)
         elems.append(s_hi)
     return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
+# ---------------------------------------------------------------------------
+# The per-ROW bias-tile max in the PACKED domain -- the hardware upper-bound row-max form (``CFG.BIAS_MAX_FORM == 1``)
+# ---------------------------------------------------------------------------
+
+
+@cute.jit
+def max_f16x2_word(a, b, *, dtype):
+    """PTX ``max.bf16x2`` / ``max.f16x2`` on two packed 16-bit pairs (``Int32`` words): the half-wise max (sm_80+, PTX ISA 7.0).
+    NaN semantics are ``max.f32``'s (a NaN half yields the other operand's half); the max of two 16-bit values is one of them, so
+    the result is EXACT in the bias dtype.  Used by :func:`packed_row_max_words`; never on unpacked fp32 (that is ``fmax_f32``)."""
+    if cutlass.const_expr(dtype != cutlass.Float16 and dtype != cutlass.BFloat16):
+        raise TypeError(f"max_f16x2_word: dtype must be Float16 or BFloat16, got {dtype}")
+    tag = "bf16x2" if cutlass.const_expr(dtype == cutlass.BFloat16) else "f16x2"
+    return inline_ptx(f"max.{tag} $0, $1, $2;", write_only_types=[cutlass.Int32], read_only_args=[a, b])
+
+
+def packed_row_max_words(words, *, dtype):
+    """Trace-time helper: ONE packed pair holding the half-wise max over the ``n / 2`` packed words of one softmax chunk's bias row
+    slice (:func:`load_bias_row_chunk`'s ``Vector[Int32, n/2]`` or a Python list of words) -- a balanced binary tree of
+    :func:`max_f16x2_word`, ``n / 2 - 1`` ops, on the SAME words :func:`bias_fma_chunk` unpacks for the add, so the row max costs no
+    unpack of its own and no fp32 tree.  The hardware upper-bound row-max form of the bias body reduces this pair across the tile's
+    chunks (one more :func:`max_f16x2_word` per extra chunk) and lifts it to fp32 with :func:`packed_pair_max_f32`."""
+    n = len(words) if isinstance(words, (list, tuple)) else int(words.shape[0])
+    if n < 1:
+        raise ValueError("packed_row_max_words: at least one packed word")
+    elems = [words[i] for i in range(n)]
+    while len(elems) > 1:
+        nxt = [max_f16x2_word(elems[i], elems[i + 1], dtype=dtype) for i in range(0, len(elems) - 1, 2)]
+        if len(elems) % 2:
+            nxt.append(elems[-1])
+        elems = nxt
+    return elems[0]
+
+
+@cute.jit
+def packed_pair_max_f32(word, *, dtype):
+    """The max of the two halves of one packed pair as ``Float32`` (:func:`f16x2_to_f32` -- two bit moves on bf16, two ``cvt`` on
+    fp16 -- then ``max.f32``): exact (a 16-bit value is exactly representable in fp32)."""
+    lo, hi = f16x2_to_f32(word, dtype=dtype)
+    return fmax_f32(lo, hi)
 
 
 # ---------------------------------------------------------------------------

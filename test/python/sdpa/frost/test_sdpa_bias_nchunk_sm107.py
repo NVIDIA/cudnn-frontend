@@ -272,7 +272,9 @@ def test_template_params_and_cfg_are_appended():
     import dataclasses
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
-    assert fields[-2:] == ["n_chunk", "bias_stages"] and TemplateParams().n_chunk == 0, "append-only; 0 renders every existing record byte-identically"
+    assert (
+        fields[-5:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form"] and TemplateParams().n_chunk == 0
+    ), "append-only; 0 renders every existing record byte-identically"
     assert c._CfgSm107.N_CHUNK == 0
 
 

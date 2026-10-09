@@ -103,6 +103,7 @@ from dataclasses import dataclass
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32
 from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED, BIAS_RING_STAGES, bias_smem_tiles, sm107_bias_preload_chunks
+from cudnn.sdpa.fwd.config_sm107 import BIAS_MAX_HW_UPPER_BOUND
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 # One body, three head-dim tile geometries (TILE_K = TILE_O = d_flavor); the record field selects the factory, the
@@ -294,8 +295,12 @@ from cudnn.frost.tile_dsl.bias import (
     bias_fma_chunk,
     additive_vec_granules,
     additive_vec_fma_chunk,
+    max_f16x2_word,
+    packed_row_max_words,
+    packed_pair_max_f32,
 )
 from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
+from cudnn.frost.tile_dsl.pointwise import fmax_f32 as _fmax_f32, tmem_load_max_reduction as _tmem_load_max_reduction
 
 # === Additive bias (resident row-block) + per-key boolean mask: CFG.BIAS_MODE / CFG.KV_MASK_FORM ===
 #
@@ -403,6 +408,13 @@ _PADDED_TAIL_PREMASK = CFG.PADDED_TAIL_FORM == 1
 # (the same sites fire the same 128 lanes per step; the MMA still runs the dead sub-tile's BMM1 / BMM2 on TMEM residue P -- its O
 # rows are confined to the dead rows; the correction's all_alpha_one ballot skips the rescale).  SMEM: untouched.
 _DEAD_SUBTILE_QUIET = CFG.DEAD_SUBTILE_QUIET == 1
+# The ROW-MAX FORM of the -inf body (CFG.BIAS_MAX_FORM, TemplateParams.bias_max_form): False = the software ``row_max_reduction``
+# over the biased, masked scores; True = the HARDWARE UPPER BOUND -- the plain body's fused ``tcgen05.ld.red...max`` over the RAW
+# scores plus the thread's packed per-row max of the bias tile (``max_k S + max_k bias >= max_k (S + bias)``; the bit-word mask is
+# ignored by the bound: masked columns can only lower the true max).  Any m >= the true row max is valid for the online softmax; the
+# slack is bounded by the row's RAW score range inside the tile (per ROW -- a block scalar's slack would be the bias range).  Pure
+# instruction-stream axis: no barrier row, no SMEM buffer, no accumulator parity depends on it.
+_HW_UPPER_MAX = CFG.BIAS_MAX_FORM == BIAS_MAX_HW_UPPER_BOUND
 # === The (n, n+1) PAIR work item (CFG.N_CHUNK > 0; TemplateParams.n_chunk) ===
 #
 # A work item is (a TILE_M-row q tile, a head, a CHUNK of up to N_CHUNK consecutive entries nb of the flattened batch axis);
@@ -450,6 +462,12 @@ if _BIAS_STREAMED and CFG.STAGES_BIAS not in BIAS_RING_STAGES:
     raise ValueError(f"prefill_d128_f16_sm107: the streamed bias ring is {sorted(BIAS_RING_STAGES)} stages deep (CFG.STAGES_BIAS={CFG.STAGES_BIAS})")
 if _BIAS_ARM and (_BIAS_RESIDENT == _BIAS_STREAMED):
     raise ValueError(f"prefill_d128_f16_sm107: CFG.BIAS_MODE={CFG.BIAS_MODE} is neither the resident block (1) nor the streamed ring (2)")
+if _HW_UPPER_MAX and not _INF_MASK_ARM:
+    raise ValueError("prefill_d128_f16_sm107: CFG.BIAS_MAX_FORM=1 is the row-max form of the bias / kv_mask body; this config has neither arm")
+if _HW_UPPER_MAX and _KV_MASK_ADD:
+    # config_sm107._validate_bias pins the same coupling; the kernel's own backstop: the additive vector has no per-tile max to bound,
+    # so the upper bound could sit BELOW the true row max (P > 1, an overflowing exp2 at a large positive vector).
+    raise ValueError(f"prefill_d128_f16_sm107: CFG.BIAS_MAX_FORM=1 is served with the bit-word kv_mask or none (KV_MASK_FORM={CFG.KV_MASK_FORM})")
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
 
@@ -2739,6 +2757,11 @@ def _softmax_kv_body_inf(
        0-substituted at the point of use (``row_max_for_exp2``) on BOTH alpha operands, so a dead iteration ships
        ``P == 0`` and alpha == 1 exactly, and a row whose every key is masked ends the item with ``total_sum == 0``
        (the correction epilogue's empty-row SELECT reads that).
+    4. CFG.BIAS_MAX_FORM == 1 (the hardware upper-bound row max): the raw chunks come from the plain body's fused
+       ``tcgen05.ld.red...max`` and the iteration's max is the UPPER BOUND ``max_k S_raw * scale_log2 + max_k bias_row *
+       (inv_scale * scale_log2)`` (the bias row max in the packed 16-bit domain, ``max.bf16x2`` / ``max.f16x2`` over the words
+       the FFMA reads; the pre-loaded chunks' max ahead of the wait); the software tree over the masked scores folds out and
+       steps 2-3 are otherwise unchanged (any m >= the true max is valid; the slack is the row's raw score range in the tile).
 
     ``kv_tile_rel`` = ``kv_loop - <the item's first tile>``, the tile's index inside the resident block; ``block_row`` the
     lane's row inside the block (``sub_tile_id * TILE_M + tid_in_wg`` on the one-batch-entry item, whose block is both
@@ -2769,6 +2792,20 @@ def _softmax_kv_body_inf(
     bias_tile = bias_ring_state.idx if _BIAS_STREAMED else kv_tile_rel
     # Python comprehension (not a staged loop / container mutation): the pre-loaded chunks' packed words.
     bias_pre = [load_bias_row_chunk(sBias.base, _BIAS_GG, bias_tile, c, block_row) for c in range(min(BIAS_PRELOAD_CHUNKS, N_CHUNKS))] if _BIAS_ARM else []
+    # The hardware upper-bound form: EVERY chunk's packed per-row bias max is computed HERE, ahead of the wait (no BMM1 dependency)
+    # -- the row-wide reduction of this form never sits behind the TMEM load.  The pre-loaded chunks reduce the words they keep for
+    # the FFMA; a non-pre-loaded chunk is read ONCE MORE through an opaque offset and its 32 words die right after the tree (one
+    # shared load would hold the FFMA's words across both TMEM chunks: 37 / 44 spills on the 128-wide rendering, 3 / 3 without).
+    # Python comprehensions on trace-time lists, in chunk order.
+    bias_max_words = (
+        [packed_row_max_words(w, dtype=STORAGE_DTYPE) for w in bias_pre]
+        + [
+            packed_row_max_words(load_bias_row_chunk(sBias.base, _BIAS_GG, bias_tile, c, block_row, opaque_offset=True), dtype=STORAGE_DTYPE)
+            for c in range(min(BIAS_PRELOAD_CHUNKS, N_CHUNKS), N_CHUNKS)
+        ]
+        if (_BIAS_ARM and _HW_UPPER_MAX)
+        else []
+    )
 
     bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase, spin=SPIN_RING_WAITS)
     bmm1_phase = bmm1_phase ^ 1
@@ -2778,11 +2815,19 @@ def _softmax_kv_body_inf(
     p_addr_base = tmem_base + cutlass.Int32(tmem_P_off)
     stats_addr = tmem_base + cutlass.Int32(stats_off)
 
-    # 2. Raw S chunk -> + bias (pre-scale) -> band mask AND kv_mask word (-inf) -> software row max.
+    # 2. Raw S chunk -> + bias (pre-scale) -> band mask AND kv_mask word (-inf) -> the row max: the software tree over the masked
+    #    scores (CFG.BIAS_MAX_FORM 0) or the hardware upper bound (1: the fused ld.red max of the RAW chunk + the packed bias row max).
     causal_diag = eff_seqlen_kv - eff_seqlen_q if cutlass.const_expr(CFG.BOTTOM_RIGHT) else None
     chunks_S = []
+    chunk_raw_max = []  # per chunk: the fused tcgen05.ld.red...max of the raw scores (the hardware upper-bound form only)
     for c in cutlass.range_constexpr(N_CHUNKS):
-        raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK)
+        if cutlass.const_expr(_HW_UPPER_MAX):
+            # LDTM.STAT: the plain body's own primitive -- the chunk's data registers AND its raw row max at index CHUNK.
+            res = _tmem_load_max_reduction(s_addr_base + cutlass.Int32(c * CHUNK), num=CHUNK)
+            raw = cutlass.Vector.from_elements(tuple(res[:CHUNK]), cutlass.Int32).bitcast(cutlass.Float32)
+            chunk_raw_max.append(cutlass.Vector.from_elements((res[CHUNK],), cutlass.Int32).bitcast(cutlass.Float32)[0])
+        else:
+            raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(s_addr_base + cutlass.Int32(c * CHUNK), cutlass.Float32), num=CHUNK)
         if cutlass.const_expr(_BIAS_ARM):
             # Chunk c's words: pre-loaded ahead of the wait, or loaded here (a Python ternary on a trace-time bool).
             bias_words = bias_pre[c] if c < BIAS_PRELOAD_CHUNKS else load_bias_row_chunk(sBias.base, _BIAS_GG, bias_tile, c, block_row)
@@ -2821,15 +2866,31 @@ def _softmax_kv_body_inf(
         # THREAD arrives have no pred= path, so the elect is a branch).
         if nvvm.elect_sync():
             bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()
-    chunks_max = []
-    for c in cutlass.range_constexpr(N_CHUNKS):
-        chunks_max.append(row_max_reduction(chunks_S[c]))
     reg_S_vec = vec_concat(chunks_S)
-    current_max_unscaled = chunks_max[0]
-    for m in chunks_max[1:]:
-        current_max_unscaled = cute.math.max(current_max_unscaled, m)
+    if cutlass.const_expr(_HW_UPPER_MAX):
+        # The UPPER BOUND of this iteration's true row max, in the exp2 argument's units: max_k S_raw * scale_log2 (the hardware max,
+        # masked columns included -- they can only LOWER the true max) + max_k bias_row * (inv_scale * scale_log2) (the bias adds
+        # pre-scale as bias * inv_scale).  An all -inf bias row gives -inf here = the dead-tile arithmetic below; a row-structured
+        # bias costs nothing: the bound is per ROW, its slack the row's raw range inside the tile.
+        raw_max = chunk_raw_max[0]
+        for m in chunk_raw_max[1:]:
+            raw_max = _fmax_f32(raw_max, m)
+        if cutlass.const_expr(_BIAS_ARM):
+            bias_pair = bias_max_words[0]
+            for w in bias_max_words[1:]:
+                bias_pair = max_f16x2_word(bias_pair, w, dtype=STORAGE_DTYPE)
+            current_max = raw_max * scale_log2 + packed_pair_max_f32(bias_pair, dtype=STORAGE_DTYPE) * (inv_scale * scale_log2)
+        else:
+            current_max = raw_max * scale_log2
+    else:
+        chunks_max = []
+        for c in cutlass.range_constexpr(N_CHUNKS):
+            chunks_max.append(row_max_reduction(chunks_S[c]))
+        current_max_unscaled = chunks_max[0]
+        for m in chunks_max[1:]:
+            current_max_unscaled = cute.math.max(current_max_unscaled, m)
+        current_max = current_max_unscaled * scale_log2  # -inf when every column of this iteration is masked
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-    current_max = current_max_unscaled * scale_log2  # -inf when every column of this iteration is masked
 
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)

@@ -434,7 +434,7 @@ def test_template_params_and_capabilities_are_appended():
 
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-7:] == [
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-8:] == [
         "bias_mode",
         "kv_mask_form",
         "tile_n",
@@ -442,6 +442,7 @@ def test_template_params_and_capabilities_are_appended():
         "bias_stages",
         "padded_tail_form",  # the padded PLAIN body's tail form (the small tiles' pre-masked tail)
         "dead_subtile_quiet",  # the one-batch-entry item's dead-sub-tile quiet body
+        "bias_max_form",  # the row-max form of the bias / kv_mask body (test_sdpa_bias_max_form_sm107.py)
     ]  # appended in that order
     assert (p.padded_tail_form, p.dead_subtile_quiet) == (0, 0), "a record without the fields renders the legacy tail and the full body"
     # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
@@ -1039,16 +1040,21 @@ def test_kv_mask_fully_masked_row_equals_the_zero_length_sequence():
 @requires_rubin
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("case", ["dense_nkv2", "dense_nkv3_384", "causal_384", "padded_kv_zero_batch", "d64_dense_128"])
-def test_identity_bias_zero_and_mask_all_true_is_bitwise_the_plain_kernel(case, dtype):
+def test_identity_bias_zero_and_mask_all_true_is_bitwise_the_plain_kernel(case, dtype, monkeypatch):
     """bias = 0 and kv_mask = all True change no value: the biased rendering (the -inf masked body on every tile, the software
     row max, fma(0, 1/scale, s) == s, a keep word of all ones) is BITWISE the plain kernel on O and Stats -- as is each arm
     alone -- at the KV tile width the arm RUNS.  Every arm runs knob-less, so the heuristics' width table decides its rendering
     (``config_sm107.sm107_tile_n_pick``: the narrow tile for a bias WITH a mask on every case here, for a bias alone on the padding
     leg and for either arm alone at one 128-wide kv tile; 128 otherwise), and the plain twin is pinned to THAT width through the
     public record: the 64- and the 128-wide renderings reduce the row in a different number of steps, so the identity is a property
-    of one rendering, never a cross-width claim (a plain 128 vs a biased 64 differ in the last bits of O and Stats)."""
+    of one rendering, never a cross-width claim (a plain 128 vs a biased 64 differ in the last bits of O and Stats).  And at ONE row-max
+    form: the kv_mask-only plan's default is the hardware upper-bound max (``bias_max_form`` 1, test_sdpa_bias_max_form_sm107.py) whose
+    m on a band-masked tile is the RAW max where the plain body takes the exact masked one -- equal within rounding, not bitwise -- so
+    the three labels are pinned to the software tree through the sweep seam here; the dense-cell identity of the default plan is pinned
+    in that module."""
     from cudnn.sdpa.fwd import config_sm107 as cfg107
 
+    monkeypatch.setattr(cfg107, "_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS", 0)
     q, k, v, kw, _ = _case_inputs(case, dtype)
     c = _CASES[case]
     plain_by_width = {}
