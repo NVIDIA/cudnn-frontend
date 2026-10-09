@@ -1928,7 +1928,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | f16/bf16 d = 256 backward: dense padding mask, right-band widening, THD, `dense_flex`, decode, deterministic; the 4-CTA multicast arm (perf) | SM100, SM103 — the ᵇ² row serves dense / causal (top-left, bottom-right) / sliding window / GQA on BSHD only |
 | Backward deterministic, decode | SM100, SM103 — served by the MXFP8 d=256 row only |
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
-| f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense/nonpaged D256; THD outside D128, nonpaged D192, and SM107 paged D256 |
+| f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense D256; THD outside D128/D256 and nonpaged D192 |
 | f16/bf16 forward PackGQA | SM107 outside dense D128 GQA (shared bodies, not with the pre-folded scale), D128 paged THD / nonpaged D128 split THD and exact D256 paged unsplit THD with CGA2 |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD outside d256 (`SM107_MXFP8_THD_SHAPES`, ᶻ) |
 | MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open) |
@@ -2109,6 +2109,21 @@ uses the same packed-CTA count, two-wave budget and Q8 floor for D128 since
 2026-10-09 (gr100, 120 THD cases: mean regret 199.5% -> 10.6%, no lead-loss). The
 D192 and paged selection rules retain their existing domains.
 
+### D256 half packed split across Blackwell and Rubin
+
+SM100/SM103/SM107 exact D256/V256 FP16/BF16 THD forward plans admit
+explicit split-KV over both paged and packed nonpaged K/V. They reuse the
+existing two-CTA D256 partial stores, prepared host and packed combine, with
+NH/HN Stats, optional final log2 Stats, runtime device lengths and bounded
+shape overrides. Nonpaged D256 requires the matching native extension. No
+new runtime staging or scalar metadata readback is introduced.
+
+CGA2 and unpacked heads remain required for split plans; sink, padded Stats,
+fused gate and pre-folded-scale combinations remain declined. Quantized and
+inexact head dimensions retain their existing limits. Automatic D256 split
+selection is unchanged: the measured Rubin paged domain below is the only
+one selected automatically; the new domains are explicit candidates.
+
 ### SM107 paged D256 half packed split
 
 The SM107 half row additionally admits explicit paged D256/V256 THD split-KV
@@ -2118,7 +2133,7 @@ shared packed host/combine; the native binder advertises this geometry
 separately so older extensions decline it. FP16/BF16, NHD/HND page pools and
 optional packed NH/HN Stats (ln/log2) retain the existing graph contract.
 Shape-override plans require a bounded packed-Q capacity. Sinks, output gates,
-padded Stats, dense/nonpaged D256 and other architectures remain outside this
+padded Stats and dense queries remain outside this
 extension. Automatic selection covers FP16/BF16, Hq4..64 with GQA groups
 1/2/4/8/16, page16/128, bottom-right causal without a window or widened right
 band, Q64..1024, and KV2K..32K with KV at least four times Q. FROST leads when

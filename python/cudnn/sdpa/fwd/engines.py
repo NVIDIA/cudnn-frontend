@@ -803,20 +803,20 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             facts.attn_scale_prefolded
             and capabilities.sm_lo == 107
             and not (facts.is_fp8 or facts.is_mxfp8)
-            and knobs.cga == 1
             and facts.thd
-            and (packed_split or _selected_d_shape(capabilities, facts) == (192, 128))
+            and (packed_split or (knobs.cga == 1 and _selected_d_shape(capabilities, facts) == (192, 128)))
         ):
-            # These two legs load the single-CTA half body (api_dsl._load_sm100_kernel_module), which
-            # applies the scale in-kernel; the cga2 prefill body of the same flavor serves the fold.
-            return "attn_scale_prefolded is not wired in the single-CTA half THD legs (packed split / D192 single-Q)"
+            # Packed splits and the D192 single-CTA leg load shared SM100
+            # bodies, which apply the scale in-kernel. Rubin's native unsplit
+            # prefill siblings serve the pre-folded scale.
+            return "attn_scale_prefolded is not wired in the shared half THD legs (packed split / D192 single-Q)"
         if packed_split and not getattr(
             cudnn._pybind_module._SdpaThdBinder,
             (
                 "supports_paged_d64_packed_split"
                 if facts.d_v == 64
                 else (
-                    "supports_paged_d256_packed_split"
+                    ("supports_paged_d256_packed_split" if facts.has_paged_kv else "supports_nonpaged_d256_packed_split")
                     if facts.d_v == 256
                     else (
                         "supports_paged_packed_split"
@@ -876,7 +876,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs without a KV-tail mask, the decode tile's ragged-Q leg, or native D128, nonpaged D192, or SM107 paged D256 packed split"
+                return "split_kv > 1 serves sink-free dense graphs without a KV-tail mask, the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
             if _synth_kv_padding(capabilities, facts):
                 # The adapter would serve this ragged S_kv through the
                 # kernel's KV-tail mask (kv_tail_mask), which the split cannot
@@ -894,7 +894,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # cannot serve, so the plan would clear eligibility and then die in
             # the lowering (contract rule 8b'). Mirrors the pack_gqa gate below.
             if capabilities.sm_lo == 107 and _selected_d_shape(capabilities, facts) == (256, 256) and not packed_split:
-                return "SM107 D256 split is qualified only for paged half THD"
+                return "SM107 D256 split is qualified only for half THD"
             if capabilities.split_d_shapes is not None and _selected_d_shape(capabilities, facts) not in capabilities.split_d_shapes:
                 return f"split_kv > 1 is wired only in the {sorted(capabilities.split_d_shapes)} kernel flavors; graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
         if knobs.pack_gqa and capabilities.pack_gqa_d_shapes is not None:

@@ -571,6 +571,8 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
         # window and can compile natively for Rubin without another kernel body.
         params = replace(params, single_q_head_dim=flavor[0])
         return _load_kernel_template(_SM100_DECODE_KERNEL_FILE, params, f"sdpa_fwd_sm107_{tag}_single_q")
+    if rubin and not fp8 and flavor == (256, 256) and params.thd_varlen and not params.paged_kv and params.split_kv > 1:
+        return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_packed_split")
     if rubin and not fp8 and params.paged_kv and flavor in ((128, 128), (256, 256)):
         return _load_kernel_template(_SM100_KERNEL_FILES[flavor], params, f"sdpa_fwd_sm107_{tag}_paged")
     if rubin and not fp8 and flavor == _SM100_DECODE_FLAVOR and params.cta_mma == 1 and not params.thd_varlen and not params.paged_kv and not params.ragged_q:
@@ -1688,7 +1690,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                         "supports_paged_d64_packed_split"
                         if int(d_v) == 64
                         else (
-                            "supports_paged_d256_packed_split"
+                            ("supports_paged_d256_packed_split" if self.paged else "supports_nonpaged_d256_packed_split")
                             if int(d_v) == 256
                             else (
                                 "supports_paged_packed_split"
@@ -1947,12 +1949,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self.softmax_scale_prefolded and self._scale_softmax_requested,
             "softmax_scale_prefolded: leave scale_softmax unset -- Q already carries attn_scale * log2(e) and the kernel applies no scale",
         )
-        if self.softmax_scale_prefolded and (self.paged or self._single_cta_half_leg() or self._rubin_shared_dense_leg()):
-            # Routing, not contract: these legs load the shared single-CTA / paged / dense d128 half bodies
+        if self.softmax_scale_prefolded and (self.paged or self.packed_thd_split or self._single_cta_half_leg() or self._rubin_shared_dense_leg()):
+            # These shared packed-split / single-CTA / paged / dense D128 half bodies
             # (_load_sm100_kernel_module), which apply the scale in-kernel.  A decline, so the plan walk
             # moves to the cga2 prefill body of the same flavor (engines.mismatch / effective_cgas mirror this rule).
             raise NotImplementedError(
-                "softmax_scale_prefolded is not wired in the paged-KV / single-CTA THD / shared dense D128 half kernel bodies (they apply the scale in-kernel)"
+                "softmax_scale_prefolded is not wired in the paged-KV / packed-split THD / single-CTA THD / shared dense D128 half kernel bodies (they apply the scale in-kernel)"
             )
         if self.paged:
             # Paged KV rides the PAGED_KV specialization of the f16/bf16 kernels
@@ -2015,7 +2017,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # facts x knobs gate so the standalone API declines identically.
             self._not_implemented_error_if(
                 self.thd and not (self.thd_decode_leg or self.packed_thd_split),
-                "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128 or nonpaged D192 packed split",
+                "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128/D256 or nonpaged D192 packed split",
             )
             self._value_error_if(
                 self.has_sink
@@ -2054,7 +2056,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             )
             self._not_implemented_error_if(
                 self._device_cc == (10, 7) and not (self.packed_thd_split or ((not self._fp8 or self._pertensor) and self.flavor in ((128, 128), (192, 128)))),
-                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D128 or D192/V128, or half paged D256 THD",
+                "split_kv > 1 on cc10.7 requires half/per-tensor FP8 D128 or D192/V128, or half D256 THD",
             )
             # The MXFP8 row serves its native d64 leg dense / unsplit / unpaged
             # (split_d_shapes leaves (64, 64) out); mirror it here.
