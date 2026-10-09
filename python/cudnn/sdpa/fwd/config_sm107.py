@@ -413,25 +413,54 @@ def sm107_padded_tail_form_pick(
 # bmm1_done wait, alpha = 1 and the stat_full arrive, the bmm2_ready arrives, the warp-group ping-pong, the stat_empty wait), no TMEM
 # load and no math, so the live sibling warp group runs the ping-pong alone.  The barrier table is unchanged by construction (the same
 # sites fire the same lanes); the MMA still runs the dead sub-tile's BMM1 / BMM2 (its P is TMEM residue, its O rows are the trimmed /
-# clipped rows).  Default 0 until the A/B on an exclusive Rubin GPU; a flip is a commit with the numbers.
-SM107_DEAD_SUBTILE_QUIET_DEFAULT = 0
+# clipped rows).  MEASURED (212-SM cc 10.7 perf node, 2376 MHz lock, every process's busy clock median 2364 MHz, counter deltas 0,
+# same-process interleaved arms, control twins within 0.13 %, 100 launches x 3 rounds, graph replay): the quiet body wins every
+# PLAIN cell with a dead sub-tile -- d32 B 1 S 384 / 300 / 600 / 100 +7.5 / +1.0 / +3.9 / +6.0 %, d64 B 1 S 384 / 300 / 600 +4.2 /
+# +0.5 / +0.7 % -- and the kv_mask cells on the dense and the 64-wide renderings (S 384 +5.8 %, S 100 +5.3 %), ties the no-dead-tile
+# controls, and LOSES on the kv_mask + PADDED 128-wide rendering (d32 S 300 / 600 -2.7 / -4.5 %: the heaviest small-tile rendering,
+# the quiet loop's code beside its hot body), so that one rendering keeps the full body (``sm107_dead_subtile_quiet_pick``).
+SM107_DEAD_SUBTILE_QUIET_DEFAULT = 1
+SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE = 0  # the kv_mask + padded body at TILE_N 128
 DEAD_SUBTILE_QUIET_FORMS = frozenset({0, 1})
 # PRIVATE, process-local sweep seam (the ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` rules): pins the quiet form a knob-less ELIGIBLE plan gets.
 _DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
-def sm107_dead_subtile_quiet_pick(d_flavor: int, *, has_bias: bool, pair_item: bool = False, request: Optional[int] = None) -> int:
+def sm107_dead_subtile_quiet_pick(
+    d_flavor: int,
+    *,
+    has_bias: bool,
+    pair_item: bool = False,
+    request: Optional[int] = None,
+    has_kv_mask: bool = False,
+    padded: bool = False,
+    tile_n: int = SM107_SMALL_TILE_N_DEFAULT,
+    s_q: Optional[int] = None,
+    cga: int = 1,
+    tile_m: int = 128,
+) -> int:
     """The ``TemplateParams.dead_subtile_quiet`` of a plan on the Rubin small tiles: 0 off the eligible set (a bias -- its warp groups
     also wait and release the bias barriers, which the quiet body does not replicate -- the pair item, whose dead sub-tile is the
     odd chunk tail recomputing row nb0, the d128 flavor); on it ``request`` when the caller made one (the adapter's
-    ``dead_subtile_quiet=``, validated there: honoured or declined, never degraded), else the sweep seam, else
-    :data:`SM107_DEAD_SUBTILE_QUIET_DEFAULT`."""
+    ``dead_subtile_quiet=``, validated there: honoured or declined, never degraded), else the sweep seam, else the measured default of
+    the plan's rendering (``has_kv_mask`` / ``padded`` / ``tile_n``, appended): :data:`SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE`
+    on the kv_mask + padded 128-wide rendering, :data:`SM107_DEAD_SUBTILE_QUIET_DEFAULT` everywhere else -- and 0 when the plan's S_q (``s_q``
+    with its cluster width ``cga`` and Q tile height ``tile_m``) leaves NO dead sub-tile: the one-batch-entry item's cluster tile is
+    2 x tile_m x cga rows (256 x cga at the default height), a dead sub-tile exists iff ``s_q % rows`` is in 1..(rows - tile_m); without
+    one the quiet rendering only costs its code (S 217: -1.6 %)."""
     if has_bias or pair_item or int(d_flavor) not in (32, 64):
         return 0
     if request is not None:
         return int(request)
     if _DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS is not None:
         return int(_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS)
+    if s_q is not None:
+        rows = 2 * int(tile_m) * max(int(cga), 1)
+        rem = int(s_q) % rows
+        if rem == 0 or rem > rows - int(tile_m):
+            return 0  # every softmax sub-tile of every super-tile holds a live row: nothing to keep quiet
+    if has_kv_mask and padded and int(tile_n) == SM107_SMALL_TILE_N_DEFAULT:
+        return SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE
     return SM107_DEAD_SUBTILE_QUIET_DEFAULT
 
 

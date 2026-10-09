@@ -71,6 +71,7 @@ from cudnn.sdpa.fwd.config_sm107 import sm107_bias_mode_pick as _sm107_bias_mode
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_stages_pick as _sm107_bias_stages_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_padded_tail_form_pick as _sm107_padded_tail_form_pick, PADDED_TAIL_FORMS as _PADDED_TAIL_FORMS
 from cudnn.sdpa.fwd.config_sm107 import sm107_dead_subtile_quiet_pick as _sm107_dead_subtile_quiet_pick, DEAD_SUBTILE_QUIET_FORMS as _DEAD_SUBTILE_QUIET_FORMS
+from cudnn.sdpa.fwd.config_sm107 import _tile_m_d128 as _sm107_tile_m_d128
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
@@ -1663,7 +1664,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         validated by ``check_support``) or the pick (``config_sm107.sm107_dead_subtile_quiet_pick``: the default constant or the sweep seam)."""
         if not self._dead_subtile_quiet_eligible():
             return 0
-        return _sm107_dead_subtile_quiet_pick(self.flavor[0], has_bias=False, pair_item=False, request=self.dead_subtile_quiet)
+        return _sm107_dead_subtile_quiet_pick(
+            self.flavor[0],
+            has_bias=False,
+            pair_item=False,
+            request=self.dead_subtile_quiet,
+            has_kv_mask=self.kv_mask_desc is not None,
+            padded=bool(self.seq_kv_lens_present),
+            tile_n=self._effective_tile_n(),
+            s_q=int(self.q_desc.shape[2]),
+            # the eligible plans (the f16/bf16 small tiles without a bias on cc 10.7) run at cga1 unless the TILE_CGA_M knob asks for 2 --
+            # the cta_mma arm of template_params()
+            cga=int(self.cga) if self.cga is not None else 1,
+            # the Q tile height the factory renders (128, or 64 under the TILE_M sweep seam): the same resolver the budgets read
+            tile_m=_sm107_tile_m_d128(self.flavor[0]),
+        )
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")

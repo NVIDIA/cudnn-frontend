@@ -1116,15 +1116,48 @@ def test_dead_subtile_quiet_pick_is_one_arithmetic_with_the_factory():
     from cudnn.sdpa.fwd.config_sm107 import (
         DEAD_SUBTILE_QUIET_FORMS,
         SM107_DEAD_SUBTILE_QUIET_DEFAULT,
+        SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE,
         make_cfg_d32,
         make_cfg_d64,
         make_cfg_d128,
         sm107_dead_subtile_quiet_pick,
     )
 
-    assert SM107_DEAD_SUBTILE_QUIET_DEFAULT in DEAD_SUBTILE_QUIET_FORMS
+    assert SM107_DEAD_SUBTILE_QUIET_DEFAULT in DEAD_SUBTILE_QUIET_FORMS and SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE in DEAD_SUBTILE_QUIET_FORMS
+    assert SM107_DEAD_SUBTILE_QUIET_DEFAULT == 1, "the quiet body is the measured default (every plain cell with a dead sub-tile a win)"
+    assert SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE == 0, "the kv_mask + padded 128-wide rendering keeps the full body (-2.7 / -4.5 %)"
     for d in (32, 64):
         assert sm107_dead_subtile_quiet_pick(d, has_bias=False) == SM107_DEAD_SUBTILE_QUIET_DEFAULT
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, has_kv_mask=True) == SM107_DEAD_SUBTILE_QUIET_DEFAULT, "a dense kv_mask body"
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, padded=True) == SM107_DEAD_SUBTILE_QUIET_DEFAULT, "the padded plain body"
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, has_kv_mask=True, padded=True, tile_n=64) == SM107_DEAD_SUBTILE_QUIET_DEFAULT
+        assert (
+            sm107_dead_subtile_quiet_pick(d, has_bias=False, has_kv_mask=True, padded=True, tile_n=128) == SM107_DEAD_SUBTILE_QUIET_DEFAULT_KV_MASK_PADDED_WIDE
+        )
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, has_kv_mask=True, padded=True, tile_n=128, request=1) == 1
+        # the dead-sub-tile existence: a 256 x cga-row cluster tile, dead iff s_q % (256 cga) in 1..(256 cga - 128)
+        for s_q, cga, want in (
+            (384, 1, 1),
+            (300, 1, 1),
+            (600, 1, 1),
+            (100, 1, 1),
+            (256, 1, 0),
+            (512, 1, 0),
+            (217, 1, 0),
+            (640, 1, 1),
+            (641, 1, 0),
+            (384, 2, 1),
+            (300, 2, 1),
+            (600, 2, 1),
+            (512, 2, 0),
+            (900, 2, 0),
+            (896, 2, 1),
+        ):
+            assert sm107_dead_subtile_quiet_pick(d, has_bias=False, s_q=s_q, cga=cga) == want, (d, s_q, cga)
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, s_q=217, request=1) == 1, "a request is honoured without a dead sub-tile too"
+        # the TILE_M = 64 lever (the sweep seam): 128-row cluster tiles, dead iff s_q % 128 in 1..64
+        for s_q, want in ((384, 0), (300, 1), (200, 0), (160, 1), (217, 0), (100, 0), (64, 1), (65, 0)):
+            assert sm107_dead_subtile_quiet_pick(d, has_bias=False, s_q=s_q, cga=1, tile_m=64) == want, (d, s_q, 64)
         assert sm107_dead_subtile_quiet_pick(d, has_bias=False, request=1) == 1
         assert sm107_dead_subtile_quiet_pick(d, has_bias=False, request=0) == 0
         assert sm107_dead_subtile_quiet_pick(d, has_bias=True, request=1) == 0
@@ -1200,6 +1233,20 @@ def test_adapter_dead_subtile_quiet_default_is_the_config_pick():
     api = _api2(s_q=384, s_kv=384)
     assert api.check_support() is True
     assert api.template_params().dead_subtile_quiet == SM107_DEAD_SUBTILE_QUIET_DEFAULT
+    api = _api2(s_q=300, s_kv=300, seq_kv_lens_present=True, kv_mask=(2, 1, 1, 300))
+    assert api.check_support() is True
+    assert api.template_params().tile_n == 128 and api.template_params().dead_subtile_quiet == 0, "the kv_mask + padded 128-wide rendering keeps the full body"
+    api = _api2(s_q=217, s_kv=217, seq_kv_lens_present=True)
+    assert api.check_support() is True
+    assert api.template_params().dead_subtile_quiet == 0, "S 217 has no dead sub-tile (217 % 256 > 128): the full body, no quiet code"
+    api = _api2(s_q=512, s_kv=512)
+    assert api.check_support() is True
+    assert api.template_params().dead_subtile_quiet == 0, "a tile multiple has no dead sub-tile"
+    api = _api2(s_q=100, s_kv=100, seq_kv_lens_present=True, kv_mask=(2, 1, 1, 100))
+    assert api.check_support() is True
+    assert (
+        api.template_params().tile_n == 64 and api.template_params().dead_subtile_quiet == SM107_DEAD_SUBTILE_QUIET_DEFAULT
+    ), "the 64-wide one takes the quiet body"
     saved = cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS
     try:
         cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = 1
