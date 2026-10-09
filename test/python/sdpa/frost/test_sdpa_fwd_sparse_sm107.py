@@ -1881,6 +1881,10 @@ def test_sparse_kernel_gate_arm_source_pins():
     assert sig.rstrip().endswith("tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,"), "the gate descriptor is the LAST kernel parameter"
     # the ungated rendering keeps its drains, the gated one its own (STAGES_GATE + 1 waits on mb_gate_empty, none on mb_q_empty)
     assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" in code
+    # the gate barriers' parities come from PipelineStates advanced by the ring depth like every other ring (P2) -- never a scalar toggle
+    assert "_phase ^ cutlass.Int32(1)" not in code, "a gate barrier's parity is a PipelineState advanced by CFG.STAGES_GATE, never a scalar toggle"
+    assert code.count("advance(ge_state, CFG.STAGES_GATE)") >= 1 and code.count("advance(gf_state, CFG.STAGES_GATE)") == 1
+    assert "ge_state = PipelineState.start(phase=1)" in code and "gf_state = PipelineState.start(phase=0)" in code
 
 
 # ============================================================================ Rubin: the fused epilogue gate
