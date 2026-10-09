@@ -4640,9 +4640,10 @@ def _fp8_pertensor_inputs(b, hq, hkv, s_q, s_kv, d_qk, d_v, fp8_dtype):
     return q, k, v
 
 
-def _fp8_d192_oracle(q_f64, k_f64, v_f64, *, attn_scale, causal, bottom_right=False):
+def _fp8_d192_oracle(q_f64, k_f64, v_f64, *, attn_scale, causal, bottom_right=False, window_left=None):
     """Float64 softmax(Q K^T * attn_scale) V and its natural-log LSE under a top-left or bottom-right
-    causal mask; a row without a live key comes out as O = 0 / LSE = -inf (the kernel's contract)."""
+    causal mask (plus an optional left window of ``window_left`` past keys riding the diagonal); a row without a
+    live key comes out as O = 0 / LSE = -inf (the kernel's contract)."""
     import torch
 
     hq, hkv = q_f64.shape[1], k_f64.shape[1]
@@ -4654,12 +4655,14 @@ def _fp8_d192_oracle(q_f64, k_f64, v_f64, *, attn_scale, causal, bottom_right=Fa
         j = torch.arange(s_kv, device=logits.device).view(1, s_kv)
         diag = i + (s_kv - s_q if bottom_right else 0)
         logits = logits.masked_fill(j > diag, float("-inf"))
+        if window_left is not None:
+            logits = logits.masked_fill(j < diag - window_left, float("-inf"))
     ref_lse = torch.logsumexp(logits, dim=-1)
     ref_o = torch.softmax(logits, dim=-1).nan_to_num(0.0) @ v_f64.repeat_interleave(rep, 1)
     return ref_o, ref_lse
 
 
-def _run_fp8_d192_softmax_arm(q, k, v, *, precision, with_stats, split_kv, causal, bottom_right, attn_scale, dtype_o):
+def _run_fp8_d192_softmax_arm(q, k, v, *, precision, with_stats, split_kv, causal, bottom_right, attn_scale, dtype_o, window_left=None):
     """Build + run the per-tensor FP8 (192, 128) kernel on cc10.7 with the requested softmax arm; returns
     ``(api, out, lse)`` with the outputs NaN-poisoned beforehand so an unwritten cell stays visible."""
     import torch
@@ -4681,6 +4684,7 @@ def _run_fp8_d192_softmax_arm(q, k, v, *, precision, with_stats, split_kv, causa
         scale_softmax=attn_scale,
         is_causal=causal,
         causal_bottom_right=bottom_right,
+        window_size_left=window_left,
         pertensor_fp8=True,
         dtype_o=dtype_o,
         cga=2,
@@ -4785,6 +4789,42 @@ def test_fp8_d192_softmax_arms_keep_keyless_rows_dead(precision, with_stats, spl
         assert torch.isfinite(lse[..., keyless:]).all(), "unwritten / non-finite live LSE rows"
         lse_err = (lse[..., keyless:].double() - ref_lse[..., keyless:]).abs().max().item()
         assert lse_err <= 1e-4, f"live rows: LSE max err {lse_err} vs oracle (natural log)"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("precision", ["float", "half"])
+def test_fp8_d192_masked_leading_tile_keeps_rows_with_later_keys_finite(precision):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys, on the per-tensor FP8 d192x128 kernel:
+    top-left causal with a 34-key band at S = 256 (rows 161..255: no key in tile 0, 34 keys in tile 1) under UNIT descales and
+    attn_scale 1, so the folded scale_log2 = log2 e > 1 overflows the scaled mask sentinel to -inf -- the running max of that
+    tile, and -inf - (-inf) = NaN in P and in the Sigma denominator (with the quantizer's amax / 448 descales the same tile
+    published P = 1 instead, wiped by the next live tile's alpha = 0).  Values are drawn inside the fp8 range (std 1.5) so unit
+    descales are the kernel's real operating point.  Every row has keys: O and LSE finite and at the float64 oracle on both
+    softmax arms (the Stats leg's exact f32 denominator keeps the LSE within 1e-4)."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 FP8 kernels serve cc10.7 only")
+    d_qk, d_v, b, hq, hkv, s = 192, 128, 1, 8, 2, 256
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def draw(h, d, std):
+        x8 = (torch.randn(b, s, h, d, device="cuda", generator=gen) * std).to(torch.float8_e4m3fn).transpose(1, 2)
+        return x8, torch.ones(1, device="cuda", dtype=torch.float32), x8.double()
+
+    q, k, v = draw(hq, d_qk, 1.5), draw(hkv, d_qk, 1.5), draw(hkv, d_v, 1.0)
+    _, out, lse = _run_fp8_d192_softmax_arm(
+        q, k, v, precision=precision, with_stats=True, split_kv=1, causal=True, bottom_right=False, attn_scale=1.0, dtype_o=torch.bfloat16, window_left=33
+    )
+    ref_o, ref_lse = _fp8_d192_oracle(q[2], k[2], v[2], attn_scale=1.0, causal=True, window_left=33)
+    assert torch.isfinite(ref_lse).all(), "geometry: every row keeps 34 keys"
+    assert torch.isfinite(out).all(), f"{int((~torch.isfinite(out)).sum())} non-finite O cells"
+    assert torch.isfinite(lse).all(), f"{int((~torch.isfinite(lse)).sum())} non-finite LSE rows"
+    scale = ref_o.abs().max().item()
+    err = (out.double() - ref_o).abs().max().item()
+    assert err <= 0.1 * scale, f"O max err {err} vs oracle (scale {scale})"
+    lse_err = (lse.double() - ref_lse).abs().max().item()
+    assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
 # ------------------------------------------------------------------ the d512 MXFP8 softmax levers (the role-split kernel, SMEM P pack)
