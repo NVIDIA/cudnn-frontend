@@ -54,7 +54,7 @@ def host(
     the DSL 4.7.0 lowering. The live prefix total stays on the device and bounds
     the combine. Partial Stats always use natural logs.
     """
-    d_qk, d_v, splits, stats_log2 = config
+    d_qk, d_v, splits, stats_log2, has_sink = config
     b, qh, _kh, tq, _tkv, _ = problem_size
     tokens, heads = cutlass.Int64(tq), cutlass.Int64(qh)
     args = (
@@ -106,10 +106,11 @@ def host(
         meta_ptr + cutlass.Int64(2) * cutlass.Int64(b),
         stats_log2,
         stream,
+        sinks_ptr=sinks_ptr if cutlass.const_expr(has_sink) else None,
     )
 
 
-def compile_host(kernel_host, cfg, storage_dtype, cache_key, *, has_lse, lse_kind, paged_hnd, ragged_q_slots):
+def compile_host(kernel_host, cfg, storage_dtype, cache_key, *, has_lse, lse_kind, paged_hnd, ragged_q_slots, has_sink=False):
     """Specialize one common pointer host; extents and strides stay dynamic."""
     if lse_kind not in ("head", "token"):
         raise ValueError("prepared packed split Stats must be head- or token-major")
@@ -149,7 +150,7 @@ def compile_host(kernel_host, cfg, storage_dtype, cache_key, *, has_lse, lse_kin
         i32,
         paged_hnd,
         kernel_host,
-        (cfg.TILE_K, cfg.TILE_O, cfg.SPLIT_KV, bool(cfg.STATS_LOG2)),
+        (cfg.TILE_K, cfg.TILE_O, cfg.SPLIT_KV, bool(cfg.STATS_LOG2), bool(has_sink)),
         ragged_q_slots,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

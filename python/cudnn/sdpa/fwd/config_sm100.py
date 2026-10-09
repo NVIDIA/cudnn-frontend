@@ -286,6 +286,11 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
     )
 
 
+def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
+    """Sink-aware packed combine, qualified on Rubin D128 paged half Q>1."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1
+
+
 def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
     """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
     # SM100 Q=1 keeps the existing ragged-Q decode/combine contract.

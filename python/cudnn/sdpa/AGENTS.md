@@ -787,3 +787,13 @@ success and validation failure. A matching device in buffer metadata alone does
 not set the calling thread's CUDA context. The SM80 regression is
 `test_sm80_direct_standalone_with_another_device_current`: run with two GPUs,
 check the launch context and stream, then verify changed-input graph replay.
+
+
+Sink-aware packed split partials must exclude the sink. Combine adds its
+per-query-head virtual-key mass once to the stable denominator and never to
+the value numerator. Partial LSE remains natural-log; convert only the final
+Stats. Test keyless rows (O=0, LSE=sink), negative-infinite sinks, poisoned dead
+partials, both runtime reduction branches, and changed sink contents/pointers
+under retained captures. `test_packed_sink_combine_counts_virtual_key_once`
+and the sink cells of `test_paged_thd_split_capture_lengths_and_stats` are the
+detectors; a sink in each partial silently counts it once per partition.
