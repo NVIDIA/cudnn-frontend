@@ -2296,14 +2296,18 @@ def _passes_the_block_level_checks(blk, *, attr: str) -> None:
 def test_fp8_declaration_declines_are_typed():
     """Every typed decline of the quantized backward's DECLARATION, on any CUDA device, before the Rubin gate and before any
     stage is asked -- and the ONE place its message texts are pinned (every other test matches the attribute name only).
-    At construction: a ``quant`` of a wrong type (``TypeError``), an ``MxQuantSpec`` (a typed ``NotImplementedError``: the
-    MXFP8 backward is a follow-up), e5m2 codes (``QuantSpec.validate``), ``grad_scaling`` outside its vocabulary or given
-    without ``quant``.  At ``check_support``: an fp16 ``sample_dy`` under ``quant`` (the quantized backward is bf16); the
-    record / weight dtype gates BOTH ways (a bf16 ``saved.h`` with a spec, e4m3 codes without one -- the Q0 message extended
-    with the ``quant=QuantSpec`` declaration --, bf16 weights with a spec, e4m3 weights without one); ``thd=True`` with
-    ``quant`` (names BOTH attributes and never the row's flag, so the caller is not told to drop the delta the block
-    requires).  There is NO ``B*S % 16`` decline: the weight-gradient GEMMs are MN-major (no K-contiguous operand), so S = 1000
-    at B = 1 passes the block-level checks with its weight gradients, with one of them, without them, and at B = 2 alike."""
+    At construction: a ``quant`` of a wrong type (``TypeError``), e5m2 codes (``QuantSpec.validate``), ``grad_scaling`` outside
+    its vocabulary or given without ``quant``; an ``MxQuantSpec`` is NO decline -- it selects the MXFP8 backward's own
+    declaration (``test_mxfp8_declaration_declines_are_typed`` pins its declines).  At ``check_support``: an fp16 ``sample_dy``
+    under ``quant`` (the quantized backward is bf16); the record / weight dtype gates BOTH ways (a bf16 ``saved.h`` with a spec,
+    e4m3 codes without one -- the Q0 message extended with the ``quant=QuantSpec`` declaration --, bf16 weights with a spec,
+    e4m3 weights without one).  ``thd=True`` with ``quant=QuantSpec`` is SERVED, not declined: the packed per-tensor fp8
+    backward constructs over any record (a placeholder without a proj_slab included -- the gate-copy decline is
+    ``check_support``'s) with the dense stage list at ``B = 1, S = T`` and the SDPA stage declared PACKED over the fp8 row,
+    the facts read off the declared stage without a compile (the packed suite owns the record's buffers); the ``MxQuantSpec``
+    x ``thd`` decline is the MXFP8 test's.  There is NO ``B*S % 16`` decline: the weight-gradient GEMMs are MN-major (no
+    K-contiguous operand), so S = 1000 at B = 1 passes the block-level checks with its weight gradients, with one of them,
+    without them, and at B = 2 alike."""
     b, s = 1, 256
     # -- construction --
     with pytest.raises(TypeError, match="quant"):
@@ -2343,34 +2347,42 @@ def test_fp8_declaration_declines_are_typed():
     with pytest.raises(ValueError, match="w_o") as ei:
         r.blk.check_support()
     assert "without quant" in str(ei.value) and "DEQUANTIZED" in str(ei.value)
-    # -- thd + quant: both attributes named, the row's flag never (the message must not tell the caller to drop the delta) --
+    # -- thd + quant=QuantSpec: SERVED packed at CONSTRUCTION (before any stage is built), whatever the record carries -- the dense
+    #    stage list at B = 1, S = T with the SDPA stage declared PACKED over the fp8 row; the facts read off the declared stage, no
+    #    compile (the packed suite, test_block_thd_backward_fp8.py, runs the record); an MxQuantSpec under thd is the typed decline
+    #    (test_mxfp8_declaration_declines_are_typed) --
     lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError) as ei:  # at CONSTRUCTION (before any stage is built), whatever the record carries
-        _declare_bwd_fp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
-    msg = str(ei.value)
-    assert "thd=True" in msg and "quant=QuantSpec" in msg and "dense-only" in msg, msg
-    assert "external_delta" not in msg, msg
-    z = torch.empty(0, device="cuda")  # a placeholder record without a proj_slab gets the same answer, not the gate-copy decline
+    r = _declare_bwd_fp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
+    assert r.blk.thd and r.blk.quant is _QSPEC and (r.blk.batch, r.blk.seq_len) == (1, 256) and (r.blk.num_sequences, r.blk.max_seq_len) == (2, 128)
+    assert [type(st).__name__ for st in r.blk._stages] == _FP8_STAGES, "the dense fp8 stage list, packed at the SDPA stage only"
+    st = r.blk._sdpa
+    assert type(st).__name__ == "_SdpaBwdFp8" and st.thd and (st.num_sequences, st.max_seq_len, st.cu_seqlens) == (2, 128, False)
+    impl = st._ensure_impl()
+    assert impl.thd is True and impl.external_delta is True and impl.seq_kv_lens_present is False and impl.amax_requested == frozenset({"amax_dP"})
+    assert (impl.max_total_seq_len_q, impl.max_total_seq_len_kv) == (256, 256)
+    assert tuple(impl.external_delta_shape) == st.delta_shape == (1, _COMMON["h_q"], 256), "the packed delta: the dense layout at B = 1, S = T"
+    assert tuple(int(x) for x in impl.stats_desc.shape) == (2, _COMMON["h_q"], 128, 1), "Stats declared over the envelope (B, H_q, S_max, 1)"
+    z = torch.empty(0, device="cuda")  # a placeholder record without a proj_slab constructs the same way (the gate-copy decline is check_support's)
     placeholder = SavedForBackward(
         h=torch.empty(256, _COMMON["d_model"], dtype=_E4M3, device="cuda"), gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths"
     )
     inp = _declare_bwd(dict(_COMMON), 1, 256).inp
-    with pytest.raises(ValueError, match="thd=True with quant=QuantSpec"):
-        GatedAttentionBlockBwd(
-            torch.empty(256, _COMMON["d_model"], dtype=torch.bfloat16, device="cuda"),
-            placeholder,
-            inp["w_qkvg"].to(_E4M3),
-            inp["w_q_norm"],
-            inp["w_k_norm"],
-            inp["cos"],
-            inp["sin"],
-            inp["w_o"].to(_E4M3),
-            GatedAttentionBlockGeometry(**_COMMON),
-            quant=_QSPEC,
-            thd=True,
-            num_sequences=2,
-            max_seq_len=256,
-        )
+    blk = GatedAttentionBlockBwd(
+        torch.empty(256, _COMMON["d_model"], dtype=torch.bfloat16, device="cuda"),
+        placeholder,
+        inp["w_qkvg"].to(_E4M3),
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        inp["cos"],
+        inp["sin"],
+        inp["w_o"].to(_E4M3),
+        GatedAttentionBlockGeometry(**_COMMON),
+        quant=_QSPEC,
+        thd=True,
+        num_sequences=2,
+        max_seq_len=256,
+    )
+    assert blk.thd and type(blk._sdpa).__name__ == "_SdpaBwdFp8" and blk._sdpa.thd and (blk._sdpa.num_sequences, blk._sdpa.max_seq_len) == (2, 256)
     # -- no B*S % 16 rule: S = 1000 at B = 1 passes the block-level checks WITH its weight gradients (T = 1000 is a ragged K the
     #    MN-major wgrads zero-fill), with one of them, without them, and at B = 2 --
     for kw, (bb, ss) in (({}, (1, 1000)), (dict(need_dw_qkvg=False), (1, 1000)), (dict(need_dw_o=False, need_dw_qkvg=False), (1, 1000)), ({}, (2, 1000))):
