@@ -61,7 +61,7 @@ _PACKAGE_PATTERNS = [
     r"^looseversion$",
     r"^numpy$",
     r"^ninja$",
-    r"^pybind11$",
+    r"^nanobind$",
 ]
 
 # Packages whose declared cuDNN backend pin we annotate in the Relevant

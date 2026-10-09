@@ -6,15 +6,15 @@
 #include <utility>
 #include <vector>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "cudnn_frontend.h"
 #include "pygraph.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend {
 
@@ -223,13 +223,13 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
           py::arg("input"),
           py::arg("scale"),
           py::arg("bias"),
-          py::arg("in_running_mean"),
-          py::arg("in_running_var"),
+          py::arg("in_running_mean").none(),
+          py::arg("in_running_var").none(),
           py::arg("epsilon"),
-          py::arg("momentum"),
-          py::arg_v("peer_stats", std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""))
+          py::arg("momentum").none(),
+          py::arg("peer_stats")        = std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "")
         .def("layernorm",
              &PyGraph::layernorm,
              py::arg("norm_forward_phase"),
@@ -237,17 +237,17 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("scale"),
              py::arg("bias"),
              py::arg("epsilon"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("adalayernorm",
              &PyGraph::adalayernorm,
              py::arg("norm_forward_phase"),
              py::arg("input"),
              py::arg("scale"),
-             py::arg_v("bias", nullptr),
+             py::arg("bias") = py::none(),
              py::arg("epsilon"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("batchnorm_inference",
              &PyGraph::batchnorm_inference,
              py::arg("input"),
@@ -255,8 +255,8 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("inv_variance"),
              py::arg("scale"),
              py::arg("bias"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("batchnorm_backward",
              &PyGraph::batchnorm_backward,
              py::arg("grad"),
@@ -264,9 +264,9 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("scale"),
              py::arg("mean"),
              py::arg("inv_variance"),
-             py::arg_v("peer_stats", std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>()),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("peer_stats")        = std::vector<std::shared_ptr<cudnn_frontend::graph::Tensor_attributes>>(),
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("layernorm_backward",
              &PyGraph::layernorm_backward,
              py::arg("grad"),
@@ -274,8 +274,8 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("scale"),
              py::arg("mean"),
              py::arg("inv_variance"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("adalayernorm_backward",
              &PyGraph::adalayernorm_backward,
              py::arg("grad"),
@@ -283,17 +283,17 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("scale"),
              py::arg("mean"),
              py::arg("inv_variance"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("rmsnorm",
              &PyGraph::rmsnorm,
              py::arg("norm_forward_phase"),
              py::arg("input"),
              py::arg("scale"),
-             py::arg_v("bias", nullptr),
+             py::arg("bias") = py::none(),
              py::arg("epsilon"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
         .def("rmsnorm_backward",
              &PyGraph::rmsnorm_backward,
              py::arg("grad"),
@@ -301,8 +301,8 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("scale"),
              py::arg("inv_variance"),
              py::arg("has_dbias"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
 
         .def("instancenorm",
              &PyGraph::instancenorm,
@@ -311,36 +311,36 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              py::arg("scale"),
              py::arg("bias"),
              py::arg("epsilon"),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
 
         .def("instancenorm_backward",
              &PyGraph::instancenorm_backward,
              py::arg("grad"),
              py::arg("input"),
              py::arg("scale"),
-             py::arg_v("mean", nullptr),
-             py::arg_v("inv_variance", nullptr),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("mean")              = py::none(),
+             py::arg("inv_variance")      = py::none(),
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
 
         .def("rope",
              &PyGraph::rope,
              py::arg("input"),
              py::arg("freqs"),
-             py::arg_v("output_scale", 1.0f),
-             py::arg_v("rope_dim", int64_t{0}),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""))
+             py::arg("output_scale")      = 1.0f,
+             py::arg("rope_dim")          = int64_t{0},
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "")
 
         .def("rope_backward",
              &PyGraph::rope_backward,
              py::arg("dY"),
              py::arg("freqs"),
-             py::arg_v("output_scale", 1.0f),
-             py::arg_v("rope_dim", int64_t{0}),
-             py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-             py::arg_v("name", ""));
+             py::arg("output_scale")      = 1.0f,
+             py::arg("rope_dim")          = int64_t{0},
+             py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+             py::arg("name")              = "");
 }
 
 // RoPE implementation

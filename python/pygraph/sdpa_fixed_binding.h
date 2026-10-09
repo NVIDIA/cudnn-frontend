@@ -7,7 +7,10 @@
 #include <limits>
 #include <string>
 #include <utility>
-#include <pybind11/stl.h>
+
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 namespace cudnn_frontend {
 namespace python_bindings {
@@ -29,7 +32,7 @@ class FixedSdpaOperands {
     int64_t device_;
     [[noreturn]] void
     invalid(const std::string &message) const {
-        throw pybind11::value_error(name_ + ": " + message);
+        throw nanobind::value_error((name_ + ": " + message).c_str());
     }
 
     int64_t
@@ -66,12 +69,12 @@ class FixedSdpaOperands {
     }
 
     void
-    add_operand(const std::string &name, const pybind11::handle &value, const pybind11::handle &declared) {
+    add_operand(const std::string &name, const nanobind::handle &value, const nanobind::handle &declared) {
         Operand op;
         op.name = name;
         if (!value.is_none()) {
             op.enabled = true;
-            op.dtype   = value.attr("dtype").cast<std::string>();
+            op.dtype   = nanobind::cast<std::string>(value.attr("dtype"));
             if (op.dtype == "bfloat16") {
                 op.code = kDLBfloat;
                 op.bits = 16;
@@ -85,14 +88,14 @@ class FixedSdpaOperands {
             } else {
                 invalid("native fixed binding does not support " + op.dtype);
             }
-            op.bytes     = multiply(value.attr("span").cast<int64_t>(), op.bits / 8);
-            op.alignment = value.attr("alignment").cast<int64_t>();
+            op.bytes     = multiply(nanobind::cast<int64_t>(value.attr("span")), op.bits / 8);
+            op.alignment = nanobind::cast<int64_t>(value.attr("alignment"));
             if (op.alignment <= 0) invalid("invalid operand alignment");
         }
         if (!declared.is_none()) {
-            auto pair    = declared.cast<pybind11::tuple>();
-            auto shape   = pair[0].cast<std::vector<int64_t>>();
-            auto strides = pair[1].cast<std::vector<int64_t>>();
+            auto pair    = nanobind::cast<nanobind::tuple>(declared);
+            auto shape   = nanobind::cast<std::vector<int64_t>>(pair[0]);
+            auto strides = nanobind::cast<std::vector<int64_t>>(pair[1]);
             op.geometry  = geometry(shape, strides);
         }
         operands_.push_back(std::move(op));

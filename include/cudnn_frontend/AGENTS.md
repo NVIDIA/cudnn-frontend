@@ -6,7 +6,7 @@ The header-only C++ library (CMake INTERFACE target `cudnn_frontend`, C++17). Um
 
 - **Header-only**: no `.cpp` files, no link-time dependencies beyond cuDNN/CUDA. New third-party code must be vendored under `thirdparty/` (currently only `nlohmann/json.hpp`, excludable via `CUDNN_FRONTEND_SKIP_JSON_LIB`).
 - Builds with `-Wall -Wextra -Wpedantic -Werror` (GCC/Clang) and `/W4 /WX` (MSVC) — code must be warning-clean on both.
-- C++17 only in `include/` (the pybind11 layer under `python/` is C++20).
+- C++17 only in `include/` (the nanobind layer under `python/` is C++20).
 - Guard anything needing a newer cuDNN with runtime `detail::get_backend_version()` checks (compare against `CUDNN_FRONTEND_VERSION`-style integers, e.g. 9.12.0 → 91200); the same headers must compile against older cuDNN 9.x. **Declare unconditionally, gate in the body**: an `#if`-conditional declaration bakes the build-time cuDNN version into the artifact, so a wheel built against 9.23 silently loses the symbol on a 9.24 system — declare the API always and return not-supported at runtime instead (review on PR #246).
 - **Guard new enum attributes with the header version, like the rest of the codebase.** Wrap the use of an attribute that only exists from cuDNN X.Y on in `#if (CUDNN_VERSION >= XY00)` with a not-supported `#else` branch, and keep the runtime backend version check (`NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION`) inside it. Only gate on a version whose released headers actually define the attribute; `#ifdef` cannot detect an enum constant, and guessing its integer value risks an ABI collision.
 - clang-format (Google-based, indent 4, 120 cols, `SortIncludes: false`) via `pre-commit run`.

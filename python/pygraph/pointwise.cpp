@@ -5,15 +5,15 @@
 
 #include <utility>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/cast.h"
-#include "pybind11/stl.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 
 #include "cudnn_frontend.h"
 #include "pygraph.h"
 
-namespace py = pybind11;
-using namespace pybind11::literals;
+namespace py = nanobind;
 
 namespace cudnn_frontend::python_bindings {
 
@@ -188,8 +188,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::ADD>,
           py::arg("a"),
           py::arg("b"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Adds two cudnn tensors.
 
@@ -206,8 +206,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::ADD>,
           py::arg("input"),
           py::arg("bias"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Add bias to the input.
 
@@ -224,8 +224,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::MUL>,
           py::arg("a"),
           py::arg("b"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Computes elementwise multiplication of two cudnn tensors.
 
@@ -242,8 +242,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::MUL>,
           py::arg("input"),
           py::arg("scale"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Scale the input.
 
@@ -260,8 +260,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("sqrt",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::SQRT>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Square root of the input tensor is computed
 
@@ -278,8 +278,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::MAX>,
           py::arg("input0"),
           py::arg("input1"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Max of the input tensors is computed
 
@@ -296,8 +296,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::MIN>,
           py::arg("input0"),
           py::arg("input1"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Max of the input tensors is computed
 
@@ -315,8 +315,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::gen_index,
           py::arg("input"),
           py::arg("axis"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Generates pointwise index value of the input tensor is generated along a given axis.
 
@@ -334,11 +334,11 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("relu",
           &PyGraph::relu,
           py::arg("input"),
-          py::arg_v("negative_slope", py::none()),
-          py::arg_v("lower_clip", py::none()),
-          py::arg_v("upper_clip", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("negative_slope")    = py::none(),
+          py::arg("lower_clip")        = py::none(),
+          py::arg("upper_clip")        = py::none(),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Apply the Rectified Linear Unit (ReLU) activation function to the input.
 
@@ -357,8 +357,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::leaky_relu,
           py::arg("input"),
           py::arg("negative_slope"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Apply the Leaky Rectified Linear Unit (Leaky ReLU) activation function to the input.
 
@@ -374,8 +374,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("tanh",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::TANH_FWD>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         tanh activation of the input tensors is computed
 
@@ -390,8 +390,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("elu",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::ELU_FWD>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Exponential Linear Unit (ELU) activation function to the input.
 
@@ -406,8 +406,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("gelu",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::GELU_FWD>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Gaussian Error Linear Unit (GELU) activation function to the input.
 
@@ -422,8 +422,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("sigmoid",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::SIGMOID_FWD>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the sigmoid activation function to the input.
 
@@ -438,9 +438,9 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("swish",
           &PyGraph::swish,
           py::arg("input"),
-          py::arg_v("swish_beta", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("swish_beta")        = py::none(),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Swish activation function to the input.
 
@@ -455,8 +455,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("softplus",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::SOFTPLUS_FWD>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Softplus activation function to the input.
 
@@ -471,8 +471,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("gelu_approx_tanh",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::GELU_APPROX_TANH_FWD>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Approximate GELU activation function to the input.
 
@@ -491,11 +491,11 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::relu_backward,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("negative_slope", py::none()),
-          py::arg_v("lower_clip", py::none()),
-          py::arg_v("upper_clip", py::none()),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("negative_slope")    = py::none(),
+          py::arg("lower_clip")        = py::none(),
+          py::arg("upper_clip")        = py::none(),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on Rectified Linear Unit (ReLU) activation function.
 
@@ -516,8 +516,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           py::arg("loss"),
           py::arg("input"),
           py::arg("negative_slope"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on Leaky Rectified Linear Unit (Leaky ReLU) activation function.
 
@@ -535,8 +535,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::TANH_BWD>,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on tanh activation function.
 
@@ -553,8 +553,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::SIGMOID_BWD>,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on sigmoid activation function.
 
@@ -571,8 +571,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::ELU_BWD>,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on elu activation function.
 
@@ -589,8 +589,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::GELU_BWD>,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on gelu activation function.
 
@@ -607,8 +607,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::SOFTPLUS_BWD>,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on softplus activation function.
 
@@ -625,9 +625,9 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::swish_backward,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("swish_beta", py::none()),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("swish_beta")        = py::none(),
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on swish activation function.
 
@@ -644,8 +644,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::GELU_APPROX_TANH_BWD>,
           py::arg("loss"),
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply backpropagation on approximate gelu activation function.
 
@@ -662,8 +662,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("erf",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::ERF>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute erf of input tensor.
 
@@ -678,8 +678,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("identity",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::IDENTITY>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Copy input tensor.
 
@@ -695,8 +695,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("exp",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::EXP>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute exponential of input tensor.
 
@@ -711,8 +711,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("log",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::LOG>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute natural logarithm of input tensor.
 
@@ -727,8 +727,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("neg",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::NEG>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute numerical negative of input tensor.
 
@@ -744,8 +744,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::MOD>,
           py::arg("input0"),
           py::arg("input1"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             In this mode, a pointwise floating-point remainder of the first tensor's division by the second tensor is computed.
 
@@ -762,8 +762,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::POW>,
           py::arg("input0"),
           py::arg("input1"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             In this mode, a pointwise value from the first tensor to the power of the second tensor is computed.
 
@@ -778,8 +778,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("abs",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::ABS>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Absolute value of input tensor.
 
@@ -794,8 +794,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("ceil",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::CEIL>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             A pointwise ceiling of the input tensor is computed.
 
@@ -810,8 +810,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("floor",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::FLOOR>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute floor of input tensor.
 
@@ -826,8 +826,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("rsqrt",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::RSQRT>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute reciprocal square root of input tensor.
 
@@ -842,8 +842,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("reciprocal",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::RECIPROCAL>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute reciprocal input tensor.
 
@@ -858,8 +858,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("sin",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::SIN>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute Sine of input tensor.
 
@@ -874,8 +874,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("cos",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::COS>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute Cosine of input tensor.
 
@@ -890,8 +890,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("tan",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::TAN>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Compute Tangent of input tensor.
 
@@ -906,8 +906,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
     m.def("logical_not",
           &PyGraph::pointwise_unary<cudnn_frontend::PointwiseMode_t::LOGICAL_NOT>,
           py::arg("input"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Compute logical_not of input tensor.
 
@@ -923,8 +923,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::LOGICAL_AND>,
           py::arg("a"),
           py::arg("b"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Computes logical and of two tensors.
 
@@ -941,8 +941,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::LOGICAL_OR>,
           py::arg("a"),
           py::arg("b"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Computes logical or of two tensors.
 
@@ -960,8 +960,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::SUB>,
           py::arg("a"),
           py::arg("b"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
         Computes subtraction of two tensors.
 
@@ -978,8 +978,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::DIV>,
           py::arg("a"),
           py::arg("b"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Computes Division of two tensors.
 
@@ -996,8 +996,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::ADD_SQUARE>,
           py::arg("a"),
           py::arg("b"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             a pointwise addition between the first tensor and the square of the second tensor is computed.
 
@@ -1015,8 +1015,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::CMP_EQ>,
           py::arg("input"),
           py::arg("comparison"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Compare Equal to Comparison to the input.
 
@@ -1033,8 +1033,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::CMP_NEQ>,
           py::arg("input"),
           py::arg("comparison"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Compare Not equal to Comparison to the input.
 
@@ -1051,8 +1051,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::CMP_GT>,
           py::arg("input"),
           py::arg("comparison"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Compare Greater Than Comparison to the input.
 
@@ -1069,8 +1069,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::CMP_GE>,
           py::arg("input"),
           py::arg("comparison"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Compare Greater Than or Equal Comparison to the input.
 
@@ -1087,8 +1087,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::CMP_LT>,
           py::arg("input"),
           py::arg("comparison"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Compare Lesser Than Comparison to the input.
 
@@ -1105,8 +1105,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           &PyGraph::pointwise_binary<cudnn_frontend::PointwiseMode_t::CMP_LE>,
           py::arg("input"),
           py::arg("comparison"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Apply the Compare Lesser Than or Equal Comparison to the input.
 
@@ -1124,8 +1124,8 @@ init_pygraph_pointwise_submodule(py::class_<PyGraph>& m) {
           py::arg("input0"),
           py::arg("input1"),
           py::arg("mask"),
-          py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),
-          py::arg_v("name", ""),
+          py::arg("compute_data_type") = cudnn_frontend::DataType_t::NOT_SET,
+          py::arg("name")              = "",
           R"pbdoc(
             Selects between input0 or input1 based on the mask
 
