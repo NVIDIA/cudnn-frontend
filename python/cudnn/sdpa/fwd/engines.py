@@ -289,10 +289,10 @@ class Capabilities:
     # epilogue read them — and fixed by the mb_stats_read barrier (same fix as
     # the f16 kernel's; see sm100/prefill_d128_fp8.py / _common_blackwell.Bars).
     single_wave_only: bool = False
-    # Serve ragged S_kv on unmasked graphs by synthesizing a full-length
-    # seq_len_kv and lowering through the kernel's padded path (masks the KV
-    # tail; mathematically identical for full lengths). Costs the padded-path
-    # overhead, so only rows that opt in use it; the KV-tail rule is waived.
+    # Serve ragged S_kv on unmasked graphs through the kernel's padded mask
+    # compiled against the scalar S_kv (TemplateParams.kv_tail_mask, no
+    # per-batch lengths buffer; #1425). Only rows that opt in use it; the
+    # KV-tail rule is waived.
     skv_tail_via_padding: bool = False
 
     # Dense layout envelope this engine accepts:
@@ -428,9 +428,9 @@ def _band_covers_kv_tail(facts: "ga.SdpaGraphFacts") -> bool:
 
 
 def _synth_kv_padding(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
-    """True when ``lower_dsl_prefill`` serves this graph's ragged S_kv through
-    the kernel's padded path with SYNTHESIZED per-batch KV lengths (pinned to
-    the full S_kv) — the one path split-KV cannot ride.
+    """True when this graph's ragged S_kv is served through the kernel's padded
+    mask compiled against the scalar S_kv (the adapter's kv_tail_mask, #1425)
+    — the one path split-KV cannot ride.
 
     Only a DENSE, mask-free graph whose S_kv is not a multiple of the KV tile
     takes it. A padded graph already carries real per-batch lengths; a paged
@@ -609,8 +609,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         return "prepared FP8 serves SM100, SM107 or SM120 scalar-scaled outputs"
     if capabilities.sm_lo == 120 and facts.has_paged_kv:
         return "prepared SM120 does not serve paged KV"
-    if _synth_kv_padding(capabilities, facts) or facts.has_bias:
-        return "prepared overrides cannot use synthesized KV lengths or bias"
+    if facts.has_bias:
+        return "prepared overrides cannot use bias"
     if facts.thd:
         if facts.has_epilogue_gate:
             return "prepared THD overrides cannot use an epilogue gate"
@@ -863,15 +863,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs without synthesized padding, the decode tile's ragged-Q leg, or native D128, nonpaged D192, or SM107 paged D256 packed split"
+                return "split_kv > 1 serves sink-free dense graphs without a KV-tail mask, the decode tile's ragged-Q leg, or native D128, nonpaged D192, or SM107 paged D256 packed split"
             if _synth_kv_padding(capabilities, facts):
-                # The lowering would serve this ragged S_kv through the padded
-                # kernel path (synthesized per-batch KV lengths) — the same
-                # path the split cannot ride. The SAME predicate as
-                # lower_dsl_prefill's so the plan is never listed; a paged
+                # The adapter would serve this ragged S_kv through the
+                # kernel's KV-tail mask (kv_tail_mask), which the split cannot
+                # ride. The SAME predicate as the adapter's so the plan is
+                # never listed; a paged
                 # graph never takes that path (its declared max only sizes
                 # the cost model), so it keeps its split.
-                return "split_kv > 1 cannot ride the synthesized KV-tail padding this S_kv needs"
+                return "split_kv > 1 cannot ride the KV-tail mask this S_kv needs"
             # No gate on the O dtype: the partials are never narrower than it,
             # and the combine performs the only cast down to it.
             # _selected_d_shape, not an envelope walk over the raw dims: the
@@ -1284,11 +1284,8 @@ def _sm100_spec() -> EngineSpec:
             thd_padded_stats=True,
             cu_seq_len=True,
             padded_stats=True,
-            # Ragged S_kv with an uncovered tail is served through the padded
-            # path with synthesized full-length per-batch KV lengths (see
-            # lower_dsl_prefill's synth_kv_padding) — mathematically identical,
-            # costs only the padded-path overhead. Same mechanism the FP8 row
-            # has always used.
+            # Ragged S_kv with an uncovered tail: the adapter compiles the
+            # padded mask against the scalar S_kv (kv_tail_mask, #1425).
             skv_tail_via_padding=True,
             # The f16/bf16 lowering serves any dense B/H/S stride permutation
             # (padded strides included) with the head dim innermost; the
@@ -1403,11 +1400,10 @@ def _sm107_spec() -> EngineSpec:
             # compile(has_lse=False) binds no dummy buffer at any level -- so a
             # stats-less graph reports get_workspace_size() == 0.
             lse_optional=True,
-            # Ragged S_kv with an uncovered tail rides the padded path with
-            # synthesized full-length per-batch KV lengths (lower_dsl_prefill's
-            # synth_kv_padding).  It is REQUIRED, not an optimization: at
-            # MASK_FLAGS == 0 the kernel's kv_right is a floor division, so an
-            # un-synthesized ragged S_kv would silently drop the tail tile.
+            # Ragged S_kv with an uncovered tail: the adapter compiles the
+            # padded mask against the scalar S_kv (kv_tail_mask, #1425).  It is
+            # REQUIRED, not an optimization: at MASK_FLAGS == 0 the kernel's
+            # kv_right is a floor division and would drop the tail tile.
             skv_tail_via_padding=True,
             # SM107_F16_THD_SHAPES is the single definition, shared with the
             # standalone adapter's gate so the two cannot drift (rule 8b').  It
@@ -2158,13 +2154,7 @@ def lower_dsl_prefill(
     ``api_type``; descriptor conversion, adapter lifecycle, variant-pack binding,
     and launch construction remain shared here.
     """
-    from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, _torch_stream_context, ws_align
-
-    # KV-tail via synthesized padding (see Capabilities.skv_tail_via_padding):
-    # a ragged S_kv with no mask covering the tail is served through the
-    # kernel's padded path with per-batch lengths pinned to the full S_kv.
-    # The predicate is shared with the split gates (mismatch / _split_points).
-    synth_kv_padding = _synth_kv_padding(spec.capabilities, facts)
+    from cudnn.sdpa.fwd.api_dsl import _torch_stream_context
 
     seq_q_t = facts.seq_q_t if facts.padded else None
     seq_kv_t = facts.seq_kv_t if facts.padded else None
@@ -2189,7 +2179,7 @@ def lower_dsl_prefill(
         window_size_left=facts.window_left,
         window_size_right=(facts.right_bound if facts.right_band_widening else None),
         scale_softmax=None if facts.attn_scale_prefolded else facts.scale,  # the fold: Q carries the scale
-        seq_kv_lens_present=facts.padded or synth_kv_padding,
+        seq_kv_lens_present=facts.padded,
         # Dense padded-Q trim (q rows >= seq_len_q[b] -> O := 0, LSE := -inf):
         # enabled whenever a dense padded graph carries per-batch Q lengths.
         # THD carries Q lengths via cu_seqlens; support is selected per native
@@ -2278,15 +2268,13 @@ def lower_dsl_prefill(
     # buffer is carved from the CALLER's workspace, so its size is fixed here at
     # build time and recorded on the executor as ``workspace_bytes`` — that
     # number is what the plan's CompiledPlan.get_workspace_size() reports.
-    #   - synthesized seq_len_kv (skv_tail_via_padding rows): b int32.
     #   - api-level scratch (api.scratch_workspace_bytes()): the dense padded
     #     [seq_kv|seq_q] combine and the THD metadata/LSE buffers.
     # No dummy-LSE chunk: every lower_dsl_prefill row is lse_optional (the
     # kernels None-specialize the LSE argument and compile the store out), so
     # a stats-less graph binds no LSE buffer at any level.
-    synth_kv_bytes = ws_align(facts.b * 4) if synth_kv_padding else 0
     api_scratch_bytes = api.scratch_workspace_bytes()
-    total_workspace_bytes = synth_kv_bytes + api_scratch_bytes
+    total_workspace_bytes = api_scratch_bytes
 
     # SM80-only feature operand (bias): the row's capability gate admitted it,
     # and the adapter's execute() declares the matching optional keyword —
@@ -2419,8 +2407,7 @@ def lower_dsl_prefill(
             k_buf, v_buf = _ir_view(k_buf, *lay_k), _ir_view(v_buf, *lay_v)
         # Scratch comes from the CALLER's workspace (never allocated here): the
         # adapter validates it against its scratch_workspace_bytes() and takes
-        # fixed offsets into it; only the synthesized seq_len_kv chunk (below,
-        # rare) is carved here, ahead of the adapter's share.
+        # fixed offsets into it.
         if total_workspace_bytes and workspace is None:
             raise ValueError(
                 f"cudnn.sdpa: {spec.name} requires a {total_workspace_bytes}-byte workspace but execute() received none; "
@@ -2428,14 +2415,6 @@ def lower_dsl_prefill(
             )
         api_workspace = workspace
         seq_kv_buf = _need(resolved, seq_kv_src, "padding mask (seq_len_kv / cu_seq_len_kv)") if seq_kv_src is not None else None
-        if synth_kv_padding and seq_kv_buf is None:
-            # Full-length per-batch KV lengths: mathematically a no-op mask that
-            # makes the kernel's padded path cover the ragged KV tail.
-            import torch
-
-            carver = WorkspaceCarver(workspace, total_workspace_bytes, spec.name)
-            seq_kv_buf = carver.take(facts.b, torch.int32).fill_(facts.s_kv)
-            api_workspace = carver.remaining()
         seq_q_buf = _need(resolved, seq_q_src, "per-batch query lengths (seq_len_q / cu_seq_len_q)") if seq_q_src is not None else None
         bias_buf = _need(resolved, bias_src, "bias") if bias_src is not None else None
         if stream is None:

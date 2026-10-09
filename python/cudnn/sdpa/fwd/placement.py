@@ -106,9 +106,10 @@ host-bound and loses eager 1.03-1.37 while winning GPU time; d512 with >= 32 que
 every cache (0.20-0.73 GPU), d512 with 8 heads loses GPU 1.04-1.11 at a 128 cache. Chunks: d192 at 128
 Q tiles loses 1.19-1.72 (16-64 tiles win 0.34-0.90); d128 at 64-512 tiles wins 0.21-0.68 while
 ``s_q <= 128``, and <= 128 tiles win 0.19-0.93 at any ``s_q``. A mask-free graph whose S_kv is off the
-KV tile runs the synthesized-padding path (no split-KV, ~68 us per eager submission): it leads only
-from ``Q tiles * s_kv >= 2**21`` (0.41-0.89 above, up to 5.6x eager / 1.36 GPU below; bound fitted on
-the 72-case random hold-out that found it).
+KV tile runs the KV-tail-mask path (no split-KV): it leads only from ``Q tiles * s_kv >= 2**21``
+(0.41-0.89 above, up to 5.6x eager / 1.36 GPU below; bound fitted on the 72-case random hold-out that
+found it, when the path also cost ~68 us per eager submission). #1425 removed that host cost (16-17 us,
+as tile-aligned graphs); the bound stays until split-KV rides the path and the hold-out is re-fit.
 
 SM107 half uses the shared paged/nonpaged native THD split selectors and the
 measured packed-GQA paged prefill contract. Selected native splits retain

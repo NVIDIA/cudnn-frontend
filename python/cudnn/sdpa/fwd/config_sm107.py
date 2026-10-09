@@ -461,7 +461,7 @@ def _mask_flags_from(params: TemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.thd_varlen or params.seq_kv_lens_present:
+    if params.thd_varlen or params.seq_kv_lens_present or params.kv_tail_mask:
         flags |= MASK_PADDED
     return flags
 

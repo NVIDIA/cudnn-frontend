@@ -1500,8 +1500,8 @@ def _split_points(
         # so this is hygiene: never PROPOSE a knob the row cannot honour).
         return [no_split]
     if _synth_kv_padding(caps, facts):
-        # This S_kv would be served through the synthesized KV-tail padding,
-        # which the split cannot ride (mismatch declines the same combination,
+        # This S_kv would be served through the kernel's KV-tail mask
+        # (kv_tail_mask), which the split cannot ride (mismatch declines the same combination,
         # through the same predicate the lowering uses). A paged graph never
         # takes that path — its per-batch lengths bound the walk on device —
         # so a declared max that is not a tile multiple keeps its split.
