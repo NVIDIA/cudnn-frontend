@@ -108,6 +108,7 @@ __all__ = [
     "SM107_F16_SMALL_D_SHAPES",
     "SM107_SMALL_D_CGAS",
     "SMALL_D_STAGES_KV",
+    "SMALL_D_TILE_MS",
     "sm107_f16_tile_width",
     "sm107_small_tile_leg",
     "D128FamilyTmemLayout",
@@ -417,7 +418,7 @@ def sm107_bias_pair_form(bias_batch_extent: int, b_flat: int, cta_mma: int) -> b
 
 
 def sm107_bias_resident_tiles(
-    tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: int = 128, pair: bool = False
+    tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: Optional[int] = None, pair: bool = False
 ) -> int:
     """How many ``tile_n``-column bias tiles (``BIAS_BLOCK_ROWS x tile_n`` elements each) the Rubin carveout holds beside
     the d128 family's Q / O slabs and K / V rings at ``tile_k = tile_o`` and the flavor's ring depth (``_stages_kv_d128``)
@@ -427,6 +428,8 @@ def sm107_bias_resident_tiles(
     64-wide one (cga1)."""
     b = bpe(dtype_qkv)
     stages = _stages_kv_d128(dtype_qkv, cta_mma, mxfp8=False, tile_k=tile_k)
+    # The Q tile height: the seam's (the TILE_M = 64 lever halves the Q / O slabs AND the block's rows) unless the caller pinned one.
+    tile_m = _tile_m_d128(tile_k) if tile_m is None else int(tile_m)
     operands = sdpa_smem_bytes(tile_m, tile_n, tile_k, tile_k, tiles_q, stages, cta_mma, b, b)
     spare = SMEM_USABLE_BYTES - _SMEM_FIXED_OVERHEAD - operands
     tile_bytes = sm107_bias_block_rows(tiles_q, tile_m, pair=pair) * tile_n * b
@@ -442,7 +445,7 @@ def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int 
 
 
 def sm107_bias_ring_stages(
-    tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: int = 128, pair: bool = False
+    tile_k: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: Optional[int] = None, pair: bool = False
 ) -> int:
     """The deepest STREAMED bias ring (``BIAS_MODE_STREAMED``) the Rubin carveout holds beside the operands at this width:
     ``min(max(BIAS_RING_STAGES), spare // tile_bytes)`` in whole ``BIAS_BLOCK_ROWS x tile_n`` tiles, **0 when fewer than
@@ -470,6 +473,49 @@ _STAGES_KV_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 # The K / V ring depths the small-tile body is validated at (SMEM fit at every width in SM107_SMALL_D_CGAS, the ring-wrap axis
 # n_kv = depth / depth + 1 / two wraps of the fresh-process census).  The validator pins cfg.STAGES_KV to this set on the small tiles.
 SMALL_D_STAGES_KV = frozenset({2, 3, 4})
+# ``_TILE_M_OVERRIDE_FOR_SWEEPS`` (same rules) pins the Q TILE HEIGHT of the 32- / 64-wide f16/bf16 tiles: 64 or 128 (:data:`SMALL_D_TILE_MS`);
+# None = 128, the height every rendering has had.  Read by the ONE helper (``_tile_m_d128``) the config factory, the bias budgets
+# (``sm107_bias_resident_tiles`` / ``sm107_bias_ring_stages``: the Q / O slabs and the bias block's rows both halve) and the kernel's
+# TMEM / grid derivations share (rule 8b').  A 64-row tile doubles the work items of a given q extent (the parallelism lever at small S)
+# and halves the MMA / softmax work per kv step; the kernel body renders it as a lane-mapping arm (``TILE_M64_LANE_FORM`` in
+# ``sm107/prefill_d128_f16.py``).  An A/B arm, never a plan path: the engine row's ``tile_ms`` stays {128} until the arm has a measured win.
+_TILE_M_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+# The Q tile heights the small-tile body is validated at.  The validator pins cfg.TILE_M to this set on the small tiles; every other
+# flavor keeps 128 (the d128 / d192 renderings and their committed records, the quantized siblings' SF geometry).
+SMALL_D_TILE_MS = frozenset({64, 128})
+
+
+def sweep_seam_state() -> Optional[tuple]:
+    """The private sweep seams' values as ONE hashable, ``None`` when every seam is unset (every plan path).  ``api_dsl`` folds it into
+    the template-module cache key and the source digest (``template_loader.load_template(extra_key=)``): the module cache keys on the
+    TemplateParams record, and a seam moves ``Cfg`` fields (the ring depth, the Q tile height) WITHOUT touching the record -- so two
+    renderings that differ only by a seam would otherwise share one module in a process (the second request silently running the
+    first rendering) and one compiled-plan artifact on disk."""
+    state = (
+        _N_CHUNK_OVERRIDE_FOR_SWEEPS,
+        _BIAS_MODE_OVERRIDE_FOR_SWEEPS,
+        _BIAS_STAGES_OVERRIDE_FOR_SWEEPS,
+        _STAGES_KV_OVERRIDE_FOR_SWEEPS,
+        _TILE_M_OVERRIDE_FOR_SWEEPS,
+    )
+    return None if all(v is None for v in state) else ("sm107_sweep_seams",) + tuple(None if v is None else int(v) for v in state)
+
+
+def _tile_m_d128(tile_k: int) -> int:
+    """The Q tile height of a d128-family rendering: 128 everywhere but the 32- / 64-wide f16/bf16 tiles, where the private seam
+    ``_TILE_M_OVERRIDE_FOR_SWEEPS`` may pin 64 (the TILE_M = 64 lever).  Read by the factory AND the bias budgets so the Q / O slabs,
+    the bias block rows and the resident / ring budgets move together (one arithmetic, rule 8b')."""
+    if tile_k > 64:
+        return 128
+    if _TILE_M_OVERRIDE_FOR_SWEEPS is not None:
+        want = int(_TILE_M_OVERRIDE_FOR_SWEEPS)
+        if want not in SMALL_D_TILE_MS:
+            raise ValueError(
+                f"_TILE_M_OVERRIDE_FOR_SWEEPS={want}: the 32- / 64-wide tiles' Q tile height is validated at {sorted(SMALL_D_TILE_MS)} rows "
+                f"(the warp-lane -> row mapping of the softmax / correction groups and the M = 64 tcgen05.mma datapath layout exist for these two only)"
+            )
+        return want
+    return 128
 
 
 # The ONE-BATCH-ENTRY item at the 32-wide tile's cga1 STREAMS its bias wherever its ring fits, resident budget or not: the 256-row
@@ -1210,14 +1256,22 @@ class D128FamilyTmemLayout:
     STATS_COLS_PER_SUBTILE: int = 8
 
 
-def d128_family_tmem_layout(cfg) -> D128FamilyTmemLayout:
+def d128_family_tmem_layout(cfg, *, stats_cols_per_subtile: int = 8) -> D128FamilyTmemLayout:
     """Derive the d128-family TMEM map from the Cfg: ``S[qs] = qs * TILE_N`` (the fp32 S accumulator, TILE_N columns per
     sub-tile); ``P[qs]`` in the TAIL of its own S slot -- the packed BMM2 A operand is ``TILE_N * BPE / 4`` columns wide
     (bf16 / f16 pack two probabilities per fp32 cell: 64 columns at TILE_N = 128, so P sits at +64; a 4-byte dtype would
     alias the full slot) and BMM1 has finished with S before P is written; ``O[qs] = TILES_Q * TILE_N + qs * TILE_O`` (the
     fp32 O accumulator, TILE_O columns per sub-tile: 128 / 64 / 32); STATS at the top of the allocation.  Every term is a
     Cfg field, never a literal copied from the d128 map (a literal O1 offset of 384 at TILE_O = 32 would leave 352 unused
-    columns and no error; a literal P offset of 64 at a TILE_N of 64 would overlap the live S columns)."""
+    columns and no error; a literal P offset of 64 at a TILE_N of 64 would overlap the live S columns).
+
+    ``stats_cols_per_subtile``: 8 on every rendering today (alpha; the final (max, sum); the score side outputs' true max in
+    columns 2-3).  The 64-row tile's quad-fragment form (``TILE_M64_LANE_FORM = 1``) publishes each value 8 wide through the
+    ``16x256b .x1`` store and takes 24; the region at the top grows by the extra columns per sub-tile, so the default keeps
+    STATS_OFF at 544 and every committed record byte-identical."""
+    if stats_cols_per_subtile < 8 or stats_cols_per_subtile % 8:
+        raise ValueError(f"d128_family_tmem_layout: stats_cols_per_subtile must be a multiple of 8, at least 8 (got {stats_cols_per_subtile})")
+    stats_region = _D128_FAMILY_STATS_REGION_COLS + cfg.TILES_Q * (stats_cols_per_subtile - 8)
     s_off = tuple(qs * cfg.TILE_N for qs in range(cfg.TILES_Q))
     p_width = (cfg.TILE_N * cfg.BPE) // 4
     p_off = tuple(s + cfg.TILE_N - p_width for s in s_off)
@@ -1228,7 +1282,8 @@ def d128_family_tmem_layout(cfg) -> D128FamilyTmemLayout:
         S_OFF=s_off,
         P_OFF=p_off,
         O_OFF=o_off,
-        STATS_OFF=TMEM_TOTAL_COLS - _D128_FAMILY_STATS_REGION_COLS,
+        STATS_OFF=TMEM_TOTAL_COLS - stats_region,
+        STATS_COLS_PER_SUBTILE=stats_cols_per_subtile,
     )
 
 
@@ -1260,6 +1315,25 @@ def _validate_head_dim_tile(cfg, flavor: str) -> None:
             (
                 cfg.TILE_K == cfg.TILE_O or (cfg.TILE_K, cfg.TILE_O) == (192, 128),
                 f"{flavor}: the d128 family serves TILE_K == TILE_O (32/64/128) or the d192xd128 pair (got {cfg.TILE_K}/{cfg.TILE_O})",
+            ),
+            (
+                cfg.TILE_M in SMALL_D_TILE_MS,
+                f"{flavor}: TILE_M must be one of {sorted(SMALL_D_TILE_MS)} (got {cfg.TILE_M}): the softmax / correction lane mapping and the "
+                f"tcgen05.mma datapath layout (M = 128: one lane per row; M = 64: 16 live rows per 32-lane TMEM sub-partition) exist for these two only",
+            ),
+            (
+                cfg.TILE_M == 128 or (cfg.TILE_K <= 64 and cfg.DTYPE_QKV in (_DTYPE_BF16, _DTYPE_FP16)),
+                f"{flavor}: the 64-row Q tile is wired on the f16/bf16 32- / 64-wide tiles only (TILE_K={cfg.TILE_K}, DTYPE_QKV={cfg.DTYPE_QKV}); the "
+                f"d128 / d192 renderings keep their committed records and the quantized siblings' k_dim / SF geometry is tied to the 128-row tile",
+            ),
+            (
+                cfg.TILE_M == 128 or cfg.CTA_MMA == 1,
+                f"{flavor}: the 64-row Q tile runs cga1 only (CTA_MMA={cfg.CTA_MMA}): a cta_group::2 MMA with a 64-row per-CTA tile has a different "
+                f"TMEM datapath layout than the one the warp-lane -> row mapping was derived for",
+            ),
+            (
+                cfg.TILE_M == 128 or not (cfg.THD_VARLEN or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.EPILOGUE_GATE),
+                f"{flavor}: the 64-row Q tile serves dense, unsplit, non-PackGQA, ungated graphs only (the small-tile rows' own gates)",
             ),
             (
                 cfg.TILE_K > 64 or cfg.STAGES_KV in SMALL_D_STAGES_KV,
@@ -1717,10 +1791,13 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     bias_stages_req = int(getattr(params, "bias_stages", 0))
     if bias_stages_req and bias_mode != BIAS_MODE_STREAMED:
         raise ValueError(f"{flavor}: bias_stages={bias_stages_req} is the STREAMED ring's depth; it needs bias_mode=2 (got {bias_mode})")
+    # The Q tile height (TILE_M): 128 on every flavor but the f16/bf16 small tiles, where the private seam may pin 64 (the TILE_M = 64
+    # lever; ``_tile_m_d128`` is the ONE helper the budgets below read too, so the Q / O slabs, the block rows and the budgets agree).
+    tile_m = _tile_m_d128(tile_k) if (tile_k <= 64 and params.dtype_qkv > _DTYPE_E5M2 and not mxfp8) else 128
     bias_tiles = 0
     stages_bias = 0
     if bias_mode == BIAS_MODE_RESIDENT:
-        bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair)
+        bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, tile_m=tile_m, pair=pair)
         if bias_tiles == 0:
             raise ValueError(
                 f"{flavor}: no resident bias block fits beside the Q / O slabs and the {stages_kv}-deep K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} "
@@ -1730,7 +1807,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         stages_bias = sm107_bias_stages_pick(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair, request=bias_stages_req)
         if stages_bias == 0:
             raise ValueError(
-                f"{flavor}: no {sorted(BIAS_RING_STAGES)}-stage streamed bias ring of {sm107_bias_block_rows(2, 128, pair=pair)} x {tile_n} tiles "
+                f"{flavor}: no {sorted(BIAS_RING_STAGES)}-stage streamed bias ring of {sm107_bias_block_rows(2, tile_m, pair=pair)} x {tile_n} tiles "
                 f"{'(requested bias_stages=' + str(bias_stages_req) + ') ' if bias_stages_req else ''}fits beside the Q / O slabs and the {stages_kv}-deep "
                 f"K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} ({SMEM_USABLE_BYTES // 1024} KiB usable)"
             )
@@ -1748,7 +1825,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
             )
 
     cfg = cls(
-        TILE_M=128,
+        TILE_M=tile_m,
         TILE_N=tile_n,
         TILE_K=tile_k,
         TILE_O=tile_o,
@@ -1804,7 +1881,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         READ_TILE_ARRIVERS=_D128_READ_TILE_ARRIVERS,
         BIAS_MODE=bias_mode,
         BIAS_RESIDENT_TILES=bias_tiles,
-        BIAS_BLOCK_ROWS=sm107_bias_block_rows(2, 128, pair=pair) if bias_mode else 0,
+        BIAS_BLOCK_ROWS=sm107_bias_block_rows(2, tile_m, pair=pair) if bias_mode else 0,
         BIAS_SWZ_BYTES=BIAS_SWZ_BYTES,
         BIAS_BOXES_PER_TILE=(tile_n * b) // BIAS_SWZ_BYTES if bias_mode else 0,
         BIAS_EMPTY_ARRIVERS=2 * 4 if (bias_mode or kv_mask_form) else 0,

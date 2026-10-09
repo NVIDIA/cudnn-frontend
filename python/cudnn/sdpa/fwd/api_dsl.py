@@ -558,7 +558,11 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
     """Load one uniquely named kernel module per template parameter set."""
 
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
-    return load_template(path, params, tag=tag)
+    # The sm107 config module's private sweep seams specialize a body WITHOUT touching the record: fold their state into the module
+    # cache key and the source digest (None on every plan path = the key every caller has had).
+    from cudnn.sdpa.fwd.config_sm107 import sweep_seam_state
+
+    return load_template(path, params, tag=tag, extra_key=sweep_seam_state())
 
 
 def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):

@@ -512,6 +512,43 @@ if _PAIR_ARM and not (_BIAS_ARM and CFG.CTA_MMA == 1 and CFG.TILES_Q == 2 and no
         "prefill_d128_f16_sm107: the (n, n+1) pair item (CFG.N_CHUNK > 0) is the resident-bias arm at cga1, two sub-tiles, a top-left band, dense, unsplit"
     )
 MAY_BE_EMPTY = _split_h.MAY_BE_EMPTY
+# === TILE_M = 64 (CFG.TILE_M; config_sm107._TILE_M_OVERRIDE_FOR_SWEEPS on the 32- / 64-wide f16/bf16 tiles) ===
+#
+# A 64-row Q tile per sub-tile: the Q / O slabs and the bias block halve, the work items of a q extent double (the parallelism
+# lever at small S), BMM1 / BMM2 run `m_dim = 64` (CFG.TILE_M x CFG.CTA_MMA -- already so spelled on the descriptors).  The
+# hardware fact the body follows (DSL: "tcgen05.mma only fills rows for the m_dim it was given; rows beyond m_dim * 4 per chunk
+# contain stale data"): an M = 64 accumulator lands in TMEM lanes 0-15 of each 32-lane sub-partition (row r -> lane (r % 16) +
+# 32 (r // 16)), lanes 16-31 are NEVER written, and every slot keeps its COLUMN count (NonInterleaved: A of BMM2 is P in TMEM).
+# TILE_M64_LANE_FORM picks how the 128 lanes of a softmax / correction warp group cover the 64 rows:
+#   0 = the half-idle REFERENCE form (built): warp w owns rows 16 w .. 16 w + 15 of the sub-tile = its TMEM sub-partition's lanes
+#       0-15; lane l < 16 is LIVE (row 16 w + l), lanes 16-31 are DEAD -- they run the same instruction stream on TMEM residue,
+#       fire every barrier arrive the live lanes fire (every init count below is in LANES, none in rows: the table is unchanged),
+#       and every GMEM / SMEM store of theirs is masked (the LSE / score stores and the sO store by `lane_live`); their P / alpha
+#       / stats stores land in TMEM lanes the M = 64 MMA and the live lanes never read.  Trivially right, one cell; rejected for
+#       production -- a MUFU.EX2 occupies the pipe for its issue cycles whatever the active mask, so the exp throughput per CTA
+#       halves -- and KEPT as the bring-up / correctness reference and the A/B lower bound of the lever.
+#   1 = the quad-fragment form (NOT built: a ValueError names the resume point): `16x256b` loads / `16x128b` stores, 4 threads
+#       per row, 2 rows per thread, two shfl.bfly steps per row reduction, the stats slot 8 -> 24 columns per sub-tile
+#       (config_sm107.d128_family_tmem_layout(stats_cols_per_subtile=24)).
+# BARRIER TABLE: NONE of the init counts change (every count is in lanes of a role or in warps); a dead lane executes every arrive.
+# SMEM: sQ / sO = TILES_Q x 64 x TILE_K/O (8 / 16 KiB at D 32 / 64), the bias block BIAS_BLOCK_ROWS = 64 (pair) / 128
+# (one-batch-entry) rows -- all from CFG; the swizzles follow TILE_K / TILE_O, not TILE_M; the operand region ends at 80 / 160 KiB
+# (DESC_VERSION 0 holds).  TMEM: S / P / O slots unchanged; STATS 8 per sub-tile at form 0 (STATS_OFF 544, the map every rendering
+# has).  P14: no new skip path (dead lanes follow the live lanes' control flow).  P15: cga1 only (config_sm107 declines cga2).
+# At TILE_M 128 every seam below is a Python ternary / const_expr on `_M64` -- the TILE_M 128 renderings trace byte-identically
+# (the committed md5 records pin it).
+TILE_M64_LANE_FORM: int = 0
+_M64 = CFG.TILE_M == 64
+if CFG.TILE_M not in (64, 128):
+    raise ValueError(f"prefill_d128_f16_sm107: TILE_M must be 64 or 128 (got {CFG.TILE_M})")
+if _M64 and TILE_M64_LANE_FORM != 0:
+    raise ValueError(
+        "prefill_d128_f16_sm107: TILE_M64_LANE_FORM 1 (the quad-fragment lane mapping: 16x256b loads, 16x128b stores, 4 threads per row) is not "
+        "built yet -- form 0 (the half-idle 32x32b reference mapping) is the only TILE_M = 64 form this body renders"
+    )
+if _M64 and (CFG.CTA_MMA != 1 or CFG.TILES_Q != 2 or IS_TF32 or CFG.THD_VARLEN or SPLIT_KV > 1 or CFG.PACK_GQA or CFG.EPILOGUE_GATE):
+    # config_sm107._validate_head_dim_tile pins the same couplings at config-build time; this is the kernel's own backstop.
+    raise ValueError("prefill_d128_f16_sm107: the 64-row Q tile is the cga1, two-sub-tile, 16-bit, dense, unsplit, non-PackGQA, ungated arm")
 _decode_initial_split = _split_h.decode_initial_split
 _decode_payload_split = _split_h.decode_payload_split
 _bounds_for_tile_split = _split_h.bounds_for_tile_split
@@ -552,6 +589,20 @@ class KernelTmemLayout:
 
 
 LAYOUT = KernelTmemLayout()
+
+
+# === TILE_M = 64 form 0: the warp-lane -> (row, live) map of a softmax / correction warp group (shared by both roles so they cannot drift) ===
+
+
+@cute.jit
+def _m64_lane_row(tid_in_wg):
+    """The row of the 64-row sub-tile a warp lane owns and whether it is LIVE (TILE_M64_LANE_FORM 0): warp ``w = tid_in_wg // 32``
+    reads TMEM sub-partition ``w`` = rows ``16 w .. 16 w + 15``; lane ``l < 16`` is row ``16 w + l``; a dead lane (``l >= 16``) aliases live
+    row ``16 w + l - 16`` so every mask / bias / LSE index it computes stays inside the tile, and its stores are masked by ``live``."""
+    lane = tid_in_wg & cutlass.Int32(31)
+    row = (tid_in_wg // cutlass.Int32(32)) * cutlass.Int32(16) + (lane & cutlass.Int32(15))
+    live = lane < cutlass.Int32(16)
+    return row, live
 
 
 # === The pair item's row / bounds arithmetic (CFG.N_CHUNK > 0); shared by every warp role so no two roles can drift ===
@@ -2824,6 +2875,9 @@ def _softmax_warp_group(
 
     softmax_wg_base_const = CFG.SOFTMAX_WG0_BASE if sub_tile_id == 0 else CFG.SOFTMAX_WG1_BASE
     tid_in_wg = cute.arch.thread_idx()[0] - cutlass.Int32(softmax_wg_base_const * 32)
+    # Each warp lane's ROW inside the sub-tile: its lane index at TILE_M 128 (one lane per row), the 16-live-rows-per-warp map at TILE_M 64
+    # (a Python ternary on the module constant: the 128 rendering is byte-identical).
+    row_in_tile = _m64_lane_row(tid_in_wg)[0] if _M64 else tid_in_wg
 
     if cutlass.const_expr(_PAIR_ARM):
         # The (n, n+1) pair item (CFG.N_CHUNK > 0): the same persistent loop over scheduler items, each item a chunk of
@@ -2885,7 +2939,7 @@ def _softmax_warp_group(
                 cutlass.Float32,
             )
             q_row_coord = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M)
-            q_abs = q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M) + tid_in_wg
+            q_abs = q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M) + row_in_tile
             # Bootstrap stat_empty wait BEFORE kv loop — lifts wait off per-iter
             # critical path so alpha publish + stat_full fire happen back-to-back.
             bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
@@ -2911,7 +2965,7 @@ def _softmax_warp_group(
                         tmem_ptr_i32,
                         bars,
                         q_abs,
-                        cutlass.Int32(sub_tile_id * CFG.TILE_M) + tid_in_wg,
+                        cutlass.Int32(sub_tile_id * CFG.TILE_M) + row_in_tile,
                         batch_idx,
                         eff_seqlen_kv,
                         eff_seqlen_q,
@@ -3088,7 +3142,9 @@ def _softmax_item_pair(
     n0, n_end, n_steps = _pair_item_rows(chunk_idx, n_rows_total)
     item_b = _pair_item_bounds(q_tile_idx, seqlen_q, seqlen_kv)
     item_live = item_b.right > item_b.left
-    q_abs = q_tile_idx * cutlass.Int32(CFG.TILE_M) + tid_in_wg
+    # Each warp lane's row of the q tile (the mask row AND the bias block row: both sub-tiles read row `row_in_tile` of the TILE_M-row block).
+    row_in_tile = _m64_lane_row(tid_in_wg)[0] if _M64 else tid_in_wg
+    q_abs = q_tile_idx * cutlass.Int32(CFG.TILE_M) + row_in_tile
     if cutlass.const_expr(_BIAS_RESIDENT):
         if item_live:
             bars.mb_bias_full.wait(bias_full_phase)
@@ -3117,7 +3173,7 @@ def _softmax_item_pair(
                 tmem_ptr_i32,
                 bars,
                 q_abs,
-                tid_in_wg,
+                row_in_tile,
                 nb,
                 eff_seqlen_kv,
                 seqlen_q,
@@ -3189,6 +3245,9 @@ def _correction_warp_group(
     # Read tidx directly from PTX sreg — cute.arch.thread_idx() in @cute.jit may yield warp-uniform via folding.
     tid_raw = cute.arch.thread_idx()[0]
     tid_in_wg = tid_raw - cutlass.Int32(CFG.CORR_WARP_BASE * 32)
+    # TILE_M 64 form 0: each warp lane's O row and whether it is live (the sO / LSE / score stores are masked by `lane_live`; the alpha
+    # ballot ORs it in so a dead lane's residue never vetoes the rescale skip).  At TILE_M 128 the row is its lane index (byte-identical).
+    row_in_tile, lane_live = _m64_lane_row(tid_in_wg) if _M64 else (tid_in_wg, None)
 
     # O_CHUNK=16 (halved from 32) shortens the alpha-rescale live range —
     # at 32, the DSL's register allocator spilled correction-warp regs to the stack.
@@ -3298,7 +3357,7 @@ def _correction_warp_group(
                     alpha = stats_vec[0]
 
                     # all_alpha_one ballot: when every lane has alpha==1.0 the entire rescale loop skips.
-                    alpha_is_one = alpha == cutlass.Float32(1.0)
+                    alpha_is_one = ((alpha == cutlass.Float32(1.0)) | (~lane_live)) if _M64 else (alpha == cutlass.Float32(1.0))
                     all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
 
                     bars.mb_stat_empty[qs].arrive()
@@ -3411,7 +3470,9 @@ def _correction_warp_group(
                 # residue * 0 -> NaN.  Zero O with a SELECT, never a multiply.
                 # OOB-row guard: under cga2 the cluster's Q rows can exceed seqlen_q;
                 # without the guard the write aliases the next head's LSE slot.
-                q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + tid_in_wg
+                q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + cutlass.Int32(qs * CFG.TILE_M) + row_in_tile
+                # The dense-row store predicate: the OOB-row guard, AND each warp lane's liveness at TILE_M 64 (a dead lane aliases a live row).
+                _row_store = ((q_row_global < seqlen_q) & lane_live) if _M64 else (q_row_global < seqlen_q)
                 _kv_empty = bounds.right <= bounds.left
                 # A row with no live key inside a live tile -- bottom-right rows above the diagonal, a left band
                 # past the last key, a zero KV length -- read off the mask geometry: these kernels mask with a
@@ -3493,18 +3554,18 @@ def _correction_warp_group(
                                     lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
                 else:
                     if cutlass.const_expr(lse_tensor is not None):
-                        if q_row_global < seqlen_q:
+                        if _row_store:
                             lse_arr = cutlass.make_array_view(lse_tensor)
                             lse_arr[_partial_batch(batch_idx, split_idx, n_batch), head_idx, q_row_global] = lse_val
                 # Score side outputs: the DENSE, unsplit row (compile() rejects the THD and split builds), the
                 # same OOB-row guard as the dense LSE store, natural units whatever STATS_LOG2 says (the base-2
                 # convention is the Stats tensor's alone).  Each store folds out independently on None.
                 if cutlass.const_expr(score_max_tensor is not None):
-                    if q_row_global < seqlen_q:
+                    if _row_store:
                         _smax_arr = cutlass.make_array_view(score_max_tensor)
                         _smax_arr[batch_idx, head_idx, q_row_global] = score_max_val
                 if cutlass.const_expr(score_sum_exp_tensor is not None):
-                    if q_row_global < seqlen_q:
+                    if _row_store:
                         _ssum_arr = cutlass.make_array_view(score_sum_exp_tensor)
                         _ssum_arr[batch_idx, head_idx, q_row_global] = score_sum_val
 
@@ -3548,7 +3609,7 @@ def _correction_warp_group(
                         col_offset_const = (chunk_idx * O_CHUNK) % D_BLOCK_SIZE
                         block_idx_const = (chunk_idx * O_CHUNK) // D_BLOCK_SIZE
                         block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
-                        smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
+                        smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + row_in_tile * cutlass.Int32(D_BLOCK_SIZE)
 
                         smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
                         # mb_o_empty[qs] wait gates the FIRST SMEM store (not the
@@ -3556,7 +3617,12 @@ def _correction_warp_group(
                         # with TMA-STG draining the prior persistent tile.
                         if chunk_idx == 0:
                             bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
-                        smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                        if cutlass.const_expr(_M64):
+                            # A dead lane aliases a live lane's row: its store is masked (a warp-divergent branch, accepted on the reference form).
+                            if lane_live:
+                                smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                        else:
+                            smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
 
                     # fence_proxy needed before TMA reads SMEM written by tcgen05_st (via store_swizzled).
                     nvvm.fence_proxy("async.shared", space="cta")
@@ -3629,7 +3695,10 @@ def _corr_item_pair(
     TMA_O_GRANU_ELEMS = CFG.TILE_M * D_BLOCK_SIZE
     LN2 = cutlass.Float32(0.6931471805599453)
     n0, n_end, n_steps = _pair_item_rows(chunk_idx, n_rows_total)
-    q_row_global = q_tile_idx * cutlass.Int32(CFG.TILE_M) + tid_in_wg
+    # TILE_M 64 form 0: each warp lane's O row of the q tile and its liveness (stores masked, the alpha ballot ORs it in); its lane index at 128.
+    row_in_tile, lane_live = _m64_lane_row(tid_in_wg) if _M64 else (tid_in_wg, None)
+    q_row_global = q_tile_idx * cutlass.Int32(CFG.TILE_M) + row_in_tile
+    _row_store = ((q_row_global < seqlen_q) & lane_live) if _M64 else (q_row_global < seqlen_q)
     for j in cutlass.range(cutlass.Int32(0), n_steps, 1, unroll=1):
         nb0, nb1, live1 = _pair_step_rows(n0, n_end, j)
         bounds = _pair_step_bounds(q_tile_idx, seqlen_q, seqlen_kv, seq_kv_lens_tensor, seq_q_lens_addr, nb0, nb1)
@@ -3662,7 +3731,7 @@ def _corr_item_pair(
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 alpha = stats_vec[0]
 
-                alpha_is_one = alpha == cutlass.Float32(1.0)
+                alpha_is_one = ((alpha == cutlass.Float32(1.0)) | (~lane_live)) if _M64 else (alpha == cutlass.Float32(1.0))
                 all_alpha_one = vote_sync(0xFFFFFFFF, alpha_is_one, VoteSync.ALL)
 
                 bars.mb_stat_empty[qs].arrive()
@@ -3754,11 +3823,11 @@ def _corr_item_pair(
             if cutlass.const_expr(lse_tensor is not None):
                 # The LSE row of THIS batch entry; a dead sub-tile 1 (an odd chunk tail recomputing row nb0) stores nothing.
                 if cutlass.const_expr(qs == 0):
-                    if q_row_global < seqlen_q:
+                    if _row_store:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_arr[nb, head_idx, q_row_global] = lse_val
                 else:
-                    if live1 & (q_row_global < seqlen_q):
+                    if live1 & _row_store:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_arr[nb, head_idx, q_row_global] = lse_val
 
@@ -3781,12 +3850,17 @@ def _corr_item_pair(
                 col_offset_const = (chunk_idx_o * O_CHUNK) % D_BLOCK_SIZE
                 block_idx_const = (chunk_idx_o * O_CHUNK) // D_BLOCK_SIZE
                 block_offset_const = block_idx_const * TMA_O_GRANU_ELEMS
-                smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(D_BLOCK_SIZE)
+                smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + row_in_tile * cutlass.Int32(D_BLOCK_SIZE)
 
                 smem_ptr = sO_sub_base.subview(smem_offset).data_ptr()
                 if chunk_idx_o == 0:
                     bars.mb_o_empty[qs].wait(o_empty_phase, spin=SPIN_RING_WAITS)
-                smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                if cutlass.const_expr(_M64):
+                    # A dead lane aliases a live lane's row: its store is masked (a warp-divergent branch, accepted on the reference form).
+                    if lane_live:
+                        smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
+                else:
+                    smem_ptr.store_swizzled(o_fp16, alignment=64, swizzle=_O_SMEM_SWIZZLE)
 
             # fence_proxy before the TMA store reads SMEM written by the generic proxy.
             nvvm.fence_proxy("async.shared", space="cta")
