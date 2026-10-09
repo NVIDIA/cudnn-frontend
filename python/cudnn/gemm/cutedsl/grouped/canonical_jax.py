@@ -119,13 +119,13 @@ def check_jax_inputs(inputs):
 
 
 @lru_cache(maxsize=128)
-def grouped_call(adapter, kernel, mac, input_types, output_types, *, backward, **scalars):
+def grouped_call(adapter, kernel, mac, input_types, output_types, *, zero_dprob, **scalars):
     return call(
         adapter,
         output_shape_dtype=output_types,
         input_spec=tuple(row_spec(t) for t in input_types),
         output_spec=tuple(row_spec(t) for t in output_types),
-        initialized_outputs={2: zeros_init} if backward else None,
+        initialized_outputs={2: zeros_init} if zero_dprob else None,
         kernel=kernel,
         mac=mac,
         **scalars,

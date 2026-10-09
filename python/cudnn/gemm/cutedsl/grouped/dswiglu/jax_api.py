@@ -96,7 +96,7 @@ def grouped_gemm_dswiglu(
         mac,
         tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
         tuple(outputs.values()),
-        backward=True,
+        zero_dprob=True,
     )(*inputs.values())
     return TupleDict(
         d_row_tensor=result[0],
