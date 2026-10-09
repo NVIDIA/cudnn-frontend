@@ -1102,8 +1102,9 @@ def test_padded_tail_form_1_cells_match_the_fp64_oracle_and_the_legacy_tail(case
 # wait, alpha = 1 + stat_full, the bmm2_ready arrives, the ping-pong, the stat_empty wait) and none of the exp2 / max / sum work, so the
 # live sibling warp group runs the ping-pong alone.  The pins: the eligibility (one arithmetic for the config pick, the factory and the
 # adapter: no bias, no pair item, the small tiles only), the typed declines, the rendering (the live body's exp count -- the quiet loop
-# has no exp -- no new spills, a different cubin), and the GPU cells: bitwise the full-body form on every stored row (the live rows'
-# arithmetic is untouched) and against the fp64 oracle.
+# has no exp -- a different cubin, and +2 STL / LDL on the d32 renderings, 3 / 3 -> 5 / 5, inside the pre-existing SPILL_TOLERANCE of
+# ``assert_no_new_spills``: not spill-free, the pin was not widened), and the GPU cells: bitwise the full-body form on every stored row
+# (the live rows' arithmetic is untouched) and against the fp64 oracle.
 
 
 def test_dead_subtile_quiet_pick_is_one_arithmetic_with_the_factory():

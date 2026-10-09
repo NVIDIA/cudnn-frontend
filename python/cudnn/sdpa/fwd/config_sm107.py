@@ -484,7 +484,10 @@ def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
     one-batch-entry item's streamed ring at 128 is the measured best (+6 / +9 % with 256 / 1024 rows), so 128 stays there; (c) a kv_mask
     alone at one 128-wide kv tile (+7..+18 %; a wash or a loss above it); (d) a plain graph whose S_kv ends in the FIRST half of a 128-wide
     tile (``s_kv % 128`` in 1..64, both D): the half tile skips 64 dead columns the 128-wide tile would mask -- d32 S 300 B 1 / 4 +4.2 /
-    +6.2 % over the 128-wide pre-masked tail, d64 S 300 a tie (0.2 %); where the tail holds MORE than 64 columns the 128-wide tile WITH
+    +6.2 % over the 128-wide pre-masked tail; d64 S 300 the half tile's LEGACY tail (the 64-wide default) is 0.8..1.1 % BEHIND the
+    128-wide pre-masked tail -- 48.14 vs 47.63 / 47.74 us, two pairs of one process -- inside the per-S rule, which follows ``s_kv % 128``
+    alone (the half tile WITH the pre-masked tail would tie it at 47.54 us, but at TILE_N 64 that form is within noise with a per-cell
+    sign, d32 -2.2..+1.3 % and d64 -0.7..+3.9 %, and is not the default); where the tail holds MORE than 64 columns the 128-wide tile WITH
     the pre-masked tail (``padded_tail_form`` 1, the 128-wide default) wins: d32 S 200 / 217 / 450 / 600 +1.8 / +3.9 / +11.5 / +13.7 %,
     d32 B 4 S 217 +5.4 %, d64 S 200 / 600 +7.1 / +20 % over the half tile (212-SM cc 10.7 perf node, 2376 MHz lock, same process) --
     before the pre-masked tail the 128-wide padded body was the instruction-cache pathology and the half tile served every d32 S and
