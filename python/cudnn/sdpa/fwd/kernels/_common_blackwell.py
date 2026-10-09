@@ -130,7 +130,11 @@ class Bars(NamedTuple):
     #                          tile's first bias read (256 lanes wait; waits do not count).
     #   mb_bias_ring_empty[s]  THREAD, init BIAS_EMPTY_ARRIVERS = the softmax warps (8): one elected arrive per softmax warp per
     #                          kv tile after the stage's last bias word is consumed; the TMA-LDG warp waits it before refilling
-    #                          the stage (pre-armed on its side: the first STAGES_BIAS fills wait on nothing).
+    #                          the stage (pre-armed on its side: the first STAGES_BIAS fills wait on nothing).  On the
+    #                          streamed_multicast ring (CFG.BIAS_MODE == 3) the init is BIAS_EMPTY_ARRIVERS x BIAS_MCAST_CTAS
+    #                          (make_classic_bars(bias_ring_empty_arrivers=): 8 own + 8 peer = 16): the PEER CTA's softmax warps
+    #                          credit this CTA's stage too, through the .release.cta cluster arrive (arrive_on_peer(release_cta=True),
+    #                          a read-then-credit across CTAs -- never the relaxed form; the kernel's barrier table has the row).
     mb_bias_ring_full: object = None
     mb_bias_ring_empty: object = None
 
@@ -411,7 +415,8 @@ def make_classic_bars(
 
     ``bias_ring_empty_arrivers`` (appended): the ``mb_bias_ring_empty`` init count when it is NOT the CTA's own softmax
     warps alone -- the ``streamed_multicast`` ring (``CFG.BIAS_MODE == 3``) releases every stage from BOTH CTAs of the
-    cluster (one elected local arrive + one elected relaxed cluster arrive per softmax warp), so each CTA's ring counts
+    cluster (one elected local arrive + one elected ``.release.cta`` cluster arrive (``arrive_on_peer(release_cta=True)``,
+    a READ-then-credit across CTAs -- never the relaxed form) per softmax warp), so each CTA's ring counts
     ``BIAS_EMPTY_ARRIVERS x 2`` per phase.  None (every other caller) = ``CFG.BIAS_EMPTY_ARRIVERS``.
     """
     if bias_resident and bias_ring_stages:
