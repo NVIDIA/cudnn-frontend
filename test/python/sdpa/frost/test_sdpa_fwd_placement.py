@@ -237,7 +237,7 @@ def test_sm107_placement_consumes_qualified_choices(monkeypatch, dtype, chooser,
         dict(thd=True, padded=True),
         dict(has_paged_kv=True, page_size=16, padded=True),
         dict(attn_scale_prefolded=True),
-        dict(has_sink=False),
+        dict(has_sink=False, causal=False, bottom_right=False, s_q=1),  # sink-free s_q 2-16 leads by the dense decode-shaped arm
         dict(window_left=128),
         dict(right_band_widening=True, right_bound=8),
         dict(s_q=17),
@@ -384,3 +384,19 @@ def test_propose_ranks_the_rubin_mxfp8_row_first_without_the_flag(monkeypatch, k
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, s_q=4096)
     assert heuristics.propose(kind, _facts(device_cc=(10, 7), **quant), {name: _OFFERED[name]}) == plans + [BACKEND]
     assert heuristics.propose(kind, _facts(device_cc=(10, 0), **quant), {name: _OFFERED[name]}) == [BACKEND] + plans
+
+
+@pytest.mark.L0
+def test_sm107_dense_d128_one_decode_tile_wave_leads(monkeypatch):
+    """Past the decode-shaped band a causal dense d64/d128 graph leads exactly when its decode-tile launch fits one wave
+    (heuristics.d128_dense_waves, issue #1518); the wave counts are patched, so no measured boundary is pinned here."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    values = dict(
+        b=2, h_q=32, h_kv=8, s_q=384, s_kv=384, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, causal=True, device_cc=(10, 7), device_sm_count=216
+    )
+    for waves, causal, expected in (((1, 1), True, placement.LEAD), ((2, 1), True, placement.TRAIL), ((1, 1), False, placement.TRAIL)):
+        monkeypatch.setattr(heuristics, "d128_dense_waves", lambda caps, facts, pack_gqa=None, waves=waves: waves)
+        assert placement.place(spec, _facts(**dict(values, causal=causal))) == expected, (waves, causal)
+    assert placement.place(spec, _facts(**dict(values, s_q=8, s_kv=32768, b=64))) == placement.LEAD  # decode-shaped: every unit count

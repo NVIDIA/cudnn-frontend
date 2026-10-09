@@ -126,6 +126,10 @@ _SM107_NO_GQA_LPT_MAX_WAVES = 24
 # b32 32/8 q8 KV 8k f16: 0.80x), so the other policy stays listed as the runner.  The unpacked (MHA) decode tile
 # measured parity (b128 64/8 unpacked 0.997-1.025) and keeps the Rubin no-GQA wave rule.
 _SM107_DECODE_TILE_LPT_MIN_KV = 2048
+# Dense d128 half past one decode tile: one cga2 wave (512-row clusters on SMs / 2 slots) costs this many single-CTA
+# decode-tile waves (128-row CTAs on every SM); the narrower tile leads while its grid quantizes into no more than that.
+# Fit on cc 10.7 (216 SMs) and B300 (148 SMs) bottom-right causal prefill / chunk cells (issue #1518).
+_D128_CGA2_WAVE_COST = 1.6
 
 # The SM80 kernels' L2 grouping budget is a per-flavor MiB table fed to the
 # template (sched_l2_mib); the adapter owns that table. For POINT ORDERING all
@@ -1015,6 +1019,33 @@ _D128_DECODE_TILE_ROWS = 128
 _D64_DECODE_TILE_ROWS = 128
 
 
+def _d128_dense_two_widths(caps: Capabilities, facts) -> bool:
+    """A dense d128 half graph both widths serve at any S_q: the SM100 f16 row and the cc 10.7 shared leg."""
+    sm100_dense = _sm100_f16(caps, facts) and _d128_f16_flavor(caps, facts) and not facts.thd and not facts.has_paged_kv
+    return sm100_dense or rubin_dense_d128_shared_leg(caps, facts)
+
+
+def d128_dense_waves(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> Optional[Tuple[int, int]]:
+    """(decode-tile waves, cga2 waves) of a dense d128 half graph both widths serve; ``None`` elsewhere."""
+    if not _d128_dense_two_widths(caps, facts):
+        return None
+    if pack_gqa is None:
+        pack_gqa = _pack_gqa_eligible(caps, facts, _D128_DECODE_TILE_ROWS)
+    pack_g = _pack_gqa_group(caps, facts, _D128_DECODE_TILE_ROWS, pack_gqa)
+    units, rows = facts.b * (facts.h_q // pack_g), facts.s_q * pack_g
+    sms = facts.device_sm_count or (_SM107_MEASURED_SMS if caps.sm_lo == 107 else 148)
+    return (
+        _ceil_div(units * _ceil_div(rows, _D128_DECODE_TILE_ROWS), sms),
+        _ceil_div(units * _ceil_div(rows, 4 * _D128_DECODE_TILE_ROWS), sms // 2),
+    )
+
+
+def _d128_dense_cga1_waves_win(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
+    """Whether the dense d128 decode tile beats the cga2 prefill cluster on wave count (_D128_CGA2_WAVE_COST)."""
+    waves = d128_dense_waves(caps, facts, pack_gqa)
+    return waves is not None and waves[0] <= _D128_CGA2_WAVE_COST * waves[1]
+
+
 def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
     """Whether one d128 decode tile covers a KV head's live Q rows.
 
@@ -1130,7 +1161,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
     if selected_shape == (128, 128) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):
         # The f16 SM100 and cc 10.7 rows: cga1 = the decode tile when one of its 128-row
         # tiles covers the head's Q rows, else the cga2 prefill pipeline.
-        return sched_policy, (1 if _d128_decode_tile_fits(caps, facts, pack_gqa) else 2)
+        return sched_policy, (1 if _d128_decode_tile_fits(caps, facts, pack_gqa) or _d128_dense_cga1_waves_win(caps, facts, pack_gqa) else 2)
     if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
         selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
@@ -2002,9 +2033,8 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         if base.pack_gqa is True and True not in _pack_gqa_points(caps, facts, tile_m or 128, base.cga, base.split_kv):
             continue
         out.append(_resplit(replace(base, tile_m=tile_m, tile_n=tile_n)))
-    # No explicit CGA-width runner: on SM100 f16 the width follows the d128
-    # decode-tile fit of each leg's own rows (_auto_sched_cga), and the other
-    # width is not offered (test_sdpa_fwd_decode_d128_sm100 pins this).
+    # No CGA-width runner here: the width follows each leg's own rows (_auto_sched_cga); the dense d128 other-width
+    # runner is added below.
     # Scheduler runners ride an UNSPLIT leg: a split set is pinned to the plain
     # scheduler above, so an LPT runner is only a candidate without one.
     sched_host = unsplit_leg
@@ -2026,6 +2056,9 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
             out.append(_resplit(replace(base, pack_gqa=True, tile_m=pack_tile[0], tile_n=pack_tile[1], cga=packed_cga)))
     for split in splits[1:]:
         out.append(_leg(split))
+    if _d128_dense_two_widths(caps, facts) and not _d128_decode_tile_fits(caps, facts, base.pack_gqa):
+        # Past one decode tile both widths serve a dense d128 graph; the wave rule picks the lead.
+        out.insert(1, _resplit(replace(base, cga=3 - base.cga)))
     seen, unique = set(), []
     for knobs in out:
         if knobs not in seen:
