@@ -1039,6 +1039,12 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     return select_d128_auto_cga(s_q=facts.s_q, pack_g=pack_g, thd=facts.thd, thd_decode_leg=thd_decode_leg) == 1
 
 
+# Longest average per-tile K/V walk (keys) at which the packed MXFP8 d128 leg still takes the single 256-row CTA
+# (causal: half of S_kv; sliding window: the window plus one tile).  Causal S=2K / S=4K and window 1024 sit at or
+# below it, causal S=8K and above keep the cga2 pair -- see _auto_sched_cga.
+_SM100_MXFP8_D128_CGA1_MAX_WALK = 2048
+
+
 def _in_flavor_sched_domain(caps: Capabilities, facts, selected: int, seed: int) -> int:
     """``selected`` when the selected flavor's scheduler domain honours it, else ``seed`` (drawn from that
     domain by the caller), else the domain's lowest policy.  The measured D192 / D256 / D512 pickers answer
@@ -1077,6 +1083,23 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
         # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
         return sched_policy, 1
+    if selected_shape == (128, 128) and facts.is_mxfp8 and 1 in domain and not facts.thd and not facts.has_paged_kv:
+        # MXFP8 d128 on a dense graph.  cga1 = one 256-row CTA of the prefill body (the geometry cuDNN's own MXFP8
+        # d128 kernel runs; no pair handshake at the tile boundary, but no K/V multicast either).  MEASURED 2026-10-07
+        # against the cga2 pair in the benchmark regime (same-node A/B, cuDNN 9.27; O bit-identical between the
+        # widths): the PACKED GQA leg wins at cga1 while its K/V walk is short -- llama 64/8 causal S=2K 0.97x (B200)
+        # / 0.97x (B300) with the three-stage cga1 ring, S=4K 1.00x / 0.99x, sliding window 1024 at S=2K 0.96x /
+        # 0.95x -- and loses once it is long (causal S=8K 1.01x / 1.00x, S=16K 1.07x on B300), where the pair's
+        # shared K/V stream pays; an unpacked leg (dense GQA, any MHA) and the split leg keep the pair (dense S=2K
+        # +3 % at cga1 on B200; AR-DiT split +2..3 %).
+        packed = pack_gqa if pack_gqa is not None else _sm100_banded_gqa_packs(caps, facts)
+        if (split_kv or 1) > 1 or not packed:
+            return sched_policy, 2
+        if facts.window_left is not None:
+            kv_walk = min(facts.s_kv, facts.window_left + 128)
+        else:
+            kv_walk = facts.s_kv // 2 if facts.causal else facts.s_kv
+        return sched_policy, 1 if kv_walk <= _SM100_MXFP8_D128_CGA1_MAX_WALK else 2
     if facts.device_cc == (10, 7) and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,

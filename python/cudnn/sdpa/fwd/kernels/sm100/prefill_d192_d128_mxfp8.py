@@ -715,8 +715,9 @@ class KernelTmemLayout:
     SF_K0_OFF: int = 128 + SF_HEAD_OFFSET + SF_TMEM_COLS_Q  # 144
     SF_Q1_OFF: int = SF_HEAD_OFFSET  # 8
     SF_K1_OFF: int = SF_HEAD_OFFSET + SF_TMEM_COLS_Q  # 16
-    # Prologue BMM1: O not yet accumulated -> O_0 region is dead scratch (the
-    # first BMM2 overwrites it with accumulate=False).  No LDTM wait needed.
+    # cc 10.0 prologue BMM1 scratch: O not yet accumulated -> the O_0 head is dead (the first BMM2 overwrites it
+    # with accumulate=False); the mb_stats_read gate orders it after the previous tile's O drain.  cc 10.3 stages
+    # the prologue SF in the steady-state S_acc scratch instead (see _mma_warp_group).
     SF_Q0_PRO_OFF: int = 256  # O_0 head
     SF_K0_PRO_OFF: int = 256 + SF_TMEM_COLS_Q  # 264
     SF_Q1_PRO_OFF: int = 256 + SF_TMEM_COLS_Q + SF_TMEM_COLS_K  # 272
@@ -1907,10 +1908,11 @@ def _mma_warp_group(
     tmem_SF_K0 = tmem_raw.subview(LAYOUT.SF_K0_OFF)
     tmem_SF_Q1 = tmem_raw.subview(LAYOUT.SF_Q1_OFF)  # sub1 steady (S_acc_0)
     tmem_SF_K1 = tmem_raw.subview(LAYOUT.SF_K1_OFF)
-    tmem_SF_Q0_pro = tmem_raw.subview(LAYOUT.SF_Q0_PRO_OFF)  # prologue (O_0, dead)
-    tmem_SF_K0_pro = tmem_raw.subview(LAYOUT.SF_K0_PRO_OFF)
-    tmem_SF_Q1_pro = tmem_raw.subview(LAYOUT.SF_Q1_PRO_OFF)
-    tmem_SF_K1_pro = tmem_raw.subview(LAYOUT.SF_K1_PRO_OFF)
+    # Prologue SF scratch: cc 10.3 the steady-state S_acc scratch (the port), cc 10.0 the dead O_0 head (develop).
+    tmem_SF_Q0_pro = tmem_SF_Q0 if FUSED_LDTM_STAT else tmem_raw.subview(LAYOUT.SF_Q0_PRO_OFF)
+    tmem_SF_K0_pro = tmem_SF_K0 if FUSED_LDTM_STAT else tmem_raw.subview(LAYOUT.SF_K0_PRO_OFF)
+    tmem_SF_Q1_pro = tmem_SF_Q1 if FUSED_LDTM_STAT else tmem_raw.subview(LAYOUT.SF_Q1_PRO_OFF)
+    tmem_SF_K1_pro = tmem_SF_K1 if FUSED_LDTM_STAT else tmem_raw.subview(LAYOUT.SF_K1_PRO_OFF)
     tmem_SF_P0 = tmem_raw.subview(LAYOUT.SF_P0_OFF)
     tmem_SF_V0 = tmem_raw.subview(LAYOUT.SF_V0_OFF)
     tmem_SF_P1 = tmem_raw.subview(LAYOUT.SF_P1_OFF)
@@ -2067,9 +2069,12 @@ def _mma_warp_group(
     ldtm_phase1 = cutlass.Int32(0)  # consumes softmax[1] arrives (for BMM1[sub0])
     # Prologue BMM1 stages Q/K scale factors in the previous tile's O region.
     # Wait until correction has drained that tile's final O TMEM loads.
-    stats_read_phase = cutlass.Int32(1)
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
+
+    # cc 10.0: the prologue QK^T of sub-tile qs stages its SF in the O_0 head, so it waits mb_stats_read[qs]
+    # (the correction has read that head of the previous tile's O); bootstrap parity 1 so the first tile passes.
+    stats_read_phase = cutlass.Int32(1)
 
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
@@ -2089,18 +2094,21 @@ def _mma_warp_group(
             # Empty mainloop — keep softmax/correction phase trackers in lockstep with non-empty path.
             bars.mb_empty_mainloop.wait(empty_mainloop_phase)
             empty_mainloop_phase = empty_mainloop_phase ^ cutlass.Int32(1)
-            bars.mb_stats_read[0].wait(stats_read_phase)
-            bars.mb_stats_read[1].wait(stats_read_phase)
+            if cutlass.const_expr(not FUSED_LDTM_STAT):
+                bars.mb_stats_read[0].wait(stats_read_phase)
+                bars.mb_stats_read[1].wait(stats_read_phase)
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                 bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
         else:
-            # Prologue: BMM1[sub0] + BMM1[sub1] for kv=kv_left.  SF_Q/K land in
-            # the O_0 region (O not yet accumulated → dead scratch; the first BMM2
-            # overwrites it with accumulate=False).  No softmax-LDTM wait needed.
+            # Prologue: BMM1[sub0] + BMM1[sub1] for kv=kv_left, with the steady-state SF scratch: sub0's SF_Q/K
+            # in S_acc_1 (the previous tile's softmax[1] has read it -- its last LDTM arrive was consumed by the
+            # P14 drain below), sub1's in S_acc_0 behind this tile's softmax[0] LDTM wait.  Nothing here touches
+            # the O region or the correction epilogue, so this QK^T overlaps the previous tile's last PV and O drain.
             bars.mb_q_full[0].wait(q_full_phase)
             bars.mb_k_full[kv_state.idx].wait(kv_state.phase)
-            bars.mb_stats_read[0].wait(stats_read_phase)
+            if cutlass.const_expr(not FUSED_LDTM_STAT):
+                bars.mb_stats_read[0].wait(stats_read_phase)
             desc_K = sK[kv_state.idx].desc()
             desc_K_SF = sK_SF[kv_state.idx].desc()
             _launch_bmm1(
@@ -2117,13 +2125,12 @@ def _mma_warp_group(
                 bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
             bars.mb_q_full[1].wait(q_full_phase)
-            # Consume softmax[0]'s prologue-iter LDTM arrive so the steady-state
-            # BMM1[sub1] ldtm[0] waits align to the SAME-iter softmax[0] (cuDNN:
-            # "tile 1 waits for tile 0's softmax; tile 0 starts immediately").
-            # Prologue SF is O-region-dead, so this wait is alignment-only.
+            # softmax[0] must have read this iteration's S_acc_0 before sub1's SF_Q/K land in its scratch
+            # (same-iter wait, as in the steady state; it also keeps the steady-state ldtm[0] phases aligned).
             wait(mb_softmax_ldtm.subview(0), ldtm_phase0)
             ldtm_phase0 = ldtm_phase0 ^ 1
-            bars.mb_stats_read[1].wait(stats_read_phase)
+            if cutlass.const_expr(not FUSED_LDTM_STAT):
+                bars.mb_stats_read[1].wait(stats_read_phase)
             _launch_bmm1(
                 bmm1_desc,
                 desc_Q1,
@@ -2396,8 +2403,8 @@ def _mma_warp_group(
             bmm2_ready_phase = bmm2_ready_phase ^ 1
             kv_state = advance(kv_state, CFG.STAGES_KV)
 
+        stats_read_phase = stats_read_phase ^ cutlass.Int32(1)
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
-        stats_read_phase = stats_read_phase ^ 1
 
         if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1):
             wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
@@ -2822,9 +2829,9 @@ def _softmax_warp_group(
     NEG_INF = cutlass.Float32(-3.4028235e38)
 
     bmm1_phase = cutlass.Int32(0)
+    epilogue_state = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
     p_inplace_phase = cutlass.Int32(0)
-    epilogue_state = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
 
     # total_sum kept as Vector[Float32,2] so per-iter update lowers to packed FMUL2 + FADD2.
     total_max = NEG_INF
@@ -2868,9 +2875,14 @@ def _softmax_warp_group(
         if cutlass.const_expr(not (CFG.MASK_FLAGS & MASK_CAUSAL)):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
-        # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
-        bars.mb_o_empty[0].wait(epilogue_state)
-        epilogue_state = epilogue_state ^ cutlass.Int32(1)
+        # cc 10.3: no top-of-tile mb_o_empty[0] gate -- the softmax touches neither the O SMEM slab nor O's TMEM
+        # columns, and its stat_empty bootstrap wait below already orders it after the correction epilogue's final-stats
+        # read; the gate delayed the first S -> P of every tile by the whole O drain (B300 dsv3/kimi dense 2k -2..-3 %).
+        # cc 10.0 keeps the gate: started early, the exp burst contends with the correction's F2FP conversions
+        # (B200 dense 2k +1.5..2.4 % without it).
+        if cutlass.const_expr(not FUSED_LDTM_STAT):
+            bars.mb_o_empty[0].wait(epilogue_state)
+            epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         # Seed P1 one S0 token behind.  Empty tiles produce no score tokens.
         if bounds.right > bounds.left:
@@ -3051,12 +3063,20 @@ def _correction_warp_group(
     eff_seqlen_q = _resolve_seqlen_q(seq_kv_lens_tensor, batch_idx, seqlen_q, n_batch, seq_q_lens_addr)
     bounds = _bounds_for_tile_split(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx, split_idx, CFG.QH_PER_KH)
 
+    if cutlass.const_expr(not MAY_BE_EMPTY and FUSED_LDTM_STAT):
+        # First tile: both O slots start free (the steady release happens in each tile's epilogue below).
+        for qs in cutlass.range_constexpr(CFG.TILES_Q):
+            bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         # Iter-0 skip — MMA's iter-0 BMM2 uses init_d=False to overwrite O, no α-rescale needed.
         if bounds.right > bounds.left:
-            for qs in cutlass.range_constexpr(CFG.TILES_Q):
-                bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+            if cutlass.const_expr(MAY_BE_EMPTY or not FUSED_LDTM_STAT):
+                # Empty tiles run the epilogue too, so the O-slot release cannot be hoisted into the previous
+                # tile's epilogue here; cc 10.0 keeps the tile-top arrive as well (see the softmax gate above).
+                for qs in cutlass.range_constexpr(CFG.TILES_Q):
+                    bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 bars.mb_stat_full[qs].wait(stat_full_phase)
                 bars.mb_stat_empty[qs].arrive()
@@ -3103,8 +3123,11 @@ def _correction_warp_group(
         for qs in cutlass.range_constexpr(CFG.TILES_Q):
             tmem_O_off = LAYOUT.O0_OFF if qs == 0 else LAYOUT.O1_OFF
 
-            bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
-
+            # cc 10.3: the final (max, sum) are in SMEM, so the row's 1/sum and LSE are computed -- and the LSE
+            # stored -- while the last PV is still in flight; only the O read below waits for it.  cc 10.0 keeps
+            # develop's order (wait here).
+            if cutlass.const_expr(not FUSED_LDTM_STAT):
+                bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
             bars.mb_stat_full[qs].wait(stat_full_phase)
 
             stats_base = cutlass.Int32(qs * 2 * CFG.TILE_M)
@@ -3208,6 +3231,9 @@ def _correction_warp_group(
 
             sO_sub_base = sO[qs].base
 
+            if cutlass.const_expr(FUSED_LDTM_STAT):
+                bars.mb_bmm2_done[qs].wait(bmm2_done_phase)
+
             if cutlass.const_expr(_FP32_PARTIALS):
                 # fp32 partials: the accumulator goes straight to the workspace,
                 # bypassing the SMEM O tile and its TMA store.
@@ -3224,10 +3250,10 @@ def _correction_warp_group(
                     CFG.TILE_O,
                     O_CHUNK,
                 )
-                # The staged branch releases the stats slot from inside its loop; the
-                # next persistent tile's prologue waits on it, so it must happen here
-                # too or the second tile deadlocks.
-                bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+                if cutlass.const_expr(not FUSED_LDTM_STAT):
+                    # cc 10.0: release the O_0-head prologue scratch to the MMA (the staged branch does it inside
+                    # its loop; the next persistent tile's prologue waits on it, or the second tile deadlocks).
+                    bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                 bars.mb_o_empty[qs].wait(o_empty_phase)
             else:
                 if cutlass.const_expr(CFG.EMIT_AMAX_O):
@@ -3242,7 +3268,7 @@ def _correction_warp_group(
                         num=O_CHUNK,
                     )
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                    if cutlass.const_expr(chunk_idx == N_CHUNKS_O - 1):
+                    if cutlass.const_expr(chunk_idx == N_CHUNKS_O - 1 and not FUSED_LDTM_STAT):
                         bars.mb_stats_read[qs].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
                     o_scaled = o_chunk * inv_sum
                     _zero_f = cutlass.Float32(0.0)
@@ -3268,6 +3294,10 @@ def _correction_warp_group(
                 # fence_proxy needed before TMA reads SMEM written by tcgen05_st.
                 nvvm.fence_proxy("async.shared", space="cta")
             bars.mb_o_full[qs].arrive()
+            if cutlass.const_expr(not MAY_BE_EMPTY and FUSED_LDTM_STAT):
+                # O_qs is drained: the NEXT tile's first BMM2 may overwrite it (its iter-0 uses init_d=False, no
+                # alpha-rescale), so release it now instead of at the next loop top (cc 10.3 only, see above).
+                bars.mb_bmm2_ready[qs * CFG.N_BMM2_CHUNKS + 0].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
             # The global amax is independent of the O TMA store.  Publish O
             # first so the store warp can overlap this atomic and the next qs.

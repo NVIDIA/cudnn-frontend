@@ -28,7 +28,7 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import arith
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
-from cudnn.frost.tile_dsl.tma import ld_global_v4
+from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global_v2
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
 # This helper is imported normally, outside the parameterized template loader.
@@ -45,6 +45,8 @@ FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:1
 # 985 x 9 rows x 4 splits on B300 against ~18 MB of traffic.
 THREADS = 128
 ROWS_PER_BLOCK = THREADS // 32
+# Splits whose LSE and partial-O rows are loaded up front, before any math.
+G_S = 4
 
 NEG_INF = float("-inf")
 
@@ -60,6 +62,16 @@ _ELEM = {
     "e4m3": cutlass.Float8E4M3FN,
     "e5m2": cutlass.Float8E5M2,
 }
+
+
+def _ld_global_f32(addr):
+    """32-bit global load of an fp32 at ``addr``."""
+    r = nvvm.inline_ptx(
+        "ld.global.f32 $0, [$1];",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[addr],
+    )
+    return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
 
 
 @cute.kernel
@@ -145,82 +157,218 @@ def _combine_kernel(
                 lse_live = in_seq & (lse_tok64 >= cutlass.Int64(0)) & (lse_tok64 < cutlass.Int64(ragged_lse_cap))
                 lse_tok = cutlass.Int32(lse_tok64)
 
-        # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
-        # Every lane redundantly walks the (very short) split axis; the values
-        # are warp-uniform and hit L1, which is cheaper than staging them.
-        m = cutlass.Float32(NEG_INF)
-        for s in cutlass.range(0, n_splits, 1, unroll=4):
-            lse_row = lp[batch + s * n_batch, head, :]
-            m = cute.math.max(m, cutlass.Float32(lse_row[q_row]))
-
-        # All splits dead (every row fully masked): emit O := 0 / lse := -inf
-        # rather than exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
-        all_dead = m == cutlass.Float32(NEG_INF)
-        m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
-
-        # A dead split (empty KV range) carries lse_s = -inf and must contribute
-        # nothing.  Its weight is dropped with a SELECT, not by trusting the
-        # arithmetic: 0 * x is NaN for a non-finite x and a fastmath exp(-inf)
-        # is only approximately zero.  (Observed: d512 with 5 KV tiles over 8
-        # splits produced NaN without the guard.)
         neg_inf = cutlass.Float32(NEG_INF)
         zero = cutlass.Float32(0.0)
-        den = cutlass.Float32(0.0)
-        for s in cutlass.range(0, n_splits, 1, unroll=4):
-            lse_row = lp[batch + s * n_batch, head, :]
-            lse_s = cutlass.Float32(lse_row[q_row])
-            live = lse_s > neg_inf
-            e = cute.math.exp(lse_s - m_safe, fastmath=True)
-            den = den + cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
-
-        inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
-        inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
-
-        # --- pass 2: O = sum_s w_s O_s / den, accumulated in fp32 ---
-        # The partial slab is compact [S*B, S_q, H, d_v]; lane l owns four
-        # contiguous columns of every split (one 16-byte load for fp32 partials
-        # when all four are inside the row); the split loop is branch-free and
-        # unrolled so the loads of several splits are in flight together.
-        o_base = o_partial.iterator.toint()
-        # The 16-byte loads need d_v % 4 == 0 (row starts stay 16-byte aligned)
-        # and a 16-byte aligned slab base: the pointer entries only promise the
-        # element alignment and take a runtime d_v, so decide at runtime (one
-        # warp-uniform test); otherwise every lane takes the element path.
-        vec_ok = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
+        # Pre-declared: both paths assign them and the tail below reads them after the join.
         amax_local = cutlass.Float32(0.0)
-        q_scale = cutlass.Float32(1.0)
-        if cutlass.const_expr(scale_o is not None):
-            q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
-        for cbase in cutlass.range(0, d_v, 128, unroll=1):
-            d0 = cbase + lane * cutlass.Int32(4)
-            if d0 < d_v:
-                acc0 = cutlass.Float32(0.0)
-                acc1 = cutlass.Float32(0.0)
-                acc2 = cutlass.Float32(0.0)
-                acc3 = cutlass.Float32(0.0)
-                for s in cutlass.range(0, n_splits, 1, unroll=4):
-                    lse_row = lp[batch + s * n_batch, head, :]
-                    lse_s = cutlass.Float32(lse_row[q_row])
-                    live = lse_s > neg_inf
-                    e = cute.math.exp(lse_s - m_safe, fastmath=True)
-                    w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
-                    e0 = zero
-                    e1 = zero
-                    e2 = zero
-                    e3 = zero
-                    # Element loads through the view, each bounded by the row, serve
-                    # the half partials (flavors whose split epilogue keeps the staged
-                    # TMA-store O path, e.g. d512) and any d_v / base that cannot take
-                    # aligned 16-byte loads (legal through the runtime-shape pointer
-                    # entries); aligned fp32 partials take one 16-byte load per split.
-                    if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
-                        if vec_ok:
-                            idx = cute.crd2idx((batch + s * n_batch, q_row, head, d0), o_partial.layout)
-                            v = ld_global_v4(o_base + cutlass.Int64(idx) * 4, cutlass.Float32)
-                            e0 = cutlass.Float32(v[0])
-                            e1 = cutlass.Float32(v[1])
-                            e2 = cutlass.Float32(v[2])
-                            e3 = cutlass.Float32(v[3])
+        m_safe = zero
+        den = zero
+        all_dead = zero > zero
+        o_base = o_partial.iterator.toint()
+        # fp32 partials with 16-byte rows: the lean path.  Lane l owns columns 4l..4l+3 of
+        # every split; each (b, h, q_row) base offset is computed once and the per-split
+        # address is a single 64-bit add (the split axis is the leading, batch-stacked mode).
+        lean = zero > zero
+        if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
+            lean = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
+        if lean:
+            lse_base = lse_partial.iterator.toint() + cutlass.Int64(cute.crd2idx((batch, head, q_row), lse_partial.layout)) * 4
+            lse_step = cutlass.Int64(lse_partial.stride[0]) * cutlass.Int64(n_batch) * 4
+            o_step = cutlass.Int64(o_partial.stride[0]) * cutlass.Int64(n_batch) * 4
+            s_last = n_splits - cutlass.Int32(1)
+            out_base = o_out.iterator.toint()
+            st_ok = zero > zero
+            if cutlass.const_expr(o_out.element_type in (cutlass.Float16, cutlass.BFloat16)):
+                _st_strides = cutlass.Int64(o_out.stride[0]) | cutlass.Int64(o_out.stride[1]) | cutlass.Int64(o_out.stride[2])
+                st_ok = (
+                    ((out_base & cutlass.Int64(7)) == cutlass.Int64(0))
+                    & (cutlass.Int64(o_out.stride[3]) == cutlass.Int64(1))
+                    & ((_st_strides & cutlass.Int64(3)) == cutlass.Int64(0))
+                )
+            q_scale = cutlass.Float32(1.0)
+            if cutlass.const_expr(scale_o is not None):
+                q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+            for cbase in cutlass.range(0, d_v, 128, unroll=1):
+                d0 = cbase + lane * cutlass.Int32(4)
+                if d0 < d_v:
+                    o_row_base = o_base + cutlass.Int64(cute.crd2idx((batch, q_row, head, d0), o_partial.layout)) * 4
+                    # Every load of the row goes out first -- the LSE of the first G_S splits and their partial-O
+                    # rows (a clamped split index re-reads the last split for slots past n_splits; those get
+                    # weight 0) -- so a warp pays ONE memory round trip instead of one per pass.
+                    lse_v = []
+                    o_v = []
+                    for s in cutlass.range_constexpr(G_S):
+                        s_eff64 = cutlass.Int64(cute.math.min(cutlass.Int32(s), s_last))
+                        lse_v.append(_ld_global_f32(lse_base + s_eff64 * lse_step))
+                        o_v.append(ld_global_v4(o_row_base + s_eff64 * o_step, cutlass.Float32))
+                    m = neg_inf
+                    for s in cutlass.range_constexpr(G_S):
+                        m = cute.math.max(m, lse_v[s])
+                    # Splits past G_S (rare) extend the max before any weight is formed.
+                    if n_splits > cutlass.Int32(G_S):
+                        for s in cutlass.range(G_S, n_splits, 1, unroll=1):
+                            m = cute.math.max(m, _ld_global_f32(lse_base + cutlass.Int64(s) * lse_step))
+                    # All splits dead (every row fully masked): emit O := 0 / lse := -inf rather than
+                    # exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
+                    all_dead = m == neg_inf
+                    m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), m.ir_value()))
+                    acc0 = zero
+                    acc1 = zero
+                    acc2 = zero
+                    acc3 = zero
+                    den = zero
+                    for s in cutlass.range_constexpr(G_S):
+                        lse_s = lse_v[s]
+                        v = o_v[s]
+                        live = (lse_s > neg_inf) & (cutlass.Int32(s) < n_splits)
+                        e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                        w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                        v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
+                        v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
+                        v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
+                        v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
+                        den = den + w
+                        acc0 = acc0 + w * v0
+                        acc1 = acc1 + w * v1
+                        acc2 = acc2 + w * v2
+                        acc3 = acc3 + w * v3
+                    if n_splits > cutlass.Int32(G_S):
+                        for s in cutlass.range(G_S, n_splits, 1, unroll=1):
+                            s64 = cutlass.Int64(s)
+                            lse_s = _ld_global_f32(lse_base + s64 * lse_step)
+                            v = ld_global_v4(o_row_base + s64 * o_step, cutlass.Float32)
+                            live = lse_s > neg_inf
+                            e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                            w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                            v0 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[0]).ir_value(), zero.ir_value()))
+                            v1 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[1]).ir_value(), zero.ir_value()))
+                            v2 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[2]).ir_value(), zero.ir_value()))
+                            v3 = cutlass.Float32(arith.select(live.ir_value(), cutlass.Float32(v[3]).ir_value(), zero.ir_value()))
+                            den = den + w
+                            acc0 = acc0 + w * v0
+                            acc1 = acc1 + w * v1
+                            acc2 = acc2 + w * v2
+                            acc3 = acc3 + w * v3
+                    inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+                    inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
+                    outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
+                    vals = []
+                    for i in cutlass.range_constexpr(4):
+                        o_val = outs[i]
+                        if cutlass.const_expr(amax_o is not None):
+                            # Measured before scale_o, so this is already the pre-quant
+                            # amax and needs no post-hoc divide.
+                            amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+                        if cutlass.const_expr(scale_o is not None):
+                            o_val = o_val * q_scale
+                        vals.append(o_val)
+                    if cutlass.const_expr(o_out.element_type in (cutlass.Float16, cutlass.BFloat16)):
+                        if st_ok & row_live & (d0 + cutlass.Int32(3) < d_v):
+                            _cvt = "bf16x2" if cutlass.const_expr(o_out.element_type == cutlass.BFloat16) else "f16x2"
+                            p01, p23 = nvvm.inline_ptx(
+                                f"cvt.rn.{_cvt}.f32 $0, $3, $2;\ncvt.rn.{_cvt}.f32 $1, $5, $4;",
+                                write_only_types=[cutlass.Int32, cutlass.Int32],
+                                read_only_args=[vals[0], vals[1], vals[2], vals[3]],
+                            )
+                            o_idx = cute.crd2idx((o_batch, o_tok, head, d0), o_out.layout)
+                            st_global_v2(out_base + cutlass.Int64(o_idx) * 2, (p01, p23), cutlass.Int32)
+                        else:
+                            for i in cutlass.range_constexpr(4):
+                                if row_live & (d0 + cutlass.Int32(i) < d_v):
+                                    oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+                    else:
+                        for i in cutlass.range_constexpr(4):
+                            # Index all modes: ArrayView's row slice is a pointer and drops
+                            # the final mode's stride, so a subsequent [d0] would assume
+                            # contiguous D.
+                            if row_live & (d0 + cutlass.Int32(i) < d_v):
+                                oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = vals[i].to(o_out.element_type)
+        else:
+            # --- pass 1: M = max_s lse_s, then den = sum_s exp(lse_s - M) ---
+            # Every lane redundantly walks the (very short) split axis; the values
+            # are warp-uniform and hit L1, which is cheaper than staging them.
+            m = cutlass.Float32(NEG_INF)
+            for s in cutlass.range(0, n_splits, 1, unroll=4):
+                lse_row = lp[batch + s * n_batch, head, :]
+                m = cute.math.max(m, cutlass.Float32(lse_row[q_row]))
+
+            # All splits dead (every row fully masked): emit O := 0 / lse := -inf
+            # rather than exp(-inf - -inf) == NaN.  m_safe only feeds the exponentials.
+            all_dead = m == cutlass.Float32(NEG_INF)
+            m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
+
+            # A dead split (empty KV range) carries lse_s = -inf and must contribute
+            # nothing.  Its weight is dropped with a SELECT, not by trusting the
+            # arithmetic: 0 * x is NaN for a non-finite x and a fastmath exp(-inf)
+            # is only approximately zero.  (Observed: d512 with 5 KV tiles over 8
+            # splits produced NaN without the guard.)
+            neg_inf = cutlass.Float32(NEG_INF)
+            zero = cutlass.Float32(0.0)
+            den = cutlass.Float32(0.0)
+            for s in cutlass.range(0, n_splits, 1, unroll=4):
+                lse_row = lp[batch + s * n_batch, head, :]
+                lse_s = cutlass.Float32(lse_row[q_row])
+                live = lse_s > neg_inf
+                e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                den = den + cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+
+            inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+            inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
+
+            # --- pass 2: O = sum_s w_s O_s / den, accumulated in fp32 ---
+            # The partial slab is compact [S*B, S_q, H, d_v]; lane l owns four
+            # contiguous columns of every split (one 16-byte load for fp32 partials
+            # when all four are inside the row); the split loop is branch-free and
+            # unrolled so the loads of several splits are in flight together.
+            o_base = o_partial.iterator.toint()
+            # The 16-byte loads need d_v % 4 == 0 (row starts stay 16-byte aligned)
+            # and a 16-byte aligned slab base: the pointer entries only promise the
+            # element alignment and take a runtime d_v, so decide at runtime (one
+            # warp-uniform test); otherwise every lane takes the element path.
+            vec_ok = ((d_v & cutlass.Int32(3)) == cutlass.Int32(0)) & ((o_base & cutlass.Int64(15)) == cutlass.Int64(0))
+            amax_local = cutlass.Float32(0.0)
+            q_scale = cutlass.Float32(1.0)
+            if cutlass.const_expr(scale_o is not None):
+                q_scale = cutlass.Float32(cutlass.make_array_view(scale_o)[0])
+            for cbase in cutlass.range(0, d_v, 128, unroll=1):
+                d0 = cbase + lane * cutlass.Int32(4)
+                if d0 < d_v:
+                    acc0 = cutlass.Float32(0.0)
+                    acc1 = cutlass.Float32(0.0)
+                    acc2 = cutlass.Float32(0.0)
+                    acc3 = cutlass.Float32(0.0)
+                    for s in cutlass.range(0, n_splits, 1, unroll=4):
+                        lse_row = lp[batch + s * n_batch, head, :]
+                        lse_s = cutlass.Float32(lse_row[q_row])
+                        live = lse_s > neg_inf
+                        e = cute.math.exp(lse_s - m_safe, fastmath=True)
+                        w = cutlass.Float32(arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+                        e0 = zero
+                        e1 = zero
+                        e2 = zero
+                        e3 = zero
+                        # Element loads through the view, each bounded by the row, serve
+                        # the half partials (flavors whose split epilogue keeps the staged
+                        # TMA-store O path, e.g. d512) and any d_v / base that cannot take
+                        # aligned 16-byte loads (legal through the runtime-shape pointer
+                        # entries); aligned fp32 partials take one 16-byte load per split.
+                        if cutlass.const_expr(o_partial.element_type == cutlass.Float32):
+                            if vec_ok:
+                                idx = cute.crd2idx((batch + s * n_batch, q_row, head, d0), o_partial.layout)
+                                v = ld_global_v4(o_base + cutlass.Int64(idx) * 4, cutlass.Float32)
+                                e0 = cutlass.Float32(v[0])
+                                e1 = cutlass.Float32(v[1])
+                                e2 = cutlass.Float32(v[2])
+                                e3 = cutlass.Float32(v[3])
+                            else:
+                                o_row = op[batch + s * n_batch, q_row, head, :]
+                                e0 = cutlass.Float32(o_row[d0])
+                                if d0 + cutlass.Int32(1) < d_v:
+                                    e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
+                                if d0 + cutlass.Int32(2) < d_v:
+                                    e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
+                                if d0 + cutlass.Int32(3) < d_v:
+                                    e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
                         else:
                             o_row = op[batch + s * n_batch, q_row, head, :]
                             e0 = cutlass.Float32(o_row[d0])
@@ -230,38 +378,29 @@ def _combine_kernel(
                                 e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
                             if d0 + cutlass.Int32(3) < d_v:
                                 e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
-                    else:
-                        o_row = op[batch + s * n_batch, q_row, head, :]
-                        e0 = cutlass.Float32(o_row[d0])
-                        if d0 + cutlass.Int32(1) < d_v:
-                            e1 = cutlass.Float32(o_row[d0 + cutlass.Int32(1)])
-                        if d0 + cutlass.Int32(2) < d_v:
-                            e2 = cutlass.Float32(o_row[d0 + cutlass.Int32(2)])
-                        if d0 + cutlass.Int32(3) < d_v:
-                            e3 = cutlass.Float32(o_row[d0 + cutlass.Int32(3)])
-                    # a dead slot may hold anything, including non-finite values
-                    v0 = cutlass.Float32(arith.select(live.ir_value(), e0.ir_value(), zero.ir_value()))
-                    v1 = cutlass.Float32(arith.select(live.ir_value(), e1.ir_value(), zero.ir_value()))
-                    v2 = cutlass.Float32(arith.select(live.ir_value(), e2.ir_value(), zero.ir_value()))
-                    v3 = cutlass.Float32(arith.select(live.ir_value(), e3.ir_value(), zero.ir_value()))
-                    acc0 = acc0 + w * v0
-                    acc1 = acc1 + w * v1
-                    acc2 = acc2 + w * v2
-                    acc3 = acc3 + w * v3
-                outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
-                for i in cutlass.range_constexpr(4):
-                    o_val = outs[i]
-                    if cutlass.const_expr(amax_o is not None):
-                        # Measured before scale_o, so this is already the pre-quant
-                        # amax and needs no post-hoc divide.
-                        amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
-                    if cutlass.const_expr(scale_o is not None):
-                        o_val = o_val * q_scale
-                    # Index all modes: ArrayView's row slice is a pointer and drops
-                    # the final mode's stride, so a subsequent [d0] would assume
-                    # contiguous D.
-                    if row_live & (d0 + cutlass.Int32(i) < d_v):
-                        oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
+                        # a dead slot may hold anything, including non-finite values
+                        v0 = cutlass.Float32(arith.select(live.ir_value(), e0.ir_value(), zero.ir_value()))
+                        v1 = cutlass.Float32(arith.select(live.ir_value(), e1.ir_value(), zero.ir_value()))
+                        v2 = cutlass.Float32(arith.select(live.ir_value(), e2.ir_value(), zero.ir_value()))
+                        v3 = cutlass.Float32(arith.select(live.ir_value(), e3.ir_value(), zero.ir_value()))
+                        acc0 = acc0 + w * v0
+                        acc1 = acc1 + w * v1
+                        acc2 = acc2 + w * v2
+                        acc3 = acc3 + w * v3
+                    outs = (acc0 * inv_den, acc1 * inv_den, acc2 * inv_den, acc3 * inv_den)
+                    for i in cutlass.range_constexpr(4):
+                        o_val = outs[i]
+                        if cutlass.const_expr(amax_o is not None):
+                            # Measured before scale_o, so this is already the pre-quant
+                            # amax and needs no post-hoc divide.
+                            amax_local = cute.math.max(amax_local, cute.math.max(o_val, -o_val))
+                        if cutlass.const_expr(scale_o is not None):
+                            o_val = o_val * q_scale
+                        # Index all modes: ArrayView's row slice is a pointer and drops
+                        # the final mode's stride, so a subsequent [d0] would assume
+                        # contiguous D.
+                        if row_live & (d0 + cutlass.Int32(i) < d_v):
+                            oo[o_batch, o_tok, head, d0 + cutlass.Int32(i)] = o_val.to(o_out.element_type)
 
         # amax: reduce across the warp, then ONE atomic per warp.  The value is
         # non-negative, so its fp32 bit pattern orders the same as the float and

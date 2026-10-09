@@ -515,6 +515,10 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         return (1, 2)
     if device_cc != (10, 7) and fp8 and not pertensor and flavor == (512, 512):
         return (1,)
+    if device_cc != (10, 7) and fp8 and not pertensor and flavor == (128, 128):
+        # MXFP8 d128 builds at both widths on the SM100 line: cga1 is one 256-row CTA of the prefill body (no
+        # collective MMA, three K/V stages), cga2 the 2-CTA pair; heuristics._auto_sched_cga picks between them.
+        return (1, 2)
     if not fp8 and flavor == _SM100_DECODE_FLAVOR:
         # cga1 on the d128 f16/bf16 flavor selects the DECODE tile (sm100/decode_d128_f16.py) on the SM100 line and,
         # since issue #1472, on cc 10.7 (the same body compiled for sm_107a, inside the version-0 descriptor window);

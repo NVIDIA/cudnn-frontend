@@ -352,7 +352,10 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
     ("mxfp8", "d_qk", "d_v", "expected_cga"),
     # Per-tensor FP8 d128 runs its unsplit leg at cga1 (one 256-row CTA, the
     # geometry cuDNN's fp8 kernel uses; B200: llama causal S=2K 1.18x -> 1.14x,
-    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair.
+    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair on a dense
+    # unsplit graph -- its cga1 serves only the packed-GQA banded leg while the
+    # per-tile K/V walk is at most _SM100_MXFP8_D128_CGA1_MAX_WALK keys; the split
+    # leg and the unpacked legs keep the pair (heuristics._auto_sched_cga).
     [(False, 128, 128, 1), (True, 128, 128, 2), (False, 256, 256, 1), (True, 256, 256, 1)],
     ids=["per_tensor-d128", "block_scale-d128", "per_tensor-d256", "block_scale-d256"],
 )
@@ -372,9 +375,10 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     assert plans
     unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
     assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        # Per-tensor FP8 d128 offers both widths; the split leg stays on the cga2
-        # pair (split_cgas_by_d_shape), so the plan list may carry both.
+    if (d_qk, d_v) == (128, 128):
+        # Both d128 quantized rows offer both widths (per-tensor: the split leg
+        # stays on the cga2 pair; MXFP8: cga1 only for the short-walk packed banded
+        # leg, the split leg keeps the pair), so the plan list may carry both.
         assert {plan.knobs.cga for plan in plans} <= {1, 2}
     else:
         assert {plan.knobs.cga for plan in plans} == {expected_cga}
@@ -382,8 +386,8 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=expected_cga)) is None
     wrong_cga = 1 if expected_cga == 2 else 2
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "per-tensor FP8 d128 builds at both widths"
+    if (d_qk, d_v) == (128, 128):
+        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "the quantized d128 rows build at both widths"
     else:
         assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
@@ -840,7 +844,7 @@ def test_d128_width_rule_is_one_rule_for_graph_and_adapter():
     decode tile's rows decide (cga_tile_m(128, 1) == _D128_DECODE_TILE_ROWS);
     a ragged graph keeps cga2 unless it is the decode tile's ragged-Q leg.
     (The adapter's cga DOMAIN is #1094's
-    test_standalone_cga_domain_admits_cga1_on_d128_f16_only.)"""
+    test_standalone_cga_domain_cga1_is_a_decode_tile_only_on_d128_f16.)"""
     from cudnn.sdpa.fwd.config_sm100 import cga_tile_m, pack_gqa_group_size
     from cudnn.sdpa.fwd.heuristics import _D128_DECODE_TILE_ROWS, _d128_decode_tile_fits, select_d128_auto_cga
 
