@@ -1167,9 +1167,10 @@ def test_sm107_d128_prefolded_graphs_keep_the_native_body(sm107_metadata_target)
 def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
     """Explicit pins on the cc 10.7 half row (issue #1472): dense d128 half admits cga=1 (the shared decode tile) and
     cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too); a group that
-    does not (96/8) is declined with the divisibility reason, dense d256 keeps its paged-THD-only PackGQA, THD nonpaged
+    does not (96/8) is declined with the divisibility reason, dense d256 packs on the d256 decode tile within its route
+    (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
     keeps the cga2 prefill pipeline (cga=1 outside its domain, no packed leg), and dense PAGED queries -- not wired on
-    cc 10.7 -- never see the tile."""
+    cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
     from cudnn.sdpa.fwd.engines import effective_cgas
 
     caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
@@ -1180,7 +1181,12 @@ def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
         assert engines.mismatch(caps, _sm107_d128_facts(h_kv=h_kv), pack) is None, h_kv
     assert engines.mismatch(caps, _sm107_d128_facts(d_qk=64, d_v=64), pack) is None
     assert "divide" in engines.mismatch(caps, _sm107_d128_facts(h_q=96, h_kv=8), pack)
-    assert engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256), pack) is not None
+    # dense d256 (64/8 at S_q 8 = 64 packed rows = two token units of the 32-column tile): the d256 decode tile packs the whole
+    # group, so the request is ADMITTED; past the route (S_q 16 = 128 rows) the dense d256 prefill kernel runs unpacked and the
+    # packed request is a typed decline naming the decode tile among the routes
+    assert engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256), pack) is None
+    past_route = engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256, s_q=16), pack)
+    assert past_route is not None and "decode tile" in past_route, past_route
     thd = _sm107_d128_facts(thd=True, padded=True)
     assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
     assert engines.mismatch(caps, thd, pack) is not None
