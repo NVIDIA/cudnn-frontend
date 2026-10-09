@@ -1784,12 +1784,11 @@ def test_thd_cache_shape_grid_tracks_runtime_capacity(d, arch, backend_lowering,
                 [sq * hq * d, d, hq * d, 1],
                 [sq * hq, 1, hq, 1],
             ] + [[1, 1, 1, 1]] * 5
-            # Ragged offsets are backend-only operands. A backend that cannot
-            # lower this graph leaves them out of the Python operand layout.
+            # Ragged offsets are caller slots in either operand layout: engines
+            # that address padded THD read them on device (the SM80 backward),
+            # so the Python layout keeps them when the backend cannot lower.
             operands = set(g._variant_pack_uids())
-            assert all(uid in operands for uid in uids[:7])
-            if not backend_lowering:
-                assert all(uid not in operands for uid in uids[7:])
+            assert all(uid in operands for uid in uids)
             overrides = [(uid, shape, stride) for uid, shape, stride in zip(uids, shapes, strides) if uid in operands]
             uids, shapes, strides = map(list, zip(*overrides))
             pack = _pack(t, bufs)

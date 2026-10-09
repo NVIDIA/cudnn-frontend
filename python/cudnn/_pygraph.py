@@ -2239,8 +2239,11 @@ class pygraph:
             # "the caller supplies nothing": a gdn graph marks its own O virtual
             # and the caller passes a buffer for it regardless. A slot nobody
             # fills stays empty; which ports are optional is the engine's own
-            # business, and it already reads them with .get().
-            order = sorted({t.uid for node in self._nodes for t in list(node.inputs.values()) + list(node.outputs.values()) if t is not None})
+            # business, and it already reads them with .get().  A port's ragged
+            # offset hangs off its tensor, not a port; it is a caller slot too
+            # (engines that address padded THD layouts read it on device).
+            ports = [t for node in self._nodes for t in list(node.inputs.values()) + list(node.outputs.values()) if t is not None]
+            order = sorted({t.uid for t in ports} | {t.ragged_offset.uid for t in ports if getattr(t, "ragged_offset", None) is not None})
         if not order:
             return None
         self._sorted_uids = order

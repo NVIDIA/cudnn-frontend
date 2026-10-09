@@ -1222,12 +1222,19 @@ class SdpaBinding:
     # Epilogue gate G (the sdpa -> sigmoid(G) -> mul tail): a REQUIRED bound
     # operand of the fused kernel.  The tail's virtual O_v / s are never bound.
     gate: Any = None
-    # THD ragged-offset tensors of Q / O / Stats ((B+1,) int32): bound operands
-    # of the SM100 decode tile's ragged-Q leg, which reads them on device as the
-    # packed row bases.  Every other lowering leaves them unbound.
+    # THD ragged-offset tensors ((B+1,) int32 / int64): bound operands of the
+    # lowerings that read them on device -- Q / O / Stats for the SM100 decode
+    # tile's ragged-Q leg, every port for the SM80 backward (caller-buffer token
+    # origins).  Every other lowering leaves them unbound.
     ragged_q: Any = None
     ragged_o: Any = None
     ragged_stats: Any = None
+    ragged_k: Any = None
+    ragged_v: Any = None
+    ragged_do: Any = None
+    ragged_dq: Any = None
+    ragged_dk: Any = None
+    ragged_dv: Any = None
 
     # Built once on first use and reused. Rebuilding it per execute cost ~1.3 us
     # per bound operand: three passes over the bound list and five dict
@@ -1304,6 +1311,12 @@ class SdpaBinding:
                 self.ragged_q,
                 self.ragged_o,
                 self.ragged_stats,
+                self.ragged_k,
+                self.ragged_v,
+                self.ragged_do,
+                self.ragged_dq,
+                self.ragged_dk,
+                self.ragged_dv,
             )
             if t is not None
         ]
