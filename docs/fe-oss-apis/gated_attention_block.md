@@ -902,9 +902,13 @@ order shuffled per iteration, 3 rounds of 150 / 60 / 20 launches per slot (2K / 
 the median of rounds (CUDA events around the whole block), the packed bf16 arm timed twice as the control pair (-1.97 .. +0.74 % over the cells: within 0.9 % in 15 of the 16, the 64/8
 causal 32K x 1 cell at -1.97 % makes that cell's numbers a weak claim). `packed overhead = packed ms / dense ms - 1` on uniform packings (`B` sequences of `S` tokens each: the same FLOPs;
 positive = the packed block is slower); the varlen cell packs `[2048, 4096, 6144, 8192]` (`B=4`, `max_seq_len = 8192`, 20480
-tokens) and reports TFLOP/s on its exact per-sequence FLOPs (causal: the exact masked pair count) beside a FLOP-scaled estimate of
-the dense block's time (`dense ms at B x S_max x FLOPs_varlen / FLOPs_dense`, which assumes time scales linearly with work -- an
-estimate, not a measured equal-work dense run), a dense torch run at `B x S_max` (which attends over the padding) and a
+tokens) and reports TFLOP/s on its exact per-sequence FLOPs -- the sum over the four sequences of the one FLOP model every row of
+these tables uses, `analytic_flops` of `test/python/gated_attention_block/cutedsl/benchmark_baseline.py`: both attention BMMs over
+`S_i^2`, halved under the causal mask, plus the dense `qkv_gate` and output projections over the `S_i` tokens, so a row's bf16, FP8
+and MXFP8 arms share one FLOP count -- beside a FLOP-scaled estimate of the dense block's time (`dense ms at B x S_max x
+FLOPs_varlen / FLOPs_dense`: the dense twin timed in the same process as the packed arm, not the uniform tables' 8K row, and the
+same FLOP model at `B x S_max`; it assumes time scales linearly with work -- an estimate, not a measured equal-work dense run), a
+dense torch run at `B x S_max` (which attends over the padding) and a
 per-sequence torch loop (exact FLOPs, one dense call per sequence); speed-ups are positive numbers, `base ms / new ms - 1`. The
 percentage of peak is against 8192 FLOP/clk/SM (bf16) x 212 SMs x the SM clock sampled during the cell; FP8 and MXFP8 against the
 K32 cap of 16384 FLOP/clk/SM (the part's K64 peak is 32768, twice that, so halve those percentages for it). Every packed arm is
