@@ -353,7 +353,8 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_declines_at_chec
     with _no_host_sync():
         blk = GatedAttentionBlockFwd(**kw, geometry=geom)
         assert isinstance(blk._sdpa, _SparseSdpa) and blk.qsa is geom.qsa
-        assert blk._stages[-1 - 2] is blk._sdpa or blk._sdpa in blk._stages  # in pipeline order, before the gate and the out projection
+        i = blk._stages.index(blk._sdpa)  # in pipeline order: the sparse stage, then the gate, then the out projection
+        assert blk._stages[i + 1 :] == (blk._gate, blk._out_proj)
         assert blk._sdpa.token_stride == geom.n_qkvg == 5760  # the slab's stride, like the dense stage would read it
         blk._check_declaration()  # the five-band W_qkvg [5760, 512] and every descriptor pass
         with pytest.raises(NotImplementedError, match="sparse attention core"):
