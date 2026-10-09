@@ -338,6 +338,53 @@ TEST_CASE("Cuda graph outlives the frontend graph", "[cudagraph][graph]") {
         CUDA_CHECK(cudaGraphDestroy(main_cuda_graph));
     }
 
+    SECTION("recorded directly and retained by a cloned graphExec") {
+        cudaGraph_t source;
+        CUDA_CHECK(cudaGraphCreate(&source, 0));
+        REQUIRE(graph->populate_cuda_graph_direct(handle, variant_pack, workspace.devPtr, source).is_good());
+        cudaGraph_t clone;
+        CUDA_CHECK(cudaGraphClone(&clone, source));
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaGraphInstantiate(&executable, clone, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphDestroy(source));
+        CUDA_CHECK(cudaGraphDestroy(clone));
+        graph.reset();
+
+        for (int replay = 0; replay < 3; ++replay) {
+            churn();
+            CUDA_CHECK(cudaGraphLaunch(executable, 0));
+            verify_output();
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+    }
+
+    SECTION("updated directly with an independent frontend plan") {
+        cudaGraph_t source;
+        CUDA_CHECK(cudaGraphCreate(&source, 0));
+        REQUIRE(graph->populate_cuda_graph_direct(handle, variant_pack, workspace.devPtr, source).is_good());
+        auto updater = create_graph(b, m, n, k, scale_value);
+        REQUIRE(build(updater));
+        Surface<half> updated_a(b * m * k, starter_value);
+        auto updated_pack   = variant_pack;
+        updated_pack[A_UID] = updated_a.devPtr;
+        REQUIRE(updater->update_cuda_graph_direct(handle, updated_pack, workspace.devPtr, source).is_good());
+        cudaGraph_t clone;
+        CUDA_CHECK(cudaGraphClone(&clone, source));
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaGraphInstantiate(&executable, clone, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphDestroy(source));
+        CUDA_CHECK(cudaGraphDestroy(clone));
+        graph.reset();
+        updater.reset();
+
+        for (int replay = 0; replay < 3; ++replay) {
+            churn();
+            CUDA_CHECK(cudaGraphLaunch(executable, 0));
+            verify_output();
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+    }
+
     SECTION("recorded with stream capture") {
         cudaStream_t stream;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
