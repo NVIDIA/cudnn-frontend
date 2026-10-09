@@ -856,6 +856,26 @@ ratios read the kernel-only CUPTI time):
   (`SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N`: 0 at TILE_N 128, 1 at TILE_N 64), read
   once by the kernel module from `CFG.TILE_N`; numerics are unchanged at every
   value, only the instruction stream around the `bmm1_done` wait moves.
+- The THIRD softmax warp group (`TemplateParams.softmax_wgs` 3: a 20-warp body
+  whose pair work item takes three rows of the chunk per step, the split 12 x 128
+  + 4 x 56 + 4 x 40 = the 20-warp entry pool) is the default of exactly ONE form
+  -- a bias TOGETHER WITH a kv_mask on the pair item at TILE_N 64, cga 1, dense KV
+  lengths, S_kv >= 640 and at most 3072 flattened batch rows
+  (`config_sm107.SM107_THREE_WG_S_KV_MIN` / `SM107_THREE_WG_B_FLAT_MAX`,
+  `sm107_softmax_wgs_pick`): +8.1 / +7.9 / +3.3 / +2.9 % over the pair's pick at
+  d32 S 640 / 768 / 896 / 1024 and +3.5 / +8.7 % at d64 S 768 / 1024 (the arm and
+  its base in one process, 100 x 3 replays, control twins <= 0.14 %); the applied
+  default confirmed knob-less +6.6 / +7.3 / +3.3 % at d32 S 640 / 768 / 1024 and
+  +5.4 / +10.7 % at d64 S 768 / 1024 at B 1, +7.2 / +7.4 % at d32 S 640 / 768 and
+  +0.8 % at d64 S 768 with four batch entries (2560 / 3072 rows), but -2.4 % at
+  d32 S 1024 with four (4096 rows) -- hence the row bound.  Inside the resolution
+  at S 384 / 512 (+0.5..+0.8 %, d64 S 512 -2.5 %), a LOSS on the bias alone at
+  TILE_N 64 (d64 -10..-17 %), and -2.5..-28.5 % at ANY chunk that is not a
+  multiple of three (the 3-WG body recomputes one or two DEAD rows per chunk:
+  `rows_per_step` in the chunk rule, 6 under the pair's cap of 8).  The P-publish
+  hand-off chain is not the binder (a no-chain variant +1.6 / -0.3 %).  Every
+  two-group rendering is byte-identical to its md5 record; O / Stats are BITWISE
+  the two-group kernel's (`test_sdpa_softmax_wgs_sm107.py`).
 
 The table those facts imply is CODE, in one place per axis, and the sweep's
 second half (S = 2048 at D 32 / 64 and B 1 / 4; cluster 1 vs 2 at D 64 S 128..2048;

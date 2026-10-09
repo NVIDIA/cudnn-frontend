@@ -315,6 +315,15 @@ class TemplateParams:
     # sm107_bias_max_form_default``: 1 on the kv_mask-only form, 0 with a bias).  A compile-time axis (the body folds on it), hence a
     # cache-key field; APPENDED.
     bias_max_form: int = 0
+    # The number of SOFTMAX WARP GROUPS of the Rubin f16/bf16 d128-file body = its Q sub-tiles per work item (``TILES_Q``): 2 = the
+    # classic 16-warp body (every existing record renders byte-identically); 3 = the 20-warp body of the (n, n+1) pair item at TILE_N 64
+    # (three rows of the chunk per step, the split 12 x 128 + 4 x 56 + 4 x 40 = the 20-warp entry pool at the 32-wide tile) -- the
+    # MEASURED default of ONE form, a bias together with a kv_mask on that item at cga1 with dense KV lengths from S_kv 640 up to 3072
+    # flattened batch rows (``config_sm107.sm107_softmax_wgs_pick``), selectable through the adapter's ``softmax_wgs=`` / the sweep seam
+    # on the rest of its serving set.  A compile-time axis (the warp table, the per-sub-tile ring depths and the TMEM map fold on it),
+    # hence a cache-key field -- the kernel-module cache is keyed by this record, so the 3-WG build is its own module; APPENDED.
+    # ``config_sm107._validate_softmax_wgs`` pins its serving set (TILE_N 64, the pair item, cga1, the f16/bf16 32- / 64-wide tiles).
+    softmax_wgs: int = 2
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

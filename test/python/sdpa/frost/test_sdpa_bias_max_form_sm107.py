@@ -74,7 +74,8 @@ def test_template_params_and_cfg_are_appended():
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     names = [f.name for f in dataclasses.fields(TemplateParams)]
-    assert names[-3:] == ["padded_tail_form", "dead_subtile_quiet", "bias_max_form"], names[-5:]  # appended after the two tail / quiet forms
+    # appended after the two tail / quiet forms; the third softmax warp group's count (softmax_wgs, test_sdpa_softmax_wgs_sm107.py) after it
+    assert names[-4:] == ["padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs"], names[-6:]
     assert TemplateParams().bias_max_form == 0
     assert c.BIAS_MAX_SOFTWARE == 0 and c.BIAS_MAX_HW_UPPER_BOUND == 1 and c.BIAS_MAX_FORMS == frozenset({0, 1})
     # the record field defaults to 0 whatever the arm: a record without the field renders the software tree byte-identically
@@ -154,7 +155,7 @@ def test_adapter_kwarg_is_appended_and_declines_typed():
     from cudnn.sdpa.fwd import api_dsl
 
     sig = inspect.signature(api_dsl.SdpaFwdDslSm100.__init__)
-    assert list(sig.parameters)[-1] == "bias_max_form" and sig.parameters["bias_max_form"].default is None
+    assert list(sig.parameters)[-2:] == ["bias_max_form", "softmax_wgs"] and sig.parameters["bias_max_form"].default is None
     assert "bias_max_form=self._resident_arm_bias_max_form()" in Path(api_dsl.__file__).read_text()
 
 

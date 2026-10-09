@@ -434,7 +434,7 @@ def test_template_params_and_capabilities_are_appended():
 
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-8:] == [
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-9:] == [
         "bias_mode",
         "kv_mask_form",
         "tile_n",
@@ -443,8 +443,13 @@ def test_template_params_and_capabilities_are_appended():
         "padded_tail_form",  # the padded PLAIN body's tail form (the small tiles' pre-masked tail)
         "dead_subtile_quiet",  # the one-batch-entry item's dead-sub-tile quiet body
         "bias_max_form",  # the row-max form of the bias / kv_mask body (test_sdpa_bias_max_form_sm107.py)
+        "softmax_wgs",  # the third softmax warp group of the TILE_N-64 pair item, default 2
     ]  # appended in that order
-    assert (p.padded_tail_form, p.dead_subtile_quiet) == (0, 0), "a record without the fields renders the legacy tail and the full body"
+    assert (p.padded_tail_form, p.dead_subtile_quiet, p.softmax_wgs) == (
+        0,
+        0,
+        2,
+    ), "a record without the fields renders the legacy tail, the full body and the two-group body"
     # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
     assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
 

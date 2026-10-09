@@ -148,7 +148,12 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     # second time (+37 ring, +8 idle: 34 / 13 -> 71 / 21; the pin was not moved with it and read stale until the streamed ring landed).
     # +2 RING waits since the STREAMED bias ring (mb_bias_ring_full in the softmax kv body, mb_bias_ring_empty in the TMA-LDG fill helper:
     # per-kv-tile sites, so they take the module constant; the two item-level mb_bias_full / mb_bias_empty waits stay idle).
-    ("f16", (128, 128)): (True, 75, 21),  # +2 ring waits: the dead-sub-tile QUIET body's mb_bmm1_done / mb_stat_empty (per kv tile, the live body's two sites)
+    # -14 RING sites when the third softmax warp group landed (TemplateParams.softmax_wgs): the five `_*_item_pair` roles spell their
+    # per-sub-tile ring protocol ONCE inside `range_constexpr(CFG.TILES_Q)` loops (one site per ring per role, two or three sub-tiles
+    # traced from it) where the pair had hand-unrolled sub-tile 0 and sub-tile 1 -- the rendering is byte-identical (the md5 records),
+    # the SOURCE count is not: 73 / 21 -> 59 / 21; +2 ring waits for the dead-sub-tile QUIET body's mb_bmm1_done / mb_stat_empty (per kv
+    # tile, the live body's two sites): 61 / 21.
+    ("f16", (128, 128)): (True, 61, 21),
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait

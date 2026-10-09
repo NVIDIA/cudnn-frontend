@@ -76,6 +76,11 @@ from cudnn.sdpa.fwd.config_sm100 import (
     d512_2x2_smem_bytes,
 )
 
+# The per-CTA register POOL a `setmaxnreg` split redistributes (the launch's entry count x the warps, NOT the 2048-register file): the
+# backward config's helper, the ONE arithmetic behind the d128-file predicate `SUM(role regs x warps) <= pool` (frost-kernels.md s2: a
+# split over the pool parks the last INCREASE warp forever -- a hang at 100 % SM utilization at every shape, no fault).
+from cudnn.sdpa.bwd.config_sm107 import reg_entry_pool as _reg_entry_pool
+
 __all__ = [
     "TemplateParams",
     "resolve_dtype_o",
@@ -109,6 +114,10 @@ __all__ = [
     "SM107_SMALL_D_CGAS",
     "SMALL_D_STAGES_KV",
     "SMALL_D_TILE_MS",
+    "SMALL_D_SOFTMAX_WGS",
+    "SM107_THREE_WG_S_KV_MIN",
+    "SM107_THREE_WG_B_FLAT_MAX",
+    "sm107_softmax_wgs_pick",
     "sm107_f16_tile_width",
     "sm107_small_tile_leg",
     "D128FamilyTmemLayout",
@@ -564,12 +573,13 @@ def sm107_bias_resident_tiles(
     return max(0, spare // tile_bytes)
 
 
-def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False) -> int:
+def sm107_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, tiles_q: int = 2) -> int:
     """The largest S_kv (in whole tiles) whose bias row-block the resident form serves at this width and cga: the work
     item's KV range is at most ceil(S_kv / tile_n) tiles.  0 = the width serves no bias.  ``pair``: the (n, n+1) item's
-    128-row block (``sm107_bias_pair_form``).  Read by the engine row's mismatch, the adapter's check_support and the config
-    factory (one arithmetic, rule 8b')."""
-    return sm107_bias_resident_tiles(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair) * tile_n
+    128-row block (``sm107_bias_pair_form``); ``tiles_q``: the body's Q sub-tiles = softmax warp groups (3 on the third-warp-group
+    arm: one more Q and O slab each, so fewer bias tiles fit).  Read by the engine row's mismatch, the adapter's check_support and
+    the config factory (one arithmetic, rule 8b')."""
+    return sm107_bias_resident_tiles(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair) * tile_n
 
 
 def sm107_bias_ring_stages(
@@ -691,6 +701,76 @@ def sm107_bias_max_form_pick(bias_mode: int, kv_mask_form: int, *, request: Opti
     return sm107_bias_max_form_default(bias_mode, kv_mask_form)
 
 
+# ``_SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS`` (the same rules) pins the number of softmax WARP GROUPS a knob-less BIAS plan on the small tiles
+# RECORDS (``TemplateParams.softmax_wgs``: 2 = the classic 16-warp body, 3 = the third softmax warp group of the TILE_N-64 pair item --
+# the plan's "third softmax warpgroup" experiment).  It feeds the RECORD through :func:`sm107_softmax_wgs_pick`, never a Cfg behind an
+# unchanged record: the kernel-module cache (``frost.template_loader``) is keyed by the TemplateParams, so a Cfg-only seam hands a second
+# in-process build the FIRST build's module (verified 2026-10-09).  None = 2.
+_SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+# The softmax warp-group counts the d128-file body is written for: 2 (every path) and 3 (the (n, n+1) pair item at TILE_N 64 -- the one
+# form whose roles loop over the sub-tiles; the one-batch-entry paths hand-unroll two).  The validator pins the serving set.
+SMALL_D_SOFTMAX_WGS = frozenset({2, 3})
+
+
+# The third softmax warp group is the DEFAULT of ONE form: a bias TOGETHER WITH a kv_mask on the (n, n+1) pair item at TILE_N 64 (the heuristics'
+# pick for that graph) at cga1, dense KV lengths, S_kv at or above this -- MEASURED (bf16 B 1 H 4, a 212-SM cc 10.7 node at the 2376 MHz lock,
+# the 3-WG arm interleaved with its 2-WG base in ONE process, 100 x 3 graph replays, control twins <= 0.14 %, speed-up = t(2 WGs) / t(3 WGs) - 1 at
+# EQUAL live row-computations -- the 3-WG body at its chunk 6 against the pair's pick n8, each body at its own chunk): D 32 S 640 / 768 / 896 /
+# 1024 +8.1 / +7.9 / +3.3 / +2.9 %, D 64 S 768 / 1024 +3.5 / +8.7 %; a confirm of the applied default on the knob-less path D 32 S 640 / 768 /
+# 1024 +6.6 / +7.3 / +3.3 %, D 64 S 768 / 1024 +5.4 / +10.7 %; and at S 512 only +0.8 % (D 32) / -2.5 % (D 64), S 384 +0.5 / +0.7 % (two
+# processes) -- inside the protocol's resolution or a loss, so the two-group body keeps those.  Every OTHER form loses or ties with three groups:
+# the bias alone at TILE_N 64 -1.0..-1.6 % at S 384 / 512 (D 32), -9.8..-17.2 % at D 64 (and its heuristics' pick is TILE_N 128 anyway), the
+# pair's own even chunk (n4 / n8) on the 3-WG body -2.5..-28.5 % (one or two DEAD rows recomputed per chunk).  The padded (per-batch KV
+# length) form is unmeasured on three groups and keeps two.  A chunk on the 3-WG body is a multiple of THREE (`rows_per_step`): 6 = the
+# largest multiple of 3 under the pair's cap of 8 (n9 within -0.5..+1.5 % of n6 from S 640, -2.9..-3.8 % at S 512: not a default).
+SM107_THREE_WG_S_KV_MIN = 640
+# ... and up to this many FLATTENED batch rows (the Q tensor's batch): the chunk 6 of the 3-WG body makes 4 / 3 the items of the pair's n8,
+# and at 4096 rows (D 32 S 1024, B 4) the per-item cost outran the body's gain (-2.4 % where B 1 at the same S won +3.3 %); 2560 / 3072 rows
+# (B 4 at S 640 / 768) kept +7.2 / +7.4 % at D 32 and +0.8 % at D 64 S 768, so the bound is the largest measured winning flattened batch.
+# A caller that does not know the flattened batch gets two groups.
+SM107_THREE_WG_B_FLAT_MAX = 3072
+
+
+def sm107_softmax_wgs_pick(
+    request=None,
+    *,
+    d_flavor: Optional[int] = None,
+    s_kv: Optional[int] = None,
+    tile_n: int = 128,
+    pair: bool = False,
+    has_bias: bool = False,
+    has_kv_mask: bool = False,
+    padded: bool = False,
+    cga: int = 1,
+    b_flat: Optional[int] = None,
+) -> int:
+    """The ``TemplateParams.softmax_wgs`` a plan records: the adapter's ``softmax_wgs=`` request, else the sweep seam
+    ``_SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS``, else the MEASURED rule above -- 3 for a bias + kv_mask graph on the (n, n+1) pair item at TILE_N 64 /
+    cga 1 with dense KV lengths, ``s_kv >= SM107_THREE_WG_S_KV_MIN`` and at most ``SM107_THREE_WG_B_FLAT_MAX`` flattened batch rows (the 32- /
+    64-wide tiles), 2 everywhere else (a caller that does not know the flattened batch gets 2).  Validity of a REQUEST --
+    TILE_N 64, the pair item, cga1, the f16/bf16 32- / 64-wide tiles -- is :func:`_validate_softmax_wgs`'s, declined typed by the adapter's
+    ``check_support`` before the factory is reached.  ONE arithmetic for the engine row's budget, the adapter and the sweep (rule 8b')."""
+    if request is not None:
+        return int(request)
+    if _SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS is not None:
+        return int(_SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS)
+    if (
+        pair
+        and int(cga) == 1
+        and int(tile_n) == 64
+        and has_bias
+        and has_kv_mask
+        and not padded
+        and d_flavor in (32, 64)
+        and s_kv is not None
+        and int(s_kv) >= SM107_THREE_WG_S_KV_MIN
+        and b_flat is not None
+        and int(b_flat) <= SM107_THREE_WG_B_FLAT_MAX
+    ):
+        return 3
+    return 2
+
+
 # The ONE-BATCH-ENTRY item at the 32-wide tile's cga1 STREAMS its bias wherever its ring fits, resident budget or not: the 256-row
 # item's block fill is exposed per item (nothing amortises it) and the ring overlaps the tile loads with the kv loop -- MEASURED
 # (bf16, a 212-SM cc 10.7 node at the 2376 MHz lock, 100 x 3 graph-replay rounds, a control twin per process, the kernel-only CUPTI
@@ -702,7 +782,9 @@ def sm107_bias_max_form_pick(bias_mode: int, kv_mask_form: int, *, request: Opti
 SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS = frozenset({32})
 
 
-def sm107_bias_mode_pick(d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request=None) -> int:
+def sm107_bias_mode_pick(
+    d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request=None, tiles_q: int = 2
+) -> int:
     """The ``TemplateParams.bias_mode`` a BIAS plan gets at this width: ``BIAS_MODE_RESIDENT`` when the resident block holds
     ``s_kv`` (:func:`sm107_bias_resident_s_kv_max`) -- except the one-batch-entry item at a width in
     :data:`SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS` (cga1), which takes ``BIAS_MODE_STREAMED`` whenever its ring fits (the measured
@@ -711,8 +793,8 @@ def sm107_bias_mode_pick(d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: i
     form does not fit here -- honoured or declined, never degraded.  ONE arithmetic for the engine row, the heuristics' width pick and
     the adapter (rule 8b')."""
     want = request if request is not None else _BIAS_MODE_OVERRIDE_FOR_SWEEPS
-    resident_ok = s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair)
-    ring_ok = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair) > 0
+    resident_ok = s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair, tiles_q=tiles_q)
+    ring_ok = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair) > 0
     if want is not None:
         want = int(want)
         if want == BIAS_MODE_RESIDENT:
@@ -734,19 +816,23 @@ def sm107_bias_mode_pick(d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: i
 SM107_ONE_BATCH_ENTRY_RING_STAGES = 2
 
 
-def sm107_bias_stages_pick(d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request: int = 0) -> int:
+def sm107_bias_stages_pick(
+    d_flavor: int, cta_mma: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request: int = 0, tiles_q: int = 2
+) -> int:
     """The ``STAGES_BIAS`` of a STREAMED plan: the request (``TemplateParams.bias_stages`` / the adapter's ``bias_stages=`` /
     the test seam) when it is in ``BIAS_RING_STAGES`` and fits, else the derived deepest ring for the PAIR item and
     ``min(deepest, SM107_ONE_BATCH_ENTRY_RING_STAGES)`` for the one-batch-entry item; 0 = no ring fits (the factory raises, the row /
     adapter decline).  A request that does not fit is 0 too (declined typed, never degraded)."""
-    deepest = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair)
+    deepest = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair)
     want = int(request) if request else (_BIAS_STAGES_OVERRIDE_FOR_SWEEPS or 0)
     if want:
         return want if (want in BIAS_RING_STAGES and want <= deepest) else 0
     return deepest if pair else min(deepest, SM107_ONE_BATCH_ENTRY_RING_STAGES)
 
 
-def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False) -> Optional[int]:
+def sm107_bias_auto_cga(
+    d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, tiles_q: int = 2
+) -> Optional[int]:
     """The NARROWEST cga in ``cgas`` whose resident block holds ``s_kv`` (``sm107_bias_resident_s_kv_max``), or ``None``
     when no width does.  The heuristics' auto pick for a BIAS graph (a kv_mask alone stages no block and keeps the flavor's
     own width rule), the width the standalone adapter lowers
@@ -757,30 +843,31 @@ def sm107_bias_auto_cga(d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = _DTY
     narrowest width whose ring fits (:func:`sm107_bias_mode_pick` != 0) -- a per-batch bias at the 64-wide tile above S_kv 256
     lands on cga2 streamed, the pair item stays cga1.  ``None`` when neither form fits anywhere."""
     for cga in sorted(cgas):
-        if sm107_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1) == BIAS_MODE_RESIDENT:
+        if sm107_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1, tiles_q=tiles_q) == BIAS_MODE_RESIDENT:
             return cga
     for cga in sorted(cgas):
-        if sm107_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1) != BIAS_MODE_NONE:
+        if sm107_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1, tiles_q=tiles_q) != BIAS_MODE_NONE:
             return cga
     return None
 
 
-def sm107_n_chunk_rule(b_flat: int, h_q: int, s_q: int, sm_count: int, *, tile_m: int = 128, waves: int = 3) -> int:
+def sm107_n_chunk_rule(b_flat: int, h_q: int, s_q: int, sm_count: int, *, tile_m: int = 128, waves: int = 3, rows_per_step: int = 2) -> int:
     """The default chunk length of the (n, n+1) PAIR item: the largest power of two ``<= h_q * ceil(s_q / tile_m) * b_flat /
     (waves * sm_count)`` (the ">= 3 waves" reading of the plan's parallelism-vs-amortisation trade), clamped to
-    ``[2, b_flat]`` and EVEN (an odd chunk runs a dead sub-tile on its last step).  ``sm_count`` 0 / None = 148.  Returns 0
-    (the one-batch-entry item) when ``b_flat < 2``."""
+    ``[rows_per_step, b_flat]`` and a MULTIPLE OF ``rows_per_step`` -- EVEN on the pair (2 rows per step: an odd chunk runs a dead
+    sub-tile on its last step), a multiple of three with the third softmax warp group (``softmax_wgs`` 3: a chunk that is not one ends in
+    one or two DEAD rows the body recomputes).  ``sm_count`` 0 / None = 148.  Returns 0 (the one-batch-entry item) when ``b_flat < 2``."""
     if b_flat < 2:
         return 0
+    rps = max(1, int(rows_per_step))
     sms = int(sm_count) if sm_count else 148
     items = h_q * (-(-s_q // tile_m)) * b_flat
     n = 1
     while n * 2 <= items // (waves * sms):
         n *= 2
-    n = max(2, min(n, b_flat))
-    if n % 2:
-        n -= 1
-    return max(2, n)
+    n = max(rps, min(n, b_flat))
+    n -= n % rps
+    return max(rps, n)
 
 
 # A PRIVATE, process-local TEST seam (None = the rule above; an int pins :func:`sm107_n_chunk_pick`'s result, 0 = the
@@ -806,21 +893,22 @@ SM107_PAIR_N_CHUNK_MAX = 8
 SM107_ONE_TILE_N_CHUNK_FLOOR, SM107_ONE_TILE_FLOOR_MAX_WAVES = 4, 2
 
 
-def sm107_n_chunk_refine(n: int, b_flat: int, h_q: int, s_q: int, sm_count: int, *, s_kv: int, tile_m: int = 128) -> int:
+def sm107_n_chunk_refine(n: int, b_flat: int, h_q: int, s_q: int, sm_count: int, *, s_kv: int, tile_m: int = 128, rows_per_step: int = 2) -> int:
     """The knob sweep's corrections to :func:`sm107_n_chunk_rule`'s 3-wave pick for the (n, n+1) pair item (the constants above
     carry the numbers): the pick is capped at :data:`SM107_PAIR_N_CHUNK_MAX`; at one 128-wide kv tile
     (``s_kv <= SM107_SMALL_TILE_N_DEFAULT``) it is floored at :data:`SM107_ONE_TILE_N_CHUNK_FLOOR` while the 2-row items fill at most
-    :data:`SM107_ONE_TILE_FLOOR_MAX_WAVES` waves.  The result stays even and inside ``[2, b_flat]`` (:func:`sm107_n_chunk_rule`'s
-    clamp)."""
+    :data:`SM107_ONE_TILE_FLOOR_MAX_WAVES` waves.  The result stays a multiple of ``rows_per_step`` (even on the pair) inside
+    ``[rows_per_step, b_flat]`` (:func:`sm107_n_chunk_rule`'s clamp); with the third softmax warp group (``rows_per_step`` 3) the cap and the
+    floor are rounded DOWN to multiples of three (8 -> 6: n9 measured -2.7..-3.6 % against n6; 4 -> 3)."""
+    rps = max(1, int(rows_per_step))
     sms = int(sm_count) if sm_count else 148
-    n = min(n, SM107_PAIR_N_CHUNK_MAX)
+    n = min(n, max(rps, SM107_PAIR_N_CHUNK_MAX - SM107_PAIR_N_CHUNK_MAX % rps))
     items_at_2 = h_q * (-(-s_q // tile_m)) * (-(-b_flat // 2))
     if s_kv <= SM107_SMALL_TILE_N_DEFAULT and items_at_2 <= SM107_ONE_TILE_FLOOR_MAX_WAVES * sms:
-        n = max(n, SM107_ONE_TILE_N_CHUNK_FLOOR)
-    n = max(2, min(n, b_flat))
-    if n % 2:
-        n -= 1
-    return max(2, n)
+        n = max(n, max(rps, SM107_ONE_TILE_N_CHUNK_FLOOR - SM107_ONE_TILE_N_CHUNK_FLOOR % rps))
+    n = max(rps, min(n, b_flat))
+    n -= n % rps
+    return max(rps, n)
 
 
 def sm107_n_chunk_pick(
@@ -834,6 +922,7 @@ def sm107_n_chunk_pick(
     s_kv: Optional[int] = None,
     d_flavor: Optional[int] = None,
     tile_n: int = 128,
+    rows_per_step: int = 2,
 ) -> int:
     """The ``TemplateParams.n_chunk`` a knob-less BIAS plan gets: 0 unless :func:`sm107_bias_pair_form` holds, else the
     test seam ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` (0 = the one-batch-entry item, for its A/B arm) or :func:`sm107_n_chunk_rule` refined by
@@ -865,10 +954,10 @@ def sm107_n_chunk_pick(
         # streams there.
         if sm107_bias_mode_pick(d_flavor, cta_mma, s_kv, pair=False) != BIAS_MODE_NONE:
             return 0
-    n = sm107_n_chunk_rule(b_flat, h_q, s_q, sm_count)
+    n = sm107_n_chunk_rule(b_flat, h_q, s_q, sm_count, rows_per_step=rows_per_step)
     if s_kv is None:
         return n
-    return sm107_n_chunk_refine(n, b_flat, h_q, s_q, sm_count, s_kv=s_kv)
+    return sm107_n_chunk_refine(n, b_flat, h_q, s_q, sm_count, s_kv=s_kv, rows_per_step=rows_per_step)
 
 
 def sm107_pair_item_active(
@@ -1744,6 +1833,33 @@ def _validate_masks(cfg, flavor: str) -> None:
 
 _D128_TOTAL_WARPS = 16
 _D128_READ_TILE_ARRIVERS = 15
+# The d128-file warp table as a function of the softmax WARP-GROUP count (2 = the 16-warp body above; 3 = the 20-warp body of the
+# TILE_N-64 pair arm, TemplateParams.softmax_wgs): 4 warps per softmax group, 4 correction warps, then the MMA / TMA-LDG / TMA-STG /
+# scheduler warps -- the kernel's role dispatch reads the Cfg ids and derives WG2's first warp as SOFTMAX_WG0_BASE + 2 x SOFTMAX_WG_WARPS.
+_D128_SOFTMAX_WG_WARPS = 4
+_D128_CORRECTION_WARPS = 4
+_D128_OTHER_WARPS = 4
+
+
+def _d128_total_warps(softmax_wgs: int) -> int:
+    return softmax_wgs * _D128_SOFTMAX_WG_WARPS + _D128_CORRECTION_WARPS + _D128_OTHER_WARPS
+
+
+def _d128_read_tile_arrivers(softmax_wgs: int) -> int:
+    """The per-CTA ``read_tile_id_arrive`` callers of the d128-file body: every softmax warp, every correction warp, the MMA, the TMA-LDG
+    and the TMA-STG warp (the kernel's READ_TILE_ARRIVERS_TOTAL at CGA_SIZE 1: ``(WGS x 4 + 4 + 1 + 1) x CGA_SIZE + CGA_M / CTA_MMA``, the
+    last term the STG warp): 15 at two groups, 19 at three.  A count the body cannot reach is a hang at EVERY shape (the module docstring's
+    d256 story)."""
+    return softmax_wgs * _D128_SOFTMAX_WG_WARPS + _D128_CORRECTION_WARPS + 1 + 1 + 1
+
+
+# The per-role register split (SOFTMAX_REGS, CORRECTION_REGS) of the d128-file body by (softmax warp groups, head-dim tile); the four
+# 40-register roles are fixed.  SUM(role regs x warps) EQUALS the launch's entry pool (reg_entry_pool: 128 x 16 = 2048; 96 x 20 = 1920),
+# as every CUTLASS warp-specialized split does: 8 x 192 + 4 x 88 + 4 x 40 = 2048; 12 x 128 + 4 x 56 + 4 x 40 = 1920 at the 32-wide tile
+# (the correction holds a 32-column O row); 12 x 120 + 4 x 80 + 4 x 40 = 1920 at the 64-wide one (a 64-column O row needs 80 -- 56 spills
+# -- so the softmax gives up 8).  The 128-register softmax of the 3-WG arm holds ONE 64-column chunk: reg_S 64 + the packed P chunk 32 +
+# the loop state, no bias pre-load (the kernel derives _BIAS_PRELOAD_EFF 0 there).  frost-kernels.md s2.
+_D128_REG_SPLIT = {2: (192, 88), (3, 32): (128, 56), (3, 64): (120, 80)}
 
 
 def _stages_kv_d128(dtype_qkv: int, cta_mma: int, *, mxfp8: bool, tile_k: int) -> int:
@@ -1933,8 +2049,9 @@ def _validate_bias(cfg, flavor: str) -> None:
                 f"and rows n / n + 1 are DIFFERENT batch entries with different K / V",
             ),
             (
-                cfg.N_CHUNK == 0 or cfg.TILES_Q == 2,
-                f"{flavor}: the pair item is the two-sub-tile pipeline (TILES_Q={cfg.TILES_Q}): sub-tile qs is row n + qs of the chunk",
+                cfg.N_CHUNK == 0 or cfg.TILES_Q == cfg.SOFTMAX_WARPGROUPS,
+                f"{flavor}: the pair item runs one softmax warp group per sub-tile (TILES_Q={cfg.TILES_Q}, SOFTMAX_WARPGROUPS={cfg.SOFTMAX_WARPGROUPS}): "
+                f"sub-tile qs is row n + qs of the chunk",
             ),
             (
                 cfg.N_CHUNK == 0 or not cfg.BOTTOM_RIGHT,
@@ -1968,6 +2085,72 @@ def _validate_bias(cfg, flavor: str) -> None:
     else:
         preds += [(cfg.STAGES_BIAS == 0 and cfg.BIAS_RESIDENT_TILES == 0, f"{flavor}: bias geometry fields must be 0 without BIAS_MODE")]
     _check(preds)
+
+
+def _validate_softmax_wgs(cfg, flavor: str) -> None:
+    """The softmax warp-group count and everything the d128-file body couples to it (frost-kernels.md s2 / s4, sdpa-invariants s6): one
+    group per Q sub-tile, the warp table, the scheduler credit count, the register split against the launch's entry pool, and the
+    serving set of the third group (the (n, n+1) pair item at TILE_N 64 on the f16/bf16 32- / 64-wide tiles at cga1 -- the one form whose
+    roles loop over the sub-tiles; the one-batch-entry paths hand-unroll two).  Each predicate names the failure it prevents."""
+    wgs = cfg.SOFTMAX_WARPGROUPS
+    split_sum = wgs * cfg.SOFTMAX_WG_WARPS * cfg.SOFTMAX_REGS + cfg.CORRECTION_WARPS * cfg.CORRECTION_REGS + _D128_OTHER_WARPS * cfg.OTHER_REGS
+    pool = _reg_entry_pool(cfg.TOTAL_WARPS)
+    _check(
+        [
+            (wgs in SMALL_D_SOFTMAX_WGS, f"{flavor}: SOFTMAX_WARPGROUPS must be one of {sorted(SMALL_D_SOFTMAX_WGS)} (got {wgs})"),
+            (
+                cfg.TILES_Q == wgs,
+                f"{flavor}: one softmax warp group per Q sub-tile (TILES_Q={cfg.TILES_Q}, SOFTMAX_WARPGROUPS={wgs}): the body indexes its S / P / O "
+                f"slots, its per-sub-tile rings and its warp-group bases by the same index",
+            ),
+            (
+                cfg.SOFTMAX_WG_WARPS == _D128_SOFTMAX_WG_WARPS and cfg.CORRECTION_WARPS == _D128_CORRECTION_WARPS and cfg.OTHER_WARPS == _D128_OTHER_WARPS,
+                f"{flavor}: the d128-file body is 4 warps per softmax group, 4 correction warps and 4 single-warp roles",
+            ),
+            (
+                cfg.TOTAL_WARPS == _d128_total_warps(wgs) and cfg.THREADS_PER_CTA == cfg.TOTAL_WARPS * 32,
+                f"{flavor}: {wgs} softmax warp groups are a {_d128_total_warps(wgs)}-warp body (got TOTAL_WARPS={cfg.TOTAL_WARPS}, THREADS_PER_CTA={cfg.THREADS_PER_CTA})",
+            ),
+            (
+                cfg.SOFTMAX_WG1_BASE == cfg.SOFTMAX_WG0_BASE + cfg.SOFTMAX_WG_WARPS
+                and cfg.CORR_WARP_BASE == cfg.SOFTMAX_WG0_BASE + wgs * cfg.SOFTMAX_WG_WARPS
+                and cfg.MMA_WARP_ID == cfg.CORR_WARP_BASE + cfg.CORRECTION_WARPS
+                and (cfg.TMALDG_WARP_ID, cfg.TMASTG_WARP_ID, cfg.SCHED_WARP_ID) == (cfg.MMA_WARP_ID + 1, cfg.MMA_WARP_ID + 2, cfg.MMA_WARP_ID + 3)
+                and cfg.SCHED_WARP_ID == cfg.TOTAL_WARPS - 1,
+                f"{flavor}: the role table must be contiguous softmax groups (WG0 at {cfg.SOFTMAX_WG0_BASE}, 4 warps each; the kernel derives WG2's first "
+                f"warp as WG0 + 8), then correction, MMA, TMA-LDG, TMA-STG, scheduler (got WG1 {cfg.SOFTMAX_WG1_BASE}, corr {cfg.CORR_WARP_BASE}, MMA "
+                f"{cfg.MMA_WARP_ID}, LDG {cfg.TMALDG_WARP_ID}, STG {cfg.TMASTG_WARP_ID}, sched {cfg.SCHED_WARP_ID} of {cfg.TOTAL_WARPS}) -- a wrong id "
+                f"puts a warp into another role's body",
+            ),
+            (
+                cfg.READ_TILE_ARRIVERS == _d128_read_tile_arrivers(wgs),
+                f"{flavor}: READ_TILE_ARRIVERS must be {_d128_read_tile_arrivers(wgs)} for {wgs} softmax warp groups (got {cfg.READ_TILE_ARRIVERS}); "
+                f"an unreachable scheduler mbarrier count is a hang at EVERY shape",
+            ),
+            (
+                split_sum <= pool,
+                f"{flavor}: the per-role register split {wgs} x {cfg.SOFTMAX_WG_WARPS} x {cfg.SOFTMAX_REGS} + {cfg.CORRECTION_WARPS} x {cfg.CORRECTION_REGS} + "
+                f"{_D128_OTHER_WARPS} x {cfg.OTHER_REGS} = {split_sum} exceeds the {cfg.TOTAL_WARPS}-warp launch's entry pool {pool}: setmaxnreg.inc can "
+                f"only draw what the .dec warps released, so the last INCREASE warp parks forever -- a HANG at 100 % SM utilization at every shape",
+            ),
+            (
+                wgs == 2
+                or (
+                    cfg.N_CHUNK > 0
+                    and cfg.TILE_N == 64
+                    and cfg.CTA_MMA == 1
+                    and cfg.TILE_K <= 64
+                    and cfg.DTYPE_QKV in (_DTYPE_BF16, _DTYPE_FP16)
+                    and cfg.BIAS_MODE != BIAS_MODE_NONE
+                    and cfg.TILE_M == 128
+                ),
+                f"{flavor}: the third softmax warp group serves the (n, n+1) pair item (N_CHUNK > 0) of the bias arm at TILE_N 64 on the f16/bf16 32- / "
+                f"64-wide tiles at cga1 and the 128-row Q tile only (got N_CHUNK={cfg.N_CHUNK}, TILE_N={cfg.TILE_N}, CTA_MMA={cfg.CTA_MMA}, TILE_K={cfg.TILE_K}, TILE_M={cfg.TILE_M}, "
+                f"DTYPE_QKV={cfg.DTYPE_QKV}, BIAS_MODE={cfg.BIAS_MODE}): the one-batch-entry paths hand-unroll two sub-tiles and the 128-register "
+                f"softmax holds one 64-column chunk",
+            ),
+        ]
+    )
 
 
 def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, tile_o: int, mxfp8: bool):
@@ -2035,20 +2218,41 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
                 f"{flavor}: bias_max_form=1 (the hardware upper-bound row max) is served with the bit-word kv_mask or none; the additive kv_mask vector "
                 f"(kv_mask_form={kv_mask_form}) has no per-tile max to bound -- keep bias_max_form=0 with it"
             )
+    # The softmax warp-group count (TemplateParams.softmax_wgs, appended; read through getattr so a record without the field renders the
+    # classic two-group body): 3 = the third softmax warp group of the TILE_N-64 pair item -- the backstops below mirror
+    # _validate_softmax_wgs (the adapter's check_support declines typed first); the warp table, the split and the arriver counts derive
+    # from it so no two of them can disagree.
+    softmax_wgs = int(getattr(params, "softmax_wgs", 2))
+    if softmax_wgs not in SMALL_D_SOFTMAX_WGS:
+        raise ValueError(f"{flavor}: softmax_wgs must be one of {sorted(SMALL_D_SOFTMAX_WGS)}; got {softmax_wgs}")
+    if softmax_wgs == 3:
+        if params.dtype_qkv <= _DTYPE_E5M2 or mxfp8 or tile_k > 64:
+            raise ValueError(f"{flavor}: softmax_wgs=3 (the third softmax warp group) is wired on the f16/bf16 32- / 64-wide tiles only")
+        if tile_n != 64 or not pair or cta_mma != 1 or tile_m != 128:
+            raise ValueError(
+                f"{flavor}: softmax_wgs=3 serves the (n, n+1) pair item at TILE_N 64, cga1 and the 128-row Q tile only (got tile_n={tile_n}, n_chunk={n_chunk}, cta_mma={cta_mma}, tile_m={tile_m}): "
+                f"its 128-register softmax holds one 64-column chunk and the one-batch-entry paths hand-unroll two sub-tiles"
+            )
+    softmax_regs, correction_regs = _D128_REG_SPLIT[2 if softmax_wgs == 2 else (softmax_wgs, tile_k)]
+    total_warps = _d128_total_warps(softmax_wgs)
+    corr_warp_base = softmax_wgs * _D128_SOFTMAX_WG_WARPS
+    mma_warp_id = corr_warp_base + _D128_CORRECTION_WARPS
     bias_tiles = 0
     stages_bias = 0
     if bias_mode == BIAS_MODE_RESIDENT:
-        bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, tile_m=tile_m, pair=pair)
+        bias_tiles = sm107_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, tile_m=tile_m, tiles_q=softmax_wgs, pair=pair)
         if bias_tiles == 0:
             raise ValueError(
                 f"{flavor}: no resident bias block fits beside the Q / O slabs and the {stages_kv}-deep K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} "
                 f"({SMEM_USABLE_BYTES // 1024} KiB usable); the bias is served on the widths of SM107_BIAS_D_SHAPES={sorted(SM107_BIAS_D_SHAPES)}"
             )
     elif bias_mode == BIAS_MODE_STREAMED:
-        stages_bias = sm107_bias_stages_pick(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair, request=bias_stages_req)
+        stages_bias = sm107_bias_stages_pick(
+            tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair, request=bias_stages_req, tiles_q=softmax_wgs
+        )
         if stages_bias == 0:
             raise ValueError(
-                f"{flavor}: no {sorted(BIAS_RING_STAGES)}-stage streamed bias ring of {sm107_bias_block_rows(2, tile_m, pair=pair)} x {tile_n} tiles "
+                f"{flavor}: no {sorted(BIAS_RING_STAGES)}-stage streamed bias ring of {sm107_bias_block_rows(softmax_wgs, tile_m, pair=pair)} x {tile_n} tiles "
                 f"{'(requested bias_stages=' + str(bias_stages_req) + ') ' if bias_stages_req else ''}fits beside the Q / O slabs and the {stages_kv}-deep "
                 f"K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} ({SMEM_USABLE_BYTES // 1024} KiB usable)"
             )
@@ -2113,13 +2317,13 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         O_PACK_DIV=o_div,
         TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
         TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
-        TILES_Q=2,
+        TILES_Q=softmax_wgs,
         SCHEDULER_STAGES=2,
         STAGES_KV=stages_kv,
-        SOFTMAX_WARPGROUPS=2,
-        CORRECTION_WARPS=4,
-        SOFTMAX_REGS=192,
-        CORRECTION_REGS=88,
+        SOFTMAX_WARPGROUPS=softmax_wgs,
+        CORRECTION_WARPS=_D128_CORRECTION_WARPS,
+        SOFTMAX_REGS=softmax_regs,
+        CORRECTION_REGS=correction_regs,
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         MASK_FLAGS=mask_flags,
         PADDED_TAIL_FORM=padded_tail_form,
@@ -2138,22 +2342,24 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         SCHEDULER_POLICY=params.sched_policy if params.sched_policy is not None else SCHED_NATURAL,
         N_BMM2_CHUNKS=tile_n // 64,
         BMM2_CHUNK_SIZE=64,
-        TOTAL_WARPS=_D128_TOTAL_WARPS,
-        THREADS_PER_CTA=_D128_TOTAL_WARPS * 32,
+        TOTAL_WARPS=total_warps,
+        THREADS_PER_CTA=total_warps * 32,
+        SOFTMAX_WG_WARPS=_D128_SOFTMAX_WG_WARPS,
+        OTHER_WARPS=_D128_OTHER_WARPS,
         SOFTMAX_WG0_BASE=0,
-        SOFTMAX_WG1_BASE=4,
-        CORR_WARP_BASE=8,
-        MMA_WARP_ID=12,
-        TMALDG_WARP_ID=13,
-        TMASTG_WARP_ID=14,
-        SCHED_WARP_ID=15,
-        READ_TILE_ARRIVERS=_D128_READ_TILE_ARRIVERS,
+        SOFTMAX_WG1_BASE=_D128_SOFTMAX_WG_WARPS,
+        CORR_WARP_BASE=corr_warp_base,
+        MMA_WARP_ID=mma_warp_id,
+        TMALDG_WARP_ID=mma_warp_id + 1,
+        TMASTG_WARP_ID=mma_warp_id + 2,
+        SCHED_WARP_ID=mma_warp_id + 3,
+        READ_TILE_ARRIVERS=_d128_read_tile_arrivers(softmax_wgs),
         BIAS_MODE=bias_mode,
         BIAS_RESIDENT_TILES=bias_tiles,
-        BIAS_BLOCK_ROWS=sm107_bias_block_rows(2, tile_m, pair=pair) if bias_mode else 0,
+        BIAS_BLOCK_ROWS=sm107_bias_block_rows(softmax_wgs, tile_m, pair=pair) if bias_mode else 0,
         BIAS_SWZ_BYTES=BIAS_SWZ_BYTES,
         BIAS_BOXES_PER_TILE=(tile_n * b) // BIAS_SWZ_BYTES if bias_mode else 0,
-        BIAS_EMPTY_ARRIVERS=2 * 4 if (bias_mode or kv_mask_form) else 0,
+        BIAS_EMPTY_ARRIVERS=softmax_wgs * _D128_SOFTMAX_WG_WARPS if (bias_mode or kv_mask_form) else 0,
         KV_MASK_FORM=kv_mask_form,
         N_CHUNK=n_chunk,
         STAGES_BIAS=stages_bias,
@@ -2161,7 +2367,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     )
 
     _validate_regs(cfg, flavor)
-    _validate_warp_layout(cfg, flavor, expect_total=_D128_TOTAL_WARPS, expect_arrivers=_D128_READ_TILE_ARRIVERS)
+    _validate_warp_layout(cfg, flavor, expect_total=_d128_total_warps(softmax_wgs), expect_arrivers=_d128_read_tile_arrivers(softmax_wgs))
+    _validate_softmax_wgs(cfg, flavor)
     _validate_dtype_k_step(cfg, flavor)
     _validate_swizzles(cfg, flavor)
     _validate_head_dim_tile(cfg, flavor)

@@ -329,9 +329,23 @@ def test_table_cell_is_the_heuristics_primary_plan(cell, want, best, margin, met
     has_bias = form in ("bias", "both")
     got_n = c.sm107_n_chunk_pick(1, b * s, _H, s, _SMS, cga, s_kv=s, d_flavor=d, tile_n=tile_n) if has_bias else 0
     pair = has_bias and got_n > 0
-    got_mode = c.sm107_bias_mode_pick(d, cga, s, pair=pair) if has_bias else 0
-    got_stages = c.sm107_bias_stages_pick(d, cga, pair=pair) if got_mode == c.BIAS_MODE_STREAMED else 0
-    assert (got_n, got_mode, got_stages) == (n_chunk, bias_mode, bias_stages), (cell, (got_n, got_mode, got_stages), best)
+    # the softmax warp-group count (the third group is the MEASURED default of the bias + kv_mask pair form at TILE_N 64 from S_kv 640, dense
+    # KV lengths): the table's n_chunk is the PAIR's pick; the 3-WG body runs the chunk 6 (its multiple of three under the pair's cap)
+    got_wgs = c.sm107_softmax_wgs_pick(
+        d_flavor=d, s_kv=s, tile_n=tile_n, pair=pair, has_bias=has_bias, has_kv_mask=form in ("mask", "both"), padded=padded, cga=cga, b_flat=b * s
+    )
+    # ... and at most SM107_THREE_WG_B_FLAT_MAX flattened batch rows (the S 1024 B 4 cell -- 4096 rows -- lost 2.4 % where B 1 won 3.3 %)
+    assert (got_wgs == 3) == (
+        form == "both" and not padded and tile_n == 64 and pair and s >= c.SM107_THREE_WG_S_KV_MIN and b * s <= c.SM107_THREE_WG_B_FLAT_MAX
+    ), (cell, got_wgs)
+    if got_wgs == 3:
+        assert c.sm107_n_chunk_pick(1, b * s, _H, s, _SMS, cga, s_kv=s, d_flavor=d, tile_n=tile_n, rows_per_step=3) == 6, cell
+    got_mode = c.sm107_bias_mode_pick(d, cga, s, pair=pair, tiles_q=got_wgs) if has_bias else 0
+    got_stages = c.sm107_bias_stages_pick(d, cga, pair=pair, tiles_q=got_wgs) if got_mode == c.BIAS_MODE_STREAMED else 0
+    # the table's bias_stages is the PAIR's; the 3-WG body's third Q / O slab leaves the 64-wide tile's streamed ring TWO stages (its +3.5 %
+    # at S 768 was measured on that 2-stage ring against the pair's 3-stage one), the 32-wide tile's three
+    want_stages = bias_stages if got_wgs == 2 else ({32: 3, 64: 2}[d] if bias_mode == c.BIAS_MODE_STREAMED else 0)
+    assert (got_n, got_mode, got_stages) == (n_chunk, bias_mode, want_stages), (cell, (got_n, got_mode, got_stages), best)
 
 
 @pytest.mark.parametrize("cell, want, best, margin, metric", _TABLE, ids=_IDS)

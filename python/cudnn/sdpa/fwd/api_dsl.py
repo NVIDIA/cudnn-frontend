@@ -74,6 +74,8 @@ from cudnn.sdpa.fwd.config_sm107 import sm107_dead_subtile_quiet_pick as _sm107_
 from cudnn.sdpa.fwd.config_sm107 import _tile_m_d128 as _sm107_tile_m_d128
 from cudnn.sdpa.fwd.config_sm107 import BIAS_MAX_HW_UPPER_BOUND as _BIAS_MAX_HW_UPPER_BOUND, BIAS_MAX_FORMS as _BIAS_MAX_FORMS
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_max_form_pick as _sm107_bias_max_form_pick
+from cudnn.sdpa.fwd.config_sm107 import sm107_softmax_wgs_pick as _sm107_softmax_wgs_pick
+from cudnn.sdpa.fwd.config_sm107 import SMALL_D_SOFTMAX_WGS as _SMALL_D_SOFTMAX_WGS
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
@@ -699,6 +701,7 @@ class SdpaFwdDsl(APIBase):
         padded_tail_form: Optional[int] = None,
         dead_subtile_quiet: Optional[int] = None,
         bias_max_form: Optional[int] = None,
+        softmax_wgs: Optional[int] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -729,6 +732,10 @@ class SdpaFwdDsl(APIBase):
         fallback the heuristics pick above the resident budget); None = the pick (``config_sm107.sm107_bias_mode_pick``).
         ``bias_stages`` (APPENDED, optional): the streamed ring's depth, 2 or 3 (None = the deepest that fits); a request on a
         plan that runs the resident block is a typed decline.
+        ``softmax_wgs`` (APPENDED, optional): the number of softmax warp groups of the Rubin f16/bf16 d128-file body -- 2 (the
+        classic 16-warp body) or 3 (the third softmax warp group: a 20-warp body whose pair work item takes THREE rows of the chunk per
+        step; an EXPERIMENT, served on the (n, n+1) pair item at tile_n 64 / cga 1 only and declined typed elsewhere).  None = 2 (or
+        the sweep seam ``config_sm107._SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS``).  Performance-only (every value computes the same function).
 
         ``sample_score_max`` / ``sample_score_sum_exp`` (APPENDED, optional): the graph's two score
         side outputs -- fp32 ``(B, H_q, S_q[, 1])`` row statistics in natural units, the softmax
@@ -846,6 +853,9 @@ class SdpaFwdDsl(APIBase):
         self.dead_subtile_quiet = None if dead_subtile_quiet is None else int(dead_subtile_quiet)
         # The row-max form (APPENDED): None = the pick, 0 / 1 = a request (check_support validates it against the arms this plan carries).
         self.bias_max_form = None if bias_max_form is None else int(bias_max_form)
+        # `softmax_wgs` (APPENDED) = the softmax warp-group count of the d128-file body, 2 / 3 (None = 2 or the sweep seam); 3 is honoured on the
+        # TILE_N-64 pair item at cga1 and declined typed elsewhere.
+        self.softmax_wgs = None if softmax_wgs is None else int(softmax_wgs)
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
@@ -1586,7 +1596,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return int(self.cga)
         if self.flavor not in _SM107_BIAS_D_SHAPES:
             return 1
-        return _sm107_bias_auto_cga(self.flavor[0], int(self.k_desc.shape[2]), _SM107_SMALL_D_CGAS[self.flavor], pair=self._resident_arm_pair_eligible()) or 1
+        return (
+            _sm107_bias_auto_cga(
+                self.flavor[0],
+                int(self.k_desc.shape[2]),
+                _SM107_SMALL_D_CGAS[self.flavor],
+                pair=self._resident_arm_pair_eligible(),
+                tiles_q=self._resident_arm_softmax_wgs(),
+            )
+            or 1
+        )
 
     def _resident_arm_n_chunk(self) -> int:
         """The ``TemplateParams.n_chunk`` of this plan: 0 off the pair item; the request when the caller made one (validated by
@@ -1606,6 +1625,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             s_kv=int(self.k_desc.shape[2]),
             d_flavor=self.flavor[0],
             tile_n=self._effective_tile_n(),
+            rows_per_step=self._resident_arm_softmax_wgs(),
         )
 
     def _resident_arm_bias_mode(self) -> int:
@@ -1616,7 +1636,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return _BIAS_MODE_NONE
         _cga = self._resident_arm_cga()
         return _sm107_bias_mode_pick(
-            self.flavor[0], _cga, int(self.k_desc.shape[2]), pair=self._resident_arm_pair_eligible() and _cga == 1, request=self.bias_mode
+            self.flavor[0],
+            _cga,
+            int(self.k_desc.shape[2]),
+            pair=self._resident_arm_pair_eligible() and _cga == 1,
+            request=self.bias_mode,
+            tiles_q=self._resident_arm_softmax_wgs(),
         )
 
     def _resident_arm_bias_stages(self) -> int:
@@ -1625,7 +1650,35 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self._resident_arm_bias_mode() != _BIAS_MODE_STREAMED:
             return 0
         _cga = self._resident_arm_cga()
-        return _sm107_bias_stages_pick(self.flavor[0], _cga, pair=self._resident_arm_pair_eligible() and _cga == 1, request=self.bias_stages or 0)
+        return _sm107_bias_stages_pick(
+            self.flavor[0],
+            _cga,
+            pair=self._resident_arm_pair_eligible() and _cga == 1,
+            request=self.bias_stages or 0,
+            tiles_q=self._resident_arm_softmax_wgs(),
+        )
+
+    def _resident_arm_softmax_wgs(self) -> int:
+        """The ``TemplateParams.softmax_wgs`` of this plan: the request (``softmax_wgs=``, validated by ``check_support``), else the sweep seam,
+        else the measured rule (``config_sm107.sm107_softmax_wgs_pick``: 3 for a bias + kv_mask graph on the pair item at tile_n 64 / cga 1 with
+        dense KV lengths at ``s_kv >= SM107_THREE_WG_S_KV_MIN``, 2 everywhere else).  Threaded as ``tiles_q`` into every bias budget / pick this
+        plan evaluates (the 3-WG body's third Q and O slab shrink the SMEM left for the bias block) and as ``rows_per_step`` into the chunk pick,
+        so the plan is admitted on the budget of the body that RUNS and its chunk is a multiple of the body's rows per step (rule 8b').  The
+        pair predicate it reads does not read the width or the chunk pick back (no cycle)."""
+        if self.bias_desc is None:
+            return _sm107_softmax_wgs_pick(self.softmax_wgs)
+        return _sm107_softmax_wgs_pick(
+            self.softmax_wgs,
+            d_flavor=self.flavor[0],
+            s_kv=int(self.k_desc.shape[2]),
+            tile_n=self._effective_tile_n(),
+            pair=self._resident_arm_pair_eligible(),
+            has_bias=True,
+            has_kv_mask=self.kv_mask_desc is not None,
+            padded=bool(self.seq_kv_lens_present),
+            cga=1 if self.cga is None else int(self.cga),
+            b_flat=int(self.q_desc.shape[0]),
+        )
 
     def _padded_tail_form_eligible(self) -> bool:
         """Whether this plan runs the Rubin small tiles' PLAIN padded body (MASK_FLAGS == MASK_PADDED alone): the only rendering with a
@@ -2160,6 +2213,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._not_implemented_error_if(
                 self.n_chunk is not None and self.n_chunk >= 1, "n_chunk is the resident-bias arm's work-item form; this plan has no bias"
             )
+            self._not_implemented_error_if(
+                self._resident_arm_softmax_wgs() != 2,
+                "softmax_wgs=3 (the third softmax warp group) is the resident-bias pair item's arm; this plan has no bias",
+            )
         # The PLAIN padded body's tail form (padded_tail_form=): a REQUEST is honoured on the Rubin small tiles' padded, band-less,
         # bias- / kv_mask-less plan and declined typed everywhere else (never degraded); None = the pick.
         self._value_error_if(
@@ -2219,8 +2276,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             if self.bias_desc is not None:
                 _bias_cga = self._resident_arm_cga()
                 _pair = self._resident_arm_pair_eligible() and _bias_cga == 1  # the item that RUNS (its block's budget)
-                _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga, pair=_pair)
+                _wgs = self._resident_arm_softmax_wgs()
+                _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga, pair=_pair, tiles_q=_wgs)
                 _item = "the (n, n+1) pair item" if _pair else "the one-batch-entry item"
+                # The third softmax warp group (softmax_wgs=3): the pair item at tile_n 64 / cga 1 only -- the one form whose roles loop over the
+                # sub-tiles (the one-batch-entry paths hand-unroll two) and the one width its 128-register softmax holds; declined typed, never
+                # degraded (config_sm107._validate_softmax_wgs is the factory's twin).
+                self._value_error_if(_wgs not in _SMALL_D_SOFTMAX_WGS, f"softmax_wgs must be one of {sorted(_SMALL_D_SOFTMAX_WGS)}; got {_wgs}")
+                self._not_implemented_error_if(
+                    _wgs == 3 and not (_pair and self._effective_tile_n() == 64 and _bias_cga == 1),
+                    f"softmax_wgs=3 (the third softmax warp group) is served on the (n, n+1) pair item at tile_n 64 / cga 1 only (this plan: {_item}, "
+                    f"tile_n {self._effective_tile_n()}, cga {_bias_cga})",
+                )
                 self._value_error_if(
                     self.bias_mode is not None and self.bias_mode not in (_BIAS_MODE_RESIDENT, _BIAS_MODE_STREAMED),
                     f"bias_mode must be 1 (the resident block) or 2 (the streamed ring); got {self.bias_mode}",
@@ -2797,6 +2864,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             dead_subtile_quiet=self._dead_subtile_quiet(),
             # The row-max form of the bias / kv_mask body (0 = the software tree, 1 = the hardware upper bound): the request, else the pick.
             bias_max_form=self._resident_arm_bias_max_form(),
+            # The softmax warp-group count (2 = every record so far; 3 = the third softmax warp group of the TILE_N-64 pair item, an experiment).
+            softmax_wgs=self._resident_arm_softmax_wgs(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

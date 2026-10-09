@@ -825,6 +825,7 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
     the graph when some width holds the block; ``heuristics._auto_sched_cga`` then picks the narrowest such width through
     ``config_sm107.sm107_bias_auto_cga`` and every proposed plan is re-asked here with its own cga) -- every one a typed
     decline, the twin of the adapter's ``check_support`` (rule 8b)."""
+    from cudnn.sdpa.fwd.config_sm107 import sm107_softmax_wgs_pick
     from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_NONE, sm107_bias_mode_pick, sm107_bias_resident_s_kv_max, sm107_pair_item_active, sm107_tile_n_pick
 
     what = "additive bias" if facts.has_bias else "per-key kv_mask"
@@ -916,9 +917,25 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         )
         for cga in widths
     }
-    modes = {cga: sm107_bias_mode_pick(selected[0], cga, facts.s_kv, pair=_pair[cga]) for cga in widths}
+    # the softmax warp-group count the plan would run at each width (3 on the bias + kv_mask pair form at TILE_N 64 above the measured S_kv;
+    # config_sm107.sm107_softmax_wgs_pick -- the adapter's pick, rule 8b'): its third Q / O slab shrinks the resident bias budget
+    _wgs = {
+        cga: sm107_softmax_wgs_pick(
+            d_flavor=selected[0],
+            s_kv=facts.s_kv,
+            tile_n=int(_tile_n),
+            pair=_pair[cga],
+            has_bias=facts.has_bias,
+            has_kv_mask=facts.has_kv_mask,
+            padded=facts.padded,
+            cga=cga,
+            b_flat=facts.b,
+        )
+        for cga in widths
+    }
+    modes = {cga: sm107_bias_mode_pick(selected[0], cga, facts.s_kv, pair=_pair[cga], tiles_q=_wgs[cga]) for cga in widths}
     if all(mode == BIAS_MODE_NONE for mode in modes.values()):
-        budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga, pair=_pair[cga]) for cga in widths}
+        budgets = {cga: sm107_bias_resident_s_kv_max(selected[0], cga, pair=_pair[cga], tiles_q=_wgs[cga]) for cga in widths}
         held = " / ".join(f"cga {cga}: S_kv <= {s_kv_max}" for cga, s_kv_max in budgets.items())
         return (
             f"no bias form fits at head-dim tile {selected[0]} for S_kv={facts.s_kv}: the resident bias block holds {held} (the SMEM left beside the Q/O "

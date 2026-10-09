@@ -273,7 +273,7 @@ def test_template_params_and_cfg_are_appended():
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
     assert (
-        fields[-5:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form"] and TemplateParams().n_chunk == 0
+        fields[-6:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs"] and TemplateParams().n_chunk == 0
     ), "append-only; 0 renders every existing record byte-identically"
     assert c._CfgSm107.N_CHUNK == 0
 
@@ -298,7 +298,7 @@ def test_kernel_carries_the_pair_arm_as_one_const_expr_axis():
         assert f"def {fn}(" in src, fn
     assert src.count("    if cutlass.const_expr(_PAIR_ARM):\n") == 5, "one function-level branch per warp role"
     assert len(re.findall(r"^        while is_valid_tile > cutlass\.Int32\(0\):", src, re.M)) == 10, "five pair loops beside five one-batch-entry loops"
-    assert "nb = nb0 if sub_tile_id == 0 else nb1" in src and "block_row" in src
+    assert "nb = rows[sub_tile_id]" in src and "block_row" in src  # the step's rows tuple (two, or three with the third softmax warp group)
 
 
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
