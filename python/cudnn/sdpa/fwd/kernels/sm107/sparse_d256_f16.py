@@ -38,7 +38,7 @@ through the shared scheduler (BSHD: the grid is the work list, 2 x T_q items dec
 form on an occupancy-sized grid).  Q^T and the block list of item i+1 are prefetched under item i's KV loop; the epilogue gate
 of item i (``O *= sigmoid(G)``, compiled out unless CFG.EPILOGUE_GATE) is TMA-staged into the freed sQ slot of item i.
 
-WARP MAP (16 warps = 512 threads at ONE softmax column group -- the default; 20 warps = 640 threads at TWO, the SOFTMAX SPLIT below; every
+WARP MAP (16 warps = 512 threads at ONE softmax column group; 20 warps = 640 threads at TWO, the SOFTMAX SPLIT below -- the DEFAULT; every
 warpgroup is role-homogeneous because ``setmaxnreg`` is warpgroup-collective; the gather / MMA / TMA / scheduler ids follow SOFTMAX_WARPS)
 
     warps 0-3   WG0    softmax + epilogue: 128 lanes = the 128 key lanes of S^T / P^T = the 128 d lanes of O^T, all 16 columns
@@ -58,8 +58,8 @@ warpgroup is role-homogeneous because ``setmaxnreg`` is warpgroup-collective; th
     warp 14     WG3    scheduler (scheduler_warp_loop for BSHD; the persistent claim-counter form for THD) -- never credits
     warp 15     WG3    spare: passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one in the body)
 
-SOFTMAX SPLIT (CFG.SOFTMAX_GROUPS = 2; TemplateParams.qsa_softmax_groups, a PERFORMANCE knob -- the same function bitwise; default off until
-its A/B/A): the softmax role becomes TWO 4-warp column GROUPS, warps 0-3 (WG0) columns 0-7 and warps 4-7 (WG1) columns 8-15 of S^T / P^T /
+SOFTMAX SPLIT (CFG.SOFTMAX_GROUPS = 2, the DEFAULT since its A/B/A; TemplateParams.qsa_softmax_groups = 1 renders the one-group body; a
+PERFORMANCE knob -- the same function bitwise): the softmax role becomes TWO 4-warp column GROUPS, warps 0-3 (WG0) columns 0-7 and warps 4-7 (WG1) columns 8-15 of S^T / P^T /
 O^T over the SAME 128 lanes (grp = warp // 4, col0 = 8 grp, lane = tidx & 127; a warp's TMEM lanes are its quadrant's, warp % 4, so warp 4
 shares lanes 0-31 with warp 0 and the column offset is a plain address add); the gather warps move to 8-15, MMA / TMA-LDG / scheduler /
 spare to 16 / 17 / 18 / 19.  Per tile each group loads ITS 8 S^T columns (tcgen05_ld num=8), reduces 8 column maxes through ITS slice of

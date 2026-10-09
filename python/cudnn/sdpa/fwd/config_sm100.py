@@ -266,8 +266,8 @@ class TemplateParams:
     qsa_include_open_block: bool = True
     qsa_list_per_sequence: bool = False
     # The sparse kernel's softmax SPLIT -- a PERFORMANCE knob of its softmax role, never numerics (the same function, bitwise, at
-    # either value): 0 = the flavor default (ONE 4-warp column group over the 16 columns, 16 warps), 2 = TWO 4-warp groups of 8
-    # columns each (20 warps, 96 registers flat).  A template-cache axis like mma_2x2 (two coexisting renderings of one file);
+    # either value): 0 = the flavor default (TWO 4-warp column groups of 8 columns each, 20 warps, 96 registers flat), 1 = ONE 4-warp
+    # column group over the 16 columns (16 warps, the pre-split body).  A template-cache axis like mma_2x2 (two coexisting renderings of one file);
     # APPEND-ONLY, default inert; every dense template declines a non-zero value together with the other qsa_* fields.
     qsa_softmax_groups: int = 0
 

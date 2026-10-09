@@ -2095,9 +2095,9 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
     """Config for sm107/sparse_d256_f16.py from the adapter's TemplateParams (``qsa_block_topk`` = the list width, ``qh_per_kh`` =
     the token's query heads on the N axis).  ``gather_warps`` selects the warp population: 8 (16 warps, the default; 128 entry
     registers, 0 spills on the host rendering) or 4 (12 warps, 168 entry registers -- the named fallback; -25 % gather issue rate).
-    ``softmax_groups`` (appended) selects the softmax SPLIT: 0 = the record's ``qsa_softmax_groups`` (itself 0 = ONE 4-warp column
-    group of 16 columns, the default body), 2 = TWO 4-warp groups of 8 columns (20 warps at 8 gather warps, 96 entry registers
-    flat; 16 warps / 128 at the 4-gather-warp fallback) -- a performance knob: the same function, bitwise, at either value.
+    ``softmax_groups`` (appended) selects the softmax SPLIT: 0 = the record's ``qsa_softmax_groups`` (itself 0 = the flavor default,
+    TWO 4-warp groups of 8 columns: 20 warps at 8 gather warps, 96 entry registers flat; 16 warps / 128 at the 4-gather-warp fallback),
+    1 = ONE 4-warp column group of 16 columns (the pre-split body, 16 warps) -- a performance knob: the same function, bitwise, at either value.
 
     Backstop only: every rejection here must also be a decline of the adapter's claims record (reaching a ValueError from a
     served record is a claims bug, not a user error).  Returns ``(cfg, TmaIters)`` like every sibling factory."""
@@ -2147,7 +2147,9 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         )
     if gather_warps not in (4, 8):
         raise ValueError(f"{flavor}: gather_warps must be 8 (16 warps) or 4 (12 warps, the named fallback); got {gather_warps}")
-    groups = int(softmax_groups) or int(getattr(params, "qsa_softmax_groups", 0) or 0) or 1
+    # 0 = the record's value, itself 0 = the flavor default: TWO column groups since the A/B/A on a 212-SM Rubin GPU (the split +20..+29 %
+    # over the one-group body, bitwise); softmax_groups=1 renders the one-group body (the measured base, 16 warps).
+    groups = int(softmax_groups) or int(getattr(params, "qsa_softmax_groups", 0) or 0) or 2
     if groups not in _SPARSE_SOFTMAX_GROUPS:
         raise ValueError(
             f"{flavor}: softmax_groups must be 1 (one 4-warp column group of 16 columns) or 2 (two 4-warp groups of 8 columns, the softmax split); got {groups}"

@@ -64,8 +64,9 @@ def _sparse(**over):
 
 
 def test_sparse_record_pins_the_header_tables():
-    """The 16-warp record at 24/2, top_k 512: every number the kernel header's tables quote."""
-    cfg, tma = make_cfg_d256_sparse(_sparse())
+    """The ONE-column-group (16-warp) record at 24/2, top_k 512 -- `softmax_groups=1`, the pre-split body and the A/B base: every number the
+    kernel header's tables quote for it (the DEFAULT record is the two-group one, pinned by test_sparse_split_config_is_twenty_warps_at_96_registers)."""
+    cfg, tma = make_cfg_d256_sparse(_sparse(), softmax_groups=1)
     assert isinstance(cfg, CfgD256Sparse)
     # tile geometry
     assert (cfg.TILE_N, cfg.TILE_K, cfg.TILE_O, cfg.N_Q, cfg.BLOCK_SIZE, cfg.BLOCKS_PER_TILE) == (128, 256, 256, 16, 4, 32)
@@ -168,7 +169,7 @@ def test_sparse_top_k_drives_every_ids_byte_count(top_k, ids_tx, slot, tiles, to
 def test_sparse_fallback_config_is_twelve_warps():
     """``gather_warps=4``: the named fallback -- 12 warps, 168 entry registers, every arriver count re-derived, the split balanced
     on ITS pool (2016), the same SMEM table."""
-    cfg, _ = make_cfg_d256_sparse(_sparse(), gather_warps=4)
+    cfg, _ = make_cfg_d256_sparse(_sparse(), gather_warps=4, softmax_groups=1)
     assert (cfg.GATHER_WARPS, cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA, cfg.ENTRY_REGS) == (4, 12, 384, 168)
     assert (cfg.GATHER_WARP_BASE, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.SCHED_WARP_ID, cfg.SPARE_WARP_ID) == (4, 8, 9, 10, 11)
     assert (cfg.KV_FULL_ARRIVERS, cfg.IDS_EMPTY_ARRIVERS, cfg.READ_TILE_ARRIVERS) == (4, 8, 10)
@@ -209,10 +210,11 @@ def test_sparse_split_config_is_twenty_warps_at_96_registers():
     assert d256_sparse_smem_layout(cfg)["starts"] == d256_sparse_smem_layout(make_cfg_d256_sparse(_sparse())[0])["starts"]
     assert (cfg.TMEM_COLS, cfg.S_ACC_OFF, cfg.O_OFF) == (64, (0, 16), (32, 48))
     _validate_cfg_d256_sparse(cfg)
-    # the record route == the keyword route; 0 = the record's value = one group
-    assert make_cfg_d256_sparse(_sparse(qsa_softmax_groups=2))[0] == cfg
-    assert make_cfg_d256_sparse(_sparse(qsa_softmax_groups=1))[0] == make_cfg_d256_sparse(_sparse())[0]
-    assert make_cfg_d256_sparse(_sparse(qsa_softmax_groups=2), softmax_groups=1)[0] == make_cfg_d256_sparse(_sparse())[0], "the keyword overrides the record"
+    # the record route == the keyword route; 0 = the record's value = the flavor default = TWO groups (since the A/B/A)
+    assert make_cfg_d256_sparse(_sparse(qsa_softmax_groups=2))[0] == cfg == make_cfg_d256_sparse(_sparse())[0]
+    one, _ = make_cfg_d256_sparse(_sparse(qsa_softmax_groups=1))
+    assert (one.SOFTMAX_GROUPS, one.TOTAL_WARPS, one.ENTRY_REGS) == (1, 16, 128) and one == make_cfg_d256_sparse(_sparse(), softmax_groups=1)[0]
+    assert make_cfg_d256_sparse(_sparse(qsa_softmax_groups=1), softmax_groups=2)[0] == cfg, "the keyword overrides the record"
     # the split on the 4-gather-warp fallback: 16 warps at 128, the split balanced on 2048
     fb, _ = make_cfg_d256_sparse(_sparse(), gather_warps=4, softmax_groups=2)
     assert (fb.SOFTMAX_WARPS, fb.GATHER_WARPS, fb.TOTAL_WARPS, fb.ENTRY_REGS, fb.MMA_WARP_ID) == (8, 4, 16, 128, 12)
@@ -423,13 +425,13 @@ _RED_ROWS = [
     (dict(BLOCK_SIZE=2, BLOCKS_PER_TILE=64), "four rows of one gather4"),  # 128 == 64 x 2 keeps the tile predicate true; the block predicate fires
     (dict(TILE_K=128), "d_qk = d_v = 256 only"),
     (dict(N_Q=32), "N_Q must be 16"),
-    (dict(SOFTMAX_WARPS=8), "4 softmax warps"),  # 8 softmax warps at ONE column group: the split record carries SOFTMAX_GROUPS=2 with them
-    (dict(COLS_PER_GROUP=8), "COLS_PER_GROUP must be N_Q / SOFTMAX_GROUPS"),
+    (dict(SOFTMAX_WARPS=12), "4 softmax warps"),  # not 4 x SOFTMAX_GROUPS (the default record carries two groups = 8 softmax warps)
+    (dict(COLS_PER_GROUP=16), "COLS_PER_GROUP must be N_Q / SOFTMAX_GROUPS"),  # 16 columns per group at two groups: not N_Q / 2
     (dict(GATHER_WARPS=6, TOTAL_WARPS=14, THREADS_PER_CTA=448), "must divide across the gather warps"),
     (dict(GATHER_WARPS=2, TOTAL_WARPS=10, THREADS_PER_CTA=320), "whole warpgroups"),
     (dict(TOTAL_WARPS=15, THREADS_PER_CTA=480), "TOTAL_WARPS must be SOFTMAX_WARPS \\+ GATHER_WARPS \\+ 4"),
     (dict(THREADS_PER_CTA=256), "32 x TOTAL_WARPS"),
-    (dict(GATHER_WARP_BASE=8), "gather warps follow the softmax warpgroup"),
+    (dict(GATHER_WARP_BASE=4), "gather warps follow the softmax warpgroup"),  # the default record's softmax warps are 0-7
     (dict(MMA_WARP_ID=13, TMALDG_WARP_ID=12), "MMA / TMA-LDG / scheduler / spare in that order"),
     (dict(SPARE_WARP_ID=14), "in that order"),
     (dict(SOFTMAX_LANES=96), "SOFTMAX_LANES is 32 x SOFTMAX_WARPS"),
@@ -678,7 +680,7 @@ def test_sparse_kernel_prologue_takes_its_geometry_from_the_config():
         # The body's Rule-7 gate: a DSL without the sm_107a target declines by name at import -- a skip here, never a failure.
         pytest.skip(f"the sparse kernel module declines this DSL: {exc}")
 
-    assert kern.DESC_VERSION == kern.CFG.DESC_VERSION == 0 and kern.CFG.TOTAL_WARPS == 16 and kern.Cfg is CfgD256Sparse
+    assert kern.DESC_VERSION == kern.CFG.DESC_VERSION == 0 and kern.CFG.TOTAL_WARPS == 20 and kern.CFG.SOFTMAX_GROUPS == 2 and kern.Cfg is CfgD256Sparse
 
 
 def _n_tiles_bindings(tree: ast.AST):

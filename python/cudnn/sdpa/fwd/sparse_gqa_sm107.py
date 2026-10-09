@@ -245,8 +245,8 @@ def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int,
     return s_page, s_tok, col_head, rows_per_page, rows_per_head
 
 
-# The softmax SPLIT's module default: CUDNN_FROST_QSA_SOFTMAX_GROUPS = 0 (unset: the kernel's default = ONE 4-warp
-# column group of 16 columns), 1 (the same, explicit) or 2 (TWO 4-warp groups of 8 columns, 20 warps).  A performance knob -- the same
+# The softmax SPLIT's module default: CUDNN_FROST_QSA_SOFTMAX_GROUPS = 0 (unset: the kernel's default = TWO 4-warp column groups of 8
+# columns, 20 warps), 2 (the same, explicit) or 1 (ONE 4-warp group of 16 columns, the pre-split body).  A performance knob -- the same
 # function, bitwise, at either value -- read once at import so a whole test tier renders the other form without an edit; the value
 # travels in TemplateParams (the module-cache key), so no two bodies ever share a compiled-plan key.  An explicit softmax_groups=
 # at construction overrides it.
@@ -297,7 +297,7 @@ class SparseGqaFwdDslSm107:
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
         # The softmax SPLIT (appended; a PERFORMANCE knob of the kernel's softmax role, the same function bitwise): 0 = the module
-        # default SOFTMAX_GROUPS_DEFAULT (itself 0 = the kernel's one 4-warp column group), 1 / 2 explicit -- compiled in as
+        # default SOFTMAX_GROUPS_DEFAULT (itself 0 = the kernel's two 4-warp column groups), 1 / 2 explicit -- compiled in as
         # TemplateParams.qsa_softmax_groups (the module-cache key: the two renderings never share a compiled artifact).
         self.softmax_groups = int(softmax_groups) if softmax_groups else SOFTMAX_GROUPS_DEFAULT
         self.block_ids, self.block_lens, self.seq_kv_lens = block_ids, block_lens, seq_kv_lens
