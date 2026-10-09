@@ -251,11 +251,25 @@ def test_sparse_declines_at_the_record(over, pattern):
 )
 def test_sparse_declines_the_arms_the_body_does_not_carry(over, arm):
     """Each arm is admitted by adding its name to SPARSE_D256_WIRED_ARMS in the commit that lands its body (and flips the adapter's
-    claims record); until then the config declines it by NAME.  When an arm lands, move its row to an accept test -- do not delete it."""
+    claims record); until then the config declines it by NAME.  When an arm lands, move its row to an accept test -- do not delete it:
+    the skip below NAMES that accept test and fails when it does not exist in this module."""
     if arm in SPARSE_D256_WIRED_ARMS:
-        pytest.skip(f"the {arm} arm is wired now: its accept test replaces this row")
+        accept = _ACCEPT_ROW_OF[arm]
+        assert callable(globals().get(accept)), f"the {arm} arm is wired but its accept row {accept} is missing from this module"
+        pytest.skip(f"the {arm} arm is wired now: its accept row {accept} replaces this one")
     with pytest.raises(ValueError, match=f"does not carry the .*{arm}"):
         make_cfg_d256_sparse(_sparse(**over))
+
+
+# the wired arm -> the accept row that replaced its decline row above (the skip message names it; a missing one fails the skip)
+_ACCEPT_ROW_OF = {
+    "epilogue_gate": "test_sparse_accepts_the_gate_arm",
+    "thd_varlen": "test_sparse_accepts_the_thd_arm",
+    "paged_kv": "test_sparse_accepts_the_paged_arm",
+    "split_kv": "test_sparse_accepts_the_decode_form_arms",
+    "list_per_sequence": "test_sparse_accepts_the_decode_form_arms",
+    "bottom_right": "test_sparse_accepts_the_decode_form_arms",
+}
 
 
 @pytest.mark.parametrize("page_size", [16, 64, 48])
@@ -285,6 +299,33 @@ def test_sparse_accepts_the_thd_arm(kv_lens_declared):
     dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
     assert (cfg.THD_VARLEN, cfg.SEQ_KV_LENS_PRESENT, cfg.PAGED_KV, cfg.PAGE_SIZE) == (1, 1, 0, 0)
     assert dataclasses.replace(cfg, THD_VARLEN=0) == dense, "the THD arm changes no other field of the record"
+    _validate_cfg_d256_sparse(cfg)
+
+
+@pytest.mark.parametrize("composition", ["alone", "thd", "paged"])
+def test_sparse_accepts_the_gate_arm(composition):
+    """The epilogue_gate arm's accept row (the wired arm; its decline row above skips): EPILOGUE_GATE carried, GATE_TX_BYTES the
+    gate BOX (Q_BOX_ROWS x TILE_O x GATE_BPE, never the 8 KiB slot), STAGES_GATE one slot (the gate aliases the item's freed Q^T
+    slot, so the SMEM table is the dense record's byte for byte -- 226,688 B), and the dense record's every other field untouched;
+    composed with the THD arm and with the paged arm the config ADMITS both (the gate touches the Q^T slot ring and the epilogue
+    only) and the arm fields read exactly as the single arms' accept rows say.  The split is the one composition refused (the gate
+    rides the combine: the RED row below)."""
+    assert "epilogue_gate" in SPARSE_D256_WIRED_ARMS
+    dense, _ = make_cfg_d256_sparse(_sparse(seq_kv_lens_present=True))
+    if composition == "alone":
+        cfg, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=True, seq_kv_lens_present=True))
+        assert dataclasses.replace(cfg, EPILOGUE_GATE=0) == dense, "the gate arm changes no other field of the record"
+    elif composition == "thd":
+        cfg, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=True, thd_varlen=True))
+        assert (cfg.THD_VARLEN, cfg.SEQ_KV_LENS_PRESENT, cfg.PAGED_KV) == (1, 1, 0)
+        assert dataclasses.replace(cfg, EPILOGUE_GATE=0, THD_VARLEN=0) == dense
+    else:
+        cfg, _ = make_cfg_d256_sparse(_sparse(epilogue_gate=True, paged_kv=True, page_size=16, seq_kv_lens_present=True))
+        assert (cfg.PAGED_KV, cfg.PAGE_SIZE, cfg.SEQ_KV_LENS_PRESENT, cfg.THD_VARLEN) == (1, 16, 1, 0)
+        assert dataclasses.replace(cfg, EPILOGUE_GATE=0, PAGED_KV=0, PAGE_SIZE=0) == dense
+    assert (cfg.EPILOGUE_GATE, cfg.STAGES_GATE) == (1, 1)
+    assert cfg.GATE_TX_BYTES == cfg.Q_BOX_ROWS * cfg.TILE_O * cfg.GATE_BPE == 6144 and cfg.GATE_TX_BYTES <= cfg.Q_SLOT_BYTES
+    assert (cfg.SMEM_TOTAL_BYTES, cfg.SMEM_CARVEOUT_BYTES, cfg.DESC_VERSION) == (dense.SMEM_TOTAL_BYTES, dense.SMEM_CARVEOUT_BYTES, dense.DESC_VERSION)
     _validate_cfg_d256_sparse(cfg)
 
 
