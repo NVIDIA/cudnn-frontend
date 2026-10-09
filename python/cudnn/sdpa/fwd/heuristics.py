@@ -1753,8 +1753,8 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     D128 FP16/BF16 with integral GQA1..16 on Blackwell, fixed or bounded, with
     or without packed Stats; the same first-wave budget avoids splitting
     already-filled/full-prefill grids. Rubin reuses this budget for its native
-    packed D128 and MLA paths, with the device's actual SM count. Blackwell
-    D128 counts the CTAs of the actual candidate: a packed CTA holds
+    packed D128 and MLA paths, with the device's actual SM count. Blackwell and
+    Rubin D128 count the CTAs of the actual candidate: a packed CTA holds
     128 / (H_q/H_kv) tokens of one KV head's group, and a declared
     ``max_total_seq_len_q`` bounds ragged batches. It also admits Q8..63, where
     the backend ran 2-16x slower than the split, and may fill a second wave
@@ -1767,7 +1767,7 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
             return 1, False
     elif (facts.d_qk, facts.d_v) != (192, 128) or facts.h_q != facts.h_kv:
         return 1, False
-    blackwell_d128 = d128 and caps.sm_lo == 100
+    counted_d128 = d128 and caps.sm_lo in (100, 107)
     if not (
         thd_split_domain(caps, facts)
         and not facts.has_paged_kv
@@ -1775,7 +1775,7 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and (facts.dtype == cudnn.data_type.BFLOAT16 or (d128 and facts.dtype == cudnn.data_type.HALF))
         and 1 <= facts.b <= 4
         and 4 <= facts.h_q <= 64
-        and (8 if blackwell_d128 else 64) <= facts.s_q <= 1024
+        and (8 if counted_d128 else 64) <= facts.s_q <= 1024
         and 2048 <= facts.s_kv <= 32768
         and 4 * facts.s_q <= facts.s_kv
         and (not facts.causal or facts.bottom_right)
@@ -1784,19 +1784,19 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.device_sm_count
     ):
         return 1, False
-    # Do not overfill the wave budget (Blackwell D128 two, else one): beyond it the extra
+    # Do not overfill the wave budget (Blackwell/Rubin D128 two, else one): beyond it the extra
     # partials/combine usually cost more than the shorter loop saves. Four KV
     # tiles per partition amortize that overhead. Reuse the power-of-two
     # specialization set; selection uses host graph facts only, never live
     # device lengths.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     group = facts.h_q // facts.h_kv
-    budget = facts.device_sm_count * (2 if blackwell_d128 else 1)
+    budget = facts.device_sm_count * (2 if counted_d128 else 1)
     choices = []
-    for pack in (False, True) if blackwell_d128 and group > 1 else (False,):
+    for pack in (False, True) if counted_d128 and group > 1 else (False,):
         rows = 128 // group if pack else 128
         q_tiles = facts.b * _ceil_div(facts.s_q, rows)
-        if blackwell_d128 and facts.max_total_seq_len_q:
+        if counted_d128 and facts.max_total_seq_len_q:
             # Each sequence leaves at most one partial tile.
             q_tiles = min(q_tiles, (facts.max_total_seq_len_q + facts.b * (rows - 1)) // rows)
         units = q_tiles * (facts.h_q // group if pack else facts.h_q)

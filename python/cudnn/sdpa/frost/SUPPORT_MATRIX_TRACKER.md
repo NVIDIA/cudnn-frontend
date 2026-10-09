@@ -2091,8 +2091,10 @@ excludes windows, sinks,
 gates and right-band widening, accepts unmasked or bottom-right causal graphs,
 retains at least four KV tiles per partition, and never overfills its wave
 budget (two for D128, one for D192). Only an actual split selection leads the backend. Full prefill,
-already-filled grids, other graph features and Rubin keep their previous
-D128 automatic policy; explicit legal split records remain available. The
+already-filled grids and other graph features keep their previous D128
+automatic policy; explicit legal split records remain available. Rubin (SM107)
+uses the same packed-CTA count, two-wave budget and Q8 floor for D128 since
+2026-10-09 (gr100, 120 THD cases: mean regret 199.5% -> 10.6%, no lead-loss). The
 D192 and paged selection rules retain their existing domains.
 
 ### SM107 paged D256 half packed split

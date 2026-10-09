@@ -319,7 +319,7 @@ def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, 
 
 @requires_dsl
 @pytest.mark.parametrize("batch,h_q,h_kv,q,kv", [(2, 8, 2, 128, 16384), (1, 32, 4, 64, 32768), (4, 16, 16, 257, 8192), (2, 16, 2, 8, 16384)])
-def test_nonpaged_d128_rubin_split_fills_one_unpacked_wave(monkeypatch, batch, h_q, h_kv, q, kv):
+def test_nonpaged_d128_rubin_split_fills_two_waves(monkeypatch, batch, h_q, h_kv, q, kv):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
@@ -327,10 +327,11 @@ def test_nonpaged_d128_rubin_split_fills_one_unpacked_wave(monkeypatch, batch, h
     facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204)
     splits, packed = heur.nonpaged_thd_split_choice(spec.capabilities, facts)
     if splits > 1:
-        # Rubin's launch budget: unpacked 128-row CTAs, one wave.
-        assert not packed
-        assert batch * len(range(0, q, 128)) * h_q * splits <= 204
+        # Rubin's launch budget: packed CTAs hold 128 // group tokens of one KV head's group, two waves.
+        g = h_q // h_kv if packed else 1
+        assert batch * len(range(0, q, 128 // g)) * (h_q // g) * splits <= 2 * 204
         assert len(range(0, kv, 128)) // splits >= 4
+        assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
 
 
 @pytest.mark.parametrize("split", [1, 2])
