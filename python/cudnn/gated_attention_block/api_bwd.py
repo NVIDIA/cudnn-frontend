@@ -6623,7 +6623,9 @@ def gated_attention_block_backward(
         # a wrong-typed quant misses the cache and reaches the class's typed decline (its key is its type name)
         (type(quant).__name__, dataclasses.astuple(quant)) if dataclasses.is_dataclass(quant) and not isinstance(quant, type) else (type(quant).__name__,),
         grad_scaling,
-        grad_scale_margin_log2,
+        # the margin by TYPE and value: True == 1 and 1.0 == 1 in Python, and a cached int-margin block must never serve a caller
+        # whose bool / float reaches the class's ValueError only on a miss
+        (type(grad_scale_margin_log2), grad_scale_margin_log2),
         # the MXFP8 (and fp4) artifacts' PRESENCE (never their bytes): which of the six the caller handed over
         tuple(x is not None for x in (h_t, h_t_sf, w_qkvg_t, w_qkvg_t_sf, w_o_t, w_o_t_sf)),
     )

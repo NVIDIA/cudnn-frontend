@@ -26,7 +26,7 @@ What is pinned here:
   DECLARED with ``B``, bitwise;
 * the margin reaches every quantize launch: ``scale_dy / scale_do / scale_dqkvg`` (``scale_dy`` alone under MXFP8) are
   ``grad_scale_from_amax(amax, 2)`` bitwise and NOT the margin-0 value, and the default-margin block is bitwise a block declared
-  without the attribute.
+  without the attribute; the convenience wrapper's cache tells the margin ``1`` from ``True`` and ``1.0`` (host).
 
 And the TRAINING LOOP over the toy decoder of ``gated_block_train`` (the convergence harness core, a tracked helper of this directory):
 
@@ -297,6 +297,55 @@ def test_grad_scale_margin_refusals_and_plumbing():
         assert (blk._quant_dy.margin_log2, blk._quant_do.margin_log2, blk._epilogue.margin_log2) == (margin, margin, margin)
     default = _fp8_decl(_GEOM, _B, _S).blk
     assert default.grad_scale_margin_log2 == _API_CONST == default._quant_dy.margin_log2 == default._quant_do.margin_log2 == default._epilogue.margin_log2
+
+
+def test_the_backward_wrapper_cache_keys_the_margin_by_type(monkeypatch):
+    """Host: the convenience wrapper caches compiled blocks by a key that tells the margin ``1`` from ``True`` and from ``1.0`` (Python
+    compares the three equal), so a block cached at an int margin is never handed to a caller passing a bool or a float -- they reach
+    the class's typed ``ValueError`` on their own miss.  The class is stubbed and the cache spied: no device compile runs, the pin is
+    the key itself."""
+    seen = []
+
+    class _SpyCache(dict):
+        def get(self, key, default=None):
+            seen.append(key)
+            return None
+
+    class _Stop(Exception):
+        pass
+
+    class _StubBwd:
+        def __init__(self, *args, **kwargs):
+            raise _Stop(kwargs.get("grad_scale_margin_log2"))
+
+    monkeypatch.setattr(_api_bwd, "_BWD_CACHE", _SpyCache())
+    monkeypatch.setattr(_api_bwd, "GatedAttentionBlockBwd", _StubBwd)
+    d = _fp8_decl(_GEOM, _B, _S)
+    inp = d.inp
+    grads_of = (d.saved.h, inp["w_qkvg"], inp["w_o"], inp["w_q_norm"], inp["w_k_norm"])
+    for t_ in grads_of:
+        t_.requires_grad_(True)
+    try:
+        for margin in (1, True, 1.0):
+            with pytest.raises(_Stop):
+                gated_attention_block_backward(
+                    d.dy,
+                    d.saved,
+                    inp["w_qkvg"],
+                    inp["w_q_norm"],
+                    inp["w_k_norm"],
+                    inp["cos"],
+                    inp["sin"],
+                    inp["w_o"],
+                    d.geom,
+                    quant=d.spec,
+                    grad_scale_margin_log2=margin,
+                )
+    finally:
+        for t_ in grads_of:
+            t_.requires_grad_(False)
+    assert len(seen) == 3 and len(set(seen)) == 3, "the wrapper's cache key does not tell the margin 1 from True and 1.0"
+    assert 1 == True == 1.0  # the aliasing the key must see through  # noqa: E712
 
 
 # ---------------------------------------------------------------------------
