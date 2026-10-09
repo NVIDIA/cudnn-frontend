@@ -700,19 +700,16 @@ class ExecutionPlanBuilder_v8 {
     apply_cuda_graph_retention_() {
         CudaGraphRetention_t const retention    = detail::effective_cuda_graph_retention(cuda_graph_retention);
         m_execution_plan.retain_for_cuda_graphs = retention != CudaGraphRetention_t::NONE;
+#if (CUDNN_VERSION >= 92800)
         if (cuda_graph_retention.has_value() && detail::get_backend_version() >= 92800) {
-            // CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION (CUDNN_TYPE_CUDA_GRAPH_RETENTION) and
-            // CUDNN_CUDA_GRAPH_RETENTION_{PER_GRAPH,NONE}, new in cuDNN 9.28, spelled numerically so that the
-            // frontend builds against any cuDNN 9 headers; a backend without the attribute rejects it below.
-            constexpr int kCudaGraphRetentionAttribute = 408;
-            constexpr int kCudaGraphRetentionType      = 33;
-            int32_t backend_retention                  = retention == CudaGraphRetention_t::NONE ? 1 : 0;
-            auto const status =
-                detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
-                                      static_cast<cudnnBackendAttributeName_t>(kCudaGraphRetentionAttribute),
-                                      static_cast<cudnnBackendAttributeType_t>(kCudaGraphRetentionType),
-                                      1,
-                                      &backend_retention);
+            cudnnCudaGraphRetention_t backend_retention = retention == CudaGraphRetention_t::NONE
+                                                              ? CUDNN_CUDA_GRAPH_RETENTION_NONE
+                                                              : CUDNN_CUDA_GRAPH_RETENTION_PER_GRAPH;
+            auto const status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                                      CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION,
+                                                      CUDNN_TYPE_CUDA_GRAPH_RETENTION,
+                                                      1,
+                                                      &backend_retention);
             if (status != CUDNN_STATUS_SUCCESS) {
                 CUDNN_FE_LOG_LABEL_ENDL(
                     "INFO: The cuDNN backend does not support "
@@ -720,6 +717,7 @@ class ExecutionPlanBuilder_v8 {
                     << status << "); it keeps its default CUDA graph retention.");
             }
         }
+#endif
     }
 
     ExecutionPlan_v8 m_execution_plan;
