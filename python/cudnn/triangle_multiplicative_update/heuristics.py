@@ -131,7 +131,7 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 # a separate pass on the two LayerNorm-prologue kernels STANDALONE (the projection stage K1 and the output stage K3, graph replay, 100-400 x 3,
 # control pair, every arm bitwise equal to the base) over N in {128, 217, 256, 384, 512, 768, 1024} x B in {1, 4} per width; the per-width signs:
 #   c = 256: the row RE-READ with ROLLED chunk loops (``ln_pass_form="smem_rolled"``) is the whole register-residency story -- K1 +178..+199 %
-#            and K3 +140..+146 % over the register form on every N >= 256 cell of both passes (K1 N = 512: 682 -> 232 us; the K = 256 renderings
+#            and K3 +140..+146 % over the register form on every N >= 256 cell of both passes (K1 N = 512: 683 -> 234 us; the K = 256 renderings
 #            spilled 240 / 241 and 499 / 504 words per lane, the rolled form 0 / 0 at REG 112-114), and the packed epilogue ON TOP of it adds
 #            +1.4..+2.3 % (K1) / +0.4..+0.9 % (K3) more, outside every such cell's control spread -- although packed ALONE loses 1.1..2.9 % against
 #            the register form (the epilogue is not the binding stage until the spills are gone).  Every c = 256 pick: rolled + packed.
