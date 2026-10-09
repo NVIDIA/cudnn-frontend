@@ -7,6 +7,9 @@ SDPA engine, behind cuEquivariance's ``triangle_attention`` signature (pinned to
     bias     (B, 1, H, S_q, S_kv)   the pair bias, one per outer batch entry, SHARED by the N rows of that entry
     mask     (B, N, 1, 1, S_kv)     a dense boolean key mask (False = the key is masked for every query of that row)
     kv_lengths (B, N, 1, 1, 1)      the right-padded alternative: keys ``j < kv_lengths[b, n]`` are live
+    mask + mask_is_prefix=True      the SAME boolean mask ASSERTED prefix-shaped (every row True on ``[0, len)``, False after): its row
+                                    lengths are derived on the DEVICE (a row count into the caller's workspace, no host synchronisation,
+                                    captured by a CUDA graph) and the call rides the ``kv_lengths`` route
     -> o (B, N, H, S_q, D), and with ``return_aux`` the fp32 row statistics (lse, max) (B, N, H, S_q)
 
 This module writes no kernel.  The attention core is the shipped ``sdpa`` graph node served by the FROST row ``sdpa_fwd_prefill_sm107``
@@ -35,7 +38,8 @@ Two surfaces:
 Served today: compute capability 10.7 (Rubin), bf16 / fp16 (the bias in the same dtype; an fp32 bias is cast once per call by the
 function, counted), ``D % 8 == 0`` with ``D <= 64`` (the row's small tiles; ``D < 32`` / ``32 < D < 64`` by TMA zero fill), any
 ``S_q`` / ``S_kv`` the bias form fits (resident up to the row's budget, streamed above it), ``B >= 1`` (one launch per outer batch
-entry until the engine carries a bias batch group), the three key-mask forms (none / lengths / dense boolean), the forward only.
+entry until the engine carries a bias batch group), the four key-mask forms (none / lengths / dense boolean / a prefix-asserted boolean
+mask served as lengths), the forward only.
 Everything else is a typed decline quoting the ENGINE's own reason (``NotImplementedError`` for a valid-but-unserved declaration,
 ``ValueError`` for a malformed one) -- including ``return_aux=True``: the row max is a side output the small-tile bias arm does not
 store yet, so the request is declined rather than served by a second pass.
@@ -44,18 +48,27 @@ Masked-row conventions (documented, not chosen in code -- see ``docs/fe-oss-apis
 masked reads ``o = 0``, ``lse = max = -inf`` here (the FROST SDPA invariant for an empty key range, on BOTH mask forms);
 cuEquivariance's ``kv_lengths`` route zeroes such a row (``o = lse = max = 0``) and its dense-mask route folds a finite ``-1e9``
 (``o`` = the uniform average of ``v``, ``lse = max = -1e9``).  :func:`mask_to_kv_lengths` therefore changes what a fully masked row
-reads only on cuEquivariance; here both forms agree.
+reads only on cuEquivariance; here both forms agree -- and so does the ``mask_is_prefix`` form, which IS the lengths route.
+
+The prefix-mask contract (``mask_is_prefix=True`` on both surfaces, :func:`prefix_mask_to_kv_lengths` for a caller with a plan of its own):
+the CALLER asserts the mask is prefix-shaped; the API computes each row's True count on the device and binds it as that row's length,
+reading the mask on the host NEVER.  The count of a non-prefix row is still a length: such a row is served as the prefix of its True
+count -- the WRONG keys, no error.  :data:`CHECK_PREFIX_MASK_ENV` ``= 1`` (or ``check_prefix_mask=True`` per call) turns on the debug
+check, the device-wide prefix test with its ONE host synchronisation, which raises a typed ``ValueError`` naming the rows that violate
+the contract; it is off by default and never runs inside a CUDA-graph capture.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import threading
 import warnings
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from cudnn._torch_stream import stream_context
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
@@ -64,8 +77,12 @@ from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
 CUEQ_SIGNATURE_VERSION = "0.12.0"
 #: The FROST engine row that serves the graph; its ``Capabilities`` row and ``mismatch()`` are the source of every typed decline.
 ENGINE_ROW = "sdpa_fwd_prefill_sm107"
-#: The key-mask forms a plan is declared with.
-MASK_FORMS = ("none", "kv_lengths", "mask")
+#: The key-mask forms a plan is declared with (``prefix_mask`` = ``mask=True, mask_is_prefix=True``: the boolean mask asserted prefix-shaped,
+#: its lengths derived on the device and served through the ``kv_lengths`` graph form).
+MASK_FORMS = ("none", "kv_lengths", "mask", "prefix_mask")
+#: ``=1`` turns on the prefix-mask DEBUG check on every call that does not pass ``check_prefix_mask`` explicitly: the device-wide prefix test
+#: (one host synchronisation per call) that raises a typed ``ValueError`` on a mask the caller asserted prefix-shaped but is not.
+CHECK_PREFIX_MASK_ENV = "CUDNN_FRONTEND_TRIANGLE_ATTENTION_CHECK_PREFIX_MASK"
 _RUBIN = (10, 7)
 _ELEM_BYTES = 2  # bf16 / fp16
 _TMA_ALIGN = 16  # the TMA-read operands (q, k, v, bias, o): the binder's `_ALIGN_TMA`
@@ -137,23 +154,135 @@ def _stream_int(stream, device) -> int:
 # ---------------------------------------------------------------------------
 # The caller's workspace -- the SDPA adapters' recipe (`ws_align` chunks dealt in order by `WorkspaceCarver`), never a local carve
 # ---------------------------------------------------------------------------
-def workspace_bytes(plan_bytes: int, n_q_lens: int) -> int:
+def workspace_bytes(plan_bytes: int, n_q_lens: int, n_kv_lens: int = 0, n_mask_stage: int = 0) -> int:
     """Bytes ``execute`` needs: the plan's own ``plan_bytes`` and, on the ``kv_lengths`` form (``n_q_lens > 0``), ``n_q_lens`` int32
     words for the Q-side lengths -- two chunks of the SDPA adapters' shared carve (``ws_align``: 128-byte chunks dealt in order), so the
-    lengths start at ``ws_align(plan_bytes)``.  The other forms need exactly the plan's own bytes."""
-    if n_q_lens <= 0:
+    lengths start at ``ws_align(plan_bytes)``.  The ``prefix_mask`` form adds two more chunks in this order: ``n_kv_lens`` int32 words
+    (the KV lengths the device derives, ``B * N``) and ``n_mask_stage`` int32 words (the mask staged as int32, ``B * N * S_kv`` -- the one
+    cast of the mask, into the caller's memory, so the row count that follows is a same-dtype reduction with no temporary).  The other
+    forms need exactly the plan's own bytes."""
+    if n_q_lens <= 0 and n_kv_lens <= 0 and n_mask_stage <= 0:
         return int(plan_bytes)
-    return ws_align(plan_bytes) + ws_align(_ALIGN_WORD * int(n_q_lens))
+    total = ws_align(plan_bytes)
+    for n in (n_q_lens, n_kv_lens, n_mask_stage):
+        if n > 0:
+            total += ws_align(_ALIGN_WORD * int(n))
+    return total
+
+
+def carve_workspace_chunks(
+    workspace, plan_bytes: int, n_q_lens: int, n_kv_lens: int, n_mask_stage: int, owner: str
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(the plan's own chunk, the Q-side lengths, the derived KV lengths, the int32 mask staging)`` -- each an int32 / uint8 view of the
+    caller's ``workspace`` or None when its count is 0 -- carved in :func:`workspace_bytes`'s order by the shared ``WorkspaceCarver``: a
+    missing, undersized, non-tensor or misaligned buffer raises ITS error (the SDPA adapters' text; its base rule is 16-byte alignment,
+    which a torch allocation satisfies, while the lengths' reader needs 4)."""
+    carver = WorkspaceCarver(workspace, workspace_bytes(plan_bytes, n_q_lens, n_kv_lens, n_mask_stage), owner)
+    plan_ws = carver.take(int(plan_bytes), torch.uint8) if plan_bytes else None
+    q_lens = carver.take(int(n_q_lens), torch.int32) if n_q_lens > 0 else None
+    kv_lens = carver.take(int(n_kv_lens), torch.int32) if n_kv_lens > 0 else None
+    stage = carver.take(int(n_mask_stage), torch.int32) if n_mask_stage > 0 else None
+    return plan_ws, q_lens, kv_lens, stage
 
 
 def carve_workspace(workspace, plan_bytes: int, n_q_lens: int, owner: str) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """``(the plan's own chunk or None, the Q-side lengths as an int32 view or None)`` carved from the caller's ``workspace`` by the
-    shared ``WorkspaceCarver`` -- a missing, undersized, non-tensor or misaligned buffer raises ITS error (the SDPA adapters' text; its
-    base rule is 16-byte alignment, which a torch allocation satisfies, while the lengths' reader needs 4)."""
-    carver = WorkspaceCarver(workspace, workspace_bytes(plan_bytes, n_q_lens), owner)
-    plan_ws = carver.take(int(plan_bytes), torch.uint8) if plan_bytes else None
-    q_lens = carver.take(int(n_q_lens), torch.int32) if n_q_lens > 0 else None
+    """``(the plan's own chunk or None, the Q-side lengths as an int32 view or None)`` -- :func:`carve_workspace_chunks` for the forms
+    without a derived-lengths chunk (the ``kv_lengths`` form and the plain ones)."""
+    plan_ws, q_lens, _kv_lens, _stage = carve_workspace_chunks(workspace, plan_bytes, n_q_lens, 0, 0, owner)
     return plan_ws, q_lens
+
+
+def prefix_check_enabled() -> bool:
+    """Whether :data:`CHECK_PREFIX_MASK_ENV` turns the prefix-mask debug check on for the calls that do not decide it themselves."""
+    return os.environ.get(CHECK_PREFIX_MASK_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _check_mask_arg(mask) -> Tuple[int, int, int]:
+    """``(B, N, S_kv)`` of a boolean ``(B, N, 1, 1, S_kv)`` mask, else the typed ``ValueError``."""
+    if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool:
+        raise ValueError(f"mask must be a boolean torch.Tensor, got {type(mask).__name__} {getattr(mask, 'dtype', None)}")
+    if mask.ndim != 5 or mask.shape[2] != 1 or mask.shape[3] != 1:
+        raise ValueError(f"mask must be (B, N, 1, 1, S_kv), got {tuple(mask.shape)}")
+    b, n, _, _, s_kv = mask.shape
+    return int(b), int(n), int(s_kv)
+
+
+def _row_counts_on_device(mask: torch.Tensor, stage5: torch.Tensor, lens4: torch.Tensor, stream) -> None:
+    """Each row's True count into ``lens4`` ``(B, N, 1, 1)`` int32, through ``stage5`` ``(B, N, 1, 1, S_kv)`` int32 -- BOTH views of memory
+    the caller owns -- on ``stream`` (a raw handle, a torch stream or None = torch's current stream).  Two stream-ordered kernels and no
+    allocation: the cast of the mask lands in the staging chunk (``copy_``), and the reduction that follows is a same-dtype ``sum`` into
+    ``lens4`` -- torch's reduction of a bool input into an int32 output would stage its own cast in a hidden temporary (``self.to(dtype)``
+    inside the reduction), which is what the explicit staging chunk replaces.  Nothing here reads the mask on the host; a CUDA graph
+    captures both kernels and a replay re-derives the lengths from the mask's contents at replay time."""
+    with stream_context(stream, mask.device):
+        stage5.copy_(mask)
+        torch.sum(stage5, dim=-1, dtype=torch.int32, out=lens4)
+
+
+def assert_prefix_mask(mask: torch.Tensor, lengths: torch.Tensor) -> None:
+    """The prefix-mask DEBUG check: every row of ``mask`` must be True exactly on ``[0, lengths[b, n])`` -- a device-wide test with ONE host
+    synchronisation; a violation is a typed ``ValueError`` naming the rows.  Never call it inside a CUDA-graph capture."""
+    b, n, s_kv = _check_mask_arg(mask)
+    prefix = torch.arange(s_kv, device=mask.device, dtype=torch.int32).view(1, 1, 1, 1, s_kv) < lengths.view(b, n, 1, 1, 1)
+    bad = (mask != prefix).view(b, n, s_kv).any(dim=-1)
+    n_bad = int(bad.sum().item())  # the host synchronisation of the check
+    if n_bad:
+        rows = bad.nonzero()[:8].tolist()
+        raise ValueError(
+            f"triangle_attention: mask_is_prefix asserts a PREFIX-shaped mask (every row True on [0, len) and False after), but {n_bad} of the "
+            f"{b * n} (b, n) rows violate it, e.g. (b, n) = {rows}: served as the prefix of its True count such a row attends the WRONG keys. "
+            "Pass the mask without mask_is_prefix (the in-kernel dense mask) or repair it; mask_to_kv_lengths(mask) returns None for it."
+        )
+
+
+def prefix_mask_workspace_bytes(b: int, n: int, s_kv: int) -> int:
+    """Bytes of the ``workspace`` :func:`prefix_mask_to_kv_lengths` stages the mask in: ``4 * B * N * S_kv`` (the mask cast to int32)."""
+    return _ALIGN_WORD * int(b) * int(n) * int(s_kv)
+
+
+def prefix_mask_to_kv_lengths(
+    mask: torch.Tensor, out: Optional[torch.Tensor] = None, *, workspace: Optional[torch.Tensor] = None, check: Optional[bool] = None, stream=None
+) -> torch.Tensor:
+    """``(B, N, 1, 1, 1)`` int32 right-padded lengths of a boolean mask ``(B, N, 1, 1, S_kv)`` the CALLER asserts prefix-shaped, computed on
+    the device with no host synchronisation -- for a caller that holds a mask and a plan of its own (``TriangleAttentionFwd(...,
+    kv_lengths=True)``, the graph's ``seq_len_kv``, cuEquivariance's ``kv_lengths``).  The sync-free twin of :func:`mask_to_kv_lengths`:
+    that one TESTS the shape (and returns None when it fails) at the price of one synchronisation; this one TRUSTS the assertion.
+
+    ``out`` -- the int32 ``(B, N, 1, 1, 1)`` contiguous tensor to write (allocated when None).  ``workspace`` -- a uint8 buffer of at least
+    :func:`prefix_mask_workspace_bytes` bytes the mask is staged in as int32 (allocated when None).  With both given the call allocates
+    nothing and a CUDA graph captures it (a replay re-derives the lengths from the mask's contents).  ``stream`` -- the raw handle or
+    torch stream the two kernels are ordered on (None = torch's current stream).  ``check`` -- run :func:`assert_prefix_mask` after the
+    count (ONE host synchronisation; a typed ``ValueError`` on a non-prefix mask); None = :data:`CHECK_PREFIX_MASK_ENV` decides.  Without
+    the check a non-prefix row yields its True count, i.e. the prefix of that length (documented, not detected).  A row with no True key
+    yields 0 -- the ``kv_lengths`` route's fully masked row (``o = 0``, ``lse = max = -inf`` on this provider)."""
+    b, n, s_kv = _check_mask_arg(mask)
+    dev = mask.device
+    if out is None:
+        out = torch.empty((b, n, 1, 1, 1), dtype=torch.int32, device=dev)
+    else:
+        if not isinstance(out, torch.Tensor) or out.dtype != torch.int32 or tuple(out.shape) != (b, n, 1, 1, 1):
+            raise ValueError(
+                f"out must be an int32 (B, N, 1, 1, 1) = {(b, n, 1, 1, 1)} tensor, got {type(out).__name__} {getattr(out, 'dtype', None)} {tuple(getattr(out, 'shape', ()))}"
+            )
+        if not out.is_contiguous() or out.device != dev:
+            raise ValueError(f"out must be contiguous and on the mask's device {dev}, got strides {tuple(out.stride())} on {out.device}")
+    if workspace is None:
+        stage5 = torch.empty((b, n, 1, 1, s_kv), dtype=torch.int32, device=dev)
+    else:
+        need = prefix_mask_workspace_bytes(b, n, s_kv)
+        if not isinstance(workspace, torch.Tensor) or workspace.dtype != torch.uint8 or not workspace.is_contiguous() or workspace.device != dev:
+            raise ValueError(
+                f"workspace must be a contiguous uint8 tensor on the mask's device {dev}, got {type(workspace).__name__} {getattr(workspace, 'dtype', None)} on {getattr(workspace, 'device', None)}"
+            )
+        if workspace.numel() < need:
+            raise ValueError(f"workspace must hold at least {need} bytes (prefix_mask_workspace_bytes({b}, {n}, {s_kv})), got {workspace.numel()}")
+        if workspace.data_ptr() % _TMA_ALIGN:
+            raise ValueError(f"workspace must be {_TMA_ALIGN}-byte aligned (its base address is {workspace.data_ptr() % _TMA_ALIGN} bytes past one)")
+        stage5 = workspace[:need].view(torch.int32).view(b, n, 1, 1, s_kv)
+    _row_counts_on_device(mask, stage5, out.view(b, n, 1, 1), stream)
+    if check if check is not None else prefix_check_enabled():
+        assert_prefix_mask(mask, out)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -165,17 +294,20 @@ class TriangleAttentionFwd(APIBase):
     Declaration (the constructor): ``sample_q`` / ``sample_k`` / ``sample_v`` ``(B, N, H, S, D)`` and ``sample_bias``
     ``(1|B, 1, 1|H, S_q, S_kv)`` (tensors or :class:`cudnn.api_base.TensorDesc`; their dtype AND strides are compile-time facts --
     the kernel's TMA descriptors are built from them), the key-mask form (``kv_lengths=True`` -> right-padded int32 lengths
-    ``(B, N, 1, 1, 1)``; ``mask=True`` -> a dense boolean mask ``(B, N, 1, 1, S_kv)``; neither -> every key live; both is a
-    ``ValueError``, as in cuEquivariance), the outputs (``lse=True`` adds the fp32 log-sum-exp ``(B, N, H, S_q)``; ``score_max=True``
+    ``(B, N, 1, 1, 1)``; ``mask=True`` -> a dense boolean mask ``(B, N, 1, 1, S_kv)``; ``mask=True, mask_is_prefix=True`` -> the same
+    boolean mask ASSERTED prefix-shaped, its row lengths derived on the device at ``execute`` and served through the ``kv_lengths`` graph
+    form; neither -> every key live; both is a ``ValueError``, as in cuEquivariance), the outputs (``lse=True`` adds the fp32 log-sum-exp ``(B, N, H, S_q)``; ``score_max=True``
     requests the fp32 row max -- declined by the engine today), the softmax ``scale`` (None = ``1 / sqrt(D)``) and optionally
     ``sample_o`` (the output's layout; None = the kernels' compact BSHD form presented as ``(B, N, H, S, D)``).
 
     ``check_support`` raises the typed declines (malformed -> ``ValueError``; unserved -> ``NotImplementedError`` quoting the
     engine row's own reason), ``compile`` builds the plan (the FROST engine row's lowering, selected by name and pinned),
     ``get_workspace_size`` is the plan's requirement (0 on most declarations) plus, on the ``kv_lengths`` form, ``N`` int32 words for the
-    Q-side lengths the graph's padding contract requires (``execute`` writes ``S_q`` there on its stream), ``execute(q, k, v, bias,
-    kv_lengths, o, lse, score_max, workspace, current_stream, *, mask)`` validates (device, dtype, shape, stride, the base alignment each
-    operand's reader needs, form) and launches -- no allocation, no conversion, no synchronisation; a captured CUDA graph replays it.
+    Q-side lengths the graph's padding contract requires (``execute`` writes ``S_q`` there on its stream) and, on the ``prefix_mask`` form,
+    ``B * N`` int32 words for the derived KV lengths plus ``B * N * S_kv`` int32 words the mask is staged in, ``execute(q, k, v, bias,
+    kv_lengths, o, lse, score_max, workspace, current_stream, *, mask, check_prefix_mask)`` validates (device, dtype, shape, stride, the
+    base alignment each operand's reader needs, form) and launches -- no allocation, no conversion, no synchronisation (the prefix-mask
+    debug check, off by default, is the documented exception); a captured CUDA graph replays it.
     ``B > 1`` is served as ``B`` launches of the one plan on the per-entry slices (the bias of entry ``b`` is broadcast over its ``N``
     rows), ``launches_per_call`` says how many.
     """
@@ -193,11 +325,16 @@ class TriangleAttentionFwd(APIBase):
         score_max: bool = False,
         scale: Optional[float] = None,
         sample_o=None,
+        mask_is_prefix: bool = False,
     ):
         super().__init__()
         self._warn_experimental_api()
         if kv_lengths and mask:
             raise ValueError("pass either mask or kv_lengths, not both")
+        if mask_is_prefix and not mask:
+            raise ValueError(
+                "mask_is_prefix=True requires mask=True: it is the prefix-asserted form of the boolean mask (pass kv_lengths=True when you hold lengths)"
+            )
         q_shape, q_stride, q_dtype, q_dev = _declaration(sample_q, "sample_q")
         k_shape, k_stride, k_dtype, k_dev = _declaration(sample_k, "sample_k")
         v_shape, v_stride, v_dtype, v_dev = _declaration(sample_v, "sample_v")
@@ -229,7 +366,7 @@ class TriangleAttentionFwd(APIBase):
         self.bias_dtype = b_dtype
         self.device = torch.device(q_dev)
         self.scale = float(scale) if scale is not None else 1.0 / math.sqrt(self.d)
-        self.mask_form = "kv_lengths" if kv_lengths else ("mask" if mask else "none")
+        self.mask_form = "kv_lengths" if kv_lengths else (("prefix_mask" if mask_is_prefix else "mask") if mask else "none")
         self.want_lse = bool(lse)
         self.want_score_max = bool(score_max)
         # The 4-D geometry ONE launch binds (the per-outer-entry slice), plus the outer stride that steps the slices.
@@ -269,8 +406,18 @@ class TriangleAttentionFwd(APIBase):
 
     @property
     def _n_q_lens(self) -> int:
-        """The int32 words of Q-side lengths the caller's workspace carries: ``N`` on the ``kv_lengths`` form, else 0."""
-        return self.n if self.mask_form == "kv_lengths" else 0
+        """The int32 words of Q-side lengths the caller's workspace carries: ``N`` on the ``kv_lengths`` and ``prefix_mask`` forms, else 0."""
+        return self.n if self.mask_form in ("kv_lengths", "prefix_mask") else 0
+
+    @property
+    def _n_kv_lens(self) -> int:
+        """The int32 words of DERIVED KV lengths the caller's workspace carries: ``B * N`` on the ``prefix_mask`` form, else 0."""
+        return self.batch * self.n if self.mask_form == "prefix_mask" else 0
+
+    @property
+    def _n_mask_stage(self) -> int:
+        """The int32 words the ``prefix_mask`` form stages the boolean mask in (its one cast, into the caller's memory): ``B * N * S_kv``, else 0."""
+        return self.batch * self.n * self.s_kv if self.mask_form == "prefix_mask" else 0
 
     def check_support(self) -> bool:
         """Typed declines: malformed declarations first (``ValueError``), then the serving envelope -- dtype, arch, the DSL, the FROST
@@ -351,7 +498,7 @@ class TriangleAttentionFwd(APIBase):
             tm = g.tensor(dim=[self.n, 1, 1, self.s_kv], stride=[self.s_kv, self.s_kv, self.s_kv, 1], data_type=cudnn.data_type.BOOLEAN, name="kv_mask")
             kw["kv_mask"] = tm
             order.append(tm)
-        elif self.mask_form == "kv_lengths":
+        elif self.mask_form in ("kv_lengths", "prefix_mask"):
             # The graph's padding contract takes a length tensor on BOTH sides (the FE validator: "Padding mask requires
             # seq_len_q/seq_len_kv"), and the kernel bounds the live Q rows by seq_len_q.  Every Q row is live here, so seq_len_q is the
             # constant S_q on every entry: `execute` writes it into the caller's workspace on the launch stream and binds that region
@@ -422,7 +569,7 @@ class TriangleAttentionFwd(APIBase):
             g.build_plans()
             self._plan_workspace_bytes = int(g.get_workspace_size())
             self._handle = cudnn.create_handle()
-        self._workspace_bytes = workspace_bytes(self._plan_workspace_bytes, self._n_q_lens)
+        self._workspace_bytes = workspace_bytes(self._plan_workspace_bytes, self._n_q_lens, self._n_kv_lens, self._n_mask_stage)
         _engine_id, record = g.get_engine_and_knobs_at_index(self._plan_index)
         self.knobs = dict(record) if record else {}
         self._uids = tuple(t.uid for t in self._order)
@@ -449,9 +596,11 @@ class TriangleAttentionFwd(APIBase):
 
     def get_workspace_size(self) -> int:
         """Bytes of the workspace ``execute`` needs: the plan's own requirement (0 on most declarations; the dense-mask form at an
-        ``S_kv`` that is not a multiple of the kv tile carries the engine's synthesized padding lengths) plus, on the ``kv_lengths`` form,
-        ``N`` int32 words for the Q-side lengths the graph's padding contract requires -- ``execute`` writes ``S_q`` there on its stream
-        before the launches.  Sized and carved by the SDPA adapters' shared recipe (:func:`workspace_bytes`, :func:`carve_workspace`)."""
+        ``S_kv`` that is not a multiple of the kv tile carries the engine's synthesized padding lengths) plus, on the ``kv_lengths`` and
+        ``prefix_mask`` forms, ``N`` int32 words for the Q-side lengths the graph's padding contract requires -- ``execute`` writes ``S_q``
+        there on its stream before the launches -- and, on the ``prefix_mask`` form, ``B * N`` int32 words for the KV lengths the device
+        derives plus ``B * N * S_kv`` int32 words the mask is staged in.  Sized and carved by the SDPA adapters' shared recipe
+        (:func:`workspace_bytes`, :func:`carve_workspace_chunks`)."""
         if self._compiled_kernel is None:
             raise RuntimeError("compile() must run before get_workspace_size()")
         return self._workspace_bytes
@@ -499,16 +648,25 @@ class TriangleAttentionFwd(APIBase):
                 raise ValueError(f"kv_lengths must be contiguous along N (stride 1), got strides {tuple(kv_lengths.stride())}")
             if mask is not None:
                 raise ValueError("this plan was declared with kv_lengths=True; mask must be None")
-        elif self.mask_form == "mask":
+        elif self.mask_form in ("mask", "prefix_mask"):
+            prefix = self.mask_form == "prefix_mask"
             if mask is None:
-                raise ValueError("this plan was declared with mask=True; a boolean (B, N, 1, 1, S_kv) mask tensor is required (no silent all-live fallback)")
+                raise ValueError(
+                    "this plan was declared with mask=True, mask_is_prefix=True; a boolean (B, N, 1, 1, S_kv) mask tensor is required (its row lengths are derived on the device)"
+                    if prefix
+                    else "this plan was declared with mask=True; a boolean (B, N, 1, 1, S_kv) mask tensor is required (no silent all-live fallback)"
+                )
             self._check_tensor(mask, "mask", (b, n, 1, 1, s_kv), None, torch.bool, align=_ALIGN_BYTE)
             if mask.stride(4) != 1 or mask.stride(1) != s_kv:
                 raise ValueError(
                     f"mask must be contiguous ((B, N, 1, 1, S_kv) with stride 1 along the keys and S_kv along N), got strides {tuple(mask.stride())}"
                 )
             if kv_lengths is not None:
-                raise ValueError("this plan was declared with mask=True; kv_lengths must be None")
+                raise ValueError(
+                    "this plan was declared with mask=True, mask_is_prefix=True; kv_lengths must be None (the lengths are derived from the mask on the device)"
+                    if prefix
+                    else "this plan was declared with mask=True; kv_lengths must be None"
+                )
         elif kv_lengths is not None or mask is not None:
             raise ValueError("this plan was declared without a key mask; declare kv_lengths=True or mask=True to apply one")
         if self.want_lse:
@@ -546,6 +704,7 @@ class TriangleAttentionFwd(APIBase):
         current_stream=None,
         *,
         mask: Optional[torch.Tensor] = None,
+        check_prefix_mask: Optional[bool] = None,
     ) -> None:
         """Launch the plan on ``current_stream`` (None = torch's current stream on the plan's device): one launch per outer batch
         entry.  Validates every tensor against the declaration, never converts or allocates.
@@ -556,16 +715,26 @@ class TriangleAttentionFwd(APIBase):
         an eager call is the API's checks plus the launch itself.  A plan the fast path does not serve (a plan workspace, a split, a
         native binder) runs through the graph's execute with the same operands.  The ``kv_lengths`` form first writes the Q-side lengths
         (``S_q`` on every entry) into the caller's workspace on the same stream -- one driver memset, stream-ordered before the launches,
-        a memset node in a captured graph."""
+        a memset node in a captured graph.  The ``prefix_mask`` form then derives the KV lengths from the boolean ``mask`` on the same
+        stream (:func:`_row_counts_on_device`: the mask cast into its staging chunk, a same-dtype row count into the lengths chunk -- two
+        kernels, no allocation, nothing read on the host; both captured by a graph) and binds them as the ``kv_lengths`` form does.
+        ``check_prefix_mask`` (that form only): True runs :func:`assert_prefix_mask` after the derivation -- the device-wide prefix test
+        with its ONE host synchronisation, a typed ``ValueError`` on a mask that is not prefix-shaped -- False skips it, None (default)
+        lets :data:`CHECK_PREFIX_MASK_ENV` decide; never True inside a CUDA-graph capture."""
         if self._compiled_kernel is None:
             raise RuntimeError("compile() must run before execute()")
         self._check_execute_args(q, k, v, bias, kv_lengths, o, lse, score_max, workspace, mask)
         stream_int = _stream_int(current_stream, self.device)
-        plan_ws = q_lens = None
+        plan_ws = q_lens = kv_lens = stage = None
         if self._workspace_bytes:
-            plan_ws, q_lens = carve_workspace(workspace, self._plan_workspace_bytes, self._n_q_lens, type(self).__name__)
+            plan_ws, q_lens, kv_lens, stage = carve_workspace_chunks(
+                workspace, self._plan_workspace_bytes, self._n_q_lens, self._n_kv_lens, self._n_mask_stage, type(self).__name__
+            )
         if q_lens is not None:
             self._write_q_lengths(q_lens, stream_int)
+        if self.mask_form == "prefix_mask":
+            kv_lengths = self._derive_kv_lengths(mask, stage, kv_lens, stream_int, check_prefix_mask)
+            mask = None  # from here on the call IS the kv_lengths form
         if self._fast_spec is not None:
             self._execute_frames(q, k, v, bias, kv_lengths, mask, o, lse, q_lens, stream_int)
         else:
@@ -581,6 +750,17 @@ class TriangleAttentionFwd(APIBase):
         ensure_current_context(stream_int, self.device_index)
         fill_word_async(q_lens.data_ptr(), self.n, self.s_q, stream_int)
 
+    def _derive_kv_lengths(self, mask: torch.Tensor, stage: torch.Tensor, kv_lens: torch.Tensor, stream_int: int, check: Optional[bool]) -> torch.Tensor:
+        """The ``prefix_mask`` form: each row's True count, computed on the execute stream into the carved ``kv_lens`` chunk through the
+        carved ``stage`` chunk (the mask's one cast, in the caller's memory), returned as the ``(B, N, 1, 1, 1)`` int32 view the
+        ``kv_lengths`` form binds.  The mask is never read on the host; the optional debug check is."""
+        b, n, s_kv = self.batch, self.n, self.s_kv
+        _row_counts_on_device(mask, stage.view(b, n, 1, 1, s_kv), kv_lens.view(b, n, 1, 1), stream_int)
+        lengths = kv_lens.view(b, n, 1, 1, 1)
+        if check if check is not None else prefix_check_enabled():
+            assert_prefix_mask(mask, lengths)
+        return lengths
+
     def _entry_views(self, q, k, v, bias, kv_lengths, mask, o, lse, b: int, q_lens=None) -> list:
         """The per-entry buffers in the graph's operand order (the declaration's 4-D geometry); with ``q_lens`` (the carved Q-side
         lengths) the ``kv_lengths`` form's ``(N, 1, 1, 1)`` view follows the KV lengths (the graph path), without it the role is bound
@@ -588,7 +768,7 @@ class TriangleAttentionFwd(APIBase):
         bufs = [q[b], k[b], v[b], bias[0] if self.bias_broadcast_batch else bias[b]]
         if self.mask_form == "mask":
             bufs.append(mask[b])
-        elif self.mask_form == "kv_lengths":
+        elif self.mask_form in ("kv_lengths", "prefix_mask"):
             bufs.append(kv_lengths[b])
             if q_lens is not None:
                 bufs.append(q_lens.view(self.n, 1, 1, 1))
@@ -628,7 +808,7 @@ class TriangleAttentionFwd(APIBase):
         roles = ["q", "k", "v", "bias"]
         if self.mask_form == "mask":
             roles.append("kv_mask")
-        elif self.mask_form == "kv_lengths":
+        elif self.mask_form in ("kv_lengths", "prefix_mask"):
             roles.append("seq_kv_lens")
         roles.append("o")
         if self.want_lse:
@@ -688,7 +868,9 @@ class TriangleAttentionFwd(APIBase):
         """Capture the launches for THESE buffers into one ``torch.cuda.CUDAGraph`` (replay = one graph launch per call; the buffers'
         contents may change between replays, their addresses may not).  ``warmup`` eager calls run first on a side stream.  The
         ``kv_lengths`` form's workspace fill is captured with the launches (a memset node), so the workspace is required here as in
-        ``execute``."""
+        ``execute``; the ``prefix_mask`` form's two derivation kernels are captured too (a replay follows the mask's contents).  The
+        warm-up calls run the prefix-mask debug check as the environment decides; the captured call never does (a synchronisation
+        inside a capture is an error)."""
         side = torch.cuda.Stream(device=q.device)
         side.wait_stream(torch.cuda.current_stream(q.device))
         with torch.cuda.stream(side):
@@ -698,7 +880,7 @@ class TriangleAttentionFwd(APIBase):
         torch.cuda.synchronize(q.device)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=side):
-            self.execute(q, k, v, bias, kv_lengths, o, lse, None, workspace, side.cuda_stream, mask=mask)
+            self.execute(q, k, v, bias, kv_lengths, o, lse, None, workspace, side.cuda_stream, mask=mask, check_prefix_mask=False)
         return graph
 
 
@@ -809,7 +991,16 @@ def _cached_plan(q, k, v, bias, mask_form: str, want_lse: bool, score_max: bool,
     if plan is not None:
         return plan
     plan = TriangleAttentionFwd(
-        q, k, v, bias, kv_lengths=(mask_form == "kv_lengths"), mask=(mask_form == "mask"), lse=want_lse, score_max=score_max, scale=scale
+        q,
+        k,
+        v,
+        bias,
+        kv_lengths=(mask_form == "kv_lengths"),
+        mask=(mask_form in ("mask", "prefix_mask")),
+        lse=want_lse,
+        score_max=score_max,
+        scale=scale,
+        mask_is_prefix=(mask_form == "prefix_mask"),
     )
     plan.check_support()
     plan.compile()
@@ -883,11 +1074,12 @@ def _route_for(q, k, v, bias, mask, kv_lengths, mask_form: str, want_lse: bool, 
         return _ROUTES.setdefault(key, route)
 
 
-def _run(plan: TriangleAttentionFwd, q, k, v, bias, kv_lengths, mask, o, lse, stream) -> None:
+def _run(plan: TriangleAttentionFwd, q, k, v, bias, kv_lengths, mask, o, lse, stream, check_prefix_mask: Optional[bool] = None) -> None:
     # The workspace per call (the torch allocator recycles it): the plan's own bytes and, on the kv_lengths form, the Q-side lengths the
-    # graph's padding contract requires -- never a cached or plan-owned tensor.
+    # graph's padding contract requires (the prefix_mask form adds its derived lengths and the mask staging) -- never a cached or
+    # plan-owned tensor.
     ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=q.device) if plan._workspace_bytes else None
-    plan.execute(q, k, v, bias, kv_lengths, o, lse, None, ws, stream, mask=mask)
+    plan.execute(q, k, v, bias, kv_lengths, o, lse, None, ws, stream, mask=mask, check_prefix_mask=check_prefix_mask)
 
 
 class _TriangleAttentionFunction(torch.autograd.Function):
@@ -896,10 +1088,10 @@ class _TriangleAttentionFunction(torch.autograd.Function):
     never handed a zero gradient."""
 
     @staticmethod
-    def forward(ctx, plan, q, k, v, bias, kv_lengths, mask, stream):
+    def forward(ctx, plan, q, k, v, bias, kv_lengths, mask, stream, check_prefix_mask=None):
         o = _bshd_empty(*q.shape, q.dtype, q.device)
         lse = torch.empty((plan.batch, plan.n, plan.h, plan.s_q), dtype=torch.float32, device=q.device)
-        _run(plan, q, k, v, bias, kv_lengths, mask, o, lse, stream)
+        _run(plan, q, k, v, bias, kv_lengths, mask, o, lse, stream, check_prefix_mask)
         ctx.save_for_backward(q, k, v, bias, o, lse)
         ctx.mark_non_differentiable(lse)
         return o, lse
@@ -909,7 +1101,7 @@ class _TriangleAttentionFunction(torch.autograd.Function):
         raise NotImplementedError(
             "triangle_attention has no backward registered yet: dq, dk, dv and dbias are a later item of this API. Run the forward under "
             "torch.no_grad() (inference) or keep the gradient path on another provider until it lands."
-        )
+        )  # the appended check_prefix_mask input takes no gradient either way
 
 
 def mask_to_kv_lengths(mask: torch.Tensor) -> Optional[torch.Tensor]:
@@ -920,12 +1112,11 @@ def mask_to_kv_lengths(mask: torch.Tensor) -> Optional[torch.Tensor]:
 
     Masked-row convention: on this provider the two forms agree (a row with ``len == 0`` reads ``o = 0``, ``lse = max = -inf`` either
     way); on cuEquivariance they differ (``kv_lengths``: the row is zeroed; dense mask: ``-1e9`` is folded, ``o`` = the uniform
-    average), so converting a mask changes what cuEquivariance's fully masked rows read -- see the documentation."""
-    if not isinstance(mask, torch.Tensor) or mask.dtype != torch.bool:
-        raise ValueError(f"mask must be a boolean torch.Tensor, got {type(mask).__name__} {getattr(mask, 'dtype', None)}")
-    if mask.ndim != 5 or mask.shape[2] != 1 or mask.shape[3] != 1:
-        raise ValueError(f"mask must be (B, N, 1, 1, S_kv), got {tuple(mask.shape)}")
-    b, n, _, _, s_kv = mask.shape
+    average), so converting a mask changes what cuEquivariance's fully masked rows read -- see the documentation.
+
+    The sync-free twin for a caller who KNOWS the mask is prefix-shaped: :func:`prefix_mask_to_kv_lengths` (no test, no synchronisation,
+    the lengths computed on the device), or ``mask_is_prefix=True`` on either API surface."""
+    b, n, s_kv = _check_mask_arg(mask)
     m = mask.reshape(b, n, s_kv)
     lengths = m.sum(dim=-1, dtype=torch.int32)
     prefix = torch.arange(s_kv, device=mask.device, dtype=torch.int32).view(1, 1, s_kv) < lengths.unsqueeze(-1)
@@ -946,12 +1137,19 @@ def triangle_attention(
     *,
     out: Optional[torch.Tensor] = None,
     stream=None,
+    mask_is_prefix: bool = False,
+    check_prefix_mask: Optional[bool] = None,
 ):
     """Triangle attention with cuEquivariance's signature (``cuequivariance_ops_torch.triangle_attention``, 0.12.0: the eight
-    parameters in its order, ``kv_lengths`` positional-or-keyword as there) and two keyword-only additions appended: ``out``
+    parameters in its order, ``kv_lengths`` positional-or-keyword as there) and four keyword-only additions appended: ``out``
     (write the output into this tensor instead of allocating; honoured on the inference
-    path, copied into under grad mode) and ``stream`` (a raw CUDA stream handle the allocations, copies and launches are ordered on;
-    None = torch's current stream).
+    path, copied into under grad mode), ``stream`` (a raw CUDA stream handle the allocations, copies and launches are ordered on;
+    None = torch's current stream), ``mask_is_prefix`` (the caller ASSERTS ``mask`` is prefix-shaped -- every row True on ``[0, len)`` and
+    False after -- so its row lengths are derived on the device, with no host synchronisation, and the call rides the ``kv_lengths``
+    route instead of the in-kernel dense mask; a non-prefix row is then served as the prefix of its True count, the WRONG keys and no
+    error) and ``check_prefix_mask`` (the debug check of that assertion: the device-wide prefix test with ONE host synchronisation, a
+    typed ``ValueError`` naming the violating rows; None = :data:`CHECK_PREFIX_MASK_ENV` decides, off by default).  A fully masked row
+    reads ``o = 0`` on every mask form of this provider.
 
     ``q, k, v`` ``(B, N, H, S, D)`` bf16 / fp16 (``k, v`` may carry fewer heads, dividing ``H``), ``bias`` ``(B|1, 1, H|1, S_q, S_kv)`` in
     the same dtype (an fp32 bias is cast once per call, counted), ``mask`` ``(B, N, 1, 1, S_kv)`` bool OR ``kv_lengths`` ``(B, N, 1, 1, 1)``
@@ -969,6 +1167,8 @@ def triangle_attention(
 
     if mask is not None and kv_lengths is not None:
         raise ValueError("pass either mask or kv_lengths, not both")
+    if mask_is_prefix and mask is None:
+        raise ValueError("mask_is_prefix=True requires a boolean mask (it asserts the mask's shape; pass kv_lengths directly when you hold lengths)")
     for name, t in (("q", q), ("k", k), ("v", v), ("bias", bias)):
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor, got {type(t).__name__}")
@@ -983,7 +1183,7 @@ def triangle_attention(
     if kv_lengths is not None and kv_lengths.dtype != torch.int32:
         raise ValueError(f"kv_lengths must be int32 (cuEquivariance's contract), got {kv_lengths.dtype}")
     b, n, h, s_q, d = q.shape
-    mask_form = "kv_lengths" if kv_lengths is not None else ("mask" if mask is not None else "none")
+    mask_form = "kv_lengths" if kv_lengths is not None else (("prefix_mask" if mask_is_prefix else "mask") if mask is not None else "none")
     want_grad = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad or bias.requires_grad)
     want_lse = bool(return_aux) or want_grad
     scale_f = float(scale) if scale is not None else 1.0 / math.sqrt(d)
@@ -1009,11 +1209,11 @@ def triangle_attention(
         q_copied = q_s is not q
         out_direct = out is not None and not q_copied and not want_grad and _out_binds(out, plan)
         if want_grad:
-            o, lse = _TriangleAttentionFunction.apply(plan, q_s, k_s, v_s, bias_s, kvl_s, mask_s, stream)
+            o, lse = _TriangleAttentionFunction.apply(plan, q_s, k_s, v_s, bias_s, kvl_s, mask_s, stream, check_prefix_mask)
         else:
             o = out if out_direct else _bshd_empty(b, n, h, s_q, d, q.dtype, device)
             lse = torch.empty((b, n, h, s_q), dtype=torch.float32, device=device) if want_lse else None
-            _run(plan, q_s, k_s, v_s, bias_s, kvl_s, mask_s, o, lse, stream)
+            _run(plan, q_s, k_s, v_s, bias_s, kvl_s, mask_s, o, lse, stream, check_prefix_mask)
         if out is not None and not out_direct:
             if tuple(out.shape) != tuple(q.shape) or out.dtype != q.dtype or out.device != device:
                 raise ValueError(f"out must be a {tuple(q.shape)} {q.dtype} tensor on {device}, got {tuple(out.shape)} {out.dtype} on {out.device}")
@@ -1044,14 +1244,18 @@ def _out_binds(out: torch.Tensor, plan: TriangleAttentionFwd) -> bool:
 
 
 __all__ = [
+    "CHECK_PREFIX_MASK_ENV",
     "CUEQ_SIGNATURE_VERSION",
     "ENGINE_ROW",
     "MASK_FORMS",
     "TriangleAttentionFwd",
     "activation_binds_zero_copy",
+    "assert_prefix_mask",
     "bias_binds_zero_copy",
     "copy_counters",
     "mask_to_kv_lengths",
+    "prefix_mask_to_kv_lengths",
+    "prefix_mask_workspace_bytes",
     "reset_copy_counters",
     "triangle_attention",
 ]

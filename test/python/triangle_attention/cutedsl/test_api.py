@@ -5,7 +5,8 @@ reference on the acceptance grid (S x D x B x the three key-mask forms), the lay
 repacks elsewhere, the output following q), the masked-row contract (o = 0, lse = -inf), CUDA-graph capture, the execute-path contract
 (no allocation, no synchronisation), autograd (forward served, backward a typed decline) and the typed declines quoting the engine; plus
 the GPU-free contract tests (the lazy export in every import order, the signature pin, mask_to_kv_lengths, the reference, the declines
-a declaration raises before any device work).
+a declaration raises before any device work); the prefix-mask form (``mask_is_prefix=True``: the lengths derived on the device, no host
+synchronisation) bitwise against both lengths routes, its debug check, its allocation-free execute and its CUDA-graph capture.
 
 Tolerances are the SM107 f16 row's own (test_sdpa_bias_sm107.py), not widened for this layer: O against the fp64 oracle at
 atol 5e-2 / rtol 3e-2 (an fp32 accumulation, one 16-bit rounding at the store), the LSE at 1e-4 / 1e-4 (the bias enters the fp32 score
@@ -84,9 +85,10 @@ else:
     import cudnn.triangle_attention.reference
     f = cudnn.triangle_attention
 assert callable(f), type(f)
-from cudnn.triangle_attention import triangle_attention as fn, mask_to_kv_lengths, TriangleAttentionFwd
-assert callable(fn) and callable(mask_to_kv_lengths)
+from cudnn.triangle_attention import triangle_attention as fn, mask_to_kv_lengths, prefix_mask_to_kv_lengths, TriangleAttentionFwd
+assert callable(fn) and callable(mask_to_kv_lengths) and callable(prefix_mask_to_kv_lengths)
 assert cudnn.mask_to_kv_lengths is mask_to_kv_lengths and cudnn.TriangleAttentionFwd is TriangleAttentionFwd
+assert cudnn.prefix_mask_to_kv_lengths is prefix_mask_to_kv_lengths
 print(type(f).__name__)
 """
     out = _probe(code)
@@ -106,17 +108,23 @@ def test_gated_attention_block_is_a_lazy_export_too():
 
 def test_signature_mirrors_cueq_0_12_0():
     """cuEquivariance's parameter names, order and defaults, verbatim: in 0.12.0 ``kv_lengths`` is the eighth POSITIONAL-OR-KEYWORD
-    parameter (no ``*`` before it -- a caller passing it positionally runs there and must run here); the two additions are keyword-only
-    and last (append-only API)."""
+    parameter (no ``*`` before it -- a caller passing it positionally runs there and must run here); the four additions are keyword-only
+    and last, in the order they were appended (append-only API: ``out`` / ``stream`` first, then the prefix-mask pair)."""
     sig = inspect.signature(tapi.triangle_attention)
     names = list(sig.parameters)
     assert names[: len(CUEQ_PARAMS)] == CUEQ_PARAMS
-    assert names[len(CUEQ_PARAMS) :] == ["out", "stream"]
+    assert names[len(CUEQ_PARAMS) :] == ["out", "stream", "mask_is_prefix", "check_prefix_mask"]
     p = sig.parameters
     assert p["mask"].default is None and p["scale"].default is None and p["return_aux"].default is False and p["kv_lengths"].default is None
     assert p["kv_lengths"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert p["out"].kind is inspect.Parameter.KEYWORD_ONLY and p["stream"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert all(p[k].kind is inspect.Parameter.KEYWORD_ONLY for k in ("out", "stream", "mask_is_prefix", "check_prefix_mask"))
+    assert p["mask_is_prefix"].default is False and p["check_prefix_mask"].default is None
     assert tapi.CUEQ_SIGNATURE_VERSION == "0.12.0"
+    assert tapi.MASK_FORMS == ("none", "kv_lengths", "mask", "prefix_mask")
+    cls = inspect.signature(tapi.TriangleAttentionFwd.__init__).parameters
+    assert list(cls)[-1] == "mask_is_prefix" and cls["mask_is_prefix"].default is False  # appended last on the class too
+    ex = inspect.signature(tapi.TriangleAttentionFwd.execute).parameters
+    assert list(ex)[-2:] == ["mask", "check_prefix_mask"] and ex["check_prefix_mask"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_mask_to_kv_lengths_detects_prefix_masks():
@@ -132,6 +140,45 @@ def test_mask_to_kv_lengths_detects_prefix_masks():
         tapi.mask_to_kv_lengths(prefix.to(torch.int32))
     with pytest.raises(ValueError, match=r"\(B, N, 1, 1, S_kv\)"):
         tapi.mask_to_kv_lengths(prefix.view(b, n, s))
+
+
+def test_prefix_mask_to_kv_lengths_is_the_sync_free_twin(monkeypatch):
+    """GPU-free (CPU tensors): the device-side helper returns each row's True count as int32 (B, N, 1, 1, 1) -- equal to mask_to_kv_lengths
+    on a prefix mask -- writes into a caller's ``out`` through a caller's ``workspace`` (the mask staged as int32 there), raises the typed
+    contract error on a non-prefix mask ONLY with the check on (kwarg or the environment), and serves the count otherwise (documented)."""
+    b, n, s = 2, 5, 11
+    lengths = torch.tensor([[7, 0, 11, 1, 5], [3, 11, 0, 4, 9]], dtype=torch.int32).view(b, n, 1, 1, 1)
+    prefix = torch.arange(s).view(1, 1, 1, 1, s) < lengths
+    got = tapi.prefix_mask_to_kv_lengths(prefix)
+    assert got.dtype == torch.int32 and tuple(got.shape) == (b, n, 1, 1, 1) and torch.equal(got, lengths) and torch.equal(got, tapi.mask_to_kv_lengths(prefix))
+    out = torch.empty(b, n, 1, 1, 1, dtype=torch.int32)
+    ws = torch.empty(tapi.prefix_mask_workspace_bytes(b, n, s), dtype=torch.uint8)
+    assert tapi.prefix_mask_workspace_bytes(b, n, s) == 4 * b * n * s
+    assert tapi.prefix_mask_to_kv_lengths(prefix, out, workspace=ws, check=True) is out and torch.equal(out, lengths)
+    assert torch.equal(ws.view(torch.int32).view(b, n, 1, 1, s), prefix.to(torch.int32)), "the workspace holds the mask's one cast"
+    holed = prefix.clone()
+    holed[0, 0, 0, 0, 2] = False  # a hole inside the live prefix: not a prefix mask
+    assert tapi.mask_to_kv_lengths(holed) is None
+    with pytest.raises(ValueError, match=r"PREFIX-shaped .* 1 of the 10 \(b, n\) rows .* \[\[0, 0\]\]"):
+        tapi.prefix_mask_to_kv_lengths(holed, check=True)
+    monkeypatch.setenv(tapi.CHECK_PREFIX_MASK_ENV, "1")
+    assert tapi.prefix_check_enabled()
+    with pytest.raises(ValueError, match="PREFIX-shaped"):
+        tapi.prefix_mask_to_kv_lengths(holed)  # check=None: the environment decides
+    assert tapi.prefix_mask_to_kv_lengths(holed, check=False)[0, 0].item() == 6  # an explicit False overrides the environment
+    monkeypatch.delenv(tapi.CHECK_PREFIX_MASK_ENV)
+    counted = tapi.prefix_mask_to_kv_lengths(holed)  # the default: no check, the row's True count (7 - 1 = 6) -- the documented behaviour
+    assert counted[0, 0].item() == 6 and torch.equal(counted.view(-1)[1:], lengths.view(-1)[1:])
+    with pytest.raises(ValueError, match="boolean"):
+        tapi.prefix_mask_to_kv_lengths(prefix.to(torch.int32))
+    with pytest.raises(ValueError, match=r"\(B, N, 1, 1, S_kv\)"):
+        tapi.prefix_mask_to_kv_lengths(prefix.view(b, n, s))
+    with pytest.raises(ValueError, match="out must be an int32"):
+        tapi.prefix_mask_to_kv_lengths(prefix, torch.empty(b, n, dtype=torch.int32))
+    with pytest.raises(ValueError, match="workspace must hold at least 440 bytes"):
+        tapi.prefix_mask_to_kv_lengths(prefix, workspace=torch.empty(8, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="workspace must be a contiguous uint8"):
+        tapi.prefix_mask_to_kv_lengths(prefix, workspace=torch.empty(440, dtype=torch.int32))
 
 
 def test_reference_is_the_formula_and_keeps_the_empty_row_contract():
@@ -191,6 +238,8 @@ def _bias_desc(bb, h, s_q, s_kv, dtype=torch.bfloat16, device="cuda", row=None):
         (dict(sample_k=_left_desc(1, 256, 4, 256, 64)), ValueError, "head dim"),
         (dict(sample_k=_left_desc(1, 256, 3, 256, 32), sample_v=_left_desc(1, 256, 3, 256, 32)), ValueError, "divide"),
         (dict(scale=0.0), ValueError, "positive"),
+        (dict(mask_is_prefix=True), ValueError, "mask_is_prefix=True requires mask=True"),
+        (dict(kv_lengths=True, mask_is_prefix=True), ValueError, "mask_is_prefix=True requires mask=True"),
     ],
 )
 def test_declaration_declines_malformed_inputs_typed(kw, exc, match):
@@ -635,6 +684,14 @@ def test_workspace_is_sized_and_carved_by_the_sdpa_adapters_recipe():
     assert plan_ws.dtype == torch.uint8 and plan_ws.numel() == 100 and plan_ws.data_ptr() == buf.data_ptr()
     assert q_lens.dtype == torch.int32 and tuple(q_lens.shape) == (217,) and q_lens.data_ptr() - buf.data_ptr() == 128
     assert tapi.carve_workspace(buf[:896], 0, 217, "TriangleAttentionFwd")[1].data_ptr() == buf.data_ptr()  # no plan bytes: the lengths lead
+    # the prefix_mask form's two more chunks, in order: the derived KV lengths (B * N words), then the mask staging (B * N * S_kv words)
+    assert wb(100, 217, 434, 2 * 217 * 217) == ws_align(100) + ws_align(4 * 217) + ws_align(4 * 434) + ws_align(4 * 2 * 217 * 217) == 379648
+    assert wb(0, 0, 0, 0) == 0 and wb(100, 0, 0, 0) == 100 and wb(0, 0, 5, 0) == 128
+    buf3 = torch.empty(wb(100, 217, 434, 2 * 217 * 217), dtype=torch.uint8)
+    p, q, kv, st = tapi.carve_workspace_chunks(buf3, 100, 217, 434, 2 * 217 * 217, "TriangleAttentionFwd")
+    assert [t.data_ptr() - buf3.data_ptr() for t in (p, q, kv, st)] == [0, 128, 1024, 2816]
+    assert kv.dtype == st.dtype == torch.int32 and kv.numel() == 434 and st.numel() == 2 * 217 * 217
+    assert tapi.carve_workspace_chunks(buf3, 100, 217, 0, 0, "TriangleAttentionFwd")[2:] == (None, None)
     with pytest.raises(ValueError, match=r"TriangleAttentionFwd requires a 1024-byte workspace but execute\(\) received none"):
         tapi.carve_workspace(None, 100, 217, "TriangleAttentionFwd")
     with pytest.raises(ValueError, match="requires a 1024-byte workspace; the provided buffer has only 1000 bytes"):
@@ -642,36 +699,50 @@ def test_workspace_is_sized_and_carved_by_the_sdpa_adapters_recipe():
 
 
 @requires_rubin
-@pytest.mark.parametrize("form", ["mask", "kv_lengths"])
+@pytest.mark.parametrize("form", ["mask", "kv_lengths", "prefix_mask"])
 def test_execute_allocates_nothing_and_never_synchronizes(form):
-    """Both key-mask forms: a warm execute allocates no device memory and issues no host synchronisation -- on the kv_lengths form the
-    Q-side lengths the graph's padding contract requires are written into the CALLER's workspace (an async memset), never allocated."""
+    """Every key-mask form: a warm execute allocates no device memory (the allocator's allocation COUNT is unchanged too, so no temporary
+    hides behind a freed buffer) and issues no host synchronisation -- on the kv_lengths form the Q-side lengths the graph's padding
+    contract requires are written into the CALLER's workspace (an async memset), never allocated; on the prefix_mask form the mask's one
+    cast and the derived KV lengths land in the caller's workspace as well (torch's own bool -> int32 reduction would stage a hidden
+    temporary, which the staging chunk replaces)."""
     s = 128
     q, k, v, bias, gen = _inputs(s, 32, seed=17)
     mask = _dense_mask(1, s, s, gen) if form == "mask" else None
-    lengths = _lengths(1, s, s, gen, empty_rows=((0, 4),)) if form == "kv_lengths" else None
-    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=(form == "mask"), kv_lengths=(form == "kv_lengths"))
+    lengths = _lengths(1, s, s, gen, empty_rows=((0, 4),)) if form != "mask" else None
+    if form == "prefix_mask":
+        mask, lengths = (torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < lengths), None
+    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=(form != "kv_lengths"), kv_lengths=(form == "kv_lengths"), mask_is_prefix=(form == "prefix_mask"))
     plan.check_support()
     plan.compile()
     if form == "kv_lengths":
         assert plan.get_workspace_size() == tapi.workspace_bytes(plan._plan_workspace_bytes, s) >= 4 * s
+    elif form == "prefix_mask":
+        assert plan.get_workspace_size() == tapi.workspace_bytes(plan._plan_workspace_bytes, s, s, s * s) >= 4 * s + 4 * s + 4 * s * s
     o = tapi._bshd_empty(*q.shape, q.dtype, q.device)
     ws = torch.empty(max(plan.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     plan.execute(q, k, v, bias, lengths, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
+    before_count = torch.cuda.memory_stats()["allocation.all.allocated"]
     torch.cuda.set_sync_debug_mode("error")
     try:
         plan.execute(q, k, v, bias, lengths, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     assert torch.cuda.memory_allocated() == before
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before_count, "a device allocation (even a freed temporary) inside execute"
     torch.cuda.synchronize()
-    _check(o, _reference(q, k, v, bias, mask=mask, kv_lengths=lengths))
+    ref_lengths = tapi.mask_to_kv_lengths(mask) if form == "prefix_mask" else lengths
+    _check(o, _reference(q, k, v, bias, mask=mask if form == "mask" else None, kv_lengths=ref_lengths))
     if form == "kv_lengths":
         _plan_ws, q_lens = tapi.carve_workspace(ws, plan._plan_workspace_bytes, s, "TriangleAttentionFwd")  # the same carve execute ran
         assert (q_lens == s).all(), "the Q-side lengths chunk must hold S_q on every entry"
         assert (o[0, 4] == 0).all()
+    elif form == "prefix_mask":
+        _plan_ws, q_lens, kv_lens, stage = tapi.carve_workspace_chunks(ws, plan._plan_workspace_bytes, s, s, s * s, "TriangleAttentionFwd")
+        assert (q_lens == s).all() and torch.equal(kv_lens.view(1, s, 1, 1, 1), ref_lengths), "the derived KV lengths live in the caller's workspace"
+        assert torch.equal(stage.view(1, s, 1, 1, s), mask.to(torch.int32)) and (o[0, 4] == 0).all()
 
 
 @requires_rubin
@@ -731,6 +802,149 @@ def test_cuda_graph_capture_replays_bitwise_and_follows_new_data():
     g3.replay()
     torch.cuda.synchronize()
     assert torch.equal(out3, eager_len2) and (out3[0, 7] == 0).all()
+
+
+@requires_rubin
+@pytest.mark.parametrize("s,d,b", [(256, 32, 1), (384, 32, 2), (217, 32, 1), (512, 64, 1)])
+def test_prefix_mask_form_equals_both_lengths_routes_bitwise(s, d, b):
+    """``mask_is_prefix=True`` on a prefix mask (rows of every length incl. 0 and S_kv; S = 217 a tail that is not a multiple of the kv
+    tile) yields o bitwise equal to ``kv_lengths=mask_to_kv_lengths(mask)`` and to the explicit lengths tensor, with no counted copy; the
+    class API's prefix plan matches the kv_lengths plan bitwise on o AND lse, and the lengths it derived sit in the caller's workspace."""
+    q, k, v, bias, gen = _inputs(s, d, b=b, bias_form="bh" if b > 1 else "h", seed=s * 3 + d + b)
+    if s % 8:
+        bias = torch.empty(*bias.shape[:4], -(-s // 8) * 8, device="cuda", dtype=bias.dtype)[..., :s].copy_(bias)  # the caller's own padded row: zero-copy
+    lengths = _lengths(b, s, s, gen, empty_rows=((0, 0), (b - 1, 17)))
+    lengths[0, 1] = s  # a full row beside the empty ones
+    mask = torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < lengths
+    assert torch.equal(tapi.mask_to_kv_lengths(mask), lengths)
+    tapi.reset_copy_counters()
+    o_conv = tapi.triangle_attention(q, k, v, bias, kv_lengths=tapi.mask_to_kv_lengths(mask))
+    o_len = tapi.triangle_attention(q, k, v, bias, kv_lengths=lengths)
+    o_pre = tapi.triangle_attention(q, k, v, bias, mask=mask, mask_is_prefix=True)
+    torch.cuda.synchronize()
+    assert tapi.copy_counters() == {}, tapi.copy_counters()
+    assert torch.equal(o_pre, o_len) and torch.equal(o_pre, o_conv)
+    assert (o_pre[0, 0] == 0).all() and (o_pre[b - 1, 17] == 0).all()
+    _check(o_pre, _reference(q, k, v, bias, kv_lengths=lengths))
+    plan_l = tapi.TriangleAttentionFwd(q, k, v, bias, kv_lengths=True, lse=True)
+    plan_p = tapi.TriangleAttentionFwd(q, k, v, bias, mask=True, mask_is_prefix=True, lse=True)
+    for plan in (plan_l, plan_p):
+        plan.check_support()
+        plan.compile()
+    assert plan_p.mask_form == "prefix_mask" and plan_p.plan_name == plan_l.plan_name, (plan_p.plan_name, plan_l.plan_name)
+    assert plan_p.get_workspace_size() == tapi.workspace_bytes(plan_p._plan_workspace_bytes, s, b * s, b * s * s)
+    o_l, o_p = (tapi._bshd_empty(*q.shape, q.dtype, q.device).fill_(float("nan")) for _ in range(2))
+    lse_l, lse_p = (torch.full((b, s, 4, s), float("nan"), device="cuda", dtype=torch.float32) for _ in range(2))
+    ws_l = torch.empty(plan_l.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    ws_p = torch.empty(plan_p.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    plan_l.execute(q, k, v, bias, lengths, o_l, lse_l, None, ws_l)
+    plan_p.execute(q, k, v, bias, None, o_p, lse_p, None, ws_p, mask=mask)
+    torch.cuda.synchronize()
+    assert torch.equal(o_p, o_l) and torch.equal(lse_p, lse_l) and torch.equal(o_p, o_pre)
+    assert torch.isneginf(lse_p[0, 0]).all() and torch.isneginf(lse_p[b - 1, 17]).all()
+    _plan_ws, q_lens, kv_lens, _stage = tapi.carve_workspace_chunks(ws_p, plan_p._plan_workspace_bytes, s, b * s, b * s * s, "TriangleAttentionFwd")
+    assert (q_lens == s).all() and torch.equal(kv_lens.view(b, s, 1, 1, 1), lengths)
+    _check(o_p, _reference(q, k, v, bias, kv_lengths=lengths), lse_p)
+
+
+@requires_rubin
+def test_prefix_mask_assertion_is_checked_only_on_request(monkeypatch):
+    """A NON-prefix mask under ``mask_is_prefix=True``: with the debug check on (the kwarg, or the environment variable) the call raises the
+    typed contract error naming the violating rows -- on both surfaces -- and with the check off (the default) the documented behaviour
+    holds: every row is served as the prefix of its True count, bitwise the explicit ``kv_lengths = mask.sum(-1)`` call, which is NOT the
+    dense-mask result (the hole moves which keys are attended)."""
+    s = 256
+    q, k, v, bias, gen = _inputs(s, 32, seed=26)
+    lengths = _lengths(1, s, s, gen, empty_rows=((0, 5),))
+    lengths[0, 0] = 200
+    holed = torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < lengths
+    holed[0, 0, 0, 0, 3:40] = False  # a hole inside row 0's live prefix
+    holed[0, 7, 0, 0, s - 1] = True  # a live key past row 7's prefix
+    assert tapi.mask_to_kv_lengths(holed) is None
+    monkeypatch.delenv(tapi.CHECK_PREFIX_MASK_ENV, raising=False)
+    with pytest.raises(ValueError, match=r"PREFIX-shaped .* 2 of the 256 \(b, n\) rows .* \[\[0, 0\], \[0, 7\]\]"):
+        tapi.triangle_attention(q, k, v, bias, mask=holed, mask_is_prefix=True, check_prefix_mask=True)
+    monkeypatch.setenv(tapi.CHECK_PREFIX_MASK_ENV, "1")
+    with pytest.raises(ValueError, match="PREFIX-shaped"):
+        tapi.triangle_attention(q, k, v, bias, mask=holed, mask_is_prefix=True)  # the environment turns the check on
+    o_forced = tapi.triangle_attention(q, k, v, bias, mask=holed, mask_is_prefix=True, check_prefix_mask=False)  # an explicit False wins
+    monkeypatch.delenv(tapi.CHECK_PREFIX_MASK_ENV)
+    o_default = tapi.triangle_attention(q, k, v, bias, mask=holed, mask_is_prefix=True)
+    counts = tapi.prefix_mask_to_kv_lengths(holed)
+    assert counts[0, 0].item() == 200 - 37 and counts[0, 7].item() == lengths[0, 7].item() + 1 and counts[0, 5].item() == 0
+    o_counts = tapi.triangle_attention(q, k, v, bias, kv_lengths=counts)
+    o_dense = tapi.triangle_attention(q, k, v, bias, mask=holed)
+    torch.cuda.synchronize()
+    assert torch.equal(o_default, o_counts) and torch.equal(o_forced, o_counts), "a non-prefix row is served as the prefix of its True count"
+    assert not torch.equal(o_default, o_dense), "the dense mask attends the holed keys; the prefix form cannot"
+    assert torch.equal(o_default[0, 1:5], o_dense[0, 1:5]) and (o_default[0, 5] == 0).all()  # the prefix rows agree, the empty row reads 0
+    _check(o_default, _reference(q, k, v, bias, kv_lengths=counts))
+    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=True, mask_is_prefix=True)
+    plan.check_support()
+    plan.compile()
+    o = tapi._bshd_empty(*q.shape, q.dtype, q.device)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="PREFIX-shaped"):
+        plan.execute(q, k, v, bias, None, o, None, None, ws, mask=holed, check_prefix_mask=True)
+    plan.execute(q, k, v, bias, None, o, None, None, ws, mask=holed)
+    torch.cuda.synchronize()
+    assert torch.equal(o, o_counts)
+    with pytest.raises(ValueError, match="requires a boolean mask"):
+        tapi.triangle_attention(q, k, v, bias, mask_is_prefix=True)
+    with pytest.raises(ValueError, match="mask_is_prefix=True; kv_lengths must be None"):
+        plan.execute(q, k, v, bias, counts, o, None, None, ws, mask=holed)
+    with pytest.raises(ValueError, match="mask_is_prefix=True; a boolean"):
+        plan.execute(q, k, v, bias, None, o, None, None, ws)
+
+
+@requires_rubin
+def test_prefix_mask_form_captures_into_a_cuda_graph_and_follows_the_mask_contents():
+    """The prefix form's derivation runs on the device only, so a CUDA graph captures the whole call (the Q-side memset, the mask cast,
+    the row count, the launches) and a replay re-derives the lengths from the mask's CURRENT contents: bitwise the eager kv_lengths call
+    before and after the mask changes, on the class API (make_cuda_graph) and on the drop-in function (torch.cuda.graph)."""
+    s = 256
+    q, k, v, bias, gen = _inputs(s, 32, seed=27)
+    lengths = _lengths(1, s, s, gen, empty_rows=((0, 3),))
+    mask = torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < lengths
+    eager = tapi.triangle_attention(q, k, v, bias, kv_lengths=lengths)
+    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=True, mask_is_prefix=True)
+    plan.check_support()
+    plan.compile()
+    out = tapi._bshd_empty(*q.shape, q.dtype, q.device)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    g = plan.make_cuda_graph(q, k, v, bias, None, out, None, ws, mask=mask)
+    out.fill_(float("nan"))
+    ws.fill_(0)  # a replay must re-derive the lengths (and re-write the Q-side ones), not rely on a previous call's chunks
+    torch.cuda.synchronize()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager) and (out[0, 3] == 0).all()
+    new_lengths = _lengths(1, s, s, gen, empty_rows=((0, 9),))
+    mask.copy_(torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < new_lengths)
+    eager_new = tapi.triangle_attention(q, k, v, bias, kv_lengths=new_lengths)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager_new) and (out[0, 9] == 0).all() and not torch.equal(eager, eager_new)
+    # the drop-in function under torch.cuda.graph (warm first; the per-call workspace is the graph pool's)
+    out_f = tapi._bshd_empty(*q.shape, q.dtype, q.device)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        tapi.triangle_attention(q, k, v, bias, mask=mask, mask_is_prefix=True, out=out_f)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    gf = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gf, stream=side):
+        tapi.triangle_attention(q, k, v, bias, mask=mask, mask_is_prefix=True, out=out_f)
+    out_f.fill_(float("nan"))
+    torch.cuda.synchronize()
+    gf.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_f, eager_new)
+    mask.copy_(torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < lengths)
+    gf.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_f, eager)
 
 
 @requires_rubin

@@ -375,6 +375,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     # triangle attention (cuEquivariance's signature; the same callable-package arrangement as the triangle multiplicative update)
     "triangle_attention": (".triangle_attention", "triangle_attention"),
     "mask_to_kv_lengths": (".triangle_attention", "mask_to_kv_lengths"),
+    "prefix_mask_to_kv_lengths": (".triangle_attention", "prefix_mask_to_kv_lengths"),
     "TriangleAttentionFwd": (".triangle_attention", "TriangleAttentionFwd"),
     # the gated attention block (its package had no entry here, so `from cudnn import gated_attention_block_forward` failed)
     "gated_attention_block_forward": (".gated_attention_block", "gated_attention_block_forward"),

@@ -14,6 +14,8 @@ q, k, v    (B, N, H, S, D)      bf16 / fp16     o[b, n, h, i] = sum_j softmax_j(
 bias       (B, 1, H, S_q, S_kv) the same dtype  the pair bias of outer entry b, shared by its N rows
 mask       (B, N, 1, 1, S_kv)   bool            a dense key mask (False = the key is masked for every query of that row)      -- or --
 kv_lengths (B, N, 1, 1, 1)      int32           right-padded lengths: keys j < kv_lengths[b, n] are live (never both)
+mask, mask_is_prefix=True       bool            the same mask ASSERTED prefix-shaped (True on [0, len), False after): its row lengths are
+                                                derived on the device -- no host synchronisation -- and the call rides the kv_lengths route
 -> o (B, N, H, S_q, D) in q's dtype
 ```
 
@@ -80,7 +82,7 @@ published `lse` yields no gradient into masked keys.
 | head dim `D` | `D % 8 == 0` and `D <= 64` (the row's 32- and 64-wide tiles; 8 / 16 / 24 -> the 32-wide tile, 40 / 48 / 56 -> the 64-wide one, by TMA zero fill) | `NotImplementedError` quoting the engine (`D = 20`: the 16-byte stride rule; `D = 128`: no bias form on the d128 tile) |
 | `S_q`, `S_kv` | any; a compact bias needs `S_kv % 8 == 0` (the TMA 16-byte row-stride rule) -- the function pads the row otherwise (counted); the bias is resident in SMEM up to the engine's budget per tile (768 kv columns at `D <= 32` for a bias shared by two or more rows of an entry, 384 at `D <= 64`; 384 / 128..256 for a per-entry bias on a single row) and streamed per kv tile above it | `NotImplementedError` quoting the engine where neither bias form fits |
 | `B`, `N`, `H` | any (`B > 1` runs one launch per outer entry; `H_kv` dividing `H`) | `ValueError` on a mismatch |
-| key mask | `mask` (bool, dense -- the in-kernel bit-word path) OR `kv_lengths` (int32, right-padded -- the zero-cost padding path); `mask_to_kv_lengths` converts a prefix-shaped mask | both: `ValueError` (cuEquivariance's rule); a non-bool mask / non-int32 lengths: `ValueError` |
+| key mask | `mask` (bool, dense -- the in-kernel bit-word path) OR `kv_lengths` (int32, right-padded -- the padding path) OR `mask` with `mask_is_prefix=True` (the mask asserted prefix-shaped: lengths derived on the device, the padding path, no host synchronisation); `mask_to_kv_lengths` converts a prefix-shaped mask with one synchronisation, `prefix_mask_to_kv_lengths` without one | both: `ValueError` (cuEquivariance's rule); a non-bool mask / non-int32 lengths: `ValueError`; `mask_is_prefix` without a mask: `ValueError`; a non-prefix mask under the assertion: `ValueError` naming the rows ONLY with the debug check on (below) |
 | `scale` | any positive finite float (default `1 / sqrt(D)`) | `ValueError` |
 | `return_aux` | `False` only: the row max is a side output the engine's bias arm does not store yet (the d128 tile stores it, the small tiles' bias arm declines it) | `NotImplementedError` quoting the engine ("without the score side outputs") |
 | layout | zero-copy on the token-major form (below); every other layout is repacked by the function with a counted copy | the class API: `NotImplementedError` naming the tensor (never a hidden copy) |
@@ -94,15 +96,16 @@ import cudnn
 from cudnn import triangle_attention, mask_to_kv_lengths   # or: from cuequivariance_torch import triangle_attention
 
 o = triangle_attention(q, k, v, bias, mask=mask, scale=scale)                 # the Boltz-2 / Protenix / OpenFold-3 call, unchanged
-o = triangle_attention(q, k, v, bias, scale=scale, kv_lengths=mask_to_kv_lengths(mask))   # a prefix mask as lengths: the zero-cost path
+o = triangle_attention(q, k, v, bias, scale=scale, kv_lengths=mask_to_kv_lengths(mask))   # a prefix mask as lengths (one host sync per mask)
+o = triangle_attention(q, k, v, bias, mask=mask, scale=scale, mask_is_prefix=True)         # the same, derived on the device: no host sync
 ```
 
-Signature (cuEquivariance 0.12.0, verbatim -- `kv_lengths` is its eighth parameter, positional-or-keyword there as here; the two
-keyword-only additions are appended):
+Signature (cuEquivariance 0.12.0, verbatim -- `kv_lengths` is its eighth parameter, positional-or-keyword there as here; the four
+keyword-only additions are appended, in the order they were added):
 
 ```python
 triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, kv_lengths=None,
-                   *, out=None, stream=None) -> torch.Tensor
+                   *, out=None, stream=None, mask_is_prefix=False, check_prefix_mask=None) -> torch.Tensor
 ```
 
 `out` writes the result into a caller-provided tensor (stable addresses for CUDA-graph users; copied into when it is not in the
@@ -115,6 +118,34 @@ Q-side lengths below -- the torch allocator recycles it), and launches. Warm a s
 `mask_to_kv_lengths(mask)` returns `(B, N, 1, 1, 1)` int32 lengths when every row of the boolean mask is a prefix (True on `[0, len)`,
 False after), else `None` so the caller falls back to `mask=`. It performs one host synchronisation (the prefix test): call it once per
 mask, not once per layer.
+
+### The prefix-mask form: `mask_is_prefix=True`
+
+The models' key masks are padding masks -- every row True on `[0, len)` and False after -- and the padding (`kv_lengths`) route of the
+kernel trims the kv loop to the live tiles where the dense-mask route visits every tile. `mask_to_kv_lengths` buys that route at the
+price of one host synchronisation per mask (the prefix test is a device-wide `all`); `mask_is_prefix=True` buys it without one:
+
+- **The contract.** The CALLER asserts the mask is prefix-shaped. The API computes each row's True count on the device -- the mask cast
+  to int32 into a staging chunk of the workspace, then a same-dtype row count into a lengths chunk: two stream-ordered kernels, no
+  allocation, no host synchronisation, both captured by a CUDA graph -- and binds the counts as the `kv_lengths` form. The mask is never
+  read on the host, so a captured graph re-derives the lengths from the mask's contents at every replay.
+- **What a violation does.** The count of a non-prefix row is still a length: such a row is served as the prefix of its True count --
+  the WRONG keys, no error. A mask that may not be prefix-shaped belongs on `mask=` (the in-kernel dense mask) or on
+  `mask_to_kv_lengths`, which tests and falls back.
+- **The debug check.** `check_prefix_mask=True` (per call) or `CUDNN_FRONTEND_TRIANGLE_ATTENTION_CHECK_PREFIX_MASK=1` (the environment,
+  for every call that does not decide it itself) runs the prefix test after the derivation -- the device-wide test with its one host
+  synchronisation -- and raises a typed `ValueError` naming the violating `(b, n)` rows. Off by default; never on inside a CUDA-graph
+  capture (`make_cuda_graph` runs it on the warm-up calls only, as the environment decides, and never on the captured call).
+- **Masked rows.** Unchanged: a row whose count is 0 reads `o = 0`, `lse = max = -inf` -- the `kv_lengths` route's convention, which on
+  this provider is also the dense mask's (the table above).
+- **The device-side helper.** A caller that holds a mask and a plan of its own (a `kv_lengths=True` plan, the graph's `seq_len_kv`, or
+  cuEquivariance's `kv_lengths`) gets the same derivation from
+  `prefix_mask_to_kv_lengths(mask, out=None, *, workspace=None, check=None, stream=None) -> (B, N, 1, 1, 1) int32`: with `out` (an int32
+  `(B, N, 1, 1, 1)` contiguous tensor) and `workspace` (a contiguous uint8 buffer of `prefix_mask_workspace_bytes(B, N, S_kv)` =
+  `4 * B * N * S_kv` bytes) the call allocates nothing and a CUDA graph captures it; without them it allocates both (the convenience
+  form); `check` is the debug check (None = the environment); `stream` the raw handle or torch stream the two kernels are ordered on.
+  It is the sync-free twin of `mask_to_kv_lengths`: that one TESTS the shape and returns `None` when it fails, this one TRUSTS the
+  assertion.
 
 ### Layouts: the zero-copy forms and the counted fallbacks
 
@@ -147,19 +178,31 @@ op.compile()                             # the FROST row's plan, pinned by name;
 ws = torch.empty(max(op.get_workspace_size(), 1), dtype=torch.uint8, device=q.device)
 op.execute(q, k, v, bias, kv_lengths, o, lse, None, ws if op.get_workspace_size() else None, stream)   # no allocation, no conversion, no sync
 graph = op.make_cuda_graph(q, k, v, bias, kv_lengths, o, lse, ws)                                  # one graph launch per replay
+
+op_p = TriangleAttentionFwd(sample_q, sample_k, sample_v, sample_bias, mask=True, mask_is_prefix=True)   # the prefix-mask form
+op_p.check_support(); op_p.compile()
+ws_p = torch.empty(op_p.get_workspace_size(), dtype=torch.uint8, device=q.device)                 # + the derived lengths + the mask staging
+op_p.execute(q, k, v, bias, None, o, None, None, ws_p, stream, mask=mask)                         # lengths derived on the device, no sync
+op_p.execute(q, k, v, bias, None, o, None, None, ws_p, stream, mask=mask, check_prefix_mask=True)  # + the debug check (one sync, typed error)
 ```
 
 Constructor flags: `kv_lengths=True` / `mask=True` (the key-mask form; the dense form is passed to `execute(..., mask=mask)`),
-`lse=True` (the fp32 `(B, N, H, S_q)` log-sum-exp), `score_max=True` (declined today, see the table), `scale`, `sample_o` (the output's
-layout; None = the compact `(B, N, S, H, D)` form). `execute` validates every tensor against the declaration -- device, dtype, shape,
+`mask_is_prefix=True` (with `mask=True`: the boolean mask asserted prefix-shaped, its row lengths derived on the device at `execute`
+and served through the `kv_lengths` graph form -- the same compiled plan as `kv_lengths=True`), `lse=True` (the fp32 `(B, N, H, S_q)`
+log-sum-exp), `score_max=True` (declined today, see the table), `scale`, `sample_o` (the output's layout; None = the compact
+`(B, N, S, H, D)` form). `execute` validates every tensor against the declaration -- device, dtype, shape,
 strides, the base alignment each operand's reader needs (16 bytes for the TMA-read `q` / `k` / `v` / `bias` / `o`, 4 bytes for the
 int32 lengths and the fp32 `lse`, none for the byte mask), the mask form -- and launches once per outer batch entry
-(`launches_per_call`). A plan is bound to the device it was declared on; declare and compile one per device. The prepared API owns
+(`launches_per_call`); its keyword `check_prefix_mask` (the prefix-mask form only; True / False / None = the environment decides) is the
+debug check above. A plan is bound to the device it was declared on; declare and compile one per device. The prepared API owns
 no device memory. The graph's padding contract takes a length tensor on both sides and the kernel bounds the live Q rows by `seq_len_q`;
-every Q row of a triangle-attention call is live, so on the `kv_lengths` form `get_workspace_size()` adds `N` int32 words that `execute`
-fills with `S_q` on its stream before the launches -- one driver memset, stream-ordered, a memset node in a captured CUDA graph. The
+every Q row of a triangle-attention call is live, so on the `kv_lengths` and prefix-mask forms `get_workspace_size()` adds `N` int32 words
+that `execute` fills with `S_q` on its stream before the launches -- one driver memset, stream-ordered, a memset node in a captured CUDA
+graph; the prefix-mask form adds `B * N` int32 words for the KV lengths it derives and `B * N * S_kv` int32 words the mask is staged in
+(its one cast, into the caller's memory: torch's own bool-to-int32 reduction would stage a hidden temporary). The
 workspace is sized and carved by the SDPA adapters' shared recipe (`ws_align` 128-byte chunks dealt in order by `WorkspaceCarver`: the
-plan's own bytes first, the lengths next); a missing, undersized or misaligned buffer raises the carver's own error -- its base rule is
+plan's own bytes first, the Q-side lengths next, then the derived KV lengths and the mask staging); a missing, undersized or misaligned
+buffer raises the carver's own error -- its base rule is
 16-byte alignment, which a torch allocation satisfies (the lengths' reader itself needs 4) -- and the buffer must be contiguous and on the
 plan's device. Nothing is allocated at build or at execute, and no per-plan tensor exists to be released at garbage-collection time inside
 someone else's capture; the drop-in function allocates that workspace per call.
@@ -181,7 +224,11 @@ hundreds of pinned calls) and the comparison against cuEquivariance on Rubin fol
 
 `test/python/triangle_attention/cutedsl/test_api.py` (L0): the fp64 reference over the acceptance grid (`S` x `D` x `B` x the three mask
 forms, empty rows on both forms), the head dims served by zero fill, fp16 / GQA / a head-broadcast bias / `S_q != S_kv`, the prefix mask vs
-`kv_lengths` (bitwise), the class API's LSE and the masked-row contract, `B = 2` against the single-entry calls (bitwise), the
+`kv_lengths` (bitwise), the prefix-mask form (`mask_is_prefix=True`) bitwise against both lengths routes on four shapes incl. empty
+rows and the 217 tail (o and lse, the derived lengths read back from the caller's workspace), its debug check on a holed mask (the
+kwarg and the environment variable; the check off = the documented count behaviour, stated by the test), its allocation-free and
+synchronisation-free execute (the allocator's allocation count unchanged), its CUDA-graph capture following the mask's contents, the
+device-side helper on CPU tensors, the class API's LSE and the masked-row contract, `B = 2` against the single-entry calls (bitwise), the
 single-entry slices of a `B = 2` batch at `S = 217` on both surfaces (`mask[1:]`, `kv_lengths[1:]`, `lse[1:]` bind as they are;
 `kv_lengths` passed positionally), the layout
 fallbacks (head-major activations: 4 counted copies, the output following `q`; the permuted / fp32 / tail bias: 1 counted copy each),

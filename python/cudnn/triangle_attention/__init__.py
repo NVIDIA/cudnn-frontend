@@ -11,7 +11,8 @@ it on the caller's stream.
 Public surface (``api.py``; cuEquivariance's ``triangle_attention`` signature, pinned to 0.12.0):
 
   ``triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False, kv_lengths=None)``      the drop-in function
-  ``mask_to_kv_lengths(mask)``                                                                            prefix-shaped mask -> lengths (or None)
+  ``mask_to_kv_lengths(mask)``                                                                            prefix-shaped mask -> lengths (or None); ONE host sync
+  ``prefix_mask_to_kv_lengths(mask, out=None, *, workspace=None, check=None, stream=None)``             an ASSERTED prefix mask -> lengths on the device, no sync
   ``TriangleAttentionFwd``                                                                                 the prepared class API
   ``triangle_attention_reference``                                                                         the fp64 reference (``reference.py``)
   ``copy_counters`` / ``reset_copy_counters``                                                              the counted layout fallbacks of the function
@@ -32,6 +33,7 @@ _LAZY_EXPORTS = {
     "TriangleAttentionFwd": (".api", "TriangleAttentionFwd"),
     "triangle_attention": (".api", "triangle_attention"),
     "mask_to_kv_lengths": (".api", "mask_to_kv_lengths"),
+    "prefix_mask_to_kv_lengths": (".api", "prefix_mask_to_kv_lengths"),
     "copy_counters": (".api", "copy_counters"),
     "reset_copy_counters": (".api", "reset_copy_counters"),
     "CUEQ_SIGNATURE_VERSION": (".api", "CUEQ_SIGNATURE_VERSION"),
