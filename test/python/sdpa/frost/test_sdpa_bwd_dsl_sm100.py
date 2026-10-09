@@ -1691,7 +1691,8 @@ def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
         params.update(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
     st, expect = _stage2_sass_probe(tmp_path, arch, params, tag=f"stage2_2x2_{arm}")
     # The compute WG's three-range split traces ITS kv body once per range; the MMA warp's kv loop is one body.
-    n_compute_bodies = 1 if arm == "dense" else 3
+    # Without SWA the low-edge range is [left, left) and the compiler drops it, so causal keeps two bodies.
+    n_compute_bodies = {"dense": 1, "causal": 2, "causal_swa": 3}[arm]
     assert expect["DESC_VERSION"] == 0 and expect["CLUSTER_Q_ROWS"] == 256 and expect["N_CHUNKS"] == 8
     # USETMAXREG is 0 here as on the 4x1 sibling: ptxas C7508 drops every setmaxregister of these 8-warp d512 bodies (it
     # cannot determine the entry count) -- recorded, not required; the 12-warp sm107 bodies pin > 0 (see that file).
