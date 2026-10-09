@@ -839,10 +839,19 @@ ratios read the kernel-only CUPTI time):
   640 / 768 / 896 it is -1 / -33 / -19 / -5 % (two GPUs, the gap closing
   monotonically towards 1024) -- not a rule; the pair ring with `n_chunk 4` is
   within 0..3 % of the best form everywhere >= 640.
-- `BIAS_PRELOAD_CHUNKS` 1 -> 0 flips sign with the rendering (a base / 0 / base
-  cross-process A/B/A over 27 cells, base drift <= 0.23 %): +1.4..+3.2 % on every
-  TILE_N 128 bias form, -2.5..-2.7 % on the bias + kv_mask body at TILE_N 64 (the
-  body the chooser will pick for that graph) -- so it is a per-RENDERING
+- `BIAS_PRELOAD_CHUNKS` 1 -> 0 flips sign with the rendering's FORM (a base / 0 /
+  base cross-process A/B/A over 27 cells, base drift <= 0.23 %, then a 12-cell
+  confirm of the applied constant, control floors <= 0.18 %): at TILE_N 128
+  +1.8..+3.2 % on the RESIDENT bias forms at S_kv >= 384 (+0.9..+2.1 % with a
+  kv_mask on the pair forms, -0.7 % on the one-batch-entry + kv_mask; a second node
+  of the class read the same S 384 d32 forms +1.7..+1.9 / +3.1 / +1.2 %), +0.0..+0.6 %
+  on the streamed ring, -1.2..+0.7 % at one kv tile (S 128, where the chooser never
+  picks 128 for a bias graph); the confirm on the applied tree +2.1 % (resident
+  pair) and +0.3 / +0.5 / +0.3 % on the three 128-wide ring renderings (above the
+  replay control floors, inside the CUPTI control spread); at TILE_N 64 the signs
+  are MIXED -- the resident bias + kv_mask body (the body the chooser picks for
+  that graph) -2.5..-2.7 %, the resident bias-only forms +0.3..+1.4 %, the ring
+  -2.6 % plain / +1.4 % with a kv_mask (one cell each) -- so it is a per-RENDERING
   constant, never a module default: `config_sm107.sm107_bias_preload_chunks`
   (`SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N`: 0 at TILE_N 128, 1 at TILE_N 64), read
   once by the kernel module from `CFG.TILE_N`; numerics are unchanged at every

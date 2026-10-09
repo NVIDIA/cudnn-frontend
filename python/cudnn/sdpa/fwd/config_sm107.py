@@ -341,13 +341,21 @@ SM107_SMALL_TILE_N_DEFAULT, SM107_SMALL_TILE_N_NARROW = 128, 64
 SM107_NARROW_TILE_S_KV_MAX = 256
 # How many of a kv step's 64-column bias chunks the softmax lanes pre-load BEFORE the bmm1_done wait (the kernel's
 # BIAS_PRELOAD_CHUNKS), per RENDERING, keyed on the KV tile width -- the sign of the pre-load is a property of the rendering, not of
-# the kernel (MEASURED, bf16 D 32 / 64, a 212-SM cc 10.7 node at the 2376 MHz lock, 100 x 3 graph-replay rounds, a base / 0 / base
-# cross-process A/B/A over 27 cells with the base drift <= 0.23 %): on the 128-wide tile loading NOTHING ahead of the wait is
-# +1.4..+3.2 % on every bias form (+1.7..+1.9 % on the pair item, +3.1 % on the one-batch-entry item, +1.2 % with a kv_mask) -- the
-# row read hides in place on the issue-bound body and the 32 packed words it kept live across the wait are freed; on the 64-wide
-# tile the bias + kv_mask body LOSES 2.5..2.7 % without the pre-load (its one 64-column chunk has nothing to overlap the row read
-# with), so that width keeps one chunk ahead of the wait (the bias-only 64-wide renderings are unmeasured either way and keep it
-# too); two chunks ahead is -1.0 % (64 words live across the wait).  Read by the kernel module at render time (one arithmetic, rule
+# the kernel (MEASURED, bf16 D 32 / 64, a 212-SM cc 10.7 node at the 2376 MHz lock, 100 x 3 graph-replay rounds: a base / 0 / base
+# cross-process A/B/A over 27 cells with the base drift <= 0.23 %, then a base / applied / base confirm over 12 cells with control
+# floors <= 0.18 % and base drift <= 0.2 %).  The sign is PER FORM, not per width.  On the 128-wide tile loading NOTHING ahead of the
+# wait is +1.8..+3.2 % on the RESIDENT bias forms at S_kv >= 384 (the pair item +1.9 / +2.0 %, the one-batch-entry item +3.2 %; with
+# a kv_mask +0.9..+2.1 % on the pair forms, -0.7 % on the one-batch-entry at S 384 -- a second node of the class read the same S 384
+# d32 forms +1.7..+1.9 / +3.1 / +1.2 %, two chunks ahead -1.0 %), +0.0..+0.6 % on the STREAMED ring (S 768) and
+# -1.2..+0.7 % at ONE kv tile (S 128, 5 of 6 forms a loss or noise -- a width the heuristics never pick for a bias graph below
+# S_kv 384): the row read hides in place on the issue-bound body and the 32 packed words it kept live across the wait are freed.
+# The confirm of the applied constant: +2.1 % (d32 S 384, pair resident) and +0.3 / +0.5 / +0.3 % on the three 128-wide streamed-ring
+# renderings (d32 S 1024 one-batch-entry; d64 S 512 / 1024 pair) -- above the replay control floors and the base drift, inside the
+# CUPTI control spread (0.9-1.1 %) of the same processes.  On the 64-wide tile the signs are MIXED: the resident bias + kv_mask
+# body (the heuristics' pick for a bias with any mask) LOSES 2.5..2.7 % without the pre-load (S 128 / 384; its one 64-column chunk
+# has nothing to overlap the row read with), the resident bias-only forms gain +0.3..+1.4 %, the streamed ring loses 2.6 % without
+# a mask and gains 1.4 % with one (S 768, one cell each) -- so that width keeps one chunk ahead of the wait for its served masked
+# body; two chunks ahead is -1.0 % (64 words live across the wait).  Read by the kernel module at render time (one arithmetic, rule
 # 8b'); the domain {0, 1, 2} is the kernel's.
 SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N = {SM107_SMALL_TILE_N_DEFAULT: 0, SM107_SMALL_TILE_N_NARROW: 1}
 

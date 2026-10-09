@@ -366,9 +366,9 @@ from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 # block is resident, so the fragment has no dependency on BMM1): 0 = after the wait, 1 = chunk 0 under BMM1 and chunk 1 under
 # chunk 0's math (32 packed words live across the wait), 2 = the whole fragment (64 words across the wait; read STL / LDL before
 # adopting it).  A per-RENDERING constant keyed on the KV tile width (config_sm107.sm107_bias_preload_chunks: 0 on the 128-wide
-# tile, 1 on the 64-wide one -- the measured signs are opposite, so neither value is a module default), read once here like
-# SPIN_RING_WAITS and never a literal at a call site; numerics are unchanged at every value (the same words are added in the same
-# order), only the instruction stream around the wait moves.
+# tile, 1 on the 64-wide one -- the measured sign differs by FORM, the config's table carries the numbers, so neither value is a
+# module default), read once here like SPIN_RING_WAITS and never a literal at a call site; numerics are unchanged at every value
+# (the same words are added in the same order), only the instruction stream around the wait moves.
 BIAS_PRELOAD_CHUNKS: int = sm107_bias_preload_chunks(CFG.TILE_N)
 _BIAS_ARM = bool(CFG.BIAS_MODE)
 # The bias FORM: the resident block (the two item-level rows R1 / R2) or the streamed ring (the two ring rows S1 / S2); every

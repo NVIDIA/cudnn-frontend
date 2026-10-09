@@ -507,8 +507,10 @@ def test_kernel_module_constants_and_mask_sites():
     assert src.count("BIAS_PRELOAD_CHUNKS: int =") == 1
     from cudnn.sdpa.fwd import config_sm107 as cfg107
 
-    # the table: nothing ahead of the wait on the 128-wide tile (+1.4..+3.2 % on every bias form), one chunk on the 64-wide one (the
-    # bias + kv_mask body loses 2.5..2.7 % without it); every value in the kernel's domain; an unrelated width keeps the one-chunk default
+    # the table: nothing ahead of the wait on the 128-wide tile (+1.8..+3.2 % on the resident bias forms at S_kv >= 384, +0.0..+0.6 % on the
+    # streamed ring; the confirm of the applied constant +2.1 % resident / +0.3..+0.5 % ring), one chunk on the 64-wide one (the resident
+    # bias + kv_mask body -- the chooser's pick for a masked bias graph -- loses 2.5..2.7 % without it; the other 64-wide forms are mixed);
+    # every value in the kernel's domain; an unrelated width keeps the one-chunk default
     assert cfg107.SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N == {128: 0, 64: 1}
     assert [cfg107.sm107_bias_preload_chunks(w) for w in (128, 64, 256)] == [0, 1, 1]
     assert all(cfg107.sm107_bias_preload_chunks(w) in (0, 1, 2) for w in (32, 64, 128, 256))
