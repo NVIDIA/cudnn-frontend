@@ -154,8 +154,15 @@ split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
 compatible with split execution. Pass `use_clc=True` to use persistent CLC
 scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the
-automatic scheduler policy has not been tuned for that combination. Automatic
-split selection uses metadata capacity rather than per-row count values. It
+automatic scheduler policy has not been tuned for that combination. For BF16,
+automatic split selection uses the fixed active KV block count: 450--899 blocks
+select four splits and 900 or more select eight, including long-Q workloads.
+When there are fewer than 512 total Q tiles (`B * H * ceil(S_q / 64)`),
+256--449 fixed blocks also select two splits. Larger Q grids with fewer than
+450 fixed blocks keep one split. For variable per-row counts, a larger Q grid
+keeps one split because index capacity does not describe actual row work;
+short-Q workloads use that capacity as an upper bound without reading counts
+back to the host. The Sage FP8 split policy is separate. Automatic selection
 falls back to a smaller split count when the estimated live workspace does not
 fit the available CUDA allocator budget; an explicit split count that exceeds
 that budget raises `RuntimeError`.

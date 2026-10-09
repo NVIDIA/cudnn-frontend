@@ -407,12 +407,14 @@ def _sm100_blk64_auto_kv_splits(
     if kv_blocks <= 1:
         return 1
 
-    # Large-Q workloads already expose enough independent Q tiles to fill the
-    # GPU. Splitting KV adds FP32 partial output traffic and a combine launch
-    # without providing useful extra parallelism.
+    # Long fixed-count rows can benefit from splitting even with a full Q grid:
+    # GB200 video workloads prefer 4/8 splits at 450/900 active KV blocks.
+    # Below that range, partial-output traffic and combine outweigh the gain.
+    # For variable counts, capacity is only an upper bound, not row work: a
+    # packed production mask can reserve thousands of slots for short rows.
     batch, heads, seqlen_q, _ = q.shape
     total_q_tiles = batch * heads * _ceil_div_int(seqlen_q, 64)
-    if total_q_tiles >= 512:
+    if total_q_tiles >= 512 and (fixed_block_sparse_num <= 0 or kv_blocks < 450):
         return 1
 
     if kv_blocks >= 900:
@@ -1209,6 +1211,7 @@ def _combine_blk64_kv_bucketed_partials(
     lse_partial_phys: torch.Tensor,
     kv_splits: int,
     output_dtype: Optional[torch.dtype] = None,
+    layout: str = "bhsd",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Combine KV-bucketed partial outputs using the shared CuTeDSL combine kernel."""
     if BlockSparseAttnForwardCombine is None:
@@ -1243,16 +1246,19 @@ def _combine_blk64_kv_bucketed_partials(
             seqlen_q,
         ),
     )
-    out_bshd = torch.empty(
-        (batch, seqlen_q, num_heads, head_dim),
+    out_shape = (batch, num_heads, seqlen_q, head_dim) if layout == "bhsd" else (batch, seqlen_q, num_heads, head_dim)
+    out = torch.empty(
+        out_shape,
         dtype=output_dtype,
         device=q.device,
     )
-    lse_bsh = torch.empty(
-        (batch, seqlen_q, num_heads),
+    out_bshd = out.transpose(1, 2) if layout == "bhsd" else out
+    lse = torch.empty(
+        (batch, num_heads, seqlen_q),
         dtype=torch.float32,
         device=q.device,
     )
+    lse_bsh = lse.transpose(1, 2)
     dtype = torch2cute_dtype_map[output_dtype]
     log_max_splits = _ceil_log2_int(kv_splits)
     # Baseline combine geometry; a single configuration is easier to maintain.
@@ -1271,7 +1277,7 @@ def _combine_blk64_kv_bucketed_partials(
         log_max_splits,
         combine_num_threads,
         combine_stages,
-    )
+    ) + (layout,)
     if compile_key not in _combine_blk64_kv_bucketed_partials.compile_cache:
         combine_kernel = BlockSparseAttnForwardCombine(
             dtype=dtype,
@@ -1298,13 +1304,14 @@ def _combine_blk64_kv_bucketed_partials(
             _to_cute_tensor_dynamic_compact_shape(
                 out_bshd,
                 mode=(0, 1, 2),
-                stride_order=(0, 1, 2, 3),
+                stride_order=(0, 2, 1, 3) if layout == "bhsd" else (0, 1, 2, 3),
             ),
             _to_cute_tensor_dynamic_compact_shape(
                 lse_bsh,
                 mode=(0, 1, 2),
                 assumed_align=4,
-                stride_order=(0, 1, 2),
+                leading_dim=1,
+                stride_order=(0, 2, 1),
             ),
             None,
             None,
@@ -1332,9 +1339,6 @@ def _combine_blk64_kv_bucketed_partials(
         current_stream,
     )
 
-    # Match the non-split BHSD/BHS output stride contract.
-    out = out_bshd.transpose(1, 2).contiguous()
-    lse = lse_bsh.transpose(1, 2).contiguous()
     return out, lse
 
 
@@ -1430,9 +1434,7 @@ def bsa_attn_fwd_blk64_cutedsl(
         q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t) for t in (q, k, v)]
     else:
         assert layout == "bshd", f"layout must be 'bhsd' or 'bshd', got {layout!r}"
-        q_bhsd = q.transpose(1, 2).contiguous()
-        k_bhsd = k.transpose(1, 2).contiguous()
-        v_bhsd = v.transpose(1, 2).contiguous()
+        q_bhsd, k_bhsd, v_bhsd = [maybe_contiguous(t).transpose(1, 2) for t in (q, k, v)]
 
     batch_size, num_head, seqlen_q, head_dim = q_bhsd.shape
     seqlen_k = k_bhsd.shape[2]
@@ -1567,11 +1569,13 @@ def bsa_attn_fwd_blk64_cutedsl(
             device=q_bhsd.device,
         )
     else:
-        out_bhsd = torch.empty(
-            (batch_size, num_head, seqlen_q, head_dim_v),
+        out_shape = (batch_size, num_head, seqlen_q, head_dim_v) if layout == "bhsd" else (batch_size, seqlen_q, num_head, head_dim_v)
+        out = torch.empty(
+            out_shape,
             dtype=output_dtype,
             device=q_bhsd.device,
         )
+        out_bhsd = out if layout == "bhsd" else out.transpose(1, 2)
         lse = torch.empty(
             (batch_size, num_head, seqlen_q),
             dtype=torch.float32,
@@ -1688,17 +1692,17 @@ def bsa_attn_fwd_blk64_cutedsl(
         )
 
     if kv_splits_i > 1:
-        out_bhsd, lse = _combine_blk64_kv_bucketed_partials(
+        out, lse = _combine_blk64_kv_bucketed_partials(
             q_bhsd,
             out_bhsd,
             lse,
             kv_splits_i,
             output_dtype=output_dtype,
+            layout=layout,
         )
         # Keep split_offsets alive through the combine launch on the same stream.
         _ = split_offsets
 
-    out = out_bhsd if layout == "bhsd" else out_bhsd.transpose(1, 2).contiguous()
     return out, lse
 
 
