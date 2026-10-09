@@ -54,6 +54,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPI
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
+    supports_paged_split_sink,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
@@ -2018,7 +2019,28 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd and not (self.thd_decode_leg or self.packed_thd_split),
                 "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128/D256 or nonpaged D192 packed split",
             )
-            self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
+            self._value_error_if(
+                self.has_sink
+                and not (
+                    self.packed_thd_split
+                    and supports_paged_split_sink(
+                        (int(d_qk), int(d_v)),
+                        device_cc=self._device_cc,
+                        fp8=self._fp8,
+                        thd=self.thd,
+                        paged=self.paged,
+                        max_q=int(s_qo),
+                    )
+                ),
+                "split_kv > 1 with an attention sink requires Rubin paged D128 half packed Q>1",
+            )
+            if self.has_sink:
+                from cudnn import _pybind_module
+
+                self._not_implemented_error_if(
+                    not getattr(_pybind_module._SdpaThdBinder, "supports_paged_split_sink", False),
+                    "packed split sinks require the matching native cuDNN Frontend extension",
+                )
             # Paged KV is padded by construction; its split composes with the
             # per-batch lengths (validated in test_sdpa_fwd_paged_sm100).
             self._value_error_if(
@@ -2357,7 +2379,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             window_left=self.window_left,
             window_right=self.window_right,
             bottom_right=self.causal_bottom_right,
-            has_sink=self.has_sink,
+            # Partial normalizers exclude the sink; packed combine adds it once.
+            has_sink=self.has_sink and not self.packed_thd_split,
             # Packed split owns the final combine in this template. Its main
             # kernel keeps partial Stats natural-log; retain the requested
             # final base for the combine instead of discarding it here.
@@ -2630,7 +2653,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.packed_thd_split:
             ps = self._paged_pool_stride(self.k_desc) if self.paged else None
             return dict(
-                has_lse=self.lse_desc is not None, lse_kind="head" if self.thd_stats_head_major else "token", paged_hnd=ps is not None and ps[1] < ps[2]
+                has_lse=self.lse_desc is not None,
+                lse_kind="head" if self.thd_stats_head_major else "token",
+                paged_hnd=ps is not None and ps[1] < ps[2],
+                **({"has_sink": True} if self.has_sink else {}),
             )
         if not self.thd or self.thd_decode_leg:
             # The ragged-Q decode leg's in-kernel LSE is the dense split-major

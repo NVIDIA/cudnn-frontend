@@ -42,6 +42,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
     supports_thd_split,
+    supports_paged_split_sink,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES, SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
@@ -560,7 +561,17 @@ def thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> 
     return (
         capabilities.sm_lo in (100, 107)
         and (not facts.shape_overrides or (facts.max_total_seq_len_q is not None and 0 < facts.max_total_seq_len_q <= facts.b * facts.s_q))
-        and not facts.has_sink
+        and (
+            not facts.has_sink
+            or supports_paged_split_sink(
+                (facts.d_qk, facts.d_v),
+                device_cc=facts.device_cc,
+                fp8=facts.is_fp8 or facts.is_mxfp8,
+                thd=facts.thd,
+                paged=facts.has_paged_kv,
+                max_q=facts.s_q,
+            )
+        )
         and not facts.has_epilogue_gate
         and supports_thd_split(
             (facts.d_qk, facts.d_v),
@@ -615,6 +626,8 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         if facts.has_epilogue_gate:
             return "prepared THD overrides cannot use an epilogue gate"
         if (split_kv or 1) > 1:
+            if facts.has_sink and not getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_split_sink", False):
+                return "packed split sinks require the matching native cuDNN Frontend extension"
             # Ragged-Q decode binds offsets through its dense launch. The
             # paged D128 THD leg instead owns bounded packed partial regions.
             return None if _thd_decode_leg(capabilities, facts) or thd_split_domain(capabilities, facts) else "prepared THD overrides cannot use split-KV"
@@ -859,7 +872,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # machine underfilled), so it is exempt from the padded exclusion.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
-                or facts.has_sink
+                or (facts.has_sink and not packed_split)
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):

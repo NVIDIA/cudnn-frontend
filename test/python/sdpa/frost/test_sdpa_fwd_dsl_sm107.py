@@ -778,7 +778,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
         knobs = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
-        assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is not None
+        assert (engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None) == paged
         bounded = dataclasses.replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
         assert engines.mismatch(caps, bounded, knobs) is None
         assert engines.mismatch(caps, dataclasses.replace(bounded, max_total_seq_len_q=None), knobs) is not None
@@ -797,7 +797,7 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
             for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
                 assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
         assert "THD queries" in engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs)
-        assert "sink-free" in engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2))
+        assert engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2)) is not None
 
 
 def test_sm107_dense_d128_shared_legs_admission():
@@ -7222,3 +7222,76 @@ def test_sm107_d512_fp8_half_softmax_sass_pins(tmp_path, has_lse, f32_ex2_min, f
     ), f"the d512 fp8 HALF has_lse={has_lse} build spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
     if stats["REG"] >= 0:
         assert stats["REG"] <= reg_measured + _REG_SLACK, f"REG {stats['REG']} > {reg_measured} + {_REG_SLACK}"
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("stats", ["none", "ln", "log2"])
+def test_packed_sink_combine_counts_virtual_key_once(dtype_name, stats):
+    """An empty real-key row still has its sink; dead partials never read poison."""
+    import math
+    import torch
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from test_sdpa_split_combine_sm100 import _partials, _output, _strides
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Sink-aware packed split is qualified on SM107")
+    dtype = getattr(torch, dtype_name)
+    owner = comb.compile_ptr(
+        dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=stats != "none", stats_log2=stats == "log2", packed=True, has_sink=True
+    )
+    fn = positional_entry(owner)
+    b, h, sq, d = 1, 3, 7, 160
+    ostride, lstride = _strides(b, h, sq, d, "int64_singleton")
+    for splits in (2, 32, 33):
+        op, lp, _, _ = _partials(b, h, sq, d, splits)
+        o, ostorage, used = _output((b, sq, h, d), ostride, dtype)
+        lse, lstorage, lused = _output((b, h, sq), lstride, torch.float32) if stats != "none" else (None, None, None)
+        total = torch.tensor([sq], device="cuda", dtype=torch.int32)
+        sinks = torch.tensor([-torch.inf, 3, 1000], device="cuda")
+
+        def run():
+            fn(
+                op.data_ptr(),
+                lp.data_ptr(),
+                o.data_ptr(),
+                lse.data_ptr() if lse is not None else None,
+                (b, h, sq, d),
+                splits,
+                ostride,
+                lstride,
+                total.data_ptr(),
+                torch.cuda.current_stream().cuda_stream,
+                sinks.data_ptr(),
+            )
+
+        run()
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(captured):
+                run()
+            for live, changed_sink in ((sq, 3), (3, -120), (0, 10)):
+                total.fill_(live)
+                sinks[1] = changed_sink
+                # Padded partial capacity is intentionally unreadable data.
+                op[:, live:].fill_(torch.nan)
+                lp[:, :, live:].fill_(torch.nan)
+                ostorage.fill_(-31)
+                if lstorage is not None:
+                    lstorage.fill_(-31)
+                captured.replay()
+                scores = lp[:, :, :live].cpu().double()
+                virtual = sinks.cpu().double()[None, :, None].expand(1, h, live)
+                weights = torch.cat((scores, virtual), 0).softmax(0).nan_to_num()
+                values = op[:, :live].cpu().double().nan_to_num()
+                ref_o = (weights[:-1].permute(0, 2, 1)[..., None] * values).sum(0)
+                torch.testing.assert_close(o[0, :live].cpu().double(), ref_o, atol=0.004, rtol=0.004)
+                assert torch.all(o[:, live:] == -31)
+                assert torch.all(ostorage.cpu()[~used] == -31)
+                if lse is not None:
+                    ref_s = torch.cat((scores, virtual), 0).logsumexp(0) * (math.log2(math.e) if stats == "log2" else 1)
+                    torch.testing.assert_close(lse[0, :, :live].cpu().double(), ref_s, atol=2e-5, rtol=2e-5)
+                    assert torch.all(lse[:, :, live:] == -31)
+                    assert torch.all(lstorage.cpu()[~lused] == -31)
+        finally:
+            captured.reset()

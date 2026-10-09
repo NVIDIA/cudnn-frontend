@@ -1172,12 +1172,13 @@ def test_thd_fp8_unfused_with_a_zero_length_sequence():
     _check_fp8_per_sequence(res)
 
 
-def _run_fp8_thd(lens, *, max_seq_len=None, training=False):
+def _run_fp8_thd(lens, *, max_seq_len=None, training=False, geom_kw=_COMMON):
     """The UNFUSED per-tensor FP8 packed forward over ``lens`` (``QuantSpec`` calibrated on the packed data as the FP8 suite
     does), INFERENCE by default; ``training=True`` (appended) declares ``save_for_backward=True`` and writes the bf16 training
     record (``_alloc_packed_saved`` at ``act_dtype=torch.bfloat16``, sentinel-filled; ``saved.h`` IS the e4m3 ``h``).  The
-    namespace carries the per-sequence fake-quant references, the QuantSpec, the e4m3 inputs, the workspace and the record."""
-    geom_kw = _COMMON
+    namespace carries the per-sequence fake-quant references, the QuantSpec, the e4m3 inputs, the workspace and the record.
+    ``geom_kw`` (appended): the block geometry, ``_COMMON`` by default (the packed fp8 BACKWARD suite varies the mask and the
+    GQA group through it)."""
     g = GatedAttentionBlockGeometry(**geom_kw)
     inp, meta = make_packed_inputs(RefGeometry(**geom_kw), lens, max_seq_len=max_seq_len)
     inp8, desc = quantize_block_inputs(inp)

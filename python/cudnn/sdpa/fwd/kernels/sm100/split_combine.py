@@ -299,6 +299,7 @@ def _combine_packed_kernel(
     total_q: cute.Tensor,
     n_splits: cutlass.Int32,
     stats_log2: cutlass.Constexpr[bool],
+    sinks: Optional[cute.Tensor] = None,
 ) -> None:
     """Four packed rows per CTA; each warp reuses split weights across D.
 
@@ -317,8 +318,13 @@ def _combine_packed_kernel(
     lp = cutlass.make_array_view(lse_partial)
     oo = cutlass.make_array_view(o_out)
     neg_inf = cutlass.Float32(NEG_INF)
+    # Sink-free partials carry only real keys. Add the per-head virtual key
+    # exactly once, in the same stable normalizer as the real split weights.
+    sink = neg_inf
+    if cutlass.const_expr(sinks is not None):
+        sink = cutlass.Float32(cutlass.make_array_view(sinks)[head])
     parallel = n_splits <= 32
-    m = neg_inf
+    m = sink
     m_safe = cutlass.Float32(0.0)
     all_dead = m == neg_inf
     den = cutlass.Float32(0.0)
@@ -330,6 +336,8 @@ def _combine_packed_kernel(
         m = lane_lse
         for bit in cutlass.range_constexpr(5):
             m = cute.math.max(m, cute.arch.shuffle_sync_bfly(m, 1 << bit))
+        if cutlass.const_expr(sinks is not None):
+            m = cute.math.max(m, sink)
         all_dead = m == neg_inf
         m_safe = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), m.ir_value()))
         if lane_lse > neg_inf:
@@ -347,6 +355,9 @@ def _combine_packed_kernel(
             partial_lse = cutlass.Float32(lp[split, head, row])
             if partial_lse > neg_inf:
                 den = den + cute.math.exp(partial_lse - m_safe, fastmath=True)
+    if cutlass.const_expr(sinks is not None):
+        if sink > neg_inf:
+            den = den + cute.math.exp(sink - m_safe, fastmath=True)
     inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_den.ir_value()))
     for d_base in cutlass.range(0, o_partial.shape[3], 128, unroll=1):
@@ -475,13 +486,15 @@ def _host_ptr_packed(
     total_q_ptr: cute.Pointer,
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
+    sinks_ptr: Optional[cute.Pointer] = None,
 ) -> None:
     """Combine compact [split, packed token, head, D] partials (B must be 1)."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     total_q = cute.make_tensor(total_q_ptr, cute.make_layout((1,), stride=(1,)))
-    _combine_packed_kernel(o_partial, lse_partial, o_out, lse_out, total_q, n_splits, stats_log2).launch(
+    sinks = cute.make_tensor(sinks_ptr, cute.make_layout((problem_size[1],), stride=(1,))) if cutlass.const_expr(sinks_ptr is not None) else None
+    _combine_packed_kernel(o_partial, lse_partial, o_out, lse_out, total_q, n_splits, stats_log2, sinks).launch(
         grid=((problem_size[2] + 3) // 4, problem_size[1], 1), block=[THREADS, 1, 1], stream=stream
     )
 
@@ -591,6 +604,7 @@ def compile_ptr(
     has_scale_o: bool = False,
     has_scale_o_input: bool = True,
     packed: bool = False,
+    has_sink: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -616,6 +630,8 @@ def compile_ptr(
         raise ValueError("the quantized pointer entry serves dense split launches")
     if packed and (ragged or quantized):
         raise ValueError("packed THD partials require the half pointer entry without ragged final placement")
+    if has_sink and not packed:
+        raise ValueError("sink-aware combine requires packed half partials")
     if ragged_i64 and not ragged:
         raise ValueError("ragged_i64 is a ragged specialization")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
@@ -654,4 +670,5 @@ def compile_ptr(
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
         symbol="frost_sdpa_fwd_combine_ptr",
+        **({"sinks_ptr": P(cutlass.Float32)} if has_sink else {}),
     )
