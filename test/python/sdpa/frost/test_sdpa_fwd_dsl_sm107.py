@@ -7072,10 +7072,10 @@ def _fp8_pertensor_problem(b, hq, hkv, s_q, s_kv, d, fp8_dtype, *, std=1.0, seed
     return (q8, dq, qd), (k8, dk, kd), (v8, dv, vd)
 
 
-def _fp8_oracle(qd, kd, vd, *, attn_scale, causal=False, causal_br=False, kv_lens=None):
+def _fp8_oracle(qd, kd, vd, *, attn_scale, causal=False, causal_br=False, kv_lens=None, window_left=None):
     """float64 softmax(attn_scale * QK^T) V and the natural-log LSE on the dequantized operands, composing the kernel's
-    mask: per-batch KV padding, top-left causal, or bottom-right causal anchored at (s_q, kv_len[b]).  A row with no live
-    key comes out as O = 0 / LSE = -inf."""
+    mask: per-batch KV padding, top-left causal, or bottom-right causal anchored at (s_q, kv_len[b]), plus an optional left
+    window of ``window_left`` past keys riding the diagonal.  A row with no live key comes out as O = 0 / LSE = -inf."""
     import torch
 
     b, hq, s_q, _ = qd.shape
@@ -7087,14 +7087,17 @@ def _fp8_oracle(qd, kd, vd, *, attn_scale, causal=False, causal_br=False, kv_len
     kl = (kv_lens.to(torch.int64) if kv_lens is not None else torch.full((b,), s_kv, dtype=torch.int64, device=qd.device)).view(b, 1, 1, 1)
     masked = j >= kl
     if causal:
-        masked = masked | (j > (i + (kl - s_q) if causal_br else i))
+        diag = i + (kl - s_q) if causal_br else i
+        masked = masked | (j > diag)
+        if window_left is not None:
+            masked = masked | (j < diag - window_left)
     logits = logits.masked_fill(masked, float("-inf"))
     lse = torch.logsumexp(logits, dim=-1)
     o = torch.softmax(logits, dim=-1).nan_to_num(0.0) @ vd.repeat_interleave(rep, 1)
     return o, lse
 
 
-def _run_d512_fp8(q8, k8, v8, descales, *, with_stats, precision, attn_scale, dtype_o, causal=False, causal_br=False, kv_lens=None):
+def _run_d512_fp8(q8, k8, v8, descales, *, with_stats, precision, attn_scale, dtype_o, causal=False, causal_br=False, kv_lens=None, window_left=None):
     """Build, compile and launch the d512 per-tensor FP8 kernel TWICE (NaN-poisoned outputs; a two-launch delta is a
     first-launch race); assert the build is the d512 per-tensor module with the requested arm; return (api, O, LSE)."""
     import torch
@@ -7114,6 +7117,7 @@ def _run_d512_fp8(q8, k8, v8, descales, *, with_stats, precision, attn_scale, dt
         scale_softmax=attn_scale,
         is_causal=causal,
         causal_bottom_right=causal_br,
+        window_size_left=window_left,
         seq_kv_lens_present=kv_lens is not None,
         pertensor_fp8=True,
         dtype_o=dtype_o,
@@ -7197,9 +7201,9 @@ def test_d512_fp8_half_softmax_matches_the_oracle(fmt, causal, b, hq, hkv, s):
 def test_d512_fp8_half_softmax_keyless_rows():
     """Keyless rows under the HALF arm: bottom-right causal with per-batch KV lengths (512, 256, 0) at s_q = 1024, s_kv = 512,
     so the first s_q - kv_len[b] rows of every head (all of batch 2) have no live key.  A fully-masked tile leaves the raw
-    max at the finite sentinel; the arm publishes P = exp2(0) = 1 with an f16 row-sum of 128, exactly as the f32 chain does,
-    and the epilogue's empty-row select must still publish O = 0 / LSE = -inf there while the live rows (some with a single
-    live key) match the oracle on both Stats legs, in the production bf16 O."""
+    max at the finite sentinel and the running-max step selects it out of the row's state (alpha = 1, P = 0 on the f16x2
+    arm exactly as on the f32 chain), and the epilogue's empty-row select publishes O = 0 / LSE = -inf there while the live
+    rows (some with a single live key) match the oracle on both Stats legs, in the production bf16 O."""
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
@@ -7240,6 +7244,55 @@ def test_d512_fp8_half_softmax_keyless_rows():
             lse_err = (lse.double() - ref_lse).abs()[live].max().item()
             print(f"live rows LSE max err {lse_err:.3e} (natural log)")
             assert lse_err <= 1e-4, f"live rows LSE max err {lse_err} vs oracle (natural log): the Stats leg must keep the exact f32 denominator"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("precision_name", ["FLOAT", "HALF"])
+def test_d512_fp8_masked_leading_tile_keeps_rows_with_later_keys_finite(precision_name):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys, on the d512 per-tensor FP8 role-split
+    kernel: top-left causal with a 34-key band at S = 256 (rows 161..255: no key in tile 0, 34 keys in tile 1) under UNIT
+    descales and attn_scale 1 -- the folded scale_log2 = log2 e > 1 overflowed the scaled mask sentinel to -inf, the running
+    max of that tile, and -inf - (-inf) = NaN went into P and the row-sum (with the quantizer's descales the tile published
+    P = 1 instead, wiped by alpha = 0 at the next live tile).  Values drawn inside the fp8 range; both softmax arms, both
+    Stats legs through the module's two-launch runner: O and LSE finite and at the float64 oracle."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the d512 per-tensor FP8 kernel serves cc10.7 only")
+    from cudnn import data_type as cudnn_dtype
+
+    b, hq, hkv, s, d = 1, 8, 2, 256, _D512_FP8_HALF_D
+    gen = torch.Generator(device="cuda").manual_seed(0)
+
+    def draw(h, std):
+        x8 = (torch.randn(b, s, h, d, device="cuda", generator=gen) * std).to(torch.float8_e4m3fn).transpose(1, 2)
+        return x8, x8.double()
+
+    (q8, qd), (k8, kd), (v8, vd) = draw(hq, 1.0), draw(hkv, 1.0), draw(hkv, 1.0)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    ref, ref_lse = _fp8_oracle(qd, kd, vd, attn_scale=1.0, causal=True, window_left=33)
+    assert torch.isfinite(ref_lse).all(), "geometry: every row keeps 34 keys"
+    scale = ref.abs().max().item()
+    for with_stats in (True, False):
+        _, out, lse = _run_d512_fp8(
+            q8,
+            k8,
+            v8,
+            (unit, unit, unit),
+            with_stats=with_stats,
+            precision=getattr(cudnn_dtype, precision_name),
+            attn_scale=1.0,
+            dtype_o=torch.bfloat16,
+            causal=True,
+            window_left=33,
+        )
+        assert torch.isfinite(out).all(), f"stats={with_stats}: {int((~torch.isfinite(out)).sum())} non-finite O cells"
+        err = (out.double() - ref).abs().max().item()
+        assert err <= 0.1 * scale, f"stats={with_stats}: O max err {err} vs oracle (scale {scale})"
+        if with_stats:
+            assert torch.isfinite(lse).all(), f"{int((~torch.isfinite(lse)).sum())} non-finite LSE rows"
+            lse_err = (lse.double() - ref_lse).abs().max().item()
+            assert lse_err <= 1e-4, f"LSE max err {lse_err} vs oracle (natural log)"
 
 
 @pytest.mark.L0
