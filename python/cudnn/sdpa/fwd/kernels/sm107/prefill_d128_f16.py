@@ -454,8 +454,8 @@ _HW_UPPER_MAX = CFG.BIAS_MAX_FORM == BIAS_MAX_HW_UPPER_BOUND
 #   both sides), three Q / O slabs, three stages of every per-sub-tile ring (q_full / q_empty / bmm1_done / bmm2_done / bmm2_ready /
 #   stat_full / stat_empty / o_full / o_empty -- every init count UNCHANGED: each row counts the lanes of ONE role per sub-tile).
 #   Rows whose init DOES move: mb_bias_empty / mb_bias_ring_empty 8 -> 12 (one elected arrive per softmax WARP = SOFTMAX_WARPGROUPS x
-#   SOFTMAX_WG_WARPS, pinned by config_sm107._validate_bias), mb_read_tile_id 15 -> 19 (12 + 4 + 2 + the scheduler warp), named barrier
-#   1 (the MMA's TMEM publish) 288 -> 416 threads (spelled from the Cfg).  The P-publish hand-off becomes a 3-way chain: WG1 waits WG0
+#   SOFTMAX_WG_WARPS, pinned by config_sm107._validate_bias), mb_read_tile_id 15 -> 19 (12 + 4 + MMA + TMA-LDG + TMA-STG; the scheduler warp waits it),
+#   named barrier 1 (the MMA's TMEM publish) 288 -> 416 threads (spelled from the Cfg).  The P-publish hand-off becomes a 3-way chain: WG1 waits WG0
 #   on named barrier 8 (as before), WG2 waits WG1 on named barrier 9 (NEW; 256 threads each).  P14: a chunk whose length is not a
 #   multiple of 3 ends with one or two DEAD sub-tiles that clamp to the last live row (every barrier fired, only the stores gated), the
 #   same path a dead sub-tile 1 runs today.  TMEM: S 0 / 64 / 128 (P in each tail +32), O 192 / 224 / 256, STATS 544 (288 <= 544 at D 32).

@@ -126,7 +126,7 @@ def test_the_seam_feeds_the_record_not_a_cfg_behind_it(_pins):
 @pytest.mark.parametrize("d", [32, 64])
 def test_the_factory_derives_the_twenty_warp_table_the_split_and_the_arriver_counts(d):
     """The three-group body as the config: 20 warps, one group per sub-tile, the role ids contiguous, READ_TILE_ARRIVERS 19 (12 softmax + 4
-    correction + MMA + TMA-LDG + the scheduler warp), BIAS_EMPTY_ARRIVERS 12 (one elected arrive per softmax warp), the split EQUAL to the
+    correction + MMA + TMA-LDG + TMA-STG; the scheduler warp waits it), BIAS_EMPTY_ARRIVERS 12 (one elected arrive per softmax warp), the split EQUAL to the
     launch's entry pool at both counts (frost-kernels.md s2: `SUM(role regs x warps) == entry x warps`)."""
     from cudnn.sdpa.bwd.config_sm107 import reg_entry_pool
 
