@@ -685,7 +685,7 @@ route (``manifest.py`` selection) is a later option if a second arch needs it.
 
 P0 limits (all typed, at declaration -- ``check_support``): bf16 / fp16, and
 per-tensor fp8 over the fp8 training record (``quant=QuantSpec``: bf16
-activations and gradients, dense only, any ``B*S``), and MXFP8 over the MXFP8
+activations and gradients, dense or packed (``thd=True``), any ``B*S``), and MXFP8 over the MXFP8
 training record (``quant=MxQuantSpec``: bf16 activations and gradients, dense
 only, ``B*S % 32 == 0`` when a projection weight gradient is requested, the
 caller's transposed artifacts at ``execute`` -- e2m1 ones under the fp4 weight
