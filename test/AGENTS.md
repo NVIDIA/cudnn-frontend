@@ -280,6 +280,15 @@ containers (CI) set `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1`, while pip torch uses
 IEEE fp32. A test that relies on the default passes in CI and fails locally,
 where `test_gemm_swiglu.py` had 64 such failures.
 
+### Clamp gradients at the boundary
+
+torch 2.14 changed `clamp`'s backward on the boundary itself: `x.clamp(-7, 7)`
+at `x = [-7, 0, 7]` gives `[0, 1, 0]`, while 2.11 / 2.13 give `[1, 1, 1]`. An
+autograd oracle that puts inputs exactly on a clamp limit therefore changes with
+the image's torch. State the kernel's convention with an explicit
+`torch.where(inside, x, x.detach().clamp(lo, hi))` instead
+(`test_grouped_dgeglu_autograd.py::clamp_closed`, #1522).
+
 ### Sanitizer diagnostic controls
 
 Keep kernel-launch dumps separate from the pass/fail sanitizer invocation.

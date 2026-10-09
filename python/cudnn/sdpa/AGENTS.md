@@ -618,6 +618,17 @@ replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
 
 
+## Adapter declines that other suites pin
+
+`gated_attention_block` runs the SDPA forward adapter as its attention stage, and
+its tests pin the adapter's declines by message (`match="multiple of 128"`).
+Those tests run only on the `oss` CI lanes (`python/*/cutedsl`, SM107). A change
+that serves a previously declined shape needs `@cudnn-ci-bot run ...,oss`, not
+only `frost`. #1520 (the KV-tail mask) turned 15 GAB decline pins red because its
+CI ran `python_tests,frost` (#1522). Detector: `git grep -n "match=" test/python/gated_attention_block`
+for the old message.
+
+
 ## Prepared THD launch bounds and setup
 
 Each compiled host contract has one production binder across graph, standalone,
