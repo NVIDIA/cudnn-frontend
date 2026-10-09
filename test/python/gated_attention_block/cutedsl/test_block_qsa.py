@@ -17,6 +17,7 @@ import sys
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import (
     GatedAttentionBlockBwd,
     GatedAttentionBlockFwd,
@@ -47,6 +48,12 @@ pytestmark = pytest.mark.L0
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
+
+# The sibling block modules skip as a WHOLE below FROST's CuTe DSL floor (``cutedsl_requirement_error``).  This module's
+# declaration cells need no DSL at all, so they keep running on a release DSL below the floor; only the arm that asks the
+# block's stages (whose ``check_support`` imports their CuTe DSL kernels) skips there -- see
+# ``test_the_sparse_decline_is_reached_after_the_stages_ahead_accepted_the_five_band_geometry``.
+_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("the gated attention block's stages")  # None at or above the floor
 
 # The 24-query-head / 2-KV-head d256 geometry of the block-sparse model at TP 1 (d_model 2560, rope 64), with the
 # indexer band: (4 + 1) x 128 = 640 columns below V -> N = 13312 + 640 = 13952.
@@ -338,8 +345,9 @@ def test_declaration_declines_every_sparse_request_it_cannot_serve(geom_kw, qsa,
 
 def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_declines_at_check_support():
     """The accept half of the contract today: the block CONSTRUCTS with the sparse stage in stage (4)'s slot, every
-    stage ahead of it accepts the five-band geometry, and the sparse stage is the typed decline (the core has not
-    landed) -- on every device, with no host sync."""
+    descriptor passes the declaration check, and the sparse stage is the typed decline (the core has not landed) -- on
+    every device and every CuTe DSL, with no host sync.  The block-level ``check_support()`` walk, in which the stages
+    ahead accept the five-band geometry first, is the next test's: those stages import their CuTe DSL kernels to answer."""
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=True))
     kw = _samples(geom)
     with _no_host_sync():
@@ -348,10 +356,9 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_declines_at_chec
         assert blk._stages[-1 - 2] is blk._sdpa or blk._sdpa in blk._stages  # in pipeline order, before the gate and the out projection
         assert blk._sdpa.token_stride == geom.n_qkvg == 5760  # the slab's stride, like the dense stage would read it
         blk._check_declaration()  # the five-band W_qkvg [5760, 512] and every descriptor pass
-        if torch.cuda.is_available():
-            with pytest.raises(NotImplementedError, match="sparse attention core"):
-                blk.check_support()
-            assert not blk._is_supported
+        with pytest.raises(NotImplementedError, match="sparse attention core"):
+            blk._sdpa.check_support()  # the stage's own decline, independent of what the stages ahead import
+        assert not blk._is_supported
     # The fused projection fork's own decline is geometry-first (reads the same on every device).
     with pytest.raises(NotImplementedError, match="256-column tiles"):
         _FusedQkvProjection(geom, batch=1, seq_len=8, dtype=torch.bfloat16, want_rstd=False).check_support()
@@ -362,6 +369,21 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_declines_at_chec
         fork.check_support()
     except NotImplementedError as e:
         assert "indexer band" not in str(e)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
+def test_the_sparse_decline_is_reached_after_the_stages_ahead_accepted_the_five_band_geometry():
+    """``check_support()`` walks the stages in pipeline order: the projection (with the indexer band) and norm + RoPE
+    accept the five-band geometry, THEN the sparse stage declines and the block is left unsupported.  The stages ahead
+    import their CuTe DSL kernels to answer, so this arm needs the DSL at FROST's floor (below it a release DSL has no
+    ``cutlass.experimental``; the sibling modules skip as a whole there, this module skips only here)."""
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=True))
+    with _no_host_sync():
+        blk = GatedAttentionBlockFwd(**_samples(geom), geometry=geom)
+        with pytest.raises(NotImplementedError, match="sparse attention core"):
+            blk.check_support()
+        assert not blk._is_supported
 
 
 def test_index_k_raw_locates_the_slab_inside_the_workspace():
