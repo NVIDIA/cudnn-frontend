@@ -199,7 +199,7 @@ from test_block_backward import (  # noqa: E402
     _declare_bwd,
     _make_dy,
 )
-from test_block_training_forward import _alloc_saved, _declare_quant, _dense_tail_declined, _dequantized_bf16_inputs, _run_training_quant  # noqa: E402
+from test_block_training_forward import _alloc_saved, _declare_quant, _dequantized_bf16_inputs, _run_training_quant  # noqa: E402
 
 _SM107 = (10, 7)
 _E4M3 = torch.float8_e4m3fn
@@ -340,6 +340,9 @@ _LAUNCH_ONLY_CELLS = [
 _BY_ID = {c.id: c for c in _CELLS + _LAUNCH_ONLY_CELLS}
 assert len(_CELLS) == 15 and len(_BY_ID) == len(_CELLS) + len(_LAUNCH_ONLY_CELLS), "the cell ids must be unique: 12 matrix rows, three in both qk_norm arms"
 _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
+# A dense S % 128 != 0 (the forward's kv_tail_mask record, #1520): outside the matrix, but through the stage-localised oracles.
+_DENSE_TAIL_CELL = _Cell("s992_dense_b1", 992, False, 1, 2, True, note="dense KV tail: the forward's kv_tail_mask record")
+_STAGE_MATRIX = pytest.mark.parametrize("cell", _CELLS + [_DENSE_TAIL_CELL], ids=[c.id for c in _CELLS + [_DENSE_TAIL_CELL]])
 _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 # The matrix's default scale_dp: the CALIBRATED one (the chart recipe -- one warm-up execute at 1.0, then get_fp8_scale_factor(amax_dP),
 # then the measured run), because at scale_dp = 1.0 the row tolerance is near-vacuous for dQ / dK (module docstring); one cell
@@ -1110,7 +1113,7 @@ def _assert_quantizers_scalars_delta_bitwise(res) -> dict:
 
 
 @requires_rubin
-@_MATRIX
+@_STAGE_MATRIX
 def test_fp8_stage_localised_bounds(cell):
     """Every stage of the quantized backward against the bound calibrated FOR IT, on the block's own operands (module docstring):
 
@@ -1722,10 +1725,15 @@ def test_fp8_execute_scalar_contracts_are_typed():
 
 
 @requires_rubin
-def test_fp8_dense_tail_has_no_record():
-    """A dense ``S % 128 != 0`` has no quantized record to run a backward over: the quantized forward declines it typed at
-    ``check_support`` (no padding mask and no causal mask covering the KV tail) -- the complement of the padded causal cells."""
-    _dense_tail_declined({**_COMMON, "qk_norm": True, "is_causal": False}, 1, 992, "fp8")
+def test_fp8_dense_tail_backward_is_finite_and_quantizes_bitwise():
+    """A dense ``S % 128 != 0`` has a quantized record: the forward masks the KV tail in-kernel (kv_tail_mask, #1520), so the
+    backward runs over it -- every gradient finite and the bitwise layer of the matrix cells, as the launch-only cells; its
+    gradients against the oracles are ``test_fp8_stage_localised_bounds[s992_dense_b1-...]``."""
+    res = _cell_backward(_DENSE_TAIL_CELL)
+    for name, ten in res.grads.items():
+        if ten is not None:
+            assert torch.isfinite(ten).all(), f"s992_dense_b1: {name} has non-finite cells"
+    _assert_quantizers_scalars_delta_bitwise(res)
 
 
 # ---------------------------------------------------------------------------
@@ -1793,10 +1801,11 @@ def test_fp8_reject_bf16_weights_with_quant():
 
 @requires_cuda
 def test_fp8_reject_thd_with_quant():
-    """``thd=True`` with ``quant``: dense-only for now (the fp8 row's packed chain serves no external delta, and the block's delta
-    contract forbids the row's own pre-pass) -- declined typed AT DECLARATION, naming BOTH attributes, and the message does NOT
-    tell the caller to build the plan without ``external_delta`` (the adapter's text must never surface here).  Host-side, over
-    placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32 ``saved.seq_lens``)."""
+    """``thd=True`` with ``quant``: dense-only for now (the block's packed quantized arm -- the fp8 row's THD chain, which serves an
+    external delta, reading the gate backward's packed bf16 delta -- is a follow-up) -- declined typed AT DECLARATION, naming BOTH
+    attributes, and the message does NOT tell the caller to build the plan without ``external_delta`` (the adapter's text must never
+    surface here).  Host-side, over placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32
+    ``saved.seq_lens``)."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     t, dm = 256, _COMMON["d_model"]
     dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")
@@ -1819,9 +1828,13 @@ def test_fp8_reject_mxquantspec():
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     mx = MxQuantSpec(descale_w_o=r.spec.descale_w_o, scale_o=r.spec.scale_o)
     blk = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=mx)
-    assert isinstance(blk.quant, MxQuantSpec) and blk._prologue is None and blk._epilogue is None and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    assert isinstance(blk.quant, MxQuantSpec) and type(blk._sdpa).__name__ == "_SdpaBwdMxfp8"
+    assert (
+        type(blk._prologue).__name__ == "_MxQuantPrologue" and type(blk._epilogue).__name__ == "_MxQuantEpilogue"
+    )  # the MXFP8 fused launches, not the fp8 ones
     blk4 = _declare_fp8_bwd(r.dy, r.saved, r.inp, r.geom, quant=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
-    assert blk4.o_fp4 is Fp4Format.NVFP4 and blk4._out_proj_dgrad.block_scale and blk4._prologue is None and blk4._gate_bwd.want_dy_descale
+    assert blk4.o_fp4 is Fp4Format.NVFP4 and blk4._out_proj_dgrad.block_scale and blk4._gate_bwd.want_dy_descale
+    assert type(blk4._prologue).__name__ == "_MxQuantPrologue"
     with pytest.raises(ValueError, match="w_o"):
         blk4.check_support()
 
@@ -1946,7 +1959,7 @@ def test_the_matrix_declares_what_the_module_says():
     runs at ``scale_dp = 1.0``; the (M) GQA layer's parametrization is the 13 GQA matrix cells (the fold is a GQA mechanism: no MHA
     cell), every one a PLAIN assertion -- the fold rounds once, so no cell carries an ``xfail``."""
     for c in _CELLS + _LAUNCH_ONLY_CELLS:
-        assert c.causal or c.s % 128 == 0, f"{c.id}: a dense S % 128 != 0 has no record"
+        assert c.causal or c.s % 128 == 0, f"{c.id}: the matrix keeps a dense S % 128 != 0 out (s992_dense_b1 covers it)"
     for c in _LAUNCH_ONLY_CELLS:  # launch-count arms the matrix does not reach, and nothing it already runs
         assert c.causal and c.id not in {m.id for m in _CELLS}, c.id
     pad_mha, kv_only = _BY_ID["s992_causal_b1_mha-norm"], _BY_ID["s384_causal_b1-norm"]
@@ -2112,6 +2125,7 @@ def test_fp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_wr
         blk.check_support()
         ws = torch.empty_like(res.ws).fill_(0xFF)
         grads = _alloc_grads(res.blk, fill=float("nan"))
+        gc.collect()  # an earlier test's cyclic garbage freed mid-compile() moves the counter down (PR #1522, sm107 CI)
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:

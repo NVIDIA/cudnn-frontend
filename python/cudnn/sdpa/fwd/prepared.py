@@ -609,7 +609,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.seq_kv_present, s.seq_q_present = bool(api.seq_kv_lens_present), bool(api.seq_q_lens_present)
     s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
     s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
-    s.kv_tail_native = bool(getattr(km, "PREPARED_KV_TAIL_NATIVE", False))
+    # SM120 always masks its rightmost KV tile; an SM100/SM107 plan compiled with kv_tail_mask masks it too.
+    s.kv_tail_native = bool(getattr(km, "PREPARED_KV_TAIL_NATIVE", False) or getattr(api, "_kv_tail_mask", False))
     s.dense_flex = bool(getattr(km, "PREPARED_DENSE_FLEX", False))
     # the COMPILED mask kind: the d192 lowering may have rewritten a square bottom-right mask as top-left
     s.causal = bool(api.is_causal)

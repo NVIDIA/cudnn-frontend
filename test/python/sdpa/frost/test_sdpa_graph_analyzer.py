@@ -169,7 +169,7 @@ def test_probe_accepts_dsv4_causal():
     assert engines.engine_name() in _eligible(g)
 
 
-@pytest.mark.parametrize("unsupported", ["sm80", "synth_kv"])
+@pytest.mark.parametrize("unsupported", ["sm80"])
 @pytest.mark.parametrize("opt_in", [False, True])
 def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsupported, opt_in):
     """Graph admission declines legacy executors before loading a DSL adapter."""
@@ -191,9 +191,6 @@ def test_fwd_override_legacy_graph_declines_before_lowering(monkeypatch, unsuppo
     for enabled in (False, True):
         graph = _mk_graph(is_override_shape_enabled=enabled)
         q, k, v, dims, strides = _mk_qkv(graph, d=128)
-        if unsupported == "synth_kv":
-            k.set_dim((B, H, 129, 128))
-            v.set_dim((B, H, 129, 128))
         o, _ = graph.sdpa(q=q, k=k, v=v, attn_scale=0.1, is_inference=True)
         _finish_output(o, dims, strides)
         if not enabled:
@@ -274,7 +271,7 @@ def test_override_filter_preserves_compatible_split_candidates(monkeypatch, d):
     assert engines.mismatch(spec.capabilities, fresh, split) is None
 
 
-@pytest.mark.parametrize("feature", ["mxfp8", "bias", "synth_kv"])
+@pytest.mark.parametrize("feature", ["mxfp8", "bias"])
 def test_prepared_override_capability_declines_legacy_features(feature):
     """The same pure predicate serves candidate filtering and runtime executor selection."""
     from dataclasses import replace
@@ -285,9 +282,11 @@ def test_prepared_override_capability_declines_legacy_features(feature):
     _finish_output(o, dims, strides)
     facts = _facts(graph)
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name())
-    changed = dict(mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True), synth_kv=dict(s_kv=129))[feature]
+    changed = dict(mxfp8=dict(is_mxfp8=True), bias=dict(has_bias=True))[feature]
     assert engines._prepared_decline_reason(caps, facts, 1) is None
     assert engines._prepared_decline_reason(caps, replace(facts, **changed), 1) is not None
+    # A mask-free S_kv off the KV tile masks its tail in-kernel, so overrides keep the prepared launch (#1425).
+    assert engines._prepared_decline_reason(caps, replace(facts, s_kv=129), 1) is None
 
 
 @pytest.mark.parametrize("dtype_o", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2])
@@ -801,8 +800,8 @@ def test_probe_rejects_bottom_right_swa_only():
 
 def test_probe_accepts_ragged_skv_via_synth_padding():
     # KV tail (S_kv % 128 != 0) with no covering mask: the f16 rows opt into
-    # skv_tail_via_padding — the lowering synthesizes full-length per-batch KV
-    # lengths and the padded path masks the tail (the FP8 row's mechanism).
+    # skv_tail_via_padding — the adapter compiles the padded mask against the
+    # scalar S_kv (kv_tail_mask, #1425).
     g = _mk_graph()
     s_kv = 300
     q = g.tensor(dim=(B, H, S, D), stride=(S * H * D, D, H * D, 1), data_type=DTYPE, name="q")
@@ -1109,7 +1108,7 @@ def test_capabilities_positional_prefix_is_append_only():
     from cudnn.sdpa.bwd import engines as bwd_engines
 
     bwd_names = [f.name for f in dataclasses.fields(bwd_engines.Capabilities)]
-    assert bwd_names[-3:] == ["bottom_right_s_q_multiple", "thd_head_stride", "zero_scale"], bwd_names
+    assert bwd_names[-4:] == ["bottom_right_s_q_multiple", "thd_head_stride", "zero_scale", "thd_ragged_offsets"], bwd_names
 
 
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
@@ -2712,9 +2711,16 @@ def test_prepared_mxfp8_override_contract(thd, override, split, accepted, rubin_
     if accepted:
         for changed in (dict(o_block_scale=32), dict(has_epilogue_gate=True)):
             assert engines._prepared_decline_reason(caps, replace(facts, **changed), split) is not None
-        rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
-        rubin_facts = replace(facts, device_cc=rubin_cc)
-        assert (engines._prepared_decline_reason(rubin, rubin_facts, split) is None) == (rubin_cc == (10, 7) and not thd and not override and split == 1)
+    # The Rubin row's prepared MXFP8 contract, on every row of the table: the executor is device cc 10.7 only;
+    # it serves fixed dense plans (a dense shape override is declined) or bounded THD (the override rides the
+    # per-sequence lengths, as on SM100); split-KV is declined dense and THD alike.  So on cc 10.7 the row
+    # accepts exactly what the SM100 row accepts at split 1.
+    rubin = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == engines.engine_name(arch="sm107", mxfp8=True))
+    rubin_facts = replace(facts, device_cc=rubin_cc)
+    rubin_accepts = rubin_cc == (10, 7) and split == 1 and (thd or not override)
+    assert rubin_accepts == (rubin_cc == (10, 7) and accepted and split == 1)
+    rubin_reason = engines._prepared_decline_reason(rubin, rubin_facts, split)
+    assert (rubin_reason is None) == rubin_accepts, (thd, override, split, rubin_cc, rubin_reason)
 
 
 # --- paged MXFP8 (block-scale pools behind the block tables) ------------------

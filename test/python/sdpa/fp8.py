@@ -29,6 +29,7 @@ from .helpers import (
     note_frost_routing,
 )
 from .random_config import packed_token_capacity
+from .fp16 import _apply_plan_pin
 
 # fmt: off
 
@@ -891,6 +892,7 @@ def exec_sdpa_fp8(cfg, request, cudnn_handle):
         graph_fwd.validate()
         graph_fwd.build_operation_graph()
         graph_fwd.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        _apply_plan_pin(graph_fwd, cfg)  # ExecConfig.plan_pin (shared with the f16 harness): an explicit backend / FROST knob-set selection, strict
         graph_fwd.check_support()
         graph_fwd.build_plans()
         note_frost_routing(graph_fwd, label="fp8-fwd")

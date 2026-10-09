@@ -677,9 +677,8 @@ def test_dsl_sm100_band_right_multi_cluster(d):
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_ragged_skv_tail_via_padding(d):
     """Ragged S_kv (not a multiple of 128) with NO mask covering the tail:
-    served through the kernel's padded path with synthesized full-length
-    per-batch KV lengths (Capabilities.skv_tail_via_padding on the f16 rows —
-    mathematically identical, tail masked by the synthesized lengths)."""
+    served through the kernel's padded mask compiled against the scalar S_kv
+    (Capabilities.skv_tail_via_padding, the adapter's kv_tail_mask; #1425)."""
     _require_dsl()
     dtype = torch.bfloat16
     b, h, s_q, s_kv = 2, 4, 128, 200  # 200 % 128 != 0, no mask at all
@@ -696,9 +695,8 @@ def test_dsl_sm100_ragged_skv_tail_via_padding(d):
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_band_right_uncovered_tail_via_padding():
     """A widened band whose last unmasked column reaches past S_kv
-    (s_q + R > s_kv) cannot rely on the band to mask the ragged tail; the f16
-    rows serve it through the synthesized-padding path instead (the FP8 row's
-    long-standing mechanism), so the garbage tail columns stay masked."""
+    (s_q + R > s_kv) cannot rely on the band to mask the ragged tail; the
+    adapter adds the KV-tail mask (kv_tail_mask), so the tail columns stay masked."""
     _require_dsl()
     dtype = torch.bfloat16
     b, h, s_q, s_kv, d, R = 2, 4, 192, 200, 128, 40  # s_q + R = 232 > 200; 200 % 128 != 0
@@ -709,6 +707,84 @@ def test_dsl_sm100_band_right_uncovered_tail_via_padding():
     o = _run_dsl_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(diagonal_band_right_bound=R))
     o_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=True, band_right=R)
     torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@torch_fork_set_rng(seed=0)
+def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(fp8, monkeypatch):
+    """A mask-free S_kv off the KV tile compiles the padded mask against the scalar S_kv (#1425): no lengths buffer,
+    the native prepared launch, and execute-time S_kv overrides on and off the tile within the declared envelope."""
+    _require_dsl()
+    import cudnn
+    from cudnn.sdpa.fwd import prepared as prep
+
+    b, hq, hk, s_q, d, declared = 2, 4, 2, 64, 128, 200
+    io = cudnn.data_type.FP8_E4M3 if fp8 else cudnn.data_type.BFLOAT16
+
+    def make(h, s):
+        x = torch.randn(b, s, h, d, device="cuda").transpose(1, 2)
+        return x.to(torch.float8_e4m3fn) if fp8 else x.to(torch.bfloat16)
+
+    def bshd_stride(h, s):
+        return [s * h * d, d, h * d, 1]
+
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
+    q0, k0, v0 = make(hq, s_q), make(hk, declared), make(hk, declared)
+    qd, kd, vd = (g.tensor_like(t) for t in (q0, k0, v0))
+    pack = {}
+    if fp8:
+        scales = [g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT) for _ in range(6)]
+        od, _, _, ad = g.sdpa_fp8(
+            q=qd,
+            k=kd,
+            v=vd,
+            descale_q=scales[0],
+            descale_k=scales[1],
+            descale_v=scales[2],
+            descale_s=scales[3],
+            scale_s=scales[4],
+            scale_o=scales[5],
+            attn_scale=d**-0.5,
+            generate_stats=False,
+        )
+        ad.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+        one = torch.ones(1, 1, 1, 1, device="cuda")
+        pack.update({t: one for t in scales})
+        pack[ad] = torch.zeros(1, 1, 1, 1, device="cuda")
+    else:
+        od, _ = g.sdpa(q=qd, k=kd, v=vd, attn_scale=d**-0.5, generate_stats=False)
+    o = torch.empty(b, s_q, hq, d, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    od.set_output(True).set_dim(list(o.shape)).set_stride(list(o.stride())).set_data_type(cudnn.data_type.BFLOAT16)
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A])
+    _select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8))
+    g.check_support()
+    g.build_plans()
+    launch = g._compiled_plans[g._plan_index]._prepared
+    assert isinstance(launch, prep.PreparedDenseLaunch) and launch.spec.native is not None and launch.spec.kv_tail_native
+    assert not launch.spec.seq_kv_present
+    if not fp8:  # prepared FP8 always carves its amax / identity-scale words
+        assert g.get_workspace_size() == 0
+    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
+
+    forbid_python_forward_binding(monkeypatch)
+    ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    for s_kv in (declared, 72, 128, 129, 199):
+        q, k, v = q0, make(hk, s_kv), make(hk, s_kv)
+        o.zero_()
+        g.execute(
+            {**pack, qd: q, kd: k, vd: v, od: o},
+            ws,
+            override_uids=[kd.get_uid(), vd.get_uid()],
+            override_shapes=[[b, hk, s_kv, d]] * 2,
+            override_strides=[bshd_stride(hk, s_kv)] * 2,
+        )
+        torch.cuda.synchronize()
+        qf, kf, vf = (t.float().repeat_interleave(hq // t.shape[1], dim=1) for t in (q, k, v))
+        o_ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, scale=d**-0.5)
+        torch.testing.assert_close(o.float(), o_ref, atol=5e-2 if fp8 else 2e-2, rtol=3e-2, msg=lambda m: f"S_kv={s_kv}: {m}")
 
 
 @pytest.mark.L0
@@ -1100,7 +1176,9 @@ def test_dsl_sm100_keyless_rows_very_negative_sink(d_qk, d_v, stats_use_log2):
 
 
 @pytest.mark.L0
-@pytest.mark.skipif(_SM == 107, reason="the cc 10.7 f16 row keeps d128 on cga2 (no measured cga1 configuration there)")
+@pytest.mark.skipif(
+    _SM == 107, reason="the SM100 standalone default width; on cc 10.7 the graph path serves the decode tile since issue #1472 (test_mhas_v2.py's P3 block)"
+)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=0)
 def test_dsl_sm100_d128_decode_shaped_cga1_sink_swa(dtype):

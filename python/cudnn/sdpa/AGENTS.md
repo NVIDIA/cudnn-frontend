@@ -300,47 +300,36 @@ Shared protocol (both passes):
   from the current state: unused slots pass at their pre-armed parity, used slots wait their last release.  Detector:
   `test_sdpa_bwd_dsl_sm100.py::test_ring_drain_walks_every_used_slot` (a pure-Python twin of the protocol over every issue
   count; the old rule misses every `0 < total < stages`) plus the single-kv-tile GPU cells on both arch lines.
-- **Barriers completed by events from ANOTHER cta_group::2 pair (cross-pair commit multicast, cross-pair TMA
-  complete_tx, a twin's remote arrive) must be waited with a non-blocking `mbarrier.test_wait.parity` poll;
-  `try_wait` -- hinted (`NANOSLEEP.SYNCS`) or hint-less (`wait(spin=True)`, a suspended `TRYWAIT`) -- parks the warp
-  and can miss the wake-up under GPU time-slicing.** Measured on the d512 2x2 backward (2026-10-01): hang within
-  2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
-  (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
-  o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
-  The scheduler payload barrier belongs to the same class on a 4-CTA cluster: the cluster lead completes it by DSMEM
-  `st.async` + complete_tx into every CTA, an outside-pair event for the second pair -- the d512 2x2 backward bodies poll
-  it as a precaution (#1323 round 2). The CI hang that prompted it -- the detector at launch 22/100 -- was later
-  attributed to the detector's OWN negative control wedging the shared GPU (the xdist lesson below), not to this
-  barrier; the poll stays because the event is outside-pair by construction.
-  The poll is two-phase with a PER-KERNEL shape (`wait_poll(mb, phase, tight_iters, sleep_ns)` /
-  `MBarrier(poll=True, poll_tight, poll_sleep_ns)`: `tight_iters` back-to-back tests, then a TIMER `nanosleep(sleep_ns)`
-  between tests; `sleep_ns = 0` is the pure tight loop). A tight loop on the MMA / TMA-LDG warp starves the compute
-  warps sharing its SMSP when the waits are long (the d512 backward ran 2.2x slower with it; it ships 128 / 128), while
-  the forwards' short waits lose nothing to it (both forwards 32 / 128; on the cc 10.7 forward the tight loop and
-  32 / 128 measured within 0.15 % of each other);
-  the timer sleep is `NANOSLEEP`, not the event-sleep `NANOSLEEP.SYNCS`, so the warp still never parks on the barrier.
-  Backward evidence: the heartbeat dump showed one cluster frozen with a follower's
-  TMA-LDG warp still waiting for a release the other three CTAs' copies of the
-  same barrier had completed five chunks earlier; the sleeping `try_wait` (1 ns
-  and 10 ms hints) and the hint-less `try_wait` spin all hung within 2-74
-  time-sliced launches, the poll never did (200/200, 300/300), and nothing was
-  wrong with any count. Backward detectors:
-  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_survives_gpu_time_slicing` (a 4x1
-  load child + the twin for 100 launches; a hang exits 3 after a 45 s budget)
-  and its negative control
-  `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing`
-  (`TemplateParams2x2.wait_form = 4` = the pre-fix form, `gpu_exclusive`);
-  `test_sdpa_bwd_config_sm100_2x2.py::test_kernel_source_pins` pins
-  `poll=_KV_SHARED` on the three ring wait sites. To localise a future hang,
-  arm `debug_heartbeat` + `debug_dump_addr` (every warp records its barrier,
-  stage, phase, kv_loop and chunk before each wait into a host-pinned buffer;
-  `lane_d512_bprop/fix/hang_dbg.py` decodes it) -- the bounded-wait lever
-  (`debug_wait_ms`) changes the wait's shape and does NOT reproduce this hang.
-  Detectors (test_sdpa_fwd_d512_2x2_sm100.py): `test_two_by_two_cross_pair_waits_poll` (source pin: exactly those
-  barriers poll, the constant is threaded, default on), `test_two_by_two_survives_gpu_time_slicing` (a role-split
-  load child + 100 watchdogged twin launches, exit 3 on a hang) and its `gpu_exclusive` negative control
-  `test_two_by_two_parking_wait_form_under_time_slicing` (pre-fix form; xfail(strict=False) until the forward
-  reproduces the hang -- the backward's `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` does).
+- **Do not pin a nondeterministic compiler output by its byte hash.** The SM100 D512 THD backward ACK body can
+  produce different PTX from identical raw/clean MLIR under the same DSL build, even with a fixed Python hash seed.
+  Use `test_stage2_2x2_sass_pins[sm_100a-thd]` for its structural lowering checks and retain THD numerical/capture
+  tests. Archive both outputs when diagnosing this; do not retry until a chosen golden happens to match.
+- **Every local barrier object needs a successful phase observation before it can be advanced again.**
+  Matching arrival counts and a different wait instruction do not establish this ordering. In the D512 shared backward
+  ring, multicast commits advance all four local empty objects. A passive follower could lag while the other CTAs recycle
+  its slot, losing the expected parity (ABA). Keep its wait: deleting it leaves an unobserved object in the multicast.
+  Gate both consumers on all four observations instead: each leader's full barrier counts its own expect-tx arrival and
+  three remote ACKs, sent only after the sending CTA's successful local empty wait. Then both MMAs and the next empty
+  release follow all four observations. Keep whole-ring drains and the KV_SHARE=1 protocol unchanged. Detectors:
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_waits_for_delayed_empty_observer` and
+  `test_sdpa_bwd_d512_sm107.py::test_chain_waits_for_delayed_empty_observer` delay a passive CTA at chunk 0 of the SECOND
+  KV tile, so both four- and eight-stage rings reuse a slot. They check reference gradients and capture/replay in a
+  watchdogged child. Check generated wait -> ACK ordering as well as source when changing this protocol.
+- **Keep cross-pair polling separate from the phase-lifetime proof.** The historical October 1 backward experiment
+  hung within 2-74 launches with sleeping/hint-less try-wait, while polling completed 200/200 and 300/300. Those finite
+  observations did not prove a lost wake-up or a correct ring; polling alone does not fix the observer ordering above.
+  Existing cross-pair polling remains in place (ring full/empty and scheduler payload); pair-local waits retain their
+  current form. `test_sdpa_bwd_config_sm100_2x2.py::test_kernel_source_pins` pins the three ring poll sites.
+  Poll shape is per kernel: backward 128 tight tests / 128 ns timer sleep, forward 32 / 128. A timer sleep is not
+  `NANOSLEEP.SYNCS`; a tight poll can starve compute warps sharing the SMSP. The historical backward tight-poll experiment
+  was 2.2x slower. Do not change polling as part of a lifecycle fix without separate attribution.
+  Keep `test_stage2_2x2_survives_gpu_time_slicing` as a natural positive stress test; the old probabilistic must-hang
+  `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` is replaced by the delayed-observer regression above.
+  Keep all diagnostic levers: `debug_heartbeat` + `debug_dump_addr` record barrier, stage, phase, kv_loop and chunk
+  before each wait (`lane_d512_bprop/fix/hang_dbg.py` decodes them). `debug_wait_ms` changes the wait's shape, so failure
+  to reproduce with it is not a waiver. Forward detectors remain `test_two_by_two_cross_pair_waits_poll`,
+  `test_two_by_two_survives_gpu_time_slicing`, and `test_two_by_two_parking_wait_form_under_time_slicing`; forward hangs
+  require their own diagnosis, not an inference from this backward fix.
 - **A watchdogged detector and the negative control that deliberately WEDGES the GPU must never share a device at
   the same time: put BOTH in `@pytest.mark.xdist_group(name="gpu_exclusive")`, the repo's convention next to the
   `gpu_exclusive` marker (which xdist does not enforce by itself).** The CI FROST lane runs 16 workers over 4 GPUs
@@ -616,6 +605,17 @@ overwrites every element, including masked rows and partial tiles. Poison
 fresh auxiliary outputs with NaNs, forbid the removed Torch clear calls, and
 replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
+
+
+## Adapter declines that other suites pin
+
+`gated_attention_block` runs the SDPA forward adapter as its attention stage, and
+its tests pin the adapter's declines by message (`match="multiple of 128"`).
+Those tests run only on the `oss` CI lanes (`python/*/cutedsl`, SM107). A change
+that serves a previously declined shape needs `@cudnn-ci-bot run ...,oss`, not
+only `frost`. #1520 (the KV-tail mask) turned 15 GAB decline pins red because its
+CI ran `python_tests,frost` (#1522). Detector: `git grep -n "match=" test/python/gated_attention_block`
+for the old message.
 
 
 ## Prepared THD launch bounds and setup

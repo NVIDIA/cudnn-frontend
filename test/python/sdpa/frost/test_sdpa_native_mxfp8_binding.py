@@ -174,8 +174,12 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     from cudnn.engines import MANIFEST
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, engine_name
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+    cc = torch.cuda.get_device_capability()
+    if cc not in ((10, 0), (10, 3), (10, 7)) or not _dsl_installed():
         pytest.skip("requires an existing paged MXFP8 graph row")
+    rubin = cc == (10, 7)
+    if rubin and split > 1:
+        pytest.skip("the cc 10.7 MXFP8 row serves paged pools unsplit")
     g, vp, out, stats, amax, reference = _build_mxfp8(
         2,
         4,
@@ -194,7 +198,9 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     )
     g.validate()
     g.build_operation_graph()
-    name = engine_name(arch="sm100", mxfp8=True)
+    # The cc 10.7 row serves the same pool contract on d128 (cga2) / d256 (cga1): separate V table, batch-innermost
+    # tables, e4m3 O, Stats, CUDA-graph replay after mutating the SF bytes, native-binder-only execution.
+    name = engine_name(arch="sm107" if rubin else "sm100", mxfp8=True)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
     cga = max(dict(caps.cgas_by_d_shape).get((d, d), caps.cgas))

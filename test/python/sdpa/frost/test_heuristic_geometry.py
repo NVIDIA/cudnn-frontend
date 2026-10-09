@@ -335,18 +335,32 @@ def test_nonpaged_d128_thd_lead_serves_a_valid_packed_first_plan(group, causal, 
 
 @requires_dsl
 @pytest.mark.parametrize("batch,h_q,h_kv,q,kv", [(2, 8, 2, 128, 16384), (1, 32, 4, 64, 32768), (4, 16, 16, 257, 8192), (2, 16, 2, 8, 16384)])
-def test_nonpaged_d128_rubin_split_fills_one_unpacked_wave(monkeypatch, batch, h_q, h_kv, q, kv):
+@pytest.mark.parametrize("bounded_total", [False, True])
+def test_nonpaged_d128_rubin_split_obeys_physical_wave_budget(monkeypatch, batch, h_q, h_kv, q, kv, bounded_total):
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
-    facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204)
+    total = q + batch - 1 if bounded_total else None
+    facts = _mla_split_facts(d_qk=128, b=batch, h_q=h_q, h_kv=h_kv, s_q=q, s_kv=kv, device_cc=(10, 7), device_sm_count=204, max_total_seq_len_q=total)
     splits, packed = heur.nonpaged_thd_split_choice(spec.capabilities, facts)
     if splits > 1:
-        # Rubin's launch budget: unpacked 128-row CTAs, one wave.
-        assert not packed
-        assert batch * len(range(0, q, 128)) * h_q * splits <= 204
+        # Count the selected candidate's physical CTAs, including a possible
+        # partial tile per sequence, without pinning its split or pack choice.
+        group = h_q // h_kv if packed else 1
+        rows = 128 // group
+        # Independently enumerate the shortest sequence that needs each
+        # tile count, then all small-batch distributions within the capacity.
+        lengths = [0, *range(1, q + 1, rows)]
+        tiles = max(
+            sum(len(range(0, length, rows)) for length in batch_lengths)
+            for batch_lengths in product(lengths, repeat=batch)
+            if total is None or sum(batch_lengths) <= total
+        )
+        # Rubin's budget: two waves.
+        assert tiles * (h_q // group) * splits <= 2 * 204
         assert len(range(0, kv, 128)) // splits >= 4
+        assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=splits, pack_gqa=packed)) is None
 
 
 @pytest.mark.parametrize("split", [1, 2])
@@ -379,6 +393,8 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
         assert mismatch(spec.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packing)) is None
     for other in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, d_qk=256, d_v=256), replace(facts, is_fp8=True)):
         assert 1 not in effective_cgas(spec.capabilities, other, 1)
+    # dense d128: cga1 is the shared decode tile (issue #1472); dense PAGED queries above stay on cga2 (not wired on cc 10.7)
+    assert 1 in effective_cgas(spec.capabilities, replace(facts, thd=False, has_paged_kv=False, page_size=0), 1)
 
 
 @requires_dsl

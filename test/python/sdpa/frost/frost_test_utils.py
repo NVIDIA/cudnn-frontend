@@ -486,3 +486,113 @@ def cuda_launch_counts(*runs):
     The capture itself is ``cuda_launch_names``."""
     names = cuda_launch_names(*runs)
     return None if names is None else [len(n) for n in names]
+
+
+def run_d512_delayed_observer(tmp_path, engine):
+    """Delay a passive CTA before observing a reused empty slot; check liveness and gradients.
+
+    The delay belongs only to the test's private template copy. No production knob or
+    scheduling probability is involved. A child process bounds an unfixed kernel's hang.
+    """
+    from pathlib import Path
+
+    import cudnn
+
+    script = tmp_path / "delayed_observer.py"
+    script.write_text(textwrap.dedent(r"""
+        import hashlib, json, os, sys
+        from pathlib import Path
+        test_root, expected_fe, engine, work = sys.argv[1:]
+        sys.path.insert(0, test_root)
+        import conftest  # Preserve allocator setup and Transformer Engine import ordering.
+        sys.path.insert(0, str(Path(test_root) / "sdpa/frost"))
+        import torch
+        import cudnn
+        from cudnn.sdpa.bwd import api_dsl
+        from frost_test_utils import process_watchdog, select_engine
+        import test_sdpa_bwd_dsl_sm100 as ref
+
+        assert Path(cudnn.__file__).resolve() == Path(expected_fe).resolve()
+        api_dsl.STAGE2_2X2 = True
+        original = api_dsl.load_template
+        served = []
+
+        def delayed(path, params, tag="template"):
+            p = Path(path)
+            if p.name == "bprop_d512_f16_2x2.py":
+                assert p.parent.name == ("sm107" if engine == "sdpa_bwd_sm107_d512" else "sm100")
+                source = p.read_text()
+                begin = source.index("def _ldg_kv_tile(")
+                end = source.index("\n@cute.jit\ndef _tmaldg_warp_group(", begin)
+                section = source[begin:end]
+                anchor = "    for c in cutlass.range_constexpr(CFG.N_CHUNKS):\n"
+                assert section.count(anchor) == 1
+                # Chunk 0 of the second KV tile reuses slot 0 on both the four-
+                # and eight-stage rings. CTA 3 is passive on this even chunk.
+                delay = (
+                    "        if cutlass.const_expr(c == 0):\n"
+                    "            if (pair_id == cutlass.Int32(1)) & (is_leader == False) & (kv_loop == cutlass.Int32(1)) & (tile_no == cutlass.Int32(0)):\n"
+                    "                observer_start = cute.arch.globaltimer()\n"
+                    "                while cute.arch.globaltimer() - observer_start < cutlass.Int64(10_000_000):\n"
+                    "                    pass\n"
+                )
+                patched = source[:begin] + section.replace(anchor, anchor + delay) + source[end:]
+                target = Path(work) / (p.parent.name + "_delayed_observer.py")
+                target.write_text(patched)
+                served.append(dict(path=str(p), sha256=hashlib.sha256(source.encode()).hexdigest(), params=repr(params)))
+                path = str(target)
+            return original(path, params, tag)
+
+        api_dsl.load_template = delayed
+        torch.manual_seed(1519)
+        b, h, sq, skv, d = 1, 4, 256, 1024, 512
+        tensors = {n: ref._bshd(b, s, h, d) for n, s in (("q", sq), ("k", skv), ("v", skv), ("do", sq))}
+        o, lse, _, dq, dk, dv = ref._reference(*(tensors[n] for n in ("q", "k", "v", "do")))
+        expected = (dq, dk, dv)
+        tensors["o"] = torch.empty_like(tensors["q"]).copy_(o)
+        tensors["stats"] = lse.unsqueeze(-1).contiguous()
+        for n, like in (("dq", "q"), ("dk", "k"), ("dv", "v")):
+            tensors[n] = torch.empty_like(tensors[like])
+        g, ports, outputs = ref._build_graph(b, h, h, sq, skv, d, d**-0.5)
+        select_engine(g, engine)
+        g.check_support()
+        g.build_plans()
+        ports.update(zip(("dq", "dk", "dv"), outputs))
+        pack = {ports[n]: t for n, t in tensors.items()}
+        workspace = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        assert served, "the delayed twin template did not serve the graph"
+        print("DELAYED_OBSERVER_SOURCE", json.dumps(served), flush=True)
+
+        def check():
+            for name, want in zip(("dq", "dk", "dv"), expected):
+                got = tensors[name].float()
+                cos = torch.nn.functional.cosine_similarity(got.flatten(), want.flatten(), dim=0).item()
+                rel = ((got - want).abs().max() / max(want.abs().max().item(), 1e-30)).item()
+                assert cos > ref._TOL_COS and rel < ref._TOL_REL, (name, cos, rel)
+
+        # Compilation is outside the execution watchdog; a slow compiler is not a hang.
+        with process_watchdog(45.0, "D512 delayed empty-phase observer"):
+            g.execute(pack, workspace)
+            torch.cuda.synchronize()
+            check()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                g.execute(pack, workspace)
+            for _ in range(8):
+                for name in ("dq", "dk", "dv"):
+                    tensors[name].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                check()
+        print("DELAYED_OBSERVER_PASS", flush=True)
+    """))
+    env = dict(os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "compiled"))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(Path(__file__).resolve().parents[2]), cudnn.__file__, engine, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    (tmp_path / "delayed_observer.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+    assert proc.returncode == 0 and "DELAYED_OBSERVER_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"

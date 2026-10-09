@@ -78,7 +78,7 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         S_mbar_ptr,
         reduce_sync_mbar_ptr,
         mOut,
-        mDenom,
+        mDenom: cute.Tensor | None,
         num_n_blocks_compute,
         seqlen_k,
         seqlen_q,
@@ -93,7 +93,11 @@ class IndexerScoreUnifiedSm100(DenseScoreRecomputeSm100):
         batch_idx=None,
         cand_batch_offsets=None,
     ):
-        """Indexer epilogue shared by score-only and score+LSE modes."""
+        """Indexer epilogue shared by score-only and score+LSE modes.
+
+        ``mDenom`` is ``None`` when ``compute_lse`` is off; every read of it
+        sits below the ``const_expr(self.compute_lse)`` early return.
+        """
         tidx_wg = tidx % self.WARPGROUP_SIZE
 
         sW_off = Int32(0) if per_head_offset is None else per_head_offset

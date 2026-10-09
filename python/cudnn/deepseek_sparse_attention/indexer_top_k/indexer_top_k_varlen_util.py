@@ -490,6 +490,9 @@ class IndexerTopKKernelVarlen:
             fix_bytes = align_bytes - misalign
 
         prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
+        # A row shorter than the bytes up to the next aligned address is all prologue.
+        if prologue_elems > length:
+            prologue_elems = length
 
         remaining = length - prologue_elems
         aligned_size = (remaining // self.vec_size) * self.vec_size

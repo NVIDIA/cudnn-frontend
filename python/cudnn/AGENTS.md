@@ -257,7 +257,7 @@ the kernel that reads it).
   flagged in review on PR #517.
 - **A raw stream handle never goes straight into `torch.cuda.ExternalStream`.**
   Every eager caller on torch's default stream hands us a default-stream
-  sentinel (`0`, `cudaStreamLegacy` = 1, `cudaStreamPerThread` = 2), and torch
+  legacy sentinel (`0`, `cudaStreamLegacy` = 1), and torch
   before PR pytorch/pytorch#183258 (in v2.13.0; NGC 26.06 and torch <= 2.12
   lack it) returns a fresh NON-BLOCKING pool stream for `ExternalStream(0)`.
   Torch work issued in that context is unordered with a kernel launched on
@@ -265,7 +265,7 @@ the kernel that reads it).
   test passes; under xdist load the kernel reads stale conversion buffers and
   a staged output is copied back before it is written (the qa sm90
   `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
-  Map the sentinels and torch's own default stream to
+  Map the legacy sentinels and torch's own default stream to
   `torch.cuda.default_stream(device)`, the current stream to itself, and only a
   genuine side stream to `ExternalStream(handle, device=device)`. The one
   implementation is `cudnn._torch_stream` (`as_torch_stream`, `stream_context`,
@@ -430,8 +430,18 @@ tensor.record_stream(as_torch_stream(ctx.stream, device))
 ```
 Never call `torch.cuda.ExternalStream` / `get_stream_from_external` directly.
 `stream_context(None)` is a no-op; a handle equal to torch's current stream is
-a no-op via the raw-handle fast path; `0`/`1`/`2` and torch's default stream
-resolve to `torch.cuda.default_stream(device)`.
+a no-op via the raw-handle fast path; `0`/`1` and torch's default stream
+resolve to `torch.cuda.default_stream(device)`. `CUstream(2)` is a per-thread
+stream, NOT the legacy default. Torch interop rejects this sentinel: a cache
+key or allocator stream record based on `(device, 2)` aliases distinct host
+threads, and mapping it to the legacy default misorders scratch lifetimes.
+Use a concrete `torch.cuda.Stream` or its raw handle. The rejection must happen
+before the raw-current-stream shortcut too. Detector:
+`core/cutedsl/test_torch_stream_sentinels.py`. When staging a caller tensor,
+record its storage on the consuming stream even when `stream=None`: the caller
+may have entered a side-stream context after allocating it elsewhere. Use
+`contiguous_on_stream` / `copy_into_on_stream`; `core/cutedsl/test_torch_stream_staging.py`
+checks both explicit and implicit current streams with allocator reuse controls.
 
 **R2 — execute needs scratch (metadata, on-device descriptors, an output the
 kernel always writes but the graph did not request, staging for a dead-but-
@@ -579,6 +589,25 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+- **A guard that keeps the backend's planner away from a graph covers EVERY
+  path that creates a backend plan, not only the heuristics query.** The cc 10.7
+  single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
+  `sdpa/fwd/backend_guard.py`: the cuDNN 9.26 / 9.27 planner SIGSEGVs there)
+  first intercepted the planning sequence only -- `_finalize_backend_layout`
+  and `backend_plan_entries`. `create_execution_plan(<backend engine id>,
+  knobs)`, a replayed autotune record, still reached the C++
+  `Graph::create_execution_plan` and took the process down the same way (rc 139
+  on 9.26.0.51, no exception to catch), so "explicit diagnostic selection stays
+  available" was a crash for exactly the selection it named. The two
+  out-of-sequence creators, `_append_backend_plan` (the explicit pin and the
+  materialization of a replayed entry) and `_lower_backend_plan` (a late
+  heuristics query for a classic call), go through
+  `_pygraph._refuse_guarded_backend` and raise the typed decline with the guard's
+  reason; `key()` / `serialize()` only lower, which completes on that domain.
+  Detector: `sdpa/frost/test_sdpa_backend_guard.py::test_explicit_backend_pin_on_a_guarded_graph_is_a_typed_decline`
+  (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
+  the first guard. A version-bounded guard also needs the detector that
+  re-measures its bound (test/AGENTS.md).
 
 ## Frontend-only kernel package layout
 

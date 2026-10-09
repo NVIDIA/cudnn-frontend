@@ -782,6 +782,36 @@ q.shape[2] != ...)` must nest its constant test outside; a `const_expr` on a
 dynamic extent or stride is an error, which is why the padded-Stats store
 selects on the fake's RANK (rank-4) and not on `shape[0] > 1`.
 
+### Per-port token origins from the bound ragged offsets (SDPA THD backward, SM80)
+
+A ragged graph binds one ragged-offset tensor per port, and a padded THD layout
+(TE's `cu_seqlens_padded`) puts a sequence's rows somewhere other than
+`prefix(lengths)`. The SM80 backward reads those values on device (issue
+#737). Its existing setup launch, which turns the lengths into the compact
+`cu_seqlens`, also writes one **token origin per port and sequence**,
+`org_p[b] = ro_p[b] × M_p / ts_p` (`M_p` the port's `ragged_offset_multiplier`,
+`ts_p` its token stride in the CALLER's buffer, Int64 arithmetic), into an Int64
+`[rows, B]` workspace region with one row per port that binds offsets. No extra
+launch; the host only binds the current offset pointers, so the origins follow
+the bound values on every execute and CUDA-graph replay.
+
+Two kinds of row origin then coexist. The **internal** packed buffers (the fp32
+dQ accumulator, `do_dot`, the GQA dK/dV partials) stay at `prefix(lengths)`,
+so their sizing and the masks and loop bounds do not change. The **caller's**
+ports are addressed at their origins: the Q/dO and K/V loads, the Stats read,
+the direct-bound dK/dV stores, and the O·dO dot, dQ cast and dK/dV fold, which
+walk `(sequence, row)` over the envelope and touch `origin + row` for
+`row < len[b]` only. Gap rows are never read or written. A staged port (a head
+dim inside the flavor envelope) keeps its origins: the staging copy moves every
+row in place, which is why origins are computed from the caller's token stride.
+
+`tile_dsl.thd.write_thd_port_origins` / `thd_port_origin` are the shared
+helpers; each path materializes only the ports it needs. Whole-token offsets
+are a supported-input precondition of the FROST engines, not a restriction of
+the cuDNN tensor API, and are not checked on device. When the backend cannot
+lower a graph, the Python-side variant-pack order includes each port's ragged
+offset tensor, so the offsets reach the engine as bound slots.
+
 ### Accept means run
 
 For a python plan, `check_support()` accepted ⇒ `build_plans()` and

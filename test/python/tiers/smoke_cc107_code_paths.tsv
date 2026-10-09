@@ -213,7 +213,7 @@ gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_sdpa_bwd_fp8_st
 gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_fp8_gemm_stage_execute_matches_fp64_with_a_slot_alpha[B1_dw_o]	fp8 GEMM stage
 gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gradients_match_fp64_autograd[causal-norm]	block bwd THD
 gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gqa_bwd[gqa_8_2]	block bwd THD | GQA
-gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_zero_length_sequence_bwd[first_empty]	block bwd THD | empty sequence
+gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_zero_length_sequence_bwd[first_empty-unfused]	block bwd THD | empty sequence
 gated_attention_block/cutedsl/test_proj_gemm.py::test_matches_torch_linear[1024-4096-2176-dtype0]	proj GEMM bf16
 gated_attention_block/cutedsl/test_proj_gemm.py::test_fused_stage_matches_the_fp32_oracle[256-norm]	proj GEMM fused norm+rope stage
 gated_attention_block/cutedsl/test_proj_gemm.py::test_fp8_matmul_with_alpha_matches_fp32_reference[256-256-256]	proj GEMM fp8 + alpha
@@ -248,6 +248,23 @@ sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_ragged_L0[test1]	graph suite TH
 sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_paged_L0[test1]	graph suite paged
 sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_fwd_L0[test1]	graph suite fp8 fwd
 sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_bwd_L0[test1]	graph suite fp8 bwd
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[keyless_rows_d128_4x1_sink_m120_stats-frost]	paged THD + sink | d128 keyless rows O=0 / LSE=sink at -120 | Stats | dead pages NaN
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[keyless_rows_d256_4x1_sink_m120_stats-frost]	paged THD + sink | d256 keyless rows O=0 / LSE=sink at -120 | Stats | dead pages NaN
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[vllm_verify_d128_64x8_p16-frost]	paged THD + sink | d128 | Q 1/4/8 packed | HND page 16 | bf16 | FROST pinned
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_verify_cc107_pinned_L0[decode_q1_d128_64x8_p16-default]	paged THD + sink | d128 | s_q=1 | default common-API walk (no opt-in flag)
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d128-cga1-pack1-64x8]	paged THD + sink | d128 cga1 two-slab + PackGQA explicit pin
+sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga2-pack1-32x2]	paged THD + sink | d256 cga2 + PackGQA explicit pin
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_sink_keyless_rows_L0[g4_sink_default]	cc 10.7 half | d128 | dense padded | bf16 | sink + keyless rows + Stats | shared decode tile (TILE_CGA_M=1, PackGQA)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[mha_decode_small]	cc 10.7 half | d128 | dense | bf16 | sink | shared decode tile, unpacked (MHA)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_decode_tile_envelope_pinned_L0[packed_cga2_small]	cc 10.7 half | d128 | dense | bf16 | sink | PackGQA at cga2 on the shared prefill body
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q1_kv16384-u1s2]	cc 10.7 half | d128 | dense | bf16 | sink-free decode | the shared decode tile's SPLIT arm (unpacked cga1, split 2) + the shared combine | Stats (Rule S4)
+sdpa/graph/test_mhas_v2.py::test_sdpa_fwd_cc107_sink_free_decode_split_pins_L0[b1_64x8_q32_kv16384-p2s2]	cc 10.7 half | d128 | dense | bf16 | sink-free | PackGQA at cga2 on the shared prefill body, split 2 + the shared combine | Stats
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0[test1]	graph suite cc 10.7 MXFP8 default plan walk (flag deleted): the row serves, the backend is planned and ranked behind
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-frost_replay]	graph API explicit selection: create_execution_plan replay of the row's (engine_id, knobs) record
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-backend_first]	graph API explicit selection: backend cc 10.7 MXFP8 engine pinned (Amax_O xfails only when the backend's Amax_O is wrong for the graph)
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_decode_sink_d128_p128]	mxfp8 pools | d128 (cga2) | page 128 | decode s_q 1 | sink | HND | distinct K/V tables | dead-page poison | FLOAT | graph API
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_prefill_sink_stats_d256_p256]	mxfp8 pools | d256 (cga1, columnwise V SF plane-major) | page 256 | prefill s_q 256 BR | sink | NHD | Stats | FLOAT
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_mtp_swa_nhd_d128_p256]	mxfp8 pools | d128 | page 256 (2 tiles per page) | MTP s_q 8 BR + left window | e5m2 | NHD | distinct tables | Stats | FLOAT
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_batch_of_two_padded_lse[legacy_offsets]	rule: first L0 cell of test_ragged_prefill_batch_of_two_padded_lse
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_single_sequence_padded_lse_rows[d128_causal-legacy_offsets]	rule: first L0 cell of test_ragged_prefill_single_sequence_padded_lse_rows
 sdpa/frost/test_fp4_pointwise_primitives.py::test_e2m1_rne_emulation_matches_the_torchao_port	rule: first L0 cell of test_e2m1_rne_emulation_matches_the_torchao_port

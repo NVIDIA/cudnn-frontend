@@ -1097,6 +1097,27 @@ def test_masked_arm_lowers_to_the_bit_word_form(tmp_path, arch, profile, mask):
     assert stats["R2P"] > 0, f"{arch} p{profile} {mask}: no R2P in the masked build -- the mask arm is the per-cell compare + select form"
 
 
+_RUBIN_PROFILE_PROBE = textwrap.dedent(r"""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+    from cudnn.sdpa.bwd.api_dsl import _sm100_kernel_path
+    from cudnn.sdpa.bwd.config_sm107 import TemplateParams
+
+    mod = load_template(
+        _sm100_kernel_path("bprop_d256_2x2_f16.py"),
+        TemplateParams(dtype_qkv=DTYPE_BF16, datapath_2x2_profile=2),
+        tag="rubin_profile_trace",
+    )
+    assert mod.DESC_VERSION == 1 and mod.CFG.KV_SUBBLOCKS == 2 and mod.COLS_PER_LANE == 64 and mod.L_CNT == 256
+    try:
+        mod.compile(b=1, qh=2, kh=2, sq=256, skv=256)
+    except AttributeError as e:
+        if "tcgen05_mma_smem_desc_v2" not in str(e):
+            raise
+        print(f"SKIP profile 2 needs the version-1 tcgen05 SMEM descriptor intrinsic (nvidia-cutlass-dsl >= 4.8.0): {e}")
+""")
+
+
 def test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic():
     """Rule S6: profile 2 (the Rubin interleaved twin) traces from this box.  Its descriptor version 1 lowers through the
     DSL's ``_tcgen05_mma_smem_desc_v2`` intrinsic (>= 4.8.0); a DSL without it fails the trace with that name, which this
@@ -1104,11 +1125,11 @@ def test_rubin_profile_traces_or_names_the_missing_dsl_intrinsic():
     PASSED on a cc 10.7 board 2026-10-01 (internal DSL 0.3.0: the trace at the device's sm_107a),
     where the twin's GPU matrix (``test_sdpa_bwd_dsl_sm107.py -k twox2``) and the sm_107a SASS rows above also ran -- the
     SKIP here is a 4.7.0-CI accommodation, not an untested path."""
-    mod = _load_kernel(2)
-    assert mod.DESC_VERSION == 1 and mod.CFG.KV_SUBBLOCKS == 2 and mod.COLS_PER_LANE == 64 and mod.L_CNT == 256
-    try:
-        mod.compile(b=1, qh=2, kh=2, sq=256, skv=256)
-    except AttributeError as e:
-        if "tcgen05_mma_smem_desc_v2" in str(e):
-            pytest.skip(f"profile 2 needs the version-1 tcgen05 SMEM descriptor intrinsic (nvidia-cutlass-dsl >= 4.8.0): {e}")
-        raise
+    # Select before DSL import, independently of the runner GPU or an inherited target.
+    arch = "sm_107a" if arch_known_to_the_dsl("sm_107a") else "sm_100a"
+    env = dict(os.environ, CUTE_DSL_ARCH=arch, CUDNN_FRONTEND_DISABLE_COMPILED_CACHE="1")
+    proc = subprocess.run([sys.executable, "-c", _RUBIN_PROFILE_PROBE], capture_output=True, text=True, timeout=1500, env=env)
+    assert proc.returncode == 0, f"{arch} profile-2 trace failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    for line in proc.stdout.splitlines():
+        if line.startswith("SKIP "):
+            pytest.skip(line.removeprefix("SKIP "))
