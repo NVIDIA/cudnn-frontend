@@ -405,8 +405,11 @@ validates and records it. The per-layer recipe of a training loop: one compiled 
 (autograd runs the backward long after every layer's forward, so the step's spec travels with the layer), `spec_l`'s `descale_*`
 from the tensors quantized this step and its activation scales from the previous step's record of that layer. `compile()` only
 allocates those scalars; their values are written on the launch stream -- by the first `execute` of a compiled block and by every
-`update_quant_scales` -- never on the stream ambient at compile time, so a block compiled on one stream and recalibrated or first
-executed on another reads what its execution stream wrote, and nothing enqueued at compile time can land later and undo an update.
+`update_quant_scales` -- never on the stream ambient at compile time, and every such write first waits on an event `compile()`
+records behind its allocations (under `torch.use_deterministic_algorithms(True)` an allocation itself fills with NaN on that
+stream), so a block compiled on one stream and recalibrated or first executed on another reads what its execution stream wrote,
+and nothing enqueued at compile time can land later and undo an update. Inside a CUDA-graph capture that wait is skipped: warm the
+block up with one eager execute before capturing (the rule below).
 
 #### Packed sequences (THD)
 

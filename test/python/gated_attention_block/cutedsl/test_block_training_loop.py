@@ -542,13 +542,17 @@ def test_first_execute_writes_the_scales_on_its_launch_stream(family, how, tmp_p
 @requires_rubin
 @_FAMILY
 @pytest.mark.parametrize("pipeline", ["unfused_training", "fused_inference"])
-def test_update_quant_scales_outlives_pending_work_on_the_compile_stream(family, pipeline):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["plain", "deterministic_alloc"])
+def test_update_quant_scales_outlives_pending_work_on_the_compile_stream(family, pipeline, deterministic):
     """``compile()`` ALLOCATES the device scalars and writes nothing: a block compiled while its ambient stream is PARKED behind a long
     spin, recalibrated with ``update_quant_scales(B)`` and executed on a side stream, reads ``B`` -- on that first execute AND on a
     later one after the parked stream has drained.  A compile-time fill of the scalars (or of the fused fp8 fork's scale vector) on the
     parked stream would land AFTER the update and silently restore ``A`` for every later execute (the first-execute write is one-shot)
     while ``blk.quant`` still said ``B``.  Both pipelines of both families; the park must still be pending at the update (asserted, so
-    the cell cannot pass vacuously)."""
+    the cell cannot pass vacuously).  The ``deterministic_alloc`` arm compiles under ``torch.use_deterministic_algorithms(True)``
+    (``fill_uninitialized_memory`` on, the default): there ``torch.empty`` itself enqueues a NaN fill of the fresh scalars on the parked
+    stream, which the writers must order themselves behind (the event ``compile()`` records) -- without it the drained park overwrites
+    a completed recalibration with NaN.  The process settings are restored whatever happens."""
     fused = pipeline == "fused_inference"
     if fused:
         _skip_without_the_fused_fork(family)
@@ -568,8 +572,20 @@ def test_update_quant_scales_outlives_pending_work_on_the_compile_stream(family,
     saved2 = _record(r) if not fused else None
     torch.cuda.synchronize()
     assert torch.cuda.current_stream() == torch.cuda.default_stream()
-    park_the_default_stream(seconds=6.0)  # compile()'s ambient stream: anything it enqueued there lands only after the spin
-    ws = _compile(r.blk)
+    prev_det, prev_fill = torch.are_deterministic_algorithms_enabled(), torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        if deterministic:
+            torch.use_deterministic_algorithms(True)
+            torch.utils.deterministic.fill_uninitialized_memory = True
+            probe = torch.empty(4, dtype=torch.float32, device="cuda")  # the arm's premise: an allocation that fills itself
+            torch.cuda.synchronize()
+            if not torch.isnan(probe).all():
+                pytest.skip("this torch does not fill torch.empty under deterministic mode; the plain arm covers the race")
+        park_the_default_stream(seconds=6.0)  # compile()'s ambient stream: anything it enqueued there lands only after the spin
+        ws = _compile(r.blk)  # under the deterministic arm: its torch.empty allocations carry a NaN fill queued behind the park
+    finally:
+        torch.use_deterministic_algorithms(prev_det)
+        torch.utils.deterministic.fill_uninitialized_memory = prev_fill
     with torch.cuda.stream(side):
         r.blk.update_quant_scales(b)
         _execute_fwd(r, r.blk, out1, ws, saved=saved1)

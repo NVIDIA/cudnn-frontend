@@ -2775,6 +2775,7 @@ class _FusedQkvProjection(_Stage):
         self._plan = None
         self._qscal = None
         self._qscal_written = False
+        self._qscal_ready = None  # the allocation stream's event, recorded in compile(); every write waits on it
 
     @property
     def fp8(self) -> bool:
@@ -2996,6 +2997,11 @@ class _FusedQkvProjection(_Stage):
             dev = self.device if self.device is not None else torch.device("cuda")
             self._qscal = torch.empty(4, dtype=torch.float32, device=dev)
             self._qscal_written = False
+            # The allocation is not free of stream work either: under torch.use_deterministic_algorithms(True) (with
+            # fill_uninitialized_memory, the default) torch.empty enqueues a NaN fill on the ambient stream.  Record it, so every
+            # writer orders itself behind whatever the allocation enqueued (write_qscal waits on this event).
+            self._qscal_ready = torch.cuda.Event()
+            self._qscal_ready.record(torch.cuda.current_stream(dev))
 
     def workspace_bytes(self) -> int:
         """None: no split-K, no scratch -- the kernel writes the slab directly."""
@@ -3053,10 +3059,15 @@ class _FusedQkvProjection(_Stage):
         """Write ``spec``'s ``[alpha_qkvg, scale_q, scale_k, scale_v]`` into the fork's fp32 vector IN PLACE on ``stream`` (a raw
         CUstream handle: the launch stream, so the next execute on it is ordered behind the write) and make ``spec`` the stage's spec.
         The ONLY writer of that vector -- :meth:`compile` allocates it and never fills it -- so no compile-time write can land after a
-        later cross-stream recalibration and restore the declared scales."""
+        later cross-stream recalibration and restore the declared scales; the write first waits on the allocation stream's event
+        (:meth:`compile` records it), so even a deterministic-mode fill of the allocation lands before it.  Inside a stream capture
+        the wait is skipped (an external event cannot be waited on there): warm the block up before capturing."""
         if self._qscal is None:
             raise RuntimeError("call compile() before write_qscal()")
-        with torch.cuda.stream(as_torch_stream(stream, self._qscal.device)):
+        ts = as_torch_stream(stream, self._qscal.device)
+        with torch.cuda.stream(ts):
+            if self._qscal_ready is not None and not torch.cuda.is_current_stream_capturing():
+                ts.wait_event(self._qscal_ready)  # the allocation's own stream work (a deterministic-mode fill) lands first
             for i, v in enumerate((spec.alpha_qkvg, spec.scale_q, spec.scale_k, spec.scale_v)):
                 self._qscal[i : i + 1].fill_(float(v))
         self.quant = spec
@@ -4535,6 +4546,9 @@ class GatedAttentionBlockFwd(APIBase):
         # fill would have no ordering against a cross-stream recalibration: pending work ahead of it on the compile stream would let
         # it land AFTER the update and silently restore the declared scales for every later execute.  Reset at compile().
         self._quant_dev_on_launch_stream = False
+        # The allocation itself is stream work under torch.use_deterministic_algorithms(True) (torch.empty enqueues a NaN fill on
+        # the ambient stream): compile() records an event behind it and every writer waits on that event first.
+        self._quant_dev_ready = None
         # rstd exists only where a norm exists: under qk_norm=False a training
         # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
         # are None -- required, both directions, at execute).
@@ -5013,6 +5027,12 @@ class GatedAttentionBlockFwd(APIBase):
         self._ws = self._layout()
         self._quant_dev = self._make_quant_dev()
         self._quant_dev_on_launch_stream = False
+        self._quant_dev_ready = None
+        if self._quant_dev:
+            # whatever the allocations above (and the fused fork's, in its stage compile) enqueued on the ambient stream -- under
+            # deterministic mode a NaN fill -- is behind this event; _write_quant_dev waits on it before writing on any stream
+            self._quant_dev_ready = torch.cuda.Event()
+            self._quant_dev_ready.record(torch.cuda.current_stream(self.device))
 
     def _quant_dev_values(self, spec: Optional[Union[QuantSpec, MxQuantSpec]]) -> Optional[dict]:
         """The per-tensor scalars of ``spec`` the block holds as 1-element fp32 device tensors, as ``{name: float}`` -- the ONE
@@ -5045,7 +5065,9 @@ class GatedAttentionBlockFwd(APIBase):
         on a launch stream only: by the FIRST ``execute`` on ITS launch stream (:meth:`_write_quant_dev`) and by every
         :meth:`update_quant_scales` on the caller's.  A fill enqueued on the stream ambient at ``compile()`` would have no ordering
         against a recalibration on another stream: pending work ahead of it would let it land after the update and restore the
-        declared values while ``self.quant`` already named the new spec."""
+        declared values while ``self.quant`` already named the new spec.  The allocation is not free of stream work either
+        (``torch.use_deterministic_algorithms(True)`` makes ``torch.empty`` fill with NaN), which is why ``compile()`` records an
+        event behind it that every writer waits on."""
         vals = self._quant_dev_values(self.quant)
         if vals is None:
             return None
@@ -5085,12 +5107,19 @@ class GatedAttentionBlockFwd(APIBase):
         """Write ``spec``'s scalars into the device tensors of :meth:`_make_quant_dev` -- and, on the fully fused fp8 pipeline, into
         the projection fork's fp32 ``[alpha_qkvg, scale_q, scale_k, scale_v]`` vector (:meth:`_FusedQkvProjection.write_qscal`) -- IN PLACE on ``stream`` (a raw CUstream
         handle: the launch stream, so the next execute on it is ordered behind the writes by construction, Rule 5).  One fill
-        per value: nothing allocated, nothing read back, no recompile.  Nothing to write under ``o_fp4`` (``{}``)."""
+        per value: nothing allocated, nothing read back, no recompile.  Nothing to write under ``o_fp4`` (``{}``).  The write
+        first waits on the event ``compile()`` recorded behind its allocations, so stream work the allocation itself enqueued (under
+        ``torch.use_deterministic_algorithms(True)`` ``torch.empty`` fills the tensors with NaN) lands before any value written on
+        another stream.  Inside a stream capture the wait is skipped (an external event cannot be waited on there) -- the documented
+        case: warm the block up before capturing."""
         qd = self._quant_dev
         if not qd:
             return
         vals = self._quant_dev_values(spec)
-        with torch.cuda.stream(as_torch_stream(stream, self.device)):
+        ts = as_torch_stream(stream, self.device)
+        with torch.cuda.stream(ts):
+            if self._quant_dev_ready is not None and not torch.cuda.is_current_stream_capturing():
+                ts.wait_event(self._quant_dev_ready)
             for name, ten in qd.items():
                 ten.fill_(vals[name])
         if self.fp8_fused:
