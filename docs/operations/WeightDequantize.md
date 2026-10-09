@@ -326,7 +326,11 @@ fields. Q6_K assembles signed six-bit values from separate bit planes, then
 applies signed int8 local scales and the FP16 superblock scale. IQ1_S uses the
 canonical 2048x8 ternary grid, an odd scale multiplier and a +/-1/8 offset;
 it is not plain binary 1-bit dequantization. Its grid is a FLOAT auxiliary tensor
-read directly from global memory. Q4_K and Q6_K require no auxiliary tensors.
+read directly from global memory. Each IQ1_S lane reuses one scale/offset across
+eight values and loads the grid entry with two 16-byte loads when aligned.
+Four-byte-aligned grid bases use scalar loads; no new alignment promise or
+codebook representation is required. Warp shuffles transpose the lane-local
+values for a vector shared-memory store. Q4_K and Q6_K require no auxiliaries.
 
 Expected weights are computed from original codes/scales before packing.
 Identity GEMMs verify every rounded output weight exactly (all IQ1_S indices),
@@ -334,6 +338,8 @@ and separate tail GEMMs exercise multiple blocks. M=16/N=256/K=544 cases exercis
 automatic split-K and queried workspace with all three formats and both operand
 types. A further M=1/K=128 case with N=512 times the actual GPU SM count covers the
 wide-grid grouped path and aligned Q4 word loads for all formats and types.
+IQ1_S tail and split-K cases also use grid bases offset by one or two FLOATs
+to exercise the scalar fallback through the C++ frontend.
 The C++ samples allocate the plan's workspace for every execution.
 Python numerical tests similarly cover split-K for signed INT8/INT4/INT2 with
 global/block/combined scaling, including plan reload and CUDA graph replay.
@@ -451,3 +457,104 @@ Broad uniform-address and callback-interface experiments were discarded after
 regression checks; no new callback ABI is exposed. Decoder/MMA overlap and
 engine-managed packed staging remain future work. Other GPUs and Windows have
 not been measured in this update. This remains a draft prototype.
+
+## IQ1_S vector loads and guarded medium-M scheduling (2026-10-09)
+
+This increment improves the customer IQ1_S decoder and the format-independent
+split-K planner. It follows backend `1f00cd62a6` and frontend `3fae893f70`.
+
+Each IQ1_S lane now decodes eight weights from one codebook index. It reuses
+the block scale and offset, reads the existing FLOAT grid entry with two
+16-byte global loads, and transposes registers before a 16-byte shared store.
+The vector path checks the actual codebook pointer. Bases aligned to only
+four bytes use scalar loads, including offsets of 4, 8 and 12 bytes. Packed
+weights retain their original 50-byte blocks and byte-alignment support.
+No codebook compression, repacking, scratch allocation or API change is needed.
+Q4_K and Q6_K retain their existing decoder paths.
+
+For 17 <= M <= 128, an unsplit grid with at least one but fewer than two CTAs
+per actual GPU SM now targets four waves instead of two. Smaller grids retain
+the old target: a broader four-wave policy regressed some cases by increasing
+partial-output/reduction traffic and was discarded. Existing K divisibility,
+minimum work per slice, shared-memory, shape and 64 MiB workspace checks still
+apply. M <= 16 retains its eight-wave target; larger M retains two waves.
+The engine never inspects the format constant or the decoder's source to tune.
+
+ABI 1 remains 256 threads, a 32x64 stride-64 callback tile, and null scratch.
+The decoder owns all loads. Synchronous B decoding and the existing MMA
+pipeline remain; this update does not implement producer/MMA overlap or packed
+staging. Rebuild plans to obtain new scheduling and supply the updated example
+source for IQ1_S gains. Saved binaries retain their recorded geometry. Always
+query execution workspace again after rebuilding a plan: more splits can
+increase it even though decoder scratch remains zero.
+
+All 198 supplied spreadsheet cases pass on ultra's RTX PRO 6000 Blackwell
+Server GPUs (SM120, 188 SMs, CUDA/NVRTC 13.4). No final sweep case regressed
+by more than 10% against the previous local sweep. Selected controls below
+use the median of three independent processes per version, with old/new
+order alternated on the same GPU. Timings are microseconds:
+
+| Format / shape | M | N | K | Previous us | Updated us | llama.cpp us | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Llama iq1 | 2 | 14336 | 4096 | 96.1 | 78.4 | 9.6 | 1.23x |
+| Llama iq1 | 1 | 4096 | 14336 | 92.2 | 76.7 | 9.0 | 1.20x |
+| Llama iq1 | 32 | 14336 | 4096 | 151.1 | 90.3 | 28.5 | 1.67x |
+| Llama q4 | 32 | 14336 | 4096 | 117.5 | 97.4 | 27.7 | 1.21x |
+| Llama q6 | 128 | 14336 | 4096 | 154.7 | 135.1 | 81.0 | 1.15x |
+| Llama iq1 | 512 | 4096 | 14336 | 587.6 | 457.2 | 215.6 | 1.29x |
+| Llama iq1 | 2048 | 1024 | 4096 | 199.2 | 149.5 | 79.1 | 1.33x |
+| Tail iq1 | 37 | 75 | 512 | 42.0 | 15.6 | 18.0 | 2.70x |
+| Qwen head q6 | 1 | 248320 | 2048 | 535.4 | 535.5 | 276.3 | 1.00x |
+| Llama q4 | 64 | 4096 | 14336 | 115.1 | 115.1 | 40.2 | 1.00x |
+
+The remaining worst model-shape ratio in the sweep is 8.51x
+cuDNN/llama.cpp (q4_K, M=1, N=4096, K=14336).
+These improvements do not establish performance parity. They are synthetic
+fixtures at Llama3.1-8B and Qwen3.6-35B-A3B dimensions, not end-to-end models,
+real routed MoE, or tokens/s measurements.
+
+The comparison protocol remains 11 alternating cuDNN/llama.cpp rounds of
+20 dependent CUDA-graph operations, with three warmup replays per timed side.
+Both cuDNN split-K phases and llama.cpp activation quantization/fixup are
+included; compilation, allocation and reference calculations are excluded.
+Caches are warm/reused, clocks unlocked, and no other timed job shares each GPU.
+llama.cpp remains pinned to `08246a28f6000100433d297c4e037c02e9d2d464`.
+cuDNN uses FP16 decoded weights/activations and FP32 accumulation; llama.cpp
+MMQ uses Q8_1 activation quantization and INT8 MMA. Every packed weight is
+checked against ggml's CPU decoder. Full outputs pass finiteness and NRMSE
+checks against FP64 unrounded-weight GEMM; 256 sampled outputs additionally
+pass the FP16-weight contract at atol=rtol=0.005. Numerical metrics accompany
+every timing. These checks do not measure model-level accuracy.
+
+Host planner boundaries, full backend integration, frontend C++ samples and
+45 Python tests pass. New backend tests cover IQ1_S auxiliary offsets 4/8/12,
+unaligned packed bases and partial grids in FP16/BF16. C++ frontend samples
+also bind offset codebooks. Existing identity cases check every decoded
+weight and all 2048 grid indices. Compute Sanitizer reports zero memcheck
+errors for ggml/pipeline cases, zero pipeline race hazards/warnings, and zero
+ggml synchronization errors.
+
+Actual compiled backend kernels, with the runtime's dynamic-SMEM opt-in:
+
+| Kernel / example | Registers/thread | Operand SMEM | Theoretical CTAs/SM |
+| --- | ---: | ---: | ---: |
+| Split M16 IQ1_S | 40 | 11,776 B | 6 |
+| Split M32 IQ1_S | 40 | 14,336 B | 6 |
+| Grouped M256 IQ1_S | 122 | 50,176 B | 2 |
+| Split M32 Q4_K | 40 | 14,336 B | 6 |
+| Split M128 Q6_K | 64 | 29,696 B | 3 |
+
+All five inspected kernels have zero local/stack storage and no LDL, STL or
+CALL instructions. The IQ1_S change adds no shared-memory allocation. CUDA
+also reserves 1 KiB per CTA. Resource use depends on customer code; this is
+not a spill-free guarantee for arbitrary decoders. Hardware performance
+counters remain unavailable (`ERR_NVGPUCTRPERM`), so stall/bandwidth attribution
+is limited to controlled experiments and binary inspection.
+
+Reproduction and complete evidence: `/tmp/cudnn-dequant-upgrade5` on ultra,
+including `README.txt`, `matrix/comparison.csv`,
+`matrix/2026-10-08-cudnn-dequant-all-iq1-vector.xlsx`, `controls/summary.json`,
+source snapshots and sanitizer/resource logs. For example:
+`bash /tmp/cudnn-dequant-upgrade5/run-compare.sh 2 14336 4096 iq1`.
+Other GPUs and Windows were not measured in this increment. The reviews
+remain draft prototypes; engine-owned staging is still milestone (b).

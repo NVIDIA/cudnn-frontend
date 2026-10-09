@@ -96,6 +96,78 @@ __device__ void decode_q4_words(const FortWeightDecodeTileV1& t, const void* sto
     *reinterpret_cast<DecodeVector*>(output + row*t.output_stride + base) = values;
 }
 
+__device__ void decode_iq1_vectors(const FortWeightDecodeTileV1& t, const void* storage,
+    const void* const* auxiliary,
+    FortWeightDecodeValue* output) {
+    // Four adjacent lanes share one 32-value group. Each lane decodes an
+    // entire eight-value grid entry, reusing its block scale and offset.
+    const long long blocks_per_row = (t.full_k + 255) / 256;
+    const int lane = t.thread_id % 32;
+    const int first_row = (lane % 4) * 8;
+    const int base = (t.thread_id / 32) * 8;
+    const int col = base + lane / 4;
+
+    const long long n = t.n_begin+col;
+    const int r0 = int(t.k_begin%256)+first_row;
+    float scale = 0, delta = 0;
+    unsigned index = 0;
+    if (col < t.valid_n && first_row < t.valid_k) {
+        const auto* block = static_cast<const unsigned char*>(storage)
+            + (n*blocks_per_row+t.k_begin/256)*50;
+        const unsigned h = read_u16(block+34+(r0/32)*2);
+        index = unsigned(block[2+r0/8]) | (((h>>((r0%32)/8*3))&7)<<8);
+        delta = (h&0x8000)?-0.125f:0.125f;
+        scale = read_half(block)*float(2*((h>>12)&7)+1);
+    }
+    float grids[8] = {};
+    if (col < t.valid_n && first_row < t.valid_k) {
+        const float* ptr = static_cast<const float*>(auxiliary[0])+index*8;
+        // Vectorize the dependent codebook loads when its base is aligned.
+        // The public FLOAT auxiliary needs only four-byte alignment; retain
+        // scalar loads for legal bases offset by 4, 8 or 12 bytes. Read the
+        // complete grid entry even at a logical K tail: all eight values exist.
+        if ((reinterpret_cast<unsigned long long>(ptr) & 15) == 0) {
+            asm("ld.global.v4.f32 {%0,%1,%2,%3}, [%4];"
+                : "=f"(grids[0]),"=f"(grids[1]),"=f"(grids[2]),"=f"(grids[3]) : "l"(ptr));
+            asm("ld.global.v4.f32 {%0,%1,%2,%3}, [%4];"
+                : "=f"(grids[4]),"=f"(grids[5]),"=f"(grids[6]),"=f"(grids[7]) : "l"(ptr+4));
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) grids[j] = ptr[j];
+        }
+    }
+    FortWeightDecodeValue decoded[8] = {};
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (col < t.valid_n && first_row+j < t.valid_k) {
+            const float weight = scale*(grids[j]+delta);
+            decoded[j] = fort_weight_decode_from_float(weight);
+        }
+    }
+    // Transpose the lane-local K values into eight adjacent N values, as
+    // in Q4_K. Invalid lanes still join every shuffle, then store zero tails.
+    #pragma unroll
+    for (int bit = 0; bit < 3; ++bit) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if ((i & (1<<bit)) == 0) {
+                const int other = i | (1<<bit);
+                const bool high = lane & (1<<(bit+2));
+                const unsigned value = __shfl_xor_sync(0xffffffffu,
+                    unsigned(high ? decoded[i] : decoded[other]), 1<<(bit+2));
+                if (high) decoded[i] = value;
+                else decoded[other] = value;
+            }
+        }
+    }
+    DecodeVector values{};
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+        values.words[j/2] |= unsigned(decoded[j]) << ((j%2)*16);
+    const int row = (lane%4)*8 + lane/4;
+    *reinterpret_cast<DecodeVector*>(output + row*t.output_stride + base) = values;
+}
+
 __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
     const void* const* auxiliary, void* cta_scratch, void* stage_scratch,
     FortWeightDecodeValue* output) {
@@ -104,9 +176,13 @@ __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
         decode_q4_words(t, storage, output);
         return;
     }
+    if (int(t.constants[0]) == 1) {
+        decode_iq1_vectors(t, storage, auxiliary, output);
+        return;
+    }
     const int format = int(t.constants[0]);
     // Example-side tuning: preserve the original address expressions for
-    // smaller Q6_K matrices and IQ1_S. Wide Q6_K benefits from keeping block
+    // smaller Q6_K matrices. Wide Q6_K benefits from keeping block
     // and bit-plane coordinates independent of the lane's K position.
     const bool uniform_q6 = format == 6 && t.full_n >= 65536;
     const int block_bytes = format == 4 ? 144 : (format == 6 ? 210 : 50);
@@ -142,8 +218,8 @@ __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
                 weight = (read_half(block)*float(scale))*float(code)
                        - (read_half(block+2)*float(minimum));
             } else if (format == 6) {
-                // Keep this specialization inside Q6_K so the IQ1_S address
-                // expressions and their compiler range analysis stay unchanged.
+                // Keep the wide specialization local to Q6_K; ordinary Q6_K
+                // retains its existing address expressions and range analysis.
                 const auto* q6_block = uniform_q6
                     ? static_cast<const unsigned char*>(storage) + (n*blocks_per_row+t.k_begin/256)*210
                     : block;
