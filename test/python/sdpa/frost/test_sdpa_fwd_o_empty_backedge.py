@@ -11,7 +11,7 @@ second phase before warpgroup 1's parity wait; the wait aliased, warpgroup 1 nev
 cc 10.3 at ~80 % of launches on square bottom-right-causal split-KV graphs (#1532) and intermittently on the cc 10.0 paged-THD
 capture/replay CI case (#1525).  Fix: each warpgroup waits ITS OWN slot, whose chain runs through its own stats publish.
 
-Two pins.  (1) Source, no GPU: no two-warpgroup forward kernel waits ``mb_o_empty[0]`` at the top of the tile any more.  (2) Device,
+Two pins.  (1) Source, no GPU: none of the eleven two-warpgroup forward kernels waits ``mb_o_empty[0]`` at the top of the tile any more.  (2) Device,
 in a SUBPROCESS under a wall budget so a regression can never wedge the suite: the smallest shape that hung deterministically on a
 cc 10.3 part (B=1, H=32, S_q = S_kv = 2048, D=128, bf16, bottom-right causal, TILE_CGA_M=2, SPLIT_KV=16, PACK_GQA=0) runs 20
 back-to-back synchronised executes and matches an fp32 reference.
@@ -36,6 +36,7 @@ _TWO_WARPGROUP_KERNELS = (
     "sm100/prefill_d128_f16.py",
     "sm100/prefill_d128_fp8.py",
     "sm100/prefill_d128_mxfp8.py",
+    "sm100/prefill_d192_d128_fp8.py",
     "sm100/prefill_d192_d128_mxfp8.py",
     "sm107/prefill_d128_f16.py",
     "sm107/prefill_d128_fp8.py",
@@ -50,12 +51,12 @@ _TWO_WARPGROUP_KERNELS = (
 def test_softmax_top_of_tile_wait_is_on_the_warpgroups_own_o_slot(kernel):
     src = open(os.path.join(_KERNELS, kernel)).read()
     code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
+    # Spelling-agnostic: the wait is `bars.mb_o_empty[<slot>].wait(epilogue_state...)` in most kernels and
+    # `_wait_mbarrier(bars.mb_o_empty[<slot>], epilogue_state)` in the sm100 d192x128 fp8 one; the SLOT is what matters.
     assert not re.search(
-        r"mb_o_empty\[0\]\.wait\(epilogue_state", code
+        r"mb_o_empty\[0\].*epilogue_state", code
     ), f"{kernel}: a softmax warpgroup waits slot 0 of mb_o_empty at the top of the tile (no back-edge from warpgroup 1)"
-    assert (
-        len(re.findall(r"mb_o_empty\[sub_tile_id\]\.wait\(epilogue_state", code)) == 1
-    ), f"{kernel}: expected exactly one per-warpgroup top-of-tile mb_o_empty wait"
+    assert len(re.findall(r"mb_o_empty\[sub_tile_id\].*epilogue_state", code)) == 1, f"{kernel}: expected exactly one per-warpgroup top-of-tile mb_o_empty wait"
 
 
 _CHILD = textwrap.dedent(r"""
