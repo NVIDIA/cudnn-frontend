@@ -342,6 +342,15 @@ _PLAIN_T64_CASES = {
     "plain_t64_384_quiet_cga2": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, cga=2),
     "d64_plain_t64_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, d=64),
     "d64_plain_300_served_pick": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, d=64, knob_tile_n=None),
+    # The measured default reaches EVERY plain TILE_N 64 form the small-tile leg admits (only THD / paged / split-KV / PackGQA / score
+    # side outputs walk past it), so the const_expr arms a dense pass proves nothing about get their own two-slot cell, each bitwise the
+    # one-slot kernel: a causal left window (the item's trimmed kv range starts past tile 0 for the second 256-row item), a sink (the
+    # sink fold in the two-slot epilogue), the bottom-right diagonal at S_q < S_kv (the diagonal offset), and f16 (the pick's dtype gate
+    # is every f16/bf16 member, not bf16 alone) -- all through the served pick at S 300 (no TILE_N knob).
+    "plain_300_served_pick_causal_window_64": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, causal=True, window_left=64, knob_tile_n=None),
+    "plain_300_served_pick_sink": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, sink=True, knob_tile_n=None),
+    "plain_300_served_pick_bottom_right_sq256": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=300, bottom_right=True, knob_tile_n=None),
+    "plain_300_served_pick_f16": dict(b=2, h=2, h_kv=2, s_q=300, s_kv=300, dtype="f16", knob_tile_n=None),
 }
 
 
@@ -413,14 +422,17 @@ def test_two_slots_on_the_plain_tile_n_64_body(case, _pins):
     """The plain (no bias, no mask) body at TILE_N 64 -- through the public knob, or the served pick itself at S 300 (``knob_tile_n`` None:
     the width rule lands on 64 and the measured slot rule on 2 with NO pin at all): the oracle sees a zero bias (s + 0 == s exactly); the
     quiet cells run the dead sub-tile's QUIET body with two slots (the cursor threaded through it), S 300 the padded legacy tail, the
-    kv_lens cell the per-batch-length arm.  The knob-less plan (the default = two slots here) is BITWISE the one-slot kernel pinned
-    through the seam."""
+    kv_lens cell the per-batch-length arm, the window / sink / bottom-right / f16 cells the mask, sink and dtype arms the default also
+    reaches.  The knob-less plan (the default = two slots here) is BITWISE the one-slot kernel pinned through the seam."""
     from cudnn.sdpa.fwd import config_sm107 as cfg107
 
     c = _PLAIN_T64_CASES[case]
     tile_n = c.get("knob_tile_n", 64)
-    assert cfg107.sm107_s_slots_pick(c.get("d", 32), 64) == 2, "the measured default the knob-less arm below renders"
-    q, k, v, kw, ref = _s13._case_inputs(case, torch.bfloat16, table=_PLAIN_T64_CASES)
+    dtype = torch.float16 if c.get("dtype") == "f16" else torch.bfloat16
+    assert (
+        cfg107.sm107_s_slots_pick(c.get("d", 32), 64, dtype_qkv=3 if dtype is torch.float16 else 2) == 2
+    ), "the measured default the knob-less arm below renders"
+    q, k, v, kw, ref = _s13._case_inputs(case, dtype, table=_PLAIN_T64_CASES)
     ref = _s13._ref_of(c, q, k, v, {**kw, "bias": torch.zeros_like(kw["bias"])})
     kw = {**kw, "bias": None}
     two = _run(q, k, v, kw, c, _pins, s_slots=None, tile_n=tile_n)
