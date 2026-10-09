@@ -460,11 +460,15 @@ def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
             _reference(s, changed)
 
 
-@pytest.mark.parametrize("hnd,d_qk", [(False, 128), (True, 128), (None, 192), (None, 128)], ids=["paged_nhd", "paged_hnd", "nonpaged_mla", "nonpaged_d128"])
+@pytest.mark.parametrize(
+    "hnd,d_qk,has_sink",
+    [(False, 128, False), (True, 128, False), (None, 192, False), (None, 128, False), (False, 128, True), (True, 128, True)],
+    ids=["paged_nhd", "paged_hnd", "nonpaged_mla", "nonpaged_d128", "paged_nhd_sink", "paged_hnd_sink"],
+)
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("splits", [4, 16])
-def test_native_packed_split_matches_reference_and_rebinds(hnd, d_qk, layout, dtype, splits):
+def test_native_packed_split_matches_reference_and_rebinds(hnd, d_qk, layout, dtype, splits, has_sink):
     """Packed splits bind independent frames without weakening observed spans."""
     if hnd is None:
         s, facts, frames = _fixture(dtype, layout)
@@ -479,6 +483,9 @@ def test_native_packed_split_matches_reference_and_rebinds(hnd, d_qk, layout, dt
             s.decl[role] = (heads, d_qk, heads * d_qk, d_qk, 1, heads * d_qk)
     else:
         s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
+    if has_sink:
+        s.has_sink = True
+        facts["sinks"] = prep.BufferFacts(0x50000, "float32", (2, 0), s.qh, (s.qh,), (1,))
     s.cga_tile_m = 128
     s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
     s.index = {name: i for i, name in enumerate(s.order)}
@@ -498,6 +505,13 @@ def test_native_packed_split_matches_reference_and_rebinds(hnd, d_qk, layout, dt
     assert second[s.index["partial_o_strides"]] == (16 * s.qh * 128, s.qh * 128, 128)
     if hnd is not None:
         assert second[s.index["block_table_v_ptr"]] == changed["block_table_v"].ptr
+    if has_sink:
+        assert first[s.index["sinks_ptr"]] == facts["sinks"].ptr
+        assert second[s.index["sinks_ptr"]] == changed["sinks"].ptr
+        for bad in (None, changed["sinks"]._replace(span=1), changed["sinks"]._replace(dtype="bfloat16"), changed["sinks"]._replace(device=(2, 1))):
+            for bind in (_native, _reference):
+                with pytest.raises(ValueError):
+                    bind(s, dict(changed, sinks=bad))
     assert tuple(s.template) == original
     s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x8000000, 29)
     assert frames[-1] == tuple(second)
