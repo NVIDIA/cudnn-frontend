@@ -680,7 +680,7 @@ def test_sparse_kernel_decode_form_source_pins():
     assert "_gather_block_ids(sIds_raw, slot_base, tile0, w, count, n_tail, tail_lo, dead)" in code
     assert "t_next = tile0 + t_next" in code and "t_abs = tile0 + i" in code
     assert "part_batch = out_batch + split * n_batch" in code and code.count("oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]") == 2
-    assert "lse_arr[part_batch, head_base + cutlass.Int32(j), out_tok] = lse_cols[j]" in code
+    assert "lse_arr[part_batch, head_base + col, out_tok] = lse_cols[j]" in code  # col = the group's head row (j at one column group)
     # the host: the grid, the partial slabs, the per-sequence list rows, the fp32 pointer + the LSE requirement
     assert "grid_shape = (SQ * SPLIT_KV, KH, B)" in code and "n_o_batches = B * SPLIT_KV" in code
     assert "n_list_rows = B if cutlass.const_expr(LIST_PER_SEQUENCE == 1) else n_q_batches * SQ" in code
@@ -2422,3 +2422,37 @@ def test_decode_form_bottom_right_with_per_token_lists():
     assert torch.isinf(ref_lse[2, :, :3]).all() and torch.isfinite(ref_lse[2, :, 3:]).all()
     max_o, max_lse = _check(outs, ref_o, ref_lse)
     print(f"\nbottom-right per-token lists S_q={S} lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; dead rows {int(torch.isinf(ref_lse).sum())}")
+
+
+def test_sparse_kernel_softmax_split_source_pins():
+    """The softmax SPLIT's shape in the source (no GPU): every split term is a ``const_expr`` fold of the module constant SOFTMAX_GROUPS (the
+    one-column-group rendering traces the pre-split program -- its cubin is byte-identical), the group's named barrier id is ``2 + grp`` as a
+    runtime value, the S^T load / the O^T rescale / the epilogue load take the group's column offset, the P^T chunk lands at the group's word
+    offset of the lane's row, the per-group column max / sum read ONE group's four warps, and no arrive site, ring wait, tile loop or SmemTile
+    was added (the counts stay 11 / 3 / 4); the config's per-group constants are what the body reads."""
+    code = _code(_kernel_source())
+    for name in (
+        "COLS = CFG.COLS_PER_GROUP",
+        "SOFTMAX_GROUPS = CFG.SOFTMAX_GROUPS",
+        "SOFTMAX_WARPS_PER_GROUP = CFG.SOFTMAX_WARPS_PER_GROUP",
+        "SOFTMAX_LANES = CFG.SOFTMAX_LANES",
+    ):
+        assert name in code, name
+    assert code.count("cutlass.const_expr(SOFTMAX_GROUPS > 1)") >= 14, "the split terms fold at one column group"
+    assert "grp = (sm_warp // cutlass.Int32(SOFTMAX_WARPS_PER_GROUP)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(0)" in code
+    assert "bar_softmax = (cutlass.Int32(_BAR_SOFTMAX) + grp) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else _BAR_SOFTMAX" in code
+    assert code.count("nvvm.barrier_cta_sync(barrier_id=bar_softmax, thread_count=BAR_SOFTMAX_THREADS)") == 2, "the exchange barriers take the group's id"
+    assert "s_off = s_off + col0" in code and code.count("o_col = o_col + col0") == 1 and "o_col_e = o_col_e + col0" in code
+    assert "p_row_base = p_row_base + grp * cutlass.Int32(P_GROUP_WORDS)" in code, "the group's 16-B chunk of the lane's P^T row"
+    assert code.count("red_read = red_read + grp * cutlass.Int32(SOFTMAX_WARPS_PER_GROUP * COLS)") == 1
+    assert code.count("red_epi_read = red_epi_read + grp * cutlass.Int32(SOFTMAX_WARPS_PER_GROUP * COLS)") == 1
+    assert code.count("for w in cutlass.range_constexpr(SOFTMAX_WARPS_PER_GROUP):") == 2, "a column max / sum combines ONE group's four warps"
+    assert "for w in cutlass.range_constexpr(SOFTMAX_WARPS):" not in code
+    assert "n_live_cols = (cutlass.Int32(Q_BOX_ROWS) - col0) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(Q_BOX_ROWS)" in code
+    assert code.count("spin=SPIN_RING_WAITS") == 11 and code.count("cutlass.range(0, n_tiles, 1, unroll=1)") == 3 and code.count("SmemTile(") == 4
+    assert (
+        code.count("bars.mb_s_empty[par].arrive()") == 1
+        and code.count("bars.mb_p_full[par].arrive()") == 1
+        and code.count("bars.mb_tmem_dealloc.arrive()") == 1
+    )
+    assert "COLS = N_Q" not in code, "the column count per group is the config's, never N_Q"

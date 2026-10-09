@@ -265,6 +265,11 @@ class TemplateParams:
     qsa_block_size: int = 0
     qsa_include_open_block: bool = True
     qsa_list_per_sequence: bool = False
+    # The sparse kernel's softmax SPLIT -- a PERFORMANCE knob of its softmax role, never numerics (the same function, bitwise, at
+    # either value): 0 = the flavor default (ONE 4-warp column group over the 16 columns, 16 warps), 2 = TWO 4-warp groups of 8
+    # columns each (20 warps, 96 registers flat).  A template-cache axis like mma_2x2 (two coexisting renderings of one file);
+    # APPEND-ONLY, default inert; every dense template declines a non-zero value together with the other qsa_* fields.
+    qsa_softmax_groups: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -330,13 +335,14 @@ def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, sp
 
 
 def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
-    if k.qsa_block_topk or k.qsa_block_size:
+    if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
         # The loader routes an index-list record (qsa_block_topk != 0) to the cc 10.7 sparse kernel
         # (config_sm107.make_cfg_d256_sparse); a dense template must never consume one -- it would read K/V densely and
-        # silently ignore the block list.  The selection is the FUNCTION, so this is a decline, not a knob fallback.
+        # silently ignore the block list.  The selection is the FUNCTION, so this is a decline, not a knob fallback (the
+        # sparse kernel's own softmax-split knob qsa_softmax_groups has no meaning on a dense template either).
         raise ValueError(
-            f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} select the index-list sparse kernel; "
-            f"the dense templates do not consume them"
+            f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} / qsa_softmax_groups={k.qsa_softmax_groups} select the "
+            f"index-list sparse kernel; the dense templates do not consume them"
         )
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
@@ -1253,12 +1259,12 @@ def make_cfg_d256_decode(params: TemplateParams) -> Tuple[CfgD256Decode, TmaIter
     ``cta_mma`` / ``sched_policy`` are accepted and unused — the decode tile
     is one cta_group::1 CTA per unit with nothing to schedule.
     """
-    if params.qsa_block_topk or params.qsa_block_size:
+    if params.qsa_block_topk or params.qsa_block_size or params.qsa_softmax_groups:
         # Same decline as the prefill templates' _validate_params: an index-list record belongs to the cc 10.7 sparse
         # kernel (its own swap-AB body over gathered K/V), never to this dense ring.
         raise ValueError(
-            f"d256 decode: qsa_block_topk={params.qsa_block_topk} / qsa_block_size={params.qsa_block_size} select the index-list sparse kernel; "
-            f"the decode tile does not consume them"
+            f"d256 decode: qsa_block_topk={params.qsa_block_topk} / qsa_block_size={params.qsa_block_size} / qsa_softmax_groups={params.qsa_softmax_groups} "
+            f"select the index-list sparse kernel; the decode tile does not consume them"
         )
     if params.decode_q_tile not in _D256_DECODE_Q_TILES:
         raise ValueError(f"d256 decode: decode_q_tile must be one of {_D256_DECODE_Q_TILES}; got {params.decode_q_tile}")

@@ -38,9 +38,10 @@ through the shared scheduler (BSHD: the grid is the work list, 2 x T_q items dec
 form on an occupancy-sized grid).  Q^T and the block list of item i+1 are prefetched under item i's KV loop; the epilogue gate
 of item i (``O *= sigmoid(G)``, compiled out unless CFG.EPILOGUE_GATE) is TMA-staged into the freed sQ slot of item i.
 
-WARP MAP (16 warps = 512 threads; every warpgroup is role-homogeneous because ``setmaxnreg`` is warpgroup-collective)
+WARP MAP (16 warps = 512 threads at ONE softmax column group -- the default; 20 warps = 640 threads at TWO, the SOFTMAX SPLIT below; every
+warpgroup is role-homogeneous because ``setmaxnreg`` is warpgroup-collective; the gather / MMA / TMA / scheduler ids follow SOFTMAX_WARPS)
 
-    warps 0-3   WG0    softmax + epilogue: 128 lanes = the 128 key lanes of S^T / P^T = the 128 d lanes of O^T
+    warps 0-3   WG0    softmax + epilogue: 128 lanes = the 128 key lanes of S^T / P^T = the 128 d lanes of O^T, all 16 columns
     warps 4-11  WG1-2  GATHER issuers w = warp - 4: blocks 4w..4w+3 of every K and V tile; the quad of ids by ONE warp-uniform
                        16-B LDS from sIds BEFORE the ring wait (the quad is 16-B aligned: BLOCK_TOPK % 4 == 0), the SELECT per
                        index; PAGED arm: ONE block-table lookup per block of the quad right there (page = block_table[b, 4 blk //
@@ -57,8 +58,23 @@ WARP MAP (16 warps = 512 threads; every warpgroup is role-homogeneous because ``
     warp 14     WG3    scheduler (scheduler_warp_loop for BSHD; the persistent claim-counter form for THD) -- never credits
     warp 15     WG3    spare: passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one in the body)
 
+SOFTMAX SPLIT (CFG.SOFTMAX_GROUPS = 2; TemplateParams.qsa_softmax_groups, a PERFORMANCE knob -- the same function bitwise; default off until
+its A/B/A): the softmax role becomes TWO 4-warp column GROUPS, warps 0-3 (WG0) columns 0-7 and warps 4-7 (WG1) columns 8-15 of S^T / P^T /
+O^T over the SAME 128 lanes (grp = warp // 4, col0 = 8 grp, lane = tidx & 127; a warp's TMEM lanes are its quadrant's, warp % 4, so warp 4
+shares lanes 0-31 with warp 0 and the column offset is a plain address add); the gather warps move to 8-15, MMA / TMA-LDG / scheduler /
+spare to 16 / 17 / 18 / 19.  Per tile each group loads ITS 8 S^T columns (tcgen05_ld num=8), reduces 8 column maxes through ITS slice of
+``red`` ([3][8 warps][8 cols] = the same 768 B) behind ITS named barrier (2 + grp, 128 threads), packs ITS 16-B P^T chunk per lane row
+(word offset 4 grp = exactly the one-group loop's chunk c = grp under the same Swizzle(1, 4, 3)), rescales ITS 8 columns of both O^T
+d-blocks, and in the epilogue sums / stores ITS columns (col0 + j < G).  Every softmax-fired barrier init doubles (SOFTMAX_LANES 256,
+IDS_EMPTY_ARRIVERS 16, READ_TILE_ARRIVERS 18, named barrier 1 at 288); the per-lane mask work is duplicated in both groups.  At ONE
+group every split term folds away (``cutlass.const_expr(SOFTMAX_GROUPS > 1)``): the default rendering's cubin is byte-identical to the
+pre-split one (28801073 ungated / ceeba558 gated, 2026-10-09).  Registers at 20 warps: 96 FLAT (65536 / 640 rounded down to 8); host
+sm_107a trace-compiles of 21 two-group renderings (gated / paged / THD / split-KV / bottom-right / f16 / G = 1, 5, 12, 16 / top-4): STL 0 /
+LDL 0 on 20, G = 16 gated 1 / 1 in the prologue only (vs 6 / 6 + 3 per TILE at one group, REG 128); the declared split
+8 x 136 + 8 x 72 + 4 x 64 = 1920 == 96 x 20; the fallback ``gather_warps=4``: 16 warps, 128 flat, 8 x 160 + 4 x 96 + 4 x 96 = 2048.
+
 Every warp except the scheduler credits the scheduler slot (read_tile_id_arrive) at the TOP of its item, right after reading
-the payload -> READ_TILE_ARRIVERS = 4 + 1 + 1 + GATHER_WARPS = 14.  Registers: a 512-thread launch gives ptxas 128 per thread
+the payload -> READ_TILE_ARRIVERS = SOFTMAX_WARPS + 1 + 1 + GATHER_WARPS = 14 (18 at two column groups).  Registers: a 512-thread launch gives ptxas 128 per thread
 FLAT (``.reqntid 512`` and no ``.maxnreg`` from the DSL; every setmaxnreg is dropped).  Host trace-compile of the decode body
 under a forced 512-thread rendering (sm_107a): REG 104, STL 0, LDL 0 on the dense-padded and the causal specializations.  The
 declared split for when ``.maxnreg`` lands: 4 x 240 + 8 x 96 + 4 x 80 = 2048 == 128 x 16 (SUM(role regs x warps) == entry x
@@ -98,7 +114,8 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                          IDS_TX_BYTES = BLOCK_TOPK x 4 (a 16-B multiple); the copy runs for EVERY item, dead ones included
                                          (item_row = the token's flat row, or the SEQUENCE under CFG.LIST_PER_SEQUENCE: one row copied by every item of it)
                                                                                                         1 == 1       8 gather + 4 softmax warps, item top 0      ids_state(2), once per item
-    4  mb_ids_empty[2]      THREAD       `if elect_sync(): arrive()` from each of the 12 consuming warps after its last read of the slot
+    4  mb_ids_empty[2]      THREAD       `if elect_sync(): arrive()` from each of the 12 consuming warps after its last read of the slot (16 at two
+                                         column groups: both groups read their lane's block id; IDS_EMPTY_ARRIVERS = GATHER_WARPS + SOFTMAX_WARPS)
                                                                                                         12 == 12     warp 13 before refilling (item i+2)  1      per item; drained at exit by warp 13
     5  mb_kv_full[3]        TMA_LOAD     each gather warp: arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=elect_sync()) once per stage fill,
                                          then its 16 gather4 x 512 B = 8192 B (OOB / -1 rows zero-filled AND credited); 8 x 8192 = the 64 KiB stage
@@ -107,9 +124,11 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
     6  mb_kv_empty[3]       MMA_COMMIT   warp 12, pred=elect_p after the last MMA reading the stage (K: with s_full's commit; V: with bmm2_done's)
                                                                                                         1 == 1       all 8 gather warps before refilling 1      the same kv_state; each gather warp drains STAGES_KV at exit
     7  mb_s_full[2]         MMA_COMMIT   warp 12, pred=elect_p right after BMM1(t)                     1 == 1       4 softmax warps, top of tile t       0      s_state(2) per TILE, never reset at an item boundary
-    8  mb_s_empty[2]        THREAD       bare arrive() from all 128 softmax lanes after tcgen05_ld -> tcgen05_wait(LOAD) -> tcgen05_fence
+    8  mb_s_empty[2]        THREAD       bare arrive() from all 128 softmax lanes after tcgen05_ld -> tcgen05_wait(LOAD) -> tcgen05_fence (256 at two
+                                         column groups, each group after ITS num=8 load; SOFTMAX_LANES)
                                                                                                         128 == 128   MMA before BMM1(t+2) reuses the slot 1      s_empty_state(2) per tile, carried
-    9  mb_p_full[2]         THREAD       bare arrive() from 128 lanes after the P^T store_swizzled + fence_proxy + the O^T rescale + tcgen05_fence
+    9  mb_p_full[2]         THREAD       bare arrive() from 128 lanes after the P^T store_swizzled + fence_proxy + the O^T rescale + tcgen05_fence (256 at
+                                         two column groups: both groups' 16-B chunks and both rescales have landed when the MMA warp's wait returns)
                                                                                                         128 == 128   MMA before BMM2(t)                   0      p_state(2) per tile, carried
    10  mb_bmm2_done[2]      MMA_COMMIT   warp 12, pred=elect_p after BMM2(t)'s two d-blocks           1 == 1       softmax before the O^T rescale (tile t+1) and once in the epilogue (last tile)
                                                                                                                                                           0      bmm2_state(2) per tile; the epilogue's wait advances it.  Also the P^T slot's
@@ -117,7 +136,7 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
    11  mb_gate_full[1]      TMA_LOAD     warp 13, arrive(n_bytes=GATE_TX_BYTES, pred=elect_sync()); the gate box (1, 1 token, G heads, 64) x 4 subtiles
                                          into the freed sQ[i % 2]; GATE_TX_BYTES = Q_BOX_ROWS x TILE_O x GATE_BPE = G x 512 B (the BOX)   [gated arm]
                                                                                                         1 == 1       128 softmax lanes, epilogue(i)       0      gf_state(1), once per item
-   12  mb_gate_empty[1]     THREAD       bare arrive() from 128 lanes after the item's last gate LDS     [gated arm]
+   12  mb_gate_empty[1]     THREAD       bare arrive() from 128 lanes after the item's last gate LDS     [gated arm]   (256 at two column groups)
                                                                                                         128 == 128   warp 13 before Q(i+2) into the slot 1      ge_state(1) pre-armed, per item: Q(1)'s wait is the pass, Q(j) waits
                                                                                                                                                                  epilogue(j - 2); the exit path waits epilogue(n - 2) BEFORE gate(n - 1)
                                                                                                                                                                  is issued (the wait Q(n) would have taken; the pass itself at n = 1),
@@ -128,12 +147,15 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                          the scheduler warp's elected arrive_expect_tx(16) + the CLC response (CLC) / its elected arrive after the
                                          4 payload stores (persistent; no expect_tx at cga1)
                                                                                                         1 == 1       every consuming warp reads the payload      tile_dsl.scheduler
-   14  sched.mb_read_tile_id[2]  THREAD  read_tile_id_arrive(mb, cga_size=1) = one elected lane per calling warp; callers = 4 + 1 + 1 + 8
+   14  sched.mb_read_tile_id[2]  THREAD  read_tile_id_arrive(mb, cga_size=1) = one elected lane per calling warp; callers = 4 + 1 + 1 + 8 (8 + 1 + 1 + 8 = 18
+                                         at two column groups)
                                                                                                         14 == 14     the scheduler before refilling the slot     tile_dsl.scheduler
-   15  mb_tmem_dealloc[1]   THREAD       bare arrive() from 128 softmax lanes at exit                   128 == 128   MMA before tmem_dealloc               0      once
-   16  named barrier 1      bar          MMA warp barrier_cta_arrive (32) + 4 softmax warps barrier_cta_sync (128), thread_count 160   the TMEM-base hand-off, once
-   17  named barrier 2      bar          the 4 softmax warps, thread_count 128: the column-max exchange per tile + the per-lane sum per item
-   18  barrier 0            bar          all 512 lanes once, after fence_mbarrier_init (the spare warp exits only after it)
+   15  mb_tmem_dealloc[1]   THREAD       bare arrive() from 128 softmax lanes at exit (256 at two groups)  128 == 128   MMA before tmem_dealloc               0      once
+   16  named barrier 1      bar          MMA warp barrier_cta_arrive (32) + EVERY softmax warp barrier_cta_sync, thread_count 32 x (SOFTMAX_WARPS + 1) = 160
+                                         (288 at two column groups)   the TMEM-base hand-off, once
+   17  named barrier 2 (+g) bar          column group g's 4 warps ONLY, id 2 + g (a runtime Int32 id at two groups), thread_count 128: the column-max
+                                         exchange per tile + the per-lane sum per item; the groups never wait on each other
+   18  barrier 0            bar          all THREADS_PER_CTA lanes once (512; 640 at two groups), after fence_mbarrier_init (the spare warp exits only after it)
 
 Init: ``if warp_idx == 0: if nvvm.elect_sync():`` every stage of every ring (``.init()`` is per stage) + the two scheduler rings
 (ONE_LANE / READ_TILE_ARRIVERS); fence_mbarrier_init + barrier_cta_sync OUTSIDE the branch.  Phase discipline: every ring
@@ -246,7 +268,8 @@ lane-only buffers last so no alignment padding is spent; 1024-B alignment modell
                                                                 block 32 i + lane // 4 (4 adjacent lanes share a word); both clamped into the slot
                                                                                                  4 B          none -- no descriptor reads it and 32 lanes x 4 B
                                                                                                               is one bank cycle: neither justification applies  221,184 (16-B aligned bulk-copy destination)
-    red                768    softmax warps: one warp-uniform fp32 per (slot, warp, column), 3 slots (tile parity 0 / 1, epilogue) x 4 x 16
+    red                768    softmax warps: one warp-uniform fp32 per (slot, warp, column), 3 slots (tile parity 0 / 1, epilogue) x SOFTMAX_WARPS x
+                              COLS_PER_GROUP = 4 x 16 or 8 x 8 (two column groups: group g reads warps 4 g .. 4 g + 3 of the slot) -- 192 words either way
                                                                 the group's 4 warps after named barrier 2
                                                                                                  4 B          none (one address per warp per column)          225,408
     misc               512    tmem_ptr (16 B), 15 mbarrier arrays (29 stages, 16-B padded: 272 B), the payload ring (64 B) -- 352 B in a 512 B reserve
@@ -260,7 +283,8 @@ needs the oversized carveout (ALLOW_OVERSIZED_SHARED_MEMORY, L1 -> 8 kB) -- meas
 after the P^T generic stores (before mb_p_full), after the once-per-CTA sQ tail-row zeroing; the TMEM path is ordered by
 tcgen05_fence + the commits; the sIds bulk copy -> LDS and gate TMA -> LDS edges are ordered by their mbarrier waits.
 
-TMEM MAP (64 columns per CTA, allocated once, is_exclusive=False -- <= 512 columns): S^T slot 0 at [0, 16), slot 1 at
+TMEM MAP (64 columns per CTA, allocated once, is_exclusive=False -- <= 512 columns; at two softmax column groups group g touches columns
+[8 g, 8 g + 8) of the active S^T slot and of BOTH O^T d-blocks -- disjoint column sets, the same 128 lanes): S^T slot 0 at [0, 16), slot 1 at
 [16, 32), O^T d-block 0 at [32, 48), d-block 1 at [48, 64).  The S^T slot count IS the depth of rows 7-10 and of sP: CFG.STAGES_S
 (= len(S_ACC_OFF) = 2, pinned by the config), read once as STAGES_S and spelled at every ring site -- never a literal 2.  No TMEM slot is assumed zero: BMM2(0) of every item overwrites
 (accumulate=False) and every dead column ends in the SELECT, never residue * 0.
@@ -460,7 +484,7 @@ SMEM_LAYOUT_QK = _SWZ_ENUM[CFG.Q_SWZ_BYTES]
 SMEM_LAYOUT_P = _SWZ_ENUM[CFG.P_SWZ_BYTES]
 # The generic-proxy P^T stores apply the same XOR pattern the UMMA descriptor decodes (Swizzle<B, 4, 3>).
 _P_SMEM_SWIZZLE = cutlass.Swizzle(_SWZ_BITS[CFG.P_SWZ_BYTES], 4, 3)
-P_ROW_WORDS = N_Q // 2
+P_ROW_WORDS = N_Q // 2  # the FULL P^T row of a key lane (every group's columns)
 
 # K-major operands (K as A of BMM1, Q^T as B of BMM1): SBO = 8 rows x 128 B.
 STRIDE_BYTE_OFFSET_QK = 8 * CFG.K_SWZ_BYTES
@@ -479,22 +503,33 @@ O_OFF = CFG.O_OFF
 TMEM_COLS = CFG.TMEM_COLS
 O_BLOCKS = TILE_O // 128
 
-# One softmax column group: 4 warps x 16 columns (= the 16 Q rows of the item).
-COLS = N_Q
-SOFTMAX_WARPS = CFG.SOFTMAX_WARPS
-SOFTMAX_LANES = CFG.SOFTMAX_LANES
+# The softmax role = SOFTMAX_GROUPS column groups of SOFTMAX_WARPS_PER_GROUP (4) warps each; group g owns columns [g COLS, (g + 1) COLS)
+# of S^T / P^T / O^T over all 128 key / d lanes (one group: 4 warps x 16 columns = the 16 Q rows of the item -- today's body; two
+# groups: 2 x 4 warps x 8 columns, the softmax chain per warp halved -- the header's SOFTMAX SPLIT paragraph).  Every count below is CFG's.
+COLS = CFG.COLS_PER_GROUP
+SOFTMAX_GROUPS = CFG.SOFTMAX_GROUPS
+SOFTMAX_WARPS_PER_GROUP = CFG.SOFTMAX_WARPS_PER_GROUP
+GROUP_LANES = 32 * SOFTMAX_WARPS_PER_GROUP  # 128 = the key rows of a tile = the lanes of ONE group
+SOFTMAX_WARPS = CFG.SOFTMAX_WARPS  # all groups
+SOFTMAX_LANES = CFG.SOFTMAX_LANES  # all groups: the init of every bare-arrive barrier the softmax role fires
 GATHER_WARP_BASE = CFG.GATHER_WARP_BASE
 GATHER_WARPS = CFG.GATHER_WARPS
 MMA_WARP_ID = CFG.MMA_WARP_ID
 TMALDG_WARP_ID = CFG.TMALDG_WARP_ID
 SCHED_WARP_ID = CFG.SCHED_WARP_ID
-P_CHUNKS = (COLS * BPE) // 16  # 16-B chunks of one key row's P^T slice
-# Named barriers: 1 = TMEM base hand-off (softmax warps + MMA warp), 2 = the softmax warps' own cross-warp reductions.
+P_CHUNKS = (COLS * BPE) // 16  # 16-B chunks of one key row's P^T slice written by ONE group (2 at one group, 1 at two)
+P_GROUP_WORDS = COLS // 2  # the words ONE group packs: its COLS columns as half pairs
+# Gate rows the epilogue reads per lane: the item's G head rows at one group; at two groups the group's COLS rows (rows past G read the
+# slot's once-zeroed tail -- finite, and their columns are never stored).
+N_GATE_ROWS = Q_BOX_ROWS if SOFTMAX_GROUPS == 1 else COLS
+# Named barriers: 1 = TMEM base hand-off (every softmax warp + the MMA warp), 2 + g = column group g's own cross-warp reductions
+# (ids 2 .. 2 + SOFTMAX_GROUPS - 1, thread_count = the group's 128 lanes; the groups never wait on each other).
 _BAR_TMEM = 1
 _BAR_SOFTMAX = 2
 BAR_TMEM_THREADS = CFG.BAR_TMEM_THREADS
 BAR_SOFTMAX_THREADS = CFG.BAR_SOFTMAX_THREADS
-# Cross-warp reduction scratch: [STAGES_S tile parities + 1 epilogue][softmax warp][COLS]; the epilogue slot is index STAGES_S.
+# Cross-warp reduction scratch: [STAGES_S tile parities + 1 epilogue][softmax warp (all groups)][COLS]; the epilogue slot is index STAGES_S;
+# 192 words at either group count, group g reads the slice of its own four warps.
 RED_SLOTS = STAGES_S + 1
 RED_WORDS = RED_SLOTS * SOFTMAX_WARPS * COLS
 
@@ -1288,7 +1323,7 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
     tmem_dealloc(tmem_ptr_i32, TMEM_COLS, CTA_GROUP_KIND)
 
 
-# === SOFTMAX warps (0-3): 128 key lanes, 16 columns = the item's query heads ============================================
+# === SOFTMAX warps (0 .. SOFTMAX_WARPS - 1): 128 key lanes per column group, COLS columns of the item's query heads per group =====
 
 
 # The hot max / min sites of the softmax body are spelled ``ftz=True`` so they lower to FMNMX (fused FMNMX3 in the dependent
@@ -1337,8 +1372,13 @@ def _softmax_warp_group(
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=BAR_TMEM_THREADS)
     tidx = cute.arch.thread_idx()[0]
-    sm_warp = tidx // cutlass.Int32(32)  # 0 .. SOFTMAX_WARPS - 1
-    lane = tidx  # key row of S^T / P^T, d row of O^T (one 16-column group)
+    sm_warp = tidx // cutlass.Int32(32)  # 0 .. SOFTMAX_WARPS - 1 (all groups)
+    # The column group (warp-uniform) and its first column; the key row of S^T / P^T = the d row of O^T is the lane WITHIN the group.
+    # At ONE group the three are the constants 0 / 0 / tidx, so that rendering traces today's program.
+    grp = (sm_warp // cutlass.Int32(SOFTMAX_WARPS_PER_GROUP)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(0)
+    col0 = (grp * cutlass.Int32(COLS)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(0)
+    lane = (tidx & cutlass.Int32(GROUP_LANES - 1)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else tidx
+    bar_softmax = (cutlass.Int32(_BAR_SOFTMAX) + grp) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else _BAR_SOFTMAX
     tmem_base = tmem_ptr_i32.load()
     red_ptr = Pointer(red_smem.data_ptr(), dtype=cutlass.Float32)
 
@@ -1379,6 +1419,8 @@ def _softmax_warp_group(
         for i in cutlass.range(0, n_tiles, 1, unroll=1):
             par = t_state.idx
             s_off = cutlass.Int32(S_ACC_OFF[0]) + par * cutlass.Int32(N_Q)
+            if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                s_off = s_off + col0  # the group's COLS columns of the slot
 
             bars.mb_s_full[par].wait(t_state.phase, spin=SPIN_RING_WAITS)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -1404,19 +1446,22 @@ def _softmax_warp_group(
                 s_cols.append(_select_f32(valid, cutlass.Float32(s_raw[j]) * scale_log2, NEG_INF))
 
             # Column max over the tile's 128 keys: butterfly inside the warp, then the group's four warps exchange through
-            # SMEM (slot = the tile's ring parity, so the single barrier per tile also orders the next reuse of the slot).
+            # SMEM (slot = the tile's ring parity, so the single barrier per tile also orders the next reuse of the slot;
+            # the slot is [SOFTMAX_WARPS][COLS] and group g reads warps 4 g .. 4 g + 3 of it after ITS named barrier).
             red_base = par * cutlass.Int32(SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
             col_max = []
             for j in cutlass.range_constexpr(COLS):
                 cm = _warp_reduce_max(s_cols[j])
                 (red_ptr + (red_base + cutlass.Int32(j))).store(cm)
                 col_max.append(cm)
-            nvvm.barrier_cta_sync(barrier_id=_BAR_SOFTMAX, thread_count=BAR_SOFTMAX_THREADS)
+            nvvm.barrier_cta_sync(barrier_id=bar_softmax, thread_count=BAR_SOFTMAX_THREADS)
             red_read = par * cutlass.Int32(SOFTMAX_WARPS * COLS)
+            if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                red_read = red_read + grp * cutlass.Int32(SOFTMAX_WARPS_PER_GROUP * COLS)
             tile_max = []
             for j in cutlass.range_constexpr(COLS):
                 tm = col_max[j]
-                for w in cutlass.range_constexpr(SOFTMAX_WARPS):
+                for w in cutlass.range_constexpr(SOFTMAX_WARPS_PER_GROUP):
                     tm = cute.math.max(tm, cutlass.Float32((red_ptr + (red_read + cutlass.Int32(w * COLS + j))).load()), ftz=True)
                 tile_max.append(tm)
 
@@ -1446,9 +1491,12 @@ def _softmax_warp_group(
             # it.  WAR on the slot: BMM2(t-2) last read it, and its completion was waited at iteration t-1 (below), BEFORE
             # this store -- the store-then-wait order inside an iteration is exactly sufficient (header row 10).
             p_words = []
-            for w in cutlass.range_constexpr(P_ROW_WORDS):
+            for w in cutlass.range_constexpr(P_GROUP_WORDS):
                 p_words.append(fp32_to_fp16(p_cols[2 * w], p_cols[2 * w + 1], dtype=STORAGE_DTYPE))
             p_row_base = par * cutlass.Int32(pBufferWords) + lane * cutlass.Int32(P_ROW_WORDS)
+            if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                # group g writes word offset 4 g of the lane's 32-B row = the chunk c = g of the one-group loop, under the same swizzle
+                p_row_base = p_row_base + grp * cutlass.Int32(P_GROUP_WORDS)
             for c in cutlass.range_constexpr(P_CHUNKS):
                 chunk = cutlass.Vector.from_elements(tuple(p_words[4 * c + k] for k in range(4)), cutlass.Int32)
                 p_ptr = Pointer(sP_raw.subview(p_row_base + cutlass.Int32(4 * c)).data_ptr(), dtype=cutlass.Int32)
@@ -1463,7 +1511,10 @@ def _softmax_warp_group(
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
                 if ~all_one:
                     for blk_o in cutlass.range_constexpr(O_BLOCKS):
-                        o_ptr = nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk_o]), cutlass.Float32)
+                        o_col = cutlass.Int32(O_OFF[blk_o])
+                        if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                            o_col = o_col + col0
+                        o_ptr = nvvm.make_tmem_ptr(tmem_base + o_col, cutlass.Float32)
                         o_vals = nvvm.tcgen05_ld("32x32b", o_ptr, num=COLS)
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         o_scaled = cutlass.Vector.from_elements(tuple(cutlass.Float32(o_vals[j]) * alpha[j] for j in range(COLS)), cutlass.Float32)
@@ -1488,15 +1539,17 @@ def _softmax_warp_group(
         red_epi = cutlass.Int32(STAGES_S * SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
         for j in cutlass.range_constexpr(COLS):
             (red_ptr + (red_epi + cutlass.Int32(j))).store(_warp_reduce_sum(cutlass.Float32(l_vec[j])))
-        nvvm.barrier_cta_sync(barrier_id=_BAR_SOFTMAX, thread_count=BAR_SOFTMAX_THREADS)
+        nvvm.barrier_cta_sync(barrier_id=bar_softmax, thread_count=BAR_SOFTMAX_THREADS)
         red_epi_read = cutlass.Int32(STAGES_S * SOFTMAX_WARPS * COLS)
+        if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+            red_epi_read = red_epi_read + grp * cutlass.Int32(SOFTMAX_WARPS_PER_GROUP * COLS)
 
         lse_cols = []
         inv_cols = []
         dead_cols = []
         for j in cutlass.range_constexpr(COLS):
             l_tot = ZERO
-            for w in cutlass.range_constexpr(SOFTMAX_WARPS):
+            for w in cutlass.range_constexpr(SOFTMAX_WARPS_PER_GROUP):
                 l_tot = l_tot + cutlass.Float32((red_ptr + (red_epi_read + cutlass.Int32(w * COLS + j))).load())
             m_raw = cutlass.Float32(m_vec[j])  # -inf while the column has no live key
             m_nat = row_max_for_exp2(m_raw) * LN2_F
@@ -1529,11 +1582,16 @@ def _softmax_warp_group(
         if cutlass.const_expr(SPLIT_KV > 1):
             part_batch = out_batch + split * n_batch
         head_base = head * cutlass.Int32(G)
+        # Two groups: column j of group g is head col0 + j; the columns at or past G (the zero tail) are never stored.
+        n_live_cols = (cutlass.Int32(Q_BOX_ROWS) - col0) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(Q_BOX_ROWS)
         if cutlass.const_expr(lse_tensor is not None):
             lse_arr = cutlass.make_array_view(lse_tensor)
-            for j in cutlass.range_constexpr(Q_BOX_ROWS):
-                if (lane == cutlass.Int32(j)) & live_row:
-                    lse_arr[part_batch, head_base + cutlass.Int32(j), out_tok] = lse_cols[j]
+            for j in cutlass.range_constexpr(COLS):
+                if cutlass.const_expr(SOFTMAX_GROUPS > 1 or j < Q_BOX_ROWS):
+                    col = (col0 + cutlass.Int32(j)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(j)
+                    ok = ((lane == col) & live_row & (cutlass.Int32(j) < n_live_cols)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else ((lane == col) & live_row)
+                    if ok:
+                        lse_arr[part_batch, head_base + col, out_tok] = lse_cols[j]
 
         # --- the fused epilogue gate (CFG.EPILOGUE_GATE; barrier rows 11 / 12): ONE wait per item on the gate the TMA warp
         # staged into this item's freed Q^T slot after its last BMM1 (it has had the last tile's softmax, BMM2, the column
@@ -1553,7 +1611,10 @@ def _softmax_warp_group(
         for blk_o in cutlass.range_constexpr(O_BLOCKS):
             if cutlass.const_expr(blk_o * 128 < D_V):
                 d_idx = lane + cutlass.Int32(blk_o * 128)
-                o_vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + cutlass.Int32(O_OFF[blk_o]), cutlass.Float32), num=COLS)
+                o_col_e = cutlass.Int32(O_OFF[blk_o])
+                if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                    o_col_e = o_col_e + col0
+                o_vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + o_col_e, cutlass.Float32), num=COLS)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                 if cutlass.const_expr(CFG.EPILOGUE_GATE):
                     # The thread's gate column (lane = d) over the item's Q_BOX_ROWS head rows, read out of the SW128 slot at the
@@ -1563,33 +1624,47 @@ def _softmax_warp_group(
                     sub = d_idx >> cutlass.Int32(_GATE_ROW_SHIFT)
                     c = d_idx & cutlass.Int32(GRANU_ELEMS - 1)
                     lane_part = gate_slot_elems + sub * cutlass.Int32(N_Q * GRANU_ELEMS) + (c & cutlass.Int32(_GATE_CHUNK_ELEMS - 1))
+                    if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                        # the group's rows start at head row col0 (a multiple of 8, so (col0 + j) & 7 == j: the XOR term is j's)
+                        lane_part = lane_part + col0 * cutlass.Int32(GRANU_ELEMS)
                     chunk = c >> cutlass.Int32(_GATE_CHUNK_SHIFT)
                     g_vals = []
                     h_vals = []
-                    for j in cutlass.range_constexpr(Q_BOX_ROWS):
+                    for j in cutlass.range_constexpr(N_GATE_ROWS):
                         off_j = (
                             lane_part + cutlass.Int32(j * GRANU_ELEMS) + ((chunk ^ cutlass.Int32(j & _GATE_SWZ_ROW_MASK)) << cutlass.Int32(_GATE_CHUNK_SHIFT))
                         )
                         g_vals.append(STORAGE_DTYPE(sQ_raw.load(off_j)).to(cutlass.Float32))  # one LDS.U16, widened
                         h_vals.append(cutlass.Float32(o_vals[j]) * inv_cols[j])  # h: inv_cols carries sigmoid's 1/2
-                    if cutlass.const_expr(Q_BOX_ROWS % 2 == 1):
+                    if cutlass.const_expr(N_GATE_ROWS % 2 == 1):
                         # gate_epilogue_pairs walks PAIRS of head rows: an odd G repeats its last element (the same packed
                         # instructions as the even case; the duplicate result is dropped below).
-                        g_vals.append(g_vals[Q_BOX_ROWS - 1])
-                        h_vals.append(h_vals[Q_BOX_ROWS - 1])
+                        g_vals.append(g_vals[N_GATE_ROWS - 1])
+                        h_vals.append(h_vals[N_GATE_ROWS - 1])
                     gated = gate_epilogue_pairs(h_vals, g_vals, half_opaque, len(h_vals))
                     if (d_idx < cutlass.Int32(D_V)) & live_row:
-                        for j in cutlass.range_constexpr(Q_BOX_ROWS):
+                        for j in cutlass.range_constexpr(N_GATE_ROWS):
                             # The dead-column SELECT per element, AFTER the gate fma (sdpa-invariants section 2).
                             val = _select_f32(dead_cols[j], ZERO, gated[j])
-                            o_row = oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]
-                            o_row[d_idx] = val.to(o_tensor.element_type)
+                            if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                                if cutlass.Int32(j) < n_live_cols:  # the group's columns at or past G are the zero tail: never stored
+                                    o_row = oo[part_batch, out_tok, head_base + col0 + cutlass.Int32(j), :]
+                                    o_row[d_idx] = val.to(o_tensor.element_type)
+                            else:
+                                o_row = oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]
+                                o_row[d_idx] = val.to(o_tensor.element_type)
                 else:
                     if (d_idx < cutlass.Int32(D_V)) & live_row:
-                        for j in cutlass.range_constexpr(Q_BOX_ROWS):
-                            val = _select_f32(dead_cols[j], ZERO, cutlass.Float32(o_vals[j]) * inv_cols[j])
-                            o_row = oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]
-                            o_row[d_idx] = val.to(o_tensor.element_type)
+                        for j in cutlass.range_constexpr(COLS):
+                            if cutlass.const_expr(SOFTMAX_GROUPS > 1 or j < Q_BOX_ROWS):
+                                val = _select_f32(dead_cols[j], ZERO, cutlass.Float32(o_vals[j]) * inv_cols[j])
+                                if cutlass.const_expr(SOFTMAX_GROUPS > 1):
+                                    if cutlass.Int32(j) < n_live_cols:  # the group's columns at or past G are the zero tail: never stored
+                                        o_row = oo[part_batch, out_tok, head_base + col0 + cutlass.Int32(j), :]
+                                        o_row[d_idx] = val.to(o_tensor.element_type)
+                                else:
+                                    o_row = oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]
+                                    o_row[d_idx] = val.to(o_tensor.element_type)
         if cutlass.const_expr(CFG.EPILOGUE_GATE):
             # Release the gate's slot to the TMA warp (row 12: a BARE arrive from every softmax lane after the item's last gate
             # LDS; generic read -> arrive -> producer wait -> TMA write needs no proxy fence).

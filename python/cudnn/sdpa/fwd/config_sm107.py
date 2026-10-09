@@ -516,8 +516,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     # descriptor, a KV split would gate the partials the combine then
     # re-normalizes, paged KV and PackGQA are simply not wired through the gate
     # TMA coordinates.
-    if k.qsa_block_topk or k.qsa_block_size:
-        # An index-list record (qsa_block_topk != 0) belongs to sm107/sparse_d256_f16.py (make_cfg_d256_sparse); a dense
+    if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
+        # An index-list record (qsa_block_topk != 0, or its softmax-split knob) belongs to sm107/sparse_d256_f16.py (make_cfg_d256_sparse); a dense
         # template would read K/V densely and silently ignore the block list.  The selection is the FUNCTION -- a decline,
         # never a knob fallback (the sm100 twin's _validate_params / make_cfg_d256_decode decline the same way).
         raise ValueError(
@@ -1592,7 +1592,9 @@ _SPARSE_FLAVOR = "sm107 d256 sparse"
 SMEM_STANDARD_CARVEOUT_BYTES = 227 * 1024
 _SPARSE_N_Q = 16  # one softmax column group (4 warps x 16 columns); 32 would be two groups
 _SPARSE_BLOCK_SIZE = 4  # tokens per block = the four rows of ONE tma_gather4
-_SPARSE_SOFTMAX_WARPS = 4
+_SPARSE_SOFTMAX_WARPS = 4  # at ONE column group (the default body)
+_SPARSE_SOFTMAX_WARPS_PER_GROUP = 4  # 128 lanes = the 128 key rows of a tile, per column group
+_SPARSE_SOFTMAX_GROUPS = (1, 2)  # the softmax SPLIT (TemplateParams.qsa_softmax_groups): 4 x 16 columns, or 2 x (4 x 8)
 _SPARSE_AUX_WARPS = 4  # MMA, TMA-LDG, scheduler, spare: one complete warpgroup at one register count
 _SPARSE_TOPK_MIN, _SPARSE_TOPK_MAX = 4, 512
 _SPARSE_IDS_SLOT_PAD_BYTES = 64  # 16 reserved words per staged list (unread in v1; keeps the slot a 16-B multiple at every top_k)
@@ -1766,6 +1768,14 @@ class CfgD256Sparse:
     CGA_M: int = 1
     CGA_N: int = 1
 
+    # --- the softmax role's column groups (APPENDED; the softmax split of the body tuning): SOFTMAX_GROUPS groups of
+    # SOFTMAX_WARPS_PER_GROUP warps, each owning COLS_PER_GROUP = N_Q / SOFTMAX_GROUPS columns of S^T / P^T / O^T over all 128 lanes;
+    # SOFTMAX_WARPS = SOFTMAX_WARPS_PER_GROUP x SOFTMAX_GROUPS and every softmax-fired barrier init (SOFTMAX_LANES, the named
+    # TMEM barrier, IDS_EMPTY_ARRIVERS, READ_TILE_ARRIVERS) follows it; the exchange barrier counts ONE group's lanes.
+    SOFTMAX_GROUPS: int = 1
+    SOFTMAX_WARPS_PER_GROUP: int = _SPARSE_SOFTMAX_WARPS_PER_GROUP
+    COLS_PER_GROUP: int = _SPARSE_N_Q
+
 
 def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
     """The sparse kernel's SMEM byte table as the allocator lays it out: declaration order = address order, the descriptor-read
@@ -1786,7 +1796,9 @@ def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
     starts["sIds"] = off
     off = _align16(off + cfg.STAGES_IDS * cfg.IDS_SLOT_BYTES)
     starts["red"] = off
-    off = _align16(off + (cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.N_Q * 4)
+    off = _align16(
+        off + (cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.COLS_PER_GROUP * 4
+    )  # [slot][warp][column]: one slot per S ring parity + the epilogue's lane sum = 768 B at either group count
     starts["misc"] = off
     off += _SPARSE_SMEM_MISC_BYTES
     total = off
@@ -1818,8 +1830,20 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             (cfg.N_Q == _SPARSE_N_Q, f"{flavor}: N_Q must be 16 (one softmax column group); got {cfg.N_Q}"),
             # warp population: role-homogeneous warpgroups
             (
-                cfg.SOFTMAX_WARPS == _SPARSE_SOFTMAX_WARPS and cfg.AUX_WARPS == _SPARSE_AUX_WARPS,
-                f"{flavor}: 4 softmax warps and the 4-warp MMA / TMA / scheduler / spare group",
+                cfg.SOFTMAX_GROUPS in _SPARSE_SOFTMAX_GROUPS
+                and cfg.SOFTMAX_WARPS_PER_GROUP == _SPARSE_SOFTMAX_WARPS_PER_GROUP
+                and cfg.SOFTMAX_WARPS == cfg.SOFTMAX_WARPS_PER_GROUP * cfg.SOFTMAX_GROUPS
+                and cfg.AUX_WARPS == _SPARSE_AUX_WARPS,
+                f"{flavor}: 4 softmax warps per column group x SOFTMAX_GROUPS in {{1, 2}} (got SOFTMAX_WARPS={cfg.SOFTMAX_WARPS}, "
+                f"SOFTMAX_GROUPS={cfg.SOFTMAX_GROUPS}, SOFTMAX_WARPS_PER_GROUP={cfg.SOFTMAX_WARPS_PER_GROUP}) and the 4-warp MMA / TMA / scheduler / spare group",
+            ),
+            (
+                cfg.N_Q % cfg.SOFTMAX_GROUPS == 0
+                and cfg.COLS_PER_GROUP == cfg.N_Q // cfg.SOFTMAX_GROUPS
+                and cfg.COLS_PER_GROUP % 2 == 0
+                and cfg.COLS_PER_GROUP * cfg.BPE >= 16,
+                f"{flavor}: COLS_PER_GROUP must be N_Q / SOFTMAX_GROUPS, even, and at least one 16-B P^T chunk per lane row (got {cfg.COLS_PER_GROUP} at "
+                f"SOFTMAX_GROUPS={cfg.SOFTMAX_GROUPS}); a narrower group would store a partial swizzled chunk",
             ),
             (
                 cfg.GATHER_WARPS >= 1 and 32 % cfg.GATHER_WARPS == 0,
@@ -1831,10 +1855,10 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             ),
             (
                 cfg.TOTAL_WARPS == cfg.SOFTMAX_WARPS + cfg.GATHER_WARPS + cfg.AUX_WARPS and cfg.TOTAL_WARPS % 4 == 0,
-                f"{flavor}: TOTAL_WARPS must be 4 + GATHER_WARPS + 4 and a multiple of 4 (got {cfg.TOTAL_WARPS})",
+                f"{flavor}: TOTAL_WARPS must be SOFTMAX_WARPS + GATHER_WARPS + 4 (= {cfg.SOFTMAX_WARPS} + {cfg.GATHER_WARPS} + 4) and a multiple of 4 (got {cfg.TOTAL_WARPS})",
             ),
             (cfg.THREADS_PER_CTA == 32 * cfg.TOTAL_WARPS, f"{flavor}: THREADS_PER_CTA must be 32 x TOTAL_WARPS"),
-            (cfg.SOFTMAX_WARP_BASE == 0 and cfg.GATHER_WARP_BASE == cfg.SOFTMAX_WARPS, f"{flavor}: the gather warps follow the softmax warpgroup"),
+            (cfg.SOFTMAX_WARP_BASE == 0 and cfg.GATHER_WARP_BASE == cfg.SOFTMAX_WARPS, f"{flavor}: the gather warps follow the softmax warpgroup(s)"),
             (
                 cfg.MMA_WARP_ID == cfg.GATHER_WARP_BASE + cfg.GATHER_WARPS
                 and cfg.TMALDG_WARP_ID == cfg.MMA_WARP_ID + 1
@@ -1858,8 +1882,9 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 f"a wrong count is an unreachable scheduler mbarrier, i.e. a hang at EVERY shape",
             ),
             (
-                cfg.BAR_TMEM_THREADS == 32 * (cfg.SOFTMAX_WARPS + 1) and cfg.BAR_SOFTMAX_THREADS == cfg.SOFTMAX_LANES,
-                f"{flavor}: the named barriers count the MMA warp + softmax warps (160) and the softmax warps (128)",
+                cfg.BAR_TMEM_THREADS == 32 * (cfg.SOFTMAX_WARPS + 1) and cfg.BAR_SOFTMAX_THREADS == 32 * cfg.SOFTMAX_WARPS_PER_GROUP,
+                f"{flavor}: the named barriers count the MMA warp + EVERY softmax warp (160 at one column group, 288 at two) and ONE column group's "
+                f"four warps (128) -- got {cfg.BAR_TMEM_THREADS} / {cfg.BAR_SOFTMAX_THREADS}",
             ),
             # gather bytes: the per-warp expect_tx x warps == the stage
             (cfg.BLOCKS_PER_WARP == cfg.BLOCKS_PER_TILE // cfg.GATHER_WARPS, f"{flavor}: BLOCKS_PER_WARP must be 32 / GATHER_WARPS"),
@@ -1945,7 +1970,7 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             (
                 lay["total"] <= SMEM_USABLE_BYTES,
                 f"{flavor}: SMEM {lay['total']} B (sQ {cfg.STAGES_Q} x {cfg.N_Q * cfg.TILE_K * cfg.BPE} + sP {cfg.STAGES_S} x {cfg.TILE_N * cfg.N_Q * cfg.BPE} + sKV {cfg.STAGES_KV} x "
-                f"{cfg.TILE_N * cfg.TILE_K * cfg.BPE} + sIds {cfg.STAGES_IDS} x {cfg.IDS_SLOT_BYTES} + red {(cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.N_Q * 4} + misc {_SPARSE_SMEM_MISC_BYTES}, "
+                f"{cfg.TILE_N * cfg.TILE_K * cfg.BPE} + sIds {cfg.STAGES_IDS} x {cfg.IDS_SLOT_BYTES} + red {(cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.COLS_PER_GROUP * 4} + misc {_SPARSE_SMEM_MISC_BYTES}, "
                 f"1024-B aligned) exceeds the {SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout; overflowing it does NOT fail the launch, it clobbers the last buffer",
             ),
             (
@@ -2066,10 +2091,13 @@ def _sparse_arms_requested(params: TemplateParams) -> Tuple[str, ...]:
     return tuple(arms)
 
 
-def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8) -> Tuple[CfgD256Sparse, TmaIters]:
+def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softmax_groups: int = 0) -> Tuple[CfgD256Sparse, TmaIters]:
     """Config for sm107/sparse_d256_f16.py from the adapter's TemplateParams (``qsa_block_topk`` = the list width, ``qh_per_kh`` =
     the token's query heads on the N axis).  ``gather_warps`` selects the warp population: 8 (16 warps, the default; 128 entry
     registers, 0 spills on the host rendering) or 4 (12 warps, 168 entry registers -- the named fallback; -25 % gather issue rate).
+    ``softmax_groups`` (appended) selects the softmax SPLIT: 0 = the record's ``qsa_softmax_groups`` (itself 0 = ONE 4-warp column
+    group of 16 columns, the default body), 2 = TWO 4-warp groups of 8 columns (20 warps at 8 gather warps, 96 entry registers
+    flat; 16 warps / 128 at the 4-gather-warp fallback) -- a performance knob: the same function, bitwise, at either value.
 
     Backstop only: every rejection here must also be a decline of the adapter's claims record (reaching a ValueError from a
     served record is a claims bug, not a user error).  Returns ``(cfg, TmaIters)`` like every sibling factory."""
@@ -2119,10 +2147,15 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8) -> Tu
         )
     if gather_warps not in (4, 8):
         raise ValueError(f"{flavor}: gather_warps must be 8 (16 warps) or 4 (12 warps, the named fallback); got {gather_warps}")
+    groups = int(softmax_groups) or int(getattr(params, "qsa_softmax_groups", 0) or 0) or 1
+    if groups not in _SPARSE_SOFTMAX_GROUPS:
+        raise ValueError(
+            f"{flavor}: softmax_groups must be 1 (one 4-warp column group of 16 columns) or 2 (two 4-warp groups of 8 columns, the softmax split); got {groups}"
+        )
 
     b = bpe(params.dtype_qkv)
     tile_n, tile_k, tile_o, n_q = 128, 256, 256, _SPARSE_N_Q
-    softmax_warps, aux_warps = _SPARSE_SOFTMAX_WARPS, _SPARSE_AUX_WARPS
+    softmax_warps, aux_warps = _SPARSE_SOFTMAX_WARPS_PER_GROUP * groups, _SPARSE_AUX_WARPS
     total_warps = softmax_warps + gather_warps + aux_warps
     blocks_per_tile = tile_n // _SPARSE_BLOCK_SIZE
     blocks_per_warp = blocks_per_tile // gather_warps
@@ -2133,9 +2166,11 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8) -> Tu
     q_box_rows = q_box_tokens * params.qh_per_kh
     ids_tx = params.qsa_block_topk * 4
     entry = sparse_entry_regs(total_warps)
-    # The split for when .maxnreg lands: softmax 240 and gather 96 on both populations; the aux group takes the remainder of
-    # the ENTRY pool so SUM(role regs x warps) == entry x warps by construction (80 at 16 warps, 168 at 12).
-    softmax_regs, gather_regs = 240, 96
+    # The split for when .maxnreg lands: softmax 240 and gather 96 on both one-group populations; at two column groups (half the
+    # per-warp softmax state) 136 / 72 on the 20-warp pool (96 x 20 = 1920) and 160 / 96 on the 16-warp fallback (128 x 16 = 2048);
+    # the aux group takes the remainder of the ENTRY pool so SUM(role regs x warps) == entry x warps by construction
+    # (80 at 16 warps, 168 at 12; 64 at 20; 96 on the two-group 16-warp fallback).
+    softmax_regs, gather_regs = (240, 96) if groups == 1 else ((136, 72) if gather_warps == 8 else (160, 96))
     aux_regs = (entry * total_warps - softmax_warps * softmax_regs - gather_warps * gather_regs) // aux_warps
     probe = CfgD256Sparse(
         TILE_N=tile_n,
@@ -2179,7 +2214,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8) -> Tu
         IDS_EMPTY_ARRIVERS=gather_warps + softmax_warps,
         READ_TILE_ARRIVERS=softmax_warps + 1 + 1 + gather_warps,
         BAR_TMEM_THREADS=32 * (softmax_warps + 1),
-        BAR_SOFTMAX_THREADS=32 * softmax_warps,
+        BAR_SOFTMAX_THREADS=32 * _SPARSE_SOFTMAX_WARPS_PER_GROUP,  # ONE column group's four warps
         BLOCKS_PER_WARP=blocks_per_warp,
         GATHER_BOXES=gather_boxes,
         GATHER_BOX_ELEMS=_GATHER4_BOX_BYTES // b,
@@ -2213,6 +2248,9 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8) -> Tu
         BOTTOM_RIGHT=int(params.bottom_right),
         SPLIT_KV=int(params.split_kv or 1),
         LIST_PER_SEQUENCE=int(params.qsa_list_per_sequence),
+        SOFTMAX_GROUPS=groups,
+        SOFTMAX_WARPS_PER_GROUP=_SPARSE_SOFTMAX_WARPS_PER_GROUP,
+        COLS_PER_GROUP=n_q // groups,
         PACK_GQA=1,
         QH_PER_KH=int(params.qh_per_kh),
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.paged_kv) else int(params.seq_kv_lens_present),
