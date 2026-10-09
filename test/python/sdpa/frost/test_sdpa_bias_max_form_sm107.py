@@ -287,8 +287,10 @@ def test_hardware_renderings_drop_the_tree_keep_the_split_and_spill_no_more(tmp_
 # --------------------------------------------------------------------------- tier 3: GPU cells (a Rubin device)
 
 # The hardware form against the software form: both are the same function up to the fp32 rounding of the exp2 arguments (a different m
-# per step), so O agrees to a bf16 ulp or two and the LSE to a few fp32 ulps -- pinned HERE, tighter than the oracle tolerances.
-_TOL_O_VS_SW = dict(atol=1.6e-2, rtol=1.6e-2)  # bf16: 8 mantissa bits
+# per step), so O agrees within atol = rtol = 1.6e-2 -- 2 bf16 ulps at UNIT magnitude (the bf16 quantum at 1.0 is 2^-7 = 7.8e-3), which for an
+# O element of magnitude 0.05 admits ~60 ulps of that element -- and the LSE within atol = rtol = 2e-5 (a few fp32 ulps of a value ~ 6..10):
+# pinned HERE, tighter than the oracle tolerances of the sibling module (`_TOL_O`: atol 5e-2 / rtol 3e-2).
+_TOL_O_VS_SW = dict(atol=1.6e-2, rtol=1.6e-2)  # bf16: 8 mantissa bits; 2 ulps at unit scale
 _TOL_LSE_VS_SW = dict(atol=2e-5, rtol=2e-5)
 
 _SWEEP = [

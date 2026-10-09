@@ -670,7 +670,18 @@ def sm107_bias_max_form_default(bias_mode: int, kv_mask_form: int) -> int:
       added per step, and it recovers a third of the -inf body's cost over the plain kernel -- **+6.1..+14.8 %** on seven cells (bf16, D 32 at
       S 256 / 384 / 512 / 768 / 1024 with one batch entry and S 384 with four, D 64 at S 384 / 768; +11.4 % at the 384 cell, +14.8 % at 1024),
       every cell outside its control-pair spread by more than ten times; a 212-SM cc 10.7 perf node at the 2376 MHz lock (sampled busy median
-      0.5 % under it, no power-cap event), 100 x 3 CUDA-graph replay, the two forms interleaved in ONE process, the fp64 oracle on both;
+      0.5 % under it, no power-cap event), 100 x 3 CUDA-graph replay, the two forms interleaved in ONE process, the fp64 oracle on both.
+      The trees behind the claim (a perf number carries its base): the seven cells were measured on the arm over ``deb8d0e6e`` -- the kv
+      tile body BEFORE the dead-sub-tile quiet default (``3cdb717d4``), which the tree this function ships in renders at S 384 on the
+      kv_mask-only plan (``dead_subtile_quiet`` 1: S_q % 256 = 128) and nowhere at S % 256 = 0 (there the S 256 / 512 / 768 / 1024 cells
+      render the SAME kv tile body on every tree: one cubin md5 for the kv_mask-only rendering across the four bases rendered).  The
+      S 384 cells were therefore RE-MEASURED on the landed tree ``b302e46b9`` (a second node of the same class, the quiet rendering attested
+      per process, same protocol): D 32 **+12.0 %** with one batch entry (62.18 -> 55.52 us; the arm's cost over the plain kernel +44.8 % ->
+      +29.3 %), **+15.2 %** with four (224.00 -> 194.50 us; +55.1 % -> +34.7 %), D 64 **+10.2 %** (71.94 -> 65.28 us; +40.4 % -> +27.4 %;
+      a duty-cycled process whose busy-clock median sat 1.0 % under the lock -- a lower bound on the absolutes, the ratio same-process); the
+      rebased tree ``111c061f8`` (the legacy body) read +11.3 % at S 384 and +14.9 % at S 1024.  Against the 6-op softmax ALU floor
+      (212 SMs x 2.364 GHz, the binding term at D 32) the plain kernel runs at 53 / 60 % on the landed S 384 cells (one / four entries) and the
+      kv_mask-only arm moves from 36 -> 40 % and 38 -> 44 % (CUPTI kernel time);
     * every form WITH a bias keeps the SOFTWARE tree: the per-step packed per-row bias-tile max (63 ``max.bf16x2`` per 128 columns per thread
       plus the early second read of the non-pre-loaded chunk) costs about twice what the removed tree saves -- **-4.9..-12.2 %** on nine
       cells (both item forms, the resident block and the streamed ring, with and without the kv_mask, D 32 / 64, S 384 / 768 / 1024).  The
