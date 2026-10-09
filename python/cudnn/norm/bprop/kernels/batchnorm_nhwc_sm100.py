@@ -282,6 +282,9 @@ def _bn_bwd_nhwc_kernel(
         row = row + PPL
 
 
+_bn_bwd_nhwc_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _bn_bwd_nhwc_host(
     mDY,

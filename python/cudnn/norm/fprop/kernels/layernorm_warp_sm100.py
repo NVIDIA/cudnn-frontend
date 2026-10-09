@@ -168,6 +168,9 @@ def _warp_fwd_kernel(
         row = row + stride
 
 
+_warp_fwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _warp_fwd_host(
     mX,
@@ -392,6 +395,9 @@ def _warp_fwd_pipe_kernel(
             row = row + stride
 
 
+_warp_fwd_pipe_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _warp_fwd_pipe_host(
     mX,
@@ -487,6 +493,8 @@ _KCACHE = {}
 # clamped [2,8] (the pipeline's bigger block+smem wants ~half the single-CTA cap).
 _PIPE_STAGES = 2
 _USE_PIPE = True  # test override
+
+
 def _smem_max():
     """Per-block shared memory a launch may request, for the architecture in hand."""
     return smem_capacity()

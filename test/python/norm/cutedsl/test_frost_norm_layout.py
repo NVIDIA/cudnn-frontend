@@ -78,7 +78,10 @@ def _install_repo_cudnn_stub():
     stub = types.ModuleType("cudnn")
     stub.__path__ = [str(repo_cudnn)]
     stub.__file__ = str(repo_cudnn / "__init__.py")
-    stub.pygraph = type("pygraph", (), {})  # the cudnn.frost lifecycle patch needs this
+    stub.pygraph = type("pygraph", (), {})
+    # cudnn.frost.buffers imports this at module scope and only calls into it
+    # from a method, so a placeholder is enough to reach the DSL version gate.
+    stub._pybind_module = types.ModuleType("cudnn._pybind_module")  # the cudnn.frost lifecycle patch needs this
 
     import enum
 
@@ -112,11 +115,19 @@ LN, RMS = NormVariant.LAYER_NORM, NormVariant.RMS_NORM
 GN, IN, BN = NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM, NormVariant.BATCH_NORM
 
 
-def _case(label, variant, shape, *, cl=False, ns=None, groups=None, has_beta=True,
-          want=None, want_fwd=None, want_bwd=None, smoke=False):
-    return dict(label=label, variant=variant, shape=shape, cl=cl, ns=ns,
-                groups=groups, has_beta=has_beta, smoke=smoke,
-                want_fwd=want_fwd or want, want_bwd=want_bwd or want)
+def _case(label, variant, shape, *, cl=False, ns=None, groups=None, has_beta=True, want=None, want_fwd=None, want_bwd=None, smoke=False):
+    return dict(
+        label=label,
+        variant=variant,
+        shape=shape,
+        cl=cl,
+        ns=ns,
+        groups=groups,
+        has_beta=has_beta,
+        smoke=smoke,
+        want_fwd=want_fwd or want,
+        want_bwd=want_bwd or want,
+    )
 
 
 # Contiguous: every variant, so all five flavors are covered fprop + bprop.
@@ -129,8 +140,7 @@ CONTIG = [
     # launch (it used to), and not silently drop to the streaming fallback (0.17 of
     # achievable against the split's 0.68). The backward has no CGA path yet.
     _case("LN long row CGA", LN, (64, 65536), ns=[65536], want_fwd="layernorm_cga_sm100"),
-    _case("RMS long row CGA", RMS, (64, 65536), ns=[65536], has_beta=False,
-          want_fwd="layernorm_cga_sm100"),
+    _case("RMS long row CGA", RMS, (64, 65536), ns=[65536], has_beta=False, want_fwd="layernorm_cga_sm100"),
     _case("BN", BN, (8, 128, 14, 14), smoke=True),
     _case("IN", IN, (8, 128, 14, 14)),
     _case("GN g=32", GN, (8, 128, 14, 14), groups=32),
@@ -138,10 +148,8 @@ CONTIG = [
     # row (4-16 CTAs on 148 SMs, 0.01-0.02 of achievable); the backward was worse --
     # groupnorm_fast declines on these and the fallback was the original
     # one-atomic-per-element kernel at 0.00. Both must take the cluster split.
-    _case("GN few rows", GN, (2, 256, 56, 56), groups=2,
-          want_fwd="groupnorm_cga_sm100", want_bwd="groupnorm_cga_sm100"),
-    _case("IN few rows", IN, (2, 8, 112, 112),
-          want_fwd="groupnorm_cga_sm100", want_bwd="groupnorm_cga_sm100"),
+    _case("GN few rows", GN, (2, 256, 56, 56), groups=2, want_fwd="groupnorm_cga_sm100", want_bwd="groupnorm_cga_sm100"),
+    _case("IN few rows", IN, (2, 8, 112, 112), want_fwd="groupnorm_cga_sm100", want_bwd="groupnorm_cga_sm100"),
 ]
 
 # Channels-last: the three layout-sensitive variants. The GroupNorm entries are picked
@@ -289,9 +297,7 @@ def _check_case(c, dtypes=DTYPES):
             y, mean, rstd = norm_fprop(c["variant"], x, g, b, **fwd)
             # dy inherits y's layout -- the chain a real model produces.
             dy = torch.randn_like(y)
-            dx, dgamma, dbeta = norm_bprop(
-                c["variant"], dy, x, g, mean, rstd, has_beta=c["has_beta"], **bwd
-            )
+            dx, dgamma, dbeta = norm_bprop(c["variant"], dy, x, g, mean, rstd, has_beta=c["has_beta"], **bwd)
             torch.cuda.synchronize()
 
         xr = x.float().detach().requires_grad_(True)

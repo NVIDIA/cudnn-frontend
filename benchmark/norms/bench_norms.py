@@ -18,6 +18,9 @@ if "cudnn" not in sys.modules:
     stub = types.ModuleType("cudnn")
     stub.__path__ = [_CUDNN_DIR]
     stub.pygraph = type("pygraph", (), {})
+    # cudnn.frost.buffers imports this at module scope (the CuTe DSL version
+    # gate lives behind it); only called into from a method, so a stub does.
+    stub._pybind_module = types.ModuleType("cudnn._pybind_module")
     sys.modules["cudnn"] = stub
 
 import torch

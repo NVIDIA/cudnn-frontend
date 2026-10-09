@@ -400,6 +400,9 @@ def _bn_nhwc_kernel(
             nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tptr[0], cutlass.Float32), (BT // 128) * KT * CPP, is_exclusive=False)
 
 
+_bn_nhwc_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _bn_nhwc_host(
     mX,
@@ -520,6 +523,9 @@ def _bn_nhwc_infer_kernel(
             ys.append((xv[e].to(cutlass.Float32) * scale[e] + shift[e]).to(et))
         nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (cutlass.Int64(row) * C + c0))
         row = row + stride
+
+
+_bn_nhwc_infer_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

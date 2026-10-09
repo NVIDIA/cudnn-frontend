@@ -137,6 +137,9 @@ def _gn_fwd_kernel(
             j = j + bt
 
 
+_gn_fwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _gn_fwd_host(
     mX,

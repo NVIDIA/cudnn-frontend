@@ -143,12 +143,25 @@ def should_use(C, R, eb, block_threads=_BT):
 
 @cute.kernel
 def _ln_fwd_cga_kernel(
-    mXi, mYi, mG, mB, mMean, mRstd,
-    C: cutlass.Constexpr, CS: cutlass.Constexpr, CGA: cutlass.Constexpr,
-    BT: cutlass.Constexpr, V: cutlass.Constexpr, VPT: cutlass.Constexpr,
-    KC: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-    Cf: cutlass.Constexpr, eps: cutlass.Constexpr,
-    has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mXi,
+    mYi,
+    mG,
+    mB,
+    mMean,
+    mRstd,
+    C: cutlass.Constexpr,
+    CS: cutlass.Constexpr,
+    CGA: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    VPT: cutlass.Constexpr,
+    KC: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Cf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     bx, _, _ = cute.arch.block_idx()
@@ -228,8 +241,7 @@ def _ln_fwd_cga_kernel(
                 if cutlass.const_expr(has_beta):
                     y = y + bv[e].to(cutlass.Float32)
                 ys.append(y.to(et))
-            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                           mYi.iterator + (base + off))
+            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (base + off))
     for k in cutlass.range_constexpr(VPT - KC if VPT > KC else 0):
         off = (tid + (KC + k) * BT) * V
         xv = nvvm.load_ext(mXi.iterator + (base + off), dtype=it_ty, count=V).bitcast(et)
@@ -241,18 +253,33 @@ def _ln_fwd_cga_kernel(
             if cutlass.const_expr(has_beta):
                 y = y + bv[e].to(cutlass.Float32)
             ys.append(y.to(et))
-        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                       mYi.iterator + (base + off))
+        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (base + off))
+
+
+_ln_fwd_cga_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
 def _ln_fwd_cga_host(
-    mX, mY, mG, mB, mMean, mRstd,
-    C: cutlass.Constexpr, CS: cutlass.Constexpr, CGA: cutlass.Constexpr,
-    BT: cutlass.Constexpr, V: cutlass.Constexpr, VPT: cutlass.Constexpr,
-    KC: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-    Cf: cutlass.Constexpr, eps: cutlass.Constexpr,
-    has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mX,
+    mY,
+    mG,
+    mB,
+    mMean,
+    mRstd,
+    C: cutlass.Constexpr,
+    CS: cutlass.Constexpr,
+    CGA: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    VPT: cutlass.Constexpr,
+    KC: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Cf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
     nctas: cutlass.Constexpr,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
@@ -260,8 +287,25 @@ def _ln_fwd_cga_host(
     mGi = cute.recast_tensor(mG, it_ty)
     mBi = cute.recast_tensor(mB, it_ty)
     _ln_fwd_cga_kernel(
-        mXi, mYi, mGi, mBi, mMean, mRstd,
-        C, CS, CGA, BT, V, VPT, KC, it_ty, et, Cf, eps, has_mean, has_beta,
+        mXi,
+        mYi,
+        mGi,
+        mBi,
+        mMean,
+        mRstd,
+        C,
+        CS,
+        CGA,
+        BT,
+        V,
+        VPT,
+        KC,
+        it_ty,
+        et,
+        Cf,
+        eps,
+        has_mean,
+        has_beta,
     ).launch(grid=(nctas, 1, 1), block=(BT, 1, 1), cluster=(CGA, 1, 1))
 
 
@@ -290,8 +334,7 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None):
     mean = torch.empty(R, dtype=torch.float32, device=x2d.device) if spec.has_mean else rstd
 
     args = (dyn(x2d.reshape(-1)), dyn(y.reshape(-1)), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd))
-    ce = (C, CS, CGA, _BT, V, VPT, KC, it_ty, et, float(C), float(eps),
-          bool(spec.has_mean), has_beta, R * CGA)
+    ce = (C, CS, CGA, _BT, V, VPT, KC, it_ty, et, float(C), float(eps), bool(spec.has_mean), has_beta, R * CGA)
     key = (params.io_dtype, C, R, CGA, KC, bool(spec.has_mean), has_beta)
     fn = _KCACHE.get(key)
     if fn is None:

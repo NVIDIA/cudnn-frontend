@@ -123,9 +123,7 @@ def norm_bprop(
             from .kernels import groupnorm_cga_sm100
 
             if groupnorm_cga_sm100.should_use(spec, DTYPE_BYTES[io]):
-                dx, dgamma, dbeta = groupnorm_cga_sm100.backward(
-                    spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params
-                )
+                dx, dgamma, dbeta = groupnorm_cga_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params)
                 return dx.reshape(x.shape), dgamma, dbeta
         if variant in (NormVariant.GROUP_NORM, NormVariant.INSTANCE_NORM) and groupnorm_fast_sm100.eligible(spec, DTYPE_BYTES[io]):
             dx, dgamma, dbeta = groupnorm_fast_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
@@ -137,9 +135,7 @@ def norm_bprop(
             from .kernels import layernorm_cga_sm100
 
             if layernorm_cga_sm100.should_use(spec.M, spec.R, DTYPE_BYTES[io]):
-                dx, dgamma, dbeta = layernorm_cga_sm100.backward(
-                    spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params
-                )
+                dx, dgamma, dbeta = layernorm_cga_sm100.backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, params=params)
                 return dx.reshape(x.shape), dgamma, dbeta
         dx, dgamma, dbeta = _ROWWISE_KERNEL[variant].backward(spec, dy2d, x2d, gamma, mean, rstd, has_beta=has_beta, cfg=cfg, params=params)
         return dx.reshape(x.shape), dgamma, dbeta

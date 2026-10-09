@@ -150,12 +150,28 @@ def should_use(C, R, eb, block_threads=_BT):
 
 @cute.kernel
 def _ln_bwd_cga_kernel(
-    mDYi, mXi, mDXi, mG, mMean, mRstd, mDGp, mDBp,
-    R: cutlass.Int32, nclusters: cutlass.Int32,
-    C: cutlass.Constexpr, CS: cutlass.Constexpr, CGA: cutlass.Constexpr,
-    BT: cutlass.Constexpr, V: cutlass.Constexpr, VPT: cutlass.Constexpr,
-    KS: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-    Cf: cutlass.Constexpr, has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mDYi,
+    mXi,
+    mDXi,
+    mG,
+    mMean,
+    mRstd,
+    mDGp,
+    mDBp,
+    R: cutlass.Int32,
+    nclusters: cutlass.Int32,
+    C: cutlass.Constexpr,
+    CS: cutlass.Constexpr,
+    CGA: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    VPT: cutlass.Constexpr,
+    KS: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Cf: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     bx, _, _ = cute.arch.block_idx()
@@ -234,10 +250,8 @@ def _ln_bwd_cga_kernel(
         for k in cutlass.range_constexpr(VPT):
             off = (tid + k * BT) * V
             if cutlass.const_expr(k < KS):
-                xv = nvvm.load_ext(sx.iterator + (tid + k * BT) * V, dtype=it_ty, count=V,
-                                   shared_space=_CTA_SS).bitcast(et)
-                dv = nvvm.load_ext(sd.iterator + (tid + k * BT) * V, dtype=it_ty, count=V,
-                                   shared_space=_CTA_SS).bitcast(et)
+                xv = nvvm.load_ext(sx.iterator + (tid + k * BT) * V, dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
+                dv = nvvm.load_ext(sd.iterator + (tid + k * BT) * V, dtype=it_ty, count=V, shared_space=_CTA_SS).bitcast(et)
             else:
                 xv = nvvm.load_ext(mXi.iterator + (base + off), dtype=it_ty, count=V).bitcast(et)
                 dv = nvvm.load_ext(mDYi.iterator + (base + off), dtype=it_ty, count=V).bitcast(et)
@@ -249,8 +263,7 @@ def _ln_bwd_cga_kernel(
                 if cutlass.const_expr(has_mean):
                     g_ = g_ - c1
                 ys.append((rs * g_).to(et))
-            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                           mDXi.iterator + (base + off))
+            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mDXi.iterator + (base + off))
         row = row + nclusters
 
     # ---- flush per-column partials: the cluster writes one whole [C] row ----
@@ -263,36 +276,78 @@ def _ln_bwd_cga_kernel(
     for k in cutlass.range_constexpr(VPT):
         off = (tid + k * BT) * V
         for h in cutlass.range_constexpr(NSEG):
-            gseg = cutlass.Vector.from_elements(
-                tuple(dg[k * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+            gseg = cutlass.Vector.from_elements(tuple(dg[k * V + h * 4 + j] for j in range(4)), cutlass.Float32)
             nvvm.store_ext(gseg, mDGp.iterator + (pbase + off + h * 4))
             if cutlass.const_expr(has_beta):
-                bseg = cutlass.Vector.from_elements(
-                    tuple(db[k * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+                bseg = cutlass.Vector.from_elements(tuple(db[k * V + h * 4 + j] for j in range(4)), cutlass.Float32)
                 nvvm.store_ext(bseg, mDBp.iterator + (pbase + off + h * 4))
+
+
+_ln_bwd_cga_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
 def _ln_bwd_cga_host(
-    mDY, mX, mDX, mG, mMean, mRstd, mDGp, mDBp, mDGamma, mDBeta, R, nclusters,
-    C: cutlass.Constexpr, CS: cutlass.Constexpr, CGA: cutlass.Constexpr,
-    BT: cutlass.Constexpr, V: cutlass.Constexpr, VPT: cutlass.Constexpr,
-    KS: cutlass.Constexpr, it_ty: cutlass.Constexpr, et: cutlass.Constexpr,
-    Cf: cutlass.Constexpr, has_mean: cutlass.Constexpr, has_beta: cutlass.Constexpr,
-    nctas: cutlass.Constexpr, FB: cutlass.Constexpr, fgrid: cutlass.Constexpr,
-    nchunk: cutlass.Constexpr, CHUNK: cutlass.Constexpr, smem_bytes: cutlass.Constexpr,
+    mDY,
+    mX,
+    mDX,
+    mG,
+    mMean,
+    mRstd,
+    mDGp,
+    mDBp,
+    mDGamma,
+    mDBeta,
+    R,
+    nclusters,
+    C: cutlass.Constexpr,
+    CS: cutlass.Constexpr,
+    CGA: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    VPT: cutlass.Constexpr,
+    KS: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Cf: cutlass.Constexpr,
+    has_mean: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    nctas: cutlass.Constexpr,
+    FB: cutlass.Constexpr,
+    fgrid: cutlass.Constexpr,
+    nchunk: cutlass.Constexpr,
+    CHUNK: cutlass.Constexpr,
+    smem_bytes: cutlass.Constexpr,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
     mDXi = cute.recast_tensor(mDX, it_ty)
     mGi = cute.recast_tensor(mG, it_ty)
     _ln_bwd_cga_kernel(
-        mDYi, mXi, mDXi, mGi, mMean, mRstd, mDGp, mDBp, R, nclusters,
-        C, CS, CGA, BT, V, VPT, KS, it_ty, et, Cf, has_mean, has_beta,
+        mDYi,
+        mXi,
+        mDXi,
+        mGi,
+        mMean,
+        mRstd,
+        mDGp,
+        mDBp,
+        R,
+        nclusters,
+        C,
+        CS,
+        CGA,
+        BT,
+        V,
+        VPT,
+        KS,
+        it_ty,
+        et,
+        Cf,
+        has_mean,
+        has_beta,
     ).launch(grid=(nctas, 1, 1), block=(BT, 1, 1), cluster=(CGA, 1, 1), smem=smem_bytes)
-    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, nclusters, C, FB, CHUNK, has_beta).launch(
-        grid=(fgrid, nchunk, 1), block=(FB, 1, 1)
-    )
+    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, nclusters, C, FB, CHUNK, has_beta).launch(grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
 _KCACHE = {}
@@ -329,11 +384,21 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
         nchunk = nclusters
     CHUNK = (nclusters + nchunk - 1) // nchunk
 
-    args = (dyn(dy2d.reshape(-1)), dyn(x2d.reshape(-1)), dyn(dx.reshape(-1)), dyn(gamma),
-            dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta),
-            cutlass.Int32(R), cutlass.Int32(nclusters))
-    ce = (C, CS, CGA, _BT, V, VPT, KS, it_ty, et, float(C), bool(spec.has_mean), has_beta,
-          nclusters * CGA, FB, fgrid, nchunk, CHUNK, smem_bytes)
+    args = (
+        dyn(dy2d.reshape(-1)),
+        dyn(x2d.reshape(-1)),
+        dyn(dx.reshape(-1)),
+        dyn(gamma),
+        dyn(mean),
+        dyn(rstd),
+        dyn(dgp),
+        dyn(dbp),
+        dyn(dgamma),
+        dyn(dbeta),
+        cutlass.Int32(R),
+        cutlass.Int32(nclusters),
+    )
+    ce = (C, CS, CGA, _BT, V, VPT, KS, it_ty, et, float(C), bool(spec.has_mean), has_beta, nclusters * CGA, FB, fgrid, nchunk, CHUNK, smem_bytes)
     key = (params.io_dtype, C, R, CGA, KS, bool(spec.has_mean), has_beta, nclusters, nchunk, CHUNK)
     fn = _KCACHE.get(key)
     if fn is None:

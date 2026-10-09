@@ -48,6 +48,8 @@ _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _BT = 256
 _CPC_MAX = 128
+
+
 def _p2(n):
     return n > 0 and (n & (n - 1)) == 0
 
@@ -90,15 +92,36 @@ def eligible(C, cpg, eb):
 
 @cute.kernel
 def _gn_fwd_nhwc_kernel(
-    mXi, mYi, mG, mB, mMean, mRstd, mP, mRet,
-    HW: cutlass.Int32, mparts: cutlass.Int32,
-    C: cutlass.Constexpr, V: cutlass.Constexpr, CPG: cutlass.Constexpr,
-    CPC: cutlass.Constexpr, TPP: cutlass.Constexpr, PPL: cutlass.Constexpr,
-    BT: cutlass.Constexpr, G: cutlass.Constexpr, GPT: cutlass.Constexpr,
-    LPG: cutlass.Constexpr, GPL: cutlass.Constexpr, SEGLEN: cutlass.Constexpr,
-    KC: cutlass.Constexpr, TILES: cutlass.Constexpr, COOP: cutlass.Constexpr,
-    it_ty: cutlass.Constexpr, et: cutlass.Constexpr, Mf: cutlass.Constexpr,
-    eps: cutlass.Constexpr, has_beta: cutlass.Constexpr,
+    mXi,
+    mYi,
+    mG,
+    mB,
+    mMean,
+    mRstd,
+    mP,
+    mRet,
+    HW: cutlass.Int32,
+    mparts: cutlass.Int32,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    CPG: cutlass.Constexpr,
+    CPC: cutlass.Constexpr,
+    TPP: cutlass.Constexpr,
+    PPL: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    G: cutlass.Constexpr,
+    GPT: cutlass.Constexpr,
+    LPG: cutlass.Constexpr,
+    GPL: cutlass.Constexpr,
+    SEGLEN: cutlass.Constexpr,
+    KC: cutlass.Constexpr,
+    TILES: cutlass.Constexpr,
+    COOP: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Mf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
 ) -> None:
     tid, _, _ = cute.arch.thread_idx()
     gx, my, nz = cute.arch.block_idx()
@@ -165,12 +188,10 @@ def _gn_fwd_nhwc_kernel(
         nvvm.barrier_cta_sync_aligned(0)
         rslot = cutlass.Int32(nz) * TILES + gx
         if tid == 0:
-            nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + rslot, cutlass.Int32(1),
-                           mem_order=nvvm.MemOrder.RELEASE, syncscope=nvvm.MemScope.GPU)
+            nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + rslot, cutlass.Int32(1), mem_order=nvvm.MemOrder.RELEASE, syncscope=nvvm.MemScope.GPU)
             done = False
             while not done:
-                v = nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + rslot, cutlass.Int32(0),
-                                   mem_order=nvvm.MemOrder.ACQUIRE, syncscope=nvvm.MemScope.GPU)
+                v = nvvm.atomicrmw(nvvm.AtomicOp.ADD, mRet.iterator + rslot, cutlass.Int32(0), mem_order=nvvm.MemOrder.ACQUIRE, syncscope=nvvm.MemScope.GPU)
                 if v >= mparts:
                     done = True
         nvvm.barrier_cta_sync_aligned(0)
@@ -215,37 +236,89 @@ def _gn_fwd_nhwc_kernel(
             ys = []
             for e in cutlass.range_constexpr(V):
                 ys.append((xc[kk * V + e] * sc[e] + sh[e]).to(et))
-            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                           mYi.iterator + ((img + p) * C + c0))
+            nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + ((img + p) * C + c0))
     p = p0 + tp + KC * PPL
     while p < p1:
         xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
         ys = []
         for e in cutlass.range_constexpr(V):
             ys.append((xv[e].to(cutlass.Float32) * sc[e] + sh[e]).to(et))
-        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty),
-                       mYi.iterator + ((img + p) * C + c0))
+        nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + ((img + p) * C + c0))
         p = p + PPL
+
+
+_gn_fwd_nhwc_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
 def _gn_fwd_nhwc_host(
-    mX, mY, mG, mB, mMean, mRstd, mP, mRet, HW, mparts,
-    C: cutlass.Constexpr, V: cutlass.Constexpr, CPG: cutlass.Constexpr,
-    CPC: cutlass.Constexpr, TPP: cutlass.Constexpr, PPL: cutlass.Constexpr,
-    BT: cutlass.Constexpr, G: cutlass.Constexpr, GPT: cutlass.Constexpr,
-    LPG: cutlass.Constexpr, GPL: cutlass.Constexpr, SEGLEN: cutlass.Constexpr,
-    KC: cutlass.Constexpr, TILES: cutlass.Constexpr, COOP: cutlass.Constexpr,
-    it_ty: cutlass.Constexpr, et: cutlass.Constexpr, Mf: cutlass.Constexpr,
-    eps: cutlass.Constexpr, has_beta: cutlass.Constexpr,
-    smem_bytes: cutlass.Constexpr, gridm: cutlass.Constexpr, gridn: cutlass.Constexpr,
+    mX,
+    mY,
+    mG,
+    mB,
+    mMean,
+    mRstd,
+    mP,
+    mRet,
+    HW,
+    mparts,
+    C: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    CPG: cutlass.Constexpr,
+    CPC: cutlass.Constexpr,
+    TPP: cutlass.Constexpr,
+    PPL: cutlass.Constexpr,
+    BT: cutlass.Constexpr,
+    G: cutlass.Constexpr,
+    GPT: cutlass.Constexpr,
+    LPG: cutlass.Constexpr,
+    GPL: cutlass.Constexpr,
+    SEGLEN: cutlass.Constexpr,
+    KC: cutlass.Constexpr,
+    TILES: cutlass.Constexpr,
+    COOP: cutlass.Constexpr,
+    it_ty: cutlass.Constexpr,
+    et: cutlass.Constexpr,
+    Mf: cutlass.Constexpr,
+    eps: cutlass.Constexpr,
+    has_beta: cutlass.Constexpr,
+    smem_bytes: cutlass.Constexpr,
+    gridm: cutlass.Constexpr,
+    gridn: cutlass.Constexpr,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
     _gn_fwd_nhwc_kernel(
-        mXi, mYi, mG, mB, mMean, mRstd, mP, mRet, HW, mparts,
-        C, V, CPG, CPC, TPP, PPL, BT, G, GPT, LPG, GPL, SEGLEN, KC, TILES, COOP,
-        it_ty, et, Mf, eps, has_beta,
+        mXi,
+        mYi,
+        mG,
+        mB,
+        mMean,
+        mRstd,
+        mP,
+        mRet,
+        HW,
+        mparts,
+        C,
+        V,
+        CPG,
+        CPC,
+        TPP,
+        PPL,
+        BT,
+        G,
+        GPT,
+        LPG,
+        GPL,
+        SEGLEN,
+        KC,
+        TILES,
+        COOP,
+        it_ty,
+        et,
+        Mf,
+        eps,
+        has_beta,
     ).launch(grid=(TILES, gridm, gridn), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
 
 
@@ -287,11 +360,19 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None):
         rstd = torch.empty(N * G, dtype=torch.float32, device=x3.device)
         pbuf = torch.empty(N * TILES * mparts * 2 * GPT, dtype=torch.float32, device=x3.device)
         ret = torch.zeros(N * TILES, dtype=torch.int32, device=x3.device)
-        args = (dyn(x3.reshape(-1)), dyn(y.reshape(-1)), dyn(gamma), dyn(beta),
-                dyn(mean), dyn(rstd), dyn(pbuf), dyn(ret),
-                cutlass.Int32(HW), cutlass.Int32(mparts))
-        ce = (C, V, CPG, CPC, TPP, PPL, BT, G, GPT, LPG, GPL, SEGLEN, KC, TILES, COOP,
-              it_ty, et, float(HW * CPG), float(eps), has_beta, smem_bytes, mparts, N)
+        args = (
+            dyn(x3.reshape(-1)),
+            dyn(y.reshape(-1)),
+            dyn(gamma),
+            dyn(beta),
+            dyn(mean),
+            dyn(rstd),
+            dyn(pbuf),
+            dyn(ret),
+            cutlass.Int32(HW),
+            cutlass.Int32(mparts),
+        )
+        ce = (C, V, CPG, CPC, TPP, PPL, BT, G, GPT, LPG, GPL, SEGLEN, KC, TILES, COOP, it_ty, et, float(HW * CPG), float(eps), has_beta, smem_bytes, mparts, N)
         key = (params.io_dtype, C, HW, N, CPG, V, CPC, KC, has_beta, mparts, COOP)
         fn = _KCACHE.get(key)
         if fn is None:

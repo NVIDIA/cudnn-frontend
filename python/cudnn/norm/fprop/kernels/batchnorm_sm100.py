@@ -92,6 +92,9 @@ def _bn_fwd_kernel(
         i = i + bt
 
 
+_bn_fwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _bn_fwd_host(
     mX,
