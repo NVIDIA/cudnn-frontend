@@ -145,7 +145,8 @@ def test_masked_leading_tile_with_live_keys_behind_it(P, d, sink):
     later shift read -inf - (-inf) = NaN -- 65,536 nonfinite O elements at d256 (with a sink also 256 nonfinite Stats),
     while the scale-1/16 twin and the unwindowed sink control were finite (the #1481 review's native reproduction).  The
     cc 10.7 MXFP8 bodies' running-max step now keeps a tile that is fully masked ahead of the row's first live key out of
-    the running state (alpha = 1, P = 0; the d128 / d512 bodies also clamp the scaled tile max to the finite sentinel).
+    the running state (alpha = 1, P = 0; the d128 / d192x128 / d512 bodies also clamp the scaled tile max to the finite sentinel, the d256
+    body does not).
     Dequantized Q / K / V = 0.5, so O is exactly 0.5 on every row with a legal key: only a NaN / inf (or a wrong LSE) can
     fail this cell, never FP8 rounding.  Dense twin: test_sdpa_fwd_mxfp8_sm100.py::test_masked_leading_tile_with_live_keys_behind_it."""
     from unittest.mock import patch

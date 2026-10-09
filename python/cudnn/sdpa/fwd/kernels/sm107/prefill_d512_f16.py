@@ -278,11 +278,12 @@ OUT_STORAGE_DTYPE = STORAGE_DTYPE
 # scaled chain; numerically neutral, the adapter pins scale_softmax_log2 to exactly 1.0 and the kernel ignores the
 # argument).  Everything downstream of the shift -- alpha, the register row-sum, the (ell, max) ship to sg1, the sink
 # fold, the LSE and STATS_LOG2 -- consumes the log2-domain max and is unchanged.  A fully-masked tile leaves the raw
-# max exactly at the finite mask sentinel (== NEG_INF_F32), so is_first re-fires on consecutive keyless tiles
-# (alpha = 0 where the scaled chain runs alpha = 1 between them); both publish P = exp2(0) = 1 there, the first live
-# tile wipes the accumulator with alpha = 0 either way, and a row with no live key at all is overridden by the
-# epilogue's _row_empty geometry select.  The sentinel is never multiplied under the fold, so the scaled-sentinel
-# overflow of the other chain (-FLT_MAX * scale_log2 -> -inf, P = NaN) cannot occur here.
+# max exactly at the finite mask sentinel (== NEG_INF_F32); a tile that is dead AHEAD of the row's first live key is
+# selected out of the running state by running_max_step_finite_sentinel on both chains (total_max kept at the
+# sentinel, alpha = 1, shift 0 -> P = 0 on every column), the first live tile then starts the online softmax, and a
+# row with no live key at all is overridden by the epilogue's _row_empty geometry select.  The sentinel is never
+# multiplied under the fold, so the scaled-sentinel overflow the select also guards the other chain against
+# (-FLT_MAX * scale_log2 -> -inf, P = NaN) cannot occur here.
 SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
 if SCALE_PREFOLDED and IS_TF32:
     raise ValueError(
