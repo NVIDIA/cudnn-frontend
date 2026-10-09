@@ -94,7 +94,7 @@ Contributor credits for these OSS CuTe DSL kernels are listed in [Acknowledgemen
 ## Key Features
 
 *   **Unified Graph API:** Create reusable, persistent `cudnn_frontend::graph::Graph` objects to describe complex subgraphs.
-*   **Ease of Use:** Simplified C++ and Python bindings (via `pybind11`) that abstract away the boilerplate of the backend API.
+*   **Ease of Use:** Simplified C++ and Python bindings (via `nanobind`) that abstract away the boilerplate of the backend API.
 *   **Performance:** Built-in autotuning and support for the latest NVIDIA GPU architectures.
 
 ## Installation

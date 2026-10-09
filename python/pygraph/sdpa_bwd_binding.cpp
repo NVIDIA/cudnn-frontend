@@ -8,9 +8,12 @@
 #include <limits>
 #include <string>
 #include <utility>
-#include <pybind11/stl.h>
 
-namespace py = pybind11;
+#include <nanobind/stl/array.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
+
+namespace py = nanobind;
 namespace cudnn_frontend {
 namespace python_bindings {
 namespace {
@@ -48,16 +51,16 @@ class SdpaBwdBinder : private FixedSdpaOperands {
 
    public:
     SdpaBwdBinder(const py::object &spec, const py::tuple &declared)
-        : FixedSdpaOperands(spec.attr("name").cast<std::string>(), spec.attr("device_index").cast<int64_t>()),
+        : FixedSdpaOperands(py::cast<std::string>(spec.attr("name")), py::cast<int64_t>(spec.attr("device_index"))),
           fn_(spec.attr("fn")),
           owner_(spec.attr("artifact")),
-          workspace_bytes_(spec.attr("workspace_bytes").cast<int64_t>()),
-          scale_(spec.attr("scale").cast<double>()),
-          scale_log2_(spec.attr("scale_log2").cast<bool>()),
-          length_form_(spec.attr("length_form").cast<bool>()) {
+          workspace_bytes_(py::cast<int64_t>(spec.attr("workspace_bytes"))),
+          scale_(py::cast<double>(spec.attr("scale"))),
+          scale_log2_(py::cast<bool>(spec.attr("scale_log2"))),
+          length_form_(py::cast<bool>(spec.attr("length_form"))) {
         if (workspace_bytes_ < 0 || device_ < 0) invalid("invalid fixed backward workspace or device");
-        const auto roles = spec.attr("roles").cast<std::vector<std::string>>();
-        const auto ops   = spec.attr("operands").cast<py::tuple>();
+        const auto roles = py::cast<std::vector<std::string>>(spec.attr("roles"));
+        const auto ops   = py::cast<py::tuple>(spec.attr("operands"));
         if (roles.size() < ops.size() || declared.size() < ops.size()) invalid("invalid backward operand declarations");
         operands_.reserve(ops.size());
         carriers_.reserve(ops.size());
@@ -65,17 +68,18 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             const auto value = ops[i];
             Carrier carrier;
             if (!value.is_none()) {
-                if (value.attr("opaque_bytes").cast<bool>()) invalid("opaque scale factors require the Python binder");
-                auto shape       = value.attr("shape").cast<std::vector<int64_t>>();
+                if (py::cast<bool>(value.attr("opaque_bytes")))
+                    invalid("opaque scale factors require the Python binder");
+                auto shape       = py::cast<std::vector<int64_t>>(value.attr("shape"));
                 carrier.elements = 1;
                 for (auto n : shape) carrier.elements = multiply(carrier.elements, n);
-                carrier.allowed_numels = value.attr("allowed_numels").cast<std::vector<int64_t>>();
+                carrier.allowed_numels = py::cast<std::vector<int64_t>>(value.attr("allowed_numels"));
                 carrier.contiguous     = roles[i] == "seq_q" || roles[i] == "seq_kv" || roles[i] == "sink" ||
                                      roles[i] == "dsink" || roles[i] == "bias" || roles[i] == "dbias";
                 carrier.length_bit = roles[i] == "seq_q" ? 0 : roles[i] == "seq_kv" ? 1 : -1;
             }
             add_operand(roles[i], value, declared[i]);
-            if (!value.is_none() && value.attr("itemsize").cast<int64_t>() != operands_.back().bits / 8)
+            if (!value.is_none() && py::cast<int64_t>(value.attr("itemsize")) != operands_.back().bits / 8)
                 invalid("operand dtype and element width disagree");
             carriers_.push_back(std::move(carrier));
         }
@@ -94,18 +98,18 @@ class SdpaBwdBinder : private FixedSdpaOperands {
         const auto workspace_end = end(workspace, workspace_bytes_);
         if (indices.size() != operands_.size()) invalid("incorrect native backward role indices");
         const auto facts            = read_native_operand_views(pack, indices);
-        const auto runtime_geometry = declared.is_none() ? py::tuple() : declared.cast<py::tuple>();
+        const auto runtime_geometry = declared.is_none() ? py::tuple() : py::cast<py::tuple>(declared);
         if (!declared.is_none() && runtime_geometry.size() != operands_.size())
             invalid("incorrect standalone geometry count");
         int length_form = 0;
-        py::tuple frame(operands_.size() + 3 + (scale_log2_ ? 1 : 0) + (length_form_ ? 1 : 0));
+        py::list frame;
         for (size_t i = 0; i < operands_.size(); ++i) {
             const auto &op      = operands_[i];
             const auto &f       = facts[i];
             const auto &carrier = carriers_[i];
             const auto label    = op.name == "seq_q" || op.name == "seq_kv" ? op.name + "_lens" : op.name;
             if (!validate(op, f, label)) {
-                frame[i] = py::none();
+                frame.append(py::none());
                 continue;
             }
             int64_t elements = 0;
@@ -124,9 +128,9 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             }
             if (!f.shape.empty()) {
                 if (!declared.is_none() && !runtime_geometry[i].is_none()) {
-                    const auto value = runtime_geometry[i].cast<py::tuple>();
-                    auto shape       = value[0].cast<std::vector<int64_t>>();
-                    auto stride      = value[1].cast<std::vector<int64_t>>();
+                    const auto value = py::cast<py::tuple>(runtime_geometry[i]);
+                    auto shape       = py::cast<std::vector<int64_t>>(value[0]);
+                    auto stride      = py::cast<std::vector<int64_t>>(value[1]);
                     if (geometry(f.shape, f.stride) != geometry(shape, stride))
                         invalid(op.name + " runtime geometry must match this fixed backward plan");
                 } else if (std::find(overridden.begin(), overridden.end(), indices[i]) != overridden.end() &&
@@ -143,18 +147,16 @@ class SdpaBwdBinder : private FixedSdpaOperands {
                 invalid(op.name + " backing storage is too small for the bound length form");
             if (workspace < end(f.pointer, bytes) && f.pointer < workspace_end)
                 invalid("caller workspace overlaps " + op.name);
-            frame[i] = py::int_(f.pointer);
+            frame.append(py::int_(f.pointer));
         }
-        size_t slot            = operands_.size();
-        const auto scale_value = scale.is_none() ? scale_ : scale.cast<double>();
-        frame[slot++]          = py::int_(workspace);
-        if (scale_log2_) frame[slot++] = py::float_(scale_value * 1.4426950408889634);
-        frame[slot++] = py::float_(scale_value);
+        const auto scale_value = scale.is_none() ? scale_ : py::cast<double>(scale);
+        frame.append(py::int_(workspace));
+        if (scale_log2_) frame.append(py::float_(scale_value * 1.4426950408889634));
+        frame.append(py::float_(scale_value));
         if (length_form_)
-            frame[slot++] =
-                py::int_(length_form);  // Graph declarations bind B lengths; standalone also accepts B+1 prefixes.
-        frame[slot] = py::int_(stream);
-        return frame;
+            frame.append(py::int_(length_form));  // Graph declarations bind B lengths; standalone also accepts B+1 prefixes.
+        frame.append(py::int_(stream));
+        return py::tuple(frame);
     }
 
     void
@@ -164,8 +166,8 @@ class SdpaBwdBinder : private FixedSdpaOperands {
             int64_t stream,
             const std::vector<int64_t> &overridden) const {
         const auto frame = bind(pack, indices, workspace, stream, overridden);
-        auto result      = py::reinterpret_steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
-        if (!result) throw py::error_already_set();
+        auto result      = py::steal<py::object>(PyObject_CallObject(fn_.ptr(), frame.ptr()));
+        if (!result) throw py::python_error();
     }
 };
 }  // namespace
