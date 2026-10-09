@@ -33,30 +33,37 @@ WORK ITEM = (query token t, KV head h): the G query heads of t (12 at 24/2, G <=
     BMM2  O^T[128 d, 16]   += V^T[128 d x 128 keys] (A, MN-major) . P^T[128 keys x 16] (B, MN-major)    2 d-blocks x 8 k-steps
 
 over n_tiles 128-key tiles, each 32 four-token blocks GATHERED by ``tma_gather4`` (one issue = 4 rows x one 128-B column box;
-4 boxes per 256-wide row per operand; 128 issues = 64 KiB per operand tile).  One CTA per SM, cga1, 16 warps, persistent
+4 boxes per 256-wide row per operand; 128 issues = 64 KiB per operand tile).  One CTA per SM, cga1, 20 warps (16 at one softmax
+column group), persistent
 through the shared scheduler (BSHD: the grid is the work list, 2 x T_q items decoded arithmetically; THD: the device-counter
 form on an occupancy-sized grid).  Q^T and the block list of item i+1 are prefetched under item i's KV loop; the epilogue gate
 of item i (``O *= sigmoid(G)``, compiled out unless CFG.EPILOGUE_GATE) is TMA-staged into the freed sQ slot of item i.
 
-WARP MAP (16 warps = 512 threads at ONE softmax column group; 20 warps = 640 threads at TWO, the SOFTMAX SPLIT below -- the DEFAULT; every
-warpgroup is role-homogeneous because ``setmaxnreg`` is warpgroup-collective; the gather / MMA / TMA / scheduler ids follow SOFTMAX_WARPS)
+WARP MAP (the DEFAULT = TWO softmax column groups: 20 warps = 640 threads; ONE group (TemplateParams.qsa_softmax_groups = 1) = 16 warps
+= 512 threads, its ids in parentheses; every warpgroup is role-homogeneous because ``setmaxnreg`` is warpgroup-collective; the gather /
+MMA / TMA / scheduler / spare ids FOLLOW SOFTMAX_WARPS -- CFG.GATHER_WARP_BASE / MMA_WARP_ID / TMALDG_WARP_ID / SCHED_WARP_ID /
+SPARE_WARP_ID -- and the body dispatches on those names, never on a literal; table re-based on the two-group default 2026-10-09)
 
-    warps 0-3   WG0    softmax + epilogue: 128 lanes = the 128 key lanes of S^T / P^T = the 128 d lanes of O^T, all 16 columns
-    warps 4-11  WG1-2  GATHER issuers w = warp - 4: blocks 4w..4w+3 of every K and V tile; the quad of ids by ONE warp-uniform
-                       16-B LDS from sIds BEFORE the ring wait (the quad is 16-B aligned: BLOCK_TOPK % 4 == 0), the SELECT per
-                       index; PAGED arm: ONE block-table lookup per block of the quad right there (page = block_table[b, 4 blk //
-                       PAGE_SIZE], an in-bounds read, -1 for a dead / past-the-length block, a page index past the table or a -1
-                       page); 4 blocks x 4 boxes = 16 gather4 per operand tile from the elected lane; ONE
-                       arrive_expect_tx(KV_TX_BYTES_PER_WARP) per operand stage; kv_state carried across items; ring drain at exit
-    warp 12     WG3    MMA issue (+ tmem_alloc / dealloc once per CTA): 4 commits per tile (s_full, kv_empty[K], bmm2_done,
-                       kv_empty[V]) + 1 per item (q_empty)
-    warp 13     WG3    TMA-LDG: Q^T(i+1) (4 subtiles, Q_TX_BYTES = the BOX bytes), the BLOCK_TOPK x 4 B ids bulk copy of
-                       item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; exit drains PER ARM:
-                       mb_ids_empty x STAGES_IDS always; ungated mb_q_empty x STAGES_Q; gated: the exit-path mb_gate_empty wait
-                       BEFORE the last item's gate (the wait Q(n_items) would have taken), then mb_gate_empty x STAGES_GATE
-                       (every mb_q_empty commit is consumed by its item's gate load -- nothing of row 2 is left to drain)
-    warp 14     WG3    scheduler (scheduler_warp_loop for BSHD; the persistent claim-counter form for THD) -- never credits
-    warp 15     WG3    spare: passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one in the body)
+    warps 0-7 (0-3)    WG0-1 (WG0)   softmax + epilogue: 128 lanes per column group = the 128 key lanes of S^T / P^T = the 128 d lanes of O^T;
+                                     column group g = warps 4g..4g+3 owns columns 8g..8g+7 (ONE group: warps 0-3 own all 16 columns) -- the
+                                     SOFTMAX SPLIT below
+    warps 8-15 (4-11)  WG2-3 (1-2)   GATHER issuers w = warp - GATHER_WARP_BASE: blocks 4w..4w+3 of every K and V tile; the quad of ids by ONE
+                                     warp-uniform 16-B LDS from sIds BEFORE the ring wait (the quad is 16-B aligned: BLOCK_TOPK % 4 == 0), the
+                                     SELECT per index; PAGED arm: ONE block-table lookup per block of the quad right there (page = block_table[b,
+                                     4 blk // PAGE_SIZE], an in-bounds read, -1 for a dead / past-the-length block, a page index past the table
+                                     or a -1 page); 4 blocks x 4 boxes = 16 gather4 per operand tile from the elected lane; ONE
+                                     arrive_expect_tx(KV_TX_BYTES_PER_WARP) per operand stage; kv_state carried across items; ring drain at exit
+    warp 16 (12)       WG4 (3)       MMA issue (CFG.MMA_WARP_ID; + tmem_alloc / dealloc once per CTA): 4 commits per tile (s_full, kv_empty[K],
+                                     bmm2_done, kv_empty[V]) + 1 per item (q_empty)
+    warp 17 (13)       WG4 (3)       TMA-LDG (CFG.TMALDG_WARP_ID): Q^T(i+1) (4 subtiles, Q_TX_BYTES = the BOX bytes), the BLOCK_TOPK x 4 B ids bulk
+                                     copy of item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; exit drains PER ARM:
+                                     mb_ids_empty x STAGES_IDS always; ungated mb_q_empty x STAGES_Q; gated: the exit-path mb_gate_empty wait
+                                     BEFORE the last item's gate (the wait Q(n_items) would have taken), then mb_gate_empty x STAGES_GATE
+                                     (every mb_q_empty commit is consumed by its item's gate load -- nothing of row 2 is left to drain)
+    warp 18 (14)       WG4 (3)       scheduler (CFG.SCHED_WARP_ID; scheduler_warp_loop for BSHD, the persistent claim-counter form for THD) --
+                                     never credits
+    warp 19 (15)       WG4 (3)       spare (CFG.SPARE_WARP_ID): passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one
+                                     in the body)
 
 SOFTMAX SPLIT (CFG.SOFTMAX_GROUPS = 2, the DEFAULT since its A/B/A; TemplateParams.qsa_softmax_groups = 1 renders the one-group body; a
 PERFORMANCE knob -- the same function bitwise): the softmax role becomes TWO 4-warp column GROUPS, warps 0-3 (WG0) columns 0-7 and warps 4-7 (WG1) columns 8-15 of S^T / P^T /
@@ -74,7 +81,8 @@ LDL 0 on 20, G = 16 gated 1 / 1 in the prologue only (vs 6 / 6 + 3 per TILE at o
 8 x 136 + 8 x 72 + 4 x 64 = 1920 == 96 x 20; the fallback ``gather_warps=4``: 16 warps, 128 flat, 8 x 160 + 4 x 96 + 4 x 96 = 2048.
 
 Every warp except the scheduler credits the scheduler slot (read_tile_id_arrive) at the TOP of its item, right after reading
-the payload -> READ_TILE_ARRIVERS = SOFTMAX_WARPS + 1 + 1 + GATHER_WARPS = 14 (18 at two column groups).  Registers: a 512-thread launch gives ptxas 128 per thread
+the payload -> READ_TILE_ARRIVERS = SOFTMAX_WARPS + 1 + 1 + GATHER_WARPS = 18 (14 at one column group).  Registers at ONE column group
+(the two-group numbers are in the SOFTMAX SPLIT paragraph above): a 512-thread launch gives ptxas 128 per thread
 FLAT (``.reqntid 512`` and no ``.maxnreg`` from the DSL; every setmaxnreg is dropped).  Host trace-compile of the decode body
 under a forced 512-thread rendering (sm_107a): REG 104, STL 0, LDL 0 on the dense-padded and the causal specializations.  The
 declared split for when ``.maxnreg`` lands: 4 x 240 + 8 x 96 + 4 x 80 = 2048 == 128 x 16 (SUM(role regs x warps) == entry x
@@ -99,74 +107,88 @@ lever's ceiling is still those bytes); a SEPARATE gate slot
 (229.4 KiB, the oversized carveout) is unmeasured -- it needs the gated rendering.
 
 BARRIER TABLE (per CTA; init = the EXACT per-phase arrival sum; "lanes" resolved from the guard form at the call site --
-nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, no cluster fence, no cross-CTA arrive)
+nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, no cluster fence, no cross-CTA arrive.  The primary
+values are the DEFAULT rendering's (TWO softmax column groups, 20 warps); the ONE-group values follow in parentheses; producers are
+named by ROLE -- the MMA warp = CFG.MMA_WARP_ID, the TMA warp = CFG.TMALDG_WARP_ID (16 / 17 at the default, 12 / 13 at one group).
+Table re-based on the two-group default 2026-10-09; before that it led with the one-group rendering.)
 
     #  name [stages]        producer     issuing lanes (guard form)                                   SUM == init  consumer / wait                   start  carried state
-    1  mb_q_full[2]         TMA_LOAD     warp 13, arrive(n_bytes=Q_TX_BYTES, pred=elect_sync()); tma_load_tile x 4 subtiles
+    1  mb_q_full[2]         TMA_LOAD     the TMA warp, arrive(n_bytes=Q_TX_BYTES, pred=elect_sync()); tma_load_tile x 4 subtiles
                                          Q_TX_BYTES = Q_BOX_ROWS x TILE_K x BPE = G x 512 B (6144 at G=12; the BOX, never the 8 KiB slot)
                                                                                                         1 == 1       MMA before the item's first BMM1     0      q_state(2), once per item
-    2  mb_q_empty[2]        MMA_COMMIT   warp 12, arrive(cta_group=1, pred=elect_p) once per item after the item's LAST BMM1
-                                                                                                        1 == 1       warp 13 before gate(i) / Q(i+2)      1 | 0  per item.  UNGATED: the pre-armed qe_state (start 1) waits
+    2  mb_q_empty[2]        MMA_COMMIT   the MMA warp, arrive(cta_group=1, pred=elect_p) once per item after the item's LAST BMM1
+                                                                                                        1 == 1       the TMA warp before gate(i) / Q(i+2) 1 | 0  per item.  UNGATED: the pre-armed qe_state (start 1) waits
                                                                                                                                                                  before Q(j), the last STAGES_Q commits drained at exit.  GATED: the
                                                                                                                                                                  wait-then-arrive qg_state (start 0) consumes commit i before gate(i);
                                                                                                                                                                  n commits, n waits -- no drain (the slot's WAR gate for Q(i+2) is row 12)
-    3  mb_ids_full[2]       TMA_LOAD     warp 13, arrive(n_bytes=IDS_TX_BYTES, pred=elect_sync()); bulk_copy(sIds[slot], block_ids[item_row], IDS_TX_BYTES)
+    3  mb_ids_full[2]       TMA_LOAD     the TMA warp, arrive(n_bytes=IDS_TX_BYTES, pred=elect_sync()); bulk_copy(sIds[slot], block_ids[item_row], IDS_TX_BYTES)
                                          IDS_TX_BYTES = BLOCK_TOPK x 4 (a 16-B multiple); the copy runs for EVERY item, dead ones included
                                          (item_row = the token's flat row, or the SEQUENCE under CFG.LIST_PER_SEQUENCE: one row copied by every item of it)
-                                                                                                        1 == 1       8 gather + 4 softmax warps, item top 0      ids_state(2), once per item
-    4  mb_ids_empty[2]      THREAD       `if elect_sync(): arrive()` from each of the 12 consuming warps after its last read of the slot (16 at two
-                                         column groups: both groups read their lane's block id; IDS_EMPTY_ARRIVERS = GATHER_WARPS + SOFTMAX_WARPS)
-                                                                                                        12 == 12     warp 13 before refilling (item i+2)  1      per item; drained at exit by warp 13
+                                                                                                        1 == 1       8 gather + 8 softmax warps (4 at one group), item top
+                                                                                                                                                          0      ids_state(2), once per item
+    4  mb_ids_empty[2]      THREAD       `if elect_sync(): arrive()` from each of the 16 consuming warps after its last read of the slot: 8 gather +
+                                         8 softmax (both column groups read their lane's block id; IDS_EMPTY_ARRIVERS = GATHER_WARPS + SOFTMAX_WARPS;
+                                         12 at one group)
+                                                                                                        16 == 16 (12 == 12)   the TMA warp before refilling (item i+2)
+                                                                                                                                                          1      per item; drained at exit by the TMA warp
     5  mb_kv_full[3]        TMA_LOAD     each gather warp: arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=elect_sync()) once per stage fill,
                                          then its 16 gather4 x 512 B = 8192 B (OOB / -1 rows zero-filled AND credited); 8 x 8192 = the 64 KiB stage
                                                                                                         8 == 8       MMA before BMM1 (K) / BMM2 (V)       0      kv_state(3) per LOAD, order K(0) K(1) V(0) K(2) V(1) ... V(n-1),
                                                                                                                                                                  CARRIED across items in the gather warps AND the MMA warp
-    6  mb_kv_empty[3]       MMA_COMMIT   warp 12, pred=elect_p after the last MMA reading the stage (K: with s_full's commit; V: with bmm2_done's)
+    6  mb_kv_empty[3]       MMA_COMMIT   the MMA warp, pred=elect_p after the last MMA reading the stage (K: with s_full's commit; V: with bmm2_done's)
                                                                                                         1 == 1       all 8 gather warps before refilling 1      the same kv_state; each gather warp drains STAGES_KV at exit
-    7  mb_s_full[2]         MMA_COMMIT   warp 12, pred=elect_p right after BMM1(t)                     1 == 1       4 softmax warps, top of tile t       0      s_state(2) per TILE, never reset at an item boundary
-    8  mb_s_empty[2]        THREAD       bare arrive() from all 128 softmax lanes after tcgen05_ld -> tcgen05_wait(LOAD) -> tcgen05_fence (256 at two
-                                         column groups, each group after ITS num=8 load; SOFTMAX_LANES)
-                                                                                                        128 == 128   MMA before BMM1(t+2) reuses the slot 1      s_empty_state(2) per tile, carried
-    9  mb_p_full[2]         THREAD       bare arrive() from 128 lanes after the P^T store_swizzled + fence_proxy + the O^T rescale + tcgen05_fence (256 at
-                                         two column groups: both groups' 16-B chunks and both rescales have landed when the MMA warp's wait returns)
-                                                                                                        128 == 128   MMA before BMM2(t)                   0      p_state(2) per tile, carried
-   10  mb_bmm2_done[2]      MMA_COMMIT   warp 12, pred=elect_p after BMM2(t)'s two d-blocks           1 == 1       softmax before the O^T rescale (tile t+1) and once in the epilogue (last tile)
+    7  mb_s_full[2]         MMA_COMMIT   the MMA warp, pred=elect_p right after BMM1(t)               1 == 1       8 softmax warps (4), top of tile t   0      s_state(2) per TILE, never reset at an item boundary
+    8  mb_s_empty[2]        THREAD       bare arrive() from all 256 softmax lanes (SOFTMAX_LANES), each column group after ITS tcgen05_ld(num=8) ->
+                                         tcgen05_wait(LOAD) -> tcgen05_fence (128 at one group, after its num=16 load)
+                                                                                                        256 == 256 (128 == 128)   MMA before BMM1(t+2) reuses the slot
+                                                                                                                                                          1      s_empty_state(2) per tile, carried
+    9  mb_p_full[2]         THREAD       bare arrive() from all 256 lanes, each column group after ITS 16-B P^T chunk store_swizzled + fence_proxy + ITS
+                                         O^T rescale + tcgen05_fence: both groups' chunks and both rescales have landed when the MMA warp's wait
+                                         returns (128 at one group)
+                                                                                                        256 == 256 (128 == 128)   MMA before BMM2(t)
+                                                                                                                                                          0      p_state(2) per tile, carried
+   10  mb_bmm2_done[2]      MMA_COMMIT   the MMA warp, pred=elect_p after BMM2(t)'s two d-blocks     1 == 1       softmax before the O^T rescale (tile t+1) and once in the epilogue (last tile)
                                                                                                                                                           0      bmm2_state(2) per tile; the epilogue's wait advances it.  Also the P^T slot's
                                                                                                                                                                  WAR gate: P^T(t) -> sP[t % 2] is stored AFTER the wait on bmm2_done(t-2) taken at iteration t-1
-   11  mb_gate_full[1]      TMA_LOAD     warp 13, arrive(n_bytes=GATE_TX_BYTES, pred=elect_sync()); the gate box (1, 1 token, G heads, 64) x 4 subtiles
+   11  mb_gate_full[1]      TMA_LOAD     the TMA warp, arrive(n_bytes=GATE_TX_BYTES, pred=elect_sync()); the gate box (1, 1 token, G heads, 64) x 4 subtiles
                                          into the freed sQ[i % 2]; GATE_TX_BYTES = Q_BOX_ROWS x TILE_O x GATE_BPE = G x 512 B (the BOX)   [gated arm]
-                                                                                                        1 == 1       128 softmax lanes, epilogue(i)       0      gf_state(1), once per item
-   12  mb_gate_empty[1]     THREAD       bare arrive() from 128 lanes after the item's last gate LDS     [gated arm]   (256 at two column groups)
-                                                                                                        128 == 128   warp 13 before Q(i+2) into the slot 1      ge_state(1) pre-armed, per item: Q(1)'s wait is the pass, Q(j) waits
-                                                                                                                                                                 epilogue(j - 2); the exit path waits epilogue(n - 2) BEFORE gate(n - 1)
-                                                                                                                                                                 is issued (the wait Q(n) would have taken; the pass itself at n = 1),
-                                                                                                                                                                 then drains x STAGES_GATE = epilogue(n - 1).  Never 2 behind: completion i
-                                                                                                                                                                 needs gate(i), issued only after the wait that consumed i - 1 (Q(i + 1)'s
-                                                                                                                                                                 in the loop, the exit-path one for the last item)
+                                                                                                        1 == 1       all 256 softmax lanes (128), epilogue(i)
+                                                                                                                                                          0      gf_state(1): wait-then-arrive, advance(.., STAGES_GATE) once per item
+   12  mb_gate_empty[1]     THREAD       bare arrive() from all 256 softmax lanes after the item's last gate LDS (SOFTMAX_LANES; 128 at one group)   [gated arm]
+                                                                                                        256 == 256 (128 == 128)   the TMA warp before Q(i+2) into the slot
+                                                                                                                                                          1      ge_state(1): pre-armed, advance(.., STAGES_GATE) once per item: Q(1)'s wait is
+                                                                                                                                                                 the pass (Q(0) skips it), Q(j) waits epilogue(j - 2); the exit path waits
+                                                                                                                                                                 epilogue(n - 2) BEFORE gate(n - 1) is issued (the wait Q(n) would have taken;
+                                                                                                                                                                 the pass itself at n = 1), then drains x STAGES_GATE = epilogue(n - 1).  Never
+                                                                                                                                                                 2 behind: completion i needs gate(i), issued only after the wait that consumed
+                                                                                                                                                                 i - 1 (Q(i + 1)'s in the loop, the exit-path one for the last item)
    13  sched.mb_scheduler[2]  TMA_LOAD (CLC response form) | THREAD (persistent form)
                                          the scheduler warp's elected arrive_expect_tx(16) + the CLC response (CLC) / its elected arrive after the
                                          4 payload stores (persistent; no expect_tx at cga1)
                                                                                                         1 == 1       every consuming warp reads the payload      tile_dsl.scheduler
-   14  sched.mb_read_tile_id[2]  THREAD  read_tile_id_arrive(mb, cga_size=1) = one elected lane per calling warp; callers = 4 + 1 + 1 + 8 (8 + 1 + 1 + 8 = 18
-                                         at two column groups)
-                                                                                                        14 == 14     the scheduler before refilling the slot     tile_dsl.scheduler
-   15  mb_tmem_dealloc[1]   THREAD       bare arrive() from 128 softmax lanes at exit (256 at two groups)  128 == 128   MMA before tmem_dealloc               0      once
-   16  named barrier 1      bar          MMA warp barrier_cta_arrive (32) + EVERY softmax warp barrier_cta_sync, thread_count 32 x (SOFTMAX_WARPS + 1) = 160
-                                         (288 at two column groups)   the TMEM-base hand-off, once
-   17  named barrier 2 (+g) bar          column group g's 4 warps ONLY, id 2 + g (a runtime Int32 id at two groups), thread_count 128: the column-max
-                                         exchange per tile + the per-lane sum per item; the groups never wait on each other
-   18  barrier 0            bar          all THREADS_PER_CTA lanes once (512; 640 at two groups), after fence_mbarrier_init (the spare warp exits only after it)
+   14  sched.mb_read_tile_id[2]  THREAD  read_tile_id_arrive(mb, cga_size=1) = one elected lane per calling warp; callers = 8 softmax + 1 MMA + 1 TMA +
+                                         8 gather = 18 (4 + 1 + 1 + 8 = 14 at one group; READ_TILE_ARRIVERS, config-derived)
+                                                                                                        18 == 18 (14 == 14)   the scheduler before refilling the slot     tile_dsl.scheduler
+   15  mb_tmem_dealloc[1]   THREAD       bare arrive() from all 256 softmax lanes at exit (128 at one group)
+                                                                                                        256 == 256 (128 == 128)   MMA before tmem_dealloc    0      once
+   16  named barrier 1      bar          MMA warp barrier_cta_arrive (32) + EVERY softmax warp barrier_cta_sync, thread_count 32 x (SOFTMAX_WARPS + 1) = 288
+                                         (160 at one group)   the TMEM-base hand-off, once
+   17  named barrier 2 (+g) bar          column group g's 4 warps ONLY, id 2 + g (a runtime Int32 id; the lone group's id is the constant 2), thread_count
+                                         128: the column-max exchange per tile + the per-lane sum per item; the groups never wait on each other
+   18  barrier 0            bar          all THREADS_PER_CTA lanes once (640; 512 at one group), after fence_mbarrier_init (the spare warp exits only after it)
 
 Init: ``if warp_idx == 0: if nvvm.elect_sync():`` every stage of every ring (``.init()`` is per stage) + the two scheduler rings
 (ONE_LANE / READ_TILE_ARRIVERS); fence_mbarrier_init + barrier_cta_sync OUTSIDE the branch.  Phase discipline: every ring
 slot and parity above comes from a PipelineState CARRIED across work items in every role that touches it and advanced at
-every producer fire / consumer wait -- NEVER recomputed from a per-item tile index.  The decode tile's arithmetic parities
+every producer fire / consumer wait -- NEVER recomputed from a per-item tile index, and never a manual ``^ 1`` flip (rows 11 / 12
+included since 2026-10-09: the single-stage gate barriers' consumer parities are ``ge_state`` / ``gf_state``, advanced through
+``advance(state, CFG.STAGES_GATE)`` -- a second flip site is how P14 drifts).  The decode tile's arithmetic parities
 (``_kv_slot``, ``(t // 2) & 1``, ``((t // 2) - 1) & 1``) are correct only because that kernel is not persistent (fresh
 barriers per unit); in a persistent CTA they HANG at n_tiles = 1 with two items (s_empty), read a stale S^T slot at
 n_tiles = 3 (s_full) and read a stale K/V slot whenever 2 x n_tiles % 3 != 0.  Every item runs >= 1 tile, so the per-item
 rings (1-4, 11-14) advance exactly once per item and the per-tile rings (5-10) at least once; the epilogue runs for every item.
 Exit drains (every arrive has a reachable wait, and the waiter is never TWO completions behind a barrier: wait() returns when the
-parity differs from the waited one, so parity(k) == parity(k + 2) parks it forever -- a hang with correct numerics): warp 13 waits
+parity differs from the waited one, so parity(k) == parity(k + 2) parks it forever -- a hang with correct numerics): the TMA warp waits
 mb_ids_empty x STAGES_IDS and, ungated, mb_q_empty x STAGES_Q (pre-armed state); gated, every mb_q_empty commit is consumed by its
 item's gate load (nothing left) and mb_gate_empty is consumed in ORDER as well as in count -- n_items completions against n_items
 waits: n_items - 1 before Q(1 .. n_items - 1) (Q(1)'s the pre-armed pass, Q(j)'s = epilogue(j - 2)), the exit-path wait taken
@@ -175,7 +197,7 @@ arrived), the exit drain x STAGES_GATE (= epilogue(n_items - 1)); completion i n
 wait that consumed completion i - 1, so the consumer is never two behind (a drain of STAGES_GATE + 1 waits with no exit-path wait
 was right in count and wrong in order: epilogue(n_items - 1) could land before the first drain wait and alias its parity); every
 gather warp waits mb_kv_empty x STAGES_KV -- each with its carried state.  Gated arm, the slot's order: Q(i) -> MMA reads ->
-mb_q_empty(i) -> gate(i) -> mb_gate_full -> epilogue(i) reads -> mb_gate_empty -> Q(i + 2); warp 13 issues gate(i) AFTER
+mb_q_empty(i) -> gate(i) -> mb_gate_full -> epilogue(i) reads -> mb_gate_empty -> Q(i + 2); the TMA warp issues gate(i) AFTER
 queuing Q(i + 1) / ids(i + 1) (their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's
 LAST BMM1) and before its next credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
 
@@ -248,11 +270,12 @@ lane-only buffers last so no alignment padding is spent; 1024-B alignment modell
     name [stages]   bytes     WRITER, how                       READER, how                      lane stride  swizzle + WHY                                   start
     sQ[2]           16,384    TMA: Q(i+1) 4 subtiles of (G rows x 64), then gate(i) into the freed slot (same box orientation);
                               rows G..15 of BOTH slots zeroed by STS once per CTA + fence_proxy, never written again
-                                                                MMA descriptor (B of BMM1, K-major, SBO 8 x 128 B); the gate: 128 lanes, lane = d,
+                                                                MMA descriptor (B of BMM1, K-major, SBO 8 x 128 B); the gate: each column group's 128 lanes, lane = d,
                                                                 G x LDS.16 at load_swizzled offsets
                                                                                                  n/a / 2 B    SW128 -- a descriptor reads it AND the per-lane
                                                                                                               reads follow the same SW128 offsets             0 (1024-aligned slots)
-    sP[2]            8,192    128 softmax lanes, store_swizzled(16-B chunks, Swizzle(1, 4, 3)) at lane x 32 B
+    sP[2]            8,192    256 softmax lanes (128 at one column group): group g store_swizzled(ITS 16-B chunk of a lane row's 32 B, word offset 4 g,
+                              Swizzle(1, 4, 3)) -- the same bytes the one-group loop's chunk c = g writes
                                                                 MMA descriptor (B of BMM2, MN-major, 32-B atom, SBO 8 x 32 B)
                                                                                                  32 B         32-B atom Swizzle(1, 4, 3) -- BOTH jobs: the
                                                                                                               descriptor decodes it (P_SWZ_BYTES = N_Q x BPE)
@@ -263,7 +286,7 @@ lane-only buffers last so no alignment padding is spent; 1024-B alignment modell
                                                                 MN-major A of BMM2 (V^T: LBO 16 KiB between d atoms, SBO 1 KiB)
                                                                                                  n/a          SW128 -- both descriptors read it; the gather
                                                                                                               map writes under the same SW128                24,576; sKV[2] at 155,648 = 152 KiB
-    sIds[2]          4,224    warp 13, ONE cp.async.bulk of IDS_TX_BYTES from block_ids[item_row]; no STS (slot = IDS_TX_BYTES + 64 B reserve, unread)
+    sIds[2]          4,224    the TMA warp, ONE cp.async.bulk of IDS_TX_BYTES from block_ids[item_row]; no STS (slot = IDS_TX_BYTES + 64 B reserve, unread)
                                                                 gather warps: ONE uniform LDS.128 of blocks 32 i + 4 w .. + 3; softmax lanes: LDS.32 of
                                                                 block 32 i + lane // 4 (4 adjacent lanes share a word); both clamped into the slot
                                                                                                  4 B          none -- no descriptor reads it and 32 lanes x 4 B
@@ -747,7 +770,8 @@ def _decode_item(t0, t1, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv):
     return tok, head, batch, item_row, kv_row_base, eff_seqlen_q, out_tok, out_batch, split
 
 
-# === TMA-LDG warp (13): Q^T and the block list of the NEXT item, one item ahead; the gate of the CURRENT item (gated arm) ====
+# === TMA-LDG warp (CFG.TMALDG_WARP_ID: 17 at two softmax column groups, 13 at one): Q^T and the block list of the NEXT item, one item
+# === ahead; the gate of the CURRENT item (gated arm) =======================================================================
 
 
 @cute.jit
@@ -953,7 +977,7 @@ def _tmaldg_warp_group(
             qe_state = advance(qe_state, STAGES_Q)
 
 
-# === GATHER warps (4-11): the K/V ring, block by block ===================================================================
+# === GATHER warps (CFG.GATHER_WARP_BASE .. + 7: 8-15 at two softmax column groups, 4-11 at one): the K/V ring, block by block =====
 
 
 @cute.jit
@@ -1178,7 +1202,7 @@ def _gather_warp_group(
         kv_state = advance(kv_state, STAGES_KV)
 
 
-# === MMA warp (12) ========================================================================================================
+# === MMA warp (CFG.MMA_WARP_ID: 16 at two softmax column groups, 12 at one) ================================================
 
 
 @cute.jit
@@ -1936,7 +1960,7 @@ def _kernel(
             scheduler_warp_loop_persistent(sched, SCHEDULER_STAGES, is_cga_first_cta, seq_kv_lens_tensor, THD_CTR_OFF(n_batch), THD_LIVE_OFF(n_batch), 1, 1)
         else:
             scheduler_warp_loop(sched, SCHEDULER_STAGES, is_cga_first_cta, 1)
-    # else: the spare warp (15) exits.
+    # else: the spare warp (CFG.SPARE_WARP_ID: 19 at two softmax column groups, 15 at one) exits.
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
