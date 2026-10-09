@@ -304,6 +304,7 @@ from typing import NamedTuple, Optional, Tuple, Union
 import torch
 from cuda.bindings import driver as cuda
 
+from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
@@ -1782,9 +1783,14 @@ class QuantSpec:
     Passing a ``QuantSpec`` (and FP8 ``h`` / weights) selects the FP8 pipeline;
     ``None`` is the bf16/f16 block.  All scales are Python floats fixed at plan
     time -- calibrated offline, like the weights' own scales -- so the execute
-    path does NO amax pass and NO host readback; the block materialises them as
-    1-element fp32 device tensors ONCE in ``compile()`` (the SDPA adapter does
-    the same for its identity descales).
+    path does NO amax pass and NO host readback; the block allocates them as
+    1-element fp32 device tensors ONCE in ``compile()`` and writes their values on
+    the launch stream at its first ``execute`` (the SDPA adapter materialises its
+    identity descales at compile time), and
+    :meth:`GatedAttentionBlockFwd.update_quant_scales` rewrites those tensors IN
+    PLACE on the launch stream for a per-step recalibration -- no recompile, no
+    new plan: the TE-style caller contract (quantize ``h`` / the weights each
+    step, recalibrate the activation scales from the previous step's record).
 
     Conventions (``x_real = x_fp8 * descale``; ``x_fp8 = sat_e4m3(x_real * scale)``):
 
@@ -2768,6 +2774,8 @@ class _FusedQkvProjection(_Stage):
         self.device = device
         self._plan = None
         self._qscal = None
+        self._qscal_written = False
+        self._qscal_ready = None  # the allocation stream's event, recorded in compile(); every write waits on it
 
     @property
     def fp8(self) -> bool:
@@ -2981,11 +2989,19 @@ class _FusedQkvProjection(_Stage):
         # artifact for a norm-OFF geometry.
         self._plan = build_fused_proj_gemm(self.params())
         if self.fp8:
-            # Plan-time constant (contract § 10): the fork reads these four once
-            # per epilogue warp; the execute path never allocates or converts.
-            q = self.quant
+            # The fork reads these four once per epilogue warp from a device vector the execute path never allocates or converts.
+            # ALLOCATED here and written on a launch stream only (write_qscal: the block's first execute or update_quant_scales, or
+            # this stage's own first execute_fp8): a fill enqueued on the stream ambient at compile() would have no ordering against
+            # a later cross-stream recalibration -- pending work ahead of it could let it land after the update and restore the
+            # declared scales.
             dev = self.device if self.device is not None else torch.device("cuda")
-            self._qscal = torch.tensor([q.alpha_qkvg, q.scale_q, q.scale_k, q.scale_v], dtype=torch.float32, device=dev)
+            self._qscal = torch.empty(4, dtype=torch.float32, device=dev)
+            self._qscal_written = False
+            # The allocation is not free of stream work either: under torch.use_deterministic_algorithms(True) (with
+            # fill_uninitialized_memory, the default) torch.empty enqueues a NaN fill on the ambient stream.  Record it, so every
+            # writer orders itself behind whatever the allocation enqueued (write_qscal waits on this event).
+            self._qscal_ready = torch.cuda.Event()
+            self._qscal_ready.record(torch.cuda.current_stream(dev))
 
     def workspace_bytes(self) -> int:
         """None: no split-K, no scratch -- the kernel writes the slab directly."""
@@ -3021,7 +3037,9 @@ class _FusedQkvProjection(_Stage):
         ``a`` is the e4m3 ``[M, K]`` view of ``h`` (the runner binds it rank-3
         ``[1, M, K]`` exactly as the bf16 runner does), ``w`` the e4m3
         ``[N_qkvg, K]`` checkpoint-layout weight; ``qscal`` is the fp32 ``[4]``
-        ``[alpha_qkvg, scale_q, scale_k, scale_v]`` materialised in :meth:`compile`.
+        ``[alpha_qkvg, scale_q, scale_k, scale_v]`` allocated in :meth:`compile` and
+        written on the launch stream (:meth:`write_qscal`; the stage's own first
+        use writes the declared spec's values when nobody wrote them before).
         """
         from .kernels.proj_gemm import run_fused_proj_gemm_fp8
 
@@ -3033,7 +3051,27 @@ class _FusedQkvProjection(_Stage):
         if not self._runner_writes_compact_qkv():
             # Never hand the round-1 slab runner three compact buffers positionally.
             raise NotImplementedError(f"{self.name}: {self._fp8_fork_available()}")
+        if not self._qscal_written:
+            self.write_qscal(self.quant, stream)  # a standalone first use: the declared values, on this launch stream
         run_fused_proj_gemm_fp8(self._plan, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, self._qscal, stream=stream)
+
+    def write_qscal(self, spec, stream) -> None:
+        """Write ``spec``'s ``[alpha_qkvg, scale_q, scale_k, scale_v]`` into the fork's fp32 vector IN PLACE on ``stream`` (a raw
+        CUstream handle: the launch stream, so the next execute on it is ordered behind the write) and make ``spec`` the stage's spec.
+        The ONLY writer of that vector -- :meth:`compile` allocates it and never fills it -- so no compile-time write can land after a
+        later cross-stream recalibration and restore the declared scales; the write first waits on the allocation stream's event
+        (:meth:`compile` records it), so even a deterministic-mode fill of the allocation lands before it.  Inside a stream capture
+        the wait is skipped (an external event cannot be waited on there): warm the block up before capturing."""
+        if self._qscal is None:
+            raise RuntimeError("call compile() before write_qscal()")
+        ts = as_torch_stream(stream, self._qscal.device)
+        with torch.cuda.stream(ts):
+            if self._qscal_ready is not None and not torch.cuda.is_current_stream_capturing():
+                ts.wait_event(self._qscal_ready)  # the allocation's own stream work (a deterministic-mode fill) lands first
+            for i, v in enumerate((spec.alpha_qkvg, spec.scale_q, spec.scale_k, spec.scale_v)):
+                self._qscal[i : i + 1].fill_(float(v))
+        self.quant = spec
+        self._qscal_written = True
 
     def execute_mxfp8(
         self, a, sf_a, w, sf_w, out_q8, out_k8, out_v8, out_gate16, out_sf_q, out_sf_k, out_sf_v, w_q_norm, w_k_norm, cos, sin, *, stream
@@ -4502,7 +4540,15 @@ class GatedAttentionBlockFwd(APIBase):
         self.mxfp8_fused = mxfp8 and self.fuse_gate and self.fuse_norm_rope
         self.quant_fused = self.fp8_fused or self.mxfp8_fused
         act = self.act_dtype
-        self._quant_dev = None  # the QuantSpec / MxQuantSpec as device scalars, materialised in compile()
+        self._quant_dev = None  # the QuantSpec / MxQuantSpec as device scalars: ALLOCATED in compile(), written on a launch stream
+        # compile() only allocates those scalars and enqueues nothing on the stream ambient then; the FIRST execute writes their
+        # VALUES on its own launch stream (_write_quant_dev), as does every update_quant_scales() on the caller's.  A compile-time
+        # fill would have no ordering against a cross-stream recalibration: pending work ahead of it on the compile stream would let
+        # it land AFTER the update and silently restore the declared scales for every later execute.  Reset at compile().
+        self._quant_dev_on_launch_stream = False
+        # The allocation itself is stream work under torch.use_deterministic_algorithms(True) (torch.empty enqueues a NaN fill on
+        # the ambient stream): compile() records an event behind it and every writer waits on that event first.
+        self._quant_dev_ready = None
         # rstd exists only where a norm exists: under qk_norm=False a training
         # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
         # are None -- required, both directions, at execute).
@@ -4980,42 +5026,136 @@ class GatedAttentionBlockFwd(APIBase):
             st.compile()
         self._ws = self._layout()
         self._quant_dev = self._make_quant_dev()
+        self._quant_dev_on_launch_stream = False
+        self._quant_dev_ready = None
+        if self._quant_dev:
+            # whatever the allocations above (and the fused fork's, in its stage compile) enqueued on the ambient stream -- under
+            # deterministic mode a NaN fill -- is behind this event; _write_quant_dev waits on it before writing on any stream
+            self._quant_dev_ready = torch.cuda.Event()
+            self._quant_dev_ready.record(torch.cuda.current_stream(self.device))
 
-    def _make_quant_dev(self) -> Optional[dict]:
-        """The quant spec's scalars as 1-element fp32 device tensors (plan-time constants, contract § 10;
-        the execute path never allocates).  ``None`` for bf16; ``{}`` under ``o_fp4`` -- neither ``alpha_o``
-        nor ``scale_o`` exists there (both pinned 1.0: the fp4 out_proj has no alpha epilogue and the fp4
-        quantizer takes no scale)."""
+    def _quant_dev_values(self, spec: Optional[Union[QuantSpec, MxQuantSpec]]) -> Optional[dict]:
+        """The per-tensor scalars of ``spec`` the block holds as 1-element fp32 device tensors, as ``{name: float}`` -- the ONE
+        spelling ``compile()`` materialises (:meth:`_make_quant_dev`) and :meth:`update_quant_scales` rewrites in place.  ``None``
+        for bf16; ``{}`` under ``o_fp4`` -- neither ``alpha_o`` nor ``scale_o`` exists there (both pinned 1.0: the fp4 out_proj has
+        no alpha epilogue and the fp4 quantizer takes no scale); under MXFP8 only the out projection's per-tensor pair survives
+        (D1) -- ``alpha_o`` for the GEMM epilogue, ``scale_o`` for the unfused quantize_o; under per-tensor FP8 the two GEMM alphas,
+        the four quantize scales and the fp8 SDPA's three descales."""
+        if spec is None:
+            return None
         if self.o_fp4 is not None:
             return {}
         if self.mxfp8:
-            # MXFP8: only the out projection's per-tensor pair survives (D1) --
-            # `alpha_o` for the GEMM epilogue, `scale_o` for the unfused quantize_o.
-            q = self.quant
-            return dict(
-                alpha_o=torch.full((1,), float(q.alpha_o), dtype=torch.float32, device=self.device),
-                scale_o=torch.full((1,), float(q.scale_o), dtype=torch.float32, device=self.device),
-            )
-        if self.quant is not None:
-            # Plan-time constants (contract § 10 allows compile-time buffers; the
-            # execute path never allocates): one fp32 device scalar per scale.
-            q = self.quant
+            return dict(alpha_o=float(spec.alpha_o), scale_o=float(spec.scale_o))
+        return dict(
+            alpha_qkvg=float(spec.alpha_qkvg),
+            alpha_o=float(spec.alpha_o),
+            scale_q=float(spec.scale_q),
+            scale_k=float(spec.scale_k),
+            scale_v=float(spec.scale_v),
+            scale_o=float(spec.scale_o),
+            descale_q=1.0 / float(spec.scale_q),
+            descale_k=1.0 / float(spec.scale_k),
+            descale_v=1.0 / float(spec.scale_v),
+        )
 
-            def _dev(v: float) -> torch.Tensor:
-                return torch.full((1,), float(v), dtype=torch.float32, device=self.device)
+    def _make_quant_dev(self) -> Optional[dict]:
+        """The quant spec's scalars as 1-element fp32 device tensors (plan-time constants; the execute path never allocates):
+        one ``torch.empty`` per name of :meth:`_quant_dev_values` -- ALLOCATED here, never filled here.  Their VALUES are written
+        on a launch stream only: by the FIRST ``execute`` on ITS launch stream (:meth:`_write_quant_dev`) and by every
+        :meth:`update_quant_scales` on the caller's.  A fill enqueued on the stream ambient at ``compile()`` would have no ordering
+        against a recalibration on another stream: pending work ahead of it would let it land after the update and restore the
+        declared values while ``self.quant`` already named the new spec.  The allocation is not free of stream work either
+        (``torch.use_deterministic_algorithms(True)`` makes ``torch.empty`` fill with NaN), which is why ``compile()`` records an
+        event behind it that every writer waits on."""
+        vals = self._quant_dev_values(self.quant)
+        if vals is None:
+            return None
+        return {name: torch.empty((1,), dtype=torch.float32, device=self.device) for name in vals}
 
-            return dict(
-                alpha_qkvg=_dev(q.alpha_qkvg),
-                alpha_o=_dev(q.alpha_o),
-                scale_q=_dev(q.scale_q),
-                scale_k=_dev(q.scale_k),
-                scale_v=_dev(q.scale_v),
-                scale_o=_dev(q.scale_o),
-                descale_q=_dev(1.0 / q.scale_q),
-                descale_k=_dev(1.0 / q.scale_k),
-                descale_v=_dev(1.0 / q.scale_v),
+    def _check_quant_update(self, spec) -> None:
+        """The typed refusals of :meth:`update_quant_scales`, every one BEFORE any write: a block declared without ``quant``
+        (``ValueError``); a spec of the other class (``TypeError``: the two classes select different pipelines); a differing plan
+        fact -- ``dtype``, and under MXFP8 ``block_size`` / ``w_qkvg_dtype`` / ``o_fp4`` -- (``ValueError`` naming the field: those
+        select kernels and the workspace carve, only the scales may move); ``spec``'s own ``validate`` EXACTLY as the declaration
+        applied it (``MxQuantSpec.validate(fused=...)`` -- the fully fused MXFP8 path pins ``scale_o == 1.0`` --, the bare
+        ``QuantSpec.validate()``: a zero / inf / NaN scale is refused there); a block not yet compiled (``RuntimeError``)."""
+        if self.quant is None:
+            raise ValueError(
+                "update_quant_scales() belongs to a quantized block (quant=QuantSpec / MxQuantSpec): this block was declared without quant and "
+                "holds no per-tensor scale to update"
             )
-        return None
+        if type(spec) is not type(self.quant):
+            raise TypeError(
+                f"update_quant_scales(): spec must be a {type(self.quant).__name__}, the class this block was declared with (QuantSpec and "
+                f"MxQuantSpec select different pipelines), got {type(spec).__name__}"
+            )
+        for name in ("dtype", "block_size", "w_qkvg_dtype", "o_fp4") if self.mxfp8 else ("dtype",):
+            if getattr(spec, name) != getattr(self.quant, name):
+                raise ValueError(
+                    f"update_quant_scales(): {type(spec).__name__}.{name} is a plan fact (it selects kernels and the workspace carve): declared "
+                    f"{getattr(self.quant, name)!r}, got {getattr(spec, name)!r}; only the scales may change -- declare a new block for a new {name}"
+                )
+        if self.mxfp8:
+            spec.validate(fused=bool(self.fuse_gate) and bool(self.fuse_norm_rope))
+        else:
+            spec.validate()
+        if self._ws is None:
+            raise RuntimeError("call compile() before update_quant_scales(): the device scalars it rewrites are materialised there")
+
+    def _write_quant_dev(self, spec, stream: int) -> None:
+        """Write ``spec``'s scalars into the device tensors of :meth:`_make_quant_dev` -- and, on the fully fused fp8 pipeline, into
+        the projection fork's fp32 ``[alpha_qkvg, scale_q, scale_k, scale_v]`` vector (:meth:`_FusedQkvProjection.write_qscal`) -- IN PLACE on ``stream`` (a raw CUstream
+        handle: the launch stream, so the next execute on it is ordered behind the writes by construction, Rule 5).  One fill
+        per value: nothing allocated, nothing read back, no recompile.  Nothing to write under ``o_fp4`` (``{}``).  The write
+        first waits on the event ``compile()`` recorded behind its allocations, so stream work the allocation itself enqueued (under
+        ``torch.use_deterministic_algorithms(True)`` ``torch.empty`` fills the tensors with NaN) lands before any value written on
+        another stream.  Inside a stream capture the wait is skipped (an external event cannot be waited on there) -- the documented
+        case: warm the block up before capturing."""
+        qd = self._quant_dev
+        if not qd:
+            return
+        vals = self._quant_dev_values(spec)
+        ts = as_torch_stream(stream, self.device)
+        with torch.cuda.stream(ts):
+            if self._quant_dev_ready is not None and not torch.cuda.is_current_stream_capturing():
+                ts.wait_event(self._quant_dev_ready)
+            for name, ten in qd.items():
+                ten.fill_(vals[name])
+        if self.fp8_fused:
+            # the fused fork's epilogue reads the four from the stage's own vector (allocated at its compile(), written only on a
+            # launch stream); the stage's spec follows, so a later recompile declares the same values
+            self._proj.write_qscal(spec, stream)
+
+    def update_quant_scales(self, spec: Union[QuantSpec, MxQuantSpec], *, current_stream: Optional[cuda.CUstream] = None) -> None:
+        """Re-point a COMPILED quantized block's per-tensor scales at ``spec`` without recompiling: an in-place write of the
+        device scalars of :meth:`_make_quant_dev` (``alpha_qkvg`` / ``alpha_o`` / ``scale_q`` / ``scale_k`` / ``scale_v`` /
+        ``scale_o`` / ``descale_q`` / ``descale_k`` / ``descale_v`` under a ``QuantSpec``; ``alpha_o`` / ``scale_o`` under an
+        ``MxQuantSpec``; and the fused fp8 fork's ``[alpha_qkvg, scale_q, scale_k, scale_v]`` vector where it exists) on the
+        launch stream -- ``current_stream`` (a raw ``CUstream``), else torch's current stream on the block's device (Rule 5) --
+        then ``self.quant = spec``.  Every consumer binds those tensors at ``execute``, so the next execute on that stream runs
+        at the new scales, and a CUDA graph that captured an execute of a WARMED-UP block replays with the LIVE values (the
+        scalars are read, never baked into the graph) -- unless the captured execute was the block's FIRST: its one-time scalar
+        write (:meth:`_write_quant_dev`, one fill kernel per value) is captured WITH the capture-time values, so every replay
+        re-writes them and overrides a later eager ``update_quant_scales``.  Run one eager execute on the capture stream before
+        capturing (every capture of the block does), or treat a graph that captured the first execute as pinned to the scales
+        it captured and re-capture after a recalibration.
+        No allocation, no host readback, no new plan: the training-loop recipe is one call per layer
+        right before its forward (``descale_h`` / ``descale_w_*`` from the tensors quantized this step, the activation scales
+        from the previous step's record), and the same ``spec`` handed to ``GatedAttentionBlockBwd.update_quant_scales`` so the
+        backward rebuilds the SDPA operands at the forward's scales.
+
+        Typed refusals, every one BEFORE any write (:meth:`_check_quant_update`): a block declared without ``quant``
+        (``ValueError``); a spec of the other class (``TypeError``); a differing plan fact -- ``dtype``, ``block_size``,
+        ``w_qkvg_dtype``, ``o_fp4`` -- (``ValueError`` naming the field: those select kernels and the carve); ``spec``'s own
+        ``validate`` exactly as the declaration applied it (the fully fused MXFP8 path keeps its ``scale_o == 1.0`` rule; a zero
+        / inf / NaN scale is its own ``ValueError``); a block not yet compiled (``RuntimeError``).  Under ``o_fp4``
+        there is nothing to write (both per-tensor scales are pinned 1.0): the call validates and records ``spec``.
+        """
+        self._check_quant_update(spec)
+        stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(self.device).cuda_stream
+        self._write_quant_dev(spec, stream)
+        self.quant = spec
 
     # -- the training record --------------------------------------------------
 
@@ -5352,6 +5492,15 @@ class GatedAttentionBlockFwd(APIBase):
         req = self.get_workspace_size()
         if workspace.numel() < req:
             raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
+        if self._quant_dev and not self._quant_dev_on_launch_stream:
+            # The FIRST execute writes the per-tensor scalars' VALUES on ITS launch stream: compile() only ALLOCATED them (a fill
+            # enqueued on the stream ambient at compile time would have no ordering against this stream, nor against a later
+            # cross-stream update_quant_scales(), which pending work on that stream could let it undo).  Once per compile(); a later
+            # update_quant_scales() writes on the caller's stream itself.  Nothing under o_fp4 ({}), nothing for bf16 (None).  A stream capture of this first
+            # execute records these fills WITH their values, so its replays re-write them: warm up before capturing
+            # (update_quant_scales's docstring).
+            self._write_quant_dev(self.quant, stream)
+            self._quant_dev_on_launch_stream = True
 
         fp8 = self.quant is not None
         mxfp8 = self.mxfp8

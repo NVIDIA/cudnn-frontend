@@ -381,6 +381,36 @@ Quantization specs:
   zero-length) row quantizes to codes `0` exactly. The `O` codes are round-to-nearest-even on the e2m1 grid,
   saturating at 6.
 
+**Per-step recalibration -- `update_quant_scales`.** The scales of a `QuantSpec` / `MxQuantSpec` are plan-time constants, and a
+training step moves them: the weights change, so `descale_w_qkvg` / `descale_w_o` (and `descale_h`, the normed residual stream's)
+are recomputed from the tensors quantized this step, and a per-tensor fp8 recipe recalibrates `scale_q` / `scale_k` / `scale_v` /
+`scale_o` from a previous step's activation amax -- the block itself runs no amax pass, the caller computes them from the record it
+already holds. `GatedAttentionBlockFwd.update_quant_scales(spec, *, current_stream=None)` re-points a COMPILED block at a new spec
+without recompiling: an in-place write of the block's device scalars (the GEMM alphas, the quantize scales, the fp8 SDPA's descales,
+and the fully fused fp8 fork's scale vector) on the launch stream (`current_stream`, else torch's current stream), then
+`blk.quant = spec`; every consumer binds those tensors at `execute`, so the next execute on that stream runs at the new scales, and a
+CUDA graph that captured an execute of a warmed-up block replays with the live values -- unless the captured execute was the block's
+first: its one-time scalar write (one fill kernel per value; the first-execute write below) is captured with the capture-time values,
+so every replay re-writes them and overrides a later eager `update_quant_scales`; warm up with one eager execute on the capture stream
+before capturing (as every capture of the block does), or treat such a graph as pinned to the scales it captured and re-capture after
+a recalibration. `GatedAttentionBlockBwd.update_quant_scales(spec)` is the
+backward half: the plan-time constants the next execute's prologue launch stores from its kernel arguments are re-resolved on the
+host (no device write; a CUDA graph captured before the call keeps the old constants -- re-capture after a recalibration). Typed
+refusals, before any write: a block declared without `quant` (`ValueError`), a spec of the other class (`TypeError`), a differing
+plan fact -- `dtype`, `block_size`, `w_qkvg_dtype`, `o_fp4` -- (`ValueError` naming it: those select kernels and the carve), the
+spec class's own `validate` exactly as the declaration applied it (the fully fused MXFP8 path keeps `scale_o == 1.0`; a zero / inf /
+NaN scale is its `ValueError`), and a block not yet compiled (`RuntimeError`); under `o_fp4` there is nothing to write and the call
+validates and records it. The per-layer recipe of a training loop: one compiled block pair per dtype configuration,
+`fwd.update_quant_scales(spec_l)` right before layer `l`'s forward and `bwd.update_quant_scales(spec_l)` right before its backward
+(autograd runs the backward long after every layer's forward, so the step's spec travels with the layer), `spec_l`'s `descale_*`
+from the tensors quantized this step and its activation scales from the previous step's record of that layer. `compile()` only
+allocates those scalars; their values are written on the launch stream -- by the first `execute` of a compiled block and by every
+`update_quant_scales` -- never on the stream ambient at compile time, and every such write first waits on an event `compile()`
+records behind its allocations (under `torch.use_deterministic_algorithms(True)` an allocation itself fills with NaN on that
+stream), so a block compiled on one stream and recalibrated or first executed on another reads what its execution stream wrote,
+and nothing enqueued at compile time can land later and undo an update. Inside a CUDA-graph capture that wait is skipped: warm the
+block up with one eager execute before capturing (the rule below).
+
 #### Packed sequences (THD)
 
 `thd=True` runs the block over ONE packed token matrix holding `B` sequences back to back -- the layout a varlen caller
@@ -456,7 +486,7 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
 need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32,
 fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, num_sequences=None, max_seq_len=None, cu_seqlens=False,
-quant=None, grad_scaling="current")` is the
+quant=None, grad_scaling="current", grad_scale_margin_log2=0)` is the
 block backward: eight stages on ONE launch stream (the two
 weight-gradient GEMMs on a block-owned side stream under `fuse_wgrad_overlap`, joined back before `execute` returns), no
 allocation, against the forward's
@@ -479,14 +509,15 @@ bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg
 
 `gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
 recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, max_seq_len=None, quant=None,
-grad_scaling="current", scale_dp=None, scale_dy=None, scale_do=None, scale_dqkvg=None)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+grad_scaling="current", scale_dp=None, scale_dy=None, scale_do=None, scale_dqkvg=None, h_t=None, h_t_sf=None, w_qkvg_t=None,
+w_qkvg_t_sf=None, w_o_t=None, w_o_t_sf=None, grad_scale_margin_log2=0)` allocates the gradients and the workspace on the launch stream (`current_stream`,
 else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
 caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
 `saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached). Under `thd=True` it
 derives `num_sequences` and `cu_seqlens` from the record (`saved.seq_lens.numel()`, `saved.seq_lens_form`) and requires
 `max_seq_len` (a `ValueError` naming it alone otherwise); both, with `max_seq_len`, are part of its cache key. `quant` /
-`grad_scaling` (the quantized backward below) join the key too, and `scale_dp` / `scale_dy` / `scale_do` / `scale_dqkvg` pass
-through to `execute`; the gradients are allocated in `dy`'s dtype (bf16 under `quant`, where `saved.h` and the weights are e4m3 codes).
+`grad_scaling` (the quantized backward below) join the key too, and `scale_dp` / `scale_dy` / `scale_do` / `scale_dqkvg` and the
+transposed artifacts `h_t` / `h_t_sf` / `w_qkvg_t` / `w_qkvg_t_sf` / `w_o_t` / `w_o_t_sf` pass through to `execute`; the gradients are allocated in `dy`'s dtype (bf16 under `quant`, where `saved.h` and the weights are e4m3 codes).
 
 **Packed sequences (THD).** `GatedAttentionBlockBwd(..., thd=True, num_sequences=B, max_seq_len=S_max, cu_seqlens=False)` --
 the forward's four knobs, appended last -- differentiates the packed training record of the section above: `dy` is
@@ -602,7 +633,11 @@ setup is one launch; +3 when `S % 128 != 0`, the q-side staging pads, and +2 whe
 padded causal S such as 992 or 1000, 17 at S = 384; 17 before the SDPA backward merged its setup and fold launches, 24 before
 the launch fusion), counted by CUPTI in the quantized backward's own suite. Gradient scales (`grad_scaling`, a declaration attribute -- it moves
 the e4m3 rounding points, so it is never a knob): `"current"` derives every gradient's per-tensor scale ON DEVICE from its own
-amax pass in this step (`2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`, with `FP8_GRAD_SCALE_MARGIN_LOG2 = 0`);
+amax pass in this step (`2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`, with `FP8_GRAD_SCALE_MARGIN_LOG2 = 0`); the margin
+is the appended declaration attribute `grad_scale_margin_log2` (an int in `[0, 8]`, the module constant by default): a compile-time
+constant of EVERY gradient quantize -- `dY`, `dO`, `dQKVG` here, `dY` alone under `MxQuantSpec` -- so a non-default value is a
+different compiled block (never a knob, never a scalar slot), refused without `quant` and under `"delayed"` (the caller's scales
+carry their own headroom there); `quant_scalars()` publishes the scales that ran;
 `"delayed"` reads the previous step's `scale_dy` / `scale_do` / `scale_dqkvg` from `execute(...)` instead (each a 1-element fp32
 CUDA tensor, required there and refused under `"current"`) while the amax passes still publish this step's amax. The softmax
 scale `scale_s = 2**FP8_SCALE_S_LOG2` (`= 2**8`) is a module constant; `scale_dp` -- the fp8 SDPA backward's dP scale, cuDNN's
