@@ -145,12 +145,16 @@ _TABLE = [
     ((32, 1024, 4, "both", False), (64, 1, 8, 2, 3), "the 64-wide rings (one-batch-entry or pair)", 9.1, "replay"),
     ((32, 2048, 4, "bias", False), (128, 1, 0, 2, 2), "one-batch-entry ring, 2 stages", 2.0, "replay"),
     ((32, 2048, 4, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths (TILE_N 64 -19 %)", 0.0, "replay"),
-    # ---- D = 32, the ragged leg (S not a tile multiple: the kernel's padding-mask arm with synthesized lengths) ----
-    ((32, 200, 1, "plain", False), (64, 1, 0, 0, 0), "plain / TILE_N 64", 50.8, "CUPTI"),
-    ((32, 217, 1, "plain", False), (64, 1, 0, 0, 0), "plain / TILE_N 64", 51.8, "CUPTI"),
-    ((32, 300, 1, "plain", False), (64, 1, 0, 0, 0), "plain / TILE_N 64", 48.4, "replay"),
-    ((32, 450, 1, "plain", False), (64, 1, 0, 0, 0), "plain / TILE_N 64", 16.4, "replay"),
-    ((32, 600, 1, "plain", False), (64, 1, 0, 0, 0), "plain / TILE_N 64", 3.6, "replay"),
+    # ---- D = 32, the ragged leg (S not a tile multiple: the kernel's padding-mask arm with synthesized lengths).  With the pre-masked
+    # tail (padded_tail_form 1, the 128-wide default) the 128-wide tile wins wherever the tail holds MORE than 64 columns (S % 128 > 64):
+    # +39.2 / +39.2 / +29.5 / +17.1 % over the legacy 128-wide body at S 200 / 217 / 450 / 600 and +1.8 / +3.9 / +11.5 / +13.7 % over
+    # the half tile (212-SM cc 10.7 perf node, 2376 MHz lock, same-process graph replay); the half tile keeps S 300 (S % 128 = 44: it
+    # skips 64 dead columns, +4.2 % over the 128-wide pre-masked tail, +42.7 % over the legacy 128-wide body) ----
+    ((32, 200, 1, "plain", False), (128, 1, 0, 0, 0), "plain / TILE_N 128 + the pre-masked tail (the half tile +1.8 % behind)", 39.2, "replay"),
+    ((32, 217, 1, "plain", False), (128, 1, 0, 0, 0), "plain / TILE_N 128 + the pre-masked tail (the half tile +3.9 % behind)", 39.2, "replay"),
+    ((32, 300, 1, "plain", False), (64, 1, 0, 0, 0), "plain / TILE_N 64 (the 128-wide pre-masked tail +4.2 % behind)", 42.7, "replay"),
+    ((32, 450, 1, "plain", False), (128, 1, 0, 0, 0), "plain / TILE_N 128 + the pre-masked tail (the half tile +11.5 % behind)", 29.5, "replay"),
+    ((32, 600, 1, "plain", False), (128, 1, 0, 0, 0), "plain / TILE_N 128 + the pre-masked tail (the half tile +13.7 % behind)", 17.1, "replay"),
     ((32, 217, 1, "mask", False), (128, 1, 0, 0, 0), "mask (TILE_N 64 a wash / -10 % at 450)", 0.0, "CUPTI"),
     ((32, 450, 1, "mask", False), (128, 1, 0, 0, 0), "mask", 0.0, "replay"),
     ((32, 200, 1, "bias", False), (64, 1, 2, 1, 0), "pair / TILE_N 64 (n4 +2 % over n2, inside the floor)", 33.5, "CUPTI"),
@@ -372,7 +376,13 @@ def test_width_pick_is_one_arithmetic_for_the_heuristics_and_the_row():
     assert (
         T(32, 256, has_bias=True, has_kv_mask=False) == 128
     ), "two kv tiles on the 32-wide tile: the one-batch-entry streamed ring at 128 is the measured best"
-    assert T(32, 600, has_bias=False, has_kv_mask=False) == 64 and T(64, 200, has_bias=False, has_kv_mask=False) == 64
+    # the padded plain body: the half tile where S_kv ends in the FIRST half of a 128-wide tile (it skips 64 dead columns: d32 S 300 +4.2 /
+    # +6.2 % at B 1 / 4), the 128-wide tile with the pre-masked tail where the tail holds more than 64 columns (d32 S 200 / 217 / 450 / 600
+    # +1.8 / +3.9 / +11.5 / +13.7 %, d64 S 200 / 600 +7.1 / +20 % over the half tile; 212-SM cc 10.7 perf node, 2376 MHz lock)
+    assert T(32, 300, has_bias=False, has_kv_mask=False) == 64 and T(64, 300, has_bias=False, has_kv_mask=False) == 64
+    assert T(32, 600, has_bias=False, has_kv_mask=False) == 128 and T(64, 200, has_bias=False, has_kv_mask=False) == 128
+    assert T(32, 217, has_bias=False, has_kv_mask=False) == 128 and T(32, 450, has_bias=False, has_kv_mask=False) == 128
+    assert T(32, 320, has_bias=False, has_kv_mask=False) == 64 and T(32, 321, has_bias=False, has_kv_mask=False) == 128, "the half-tile edge"
     # a request is returned as made (honoured or declined downstream, never degraded); a flavor without the narrow width keeps 128
     assert T(32, 512, has_bias=True, has_kv_mask=True, request=128) == 128 and T(128, 512, has_bias=True, has_kv_mask=True) == 128
     assert T(32, 512, has_bias=False, has_kv_mask=False, domain=frozenset({128})) == 128

@@ -69,6 +69,7 @@ def test_tile_n_and_kv_mask_form_constants_are_shared_by_row_adapter_and_factory
     ring halves in bytes) -- the budgets every row / adapter gate asks at TILE_N 128 are therefore conservative at 64."""
     import cudnn
     from cudnn.sdpa.fwd import config_sm107 as c
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     caps = _caps()
     assert caps.tile_ns_by_d_shape == c.SM107_TILE_NS_BY_D_SHAPE == (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
@@ -894,15 +895,21 @@ def test_padded_tail_form_pick_is_one_arithmetic_with_the_factory():
     from cudnn.sdpa.fwd.config_sm107 import (
         PADDED_TAIL_FORMS,
         SM107_PADDED_TAIL_FORM_DEFAULT,
+        SM107_PADDED_TAIL_FORM_DEFAULT_NARROW,
         make_cfg_d32,
         make_cfg_d64,
         make_cfg_d128,
         sm107_padded_tail_form_pick,
     )
 
-    assert SM107_PADDED_TAIL_FORM_DEFAULT in PADDED_TAIL_FORMS
+    assert SM107_PADDED_TAIL_FORM_DEFAULT in PADDED_TAIL_FORMS and SM107_PADDED_TAIL_FORM_DEFAULT_NARROW in PADDED_TAIL_FORMS
+    assert SM107_PADDED_TAIL_FORM_DEFAULT == 1, "the 128-wide default is the pre-masked tail (every measured 128-wide padded plain cell a win)"
+    assert SM107_PADDED_TAIL_FORM_DEFAULT_NARROW == 0, "the 64-wide tile keeps the legacy tail (within noise, a per-cell sign)"
     for d in (32, 64):
         assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False) == SM107_PADDED_TAIL_FORM_DEFAULT
+        assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False, tile_n=128) == SM107_PADDED_TAIL_FORM_DEFAULT
+        assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False, tile_n=64) == SM107_PADDED_TAIL_FORM_DEFAULT_NARROW
+        assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False, tile_n=64, request=1) == 1
         assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False, request=1) == 1
         assert sm107_padded_tail_form_pick(d, padded=True, has_bias=False, has_kv_mask=False, request=0) == 0
         for off in (dict(padded=False), dict(has_bias=True), dict(has_kv_mask=True), dict(causal=True), dict(swa=True)):
@@ -914,8 +921,11 @@ def test_padded_tail_form_pick_is_one_arithmetic_with_the_factory():
     try:
         cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 1
         assert sm107_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False) == 1
+        assert sm107_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False, tile_n=64) == 1, "the seam pins either width"
         assert sm107_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False, request=0) == 0
         assert sm107_padded_tail_form_pick(32, padded=False, has_bias=False, has_kv_mask=False) == 0
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 0
+        assert sm107_padded_tail_form_pick(32, padded=True, has_bias=False, has_kv_mask=False) == 0, "the seam pins the legacy form at 128 too"
     finally:
         cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved
     base = dict(cta_mma=1, dtype_qkv=2, seq_kv_lens_present=True)
@@ -971,11 +981,19 @@ def test_adapter_padded_tail_form_default_is_the_config_pick():
     """Without a request the adapter's record carries the config pick (the default constant, or the sweep seam when a driver pins it);
     the seam never reaches an ineligible plan."""
     from cudnn.sdpa.fwd import config_sm107 as cfg_mod
-    from cudnn.sdpa.fwd.config_sm107 import SM107_PADDED_TAIL_FORM_DEFAULT
+    from cudnn.sdpa.fwd.config_sm107 import SM107_PADDED_TAIL_FORM_DEFAULT, SM107_PADDED_TAIL_FORM_DEFAULT_NARROW
 
     api = _api2(s_q=217, s_kv=217, seq_kv_lens_present=True)
     assert api.check_support() is True
+    assert api.template_params().tile_n == 128, "S 217 ends in the second half of a 128-wide tile: the 128-wide pick"
     assert api.template_params().padded_tail_form == SM107_PADDED_TAIL_FORM_DEFAULT
+    api = _api2(s_q=300, s_kv=300, seq_kv_lens_present=True)
+    assert api.check_support() is True
+    assert api.template_params().tile_n == 64, "S 300 ends in the first half of a 128-wide tile: the half tile"
+    assert api.template_params().padded_tail_form == SM107_PADDED_TAIL_FORM_DEFAULT_NARROW
+    api = _api2(s_q=300, s_kv=300, seq_kv_lens_present=True, tile_n=128)
+    assert api.check_support() is True
+    assert api.template_params().padded_tail_form == SM107_PADDED_TAIL_FORM_DEFAULT, "an explicit 128 takes the 128-wide default"
     saved = cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS
     try:
         cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = 1
@@ -1074,3 +1092,192 @@ def test_padded_tail_form_1_cells_match_the_fp64_oracle_and_the_legacy_tail(case
     torch.testing.assert_close(out1["stats"].squeeze(-1)[live].double(), out0["stats"].squeeze(-1)[live].double(), **_TOL_LSE)
     bitwise = torch.equal(out1["o"], out0["o"]) and torch.equal(out1["stats"], out0["stats"])
     print(f"\n{case}: pre-masked tail vs legacy tail bitwise={bitwise}")
+
+
+# --------------------------------------------------------------------------- the dead-sub-tile QUIET body (TemplateParams.dead_subtile_quiet)
+#
+# The one-batch-entry item's softmax sub-tile with NO live row -- sub-tile 1 of the last 256-row super-tile when S_q % 256 is in 1..128
+# (S 384: one of the item's four softmax sub-tiles), and under cga2 the non-leader CTA's sub-tiles past S_q -- runs the FULL softmax body
+# on rows the correction trims or the TMA store clips.  The quiet body (form 1) fires the live body's barrier sequence (the bmm1_done
+# wait, alpha = 1 + stat_full, the bmm2_ready arrives, the ping-pong, the stat_empty wait) and none of the exp2 / max / sum work, so the
+# live sibling warp group runs the ping-pong alone.  The pins: the eligibility (one arithmetic for the config pick, the factory and the
+# adapter: no bias, no pair item, the small tiles only), the typed declines, the rendering (the live body's exp count -- the quiet loop
+# has no exp -- no new spills, a different cubin), and the GPU cells: bitwise the full-body form on every stored row (the live rows'
+# arithmetic is untouched) and against the fp64 oracle.
+
+
+def test_dead_subtile_quiet_pick_is_one_arithmetic_with_the_factory():
+    """``sm107_dead_subtile_quiet_pick`` returns 0 off the bias-less one-batch-entry small-tile body (a bias, the pair item, d128) whatever
+    the request or the seam say; on it the request wins over the seam, the seam over the default; and the factory refuses form 1 on
+    exactly the shapes the pick returns 0 for (a bias, the pair item, d128, PackGQA) while rendering form 0 / 1 on the eligible ones --
+    dense, padded (with either tail form), kv_mask, cga2."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg_mod
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import (
+        DEAD_SUBTILE_QUIET_FORMS,
+        SM107_DEAD_SUBTILE_QUIET_DEFAULT,
+        make_cfg_d32,
+        make_cfg_d64,
+        make_cfg_d128,
+        sm107_dead_subtile_quiet_pick,
+    )
+
+    assert SM107_DEAD_SUBTILE_QUIET_DEFAULT in DEAD_SUBTILE_QUIET_FORMS
+    for d in (32, 64):
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False) == SM107_DEAD_SUBTILE_QUIET_DEFAULT
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, request=1) == 1
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, request=0) == 0
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=True, request=1) == 0
+        assert sm107_dead_subtile_quiet_pick(d, has_bias=False, pair_item=True, request=1) == 0
+    assert sm107_dead_subtile_quiet_pick(128, has_bias=False, request=1) == 0
+    saved = cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS
+    try:
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = 1
+        assert sm107_dead_subtile_quiet_pick(32, has_bias=False) == 1
+        assert sm107_dead_subtile_quiet_pick(32, has_bias=False, request=0) == 0
+        assert sm107_dead_subtile_quiet_pick(32, has_bias=True) == 0
+    finally:
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = saved
+    base = dict(cta_mma=1, dtype_qkv=2)
+    for form in (0, 1):
+        cfg, _ = make_cfg_d32(TemplateParams(**base, dead_subtile_quiet=form))
+        assert cfg.DEAD_SUBTILE_QUIET == form
+    for ok in (
+        dict(**base, seq_kv_lens_present=True, dead_subtile_quiet=1),  # the padding leg, the legacy tail
+        dict(**base, seq_kv_lens_present=True, padded_tail_form=1, dead_subtile_quiet=1),  # the padding leg, the pre-masked tail
+        dict(**base, kv_mask_form=1, dead_subtile_quiet=1),  # the kv_mask -inf body (no bias barriers)
+        dict(**base, window_right=0, dead_subtile_quiet=1),  # a causal band (the 3-segment arm)
+    ):
+        assert make_cfg_d32(TemplateParams(**ok))[0].DEAD_SUBTILE_QUIET == 1, ok
+    assert make_cfg_d64(TemplateParams(cta_mma=2, dtype_qkv=2, dead_subtile_quiet=1))[0].DEAD_SUBTILE_QUIET == 1
+    assert make_cfg_d32(TemplateParams(**base))[0].DEAD_SUBTILE_QUIET == 0  # a record without the field renders the full body
+    for bad in (
+        dict(**base, bias_mode=1, dead_subtile_quiet=1),  # the bias arm (its warp groups wait / release the bias barriers)
+        dict(**base, bias_mode=1, n_chunk=2, dead_subtile_quiet=1),  # the pair item
+        dict(**base, pack_gqa=True, qh_per_kh=2, dead_subtile_quiet=1),  # PackGQA's row mapping
+        dict(**base, dead_subtile_quiet=2),  # not a form
+    ):
+        with pytest.raises(ValueError, match="dead_subtile_quiet"):
+            make_cfg_d32(TemplateParams(**bad))
+    with pytest.raises(ValueError, match="dead_subtile_quiet"):
+        make_cfg_d128(TemplateParams(**base, dead_subtile_quiet=1))
+
+
+_DEAD_SUBTILE_ADAPTER_CELLS = [
+    # (name, adapter kwargs, accept?, the TemplateParams.dead_subtile_quiet of the record)
+    ("dense d32 S 384, quiet requested", dict(s_q=384, s_kv=384, dead_subtile_quiet=1), True, 1),
+    ("dense d32 S 384, form 0 requested", dict(s_q=384, s_kv=384, dead_subtile_quiet=0), True, 0),
+    ("padded d32 S 300, quiet requested", dict(s_q=300, s_kv=300, seq_kv_lens_present=True, dead_subtile_quiet=1), True, 1),
+    ("d32 + kv_mask, quiet requested", dict(s_q=384, s_kv=384, kv_mask=(2, 1, 1, 384), dead_subtile_quiet=1), True, 1),
+    ("d64 cga2 S 300, quiet requested", dict(d=64, s_q=300, s_kv=300, cga=2, seq_kv_lens_present=True, dead_subtile_quiet=1), True, 1),
+    ("d32 + bias, quiet requested", dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), dead_subtile_quiet=1), False, None),
+    ("d128, quiet requested", dict(d=128, s_q=384, s_kv=384, dead_subtile_quiet=1), False, None),
+    ("d32, form 2 requested", dict(s_q=384, s_kv=384, dead_subtile_quiet=2), False, None),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("name, kw, accept, record", _DEAD_SUBTILE_ADAPTER_CELLS, ids=[c[0] for c in _DEAD_SUBTILE_ADAPTER_CELLS])
+def test_adapter_dead_subtile_quiet_requests_are_honoured_or_declined_typed(name, kw, accept, record):
+    """A ``dead_subtile_quiet=`` request is honoured on the bias-less one-batch-entry small-tile plan (the record carries it) and declined
+    typed everywhere else (a bias, the d128 flavor, a value outside 0 / 1) -- never degraded."""
+    if not accept:
+        with pytest.raises((NotImplementedError, ValueError), match="dead_subtile_quiet"):
+            _api2(**kw).check_support()
+        return
+    api = _api2(**kw)
+    assert api.check_support() is True, name
+    assert api.template_params().dead_subtile_quiet == record, (name, api.template_params())
+
+
+@requires_rubin
+def test_adapter_dead_subtile_quiet_default_is_the_config_pick():
+    """Without a request the adapter's record carries the config pick (the default constant, or the sweep seam when a driver pins it);
+    the seam never reaches an ineligible (bias) plan."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg_mod
+    from cudnn.sdpa.fwd.config_sm107 import SM107_DEAD_SUBTILE_QUIET_DEFAULT
+
+    api = _api2(s_q=384, s_kv=384)
+    assert api.check_support() is True
+    assert api.template_params().dead_subtile_quiet == SM107_DEAD_SUBTILE_QUIET_DEFAULT
+    saved = cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS
+    try:
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = 1
+        api = _api2(s_q=384, s_kv=384)
+        assert api.check_support() is True
+        assert api.template_params().dead_subtile_quiet == 1
+        api = _api2(s_q=384, s_kv=384, bias=(1, 4, 384, 384))
+        assert api.check_support() is True
+        assert api.template_params().dead_subtile_quiet == 0, "the seam must not reach the bias plan"
+    finally:
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = saved
+
+
+@pytest.mark.parametrize(
+    "d, cta, tile_n, base_arm",
+    [(32, 1, 128, "d32_dense_bf16"), (32, 1, 64, "d32_dense_bf16"), (64, 2, 128, "d64_dense_bf16"), (32, 1, 128, "d32_padded_bf16")],
+    ids=["d32_t128", "d32_t64", "d64_cga2_t128", "d32_padded_t128"],
+)
+def test_dead_subtile_quiet_rendering_adds_a_quiet_loop_and_no_math(tmp_path, d, cta, tile_n, base_arm):
+    """The quiet-body rendering traced for sm_107a carries the SAME exp count as the full-body rendering (the quiet loop has no exp2 /
+    max / sum), the register split, no cluster drain, spills no more than the full-body rendering, and is a different cubin."""
+    full = dict(_RECORD_ARMS[base_arm])
+    full.update({"__d": d, "cta_mma": cta, "dtype_qkv": 2, "tile_n": tile_n})
+    quiet = dict(full)
+    quiet["dead_subtile_quiet"] = 1
+    p_full = _probe(tmp_path, full, f"quiet0_{base_arm}_{cta}_{tile_n}")
+    p_quiet = _probe(tmp_path, quiet, f"quiet1_{base_arm}_{cta}_{tile_n}")
+    assert p_full.cubin_md5 != p_quiet.cubin_md5
+    assert p_quiet.stats["MUFU_EX2"] == p_full.stats["MUFU_EX2"], (p_quiet.stats, p_full.stats)
+    assert p_quiet.stats["FMNMX3"] == p_full.stats["FMNMX3"], (p_quiet.stats, p_full.stats)
+    assert p_quiet.stats["USETMAXREG"] > 0 and p_quiet.stats["CGAERRBAR"] == 0, p_quiet.stats
+    assert_no_new_spills(p_quiet.stats, p_full.stats, tag=f"dead_subtile_quiet 1 {base_arm} cga{cta} TILE_N {tile_n} vs the full body: ")
+
+
+# The dead-sub-tile cells: S 384 (sub-tile 1 of super-tile 2 dead: the headline), S 100 (the only super-tile's sub-tile 1 dead), the
+# padding leg (S 300 / 600 with a ragged tail, under both tail forms), the kv_mask -inf body, the causal 3-segment arm, d64 at cga2 (the
+# non-leader CTA's sub-tiles past S_q) and the NO-dead-tile control (S 512: the quiet arm must be bitwise the full body).
+_DEAD_SUBTILE_CASES = {
+    "dead_384": dict(s=384, h=2),
+    "dead_100_one_super": dict(s=100),
+    "dead_300_padded": dict(s=300, h=2),
+    "dead_300_padded_tail1": dict(s=300, h=2, tail=1),
+    "dead_600_padded": dict(s=600, h=2),
+    "dead_384_mask": dict(s=384, h=2, mask=True),
+    "dead_384_causal": dict(s=384, h=2, causal=True),
+    "dead_d64_300_cga2": dict(d=64, s=300, h=2, cga=2),
+    "dead_d64_384_cga2": dict(d=64, s=384, h=2, cga=2),
+    "dead_384_f16": dict(s=384, h=2, io=torch.float16),
+    "live_512_control": dict(s=512, h=2),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_DEAD_SUBTILE_CASES))
+def test_dead_subtile_quiet_cells_are_bitwise_the_full_body_and_match_the_fp64_oracle(case):
+    """Every cell under the quiet body (the sweep seam pins form 1 for the plan): O / Stats against the fp64 oracle, two launches bitwise
+    -- and BITWISE the full-body form of the same graph on every stored row (the quiet body touches only rows nobody stores: the live
+    rows' arithmetic is the same instruction stream)."""
+    from cudnn.sdpa.fwd import config_sm107 as cfg_mod
+
+    c = _DEAD_SUBTILE_CASES[case]
+    io = c.get("io", torch.bfloat16)
+    s = c["s"]
+    cc = dict(c)
+    cc.pop("io", None)
+    tail = cc.pop("tail", None)
+    if s % 128:
+        cc["kv_lens"] = [s] * 2  # the SAME per-batch lengths the engine synthesises for an S_kv off the tile multiple
+    saved_q, saved_t = cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS, cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS
+    try:
+        cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = tail
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = 1
+        out1, ref, _ = _run_cell(cc, io)
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS = 0
+        out0, _, _ = _run_cell(cc, io)
+    finally:
+        cfg_mod._DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS, cfg_mod._PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS = saved_q, saved_t
+    _check(out1, ref)
+    _check(out0, ref)
+    assert torch.equal(out1["o"], out0["o"]), f"{case}: the quiet body changed a stored O row"
+    assert torch.equal(out1["stats"], out0["stats"]), f"{case}: the quiet body changed a stored Stats row"

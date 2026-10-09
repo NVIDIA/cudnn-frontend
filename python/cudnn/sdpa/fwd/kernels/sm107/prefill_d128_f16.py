@@ -221,6 +221,7 @@ from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
 )
 from cudnn.frost.tile_dsl.pointwise import (
+    opaque_f32_zero,
     tmem_load_max_reduction_tile,
     row_reduction_pair,
     row_max_reduction,
@@ -390,6 +391,18 @@ _INF_MASK_ARM = _BIAS_ARM or _KV_MASK_ARM
 # is one body).  No barrier row changes: the pre-mask sits inside the body between the `mb_bmm1_done` wait and the P store, on the
 # calling thread's own S columns (the MMA writes S[qs] again only for the next BMM1, after this body's `mb_bmm2_ready`).
 _PADDED_TAIL_PREMASK = CFG.PADDED_TAIL_FORM == 1
+# The DEAD-SUB-TILE QUIET body (CFG.DEAD_SUBTILE_QUIET == 1; TemplateParams.dead_subtile_quiet; the one-batch-entry item, no bias --
+# the config factory refuses it with a bias, on the pair item, under PackGQA / THD / the gated epilogue).  A softmax sub-tile whose
+# FIRST row is at or past its batch entry's S_q has no live row: sub-tile 1 of the last 256-row super-tile when S_q % 256 is in
+# 1..128 (S 384: one of the item's four softmax sub-tiles), and under cga2 the non-leader CTA's sub-tiles past S_q (q_super_idx is
+# per CTA).  Its rows are the correction's trimmed / OOB rows (never stored, or SELECTed to 0 under per-batch Q lengths) and its
+# LSE rows are never written, so the warp group runs the kv range through `_softmax_kv_body_quiet` -- every barrier interaction of
+# the live body in the same order (the mb_bmm1_done wait, alpha = 1 + mb_stat_full, the mb_bmm2_ready arrives, the warp-group
+# ping-pong, the mb_stat_empty wait), no TMEM load, no exp2 / max / sum -- and the live arms see an EMPTY range.  The live sibling
+# warp group then runs the ping-pong alone (the small tiles run at the softmax issue rate).  BARRIER TABLE: unchanged by construction
+# (the same sites fire the same 128 lanes per step; the MMA still runs the dead sub-tile's BMM1 / BMM2 on TMEM residue P -- its O
+# rows are confined to the dead rows; the correction's all_alpha_one ballot skips the rescale).  SMEM: untouched.
+_DEAD_SUBTILE_QUIET = CFG.DEAD_SUBTILE_QUIET == 1
 # === The (n, n+1) PAIR work item (CFG.N_CHUNK > 0; TemplateParams.n_chunk) ===
 #
 # A work item is (a TILE_M-row q tile, a head, a CHUNK of up to N_CHUNK consecutive entries nb of the flattened batch axis);
@@ -2449,6 +2462,44 @@ def _premask_padded_tail(s_addr_base, q_abs, kv_loop, eff_seqlen_kv):
 
 
 @cute.jit
+def _softmax_kv_body_quiet(
+    sub_tile_id: int,
+    tmem_ptr_i32,
+    bars,
+    bmm1_phase,
+    stat_empty_phase,
+    leader_cta_id,
+):
+    """The QUIET per-iter kv body of a DEAD softmax sub-tile (CFG.DEAD_SUBTILE_QUIET == 1; no live row in this warp group's 128 rows):
+    the live body's barrier sequence in the live body's order -- the mb_bmm1_done wait, the top ping-pong sync (sub-tile 1), alpha = 1
+    stored to the stats slot + the mb_stat_full arrive (the correction's all_alpha_one ballot then skips the rescale), one mb_bmm2_ready
+    arrive per chunk (the MMA's BMM2 reads the TMEM residue P: its O rows are this sub-tile's, trimmed or clipped downstream), the
+    bottom ping-pong sync (sub-tile 0), the mb_stat_empty wait -- and NO TMEM load, exp2, max or sum.  SUM(issuing lanes) per site is
+    the live body's (128 THREAD lanes on stat_full / bmm2_ready; the 256-thread named barrier), so every init count holds.
+    Returns (bmm1_phase, stat_empty_phase)."""
+    stats_off = LAYOUT.STATS_OFF + sub_tile_id * 8
+    N_CHUNKS = CFG.N_BMM2_CHUNKS
+    bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase, spin=SPIN_RING_WAITS)
+    bmm1_phase = bmm1_phase ^ 1
+    stats_addr = tmem_ptr_i32.load() + cutlass.Int32(stats_off)
+    if sub_tile_id == 1:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+    # alpha = 1 exactly (an opaque 0 + 1: no constant reaches the store), so the correction's all_alpha_one ballot passes.
+    alpha_one = opaque_f32_zero() + cutlass.Float32(1.0)
+    alpha_vec = cutlass.Vector.from_elements((alpha_one,), cutlass.Float32)
+    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    bars.mb_stat_full[sub_tile_id].arrive()
+    for c in cutlass.range_constexpr(N_CHUNKS):
+        bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + c].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    if sub_tile_id == 0:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+    bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
+    stat_empty_phase = stat_empty_phase ^ 1
+    return bmm1_phase, stat_empty_phase
+
+
+@cute.jit
 def _softmax_kv_body(
     apply_mask: bool,
     sub_tile_id: int,
@@ -2994,6 +3045,22 @@ def _softmax_warp_group(
             # critical path so alpha publish + stat_full fire happen back-to-back.
             bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
             stat_empty_phase = stat_empty_phase ^ 1
+            # The live arms' loop bounds: the tile's own (`bounds`), or -- under the dead-sub-tile quiet body -- EMPTY on a dead
+            # sub-tile, whose kv range the quiet loop below walks instead.  Off the arm the three names alias `bounds` (no IR).
+            live_lo = bounds.left
+            live_mid_lo = bounds.unmasked_lo
+            live_mid_hi = bounds.unmasked_hi
+            if cutlass.const_expr(_DEAD_SUBTILE_QUIET):
+                # DEAD = this warp group's first row is at or past the batch entry's S_q (warp-group uniform: the tile decode and
+                # the resolved length are uniform).  The quiet loop walks the whole kv range with the live body's barrier sequence
+                # and no math; the live arms then see [right, right) -- zero iterations -- on this sub-tile.
+                sub_dead = (q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M)) >= eff_seqlen_q
+                quiet_hi = cutlass.Int32(arith.select(sub_dead.ir_value(), bounds.right.ir_value(), bounds.left.ir_value()))
+                for kv_loop in cutlass.range(bounds.left, quiet_hi, 1, unroll=1):
+                    bmm1_phase, stat_empty_phase = _softmax_kv_body_quiet(sub_tile_id, tmem_ptr_i32, bars, bmm1_phase, stat_empty_phase, leader_cta_id)
+                live_lo = quiet_hi
+                live_mid_lo = cutlass.Int32(arith.select(sub_dead.ir_value(), bounds.right.ir_value(), bounds.unmasked_lo.ir_value()))
+                live_mid_hi = cutlass.Int32(arith.select(sub_dead.ir_value(), bounds.right.ir_value(), bounds.unmasked_hi.ir_value()))
             # 3-segment kv loop: LEFT-masked / fully-unmasked / RIGHT-masked.
             # At MASK_NONE bounds collapse so the two masked sub-loops have empty range and fold out.
             if cutlass.const_expr(_INF_MASK_ARM):
@@ -3007,7 +3074,7 @@ def _softmax_warp_group(
                         bias_full_phase = bias_full_phase ^ cutlass.Int32(1)
                 total_max = NEG_INF_TRUE
                 total_max_safe = NEG_INF_TRUE
-                for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                for kv_loop in cutlass.range(live_lo, bounds.right, 1, unroll=1):
                     total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body_inf(
                         sub_tile_id,
                         kv_loop,
@@ -3045,7 +3112,7 @@ def _softmax_warp_group(
                 # over the whole range with the HW-max body; the tail tile (kv_loop >= unmasked_hi -- the last tile when this batch
                 # entry's S_kv is not a tile multiple, never otherwise) pre-masks its out-of-range S columns in TMEM.  One softmax body
                 # per warp group in the rendering; the legacy 3-segment form below carries a second, software-max body for the tail.
-                for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                for kv_loop in cutlass.range(live_lo, bounds.right, 1, unroll=1):
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                         False,
                         sub_tile_id,
@@ -3066,7 +3133,7 @@ def _softmax_warp_group(
                         tail_premask=kv_loop >= bounds.unmasked_hi,
                     )
             elif cutlass.const_expr(CFG.MASK_FLAGS == MASK_NONE):
-                for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+                for kv_loop in cutlass.range(live_lo, bounds.right, 1, unroll=1):
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                         False,
                         sub_tile_id,
@@ -3086,7 +3153,7 @@ def _softmax_warp_group(
                         track_true_max,
                     )
             else:
-                for kv_loop in cutlass.range(bounds.left, bounds.unmasked_lo, 1, unroll=1):
+                for kv_loop in cutlass.range(live_lo, live_mid_lo, 1, unroll=1):
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                         True,
                         sub_tile_id,
@@ -3105,7 +3172,7 @@ def _softmax_warp_group(
                         true_max,
                         track_true_max,
                     )
-                for kv_loop in cutlass.range(bounds.unmasked_lo, bounds.unmasked_hi, 1, unroll=1):
+                for kv_loop in cutlass.range(live_mid_lo, live_mid_hi, 1, unroll=1):
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                         False,
                         sub_tile_id,
@@ -3124,7 +3191,7 @@ def _softmax_warp_group(
                         true_max,
                         track_true_max,
                     )
-                for kv_loop in cutlass.range(bounds.unmasked_hi, bounds.right, 1, unroll=1):
+                for kv_loop in cutlass.range(live_mid_hi, bounds.right, 1, unroll=1):
                     total_max, total_sum, bmm1_phase, stat_empty_phase, true_max = _softmax_kv_body(
                         True,
                         sub_tile_id,

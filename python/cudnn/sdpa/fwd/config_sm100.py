@@ -294,6 +294,15 @@ class TemplateParams:
     # (``config_sm107.sm107_padded_tail_form_pick``).  A compile-time axis of the kv loop, hence a cache-key field; 0 on every other
     # rendering (the factory refuses 1 off the eligible set).  APPENDED.
     padded_tail_form: int = 0
+    # The DEAD-SUB-TILE QUIET body of the one-batch-entry item on the Rubin f16/bf16 32- / 64-wide tiles (no bias): a softmax sub-tile
+    # whose FIRST row is at or past its batch entry's S_q has no live row -- sub-tile 1 of the last 256-row super-tile when S_q % 256 is
+    # in 1..128 (S 384: a quarter of the item's softmax work), and under cga2 the non-leader CTA's sub-tiles past S_q.  0 = that warp
+    # group runs the FULL softmax body on rows nobody stores (the correction trims them, the TMA store clips them); 1 = it runs the QUIET
+    # body: every barrier interaction of the live body (the bmm1_done wait, alpha = 1 and the stat_full arrive, the bmm2_ready arrives,
+    # the warp-group ping-pong, the stat_empty wait), no TMEM load and no exp2 / max / sum, so the live sibling warp group runs the
+    # ping-pong alone (``config_sm107.sm107_dead_subtile_quiet_pick``).  A compile-time axis of the kv loop, hence a cache-key field;
+    # 0 on every other rendering (the factory refuses 1 with a bias, on the pair item, on PackGQA / THD / the gated epilogue).  APPENDED.
+    dead_subtile_quiet: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

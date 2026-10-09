@@ -366,8 +366,14 @@ def sm107_bias_preload_chunks(tile_n: int) -> int:
 # 15.4 for the DENSE S 256 cell and 19.6 for the same shape WITH a kv_mask, whose -inf body is one body); 1 = the PRE-MASKED tail --
 # one loop, the HW-max body on every tile, and on the tail tile the softmax warp first rewrites its sub-tile's out-of-range S
 # columns as -inf in TMEM (a plain load, the bit-word PADDED mask, a store, one tcgen05.wait::st) so the fused max load observes
-# them masked.  Default 0 until the A/B on an exclusive Rubin GPU; a flip is a commit with the numbers.
-SM107_PADDED_TAIL_FORM_DEFAULT = 0
+# them masked.  MEASURED (212-SM cc 10.7 perf node, 2376 MHz lock, same-process interleaved arms, 100 launches x 3 rounds, control
+# twins within 0.4 %): at TILE_N 128 form 1 wins EVERY padded plain cell -- d32 B 1 S 200 / 217 / 300 / 450 / 600 +39 / +39 / +43 /
+# +29 / +17 %, d32 B 4 S 217 / 300 +81 / +56 %, d64 B 1 S 200 / 300 / 600 +37 / +37 / +13 % over the legacy 128-wide body -- so the
+# 128-wide default is 1; at TILE_N 64 (two half bodies under the cliff already) it is within noise with a per-cell sign (d32
+# -0.4..-2.2 %, d64 +1.2..+2.3 %), so the 64-wide default stays the legacy form.  A request or the sweep seam pins either form at
+# either width.
+SM107_PADDED_TAIL_FORM_DEFAULT = 1  # the 128-wide tile
+SM107_PADDED_TAIL_FORM_DEFAULT_NARROW = 0  # the 64-wide tile
 PADDED_TAIL_FORMS = frozenset({0, 1})
 # PRIVATE, process-local sweep seam (the ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` rules: ``monkeypatch.setattr`` in a test or a sweep driver
 # that resets it to None; never a plan path, an import or a config): pins the padded tail form a knob-less ELIGIBLE plan gets.
@@ -375,19 +381,58 @@ _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
 def sm107_padded_tail_form_pick(
-    d_flavor: int, *, padded: bool, has_bias: bool, has_kv_mask: bool, causal: bool = False, swa: bool = False, request: Optional[int] = None
+    d_flavor: int,
+    *,
+    padded: bool,
+    has_bias: bool,
+    has_kv_mask: bool,
+    causal: bool = False,
+    swa: bool = False,
+    request: Optional[int] = None,
+    tile_n: int = SM107_SMALL_TILE_N_DEFAULT,
 ) -> int:
     """The ``TemplateParams.padded_tail_form`` of a plan on the Rubin small tiles: 0 off the eligible set (a dense S_kv at a tile
     multiple, a bias or a kv_mask -- whose -inf body is ONE body already -- a causal / SWA band, the d128 flavor); on it ``request``
     when the caller made one (the adapter's ``padded_tail_form=``, validated there: honoured or declined, never degraded), else the
-    sweep seam, else :data:`SM107_PADDED_TAIL_FORM_DEFAULT`."""
+    sweep seam, else the measured default of the plan's KV tile width ``tile_n`` (appended, default 128):
+    :data:`SM107_PADDED_TAIL_FORM_DEFAULT` on the 128-wide tile, :data:`SM107_PADDED_TAIL_FORM_DEFAULT_NARROW` on the 64-wide one."""
     if not padded or has_bias or has_kv_mask or causal or swa or int(d_flavor) not in (32, 64):
         return 0
     if request is not None:
         return int(request)
     if _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS is not None:
         return int(_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS)
-    return SM107_PADDED_TAIL_FORM_DEFAULT
+    return SM107_PADDED_TAIL_FORM_DEFAULT_NARROW if int(tile_n) == SM107_SMALL_TILE_N_NARROW else SM107_PADDED_TAIL_FORM_DEFAULT
+
+
+# The DEAD-SUB-TILE QUIET body (TemplateParams.dead_subtile_quiet; the one-batch-entry item of the small tiles, no bias): a softmax
+# sub-tile whose first row is at or past its batch entry's S_q has no live row -- sub-tile 1 of the last 256-row super-tile when
+# S_q % 256 is in 1..128 (S 384: a quarter of the item's softmax work; S 300 / 600 on the padding leg), and under cga2 the non-leader
+# CTA's sub-tiles past S_q.  0 = the legacy form: that warp group runs the full softmax body on rows nobody stores (exp2 / max / sum
+# on values the correction trims or the TMA store clips); 1 = the QUIET body: the same barrier sequence as the live body (the
+# bmm1_done wait, alpha = 1 and the stat_full arrive, the bmm2_ready arrives, the warp-group ping-pong, the stat_empty wait), no TMEM
+# load and no math, so the live sibling warp group runs the ping-pong alone.  The barrier table is unchanged by construction (the same
+# sites fire the same lanes); the MMA still runs the dead sub-tile's BMM1 / BMM2 (its P is TMEM residue, its O rows are the trimmed /
+# clipped rows).  Default 0 until the A/B on an exclusive Rubin GPU; a flip is a commit with the numbers.
+SM107_DEAD_SUBTILE_QUIET_DEFAULT = 0
+DEAD_SUBTILE_QUIET_FORMS = frozenset({0, 1})
+# PRIVATE, process-local sweep seam (the ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` rules): pins the quiet form a knob-less ELIGIBLE plan gets.
+_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm107_dead_subtile_quiet_pick(d_flavor: int, *, has_bias: bool, pair_item: bool = False, request: Optional[int] = None) -> int:
+    """The ``TemplateParams.dead_subtile_quiet`` of a plan on the Rubin small tiles: 0 off the eligible set (a bias -- its warp groups
+    also wait and release the bias barriers, which the quiet body does not replicate -- the pair item, whose dead sub-tile is the
+    odd chunk tail recomputing row nb0, the d128 flavor); on it ``request`` when the caller made one (the adapter's
+    ``dead_subtile_quiet=``, validated there: honoured or declined, never degraded), else the sweep seam, else
+    :data:`SM107_DEAD_SUBTILE_QUIET_DEFAULT`."""
+    if has_bias or pair_item or int(d_flavor) not in (32, 64):
+        return 0
+    if request is not None:
+        return int(request)
+    if _DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS is not None:
+        return int(_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS)
+    return SM107_DEAD_SUBTILE_QUIET_DEFAULT
 
 
 def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: bool, padded: bool = False, request: Optional[int] = None, domain=None) -> int:
@@ -400,11 +445,15 @@ def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
     ragged leg) -- the combined body is the one over the instruction-cache cliff; (b) a bias alone at one 128-wide kv tile (the pair n4 / n2: +26 / +24 % at d32 / d64 with 128 rows, +35 /
     +22 % with 512) and at two tiles on the 64-wide tile (the pair n2 / n8: +24 / +4 %) -- at two tiles on the 32-wide tile the
     one-batch-entry item's streamed ring at 128 is the measured best (+6 / +9 % with 256 / 1024 rows), so 128 stays there; (c) a kv_mask
-    alone at one 128-wide kv tile (+7..+18 %; a wash or a loss above it); (d) a plain graph whose S_kv is not a tile multiple (the padded dense body's
-    pathology) at the 32-wide tile, and at the 64-wide one up to ``SM107_NARROW_TILE_S_KV_MAX`` -- not for per-batch lengths at a tile
-    multiple (128 wins there: the narrow tile is -11..-18 % at S 512 / 1024 and -19 / -20 % at d32 / d64 S 2048 with 0.75 S keys).  The pick
-    sees ``s_kv``, never the lengths: where the LENGTHS end mid-tile (0.75 S at S 256 = 192 keys) the half tile measured +58..+119 % and this
-    rule cannot follow it -- the padded dense body's pathology stays an open kernel item; else :data:`SM107_SMALL_TILE_N_DEFAULT`.
+    alone at one 128-wide kv tile (+7..+18 %; a wash or a loss above it); (d) a plain graph whose S_kv ends in the FIRST half of a 128-wide
+    tile (``s_kv % 128`` in 1..64, both D): the half tile skips 64 dead columns the 128-wide tile would mask -- d32 S 300 B 1 / 4 +4.2 /
+    +6.2 % over the 128-wide pre-masked tail, d64 S 300 a tie (0.2 %); where the tail holds MORE than 64 columns the 128-wide tile WITH
+    the pre-masked tail (``padded_tail_form`` 1, the 128-wide default) wins: d32 S 200 / 217 / 450 / 600 +1.8 / +3.9 / +11.5 / +13.7 %,
+    d32 B 4 S 217 +5.4 %, d64 S 200 / 600 +7.1 / +20 % over the half tile (212-SM cc 10.7 perf node, 2376 MHz lock, same process) --
+    before the pre-masked tail the 128-wide padded body was the instruction-cache pathology and the half tile served every d32 S and
+    d64 up to 256; not for per-batch lengths at a tile multiple (128 wins there: the narrow tile is -11..-18 % at S 512 / 1024 and -19 /
+    -20 % at d32 / d64 S 2048 with 0.75 S keys).  The pick sees ``s_kv``, never the lengths: where the LENGTHS end mid-tile (0.75 S at
+    S 256 = 192 keys) the half tile measured +58..+119 % and this rule cannot follow it; else :data:`SM107_SMALL_TILE_N_DEFAULT`.
     ``domain`` = the flavor's served widths (:data:`SM107_TILE_NS_BY_D_SHAPE`); a flavor without the narrow width keeps the default."""
     if request is not None:
         return int(request)
@@ -420,7 +469,7 @@ def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
         return SM107_SMALL_TILE_N_NARROW
     if has_kv_mask and int(s_kv) <= SM107_SMALL_TILE_N_DEFAULT:
         return SM107_SMALL_TILE_N_NARROW
-    if padded_body and not has_kv_mask and int(s_kv) % SM107_SMALL_TILE_N_DEFAULT != 0 and (int(d_flavor) == 32 or int(s_kv) <= SM107_NARROW_TILE_S_KV_MAX):
+    if padded_body and not has_kv_mask and 0 < int(s_kv) % SM107_SMALL_TILE_N_DEFAULT <= SM107_SMALL_TILE_N_NARROW:
         return SM107_SMALL_TILE_N_NARROW
     return SM107_SMALL_TILE_N_DEFAULT
 
@@ -1142,6 +1191,11 @@ class _CfgSm107:
     # tile's out-of-range S columns rewritten as -inf in TMEM before the fused max load).  Every kernel seam folds on
     # cutlass.const_expr(CFG.PADDED_TAIL_FORM == 1); the factory refuses 1 off the eligible set (sm107_padded_tail_form_pick).
     PADDED_TAIL_FORM: int = 0
+    # The dead-sub-tile quiet body (TemplateParams.dead_subtile_quiet; the one-batch-entry item of the f16/bf16 small tiles, no
+    # bias): 1 = a softmax sub-tile with no live row (its first row >= the batch entry's S_q) runs the kv range through the QUIET
+    # body (the live body's barrier sequence, no math) and the live arms see an empty range; 0 = it runs the full body.  Every
+    # kernel seam folds on cutlass.const_expr(CFG.DEAD_SUBTILE_QUIET == 1); the factory refuses 1 off the eligible set.
+    DEAD_SUBTILE_QUIET: int = 0
     WINDOW_LEFT: int = 0
     WINDOW_RIGHT: int = 0
     BOTTOM_RIGHT: int = 0
@@ -1555,6 +1609,22 @@ def _validate_masks(cfg, flavor: str) -> None:
             ),
             (
                 not (
+                    int(getattr(cfg, "DEAD_SUBTILE_QUIET", 0)) == 1
+                    and (
+                        int(getattr(cfg, "BIAS_MODE", 0))
+                        or int(getattr(cfg, "N_CHUNK", 0))
+                        or cfg.PACK_GQA
+                        or cfg.THD_VARLEN
+                        or int(getattr(cfg, "EPILOGUE_GATE", 0))
+                    )
+                ),
+                f"{flavor}: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) needs the one-batch-entry item without a bias, PackGQA, THD or the "
+                f"gated epilogue -- the quiet body replicates the plain row mapping's barrier sequence and none of the bias barriers (got "
+                f"BIAS_MODE={getattr(cfg, 'BIAS_MODE', 0)}, N_CHUNK={getattr(cfg, 'N_CHUNK', 0)}, PACK_GQA={cfg.PACK_GQA}, THD_VARLEN={cfg.THD_VARLEN}, "
+                f"EPILOGUE_GATE={getattr(cfg, 'EPILOGUE_GATE', 0)}); a bias arm kept quiet would skip the mb_bias_full wait its init count expects",
+            ),
+            (
+                not (
                     int(getattr(cfg, "PADDED_TAIL_FORM", 0)) == 1
                     and (cfg.MASK_FLAGS != MASK_PADDED or int(getattr(cfg, "BIAS_MODE", 0)) or int(getattr(cfg, "KV_MASK_FORM", 0)))
                 ),
@@ -1870,6 +1940,20 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
             f"(MASK_FLAGS == MASK_PADDED alone, no bias / kv_mask); got MASK_FLAGS={mask_flags}, bias_mode={bias_mode}, kv_mask_form={kv_mask_form}, "
             f"TILE_K={tile_k}, dtype_qkv={params.dtype_qkv}"
         )
+    # The dead-sub-tile quiet body (TemplateParams.dead_subtile_quiet, appended; read through getattr so a record without the field
+    # renders the full body): the one-batch-entry item of the f16/bf16 small tiles without a bias -- the bias arms also wait and
+    # release the bias barriers per item, the pair item's dead sub-tile is the odd chunk tail, the d128 flavor keeps its rendering.
+    dead_subtile_quiet = int(getattr(params, "dead_subtile_quiet", 0))
+    if dead_subtile_quiet not in DEAD_SUBTILE_QUIET_FORMS:
+        raise ValueError(f"{flavor}: dead_subtile_quiet must be 0 (the full body on a dead sub-tile) or 1 (the quiet body); got {dead_subtile_quiet}")
+    if dead_subtile_quiet == 1 and (
+        bias_mode or pair or tile_k > 64 or mxfp8 or params.dtype_qkv <= _DTYPE_E5M2 or params.pack_gqa or params.thd_varlen or params.epilogue_gate
+    ):
+        raise ValueError(
+            f"{flavor}: dead_subtile_quiet=1 (the dead-sub-tile quiet body) is wired on the f16/bf16 32- / 64-wide tiles' one-batch-entry item "
+            f"without a bias, PackGQA, THD or the gated epilogue only; got bias_mode={bias_mode}, n_chunk={n_chunk}, TILE_K={tile_k}, "
+            f"dtype_qkv={params.dtype_qkv}, pack_gqa={params.pack_gqa}, thd_varlen={params.thd_varlen}, epilogue_gate={params.epilogue_gate}"
+        )
     cls = {192: CfgD192, 128: CfgD128, 64: CfgD64, 32: CfgD32}[tile_k]
     if tile_k <= 64:
         # The small tiles are the f16/bf16 kernel's: the quantized d128 files keep TILE_K = 128 (their k_dim / SF geometry
@@ -1914,6 +1998,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
         MASK_FLAGS=mask_flags,
         PADDED_TAIL_FORM=padded_tail_form,
+        DEAD_SUBTILE_QUIET=dead_subtile_quiet,
         WINDOW_LEFT=win_l,
         WINDOW_RIGHT=win_r,
         BOTTOM_RIGHT=bottom_right,

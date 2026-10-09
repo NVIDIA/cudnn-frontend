@@ -70,6 +70,7 @@ from cudnn.sdpa.fwd.config_sm107 import BIAS_RING_STAGES as _BIAS_RING_STAGES
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_mode_pick as _sm107_bias_mode_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_stages_pick as _sm107_bias_stages_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_padded_tail_form_pick as _sm107_padded_tail_form_pick, PADDED_TAIL_FORMS as _PADDED_TAIL_FORMS
+from cudnn.sdpa.fwd.config_sm107 import sm107_dead_subtile_quiet_pick as _sm107_dead_subtile_quiet_pick, DEAD_SUBTILE_QUIET_FORMS as _DEAD_SUBTILE_QUIET_FORMS
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
@@ -693,6 +694,7 @@ class SdpaFwdDsl(APIBase):
         bias_mode: Optional[int] = None,
         bias_stages: Optional[int] = None,
         padded_tail_form: Optional[int] = None,
+        dead_subtile_quiet: Optional[int] = None,
     ) -> None:
         """Capture the common SDPA operation and tuning contract.
 
@@ -827,6 +829,10 @@ class SdpaFwdDsl(APIBase):
         # the pick (config_sm107.sm107_padded_tail_form_pick), 0 / 1 = a request honoured on the eligible plan (padded, no bias / kv_mask,
         # no band, the 32- / 64-wide tiles) and declined typed elsewhere.
         self.padded_tail_form = None if padded_tail_form is None else int(padded_tail_form)
+        # `dead_subtile_quiet` (APPENDED) = the dead-sub-tile quiet body of the one-batch-entry item on the Rubin small tiles
+        # (TemplateParams.dead_subtile_quiet): None = the pick (config_sm107.sm107_dead_subtile_quiet_pick), 0 / 1 = a request honoured on
+        # the eligible plan (the 32- / 64-wide f16/bf16 tiles, no bias, no PackGQA / THD / gate) and declined typed elsewhere.
+        self.dead_subtile_quiet = None if dead_subtile_quiet is None else int(dead_subtile_quiet)
         self.amax_o_desc = self._make_tensor_desc(sample_amax_o, name="amax_o")
         # Fused epilogue gate (O := O * sigmoid(GATE)); None = ungated specialization.
         self.gate_desc = self._make_tensor_desc(sample_gate, name="gate") if sample_gate is not None else None
@@ -1635,7 +1641,29 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             has_bias=False,
             has_kv_mask=False,
             request=self.padded_tail_form,
+            tile_n=self._effective_tile_n(),
         )
+
+    def _dead_subtile_quiet_eligible(self) -> bool:
+        """Whether this plan runs the one-batch-entry item of the Rubin small tiles without a bias (``TemplateParams.dead_subtile_quiet``):
+        the only rendering whose dead softmax sub-tile (no live row) can take the quiet body -- the bias arms also wait and release the
+        bias barriers per item, which the quiet body does not replicate."""
+        return (
+            self._device_cc == (10, 7)
+            and not self._fp8
+            and self.flavor in _SM107_F16_SMALL_D_SHAPES
+            and not self.thd
+            and not self.pack_gqa
+            and self.gate_desc is None
+            and self.bias_desc is None
+        )
+
+    def _dead_subtile_quiet(self) -> int:
+        """The ``TemplateParams.dead_subtile_quiet`` of this plan: 0 off the eligible rendering; else the request (``dead_subtile_quiet=``,
+        validated by ``check_support``) or the pick (``config_sm107.sm107_dead_subtile_quiet_pick``: the default constant or the sweep seam)."""
+        if not self._dead_subtile_quiet_eligible():
+            return 0
+        return _sm107_dead_subtile_quiet_pick(self.flavor[0], has_bias=False, pair_item=False, request=self.dead_subtile_quiet)
 
     def check_support(self) -> bool:
         self._logger.debug("Entering check_support")
@@ -2110,6 +2138,18 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"KV lengths or an S_kv off the tile multiple, no bias / kv_mask, no causal / sliding-window band); head dims ({d_qk}, {d_v}) select "
             f"{self.flavor} on cc {self._device_cc}, padded={bool(self.seq_kv_lens_present)}, bias={self.bias_desc is not None}, "
             f"kv_mask={self.kv_mask_desc is not None}, causal={self.is_causal}, window=({self.window_size_left}, {self.window_size_right})",
+        )
+        # The dead-sub-tile quiet body (dead_subtile_quiet=): a REQUEST is honoured on the Rubin small tiles' bias-less one-batch-entry
+        # plan and declined typed everywhere else (never degraded); None = the pick.
+        self._value_error_if(
+            self.dead_subtile_quiet is not None and self.dead_subtile_quiet not in _DEAD_SUBTILE_QUIET_FORMS,
+            f"dead_subtile_quiet must be 0 (the full body on a dead sub-tile) or 1 (the quiet body); got {self.dead_subtile_quiet}",
+        )
+        self._not_implemented_error_if(
+            self.dead_subtile_quiet is not None and not self._dead_subtile_quiet_eligible(),
+            f"dead_subtile_quiet={self.dead_subtile_quiet} selects the dead-sub-tile body of the Rubin f16/bf16 32- / 64-wide tiles' one-batch-entry "
+            f"item (no bias, no PackGQA / THD / gated epilogue); head dims ({d_qk}, {d_v}) select {self.flavor} on cc {self._device_cc}, "
+            f"bias={self.bias_desc is not None}, pack_gqa={self.pack_gqa}, thd={self.thd}, gate={self.gate_desc is not None}",
         )
         if self.bias_desc is not None or self.kv_mask_desc is not None:
             # The resident-block arms bind through the PREPARED launch only: the staging-copy executor (a layout TMA cannot bind
@@ -2701,6 +2741,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # The PLAIN padded body's tail form on the Rubin small tiles (0 = the legacy second masked body, 1 = the pre-masked tail): the
             # request, else the pick; 0 on every other rendering.
             padded_tail_form=self._padded_tail_form(),
+            # The dead-sub-tile quiet body of the one-batch-entry item (0 = the full body on a dead sub-tile, 1 = the quiet body): the
+            # request, else the pick; 0 on every other rendering.
+            dead_subtile_quiet=self._dead_subtile_quiet(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

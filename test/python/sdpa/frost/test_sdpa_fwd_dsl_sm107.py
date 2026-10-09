@@ -148,7 +148,7 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     # second time (+37 ring, +8 idle: 34 / 13 -> 71 / 21; the pin was not moved with it and read stale until the streamed ring landed).
     # +2 RING waits since the STREAMED bias ring (mb_bias_ring_full in the softmax kv body, mb_bias_ring_empty in the TMA-LDG fill helper:
     # per-kv-tile sites, so they take the module constant; the two item-level mb_bias_full / mb_bias_empty waits stay idle).
-    ("f16", (128, 128)): (True, 73, 21),
+    ("f16", (128, 128)): (True, 75, 21),  # +2 ring waits: the dead-sub-tile QUIET body's mb_bmm1_done / mb_stat_empty (per kv tile, the live body's two sites)
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait
