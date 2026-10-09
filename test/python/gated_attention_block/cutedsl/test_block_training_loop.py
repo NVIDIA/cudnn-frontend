@@ -19,8 +19,9 @@ What is pinned here:
   with ``B`` (unfused training pipeline and fully fused inference fork, per-tensor fp8 and MXFP8), the scalars read back as ``B``'s,
   the fused fp8 fork's scale vector follows, and under ``o_fp4`` the call validates and records (nothing to write);
 * the refusals, typed, BEFORE any write (host: any CUDA device);
-* stream ordering: an update + execute on a side stream while the default stream is parked equals the eager result, and the FIRST
-  execute of a compiled block writes the scalars on its own launch stream (compile-time fills poisoned on purpose);
+* stream ordering: an update + execute on a side stream while the default stream is parked equals the eager result, the FIRST
+  execute of a compiled block writes the scalars on its own launch stream (the allocated scalars poisoned on purpose), and a
+  recalibration on a side stream outlives pending work on the stream ``compile()`` ran on (it allocates and never fills);
 * the backward API changes the prologue's constants: ``quant_scalars()`` reads ``B``'s values and the gradients equal a backward
   DECLARED with ``B``, bitwise;
 * the margin reaches every quantize launch: ``scale_dy / scale_do / scale_dqkvg`` (``scale_dy`` alone under MXFP8) are
@@ -428,9 +429,9 @@ def test_update_quant_scales_is_stream_ordered(family, how):
 @_FAMILY
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
 def test_first_execute_writes_the_scales_on_its_launch_stream(family, how, tmp_path):
-    """``compile()`` fills the device scalars on whatever stream is ambient then; the FIRST execute writes their VALUES again on ITS
-    launch stream, so a block compiled on one stream and first executed on another reads what its execution stream wrote.  Pinned
-    without a timing window: the compile-time values are POISONED to NaN (synchronously) after ``compile()`` and the first execute runs
+    """``compile()`` only ALLOCATES the device scalars; the FIRST execute writes their VALUES on ITS launch stream, so a block compiled
+    on one stream and first executed on another reads what its execution stream wrote.  Pinned
+    without a timing window: the allocated scalars are POISONED to NaN (synchronously) after ``compile()`` and the first execute runs
     on a side stream (ambient, or explicit with the ambient stream left at the default stream) -- its output is bitwise the
     synchronised run's and the scalars read back as ``spec``'s.
     The write is one-shot per compile: a second poison is NOT repaired by the second execute (``update_quant_scales`` is the caller's
@@ -487,6 +488,57 @@ def test_first_execute_writes_the_scales_on_its_launch_stream(family, how, tmp_p
     _execute_fwd(ref, blk, out2, ws, saved=_record(ref))
     torch.cuda.synchronize()
     assert torch.equal(out2, ref.out)
+
+
+@requires_rubin
+@_FAMILY
+@pytest.mark.parametrize("pipeline", ["unfused_training", "fused_inference"])
+def test_update_quant_scales_outlives_pending_work_on_the_compile_stream(family, pipeline):
+    """``compile()`` ALLOCATES the device scalars and writes nothing: a block compiled while its ambient stream is PARKED behind a long
+    spin, recalibrated with ``update_quant_scales(B)`` and executed on a side stream, reads ``B`` -- on that first execute AND on a
+    later one after the parked stream has drained.  A compile-time fill of the scalars (or of the fused fp8 fork's scale vector) on the
+    parked stream would land AFTER the update and silently restore ``A`` for every later execute (the first-execute write is one-shot)
+    while ``blk.quant`` still said ``B``.  Both pipelines of both families; the park must still be pending at the update (asserted, so
+    the cell cannot pass vacuously)."""
+    fused = pipeline == "fused_inference"
+    if fused:
+        _skip_without_the_fused_fork(family)
+    kw = dict(fuse_norm_rope=True, fuse_gate=True) if fused else {}
+    r = _declare_quant(_GEOM, _B, _S, family, training=not fused, scale_o=1.0 if (fused and family == "mxfp8") else None, **kw)
+    a = r.spec
+    b = _spec_b(a, fused=fused)
+    blk_b, out_b = _fwd_block_with(r, b, training=not fused, **kw)
+    ws_b = _compile(blk_b)  # also warms the artifact caches, so the compile behind the park below is short against it
+    saved_b = _record(r) if not fused else None
+    _execute_fwd(r, blk_b, out_b, ws_b, saved=saved_b)
+    torch.cuda.synchronize()
+    assert not torch.equal(out_b, r.out) or fused, "B must move the output, or the pin proves nothing"
+    side = torch.cuda.Stream()
+    out1, out2 = torch.empty_like(r.out), torch.empty_like(r.out)
+    saved1 = _record(r) if not fused else None
+    saved2 = _record(r) if not fused else None
+    torch.cuda.synchronize()
+    assert torch.cuda.current_stream() == torch.cuda.default_stream()
+    park_the_default_stream(seconds=6.0)  # compile()'s ambient stream: anything it enqueued there lands only after the spin
+    ws = _compile(r.blk)
+    with torch.cuda.stream(side):
+        r.blk.update_quant_scales(b)
+        _execute_fwd(r, r.blk, out1, ws, saved=saved1)
+    assert not torch.cuda.default_stream().query(), "the park drained before the update: the race window closed, lengthen the park"
+    side.synchronize()
+    torch.cuda.synchronize()  # the park drains: whatever compile() enqueued on the default stream has landed by now
+    with torch.cuda.stream(side):
+        _execute_fwd(r, r.blk, out2, ws, saved=saved2)
+    torch.cuda.synchronize()
+    assert torch.equal(out1, out_b), "the first execute after the cross-stream update does not read B"
+    assert torch.equal(
+        out2, out_b
+    ), f"an execute after the compile stream drained reads scales a compile-time write restored: max {(out2.float() - out_b.float()).abs().max().item():.3e}"
+    assert _dev_values(r.blk) == _f32_values(r.blk._quant_dev_values(b)), "the device scalars were overwritten after the update"
+    if fused and family == "fp8":
+        assert r.blk._proj._qscal.tolist() == [_f32(v) for v in (b.alpha_qkvg, b.scale_q, b.scale_k, b.scale_v)]
+    if not fused:
+        assert torch.equal(saved2.o, saved_b.o) and torch.equal(saved2.lse, saved_b.lse)
 
 
 # ---------------------------------------------------------------------------

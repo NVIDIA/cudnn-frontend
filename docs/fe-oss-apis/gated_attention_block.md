@@ -403,9 +403,10 @@ NaN scale is its `ValueError`), and a block not yet compiled (`RuntimeError`); u
 validates and records it. The per-layer recipe of a training loop: one compiled block pair per dtype configuration,
 `fwd.update_quant_scales(spec_l)` right before layer `l`'s forward and `bwd.update_quant_scales(spec_l)` right before its backward
 (autograd runs the backward long after every layer's forward, so the step's spec travels with the layer), `spec_l`'s `descale_*`
-from the tensors quantized this step and its activation scales from the previous step's record of that layer. The first `execute`
-of a compiled block also writes those scalars on its own launch stream, so a block compiled on one stream and first executed on
-another reads what its execution stream wrote.
+from the tensors quantized this step and its activation scales from the previous step's record of that layer. `compile()` only
+allocates those scalars; their values are written on the launch stream -- by the first `execute` of a compiled block and by every
+`update_quant_scales` -- never on the stream ambient at compile time, so a block compiled on one stream and recalibrated or first
+executed on another reads what its execution stream wrote, and nothing enqueued at compile time can land later and undo an update.
 
 #### Packed sequences (THD)
 
