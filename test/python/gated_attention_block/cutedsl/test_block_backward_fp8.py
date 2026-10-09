@@ -2088,10 +2088,10 @@ def test_fp8_thd_with_quant_is_served_at_declaration():
 
 @requires_cuda
 def test_fp8_reject_thd_with_mxquantspec():
-    """``thd=True`` with an ``MxQuantSpec`` stays the typed dense-only decline AT DECLARATION, naming BOTH attributes (no packed
-    MXFP8 training record exists; the SDPA-layout MX quantizes have no packed per-sequence arm), while the per-tensor fp8 sibling
-    is served packed (the test above).  The message does NOT tell the caller to build the plan without ``external_delta`` (the
-    adapter's text must never surface here)."""
+    """``thd=True`` with an ``MxQuantSpec`` stays the typed dense-only decline AT DECLARATION, naming BOTH attributes (the
+    backward's SDPA-layout MX quantizes run the quantizer's dense arm only; the packed MXFP8 training record exists, the packed
+    MXFP8 backward is a follow-up), while the per-tensor fp8 sibling is served packed (the test above).  The message does NOT
+    tell the caller to build the plan without ``external_delta`` (the adapter's text must never surface here)."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     t, dm = 256, _COMMON["d_model"]
     dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")

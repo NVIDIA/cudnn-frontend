@@ -4335,8 +4335,9 @@ class GatedAttentionBlockBwd(APIBase):
             # At construction, right after the THD shape facts and BEFORE any stage is built, so the decline names the block's
             # own attributes.  Independent of the record's content, so a placeholder record (no proj_slab yet) gets this answer
             # and not the gate-copy one.  The per-tensor fp8 backward (quant=QuantSpec) is SERVED packed -- the fp8 SDPA row's THD
-            # chain reads the gate backward's packed delta (_SdpaBwdFp8, "Packed sequences") -- the MXFP8 one is not, for the two
-            # reasons named, which land together with the MXFP8 forward's THD row.
+            # chain reads the gate backward's packed delta (_SdpaBwdFp8, "Packed sequences") -- the MXFP8 one is not, for the one
+            # reason named: its SDPA-layout MX quantize stages run the quantizer's dense arm only (the packed MXFP8 training record
+            # and the packed head-major delta both exist; the packed MXFP8 backward is a follow-up).
             raise ValueError(
                 "thd=True with quant=MxQuantSpec: the MXFP8 block backward is dense-only for now -- its SDPA-layout MX quantize stages run the quantizer's "
                 "dense arm only (the packed per-sequence scale-factor arm the packed MXFP8 forward uses is not wired into the backward yet), while the "
@@ -4804,7 +4805,8 @@ class GatedAttentionBlockBwd(APIBase):
         bounds ``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and
         ``num_sequences * max_seq_len >= T`` -- and, dense, the THD-only knobs
         refused (``thd`` together with an ``MxQuantSpec`` is declined at CONSTRUCTION,
-        naming both attributes: no packed MXFP8 training record exists; the per-tensor
+        naming both attributes: the backward's SDPA-layout MX quantizes run the quantizer's
+        dense arm only, the packed MXFP8 training record exists; the per-tensor
         fp8 backward is served packed); ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
         dense block; padding (``seq_lens_present`` or ``sample_saved.seq_lens``
         on a dense block -- the ``sdpa_bwd_sm107`` row declines it, a follow-up
