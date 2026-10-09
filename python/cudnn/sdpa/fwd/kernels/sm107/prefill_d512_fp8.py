@@ -82,6 +82,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.tma import cp_async_bulk_shared_cluster_shared_cta
@@ -704,7 +705,7 @@ def _kernel(
     _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
-    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
     o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     # ------------------------------------------------------------------
@@ -983,6 +984,8 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 sg0_mcast_mask=sg0_mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
         else:
             _mma_warp_non_leader(
@@ -1984,17 +1987,25 @@ def _compute_warp_group(
             # Write LSE — under cga2 each sg1 peer writes its half of O+LSE
             # rows (leader = [0:128], peer = [128:256]).  Per-thread row.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
-            # Gated exactly like the LSE write below.
-            if q_row_global < seqlen_q:
+            # ONE row bound for BOTH the LSE write and the amax atomic below.  They must stay tied: amax is an
+            # atomicMax, which only GROWS, so a single row past the sequence's own length folded in permanently
+            # inflates the graph's Amax_O for the whole tensor and no per-row check ever shows it.  Under THD the
+            # bound is the per-sequence Q length S_q_b, not the dense seqlen_q: with that bound the single-query
+            # THD draws of the cc 10.7 FP8 sweep reported Amax_O 2 % to 7x above the O they stored (the tile's
+            # other 127 rows, stale Q, are stored as zero but were still reduced).  Mirrors prefill_d512_mxfp8.
+            q_row_limit = seqlen_q
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                q_row_limit = _s_q_b
+            if q_row_global < q_row_limit:
                 nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
             if cutlass.const_expr(CFG.THD_VARLEN):
                 # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
                 # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
-                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
-                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
-                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < _s_q_b:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         # Written in the CALLER's layout, picked by the STATIC rank compile()
                         # baked in: token-major rank-2 [T, QH] (the DEFAULT) or head-major
@@ -2010,7 +2021,7 @@ def _compute_warp_group(
                                 lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < seqlen_q:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_arr[batch_idx, head_idx, q_row_global] = lse
 
@@ -2086,6 +2097,8 @@ def _mma_warp_group(
     mcast_mask,
     sg0_mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     """MMA warp leader — sg-conditional BMM1 (sg0 leader) or BMM2 (sg1 leader).
 
@@ -2133,7 +2146,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,

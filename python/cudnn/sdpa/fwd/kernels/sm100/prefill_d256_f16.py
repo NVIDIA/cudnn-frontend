@@ -974,6 +974,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -1813,14 +1814,14 @@ def _correction_warp_group(
                     lse_arr[split_idx, row_head_idx, _cu_q_b + q_row_global] = lse_val
                 elif cutlass.const_expr(len(lse_tensor.shape) == 2):
                     # token-major packed (T, H)
-                    lse_arr[_cu_q_b + q_row_global, head_idx] = lse_val
+                    lse_arr[_cu_q_b + q_row_global, row_head_idx] = lse_val
                 else:
                     # head-major packed (1, QH, head_stride)
                     if cutlass.const_expr(len(lse_tensor.shape) == 4):
                         # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
-                        lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
+                        lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse_val
                     else:
-                        lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse_val
+                        lse_arr[cutlass.Int32(0), row_head_idx, _cu_q_b + q_row_global] = lse_val
         else:
             if q_row_global < seqlen_q:
                 lse_arr = cutlass.make_array_view(lse_tensor)
@@ -2108,7 +2109,7 @@ def _host(
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
             cutlass.Int64(o_tensor.stride[1]),
-            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
+            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA // HEADS_PER_TILE),
             n_thd_units,  # persistent cluster count; also seeds the claim counter
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
             SPLIT_KV,
@@ -2159,8 +2160,8 @@ LSE_KINDS = ("dense", "token", "head", "padded")
 @lru_cache(maxsize=None)
 def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
-    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and PAGED_KV and not CFG.PACK_GQA):
-        raise ValueError("packed D256 split requires paged THD without PackGQA")
+    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and not CFG.PACK_GQA):
+        raise ValueError("packed D256 split requires THD without PackGQA")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     return _compile_thd_split_host(_host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=False)
 

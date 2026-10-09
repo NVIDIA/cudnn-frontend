@@ -1853,10 +1853,10 @@ _PAGED_UNWIRED_KERNELS = [
     ("sm100/prefill_d512_f16_2x2.py", 2, 2),
     ("sm107/prefill_d128_f16.py", 2, 2),
     ("sm107/prefill_d128_fp8.py", 0, 2),
-    ("sm107/prefill_d128_mxfp8.py", 0, 2),
+    ("sm107/prefill_d192_d128_mxfp8.py", 0, 2),
     ("sm107/prefill_d256_f16.py", 2, 2),
     ("sm107/prefill_d256_fp8.py", 0, 1),
-    ("sm107/prefill_d256_mxfp8.py", 0, 1),
+    ("sm107/prefill_d512_mxfp8.py", 0, 2),
 ]
 
 
@@ -1867,9 +1867,10 @@ def test_paged_unwired_kernels_refuse_paged_params(rel, dtype_qkv, cta_mma):
     family (per-tensor FP8 d128 is wired now, MXFP8 shares its dtype codes) and names
     the d192 flavor for the f16/bf16 kernel, so each d128 / d192x128 / d256 / d512 kernel
     file WITHOUT the PAGED_KV specialization -- the d192x128 / d256 / d512 FP8 flavors, the
-    d512 2x2-datapath twin and all six SM107 d128 / d256 siblings -- must refuse a paged
-    TemplateParams itself, at module scope -- never load its dense K/V descriptors over
-    a page pool."""
+    d512 2x2-datapath twin, the four SM107 d128 / d256 half and per-tensor FP8 siblings and
+    the SM107 d192x128 / d512 MXFP8 siblings (the SM107 d128 / d256 MXFP8 siblings carry
+    their own PAGED_KV loader) -- must refuse a paged TemplateParams itself, at module scope
+    (or in its config backstop) -- never load its dense K/V descriptors over a page pool."""
     from cudnn.frost.template_loader import load_template
     from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
@@ -1925,7 +1926,7 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="Rubin paged KV requires half D128/D256 THD"):
+    with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries and MXFP8 pools"):
         _api().check_support()
 
 
@@ -2338,13 +2339,14 @@ def _build_mxfp8(
     poison_dead_pages=True,
     q_bhsd=False,
     mixed_layout=False,
+    attn_scale=None,
 ):
-    """-> (graph, variant pack, O, Stats, amax, reference inputs)."""
+    """-> (graph, variant pack, O, Stats, amax, reference inputs).  ``attn_scale`` None = 1 / sqrt(d_qk)."""
     import cudnn
 
     dev = "cuda"
     fp8 = _FP8[in_key]
-    scale = 1.0 / math.sqrt(d_qk)
+    scale = 1.0 / math.sqrt(d_qk) if attn_scale is None else float(attn_scale)
     pools = _pools_mxfp8(B, KH, P, max_pages, hnd, fp8, d_qk=d_qk, d_v=d_v, separate_v=separate_v, batch_inner=batch_inner)
     if mixed_layout:  # HND K pool next to an NHD V pool
         pools["v_c"] = pools["v_c"].permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3) if hnd else pools["v_c"].contiguous()
@@ -2666,19 +2668,22 @@ def test_paged_mxfp8_graph_other_flavors(dims, hnd):
 
 
 @pytest.mark.L0
-def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
-    """check_support declines paged MXFP8 KV on a cc10.7 device (Rubin paged KV is half
-    THD only); the same adapter accepts the graph on the real SM100 device."""
-    import re
-
-    from cudnn.frost.buffers import cutedsl_arch_requirement_error
+@pytest.mark.parametrize("dims", [(128, 128), (256, 256), (192, 128), (512, 512)], ids=["d128", "d256", "d192x128", "d512"])
+def test_paged_mxfp8_adapter_sm107_device_contract(monkeypatch, dims):
+    """check_support on a mocked cc 10.7 device: MXFP8 pools are ACCEPTED on d128 / d256 (the cc 10.7 row's
+    paged_d_shapes -- the sm107 d128 / d256 MXFP8 kernels carry their own PAGED_KV loader) and declined on
+    d192x128 / d512 by the Rubin paged clause; the same adapter accepts every flavor on the real SM100 device.
+    The DSL's sm_107a model is monkeypatched (as the f16 twin does), so the paged capability boundary itself
+    is what is checked, not the worker's release DSL."""
+    from cudnn.frost import buffers
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
+    d_qk, d_v = dims
     B, H, KH, P, max_pages = 2, 8, 2, 128, 4
     dev = "cuda"
-    pools = _pools_mxfp8(B, KH, P, max_pages, False, _FP8["e4m3"])
-    Qb = torch.zeros(B, 1, H, D_MXFP8, device=dev, dtype=torch.float8_e4m3fn).transpose(1, 2)
-    Ob = torch.empty(B, 1, H, D_MXFP8, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+    pools = _pools_mxfp8(B, KH, P, max_pages, False, _FP8["e4m3"], d_qk=d_qk, d_v=d_v)
+    Qb = torch.zeros(B, 1, H, d_qk, device=dev, dtype=torch.float8_e4m3fn).transpose(1, 2)
+    Ob = torch.empty(B, 1, H, d_v, device=dev, dtype=torch.bfloat16).transpose(1, 2)
     lse = torch.empty(B, H, 1, device=dev, dtype=torch.float32)
 
     def _api():
@@ -2695,12 +2700,18 @@ def test_paged_mxfp8_adapter_declines_sm107_device(monkeypatch):
             paged_max_seq_len_kv=max_pages * P,
         )
 
-    _api().check_support()
+    _api().check_support()  # the real SM100 device: every flavor
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    # A DSL without sm_107a declines first; only a DSL that can target SM107 reaches the paged rule.
-    dsl_error = cutedsl_arch_requirement_error((10, 7))
-    with pytest.raises(NotImplementedError, match=re.escape(dsl_error) if dsl_error else "Rubin paged KV requires half D128/D256 THD"):
-        _api().check_support()
+    if dims in ((128, 128), (256, 256)):
+        try:
+            _api().check_support()
+        except NotImplementedError as e:  # an unrelated mocked-device decline fails visibly with its own text
+            assert "Rubin paged KV" not in str(e), e
+            raise
+    else:
+        with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries and MXFP8 pools"):
+            _api().check_support()
 
 
 @pytest.mark.L0

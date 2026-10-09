@@ -771,13 +771,14 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         assert (why is None) == (d_v == 128), (d_qk, d_v, why)
     for feature in (dict(thd=True, padded=True), dict(padded=True), dict(has_sink=True)):
         assert engines.mismatch(caps, _f16_facts(**feature), engines.SdpaFwdKnobs(split_kv=2)) is not None
-    assert engines.mismatch(caps, _f16_facts(), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
+    # THD nonpaged d128 unsplit has no packed leg (dense d128 packs on the shared SM100 body since issue #1472, below).
+    assert engines.mismatch(caps, _f16_facts(thd=True, padded=True), engines.SdpaFwdKnobs(pack_gqa=True)) is not None
 
     for d_qk, d_v, paged in ((128, 128, True), (192, 128, False)):
         facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
         knobs = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
-        assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is not None
+        assert (engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None) == paged
         bounded = dataclasses.replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
         assert engines.mismatch(caps, bounded, knobs) is None
         assert engines.mismatch(caps, dataclasses.replace(bounded, max_total_seq_len_q=None), knobs) is not None
@@ -786,6 +787,83 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
         assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
+        # cc 10.7 paged THD + attention sink: the sink composes with the paged THD leg -- unsplit, packed or not,
+        # at every cluster width the leg admits -- while dense paged queries and sink x split-KV keep their declines.
+        sink = dataclasses.replace(facts, has_sink=True)
+        gqa_sink = dataclasses.replace(sink, h_q=16, h_kv=2)
+        assert engines.mismatch(caps, sink, knobs) is None, d
+        assert engines.mismatch(caps, gqa_sink, dataclasses.replace(knobs, pack_gqa=True)) is None, d
+        if d == 128:
+            for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
+                assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
+        assert "THD queries" in engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs)
+        assert engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2)) is not None
+
+
+def test_sm107_dense_d128_shared_legs_admission():
+    """Issue #1472: the cc 10.7 half row admits the shared SM100 d128 bodies on DENSE d128 half graphs -- PackGQA (the
+    shared prefill body at cga2) and cga1 (the shared decode tile) -- and keeps every other leg where it was: the
+    pre-folded scale stays on the Rubin body (its arm is not in the shared bodies), dense d256 PackGQA stays declined,
+    THD nonpaged keeps the cga2 prefill pipeline, and the standalone cga domain mirrors the row (keep the three in
+    lockstep).  An MHA PackGQA pin is the bit-exact unpacked fold (PACK_G = 1), honorable as on the SM100 row; the
+    heuristics never propose it."""
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    pack, cga1 = engines.SdpaFwdKnobs(pack_gqa=True), engines.SdpaFwdKnobs(cga=1)
+    assert engines.mismatch(caps, _f16_facts(h_kv=2), pack) is None
+    assert engines.mismatch(caps, _f16_facts(h_kv=2, d_qk=64, d_v=64), pack) is None, "the d64 envelope rides the same bodies"
+    assert engines.mismatch(caps, _f16_facts(), pack) is None, "MHA: PACK_G = 1, the bit-exact unpacked fold (SM100 parity)"
+    assert "pre-folded" in engines.mismatch(caps, _f16_facts(h_kv=2, attn_scale_prefolded=True), pack)
+    assert engines.mismatch(caps, _f16_facts(h_kv=2, d_qk=256, d_v=256), pack) is not None
+    assert engines.mismatch(caps, _f16_facts(h_kv=2, s_q=4), cga1) is None
+    assert engines.mismatch(caps, _f16_facts(s_q=4), cga1) is None, "MHA rides the decode tile unpacked"
+    assert "outside this engine's domain" in engines.mismatch(caps, _f16_facts(h_kv=2, thd=True, padded=True), cga1)
+    assert "outside this engine's domain" in engines.mismatch(caps, _f16_facts(h_kv=2, attn_scale_prefolded=True), cga1)
+    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
+
+
+@pytest.mark.parametrize("dtype_name", ["HALF", "BFLOAT16"])
+@pytest.mark.parametrize("group", [2, 4, 8, 16])
+def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
+    """Packing is explicit and confined to the qualified paged half THD path."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
+    caps = _caps("sdpa_fwd_prefill_sm107")
+    dt = getattr(cudnn.data_type, dtype_name)
+    facts = _f16_facts(
+        h_q=group * 2,
+        h_kv=2,
+        d_qk=256,
+        d_v=256,
+        dtype=dt,
+        dtype_o=dt,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+    )
+    knobs = engines.SdpaFwdKnobs(cga=2, split_kv=1, pack_gqa=True)
+    assert engines.mismatch(caps, facts, knobs) is None
+    bounded = dataclasses.replace(facts, wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
+    assert engines.mismatch(caps, bounded, knobs) is None
+    # cc 10.7 paged THD + sink: the sink composes with paged D256 PackGQA (unsplit); sink x split stays declined.
+    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None
+    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), dataclasses.replace(knobs, split_kv=2)) is not None
+    for changed in (
+        dict(thd=False),
+        dict(has_paged_kv=False),
+        dict(device_cc=(10, 0)),
+        dict(device_cc=(10, 8)),
+        dict(h_q=6),
+    ):
+        assert engines.mismatch(caps, dataclasses.replace(facts, **changed), knobs) is not None, changed
+    for changed in (dict(cga=1), dict(split_kv=2)):
+        assert engines.mismatch(caps, facts, dataclasses.replace(knobs, **changed)) is not None, changed
+    blackwell = dataclasses.replace(facts, device_cc=(10, 0))
+    assert engines.mismatch(_caps("sdpa_fwd_prefill_sm100"), blackwell, knobs) is not None
 
 
 def test_sm107_fp8_pack_gqa_is_d128_only():
@@ -807,6 +885,15 @@ def test_sm107_fp8_pack_gqa_is_d128_only():
         assert why is not None and "pack_gqa" in why, (d_qk, d_v, why)
     packed_d128 = _f16_facts(**_fp8_ungated_kw(h_kv=2, d_qk=128, d_v=128))
     assert engines.mismatch(caps, packed_d128, engines.SdpaFwdKnobs(pack_gqa=True)) is None
+
+
+def test_sm107_fp8_paged_sink_declines():
+    """The paged + sink lift is the HALF row's: the Rubin per-tensor FP8 row has no paged capability, so a paged
+    THD + sink FP8 graph on cc 10.7 keeps its typed decline (the fp8 row's `paged_kv=not rubin_row`)."""
+    from cudnn.sdpa.fwd import engines
+
+    why = engines.mismatch(_caps("sdpa_fwd_prefill_sm107_fp8"), _quant_facts(has_paged_kv=True, page_size=16, padded=True, thd=True, has_sink=True))
+    assert why is not None and "paged" in why, why
 
 
 @pytest.mark.parametrize("family", ["fp8", "mxfp8"])
@@ -949,8 +1036,16 @@ def test_rubin_mxfp8_forward_row_exists():
     INVERTED 2026-09-09: d192xd128 gained a
     Rubin MXFP8 sibling, at cga2 ONLY -- at cga1 that flavor's scale-factor
     tiles start past the 256 KiB version-0 tcgen05 descriptor window.  SM100's
-    row stays capped at cc 10.6."""
+    row stays capped at cc 10.6.
+    INVERTED 2026-10-08: the row serves THD at d256 ONLY -- that body rides the
+    FROST THD contract at cga1 with the packed per-sequence-tile-padded
+    scale-factor layout, so ``thd_d_shapes`` is the config's
+    ``SM107_MXFP8_THD_SHAPES`` (one constant with the standalone wrapper's
+    Rubin THD gate and the config backstop); the d128 / d192xd128 / d512 MXFP8
+    bodies keep the pre-upstream THD arm and stay declined through it.
+    Split-KV and PackGQA stay declined row-wide."""
     from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 
     caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
     assert caps.is_mxfp8 is True
@@ -967,10 +1062,71 @@ def test_rubin_mxfp8_forward_row_exists():
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").cgas_by_d_shape != caps.cgas_by_d_shape
     # Exact-native only: the SF tensors are not zero-padded.
     assert caps.d_pad_multiple == 0
-    # The machinery the ported kernels lack stays declined.
-    assert caps.thd is False and caps.split_kv_supported is False
+    # THD at d256 only, on the named SET (never a bare True), with both length forms and
+    # the per-batch padded Stats layout like every other Rubin THD row.  The mismatch()
+    # walk over the row's d_shapes (admit exactly these, decline the rest typed) is
+    # test_sdpa_fp8_sm107.py::test_sm107_mxfp8_thd_shapes_match_the_row.
+    assert caps.thd is True
+    assert caps.thd_d_shapes is SM107_MXFP8_THD_SHAPES
+    assert caps.thd_d_shapes == frozenset({(256, 256)}) and caps.thd_d_shapes < caps.d_shapes
+    assert caps.thd_padded_stats is True and caps.cu_seq_len is True
+    # The machinery the ported kernels lack stays declined: split-KV and PackGQA.
+    assert caps.split_kv_supported is False
     assert caps.pack_gqas == frozenset({False})
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").sm_hi == 106
+
+
+def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
+    """The cc 10.7 MXFP8 row serves the SM100 paged MXFP8 pool contract (#1214) on d128 / d256 with DENSE queries:
+    F8_128x4 descale pools paging with K/V, page_size % 128, the sink / causal / bottom-right / SWA / padding masks,
+    Stats and the f16x2 exponent arm composed.  Declined, each by its own typed reason: page 64, THD queries over
+    pools (stage 2), the d192x128 / d512 pools (stage 3), a block-scaled O over pools, the pre-folded scale over paged
+    KV, pools without a padding mask, and split_kv > 1 (also with a sink).  The half row keeps its THD requirement
+    and the per-tensor FP8 row serves no paged KV."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    assert caps.paged_kv is True and caps.paged_d_shapes == frozenset({(128, 128), (256, 256)})
+    assert caps.sink is True and caps.thd is True and caps.thd_d_shapes == frozenset({(256, 256)})  # THD at d256 only (#1488); pools serve dense queries
+
+    def paged(**kw):
+        return _quant_facts(**{"is_mx": True, "has_paged_kv": True, "page_size": 128, "padded": True, **kw})
+
+    for d in (128, 256):
+        for extra in (
+            {},
+            dict(has_sink=True),
+            dict(causal=True, bottom_right=True, right_bound=0),
+            dict(page_size=256),
+            dict(dtype=cudnn.data_type.FP8_E5M2),
+            dict(window_left=128, causal=True, right_bound=0),
+            dict(s_q=1),
+            dict(wants_stats=True),
+            dict(softmax_precision=cudnn.data_type.HALF),
+            dict(has_sink=True, causal=True, bottom_right=True, right_bound=0, wants_stats=True, s_q=4),
+        ):
+            assert engines.mismatch(caps, paged(d_qk=d, d_v=d, **extra)) is None, (d, extra)
+    # The explicit knobs of the served plans: cga2 at d128, cga1 at d256, NATURAL, 128x128, unpacked, unsplit.
+    assert engines.mismatch(caps, paged(), SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)) is None
+    assert engines.mismatch(caps, paged(d_qk=256, d_v=256), SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)) is None
+    for kw, needle in (
+        (dict(page_size=64), "multiple of 128"),
+        (dict(thd=True), "THD"),
+        (dict(d_qk=192, d_v=128), "d128, d256 kernel flavors only"),
+        (dict(d_qk=512, d_v=512), "d128, d256 kernel flavors only"),
+        (dict(o_block_scale=32, dtype_o=cudnn.data_type.FP8_E4M3), "block-scaled O"),
+        (dict(attn_scale_prefolded=True), "paged-KV kernel bodies"),
+        (dict(padded=False), "use_padding_mask"),
+    ):
+        reason = engines.mismatch(caps, paged(**kw))
+        assert reason is not None and needle in reason, (kw, reason)
+    assert engines.mismatch(caps, paged(has_sink=True), SdpaFwdKnobs(split_kv=2)) is not None
+    # The half row: dense paged queries stay declined on cc 10.7 (THD queries are its paged form).
+    half = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(has_paged_kv=True, page_size=16, padded=True, thd=False))
+    assert half is not None and "THD queries" in half, half
+    assert not _caps("sdpa_fwd_prefill_sm107_fp8").paged_kv
 
 
 def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
@@ -2038,7 +2194,12 @@ def test_sm107_gate_kernel_signatures_are_append_only():
     ``gate_strides``) is always declared and compile() keys only what specializes the trace.
     Both quantized families use prepared pointer hosts with runtime gate strides.
     Their internal tensor host signatures remain append-only: ``gate_tensor``
-    immediately follows ``stream``; prepared flags may follow."""
+    immediately follows ``stream``; prepared flags may follow.  Ahead of ``stream``
+    the slot ORDER is the pointer host's ABI: ``_mxfp8_host._launch`` passes
+    everything up to ``seq_q_lens_addr`` positionally and, under ``thd_slots``,
+    the three THD length slots right after it (``stream=`` and the flags go by
+    keyword), so those slots are pinned by position on both Rubin d256
+    quantized kernels and on the SM100 MXFP8 twin the same host drives."""
     import inspect
 
     f16, fp8, mxfp8 = _all_gate_kernel_modules()
@@ -2069,10 +2230,21 @@ def test_sm107_gate_kernel_signatures_are_append_only():
         assert inspect.signature(mod._host).parameters["gate_tensor"].default is None
     for mod in (f16, fp8, mxfp8):
         assert "gate_tensor" in inspect.signature(mod._kernel).parameters and "tma_gate_desc" in inspect.signature(mod._kernel).parameters
-    # The MXFP8 kernel's SF totals stay keyword-only-in-effect AFTER seq_q_lens_addr and BEFORE stream;
-    # gate_tensor is the one parameter after stream.
+    # The THD length slots sit RIGHT AFTER seq_q_lens_addr and BEFORE stream: the positional tail the shared
+    # pointer hosts pass (_fp8_host._launch always, _mxfp8_host._launch under thd_slots), so a parameter inserted
+    # ahead of them would swallow the THD lengths.  The MXFP8 kernel reads its SF tile extents off the bound SF
+    # tensors -- the total_*_sf_tiles host parameters its pre-upstream THD arm kept in exactly these slots are
+    # gone (no caller ever passed them; the pointer hosts are the only callers).
+    thd_slots = ["thd_q_lens_tensor", "thd_kv_lens_tensor", "thd_lens_form"]
+    for mod in (fp8, mxfp8):
+        host = list(inspect.signature(mod._host).parameters)
+        at = host.index("seq_q_lens_addr")
+        assert host[at + 1 : at + 4] == thd_slots and host.index("thd_lens_form") < host.index("stream"), (mod.__name__, host[at:])
     mx_host = list(inspect.signature(mxfp8._host).parameters)
-    assert mx_host.index("seq_q_lens_addr") < mx_host.index("total_q_sf_tiles") < mx_host.index("total_kv_sf_tiles") < mx_host.index("stream"), mx_host
+    assert not {"total_q_sf_tiles", "total_kv_sf_tiles"} & set(mx_host), mx_host
+    sm100_mx_host = list(inspect.signature(_load(_D256, rubin=False, **_MXFP8_LOAD_KW)._host).parameters)
+    at = sm100_mx_host.index("seq_q_lens_addr")
+    assert sm100_mx_host[at + 1 : at + 4] == thd_slots, sm100_mx_host[at:]
 
     # Ungated f16: the gate slot is folded out (the fake is None iff CFG.EPILOGUE_GATE == 0).
     off = _load(_D256, rubin=True)
@@ -4281,7 +4453,7 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             1,
             "current_max = cute.math.max(max_a, max_b)\n",
             "reg_S_a = reg_S_a - new_total_max",
-            "current_max = cute.math.max(max_a, max_b) * scale_log2",
+            "current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)",
             "reg_S_a = reg_S_a * scale_log2 - new_total_max",
         ),
         (
@@ -4291,7 +4463,7 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             2,
             "current_max = current_max_raw\n",
             "reg_S_tile.vec - total_max",
-            "current_max = current_max_raw * scale_log2",
+            "current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)",
             "reg_S_tile.vec * scale_log2 - total_max",
         ),
     ],
@@ -4339,6 +4511,46 @@ def test_prefolded_scale_declines_the_single_cta_half_legs_on_the_adapter(monkey
     for (d, d_v), kw in (((192, 128), dict(cga=1, split_kv=1)), ((128, 128), dict(cga=1, split_kv=2))):
         plain = dict(common, softmax_scale_prefolded=False)
         assert _gate_api(d=d, d_v=d_v, **plain, **kw).check_support(), (d, d_v, kw)
+
+
+@requires_dsl
+def test_rubin_dense_d128_legs_load_the_shared_sm100_bodies():
+    """The loader's two dense cc 10.7 arms (issue #1472): dense d128 half at cta_mma=1 -> the shared DECODE tile
+    (sm100/decode_d128_f16.py, packed or not), dense packed d128 half at cga2 -> the shared SM100 prefill body, dense
+    unpacked cga2 -> the Rubin sibling, and the paged THD cga1 unsplit leg -> the shared prefill body (the two-slab paged
+    prefill, never the tile)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16
+
+    def where(**params):
+        mod = _load_sm100_kernel_module((128, 128), TemplateParams(dtype_qkv=DTYPE_BF16, **params), rubin=True)
+        return os.path.basename(os.path.dirname(mod.__file__)), os.path.basename(mod.__file__)
+
+    assert where(cta_mma=1) == ("sm100", "decode_d128_f16.py")
+    assert where(cta_mma=1, pack_gqa=True, qh_per_kh=8) == ("sm100", "decode_d128_f16.py")
+    assert where(cta_mma=2, pack_gqa=True, qh_per_kh=8) == ("sm100", "prefill_d128_f16.py")
+    assert where(cta_mma=2) == ("sm107", "prefill_d128_f16.py")
+    assert where(cta_mma=1, thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True, split_kv=1) == ("sm100", "prefill_d128_f16.py")
+
+
+def test_rubin_shared_dense_legs_decline_the_prefolded_scale_on_the_adapter(monkeypatch):
+    """Adapter twins of the dense cc 10.7 legs (CPU-side, the device pinned to cc 10.7): dense d128 half at cga=1 and
+    PackGQA at cga2 are ADMITTED (template_params carries the width / packing verbatim) and both DECLINE the pre-folded
+    scale (the shared bodies apply the scale in-kernel: a typed NotImplementedError, so the plan walk moves to the Rubin
+    cga2 body, which keeps the fold), while THD (ragged) at cga=1 keeps the existing decode-tile decline."""
+    import torch
+
+    _fake_cc(monkeypatch, (10, 7))
+    common = dict(d=128, d_v=128, dtype=torch.bfloat16, with_gate=False, h=8, h_kv=2, s=128)
+    api = _gate_api(**common, cga=1)
+    assert api.check_support() and api.template_params().cta_mma == 1
+    api = _gate_api(**common, cga=2, pack_gqa=True)
+    assert api.check_support() and api.template_params().pack_gqa is True and api.template_params().cta_mma == 2
+    for kw in (dict(cga=1), dict(cga=2, pack_gqa=True)):
+        with pytest.raises(NotImplementedError, match="apply the scale in-kernel"):
+            _gate_api(**common, softmax_scale_prefolded=True, scale_softmax=None, **kw).check_support()
+    assert _gate_api(**common, cga=2, softmax_scale_prefolded=True, scale_softmax=None).check_support(), "the Rubin cga2 body keeps the fold"
+    with pytest.raises(NotImplementedError, match="decode tile"):
+        _gate_api(**common, thd=True, seq_kv_lens_present=True, cga=1, split_kv=1).check_support()
 
 
 def test_softmax_arms_tag_reads_the_module_constants_and_the_stats_gate():
@@ -4862,9 +5074,9 @@ def _pertensor_fp8_oracle(qd, kd, vd, *, scale, causal, bottom_right, window_lef
     return o, lse, keyless
 
 
-def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom_right=False, window_left=None, cga=None):
+def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom_right=False, window_left=None, cga=None, scale_softmax=None):
     """Build, compile and launch the d256 per-tensor FP8 adapter (bf16 O); returns (api, O [b, hq, s_q, d], LSE or None).
-    O and LSE start as NaN sentinels so an unwritten cell stays visible."""
+    O and LSE start as NaN sentinels so an unwritten cell stays visible.  ``scale_softmax`` defaults to d ** -0.5."""
     import torch
     from cudnn import data_type as cudnn_dtype
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -4882,7 +5094,7 @@ def _run_d256_fp8(q8, k8, v8, descales, *, precision, with_stats, causal, bottom
         is_causal=causal,
         causal_bottom_right=bottom_right,
         window_size_left=window_left,
-        scale_softmax=d**-0.5,
+        scale_softmax=d**-0.5 if scale_softmax is None else scale_softmax,
         pertensor_fp8=True,
         dtype_o=torch.bfloat16,
         cga=cga,
@@ -5058,6 +5270,33 @@ def test_d256_fp8_softmax_tail_is_one_helper_at_four_sites():
     assert tail.count("cutlass.Float32), chunk_P_") == 2, "the f32 chain keeps its two Float32-pointer P stores"
     assert "reg_S = reg_S * scale_log2 - new_total_max" in tail and "reg_S - new_total_max\n" not in tail, "no pre-folded shift: the scale fold stays"
     assert "has_lse: cutlass.Constexpr[bool]," in wg.split(")")[0] and "has_lse=lse_tensor is not None," in code
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("with_stats", [True, False], ids=["stats", "nostats"])
+def test_d256_fp8_masked_leading_tile_keeps_rows_with_later_keys_finite(with_stats):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys: top-left causal with left bound 34 at S = 256 --
+    rows 161..255 have no key in tile 0 (keys 0..127) and their 34 keys in tile 1 -- under UNIT descales and attn_scale 1.  The
+    per-tensor kernel folds descale_q * descale_k into scale_log2, so this is the configuration (a producer whose values already sit
+    in the fp8 range) whose scaled mask sentinel, taken as the running max, overflows to -inf and reads -inf - (-inf) = NaN into P;
+    with the quantizer's amax / 448 descales the same tile publishes P = 1 instead, wiped by the next live tile's alpha = 0.  Measured
+    before the fix: O finite garbage of 1e32..1e34 (the NaN row-sum floored to 1e-30).  Every row has keys, so O and LSE are finite
+    and inside the module's d256 fp8 oracle bounds; the fix keeps a tile that is dead ahead of the first live key out of the running
+    state (total_max kept, alpha = 1, P = 0)."""
+    import torch
+
+    _d256_fp8_half_only()
+    # Values drawn INSIDE the fp8 range and bound with unit descales (not _pertensor_fp8_problem's amax / 448 quantizer, whose
+    # 448-scale codes under unit descales put the logits near 5e7, past fp32's resolution of the LSE): logits std ~36 at d = 256.
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q8, k8 = ((torch.randn(1, 256, h, 256, device="cuda", generator=gen) * 1.5).to(torch.float8_e4m3fn).transpose(1, 2) for h in (8, 2))
+    v8 = torch.randn(1, 256, 2, 256, device="cuda", generator=gen).to(torch.float8_e4m3fn).transpose(1, 2)
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    _, out, lse = _run_d256_fp8(q8, k8, v8, (unit, unit, unit), precision="float", with_stats=with_stats, causal=True, window_left=33, scale_softmax=1.0)
+    ref_o, ref_lse, keyless = _pertensor_fp8_oracle(q8.double(), k8.double(), v8.double(), scale=1.0, causal=True, bottom_right=False, window_left=33)
+    assert not keyless.any(), "geometry: every row keeps 34 keys"
+    assert torch.isfinite(out.float()).all(), f"{int((~torch.isfinite(out.float())).sum())} non-finite O cells"
+    _check_d256_fp8(out, lse, ref_o, ref_lse, keyless, with_stats=with_stats, tag="fp8 d256 masked leading tile")
 
 
 # --- the d256 f16/bf16 kernel: pre-folded softmax scale ----------------------------------------------------------------
@@ -5262,6 +5501,36 @@ def test_d256_half_prefolded_scale_matches_the_oracle(dtype_name, mask, with_sta
         lse_err = (lse_fold.double() - ref_fold_lse).abs().max().item()
         assert lse_err <= 5e-4, f"LSE max err {lse_err} vs the oracle (natural log)"
         assert (lse_base.double() - ref_base_lse).abs().max().item() <= 5e-4, "the unfolded control drifted from its own oracle"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefolded", [False, True], ids=["scaled", "prefolded"])
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
+def test_d256_half_masked_leading_tile_keeps_rows_with_later_keys_finite(dtype_name, prefolded):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys: top-left causal with left bound 34 at S = 256 --
+    rows 161..255 have no key in tile 0 (keys 0..127) and their 34 keys in tile 1 -- at attn_scale 1 on both chains.  The scaled
+    chain took the finite mask sentinel times scale_log2 > 1 (= -inf) as the running max and read -inf - (-inf) = NaN into P
+    (194,560 NaN O elements measured); the pre-folded chain kept the raw sentinel and published P = 1 per masked column.  Both now
+    select a tile that is dead ahead of the first live key out of the running state (total_max kept, alpha = 1, P = 0): O and LSE
+    finite and at the float64 oracle of the half operands each chain saw."""
+    import math
+
+    import torch
+
+    _d256_fold_board_only()
+    dt = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    attn_scale = 1.0
+    q0, q1, k, v = _d256_fold_operands(1, 8, 2, 256, 256, dt, prefold_scale=attn_scale * math.log2(math.e))
+    q = q1 if prefolded else q0
+    _, out, lse = _d256_fold_launch(q, k, v, with_stats=True, prefolded=prefolded, attn_scale=attn_scale, api_kw=dict(is_causal=True, window_size_left=33))
+    ref_o, ref_lse, live = _d256_fold_oracle(q, k, v, scale=math.log(2.0) if prefolded else attn_scale, causal=True, window_left=33)
+    assert live.all(), "geometry: every row keeps 34 keys"
+    assert torch.isfinite(out.float()).all(), f"{int((~torch.isfinite(out.float())).sum())} non-finite O cells"
+    assert torch.isfinite(lse).all(), f"{int((~torch.isfinite(lse)).sum())} non-finite LSE rows"
+    err, amax = (out.double() - ref_o).abs().max().item(), ref_o.abs().max().item()
+    assert err <= 0.1 * amax, f"O max err {err} vs the oracle (max|ref| {amax})"
+    lse_err = (lse.double() - ref_lse).abs().max().item()
+    assert lse_err <= 5e-4, f"LSE max err {lse_err:.2e} vs the oracle (natural log)"
 
 
 @pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
@@ -5658,9 +5927,15 @@ def test_d256_mxfp8_softmax_tail_is_shared_by_every_segment():
         "make_tmem_ptr(p_addr_b, cutlass.Float32)",
         "reg_S_a = reg_S_a - new_total_max",
         "reg_S_a = reg_S_a * scale_log2 - new_total_max",
-        "current_max = cute.math.max(max_a, max_b)\n",
+        "raw_max = cute.math.max(max_a, max_b)\n",
+        "current_max = raw_max\n",
+        "current_max = raw_max * scale_log2\n",
     ):
         assert arm in helper, f"_softmax_tail lacks the arm {arm!r}"
+    assert (
+        "total_max,alpha,new_total_max=running_max_step_finite_sentinel(raw_max,current_max,total_max,NEG_INF,RESCALE_THRESHOLD,masked=CFG.MASK_FLAGS!=MASK_NONE)"
+        in re.sub(r"\s+", "", helper)
+    ), "the running-max step (the leading-dead-tile guard) is the shared finite-sentinel helper, called with the RAW tile max"
     assert "fused_shift_f16_exp_chunk(" not in helper and "f16_exp_chunk(" not in helper.replace(
         "f16_exp_chunk_", ""
     ), "the ones-MMA (sum-less) helpers do not serve a register-sum kernel"
@@ -6947,3 +7222,76 @@ def test_sm107_d512_fp8_half_softmax_sass_pins(tmp_path, has_lse, f32_ex2_min, f
     ), f"the d512 fp8 HALF has_lse={has_lse} build spills ({stats['STL']} STL / {stats['LDL']} LDL, ceiling {spill_max})"
     if stats["REG"] >= 0:
         assert stats["REG"] <= reg_measured + _REG_SLACK, f"REG {stats['REG']} > {reg_measured} + {_REG_SLACK}"
+
+
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
+@pytest.mark.parametrize("stats", ["none", "ln", "log2"])
+def test_packed_sink_combine_counts_virtual_key_once(dtype_name, stats):
+    """An empty real-key row still has its sink; dead partials never read poison."""
+    import math
+    import torch
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+    from test_sdpa_split_combine_sm100 import _partials, _output, _strides
+
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Sink-aware packed split is qualified on SM107")
+    dtype = getattr(torch, dtype_name)
+    owner = comb.compile_ptr(
+        dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=stats != "none", stats_log2=stats == "log2", packed=True, has_sink=True
+    )
+    fn = positional_entry(owner)
+    b, h, sq, d = 1, 3, 7, 160
+    ostride, lstride = _strides(b, h, sq, d, "int64_singleton")
+    for splits in (2, 32, 33):
+        op, lp, _, _ = _partials(b, h, sq, d, splits)
+        o, ostorage, used = _output((b, sq, h, d), ostride, dtype)
+        lse, lstorage, lused = _output((b, h, sq), lstride, torch.float32) if stats != "none" else (None, None, None)
+        total = torch.tensor([sq], device="cuda", dtype=torch.int32)
+        sinks = torch.tensor([-torch.inf, 3, 1000], device="cuda")
+
+        def run():
+            fn(
+                op.data_ptr(),
+                lp.data_ptr(),
+                o.data_ptr(),
+                lse.data_ptr() if lse is not None else None,
+                (b, h, sq, d),
+                splits,
+                ostride,
+                lstride,
+                total.data_ptr(),
+                torch.cuda.current_stream().cuda_stream,
+                sinks.data_ptr(),
+            )
+
+        run()
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(captured):
+                run()
+            for live, changed_sink in ((sq, 3), (3, -120), (0, 10)):
+                total.fill_(live)
+                sinks[1] = changed_sink
+                # Padded partial capacity is intentionally unreadable data.
+                op[:, live:].fill_(torch.nan)
+                lp[:, :, live:].fill_(torch.nan)
+                ostorage.fill_(-31)
+                if lstorage is not None:
+                    lstorage.fill_(-31)
+                captured.replay()
+                scores = lp[:, :, :live].cpu().double()
+                virtual = sinks.cpu().double()[None, :, None].expand(1, h, live)
+                weights = torch.cat((scores, virtual), 0).softmax(0).nan_to_num()
+                values = op[:, :live].cpu().double().nan_to_num()
+                ref_o = (weights[:-1].permute(0, 2, 1)[..., None] * values).sum(0)
+                torch.testing.assert_close(o[0, :live].cpu().double(), ref_o, atol=0.004, rtol=0.004)
+                assert torch.all(o[:, live:] == -31)
+                assert torch.all(ostorage.cpu()[~used] == -31)
+                if lse is not None:
+                    ref_s = torch.cat((scores, virtual), 0).logsumexp(0) * (math.log2(math.e) if stats == "log2" else 1)
+                    torch.testing.assert_close(lse[0, :, :live].cpu().double(), ref_s, atol=2e-5, rtol=2e-5)
+                    assert torch.all(lse[:, :, live:] == -31)
+                    assert torch.all(lstorage.cpu()[~lused] == -31)
+        finally:
+            captured.reset()

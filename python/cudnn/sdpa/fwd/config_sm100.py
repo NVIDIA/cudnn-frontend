@@ -237,6 +237,12 @@ class TemplateParams:
     # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
     # role-split A/B arm).
     mma_2x2: bool = False
+    # attn_scale < 0: BMM1 negates Q (tcgen05 a_negate), so the kernel's raw-score max, masks and exp2 run on -S at
+    # |attn_scale| (#1435). APPEND-ONLY, default False.
+    negate_scores: bool = False
+    # A dense S_kv off the KV tile with no mask covering the tail: compile the padded mask against the scalar
+    # S_kv, with no per-batch lengths buffer (MASK_PADDED without SEQ_KV_LENS_PRESENT; #1425).
+    kv_tail_mask: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -265,23 +271,35 @@ _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
 
 
 def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
-    """Packed half partials: D128, nonpaged D192/V128, and SM107 paged D256."""
+    """Packed half partials for the explicitly wired native head geometries."""
     return (
         device_cc in ((10, 0), (10, 3), (10, 7))
         and not fp8
         and thd
         and not padded_stats
         and (
-            (d_shape == (128, 128) and max_q > (1 if paged else 0))
+            (device_cc in ((10, 0), (10, 3)) and paged and d_shape == (64, 64) and max_q > 0)
+            or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
-            or (device_cc == (10, 7) and paged and d_shape == (256, 256) and max_q > 0)
+            or (d_shape == (256, 256) and max_q > 0)
         )
     )
 
 
-def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv):
+def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
+    """Sink-aware packed combine, qualified on Rubin D128 paged half Q>1."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1
+
+
+def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
     """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
-    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+    # SM100 Q=1 keeps the existing ragged-Q decode/combine contract.
+    return (device_cc == (10, 7) or (device_cc == (10, 0) and max_q > 1)) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+
+
+def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
+    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
 def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
@@ -357,7 +375,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
-            (flavor == "d256" and k.cta_mma == 2 and k.paged_kv and not fp8 and not k.pack_gqa)
+            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
+            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
             or (
                 flavor == "d128"
                 and k.cta_mma == 1
@@ -377,13 +396,20 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
         if k.thd_varlen and not (
-            flavor == "d128"
-            and not fp8
+            not fp8
             and (
-                ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and k.split_kv > 1)
+                or (
+                    flavor == "d128"
+                    and (
+                        ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1)
+                        or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                    )
+                )
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
             )
         ):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 split")
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, or paged half d256 cga2 unsplit")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
@@ -448,7 +474,7 @@ def _mask_flags_from(params: TemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.thd_varlen or params.seq_kv_lens_present:
+    if params.thd_varlen or params.seq_kv_lens_present or params.kv_tail_mask:
         flags |= MASK_PADDED
     return flags
 
@@ -2478,7 +2504,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d64 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64 decode: f16 K=16 MMA phases"),
-        (cfg.THD_VARLEN == 0, "d64 decode: dense graphs only"),
+        (not cfg.THD_VARLEN or (cfg.SPLIT_KV > 1 and cfg.PAGED_KV), "d64 decode: THD requires paged split"),
         (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64 decode: BMM2 chunking is TILE_N-derived"),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
@@ -2500,13 +2526,14 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         raise ValueError(f"d64 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d64 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen:
-        raise ValueError("d64 decode: THD/varlen is not wired on the decode tile (dense graphs only)")
+    if params.thd_varlen and not (params.split_kv > 1 and params.paged_kv):
+        raise ValueError("d64 decode: THD requires paged split")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d64 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD64Decode(
+        THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
@@ -2648,7 +2675,7 @@ def canonicalize_d192_lowering(
     window_right = params.window_right
 
     template_window_right = window_right
-    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
+    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present and not params.kv_tail_mask:
         # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
         # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
         # right band no sequence reaches.  The band is a compile-time

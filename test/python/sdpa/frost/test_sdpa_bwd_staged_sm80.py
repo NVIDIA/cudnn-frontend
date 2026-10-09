@@ -101,6 +101,13 @@ def test_packed_staged_preserves_output_tail(dtype, d, dv, hkv, stats_layout):
                     tensor.view(changed.cap_q, changed.h).copy_(changed.lse[0].transpose(0, 1))
                 else:
                     tensor.view(1, changed.h, -1)[..., : changed.cap_q].copy_(changed.lse)
+            elif name.endswith("_ro"):
+                # The ragged offsets describe the layout and are read on device:
+                # re-lay them with the lengths (same per-port token stride).
+                kv_side = name.split("::")[-1].lower()[:-3] in ("k", "v", "dk", "dv")
+                old_cu, new_cu = (case.cu_k, changed.cu_k) if kv_side else (case.cu_q, changed.cu_q)
+                stride = int(tensor.view(-1)[-1].item()) // old_cu[-1]
+                tensor.copy_((torch.tensor(new_cu, device="cuda", dtype=tensor.dtype) * stride).view_as(tensor))
         for output in outputs:
             output.fill_(float("nan"))
         workspace.fill_(0xBD)

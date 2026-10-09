@@ -9,7 +9,6 @@ from functools import lru_cache
 import cutlass
 import cutlass.utils
 import jax
-import jax.numpy as jnp
 import ml_dtypes
 
 from cudnn.api_base import TupleDict, ceil_div
@@ -38,10 +37,6 @@ def sf_array(array):
     return array
 
 
-def sf_zeros(shape_dtype):
-    return jnp.zeros(shape_dtype.shape, jnp.uint8).view(shape_dtype.dtype)
-
-
 def sf_shape(rows, cols):
     return (1, ceil_div(rows, 128), ceil_div(ceil_div(cols, 32), 4), 32, 4, 4)
 
@@ -67,9 +62,9 @@ def check_grouped_shapes(inputs, outputs, *, backward):
     for name in ("sfa", "sfb"):
         if _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float8E8M0FNU:
             raise ValueError(f"{name} must contain E8M0 scale bytes")
-    for name in ("alpha", "beta", "norm_const"):
-        if name in inputs and _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float32:
-            raise ValueError(f"{name} must be float32")
+    for name, shape in (("alpha", (experts,)), ("beta", (experts,)), ("norm_const", (1,))):
+        if name in inputs and (tuple(inputs[name].shape) != shape or _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float32):
+            raise ValueError(f"{name} must have shape {shape} and dtype float32")
     if inputs["prob"].shape != (m,):
         raise ValueError("prob must have shape (m,)")
     if inputs["padded_offsets"].shape != (experts,) or _convert_to_cutlass_data_type(inputs["padded_offsets"].dtype) is not cutlass.Int32:
@@ -81,16 +76,16 @@ def check_grouped_shapes(inputs, outputs, *, backward):
         raise ValueError("d_dtype must be e4m3 for JAX backward; the packed backward quantizer does not support e5m2")
 
 
-def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn):
+def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn, discrete_col_sfd):
     check_grouped_shapes(inputs, outputs, backward=True)
     experts = inputs["b"].shape[0]
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-    config = (experts, mma_tiler_mn, cluster_shape_mn, margin)
+    config = (experts, mma_tiler_mn, cluster_shape_mn, margin, discrete_col_sfd)
     signature = tuple((name, tuple(t.shape), str(t.dtype)) for name, t in (*inputs.items(), *outputs.items()))
     validation_key = (config, signature)
     if validation_key not in validated_configs:
         samples = {f"sample_{name}": row_major_desc(t.shape, t.dtype, f"sample_{name}") for name, t in (*inputs.items(), *outputs.items())}
-        api = api_type(**samples, sf_vec_size=32, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
+        api = api_type(**samples, sf_vec_size=32, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn, discrete_col_sfd=discrete_col_sfd)
         api.check_support()
         if config not in kernel_cache:
             kwargs = dict(
@@ -99,7 +94,7 @@ def grouped_plan(api_type, inputs, outputs, *, mma_tiler_mn, cluster_shape_mn):
                 use_2cta_instrs=api.use_2cta_instrs,
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=api.cluster_shape_mn,
-                discrete_col_sfd=False,
+                discrete_col_sfd=discrete_col_sfd,
                 expert_cnt=experts,
                 use_mono_increase_expert_idx=True,
                 vectorized_f32=False,
@@ -124,15 +119,16 @@ def check_jax_inputs(inputs):
 
 
 @lru_cache(maxsize=128)
-def grouped_call(adapter, kernel, mac, input_types, output_types):
+def grouped_call(adapter, kernel, mac, input_types, output_types, *, backward, **scalars):
     return call(
         adapter,
         output_shape_dtype=output_types,
         input_spec=tuple(row_spec(t) for t in input_types),
         output_spec=tuple(row_spec(t) for t in output_types),
-        initialized_outputs={0: zeros_init, 1: zeros_init, 2: zeros_init, 3: sf_zeros, 4: sf_zeros},
+        initialized_outputs={2: zeros_init} if backward else None,
         kernel=kernel,
         mac=mac,
+        **scalars,
     )
 
 
@@ -143,11 +139,18 @@ def check_jax_wrapper_options(
     sf_vec_size,
     vector_f32,
     m_aligned,
-    discrete_col_sfd,
     current_stream,
     epilogue_op=None,
     dprob_tensor_buf=None,
     amax_tensor_buf=None,
+    bias_tensor=None,
+    b_ptrs=None,
+    sfb_ptrs=None,
+    b_major="k",
+    use_dynamic_sched=False,
+    use_single_group_runtime_offsets=False,
+    sf_fp8_dtype_override=None,
+    scheduler_counter_tensor=None,
 ):
     options = {
         "acc_dtype": acc_dtype is None or _convert_to_cutlass_data_type(acc_dtype) is cutlass.Float32,
@@ -155,11 +158,18 @@ def check_jax_wrapper_options(
         "sf_vec_size": sf_vec_size == 32,
         "vector_f32": not vector_f32,
         "m_aligned": m_aligned == 256,
-        "discrete_col_sfd": not discrete_col_sfd,
         "current_stream": current_stream is None,
         "epilogue_op": epilogue_op in (None, "none", "identity"),
         "dprob_tensor_buf": dprob_tensor_buf is None,
         "amax_tensor_buf": amax_tensor_buf is None,
+        "bias_tensor": bias_tensor is None,
+        "b_ptrs": b_ptrs is None,
+        "sfb_ptrs": sfb_ptrs is None,
+        "b_major": b_major == "k",
+        "use_dynamic_sched": not use_dynamic_sched,
+        "use_single_group_runtime_offsets": not use_single_group_runtime_offsets,
+        "sf_fp8_dtype_override": sf_fp8_dtype_override is None,
+        "scheduler_counter_tensor": scheduler_counter_tensor is None,
     }
     for name, supported in options.items():
         if not supported:

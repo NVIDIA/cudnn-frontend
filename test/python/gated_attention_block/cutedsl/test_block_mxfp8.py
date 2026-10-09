@@ -71,6 +71,9 @@ from gated_block_reference import (  # noqa: E402
 _SM107 = (10, 7)
 E4M3 = torch.float8_e4m3fn
 _SENTINEL = 1.5e30  # a finite magnitude no correct output cell can hold; survivors localize an unwritten region
+MX_COS_FLOOR = (
+    0.99  # the ONE cosine floor of every MXFP8 fake-quant oracle cell (the kernels' unit-scale e4m3 P is not replicated); the packed suite imports it
+)
 _FUSED = dict(fuse_norm_rope=True, fuse_gate=True)
 _GEOM = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 # The unfused MXFP8 stage list, in pipeline order (FROZEN: block_perf_table / block_fusion_table code against it).
@@ -601,7 +604,7 @@ def test_sf_swizzle_round_trips_and_pads_to_whole_atoms():
 @pytest.mark.parametrize("seq_len, causal", [(256, True), (1000, True), (256, False), (1024, False)])
 def test_mxfp8_block_matches_the_fake_quant_oracle(seq_len, causal):
     """Causal covers a KV tail (S=1000: the quantize stages write the pad rows' SF as 0x00 exactly like the
-    torch oracle pads); dense needs S % 128 == 0 (see the decline test).  B=2 so V's D-plane-major SF stride
+    torch oracle pads); a dense KV tail is masked in-kernel (see the dense-tail test).  B=2 so V's D-plane-major SF stride
     (B*KH*n_tiles*512) is exercised past the (b=0, h=0) coincidence."""
     out, ref, blk, _, spec = _run_mx_block({**_GEOM, "is_causal": causal}, batch=2, seq_len=seq_len, sentinel=True)
     assert [s.name for s in blk._stages] == _MX_STAGES
@@ -610,7 +613,7 @@ def test_mxfp8_block_matches_the_fake_quant_oracle(seq_len, causal):
     c = _cos(out, ref)
     rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
     print(f"\nmxfp8 block S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e} scale_o={spec.scale_o:.4g} proj route={blk._proj._plan.route}")
-    assert c > 0.99, f"mxfp8 block cos {c}"
+    assert c > MX_COS_FLOOR, f"mxfp8 block cos {c}"
 
 
 @requires_rubin
@@ -623,7 +626,7 @@ def test_mxfp8_sf_order_s_sweep_does_not_degrade_with_s():
         out, ref, _, _, _ = _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=s)
         cs[s] = _cos(out, ref)
     print("\nmxfp8 SF-order S-sweep (B=1 dense): " + "  ".join(f"S={s}: cos={c:.6f}" for s, c in cs.items()))
-    assert all(c > 0.99 for c in cs.values()), cs
+    assert all(c > MX_COS_FLOOR for c in cs.values()), cs
     assert max(cs.values()) - min(cs.values()) < 5e-3, f"cosine drifts with S -- an SF layout bug: {cs}"
 
 
@@ -649,7 +652,7 @@ def test_mxfp8_dead_padded_entry_is_exactly_zero(kw):
     assert (out[1] == 0).all(), f"the dead entry must be EXACTLY zero (select, not residue * sigmoid); max|out[1]| = {out[1].abs().max().item()}"
     c = _cos(out[0], ref[0])
     print(f"\nmxfp8 {'fused' if kw else 'unfused'} block dead entry S={s}: live cos={c:.6f}")
-    assert c > 0.99, f"live entry cos {c}"
+    assert c > MX_COS_FLOOR, f"live entry cos {c}"
 
 
 @requires_rubin
@@ -669,7 +672,7 @@ def test_mxfp8_ragged_padded_entries_match_the_oracle():
     assert torch.isfinite(out.float()).all()
     cs = [_cos(out[i], ref[i]) for i in range(2)]
     print(f"\nmxfp8 block ragged padding S={s} seq_lens={seq_lens.tolist()}: cos per entry={[f'{c:.6f}' for c in cs]} scale_o={spec.scale_o:.4g}")
-    assert all(c > 0.99 for c in cs), f"ragged padded entries cos {cs}"
+    assert all(c > MX_COS_FLOOR for c in cs), f"ragged padded entries cos {cs}"
 
 
 @requires_rubin
@@ -745,7 +748,7 @@ def test_mxfp8_fused_block_matches_the_fake_quant_oracle(seq_len, causal):
     c = _cos(out, ref)
     rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
     print(f"\nmxfp8 FUSED block B={b} S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e}")
-    assert c > 0.99, f"fused mxfp8 block cos {c}"
+    assert c > MX_COS_FLOOR, f"fused mxfp8 block cos {c}"
     out2 = torch.full_like(out, _SENTINEL)
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
     _execute(blk, mx, out2, ws)
@@ -766,8 +769,13 @@ def test_mxfp8_fused_declines_ragged_s_at_b_gt_1():
 
 
 @requires_rubin
-def test_mxfp8_dense_kv_tail_is_declined_not_computed_wrong():
-    """The Rubin MXFP8 SDPA leaves a dense KV tail unmasked, so the adapter DECLINES S % 128 != 0 without a padding
-    mask or a causal mask -- the block surfaces that at check_support, typed."""
-    with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
-        _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000)
+def test_mxfp8_dense_kv_tail_is_masked_not_computed_wrong():
+    """A dense S % 128 != 0 with no padding mask: the SDPA adapter compiles the padded mask against the scalar S_kv
+    (kv_tail_mask, #1520), so the block serves it and the KV tail stays out of the softmax -- the oracle, at the same
+    cosine floor as the matrix, and every output cell written."""
+    out, ref, _, _, _ = _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000, sentinel=True)
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    c = _cos(out, ref)
+    print(f"\nmxfp8 block dense KV tail S=1000: cos={c:.6f}")
+    assert c > MX_COS_FLOOR, f"mxfp8 dense KV tail cos {c}"

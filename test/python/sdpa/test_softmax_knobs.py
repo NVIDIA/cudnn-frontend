@@ -50,10 +50,15 @@ def test_fp8_row_serves_the_half_exponent_only(flavor):
 
 
 @pytest.mark.parametrize("flavor", FLAVORS)
-def test_mxfp8_row_serves_all_four_sets_dense_only(flavor):
+def test_mxfp8_row_serves_all_four_sets_dense_and_the_half_exponent_over_pools(flavor):
     assert sk.served_softmax_knob_sets("mxfp8", *flavor) == (DEFAULT, HALF_SET, FOLD_SET, BOTH)
-    assert sk.served_softmax_knob_sets("mxfp8", *flavor, thd=True) == (DEFAULT,), "no MXFP8 THD on cc 10.7"
-    assert sk.served_softmax_knob_sets("mxfp8", *flavor, paged=True) == (DEFAULT,), "no MXFP8 paged KV on cc 10.7"
+    assert sk.served_softmax_knob_sets("mxfp8", *flavor, thd=True) == (
+        (DEFAULT, HALF_SET, FOLD_SET, BOTH) if flavor == (256, 256) else (DEFAULT,)
+    ), "MXFP8 THD on cc 10.7 is the d256 body only (#1488)"
+    assert sk.served_softmax_knob_sets("mxfp8", *flavor, thd=True, paged=True) == (DEFAULT,), "no MXFP8 THD over pools"
+    assert sk.served_softmax_knob_sets("mxfp8", *flavor, paged=True) == (
+        (DEFAULT, HALF_SET) if flavor in ((128, 128), (256, 256)) else (DEFAULT,)
+    ), "MXFP8 pools on cc 10.7: the f16x2 exponent composes with the page loader; the fold stays declined over paged KV"
 
 
 def test_inexact_flavors_and_unknown_families():
@@ -98,7 +103,7 @@ def test_mirror_agrees_with_the_engine_rows_and_config_tables(family, flavor, pa
     if family == "fp8":
         assert caps.attn_scale_prefolded_d_shapes is None, "per-tensor FP8 must keep the fold declined (descale contract)"
     if family == "mxfp8":
-        assert not caps.thd and not caps.paged_kv
+        assert caps.thd and caps.thd_d_shapes == frozenset({(256, 256)}) and caps.paged_kv and caps.paged_d_shapes == frozenset({(128, 128), (256, 256)})
 
 
 def test_every_served_set_is_well_formed():

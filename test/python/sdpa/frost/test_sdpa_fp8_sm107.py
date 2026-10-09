@@ -282,6 +282,37 @@ def test_fp8_thd_leg_loads(rubin):
     assert mod.CGA_TILE_M == mod.CFG.TILES_Q * mod.CFG.TILE_M * mod.CFG.CTA_MMA
 
 
+def test_mxfp8_thd_leg_loads():
+    """The FROST THD contract is baked into the Rubin d256 MXFP8 body: a THD specialization template-loads with the
+    flag folded in, the metadata overload set, the persistent claim-counter grid declared (THD_PERSISTENT -- the
+    adapter sizes the THD grid at min(envelope, resident) only for a module that declares it), the cga1 envelope tile
+    constant the adapter's plan-time grid derives from, and the setup-launch / persistent-scheduler helpers imported --
+    the static tell of the port.  The three other Rubin MXFP8 flavors keep the pre-upstream arm and the config declines
+    them, typed, before a body is rendered (the row declines them first through thd_d_shapes; reaching the config's
+    raise is an engine-row bug, not a user error).  End-to-end THD numerics ride test_sdpa_fwd_mxfp8_sm100.py's d256
+    THD cells on Rubin through the same adapter."""
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+    from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
+
+    def load(flavor, cta_mma):
+        params = TemplateParams(dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=cta_mma, thd_varlen=True, seq_kv_lens_present=True)
+        return _load_sm100_kernel_module(flavor, params, fp8=True, pertensor=False, rubin=True)
+
+    assert SM107_MXFP8_THD_SHAPES == frozenset({(256, 256)})
+    mod = load((256, 256), cta_mma=1)  # the row serves d256 MXFP8 at cga1 only (cgas_by_d_shape)
+    assert "sm107" in mod.__name__ and "mxfp8" in mod.__name__
+    assert mod.CFG.THD_VARLEN == 1
+    assert mod.CFG.SEQ_KV_LENS_PRESENT == 1  # THD overloads the metadata buffer
+    assert mod.CFG.CTA_MMA == 1
+    assert mod.THD_PERSISTENT is True
+    assert mod.CGA_TILE_M == mod.CFG.TILES_Q * mod.CFG.TILE_M * mod.CFG.CTA_MMA == 128  # the setup launch's cga_tile_m at cga1
+    for name in ("scheduler_warp_loop_persistent", "THD_SETUP_THREADS", "tma_tensormap_acquire", "compile_prepared"):
+        assert hasattr(mod, name), name
+    for flavor, cta_mma in (((128, 128), 2), ((192, 128), 2), ((512, 512), 2)):
+        with pytest.raises(ValueError, match="THD/varlen on the SM107 MXFP8 line is served by"):
+            load(flavor, cta_mma=cta_mma)
+
+
 def test_softmax_f16_module_derivation():
     """softmax_precision=HALF folds to the SM107 sibling's f16x2 exponent
     path (SOFTMAX_F16=1); the SM100 module refuses the flag outright."""
@@ -482,6 +513,94 @@ def _fp8_facts(**kw):
     )
     base.update(kw)
     return ga.SdpaGraphFacts(**base)
+
+
+def test_sm107_mxfp8_thd_shapes_match_the_row():
+    """The Rubin MXFP8 row's THD shape set is ONE object with the standalone adapter's Rubin THD gate and
+    the config constant (rule 8b'), the config's flavor-name twin spells the same shapes, and mismatch()
+    ADMITS a THD graph exactly at those shapes while DECLINING every other native MXFP8 shape with the
+    typed thd_d_shapes text -- iterating the row's own d_shapes rather than naming a literal, so a
+    widening of either side alone is caught (the FP8 envelope-floor pin's lesson)."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import _SM107_MXFP8_THD_SHAPES
+    from cudnn.sdpa.fwd.config_sm107 import _MXFP8_THD_FLAVORS, SM107_MXFP8_THD_SHAPES
+
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    rubin = caps[engines.engine_name(arch="sm107", mxfp8=True)]
+    assert rubin.thd and rubin.cu_seq_len and rubin.thd_padded_stats
+    assert rubin.thd_d_shapes is SM107_MXFP8_THD_SHAPES
+    assert _SM107_MXFP8_THD_SHAPES is SM107_MXFP8_THD_SHAPES
+    assert SM107_MXFP8_THD_SHAPES <= rubin.d_shapes
+    # The config's flavor-name twin (what _validate_params declines by) names exactly the same shapes.
+    assert {f"sm107 d{dq}{'' if dq == dv else f'xd{dv}'} mxfp8" for dq, dv in SM107_MXFP8_THD_SHAPES} == _MXFP8_THD_FLAVORS
+    # Dense stays served everywhere; THD is admitted exactly at the served shapes and declined, typed, elsewhere.
+    for dq, dv in sorted(rubin.d_shapes):
+        dense = _fp8_facts(is_fp8=False, is_mxfp8=True, dtype=cudnn.data_type.FP8_E4M3, device_cc=(10, 7), d_qk=dq, d_v=dv)
+        assert engines.mismatch(rubin, dense) is None, (dq, dv, engines.mismatch(rubin, dense))
+        thd = _fp8_facts(is_fp8=False, is_mxfp8=True, dtype=cudnn.data_type.FP8_E4M3, device_cc=(10, 7), d_qk=dq, d_v=dv, thd=True)
+        verdict = engines.mismatch(rubin, thd)
+        if (dq, dv) in SM107_MXFP8_THD_SHAPES:
+            assert verdict is None, (dq, dv, verdict)
+        else:
+            assert verdict is not None and "THD (ragged) rides the packed native-tile leg" in verdict, (dq, dv, verdict)
+    # The SM100 row is untouched: THD on all four of its d >= 128 flavors.
+    assert caps[engines.engine_name(mxfp8=True)].thd_d_shapes == frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
+
+
+def _mxfp8_api(d=256, dv=None, *, h=8, h_kv=None, s=512, gate=False, **kw):
+    """A d x dv block-scale MXFP8 SdpaFwdDslSm100 (the standalone wrapper) built from descriptors only."""
+    import torch
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    dv = d if dv is None else dv
+    h_kv = h if h_kv is None else h_kv
+
+    def desc(shape, dtype, name):
+        b, hh, ss, dd = shape
+        stride = (ss * hh * dd, dd, hh * dd, 1)
+        return TensorDesc(dtype=dtype, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device="cuda", name=name)
+
+    e4m3 = torch.float8_e4m3fn
+    return SdpaFwdDslSm100(
+        desc((1, h, s, d), e4m3, "q"),
+        desc((1, h_kv, s, d), e4m3, "k"),
+        desc((1, h_kv, s, dv), e4m3, "v"),
+        desc((1, h, s, dv), torch.bfloat16, "o"),
+        None,
+        pertensor_fp8=False,
+        dtype_o=torch.bfloat16,
+        sample_gate=desc((1, h, s, dv), torch.bfloat16, "gate") if gate else None,
+        **kw,
+    )
+
+
+def test_sm107_mxfp8_thd_check_support_declines_typed(monkeypatch):
+    """Standalone twin of the Rubin MXFP8 row's THD claims (rule 8b'), on a fake cc 10.7 device: THD is ADMITTED at
+    (256, 256) -- the per-batch lengths form and the cu_seqlens form -- and DECLINED, typed, at the three MXFP8 shapes
+    whose body keeps the pre-upstream THD arm, and at (256, 256) when combined with split-KV, PackGQA or the fused
+    epilogue gate: each a NotImplementedError out of check_support(), never a bare TypeError out of compile().  The
+    dense twins at (256, 256) stay admitted."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    assert _mxfp8_api(thd=True).check_support()
+    assert _mxfp8_api(thd=True, cu_seq_q_lens=True, cu_seq_kv_lens=True).check_support()
+    for d, dv in ((128, 128), (192, 128), (512, 512)):
+        with pytest.raises(NotImplementedError, match=r"THD/varlen on the Rubin \(SM107\) line") as exc:
+            _mxfp8_api(d, dv, thd=True).check_support()
+        assert "MXFP8 [(256, 256)]" in str(exc.value) and f"got (D_QK={d}, D_V={dv}) on the MXFP8 path" in str(exc.value)
+    with pytest.raises(NotImplementedError, match="split_kv > 1"):
+        _mxfp8_api(thd=True, split_kv=2).check_support()
+    with pytest.raises(NotImplementedError, match="PackGQA"):
+        _mxfp8_api(thd=True, h_kv=2, pack_gqa=True).check_support()
+    with pytest.raises(NotImplementedError, match="dense-only"):
+        _mxfp8_api(thd=True, gate=True).check_support()
+    assert _mxfp8_api().check_support()
+    assert _mxfp8_api(gate=True).check_support()
 
 
 def test_fp8_envelope_mismatch_rules():
@@ -1414,6 +1533,84 @@ class TestPreparedSm107Mxfp8:
     @pytest.mark.parametrize("layout", ["padded", "batch_inner"])
     def test_sm107_mxfp8_runtime_stats_layout(self, d, dv, layout):
         _prepared_mxfp8_checks.test_prepared_mxfp8_runtime_stats_layout_keeps_generic_branch(d, dv, layout)
+
+    # THD at (256, 256) -- the Rubin MXFP8 row's THD shape set (config_sm107.SM107_MXFP8_THD_SHAPES): the shared
+    # prepared-MXFP8 cells with thd=True, mirroring the per-tensor FP8 class above.  The packed per-sequence-tile-padded
+    # scale factors reach the binder as the exact packed layout here (the suite's _quantize_seq concatenation).
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_thd_routes(self, dtype):
+        g, vp, ws, bufs, tensors = _prepared_mxfp8_checks._case(d=256, dv=256, thd=True, output_dtype=dtype)
+        assert g._compiled_plans[g._plan_index]._prepared is not None
+        g.execute(vp, ws)
+        _prepared_mxfp8_checks._check(bufs, thd=True)
+        with _prepared_mxfp8_checks._cuda_graph() as graph:
+            with torch.cuda.graph(graph):
+                g.execute(vp, ws)
+            _prepared_mxfp8_checks._change_scales(bufs)
+            bufs["o"].fill_(float("nan"))
+            bufs["lse"].fill_(float("nan"))
+            bufs["amax_o"].fill_(999)
+            graph.replay()
+            _prepared_mxfp8_checks._check(bufs, thd=True)
+
+    @pytest.mark.parametrize("stats,amax", [(True, True), (False, False)])
+    @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2])
+    def test_sm107_mxfp8_thd_rebind(self, stats, amax, dtype, output_dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_rebind_scales_and_buffers(True, stats, amax, dtype, 256, 256, output_dtype)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+    def test_sm107_mxfp8_thd_capture(self, dtype):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_capture_reads_current_scales(True, 1, 256, 256, dtype)
+
+    @pytest.mark.parametrize("carrier", [torch.uint8, torch.int32])
+    def test_sm107_mxfp8_thd_sf_storage(self, carrier):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_sf_physical_permutation(True, 256, 256, carrier)
+
+    def test_sm107_mxfp8_thd_graph_and_adapter_bind_same_frame(self, monkeypatch):
+        _prepared_mxfp8_checks.test_prepared_mxfp8_graph_and_adapter_bind_same_frame(True, 256, 256, monkeypatch)
+
+    def test_sm107_mxfp8_thd_no_allocation_or_sync(self, monkeypatch):
+        """The THD twin of the dense no-allocation / no-sync cell at the one THD shape this row serves (the shared cell
+        is pinned to d128, which the Rubin MXFP8 row declines under THD)."""
+        g, vp, ws, bufs, _ = _prepared_mxfp8_checks._case(thd=True, d=256, dv=256, skv=512)
+        g.execute(vp, ws)
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        with monkeypatch.context() as m:
+            for name in ("empty", "zeros", "ones", "empty_like", "zeros_like", "ones_like"):
+                m.setattr(torch, name, lambda *a, **kw: pytest.fail("execute allocated a tensor"))
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                g.execute(vp, ws)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        torch.cuda.synchronize()
+        _prepared_mxfp8_checks._check(bufs, thd=True, skv=512)
+
+    def test_sm107_mxfp8_thd_sf_binder_rejects_typed(self):
+        """The packed scale-factor binder's two shape rules surface as typed ValueErrors at execute, on a plan that just
+        ran: a K / V pair with different packed tile counts, and a buffer whose byte count is not a whole number of
+        H x 1024-byte tile rows; the original buffers then execute again."""
+        g, vp, ws, bufs, ts = _prepared_mxfp8_checks._case(thd=True, d=256, dv=256)
+        g.execute(vp, ws)
+        torch.cuda.synchronize()
+        _prepared_mxfp8_checks._check(bufs, thd=True)
+        sf_v = bufs["sf_v"]
+        vp[ts["sf_v"]] = torch.cat([sf_v, torch.zeros_like(sf_v[:, :, :1])], dim=2)  # one slack tile on V only
+        with pytest.raises(ValueError, match="same packed tile count"):
+            g.execute(vp, ws)
+        vp[ts["sf_v"]] = sf_v
+        sf_q = bufs["sf_q"]
+        vp[ts["sf_q"]] = sf_q.reshape(-1)[: sf_q.numel() - 512]  # half a tile short of a whole tile row
+        with pytest.raises(ValueError, match="whole packed tile rows"):
+            g.execute(vp, ws)
+        vp[ts["sf_q"]] = sf_q
+        bufs["o"].fill_(float("nan"))
+        g.execute(vp, ws)
+        torch.cuda.synchronize()
+        _prepared_mxfp8_checks._check(bufs, thd=True)
 
     @pytest.mark.gpu_exclusive
     @pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])

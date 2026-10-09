@@ -465,6 +465,9 @@ def _kernel(
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
+    if cutlass.const_expr(PARAMS.thd_batch_one):
+        # Specialize only declared batch capacity; Q/KV lengths remain live.
+        n_batch = cutlass.Int32(1)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
 
@@ -1439,6 +1442,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -1991,7 +1995,7 @@ def _softmax_warp_group(
     # Phase trackers persist across tile boundaries (barriers don't reset).
     bmm1_phase = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
-    # init phase=1; both softmax wgs wait on slot [0] not [SoftmaxGid].
+    # init phase=1; each softmax wg waits its own O slot (see the top-of-tile wait).
     epilogue_state = cutlass.Int32(1)
 
     # total_sum kept as Vector[Float32, 2] (even/odd partials) so per-iter update lowers to packed FMUL2 + FADD2.
@@ -2028,9 +2032,14 @@ def _softmax_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        # Top-of-tile mb_o_empty[0] wait: without it softmax can race into the
+        # Top-of-tile mb_o_empty wait: without it softmax can race into the
         # next tile while TMA-STG is still draining the prior tile's O slot.
-        bars.mb_o_empty[0].wait(epilogue_state)
+        # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
+        # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
+        # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
+        # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
+        # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
+        bars.mb_o_empty[sub_tile_id].wait(epilogue_state)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF
@@ -2747,7 +2756,8 @@ def compile(  # noqa: A001
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
-    Every extent and stride is a runtime argument of the artifact (see ``_host``),
+    Extents and strides are runtime arguments (see ``_host``), except the
+    existing ``thd_batch_one`` template specialization of batch capacity,
     so the key is only what specializes the traced code: the head-dim ENVELOPE
     (``d_qk`` / ``d_v``: the TMA descriptors carry the real extents while the
     tile box stays the compile-time TILE geometry — box columns past d_qk / d_v

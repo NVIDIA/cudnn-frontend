@@ -1655,6 +1655,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=_MXFP8_K_DIM,
+        a_negate=int(PARAMS.negate_scores),
     )
     # sf_blocks_per_step = TILE_K_HW/32 (SF cols per MMA k-step); NOT SF_NUM_BLOCKS_K (total across K-tile).
     _MXFP8_SF_BLOCKS_PER_STEP = _MXFP8_TILE_K_HW // 32
@@ -2266,7 +2267,14 @@ def _softmax_kv_body(
     if nvvm.elect_sync():
         arrive_on_leader(mb_softmax_ldtm.subview(sub_tile_id), leader_cta_id, CFG.CTA_MMA)
 
-    current_max = cute.math.max(max_a, max_b) * scale_log2
+    # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF), as the pre-folded
+    # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
+    # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
+    # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
+    # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves
+    # (the sm107 siblings carry the same line; the d256 bodies select the dead tile out through
+    # running_max_step_finite_sentinel instead).
+    current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)
 
     # sync the two softmax warpgroups before the stat-store (dense specialization only, see SOFTMAX_WG_BARRIER).
     if cutlass.const_expr(SOFTMAX_WG_BARRIER and sub_tile_id == 1):
@@ -2413,8 +2421,13 @@ def _softmax_warp_group(
         # tile's last PV issue).
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
-        # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
-        bars.mb_o_empty[0].wait(epilogue_state, spin=SPIN_RING_WAITS)
+        # Each softmax wg waits its own O slot; without this softmax races ahead while TMA-STG drains prior tile.
+        # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
+        # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
+        # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
+        # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
+        # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
+        bars.mb_o_empty[sub_tile_id].wait(epilogue_state, spin=SPIN_RING_WAITS)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF

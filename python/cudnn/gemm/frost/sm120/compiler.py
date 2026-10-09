@@ -3322,6 +3322,14 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     )
     if slices <= 1:
         return config
+    # Snap to the largest power of two <= the bound. Measured on the weekly
+    # exhaustive sweep: when the wave arithmetic lands on an odd slice count,
+    # the best power-of-two split of the same geometry matches it within noise
+    # (several such layers prefer the shallower or even the unsplit form), so
+    # the odd split buys nothing while sitting outside the validated axis.
+    slices = 1 << (slices.bit_length() - 1)
+    if slices <= 1:
+        return config
     return replace(config, split_k_slices=slices)
 
 
@@ -3373,6 +3381,8 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
         b_elem_bytes=DTYPE_BYTES[chain.matmul.b_dtype],
         force_cta_group=force_cta_group,
         m_is_group_average=chain.moe is not None,
+        _pipeline="sm120",
+        _batch=chain.matmul.batch,
     )
     # Re-target at the preferred family and MMA-inst K width; cta_group rides
     # the geometry and only moves when the family cannot serve it (sm120 is

@@ -489,12 +489,20 @@ def test_gate_bwd_delta_geometry_is_the_chains():
 @requires_cuda
 @_DTYPES
 @pytest.mark.parametrize("d", [64, 128, 256])
-@pytest.mark.parametrize("b, s", [(1, 128), (3, 100), (2, 257)], ids=["b1-aligned", "b3-ragged", "b2-two-tiles-ragged"])
+@pytest.mark.parametrize(
+    "b, s",
+    [(1, 128), (3, 100), (2, 257), (1, 628), (1, 300)],
+    ids=["b1-aligned", "b3-ragged", "b2-two-tiles-ragged", "b1-thd-628", "b1-thd-300"],
+)
 def test_gate_bwd_delta_is_bitwise_the_chains_dot_do_o(dtype, d, b, s):
     """``delta`` (fp32 ``[B, H, S_pad]``) equals the chain's own ``dot_do_o`` over the dO this kernel STORED -- bit for bit,
     pad tail included (zeros past ``S``; both buffers NaN-poisoned first), on every CUDA device: the same fp32 products
     summed in the same order (module docstring).  ``d`` walks 1, 2 and 4 chain hand-off rounds; a ragged ``S`` exercises
-    the pad tail and a two-tile ``S`` the chain's second q tile."""
+    the pad tail and a two-tile ``S`` the chain's second q tile.  The two ``B = 1`` ragged multi-tile cells are the PACKED
+    (THD) identity's own shape: at ``s = T`` the ``(token // s, token % s)`` decode is ``(0, token)`` and the buffer is the
+    head-major ``[1, H, ceil128(T)]`` delta the packed SDPA backward reads, its tail ``[T, ceil128(T))`` zeroed from the row at
+    ``T - 1`` -- so the fused packed block is bitwise the unfused one without a packed producer arm (628 = 300 + 128 + 200,
+    the packed suites' lengths; 300 = a lone tail tile)."""
     h = 4
     t = b * s
     s_pad = -(-s // 128) * 128
@@ -781,18 +789,20 @@ def test_gate_bwd_fp8_recipe_contract_is_typed():
 
 @requires_cuda
 def test_gate_bwd_default_artifacts_are_byte_identical():
-    """The default knobs (``og_fp8=False``, ``has_amax_do=False``) are ONE artifact with the pre-fp8 request -- the bf16
-    backward's -- keyed by every knob (the two new ones appended, at their defaults, so the key of yesterday's request is
-    today's plus two ``False``); an old-style recipe construction is still valid."""
+    """The default knobs (``og_fp8=False``, ``has_amax_do=False``, ``has_dy_descale=False``) are ONE artifact with the pre-fp8
+    request -- the bf16 backward's -- keyed by every knob (the new ones appended, at their defaults, so the key of yesterday's
+    request is today's plus the appended ``False``s); an old-style recipe construction is still valid."""
     kw = dict(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False)
     a = compile_sigmoid_gate_bwd(**kw)
-    b = compile_sigmoid_gate_bwd(**kw, og_fp8=False, has_amax_do=False)
-    assert a.compiled is b.compiled and a == b and a.og_fp8 is False and a.has_amax_do is False
+    b = compile_sigmoid_gate_bwd(**kw, og_fp8=False, has_amax_do=False, has_dy_descale=False)
+    assert a.compiled is b.compiled and a == b and a.og_fp8 is False and a.has_amax_do is False and a.has_dy_descale is False
     keys = [k for k, v in compiled_cache.items() if v is a.compiled]
-    # the key ends with (has_amax_do, has_amax_dg, n_ctas_cap): both folds off, no persistent cap
-    assert len(keys) == 1 and keys[0][-3:] == (False, False, 0) and keys[0][:3] == ("torch.bfloat16", 8, 256)
+    # the key ends with (has_amax_do, has_amax_dg, n_ctas_cap, has_dy_descale): both folds off, no persistent cap, no dY descale --
+    # compared by TYPE too (`0 == False` in Python, so a tail compare alone would not see a shifted key)
+    assert len(keys) == 1 and keys[0][:3] == ("torch.bfloat16", 8, 256), keys
+    assert [(type(v), v) for v in keys[0][-4:]] == [(bool, False), (bool, False), (int, 0), (bool, False)], keys[0][-4:]
     old = SigmoidGateBwdRecipe(compiled=None, h=8, d=256, rows_per_cta=4, has_og=True, has_seq_lens=False, dtype=torch.bfloat16)
-    assert (old.has_delta, old.og_fp8, old.has_amax_do, old.has_amax_dg, old.n_ctas_cap) == (False, False, False, False, 0)
+    assert (old.has_delta, old.og_fp8, old.has_amax_do, old.has_amax_dg, old.n_ctas_cap, old.has_dy_descale) == (False, False, False, False, 0, False)
     c = compile_sigmoid_gate_bwd(**kw, has_amax_do=True)
     assert c.compiled is not a.compiled and c.has_amax_do is True and c.n_ctas_cap > 0 and a.n_ctas_cap == 0
 
@@ -878,3 +888,134 @@ def test_gate_bwd_amax_dg_contract_is_typed():
     a = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False)
     assert compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False, has_amax_dg=False).compiled is a.compiled
     assert compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False, has_amax_dg=True).compiled is not a.compiled
+
+
+# ---------------------------------------------------------------------------
+# The dY descale arm (`has_dy_descale`): the two-level NVFP4 cast's descale, folded into the gate backward
+# ---------------------------------------------------------------------------
+
+
+def _run_descaled(dog, o, gate, descale, *, h, d, s, og_fp8=False, scale_o=None, amax_do=None):
+    """The ``has_dy_descale`` artifact (``has_og``, ``has_delta``; optionally the fp8 arm) over ``dog`` with the slot ``descale`` ->
+    ``(dO, dG, og, delta)``, sentinel-filled first."""
+    t = int(dog.shape[0])
+    r = compile_sigmoid_gate_bwd(
+        dtype=dog.dtype, h=h, d=d, has_og=True, has_seq_lens=False, has_delta=True, og_fp8=og_fp8, has_amax_do=amax_do is not None, has_dy_descale=True
+    )
+    assert r.has_dy_descale is True
+    do, dg = torch.empty_like(dog), torch.empty_like(dog)
+    og = torch.full((t, h, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn) if og_fp8 else torch.empty_like(dog)
+    delta = torch.full((t // s, h, s), float("nan"), device="cuda", dtype=torch.float32)
+    run_sigmoid_gate_bwd(r, dog, o, gate, do, dg, og, s=s, stream=_stream(), delta=delta, descale_dy=descale, scale_o=scale_o, amax_do=amax_do)
+    torch.cuda.synchronize()
+    return r, do, dg, og, delta
+
+
+@requires_cuda
+@pytest.mark.parametrize("scale", [2.0**-13, 2.0**7], ids=["2^-13", "2^7"])
+@pytest.mark.parametrize("t, h, d", [(64, 8, 256), (37, 4, 128)])
+def test_gate_bwd_dy_descale_arm_is_bitwise_the_explicit_multiply(scale, t, h, d):
+    """The arm over the SCALED gradient ``bf16(scale x dO_gated)`` with ``descale_dy = 1 / scale`` == the plain artifact over the
+    unscaled ``dO_gated``, BITWISE on ``dO``, ``dG``, ``og`` and ``delta`` -- for a power of two ``fp32(bf16(scale x g)) x (1 / scale)
+    == fp32(bf16(g))`` exactly, so the two-level cast's descale costs no bits anywhere downstream (the dY floor remedy of the fp4 weight
+    modes' backward); the value is read from the tensor (a changed slot changes the bytes without a recompile); the arm is a distinct
+    artifact from the plain one."""
+    s = 32 if t % 32 == 0 else t  # one batch entry of t tokens for a ragged t (the delta's [B, H, S_pad])
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=41)
+    dog_s = (dog.float() * scale).to(torch.bfloat16)
+    assert torch.equal((dog_s.float() / scale).to(torch.bfloat16), dog), "the pre-scale is exact in bf16 at this magnitude"
+    do_p, dg_p, og_p = (torch.empty_like(dog) for _ in range(3))
+    delta_p = torch.full((t // s, h, s), float("nan"), device="cuda", dtype=torch.float32)
+    base = _run(dog, o, gate, do_p, dg_p, og_p, h=h, d=d, s=s, delta=delta_p)
+    descale = torch.tensor([1.0 / scale], device="cuda", dtype=torch.float32)
+    r, do, dg, og, delta = _run_descaled(dog_s, o, gate, descale, h=h, d=d, s=s)
+    assert r.compiled is not base.compiled
+    assert torch.equal(do, do_p), "dO differs from the plain artifact over the unscaled gradient"
+    assert torch.equal(dg, dg_p), "dG differs from the plain artifact over the unscaled gradient"
+    assert torch.equal(og, og_p), "og (O * s) must not depend on the descale"
+    assert torch.equal(delta, delta_p), "delta (over the stored dO) differs from the plain artifact's"
+    # the slot is read at launch: with the descale halved the outputs are those of the plain artifact over dog / 2
+    descale.fill_(0.5 / scale)
+    _, do2, dg2, _, delta2 = _run_descaled(dog_s, o, gate, descale, h=h, d=d, s=s)
+    half = (dog.float() * 0.5).to(torch.bfloat16)
+    do_h, dg_h, og_h = (torch.empty_like(dog) for _ in range(3))
+    delta_h = torch.full((t // s, h, s), float("nan"), device="cuda", dtype=torch.float32)
+    _run(half, o, gate, do_h, dg_h, og_h, h=h, d=d, s=s, delta=delta_h)
+    assert torch.equal(do2, do_h) and torch.equal(dg2, dg_h) and torch.equal(delta2, delta_h), "the descale is not read from the tensor"
+
+
+@requires_cuda
+def test_gate_bwd_dy_descale_non_power_of_two_is_one_fp32_multiply():
+    """A non-power-of-two descale (``3.0``) is one fp32 multiply of ``dO_gated`` before the products: within the gate kernel's own bound
+    of the fp64 autograd of ``o * sigmoid(g)`` fed ``3 x dO_gated``."""
+    t, h, d, s = 64, 8, 256, 32
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=43)
+    descale = torch.tensor([3.0], device="cuda", dtype=torch.float32)
+    _, do, dg, og, _ = _run_descaled(dog, o, gate, descale, h=h, d=d, s=s)
+    do_ref, dg_ref, og_ref = _ref((dog.float() * 3.0).to(torch.bfloat16), o, gate)
+    o64 = o.double().requires_grad_(True)
+    g64 = gate.double().requires_grad_(True)
+    do_ref, dg_ref = torch.autograd.grad(o64 * torch.sigmoid(g64), (o64, g64), dog.double() * 3.0)
+    _check(do, do_ref, torch.bfloat16)
+    _check(dg, dg_ref, torch.bfloat16)
+    _check(og, og_ref, torch.bfloat16)
+
+
+@requires_cuda
+def test_gate_bwd_dy_descale_contract_is_typed():
+    """``descale_dy`` BOTH ways against the recipe (Rule 1): a ``has_dy_descale`` artifact refuses a launch without the slot, a plain one
+    refuses a given slot; the slot's contract (fp32, 1 element, CUDA, 4-byte aligned -- ``check_scalar_slot``); the arm is in the cache
+    key (LAST) and an old-style recipe reads ``has_dy_descale=False``."""
+    base = dict(compiled=None, h=8, d=256, rows_per_cta=4, dtype=torch.bfloat16, has_seq_lens=False)
+    plain = SigmoidGateBwdRecipe(has_og=True, **base)
+    arm = SigmoidGateBwdRecipe(has_og=True, has_dy_descale=True, **base)
+    assert plain.has_dy_descale is False and arm.has_dy_descale is True
+    t = 4
+    x = torch.empty(t, 8, 256, dtype=torch.bfloat16, device="cuda")
+    slot = torch.zeros(1, device="cuda")
+    st = _stream()
+    with pytest.raises(ValueError, match="WITH the dY descale"):
+        run_sigmoid_gate_bwd(arm, x, x, x, x, x, x, stream=st)
+    with pytest.raises(ValueError, match="WITHOUT the dY descale"):
+        run_sigmoid_gate_bwd(plain, x, x, x, x, x, x, stream=st, descale_dy=slot)
+    with pytest.raises(ValueError, match="descale_dy must be a 1-element fp32 CUDA tensor"):
+        run_sigmoid_gate_bwd(arm, x, x, x, x, x, x, stream=st, descale_dy=torch.zeros(1, device="cuda", dtype=torch.float64))
+    with pytest.raises(ValueError, match="descale_dy must be a 1-element fp32 CUDA tensor"):
+        run_sigmoid_gate_bwd(arm, x, x, x, x, x, x, stream=st, descale_dy=torch.zeros(2, device="cuda"))
+    with pytest.raises(ValueError, match="descale_dy must be a 1-element fp32 CUDA tensor"):
+        run_sigmoid_gate_bwd(arm, x, x, x, x, x, x, stream=st, descale_dy=torch.zeros(1))
+    kw = dict(dtype=torch.bfloat16, h=8, d=256, has_og=True, has_seq_lens=False)
+    a = compile_sigmoid_gate_bwd(**kw)
+    c = compile_sigmoid_gate_bwd(**kw, has_dy_descale=True)
+    assert c.compiled is not a.compiled and c.has_dy_descale is True and a.has_dy_descale is False
+    keys = [k for k, v in compiled_cache.items() if v is c.compiled]
+    assert len(keys) == 1 and keys[0][-1] is True and keys[0][-2] == 0, keys
+
+
+@requires_fp8
+def test_gate_bwd_dy_descale_composes_with_the_fp8_arm():
+    """The recipe the fp4 weight modes' backward builds under an NVFP4 out-projection weight -- ``og_fp8=True, has_delta=True,
+    has_amax_do=True, has_dy_descale=True`` -- traces and runs: ``og8`` is BITWISE the fp8 arm's without the descale (``O * s`` does not
+    involve ``dO_gated``), and ``dO`` / ``dG`` / ``delta`` / the dO amax partials are BITWISE the fp8 arm's over the UNSCALED gradient
+    (the descale undoes the power-of-two pre-scale exactly, the amax fold reads the stored dO)."""
+    t, h, d, s = 64, 8, 256, 32
+    scale = 2.0**-9
+    dog, o, gate = _make(t, h, d, torch.bfloat16, seed=47)
+    scale_o = torch.tensor([2.0**-3], device="cuda", dtype=torch.float32)
+    r_fp8 = compile_sigmoid_gate_bwd(dtype=torch.bfloat16, h=h, d=d, has_og=True, has_seq_lens=False, has_delta=True, og_fp8=True, has_amax_do=True)
+    n_part = n_partials_for(r_fp8, t)
+    do_p, dg_p = torch.empty_like(dog), torch.empty_like(dog)
+    og8_p = torch.full((t, h, d), 0x7F, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    delta_p = torch.full((t // s, h, s), float("nan"), device="cuda", dtype=torch.float32)
+    amax_p = torch.full((n_part,), float("nan"), device="cuda", dtype=torch.float32)
+    run_sigmoid_gate_bwd(r_fp8, dog, o, gate, do_p, dg_p, og8_p, s=s, stream=_stream(), delta=delta_p, scale_o=scale_o, amax_do=amax_p)
+    torch.cuda.synchronize()
+    dog_s = (dog.float() * scale).to(torch.bfloat16)
+    amax = torch.full((n_part,), float("nan"), device="cuda", dtype=torch.float32)
+    r, do, dg, og8, delta = _run_descaled(dog_s, o, gate, torch.tensor([1.0 / scale], device="cuda"), h=h, d=d, s=s, og_fp8=True, scale_o=scale_o, amax_do=amax)
+    assert (r.og_fp8, r.has_amax_do, r.has_delta, r.has_dy_descale) == (True, True, True, True) and n_partials_for(r, t) == n_part
+    assert torch.equal(og8.view(torch.uint8), og8_p.view(torch.uint8)), "og8 must not depend on the dY descale"
+    assert (
+        torch.equal(do, do_p) and torch.equal(dg, dg_p) and torch.equal(delta, delta_p)
+    ), "dO / dG / delta differ from the fp8 arm's over the unscaled gradient"
+    assert torch.equal(amax, amax_p), "the dO amax partials differ from the fp8 arm's"

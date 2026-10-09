@@ -256,8 +256,8 @@ def _facts():
 
 def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     """A ragged S_kv on a skv_tail_via_padding row is served through the
-    padded kernel path (synthesized per-batch KV lengths) — the one path the
-    split cannot ride. The gate must mirror lower_dsl_prefill's predicate so
+    kernel's KV-tail mask (kv_tail_mask, #1425) — the one path the split
+    cannot ride. The gate must mirror the adapter's predicate so
     the plan is never listed, not declined at build."""
     from cudnn.sdpa import graph_analyzer as ga
 
@@ -774,3 +774,11 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
         src = (kdir / name).read_text()
         assert "make_split_helpers" in src, f"{name}: no longer split-capable; drop it from _SLOTLESS_FLAVORS"
         assert not has_slot(src), f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"
+
+
+@pytest.mark.parametrize("min_tiles", [1, 2, 4])
+def test_candidates_and_choice_respect_a_supplied_min_tiles(min_tiles):
+    for kv_tiles in (1, 3, 16, 17, 512):
+        assert all(kv_tiles // s >= min_tiles for s in split_kv_candidates(sm_count=188, kv_tiles=kv_tiles, min_tiles=min_tiles) if s > 1)
+        s = choose_split_kv(q_tiles=1, heads_q=1, batch=1, kv_tiles=kv_tiles, sm_count=188, combine_rows=8, min_tiles=min_tiles, combine_floor=0.1)
+        assert s == 1 or kv_tiles // s >= min_tiles

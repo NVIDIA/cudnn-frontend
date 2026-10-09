@@ -319,6 +319,12 @@ def test_tail_rope_wrapper_normalizes_raw_stream(monkeypatch, stream_kind):
 
     monkeypatch.setattr(api, "TailRoPEForward", Plan)
     with torch.cuda.stream(caller):
+        if stream_kind == "per_thread":
+            with pytest.raises(ValueError, match="cudaStreamPerThread"):
+                api.tail_rope(x, x, x, stream=requested)
+            assert not allocations and not launches
+            assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream
+            return
         result = api.tail_rope(x, x, x, stream=requested)
         assert result["out"].shape == x.shape
         assert torch.cuda.current_stream(device).cuda_stream == caller.cuda_stream

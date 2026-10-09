@@ -99,6 +99,10 @@ from typing import NamedTuple
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d192_mxfp8
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d192_d128_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/prefill_d128_mxfp8 and sm107/prefill_d256_mxfp8)"
+    )
 CFG, _TMA = make_cfg_d192_mxfp8(PARAMS)
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
@@ -1433,6 +1437,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=_MXFP8_K_DIM,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv_bs = prims.Tcgen05MxInstrDesc.build(
         a_dtype=STORAGE_DTYPE,
@@ -2035,7 +2040,12 @@ def _softmax_kv_body(
         # are overridden by the correction's _kv_empty select -- same O either way.
         current_max = cute.math.max(max_a, max_b)
     else:
-        current_max = cute.math.max(max_a, max_b) * scale_log2
+        # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF), as the pre-folded
+        # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
+        # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
+        # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
+        # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves.
+        current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)
 
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
@@ -2212,8 +2222,13 @@ def _softmax_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
-        bars.mb_o_empty[0].wait(epilogue_state, spin=SPIN_RING_WAITS)
+        # Each softmax wg waits its own O slot; without this softmax races ahead while TMA-STG drains prior tile.
+        # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
+        # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
+        # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
+        # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
+        # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
+        bars.mb_o_empty[sub_tile_id].wait(epilogue_state, spin=SPIN_RING_WAITS)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF

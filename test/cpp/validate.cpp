@@ -325,3 +325,45 @@ TEST_CASE("SDPA block-mask backend support boundary", "[graph][sdpa][validate]")
         }
     }
 }
+
+TEST_CASE("Rmsnorm forward without scale", "[graph][rmsnorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    auto make = [](std::vector<int64_t> x_dim, fe::NormFwdPhase_t phase, std::vector<int64_t> inv_var_dim) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        std::vector<int64_t> x_stride(x_dim.size(), 1);
+        for (int i = static_cast<int>(x_dim.size()) - 2; i >= 0; i--) x_stride[i] = x_stride[i + 1] * x_dim[i + 1];
+        auto X       = graph->tensor(fe::graph::Tensor_attributes().set_name("X").set_dim(x_dim).set_stride(x_stride));
+        auto epsilon = graph->tensor(1e-5f);
+        auto options = fe::graph::Rmsnorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        auto [Y, inv_var] = graph->rmsnorm(X, nullptr, options);
+        Y->set_output(true);
+        if (inv_var) {
+            inv_var->set_output(true);
+            if (!inv_var_dim.empty()) {
+                std::vector<int64_t> s(inv_var_dim.size(), 1);
+                for (int i = static_cast<int>(inv_var_dim.size()) - 2; i >= 0; i--)
+                    s[i] = s[i + 1] * inv_var_dim[i + 1];
+                inv_var->set_dim(inv_var_dim).set_stride(s);
+            }
+        }
+        return std::make_pair(graph, inv_var);
+    };
+
+    // One non-unit axis after the first: unambiguous. Training used to dereference the null scale here.
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        auto [graph, inv_var] = make({64, 128, 1, 1}, phase, {});
+        REQUIRE(graph->validate().is_good());
+        if (inv_var) REQUIRE(inv_var->get_dim() == std::vector<int64_t>{64, 1, 1, 1});
+    }
+
+    // {B, S, H}: the backend's inference default and the inferred INV_VARIANCE disagree, so refuse.
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        auto status = make({4, 16, 128}, phase, {}).first->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::INVALID_VALUE);
+    }
+
+    // Explicit INV_VARIANCE dims state the axes.
+    REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, {4, 16, 1}).first->validate().is_good());
+}
