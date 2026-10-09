@@ -1659,10 +1659,10 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     D128 FP16/BF16 with integral GQA1..16 on Blackwell, fixed or bounded, with
     or without packed Stats; the same first-wave budget avoids splitting
     already-filled/full-prefill grids. Rubin reuses this budget for its native
-    packed D128 and MLA paths, with the device's actual SM count. Blackwell
-    D128 counts the CTAs of the actual candidate: a packed CTA holds
+    packed D128 and MLA paths, with the device's actual SM count. Native
+    D128 counts the CTAs of the actual candidate on both architectures: a packed CTA holds
     128 / (H_q/H_kv) tokens of one KV head's group, and a declared
-    ``max_total_seq_len_q`` bounds ragged batches. It also admits Q8..63, where
+    ``max_total_seq_len_q`` bounds ragged batches. Blackwell also admits Q8..63, where
     the backend ran 2-16x slower than the split, and may fill a second wave
     when that shortens waves x KV loop.
     """
@@ -1699,10 +1699,10 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     group = facts.h_q // facts.h_kv
     budget = facts.device_sm_count * (2 if blackwell_d128 else 1)
     choices = []
-    for pack in (False, True) if blackwell_d128 and group > 1 else (False,):
+    for pack in (False, True) if d128 and group > 1 else (False,):
         rows = 128 // group if pack else 128
         q_tiles = facts.b * _ceil_div(facts.s_q, rows)
-        if blackwell_d128 and facts.max_total_seq_len_q:
+        if d128 and facts.max_total_seq_len_q:
             # Each sequence leaves at most one partial tile.
             q_tiles = min(q_tiles, (facts.max_total_seq_len_q + facts.b * (rows - 1)) // rows)
         units = q_tiles * (facts.h_q // group if pack else facts.h_q)
