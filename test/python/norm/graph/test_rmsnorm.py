@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import math
 
 import cudnn
 import pytest
@@ -319,3 +320,91 @@ def test_rmsnorm_llm_block_scaled_output(quantization, phase, include_column_out
         torch.testing.assert_close(outputs.inv_variance, inv_variance_expected, atol=1e-5, rtol=1e-5)
     else:
         assert outputs.inv_variance is None
+
+
+def _run_norm_leaving_stats_dims_to_inference(cudnn_handle, x, scale, *, layernorm=False, phase=cudnn.norm_forward_phase.TRAINING):
+    """Build a forward norm whose stats dims are left to the graph, allocate every stats buffer from ``get_dim()`` with a
+    NaN guard band behind it, execute, and return ``(y, {name: (dims after validate(), dims after build, buffer, guard_written)})``."""
+    graph = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
+    cudnn.set_stream(handle=cudnn_handle, stream=torch.cuda.current_stream().cuda_stream)
+    X = graph.tensor(name="X", dim=list(x.shape), stride=list(x.stride()), data_type=x.dtype)
+    S = None if scale is None else graph.tensor(name="scale", dim=list(scale.shape), stride=list(scale.stride()), data_type=scale.dtype)
+    eps = graph.tensor(name="eps", dim=[1] * x.dim(), stride=[1] * x.dim(), is_pass_by_value=True, data_type=cudnn.data_type.FLOAT)
+    if layernorm:
+        bias = torch.zeros_like(scale)
+        Bt = graph.tensor(name="bias", dim=list(bias.shape), stride=list(bias.stride()), data_type=bias.dtype)
+        Y, mean, inv_var = graph.layernorm(norm_forward_phase=phase, input=X, scale=S, bias=Bt, epsilon=eps)
+        stats = {"mean": mean, "inv_var": inv_var}
+    else:
+        Y, inv_var = graph.rmsnorm(norm_forward_phase=phase, input=X, scale=S, epsilon=eps)
+        stats = {"inv_var": inv_var}
+    stats = {k: t for k, t in stats.items() if t is not None}
+    Y.set_output(True).set_data_type(x.dtype)
+    for t in stats.values():
+        t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    graph.validate()
+    validated_dims = {name: [int(d) for d in t.get_dim()] for name, t in stats.items()}
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
+    y = torch.full_like(x, float("nan"))
+    variant_pack = {X: x, eps: torch.full((1,) * x.dim(), 1e-5), Y: y}
+    if S is not None:
+        variant_pack[S] = scale
+    if layernorm:
+        variant_pack[Bt] = bias
+    buffers = {}
+    for name, t in stats.items():
+        dims = [int(d) for d in t.get_dim()]
+        n = math.prod(dims)
+        guarded = torch.full((n + x.numel(),), float("nan"), device="cuda")
+        variant_pack[t] = guarded[:n].view(dims)
+        buffers[name] = (dims, guarded[:n], guarded[n:])
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+    return y, {name: (validated_dims[name], dims, buf, int((~guard.isnan()).sum())) for name, (dims, buf, guard) in buffers.items()}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("layernorm", [False, True], ids=["rmsnorm", "layernorm"])
+def test_norm_forward_inferred_stats_dims_cover_what_the_kernel_writes(layernorm, cudnn_handle):
+    """``{B, S, H}`` with a ``{1, 1, H}`` scale: after ``validate()`` the graph used to report ``{B, 1, 1}`` stats while the
+    kernel writes ``B * S`` rows -- an allocation sized from ``get_dim()`` there was overrun ``S``-fold.  The inferred dims
+    now follow the C++ node (input dims, 1 wherever the scale is not)."""
+    B, S, H = 2, 8, 64
+    x = make_seeded_randn((B, S, H), torch.float32, 7)
+    scale = torch.ones(1, 1, H, device="cuda")
+    y, stats = _run_norm_leaving_stats_dims_to_inference(cudnn_handle, x, scale, layernorm=layernorm)
+    centered = x - x.mean(-1, keepdim=True) if layernorm else x
+    inv_var = torch.rsqrt(centered.square().mean(-1, keepdim=True) + 1e-5)
+    for name, (validated_dims, dims, buf, guard_written) in stats.items():
+        assert validated_dims == dims == [B, S, 1], name
+        assert guard_written == 0, f"{name}: the kernel wrote {guard_written} elements past the inferred extent"
+    torch.testing.assert_close(stats["inv_var"][2].view(B, S, 1), inv_var, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(y, centered * inv_var, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("phase", [cudnn.norm_forward_phase.INFERENCE, cudnn.norm_forward_phase.TRAINING], ids=["inference", "training"])
+def test_rmsnorm_without_scale(phase, cudnn_handle):
+    """``scale=None`` (#188): one non-unit axis after the first states the normalization axes, so no scale is needed."""
+    rows, H = 64, 128
+    x = make_seeded_randn((rows, H, 1, 1), torch.float32, 11)
+    y, stats = _run_norm_leaving_stats_dims_to_inference(cudnn_handle, x, None, phase=phase)
+    inv_var = torch.rsqrt(x.square().mean(1, keepdim=True) + 1e-5)
+    torch.testing.assert_close(y, x * inv_var, atol=1e-5, rtol=1e-5)
+    if phase == cudnn.norm_forward_phase.TRAINING:
+        validated_dims, dims, buf, guard_written = stats["inv_var"]
+        assert validated_dims == dims == [rows, 1, 1, 1] and guard_written == 0
+        torch.testing.assert_close(buf.view(rows, 1, 1, 1), inv_var, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_rmsnorm_without_scale_refuses_ambiguous_axes(cudnn_handle):
+    """``{B, S, H}`` with no scale: the backend's inference default (H only) and the stats default (S and H) disagree, so
+    the node refuses rather than pick one."""
+    x = make_seeded_randn((2, 8, 64), torch.float32, 13)
+    with pytest.raises(Exception, match="ambiguous"):
+        _run_norm_leaving_stats_dims_to_inference(cudnn_handle, x, None, phase=cudnn.norm_forward_phase.INFERENCE)
