@@ -254,6 +254,8 @@ def build_fprop_graph(
         checkpoint_every_n_tokens=checkpoint,
         name="gdp",
     )
+    if state_checkpoints_t is not None:
+        state_checkpoints_t.set_data_type(cudnn.data_type.FLOAT)
     return graph, dict(
         q=q_t,
         k=k_t,
@@ -466,10 +468,10 @@ def run_gdp_fwd(
     elif output_final_state:
         final_state = torch.empty(N, HO, V, K, dtype=state_out_dtype, device=device)
         variant_pack[t["fs"]] = final_state
-    state_checkpoints = torch.empty(0, dtype=q.dtype, device=device)
+    state_checkpoints = torch.empty(0, dtype=torch.float32, device=device)
     if checkpoint > 0:
         total_checkpoints = max(total * n // checkpoint + N, 1)
-        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=q.dtype, device=device)
+        state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=torch.float32, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
     graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
     return o, final_state, state_checkpoints
@@ -623,9 +625,9 @@ def gdp_fwd_fake(
     final = q.new_empty((N, HO, V, K) if output_final_state else (0,), dtype=state_dtype)
     if checkpoint_every_n_tokens > 0:
         total_checkpoints = max(total * int(num_householder) // int(checkpoint_every_n_tokens) + N, 1)
-        state_checkpoints = q.new_empty(total_checkpoints, HO, V, K)
+        state_checkpoints = q.new_empty(total_checkpoints, HO, V, K, dtype=torch.float32)
     else:
-        state_checkpoints = q.new_empty(0)
+        state_checkpoints = q.new_empty(0, dtype=torch.float32)
     return o, final, state_checkpoints
 
 
@@ -728,7 +730,10 @@ def build_bprop_graph(
         dfs_t = graph.tensor([N, HO, V, K], data_type=dstate_in_dtype, name="d_final_state")
     checkpoints_t = None
     if checkpoint_rows is not None:
-        checkpoints_t = graph.tensor([checkpoint_rows, HO, V, K], data_type=io_dtype, name="state_checkpoints")
+        # one chunk is 64 expanded tokens; coarser checkpoints seed FP32 recomputation, dense ones feed backward
+        checkpoints_t = graph.tensor(
+            [checkpoint_rows, HO, V, K], data_type=cudnn.data_type.FLOAT if checkpoint_every_n_tokens > 64 else io_dtype, name="state_checkpoints"
+        )
     a_log_t = dt_bias_t = None
     if a_log_dtype is not None:
         a_log_t = graph.tensor([HO], data_type=a_log_dtype, name="a_log")
@@ -858,7 +863,7 @@ def gdp_bwd(
             raise ValueError(f"initial_state must carry one state per sequence: got {initial_state.shape[0]} for {N} sequences")
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32
     if state_checkpoints is not None:
-        check_dtype("state_checkpoints", state_checkpoints, q.dtype)
+        check_dtype("state_checkpoints", state_checkpoints, torch.float32)
     for tensor_name, tensor in (
         ("k", k),
         ("v", v),
@@ -973,7 +978,8 @@ def gdp_bwd(
     if dstate_in is not None:
         variant_pack[t["dfs"]] = dstate_in
     if state_checkpoints is not None:
-        variant_pack[t["checkpoints"]] = state_checkpoints
+        # one chunk is 64 expanded tokens; coarser checkpoints seed FP32 recomputation, dense ones feed backward
+        variant_pack[t["checkpoints"]] = state_checkpoints if checkpoint_every_n_tokens > 64 else state_checkpoints.to(q.dtype)
     d_a_log = torch.empty(0, dtype=torch.float32, device=device)
     d_dt_bias = torch.empty(0, dtype=torch.float32, device=device)
     if a_log is not None:

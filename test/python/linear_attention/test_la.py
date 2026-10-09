@@ -1370,7 +1370,7 @@ def test_checkpoints_match_prefix_final_states(backend, variant):
     _, _, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
-    assert state_checkpoints.dtype == case.dtype
+    assert state_checkpoints.dtype == (torch.float32 if variant in ("gdn", "gdp") else case.dtype)
     # row 0 is the incoming state, zero here since no initial_state was passed
     assert not state_checkpoints[0].any(), "row 0 must be the (zero) incoming state"
     for j in sorted({1, valid - 1}):
@@ -1466,13 +1466,36 @@ def test_checkpoints_coarse_cadence(backend, variant, K, ckpt_mult):
     o, fs, state_checkpoints = run_fwd(backend, case, output_final_state=True, checkpoint_every_n_tokens=ckpt * case.n)
     valid = (T - 1) // ckpt + 1
     assert state_checkpoints.shape == (T // ckpt + 1, case.HO, case.V, case.K)
-    assert state_checkpoints.dtype == case.dtype
+    assert state_checkpoints.dtype == (torch.float32 if variant in ("gdn", "gdp") else case.dtype)
     assert not state_checkpoints[0].any(), "row 0 must be the (zero) incoming state"
     for j in sorted({1, valid - 1}):
         n = j * ckpt
         with waive_unsupported(backend, variant):
             _, fs_p = pinned_op(backend, variant)(*op_args(case, window=(0, n)), output_final_state=True)
         assert_rms_close(f"state_checkpoints[{j}]", state_checkpoints[j], fs_p[0], STATE_TOL[case.dtype])
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", ["gdn", "gdp"])
+@pytest.mark.parametrize("K,V", HEAD_DIMS)
+def test_checkpoint_restart_matches_forward(backend, variant, K, V):
+    """Recomputation from a saved checkpoint must match uninterrupted forward bitwise."""
+    # use two Householder factors for GDP; one would reduce it to GDN
+    n = 2 if variant == "gdp" else 1
+    case = make_case(variant, torch.bfloat16, T=3 * CHUNK[variant] // n, H=2, K=K, V=V, n=n, lo=0.98)
+    state0 = random_state(case)
+    checkpoint = 2 * CHUNK[variant]
+    boundary = checkpoint // case.n
+    _, full, series = run_fwd(backend, case, initial_state=state0, output_final_state=True, checkpoint_every_n_tokens=checkpoint, batch_invariant=True)
+    recompute = getattr(torch.ops.cudnn, SUMMARY_OPS[variant])
+    recompute_options = dict(output_transition=False, batch_invariant=False, plan_name=f"{variant}_summary_frost")
+    full_recomputed = recompute(*op_args(case)[1:], initial_state=state0, **recompute_options)[0]
+    restart_state = series[1:2].float()
+    resumed = recompute(*op_args(window(case, boundary, case.T))[1:], initial_state=restart_state, **recompute_options)[0]
+    _, prefix = run_fwd(backend, window(case, 0, boundary), initial_state=state0, output_final_state=True, batch_invariant=True)
+    assert_bitwise("full recompute vs forward", full_recomputed, full)
+    assert_bitwise("checkpoint restart vs uninterrupted forward", resumed, full)
+    assert_bitwise("checkpoint vs forward prefix state", restart_state, prefix)
 
 
 # ---------------------------------------------------------------------------
