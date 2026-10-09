@@ -1701,6 +1701,11 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.page_size == 16
         and facts.window_left is None
     )
+    if not family:
+        # Outside the tuned family (head counts, group, dtype, page size, ...): the old
+        # unsplit proposals.  Checked BEFORE the bands below divide by the packed tile
+        # width, which is zero for a group wider than the tile.
+        return 1, False
     # The measured chunked-prefill band (bottom-right causal, Q 64..1024 over HND pools).
     prefill_band = (
         facts.causal
@@ -1719,7 +1724,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         group = facts.h_q // facts.h_kv
         packed_units = facts.b * _ceil_div(facts.s_q, 128 // group) * facts.h_kv
         decode_band = packed_units * 4 <= (facts.device_sm_count or 128)
-    if not (family and (prefill_band or decode_band)):
+    if not (prefill_band or decode_band):
         return 1, False
     if caps.sm_lo == 100:
         # Packed tiles can remove a partial-wave tail. Preserve first-wave

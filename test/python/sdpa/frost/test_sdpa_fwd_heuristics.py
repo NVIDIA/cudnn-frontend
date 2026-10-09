@@ -1414,6 +1414,23 @@ def test_sm107_paged_thd_sink_long_cache_splits_like_its_sink_free_twin(sm107_me
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "nonpaged"])
+@pytest.mark.parametrize("h_q, h_kv", [(256, 1), (64, 64), (6, 2)], ids=["mqa_g256", "mha", "g3"])
+def test_sm107_thd_split_chooser_outside_its_family_keeps_the_old_plans(sm107_metadata_target, paged, h_q, h_kv):
+    """The cc 10.7 decode arm of the paged split chooser (issue #1517) must be gated by the chooser's family BEFORE
+    it divides by the packed tile width: an MQA group of 256 makes ``128 // group`` zero, and the chooser is
+    consulted for every THD graph (paged or not), so a graph outside the tuned family has to keep its unsplit
+    proposals instead of raising ZeroDivisionError out of recommend()."""
+    from cudnn.sdpa.fwd.heuristics import paged_thd_split_choice
+
+    facts = _sm107_paged_thd_facts(b=1, h_q=h_q, h_kv=h_kv, s_q=4, s_kv=8192, has_paged_kv=paged, page_size=16 if paged else 0)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert paged_thd_split_choice(spec.capabilities, facts) == (1, False)
+    plans = _sm107_f16_plans(facts)
+    assert all((p.knobs.split_kv or 1) == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
 def test_sm107_paged_thd_rules_do_not_move_the_sm100_row():
     """The cc 10.7 paged measurements widen nothing on the SM100 line: paged GQA16 stays unpacked-first there, a sink keeps
     the NATURAL lead and the cga2 width (its own measured family, #1468 / PR #1469's domain)."""
