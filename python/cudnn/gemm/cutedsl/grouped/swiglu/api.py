@@ -293,7 +293,6 @@ def grouped_gemm_swiglu_wrapper_sm100(
             sf_vec_size=sf_vec_size,
             vector_f32=vector_f32,
             m_aligned=m_aligned,
-            discrete_col_sfd=discrete_col_sfd,
             current_stream=current_stream,
         )
         return grouped_gemm_swiglu(
@@ -309,6 +308,7 @@ def grouped_gemm_swiglu_wrapper_sm100(
             d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
         )
     if framework != "torch":
         raise ValueError(f"Unsupported tensor framework '{framework}' for grouped_gemm_swiglu_wrapper_sm100; pass torch tensors")
