@@ -183,9 +183,16 @@ def k2_tile_for(n_res: int, channels: int = 128, batch: int = 1, direction: str 
 
 
 def default_k_block(n_res: int) -> int:
-    """The row tile a bare declaration runs at ``n_res``: the substrate's rule (``cudnn.gemm.frost.ln_prologue.default_k_block``) held inside
-    :data:`K_BLOCK_DOMAIN` (below N = 33 the API declines before any launch; the clamp keeps the record in the vocabulary there)."""
-    return max(_substrate_default_k_block(n_res), K_BLOCK_DOMAIN[0])
+    """The row tile a bare declaration runs at ``n_res``: the substrate's rule (``cudnn.gemm.frost.ln_prologue.default_k_block``: 256 from N = 256,
+    else the next power of two >= N) held inside :data:`K_BLOCK_DOMAIN` (below N = 33 the API declines before any launch; the clamp keeps the record in
+    the vocabulary there) -- EXCEPT where the 128-row block computes fewer rows than the 256 one (``N mod 256`` in 1..128 from N = 256: at N = 384 the
+    rule's 256 pads 25 % of every pair tile, 128 pads none), measured on the 212-SM Rubin perf-node class as the faster tile there (the lever's record:
+    N = 384, c = 128 and 256, B = 1 and 4, both directions; the per-CTA TMA box is the same as 256's, only the scheduler walks fewer tiles)."""
+    n = int(n_res)
+    kb = max(_substrate_default_k_block(n), K_BLOCK_DOMAIN[0])
+    if n >= PAIR_TILE_ROWS and -(-n // 128) * 128 < -(-n // PAIR_TILE_ROWS) * PAIR_TILE_ROWS:
+        kb = 128
+    return kb
 
 
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:

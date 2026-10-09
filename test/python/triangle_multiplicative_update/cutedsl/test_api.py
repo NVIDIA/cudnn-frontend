@@ -713,7 +713,10 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     assert th.K_BLOCK_DOMAIN == (64, 128, 256)
     assert th.recommend(64, 128, 1).k_block == 64 and th.recommend(128, 128, 1).k_block == 128 and th.recommend(217, 128, 1).k_block == 256
     assert th.recommend(256, 128, 1).k_block == th.recommend(512, 128, 1).k_block == th.recommend(2048, 256, 4).k_block == 256
-    assert th.recommend(384, 128, 1).k_block == th.default_k_block(384) and th.recommend(33, 128, 1).k_block == 64  # (33: clamped into the domain)
+    assert th.recommend(384, 128, 1).k_block == th.default_k_block(384) == 128 and th.recommend(33, 128, 1).k_block == 64  # (33: clamped into the domain)
+    assert th.recommend(384, 256, 4, "incoming").k_block == 128 and th.recommend(640, 128, 1).k_block == 128  # N mod 256 in 1..128: fewer rows at 128
+    assert th.recommend(300, 128, 1).k_block == 128 and th.recommend(400, 128, 1).k_block == 256  # 400: 512 rows per bi either way -> the rule's 256
+    assert th.recommend(768, 128, 1).k_block == 256 and th.recommend(217, 128, 1).k_block == 256  # multiples of 256 and N < 256 keep the rule
     from dataclasses import replace
 
     base = th.recommend(512, 128, 1)
