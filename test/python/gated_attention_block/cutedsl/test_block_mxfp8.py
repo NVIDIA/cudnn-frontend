@@ -778,4 +778,4 @@ def test_mxfp8_dense_kv_tail_is_masked_not_computed_wrong():
     assert torch.isfinite(out.float()).all()
     c = _cos(out, ref)
     print(f"\nmxfp8 block dense KV tail S=1000: cos={c:.6f}")
-    assert c > 0.99, f"mxfp8 dense KV tail cos {c}"
+    assert c > MX_COS_FLOOR, f"mxfp8 dense KV tail cos {c}"
