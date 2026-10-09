@@ -1801,8 +1801,8 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
             q_tiles = min(q_tiles, (facts.max_total_seq_len_q + facts.b * (rows - 1)) // rows)
         units = q_tiles * (facts.h_q // group if pack else facts.h_q)
         for s in split_kv_candidates(sm_count=facts.device_sm_count, kv_tiles=kv_tiles):
-            if caps.sm_lo == 107 and s > 16:
-                break  # Rubin was measured at splits 2-16
+            if counted_d128 and caps.sm_lo == 107 and s > 16:
+                break  # Rubin D128 was measured at splits 2-16
             if s > 1 and units * s <= budget and kv_tiles // s >= 4:
                 # Fewest waves x loop, then fewer partials, then unpacked.
                 choices.append((_ceil_div(units * s, facts.device_sm_count) * _ceil_div(kv_tiles, s), s, pack))
