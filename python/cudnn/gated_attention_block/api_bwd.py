@@ -401,8 +401,11 @@ is the launch order):
   and the workspace delta are below and in :meth:`GatedAttentionBlockBwd.get_workspace_size`.
 
 Declined (typed, naming the attribute) on top of the fp8 arm's: an e5m2 ``dtype``,
-``thd=True`` with an MxQuantSpec (dense-only: no packed MXFP8 training record exists, and the
-SDPA-layout MX quantizes are dense-only), ``B*S % 32 != 0`` when a projection weight
+``thd=True`` with an MxQuantSpec (dense-only: the backward's SDPA-layout MX quantize
+stages run the quantizer's dense arm only -- its packed per-sequence scale-factor arm is
+not wired into them yet, while the packed MXFP8 training record the forward writes and
+the packed head-major delta both exist; the packed MXFP8 backward is a follow-up),
+``B*S % 32 != 0`` when a projection weight
 gradient is requested, ``scale_dp`` / ``scale_do`` / ``scale_dqkvg`` at ``execute``, an
 artifact given without its need or a need without its artifact, a ``.t()``-view
 artifact, a wrong blob byte count or dtype, an artifact in the wrong dtype for its
@@ -3401,8 +3404,8 @@ class _SdpaBwdMxfp8(_Stage):
 
     Declared with ``deterministic=False`` (the row declines ``True``), ``seq_kv_lens_present=False`` (the block declines
     padding first), the geometry's masks exactly as :class:`_SdpaBwd` maps them.  Dense only: the MXFP8 block backward
-    declines ``thd`` at declaration (no packed MXFP8 training record exists, and the SDPA-layout MX quantizes have no packed arm;
-    the per-tensor fp8 sibling :class:`_SdpaBwdFp8` serves the packed record).
+    declines ``thd`` at declaration (its SDPA-layout MX quantizes run the quantizer's dense arm only; the packed MXFP8 training
+    record exists, the packed MXFP8 backward is a follow-up; the per-tensor fp8 sibling :class:`_SdpaBwdFp8` serves the packed record).
     """
 
     name = "sdpa_bwd_mxfp8"
@@ -4332,14 +4335,15 @@ class GatedAttentionBlockBwd(APIBase):
             # At construction, right after the THD shape facts and BEFORE any stage is built, so the decline names the block's
             # own attributes.  Independent of the record's content, so a placeholder record (no proj_slab yet) gets this answer
             # and not the gate-copy one.  The per-tensor fp8 backward (quant=QuantSpec) is SERVED packed -- the fp8 SDPA row's THD
-            # chain reads the gate backward's packed delta (_SdpaBwdFp8, "Packed sequences") -- the MXFP8 one is not, for the two
-            # reasons named, which land together with the MXFP8 forward's THD row.
+            # chain reads the gate backward's packed delta (_SdpaBwdFp8, "Packed sequences") -- the MXFP8 one is not, for the one
+            # reason named: its SDPA-layout MX quantize stages run the quantizer's dense arm only (the packed MXFP8 training record
+            # and the packed head-major delta both exist; the packed MXFP8 backward is a follow-up).
             raise ValueError(
-                "thd=True with quant=MxQuantSpec: the MXFP8 block backward is dense-only for now -- no packed MXFP8 training record exists (the MXFP8 "
-                "training forward declines thd) and the backward's SDPA-layout MX quantizes write tiles of a padded [B, S] grid, not the packed "
-                "per-sequence-tile scale-factor blobs the MXFP8 SDPA row's THD chain binds; both arrive with the MXFP8 forward's THD row. Run the "
-                "dense MXFP8 backward (thd=False), the packed per-tensor fp8 backward (quant=QuantSpec over the packed fp8 training record) or the "
-                "packed bf16 backward over the dequantized record"
+                "thd=True with quant=MxQuantSpec: the MXFP8 block backward is dense-only for now -- its SDPA-layout MX quantize stages run the quantizer's "
+                "dense arm only (the packed per-sequence scale-factor arm the packed MXFP8 forward uses is not wired into the backward yet), while the "
+                "packed MXFP8 training record and the packed head-major delta both exist; run the dense MXFP8 backward (thd=False), the packed per-tensor "
+                "fp8 backward (quant=QuantSpec over the packed fp8 training record) or the packed bf16 backward over the dequantized record; the packed "
+                "MXFP8 backward is a follow-up"
             )
         self.quant: Optional[Union[QuantSpec, MxQuantSpec]] = quant
         self.grad_scaling = grad_scaling
@@ -4801,7 +4805,8 @@ class GatedAttentionBlockBwd(APIBase):
         bounds ``num_sequences >= 1``, ``2 <= max_seq_len <= T`` and
         ``num_sequences * max_seq_len >= T`` -- and, dense, the THD-only knobs
         refused (``thd`` together with an ``MxQuantSpec`` is declined at CONSTRUCTION,
-        naming both attributes: no packed MXFP8 training record exists; the per-tensor
+        naming both attributes: the backward's SDPA-layout MX quantizes run the quantizer's
+        dense arm only, the packed MXFP8 training record exists; the per-tensor
         fp8 backward is served packed); ``dw_norm_dtype`` other than fp32; a PACKED record handed to a
         dense block; padding (``seq_lens_present`` or ``sample_saved.seq_lens``
         on a dense block -- the ``sdpa_bwd_sm107`` row declines it, a follow-up

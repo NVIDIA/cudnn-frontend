@@ -629,9 +629,9 @@ def test_thd_fp8_record_contracts_are_typed():
 
 @requires_cuda
 def test_thd_fp8_backward_declines_an_mxquantspec():
-    """``thd=True`` with an ``MxQuantSpec`` stays the typed decline at construction, naming both attributes and the two reasons (no
-    packed MXFP8 training record; the SDPA-layout MX quantizes have no packed per-sequence arm) and pointing at the served packed
-    per-tensor fp8 backward; the adapter's text never surfaces."""
+    """``thd=True`` with an ``MxQuantSpec`` stays the typed decline at construction, naming both attributes and the one remaining
+    reason (the backward's SDPA-layout MX quantizes run the quantizer's dense arm only; the packed MXFP8 training record exists)
+    and pointing at the served packed per-tensor fp8 backward; the adapter's text never surfaces."""
     with pytest.raises(ValueError, match="thd") as ei:
         _declare_fp8_thd_bwd(quant=MxQuantSpec(descale_w_o=0.03, scale_o=1.0))
     msg = str(ei.value)

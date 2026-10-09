@@ -27,6 +27,18 @@ columnwise arm's physically transposed ``[H*D, T]`` store) take the same three t
 block reference's ``mx_quantize_rowwise_2d`` / ``mx_swizzle_sf_rowwise_padded`` (the artifact
 builder's own oracle) cross-checked with ``quantize_to_mxfp8``'s ``_d`` / ``_s`` payloads -- bitwise,
 the default arms' artifacts untouched.
+
+The PACKED arm (``packed=True``: the block's THD pipeline; SF tiles per sequence in ``cu_seqlens``
+order, the V planes adjacent, slack past the live total zero) is pinned the same way: per sequence
+against ``quantize_to_mxfp8`` on that sequence's rows re-laid as the Rubin MXFP8 SDPA's THD row
+reads them (``_packed_sf_reference``), BITWISE against the dense launch where the two layouts
+coincide (``B = 1``: the payload and the Q/K slabs; the V slabs are the dense atoms in the
+plane-adjacent order), as an exact PERMUTATION of the dense blobs on a uniform packing, with every
+byte written under an E8M0-NaN (``0xFF``) poison (pad blocks and slack ``0x00``), on both length
+forms (``[B]`` lengths, ``[B+1]`` prefix sums at a non-zero base), on ``B = 300`` five-token
+sequences (the warp scan has no cap on ``B``), and the dual-axis packed pair bitwise the two
+standalone packed launches.  The dense artifacts' SASS is unchanged by the arm (the appended
+parameters are trace-time constants there).
 """
 
 import glob
@@ -79,13 +91,18 @@ from cudnn.gated_attention_block.kernels.quantize_mxfp8 import (  # noqa: E402
     lanes_per_row,
     moved_bytes,
     n_sf_tiles,
+    n_sf_tiles_packed_cap,
     run_quantize_mxfp8,
     sf_byte_canonical,
     sf_byte_columnwise,
+    sf_byte_columnwise_packed,
     sf_byte_rowwise,
+    sf_byte_rowwise_packed,
     sf_bytes,
+    sf_bytes_packed,
     sf_tile_bytes,
     validate_mode,
+    validate_packed_mode,
     validate_shape,
 )
 
@@ -241,9 +258,140 @@ def _tail_sf_bytes(axis: str, *, batch: int, h: int, seq_len: int):
     return sorted(offs)
 
 
+def _lens_tensor(lens, *, cu: bool = False, base: int = 0) -> torch.Tensor:
+    """The packed lengths as the kernel takes them: ``[B]`` int32 lengths, or ``[B+1]`` int32 prefix sums at ``base``."""
+    if not cu:
+        return torch.tensor([int(n) for n in lens], dtype=torch.int32, device="cuda")
+    cu_vals, acc = [int(base)], int(base)
+    for n in lens:
+        acc += int(n)
+        cu_vals.append(acc)
+    return torch.tensor(cu_vals, dtype=torch.int32, device="cuda")
+
+
+def _launch_packed(axis: str, src: torch.Tensor, lens, *, h: int, cu: bool = False, cu_base: int = 0, poison: int = 0xFF):
+    """Compile (cached) the PACKED arm, poison dst (0xFF = e4m3 NaN) and the whole SF slot incl. its slack (0xFF = E8M0 NaN), run, sync.
+
+    ``src`` is the packed ``[T, H, D]`` (``T = sum(lens)``); the SF slot is ``sf_bytes_packed(B, H, T, D)`` (the capacity bound the
+    block carves).  Returns ``(dst, sf, seq_lens)``."""
+    b, t = len(lens), int(sum(lens))
+    r = compile_quantize_mxfp8(dtype_in=src.dtype, h=h, d=D, axis=axis, packed=True)
+    assert r.packed is True and r.sf_layout == SF_LAYOUT_SDPA
+    dst = torch.full((t, h, D), poison, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    sf = torch.full((sf_bytes_packed(b, h, t, D),), poison, dtype=torch.uint8, device="cuda")
+    seq_lens = _lens_tensor(lens, cu=cu, base=cu_base)
+    run_quantize_mxfp8(r, src, dst, sf, stream=torch.cuda.current_stream().cuda_stream, seq_lens=seq_lens, num_sequences=b, cu_seqlens=cu)
+    torch.cuda.synchronize()
+    return dst, sf, seq_lens
+
+
+def _packed_sf_reference(axis: str, src_thd: torch.Tensor, lens, *, h: int):
+    """The PACKED layout's oracle, per sequence: ``quantize_to_mxfp8`` on the sequence's own rows (``b = 1``), its SF tiles re-laid as
+    the Rubin MXFP8 SDPA's THD row reads them -- rowwise ``[h, n_tiles, 1024]`` slabs as they come, columnwise the plane-major
+    ``[D/128, h, n_tiles, 512]`` atoms transposed to ``[h, n_tiles, D/128, 512]`` (the SDPA THD suite's per-sequence recipe) -- then the
+    sequences' tiles concatenated per head in ``cu_seqlens`` order and the slot's slack tiles zero.  An empty sequence contributes no
+    rows and no tiles.  Returns ``(data [T, H, D] e4m3, sf flat uint8 of sf_bytes_packed)``."""
+    b, t = len(lens), int(sum(lens))
+    n_cap = n_sf_tiles_packed_cap(t, b)
+    datas, sfs, lo = [], [], 0
+    for n in lens:
+        n = int(n)
+        if n == 0:
+            continue
+        bhsd = src_thd[lo : lo + n].reshape(1, n, h, D).permute(0, 2, 1, 3)
+        row_d, _, row_sf, col_d, _, col_sf = quantize_to_mxfp8(bhsd, 1, h, n, D, with_ref=False)
+        n_tiles = n_sf_tiles(n)
+        if axis == AXIS_ROW:
+            data, sf = row_d, row_sf.view(torch.uint8).reshape(h, n_tiles, sf_tile_bytes(D))
+        else:
+            planes = D // 128
+            data = col_d
+            sf = col_sf.view(torch.uint8).reshape(planes, h, n_tiles, 512).permute(1, 2, 0, 3).reshape(h, n_tiles, sf_tile_bytes(D))
+        datas.append(data.permute(0, 2, 1, 3).reshape(n, h, D))
+        sfs.append(sf)
+        lo += n
+    data = torch.cat(datas, dim=0)
+    sf = torch.cat(sfs, dim=1)
+    assert sf.shape[1] <= n_cap, (sf.shape, n_cap)
+    slack = torch.zeros((h, n_cap - sf.shape[1], sf_tile_bytes(D)), dtype=torch.uint8, device=sf.device)
+    return data, torch.cat([sf, slack], dim=1).reshape(-1)
+
+
+def _check_packed_against_oracle(axis: str, src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, lens, *, h: int) -> None:
+    ref_d, ref_sf = _packed_sf_reference(axis, src, lens, h=h)
+    got_d = dst.view(torch.uint8)
+    assert ref_sf.numel() == sf.numel(), (ref_sf.numel(), sf.numel())
+    n_bad_d = int((got_d != ref_d.view(torch.uint8)).sum().item())
+    n_bad_sf = int((sf != ref_sf).sum().item())
+    assert n_bad_d == 0, f"{axis} packed {list(lens)}: {n_bad_d} / {got_d.numel()} e4m3 codes differ from the per-sequence oracle"
+    assert n_bad_sf == 0, f"{axis} packed {list(lens)}: {n_bad_sf} / {sf.numel()} SF bytes differ from the per-sequence oracle (byte ORDER or rounding)"
+    # every byte written: the 0xFF poison is a NaN in both formats and cannot come from finite data -- the slack tiles included
+    assert int((got_d == 0xFF).sum().item()) == 0, "e4m3 sentinel survived: some packed data rows were never written"
+    assert int((sf == 0xFF).sum().item()) == 0, "SF sentinel survived: a pad block or a slack tile was never written (E8M0 NaN under the SDPA's whole-tile TMA)"
+
+
 # ---------------------------------------------------------------------------
 # Tier 1: shape algebra + layout contracts -- no GPU
 # ---------------------------------------------------------------------------
+
+
+def test_packed_contracts_are_typed():
+    """The packed arm's algebra and its typed contract, no device: the capacity bound dominates the live total for any lengths
+    (and IS the dense count at ``B = 1``), the byte twins place a slab at ``(h*n_cap + tile) * 1024`` with the V planes adjacent
+    (at ``B = 1`` the rowwise twin is the dense one; the columnwise twin differs from the dense D-plane-major one as soon as
+    ``H * n_tiles > 1``), and ``packed`` refuses the canonical / transposed modes before any tracing."""
+    import random
+
+    rng = random.Random(7)
+    for _ in range(200):
+        b = rng.randint(1, 40)
+        lens = [rng.randint(0, 700) for _ in range(b)]
+        t = sum(lens)
+        live = sum(n_sf_tiles(n) for n in lens)
+        cap = n_sf_tiles_packed_cap(t, b)
+        assert live <= cap < live + b, (lens, live, cap)
+    for t in (1, 127, 128, 129, 300, 1000):
+        assert n_sf_tiles_packed_cap(t, 1) == n_sf_tiles(t) and sf_bytes_packed(1, 3, t, D) == sf_bytes(1, 3, t, D)
+    h, n_cap = 3, 5
+    for hh in range(h):
+        for tile in range(n_cap):
+            for r in (0, 31, 32, 127):
+                for d_idx in (0, 32, 128, 255):
+                    want = (hh * n_cap + tile) * sf_tile_bytes(D) + ((d_idx // 32) // 4) * 512 + (r % 32) * 16 + (r // 32) * 4 + (d_idx // 32) % 4
+                    assert sf_byte_rowwise_packed(hh, tile, r, d_idx, n_cap=n_cap, d=D) == want
+                    assert sf_byte_rowwise_packed(hh, tile, r, d_idx, n_cap=n_cap, d=D) == sf_byte_rowwise(
+                        0, hh, tile * 128 + r, d_idx, n_heads=h, n_tiles=n_cap, d=D
+                    )
+                    plane, dm = d_idx // 128, d_idx % 128
+                    want_c = (hh * n_cap + tile) * sf_tile_bytes(D) + plane * 512 + (dm % 32) * 16 + (dm // 32) * 4 + r // 32
+                    assert sf_byte_columnwise_packed(hh, tile, r, d_idx, n_cap=n_cap, d=D) == want_c
+    # the whole packed V slot is a permutation of the dense B=1 one (every byte lands exactly once); at (h, n) = (1, 1) they coincide
+    dense = {sf_byte_columnwise(0, hh, s_, dd, n_heads=h, n_tiles=n_cap, batch=1) for hh in range(h) for s_ in range(0, n_cap * 128, 32) for dd in range(D)}
+    packed = {
+        sf_byte_columnwise_packed(hh, s_ // 128, s_ % 128, dd, n_cap=n_cap, d=D) for hh in range(h) for s_ in range(0, n_cap * 128, 32) for dd in range(D)
+    }
+    assert dense == packed == set(range(sf_bytes_packed(1, h, n_cap * 128, D)))
+    assert sf_byte_columnwise_packed(0, 0, 40, 130, n_cap=1, d=D) == sf_byte_columnwise(0, 0, 40, 130, n_heads=1, n_tiles=1, batch=1)
+    assert sf_byte_columnwise_packed(0, 1, 40, 2, n_cap=2, d=D) != sf_byte_columnwise(
+        0, 0, 128 + 40, 2, n_heads=1, n_tiles=2, batch=1
+    )  # plane 0 of tile 1: 1024 vs 512
+    validate_packed_mode(SF_LAYOUT_SDPA, False, False)
+    validate_packed_mode(SF_LAYOUT_SDPA, False, True)
+    validate_packed_mode(SF_LAYOUT_GEMM, True, False)
+    with pytest.raises(ValueError, match="sf_layout='sdpa'"):
+        validate_packed_mode(SF_LAYOUT_GEMM, False, True)
+    with pytest.raises(ValueError, match="transposed=True"):
+        validate_packed_mode(SF_LAYOUT_SDPA, True, True)
+    with pytest.raises(ValueError, match="bool"):
+        validate_packed_mode(SF_LAYOUT_SDPA, False, 1)
+    with pytest.raises(ValueError, match="sf_layout='sdpa'"):
+        compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, sf_layout=SF_LAYOUT_GEMM, packed=True)
+    with pytest.raises(ValueError, match="sf_layout='sdpa'"):  # the layout check comes first; the transposed one is pinned on validate_packed_mode above
+        compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_COL, sf_layout=SF_LAYOUT_GEMM, transposed=True, packed=True)
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import compile_quantize_mxfp8_dual
+
+    with pytest.raises(ValueError, match="sf_layout='sdpa'"):
+        compile_quantize_mxfp8_dual(dtype_in=torch.bfloat16, h=2, d=D, sf_layout=SF_LAYOUT_GEMM, transposed_second=True, packed=True)
 
 
 def test_rcp_448_is_the_exact_fp32_rounding():
@@ -545,14 +693,14 @@ def test_oracle_pads_s_to_128_with_zero_scales():
 
 _SASS_PROBE = textwrap.dedent("""
     import glob, os, subprocess, sys
-    axis, sf_layout, transposed, dump, cands = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4], sys.argv[5:]
+    axis, sf_layout, transposed, packed, dump, cands = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4] == "1", sys.argv[5], sys.argv[6:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump  # read once, at the first cutlass import
     import torch
     from cudnn.gated_attention_block.kernels.quantize_mxfp8 import COMPILE_OPTIONS, compile_quantize_mxfp8
     # --keep-cubin, NOT --keep-sass: the latter runs the DSL's own wheel nvdisasm, which ICEs on sm_107a.
     compile_quantize_mxfp8(
         dtype_in=torch.bfloat16, h=4, d=256, axis=axis, compile_options=COMPILE_OPTIONS + " --gpu-arch sm_107a --keep-cubin",
-        sf_layout=sf_layout, transposed=transposed,
+        sf_layout=sf_layout, transposed=transposed, packed=packed,
     )
     cubins = glob.glob(os.path.join(dump, "*.sm_107a.cubin"))
     if not cubins:
@@ -584,13 +732,20 @@ _SASS_PROBE = textwrap.dedent("""
 
 
 @pytest.mark.parametrize(
-    "axis, sf_layout, transposed, e8m0_cvts",
-    [(AXIS_ROW, SF_LAYOUT_SDPA, False, 8), (AXIS_COL, SF_LAYOUT_SDPA, False, 2), (AXIS_ROW, SF_LAYOUT_GEMM, False, 8), (AXIS_COL, SF_LAYOUT_GEMM, True, 2)],
-    ids=["row", "col", "canonical", "transposed"],
+    "axis, sf_layout, transposed, packed, e8m0_cvts",
+    [
+        (AXIS_ROW, SF_LAYOUT_SDPA, False, False, 8),
+        (AXIS_COL, SF_LAYOUT_SDPA, False, False, 2),
+        (AXIS_ROW, SF_LAYOUT_GEMM, False, False, 8),
+        (AXIS_COL, SF_LAYOUT_GEMM, True, False, 2),
+        (AXIS_ROW, SF_LAYOUT_SDPA, False, True, 8),
+        (AXIS_COL, SF_LAYOUT_SDPA, False, True, 2),
+    ],
+    ids=["row", "col", "canonical", "transposed", "packed-row", "packed-col"],
 )
-def test_sm107_trace_compile_has_no_spills(axis, sf_layout, transposed, e8m0_cvts, tmp_path):
+def test_sm107_trace_compile_has_no_spills(axis, sf_layout, transposed, packed, e8m0_cvts, tmp_path):
     """Compile for Rubin here (no device match needed), decode with an nvdisasm that knows sm_107a: STL/LDL must be 0 -- for
-    the two SDPA-layout arms and the two GEMM-canonical ones.
+    the two SDPA-layout arms, the two GEMM-canonical ones and the two PACKED ones (the warp scan adds shuffles, no local memory).
 
     Also pins that the scale is produced by the hardware ``cvt.rp...ue8m0x2`` (at least one per row pass rowwise = 8
     at 256 threads / D=256; one ``e8m0_pair`` per warp unit columnwise = 2 -- a LOWER bound, ptxas may duplicate), that
@@ -605,18 +760,23 @@ def test_sm107_trace_compile_has_no_spills(axis, sf_layout, transposed, e8m0_cvt
     cands = _nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
-    dump = tmp_path / f"quantize_mxfp8_{axis}_{sf_layout}_{int(transposed)}"
+    dump = tmp_path / f"quantize_mxfp8_{axis}_{sf_layout}_{int(transposed)}_{int(packed)}"
     dump.mkdir()
     proc = subprocess.run(
-        [sys.executable, "-c", _SASS_PROBE, axis, sf_layout, "1" if transposed else "0", str(dump), *cands], capture_output=True, text=True, timeout=600
+        [sys.executable, "-c", _SASS_PROBE, axis, sf_layout, "1" if transposed else "0", "1" if packed else "0", str(dump), *cands],
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
     assert proc.returncode == 0, f"trace-compile failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     if any(ln.startswith("SKIP") for ln in proc.stdout.splitlines()):
         pytest.skip(f"{[ln for ln in proc.stdout.splitlines() if ln.startswith(('SKIP', 'REJECT'))]}")
     keys = ("SPILL", "E8M0CVT", "E4M3CVT", "FMNMX3", "STG128", "STG16", "LINES")
     stats = {k: int(v) for k, v in (ln.split() for ln in proc.stdout.splitlines() if ln.split() and ln.split()[0] in keys)}
-    print(f"\n[{axis} {sf_layout} transposed={transposed}] sm_107a SASS: {stats} via {[ln for ln in proc.stdout.splitlines() if ln.startswith('NVDISASM')]}")
-    assert stats["SPILL"] == 0, f"{axis} {sf_layout} transposed={transposed}: {stats['SPILL']} STL/LDL in the sm_107a cubin"
+    print(
+        f"\n[{axis} {sf_layout} transposed={transposed} packed={packed}] sm_107a SASS: {stats} via {[ln for ln in proc.stdout.splitlines() if ln.startswith('NVDISASM')]}"
+    )
+    assert stats["SPILL"] == 0, f"{axis} {sf_layout} transposed={transposed} packed={packed}: {stats['SPILL']} STL/LDL in the sm_107a cubin"
     assert stats["E8M0CVT"] >= e8m0_cvts, f"{axis}: fewer ue8m0x2 cvts than the source issues -- {stats}"
     assert stats["E4M3CVT"] > 0 and stats["FMNMX3"] > 0, stats
     if axis == AXIS_COL:
@@ -629,24 +789,31 @@ def test_sm107_trace_compile_has_no_spills(axis, sf_layout, transposed, e8m0_cvt
 
 def test_default_artifacts_are_byte_identical():
     """The appended knobs do not fork the default artifact: the implicit and the explicit ``(sf_layout="sdpa",
-    transposed=False)`` builds are ONE cache entry, keyed by today's 7-tuple as the PREFIX plus the two appended fields, and
-    each new mode is its own entry with the same prefix.  Traced for sm_107a in-process (no device match needed; SKIPS where
-    the DSL predates it) -- the SASS of the default arms is unchanged by construction: every new statement sits under a
-    ``const_expr`` on the two knobs."""
+    transposed=False, packed=False)`` builds are ONE cache entry, keyed by today's 7-tuple as the PREFIX plus the three appended
+    fields, and each new mode is its own entry with the same prefix.  Traced for sm_107a in-process (no device match needed; SKIPS
+    where the DSL predates it) -- the SASS of the default arms is unchanged by construction: every new statement sits under a
+    ``const_expr`` on the knobs, and the packed arm's appended kernel arguments are trace-time constants (``None``) on the default
+    arms, so their kernel parameter lists are unchanged too."""
     if not _sm107a_known_to_the_dsl():
         pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
     opts = COMPILE_OPTIONS + " --gpu-arch sm_107a"
     before = len(compiled_cache)
     r1 = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts)
-    r2 = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts, sf_layout=SF_LAYOUT_SDPA, transposed=False)
-    assert r1.compiled is r2.compiled and (r1.sf_layout, r1.transposed) == (SF_LAYOUT_SDPA, False) == (r2.sf_layout, r2.transposed)
+    r2 = compile_quantize_mxfp8(
+        dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts, sf_layout=SF_LAYOUT_SDPA, transposed=False, packed=False
+    )
+    assert r1.compiled is r2.compiled and (r1.sf_layout, r1.transposed, r1.packed) == (SF_LAYOUT_SDPA, False, False) == (r2.sf_layout, r2.transposed, r2.packed)
     keys = [k for k, v in compiled_cache.items() if v is r1.compiled]
-    assert len(keys) == 1 and keys[0][:6] == ("torch.bfloat16", 2, D, AXIS_ROW, 256, opts) and keys[0][7:] == (SF_LAYOUT_SDPA, False), keys
+    assert len(keys) == 1 and keys[0][:6] == ("torch.bfloat16", 2, D, AXIS_ROW, 256, opts) and keys[0][7:] == (SF_LAYOUT_SDPA, False, False), keys
     r3 = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts, sf_layout=SF_LAYOUT_GEMM)
     assert r3.compiled is not r1.compiled
     k3 = [k for k, v in compiled_cache.items() if v is r3.compiled]
-    assert len(k3) == 1 and k3[0][:7] == keys[0][:7] and k3[0][7:] == (SF_LAYOUT_GEMM, False)
-    assert len(compiled_cache) >= before + 2 and len({k[7:] for k in (keys[0], k3[0])}) == 2
+    assert len(k3) == 1 and k3[0][:7] == keys[0][:7] and k3[0][7:] == (SF_LAYOUT_GEMM, False, False)
+    r4 = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=2, d=D, axis=AXIS_ROW, compile_options=opts, packed=True)
+    assert r4.compiled is not r1.compiled and r4.packed is True
+    k4 = [k for k, v in compiled_cache.items() if v is r4.compiled]
+    assert len(k4) == 1 and k4[0][:7] == keys[0][:7] and k4[0][7:] == (SF_LAYOUT_SDPA, False, True)
+    assert len(compiled_cache) >= before + 3 and len({k[7:] for k in (keys[0], k3[0], k4[0])}) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -655,15 +822,18 @@ def test_default_artifacts_are_byte_identical():
 
 
 @requires_mx_cvt
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
 @pytest.mark.parametrize("b", [1, 2])
 @pytest.mark.parametrize("s", [128, 256, 384, 512, 1000, 900])
 @pytest.mark.parametrize("role", ["q", "k", "v"])
-def test_compact_source_is_bit_exact_vs_oracle(role, s, b):
+def test_compact_source_is_bit_exact_vs_oracle(role, s, b, packed):
     """Compact ``[T, H, D]`` bf16 in; e4m3 codes AND the F8_128x4 SF blob equal the oracle byte for byte.
 
     H_q=4 (q) vs H_kv=2 (k, v) so the head stride of the SF tile index is exercised; S=1000 is the KV tail
     (104 live rows in the last tile; columnwise the 992..1023 block STRADDLES S), S=900 adds three 32-token
-    blocks that are entirely padding (columnwise SF must be 0x00 there)."""
+    blocks that are entirely padding (columnwise SF must be 0x00 there).  ``packed``: the same ``(b, s)`` as the
+    uniform packing ``(s,) * b`` through the PACKED arm against the per-sequence oracle (its slack tiles ``0x00``);
+    the e4m3 payload is the dense launch's byte for byte."""
     axis, h, _ = ROLES[role]
     torch.manual_seed(zlib.crc32(f"{role}-{s}-{b}".encode()) & 0xFFFF)  # str hash is per-process randomized; crc32 replays
     x = (torch.randn(b * s, h, D, device="cuda") * 3.0).to(torch.bfloat16)
@@ -672,6 +842,10 @@ def test_compact_source_is_bit_exact_vs_oracle(role, s, b):
     offs = _tail_sf_bytes(axis, batch=b, h=h, seq_len=s)
     if offs:
         assert int(sf[offs].max().item()) == 0, "pad-row SF bytes must be 0x00"
+    if packed:
+        dst_p, sf_p, _ = _launch_packed(axis, x, (s,) * b, h=h)
+        _check_packed_against_oracle(axis, x, dst_p, sf_p, (s,) * b, h=h)
+        assert torch.equal(dst_p.view(torch.uint8), dst.view(torch.uint8)), "the packed payload differs from the dense launch's"
 
 
 @requires_mx_cvt
@@ -748,6 +922,207 @@ def test_e8m0_corners_on_device(axis):
             code = int(codes[32 * r, 0, 0].item())
         assert int(sf[off].item()) == e, f"{axis} amax={amax}: SF 0x{int(sf[off].item()):02X} != 0x{e:02X}"
         assert code == exp_code, f"{axis} amax={amax}: code 0x{code:02X} != 0x{exp_code:02X}"
+
+
+# ---------------------------------------------------------------------------
+# The PACKED (THD) arm: per-sequence-tile-padded SF tiles in cu_seqlens order
+# ---------------------------------------------------------------------------
+
+_PACKINGS = [
+    (300, 128, 200),  # the block's THD suite packing: a tail tile on every sequence, none a 128-multiple
+    (5, 130, 1000),  # a 5-token sequence (one tile), a 2-tile one, a 1000-token one (the KV tail of the dense suite)
+    (126, 0, 60),  # an EMPTY sequence in the middle: zero tiles, zero rows
+    (300, 200, 0),  # a TRAILING empty sequence: cu_sf[B] == cu_sf[B-1], the slack starts right after the last live tile
+    (512,),  # B = 1: the packed layout is the dense one
+]
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("cu", [False, True], ids=["lengths", "prefix"])
+@pytest.mark.parametrize("lens", _PACKINGS, ids=lambda l: "x".join(str(n) for n in l))
+@pytest.mark.parametrize("role", ["q", "k", "v"])
+def test_packed_matches_the_per_sequence_oracle(role, lens, cu):
+    """The PACKED arm against ``quantize_to_mxfp8`` run on each sequence's own rows and re-laid as the SDPA's THD row reads the
+    tiles (``_packed_sf_reference``): e4m3 codes and SF bytes equal byte for byte, every byte of the slot written (the pad
+    blocks of a tail tile and the slack tiles ``0x00``, never the ``0xFF`` poison), empty sequences owning no tiles, on both
+    length forms (the ``[B+1]`` prefix sums at base 0 here; a non-zero base in its own cell)."""
+    axis, h, _ = ROLES[role]
+    torch.manual_seed(zlib.crc32(f"packed-{role}-{lens}-{cu}".encode()) & 0xFFFF)
+    t = sum(lens)
+    x = (torch.randn(t, h, D, device="cuda") * 3.0).to(torch.bfloat16)
+    dst, sf, _ = _launch_packed(axis, x, lens, h=h, cu=cu)
+    _check_packed_against_oracle(axis, x, dst, sf, lens, h=h)
+    # the slack tiles (past the live total, up to the capacity) are 0x00: the capacity-slack class stays inert for the SDPA
+    live = sum(n_sf_tiles(n) for n in lens)
+    n_cap = n_sf_tiles_packed_cap(t, len(lens))
+    slack = sf.view(h, n_cap, sf_tile_bytes(D))[:, live:]
+    assert slack.numel() == h * (n_cap - live) * sf_tile_bytes(D) and (slack.numel() == 0 or int(slack.max().item()) == 0)
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("role", ["q", "k", "v"])
+@pytest.mark.parametrize("t", [128, 300, 1000])
+def test_packed_b1_is_the_dense_layout(role, t):
+    """``B = 1``: the packed launch over ``(t,)`` against the dense ``batch=1, seq_len=t`` launch over the SAME bytes -- the e4m3
+    payload and the Q / K slabs BITWISE (``cu_sf[0] = 0``, ``n_cap = ceil(t/128)``: the two layouts coincide); the V slot holds the
+    dense atoms in the plane-ADJACENT order (``packed.view(h, n, 2, 512).permute(2, 0, 1, 3) == dense.view(2, h, n, 512)``), which
+    is the dense slot itself only at ``h * n == 1``.  A difference is a finding, never a tolerance."""
+    axis, h, _ = ROLES[role]
+    torch.manual_seed(zlib.crc32(f"b1-{role}-{t}".encode()) & 0xFFFF)
+    x = (torch.randn(t, h, D, device="cuda") * 3.0).to(torch.bfloat16)
+    dst_d, sf_d = _launch(axis, x, batch=1, seq_len=t, h=h)
+    dst_p, sf_p, _ = _launch_packed(axis, x, (t,), h=h)
+    assert sf_p.numel() == sf_d.numel() == sf_bytes(1, h, t, D)
+    assert torch.equal(dst_p.view(torch.uint8), dst_d.view(torch.uint8)), "B=1 packed payload differs from the dense launch"
+    n = n_sf_tiles(t)
+    if axis == AXIS_ROW:
+        assert torch.equal(sf_p, sf_d), "B=1 packed Q/K scale slabs differ from the dense launch"
+    else:
+        perm = sf_p.view(h, n, D // 128, 512).permute(2, 0, 1, 3).reshape(-1)
+        assert torch.equal(perm, sf_d), "B=1 packed V scale atoms are not the dense atoms in the plane-adjacent order"
+        assert (h * n == 1) == torch.equal(sf_p, sf_d)
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("role", ["q", "k", "v"])
+@pytest.mark.parametrize("s, b", [(256, 4), (200, 4), (128, 2)])
+def test_packed_uniform_is_a_permutation_of_the_dense_blobs(role, s, b):
+    """A UNIFORM packing ``(s,) * b`` against the dense ``(b, s)`` launch over the same bytes: the payload bitwise, the SF slabs an
+    exact PERMUTATION -- Q/K ``packed.view(H, B, n, 1024).permute(1, 0, 2, 3) == dense.view(B, H, n, 1024)``, V
+    ``packed.view(H, B, n, 2, 512).permute(3, 1, 0, 2, 4) == dense.view(2, B, H, n, 512)`` (the oracle-free pin of the burst
+    addressing); at ``s = 200`` every sequence has a tail tile and the slot carries slack tiles past ``B * n``."""
+    axis, h, _ = ROLES[role]
+    torch.manual_seed(zlib.crc32(f"perm-{role}-{s}-{b}".encode()) & 0xFFFF)
+    x = (torch.randn(b * s, h, D, device="cuda") * 3.0).to(torch.bfloat16)
+    dst_d, sf_d = _launch(axis, x, batch=b, seq_len=s, h=h)
+    dst_p, sf_p, _ = _launch_packed(axis, x, (s,) * b, h=h)
+    assert torch.equal(dst_p.view(torch.uint8), dst_d.view(torch.uint8))
+    n = n_sf_tiles(s)
+    n_cap = n_sf_tiles_packed_cap(b * s, b)
+    live = sf_p.view(h, n_cap, sf_tile_bytes(D))[:, : b * n]  # the slack tiles (zero) are not part of the permutation
+    if axis == AXIS_ROW:
+        assert torch.equal(live.reshape(h, b, n, sf_tile_bytes(D)).permute(1, 0, 2, 3).reshape(-1), sf_d)
+    else:
+        assert torch.equal(live.reshape(h, b, n, D // 128, 512).permute(3, 1, 0, 2, 4).reshape(-1), sf_d)
+    if n_cap > b * n:
+        assert int(sf_p.view(h, n_cap, sf_tile_bytes(D))[:, b * n :].max().item()) == 0
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("axis", [AXIS_ROW, AXIS_COL])
+def test_packed_prefix_sums_at_a_nonzero_base_are_the_lengths_form_bitwise(axis):
+    """``cu_seqlens=True`` with a prefix tensor sliced from a larger one (base 100): the kernel reads adjacent DIFFERENCES, so the
+    base never matters -- bitwise the ``[B]`` lengths launch and the base-0 prefix launch."""
+    h, lens = 2, (300, 128, 200)
+    torch.manual_seed(11)
+    x = torch.randn(sum(lens), h, D, device="cuda").to(torch.bfloat16)
+    d0, s0, _ = _launch_packed(axis, x, lens, h=h)
+    d1, s1, _ = _launch_packed(axis, x, lens, h=h, cu=True)
+    d2, s2, l2 = _launch_packed(axis, x, lens, h=h, cu=True, cu_base=100)
+    assert l2.tolist() == [100, 400, 528, 728]
+    assert torch.equal(d0.view(torch.uint8), d1.view(torch.uint8)) and torch.equal(s0, s1)
+    assert torch.equal(d0.view(torch.uint8), d2.view(torch.uint8)) and torch.equal(s0, s2)
+
+
+@requires_mx_cvt
+@pytest.mark.parametrize("axis", [AXIS_ROW, AXIS_COL])
+def test_packed_many_short_sequences_have_no_cap(axis):
+    """``B = 300`` sequences of 5..128 tokens (the block's shortest legal sequence is 5): the per-unit warp scan walks ten
+    32-sequence chunks with a carried total -- no SMEM array of ``B`` entries, no cap on ``B`` -- and every sequence lands on its own
+    tiles (the per-sequence oracle names a wrong one).  Run on both length forms."""
+    import random
+
+    rng = random.Random(300)
+    lens = [rng.randint(5, 128) for _ in range(300)]
+    h = 2
+    torch.manual_seed(300)
+    x = torch.randn(sum(lens), h, D, device="cuda").to(torch.bfloat16)
+    for cu in (False, True):
+        dst, sf, _ = _launch_packed(axis, x, lens, h=h, cu=cu)
+        _check_packed_against_oracle(axis, x, dst, sf, lens, h=h)
+
+
+@requires_mx_cvt
+def test_packed_two_launches_are_bitwise_identical():
+    torch.manual_seed(13)
+    h, lens = 2, (300, 128, 200)
+    x = torch.randn(sum(lens), h, D, device="cuda").to(torch.bfloat16)
+    for axis in (AXIS_ROW, AXIS_COL):
+        d1, s1, _ = _launch_packed(axis, x, lens, h=h)
+        d2, s2, _ = _launch_packed(axis, x, lens, h=h, poison=0x00)
+        assert torch.equal(d1.view(torch.uint8), d2.view(torch.uint8)) and torch.equal(s1, s2), axis
+
+
+@requires_mx_cvt
+def test_dual_axis_packed_sdpa_pair_is_bitwise_the_two_standalone_packed_launches():
+    """The dual-axis arm under ``packed=True`` (the SDPA pair): ``dst`` / ``sf`` equal the standalone packed rowwise launch and
+    ``dst_T`` / ``sf_T`` the standalone packed columnwise one, byte for byte -- the same per-sequence decode, the same bursts."""
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import compile_quantize_mxfp8_dual, run_quantize_mxfp8_dual
+
+    torch.manual_seed(17)
+    h, lens = 2, (300, 128, 200)
+    b, t = len(lens), sum(lens)
+    x = torch.randn(t, h, D, device="cuda").to(torch.bfloat16)
+    r = compile_quantize_mxfp8_dual(dtype_in=x.dtype, h=h, d=D, packed=True)
+    assert r.packed is True
+    dst = torch.full((t, h, D), 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    dst_t = torch.full((t, h, D), 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    sf = torch.full((sf_bytes_packed(b, h, t, D),), 0xFF, dtype=torch.uint8, device="cuda")
+    sf_t = torch.full_like(sf, 0xFF)
+    seq_lens = _lens_tensor(lens)
+    run_quantize_mxfp8_dual(r, x, dst, sf, dst_t, sf_t, stream=torch.cuda.current_stream().cuda_stream, seq_lens=seq_lens, num_sequences=b)
+    torch.cuda.synchronize()
+    row_d, row_sf, _ = _launch_packed(AXIS_ROW, x, lens, h=h)
+    col_d, col_sf, _ = _launch_packed(AXIS_COL, x, lens, h=h)
+    assert torch.equal(dst.view(torch.uint8), row_d.view(torch.uint8)) and torch.equal(sf, row_sf)
+    assert torch.equal(dst_t.view(torch.uint8), col_d.view(torch.uint8)) and torch.equal(sf_t, col_sf)
+    with pytest.raises(ValueError, match="batch / seq_len are refused"):
+        run_quantize_mxfp8_dual(r, x, dst, sf, dst_t, sf_t, batch=1, seq_len=t, stream=torch.cuda.current_stream().cuda_stream)
+
+
+@requires_mx_cvt
+def test_packed_run_declines_a_mismatched_binding():
+    """The packed arm's host contract, typed both ways and before any launch: a packed recipe refuses ``batch`` / ``seq_len`` and
+    needs ``seq_lens`` (int32, 1-D, contiguous, CUDA, ``B`` or ``B+1`` entries) + ``num_sequences >= 1`` and the capacity byte count;
+    a dense recipe refuses the packed trio.  A refused call launches nothing (the sentinel-filled outputs are untouched)."""
+    h, lens = 2, (300, 128, 200)
+    b, t = len(lens), sum(lens)
+    x = torch.randn(t, h, D, device="cuda").to(torch.bfloat16)
+    r = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=h, d=D, axis=AXIS_ROW, packed=True)
+    dst = torch.full((t, h, D), 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+    sf = torch.full((sf_bytes_packed(b, h, t, D),), 0xFF, dtype=torch.uint8, device="cuda")
+    st = torch.cuda.current_stream().cuda_stream
+    good = _lens_tensor(lens)
+    with pytest.raises(ValueError, match="batch / seq_len are refused"):
+        run_quantize_mxfp8(r, x, dst, sf, batch=1, seq_len=t, stream=st, seq_lens=good, num_sequences=b)
+    with pytest.raises(ValueError, match="num_sequences >= 1"):
+        run_quantize_mxfp8(r, x, dst, sf, stream=st, seq_lens=good, num_sequences=0)
+    with pytest.raises(ValueError, match="int32"):
+        run_quantize_mxfp8(r, x, dst, sf, stream=st, seq_lens=good.to(torch.int64), num_sequences=b)
+    with pytest.raises(ValueError, match="of 3 elements"):
+        run_quantize_mxfp8(r, x, dst, sf, stream=st, seq_lens=good[:2], num_sequences=b)
+    with pytest.raises(ValueError, match="of 4 elements"):
+        run_quantize_mxfp8(r, x, dst, sf, stream=st, seq_lens=good, num_sequences=b, cu_seqlens=True)
+    with pytest.raises(ValueError, match="int32"):
+        run_quantize_mxfp8(r, x, dst, sf, stream=st, seq_lens=None, num_sequences=b)
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        run_quantize_mxfp8(r, x, dst, sf, stream=st, seq_lens=good.cpu(), num_sequences=b)
+    with pytest.raises(ValueError, match="PACKED layout"):
+        run_quantize_mxfp8(r, x, dst, sf[:-1], stream=st, seq_lens=good, num_sequences=b)
+    with pytest.raises(ValueError, match="PACKED layout"):  # the DENSE B=1 byte count (10 tiles / head) is not the packed capacity at B = 4 (8 tiles / head)
+        run_quantize_mxfp8(
+            r, x, dst, torch.zeros(sf_bytes(1, h, t, D), dtype=torch.uint8, device="cuda"), stream=st, seq_lens=_lens_tensor(lens + (0,)), num_sequences=b + 1
+        )
+    torch.cuda.synchronize()
+    assert int((dst.view(torch.uint8) != 0xFF).sum().item()) == 0 and int((sf != 0xFF).sum().item()) == 0, "a refused call launched"
+    dense = compile_quantize_mxfp8(dtype_in=torch.bfloat16, h=h, d=D, axis=AXIS_ROW)
+    sf_dense = torch.zeros(sf_bytes(1, h, t, D), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="PACKED arm"):
+        run_quantize_mxfp8(dense, x, dst, sf_dense, batch=1, seq_len=t, stream=st, seq_lens=good, num_sequences=b)
+    with pytest.raises(ValueError, match="PACKED arm"):
+        run_quantize_mxfp8(dense, x, dst, sf_dense, batch=1, seq_len=t, stream=st, cu_seqlens=True)
+    with pytest.raises(ValueError, match="required for a dense"):
+        run_quantize_mxfp8(dense, x, dst, sf_dense, stream=st)
 
 
 # ---------------------------------------------------------------------------

@@ -71,6 +71,9 @@ from gated_block_reference import (  # noqa: E402
 _SM107 = (10, 7)
 E4M3 = torch.float8_e4m3fn
 _SENTINEL = 1.5e30  # a finite magnitude no correct output cell can hold; survivors localize an unwritten region
+MX_COS_FLOOR = (
+    0.99  # the ONE cosine floor of every MXFP8 fake-quant oracle cell (the kernels' unit-scale e4m3 P is not replicated); the packed suite imports it
+)
 _FUSED = dict(fuse_norm_rope=True, fuse_gate=True)
 _GEOM = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 # The unfused MXFP8 stage list, in pipeline order (FROZEN: block_perf_table / block_fusion_table code against it).
@@ -610,7 +613,7 @@ def test_mxfp8_block_matches_the_fake_quant_oracle(seq_len, causal):
     c = _cos(out, ref)
     rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
     print(f"\nmxfp8 block S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e} scale_o={spec.scale_o:.4g} proj route={blk._proj._plan.route}")
-    assert c > 0.99, f"mxfp8 block cos {c}"
+    assert c > MX_COS_FLOOR, f"mxfp8 block cos {c}"
 
 
 @requires_rubin
@@ -623,7 +626,7 @@ def test_mxfp8_sf_order_s_sweep_does_not_degrade_with_s():
         out, ref, _, _, _ = _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=s)
         cs[s] = _cos(out, ref)
     print("\nmxfp8 SF-order S-sweep (B=1 dense): " + "  ".join(f"S={s}: cos={c:.6f}" for s, c in cs.items()))
-    assert all(c > 0.99 for c in cs.values()), cs
+    assert all(c > MX_COS_FLOOR for c in cs.values()), cs
     assert max(cs.values()) - min(cs.values()) < 5e-3, f"cosine drifts with S -- an SF layout bug: {cs}"
 
 
@@ -649,7 +652,7 @@ def test_mxfp8_dead_padded_entry_is_exactly_zero(kw):
     assert (out[1] == 0).all(), f"the dead entry must be EXACTLY zero (select, not residue * sigmoid); max|out[1]| = {out[1].abs().max().item()}"
     c = _cos(out[0], ref[0])
     print(f"\nmxfp8 {'fused' if kw else 'unfused'} block dead entry S={s}: live cos={c:.6f}")
-    assert c > 0.99, f"live entry cos {c}"
+    assert c > MX_COS_FLOOR, f"live entry cos {c}"
 
 
 @requires_rubin
@@ -669,7 +672,7 @@ def test_mxfp8_ragged_padded_entries_match_the_oracle():
     assert torch.isfinite(out.float()).all()
     cs = [_cos(out[i], ref[i]) for i in range(2)]
     print(f"\nmxfp8 block ragged padding S={s} seq_lens={seq_lens.tolist()}: cos per entry={[f'{c:.6f}' for c in cs]} scale_o={spec.scale_o:.4g}")
-    assert all(c > 0.99 for c in cs), f"ragged padded entries cos {cs}"
+    assert all(c > MX_COS_FLOOR for c in cs), f"ragged padded entries cos {cs}"
 
 
 @requires_rubin
@@ -745,7 +748,7 @@ def test_mxfp8_fused_block_matches_the_fake_quant_oracle(seq_len, causal):
     c = _cos(out, ref)
     rel = ((out.float() - ref.float()).abs().max() / ref.float().abs().max().clamp_min(1e-30)).item()
     print(f"\nmxfp8 FUSED block B={b} S={seq_len} causal={causal}: cos={c:.6f} max_rel={rel:.3e}")
-    assert c > 0.99, f"fused mxfp8 block cos {c}"
+    assert c > MX_COS_FLOOR, f"fused mxfp8 block cos {c}"
     out2 = torch.full_like(out, _SENTINEL)
     ws = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
     _execute(blk, mx, out2, ws)
@@ -775,4 +778,4 @@ def test_mxfp8_dense_kv_tail_is_masked_not_computed_wrong():
     assert torch.isfinite(out.float()).all()
     c = _cos(out, ref)
     print(f"\nmxfp8 block dense KV tail S=1000: cos={c:.6f}")
-    assert c > 0.99, f"mxfp8 dense KV tail cos {c}"
+    assert c > MX_COS_FLOOR, f"mxfp8 dense KV tail cos {c}"

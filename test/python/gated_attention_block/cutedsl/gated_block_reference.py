@@ -1040,14 +1040,21 @@ def mx_fake_quant_v_columnwise(v: torch.Tensor) -> torch.Tensor:
     return deq.permute(0, 3, 1, 2).contiguous()  # [b, s, h, d]
 
 
-def _mxfp8_gated_o(inp_mx: dict, geom: RefGeometry, *, seq_lens: Optional[torch.Tensor], fused: bool) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+def _mxfp8_gated_o(
+    inp_mx: dict, geom: RefGeometry, *, seq_lens: Optional[torch.Tensor], fused: bool, h32: Optional[torch.Tensor] = None
+) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
     """Stages (1)..(5) of the MXFP8 chain in fp32 with the block's rounding points -> the gated O
-    (fp32 under ``fused``, bf16 otherwise -- the value the per-tensor O quantization sees)."""
-    b, s, dm = inp_mx["h"].shape
+    (fp32 under ``fused``, bf16 otherwise -- the value the per-tensor O quantization sees).
+
+    ``h32`` (appended): the fp32 ``[B, S, d_model]`` DEQUANTIZED ``h`` to use instead of reading ``inp_mx["h"]`` through
+    ``inp_mx["h_sf"]`` -- the packed per-sequence oracle dequantizes the whole ``T``-row blob once and hands every sequence
+    its rows (a sequence's rows of the padded F8_128x4 blob are not a blob of their own).  The shapes come from it then."""
+    src = inp_mx["h"] if h32 is None else h32
+    b, s, dm = src.shape
     t = b * s
     hq, hkv, d, r = geom.h_q, geom.h_kv, geom.d_head, geom.rope_dim
     # (1) block-dequantized codes (E8M0 exact) x block-dequantized weights, fp32 accumulate.
-    h32 = mx_dequant_rowwise_2d(inp_mx["h"].reshape(t, dm), inp_mx["h_sf"])
+    h32 = mx_dequant_rowwise_2d(inp_mx["h"].reshape(t, dm), inp_mx["h_sf"]) if h32 is None else h32.reshape(t, dm).float()
     w32 = mx_dequant_rowwise_2d(inp_mx["w_qkvg"], inp_mx["w_qkvg_sf"])
     proj = h32 @ w32.t()
     if not fused:
@@ -1110,6 +1117,7 @@ def gated_attention_block_mxfp8_reference(
     seq_lens: Optional[torch.Tensor] = None,
     fused: bool = False,
     o_fp4=None,
+    h32: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """fp32 chain with the MXFP8 block's exact quantization points -> bf16 ``[B, S, d_model]``.
 
@@ -1135,8 +1143,11 @@ def gated_attention_block_mxfp8_reference(
     :func:`quantize_block_inputs_mxfp8` with the same ``o_fp4``) -- the oracle reads exactly the
     scale bytes the block-scale GEMM reads.  Neither side carries a per-tensor scale:
     ``scale_o`` / ``descale_w_o`` must be 1.0 (``ValueError`` otherwise, so a mis-specified oracle
-    cannot silently agree with a block that pins them)."""
-    og, (b, s, dm) = _mxfp8_gated_o(inp_mx, geom, seq_lens=seq_lens, fused=fused)
+    cannot silently agree with a block that pins them).
+
+    ``h32`` (appended): the dequantized fp32 ``h`` rows to run the chain on instead of ``inp_mx["h"]`` through its blob
+    (:func:`_mxfp8_gated_o`; the per-sequence packed oracle's hand-off)."""
+    og, (b, s, dm) = _mxfp8_gated_o(inp_mx, geom, seq_lens=seq_lens, fused=fused, h32=h32)
     hq, d = geom.h_q, geom.d_head
     if o_fp4 is None:
         og32 = dequant_e4m3(quant_e4m3(og, scale_o), 1.0 / scale_o).reshape(b * s, hq * d)  # o was transposed: reshape copies
@@ -1333,6 +1344,51 @@ def compare_packed(refs: list, lens, check) -> list:
         else:
             print(f"seq {i} [{lo}:{hi}]: ok")
     return failures
+
+
+def mx_dequant_packed_h(inp_mx: dict) -> torch.Tensor:
+    """The packed ``h`` (``[T, d_model]`` / ``[1, T, d_model]`` e4m3 MXFP8 codes) dequantized ONCE through its padded F8_128x4 blob
+    ``h_sf`` over all ``T`` rows -> fp32 ``[T, d_model]``.  A sequence's rows of that blob are not a blob of their own (the atoms
+    are 128-row bands of the WHOLE token matrix), so the per-sequence MXFP8 oracles below slice this instead of re-deriving
+    scales -- they read exactly the bytes the packed block's stage (1) reads."""
+    h3 = _packed_rows(inp_mx["h"])
+    t, dm = int(h3.shape[1]), int(h3.shape[2])
+    return mx_dequant_rowwise_2d(h3.reshape(t, dm), inp_mx["h_sf"])
+
+
+def _mxfp8_packed_sequences(inp_mx: dict, lens):
+    """Yield ``(i, lo, hi, inp_i, h32_i)`` per NON-empty sequence of a packing: the sequence's own rows of ``cos`` / ``sin`` and
+    of the dequantized ``h`` (``[1, len_i, d_model]`` fp32), the codes dict otherwise unchanged (weights, blobs, ``w_o``)."""
+    h3, cos3, sin3 = _packed_rows(inp_mx["h"]), _packed_rows(inp_mx["cos"]), _packed_rows(inp_mx["sin"])
+    h32 = mx_dequant_packed_h(inp_mx)
+    dm = int(h3.shape[2])
+    for i, (lo, hi) in enumerate(sequence_slices(lens)):
+        if hi == lo:
+            continue
+        inp_i = dict(inp_mx, h=h3[:, lo:hi], cos=cos3[:, lo:hi], sin=sin3[:, lo:hi])
+        yield i, lo, hi, inp_i, h32[lo:hi].view(1, hi - lo, dm)
+
+
+def mxfp8_calibrated_scale_o_packed(inp_mx: dict, geom: RefGeometry, lens) -> float:
+    """The packed twin of :func:`mxfp8_calibrated_scale_o`: ONE static per-tensor ``scale_o`` for the UNFUSED MXFP8 block over
+    a packing, calibrated on the oracle's gated O of every sequence (each sequence attends inside its own rows).  At ``B = 1``
+    it IS the dense calibration (one sequence, the same chain over the same dequantized rows)."""
+    parts = [
+        _mxfp8_gated_o(inp_i, geom, seq_lens=None, fused=False, h32=h32_i)[0].flatten() for _i, _lo, _hi, inp_i, h32_i in _mxfp8_packed_sequences(inp_mx, lens)
+    ]
+    return amax_scale(torch.cat(parts))
+
+
+def gated_attention_block_mxfp8_reference_packed(inp_mx: dict, geom: RefGeometry, lens, *, descale_w_o: float, scale_o: float, o_fp4=None) -> list:
+    """The UNFUSED MXFP8 oracle per sequence of a packing: :func:`gated_attention_block_mxfp8_reference` (``fused=False``) on each
+    sequence's own rows -- its causal diagonal is its own -- reading the SAME codes and blobs the packed block reads: ``h`` through
+    the whole ``T``-row blob (:func:`mx_dequant_packed_h`), the weights and ``w_o`` as given (an e2m1 ``W_qkvg`` as its e4m3 SHADOW
+    codes with the unchanged blob, the fp4-weight suite's recipe; ``o_fp4`` exactly as on the dense side).  One bf16
+    ``[1, len_i, d_model]`` per sequence, ``None`` for an empty one (no rows exist; the neighbours are what a test checks there)."""
+    refs = [None] * len([int(n) for n in lens])
+    for i, _lo, _hi, inp_i, h32_i in _mxfp8_packed_sequences(inp_mx, lens):
+        refs[i] = gated_attention_block_mxfp8_reference(inp_i, geom, descale_w_o=descale_w_o, scale_o=scale_o, fused=False, o_fp4=o_fp4, h32=h32_i)
+    return refs
 
 
 # ---------------------------------------------------------------------------
