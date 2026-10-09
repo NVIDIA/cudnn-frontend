@@ -1,5 +1,7 @@
 # Python-native `cudnn.pygraph` and pluggable execution backends
 
+> Execute-time shape overrides (`override_uids` / `override_shapes` / `override_strides`) are passed directly to native backend plans. Python engines whose compiled plan has `takes_variant_pack=True` receive the normalized override geometry in their `VariantPack`; legacy map-based Python engines reject these overrides before execution. Each engine determines which geometries it supports. See [Execute-Time Shape Overrides](../operations/Attention.md#execute-time-shape-overrides).
+
 ## What this is
 
 `cudnn.pygraph` is a Python-native graph class: graph structure (nodes,
@@ -358,7 +360,8 @@ are close.
   adapter that builds and executes cached `gdn`/`gdn_bwd` graphs (the SDPA
   op pattern), so it inherits whatever engine the planner selects. The
   optional `use_qk_l2norm` attribute asks the engine to L2-normalize the q/k
-  rows; `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
+  rows (`x * rsqrt(sum(x * x) + 1e-6)`, forward and backward Jacobian);
+  `GdnFrostEngine` (the SM100-SM103 and SM107 default, serving both `gdn` and
   `gdn_bwd` on the FROST chunked kernels) serves it through a workspace
   helper kernel (normalized q/k copies + saved inverse norms, with the
   backward Jacobian projection applied in place after the head-group fold),
@@ -602,6 +605,14 @@ record to the graph; engines read that record back rather than parsing again.
   `has_bias=True` as a fact, never an error; each engine's `Capabilities` row
   does the rejecting in `mismatch()`. A shared parser that starts rejecting
   becomes an if-ladder that must know every kernel.
+- **Caller hints are facts too.** `cudnn.pygraph(..., is_cuda_graph_replay_expected=True)`
+  (keyword-only; `cudnn.graph(...)` forwards it) states that the caller will
+  capture `graph.execute` into a CUDA graph and replay it. The SDPA analyzer
+  records it as `cuda_graph_replay`, and a family's heuristics may then lead
+  with the plan that is fastest on the GPU alone, since per-execute host costs
+  are paid once at capture (the SDPA forward d256 decode tile leads with its
+  split-KV plan instead of listing it as the runner-up). The hint changes no
+  numerics and no support, and it is never forwarded to the backend.
 - **Framework-neutral vocabulary**: `cudnn.data_type`, not `torch.dtype`;
   device from `cudnn.create_device_properties()`, the backend's own descriptor.
   Facts are what every engine of a family reads, so expressing them in one
@@ -742,10 +753,12 @@ only to decline is why `closed_under` existed.
   bug: the record would replay a different kernel after the pick changes.
 - Knobs are performance-only: a plan computes the same function under any knob
   value, so an autotuner may pick freely. Anything numerics-changing
-  (`softmax_precision`) is an **op attribute** declared in the op spec's
-  `python_only_attrs`: never forwarded to C++, a SET value makes the node
-  backend-unlowerable (`serialize()` and `key()` refuse it), and it surfaces as
-  a graph fact the capability rows gate on.
+  (`softmax_precision`) or a contract on the inputs (`attn_scale_prefolded`:
+  Q already carries the softmax scale) is an **op attribute** declared in the
+  op spec's `python_only_attrs`: never forwarded to C++, a SET value (a bool
+  attribute set to `False` counts as unset) makes the node backend-unlowerable
+  (`serialize()` and `key()` refuse it), and it surfaces as a graph fact the
+  capability rows gate on.
 
 ### One kernel per layout class, not per shape (SDPA THD)
 
@@ -768,6 +781,36 @@ facts shaped this: `and` is staged, so `const_expr(CFG.PACK_GQA and
 q.shape[2] != ...)` must nest its constant test outside; a `const_expr` on a
 dynamic extent or stride is an error, which is why the padded-Stats store
 selects on the fake's RANK (rank-4) and not on `shape[0] > 1`.
+
+### Per-port token origins from the bound ragged offsets (SDPA THD backward, SM80)
+
+A ragged graph binds one ragged-offset tensor per port, and a padded THD layout
+(TE's `cu_seqlens_padded`) puts a sequence's rows somewhere other than
+`prefix(lengths)`. The SM80 backward reads those values on device (issue
+#737). Its existing setup launch, which turns the lengths into the compact
+`cu_seqlens`, also writes one **token origin per port and sequence**,
+`org_p[b] = ro_p[b] × M_p / ts_p` (`M_p` the port's `ragged_offset_multiplier`,
+`ts_p` its token stride in the CALLER's buffer, Int64 arithmetic), into an Int64
+`[rows, B]` workspace region with one row per port that binds offsets. No extra
+launch; the host only binds the current offset pointers, so the origins follow
+the bound values on every execute and CUDA-graph replay.
+
+Two kinds of row origin then coexist. The **internal** packed buffers (the fp32
+dQ accumulator, `do_dot`, the GQA dK/dV partials) stay at `prefix(lengths)`,
+so their sizing and the masks and loop bounds do not change. The **caller's**
+ports are addressed at their origins: the Q/dO and K/V loads, the Stats read,
+the direct-bound dK/dV stores, and the O·dO dot, dQ cast and dK/dV fold, which
+walk `(sequence, row)` over the envelope and touch `origin + row` for
+`row < len[b]` only. Gap rows are never read or written. A staged port (a head
+dim inside the flavor envelope) keeps its origins: the staging copy moves every
+row in place, which is why origins are computed from the caller's token stride.
+
+`tile_dsl.thd.write_thd_port_origins` / `thd_port_origin` are the shared
+helpers; each path materializes only the ports it needs. Whole-token offsets
+are a supported-input precondition of the FROST engines, not a restriction of
+the cuDNN tensor API, and are not checked on device. When the backend cannot
+lower a graph, the Python-side variant-pack order includes each port's ragged
+offset tensor, so the offsets reach the engine as bound slots.
 
 ### Accept means run
 
@@ -840,11 +883,27 @@ artifact can never be reused by accident:
   next start-up. Kernels whose in-process object converts raw pointer
   arguments, takes a dataclass argument, or has a default JSON cannot carry
   are not persisted.
+- **One object per kernel per process.** In front of the files sits an
+  in-process memo keyed by the device a build targets, the live CUDA device the
+  compile is issued under (the DSL ties a compiled object's executor to a device
+  context; the two agree unless a handle scoped the build to another GPU), the
+  key, the symbol and the compile options: a second plan over the same
+  kernel in the same process gets the object the first plan got — no trace, no
+  compile, no file touched — whatever the on-disk cache's state. A graph that
+  builds several plans over one kernel, or a test suite that builds one block
+  instance per case, otherwise pays a full JIT per plan (`cute.compile` has no
+  memo of its own; with the on-disk cache off, the gated-attention-block
+  backward suite -- 109 cases -- went from 855 s to 261 s and from 730 to 100
+  compiles on a Rubin development part). A kernel without a key is never
+  memoised; a failed compile is not memoised; `clear_memo()` forgets the
+  objects.
+  `CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0` turns the memo off — for a
+  test that exercises the reload path itself, or an A/B of the memo.
 - Location: `CUDNN_FRONTEND_COMPILED_CACHE`, else
   `$XDG_CACHE_HOME/cudnn_frontend/compiled_plans`; `set_cache_dir()` for a
   caller that owns a workspace (FlashInfer); `CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1`
-  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned
-  per process. Bump `_SCHEMA` on any incompatible change.
+  turns it off; `stats()` reports hits / misses / bypassed / invalid / pruned /
+  memo_hits per process. Bump `_SCHEMA` on any incompatible change.
 - **Dead environments are retired.** The manifest hashes the package's source,
   so every edited checkout and every CI commit mints an environment directory
   that will never be hit again — a few hundred MB per commit on a runner with a

@@ -741,8 +741,8 @@ class GroupedGemmDgluBlockScaledAPI(APIBase):
 
         # ---- Disabled configurations ----
         self._not_implemented_error_if(
-            self._deterministic and (self._is_rubin_kernel or self.dbias_desc is not None or self.weight_mode != MoEWeightMode.DENSE),
-            "deterministic dprob is implemented only for the SM100 dense kernel without dbias",
+            self._deterministic and (self._is_rubin_kernel or self.dbias_desc is not None),
+            "deterministic dprob is implemented only for the SM100 kernel without dbias",
         )
         self._not_implemented_error_if(
             self.dbias_desc is None and self._is_fp4x2(self.ab_dtype) and self.sf_vec_size == 16 and self.d_dtype == torch.float32,

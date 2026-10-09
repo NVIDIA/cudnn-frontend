@@ -1,0 +1,7 @@
+# Refreshed 2026-10-09 for the per-CTA empty-phase observer ACK protocol.
+# Default renderings, all debug levers off; each rendered twice in independent processes.
+# PTX text depends on the DSL build; tests compare only when the dsl line matches.
+dsl=nvidia-cutlass-dsl 4.8.0
+stage2_2x2 sm_107a dense_bf16 rc=0 ptx_md5=ec5cccfc716d4328846176cc9626feba
+stage2_2x2 sm_107a causal_bf16 rc=0 ptx_md5=62d348cd72a1c8b81b5bfece48888d13
+stage2_2x2 sm_107a thd_bf16 rc=0 ptx_md5=a9a60d0cb2df5b67f43d9aa91faa339b

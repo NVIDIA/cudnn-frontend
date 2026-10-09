@@ -186,6 +186,17 @@ elif CFG.DTYPE_QKV == 4:
 else:
     raise ValueError(f"prefill_sdpa_f16: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 2=BF16, 3=FP16, or 4=TF32)")
 
+# softmax_scale_prefolded (the graph attribute attn_scale_prefolded): the caller multiplied Q by
+# attn_scale * log2(e), so the raw QK^T already sits in the log2 domain.  The softmax body then takes the
+# RAW row max (no `* scale_log2`) and shifts with `reg_S - m` (one FADD2 per pair where the scaled path
+# issues an FFMA2); `scale_log2` stays a runtime argument of every signature (the adapter pins it to
+# exactly 1.0) and is simply dead under the fold.  Numerically neutral: the running max, the published
+# Stats, the LSE, the sink fold and the split partials all consume the same log2-domain values either way,
+# and the f32 exponent chain is unchanged (softmax_f16 is a quantized-kernel specialization; the config
+# declines it on half inputs).  Instruction-neutral on its own -- it keeps the knob matrix uniform across
+# the cc 10.7 forward flavors.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     sdpa_operand_tensors,
@@ -1106,6 +1117,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -1447,7 +1459,15 @@ def _softmax_kv_body(
     # Pass size=CFG.TILE_N explicitly — Vector.shape[0] is an MLIR value
     # (not Python int) for vec_concat-built vectors, so auto-detect can't recover the length.
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-    current_max = current_max_unscaled * scale_log2
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Raw-domain max (Q carries the scale).  A fully-masked tile leaves it exactly at the finite mask
+        # sentinel (== NEG_INF), so is_first re-fires on consecutive keyless tiles (alpha = 0) where the
+        # scaled path runs alpha = 1 between them; both publish P = exp2(0) = 1 there, the first live tile
+        # wipes the accumulator with alpha = 0, and a row with no live key at all is overridden by the
+        # correction's geometry select (_kv_empty) -- same O / Stats either way.
+        current_max = current_max_unscaled
+    else:
+        current_max = current_max_unscaled * scale_log2
 
     # Named-barrier wg0/wg1 sync: sub_tile_id==1 waits at TOP for sub_tile_id==0's bottom arrive.
     if sub_tile_id == 1:
@@ -1480,7 +1500,11 @@ def _softmax_kv_body(
     bars.mb_stat_full[sub_tile_id].arrive()
 
     # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
-    reg_S = reg_S * scale_log2 - new_total_max
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Pre-folded scale: the shift alone (FADD2 pairs) -- the scores are already log2-domain.
+        reg_S = reg_S - new_total_max
+    else:
+        reg_S = reg_S * scale_log2 - new_total_max
 
     # Chunk 0 manual unroll — the DSL's @cute.jit tracer makes the loop iter an
     # MLIR value, breaking Python slice.indices() math inside RegTile[].

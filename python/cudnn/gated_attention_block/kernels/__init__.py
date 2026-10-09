@@ -16,11 +16,20 @@ stage of the pipeline in ``api.py``::
                                 q8 / k8 / v8 + bf16 gate16 out -- also a fork
     qk_norm_rope.py             stages (2)+(3), per-lane LDG pipeline
     qk_norm_rope_tma.py         stages (2)+(3), TMA-staged A/B of the above
-    quantize.py                 (3q) / (5q): per-tensor e4m3 quantize pass (unfused FP8)
+    quantize.py                 (3q) / (5q): per-tensor e4m3 quantize pass (unfused FP8); the quantized BACKWARD's
+                                amax / amax-partials passes, gradient casts and scalar-block init
     elementwise.py              stage (5) sigmoid gate, and (3b) V compaction
     sigmoid_gate_bwd.py         BACKWARD of stage (5): dO, dG into the GATE band, optional O_gated
     qk_norm_rope_bwd.py         BACKWARD of stages (2)+(3): exact RoPE adjoint + RMSNorm backward into
                                 the Q / K bands, dW_norm partials + fixed-order reduce, the V band copy
+    fp8_bwd_fused.py            the quantized BACKWARD's two fused small-kernel launches -- PROLOGUE (scalar init,
+                                dY amax partials, the Q / K rebuild with its e4m3 epilogue, v8) and EPILOGUE (dW_norm
+                                reduce, dqkvg quantize): block-range dispatch over the standalone kernels' bodies
+    quantize_mxfp8.py           (3q, MXFP8): the block quantize pass -- rowwise / columnwise, the SDPA and the GEMM-canonical
+                                SF layouts, and the DUAL-AXIS arm (both quantizations from one read)
+    mxfp8_bwd_fused.py          the MXFP8 BACKWARD's two fused launches -- PROLOGUE (scalar init, dY amax partials, the Q / K
+                                rebuild with its MX epilogue: q8 / q_T8 / k8 / k_T8 from a 32-token tile, v8) and EPILOGUE
+                                (dW_norm reduce, the dual-axis canonical dqkvg cast): block-range dispatch over the bodies
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the

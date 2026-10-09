@@ -1955,19 +1955,22 @@ def _run_mxfp8(
         # Eager AND captured execution over both a non-finite and a finite previous content of the outputs: a store skipped for
         # a fully masked kv tile, or a per-execute host state, would show as a bit difference against run 0.
         replay = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
-            g.execute(pack, ws)
-        for i in range(repeat_outputs):
-            for x in outs_t.values():
-                x.fill_(float("nan") if i % 4 < 2 else 123.0)
-            if i % 2:
-                replay.replay()
-            else:
+        try:
+            with torch.cuda.graph(replay, stream=torch.cuda.current_stream()):
                 g.execute(pack, ws)
-            torch.cuda.synchronize()
-            for name, x in outs_t.items():
-                same = torch.equal(x.view(torch.int16), outs[0][name].view(torch.int16))
-                assert same, f"{name}: {'replay' if i % 2 else 'eager'} run {i} over {'NaN' if i % 4 < 2 else '123.0'}-poisoned outputs differs from run 0"
+            for i in range(repeat_outputs):
+                for x in outs_t.values():
+                    x.fill_(float("nan") if i % 4 < 2 else 123.0)
+                if i % 2:
+                    replay.replay()
+                else:
+                    g.execute(pack, ws)
+                torch.cuda.synchronize()
+                for name, x in outs_t.items():
+                    same = torch.equal(x.view(torch.int16), outs[0][name].view(torch.int16))
+                    assert same, f"{name}: {'replay' if i % 2 else 'eager'} run {i} over {'NaN' if i % 4 < 2 else '123.0'}-poisoned outputs differs from run 0"
+        finally:
+            replay.reset()
     run = _MxRun()
     run.graph, run.pack, run.workspace, run.outs, run.lse, run.scale = g, pack, ws, outs, lse, scale
     run.shape = (b, hq, hkv, sq, skv)
@@ -2415,8 +2418,9 @@ def test_p_b_ds_payloads_and_atoms_dequantize_to_the_oracles_quantized_ds(monkey
 def test_p_b_runs_no_dequant_pass_and_p_c_runs_two(monkeypatch):
     """The launch census of one execute (torch.profiler / CUPTI): the bf16-dS chain runs the two SF-aware dequant kernels (q_T, k_T)
     ahead of its bf16 GEMMs; the block-scaled chain runs NONE -- its GEMMs read the e4m3 payloads and scale factors directly.  Stage-3
-    launches: dK once per chunk on both; dQ once per GQA group member on the block-scale arm (its B scale-factor descriptor is
-    indexed per A / C head) and, under ``DQ_SINGLE_LAUNCH``, once per chunk on the bf16 twin's plain rendering."""
+    launches: dK once per chunk on both; dQ once per chunk on BOTH under ``DQ_SINGLE_LAUNCH`` (the block-scale arm's dQ record takes
+    ``b_head_group = group`` like the plain rendering: B and its scale-factor descriptor are indexed by ``h // group``), once per GQA
+    group member on the per-member twin."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, config_sm107 as cfg
 
     counts = {}
@@ -2439,9 +2443,143 @@ def test_p_b_runs_no_dequant_pass_and_p_c_runs_two(monkeypatch):
     group = 4 // 2  # the cell's H_q / H_kv
     assert counts[cfg.DS_SF_P_C]["dequant"] == 2, counts
     assert counts[cfg.DS_SF_P_B]["dequant"] == 0 and cfg.DS_SF_POLICY_DEFAULT == cfg.DS_SF_P_B, "the shipped default launches no dequant pass"
-    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + group, counts  # dK + one dQ launch per GQA group member (the block-scale arm)
+    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts  # dK + ONE dQ launch per chunk (the block-scale arm too)
     assert counts[cfg.DS_SF_P_C]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts  # the plain rendering's single dQ launch
     assert counts[cfg.DS_SF_P_B]["main"] == counts[cfg.DS_SF_P_C]["main"] >= 1, counts
+
+
+# The block-scale single-launch dQ pin's cells: the GQA geometries of the row suites (8/2) and of the 397B block (32/2), S a tile
+# multiple (512), q- AND kv-padded (992 = 31 x 32, S % 128 = 96: the row's SF re-stagings and both pad terms) and 8K (several
+# M tiles per head, the causal trim thinning the k walk); dense and causal -- the full 2 x 3 x 2 matrix, twelve cells.  EVERY
+# cell runs the e4m3-dS oracle on both arms, the two 32-head 8K cells included: ``compute_ref_backward`` walks the scores in
+# 128-wide kv blocks, so its live set at 32 heads x 8K is a few hundred MiB per block over the [B, H, S, D] fp32 operands and
+# accumulators (the test's own torch forward holds the full [1, 32, 8K, 8K] fp32 score matrix, ~8 GiB -- well inside a 200+ GiB
+# part); the first version of this table ran those two cells finite + bitwise only on an unmeasured memory estimate.
+_BS_DQ_TWIN_CELLS = {
+    "gqa8-2_s512_dense": dict(hq=8, hkv=2, s=512),
+    "gqa8-2_s512_causal": dict(hq=8, hkv=2, s=512, causal=True),
+    "gqa32-2_s512_dense": dict(hq=32, hkv=2, s=512),
+    "gqa32-2_s512_causal": dict(hq=32, hkv=2, s=512, causal=True),
+    "gqa8-2_s992_dense": dict(hq=8, hkv=2, s=992),
+    "gqa8-2_s992_causal": dict(hq=8, hkv=2, s=992, causal=True),
+    "gqa32-2_s992_dense": dict(hq=32, hkv=2, s=992),
+    "gqa32-2_s992_causal": dict(hq=32, hkv=2, s=992, causal=True),
+    "gqa8-2_s8192_dense": dict(hq=8, hkv=2, s=8192),
+    "gqa8-2_s8192_causal": dict(hq=8, hkv=2, s=8192, causal=True),
+    "gqa32-2_s8192_dense": dict(hq=32, hkv=2, s=8192),
+    "gqa32-2_s8192_causal": dict(hq=32, hkv=2, s=8192, causal=True),
+}
+
+
+def _bs_dq_arm(monkeypatch, single, *, hq, hkv, s, causal=False, check=True):
+    """One arm of the block-scale single-launch pin on THIS row (P-b): ``api_dsl_sm107.DQ_SINGLE_LAUNCH = single`` (read when the
+    adapter's ``_stage3_records`` runs at compile), the row built + pinned + executed through ``_run_mxfp8`` into NaN-poisoned outputs
+    (the oracle on the arm unless ``check=False``), and what the plan did: the adapter (captured off the row's inherited ``compile``),
+    its dQ record's ``b_head_group`` and head chunking, the host trace's ``_dq_launches`` calls (the compiled-plan cache is switched
+    off for the arm so the host traces in-process -- a cache HIT would skip the trace the spy watches; the chunk loop is one
+    ``scf.for`` body, so the spy sees the arithmetic once per trace, not once per launch -- the compiled-plan cache AND its in-process
+    memo are switched off for the arm, so every build traces), and the RUNTIME kernel launches of one
+    execute from a CUDA-graph capture (the d512 suite's ``_captured_kernel_launches``: every launch a node, nothing runs)."""
+    from test_sdpa_bwd_d512_sm107 import _captured_kernel_launches
+
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+
+    monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", single)
+    monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    # the host-trace spy below needs a TRACE: the in-process memo in front of the compiled-plan cache hands a plan whose
+    # (device, key, symbol, options) this process already built the first build's object WITHOUT re-tracing the host body, and
+    # `_dq_launches` is called inside that trace -- the arm's cell is the suite's default shape, so an earlier test's plan would
+    # serve it and the spy would see nothing (0 calls, not the 1 per trace this pin asserts)
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
+    apis, dq_calls = [], []
+    original_compile = sm107.SdpaBwdDslSm107.compile
+
+    def compile_spy(adapter):
+        apis.append(adapter)
+        return original_compile(adapter)
+
+    original_dq = prepared_host._dq_launches
+
+    def dq_spy(group, bhg):
+        n = original_dq(group, bhg)
+        dq_calls.append((group, bhg, n))
+        return n
+
+    monkeypatch.setattr(sm107.SdpaBwdDslSm107, "compile", compile_spy)
+    monkeypatch.setattr(prepared_host, "_dq_launches", dq_spy)
+    run = _run_mxfp8(hq=hq, hkv=hkv, sq=s, skv=s, causal=causal, poison=float("nan"), check=check)
+    assert len(apis) == 1 and type(apis[0]).__name__ == "SdpaBwdDslSm107Mxfp8", [type(a).__name__ for a in apis]
+    api = apis[0]
+    assert api._ds_block_scaled, "the pin is the block-scale arm's (P-b)"
+    for x in run.outs[0].values():
+        assert torch.isfinite(x.float()).all(), "a non-finite gradient on the arm"
+    outs = {n: x.clone() for n, x in run.outs[0].items()}
+    kernels, nodes, names = _captured_kernel_launches(lambda: run.graph.execute(run.pack, run.workspace))
+    torch.cuda.synchronize()
+    facts = dict(
+        dq_bhg=int(api._dq_b_head_group),
+        chunk=int(api._qh_chunk),
+        chunks=-(-run.shape[0] // int(api._b_chunk)) * (hq // int(api._qh_chunk)),
+        dq_calls=list(dq_calls),  # a snapshot: the next arm's spy wraps this one and would append to the same list
+        kernel_launches=kernels,
+        graph_nodes=nodes,
+        gemm_launches_by_name=sum(1 for n in names if n and "bprop_matmul" in n) if names and all(names) else None,
+        kernel_names=names,
+    )
+    return outs, facts
+
+
+@requires_rubin
+@pytest.mark.parametrize("cell", list(_BS_DQ_TWIN_CELLS), ids=list(_BS_DQ_TWIN_CELLS))
+def test_stage3_block_scale_dq_single_launch_is_bitwise_the_per_member_launches(monkeypatch, cell):
+    """Under GQA the block-scale arm's dQ GEMM is ONE launch per head chunk, like the plain renderings': its dQ record takes
+    ``MatmulTemplateParams.b_head_group = group``, the template indexes B = k_T AND its scale-factor descriptor by ``h // group``
+    (``_b_head``), and the host binds the whole dS / atom / dQ chunk against the kv-head windows of ``k_T`` and of its scale-factor
+    planes view -- where the arm used to run one launch per group MEMBER over every ``group``-th Q head (sixteen under-one-wave
+    launches at the 397B geometry).  Both forms pair every Q head with the same K head and the same K scales and walk the same k
+    tiles per output tile into an fp32 accumulator, so dQ must be the SAME BITS -- and dK / dV, which the change never touches.
+    ``DQ_SINGLE_LAUNCH = False`` is the twin (``b_head_group = 1``, the per-member loop); both arms are held to the e4m3-dS fp64
+    oracle with NaN-poisoned outputs (``_run_mxfp8``) on every one of the twelve cells (``_BS_DQ_TWIN_CELLS``).
+    The LAUNCH COUNT is pinned from a CUDA-graph capture of one execute -- ``group - 1`` fewer kernels per head chunk on the
+    shipped arm, and by kernel name ``2 * chunks`` stage-3 GEMM launches (dK + dQ per chunk; the main kernel is not one) against
+    ``(1 + group) * chunks`` -- and from the host trace's ``_dq_launches`` call (1 vs ``group`` launches per chunk)."""
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+
+    assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
+    kw = dict(_BS_DQ_TWIN_CELLS[cell])
+    group = kw["hq"] // kw["hkv"]
+    _p_b(monkeypatch)
+    single, f_single = _bs_dq_arm(monkeypatch, True, **kw)
+    members, f_members = _bs_dq_arm(monkeypatch, False, **kw)
+    n_chunks = f_single["chunks"]
+    assert f_single["chunk"] % group == 0 and f_members["chunks"] == n_chunks, (f_single, f_members)
+    # the records' b_head_group, copied off the dQ record at compile: the group on the shipped arm, 1 on the twin
+    assert (f_single["dq_bhg"], f_members["dq_bhg"]) == (group, 1), (f_single, f_members)
+    # the host trace: `_dq_launches(group, b_head_group)` exactly once per trace -> 1 dQ launch per chunk on the shipped arm, `group` on the twin
+    assert f_single["dq_calls"] == [(group, group, 1)], f_single
+    assert f_members["dq_calls"] == [(group, 1, group)], f_members
+    # the runtime launches of one execute: every node a kernel; the per-member arm launches (group - 1) more dQ GEMMs per chunk
+    assert f_single["kernel_launches"] == f_single["graph_nodes"] and f_members["kernel_launches"] == f_members["graph_nodes"], (f_single, f_members)
+    assert f_members["kernel_launches"] - f_single["kernel_launches"] == (group - 1) * n_chunks, (
+        f"single-launch arm {f_single['kernel_launches']} kernels vs per-member {f_members['kernel_launches']}: expected {group - 1} x {n_chunks} chunks "
+        f"fewer; facts {f_single} / {f_members}"
+    )
+    if f_single["gemm_launches_by_name"] is not None:
+        assert (f_single["gemm_launches_by_name"], f_members["gemm_launches_by_name"]) == (2 * n_chunks, (1 + group) * n_chunks), (f_single, f_members)
+    print(
+        f"\n{_ENGINE} block-scale dQ launches {cell} chunks={n_chunks}: single {f_single['kernel_launches']} kernels, per-member "
+        f"{f_members['kernel_launches']}; stage-3 GEMMs by name {f_single['gemm_launches_by_name']} / {f_members['gemm_launches_by_name']}"
+    )
+    # the bits: dQ, and dK / dV which the change never touches
+    for name in ("dQ", "dK", "dV"):
+        x, y = single[name], members[name]
+        xi, yi = x.contiguous().view(torch.int16), y.contiguous().view(torch.int16)
+        n_diff = (xi != yi).sum().item()
+        assert n_diff == 0, (
+            f"{name}: the single dQ launch vs the per-member launches differ in {n_diff} of {xi.numel()} int16 words "
+            f"(max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+        )
 
 
 @requires_rubin
@@ -2473,7 +2611,8 @@ def test_unserved_amax_graph_declines_typed_end_to_end():
 #
 # The MXFP8 row's twins of the half suite's ``_run_adapter`` cells over ``_Quant`` operands: ``SdpaBwdDslSm107Mxfp8(seq_kv_lens_present=True)``
 # against ``mxfp8_ref.compute_ref_backward`` composing the SAME per-batch lengths INSIDE itself (``padding=``: slicing a quantized operand
-# per batch entry would re-block its columnwise 1x32 scale factors), the appended ``external_delta`` plan fact (DENSE only; the delta is
+# per batch entry would re-block its columnwise 1x32 scale factors), the appended ``external_delta`` plan fact (the dense plans here,
+# the THD twins in test_sdpa_bwd_thd_mxfp8_sm107.py; the delta is
 # the dot of the bf16 ``o_f16`` / ``dO_f16`` ports, so a caller's tensor is BITWISE the row's own pre-pass when it holds the same fp32
 # values), and bottom-right at a ragged S_q through the graph (served now).  The K / V rows past a batch entry's kv length hold FINITE
 # data in every cell (the finite-data contract of the per-batch arm); a NaN pad in the delta is the contract's, not the kernel's, to
@@ -2875,3 +3014,186 @@ def test_causal_bottom_right_ragged_s_q_is_served(ds_policy, sq, skv):
     """Bottom-right causal at a RAGGED S_q through the GRAPH -- the shape the row used to decline: the body's diagonal reads
     ``seqlen_q_real`` (the one-line change next to its q-pad band)."""
     _run_mxfp8(sq=sq, skv=skv, causal=True, bottom_right=True)
+
+
+# =========================================================================== the GQA dK fold: fp32 partials, rounded ONCE (the fp8 row's precedent)
+# Under GQA the block-scaled chain's dK GEMM stores its EPI_NONE accumulator -- already the true-unit value, the MMA dequantized -- in
+# fp32, so the fold's fixed-order fp32 sum of the group's per-Q-head partials is rounded to bf16 exactly ONCE, like the reference
+# (a bf16 partial was rounded a second time by the fold: relative RMS 2.7e-3 vs the reference under GQA on the per-tensor fp8 row
+# before it moved to fp32 partials, 0 under MHA).  dV's partials stay bf16: the main kernel stores them from its epilogue and the
+# fp32 staging does not fit its 327 KiB SMEM.  Three pins: the adapter's record + carve (host), the host's DERIVED view dtype and
+# the unchanged compile entries (host, source), the kernel's own partials folded on the host bitwise the row's dK (Rubin).
+_DKV_REDUCE_PROBE = textwrap.dedent(r"""
+import glob, os, re, subprocess, sys
+dump, group, cands = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump
+os.environ["CUTE_DSL_KEEP"] = "cubin"
+os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+import cutlass, cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host
+B, S, Hk, D = 1, 1024, 2, 256
+dk_ws = make_fake_compact_tensor(cutlass.Float32, (B, S, Hk * group, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+dv_ws = make_fake_compact_tensor(cutlass.BFloat16, (B, S, Hk * group, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+dk = make_fake_compact_tensor(cutlass.BFloat16, (B, S, Hk, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+dv = make_fake_compact_tensor(cutlass.BFloat16, (B, S, Hk, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+cute.compile(dkv_reduce_host, dk_ws, dv_ws, dk, dv, D, D, group, cutlass.BFloat16, False, make_fake_stream(use_tvm_ffi_env_stream=False),
+             options="--enable-tvm-ffi --gpu-arch sm_107a")
+print("COMPILED")
+cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+if not cubins:
+    print("SKIP no cubin dumped"); sys.exit(0)
+nvd = None
+for c in cands:
+    try:
+        proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("REJECT", c, "->", repr(exc)); continue
+    if proc.returncode == 0 and proc.stdout.strip():
+        nvd = c; break
+if nvd is None:
+    print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+def cnt(pat):
+    rx = re.compile(pat)
+    return sum(1 for ln in sass if rx.search(ln))
+# single backslashes: this program is the body of a raw triple-quoted literal, so a doubled one reaches the probe's re as a
+# LITERAL backslash and every count reads 0 (the first run's STG 0 -- a kernel with no global store -- was that)
+for key, pat in (("LDG128", r"LDG\.E\.128"), ("LDG64", r"LDG\.E\.64"), ("LDG32", r"LDG\.E\b(?!\.)"), ("STL", r"\bSTL\b"), ("LDL", r"\bLDL\b"), ("STG", r"\bSTG\.E")):
+    print("SASS", key, cnt(pat))
+""")
+
+
+def test_mxfp8_gqa_dk_partials_are_fp32_on_the_block_scale_chain_and_dv_bf16(monkeypatch, ds_policy):
+    """Under GQA the MXFP8 row's per-Q-head dK partials are fp32 on the block-scaled chain (``_dk_part_fp32``): the dK record is
+    the block-scale arm's EPI_NONE rendering with an fp32 D (``matmul_out_dtype == DTYPE_FP32``) and the carve's ``dk_part`` is
+    fp32, while ``dv_part`` stays bf16 (the kernel's epilogue dtype) and the dQ record keeps the caller's bf16; at MHA there is no
+    dK partial (the GEMM writes the caller's bf16 dK) and nothing changes; the bf16-dS twin keeps bf16 partials (its bf16 renderings
+    store the io dtype).  The host-side guard of the same fact: BOTH ``R_MX_DK_PART`` view sites of ``prepared_host`` (the dense and
+    the THD arm) DERIVE the view dtype from the policy and the group the host already holds -- never a second flag whose disagreement
+    with the carve would read half an fp32 region as bf16 (a wrong dK, no crash) -- and neither ``compile_host_mxfp8`` entry grew a
+    parameter for it."""
+    import inspect
+
+    from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_FP32
+    from cudnn.sdpa.bwd import config_sm107 as cfg
+    from cudnn.sdpa.bwd.config_sm100 import EPI_NONE, matmul_out_dtype, validate_matmul_params
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host as ph
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    block_scaled = ds_policy == cfg.DS_SF_P_B
+    gqa = _mxfp8_adapter(b=1, hq=4, hkv=2, sq=512, skv=512)
+    mha = _mxfp8_adapter(b=1, hq=2, hkv=2, sq=512, skv=512)
+    gqa.check_support()
+    mha.check_support()
+    assert gqa._ds_block_scaled is block_scaled and gqa._dk_part_fp32 is block_scaled and mha._dk_part_fp32 is False
+    plan_gqa = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in gqa._scratch_shapes()}
+    plan_mha = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in mha._scratch_shapes()}
+    part = torch.float32 if block_scaled else torch.bfloat16
+    assert plan_gqa["dk_part"] == ((1, 512, 4, _D), part) and plan_gqa["dv_part"] == ((1, 512, 4, _D), torch.bfloat16)
+    assert "dk_part" not in plan_mha and "dv_part" not in plan_mha, "MHA without kv padding: the GEMM and the kernel write the caller's dK / dV"
+    assert gqa.scratch_workspace_bytes() == sum(ws_align(math.prod(s) * dt.itemsize) for s, dt in plan_gqa.values()), "the carve pays for the fp32 partial"
+
+    class _Mod:
+        pass
+
+    def records(api):
+        mod = _Mod()
+        mod.CFG = cfg.make_cfg_d256_bwd(api._template_params(), cfg.FAMILY_MXFP8)
+        return api._stage3_records(mod, (256, 256))
+
+    dk, dq = records(gqa)
+    dk_m, dq_m = records(mha)
+    for rec in (dk, dq, dk_m, dq_m):
+        validate_matmul_params(rec)
+        assert rec.block_scale is block_scaled and rec.epi_mode == EPI_NONE
+    assert matmul_out_dtype(dk) == (DTYPE_FP32 if block_scaled else DTYPE_BF16), "the GQA dK record stores the fp32 partial on the block-scaled chain"
+    assert dq.dtype_out == -1 and matmul_out_dtype(dq) == DTYPE_BF16, "the dQ record is the caller's bf16 dQ, per head"
+    assert dk_m.dtype_out == -1 and matmul_out_dtype(dk_m) == DTYPE_BF16, "MHA: the caller's bf16 dK, the same rendering as before"
+    # the host: the dtype of the R_MX_DK_PART view is DERIVED from (policy, group) on both arms, and no compile entry grew a flag
+    code = _code_only(open(ph.__file__, encoding="utf-8").read())
+    for name in ("host_mxfp8", "host_mxfp8_thd"):
+        body = _def_body(code, name)
+        assert (
+            "dk_part_dtype = cutlass.Float32 if (p_b and group > 1) else half" in body
+        ), f"{name}: the dK partial's view dtype must be derived from the policy and the group"
+        assert (
+            "regions[R_MX_DK_PART], dk_part_dtype)" in body and "regions[R_MX_DK_PART], half)" not in body
+        ), f"{name}: the R_MX_DK_PART view takes the derived dtype"
+        assert "regions[R_MX_DV_PART], half)" in body, f"{name}: the dV partial stays bf16"
+    assert list(inspect.signature(ph.compile_host_mxfp8).parameters) == [
+        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "seq_kv_present", "external_delta",
+    ]  # fmt: skip
+    assert list(inspect.signature(ph.compile_host_mxfp8_thd).parameters) == [
+        "main", "mm_dk", "mm_dq", "config", "geometry", "regions", "sm", "cache_key", "stage_sf_pads", "ds_sf_policy", "external_delta",
+    ]  # fmt: skip
+
+
+def test_dkv_reduce_traces_an_fp32_dk_partial_beside_a_bf16_dv_partial(tmp_path):
+    """The shared fold kernel reads each partial through ITS OWN pointer dtype (``_reduce_group_vec``: ``part[e].to(Float32)`` is the
+    identity on fp32; ``io_dtype`` types the output only), so the MXFP8 row's fp32 ``dk_part`` beside its bf16 ``dv_part`` needs no
+    kernel change: an sm_107a trace-compile of ``dkv_reduce_host`` over exactly that pair (group 4, bf16 out) must succeed.  The
+    fp32 partial's 8-element vector is read through the fold's existing load path (functional; the fold's load geometry is a later
+    tune, the fp8 row's fold pass being the precedent) -- the SASS load counts are printed, not pinned: this build reads 32 scalar
+    ``LDG.E`` and no ``LDG.E.128`` in the cubin (the fold's known scalarized-load item), ``STG.E`` 2; the spill pin (``STL`` /
+    ``LDL`` both 0) IS asserted, and it read 0 / 0 once its regexes were made real."""
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
+    dump = tmp_path / "dkv_reduce_sm107a"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", _DKV_REDUCE_PROBE, str(dump), "4", *nvdisasm_candidates()], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"sm_107a trace-compile of dkv_reduce_host (fp32 dk_ws, bf16 dv_ws) failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = proc.stdout.splitlines()
+    assert "COMPILED" in out, out
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ")}
+    print(f"\ndkv_reduce (fp32 dK partials + bf16 dV partials, group 4) sm_107a SASS: {stats or [ln for ln in out if ln.startswith(('SKIP', 'REJECT'))]}")
+    if stats:
+        assert stats["STL"] == 0 and stats["LDL"] == 0, f"the fold spills with an fp32 partial beside a bf16 one ({stats})"
+
+
+@requires_rubin
+def test_mxfp8_gqa_dk_is_the_once_rounded_fold_of_its_fp32_partials(ds_policy):
+    """STRUCTURAL, no tolerance: under GQA the row's dK ``torch.equal``s the host fold of the kernel's OWN ``dk_part`` region -- read
+    back through the plan's carve in the dtype the plan carved it (fp32 on the block-scaled chain, bf16 on the twin) -- summed in
+    ``_reduce_group_vec``'s order (the group's q heads ascending, fp32 accumulation from zero) and rounded to bf16 ONCE.  Under
+    the block-scaled chain that is the once-rounded fold the reference computes; the twin folds bf16 partials the same way.  The
+    cell runs the row's UNCHANGED recipe against the oracle first (``_run_mxfp8_adapter``, GQA 8/2 causal), then prints the
+    relative RMS of the row's dK to the once-rounded reference next to what the group-rounded fold of bf16-rounded partials (the
+    form the row shipped before) reads -- the fp8 row's precedent moved 2.6e-3 -> 0 under bf16 gradients."""
+    run = _run_mxfp8_adapter(b=1, hq=8, hkv=2, sq=512, skv=512, kv_lens=None, causal=True)
+    api = run.api
+    b, hq, hkv, sq, skv = 1, 8, 2, 512, 512
+    group = hq // hkv
+    plan = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in api._scratch_shapes()}
+    shape, dtype = plan["dk_part"]
+    assert shape == (b, skv, hq, _D) and dtype == (torch.float32 if api._ds_block_scaled else torch.bfloat16) and api._dk_part_fp32 is api._ds_block_scaled
+    off, _shape = _workspace_region(api, "dk_part")
+    part = run.ws[off : off + math.prod(shape) * dtype.itemsize].view(dtype).view(*shape).clone()  # [B, S_kv, H_q, D], the kernel's own partials
+    assert torch.isfinite(part.float()).all(), "the dK partial region holds non-finite values"
+    # the fold as _reduce_group_vec spells it: acc = 0; for g in 0..group-1: acc += part[q head kv*group + g] (fp32); round once
+    acc = torch.zeros(b, skv, hkv, _D, dtype=torch.float32, device=part.device)
+    for g in range(group):
+        acc = acc + part[:, :, g::group].float()
+    fold = acc.to(torch.bfloat16)
+    dk = run.outs[0]["dK"]  # [B, S_kv, H_kv, D] bf16
+    n_diff = (fold.view(torch.int16) != dk.view(torch.int16)).sum().item()
+    assert n_diff == 0, f"dK is not the once-rounded fixed-order fold of the kernel's own dK partials: {n_diff} of {dk.numel()} elements differ"
+    # informational: the distance to the once-rounded reference, the kernel's dK vs the previous (group-rounded) form
+    ref = run.refs["dK"].permute(0, 2, 1, 3).float()  # [B, S_kv, H_kv, D]
+    prev = torch.zeros_like(acc)
+    for g in range(group):
+        prev = prev + part[:, :, g::group].to(torch.bfloat16).float()  # a bf16 partial per member, as the row shipped before
+    prev = prev.to(torch.bfloat16)
+
+    def rel_rms(x):
+        return ((x.float() - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
+
+    def frac_off(x):
+        return ((x.float() - ref).abs() > 2.0**-8 * ref.abs().clamp_min(2.0**-126)).float().mean().item()
+
+    print(
+        f"\n{_POLICY_IDS.get(run.policy, run.policy)} GQA 8/2 dK vs the once-rounded reference: relative RMS {rel_rms(dk):.3e} "
+        f"(group-rounded bf16 partials would read {rel_rms(prev):.3e}); elements more than one bf16 ulp off: {100 * frac_off(dk):.3f} % "
+        f"(group-rounded form {100 * frac_off(prev):.3f} %); partial dtype {dtype}"
+    )

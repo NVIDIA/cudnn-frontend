@@ -12,6 +12,7 @@ from .api import (
     SavedForBackward,
     build_fused_qkvg_weight,
     gated_attention_block_forward,
+    qkvg_from_hf,
     saved_slab_views,
 )
 from .api_bwd import (
@@ -34,5 +35,6 @@ __all__ = [
     "build_fused_qkvg_weight",
     "gated_attention_block_backward",
     "gated_attention_block_forward",
+    "qkvg_from_hf",
     "saved_slab_views",
 ]

@@ -832,7 +832,6 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             sf_vec_size=sf_vec_size,
             vector_f32=vector_f32,
             m_aligned=m_aligned,
-            discrete_col_sfd=discrete_col_sfd,
             current_stream=current_stream,
             epilogue_op=epilogue_op,
             dprob_tensor_buf=dprob_tensor_buf,
@@ -852,6 +851,7 @@ def grouped_gemm_dswiglu_wrapper_sm100(
             d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
         )
     import torch
 

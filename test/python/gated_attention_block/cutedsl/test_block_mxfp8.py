@@ -254,9 +254,17 @@ def test_mxfp8_needs_all_three_halves():
         _decl_block(quant=object())
 
 
-def test_mxfp8_declines_training_and_mixed_fusions():
-    with pytest.raises(NotImplementedError, match="inference-only"):
-        _decl_block(save_for_backward=True, inplace_qkv=False)
+def test_mxfp8_unfused_trains_and_mixed_fusions_decline():
+    """INVERTED (the training half, 2026-10-01) from ``test_mxfp8_declines_training_and_mixed_fusions``: the UNFUSED MXFP8
+    pipeline accepts ``save_for_backward`` with the frozen 9-stage list and compact bf16 Q/K reserved for the out-of-place
+    norm (the record's PRE-norm bands; ``test_block_training_forward.py`` pins routing and record).  The fused twin's knobs
+    keep their own typed training guards, and a single fusion knob stays the both-or-neither decline naming both knobs."""
+    blk = _decl_block(save_for_backward=True, inplace_qkv=False)
+    assert blk.save_for_backward and blk.mxfp8 and not blk.mxfp8_fused and [s.name for s in blk._stages] == _MX_STAGES
+    lay = blk._layout()
+    assert lay.q >= 0 and lay.k >= 0 and lay.v == -1 and lay.proj == -1 and lay.o == -1 and lay.o_gated >= 0 and lay.sf_q >= 0
+    with pytest.raises(ValueError, match="incompatible with save_for_backward"):
+        _decl_block(save_for_backward=True, **_FUSED)
     for kw in (dict(fuse_gate=True), dict(fuse_norm_rope=True)):
         with pytest.raises(NotImplementedError, match="fuse_norm_rope") as ei:
             _decl_block(**kw)
@@ -593,7 +601,7 @@ def test_sf_swizzle_round_trips_and_pads_to_whole_atoms():
 @pytest.mark.parametrize("seq_len, causal", [(256, True), (1000, True), (256, False), (1024, False)])
 def test_mxfp8_block_matches_the_fake_quant_oracle(seq_len, causal):
     """Causal covers a KV tail (S=1000: the quantize stages write the pad rows' SF as 0x00 exactly like the
-    torch oracle pads); dense needs S % 128 == 0 (see the decline test).  B=2 so V's D-plane-major SF stride
+    torch oracle pads); a dense KV tail is masked in-kernel (see the dense-tail test).  B=2 so V's D-plane-major SF stride
     (B*KH*n_tiles*512) is exercised past the (b=0, h=0) coincidence."""
     out, ref, blk, _, spec = _run_mx_block({**_GEOM, "is_causal": causal}, batch=2, seq_len=seq_len, sentinel=True)
     assert [s.name for s in blk._stages] == _MX_STAGES
@@ -758,8 +766,13 @@ def test_mxfp8_fused_declines_ragged_s_at_b_gt_1():
 
 
 @requires_rubin
-def test_mxfp8_dense_kv_tail_is_declined_not_computed_wrong():
-    """The Rubin MXFP8 SDPA leaves a dense KV tail unmasked, so the adapter DECLINES S % 128 != 0 without a padding
-    mask or a causal mask -- the block surfaces that at check_support, typed."""
-    with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
-        _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000)
+def test_mxfp8_dense_kv_tail_is_masked_not_computed_wrong():
+    """A dense S % 128 != 0 with no padding mask: the SDPA adapter compiles the padded mask against the scalar S_kv
+    (kv_tail_mask, #1520), so the block serves it and the KV tail stays out of the softmax -- the oracle, at the same
+    cosine floor as the matrix, and every output cell written."""
+    out, ref, _, _, _ = _run_mx_block({**_GEOM, "is_causal": False}, batch=1, seq_len=1000, sentinel=True)
+    assert not (out == _SENTINEL).any(), f"{(out == _SENTINEL).sum().item()} output cells were never written"
+    assert torch.isfinite(out.float()).all()
+    c = _cos(out, ref)
+    print(f"\nmxfp8 block dense KV tail S=1000: cos={c:.6f}")
+    assert c > 0.99, f"mxfp8 dense KV tail cos {c}"

@@ -67,32 +67,55 @@ def test_compressed_indexer_rejects_unsupported_qhead_group_before_launch():
 
 
 @pytest.mark.L0
-def test_indexer_denom_placeholders_use_stable_power_of_two_buckets():
+@torch_fork_set_rng(seed=35)
+def test_compressed_denom_slot_compiled_out():
+    """Without LSE the stage-1 kernel takes denom=None (Rule 8, R3): no placeholder pool, and a fully pre-allocated call allocates nothing."""
     _require_sm100()
     try:
+        from cudnn import DSA
         from cudnn.deepseek_sparse_attention.indexer_forward import _compressed_top_k_sm100 as compressed_impl
-        from cudnn.deepseek_sparse_attention.indexer_forward import _interface as dense_impl
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    device = torch.device("cuda")
-    for getter in (
-        compressed_impl._get_fwd_unified_denom_placeholder,
-        dense_impl._get_fwd_denom_placeholder,
-    ):
-        bucket_8_view_5 = getter((5,), device)
-        bucket_8_view_8 = getter((8,), device)
-        bucket_16_view_9 = getter((9,), device)
-        bucket_8_view_5_again = getter((5,), device)
-        rank_2_bucket_8 = getter((1, 5), device)
+    for name in ("_denom_placeholder_cache", "_denom_placeholder_cache_lock", "_get_fwd_unified_denom_placeholder"):
+        assert not hasattr(compressed_impl, name), f"{name} still exists"
 
-        assert bucket_8_view_5.shape == (5,)
-        assert bucket_8_view_5.untyped_storage().nbytes() == 8 * bucket_8_view_5.element_size()
-        assert bucket_8_view_5.data_ptr() == bucket_8_view_8.data_ptr()
-        assert bucket_16_view_9.untyped_storage().nbytes() == 16 * bucket_16_view_9.element_size()
-        assert bucket_16_view_9.data_ptr() != bucket_8_view_5.data_ptr()
-        assert bucket_8_view_5_again.data_ptr() == bucket_8_view_5.data_ptr()
-        assert rank_2_bucket_8.data_ptr() != bucket_8_view_5.data_ptr()
+    device = torch.device("cuda")
+    b, s_q, s_k, h_q, d = 2, 128, 64, 64, 128
+    ratio, top_k = 4, 16
+    q = torch.randn((b, s_q, h_q, d), dtype=torch.bfloat16, device=device)
+    k = torch.randn((b, s_k, 1, d), dtype=torch.bfloat16, device=device)
+    w = torch.randn((b, s_q, h_q), dtype=torch.bfloat16, device=device).abs() * 0.1
+    cand = torch.empty(DSA.compress_topk_cand_buffer_size(b, s_q, s_k, ratio, microbatch_rows=0), dtype=torch.float32, device=device)
+    out_indices = torch.empty((b, s_q, top_k), dtype=torch.int32, device=device)
+    out_logits = torch.empty((b, s_q, top_k), dtype=torch.float32, device=device)
+
+    def run():
+        return DSA.indexer_forward_top_k_wrapper(
+            q,
+            k,
+            w,
+            top_k=top_k,
+            ratio=ratio,
+            microbatch_rows=0,
+            topk_indices_global=False,
+            return_softmax=False,
+            cand_buffer=cand,
+            out_indices=out_indices,
+            out_logits=out_logits,
+        )
+
+    run()  # lazy compile with denom=None
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+
+    result = run()
+    torch.cuda.synchronize()
+    check_ref_compressed_topk(ref_indexer_forward(q, k, w, ratio), result["indices"], result["logits"], top_k, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.L0
@@ -336,8 +359,13 @@ def test_DSA_compressed_stage2_deterministic_ties(
 
 
 @pytest.mark.L0
-def test_DSA_compressed_stage2_deterministic_shrink_fallback():
-    """A 4096-way exact tie forces the full-row fallback and selects ids 0..K-1."""
+@pytest.mark.parametrize("pattern", ["zero", "late", "mixed"])
+@pytest.mark.parametrize(
+    "seqlen_k,top_k,block_threads",
+    [(4096, 64, 512), (2047, 64, 128), (2048, 64, 256), (2049, 2048, 512), (8193, 2048, 32), (8193, 2048, 1024), (8193, 1, 512), (31, 64, 64)],
+)
+def test_DSA_compressed_stage2_deterministic_shrink_fallback(seqlen_k, top_k, block_threads, pattern):
+    """Preserve the stable tie set across shrink overflow, CTA tiles, and padding."""
     _require_sm100()
     try:
         from cudnn.deepseek_sparse_attention.indexer_top_k.compress_top_k_sm100 import compress_stage2_topk
@@ -345,50 +373,52 @@ def test_DSA_compressed_stage2_deterministic_shrink_fallback():
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
     device = torch.device("cuda")
-    seqlen_k, top_k = 4096, 64
     candidates = torch.zeros(seqlen_k, dtype=torch.float32, device=device)
+    if pattern == "late":
+        candidates[: seqlen_k // 2] = -1
+    elif pattern == "mixed":
+        positions = torch.arange(seqlen_k, device=device)
+        candidates = torch.where(positions % 8 < 4, 1.0, torch.where(positions % 8 == 4, 3.0 + positions / 32768, -positions.float()))
     cand_batch_offsets = torch.tensor([0, seqlen_k], dtype=torch.int64, device=device)
     q_causal_offsets = torch.tensor([seqlen_k - 1], dtype=torch.int32, device=device)
 
-    compress_stage2_topk(
-        candidates,
-        1,
-        1,
-        seqlen_k,
-        top_k,
-        1,
-        cand_batch_offsets=cand_batch_offsets,
-        q_causal_offsets=q_causal_offsets,
-        deterministic=False,
-    )
-    indices, logits = compress_stage2_topk(
-        candidates,
-        1,
-        1,
-        seqlen_k,
-        top_k,
-        1,
-        cand_batch_offsets=cand_batch_offsets,
-        q_causal_offsets=q_causal_offsets,
-        deterministic=True,
-    )
-    indices_again, _ = compress_stage2_topk(
-        candidates,
-        1,
-        1,
-        seqlen_k,
-        top_k,
-        1,
-        cand_batch_offsets=cand_batch_offsets,
-        q_causal_offsets=q_causal_offsets,
-        deterministic=True,
-    )
-    torch.cuda.synchronize()
+    def run(**kwargs):
+        return compress_stage2_topk(
+            candidates,
+            1,
+            1,
+            seqlen_k,
+            top_k,
+            1,
+            block_threads=block_threads,
+            cand_batch_offsets=cand_batch_offsets,
+            q_causal_offsets=q_causal_offsets,
+            **kwargs,
+        )
 
-    expected = torch.arange(top_k, dtype=torch.int32, device=device).view(1, 1, top_k)
-    assert torch.equal(indices.sort(dim=-1).values, expected)
-    assert torch.equal(indices.sort(dim=-1).values, indices_again.sort(dim=-1).values)
-    assert torch.equal(logits, torch.zeros_like(logits))
+    selected = candidates.argsort(descending=True, stable=True)[:top_k]
+    expected = torch.full((1, 1, top_k), -1, dtype=torch.int32, device=device)
+    expected[..., : selected.numel()] = selected.int()
+    expected_logits = torch.full(expected.shape, -torch.inf, device=device)
+    expected_logits[..., : selected.numel()] = candidates[selected]
+    _, default_logits = run(deterministic=False)
+    torch.testing.assert_close(default_logits.sort(-1).values, expected_logits.sort(-1).values, atol=0, rtol=0)
+    indices, logits = run(deterministic=True)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run(deterministic=True, out_indices=indices, out_logits=logits)
+        for _ in range(3):
+            indices.fill_(-99)
+            logits.fill_(99)
+            graph.replay()
+            torch.testing.assert_close(indices.sort(-1).values, expected.sort(-1).values, atol=0, rtol=0)
+            valid = indices >= 0
+            torch.testing.assert_close(logits[valid], candidates[indices[valid].long()], atol=0, rtol=0)
+            assert torch.isneginf(logits[~valid]).all()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.L0

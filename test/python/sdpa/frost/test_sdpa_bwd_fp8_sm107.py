@@ -38,7 +38,9 @@ the half suite's ``_ref_dump_dir``).
 
 from __future__ import annotations
 
+import collections
 import math
+import types
 
 import pytest
 import torch
@@ -544,6 +546,84 @@ def _ds_dtype_code() -> int:
 
 
 _DS_KNOBS = [pytest.param(DTYPE_E4M3, id="e4m3-ds"), pytest.param(DTYPE_BF16, id="bf16-ds")]
+# The oracle of a case depends on (shape, mask, seed, attn_scale) and, for the backward, on the dS rounding (ds_knob); the gradient dtype
+# only CASTS the fp32 gradients (compute_ref_backward: ``torch_otype`` casts dQ / dK / dV, nothing else).  _run_fp8 computes each oracle
+# once per process and keeps the fp32 results here; every parametrization of the same case reuses the SAME tensors, so the reference
+# values are bitwise the unshared form's.  The (b, h, s_q, s_kv) intermediates are NOT kept (``ref_bwd`` re-derives a selection on demand).
+# Bounded by bytes, oldest case first: the fp32 gradients of a 32-head S=2K cell are ~200 MB, and the memo must not be what fills a
+# 16 GiB part; the parametrizations of one case are adjacent in collection order, so a small budget keeps nearly every hit.
+# Under the disk cache's VERIFY mode the memo stands aside (_oracle_memo), so a repeated case is verified like a first one.
+_ORACLE_MEMO: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_ORACLE_MEMO_BUDGET_BYTES = 2 * 2**30
+
+
+def _tensor_bytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (tuple, list)):
+        return sum(_tensor_bytes(v) for v in value)
+    return 0
+
+
+def _oracle_memo(key, compute):
+    """``compute()`` once per key per process; a hit is the SAME object the first call produced (bitwise by construction).
+
+    Under the disk cache's VERIFY mode (``CUDNN_TEST_REF_CACHE`` names a directory and ``CUDNN_TEST_REF_CACHE_VERIFY`` is on) the
+    memo stands aside: every call runs ``compute`` -- ``cached_reference``, which recomputes the oracle and compares it bitwise with
+    the stored entry -- so a repeated case, or a case memoized before the cache was switched on, is verified like a first one."""
+    from sdpa import ref_cache
+
+    if ref_cache.cache_dir() is not None and ref_cache.verify():
+        return compute()
+    hit = _ORACLE_MEMO.get(key)
+    if hit is not None:
+        _ORACLE_MEMO.move_to_end(key)
+        return hit[0]
+    value = compute()
+    _ORACLE_MEMO[key] = (value, _tensor_bytes(value))
+    while len(_ORACLE_MEMO) > 1 and sum(nbytes for _, nbytes in _ORACLE_MEMO.values()) > _ORACLE_MEMO_BUDGET_BYTES:
+        _ORACLE_MEMO.popitem(last=False)
+    return value
+
+
+def test_oracle_memo_stands_aside_under_disk_cache_verify(monkeypatch, tmp_path):
+    """Under ``CUDNN_TEST_REF_CACHE_VERIFY`` a REPEATED case still reaches the oracle: the process-local memo would otherwise answer
+    before ``cached_reference`` could recompute and compare, and a case memoized before the cache was switched on would never be
+    verified.  With VERIFY off the memo serves the repeat without a compute, as before."""
+    from sdpa import ref_cache
+
+    monkeypatch.setenv("CUDNN_TEST_REF_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_TEST_REF_CACHE_VERIFY", "1")
+    key = ("memo-verify-pin", str(tmp_path))
+    calls = []
+
+    def oracle_of(value):
+        def oracle():  # ONE source for every value: the disk key hashes the callable's source, so a drift is a drift, not another entry
+            calls.append(1)
+            return (torch.full((2, 3), value, device="cuda"), 0.25)
+
+        return oracle
+
+    def through_cache(value):
+        return lambda: ref_cache.cached_reference("memo_pin", dict(key=str(key)), oracle_of(value))
+
+    try:
+        first = _oracle_memo(key, through_cache(1.5))  # a disk miss: computed and stored
+        before = ref_cache.stats()["verified"]
+        second = _oracle_memo(key, through_cache(1.5))  # the repeat: recomputed and compared bitwise, not answered from the memo
+        assert len(calls) == 2 and ref_cache.stats()["verified"] == before + 1
+        assert torch.equal(first[0], second[0]) and first[1] == second[1]
+        with pytest.raises(AssertionError, match="differs from a fresh compute"):
+            _oracle_memo(key, through_cache(1.5 + 2**-20))  # a drifted oracle fails the repeated case too
+        monkeypatch.setenv("CUDNN_TEST_REF_CACHE_VERIFY", "0")
+        n = len(calls)
+        a = _oracle_memo(key, through_cache(1.5))  # VERIFY off: a disk hit (no oracle call), memoized ...
+        b = _oracle_memo(key, through_cache(1.5))  # ... and the memo answers the repeat
+        assert a is b and len(calls) == n
+    finally:
+        _ORACLE_MEMO.pop(key, None)
+
+
 # One accept cell per member of the row's ``out_dtypes`` (engine contract): the fp8 contract's e4m3 gradients and the two
 # half dtypes the row also serves -- there the gradients land UNSCALED (scale_dQ / dK / dV = 1, the oracle casts them) while
 # dS keeps its e4m3 rounding at scale_dP on the shipped chain.  The dense, causal and GQA-causal cells run all three; every
@@ -636,6 +716,7 @@ def _run_fp8(
     oracle alike -- 0.0 included, a valid scale the adapter must preserve."""
     from sdpa.fp8_ref import compute_ref, compute_ref_backward
     from sdpa.helpers import get_fp8_descale_factor, get_fp8_scale_factor
+    from sdpa.ref_cache import cached_reference  # a node-local DISK cache of oracle outputs; off unless CUDNN_TEST_REF_CACHE names a dir
 
     hkv = hq if hkv is None else hkv
     dev = "cuda"
@@ -658,8 +739,21 @@ def _run_fp8(
     s_descale = 1.0 / s_scale
     right = 0 if causal else None
     align = (cudnn.diagonal_alignment.BOTTOM_RIGHT if bottom_right else cudnn.diagonal_alignment.TOP_LEFT) if causal else None
-    o8, stats, o_amax = compute_ref(
-        q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align
+    # Everything the oracles depend on that this module's content does not pin: the operands are drawn from `seed` on the CPU
+    # generator and quantized per tensor by the two helpers above, `_D` is the row's head dim, `_T_E4M3` the operand dtype.  The
+    # RECIPE itself -- this function: the draw order, the quantization call sites, `ref_bwd` -- reaches the disk key as the content
+    # of this WHOLE module (sdpa/ref_cache.py hashes the file the oracle callable is defined in and every test-tree file on the call
+    # stack at the call), so an edit here is a miss; `quant` scales through sdpa/helpers.py, a listed reference source.
+    fwd_key = ("fwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale)
+    _KEY_NAMES = ("b", "hq", "hkv", "sq", "skv", "causal", "bottom_right", "left", "seed", "scale")
+    _disk_key_common = dict(d=_D, in_dtype=str(_T_E4M3))
+
+    def _fwd_oracle():
+        return compute_ref(q8, k8, v8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, _T_E4M3, left_bound=left, right_bound=right, diag_align=align)
+
+    o8, stats, o_amax = _oracle_memo(
+        fwd_key,
+        lambda: cached_reference("fp8_row_fwd", dict(zip(_KEY_NAMES, fwd_key[1:]), recipe="compute_ref e4m3 P, e4m3 O", **_disk_key_common), _fwd_oracle),
     )
     # compute_ref hands O back as a [B, S, H, D]-SHAPED VIEW over B,H,S,D-contiguous memory (its strides are BHSD).  The
     # graph declares O with BSHD strides, so without this the kernel reads O scrambled -> delta wrong on ~all rows (max
@@ -670,7 +764,7 @@ def _run_fp8(
 
     ds_knob = _ds_dtype_code()
 
-    def ref_bwd(return_intermediates=False, quantize_ds=None):
+    def ref_bwd(return_intermediates=False, quantize_ds=None, quantize_grads=True):
         # The reference composes the SAME dS rounding as the chain under test (sdpa-invariants s8): the e4m3 chain's dQ / dK
         # consume dS_q = e4m3(dS * scale_dP) -> quantize_ds=True (the backend recipe); the bf16 twin holds dS in bf16 -> the
         # reference keeps it in fp32.  P stays quantized on both (the dV BMM2 consumes e4m3 P on both sides).
@@ -679,13 +773,26 @@ def _run_fp8(
         return compute_ref_backward(
             q8, k8, v8, o8, do8, scale, q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, o_ds, do_ds, grad_dtype,
             left_bound=left, right_bound=right, diag_align=align, stats=stats, return_intermediates=return_intermediates,
-            quantize_ds=quantize_ds,
+            quantize_ds=quantize_ds, quantize_grads=quantize_grads,
         )  # fmt: skip
 
-    dq_ref, dk_ref, dv_ref, _dsink, dp_amax, dq_amax, dk_amax, dv_amax, inter = ref_bwd(return_intermediates=True)
+    bwd_key = ("bwd", b, hq, hkv, sq, skv, causal, bottom_right, left, seed, scale, ds_knob == DTYPE_E4M3)
+
+    def _bwd_oracle():
+        dq32, dk32, dv32, _dsink, dp_amax, dq_amax, dk_amax, dv_amax, inter = ref_bwd(return_intermediates=True, quantize_grads=False)
+        return (dq32, dk32, dv32, dp_amax, dq_amax, dk_amax, dv_amax, inter["ds_scaled"].abs().max().item())
+
+    dq32, dk32, dv32, dp_amax, dq_amax, dk_amax, dv_amax, ds_scaled_max = _oracle_memo(
+        bwd_key,
+        lambda: cached_reference(
+            "fp8_row_bwd", dict(zip(_KEY_NAMES + ("e4m3_ds",), bwd_key[1:]), recipe="compute_ref_backward fp32 grads", **_disk_key_common), _bwd_oracle
+        ),
+    )
     dp_scale = get_fp8_scale_factor(dp_amax, _T_E4M3)
-    ds_amax = inter["ds_scaled"].abs().max().item() / dp_scale  # the fp32 dS the contract's amax_dP reduces
+    ds_amax = ds_scaled_max / dp_scale  # the fp32 dS the contract's amax_dP reduces
     grad_scale = {n: get_fp8_scale_factor(a, grad_dtype) for n, a in (("dQ", dq_amax), ("dK", dk_amax), ("dV", dv_amax))}
+    # the reference's own quantize_grads=True cast, applied here per gradient dtype: (grad * get_fp8_scale_factor(amax, torch_otype)).to(torch_otype)
+    dq_ref, dk_ref, dv_ref = ((g * grad_scale[n]).to(grad_dtype) for n, g in (("dQ", dq32), ("dK", dk32), ("dV", dv32)))
     scalars = dict(
         descale_q=q_ds,
         descale_k=k_ds,
@@ -965,7 +1072,13 @@ def _run_on_knob(monkeypatch, knob, **kw):
 @pytest.mark.parametrize("case", [dict(), dict(causal=True), dict(hq=8, hkv=2, causal=True)], ids=["dense", "causal", "gqa-causal"])
 def test_fp8_ds_workspace_dtypes_agree(monkeypatch, case):
     """The two chains side by side on one input.  dV does not depend on dS and amax_dP is folded BEFORE the scale and the
-    cast, so both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change).  dQ / dK each pass the
+    cast, so at MHA both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change).  Under GQA the
+    e4m3 chain folds dV from fp32 per-Q-head partials (one rounding) while the bf16-dS twin keeps bf16 partials (its 96 KiB dS ring
+    leaves no SMEM for the fp32 dV staging), so their dV codes differ where the twin's extra partial rounding lands on an e4m3
+    midpoint: what is pinned there is that the e4m3 chain's dV is never FARTHER from the once-rounded oracle than the twin's, that
+    at most 0.1 % of its codes are off the oracle's (0 measured: the single rounding IS the oracle's), and that amax_dV differs
+    by at most ``group`` half-ulps of bf16 relative (the twin's partial roundings).  No per-element bound between the chains is
+    claimed: a bf16 partial's rounding is relative to the partial, so under cancellation it exceeds any step of the small sum.  dQ / dK each pass the
     recipe against their OWN oracle (``check()``, the fixture-parametrized accept cases); against EACH OTHER they differ by
     exactly the e4m3 rounding of dS (3 mantissa bits, 2^-4 relative per element, an e4m3 midpoint flip per value) -- a
     per-element flip budget cannot hold between them and is not claimed.  What is pinned: the dequantized dQ / dK of the two
@@ -979,9 +1092,28 @@ def test_fp8_ds_workspace_dtypes_agree(monkeypatch, case):
     e4m3 = _run_on_knob(monkeypatch, DTYPE_E4M3, **case).check()
     bf16 = _run_on_knob(monkeypatch, DTYPE_BF16, **case).check()
     assert e4m3.ds_knob == DTYPE_E4M3 and bf16.ds_knob == DTYPE_BF16
-    assert torch.equal(e4m3.outs[0]["dV"].view(torch.int8), bf16.outs[0]["dV"].view(torch.int8)), "dV must be bitwise across the dS workspace dtype"
     assert e4m3.amax[0]["dP"].item() == bf16.amax[0]["dP"].item(), "amax_dP is the pre-quant fp32 max on both chains"
-    assert e4m3.amax[0]["dV"].item() == bf16.amax[0]["dV"].item()
+    group = case.get("hq", 2) // case.get("hkv", case.get("hq", 2))
+    if group == 1:
+        assert torch.equal(e4m3.outs[0]["dV"].view(torch.int8), bf16.outs[0]["dV"].view(torch.int8)), "dV must be bitwise across the dS workspace dtype"
+        assert e4m3.amax[0]["dV"].item() == bf16.amax[0]["dV"].item()
+    else:
+        a8, b8, r8 = e4m3.outs[0]["dV"], bf16.outs[0]["dV"], e4m3.refs["dV"]
+        assert torch.equal(r8.view(torch.int8), bf16.refs["dV"].view(torch.int8)), "dV does not depend on dS: one oracle dV behind both runs"
+        n_ab, n_ar, n_br = (int((x.view(torch.int8) != y.view(torch.int8)).sum()) for x, y in ((a8, b8), (a8, r8), (b8, r8)))
+        print(
+            f"\ndV e4m3-dS (fp32 partials) vs bf16-dS (bf16 partials) chain ({case}): {n_ab} of {a8.numel()} codes differ; vs the oracle: "
+            f"{n_ar} (fp32 partials) / {n_br} (bf16 partials); amax_dV {e4m3.amax[0]['dV'].item():.6g} / {bf16.amax[0]['dV'].item():.6g}"
+        )
+        assert n_ar <= n_br, "the fp32 per-Q-head partials must leave the e4m3 chain's dV no farther from the once-rounded oracle than the twin's bf16 partials"
+        # The fp32-partial chain's dV IS the oracle's rounding up to fp32-vs-fp64 accumulation residue: 0 of 262144 codes off at this cell
+        # (MEASURED 2026-10-06; the twin 9905 = 3.8 %).  A per-element bound on the chain-vs-chain difference is NOT claimed: a bf16
+        # partial's rounding error is relative to the PARTIAL, so under cancellation it exceeds any step of the small sum.
+        assert n_ar <= a8.numel() // 1000, f"{n_ar} of {a8.numel()} dV codes off the once-rounded oracle with fp32 partials (> 0.1 %)"
+        am_a, am_b = e4m3.amax[0]["dV"].item(), bf16.amax[0]["dV"].item()
+        assert abs(am_a - am_b) <= group * 2.0**-9 * max(
+            am_a, am_b
+        ), "amax_dV: the twin's bf16 partial roundings move the fold's max by at most group half-ulps of bf16"
     for name in ("dQ", "dK"):
         a = e4m3.outs[0][name].float() * e4m3.descales[name]
         b = bf16.outs[0][name].float() * bf16.descales[name]
@@ -1567,8 +1699,9 @@ def test_kernel_level_e4m3_ds_workspace_is_the_scaled_quantized_ds(stem):
 # The fp8 row's twins of the half suite's ``_run_adapter`` cells (test_sdpa_bwd_dsl_sm107.py): ``SdpaBwdDslSm107Fp8(seq_kv_lens_present=True)``
 # over the twelve scalars and the four amax outputs, the fp8 oracle composing the SAME per-batch lengths and band INSIDE itself
 # (``padding=``: slicing the operands per batch entry would be a different e4m3 quantization of nothing but the slice), the
-# appended ``external_delta`` plan fact (DENSE only: a caller's fp32 ``[B, H_q, S_q_pad]`` ``rowsum(dO * O)`` in TRUE units, bound
-# AS IS -- the fp8 kernel reads delta unscaled, nobody applies ``descale_o * descale_dO`` to a caller's tensor; zeros past S_q), and
+# appended ``external_delta`` plan fact (the dense plans here -- the THD twins are test_sdpa_bwd_thd_fp8_sm107.py's: a caller's fp32
+# ``[B, H_q, S_q_pad]`` ``rowsum(dO * O)`` in TRUE units, bound AS IS -- the fp8 kernel reads delta unscaled, nobody applies
+# ``descale_o * descale_dO`` to a caller's tensor; zeros past S_q), and
 # bottom-right at a ragged S_q through the graph (served now: the body threads ``seqlen_q_real``).  The K / V rows past a batch
 # entry's kv length and the delta's pad rows hold FINITE data in every cell (the finite-data contract of the per-batch arm:
 # ``chunk_dS = (dP * scale - dot) * P`` and ``0 * NaN = NaN``; the dense rows get finite pads from the zero-filled staging, the
@@ -2005,3 +2138,262 @@ def test_causal_bottom_right_ragged_s_q_is_served(ds_knob, sq, skv):
     128 -> 1): the body derives the diagonal ``S_kv - S_q`` and its q-tile trim from ``seqlen_q_real``, so S_q = 500 runs its own
     diagonal, not S_q = 512's; the staging's zero-filled dO and ``+inf`` LSE rows keep the pad rows at P = 0."""
     _run_fp8(b=1, hq=2, sq=sq, skv=skv, causal=True, bottom_right=True).check()
+
+
+# --------------------------------------------------------------------------- the GQA fold rounds ONCE: fp32 per-Q-head partials (host) + one fold / one setup launch
+
+
+def test_fp8_gqa_partials_are_fp32_on_the_e4m3_chain_and_bf16_otherwise(monkeypatch, ds_knob):
+    """Under GQA the fp8 row's per-Q-head dK / dV partials are fp32 on the e4m3-dS chain -- the main kernel is loaded at
+    ``dtype_o = DTYPE_FP32`` (dV_true stored UNROUNDED) and the dK record's ``EPI_DESCALE`` output is fp32 -- so the fold's
+    fixed-order fp32 sum of the group is rounded ONCE (a bf16 partial was rounded a second time by the fold: relative RMS 2.7e-3 on
+    dK / dV vs the reference under GQA, 0 under MHA).  At MHA nothing changes (``dtype_o = BF16``, a bf16 ``dv_part``, no ``dk_part``:
+    the fold is a copy + amax, dK is quantized in the GEMM -- the pre-fp32 kernels and bits), and the bf16-dS twin keeps bf16
+    partials on every path (no SMEM for the fp32 dV staging beside its 96 KiB dS ring; its bf16 renderings store the io dtype)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_FP32
+    from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_QUANT, matmul_out_dtype
+    from test_sdpa_bwd_dsl_sm107 import _adapter
+
+    monkeypatch.setattr(sm107, "FP8_DS_DTYPE", ds_knob)
+    e4m3_chain = ds_knob == DTYPE_E4M3
+    gqa = _adapter(SdpaBwdDslSm107Fp8, b=1, hq=4, hkv=2, dt=_T_E4M3, grad_dt=torch.bfloat16, amax_requested=_AMAX)
+    mha = _adapter(SdpaBwdDslSm107Fp8, b=1, hq=2, hkv=2, dt=_T_E4M3, grad_dt=torch.bfloat16, amax_requested=_AMAX)
+    assert gqa.check_support() and mha.check_support()
+    assert gqa._fp32_partials is e4m3_chain and mha._fp32_partials is False
+    assert gqa._template_params().dtype_o == (DTYPE_FP32 if e4m3_chain else DTYPE_BF16), "the main kernel stores dV_true unrounded under GQA"
+    assert mha._template_params().dtype_o == DTYPE_BF16, "MHA keeps the bf16 dV_true the copy-fold reads: the same kernel as before"
+    plan_gqa = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in gqa._scratch_shapes()}
+    plan_mha = {name: (tuple(int(x) for x in shape), dt) for name, shape, dt in mha._scratch_shapes()}
+    part = torch.float32 if e4m3_chain else torch.bfloat16
+    assert plan_gqa["dv_part"] == ((1, 512, 4, _D), part) and plan_gqa["dk_part"] == ((1, 512, 4, _D), part)
+    assert plan_mha["dv_part"] == ((1, 512, 2, _D), torch.bfloat16), "MHA: the bf16 dV_true the fold copies"
+    assert ("dk_part" in plan_mha) is (not e4m3_chain), "MHA on the e4m3 chain quantizes dK in the GEMM: no dK partial"
+    # the records: the DESCALE output IS the fp32 partial (the template pins FP32 to DESCALE), QUANT the gradient dtype
+    dk, dq = gqa._stage3_records(types.SimpleNamespace(CFG=types.SimpleNamespace(TILE_M=128, CTA_MMA=2)), (256, 256))
+    if e4m3_chain:
+        assert (dk.epi_mode, matmul_out_dtype(dk)) == (EPI_DESCALE, DTYPE_FP32) and (dq.epi_mode, matmul_out_dtype(dq)) == (EPI_QUANT, DTYPE_BF16)
+    else:
+        assert matmul_out_dtype(dk) == matmul_out_dtype(dq) == DTYPE_BF16, "the twin's bf16 renderings store the io dtype"
+    # the carve pays for it: the two partials double under GQA on the e4m3 chain (64 KiB per kv token at the 397B geometry)
+    bytes_part = 2 * (1 * 512 * 4 * _D) * part.itemsize
+    assert sum(ws_align(math.prod(s) * dt.itemsize) for n, (s, dt) in plan_gqa.items() if n in ("dv_part", "dk_part")) == ws_align(bytes_part // 2) * 2
+
+
+def test_fp32_dv_partial_config_fits_the_rubin_cap_only_with_the_e4m3_ds_ring():
+    """``dtype_o = DTYPE_FP32`` on the fp8 body: the dV staging aliasing K + V grows to 128 KiB (``BPE_O = 4``, 32-element 128-B
+    rows, 8 TMA subtiles), 322 KiB of slabs -- 1 KiB under the 325 KiB usable -- with every tcgen05 descriptor root where it
+    was (K / V sit at the alias slab's start, nothing descriptor-reads the slabs after it); with the bf16-dS twin's 96 KiB ring
+    the same staging is 370 KiB and the config REFUSES it (which is why the twin keeps bf16 partials), and the MXFP8 body
+    does not take the code at all (half-precision gradients, no fold-quant pass)."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_FP32
+    from cudnn.sdpa.bwd import config_sm107 as cfg
+
+    fp32 = cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP32), cfg.FAMILY_FP8)
+    bf16 = cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_BF16), cfg.FAMILY_FP8)
+    assert (fp32.DTYPE_O, fp32.BPE_O) == (DTYPE_FP32, 4) and cfg.bpe(DTYPE_FP32) == 4
+    b = cfg.buffer_elems(fp32)
+    assert (b.DV_D_BLOCK, b.TMA_DV_ITERS, b.DV_BLOCK_SLAB) == (32, 8, 128 * 32), "32 fp32 per 128-B store row, eight subtiles per 256-wide dV row"
+    assert cfg.smem_bytes(bf16) == 258 * 1024 and cfg.smem_bytes(fp32) == 322 * 1024
+    assert cfg.kernel_smem_bytes(fp32) <= cfg.SMEM_CAP_BYTES, "the fp32 staging must fit the 327 KiB oversized cap with the scaffold"
+    assert cfg.desc_roots(fp32) == cfg.desc_roots(bf16), "no descriptor root moves: the alias slab only grows at its end"
+    assert max(off for _lbl, off in cfg.desc_roots(fp32)) < 256 * 1024
+    with pytest.raises(ValueError, match="exceed the 327 KiB"):
+        cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP32, dtype_ds=DTYPE_BF16), cfg.FAMILY_FP8)
+    with pytest.raises(ValueError, match="dtype_o must be"):
+        cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_E4M3, dtype_o=DTYPE_FP32), cfg.FAMILY_MXFP8)
+    with pytest.raises(ValueError, match="dtype_o must be"):
+        cfg.make_cfg_d256_bwd(cfg.TemplateParams(dtype_qkv=DTYPE_BF16, dtype_o=DTYPE_FP32), cfg.FAMILY_F16)
+
+
+def test_stage3_fp32_output_is_the_descale_or_block_scale_partial_only():
+    """The stage-3 template's fp32 D is a per-Q-head true-unit partial and nothing else: ``validate_matmul_params`` admits
+    ``dtype_out = DTYPE_FP32`` with ``EPI_DESCALE`` on the per-tensor fp8 arm and with ``EPI_NONE`` on the BLOCK-SCALE arm (whose MMA
+    already dequantized: the accumulator IS the true-unit value), and refuses it with ``EPI_QUANT`` (a quantized gradient has a
+    gradient dtype), with ``EPI_NONE`` on the per-tensor fp8 arm (an unscaled accumulator has no fp32 consumer) and on the bf16 rows
+    (``EPI_NONE`` stores the io dtype); ``_stage3_params`` writes it on the DESCALE record by itself (no caller passes it) and on the
+    block-scale dK record under ``dk_fp32_out`` only (the dQ record keeps the inherited bf16; the flag without ``block_scale`` is
+    refused), leaving the QUANT record's gradient dtype and the half row's inherited -1 alone."""
+    from cudnn.frost.tile_dsl.constants import DTYPE_FP32
+    from cudnn.sdpa.bwd.api_dsl_sm107 import _stage3_params
+    from cudnn.sdpa.bwd.config_sm100 import EPI_DESCALE, EPI_NONE, EPI_QUANT, MatmulTemplateParams, matmul_out_dtype, validate_matmul_params
+
+    fp8 = dict(dtype_qkv=DTYPE_E4M3, cgrp_tile_mn=(256, 256))
+    validate_matmul_params(MatmulTemplateParams(**fp8, epi_mode=EPI_DESCALE, dtype_out=DTYPE_FP32))
+    with pytest.raises(ValueError, match="FP32 output is the DESCALE"):
+        validate_matmul_params(MatmulTemplateParams(**fp8, epi_mode=EPI_QUANT, dtype_out=DTYPE_FP32))
+    with pytest.raises(ValueError):
+        validate_matmul_params(MatmulTemplateParams(dtype_qkv=DTYPE_BF16, cgrp_tile_mn=(256, 256), epi_mode=EPI_NONE, dtype_out=DTYPE_FP32))
+    with pytest.raises(ValueError):  # the per-tensor fp8 arm: EPI_NONE is not even an epilogue it renders, fp32 or not
+        validate_matmul_params(MatmulTemplateParams(**fp8, epi_mode=EPI_NONE, dtype_out=DTYPE_FP32))
+    # the block-scale arm: its EPI_NONE partial may be fp32 (the MXFP8 row's GQA dK), the inherited default stays bf16
+    validate_matmul_params(MatmulTemplateParams(**fp8, block_scale=True, epi_mode=EPI_NONE, dtype_out=DTYPE_FP32))
+    assert matmul_out_dtype(MatmulTemplateParams(**fp8, block_scale=True, epi_mode=EPI_NONE)) == DTYPE_BF16
+    with pytest.raises(ValueError, match="block_scale dequantizes IN the MMA"):  # a block-scale record has no epilogue to quantize with, fp32 or not
+        validate_matmul_params(MatmulTemplateParams(**fp8, block_scale=True, epi_mode=EPI_QUANT, dtype_out=DTYPE_FP32))
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_BF16)
+    assert (dk.dtype_out, matmul_out_dtype(dk)) == (DTYPE_FP32, DTYPE_FP32) and (dq.dtype_out, matmul_out_dtype(dq)) == (DTYPE_BF16, DTYPE_BF16)
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_QUANT, EPI_QUANT), dtype_out=DTYPE_E4M3)
+    assert dk.dtype_out == dq.dtype_out == DTYPE_E4M3
+    dk, dq = _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256))
+    assert dk.dtype_out == dq.dtype_out == -1 and matmul_out_dtype(dk) == DTYPE_BF16
+    # the block-scale records: fp32 dK partial on request, bf16 dQ always; today's bytes without the flag; the flag needs the arm
+    dk, dq = _stage3_params(DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), block_scale=True, gqa_group=4, dq_single_launch=False)
+    assert dk.dtype_out == dq.dtype_out == -1 and matmul_out_dtype(dk) == matmul_out_dtype(dq) == DTYPE_BF16 and dk.block_scale and dq.block_scale
+    dk, dq = _stage3_params(
+        DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), block_scale=True, gqa_group=4, dq_single_launch=False, dk_fp32_out=True
+    )
+    assert (
+        (dk.dtype_out, matmul_out_dtype(dk)) == (DTYPE_FP32, DTYPE_FP32)
+        and dk.epi_mode == EPI_NONE
+        and (dq.dtype_out, matmul_out_dtype(dq)) == (-1, DTYPE_BF16)
+    )
+    validate_matmul_params(dk)
+    validate_matmul_params(dq)
+    with pytest.raises(ValueError, match="dk_fp32_out"):
+        _stage3_params(
+            DTYPE_E4M3, causal=True, shift=0, gran=256, cgrp_tile_mn=(256, 256), epi_modes=(EPI_DESCALE, EPI_QUANT), dtype_out=DTYPE_BF16, dk_fp32_out=True
+        )
+    with pytest.raises(ValueError, match="dk_fp32_out"):
+        _stage3_params(DTYPE_BF16, causal=False, shift=0, gran=256, cgrp_tile_mn=(256, 256), dk_fp32_out=True)
+
+
+@requires_rubin
+@pytest.mark.parametrize("hkv", [2, 4], ids=["gqa", "mha"])
+def test_fp8_row_launches_one_setup_and_one_fold_whatever_the_group(hkv):
+    """The fp8 row's dense chain is ``setup + dot + c x (main + dK + q x dQ) + fold`` = 6 launches at one chunk with one dQ launch,
+    at GQA and MHA alike: the uniform kv-length fill and the amax resets are ONE setup launch (``_fp8_setup``), and under GQA
+    the dK fold rides the dV fold's launch (``fold_quant_pair``) -- the two launches the chain used to spend on them are gone.
+    Counted with CUPTI (``cuda_launch_counts``; a profiler that records nothing here prints 'unverified' and asserts nothing)."""
+    gqa = _run_fp8_adapter(b=1, hq=4, hkv=hkv, sq=512, skv=512, kv_lens=None, causal=True)
+    gqa.check()
+    counts = cuda_launch_counts(gqa.rerun)
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        print(f"\nlaunches at hq=4 hkv={hkv}: {counts[0]}")
+        assert counts == [6], f"setup + dot + main + dK + dQ + fold = 6 launches expected at hq=4 hkv={hkv}; CUPTI saw {counts[0]}"
+
+
+# ---------------------------------------------------------------------------- the fold + quantize pass: geometry and sm_107a SASS pins
+# The pass streams the GQA partials (2 x 256 MiB of fp32 for the dV + dK pair at B=1, H_q=32, S_kv=8K), so its form is a bandwidth
+# decision -- and one no numerics test can see: the previous form read every partial through 32-bit scalar loads (its vector load
+# had lost the tensor's alignment in the pointer arithmetic) and ran at 41-56 % of the HBM pin, bitwise correct.  Two tripwires:
+# the geometry helpers (one 16-byte load per partial per thread, a persistent grid capped at 8 CTAs of 256 threads per SM) and the
+# SASS of the pair kernel compiled for sm_107a (128-bit loads, no scalar partial reads, no spill, ONE atomicMax site per operand
+# set).  A third pin keeps the fp8 host-compile entries from growing a placeholder default for the device's multiprocessor count.
+_FOLD_SASS_PROBE = """
+import glob, os, re, subprocess, sys
+dump, group, cands = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump
+os.environ["CUTE_DSL_KEEP"] = "cubin"
+os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+import cutlass, cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import fold_quant_pair_host
+B, S, Hk, D = 1, 1024, 2, 256
+ws = make_fake_compact_tensor(cutlass.Float32, (B, S, Hk * group, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+out = make_fake_compact_tensor(cutlass.Float8E4M3FN, (B, S, Hk, D), stride_order=(3, 2, 1, 0), assumed_align=16)
+sc = make_fake_compact_tensor(cutlass.Float32, (1,), stride_order=(0,), assumed_align=16)
+cute.compile(fold_quant_pair_host, ws, out, None, sc, sc, ws, out, None, sc, sc, D, group, cutlass.Float8E4M3FN, 204,
+             make_fake_stream(use_tvm_ffi_env_stream=False), None, options="--enable-tvm-ffi --gpu-arch sm_107a")
+cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+if not cubins:
+    print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+nvd = None
+for c in cands:
+    try:
+        proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("REJECT", c, "->", repr(exc)); continue
+    if proc.returncode == 0 and proc.stdout.strip():
+        nvd = c; break
+    print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+if nvd is None:
+    print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+def cnt(pat):
+    rx = re.compile(pat)
+    return sum(1 for ln in sass if rx.search(ln))
+for key, pat in (("LDG128", r"LDG\\.E\\.128"), ("LDG64", r"LDG\\.E\\.64"), ("LDG32", r"LDG\\.E\\b(?!\\.)"), ("STL", r"\\bSTL\\b"), ("LDL", r"\\bLDL\\b"),
+                 ("REDMAX", r"REDG\\.E\\.MAX"), ("FMNMX", r"\\bFMNMX"), ("BAR", r"\\bBAR\\.SYNC")):
+    print("SASS", key, cnt(pat))
+"""
+
+
+def test_fp8_fold_pass_geometry_is_one_aligned_load_per_partial_on_a_persistent_grid():
+    """The helpers the fold hosts size their launch with: one 16-byte load per partial per thread (4 fp32 / 8 bf16 elements), work
+    items of ``threads x vec`` elements, and a persistent CTA count capped at ``FOLD_QUANT_CTAS_PER_SM`` CTAs of 256 threads per SM
+    in the GRID (2048 threads per SM requested -- two resident sets, the fp32 group-16 pair kernel being 64 registers per thread;
+    the measured optimum on Rubin: a cap of 4 CTAs per SM lost 5-8 %, a one-item-per-CTA grid 7-41 % at S=32K) and never above
+    the items; the pair split hands each set at least one CTA and the cap in proportion to its items."""
+    import cutlass
+
+    from cudnn.sdpa.bwd.kernels import bprop_chain_common as C
+
+    assert C.FOLD_QUANT_LOAD_BYTES == 16 and C.FOLD_QUANT_THREADS * C.FOLD_QUANT_CTAS_PER_SM == 2048
+    assert C.fold_quant_vec(cutlass.Float32) == 4 and C.fold_quant_vec(cutlass.BFloat16) == 8
+    items = C.fold_quant_items((1, 8192, 2, 256), 256, 4)  # the 397B geometry's dV set at S=8K: 4M elements / (256 x 4)
+    assert items == 8192 * 2 * 256 // (256 * 4) == 4096
+    assert C.fold_quant_items((2, 1000, 2, 256), 256, 4) == -(-2 * 1000 * 2 * 256 // 1024)  # a tail item, never a dropped one
+    assert C.fold_quant_ctas(items, 204) == 204 * 8 == 1632 and C.fold_quant_ctas(100, 204) == 100 and C.fold_quant_ctas(0, 204) == 1
+    assert C.fold_quant_pair_ctas(items, items, 204) == (816, 816)
+    for items_a, items_b in ((3, 3000), (3000, 3), (1, 1), (5000, 5000), (1632, 1)):
+        a, b = C.fold_quant_pair_ctas(items_a, items_b, 204)
+        assert 1 <= a <= items_a and 1 <= b <= items_b and a + b <= 1632, (items_a, items_b, a, b)  # at least one CTA per set, never more than items or the cap
+    assert C.fold_quant_pair_ctas(3, 3000, 204) == (1, 1631)  # proportional (floor): the small set keeps one CTA, the cap goes to the large one
+    assert C.fold_quant_pair_ctas(1, 1, 204) == (1, 1)
+
+
+def test_fp8_prepared_host_compile_takes_the_device_sm_count_without_a_default():
+    """The two fp8 host-compile entries size the fold passes' persistent grid on ``sm_count`` -- the device's multiprocessor count,
+    a plan fact the caller reads from the device and folds into the cache key.  A placeholder default would compile a CORRECT
+    artifact whose fold pass streams half a gigabyte of partials through a handful of CTAs, so the argument is keyword-only with
+    no default, and a value that is not a positive int is rejected by name before anything is traced."""
+    import inspect
+
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host as P
+
+    for entry in (P.compile_host_fp8, P.compile_host_fp8_thd):
+        param = inspect.signature(entry).parameters["sm_count"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is inspect.Parameter.empty, entry.__name__
+        with pytest.raises(TypeError, match="sm_count"):
+            entry(None, None, None, None, None, None, None, (False, False, False, False), 107, "key")
+        for bad in (0, -1, 1.5, None, 204.0):
+            with pytest.raises(ValueError, match="multiprocessor count"):
+                entry(None, None, None, None, None, None, None, (False, False, False, False), 107, "key", sm_count=bad)
+
+
+def test_fp8_fold_pass_sass_reads_128_bit_vectors_and_folds_one_atomic_per_cta(tmp_path):
+    """sm_107a SASS of ``fold_quant_pair_kernel`` (fp32 partials, group 16, e4m3 out): every partial read is a 128-bit load (one
+    per partial per set body -- the previous form read 258 32-bit scalars per thread and no LDG.128), the only 32-bit loads are
+    the two scale words, no stack spill, the amax tree on FMNMX, and exactly ONE ``REDG.E.MAX`` site per operand set behind the
+    CTA barrier (the per-warp atomic of the previous form was 32768 same-address arrivals per launch at S=8K)."""
+    import subprocess
+    import sys
+
+    from frost_test_utils import arch_known_to_the_dsl, nvdisasm_candidates
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
+    cands = nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    group = 16
+    dump = tmp_path / "fold_quant_pair_sm107a"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", _FOLD_SASS_PROBE, str(dump), str(group), *cands], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, f"sm_107a trace-compile of fold_quant_pair_host failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ")}
+    print(f"\nfold_quant_pair sm_107a SASS: {stats}")
+    assert stats["LDG128"] >= 2 * group, f"fewer 128-bit loads than partials: the partial reads are not vectorized ({stats})"
+    assert stats["LDG64"] == 0 and stats["LDG32"] <= 4, f"scalar / 64-bit global loads beyond the scale words: a partial read lost its alignment ({stats})"
+    assert stats["STL"] == 0 and stats["LDL"] == 0, f"the fold pass spills ({stats})"
+    assert stats["FMNMX"] > 0, f"the amax tree is compare + select, not FMNMX ({stats})"
+    assert stats["REDMAX"] == 2, f"expected ONE amax atomic site per operand set (2 for the pair), got {stats['REDMAX']}"
+    assert stats["BAR"] >= 2, f"no CTA barrier: the warp maxima are not combined before the atomic ({stats})"

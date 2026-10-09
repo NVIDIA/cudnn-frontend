@@ -22,11 +22,12 @@ def _inputs(d, dv, dtype, capq=384, capkv=448, seed=57):
     return tuple(torch.randn(1, t, h, dim, generator=g, device="cuda", dtype=dtype) * 0.4 for t, h, dim in ((capq, 4, d), (capkv, 2, d), (capkv, 2, dv)))
 
 
-def _run(tensors, cq, ck, *, causal=False, bottom=False, window=-1, sink=None, maxq=192, stream=None):
+def _run(tensors, cq, ck, *, causal=False, bottom=False, window=-1, sink=None, maxq=192, stream=None, scale=None):
     from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
 
     return sdpa_fwd_wrapper_sm80(
         *tensors,
+        scale_softmax=scale,
         is_causal=causal,
         causal_bottom_right=bottom,
         window_size=(window, -1),
@@ -38,15 +39,16 @@ def _run(tensors, cq, ck, *, causal=False, bottom=False, window=-1, sink=None, m
     )
 
 
-def _check(tensors, out, lq, lk, *, causal=False, bottom=False, window=-1, sink=None):
+def _check(tensors, out, lq, lk, *, causal=False, bottom=False, window=-1, sink=None, scale=None):
     q, k, v = tensors
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
     qs = ks = 0
     for nq, nk in zip(lq, lk):
         if nq:
             qq = q[0, qs : qs + nq].transpose(0, 1).double()
             kk = k[0, ks : ks + nk].transpose(0, 1).double().repeat_interleave(2, 0)
             vv = v[0, ks : ks + nk].transpose(0, 1).double().repeat_interleave(2, 0)
-            logits = qq @ kk.transpose(-1, -2) / math.sqrt(q.shape[-1])
+            logits = qq @ kk.transpose(-1, -2) * scale
             row = torch.arange(nq, device=q.device)[:, None] + (nk - nq if bottom else 0)
             col = torch.arange(nk, device=q.device)[None, :]
             mask = torch.ones((nq, nk), dtype=torch.bool, device=q.device)
@@ -74,7 +76,17 @@ def _check(tensors, out, lq, lk, *, causal=False, bottom=False, window=-1, sink=
 @pytest.mark.parametrize("features", [False, True])
 @pytest.mark.L0
 def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
-    from cudnn.sdpa.fwd import api_dsl
+    from cudnn.sdpa.fwd import api_dsl, prepared_sm80_thd
+
+    bound = []
+    original = prepared_sm80_thd.execute
+
+    def native_execute(launch, *args):
+        assert type(launch).__name__ == "_SdpaSm80ThdBinder"
+        bound.append(launch)
+        return original(launch, *args)
+
+    monkeypatch.setattr(prepared_sm80_thd, "execute", native_execute)
 
     tensors = _inputs(d, dv, dtype)
     lq, lk = (96, 129), (65, 193)
@@ -82,6 +94,7 @@ def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
     sink = torch.tensor([-0.7, 0.4, 1.1, -0.2], device="cuda") if features else None
     kw = dict(causal=features, bottom=features, window=64 if features else -1, sink=sink)
     _check(tensors, _run(tensors, cq, ck, **kw), lq, lk, **kw)
+    assert len(bound) == 1, "packed wrapper must use its native binder"
     fresh = _inputs(d, dv, dtype, seed=81)
     # A return to tensor launch plumbing must fail even if numerics agree.
     import cutlass.cute.runtime as runtime
@@ -112,11 +125,14 @@ def test_thd_wrapper_rebind_and_capture(d, dv, dtype, features, monkeypatch):
 @pytest.mark.parametrize("d,dv", [(128, 128), (96, 80)])
 def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, d, dv, tmp_path, monkeypatch):
     import cutlass.cute as cute
+    from cudnn.sdpa.fwd.prepared_sm80_thd import build_launch
     from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
     from cudnn.frost import compiled_cache
 
+    build_launch.cache_clear()
     compile_thd_host.cache_clear()
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")  # the reload path is under test; the memo would hand plan 2 the object plan 1 got
     if cache_mode == "disabled":
         monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
     elif cache_mode == "unknown_manifest":
@@ -127,6 +143,9 @@ def test_thd_wrapper_artifact_survives_capacity_change(cache_mode, d, dv, tmp_pa
     _check(a, _run(a, cq, ck), lq, lk)
     before = compiled_cache.stats()
     if cache_mode == "disk":
+        # Discard both the immutable launch plan and its compiled-host cache;
+        # this leg must exercise a real disk reload, not a still-warm binder.
+        build_launch.cache_clear()
         compile_thd_host.cache_clear()
     monkeypatch.setattr(cute, "compile", lambda *a, **k: pytest.fail("artifact was not reloadable"))
     b = _inputs(d, dv, torch.float16, capq=512, capkv=640, seed=93)
@@ -288,6 +307,19 @@ def test_thd_wrapper_preserves_packed_row_origins(d, dv, dtype, features):
         check(out)
     finally:
         graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d,dv", [(64, 64), (128, 128), (256, 256)])
+@pytest.mark.parametrize("scale", [0.0, -0.3, 1.0])
+@pytest.mark.parametrize("features", [False, True])
+def test_thd_nonpositive_and_large_scale(d, dv, scale, features):
+    # The packed path compiles the scale's sign into the kernel (#1435) and clamps the scaled max above ln 2 (#1442).
+    tensors = _inputs(d, dv, torch.bfloat16)
+    lq, lk = (96, 0, 129), (65, 0, 193)
+    sink = torch.tensor([-0.7, 0.4, 1.1, -0.2], device="cuda") if features else None
+    kw = dict(causal=True, bottom=features, window=64 if features else -1, sink=sink)
+    _check(tensors, _run(tensors, _prefix(lq), _prefix(lk), scale=scale, **kw), lq, lk, scale=scale, **kw)
 
 
 @pytest.mark.L0

@@ -19,7 +19,10 @@ gradient GEMMs and a fold:
                                                           the fp8 row renders its K64 fp8 arm with a descale /
                                                           quantize epilogue)
     stage 4  GQA fold of the per-Q-head dK / dV partials  dkv_reduce_host (half) /
-             (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host (fp8: dV always, dK under GQA)
+             (+ descale, amax, scale, cast on the fp8 row)  fold_quant_host / fold_quant_pair_host (fp8: dV always, dK under
+             GQA -- the two in ONE launch; the partials are fp32 under GQA so the fold rounds once;
+             MXFP8: dkv_reduce_host over fp32 dK partials + bf16 dV partials under GQA -- dK rounded
+             once, dV once per group member)
 
 The workspace is KV-MAJOR (``[.., S_kv, S_q]``, q contiguous) -- the layout the stage-2
 kernel writes without a transpose -- so the stage-3 operand majors are the OPPOSITE of
@@ -110,12 +113,16 @@ quantize passes) -- from device pointers and the caller's workspace, and records
 straight into it (``engines.lower_dsl_bwd*`` -> ``PreparedBwdLaunch``); :meth:`execute` is
 the standalone twin over torch tensors.  No torch op runs on the execute path.
 
-**An externally computed delta (every row, dense plans).**  ``external_delta=True`` at
+**An externally computed delta (every row, every plan).**  ``external_delta=True`` at
 construction declares that the caller hands stage 1's result to ``execute(..., delta_tensor=)``:
-a contiguous fp32 ``[B, H_q, S_q_pad]`` tensor (``external_delta_shape``; ``S_q_pad`` =
-``S_q`` rounded up to the 128-row q tile, zeros past ``S_q``) on the plan's device, 16-B
-aligned, holding ``rowsum(dO * O)`` -- the gated attention block's sigmoid-gate backward
-produces it while it already reads O and dO, in ``dot_do_o``'s own reduction order
+a contiguous fp32 tensor of ``external_delta_shape`` -- ``[B, H_q, S_q_pad]`` on a dense plan
+(``S_q_pad`` = ``S_q`` rounded up to the 128-row q tile, zeros past ``S_q``); on a THD plan the
+PACKED head-major ``[1, H_q, ceil128(T_q)]`` the THD main kernel reads (``T_q`` the plan's token
+capacity -- the declared packed total tightened to the envelope's ``B * S_max``, ``_thd_total`` --,
+zeros past ``T_q``: the dense layout at ``B = 1, S = T_q``, so a dense producer run over the
+packed tokens writes it as is) -- on the plan's device, 16-B aligned, holding
+``rowsum(dO * O)`` -- the gated attention block's sigmoid-gate backward produces it while it
+already reads O and dO, in ``dot_do_o``'s own reduction order
 (``gated_attention_block/kernels/sigmoid_gate_bwd.py``), so the fused and the unfused block are
 bitwise equal.  Under the flag the chain launches no ``dot``, reads O once less, and the
 workspace carve has no ``delta`` region (``scratch_workspace_bytes()`` shrinks by it); the
@@ -137,22 +144,25 @@ on every row: the kernels read them (``0 * NaN``), and under the MXFP8 row's blo
 32-element q block straddling the pad folds them into the REAL columns' E8M0 scale -- device
 data no host check can see.  The ``o`` / ``descale_o`` (fp8) and ``o_f16`` / ``dO_f16``
 (MXFP8) operands stay required under the flag and are read by nothing (append-only ABI; the
-gated block's training record saves O anyway).  Declined under THD on every row: the THD
-chain's delta is PACKED head-major and computed by its own pre-pass, and no producer emits
-the packed layout yet.
+gated block's training record saves O anyway).  Served under THD on every row in the packed
+form above: the appended, standalone-only ``delta`` slot of each THD launch record
+(``prepared_sm107.ROLES_*_THD``), the THD host viewing a caller's tensor from the plan's token
+capacity exactly as it views its own carved region, and the chain's packed ``dot`` not launched.
 
 FP8 (cuDNN ``sdpa_fp8_backward``): the twelve scalar descales / scales are 1-element
 fp32 DEVICE tensors, read by the kernels -- never folded on the host.  Stage 2 consumes
 descale_q/k/v/dO/s, scale_s and scale_dP, publishes ``dS_q = e4m3(dS * scale_dP)`` (dS
-in TRUE units, attn_scale folded) to the e4m3 workspace and its per-Q-head dV in bf16
-(``dtype_o = BF16``: the pre-quantization value), and folds ``amax_dP`` in-kernel over the
+in TRUE units, attn_scale folded) to the e4m3 workspace and its per-Q-head dV_true
+(``dtype_o = FP32`` under GQA -- the fold sums the group's partials in fp32 and rounds
+ONCE; ``BF16`` at MHA, where the fold is a copy + amax), and folds ``amax_dP`` in-kernel over the
 fp32 dS BEFORE the scale and the cast.  The GEMMs render the template's fp8 K64 arm over
 the e4m3 dS and the e4m3 Q / K payloads (no upcast copies) and undo both scalings in their
 epilogue: dQ = ``QUANT`` straight into the caller's dQ (``acc * descale_dP * descale_k``
 -> ``amax_dQ`` -> ``* scale_dQ`` -> the gradient dtype); dK likewise into the caller's dK
-at MHA, or ``DESCALE`` to bf16 per-Q-head TRUE-unit partials under GQA, which stage 4 sums
-in fixed order BEFORE it folds ``amax_dK``, applies ``scale_dK`` and casts.  dV always
-goes through stage 4 (fold + ``amax_dV`` + ``scale_dV`` + cast).  ``FP8_DS_DTYPE = BF16``
+at MHA, or ``DESCALE`` to fp32 per-Q-head TRUE-unit partials under GQA, which stage 4 sums
+in fixed order BEFORE it folds ``amax_dK``, applies ``scale_dK`` and casts -- one rounding, like
+the reference.  dV always goes through stage 4 (fold + ``amax_dV`` + ``scale_dV`` + cast; the dV
+and dK folds share ONE launch under GQA).  ``FP8_DS_DTYPE = BF16``
 restores the pre-quantized chain end to end (bf16 dS, bf16 GEMMs over EXACT e4m3 -> bf16
 upcasts of Q / K, three fold + quantize passes; ``descale_dP`` / ``scale_dP`` unused) --
 the A/B and oracle twin.
@@ -188,9 +198,12 @@ and writes two payloads (``ds_dk`` per 32-q block of a kv row, ``ds_dq`` per 32-
 column) plus their F8_128x4 E8M0 atoms (``sf_ds_dk`` / ``sf_ds_dq``); the stage-3 GEMMs render
 the block-scale arm (``MatmulTemplateParams.block_scale``: dK = ds_dk . q_T with the ``sf_ds_dk``
 atoms as SFA and the columnwise ``sf_q_T`` as SFB, dQ = ds_dq^T . k_T with ``sf_ds_dq`` / ``sf_k_T``),
-dequantizing in the MMA -- no dequant pass, EPI_NONE, bf16 true-unit gradients; a ragged S_q /
-S_kv re-stages the columnwise q_T / k_T scale factors with their pad groups zeroed (the MMA
-reads whole atoms).  Rubin-line only (the arm's 576-column exclusive TMEM).  Its stage-2
+dequantizing in the MMA -- no dequant pass, EPI_NONE, bf16 true-unit gradients (under GQA the dK
+rendering stores its fp32 accumulator -- the per-Q-head partial ``dkv_reduce`` sums in fp32 and rounds
+ONCE, like the reference -- while dV's per-Q-head partials stay bf16, the kernel's epilogue dtype, so
+dV carries one bf16 rounding per group member: the fp32 dV staging does not fit the kernel's 327 KiB
+SMEM); a ragged S_q / S_kv re-stages the columnwise q_T / k_T scale factors with their pad groups
+zeroed (the MMA reads whole atoms).  Rubin-line only (the arm's 576-column exclusive TMEM).  Its stage-2
 workspace chunks against the same ``_SM107_WS_BUDGET_BYTES`` as every other sm107 row (8 GiB: at
 2 + 2/32 bytes per dS element the 8K H=128 head chunk is 32 heads / 4 launches).  **dS policy
 P-c** (``MXFP8_DS_SF_POLICY = DS_SF_P_C``): a bf16 dS
@@ -214,8 +227,9 @@ buffer and the device claim counter, per-sequence clipped dV stores, the kv-BLOC
 workspace (bf16 under P-c, the two block-scaled e4m3 payloads + E8M0 atoms under P-b), the
 stage-3 GEMMs trimmed PER SEQUENCE (P-c: the bf16 renderings over the exactly dequantized
 packed q_T / k_T; P-b: the block-scale arm's THD leg over the kv-blocked payloads + atoms and
-the packed columnwise q_T / k_T scale factors, dQ once per GQA group member as on the dense
-P-b chain) and the GQA fold bounded ON DEVICE at the live kv total.  **The seven scale-factor
+the packed columnwise q_T / k_T scale factors, dQ once per head chunk under GQA as on the dense
+P-b chain: the dQ record's ``b_head_group`` is the group) and the GQA fold bounded ON DEVICE at
+the live kv total.  **The seven scale-factor
 tensors travel PACKED per-sequence-TILE-padded**, the forward's convention
 (``fwd/prepared._bind_mxfp8_scales``): per head, every sequence's ``ceil(s_b / 128)`` F8_128x4
 tiles in cu_seqlens order -- sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``,
@@ -253,7 +267,8 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import TensorDesc
 from cudnn.frost.template_loader import load_template
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16, DTYPE_FP32
+from cudnn.sdpa.bwd import config_d256_2x2 as _cfg2x2
 from cudnn.sdpa.bwd import config_sm107 as _cfg
 from cudnn.sdpa.bwd import prepared_sm107 as _prepared
 from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
@@ -288,6 +303,10 @@ _SM107_TEMPLATE_TAGS = {
     _cfg.FAMILY_FP8: "sdpa_bwd_sm107_main_fp8",
     _cfg.FAMILY_MXFP8: "sdpa_bwd_sm107_main_mxfp8",
 }
+# The 2x2-datapath body (kernels/ level: it serves the SM100 line AND the Rubin twin; frost/README rule 10) and the
+# template tag of its Rubin rendering.  The SM100 row's adapter (api_dsl_sm100_d256) names its own tag.
+_2X2_KERNEL_FILE = "bprop_d256_2x2_f16.py"
+_2X2_TEMPLATE_TAG_SM107 = "sdpa_bwd_sm107_main_2x2"
 _SM107_MM_TAGS = {"dk": "sdpa_bwd_sm107_mm_dk", "dq": "sdpa_bwd_sm107_mm_dq"}
 # The stage-2 dS workspace budget EVERY sm107 row chunks against (``_sm107_chunks``): ONE constant for the half row, the
 # per-tensor fp8 row and both of the MXFP8 row's dS policies.  Above it the (batch, head) chunk shrinks and the chain runs
@@ -350,6 +369,20 @@ FP8_DS_DTYPE: int = DTYPE_E4M3
 # over P-c, both at a 4 GiB stage-2 budget (the main kernel 1.27x / 1.54x the bf16-dS body, both stage-3 GEMMs 1.8x faster and the two
 # dequant passes gone), every accept cell within the fp8 recipe, the dS payloads bit-exact against the oracle's 1x32 quantization.
 MXFP8_DS_SF_POLICY: int = _cfg.DS_SF_POLICY_DEFAULT
+# The Rubin 2x2-datapath twin of the half row's main kernel.  False = the shipped 4x1 body (``sm107/bprop_d256_f16.py``,
+# ``datapath_2x2_profile = 0``: its rendering stays byte-identical).  True = ``kernels/bprop_d256_2x2_f16.py`` at profile
+# 2 (two 64-row sub-blocks per CTA, ``tcgen05.mma.cta_group::2`` M = 128, descriptor version 1) -- the body the SM100
+# ``sdpa_bwd_sm100_d256`` row runs at profile 1, so one fix lands once.  Read at CALL time (``_kernel_file`` /
+# ``_template_params``) like DQ_SINGLE_LAUNCH, and copied INTO the TemplateParams record so it reaches the template
+# source hash (the compiled-plan cache would otherwise serve the other geometry).  A module constant, not a knob and
+# never an env var: it must never differ per plan.  Flips to True only if the Rubin A/B measures <= 1.00x of the 4x1
+# body (design_d256_bprop section 17; the SM100 row does not depend on it).  The fp8 row ignores it (f16 family only).
+BWD_D256_2X2: bool = False
+# Which 2x2 profile the twin runs when ``BWD_D256_2X2`` is on: ``PROFILE_SM107_INTERLEAVED`` (2, the design's Rubin twin:
+# two sub-blocks per CTA, 322 KiB, descriptor version 1) or ``PROFILE_SM100`` (1, the SM100 row's body as-is on Rubin --
+# the bring-up / A/B arm).  A module constant like the switch above (read at CALL time, copied into the TemplateParams
+# record); ``config_d256_2x2.PROFILES`` is the legal set and ``_datapath_2x2_profile`` refuses anything else.
+BWD_D256_2X2_PROFILE: int = _cfg2x2.PROFILE_SM107_INTERLEAVED
 
 
 def _sm107_chunks(b: int, h_q: int, group: int, s_q_pad: int, s_kv_pad: int, bpe_ds: int, budget: int = _SM107_WS_BUDGET_BYTES, batch_chunking: bool = True):
@@ -398,6 +431,7 @@ def _stage3_params(
     gqa_group: int = 1,
     dq_single_launch: Optional[bool] = None,
     block_scale: bool = False,
+    dk_fp32_out: bool = False,
 ):
     """The two stage-3 renderings ``(dK, dQ)`` for the KV-MAJOR ``[S_kv, S_q]`` workspace.
 
@@ -414,15 +448,18 @@ def _stage3_params(
     cluster tile ``_stage3_cgrp_tile_mn`` picked -- required, so a caller cannot fall into the
     padded rendering by omission.  ``dtype_code`` is the dS WORKSPACE dtype (the GEMMs' A
     operand): E4M3 selects the template's fp8 K64 arm, whose epilogue each rendering names in
-    ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> bf16 true-unit partials, ``EPI_QUANT`` -> the
-    quantized gradient in ``dtype_out`` + amax); the half row's bf16 / fp16 records keep
+    ``epi_modes = (dK, dQ)`` (``EPI_DESCALE`` -> fp32 true-unit per-Q-head partials, the GQA fold's
+    single-rounding input; ``EPI_QUANT`` -> the quantized gradient in ``dtype_out`` + amax); the half row's bf16 / fp16 records keep
     ``EPI_NONE`` and the inherited output dtype.  ``gqa_group`` (``H_q / H_kv``) with
     ``dq_single_launch`` (None = the module constant ``DQ_SINGLE_LAUNCH``, read at CALL time so
     the bitwise pin can flip it) sets the dQ record's ``b_head_group``: the group when one launch
     covers a whole head chunk (its B = K is indexed by ``h // group``), 1 for the per-member loop
     and always at MHA -- the dK record's B = Q is per Q head and keeps 1.  ``block_scale`` (appended, default False) renders the MXFP8 block-scale arm
     over an E4M3 dS workspace whose 32-element K blocks carry E8M0 scale atoms (``MatmulTemplateParams.block_scale``): both
-    renderings stay ``EPI_NONE`` (the MMA dequantizes; the accumulator is the true-unit gradient) with the inherited bf16 output.
+    renderings stay ``EPI_NONE`` (the MMA dequantizes; the accumulator is the true-unit gradient) with the inherited bf16 output --
+    unless ``dk_fp32_out`` (appended, default False; needs ``block_scale``), which stores the dK record's D in fp32: the per-Q-head
+    TRUE-unit partial a GQA fold sums in fp32 and rounds ONCE (the fp8 arm's ``EPI_DESCALE`` partial, on the arm whose MMA already
+    dequantized); the dQ record keeps the inherited bf16 (the caller's dQ, per head).
     """
     if trim is None:
         trim = STAGE3_CAUSAL_TRIM
@@ -431,6 +468,11 @@ def _stage3_params(
     if int(gqa_group) < 1:
         raise ValueError(f"sm107 stage 3: gqa_group must be >= 1 (H_q / H_kv); got {gqa_group}")
     dq_b_head_group = int(gqa_group) if (dq_single_launch and int(gqa_group) > 1) else 1
+    if dk_fp32_out and not block_scale:
+        raise ValueError(
+            "sm107 stage 3: dk_fp32_out stores the block-scale arm's fp32 dK partial (its EPI_NONE accumulator is the true-unit value); the "
+            "per-tensor fp8 arm's fp32 partial is EPI_DESCALE's own and the half rows store the io dtype -- pass block_scale=True or leave it False"
+        )
     if window is not None and int(window) <= 0:
         # The template spells "no window" as causal_window == 0, while the kernels' SWA arm at W = 0 keeps exactly one key per
         # row -- the two would disagree on what was written.  Unreachable through the rows (check_support / config_sm107
@@ -451,11 +493,17 @@ def _stage3_params(
         block_scale=bool(block_scale),
     )
     dk_mode, dq_mode = epi_modes
+
+    def _out(mode, fp32_partial=False):
+        # QUANT stores the gradient dtype; DESCALE the fp32 per-Q-head TRUE-unit partial (the GQA fold sums the group in fp32 and
+        # rounds ONCE -- a bf16 partial was rounded a second time by the fold, rel RMS 2.7e-3 vs the reference); NONE inherits --
+        # except the block-scale arm's dK record under ``dk_fp32_out``, whose EPI_NONE accumulator is already the true-unit value and
+        # is stored fp32 for the same fold.
+        return dtype_out if mode == EPI_QUANT else (DTYPE_FP32 if (mode == EPI_DESCALE or fp32_partial) else -1)
+
     return (
-        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=dtype_out if dk_mode == EPI_QUANT else -1, **common),
-        MatmulTemplateParams(
-            a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=dtype_out if dq_mode == EPI_QUANT else -1, b_head_group=dq_b_head_group, **common
-        ),
+        MatmulTemplateParams(a_is_m_major=False, causal_mode=lo, epi_mode=dk_mode, dtype_out=_out(dk_mode, bool(block_scale and dk_fp32_out)), **common),
+        MatmulTemplateParams(a_is_m_major=True, causal_mode=hi, epi_mode=dq_mode, dtype_out=_out(dq_mode), b_head_group=dq_b_head_group, **common),
     )
 
 
@@ -748,16 +796,10 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
                 self.seq_kv_lens_present or self.seq_q_lens_present,
                 f"{n} THD: THD carries its per-sequence lengths in the metadata buffer, not as seq_*_lens_present tensors (mutually exclusive)",
             )
-            # The externally computed delta is a DENSE contract ([B, H_q, S_q_pad] fp32, one row per envelope position): the THD
-            # chain's delta is PACKED head-major at ceil128(T_q) and computed by its own dot_do_o over the packed O / dO, and no
-            # producer emits the packed layout.  Declined typed here, before any plan is built; a delta_tensor at execute is then
-            # refused by the plan-fact check (external_delta=False) -- never silently ignored.
-            self._value_error_if(
-                self.external_delta,
-                f"{n} THD: external_delta is not served on the packed chain -- its delta is dot_do_o over the packed O / dO in the head-major "
-                f"[1, H_q, ceil128(T_q)] layout the THD main kernel reads, and a caller's dense [B, H_q, S_q_pad] delta has no packed twin; "
-                f"build the THD plan without external_delta (the chain launches its own pre-pass)",
-            )
+            # The externally computed delta is SERVED under THD: the contract is the PACKED head-major [1, H_q, ceil128(T_q)] fp32
+            # layout the THD main kernel reads (`external_delta_shape`), which IS the dense [B, H_q, S_q_pad] layout at B = 1, S = T_q
+            # -- a dense producer run over the packed tokens writes it as is, tail included.  The slot is the THD specs' LAST,
+            # standalone-only operand; a delta_tensor of the dense envelope shape is refused by `_check_external_delta`.
             # The declared totals are REQUIRED, and the reason is the workspace: scratch_workspace_bytes() is a BUILD-time function,
             # and the blocked dS row count, delta's row stride and the GQA partials are all fixed from the packed token capacity
             # before any buffer exists.  Undeclared, that capacity falls back to B * S_max -- more tokens than a packed buffer holds.
@@ -839,15 +881,19 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         kv_rows = skvp if self._kv_padded else skv
         gqa = self._gqa_group > 1
         if self.thd:
-            # THD: delta packed head-major at ceil128(T_q) -- always the chain's own (every THD row declines ``external_delta``: a
-            # caller's dense [B, H_q, S_q_pad] delta has no packed twin, ``check_support``); ONE head chunk of the kv-BLOCKED dS
+            # THD: delta packed head-major at ceil128(T_q) -- unless ``external_delta`` (the caller's tensor of that same shape,
+            # ``external_delta_shape``, replaces the region, as on the dense plans); ONE head chunk of the kv-BLOCKED dS
             # workspace; the metadata buffer (5B+5 words) followed by the main kernel's tensor maps on the next 128-B boundary
             # (``tile_dsl.thd.THD_BWD_MAPS_META_WORDS``; the slot count is the body's, ``_thd_map_slots``); stage 3's (B + 1)
             # patched descriptors; then the family's regions over the PACKED token axes (``_thd_family_scratch_shapes``).  No
             # staging (the packed path reads the caller's buffers).
             tq, tkv = self._t_q_cap, self._t_kv_cap
-            plan = [
-                ("delta", (1, h, -(-tq // 128) * 128), torch.float32),
+            plan = []
+            if not self.external_delta:
+                # stage 1's delta, PACKED head-major: [1, H_q, ceil128(T_q)] fp32 -- dot_do_o over the packed O / dO writes the rounded
+                # extent, zeros past T_q.  Under external_delta the caller's tensor of the same shape (`external_delta_shape`) replaces it.
+                plan.append(("delta", self.external_delta_shape, torch.float32))
+            plan += [
                 ("ds_ws", (1, self._qh_chunk, self._ws_rows_cap, sqp), self._ds_dtype),
                 ("seq_kv", (THD_BWD_MAPS_META_WORDS(b, self._thd_map_slots(b)),), torch.int32),
                 ("desc_words", ((b + 1) * 16,), torch.int64),
@@ -913,9 +959,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
 
     @property
     def external_delta_shape(self) -> tuple:
-        """The delta's contract, ``(B, H_q, S_q_pad)``: what stage 1 writes into the workspace region, and what
-        ``execute(delta_tensor=)`` must carry under ``external_delta`` -- fp32, contiguous, zeros on the pad rows
-        ``[S_q, S_q_pad)``, 16-B aligned, on the plan's device."""
+        """The delta's contract: what stage 1 writes into the workspace region, and what ``execute(delta_tensor=)`` must carry
+        under ``external_delta`` -- fp32, contiguous, 16-B aligned, on the plan's device.  Dense: ``(B, H_q, S_q_pad)``, zeros on
+        the pad rows ``[S_q, S_q_pad)``.  THD: the PACKED head-major ``(1, H_q, ceil128(T_q))`` the THD main kernel reads at the
+        packed token index, zeros past ``T_q`` -- the dense layout at ``B = 1, S = T_q``.  ``T_q`` is the plan's TOKEN CAPACITY:
+        the declared packed total tightened to the envelope's ``B * S_max`` (``_thd_total``, a MIN), so an oversized declaration
+        does not widen the shape -- the refusal below names the capacity's shape, never the declaration."""
+        if self.thd:
+            return (1, self.h_q, -(-self._t_q_cap // _SM107_Q_PAD) * _SM107_Q_PAD)
         return (self.batch_size, self.h_q, self._sq_pad)
 
     def _check_external_delta(self, delta_tensor) -> None:
@@ -938,10 +989,20 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             delta_tensor.dtype != torch.float32,
             f"{n}: delta_tensor must be fp32 (the chain's dot_do_o layout), got {delta_tensor.dtype}",
         )
+        # The dense message is unchanged word for word (its regex pins); the THD plan names its packed form instead.
+        layout, note = (
+            (
+                "[1, H_q, ceil128(T_q)]",
+                "the PACKED head-major layout the THD main kernel reads: T_q = the plan's token capacity (the declared packed total, tightened "
+                "to B*S_max), zeros past T_q",
+            )
+            if self.thd
+            else ("[B, H_q, S_q_pad]", f"S_q_pad = S_q rounded up to {_SM107_Q_PAD}, zeros past S_q")
+        )
         self._value_error_if(
             shape != tuple(self.external_delta_shape) or not delta_tensor.is_contiguous(),
-            f"{n}: delta_tensor must be a CONTIGUOUS [B, H_q, S_q_pad] = {self.external_delta_shape} tensor (S_q_pad = S_q rounded up to {_SM107_Q_PAD}, zeros past "
-            f"S_q), got shape {shape} with strides {tuple(delta_tensor.stride())}",
+            f"{n}: delta_tensor must be a CONTIGUOUS {layout} = {self.external_delta_shape} tensor ({note}), got shape {shape} with strides "
+            f"{tuple(delta_tensor.stride())}",
         )
         self._value_error_if(
             not delta_tensor.is_cuda or delta_tensor.device != self.q_desc.device,
@@ -950,6 +1011,35 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._value_error_if(delta_tensor.data_ptr() % 16 != 0, f"{n}: delta_tensor base must be 16-byte aligned, got {delta_tensor.data_ptr():#x}")
 
     # --- compilation -------------------------------------------------------------------
+    def _datapath_2x2_profile(self) -> int:
+        """The main kernel's ``datapath_2x2_profile``: 0 = the shipped 4x1 body; ``BWD_D256_2X2_PROFILE`` (2 = the Rubin
+        interleaved twin, 1 = the SM100 body) when ``BWD_D256_2X2`` is on (both read at CALL time, f16 family only).  The
+        SM100 d256 row overrides this with profile 1."""
+        if not (BWD_D256_2X2 and self._FAMILY == _cfg.FAMILY_F16):
+            return _cfg2x2.PROFILE_OFF
+        if BWD_D256_2X2_PROFILE not in _cfg2x2.PROFILES:
+            raise ValueError(f"api_dsl_sm107.BWD_D256_2X2_PROFILE must be one of {_cfg2x2.PROFILES}; got {BWD_D256_2X2_PROFILE!r}")
+        return BWD_D256_2X2_PROFILE
+
+    def _kernel_file(self) -> str:
+        """The main kernel template, RELATIVE to ``kernels/`` (the 4x1 body of this family, or the 2x2 body under the twin)."""
+        return _2X2_KERNEL_FILE if self._datapath_2x2_profile() != _cfg2x2.PROFILE_OFF else _SM107_KERNEL_FILES[self._FAMILY]
+
+    def _template_tag(self) -> str:
+        return _2X2_TEMPLATE_TAG_SM107 if self._datapath_2x2_profile() != _cfg2x2.PROFILE_OFF else _SM107_TEMPLATE_TAGS[self._FAMILY]
+
+    def _stage3_tile_mn(self, sm: int) -> tuple:
+        """The stage-3 cluster tile: ``_stage3_cgrp_tile_mn`` (the Rubin-line rule; the SM100 d256 row passes its tile explicitly)."""
+        return _stage3_cgrp_tile_mn(sm, _SM107_D)
+
+    @staticmethod
+    def _stage3_gran(mod) -> int:
+        """The stage-3 K-trim granularity = the main kernel's kv WRITE block: ``kv_pad_rows`` of the 4x1 config (its 256-row
+        kv block), ``kv_pad_rows_2x2`` of the 2x2 config (its 256-row kv write PAIR -- NOT its 128-row kv block on profile 1)."""
+        if isinstance(mod.CFG, _cfg2x2.CfgBwdD256x2):
+            return _cfg2x2.kv_pad_rows_2x2(mod.CFG)
+        return _cfg.kv_pad_rows(mod.CFG)
+
     def _template_params(self):
         return _cfg.TemplateParams(
             dtype_qkv=_DTYPE_CODE[self.dtype],
@@ -964,6 +1054,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             # THD: the per-sequence lengths come from the metadata buffer (mutually exclusive with the dense length flags).
             thd_varlen=self.thd,
             dtype_o=self._dtype_o_code(),
+            datapath_2x2_profile=self._datapath_2x2_profile(),
             **self._template_params_family(),
         )
 
@@ -1004,7 +1095,7 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
             _DTYPE_CODE[self._ds_dtype],
             bool(self.is_causal),
             shift,
-            _cfg.kv_pad_rows(mod.CFG),
+            self._stage3_gran(mod),
             cgrp_tile_mn=tile_mn,
             window=window,
             gqa_group=self._gqa_group,
@@ -1022,14 +1113,14 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         self._ensure_support_checked()
         if self._compiled is not None:
             return self._compiled
-        mod = load_template(_sm100_kernel_path(_SM107_KERNEL_FILES[self._FAMILY]), self._template_params(), tag=_SM107_TEMPLATE_TAGS[self._FAMILY])
+        mod = load_template(_sm100_kernel_path(self._kernel_file()), self._template_params(), tag=self._template_tag())
         # The bodies' own geometry guards (tile multiples, chunk divisors) -- cheap, and the plan is wrong if they fire.
         _cfg.validate_head_chunk(self.h_q, self.h_kv, self._qh_chunk)
         # Stage 3 reads the dS workspace in ITS dtype (`_stage3_records`: the io dtype on the half chain; on the fp8 chain the
         # e4m3 workspace through the fp8 K64 arm + its epilogue, or the bf16 twin through the bf16 renderings).
         # The d = 256 cluster tile (no N padding) on the Rubin line; `prepared_sm107._sm` resolves the same device the
         # prepared artifact is compiled for.
-        tile_mn = _stage3_cgrp_tile_mn(_prepared._sm(self), _SM107_D)
+        tile_mn = self._stage3_tile_mn(_prepared._sm(self))
         if self.thd:
             # The per-sequence K-trim reads only tiles the kernel wrote (`_stage3_thd_needs_zero_fill`): no fill under any mask
             # the row serves; the untrimmed twin and the wide-tile twin keep it (`prepared_host.host_f16_thd`).  The persistent
@@ -1116,15 +1207,15 @@ class SdpaBwdDslSm107(SdpaBwdDsl):
         satisfy ``0 <= len <= S_kv`` -- device data, not validated here.  ``delta_tensor``
         (appended) is required exactly when the plan was built with ``external_delta=True``:
         fp32 contiguous ``external_delta_shape`` on the plan's device (module docstring, "An
-        externally computed delta").  The two are independent plan facts: a plan built with
-        both takes both."""
+        externally computed delta"; under THD the PACKED head-major ``[1, H_q, ceil128(T_q)]``).
+        The two are independent plan facts: a plan built with both takes both."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self._check_external_delta(delta_tensor)
         self.compile()
         if self.thd:
-            # The THD plan's two appended slots are the two length tensors; a delta never reaches here (`_check_external_delta`
-            # refused it above: the THD row is built with external_delta=False, `check_support`).
-            tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens)
+            # The THD spec's slots 9 / 10 are the two length tensors, slot 11 the delta (`prepared_sm107.ROLES_F16_THD`): bound exactly
+            # when the plan was built with external_delta (`_check_external_delta` above), None-specialized otherwise.
+            tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_q_lens, seq_kv_lens, delta_tensor)
         else:
             tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor, seq_kv_lens, delta_tensor)
         _prepared.execute_standalone(self, tensors, workspace, current_stream, scale_softmax)
@@ -1203,8 +1294,9 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         for name, desc in (("k", self.k_desc), ("v", self.v_desc), ("o", self.o_desc), ("dO", self.do_desc)):
             self._value_error_if(desc.dtype != self.dtype, f"{n}: {name} is an FP8 payload and must share Q's dtype {self.dtype}; got {desc.dtype}")
         # Bottom-right causal at a ragged S_q is served: the body takes the REAL q length (``seqlen_q_real``) for the diagonal and
-        # the q-tile trim (``Capabilities.bottom_right_s_q_multiple = 1``).  The external delta is served DENSE (TRUE units,
-        # module doc) and declined under THD by the shared check_support.
+        # the q-tile trim (``Capabilities.bottom_right_s_q_multiple = 1``).  The external delta is served on both forms (TRUE
+        # units, module doc): dense ``[B, H_q, S_q_pad]`` and, under THD, the PACKED head-major ``[1, H_q, ceil128(T_q)]``; the
+        # shared check_support keeps the two-directional plan-fact guard (``_check_external_delta``).
         if self.thd and not self._ds_fp8:
             # The bf16-dS twin upcasts Q / K exactly (e4m3 -> bf16) over COMPACT packed rows -- ``prepared_host._cast_fp8_to_bf16``
             # walks ``T * H * D`` contiguous elements -- so a padded token stride (admitted by the packed-rows rule) would scramble
@@ -1217,9 +1309,23 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
                     f"exact e4m3 -> bf16 upcast; got token stride {int(desc.stride[2])} -- the shipped e4m3-dS chain serves any packed stride",
                 )
 
+    @property
+    def _fp32_partials(self) -> bool:
+        """The per-Q-head dK / dV partials are fp32 under GQA on the e4m3-dS chain: the fold sums the group's partials in fp32 and
+        rounds ONCE (a bf16 partial is rounded a second time by the fold -- relative RMS 2.7e-3 on dK / dV vs the reference under GQA,
+        0 under MHA).  At MHA the dV fold is a copy + amax (bitwise whatever the partial dtype) and dK is quantized in the GEMM, so the
+        partials stay bf16 -- the same kernels and bits as before.  The bf16-dS twin keeps bf16 partials on every path: its 96 KiB dS
+        ring leaves no room for the main kernel's 128 KiB fp32 dV staging (``config_sm107.smem_layout``), and its bf16 renderings
+        store the io dtype."""
+        return self._ds_fp8 and self.h_q // max(self.h_kv, 1) > 1
+
+    @property
+    def _partial_dtype(self):
+        return torch.float32 if self._fp32_partials else torch.bfloat16
+
     def _dtype_o_code(self) -> int:
-        # Stage 2 publishes dV in bf16 (the pre-quantization value) for the fold + quantize pass.
-        return DTYPE_BF16
+        # Stage 2 publishes dV_true for the fold + quantize pass: fp32 under GQA (summed and rounded once by the fold), bf16 otherwise.
+        return DTYPE_FP32 if self._fp32_partials else DTYPE_BF16
 
     def _ds_torch_dtype(self):
         """e4m3 (``FP8_DS_DTYPE = DTYPE_E4M3``, shipped: dS_q = e4m3(dS * scale_dP) for the fp8 GEMM arm) or bf16 (the twin)."""
@@ -1236,13 +1342,13 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
 
     def _stage3_records(self, mod, tile_mn):
         """e4m3 dS: the fp8 K64 arm -- dQ ``EPI_QUANT`` into the caller's dQ (amax_dQ in the epilogue); dK ``EPI_QUANT``
-        into the caller's dK at MHA, ``EPI_DESCALE`` (bf16 true-unit per-Q-head partials, quantized AFTER the GQA fold)
+        into the caller's dK at MHA, ``EPI_DESCALE`` (fp32 true-unit per-Q-head partials, summed and quantized ONCE by the GQA fold)
         otherwise.  bf16 dS: the bf16 renderings, no epilogue (stage 4 folds + quantizes all three).  Dense: the bottom-right
         shift and the window as the half row spells them (the window dropped from the trim under per-batch kv lengths with
         bottom-right, ``_stage3_trim_window``).  THD: the same renderings with the half row's THD arm (``thd_varlen`` +
         ``thd_rows_kv``, the per-sequence diagonal as ``thd_causal_bottom_right``, the constant shift 0, the window KEPT: the
         per-sequence trim anchors it on the sequence's own diagonal exactly as the kernel does)."""
-        gran = _cfg.kv_pad_rows(mod.CFG)
+        gran = self._stage3_gran(mod)
         if self.thd:
             shift, window = 0, self.window_size_left
         else:
@@ -1274,15 +1380,16 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         )
 
     def _thd_family_scratch_shapes(self, tq: int, tkv: int, gqa: bool):
-        """The fp8 row's THD regions over the PACKED token capacities: stage 2's bf16 per-Q-head dV_true partials ALWAYS (dV takes
-        the fold + quantize pass whatever the group), the e4m3-dS chain's bf16 dK partials under GQA, the bf16-dS twin's partials,
-        dQ workspace and exact upcasts, and the amax scratch -- the dense ``_family_scratch_shapes`` with B = 1 and the token
-        capacities for the row extents (every fold pass stops at the live total on device)."""
+        """The fp8 row's THD regions over the PACKED token capacities: stage 2's per-Q-head dV_true partials ALWAYS (dV takes
+        the fold + quantize pass whatever the group; fp32 under GQA, bf16 at MHA -- ``_partial_dtype``), the e4m3-dS chain's fp32 dK
+        partials under GQA, the bf16-dS twin's bf16 partials, dQ workspace and exact upcasts, and the amax scratch -- the dense
+        ``_family_scratch_shapes`` with B = 1 and the token capacities for the row extents (every fold pass stops at the live total
+        on device)."""
         h, hkv, d = self.h_q, self.h_kv, _SM107_D
-        plan = [("dv_part", (1, tkv, h, d), torch.bfloat16)]
+        plan = [("dv_part", (1, tkv, h, d), self._partial_dtype)]
         if self._ds_fp8:
             if gqa:
-                plan.append(("dk_part", (1, tkv, h, d), torch.bfloat16))
+                plan.append(("dk_part", (1, tkv, h, d), self._partial_dtype))
         else:
             plan += [
                 ("dk_part", (1, tkv, h, d), torch.bfloat16),  # stage 3's per-Q-head dS . Q8 (descale_q pending)
@@ -1295,12 +1402,12 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
         b, h, hkv, sq, skv, d = self.batch_size, self.h_q, self.h_kv, self.s_q_max, self.s_k_max, _SM107_D
-        plan = [("dv_part", (b, kv_rows, h, d), torch.bfloat16)]  # stage 2's per-Q-head dV_true, bf16
+        plan = [("dv_part", (b, kv_rows, h, d), self._partial_dtype)]  # stage 2's per-Q-head dV_true: fp32 under GQA, bf16 at MHA
         if self._ds_fp8:
             # e4m3 dS: the GEMMs read the e4m3 payloads directly and quantize dQ (and MHA dK) in their epilogue; only the
-            # GQA dK partials (bf16, TRUE units: EPI_DESCALE) go through stage 4.
+            # GQA dK partials (fp32, TRUE units: EPI_DESCALE) go through stage 4, which rounds the group's sum once.
             if gqa:
-                plan.append(("dk_part", (b, kv_rows, h, d), torch.bfloat16))
+                plan.append(("dk_part", (b, kv_rows, h, d), self._partial_dtype))
         else:
             plan += [
                 ("dk_part", (b, kv_rows, h, d), torch.bfloat16),  # stage 3's per-Q-head dS . Q8 (descale_q pending)
@@ -1362,8 +1469,8 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         ``seq_kv_lens_present=True`` (every entry ``0 <= len <= S_kv``, the K / V rows past it
         FINITE -- device data, not validated here); ``delta_tensor`` (appended) exactly when it
         was built with ``external_delta=True``: fp32 contiguous ``external_delta_shape`` in TRUE
-        units (module doc).  Under THD both length tensors are required instead and no delta is
-        taken."""
+        units (module doc; under THD the PACKED head-major ``[1, H_q, ceil128(T_q)]``).  Under THD
+        both length tensors are required in place of the per-batch kv lengths."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
         self._check_external_delta(delta_tensor)
         given = dict(
@@ -1392,8 +1499,9 @@ class SdpaBwdDslSm107Fp8(SdpaBwdDslSm107):
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
         quant = tuple(given[name] for name in _prepared.FP8_SCALARS) + tuple(amaxes[name] for name in _prepared.FP8_AMAX)
         if self.thd:
-            # The THD spec's slots 9 / 10 are the two length tensors, then the scalars and the amax (`prepared_sm107.ROLES_FP8_THD`).
-            tensors += (seq_q_lens, seq_kv_lens) + quant
+            # The THD spec's slots 9 / 10 are the two length tensors, then the scalars and the amax, then the delta LAST (slot 27,
+            # `prepared_sm107.ROLES_FP8_THD`): bound exactly when the plan was built with external_delta, None-specialized otherwise.
+            tensors += (seq_q_lens, seq_kv_lens) + quant + (delta_tensor,)
         else:
             # The dense spec's two appended slots (25 / 26) follow the scalars and the amax (`prepared_sm107.ROLES_FP8`).
             tensors += quant + (seq_kv_lens, delta_tensor)
@@ -1510,6 +1618,20 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
     def _ds_block_scaled(self) -> bool:
         """True under the P-b chain: two 1x32-scaled e4m3 dS payloads + E8M0 atoms into the block-scale stage-3 GEMM arm."""
         return self._ds_policy == _cfg.DS_SF_P_B
+
+    @property
+    def _dk_part_fp32(self) -> bool:
+        """The per-Q-head dK partials are fp32 under GQA on the block-scaled chain: the dK GEMM's EPI_NONE store is the true-unit fp32
+        accumulator (the MMA dequantizes), so the fold's fixed-order fp32 sum of the group rounds ONCE, like the reference (a bf16
+        partial is rounded a second time by the fold -- relative RMS 2.7e-3 vs the reference under GQA, measured on the per-tensor fp8
+        row before it moved to fp32 partials; 0 under MHA).  At MHA the GEMM writes the caller's bf16 dK (no partial), and the
+        bf16-dS twin's bf16 renderings store the io dtype on every path.  dV's per-Q-head partials stay bf16 on both chains: the main
+        kernel stores them from its epilogue and the fp32 staging does not fit its 327 KiB SMEM -- dV carries one bf16 rounding per
+        group member.  The ONE adapter-side spelling of the fact: the stage-3 record (``_stage3_records``) and the two carves
+        (``_family_scratch_shapes`` / ``_thd_family_scratch_shapes``) read it, and the host derives the same predicate from the facts
+        it already holds (``prepared_host.host_mxfp8`` / ``host_mxfp8_thd``: the policy and the group), so the record, the carve and
+        the view cannot disagree."""
+        return self._ds_block_scaled and self._gqa_group > 1
 
     # --- geometry ------------------------------------------------------------------
     def _initialize_implementation(self) -> None:
@@ -1693,7 +1815,11 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         """P-c: the base class's bf16 renderings over the bf16 dS.  P-b: the block-scale arm (``MatmulTemplateParams.block_scale``)
         over the e4m3 payloads -- dK reads ``ds_dk`` [kv, q] K-major with the ``sf_ds_dk`` atoms, dQ reads ``ds_dq`` as [q, kv]
         M-major with ``sf_ds_dq``; B is the columnwise q_T / k_T payload with its D-plane-major SF.  EPI_NONE on both (the MMA
-        dequantizes; the fp32 accumulator is the true-unit gradient, stored bf16)."""
+        dequantizes; the fp32 accumulator is the true-unit gradient): dQ stored bf16 (the caller's dQ, per head); dK stored fp32 under
+        GQA (``_dk_part_fp32``: the per-Q-head partial the fold sums and rounds once) and bf16 at MHA (the caller's dK).  dQ once per
+        head chunk under GQA exactly like the plain renderings (``b_head_group = group`` through ``DQ_SINGLE_LAUNCH``, read at call
+        time): the template indexes B AND its scale-factor descriptor by ``h // b_head_group``, the host windows the SFB view to the
+        chunk's kv heads (``prepared_host._stage3_block_scale``), and the single launch is bitwise the per-member launches."""
         if not self._ds_block_scaled:
             return super()._stage3_records(mod, tile_mn)  # the bf16 renderings, dense or the half row's THD arm
         if self.thd:
@@ -1703,8 +1829,9 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             shift = (self.s_k_max - self.s_q_max) if (self.is_causal and self.causal_bottom_right) else 0
             # Per-batch kv lengths under bottom-right read the plain bottom-right band: the window edge is the kernel's alone.
             window = _stage3_trim_window(self.window_size_left, bool(self.is_causal), bool(self.causal_bottom_right), bool(self.seq_kv_lens_present))
-        # The block-scale arm launches dQ once per GQA group member (its SFB descriptor is indexed per A / C head), so its dQ record
-        # keeps b_head_group == 1 whatever DQ_SINGLE_LAUNCH says; the single launch is the plain renderings' form (a follow-up here).
+        # The block-scale arm's dQ record takes the GQA group like the plain renderings (`dq_single_launch=None` = the module constant
+        # DQ_SINGLE_LAUNCH, read at call time so the bitwise pin can flip it): the SFB load uses the same grouped head coordinate as the
+        # B load (`_b_head`), so one launch over the whole dS / atom / dQ chunk pairs every Q head with its K head and its K scales.
         p_dk, p_dq = _stage3_params(
             DTYPE_E4M3,
             bool(self.is_causal),
@@ -1714,7 +1841,8 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
             window=window,
             block_scale=True,
             gqa_group=self._gqa_group,
-            dq_single_launch=False,
+            dq_single_launch=None,
+            dk_fp32_out=self._dk_part_fp32,
         )
         if not self.thd:
             return p_dk, p_dq
@@ -1740,8 +1868,8 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         bytes are READ: ``sf_v`` / ``sf_do`` / ``sf_do_T`` always (the main kernel's dP / dV operands), ``sf_q_T`` / ``sf_k_T`` under P-b
         (the block-scale GEMMs read whole atoms; P-c dequantizes per token and never touches a pad byte); the P-b chain's second
         payload and two atom tensors over the kv-BLOCKED rows, or the P-c chain's exactly dequantized bf16 ``q_T`` / ``k_T`` over the
-        packed tokens; the per-Q-head dK / dV partials under GQA (the bounded fold writes the caller's dK / dV at the live rows:
-        no fold staging, no padding copy-out)."""
+        packed tokens; the per-Q-head dK / dV partials under GQA -- dK fp32 on the block-scaled chain (``_dk_part_fp32``), dV bf16 --
+        (the bounded fold writes the caller's dK / dV at the live rows: no fold staging, no padding copy-out)."""
         b, h, hkv, d = self.batch_size, self.h_q, self.h_kv, _SM107_D
         sqp, rcap, hc = self._sq_pad, self._ws_rows_cap, self._qh_chunk
         plan = [("sf_meta", (STAGE3_THD_SF_META_WORDS(b),), torch.int32)]
@@ -1762,7 +1890,7 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         else:
             plan += [("q_T_bf16", (1, tq, h, d), torch.bfloat16), ("k_T_bf16", (1, tkv, hkv, d), torch.bfloat16)]
         if gqa:
-            plan += [("dv_part", (1, tkv, h, d), self.out_dtype), ("dk_part", (1, tkv, h, d), self.out_dtype)]
+            plan += [("dv_part", (1, tkv, h, d), self.out_dtype), ("dk_part", (1, tkv, h, d), torch.float32 if self._dk_part_fp32 else self.out_dtype)]
         return plan
 
     def _family_scratch_shapes(self, kv_rows: int, gqa: bool):
@@ -1803,11 +1931,12 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         else:
             # Stage 3's B operands: the columnwise q_T / k_T dequantized EXACTLY to bf16 (real extents).
             plan += [("q_T_bf16", (b, sq, h, d), torch.bfloat16), ("k_T_bf16", (b, skv, hkv, d), torch.bfloat16)]
-        # stage 2's dV per Q head: the caller's dV only when MHA and no kv padding; stage 3's dK per Q head: the caller's dK when MHA.
+        # stage 2's dV per Q head (bf16, the kernel's epilogue dtype): the caller's dV only when MHA and no kv padding; stage 3's dK per
+        # Q head: the caller's dK when MHA, else the partial -- fp32 on the block-scaled chain (``_dk_part_fp32``: the fold rounds once).
         if gqa or self._kv_padded:
             plan.append(("dv_part", (b, kv_rows, h, d), self.out_dtype))
         if gqa:
-            plan.append(("dk_part", (b, kv_rows, h, d), self.out_dtype))
+            plan.append(("dk_part", (b, kv_rows, h, d), torch.float32 if self._dk_part_fp32 else self.out_dtype))
             if self._kv_padded:
                 plan += [("dk_fold", (b, kv_rows, hkv, d), self.out_dtype), ("dv_fold", (b, kv_rows, hkv, d), self.out_dtype)]
         return plan
@@ -1856,8 +1985,9 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         ``do_tensor`` the rowwise e4m3 dO; the SF tensors are the F8_128x4 uint8 blobs (byte count checked, dims free).
         ``seq_kv_lens`` ([B] int32) is required exactly when the plan was built with ``seq_kv_lens_present=True`` (the K / V
         rows past a length FINITE -- device data, not validated here); ``delta_tensor`` (appended) exactly when it was built with
-        ``external_delta=True``: fp32 contiguous ``external_delta_shape``, zeros past ``S_q`` (module doc).  Under THD both length
-        tensors are required instead and no delta is taken; the SF tensors are the PACKED per-sequence-tile-padded blobs whose
+        ``external_delta=True``: fp32 contiguous ``external_delta_shape``, zeros past ``S_q`` (module doc; under THD the PACKED
+        head-major ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``).  Under THD both length tensors are required in place of the
+        per-batch kv lengths; the SF tensors are the PACKED per-sequence-tile-padded blobs whose
         live tile count is derived from their byte size per call (whole tile rows, one count per side, at most the plan's
         capacity -- each a typed ``ValueError`` at bind)."""
         self._refuse_unclaimed(seq_q_lens, seq_kv_lens, sink_tensor, dsink_tensor, bias_tensor, dbias_tensor)
@@ -1880,8 +2010,9 @@ class SdpaBwdDslSm107Mxfp8(SdpaBwdDslSm107):
         self.compile()
         tensors = (q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, stats_tensor, dq_tensor, dk_tensor, dv_tensor)
         if self.thd:
-            # The THD spec's slots 9 / 10 are the two length tensors, then the payloads and the packed SF blobs (`prepared_sm107.ROLES_MXFP8_THD`).
-            tensors += (seq_q_lens, seq_kv_lens) + tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
+            # The THD spec's slots 9 / 10 are the two length tensors, then the payloads and the packed SF blobs, then the delta LAST
+            # (slot 22, `prepared_sm107.ROLES_MXFP8_THD`): bound exactly when the plan was built with external_delta.
+            tensors += (seq_q_lens, seq_kv_lens) + tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF) + (delta_tensor,)
         else:
             tensors += tuple(extras[name] for name in _prepared.MXFP8_PAYLOADS + _prepared.MXFP8_SF)
             # The two appended slots (20 / 21): the per-batch kv lengths, then the delta (`prepared_sm107.ROLES_MXFP8`).
@@ -1896,6 +2027,8 @@ __all__ = [
     "FP8_DS_DTYPE",
     "MXFP8_DS_SF_POLICY",
     "DQ_SINGLE_LAUNCH",
+    "BWD_D256_2X2",
+    "BWD_D256_2X2_PROFILE",
     "STAGE3_CAUSAL_TRIM",
     "STAGE3_D256_TILE",
     "_stage3_needs_zero_fill",

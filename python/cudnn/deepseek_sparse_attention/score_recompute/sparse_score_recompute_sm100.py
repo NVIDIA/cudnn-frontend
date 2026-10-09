@@ -213,7 +213,7 @@ class SparseScoreRecomputeSm100:
         mPerHead: cute.Tensor,  # (bs, seqlen_q, n_heads_q) — W (BF16) or LSE (FP32)
         mTopkIdx: cute.Tensor,  # (bs, seqlen_q, topk) INT32
         mOut: cute.Tensor,  # (bs, seqlen_q, topk) FP32
-        mTopkLength: cute.Tensor,  # (bs, seqlen_q) INT32 (dummy when unused)
+        mTopkLength: cute.Tensor | None,  # (bs, seqlen_q) INT32; None (compiled out) unless have_topk_length
         softmax_scale: Float32 | float,
         stream: cuda.CUstream,
     ):
@@ -304,8 +304,10 @@ class SparseScoreRecomputeSm100:
         # --- Output layout: (bs, seqlen_q, topk) -> (seqlen_q, topk, bs) ---
         mOut = cute.make_tensor(mOut.iterator, cute.select(mOut.layout, mode=[1, 2, 0]))
 
-        # --- TopkLength layout: (bs, seqlen_q) -> (seqlen_q, bs) ---
-        mTopkLength = cute.make_tensor(mTopkLength.iterator, cute.select(mTopkLength.layout, mode=[1, 0]))
+        # --- TopkLength layout: (bs, seqlen_q) -> (seqlen_q, bs); the slot is
+        # compiled out (None at compile and launch) when have_topk_length is False ---
+        if const_expr(mTopkLength is not None):
+            mTopkLength = cute.make_tensor(mTopkLength.iterator, cute.select(mTopkLength.layout, mode=[1, 0]))
 
         # --- Grid and kernel dispatch (CLC persistent scheduling) ---
         seqlen_q_packed = cute.size(mQ.shape[0])
@@ -966,7 +968,7 @@ class SparseScoreRecomputeSm100:
         mK: cute.Tensor,
         sK_slice: cute.Tensor,
         mTopkIdx: cute.Tensor,
-        mTopkLength: cute.Tensor,
+        mTopkLength: cute.Tensor | None,
         copy_atom: cute.CopyAtom,
         thr_copy: cute.TiledCopy,
         n_block: Int32,

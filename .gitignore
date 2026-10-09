@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# cuDNN FE test harness: per-run FROST routing tallies (test/python/conftest.py removes a run's directory at its end)
+test/python/.frost_routing*/

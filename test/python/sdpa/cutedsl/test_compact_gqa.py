@@ -333,8 +333,14 @@ def test_ds_budget_resize_is_atomic(monkeypatch):
 
 @pytest.mark.L0
 def test_default_stream_context(monkeypatch):
-    """Never wrap default-stream sentinels in ExternalStream."""
-    cls = api_class()
+    """Validate stream interop without compiling an architecture-specific kernel."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("CompactGqaBackward requires CuTe DSL >=4.7.0")
+    from cudnn.sdpa.bwd.compact_gqa import CompactGqaBackward as cls
+
     plan = cls.__new__(cls)
     plan.device, plan._stream = torch.device("cuda", torch.cuda.current_device()), None
     default = torch.cuda.default_stream(plan.device)
@@ -345,9 +351,12 @@ def test_default_stream_context(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "ExternalStream", unexpected_external)
     with torch.cuda.stream(torch.cuda.Stream()):
-        for handle in (0, 1, 2, default.cuda_stream):
+        for handle in (0, 1, default.cuda_stream):
             with plan._context(handle):
                 assert torch.cuda.current_stream(plan.device) == default
+        with pytest.raises(ValueError, match="cudaStreamPerThread"):
+            with plan._context(2):
+                raise AssertionError("unsupported per-thread context was entered")
 
 
 @pytest.mark.L0

@@ -3,7 +3,7 @@
 
 """``cudnn._torch_stream``: the one place a raw stream handle becomes a torch stream (Rule 5).
 
-Default-stream sentinels (0, cudaStreamLegacy, cudaStreamPerThread) and torch's own
+Legacy default-stream sentinels (0, cudaStreamLegacy) and torch's own
 default stream map to ``torch.cuda.default_stream``; torch's current stream maps to
 itself; only a genuine side stream is wrapped in ``torch.cuda.ExternalStream``.
 """

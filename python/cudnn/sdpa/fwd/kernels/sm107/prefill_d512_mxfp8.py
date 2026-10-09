@@ -112,6 +112,10 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d512_mxfp8
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d512_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/prefill_d128_mxfp8 and sm107/prefill_d256_mxfp8)"
+    )
 CFG, _TMA = make_cfg_d512_mxfp8(PARAMS)
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
@@ -233,6 +237,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     fp32_to_fp8_pack,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
+from cudnn.frost.tile_dsl import softmax_f16 as _softmax_f16
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
 from cudnn.frost.tile_dsl.tma import (
     tma_load_tile,
@@ -282,6 +287,28 @@ else:
 # E8M0 SF byte; mirrors d256_mxfp8.py).
 MMA_KIND = nvvm.MMABlockScaleKind.MXF8F6F4
 SCALE_VEC_SIZE = nvvm.Tcgen05MMAScaleVecSize.BLOCK32
+
+# Softmax levers (TemplateParams.softmax_f16 / softmax_scale_prefolded), honored in the sg0 softmax body
+# (`_sg0_softmax_kv_iter`).  The arms themselves live in cudnn.frost.tile_dsl.softmax_f16, shared with the d128 /
+# d192x128 / d256 quantized siblings; this body only picks the unit (16 scores = one 16-B P vector) and the row-sum.
+# softmax_f16 (softmax_precision=HALF): the exponent runs as MUFU EX2.F16x2 on packed pairs and P casts straight
+# from f16x2 to the FP8 pair format (half the MUFU issues of the f32 chain).  This kernel normalizes O with a
+# REGISTER row-sum (no ones-MMA), so the stats-less HALF arm sums the f16x2 P words it stores (the HADD2 pair tree
+# of softmax_f16.f16_pairs_sum_pair -- self-consistent with the P the BMM2 consumes, below the FP8 cast noise) and
+# the Stats specialization keeps the exact f32 sum (a second, f32 exp2 of the shifted scores) for O and the LSE:
+# HALF + Stats is honored, not faster.
+SOFTMAX_F16 = int(PARAMS.softmax_f16)
+# softmax_scale_prefolded: the caller multiplied Q by attn_scale * log2(e), so the raw QK^T already sits in the
+# log2 domain -- the running max is the RAW tile max and the per-score shift is S - m (no multiply).  scale_log2
+# stays in every signature as a dead runtime argument (the adapter pins it to 1.0).  The published Stats, the
+# sink fold and the empty-row selects of the sg1 epilogue consume the log2-domain max exactly as before.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+# With BOTH set and no Stats, the shift and the f32 -> f16x2 convert fuse into ONE instruction per pair (FHADD2
+# .FTZ.RZ on the RAW scores; softmax_f16.FUSED_SHIFT_CVT_AVAILABLE probes the DSL op, a DSL without it falls back
+# to the unfused HALF arm).  The Stats specialization never takes the fused arm: it needs the shifted f32 scores
+# for the exact denominator.  Keep the constant's name -- the tests read it off the loaded module.
+_FUSED_SHIFT_CVT = bool(SOFTMAX_F16 and SCALE_PREFOLDED and _softmax_f16.FUSED_SHIFT_CVT_AVAILABLE)
+_FP8_TAG_P = _softmax_f16.fp8_pair_tag(CFG.DTYPE_QKV)
 
 
 # DTYPE_O is independent of DTYPE_QKV (C++ Cfg::DTYPE_O — defaults to DTYPE_QKV
@@ -1231,6 +1258,7 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 @cute.jit
 def _sg0_softmax_kv_iter(
     apply_mask: cutlass.Constexpr[bool],
+    has_lse: cutlass.Constexpr[bool],
     kv_loop,
     # State (threaded, returned updated):
     sg0_xfer_state,
@@ -1312,7 +1340,20 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
-    current_max = current_max_raw * scale_log2
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Raw-domain max (Q carries attn_scale * log2(e)).  A fully-masked tile leaves it exactly at the finite mask
+        # sentinel (== NEG_INF_F32), so is_first re-fires on consecutive keyless tiles (alpha = 0) where the scaled
+        # path runs alpha = 1 between them; both publish P = exp2(0) = 1 there, the first live tile wipes the
+        # accumulator (sg1's rescale multiplies a finite O by 0), and keyless rows are overridden by the epilogue's
+        # _row_empty select -- same O either way.
+        current_max = current_max_raw
+    else:
+        # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF_F32), as the pre-folded
+        # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
+        # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
+        # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
+        # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves.
+        current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)
 
     # Online softmax (RESCALE_THRESHOLD skip).
     old_total_max = total_max
@@ -1334,14 +1375,6 @@ def _sg0_softmax_kv_iter(
     )
     alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max; then exp2.  Keep the FP32
-    # RegTile (slice via .vec slicing) and cast each chunk to FP8 inside the
-    # P_TMA_ITERS loop — RegTile(Float8E4M3FN) is illegal at JIT, but slicing
-    # the FP32 RegTile then casting the slice is fine (per d256_fp8 pattern).
-    reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
-    reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
-    reg_P_tile = RegTile(reg_P_fp32, size=CFG.TILE_N)
-
     # ---- Write P[tid, :] to SMEM xfer ring slot[parity] (K1 swizzle hoist + K2 fp8 pack) ----
     # K1: the Swizzle(3,4,3) XOR term of every 16-B vector of this lane's P row is LOOP-INVARIANT: the swizzle XORs bits
     # [7,10) of the byte address into bits [4,7), and for address = sP_xfer + slot*pXferBytes + chunk*P_BLOCK_BYTES +
@@ -1355,24 +1388,74 @@ def _sg0_softmax_kv_iter(
     # K2: `pointwise.fp32_to_fp8_pack` (4 x cvt.rn.satfinite.e4m3x2.f32 -> 4 Int32 words in memory byte order) instead of
     # `Vector.to(Float8E4M3FN)` on the RegTile slice, whose lowering re-packed the last word of the slice through 7 PRMT +
     # LOP3.  The words are BITCAST to the storage dtype (a value cast would convert the integers) and stored as 16-B vectors.
+    # The exponent arm is a trace-time choice (SOFTMAX_F16 / SCALE_PREFOLDED / has_lse); every arm feeds the SAME
+    # bitcast + 16-B vector store at p_row_offs[k] below, so the slot layout, the DSMEM ship and the BMM2
+    # descriptor never see the difference.
     p_xfer_slot = sP_xfer_raw.subview(cur_parity_S * cutlass.Int32(pXferElems))
-    for chunk in cutlass.range_constexpr(P_TMA_ITERS):
-        chunk_P_fp32 = reg_P_tile[chunk * P_D_BLOCK : (chunk + 1) * P_D_BLOCK].vec
-        for k in cutlass.range_constexpr(P_VECS_PER_CHUNK):
-            vals = []
-            for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
-                vals.append(chunk_P_fp32[k * P_ELEMS_PER_VEC + i])
-            vec_fp8 = fp32_to_fp8_pack(vals, dtype=P_STORAGE_DTYPE).bitcast(P_STORAGE_DTYPE)
-            dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
-            dst.store(vec_fp8, alignment=P_VEC_BYTES)
+    if cutlass.const_expr(SOFTMAX_F16):
+        # HALF arms.  P is packed per 16-B vector, so the unit is 16 scores: softmax_f16.f16_exp_values returns
+        # the vector's 4 FP8 words (fp32_to_fp8_pack byte order) plus its 8 f16x2 P words, gathered over the
+        # kv-step for the stats-less register row-sum.
+        if cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse):
+            # Fused arm (stats-less): the RAW scores go straight into FHADD2 -- (S - m) and the f32 -> f16x2
+            # convert in one instruction per pair.  No shifted f32 copy exists.
+            src_tile = reg_S_tile
+        else:
+            if cutlass.const_expr(SCALE_PREFOLDED):
+                reg_S_shifted = reg_S_tile.vec - total_max
+            else:
+                reg_S_shifted = reg_S_tile.vec * scale_log2 - total_max
+            src_tile = RegTile(reg_S_shifted, size=CFG.TILE_N)
+        p_pairs = []
+        for chunk in cutlass.range_constexpr(P_TMA_ITERS):
+            chunk_vals = src_tile[chunk * P_D_BLOCK : (chunk + 1) * P_D_BLOCK].vec
+            for k in cutlass.range_constexpr(P_VECS_PER_CHUNK):
+                vals = []
+                for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
+                    vals.append(chunk_vals[k * P_ELEMS_PER_VEC + i])
+                if cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse):
+                    words, pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC, fused_m=total_max)
+                else:
+                    words, pairs = _softmax_f16.f16_exp_values(vals, _FP8_TAG_P, P_ELEMS_PER_VEC)
+                p_pairs.extend(pairs)
+                vec_fp8 = cutlass.Vector.from_elements(tuple(words), cutlass.Int32).bitcast(P_STORAGE_DTYPE)
+                dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
+                dst.store(vec_fp8, alignment=P_VEC_BYTES)
+        if cutlass.const_expr(has_lse):
+            # Stats: the EXACT f32 row-sum -- the published LSE's denominator and, on this register-sum kernel,
+            # O's too -- from a second, f32 exp2 of the shifted scores; the f16 P words above feed the BMM2 only.
+            iter_sum_pair = row_reduction_pair(cute.math.exp2(reg_S_shifted, fastmath=True))
+        else:
+            # Stats-less: the HADD2 pair tree over the 64 P words this lane just stored (self-consistent with
+            # the P the BMM2 consumes).
+            iter_sum_pair = _softmax_f16.f16_pairs_sum_pair(p_pairs)
+    else:
+        # f32 chain: reg_S = reg_S * scale_log2 - total_max (S - total_max under the fold); then exp2.  Keep the
+        # FP32 RegTile (slice via .vec slicing) and cast each 16-elem unit to FP8 -- RegTile(Float8E4M3FN) is
+        # illegal at JIT, but slicing the FP32 RegTile then casting the slice is fine (per d256_fp8 pattern).
+        if cutlass.const_expr(SCALE_PREFOLDED):
+            reg_S_scaled = reg_S_tile.vec - total_max
+        else:
+            reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+        reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
+        reg_P_tile = RegTile(reg_P_fp32, size=CFG.TILE_N)
+        for chunk in cutlass.range_constexpr(P_TMA_ITERS):
+            chunk_P_fp32 = reg_P_tile[chunk * P_D_BLOCK : (chunk + 1) * P_D_BLOCK].vec
+            for k in cutlass.range_constexpr(P_VECS_PER_CHUNK):
+                vals = []
+                for i in cutlass.range_constexpr(P_ELEMS_PER_VEC):
+                    vals.append(chunk_P_fp32[k * P_ELEMS_PER_VEC + i])
+                vec_fp8 = fp32_to_fp8_pack(vals, dtype=P_STORAGE_DTYPE).bitcast(P_STORAGE_DTYPE)
+                dst = p_xfer_slot.subview(cutlass.Int32(chunk * P_BLOCK_BYTES) + p_row_offs[k]).data_ptr()
+                dst.store(vec_fp8, alignment=P_VEC_BYTES)
+        iter_sum_pair = row_reduction_pair(reg_P_fp32)
 
     # ---- Write alpha[tid] (FP32) to alpha xfer slot[parity] (K4: per-lane row base hoisted per work item) ----
     alpha_slot = alpha_row_base.subview(cur_parity_S * cutlass.Int32(CFG.TILE_M))
     alpha_slot.store(alpha)
 
-    # Update total_sum = total_sum * alpha + row_reduction(reg_P).
+    # Update total_sum = total_sum * alpha + row_reduction(P) (the arm's pair, see above).
     alpha_pair = cutlass.Vector.from_elements((alpha, alpha), cutlass.Float32)
-    iter_sum_pair = row_reduction_pair(reg_P_fp32)
     total_sum_vec = total_sum_vec * alpha_pair + iter_sum_pair
 
     # Fence SMEM→async; sync the 4 compute warps so all 128 rows of
@@ -1602,6 +1685,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_left, kv_right, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             False,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -1627,6 +1711,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_left, kv_unmasked_lo, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             True,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -1651,6 +1736,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_unmasked_lo, kv_unmasked_hi, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             False,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -1675,6 +1761,7 @@ def _compute_warp_group(
                     for _kv in cutlass.range(kv_unmasked_hi, kv_right, 1, unroll=1):
                         sg0_xfer_state, bmm1_done_state, total_max, total_sum_vec = _sg0_softmax_kv_iter(
                             True,
+                            lse_tensor is not None,
                             _kv,
                             sg0_xfer_state,
                             bmm1_done_state,
@@ -2188,6 +2275,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=_MXFP8_K_DIM,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv_bs = prims.Tcgen05MxInstrDesc.build(
         a_dtype=STORAGE_DTYPE,

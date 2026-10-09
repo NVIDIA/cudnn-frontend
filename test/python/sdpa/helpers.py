@@ -36,9 +36,24 @@ def note_frost_routing(graph, label="graph"):
         template = _kernel_template_of(graph)
         if template:
             frost_routing.note(f"frost:{engine.name}:{template}")
+        # ... and the softmax arms that template compiled (f32 / f16 exponent, pre-folded scale, fused
+        # shift+convert), so a lever sweep can assert the arm it asked for is the one that ran.
+        arms = _softmax_arms_of(graph)
+        if arms:
+            frost_routing.note(f"frost:{engine.name}:arms={arms}")
+        frost_routing.LAST_ARMS = arms
     else:
         frost_routing.note(f"native:{label}")
         frost_routing.LAST_PLAN = (None, None)
+        frost_routing.LAST_ARMS = None
+
+
+def _softmax_arms_of(graph):
+    """The softmax-arm tag of the selected FROST plan (``softmax_arms`` on the compiled executor, set by
+    engines.lower_dsl_prefill from api_dsl.softmax_arms_of), or None."""
+    plans = getattr(graph, "_compiled_plans", None) or {}
+    plan = plans.get(getattr(graph, "_plan_index", None))
+    return getattr(getattr(plan, "_compiled", None), "softmax_arms", None)
 
 
 def _kernel_template_of(graph):
@@ -399,7 +414,18 @@ def convert_uniform_to_packed(uniform_tensor, seq_len, max_t):
 
     return packed_tensor
 
-def create_container_and_page_table(tensor, block_size):
+def create_container_and_page_table(tensor, block_size, seq_lens=None, layout="hnd"):
+    """Carve the dense (B, H, S, D) ``tensor`` into K/V page pools plus an INT32 block table.
+
+    ``layout``: "hnd" (default) = [pages, H, page, D] contiguous; "nhd" = the same (pages, H, page, D)
+    logical dims over [pages, page, H, D] physical storage, declared through its real strides (the
+    token-major pool layout serving frameworks also hand over).
+    ``seq_lens``: opt-in dead-page poison (mirrors sdpa.fp8.create_paged_container_and_block_table):
+    every page no per-batch length reaches is NaN-filled, so an engine that dereferences a dead
+    table slot poisons its O.  FROST paged kernels issue a TMA-OOB page -1 there, and the cuDNN backend
+    does not read a dead slot either (cc 10.7, cuDNN 9.26 / 9.27: identical O with and without the
+    poison), so the paged THD + sink block passes the lengths on both of its routes.
+    """
     B, H, S, D = tensor.shape
     blocks_per_batch = math.ceil(S/block_size)
 
@@ -411,6 +437,17 @@ def create_container_and_page_table(tensor, block_size):
         cat_tensor = tensor
 
     reshaped = torch.cat((cat_tensor.clone()).chunk(blocks_per_batch, dim=2), dim=0)
+    if layout == "nhd":
+        # Token-major pages: the same (pages, H, page, D) logical dims over [pages, page, H, D]
+        # physical storage, declared through its real strides (page*H*D, D, H*D, 1).
+        reshaped = reshaped.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+    elif layout != "hnd":
+        raise ValueError(f"paged pool layout must be 'hnd' or 'nhd'; got {layout!r}")
+    if seq_lens is not None:
+        # Page p of batch b is pool index p*B + b (below): NaN-fill every page past ceil(len / page).
+        dead = [p * B + b for b, length in enumerate(seq_lens) for p in range(math.ceil(int(length) / block_size), blocks_per_batch)]
+        if dead:
+            reshaped[torch.tensor(dead, device=reshaped.device, dtype=torch.int64)] = float("nan")
 
     # Page p of batch b lives at pool index p*B + b (the chunk/cat above). The
     # table is stored ROW-MAJOR — each batch's page list contiguous, strides

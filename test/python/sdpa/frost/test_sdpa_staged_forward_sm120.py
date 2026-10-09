@@ -102,6 +102,7 @@ def _check(tensors, storage, features=False):
 @pytest.mark.parametrize("split,features", [(1, False), (1, True), (4, False)])
 def test_staged_forward_uses_pointer_host(d, fp8, split, features, monkeypatch):
     import cutlass.cute as cute
+    from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
     api, tensors, storage = _case(d, fp8=fp8, split=split, features=features)
     monkeypatch.setattr(cute.runtime, "make_fake_tensor", lambda *a, **k: pytest.fail("staged forward constructed a tensor fake"))
@@ -110,6 +111,8 @@ def test_staged_forward_uses_pointer_host(d, fp8, split, features, monkeypatch):
     backing = torch.full((required + 257,), 177, device="cuda", dtype=torch.uint8)
     workspace = backing[128 : 128 + required + 1]
     api.compile()
+    assert api._staged_spec.core.native is not None
+    forbid_python_forward_binding(monkeypatch)
     assert api.scratch_workspace_bytes() == required
     assert api._staged_spec is not None and api._dense_spec is None
     _execute(api, tensors, workspace)

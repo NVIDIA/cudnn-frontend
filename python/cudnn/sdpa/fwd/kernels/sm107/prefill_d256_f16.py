@@ -185,6 +185,32 @@ if CFG.DTYPE_O != CFG.DTYPE_QKV:
     raise NotImplementedError(f"prefill_sdpa_d256_f16: DTYPE_O={CFG.DTYPE_O} != DTYPE_QKV=" f"{CFG.DTYPE_QKV} not yet supported.")
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
 
+# softmax_scale_prefolded (TemplateParams.softmax_scale_prefolded <- the graph's attn_scale_prefolded): the caller
+# multiplied Q by attn_scale * log2(e), so the raw QK^T already sits in the log2 domain.  The softmax then takes the
+# RAW row max and shifts with one FADD2 per pair (reg_S - m) in place of the FFMA2 (reg_S * scale_log2 - m); the
+# ``scale_log2`` runtime argument stays in every signature as a dead operand (the adapter pins it to exactly 1.0 and
+# the kernel never reads it under the fold).  The published Stats are unchanged: the running max and the shifted
+# scores live in the same log2 domain as when the kernel applies the scale, so the correction's LSE / sink fold /
+# inv_sum consume the same values.  Numerically neutral on its own (the per-score multiply by the scale becomes the
+# caller's one rounding of Q); the fused shift+convert it enables is a quantized-kernel arm this body does not carry.
+# Mask sentinel: a fully-masked tile leaves the raw max exactly at the finite mask sentinel (== NEG_INF) under the fold, at
+# the scaled sentinel otherwise.  Ahead of the row's first live key such a tile is DEAD: running_max_step_finite_sentinel
+# (the shared running-max step) keeps total_max at NEG_INF, publishes alpha = 1 and shifts the tile by 0 so P = 0, and the
+# first live tile starts the online softmax through is_first -- the sentinel never becomes the running max (scaled by
+# scale_log2 > 1 it overflowed to -inf and the shift read -inf - (-inf) = NaN; below that P = 1 per masked column).  A
+# keyless row ends at (NEG_INF, 0) and is overridden by the correction's _kv_empty select.  The softmax body is inlined four
+# times (dense / left-masked / unmasked interior / right-masked); every copy carries both arms at its max site and its
+# shift site -- the source pin in test_sdpa_fwd_dsl_sm107.py counts them.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+# softmax_precision=HALF (TemplateParams.softmax_f16) is a quantized-kernel specialization: on half inputs the f16x2
+# exponent would be a new numerics class (exp input ulp 2^-8 at the rescale threshold; bf16 ex2 is 2^-7), so the config
+# backstop (config_sm107.py _validate_params) declines it before this body loads and the fused arm never exists here.
+# The constants are kept so the cc 10.7 forward kernels expose one lever vocabulary (tests read _k_mod._FUSED_SHIFT_CVT).
+SOFTMAX_F16 = int(PARAMS.softmax_f16)
+if SOFTMAX_F16:
+    raise ValueError("prefill_d256_f16: softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization; half inputs run the f32 exponent")
+_FUSED_SHIFT_CVT = False
+
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     sdpa_gate_tensor,
@@ -195,6 +221,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     compute_kv_loop_bounds,
     lpt_tile_coords,
     make_sdpa_helpers,
+    running_max_step_finite_sentinel,
     gate_geometry,
     issue_gate_load,
     gate_chunk_smem_offset,
@@ -1094,6 +1121,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -1411,21 +1439,25 @@ def _softmax_warp_group(
                     num_elems=CFG.TILE_N,
                 )
                 reg_S = RegTile(reg_S_tile.vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
 
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 # Chunk 1 cast/store/sum folds out at trace time when N_CHUNKS == 1
                 chunk_S_0 = reg_S[0:CHUNK].vec
@@ -1499,20 +1531,24 @@ def _softmax_warp_group(
                 for m in chunks_max[1:]:
                     current_max_unscaled = cute.math.max(current_max_unscaled, m)
                 reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 chunk_S_0 = reg_S[0:CHUNK].vec
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1560,20 +1596,24 @@ def _softmax_warp_group(
                     num_elems=CFG.TILE_N,
                 )
                 reg_S = RegTile(reg_S_tile.vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 chunk_S_0 = reg_S[0:CHUNK].vec
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
@@ -1644,20 +1684,24 @@ def _softmax_warp_group(
                 for m in chunks_max[1:]:
                     current_max_unscaled = cute.math.max(current_max_unscaled, m)
                 reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-                current_max = current_max_unscaled * scale_log2
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    current_max = current_max_unscaled  # raw-domain max (Q carries attn_scale * log2 e); sentinel note at SCALE_PREFOLDED
+                else:
+                    current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 bars.mb_stat_full.arrive()
-                reg_S = reg_S * scale_log2 - new_total_max
+                if cutlass.const_expr(SCALE_PREFOLDED):
+                    reg_S = reg_S - new_total_max  # FADD2 per pair; the scale is the caller's
+                else:
+                    reg_S = reg_S * scale_log2 - new_total_max
 
                 chunk_S_0 = reg_S[0:CHUNK].vec
                 chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)

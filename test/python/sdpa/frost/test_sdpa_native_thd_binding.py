@@ -6,6 +6,8 @@ The Python binder is an explicit reference here, never an exception-driven
 production fallback for native plans. No test pins a heuristic or timing.
 """
 
+import sdpa_binding_reference as binding_reference
+
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -17,7 +19,7 @@ pytestmark = [pytest.mark.L0]
 
 
 def _fixture(dtype="bfloat16", layout="NH", rank=4):
-    s = prep.ThdLaunchSpec()
+    s = binding_reference.ReferenceThdLaunchSpec()
     s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, 128, 128
     s.cga_tile_m = 512
     s.paged, s.has_sink, s.lse_padded = False, False, False
@@ -57,7 +59,7 @@ def _native(s, facts, workspace=0x30000, stream=17):
 
 
 def _reference(s, facts, workspace=0x30000, stream=17):
-    return prep._bind_thd_python(s, facts, workspace, stream, stream)
+    return binding_reference._bind_thd_python(s, facts, workspace, stream, stream)
 
 
 def _equal(s, facts, **kwargs):
@@ -118,9 +120,9 @@ def test_native_rejects_invalid_runtime_contract_without_fallback(role, updates,
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError):
         _reference(s, changed)
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native plans must not fall back after a validation error"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native plans must not fall back after a validation error"), raising=False)
     with pytest.raises(ValueError):
-        prep.bind_thd(s, changed, 0x30000, 17, 17)
+        _native(s, changed)
     assert frames == []
 
 
@@ -343,9 +345,9 @@ def test_native_paged_revalidates_each_call(hnd, role, defect, monkeypatch):
         changed = dict(facts, **{role: f._replace(**update)})
     with pytest.raises(ValueError):
         _reference(s, changed)
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native paged plans must not fall back"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native paged plans must not fall back"), raising=False)
     with pytest.raises(ValueError):
-        prep.bind_thd(s, changed, 0x30000, 17, 17)
+        _native(s, changed)
     assert frames == []
 
 
@@ -458,23 +460,23 @@ def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
             _reference(s, changed)
 
 
-@pytest.mark.parametrize("hnd", [False, True, None], ids=["paged_nhd", "paged_hnd", "nonpaged_mla"])
+@pytest.mark.parametrize("hnd,d_qk", [(False, 128), (True, 128), (None, 192), (None, 128)], ids=["paged_nhd", "paged_hnd", "nonpaged_mla", "nonpaged_d128"])
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("splits", [4, 16])
-def test_native_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
+def test_native_packed_split_matches_reference_and_rebinds(hnd, d_qk, layout, dtype, splits):
     """Packed splits bind independent frames without weakening observed spans."""
     if hnd is None:
         s, facts, frames = _fixture(dtype, layout)
-        s.d_qk = 192
+        s.d_qk = d_qk
         for role, heads in (("q", s.qh), ("k", s.kh)):
             f = facts[role]
             facts[role] = f._replace(
-                span=f.span * 3 // 2,
-                shape=(*f.shape[:-1], 192),
-                strides=(*(x * 3 // 2 for x in f.strides[:-1]), 1),
+                span=f.span * d_qk // 128,
+                shape=(*f.shape[:-1], d_qk),
+                strides=(*(x * d_qk // 128 for x in f.strides[:-1]), 1),
             )
-            s.decl[role] = (heads, 192, heads * 192, 192, 1, heads * 192)
+            s.decl[role] = (heads, d_qk, heads * d_qk, d_qk, 1, heads * d_qk)
     else:
         s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
     s.cga_tile_m = 128

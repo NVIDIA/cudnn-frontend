@@ -9,10 +9,12 @@ artifact of each row, or the THD sibling (``compile_plan_thd`` / ``compile_plan_
 ABI and cache key.
 Per call, ``bind()`` validates every operand against its ``Operand`` and hands the artifact a flat pointer frame; the
 graph plan binds the normalized variant pack (``PreparedBwdLaunch``), the standalone adapter binds torch tensors
-(``execute_standalone``).  Nothing here touches torch on the execute path.
+(``execute_standalone``). The standalone adapter observes tensor metadata and selects the plan device context; it does
+not convert tensors or allocate execute-time storage.
 """
 
 import math
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 from cudnn.frost.compiled_cache import positional_entry
@@ -39,13 +41,17 @@ ROLES_F16 = ROLES[:9] + _APPENDED_ROLES
 ATTRIBUTES_F16 = ATTRIBUTES[:9] + _APPENDED_ATTRIBUTES
 # A THD plan binds BOTH per-sequence length tensors (``(B,)`` lengths on the graph, ``(B,)`` or ``(B+1,)`` prefixes standalone --
 # ``bind()`` derives the form from numel, finding the two roles by NAME) right after the nine packed tensors, at slots 9 / 10 on
-# every row (the family's extra operands follow); ``length_form=True`` on its spec.  No THD plan has a delta slot: every THD row
-# declines ``external_delta`` (its delta is the chain's own ``dot_do_o`` over the packed O / dO, ``SdpaBwdDslSm107.check_support``),
-# so no standalone-only role either.
+# every row (the family's extra operands follow); ``length_form=True`` on its spec.  Every THD spec ends with the same appended,
+# STANDALONE-ONLY ``delta`` slot as its dense twin (``_thd_delta_operand``): the caller's PACKED head-major ``[1, H_q, ceil128(T_q)]``
+# fp32 ``rowsum(dO * O)`` under ``external_delta=True`` -- the dense layout at ``B = 1, S = T_q`` -- None-specialized otherwise (the
+# chain's own ``dot_do_o`` over the packed O / dO fills its region).  Half row: slot 11; fp8 row: slot 27 (after the twelve scalars
+# and the four amax); MXFP8 row: slot 22 (after the four payloads and the seven scale-factor blobs).  Both binders are generic over
+# an appended role: the python one finds the two lengths by NAME, the C++ one loops over the launch spec's roles and derives the length
+# bits from the role names -- so the slot lands with no binder change.
 _THD_LENGTH_ROLES = ("seq_q", "seq_kv")
 _THD_LENGTH_ATTRIBUTES = ("seq_len_q", "seq_len_kv")
-ROLES_F16_THD = ROLES[:9] + _THD_LENGTH_ROLES
-ATTRIBUTES_F16_THD = ATTRIBUTES[:9] + _THD_LENGTH_ATTRIBUTES
+ROLES_F16_THD = ROLES[:9] + _THD_LENGTH_ROLES + (EXTERNAL_DELTA_ROLE,)
+ATTRIBUTES_F16_THD = ATTRIBUTES[:9] + _THD_LENGTH_ATTRIBUTES + (EXTERNAL_DELTA_ROLE,)
 FP8_SCALARS = (
     "descale_q",
     "descale_k",
@@ -64,8 +70,8 @@ FP8_AMAX = ("amax_dQ", "amax_dK", "amax_dV", "amax_dP")
 ROLES_FP8 = ROLES[:9] + FP8_SCALARS + FP8_AMAX + _APPENDED_ROLES
 ATTRIBUTES_FP8 = ATTRIBUTES[:9] + FP8_SCALARS + FP8_AMAX + _APPENDED_ATTRIBUTES
 # The fp8 row's THD plan: the two length operands at slots 9 / 10, then the scalars and the requested amax (``compile_plan_fp8_thd``).
-ROLES_FP8_THD = ROLES[:9] + _THD_LENGTH_ROLES + FP8_SCALARS + FP8_AMAX
-ATTRIBUTES_FP8_THD = ATTRIBUTES[:9] + _THD_LENGTH_ATTRIBUTES + FP8_SCALARS + FP8_AMAX
+ROLES_FP8_THD = ROLES[:9] + _THD_LENGTH_ROLES + FP8_SCALARS + FP8_AMAX + (EXTERNAL_DELTA_ROLE,)
+ATTRIBUTES_FP8_THD = ATTRIBUTES[:9] + _THD_LENGTH_ATTRIBUTES + FP8_SCALARS + FP8_AMAX + (EXTERNAL_DELTA_ROLE,)
 # The MXFP8 row appends the ``sdpa_mxfp8_backward`` ports the half node lacks: the transposed-quantization payloads, the
 # half-precision dO and the seven F8_128x4 scale tensors (the SM100 MXFP8 adapter's role / attribute spelling; the attributes
 # are the ``SdpaBinding`` field names).  ``o`` carries the ``o_f16`` port, ``do`` the ROWWISE e4m3 dO.
@@ -79,8 +85,8 @@ ATTRIBUTES_MXFP8 = ATTRIBUTES[:9] + MXFP8_ATTRIBUTES + _APPENDED_ATTRIBUTES
 # convention: sequence b's tiles start at ``cu_sf[b] = SUM_{i<b} ceil(s_i / 128)``), so their live byte count is a per-call fact
 # of the bound buffer: ``bind()`` derives ONE packed tile count per SIDE (``MXFP8_SF_Q_SIDE`` / ``MXFP8_SF_KV_SIDE``, every tensor
 # of a side at the same count) and frames the two counts after ``lens_form`` for the host (``sf_tiles_q``, ``sf_tiles_kv``).
-ROLES_MXFP8_THD = ROLES[:9] + _THD_LENGTH_ROLES + MXFP8_PAYLOADS + MXFP8_SF
-ATTRIBUTES_MXFP8_THD = ATTRIBUTES[:9] + _THD_LENGTH_ATTRIBUTES + MXFP8_ATTRIBUTES
+ROLES_MXFP8_THD = ROLES[:9] + _THD_LENGTH_ROLES + MXFP8_PAYLOADS + MXFP8_SF + (EXTERNAL_DELTA_ROLE,)
+ATTRIBUTES_MXFP8_THD = ATTRIBUTES[:9] + _THD_LENGTH_ATTRIBUTES + MXFP8_ATTRIBUTES + (EXTERNAL_DELTA_ROLE,)
 MXFP8_SF_Q_SIDE = ("sf_q", "sf_q_T", "sf_do", "sf_do_T")
 MXFP8_SF_KV_SIDE = ("sf_k", "sf_k_T", "sf_v")
 
@@ -213,6 +219,14 @@ def _sm(api) -> int:
     return major * 10 + minor
 
 
+def _sm_count(api) -> int:
+    """The device's multiprocessor count -- a plan fact of the fp8 row (its fold passes run a persistent grid sized on it,
+    ``bprop_chain_common.fold_quant_ctas``), folded into the artifact's cache key next to the arch."""
+    from cudnn.frost.device import multiprocessor_count, resolve_device
+
+    return int(multiprocessor_count(resolve_device(api.q_desc.device)))
+
+
 def _dsl_dtype(torch_dtype):
     import cutlass
 
@@ -220,8 +234,9 @@ def _dsl_dtype(torch_dtype):
 
 
 def _delta_geometry(api):
-    """The delta's ``(shape, strides)``: ``[B, H_q, S_q_pad]`` fp32 contiguous -- the ``dot_do_o`` layout, whether the chain
-    carves it (``api._scratch_shapes()``'s ``delta`` entry) or the caller provides it (``external_delta_shape``)."""
+    """The delta's ``(shape, strides)``: ``external_delta_shape`` fp32 contiguous -- ``[B, H_q, S_q_pad]`` dense, the PACKED
+    head-major ``[1, H_q, ceil128(T_q)]`` under THD -- the ``dot_do_o`` layout, whether the chain carves it (``api._scratch_shapes()``'s
+    ``delta`` entry) or the caller provides it."""
     shape = tuple(int(x) for x in api.external_delta_shape)
     return shape, (shape[1] * shape[2], shape[2], 1)
 
@@ -242,6 +257,18 @@ def _appended_dense_operands(api):
         Operand("float32", delta_shape, delta_strides, math.prod(delta_shape), 16, 4) if external else None,
     ]
     return operands, ((seq_kv_shape, seq_kv_strides), (delta_shape, delta_strides)), seq_kv_present, external
+
+
+def _thd_delta_operand(api):
+    """The THD specs' appended delta slot -- the LAST role of every THD role list: the caller's PACKED head-major
+    ``[1, H_q, ceil128(T_q)]`` fp32 delta (16-B aligned, ``H_q * ceil128(T_q)`` elements; its exact layout is checked by the adapter's
+    ``_check_external_delta`` before the bind) exactly when the plan was built with ``external_delta``, None-specialized otherwise --
+    the dense slot's rule (``_appended_dense_operands``).  The THD hosts view it from ``config`` (the plan's token capacity), so the
+    slot needs no ``geometry`` entry; the plan fact keys the artifact (``compile_plan_*_thd``)."""
+    if not api.external_delta:
+        return None
+    shape, strides = _delta_geometry(api)
+    return Operand("float32", shape, strides, math.prod(shape), 16, 4)
 
 
 def compile_plan(api, main, mm_dk, mm_dq):
@@ -269,9 +296,24 @@ def compile_plan(api, main, mm_dk, mm_dq):
         (tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), config, geometry, regions, _dtype_name(api.dtype), sm, seq_kv_present, external)
     )
     entry = compile_host_f16(
-        main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, seq_kv_present=seq_kv_present, external_delta=external
+        main._host,
+        mm_dk._host,
+        mm_dq._host,
+        config,
+        geometry,
+        regions,
+        dtype,
+        sm,
+        key,
+        seq_kv_present=seq_kv_present,
+        external_delta=external,
+        # The row's name is the spec's and the artifact symbol's (``frost_sdpa_bwd_sm107_prepared`` on the Rubin row, the SM100
+        # d256 row's own on ``sdpa_bwd_sm100_d256``); the host_f16 chain is the same for both.
+        symbol=f"frost_{api._NAME}_prepared",
     )
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
+    return _spec(
+        api, entry, operands, offset, api._NAME, ROLES_F16, ATTRIBUTES_F16, scale_log2=False, standalone_only_roles=(EXTERNAL_DELTA_ROLE,), native_binding=True
+    )
 
 
 def _thd_geometry(api, roles=ROLES[:9]):
@@ -304,22 +346,37 @@ def _thd_geometry(api, roles=ROLES[:9]):
 
 
 def compile_plan_thd(api, main, mm_dk, mm_dq):
-    """The half row's THD spec (``api.thd``): packed geometry, the two length operands (``allowed_numels`` B / B+1), the
-    workspace carve (``_REGION_SLOTS_F16`` with the pad / fold slots None: no staging under THD), and the SIBLING artifact
-    ``prepared_host.host_f16_thd`` under its own cache key (``thd`` + the THD config: the dense artifact's key and ABI are
-    untouched)."""
+    """The half row's THD spec (``api.thd``): packed geometry, the two length operands (``allowed_numels`` B / B+1) at slots 9 / 10,
+    the appended standalone-only delta at slot 11 (``_thd_delta_operand``: bound under ``external_delta``, with which the carve has no
+    ``delta`` region and the artifact launches no ``dot``), the workspace carve (``_REGION_SLOTS_F16`` with the pad / fold slots None:
+    no staging under THD), and the SIBLING artifact ``prepared_host.host_f16_thd`` under its own cache key (``thd`` + the THD config +
+    the delta fact: the dense artifact's key and ABI are untouched)."""
     from .kernels.sm107.prepared_host import compile_host_f16_thd
 
     b = api.batch_size
     geometry, operands = _thd_geometry(api)
     operands += [Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in range(2)]
+    operands += [_thd_delta_operand(api)]
+    external = bool(api.external_delta)
     regions, offset = _regions(api, _REGION_SLOTS_F16)
     config = _thd_config(api)  # the half row's dS element size IS its io itemsize
     sm = _sm(api)
     dtype = _dsl_dtype(api.dtype)
-    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.dtype), sm))
-    entry = compile_host_f16_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key)
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107", ROLES_F16_THD, ATTRIBUTES_F16_THD, scale_log2=False, length_form=True)
+    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.dtype), sm, external))
+    entry = compile_host_f16_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, dtype, sm, key, external_delta=external)
+    return _spec(
+        api,
+        entry,
+        operands,
+        offset,
+        "sdpa_bwd_sm107",
+        ROLES_F16_THD,
+        ATTRIBUTES_F16_THD,
+        scale_log2=False,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
+        length_form=True,
+        native_binding=True,
+    )
 
 
 def _fp8_scalar_operands(api):
@@ -351,6 +408,7 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
     regions, offset = _regions(api, _REGION_SLOTS_FP8)
     config = _config(api)
     sm = _sm(api)
+    sm_count = _sm_count(api)
     grad_dtype = _dsl_dtype(api.grad_dtype)
     key = repr(
         (
@@ -363,6 +421,7 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
             sm,
             seq_kv_present,
             external,
+            sm_count,
         )
     )
     entry = compile_host_fp8(
@@ -378,8 +437,20 @@ def compile_plan_fp8(api, main, mm_dk, mm_dq):
         key,
         seq_kv_present=seq_kv_present,
         external_delta=external,
+        sm_count=sm_count,
     )
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8, ATTRIBUTES_FP8, scale_log2=True, standalone_only_roles=(EXTERNAL_DELTA_ROLE,))
+    return _spec(
+        api,
+        entry,
+        operands,
+        offset,
+        "sdpa_bwd_sm107_fp8",
+        ROLES_FP8,
+        ATTRIBUTES_FP8,
+        scale_log2=True,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
+        native_binding=False,
+    )
 
 
 def _thd_config(api):
@@ -412,9 +483,10 @@ def compile_plan_fp8_thd(api, main, mm_dk, mm_dq):
     """The fp8 row's THD spec (``api.thd``): the nine PACKED tensors (``_thd_geometry``), the two length operands at slots 9 / 10
     (``allowed_numels`` B / B+1), the twelve scalars and the requested amax (``_fp8_scalar_operands``), the workspace carve
     (``_REGION_SLOTS_FP8`` with the pad slots None: no staging under THD) and the SIBLING artifact ``prepared_host.host_fp8_thd``
-    under its own cache key (``thd`` + the THD config): the dense artifact's key and ABI are untouched.  No delta slot (the THD
-    rows decline ``external_delta``).  The host views the lengths and the scalars with fixed geometries, so ``geometry`` carries
-    the nine packed layouts only, as the half row's THD plan does."""
+    under its own cache key (``thd`` + the THD config + the delta fact): the dense artifact's key and ABI are untouched.  The delta
+    slot is LAST (27, ``_thd_delta_operand``): the caller's PACKED head-major delta in TRUE units, bound under ``external_delta`` (the
+    chain then launches no scaled ``dot`` and the carve has no ``delta`` region).  The host views the lengths, the scalars and the
+    delta with fixed geometries, so ``geometry`` carries the nine packed layouts only, as the half row's THD plan does."""
     from .kernels.sm107.prepared_host import compile_host_fp8_thd
 
     b = api.batch_size
@@ -422,13 +494,43 @@ def compile_plan_fp8_thd(api, main, mm_dk, mm_dq):
     operands += [Operand("int32", (b,), (1,), b, 4, 4, (b, b + 1)) for _ in _THD_LENGTH_ROLES]
     scalars, requested = _fp8_scalar_operands(api)
     operands += scalars
+    operands += [_thd_delta_operand(api)]
+    external = bool(api.external_delta)
     regions, offset = _regions(api, _REGION_SLOTS_FP8)
     config = _thd_config(api)
     sm = _sm(api)
+    sm_count = _sm_count(api)
     grad_dtype = _dsl_dtype(api.grad_dtype)
-    key = repr((tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)), "thd", config, geometry, regions, _dtype_name(api.grad_dtype), requested, sm))
-    entry = compile_host_fp8_thd(main._host, mm_dk._host, mm_dq._host, config, geometry, regions, grad_dtype, requested, sm, key)
-    return _spec(api, entry, operands, offset, "sdpa_bwd_sm107_fp8", ROLES_FP8_THD, ATTRIBUTES_FP8_THD, scale_log2=True, length_form=True)
+    key = repr(
+        (
+            tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),
+            "thd",
+            config,
+            geometry,
+            regions,
+            _dtype_name(api.grad_dtype),
+            requested,
+            sm,
+            sm_count,
+            external,
+        )
+    )
+    entry = compile_host_fp8_thd(
+        main._host, mm_dk._host, mm_dq._host, config, geometry, regions, grad_dtype, requested, sm, key, sm_count=sm_count, external_delta=external
+    )
+    return _spec(
+        api,
+        entry,
+        operands,
+        offset,
+        "sdpa_bwd_sm107_fp8",
+        ROLES_FP8_THD,
+        ATTRIBUTES_FP8_THD,
+        scale_log2=True,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
+        length_form=True,
+        native_binding=False,
+    )
 
 
 def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
@@ -455,14 +557,9 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
     sm = _sm(api)
     stage_sf_pads = bool(_host.MXFP8_STAGE_SF_PADS)  # read at plan build; part of the key (the poisoned-SF-pad RED twin flips it)
     ds_sf_policy = int(api._ds_policy)  # the adapter's dS policy (P-c bf16 dS | P-b block-scaled e4m3 dS): selects the chain the artifact runs
-    if api._ds_block_scaled and int(api._dq_b_head_group) != 1:
-        # The block-scale arm indexes its B scale-factor descriptor per A / C head and launches dQ once per GQA group member
-        # (prepared_host._stage3_block_scale); a dQ record grouped by the GQA head (the plain renderings' single launch) would pair
-        # Q heads with the wrong K head -- refuse here, in plain Python, before anything is compiled.
-        raise ValueError(
-            f"sdpa_bwd_sm107_mxfp8: the block-scaled dS chain's dQ record must keep b_head_group == 1 (one launch per GQA group member); "
-            f"got {api._dq_b_head_group}"
-        )
+    # The dQ record's b_head_group (1 or the GQA group) rides in `config` and is the ONE source of the dQ launch count on both chains:
+    # the block-scale arm indexes its B scale-factor descriptor by the same grouped head as B itself, and the host
+    # (prepared_host._dq_launches) refuses any value that is neither 1 nor the group at trace time.
     key = repr(
         (
             tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),
@@ -492,7 +589,16 @@ def compile_plan_mxfp8(api, main, mm_dk, mm_dq):
         external_delta=external,
     )
     return _spec(
-        api, entry, operands, offset, "sdpa_bwd_sm107_mxfp8", ROLES_MXFP8, ATTRIBUTES_MXFP8, scale_log2=True, standalone_only_roles=(EXTERNAL_DELTA_ROLE,)
+        api,
+        entry,
+        operands,
+        offset,
+        "sdpa_bwd_sm107_mxfp8",
+        ROLES_MXFP8,
+        ATTRIBUTES_MXFP8,
+        scale_log2=True,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
+        native_binding=False,
     )
 
 
@@ -504,8 +610,11 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
     per head and the declared sample's own count -- one count per side; ``BwdLaunchSpec.packed_tile_groups`` frames the two counts after ``lens_form``), the workspace carve
     (``_REGION_SLOTS_MXFP8`` with the dense pad / fold slots None and the ``sf_*_pad`` slots re-purposed as the packed staging
     copies of the five SF tensors whose pad bytes the kernel or the GEMMs read, plus ``sf_meta``) and the SIBLING artifact
-    ``prepared_host.host_mxfp8_thd`` under its own cache key (``thd`` + the THD config + the SF staging switch + the dS policy):
-    the dense artifact's key and ABI are untouched.  No delta slot (the THD rows decline ``external_delta``)."""
+    ``prepared_host.host_mxfp8_thd`` under its own cache key (``thd`` + the THD config + the SF staging switch + the dS policy + the
+    delta fact): the dense artifact's key and ABI are untouched.  The delta slot is LAST (22, ``_thd_delta_operand``): the caller's
+    PACKED head-major delta in TRUE units (bitwise the row's own ``dot`` over the packed ``o_f16`` / ``dO_f16`` ports when the producer
+    reproduces its order), bound under ``external_delta``; ``geometry`` carries a trailing None for it (the host views it from
+    ``config``)."""
     from .kernels.sm107 import prepared_host as _host
 
     b = api.batch_size
@@ -521,18 +630,17 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
         cap = api._sf_capacity_bytes(name)  # the capacity in bytes: the larger of ceil(T_cap / 128) + B tiles per head and the declared count
         geometry.append(((cap,), (1,)))
         operands.append(Operand("int8", (cap,), (1,), cap, 16, 1, opaque_bytes=True, packed_tile_bytes=api._sf_tile_row_bytes(name)))
+    # Slot 22, the caller's delta (the host views it from `config`: None here, as for the lengths).
+    operands += [_thd_delta_operand(api)]
+    geometry.append(None)
+    external = bool(api.external_delta)
     regions, offset = _regions(api, _REGION_SLOTS_MXFP8)
     config = _thd_config(api)
     sm = _sm(api)
     stage_sf_pads = bool(_host.MXFP8_STAGE_SF_PADS)  # read at plan build; part of the key (the poisoned-SF-pad RED twin flips it)
     ds_sf_policy = int(api._ds_policy)
-    if api._ds_block_scaled and int(api._dq_b_head_group) != 1:
-        # The block-scale arm's THD leg launches dQ once per GQA group member exactly like its dense form (its SFB descriptor is
-        # indexed per A / C head): refuse a grouped dQ record here, in plain Python, before anything is compiled.
-        raise ValueError(
-            f"sdpa_bwd_sm107_mxfp8 THD: the block-scaled dS chain's dQ record must keep b_head_group == 1 (one launch per GQA group member); "
-            f"got {api._dq_b_head_group}"
-        )
+    # The dQ record's b_head_group (1 or the GQA group) rides in `config` as on the dense plan: the block-scale arm's THD leg indexes
+    # its packed B scale factors by the same grouped head as B (the SF tile prefix is a token-side term), one launch per head chunk.
     key = repr(
         (
             tuple(mod.FROST_SOURCE_DIGEST for mod in (main, mm_dk, mm_dq)),
@@ -544,9 +652,12 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
             sm,
             stage_sf_pads,
             ds_sf_policy,
+            external,
         )
     )
-    entry = _host.compile_host_mxfp8_thd(main._host, mm_dk._host, mm_dq._host, config, tuple(geometry), regions, sm, key, stage_sf_pads, ds_sf_policy)
+    entry = _host.compile_host_mxfp8_thd(
+        main._host, mm_dk._host, mm_dq._host, config, tuple(geometry), regions, sm, key, stage_sf_pads, ds_sf_policy, external_delta=external
+    )
     return _spec(
         api,
         entry,
@@ -556,12 +667,28 @@ def compile_plan_mxfp8_thd(api, main, mm_dk, mm_dq):
         ROLES_MXFP8_THD,
         ATTRIBUTES_MXFP8_THD,
         scale_log2=True,
+        standalone_only_roles=(EXTERNAL_DELTA_ROLE,),
         length_form=True,
         packed_tile_groups=(MXFP8_SF_Q_SIDE, MXFP8_SF_KV_SIDE),
+        native_binding=False,
     )
 
 
-def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, standalone_only_roles=(), length_form=False, packed_tile_groups=()):
+def _spec(
+    api,
+    entry,
+    operands,
+    offset,
+    name,
+    roles,
+    attributes,
+    *,
+    scale_log2,
+    standalone_only_roles=(),
+    length_form=False,
+    packed_tile_groups=(),
+    native_binding,
+):
     owner = SimpleNamespace(entry=entry, workspace_bytes=offset)
     fn = positional_entry(entry)
     if fn is None:
@@ -580,6 +707,7 @@ def _spec(api, entry, operands, offset, name, roles, attributes, *, scale_log2, 
         scale_log2=scale_log2,
         standalone_only_roles=tuple(standalone_only_roles),
         packed_tile_groups=tuple(tuple(g) for g in packed_tile_groups),
+        native_binding=native_binding,
     )
 
 
@@ -587,6 +715,7 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
     """The adapter's ``execute``: torch tensors in role order -> facts -> ``bind`` -> the artifact.  The nine tensor roles are
     held to the plan's exact geometry (Stats: contiguous with the plan's element count); scalars and amax bind by facts alone."""
     import torch
+    from cudnn._device import ensure_current_context
     from cudnn.sdpa.fwd.prepared import facts_of_tensor
     from .prepared import execute
 
@@ -610,4 +739,8 @@ def execute_standalone(api, tensors, workspace, current_stream, scale):
                 # MXFP8 row's four extra payloads); the fp8 row's [1] scalars and the opaque SF blobs bind by facts alone.
                 geom = tuple(op.shape[j] for j in (0, 2, 1, 3)), tuple(op.strides[j] for j in (0, 2, 1, 3))
         geometry.append(geom)
-    execute(spec, facts, ws.ptr, int(current_stream), scale=scale, geometry=geometry)
+    stream = int(current_stream)
+    device_context = nullcontext() if torch.cuda.current_device() == spec.device_index else torch.cuda.device(spec.device_index)
+    with device_context:
+        ensure_current_context(stream, spec.device_index)
+        execute(spec, facts, ws.ptr, stream, scale=scale, geometry=geometry)

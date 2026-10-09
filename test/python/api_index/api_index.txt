@@ -202,6 +202,7 @@ cudnn.deepseek_sparse_attention.DenseIndexerBackward
 cudnn.deepseek_sparse_attention.DenseIndexerBackward.check_support
 cudnn.deepseek_sparse_attention.DenseIndexerBackward.compile
 cudnn.deepseek_sparse_attention.DenseIndexerBackward.execute
+cudnn.deepseek_sparse_attention.DenseIndexerBackward.scratch_workspace_bytes
 cudnn.deepseek_sparse_attention.DenseIndexerScoreRecompute
 cudnn.deepseek_sparse_attention.DenseIndexerScoreRecompute.check_support
 cudnn.deepseek_sparse_attention.DenseIndexerScoreRecompute.compile
@@ -210,6 +211,7 @@ cudnn.deepseek_sparse_attention.IndexerBackward
 cudnn.deepseek_sparse_attention.IndexerBackward.check_support
 cudnn.deepseek_sparse_attention.IndexerBackward.compile
 cudnn.deepseek_sparse_attention.IndexerBackward.execute
+cudnn.deepseek_sparse_attention.IndexerBackward.scratch_workspace_bytes
 cudnn.deepseek_sparse_attention.IndexerForward
 cudnn.deepseek_sparse_attention.IndexerForward.check_support
 cudnn.deepseek_sparse_attention.IndexerForward.compile
@@ -218,6 +220,7 @@ cudnn.deepseek_sparse_attention.IndexerTopK
 cudnn.deepseek_sparse_attention.IndexerTopK.check_support
 cudnn.deepseek_sparse_attention.IndexerTopK.compile
 cudnn.deepseek_sparse_attention.IndexerTopK.execute
+cudnn.deepseek_sparse_attention.IndexerTopK.scratch_workspace_bytes
 cudnn.deepseek_sparse_attention.SparseAttentionBackward
 cudnn.deepseek_sparse_attention.SparseAttentionBackward.check_support
 cudnn.deepseek_sparse_attention.SparseAttentionBackward.compile
@@ -280,6 +283,7 @@ cudnn.engines.CompiledPlan.get_workspace_size
 cudnn.engines.CompiledPlan.takes_variant_pack
 cudnn.engines.EngineFamily
 cudnn.engines.EngineFamily.analyzer
+cudnn.engines.EngineFamily.backend_guard
 cudnn.engines.EngineFamily.heuristics
 cudnn.engines.EngineFamily.id_end
 cudnn.engines.EngineFamily.offered_ids
@@ -396,6 +400,12 @@ cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.check_support
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.compile
 cudnn.gemm.cutedsl.grouped.GroupedGemmWgradSm100.execute
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.allocate_outputs
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.check_call
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.m
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.run
+cudnn.gemm.cutedsl.grouped.PreparedGroupedGemm.set_m
 cudnn.gemm.cutedsl.grouped.get_grouped_gemm_wgrad_workspace_size_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_dglu_wrapper_sm100
@@ -413,6 +423,7 @@ cudnn.gemm.cutedsl.grouped.grouped_gemm_swiglu_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_jax_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wgrad_wrapper_sm100
 cudnn.gemm.cutedsl.grouped.grouped_gemm_wrapper_sm100
+cudnn.gemm.cutedsl.grouped.prepare_grouped_gemm
 cudnn.gemm.mhc_projection_backward
 cudnn.gemm.moe_grouped_matmul
 cudnn.gemm.ops
@@ -814,12 +825,21 @@ cudnn.sdpa.bwd.Nvfp4AttentionQatBackward
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.check_support
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.compile
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.execute
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.fallback_reason
 cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.scratch_workspace_bytes
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.selected_backend
+cudnn.sdpa.bwd.Nvfp4AttentionQatBackward.selected_head_chunk
 cudnn.sdpa.bwd.SdpaBwdDsl
 cudnn.sdpa.bwd.SdpaBwdDsl.check_support
 cudnn.sdpa.bwd.SdpaBwdDsl.compile
 cudnn.sdpa.bwd.SdpaBwdDsl.execute
 cudnn.sdpa.bwd.SdpaBwdDsl.scratch_workspace_bytes
+cudnn.sdpa.bwd.SdpaBwdDslSm100D256
+cudnn.sdpa.bwd.SdpaBwdDslSm100D256.check_support
+cudnn.sdpa.bwd.SdpaBwdDslSm100D256.compile
+cudnn.sdpa.bwd.SdpaBwdDslSm100D256.execute
+cudnn.sdpa.bwd.SdpaBwdDslSm100D256.external_delta_shape
+cudnn.sdpa.bwd.SdpaBwdDslSm100D256.scratch_workspace_bytes
 cudnn.sdpa.bwd.SdpaBwdDslSm107
 cudnn.sdpa.bwd.SdpaBwdDslSm107.check_support
 cudnn.sdpa.bwd.SdpaBwdDslSm107.compile

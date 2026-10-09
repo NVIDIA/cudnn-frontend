@@ -22,6 +22,11 @@ from cudnn.frost import compiled_cache
 tests, package, arch, route, dtype, reload = sys.argv[1:]
 assert Path(cudnn.__file__).resolve() == Path(package).resolve(), cudnn.__file__
 sys.path[:0] = [tests, str(Path(tests).parents[1])]
+if route.endswith("_2x2"):
+    # The SM100 d512 chain's 2x2 stage-2 twin: a module constant read when the plan compiles, flipped before anything builds.
+    from cudnn.sdpa.bwd import api_dsl
+    api_dsl.STAGE2_2X2 = True
+    route = route[: -len("_2x2")]
 if reload == "1":
     def forbidden(*a, **kw):
         raise AssertionError("prepared backward plan invoked JIT in the second process")
@@ -82,6 +87,12 @@ elif arch == "sm107" and route == "fp8":
     check = lambda: _check_prepared_fp8(case)
 elif arch == "sm107":
     from test_sdpa_bwd_dsl_sm107 import _prepared_case, _check_prepared
+    case = _prepared_case(dt=dtype, causal=(route != "dense"))
+    g, vp, ws = case.graph, case.pack, case.workspace
+    outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]
+    check = lambda: _check_prepared(case)
+elif arch == "sm100_d256":
+    from test_sdpa_bwd_d256_sm100 import _prepared_case, _check_prepared
     case = _prepared_case(dt=dtype, causal=(route != "dense"))
     g, vp, ws = case.graph, case.pack, case.workspace
     outputs = [case.tensors[n] for n in ("dq", "dk", "dv")]

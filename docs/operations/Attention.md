@@ -316,6 +316,8 @@ graph.sdpa(
     stats_use_log2=False,                 # Return stats as (max + ln(sum_exp)) * log2(e) instead of max + ln(sum_exp)
     implementation=AUTO,                  # SDPA implementation: AUTO, COMPOSITE, UNIFIED
     unfuse_fma=False,                     # Use unfused mul/add in the softmax computation
+    softmax_precision=None,               # Softmax exponent precision: FLOAT (default) or HALF (FROST FP8 / MXFP8 engines, cc 10.7)
+    attn_scale_prefolded=False,           # Q already carries attn_scale * log2(e); the engine applies no scale (FROST engines, cc 10.7)
     compute_data_type=NOT_SET,            # Computation data type
     name=None,                            # Operation name
 )
@@ -346,6 +348,8 @@ graph.sdpa(
 - `stats_use_log2` (Optional[bool]): If True, `stats` is returned in base 2, $\log_2(e)\,[\max + \ln(\sum e^{s - \max})]$, instead of the default natural-log form $\max + \ln(\sum e^{s - \max})$. This is the convention of flash-attention-style kernels (FA2/FA3, TRT-LLM) that fold $\log_2 e$ into the softmax scale, so consumers that mix LSE tensors from several backends (cascade/split-KV merges, speculative decoding) get one convention without an extra elementwise pass. Only affects `stats`; `score_max` and `score_sum_exp` are unchanged, and `sdpa_backward` still expects natural-log stats. Served by the FROST SDPA engines and, on cuDNN 9.27.0+, by both the `UNIFIED` and `COMPOSITE` implementations (`CUDNN_ATTR_OPERATION_SOFTMAX_STATS_LOG2` on the softmax operation descriptor used by both implementations); on older backends both decline it at validation, so only a FROST engine can serve it there.
 - `implementation` (Optional[cudnn.attention_implementation]): SDPA implementation to use. `AUTO` (default), `COMPOSITE`, or `UNIFIED`.
 - `unfuse_fma` (Optional[bool]): Use unfused mul/add in the softmax computation.
+- `softmax_precision` (Optional[cudnn.data_type]): Precision of the softmax exponent and probability path. `None` (the default) is the f32 pipeline every engine runs and leaves the engine choice open. `HALF` asks for the f16x2 exponent arm of the FROST FP8 and MXFP8 forward engines on cc 10.7 (head-dim flavors 128, 192x128, 256 and 512): the exponent runs on packed f16 pairs and P is cast from f16 straight to the FP8 pair format, halving the transcendental work of the softmax warps. Numerics-changing (P moves by about one f16 ulp of the exponent), so it is an op attribute rather than a tuning knob: the cuDNN backend has no field for it, a set value keeps the graph on the python engines (`serialize()` and `key()` refuse it), and an engine without the arm declines instead of degrading. An explicit `FLOAT` is also a set value: it selects the f32 pipeline on the python engines only, so omit the attribute unless that is intended. `stats`, when requested, always come from the exact f32 row sum; on the d256 and d512 FP8 / MXFP8 kernels (which normalize O with a register row sum) a HALF forward without `stats` normalizes O with an f16 pair sum of the stored probabilities instead, so on those flavors O under HALF is not bit-identical with and without `generate_stats` (both within the family bound; d128, d192x128 and the FLOAT pipeline are unaffected). Forward only: `sdpa_backward` declines it. The f16 arm rounds the exponent argument to f16 before the FP8 cast of P, so a probability within one f16 rounding step of an FP8 code midpoint can land one code away from the f32 pipeline's (one E5M2 code is a 25 % step, one E4M3 code 12.5 %); on O that is at most one code step of that key's weight times its V -- rare, bounded, and budgeted by the FP8 test harnesses like the f32 pipeline's own midpoint flips.
+- `attn_scale_prefolded` (Optional[bool]): Declares that Q was already multiplied by `attn_scale * log2(e)` (before quantization for FP8 / MXFP8 inputs), so the engine applies no softmax scale; `attn_scale` must stay unset. Served by the FROST MXFP8 and f16/bf16 forward engines on cc 10.7 (head-dim flavors 128, 192x128, 256 and 512; not over paged KV; not on per-tensor FP8, whose kernels fold the descale factors into the softmax scale). `stats` keep their usual form. On a graph without `stats`, `attn_scale_prefolded=True` together with `softmax_precision=HALF` fuses the per-score shift and the f32-to-f16 convert into one instruction per pair (measured 6-7 % faster on the d128 MXFP8 kernel at 32k context). `False` (or `0`) is the default and counts as unset. Forward only: `sdpa_backward` declines it.
 - `compute_data_type` (Optional[cudnn.data_type]): Data type for internal computation.
 - `name` (Optional[str]): Name for the operation.
 
@@ -387,7 +391,9 @@ graph.sdpa(
     - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
-  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`. On cc 10.7 (SM107) the f16/bf16 row serves paged KV for packed (THD / ragged-Q) queries on the d128 and d256 flavors, with or without `sink_token` -- prefill- and decode-shaped packed batches (per-request Q of 1 / 4 / 8), GQA with PackGQA, HND and NHD pools -- through the paged prefill pipeline; dense (BSHD) paged queries are declined there, and a sink graph is never split on any row.
+  - **MXFP8 page pools** (`sdpa_mxfp8` with `paged_attention_*`): the descales are page pools too (`descale_k [num_pages, H_kv, page_size, ceil4(D/32)]`, `descale_v [num_pages, H_kv, page_size/32, D]`, F8_128x4, so `page_size` is a multiple of 128; for D > 128 the `descale_v` planes are D-plane-major across the whole pool); the cuDNN backend has no engine for them -- the FROST MXFP8 engines serve them on the SM100 line (every native flavor, dense queries) and on cc 10.7 (d128 / d256, dense queries, sinks compose); THD (ragged-Q) queries over MXFP8 pools decline on every arch today. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  - **FROST engines** (cc 10.7, f16/bf16): dense d128 graphs whose `S_q * pack_g <= 128` ride the same decode tile (`TILE_CGA_M=1`, the shared body compiled for sm_107a; issue #1472) and dense d128 GQA packs on the shared prefill body under a diagonal band (a mask-free graph whose rows fit the decode tile unpacked rides it unpacked); paged THD queries keep the prefill pipeline there. With `sink_token`, dense d128 decode / verify graphs inside the measured band (bottom-right causal `S_q <= 16` or mask-free `S_q == 1`, GQA 4 / 8 / 16, at least 32 (batch, KV-head) units, caches 1k-16k, no window) are served by these plans by default, without the opt-in flag. Paged THD queries with GQA 4 / 8 / 16 pack by default there, with or without `sink_token`, and a sink no longer changes the scheduling or tile-width choice of a paged THD plan. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
   - **Offset calculation**:
     - $K_{cache}[b,h,s,d] = K_{container}[page\_table\_k[b,1,s / bs_k, 1], h, s \mod bs_k, d]$
     - $V_{cache}[b,h,s,d] = V_{container}[page\_table\_v[b,1,s / bs_v, 1], h, s \mod bs_v, d]$
@@ -415,9 +421,13 @@ graph.sdpa(
 
 A gated attention tail -- the SDPA output multiplied by the sigmoid of a per-element gate tensor `G` of O's shape,
 `O_gated = O * sigmoid(G)` -- is built as three graph nodes, an `sdpa` (or `sdpa_fp8` / `sdpa_mxfp8`) node followed by
-`sigmoid` and `mul` pointwise nodes on `O`. Under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` the Rubin d256 FROST
-forward engines (`sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm107_fp8`, `sdpa_fwd_prefill_sm107_mxfp8`) serve the
-whole tail fused: the gate tile is TMA-staged by the kernel's load warp and applied in the epilogue after the
+`sigmoid` and `mul` pointwise nodes on `O`. The Rubin d256 FROST forward engines serve the whole tail fused when they
+serve the graph: the MXFP8 row (`sdpa_fwd_prefill_sm107_mxfp8`) is offered by default and leads on cc 10.7, so the fused
+tail is its default execution; the half row (`sdpa_fwd_prefill_sm107`) is offered by default but its placement keeps the
+backend first for dense d256 graphs, which then run the tail unfused as the three nodes -- it serves the tail fused when it
+leads the plan list, when the backend declines, or under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; the FP8 row
+(`sdpa_fwd_prefill_sm107_fp8`) serves it under that flag. On the fused path the gate tile is TMA-staged by the kernel's load
+warp and applied in the epilogue after the
 dead-row select, so the gated `O` (and the quantized `O` on the FP8 / MXFP8 rows) is written once. Served today at
 `d_qk = d_v = 256` with a bf16 `G`, dense / unsplit / non-PackGQA / non-paged layouts; any other combination
 falls back to the unfused three-node execution. Two contracts hold on the fused path: `Stats` (LSE) is
@@ -1190,6 +1200,122 @@ Where:
 - $D_{qk}$ is the embedding dimension per head of query and key
 - $D_{v}$ is the embedding dimension per head of value
 
+
+## Execute-Time Shape Overrides
+
+Unified SDPA forward distinguishes the shape a graph **declares** from the shape a
+run **uses**:
+
+| stage | what it says | who sees it |
+|---|---|---|
+| build, `pygraph(is_override_shape_enabled=True)` | the largest extent this graph will ever be asked for | the heuristic, i.e. the plan choice |
+| execute, `override_uids` / `override_shapes` / `override_strides` | the extent **this** run actually uses | the backend, at launch |
+
+The declaration is the envelope the plan is built for, not a promise about any
+one run. One plan can then serve many extents without being rebuilt, which is
+what a serving stack wants when it groups requests into length buckets.
+
+The example requires a frontend compiled against cuDNN >= 9.21 and a cuDNN
+>= 9.23 runtime for the workspace query with overrides. Its 64-row extent is
+from the measured plan below; validate other plans before using that window.
+
+```python
+import cudnn
+import torch
+
+B, H, D = 1, 4, 64
+g = cudnn.pygraph(
+    io_data_type=cudnn.data_type.HALF,
+    intermediate_data_type=cudnn.data_type.FLOAT,
+    compute_data_type=cudnn.data_type.FLOAT,
+    is_override_shape_enabled=True,
+)
+Q = g.tensor(name="q", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+K = g.tensor(name="k", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+V = g.tensor(name="v", dim=[B, H, 256, D], stride=[H * 256 * D, 256 * D, D, 1], data_type=cudnn.data_type.HALF)
+O, _ = g.sdpa(Q, K, V, is_inference=True, attn_scale=1.0 / (D ** 0.5))
+O.set_output(True).set_data_type(cudnn.data_type.HALF)
+g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+
+# This run uses 64 of the declared 256 rows. Buffers keep the declared extent.
+q, k, v = (torch.randn(B, H, 256, D, dtype=torch.float16, device="cuda") for _ in range(3))
+o = torch.empty(B, H, 256, D, dtype=torch.float16, device="cuda")
+geometry = [B, H, 64, D]
+strides = [H * 256 * D, 256 * D, D, 1]
+overrides = dict(
+    override_uids=[Q.get_uid(), K.get_uid(), V.get_uid(), O.get_uid()],
+    override_shapes=[geometry, geometry, geometry, geometry],
+    override_strides=[strides, strides, strides, strides],
+)
+# Query for the same geometry passed to execute (cuDNN >= 9.23).
+workspace = torch.empty(g.get_workspace_size(**overrides), dtype=torch.uint8, device="cuda")
+g.execute({Q: q, K: k, V: v, O: o}, workspace, **overrides)
+```
+
+### What an override does and does not do
+
+- **Buffers are sized for the declaration.** An override says how much of a
+  declared buffer this run uses; it neither shrinks the allocation nor re-packs
+  the layout, and the strides describe the declared storage. Allocating only the
+  run's extent leaves the kernel addressing past the buffer.
+- **The plan is chosen at build time.** `override_*` does not re-run the
+  heuristic and does not reselect an engine, so grouping lengths into buckets is
+  the caller's policy rather than something this feature does. Two graphs
+  declared at different extents are two different plans.
+- **It is not `set_dynamic_shape_enabled` / the kernel cache.** That feature
+  reuses compiled kernels across dynamic-shape graphs (see
+  [Dynamic Shapes and Kernel Cache](../utilities/dynamic-kernel-cache.md)); this
+  one keeps a single plan and re-describes its operands per run.
+- **It is not CUDA graph capture/replay.** Overrides are an execute-path
+  argument; capturing a graph populated with a fixed variant pack is a separate
+  contract.
+
+### Boundaries
+
+Measured on an L20 (SM89), cuDNN 9.26, FP16, `B=1 H=4 D=64`, plan
+`eng8_k24=1_k27=0_k38=0_k40=3_k41=1` for prefill and
+`eng8_k24=1_k27=0_k38=0_k40=2_k41=1` for decode. Buffers cover the declared
+extent, or the larger override for the explicitly oversized probe:
+
+| declared | run | result |
+|---|---|---|
+| 256, non-causal | 64 / 128 / 192 / 256 | served, max abs error ~3e-4 (FP16 storage) |
+| 256, causal | 2 / 33 / 64 / 96 / 128 | served, same error |
+| 256, `generate_stats=True` | 64 | served, O and Stats both follow the override |
+| 1 (decode), KV declared 256 | `s_q=1`, `s_kv=64` | served |
+| 256 | `s_q = 1` | **rejected**: `CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE` |
+| 256 | 96 / 160 (non-causal, off the 64-row tile grid) | **not rejected, wrong output** |
+| 256 | 320 (beyond the declaration, with storage and strides for 320 rows) | **not rejected** on the measured plan; outside the declared envelope |
+| any | `override_uids` and `override_shapes` of different length | rejected at variant-pack finalize (`CUDNN_STATUS_BAD_PARAM`) |
+
+These are observations of this platform and plan, not a portable supported-shape
+contract. The tests gate measured overrides and strict xfails on the device,
+runtime version, and selected plan. The oversized probe allocates physical
+storage for every overridden row; an xfail does not make an undersized CUDA
+allocation safe. Acceptance outside the declaration is not a correctness guarantee.
+
+Two consequences for callers:
+
+1. **Decode and prefill are different engine classes.** A declared prefill graph
+   cannot be overridden to `s_q == 1`, and a graph declared at `s_q == 1` should
+   not be expected to serve prefill lengths. Keep one graph per class.
+2. **The legal window is narrower than "anything up to the declaration".** In the
+   non-causal class only multiples of the plan's Q tile were served on the
+   measured configuration; the other lengths produced wrong output without an
+   error. Validate the window you intend to use against your own plan and shapes
+   before relying on it, and prefer run extents that match the declaration's
+   tiling.
+
+The `s_q == 1` boundary and the declared-max-length sensitivity of the heuristic
+(an `eng8` -> `eng10` flip between a declared 128 and 256, and 2.0-2.3x cost on
+4-token rows on B200) were reported in
+[#1087](https://github.com/NVIDIA/cudnn-frontend/issues/1087) for SM100/SM107.
+Those numbers belong to the reporter's platform; the table above is this
+repository's L20 measurement, and on that configuration the plan list did not
+change between a declared 64 and a declared 256. The split-KV note in the same
+report (an override forces the split-KV factor to 1; 1.2-1.6x on low-occupancy
+shapes for the per-batch `seq_len` form) is likewise the reporter's measurement
+and has not been repeated here.
 
 ## FAQs
 

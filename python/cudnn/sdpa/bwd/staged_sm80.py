@@ -12,7 +12,7 @@ import torch
 from cudnn.sdpa.fwd.api_dsl import _torch_stream_context, ws_align
 from cudnn.sdpa.fwd.prepared import BufferFacts, facts_of_tensor
 from .prepared import ROLES, bind
-from .prepared_sm80 import build_spec
+from .prepared_sm80 import RO_ROLES, build_spec
 from .kernels.sm80.prepared_host import workspace_regions
 
 
@@ -44,8 +44,10 @@ def layout_for(api):
         if api.thd:
             # Packed output casts/folds already truncate the flavor padding
             # and preserve the capacity tail on device; never copy them back.
+            # Copies keep every row in place, so they span the caller's
+            # physical capacity: bound ragged offsets address caller rows.
             copy = padded and role in ROLES[:5]
-            batch, seq = 1, api._t_kv_cap if is_kv else api._t_q_cap
+            batch, seq = 1, api._t_kv_phys if is_kv else api._t_q_phys
         else:
             copy = padded or not compact or role == "dq" or (role in ("dk", "dv") and api.h_q != api.h_kv)
             batch = api.batch_size
@@ -82,7 +84,7 @@ def compile_staged(api, d64_module):
     return spec
 
 
-def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
+def run_staged(api, tensors, workspace, stream, scale, rope_freqs, ro_tensors=()):
     """Bind current staged pointers to one compiled chain; retain no buffers."""
     layout, spec = api._staged_layout, api._staged_prepared
     original = dict(zip(ROLES, tensors))
@@ -95,8 +97,14 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
     # Check overlap before any staging write. Shape checks below use metadata
     # only, including THD lengths; no device value is read on the host.
     original_facts = {role: facts_of_tensor(tensor) for role, tensor in original.items()}
-    for role, tensor in (*original.items(), ("rope", rope_freqs)):
-        f = facts_of_tensor(tensor) if role == "rope" else original_facts[role]
+    # Bound ragged offsets ride to the chain unchanged: the staging copies keep
+    # every row in place, so caller-buffer token origins stay valid.
+    ro_pairs = tuple(zip(RO_ROLES, ro_tensors or (None,) * len(RO_ROLES)))
+    ro_facts = {role: facts_of_tensor(tensor) for role, tensor in ro_pairs}
+    # The offsets are read by the setup launch after the staging copies run, so
+    # they must not alias any of the caller workspace, staging prefix included.
+    for role, tensor in (*original.items(), ("rope", rope_freqs), *ro_pairs):
+        f = ro_facts[role] if role in ro_facts else facts_of_tensor(tensor) if role == "rope" else original_facts[role]
         if f is not None:
             if role == "rope" and tensor.device.type == "cpu":
                 continue  # Preserve the standalone wrapper's CPU angle-table input.
@@ -110,7 +118,7 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
         f = original_facts[role]
         shape, strides = tuple(desc.shape), tuple(desc.stride)
         if api.thd:
-            tokens = api._t_kv_cap if role in ("k", "v", "dk", "dv") else api._t_q_cap
+            tokens = api._t_kv_phys if role in ("k", "v", "dk", "dv") else api._t_q_phys
             shape = (1, shape[1], tokens, shape[3])
             strides = (tokens * api._thd_token_strides[role], api._thd_head_strides[role], api._thd_token_strides[role], 1)
         if tensor.dtype != api.dtype or f.shape != shape or any(n > 1 and actual != expected for n, actual, expected in zip(shape, f.strides, strides)):
@@ -168,7 +176,9 @@ def run_staged(api, tensors, workspace, stream, scale, rope_freqs):
             raise ValueError(f"sdpa_bwd_sm80: {role} dtype must match its declaration or accumulation output")
     if stream is None:
         stream = torch.cuda.current_stream(device).cuda_stream
-    cooked_facts = dict(original_facts, stats=facts_of_tensor(stats) if api._has_rope else original_facts["stats"], dbias=None, dsink=None, rope=None)
+    cooked_facts = dict(
+        original_facts, **ro_facts, stats=facts_of_tensor(stats) if api._has_rope else original_facts["stats"], dbias=None, dsink=None, rope=None
+    )
     if not api._has_rope:
         _run_copies(api, original_facts, cooked_facts, ws.ptr, int(stream), scale)
         return
@@ -261,7 +271,7 @@ def _run_copies(api, original, cooked, base, stream, scale):
             dst_strides.append(tuple(dst.strides[i] for i in (0, 2, 1, 3)))
         frames.append((tuple(srcs), tuple(dsts), tuple(src_strides), tuple(dst_strides)) if output else (tuple(srcs), tuple(dsts), tuple(src_strides)))
     if api.thd and frames[0] is not None:
-        frames[0] += (api._t_q_cap, api._t_kv_cap)
+        frames[0] += (api._t_q_phys, api._t_kv_phys)
     outputs = [original[role] for role, _, _ in copies[1][2]] if copies[1] is not None else []
     serial_scatter = any(a.ptr < b.ptr + b.span * 2 and b.ptr < a.ptr + a.span * 2 for i, a in enumerate(outputs) for b in outputs[i + 1 :])
     aux_frames = []
