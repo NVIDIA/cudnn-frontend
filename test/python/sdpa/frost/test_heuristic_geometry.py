@@ -266,17 +266,33 @@ def test_paged_split_public_request_declines_unsupported_geometry(overrides):
 
 @requires_dsl
 @pytest.mark.parametrize("wants_stats", [False, True])
-@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("paged,d,arch", [(False, 128, "sm100"), (False, 192, "sm100"), (True, 128, "sm100"), (True, 128, "sm107")])
 @pytest.mark.parametrize("batch,heads,q,kv", [(1, 4, 128, 4096), (4, 8, 128, 8192), (1, 16, 512, 32768)])
-def test_bounded_overrides_use_declared_geometry(batch, heads, q, kv, d, wants_stats):
+def test_bounded_overrides_use_declared_geometry(batch, heads, q, kv, paged, d, arch, wants_stats, monkeypatch):
     # An explicit upper bound permits the same plan-time policy as the fixed
     # declaration. Do not pin a split count or a winning engine.
-    args = dict(b=batch, h_q=heads, h_kv=heads, s_q=q, s_kv=kv, device_sm_count=148, d_qk=d, wants_stats=wants_stats)
-    exact = _mla_split_facts(**args)
-    bounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=batch * q)
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, bounded) == heur.nonpaged_thd_split_choice(SPEC.capabilities, exact)
-    unbounded = _mla_split_facts(**args, shape_overrides=True, max_total_seq_len_q=None)
-    assert heur.nonpaged_thd_split_choice(SPEC.capabilities, unbounded) == (1, False)
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_" + arch)
+    args = dict(
+        b=batch,
+        h_q=heads,
+        h_kv=heads // 4 if paged else heads,
+        s_q=q,
+        s_kv=kv,
+        device_sm_count=148,
+        device_cc=(10, 7) if arch == "sm107" else (10, 0),
+        d_qk=d,
+        wants_stats=wants_stats,
+    )
+    facts = _paged_split_facts if paged else _mla_split_facts
+    choose = heur.paged_thd_split_choice if paged else heur.nonpaged_thd_split_choice
+    exact = facts(**args)
+    bounded = facts(**args, shape_overrides=True, max_total_seq_len_q=batch * q)
+    assert choose(spec.capabilities, bounded) == choose(spec.capabilities, exact)
+    unbounded = facts(**args, shape_overrides=True, max_total_seq_len_q=None)
+    assert choose(spec.capabilities, unbounded) == (1, False)
 
 
 @requires_dsl
