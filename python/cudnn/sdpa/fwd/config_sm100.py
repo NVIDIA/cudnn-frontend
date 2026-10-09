@@ -281,7 +281,7 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
             (device_cc in ((10, 0), (10, 3)) and paged and d_shape == (64, 64) and max_q > 0)
             or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
-            or (device_cc == (10, 7) and paged and d_shape == (256, 256) and max_q > 0)
+            or (d_shape == (256, 256) and max_q > 0)
         )
     )
 
@@ -289,6 +289,11 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
 def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
     """Native scalar-tail masking composes with D128 half/per-tensor FP8 split."""
     return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)
+
+
+def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
+    """Sink-aware packed combine, qualified on Rubin D128 paged half Q>1."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1
 
 
 def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
@@ -376,7 +381,7 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
             (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
-            or (flavor == "d256" and k.cta_mma == 2 and k.paged_kv and not fp8 and not k.pack_gqa)
+            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
             or (
                 flavor == "d128"
                 and k.cta_mma == 1

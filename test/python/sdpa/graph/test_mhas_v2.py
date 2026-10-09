@@ -3810,9 +3810,9 @@ def _p2_planned_graph(cfg, cudnn_handle):
 
 @_cc107_only
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("d", [256])
 def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn_handle):
-    """Sink x split-KV stays declined on the paged THD leg (sm100/split_combine has no sink fold): every plan the row
+    """D256 sink x split-KV stays declined on the paged THD leg: every plan the row
     proposes for a paged THD + sink graph is unsplit, and pinning SPLIT_KV=2 on its own proposal through
     create_execution_plan is a typed decline at build, never a degraded plan.  (TILE_CGA_M=2 is the row's cluster
     domain under a split; a cga1 pin would decline on the cga domain first and mask the reason under test.)"""

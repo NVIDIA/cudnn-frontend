@@ -271,10 +271,10 @@ class SdpaThdBinder {
             const bool d64_split = paged_ && cga_tile_m_ == 128 && split_dq == 64 && split_dv == 64;
             const bool d128_split =
                 cga_tile_m_ == 128 && split_dv == 128 && (split_dq == 128 || (!paged_ && split_dq == 192));
-            const bool d256_split = paged_ && cga_tile_m_ == 256 && split_dq == 256 && split_dv == 256;
-            if (has_sink_ || splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX ||
-                off_partial_o_ < 0 || off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 ||
-                !(d64_split || d128_split || d256_split))
+            const bool d256_split = cga_tile_m_ == 256 && split_dq == 256 && split_dv == 256;
+            if ((has_sink_ && !(paged_ && d128_split && split_dq == 128)) || splits_ <= 1 || split_capacity_ <= 0 ||
+                split_capacity_ > INT32_MAX || off_partial_o_ < 0 || off_partial_lse_ < 0 || off_partial_o_ % 16 ||
+                off_partial_lse_ % 16 || !(d64_split || d128_split || d256_split))
                 invalid("invalid prepared packed split geometry");
             const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);
             if (off_partial_o_ < add(off_o_desc_, multiply(add(b_, 3), 128)) ||
@@ -795,8 +795,10 @@ init_sdpa_thd_binding(py::module_ &m) {
         .def(py::init<const py::object &>(), py::arg("spec"))
         .def_property_readonly_static("supports_stats_stride_override", [](py::object) { return true; })
         .def_property_readonly_static("supports_paged_packed_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_paged_split_sink", [](py::object) { return true; })
         .def_property_readonly_static("supports_paged_d64_packed_split", [](py::object) { return true; })
         .def_property_readonly_static("supports_paged_d256_packed_split", [](py::object) { return true; })
+        .def_property_readonly_static("supports_nonpaged_d256_packed_split", [](py::object) { return true; })
         .def_property_readonly_static("supports_nonpaged_packed_split", [](py::object) { return true; })
         .def_property_readonly_static("supports_nonpaged_d128_packed_split", [](py::object) { return true; })
         .def("bind",

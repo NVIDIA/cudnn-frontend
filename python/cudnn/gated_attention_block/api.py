@@ -266,11 +266,17 @@ LSE ``[1, H_q, T]`` -- the dense record's ``[B, H_q, S]`` at ``B = 1, S = T``, s
 the :class:`SavedForBackward` contract is unchanged (``seq_lens`` REQUIRED and
 ``seq_lens_form`` naming its form).  ``cos`` / ``sin`` are PER-TOKEN tables whose
 positions restart at every sequence; the caller packs them.  Served: bf16 / fp16
-(inference and training), the UNFUSED per-tensor FP8 pipeline, ``fuse_norm_rope``
-for bf16 / fp16 inference.  Typed declines: ``fuse_gate`` (the SDPA's epilogue
-gate has no THD gate descriptor), MXFP8 and the fp4 modes that ride it (no packed
-per-sequence scale-factor layout), ``seq_lens_present`` (the two length contracts
-are mutually exclusive).  The lengths are device data, never read on the host:
+(inference and training), the UNFUSED per-tensor FP8 and MXFP8 pipelines
+(inference and training; the fp4 modes that ride MXFP8 included -- the three
+``quantize_mxfp8`` stages run their PACKED arm and write the SDPA row's
+per-sequence-tile-padded scale-factor layout at the slot capacity
+``_sf_slot_bytes_packed``; ``kernels/quantize_mxfp8.py`` "PACKED sequences"),
+``fuse_norm_rope`` for bf16 / fp16 inference.  Typed declines: ``fuse_gate`` (the
+SDPA's epilogue gate has no THD gate descriptor), the fully fused quantized
+pipelines (``fuse_gate`` again, and the fused MXFP8 projection fork decodes
+``(b, s_tile)`` once per 128-row GEMM tile, which a packed tile may straddle),
+``seq_lens_present`` (the two length contracts are mutually exclusive).  The
+lengths are device data, never read on the host:
 the caller's contract is every length in ``[0, max_seq_len]`` and
 ``sum(lengths) == T`` -- the SDPA leaves rows past the live total UNWRITTEN, and
 the gate and the backward's weight-gradient GEMMs read every one of the ``T``
@@ -280,7 +286,7 @@ varies pads with zero-length sequences.
 Not in scope for v1, in the order they are likely to land: an MXFP8 (e4m3
 block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the block-scaled
 out projection exists only in the fp4 formats above); the graph-API engine row;
-the packed-sequence arms of ``fuse_gate`` and of the MXFP8 pipeline. This is a
+the packed-sequence arms of ``fuse_gate`` and of the fully fused MXFP8 pipeline. This is a
 frontend-only OSS API first; a manifest family + ``Capabilities`` comes when the
 stages exist to be honest about.
 """
@@ -996,6 +1002,20 @@ def _sf_slot_bytes(b: int, h: int, s: int, d: int) -> int:
     return b * h * _ceil_div(s, _SF_TILE_ROWS) * (_SF_TILE_ROWS * d // _SF_BLOCK)
 
 
+def _sf_slot_bytes_packed(num_sequences: int, h: int, t: int, d: int) -> int:
+    """Bytes of ONE SDPA scale-factor blob under THD (``thd=True``): the PACKED per-sequence-tile-padded layout the Rubin
+    d256 MXFP8 row reads, sized at its CAPACITY -- ``H * n_cap * (128 * D/32)`` with ``n_cap = (T + 127 * B) // 128``, the
+    host bound on the live tile total ``sum_b ceil(s_b / 128)`` (the lengths' VALUES are never read; ``B = num_sequences``).
+    The dense ``(1, T)`` count ``H * ceil(T/128)`` is short by up to ``B - 1`` tiles per head -- a slot sized that way is
+    an out-of-bounds write by the packed quantizer.  ``kernels/quantize_mxfp8.py::sf_bytes_packed`` is the ONE source of
+    the formula; K and V (both ``h_kv``) carry the same count by construction, which the SDPA's binder requires (it
+    derives the tile extent from the byte count, so the view handed over must be the WHOLE slot, never the live total).
+    """
+    from .kernels.quantize_mxfp8 import sf_bytes_packed
+
+    return sf_bytes_packed(num_sequences, h, t, d)
+
+
 def _plan_workspace(
     geom: GatedAttentionBlockGeometry,
     b: int,
@@ -1010,6 +1030,7 @@ def _plan_workspace(
     o_fp4: Optional[Fp4Format] = None,
     want_saved: bool = False,
     saved_gate_copy: bool = False,
+    thd_num_sequences: int = 0,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
@@ -1035,6 +1056,11 @@ def _plan_workspace(
     ``mxfp8`` (appended) adds the three SDPA scale-factor blobs ``sf_q`` /
     ``sf_k`` / ``sf_v`` (:func:`_sf_slot_bytes`) at the END of either layout, so
     every FP8 offset is byte-identical to before MXFP8 existed.
+    ``thd_num_sequences`` (appended; 0 = dense) sizes those three slots at the
+    PACKED capacity (:func:`_sf_slot_bytes_packed`, ``B = thd_num_sequences``,
+    ``T = b * s``) for a ``thd=True`` block -- the ONLY difference between the
+    packed MXFP8 carve and the dense ``(1, T)`` one (pinned by
+    ``test_block_thd_mxfp8.py``).
 
     ``o_fp4`` (appended; an :class:`Fp4Format`) appends ``o4`` (packed e2m1 gated O,
     ``t*h_q*d_head // 2`` bytes) and ``sf_o`` (its padded F8_128x4 blob,
@@ -1095,7 +1121,7 @@ def _plan_workspace(
             ("o", t * geom.h_q * geom.d_head * e) if o_fp4 is not None else ("o8", t * geom.h_q * geom.d_head),
         ]
         if mxfp8:
-            slots += _sf_slots(geom, b, s)
+            slots += _sf_slots(geom, b, s, thd_num_sequences)
         if o_fp4 is not None:
             slots += _o_fp4_slots(geom, t, o_fp4)
         for name, nbytes in slots:
@@ -1179,7 +1205,7 @@ def _plan_workspace(
         slots += [("o8", t * geom.h_q * geom.d_head)]
     if mxfp8:
         # MXFP8: the SDPA's F8_128x4 SF blobs, written by the three quantize_mxfp8 stages.
-        slots += _sf_slots(geom, b, s)
+        slots += _sf_slots(geom, b, s, thd_num_sequences)
     if o_fp4 is not None:
         # fp4 O (rows 8 / 9): the quantize_fp4 stage's packed codes + the out_proj GEMM's scale blob, at the END.
         slots += _o_fp4_slots(geom, t, o_fp4)
@@ -1210,13 +1236,16 @@ def _plan_workspace(
     )
 
 
-def _sf_slots(geom: GatedAttentionBlockGeometry, b: int, s: int) -> list:
-    """The three MXFP8 SDPA scale-factor slots, in (Q, K, V) order."""
-    return [
-        ("sf_q", _sf_slot_bytes(b, geom.h_q, s, geom.d_head)),
-        ("sf_k", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
-        ("sf_v", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
-    ]
+def _sf_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, thd_num_sequences: int = 0) -> list:
+    """The three MXFP8 SDPA scale-factor slots, in (Q, K, V) order.  ``thd_num_sequences`` (appended; 0 = dense) selects
+    the PACKED capacity count of :func:`_sf_slot_bytes_packed` at ``T = b * s`` for a ``thd=True`` block."""
+
+    def nbytes(h: int) -> int:
+        if thd_num_sequences:
+            return _sf_slot_bytes_packed(thd_num_sequences, h, b * s, geom.d_head)
+        return _sf_slot_bytes(b, h, s, geom.d_head)
+
+    return [("sf_q", nbytes(geom.h_q)), ("sf_k", nbytes(geom.h_kv)), ("sf_v", nbytes(geom.h_kv))]
 
 
 def _o_fp4_code_bytes(geom: GatedAttentionBlockGeometry, t: int) -> int:
@@ -2037,6 +2066,20 @@ class _QuantizeMxfp8(_Stage):
     ``T % 32 == 0`` (whole 32-token blocks).  ``moved_bytes`` is the same count in
     every mode; ``execute`` forwards the same operands (``dst`` is the ``[H*D, T]``
     matrix when transposed).
+
+    **The packed arm** (``packed=True``, appended; the block's THD pipeline): the
+    unit is a ``(head, packed tile)`` of the PER-SEQUENCE-TILE-PADDED SF layout the
+    Rubin d256 MXFP8 SDPA's THD row reads (``kernels/quantize_mxfp8.py`` "PACKED
+    sequences": Q/K slabs at ``(h*n_cap + tile) * 1024``, V's two D-planes ADJACENT
+    inside the tile), the grid ``(H, n_cap)`` with ``n_cap = (T + 127 *
+    num_sequences) // 128`` the capacity bound on ``sum_b ceil(s_b/128)``, every
+    slack tile zero-filled; the kernel resolves each tile's sequence from the
+    lengths tensor on device.  ``execute(..., seq_lens=)`` then takes that tensor
+    (``[B]`` int32 lengths, or ``[B+1]`` prefix sums under ``cu_seqlens``) INSTEAD of
+    ``batch`` / ``seq_len`` -- REQUIRED under ``packed``, refused otherwise (Rule 1,
+    both ways; the kernel host checks the same).  ``sf_bytes()`` is then
+    :func:`_sf_slot_bytes_packed`.  ``batch`` / ``seq_len`` stay the block's ``(1,
+    T)`` so ``rows()`` / ``moved_bytes()`` read ``T``.
     """
 
     def __init__(
@@ -2053,6 +2096,9 @@ class _QuantizeMxfp8(_Stage):
         transposed: bool = False,
         dual: bool = False,
         transposed_second: bool = False,
+        packed: bool = False,
+        num_sequences: int = 0,
+        cu_seqlens: bool = False,
     ) -> None:
         self.name = name
         self.geom = geometry
@@ -2070,10 +2116,23 @@ class _QuantizeMxfp8(_Stage):
         # half); ``execute`` then takes ``dst_T`` / ``sf_T`` (appended) -- REQUIRED under ``dual``, refused otherwise (Rule 1).
         self.dual = bool(dual)
         self.transposed_second = bool(transposed_second)
+        # Appended: the PACKED (THD) arm -- see the class docstring.  ``num_sequences`` is the packing's B (the lengths tensor has B
+        # entries, or B+1 prefix sums under ``cu_seqlens``); the lengths themselves ride ``execute(seq_lens=)``.
+        self.packed = bool(packed)
+        self.num_sequences = int(num_sequences)
+        self.cu_seqlens = bool(cu_seqlens)
         self._recipe = None
 
     def check_support(self) -> None:
-        from .kernels.quantize_mxfp8 import AXES, SF_LAYOUTS, validate_dual_mode, validate_dual_shape, validate_mode, validate_shape
+        from .kernels.quantize_mxfp8 import (
+            AXES,
+            SF_LAYOUTS,
+            validate_dual_mode,
+            validate_dual_shape,
+            validate_mode,
+            validate_packed_mode,
+            validate_shape,
+        )
 
         if self.axis not in AXES:
             raise ValueError(f"{self.name}: axis must be one of {AXES} ('row' for Q/K, 'col' for V), got {self.axis!r}")
@@ -2086,6 +2145,16 @@ class _QuantizeMxfp8(_Stage):
             )
         if self.dtype_in not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: the quantize source must be bf16/f16, got {self.dtype_in}")
+        if self.packed:
+            # The packed arm serves the SDPA layouts only (no canonical blob, no transposed store) and needs the packing's B.
+            validate_packed_mode(self.sf_layout, self.transposed, True)
+            if self.num_sequences < 1:
+                raise ValueError(
+                    f"{self.name}: packed=True needs num_sequences >= 1 (the packing's B: the lengths tensor has B entries, or B+1 prefix sums "
+                    f"under cu_seqlens), got {self.num_sequences}"
+                )
+        elif self.num_sequences or self.cu_seqlens:
+            raise ValueError(f"{self.name}: num_sequences / cu_seqlens are the packed (THD) arm's fields (packed=True); this stage is dense")
         if self.dual:
             if self.axis != "row" or self.transposed:
                 raise ValueError(
@@ -2111,6 +2180,7 @@ class _QuantizeMxfp8(_Stage):
                 threads_per_cta=_QUANTIZE_MXFP8_THREADS,
                 sf_layout=self.sf_layout,
                 transposed_second=self.transposed_second,
+                packed=self.packed,
             )
             return
         self._recipe = compile_quantize_mxfp8(
@@ -2121,6 +2191,7 @@ class _QuantizeMxfp8(_Stage):
             threads_per_cta=_QUANTIZE_MXFP8_THREADS,
             sf_layout=self.sf_layout,
             transposed=self.transposed,
+            packed=self.packed,
         )
 
     def rows(self) -> int:
@@ -2129,12 +2200,15 @@ class _QuantizeMxfp8(_Stage):
     def sf_bytes(self) -> int:
         """Bytes of the SF blob this stage writes, BY LAYOUT: ``"sdpa"`` -> ``_sf_slot_bytes`` (== the SDPA adapter's
         ``_reshape_sf`` count); ``"gemm"`` -> ``proj_gemm.sf_blob_bytes(T, H*D)`` rowwise / ``sf_blob_bytes(H*D, T)``
-        transposed (the block-scale GEMM's padded F8_128x4 blob; the batch folds into the rows)."""
+        transposed (the block-scale GEMM's padded F8_128x4 blob; the batch folds into the rows); under ``packed`` the
+        capacity count :func:`_sf_slot_bytes_packed` (``T = rows()``)."""
         if self.sf_layout == "gemm":
             from .kernels.proj_gemm import sf_blob_bytes
 
             k = self.heads * self.geom.d_head
             return sf_blob_bytes(k, self.rows()) if self.transposed else sf_blob_bytes(self.rows(), k)
+        if self.packed:
+            return _sf_slot_bytes_packed(self.num_sequences, self.heads, self.rows(), self.geom.d_head)
         return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
 
     def sf_bytes_second(self) -> int:
@@ -2146,6 +2220,8 @@ class _QuantizeMxfp8(_Stage):
             from .kernels.proj_gemm import sf_blob_bytes
 
             return sf_blob_bytes(self.heads * self.geom.d_head, self.rows())
+        if self.packed:
+            return _sf_slot_bytes_packed(self.num_sequences, self.heads, self.rows(), self.geom.d_head)
         return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
 
     def moved_bytes(self) -> int:
@@ -2166,26 +2242,46 @@ class _QuantizeMxfp8(_Stage):
         current_stream=None,
         dst_T: Optional[torch.Tensor] = None,
         sf_T: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """``src`` ``[T, H, D]`` (strided ok), ``dst`` compact e4m3 ``[T, H, D]`` (the contiguous ``[H*D, T]`` matrix when
         ``transposed``), ``sf`` uint8 flat (``sf_bytes()`` bytes).  Under ``dual`` (appended) ``dst_T`` / ``sf_T`` are the second
         half's outputs -- a compact e4m3 ``[T, H, D]`` + the D-plane-major blob under ``"sdpa"``, the contiguous ``[H*D, T]`` matrix +
-        ``sf_bytes_second()`` under ``"gemm"`` -- REQUIRED; without ``dual`` they are refused (Rule 1, both ways)."""
+        ``sf_bytes_second()`` under ``"gemm"`` -- REQUIRED; without ``dual`` they are refused (Rule 1, both ways).
+
+        Under ``packed`` (appended; THD) ``seq_lens`` -- the ``[B]`` int32 lengths, or the ``[B+1]`` int32 prefix sums under
+        ``cu_seqlens``, on ``src``'s device -- REPLACES ``batch`` / ``seq_len`` (REQUIRED, and those two are refused; a dense stage
+        refuses ``seq_lens``: Rule 1, both ways).  The lengths are validated for FORM only and never read on the host (CUDA-graph
+        capturable): the caller's contract is every length in ``[0, max_seq_len]`` and ``sum(lengths) == T`` -- a violation writes
+        payload rows past ``T`` (the SF writes are bounded by the slot's capacity in every case)."""
         from .kernels.quantize_mxfp8 import run_quantize_mxfp8, run_quantize_mxfp8_dual
 
         if self._recipe is None:
             raise RuntimeError("call compile() before execute()")
-        b = self.batch if batch is None else int(batch)
-        s = self.seq_len if seq_len is None else int(seq_len)
+        if self.packed:
+            if seq_lens is None:
+                raise ValueError(
+                    f"{self.name}: this stage is packed=True (THD): execute needs seq_lens (the [B] int32 lengths, or [B+1] int32 prefix sums under "
+                    "cu_seqlens) in place of batch / seq_len"
+                )
+            if batch is not None or seq_len is not None:
+                raise ValueError(
+                    f"{self.name}: packed=True: batch / seq_len are the dense geometry; the packed stage runs over (T, num_sequences, seq_lens) (Rule 1)"
+                )
+            geo = dict(seq_lens=seq_lens, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens)
+        else:
+            if seq_lens is not None:
+                raise ValueError(f"{self.name}: seq_lens is the packed (THD) stage's lengths tensor; this stage is packed=False (Rule 1)")
+            geo = dict(batch=self.batch if batch is None else int(batch), seq_len=self.seq_len if seq_len is None else int(seq_len))
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(src.device).cuda_stream
         if self.dual:
             if dst_T is None or sf_T is None:
                 raise ValueError(f"{self.name}: this stage is dual=True (rowwise + columnwise from one read): dst_T and sf_T must be bound at execute (Rule 1)")
-            run_quantize_mxfp8_dual(self._recipe, src, dst, sf, dst_T, sf_T, batch=b, seq_len=s, stream=stream)
+            run_quantize_mxfp8_dual(self._recipe, src, dst, sf, dst_T, sf_T, stream=stream, **geo)
             return
         if dst_T is not None or sf_T is not None:
             raise ValueError(f"{self.name}: this stage is dual=False; passing dst_T / sf_T would silently ignore them (Rule 1)")
-        run_quantize_mxfp8(self._recipe, src, dst, sf, batch=b, seq_len=s, stream=stream)
+        run_quantize_mxfp8(self._recipe, src, dst, sf, stream=stream, **geo)
 
 
 class _QuantizeFp4(_Stage):
@@ -3076,6 +3172,11 @@ class _Sdpa(_Stage):
     (``engine_name(arch, mxfp8=True)``: NATURAL at (256, 256) -- the per-tensor
     row's LPT claim does NOT transfer, D5) and ``cta_mma`` is left to the
     adapter (1 for the quantized d256 flavor).  ``has_amax_o=False`` as under FP8.
+    Under ``thd=True`` the three blobs are the row's PACKED per-sequence-tile-padded
+    layout at the block's slot CAPACITY (``_sf_slot_bytes_packed``: ``n_cap`` tiles
+    per head, K and V equal) -- the adapter's binder derives the tile extent from
+    the byte count, so each view handed over is the WHOLE slot, never the live
+    total; the block's packed ``quantize_mxfp8`` stages write every byte of it.
 
     **FP8** (``dtype == e4m3``): ``pertensor_fp8=True``, ``dtype_o`` (bf16 on the
     unfused pipeline, e4m3 on the fully fused one) and ``has_amax_o=False`` --
@@ -3175,8 +3276,10 @@ class _Sdpa(_Stage):
         self.want_lse = bool(want_lse)
         self.seq_lens_present = bool(seq_lens_present)
         # THD (packed sequences).  The block validates the whole contract (typed, in order) before building this stage;
-        # the checks here keep the STAGE honest on its own: the envelope must be declared, and the three features whose
-        # SDPA specializations have no THD arm are declined by name rather than left to the adapter's later message.
+        # the checks here keep the STAGE honest on its own: the envelope must be declared, and the two features whose
+        # SDPA specializations have no THD arm (the epilogue gate, the dense padding mask) are declined by name rather than
+        # left to the adapter's later message.  MXFP8 rides: the row's THD arm reads the packed per-sequence-tile-padded
+        # scale-factor layout the block's packed quantize stages write (class docstring).
         self.thd = bool(thd)
         self.cu_seqlens = bool(cu_seqlens)
         self.num_sequences = None if num_sequences is None else int(num_sequences)
@@ -3188,8 +3291,6 @@ class _Sdpa(_Stage):
                 raise NotImplementedError(
                     f"{self.name}: fuse_gate=True has no THD arm (the adapter declines 'epilogue gate fusion is dense-only (no THD gate descriptor)')"
                 )
-            if self.mxfp8:
-                raise NotImplementedError(f"{self.name}: the MXFP8 SDPA row serves no THD (its scale-factor tensors have no packed per-sequence layout)")
             if self.seq_lens_present:
                 raise ValueError(f"{self.name}: thd=True and seq_lens_present=True are mutually exclusive (the packed lengths ARE the per-sequence lengths)")
         elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
@@ -3743,8 +3844,11 @@ class GatedAttentionBlockFwd(APIBase):
     the head-major ``[1, H_q, T]``, ``saved.seq_lens`` the lengths tensor itself,
     ``saved.seq_lens_form`` its form.  Stage (4) runs the SDPA's varlen arm over
     packed ``(T, H, D)`` views in the natural tile order.  bf16 / fp16 (inference
-    and training), the UNFUSED per-tensor FP8 pipeline and ``fuse_norm_rope``
-    (bf16 / fp16 inference) are served; ``fuse_gate``, MXFP8 / fp4 and
+    and training), the UNFUSED per-tensor FP8 and MXFP8 pipelines (the fp4 modes
+    included; the three MXFP8 quantize stages write the SDPA row's PACKED
+    per-sequence-tile-padded scale-factor layout into slots sized at the capacity
+    ``_sf_slot_bytes_packed``) and ``fuse_norm_rope`` (bf16 / fp16 inference) are
+    served; ``fuse_gate``, the fully fused quantized pipelines and
     ``seq_lens_present`` are typed declines.  Module docstring, "THD".
 
     **TRAINING (``save_for_backward=True``; bf16 / fp16, out of place, no fusion
@@ -3971,8 +4075,9 @@ class GatedAttentionBlockFwd(APIBase):
                 "Pass fuse_gate=False for training."
             )
         # THD, typed, in this order: the length contract, the PIPELINE (so a fully fused quantized request hears about the
-        # pipeline, not the knob), the knob, the dtype family, then the sizes.  Everything else -- the unfused per-tensor
-        # FP8 pipeline, fuse_norm_rope for bf16 / fp16 inference, training -- is served at (1, T) with no further branch.
+        # pipeline, not the knob), the knob, then the sizes.  Everything else -- the unfused per-tensor FP8 and MXFP8
+        # pipelines (the fp4 modes included: the three quantize_mxfp8 stages run their PACKED arm, module docstring "THD"),
+        # fuse_norm_rope for bf16 / fp16 inference, training -- is served at (1, T) with no further branch.
         if self.thd:
             if self.seq_lens_present:
                 raise ValueError(
@@ -3983,7 +4088,8 @@ class GatedAttentionBlockFwd(APIBase):
             if quant is not None and (self.fuse_gate or self.fuse_norm_rope):
                 raise NotImplementedError(
                     f"the fully fused {_family} pipeline (fuse_norm_rope + fuse_gate) is dense-only: its gated SDPA specialization has no THD "
-                    "arm ('epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True run the UNFUSED quantized pipeline "
+                    "arm ('epilogue gate fusion is dense-only (no THD gate descriptor)'), and the fused MXFP8 projection fork decodes (b, s_tile) "
+                    "once per 128-row GEMM tile, which a packed tile may straddle; under thd=True run the UNFUSED quantized pipeline "
                     "(fuse_norm_rope=False, fuse_gate=False)"
                 )
             if self.fuse_gate:
@@ -3991,13 +4097,6 @@ class GatedAttentionBlockFwd(APIBase):
                     "fuse_gate=True is dense-only: the Rubin d256 SDPA's epilogue gate has no THD gate descriptor (sdpa/fwd/api_dsl.py declines "
                     "'epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True use fuse_gate=False (stage (5) runs as its "
                     "own launch)"
-                )
-            if self.mxfp8:
-                raise NotImplementedError(
-                    "MXFP8 (and the fp4 modes that ride it: MxQuantSpec.w_qkvg_dtype, o_fp4) is dense-only under thd=True: the "
-                    "sdpa_fwd_prefill_sm107_mxfp8 row serves no THD (its scale-factor tensors have no packed per-sequence layout) and the "
-                    "block's quantize_mxfp8 stage writes one F8_128x4 atom per (sequence, head, 128-row tile) of a padded [B, S] grid; use "
-                    "QuantSpec (per-tensor FP8, unfused) or the bf16 / fp16 pipeline"
                 )
             if self.num_sequences is None or self.max_seq_len is None:
                 raise ValueError(
@@ -4088,8 +4187,19 @@ class GatedAttentionBlockFwd(APIBase):
             self._quant_q = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_q")
             self._quant_kv = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_kv, name="quantize_kv")
         elif quantize:
+            # THD: the PACKED arm -- the per-sequence-tile-padded SF layout the MXFP8 row's THD arm reads, at the slot capacity
+            # (num_sequences is the packing's B; the lengths ride execute(seq_lens=) into each of the three launches).
             _mxq = lambda heads, axis, name: _QuantizeMxfp8(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=heads, axis=axis, name=name
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype_in=act,
+                heads=heads,
+                axis=axis,
+                name=name,
+                packed=self.thd,
+                num_sequences=self.num_sequences if self.thd else 0,
+                cu_seqlens=self.cu_seqlens,
             )  # noqa: E731
             self._quant_q = _mxq(geometry.h_q, "row", "quantize_mxfp8_q")
             self._quant_k = _mxq(geometry.h_kv, "row", "quantize_mxfp8_k")
@@ -4369,6 +4479,7 @@ class GatedAttentionBlockFwd(APIBase):
             o_fp4=self.o_fp4,
             want_saved=self.save_for_backward,
             saved_gate_copy=self.saved_gate_copy,
+            thd_num_sequences=self.num_sequences if self.thd else 0,
         )
 
     def get_workspace_size(self) -> int:
@@ -4809,10 +4920,9 @@ class GatedAttentionBlockFwd(APIBase):
         if self.o_fp4 is not None:
             o4, sfo = self._fp4_o_views(workspace, ws, t)
         if mxfp8:
-            # The SDPA's own F8_128x4 SF blobs (flat uint8), written by the three quantize stages.
-            sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(self.batch, g.h_q, self.seq_len, g.d_head),), torch.uint8)
-            sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
-            sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
+            # The SDPA's own F8_128x4 SF blobs (flat uint8), written by the three quantize stages -- under THD the WHOLE packed
+            # slot (the capacity count; the SDPA's binder derives the tile extent from the byte count), never the live total.
+            sfq, sfk, sfv = self._sf_views(workspace, ws)
 
         o_q, o_g, o_k, o_v = g.qkvg_offsets
         # Column slices of the fused projection, as strided views. Every consumer
@@ -4874,9 +4984,11 @@ class GatedAttentionBlockFwd(APIBase):
             # (3q) bf16 normed Q/K (+ the slab's V band) -> compact e4m3 + the SDPA's
             # F8_128x4 SF blobs: Q / K ROWWISE (blocks along D), V COLUMNWISE (blocks
             # along S, D-plane-major SF).  This IS the compaction the MXFP8 SDPA needs.
-            self._quant_q.execute(q_n, q8, sfq, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
-            self._quant_k.execute(k_n, k8, sfk, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
-            self._quant_v.execute(v_src, v8, sfv, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
+            # THD: the PACKED arm takes the lengths tensor (the very one the SDPA reads) in place of the (1, T) geometry.
+            qkw = dict(seq_lens=seq_lens) if self.thd else dict(batch=self.batch, seq_len=self.seq_len)
+            self._quant_q.execute(q_n, q8, sfq, current_stream=stream, **qkw)
+            self._quant_k.execute(k_n, k8, sfk, current_stream=stream, **qkw)
+            self._quant_v.execute(v_src, v8, sfv, current_stream=stream, **qkw)
             q_c, k_c, v_c = q8, k8, v8
         elif fp8:
             # (3q) bf16 normed Q/K (+ the slab's V band) -> compact e4m3.  This IS the
@@ -4933,6 +5045,23 @@ class GatedAttentionBlockFwd(APIBase):
         else:
             # (6) -- reads the gated O: the workspace `o` (inference) or `o_gated` (training).
             self._out_proj.execute(o_gated.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
+
+    def _sf_views(self, workspace: torch.Tensor, ws: "_Intermediates") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The three MXFP8 scale-factor slots as flat uint8 views, sized exactly as the carve reserved them: ``_sf_slot_bytes``
+        dense, ``_sf_slot_bytes_packed`` under ``thd`` (the capacity ``n_cap`` tiles per head -- the packed quantize stages write
+        every byte and the SDPA's binder reads the tile extent off the byte count, so Q / K / V are each handed the WHOLE slot)."""
+        g = self.geom
+
+        def nbytes(h: int) -> int:
+            if self.thd:
+                return _sf_slot_bytes_packed(self.num_sequences, h, self.batch * self.seq_len, g.d_head)
+            return _sf_slot_bytes(self.batch, h, self.seq_len, g.d_head)
+
+        return (
+            _view(workspace, ws.sf_q, (nbytes(g.h_q),), torch.uint8),
+            _view(workspace, ws.sf_k, (nbytes(g.h_kv),), torch.uint8),
+            _view(workspace, ws.sf_v, (nbytes(g.h_kv),), torch.uint8),
+        )
 
     def _fp4_o_views(self, workspace: torch.Tensor, ws: "_Intermediates", t: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """The two fp4-O workspace views: ``o4`` -- the packed e2m1 gated O as ``float4_e2m1fn_x2 [T, H_q*D/2]``
@@ -5045,9 +5174,7 @@ class GatedAttentionBlockFwd(APIBase):
         gate16 = _view(workspace, ws.gate16, (t, g.h_q, g.d_head), self.act_dtype)
         # e4m3 O for the per-tensor out_proj, or (o_fp4) bf16 O for the quantize_fp4 stage -- one slot exists, never both.
         o_sdpa = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4) if self.o_fp4 is None else _view(workspace, ws.o, (t, g.h_q, g.d_head), self.act_dtype)
-        sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(b, g.h_q, s, g.d_head),), torch.uint8)
-        sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
-        sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
+        sfq, sfk, sfv = self._sf_views(workspace, ws)  # the fully fused pipeline is dense-only: the dense slot sizes
         engine_ws = workspace[ws.engine_scratch :]
         # (1''): the runner takes the four data outputs 2-D ([T, h*d]) + the three SF blobs flat.
         self._proj.execute_mxfp8(
