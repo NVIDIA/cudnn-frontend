@@ -236,6 +236,13 @@ def _extract_facts(node: Any) -> NormGraphFacts:
     run_mean = _port(inputs, "in_running_mean", "prev_running_mean", "running_mean")
     run_var = _port(inputs, "in_running_var", "prev_running_var", "running_var")
 
+    # A backward graph has no bias INPUT -- beta only shows up as the DBias
+    # OUTPUT -- so deriving has_beta from the input alone reports False for every
+    # bprop graph. The lowering passes has_beta straight to norm_bprop, which then
+    # returns dbeta=None and the DBias buffer is never written: silent, because the
+    # engine simply skips a copy it thinks it has nothing for.
+    dbias_out = _port(outputs, "DBias", "Dbias", "dbias", "dbeta")
+
     return NormGraphFacts(
         variant=variant,
         phase=phase,
@@ -244,7 +251,7 @@ def _extract_facts(node: Any) -> NormGraphFacts:
         num_groups=int(num_groups) if num_groups is not None else None,
         dtype=x_dtype,
         uniform_dtype=uniform,
-        has_beta=bias is not None,
+        has_beta=(bias is not None) if phase == "fprop" else (dbias_out is not None),
         has_mean=HAS_MEAN[variant],
         training=training,
         eps=eps,
@@ -262,7 +269,7 @@ def _extract_facts(node: Any) -> NormGraphFacts:
         dy_t=dy,
         dx_t=_port(outputs, "DX", "dx", "grad_input"),
         dscale_t=_port(outputs, "DScale", "Dscale", "dscale", "dgamma"),
-        dbias_t=_port(outputs, "DBias", "Dbias", "dbias", "dbeta"),
+        dbias_t=dbias_out,
     )
 
 

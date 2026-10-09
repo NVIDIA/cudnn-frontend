@@ -52,6 +52,18 @@ _ROWWISE_KERNEL = {
 }
 
 
+def _flat(t):
+    """Per-channel vectors as 1-D, whatever rank the caller passed.
+
+    The kernels index gamma/beta/mean/rstd FLAT (``mG[c]``, ``mMean[row]``), so a
+    rank-3 ``scale`` of shape (1, 1, C) or a rank-3 ``mean`` of (N, S, 1) -- which
+    is exactly what a cuDNN graph hands over -- indexes wrong and produces silently
+    incorrect dx / dgamma. (dbeta survives, because it never touches these.) These
+    are contiguous per-channel vectors, so the reshape is a view.
+    """
+    return t if t is None or t.dim() == 1 else t.reshape(-1)
+
+
 def _as_variant(v) -> NormVariant:
     return v if isinstance(v, NormVariant) else NormVariant(v)
 
@@ -95,6 +107,8 @@ def norm_fprop(
     # chain stay on the native NHWC kernels end to end.
     if not (_as_variant(variant) in _NHWC_NATIVE and _is_nhwc(x)):
         x = x.contiguous()
+    gamma, beta = _flat(gamma), _flat(beta)
+    running_mean, running_var = _flat(running_mean), _flat(running_var)
     io = torch_dtype_to_str(x.dtype)
 
     if variant in ROWWISE_VARIANTS:
