@@ -157,8 +157,11 @@ class SdpaDenseBinder {
             has_amax_  = py::cast<bool>(quant.attr("has_amax"));
             fill_word_ = py::module_::import_("cudnn.frost.buffers").attr("fill_word_async");
         }
-        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink")))
-            invalid("native dense binding requires attention without split sinks");
+        // The half flavors fold an attention sink once in the combine pass (the
+        // sink combine entries take the fp32 [H] pointer); the FP8 epilogues
+        // still fold it per tile, so a quantized sink cannot split.
+        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink") && quantized_))
+            invalid("native dense binding requires FP8 attention without split sinks");
         const auto dq = integer("d_qk"), dv = integer("d_v");
         if (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8)
             invalid("native dense binding requires a supported half attention head dimension pair");
@@ -471,34 +474,29 @@ class SdpaDenseBinder {
         if (split_ > 1) {
             const auto partial_lse = add(workspace, lse_offset_);
             auto os                = py::cast<std::array<int64_t, 3>>(o.bound);
+            // The combine entry's positional frame (split_combine.compile_ptr): the
+            // dense base, the ragged-Q leg's offsets / divisors / capacities, the
+            // half flavors' fp32 [H] sink pointer (has_sink entries), then the stream.
+            py::list cf;
+            cf.append(workspace);
+            cf.append(partial_lse);
+            cf.append(facts[O].pointer);
+            cf.append(frame[index_[LSEPtr]]);
+            cf.append(py::make_tuple(b_, qh_, sq_, d_v_));
+            cf.append(split_);
+            cf.append(py::make_tuple(os[0], os[1], os[2], 1));
+            cf.append(frame[index_[LSEStrides]]);
             if (ragged_) {
                 const int64_t max_tokens = std::numeric_limits<int32_t>::max();
-                combine_frame =
-                    py::make_tuple(workspace,
-                                   partial_lse,
-                                   facts[O].pointer,
-                                   frame[index_[LSEPtr]],
-                                   py::make_tuple(b_, qh_, sq_, d_v_),
-                                   split_,
-                                   py::make_tuple(os[0], os[1], os[2], 1),
-                                   frame[index_[LSEStrides]],
-                                   ragged_offsets[0],
-                                   ragged_offsets[1],
-                                   ragged_offsets[2],
-                                   ragged_divs_,
-                                   py::make_tuple(std::min(o_cap, max_tokens), std::min(lse_cap, max_tokens)),
-                                   stream);
-            } else {
-                combine_frame = py::make_tuple(workspace,
-                                               partial_lse,
-                                               facts[O].pointer,
-                                               frame[index_[LSEPtr]],
-                                               py::make_tuple(b_, qh_, sq_, d_v_),
-                                               split_,
-                                               py::make_tuple(os[0], os[1], os[2], 1),
-                                               frame[index_[LSEStrides]],
-                                               stream);
+                cf.append(ragged_offsets[0]);
+                cf.append(ragged_offsets[1]);
+                cf.append(ragged_offsets[2]);
+                cf.append(ragged_divs_);
+                cf.append(py::make_tuple(std::min(o_cap, max_tokens), std::min(lse_cap, max_tokens)));
             }
+            if (has_sink_) cf.append(facts[Sinks].pointer);
+            cf.append(stream);
+            combine_frame = py::tuple(cf);
             put(frame, OPtr, py::int_(workspace));
             if (fp32_partial_) put(frame, PartialOPtr, py::int_(workspace));
             put(frame, OStrides, partial_o_strides_);
