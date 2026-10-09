@@ -145,6 +145,40 @@ DESC_VERSION: int = 0
 # +0.3 % on one) and is a no-op on every cga1 rendering by construction (the cluster arm folds out at CGA_SIZE 1; the cubins
 # are byte-identical), so this kernel carries no constant for it.
 SPIN_RING_WAITS: bool = True
+# exp2 MUFU / FMA split -- the Rubin small-D PROBE (an experiment, never a default on cc 10.7).  ``tile_dsl.pointwise.exp2_emul_pair``
+# evaluates a compile-time subset of every row's exp2 on the FMA pipe (6 packed FP32 / INT instructions per pair, no MUFU.EX2): the
+# sm100 d128 kernels' ``_E2E_*`` block (pattern (16, 4, TILE_N): the LAST 4 of every 16 columns; shipped there on cc 10.0 only), which
+# MEASURED +7.8 % on B200 and -9..-10 % on the Rubin d128 MXFP8 kernel -- MUFU.EX2 issues 32 lanes/clk/SM on sm_107a, so an emulated
+# exp2 costs 1.99x the pipe time it frees at D = 128, where MUFU is not the bottleneck.  At D = 32 the softmax ALU and MUFU set the
+# floor together (the MMA sits 2-4x under them), so the sign is MEASURED on the small tiles rather than inferred.  ``PARAMS.exp2_fma_split``
+# is False on every cc 10.7 build (api_dsl._exp2_fma_split_for gates it to cc 10.0); EXP2_FMA_SPLIT is the module constant the probe flips
+# (a second source tree with ONE edit, the cross-process A/B/A's variant).  Off, every chunk exp2 traces ``cute.math.exp2`` -- the
+# byte-identical develop spelling (test_no_bias_renderings_are_byte_identical_to_the_pre_bias_record).  The alpha exp2 (one per row per
+# kv step) stays on MUFU either way.  A masked column (-inf, or the -3.4e38 sentinel of the dense band arm) emulates to EXACTLY 0.0:
+# the clamp to -127 makes the floor -127 and the fraction 0, so p(f) = 1.0 and the exponent insertion (-127 + 127) << 23 is +0.0.
+EXP2_FMA_SPLIT: bool = False
+_E2E_FREQ = 16
+_E2E_RES = 4
+_E2E_LIMIT = CFG.TILE_N
+_E2E_ENABLED = bool(PARAMS.exp2_fma_split) or EXP2_FMA_SPLIT
+# Emulated columns per row per kv step (TILE_N / 4 with the probe on: 16 of 64 or 32 of 128; 0 off).
+_E2E_EMULATED_COLS = (_E2E_LIMIT // _E2E_FREQ) * _E2E_RES if _E2E_ENABLED else 0
+if not (0 <= _E2E_RES <= _E2E_FREQ and _E2E_FREQ % 2 == 0 and _E2E_RES % 2 == 0 and _E2E_LIMIT % _E2E_FREQ == 0):
+    raise ValueError(f"{__name__}: exp2 emulation pattern freq={_E2E_FREQ} res={_E2E_RES} limit={_E2E_LIMIT} must be even with 0 <= res <= freq | limit")
+
+
+def _e2e_pairs(chunk: int, chunk_elems: int = CFG.BMM2_CHUNK_SIZE) -> frozenset:
+    """Pair indices (pair p = columns 2p, 2p+1 of the 64-wide softmax chunk) that ``exp2_mixed`` emulates on the FMA pipe."""
+    return frozenset(
+        p
+        for p in range(chunk_elems // 2)
+        if ((chunk * chunk_elems + 2 * p) % _E2E_FREQ) >= (_E2E_FREQ - _E2E_RES) and (chunk * chunk_elems + 2 * p) < _E2E_LIMIT
+    )
+
+
+_E2E_PAIRS = tuple(_e2e_pairs(c) if _E2E_ENABLED else frozenset() for c in range(CFG.N_BMM2_CHUNKS))
+if 2 * sum(len(p) for p in _E2E_PAIRS) != _E2E_EMULATED_COLS:
+    raise ValueError(f"{__name__}: exp2 emulation pairs cover {2 * sum(len(p) for p in _E2E_PAIRS)} columns, expected {_E2E_EMULATED_COLS}")
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
@@ -181,6 +215,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     row_reduction_pair,
     row_max_reduction,
     vec_scale_pair,
+    exp2_mixed,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
@@ -2456,7 +2491,8 @@ def _softmax_kv_body(
     # Chunk 0 manual unroll — the DSL's @cute.jit tracer makes the loop iter an
     # MLIR value, breaking Python slice.indices() math inside RegTile[].
     chunk_S_0 = reg_S[0:CHUNK].vec
-    chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    # exp2 split probe: the _E2E_PAIRS[0] columns on the FMA pipe, the rest on MUFU; off (the default) the plain MUFU exp2 (a trace-time ternary).
+    chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK) if _E2E_ENABLED else cute.math.exp2(chunk_S_0, fastmath=True)
     # Hoist chunk 0's sum before the cast to overlap with the cast's FFMA chain.
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
@@ -2472,7 +2508,7 @@ def _softmax_kv_body(
     deferred_P_1 = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK) if _E2E_ENABLED else cute.math.exp2(chunk_S_1, fastmath=True)
         chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
         nvvm.tcgen05_st(
             "32x32b",
@@ -2653,7 +2689,8 @@ def _softmax_kv_body_inf(
     reg_S = reg_S * scale_log2 - total_max_safe
 
     chunk_S_0 = reg_S[0:CHUNK].vec
-    chunk_P_0 = cute.math.exp2(chunk_S_0, fastmath=True)
+    # exp2 split probe: the _E2E_PAIRS[0] columns on the FMA pipe, the rest on MUFU; off (the default) the plain MUFU exp2 (a trace-time ternary).
+    chunk_P_0 = exp2_mixed(chunk_S_0, _E2E_PAIRS[0], CHUNK) if _E2E_ENABLED else cute.math.exp2(chunk_S_0, fastmath=True)
     hoisted_sum = row_reduction_pair(chunk_P_0)
     chunk_P_0_fp16 = chunk_P_0.to(STORAGE_DTYPE)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base, cutlass.Float32), chunk_P_0_fp16)
@@ -2663,7 +2700,7 @@ def _softmax_kv_body_inf(
     deferred_P_1 = None
     if cutlass.const_expr(N_CHUNKS == 2):
         chunk_S_1 = reg_S[CHUNK : 2 * CHUNK].vec
-        deferred_P_1 = cute.math.exp2(chunk_S_1, fastmath=True)
+        deferred_P_1 = exp2_mixed(chunk_S_1, _E2E_PAIRS[1], CHUNK) if _E2E_ENABLED else cute.math.exp2(chunk_S_1, fastmath=True)
         chunk_P_1_fp16 = deferred_P_1.to(STORAGE_DTYPE)
         nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(p_addr_base + cutlass.Int32(P_COLS_PER_CHUNK), cutlass.Float32), chunk_P_1_fp16)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
