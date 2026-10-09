@@ -807,19 +807,21 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, ou
 
         run()
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
-            run()
-        v.copy_((-v.float()).to(input_dtype))
-        captured.replay()
-        torch.cuda.synchronize()
-        qf, kf, vf = (t.float().repeat_interleave(hq // t.shape[1], dim=1) for t in (q, k, v))
-        o_ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, scale=d**-0.5)
-        torch.testing.assert_close(lse[..., 0], (qf.double() @ kf.double().transpose(-1, -2) * d**-0.5).logsumexp(-1).float(), atol=1e-3, rtol=1e-3)
-        captured.reset()
-        if fp8:
-            torch.testing.assert_close(pack[ad].flatten()[0], o_ref.abs().max() * 0.25, atol=0.03, rtol=0.03)
-            o_ref = o_ref * 0.25 * 2.0  # descale_v, then scale_o; Amax excludes scale_o
-        torch.testing.assert_close(o.float(), o_ref, atol=5e-2 if fp8 else 2e-2, rtol=3e-2, msg=lambda m: f"S_kv={s_kv}: {m}")
+        try:
+            with torch.cuda.graph(captured):
+                run()
+            v.copy_((-v.float()).to(input_dtype))
+            captured.replay()
+            torch.cuda.synchronize()
+            qf, kf, vf = (t.float().repeat_interleave(hq // t.shape[1], dim=1) for t in (q, k, v))
+            o_ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, scale=d**-0.5)
+            torch.testing.assert_close(lse[..., 0], (qf.double() @ kf.double().transpose(-1, -2) * d**-0.5).logsumexp(-1).float(), atol=1e-3, rtol=1e-3)
+            if fp8:
+                torch.testing.assert_close(pack[ad].flatten()[0], o_ref.abs().max() * 0.25, atol=0.03, rtol=0.03)
+                o_ref = o_ref * 0.25 * 2.0  # descale_v, then scale_o; Amax excludes scale_o
+            torch.testing.assert_close(o.float(), o_ref, atol=5e-2 if fp8 else 2e-2, rtol=3e-2, msg=lambda m: f"S_kv={s_kv}: {m}")
+        finally:
+            captured.reset()
 
 
 @pytest.mark.L0
