@@ -87,6 +87,49 @@ _DTYPE_FAMILIES = [
 ]
 
 
+def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
+    """Source pin (no GPU) over EVERY cc 10.7 prefill kernel: the online-softmax running-max step is either the shared
+    finite-sentinel helper ``running_max_step_finite_sentinel`` (the kernels that mask with the finite sentinel; it keeps a
+    KV tile that is fully masked AHEAD of the row's first live key out of the running state -- total_max kept, alpha = 1, a
+    shift of 0 so P = 0 -- where the inlined chain took the sentinel as the running max: scaled by scale_log2 > 1 it
+    overflowed to -inf and the shift read -inf - (-inf) = NaN into P, below that P = 1 per masked column wiped only by
+    alpha = 0 at the next live tile) or ``row_max_for_exp2`` (the -inf-masked 2x2 twin).  Every helper call passes the RAW
+    tile max first and folds its guard on the module's mask flags, and no inlined ``is_first`` / ``exp_input`` chain remains
+    beside it.  A kernel that matches neither is the unguarded form this pin exists to refuse."""
+    import glob
+    import os
+
+    from cudnn.sdpa.fwd.kernels import sm107 as pkg
+
+    files = sorted(glob.glob(os.path.join(os.path.dirname(pkg.__file__), "prefill_*.py")))
+    assert len(files) >= 13, files
+    shared_call = re.compile(
+        r"running_max_step_finite_sentinel\(\s*(\w+),\s*current_max,\s*total_max,\s*(NEG_INF(?:_F32)?),\s*RESCALE_THRESHOLD(?:_F32)?,\s*masked=CFG\.MASK_FLAGS != MASK_NONE\s*\)"
+    )
+    seen_shared = 0
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            code = _code_lines(fh.read())
+        name = os.path.basename(f)
+        if "row_max_for_exp2(" in code:
+            assert "running_max_step_finite_sentinel" not in code, f"{name}: both running-max forms in one body"
+            continue
+        calls = shared_call.findall(code)
+        assert (
+            calls
+        ), f"{name}: the running-max step is neither running_max_step_finite_sentinel (RAW max first, masked=CFG.MASK_FLAGS != MASK_NONE) nor row_max_for_exp2"
+        assert code.count("running_max_step_finite_sentinel(") == len(calls), f"{name}: a helper call with a different argument shape"
+        assert {c[0] for c in calls} & {"raw_max", "current_max_unscaled", "current_max_raw"} == {
+            c[0] for c in calls
+        }, f"{name}: the first operand must be the RAW tile max: {calls}"
+        for frag in ("is_first = total_max ==", "update_cond = is_first", "exp_input = ", "new_total_max = total_max"):
+            assert frag not in code, f"{name}: the inlined running-max chain {frag!r} remains beside the shared helper"
+        seen_shared += 1
+    assert (
+        seen_shared == 12
+    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8) take the helper; saw {seen_shared}"
+
+
 @pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])
 @pytest.mark.parametrize("flavor", _FLAVORS)
 def test_sm107_descriptor_version_matches_the_smem_budget(flavor, kind, load_kw):
@@ -4516,6 +4559,13 @@ def test_mxfp8_fold_and_fused_arms_are_wired_in_the_body(flavor, extra, fold_sit
     assert code.count("if cutlass.const_expr(_FUSED_SHIFT_CVT and not has_lse):") == fused_sites, "the fused arm is stats-less only"
     assert raw_max in code and raw_shift in code, "the fold arm: raw running max, plain subtract"
     assert scaled_max in code and scaled_shift in code, "the scaled chain stays on the else arms"
+    # the shift operand is the exp2 shift the shared running-max step returns (0 on a tile that is dead ahead of the row's
+    # first live key), never the running max itself
+    assert "- total_max" not in code.split("def _softmax_kv_body(" if flavor == (192, 128) else "def _sg0_softmax_kv_iter(", 1)[1].split("\ndef ", 1)[0]
+    assert re.search(
+        r"total_max, alpha, new_total_max = running_max_step_finite_sentinel\(\s*\w+, current_max, total_max, NEG_INF(_F32)?, RESCALE_THRESHOLD(_F32)?, masked=CFG\.MASK_FLAGS != MASK_NONE\s*\)",
+        code,
+    ), "the running-max step is the shared finite-sentinel helper, called with the RAW tile max"
     assert "fused_shift_f16_exp_chunk" in code or "fused_m=" in code, "the fused arm calls the shared helper"
 
 
