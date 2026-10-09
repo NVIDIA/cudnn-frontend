@@ -215,7 +215,7 @@ gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_sdpa_bwd_fp8_st
 gated_attention_block/cutedsl/test_block_bwd_fp8_stages.py::test_fp8_gemm_stage_execute_matches_fp64_with_a_slot_alpha[B1_dw_o]
 gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gradients_match_fp64_autograd[causal-norm]
 gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_gqa_bwd[gqa_8_2]
-gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_zero_length_sequence_bwd[first_empty]
+gated_attention_block/cutedsl/test_block_thd_backward.py::test_thd_zero_length_sequence_bwd[first_empty-unfused]
 gated_attention_block/cutedsl/test_proj_gemm.py::test_matches_torch_linear[1024-4096-2176-dtype0]
 gated_attention_block/cutedsl/test_proj_gemm.py::test_fused_stage_matches_the_fp32_oracle[256-norm]
 gated_attention_block/cutedsl/test_proj_gemm.py::test_fp8_matmul_with_alpha_matches_fp32_reference[256-256-256]
@@ -259,6 +259,9 @@ sdpa/graph/test_mhas_v2.py::test_sdpa_paged_thd_sink_plan_pins_cc107_L0[d256-cga
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0[test1]
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-frost_replay]
 sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_cc107_explicit_plan_pins_L0[d128_causal_sink-backend_first]
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_decode_sink_d128_p128]
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_prefill_sink_stats_d256_p256]
+sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_paged_cc107_pinned_L0[smoke_mtp_swa_nhd_d128_p256]
 # --- rule-added: the first L0 cell of each numerics function of the remaining sdpa/frost modules (<= 2 per module) ---
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_batch_of_two_padded_lse[legacy_offsets]
 sdpa/frost/test_flashinfer_shaped_sdpa.py::test_ragged_prefill_single_sequence_padded_lse_rows[d128_causal-legacy_offsets]

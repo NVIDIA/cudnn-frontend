@@ -1051,6 +1051,59 @@ def test_rubin_mxfp8_forward_row_exists():
     assert _caps("sdpa_fwd_prefill_sm100_mxfp8").sm_hi == 106
 
 
+def test_rubin_mxfp8_row_serves_paged_pools_on_d128_d256():
+    """The cc 10.7 MXFP8 row serves the SM100 paged MXFP8 pool contract (#1214) on d128 / d256 with DENSE queries:
+    F8_128x4 descale pools paging with K/V, page_size % 128, the sink / causal / bottom-right / SWA / padding masks,
+    Stats and the f16x2 exponent arm composed.  Declined, each by its own typed reason: page 64, THD queries over
+    pools (stage 2), the d192x128 / d512 pools (stage 3), a block-scaled O over pools, the pre-folded scale over paged
+    KV, pools without a padding mask, and split_kv > 1 (also with a sink).  The half row keeps its THD requirement
+    and the per-tensor FP8 row serves no paged KV."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    assert caps.paged_kv is True and caps.paged_d_shapes == frozenset({(128, 128), (256, 256)})
+    assert caps.sink is True and caps.thd is True and caps.thd_d_shapes == frozenset({(256, 256)})  # THD at d256 only (#1488); pools serve dense queries
+
+    def paged(**kw):
+        return _quant_facts(**{"is_mx": True, "has_paged_kv": True, "page_size": 128, "padded": True, **kw})
+
+    for d in (128, 256):
+        for extra in (
+            {},
+            dict(has_sink=True),
+            dict(causal=True, bottom_right=True, right_bound=0),
+            dict(page_size=256),
+            dict(dtype=cudnn.data_type.FP8_E5M2),
+            dict(window_left=128, causal=True, right_bound=0),
+            dict(s_q=1),
+            dict(wants_stats=True),
+            dict(softmax_precision=cudnn.data_type.HALF),
+            dict(has_sink=True, causal=True, bottom_right=True, right_bound=0, wants_stats=True, s_q=4),
+        ):
+            assert engines.mismatch(caps, paged(d_qk=d, d_v=d, **extra)) is None, (d, extra)
+    # The explicit knobs of the served plans: cga2 at d128, cga1 at d256, NATURAL, 128x128, unpacked, unsplit.
+    assert engines.mismatch(caps, paged(), SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=2, pack_gqa=False, split_kv=1)) is None
+    assert engines.mismatch(caps, paged(d_qk=256, d_v=256), SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)) is None
+    for kw, needle in (
+        (dict(page_size=64), "multiple of 128"),
+        (dict(thd=True), "THD"),
+        (dict(d_qk=192, d_v=128), "d128, d256 kernel flavors only"),
+        (dict(d_qk=512, d_v=512), "d128, d256 kernel flavors only"),
+        (dict(o_block_scale=32, dtype_o=cudnn.data_type.FP8_E4M3), "block-scaled O"),
+        (dict(attn_scale_prefolded=True), "paged-KV kernel bodies"),
+        (dict(padded=False), "use_padding_mask"),
+    ):
+        reason = engines.mismatch(caps, paged(**kw))
+        assert reason is not None and needle in reason, (kw, reason)
+    assert engines.mismatch(caps, paged(has_sink=True), SdpaFwdKnobs(split_kv=2)) is not None
+    # The half row: dense paged queries stay declined on cc 10.7 (THD queries are its paged form).
+    half = engines.mismatch(_caps("sdpa_fwd_prefill_sm107"), _f16_facts(has_paged_kv=True, page_size=16, padded=True, thd=False))
+    assert half is not None and "THD queries" in half, half
+    assert not _caps("sdpa_fwd_prefill_sm107_fp8").paged_kv
+
+
 def test_sm107_quantized_rows_serve_d192_on_their_native_kernels():
     """ACCEPT side of the 2026-09-09 d192 addition, one case PER DTYPE MEMBER of
     each row's frozenset -- a row listing two dtypes is making two claims, and a
@@ -4375,7 +4428,7 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             1,
             "current_max = cute.math.max(max_a, max_b)\n",
             "reg_S_a = reg_S_a - new_total_max",
-            "current_max = cute.math.max(max_a, max_b) * scale_log2",
+            "current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)",
             "reg_S_a = reg_S_a * scale_log2 - new_total_max",
         ),
         (
@@ -4385,7 +4438,7 @@ def test_softmax_lever_config_backstops_follow_the_flavor_tables():
             2,
             "current_max = current_max_raw\n",
             "reg_S_tile.vec - total_max",
-            "current_max = current_max_raw * scale_log2",
+            "current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)",
             "reg_S_tile.vec * scale_log2 - total_max",
         ),
     ],

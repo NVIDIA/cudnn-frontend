@@ -108,10 +108,18 @@ from cudnn.sdpa.fwd.config_sm107 import TCGEN05_V0_ADDR_LIMIT, TemplateParams, m
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 CFG, _TMA = make_cfg_d256_mxfp8(PARAMS)
-if PARAMS.paged_kv:
-    raise ValueError(
-        "prefill_d256_mxfp8_sm107: paged_kv is not wired on this kernel (the PAGED_KV specialization lives in sm100/prefill_d128_f16, sm100/prefill_d256_f16 and sm100/prefill_d128_fp8)"
-    )
+# Paged KV (CFG.PAGED_KV): K/V and their F8_128x4 scale-factor pools are addressed through the block tables -- the page
+# id is the TMA batch coordinate of the K/V AND SF descriptors and the tile inside the page the SF tile coordinate (the
+# SM100 sibling's specialization, sm100/prefill_d256_mxfp8.py; V's columnwise SF keeps its D-plane-major layout ACROSS
+# THE POOL: group (page * KH + head) * tiles_per_page + tile); page -1 past a sequence's live pages is TMA-OOB zero
+# fill.  A page holds whole 128-row SF atom sets, so PAGE_SIZE is a multiple of TILE_N (config_sm107 backstops it).
+# Paging changes the TMA-LDG warp's coordinates and the host's descriptor extents only: no SMEM, so the version-0
+# descriptor window (d256_mxfp8_last_sf_tile_start) is untouched.
+PAGED_KV = bool(CFG.PAGED_KV)
+PAGE_SIZE = CFG.PAGE_SIZE if PAGED_KV else 0
+if PAGED_KV and PAGE_SIZE % CFG.TILE_N != 0:
+    raise ValueError(f"prefill_d256_mxfp8_sm107: paged_kv needs page_size to be a multiple of {CFG.TILE_N}; got {PAGE_SIZE}")
+TILES_PER_PAGE = PAGE_SIZE // CFG.TILE_N if PAGED_KV else 1
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
 # decision point, wired into every construction below rather than repeated as a
@@ -627,7 +635,8 @@ def _kernel(
     # rather than passing None, so the GridConstant never has to be Optional;
     # CFG.EPILOGUE_GATE (and the None-specialized gate_tensor below) fold the
     # feature in or out.  _host calls _kernel POSITIONALLY, so inserting here is
-    # safe; seq_q_lens_addr stays the last parameter.
+    # safe; seq_q_lens_addr stays the last POSITIONAL parameter (the paged block
+    # tables after it are keyword-only in effect).
     tma_gate_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_q_sf_desc: cutlass.GridConstant[tmap.TensorMap],
     tma_k_sf_desc: cutlass.GridConstant[tmap.TensorMap],
@@ -650,6 +659,10 @@ def _kernel(
     qh_per_kh: cutlass.Int32,
     scale_softmax_log2: cutlass.Float32,
     seq_q_lens_addr: cutlass.Int64 = 0,
+    # Paged KV (PAGED_KV): the (B, max_pages) int32 block tables of K and V (None folds the page walk out); passed by
+    # keyword by _host, so seq_q_lens_addr keeps its positional slot.
+    block_table_tensor: Optional[cute.Tensor] = None,
+    block_table_v_tensor: Optional[cute.Tensor] = None,
 ) -> None:
 
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1068,6 +1081,8 @@ def _kernel(
             tma_gate_desc=tma_gate_desc,
             sGate=sGate,
             o_desc_words=o_desc_words,
+            block_table_tensor=block_table_tensor,
+            block_table_v_tensor=block_table_v_tensor,
         )
 
     elif warp_idx == CFG.TMASTG_WARP_ID:
@@ -1115,6 +1130,33 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
+def _paged_page(block_table_tensor, batch_idx, slot, n_pages_b):
+    """Slots past the live pages read page -1 so TMA zero-fills instead of reading a stale page."""
+    bt = cutlass.make_array_view(block_table_tensor)  # [B, max_pages]
+    last_live = cute.math.max(n_pages_b - cutlass.Int32(1), cutlass.Int32(0))
+    page_live = cutlass.Int32(bt[batch_idx, cute.math.min(slot, last_live)])
+    in_range = slot < n_pages_b
+    return cutlass.Int32(arith.select(in_range.ir_value(), page_live.ir_value(), cutlass.Int32(-1).ir_value()))
+
+
+@cute.jit
+def _kv_tile_coords(kv_tile, batch_idx, tma_batch, kv_seq_off, cu_sf_k_base, n_pages_b, block_table_tensor, block_table_v_tensor):
+    """TMA coordinates of KV tile ``kv_tile``: (k_row, k_page, k_sf_tile, v_row, v_page, v_sf_tile).  V's columnwise
+    SF group (``v_page * n_kh + kv_head_idx`` under paging, ``tma_batch * n_kh + kv_head_idx`` dense) is formed at the
+    call site.  Dense graphs use the batch as the page (today's expressions, so the dense trace is unchanged)."""
+    if cutlass.const_expr(PAGED_KV):
+        slot = kv_tile // cutlass.Int32(TILES_PER_PAGE)
+        tile_in_page = kv_tile % cutlass.Int32(TILES_PER_PAGE)
+        row = tile_in_page * cutlass.Int32(CFG.TILE_N)
+        k_page = _paged_page(block_table_tensor, batch_idx, slot, n_pages_b)
+        v_page = _paged_page(block_table_v_tensor, batch_idx, slot, n_pages_b)
+        return row, k_page, tile_in_page, row, v_page, tile_in_page
+    row = kv_tile * cutlass.Int32(CFG.TILE_N) + kv_seq_off
+    sf_tile = cu_sf_k_base + kv_tile
+    return row, tma_batch, sf_tile, row, tma_batch, sf_tile
+
+
+@cute.jit
 def _tmaldg_warp_group(
     tma_q_desc,
     tma_k_desc,
@@ -1149,6 +1191,9 @@ def _tmaldg_warp_group(
     # n_batch+1 / n_batch+2 hold the packed-total-clamped K / V maps this warp
     # loads through.  None on the dense build (the static GridConstant maps serve).
     o_desc_words=None,
+    # Paged KV (appended, called by keyword): None when PAGED_KV is off.
+    block_table_tensor=None,
+    block_table_v_tensor=None,
 ):
     """Q/K/V/SF TMA loads with cga2 SF split-half multicast.
 
@@ -1266,6 +1311,11 @@ def _tmaldg_warp_group(
         kv_left = bounds_init.left
         kv_right = bounds_init.right
 
+    # eff_seqlen_kv exists here because PAGED_KV implies MASK_PADDED (config / mismatch backstops).
+    n_pages_b = cutlass.Int32(0)
+    if cutlass.const_expr(PAGED_KV):
+        n_pages_b = (eff_seqlen_kv + cutlass.Int32(PAGE_SIZE - 1)) // cutlass.Int32(PAGE_SIZE)
+
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
@@ -1320,7 +1370,9 @@ def _tmaldg_warp_group(
             )
 
             for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
-                kv_row_base = kv_loop * cutlass.Int32(CFG.TILE_N)
+                k_row, k_page, k_sf_tile, v_row, v_page, v_sf_tile = _kv_tile_coords(
+                    kv_loop, batch_idx, tma_batch, kv_seq_off, cu_sf_k_base, n_pages_b, block_table_tensor, block_table_v_tensor
+                )
 
                 bars.mb_k_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                 if cutlass.const_expr(CFG.CTA_MMA == 2):
@@ -1329,7 +1381,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sK[kv_state.idx],
-                    tma_k(cutlass.Int32(0), kv_head_idx, kv_row_base + K_ROW_OFFSET_PEER + kv_seq_off, tma_batch),
+                    tma_k(cutlass.Int32(0), kv_head_idx, k_row + K_ROW_OFFSET_PEER, k_page),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1337,7 +1389,7 @@ def _tmaldg_warp_group(
                 )
                 tma_load_tile(
                     sK_SF[kv_state.idx].shifted(k_sf_peer_off),
-                    tma_k_sf(k_sf_peer_row, cu_sf_k_base + kv_loop, kv_head_idx, tma_batch, coord_0=cutlass.Int32(0)),
+                    tma_k_sf(k_sf_peer_row, k_sf_tile, kv_head_idx, k_page, coord_0=cutlass.Int32(0)),
                     bars.mb_k_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=sf_mcast_mask,
@@ -1350,7 +1402,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state.idx].arrive(n_bytes=vTmaTransactionBytes + V_SF_EXPECT_BYTES, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sV[kv_state.idx],
-                    tma_v(V_COL_OFFSET_PEER, kv_head_idx, kv_row_base + kv_seq_off, tma_batch),
+                    tma_v(V_COL_OFFSET_PEER, kv_head_idx, v_row, v_page),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1358,7 +1410,7 @@ def _tmaldg_warp_group(
                 )
                 tma_load_tile(
                     sV_SF[kv_state.idx].shifted(v_sf_peer_off),
-                    tma_v_sf(cutlass.Int32(0), v_sf_peer_plane, cu_sf_k_base + kv_loop, tma_batch * n_kh + kv_head_idx, coord_0=cutlass.Int32(0)),
+                    tma_v_sf(cutlass.Int32(0), v_sf_peer_plane, v_sf_tile, v_page * n_kh + kv_head_idx, coord_0=cutlass.Int32(0)),
                     bars.mb_v_full[kv_state.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=sf_mcast_mask,
@@ -1406,6 +1458,8 @@ def _tmaldg_warp_group(
             bounds_next = _bounds_for_tile(q_super_idx, eff_seqlen_q, eff_seqlen_kv, cta_in_pair, seq_q_lens_addr, batch_idx)
             kv_left = bounds_next.left
             kv_right = bounds_next.right
+            if cutlass.const_expr(PAGED_KV):
+                n_pages_b = (eff_seqlen_kv + cutlass.Int32(PAGE_SIZE - 1)) // cutlass.Int32(PAGE_SIZE)
 
     if cutlass.const_expr(CFG.CTA_MMA == 2):
         for _ks in cutlass.range_constexpr(CFG.STAGES_KV):
@@ -2829,6 +2883,13 @@ def _host(
     thd_q_lens_tensor: Optional[cute.Tensor] = None,
     thd_kv_lens_tensor: Optional[cute.Tensor] = None,
     thd_lens_form: Optional[cutlass.Int32] = None,
+    # Paged KV (PAGED_KV): the (B, max_pages) int32 block tables of K and V, passed by KEYWORD by the prepared host
+    # (_mxfp8_host._launch, which every SM107 MXFP8 execution goes through); None folds the page walk out.  Keyword-only
+    # in effect: they sit after the three THD length slots (the last parameters that host passes positionally) and
+    # BEFORE stream, like the SM100 hosts, so gate_tensor stays the first parameter after stream (the append-only pin
+    # test_sm107_gate_kernel_signatures_are_append_only, which also pins the THD slots right after seq_q_lens_addr).
+    block_table_tensor: Optional[cute.Tensor] = None,
+    block_table_v_tensor: Optional[cute.Tensor] = None,
     # FROST plans must run on the caller's stream (engine contract; there is a
     # dedicated stream-respect test).  Threaded exactly as the shipped
     # sm107/prefill_d128_fp8.py sibling does.
@@ -2862,6 +2923,9 @@ def _host(
         # and tile count -- uniformly wrong output with no crash.
         SQ = q_tensor.shape[1]
         SKV = k_tensor.shape[1]
+    if cutlass.const_expr(PAGED_KV):
+        # The masks clamp against what the block table can address, not the declared skv.
+        SKV = block_table_tensor.shape[1] * cutlass.Int32(PAGE_SIZE)
 
     _O_GRANU_ELEMS = CFG.O_SWZ_BYTES // CFG.BPE_O
     qk_box_q = (1, CFG.TILE_M, 1, TMA_QK_GRANU_ELEMS)
@@ -2949,6 +3013,13 @@ def _host(
     _B_SF = 1 if cutlass.const_expr(CFG.THD_VARLEN) else B
     _q_sf_num_tiles = sf_q_tensor.shape[2] if cutlass.const_expr(CFG.THD_VARLEN) else sq_sf_tiles
     _kv_sf_num_tiles = sf_k_tensor.shape[2] if cutlass.const_expr(CFG.THD_VARLEN) else skv_sf_tiles
+    _kv_sf_batches = _B_SF
+    if cutlass.const_expr(PAGED_KV):
+        # The K/V SF pools page with K/V: one descriptor batch per POOL PAGE, TILES_PER_PAGE atom sets each (the
+        # loader's K-SF coordinates are (tile_in_page, head, page); V's columnwise group is page * KH + head, and the
+        # shared builder derives the pool-wide plane stride n_pages * KH * TILES_PER_PAGE atoms from these extents).
+        _kv_sf_batches = k_tensor.shape[0]
+        _kv_sf_num_tiles = TILES_PER_PAGE
 
     # SF TMA descriptors (sdpa/kernels/_mxfp8_sf.py).  Q / K are ROWWISE: their
     # atom grid is per-(b, h, s_tile) contiguous, one tile's slab per box.  V's SF
@@ -2964,13 +3035,18 @@ def _host(
         sf_q_tensor, num_tiles=_q_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_Q, num_rows_box=SF_NUM_ROWS_Q, num_heads=QH, num_batches=_B_SF
     )
     tma_k_sf_desc = build_rowwise_sf_desc(
-        sf_k_tensor, num_tiles=_kv_sf_num_tiles, sf_smem_size=SF_SMEM_SIZE_K, num_rows_box=SF_NUM_ROWS_K // CFG.CTA_MMA, num_heads=KH, num_batches=_B_SF
+        sf_k_tensor,
+        num_tiles=_kv_sf_num_tiles,
+        sf_smem_size=SF_SMEM_SIZE_K,
+        num_rows_box=SF_NUM_ROWS_K // CFG.CTA_MMA,
+        num_heads=KH,
+        num_batches=_kv_sf_batches,
     )
     tma_v_sf_desc = build_columnwise_sf_desc(
         sf_v_tensor,
         num_tiles=_kv_sf_num_tiles,
         num_heads=KH,
-        num_batches=_B_SF,
+        num_batches=_kv_sf_batches,
         num_planes=SF_NUM_BLOCKS_V,
         planes_per_box=V_SF_PLANES_PER_PEER,
         sf_bytes_per_block=SF_BYTES_PER_BLOCK,
@@ -3032,6 +3108,8 @@ def _host(
         cutlass.Int32(QH // KH),
         scale_softmax_log2,
         seq_q_lens_addr,
+        block_table_tensor=block_table_tensor,
+        block_table_v_tensor=block_table_v_tensor,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
