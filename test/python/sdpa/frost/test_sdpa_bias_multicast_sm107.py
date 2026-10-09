@@ -195,8 +195,10 @@ def test_cfg_is_appended_and_the_kernel_carries_the_multicast_ring_as_one_const_
     from cudnn.sdpa.fwd import config_sm107 as c
 
     fields = [f.name for f in dataclasses.fields(c._CfgSm107)]
+    # the tail of the appended fields: STAGES_BIAS (the ring depth), BIAS_MAX_FORM (the row-max form, appended by the base this arm was
+    # rebased onto), then this arm's BIAS_MCAST_CTAS -- each a later append, never an insertion
     assert (
-        fields[-2:] == ["STAGES_BIAS", "BIAS_MCAST_CTAS"] and c._CfgSm107.BIAS_MCAST_CTAS == 1
+        fields[-3:] == ["STAGES_BIAS", "BIAS_MAX_FORM", "BIAS_MCAST_CTAS"] and c._CfgSm107.BIAS_MCAST_CTAS == 1
     ), "append-only; 1 renders every existing record byte-identically"
     src = _KERNEL.read_text()
     assert "_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES" in src and "_BIAS_MCAST = CFG.BIAS_MODE == BIAS_MODE_STREAMED_MULTICAST" in src

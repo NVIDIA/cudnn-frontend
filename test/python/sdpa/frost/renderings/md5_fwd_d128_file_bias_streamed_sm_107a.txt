@@ -1,13 +1,14 @@
 # The sm107 f16/bf16 d128-file kernel's cubin md5 in the STREAMED bias form (TemplateParams.bias_mode = 2) on the arms of
-# test_sdpa_bias_streamed_sm107.py's rendering pins, rendered BEFORE the ring's MULTICAST form (bias_mode = 3) landed (host trace-compile of
-# the tree at 40ebd643; the probe body is test_sdpa_bias_streamed_sm107.py's).  The multicast form's seams fold OUT of the cga1 ring
-# (every one is a const_expr on BIAS_MODE == 3 or a Python-int factor equal to 1), so these renderings must stay byte-identical.
-# Lines: dsl=<distribution> <version>; fwd_d128_file sm_107a <arm> rc=0 cubin_md5=<md5>.  A record stays valid for the DSL build it names.
+# test_sdpa_bias_streamed_sm107.py's rendering pins, rendered on the tree the ring's MULTICAST form (bias_mode = 3) was rebased onto, BEFORE
+# the form landed (host trace-compile of the unedited base a1f843758; the probe body is test_sdpa_bias_streamed_sm107.py's).  The multicast
+# form's seams fold OUT of the cga1 ring (every one is a const_expr on BIAS_MODE == 3 or a Python-int factor equal to 1), so these renderings
+# must stay byte-identical.  Lines: dsl=<distribution> <version>; fwd_d128_file sm_107a <arm> rc=0 cubin_md5=<md5>.  A record stays valid for
+# the DSL build it names.
 dsl=nvidia-cutlass-dsl 4.8.0
-fwd_d128_file sm_107a d32_pair_3 rc=0 cubin_md5=2e4c53fc7a9a07ad698c63cfb25805e5
-fwd_d128_file sm_107a d32_pair_2 rc=0 cubin_md5=795004473048eb092b494ae83b61da22
-fwd_d128_file sm_107a d32_pair_mask_padded_causal rc=0 cubin_md5=8084e61da137d2856899abc42d9e96ce
-fwd_d128_file sm_107a d32_one_batch_entry_2 rc=0 cubin_md5=40978bb7ca202dc71469bfce6a706ade
-fwd_d128_file sm_107a d32_one_batch_entry_3_requested rc=0 cubin_md5=7f2a4f0855a4dc1aa24ea24323656707
-fwd_d128_file sm_107a d64_pair_3 rc=0 cubin_md5=da6965d711b475b19e77c8443918f923
-fwd_d128_file sm_107a d64_one_batch_entry_cga2_2 rc=0 cubin_md5=89b8d5699091f4c72fe6027e1d7187d2
+fwd_d128_file sm_107a d32_pair_3 rc=0 cubin_md5=32d3e2cfe9562f4ddb5917a73c680588
+fwd_d128_file sm_107a d32_pair_2 rc=0 cubin_md5=ede8dd2814d5ce3a4f30ad35e6ac5e79
+fwd_d128_file sm_107a d32_pair_mask_padded_causal rc=0 cubin_md5=def1ffbf117fe2ee595c91823f36e2db
+fwd_d128_file sm_107a d32_one_batch_entry_2 rc=0 cubin_md5=098046a48afaeec7573c765fb0836675
+fwd_d128_file sm_107a d32_one_batch_entry_3_requested rc=0 cubin_md5=4df3883bdb50faa3ab4c65116e6bafbd
+fwd_d128_file sm_107a d64_pair_3 rc=0 cubin_md5=b046dbb5cef0a35ba8781f0e495b5cf3
+fwd_d128_file sm_107a d64_one_batch_entry_cga2_2 rc=0 cubin_md5=1b7cd4d84e3fc66958dd5d1ca2268c01
