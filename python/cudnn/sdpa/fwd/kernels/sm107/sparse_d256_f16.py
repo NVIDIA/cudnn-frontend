@@ -51,7 +51,8 @@ WARP MAP (16 warps = 512 threads; every warpgroup is role-homogeneous because ``
                        kv_empty[V]) + 1 per item (q_empty)
     warp 13     WG3    TMA-LDG: Q^T(i+1) (4 subtiles, Q_TX_BYTES = the BOX bytes), the BLOCK_TOPK x 4 B ids bulk copy of
                        item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; exit drains PER ARM:
-                       mb_ids_empty x STAGES_IDS always; ungated mb_q_empty x STAGES_Q; gated mb_gate_empty x (STAGES_GATE + 1)
+                       mb_ids_empty x STAGES_IDS always; ungated mb_q_empty x STAGES_Q; gated: the exit-path mb_gate_empty wait
+                       BEFORE the last item's gate (the wait Q(n_items) would have taken), then mb_gate_empty x STAGES_GATE
                        (every mb_q_empty commit is consumed by its item's gate load -- nothing of row 2 is left to drain)
     warp 14     WG3    scheduler (scheduler_warp_loop for BSHD; the persistent claim-counter form for THD) -- never credits
     warp 15     WG3    spare: passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one in the body)
@@ -117,7 +118,12 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                          into the freed sQ[i % 2]; GATE_TX_BYTES = Q_BOX_ROWS x TILE_O x GATE_BPE = G x 512 B (the BOX)   [gated arm]
                                                                                                         1 == 1       128 softmax lanes, epilogue(i)       0      gf_state(1), once per item
    12  mb_gate_empty[1]     THREAD       bare arrive() from 128 lanes after the item's last gate LDS     [gated arm]
-                                                                                                        128 == 128   warp 13 before Q(i+2) into the slot 1      ge_state(1) pre-armed, per item; drained at exit by warp 13
+                                                                                                        128 == 128   warp 13 before Q(i+2) into the slot 1      ge_state(1) pre-armed, per item: Q(1)'s wait is the pass, Q(j) waits
+                                                                                                                                                                 epilogue(j - 2); the exit path waits epilogue(n - 2) BEFORE gate(n - 1)
+                                                                                                                                                                 is issued (the wait Q(n) would have taken; the pass itself at n = 1),
+                                                                                                                                                                 then drains x STAGES_GATE = epilogue(n - 1).  Never 2 behind: completion i
+                                                                                                                                                                 needs gate(i), issued only after the wait that consumed i - 1 (Q(i + 1)'s
+                                                                                                                                                                 in the loop, the exit-path one for the last item)
    13  sched.mb_scheduler[2]  TMA_LOAD (CLC response form) | THREAD (persistent form)
                                          the scheduler warp's elected arrive_expect_tx(16) + the CLC response (CLC) / its elected arrive after the
                                          4 payload stores (persistent; no expect_tx at cga1)
@@ -137,14 +143,19 @@ every producer fire / consumer wait -- NEVER recomputed from a per-item tile ind
 barriers per unit); in a persistent CTA they HANG at n_tiles = 1 with two items (s_empty), read a stale S^T slot at
 n_tiles = 3 (s_full) and read a stale K/V slot whenever 2 x n_tiles % 3 != 0.  Every item runs >= 1 tile, so the per-item
 rings (1-4, 11-14) advance exactly once per item and the per-tile rings (5-10) at least once; the epilogue runs for every item.
-Exit drains (every arrive has a reachable wait): warp 13 waits mb_ids_empty x STAGES_IDS and, ungated, mb_q_empty x STAGES_Q
-(pre-armed state); gated, every mb_q_empty commit is consumed by its item's gate load (nothing left) and mb_gate_empty is
-drained x (STAGES_GATE + 1) = 2: n_items completions, n_items - 1 loop waits of which ONE is the pre-armed pass -> 2
-unconsumed for every n_items >= 1 (n_items = 1: the first drain wait IS the pass); every gather warp waits mb_kv_empty x
-STAGES_KV -- each with its carried state.  Gated arm, the slot's order: Q(i) -> MMA reads -> mb_q_empty(i) -> gate(i) ->
-mb_gate_full -> epilogue(i) reads -> mb_gate_empty -> Q(i + 2); warp 13 issues gate(i) AFTER queuing Q(i + 1) / ids(i + 1)
-(their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's LAST BMM1) and before its next
-credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
+Exit drains (every arrive has a reachable wait, and the waiter is never TWO completions behind a barrier: wait() returns when the
+parity differs from the waited one, so parity(k) == parity(k + 2) parks it forever -- a hang with correct numerics): warp 13 waits
+mb_ids_empty x STAGES_IDS and, ungated, mb_q_empty x STAGES_Q (pre-armed state); gated, every mb_q_empty commit is consumed by its
+item's gate load (nothing left) and mb_gate_empty is consumed in ORDER as well as in count -- n_items completions against n_items
+waits: n_items - 1 before Q(1 .. n_items - 1) (Q(1)'s the pre-armed pass, Q(j)'s = epilogue(j - 2)), the exit-path wait taken
+BEFORE the last item's gate is issued (= epilogue(n_items - 2); the pass itself at n_items = 1, taken while nothing can have
+arrived), the exit drain x STAGES_GATE (= epilogue(n_items - 1)); completion i needs gate(i), and gate(i) is issued only after the
+wait that consumed completion i - 1, so the consumer is never two behind (a drain of STAGES_GATE + 1 waits with no exit-path wait
+was right in count and wrong in order: epilogue(n_items - 1) could land before the first drain wait and alias its parity); every
+gather warp waits mb_kv_empty x STAGES_KV -- each with its carried state.  Gated arm, the slot's order: Q(i) -> MMA reads ->
+mb_q_empty(i) -> gate(i) -> mb_gate_full -> epilogue(i) reads -> mb_gate_empty -> Q(i + 2); warp 13 issues gate(i) AFTER
+queuing Q(i + 1) / ids(i + 1) (their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's
+LAST BMM1) and before its next credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
 
 THE ONE HELPER ``_item_bounds``: n_tiles, count, the tail block id(s), dead and the split chunk are computed by ONE pure
 helper at the item-start site of EVERY role that loops over tiles (softmax, MMA, the 8 gather warps, the TMA warp) over the
@@ -735,8 +746,9 @@ def _tma_issue_item(
     4, pre-armed).  The Q slot's wait is the arm's: ungated, ``mb_q_empty[slot]`` (row 2, pre-armed: Q(0), Q(1) pass fresh);
     gated, ``mb_gate_empty`` (row 12, pre-armed, ONE stage: Q(1) passes fresh, Q(j) waits epilogue(j - 2) -- the consumer of
     gate(j - 2) in this same slot), skipped for the prologue's Q(0) (``first``: a fresh slot, and the pre-armed pass is
-    Q(1)'s).  Returns the advanced PipelineStates as (idx, phase) pairs, the gate-empty consumer's (``ge``, one stage =
-    CFG.STAGES_GATE, advanced per wait like every other ring -- never a scalar parity toggle) included."""
+    Q(1)'s); the wait Q(n_items) would have taken is the caller's exit-path wait before the last gate.  Returns the advanced
+    PipelineStates as (idx, phase) pairs, the gate-empty consumer's (``ge``, one stage = CFG.STAGES_GATE, advanced per wait like
+    every other ring -- never a scalar parity toggle) included."""
     # --- the list (row 4 wait -> row 3 arm + copy)
     bars.mb_ids_empty[ie_idx].wait(ie_phase)
     bars.mb_ids_full[i_idx].arrive(n_bytes=IDS_TX_BYTES, pred=nvvm.elect_sync())
@@ -872,6 +884,16 @@ def _tmaldg_warp_group(
             # The gate of the CURRENT item, after the next item's prefetch was queued (the Q / ids prefetch keeps its place
             # under this item's KV loop; the gate's wait is the item's LAST BMM1 -- the late one) and before the next credit
             # (which the softmax warps give only after epilogue(i), later than this issue).
+            if is_valid <= cutlass.Int32(0):
+                # The LAST item (row 12's exit path): no Q(i + 1) is issued, so the mb_gate_empty wait Q(i + 1) would have taken --
+                # the one that consumes epilogue(i - 1)'s release of the other slot -- is taken HERE, before gate(i) exists.  ORDER,
+                # not count: wait() returns when the barrier's parity differs from the waited one, so a consumer that falls TWO
+                # completions behind a single-stage barrier spins forever (parity(i - 1) == parity(i + 1)) -- a hang with correct
+                # numerics.  Taken here, completion i cannot land before this wait (it needs gate(i)), so the consumer is never more
+                # than one completion behind, and the exit drain below consumes exactly STAGES_GATE = 1 completion (epilogue(i)).
+                # n_items = 1: this is the pre-armed pass, taken while nothing can have arrived (gate(0) is issued after it).
+                bars.mb_gate_empty.wait(ge_state.phase)
+                ge_state = advance(ge_state, CFG.STAGES_GATE)
             qgi, qgp = _tma_issue_gate(tma_gate, sQ, bars, cur_out_tok, cur_head, cur_out_batch, qg_state.idx, qg_state.phase)
             qg_state = PipelineState(idx=qgi, phase=qgp)
         cur_out_tok, cur_head, cur_out_batch = out_tok, head, out_batch
@@ -881,10 +903,12 @@ def _tmaldg_warp_group(
         bars.mb_ids_empty[ie_state.idx].wait(ie_state.phase)
         ie_state = advance(ie_state, STAGES_IDS)
     if cutlass.const_expr(CFG.EPILOGUE_GATE):
-        # Row 12: n_items completions, n_items - 1 loop waits of which ONE was the pre-armed pass -> exactly STAGES_GATE + 1
-        # = 2 unconsumed for every n_items >= 1 (n_items = 1: the first drain wait IS the pass, the second consumes
-        # epilogue(0)).  Row 2 needs no drain here: every mb_q_empty commit was consumed by its item's gate load.
-        for _ in cutlass.range_constexpr(CFG.STAGES_GATE + 1):
+        # Row 12: n_items completions against n_items waits -- n_items - 1 before Q(1 .. n_items - 1) (Q(1)'s the pre-armed pass,
+        # Q(j)'s = epilogue(j - 2)) plus the exit-path wait taken above BEFORE the last gate (= epilogue(n_items - 2); the pass
+        # itself at n_items = 1) -> exactly STAGES_GATE = 1 unconsumed (epilogue(n_items - 1)) for every n_items >= 1, and the
+        # consumer never two completions behind the single-stage barrier.  Row 2 needs no drain here: every mb_q_empty commit
+        # was consumed by its item's gate load.
+        for _ in cutlass.range_constexpr(CFG.STAGES_GATE):
             bars.mb_gate_empty.wait(ge_state.phase)
             ge_state = advance(ge_state, CFG.STAGES_GATE)
     else:

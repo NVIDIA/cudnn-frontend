@@ -1879,11 +1879,17 @@ def test_sparse_kernel_gate_arm_source_pins():
     i_sig = code.index("def _kernel(")
     sig = code[i_sig : code.index(") -> None:", i_sig)]
     assert sig.rstrip().endswith("tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,"), "the gate descriptor is the LAST kernel parameter"
-    # the ungated rendering keeps its drains, the gated one its own (STAGES_GATE + 1 waits on mb_gate_empty, none on mb_q_empty)
-    assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" in code
+    # the ungated rendering keeps its drains; the gated one consumes mb_gate_empty in ORDER as well as in count: the exit-path wait
+    # BEFORE the last item's gate (a parity wait two completions behind a single-stage barrier never returns), then x STAGES_GATE
+    assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" not in code, "the drain is STAGES_GATE deep once the exit path waits before the last gate"
+    assert code.count("cutlass.range_constexpr(CFG.STAGES_GATE)") == 1
+    i_exit_wait = code.index("if is_valid <= cutlass.Int32(0):\n                bars.mb_gate_empty.wait(ge_state.phase)")
+    i_last_gate = code.index("qgi, qgp = _tma_issue_gate(")
+    i_drain = code.index("cutlass.range_constexpr(CFG.STAGES_GATE)")
+    assert i_exit_wait < i_last_gate < i_drain, "the exit-path mb_gate_empty wait precedes the last gate's issue, the drain follows the loop"
     # the gate barriers' parities come from PipelineStates advanced by the ring depth like every other ring (P2) -- never a scalar toggle
     assert "_phase ^ cutlass.Int32(1)" not in code, "a gate barrier's parity is a PipelineState advanced by CFG.STAGES_GATE, never a scalar toggle"
-    assert code.count("advance(ge_state, CFG.STAGES_GATE)") >= 1 and code.count("advance(gf_state, CFG.STAGES_GATE)") == 1
+    assert code.count("advance(ge_state, CFG.STAGES_GATE)") == 2 and code.count("advance(gf_state, CFG.STAGES_GATE)") == 1
     assert "ge_state = PipelineState.start(phase=1)" in code and "gf_state = PipelineState.start(phase=0)" in code
 
 
