@@ -461,16 +461,23 @@ def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
 
 @pytest.mark.L0
 def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
-    """A THD or paged MXFP8 request on cc 10.7 reads the contract-level reason -- one clause ahead of the generic
-    feature loop, keyed on the row's own thd / paged_kv flags; the SM100 MXFP8 row, which serves both, is untouched."""
+    """The cc 10.7 MXFP8 row claims THD (at d256 only, #1488's thd_d_shapes) AND paged pools (d128 / d256 with dense
+    queries), so its former gap clause has no live case and is gone; every decline reads the clause that governs it:
+    THD at another head dim the generic THD-shape clause, a THD query over pools the paged MXFP8 clause, a page that
+    does not hold whole 128-row SF atoms the page-size clause.  The SM100 MXFP8 row, which serves THD and pools, is
+    untouched."""
     caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
     rubin, sm100 = caps[engines.engine_name(mxfp8=True, arch="sm107")], caps[engines.engine_name(mxfp8=True)]
-    gap = "the cc 10.7 MXFP8 row serves dense BSHD graphs only; THD and paged MXFP8 are not wired on cc 10.7"
+    thd_leg = "THD (ragged) rides the packed native-tile leg on this engine (shapes [(256, 256)]); the head-dim envelope is dense-only"
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
     thd = dict(thd=True, padded=True, **quant)
     paged = dict(has_paged_kv=True, padded=True, page_size=128, **quant)
-    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **thd)) == gap
-    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **paged)) == gap
+    paged64 = dict(has_paged_kv=True, padded=True, page_size=64, **quant)
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **thd)) == thd_leg, "THD at d128: the THD-shape clause"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), d_qk=256, d_v=256, **thd)) is None, "THD at d256 is served (#1488)"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **paged)) is None, "page-128 pools with dense queries are served"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), d_qk=256, d_v=256, thd=True, **paged)) == "paged MXFP8 KV with THD queries is not wired"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **paged64)) == "paged MXFP8 KV needs page_size to be a multiple of 128; got 64"
     assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **quant)) is None, "dense BSHD stays admitted"
     assert engines.mismatch(sm100, _facts(**thd)) is None
     assert engines.mismatch(sm100, _facts(**paged)) is None

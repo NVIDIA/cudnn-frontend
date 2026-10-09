@@ -112,6 +112,10 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d512_mxfp8
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
+if PARAMS.paged_kv:
+    raise ValueError(
+        "prefill_d512_mxfp8_sm107: paged_kv is not wired on this kernel (the cc 10.7 PAGED_KV specialization lives in sm107/prefill_d128_mxfp8 and sm107/prefill_d256_mxfp8)"
+    )
 CFG, _TMA = make_cfg_d512_mxfp8(PARAMS)
 
 # tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE
@@ -1344,7 +1348,12 @@ def _sg0_softmax_kv_iter(
         # _row_empty select -- same O either way.
         current_max = current_max_raw
     else:
-        current_max = current_max_raw * scale_log2
+        # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF_F32), as the pre-folded
+        # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
+        # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
+        # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
+        # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves.
+        current_max = cute.math.max(current_max_raw * scale_log2, NEG_INF_F32)
 
     # Online softmax (RESCALE_THRESHOLD skip).
     old_total_max = total_max

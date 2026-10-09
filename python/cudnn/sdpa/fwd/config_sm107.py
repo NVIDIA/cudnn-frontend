@@ -166,6 +166,14 @@ SM107_FP8_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)
 # `_validate_params` already receives, so adding a ported flavor is one entry.
 _F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm107 d512"})
 
+# Paged KV (TemplateParams.paged_kv / page_size) on the Rubin line: wired through the K/V TMA-LDG sites of the MXFP8
+# d128 / d256 siblings only -- the SM100 PAGED_KV specialization ported (page id = TMA batch coordinate of the K/V and
+# SF descriptors, tile-in-page = SF tile coordinate).  engines' paged_d_shapes and the adapter's Rubin clause name the
+# same two shapes; half paged graphs never load an sm107 file (api_dsl._load_sm100_kernel_module routes them to the
+# SM100 bodies).  _validate_params declines every other flavor, and each unwired MXFP8 kernel file refuses paged_kv at
+# module scope as well.  A page holds whole 128-row F8_128x4 SF atom sets, so page_size is a multiple of the KV tile.
+_PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128 mxfp8", "sm107 d256 mxfp8"})
+
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
 # same one-definition-two-consumers arrangement as SM107_FP8_THD_SHAPES above
 # (engine row + standalone adapter gate; contract rule 8b').  Must stay in step
@@ -486,6 +494,31 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             raise ValueError(f"{flavor}: epilogue_gate is wired on {sorted(_EPILOGUE_GATE_FLAVORS)} only")
         if k.thd_varlen or (k.split_kv or 1) > 1 or k.pack_gqa or k.paged_kv:
             raise ValueError(f"{flavor}: epilogue_gate is dense, unsplit, unpaged, non-PackGQA only")
+    # Paged KV: the two MXFP8 flavors whose TMA-LDG warp walks the block tables (_PAGED_KV_FLAVORS_SM107); every
+    # other Rubin flavor refuses here, before its module body could trace dense K/V descriptors over a page pool.
+    # Dense queries only (THD queries over pools are the stage-2 port: the quantized THD setup clamps the K/V
+    # descriptors to a packed total), unsplit and unpacked, and a page is a whole number of 128-row F8_128x4 SF atom
+    # sets (the SF pools page with K/V; a 64-row page cannot hold one).
+    if k.paged_kv:
+        if flavor not in _PAGED_KV_FLAVORS_SM107:
+            raise ValueError(
+                f"{flavor}: paged_kv is not wired on this Rubin flavor (the cc 10.7 PAGED_KV specialization lives in "
+                f"sm107/prefill_d128_mxfp8.py and sm107/prefill_d256_mxfp8.py; served: {sorted(_PAGED_KV_FLAVORS_SM107)})"
+            )
+        if not k.seq_kv_lens_present:
+            raise ValueError(f"{flavor}: paged_kv requires seq_kv_lens_present (the per-batch KV length bounds the block-table walk)")
+        if k.thd_varlen:
+            raise ValueError(
+                f"{flavor}: THD queries over MXFP8 pools are not wired on cc 10.7 (the quantized THD setup clamps K/V descriptors to a packed total)"
+            )
+        if k.pack_gqa or (k.split_kv or 1) > 1:
+            raise ValueError(f"{flavor}: paged_kv serves unsplit, unpacked plans only")
+        if k.page_size <= 0 or k.page_size % 128 != 0:
+            raise ValueError(
+                f"{flavor}: paged MXFP8 KV needs page_size to be a positive multiple of 128 (whole F8_128x4 SF atom sets per page); got {k.page_size}"
+            )
+    elif k.page_size:
+        raise ValueError(f"{flavor}: page_size requires paged_kv=True")
     if k.dtype_qkv not in (_DTYPE_E4M3, _DTYPE_E5M2, _DTYPE_BF16, _DTYPE_FP16):
         raise ValueError(f"{flavor}: dtype_qkv must be 0=E4M3/1=E5M2/2=BF16/3=FP16 (got {k.dtype_qkv}); Rubin has no TF32 prefill kernel")
     dtype_o = resolve_dtype_o(k)
@@ -496,8 +529,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) requires FP8 inputs")
         if not block_scaled_o_wired:
             raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) is wired in the d128 kernels (per-tensor FP8, MXFP8) only")
-        if k.thd_varlen or k.seq_q_lens_present or (k.split_kv or 1) > 1 or k.pack_gqa:
-            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) serves dense, unsplit, unpacked graphs only")
+        if k.thd_varlen or k.seq_q_lens_present or (k.split_kv or 1) > 1 or k.pack_gqa or k.paged_kv:
+            raise ValueError(f"{flavor}: block-scaled O (dtype_o {dtype_o}) serves dense, unsplit, unpacked, unpaged graphs only")
     if k.dtype_qkv > _DTYPE_E5M2 and dtype_o != k.dtype_qkv:
         raise ValueError(f"{flavor}: half input (BF16/FP16) requires dtype_o == dtype_qkv; got dtype_o={dtype_o}")
     quantized = k.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2)
@@ -642,6 +675,9 @@ class _CfgSm107:
     SEQ_KV_LENS_PRESENT: int = 0
     SEQ_Q_LENS_PRESENT: int = 0
     THD_VARLEN: int = 0
+    # Paged KV cache (TemplateParams.paged_kv / page_size); only the d128 / d256 MXFP8 factories set them.
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
 
     L2_SIZE_MIB: int = 60
     SCHEDULER_POLICY: int = SCHED_NATURAL
@@ -952,6 +988,8 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         SEQ_KV_LENS_PRESENT=1 if params.thd_varlen else int(params.seq_kv_lens_present),
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        PAGED_KV=int(bool(params.paged_kv)),
+        PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
         SCHEDULER_POLICY=params.sched_policy if params.sched_policy is not None else SCHED_NATURAL,
         N_BMM2_CHUNKS=tile_n // 64,
         BMM2_CHUNK_SIZE=64,
@@ -1132,6 +1170,8 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         SEQ_KV_LENS_PRESENT=1 if params.thd_varlen else int(params.seq_kv_lens_present),
         SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=int(params.thd_varlen),
+        PAGED_KV=int(bool(params.paged_kv)),
+        PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
         SCHEDULER_POLICY=params.sched_policy if params.sched_policy is not None else SCHED_NATURAL,
         N_BMM2_CHUNKS=tile_n // 64,
         BMM2_CHUNK_SIZE=64,
