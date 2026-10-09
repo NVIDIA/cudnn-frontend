@@ -15,7 +15,7 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 4. Classify the kernel before choosing a template:
    - Kernel family: dense GEMM, GEMM fusion, grouped GEMM, discrete grouped GEMM, MoE, attention, sparse attention, or another frontend-only API family.
    - Execution topology: single kernel, paired forward/backward APIs, multi-kernel orchestrator, helper-kernel setup, distributed/runtime-coordinated execution, or internal scheduler.
-   - Public surface: `<op_name>_<framework>_<direction>` functions (see `docs/fe-oss-apis/api_conventions.md`), returned tensors, optional outputs, workspace ownership, and import/export namespace.
+   - Public surface: `<op_name>_<direction>` / `<op_name>_jax_<direction>` functions (see `docs/fe-oss-apis/api_conventions.md`), returned tensors, optional outputs, workspace ownership, and import/export namespace.
    - Internal support: source helper modules, schedulers, metadata utilities, and generated descriptors that must stay private to the package.
    - Architecture variant: whether the public API needs transparent dispatch to an alternate CuTeDSL module for a newer GPU (for example Rubin `sm107` vs the default SM100 kernel). Keep the public functions unchanged when dispatch is internal.
 5. Read `references/integration-pattern.md` for the detailed repo conventions before implementing.

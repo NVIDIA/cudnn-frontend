@@ -62,7 +62,7 @@ Follow the closest template instead of inventing a new lifecycle.
   - Implement `compile()` for the CuTeDSL kernel compile path.
   - Implement `execute(...)` for preallocated runtime inputs/outputs and stream handling.
 - Wrapper API:
-  - Name each function `<op_name>_<framework>_<direction>`, following `docs/fe-oss-apis/api_conventions.md`.
+  - Name each function `<op_name>_<direction>` (PyTorch) or `<op_name>_jax_<direction>` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
   - Allocate output tensors for common use.
   - Reuse the existing template's cache strategy when applicable.
   - Return `cudnn.api_base.TupleDict` so callers can use both key access and tuple unpacking.
