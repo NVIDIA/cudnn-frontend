@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <type_traits>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -133,7 +134,7 @@ load_cudart_so() {
 #else
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
 #endif
-    constexpr size_t num_libs = sizeof(libs) / sizeof(libs[0]);
+    constexpr size_t num_libs = std::size(libs);
 
     HMODULE lib_handle = nullptr;
     int loaded_index   = -1;
