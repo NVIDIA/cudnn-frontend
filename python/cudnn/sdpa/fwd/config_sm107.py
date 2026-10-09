@@ -686,11 +686,11 @@ def sm107_bias_max_form_default(bias_mode: int, kv_mask_form: int) -> int:
     """The MEASURED default row-max form of a bias / kv_mask plan that requests none -- per FORM, never one constant:
 
     * the kv_mask-ONLY form (the bit word, no bias) runs the HARDWARE UPPER BOUND: there the bound is the fused raw max alone, nothing is
-      added per step, and it recovers a third of the -inf body's cost over the plain kernel -- **+6.1..+14.8 %** on seven cells (bf16, D 32 at
+      added per step, and it recovers a third of the -inf body's cost over the plain kernel -- **+6.1..+14.8 %** on eight cells (bf16, D 32 at
       S 256 / 384 / 512 / 768 / 1024 with one batch entry and S 384 with four, D 64 at S 384 / 768; +11.4 % at the 384 cell, +14.8 % at 1024),
       every cell outside its control-pair spread by more than ten times; a 212-SM cc 10.7 perf node at the 2376 MHz lock (sampled busy median
       0.5 % under it, no power-cap event), 100 x 3 CUDA-graph replay, the two forms interleaved in ONE process, the fp64 oracle on both.
-      The trees behind the claim (a perf number carries its base): the seven cells were measured on the arm over ``deb8d0e6e`` -- the kv
+      The trees behind the claim (a perf number carries its base): the eight cells were measured on the arm over ``deb8d0e6e`` -- the kv
       tile body BEFORE the dead-sub-tile quiet default (``3cdb717d4``), which the tree this function ships in renders at S 384 on the
       kv_mask-only plan (``dead_subtile_quiet`` 1: S_q % 256 = 128) and nowhere at S % 256 = 0 (there the S 256 / 512 / 768 / 1024 cells
       render the SAME kv tile body on every tree: one cubin md5 for the kv_mask-only rendering across the four bases rendered).  The
@@ -705,7 +705,13 @@ def sm107_bias_max_form_default(bias_mode: int, kv_mask_form: int) -> int:
       plus the early second read of the non-pre-loaded chunk) costs about twice what the removed tree saves -- **-4.9..-12.2 %** on nine
       cells (both item forms, the resident block and the streamed ring, with and without the kv_mask, D 32 / 64, S 384 / 768 / 1024).  The
       bias row max has to come from OUTSIDE the per-step path (a per-item reduction over the resident block, or a once-per-execute row-max
-      pre-pass over the bias) before those arms can collect the kv_mask-only gain; recorded, not built;
+      pre-pass over the bias) before those arms can collect the kv_mask-only gain; recorded, not built.  The trees behind THIS half: the
+      nine cells were measured on the same arm over ``deb8d0e6e`` -- whose 128-wide bias arms pre-load ONE bias chunk and render the legacy
+      dead-sub-tile body -- and two of them again on ``111c061f8`` (the same constants: the S 384 resident pair -8.4 %, the S 1024
+      one-batch-entry ring -12.1 %); the tree this function ships in renders the 128-wide bias arms with NO pre-loaded chunk
+      (``9022d1a47``) and the quiet body at S 384, where the hardware-vs-software sign of the bias forms is UNMEASURED -- the software
+      default is the pre-existing kernel either way, so only a missed win is at stake there; the per-item / pre-pass follow-up re-measures
+      from that tree;
     * a plan without either arm has no -inf body: the software value (the field is meaningless there and the factory pins it to 0).
 
     The adapter's pick (:func:`sm107_bias_max_form_pick`) applies this unless a request or the sweep seam overrides it; the record field

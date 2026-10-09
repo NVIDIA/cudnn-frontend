@@ -82,7 +82,7 @@ def test_template_params_and_cfg_are_appended():
     for kw in (dict(bias_mode=1), dict(kv_mask_form=1), dict(bias_mode=1, kv_mask_form=1, tile_n=64), {}):
         cfg, _ = c.make_cfg_d32(_params(**kw))
         assert cfg.BIAS_MAX_FORM == 0, kw
-    # the MEASURED per-form default the adapter picks: the hardware bound on the kv_mask-only form (+6..+15 % on seven cells), the software
+    # the MEASURED per-form default the adapter picks: the hardware bound on the kv_mask-only form (+6..+15 % on eight cells), the software
     # tree wherever a bias is present (-5..-12 % on nine cells) and on a plan without either arm
     assert c.sm107_bias_max_form_default(0, 1) == 1
     assert c.sm107_bias_max_form_default(1, 0) == 0 and c.sm107_bias_max_form_default(2, 0) == 0
