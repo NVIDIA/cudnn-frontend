@@ -884,55 +884,62 @@ def test_update_quant_scales_reaches_a_captured_execute_of_a_warmed_up_block(fam
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     assert torch.equal(out_g, r.out)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        _execute_fwd(r, r.blk, out_g, ws_g, saved=saved_g)
-    out_g.fill_(float("nan"))
-    torch.cuda.synchronize()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out_g, r.out), "the warmed-up capture does not replay the eager A result"
-    r.blk.update_quant_scales(b)  # eager, on the default stream, between two replays
-    torch.cuda.synchronize()
-    assert _dev_values(r.blk) == want_b
-    out_g.fill_(float("nan"))
-    torch.cuda.synchronize()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(
-        out_g, out_b
-    ), f"the replay after update_quant_scales(B) is not the B block's out: max {(out_g.float() - out_b.float()).abs().max().item():.3e}"
-    assert torch.equal(saved_g.o, saved_b.o) and torch.equal(saved_g.lse, saved_b.lse), "the record written by the replay differs from the B block's"
-    assert _dev_values(r.blk) == want_b
-    # (2) the FIRST execute captured: the documented limitation
-    blk2, out2 = _fwd_block_with(r, a, training=True)
-    ws2 = _compile(blk2)
-    saved2 = _record(r)
-    torch.cuda.synchronize()
-    assert blk2._quant_dev_on_launch_stream is False
-    graph2 = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph2, stream=stream):
-        _execute_fwd(r, blk2, out2, ws2, saved=saved2)
-    assert blk2._quant_dev_on_launch_stream is True, "the one-shot write was not part of the captured first execute"
-    out2.fill_(float("nan"))
-    torch.cuda.synchronize()
-    graph2.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out2, r.out)
-    blk2.update_quant_scales(b)
-    torch.cuda.synchronize()
-    assert _dev_values(blk2) == want_b
-    out2.fill_(float("nan"))
-    torch.cuda.synchronize()
-    graph2.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out2, r.out), "a graph that captured the FIRST execute no longer replays its capture-time scales: the documented limitation moved"
-    assert _dev_values(blk2) == want_a, "the replayed one-time write did not re-write the capture-time values"
-    out3 = torch.empty_like(r.out)
-    _execute_fwd(r, blk2, out3, ws2, saved=_record(r))
-    torch.cuda.synchronize()
-    assert torch.equal(out3, r.out)  # an eager execute right after that replay reads the replayed A scalars
-    blk2.update_quant_scales(b)
-    _execute_fwd(r, blk2, out3, ws2, saved=_record(r))
-    torch.cuda.synchronize()
-    assert torch.equal(out3, out_b)  # and the caller's path outside the graph still reaches B
+    graph, graph2 = torch.cuda.CUDAGraph(), None
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            _execute_fwd(r, r.blk, out_g, ws_g, saved=saved_g)
+        out_g.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out_g, r.out), "the warmed-up capture does not replay the eager A result"
+        r.blk.update_quant_scales(b)  # eager, on the default stream, between two replays
+        torch.cuda.synchronize()
+        assert _dev_values(r.blk) == want_b
+        out_g.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(
+            out_g, out_b
+        ), f"the replay after update_quant_scales(B) is not the B block's out: max {(out_g.float() - out_b.float()).abs().max().item():.3e}"
+        assert torch.equal(saved_g.o, saved_b.o) and torch.equal(saved_g.lse, saved_b.lse), "the record written by the replay differs from the B block's"
+        assert _dev_values(r.blk) == want_b
+        # (2) the FIRST execute captured: the documented limitation
+        blk2, out2 = _fwd_block_with(r, a, training=True)
+        ws2 = _compile(blk2)
+        saved2 = _record(r)
+        torch.cuda.synchronize()
+        assert blk2._quant_dev_on_launch_stream is False
+        graph2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph2, stream=stream):
+            _execute_fwd(r, blk2, out2, ws2, saved=saved2)
+        assert blk2._quant_dev_on_launch_stream is True, "the one-shot write was not part of the captured first execute"
+        out2.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph2.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out2, r.out)
+        blk2.update_quant_scales(b)
+        torch.cuda.synchronize()
+        assert _dev_values(blk2) == want_b
+        out2.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph2.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out2, r.out), "a graph that captured the FIRST execute no longer replays its capture-time scales: the documented limitation moved"
+        assert _dev_values(blk2) == want_a, "the replayed one-time write did not re-write the capture-time values"
+        out3 = torch.empty_like(r.out)
+        _execute_fwd(r, blk2, out3, ws2, saved=_record(r))
+        torch.cuda.synchronize()
+        assert torch.equal(out3, r.out)  # an eager execute right after that replay reads the replayed A scalars
+        blk2.update_quant_scales(b)
+        _execute_fwd(r, blk2, out3, ws2, saved=_record(r))
+        torch.cuda.synchronize()
+        assert torch.equal(out3, out_b)  # and the caller's path outside the graph still reaches B
+    finally:
+        # test-owned graphs are reset here, assertion or not: a graph collected from a reference cycle inside a LATER test's
+        # capture would invalidate that capture (the teardown hook flags an unreset graph)
+        graph.reset()
+        if graph2 is not None:
+            graph2.reset()
