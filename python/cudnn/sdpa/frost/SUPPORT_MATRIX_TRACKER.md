@@ -253,7 +253,10 @@ that would overflow the FP32 products.
 **LPT_L2 departs from the shared rule**: SM120 passes the raw 50 MiB, so its
 block is `floor(budget / per-group)` KV groups; SM90 floors that count to a power
 of two. The raw width measured 3–14 % slower here (short last block under one
-wave); a balanced width is the follow-up.
+wave). The shared decode now spreads the groups evenly over the same block
+count (`lpt_l2_tile_coords`), which shrinks the tail underfill (9 groups at
+a width of 8 now run as 5 + 4 instead of 8 + 1); on
+B300 that made LPT_L2 plans up to 5.2 % faster (median 0.4 %).
 **Measured** on H200 (132 SMs), bf16, forward with O + Stats, against cuDNN
 9.24.0 (FE 1.30.0, CUDA 13.0, DSL 4.8.0.dev0, 5 alternating rounds; SOL against
 the 1071 TFLOPS BF16 MMA peak). DeepSeek-V4 Flash, the #991 set (b=2, 64/1 heads,
