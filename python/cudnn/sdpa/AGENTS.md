@@ -842,8 +842,11 @@ ratios read the kernel-only CUPTI time):
 - `BIAS_PRELOAD_CHUNKS` 1 -> 0 flips sign with the rendering (a base / 0 / base
   cross-process A/B/A over 27 cells, base drift <= 0.23 %): +1.4..+3.2 % on every
   TILE_N 128 bias form, -2.5..-2.7 % on the bias + kv_mask body at TILE_N 64 (the
-  body the chooser will pick for that graph) -- not a module default; a
-  per-rendering constant if anything.
+  body the chooser will pick for that graph) -- so it is a per-RENDERING
+  constant, never a module default: `config_sm107.sm107_bias_preload_chunks`
+  (`SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N`: 0 at TILE_N 128, 1 at TILE_N 64), read
+  once by the kernel module from `CFG.TILE_N`; numerics are unchanged at every
+  value, only the instruction stream around the `bmm1_done` wait moves.
 
 The table those facts imply is CODE, in one place per axis, and the sweep's
 second half (S = 2048 at D 32 / 64 and B 1 / 4; cluster 1 vs 2 at D 64 S 128..2048;

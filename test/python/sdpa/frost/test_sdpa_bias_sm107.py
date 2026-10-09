@@ -498,8 +498,17 @@ def test_kernel_module_constants_and_mask_sites():
     bias_ring_stages=)`` (the two bias FORMS fold on CFG.BIAS_MODE), and every mask site of the file calls ``apply_mask_chunk`` directly
     (the one bit-word form; no ``form=``)."""
     src = _KERNEL.read_text()
-    m = re.search(r"^BIAS_PRELOAD_CHUNKS: int = (\d)", src, re.M)
-    assert m and int(m.group(1)) in (0, 1, 2), "BIAS_PRELOAD_CHUNKS must be a module constant in {0, 1, 2}"
+    assert (
+        "BIAS_PRELOAD_CHUNKS: int = sm107_bias_preload_chunks(CFG.TILE_N)" in src
+    ), "BIAS_PRELOAD_CHUNKS is the per-rendering constant (one arithmetic, rule 8b')"
+    assert src.count("BIAS_PRELOAD_CHUNKS: int =") == 1
+    from cudnn.sdpa.fwd import config_sm107 as cfg107
+
+    # the table: nothing ahead of the wait on the 128-wide tile (+1.4..+3.2 % on every bias form), one chunk on the 64-wide one (the
+    # bias + kv_mask body loses 2.5..2.7 % without it); every value in the kernel's domain; an unrelated width keeps the one-chunk default
+    assert cfg107.SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N == {128: 0, 64: 1}
+    assert [cfg107.sm107_bias_preload_chunks(w) for w in (128, 64, 256)] == [0, 1, 1]
+    assert all(cfg107.sm107_bias_preload_chunks(w) in (0, 1, 2) for w in (32, 64, 128, 256))
     assert "make_classic_bars(CFG, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)" in src
     assert "form=" not in "".join(ln for ln in src.splitlines() if "apply_mask_chunk(" in ln)
     assert 'mask_value=float("-inf")' in src and "row_max_for_exp2(total_max)" in src

@@ -102,7 +102,7 @@ from dataclasses import dataclass
 # `import` usable as a standalone driver.
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d128_family_tmem_layout, make_cfg_d32, make_cfg_d64, make_cfg_d128
 from cudnn.sdpa.fwd.config_sm107 import KV_MASK_BOOL_WORD, KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32
-from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED, BIAS_RING_STAGES, bias_smem_tiles
+from cudnn.sdpa.fwd.config_sm107 import BIAS_MODE_RESIDENT, BIAS_MODE_STREAMED, BIAS_RING_STAGES, bias_smem_tiles, sm107_bias_preload_chunks
 
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
 # One body, three head-dim tile geometries (TILE_K = TILE_O = d_flavor); the record field selects the factory, the
@@ -363,10 +363,12 @@ from cudnn.frost.tile_dsl.mask import kv_mask_keep_words
 #
 # BIAS_PRELOAD_CHUNKS: how many of the step's 64-column bias chunks the softmax lanes load BEFORE the bmm1_done wait (the
 # block is resident, so the fragment has no dependency on BMM1): 0 = after the wait, 1 = chunk 0 under BMM1 and chunk 1 under
-# chunk 0's math (the register-budget-safe default: 32 packed words live across the wait), 2 = the whole fragment (64 words
-# across the wait; read STL / LDL before adopting it).  A per-kernel constant like SPIN_RING_WAITS: flipping it is the whole
-# experiment, never a literal at a call site.
-BIAS_PRELOAD_CHUNKS: int = 1
+# chunk 0's math (32 packed words live across the wait), 2 = the whole fragment (64 words across the wait; read STL / LDL before
+# adopting it).  A per-RENDERING constant keyed on the KV tile width (config_sm107.sm107_bias_preload_chunks: 0 on the 128-wide
+# tile, 1 on the 64-wide one -- the measured signs are opposite, so neither value is a module default), read once here like
+# SPIN_RING_WAITS and never a literal at a call site; numerics are unchanged at every value (the same words are added in the same
+# order), only the instruction stream around the wait moves.
+BIAS_PRELOAD_CHUNKS: int = sm107_bias_preload_chunks(CFG.TILE_N)
 _BIAS_ARM = bool(CFG.BIAS_MODE)
 # The bias FORM: the resident block (the two item-level rows R1 / R2) or the streamed ring (the two ring rows S1 / S2); every
 # form-specific seam folds on one of these two, every shared seam on _BIAS_ARM.

@@ -338,6 +338,24 @@ SM107_FP32_VECTOR_WITH_BIAS_TILE_N = 64
 SM107_SMALL_TILE_N_DEFAULT, SM107_SMALL_TILE_N_NARROW = 128, 64
 # the d64 bias-only graph and the d64 padded body take the narrow tile up to this S_kv (one or two 128-wide kv tiles)
 SM107_NARROW_TILE_S_KV_MAX = 256
+# How many of a kv step's 64-column bias chunks the softmax lanes pre-load BEFORE the bmm1_done wait (the kernel's
+# BIAS_PRELOAD_CHUNKS), per RENDERING, keyed on the KV tile width -- the sign of the pre-load is a property of the rendering, not of
+# the kernel (MEASURED, bf16 D 32 / 64, a 212-SM cc 10.7 node at the 2376 MHz lock, 100 x 3 graph-replay rounds, a base / 0 / base
+# cross-process A/B/A over 27 cells with the base drift <= 0.23 %): on the 128-wide tile loading NOTHING ahead of the wait is
+# +1.4..+3.2 % on every bias form (+1.7..+1.9 % on the pair item, +3.1 % on the one-batch-entry item, +1.2 % with a kv_mask) -- the
+# row read hides in place on the issue-bound body and the 32 packed words it kept live across the wait are freed; on the 64-wide
+# tile the bias + kv_mask body LOSES 2.5..2.7 % without the pre-load (its one 64-column chunk has nothing to overlap the row read
+# with), so that width keeps one chunk ahead of the wait (the bias-only 64-wide renderings are unmeasured either way and keep it
+# too); two chunks ahead is -1.0 % (64 words live across the wait).  Read by the kernel module at render time (one arithmetic, rule
+# 8b'); the domain {0, 1, 2} is the kernel's.
+SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N = {SM107_SMALL_TILE_N_DEFAULT: 0, SM107_SMALL_TILE_N_NARROW: 1}
+
+
+def sm107_bias_preload_chunks(tile_n: int) -> int:
+    """The kernel's ``BIAS_PRELOAD_CHUNKS`` for a rendering at KV tile width ``tile_n`` (:data:`SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N`);
+    a width outside the small tiles' domain (the d128 / d192 / d256 / d512 renderings, which carry no bias arm) keeps the one-chunk
+    default so an unrelated rendering's instruction stream is unchanged."""
+    return SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N.get(int(tile_n), 1)
 
 
 def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: bool, padded: bool = False, request: Optional[int] = None, domain=None) -> int:
