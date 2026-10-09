@@ -120,8 +120,8 @@ envelope, random hold-out); develop led none of them (mean regret 116%):
   d64/d128 0.02-0.93 on the shared decode tile (#1484; re-measured 2026-10-09, 144 cases, causal and mask-free,
   s_q 2-16, 1-512 KV units, 2k-128k KV), where the 2026-10-08 sweep on the Rubin body had 64+ units losing.
 - prefill: d512 and its envelope lead (0.08-0.67); chunks of <= 128 Q tiles from a 4k cache lead
-  (d64-d256, 0.04-1.00); a causal d64/d128 graph whose decode-tile launch fits one wave leads
-  (heuristics.d128_dense_waves; 0.42-0.86 over 25 cases, issue #1518). Other squares and wider chunks are
+  (d64-d256, 0.04-1.00); a causal d64/d128 graph whose decode-tile launch fits one wave leads, with or
+  without a sink (_d128_one_decode_tile_wave, shared with SM100; issue #1518). Other squares and wider chunks are
   mixed (up to 1.98x) -> TRAIL. Over the 386-case 2026-10-09 d64/d128 set the mean regret is 1.8%
   (develop placement 179.5%), with no lead slower than 1.03x warm or cold.
 - ``s_q == 1`` keeps the backend (d64/d128/d256/d512 1.6-25x; d192 mixed).
@@ -296,15 +296,21 @@ def place(spec, facts) -> str:
     return LEAD
 
 
+def _d128_one_decode_tile_wave(caps: Capabilities, facts) -> bool:
+    """Causal dense d64/d128 prefill whose decode-tile launch fits one wave (heuristics.d128_dense_waves), sink or not.
+
+    B200 / B300 / cc 10.7, cuDNN 9.27, 2026-10-09 (issue #1518): the first FROST plan ran 0.03-0.88 of the backend's, warm and
+    cold, on all 146 qualifying cases (79 A/B, 67 candidate audit); windows and right bands were not measured."""
+    from .heuristics import d128_dense_waves
+
+    if facts.s_q <= DECODE_SHAPED_MAX_S_Q or not facts.causal or facts.window_left is not None or facts.right_band_widening:
+        return False
+    waves = d128_dense_waves(caps, facts)
+    return waves is not None and waves[0] == 1
+
+
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import (
-        _prefer_paged_d256_lpt,
-        _prefer_thd_pack_gqa,
-        d128_dense_waves,
-        nonpaged_thd_split_choice,
-        paged_d256_prefix_launch,
-        paged_thd_split_choice,
-    )
+    from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
     if facts.device_cc != (10, 7):
         return TRAIL
@@ -334,6 +340,8 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     # Share the qualified prefix envelope with candidate generation.
     if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts)[0] > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
+    if _d128_one_decode_tile_wave(caps, facts):
+        return LEAD
     if not (facts.thd or facts.has_paged_kv or facts.has_sink) and facts.window_left is None:
         # Dense, measured on a gr100 board (216 SMs) against cuDNN 9.27 (2026-10-08).
         flavor = _selected_d_shape(caps, facts)
@@ -344,9 +352,6 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
                 return LEAD  # d512 and its d320-d448 envelope: 0.08-0.67
             if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and _q_tiles(facts) <= CHUNKED_MAX_Q_TILES:
                 return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)
-            waves = d128_dense_waves(caps, facts)
-            if facts.causal and waves is not None and waves[0] == 1:
-                return LEAD  # causal d64/d128 within one decode-tile wave: 0.42-0.86 (25 cases, issue #1518)
     # The shared paged pipeline also benefits from GQA packing without a
     # split. Large-batch short queries recover unused Q rows without partials.
     # Smaller GPU-only gains do not reliably repay the host submission cost;
@@ -490,7 +495,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
             return TRAIL
         return TRAIL  # d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x)
     # prefill-shaped
-    if _in_paged_d256_prefill_domain(facts):
+    if _in_paged_d256_prefill_domain(facts) or _d128_one_decode_tile_wave(caps, facts):
         return LEAD
     if (
         facts.thd

@@ -130,6 +130,9 @@ _SM107_DECODE_TILE_LPT_MIN_KV = 2048
 # decode-tile waves (128-row CTAs on every SM); the narrower tile leads while its grid quantizes into no more than that.
 # Fit on cc 10.7 (216 SMs) and B300 (148 SMs) bottom-right causal prefill / chunk cells (issue #1518).
 _D128_CGA2_WAVE_COST = 1.6
+# ... below this cache: past it the cga2 pair's shared K/V reads win (B200 / cc 10.7 chunks at 32k-128k KV ran 0.86-0.97
+# on the decode tile without it; with it the 68 changed first plans run 0.98x or faster).
+_D128_CGA1_MAX_KV = 16384
 
 # The SM80 kernels' L2 grouping budget is a per-flavor MiB table fed to the
 # template (sched_l2_mib); the adapter owns that table. For POINT ORDERING all
@@ -1043,7 +1046,7 @@ def d128_dense_waves(caps: Capabilities, facts, pack_gqa: Optional[bool] = None)
 def _d128_dense_cga1_waves_win(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
     """Whether the dense d128 decode tile beats the cga2 prefill cluster on wave count (_D128_CGA2_WAVE_COST)."""
     waves = d128_dense_waves(caps, facts, pack_gqa)
-    return waves is not None and waves[0] <= _D128_CGA2_WAVE_COST * waves[1]
+    return waves is not None and facts.s_kv < _D128_CGA1_MAX_KV and waves[0] <= _D128_CGA2_WAVE_COST * waves[1]
 
 
 def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] = None) -> bool:
