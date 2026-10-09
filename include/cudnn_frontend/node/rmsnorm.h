@@ -45,8 +45,9 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
             // Only infer dims and strides if user did not set them
             if (inv_var->get_dim().empty()) {
                 auto inv_var_dim = X->get_dim();
-                auto scale       = attributes.inputs[Rmsnorm_attributes::input_names::SCALE];
-                if (scale->get_dim().empty()) {
+                auto scale_it    = attributes.inputs.find(Rmsnorm_attributes::input_names::SCALE);
+                auto scale       = (scale_it != attributes.inputs.end()) ? scale_it->second : nullptr;
+                if (scale == nullptr || scale->get_dim().empty()) {
                     // mean inv_var dim is n,1,1,1
                     for (size_t i = 1; i < inv_var_dim.size(); i++) {
                         inv_var_dim[i] = 1;
@@ -79,6 +80,32 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
         RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.forward_phase == NormFwdPhase_t::NOT_SET,
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Forward phase not set of rmsnorm node.");
+
+        // Without a scale the backend picks the normalization axes by rank (inference) or from INV_VARIANCE (training),
+        // so accept only graphs where those agree: one non-unit axis after the first, or explicit INV_VARIANCE dims
+        // (#188).
+        auto const scale_it = attributes.inputs.find(Rmsnorm_attributes::input_names::SCALE);
+        if (scale_it == attributes.inputs.end() || scale_it->second == nullptr) {
+            auto const x_it = attributes.inputs.find(Rmsnorm_attributes::input_names::X);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(x_it == attributes.inputs.end() || x_it->second == nullptr,
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "Tensor X not set of rmsnorm node.");
+            auto const& x_dim = x_it->second->get_dim();
+            auto const non_unit_axes =
+                x_dim.empty() ? 0 : std::count_if(x_dim.begin() + 1, x_dim.end(), [](int64_t d) { return d != 1; });
+            bool inv_var_dims_set = false;
+            if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+                auto const inv_var_it = attributes.outputs.find(Rmsnorm_attributes::output_names::INV_VARIANCE);
+                inv_var_dims_set      = inv_var_it != attributes.outputs.end() && inv_var_it->second != nullptr &&
+                                   !inv_var_it->second->get_dim().empty();
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                non_unit_axes > 1 && !inv_var_dims_set,
+                error_code_t::INVALID_VALUE,
+                "Rmsnorm without scale: X has more than one non-unit dimension after the first, so the normalization "
+                "axes are ambiguous. Pass a scale, reshape X to {rows, hidden, 1, 1}, or (training) set the "
+                "INV_VARIANCE dims.");
+        }
 
         return {error_code_t::OK, ""};
     }
@@ -130,15 +157,17 @@ class RMSNormNode : public NodeCRTP<RMSNormNode> {
                                                        1,
                                                        &x_desc));
 
-        // Set scale tensor
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Rmsnorm_attributes::input_names::SCALE);
-        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+        // Set optional scale tensor
+        auto SCALE = attributes.inputs.find(Rmsnorm_attributes::input_names::SCALE);
+        if ((SCALE != attributes.inputs.end()) && (SCALE->second != nullptr)) {
+            auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &scale_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(rmsnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &scale_desc));
+        }
 
         // Set epsilon tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Rmsnorm_attributes::input_names::EPSILON);

@@ -3615,8 +3615,11 @@ Graph::rmsnorm(std::shared_ptr<Tensor_attributes> x,
             output_tensor(attributes.name + "::INV_VARIANCE");
     }
     // Set inputs
-    attributes.inputs[Rmsnorm_attributes::input_names::X]     = x;
-    attributes.inputs[Rmsnorm_attributes::input_names::SCALE] = scale;
+    attributes.inputs[Rmsnorm_attributes::input_names::X] = x;
+    // scale is optional (the backend accepts a null SCALE_DESC, #188); keep nullptr out of the inputs map
+    if (scale) {
+        attributes.inputs[Rmsnorm_attributes::input_names::SCALE] = scale;
+    }
 
     sub_nodes.emplace_back(std::make_unique<RMSNormNode>(std::move(attributes), context));
 
