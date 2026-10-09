@@ -334,7 +334,13 @@ def test_ds_budget_resize_is_atomic(monkeypatch):
 @pytest.mark.L0
 def test_default_stream_context(monkeypatch):
     """Validate stream interop without compiling an architecture-specific kernel."""
-    cls = pytest.importorskip("cudnn.sdpa.bwd.compact_gqa").CompactGqaBackward
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        pytest.skip("CompactGqaBackward requires CuTe DSL >=4.7.0")
+    from cudnn.sdpa.bwd.compact_gqa import CompactGqaBackward as cls
+
     plan = cls.__new__(cls)
     plan.device, plan._stream = torch.device("cuda", torch.cuda.current_device()), None
     default = torch.cuda.default_stream(plan.device)
