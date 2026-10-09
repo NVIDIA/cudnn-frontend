@@ -853,11 +853,15 @@ one kv tile) is in it:
 
 - `config_sm107.sm107_tile_n_pick` is the width (a bias with ANY mask -- the
   kv_mask or the kernel's padding-mask arm -- takes TILE_N 64: the combined body
-  is the one over the instruction-cache cliff, +14 % even at d32 S 2048 with
-  per-batch lengths; a bias alone at S_kv <= 256; a kv_mask alone at one kv tile,
+  is the one over the instruction-cache cliff: with per-batch lengths of 0.75 S
+  +11..+73 % at S 256..2048, both D, B 1 / 4, 13 of 13 cells with the table's form
+  measured; a bias alone at S_kv <= 256; a kv_mask alone at one kv tile,
   +7..+14 %; the plain body at S_kv % 128 != 0 at d32 and up to 256 at d64; 128
   everywhere else -- per-batch lengths at a tile multiple included, where 64 is
-  -19 / -20 % on the plain body at d32 / d64 S 2048). `heuristics._resident_arm_tile_n`, the engine
+  -11..-18 % on the plain body at S 512 / 1024 and -19 / -20 % at d32 / d64 S 2048;
+  the pick sees S_kv, not the lengths, so where the lengths themselves end
+  mid-tile (0.75 S at S 256 = 192 keys) the half tile's measured +58..+119 % is
+  out of its reach -- the padded dense body's open kernel item). `heuristics._resident_arm_tile_n`, the engine
   row's form evaluation in `engines._bias_arm_decline` and the adapter's
   `_effective_tile_n` call it (rule 8b').
 - The one-batch-entry guard of `sm107_n_chunk_pick` holds at TILE_N 128 only: on
@@ -875,7 +879,7 @@ one kv tile) is in it:
   256-row item's block fill is exposed per item, the ring overlaps it); the pair
   item keeps "resident where it fits" (its 2-stage ring is -0.3 / -1.7 % at d32).
 - Cluster 2 is never the pick on the small tiles: -32 / -31 % at d64 S 128 / 256,
-  a tie at 384 / 512, -2.8 % at 2048; a cga2 request at D <= 32 rides the 64-wide
+  a tie at 384 / 512, -2.7 % at 2048 (graph replay; the CUPTI kernel time -2.4 %); a cga2 request at D <= 32 rides the 64-wide
   tile (-45 % at S 256); the d64 one-batch-entry cga2 ring stays an isolated
   point (+4 % at S_kv 1024 only).
 

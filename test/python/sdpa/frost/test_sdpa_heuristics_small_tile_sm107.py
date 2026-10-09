@@ -87,7 +87,7 @@ _TABLE = [
     (
         (32, 256, 1, "bias", False),
         (128, 1, 0, 2, 2),
-        "one-batch-entry ring, 2 stages (+6.0 %; the same ring on the 64-wide tile +10.2 %, an open lever; the pair n2 at 64 +6.0 %)",
+        "one-batch-entry ring, 2 stages (+6.0 %; the pair n2 at 64 +6.0 %; the same ring on the 64-wide tile is a DIRECTION only: its +10.2 % is a CUPTI figure from a process whose CUPTI control twin spread 21.4 % under a degraded clock -- the replay there, at a 0.08 % twin, reads +3.5 % over the 128-wide ring)",
         6.0,
         "CUPTI",
     ),
@@ -182,7 +182,7 @@ _TABLE = [
         "replay",
     ),
     ((64, 1024, 1, "both", False), (64, 1, 8, 2, 3), "pair ring / TILE_N 64 (n32 measured +39 %)", 39.0, "replay"),
-    ((64, 2048, 1, "plain", False), (128, 1, 0, 0, 0), "plain, cga1 (cga2 -2.8 %)", 0.0, "replay"),
+    ((64, 2048, 1, "plain", False), (128, 1, 0, 0, 0), "plain, cga1 (cga2 -2.7 % replay, -2.4 % CUPTI)", 0.0, "replay"),
     ((64, 2048, 1, "bias", False), (128, 1, 8, 2, 3), "pair ring n8 (+3.8 % over the rule's n128; n4 / n16 within 0.3 %)", 3.8, "replay"),
     ((64, 2048, 1, "both", False), (64, 1, 8, 2, 3), "pair n8 ring / TILE_N 64", 50.8, "replay"),
     ((64, 2048, 1, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths (TILE_N 64 -20 %)", 0.0, "replay"),
@@ -199,6 +199,105 @@ _TABLE = [
     ((64, 1024, 4, "both", False), (64, 1, 8, 2, 3), "pair ring / TILE_N 64 (n128 measured +31.6 %)", 31.6, "replay"),
     ((64, 2048, 4, "bias", False), (128, 1, 8, 2, 3), "pair ring n8 (+4.3 % over the rule's n512, 8192 rows; lower-bound process)", 4.3, "replay"),
     ((64, 2048, 4, "both", False), (64, 1, 8, 2, 3), "pair ring / TILE_N 64 (n512 measured +39 %; lower-bound process)", 39.1, "replay"),
+    # ---- the padding-mask leg: per-batch KV lengths of 0.75 S, both D, B 1 / 4, S 256 / 512 / 1024 (+ the d32 B 1 S 2048 bias cell), measured on
+    # four CLEAN processes (2364 MHz) after the first cut of the table had generalised the bias-with-padding width rule from ONE cell ----
+    (
+        (32, 256, 1, "bias", True),
+        (64, 1, 2, 1, 0),
+        "bias + per-batch KV lengths 0.75 S: the table's pair n2 / resident / TILE_N 64 +52.4 %; the one-batch-entry / resident / TILE_N 64 +60.1 % -- the one-batch-entry item on the half tile runs 7.7 points ahead of the pair here (an open lever, not a guard change from one process)",
+        60.1,
+        "CUPTI",
+    ),
+    (
+        (32, 256, 1, "plain", True),
+        (128, 1, 0, 0, 0),
+        "plain with per-batch KV lengths 0.75 S (TILE_N 64 +94.4 %: kv_len 192 ends mid-tile, the padded dense body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item)",
+        94.4,
+        "CUPTI",
+    ),
+    (
+        (32, 512, 1, "bias", True),
+        (64, 1, 8, 1, 0),
+        "bias + per-batch KV lengths 0.75 S: the table's pair n8 / resident / TILE_N 64 +23.5 %; the one-batch-entry / ring 3 st / TILE_N 64 +26.1 % -- the one-batch-entry item on the half tile runs 2.6 points ahead of the pair here (an open lever, not a guard change from one process)",
+        26.1,
+        "replay",
+    ),
+    ((32, 512, 1, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -11.5 %)", 0.0, "replay"),
+    (
+        (32, 1024, 1, "bias", True),
+        (64, 1, 8, 2, 3),
+        "bias + per-batch KV lengths 0.75 S: the table's pair n8 / ring 3 st / TILE_N 64 +11.3 %; the one-batch-entry / ring 3 st / TILE_N 64 +16.4 % -- the one-batch-entry item on the half tile runs 5.1 points ahead of the pair here (an open lever, not a guard change from one process)",
+        16.4,
+        "replay",
+    ),
+    ((32, 1024, 1, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -16.3 %)", 0.0, "replay"),
+    (
+        (32, 2048, 1, "bias", True),
+        (64, 1, 8, 2, 3),
+        "bias + per-batch KV lengths 0.75 S: one-batch-entry / ring 3 st / TILE_N 64 +14.3 % (the table's pair n8 ring at 64 unmeasured here)",
+        14.3,
+        "replay",
+    ),
+    ((32, 256, 4, "bias", True), (64, 1, 8, 1, 0), "bias + per-batch KV lengths 0.75 S: pair n8 / resident / TILE_N 64 +60.8 %", 60.8, "replay"),
+    (
+        (32, 256, 4, "plain", True),
+        (128, 1, 0, 0, 0),
+        "plain with per-batch KV lengths 0.75 S (TILE_N 64 +107.0 %: kv_len 192 ends mid-tile, the padded dense body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item)",
+        107.0,
+        "replay",
+    ),
+    (
+        (32, 512, 4, "bias", True),
+        (64, 1, 8, 1, 0),
+        "bias + per-batch KV lengths 0.75 S: the table's pair n8 / resident / TILE_N 64 +25.5 %; the one-batch-entry / ring 3 st / TILE_N 64 +29.2 % -- the one-batch-entry item on the half tile runs 3.8 points ahead of the pair here (an open lever, not a guard change from one process)",
+        29.2,
+        "replay",
+    ),
+    ((32, 512, 4, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -13.1 %)", 0.0, "replay"),
+    (
+        (32, 1024, 4, "bias", True),
+        (64, 1, 8, 2, 3),
+        "bias + per-batch KV lengths 0.75 S: the table's pair n8 / ring 3 st / TILE_N 64 +13.8 %; the one-batch-entry / ring 3 st / TILE_N 64 +16.8 % -- the one-batch-entry item on the half tile runs 3.0 points ahead of the pair here (an open lever, not a guard change from one process)",
+        16.8,
+        "replay",
+    ),
+    ((32, 1024, 4, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -16.6 %)", 0.0, "replay"),
+    ((64, 256, 1, "bias", True), (64, 1, 2, 1, 0), "bias + per-batch KV lengths 0.75 S: pair n2 / resident / TILE_N 64 +50.9 %", 50.9, "replay"),
+    (
+        (64, 256, 1, "plain", True),
+        (128, 1, 0, 0, 0),
+        "plain with per-batch KV lengths 0.75 S (TILE_N 64 +66.6 %: kv_len 192 ends mid-tile, the padded dense body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item)",
+        66.6,
+        "CUPTI",
+    ),
+    ((64, 512, 1, "bias", True), (64, 1, 8, 2, 3), "bias + per-batch KV lengths 0.75 S: pair n8 / ring 3 st / TILE_N 64 +39.3 %", 39.3, "replay"),
+    ((64, 512, 1, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -12.8 %)", 0.0, "replay"),
+    (
+        (64, 1024, 1, "bias", True),
+        (64, 1, 8, 2, 3),
+        "bias + per-batch KV lengths 0.75 S: the table's pair n8 / ring 3 st / TILE_N 64 +29.8 %; the pair n2 / ring 3 st / TILE_N 64 +31.6 % -- a 2-row chunk 1.8 points ahead of the capped n8 here (one process; the cap at 8 stays)",
+        31.6,
+        "replay",
+    ),
+    ((64, 1024, 1, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -17.6 %)", 0.0, "replay"),
+    ((64, 256, 4, "bias", True), (64, 1, 8, 1, 0), "bias + per-batch KV lengths 0.75 S: pair n8 / resident / TILE_N 64 +73.2 %", 73.2, "replay"),
+    (
+        (64, 256, 4, "plain", True),
+        (128, 1, 0, 0, 0),
+        "plain with per-batch KV lengths 0.75 S (TILE_N 64 +86.4 %: kv_len 192 ends mid-tile, the padded dense body's pathology -- the pick sees S_kv = 256, a tile multiple, and cannot follow the lengths; an open kernel item)",
+        86.4,
+        "replay",
+    ),
+    (
+        (64, 512, 4, "bias", True),
+        (64, 1, 8, 2, 3),
+        "bias + per-batch KV lengths 0.75 S: pair n8 / ring 3 st / TILE_N 64 +47.9 % (the pair n2 / ring 3 st / TILE_N 64 +48.3 %, within a point)",
+        47.9,
+        "replay",
+    ),
+    ((64, 512, 4, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -14.9 %)", 0.0, "replay"),
+    ((64, 1024, 4, "bias", True), (64, 1, 8, 2, 3), "bias + per-batch KV lengths 0.75 S: pair n8 / ring 3 st / TILE_N 64 +38.5 %", 38.5, "replay"),
+    ((64, 1024, 4, "plain", True), (128, 1, 0, 0, 0), "plain with per-batch KV lengths 0.75 S (TILE_N 64 -17.7 %)", 0.0, "replay"),
 ]
 _IDS = [f"d{d}_S{s}_B{b}_{form}{'_padded' if padded else ''}" for (d, s, b, form, padded), *_ in _TABLE]
 
@@ -358,7 +457,7 @@ def test_one_batch_entry_ring_runs_two_stages_and_the_pair_ring_the_deepest():
 
 def test_cluster_axis_keeps_cga1_on_the_small_tiles():
     """Cluster 1 vs 2 at small S (the wave-quantisation question): cga2 is -32 / -31 % at d64 S 128 / 256 (plain), a tie at 384 / 512
-    and -2.8 % at 2048; a bias at cga2 is the one-batch-entry ring, -22 % at 384.  The d64 default stays cga1; a cga2 REQUEST at
+    and -2.7 % at 2048 (replay; -2.4 % CUPTI); a bias at cga2 is the one-batch-entry ring, -22 % at 384.  The d64 default stays cga1; a cga2 REQUEST at
     D <= 32 rides the 64-wide tile (the only validated cga2 width)."""
     for s in (128, 256, 384, 512, 2048):
         for form in ("plain", "mask", "bias", "both"):

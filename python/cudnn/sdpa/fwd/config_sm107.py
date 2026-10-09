@@ -344,13 +344,16 @@ def sm107_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
     caller made one (the ``TILE_N`` knob / the adapter's ``tile_n=``: honoured or declined by the row / adapter, never degraded);
     else :data:`SM107_SMALL_TILE_N_NARROW` for (a) a bias TOGETHER WITH a mask -- a kv_mask of any form (the fp32 vector's only served
     width, :data:`SM107_FP32_VECTOR_WITH_BIAS_TILE_N`, agrees) or the kernel's padding-mask arm (per-batch KV lengths, or
-    ``s_kv % 128 != 0``: +14 % at d32 S 2048 with lengths, +17..+38 % on the ragged leg) -- the combined body is the one over the
-    instruction-cache cliff; (b) a bias alone at one 128-wide kv tile (the pair n4 / n2: +26 / +24 % at d32 / d64 with 128 rows, +35 /
+    ``s_kv % 128 != 0``: with per-batch lengths of 0.75 S +11..+73 % over the pre-table pick at S 256 / 512 / 1024 / 2048, both D, B 1 / 4 --
+    13 of 13 cells with the table's form measured, the d32 B 1 S 2048 cell through the one-batch-entry ring at 64 (+14 %); +17..+38 % on the
+    ragged leg) -- the combined body is the one over the instruction-cache cliff; (b) a bias alone at one 128-wide kv tile (the pair n4 / n2: +26 / +24 % at d32 / d64 with 128 rows, +35 /
     +22 % with 512) and at two tiles on the 64-wide tile (the pair n2 / n8: +24 / +4 %) -- at two tiles on the 32-wide tile the
     one-batch-entry item's streamed ring at 128 is the measured best (+6 / +9 % with 256 / 1024 rows), so 128 stays there; (c) a kv_mask
     alone at one 128-wide kv tile (+7..+18 %; a wash or a loss above it); (d) a plain graph whose S_kv is not a tile multiple (the padded dense body's
     pathology) at the 32-wide tile, and at the 64-wide one up to ``SM107_NARROW_TILE_S_KV_MAX`` -- not for per-batch lengths at a tile
-    multiple (128 wins there: the narrow tile is -19 / -20 % at d32 / d64 S 2048 with 0.75 S keys); else :data:`SM107_SMALL_TILE_N_DEFAULT`.
+    multiple (128 wins there: the narrow tile is -11..-18 % at S 512 / 1024 and -19 / -20 % at d32 / d64 S 2048 with 0.75 S keys).  The pick
+    sees ``s_kv``, never the lengths: where the LENGTHS end mid-tile (0.75 S at S 256 = 192 keys) the half tile measured +58..+119 % and this
+    rule cannot follow it -- the padded dense body's pathology stays an open kernel item; else :data:`SM107_SMALL_TILE_N_DEFAULT`.
     ``domain`` = the flavor's served widths (:data:`SM107_TILE_NS_BY_D_SHAPE`); a flavor without the narrow width keeps the default."""
     if request is not None:
         return int(request)
