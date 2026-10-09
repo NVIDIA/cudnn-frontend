@@ -1,5 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 NVIDIA Corporation. All rights reserved.
 #pragma once
 
 // Example customer program, not a format-specific engine implementation.
@@ -21,12 +20,95 @@ __device__ float read_half(const unsigned char* p) {
     asm("cvt.f32.f16 %0, %1;" : "=f"(value) : "h"(h));
     return value;
 }
+// Read eight Q4_K code bytes. Aligned allocations use two word loads;
+// byte reads retain correctness for a caller with a smaller alignment promise.
+__device__ __forceinline__ void read_q4_codes(const unsigned char* p, unsigned (&v)[2]) {
+    if (reinterpret_cast<unsigned long long>(p) & 3) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) v[i/4] |= unsigned(p[i]) << ((i%4)*8);
+    } else {
+        const auto* words = reinterpret_cast<const unsigned*>(p);
+        v[0] = words[0];
+        v[1] = words[1];
+    }
+}
 struct __align__(16) DecodeVector { unsigned words[4]; };
+__device__ void decode_q4_words(const FortWeightDecodeTileV1& t, const void* storage,
+    FortWeightDecodeValue* output) {
+    // One warp covers 32 K rows x 8 N columns. Four adjacent lanes load
+    // consecutive eight-byte runs in one physical ggml block; the next four
+    // lanes handle the next column. Each lane reuses its scale/minimum eight
+    // times. Complete 144-byte blocks are required even for a logical K tail.
+    const int lane = t.thread_id % 32;
+    const int first_row = (lane % 4) * 8;
+    const int base = (t.thread_id / 32) * 8;
+    const int col = base + lane / 4;
+    // ABI 1 K origins are multiples of 32, so a tile never crosses a ggml
+    // 256-value block. Keep that uniform block address separate from lane K.
+    const int r0 = int(t.k_begin % 256) + first_row;
+    unsigned codes[2] = {};
+    float scale = 0, minimum = 0;
+    if (col < t.valid_n && first_row < t.valid_k) {
+        const long long n = t.n_begin + col;
+        const auto* block = static_cast<const unsigned char*>(storage)
+            + (n*((t.full_k+255)/256) + t.k_begin/256)*144;
+        const int group = r0/32;
+        const auto* scales = block + 4;
+        const unsigned sc = group < 4 ? (scales[group]&63)
+            : ((scales[group+4]&15) | ((scales[group-4]>>6)<<4));
+        const unsigned mn = group < 4 ? (scales[group+4]&63)
+            : ((scales[group+4]>>4) | ((scales[group]>>6)<<4));
+        scale = read_half(block)*float(sc);
+        minimum = read_half(block+2)*float(mn);
+        read_q4_codes(block+16+(r0/64)*32+r0%32, codes);
+    }
+    FortWeightDecodeValue decoded[8] = {};
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (col < t.valid_n && first_row+j < t.valid_k) {
+            const unsigned code = (codes[j/4] >> ((j%4)*8+(r0/32%2)*4)) & 15;
+            decoded[j] = fort_weight_decode_from_float(scale*float(code)-minimum);
+        }
+    }
+    // Swap the three column bits in the lane ID with the three K bits in
+    // the value index. Now each lane owns eight adjacent N values at one K,
+    // suitable for a 16-byte shared store. Every lane, including tail lanes,
+    // must participate in all shuffles; invalid values above remain zero.
+    #pragma unroll
+    for (int bit = 0; bit < 3; ++bit) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if ((i & (1<<bit)) == 0) {
+                const int other = i | (1<<bit);
+                const bool high = lane & (1<<(bit+2));
+                const unsigned value = __shfl_xor_sync(0xffffffffu,
+                    unsigned(high ? decoded[i] : decoded[other]), 1<<(bit+2));
+                if (high) decoded[i] = value;
+                else decoded[other] = value;
+            }
+        }
+    }
+    DecodeVector values{};
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+        values.words[j/2] |= unsigned(decoded[j]) << ((j%2)*16);
+    const int row = (lane%4)*8 + lane/4;
+    *reinterpret_cast<DecodeVector*>(output + row*t.output_stride + base) = values;
+}
+
 __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
     const void* const* auxiliary, void* cta_scratch, void* stage_scratch,
     FortWeightDecodeValue* output) {
     if (cta_scratch || stage_scratch) asm("trap;"); // Milestone 1 contract.
+    if (int(t.constants[0]) == 4) {
+        decode_q4_words(t, storage, output);
+        return;
+    }
     const int format = int(t.constants[0]);
+    // Example-side tuning: preserve the original address expressions for
+    // smaller Q6_K matrices and IQ1_S. Wide Q6_K benefits from keeping block
+    // and bit-plane coordinates independent of the lane's K position.
+    const bool uniform_q6 = format == 6 && t.full_n >= 65536;
     const int block_bytes = format == 4 ? 144 : (format == 6 ? 210 : 50);
     const long long blocks_per_row = (t.full_k + 255) / 256;
     // A physical ggml row supplies one logical B column. Adjacent warp lanes
@@ -60,16 +142,24 @@ __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
                 weight = (read_half(block)*float(scale))*float(code)
                        - (read_half(block+2)*float(minimum));
             } else if (format == 6) {
+                // Keep this specialization inside Q6_K so the IQ1_S address
+                // expressions and their compiler range analysis stay unchanged.
+                const auto* q6_block = uniform_q6
+                    ? static_cast<const unsigned char*>(storage) + (n*blocks_per_row+t.k_begin/256)*210
+                    : block;
+                const int q6_r = uniform_q6 ? int(t.k_begin%256)+row : r;
                 // Within each 128-value chunk, ql holds paired low nibbles;
                 // qh has four two-bit planes. Signed scales apply every 16 values.
-                const int chunk = r/128, lane = r%32, quadrant = (r%128)/32;
-                const unsigned low = (block[chunk*64 + (quadrant%2)*32 + lane]
+                const int chunk = uniform_q6 ? int(t.k_begin%256)/128 : r/128;
+                const int lane = uniform_q6 ? row : r%32;
+                const int quadrant = uniform_q6 ? int(t.k_begin%128)/32 : (r%128)/32;
+                const unsigned low = (q6_block[chunk*64 + (quadrant%2)*32 + lane]
                     >> ((quadrant/2)*4)) & 15;
-                const unsigned high = (block[128 + chunk*32 + lane] >> (quadrant*2)) & 3;
+                const unsigned high = (q6_block[128 + chunk*32 + lane] >> (quadrant*2)) & 3;
                 const int code = int(low | (high << 4)) - 32;
-                const unsigned raw_scale = block[192 + r/16];
+                const unsigned raw_scale = q6_block[192 + q6_r/16];
                 const int scale = int(raw_scale) - (raw_scale >= 128 ? 256 : 0);
-                weight = (read_half(block+208)*float(scale))*float(code);
+                weight = (read_half(q6_block+208)*float(scale))*float(code);
             } else {
                 // IQ1_S encodes an index into a ternary 8-value grid. It is not
                 // one binary integer per weight. qh also carries the odd scale

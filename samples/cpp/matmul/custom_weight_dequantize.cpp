@@ -190,10 +190,15 @@ TEST_CASE("Custom weight dequantization ggml blocks", "[matmul][weight_dequantiz
     REQUIRE(cudnnBackendDestroyDescriptor(probe) == CUDNN_STATUS_SUCCESS);
     auto format   = GENERATE(4, 6, 1);  // Q4_K, Q6_K, IQ1_S
     auto bf16     = GENERATE(false, true);
-    auto shape    = GENERATE(0, 1, 2);  // tails, identity, automatic split-K
-    bool identity = shape == 1, split = shape == 2;
-    const int64_t m = identity ? 256 : (split ? 16 : 37), k = identity ? 256 : (split ? 544 : 515),
-                  n   = identity ? 64 : (split ? 256 : 75);
+    auto shape    = GENERATE(0, 1, 2, 3);  // tails, identity, split-K, wide K128 group
+    bool identity = shape == 1, split = shape == 2, wide = shape == 3;
+    int device;
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    const int64_t m   = wide ? 1 : (identity ? 256 : (split ? 16 : 37));
+    const int64_t k   = wide ? 128 : (identity ? 256 : (split ? 544 : 515));
+    const int64_t n   = wide ? 8LL * 64 * prop.multiProcessorCount : (identity ? 64 : (split ? 256 : 75));
     const int64_t lda = (k + 7) / 8 * 8;
     CAPTURE(format, bf16, shape);
     GgmlWeightFixture fixture(format, k, n);
@@ -214,7 +219,7 @@ TEST_CASE("Custom weight dequantization ggml blocks", "[matmul][weight_dequantiz
     w->set_alignment(1);
     std::vector<std::shared_ptr<fe::graph::Tensor_attributes> > aux;
     if (format == 1) aux.push_back(vector(5, fixture.codebook.size(), fe::DataType_t::FLOAT));
-    // Bytewise field reads permit an unaligned packed base. The FLOAT grid
+    // Bytewise field reads and the Q4 word-load fallback permit an unaligned base. The FLOAT grid
     // still requires natural alignment, which the engine checks separately.
     auto program = fe::graph::Weight_dequantize_program()
                        .set_source(ggml_decode_source)
@@ -250,10 +255,12 @@ TEST_CASE("Custom weight dequantization ggml blocks", "[matmul][weight_dequantiz
     Surface<uint8_t> wg(fixture.packed.size() + 1, 0);
     Surface<float> grid(fixture.codebook.size(), 0), cg(m * n, 0);
     CUDA_CHECK(cudaMemcpy(ag.devPtr, ah.data(), ah.size() * 2, cudaMemcpyHostToDevice));
-    // Deliberately offset the allocation: no engine-imposed vector-load alignment.
-    CUDA_CHECK(cudaMemcpy(wg.devPtr + 1, fixture.packed.data(), fixture.packed.size(), cudaMemcpyHostToDevice));
+    // Cover the aligned Q4 word path as well as the unaligned byte fallback.
+    const int packed_offset = wide ? 0 : 1;
+    CUDA_CHECK(
+        cudaMemcpy(wg.devPtr + packed_offset, fixture.packed.data(), fixture.packed.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(grid.devPtr, fixture.codebook.data(), fixture.codebook.size() * 4, cudaMemcpyHostToDevice));
-    std::unordered_map<int64_t, void*> bindings{{1, ag.devPtr}, {2, wg.devPtr + 1}, {4, cg.devPtr}};
+    std::unordered_map<int64_t, void*> bindings{{1, ag.devPtr}, {2, wg.devPtr + packed_offset}, {4, cg.devPtr}};
     if (format == 1) bindings[5] = grid.devPtr;
     REQUIRE(graph.execute(*owner, bindings, workspace_size ? workspace.devPtr : nullptr).is_good());
     std::vector<float> actual(m * n);

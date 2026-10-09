@@ -307,7 +307,17 @@ ggml Q4_K (144 bytes), Q6_K (210 bytes) and IQ1_S (50 bytes) blocks, each encodi
 The same source string can be passed to Python's `graph.weight_dequantize`.
 
 Physical row n contains ceil(K/256) complete blocks along K and produces logical
-B[:,n]. Bytewise loads avoid extra padding for the 210/50-byte block strides.
+B[:,n]. Bytewise metadata loads avoid extra padding for the 210/50-byte block
+strides. Q4_K now reads eight consecutive code bytes per lane with aligned word
+loads when possible, then reuses the local scale/minimum for eight weights. A
+warp register transpose turns these into adjacent N values for vector shared
+stores. Unaligned bases use a byte-load fallback, with no read beyond the
+complete physical block. Tail lanes participate in every shuffle and carry
+zero values. Q6_K/IQ1_S retain K-coalesced byte loads. For very wide Q6_K matrices
+(N >= 65536), lane-independent block and bit-plane calculations improve the
+measured output-head cases. Smaller Q6_K matrices and IQ1_S keep their original
+addressing, which performed better in the broader sweep. These optimizations are customer example code;
+the engine still has no knowledge of ggml formats.
 The sample sets both the program input_alignment and the weight tensor
 alignment to 1 and tests a deliberately unaligned weight base. This does not relax the natural alignment of auxiliary FLOAT tensors.
 
@@ -322,9 +332,122 @@ Expected weights are computed from original codes/scales before packing.
 Identity GEMMs verify every rounded output weight exactly (all IQ1_S indices),
 and separate tail GEMMs exercise multiple blocks. M=16/N=256/K=544 cases exercise
 automatic split-K and queried workspace with all three formats and both operand
-types. The C++ samples allocate the plan's workspace for every execution.
+types. A further M=1/K=128 case with N=512 times the actual GPU SM count covers the
+wide-grid grouped path and aligned Q4 word loads for all formats and types.
+The C++ samples allocate the plan's workspace for every execution.
 Python numerical tests similarly cover split-K for signed INT8/INT4/INT2 with
 global/block/combined scaling, including plan reload and CUDA graph replay.
 Both FP16 and BF16 are tested.
 The grid's MIT license and pinned ggml source revision accompany the sample.
 These are correctness examples, not measured performance comparisons to ggml.
+
+## Wide-grid K128 mainloop update
+
+The backend can group four unchanged 32x64 callback tiles when 1 <= M <= 32,
+N is divisible by 64, K >= 128 is divisible by 128, and N/64 is at least eight
+times the current GPU's SM count. M <= 16 uses a 16x64x128 engine tile with
+23,552 bytes of operand shared memory; M <= 32 uses 32x64x128 with 28,672 bytes.
+Each allocation holds one group. Smaller budgets or ineligible shapes keep
+the previous selection. This reduces publication/layout-conversion barriers
+for wide GEMMs such as the output head; it adds no decoder scratch, packed
+staging or workspace. Other shapes can still require split-K workspace.
+
+No frontend signature or device ABI change is needed. Existing saved plans
+keep their original geometry; rebuild plans to obtain new scheduling. Supply
+the updated example source and rebuild its plan to obtain the decoder load
+changes. Model-shape timings and validation are recorded in backend MR !4559;
+these examples remain correctness tests, not end-to-end model benchmarks.
+
+## K128 grouping and packed-word example update (2026-10-09)
+
+This update retains ABI 1 and decoder-owned loads. Wide small-M GEMMs can publish
+four K32 tiles together, reducing engine barriers. Selection requires 1 <= M <= 32,
+N divisible by 64, K >= 128 divisible by 128, at least eight CTAs per actual GPU
+SM, and sufficient operand SMEM. M16/M32 use 23,552/28,672 bytes. The callback
+still sees 32x64, stride 64, all 256 threads, and null scratch. No workspace is
+needed on this grouped path. New serialized names preserve the exact M/K
+geometry; existing plans keep their old geometry. Rebuild plans to retune.
+
+The example Q4_K decoder loads eight code bytes per lane with aligned words
+(or byte fallback), reuses scales/minima across eight values, and transposes
+registers before its vector shared store. It requires only complete original
+blocks, not padded/repacked weights. Wide Q6_K uses uniform block/plane
+coordinates; the specialization stays inside the Q6 branch. IQ1_S and smaller
+Q6_K address expressions remain unchanged. These format decisions exist only
+in customer example source, not in the FORT engine. Supply the updated source
+and rebuild the plan to obtain these sample-side gains.
+
+Compared with backend `ab3765866` and frontend `94039fa6`, all 198 supplied
+spreadsheet shapes pass the final numerical harness on ultra's RTX PRO 6000
+(SM120, 188 SMs, CUDA/NVRTC 13.4). Six output-head shapes select K128; the
+previous 143 split-K and 29 grouped-K64 selections remain. The improvements
+are concentrated in Q4_K and the small-M output head; many other cases are
+unchanged. The following controls use medians of three independent processes
+per implementation, with before/after order alternated on the same GPU:
+
+| Format / shape | M | N | K | Previous us | Updated us | llama.cpp us | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen head q6 | 1 | 248320 | 2048 | 764.8 | 535.1 | 276.3 | 1.43x |
+| Qwen head q6 | 16 | 248320 | 2048 | 812.7 | 596.4 | 310.2 | 1.36x |
+| Qwen head q6 | 32 | 248320 | 2048 | 837.4 | 582.7 | 333.7 | 1.44x |
+| Qwen head q6 | 512 | 248320 | 2048 | 2941.5 | 2902.2 | 2430.1 | 1.01x |
+| Llama FFN q4 | 1 | 4096 | 14336 | 103.7 | 85.6 | 10.0 | 1.21x |
+| Llama FFN q4 | 1 | 14336 | 4096 | 105.3 | 85.9 | 11.9 | 1.23x |
+| Llama FFN q4 | 512 | 4096 | 14336 | 660.4 | 480.7 | 212.7 | 1.37x |
+| Llama FFN q4 | 512 | 14336 | 4096 | 454.8 | 450.4 | 209.8 | 1.01x |
+| Llama FFN iq1 | 2 | 14336 | 4096 | 96.2 | 96.2 | 9.7 | 1.00x |
+| Tail regression iq1 | 37 | 64 | 256 | 9.9 | 9.9 | 6.9 | 1.00x |
+
+Full-sweep rows slower by more than 10% versus the prior local sweep: [].
+The remaining worst model-shape cuDNN/llama.cpp ratio is 10.22x, so this is
+not performance parity. The small-M IQ1_S cases remain a major gap.
+
+Each process uses 11 alternating cuDNN/llama.cpp rounds of 20 dependent CUDA
+graph operations, with three warmup replays per timed side. Allocation,
+compilation and reference calculation are excluded; all cuDNN phases and
+llama.cpp activation quantization/fixup are included. Inputs are reused, caches
+are not flushed, and clocks are not locked. llama.cpp remains pinned to
+`08246a28f6000100433d297c4e037c02e9d2d464`. These are synthetic fixtures at model
+dimensions, not end-to-end models, tokens/s, or routed/grouped MoE.
+
+Every packed weight is checked against the ggml CPU decoder; full outputs are
+checked for finiteness and NRMSE against FP64 unrounded-weight GEMM, plus 256
+CPU-double samples against FP16-rounded weights at atol=rtol=0.005. cuDNN uses
+FP16 activations/decoded weights and FP32 accumulation; MMQ uses Q8_1 activation
+quantization and INT8 MMA. The errors are retained beside timings; these tests
+do not establish model-level accuracy or elementwise tolerance on every large
+output. The tolerance was not relaxed.
+
+Full backend integration and host planner tests pass. New tests cover exact
+K128 SMEM/grid boundaries, partial M, single/multiple groups, CTA barriers,
+FP16/BF16 output, plan and kernel-cache reload, capture/rebind, and Q4 packed
+base offsets 1/2/3 with physical tail blocks. Frontend C++ samples pass
+1,734,318 assertions in two cases, including all three formats and both operand
+types on the aligned wide-grid path; Python passes 45 tests, zero skipped.
+Compute Sanitizer: ggml/pipeline memcheck zero errors, pipeline racecheck zero
+hazards/warnings, and ggml shuffle synccheck zero errors.
+
+Actual backend CUBIN resources (including the runtime's dynamic-SMEM opt-in):
+
+| Kernel / example | Registers/thread | Dynamic operand SMEM | Theoretical CTAs/SM |
+| --- | ---: | ---: | ---: |
+| K128 M16 Q6_K | 77 | 23,552 B | 3 |
+| K128 M32 Q6_K | 77 | 28,672 B | 3 |
+| Split-K M16 Q4_K | 40 | 11,776 B | 6 |
+| K64 M256 Q4_K | 124 | 50,176 B | 2 |
+
+All four inspected kernels have zero stack/local bytes and no LDL/STL/CALL
+instructions. CUDA reserves an additional 1 KiB/CTA. These counts depend on
+customer code and do not guarantee spill-free arbitrary decoders. Hardware
+performance counters are unavailable to this account (`ERR_NVGPUCTRPERM`), so
+these results use controlled timings and binary inspection, not counter-based
+bandwidth or stall attribution.
+
+The report, source snapshots, CSV, annotated workbook, controls and logs are in
+`/tmp/cudnn-dequant-upgrade4` on ultra. See `README.txt`, `matrix/comparison.csv`,
+`matrix/2026-10-08-cudnn-dequant-all-k128-words.xlsx` and `controls/summary.json`.
+For example: `bash /tmp/cudnn-dequant-upgrade4/run-compare.sh 1 248320 2048 q6`.
+Broad uniform-address and callback-interface experiments were discarded after
+regression checks; no new callback ABI is exposed. Decoder/MMA overlap and
+engine-managed packed staging remain future work. Other GPUs and Windows have
+not been measured in this update. This remains a draft prototype.
