@@ -12,6 +12,9 @@ function and stay op attributes the API never sets.
                      ``"major"``: every row block of pass 0 before pass 1).
   ``k3_prologue``    the output stage's MN-major LayerNorm form (``"mn_major"`` in place; ``"transpose"`` into the K-major layout).
   ``clc_stages``     the two LayerNorm-prologue stages' scheduler ring depth.
+  ``k_block``        the two LayerNorm-prologue stages' row tile: k's per 256-row pair tile (:data:`K_BLOCK_DOMAIN`; the substrate's rule
+                     ``default_k_block`` when a record leaves it unset -- 256 from N = 256, else the next power of two >= N).  At N = 384 the
+                     rule's 256 pads 25 % of every pair tile's rows; 128 pads none (the lever measured in the perf campaign).
 
 :func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class, keyed by hidden width ``c``,
 N bucket, batch bucket and direction: a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
@@ -31,7 +34,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
-from cudnn.gemm.frost.ln_prologue import A0_PROLOGUES, PASS_ORDERS
+from cudnn.gemm.frost.ln_prologue import A0_PROLOGUES, MIN_K_BLOCK_MN_MAJOR, PAIR_TILE_ROWS, PASS_ORDERS
+from cudnn.gemm.frost.ln_prologue import default_k_block as _substrate_default_k_block
 
 from .kernels import contraction as k2
 
@@ -45,6 +49,9 @@ K2_TILE_DOMAIN: Tuple[str, ...] = (
 )
 #: The scheduler ring depths of the LayerNorm-prologue stages that were measured (the substrate admits 1..8).
 CLC_STAGES_DOMAIN: Tuple[int, ...] = (1, 2, 4)
+#: The row tiles (k's per 256-row pair tile) BOTH stages serve for every N the API admits: the output stage's MN-major box needs >= 64, the pair
+#: tile is 256 -- the powers of two between (the projection stage alone admits 8).
+K_BLOCK_DOMAIN: Tuple[int, ...] = tuple(1 << i for i in range(MIN_K_BLOCK_MN_MAJOR.bit_length() - 1, PAIR_TILE_ROWS.bit_length()))
 #: The batch sizes the table was measured at; :func:`batch_bucket` maps any B onto the nearest one below (B >= 4 -> 4, else 1).
 BATCH_BUCKETS: Tuple[int, ...] = (1, 4)
 #: The c = 128 geometry's knob values below N = 512 (the API's K1 tile-order pin reads the first); :func:`recommend` is the table that decides.
@@ -63,9 +70,10 @@ class TriMulKnobs:
     k1_pass_order: Optional[str] = None
     k3_prologue: Optional[str] = None
     clc_stages: Optional[int] = None
+    k_block: Optional[int] = None  # appended (2026-10-09): the row tile of the two LayerNorm-prologue stages
 
     def is_complete(self) -> bool:
-        return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages)
+        return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages, self.k_block)
 
     def merged_over(self, base: "TriMulKnobs") -> "TriMulKnobs":
         """This record's SET axes over ``base`` (the unset ones keep the base's values)."""
@@ -74,6 +82,7 @@ class TriMulKnobs:
             k1_pass_order=self.k1_pass_order if self.k1_pass_order is not None else base.k1_pass_order,
             k3_prologue=self.k3_prologue if self.k3_prologue is not None else base.k3_prologue,
             clc_stages=self.clc_stages if self.clc_stages is not None else base.clc_stages,
+            k_block=self.k_block if self.k_block is not None else base.k_block,
         )
 
 
@@ -90,6 +99,8 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
         raise ValueError(f"k3_prologue must be one of {A0_PROLOGUES}, got {knobs.k3_prologue!r}")
     if knobs.clc_stages is not None and knobs.clc_stages not in CLC_STAGES_DOMAIN:
         raise ValueError(f"clc_stages must be one of {CLC_STAGES_DOMAIN}, got {knobs.clc_stages!r}")
+    if knobs.k_block is not None and (isinstance(knobs.k_block, bool) or knobs.k_block not in K_BLOCK_DOMAIN):
+        raise ValueError(f"k_block must be one of {K_BLOCK_DOMAIN} (k's per 256-row pair tile of the two LayerNorm-prologue stages), got {knobs.k_block!r}")
 
 
 # THE TABLE, part 1 -- the BUCKET picks.  Per hidden width ``c``: descending N floors, each with the COMPLETE knob set measured best over the bucket's
@@ -171,9 +182,15 @@ def k2_tile_for(n_res: int, channels: int = 128, batch: int = 1, direction: str 
     return recommend(n_res, channels, batch, direction).k2_tile
 
 
+def default_k_block(n_res: int) -> int:
+    """The row tile a bare declaration runs at ``n_res``: the substrate's rule (``cudnn.gemm.frost.ln_prologue.default_k_block``) held inside
+    :data:`K_BLOCK_DOMAIN` (below N = 33 the API declines before any launch; the clamp keeps the record in the vocabulary there)."""
+    return max(_substrate_default_k_block(n_res), K_BLOCK_DOMAIN[0])
+
+
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:
-    """The measured default knob set for this geometry: the (width, N bucket) pick with the (batch bucket, direction) refinements applied --
-    complete (every axis set)."""
+    """The measured default knob set for this geometry: the (width, N bucket) pick with the (batch bucket, direction) refinements applied, the
+    row tile from :func:`default_k_block` unless a pick or refinement sets it -- complete (every axis set)."""
     if direction not in k2.DIRECTIONS:
         raise ValueError(f"direction must be one of {k2.DIRECTIONS}, got {direction!r}")
     n_res = int(n_res)
@@ -183,6 +200,8 @@ def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = 
     for r_floor, r_batch, r_direction, override in _REFINEMENTS.get(width, ()):
         if r_floor == floor and r_batch == bb and (r_direction is None or r_direction == direction):
             knobs = override.merged_over(knobs)
+    if knobs.k_block is None:
+        knobs = replace(knobs, k_block=default_k_block(n_res))
     return knobs
 
 
@@ -207,8 +226,10 @@ __all__ = [
     "DEFAULT_K1_PASS_ORDER",
     "DEFAULT_K3_PROLOGUE",
     "K2_TILE_DOMAIN",
+    "K_BLOCK_DOMAIN",
     "TriMulKnobs",
     "batch_bucket",
+    "default_k_block",
     "k2_tile_for",
     "recommend",
     "resolve",

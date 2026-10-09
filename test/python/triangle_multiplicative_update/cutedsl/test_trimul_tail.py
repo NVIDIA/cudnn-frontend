@@ -247,6 +247,34 @@ def test_tail_runner_declines_before_touching_the_artifact():
 # ---------------------------------------------------------------------------
 # Rubin: the fp64 oracle (y from a torch K1 / K2), the knob pins, the degenerate rows
 # ---------------------------------------------------------------------------
+def test_tail_runner_declines_a_row_tile_below_the_mn_major_box():
+    """``k_block`` < 64 cannot serve the accumulators arm (its MN-major operand lands in 64-row boxes of ONE bi): a typed ValueError before the
+    artifact, while 64 / 128 / 256 reach it; a malformed value (not a power of two) is the geometry's own ValueError."""
+    p = k3.tail_params(128, 128, has_bias=False, want_stats=False)
+    plan = _fake_plan(p)
+    n_res, bn = 384, 2
+    rows = bn * n_res
+    bf16 = torch.bfloat16
+    args = (
+        torch.zeros(128, bn, 384, dtype=bf16),
+        torch.zeros(rows, 128, dtype=bf16),
+        torch.zeros(128, 128, dtype=bf16),
+        torch.zeros(128, 128, dtype=bf16),
+        torch.zeros(rows, 128, dtype=bf16),
+        torch.zeros(128, dtype=bf16),
+        torch.zeros(128, dtype=bf16),
+        torch.zeros(128, dtype=bf16),
+        torch.zeros(128, dtype=bf16),
+    )
+    for kb in (64, 128, 256, None):
+        with pytest.raises(_Boom):
+            sub.run_ln_dual_gemm_tail(plan, *args, n_res=n_res, bn=bn, bias=None, stats=None, residual=None, stream=0, k_block=kb)
+    with pytest.raises(ValueError, match="k_block must be >= 64"):
+        sub.run_ln_dual_gemm_tail(plan, *args, n_res=n_res, bn=bn, bias=None, stats=None, residual=None, stream=0, k_block=32)
+    with pytest.raises(ValueError, match="power of two"):
+        sub.run_ln_dual_gemm_tail(plan, *args, n_res=n_res, bn=bn, bias=None, stats=None, residual=None, stream=0, k_block=96)
+
+
 def _inputs(n_res, batch, c_z, c, with_bias, seed=0, device="cuda"):
     """z and the K3 weights (cuEquivariance's conventions) plus a torch model of K1 / K2 producing the channel-major bf16 y."""
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -319,7 +347,7 @@ def _stacked_biases(inp, p_ob=None):
     return k3.stack_tail_biases(p_ob, inp["g_ob"]) if (p_ob is not None or inp["g_ob"] is not None) else None
 
 
-def _launch(plan, inp, out, stats, stream, *, weights=None, residual=None, biases=None):
+def _launch(plan, inp, out, stats, stream, *, weights=None, residual=None, biases=None, k_block=None):
     p_out, p_ob = (inp["p_out"], inp["p_ob"]) if weights is None else weights
     if biases is None:
         biases = _stacked_biases(inp, p_ob)
@@ -338,6 +366,7 @@ def _launch(plan, inp, out, stats, stream, *, weights=None, residual=None, biase
         stats=stats,
         residual=residual,
         stream=stream,
+        k_block=k_block,
     )
 
 
@@ -517,3 +546,26 @@ def test_tail_runner_declines_a_small_n_and_a_misshaped_y():
             *[torch.zeros(128, device="cuda", dtype=bf16)] * 4,
             stream=0,
         )
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,k_block", [(384, 2, 128), (384, 1, 64), (128, 2, 256)])
+def test_k3_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
+    """The accumulators arm under ``k_block``: the same plan, the same bits as the rule (output and statistics).  kb = 128 at N = 384 splits one
+    bi's j across the CTA's two MN-major boxes (as N = 128 does today), kb = 64 gives each box its own bi (as N = 64 does); the rule's 256 pads
+    25 % of every pair tile at N = 384."""
+    c_z = c = 128
+    plan = k3.build_trimul_tail(k3.tail_params(c_z, c, has_bias=True, want_stats=True, eps=1e-5))
+    inp = _inputs(n_res, batch, c_z, c, True, seed=33)
+    stream = torch.cuda.current_stream().cuda_stream
+    outs = []
+    for kb in (None, k_block):
+        out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda", dtype=torch.float32)
+        g = _launch(plan, inp, out, stats, stream, k_block=kb)
+        torch.cuda.synchronize()
+        assert g.kb == (sub.default_k_block(n_res) if kb is None else kb)
+        assert not (out.float() == _SENTINEL).any() and torch.isfinite(out.float()).all() and (stats[:, 1] > 0).all()
+        outs.append((out, stats, g))
+    (o0, s0, g0), (o1, s1, g1) = outs
+    assert torch.equal(o0, o1) and torch.equal(s0, s1), f"the row tile changed the output bits (kb {g0.kb} -> {g1.kb})"

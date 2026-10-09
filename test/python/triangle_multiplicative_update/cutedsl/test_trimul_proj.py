@@ -48,9 +48,29 @@ requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the LN-prologue du
 # ---------------------------------------------------------------------------
 # GPU-free: the row-block geometry, the weight interleave, the typed declines, the model counts
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("n_res,bn", [(8, 1), (9, 3), (64, 128), (100, 7), (128, 256), (217, 217), (256, 1), (384, 2), (512, 512), (1000, 3)])
-def test_row_block_geometry_covers_every_valid_row_exactly_once(n_res, bn):
-    g = sub.row_block_geometry(n_res, bn)
+@pytest.mark.parametrize(
+    "n_res,bn,k_block",
+    [
+        (8, 1, None),
+        (9, 3, None),
+        (64, 128, None),
+        (100, 7, None),
+        (128, 256, None),
+        (217, 217, None),
+        (256, 1, None),
+        (384, 2, None),
+        (512, 512, None),
+        (1000, 3, None),
+        (384, 2, 128),  # the k_block knob: 3 full k blocks of 2 bi (the rule's 256 pads 25 % of every pair tile at N = 384)
+        (384, 1, 64),
+        (217, 3, 32),  # 7 blocks of 32 (224 rows per bi: 3 % padding instead of the rule's 15 %) -- the projection stage alone
+        (128, 5, 256),  # a k_block above N: one bi per tile, half of every tile padding (legal)
+        (1000, 3, 8),
+    ],
+)
+def test_row_block_geometry_covers_every_valid_row_exactly_once(n_res, bn, k_block):
+    g = sub.row_block_geometry(n_res, bn, k_block)
+    assert g.kb == (sub.default_k_block(n_res) if k_block is None else k_block)
     assert g.r_i * g.kb == 256 and g.kb & (g.kb - 1) == 0 and g.kb >= 8 and g.kb == 1 << g.lkb
     assert g.kbc * g.rc == 128 and g.kbc == min(g.kb, 128)
     assert g.n_pad % 8 == 0 and n_res <= g.n_pad < n_res + 8
@@ -65,6 +85,19 @@ def test_row_block_geometry_covers_every_valid_row_exactly_once(n_res, bn):
                 assert (bi, k) not in covered
                 covered.add((bi, k))
     assert len(covered) == bn * n_res
+
+
+def test_row_block_geometry_k_block_is_a_typed_vocabulary():
+    """The knob's domain: an int power of two in [8, 256]; the rule pads 25 % at N = 384 and k_block = 128 pads none (the lever's arithmetic)."""
+    for bad in (0, 4, 96, 512, 7, -128, 128.0, "128", True):
+        with pytest.raises(ValueError, match="k_block"):
+            sub.row_block_geometry(384, 2, bad)
+    assert sub.validate_k_block(128) == 128 and sub.default_k_block(384) == 256 and sub.default_k_block(128) == 128 and sub.default_k_block(33) == 64
+    rule, knob = sub.row_block_geometry(384, 4), sub.row_block_geometry(384, 4, 128)
+    assert rule.rows_valid == knob.rows_valid == 4 * 384
+    assert rule.rows_computed == 4 * 2 * 256 == 4 * rule.rows_valid // 3 and knob.rows_computed == knob.rows_valid  # 25 % padding -> none
+    assert (rule.pair_tiles, knob.pair_tiles) == (8, 6) and (rule.kbc, rule.rc) == (knob.kbc, knob.rc) == (128, 1)  # the SAME per-CTA TMA box
+    assert sub.row_block_geometry(384, 1, 64).kbc == 64 and sub.row_block_geometry(384, 1, 64).rc == 2
 
 
 def test_interleave_value_gate_puts_value_and_gate_blocks_in_one_256_tile():
@@ -247,14 +280,16 @@ def _reference(inp, c, eps):
     return torch.stack(outs), mean, rstd
 
 
-def _launch(plan, inp, c, planes, stats, stream, *, w_stack=None, b_stack=None):
+def _launch(plan, inp, c, planes, stats, stream, *, w_stack=None, b_stack=None, k_block=None):
     """``w_stack`` / ``b_stack`` = the interleaved weight / bias stacks (``torch.cat`` copies, GPU kernels of their own): a timed callable
     builds them ONCE and passes them in; per call they ride inside every CUDA-graph replay as extra kernels."""
     if w_stack is None:
         w_stack = k1.stack_projection_weights(inp["p_in"], inp["g_in"])
     if b_stack is None:
         b_stack = k1.stack_projection_biases(inp["p_b"], inp["g_b"]) if inp["p_b"] is not None else None
-    return k1.run_trimul_proj(plan, inp["z"], w_stack, planes, inp["ln_w"], inp["ln_b"], bias_stacked=b_stack, mask=inp["mask"], stats=stats, stream=stream)
+    return k1.run_trimul_proj(
+        plan, inp["z"], w_stack, planes, inp["ln_w"], inp["ln_b"], bias_stacked=b_stack, mask=inp["mask"], stats=stats, stream=stream, k_block=k_block
+    )
 
 
 _SENTINEL = 1.5e30
@@ -475,3 +510,29 @@ def test_runner_declines_a_plan_for_another_k_and_a_misshaped_mask():
             mask=torch.ones(1, 16, 15, device="cuda", dtype=torch.bfloat16),
             stream=0,
         )
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,k_block", [(384, 2, 128), (384, 1, 64), (217, 1, 32), (128, 2, 256)])
+def test_k1_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
+    """The row tile (k's per 256-row pair tile) is a RUNTIME operand of the compiled kernel: the same plan launched with ``k_block`` computes the
+    SAME bits as the rule (planes AND statistics) -- a row's LayerNorm, MMA K order and epilogue do not depend on the tile it sits in.  At N = 384
+    the rule pads 25 % of every pair tile (kb = 256 over 384 k); kb = 128 / 64 pad none (fewer scheduler tiles, the same per-CTA TMA box at 128)."""
+    c_z = c = 128
+    params = k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, eps=1e-5)
+    plan = k1.build_trimul_proj(params)
+    inp = _inputs(n_res, batch, c_z, c, "random", True, seed=31)
+    stream = torch.cuda.current_stream().cuda_stream
+    outs = []
+    for kb in (None, k_block):
+        planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda", dtype=torch.float32)
+        g = _launch(plan, inp, c, planes, stats, stream, k_block=kb)
+        torch.cuda.synchronize()
+        assert g.kb == (sub.default_k_block(n_res) if kb is None else kb) and g.rows_valid == batch * n_res * n_res
+        assert not (planes[:, :, :, :n_res].float() == _SENTINEL).any() and (stats[:, 1] > 0).all()
+        outs.append((planes, stats, g))
+    (p0, s0, g0), (p1, s1, g1) = outs
+    assert torch.equal(p0, p1) and torch.equal(s0, s1), f"the row tile changed the output bits (kb {g0.kb} -> {g1.kb})"
+    if n_res == 384:
+        assert g0.rows_computed == 4 * g0.rows_valid // 3 and g1.rows_computed == g1.rows_valid  # the 25 % the lever removes

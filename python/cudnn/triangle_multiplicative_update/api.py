@@ -26,7 +26,7 @@ Served today: Rubin (SM107, compute capability 10.7), bf16, ``c_z == c in {128, 
 direction needs ``N % 8 == 0``), the forward only.  ``c_z = 384`` is withdrawn: its sm_107a renderings spill through a 1.7 KB stack per
 thread (the LayerNorm row held in registers) and no oracle cell covers them -- it returns with a rendering free of that residency and an
 accept test per direction.  Performance knobs (the contraction tile, the projection stage's tile order, the output stage's prologue form,
-the scheduler ring depth) come from :mod:`.heuristics` -- the measured defaults per geometry -- and may be overridden per plan; every
+the scheduler ring depth, the two LayerNorm-prologue stages' row tile ``k_block``) come from :mod:`.heuristics` -- the measured defaults per geometry -- and may be overridden per plan; every
 value of every domain computes the same function.  Everything else is a typed decline (``NotImplementedError`` for a valid-but-unserved
 declaration, ``ValueError`` for a malformed one), never a silent slow path -- including autograd: no backward is registered yet, so a call
 under grad mode with an input or parameter that ``requires_grad`` raises ``NotImplementedError`` instead of returning a tensor without a
@@ -558,6 +558,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             mask=mask,
             stats=None,
             stream=stream,
+            k_block=self.knobs.k_block,
         )
         a_v, b_v, y_v = k2.k2_operand_views(plane_a, plane_b, y, channels=self.c, batch=b, n_res=n, direction=self.direction)
         bd = self._k2_binding
@@ -577,6 +578,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             stats=None,
             residual=None,
             stream=stream,
+            k_block=self.knobs.k_block,
         )
 
     def make_cuda_graph(self, x, mask, weights, out, workspace, *, warmup: int = 2) -> "torch.cuda.CUDAGraph":

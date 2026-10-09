@@ -133,6 +133,7 @@ def run_trimul_tail(
     stats=None,  # [B * N * N, 2] fp32 (mean, rstd) of LayerNorm 2, iff params.want_stats
     residual=None,  # [B, N, N, c_z] bf16, iff params.fuse_residual (normally z itself)
     stream,
+    k_block=None,  # k's per 256-row pair tile (the substrate's rule when None; >= 64 here -- the MN-major box; bitwise the same output)
 ) -> RowBlockGeometry:
     """Launch K3.  No allocation, no conversion."""
     if z.ndim != 4 or z.shape[1] != z.shape[2]:
@@ -166,6 +167,7 @@ def run_trimul_tail(
         stats=stats,
         residual=residual.view(rows, c_z) if residual is not None else None,
         stream=stream,
+        k_block=k_block,
     )
 
 

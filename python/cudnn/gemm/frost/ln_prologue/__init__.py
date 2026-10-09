@@ -39,7 +39,11 @@ the output: ``out[pass][c][bi][k]`` with the ``k`` axis padded to ``n_pad`` (a m
 next power of two >= ``max(n_res, 8)``), so the A load is one 3-D TMA box ``(64 channels, min(kb, 128) k, 128 // min(kb, 128) bi)``
 per CTA, the store the matching ``(k, bi, 32 channels)`` box, and a row's ``(bi, k)`` are a shift and a mask of its tile row.
 The last ``k`` block of a ``bi`` and the last ``bi`` block are partial: TMA zero-fills the loads, clips the stores, and the
-kernel treats such rows as masked (``mask = 0``, no statistics).
+kernel treats such rows as masked (``mask = 0``, no statistics).  ``kb`` is a RUNTIME operand of the compiled kernel (``lkb`` /
+``n_kb`` / ``kbc`` / ``rc`` in the launch's ``geom`` tuple, dynamic TMA box dims), so a caller may override the rule through
+``k_block`` on ``row_block_geometry`` / the two launchers -- a performance knob: every row's arithmetic is independent of the
+tile it sits in, so the output is bitwise the same under every admitted ``kb``.  Why one would: at ``n_res = 384`` the rule's
+``kb = 256`` pads 25 % of every pair tile's rows (the second k block holds 128 valid k of 256); ``kb = 128`` pads none.
 """
 
 from __future__ import annotations
@@ -71,6 +75,8 @@ A0_MAJORS = ("k", "mn")
 A0_PROLOGUES = ("mn_major", "transpose")
 #: The MN-major TMA box is 64 rows of ONE ``bi``: a pair tile's ``kb`` must be >= 64 (``n_res > 32``) in the accumulators arm.
 MIN_N_RES_MN_MAJOR = 33
+#: The same constraint on the LAUNCHED ``kb`` (a caller's ``k_block`` below 64 cannot serve the accumulators arm; the columns arm admits 8).
+MIN_K_BLOCK_MN_MAJOR = 64
 #: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
 BODIES = {"sm107": "sm107_dual_gemm.py"}
 
@@ -231,17 +237,33 @@ class RowBlockGeometry:
         return self.bn * self.n_res
 
 
-def row_block_geometry(n_res: int, bn: int) -> RowBlockGeometry:
-    """``kb = 256`` for ``n_res >= 256`` (one bi per pair tile), else the next power of two >= max(n_res, 8)."""
+def default_k_block(n_res: int) -> int:
+    """The rule: ``kb = 256`` for ``n_res >= 256`` (one bi per pair tile), else the next power of two >= max(n_res, 8)."""
+    n_res = int(n_res)
+    if n_res >= PAIR_TILE_ROWS:
+        return PAIR_TILE_ROWS
+    kb = MIN_K_BLOCK
+    while kb < n_res:
+        kb *= 2
+    return kb
+
+
+def validate_k_block(k_block) -> int:
+    """A caller's ``k_block``: a power of two in ``[MIN_K_BLOCK, PAIR_TILE_ROWS]`` (ValueError names the domain -- a malformed declaration)."""
+    if isinstance(k_block, bool) or not isinstance(k_block, int):
+        raise ValueError(f"k_block must be an int power of two in [{MIN_K_BLOCK}, {PAIR_TILE_ROWS}], got {k_block!r}")
+    if k_block < MIN_K_BLOCK or k_block > PAIR_TILE_ROWS or k_block & (k_block - 1):
+        raise ValueError(f"k_block must be a power of two in [{MIN_K_BLOCK}, {PAIR_TILE_ROWS}] (k's per 256-row pair tile), got {k_block}")
+    return k_block
+
+
+def row_block_geometry(n_res: int, bn: int, k_block: Optional[int] = None) -> RowBlockGeometry:
+    """The pair-tile decomposition: ``kb`` = :func:`default_k_block` (``None``) or the caller's :func:`validate_k_block`-checked ``k_block``
+    (a performance knob -- the same bits under every admitted value; the accumulators arm additionally needs ``kb >= MIN_K_BLOCK_MN_MAJOR``)."""
     n_res, bn = int(n_res), int(bn)
     if n_res < 1 or bn < 1:
         raise ValueError(f"n_res and bn must be >= 1, got n_res={n_res}, bn={bn}")
-    if n_res >= PAIR_TILE_ROWS:
-        kb = PAIR_TILE_ROWS
-    else:
-        kb = MIN_K_BLOCK
-        while kb < n_res:
-            kb *= 2
+    kb = default_k_block(n_res) if k_block is None else validate_k_block(k_block)
     lkb = kb.bit_length() - 1
     r_i = PAIR_TILE_ROWS // kb
     n_kb = -(-n_res // kb)
@@ -320,6 +342,7 @@ def run_ln_dual_gemm(
     mask=None,  # [bn * n_res] bf16 per-row mask, required iff params.has_mask
     stats=None,  # [bn * n_res, 2] fp32 (mean, rstd), required iff params.want_stats
     stream,
+    k_block: Optional[int] = None,  # k's per 256-row pair tile (row_block_geometry's rule when None; performance only, bitwise the same)
 ) -> RowBlockGeometry:
     """Launch.  No allocation, no conversion; every check is cheap host arithmetic.  Returns the geometry used."""
     import torch
@@ -327,7 +350,7 @@ def run_ln_dual_gemm(
 
     p = plan.params
     _check(not p.dual, "this artifact was compiled with pairing='accumulators'; launch it through run_ln_dual_gemm_tail")
-    g = row_block_geometry(n_res, bn)
+    g = row_block_geometry(n_res, bn, k_block)
     rows = g.rows_valid
     bf16 = torch.bfloat16
     _check(
@@ -437,6 +460,7 @@ def run_ln_dual_gemm_tail(
     stats=None,  # [bn * n_res, 2] fp32 (mean, rstd) of operand 0's LayerNorm, required iff params.want_stats
     residual=None,  # [bn * n_res, c_out] bf16 pair-major, required iff params.fuse_residual
     stream,
+    k_block: Optional[int] = None,  # k's per 256-row pair tile (row_block_geometry's rule when None; >= MIN_K_BLOCK_MN_MAJOR here; bitwise the same)
 ) -> RowBlockGeometry:
     """Launch the accumulators arm (K3).  No allocation, no conversion; every check is cheap host arithmetic.  Returns the geometry."""
     import torch
@@ -444,10 +468,14 @@ def run_ln_dual_gemm_tail(
 
     p = plan.params
     _check(p.dual, "this artifact was compiled with pairing='columns'; launch it through run_ln_dual_gemm")
-    g = row_block_geometry(n_res, bn)
+    g = row_block_geometry(n_res, bn, k_block)
     _check(
         g.n_res >= MIN_N_RES_MN_MAJOR,
         f"the accumulators arm loads the MN-major operand in 64-row boxes of one bi: n_res must be >= {MIN_N_RES_MN_MAJOR} (kb >= 64), got {n_res}",
+    )
+    _check(
+        g.kb >= MIN_K_BLOCK_MN_MAJOR,
+        f"the accumulators arm loads the MN-major operand in 64-row boxes of one bi: k_block must be >= {MIN_K_BLOCK_MN_MAJOR}, got {g.kb}",
     )
     rows = g.rows_valid
     bf16 = torch.bfloat16

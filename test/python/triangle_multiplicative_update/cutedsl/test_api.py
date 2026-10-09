@@ -687,7 +687,7 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         seen = set()
         for floor, bb, direction, override in rows:
             assert floor in floors and bb in th.BATCH_BUCKETS and direction in (None, "outgoing", "incoming")
-            axes = [a for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages") if getattr(override, a) is not None]
+            axes = [a for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "k_block") if getattr(override, a) is not None]
             assert len(axes) == 1, (width, floor, bb, direction, axes)
             for d in (("outgoing", "incoming") if direction is None else (direction,)):
                 assert (floor, bb, d, axes[0]) not in seen, "two refinements override one axis of one cell"
@@ -709,6 +709,11 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     )  # the K1 order follows the ring depth
     assert th.recommend(384, 128, 1).clc_stages == 4 and th.recommend(384, 128, 4).clc_stages == 1
     assert th.recommend(128, 256, 4).clc_stages == 1 and th.recommend(128, 256, 1).clc_stages == 2
+    # the row tile of the two LayerNorm-prologue stages: the substrate's rule unless a pick sets it (every member of the domain is bitwise the same)
+    assert th.K_BLOCK_DOMAIN == (64, 128, 256)
+    assert th.recommend(64, 128, 1).k_block == 64 and th.recommend(128, 128, 1).k_block == 128 and th.recommend(217, 128, 1).k_block == 256
+    assert th.recommend(256, 128, 1).k_block == th.recommend(512, 128, 1).k_block == th.recommend(2048, 256, 4).k_block == 256
+    assert th.recommend(384, 128, 1).k_block == th.default_k_block(384) and th.recommend(33, 128, 1).k_block == 64  # (33: clamped into the domain)
     from dataclasses import replace
 
     base = th.recommend(512, 128, 1)
@@ -721,8 +726,10 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     )  # keeps pair-A4 / major / transpose
     assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs()) == base  # an empty record changes nothing
     assert th.resolve(512, 128, 1, "outgoing") == base
-    full = th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4)
-    assert th.resolve(512, 128, 1, "outgoing", knobs=full) == full  # a complete record replaces every axis
+    full = th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4, k_block=128)
+    assert full.is_complete() and th.resolve(512, 128, 1, "outgoing", knobs=full) == full  # a complete record replaces every axis
+    four = th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4)
+    assert not four.is_complete() and th.resolve(512, 128, 1, "outgoing", knobs=four) == replace(four, k_block=256)  # the row tile from the rule
     assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4), k2_tile=k2.SMALL_N_TILE_CONFIG) == replace(
         base, clc_stages=4, k2_tile=k2.SMALL_N_TILE_CONFIG
     )
@@ -731,6 +738,9 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         (dict(k1_pass_order="zigzag"), "k1_pass_order"),
         (dict(k3_prologue="swizzle"), "k3_prologue"),
         (dict(clc_stages=3), "clc_stages"),
+        (dict(k_block=96), "k_block"),
+        (dict(k_block=32), "k_block"),  # the projection stage alone would admit it; the output stage's MN-major box needs >= 64
+        (dict(k_block=True), "k_block"),
     ):
         with pytest.raises(ValueError, match=axis):
             th.validate_knobs(th.TriMulKnobs(**bad))
@@ -787,6 +797,8 @@ def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_declin
         None,
         tapi.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1),
         tapi.TriMulKnobs(k2_tile=k2.SMALL_N_MULTICAST_B2_TILE_CONFIG, clc_stages=4),
+        tapi.TriMulKnobs(k_block=64),  # the row tile: 4 bi x 64 k per pair tile instead of the rule's 2 x 128 at N = 128
+        tapi.TriMulKnobs(k_block=256),  # 1 bi x 256 k: the second half of every pair tile is padding at N = 128 (legal, wasteful)
     ):
         plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True, knobs=knobs)
         assert plan.check_support()
@@ -797,7 +809,7 @@ def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_declin
         torch.cuda.synchronize()
         assert not (out.float() == _SENTINEL).any() and torch.isfinite(out.float()).all()
         outs.append(out)
-    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2]), "a performance knob changed the output bits"
+    assert all(torch.equal(outs[0], o) for o in outs[1:]), "a performance knob changed the output bits"
     plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, k2_tile=k2.SMALL_N_TILE_CONFIG)
     assert plan.check_support()  # the single-axis override takes the same path
     other_family = "CONFIG_sm120_512x512x32_16x16x32_cluster1x1_warps2x4"  # a catalog name this arch tree cannot render

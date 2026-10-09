@@ -135,6 +135,7 @@ def run_trimul_proj(
     mask=None,  # [B, N, N] bf16 pair mask, iff params.has_mask
     stats=None,  # [B * N * N, 2] fp32 (mean, rstd), iff params.want_stats
     stream,
+    k_block=None,  # k's per 256-row pair tile (the substrate's rule when None; a performance knob, bitwise the same planes)
 ) -> RowBlockGeometry:
     """Launch K1.  No allocation, no conversion (the mask must already be bf16 ``[B, N, N]``; the planes are the caller's workspace)."""
     if z.ndim != 4 or z.shape[1] != z.shape[2]:
@@ -157,6 +158,7 @@ def run_trimul_proj(
         mask=mask.reshape(-1) if mask is not None else None,
         stats=stats,
         stream=stream,
+        k_block=k_block,
     )
 
 
