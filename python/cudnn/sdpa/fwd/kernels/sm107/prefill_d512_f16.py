@@ -242,6 +242,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     lpt_tile_coords,
     make_sdpa_helpers,
     o_epilogue_convert_store,
+    running_max_step_finite_sentinel,
 )
 
 # ----------------------------------------------------------------------------
@@ -1134,6 +1135,8 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
+    # current_max_raw is the tile's RAW row max -- exactly NEG_INF_F32 (the finite mask sentinel) iff every column of this
+    # tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.
     if cutlass.const_expr(SCALE_PREFOLDED):
         # Raw-domain max: Q carries attn_scale * log2(e) (SCALE_PREFOLDED, module header).
         current_max = current_max_raw
@@ -1144,31 +1147,23 @@ def _sg0_softmax_kv_iter(
     # doubles as the tmem_load_fence cross-warp sync.
     bars.mb_s_acc_empty[cur_parity_S].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    # Online softmax (RESCALE_THRESHOLD skip).
-    old_total_max = total_max
-    is_first = total_max == NEG_INF_F32
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD_F32)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF_F32, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that and under the pre-folded scale every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF_F32, 0) and is published by the
+    # epilogue's _row_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_raw, current_max, total_max, NEG_INF_F32, RESCALE_THRESHOLD_F32, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF_F32.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max (pre-folded scale: reg_S - total_max); then exp2.
+    # reg_S = reg_S * scale_log2 - new_total_max (pre-folded scale: reg_S - new_total_max); then exp2.  new_total_max is the
+    # running max, or 0 on a dead leading tile (every column of it then lands at exp2(sentinel) = +0).
     if cutlass.const_expr(SCALE_PREFOLDED):
-        reg_S_scaled = reg_S_tile.vec - total_max
+        reg_S_scaled = reg_S_tile.vec - new_total_max
     else:
-        reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+        reg_S_scaled = reg_S_tile.vec * scale_log2 - new_total_max
     reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
     reg_P_half_vec = reg_P_fp32.to(P_STORAGE_DTYPE)
     reg_P_half = RegTile(reg_P_half_vec, size=CFG.TILE_N)

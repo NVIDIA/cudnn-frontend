@@ -3712,11 +3712,12 @@ class TestStagedHalf:
 # re-executions with a CHANGED V and NaN / +inf-poisoned outputs -- each
 # retained O / LSE equals the recomputed reference, LSE is bitwise independent
 # of V, and two executions on identical inputs are bitwise equal.
-# The scale = 1 masked variant NaNs on develop 4c0dc9a8 exactly as on this
-# head (the review's finding): the live rows whose window excludes KV tile 0
-# publish LSE = log(1e-30) and O = NaN -- classified as a pre-existing develop
-# defect (documented in the PR #1288 follow-ups); kept as a
-# STRICT xfail so the suite documents it and flips the day it is fixed.
+# The scale = 1 masked variant is the LEADING-DEAD-TILE geometry: the live rows
+# whose 130-key window excludes KV tile 0 (bottom-right diag >= 257) took the
+# scaled mask sentinel, -inf at scale 1, as their running max and published
+# LSE = log(1e-30) and O = NaN.  The softmax's running-max step now selects a
+# tile that is fully masked ahead of the row's first live key out of the state
+# (alpha = 1, P = 0), so those cells run as regression cells of the fix.
 # ============================================================================
 
 _HANDOFF_GEOMETRY = dict(b=3, h_q=8, h_kv=4, s_q=1024, s_kv=512, d=512)
@@ -3821,29 +3822,16 @@ def _handoff_check(o, lse, ref_o, ref_lse, q_lens, *, tag):
 _HANDOFF_MASKS = {"dense": dict(causal_br=False, window_left=None), "causal_br_swa129": dict(causal_br=True, window_left=_HANDOFF_WINDOW_LEFT)}
 
 
-def _d512_twin_on() -> bool:
-    """The call-time d512 2x2 twin (api_dsl.D512_2X2), read at collection: under it these cells lower onto the 2x2 sibling
-    (sm107/prefill_d512_f16_2x2.py), whose softmax has no section-3 floor leak -- the scale-1 cells PASS there (measured
-    2026-10-01 on a cc 10.7 board), so the strict xfail below is the ROLE-SPLIT kernel's and must not turn that pass into an XPASS failure."""
-    from cudnn.sdpa.fwd import api_dsl
-
-    return bool(api_dsl.D512_2X2)
-
-
-_HANDOFF_SCALE1_XFAIL = pytest.mark.xfail(
-    condition=not _d512_twin_on(),
-    strict=True,
-    reason="pre-existing on develop 4c0dc9a8: at scale 1 the d512 f16 / bf16 ROLE-SPLIT kernel NaNs the LIVE rows whose 130-key window excludes the "
-    "first KV tile (bottom-right diag >= 257; LSE = log(1e-30), the section-3 floor leak); scale 0.5 is exact; same first location (0, 0, 769) and "
-    "count (3064 rows) on develop and head -- see the PR #1288 follow-ups.  The 2x2 sibling (twin on) passes these cells",
-)
 _HANDOFF_CASES = [
     pytest.param("bf16", "dense", 0.5, id="bf16-dense-scale0.5"),
     pytest.param("bf16", "causal_br_swa129", 0.5, id="bf16-causal_br_swa129-scale0.5"),
     pytest.param("fp16", "dense", 0.5, id="fp16-dense-scale0.5"),
     pytest.param("fp16", "causal_br_swa129", 0.5, id="fp16-causal_br_swa129-scale0.5"),
-    pytest.param("bf16", "causal_br_swa129", 1.0, id="bf16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
-    pytest.param("fp16", "causal_br_swa129", 1.0, id="fp16-causal_br_swa129-scale1", marks=_HANDOFF_SCALE1_XFAIL),
+    # scale 1: the 130-key window of the rows past bottom-right diag 257 excludes KV tile 0 -- a fully-masked tile AHEAD of the
+    # row's first live key.  The scaled chain took the sentinel * log2 e = -inf as the running max and read -inf - (-inf) = NaN
+    # into P (3064 NaN rows, LSE = log(1e-30)); the running-max step now keeps such a tile out of the state (alpha = 1, P = 0).
+    pytest.param("bf16", "causal_br_swa129", 1.0, id="bf16-causal_br_swa129-scale1"),
+    pytest.param("fp16", "causal_br_swa129", 1.0, id="fp16-causal_br_swa129-scale1"),
 ]
 
 
@@ -3854,7 +3842,9 @@ def test_sm107_d512_correction_handoff_under_mixed_rescale(dtype, mask, scale):
     rescale at every KV tile while their neighbours pass through, a queryless
     batch and (masked arm) keyless rows exercise the dead-row selects, and the
     outputs are retained across three replays with a changed V.  The reference
-    composes the same padding, diagonal and window as the graph."""
+    composes the same padding, diagonal and window as the graph.  The scale-1
+    masked cells are the leading-dead-tile regression: rows whose window excludes
+    KV tile 0 keep their later keys and must come out finite and at the reference."""
     import torch
 
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
@@ -6748,10 +6738,12 @@ def test_d512_half_prefolded_scale_keyless_and_dead_rows(_d512_role_split, dtype
     """The correction-storm geometry of the d512 correction hand-off test above under the fold: per-batch Q /
     KV padding with a QUERYLESS batch (dead rows: O exactly 0, LSE -inf) and, in the masked arm, bottom-right causal + left
     window 129 (the first 512 / 256 rows of batches 0 / 1 are KEYLESS; live rows whose window excludes KV tile 0 see a
-    fully-masked FIRST tile -- the finite-sentinel re-fire of the raw-max path, wiped by alpha = 0 on the first live tile).
-    Q carries scale * log2 e; the fp64 reference composes the same padding / diagonal / window with ln 2.  Scale 1 is the
-    geometry the SCALED chain NaNs (its sentinel * log2 e overflows to -inf: the strict xfail above); the fold never
-    multiplies the sentinel, so it must pass here.  Two launches on identical inputs must be bitwise equal."""
+    fully-masked FIRST tile, which the running-max step selects out of the row's state: alpha = 1, P = 0, the first live
+    tile then starts the online softmax).  Q carries scale * log2 e; the fp64 reference composes the same padding /
+    diagonal / window with ln 2.  Scale 1 is the geometry on which the SCALED chain used to NaN (its sentinel * log2 e
+    overflows to -inf) while the fold published P = 1 on the dead tile and wiped it with alpha = 0 at the next one -- both
+    chains take the same select now (the hand-off cells above hold the scaled chain at scale 1).  Two launches on identical
+    inputs must be bitwise equal."""
     import math
 
     import torch
