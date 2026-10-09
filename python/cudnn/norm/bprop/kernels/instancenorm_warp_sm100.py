@@ -190,6 +190,9 @@ def _in_bwd_warp_kernel(
             mDBp[gw] = db
 
 
+_in_bwd_warp_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def _in_bwd_finalize_kernel(
     mDGp,
@@ -216,6 +219,9 @@ def _in_bwd_finalize_kernel(
         mDGamma[c] = sg
         if cutlass.const_expr(has_beta):
             mDBeta[c] = sb
+
+
+_in_bwd_finalize_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

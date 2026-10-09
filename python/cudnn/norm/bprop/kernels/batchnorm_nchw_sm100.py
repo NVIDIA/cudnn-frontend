@@ -376,6 +376,9 @@ def _bn_bwd_nchw_kernel(
         n = n + 1
 
 
+_bn_bwd_nchw_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _bn_bwd_nchw_host(
     mDY,

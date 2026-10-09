@@ -181,6 +181,9 @@ def _ln_bwd_kernel(
             j = j + bt
 
 
+_ln_bwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _ln_bwd_host(
     mDY,
@@ -403,13 +406,14 @@ def _ln_bwd_pipe_kernel(
         for it in cutlass.range_constexpr(ldgs):
             col0 = (it * tpr + tid) * V
             for h in cutlass.range_constexpr(NSEG):
-                gseg = cutlass.Vector.from_elements(
-                    tuple(dgp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+                gseg = cutlass.Vector.from_elements(tuple(dgp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
                 nvvm.store_ext(gseg, mDGp.iterator + (pbase + col0 + h * 4))
                 if cutlass.const_expr(has_beta):
-                    bseg = cutlass.Vector.from_elements(
-                        tuple(dbp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
+                    bseg = cutlass.Vector.from_elements(tuple(dbp[it * V + h * 4 + j] for j in range(4)), cutlass.Float32)
                     nvvm.store_ext(bseg, mDBp.iterator + (pbase + col0 + h * 4))
+
+
+_ln_bwd_pipe_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.kernel
@@ -448,6 +452,9 @@ def _ln_bwd_finalize_kernel(
         cute.arch.atomic_add(mDG.iterator + c, gsum)
         if cutlass.const_expr(has_beta):
             cute.arch.atomic_add(mDB.iterator + c, bsum)
+
+
+_ln_bwd_finalize_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -634,6 +641,9 @@ def _ln_bwd_tiled_kernel(
             col0 = (it * tpr + tid) * V
             for e in cutlass.range_constexpr(V):
                 mDGp[pbase + (col0 + e)] = dgp[it * V + e]
+
+
+_ln_bwd_tiled_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

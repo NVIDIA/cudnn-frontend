@@ -32,6 +32,9 @@ if "cudnn" not in sys.modules:
     _stub = types.ModuleType("cudnn")
     _stub.__path__ = [_REPO_CUDNN]
     _stub.pygraph = type("pygraph", (), {})
+    # cudnn.frost.buffers imports this at module scope (the CuTe DSL version gate
+    # lives behind it); it is only called into from a method, so a placeholder does.
+    _stub._pybind_module = types.ModuleType("cudnn._pybind_module")
 
     class _DT(_enum.Enum):
         HALF = 1

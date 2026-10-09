@@ -85,6 +85,9 @@ def _bn_bwd_kernel(
         i = i + bt
 
 
+_bn_bwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _bn_bwd_host(
     mDY,

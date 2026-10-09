@@ -286,10 +286,19 @@ def _gn_bwd_nhwc_kernel(
             mS1[slot] = ab
 
 
+_gn_bwd_nhwc_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def _gn_bwd_nhwc_finalize(
-    mS1, mS2, mDGamma, mDBeta, NM: cutlass.Int32,
-    C: cutlass.Constexpr, CW: cutlass.Constexpr, R: cutlass.Constexpr,
+    mS1,
+    mS2,
+    mDGamma,
+    mDBeta,
+    NM: cutlass.Int32,
+    C: cutlass.Constexpr,
+    CW: cutlass.Constexpr,
+    R: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
 ) -> None:
     """Reduce the per-(image, H*W-part) channel gradients down to ``[C]``.
@@ -326,6 +335,9 @@ def _gn_bwd_nhwc_finalize(
         mDGamma[c] = sg
         if cutlass.const_expr(has_beta):
             mDBeta[c] = sb
+
+
+_gn_bwd_nhwc_finalize.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -407,9 +419,7 @@ def _gn_bwd_nhwc_host(
         et,
         Mf,
     ).launch(grid=(TILES, gridm, gridn), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
-    _gn_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, NM, C, fcw, fr, has_beta).launch(
-        grid=(fgrid, 1, 1), block=(fcw * fr, 1, 1), smem=fsmem
-    )
+    _gn_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, NM, C, fcw, fr, has_beta).launch(grid=(fgrid, 1, 1), block=(fcw * fr, 1, 1), smem=fsmem)
 
 
 _KCACHE = {}
@@ -520,7 +530,34 @@ def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=N
             cutlass.Int32(mparts),
             cutlass.Int32(NM),
         )
-        ce = (C, V, CPG, CPC, TPP, PPL, BT, G, GPT, LPG, GPL, SEGLEN, KC, TILES, COOP, it_ty, et, float(HW * CPG), has_beta, smem_bytes, mparts, N, fgrid, fcw, fr, fsmem)
+        ce = (
+            C,
+            V,
+            CPG,
+            CPC,
+            TPP,
+            PPL,
+            BT,
+            G,
+            GPT,
+            LPG,
+            GPL,
+            SEGLEN,
+            KC,
+            TILES,
+            COOP,
+            it_ty,
+            et,
+            float(HW * CPG),
+            has_beta,
+            smem_bytes,
+            mparts,
+            N,
+            fgrid,
+            fcw,
+            fr,
+            fsmem,
+        )
         key = (params.io_dtype, C, HW, N, CPG, G, V, CPC, KC, has_beta, mparts, COOP)
         fn = _KCACHE.get(key)
         if fn is None:

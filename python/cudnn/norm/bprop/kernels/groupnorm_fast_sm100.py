@@ -215,6 +215,9 @@ def _gn_bwd_fast_kernel(
             mDBp[bid * CPG + tid] = aggb
 
 
+_gn_bwd_fast_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def _gn_bwd_finalize_kernel(
     mDGp,
@@ -244,6 +247,9 @@ def _gn_bwd_finalize_kernel(
         mDGamma[c] = sg
         if cutlass.const_expr(has_beta):
             mDBeta[c] = sb
+
+
+_gn_bwd_finalize_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit

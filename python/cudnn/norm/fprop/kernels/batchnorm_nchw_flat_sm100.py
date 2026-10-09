@@ -358,6 +358,9 @@ def _bn_flat(
             nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tptr[0], cutlass.Float32), max(1, BT // 128) * KTR * VPT * VS, is_exclusive=False)
 
 
+_bn_flat.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _bn_flat_host(
     mX,

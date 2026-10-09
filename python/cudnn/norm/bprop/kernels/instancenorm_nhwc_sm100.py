@@ -39,6 +39,8 @@ _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _CPC_MAX = 128
 _BT = 256
+
+
 def nhwc_cfg(C, eb, block_threads=_BT):
     """``(V, CPC, TPP, PPL, cblks, BT)`` or None when C is not 128-bit tileable."""
     V = 16 // eb
@@ -272,10 +274,19 @@ def _in_bwd_nhwc_kernel(
         row = row + PPL
 
 
+_in_bwd_nhwc_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.kernel
 def _in_bwd_nhwc_finalize(
-    mS1, mS2, mDGamma, mDBeta, N: cutlass.Int32,
-    C: cutlass.Constexpr, CW: cutlass.Constexpr, R: cutlass.Constexpr,
+    mS1,
+    mS2,
+    mDGamma,
+    mDBeta,
+    N: cutlass.Int32,
+    C: cutlass.Constexpr,
+    CW: cutlass.Constexpr,
+    R: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
 ) -> None:
     """Reduce the per-image channel gradients down to ``[C]``.
@@ -312,6 +323,9 @@ def _in_bwd_nhwc_finalize(
         mDGamma[c] = sg
         if cutlass.const_expr(has_beta):
             mDBeta[c] = sb
+
+
+_in_bwd_nhwc_finalize.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
 @cute.jit
@@ -382,9 +396,7 @@ def _in_bwd_nhwc_host(
         et,
         Mf,
     ).launch(grid=(cblks, mparts, gridz), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
-    _in_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, N, C, fcw, fr, has_beta).launch(
-        grid=(fgrid, 1, 1), block=(fcw * fr, 1, 1), smem=fsmem
-    )
+    _in_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, N, C, fcw, fr, has_beta).launch(grid=(fgrid, 1, 1), block=(fcw * fr, 1, 1), smem=fsmem)
 
 
 _KCACHE = {}

@@ -36,6 +36,15 @@ def __getattr__(name: str) -> Any:
         module_name, attr_name = _LAZY_EXPORTS[name]
     except KeyError:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    # AGENTS.md Rule 7: gate the CuTe DSL version HERE, before the kernel modules are
+    # imported. pyproject's floor is the downstream one (4.6.2) and is below what these
+    # kernels need, so an install that satisfies pip can still be too old -- and the
+    # failure must read as a version problem, not as a missing dependency.
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    error = cutedsl_requirement_error("cudnn.norm")
+    if error is not None:
+        raise ImportError(error)
     import importlib
 
     value = getattr(importlib.import_module(module_name), attr_name)

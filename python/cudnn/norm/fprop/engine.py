@@ -47,6 +47,12 @@ class FrostNormFwdEngine(BaseEngine):
     def _decline_reason(self, graph, knobs) -> Optional[str]:
         from cudnn.norm.fprop.engines import analyze_for, mismatch
 
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        # Rule 7: decline at CHECK time, not when lowering imports the kernels.
+        error = cutedsl_requirement_error(self.name)
+        if error is not None:
+            return error
         facts = analyze_for(graph)
         if facts is None:
             return "graph is not a single norm node this engine serves"

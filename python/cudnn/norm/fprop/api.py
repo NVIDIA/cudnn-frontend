@@ -109,17 +109,13 @@ def norm_fprop(
             N, C, H, W = (int(v) for v in x.shape)
             if groupnorm_nhwc_sm100.eligible(C, int(spec.channels_per_group), DTYPE_BYTES[io]):
                 x3 = x.permute(0, 2, 3, 1).reshape(N, H * W, C)  # view, no copy
-                y3, mean, rstd = groupnorm_nhwc_sm100.forward(
-                    spec, x3, gamma, beta, eps=eps, cfg=None, params=params
-                )
+                y3, mean, rstd = groupnorm_nhwc_sm100.forward(spec, x3, gamma, beta, eps=eps, cfg=None, params=params)
                 return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
         if variant == NormVariant.INSTANCE_NORM and _is_nhwc(x):
             N, C, H, W = (int(v) for v in x.shape)
             if instancenorm_nhwc_sm100.nhwc_cfg(C, DTYPE_BYTES[io]) is not None:
                 x3 = x.permute(0, 2, 3, 1).reshape(N, H * W, C)  # view, no copy
-                y3, mean, rstd = instancenorm_nhwc_sm100.forward(
-                    spec, x3, gamma, beta, eps=eps, cfg=None, params=params
-                )
+                y3, mean, rstd = instancenorm_nhwc_sm100.forward(spec, x3, gamma, beta, eps=eps, cfg=None, params=params)
                 return y3.reshape(N, H, W, C).permute(0, 3, 1, 2), mean, rstd
 
         x2d = x.reshape(spec.R, spec.M)

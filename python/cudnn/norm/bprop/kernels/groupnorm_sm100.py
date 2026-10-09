@@ -172,6 +172,9 @@ def _gn_bwd_kernel(
             j = j + bt
 
 
+_gn_bwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _gn_bwd_host(
     mDY,

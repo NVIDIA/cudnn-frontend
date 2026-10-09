@@ -144,6 +144,9 @@ def _ln_fwd_kernel(
             j = j + bt
 
 
+_ln_fwd_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 @cute.jit
 def _ln_fwd_host(
     mX,

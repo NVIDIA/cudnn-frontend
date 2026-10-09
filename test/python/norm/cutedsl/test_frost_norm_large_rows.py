@@ -60,6 +60,9 @@ def _install_repo_cudnn_stub():
     stub.__path__ = [str(repo_cudnn)]
     stub.__file__ = str(repo_cudnn / "__init__.py")
     stub.pygraph = type("pygraph", (), {})
+    # cudnn.frost.buffers imports this at module scope and only calls into it
+    # from a method, so a placeholder is enough to reach the DSL version gate.
+    stub._pybind_module = types.ModuleType("cudnn._pybind_module")
 
     import enum
 
@@ -94,12 +97,12 @@ def _case(R, D, *, dtypes, cga_bwd=True, smoke=False):
 
 
 CASES = [
-    _case(1, 65536, dtypes=SMALL),             # a single row
+    _case(1, 65536, dtypes=SMALL),  # a single row
     _case(31, 16384, dtypes=SMALL, smoke=True),  # fewer rows than clusters, odd R
     _case(64, 32768, dtypes=SMALL),
     _case(512, 32768, dtypes=BIG, smoke=True),
     _case(512, 65536, dtypes=BIG),
-    _case(128, 131072, dtypes=BIG),            # the longest row supported
+    _case(128, 131072, dtypes=BIG),  # the longest row supported
     # Below the backward's threshold with enough rows to fill the machine: the
     # pipelined backward must keep this one (0.60 of achievable against the split's
     # 0.23). Asserts the threshold from the side that otherwise rots unnoticed.
@@ -159,7 +162,7 @@ def _check_case(c, dtypes=None):
     R, D = c["R"], c["D"]
     print(f"\n=== R={R} D={D} (bwd split expected: {c['cga_bwd']}) ===")
     for variant, vn, has_beta in ((LN, "LN", True), (RMS, "RMS", False)):
-        for dtype in (dtypes or c["dtypes"]):
+        for dtype in dtypes or c["dtypes"]:
             torch.manual_seed(0)
             x = torch.randn(R, D, device="cuda", dtype=dtype)
             g = torch.randn(D, device="cuda", dtype=dtype)
@@ -169,16 +172,13 @@ def _check_case(c, dtypes=None):
             with _record_dispatch() as seen:
                 y, mean, rstd = norm_fprop(variant, x, g, b, eps=1e-5, **kw)
                 dy = torch.randn_like(y)
-                dx, dgamma, dbeta = norm_bprop(
-                    variant, dy, x, g, mean, rstd, has_beta=has_beta, **kw
-                )
+                dx, dgamma, dbeta = norm_bprop(variant, dy, x, g, mean, rstd, has_beta=has_beta, **kw)
                 torch.cuda.synchronize()
 
             xr = x.float().detach().requires_grad_(True)
             gr = g.float().detach().requires_grad_(True)
             br = b.float().detach().requires_grad_(True) if b is not None else None
-            y_ref = (F.layer_norm(xr, [D], gr, br, 1e-5) if has_beta
-                     else F.rms_norm(xr, [D], gr, eps=1e-5))
+            y_ref = F.layer_norm(xr, [D], gr, br, 1e-5) if has_beta else F.rms_norm(xr, [D], gr, eps=1e-5)
             ins = [t for t in (xr, gr, br) if t is not None]
             grads = torch.autograd.grad(y_ref, ins, grad_outputs=dy.float())
 
@@ -189,8 +189,7 @@ def _check_case(c, dtypes=None):
             if has_beta:
                 ok &= _check("bwd dbeta", dbeta, grads[2], dtype)
             ok &= _flag("fwd kernel", CGA_F in seen["fwd"], f"{seen['fwd']} want {CGA_F}")
-            ok &= _flag("bwd kernel", (CGA_F in seen["bwd"]) == c["cga_bwd"],
-                        f"{seen['bwd']} split={c['cga_bwd']}")
+            ok &= _flag("bwd kernel", (CGA_F in seen["bwd"]) == c["cga_bwd"], f"{seen['bwd']} split={c['cga_bwd']}")
             del x, g, b, y, dy, dx, dgamma, dbeta, xr, gr, br, y_ref, grads
             torch.cuda.empty_cache()
     return ok
