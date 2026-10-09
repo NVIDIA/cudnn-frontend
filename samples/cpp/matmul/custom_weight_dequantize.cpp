@@ -122,7 +122,10 @@ TEST_CASE("Custom weight dequantization matmul", "[matmul][weight_dequantize][gr
     REQUIRE(restored.build_plans().is_good());
     int64_t workspace_size = -1;
     REQUIRE(restored.get_workspace_size(workspace_size).is_good());
-    REQUIRE(workspace_size == 0);
+    REQUIRE(workspace_size >= 0);
+    // Small GEMM grids may use split-K with FP32 partial outputs. Always query
+    // the plan; decoder scratch being zero does not imply zero GEMM workspace.
+    Surface<uint8_t> workspace(std::max<int64_t>(1, workspace_size), 0);
 
     std::vector<unsigned short> a_host(m * lda, 0);
     for (int64_t row = 0; row < m; ++row)
@@ -151,7 +154,7 @@ TEST_CASE("Custom weight dequantization matmul", "[matmul][weight_dequantize][gr
         float global = pass == 0 ? 0.375f : 0.625f;
         CUDA_CHECK(cudaMemcpy(block_gpu.devPtr, scales.data(), scale_count * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(global_gpu.devPtr, &global, sizeof(float), cudaMemcpyHostToDevice));
-        REQUIRE(restored.execute(handle, variant_pack, nullptr).is_good());
+        REQUIRE(restored.execute(handle, variant_pack, workspace_size ? workspace.devPtr : nullptr).is_good());
         CUDA_CHECK(cudaMemcpy(actual.data(), c_gpu.devPtr, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
         for (int64_t row = 0; row < k; ++row)
             for (int64_t col = 0; col < n; ++col) {
@@ -185,12 +188,14 @@ TEST_CASE("Custom weight dequantization ggml blocks", "[matmul][weight_dequantiz
     if (cudnnBackendCreateDescriptor(CUDNN_BACKEND_WEIGHT_DECODE_DESCRIPTOR, &probe) != CUDNN_STATUS_SUCCESS)
         SKIP("Runtime library lacks experimental weight-dequantization descriptors");
     REQUIRE(cudnnBackendDestroyDescriptor(probe) == CUDNN_STATUS_SUCCESS);
-    auto format     = GENERATE(4, 6, 1);  // Q4_K, Q6_K, IQ1_S
-    auto bf16       = GENERATE(false, true);
-    auto identity   = GENERATE(false, true);
-    const int64_t m = identity ? 256 : 37, k = identity ? 256 : 515, n = identity ? 64 : 75;
+    auto format   = GENERATE(4, 6, 1);  // Q4_K, Q6_K, IQ1_S
+    auto bf16     = GENERATE(false, true);
+    auto shape    = GENERATE(0, 1, 2);  // tails, identity, automatic split-K
+    bool identity = shape == 1, split = shape == 2;
+    const int64_t m = identity ? 256 : (split ? 16 : 37), k = identity ? 256 : (split ? 544 : 515),
+                  n   = identity ? 64 : (split ? 256 : 75);
     const int64_t lda = (k + 7) / 8 * 8;
-    CAPTURE(format, bf16, identity);
+    CAPTURE(format, bf16, shape);
     GgmlWeightFixture fixture(format, k, n);
     auto dtype = bf16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
     auto round = [bf16](float x) -> float {
@@ -227,7 +232,10 @@ TEST_CASE("Custom weight dequantization ggml blocks", "[matmul][weight_dequantiz
     REQUIRE(graph.create_execution_plan(10, {}).is_good());
     REQUIRE(graph.check_support().is_good());
     REQUIRE(graph.build_plans().is_good());
-    REQUIRE(graph.get_workspace_size() == 0);
+    auto workspace_size = graph.get_workspace_size();
+    REQUIRE(workspace_size >= 0);
+    REQUIRE((workspace_size > 0) == split);
+    Surface<uint8_t> workspace(std::max<int64_t>(1, workspace_size), 0);
     std::vector<unsigned short> ah(m * lda, 0);
     std::vector<float> af(m * k);
     for (int64_t r = 0; r < m; ++r)
@@ -247,7 +255,7 @@ TEST_CASE("Custom weight dequantization ggml blocks", "[matmul][weight_dequantiz
     CUDA_CHECK(cudaMemcpy(grid.devPtr, fixture.codebook.data(), fixture.codebook.size() * 4, cudaMemcpyHostToDevice));
     std::unordered_map<int64_t, void*> bindings{{1, ag.devPtr}, {2, wg.devPtr + 1}, {4, cg.devPtr}};
     if (format == 1) bindings[5] = grid.devPtr;
-    REQUIRE(graph.execute(*owner, bindings, nullptr).is_good());
+    REQUIRE(graph.execute(*owner, bindings, workspace_size ? workspace.devPtr : nullptr).is_good());
     std::vector<float> actual(m * n);
     CUDA_CHECK(cudaMemcpy(actual.data(), cg.devPtr, actual.size() * 4, cudaMemcpyDeviceToHost));
     for (int64_t r = 0; r < m; ++r)

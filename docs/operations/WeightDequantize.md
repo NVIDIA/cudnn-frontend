@@ -91,6 +91,22 @@ status. The current prototype engine is native GEMM engine 10 with default
 configuration; tests select it with `create_execution_plan(10, {})`. Bind A,
 W, S, G and C at execution. FORT inserts the decoder into the GEMM's shared-memory
 producer; there is no separate dequantization kernel or dense B global workspace.
+After building the plan, always query and allocate execution workspace. Small
+grids can select split-K and require up to 64 MiB for FP32 partial outputs,
+followed by a deterministic reduction launch. This is separate from decoder
+scratch, which remains zero. Using the sample's RAII `Surface` helper:
+
+```cpp
+int64_t workspace_bytes = 0;
+// Check the returned status, as for the other graph calls.
+graph.get_workspace_size(workspace_bytes);
+Surface<uint8_t> workspace(std::max<int64_t>(1, workspace_bytes), 0);
+graph.execute(handle, bindings, workspace_bytes ? workspace.devPtr : nullptr);
+```
+
+The workspace allocation must remain alive until execution completes, be
+16-byte aligned, and not overlap any bound tensor. Use independent workspace
+and outputs for concurrent executions. It needs no initialization.
 See the executable [C++ sample](../../samples/cpp/matmul/custom_weight_dequantize.cpp)
 for allocations, support probes, CPU references, serialization and plan reuse.
 
@@ -113,8 +129,10 @@ graph.build_operation_graph()
 graph.create_execution_plan(10, {})
 graph.check_support()
 graph.build_plans()
+workspace_bytes = graph.get_workspace_size()
+workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=a_gpu.device) if workspace_bytes else None
 graph.execute({A: a_gpu, W: storage_gpu, S: block_scales_gpu,
-               G: global_scale_gpu, C: c_gpu}, None)
+               G: global_scale_gpu, C: c_gpu}, workspace)
 ```
 
 Create physical graph tensors with the same dimensions, strides and datatypes as
@@ -199,7 +217,7 @@ checks cannot prove customer indexing or synchronization correct.
 The GEMM stage budget excludes decoder staging/scratch:
 
 ```text
-M_tile    = 32, 64 or 128, depending on M and the available shared-memory budget
+M_tile    = 16, 32, 64 or 128, depending on shape, scheduling and the SMEM budget
 per_stage = 2 * (M_tile * 40 + 32 * 72)  # padded internal MMA operands
 stages    = 2
 ```
@@ -213,6 +231,14 @@ ABI and all-thread participation remain unchanged.
 
 The original padded choices require 14,336 / 19,456 / 29,696 bytes. A smaller budget
 selects a smaller M tile, with an unpadded M=32 fallback at 12,288 bytes.
+For small nongrouped grids, N >= 128 divisible by 64 and K >= 512 divisible by
+32, the backend may partition K among 2-128 CTAs per output tile. M <= 16 then
+uses an M=16 tile with 11,776 bytes of operand SMEM. The minimum accepted budget
+remains 12,288 bytes. Selection uses the actual GPU's SM count, minimum work per
+slice and a 64 MiB global-workspace cap. Each CTA writes FP32 partials, then a
+second launch sums them in fixed order before the final output conversion.
+No atomics or workspace initialization are required. Both launches participate
+in capture/replay. Query the plan's workspace; do not assume it is zero.
 The callback still sees a 32x64 output at stride 64 and all 256 CTA threads;
 FORT performs the internal layout conversion afterward. Existing ABI 1
 programs and legal CTA barriers remain valid. At least 12,288 bytes must fit. Scratch is rejected during frontend
@@ -224,7 +250,8 @@ or FP32 C. A's leading dimension and base must be 16-byte aligned. Physical
 storage and auxiliary tensors must be contiguous `[1,1,length]` vectors; their
 promised alignment must satisfy the program and their natural datatype
 alignment. Output must be virtual. Batched/dynamic/override shapes, decode-A,
-additional fusions, alternate tile shapes, split-K and Stream-K are rejected.
+additional fusions, alternate callback tile shapes and user split-K/Stream-K
+knobs are rejected. Automatic internal split-K requires no new frontend option.
 The backend remains authoritative for graph, resource, and launch-pointer checks.
 
 The full source, entry, constants, resource declarations and ordered tensor
@@ -232,6 +259,8 @@ connections participate in structural serialization and graph identity; changing
 them builds a different program. Runtime scale **values** are not part of that
 identity. Plan serialization also retains the program. Treat serialized plans
 containing customer device source with the same trust as the original source.
+Serialized split-K kernels retain their original M tile, slice count and
+workspace requirement; existing unsplit plans remain valid with zero workspace.
 
 This frontend operation adds setup/lowering work only. It uses the existing
 prototype's synchronous custom B producer and tensor-core GEMM; it does not
@@ -291,6 +320,11 @@ read directly from global memory. Q4_K and Q6_K require no auxiliary tensors.
 
 Expected weights are computed from original codes/scales before packing.
 Identity GEMMs verify every rounded output weight exactly (all IQ1_S indices),
-and separate tail GEMMs exercise multiple blocks. Both FP16 and BF16 are tested.
+and separate tail GEMMs exercise multiple blocks. M=16/N=256/K=544 cases exercise
+automatic split-K and queried workspace with all three formats and both operand
+types. The C++ samples allocate the plan's workspace for every execution.
+Python numerical tests similarly cover split-K for signed INT8/INT4/INT2 with
+global/block/combined scaling, including plan reload and CUDA graph replay.
+Both FP16 and BF16 are tested.
 The grid's MIT license and pinned ggml source revision accompany the sample.
 These are correctness examples, not measured performance comparisons to ggml.

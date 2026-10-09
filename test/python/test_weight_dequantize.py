@@ -37,8 +37,9 @@ __device__ void decode(const FortWeightDecodeTileV1& t, const void* storage,
 """
 
 
-def make_graph(handle, bits=4, scaling=3, dtype=cudnn.data_type.HALF, **program):
-    m, k, n, lda, block_k, block_n = 37, 83, 75, 88, 24, 20
+def make_graph(handle, bits=4, scaling=3, dtype=cudnn.data_type.HALF, shape=(37, 83, 75), **program):
+    m, k, n = shape
+    lda, block_k, block_n = (k + 7) // 8 * 8, 24, 20
     byte_count = (k * n * bits + 7) // 8
     scale_count = ((k + block_k - 1) // block_k) * ((n + block_n - 1) // block_n)
     graph = cudnn.pygraph(io_data_type=dtype, intermediate_data_type=dtype, compute_data_type=cudnn.data_type.FLOAT, handle=handle)
@@ -77,16 +78,20 @@ def build_prototype(graph):
     graph.create_execution_plan(10, {})
     graph.check_support()
     graph.build_plans()
-    assert graph.get_workspace_size() == 0
+    assert graph.get_workspace_size() >= 0
 
 
 @pytest.mark.parametrize("bits", [8, 4, 2])
 @pytest.mark.parametrize("scaling", [1, 2, 3], ids=["global", "block", "block_global"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype):
-    graph, tensors = make_graph(cudnn_handle, bits, scaling, dtype)
+@pytest.mark.parametrize("shape", [(37, 83, 75), (16, 544, 256)], ids=["tails", "split_k"])
+def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype, shape):
+    graph, tensors = make_graph(cudnn_handle, bits, scaling, dtype, shape)
     build_prototype(graph)
-    m, k, n, lda, block_k, block_n = 37, 83, 75, 88, 24, 20
+    m, k, n = shape
+    lda, block_k, block_n = (k + 7) // 8 * 8, 24, 20
+    workspace_size = graph.get_workspace_size()
+    assert (workspace_size > 0) == (shape == (16, 544, 256))
     blocks_n = (n + block_n - 1) // block_n
     scale_count = ((k + block_k - 1) // block_k) * blocks_n
     # Deterministic CPU inputs, independent of the GPU's SM count.
@@ -106,13 +111,14 @@ def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype):
         block_gpu = torch.empty(scale_count, dtype=torch.float32, device="cuda")
         global_gpu = torch.empty(1, dtype=torch.float32, device="cuda")
         c_gpu = torch.empty((1, m, n), dtype=torch.float32, device="cuda")
+        workspace = torch.empty(workspace_size, dtype=torch.uint8, device="cuda") if workspace_size else None
         bindings = dict(zip(tensors, (a_gpu, w_gpu, block_gpu, global_gpu, c_gpu)))
         for iteration in range(3):
             scales = ((torch.arange(scale_count) % 7 + 1 + (2 if iteration == 2 else 0)) / 16).float()
             global_scale = 0.375 if iteration == 0 else 0.625
             block_gpu.copy_(scales)
             global_gpu.fill_(global_scale)
-            graph.execute(bindings, None)
+            graph.execute(bindings, workspace)
             expected_b = original.float()
             if scaling & 2:
                 block_ids = (torch.arange(k)[:, None] // block_k) * blocks_n + torch.arange(n)[None, :] // block_n
@@ -127,12 +133,13 @@ def test_weight_dequantize_numerics(cudnn_handle, bits, scaling, dtype):
             saved = graph.serialize()
             restored = cudnn.pygraph(handle=cudnn_handle)
             restored.deserialize(cudnn_handle, saved)
+            assert restored.get_workspace_size() == workspace_size
             uid_bindings = {t.get_uid(): data for t, data in bindings.items()}
-            restored.execute(uid_bindings, None)
+            restored.execute(uid_bindings, workspace)
             torch.testing.assert_close(c_gpu[0].cpu().double(), expected, atol=0.005, rtol=0.005)
             capture = torch.cuda.CUDAGraph()
             with torch.cuda.graph(capture, stream=stream):
-                graph.execute(bindings, None)
+                graph.execute(bindings, workspace)
             c_gpu.fill_(float("nan"))
             capture.replay()
             torch.testing.assert_close(c_gpu[0].cpu().double(), expected, atol=0.005, rtol=0.005)
