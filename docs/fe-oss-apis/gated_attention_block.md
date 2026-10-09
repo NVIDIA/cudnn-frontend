@@ -735,8 +735,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   whose `seq_lens` is a tensor, and at `execute` for the record handed there: a padded record contradicts a dense
   declaration and is refused before any launch; the `sdpa_bwd_sm107` row declines padding); `window_left > 0` only
   (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
-  `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` has no training record to differentiate: the
-  forward's SDPA row declines it (its KV tail would be unmasked); causal covers the tail.
+  `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` is differentiated like any other record: the
+  forward's SDPA row masks its KV tail in-kernel (#1520); causal covers the tail.
 - Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward, inference and
   training (its packed record goes through the packed bf16 backward with the dequantized `h` and weights; a record handed
   through with its e4m3 `h` is the same typed decline as on the dense side, after the packed-length checks);
@@ -751,8 +751,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   -- and per-tensor fp8 / MXFP8 over the quantized training records (`quant=QuantSpec` / `quant=MxQuantSpec`, the record as
   written, the fp4 weight modes through their transposed e2m1 artifacts); the bf16 backward takes either record with the
   dequantized bf16 `h` and weights.
-- FP8: a dense (no-mask) sequence length must be a multiple of 128 unless the causal mask or a padding mask
-  covers the KV tail (the Rubin per-tensor FP8 SDPA contract); MXFP8: e4m3 codes only (e5m2 is a typed decline);
+- FP8: a dense (no-mask) sequence length off a multiple of 128 is served; the SDPA masks the KV tail in-kernel
+  (#1520); MXFP8: e4m3 codes only (e5m2 is a typed decline);
   the fully fused MXFP8 path needs `scale_o == 1.0` and, at `B > 1`, `S % 128 == 0` (a scale-factor atom is per
   sequence).
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).

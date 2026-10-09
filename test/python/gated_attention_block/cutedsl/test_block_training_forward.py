@@ -823,8 +823,8 @@ _FP8_STAGES = ["qkv_gate_proj", "qk_norm_rope", "quantize_q", "quantize_kv", "sd
 _MX_STAGES = ["qkv_gate_proj", "qk_norm_rope", "quantize_mxfp8_q", "quantize_mxfp8_k", "quantize_mxfp8_v", "sdpa", "sigmoid_gate", "quantize_o", "out_proj"]
 # The quantized training forward's accept geometry, crossed with ``_QK_NORM`` (the norm kernel's ``apply_norm`` trace and
 # whether rstd is written are the axis that changes what the out-of-place norm writes): S in {256, 512, 992, 1024} -- 992 is
-# ``S % 128 != 0`` (the causal tail tile and, under MXFP8, the SF-pad arm); a DENSE 992 is the quantized SDPA rows' typed
-# ``S % 128`` decline, pinned in the cell -- plus S = 1000 causal (``S % 32 != 0``), B in {1, 2}, GQA 8/2 and MHA.
+# ``S % 128 != 0`` (the causal tail tile and, under MXFP8, the SF-pad arm); a DENSE 992 is the KV tail the SDPA rows mask
+# in-kernel (kv_tail_mask, #1520) -- plus S = 1000 causal (``S % 32 != 0``), B in {1, 2}, GQA 8/2 and MHA.
 _QUANT_GEOMS = pytest.mark.parametrize(
     "seq_len, causal, batch, h_kv",
     [(256, True, 1, 2), (512, True, 2, 2), (992, True, 1, 2), (992, False, 2, 2), (1000, True, 2, 2), (1024, False, 1, 8)],
@@ -836,14 +836,6 @@ def _quant_geom(qk_norm, causal, h_kv):
     """The geometry kwargs of one quantized training cell: ``_COMMON`` with the three axes the cells cross -- ``h_kv``, ``qk_norm``,
     ``is_causal`` -- overridden."""
     return {**_COMMON, "h_kv": h_kv, "qk_norm": qk_norm, "is_causal": causal}
-
-
-def _dense_tail_declined(geom_kw, batch, seq_len, family):
-    """A DENSE ``S % 128 != 0`` is the quantized SDPA rows' typed decline (no padding mask and no causal mask covering the KV
-    tail), on the training forward exactly as on inference (``test_fp8_dense_kv_tail_is_declined_not_computed_wrong`` and
-    its MXFP8 twin): pinned at ``check_support``, before any launch."""
-    with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
-        _run_training_quant(geom_kw, batch, seq_len, family)
 
 
 def _quant_inputs(geom_kw, batch, seq_len, family):
@@ -1193,11 +1185,8 @@ def test_quantized_training_forward_is_bitwise_the_inference_block(family, qk_no
     GATE / V bands of the quantized TRAINING forward equal the quantized INFERENCE block's bit for bit.  The slab's Q/K bands
     do NOT: the inference block normed (or, ``rope_only``, rotated) them IN PLACE, the record keeps them PRE-norm -- and the
     forward's own norm+RoPE over the record's bands reproduces the inference slab's normed bands (and the saved rstd, when the
-    geometry norms) bitwise.  Over ``_QUANT_GEOMS`` x ``_QK_NORM``; the dense ``S % 128 != 0`` cell pins the rows' decline."""
+    geometry norms) bitwise.  Over ``_QUANT_GEOMS`` x ``_QK_NORM``."""
     geom_kw = _quant_geom(qk_norm, causal, h_kv)
-    if not causal and seq_len % 128:
-        _dense_tail_declined(geom_kw, batch, seq_len, family)
-        return
     b, s = batch, seq_len
     r = _run_training_quant(geom_kw, b, s, family)
     inf = _run_inference_quant(r)
@@ -1233,11 +1222,8 @@ def test_quantized_training_record_keeps_pre_norm_bands(family, qk_norm, seq_len
     -- or, ``rope_only``, the rotation -- of a band is far from the band).  The forward's OWN norm+RoPE then quantize,
     replayed over the record's bands into fresh buffers, reproduce the workspace ``q8`` / ``k8`` (and the MXFP8 scale-factor
     blobs) bitwise: the quantizers consumed exactly the normed form of what the record keeps.  Over ``_QUANT_GEOMS`` x
-    ``_QK_NORM``; the dense ``S % 128 != 0`` cell pins the rows' decline."""
+    ``_QK_NORM``."""
     geom_kw = _quant_geom(qk_norm, causal, h_kv)
-    if not causal and seq_len % 128:
-        _dense_tail_declined(geom_kw, batch, seq_len, family)
-        return
     b, s = batch, seq_len
     r = _run_training_quant(geom_kw, b, s, family)
     g, t, d = r.geom, b * s, r.geom.d_head
