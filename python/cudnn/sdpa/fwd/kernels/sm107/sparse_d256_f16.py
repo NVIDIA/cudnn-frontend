@@ -246,7 +246,8 @@ after the P^T generic stores (before mb_p_full), after the once-per-CTA sQ tail-
 tcgen05_fence + the commits; the sIds bulk copy -> LDS and gate TMA -> LDS edges are ordered by their mbarrier waits.
 
 TMEM MAP (64 columns per CTA, allocated once, is_exclusive=False -- <= 512 columns): S^T slot 0 at [0, 16), slot 1 at
-[16, 32), O^T d-block 0 at [32, 48), d-block 1 at [48, 64).  No TMEM slot is assumed zero: BMM2(0) of every item overwrites
+[16, 32), O^T d-block 0 at [32, 48), d-block 1 at [48, 64).  The S^T slot count IS the depth of rows 7-10 and of sP: CFG.STAGES_S
+(= len(S_ACC_OFF) = 2, pinned by the config), read once as STAGES_S and spelled at every ring site -- never a literal 2.  No TMEM slot is assumed zero: BMM2(0) of every item overwrites
 (accumulate=False) and every dead column ends in the SELECT, never residue * 0.
 
 GATHER TENSOR MAP: one 2-D map per operand, tokens OUTER, the token's FULL ROW inner, box (64 elems, 1 row) = one 128-B
@@ -381,6 +382,12 @@ BPE = CFG.BPE
 STAGES_KV = CFG.STAGES_KV
 STAGES_Q = CFG.STAGES_Q
 STAGES_IDS = CFG.STAGES_IDS
+# The S^T / P^T ring depth (barrier rows 7-10 and the sP buffers): the S^T TMEM slots of the map, read ONCE here and spelled at every
+# ring site below -- the four MBarriers, every advance() of s_state / s_empty_state / p_state / bmm2_state / t_state, the sP Array and
+# SmemTile, the init loop, the red scratch's parity slots.  Never a literal: a depth changed at some sites and not others is a stale S^T
+# slot read from the first reuse (frost-kernels.md section 6).  The config pins STAGES_S == len(S_ACC_OFF) == 2; the check below is the
+# trace-time twin for a direct template load.
+STAGES_S = CFG.STAGES_S
 SCHEDULER_STAGES = CFG.SCHEDULER_STAGES
 BLOCK_SIZE = CFG.BLOCK_SIZE
 BLOCKS_PER_TILE = CFG.BLOCKS_PER_TILE
@@ -449,8 +456,10 @@ STRIDE_BYTE_OFFSET_VT = 8 * CFG.V_SWZ_BYTES
 # P^T as the MN-major B of BMM2: one atom wide (N_Q * 2 B), SBO = 8 key rows.
 STRIDE_BYTE_OFFSET_P = 8 * CFG.P_SWZ_BYTES
 
-# TMEM: two S^T slots then the two O^T d-blocks, N_Q fp32 columns each (CFG.S_ACC_OFF / CFG.O_OFF, allocated once per CTA).
+# TMEM: STAGES_S S^T slots then the two O^T d-blocks, N_Q fp32 columns each (CFG.S_ACC_OFF / CFG.O_OFF, allocated once per CTA).
 S_ACC_OFF = CFG.S_ACC_OFF
+if len(S_ACC_OFF) != STAGES_S:
+    raise ValueError(f"sparse_d256_f16: STAGES_S={STAGES_S} must equal the number of S^T TMEM slots (len(S_ACC_OFF)={len(S_ACC_OFF)})")
 O_OFF = CFG.O_OFF
 TMEM_COLS = CFG.TMEM_COLS
 O_BLOCKS = TILE_O // 128
@@ -470,8 +479,8 @@ _BAR_TMEM = 1
 _BAR_SOFTMAX = 2
 BAR_TMEM_THREADS = CFG.BAR_TMEM_THREADS
 BAR_SOFTMAX_THREADS = CFG.BAR_SOFTMAX_THREADS
-# Cross-warp reduction scratch: [2 tile parities + 1 epilogue][softmax warp][COLS].
-RED_SLOTS = 3
+# Cross-warp reduction scratch: [STAGES_S tile parities + 1 epilogue][softmax warp][COLS]; the epilogue slot is index STAGES_S.
+RED_SLOTS = STAGES_S + 1
 RED_WORDS = RED_SLOTS * SOFTMAX_WARPS * COLS
 
 LOG2E = 1.4426950408889634
@@ -513,10 +522,10 @@ def make_sparse_bars() -> SparseBars:
         mb_ids_empty=MBarrier(_alloc(STAGES_IDS), stages=STAGES_IDS, init_count=CFG.IDS_EMPTY_ARRIVERS, producer=Producer.THREAD),
         mb_kv_full=MBarrier(_alloc(STAGES_KV), stages=STAGES_KV, init_count=CFG.KV_FULL_ARRIVERS, producer=Producer.TMA_LOAD),
         mb_kv_empty=MBarrier(_alloc(STAGES_KV), stages=STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_s_full=MBarrier(_alloc(2), stages=2, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_s_empty=MBarrier(_alloc(2), stages=2, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
-        mb_p_full=MBarrier(_alloc(2), stages=2, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
-        mb_bmm2_done=MBarrier(_alloc(2), stages=2, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_s_full=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_s_empty=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
+        mb_p_full=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
+        mb_bmm2_done=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
         mb_gate_full=gate_full,
         mb_gate_empty=gate_empty,
@@ -1191,8 +1200,8 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
         bars.mb_kv_empty[kv_state.idx].arrive(cta_group=1, pred=elect_p)
         bars.mb_q_empty[q_state.idx].arrive(cta_group=1, pred=elect_p & (n_tiles == cutlass.Int32(1)))
         kv_state = advance(kv_state, STAGES_KV)
-        s_state = advance(s_state, 2)
-        s_empty_state = advance(s_empty_state, 2)
+        s_state = advance(s_state, STAGES_S)
+        s_empty_state = advance(s_empty_state, STAGES_S)
 
         for i in cutlass.range(0, n_tiles, 1, unroll=1):
             # BMM1(i + 1) ahead of BMM2(i): the softmax of tile i overlaps the next score tile, and the K slot is released as
@@ -1207,8 +1216,8 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
                 bars.mb_kv_empty[kv_state.idx].arrive(cta_group=1, pred=elect_p1)
                 bars.mb_q_empty[q_state.idx].arrive(cta_group=1, pred=elect_p1 & ((i + cutlass.Int32(2)) == n_tiles))
                 kv_state = advance(kv_state, STAGES_KV)
-                s_state = advance(s_state, 2)
-                s_empty_state = advance(s_empty_state, 2)
+                s_state = advance(s_state, STAGES_S)
+                s_empty_state = advance(s_empty_state, STAGES_S)
 
             # BMM2(i): V(i) is the next load of the ring, P^T(i) the softmax's publish.
             bars.mb_kv_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
@@ -1228,8 +1237,8 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
             bars.mb_bmm2_done[bmm2_state.idx].arrive(cta_group=1, pred=elect_p2)
             bars.mb_kv_empty[kv_state.idx].arrive(cta_group=1, pred=elect_p2)
             kv_state = advance(kv_state, STAGES_KV)
-            p_state = advance(p_state, 2)
-            bmm2_state = advance(bmm2_state, 2)
+            p_state = advance(p_state, STAGES_S)
+            bmm2_state = advance(bmm2_state, STAGES_S)
 
         q_state = advance(q_state, STAGES_Q)
 
@@ -1414,7 +1423,7 @@ def _softmax_warp_group(
             # on top.  Skipped when no column's max moved.
             if i > cutlass.Int32(0):
                 bars.mb_bmm2_done[bmm2_state.idx].wait(bmm2_state.phase, spin=SPIN_RING_WAITS)
-                bmm2_state = advance(bmm2_state, 2)
+                bmm2_state = advance(bmm2_state, STAGES_S)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
                 if ~all_one:
                     for blk_o in cutlass.range_constexpr(O_BLOCKS):
@@ -1427,7 +1436,7 @@ def _softmax_warp_group(
             # Publish P^T(t) (and the rescaled O^T) to the MMA warp.
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             bars.mb_p_full[par].arrive()
-            t_state = advance(t_state, 2)
+            t_state = advance(t_state, STAGES_S)
 
         # The last read of this item's list slot (row 4: ONE lane per consuming warp).
         if nvvm.elect_sync():
@@ -1436,15 +1445,15 @@ def _softmax_warp_group(
 
         # --- epilogue: the item's last BMM2 must land before O^T is read (one wait per tile: this is the last tile's).
         bars.mb_bmm2_done[bmm2_state.idx].wait(bmm2_state.phase)
-        bmm2_state = advance(bmm2_state, 2)
+        bmm2_state = advance(bmm2_state, STAGES_S)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
 
         # Column sums over the 128 lanes (once per item), via the epilogue slot.
-        red_epi = cutlass.Int32(2 * SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
+        red_epi = cutlass.Int32(STAGES_S * SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
         for j in cutlass.range_constexpr(COLS):
             (red_ptr + (red_epi + cutlass.Int32(j))).store(_warp_reduce_sum(cutlass.Float32(l_vec[j])))
         nvvm.barrier_cta_sync(barrier_id=_BAR_SOFTMAX, thread_count=BAR_SOFTMAX_THREADS)
-        red_epi_read = cutlass.Int32(2 * SOFTMAX_WARPS * COLS)
+        red_epi_read = cutlass.Int32(STAGES_S * SOFTMAX_WARPS * COLS)
 
         lse_cols = []
         inv_cols = []
@@ -1608,7 +1617,7 @@ def _kernel(
 
     # SMEM in the header table's order: the descriptor-read operands first (1024-B aligned), the register-addressed buffers last.
     sQ_raw = cutlass.Array(STORAGE_DTYPE, STAGES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sP_raw = cutlass.Array(cutlass.Int32, 2 * pBufferWords, alignment=1024, space=cutlass.AddressSpace.smem)
+    sP_raw = cutlass.Array(cutlass.Int32, STAGES_S * pBufferWords, alignment=1024, space=cutlass.AddressSpace.smem)
     sKV_raw = cutlass.Array(STORAGE_DTYPE, STAGES_KV * kvBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sIds_raw = cutlass.Array(cutlass.Int32, STAGES_IDS * IDS_SLOT_WORDS, alignment=16, space=cutlass.AddressSpace.smem)
     red_smem = cutlass.Array(cutlass.Float32, RED_WORDS, alignment=16, space=cutlass.AddressSpace.smem)
@@ -1648,11 +1657,11 @@ def _kernel(
         layout=SMEM_LAYOUT_QK,
         desc_version=DESC_VERSION,
     )
-    # P^T: the MN-major B operand of BMM2, two buffers of TILE_N key rows.
+    # P^T: the MN-major B operand of BMM2, STAGES_S buffers of TILE_N key rows.
     sP = SmemTile(
         base=sP_raw,
         elems_per_stage=pBufferWords,
-        stages=2,
+        stages=STAGES_S,
         leading_byte_offset=0,
         stride_byte_offset=STRIDE_BYTE_OFFSET_P,
         layout=SMEM_LAYOUT_P,
@@ -1683,7 +1692,7 @@ def _kernel(
             for s in cutlass.range_constexpr(STAGES_KV):
                 bars.mb_kv_full[s].init()
                 bars.mb_kv_empty[s].init()
-            for p in cutlass.range_constexpr(2):
+            for p in cutlass.range_constexpr(STAGES_S):
                 bars.mb_s_full[p].init()
                 bars.mb_s_empty[p].init()
                 bars.mb_p_full[p].init()

@@ -1597,7 +1597,12 @@ _SPARSE_AUX_WARPS = 4  # MMA, TMA-LDG, scheduler, spare: one complete warpgroup 
 _SPARSE_TOPK_MIN, _SPARSE_TOPK_MAX = 4, 512
 _SPARSE_IDS_SLOT_PAD_BYTES = 64  # 16 reserved words per staged list (unread in v1; keeps the slot a 16-B multiple at every top_k)
 _SPARSE_SMEM_MISC_BYTES = 512  # tmem_ptr 16 B + 15 mbarrier arrays (29 stages, 16-B padded) 272 B + the 2-slot payload ring 64 B = 352 B (+ the two 1-stage gate arrays, 32 B, on the EPILOGUE_GATE rendering), reserved as 512
-_SPARSE_RED_SLOTS = 3  # the column-max exchange scratch: tile parity 0 / 1 + the epilogue's lane sum
+# The S^T / P^T ring depth: the S^T TMEM slots (S_ACC_OFF), the sP buffers and the s_full / s_empty / p_full / bmm2_done rings are all
+# STAGES_S deep, and the column-max exchange scratch holds one slot per ring parity + the epilogue's lane sum.  The kernel reads the
+# depth ONCE (`STAGES_S = CFG.STAGES_S`) and spells it at every ring site -- never a literal 2 (frost-kernels.md section 6: a depth
+# changed at some sites and not others is a stale S^T slot read from the first reuse, a silent wrong answer).
+_SPARSE_STAGES_S = 2
+_SPARSE_RED_SLOTS = _SPARSE_STAGES_S + 1  # the column-max exchange scratch: one slot per S ring parity + the epilogue's lane sum
 _GATHER4_ROWS = 4  # rows per gather4 issue
 _GATHER4_BOX_BYTES = 128  # one SW128 span per row per issue
 _REG_FILE_PER_CTA = 65536
@@ -1675,6 +1680,7 @@ class CfgD256Sparse:
 
     # --- rings
     STAGES_KV: int = 3  # K(t), V(t), K(t+1) resident: 3 x 64 KiB
+    STAGES_S: int = _SPARSE_STAGES_S  # S^T slots in TMEM (len(S_ACC_OFF)) = sP buffers = the s_full / s_empty / p_full / bmm2_done ring depth
     STAGES_Q: int = 2  # Q^T of item i and i+1 (the gate of item i aliases its freed slot)
     STAGES_IDS: int = 2  # the list of item i and i+1 (the one-item-ahead prefetch)
     STAGES_GATE: int = 1
@@ -1772,7 +1778,7 @@ def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
     starts["sQ"] = off
     off = _align_slab(off + cfg.STAGES_Q * cfg.N_Q * cfg.TILE_K * cfg.BPE)
     starts["sP"] = off
-    off = _align_slab(off + 2 * cfg.TILE_N * cfg.N_Q * cfg.BPE)
+    off = _align_slab(off + cfg.STAGES_S * cfg.TILE_N * cfg.N_Q * cfg.BPE)
     starts["sKV"] = off
     kv_stage = cfg.TILE_N * cfg.TILE_K * cfg.BPE
     starts["sKV_last"] = off + (cfg.STAGES_KV - 1) * kv_stage
@@ -1780,7 +1786,7 @@ def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
     starts["sIds"] = off
     off = _align16(off + cfg.STAGES_IDS * cfg.IDS_SLOT_BYTES)
     starts["red"] = off
-    off = _align16(off + _SPARSE_RED_SLOTS * cfg.SOFTMAX_WARPS * cfg.N_Q * 4)
+    off = _align16(off + (cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.N_Q * 4)
     starts["misc"] = off
     off += _SPARSE_SMEM_MISC_BYTES
     total = off
@@ -1919,6 +1925,12 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 cfg.STAGES_Q == 2 and cfg.STAGES_IDS == 2 and cfg.STAGES_GATE == 1 and cfg.SCHEDULER_STAGES == 2,
                 f"{flavor}: Q / ids rings are 2-deep (the one-item-ahead prefetch), the gate single-slot, the scheduler 2-deep",
             ),
+            (
+                cfg.STAGES_S == len(cfg.S_ACC_OFF) == 2,
+                f"{flavor}: STAGES_S (got {cfg.STAGES_S}) must be the number of S^T TMEM slots (len(S_ACC_OFF) = {len(cfg.S_ACC_OFF)}) = 2: the s_full / "
+                f"s_empty / p_full / bmm2_done rings, the sP buffers and the column-max scratch's parity slots are all that deep -- a depth the TMEM "
+                f"map does not hold is a stale S^T slot read from the first reuse (a silent wrong answer, no crash)",
+            ),
             # SMEM: the byte table with alignment modelled, against the carveout the config claims
             (
                 st["sQ"] % 1024 == 0 and st["sP"] % 1024 == 0 and st["sKV"] % 1024 == 0,
@@ -1932,8 +1944,8 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             ),
             (
                 lay["total"] <= SMEM_USABLE_BYTES,
-                f"{flavor}: SMEM {lay['total']} B (sQ {cfg.STAGES_Q} x {cfg.N_Q * cfg.TILE_K * cfg.BPE} + sP 2 x {cfg.TILE_N * cfg.N_Q * cfg.BPE} + sKV {cfg.STAGES_KV} x "
-                f"{cfg.TILE_N * cfg.TILE_K * cfg.BPE} + sIds {cfg.STAGES_IDS} x {cfg.IDS_SLOT_BYTES} + red {_SPARSE_RED_SLOTS * cfg.SOFTMAX_WARPS * cfg.N_Q * 4} + misc {_SPARSE_SMEM_MISC_BYTES}, "
+                f"{flavor}: SMEM {lay['total']} B (sQ {cfg.STAGES_Q} x {cfg.N_Q * cfg.TILE_K * cfg.BPE} + sP {cfg.STAGES_S} x {cfg.TILE_N * cfg.N_Q * cfg.BPE} + sKV {cfg.STAGES_KV} x "
+                f"{cfg.TILE_N * cfg.TILE_K * cfg.BPE} + sIds {cfg.STAGES_IDS} x {cfg.IDS_SLOT_BYTES} + red {(cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.N_Q * 4} + misc {_SPARSE_SMEM_MISC_BYTES}, "
                 f"1024-B aligned) exceeds the {SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout; overflowing it does NOT fail the launch, it clobbers the last buffer",
             ),
             (
@@ -1947,8 +1959,8 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             ),
             # TMEM
             (
-                cfg.TMEM_COLS == 64 and cfg.TMEM_COLS >= 4 * cfg.N_Q and (cfg.TMEM_COLS & (cfg.TMEM_COLS - 1)) == 0,
-                f"{flavor}: TMEM is 4 x N_Q fp32 columns rounded to a power of two = 64",
+                cfg.TMEM_COLS == 64 and cfg.TMEM_COLS >= (cfg.STAGES_S + len(cfg.O_OFF)) * cfg.N_Q and (cfg.TMEM_COLS & (cfg.TMEM_COLS - 1)) == 0,
+                f"{flavor}: TMEM is (STAGES_S + 2 O^T d-blocks) x N_Q = 4 x N_Q fp32 columns rounded to a power of two = 64",
             ),
             (
                 cfg.S_ACC_OFF == (0, cfg.N_Q) and cfg.O_OFF == (2 * cfg.N_Q, 3 * cfg.N_Q),
@@ -2145,6 +2157,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8) -> Tu
         P_SWZ_BYTES=n_q * b,
         TILE_K_HW=tile_k_hw(params.dtype_qkv),
         STAGES_KV=3,
+        STAGES_S=_SPARSE_STAGES_S,
         STAGES_Q=2,
         STAGES_IDS=2,
         STAGES_GATE=1,
@@ -2182,8 +2195,8 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8) -> Tu
         IDS_TX_BYTES=ids_tx,
         IDS_SLOT_BYTES=ids_tx + _SPARSE_IDS_SLOT_PAD_BYTES,
         TMEM_COLS=64,
-        S_ACC_OFF=(0, n_q),
-        O_OFF=(2 * n_q, 3 * n_q),
+        S_ACC_OFF=tuple(i * n_q for i in range(_SPARSE_STAGES_S)),  # one N_Q-column S^T slot per ring parity
+        O_OFF=tuple((_SPARSE_STAGES_S + i) * n_q for i in range(2)),  # the two O^T d-blocks after them
         ENTRY_REGS=entry,
         SOFTMAX_REGS=softmax_regs,
         GATHER_REGS=gather_regs,

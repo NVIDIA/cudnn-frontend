@@ -73,6 +73,8 @@ def test_sparse_record_pins_the_header_tables():
     assert (cfg.DTYPE_QKV, cfg.DTYPE_O, cfg.BPE, cfg.BPE_O, cfg.GATE_BPE) == (BF16, BF16, 2, 2, 2)
     assert (cfg.Q_SWZ_BYTES, cfg.K_SWZ_BYTES, cfg.V_SWZ_BYTES, cfg.P_SWZ_BYTES, cfg.TILE_K_HW) == (128, 128, 128, 32, 16)
     assert (cfg.STAGES_KV, cfg.STAGES_Q, cfg.STAGES_IDS, cfg.STAGES_GATE, cfg.SCHEDULER_STAGES) == (3, 2, 2, 1, 2)
+    # the S^T / P^T ring depth is ONE derived field: the S^T TMEM slots, the sP buffers, the four per-tile rings (barrier rows 7-10)
+    assert cfg.STAGES_S == len(cfg.S_ACC_OFF) == 2
     # warp map: role-homogeneous warpgroups
     assert (cfg.SOFTMAX_WARPS, cfg.GATHER_WARPS, cfg.AUX_WARPS, cfg.TOTAL_WARPS, cfg.THREADS_PER_CTA) == (4, 8, 4, 16, 512)
     assert (cfg.SOFTMAX_WARP_BASE, cfg.GATHER_WARP_BASE, cfg.MMA_WARP_ID, cfg.TMALDG_WARP_ID, cfg.SCHED_WARP_ID, cfg.SPARE_WARP_ID) == (0, 4, 12, 13, 14, 15)
@@ -383,6 +385,10 @@ _RED_ROWS = [
     ),  # the layout moved to the oversized mode but the record still claims standard
     (dict(STAGES_KV=6, SMEM_TOTAL_BYTES=226688 + 3 * 65536, SMEM_CARVEOUT_BYTES=SMEM_USABLE_BYTES), "exceeds the 320 KiB usable Rubin carveout"),
     (dict(DESC_VERSION=1), "descriptor version must be 0"),
+    (
+        dict(STAGES_S=3),
+        "STAGES_S \\(got 3\\) must be the number of S\\^T TMEM slots",
+    ),  # the TMEM map holds two S^T slots; a deeper ring would read a stale slot
     (dict(TMEM_COLS=128), "4 x N_Q fp32 columns"),
     (dict(O_OFF=(16, 32)), "TMEM map"),
     (dict(ENTRY_REGS=136), "ENTRY_REGS must be the launch"),

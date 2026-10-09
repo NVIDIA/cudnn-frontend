@@ -557,6 +557,14 @@ def test_sparse_kernel_source_pins():
     # no per-item tile-index parity anywhere (the decode tile's arithmetic form)
     assert "_kv_slot(" not in code and "// cutlass.Int32(2)) & cutlass.Int32(1)" not in code
     assert "EXPLICIT_ABI = True" in code
+    # the S^T / P^T ring depth is read ONCE from the config and spelled at every ring site -- never a literal 2 (a depth changed at some
+    # sites and not others is a stale S^T slot read from the first reuse): every advance() names a depth constant, the four per-tile
+    # MBarriers and the sP tile take STAGES_S, and the only other depths are the CFG ring fields
+    assert "STAGES_S = CFG.STAGES_S" in code and "RED_SLOTS = STAGES_S + 1" in code
+    assert re.search(r"advance\(\w+, \d+\)", code) is None, "every PipelineState advance takes a named ring depth, never a literal"
+    assert set(re.findall(r"advance\(\w+, (\w+)\)", code)) == {"STAGES_S", "STAGES_KV", "STAGES_Q", "STAGES_IDS", "SCHEDULER_STAGES"}
+    assert code.count("_alloc(STAGES_S), stages=STAGES_S") == 4 and "_alloc(2)" not in code and "stages=2" not in code
+    assert "range_constexpr(STAGES_S)" in code and "range_constexpr(2)" not in code and "STAGES_S * pBufferWords" in code
 
 
 def test_sparse_kernel_thd_arm_source_pins():
