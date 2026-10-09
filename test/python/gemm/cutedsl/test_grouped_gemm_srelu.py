@@ -974,6 +974,93 @@ def _run_srelu_case(case, **wrapper_kwargs):
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("c_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("vector_f32", [False, True])
+@pytest.mark.parametrize("tanh_clamp_scale", [None, 10.0])
+def test_grouped_gemm_srelu_uses_saved_c_precision(request, c_dtype, vector_f32, tanh_clamp_scale):
+    """Distinct FP32 accumulators in one BF16 bin must produce the same activation.
+
+    FP32 output exposes the activation input cast independently of output quantization.
+    FP32 C is a control: its distinct accumulator values must remain distinct.
+    """
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Grouped SReLU requires SM100")
+    case = _build_srelu_case(request, torch.float8_e4m3fn, c_dtype, torch.float32, 32, torch.float8_e8m0fnu, vector_f32, False)
+    inputs, cfg = case
+    for name in ("a_tensor", "b_tensor", "sfa_tensor", "sfb_tensor"):
+        inputs[name].copy_(torch.ones_like(inputs[name], dtype=torch.float32))
+    inputs["prob_tensor"].fill_(0.5003)
+    outputs = []
+    for h in (1.0 + 1.0 / 1024, 1.0 + 3.0 / 1024):
+        inputs["alpha_tensor"].fill_(h / cfg["k"])
+        result = _run_srelu_case(case, tanh_clamp_scale=tanh_clamp_scale)
+        # Do not allow the test to pass by accidentally generating identical FP32 C.
+        expected_c = torch.full_like(result["c_tensor"], h)
+        torch.testing.assert_close(result["c_tensor"], expected_c, rtol=0, atol=0)
+        saved = result["c_tensor"].float()
+        if tanh_clamp_scale is None:
+            expected = saved.relu().square()
+        else:
+            expected = (tanh_clamp_scale * torch.tanh(saved.relu() / tanh_clamp_scale)).square()
+        expected = expected * inputs["prob_tensor"]
+        torch.testing.assert_close(result["d_tensor"], expected, rtol=2e-5, atol=2e-5)
+        outputs.append(result)
+    if c_dtype == torch.bfloat16:
+        assert torch.equal(outputs[0]["c_tensor"], outputs[1]["c_tensor"])
+        assert torch.equal(outputs[0]["d_tensor"], outputs[1]["d_tensor"])
+    else:
+        assert not torch.equal(outputs[0]["c_tensor"], outputs[1]["c_tensor"])
+        assert not torch.equal(outputs[0]["d_tensor"], outputs[1]["d_tensor"])
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+@pytest.mark.parametrize("vector_f32", [False, True])
+@pytest.mark.parametrize("tanh_clamp_scale", [None, 10.0])
+def test_grouped_gemm_srelu_mxfp8_recompute_matches_forward(request, vector_f32, tanh_clamp_scale):
+    """Compare original and regenerated FC2 input column bytes and MXFP8 scales."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Grouped SReLU requires SM100")
+    from cudnn import grouped_gemm_dsrelu_wrapper_sm100
+    from cuda.bindings import driver as cuda
+
+    case = _build_srelu_case(request, torch.float8_e4m3fn, torch.bfloat16, torch.float8_e4m3fn, 32, torch.float8_e8m0fnu, vector_f32, True)
+    inputs, cfg = case
+    inputs["alpha_tensor"].fill_(0.01)
+    inputs["prob_tensor"].fill_(0.5003)
+    original = _run_srelu_case(case, tanh_clamp_scale=tanh_clamp_scale)
+    recomputed = grouped_gemm_dsrelu_wrapper_sm100(
+        a_tensor=inputs["a_tensor"],
+        b_tensor=inputs["b_tensor"],
+        c_tensor=original["c_tensor"],
+        sfa_tensor=inputs["sfa_tensor"],
+        sfb_tensor=inputs["sfb_tensor"],
+        padded_offsets=inputs["padded_offsets_tensor"],
+        alpha_tensor=inputs["alpha_tensor"],
+        prob_tensor=inputs["prob_tensor"],
+        norm_const_tensor=inputs["norm_const_tensor"],
+        acc_dtype=cfg["acc_dtype"],
+        d_dtype=cfg["d_dtype"],
+        mma_tiler_mn=cfg["mma_tiler_mn"],
+        cluster_shape_mn=cfg["cluster_shape_mn"],
+        sf_vec_size=cfg["sf_vec_size"],
+        vector_f32=vector_f32,
+        m_aligned=cfg["m_aligned"],
+        discrete_col_sfd=True,
+        use_dsrelu_reuse=True,
+        tanh_clamp_scale=tanh_clamp_scale,
+        current_stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    for forward_key, recompute_key in (("d_col_tensor", "d_srelu_tensor"), ("sfd_col_tensor", "sfd_col_d_srelu_tensor")):
+        forward = original[forward_key]
+        backward = recomputed[recompute_key]
+        assert forward is not None and backward is not None
+        assert forward.shape == backward.shape
+        assert torch.equal(forward.contiguous().view(torch.uint8), backward.contiguous().view(torch.uint8)), f"{forward_key} differs from {recompute_key}"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
 @pytest.mark.parametrize("tanh_clamp_scale", GROUPED_GEMM_SRELU_CLAMP_SCALES)
 @pytest.mark.parametrize(
     "ab_dtype,c_dtype,d_dtype,sf_vec_size,sf_dtype,vector_f32,discrete_col_sfd",
