@@ -6161,15 +6161,33 @@ def _fold_within_unfolded(err_fold, err_unfolded, scale, dtype, *, tag):
 
 
 def _half_prefold_api(
-    d_qk, d_v, dtype, *, prefolded, with_stats, split_kv, b, hq, hkv, s_q, s_kv, causal=False, bottom_right=False, window_left=None, sink=False, seed=0
+    d_qk,
+    d_v,
+    dtype,
+    *,
+    prefolded,
+    with_stats,
+    split_kv,
+    b,
+    hq,
+    hkv,
+    s_q,
+    s_kv,
+    causal=False,
+    bottom_right=False,
+    window_left=None,
+    sink=False,
+    seed=0,
+    attn_scale=None,
 ):
-    """The adapter of one leg (folded or unfolded) of a dense problem on the cc 10.7 half twin, plus its tensors."""
+    """The adapter of one leg (folded or unfolded) of a dense problem on the cc 10.7 half twin, plus its tensors.
+    ``attn_scale`` defaults to d_qk ** -0.5; the leading-dead-tile cells pass 1.0 (scale_log2 > 1)."""
     import math
 
     import torch
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
 
-    attn_scale = d_qk**-0.5
+    attn_scale = d_qk**-0.5 if attn_scale is None else attn_scale
     q, k, v = _half_prefold_tensors(b, hq, hkv, s_q, s_kv, d_qk, d_v, dtype, attn_scale * math.log2(math.e) if prefolded else 1.0, seed=seed)
     out = torch.full((b, s_q, hq, d_v), float("nan"), device="cuda", dtype=dtype).transpose(1, 2)  # sentinel: an unclaimed tile stays visible
     lse = torch.full((b, hq, s_q), float("nan"), device="cuda", dtype=torch.float32) if with_stats else None
@@ -6194,7 +6212,7 @@ def _half_prefold_api(
 
 
 def _half_prefold_leg(
-    d_qk, d_v, dtype, *, prefolded, with_stats, split_kv, b, hq, hkv, s_q, s_kv, causal=False, bottom_right=False, window_left=None, sink=False
+    d_qk, d_v, dtype, *, prefolded, with_stats, split_kv, b, hq, hkv, s_q, s_kv, causal=False, bottom_right=False, window_left=None, sink=False, attn_scale=None
 ):
     """Run one leg and hold it to its oracle; returns (O max abs err, max|ref|, out, lse, ref_lse)."""
     import math
@@ -6217,6 +6235,7 @@ def _half_prefold_leg(
         bottom_right=bottom_right,
         window_left=window_left,
         sink=sink,
+        attn_scale=attn_scale,
     )
     assert api.check_support()
     api.compile()
@@ -6255,6 +6274,74 @@ def test_half_prefolded_scale_matches_the_oracle(d_qk, d_v, dtype_name, mask, wi
     err_fold, scale, *_ = _half_prefold_leg(d_qk, d_v, dtype, prefolded=True, **common)
     err_unfolded, *_ = _half_prefold_leg(d_qk, d_v, dtype, prefolded=False, **common)
     _fold_within_unfolded(err_fold, err_unfolded, scale, dtype, tag=f"d{d_qk}x{d_v} {dtype_name} {mask} stats={with_stats} split={split_kv}")
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("prefolded", [False, True], ids=["scaled", "prefolded"])
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("d_qk, d_v", _HALF_PREFOLD_TWINS)
+def test_half_masked_leading_tile_keeps_rows_with_later_keys_finite(d_qk, d_v, dtype_name, prefolded):
+    """A row whose FIRST KV tile is fully masked while a LATER tile holds its keys, on the half d128 / d192x128 twins:
+    top-left causal with a 34-key band (window_size_left 33) at S = 256 -- rows 161..255 have no key in tile 0 (keys 0..127)
+    and their 34 keys in tile 1 -- at attn_scale 1.  The scaled chain took the finite mask sentinel times scale_log2 > 1
+    (= -inf) as the running max and read -inf - (-inf) = NaN into P (NaN O on every such row); the pre-folded chain kept the
+    raw sentinel and published P = 1 per masked column, wiped only by alpha = 0 at the next live tile.  Both chains now select
+    a tile that is dead ahead of the first live key out of the running state (total_max kept, alpha = 1, P = 0): O and LSE
+    finite and at the float64 oracle of the half operands each chain saw (every row has keys, so the oracle is finite)."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 half kernels serve cc10.7 only")
+    dtype = getattr(torch, dtype_name)
+    err, scale, out, lse, ref_lse = _half_prefold_leg(
+        d_qk, d_v, dtype, prefolded=prefolded, with_stats=True, split_kv=1, b=1, hq=8, hkv=2, s_q=256, s_kv=256, causal=True, window_left=33, attn_scale=1.0
+    )
+    assert torch.isfinite(ref_lse).all(), "geometry: every row keeps 34 keys"
+    assert torch.isfinite(lse).all() and torch.isfinite(out).all()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name", ["bfloat16", "float16"])
+@pytest.mark.parametrize("d_qk, d_v", _HALF_PREFOLD_TWINS)
+def test_half_masked_leading_tile_bottom_right_padded_keeps_rows_with_later_keys_finite(d_qk, d_v, dtype_name):
+    """The padded bottom-right twin of the geometry on the half d128 / d192x128 kernels: per-batch lengths Q 65 / KV 193 on
+    a 256 x 256 problem, bottom-right causal (the diagonal 128 keys back) with a 34-key band at attn_scale 1 -- rows 33..64 see
+    KV tile 0 fully masked and their keys in tile 1, rows 0..32 keep keys in tile 0, rows 65..255 are padded (O = 0, LSE =
+    -inf through the dead-row select).  The fp64 reference composes the same padding, diagonal and window."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the cc10.7 half kernels serve cc10.7 only")
+    dtype = getattr(torch, dtype_name)
+    b, hq, hkv, s = 1, 8, 2, 256
+    q, k, v = _half_prefold_tensors(b, hq, hkv, s, s, d_qk, d_v, dtype, 1.0, seed=0)
+    q_lens = torch.tensor([65], dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor([193], dtype=torch.int32, device="cuda")
+    o = torch.empty(b, s, hq, d_v, device="cuda", dtype=dtype).transpose(1, 2)
+    lse = torch.empty(b, hq, s, device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_left=33,
+        scale_softmax=1.0,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+        cga=2,
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._k_mod.__file__.endswith(_half_prefold_twin_file(d_qk)), api._k_mod.__file__
+    out, lse_out = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    ref_o, ref_lse = _handoff_reference(q, k, v, scale=1.0, causal_br=True, window_left=33, q_lens=q_lens, kv_lens=kv_lens)
+    assert torch.isfinite(ref_lse[..., :65]).all() and torch.isneginf(ref_lse[..., 65:]).all(), "geometry: rows 0..64 have keys, the rest are padded"
+    _handoff_check(out, lse_out, ref_o, ref_lse, q_lens, tag=f"d{d_qk}x{d_v} {dtype_name} bottom-right padded leading tile")
 
 
 @pytest.mark.parametrize("sink", [False, True], ids=["nosink", "sink"])
