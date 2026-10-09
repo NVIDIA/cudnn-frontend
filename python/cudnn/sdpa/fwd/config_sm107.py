@@ -368,7 +368,8 @@ SM107_NARROW_TILE_S_KV_MAX = 256
 # S_kv 384): the row read hides in place on the issue-bound body and the 32 packed words it kept live across the wait are freed.
 # The confirm of the applied constant: +2.1 % (d32 S 384, pair resident) and +0.3 / +0.5 / +0.3 % on the three 128-wide streamed-ring
 # renderings (d32 S 1024 one-batch-entry; d64 S 512 / 1024 pair) -- above the replay control floors and the base drift, inside the
-# CUPTI control spread (0.9-1.1 %) of the same processes.  On the 64-wide tile the signs are MIXED: the resident bias + kv_mask
+# CUPTI control spread of the d32 processes (1.12 / 1.12 / 1.08 %) and of the d64 variant process (0.93 %), above the two d64 base
+# processes' (0.14 / 0.02 %): at the edge of resolution.  On the 64-wide tile the signs are MIXED: the resident bias + kv_mask
 # body (the heuristics' pick for a bias with any mask) LOSES 2.5..2.7 % without the pre-load (S 128 / 384; its one 64-column chunk
 # has nothing to overlap the row read with), the resident bias-only forms gain +0.3..+1.4 %, the streamed ring loses 2.6 % without
 # a mask and gains 1.4 % with one (S 768, one cell each) -- so that width keeps one chunk ahead of the wait for its served masked
