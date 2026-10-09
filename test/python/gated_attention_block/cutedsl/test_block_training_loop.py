@@ -570,6 +570,10 @@ def test_update_quant_scales_outlives_pending_work_on_the_compile_stream(family,
     out1, out2 = torch.empty_like(r.out), torch.empty_like(r.out)
     saved1 = _record(r) if not fused else None
     saved2 = _record(r) if not fused else None
+    # the tested block's workspace is allocated BEFORE the park (the same declaration as blk_b up to the scales, so the same size): under
+    # the deterministic arm an allocation behind the park carries its own NaN fill, which no event orders and which could land in the
+    # middle of the first side-stream execute -- a workspace hazard unrelated to the scale ordering this cell pins
+    ws = torch.empty_like(ws_b)
     torch.cuda.synchronize()
     assert torch.cuda.current_stream() == torch.cuda.default_stream()
     prev_det, prev_fill = torch.are_deterministic_algorithms_enabled(), torch.utils.deterministic.fill_uninitialized_memory
@@ -582,7 +586,9 @@ def test_update_quant_scales_outlives_pending_work_on_the_compile_stream(family,
             if not torch.isnan(probe).all():
                 pytest.skip("this torch does not fill torch.empty under deterministic mode; the plain arm covers the race")
         park_the_default_stream(seconds=6.0)  # compile()'s ambient stream: anything it enqueued there lands only after the spin
-        ws = _compile(r.blk)  # under the deterministic arm: its torch.empty allocations carry a NaN fill queued behind the park
+        r.blk.check_support()
+        r.blk.compile()  # under the deterministic arm: its torch.empty scalar allocations carry a NaN fill queued behind the park
+        assert r.blk.get_workspace_size() == ws.numel()
     finally:
         torch.use_deterministic_algorithms(prev_det)
         torch.utils.deterministic.fill_uninitialized_memory = prev_fill
