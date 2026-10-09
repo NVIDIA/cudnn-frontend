@@ -110,8 +110,17 @@ the 72-case random hold-out that found it).
 
 SM107 half uses the shared paged/nonpaged native THD split selectors and the
 measured packed-GQA paged prefill contract. Selected native splits retain
-priority; other eligible graphs retain the backend first. The per-tensor FP8
-Rubin row remains opt-in. Qualification and timing evidence are maintained internally.
+priority. Dense graphs (no THD, paging, window or sink), measured 2026-10-08 on a gr100 board
+(216 SMs) against public cuDNN 9.27.0.42, 620 cases (decode, chunked prefill, squares, d512
+envelope, random hold-out); develop led none of them (mean regret 116%):
+- ``2 <= s_q <= 16``: d192/d256/d512 lead (0.04-0.75; the backend runs these 2-10x slower);
+  d64/d128 lead at one KV unit or <= 8 units with >= 8k KV (0.07-0.63), 64+ units lose 1.1-1.6x.
+- prefill: d512 and its envelope lead (0.08-0.67); chunks of <= 128 Q tiles from a 4k cache lead
+  (d64-d256, 0.04-1.00). Squares and wider chunks are mixed (up to 1.98x) -> TRAIL.
+- ``s_q == 1`` keeps the backend (d64/d128/d256/d512 1.6-25x; d192 mixed).
+New mean regret 3.2%, no lead slower than 1.03x warm or cold. The board's timing is noisy for the
+first arm measured (FROST), which biases these ratios against FROST. The per-tensor FP8
+Rubin row remains opt-in.
 
 SM107 MXFP8 row (``sdpa_fwd_prefill_sm107_mxfp8``, offered by default since 2026-10): LEAD on exact
 cc 10.7 for every graph the row admits -- dense BSHD, exact d128 / d192x128 / d256 / d512, E4M3 / E5M2
@@ -205,6 +214,8 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
+SM107_DECODE_SHAPED_MAX_UNITS = 8  # 2 <= s_q <= 16, d64/d128: b * h_kv above this lost to the backend
+SM107_DECODE_SHAPED_MIN_KV_TOKENS = 8192  # ... and at 8 units a 2k cache is parity (0.91-1.06)
 SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
 
@@ -227,8 +238,8 @@ def place(spec, facts) -> str:
     """``LEAD`` or ``TRAIL`` for the row ``spec`` serving ``facts`` (see the module docstring).
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
-    their measured shard table. The SM107 half row leads for a selected native THD split
-    or qualified packed paged prefill; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it
+    their measured shard table. The SM107 half row leads for a selected native THD split,
+    qualified packed paged prefill, or the measured dense shards; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it
     admits (a qualification verdict, module docstring). Every unmeasured row (SM80, SM100 mxfp8, the
     fp8 rows of SM107 / SM120) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
@@ -258,6 +269,20 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     # Share the qualified prefix envelope with candidate generation.
     if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts)[0] > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
+    if not (facts.thd or facts.has_paged_kv or facts.has_sink) and facts.window_left is None:
+        # Dense, measured on a gr100 board (216 SMs) against cuDNN 9.27 (2026-10-08).
+        flavor = _selected_d_shape(caps, facts)
+        if 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
+            if flavor in ((192, 128), (256, 256), (512, 512)):
+                return LEAD  # 0.04-0.75 of the backend
+            units = facts.b * facts.h_kv
+            if units == 1 or (units <= SM107_DECODE_SHAPED_MAX_UNITS and facts.s_kv >= SM107_DECODE_SHAPED_MIN_KV_TOKENS):
+                return LEAD  # d64/d128: 0.07-0.63; 64+ units lost 1.1-1.6x
+        elif facts.s_q > DECODE_SHAPED_MAX_S_Q:
+            if flavor == (512, 512):
+                return LEAD  # d512 and its d320-d448 envelope: 0.08-0.67
+            if facts.s_q < facts.s_kv and facts.s_kv >= CHUNKED_MIN_KV_TOKENS and _q_tiles(facts) <= CHUNKED_MAX_Q_TILES:
+                return LEAD  # chunked, d64-d256: 0.04-1.00; squares and wider chunks stay mixed (up to 1.98x)
     # The shared paged pipeline also benefits from GQA packing without a
     # split. Large-batch short queries recover unused Q rows without partials.
     # Smaller GPU-only gains do not reliably repay the host submission cost;
