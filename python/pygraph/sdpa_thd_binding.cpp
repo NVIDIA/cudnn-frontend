@@ -272,8 +272,10 @@ class SdpaThdBinder {
             const bool d128_split =
                 cga_tile_m_ == 128 && split_dv == 128 && (split_dq == 128 || (!paged_ && split_dq == 192));
             const bool d256_split = paged_ && cga_tile_m_ == 256 && split_dq == 256 && split_dv == 256;
-            if (has_sink_ || splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX ||
-                off_partial_o_ < 0 || off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 ||
+            // A sink composes with the packed split: the kernel writes sink-free partials and the
+            // packed combine folds the sink logit once per row (sinks_ptr feeds both launches).
+            if (splits_ <= 1 || split_capacity_ <= 0 || split_capacity_ > INT32_MAX || off_partial_o_ < 0 ||
+                off_partial_lse_ < 0 || off_partial_o_ % 16 || off_partial_lse_ % 16 ||
                 !(d64_split || d128_split || d256_split))
                 invalid("invalid prepared packed split geometry");
             const int64_t partial_rows = multiply(multiply(splits_, split_capacity_), qh_);

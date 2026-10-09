@@ -234,7 +234,7 @@ def test_sm107_placement_consumes_qualified_choices(monkeypatch, dtype, chooser,
     [
         None,
         dict(device_cc=(10, 0)),
-        dict(thd=True, padded=True),
+        dict(thd=True, padded=True, s_q=4),  # THD: outside the dense shard, and below the nonpaged THD split's Q band (a sink rides that split since #1517)
         dict(has_paged_kv=True, page_size=16, padded=True),
         dict(attn_scale_prefolded=True),
         dict(has_sink=False),

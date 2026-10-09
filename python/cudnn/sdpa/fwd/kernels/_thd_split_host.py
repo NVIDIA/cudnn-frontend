@@ -52,9 +52,11 @@ def host(
     The caller reserves bounded partial storage once. The native binder supplies
     compact partial-O strides: deriving TMA strides in this nested host fails
     the DSL 4.7.0 lowering. The live prefix total stays on the device and bounds
-    the combine. Partial Stats always use natural logs.
+    the combine. Partial Stats always use natural logs.  With an attention sink
+    the split kernel writes sink-free partials and the combine folds the sink
+    logit once per row (``has_sink`` in ``config``).
     """
-    d_qk, d_v, splits, stats_log2 = config
+    d_qk, d_v, splits, stats_log2, has_sink = config
     b, qh, _kh, tq, _tkv, _ = problem_size
     tokens, heads = cutlass.Int64(tq), cutlass.Int64(qh)
     args = (
@@ -94,6 +96,9 @@ def host(
     final_stats_strides = (
         (cutlass.Int64(0), cutlass.Int64(lse_ext), cutlass.Int64(1)) if cutlass.const_expr(lse_kind == "head") else (cutlass.Int64(0), cutlass.Int64(1), heads)
     )
+    combine_sinks = None
+    if cutlass.const_expr(has_sink):
+        combine_sinks = sinks_ptr
     _host_ptr_packed(
         o_partial_ptr,
         lse_partial_ptr,
@@ -104,6 +109,7 @@ def host(
         (cutlass.Int64(0), o_strides[1], o_strides[2], cutlass.Int64(1)),
         final_stats_strides,
         meta_ptr + cutlass.Int64(2) * cutlass.Int64(b),
+        combine_sinks,
         stats_log2,
         stream,
     )
@@ -149,7 +155,7 @@ def compile_host(kernel_host, cfg, storage_dtype, cache_key, *, has_lse, lse_kin
         i32,
         paged_hnd,
         kernel_host,
-        (cfg.TILE_K, cfg.TILE_O, cfg.SPLIT_KV, bool(cfg.STATS_LOG2)),
+        (cfg.TILE_K, cfg.TILE_O, cfg.SPLIT_KV, bool(cfg.STATS_LOG2), bool(cfg.HAS_SINK)),
         ragged_q_slots,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",

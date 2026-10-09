@@ -166,6 +166,7 @@ def test_packed_combine_live_total_and_runtime_split_boundary(dtype, stats):
                 ostride,
                 lstride,
                 total.data_ptr(),
+                None,  # sink-free: the sink slot is None-specialized off
                 torch.cuda.current_stream().cuda_stream,
             )
 
@@ -199,6 +200,77 @@ def test_packed_combine_live_total_and_runtime_split_boundary(dtype, stats):
                 check(live)
         finally:
             captured.reset()
+
+
+def _sink_reference(o, lse, sink):
+    """The sink-aware log-sum-exp over split partials: one more term with no O payload, so a row
+    whose every split is dead comes out as O := 0 / LSE := sink."""
+    splits = o.shape[0]
+    scores = torch.cat([lse.double(), sink.double().view(1, 1, -1, 1).expand(1, lse.shape[1], -1, lse.shape[3])], 0)
+    maximum = scores.amax(0)
+    weights = (scores - maximum).exp()
+    denominator = weights.sum(0)
+    dead = torch.isneginf(lse).permute(0, 1, 3, 2).unsqueeze(-1)
+    safe_o = o.double().masked_fill(dead, 0)
+    ref_o = (weights[:splits].permute(0, 1, 3, 2).unsqueeze(-1) * safe_o).sum(0) / denominator.permute(0, 2, 1).unsqueeze(-1)
+    return ref_o, maximum + denominator.log()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("stats", ["none", "ln", "log2"])
+@pytest.mark.parametrize("splits", [2, 8, 33], ids=["s2", "s8_warp", "s33_serial"])
+def test_packed_combine_folds_the_sink_once(dtype, stats, splits):
+    """The packed entry's sink fold: the per-head sink logit joins the log-sum-exp exactly once
+    over sink-free partials (both the warp-parallel and the serial split walks).  Row 0, where
+    every split is dead, is the keyless-row contract O := 0 / LSE := sink; a far-end sink
+    (-120, below any partial's reach in fp32) must leave the live rows at their sink-free value
+    and still own the keyless row."""
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    owner = comb.compile_ptr(
+        dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=stats != "none", stats_log2=stats == "log2", packed=True, has_sink=True
+    )
+    fn = positional_entry(owner)
+    assert fn is not None
+    b, h, sq, d = 1, 3, 7, 128
+    ostride, lstride = _strides(b, h, sq, d, "compact")
+    generator = torch.Generator().manual_seed(20261009)
+    for sink in (torch.randn(h, generator=generator) * 2.0, torch.full((h,), -120.0)):
+        op, lp, _, _ = _partials(b, h, sq, d, splits)
+        ref_o, ref_lse = _sink_reference(op.cpu().view(splits, b, sq, h, d), lp.cpu().view(splits, b, h, sq), sink)
+        o, _, _ = _output((b, sq, h, d), ostride, dtype)
+        lse, _, _ = _output((b, h, sq), lstride, torch.float32) if stats != "none" else (None, None, None)
+        total = torch.tensor([sq], device="cuda", dtype=torch.int32)
+        sink_gpu = sink.cuda().contiguous()
+        fn(
+            op.data_ptr(),
+            lp.data_ptr(),
+            o.data_ptr(),
+            lse.data_ptr() if lse is not None else None,
+            (b, h, sq, d),
+            splits,
+            ostride,
+            lstride,
+            total.data_ptr(),
+            sink_gpu.data_ptr(),
+            torch.cuda.current_stream().cuda_stream,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o.cpu().float(), ref_o.float(), atol=0.004, rtol=0.004)
+        assert torch.count_nonzero(o[:, 0]).item() == 0, "a row whose every split is dead holds the sink's mass alone: O := 0"
+        if lse is not None:
+            want = ref_lse * (math.log2(math.e) if stats == "log2" else 1)
+            torch.testing.assert_close(lse.cpu().double(), want, atol=2e-5, rtol=2e-5)
+            torch.testing.assert_close(lse[:, :, 0].cpu(), sink.view(1, h).expand(b, h) * (math.log2(math.e) if stats == "log2" else 1), atol=1e-6, rtol=0)
+
+
+def test_packed_combine_sink_entry_is_packed_only():
+    """The sink fold is wired on the packed THD combine; the dense entries keep their ABI."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    with pytest.raises(ValueError, match="packed"):
+        comb.compile_ptr(dtype_o="bf16", has_lse=True, has_sink=True)
 
 
 @pytest.mark.parametrize("layout", ["compact", "strided", "int64_singleton"])

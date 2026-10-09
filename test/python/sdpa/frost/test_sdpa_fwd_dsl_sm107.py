@@ -778,7 +778,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         facts = _f16_facts(d_qk=d_qk, d_v=d_v, thd=True, padded=True, has_paged_kv=paged, page_size=16 if paged else 0)
         knobs = engines.SdpaFwdKnobs(cga=1, split_kv=2, pack_gqa=False)
         assert engines.mismatch(caps, facts, knobs) is None
-        assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is not None
+        # The packed split folds the sink once per row in its combine (sink-free partials), so a sink rides it.
+        assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None
         bounded = dataclasses.replace(facts, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
         assert engines.mismatch(caps, bounded, knobs) is None
         assert engines.mismatch(caps, dataclasses.replace(bounded, max_total_seq_len_q=None), knobs) is not None
@@ -788,7 +789,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
         assert engines.mismatch(caps, facts, knobs) is None
         assert engines.mismatch(caps, dataclasses.replace(facts, thd=False), knobs) is not None
         # cc 10.7 paged THD + attention sink: the sink composes with the paged THD leg -- unsplit, packed or not,
-        # at every cluster width the leg admits -- while dense paged queries and sink x split-KV keep their declines.
+        # at every cluster width the leg admits, and with the packed split (whose combine folds the sink once per
+        # row) -- while dense paged queries keep their decline.
         sink = dataclasses.replace(facts, has_sink=True)
         gqa_sink = dataclasses.replace(sink, h_q=16, h_kv=2)
         assert engines.mismatch(caps, sink, knobs) is None, d
@@ -797,7 +799,8 @@ def test_sm107_f16_split_coverage_and_pack_gqa_gate():
             for packed in (False, True):  # the two-slab cga1 prefill body (supports_paged_prefill_cga1)
                 assert engines.mismatch(caps, gqa_sink, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=packed)) is None
         assert "THD queries" in engines.mismatch(caps, dataclasses.replace(sink, thd=False), knobs)
-        assert "sink-free" in engines.mismatch(caps, sink, dataclasses.replace(knobs, split_kv=2))
+        split_cga = 2 if d == 256 else 1  # the packed split's cluster width per flavor
+        assert engines.mismatch(caps, sink, engines.SdpaFwdKnobs(cga=split_cga, split_kv=2, pack_gqa=False)) is None, d
 
 
 def test_sm107_dense_d128_shared_legs_admission():
@@ -849,9 +852,10 @@ def test_sm107_paged_d256_pack_gqa_support_contract(dtype_name, group):
     assert engines.mismatch(caps, facts, knobs) is None
     bounded = dataclasses.replace(facts, wants_stats=True, shape_overrides=True, max_total_seq_len_q=facts.b * facts.s_q)
     assert engines.mismatch(caps, bounded, knobs) is None
-    # cc 10.7 paged THD + sink: the sink composes with paged D256 PackGQA (unsplit); sink x split stays declined.
+    # cc 10.7 paged THD + sink: the sink composes with paged D256 PackGQA, unsplit and through the packed split
+    # (whose combine folds the sink once per row); the PackGQA knob itself stays unsplit (the loop below).
     assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), knobs) is None
-    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), dataclasses.replace(knobs, split_kv=2)) is not None
+    assert engines.mismatch(caps, dataclasses.replace(facts, has_sink=True), dataclasses.replace(knobs, split_kv=2, pack_gqa=False)) is None
     for changed in (
         dict(thd=False),
         dict(has_paged_kv=False),

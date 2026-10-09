@@ -258,10 +258,19 @@ def test_packed_split_override_requires_bounded_workspace(capacity, paged, d):
 
 
 @requires_dsl
-@pytest.mark.parametrize("overrides", [{"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 128}, {"has_paged_kv": False, "d_qk": 256, "d_v": 256}, {"has_sink": True}])
+@pytest.mark.parametrize("overrides", [{"device_cc": (10, 7)}, {"d_qk": 64, "d_v": 128}, {"has_paged_kv": False, "d_qk": 256, "d_v": 256}])
 def test_paged_split_public_request_declines_unsupported_geometry(overrides):
     facts = _paged_split_facts(**overrides)
     assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)) is not None
+
+
+@requires_dsl
+def test_paged_split_public_request_admits_a_sink():
+    """The packed split folds the attention sink once per row in its combine (sink-free partials), so a sink is
+    not a decline on this leg; the dense split (cga2 on d128) keeps declining it (no sink fold in that combine)."""
+    facts = _paged_split_facts(has_sink=True)
+    assert mismatch(SPEC.capabilities, facts, heur.SdpaFwdKnobs(cga=1, split_kv=4, pack_gqa=False)) is None
+    assert "sink-free" in mismatch(SPEC.capabilities, replace(facts, thd=False, has_paged_kv=False), heur.SdpaFwdKnobs(cga=2, split_kv=4, pack_gqa=False))
 
 
 @requires_dsl
@@ -308,8 +317,9 @@ def test_nonpaged_d128_split_explicit_contract(device_cc, pack_gqa, monkeypatch)
     knobs = heur.SdpaFwdKnobs(cga=1, split_kv=3, pack_gqa=pack_gqa)
     assert mismatch(spec.capabilities, facts, knobs) is None
     assert mismatch(spec.capabilities, facts, replace(knobs, split_kv=1)) is not None
-    for invalid in (replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True), replace(facts, d_qk=256, d_v=256)):
+    for invalid in (replace(facts, has_epilogue_gate=True), replace(facts, d_qk=256, d_v=256)):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
+    assert mismatch(spec.capabilities, replace(facts, has_sink=True), knobs) is None  # the packed combine folds the sink
     previous = type("PreviousNativeBinder", (), {"supports_nonpaged_packed_split": True, "supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
@@ -412,8 +422,9 @@ def test_paged_d256_split_explicit_contract(monkeypatch, splits, cga):
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=1), replace(knobs, pack_gqa=True)):
         assert mismatch(spec.capabilities, facts, invalid) is not None
-    for invalid in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+    for invalid in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, has_epilogue_gate=True)):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
+    assert mismatch(spec.capabilities, replace(facts, has_sink=True), knobs) is None  # the packed combine folds the sink
     previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(spec.capabilities, facts, knobs)
@@ -433,8 +444,9 @@ def test_paged_d64_split_explicit_contract(monkeypatch, device_cc, splits, packe
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=2), replace(knobs, split_kv=1, pack_gqa=True)):
         assert mismatch(SPEC.capabilities, facts, invalid) is not None
-    for invalid in (replace(facts, has_paged_kv=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+    for invalid in (replace(facts, has_paged_kv=False), replace(facts, has_epilogue_gate=True)):
         assert mismatch(SPEC.capabilities, invalid, knobs) is not None
+    assert mismatch(SPEC.capabilities, replace(facts, has_sink=True), knobs) is None  # the packed combine folds the sink
     previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
     assert "matching native" in mismatch(SPEC.capabilities, facts, knobs)

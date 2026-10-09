@@ -251,6 +251,10 @@ def test_split_kv_rejects_unsupported_combos():
     assert make_cfg_d128(TemplateParams(split_kv=4, sched_policy=SCHED_LPT))[0].SPLIT_KV == 4
     with pytest.raises(ValueError, match="sink"):
         make_cfg_d128(TemplateParams(split_kv=4, has_sink=True))
+    # The packed THD split compiles the epilogue sink fold out and folds the sink once in its combine.
+    assert (
+        make_cfg_d128(TemplateParams(split_kv=4, has_sink=True, thd_varlen=True, seq_kv_lens_present=True, cta_mma=1, single_q_head_dim=128))[0].HAS_SINK == 1
+    )
     with pytest.raises(ValueError, match="dense-only"):
         make_cfg_d128(TemplateParams(split_kv=4, thd_varlen=True, seq_kv_lens_present=True))
 

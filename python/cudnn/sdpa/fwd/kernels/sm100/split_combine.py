@@ -10,6 +10,12 @@ A split whose range came out empty ends with total_sum == 0, which the epilogue
 turns into ``O := 0 / lse := -inf`` — the identity here, so empty splits need no
 special case.
 
+An attention sink is folded HERE, once per row, by the packed entry: the split
+kernels store sink-free partials (their per-split fold is compiled out under a
+split), and the sink logit joins the log-sum-exp as one more term with no O
+payload, so a row whose every split is dead comes out as ``O := 0 / lse := sink``
+(the unsplit kernels' keyless-row contract).
+
 One block per (q_row, head, batch); the block's threads stride over d_v, and
 each thread walks the split axis in registers.
 """
@@ -299,12 +305,18 @@ def _combine_packed_kernel(
     total_q: cute.Tensor,
     n_splits: cutlass.Int32,
     stats_log2: cutlass.Constexpr[bool],
+    # Per-head fp32 sink logits (QH,), or None (None-specialized) for a sink-free
+    # graph.  The sink is one more log-sum-exp term with no O payload: it joins
+    # the row max and the denominator, so the sink-free partials the split
+    # kernels wrote are weighted exactly as the unsplit sink fold would.
+    sinks: Optional[cute.Tensor] = None,
 ) -> None:
     """Four packed rows per CTA; each warp reuses split weights across D.
 
     Packed partials have no per-sequence padding or batch coordinate. The
     device total guards their unwritten tail before any partial is read.
     Final O/Stats retain the caller's strides and partial Stats stay in ln.
+    With ``sinks`` the sink logit is folded once per row (see the module doc).
     """
     thread = cute.arch.thread_idx()[0]
     lane = thread % 32
@@ -318,6 +330,12 @@ def _combine_packed_kernel(
     oo = cutlass.make_array_view(o_out)
     neg_inf = cutlass.Float32(NEG_INF)
     parallel = n_splits <= 32
+    # The sink logit enters the row max and the denominator like a split with no
+    # payload; a -inf sink (or no sink) contributes nothing, through the same
+    # live-select the dead splits take.
+    sink_logit = neg_inf
+    if cutlass.const_expr(sinks is not None):
+        sink_logit = cutlass.Float32(cutlass.make_array_view(sinks)[head])
     m = neg_inf
     m_safe = cutlass.Float32(0.0)
     all_dead = m == neg_inf
@@ -327,7 +345,7 @@ def _combine_packed_kernel(
         lane_lse = neg_inf
         if lane < n_splits:
             lane_lse = cutlass.Float32(lp[lane, head, row])
-        m = lane_lse
+        m = cute.math.max(lane_lse, sink_logit)
         for bit in cutlass.range_constexpr(5):
             m = cute.math.max(m, cute.arch.shuffle_sync_bfly(m, 1 << bit))
         all_dead = m == neg_inf
@@ -339,6 +357,7 @@ def _combine_packed_kernel(
             den = den + cute.arch.shuffle_sync_bfly(den, 1 << bit)
     else:
         # Preserve arbitrary runtime split counts for internal prepared users.
+        m = sink_logit
         for split in cutlass.range(0, n_splits, 1, unroll=1):
             m = cute.math.max(m, cutlass.Float32(lp[split, head, row]))
         all_dead = m == neg_inf
@@ -347,6 +366,9 @@ def _combine_packed_kernel(
             partial_lse = cutlass.Float32(lp[split, head, row])
             if partial_lse > neg_inf:
                 den = den + cute.math.exp(partial_lse - m_safe, fastmath=True)
+    if cutlass.const_expr(sinks is not None):
+        if sink_logit > neg_inf:
+            den = den + cute.math.exp(sink_logit - m_safe, fastmath=True)
     inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
     inv_den = cutlass.Float32(arith.select(all_dead.ir_value(), cutlass.Float32(0.0).ir_value(), inv_den.ir_value()))
     for d_base in cutlass.range(0, o_partial.shape[3], 128, unroll=1):
@@ -473,15 +495,22 @@ def _host_ptr_packed(
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     total_q_ptr: cute.Pointer,
+    sinks_ptr: Optional[cute.Pointer],
     stats_log2: cutlass.Constexpr[bool],
     stream: _cuda_driver.CUstream = None,
 ) -> None:
-    """Combine compact [split, packed token, head, D] partials (B must be 1)."""
+    """Combine compact [split, packed token, head, D] partials (B must be 1).
+
+    ``sinks_ptr`` (QH fp32 sink logits, or None-specialized off) folds the
+    attention sink once per row; the split kernels wrote sink-free partials."""
     o_partial, lse_partial, o_out, lse_out = _ptr_operands(
         o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides
     )
     total_q = cute.make_tensor(total_q_ptr, cute.make_layout((1,), stride=(1,)))
-    _combine_packed_kernel(o_partial, lse_partial, o_out, lse_out, total_q, n_splits, stats_log2).launch(
+    sinks = None
+    if cutlass.const_expr(sinks_ptr is not None):
+        sinks = cute.make_tensor(sinks_ptr, cute.make_layout((problem_size[1],), stride=(1,)))
+    _combine_packed_kernel(o_partial, lse_partial, o_out, lse_out, total_q, n_splits, stats_log2, sinks).launch(
         grid=((problem_size[2] + 3) // 4, problem_size[1], 1), block=[THREADS, 1, 1], stream=stream
     )
 
@@ -591,6 +620,7 @@ def compile_ptr(
     has_scale_o: bool = False,
     has_scale_o_input: bool = True,
     packed: bool = False,
+    has_sink: bool = False,
 ) -> Callable:
     """Compile a shape-generic pointer entry for prepared split execution.
 
@@ -601,8 +631,10 @@ def compile_ptr(
     otherwise) and their elements-per-token divisors. Every stride is Int64,
     including singleton dimensions. Packed partials use a row-per-warp reduction
     and append the device-total-Q pointer; other entries share the existing
-    reduction and launch. The quantized dense entry appends Amax/scale
-    pointers; half and ragged entries keep their existing positional ABI.
+    reduction and launch, followed by the sink pointer (``has_sink``: QH fp32
+    sink logits folded once per row; None-specialized off otherwise). The
+    quantized dense entry appends Amax/scale pointers; half and ragged entries
+    keep their existing positional ABI.
     ``has_scale_o_input=False`` removes the scalar input and Amax unscale
     launch for MXFP8. Per-tensor FP8 retains both by default.
     """
@@ -616,6 +648,8 @@ def compile_ptr(
         raise ValueError("the quantized pointer entry serves dense split launches")
     if packed and (ragged or quantized):
         raise ValueError("packed THD partials require the half pointer entry without ragged final placement")
+    if has_sink and not packed:
+        raise ValueError("the sink fold is wired on the packed THD combine only (dense split x sink stays declined)")
     if ragged_i64 and not ragged:
         raise ValueError("ragged_i64 is a ragged specialization")
     _cache_key = _template_key(globals(), locals(), "compile_ptr")
@@ -635,7 +669,7 @@ def compile_ptr(
         (cutlass.Int64(0),) * 3,
     )
     if packed:
-        entry, extra = _host_ptr_packed, (P(cutlass.Int32),)
+        entry, extra = _host_ptr_packed, (P(cutlass.Int32), P(cutlass.Float32) if has_sink else None)
     elif quantized:
         entry, extra = _host_ptr_quantized, (P(cutlass.Float32) if has_amax else None, P(cutlass.Float32) if has_scale_o_input else None, bool(has_scale_o))
     elif ragged:

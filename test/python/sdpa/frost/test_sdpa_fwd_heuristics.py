@@ -1399,6 +1399,21 @@ def test_sm107_paged_thd_sink_sets_pack_and_order_like_their_sink_free_twins(sm1
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("s_kv", [2052, 8196, 32772], ids=["kv2k", "kv8k", "kv32k"])
+def test_sm107_paged_thd_sink_long_cache_splits_like_its_sink_free_twin(sm107_metadata_target, s_kv):
+    """Issue #1517: one-token paged decode with an attention sink (b1 32/8 d128 bf16 page 16) on cc 10.7 is an
+    underfilled launch whose lever is the packed KV split.  The packed combine folds the sink once per row, so the
+    sink graph takes exactly the sink-free twin's proposal -- a split lead where the twin splits -- instead of the
+    unsplit plan it was pinned to while sink x split was declined."""
+    base = dict(b=1, h_q=32, h_kv=8, s_q=1, s_kv=s_kv)
+    sink = _sm107_f16_plans(_sm107_paged_thd_facts(**base))
+    twin = _sm107_f16_plans(_sm107_paged_thd_facts(has_sink=False, **base))
+    assert sink[0].knobs == twin[0].knobs, (sink[0].knobs, twin[0].knobs)
+    assert (twin[0].knobs.split_kv or 1) > 1, twin[0].knobs
+    assert [p.knobs for p in sink] == [p.knobs for p in twin]
+
+
+@pytest.mark.L0
 def test_sm107_paged_thd_rules_do_not_move_the_sm100_row():
     """The cc 10.7 paged measurements widen nothing on the SM100 line: paged GQA16 stays unpacked-first there, a sink keeps
     the NATURAL lead and the cga2 width (its own measured family, #1468 / PR #1469's domain)."""

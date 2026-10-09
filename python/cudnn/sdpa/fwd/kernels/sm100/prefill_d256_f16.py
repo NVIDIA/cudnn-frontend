@@ -1760,7 +1760,11 @@ def _correction_warp_group(
         inv_sum = cutlass.Float32(0.0)
         q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * TOKENS_PER_TILE) + (tid_in_wg // cutlass.Int32(HEADS_PER_TILE))
         row_head_idx = head_idx * cutlass.Int32(HEADS_PER_TILE) + (tid_in_wg % cutlass.Int32(HEADS_PER_TILE))
-        if cutlass.const_expr(CFG.HAS_SINK):
+        # Under a KV split the sink is NOT folded here: the partials carry the sink-free
+        # (max, sum) pair and sm100/split_combine folds the sink logit exactly once over
+        # the recombined row (a per-split fold would count it SPLIT_KV times); the no-sink
+        # arm's dead-row override (O := 0 / LSE := -inf) is then the combine's identity.
+        if cutlass.const_expr(CFG.HAS_SINK and SPLIT_KV == 1):
             sinks_arr = cutlass.make_array_view(sinks_tensor)
             sink_logit = cutlass.Float32(sinks_arr[row_head_idx])
             # Keyless row (total_sum == 0; the softmax masks with -inf and publishes a

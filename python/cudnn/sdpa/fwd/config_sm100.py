@@ -279,7 +279,10 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
         and not padded_stats
         and (
             (device_cc in ((10, 0), (10, 3)) and paged and d_shape == (64, 64) and max_q > 0)
-            or (d_shape == (128, 128) and max_q > (1 if paged else 0))
+            # Paged D128 at one token per request is the SM100 line's ragged-Q decode leg (dense partials,
+            # the ragged combine); cc 10.7 has no such leg, so its one-token paged decode -- issue #1517's
+            # sink decode among it -- rides the packed split instead.
+            or (d_shape == (128, 128) and max_q > (1 if paged and device_cc != (10, 7) else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
             or (device_cc == (10, 7) and paged and d_shape == (256, 256) and max_q > 0)
         )
@@ -380,10 +383,11 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             )
         ):
             raise ValueError(f"{flavor}: split_kv > 1 is dense-only (THD packs its own flat grid)")
-        if k.has_sink:
-            # The sink logit is folded into the softmax denominator in the
-            # per-tile epilogue, so every split would add its own copy of it.
-            raise ValueError(f"{flavor}: split_kv > 1 with attention sink is not supported (the sink would be counted once per split)")
+        if k.has_sink and not k.thd_varlen:
+            # The dense split's combine entry has no sink fold, and the per-tile
+            # epilogue fold would be counted once per split.  The packed THD split
+            # compiles the epilogue fold out and folds the sink once in its combine.
+            raise ValueError(f"{flavor}: dense split_kv > 1 with attention sink is not supported (the sink is folded by the packed THD split's combine only)")
     lpt_head_groups = (1, 8, 16, 32) if flavor == "d256" else (1, 8, 16)
     if k.lpt_head_group not in lpt_head_groups:
         raise ValueError(f"{flavor}: LPT_HEAD_GROUP must be one of {lpt_head_groups}; got {k.lpt_head_group}")

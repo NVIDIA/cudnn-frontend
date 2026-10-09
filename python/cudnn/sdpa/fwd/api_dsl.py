@@ -1557,8 +1557,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         # Stats (a per-batch padded Stats has no ragged base), int32 offsets
         # whose multiplier divides the row (checked with the ragged tensors
         # in engines.mismatch), per-batch KV lengths (the dense kernel's
-        # SEQ_KV read; the cu form is not plumbed) and no sink (sink + split is
-        # declined everywhere).  Twin of engines._thd_decode_leg; keep in lockstep.
+        # SEQ_KV read; the cu form is not plumbed) and no sink (this leg's dense
+        # combine entry has no sink fold; the packed THD split's does).  Twin of
+        # engines._thd_decode_leg; keep in lockstep.
         self.thd_decode_leg = bool(
             self.thd
             and self.paged
@@ -1661,8 +1662,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             max_q=int(s_qo),
         )
         # An unsplit Rubin paged request uses the prefill template even at
-        # one query token; the split decode leg belongs to the SM100 family.
-        self.thd_decode_leg = self.thd_decode_leg and not paged_prefill_cga1
+        # one query token; the split decode leg belongs to the SM100 family
+        # (engines._thd_decode_leg: sm_hi < 107) -- on cc 10.7 a split one-token
+        # paged request rides the packed THD split below, never the ragged leg.
+        self.thd_decode_leg = self.thd_decode_leg and not paged_prefill_cga1 and self._device_cc != (10, 7)
         split_cga = self.cga if self.cga is not None else (1 if (int(d_qk), int(d_v)) == (64, 64) else 2)
         self.packed_thd_split = bool(
             split_cga == (2 if (int(d_qk), int(d_v)) == (256, 256) else 1)
@@ -1704,7 +1707,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         arch_error = cutedsl_arch_requirement_error(self._device_cc)
         self._not_implemented_error_if(arch_error is not None, arch_error)
         # The ragged-Q decode leg is an sm100/decode_d128_f16.py mode not wired on cc 10.7 (its dense d128 graphs ride that
-        # tile through TILE_CGA_M=1 since issue #1472); the admitted unsplit paged cga1 THD leg uses the two-slab prefill template.
+        # tile through TILE_CGA_M=1 since issue #1472); the admitted unsplit paged cga1 THD leg uses the two-slab prefill
+        # template and the split one-token paged leg rides the packed THD split (thd_decode_leg is cleared on cc 10.7 above,
+        # so this is the backstop).
         self._not_implemented_error_if(
             self.thd_decode_leg and self._device_cc == (10, 7),
             "the d128 decode tile's ragged-Q leg is not wired on cc10.7 (Rubin); THD graphs keep the prefill tile there",
@@ -2016,7 +2021,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd and not (self.thd_decode_leg or self.packed_thd_split),
                 "split_kv > 1 is dense-only, except the decode tile's ragged-Q leg and native D128 or nonpaged D192 packed split",
             )
-            self._value_error_if(self.has_sink, "split_kv > 1 with an attention sink is not supported")
+            # The packed THD split folds the sink once per row in its combine over
+            # sink-free partials; the dense combine entry has no sink fold.
+            self._value_error_if(self.has_sink and not self.packed_thd_split, "split_kv > 1 with an attention sink is served by the packed THD split only")
             # Paged KV is padded by construction; its split composes with the
             # per-batch lengths (validated in test_sdpa_fwd_paged_sm100).
             self._value_error_if(

@@ -3515,8 +3515,9 @@ def test_sdpa_mxfp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
 # paged-validated sink fold: a keyless row stores O := 0 / LSE := sink, sinks are indexed per packed query head, so
 # PackGQA composes.  Before this block the row declined every paged graph with a sink on cc 10.7; the cuDNN 9.26
 # backend serves paged THD + sink at s_q >= 2 and has no engine for a sink at s_q == 1, so paged decode with sinks
-# had no plan at all through the common API.  Every must-serve cell is strict (_must_run); sink x split-KV stays
-# declined on every row; no cell pins a plan-list order or a heuristic winner (placement and tuning: issue #1472).
+# had no plan at all through the common API.  Every must-serve cell is strict (_must_run); sink x split-KV rides the
+# packed THD split (issue #1517: sink-free partials, the sink folded once per row by the packed combine) and stays
+# declined on the dense split; no cell pins a plan-list order or a heuristic winner (placement and tuning: issue #1472).
 
 _P2_KV24 = [4096, 4095, 4000, 3073, 2048, 1025, 1000, 513, 512, 300, 257, 129, 128, 65, 17, 16, 15, 1, 0, 2047, 1536, 777, 255, 33]
 _P2_Q148 = [1] * 8 + [4] * 8 + [8] * 8
@@ -3605,20 +3606,27 @@ def _p2_frost(cfg, request, cudnn_handle, *, cga=None, pin=None):
     anyway) keeps the graph on the python engines as the sibling cc 10.7 sweeps do, so a FROST decline is the
     failure text instead of a backend fallback; _exec_sdpa_on_frost pins the row and the shared paged template;
     _must_run turns a WAIVED skip into a failure.  ``pin`` appends + selects one explicit knob set
-    (ExecConfig.plan_pin); the cell's keyless rows are asserted bit-exact (_p2_exact_keyless_checker).  Returns the
-    served plan's knobs (asserted unsplit, never a winner)."""
+    (ExecConfig.plan_pin); the cell's keyless rows are asserted bit-exact (_p2_exact_keyless_checker).  The kernel
+    template is asserted from the SERVED plan: the paged prefill body, or -- a d128 plan that splits (issue #1517) --
+    the shared decode tile.  Returns the served plan's knobs (a pinned split is asserted honored; never a winner)."""
     engine = _cc107_engine("half")
     cfg.softmax_precision = cudnn.data_type.FLOAT
     if pin is not None:
         cfg.plan_pin = {"engine": engine, "knobs": pin}
+    templates = {_P2_TEMPLATE[cfg.d_qk], "decode_d128_f16"}
+    before = {t: frost_routing.snapshot().get(f"frost:{engine}:{t}", 0) for t in templates}
     with _must_run(request):
-        _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=cga, template=_P2_TEMPLATE[cfg.d_qk], tensor_checker=_p2_exact_keyless_checker(cfg))
+        _exec_sdpa_on_frost(cfg, request, cudnn_handle, engine=engine, cga=cga, tensor_checker=_p2_exact_keyless_checker(cfg))
     if request.config.option.dryrun:
         return None
     served, knobs = frost_routing.LAST_PLAN
     assert served == engine and knobs is not None, frost_routing.LAST_PLAN
-    assert knobs.split_kv in (None, 1), f"sink x split-KV is declined on every row, yet the served plan was {knobs}"
-    print(f"@@@@ P2 plan on {engine}: TILE_CGA_M={knobs.cga} PACK_GQA={knobs.pack_gqa} SCHED_POLICY={knobs.sched_policy}")
+    want = "decode_d128_f16" if cfg.d_qk == 128 and (knobs.split_kv or 1) > 1 else _P2_TEMPLATE[cfg.d_qk]
+    after = {t: frost_routing.snapshot().get(f"frost:{engine}:{t}", 0) for t in templates}
+    assert after[want] == before[want] + 1, f"expected template {want!r} for {knobs}; routing tally: {frost_routing.snapshot()}"
+    if pin is not None and int(pin.get("SPLIT_KV", 1)) > 1:
+        assert knobs.split_kv == int(pin["SPLIT_KV"]), f"the pinned packed split must be the plan served; got {knobs}"
+    print(f"@@@@ P2 plan on {engine}: TILE_CGA_M={knobs.cga} PACK_GQA={knobs.pack_gqa} SCHED_POLICY={knobs.sched_policy} SPLIT_KV={knobs.split_kv}")
     return knobs
 
 
@@ -3646,7 +3654,7 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     head-major (head-major on single-request batches only where the logical rows reach the packed capacity -- the b == 1
     guard below and test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0); HND / NHD pools; dead pool pages
     NaN-poisoned; f16:bf16 1:2.  The sink-free half is the control (served before this change); every case is strict
-    and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph is unsplit."""
+    and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph may split (issue #1517)."""
     _require_p2_env()
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     geom_seed = abs(hash(test_no))
@@ -3694,7 +3702,10 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     with _must_run(request):
         _exec_cc107(test, request, cudnn_handle, "half")
     if cfg.with_sink_token and not request.config.option.dryrun:
-        assert frost_routing.LAST_PLAN[1].split_kv in (None, 1), frost_routing.LAST_PLAN
+        # A sink graph splits only through the packed THD split (issue #1517): d128 on the single-CTA decode
+        # tile, d256 on its two-CTA prefix; any other split would be the dense combine, which has no sink fold.
+        knobs = frost_routing.LAST_PLAN[1]
+        assert (knobs.split_kv or 1) == 1 or knobs.cga == (2 if cfg.d_qk == 256 else 1), frost_routing.LAST_PLAN
 
 
 _P2_PINNED = [
@@ -3811,29 +3822,31 @@ def _p2_planned_graph(cfg, cudnn_handle):
 @_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("d", [128, 256])
-def test_sdpa_paged_thd_sink_split_declines_cc107_L0(env_info, d, request, cudnn_handle):
-    """Sink x split-KV stays declined on the paged THD leg (sm100/split_combine has no sink fold): every plan the row
-    proposes for a paged THD + sink graph is unsplit, and pinning SPLIT_KV=2 on its own proposal through
-    create_execution_plan is a typed decline at build, never a degraded plan.  (TILE_CGA_M=2 is the row's cluster
-    domain under a split; a cga1 pin would decline on the cga domain first and mask the reason under test.)"""
+def test_sdpa_paged_thd_sink_split_serves_cc107_L0(env_info, d, request, cudnn_handle):
+    """Sink x split-KV rides the paged THD leg's packed split (issue #1517): the shared body writes sink-free
+    partials and sm100/split_combine's packed entry folds the sink logit once per row, so pinning SPLIT_KV=2 on the
+    row's own proposal (TILE_CGA_M=1 on d128, the single-CTA packed split; 2 on d256, its two-CTA prefix) through
+    create_execution_plan is a served, strict cell: the 1 / 4 / 8-token requests over 4096 / 2048 / 129 / 16-key
+    caches match the reference and the keyless rows stay bit-exact (_p2_exact_keyless_checker).  The d128 packed
+    split runs the shared decode tile (sdpa_fwd_sm107_d128_single_q), the d256 one the paged prefill body."""
     _require_p2_env()
     cfg = _p2_cfg(dtype=torch.bfloat16, d=d, h_q=32, h_kv=8, b=4, s_q=8, seq_len_q=[1, 4, 8, 8], s_kv=4096, seq_len_kv=[4096, 2048, 129, 16], page=16)
-    cfg.softmax_precision = cudnn.data_type.FLOAT   # python engines only: the plan list is the row's proposals
-    graph, _tensors = _p2_planned_graph(cfg, cudnn_handle)
-    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
-    want = _cc107_engine("half")
-    names = [graph.get_plan_name_at_index(i) for i in range(graph.get_execution_plan_count())]
-    ours = [i for i, name in enumerate(names) if name == want or name.startswith(want + "[")]
-    assert ours, f"the row must propose a plan for paged THD + sink on cc 10.7; plans: {names}"
-    for i in ours:
-        assert SdpaFwdKnobs.from_public(graph.get_engine_and_knobs_at_index(i)[1]).split_kv in (None, 1), names[i]
-    engine_id, knobs = graph.get_engine_and_knobs_at_index(ours[0])
-    graph.create_execution_plan(engine_id, {**knobs, cudnn.knob_type.SPLIT_KV: 2, cudnn.knob_type.TILE_CGA_M: 2})
-    graph.select_plan(graph.get_execution_plan_count() - 1)
-    graph.check_support()   # facts-level: paged THD + sink IS served
-    with pytest.raises((NotImplementedError, cudnn.cudnnGraphNotSupportedError), match="sink-free") as decline:
-        graph.build_plans()   # knob-level: the pinned split is the typed decline
-    print(f"@@@@ P2 split decline: {decline.value}")
+    knobs = _p2_frost(cfg, request, cudnn_handle, pin={"SPLIT_KV": 2, "TILE_CGA_M": 1 if d == 128 else 2, "PACK_GQA": 0})
+    if knobs is not None:
+        assert knobs.split_kv == 2, knobs
+
+
+@_cc107_only
+@pytest.mark.L0
+def test_sdpa_paged_thd_sink_one_token_leads_with_the_split_cc107_L0(env_info, request, cudnn_handle):
+    """Issue #1517's shape (b1 32/8 d128 bf16 page 16, one token, a long cache): the row's FIRST proposal for the
+    sink graph is a packed split (the sink-free twin's lead) on the shared decode tile, served strictly and checked
+    against the reference."""
+    _require_p2_env()
+    cfg = _p2_cfg(dtype=torch.bfloat16, d=128, h_q=32, h_kv=8, b=1, s_q=1, seq_len_q=[1], s_kv=8208, seq_len_kv=[8196], page=16)
+    knobs = _p2_frost(cfg, request, cudnn_handle)
+    if knobs is not None:
+        assert (knobs.split_kv or 1) > 1 and knobs.cga == 1, knobs
 
 
 @_cc107_only

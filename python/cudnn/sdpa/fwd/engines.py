@@ -501,8 +501,9 @@ def _thd_decode_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> b
     clamped descriptors), ragged Stats when Stats are requested (a per-batch
     padded Stats has no ragged base to place rows at), int32 offsets whose
     multiplier divides the row, per-batch ``seq_len_kv`` (the dense kernel's
-    SEQ_KV read; the cu form is not plumbed), no sink (sink + split is declined
-    everywhere) and no fused epilogue gate (unsplittable). Twin of
+    SEQ_KV read; the cu form is not plumbed), no sink (this leg's dense combine
+    entry has no sink fold; the packed THD split's does) and no fused epilogue
+    gate (unsplittable). Twin of
     ``SdpaFwdDslSm100.thd_decode_leg``; keep in lockstep.
     """
     if not (facts.thd and facts.has_paged_kv and facts.s_q == 1):
@@ -556,11 +557,13 @@ def paged_thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts
 
 
 def thd_split_domain(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
-    """Fixed packed-Q bounds whose partial workspace is caller-owned."""
+    """Fixed packed-Q bounds whose partial workspace is caller-owned.
+
+    An attention sink rides this contract: the split kernels write sink-free
+    partials and the packed combine folds the sink logit once per row."""
     return (
         capabilities.sm_lo in (100, 107)
         and (not facts.shape_overrides or (facts.max_total_seq_len_q is not None and 0 < facts.max_total_seq_len_q <= facts.b * facts.s_q))
-        and not facts.has_sink
         and not facts.has_epilogue_gate
         and supports_thd_split(
             (facts.d_qk, facts.d_v),
@@ -857,13 +860,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             # Paged KV is padded by construction and its split composes with
             # the per-batch lengths (the decode lever when B*H_kv leaves the
             # machine underfilled), so it is exempt from the padded exclusion.
+            # An attention sink composes with the PACKED split only: its
+            # combine folds the sink logit once per row over sink-free
+            # partials; the dense combine entry has no sink fold.
             if (
                 (facts.thd and not (ragged_decode or packed_split))
-                or facts.has_sink
+                or (facts.has_sink and not packed_split)
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs without a KV-tail mask, the decode tile's ragged-Q leg, or native D128, nonpaged D192, or SM107 paged D256 packed split"
+                return "split_kv > 1 serves sink-free dense graphs without a KV-tail mask, the decode tile's ragged-Q leg, or native D128, nonpaged D192, or SM107 paged D256 packed split (with or without a sink)"
             if _synth_kv_padding(capabilities, facts):
                 # The adapter would serve this ragged S_kv through the
                 # kernel's KV-tail mask (kv_tail_mask), which the split cannot
@@ -1097,8 +1103,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         # PAGED_KV only changes the K/V TMA-LDG warp (validated together in
         # test_sdpa_fwd_paged_sm100, S_q 1..4, PackGQA on/off, HND/NHD, with a
         # left window, on the d128, d192x128 and d256 flavors). Sink + split-KV
-        # stays declined above (the combine is not sink-aware), so sink decode
-        # runs unsplit. The FP8 kernel's sink fold and its block-scaled O
+        # rides the packed THD split (the packed combine folds the sink once
+        # per row); the dense split entry stays declined above with a sink.
+        # The FP8 kernel's sink fold and its block-scaled O
         # epilogue (sf_o) over pools are not validated, so those two pairs stay
         # declined on the fp8 row.
         # On cc 10.7 the same composition rides the shared d128 / d256 bodies compiled for sm_107a (the Rubin
@@ -1361,15 +1368,17 @@ def _sm107_spec() -> EngineSpec:
       descriptors that keep a NaN capacity tail out of BMM2.
     - ``split_kv_supported``: dense d128 and d192x128 use FP32 partials and
       the shared combine. Bounded D128 THD and nonpaged D192 THD
-      also use the shared single-CTA packed partials. Sink split stays declined.
+      also use the shared single-CTA packed partials, with or without an
+      attention sink (the packed combine folds it once per row); dense split
+      x sink stays declined.
     - ``pack_gqas``: D128 dense GQA graphs (the shared SM100 d128 bodies compiled for cc 10.7: the prefill body at
       cga2, the decode tile at cga1 -- the Rubin sibling carries no PACK_GQA arm; not with the pre-folded scale;
       issue #1472), D128 paged/nonpaged split THD and D256 paged unsplit THD use the shared half pipeline.
     - ``paged_kv``: D128/D256 half THD -- with or without an attention sink (the
       per-row epilogue fold; a keyless row stores O := 0 / LSE := sink) -- uses the
       shared Blackwell paged pipeline, compiled natively for SM107.  Dense (non-THD)
-      paged queries stay declined; sink + split-KV stays declined row-wide (the
-      combine is not sink-aware), so a sink decode graph runs unsplit.
+      paged queries stay declined; a sink decode graph splits through the packed
+      THD split (sink-free partials, the sink folded once in the packed combine).
     - ``softmax_precisions``: FLOAT only -- the half kernels run the f32 exponent
       (the f16x2 arm is a quantized-kernel specialization).
     - ``attn_scale_prefolded_d_shapes``: every half prefill body carries the

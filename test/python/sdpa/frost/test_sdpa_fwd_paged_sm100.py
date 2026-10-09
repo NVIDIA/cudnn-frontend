@@ -1062,11 +1062,12 @@ def test_paged_adapter_cuda_graph_replay_no_host_sync():
 # --- THD (ragged) queries over a paged cache: chunked prefill -----------------
 
 
-def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window=None):
+def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window=None, sink=None):
     """One packed sequence's rows against its own pages: ``q_seq`` [S_q, H, d],
     ``pages`` that sequence's block-table row, ``L`` its live KV length.  Full
     attention over the L keys, or (``causal_window`` = W) top-left causal with a
-    left window -- row r sees keys r - W <= j <= r.  Returns O [S_q, H, D_v] fp32."""
+    left window -- row r sees keys r - W <= j <= r.  ``sink`` [H] fp32 adds one
+    softmax column with V = 0 (a keyless row is then O = 0).  Returns O [S_q, H, D_v] fp32."""
     S_q, H, d = q_seq.shape
     KH = k_pool.shape[1] if hnd else k_pool.shape[2]
     P = k_pool.shape[2] if hnd else k_pool.shape[1]
@@ -1082,19 +1083,25 @@ def _ref_thd_sequence(q_seq, k_pool, v_pool, pages, L, hnd, scale, causal_window
         r = torch.arange(S_q, device=s.device).view(-1, 1)
         j = torch.arange(L, device=s.device).view(1, -1)
         s = s.masked_fill((j > r) | (j < r - causal_window), float("-inf"))
-    return torch.einsum("hql,lhd->qhd", torch.softmax(s, -1), v)
+    if sink is not None:
+        s = torch.cat([s, sink.float().view(H, 1, 1).expand(H, S_q, 1)], dim=-1)
+    return torch.einsum("hql,lhd->qhd", torch.softmax(s, -1)[..., :L], v)
 
 
-def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None, pack_gqa=None):
+def _run_thd_graph(
+    dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20, causal_window=None, pack_gqa=None, sink=False, split_kv=None, dtype=torch.float16
+):
     """Ragged Q/O (packed [T, H, D] storage + ragged offsets, per-sequence
     ``seq_len_q``) attending K/V page pools through block tables, optionally under
-    top-left causal + a left window of ``causal_window`` keys.  Checks every packed
-    row against the fp32 reference; returns the pinned plan."""
+    top-left causal + a left window of ``causal_window`` keys.  ``sink`` binds one
+    randn logit per head; ``split_kv`` pins the packed THD split (appending the knob
+    set to the row's own proposal when the heuristics did not list it).  Checks every
+    packed row against the fp32 reference; returns the pinned plan."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import engine_name
 
-    dev, dtype = "cuda", torch.float16
+    dev = "cuda"
     d, d_v = dims
     B, T, S_max = len(q_lens), sum(q_lens), max(q_lens)
     cu = [0]
@@ -1116,8 +1123,9 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     ro = (torch.tensor(cu, dtype=torch.int64, device=dev) * H * d).view(B + 1, 1, 1, 1)
     o_ro = (torch.tensor(cu, dtype=torch.int64, device=dev) * H * d_v).view(B + 1, 1, 1, 1)
 
-    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    tq = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=cudnn.data_type.HALF, name="q")
+    io = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tq = g.tensor(dim=[B, H, S_max, d], stride=list(stride), data_type=io, name="q")
     k, v = g.tensor_like(k_c), g.tensor_like(v_c)
     tk, tv = g.tensor_like(bt), g.tensor_like(bt)
     sq_t, sk_t = g.tensor_like(slq), g.tensor_like(slk)
@@ -1125,6 +1133,9 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     tq.set_ragged_offset(qro)
     # cuDNN's sliding_window_length counts the diagonal: offset W == length W + 1.
     band = {} if causal_window is None else dict(use_causal_mask=True, sliding_window_length=causal_window + 1)
+    sink_gpu = torch.randn(1, H, 1, 1, device=dev, dtype=torch.float32) if sink else None
+    if sink_gpu is not None:
+        band["sink_token"] = g.tensor_like(sink_gpu)
     o, _ = g.sdpa(
         name="sdpa",
         q=tq,
@@ -1146,22 +1157,82 @@ def _run_thd_graph(dims, hnd, *, q_lens, kv_lens, H=8, KH=2, P=16, max_pages=20,
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     plan = select_engine(g, engine_name(), pack_gqa=pack_gqa)
+    if split_kv is not None and plan.knobs.split_kv != split_kv:
+        names = [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
+        idx = next(
+            (
+                i
+                for i, n in enumerate(names)
+                if n.startswith(engine_name()) and g.plans[i].knobs.split_kv == split_kv and (pack_gqa is None or g.plans[i].knobs.pack_gqa == pack_gqa)
+            ),
+            None,
+        )
+        if idx is None:
+            # The packed split is the row's cga1 (d128) contract; append the knob set to the pinned proposal.
+            engine_id, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+            g.create_execution_plan(engine_id, {**knobs, cudnn.knob_type.SPLIT_KV: split_kv, cudnn.knob_type.TILE_CGA_M: 1})
+            idx = g.get_execution_plan_count() - 1
+        g.select_plan(idx)
+        plan = g.plans[idx]
+        assert plan.knobs.split_kv == split_kv, plan.knobs
     g.check_support()
     g.build_plans()
     ws = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
+    vp = {tq: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk, qro: ro, oro: o_ro, o: o_gpu}
+    if sink_gpu is not None:
+        vp[band["sink_token"]] = sink_gpu
     torch.cuda.set_sync_debug_mode("error")
     try:
-        g.execute({tq: q_gpu, k: k_c, v: v_c, tk: bt, tv: bt, sq_t: slq, sk_t: slk, qro: ro, oro: o_ro, o: o_gpu}, ws)
+        g.execute(vp, ws)
     finally:
         torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize()
 
     o_out = o_stor[: T * H * d_v].reshape(T, H, d_v).float()
     assert not torch.isnan(o_out).any(), "NaN in O"
+    sink_ref = sink_gpu.flatten() if sink_gpu is not None else None
     for b in range(B):
-        ref_o = _ref_thd_sequence(q_pk[cu[b] : cu[b + 1]], k_pool, v_pool, bt.view(B, max_pages)[b], kv_lens[b], hnd, scale, causal_window)
-        torch.testing.assert_close(o_out[cu[b] : cu[b + 1]], ref_o, atol=2e-2, rtol=0)
+        ref_o = _ref_thd_sequence(q_pk[cu[b] : cu[b + 1]], k_pool, v_pool, bt.view(B, max_pages)[b], kv_lens[b], hnd, scale, causal_window, sink=sink_ref)
+        torch.testing.assert_close(o_out[cu[b] : cu[b + 1]], ref_o, atol=2e-2 if dtype == torch.float16 else 5e-2, rtol=0)
+        if sink_ref is not None and kv_lens[b] == 0:
+            assert o_out[cu[b] : cu[b + 1]].abs().max().item() == 0.0, "a keyless row holds the sink's mass alone: O := 0"
     return plan
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("hnd", [False, True], ids=["NHD", "HND"])
+@pytest.mark.parametrize("pack_gqa", [False, True], ids=["unpacked", "packed"])
+@pytest.mark.parametrize("splits", [2, 4])
+def test_paged_graph_thd_sink_split_kv(hnd, pack_gqa, splits):
+    """Paged THD decode / verify with an attention sink THROUGH the packed KV split (issue #1517): the shared d128
+    decode tile writes sink-free partials and the packed combine folds the sink logit once per row.  bf16, GQA 32/8
+    (the issue's heads), page 16, 1 / 4 / 8-token requests over 300 / 77 / 0 / 1000-key caches: the empty cache's rows
+    are keyless (O := 0), every other row's O matches the sink-aware fp32 reference; packed and unpacked rows alike."""
+    plan = _run_thd_graph(
+        (128, 128),
+        hnd,
+        H=32,
+        KH=8,
+        max_pages=70,
+        q_lens=[1, 4, 8, 1],
+        kv_lens=[300, 77, 0, 1000],
+        pack_gqa=pack_gqa,
+        sink=True,
+        split_kv=splits,
+        dtype=torch.bfloat16,
+    )
+    assert plan.knobs.split_kv == splits and plan.knobs.cga == 1, plan.knobs
+
+
+@pytest.mark.L0
+def test_paged_graph_thd_sink_split_kv_long_cache():
+    """The issue #1517 shape on the shared body (b1 32/8 d128 bf16 page 16, a 32K cache) through a 16-way packed
+    split with the sink: 16 sink-free partials of one packed request recombined under the sink fold.  Two tokens
+    rather than one: the SM100 line's one-token paged leg is the ragged-Q decode tile (dense partials, a combine
+    entry without the sink fold), and the packed split starts at two tokens there; cc 10.7 admits one token and
+    leads with the split (test_sdpa_fwd_heuristics)."""
+    plan = _run_thd_graph((128, 128), True, H=32, KH=8, P=16, max_pages=2050, q_lens=[2], kv_lens=[32772], sink=True, split_kv=16, dtype=torch.bfloat16)
+    assert plan.knobs.split_kv == 16 and plan.knobs.cga == 1, plan.knobs
 
 
 @pytest.mark.L0

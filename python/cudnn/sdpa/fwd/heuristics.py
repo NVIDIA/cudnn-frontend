@@ -1466,8 +1466,9 @@ def _split_points(
     ``unsplit_knobs`` lets the no-split candidate carry a different complete
     geometry; D192 requires this because split-KV is CGA2-only while its tuned
     unsplit assignment may use CGA1. The generator respects structural limits
-    (dense-only, no sink — mismatch() enforces the same, so an emitted >1
-    never reaches a kernel that cannot honor it).
+    (dense-only, no sink -- the packed THD split proposes its own split through
+    the THD choosers; mismatch() enforces the same, so an emitted >1 never
+    reaches a kernel that cannot honor it).
 
     A split the model asks for LEADS, with no-split behind it as the runner-up
     — so a plain ``build_plans()`` runs the split, and autotune / select_plan
@@ -1687,7 +1688,7 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     """
     if (facts.d_qk, facts.d_v) == (256, 256):
         return _paged_d256_thd_split_choice(caps, facts), False
-    if not (
+    family = (
         paged_thd_split_domain(caps, facts)
         and (facts.d_qk, facts.d_v) == (128, 128)
         and getattr(cudnn._pybind_module._SdpaThdBinder, "supports_paged_packed_split", False)
@@ -1698,14 +1699,27 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
         and facts.h_q % facts.h_kv == 0
         and facts.h_q // facts.h_kv in ((1, 2, 4, 8, 16) if caps.sm_lo == 100 else (1, 2, 4, 8))
         and facts.page_size == 16
-        and facts.causal
-        and facts.bottom_right
         and facts.window_left is None
+    )
+    # The measured chunked-prefill band (bottom-right causal, Q 64..1024 over HND pools).
+    prefill_band = (
+        facts.causal
+        and facts.bottom_right
         and 64 <= facts.s_q <= 1024
         and 2048 <= facts.s_kv <= 32768
         and facts.k_t is not None
         and facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]
-    ):
+    )
+    # The cc 10.7 decode / verify arm (issue #1517): a few packed requests of up to 63 tokens
+    # over a 2K+ cache leave the device at least three-quarters idle even packed, so the
+    # KV loop -- not the Q grid -- is the only lever.  Admitted by the same first-wave budget
+    # below (a filled launch returns 1 from it); the SM100 line keeps its own decode legs.
+    decode_band = False
+    if caps.sm_lo == 107 and 1 <= facts.s_q < 64 and facts.s_kv >= 2048 and (not facts.causal or facts.bottom_right):
+        group = facts.h_q // facts.h_kv
+        packed_units = facts.b * _ceil_div(facts.s_q, 128 // group) * facts.h_kv
+        decode_band = packed_units * 4 <= (facts.device_sm_count or 128)
+    if not (family and (prefill_band or decode_band)):
         return 1, False
     if caps.sm_lo == 100:
         # Packed tiles can remove a partial-wave tail. Preserve first-wave
