@@ -863,7 +863,17 @@ SM107_ONE_BATCH_ENTRY_STREAMING_D_FLAVORS = frozenset({32})
 
 
 def sm107_bias_mode_pick(
-    d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: int = _DTYPE_BF16, tile_n: int = 128, pair: bool = False, request=None, tiles_q: int = 2
+    d_flavor: int,
+    cta_mma: int,
+    s_kv: int,
+    *,
+    dtype_qkv: int = _DTYPE_BF16,
+    tile_n: int = 128,
+    pair: bool = False,
+    request=None,
+    tiles_q: int = 2,
+    global_lengths: bool = False,
+    natural: bool = False,
 ) -> int:
     """The ``TemplateParams.bias_mode`` a BIAS plan gets at this width: ``BIAS_MODE_RESIDENT`` when the resident block holds
     ``s_kv`` (:func:`sm107_bias_resident_s_kv_max`) -- except the one-batch-entry item at a width in
@@ -871,7 +881,10 @@ def sm107_bias_mode_pick(
     pick above) -- else ``BIAS_MODE_STREAMED`` when a ring of >= 2 stages fits (:func:`sm107_bias_ring_stages`), else **0 = no form at
     this width** (a typed decline).  ``request`` (the adapter's ``bias_mode=`` or the test seam) pins the form and returns 0 when THAT
     form does not fit here -- honoured or declined, never degraded.  ONE arithmetic for the engine row, the heuristics' width pick and
-    the adapter (rule 8b')."""
+    the adapter (rule 8b').  The PAIR item's ring takes its cluster-MULTICAST form (``BIAS_MODE_STREAMED_MULTICAST``) at a width in
+    :data:`SM107_PAIR_RING_MULTICAST_D_FLAVORS` when the caller vouches for the two facts the form needs -- ``global_lengths`` (no
+    per-batch KV / Q lengths) and ``natural`` (the NATURAL scheduler pairs the cluster's chunks) -- both False by default, so a
+    caller that cannot vouch gets the cga1 ring as before (the adapter and the engine row pass them)."""
     want = request if request is not None else _BIAS_MODE_OVERRIDE_FOR_SWEEPS
     resident_ok = s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair, tiles_q=tiles_q)
     ring_ok = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair) > 0
@@ -890,8 +903,22 @@ def sm107_bias_mode_pick(
         return BIAS_MODE_STREAMED  # measured at 2 and 3 kv tiles; one tile keeps the block (nothing to overlap)
     if resident_ok:
         return BIAS_MODE_RESIDENT
+    if ring_ok and pair and int(cta_mma) == 1 and int(d_flavor) in SM107_PAIR_RING_MULTICAST_D_FLAVORS and global_lengths and natural:
+        return BIAS_MODE_STREAMED_MULTICAST  # the pair ring's MEASURED default (the record above SM107_PAIR_RING_MULTICAST_D_FLAVORS)
     return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
 
+
+# The PAIR item's streamed ring runs in its cluster-MULTICAST form (bias_mode 3: two chunk-adjacent CTAs of a (1, 1, 2) cluster share
+# one bias tile sequence through one .multicast::cluster TMA load) by default at the 32-wide tile, where the pair's resident block
+# does not hold S_kv -- MEASURED on the 212-SM Rubin perf-node class (lock 2376 per job, 100 x 3 graph replay, the control pair in
+# the same process, the fp64 oracle on every timed cell): on the cells the heuristics serve with the pair's cga1 ring (S_q % 256 != 0,
+# S_kv above the block's budget) the multicast ring is +3.38 % over the knob-less pick at D 32 S 896 (B 1; +3.16 / +3.29 % over the
+# n4 / n8 ring, +5.36 % over the 2-stage ring) and the same arm-vs-arm delta holds on the pair ring at S 640 / 768 / 1024, B 1 and
+# B 2 (+3.09 / +2.05 / +3.07 / +2.31 / +2.79 % at n4; +0.71 % at S 512 B 2, NEUTRAL at S 512 B 1).  NOT the 64-wide tile: -6.3 /
+# -10.1 % at S 1024 / 512 (its wider bias row feeds two CTAs no better than one) -- the frozenset holds the measured flavor only.
+# Where the pair's RESIDENT block holds S_kv the block stays (the multicast ring loses to it: -4.70 % at S 384, -1.87 % at S 640);
+# the one-batch-entry item (S_q % 256 == 0) keeps its own ring, 5..9 % ahead of every pair form at S 512 / 768 / 1024.
+SM107_PAIR_RING_MULTICAST_D_FLAVORS = frozenset({32})
 
 # The one-batch-entry item's streamed ring runs 2 stages, not the deepest that fits: its 64 KiB stage x 3 buys a lookahead the
 # 2-sub-tile item never uses -- MEASURED +3.6 / +2.0 / +1.5 % at d32 S 512 / 768 / 1024 (B = 1), +3.2 / +2.1 / +1.6 % at B = 4,

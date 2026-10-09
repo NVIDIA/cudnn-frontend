@@ -205,7 +205,12 @@ def test_config_factory_derives_the_pair_block_and_raises_on_each_coupling():
         (dict(s_q=512, s_kv=512, bias="h", n_chunk=8), True, 8, 1),
         (dict(s_q=512, s_kv=512, bias="h", n_chunk=0), True, 0, 2),  # the one-batch-entry item above ITS budget: the streamed ring
         (dict(s_q=768, s_kv=768, bias="h"), True, 0, 2),  # S_q % 256 == 0: the one-batch-entry ring (+8.6 % over the pair's resident block)
-        (dict(s_q=896, s_kv=896, bias="h"), True, "rule", 2),  # over the 6-tile budget: the pair's streamed ring
+        (
+            dict(s_q=896, s_kv=896, bias="h"),
+            True,
+            "rule",
+            3,
+        ),  # over the 6-tile budget: the pair's streamed ring in its cluster-multicast form (the measured default at D 32)
         (dict(s_q=512, s_kv=512, bias="b"), True, 0, 2),  # a per-batch bias: the one-batch-entry item's streamed ring
         (dict(s_q=256, s_kv=256, bias="b", n_chunk=4), False, None, None),
         (dict(s_q=256, s_kv=256, bias="h", b=1, n_chunk=4), False, None, None),

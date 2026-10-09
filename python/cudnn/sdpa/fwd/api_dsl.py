@@ -1633,7 +1633,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
     def _resident_arm_bias_mode(self) -> int:
         """The ``TemplateParams.bias_mode`` of this plan: 0 without a bias; else the request (``bias_mode=``, validated by
         ``check_support``) or the pick at the plan's width and item form (``config_sm107.sm107_bias_mode_pick``: the resident block
-        where it holds S_kv, else the streamed ring; 0 = no form fits -- ``check_support`` declines that typed)."""
+        where it holds S_kv, else the streamed ring -- the pair item's in its cluster-multicast form at the measured widths under
+        global lengths and the NATURAL scheduler; 0 = no form fits -- ``check_support`` declines that typed)."""
         if self.bias_desc is None:
             return _BIAS_MODE_NONE
         _cga = self._resident_arm_cga()
@@ -1644,6 +1645,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             pair=self._resident_arm_pair_eligible() and _cga == 1,
             request=self.bias_mode,
             tiles_q=self._resident_arm_softmax_wgs(),
+            # the two facts the pair ring's cluster-multicast default needs (config_sm107.SM107_PAIR_RING_MULTICAST_D_FLAVORS): no
+            # per-batch lengths, and the NATURAL scheduler (a None policy derives to NATURAL on this device, template_params below)
+            global_lengths=not (self.seq_kv_lens_present or self.seq_q_lens_present),
+            natural=self.sched_policy is None or self.sched_policy == SCHED_NATURAL,
         )
 
     def _s_slots(self) -> int:

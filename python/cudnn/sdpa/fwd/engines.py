@@ -934,9 +934,17 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         )
         for cga in widths
     }
-    modes = {cga: sm107_bias_mode_pick(selected[0], cga, facts.s_kv, pair=_pair[cga], tiles_q=_wgs[cga]) for cga in widths}
+    # the pair ring's cluster-multicast default needs global lengths and the NATURAL scheduler (the pick's two facts; a knob-less graph
+    # derives NATURAL on this device) -- with either fact absent the pick is the cga1 ring, exactly the adapter's arithmetic
+    _natural = knobs is None or knobs.sched_policy is None or knobs.sched_policy == SCHED_NATURAL
+    modes = {
+        cga: sm107_bias_mode_pick(
+            selected[0], cga, facts.s_kv, pair=_pair[cga], tiles_q=_wgs[cga], global_lengths=not (facts.padded or facts.seq_q_trim), natural=_natural
+        )
+        for cga in widths
+    }
     if any(mode == BIAS_MODE_STREAMED_MULTICAST for mode in modes.values()):
-        # The multicast bias ring (bias_mode 3, a request-only form: the pick returns it through the test seam / the adapter's request):
+        # The multicast bias ring (bias_mode 3: the pair ring's measured default at D 32, or the test seam's / the adapter's request):
         # ONE kv-tile sequence streamed to both CTAs of a cluster, so the two chunks' step bounds must be the same function of (q tile,
         # S_q, S_kv) -- per-batch lengths break that lockstep; the chunk pairing rides the NATURAL payload (the config validator pins both).
         if facts.padded or facts.seq_q_trim:

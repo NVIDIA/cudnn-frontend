@@ -195,10 +195,10 @@ def test_cfg_is_appended_and_the_kernel_carries_the_multicast_ring_as_one_const_
     from cudnn.sdpa.fwd import config_sm107 as c
 
     fields = [f.name for f in dataclasses.fields(c._CfgSm107)]
-    # the tail of the appended fields: STAGES_BIAS (the ring depth), BIAS_MAX_FORM (the row-max form, appended by the base this arm was
-    # rebased onto), then this arm's BIAS_MCAST_CTAS -- each a later append, never an insertion
+    # the tail of the appended fields: STAGES_BIAS (the ring depth), BIAS_MAX_FORM (the row-max form) and S_SLOTS (the double-buffered S),
+    # both appended by the base this arm was rebased onto, then this arm's BIAS_MCAST_CTAS -- each a later append, never an insertion
     assert (
-        fields[-3:] == ["STAGES_BIAS", "BIAS_MAX_FORM", "BIAS_MCAST_CTAS"] and c._CfgSm107.BIAS_MCAST_CTAS == 1
+        fields[-4:] == ["STAGES_BIAS", "BIAS_MAX_FORM", "S_SLOTS", "BIAS_MCAST_CTAS"] and c._CfgSm107.BIAS_MCAST_CTAS == 1
     ), "append-only; 1 renders every existing record byte-identically"
     src = _KERNEL.read_text()
     assert "_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES" in src and "_BIAS_MCAST = CFG.BIAS_MODE == BIAS_MODE_STREAMED_MULTICAST" in src
@@ -276,7 +276,9 @@ _ADAPTER_CELLS = [
     (dict(s_q=896, s_kv=896, bias="h", bias_mode=3), True, (3, 3, 1, True)),
     (dict(s_q=384, s_kv=384, bias="h", bias_mode=3), True, (3, 3, 1, True)),
     (dict(d=64, s_q=1024, s_kv=1024, bias="h", bias_mode=3), True, (3, 3, 1, True)),
-    (dict(s_q=896, s_kv=896, bias="h"), True, (2, 3, 1, True)),  # knob-less: the pair's cga1 ring (the pick never returns the multicast form)
+    (dict(s_q=896, s_kv=896, bias="h"), True, (3, 3, 1, True)),  # knob-less: the multicast ring, the pair ring's MEASURED default at D 32
+    (dict(s_q=896, s_kv=896, bias="h", seq_kv_lens_present=True), True, (2, 3, 1, True)),  # knob-less + per-batch lengths: the cga1 ring
+    (dict(d=64, s_q=1024, s_kv=1024, bias="h"), True, (2, 3, 1, True)),  # knob-less at D 64: the cga1 ring (the multicast ring loses there)
     (dict(s_q=1024, s_kv=1024, bias="h", bias_mode=3), False, None),  # S_q % 256 == 0 knob-less = the one-batch-entry item: no pair, so no form 3
     (dict(s_q=1024, s_kv=1024, bias="b", bias_mode=3, n_chunk=4), False, None),  # a per-batch bias: no pair item
     (dict(s_q=1024, s_kv=1024, bias="h", b=1, bias_mode=3), False, None),  # one flattened row: no pair item
@@ -296,7 +298,9 @@ _ADAPTER_CELLS = [
         "d32_S896_mcast",
         "d32_S384_mcast_where_the_block_fits",
         "d64_S1024_mcast",
-        "d32_S896_knobless_is_the_cga1_ring",
+        "d32_S896_knobless_is_the_multicast_ring",
+        "d32_S896_knobless_per_batch_lengths_is_the_cga1_ring",
+        "d64_S1024_knobless_is_the_cga1_ring",
         "d32_S1024_knobless_one_batch_entry_declines",
         "per_batch_bias_declines",
         "one_row_declines",
@@ -322,6 +326,35 @@ def test_adapter_check_support_is_the_rows_twin(_s13_rubin, kw, accept, want):
     api.check_support()
     params = api.template_params()
     assert (params.bias_mode, params.bias_stages, params.cta_mma, params.n_chunk >= 2) == want, params
+
+
+def test_the_multicast_ring_is_the_pair_rings_measured_default_at_d32():
+    """The pick (ONE arithmetic for the row, the heuristics and the adapter) returns the multicast ring where the PAIR item would run its
+    cga1 ring at D 32 -- the pair's resident block does not hold S_kv -- and the caller vouches for GLOBAL lengths and the NATURAL
+    scheduler (the two facts the cluster's shared kv-tile sequence needs); every other input keeps its pick: the block where it fits, the
+    cga1 ring at D 64, under per-batch lengths, under any other scheduler, on the one-batch-entry item, and for every caller that passes
+    neither fact (the default).  MEASURED on the 212-SM Rubin perf-node class (lock 2376 per job, 100 x 3 graph replay, control pair in
+    process): +3.38 % over the knob-less pick at D 32 S 896 B 1 (the pair's n8 ring), +3.16 / +3.29 % over the n4 / n8 ring; the same
+    arm-vs-arm delta on the pair ring at S 640 / 768 / 1024 (+2.0..+3.1 %, B 1 and B 2); -6.3..-10.1 % at D 64; -4.7 / -1.9 % against the
+    resident block at S 384 / 640."""
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    assert c.SM107_PAIR_RING_MULTICAST_D_FLAVORS == frozenset({32})
+    both = dict(global_lengths=True, natural=True)
+    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True, **both) == c.BIAS_MODE_STREAMED_MULTICAST
+    assert c.sm107_bias_mode_pick(32, 1, 1152, pair=True, **both) == c.BIAS_MODE_STREAMED_MULTICAST
+    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True) == c.BIAS_MODE_STREAMED, "a caller that vouches for neither fact keeps the cga1 ring"
+    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True, global_lengths=True) == c.BIAS_MODE_STREAMED, "the NATURAL scheduler is required"
+    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True, natural=True) == c.BIAS_MODE_STREAMED, "global lengths are required"
+    assert c.sm107_bias_mode_pick(32, 1, 768, pair=True, **both) == c.BIAS_MODE_RESIDENT, "the block where it holds S_kv (-1.9 % at S 640)"
+    assert c.sm107_bias_mode_pick(32, 1, 384, pair=True, **both) == c.BIAS_MODE_RESIDENT
+    assert c.sm107_bias_mode_pick(64, 1, 1024, pair=True, **both) == c.BIAS_MODE_STREAMED, "D 64 keeps the cga1 ring (-6.3..-10.1 %)"
+    assert c.sm107_bias_mode_pick(32, 1, 896, pair=False, **both) == c.BIAS_MODE_STREAMED, "the one-batch-entry item's own ring"
+    assert c.sm107_bias_mode_pick(32, 2, 896, pair=False, **both) in (c.BIAS_MODE_RESIDENT, c.BIAS_MODE_STREAMED), "cga2 is the collective geometry"
+    assert c.sm107_bias_mode_pick(32, 1, 896, pair=True, request=2, **both) == c.BIAS_MODE_STREAMED, "a request is honoured"
+    assert (
+        c.sm107_bias_mode_pick(32, 1, 896, pair=True, request=3) == c.BIAS_MODE_STREAMED_MULTICAST
+    ), "...and a request needs neither fact (the adapter declines them)"
 
 
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)

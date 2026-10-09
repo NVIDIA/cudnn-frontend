@@ -153,9 +153,11 @@ _SPIN_RING_WAITS = {  # (kind, flavor): (SPIN_RING_WAITS, ring wait sites, idle 
     # traced from it) where the pair had hand-unrolled sub-tile 0 and sub-tile 1 -- the rendering is byte-identical (the md5 records),
     # the SOURCE count is not: 73 / 21 -> 59 / 21; +2 ring waits for the dead-sub-tile QUIET body's mb_bmm1_done / mb_stat_empty (per kv
     # tile, the live body's two sites): 61 / 21.
-    # +1 RING wait (the multicast ring's softmax ghost loop: mb_bias_ring_full per leader fill a padded / shorter chunk receives) and +1 IDLE
-    # wait (the TMA-LDG warp's end-of-kernel mb_bias_ring_empty drain, P15) since the ring's cluster-multicast form (bias_mode 3) landed: 62 / 22.
-    ("f16", (128, 128)): (True, 62, 22),
+    # +20 RING waits with the double-buffered S (TemplateParams.s_slots: the per-slot mb_bmm1_done / mb_bmm2_ready cursor waits of every role,
+    # spelled per slot) -- 81 / 21 on that body (its pin had stayed at 61 / 21); +1 RING wait (the multicast ring's softmax ghost loop:
+    # mb_bias_ring_full per leader fill a padded / shorter chunk receives) and +1 IDLE wait (the TMA-LDG warp's end-of-kernel
+    # mb_bias_ring_empty drain, P15) since the ring's cluster-multicast form (bias_mode 3) landed: 82 / 22.
+    ("f16", (128, 128)): (True, 82, 22),
     ("fp8", (128, 128)): (False, 44, 12),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("mxfp8", (128, 128)): (True, 36, 13),  # +1 ring wait: the block-scaled O epilogue's first mb_o_empty wait (sf_o)
     ("f16", (192, 128)): (True, 32, 11),  # +1 ring wait: the FP32 split-partial epilogue's mb_o_empty wait

@@ -268,8 +268,14 @@ def test_config_factory_derives_the_ring_and_raises_on_each_coupling():
 # (adapter kwargs, accept?, expected bias_mode, expected bias_stages, expected cta_mma): the adapter is the row's twin and honours a
 # requested form / depth where it fits, declining typed elsewhere (never degraded).
 _ADAPTER_CELLS = [
-    (dict(s_q=896, s_kv=896, bias="h"), True, 2, 3, 1),
-    (dict(s_q=896, s_kv=896, bias="h", bias_stages=2), True, 2, 2, 1),
+    (
+        dict(s_q=896, s_kv=896, bias="h"),
+        True,
+        3,
+        3,
+        1,
+    ),  # the pair ring's measured default at D 32: its cluster-multicast form (test_sdpa_bias_multicast_sm107.py)
+    (dict(s_q=896, s_kv=896, bias="h", bias_stages=2), True, 3, 2, 1),
     (dict(s_q=1024, s_kv=1024, bias="b"), True, 2, 2, 1),  # the one-batch-entry ring runs 2 stages (the measured pick)
     (dict(s_q=1024, s_kv=1024, bias="h", b=1), True, 2, 2, 1),
     (dict(s_q=1024, s_kv=1024, bias="b", bias_stages=3), True, 2, 3, 1),  # the deepest ring as a request
@@ -325,7 +331,7 @@ def test_adapter_check_support_is_the_rows_twin(_s13_rubin, kw, accept, mode, st
     api.check_support()
     params = api.template_params()
     assert (params.bias_mode, params.bias_stages, params.cta_mma) == (mode, stages, cga), params
-    if mode == 2 and form == "h" and b >= 2 and cga == 1:
+    if mode in (2, 3) and form == "h" and b >= 2 and cga == 1:
         assert params.n_chunk >= 2, "the pair item streams too"
     if form == "b" or b == 1:
         assert params.n_chunk == 0, "the one-batch-entry item streams its 256-row tiles"

@@ -187,7 +187,8 @@ def test_kernel_carries_the_two_slot_arm_as_one_const_expr_axis():
     kept verbatim (the byte-identity pins below are the proof; this is the static detector)."""
     code = (Path(__file__).resolve().parents[4] / "python" / "cudnn" / "sdpa" / "fwd" / "kernels" / "sm107" / "prefill_d128_f16.py").read_text()
     assert "_S2: bool = CFG.S_SLOTS == 2" in code
-    assert "make_classic_bars(CFG, s_stages=CFG.TILES_Q * CFG.S_SLOTS" in code
+    # the factory call spans lines since the bias ring's multicast form added its release-count keyword; the slot ring is its first keyword
+    assert "make_classic_bars(\n        CFG,\n        s_stages=CFG.TILES_Q * CFG.S_SLOTS," in code
     for fn in ("def _mma_tile_s2(", "def _mma_item_pair_s2(", "def _mma_bmm1_s2(", "def _mma_bmm2_s2(", "def _bmm2_ready_stage0("):
         assert fn in code, fn
     # the two slot-indexed rings are initialised over EVERY stage
