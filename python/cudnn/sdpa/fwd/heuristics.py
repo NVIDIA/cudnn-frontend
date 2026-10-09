@@ -1722,23 +1722,26 @@ def paged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
             if waves > splits:
                 return 1, False
         return splits, pack
-    # Keep Rubin's separately qualified first-wave assignments unchanged.
+    # Retain Rubin's first-wave budget, using the same declared packed-token
+    # capacity bound as Blackwell. Never read runtime sequence lengths here.
     kv_tiles = _ceil_div(facts.s_kv, 128)
     sm_count = facts.device_sm_count or 128
     choices = []
     for pack in (False, True):
         group = facts.h_q // facts.h_kv if pack else 1
-        units = facts.b * _ceil_div(facts.s_q, 128 // group) * (facts.h_q // group)
+        units = _d128_thd_split_units(facts, group)
+        if not units:
+            continue
         # Keep four KV tiles per partition to amortize setup/combine.
         budget = min(16, max(1, sm_count // units), max(1, kv_tiles // 4))
         loop_tiles = _ceil_div(kv_tiles, budget)
         splits = _ceil_div(kv_tiles, loop_tiles)
         if splits > 1:
             work = _ceil_div(units * splits, sm_count) * loop_tiles
-            # Equal loop work prefers fewer partials, then unpacked.
-            choices.append((work, splits, pack))
+            # Equal loop work prefers fewer partials, then fewer physical CTAs.
+            choices.append((work, splits, units, pack))
     if choices:
-        _, splits, pack = min(choices)
+        _, splits, _, pack = min(choices)
         return splits, pack
     if caps.sm_lo == 107 and facts.b <= 4 and facts.s_q <= 128 and facts.s_kv >= 8192:
         # Preserve first-wave choices. One-tile queries can use more waves;
