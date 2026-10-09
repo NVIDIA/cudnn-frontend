@@ -43,7 +43,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_d256_pack_gqa,
     supports_thd_split,
 )
-from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES, SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR
 
 # The DSL adapters (api_dsl) and cuda.bindings are LOWERING dependencies, not
@@ -593,13 +593,13 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
         return "prepared block-scaled outputs require fixed dense unsplit plans"
     if facts.is_mxfp8 and (
         capabilities.sm_lo not in (100, 107)
-        or (capabilities.sm_lo == 107 and (facts.thd or (split_kv or 1) > 1))
+        or (capabilities.sm_lo == 107 and (split_kv or 1) > 1)
         or not capabilities.is_mxfp8
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
         or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
         or (facts.shape_overrides and not facts.thd)
     ):
-        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense scalar outputs"
+        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense or bounded THD scalar outputs"
     if facts.is_fp8 and (
         capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
@@ -1840,8 +1840,17 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     descriptor window at cga1.
 
     Declined deliberately, because the ported kernels lack the machinery (not
-    because it went untested): THD, split-KV and PackGQA (the dense padded-Q
-    trim is carried since #1037).  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
+    because it went untested): split-KV and PackGQA (the dense padded-Q trim is
+    carried since #1037).  THD/varlen is served at d256 ONLY
+    (``thd_d_shapes = config_sm107.SM107_MXFP8_THD_SHAPES``, one constant with the
+    standalone adapter's gate and its ``_can_prepare_mxfp8``, rule 8b'): that body
+    rides the FROST THD contract at cga1 with the PACKED per-sequence-TILE-padded
+    scale-factor layout the SM100 row and the SM107 MXFP8 backward already use
+    (``[1, H, Σ_b ceil(S_b/128), SF_SMEM]`` tile sequences in cu_seqlens order;
+    the native binder derives the packed tile extent from the bound buffer's byte
+    size, so a producer may hand zero-filled slack tiles past the live total);
+    the d128 / d192x128 / d512 MXFP8 bodies keep the pre-upstream THD arm and
+    stay declined.  Optional stats IS served (``lse_optional=True`` below -- has_lse=False
     is a real specialization on every Rubin kernel, not an accepted-and-ignored
     flag).  See _sm107_spec for the same list on f16.
 
@@ -1894,6 +1903,19 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             # every Rubin kernel, not an accepted-and-ignored flag.
             lse_optional=True,
             skv_tail_via_padding=True,
+            # THD/varlen at d256 ONLY (SM107_MXFP8_THD_SHAPES -- shared with the
+            # standalone adapter's gate and _can_prepare_mxfp8, rule 8b').  The
+            # d256 body rides the FROST THD contract at cga1: packed [1,T,H,D]
+            # Q/K/V/O + cu_seqlens (both length forms -> cu_seq_len), PACKED
+            # per-sequence-TILE-padded SF tensors, and the ragged Stats in all
+            # three layouts -- token-major, head-major and per-batch padded
+            # (thd_padded_stats).  The d128 / d192x128 / d512 MXFP8 bodies keep
+            # the pre-upstream THD arm (7-arg setup call, 3B+2 metadata, static
+            # K/V maps) and stay declined through thd_d_shapes.
+            thd=True,
+            thd_d_shapes=SM107_MXFP8_THD_SHAPES,
+            thd_padded_stats=True,
+            cu_seq_len=True,
             # NATURAL row-wide; LPT and LPT_L2 claimed PER FLAVOR, like the f16
             # and FP8 rows, where the kernel honours them.
             #

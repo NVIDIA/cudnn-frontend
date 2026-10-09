@@ -172,6 +172,28 @@ _F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm
 # with _F16_THD_FLAVORS, which is the same fact keyed by config-flavor name.
 SM107_F16_THD_SHAPES = frozenset({(128, 128), (192, 128), (256, 256), (512, 512)})
 
+# MXFP8 flavor names whose kernel body carries the FROST THD contract (the 14-arg
+# build_thd_meta_o_descs_kernel setup launch, the 4B+4 metadata, the persistent
+# claim-counter scheduler, the dead-unit O-store guard, the packed-total-clamped
+# runtime K/V descriptors, the three Stats arms) together with the PACKED
+# per-sequence-TILE-padded scale-factor layout (SF descriptors at B = 1 over the
+# bound SF tensor's tile extent, every SF load offset by the per-sequence SF-tile
+# prefix base).  Keyed by the `flavor` string `_validate_params` receives.  The
+# d128 / d192xd128 / d512 MXFP8 bodies still carry the pre-upstream arm (7-arg
+# setup call, 3B+2 metadata, static K/V maps, `total_*_sf_tiles` host kwargs the
+# prepared pointer host never passes) and are declined here as well as by the
+# row -- reaching the raise below is an engine-row bug, not a user error.
+_MXFP8_THD_FLAVORS = frozenset({"sm107 d256 mxfp8"})
+
+# Head-dim shapes whose Rubin MXFP8 kernel carries the THD/varlen leg -- the same
+# one-definition-many-consumers arrangement as the two sets above (the engine
+# row's `thd_d_shapes`, the standalone adapter's Rubin THD gate and its
+# `_can_prepare_mxfp8`, the MXFP8 suite's per-shape Rubin skip; contract rule
+# 8b').  Must stay in step with _MXFP8_THD_FLAVORS, the same fact keyed by
+# config-flavor name.  d256 ONLY: the row serves d256 MXFP8 at cga1, the width
+# the THD arm is validated at.
+SM107_MXFP8_THD_SHAPES = frozenset({(256, 256)})
+
 # Head-dim shapes whose Rubin kernels carry the FUSED EPILOGUE GATE
 # (O := O * sigmoid(G), TemplateParams.epilogue_gate).  ONE named constant with
 # three consumers -- the engine rows' ``epilogue_gate_d_shapes``, the standalone
@@ -509,6 +531,18 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
         raise ValueError(
             f"{flavor}: THD/varlen on the SM107 f16/bf16 line is served by {sorted(_F16_THD_FLAVORS)} only "
             f"(got dtype_qkv={k.dtype_qkv}); the other flavors' setup-kernel call sites are not ported"
+        )
+    # The MXFP8 twin of the gate above (the flavor string carries the family: the
+    # per-tensor FP8 d256 config is "sm107 d256", the MXFP8 one "sm107 d256 mxfp8").
+    # A pre-upstream MXFP8 body loaded with THD_VARLEN=1 would call the 14-arg setup
+    # helper with 7 arguments and size its SF descriptors from host kwargs the
+    # prepared host never passes -- a trace error at best, a zero-extent descriptor
+    # (cudaErrorIllegalInstruction) at worst -- so it is declined here, where the
+    # row (`thd_d_shapes = SM107_MXFP8_THD_SHAPES`) already declines it.
+    if k.thd_varlen and k.dtype_qkv in (_DTYPE_E4M3, _DTYPE_E5M2) and flavor.endswith(" mxfp8") and flavor not in _MXFP8_THD_FLAVORS:
+        raise ValueError(
+            f"{flavor}: THD/varlen on the SM107 MXFP8 line is served by {sorted(_MXFP8_THD_FLAVORS)} only; "
+            f"the other MXFP8 bodies keep the pre-upstream THD arm (7-arg setup call, 3B+2 metadata, static K/V maps)"
         )
     if k.seq_q_lens_present:
         if k.thd_varlen:

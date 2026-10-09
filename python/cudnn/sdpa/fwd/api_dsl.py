@@ -49,6 +49,7 @@ from cudnn.sdpa.fwd.config_sm90 import (
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES as _SM107_F16_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP8_THD_SHAPES as _SM107_FP8_THD_SHAPES
+from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES as _SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
@@ -2070,15 +2071,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
         # THD on the Rubin line: the per-tensor FP8 kernels at every ported
-        # shape (SM107_FP8_THD_SHAPES: d128, d192xd128, d256, d512) and the
-        # f16/bf16 kernels at the same four (SM107_F16_THD_SHAPES) -- all on
-        # the FROST THD contract (the 14-arg setup helper, the 4B+4 metadata
-        # the shared decode reads) since 2026-09-09.  MXFP8 THD is declined
-        # line-wide: those bodies' scale-factor tensors have no packed
-        # per-sequence layout yet.
+        # shape (SM107_FP8_THD_SHAPES: d128, d192xd128, d256, d512), the
+        # f16/bf16 kernels at the same four (SM107_F16_THD_SHAPES) and the
+        # MXFP8 kernel at d256 (SM107_MXFP8_THD_SHAPES) -- all on the FROST THD
+        # contract (the 14-arg setup helper, the 4B+4 metadata the shared
+        # decode reads); the MXFP8 d256 body additionally reads its PACKED
+        # per-sequence-tile-padded scale factors.  The d128 / d192xd128 / d512
+        # MXFP8 bodies keep the pre-upstream THD arm and stay declined.
         #
         # This gate is the STANDALONE-wrapper twin of the rows' decline
-        # (`thd=False` on f16/MXFP8, `thd_d_shapes` on FP8), which the rows
+        # (`thd_d_shapes` on every Rubin row), which the rows
         # cannot cover because the wrapper never consults them.  Without it
         # check_support() returns True and compile() dies with a bare TypeError
         # on the lse_head_major kwarg -- an untyped escape, not a decline.
@@ -2090,10 +2092,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and self._device_cc == (10, 7)
             and not (
                 (self._fp8 and self._pertensor and (int(d_qk), int(d_v)) in _SM107_FP8_THD_SHAPES)
+                or (self._fp8 and not self._pertensor and (int(d_qk), int(d_v)) in _SM107_MXFP8_THD_SHAPES)
                 or (not self._fp8 and (int(d_qk), int(d_v)) in _SM107_F16_THD_SHAPES)
             ),
-            f"THD/varlen on the Rubin (SM107) line is per-tensor FP8 {sorted(_SM107_FP8_THD_SHAPES)} "
-            f"or f16/bf16 {sorted(_SM107_F16_THD_SHAPES)} only; "
+            f"THD/varlen on the Rubin (SM107) line is per-tensor FP8 {sorted(_SM107_FP8_THD_SHAPES)}, "
+            f"MXFP8 {sorted(_SM107_MXFP8_THD_SHAPES)} or f16/bf16 {sorted(_SM107_F16_THD_SHAPES)} only; "
             f"got (D_QK={d_qk}, D_V={d_v}) on the "
             f"{'MXFP8' if (self._fp8 and not self._pertensor) else 'FP8' if self._fp8 else 'f16/bf16'} path",
         )
@@ -2596,7 +2599,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             and (not self.o_block_scale or self._can_prepare_block_output())
         ):
             return False
-        if self._device_cc == (10, 7) and (self.thd or self.split_kv > 1 or self.pack_gqa):
+        if self._device_cc == (10, 7) and (self.split_kv > 1 or self.pack_gqa):
             return False
         return self.thd or all(
             self._prepared_operand_layout(desc) is not None

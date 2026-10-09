@@ -85,7 +85,8 @@ output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
 SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry.
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
-head shapes; THD, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
+head shapes and for bounded THD at d256 (`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other
+three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
 shape overrides remain declined because SF batch/head pitches are plan-fixed.
 SM107 D256 MXFP8 gates also use the prepared host. The existing direct-only SM100
 D128/D192 PV-BF16 specialization prepares native layouts with BF16 V and no SF_V
@@ -1135,7 +1136,9 @@ bottom-right band there; **the K / V rows at or past a length — and, on the mx
 kernels select P = 0 there, but `dS = (dP − delta) ∘ P` is `NaN × 0`; the dense rows get
 finite pads from the zero-filled staging, the per-batch arm reads the caller's buffers).
 `external_delta=True` + `execute(delta_tensor=)`: a contiguous fp32 `[B, H_q, S_q_pad]`
-delta (zeros past S_q) in place of the chain's own `dot` launch and `delta` region — on
+delta (zeros past S_q; under THD the packed head-major `[1, H_q, ceil128(T_q)]`, zeros
+past the token capacity `T_q` — the same layout at `B = 1, S = T_q`) in place of the
+chain's own `dot` launch and `delta` region — on
 the f16 row the raw half-precision dot (bitwise the chain's own when the producer forms it
 in `dot_do_o`'s order), on the fp8 row in **TRUE units, unscaled** (nobody applies
 `descale_o · descale_dO` to a caller's delta, so it is not bitwise the row's own scaled
@@ -1167,8 +1170,9 @@ the 0xFF-poisoned unwritten capacity tail into the caller's gradients AND into t
 columns and the capacity tail excluded at all four fold sites (the kernel's row gate and
 fold values, the GEMM epilogue's per-row gate, the bounded fold passes) — and there is
 ONE `scale_dP` per packed batch (the forward's one-scalar-per-operand convention over
-packed tokens). Declined under THD as on the f16 row: an external delta, right-band
-widening, bias. Tests: `test_sdpa_bwd_thd_fp8_sm107.py` (direct adapter + the graph-tier
+packed tokens). An external delta is served under THD as on the f16 row (the packed
+`[1, H_q, ceil128(T_q)]` form in TRUE units; no `dot` launch, no `delta` region). Declined
+under THD as on the f16 row: right-band widening, bias. Tests: `test_sdpa_bwd_thd_fp8_sm107.py` (direct adapter + the graph-tier
 probe), the THD pins of `test_sdpa_bwd_fp8_sm107.py`.
 ᵐˣ **d=256 MXFP8 backward (`sdpa_bwd_sm107_mxfp8`, `sdpa_mxfp8_backward`;
 `api_dsl_sm107.SdpaBwdDslSm107Mxfp8`, kernel `sm107/bprop_d256_mxfp8.py`, config
@@ -1292,9 +1296,12 @@ block-scale GEMMs (whole atoms) — are re-staged per execute into packed stagin
 with every byte scaling a position at or past its sequence's length zeroed, from the
 device prefixes (`sf_meta = [cu_sf_q(B+1) | cu_sf_k(B+1)]`, a workspace region of its own
 next to the shared metadata, written by the chain's setup launch); `sf_q / sf_k` pads are
-harmless (an S NaN is select-dead) and bind as they are. Declined under THD as on the
-sibling rows: an external delta, right-band widening, bias. Stats comes from the caller
-(no Rubin MXFP8 THD forward row feeds it yet). Tests: `test_sdpa_bwd_thd_mxfp8_sm107.py`
+harmless (an S NaN is select-dead) and bind as they are. An external delta is served under
+THD as on the sibling rows (the packed `[1, H_q, ceil128(T_q)]` form over the `o_f16` /
+`dO_f16` ports, bitwise the chain's own `dot` when formed in its order). Declined under THD
+as on the sibling rows: right-band widening, bias. Stats comes from the caller
+(the Rubin MXFP8 forward row serves THD at d256 since 2026-10-08 -- footnote ᶻ -- and
+writes the packed Stats this row consumes). Tests: `test_sdpa_bwd_thd_mxfp8_sm107.py`
 (direct adapter), the THD pins of `test_sdpa_bwd_mxfp8_sm107.py`.
 ᵇ³ **d ∈ (256, 512] backward (`sdpa_bwd_sm107_d512`, f16/bf16, opt_in, 2026-10-01;
 `python/cudnn/sdpa/bwd/api_dsl_sm107_d512.py`, stage-2 kernel
@@ -1486,7 +1493,11 @@ sequences exact (empty-KV: no unit, zero dQ by
 select; empty-Q: one forced fully-masked tile whose every operand load is routed past the
 clamped extent -- zero-filled, so an all-NaN Q / dO capacity with no live query row still
 yields exact-zero dK/dV; the same routing for the spare units of the occupancy-sized grid).
-Declined under THD: right-band widening (as dense), bias, an external delta (every row; the
+An external delta is served under THD on every row (`external_delta=True` +
+`execute(delta_tensor=)`: the packed head-major `[1, H_q, ceil128(T_q)]`, zeros past the
+token capacity, read where the chain read its own region, one `dot` launch and the `delta`
+region gone; the `external_delta` cells of the three THD suites). Declined under THD:
+right-band widening (as dense), bias (every row; the
 MXFP8 row's packed scale-factor contract is its own paragraph, ᵐˣ).  Perf (Rubin, cc 10.7, 212 SMs; B = 4, S_max = 8192,
 bf16, the THD arms against the dense run of the same shape in one process): the THD
 overhead at identical FLOPs (uniform 8192-token sequences) is +0.1 / +1.3 / +1.8 % under the
@@ -1523,9 +1534,33 @@ bottom-right, 9/9 per flavor). Whole-suite baseline on Rubin moved from
 **829 passed / 11 failed** on unmodified `develop` to **1111 passed / 10
 failed**; those 10 are the pre-existing set (9 ×
 `test_q_loop_bounds_match_reference`, 1 × `test_torch_ops::test_padded_seq_lens`)
-verified to reproduce at `60cb6cda`. **Still declined: MXFP8 THD line-wide** —
-those bodies keep the pre-upstream 7-arg setup call and their scale-factor
-tensors have no packed-THD layout yet, so the row declines rather than
+verified to reproduce at `60cb6cda`. **MXFP8 THD is served at d256** (2026-10-08:
+`config_sm107.SM107_MXFP8_THD_SHAPES` is the row's `thd_d_shapes`, the standalone
+adapter's Rubin THD gate and its `_can_prepare_mxfp8` -- one constant, rule 8b'; the
+d256 MXFP8 body moved onto the same FROST THD contract at cga1 -- the 14-arg setup
+launch, 4B+4 metadata, the persistent claim-counter scheduler, the dead-unit O-store
+guard, the packed-total-clamped runtime K/V maps, the three Stats arms (token-major,
+head-major, per-batch padded, so `thd_padded_stats` is claimed) -- with the PACKED
+per-sequence-TILE-padded scale-factor layout the SM100 MXFP8 row and the SM107 MXFP8
+backward already use: SF descriptors at B = 1 over the bound SF tensor's tile extent,
+which the native binder derives from the buffer's byte size, so a producer may hand
+zero-filled slack tiles past the live total and every kernel coordinate stays below
+`cu_sf[B]`; both length forms (`cu_seq_len`); the dense cubin is byte-identical before
+and after the port. Validated on Rubin (cc 10.7) through the SM100 MXFP8 THD suite's
+d256 cells, which the per-shape Rubin skip now admits -- 37 THD cells green at the
+suite's unchanged tolerances (E4M3 + E5M2; none / causal / bottom-right / sliding-window;
+sink; GQA 8/2 and MQA 8/1 (eight Q heads over one K/V head); both length forms;
+zero-length sequences first, middle and last;
+scale-factor slack capacity bitwise the exact buffer; Stats VALUES in the token-major,
+head-major and per-batch padded layouts; per-sequence attribution for one to three
+sequences; a single-unit launch; the multi-unit claim loop) plus the 3 Rubin decline cells
+at the unported shapes, the 25 THD prepared-launch cells of the SM107 entry point
+(`TestPreparedSm107Mxfp8`: routes, rebind, capture, SF storage order, one bound frame, no
+allocation or sync, the packed-SF binder's typed declines), and the dense d256 surface
+unchanged-green (37 suite cells + 24 dense prepared cells) on a byte-identical cubin).
+**Still declined: MXFP8 THD at d128 / d192×d128 / d512** — those bodies keep the pre-upstream
+7-arg setup call and the `total_*_sf_tiles` host kwargs the prepared pointer host
+never passes, so the row declines them through `thd_d_shapes` rather than
 half-serving.
 
 ʸ Per-tensor FP8 **THD** at d192×d128 came free with the DSv3 port and is
@@ -1880,7 +1915,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | MXFP8 backward: E5M2, bottom-right / band-widened / sliding-window masks, non-BSHD strides, `amax_*` outputs | SM100, SM103 |
 | f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense/nonpaged D256; THD outside D128, nonpaged D192, and SM107 paged D256 |
 | f16/bf16 forward PackGQA | SM107 outside dense D128 GQA (shared bodies, not with the pre-folded scale), D128 paged THD / nonpaged D128 split THD and exact D256 paged unsplit THD with CGA2 |
-| d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD row-wide |
+| d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD outside d256 (`SM107_MXFP8_THD_SHAPES`, ᶻ) |
 | MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open) |
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
 | MXFP8 backward outside SM100/SM103 d = 256 and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |

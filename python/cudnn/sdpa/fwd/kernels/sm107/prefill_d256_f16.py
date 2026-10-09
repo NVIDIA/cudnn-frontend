@@ -193,12 +193,14 @@ OUT_STORAGE_DTYPE = STORAGE_DTYPE
 # scores live in the same log2 domain as when the kernel applies the scale, so the correction's LSE / sink fold /
 # inv_sum consume the same values.  Numerically neutral on its own (the per-score multiply by the scale becomes the
 # caller's one rounding of Q); the fused shift+convert it enables is a quantized-kernel arm this body does not carry.
-# Mask sentinel under the fold: a fully-masked tile leaves the raw max exactly at the finite mask sentinel (== NEG_INF),
-# so is_first re-fires on consecutive keyless tiles (alpha = 0) where the scaled path runs alpha = 1 between them; both
-# publish P = exp2(0) = 1 there, the first live tile wipes the accumulator, and a keyless row is overridden by the
-# correction's _kv_empty select -- same O and LSE either way.  The softmax body is inlined four times (dense /
-# left-masked / unmasked interior / right-masked); every copy carries both arms at its max site and its shift site --
-# the source pin in test_sdpa_fwd_dsl_sm107.py counts them.
+# Mask sentinel: a fully-masked tile leaves the raw max exactly at the finite mask sentinel (== NEG_INF) under the fold, at
+# the scaled sentinel otherwise.  Ahead of the row's first live key such a tile is DEAD: running_max_step_finite_sentinel
+# (the shared running-max step) keeps total_max at NEG_INF, publishes alpha = 1 and shifts the tile by 0 so P = 0, and the
+# first live tile starts the online softmax through is_first -- the sentinel never becomes the running max (scaled by
+# scale_log2 > 1 it overflowed to -inf and the shift read -inf - (-inf) = NaN; below that P = 1 per masked column).  A
+# keyless row ends at (NEG_INF, 0) and is overridden by the correction's _kv_empty select.  The softmax body is inlined four
+# times (dense / left-masked / unmasked interior / right-masked); every copy carries both arms at its max site and its
+# shift site -- the source pin in test_sdpa_fwd_dsl_sm107.py counts them.
 SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
 # softmax_precision=HALF (TemplateParams.softmax_f16) is a quantized-kernel specialization: on half inputs the f16x2
 # exponent would be a new numerics class (exp input ulp 2^-8 at the rescale threshold; bf16 ex2 is 2^-7), so the config
@@ -219,6 +221,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     compute_kv_loop_bounds,
     lpt_tile_coords,
     make_sdpa_helpers,
+    running_max_step_finite_sentinel,
     gate_geometry,
     issue_gate_load,
     gate_chunk_smem_offset,
@@ -1441,13 +1444,11 @@ def _softmax_warp_group(
                 else:
                     current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1535,13 +1536,11 @@ def _softmax_warp_group(
                 else:
                     current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1602,13 +1601,11 @@ def _softmax_warp_group(
                 else:
                     current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
@@ -1692,13 +1689,11 @@ def _softmax_warp_group(
                 else:
                     current_max = current_max_unscaled * scale_log2
 
-                old_total_max = total_max
-                is_first = total_max == NEG_INF
-                update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-                total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
-                exp_input = cutlass.Float32(arith.select(is_first.ir_value(), NEG_INF.ir_value(), (old_total_max - total_max).ir_value()))
-                alpha = cute.math.exp2(exp_input, fastmath=True)
-                new_total_max = total_max
+                # Running max / alpha / exp2 shift; a tile fully masked ahead of the row's first live key is selected out of the
+                # state (total_max stays NEG_INF, alpha = 1, shift 0 -> P = 0) -- the sentinel never becomes the running max.
+                total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+                    current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
+                )
                 alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)

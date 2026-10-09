@@ -1793,10 +1793,11 @@ def test_fp8_reject_bf16_weights_with_quant():
 
 @requires_cuda
 def test_fp8_reject_thd_with_quant():
-    """``thd=True`` with ``quant``: dense-only for now (the fp8 row's packed chain serves no external delta, and the block's delta
-    contract forbids the row's own pre-pass) -- declined typed AT DECLARATION, naming BOTH attributes, and the message does NOT
-    tell the caller to build the plan without ``external_delta`` (the adapter's text must never surface here).  Host-side, over
-    placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32 ``saved.seq_lens``)."""
+    """``thd=True`` with ``quant``: dense-only for now (the block's packed quantized arm -- the fp8 row's THD chain, which serves an
+    external delta, reading the gate backward's packed bf16 delta -- is a follow-up) -- declined typed AT DECLARATION, naming BOTH
+    attributes, and the message does NOT tell the caller to build the plan without ``external_delta`` (the adapter's text must never
+    surface here).  Host-side, over placeholders shaped like a packed record (``[T, d_model]`` bf16 dy, e4m3 ``saved.h``, int32
+    ``saved.seq_lens``)."""
     r = _fp8_decl(dict(_COMMON), 1, 256, quant=None)
     t, dm = 256, _COMMON["d_model"]
     dy = torch.empty(t, dm, dtype=torch.bfloat16, device="cuda")

@@ -447,10 +447,12 @@ record (`seq_lens_form=None`) is refused by a packed backward, a packed record b
 optional and, when given, must be `saved.seq_lens` itself. Every token-wise stage is the dense `B=1, S=T` block's (the two weight-gradient GEMMs contract over `K = T`; the two
 data-gradient GEMMs produce `T` rows and contract over `d_model` and `n_qkvg`); the SDPA backward runs the packed d=256 chain (`SdpaBwdDslSm107(thd=True)`: its own setup
 launches, per-sequence descriptors, the kv-blocked dS workspace, the GQA fold bounded by the live total on the device).
-`fuse_wgrad_overlap` is served (bitwise the in-order block); `fuse_gate_bwd` is a typed `NotImplementedError` under THD for
-now (the packed chain computes its `delta` in the head-major packed layout and has no external producer yet). The
+`fuse_wgrad_overlap` and `fuse_gate_bwd` are both served, each bitwise the plain packed block: the gate backward's `delta`
+at `B = 1, S = T` is byte for byte the packed head-major `[1, H_q, ceil128(T)]` delta the packed chain reads (tail zeroed),
+so under `fuse_gate_bwd` the chain's own `dot_do_o` launch is gone and its `delta` region moves into the block's
+(`test_thd_fused_gate_bwd_is_bitwise_the_unfused_packed_block`). The
 declaration bounds and the lengths contract are the forward's. Workspace: the dense `B=1, S=T` carve plus the packed
-chain's scratch -- `delta [1, H_q, ceil128(T)]`, ONE head chunk of the kv-blocked dS, `[qh_chunk, ceil256(T + 256 B),
+chain's scratch -- `delta [1, H_q, ceil128(T)]` (unless `fuse_gate_bwd`), ONE head chunk of the kv-blocked dS, `[qh_chunk, ceil256(T + 256 B),
 ceil128(max_seq_len)]` in the activation dtype, the metadata and descriptors, the GQA partials -- so declare `max_seq_len`
 tight.
 
@@ -474,11 +476,13 @@ given for a `need_*=False`, or missing for a `need_*=True`, is a typed error at 
 **Fusion knob -- `fuse_gate_bwd` (default `False`).** The SDPA backward's first launch is `delta = rowsum(dO * O)` over
 the `dO` the gate backward just wrote and the `O` it just read. With the knob on, the gate-backward kernel emits `delta`
 as a fourth output (the bf16 / fp16-rounded `dO` it stores, summed in the chain's own `dot_do_o` order, the pad rows
-zeroed) into a block-owned fp32 `[B, H_q, S_pad]` region, and the SDPA backward adapter is built with
+zeroed) into a block-owned fp32 `[B, H_q, S_pad]` region (`[1, H_q, ceil128(T)]` under `thd`: the dense arm at `B = 1, S = T`
+is the packed chain's own head-major layout), and the SDPA backward adapter is built with
 `external_delta=True` and reads that tensor: one launch and one read each of `O` and `dO` fewer (`11 + c*(2+q)` launches,
 14 / 21 at the test geometry), the adapter's own `delta` region gone from its scratch (the block's region takes its
 place, same bytes). Performance-only in the strict sense: the gradients are **bitwise** the unfused block's
-(`test_fused_gate_bwd_is_bitwise_the_unfused_block`, bf16 and fp16, dense and causal, B=1 and B=3 under GQA), and the
+(`test_fused_gate_bwd_is_bitwise_the_unfused_block`, bf16 and fp16, dense and causal, B=1 and B=3 under GQA; packed:
+`test_thd_fused_gate_bwd_is_bitwise_the_unfused_packed_block`), and the
 two-run and stream-order pins run under both knob values. Measured whole-backward effect: see the performance section.
 
 **Scheduling knob -- `fuse_wgrad_overlap` (default `False`).** The two weight-gradient GEMMs are consumed by nothing
@@ -569,7 +573,7 @@ two executes are bitwise equal under every knob set (pinned by `test_fp8_two_run
 inert under `quant`: the fused delta is mandatory there. `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after the slots and operands they read are written).
 Declined (typed, naming the attribute): e5m2 codes, an fp16 `dy` (the quantized
 backward is bf16), a bf16 `saved.h` or bf16 weights with a `QuantSpec` and e4m3 codes without one (both ways), `thd=True` with
-`quant` -- dense-only for now, a THD arm follows once the gate backward emits the packed delta --, and a geometry whose Q / K
+`quant` -- dense-only for now, its packed arm a follow-up --, and a geometry whose Q / K
 rebuild only the LDG norm + RoPE kernel can tile: the fused prologue runs the TMA kernel, whose `tile_rows` must divide `h_q`,
 be a multiple of `h_kv` and of 4 (nothing in 1..16 does for `h_q = 20` MHA or `h_q = 6` over `h_kv = 2`; the bf16 backward
 serves such a geometry through the LDG rebuild). There is no `B*S` rule: the
@@ -740,7 +744,7 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
-  `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, `fuse_gate_bwd`, the packing knobs on a dense block.
+  `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, the packing knobs on a dense block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above), the fp4
   modes of the MXFP8 pipeline included; the fully fused quantized pipelines are inference only. The backward is bf16 / fp16
