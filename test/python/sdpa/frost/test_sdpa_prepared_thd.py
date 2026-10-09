@@ -2078,8 +2078,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
             pytest.skip("Native D64 paged split is qualified on SM100/SM103")
         d = 64
     if geometry.startswith("d256"):
-        if arch != "sm107":
-            pytest.skip("Paged D256 split and PackGQA are qualified on SM107")
+        if arch != "sm107" and splits == 1:
+            pytest.skip("Paged D256 unsplit PackGQA is qualified on SM107")
         d = 256
     if "_gqa16_" in geometry:
         h, hk = 16, 1
@@ -2334,12 +2334,13 @@ def test_mla_thd_fixed_split_capture(dtype, splits, stats_layout, stats_log2, ba
     _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle)
 
 
-def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle, *, d=192, pack_gqa=False, causal=True):
+def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle, *, d=192, pack_gqa=False, causal=True, qcap=129):
     """Explicit/automatic plans preserve rebased views, live lengths and output layouts."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Nonpaged packed split is admitted on SM100, SM103 and SM107")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
-    b, h, hk, d, dv, qcap, kcap = batch, 4, 2, d, 128, 129, 513
+    b, h, hk, d, dv, kcap = batch, 4, 2, d, (256 if d == 256 else 128), 513
+    pitch = dv + 128
     if splits is None:
         if dtype != torch.bfloat16 and d != 128:
             pytest.skip("Automatic nonpaged split placement is currently measured for BF16 (FP16 for D128)")
@@ -2353,9 +2354,9 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         "q": torch.randn(tq + 3 + spare, h, d, device=DEV, dtype=dtype, generator=rng)[3:],
         "k": torch.randn(tk + 5, hk, d, device=DEV, dtype=dtype, generator=rng)[5:],
     }
-    v_storage = torch.randn(tk + 5, hk, 256, device=DEV, dtype=dtype, generator=rng)
-    o_storage = torch.full((tq + 3 + spare, h, 256), float("nan"), device=DEV, dtype=dtype)
-    bufs.update(v=v_storage[5:, :, 128:], o=o_storage[3:, :, 64:192])
+    v_storage = torch.randn(tk + 5, hk, pitch, device=DEV, dtype=dtype, generator=rng)
+    o_storage = torch.full((tq + 3 + spare, h, pitch), float("nan"), device=DEV, dtype=dtype)
+    bufs.update(v=v_storage[5:, :, 128:], o=o_storage[3:, :, 64 : 64 + dv])
     if stats_layout is not None:
         bufs["lse"] = torch.empty((h, tq + 17) if stats_layout == "HN" else (tq + spare, h), device=DEV)
     for name in ("cu_q", "cu_kv", "off_q", "off_k", "off_v", "off_o", "off_lse"):
@@ -2386,7 +2387,7 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         max_total_seq_len_q=None if spare and stats_layout != "HN" else tq,
         max_total_seq_len_kv=tk,
     )
-    t["o"].set_output(True).set_dim([b, h, qcap, dv]).set_stride([qcap * h * 256, 256, h * 256, 1]).set_ragged_offset(t["off_o"])
+    t["o"].set_output(True).set_dim([b, h, qcap, dv]).set_stride([qcap * h * pitch, pitch, h * pitch, 1]).set_ragged_offset(t["off_o"])
     if stats_layout is not None:
         t["lse"] = stats
         stride = [h * (tq + 17), tq + 17, 1, 1] if stats_layout == "HN" else [qcap * h, 1, h, 1]
@@ -2401,7 +2402,9 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         # Exercise the public default without pinning a particular split count.
         g.build_plans()
     else:
-        g.create_execution_plan(engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)})
+        g.create_execution_plan(
+            engine, {**knobs, cudnn.knob_type.TILE_CGA_M: 2 if d == 256 else 1, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.PACK_GQA: int(pack_gqa)}
+        )
         g.build_plan_at_index(g.get_execution_plan_count() - 1)
     ws = torch.empty(g.get_workspace_size(), device=DEV, dtype=torch.uint8)
     pack = {t[n]: x for n, x in bufs.items() if n in t}
@@ -2417,7 +2420,7 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
     )
 
     def lengths(ql, kl):
-        ql, kl = ql[:b], kl[:b]
+        ql, kl = [min(qcap, q) for q in ql[:b]], kl[:b]
         # Prefix bases describe sliced length arrays; tensor pointers carry physical origins.
         cq, ck = [0, *accumulate(ql)], [0, *accumulate(kl)]
         values = dict(
@@ -2425,8 +2428,8 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
             cu_kv=[x + 5 for x in ck],
             off_q=[x * h * d for x in cq],
             off_k=[x * hk * d for x in ck],
-            off_v=[x * hk * 256 for x in ck],
-            off_o=[x * h * 256 for x in cq],
+            off_v=[x * hk * pitch for x in ck],
+            off_o=[x * h * pitch for x in cq],
             off_lse=[x * (1 if stats_layout == "HN" else h) for x in cq],
         )
         for n, x in values.items():
@@ -2449,7 +2452,7 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
         with torch.cuda.graph(graph):
             execute()
         for ql, kl in (([65, 129, 0], [257, 513, 0]), ([0, 33, 1], [0, 17, 0]), ([1, 0, 65], [1, 0, 129]), ([17, 0, 0], [0, 0, 0])):
-            ql, kl = ql[:b], kl[:b]
+            ql, kl = [min(qcap, q) for q in ql[:b]], kl[:b]
             cq, ck = lengths(ql, kl)
             bufs["q"].mul_(-0.5)
             o_storage.fill_(float("nan"))
@@ -2479,7 +2482,7 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
                     ref_lse = scores.logsumexp(-1) * (math.log2(math.e) if stats_log2 else 1)
                     torch.testing.assert_close(lse[cq[i] : cq[i + 1]].T.double(), ref_lse, atol=3e-4, rtol=0)
             assert torch.isnan(o_storage[:3]).all() and torch.isnan(o_storage[3 + cq[-1] :]).all()
-            assert torch.isnan(o_storage[..., :64]).all() and torch.isnan(o_storage[..., 192:]).all()
+            assert torch.isnan(o_storage[..., :64]).all() and torch.isnan(o_storage[..., 64 + dv :]).all()
             if lse is not None:
                 assert torch.isnan(lse[: cq[0]]).all() and torch.isnan(lse[cq[-1] :]).all()
     finally:
@@ -2507,3 +2510,16 @@ def _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, 
 def test_d128_nonpaged_thd_split_capture(dtype, batch, splits, stats_layout, stats_log2, pack_gqa, causal, monkeypatch, cudnn_handle):
     """Ragged D128 reuses packed partials for both packed and unpacked GQA."""
     _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle, d=128, pack_gqa=pack_gqa, causal=causal)
+
+
+@requires_blackwell
+@requires_dsl
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize(
+    "splits,stats_layout,stats_log2,causal,qcap",
+    [(2, "HN", False, True, 129), (3, "NH", True, False, 129), (8, None, False, True, 129), (8, "HN", True, False, 1)],
+)
+def test_d256_nonpaged_thd_split_capture(dtype, batch, splits, stats_layout, stats_log2, causal, qcap, monkeypatch, cudnn_handle):
+    """The two-CTA D256 partials preserve packed offsets, tails and Stats."""
+    _nonpaged_thd_split_capture(dtype, splits, stats_layout, stats_log2, batch, monkeypatch, cudnn_handle, d=256, causal=causal, qcap=qcap)
