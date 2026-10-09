@@ -505,6 +505,13 @@ def test_kernel_module_constants_and_mask_sites():
     assert 'mask_value=float("-inf")' in src and "row_max_for_exp2(total_max)" in src
     assert "_kv_empty | (total_sum == cutlass.Float32(0.0))" in src, "the fully masked row's SELECT"
     assert "issue_bias_block_load(" in src and "load_bias_row_chunk(" in src and "kv_mask_keep_words(" in src
+    # The exp2 MUFU / FMA split PROBE: a module constant that is OFF (the split loses on cc 10.7 at every head dim measured), folded at
+    # trace time with the adapter's cc 10.0-only field, and every chunk exp2 site a trace-time ternary on it (off = the plain MUFU exp2,
+    # the byte-identical rendering the md5 record above pins).
+    assert re.search(r"^EXP2_FMA_SPLIT: bool = False$", src, re.M), "EXP2_FMA_SPLIT must stay False: the split is a measured loss on cc 10.7"
+    assert "_E2E_ENABLED = bool(PARAMS.exp2_fma_split) or EXP2_FMA_SPLIT" in src
+    sites = [ln for ln in src.splitlines() if "cute.math.exp2(chunk_S_" in ln]
+    assert len(sites) == 4 and all("exp2_mixed(" in ln and "if _E2E_ENABLED else" in ln for ln in sites), sites
 
 
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)

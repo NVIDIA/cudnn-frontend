@@ -150,7 +150,13 @@ SPIN_RING_WAITS: bool = True
 # sm100 d128 kernels' ``_E2E_*`` block (pattern (16, 4, TILE_N): the LAST 4 of every 16 columns; shipped there on cc 10.0 only), which
 # MEASURED +7.8 % on B200 and -9..-10 % on the Rubin d128 MXFP8 kernel -- MUFU.EX2 issues 32 lanes/clk/SM on sm_107a, so an emulated
 # exp2 costs 1.99x the pipe time it frees at D = 128, where MUFU is not the bottleneck.  At D = 32 the softmax ALU and MUFU set the
-# floor together (the MMA sits 2-4x under them), so the sign is MEASURED on the small tiles rather than inferred.  ``PARAMS.exp2_fma_split``
+# floor together (the MMA sits 2-4x under them), so the sign was MEASURED on the small tiles rather than inferred -- and it LOSES there
+# too (a 212-SM cc 10.7 node at the 2376 MHz lock, base / split / base cross-process A/B/A, 100 x 3 graph replay, control twin, base
+# drift <= 0.09 %): D 32 S 384 plain / bias / bias + kv_mask at TILE_N 64 -6.9 / -13.6 / -3.7 %, S 1024 -10.0 / -16.6 / -2.7 %; D 64
+# S 384 -6.7 / -17.3 / -4.0 %, S 768 -9.4 / -29.1 / -3.6 % -- the loss scales with the emulated columns per step (largest on the
+# two-chunk TILE_N 128 bias forms, smallest on the one-chunk TILE_N 64 masked form), because the softmax body is ALU-issue bound and
+# the emulation adds 3 packed ops per element to the binding pipe.  Numerics with the split on: O unchanged to the bf16 rounding, LSE
+# max-abs-diff ~1e-5 vs ~1e-6 (the primitive's documented fp32 row-sum shift), two launches bitwise.  ``PARAMS.exp2_fma_split``
 # is False on every cc 10.7 build (api_dsl._exp2_fma_split_for gates it to cc 10.0); EXP2_FMA_SPLIT is the module constant the probe flips
 # (a second source tree with ONE edit, the cross-process A/B/A's variant).  Off, every chunk exp2 traces ``cute.math.exp2`` -- the
 # byte-identical develop spelling (test_no_bias_renderings_are_byte_identical_to_the_pre_bias_record).  The alpha exp2 (one per row per
