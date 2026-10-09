@@ -414,6 +414,9 @@ _BY_ID = {c.id: c for c in _CELLS + _LAUNCH_ONLY_CELLS}
 assert len(_CELLS) == 14 and len(_BY_ID) == len(_CELLS) + len(_LAUNCH_ONLY_CELLS), "the cell ids must be unique: 11 matrix rows, three in both qk_norm arms"
 assert all(c.t % 32 == 0 for c in _CELLS if c.need_dw_qkvg), "every accept cell with the projection weight gradient has B*S % 32 == 0"
 _MATRIX = pytest.mark.parametrize("cell", _CELLS, ids=[c.id for c in _CELLS])
+# A dense S % 128 != 0 (the forward's kv_tail_mask record, #1520): outside the matrix, but through the stage-localised oracles.
+_DENSE_TAIL_CELL = _Cell("s992_dense_b1", 992, False, 1, 2, True, note="dense KV tail: the forward's kv_tail_mask record")
+_STAGE_MATRIX = pytest.mark.parametrize("cell", _CELLS + [_DENSE_TAIL_CELL], ids=[c.id for c in _CELLS + [_DENSE_TAIL_CELL]])
 _BITWISE_CELL = _BY_ID["s512_causal_b2-norm"]
 _KNOB_SETS = pytest.mark.parametrize("knobs", list(_KNOBS.values()), ids=list(_KNOBS))
 _GQA_CELLS = [c for c in _CELLS if c.group > 1]
@@ -1255,7 +1258,7 @@ def _assert_seeded_dw_qkvg_row_budgeted(res, v: dict, ref: dict, flip_ev: dict, 
 
 
 @requires_rubin
-@_MATRIX
+@_STAGE_MATRIX
 def test_mxfp8_stage_localised_bounds(cell):
     """Every stage of the MXFP8 backward against the bound calibrated FOR IT, on the block's own operands (module docstring): the
     bitwise layer (every payload and blob, the scalars, the delta); the gradients ``torch.equal`` a standalone
@@ -2080,8 +2083,9 @@ def test_mxfp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_
 @requires_rubin
 def test_mxfp8_dense_tail_backward_is_finite_and_quantizes_bitwise():
     """A dense ``S % 128 != 0`` has an MXFP8 record: the forward masks the KV tail in-kernel (kv_tail_mask, #1520), so the
-    backward runs over it -- every gradient finite and the bitwise layer of the matrix cells, as the launch-only cells."""
-    res = _cell_backward(_Cell("s992_dense_b1", 992, False, 1, 2, True, note="dense KV tail: the forward's kv_tail_mask record"))
+    backward runs over it -- every gradient finite and the bitwise layer of the matrix cells, as the launch-only cells; its
+    gradients against the oracles are ``test_mxfp8_stage_localised_bounds[s992_dense_b1-...]``."""
+    res = _cell_backward(_DENSE_TAIL_CELL)
     for name, ten in res.grads.items():
         if ten is not None:
             assert torch.isfinite(ten).all(), f"s992_dense_b1: {name} has non-finite cells"
