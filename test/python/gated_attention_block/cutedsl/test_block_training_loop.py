@@ -58,6 +58,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
+
+requirement_error = cutedsl_requirement_error("Gated attention block training-loop tests")
+if requirement_error:
+    pytest.skip(requirement_error, allow_module_level=True)
+
 pytestmark = pytest.mark.L0
 
 from cudnn.gated_attention_block import (  # noqa: E402
