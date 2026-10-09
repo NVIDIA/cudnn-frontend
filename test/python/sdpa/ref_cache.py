@@ -71,6 +71,7 @@ _REF_SOURCES = (  # CLOSED under its own relative / `sdpa.` imports (pinned by t
     "sdpa/fp16_ref.py",
     "sdpa/mxfp8_ref.py",
     "sdpa/helpers.py",
+    "sdpa/fp16.py",
     "sdpa/fp8.py",
     "sdpa/mxfp8.py",
     "sdpa/mxfp8_quant.py",

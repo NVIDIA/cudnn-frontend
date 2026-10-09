@@ -2121,6 +2121,7 @@ def test_fp8_first_use_on_an_explicit_stream_reads_nothing_the_ambient_stream_wr
         blk.check_support()
         ws = torch.empty_like(res.ws).fill_(0xFF)
         grads = _alloc_grads(res.blk, fill=float("nan"))
+        gc.collect()  # an earlier test's cyclic garbage freed mid-compile() moves the counter down (PR #1522, sm107 CI)
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
