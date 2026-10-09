@@ -1325,10 +1325,12 @@ def _prefer_thd_pack_gqa(caps: Capabilities, facts) -> bool:
         and facts.causal
         and not facts.has_epilogue_gate
         and (facts.d_qk, facts.d_v) in caps.thd_pack_gqa_d_shapes
-        # Nonpaged SM100 GQA16 packs too: unpacked it ran 1.04-2.58x the backend, packed 0.53-0.99.  So does cc 10.7
-        # paged THD (216 SMs, cuDNN 9.26 / 9.27, CUDA-graph replay, with or without a sink): unpacked cga2 2.8 ms
-        # against the packed set's 0.22 ms at b128 64/4 q 1 / 4 / 8 KV 2k (page 16 and 128), 184 vs 43 us at b24 mixed.
-        and facts.h_q // facts.h_kv in ((4, 8, 16) if (_sm100_f16(caps, facts) and not facts.has_paged_kv) or _sm107_paged_half(caps, facts) else (4, 8))
+        # Nonpaged SM100 also packs GQA16 (unpacked 1.04-2.58x the backend, packed 0.53-0.99) and GQA2
+        # (packed matched or beat unpacked on all 72 measured cases, e.g. 1.58 -> 0.94). So does cc 10.7
+        # paged THD with GQA16 (216 SMs, cuDNN 9.26 / 9.27, CUDA-graph replay, with or without a sink): unpacked
+        # cga2 2.8 ms against the packed set's 0.22 ms at b128 64/4 q 1 / 4 / 8 KV 2k (page 16 and 128), 184 vs 43 us at b24 mixed.
+        and facts.h_q // facts.h_kv
+        in ((2, 4, 8, 16) if _sm100_f16(caps, facts) and not facts.has_paged_kv else (4, 8, 16) if _sm107_paged_half(caps, facts) else (4, 8))
     )
 
 
