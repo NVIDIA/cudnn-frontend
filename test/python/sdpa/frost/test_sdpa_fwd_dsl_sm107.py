@@ -3760,7 +3760,9 @@ class TestStagedHalf:
 # scaled mask sentinel, -inf at scale 1, as their running max and published
 # LSE = log(1e-30) and O = NaN.  The softmax's running-max step now selects a
 # tile that is fully masked ahead of the row's first live key out of the state
-# (alpha = 1, P = 0), so those cells run as regression cells of the fix.
+# (alpha = 1, P = 0), so those cells run at scale 1 on whichever d512 kernel the
+# call-time twin switch selects; test_d512_half_masked_leading_tile_keeps_rows_
+# with_later_keys_finite pins the same geometry to the ROLE-SPLIT kernel.
 # ============================================================================
 
 _HANDOFF_GEOMETRY = dict(b=3, h_q=8, h_kv=4, s_q=1024, s_kv=512, d=512)
@@ -3873,6 +3875,7 @@ _HANDOFF_CASES = [
     # scale 1: the 130-key window of the rows past bottom-right diag 257 excludes KV tile 0 -- a fully-masked tile AHEAD of the
     # row's first live key.  The scaled chain took the sentinel * log2 e = -inf as the running max and read -inf - (-inf) = NaN
     # into P (3064 NaN rows, LSE = log(1e-30)); the running-max step now keeps such a tile out of the state (alpha = 1, P = 0).
+    # (These cells lower onto the 2x2 twin while api_dsl.D512_2X2 is on; the role-split pin is the dedicated cell below.)
     pytest.param("bf16", "causal_br_swa129", 1.0, id="bf16-causal_br_swa129-scale1"),
     pytest.param("fp16", "causal_br_swa129", 1.0, id="fp16-causal_br_swa129-scale1"),
 ]
@@ -6855,6 +6858,49 @@ def test_d512_half_prefolded_scale_keyless_and_dead_rows(_d512_role_split, dtype
         q, k, v, scale=math.log(2.0), causal_br=arm["causal_br"], window_left=arm["window_left"], q_lens=q_lens, kv_lens=kv_lens
     )
     _handoff_check(o0, lse0, ref_o, ref_lse, q_lens, tag=f"fold {mask} scale {scale}")
+    o1, lse1 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    assert torch.equal(o1, o0) and torch.equal(lse1, lse0), "two launches on identical inputs must be bitwise equal (a race otherwise)"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype_name", _D512_HALF_FOLD_DTYPES)
+def test_d512_half_masked_leading_tile_keeps_rows_with_later_keys_finite(_d512_role_split, dtype_name):
+    """The correction hand-off geometry at scale 1 pinned to the ROLE-SPLIT d512 half kernel (the call-time 2x2 twin off):
+    bottom-right causal + a 129-key window on per-batch padded Q / KV lengths -- the live rows past bottom-right diag 257
+    (130 keys each, their window excluding KV tile 0) see a fully-masked FIRST tile and their keys in later tiles.  This
+    kernel's scaled chain took the sentinel * log2 e = -inf as the running max and published O = NaN with LSE = log(1e-30)
+    on 3064 rows; the running-max step now keeps such a tile out of the state (alpha = 1, P = 0): every retained O / LSE at
+    the fp64 reference (dead and keyless rows exactly 0 / -inf), two launches on identical inputs bitwise equal."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    _d512_half_fold_skip()
+    dt = getattr(torch, dtype_name)
+    arm = _HANDOFF_MASKS["causal_br_swa129"]
+    q, k, v, q_lens, kv_lens = _handoff_problem(dt)
+    g = _HANDOFF_GEOMETRY
+    o = torch.empty(g["b"], g["s_q"], g["h_q"], g["d"], device="cuda", dtype=dt).transpose(1, 2)
+    lse = torch.empty(g["b"], g["h_q"], g["s_q"], device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q,
+        sample_k=k,
+        sample_v=v,
+        sample_o=o,
+        sample_lse=lse,
+        is_causal=True,
+        causal_bottom_right=True,
+        window_size_left=arm["window_left"],
+        scale_softmax=1.0,
+        seq_kv_lens_present=True,
+        seq_q_lens_present=True,
+    )
+    assert api.check_support()
+    api.compile()
+    _d512_half_fold_assert_module(api, prefolded=False)
+    o0, lse0 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
+    ref_o, ref_lse = _handoff_reference(q, k, v, scale=1.0, causal_br=True, window_left=arm["window_left"], q_lens=q_lens, kv_lens=kv_lens)
+    _handoff_check(o0, lse0, ref_o, ref_lse, q_lens, tag=f"role-split {dtype_name} scale 1 leading tile")
     o1, lse1 = _handoff_execute(api, q, k, v, o, lse, q_lens, kv_lens)
     assert torch.equal(o1, o0) and torch.equal(lse1, lse0), "two launches on identical inputs must be bitwise equal (a race otherwise)"
 
