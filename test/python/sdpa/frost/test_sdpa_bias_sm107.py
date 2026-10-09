@@ -434,7 +434,7 @@ def test_template_params_and_capabilities_are_appended():
 
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-9:] == [
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-10:] == [
         "bias_mode",
         "kv_mask_form",
         "tile_n",
@@ -444,12 +444,14 @@ def test_template_params_and_capabilities_are_appended():
         "dead_subtile_quiet",  # the one-batch-entry item's dead-sub-tile quiet body
         "bias_max_form",  # the row-max form of the bias / kv_mask body (test_sdpa_bias_max_form_sm107.py)
         "softmax_wgs",  # the third softmax warp group of the TILE_N-64 pair item, default 2
+        "s_slots",  # the double-buffered S of the small tiles at TILE_N 64 (default 1)
     ]  # appended in that order
-    assert (p.padded_tail_form, p.dead_subtile_quiet, p.softmax_wgs) == (
+    assert (p.padded_tail_form, p.dead_subtile_quiet, p.softmax_wgs, p.s_slots) == (
         0,
         0,
         2,
-    ), "a record without the fields renders the legacy tail, the full body and the two-group body"
+        1,
+    ), "a record without the fields renders the legacy tail, the full body, the two-group body and one S slot"
     # ... followed by the per-shape TILE_N domain (the TILE_N 64 cells of the small tiles), appended after them.
     assert [f.name for f in dataclasses.fields(Capabilities)][-5:] == ["bias_d_shapes", "bias_io_dtype_only", "kv_mask", "kv_mask_dtypes", "tile_ns_by_d_shape"]
 
@@ -520,7 +522,10 @@ def test_kernel_module_constants_and_mask_sites():
     assert cfg107.SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N == {128: 0, 64: 1}
     assert [cfg107.sm107_bias_preload_chunks(w) for w in (128, 64, 256)] == [0, 1, 1]
     assert all(cfg107.sm107_bias_preload_chunks(w) in (0, 1, 2) for w in (32, 64, 128, 256))
-    assert "make_classic_bars(CFG, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)" in src
+    assert (
+        "make_classic_bars(CFG, s_stages=CFG.TILES_Q * CFG.S_SLOTS, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)"
+        in src
+    )
     assert "form=" not in "".join(ln for ln in src.splitlines() if "apply_mask_chunk(" in ln)
     assert 'mask_value=float("-inf")' in src and "row_max_for_exp2(total_max)" in src
     assert "_kv_empty | (total_sum == cutlass.Float32(0.0))" in src, "the fully masked row's SELECT"

@@ -76,6 +76,7 @@ from cudnn.sdpa.fwd.config_sm107 import BIAS_MAX_HW_UPPER_BOUND as _BIAS_MAX_HW_
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_max_form_pick as _sm107_bias_max_form_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_softmax_wgs_pick as _sm107_softmax_wgs_pick
 from cudnn.sdpa.fwd.config_sm107 import SMALL_D_SOFTMAX_WGS as _SMALL_D_SOFTMAX_WGS
+from cudnn.sdpa.fwd.config_sm107 import sm107_s_slots_pick as _sm107_s_slots_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
@@ -1644,6 +1645,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             tiles_q=self._resident_arm_softmax_wgs(),
         )
 
+    def _s_slots(self) -> int:
+        """The ``TemplateParams.s_slots`` of this plan: 1 everywhere but the Rubin 32- / 64-wide f16/bf16 tiles, where
+        ``config_sm107.sm107_s_slots_pick`` decides (the derived 1 until the double-buffered S is measured a default; the sweep seam's
+        value verbatim, which the factory validates against TILE_N 64 and the TMEM fit)."""
+        if self.flavor in _SM107_F16_SMALL_D_SHAPES and self._device_cc == (10, 7) and not self._fp8:
+            return _sm107_s_slots_pick(self.flavor[0], self._effective_tile_n())
+        return 1
+
     def _resident_arm_bias_stages(self) -> int:
         """The ``TemplateParams.bias_stages`` of this plan: 0 off the streamed ring; else the request (``bias_stages=``, validated by
         ``check_support``) or the derived deepest ring (``config_sm107.sm107_bias_stages_pick``)."""
@@ -1664,9 +1673,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         dense KV lengths at ``s_kv >= SM107_THREE_WG_S_KV_MIN``, 2 everywhere else).  Threaded as ``tiles_q`` into every bias budget / pick this
         plan evaluates (the 3-WG body's third Q and O slab shrink the SMEM left for the bias block) and as ``rows_per_step`` into the chunk pick,
         so the plan is admitted on the budget of the body that RUNS and its chunk is a multiple of the body's rows per step (rule 8b').  The
-        pair predicate it reads does not read the width or the chunk pick back (no cycle)."""
+        pair predicate it reads does not read the width or the chunk pick back (no cycle); ``_s_slots`` reads the width only (no cycle either)."""
         if self.bias_desc is None:
-            return _sm107_softmax_wgs_pick(self.softmax_wgs)
+            return _sm107_softmax_wgs_pick(self.softmax_wgs, s_slots=self._s_slots())
         return _sm107_softmax_wgs_pick(
             self.softmax_wgs,
             d_flavor=self.flavor[0],
@@ -1678,6 +1687,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             padded=bool(self.seq_kv_lens_present),
             cga=1 if self.cga is None else int(self.cga),
             b_flat=int(self.q_desc.shape[0]),
+            s_slots=self._s_slots(),  # a two-slot record is served with two groups only (the pick degrades its default; a request stays typed)
         )
 
     def _padded_tail_form_eligible(self) -> bool:
@@ -2866,6 +2876,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             bias_max_form=self._resident_arm_bias_max_form(),
             # The softmax warp-group count (2 = every record so far; 3 = the third softmax warp group of the TILE_N-64 pair item, an experiment).
             softmax_wgs=self._resident_arm_softmax_wgs(),
+            # The S / P TMEM slot count per sub-tile (1 on every record but the Rubin small tiles' double-buffered S at TILE_N 64):
+            # config_sm107.sm107_s_slots_pick -- the derived 1, or the sweep seam's value verbatim (a typed factory raise off its domain).
+            s_slots=self._s_slots(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

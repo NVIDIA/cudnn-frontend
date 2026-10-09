@@ -324,6 +324,14 @@ class TemplateParams:
     # hence a cache-key field -- the kernel-module cache is keyed by this record, so the 3-WG build is its own module; APPENDED.
     # ``config_sm107._validate_softmax_wgs`` pins its serving set (TILE_N 64, the pair item, cga1, the f16/bf16 32- / 64-wide tiles).
     softmax_wgs: int = 2
+    # The S / P TMEM slot count per softmax sub-tile of the Rubin 32- / 64-wide f16/bf16 tiles at TILE_N 64 (APPENDED after ``softmax_wgs``; the sm107
+    # d128 file reads it through getattr, every other template ignores it): 1 = one slot per sub-tile (every record so far renders
+    # byte-identically), 2 = the double-buffered S -- the MMA warp issues BMM1(k + 1) into the free slot ahead of BMM2(k) so the
+    # tensor core runs it while the softmax is still on S(k).  A template-key field (not a compile() arg, not a config seam): the
+    # slot count changes the TRACED code (the TMEM map, two barrier rings' extents, three roles' cursors) and the template-module
+    # cache keys on this record alone, so a process that builds both forms must see two records.  Picked by
+    # config_sm107.sm107_s_slots_pick; validated by the factory (TILE_N 64, the small f16/bf16 tiles, the TMEM fit).
+    s_slots: int = 1
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

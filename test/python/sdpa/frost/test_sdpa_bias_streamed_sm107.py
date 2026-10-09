@@ -334,7 +334,7 @@ def test_template_params_cfg_and_bars_are_appended():
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
     assert (
-        fields[-6:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs"]
+        fields[-7:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots"]
         and TemplateParams().bias_stages == 0
     ), "append-only; 0 renders every existing record byte-identically"
     assert c._CfgSm107.STAGES_BIAS == 0
@@ -355,7 +355,10 @@ def test_kernel_carries_the_streamed_ring_as_one_const_expr_axis():
     assert src.count("bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()") == 1
     assert src.count("bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)") == 2 and src.count("return advance(bias_ring_state, CFG.STAGES_BIAS)") == 1
     assert "for bs in cutlass.range_constexpr(CFG.STAGES_BIAS):" in src
-    assert "make_classic_bars(CFG, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)" in src
+    assert (
+        "make_classic_bars(CFG, s_stages=CFG.TILES_Q * CFG.S_SLOTS, bias_resident=_BIAS_RESIDENT, bias_ring_stages=CFG.STAGES_BIAS if _BIAS_STREAMED else 0)"
+        in src
+    )
     assert "n_tiles=bias_smem_tiles(CFG)" in src
     assert "if cutlass.const_expr(_BIAS_ARM):\n                if item_live:" not in src, "the item-level rows fold on the RESIDENT guard"
     assert "if cutlass.const_expr(_BIAS_RESIDENT):" in src

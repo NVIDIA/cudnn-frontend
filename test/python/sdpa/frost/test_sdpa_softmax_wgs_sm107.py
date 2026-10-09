@@ -76,7 +76,8 @@ def test_the_record_field_and_the_seam_are_appended_and_default_to_two():
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-1] == "softmax_wgs" and TemplateParams().softmax_wgs == 2
+    # `s_slots` (the double-buffered S of the small tiles) is appended after it: the tail names both
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-2:] == ["softmax_wgs", "s_slots"] and TemplateParams().softmax_wgs == 2
     assert c._SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS is None, "the seam is a per-test / per-sweep pin, never a module default"
     assert c.SMALL_D_SOFTMAX_WGS == frozenset({2, 3}) and "SMALL_D_SOFTMAX_WGS" in c.__all__ and "sm107_softmax_wgs_pick" in c.__all__
     assert c.sm107_softmax_wgs_pick() == 2 and c.sm107_softmax_wgs_pick(3) == 3

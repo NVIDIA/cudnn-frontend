@@ -118,6 +118,8 @@ __all__ = [
     "SM107_THREE_WG_S_KV_MIN",
     "SM107_THREE_WG_B_FLAT_MAX",
     "sm107_softmax_wgs_pick",
+    "SMALL_D_S_SLOTS",
+    "sm107_s_slots_pick",
     "sm107_f16_tile_width",
     "sm107_small_tile_leg",
     "D128FamilyTmemLayout",
@@ -629,7 +631,9 @@ def sweep_seam_state() -> Optional[tuple]:
     the template-module cache key and the source digest (``template_loader.load_template(extra_key=)``): the module cache keys on the
     TemplateParams record, and a seam moves ``Cfg`` fields (the ring depth, the Q tile height) WITHOUT touching the record -- so two
     renderings that differ only by a seam would otherwise share one module in a process (the second request silently running the
-    first rendering) and one compiled-plan artifact on disk."""
+    first rendering) and one compiled-plan artifact on disk.  ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` is NOT in the tuple on purpose: its
+    pick lands IN the record (``TemplateParams.s_slots``, ``sm107_s_slots_pick``), so the record alone already keys the two
+    renderings -- a seam belongs here only when it moves ``Cfg`` without moving the record."""
     state = (
         _N_CHUNK_OVERRIDE_FOR_SWEEPS,
         _BIAS_MODE_OVERRIDE_FOR_SWEEPS,
@@ -755,17 +759,24 @@ def sm107_softmax_wgs_pick(
     padded: bool = False,
     cga: int = 1,
     b_flat: Optional[int] = None,
+    s_slots: int = 1,
 ) -> int:
     """The ``TemplateParams.softmax_wgs`` a plan records: the adapter's ``softmax_wgs=`` request, else the sweep seam
     ``_SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS``, else the MEASURED rule above -- 3 for a bias + kv_mask graph on the (n, n+1) pair item at TILE_N 64 /
     cga 1 with dense KV lengths, ``s_kv >= SM107_THREE_WG_S_KV_MIN`` and at most ``SM107_THREE_WG_B_FLAT_MAX`` flattened batch rows (the 32- /
-    64-wide tiles), 2 everywhere else (a caller that does not know the flattened batch gets 2).  Validity of a REQUEST --
+    64-wide tiles), 2 everywhere else (a caller that does not know the flattened batch gets 2; a two-slot record -- ``s_slots`` 2 -- gets 2,
+    the only group count the double-buffered S is served with).  Validity of a REQUEST --
     TILE_N 64, the pair item, cga1, the f16/bf16 32- / 64-wide tiles -- is :func:`_validate_softmax_wgs`'s, declined typed by the adapter's
     ``check_support`` before the factory is reached.  ONE arithmetic for the engine row's budget, the adapter and the sweep (rule 8b')."""
     if request is not None:
         return int(request)
     if _SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS is not None:
         return int(_SOFTMAX_WGS_OVERRIDE_FOR_SWEEPS)
+    if int(s_slots) == 2:
+        # The double-buffered S (``TemplateParams.s_slots`` 2) is served with TWO softmax warp groups only (its MMA issue order hand-unrolls two
+        # sub-tiles; ``_validate_tile_n``): a measured DEFAULT must never produce an invalid record, so a two-slot plan that requests no group
+        # count takes two groups where the rule below would pick three.  A REQUEST of three (or the seam) passes verbatim and the factory declines it typed.
+        return 2
     if (
         pair
         and int(cga) == 1
@@ -781,6 +792,32 @@ def sm107_softmax_wgs_pick(
     ):
         return 3
     return 2
+
+
+# ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` (same rules as the three seams above) pins the S / P TMEM slot count per softmax sub-tile of the
+# 32- / 64-wide f16/bf16 tiles at TILE_N 64 (``TemplateParams.s_slots``; :data:`SMALL_D_S_SLOTS`): 2 = the double-buffered S (the MMA
+# warp issues BMM1(k + 1) into the free slot ahead of BMM2(k)), None = the derived count (1).  Read by :func:`sm107_s_slots_pick`, which
+# the adapter calls when it builds the record -- the value lands IN the TemplateParams, so the template-module cache (keyed on the
+# record alone) and the compiled-plan cache both see two kernels for the two counts; a pinned value is returned VERBATIM, so a plan
+# outside the arm's domain (TILE_N 128, d128, a quantized dtype) is a typed factory raise, never a silent one-slot rendering under a
+# two-slot label (an A/B whose two arms share one record compares the first-built kernel with itself).
+_S_SLOTS_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+# The S / P slot counts the small-tile body is validated at: 1 (the classic one slot per sub-tile) and 2 (the double-buffered S at
+# TILE_N 64 -- the TMEM map 2 sub-tiles x 2 slots x 64 + O + STATS fits the 576 columns; at TILE_N 128 it does not, a 3-slot S fits
+# nowhere: 3 x 2 x 128 = 768).
+SMALL_D_S_SLOTS = frozenset({1, 2})
+
+
+def sm107_s_slots_pick(d_flavor: int, tile_n: int, *, dtype_qkv: int = _DTYPE_BF16, request: Optional[int] = None) -> int:
+    """The ``TemplateParams.s_slots`` a knob-less plan gets: ``request`` when the caller made one (returned verbatim; the factory
+    validates it), else the sweep seam ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` (verbatim, see its note), else 1.  The derived count is 1 on
+    every shape until the double-buffered S is MEASURED a win on the cells the heuristics serve (the TILE_N 64 bias + kv_mask forms);
+    the arguments name the domain the measurement is keyed on and are what a future rule reads."""
+    if request is not None:
+        return int(request)
+    if _S_SLOTS_OVERRIDE_FOR_SWEEPS is not None:
+        return int(_S_SLOTS_OVERRIDE_FOR_SWEEPS)
+    return 1
 
 
 # The ONE-BATCH-ENTRY item at the 32-wide tile's cga1 STREAMS its bias wherever its ring fits, resident budget or not: the 256-row
@@ -1467,6 +1504,13 @@ class _CfgSm107:
     # The row-max form of the -inf body (TemplateParams.bias_max_form): 0 = the software max tree, 1 = the hardware upper bound
     # (BIAS_MAX_HW_UPPER_BOUND).  Pure instruction-stream axis: no barrier, no SMEM, no accumulator parity depends on it.
     BIAS_MAX_FORM: int = 0
+    # The S / P TMEM slot count per softmax sub-tile (TemplateParams.s_slots; d128-file f16/bf16 small tiles at TILE_N 64 only): 1 = the
+    # classic one slot per sub-tile (every seam folds on cutlass.const_expr(CFG.S_SLOTS == 2), so 1 traces the one-slot instruction
+    # stream byte-for-byte), 2 = the double-buffered S -- the TMEM map gains the slot axis (d128_family_tmem_layout: S[qs][p] at
+    # S_OFF[qs] + p * S_SLOT_STRIDE), mb_bmm1_done / mb_bmm2_ready gain a x 2 stage axis (make_classic_bars(s_stages=TILES_Q x S_SLOTS)),
+    # and every role walks a depth-2 PipelineState cursor over the slots, advanced once per non-empty kv tile.  A pure overlap knob:
+    # the same MMAs and softmax steps in the same order -- O and Stats are BITWISE the one-slot kernel's.
+    S_SLOTS: int = 1
 
 
 @dataclass(frozen=True)
@@ -1541,6 +1585,10 @@ class D128FamilyTmemLayout:
     O_OFF: Tuple[int, ...]
     STATS_OFF: int
     STATS_COLS_PER_SUBTILE: int = 8
+    # The S / P slot axis (Cfg.S_SLOTS; 1 on every rendering but the double-buffered small tiles): slot p of sub-tile qs sits at
+    # S_OFF[qs] + p * S_SLOT_STRIDE (its P at P_OFF[qs] + p * S_SLOT_STRIDE); S_OFF / P_OFF name slot 0.
+    S_SLOTS: int = 1
+    S_SLOT_STRIDE: int = 0
 
 
 def d128_family_tmem_layout(cfg, *, stats_cols_per_subtile: int = 8) -> D128FamilyTmemLayout:
@@ -1559,10 +1607,15 @@ def d128_family_tmem_layout(cfg, *, stats_cols_per_subtile: int = 8) -> D128Fami
     if stats_cols_per_subtile < 8 or stats_cols_per_subtile % 8:
         raise ValueError(f"d128_family_tmem_layout: stats_cols_per_subtile must be a multiple of 8, at least 8 (got {stats_cols_per_subtile})")
     stats_region = _D128_FAMILY_STATS_REGION_COLS + cfg.TILES_Q * (stats_cols_per_subtile - 8)
-    s_off = tuple(qs * cfg.TILE_N for qs in range(cfg.TILES_Q))
+    # The slot axis (Cfg.S_SLOTS, 1 on every record but the double-buffered small tiles; read through getattr so the quantized
+    # siblings' Cfg classes, which carry no such field, keep their map): sub-tile qs owns S_SLOTS consecutive TILE_N-column slots,
+    # S[qs][p] = (qs * S_SLOTS + p) * TILE_N, each with its own P tail; O follows the LAST slot.  At S_SLOTS = 1 every value is the map
+    # the kernels always had.
+    n_slots = int(getattr(cfg, "S_SLOTS", 1))
+    s_off = tuple(qs * n_slots * cfg.TILE_N for qs in range(cfg.TILES_Q))
     p_width = (cfg.TILE_N * cfg.BPE) // 4
     p_off = tuple(s + cfg.TILE_N - p_width for s in s_off)
-    o_base = cfg.TILES_Q * cfg.TILE_N
+    o_base = cfg.TILES_Q * n_slots * cfg.TILE_N
     o_off = tuple(o_base + qs * cfg.TILE_O for qs in range(cfg.TILES_Q))
     return D128FamilyTmemLayout(
         TOTAL_COLS=TMEM_TOTAL_COLS,
@@ -1571,6 +1624,8 @@ def d128_family_tmem_layout(cfg, *, stats_cols_per_subtile: int = 8) -> D128Fami
         O_OFF=o_off,
         STATS_OFF=TMEM_TOTAL_COLS - stats_region,
         STATS_COLS_PER_SUBTILE=stats_cols_per_subtile,
+        S_SLOTS=n_slots,
+        S_SLOT_STRIDE=cfg.TILE_N if n_slots > 1 else 0,
     )
 
 
@@ -1979,8 +2034,30 @@ def _validate_tile_n(cfg, flavor: str) -> None:
                 f"{flavor}: the softmax chunking is TILE_N / 64 chunks of 64 (got {cfg.N_BMM2_CHUNKS} x {cfg.BMM2_CHUNK_SIZE} vs TILE_N={cfg.TILE_N})",
             ),
             (
+                getattr(cfg, "S_SLOTS", 1) in SMALL_D_S_SLOTS,
+                f"{flavor}: the S / P slot count per sub-tile is validated at S_SLOTS in {sorted(SMALL_D_S_SLOTS)} (got {getattr(cfg, 'S_SLOTS', 1)}): a 3-slot S "
+                f"fits no TMEM map at two sub-tiles (3 x 2 x 128 = 768 > {lay.TOTAL_COLS}) and the body walks a depth-S_SLOTS cursor validated at 1 / 2",
+            ),
+            (
+                getattr(cfg, "S_SLOTS", 1) == 1 or cfg.TILE_N == 64,
+                f"{flavor}: the double-buffered S (S_SLOTS = {getattr(cfg, 'S_SLOTS', 1)}) is the TILE_N 64 form: at TILE_N {cfg.TILE_N} the map "
+                f"{cfg.TILES_Q} sub-tiles x {getattr(cfg, 'S_SLOTS', 1)} slots x {cfg.TILE_N} S columns + the O slots ends at {lay.O_OFF[-1] + cfg.TILE_O}, past the "
+                f"STATS region at {lay.STATS_OFF} of the {lay.TOTAL_COLS}-column allocation -- the next kv tile's BMM1 would overwrite the softmax stats",
+            ),
+            (
+                getattr(cfg, "S_SLOTS", 1) == 1 or (cfg.TILE_K <= 64 and cfg.DTYPE_QKV > _DTYPE_E5M2),
+                f"{flavor}: the double-buffered S is wired on the f16/bf16 32- / 64-wide tiles only (TILE_K={cfg.TILE_K}, DTYPE_QKV={cfg.DTYPE_QKV}): the "
+                f"quantized d128 files and the d128 rendering keep one slot per sub-tile",
+            ),
+            (
+                getattr(cfg, "S_SLOTS", 1) == 1 or getattr(cfg, "SOFTMAX_WARPGROUPS", 2) == 2,
+                f"{flavor}: the double-buffered S (S_SLOTS = {getattr(cfg, 'S_SLOTS', 1)}) is served with two softmax warp groups only (got "
+                f"SOFTMAX_WARPGROUPS={getattr(cfg, 'SOFTMAX_WARPGROUPS', 2)}): the two-slot MMA issue order (BMM1(k) of both sub-tiles ahead of BMM2(k - 1) of "
+                f"both) hand-unrolls the two-sub-tile body and its barrier audit is the two-group one; the third softmax warp group keeps one slot per sub-tile",
+            ),
+            (
                 lay.O_OFF[-1] + cfg.TILE_O <= lay.STATS_OFF,
-                f"{flavor}: TILES_Q x TILE_N + TILES_Q x TILE_O = {lay.O_OFF[-1] + cfg.TILE_O} TMEM columns must end at or before STATS ({lay.STATS_OFF})",
+                f"{flavor}: TILES_Q x S_SLOTS x TILE_N + TILES_Q x TILE_O = {lay.O_OFF[-1] + cfg.TILE_O} TMEM columns must end at or before STATS ({lay.STATS_OFF})",
             ),
         ]
     )
@@ -2190,6 +2267,13 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     tile_n = int(getattr(params, "tile_n", 128))
     if tile_n != 128 and (params.dtype_qkv <= _DTYPE_E5M2 or tile_k > 64):
         raise ValueError(f"{flavor}: TILE_N = {tile_n} is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep 128)")
+    # The S / P slot count (TemplateParams.s_slots, appended; getattr so a record without the field renders one slot): 2 = the
+    # double-buffered S of the f16/bf16 small tiles at TILE_N 64 -- _validate_tile_n pins the couplings (the TMEM fit, the width, the dtype).
+    s_slots = int(getattr(params, "s_slots", 1))
+    if s_slots != 1 and (params.dtype_qkv <= _DTYPE_E5M2 or mxfp8 or tile_k > 64):
+        raise ValueError(
+            f"{flavor}: s_slots = {s_slots} (the double-buffered S) is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep 1)"
+        )
     bias_mode = int(getattr(params, "bias_mode", 0))
     kv_mask_form = int(getattr(params, "kv_mask_form", 0))
     if bias_mode or kv_mask_form:
@@ -2376,6 +2460,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         N_CHUNK=n_chunk,
         STAGES_BIAS=stages_bias,
         BIAS_MAX_FORM=bias_max_form,
+        S_SLOTS=s_slots,
     )
 
     _validate_regs(cfg, flavor)
