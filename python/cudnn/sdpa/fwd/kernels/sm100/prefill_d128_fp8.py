@@ -2092,7 +2092,7 @@ def _softmax_warp_group(
     # Phase trackers persist (XOR) across tile boundaries.
     bmm1_phase = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes
-    # BOTH softmax wgs wait on mb_o_empty[0]; init phase=1, XOR after.
+    # init phase=1, XOR after; each softmax wg waits its own O slot (see the top-of-tile wait).
     epilogue_state = cutlass.Int32(1)
 
     # total_sum is Vector[Float32, 2] (even/odd partials) so per-iter update
