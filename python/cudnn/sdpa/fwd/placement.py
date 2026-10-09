@@ -224,8 +224,8 @@ THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measur
 THD_PACKED_GQA2_MIN_KV_TOKENS = 4096  # GQA2 packs two heads a tile: large batches on a 1-2k cache lost up to 1.26x
 # Small unsplit packed launches lose to the backend (KV 576-1024 below ~110 query rows per SM: up to
 # 1.43x on B200 and a 68-SM SM100); 8192 rows lost on B200 (148 SMs) and won 0.71-0.89 on 68 SMs.
-THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # b * h_q * s_q per SM
-THD_PACKED_LONG_Q = 256  # ... except long sequences: Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
+THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # h_q * (b * s_q, or a smaller declared token total) per SM
+THD_PACKED_LONG_Q = 256  # ... except long sequences (by declared total / b): Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
 THD_PACKED_LONG_Q_MIN_KV = 1024
 CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
 
@@ -492,8 +492,12 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
         and not (facts.has_sink or facts.right_band_widening)
         and facts.s_kv > THD_PACKED_MIN_KV_TOKENS
         and (
-            facts.b * facts.h_q * facts.s_q >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
-            or (facts.s_q >= THD_PACKED_LONG_Q and facts.s_kv >= THD_PACKED_LONG_Q_MIN_KV)
+            facts.h_q * min(facts.b * facts.s_q, facts.max_total_seq_len_q or facts.b * facts.s_q)
+            >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
+            or (
+                min(facts.s_q, -(-(facts.max_total_seq_len_q or facts.b * facts.s_q) // facts.b)) >= THD_PACKED_LONG_Q
+                and facts.s_kv >= THD_PACKED_LONG_Q_MIN_KV
+            )
         )
         and (facts.h_q != 2 * facts.h_kv or facts.s_kv >= THD_PACKED_GQA2_MIN_KV_TOKENS)
         and _prefer_thd_pack_gqa(caps, facts)
