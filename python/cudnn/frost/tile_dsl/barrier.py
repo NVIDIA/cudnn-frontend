@@ -217,9 +217,16 @@ def launch_dependent_grids():
 def mbar_arrive_on_peer(mb, peer_cta_id, pred=None, release_cta: cutlass.Constexpr[bool] = False):
     """One arrive per calling lane on the PEER CTA's copy of ``mb`` (``mapa``; nothing here elects -- the caller counts lanes).
 
-    ``release_cta=False`` (the default; every untouched call site compiles to the same cubin as before this kwarg existed):
-    ``mbarrier.arrive.relaxed.cluster`` -- a COUNT-ONLY credit for data the arrive does not have to order (an async-proxy write
-    already completed by ``tcgen05_wait`` or a TMA ``complete_tx``), or a one-shot notification (``mb_tmem_dealloc``).
+    ``release_cta=False`` (the default; every call site that predates this kwarg compiles to the same cubin as before it existed):
+    ``mbarrier.arrive.relaxed.cluster`` -- RIGHT for a COUNT-ONLY credit whose data an async proxy already ordered (a ``tcgen05_st``
+    completed by ``tcgen05_wait(STORE)``, a TMA ``complete_tx``, a TMA store drained by ``tma_store_wait``) and for a one-shot
+    notification (``mb_tmem_dealloc``).  The default is what those callers COMPILED TO, not a statement that each of them is such a
+    credit: the d512 forwards' per-iteration cross-sub-group ``mb_alpha_xfer_empty`` credit follows the thread's own generic
+    ``alpha_addr.load()`` of the slot it frees and still takes the default -- a read-then-credit shape that is an OPEN family audit,
+    not a verified exemption (the d512 backward's ``mb_s_xfer_empty`` credit is not one: a named barrier performs the four warps' reads
+    before the elected arrive).  Static detector for any caller: name the last generic load of the stage before the arrive; if there
+    is one and nothing between them performs it (a ``bar.sync`` of every reading warp counts, a relaxed arrive does not), the site
+    belongs to the ``release_cta=True`` case below.
 
     ``release_cta=True``: ``mbarrier.arrive.release.cta.shared::cluster`` -- for a READ-then-credit across CTAs: the credit that
     lets the PEER refill a stage THIS thread has just read with generic loads (the multicast bias ring's ``_empty``: the peer's next
@@ -227,10 +234,17 @@ def mbar_arrive_on_peer(mb, peer_cta_id, pred=None, release_cta: cutlass.Constex
     thread's prior ``ld.shared`` before the credit becomes visible, so ptxas may hoist it above an independent load and the refill
     lands under the read -- the same shape as the ``tcgen05_wait(LOAD)`` arrive-between-loads incident.  The CTA-scope release
     is the scheduler credit's form (``scheduler.read_tile_id_arrive``: "a relaxed arrive would let the refill race a
-    still-in-flight decode") and CUTLASS's ``consumer_release``; on sm_107a both forms lower to the same
-    ``USYNCS.ARRIVE.TRANS64.RED.ACT0`` with no ``CGAERRBAR`` / ``MEMBAR.ALL.GPU`` (:func:`arrive_on_leader_release`), so the
-    release form is FREE.  Never ``.release.cluster`` (a GPU-scope drain per arrive).  The predicated arms are inline PTX with one
-    REGISTER operand (the ``inline_ptx(predicate=)`` hazard needs an immediate operand, which these templates do not have)."""
+    still-in-flight decode") and CUTLASS's ``consumer_release``; on sm_107a the flip changes NO SASS text and costs nothing: the
+    relaxed and the release form lower to the same ``USYNCS.ARRIVE.TRANS64.RED.*`` instruction whose suffix is the LOWERING SHAPE,
+    not the memory order -- ``.RED.A1T0`` for the predicated inline-PTX credit (the multicast bias ring's four ring credits are the
+    same ``USYNCS.ARRIVE.TRANS64.RED.A1T0`` at the same positions before and after the flip, 3640 instructions identical, 16 cubin
+    bytes = the arrive's ordering bits), ``.RED.ACT0`` for the unpredicated DSL arrive (:func:`arrive_on_leader_release` and the
+    unpredicated arm here; a local arrive is the non-``RED`` ``USYNCS.ARRIVE.TRANS64.ACT0``) -- with no ``CGAERRBAR`` /
+    ``MEMBAR.ALL.GPU`` on either form; every mnemonic is pinned and printed by ``test_tile_dsl_release_arrive.py``.  Never
+    ``.release.cluster`` (a GPU-scope drain per arrive).  The predicated arms are inline PTX with one REGISTER operand (the
+    ``inline_ptx(predicate=)`` hazard needs an immediate operand, which these templates do not have).  Both ``release_cta=True`` arms are
+    pinned by ``test_tile_dsl_release_arrive.py`` (forms ``peer_release`` / ``peer_release_pred``: the PTX form, the SASS no-drain pins, a
+    2-CTA publish-then-read on Rubin); the unpredicated arm has no kernel caller yet -- the pin is what keeps it from rotting unseen."""
     peer_mb = nvvm.mapa(mb, peer_cta_id)
     if cutlass.const_expr(pred is None):
         if cutlass.const_expr(release_cta):
