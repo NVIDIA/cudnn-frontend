@@ -17,8 +17,11 @@ PER SEQUENCE on the packed rows: ``dh`` packed back row by row, every weight gra
 masses combined as ``sqrt(sum mass_i^2)``, ``amax_dP`` the max over the sequences.  Tolerances are the dense fp8 suite's,
 imported and never re-literalled: the fp8 SDPA row's recipe on the SDPA stage per sequence (``_row_tol``: ``_FP8_GRAD_TOL`` with
 ``assert_close_fp8_grad``'s flip budget, ``amax_dP`` under ``_AMAX_DS_TOL``) plus the bf16 block's bound form on the stage's bf16
-output, the (M) end-to-end in the row-budgeted form (``1e-5 x rows x keys``) on ``dh / dw_qkvg / dw_o``, the seeded oracle under the
-bf16 block's bound on ``dh / dw_o / dW_norm`` and, on ``dw_qkvg``, in the row-budgeted form with the dense suite's flip ATTRIBUTION
+output, the (M) end-to-end in the row-budgeted form (``1e-5 x rows x keys``) on ``dh / dw_qkvg``, the seeded oracle under the
+bf16 block's bound on ``dh / dW_norm``, ``dw_o`` on both layers in the dense suite's e4m3 FLIP-CLASS form (``_assert_dw_o_flip_structured``:
+every cell outside the bf16 bound in a column an ``og8`` flip touched, the residual after the flips' exact rank-1 term inside the bound,
+the flip class itself capped -- the og8 cast's one-code flips are COLUMN events a row count at a short reduction does not describe; a
+kernel-vs-kernel reference keeps ``dw_o`` row-budgeted) and, on ``dw_qkvg``, in the row-budgeted form with the dense suite's flip ATTRIBUTION
 (every row outside the bound a ``dqkvg8`` flip's, its pre-cast slab column inside its band's bound, and -- the magnitude guard -- the whole ``dW_qkvg`` within the GEMM suite's bound
 of its own dequantized codes) -- where that budget is its FLOOR
 (fewer than 20 tokens: the 5-token cell) the ``dw_qkvg`` row count is REPORTED, not asserted, and the attribution carries the pin on
@@ -86,6 +89,7 @@ from test_block_backward import _KNOBS, _alloc_grads, _assert_dw_norm_close, _as
 from test_block_backward_fp8 import (  # noqa: E402
     _E4M3,
     _api_const,
+    _assert_dw_o_flip_structured,
     _assert_dw_qkvg_floor_guard,
     _assert_quantizers_scalars_delta_bitwise,
     _assert_seeded_dw_qkvg_row_budgeted,
@@ -459,21 +463,31 @@ def _assert_sdpa_stage_per_sequence(res, v: dict) -> None:
 
 def _assert_m_row_budgeted(tag: str, res, ref: dict, flip_ev: Optional[dict] = None, v: Optional[dict] = None) -> dict:
     """The (M) end-to-end in the dense suite's ONE form: the bf16 block's bound with the SDPA stage's flip class propagated and budgeted
-    by ROWS (``1e-5 x rows x keys``, at least 1) on ``dh / dw_qkvg / dw_o`` -- every output, both GQA fold paths included (the row folds
-    its per-Q-head partials from fp32, rounding once like the reference) -- never widened.  Where ``dw_qkvg``'s budget is its FLOOR
+    by ROWS (``1e-5 x rows x keys``, at least 1) on ``dh / dw_qkvg`` -- both GQA fold paths included (the row folds its per-Q-head
+    partials from fp32, rounding once like the reference) -- never widened.  Where ``dw_qkvg``'s budget is its FLOOR
     (``_row_budget_floored``: fewer than 20 tokens) the count is REPORTED and every row outside is held to the cast's flip class instead
     -- a row a ``dqkvg8`` flip touched, its pre-cast slab column inside its band's bound (the dense suite's attribution conditions (2)
     and (3), read from ``flip_ev`` = ``_report_seeded_intermediates``'s evidence, REQUIRED there) AND to the dense suite's magnitude guard
     (4): the whole ``dW_qkvg`` within the GEMM suite's bound of ``dqkvg8^T . h8`` on the block's own codes (``v`` = the intermediates,
     REQUIRED there; ``_assert_dw_qkvg_floor_guard`` -- the residual form needs the oracle's codes and is the seeded layer's) -- the honest
-    form of the pin at a length whose proportional budget does not describe the class; ``dh / dw_o`` keep the row-budgeted form at every
-    length.  Returns the per-output report."""
+    form of the pin at a length whose proportional budget does not describe the class; ``dh`` keeps the row-budgeted form at every
+    length.  ``dw_o`` takes the dense suite's e4m3 flip-class form (``_assert_dw_o_flip_structured``: the og8 cast's one-code flips are
+    COLUMN events, so a row count at a short reduction does not describe them) against an ORACLE reference, which carries the ``og8``
+    the form attributes by; a kernel-vs-kernel reference (the uniform packed ``B = 4`` block against the dense ``B = 4`` block) has no
+    ``og8`` and keeps ``dw_o`` row-budgeted as before.  Returns the per-output report."""
     m = _print_end_to_end(tag, res.grads, ref, keys=_row_keys(res))
     assert m, tag
     floored = "dw_qkvg" in m and _row_budget_floored(m["dw_qkvg"]["rows"], _row_keys(res)["dw_qkvg"])
-    budgeted = ("dh", "dw_o") if floored else ("dh", "dw_qkvg", "dw_o")
+    # dW_o: the e4m3 flip-class form at every length -- against an ORACLE reference, which carries the og8 the form attributes by; a
+    # kernel-vs-kernel reference (the uniform packed B=4 block vs the dense B=4 block) has no og8 and keeps the row-budgeted form
+    flip_form = res.grads.get("dw_o") is not None and ref.get("og8") is not None
+    budgeted = ("dh",) if floored else ("dh", "dw_qkvg")
+    if res.grads.get("dw_o") is not None and not flip_form:
+        budgeted = budgeted + ("dw_o",)
     over = {n: (m[n]["rows_outside"], m[n]["rows"], m[n]["row_budget"]) for n in budgeted if n in m and m[n]["rows_outside"] > m[n]["row_budget"]}
     assert not over, f"{tag}: (M) rows outside the bf16 bound exceed the 1e-5 x rows x keys row budget (rows outside, rows, budget): {over}"
+    if flip_form:
+        _assert_dw_o_flip_structured(res, _slots(res) if v is None else v, ref, f"{tag} dw_o")
     if floored:
         assert flip_ev is not None, f"{tag}: the dw_qkvg row budget is its floor here -- the flip evidence is required for the attribution form"
         rows_out = torch.nonzero(_rows_outside_mask(res.grads["dw_qkvg"], ref["dw_qkvg"])).flatten()
@@ -500,8 +514,9 @@ def _assert_m_row_budgeted(tag: str, res, ref: dict, flip_ev: Optional[dict] = N
 
 
 def _assert_seeded_under_the_bf16_bound(tag: str, res, ref: dict, v: Optional[dict] = None, flip_ev: Optional[dict] = None) -> dict:
-    """Downstream of the SDPA stage, the dense suite's seeded layer at ``B = 1, S = T``: ``dh / dw_o`` vs the oracle SEEDED with the
-    block's own per-sequence dQ / dK / dV under the bf16 block's bound, ``dW_norm`` under the noise bound with the combined mass, and
+    """Downstream of the SDPA stage, the dense suite's seeded layer at ``B = 1, S = T``: ``dh`` vs the oracle SEEDED with the block's
+    own per-sequence dQ / dK / dV under the bf16 block's bound, ``dw_o`` in the e4m3 flip-class form (``_assert_dw_o_flip_structured``),
+    ``dW_norm`` under the noise bound with the combined mass, and
     ``dw_qkvg`` in the ROW-BUDGETED form WITH its attribution (``_assert_seeded_dw_qkvg_row_budgeted`` over the packed slab: the rows
     with a cell outside the bound within ``1e-5 x rows x keys``, EVERY such row one a ``dqkvg8`` flip touched, its PRE-cast slab column
     inside its band's bound -- the cast's rounding, not a band's miss; the flip evidence from ``_report_seeded_intermediates`` over the
@@ -510,9 +525,10 @@ def _assert_seeded_under_the_bf16_bound(tag: str, res, ref: dict, v: Optional[di
     floored form), else it is computed here."""
     v = _slots(res) if v is None else v
     worst = {}
-    for name in ("dh", "dw_o"):
-        if res.grads[name] is not None:
-            worst[name] = _assert_grad_close(res.grads[name], ref[name], f"{tag} {name} vs the seeded oracle")
+    if res.grads["dh"] is not None:
+        worst["dh"] = _assert_grad_close(res.grads["dh"], ref["dh"], f"{tag} dh vs the seeded oracle")
+    if res.grads["dw_o"] is not None:
+        worst["dw_o"] = _assert_dw_o_flip_structured(res, v, ref, f"{tag} dw_o vs the seeded oracle")  # the e4m3 flip-class form
     if res.grads["dw_qkvg"] is not None:
         flip_ev = _report_seeded_intermediates(res, v, ref) if flip_ev is None else flip_ev
         worst["dw_qkvg"] = _assert_seeded_dw_qkvg_row_budgeted(res, v, ref, flip_ev, f"{tag} dw_qkvg vs the seeded oracle")
@@ -651,8 +667,9 @@ def test_thd_fp8_gradients_match_the_per_sequence_modelled_oracle(causal, h_kv):
     MHA 8/8, at the calibrated ``scale_dp``: the dense fp8 suite's layers at ``B = 1, S = T`` -- the quantizers, every scalar and the
     delta BITWISE (the delta the chain's own ``dot_do_o`` over the packed bf16 O / dO with an exactly-zero tail); the SDPA stage's bf16
     dQ / dK / dV of EVERY sequence under the fp8 row's recipe and the bf16 bound form, ``amax_dP`` the max over the sequences; the (M)
-    end-to-end row-budgeted on ``dh / dw_qkvg / dw_o`` against the per-sequence modelled oracle (``dh`` per sequence, the weight
-    gradients the SUM over the sequences); ``dh / dw_o / dW_norm`` vs the seeded per-sequence oracle under the bf16 block's bound,
+    end-to-end row-budgeted on ``dh / dw_qkvg`` against the per-sequence modelled oracle (``dh`` per sequence, the weight gradients
+    the SUM over the sequences) and ``dw_o`` in the e4m3 flip-class form; ``dh / dW_norm`` vs the seeded per-sequence oracle under the
+    bf16 block's bound, ``dw_o`` in the flip-class form again,
     ``dw_qkvg`` in the row-budgeted form with its flip attribution (every row outside a ``dqkvg8`` flip's, its pre-cast slab column
     inside its band's bound).
     Magnitudes are printed on every cell; no bound is this module's own."""
