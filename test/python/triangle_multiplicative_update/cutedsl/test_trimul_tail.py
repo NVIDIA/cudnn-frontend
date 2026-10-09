@@ -70,6 +70,16 @@ def test_accumulators_arm_declines_typed(kw):
         sub.validate_ln_dual_gemm_params(sub.LnDualGemmParams(**kw))
 
 
+def test_re_read_ln_form_declines_the_transpose_prologue():
+    """`ln_pass_form` "smem" / "smem_rolled" re-read operand 0's MN-major stage in every LayerNorm pass; the transpose form's K-major row writes
+    overwrite channel rows other lanes still re-read (the register form reads everything before its LN_SYNC barrier), so the pair is a typed decline
+    on the host, never a race on the device."""
+    for lnf in ("smem", "smem_rolled"):
+        with pytest.raises(ValueError, match="a0_prologue='mn_major'"):
+            sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, a0_prologue="transpose", ln_pass_form=lnf))
+        sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, a0_prologue="mn_major", ln_pass_form=lnf))  # the served pair
+
+
 def test_tail_params_is_the_accumulators_arm():
     p = k3.tail_params(128, 128, has_bias=True)
     sub.validate_ln_dual_gemm_params(p)
@@ -445,6 +455,26 @@ def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batc
     print(f"mn_major vs transpose: {n_diff} cells differ (of {outs['mn_major'][0].numel()})")
     assert torch.equal(outs["mn_major"][1], outs["transpose"][1]), "the statistics must be bitwise equal (same reads, same arithmetic)"
     assert n_diff == 0, f"the two prologue forms differ on {n_diff} cells"
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,c_z", [(217, 2, 128), (128, 1, 256)])
+@pytest.mark.parametrize("ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed")])
+def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, ln_pass_form, epi_math):
+    """On the accumulators arm (mn_major prologue): the re-read LayerNorm forms and the packed epilogue are BITWISE the default forms (output and
+    the LN2 statistics) -- the same bf16 words summed in the same order, the same fp32 operations per element."""
+    inp = _inputs(n_res, batch, c_z, c_z, True, seed=17)
+    outs = []
+    for lnf, epm in (("registers", "scalar"), (ln_pass_form, epi_math)):
+        plan = k3.build_trimul_tail(k3.tail_params(c_z, c_z, has_bias=True, want_stats=True, a0_prologue="mn_major", ln_pass_form=lnf, epi_math=epm))
+        out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, out, stats, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert not (out.float() == _SENTINEL).any(), f"{lnf}/{epm}: a never-written cell"
+        outs.append((out, stats))
+    assert torch.equal(outs[0][0], outs[1][0]), f"{ln_pass_form}/{epi_math} changed the output"
+    assert torch.equal(outs[0][1], outs[1][1]), f"{ln_pass_form}/{epi_math} changed the statistics"
 
 
 @requires_rubin

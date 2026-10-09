@@ -355,10 +355,16 @@ def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
 # documents the dropped split -- when THAT assertion fails the DSL started emitting `.maxnreg`: re-measure the roles against entry x warps
 # and update these pins.  (The kernel-test renderings with want_stats=True spill about twice as much at K = 256: 468 / 470 and 903 / 910.)
 _SASS_SPILL_PINS = {
-    ("k1", 128): dict(STL=1, LDL=1),
-    ("k1", 256): dict(STL=240, LDL=241),
-    ("k3", 128): dict(STL=1, LDL=1),
-    ("k3", 256): dict(STL=499, LDL=504),
+    ("k1", 128, "registers", "scalar"): dict(STL=1, LDL=1),
+    ("k1", 256, "registers", "scalar"): dict(STL=240, LDL=241),
+    ("k3", 128, "registers", "scalar"): dict(STL=1, LDL=1),
+    ("k3", 256, "registers", "scalar"): dict(STL=499, LDL=504),
+    # The re-read LayerNorm form with ROLLED chunk loops (`ln_pass_form="smem_rolled"`) holds no row in registers and keeps its normalise pass a
+    # real loop (cutlass.range(..., unroll=1)): the K = 256 residency spills are GONE on both arms (0 / 0 measured, REG 112-114 vs the flat 168),
+    # with the packed epilogue on top.  The unrolled re-read form ("smem") only halves them (K1 118 / 118, K3 235 / 235): the normalise pass's
+    # unrolled broadcast gamma / beta loads are hoisted by the compiler and the row re-appears as live registers -- which is why the rolled form exists.
+    ("k1", 256, "smem_rolled", "packed"): dict(STL=0, LDL=0),
+    ("k3", 256, "smem_rolled", "packed"): dict(STL=0, LDL=0),
 }
 _SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",)}
 _SASS_PROBE_BODY = """
@@ -366,30 +372,67 @@ from cudnn.gemm.frost import ln_prologue
 from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1
 from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
 arm, kk = params_kw["arm"], int(params_kw["k"])
-# the API's parameter sets (api.py compile(): biases on, the mask bound, no statistics, the heuristics' default knobs)
-p = k1.proj_params(kk, kk, has_bias=True, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2) if arm == "k1" else k3.tail_params(kk, kk, has_bias=True, want_stats=False)
+lnf, epm = params_kw.get("ln_pass_form", "registers"), params_kw.get("epi_math", "scalar")
+# the API's parameter sets (api.py compile(): biases on, the mask bound, no statistics, the heuristics' default knobs) at the pinned LN / epilogue forms
+if arm == "k1":
+    p = k1.proj_params(kk, kk, has_bias=True, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2, ln_pass_form=lnf, epi_math=epm)
+else:
+    p = k3.tail_params(kk, kk, has_bias=True, want_stats=False, ln_pass_form=lnf, epi_math=epm)
 plan = ln_prologue.build_ln_dual_gemm(p)
 print("EXPECT_K", kk)
 """
 
 
-@pytest.mark.parametrize("arm,k", sorted(_SASS_SPILL_PINS))
-def test_sm107_rendering_spill_pins(tmp_path, arm, k):
+@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math", sorted(_SASS_SPILL_PINS))
+def test_sm107_rendering_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math):
     """Trace-compile the rendering for sm_107a (no GPU needed), read STL / LDL / USETMAXREG off the SASS: the served widths' spill counts are
-    pinned per arm, the dropped register split is documented by USETMAXREG == 0."""
+    pinned per arm and LayerNorm / epilogue form, the dropped register split is documented by USETMAXREG == 0."""
     probe = sass_utils.run_sass_probe(
         tmp_path,
         probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
         arch="sm_107a",
-        params=dict(arm=arm, k=k),
-        tag=f"ln_dual_gemm_{arm}_k{k}",
+        params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math=epi_math),
+        tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_{epi_math}",
     )
     st = probe.stats
-    print(f"{arm} K={k}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} lines {st['LINES']} cubin {probe.cubin_md5}")
-    sass_utils.assert_no_new_spills(st, _SASS_SPILL_PINS[(arm, k)], tag=f"{arm} K={k}: ")
+    print(f"{arm} K={k} {ln_pass_form} {epi_math}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} lines {st['LINES']} cubin {probe.cubin_md5}")
+    sass_utils.assert_no_new_spills(st, _SASS_SPILL_PINS[(arm, k, ln_pass_form, epi_math)], tag=f"{arm} K={k} {ln_pass_form} {epi_math}: ")
     assert (
         st["USETMAXREG"] == 0
     ), f"{arm} K={k}: the rendering now carries a REAL register split (USETMAXREG {st['USETMAXREG']}) -- re-measure the roles and the spill pins"
+
+
+@pytest.mark.parametrize(
+    "kw,axis",
+    [
+        (dict(ln_pass_form="rows"), "ln_pass_form"),
+        (dict(epi_math="vector"), "epi_math"),
+    ],
+)
+def test_ln_pass_form_and_epi_math_decline_typed(kw, axis):
+    """The two substrate forms are a closed vocabulary (performance only); a value outside it is a typed ValueError naming the axis."""
+    with pytest.raises(ValueError, match=axis):
+        sub.validate_ln_dual_gemm_params(k1.proj_params(128, 128, has_bias=True, has_mask=True, **kw))
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
+@pytest.mark.parametrize("ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed")])
+def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, c, mask_kind, ln_pass_form, epi_math):
+    """The re-read LayerNorm forms sum the same bf16 words in the same order (a re-load of the unchanged stage replaces a register), and the packed
+    epilogue runs the scalar form's fp32 operations in its association on fp32x2 pairs: planes AND statistics BITWISE equal to the default forms."""
+    inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=13)
+    outs = []
+    for lnf, epm in (("registers", "scalar"), (ln_pass_form, epi_math)):
+        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, ln_pass_form=lnf, epi_math=epm))
+        planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert not (planes[:, :, :, :n_res] == _SENTINEL).any(), f"{lnf}/{epm}: a never-written cell in the valid region"
+        outs.append((planes, stats))
+    assert torch.equal(outs[0][0], outs[1][0]), f"{ln_pass_form}/{epi_math} changed the planes"
+    assert torch.equal(outs[0][1], outs[1][1]), f"{ln_pass_form}/{epi_math} changed the statistics"
 
 
 @requires_rubin

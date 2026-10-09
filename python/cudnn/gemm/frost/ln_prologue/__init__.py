@@ -77,6 +77,14 @@ A0_PROLOGUES = ("mn_major", "transpose")
 MIN_N_RES_MN_MAJOR = 33
 #: The same constraint on the LAUNCHED ``kb`` (a caller's ``k_block`` below 64 cannot serve the accumulators arm; the columns arm admits 8).
 MIN_K_BLOCK_MN_MAJOR = 64
+#: The LayerNorm warps' pass form (performance only; bitwise the same operand): ``"registers"`` = the row's ``K / 2`` packed words stay in
+#: registers between the statistics passes and the normalise pass (the residency that spills from K = 256 up at the flat entry allocation);
+#: ``"smem"`` = every pass re-reads the row's 16-byte chunks from the (unchanged) SMEM stage at the same swizzled offsets -- no residency;
+#: ``"smem_rolled"`` = the same with the per-stage chunk loops as runtime loops (the code-size lever against the instruction-cache stall).
+LN_PASS_FORMS = ("registers", "smem", "smem_rolled")
+#: The gated epilogue's arithmetic form (performance only; the same fp32 operations per element): ``"scalar"`` = one element at a time;
+#: ``"packed"`` = channel PAIRS on the packed fp32x2 ALU (``add.f32x2`` / ``mul.f32x2`` / ``fma.rn.f32x2``: half the ALU issue per element).
+EPI_MATHS = ("scalar", "packed")
 #: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
 BODIES = {"sm107": "sm107_dual_gemm.py"}
 
@@ -143,6 +151,13 @@ class LnDualGemmParams:
     fuse_residual: bool = False
     #: the TMA warp prefetches the tile's A boxes into L2 before waiting for a ring slot (performance only).
     prefetch_a_l2: bool = False
+    #: :data:`LN_PASS_FORMS` -- how the LayerNorm warps hold the row between their passes (performance only; bitwise the same operand).  The
+    #: default stays the rendering's register residency; a consumer picks the re-read form per width (its value is in the spill counts).
+    #: Under ``pairing = "accumulators"`` the re-read forms require ``a0_prologue = "mn_major"`` (the transpose form's K-major writes overlap
+    #: the channel rows every lane still re-reads -- the register form keeps all reads before its LN_SYNC barrier, the re-read form cannot).
+    ln_pass_form: str = "registers"
+    #: :data:`EPI_MATHS` -- the gated epilogue's arithmetic form (performance only).
+    epi_math: str = "scalar"
 
     @property
     def dual(self) -> bool:
@@ -188,6 +203,10 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
         raise ValueError(f"a0_major must be one of {A0_MAJORS}, got {p.a0_major!r}")
     if p.a0_prologue not in A0_PROLOGUES:
         raise ValueError(f"a0_prologue must be one of {A0_PROLOGUES}, got {p.a0_prologue!r}")
+    if p.ln_pass_form not in LN_PASS_FORMS:
+        raise ValueError(f"ln_pass_form must be one of {LN_PASS_FORMS}, got {p.ln_pass_form!r}")
+    if p.epi_math not in EPI_MATHS:
+        raise ValueError(f"epi_math must be one of {EPI_MATHS}, got {p.epi_math!r}")
     if p.dual:
         if p.has_mask or p.skip_masked_tiles:
             raise ValueError("pairing='accumulators' has no output mask: has_mask and skip_masked_tiles must be False")
@@ -197,6 +216,11 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
             raise ValueError("pairing='accumulators' is written for an MN-major operand 0 (the channel-major y rows); a0_major must be 'mn'")
         if p.k > 6 * K_STAGE:
             raise ValueError(f"pairing='accumulators' keeps every K stage of a tile resident in a 6-deep ring: K must be <= {6 * K_STAGE}, got {p.k}")
+        if p.ln_pass_form != "registers" and p.a0_prologue != "mn_major":
+            raise ValueError(
+                f"ln_pass_form={p.ln_pass_form!r} re-reads operand 0's MN-major stage in every LayerNorm pass; a0_prologue='transpose' overwrites the "
+                "channel rows other lanes still read (the register form reads everything before its LN_SYNC barrier) -- use a0_prologue='mn_major'"
+            )
     else:
         if p.a0_major != "k":
             raise ValueError("pairing='columns' (the single K-major operand) takes a0_major='k'")

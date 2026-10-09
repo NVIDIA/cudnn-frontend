@@ -445,6 +445,8 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                     eps=self.eps,
                     pass_order=self.knobs.k1_pass_order,
                     clc_stages=self.knobs.clc_stages,
+                    ln_pass_form=self.knobs.ln_pass_form,
+                    epi_math=self.knobs.epi_math,
                 ),
                 self.device_index,
             )
@@ -458,6 +460,8 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                     eps=self.eps,
                     a0_prologue=self.knobs.k3_prologue,
                     clc_stages=self.knobs.clc_stages,
+                    ln_pass_form=self.knobs.ln_pass_form,
+                    epi_math=self.knobs.epi_math,
                 ),
                 self.device_index,
             )

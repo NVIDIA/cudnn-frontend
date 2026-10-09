@@ -61,15 +61,21 @@ def tail_params(
     eps: float = 1e-5,
     clc_stages: Optional[int] = None,
     diag: str = "",
+    ln_pass_form: Optional[str] = None,
+    epi_math: Optional[str] = None,
 ) -> LnDualGemmParams:
     """The substrate's compile-time parameters of K3 for the ``(c_z, c)`` geometry.  Both GEMMs share one K (the ring stage is one k-tile of
     every operand), so ``c == c_z`` for now -- the Protenix-v2 ``c_z = 256, c = 128`` geometry is a typed decline until the per-GEMM k-tile
-    count lands."""
+    count lands.  ``ln_pass_form`` / ``epi_math`` (performance only, bitwise the same output) default to the substrate's."""
     if int(c) != int(c_z):
         raise ValueError(f"K3 on the substrate needs c == c_z (one K for the value GEMM over y and the gate GEMM over z), got c={c}, c_z={c_z}")
     kw = {} if clc_stages is None else {"clc_stages": int(clc_stages)}
     if diag:
         kw["diag"] = str(diag)
+    if ln_pass_form is not None:
+        kw["ln_pass_form"] = str(ln_pass_form)
+    if epi_math is not None:
+        kw["epi_math"] = str(epi_math)
     return LnDualGemmParams(
         k=int(c),
         c_out=int(c_z),

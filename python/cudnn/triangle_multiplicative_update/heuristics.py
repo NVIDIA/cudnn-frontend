@@ -15,6 +15,10 @@ function and stay op attributes the API never sets.
   ``k_block``        the two LayerNorm-prologue stages' row tile: k's per 256-row pair tile (:data:`K_BLOCK_DOMAIN`; the substrate's rule
                      ``default_k_block`` when a record leaves it unset -- 256 from N = 256, else the next power of two >= N).  At N = 384 the
                      rule's 256 pads 25 % of every pair tile's rows; 128 pads none (the lever measured in the perf campaign).
+  ``ln_pass_form``   the two stages' LayerNorm pass form (:data:`LN_PASS_FORMS`: ``"registers"`` = the row held in registers between the passes;
+                     ``"smem"`` / ``"smem_rolled"`` = the row re-read from the SMEM stage in every pass, unrolled / rolled chunk loops -- the
+                     rolled form has no K = 256 spills; bitwise the same output).
+  ``epi_math``       the two stages' gated-epilogue arithmetic form (:data:`EPI_MATHS`: ``"scalar"`` / ``"packed"`` fp32x2 pairs; bitwise).
 
 :func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class, keyed by hidden width ``c``,
 N bucket, batch bucket and direction: a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
@@ -34,7 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
-from cudnn.gemm.frost.ln_prologue import A0_PROLOGUES, MIN_K_BLOCK_MN_MAJOR, PAIR_TILE_ROWS, PASS_ORDERS
+from cudnn.gemm.frost.ln_prologue import A0_PROLOGUES, EPI_MATHS, LN_PASS_FORMS, MIN_K_BLOCK_MN_MAJOR, PAIR_TILE_ROWS, PASS_ORDERS
 from cudnn.gemm.frost.ln_prologue import default_k_block as _substrate_default_k_block
 
 from .kernels import contraction as k2
@@ -58,6 +62,10 @@ BATCH_BUCKETS: Tuple[int, ...] = (1, 4)
 DEFAULT_K1_PASS_ORDER = "interleaved"
 DEFAULT_K3_PROLOGUE = "mn_major"
 DEFAULT_CLC_STAGES = 2
+#: The substrate forms every bucket pick carries today (the substrate's own defaults): the re-read / packed forms are selectable through
+#: ``TriMulKnobs(ln_pass_form=..., epi_math=...)`` and flip here per width only with a measured A/B/A on the perf-node class.
+_LN_FORM_DEFAULT = "registers"
+_EPI_MATH_DEFAULT = "scalar"
 
 
 @dataclass(frozen=True)
@@ -71,9 +79,12 @@ class TriMulKnobs:
     k3_prologue: Optional[str] = None
     clc_stages: Optional[int] = None
     k_block: Optional[int] = None  # appended (2026-10-09): the row tile of the two LayerNorm-prologue stages
+    #: appended axes (the two LayerNorm-prologue stages share them): the LayerNorm pass form and the epilogue arithmetic form
+    ln_pass_form: Optional[str] = None
+    epi_math: Optional[str] = None
 
     def is_complete(self) -> bool:
-        return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages, self.k_block)
+        return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages, self.k_block, self.ln_pass_form, self.epi_math)
 
     def merged_over(self, base: "TriMulKnobs") -> "TriMulKnobs":
         """This record's SET axes over ``base`` (the unset ones keep the base's values)."""
@@ -83,6 +94,8 @@ class TriMulKnobs:
             k3_prologue=self.k3_prologue if self.k3_prologue is not None else base.k3_prologue,
             clc_stages=self.clc_stages if self.clc_stages is not None else base.clc_stages,
             k_block=self.k_block if self.k_block is not None else base.k_block,
+            ln_pass_form=self.ln_pass_form if self.ln_pass_form is not None else base.ln_pass_form,
+            epi_math=self.epi_math if self.epi_math is not None else base.epi_math,
         )
 
 
@@ -101,6 +114,10 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
         raise ValueError(f"clc_stages must be one of {CLC_STAGES_DOMAIN}, got {knobs.clc_stages!r}")
     if knobs.k_block is not None and (isinstance(knobs.k_block, bool) or knobs.k_block not in K_BLOCK_DOMAIN):
         raise ValueError(f"k_block must be one of {K_BLOCK_DOMAIN} (k's per 256-row pair tile of the two LayerNorm-prologue stages), got {knobs.k_block!r}")
+    if knobs.ln_pass_form is not None and knobs.ln_pass_form not in LN_PASS_FORMS:
+        raise ValueError(f"ln_pass_form must be one of {LN_PASS_FORMS}, got {knobs.ln_pass_form!r}")
+    if knobs.epi_math is not None and knobs.epi_math not in EPI_MATHS:
+        raise ValueError(f"epi_math must be one of {EPI_MATHS}, got {knobs.epi_math!r}")
 
 
 # THE TABLE, part 1 -- the BUCKET picks.  Per hidden width ``c``: descending N floors, each with the COMPLETE knob set measured best over the bucket's
@@ -115,22 +132,22 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 # control spread -- adopted by judgment).
 _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     128: (
-        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1)),
-        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1)),
-        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1)),
-        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
-        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2)),
-        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1)),
-        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2)),
+        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="interleaved", k3_prologue="transpose", clc_stages=2, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
     ),
     256: (
-        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
-        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
-        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
-        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
-        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
-        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1)),
-        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=2)),
+        (1024, TriMulKnobs(k2_tile=k2.MULTICAST_A4_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (768, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (512, TriMulKnobs(k2_tile=k2.MULTICAST_A2_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (384, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (256, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (129, TriMulKnobs(k2_tile=k2.DESIGN_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=1, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
+        (0, TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=2, ln_pass_form=_LN_FORM_DEFAULT, epi_math=_EPI_MATH_DEFAULT)),
     ),
 }
 

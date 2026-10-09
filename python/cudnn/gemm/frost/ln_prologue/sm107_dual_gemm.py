@@ -127,6 +127,22 @@ rendering's own ``store_swizzled(Swizzle(2, 4, 3))`` + s64b TMA store, a 3-D ``(
 waiting for a ring slot).  The arrival ledger of every mbarrier is unchanged; ``a_full`` counts ``num_a_operands x sA_bytes`` and ``ab_full``
 ``num_b_operands x sB_bytes x 2``.
 
+LN PASS FORMS (``LnDualGemmParams.ln_pass_form``; performance only -- the SAME operand, bitwise: the same bf16 words summed in the same order).
+``"registers"`` (the default = this rendering's form): pass A reads the row's 16-B chunks into K / 2 packed words and sums, pass B squares the
+deviations from the registers, pass C normalises from them and writes back -- the residency that spills from K = 256 up at the flat entry
+allocation (REGISTER SPLIT above).  ``"smem"``: no residency -- passes B and C RE-READ the chunks from the unchanged stage at the same swizzled
+offsets (each lane re-reads only its own row: no cross-lane hazard; K3's MN-major operand 0 re-reads its channel-pair words, whose only other reader, lane j ^ 1,
+extracts its own half by ``prmt``).  ``"smem_rolled"``: the same with the per-stage chunk loops as runtime loops (the XOR and the gamma / beta
+offsets computed per chunk) -- the code-size lever.  Under ``pairing = "accumulators"`` the re-read forms take ``a0_prologue = "mn_major"`` only
+(typed decline on the host): the transpose form's K-major row writes overwrite channel rows other lanes still re-read; the register form reads
+everything before its LN_SYNC barrier.  Barrier table and SMEM table UNCHANGED: no arrive / wait site moves, no new buffer, the re-reads are the
+pass-A reads repeated.
+
+EPILOGUE MATH (``LnDualGemmParams.epi_math``; performance only).  ``"scalar"`` (the default): one element at a time.  ``"packed"``: channel
+PAIRS on the packed fp32x2 ALU -- ``add.f32x2`` for the two bias adds, ``sigmoid2`` (``mul.f32x2`` by an opaque 0.5, two ``tanh.approx``, one
+``fma.rn.f32x2``), ``mul.f32x2`` for ``gate * value`` and for ``* mask``, ``add.f32x2`` for the fused residual; the mask SELECT stays per element and
+AFTER the arithmetic (never a multiply by zero of a residue).  Each packed op is the IEEE fp32 op per lane in the scalar form's association.
+
 Parameters come from the FROST template loader as ``FROST_TEMPLATE_PARAMS`` (a
 :class:`cudnn.gemm.frost.ln_prologue.LnDualGemmParams`); a plain import gets the ``k = 128, c_out = 128, passes = 2``
 geometry so the file runs standalone.
@@ -141,7 +157,7 @@ from cutlass._mlir.dialects import arith
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.frost.tile_dsl.barrier import arrive_on_leader_release
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, sigmoid
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, sigmoid, sigmoid2
 from cudnn.frost.tile_dsl.tma import ld_global_v4, ld_shared_v4, st_global_v2, st_shared_v4
 from cudnn.gemm.frost.ln_prologue import PAIR_TILE_ROWS, LnDualGemmParams, validate_ln_dual_gemm_params
 from cudnn.gemm.frost.tile_helpers import (
@@ -281,6 +297,12 @@ _A0_TRANSPOSE: bool = _DUAL and PARAMS.a0_prologue == "transpose"  # operand 0 n
 _AFFINE_FOLD: bool = _DUAL and PARAMS.affine_fold  # operand 0's LayerNorm without gamma / beta (folded into W / bias on the host)
 _FUSE_RESIDUAL: bool = _DUAL and PARAMS.fuse_residual
 _PREFETCH_A_L2: bool = PARAMS.prefetch_a_l2
+# LN PASS FORMS (module docstring): the re-read forms hold NO row in registers -- every LayerNorm pass re-reads the stage's chunks at the same
+# swizzled offsets (bitwise the same operand: the same values in the same order); the rolled form makes the per-stage chunk loops runtime loops.
+_LN_SMEM: bool = PARAMS.ln_pass_form != "registers"
+_LN_ROLLED: bool = PARAMS.ln_pass_form == "smem_rolled"
+# EPILOGUE MATH (module docstring): the gated pairing on packed fp32x2 pairs (the same fp32 operations per element, half the ALU issue).
+_EPI_PACKED: bool = PARAMS.epi_math == "packed"
 if _DUAL:
     mma_inst_shape_mnk = (256, 128, 16)  # two GEMMs of N = 128 per pair tile
     cgrp_tile_mnk = (256, 128, 64)
@@ -1445,17 +1467,33 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                             _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
                             _rz.append(_lo)
                             _rz.append(_hi)
-                for _i in cutlass.range_constexpr(epi_n if _DIAG != "no_epi_math" else 0):
-                    if cutlass.const_expr(HAS_BIAS):
-                        _gate = sigmoid(_g[_i] + _bg[_i])
-                        _o = _gate * (_v[_i] + _bp[_i]) * m_val
-                    else:
-                        _gate = sigmoid(_g[_i])
-                        _o = _gate * _v[_i] * m_val
-                    if cutlass.const_expr(_FUSE_RESIDUAL):
-                        _o = _o + _rz[_i]  # one rounding for update + residual (the fused block form; the API's unfused form rounds twice)
-                    # A masked / padded row is EXACTLY +0.0 (a select, never x * 0: the residue may be anything).
-                    _outs.append(cutlass.Float32(arith.select((m_val == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), _o.ir_value())))
+                if cutlass.const_expr(_EPI_PACKED and _DIAG != "no_epi_math"):
+                    # EPILOGUE MATH "packed" (module docstring): channel pairs on the fp32x2 ALU -- the scalar form's operations in its association
+                    # (gate = sigmoid(g + b_g); o = (gate * (v + b_p)) * m [+ resid]); the mask SELECT stays per element, after the arithmetic.
+                    for _h in cutlass.range_constexpr(epi_n // 2):
+                        _i = 2 * _h
+                        _gl, _gh = fadd2(_g[_i], _g[_i + 1], _bg[_i], _bg[_i + 1]) if cutlass.const_expr(HAS_BIAS) else (_g[_i], _g[_i + 1])
+                        _vl, _vh = fadd2(_v[_i], _v[_i + 1], _bp[_i], _bp[_i + 1]) if cutlass.const_expr(HAS_BIAS) else (_v[_i], _v[_i + 1])
+                        _sl, _sh = sigmoid2(_gl, _gh)
+                        _pl, _ph = fmul2(_sl, _sh, _vl, _vh)
+                        _ol, _oh = fmul2(_pl, _ph, m_val, m_val)
+                        if cutlass.const_expr(_FUSE_RESIDUAL):
+                            _ol, _oh = fadd2(_ol, _oh, _rz[_i], _rz[_i + 1])
+                        # A masked / padded row is EXACTLY +0.0 (a select, never x * 0: the residue may be anything).
+                        _outs.append(cutlass.Float32(arith.select((m_val == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), _ol.ir_value())))
+                        _outs.append(cutlass.Float32(arith.select((m_val == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), _oh.ir_value())))
+                else:
+                    for _i in cutlass.range_constexpr(epi_n if _DIAG != "no_epi_math" else 0):
+                        if cutlass.const_expr(HAS_BIAS):
+                            _gate = sigmoid(_g[_i] + _bg[_i])
+                            _o = _gate * (_v[_i] + _bp[_i]) * m_val
+                        else:
+                            _gate = sigmoid(_g[_i])
+                            _o = _gate * _v[_i] * m_val
+                        if cutlass.const_expr(_FUSE_RESIDUAL):
+                            _o = _o + _rz[_i]  # one rounding for update + residual (the fused block form; the API's unfused form rounds twice)
+                        # A masked / padded row is EXACTLY +0.0 (a select, never x * 0: the residue may be anything).
+                        _outs.append(cutlass.Float32(arith.select((m_val == cutlass.Float32(0.0)).ir_value(), cutlass.Float32(0.0).ir_value(), _o.ir_value())))
 
                 if subtile_idx == _EPI_SUBTILES - 1:
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -1609,28 +1647,71 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             _row_words = []
             _sum = cutlass.Float32(0.0)
             _sumsq = cutlass.Float32(0.0)
-            for _j in cutlass.range_constexpr(_NK if _ln_work else 0):
-                _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
-                for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
-                    _phys = _q ^ ln_swz
-                    _words = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _phys * 8), cutlass.Int32)
-                    for _w in _words:
-                        _row_words.append(_w)
-                        _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
-                        _sum = _sum + _lo + _hi
-                        if cutlass.const_expr(_DIAG == "one_pass_stats"):
-                            _sumsq = _sumsq + _lo * _lo + _hi * _hi
+            if cutlass.const_expr(_LN_SMEM):
+                # LN PASS FORMS "smem" / "smem_rolled" (module docstring): pass A only SUMS -- the row is not kept; passes B / C re-read the chunks
+                for _j in cutlass.range_constexpr(_NK if _ln_work else 0):
+                    _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
+                    if cutlass.const_expr(_LN_ROLLED):
+                        # a runtime loop carries SCALARS only (the DSL joins every assignment of a loop-body name to one type: no list names here)
+                        for _q in cutlass.range(cta_tile_mnk[2] // 8, unroll=1):  # unroll=1 = NO unrolling (the rolled form's point)
+                            _aw0, _aw1, _aw2, _aw3 = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + (_q ^ ln_swz) * 8), cutlass.Int32)
+                            for _awx in (_aw0, _aw1, _aw2, _aw3):
+                                _alo, _ahi = f16x2_to_f32(_awx, dtype=cutlass.BFloat16)
+                                _sum = _sum + _alo + _ahi
+                                if cutlass.const_expr(_DIAG == "one_pass_stats"):
+                                    _sumsq = _sumsq + _alo * _alo + _ahi * _ahi
+                    else:
+                        for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                            _words = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + (_q ^ ln_swz) * 8), cutlass.Int32)
+                            for _w in _words:
+                                _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                                _sum = _sum + _lo + _hi
+                                if cutlass.const_expr(_DIAG == "one_pass_stats"):
+                                    _sumsq = _sumsq + _lo * _lo + _hi * _hi
+            else:
+                for _j in cutlass.range_constexpr(_NK if _ln_work else 0):
+                    _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
+                    for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                        _phys = _q ^ ln_swz
+                        _words = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _phys * 8), cutlass.Int32)
+                        for _w in _words:
+                            _row_words.append(_w)
+                            _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                            _sum = _sum + _lo + _hi
+                            if cutlass.const_expr(_DIAG == "one_pass_stats"):
+                                _sumsq = _sumsq + _lo * _lo + _hi * _hi
             _mean = _sum * cutlass.Float32(_INV_K)
             # (3) pass B: sum of squared deviations (two-pass: the mean is subtracted before squaring)
             _sq = cutlass.Float32(0.0)
             if cutlass.const_expr(_DIAG == "one_pass_stats"):
                 _sq = _sumsq - _sum * _mean  # DIAGNOSTIC: E[x^2] - mean^2 from the first pass
             else:
-                for _w in _row_words:
-                    _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
-                    _dl = _lo - _mean
-                    _dh = _hi - _mean
-                    _sq = _sq + _dl * _dl + _dh * _dh
+                if cutlass.const_expr(_LN_SMEM):
+                    # the re-read of pass A's chunks (the stage is unchanged until pass C): the same words, the same order -> bitwise the register form
+                    for _j in cutlass.range_constexpr(_NK if _ln_work else 0):
+                        _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
+                        if cutlass.const_expr(_LN_ROLLED):
+                            for _q in cutlass.range(cta_tile_mnk[2] // 8, unroll=1):  # unroll=1 = NO unrolling (the rolled form's point)
+                                _bw0, _bw1, _bw2, _bw3 = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + (_q ^ ln_swz) * 8), cutlass.Int32)
+                                for _bwx in (_bw0, _bw1, _bw2, _bw3):
+                                    _blo, _bhi = f16x2_to_f32(_bwx, dtype=cutlass.BFloat16)
+                                    _bdl = _blo - _mean
+                                    _bdh = _bhi - _mean
+                                    _sq = _sq + _bdl * _bdl + _bdh * _bdh
+                        else:
+                            for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                                _words = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + (_q ^ ln_swz) * 8), cutlass.Int32)
+                                for _w in _words:
+                                    _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                                    _dl = _lo - _mean
+                                    _dh = _hi - _mean
+                                    _sq = _sq + _dl * _dl + _dh * _dh
+                else:
+                    for _w in _row_words:
+                        _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
+                        _dl = _lo - _mean
+                        _dh = _hi - _mean
+                        _sq = _sq + _dl * _dl + _dh * _dh
             _rstd = cute.math.rsqrt(_sq * cutlass.Float32(_INV_K) + cutlass.Float32(_EPS), fastmath=True)
             # (4) the statistics of OPERAND 0, once per row (pass 0, N tile 0), valid rows only -- K1's only operand is K-major (here);
             #     K3's operand 0 is the MN-major one (its statistics are written in (5b) below)
@@ -1643,23 +1724,47 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             _wi = 0
             for _j in cutlass.range_constexpr(_NK if (_DIAG != "no_ln_norm" and _ln_work) else 0):
                 _row_base = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
-                for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
-                    _phys = _q ^ ln_swz
-                    _c0 = 2 * _K * _KOP + _j * cta_tile_mnk[2] + _q * 8
-                    _gam = []
-                    _bet = []
-                    _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_c0), cutlass.Float32))
-                    _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_c0 + 4), cutlass.Float32))
-                    _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _c0), cutlass.Float32))
-                    _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _c0 + 4), cutlass.Float32))
-                    _packed = []
-                    for _e in cutlass.range_constexpr(4):
-                        _lo, _hi = f16x2_to_f32(_row_words[_wi + _e], dtype=cutlass.BFloat16)
-                        _ylo = (_lo - _mean) * _rstd * _gam[2 * _e] + _bet[2 * _e]
-                        _yhi = (_hi - _mean) * _rstd * _gam[2 * _e + 1] + _bet[2 * _e + 1]
-                        _packed.append(fp32_to_fp16(_ylo, _yhi, dtype=cutlass.BFloat16))
-                    _wi += 4
-                    st_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _phys * 8), _packed, cutlass.Int32)
+                if cutlass.const_expr(_LN_SMEM and _LN_ROLLED):
+                    # the re-read form, rolled: the chunk index is a loop variable; its XOR and its gamma / beta offset are computed per chunk
+                    for _q in cutlass.range(cta_tile_mnk[2] // 8, unroll=1):  # unroll=1 = NO unrolling (the rolled form's point)
+                        _cphys = _q ^ ln_swz
+                        _cc0 = 2 * _K * _KOP + _j * cta_tile_mnk[2] + _q * 8
+                        _cg0, _cg1, _cg2, _cg3 = ld_shared_v4(smem_ln_params.data_ptr(_cc0), cutlass.Float32)
+                        _cg4, _cg5, _cg6, _cg7 = ld_shared_v4(smem_ln_params.data_ptr(_cc0 + 4), cutlass.Float32)
+                        _cb0, _cb1, _cb2, _cb3 = ld_shared_v4(smem_ln_params.data_ptr(_K + _cc0), cutlass.Float32)
+                        _cb4, _cb5, _cb6, _cb7 = ld_shared_v4(smem_ln_params.data_ptr(_K + _cc0 + 4), cutlass.Float32)
+                        _cw0, _cw1, _cw2, _cw3 = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _cphys * 8), cutlass.Int32)
+                        _cl0, _ch0 = f16x2_to_f32(_cw0, dtype=cutlass.BFloat16)
+                        _cl1, _ch1 = f16x2_to_f32(_cw1, dtype=cutlass.BFloat16)
+                        _cl2, _ch2 = f16x2_to_f32(_cw2, dtype=cutlass.BFloat16)
+                        _cl3, _ch3 = f16x2_to_f32(_cw3, dtype=cutlass.BFloat16)
+                        _cpk0 = fp32_to_fp16((_cl0 - _mean) * _rstd * _cg0 + _cb0, (_ch0 - _mean) * _rstd * _cg1 + _cb1, dtype=cutlass.BFloat16)
+                        _cpk1 = fp32_to_fp16((_cl1 - _mean) * _rstd * _cg2 + _cb2, (_ch1 - _mean) * _rstd * _cg3 + _cb3, dtype=cutlass.BFloat16)
+                        _cpk2 = fp32_to_fp16((_cl2 - _mean) * _rstd * _cg4 + _cb4, (_ch2 - _mean) * _rstd * _cg5 + _cb5, dtype=cutlass.BFloat16)
+                        _cpk3 = fp32_to_fp16((_cl3 - _mean) * _rstd * _cg6 + _cb6, (_ch3 - _mean) * _rstd * _cg7 + _cb7, dtype=cutlass.BFloat16)
+                        st_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _cphys * 8), [_cpk0, _cpk1, _cpk2, _cpk3], cutlass.Int32)
+                else:
+                    for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                        _phys = _q ^ ln_swz
+                        _c0 = 2 * _K * _KOP + _j * cta_tile_mnk[2] + _q * 8
+                        _gam = []
+                        _bet = []
+                        _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_c0), cutlass.Float32))
+                        _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_c0 + 4), cutlass.Float32))
+                        _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _c0), cutlass.Float32))
+                        _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _c0 + 4), cutlass.Float32))
+                        if cutlass.const_expr(_LN_SMEM):
+                            _words = ld_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _phys * 8), cutlass.Int32)  # the re-read form, unrolled
+                        else:
+                            _words = _row_words[_wi : _wi + 4]
+                        _packed = []
+                        for _e in cutlass.range_constexpr(4):
+                            _lo, _hi = f16x2_to_f32(_words[_e], dtype=cutlass.BFloat16)
+                            _ylo = (_lo - _mean) * _rstd * _gam[2 * _e] + _bet[2 * _e]
+                            _yhi = (_hi - _mean) * _rstd * _gam[2 * _e + 1] + _bet[2 * _e + 1]
+                            _packed.append(fp32_to_fp16(_ylo, _yhi, dtype=cutlass.BFloat16))
+                        _wi += 4
+                        st_shared_v4(smem_a_list[_KOP].data_ptr(_row_base + _phys * 8), _packed, cutlass.Int32)
             # (5b) K3 ARM: operand 0 (y rows) in its MN-major stage -- lane = j, loop over the channels.  Pass A: per channel pair two 32-bit
             #      loads (the words holding (c, j), (c, j ^ 1)) + ONE prmt -> the packed (c, c + 1) word of row j (64 words, K1's footprint);
             #      pass B from the registers; the LN2 statistics; pass C: (x - mean) * rstd [* gamma + beta] -> bf16 -> written back IN
@@ -1668,23 +1773,73 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             if cutlass.const_expr(_DUAL and _ln_work):
                 _row_words0 = []
                 _sum0 = cutlass.Float32(0.0)
-                for _j in cutlass.range_constexpr(_NK):
-                    _wb = (sA_elems // 2) * _sts[_j]
-                    for _p in cutlass.range_constexpr(cta_tile_mnk[2] // 2):
-                        _ca = 2 * _p
-                        _wa = _a0w.data_ptr(_wb + _xow[_ca & 7] + _ca * 32).load()
-                        _wc = _a0w.data_ptr(_wb + _xow[(_ca + 1) & 7] + (_ca + 1) * 32).load()
-                        _w0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_wa, _wc, _sel])
-                        _row_words0.append(_w0)
-                        _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
-                        _sum0 = _sum0 + _lo + _hi
+                if cutlass.const_expr(_LN_SMEM):
+                    # LN PASS FORMS: operand 0 by 8-channel chunks q (a runtime loop in the rolled form) x channel pairs e -- pair (q * 8 + 2 e)'s
+                    # XOR offsets are the constants xo[2 e] / xo[2 e + 1] either way; the pair order equals the register form's -> bitwise
+                    for _j in cutlass.range_constexpr(_NK):
+                        _wb = (sA_elems // 2) * _sts[_j]
+                        if cutlass.const_expr(_LN_ROLLED):
+                            for _q in cutlass.range(cta_tile_mnk[2] // 8, unroll=1):  # unroll=1 = NO unrolling (the rolled form's point)
+                                for _e in cutlass.range_constexpr(4):
+                                    _oaca = _q * 8 + 2 * _e
+                                    _oawa = _a0w.data_ptr(_wb + _xow[2 * _e] + _oaca * 32).load()
+                                    _oawc = _a0w.data_ptr(_wb + _xow[2 * _e + 1] + (_oaca + 1) * 32).load()
+                                    _oaw0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_oawa, _oawc, _sel])
+                                    _oalo, _oahi = f16x2_to_f32(_oaw0, dtype=cutlass.BFloat16)
+                                    _sum0 = _sum0 + _oalo + _oahi
+                        else:
+                            for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                                for _e in cutlass.range_constexpr(4):
+                                    _ca = _q * 8 + 2 * _e
+                                    _wa = _a0w.data_ptr(_wb + _xow[2 * _e] + _ca * 32).load()
+                                    _wc = _a0w.data_ptr(_wb + _xow[2 * _e + 1] + (_ca + 1) * 32).load()
+                                    _w0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_wa, _wc, _sel])
+                                    _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
+                                    _sum0 = _sum0 + _lo + _hi
+                else:
+                    for _j in cutlass.range_constexpr(_NK):
+                        _wb = (sA_elems // 2) * _sts[_j]
+                        for _p in cutlass.range_constexpr(cta_tile_mnk[2] // 2):
+                            _ca = 2 * _p
+                            _wa = _a0w.data_ptr(_wb + _xow[_ca & 7] + _ca * 32).load()
+                            _wc = _a0w.data_ptr(_wb + _xow[(_ca + 1) & 7] + (_ca + 1) * 32).load()
+                            _w0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_wa, _wc, _sel])
+                            _row_words0.append(_w0)
+                            _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
+                            _sum0 = _sum0 + _lo + _hi
                 _mean0 = _sum0 * cutlass.Float32(_INV_K)
                 _sq0 = cutlass.Float32(0.0)
-                for _w0 in _row_words0:
-                    _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
-                    _dl = _lo - _mean0
-                    _dh = _hi - _mean0
-                    _sq0 = _sq0 + _dl * _dl + _dh * _dh
+                if cutlass.const_expr(_LN_SMEM):
+                    for _j in cutlass.range_constexpr(_NK):
+                        _wb = (sA_elems // 2) * _sts[_j]
+                        if cutlass.const_expr(_LN_ROLLED):
+                            for _q in cutlass.range(cta_tile_mnk[2] // 8, unroll=1):  # unroll=1 = NO unrolling (the rolled form's point)
+                                for _e in cutlass.range_constexpr(4):
+                                    _obca = _q * 8 + 2 * _e
+                                    _obwa = _a0w.data_ptr(_wb + _xow[2 * _e] + _obca * 32).load()
+                                    _obwc = _a0w.data_ptr(_wb + _xow[2 * _e + 1] + (_obca + 1) * 32).load()
+                                    _obw0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_obwa, _obwc, _sel])
+                                    _oblo, _obhi = f16x2_to_f32(_obw0, dtype=cutlass.BFloat16)
+                                    _obdl = _oblo - _mean0
+                                    _obdh = _obhi - _mean0
+                                    _sq0 = _sq0 + _obdl * _obdl + _obdh * _obdh
+                        else:
+                            for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                                for _e in cutlass.range_constexpr(4):
+                                    _ca = _q * 8 + 2 * _e
+                                    _wa = _a0w.data_ptr(_wb + _xow[2 * _e] + _ca * 32).load()
+                                    _wc = _a0w.data_ptr(_wb + _xow[2 * _e + 1] + (_ca + 1) * 32).load()
+                                    _w0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_wa, _wc, _sel])
+                                    _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
+                                    _dl = _lo - _mean0
+                                    _dh = _hi - _mean0
+                                    _sq0 = _sq0 + _dl * _dl + _dh * _dh
+                else:
+                    for _w0 in _row_words0:
+                        _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
+                        _dl = _lo - _mean0
+                        _dh = _hi - _mean0
+                        _sq0 = _sq0 + _dl * _dl + _dh * _dh
                 _rstd0 = cute.math.rsqrt(_sq0 * cutlass.Float32(_INV_K) + cutlass.Float32(_EPS), fastmath=True)
                 if cutlass.const_expr(WANT_STATS):
                     if row_valid & (tile_n == 0):
@@ -1695,35 +1850,76 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 _wi = 0
                 for _j in cutlass.range_constexpr(_NK if _DIAG != "no_ln_norm" else 0):
                     _row_base0 = sA_elems * _sts[_j] + ln_tid * cta_tile_mnk[2]
-                    for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
-                        _cg = _j * cta_tile_mnk[2] + _q * 8  # the global channel of this 8-chunk (operand 0's gamma / beta sit at [0, 2 K))
-                        _gam = []
-                        _bet = []
-                        if cutlass.const_expr(not _AFFINE_FOLD):
-                            _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_cg), cutlass.Float32))
-                            _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_cg + 4), cutlass.Float32))
-                            _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _cg), cutlass.Float32))
-                            _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _cg + 4), cutlass.Float32))
-                        _packed = []
-                        for _e in cutlass.range_constexpr(4):
-                            _lo, _hi = f16x2_to_f32(_row_words0[_wi + _e], dtype=cutlass.BFloat16)
+                    _wb = (sA_elems // 2) * _sts[_j]
+                    if cutlass.const_expr(_LN_SMEM and _LN_ROLLED):
+                        # the re-read form, rolled ("mn_major" only -- the host declines the transpose form under the re-read forms): per chunk the
+                        # gamma / beta broadcast loads, then per pair the two b32 re-reads + prmt, normalise, the in-place b16 stores of the element this thread owns (row j)
+                        for _q in cutlass.range(cta_tile_mnk[2] // 8, unroll=1):  # unroll=1 = NO unrolling (the rolled form's point)
+                            _occg = _j * cta_tile_mnk[2] + _q * 8
                             if cutlass.const_expr(_AFFINE_FOLD):
-                                _ylo = (_lo - _mean0) * _rstd0
-                                _yhi = (_hi - _mean0) * _rstd0
+                                _hg0 = _hg1 = _hg2 = _hg3 = _hg4 = _hg5 = _hg6 = _hg7 = _rstd0  # unused under the fold (the pure (x - mean) * rstd)
+                                _hb0 = _hb1 = _hb2 = _hb3 = _hb4 = _hb5 = _hb6 = _hb7 = _rstd0
                             else:
-                                _ylo = (_lo - _mean0) * _rstd0 * _gam[2 * _e] + _bet[2 * _e]
-                                _yhi = (_hi - _mean0) * _rstd0 * _gam[2 * _e + 1] + _bet[2 * _e + 1]
-                            if cutlass.const_expr(_A0_TRANSPOSE):
-                                _packed.append(fp32_to_fp16(_ylo, _yhi, dtype=cutlass.BFloat16))
-                            else:
-                                _cl = _q * 8 + 2 * _e  # the stage-local channel of _lo; _hi is the next channel
-                                smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[_cl & 7] + _cl * cta_tile_mnk[2]).store(_ylo.to(cutlass.BFloat16))
-                                smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[(_cl + 1) & 7] + (_cl + 1) * cta_tile_mnk[2]).store(
-                                    _yhi.to(cutlass.BFloat16)
+                                _hg0, _hg1, _hg2, _hg3 = ld_shared_v4(smem_ln_params.data_ptr(_occg), cutlass.Float32)
+                                _hg4, _hg5, _hg6, _hg7 = ld_shared_v4(smem_ln_params.data_ptr(_occg + 4), cutlass.Float32)
+                                _hb0, _hb1, _hb2, _hb3 = ld_shared_v4(smem_ln_params.data_ptr(_K + _occg), cutlass.Float32)
+                                _hb4, _hb5, _hb6, _hb7 = ld_shared_v4(smem_ln_params.data_ptr(_K + _occg + 4), cutlass.Float32)
+                            for _e in cutlass.range_constexpr(4):
+                                _occl = _q * 8 + 2 * _e
+                                _ocwa = _a0w.data_ptr(_wb + _xow[2 * _e] + _occl * 32).load()
+                                _ocwc = _a0w.data_ptr(_wb + _xow[2 * _e + 1] + (_occl + 1) * 32).load()
+                                _ocw0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_ocwa, _ocwc, _sel])
+                                _oclo, _ochi = f16x2_to_f32(_ocw0, dtype=cutlass.BFloat16)
+                                if cutlass.const_expr(_AFFINE_FOLD):
+                                    _ocylo = (_oclo - _mean0) * _rstd0
+                                    _ocyhi = (_ochi - _mean0) * _rstd0
+                                else:
+                                    _ocgl = (_hg0, _hg1, _hg2, _hg3, _hg4, _hg5, _hg6, _hg7)[2 * _e]
+                                    _ocgh = (_hg0, _hg1, _hg2, _hg3, _hg4, _hg5, _hg6, _hg7)[2 * _e + 1]
+                                    _ocbl = (_hb0, _hb1, _hb2, _hb3, _hb4, _hb5, _hb6, _hb7)[2 * _e]
+                                    _ocbh = (_hb0, _hb1, _hb2, _hb3, _hb4, _hb5, _hb6, _hb7)[2 * _e + 1]
+                                    _ocylo = (_oclo - _mean0) * _rstd0 * _ocgl + _ocbl
+                                    _ocyhi = (_ochi - _mean0) * _rstd0 * _ocgh + _ocbh
+                                smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[2 * _e] + _occl * cta_tile_mnk[2]).store(_ocylo.to(cutlass.BFloat16))
+                                smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[2 * _e + 1] + (_occl + 1) * cta_tile_mnk[2]).store(
+                                    _ocyhi.to(cutlass.BFloat16)
                                 )
-                        _wi += 4
-                        if cutlass.const_expr(_A0_TRANSPOSE):
-                            st_shared_v4(smem_a_list[0].data_ptr(_row_base0 + (_q ^ ln_swz) * 8), _packed, cutlass.Int32)
+                    else:
+                        for _q in cutlass.range_constexpr(cta_tile_mnk[2] // 8):
+                            _cg = _j * cta_tile_mnk[2] + _q * 8  # the global channel of this 8-chunk (operand 0's gamma / beta sit at [0, 2 K))
+                            _gam = []
+                            _bet = []
+                            if cutlass.const_expr(not _AFFINE_FOLD):
+                                _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_cg), cutlass.Float32))
+                                _gam.extend(ld_shared_v4(smem_ln_params.data_ptr(_cg + 4), cutlass.Float32))
+                                _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _cg), cutlass.Float32))
+                                _bet.extend(ld_shared_v4(smem_ln_params.data_ptr(_K + _cg + 4), cutlass.Float32))
+                            _packed = []
+                            for _e in cutlass.range_constexpr(4):
+                                _cl = _q * 8 + 2 * _e  # the stage-local channel of _lo; _hi is the next channel
+                                if cutlass.const_expr(_LN_SMEM):
+                                    _wa = _a0w.data_ptr(_wb + _xow[2 * _e] + _cl * 32).load()  # the re-read form, unrolled
+                                    _wc = _a0w.data_ptr(_wb + _xow[2 * _e + 1] + (_cl + 1) * 32).load()
+                                    _w0 = nvvm.inline_ptx("prmt.b32 $0, $1, $2, $3;", write_only_types=[cutlass.Int32], read_only_args=[_wa, _wc, _sel])
+                                else:
+                                    _w0 = _row_words0[_wi + _e]
+                                _lo, _hi = f16x2_to_f32(_w0, dtype=cutlass.BFloat16)
+                                if cutlass.const_expr(_AFFINE_FOLD):
+                                    _ylo = (_lo - _mean0) * _rstd0
+                                    _yhi = (_hi - _mean0) * _rstd0
+                                else:
+                                    _ylo = (_lo - _mean0) * _rstd0 * _gam[2 * _e] + _bet[2 * _e]
+                                    _yhi = (_hi - _mean0) * _rstd0 * _gam[2 * _e + 1] + _bet[2 * _e + 1]
+                                if cutlass.const_expr(_A0_TRANSPOSE):
+                                    _packed.append(fp32_to_fp16(_ylo, _yhi, dtype=cutlass.BFloat16))
+                                else:
+                                    smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[_cl & 7] + _cl * cta_tile_mnk[2]).store(_ylo.to(cutlass.BFloat16))
+                                    smem_a_list[0].data_ptr(sA_elems * _sts[_j] + _xoe[(_cl + 1) & 7] + (_cl + 1) * cta_tile_mnk[2]).store(
+                                        _yhi.to(cutlass.BFloat16)
+                                    )
+                            _wi += 4
+                            if cutlass.const_expr(_A0_TRANSPOSE):
+                                st_shared_v4(smem_a_list[0].data_ptr(_row_base0 + (_q ^ ln_swz) * 8), _packed, cutlass.Int32)
             # (6) the pair-level mask vote (leader CTA): are ALL 256 rows of the pair tile masked or padded?  Each lane reads
             # its own row's mask and the follower's row with the same index; a nonzero anywhere keeps the MMA.
             if cutlass.const_expr(SKIP_MASKED_TILES):
