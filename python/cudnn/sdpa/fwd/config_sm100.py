@@ -237,6 +237,12 @@ class TemplateParams:
     # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
     # role-split A/B arm).
     mma_2x2: bool = False
+    # attn_scale < 0: BMM1 negates Q (tcgen05 a_negate), so the kernel's raw-score max, masks and exp2 run on -S at
+    # |attn_scale| (#1435). APPEND-ONLY, default False.
+    negate_scores: bool = False
+    # A dense S_kv off the KV tile with no mask covering the tail: compile the padded mask against the scalar
+    # S_kv, with no per-batch lengths buffer (MASK_PADDED without SEQ_KV_LENS_PRESENT; #1425).
+    kv_tail_mask: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -280,9 +286,10 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
     )
 
 
-def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv):
+def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
     """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
-    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+    # SM100 Q=1 keeps the existing ragged-Q decode/combine contract.
+    return (device_cc == (10, 7) or (device_cc == (10, 0) and max_q > 1)) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
 
 
 def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
@@ -462,7 +469,7 @@ def _mask_flags_from(params: TemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.thd_varlen or params.seq_kv_lens_present:
+    if params.thd_varlen or params.seq_kv_lens_present or params.kv_tail_mask:
         flags |= MASK_PADDED
     return flags
 
@@ -2663,7 +2670,7 @@ def canonicalize_d192_lowering(
     window_right = params.window_right
 
     template_window_right = window_right
-    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
+    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present and not params.kv_tail_mask:
         # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
         # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
         # right band no sequence reaches.  The band is a compile-time

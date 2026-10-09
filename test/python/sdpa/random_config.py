@@ -240,6 +240,26 @@ class ExecConfig:
     # so a sweep that asserts FROST routing (the cc 10.7 sweeps) lands every case on the row.
     # Inference only (the backward graph declares BHSD).
     bshd_layout: bool = None
+    # Paged only (f16/bf16 forward harness): physical layout of the K/V page pools that
+    # sdpa.helpers.create_container_and_page_table carves from the dense (B, H, S, D) tensors.
+    # None / "hnd" = [pages, H, page, D] contiguous (today's layout); "nhd" = [pages, page, H, D]
+    # physical, declared through the same (pages, H, page, D) logical dims with permuted strides
+    # (the token-major pool layout serving frameworks also hand over).
+    paged_pool_layout: str = None
+    # Forward only: one sink logit on every head instead of the N(0, 0.5) draw (keyless-row pins at
+    # -120 / -5 / +3 / +10 exercise both far ends of the sink fold).
+    sink_token_value: float = None
+    # Forward only, Rule 9 diagnostics: pin ONE plan of the unified list instead of walking it.
+    # {"engine": "backend"} selects the first backend plan; {"engine": "<FROST engine name>",
+    # "knobs": {"TILE_CGA_M": 1, "PACK_GQA": 1, "SPLIT_KV": 1}} appends that knob set through
+    # graph.create_execution_plan and selects it.  A pin is strict: a decline of the pinned plan
+    # FAILS the case (it never degrades to another plan).  Plain dict, so --repro replays the pin.
+    plan_pin: dict = None
+    # Paged MXFP8 harness lever (sdpa/mxfp8.py, forward / inference; set AFTER the RandomizationContext so no seed
+    # moves): V pages live at a different pool permutation than K's and bind their OWN block table (proves per-page
+    # SF_V addressing rather than contiguous-pool luck).  The MXFP8 harness reads paged_pool_layout ("nhd") and
+    # sink_token_value above as the f16 harness does.
+    paged_distinct_v_table: bool = False
 
     @property
     def is_train(self):

@@ -301,11 +301,15 @@ frontend requires both) and no body threads per-batch Q lengths, so serving the 
 form would mean ignoring the q lengths.
 
 An externally computed `delta` is the other plan fact of that standalone surface, on
-every row: `external_delta=True` at construction declares that the caller computes stage
-1's `delta = rowsum(dO ∘ O)` and hands it to `execute(..., delta_tensor=)` — an fp32
-contiguous tensor of `external_delta_shape` = `(B, H_q, S_q_pad)` (`S_q_pad` = `S_q`
-rounded up to the 128-row q tile, **zeros past `S_q`**), 16-byte aligned, on the plan's
-device, holding the raw row dot (`attn_scale` is applied in the main kernel). The chain
+every row, dense and THD: `external_delta=True` at construction declares that the caller
+computes stage 1's `delta = rowsum(dO ∘ O)` and hands it to `execute(..., delta_tensor=)`
+— an fp32 contiguous tensor of `external_delta_shape`, 16-byte aligned, on the plan's
+device, holding the raw row dot (`attn_scale` is applied in the main kernel): on a dense
+plan `(B, H_q, S_q_pad)` (`S_q_pad` = `S_q` rounded up to the 128-row q tile, **zeros past
+`S_q`**); on a THD plan the PACKED head-major `(1, H_q, ceil128(T_q))` the packed chain
+reads at the packed token index (`T_q` = the plan's token capacity, the declared
+`max_total_seq_len_q` tightened to `B · S_max`; **zeros past `T_q`**) — the dense layout
+at `B = 1, S = T_q`, so one producer serves both forms. The chain
 then launches no `dot` and reads O once less, and the workspace carve has no `delta`
 region (`scratch_workspace_bytes()` shrinks by exactly it); the operand is checked before
 any bind — dtype, shape, strides, device, alignment, each a typed `ValueError` — and a
@@ -327,8 +331,12 @@ own pre-pass (its tests compare against an oracle fed the same delta). The pad r
 `[S_q, S_q_pad)` must be finite zeros on every row: the kernels read them, and under the
 MXFP8 row's block-scaled dS a 32-element q block straddling the pad folds them into the
 real columns' E8M0 scale. The `o` / `descale_o` (fp8) and `o_f16` / `dO_f16` (MXFP8)
-operands stay required under the flag and are read by nothing. Declined under THD on
-every row (the packed chain's delta is head-major and computed by its own pre-pass).
+operands stay required under the flag and are read by nothing. Under THD the same
+contract holds in the packed form above: the chain reads the caller's tensor where it
+read its own `delta` region, launches no `dot` and carves no region (the carve shrinks by
+exactly `H_q · ceil128(T_q)` fp32 values); a producer that forms the delta in `dot`'s
+order over the packed O / dO is bitwise the chain's own on the bf16 / fp16 and MXFP8 rows,
+and the fp8 row again reads it in true units.
 
 Bottom-right causal at a ragged `S_q` is served on all three rows: every body takes the
 real lengths (`seqlen_q_real` / `seqlen_kv_real`) and derives the diagonal `S_kv − S_q`
@@ -382,8 +390,8 @@ without query rows -- an empty-Q sequence, a spare unit of the occupancy-sized g
 loads every operand past the clamped extent (zero-filled), so even an all-NaN Q / dO
 capacity with no live query row yields exact-zero dK / dV. Served under THD:
 none / causal / bottom-right / sliding window, GQA / MQA, empty sequences on either side
-(their gradients are exact zeros). Declined under THD: right-band widening, bias, an
-external `delta`.
+(their gradients are exact zeros), an external `delta` in its packed head-major form
+(see Sequence lengths above). Declined under THD: right-band widening, bias.
 
 On the fp8 row the same mechanism runs in e4m3: packed e4m3 payloads through the
 packed-total-clamped descriptors, a kv-blocked **e4m3** dS workspace (`dS_q = e4m3(dS ·
@@ -427,9 +435,12 @@ length zeroed, per execute, from the device prefixes; `descale_q / k` pads are h
 (an S NaN is select-dead) and bind as they are. Both dS policies serve THD: P-c runs the
 bf16 THD gradient GEMMs over the packed `q_T / k_T` dequantized exactly to bf16 per token
 (no pad byte is read), P-b the block-scale arm's THD leg (the kv-blocked payloads + atoms,
-B's scale factors through the per-sequence SF tile prefixes) with dQ once per GQA group
-member, as on the dense P-b chain. No amax (the row's contract); Stats comes from the
-caller — no Rubin MXFP8 THD forward row feeds it yet.
+B's scale factors through the per-sequence SF tile prefixes) with dQ once per head chunk
+under GQA, as on the dense P-b chain: the dQ record's `b_head_group` is the GQA group, so
+B and its scale factors are indexed by `h // group` (the SF tile prefix is a token-side
+term) and one launch covers the whole head chunk, bitwise the per-member launches. No
+amax (the row's contract); Stats comes from the caller — no Rubin MXFP8 THD forward row
+feeds it yet.
 
 ### FP8 numerics (`sdpa_bwd_sm107_fp8`)
 
@@ -553,8 +564,8 @@ plan creation.
   graph carries both lengths and no body threads per-batch Q lengths; per-batch KV
   lengths are served on every row's standalone adapter, see Sequence lengths; a RAGGED
   padded graph is THD and served on `sdpa_bwd_sm107`, `sdpa_bwd_sm107_fp8` and
-  `sdpa_bwd_sm107_mxfp8`), sink / dSink, bias / dBias, right-band widening, an external
-  `delta` under THD, `dense_flex` layouts,
+  `sdpa_bwd_sm107_mxfp8`), sink / dSink, bias / dBias, right-band widening,
+  `dense_flex` layouts,
   decode shapes (`S_q == 1`), `use_deterministic_algorithm` (the chains have no atomics;
   the claim waits on the bring-up sweep), dropout / ALiBi / softcap; on the MXFP8
   row also the `amax_dQ / dK / dV` outputs, fp16 gradients and any

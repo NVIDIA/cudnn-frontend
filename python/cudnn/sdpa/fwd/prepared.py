@@ -317,7 +317,8 @@ def build_thd_spec(api, *, scale_softmax: Optional[float]) -> ThdLaunchSpec:
     else:
         put("lse_strides", (0, 0, 0))
         put("lse_ext", s.lse_head_stride)  # compact head-major: the token capacity, written per call
-    put("scale_softmax_log2", scale * math.log2(math.e))
+    # Plans with negate_scores (SM100/SM107/SM120) run at |scale| (#1435).
+    put("scale_softmax_log2", (-scale if getattr(api, "_score_negated", False) else scale) * math.log2(math.e))
     put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
     put("thd_max_sq", int(api.s_q_max))
     put("n_thd_units", int(plan.units))
@@ -608,7 +609,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.seq_kv_present, s.seq_q_present = bool(api.seq_kv_lens_present), bool(api.seq_q_lens_present)
     s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
     s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
-    s.kv_tail_native = bool(getattr(km, "PREPARED_KV_TAIL_NATIVE", False))
+    # SM120 always masks its rightmost KV tile; an SM100/SM107 plan compiled with kv_tail_mask masks it too.
+    s.kv_tail_native = bool(getattr(km, "PREPARED_KV_TAIL_NATIVE", False) or getattr(api, "_kv_tail_mask", False))
     s.dense_flex = bool(getattr(km, "PREPARED_DENSE_FLEX", False))
     # the COMPILED mask kind: the d192 lowering may have rewritten a square bottom-right mask as top-left
     s.causal = bool(api.is_causal)
@@ -683,7 +685,8 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
 
     put("lse_strides", (0, 0, 0))
     put("lse_ext", 0)
-    put("scale_softmax_log2", scale * math.log2(math.e))
+    # Plans with negate_scores (SM100/SM107/SM120) run at |scale| (#1435).
+    put("scale_softmax_log2", (-scale if getattr(api, "_score_negated", False) else scale) * math.log2(math.e))
     put("scale_softmax", scale)  # SM90 retains natural units, including literal zero.
     put("thd_max_sq", int(api.s_q_max))
     put("n_thd_units", 0)

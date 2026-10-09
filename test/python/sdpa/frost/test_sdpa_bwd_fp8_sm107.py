@@ -1699,8 +1699,9 @@ def test_kernel_level_e4m3_ds_workspace_is_the_scaled_quantized_ds(stem):
 # The fp8 row's twins of the half suite's ``_run_adapter`` cells (test_sdpa_bwd_dsl_sm107.py): ``SdpaBwdDslSm107Fp8(seq_kv_lens_present=True)``
 # over the twelve scalars and the four amax outputs, the fp8 oracle composing the SAME per-batch lengths and band INSIDE itself
 # (``padding=``: slicing the operands per batch entry would be a different e4m3 quantization of nothing but the slice), the
-# appended ``external_delta`` plan fact (DENSE only: a caller's fp32 ``[B, H_q, S_q_pad]`` ``rowsum(dO * O)`` in TRUE units, bound
-# AS IS -- the fp8 kernel reads delta unscaled, nobody applies ``descale_o * descale_dO`` to a caller's tensor; zeros past S_q), and
+# appended ``external_delta`` plan fact (the dense plans here -- the THD twins are test_sdpa_bwd_thd_fp8_sm107.py's: a caller's fp32
+# ``[B, H_q, S_q_pad]`` ``rowsum(dO * O)`` in TRUE units, bound AS IS -- the fp8 kernel reads delta unscaled, nobody applies
+# ``descale_o * descale_dO`` to a caller's tensor; zeros past S_q), and
 # bottom-right at a ragged S_q through the graph (served now: the body threads ``seqlen_q_real``).  The K / V rows past a batch
 # entry's kv length and the delta's pad rows hold FINITE data in every cell (the finite-data contract of the per-batch arm:
 # ``chunk_dS = (dP * scale - dot) * P`` and ``0 * NaN = NaN``; the dense rows get finite pads from the zero-filled staging, the

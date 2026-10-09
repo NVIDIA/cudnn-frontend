@@ -82,6 +82,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.tma import cp_async_bulk_shared_cluster_shared_cta
@@ -704,7 +705,7 @@ def _kernel(
     _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
-    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
     o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     # ------------------------------------------------------------------
@@ -983,6 +984,8 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 sg0_mcast_mask=sg0_mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
         else:
             _mma_warp_non_leader(
@@ -2094,6 +2097,8 @@ def _mma_warp_group(
     mcast_mask,
     sg0_mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     """MMA warp leader — sg-conditional BMM1 (sg0 leader) or BMM2 (sg1 leader).
 
@@ -2141,7 +2146,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,

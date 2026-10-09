@@ -465,6 +465,9 @@ def _kernel(
     # (D, row, H_kv, page); derived by _host from the bound strides.
     paged_hnd: cutlass.Constexpr[bool] = False,
 ) -> None:
+    if cutlass.const_expr(PARAMS.thd_batch_one):
+        # Specialize only declared batch capacity; Q/KV lengths remain live.
+        n_batch = cutlass.Int32(1)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
 
@@ -1439,6 +1442,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -2747,7 +2751,8 @@ def compile(  # noqa: A001
 ) -> Callable:
     """Compile the host entry for one layout kind.
 
-    Every extent and stride is a runtime argument of the artifact (see ``_host``),
+    Extents and strides are runtime arguments (see ``_host``), except the
+    existing ``thd_batch_one`` template specialization of batch capacity,
     so the key is only what specializes the traced code: the head-dim ENVELOPE
     (``d_qk`` / ``d_v``: the TMA descriptors carry the real extents while the
     tile box stays the compile-time TILE geometry — box columns past d_qk / d_v

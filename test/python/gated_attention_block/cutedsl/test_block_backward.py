@@ -2647,6 +2647,7 @@ def _stand_in_for_compile(blk):
         side_gemm_scratch_bytes=1 if blk.fuse_wgrad_overlap else None,
         quant=blk.quant,
         amax_partials_n=8 if blk.quant is not None else 0,  # compile() passes the prologue recipe's SMs x 8 cap; one SM's worth stands in
+        mx_prologue_arm=blk.mx_prologue_arm,  # the MXFP8 prologue's arm keys the rebuild regions (None on the bf16 / fp8 arms)
     )
     blk._compiled_kernel = blk._ws
     blk._samples = None
@@ -2739,41 +2740,27 @@ def test_quant_scalars_are_zero_copy_views_of_the_workspace():
 # The MXFP8 backward (quant=MxQuantSpec): its declaration and declines (any CUDA device), its carve (anywhere)
 # ---------------------------------------------------------------------------
 
-# The MXFP8 backward's stage list in launch order (module docstring of api_bwd, "The MXFP8 backward"): nothing fused, every block
-# quantize its own launch; the two projection GEMMs are the block-scale stages, the out-projection ones the per-tensor fp8 stages.
+# The MXFP8 backward's stage list in launch order (module docstring of api_bwd, "The MXFP8 backward"): the fp8 chain's shape -- the fused
+# PROLOGUE and EPILOGUE, one dual-axis dO quantize; the two projection GEMMs are the block-scale stages, the out-projection ones the
+# per-tensor fp8 stages.
 _MXFP8_STAGES = [
-    "_InitScalars",
-    "_AmaxPartials",
-    "_QuantizeGrad",
+    "_MxQuantPrologue",  # init | dY amax partials | the Q / K rebuild's MX epilogue (q8 / q_T8 / k8 / k_T8 with their blobs) | v8
+    "_QuantizeGrad",  # dY, per-tensor
     "_OutProjDgrad",
     "_SigmoidGateBwd",
-    "_QuantizeMxfp8",  # dO rowwise
-    "_QuantizeMxfp8",  # dO columnwise
+    "_QuantizeMxfp8",  # dO, DUAL-AXIS: rowwise + columnwise from one read
     "_OutProjWgrad",
-    "_QkNormRope",
-    "_QuantizeMxfp8",  # q rowwise
-    "_QuantizeMxfp8",  # q columnwise
-    "_QuantizeMxfp8",  # k rowwise
-    "_QuantizeMxfp8",  # k columnwise
-    "_QuantizeMxfp8",  # v rowwise
     "_SdpaBwdMxfp8",
     "_QkNormRopeBwd",
-    "_QuantizeMxfp8",  # dqkvg rowwise, canonical
-    "_QuantizeMxfp8",  # dqkvg transposed, canonical
+    "_MxQuantEpilogue",  # dW_norm reduce | the dual-axis canonical dQKVG cast (rowwise + transposed)
     "_QkvGateWgrad",
     "_QkvGateDgrad",
 ]
-# (name, axis, sf_layout, transposed, heads-of) of the nine MXFP8 quantizes, in launch order
+# (name, axis, sf_layout, transposed, heads-of) of the ONE standalone MXFP8 quantize stage of the fused chain -- the dual-axis dO
+# launch (its columnwise half rides the same stage: `dual=True`); the other eight block quantizations are jobs of the fused PROLOGUE
+# (q / q_T / k / k_T / v) and EPILOGUE (dqkvg / dqkvg_T)
 _MXFP8_QUANTIZES = [
     ("quantize_mxfp8_do", "row", "sdpa", False, "h_q"),
-    ("quantize_mxfp8_do_T", "col", "sdpa", False, "h_q"),
-    ("quantize_mxfp8_q", "row", "sdpa", False, "h_q"),
-    ("quantize_mxfp8_q_T", "col", "sdpa", False, "h_q"),
-    ("quantize_mxfp8_k", "row", "sdpa", False, "h_kv"),
-    ("quantize_mxfp8_k_T", "col", "sdpa", False, "h_kv"),
-    ("quantize_mxfp8_v", "row", "sdpa", False, "h_kv"),
-    ("quantize_mxfp8_dqkvg", "row", "gemm", False, "n_per_d"),
-    ("quantize_mxfp8_dqkvg_T", "col", "gemm", True, "n_per_d"),
 ]
 # The eight slots the MXFP8 arm writes a non-zero value to (the dY point and the three live constants); the other 21 read 0.0.
 _MXFP8_LIVE_SLOTS = ("amax_dy", "scale_dy", "descale_dy", "alpha_b1", "alpha_b2", "scale_o", "descale_o", "descale_w_o")
@@ -2820,7 +2807,8 @@ def _mx_artifacts(inp16: dict, geom, *, h_t=True, w_qkvg_t=True) -> dict:
 def test_mxfp8_declaration_declines_are_typed():
     """Every typed decline of the MXFP8 backward's DECLARATION, on any CUDA device, before the Rubin gate and before any stage is
     asked -- and the ONE place its message texts are pinned (every other test matches the attribute name only).  At construction:
-    the fp4 weight modes (``w_qkvg_dtype`` e2m1, ``o_fp4``: their backward follows), e5m2 codes (``MxQuantSpec.validate``),
+    the fp4 weight modes CONSTRUCT (``w_qkvg_dtype`` e2m1, ``o_fp4``: their backward is ``test_block_backward_fp4.py``'s) and an e4m3
+    weight handed to such a block is ``check_support``'s decline naming the weight and the field, e5m2 codes (``MxQuantSpec.validate``),
     ``thd=True`` with an MxQuantSpec (names BOTH attributes, says dense-only, and never the row's flag), ``grad_scaling`` outside its
     vocabulary.  At ``check_support``: an fp16 ``sample_dy`` (the MXFP8 backward is bf16); the record / weight dtype gates BOTH
     ways (a bf16 ``saved.h`` with an MxQuantSpec, e4m3 codes without one -- the bf16 backward's message now names ``quant=MxQuantSpec``
@@ -2829,13 +2817,18 @@ def test_mxfp8_declaration_declines_are_typed():
     the block-level checks with ``need_dw_qkvg=False``; the rule binds ``B*S``, so S = 1008 at B = 2 and S = 992 at B = 1 pass while S =
     1000 at B = 1 and at B = 2 are declined); every bf16 decline unchanged (padding spot-checked)."""
     b, s = 1, 256
-    # -- construction: the fp4 modes, e5m2, thd + spec, grad_scaling --
-    with pytest.raises(NotImplementedError, match="w_qkvg_dtype") as ei:
-        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, w_qkvg_dtype=torch.float4_e2m1fn_x2))
-    assert "fp4 weight modes" in str(ei.value), str(ei.value)
-    with pytest.raises(NotImplementedError, match="o_fp4") as ei:
-        _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
-    assert "fp4 weight modes" in str(ei.value), str(ei.value)
+    # -- construction: the fp4 weight modes CONSTRUCT (their backward is served); an e4m3 weight under them is check_support's decline, by name --
+    r4 = _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, w_qkvg_dtype=torch.float4_e2m1fn_x2))
+    assert r4.blk.w_qkvg_dtype == torch.float4_e2m1fn_x2 and r4.blk.w_o_dtype == _E4M3 and r4.blk.o_fp4 is None
+    with pytest.raises(ValueError, match="w_qkvg") as ei:
+        r4.blk.check_support()
+    assert "float4_e2m1fn_x2" in str(ei.value) and "w_qkvg_dtype" in str(ei.value), str(ei.value)
+    r4 = _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=1.0, scale_o=1.0, o_fp4=Fp4Format.NVFP4))
+    assert r4.blk.o_fp4 is Fp4Format.NVFP4 and r4.blk.w_o_dtype == torch.float4_e2m1fn_x2 and r4.blk.w_qkvg_dtype == _E4M3
+    with pytest.raises(ValueError, match="w_o") as ei:
+        r4.blk.check_support()
+    assert "float4_e2m1fn_x2" in str(ei.value) and "o_fp4" in str(ei.value), str(ei.value)
+    # -- construction: e5m2, thd + spec, grad_scaling --
     with pytest.raises(NotImplementedError, match="MxQuantSpec"):
         _declare_bwd_mxfp8(dict(_COMMON), b, s, spec=MxQuantSpec(descale_w_o=0.125, dtype=torch.float8_e5m2))
     with pytest.raises(ValueError, match="grad_scaling"):
@@ -2889,25 +2882,32 @@ def test_mxfp8_declaration_declines_are_typed():
 
 @requires_cuda
 def test_mxfp8_declaration_wires_the_stage_list():
-    """``quant=MxQuantSpec`` builds the MXFP8 backward's stage list in its launch order -- the standalone scalar init and dY amax
-    partials, the per-tensor dY quantize, the e4m3 out_proj dgrad, the gate backward's fp8 arm WITHOUT the amax folds, the two dO
-    block quantizes, the e4m3 out_proj wgrad, the bf16 Q / K rebuild (no V compaction), the five SDPA-operand block quantizes, the
-    MXFP8 SDPA stage, the norm backward (no amax fold), the two GEMM-canonical dQKVG quantizes, the two block-scale projection
-    GEMMs -- with every declaration fact: the out-projection GEMMs per-tensor e4m3 (``alpha=True``, bf16 out, the 64-byte MMA K),
-    the projection GEMMs ``block_scale=True`` (``alpha=False``, bf16 out, the same K64); the nine quantizes' (axis, layout,
-    transposed, heads); the needs dropping exactly their launches; ``"delayed"`` flipping the dY quantize alone; the bf16 and the fp8
-    declarations untouched."""
-    from cudnn.gated_attention_block.api_bwd import _FP8_GEMM_MMA_TILE_K_BYTES, _AmaxPartials, _InitScalars, _QuantizeGrad
-    from cudnn.gated_attention_block.api import _QkNormRope, _QuantizeMxfp8
+    """``quant=MxQuantSpec`` builds the MXFP8 backward's stage list in its launch order -- the fused PROLOGUE (the scalar init, the
+    dY amax partials, the Q / K rebuild's MX epilogue and the v quantize as its jobs), the per-tensor dY quantize, the e4m3 out_proj
+    dgrad, the gate backward's fp8 arm WITHOUT the amax folds, the DUAL-AXIS dO block quantize, the e4m3 out_proj wgrad, the MXFP8
+    SDPA stage, the norm backward (no amax fold), the fused EPILOGUE (the dW_norm reduce and the dual-axis canonical dQKVG cast), the
+    two block-scale projection GEMMs -- with every declaration fact: the out-projection GEMMs per-tensor e4m3 (``alpha=True``, bf16
+    out, the 64-byte MMA K), the projection GEMMs ``block_scale=True`` (``alpha=False``, bf16 out, the same K64); the one standalone
+    quantize's (axis, layout, transposed, heads, dual); the prologue's slot facts and arm (the carve's key); the epilogue's three jobs
+    following the needs -- the needs dropping exactly their launches (a cast half folds out, the epilogue launch stays while a job
+    remains, and goes when none does); every standalone launch of the unfused chain unbuilt; ``"delayed"`` flipping the dY quantize
+    alone; the bf16 and the fp8 declarations untouched."""
+    from cudnn.gated_attention_block.api_bwd import _FP8_GEMM_MMA_TILE_K_BYTES, _MxQuantEpilogue, _MxQuantPrologue, _QuantizeGrad
+    from cudnn.gated_attention_block.api import _QuantizeMxfp8
 
     on = _declare_bwd_mxfp8(dict(_COMMON), 1, 256).blk
     assert [type(st).__name__ for st in on._stages] == _MXFP8_STAGES
     assert isinstance(on.quant, MxQuantSpec) and on.grad_scaling == "current" and on.w_dtype == _E4M3 and on.act_dtype == torch.bfloat16
-    assert on._prologue is None and on._epilogue is None and on._compact_v is None and on._quant_vals is None  # VALUES at compile()
-    assert isinstance(on._scalar_init, _InitScalars) and isinstance(on._amax_dy, _AmaxPartials) and isinstance(on._recompute_qk, _QkNormRope)
-    assert (on._scalar_init.n_slots, on._scalar_init.const_slot0, on._scalar_init.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, len(QUANT_CONST_SLOTS))
+    assert isinstance(on._prologue, _MxQuantPrologue) and isinstance(on._epilogue, _MxQuantEpilogue) and on._quant_vals is None  # VALUES at compile()
+    assert on._stages[0] is on._prologue and on._stages[-3] is on._epilogue
+    # the unfused chain's standalone launches are the fused launches' jobs now: none is built
+    assert on._scalar_init is None and on._amax_dy is None and on._recompute_qk is None and on._compact_v is None and on._quant_do_T is None
+    assert on._quant_q is None and on._quant_q_T is None and on._quant_k is None and on._quant_k_T is None and on._quant_v is None
+    assert on._quant_dqkvg is None and on._quant_dqkvg_T is None
+    assert (on._prologue.n_slots, on._prologue.const_slot0, on._prologue.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, len(QUANT_CONST_SLOTS))
+    assert on._prologue.arm == on.mx_prologue_arm == "mx_epilogue" and on._prologue.dtype == torch.bfloat16 and on._prologue._recipe is None
+    assert (on._epilogue.want_dw, on._epilogue.want_row, on._epilogue.want_col) == (True, True, True) and on._epilogue.dtype == torch.bfloat16
     d = _COMMON["d_head"]
-    assert on._amax_dy.heads == _COMMON["d_model"] // d and on._amax_dy.dtype_in == torch.bfloat16
     qdy = on._quant_dy
     assert isinstance(qdy, _QuantizeGrad)
     assert (qdy.heads, qdy.n_alpha, qdy.own_amax, qdy.amax_src, qdy.scale_src, qdy.persistent) == (_COMMON["d_model"] // d, 2, False, "partials", "amax", False)
@@ -2939,18 +2939,24 @@ def test_mxfp8_declaration_wires_the_stage_list():
         (name, axis, layout, transposed, heads_of[h]) for name, axis, layout, transposed, h in _MXFP8_QUANTIZES
     ]
     assert all(st.dtype_in == torch.bfloat16 for st in quantizes)
-    # the needs drop exactly their launches
+    assert quantizes == [on._quant_do] and on._quant_do.dual is True and on._quant_do.transposed_second is False  # the dO dual-axis launch
+    # the needs drop exactly their launches; a cast half of the epilogue folds out, the launch stays while one of its jobs remains
     no_wo = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dw_o=False).blk
     assert [type(st).__name__ for st in no_wo._stages] == [n for n in _MXFP8_STAGES if n != "_OutProjWgrad"]
     assert (no_wo._gate_bwd.want_og, no_wo._gate_bwd.og_fp8, no_wo._gate_bwd.want_delta) == (False, False, True)
     no_wq = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dw_qkvg=False).blk
-    assert no_wq._quant_dqkvg_T is None and no_wq._qkv_gate_wgrad is None and no_wq._quant_dqkvg is not None
-    assert len(no_wq._stages) == len(_MXFP8_STAGES) - 2
+    assert no_wq._qkv_gate_wgrad is None and (no_wq._epilogue.want_dw, no_wq._epilogue.want_row, no_wq._epilogue.want_col) == (True, True, False)
+    assert len(no_wq._stages) == len(_MXFP8_STAGES) - 1
     no_dh = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dh=False).blk
-    assert no_dh._quant_dqkvg is None and no_dh._qkv_gate_dgrad is None and no_dh._quant_dqkvg_T is not None
-    assert len(no_dh._stages) == len(_MXFP8_STAGES) - 2
+    assert no_dh._qkv_gate_dgrad is None and (no_dh._epilogue.want_dw, no_dh._epilogue.want_row, no_dh._epilogue.want_col) == (True, False, True)
+    assert len(no_dh._stages) == len(_MXFP8_STAGES) - 1
     rope = _declare_bwd_mxfp8({**_COMMON, "qk_norm": False}, 1, 256).blk
     assert rope._norm_bwd.want_dw is False and [type(st).__name__ for st in rope._stages] == _MXFP8_STAGES
+    assert (rope._epilogue.want_dw, rope._epilogue.want_row, rope._epilogue.want_col) == (False, True, True)  # the epilogue stays for the cast
+    only_wo = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, need_dh=False, need_dw_qkvg=False, need_dw_norms=False).blk
+    assert only_wo._epilogue is None and [type(st).__name__ for st in only_wo._stages] == [
+        n for n in _MXFP8_STAGES if n not in ("_MxQuantEpilogue", "_QkvGateWgrad", "_QkvGateDgrad")
+    ]
     delayed = _declare_bwd_mxfp8(dict(_COMMON), 1, 256, grad_scaling="delayed").blk
     assert delayed._quant_dy.scale_src == "given" and (delayed._quant_dy.own_amax, delayed._quant_dy.amax_src) == (False, "partials")
     # the bf16 and the fp8 declarations are untouched
@@ -2958,6 +2964,63 @@ def test_mxfp8_declaration_wires_the_stage_list():
     assert off.quant is None and off._scalar_init is None and off._amax_dy is None and [type(st).__name__ for st in off._stages] == _BF16_STAGES
     fp8 = _declare_bwd_fp8(dict(_COMMON), 1, 256).blk
     assert fp8._scalar_init is None and fp8._amax_dy is None and fp8._quant_q is None and [type(st).__name__ for st in fp8._stages] == _FP8_STAGES
+
+
+def test_mxfp8_fused_stage_contracts_are_typed():
+    """Host, no GPU (the two fused stage classes alone): ``_MxQuantPrologue.check_support`` declines, GEOMETRY FIRST and device-free -- a
+    non-bf16 record (``NotImplementedError``), the slot arithmetic (no slot; constants outside the block; more constants than the init
+    ABI's arguments), ``d_model % d_head`` (the dY view), a ``d_head`` the MX token tile cannot serve (``validate_mx_shape``: the
+    warp-per-row rule) -- and then the arch (the TMA ring: SM90 or newer; on an older part that is the one decline left, naming TMA);
+    ``_MxQuantEpilogue.check_support`` declines a non-bf16 gradient, a dW_norm job without the norm, nothing to launch and a
+    transposed half at ``B*S % 32 != 0``.  The prologue's ``arm`` is ``"mx_epilogue"``, a member of ``MX_PROLOGUE_ARMS``; both stages
+    refuse ``execute`` before ``compile``."""
+    from cudnn.gated_attention_block.api_bwd import MX_PROLOGUE_ARMS, _MxQuantEpilogue, _MxQuantPrologue
+    from cudnn.gated_attention_block.kernels.quantize import MAX_INIT_CONSTS
+
+    g = GatedAttentionBlockGeometry(**_COMMON)
+    n_slots = len(QUANT_SCALAR_SLOTS)
+    ok = dict(batch=1, seq_len=256, dtype=torch.bfloat16, n_slots=n_slots, const_slot0=15, n_consts=14)
+    pro = _MxQuantPrologue(g, **ok)
+    assert pro.arm == "mx_epilogue" and pro.arm in MX_PROLOGUE_ARMS and pro.name == "mxfp8_bwd_prologue"
+    with pytest.raises(NotImplementedError, match="bf16"):
+        _MxQuantPrologue(g, **{**ok, "dtype": torch.float16}).check_support()
+    with pytest.raises(ValueError, match="n_slots"):
+        _MxQuantPrologue(g, **{**ok, "n_slots": 0}).check_support()
+    with pytest.raises(ValueError, match="inside"):
+        _MxQuantPrologue(g, **{**ok, "const_slot0": n_slots - 3}).check_support()
+    with pytest.raises(ValueError, match="ABI"):
+        _MxQuantPrologue(g, **{**ok, "n_slots": 64, "const_slot0": 0, "n_consts": MAX_INIT_CONSTS + 1}).check_support()
+    with pytest.raises(ValueError, match="d_model"):
+        _MxQuantPrologue(GatedAttentionBlockGeometry(**{**_COMMON, "d_model": 640}), **ok).check_support()
+    with pytest.raises(ValueError, match="d_head"):
+        _MxQuantPrologue(GatedAttentionBlockGeometry(**{**_COMMON, "d_head": 128}), **ok).check_support()
+    with pytest.raises(RuntimeError, match="compile"):
+        pro.n_partials()
+    with pytest.raises(RuntimeError, match="compile"):
+        pro.execute(**{k: None for k in ("slots", "dy", "partials", "q_pre", "k_pre", "w_q", "w_k", "cos", "sin", "q8", "sf_q", "q_T8", "sf_q_T", "k8", "sf_k", "k_T8", "sf_k_T", "v", "v8", "sf_v", "stream")})  # fmt: skip
+    cc = _cc()
+    if cc is not None:  # the arch decision below asks the ambient device; without one the device-free checks above are the test
+        if cc[0] < 9:
+            with pytest.raises(NotImplementedError, match="SM90"):
+                pro.check_support()  # the geometry passed; the TMA ring is the one decline left on this part
+        else:
+            pro.check_support()
+    epi = dict(batch=1, seq_len=256, dtype=torch.bfloat16, want_dw=True, want_row=True, want_col=True)
+    assert _MxQuantEpilogue(g, **epi).name == "mxfp8_bwd_epilogue"
+    _MxQuantEpilogue(g, **epi).check_support()
+    with pytest.raises(NotImplementedError, match="bf16"):
+        _MxQuantEpilogue(g, **{**epi, "dtype": torch.float16}).check_support()
+    with pytest.raises(ValueError, match="qk_norm"):
+        _MxQuantEpilogue(GatedAttentionBlockGeometry(**{**_COMMON, "qk_norm": False}), **epi).check_support()
+    with pytest.raises(ValueError, match="nothing to launch"):
+        _MxQuantEpilogue(g, **{**epi, "want_dw": False, "want_row": False, "want_col": False}).check_support()
+    with pytest.raises(ValueError, match="32"):
+        _MxQuantEpilogue(g, **{**epi, "seq_len": 1000}).check_support()
+    _MxQuantEpilogue(g, **{**epi, "seq_len": 1000, "want_col": False}).check_support()  # a dgrad-only block serves a ragged T
+    with pytest.raises(RuntimeError, match="compile"):
+        _MxQuantEpilogue(g, **epi).execute(
+            plane_q=None, plane_k=None, dw_q_norm=None, dw_k_norm=None, src=None, dst=None, sf=None, dst_t=None, sf_t=None, stream=0
+        )
 
 
 @requires_cuda
@@ -2979,12 +3042,14 @@ def test_workspace_carve_under_mxfp8_is_the_declared_composition():
     """``_plan_bwd_workspace(quant=MxQuantSpec)`` on any device -- the pure-carve twin of
     ``test_workspace_carve_under_quant_is_the_declared_composition``: the bf16 regions keep their places and sizes except the two
     the MXFP8 backward does not write (``o_gated`` -> -1: B3's third output is the e4m3 ``og8``; ``recompute_v`` -> -1: ``v8`` IS V's
-    compaction) -- the bf16 ``recompute`` / ``recompute_k`` ARE carved (the bf16 rebuild feeds the block quantizes) --, ``delta`` is
-    MANDATORY, and the MXFP8 regions are appended AFTER every bf16 region in the documented order, every payload right before its
+    compaction) -- the bf16 ``recompute`` / ``recompute_k`` ARE carved under the default and the bf16-rebuild prologue arm (the bf16
+    rebuild feeds the block quantizes there) and NOT under the MX-epilogue arm the block runs (``mx_prologue_arm``: the fused prologue
+    writes the four Q / K payloads out of registers), every later region then moving up by exactly their two aligned sizes --, ``delta``
+    is MANDATORY, and the MXFP8 regions are appended AFTER every bf16 region in the documented order, every payload right before its
     scale-factor blob (the SDPA-layout blobs at ``_sf_slot_bytes``, the canonical ones at ``sf_blob_bytes``), each padded to the carve
     alignment, then the scalar block and the dY partials; ``og8`` follows ``need_dw_o``; the dO / dG / band partials are never carved
-    and a non-zero count for them is typed; the ``quant=None`` and the ``quant=QuantSpec`` layouts are byte-identical to before (every
-    MXFP8 field -1 on both)."""
+    and a non-zero count for them is typed; an arm outside ``MX_PROLOGUE_ARMS`` or an arm without an MxQuantSpec is typed; the
+    ``quant=None`` and the ``quant=QuantSpec`` layouts are byte-identical to before (every MXFP8 field -1 on both)."""
     from cudnn.gated_attention_block.api import _sf_slot_bytes
     from cudnn.gated_attention_block.kernels.proj_gemm import sf_blob_bytes
 
@@ -3092,6 +3157,35 @@ def test_workspace_carve_under_mxfp8_is_the_declared_composition():
     added = sum(al(sizes[name]) for name in order if name in ("dy8", "do8", "sf_do", "do_T8", "sf_do_T", "og8", "q8", "sf_q", "q_T8", "sf_q_T"))
     added += sum(al(sizes[name]) for name in ("k8", "sf_k", "k_T8", "sf_k_T", "v8", "sf_v", "dqkvg8", "sf_dqkvg", "dqkvg_t8", "sf_dqkvg_t", "quant_scalars"))
     assert laymx.total_bytes - lay16.total_bytes == added - al(t * g.h_q * d * e) - al(t * g.h_kv * d * e)
+    # the fused prologue's MX-epilogue ARM (the block's: GatedAttentionBlockBwd.mx_prologue_arm) carves NEITHER bf16 rebuild region, and
+    # every later region moves up by exactly their two aligned sizes; the bf16-rebuild arm is the default carve, byte for byte; a bad arm
+    # and an arm without an MxQuantSpec are typed
+    from cudnn.gated_attention_block.api_bwd import MX_PROLOGUE_ARM_BF16_REBUILD, MX_PROLOGUE_ARM_MX_EPILOGUE, MX_PROLOGUE_ARMS
+
+    assert MX_PROLOGUE_ARMS == (MX_PROLOGUE_ARM_MX_EPILOGUE, MX_PROLOGUE_ARM_BF16_REBUILD) == ("mx_epilogue", "bf16_rebuild")
+    fused = _plan_bwd_workspace(
+        g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=mx, mx_prologue_arm=MX_PROLOGUE_ARM_MX_EPILOGUE, **common
+    )
+    shift = al(sizes["recompute"]) + al(sizes["recompute_k"])
+    assert fused.recompute == -1 and fused.recompute_k == -1 and fused.total_bytes == laymx.total_bytes - shift
+    moved = False
+    for name in order:
+        if name in ("recompute", "recompute_k"):
+            moved = True
+            continue
+        assert getattr(fused, name) == getattr(laymx, name) - (shift if moved else 0), (name, getattr(fused, name), getattr(laymx, name))
+    assert (fused.do_gated, fused.dqkvg) == (laymx.do_gated, laymx.dqkvg) and fused.dq == laymx.dqkvg + al(sizes["dqkvg"])
+    kept = _plan_bwd_workspace(
+        g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=mx, mx_prologue_arm=MX_PROLOGUE_ARM_BF16_REBUILD, **common
+    )
+    assert kept == laymx
+    with pytest.raises(ValueError, match="mx_prologue_arm"):
+        _plan_bwd_workspace(g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=mx, mx_prologue_arm="rowwise", **common)
+    for q_other in (None, _QSPEC):
+        with pytest.raises(ValueError, match="MxQuantSpec"):
+            _plan_bwd_workspace(
+                g, b, s, torch.bfloat16, RecomputePolicy.RECOMPUTE_QK_PRE, need=need, quant=q_other, mx_prologue_arm=MX_PROLOGUE_ARM_MX_EPILOGUE, **common
+            )
     # the fp8 carve is untouched by the MXFP8 arm (its own test pins the composition; here: the same bytes as before, no MX field)
     assert lay8.recompute == -1 and lay8.recompute_k == -1 and lay8.o_gated == -1 and lay8.recompute_v == -1
 
@@ -3158,8 +3252,8 @@ def test_mxfp8_plan_time_constants_are_init_launch_arguments():
     """Host, any CUDA device, no compile and no launch: under an ``MxQuantSpec`` the plan-time constants are the SAME 14 slots
     (``QUANT_CONST_SLOTS``, the tail of the unchanged 29-slot tuple), their VALUES Python floats resolved at ``compile()`` -- the three
     live ones (``scale_o``, ``descale_o = 1 / scale_o``, ``descale_w_o``) at the MxQuantSpec's values and the eleven dead ones exactly 0.0
-    (never 1.0) -- handed to the standalone scalar-init launch as kernel ARGUMENTS (``_execute_mxfp8`` spells ``consts=tuple(vals[n]
-    for n in QUANT_CONST_SLOTS)``), the launch declared over the whole block with the constants' slot range and WITHOUT the
+    (never 1.0) -- handed to the fused PROLOGUE's init job as kernel ARGUMENTS (``_execute_mxfp8`` spells ``consts=tuple(vals[n]
+    for n in QUANT_CONST_SLOTS)``), the prologue declared over the whole block with the constants' slot range and WITHOUT the
     ``descale_dp`` division (no dP scalar); ``compile()`` writes nothing to the device."""
     r = _declare_bwd_mxfp8(dict(_COMMON), 1, 256)
     blk, spec = r.blk, r.spec
@@ -3171,7 +3265,7 @@ def test_mxfp8_plan_time_constants_are_init_launch_arguments():
     want.update(scale_o=float(spec.scale_o), descale_o=1.0 / float(spec.scale_o), descale_w_o=float(spec.descale_w_o))
     assert vals == want, (vals, want)
     assert all(vals[n] != 0.0 for n in _MXFP8_LIVE_CONSTS) and all(vals[n] == 0.0 for n in QUANT_CONST_SLOTS if n not in _MXFP8_LIVE_CONSTS)
-    init = blk._scalar_init
+    init = blk._prologue  # the fused prologue's first job is the scalar init: it carries the init body's slot facts
     assert blk._stages[0] is init and (init.n_slots, init.const_slot0, init.n_consts) == (len(QUANT_SCALAR_SLOTS), 15, 14)
     exe = inspect.getsource(GatedAttentionBlockBwd._execute_mxfp8)
     assert "consts=tuple(vals[n] for n in QUANT_CONST_SLOTS)" in exe, "the init launch is handed every plan-time constant, in slot order"

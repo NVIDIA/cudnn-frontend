@@ -391,7 +391,9 @@ graph.sdpa(
     - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
-  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`. On cc 10.7 (SM107) the f16/bf16 row serves paged KV for packed (THD / ragged-Q) queries on the d128 and d256 flavors, with or without `sink_token` -- prefill- and decode-shaped packed batches (per-request Q of 1 / 4 / 8), GQA with PackGQA, HND and NHD pools -- through the paged prefill pipeline; dense (BSHD) paged queries are declined there, and a sink graph is never split on any row.
+  - **MXFP8 page pools** (`sdpa_mxfp8` with `paged_attention_*`): the descales are page pools too (`descale_k [num_pages, H_kv, page_size, ceil4(D/32)]`, `descale_v [num_pages, H_kv, page_size/32, D]`, F8_128x4, so `page_size` is a multiple of 128; for D > 128 the `descale_v` planes are D-plane-major across the whole pool); the cuDNN backend has no engine for them -- the FROST MXFP8 engines serve them on the SM100 line (every native flavor, dense queries) and on cc 10.7 (d128 / d256, dense queries, sinks compose); THD (ragged-Q) queries over MXFP8 pools decline on every arch today. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  - **FROST engines** (cc 10.7, f16/bf16): dense d128 graphs whose `S_q * pack_g <= 128` ride the same decode tile (`TILE_CGA_M=1`, the shared body compiled for sm_107a; issue #1472) and dense d128 GQA packs on the shared prefill body under a diagonal band (a mask-free graph whose rows fit the decode tile unpacked rides it unpacked); paged THD queries keep the prefill pipeline there. With `sink_token`, dense d128 decode / verify graphs inside the measured band (bottom-right causal `S_q <= 16` or mask-free `S_q == 1`, GQA 4 / 8 / 16, at least 32 (batch, KV-head) units, caches 1k-16k, no window) are served by these plans by default, without the opt-in flag. Paged THD queries with GQA 4 / 8 / 16 pack by default there, with or without `sink_token`, and a sink no longer changes the scheduling or tile-width choice of a paged THD plan. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
   - **Offset calculation**:
     - $K_{cache}[b,h,s,d] = K_{container}[page\_table\_k[b,1,s / bs_k, 1], h, s \mod bs_k, d]$
     - $V_{cache}[b,h,s,d] = V_{container}[page\_table\_v[b,1,s / bs_v, 1], h, s \mod bs_v, d]$
@@ -419,9 +421,13 @@ graph.sdpa(
 
 A gated attention tail -- the SDPA output multiplied by the sigmoid of a per-element gate tensor `G` of O's shape,
 `O_gated = O * sigmoid(G)` -- is built as three graph nodes, an `sdpa` (or `sdpa_fp8` / `sdpa_mxfp8`) node followed by
-`sigmoid` and `mul` pointwise nodes on `O`. Under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` the Rubin d256 FROST
-forward engines (`sdpa_fwd_prefill_sm107`, `sdpa_fwd_prefill_sm107_fp8`, `sdpa_fwd_prefill_sm107_mxfp8`) serve the
-whole tail fused: the gate tile is TMA-staged by the kernel's load warp and applied in the epilogue after the
+`sigmoid` and `mul` pointwise nodes on `O`. The Rubin d256 FROST forward engines serve the whole tail fused when they
+serve the graph: the MXFP8 row (`sdpa_fwd_prefill_sm107_mxfp8`) is offered by default and leads on cc 10.7, so the fused
+tail is its default execution; the half row (`sdpa_fwd_prefill_sm107`) is offered by default but its placement keeps the
+backend first for dense d256 graphs, which then run the tail unfused as the three nodes -- it serves the tail fused when it
+leads the plan list, when the backend declines, or under `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1`; the FP8 row
+(`sdpa_fwd_prefill_sm107_fp8`) serves it under that flag. On the fused path the gate tile is TMA-staged by the kernel's load
+warp and applied in the epilogue after the
 dead-row select, so the gated `O` (and the quantized `O` on the FP8 / MXFP8 rows) is written once. Served today at
 `d_qk = d_v = 256` with a bf16 `G`, dense / unsplit / non-PackGQA / non-paged layouts; any other combination
 falls back to the unfused three-node execution. Two contracts hold on the fused path: `Stats` (LSE) is

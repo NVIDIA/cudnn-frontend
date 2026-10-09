@@ -338,6 +338,16 @@ DSL satisfies your kernel.**
   must slice by the lengths recorded during extraction, rather than assuming
   one value per field. Static coordinates can contribute zero values, too.
   `test_cutlass_schedulers.py` checks these round trips on real MLIR values.
+- **The installed DSL's preprocessor may be patched by a co-resident library.**
+  quack-kernels (>= 0.6.2, pinned by vLLM and SGLang, and present in the CI
+  test image) replaces `DSLPreprocessor.visit_If` process-wide on
+  `import quack`. It rewrites `if const_expr(S) and D: ... else: body` into a
+  constexpr `if` that holds a copy of `body`, so a name assigned in `body`
+  becomes function-scoped. If a later dynamic loop reassigns that name, the
+  loop carries it as maybe-unset (`TYPE_UNSTABLE_JOIN ... None on one path`)
+  whenever `S` is true. Give such loop-local names their own spelling.
+  Detector: rerun the kernel's tests with quack imported first (for example,
+  a `-p` plugin that does `import quack`).
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
@@ -569,6 +579,25 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+- **A guard that keeps the backend's planner away from a graph covers EVERY
+  path that creates a backend plan, not only the heuristics query.** The cc 10.7
+  single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
+  `sdpa/fwd/backend_guard.py`: the cuDNN 9.26 / 9.27 planner SIGSEGVs there)
+  first intercepted the planning sequence only -- `_finalize_backend_layout`
+  and `backend_plan_entries`. `create_execution_plan(<backend engine id>,
+  knobs)`, a replayed autotune record, still reached the C++
+  `Graph::create_execution_plan` and took the process down the same way (rc 139
+  on 9.26.0.51, no exception to catch), so "explicit diagnostic selection stays
+  available" was a crash for exactly the selection it named. The two
+  out-of-sequence creators, `_append_backend_plan` (the explicit pin and the
+  materialization of a replayed entry) and `_lower_backend_plan` (a late
+  heuristics query for a classic call), go through
+  `_pygraph._refuse_guarded_backend` and raise the typed decline with the guard's
+  reason; `key()` / `serialize()` only lower, which completes on that domain.
+  Detector: `sdpa/frost/test_sdpa_backend_guard.py::test_explicit_backend_pin_on_a_guarded_graph_is_a_typed_decline`
+  (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
+  the first guard. A version-bounded guard also needs the detector that
+  re-measures its bound (test/AGENTS.md).
 
 ## Frontend-only kernel package layout
 

@@ -2222,10 +2222,11 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     """The half row's THD plan: declared totals tighten the token capacity (a MIN), the dS workspace is kv-BLOCKED at the
     kernel's 256-row block with every sequence padded to it, no staging and no batch chunking, the metadata region carries the
     main kernel's (5 + B) tensor maps, the GQA partials ride the packed kv capacity, and the two length operands join the launch record
-    (``length_form``)."""
+    (``length_form``) at slots 9 / 10, ahead of the appended standalone-only delta slot (``test_sdpa_bwd_thd_sm107.py`` holds its
+    contract)."""
     from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, ROLES_F16_THD
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, EXTERNAL_DELTA_ROLE, ROLES_F16_THD
 
     api = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=5000)
     assert api.check_support()
@@ -2237,7 +2238,8 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     assert plan["seq_kv"] == (THD_BWD_MAPS_META_WORDS(3, 8),) and plan["desc_words"] == (4 * 16,)
     assert plan["dv_part"] == (1, 1500, 4, 256) and plan["dk_part"] == (1, 1500, 4, 256) and "q_pad" not in plan and "k_pad" not in plan
     assert api._template_params().thd_varlen and not api._template_params().seq_kv_lens_present
-    assert ROLES_F16_THD[-2:] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[-2:] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 11
+    assert ROLES_F16_THD[9:11] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 12
+    assert ROLES_F16_THD[-1] == ATTRIBUTES_F16_THD[-1] == EXTERNAL_DELTA_ROLE, "the delta slot is appended LAST, after the two lengths"
     # The stage-3 records under THD: the THD arm on, rows KV-major, the SAME two-sided trim as the dense records (per sequence
     # in the template: a constant shift of 0, bottom-right spelled as `thd_causal_bottom_right`), dQ once per head chunk.
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, validate_matmul_params
@@ -2441,8 +2443,9 @@ def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region(monkey
     assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(2 * 8 * 512 * 4)
     assert (own._b_chunk, own._qh_chunk, own._sq_pad, own._skv_pad) == (ext._b_chunk, ext._qh_chunk, ext._sq_pad, ext._skv_pad)
     e4m3 = torch.float8_e4m3fn
-    # The quantized rows take the flag too (DENSE only; their THD plans decline it): the carve drops ``delta`` under it and the
-    # standalone-only role is appended LAST on both role lists (after the per-batch kv lengths).  The fp8 kernel reads delta in
+    # The quantized rows take the flag too (the dense plans here; their THD plans serve it as well -- test_sdpa_bwd_thd_*_sm107.py):
+    # the carve drops ``delta`` under it and the standalone-only role is appended LAST on both role lists (after the per-batch kv
+    # lengths).  The fp8 kernel reads delta in
     # TRUE units unscaled, so a caller's bf16-derived delta binds AS IS; the mxfp8 delta is the dot of the f16 ports.
     for api_ext, api_own in (
         (_adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3, external_delta=True), _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3)),

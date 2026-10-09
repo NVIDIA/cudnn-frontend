@@ -1,15 +1,7 @@
-# PTX md5 of the cc 10.7 d512 stage-2 2x2 renderings (kernels/sm107/bprop_d512_f16_2x2.py at the 8-stage ring arm: stages_kv 8 /
-# cast_stages 2 / SM107_USABLE_DYN_SMEM_2X2), CUTE_DSL_ARCH=sm_107a.  All three lines were rendered on a cc 10.7 board on
-# 2026-10-06 from the tree of PR #1323's review follow-up (the end-of-kernel ring drains walk the whole ring and the compute
-# warp group synchronizes before its mb_tmem_dealloc arrive), twice in independent processes with identical md5s, through the
-# probe test_sdpa_bwd_d512_sm107.py::test_fork_rendering_ptx_md5_is_recorded renders.  The SM100 body at the same parameters
-# renders the same md5s on that board (the fork is a byte-identical rendering of the SM100 twin at the cc 10.7 ring arm, so the
-# SM100 twin's bitwise-vs-role-split oracle carries over).  BOARD-ONLY PIN: the public 4.7.0 DSL has no sm_107a target, so in
-# public CI the md5 and SASS cases of this record SKIP (a skip there is not coverage); there the fork is held by
-# test_fork_code_diff_is_only_the_listed_deltas, test_fork_source_pins and its import-time _require pins, while the SM100 4x1
-# sm_100a record (md5_stage2_4x1_sm100a.txt) does run on the public 4.7.0.  The PTX text is a function of the DSL build: the
-# test compares only when the installed DSL matches the `dsl=` line and skips otherwise -- re-render on the board to refresh.
-dsl=nvidia-cutlass-dsl-internal 0.3.0+20260728043000.556925e
-stage2_2x2 sm_107a dense_bf16 rc=0 ptx_md5=7769f7a8a50868ef89afcfa50158cd4e
-stage2_2x2 sm_107a causal_bf16 rc=0 ptx_md5=8744e7b0dbf44dc847358318eab5b726
-stage2_2x2 sm_107a thd_bf16 rc=0 ptx_md5=4a85a599fbbd9067e0ce816b398f3820
+# Refreshed 2026-10-09 for the per-CTA empty-phase observer ACK protocol.
+# Default renderings, all debug levers off; each rendered twice in independent processes.
+# PTX text depends on the DSL build; tests compare only when the dsl line matches.
+dsl=nvidia-cutlass-dsl 4.8.0
+stage2_2x2 sm_107a dense_bf16 rc=0 ptx_md5=ec5cccfc716d4328846176cc9626feba
+stage2_2x2 sm_107a causal_bf16 rc=0 ptx_md5=62d348cd72a1c8b81b5bfece48888d13
+stage2_2x2 sm_107a thd_bf16 rc=0 ptx_md5=a9a60d0cb2df5b67f43d9aa91faa339b

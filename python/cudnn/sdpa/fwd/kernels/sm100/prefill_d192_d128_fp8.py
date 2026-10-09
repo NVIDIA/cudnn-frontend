@@ -47,7 +47,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
-from cudnn.sdpa.fwd.kernels._quantized import _initialize_split_amax, _scale_or_one
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit, _initialize_split_amax, _scale_or_one
 import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls cuda)
 
 from dataclasses import dataclass
@@ -903,7 +903,7 @@ def _kernel(
         _pre_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
         _pre_dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
         _pre_scl_o = _scale_or_one(scale_o_t)
-        scale_softmax_log2 = scale_softmax_log2 * _pre_dsc_q * _pre_dsc_k
+        scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _pre_dsc_q * _pre_dsc_k)
         o_scale_fused = o_scale_fused * _pre_dsc_v * _pre_scl_o
 
     softmax_first_end = CFG.CORR_WARP_BASE if cutlass.const_expr(MERGE_SOFTMAX_WGS) else CFG.SOFTMAX_WG0_BASE + CFG.SOFTMAX_WG_WARPS
@@ -912,7 +912,7 @@ def _kernel(
         if cutlass.const_expr(_ROLE_LOCAL_E4_SCALES):
             _wg0_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
             _wg0_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
-            scale_log2 = scale_softmax_log2 * _wg0_dsc_q * _wg0_dsc_k
+            scale_log2 = cute.math.abs(scale_softmax_log2 * _wg0_dsc_q * _wg0_dsc_k)
         else:
             scale_log2 = scale_softmax_log2
         if cutlass.const_expr(MERGE_SOFTMAX_WGS):
@@ -945,7 +945,7 @@ def _kernel(
         if cutlass.const_expr(_ROLE_LOCAL_E4_SCALES):
             _wg1_dsc_q = cutlass.Float32(cutlass.make_array_view(descale_q_t)[0])
             _wg1_dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
-            scale_log2 = scale_softmax_log2 * _wg1_dsc_q * _wg1_dsc_k
+            scale_log2 = cute.math.abs(scale_softmax_log2 * _wg1_dsc_q * _wg1_dsc_k)
         else:
             scale_log2 = scale_softmax_log2
         _softmax_warp_group(
@@ -1023,6 +1023,8 @@ def _kernel(
                     n_batch=n_batch,
                     mcast_mask=mcast_mask,
                     cta_in_pair=cta_in_pair,
+                    descale_q_t=descale_q_t,
+                    descale_k_t=descale_k_t,
                 )
             else:
                 _mma_warp_quiet(tmem_ptr_i32, bars)
@@ -1044,6 +1046,8 @@ def _kernel(
                 n_batch=n_batch,
                 mcast_mask=mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
 
     elif warp_idx == CFG.TMALDG_WARP_ID:
@@ -1516,6 +1520,8 @@ def _mma_warp_group(
     n_batch,
     mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     """Unified MMA warp (cga1 / cga2-leader; MASK_NONE/PADDED/CAUSAL/SWA).
 
@@ -1536,7 +1542,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=0,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
         a_dtype=STORAGE_DTYPE,
