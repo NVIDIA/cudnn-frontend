@@ -24,9 +24,8 @@ Each name is a function exported from the top-level `cudnn` package.
 
 ## Rules
 
-1. **Functions only.** Do not export op classes. The `APIBase` subclass and its
-   `check_support()`, `compile()`, and `execute()` are internal. Exported op
-   classes such as `GroupedGemmSwigluSm100` are legacy.
+1. **Functions only.** Do not export op classes. Exported op classes such as
+   `GroupedGemmSwigluSm100` are legacy.
 2. **No `wrapper` in names.** The function is the framework op; `wrapper` adds
    nothing.
 3. **Spell out the direction.** Use `forward` / `backward`, never `fwd` / `bwd`.

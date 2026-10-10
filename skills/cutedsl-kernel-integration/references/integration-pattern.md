@@ -47,10 +47,9 @@ Use this routing table before choosing the package namespace:
 
 Follow the closest template instead of inventing a new lifecycle.
 
-- Class API:
-  - Extend `cudnn.api_base.APIBase`.
-  - Capture sample tensor metadata with `_make_tensor_desc(...)`.
-  - Implement `check_support()` for dtype, shape, stride, tiling, architecture, and unsupported combinations.
+- Public functions:
+  - Name each function `<op_name>_<direction>` (PyTorch) or `<op_name>_jax_<direction>` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
+  - Validate dtype, shape, stride, tiling, architecture, and unsupported combinations before compiling.
   - For fused kernels, validate epilogue-specific constraints: activation mode, auxiliary inputs/outputs, output shape/stride contract, dtype compatibility, and unsupported activation/config combinations.
   - For dense blockscaled epilogue kernels, model every public output explicitly. Common contracts include `C` plus `AB12`, split `D1/D2`, `amax`, `SFC`, `SFD1/SFD2`, or probability inputs such as `prob_tensor`.
   - Reject or document stubbed auxiliary-output paths; do not silently advertise an output that the source kernel only prints as unimplemented.
@@ -59,21 +58,18 @@ Follow the closest template instead of inventing a new lifecycle.
   - For MoE kernels, keep shared helper, scheduler, extension, and metadata modules factored as internal package files. Treat `padded_offsets`, `MoESchedulerParams`, `MoEPersistentTileScheduler`, `helper_kernel`, and weight mode as API/codegen-sensitive state.
   - For SDPA/FMHA kernels, preserve orchestrator/helper topology. For example, a two-kernel backward source may have one public orchestrator that launches DQ and DK/DV subkernels plus internal `fmha_utils.py` and `utils.py` helpers. Validate the head-dimension constraint, Q/K/V/O/dO/LSE/dQ/dK/dV tensor contracts, varlen `cum_seqlen_q/k` and max-sequence arguments, `scale_softmax`, causal/window mask semantics, split-head mode, CLC dynamic scheduler mode, workspace shape/layout, and two-kernel execution order.
   - For distributed kernels, validate and document `torch.distributed` state, world size, barrier flags, all-reduce mode, and symmetric-memory requirements separately from `cutedsl`.
-  - Implement `compile()` for the CuTeDSL kernel compile path.
-  - Implement `execute(...)` for preallocated runtime inputs/outputs and stream handling.
-- Wrapper API:
-  - Name each function `<op_name>_<direction>` (PyTorch) or `<op_name>_jax_<direction>` (JAX), following `docs/fe-oss-apis/api_conventions.md`.
+  - Compile the CuTeDSL kernel once per configuration and reuse it; follow the existing template's cache strategy when applicable.
+  - Accept preallocated runtime inputs/outputs and an explicit stream.
   - Allocate output tensors for common use.
-  - Reuse the existing template's cache strategy when applicable.
-  - Return `cudnn.api_base.TupleDict` so callers can use both key access and tuple unpacking.
+  - Return a `TupleDict` so callers can use both key access and tuple unpacking.
   - Include auxiliary outputs in `TupleDict` with stable names and tuple order. Validate coupled optional tensors as a set, for example `bias`/`dbias`, `d_col`, `dprob`, `amax`, `sfd_row`, `sfd_col`, `linear_offset`, and workspace-backed outputs.
   - For SDPA backward wrappers, return gradients with stable keys such as `dq_tensor`, `dk_tensor`, and `dv_tensor`; make wrapper-owned workspace allocation, zeroing, and reuse explicit.
   - For paired forward/backward kernels, expose sibling APIs with shared internal helpers instead of merging incompatible public contracts.
 - `__init__.py`:
-  - Export the public functions, not the `APIBase` class.
+  - Export the public functions.
   - Keep `__all__` complete and explicit.
 
-Use existing helpers from `api_base.py`, `datatypes.py`, and family utility modules before adding new helpers.
+Use existing helpers from `datatypes.py` and family utility modules before adding new helpers.
 
 ## Architecture-Specific Kernel Variants (Rubin / SM107)
 
@@ -112,7 +108,7 @@ Rubin kernel modules are internal implementation details. Do not add new public 
 
 ### `api.py` dispatch conventions
 
-Device gating lives in `cudnn.api_base`: `is_sm107_device()` and `self._is_rubin_kernel` (set in `APIBase.__init__`).
+Device gating uses `is_sm107_device()`.
 
 Add a lazy Rubin kernel loader near the top of `api.py`:
 
@@ -122,33 +118,32 @@ def _get_rubin_kernel():
     return RubinKernelAlias
 ```
 
-In `__init__` (after `super().__init__()`):
+Select the kernel once per call:
 
 ```python
-self._kernel = _get_rubin_kernel() if self._is_rubin_kernel else DefaultKernelClass
+kernel = _get_rubin_kernel() if is_sm107_device() else DefaultKernelClass
 ```
 
 Then:
 
-- Replace hard-coded references like `DefaultKernelClass.FIX_PAD_SIZE` with `self._kernel.FIX_PAD_SIZE`.
+- Replace hard-coded references like `DefaultKernelClass.FIX_PAD_SIZE` with `kernel.FIX_PAD_SIZE`.
 - Include `get_device_type()` (`"blackwell"` or `"rubin"`) in wrapper cache keys whenever the wrapper can dispatch to architecture-specific kernels.
 - Lazy-import the Rubin module inside `_get_rubin_kernel()` so non-Rubin environments do not pay import cost up front.
-- Branch in `compile()` / `execute()` only when the Rubin kernel signature or epilogue contract differs from the default kernel. `grouped_gemm_glu` and `grouped_gemm_dglu` only swap the kernel class; `grouped_gemm_quant` additionally adapts compile/execute kwargs for Rubin's optional `c` materialization path and omits `row_scale` on Rubin while keeping it on non-Rubin architectures.
+- Branch in the compile and launch code only when the Rubin kernel signature or epilogue contract differs from the default kernel. `grouped_gemm_glu` and `grouped_gemm_dglu` only swap the kernel class; `grouped_gemm_quant` additionally adapts compile/execute kwargs for Rubin's optional `c` materialization path and omits `row_scale` on Rubin while keeping it on non-Rubin architectures.
 
-Do not expose `_is_rubin_kernel`, `_get_rubin_kernel()`, or Rubin module paths in public docs unless the user-visible contract changes.
+Do not expose `_get_rubin_kernel()` or Rubin module paths in public docs unless the user-visible contract changes.
 
 ## Public Exports
 
 Add lazy top-level exports in `python/cudnn/__init__.py` for public APIs intended to be imported as `from cudnn import ...`.
 
-Expose both the class API and the high-level wrapper by default when both are implemented and documented. If an API is intentionally wrapper-only or class-only, document that choice in the FE OSS API page and keep `__all__` aligned with the public surface. For nested families, re-export through the operation and family `__init__.py` files whenever callers are expected to import from that family namespace.
+Expose the public functions and keep `__all__` aligned with the public surface. For nested families, re-export through the operation and family `__init__.py` files whenever callers are expected to import from that family namespace.
 
 Use the existing `_LAZY_OPTIONAL_IMPORTS` table rather than eager optional imports. Add entries that route public names through the family module when one exists:
 
 ```python
 _LAZY_OPTIONAL_IMPORTS = {
-    "PublicApiClass": (".family_module", "PublicApiClass"),
-    "public_wrapper": (".family_module", "public_wrapper"),
+    "public_function": (".family_module", "public_function"),
 }
 ```
 
@@ -158,7 +153,7 @@ The loader already formats optional dependency failures as:
 raise ImportError(f"{name} requires optional dependencies. {_OPTIONAL_DEPENDENCY_INSTALL_HINT}: {e}") from e
 ```
 
-For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_grouped`, or `sdpa`, also update the family `__init__.py` (and the lazy-export table in `python/cudnn/__init__.py`) if the class or wrapper should be available from that namespace.
+For family modules such as `gemm.cutedsl.grouped`, `gemm.cutedsl.discrete_grouped`, or `sdpa`, also update the family `__init__.py` (and the lazy-export table in `python/cudnn/__init__.py`) if the function should be available from that namespace.
 
 ## Dependencies
 
@@ -187,7 +182,6 @@ The doc page should cover:
 - Experimental status if matching existing FE OSS APIs.
 - Install command when optional CuTeDSL dependencies are required.
 - High-level wrapper usage.
-- Class API lifecycle when exposed.
 - Epilogue semantics, activation behavior, and any auxiliary outputs.
 - Discrete pointer-array arguments, descriptor workspace layout, and how the API differs from dense grouped GEMM when applicable.
 - Grouped metadata semantics such as `padded_offsets`, per-group shape/stride/address arrays, scheduler mode, and helper-kernel requirements.
@@ -209,7 +203,7 @@ Typical files:
 Coverage should include:
 
 - Import and wrapper smoke coverage.
-- `check_support()` success and failure cases for key dtype, shape, stride, and config constraints.
+- Supported and unsupported cases for key dtype, shape, stride, and config constraints.
 - For fused kernels, a matrix that separates supported epilogue paths, unsupported epilogue/config paths, output-shape invariants, reference comparisons, and environment-based skip reasons.
 - For blockscaled epilogue kernels, one reference check per public output, including `amax` and auxiliary scale-factor tensors; include nontrivial `alpha`/`beta`, `prob_tensor`, and epilogue cases that affect auxiliary values.
 - For grouped kernels, cover `padded_offsets`, per-group metadata, helper/scheduler modes, fixed padding, and workspace requirements.
