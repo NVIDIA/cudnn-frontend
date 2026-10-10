@@ -90,7 +90,10 @@ The legacy block-scaled backend is selected only by a supported matching FP4/FP8
 operand pair. It preserves the pre-existing scale-factor contract: provide
 `sfa_tensor` and `sfb_tensor`, and provide `global_scale_a` and
 `global_scale_b` where the selected low-precision format requires them. BF16
-does not reinterpret these controls; it rejects them instead.
+does not reinterpret these controls; it rejects them instead. `sfa_tensor` and
+`sfb_tensor` may also be flat 1-D buffers holding the same packed bytes as the
+`(round_up(rows, 128), round_up(ceil(tokens / sf_vec_size), 4))` view; the wrapper
+advertises `supports_canonical_layouts`.
 
 Torch block-scaled callers in dense or discrete output mode that retain
 operations for CUDA Graph replay may provide a caller-owned

@@ -19,7 +19,6 @@ Discrete mode
 
 from __future__ import annotations
 
-from dataclasses import replace
 
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 from ..backend_utils import rubin_single_group_offsets_kwarg
@@ -29,6 +28,7 @@ from ..canonical import (
     canonical_prob_fake,
     check_sf_shape,
     is_flat_sf,
+    layout_desc,
     make_flat_sf_fake,
     normalize_b,
     normalize_mx,
@@ -48,12 +48,6 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
-
-
-def layout_desc(api, tensor, name):
-    if tensor is None:
-        return None
-    return replace(api._make_tensor_desc(tensor, name=name, canonical=True), dtype=tensor.dtype)
 
 
 def _get_rubin_kernel():

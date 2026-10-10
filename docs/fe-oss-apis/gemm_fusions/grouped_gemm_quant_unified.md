@@ -45,7 +45,9 @@ The unified wrapper and API class also accept contiguous A `(M, K)`, dense B
 `(L, N, K)`, and probability `(M,)`. Operands may independently use canonical or
 legacy layouts. Scale buffers may be contiguous tensors of any rank, provided
 their bytes are already packed in the required MMA-tiled physical order; reshaping
-ordinary logical scales does not perform this packing.
+ordinary logical scales does not perform this packing. A dense canonical B may
+instead be an N-major `(L, K, N)` contiguous buffer, such as a column-wise weight,
+when `b_major="n"` (FP8 only).
 
 With 2-D A, the wrapper returns D/D_col `(M, N)` and contiguous SFD buffers with
 physical shape `(1, ceil(rows/128), ceil(ceil(cols/sf_vec_size)/4), 32, 4, 4)`.

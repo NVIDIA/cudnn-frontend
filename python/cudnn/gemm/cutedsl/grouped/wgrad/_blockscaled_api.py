@@ -18,6 +18,7 @@ from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tenso
 from cudnn.tensor_adapter import is_torch_tensor
 
 from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
+from ..canonical import check_sf_shape, make_flat_sf_fake
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 
 
@@ -40,6 +41,19 @@ def _is_supported_rubin_quantization(ab_dtype: torch.dtype, sf_dtype: torch.dtyp
 
 def _round_up(a: int, b: int) -> int:
     return ceil_div(a, b) * b
+
+
+def wgrad_sf_fake(api, desc):
+    if len(desc.shape) == 1:
+        return make_flat_sf_fake(api, desc)
+    return api._make_fake_cute_compact_tensor(
+        dtype=desc.dtype,
+        shape=desc.shape,
+        stride_order=desc.stride_order,
+        assumed_align=16,
+        dynamic_mode=1,
+        divisibility=4,
+    )
 
 
 class GroupedGemmWgradBlockScaledAPI(APIBase):
@@ -210,8 +224,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
 
         _ = self._check_tensor_shape(self.a_desc, (m, tokens_sum), "sample_a")
         _ = self._check_tensor_shape(self.b_desc, (tokens_sum, n), "sample_b")
-        _ = self._check_tensor_shape(self.sfa_desc, (_round_up(m, 128), self._scale_cols), "sample_sfa")
-        _ = self._check_tensor_shape(self.sfb_desc, (_round_up(n, 128), self._scale_cols), "sample_sfb")
+        check_sf_shape(self, self.sfa_desc, len(self.sfa_desc.shape) == 1, (_round_up(m, 128), self._scale_cols), "sample_sfa")
+        check_sf_shape(self, self.sfb_desc, len(self.sfb_desc.shape) == 1, (_round_up(n, 128), self._scale_cols), "sample_sfb")
         _ = self._check_tensor_shape(self.offsets_desc, (self.expert_cnt,), "sample_offsets")
 
         dtype = self._check_dtype(self.a_desc, [torch.float4_e2m1fn_x2, torch.uint8, torch.float8_e5m2, torch.float8_e4m3fn], "sample_a")
@@ -384,22 +398,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 divisibility=16,
             )
         )
-        sfa_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfa_desc.dtype,
-            shape=self.sfa_desc.shape,
-            stride_order=self.sfa_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
-        sfb_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfb_desc.dtype,
-            shape=self.sfb_desc.shape,
-            stride_order=self.sfb_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
+        sfa_fake = wgrad_sf_fake(self, self.sfa_desc)
+        sfb_fake = wgrad_sf_fake(self, self.sfb_desc)
         wgrad_fake = self._make_fake_cute_tensor_from_desc(self.wgrad_desc, assumed_align=16)
         offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
@@ -491,22 +491,8 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
                 divisibility=16,
             )
         )
-        sfa_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfa_desc.dtype,
-            shape=self.sfa_desc.shape,
-            stride_order=self.sfa_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
-        sfb_fake = self._make_fake_cute_compact_tensor(
-            dtype=self.sfb_desc.dtype,
-            shape=self.sfb_desc.shape,
-            stride_order=self.sfb_desc.stride_order,
-            assumed_align=16,
-            dynamic_mode=1,
-            divisibility=4,
-        )
+        sfa_fake = wgrad_sf_fake(self, self.sfa_desc)
+        sfb_fake = wgrad_sf_fake(self, self.sfb_desc)
         offsets_fake = self._make_fake_cute_tensor_from_desc(self.offsets_desc, assumed_align=4)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         gs_a_fake = self._make_fake_cute_tensor_from_desc(self.global_scale_a_desc, assumed_align=4)
