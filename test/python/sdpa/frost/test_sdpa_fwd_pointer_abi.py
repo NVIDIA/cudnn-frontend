@@ -103,6 +103,32 @@ def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
     torch.testing.assert_close(lse[0], scores.logsumexp(-1).float(), atol=2e-3, rtol=2e-3)
 
 
+def test_gate_in_combine_binding_keeps_the_plans_device_check():
+    """The d256 decode tile's gated split binds G outside the native dense binder (prepared.CombineGate), whose
+    operand check therefore never sees it: the binding keeps the plan's CUDA device itself -- a gate observed on the
+    CPU or on another CUDA device is the native binder's own typed error before any launch, an unknown device (a bare
+    address) stays admitted, and the bound frame carries G's address with its strides in the combine's BSHD order."""
+    from cudnn.sdpa.fwd.prepared import _DLPACK_CPU, _DLPACK_CUDA, BufferFacts, CombineGate
+
+    seen = []
+    gate = CombineGate(lambda *frame: seen.append(frame), "bfloat16", (2, 4, 1, 256), (_DLPACK_CUDA, 1))
+    shape, strides = (2, 4, 1, 256), (1024, 256, 1024, 1)  # BHSD facts of a (B, S_q, H, D)-contiguous gate
+
+    def facts(device, ptr=4096):
+        return BufferFacts(ptr, "bfloat16", device, 2048, shape, strides)
+
+    for off in ((_DLPACK_CPU, 0), (_DLPACK_CUDA, 0)):
+        with pytest.raises(ValueError, match="gate must be on this plan's CUDA device"):
+            gate.bind(facts(off))
+        with pytest.raises(RuntimeError, match="no gate bound"):
+            gate(1, 2, 3, 4, 5, 6, 7, 8, 9)  # a refused bind leaves nothing for the launch to consume
+    gate.bind(facts((_DLPACK_CUDA, 1)))
+    gate(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    gate.bind(facts((-1, -1)))  # a bare address: device unknown, admitted as the native binder admits it
+    gate(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    assert [f[8:10] for f in seen] == [(4096, (1024, 1024, 256, 1))] * 2, seen
+
+
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize("d", [128, 256])
 def test_direct_decode_launch_rejects_wrong_packed_head_ratio(d):

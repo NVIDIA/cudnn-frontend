@@ -543,20 +543,27 @@ class CombineGate:
     Thread-local, like the binder's own per-call frame (two threads may execute one
     plan concurrently with different buffers).  Under CUDA-graph capture the launch
     is recorded with the bound address, exactly as every other pointer of the frame.
+    The binding also keeps the plan's CUDA-device check the native binder applies to
+    every operand it binds -- the gate is not one of them on this path -- with the
+    binder's own policy: a KNOWN device other than the plan's (a CPU gate, another
+    GPU) is refused before any launch, an unknown one (a bare address) is admitted.
     """
 
-    __slots__ = ("entry", "dtype", "shape", "_tls")
+    __slots__ = ("entry", "dtype", "shape", "device", "_tls")
 
-    def __init__(self, entry, dtype: str, shape: Tuple[int, int, int, int]):
+    def __init__(self, entry, dtype: str, shape: Tuple[int, int, int, int], device: Tuple[int, int]):
         self.entry = entry  # the gated combine's positional tvm-ffi entry
         self.dtype = dtype  # G's dtype as a bare name ("bfloat16")
         self.shape = tuple(int(x) for x in shape)  # (B, H_q, S_q, D_v): the logical BHSD gate = O's shape
+        self.device = (int(device[0]), int(device[1]))  # the plan's DLPack (device_type, device_id)
         self._tls = threading.local()
 
     def bind(self, facts: Optional[BufferFacts]) -> None:
         """Record G (a logical BHSD ``(B, H_q, S_q, D_v)`` buffer's facts) for the next combine launch."""
         if facts is None or not facts.ptr:
             raise ValueError("cudnn.sdpa: the gate G is required by this gate-in-combine specialization and must have a non-null address")
+        if int(facts.device[0]) != -1 and (int(facts.device[0]), int(facts.device[1])) != self.device:
+            raise ValueError("cudnn.sdpa: gate must be on this plan's CUDA device")  # the native binder's operand rule, kept here
         if facts.dtype != self.dtype:
             raise ValueError(f"cudnn.sdpa: gate dtype {facts.dtype} does not match the compiled gate-in-combine dtype {self.dtype}")
         shape = tuple(int(x) for x in facts.shape)
@@ -732,9 +739,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
         if fn is None:
             raise NotImplementedError("the split combine artifact exposes no positional tvm-ffi entry")
         rows, sq, h, d = s.split * s.b, s.s_q_max, s.qh, s.d_v
-        combine_gate = CombineGate(fn, gate_dtype, (s.b, h, sq, d)) if gate_in_combine else None
-        o_size, lse_size = rows * sq * h * d, rows * h * sq
         device = (_DLPACK_CUDA, s.device_index)
+        combine_gate = CombineGate(fn, gate_dtype, (s.b, h, sq, d), device) if gate_in_combine else None
+        o_size, lse_size = rows * sq * h * d, rows * h * sq
         s.combine = SplitCombineSpec(
             combine_gate if combine_gate is not None else fn,
             owner,

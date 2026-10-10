@@ -1926,6 +1926,44 @@ def test_decode_adapter_gate_rides_the_combine_on_the_tile_only():
 
 
 @_gpu
+def test_decode_adapter_gated_split_rejects_a_gate_off_the_plans_device():
+    """The gate-in-combine split binds G outside the native dense binder, so the binding keeps the plan's
+    CUDA-device check itself (prepared.CombineGate): a same-shape CPU gate is the SAME typed error on the
+    tile's split (the combine's binding) as on the unsplit fused-gate prefill kernel (the native binder) --
+    never an address forwarded to a launch."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    B, H, KH, S = 2, 24, 2, 256
+    dtype = torch.bfloat16
+    q = torch.randn(B, 1, H, D, device="cuda", dtype=dtype).transpose(1, 2)
+    k = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+    v = torch.randn(B, S, KH, D, device="cuda", dtype=dtype).transpose(1, 2)
+    o = torch.empty_like(q)
+    lse = torch.empty(B, H, 1, device="cuda", dtype=torch.float32)
+    gate_cpu = torch.randn(B, 1, H, D, dtype=dtype).transpose(1, 2)
+    for split, pack in ((2, True), (1, False)):  # the tile's split (gate in the combine) and the prefill kernel's fused gate
+        api = SdpaFwdDslSm100(
+            sample_q=q,
+            sample_k=k,
+            sample_v=v,
+            sample_o=o,
+            sample_lse=lse,
+            seq_kv_lens_present=False,
+            pack_gqa=pack,
+            split_kv=split,
+            sample_gate=torch.empty_like(q),
+        )
+        api.check_support()
+        api.compile()
+        assert api._gate_in_combine() == (split > 1)
+        kw = dict(lse_tensor=lse, gate=gate_cpu)
+        if api.scratch_workspace_bytes():
+            kw["workspace"] = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+        with pytest.raises(ValueError, match="gate must be on this plan's CUDA device"):
+            api.execute(q, k, v, o, **kw)
+
+
+@_gpu
 def test_decode_adapter_gated_split_cuda_graph_replay_no_host_sync():
     """The standalone adapter with ``sample_gate`` on the decode tile's split (packed 16:1, split 4
     over pages): the two launches -- the ungated tile's partials, the GATED combine -- capture once
