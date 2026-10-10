@@ -369,6 +369,54 @@ TEST_CASE("Rmsnorm forward without scale", "[graph][rmsnorm][validate]") {
     REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, {4, 16, 1}).first->validate().is_good());
 }
 
+TEST_CASE("Rmsnorm and Layernorm backward without scale", "[graph][rmsnorm][layernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    auto packed = [](std::vector<int64_t> const& d) {
+        std::vector<int64_t> s(d.size(), 1);
+        for (int i = static_cast<int>(d.size()) - 2; i >= 0; i--) s[i] = s[i + 1] * d[i + 1];
+        return s;
+    };
+    std::vector<int64_t> const x_dim = {4, 16, 128}, stats_dim = {4, 16, 1};
+    auto make_graph = [] {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        return graph;
+    };
+    auto tensor = [&](std::shared_ptr<fe::graph::Graph>& graph, char const* name, std::vector<int64_t> const& d) {
+        return graph->tensor(fe::graph::Tensor_attributes().set_name(name).set_dim(d).set_stride(packed(d)));
+    };
+
+    // These used to dereference the null scale. The stats dims state the axes, so no scale is needed.
+    for (bool dbias : {false, true}) {
+        auto graph               = make_graph();
+        auto [DX, DScale, DBias] = graph->rmsnorm_backward(tensor(graph, "DY", x_dim),
+                                                           tensor(graph, "X", x_dim),
+                                                           nullptr,
+                                                           tensor(graph, "inv_var", stats_dim),
+                                                           fe::graph::Rmsnorm_backward_attributes().has_dbias(dbias));
+        DX->set_output(true);
+        REQUIRE(DScale == nullptr);
+        REQUIRE(DBias == nullptr);
+        // DBIAS needs a scale to take its dims from.
+        REQUIRE(graph->validate().get_code() == (dbias ? fe::error_code_t::INVALID_VALUE : fe::error_code_t::OK));
+        if (!dbias) REQUIRE(DX->get_dim() == x_dim);
+    }
+
+    auto graph = make_graph();
+    auto [DX, DScale, DBias] =
+        graph->layernorm_backward(tensor(graph, "DY", x_dim),
+                                  tensor(graph, "X", x_dim),
+                                  nullptr,
+                                  fe::graph::Layernorm_backward_attributes().set_saved_mean_and_inv_variance(
+                                      tensor(graph, "mean", stats_dim), tensor(graph, "inv_var", stats_dim)));
+    DX->set_output(true);
+    REQUIRE(DScale == nullptr);
+    REQUIRE(DBias == nullptr);
+    REQUIRE(graph->validate().is_good());
+    REQUIRE(DX->get_dim() == x_dim);
+}
+
 TEST_CASE("Layernorm forward with optional scale and bias", "[graph][layernorm][validate]") {
     namespace fe = cudnn_frontend;
 

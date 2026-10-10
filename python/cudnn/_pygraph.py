@@ -3062,6 +3062,11 @@ def _training_phase(node):  # norm stats exist only in TRAINING forward phase
 
 _NORM_FWD_MAYBE = {"mean": _training_phase, "inv_var": _training_phase}
 
+
+def _has_scale(node):  # rmsnorm/layernorm backward without a scale have no DScale or DBias (#188)
+    return node.inputs.get("scale") is not None
+
+
 _STRUCTURED_OPS = {
     # ---- norms --------------------------------------------------------------
     "rmsnorm": dict(
@@ -3080,7 +3085,7 @@ _STRUCTURED_OPS = {
         # classic rmsnorm_backward names its outputs ::Dscale/::Dbias (mixed
         # case), unlike the other norm backwards (::DSCALE/::DBIAS)
         out_suffix={"DScale": "Dscale", "DBias": "Dbias"},
-        maybe={"DBias": lambda n: n.params.get("has_dbias", True) is not False},
+        maybe={"DScale": _has_scale, "DBias": lambda n: _has_scale(n) and n.params.get("has_dbias", True) is not False},
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
@@ -3096,6 +3101,7 @@ _STRUCTURED_OPS = {
         node_type=NodeType.LAYERNORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
         outputs=("DX", "DScale", "DBias"),
+        maybe={"DScale": _has_scale, "DBias": _has_scale},
         infer=_NORM_BWD_INFER,
     ),
     "adalayernorm": dict(
@@ -3669,7 +3675,8 @@ def _install_structured_builders() -> None:
                 kwargs[ak] = v
             args = args[:n_p]
             for port, v in zip(input_ports, args):
-                node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+                if v is not None:  # an optional port passed positionally as None (e.g. scale, #188)
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
             for port in input_ports[len(args) :]:
                 v = kwargs.pop(port, None)
                 if v is not None:

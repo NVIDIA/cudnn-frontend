@@ -201,6 +201,10 @@ std::array<std::shared_ptr<Tensor_attributes>, 3>
 ```
 The output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
+`scale` is optional (Python: `scale=None`). Without it there is no scale or bias gradient (both returned as `nullptr` /
+`None`). The saved `mean` and `inv_variance` dims state the normalization axes, as in the forward. Verified on Hopper with cuDNN 9.12, 9.14, 9.18, 9.20, 9.24 and 9.27, and on
+Ampere and Blackwell with 9.27; older backends were not qualified.
+
 Layernorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
 ```
 Layernorm_attributes&
@@ -232,6 +236,11 @@ older backends were not qualified. Without a scale, nothing states the normaliza
 - In training, the caller sets the `INV_VARIANCE` dims explicitly, e.g. `{B, S, 1}` for `x = {B, S, H}`.
 
 Any other shape is refused with `INVALID_VALUE`. Pass a scale of ones, or reshape, to get the axes you want.
+
+`Graph::rmsnorm_backward(dy, x, scale, inv_variance, attributes)` also takes an optional `scale` (Python: `scale=None`).
+Without it there is no `DSCALE` or `DBIAS`, so `has_dbias(true)` is refused. The `INV_VARIANCE` dims state the
+normalization axes. Verified on Hopper with cuDNN 9.12, 9.14, 9.18, 9.20, 9.24 and 9.27, and on
+Ampere and Blackwell with 9.27; older backends were not qualified.
 
 ## RMSNorm PyTorch API
 

@@ -3472,15 +3472,22 @@ Graph::layernorm_backward(std::shared_ptr<Tensor_attributes> dy,
     // Set outputs
     auto DX = attributes.outputs[Layernorm_backward_attributes::output_names::DX] =
         output_tensor(attributes.name + "::DX");
-    auto DSCALE = attributes.outputs[Layernorm_backward_attributes::output_names::DSCALE] =
-        output_tensor(attributes.name + "::DSCALE");
-    auto DBIAS = attributes.outputs[Layernorm_backward_attributes::output_names::DBIAS] =
-        output_tensor(attributes.name + "::DBIAS");
+    // scale is optional (#188); without one there is no DSCALE or DBIAS
+    std::shared_ptr<Tensor_attributes> DSCALE = nullptr;
+    std::shared_ptr<Tensor_attributes> DBIAS  = nullptr;
+    if (scale) {
+        DSCALE = attributes.outputs[Layernorm_backward_attributes::output_names::DSCALE] =
+            output_tensor(attributes.name + "::DSCALE");
+        DBIAS = attributes.outputs[Layernorm_backward_attributes::output_names::DBIAS] =
+            output_tensor(attributes.name + "::DBIAS");
+    }
 
     // Set inputs
-    attributes.inputs[Layernorm_backward_attributes::input_names::DY]    = dy;
-    attributes.inputs[Layernorm_backward_attributes::input_names::X]     = x;
-    attributes.inputs[Layernorm_backward_attributes::input_names::SCALE] = scale;
+    attributes.inputs[Layernorm_backward_attributes::input_names::DY] = dy;
+    attributes.inputs[Layernorm_backward_attributes::input_names::X]  = x;
+    if (scale) {
+        attributes.inputs[Layernorm_backward_attributes::input_names::SCALE] = scale;
+    }
 
     sub_nodes.emplace_back(std::make_unique<DLNNode>(std::move(attributes), context));
 
@@ -3679,18 +3686,24 @@ Graph::rmsnorm_backward(std::shared_ptr<Tensor_attributes> dy,
     // Set outputs
     auto DX = attributes.outputs[Rmsnorm_backward_attributes::output_names::DX] =
         output_tensor(attributes.name + "::DX");
-    auto DScale = attributes.outputs[Rmsnorm_backward_attributes::output_names::DSCALE] =
-        output_tensor(attributes.name + "::Dscale");
-    std::shared_ptr<Tensor_attributes> DBias = nullptr;
-    if (attributes.use_dbias.value_or(true)) {
-        DBias = attributes.outputs[Rmsnorm_backward_attributes::output_names::DBIAS] =
-            output_tensor(attributes.name + "::Dbias");
+    // scale is optional (#188); without one there is no DSCALE or DBIAS
+    std::shared_ptr<Tensor_attributes> DScale = nullptr;
+    std::shared_ptr<Tensor_attributes> DBias  = nullptr;
+    if (scale) {
+        DScale = attributes.outputs[Rmsnorm_backward_attributes::output_names::DSCALE] =
+            output_tensor(attributes.name + "::Dscale");
+        if (attributes.use_dbias.value_or(true)) {
+            DBias = attributes.outputs[Rmsnorm_backward_attributes::output_names::DBIAS] =
+                output_tensor(attributes.name + "::Dbias");
+        }
     }
 
     // Set inputs
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::DY]           = dy;
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::X]            = x;
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE]        = scale;
+    attributes.inputs[Rmsnorm_backward_attributes::input_names::DY] = dy;
+    attributes.inputs[Rmsnorm_backward_attributes::input_names::X]  = x;
+    if (scale) {
+        attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE] = scale;
+    }
     attributes.inputs[Rmsnorm_backward_attributes::input_names::INV_VARIANCE] = inv_variance;
 
     sub_nodes.emplace_back(std::make_unique<DRMSNormNode>(std::move(attributes), context));
