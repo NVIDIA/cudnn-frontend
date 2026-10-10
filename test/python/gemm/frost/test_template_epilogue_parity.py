@@ -71,6 +71,8 @@ _SM120 = [
     ("sm120_block_scale_matmul.py", 1),
     ("sm120_moe_grouped_matmul_fwd.py", 1),
     ("sm120_moe_grouped_block_scale_matmul_fwd.py", 1),
+    ("sm120_moe_grouped_matmul_fwd_swap_ab.py", 1),
+    ("sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py", 1),
 ]
 
 # SETUP (LDTM shape + row base + span list) depends on the DRAIN LAYOUT, which

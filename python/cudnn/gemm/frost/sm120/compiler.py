@@ -853,8 +853,12 @@ def _render_tile_constants(
         _ab_stages, _, _ = tmpl.multi_gemm_ab_stages(chain, cfg)
     else:
         _ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
-    if chain.has_moe and chain.matmul.a_major != "k":
-        raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {chain.matmul.a_major}-major token")
+    if chain.has_moe:
+        # The token is A on the ordinary MoE kernel and B after the swap-AB
+        # lowering; either way it rides a K-major TMA box.
+        token_major = chain.matmul.b_major if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.a_major
+        if token_major != "k":
+            raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {token_major}-major token")
     # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
@@ -950,6 +954,10 @@ def _render_tile_constants(
         lines.append(f"moe_gather = {chain.moe.mode == 'gather'}")
         lines.append(f"moe_scatter = {chain.moe.mode == 'scatter'}")
         lines.append(f"moe_top_k = {chain.moe.top_k}")
+        # Swap-AB: the routed token axis is N, and the STG chunk was clamped to
+        # the first_token_offset alignment the graph promises (dtypes'
+        # _compute_output_vec_bytes); runtime S must keep it.
+        lines.append(f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}")
         # MoE grouped matmul: the grouped persistent scheduler launches a FIXED
         # grid of co-resident CTAs and pulls tiles off a global counter.
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
@@ -1285,17 +1293,22 @@ def _render_block_scale_tile_constants(
     block-scale templates add (packed row width, SF box shape, the warp MMA's
     kind / scale-vec / scale-format / operand types). Nothing of the tcgen05
     renderer's world exists here: no TMEM budget, no SMEM descriptors, no
-    SMEM->TMEM (utccp) copy schedules, no multicast plan. The MoE template
-    additionally takes the persistent grid size and the ``first_token_offset``
-    dtype, and addresses A and SFA through global descriptors.
+    SMEM->TMEM (utccp) copy schedules, no multicast plan. The MoE templates
+    additionally take the persistent grid size and the ``first_token_offset``
+    dtype, and address the token and its scales (A / SFA; B / SFB after the
+    swap-AB lowering) through global descriptors.
     """
     _check_own_family(tmpl)
     from ..tile_config import _SM120_STG_STAGE_ELEMS, ConfigSm120, smem_ab_stages, validate_block_scale_config_sm120
 
     if chain.is_multi_gemm or chain.has_mainloop_fusion:
         raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM block-scale matmul chains only")
-    if chain.has_moe and chain.matmul.a_major != "k":
-        raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {chain.matmul.a_major}-major token")
+    if chain.has_moe:
+        # The token is A on the ordinary MoE kernel and B after the swap-AB
+        # lowering; either way it rides a K-major TMA box.
+        token_major = chain.matmul.b_major if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.a_major
+        if token_major != "k":
+            raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {token_major}-major token")
     # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
     if tmpl.warps_per_cta is not None:
         cfg = replace(cfg, warps_per_cta=tmpl.warps_per_cta)
@@ -1378,7 +1391,10 @@ def _render_block_scale_tile_constants(
     compute_warps = (cta_m // cfg.warp_tile_m) * (cta_n // cfg.warp_tile_n)
     staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
     if chain.has_moe and chain.moe.mode == "gather":
-        staging_bytes += cta_m * 32 * chain.num_a_operands
+        # GATHER's linear-scale scratch: 32 B per routed token row of the tile,
+        # per token operand -- the token is B after the swap-AB lowering.
+        token_rows, token_operands = (cta_n, chain.num_b_operands) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, chain.num_a_operands)
+        staging_bytes += token_rows * 32 * token_operands
     ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=staging_bytes)
     if ab_stages < 1:
         raise NotImplementedError(
@@ -1473,6 +1489,10 @@ def _render_block_scale_tile_constants(
         # global counter; first_token_offset's dtype drives the compile() fake.
         lines.append(f"grid_num_clusters = {_grid_num_clusters(cfg)}")
         lines.append(f"offset_cutlass_dtype = {DTYPE_TO_CUTLASS[chain.moe.offset_dtype]}")
+        # Swap-AB: the routed token axis is N, and the STG chunk was clamped to
+        # the first_token_offset alignment the graph promises (dtypes'
+        # _compute_output_vec_bytes); runtime S must keep it.
+        lines.append(f"moe_token_alignment = {_pow2_floor(math.gcd(chain.moe.offset_multiple, chain.matmul.N)) if isinstance(chain.moe, MoeSwapAbSpec) else 1}")
     lines.extend(_quant_device_imports(chain))
     return "\n".join(lines)
 
@@ -1591,17 +1611,22 @@ def _render_template(
     # vector and source extent, independently of the routed output extent.
     moe_kernel_ma_params = moe_ma_list = moe_host_ma_pass = ""
     if chain.has_moe and chain.moe.mode in ("gather", "scatter"):
+        # The routed rows are M on the ordinary MoE kernel and N after the
+        # swap-AB lowering, where the token (and its source extent) is B.
+        swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        routed_rows = "sym_n" if swapped else "sym_m"
+        token_operand = "b_0" if swapped else "a_0"
         host_ab_params = "token_index: cute.Tensor,\n" + host_ab_params
-        compile_ab_fakes += "\nfake_token_index = make_fake_compact_tensor(cutlass.Int32, (sym_m,), stride_order=(0,), assumed_align=4)"
+        compile_ab_fakes += f"\nfake_token_index = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
         compile_ab_pass = "fake_token_index,\n" + compile_ab_pass
         moe_kernel_ma_params = "token_index: cute.Tensor,"
         moe_host_ma_pass = "token_index,"
         if chain.moe.mode == "gather":
             moe_kernel_ma_params += "\nsource_rows: cutlass.Int64,"
-            moe_host_ma_pass += "\na_0.shape[0],"
+            moe_host_ma_pass += f"\n{token_operand}.shape[0],"
         else:
             host_ab_params = "token_ks: cute.Tensor,\n" + host_ab_params
-            compile_ab_fakes += "\nfake_token_ks = make_fake_compact_tensor(cutlass.Int32, (sym_m,), stride_order=(0,), assumed_align=4)"
+            compile_ab_fakes += f"\nfake_token_ks = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
             compile_ab_pass = "fake_token_ks,\n" + compile_ab_pass
             moe_kernel_ma_params += "\ntoken_ks: cute.Tensor,"
             moe_host_ma_pass += "\ntoken_ks,"
@@ -1853,10 +1878,14 @@ def _render_block_scale_template(
     # SCATTER add routing metadata to the device signature.
     moe_kernel_ma_params = moe_host_ma_pass = ""
     if chain.has_moe and chain.moe.mode in ("gather", "scatter"):
+        # The routed rows are M on the ordinary MoE kernel and N after the
+        # swap-AB lowering, where the token (and its source extent) is B.
+        swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        routed_rows = "sym_n" if swapped else "sym_m"
+        token_operand = "b_0" if swapped else "a_0"
         if chain.moe.mode == "gather":
             moe_kernel_ma_params += "\nsource_rows: cutlass.Int64,"
-            moe_host_ma_pass += "\na_0.shape[0],"
-        routed_rows = "sym_n" if isinstance(chain.moe, MoeSwapAbSpec) else "sym_m"
+            moe_host_ma_pass += f"\n{token_operand}.shape[0],"
         host_ab_params = "token_index: cute.Tensor,\n" + host_ab_params
         compile_ab_fakes += f"\nfake_token_index = make_fake_compact_tensor(cutlass.Int32, ({routed_rows},), stride_order=(0,), assumed_align=4)"
         compile_ab_pass = "fake_token_index,\n" + compile_ab_pass
@@ -2860,12 +2889,15 @@ def _grouped_row_quant_scale_blob_reject(
     contract so every accepted destination is one dense byte run.
     """
     blobs = []
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    if swapped:
+        total_rows, runtime_n = runtime_n, total_rows
     for spec, buf in zip(chain.outputs, outputs):
         if not spec.is_quant_scale:
             continue
         quant_idx = int(spec.source.rsplit("_", 1)[1])
         quant = chain.quants[quant_idx]
-        if not quant.grouped_by_moe or quant.axis == 1:
+        if not quant.grouped_by_moe or (quant.axis == 1) != swapped:
             continue
         padded_n_blocks = ((runtime_n // quant.block_size + 3) // 4) * 4
         required_rows = segmented_row_scale_capacity_rows(total_rows, num_groups)
@@ -3441,11 +3473,12 @@ def _precheck_moe(
     reason = mma_arch_reject(chain, GraphType.MOE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
-    if chain.matmul.a_major != "k":
+    token_major = chain.matmul.b_major if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.a_major
+    if token_major != "k":
         raise NotImplementedError(
-            "MoE grouped matmul supports only K-major token: the grouped A walk "
+            "MoE grouped matmul supports only K-major token: the grouped token walk "
             "is a K-major TMA box offset to the routed group's first row "
-            f"(got token {chain.matmul.a_major}-major)"
+            f"(got token {token_major}-major)"
         )
     _arch_reason = select_template(chain, config).active_reject(config)
     if _arch_reason is not None:
@@ -3495,13 +3528,16 @@ def _precheck_moe_block_scale(
     reason = mma_arch_reject(chain, GraphType.MOE_BLOCK_SCALE, config.pipeline)
     if reason is not None:
         raise NotImplementedError(reason)
-    if chain.matmul.a_major != "k":
+    token_major = chain.matmul.b_major if isinstance(chain.moe, MoeSwapAbSpec) else chain.matmul.a_major
+    if token_major != "k":
         raise NotImplementedError(
-            "MoE block-scale matmul supports only K-major token: the grouped A walk "
+            "MoE block-scale matmul supports only K-major token: the grouped token walk "
             "is a K-major TMA box offset to the routed group's first row "
-            f"(got token {chain.matmul.a_major}-major)"
+            f"(got token {token_major}-major)"
         )
-    if chain.reductions:
+    # The fp32-only gate is the non-swapped template's; the swap-AB template runs
+    # every reduction dtype the shared STG epilogue emits (int32 included), as on sm100.
+    if chain.reductions and not isinstance(chain.moe, MoeSwapAbSpec):
         for red in chain.reductions:
             if red.compute_dtype != "fp32" or red.dtype != "fp32":
                 raise NotImplementedError("MoE block-scale reduction supports only fp32 compute/output")
@@ -3792,18 +3828,10 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
             raise KeyError(f"variant pack is missing a buffer for {role}")
         return resolved[id(t)]
 
-    a_bufs = [pull(t, "token") for t in b.a_operands]
-    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
-    out_bufs = [pull(t, "output") for t in b.outputs]
-    aux_bufs = [pull(t, "aux") for t in b.aux]
-    fto = pull(b.first_token_offset, "first_token_offset")
-    sfa = [pull(t, "SFA") for t in b.sfa_operands]
-    sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
-    k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
-    S = a_bufs[0].shape[1]
-    token_index = token_ks = None
-    mode = compiled.chain.moe.mode
-    if mode in ("gather", "scatter"):
+    def routing_indices(tokens):
+        mode = compiled.chain.moe.mode
+        if mode == "none":
+            return None, None
         indices = []
         for tensor, role in [(b.token_index, "token_index")] + ([(b.token_ks, "token_ks")] if mode == "scatter" else []):
             buf = pull(tensor, role)
@@ -3812,14 +3840,48 @@ def _resolve_moe_variant_pack(compiled, variant_pack: dict):
                 raise ValueError(f"MoE {mode.upper()} {role} must have shape [1, routed_rows, 1]")
             if buffers.dtype_name(buf) != "int32" or buf.stride(1) != 1 or buffers.data_ptr(buf) % 4:
                 raise ValueError(f"MoE {mode.upper()} {role} must be aligned INT32 with contiguous routed rows")
-            if mode == "scatter" and (shape[1] != S or S % compiled.chain.moe.top_k):
+            if mode == "scatter" and (shape[1] != tokens[0].shape[1] or shape[1] % compiled.chain.moe.top_k):
                 raise ValueError(f"MoE SCATTER {role} must match token rows divisible by top_k")
             indices.append(buf.reshape([shape[1]]))
-        if any(len(a.shape) != 3 or a.shape[0] != 1 or tuple(a.shape) != tuple(a_bufs[0].shape) for a in a_bufs):
+        if any(len(t.shape) != 3 or t.shape[0] != 1 or tuple(t.shape) != tuple(tokens[0].shape) for t in tokens):
             raise ValueError(f"MoE {mode.upper()} token operands must share shape [1, rows, K]")
-        token_index = indices[0]
-        token_ks = indices[1] if mode == "scatter" else None
-        S = token_index.shape[0]
+        return indices[0], indices[1] if mode == "scatter" else None
+
+    if isinstance(compiled.chain.moe, MoeSwapAbSpec):
+        a_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.a_operands]
+        b_bufs = [pull(t, "token") for t in b.b_operands]
+        out_bufs = [
+            (
+                pull(t, "output")
+                if spec.is_quant_scale and compiled.chain.quants[int(spec.source.rsplit("_", 1)[1])].scale_reorder == "F8_128x4"
+                else _swap_mn_view(pull(t, "output"))
+            )
+            for spec, t in zip(compiled.chain.outputs, b.outputs)
+        ]
+        aux_bufs = [_swap_mn_view(pull(t, "aux")) for t in b.aux]
+        fto = pull(b.first_token_offset, "first_token_offset")
+        sfa = [_kernel_order(pull(t, "SFA"), t, memo) for t in b.sfa_operands]
+        sfb = [pull(t, "SFB") for t in b.sfb_operands]
+        mm = compiled.chain.matmul
+        token_index, token_ks = routing_indices(b_bufs)
+        m = a_bufs[0].shape[1]
+        n = token_index.shape[0] if token_index is not None else b_bufs[0].shape[1]
+        k = a_bufs[0].shape[2] * (2 if mm.a_dtype == "fp4_e2m1" else 1)
+        reason = _tma_alignment_reject(mm.a_dtype, mm.b_dtype, mm.a_major, mm.b_major, m, n, k)
+        if reason is not None:
+            raise ValueError(reason)
+        return a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, token_index, token_ks, (m, n, k)
+
+    a_bufs = [pull(t, "token") for t in b.a_operands]
+    b_bufs = [_kernel_order(pull(t, "weight"), t, memo) for t in b.b_operands]
+    out_bufs = [pull(t, "output") for t in b.outputs]
+    aux_bufs = [pull(t, "aux") for t in b.aux]
+    fto = pull(b.first_token_offset, "first_token_offset")
+    sfa = [pull(t, "SFA") for t in b.sfa_operands]
+    sfb = [_kernel_order(pull(t, "SFB"), t, memo) for t in b.sfb_operands]
+    k_factor = 2 if compiled.chain.matmul.a_dtype == "fp4_e2m1" else 1
+    token_index, token_ks = routing_indices(a_bufs)
+    S = token_index.shape[0] if token_index is not None else a_bufs[0].shape[1]
     K = a_bufs[0].shape[2] * k_factor
     # N from the weight: a dense output may be FP4-packed (N/2 bytes).
     N = b_bufs[0].shape[1]
@@ -3870,8 +3932,9 @@ def _moe_reset_sched_counter(workspace, desc_slots: int, stream) -> None:
 
     It lives in the slot past the per-CTA descriptor scratch, so it rides the
     same buffer and the same stable pointer that makes the plan graph-safe.
-    A 4-byte D32 memset, not a kernel. Only the block-scale MoE launchers need
-    it: the dense MoE template's host zeroes its own counter."""
+    A 4-byte D32 memset, not a kernel. Only the non-swapped block-scale MoE
+    launchers need it: the dense MoE templates and both swap-AB templates zero
+    their own counter in the host (``_launch_moe_swap_ab`` issues no memset)."""
     buffers.memset_zero_async(
         workspace.data_ptr() + desc_slots * _MOE_DESC_SLOT_BYTES,
         4,
@@ -4043,6 +4106,10 @@ class CompiledMoeGemm:
         _r = _alignment_reject(_named)
         if _r is not None:
             raise ValueError(_r)
+        if isinstance(self.chain.moe, MoeSwapAbSpec):
+            return _launch_moe_swap_ab(
+                self, a_bufs, b_bufs, out_bufs, aux_bufs, fto, [], [], snk, workspace, stream, token_index=token_index, token_ks=token_ks
+            )
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         if self.chain.is_multi_gemm or self.chain.ops:
             pairs = [(a_bufs[ai], b_bufs[bi]) for ai, bi in self.chain.gemm_operands]
@@ -4170,6 +4237,80 @@ def _moe_launch_tail(cs, aux=(), *, tma_slots: "frozenset[int]" = frozenset()) -
     taps = [c for i, c in enumerate(cs) if i not in tma_slots]
     tmas = [cs[i] for i in sorted(tma_slots) if i < len(cs)]
     return (*taps, *aux, *tmas)
+
+
+def _launch_moe_swap_ab(compiled, weights, tokens, outputs, aux, offsets, weight_sf, token_sf, mnk, workspace, stream, token_index=None, token_ks=None):
+    chain, cfg = compiled.chain, compiled.config
+    m, n, k = map(int, mnk)
+    e = int(weights[0].shape[0])
+    offsets = _offset_vector(offsets)
+    g = _moe_num_groups(offsets, e)
+    if chain.quants and (m, n) != (chain.matmul.M, chain.matmul.N):
+        runtime_chain = replace(chain, matmul=replace(chain.matmul, M=m, N=n))
+        try:
+            _check_block_quant_supported(runtime_chain, _epi_vec_bytes(chain, cfg), cfg)
+        except NotImplementedError as exc:
+            raise ValueError(str(exc)) from exc
+    if n % math.gcd(_epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype], chain.moe.offset_multiple, chain.matmul.N):
+        raise ValueError("MoE weight-by-token runtime S violates the compiled STG chunk alignment")
+    for quant in chain.quants:
+        if (m if quant.axis == 1 else n) % quant.block_size:
+            raise ValueError("MoE weight-by-token quantization axis must contain whole runtime blocks")
+    for spec, out in zip(chain.outputs, outputs):
+        expected = _expected_output_shape(spec, chain, (m, n, k))
+        if tuple(out.shape) != expected:
+            raise ValueError(f"MoE weight-by-token output {spec.source!r} must have lowered shape {expected}; got {tuple(out.shape)}")
+        if not spec.is_reduction and not spec.is_quant_scale and out.stride(-1 if spec.major == "n" else -2) != 1:
+            raise ValueError("MoE weight-by-token output must match the lowered graph's [1,N,S] shape and major")
+        if spec.is_quant_scale:
+            qi = int(spec.source.rsplit("_", 1)[1])
+            if chain.quants[qi].scale_reorder == "F8_128x4":
+                reason = _sf_blob_reject([(f"quant scale output[{qi}]", out, math.prod(expected) * DTYPE_BYTES[spec.dtype])])
+                if reason is not None:
+                    raise ValueError(reason)
+    scale_blob_reason = _grouped_row_quant_scale_blob_reject(chain, outputs, m, n, g)
+    if scale_blob_reason is not None:
+        raise ValueError(scale_blob_reason)
+    for i, spec in enumerate(chain.output_specs):
+        if i in compiled.tma_slots and spec.major == "n" and n * DTYPE_BYTES[spec.dtype] % 16:
+            raise ValueError("MoE weight-by-token runtime S violates the TMA token boundary alignment")
+    token_rows = tokens[0].shape[1] if token_index is not None else n
+    for tok in tokens:
+        if len(tok.shape) != 3 or tuple(tok.shape[:2]) != (1, token_rows) or int(tok.shape[2]) * (2 if chain.matmul.b_dtype == "fp4_e2m1" else 1) != k:
+            raise ValueError("MoE weight-by-token token operands must share [1,S,K]")
+    for weight in weights:
+        if tuple(weight.shape[:2]) != (e, m) or int(weight.shape[2]) * (2 if chain.matmul.a_dtype == "fp4_e2m1" else 1) != k:
+            raise ValueError("MoE weight-by-token weight operands must share [E,N,K] in kernel order")
+    if any(_moe_operand_layout_bad(chain, w, t) for t in tokens for w in weights):
+        raise ValueError("MoE weight-by-token operands must have the graph's contiguous major dimension")
+    for ref, buf in zip(chain.aux_tensors, aux):
+        if ref.grouped_by_moe and (len(buf.shape) != 3 or int(buf.shape[0]) != g):
+            raise ValueError(f"per-group aux {ref.name!r} must have leading dimension {g}")
+    a = [w.permute(1, 2, 0) for w in weights]
+    b = [t.permute(1, 2, 0) for t in tokens]
+    c = [out.permute(1, 2, 0) for out in outputs]
+    problem = (m, n, k, e, g, *(x for buf in a + b + c for x in buf.stride()))
+    wrap = _maybe_wrap_layout
+    a = [wrap(buf, _LEADING_DIM_A) for buf in a]
+    b = [wrap(buf, _LEADING_DIM_B) for buf in b]
+    c = [_wrap_raw_tensor(buf) if spec.is_reduction or spec.is_quant_scale else wrap(buf, _LEADING_DIM_C) for spec, buf in zip(chain.outputs, c)]
+    sf = [wrap(buf.permute(1, 2, 0), _LEADING_DIM_AUX) for buf in weight_sf + token_sf]
+    aux = [wrap(_reshape_aux_to_fake(buf, ref), _LEADING_DIM_AUX) for ref, buf in zip(chain.aux_tensors, aux)]
+    slots = compiled._grid_ctas * compiled._desc_slots_per_cta
+    workspace = compiled._make_workspace(slots + _MOE_SCHED_COUNTER_SLOTS, workspace)
+    _initialize_reduction_outputs(chain, outputs, stream)
+    return compiled._launchable(
+        problem,
+        offsets,
+        workspace,
+        *((token_ks,) if token_ks is not None else ()),
+        *((token_index,) if token_index is not None else ()),
+        *a,
+        *b,
+        *sf,
+        *_moe_launch_tail(c, aux, tma_slots=compiled.tma_slots),
+        stream=_as_custream(stream),
+    )
 
 
 def _jit_moe(
@@ -4444,23 +4585,32 @@ class CompiledMoeBlockScaleGemm:
             raise ValueError(_r)
         if sfa or sfb:
             _S, _N, _K = snk[0], snk[1], snk[2]
-            token_sf = sfa
+            token_sf, weight_sf, weights = sfa, sfb, b_bufs
+            if isinstance(self.chain.moe, MoeSwapAbSpec):
+                _S, _N = _N, _S
+                token_sf, weight_sf, weights = sfb, sfa, a_bufs
             if self.chain.moe.mode == "gather":
                 from ..kernel_registry import linear_token_sf_reject
 
-                for sf in sfa:
-                    reason = linear_token_sf_reject(sf.shape, sf.stride(), a_bufs[0].shape[1], _K // self.chain.block_scale.block_size)
+                source_rows = (b_bufs if isinstance(self.chain.moe, MoeSwapAbSpec) else a_bufs)[0].shape[1]
+                for sf in token_sf:
+                    reason = linear_token_sf_reject(sf.shape, sf.stride(), source_rows, _K // self.chain.block_scale.block_size)
                     if reason is not None:
                         raise ValueError(reason)
-                token_sf = []
+                token_sf = []  # Linear inputs do not use segmented F8_128x4 capacity.
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
-            _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), _moe_num_groups(fto, int(b_bufs[0].shape[0])))
+            _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), _moe_num_groups(fto, int(weights[0].shape[0])))
             _r_sf = _sf_blob_reject(
                 [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(token_sf or [])]
-                + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(b_bufs[j].shape[0])) for j, x in enumerate(sfb or [])]
+                + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(weights[j].shape[0])) for j, x in enumerate(weight_sf or [])]
             )
             if _r_sf is not None:
                 raise ValueError(_r_sf)
+        if isinstance(self.chain.moe, MoeSwapAbSpec):
+            # The swapped binding's SFA is the weight's, its SFB the token's.
+            return _launch_moe_swap_ab(
+                self, a_bufs, b_bufs, out_bufs, aux_bufs, fto, sfa, sfb, snk, workspace, stream, token_index=token_index, token_ks=token_ks
+            )
         out = out_bufs if len(out_bufs) > 1 else out_bufs[0]
         fake_a = self.chain.block_scale.fake_dequant_a
         fake_b = self.chain.block_scale.fake_dequant_b
