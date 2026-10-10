@@ -457,6 +457,144 @@ def test_fp8_softmax_f16_e2e():
     assert xerr <= 0.05 * ref.abs().max().item(), f"HALF-vs-FLOAT softmax divergence {xerr}"
 
 
+def _fp8_d128_leading_tile_operands(b, hq, hkv, s_q, s_kv, d, *, seed=0):
+    """Q / K / V drawn INSIDE the fp8 range (std 1.5 / 1.5 / 1.0) and bound with UNIT descales -- the operating point at which the
+    per-tensor kernel's folded scale_log2 = attn_scale * log2 e overflows a finite mask sentinel to -inf at attn_scale 1 (the
+    quantizer's amax / 448 descales keep it finite).  BSHD-physical storage under BHSD views; the float64 copies for the oracle."""
+    import torch
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+
+    def draw(h, s, std):
+        x8 = (torch.randn(b, s, h, d, device="cuda", generator=gen) * std).to(torch.float8_e4m3fn).transpose(1, 2)
+        return x8, x8.double()
+
+    return draw(hq, s_q, 1.5), draw(hkv, s_kv, 1.5), draw(hkv, s_kv, 1.0)
+
+
+def _fp8_d128_leading_tile_oracle(qd, kd, vd, *, scale, bottom_right, window_left, q_lens=None, kv_lens=None):
+    """float64 softmax(scale * Q K^T) V and the natural-log LSE composing the kernel's mask: the causal diagonal (top-left, or
+    bottom-right anchored at (q_len[b], kv_len[b])), a left window of ``window_left`` past keys riding it, and per-batch Q / KV
+    padding.  Dead (row >= q_len[b]) and keyless rows come out as O = 0 / LSE = -inf."""
+    import torch
+
+    b, hq, s_q, _ = qd.shape
+    hkv, s_kv = kd.shape[1], kd.shape[2]
+    rep = hq // hkv
+    logits = (qd @ kd.repeat_interleave(rep, 1).transpose(-1, -2)) * scale
+    i = torch.arange(s_q, device=qd.device).view(1, 1, s_q, 1)
+    j = torch.arange(s_kv, device=qd.device).view(1, 1, 1, s_kv)
+    ql = (q_lens.to(torch.int64) if q_lens is not None else torch.full((b,), s_q, dtype=torch.int64, device=qd.device)).view(b, 1, 1, 1)
+    kl = (kv_lens.to(torch.int64) if kv_lens is not None else torch.full((b,), s_kv, dtype=torch.int64, device=qd.device)).view(b, 1, 1, 1)
+    diag = i + (kl - ql) if bottom_right else i
+    masked = (i >= ql) | (j >= kl) | (j > diag) | (j < diag - window_left)
+    logits = logits.masked_fill(masked, float("-inf"))
+    lse = torch.logsumexp(logits, dim=-1)
+    o = torch.softmax(logits, dim=-1).nan_to_num(0.0) @ vd.repeat_interleave(rep, 1)
+    return o, lse
+
+
+def _run_fp8_d128_leading_tile(q8, k8, v8, *, precision, scale, bottom_right, window_left, q_lens=None, kv_lens=None):
+    """One launch of the per-tensor FP8 d128 kernel on cc 10.7 with unit descales; NaN-poisoned outputs; -> (O, LSE)."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, s_q, _ = q8.shape
+    d_v = v8.shape[-1]
+    out = torch.full((b, s_q, hq, d_v), float("nan"), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    lse = torch.full((b, hq, s_q), float("nan"), device="cuda", dtype=torch.float32)
+    api = SdpaFwdDslSm100(
+        sample_q=q8,
+        sample_k=k8,
+        sample_v=v8,
+        sample_o=out,
+        sample_lse=lse,
+        is_causal=True,
+        causal_bottom_right=bottom_right,
+        window_size_left=window_left,
+        scale_softmax=scale,
+        seq_kv_lens_present=kv_lens is not None,
+        seq_q_lens_present=q_lens is not None,
+        pertensor_fp8=True,
+        softmax_precision=precision,
+    )
+    assert api.check_support()
+    api.compile()
+    assert api._k_mod.__file__.endswith("sm107/prefill_d128_fp8.py"), api._k_mod.__file__
+    unit = torch.ones(1, device="cuda", dtype=torch.float32)
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    kw = dict(descale_q=unit, descale_k=unit, descale_v=unit, workspace=ws)
+    if q_lens is not None:
+        kw["seq_q_lens"] = q_lens
+    if kv_lens is not None:
+        kw["seq_kv_lens"] = kv_lens
+    api.execute(q_tensor=q8, k_tensor=k8, v_tensor=v8, o_tensor=out, lse_tensor=lse, **kw)
+    torch.cuda.synchronize()
+    return out, lse
+
+
+def _check_fp8_d128_leading_tile(out, lse, ref_o, ref_lse, *, tag):
+    """Every O cell written and finite; LSE finite where the oracle's is and -inf exactly where it is; dead rows O = 0 exactly;
+    live rows within 0.1 * max|ref| (bf16 O) and the LSE within 1e-4 natural (the Stats leg's exact f32 denominator)."""
+    import torch
+
+    assert torch.isfinite(out.float()).all(), f"{tag}: {int((~torch.isfinite(out.float())).sum())} non-finite / unwritten O cells"
+    live = torch.isfinite(ref_lse)
+    assert not torch.isnan(lse).any(), f"{tag}: unwritten LSE rows"
+    assert torch.equal(torch.isneginf(lse), ~live), f"{tag}: LSE = -inf exactly on the dead rows, nowhere else"
+    dead_rows = (~live).unsqueeze(-1).expand_as(out)
+    assert (out[dead_rows] == 0).all(), f"{tag}: dead rows must be EXACTLY 0 (a select, not residue * 0)"
+    scale = ref_o.abs().max().item()
+    err = (out.double() - ref_o).abs().max().item()
+    assert err <= 0.1 * scale, f"{tag}: O max err {err} vs oracle (scale {scale})"
+    lse_err = (lse.double()[live] - ref_lse[live]).abs().max().item()
+    assert lse_err <= 1e-4, f"{tag}: LSE max err {lse_err} vs oracle (natural log)"
+
+
+@pytest.mark.parametrize("half_softmax", [False, True], ids=["f32-exp", "f16x2-exp"])
+def test_fp8_d128_masked_leading_tile_keeps_rows_with_later_keys_finite(half_softmax):
+    """Rubin e2e: a row whose FIRST KV tile is fully masked while a LATER tile holds its keys, on the per-tensor FP8 d128
+    kernel -- top-left causal with a 34-key band at S = 256 (rows 161..255: no key in tile 0, their 34 keys in tile 1) under
+    UNIT descales and attn_scale 1.  The kernel folds descale_q * descale_k into scale_log2, so here scale_log2 = log2 e > 1
+    overflowed the scaled mask sentinel to -inf; taken as the running max it read -inf - (-inf) = NaN into P and into the
+    Sigma denominator (with the quantizer's descales the same tile published P = 1 instead, wiped by the next live tile's
+    alpha = 0 -- a multiply by zero).  The running-max step now keeps a tile that is dead ahead of the first live key out of
+    the state (total_max kept, alpha = 1, P = 0): O and LSE finite and at the float64 oracle on both softmax arms."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    precision = _c.data_type.HALF if half_softmax else _c.data_type.FLOAT
+    (q8, qd), (k8, kd), (v8, vd) = _fp8_d128_leading_tile_operands(1, 8, 2, 256, 256, 128)
+    out, lse = _run_fp8_d128_leading_tile(q8, k8, v8, precision=precision, scale=1.0, bottom_right=False, window_left=33)
+    ref_o, ref_lse = _fp8_d128_leading_tile_oracle(qd, kd, vd, scale=1.0, bottom_right=False, window_left=33)
+    assert torch.isfinite(ref_lse).all(), "geometry: every row keeps 34 keys"
+    _check_fp8_d128_leading_tile(out, lse, ref_o, ref_lse, tag=f"d128 fp8 leading tile half_softmax={half_softmax}")
+
+
+@pytest.mark.parametrize("half_softmax", [False, True], ids=["f32-exp", "f16x2-exp"])
+def test_fp8_d128_masked_leading_tile_bottom_right_padded_keeps_rows_with_later_keys_finite(half_softmax):
+    """The padded bottom-right twin on the per-tensor FP8 d128 kernel: per-batch lengths Q 65 / KV 193 on a 256 x 256 problem,
+    bottom-right causal (the diagonal 128 keys back) with a 34-key band at attn_scale 1 under unit descales -- rows 33..64 see
+    KV tile 0 fully masked and their keys in tile 1, rows 0..32 keep keys in tile 0, rows 65..255 are padded (O = 0 and LSE =
+    -inf through the dead-row select).  The fp64 oracle composes the same padding, diagonal and window."""
+    import torch
+    import cudnn as _c
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 FP8 kernels serve cc10.7 only")
+    precision = _c.data_type.HALF if half_softmax else _c.data_type.FLOAT
+    (q8, qd), (k8, kd), (v8, vd) = _fp8_d128_leading_tile_operands(1, 8, 2, 256, 256, 128, seed=1)
+    q_lens = torch.tensor([65], dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor([193], dtype=torch.int32, device="cuda")
+    out, lse = _run_fp8_d128_leading_tile(q8, k8, v8, precision=precision, scale=1.0, bottom_right=True, window_left=33, q_lens=q_lens, kv_lens=kv_lens)
+    ref_o, ref_lse = _fp8_d128_leading_tile_oracle(qd, kd, vd, scale=1.0, bottom_right=True, window_left=33, q_lens=q_lens, kv_lens=kv_lens)
+    assert torch.isfinite(ref_lse[..., :65]).all() and torch.isneginf(ref_lse[..., 65:]).all(), "geometry: rows 0..64 have keys, the rest are padded"
+    _check_fp8_d128_leading_tile(out, lse, ref_o, ref_lse, tag=f"d128 fp8 bottom-right padded leading tile half_softmax={half_softmax}")
+
+
 def test_fp8_rows_serve_dense_envelope():
     """BOTH per-tensor FP8 rows (sm100 and sm107) serve the dense head-dim
     ENVELOPE of their kernel flavors (TMA zero-padding — exact in FP8;

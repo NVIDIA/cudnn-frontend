@@ -254,6 +254,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     compute_kv_loop_bounds,
     lpt_tile_coords,
     make_sdpa_helpers,
+    running_max_step_finite_sentinel,
 )
 
 CGA_SIZE = CFG.CGA_M * CFG.CGA_N
@@ -1751,32 +1752,25 @@ def _softmax_kv_body(
 
     # size= explicit — Vector.shape[0] is MLIR-typed after vec_concat.
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
+    # current_max_unscaled is the tile's RAW row max -- exactly NEG_INF (the finite mask sentinel) iff every column of
+    # this tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.  scale_log2 carries the
+    # per-tensor descale fold, so the scaled sentinel stays finite under the quantizer's descales and overflows under unit ones.
     current_max = current_max_unscaled * scale_log2
 
     # sync the warpgroups before the stat-store.
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
-    # Online softmax with RESCALE_THRESHOLD skip.
-    old_total_max = total_max
-    is_first = total_max == NEG_INF
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF, 0) and is published by the
+    # epilogue's row_dead / _kv_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
-    new_total_max = total_max
 
     alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
