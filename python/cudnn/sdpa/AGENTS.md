@@ -281,6 +281,27 @@ on the address path shows the wrap before any GPU run.
   with the existing `thd_over_launched_units_are_dead` and
   `thd_multi_unit_per_cta` regressions.
 
+## Scheduler readers and output-phase cadence
+
+Every scheduler payload reader must either return a reuse credit or have a
+back-edge that gates the next publication on its observation. An idle role
+that only reads a CLC response can miss a complete parity cycle, including
+the terminal response. Remove that role's loop when it has no work. If this
+also removes the only waiter on a credit barrier, stop arriving that object:
+common dense CLC routes credits only to its leader, while persistent THD and
+local predecode retain broadcast credits and their local scheduler roles.
+Check the scheduler selection at each caller; THD does not imply persistent
+scheduling in every kernel family.
+
+Match barrier completion cadence to the consumer's loop. SM100 D512 MXFP8
+SWA=128 drains two Dv slices per tile, so a once-per-tile softmax wait must use
+the once-per-tile Q/O alias signal, including its explicit bootstrap phase,
+not the twice-per-tile O-empty signal. Detector:
+`test_sdpa_fwd_o_empty_backedge.py::test_d512_swa_waits_for_both_output_slices`
+delays softmax after publishing retained P, then checks dense/THD O, LSE and
+Amax after capture/replay. The delay lives in a private test template copy;
+production kernels gain no debug knob or timing-dependent assertion.
+
 ## 2x2 datapath (cta_group::2, M=128 collective = 64 rows per CTA) lessons
 
 Kernels on this atom: forward `fwd/kernels/sm100/prefill_d512_f16_2x2.py` + `fwd/kernels/sm107/prefill_d512_f16_2x2.py`

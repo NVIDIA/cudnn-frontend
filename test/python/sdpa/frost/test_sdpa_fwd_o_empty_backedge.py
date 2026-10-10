@@ -15,6 +15,8 @@ Two pins.  (1) Source, no GPU: none of the eleven two-warpgroup forward kernels 
 in a SUBPROCESS under a wall budget so a regression can never wedge the suite: the smallest shape that hung deterministically on a
 cc 10.3 part (B=1, H=32, S_q = S_kv = 2048, D=128, bf16, bottom-right causal, TILE_CGA_M=2, SPLIT_KV=16, PACK_GQA=0) runs 20
 back-to-back synchronised executes and matches an fp32 reference.
+A separate D512 MXFP8 probe delays softmax after both Dv slices have their P input: its once-per-tile gate must observe
+a once-per-tile completion, rather than alias two O-empty phases. It checks dense and THD output, Stats and Amax after replay.
 """
 
 import os
@@ -113,3 +115,116 @@ def test_square_causal_split_kv_cga2_completes_every_launch(tmp_path):
         pytest.fail(f"HANG: the split-KV cga2 bottom-right-causal child did not finish within {budget_s:.0f} s (the #1532 signature).\n{out[-3000:]}")
     assert proc.returncode == 0, f"child failed rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
     assert proc.stdout.count(" ok") == 20 and "OK" in proc.stdout, proc.stdout[-2000:]
+
+
+_D512_SWA_CHILD = textwrap.dedent(r"""
+    import hashlib, json, os, sys
+    from pathlib import Path
+    test_root, expected_fe, layout, work = sys.argv[1:]
+    sys.path.insert(0, test_root)
+    import conftest  # Allocator and Transformer Engine import ordering.
+    sys.path.insert(0, str(Path(test_root) / "sdpa/frost"))
+    import torch
+    import cudnn
+    from cudnn.sdpa.fwd import api_dsl
+    from frost_test_utils import process_watchdog
+    import test_sdpa_fwd_mxfp8_sm100 as ref
+
+    assert Path(cudnn.__file__).resolve() == Path(expected_fe).resolve()
+    original_load = api_dsl.load_template
+    served = []
+
+    def delayed(path, params, tag="template"):
+        p = Path(path)
+        if p.parent.name == "sm100" and p.name == "prefill_d512_mxfp8.py":
+            source = p.read_text()
+            begin = source.index("def _softmax_warp_group(")
+            end = source.index("\n@cute.jit", begin)
+            section = source[begin:end]
+            anchor = "        wait(mb_decoded.subview(sched_state.idx), sched_state.phase)\n"
+            assert section.count(anchor) == 1
+            # P is already published for BOTH Dv slices. Delay the softmax role
+            # here so their two O-empty phases finish before its next tile wait.
+            delay = (
+                "        if cutlass.const_expr(_SWA_REUSE_P):\n"
+                "            delayed_start = cute.arch.globaltimer()\n"
+                "            while cute.arch.globaltimer() - delayed_start < cutlass.Int64(10_000_000):\n"
+                "                pass\n"
+            )
+            target = Path(work) / "template_d512_delayed_softmax.py"
+            target.write_text(source[:begin] + section.replace(anchor, delay + anchor) + source[end:])
+            module = original_load(str(target), params, tag)
+            assert module._SWA_REUSE_P, "the two-output-slice path was not exercised"
+            if params.thd_varlen:
+                # This kernel's THD claim loop normally gets the full envelope
+                # grid. Enable the existing test launch cap on this private
+                # module so FROST_THD_CLUSTERS=1 really reuses the same CTA.
+                module.THD_PERSISTENT = True
+            served.append(dict(sha256=hashlib.sha256(source.encode()).hexdigest(), params=repr(params)))
+            return module
+        return original_load(path, params, tag)
+
+    api_dsl.load_template = delayed
+    original_execute = cudnn.pygraph.execute
+
+    def replayed(self, *args, **kwargs):
+        # Compilation happens before execute; the watchdog covers device work.
+        with process_watchdog(45.0, "D512 delayed softmax output-drain observer"):
+            original_execute(self, *args, **kwargs)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                original_execute(self, *args, **kwargs)
+            for _ in range(4):
+                graph.replay()
+                torch.cuda.synchronize()
+
+    cudnn.pygraph.execute = replayed
+    torch.manual_seed(1541)
+    if layout == "dense":
+        result = ref._run(1, 64, 1, 512, "e4m3", torch.float16, scale=512**-0.5,
+                          sdpa_kwargs=dict(use_causal_mask=True, diagonal_band_left_bound=128),
+                          d_qk=512, d_v=512, return_lse=True)
+        output, expected, amax, lse, expected_lse = result
+    else:
+        os.environ["FROST_THD_CLUSTERS"] = "1"
+        # Include keyless work as well as repeated live work on the same CTA.
+        output, expected, amax, lse, expected_lse = ref._run_thd(
+            [512, 256], [512, 0], 4, 1, "e4m3", torch.float16,
+            scale=512**-0.5, causal=True, swa_window=127,
+            stats=True, d_qk=512, d_v=512, with_lse_ref=True)
+    assert served, "the delayed D512 template did not serve the graph"
+    assert torch.isfinite(output).all()
+    ref._check(output, expected, torch.float16, "e4m3", d_qk=512)
+    torch.testing.assert_close(lse.float(), expected_lse.float(), atol=3e-3, rtol=3e-3)
+    assert abs(amax.item() - expected.abs().max().item()) <= 0.03
+    print("D512_DELAYED_SOFTMAX_PASS", json.dumps(served), flush=True)
+    """)
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("layout", ["dense", "thd"])
+@requires_blackwell
+@requires_dsl
+def test_d512_swa_waits_for_both_output_slices(tmp_path, layout):
+    """A delayed once-per-tile observer must not alias the twice-per-tile O-empty phase."""
+    from pathlib import Path
+
+    import torch
+    import cudnn
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("the two-slice SWA=128 reuse path belongs to SM100 D512 MXFP8")
+    script = tmp_path / "d512_delayed_softmax.py"
+    script.write_text(_D512_SWA_CHILD)
+    env = dict(os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "compiled"))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(Path(__file__).resolve().parents[2]), cudnn.__file__, layout, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    (tmp_path / "delayed_softmax.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+    assert proc.returncode == 0 and "D512_DELAYED_SOFTMAX_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"

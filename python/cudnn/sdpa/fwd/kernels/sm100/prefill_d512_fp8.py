@@ -837,6 +837,12 @@ def _kernel(
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _sg0_softmax_kv_iter(
     apply_mask: bool,
@@ -2175,7 +2181,10 @@ def _tmastg_warp_group(
         qh_per_kh,
         seqlen_kv,
     )
-    is_valid_tile = cutlass.Int32(1)
+    # sg0 does not store O or contribute scheduler read credits. It must not
+    # observe the ring: the credited roles could reuse its slot twice before
+    # this idle warp consumes a response, losing the terminal phase.
+    is_valid_tile = cutlass.Int32(is_sg1)
     sched_state = PipelineState.start()
 
     # Each per-sequence O map is immutable for this launch.
