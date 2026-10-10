@@ -98,6 +98,18 @@ explicit opt-in does not bypass the contract. The same pure capability predicate
 filters candidate knobs and selects the prepared executor. Static-geometry graph
 eligibility is unchanged.
 
+### Explicit scalar KV-tail split
+
+SM100/SM103/SM107 exact D128/V128 FP16/BF16 and per-tensor FP8 dense
+forward plans can explicitly combine split-KV with a mask-free, non-tile-aligned
+KV extent. The existing scalar-tail mask bounds each split; empty partitions
+emit the combine identity. No per-batch length tensor or execute-time staging
+is introduced. Native shape overrides may shrink KV within the declaration,
+with the requested O, Stats and FP8 Amax contracts preserved. CGA domains are
+unchanged (FP8 split uses CGA2). Other dimensions, MXFP8, dense padding and
+sink combinations retain their existing restrictions. Automatic scalar-tail
+selection remains unsplit pending independent tuning.
+
 > **Keeping this current is a hard rule.** A change to any FROST SDPA
 > `Capabilities` row, or adding/retiring an `EngineSpec`, updates this file in
 > the same commit — see `python/cudnn/sdpa/AGENTS.md` **Rule S2** and
@@ -474,7 +486,8 @@ with them; it pays when `B * H_kv` leaves SMs idle) and recombined by
 The declared `paged_attention_max_seq_len_kv` only sizes that cost model — a maximum
 that is not a multiple of the 128-row KV tile (FlashInfer passes its true max verbatim,
 e.g. 4000) does not withhold the split, unlike a mask-free dense `S_kv` off the tile, which rides
-the KV-tail mask the split cannot. Decode-shaped d128 units
+the KV-tail mask. Exact D128 now permits that scalar-tail split explicitly;
+automatic scalar-tail selection stays conservative. Decode-shaped d128 units
 (`S_q * PACK_G <= 128`, one decode tile's Q rowsᵈᵗ) launch one CTA per `(batch, packed
 head)` unit on the plain scheduler; the packed head holds `PACK_G` Q heads — the KV
 head's whole group when it divides the tile, its largest divisor that doesᵐ, a single Q
