@@ -2228,7 +2228,13 @@ def _softmax_warp_group(
         q_abs = q_row_coord + tid_in_wg
         swa_row_quadrant = tid_in_wg >> cutlass.Int32(5)
 
-        if cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
+        if cutlass.const_expr(_SWA_REUSE_P):
+            # O-empty completes twice per tile (one per Dv slice), so it cannot
+            # gate this once-per-tile consumer. The Q/O alias signal completes
+            # only after BOTH slices drain, and their stats/P depend on us.
+            # Its explicit bootstrap arrive is one phase ahead of O-empty.
+            bars.mb_q_o_alias.wait(epilogue_state ^ cutlass.Int32(1))
+        elif cutlass.const_expr(not CFG.FUSED_CORR_SPLIT_P):
             bars.mb_o_empty.wait(epilogue_state)
         if cutlass.const_expr(softmax_half == 0 and not CFG.FUSED_CORR_SPLIT_P):
             bars.mb_stat_empty.wait(stat_empty_phase)

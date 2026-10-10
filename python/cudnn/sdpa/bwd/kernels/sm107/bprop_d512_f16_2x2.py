@@ -304,6 +304,12 @@ class Dbg(NamedTuple):
     cslot: object = 0
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not _THD:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _dbg_record(dbg, status: int, bar_id: int, idx, phase, aux0, aux1, aux2, aux3, aux4, raw):
     """One elected lane writes this warp's record; the status word goes LAST so a half-written record never reads as set."""

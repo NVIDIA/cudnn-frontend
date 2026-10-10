@@ -203,6 +203,12 @@ def _exp2_mixed_late(vec):
     return cutlass.Vector.from_elements(tuple(values), cutlass.Float32)
 
 
+# Only the common dense CLC path has a single scheduler publisher.
+# THD/predecode retains local schedulers and broadcast credits.
+if not CFG.THD_VARLEN:
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
+
+
 @cute.jit
 def _wait_ptr(mb, phase):
     phase = cutlass.Int32(phase)

@@ -200,6 +200,25 @@ def read_tile_id_arrive(mb, cga_size: int, predicated: cutlass.Constexpr[bool] =
         )
 
 
+@cute.jit
+def read_tile_id_arrive_on_leader(mb, cga_size: int, predicated: cutlass.Constexpr[bool] = True):
+    """Credit the sole CLC publisher; peer credit objects are never advanced.
+
+    Dense CLC has no peer scheduler role. Its workers still wait for their
+    local payload, but credit only CTA 0 after decoding it. Broadcasting
+    credits would advance peer barriers with no successful phase observer.
+    Persistent THD and local predecode schedulers must keep the broadcast
+    helper above. ``predicated`` preserves that helper's call signature;
+    a single target needs only one elected lane for either lowering choice.
+    """
+    if nvvm.elect_sync():
+        if cutlass.const_expr(cga_size == 1):
+            nvvm.mbarrier_arrive(mb)
+        else:
+            peer_mb = nvvm.mapa(mb, cutlass.Int32(0))
+            nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA)
+
+
 class Sched(NamedTuple):
     mb_scheduler: object
     mb_read_tile_id: object
@@ -361,7 +380,10 @@ def scheduler_warp_loop(sched, sched_stages: int, is_cga_first_cta, cga_size: in
     argument turns that into a trace-time error rather than a cluster hang.
     """
     state = PipelineState.start()
-    is_valid = cutlass.Int32(1)
+    # Only the leader publishes CLC responses. Peer scheduler warps are not
+    # counted in read_tile_id credits, so letting them observe the ring lets
+    # the producer lap their parity wait. They have no work to do here.
+    is_valid = cutlass.Int32(is_cga_first_cta)
 
     while is_valid > cutlass.Int32(0):
         wait(sched.mb_read_tile_id.subview(state.idx), state.phase)
