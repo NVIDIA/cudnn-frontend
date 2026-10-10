@@ -14,7 +14,9 @@ Three tiers:
 
 * host, no device: the primitive imports nothing kernel-private and nothing of the pre-upstream DSL; the ``cta_group``
   contract; the CuTe DSL version gate (AGENTS.md Rule 7) -- a DSL below the floor and a DSL without the ``sm_107a``
-  target are each refused by NAME, before any atom import (a controlled probe over the version state, no real downgrade).
+  target are each refused by NAME, before any atom import (a controlled probe over the version state, no real downgrade);
+  the HOST entry of that gate is ``tile_dsl.requirements`` (no cutlass import -- ``test_tile_dsl_requirements.py`` proves
+  it importable below the floor in a fresh process, which the probes here, run after importing ``tma``, cannot).
 * host, an ``sm_107a`` trace-compile (any box whose cutlass-dsl knows the arch): the PTX carries one
   ``tile::gather4 ... cta_group::N.L2::cache_hint`` per issue of the per-warp body, the ``ld.global.nc.v4.s32`` id load and
   the opaque ``mov.b64`` of the EVICT_LAST hint; with an nvdisasm that decodes the cubin, the SASS carries one
@@ -73,8 +75,12 @@ def test_gather4_primitive_imports_nothing_private_and_nothing_of_the_old_dsl():
         for line in code.splitlines():
             if line.startswith(("import ", "from ")):
                 assert line.startswith(("import cutlass", "from cutlass", "from .", "from typing", "from dataclasses", "import enum")), f"{name}: {line}"
+    for line in _code_lines(_tile_dsl_source("requirements.py")).splitlines():
+        if line.startswith(("import ", "from ")):
+            assert "cutlass" not in line, f"requirements.py (the host gate) must import nothing from the DSL: {line}"
     tma_src = _tile_dsl_source("tma.py")
     assert "def tma_gather4(" in tma_src and "def ldg_int32x4(" in tma_src and "def opaque_i64(" in tma_src
+    assert "def tma_gather4_requirement_error(" in _tile_dsl_source("requirements.py")
     assert "TMA_L2_EVICT_LAST = 0x14F0000000000000" in tma_src
     assert "def apply_membership_words(" in _tile_dsl_source("mask.py")
 
@@ -87,12 +93,16 @@ def test_tma_gather4_rejects_a_cta_group_outside_1_2():
 
 
 def test_tma_gather4_declines_a_dsl_below_the_floor_by_name(monkeypatch):
-    """Rule 7: a DSL below ``CUTEDSL_MIN_VERSION`` is refused by the gate -- host-callable and at trace time, BEFORE the
-    inline-asm atom import -- with a message naming the installed and the required version (never an ``AttributeError``
-    from inside the DSL).  The version state is substituted, not the wheel."""
+    """Rule 7: a DSL below ``CUTEDSL_MIN_VERSION`` is refused by the gate -- host-callable (``tile_dsl.requirements``, which
+    ``tma`` re-exports) and at trace time, BEFORE the inline-asm atom import -- with a message naming the installed and the
+    required version (never an ``AttributeError`` from inside the DSL).  The version state is substituted, not the wheel;
+    the below-floor IMPORT of the host entry is ``test_tile_dsl_requirements.py``'s fresh-process pin."""
     import cudnn.frost.buffers as buffers
-    from cudnn.frost.tile_dsl.tma import tma_gather4, tma_gather4_requirement_error
+    import cudnn.frost.tile_dsl.tma as tma
+    from cudnn.frost.tile_dsl.requirements import tma_gather4_requirement_error
+    from cudnn.frost.tile_dsl.tma import tma_gather4
 
+    assert tma.tma_gather4_requirement_error is tma_gather4_requirement_error, "tma re-exports the host module's gate"
     assert tma_gather4_requirement_error() is None, "the installed DSL satisfies the floor (requires_dsl)"
     monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
     msg = tma_gather4_requirement_error()
@@ -106,7 +116,7 @@ def test_tma_gather4_declines_a_dsl_without_the_sm_107a_target_by_name(monkeypat
     is refused by name through the host-callable gate the adapters run before importing their kernel module; the gate
     is silent for a part the DSL serves."""
     import cudnn.frost.buffers as buffers
-    from cudnn.frost.tile_dsl.tma import tma_gather4_requirement_error
+    from cudnn.frost.tile_dsl.requirements import tma_gather4_requirement_error
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
     msg = tma_gather4_requirement_error((10, 7))
@@ -158,7 +168,7 @@ def _stream():
 
 
 def _skip_unless_the_dsl_serves_this_part():
-    from cudnn.frost.tile_dsl.tma import tma_gather4_requirement_error
+    from cudnn.frost.tile_dsl.requirements import tma_gather4_requirement_error
 
     msg = tma_gather4_requirement_error(tuple(torch.cuda.get_device_capability()))
     if msg is not None:

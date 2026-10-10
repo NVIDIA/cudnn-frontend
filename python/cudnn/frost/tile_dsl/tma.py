@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 
 from .swizzle import swizzle_xor_128b
+from .requirements import tma_gather4_requirement_error  # noqa: F401  re-export; the HOST entry is tile_dsl.requirements
 
 
 def _advance(x, n):
@@ -559,26 +560,15 @@ _GATHER4_CONSTRAINTS = "r,l,r,r,r,r,r,r,l"
 _PAIR_LEADER_MBAR_MASK = -0x1000001
 
 
-def tma_gather4_requirement_error(device_cc=None):
-    """The CuTe DSL version gate of :func:`tma_gather4` (AGENTS.md Rule 7), host-callable: a message naming the
-    installed DSL when it is below the library floor (``cutedsl_requirement_error``), else -- when ``device_cc`` is
-    given -- the message of ``cutedsl_arch_requirement_error`` for a DSL without the part's target (an SM107 part needs
-    the public 4.8.0 wheel, the first whose ``Arch`` knows ``sm_107a``), else ``None``.
-
-    An adapter's ``check_support`` calls this BEFORE importing its kernel module, so a too-old DSL reads as a version
-    problem instead of a ``KeyError('sm_107a')`` / ``AttributeError`` from inside the DSL; :func:`tma_gather4` runs the
-    version half again at trace time, before it imports the ``llvm`` inline-asm atom.  Plain Python: no DSL import, no
-    device query (``tile_dsl`` never queries the device; the cc is the API layer's fact)."""
-    from ..buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
-
-    msg = cutedsl_requirement_error("tile_dsl.tma.tma_gather4")
-    if msg is None and device_cc is not None:
-        msg = cutedsl_arch_requirement_error(tuple(device_cc))
-    return msg
+# The HOST half of the Rule-7 gate, ``tma_gather4_requirement_error``, lives in ``tile_dsl/requirements.py`` -- a module
+# with NO cutlass import, so an adapter's ``check_support`` can import it on a DSL below the floor, where THIS module's
+# ``cutlass.experimental`` import (line 5) fails before any function here could run -- and is re-exported above for
+# callers that already hold the DSL.
 
 
 def _require_gather4_dsl():
-    """Trace-time half of the Rule-7 gate: raise (naming the version) before any atom import."""
+    """Trace-time half of the Rule-7 gate: raise (naming the version) before any atom import -- the host half is
+    :func:`tile_dsl.requirements.tma_gather4_requirement_error`."""
     msg = tma_gather4_requirement_error()
     if msg is not None:
         raise RuntimeError(msg)
@@ -643,7 +633,8 @@ def tma_gather4(desc, dst_smem, mbar, col, r0, r1, r2, r3, *, cta_group: int = 1
     One elected lane per CTA issues; the caller elects (this is a trace-time macro, like
     ``tma_load_tile``'s inner op).  Bytes per issue = ``4 * cols * BPE``.  Gate: a DSL below the
     library floor raises here, naming the version, before the inline-asm atom is imported
-    (:func:`tma_gather4_requirement_error`, AGENTS.md Rule 7).
+    (the host half is :func:`tile_dsl.requirements.tma_gather4_requirement_error`, importable below the
+    floor; AGENTS.md Rule 7).
     """
     if cutlass.const_expr(cta_group not in (1, 2)):
         raise ValueError(f"tma_gather4: cta_group must be 1 or 2, got {cta_group}")
