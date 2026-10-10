@@ -4,6 +4,8 @@
  */
 
 #include "../utils/helpers.h"
+#include <chrono>
+#include <thread>
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 
@@ -759,5 +761,120 @@ TEST_CASE("ALiBi slopes outlive the frontend graph in a CUDA graph", "[cudagraph
         CUDA_CHECK(cudaGraphExecDestroy(cuda_graph_exec));
         CUDA_CHECK(cudaGraphDestroy(cudnn_cuda_graph));
     }
+#endif  // CUDART_VERSION < 12000
+}
+
+/*
+With CudaGraphRetention_t::NONE, the CUDA graphs recorded from a frontend graph hold no reference to its
+execution plans: destroying the frontend graph and then the CUDA graph releases nothing through the
+deferred-release queue. With PER_GRAPH (the default), the CUDA graph's reference to the plan is queued
+for release once the CUDA graph is gone.
+*/
+TEST_CASE("CUDA graph retention option", "[cudagraph][graph]") {
+#if (CUDART_VERSION < 12000)
+    SKIP("Test requires cuda toolkit 12.0 or above");
+#else
+    namespace fe = cudnn_frontend;
+    using fe::detail::CudaGraphRetainedResource;
+    if (cudnnGetCudartVersion() < 12000) {
+        SKIP("Test requires cuda toolkit 12.0 or above");
+    }
+    auto handle_ptr = create_cudnn_handle();
+    auto handle     = *handle_ptr;
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    REQUIRE(cudnnSetStream(handle, stream) == CUDNN_STATUS_SUCCESS);
+
+    int64_t const b = 1, h = 4, s = 64, d = 64;
+    Surface<half> q_gpu(b * h * s * d);
+    Surface<half> k_gpu(b * h * s * d);
+    Surface<half> v_gpu(b * h * s * d);
+    Surface<half> o_gpu(b * h * s * d);
+    std::unordered_map<fe::graph::Tensor_attributes::uid_t, void *> variant_pack = {
+        {101, q_gpu.devPtr}, {102, k_gpu.devPtr}, {103, v_gpu.devPtr}, {104, o_gpu.devPtr}};
+
+    auto record_and_release = [&](fe::CudaGraphRetention_t retention) -> bool {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_cuda_graph_retention(retention);
+        REQUIRE(graph->get_cuda_graph_retention() == retention);
+        graph->set_io_data_type(fe::DataType_t::HALF)
+            .set_intermediate_data_type(fe::DataType_t::FLOAT)
+            .set_compute_data_type(fe::DataType_t::FLOAT);
+        auto qkv = [&](char const *name, int64_t uid) {
+            return graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name(name)
+                                     .set_uid(uid)
+                                     .set_dim({b, h, s, d})
+                                     .set_stride({h * s * d, s * d, d, 1}));
+        };
+        auto [o, stats] = graph->sdpa(qkv("Q", 101),
+                                      qkv("K", 102),
+                                      qkv("V", 103),
+                                      fe::graph::SDPA_attributes().set_generate_stats(false).set_attn_scale(0.125f));
+        (void)stats;
+        o->set_output(true).set_uid(104).set_dim({b, h, s, d}).set_stride({h * s * d, s * d, d, 1});
+        REQUIRE(graph->validate().is_good());
+        REQUIRE(graph->build_operation_graph(handle).is_good());
+        REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+        graph->select_behavior_notes({fe::BehaviorNote_t::RUNTIME_COMPILATION});
+        if (graph->check_support().is_bad()) {
+            return false;
+        }
+        REQUIRE(graph->build_plans().is_good());
+        Surface<int8_t> workspace(graph->get_workspace_size());
+
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<half> reference(o_gpu.size);
+        CUDA_CHECK(cudaMemcpy(reference.data(), o_gpu.devPtr, sizeof(half) * o_gpu.size, cudaMemcpyDeviceToHost));
+
+        CudaGraphRetainedResource::drain_deferred_releases();  // also run by the execute above
+        REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
+
+        cudaGraph_t cuda_graph;
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        REQUIRE(graph->execute(handle, variant_pack, workspace.devPtr).is_good());
+        CUDA_CHECK(cudaStreamEndCapture(stream, &cuda_graph));
+        cudaGraphExec_t exec;
+        CUDA_CHECK(cudaGraphInstantiate(&exec, cuda_graph, nullptr, nullptr, 0));
+
+        // The frontend graph stays alive across the replay, as NONE requires.
+        CUDA_CHECK(cudaMemsetAsync(o_gpu.devPtr, 0, sizeof(half) * o_gpu.size, stream));
+        CUDA_CHECK(cudaGraphLaunch(exec, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<half> replayed(o_gpu.size);
+        CUDA_CHECK(cudaMemcpy(replayed.data(), o_gpu.devPtr, sizeof(half) * o_gpu.size, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < replayed.size(); ++i) {
+            REQUIRE(__half2float(replayed[i]) == __half2float(reference[i]));
+        }
+
+        graph.reset();
+        CUDA_CHECK(cudaGraphExecDestroy(exec));
+        CUDA_CHECK(cudaGraphDestroy(cuda_graph));
+        // User-object destructors run asynchronously; give them time.
+        for (int i = 0; i < 200 && !CudaGraphRetainedResource::has_deferred_releases(); ++i) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return true;
+    };
+
+    SECTION("PER_GRAPH: the CUDA graph's reference to the plan is released once the CUDA graph is gone") {
+        if (!record_and_release(fe::CudaGraphRetention_t::PER_GRAPH)) {
+            SKIP("No runtime-compiled engine for this SDPA graph.");
+        }
+        REQUIRE(CudaGraphRetainedResource::has_deferred_releases());
+        CudaGraphRetainedResource::drain_deferred_releases();
+    }
+
+    SECTION("NONE: the CUDA graph holds no reference") {
+        if (!record_and_release(fe::CudaGraphRetention_t::NONE)) {
+            SKIP("No runtime-compiled engine for this SDPA graph.");
+        }
+        REQUIRE_FALSE(CudaGraphRetainedResource::has_deferred_releases());
+    }
+
+    REQUIRE(cudnnSetStream(handle, nullptr) == CUDNN_STATUS_SUCCESS);
+    CUDA_CHECK(cudaStreamDestroy(stream));
 #endif  // CUDART_VERSION < 12000
 }

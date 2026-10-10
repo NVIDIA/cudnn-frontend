@@ -215,6 +215,26 @@ python -m cudnn.collect_env
 
 If `import cudnn` itself fails, download [collect_env.py](python/cudnn/collect_env.py) and run it standalone with any Python.
 
+### CUDA graph retention
+
+A CUDA graph recorded from a graph (stream capture of `execute()`, or `populate_cuda_graph()`) holds references to the execution plans and kernel code it launches, so it stays valid after the graph is destroyed. Launching a CUDA graph that holds such references takes slightly longer. Applications that keep each graph alive for as long as the CUDA graphs recorded from it can turn the references off:
+
+```cpp
+graph.set_cuda_graph_retention(cudnn_frontend::CudaGraphRetention_t::NONE);  // before building plans
+```
+
+```python
+graph = cudnn.pygraph(..., cuda_graph_retention=cudnn.cuda_graph_retention.NONE)
+```
+
+or for the whole process, for graphs that do not set it:
+
+```bash
+export CUDNN_CUDA_GRAPH_RETENTION=none   # default: per_graph
+```
+
+The variable is shared with the cuDNN backend, so with cuDNN 9.28 or newer it turns off the backend's references too; the graph setting is also passed to the backend. With cuDNN 9.27, whose backend always keeps its references, only the frontend's are removed.
+
 ### Overriding the CUDA runtime library
 
 When the frontend is built with dynamic loading enabled, it locates the CUDA runtime
