@@ -154,13 +154,23 @@ Layernorm_attributes&
 set_compute_data_type(DataType_t value)
 ```
 
+`scale` and `bias` are optional; pass `nullptr` (Python: `None`). Verified on Hopper with cuDNN 9.12, 9.14, 9.18, 9.20, 9.24 and
+9.27, and on Ampere and Blackwell with 9.27; older backends were not qualified.
+
+- **Scale without bias** (`nn.LayerNorm(bias=False)`) works for any shape. As with a bias, the training `mean` and
+  `variance` dims are `input`'s dims with 1 wherever `scale` is not 1.
+- **Bias without scale** is refused with `INVALID_VALUE`, because the backend rejects it. Pass a scale of ones.
+- **Neither:** nothing states the normalization axes, so the same rule as [RMSNorm without a scale](#rmsnorm-graph-api)
+  applies. `input` may have at most one non-unit dimension after the first, or, in training, the caller sets the
+  `mean` and `variance` dims.
+
 ### Python API
 
 - layernorm
     - norm_forward_phase
     - input
-    - scale
-    - bias
+    - scale (optional)
+    - bias (optional)
     - epsilon
     - compute_data_type
     - name
@@ -271,13 +281,15 @@ AdaLayernorm_attributes&
 set_compute_data_type(DataType_t value)
 ```
 
+`bias` is optional; pass `nullptr` (Python: `None`, the default). `scale` is required.
+
 ### Python API
 
 - adalayernorm
     - norm_forward_phase
     - input
     - scale
-    - bias
+    - bias (optional)
     - epsilon
     - compute_data_type
     - name

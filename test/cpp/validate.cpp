@@ -367,3 +367,77 @@ TEST_CASE("Rmsnorm forward without scale", "[graph][rmsnorm][validate]") {
     // Explicit INV_VARIANCE dims state the axes.
     REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, {4, 16, 1}).first->validate().is_good());
 }
+
+TEST_CASE("Layernorm forward with optional scale and bias", "[graph][layernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    // affine: 0 = scale only, 1 = bias only, 2 = neither (scale/bias over the last axis)
+    auto make = [](std::vector<int64_t> x_dim, fe::NormFwdPhase_t phase, int affine, std::vector<int64_t> stats_dim) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        auto packed = [](std::vector<int64_t> const& d) {
+            std::vector<int64_t> s(d.size(), 1);
+            for (int i = static_cast<int>(d.size()) - 2; i >= 0; i--) s[i] = s[i + 1] * d[i + 1];
+            return s;
+        };
+        auto X = graph->tensor(fe::graph::Tensor_attributes().set_name("X").set_dim(x_dim).set_stride(packed(x_dim)));
+        std::vector<int64_t> affine_dim(x_dim.size(), 1);
+        affine_dim.back() = x_dim.back();
+        auto make_affine  = [&](char const* name) {
+            return graph->tensor(
+                fe::graph::Tensor_attributes().set_name(name).set_dim(affine_dim).set_stride(packed(affine_dim)));
+        };
+        std::shared_ptr<fe::graph::Tensor_attributes> scale = affine == 0 ? make_affine("scale") : nullptr;
+        std::shared_ptr<fe::graph::Tensor_attributes> bias  = affine == 1 ? make_affine("bias") : nullptr;
+        auto epsilon                                        = graph->tensor(1e-5f);
+        auto options            = fe::graph::Layernorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        auto [Y, mean, inv_var] = graph->layernorm(X, scale, bias, options);
+        Y->set_output(true);
+        for (auto const& T : {mean, inv_var}) {
+            if (!T) continue;
+            T->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+            if (!stats_dim.empty()) T->set_dim(stats_dim).set_stride(packed(stats_dim));
+        }
+        return std::make_pair(graph, inv_var);
+    };
+
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        // Scale without bias (LayerNorm(bias=False)). This used to dereference the null bias.
+        auto [graph, inv_var] = make({4, 16, 128}, phase, 0, {});
+        REQUIRE(graph->validate().is_good());
+        if (inv_var) REQUIRE(inv_var->get_dim() == std::vector<int64_t>{4, 16, 1});
+
+        // The backend refuses a bias without a scale; say so before it does.
+        REQUIRE(make({4, 16, 128}, phase, 1, {}).first->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+
+        // Neither: unambiguous with one non-unit axis after the first, refused otherwise (as for rmsnorm).
+        auto [plain, plain_inv_var] = make({64, 128, 1, 1}, phase, 2, {});
+        REQUIRE(plain->validate().is_good());
+        if (plain_inv_var) REQUIRE(plain_inv_var->get_dim() == std::vector<int64_t>{64, 1, 1, 1});
+        REQUIRE(make({4, 16, 128}, phase, 2, {}).first->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+    }
+
+    // Explicit stats dims state the axes.
+    REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, 2, {4, 16, 1}).first->validate().is_good());
+}
+
+TEST_CASE("AdaLayernorm forward without bias", "[graph][adalayernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        auto X = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("X").set_dim({4, 16, 128}).set_stride({16 * 128, 128, 1}));
+        auto scale = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("scale").set_dim({4, 1, 128}).set_stride({128, 128, 1}));
+        auto epsilon = graph->tensor(1e-5f);
+        auto options = fe::graph::AdaLayernorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        // The Python binding has always defaulted bias to None; the C++ node used to dereference it.
+        auto [Y, mean, inv_var] = graph->adalayernorm(X, scale, nullptr, options);
+        Y->set_output(true);
+        if (mean) mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+        if (inv_var) inv_var->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+        REQUIRE(graph->validate().is_good());
+    }
+}

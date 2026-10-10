@@ -3296,9 +3296,14 @@ Graph::layernorm(std::shared_ptr<Tensor_attributes> x,
             output_tensor(attributes.name + "::INV_VARIANCE");
     }
     // Set inputs
-    attributes.inputs[Layernorm_attributes::input_names::X]     = x;
-    attributes.inputs[Layernorm_attributes::input_names::SCALE] = scale;
-    attributes.inputs[Layernorm_attributes::input_names::BIAS]  = bias;
+    attributes.inputs[Layernorm_attributes::input_names::X] = x;
+    // scale and bias are optional (#188); keep nullptr out of the inputs map
+    if (scale) {
+        attributes.inputs[Layernorm_attributes::input_names::SCALE] = scale;
+    }
+    if (bias) {
+        attributes.inputs[Layernorm_attributes::input_names::BIAS] = bias;
+    }
 
     sub_nodes.emplace_back(std::make_unique<LayerNormNode>(std::move(attributes), context));
 
@@ -3323,7 +3328,10 @@ Graph::adalayernorm(std::shared_ptr<Tensor_attributes> x,
     // Set inputs
     attributes.inputs[AdaLayernorm_attributes::input_names::X]     = x;
     attributes.inputs[AdaLayernorm_attributes::input_names::SCALE] = scale;
-    attributes.inputs[AdaLayernorm_attributes::input_names::BIAS]  = bias;
+    // bias is optional (#188); keep nullptr out of the inputs map
+    if (bias) {
+        attributes.inputs[AdaLayernorm_attributes::input_names::BIAS] = bias;
+    }
 
     sub_nodes.emplace_back(std::make_unique<AdaLayerNormNode>(std::move(attributes), context));
 

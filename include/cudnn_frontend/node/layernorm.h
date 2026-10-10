@@ -44,37 +44,36 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
         auto scale_bias_dim = X->get_dim();
         scale_bias_dim[0]   = 1;
 
-        auto scale = attributes.inputs[Layernorm_attributes::input_names::SCALE];
-        // Only infer dims and strides if user did not set them
-        if (scale->get_dim().empty()) {
-            scale->set_dim(scale_bias_dim);
-        }
-        if (scale->get_stride().empty()) {
-            auto const& scale_dim = scale->get_dim();
-            std::vector<int64_t> stride_order;
-            CHECK_CUDNN_FRONTEND_ERROR(
-                detail::generate_stride_order_preserving_format(X->get_stride(), scale_dim.size(), stride_order));
-            scale->set_stride(detail::generate_stride(scale_dim, stride_order));
-        }
+        // scale and bias are optional (#188); an absent one is nullptr or missing from the inputs map
+        auto optional_input = [this](Layernorm_attributes::input_names name) -> std::shared_ptr<Tensor_attributes> {
+            auto it = attributes.inputs.find(name);
+            return it != attributes.inputs.end() ? it->second : nullptr;
+        };
+        auto scale = optional_input(Layernorm_attributes::input_names::SCALE);
+        auto bias  = optional_input(Layernorm_attributes::input_names::BIAS);
 
-        auto bias = attributes.inputs[Layernorm_attributes::input_names::BIAS];
-        // Only infer dims and strides if user did not set them
-        if (bias->get_dim().empty()) {
-            bias->set_dim(scale_bias_dim);
-        }
-        if (bias->get_stride().empty()) {
-            auto const& bias_dim = bias->get_dim();
-            std::vector<int64_t> stride_order;
-            CHECK_CUDNN_FRONTEND_ERROR(
-                detail::generate_stride_order_preserving_format(X->get_stride(), bias_dim.size(), stride_order));
-            bias->set_stride(detail::generate_stride(bias_dim, stride_order));
+        for (auto const& T : {scale, bias}) {
+            if (T == nullptr) {
+                continue;
+            }
+            // Only infer dims and strides if user did not set them
+            if (T->get_dim().empty()) {
+                T->set_dim(scale_bias_dim);
+            }
+            if (T->get_stride().empty()) {
+                auto const& T_dim = T->get_dim();
+                std::vector<int64_t> stride_order;
+                CHECK_CUDNN_FRONTEND_ERROR(
+                    detail::generate_stride_order_preserving_format(X->get_stride(), T_dim.size(), stride_order));
+                T->set_stride(detail::generate_stride(T_dim, stride_order));
+            }
         }
 
         if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
-            // stats dim is x where scale == 1 else 1
+            // stats dim is x where scale == 1 else 1; without a scale, n,1,1,1
             auto stats_dim = X->get_dim();
             for (size_t i = 0; i < stats_dim.size(); i++) {
-                if (scale->get_dim()[i] != 1) {
+                if (scale ? scale->get_dim()[i] != 1 : i > 0) {
                     stats_dim[i] = 1;
                 }
             }
@@ -131,6 +130,38 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "Forward phase not set of layernorm node.");
 
+        auto has_input = [this](Layernorm_attributes::input_names name) {
+            auto it = attributes.inputs.find(name);
+            return it != attributes.inputs.end() && it->second != nullptr;
+        };
+        bool const has_scale = has_input(Layernorm_attributes::input_names::SCALE);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(!has_scale && has_input(Layernorm_attributes::input_names::BIAS),
+                                       error_code_t::INVALID_VALUE,
+                                       "Layernorm with a bias requires a scale (pass a scale of ones).");
+
+        // Without scale or bias the backend picks the normalization axes by rank (inference) or from the stats dims
+        // (training), so accept only graphs where those agree, as for rmsnorm (#188).
+        if (!has_scale) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(!has_input(Layernorm_attributes::input_names::X),
+                                           error_code_t::ATTRIBUTE_NOT_SET,
+                                           "Tensor X not set of layernorm node.");
+            auto const& x_dim = attributes.inputs.at(Layernorm_attributes::input_names::X)->get_dim();
+            auto const non_unit_axes =
+                x_dim.empty() ? 0 : std::count_if(x_dim.begin() + 1, x_dim.end(), [](int64_t d) { return d != 1; });
+            bool stats_dims_set = false;
+            if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
+                auto const inv_var_it = attributes.outputs.find(Layernorm_attributes::output_names::INV_VARIANCE);
+                stats_dims_set        = inv_var_it != attributes.outputs.end() && inv_var_it->second != nullptr &&
+                                 !inv_var_it->second->get_dim().empty();
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(
+                non_unit_axes > 1 && !stats_dims_set,
+                error_code_t::INVALID_VALUE,
+                "Layernorm without scale: X has more than one non-unit dimension after the first, so the normalization "
+                "axes are ambiguous. Pass a scale, reshape X to {rows, hidden, 1, 1}, or (training) set the MEAN and "
+                "INV_VARIANCE dims.");
+        }
+
         return {error_code_t::OK, ""};
     }
 
@@ -181,24 +212,28 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
                                                        1,
                                                        &x_desc));
 
-        // Set scale and bias tensors
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Layernorm_attributes::input_names::SCALE);
-        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+        // Set the optional scale and bias tensors
+        auto SCALE = attributes.inputs.find(Layernorm_attributes::input_names::SCALE);
+        if ((SCALE != attributes.inputs.end()) && (SCALE->second != nullptr)) {
+            auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &scale_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_SCALE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &scale_desc));
+        }
 
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(BIAS, Layernorm_attributes::input_names::BIAS);
-        auto bias_desc = tensors.at(BIAS->second->get_uid())->get_raw_desc();
+        auto BIAS = attributes.inputs.find(Layernorm_attributes::input_names::BIAS);
+        if ((BIAS != attributes.inputs.end()) && (BIAS->second != nullptr)) {
+            auto bias_desc = tensors.at(BIAS->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &bias_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(layernorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &bias_desc));
+        }
 
         // Set epsilon tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(EPSILON, Layernorm_attributes::input_names::EPSILON);
