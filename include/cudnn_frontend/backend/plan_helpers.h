@@ -8,7 +8,7 @@
 #include <sstream>
 #include <vector>
 
-#include "cudnn.h"
+#include <cudnn.h>
 
 #include "backend_descriptor.h"
 #include "../knobs.h"
