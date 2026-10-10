@@ -1634,7 +1634,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """The ``TemplateParams.bias_mode`` of this plan: 0 without a bias; else the request (``bias_mode=``, validated by
         ``check_support``) or the pick at the plan's width and item form (``config_sm107.sm107_bias_mode_pick``: the resident block
         where it holds S_kv, else the streamed ring -- the pair item's in its cluster-multicast form at the measured widths under
-        global lengths and the NATURAL scheduler; 0 = no form fits -- ``check_support`` declines that typed)."""
+        global lengths (``seq_kv_lens_present`` False: the lowering sets it for real per-batch lengths AND for a dense S_kv tail it
+        serves through synthesized ones, so that tail keeps the cga1 ring) and the NATURAL scheduler; 0 = no form fits --
+        ``check_support`` declines that typed)."""
         if self.bias_desc is None:
             return _BIAS_MODE_NONE
         _cga = self._resident_arm_cga()

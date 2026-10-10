@@ -883,8 +883,10 @@ def sm107_bias_mode_pick(
     form does not fit here -- honoured or declined, never degraded.  ONE arithmetic for the engine row, the heuristics' width pick and
     the adapter (rule 8b').  The PAIR item's ring takes its cluster-MULTICAST form (``BIAS_MODE_STREAMED_MULTICAST``) at a width in
     :data:`SM107_PAIR_RING_MULTICAST_D_FLAVORS` when the caller vouches for the two facts the form needs -- ``global_lengths`` (no
-    per-batch KV / Q lengths) and ``natural`` (the NATURAL scheduler pairs the cluster's chunks) -- both False by default, so a
-    caller that cannot vouch gets the cga1 ring as before (the adapter and the engine row pass them)."""
+    per-batch KV / Q lengths; a dense S_kv tail the lowering serves through SYNTHESIZED per-batch lengths, ``engines._synth_kv_padding``,
+    is NOT global either: the adapter sees ``seq_kv_lens_present`` and the row reads the same predicate, so a dense mask-free bias graph
+    whose S_kv is not a KV-tile multiple keeps the cga1 ring) and ``natural`` (the NATURAL scheduler pairs the cluster's chunks) -- both
+    False by default, so a caller that cannot vouch gets the cga1 ring as before (the adapter and the engine row pass them)."""
     want = request if request is not None else _BIAS_MODE_OVERRIDE_FOR_SWEEPS
     resident_ok = s_kv <= sm107_bias_resident_s_kv_max(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair, tiles_q=tiles_q)
     ring_ok = sm107_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair) > 0
@@ -917,7 +919,9 @@ def sm107_bias_mode_pick(
 # B 2 (+3.09 / +2.05 / +3.07 / +2.31 / +2.79 % at n4; +0.71 % at S 512 B 2, NEUTRAL at S 512 B 1).  NOT the 64-wide tile: -6.3 /
 # -10.1 % at S 1024 / 512 (its wider bias row feeds two CTAs no better than one) -- the frozenset holds the measured flavor only.
 # Where the pair's RESIDENT block holds S_kv the block stays (the multicast ring loses to it: -4.70 % at S 384, -1.87 % at S 640);
-# the one-batch-entry item (S_q % 256 == 0) keeps its own ring, 5..9 % ahead of every pair form at S 512 / 768 / 1024.
+# the one-batch-entry item (S_q % 256 == 0) keeps its own ring, 5..9 % ahead of every pair form at S 512 / 768 / 1024.  The class is
+# the pair ring under GLOBAL lengths: a dense S_kv tail (S_kv % 128 != 0 with no mask covering it) runs the kernel's padded path with
+# synthesized per-batch lengths and keeps the cga1 ring -- unmeasured for the multicast form (every measured cell was a 128-multiple).
 SM107_PAIR_RING_MULTICAST_D_FLAVORS = frozenset({32})
 
 # The one-batch-entry item's streamed ring runs 2 stages, not the deepest that fits: its 64 KiB stage x 3 buys a lookahead the

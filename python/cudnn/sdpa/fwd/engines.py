@@ -935,20 +935,26 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
         for cga in widths
     }
     # the pair ring's cluster-multicast default needs global lengths and the NATURAL scheduler (the pick's two facts; a knob-less graph
-    # derives NATURAL on this device) -- with either fact absent the pick is the cga1 ring, exactly the adapter's arithmetic
+    # derives NATURAL on this device) -- with either fact absent the pick is the cga1 ring, exactly the adapter's arithmetic.  GLOBAL
+    # lengths = what the adapter will SEE: a dense S_kv tail (S_kv % skv_tile != 0, no mask covering it) is served through the kernel's
+    # padded path with SYNTHESIZED per-batch lengths (_synth_kv_padding -- the lowering passes seq_kv_lens_present=True to the adapter,
+    # whose _resident_arm_bias_mode then picks the cga1 ring), so the row reads the lowering's predicate too (rule 8b: one form per plan).
     _natural = knobs is None or knobs.sched_policy is None or knobs.sched_policy == SCHED_NATURAL
+    _global_lengths = not (facts.padded or facts.seq_q_trim or _synth_kv_padding(capabilities, facts))
     modes = {
-        cga: sm107_bias_mode_pick(
-            selected[0], cga, facts.s_kv, pair=_pair[cga], tiles_q=_wgs[cga], global_lengths=not (facts.padded or facts.seq_q_trim), natural=_natural
-        )
+        cga: sm107_bias_mode_pick(selected[0], cga, facts.s_kv, pair=_pair[cga], tiles_q=_wgs[cga], global_lengths=_global_lengths, natural=_natural)
         for cga in widths
     }
     if any(mode == BIAS_MODE_STREAMED_MULTICAST for mode in modes.values()):
         # The multicast bias ring (bias_mode 3: the pair ring's measured default at D 32, or the test seam's / the adapter's request):
         # ONE kv-tile sequence streamed to both CTAs of a cluster, so the two chunks' step bounds must be the same function of (q tile,
-        # S_q, S_kv) -- per-batch lengths break that lockstep; the chunk pairing rides the NATURAL payload (the config validator pins both).
-        if facts.padded or facts.seq_q_trim:
-            return "the multicast bias ring (bias_mode 3) streams one kv-tile sequence to both CTAs of a cluster; per-batch lengths are served by the cga1 ring only"
+        # S_q, S_kv) -- per-batch lengths break that lockstep (the synthesized ones of a dense S_kv tail included: the adapter declines
+        # them typed, so the row does too); the chunk pairing rides the NATURAL payload (the config validator pins both).
+        if not _global_lengths:
+            return (
+                "the multicast bias ring (bias_mode 3) streams one kv-tile sequence to both CTAs of a cluster; per-batch lengths "
+                f"({'synthesized for the dense S_kv tail ' + str(facts.s_kv) if not (facts.padded or facts.seq_q_trim) else 'real'}) are served by the cga1 ring only"
+            )
         if knobs is not None and knobs.sched_policy is not None and knobs.sched_policy != SCHED_NATURAL:
             return f"the multicast bias ring (bias_mode 3) pairs chunks through the NATURAL scheduler's payload; got sched_policy={knobs.sched_policy}"
     if all(mode == BIAS_MODE_NONE for mode in modes.values()):

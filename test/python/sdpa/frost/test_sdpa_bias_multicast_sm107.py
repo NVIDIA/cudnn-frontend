@@ -15,8 +15,12 @@ ordered after the thread's generic loads of the stage it frees; same SASS on sm_
 SHORTER tail chunk runs the ring-only GHOST handshake for every fill
 the leader issues beyond its own steps, so both rings stay in lockstep.  The L2 -> SMEM bias feed of the pair item is halved; O / Stats
 are BITWISE the cga1 ring's (same tiles, same order, same FFMA).  Served with GLOBAL lengths only (per-row lengths would make the two
-chunks' kv-tile sequences differ) under the NATURAL scheduler; a REQUEST-ONLY form (the adapter's ``bias_mode=3`` / the test seam):
-``sm107_bias_mode_pick`` never picks it by itself, so no Capabilities row moves.
+chunks' kv-tile sequences differ) under the NATURAL scheduler.  The MEASURED default of ONE class (``sm107_bias_mode_pick`` with the
+two facts the adapter and the engine row pass): the PAIR item's ring at D 32 where the pair's resident block does not hold S_kv, under
+GLOBAL lengths -- no per-batch lengths, neither real ones nor the ones the lowering SYNTHESIZES for a dense S_kv tail (``S_kv % 128 != 0``
+with no mask covering it: ``engines._synth_kv_padding``, the padded kernel path), so a dense tail keeps the cga1 ring -- and the NATURAL
+scheduler; a request (the adapter's ``bias_mode=3`` / the test seam) elsewhere, declined typed where the form does not fit.  No
+Capabilities row moves (the cga1 ring served every cell of the class before).
 
 Three tiers: (1) CPU contract -- the pick returns the form on request only and declines it off the pair / off cga1, the config
 factory's couplings (each raises with its message), the appended Cfg field, the ring's 16-count bars, the kernel's one const_expr axis,
@@ -244,6 +248,14 @@ _CELLS = [
     ),
     ("pair d64 S1024", dict(d_qk=64, d_v=64, s_q=1024, s_kv=1024, **_s13._bias_kw(s_q=1024, s_kv=1024)), None, True),
     ("pair d32 S1024 with per-batch lengths: the cga1 ring only", dict(s_q=1024, s_kv=1024, padded=True, **_s13._bias_kw(s_q=1024, s_kv=1024)), None, False),
+    # a DENSE S_kv % 128 != 0 tail: the lowering serves it through the padded path with SYNTHESIZED per-batch lengths (engines._synth_kv_padding),
+    # so the row reads the same fact as the adapter -- the seam's form is a typed decline, the cga1 ring serves the cell without the seam
+    (
+        "pair d32 S1000 dense tail with synthesized per-batch lengths: the cga1 ring only",
+        dict(s_q=1000, s_kv=1000, **_s13._bias_kw(s_q=1000, s_kv=1000)),
+        None,
+        False,
+    ),
     ("per-batch bias d32 S1024: no pair, no form on the seam", dict(s_q=1024, s_kv=1024, **_s13._bias_kw(b=2, s_q=1024, s_kv=1024)), None, False),
     ("one flattened row d32 S1024: no pair", dict(b=1, s_q=1024, s_kv=1024, **_s13._bias_kw(s_q=1024, s_kv=1024)), None, False),
 ]
@@ -278,6 +290,7 @@ _ADAPTER_CELLS = [
     (dict(d=64, s_q=1024, s_kv=1024, bias="h", bias_mode=3), True, (3, 3, 1, True)),
     (dict(s_q=896, s_kv=896, bias="h"), True, (3, 3, 1, True)),  # knob-less: the multicast ring, the pair ring's MEASURED default at D 32
     (dict(s_q=896, s_kv=896, bias="h", seq_kv_lens_present=True), True, (2, 3, 1, True)),  # knob-less + per-batch lengths: the cga1 ring
+    (dict(s_q=1000, s_kv=1000, bias="h", seq_kv_lens_present=True), True, (2, 3, 1, True)),  # the dense S 1000 tail AS THE LOWERING PASSES IT: the cga1 ring
     (dict(d=64, s_q=1024, s_kv=1024, bias="h"), True, (2, 3, 1, True)),  # knob-less at D 64: the cga1 ring (the multicast ring loses there)
     (dict(s_q=1024, s_kv=1024, bias="h", bias_mode=3), False, None),  # S_q % 256 == 0 knob-less = the one-batch-entry item: no pair, so no form 3
     (dict(s_q=1024, s_kv=1024, bias="b", bias_mode=3, n_chunk=4), False, None),  # a per-batch bias: no pair item
@@ -300,6 +313,7 @@ _ADAPTER_CELLS = [
         "d64_S1024_mcast",
         "d32_S896_knobless_is_the_multicast_ring",
         "d32_S896_knobless_per_batch_lengths_is_the_cga1_ring",
+        "d32_S1000_dense_tail_as_the_lowering_passes_it_is_the_cga1_ring",
         "d64_S1024_knobless_is_the_cga1_ring",
         "d32_S1024_knobless_one_batch_entry_declines",
         "per_batch_bias_declines",
@@ -355,6 +369,53 @@ def test_the_multicast_ring_is_the_pair_rings_measured_default_at_d32():
     assert (
         c.sm107_bias_mode_pick(32, 1, 896, pair=True, request=3) == c.BIAS_MODE_STREAMED_MULTICAST
     ), "...and a request needs neither fact (the adapter declines them)"
+
+
+def _spy_row_picks(monkeypatch):
+    """Record every ``sm107_bias_mode_pick`` call the ENGINE ROW makes (it imports the name at call time) with its result."""
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    seen = []
+    orig = c.sm107_bias_mode_pick
+
+    def spy(*a, **kw):
+        r = orig(*a, **kw)
+        seen.append((a, kw, r))
+        return r
+
+    monkeypatch.setattr(c, "sm107_bias_mode_pick", spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "s, padded, want_global, want_mode",
+    [
+        (896, False, True, 3),  # the class: a 128-multiple S_kv above the pair block's budget, dense -> the multicast ring
+        (1000, False, False, 2),  # a DENSE tail: the lowering synthesizes per-batch lengths (seq_kv_lens_present=True) -> the cga1 ring
+        (1024, True, False, 2),  # real per-batch lengths -> the cga1 ring
+    ],
+    ids=["S896_dense_is_the_multicast_ring", "S1000_dense_tail_is_the_cga1_ring", "S1024_padded_is_the_cga1_ring"],
+)
+def test_the_row_passes_the_lowerings_length_fact_to_the_pick(monkeypatch, s, padded, want_global, want_mode):
+    """The engine row's ``global_lengths`` fact is what the adapter will SEE, not what the graph declares: a dense S_kv tail is served
+    through the kernel's padded path with SYNTHESIZED per-batch lengths (``engines._synth_kv_padding``; ``lower_dsl_prefill`` passes
+    ``seq_kv_lens_present=True``), so the row passes ``global_lengths=False`` there and computes the cga1 ring -- the form the adapter's
+    ``_resident_arm_bias_mode`` picks (rule 8b: one form per plan).  Without this the row computed the multicast ring on a dense tail while
+    the adapter built the cga1 ring (numerics unaffected; the row and the adapter disagreed on the plan's form)."""
+    from cudnn.sdpa.fwd import engines
+
+    seen = _spy_row_picks(monkeypatch)
+    caps = _s13._caps()
+    kw = dict(s_q=s, s_kv=s, **_s13._bias_kw(s_q=s, s_kv=s))
+    if padded:
+        kw["padded"] = True
+    f = _s13._facts(**_s13._resolve_dtypes(kw))
+    assert engines._synth_kv_padding(caps, f) == (not padded and s % 128 != 0), "the lowering's predicate for this cell"
+    assert engines.mismatch(caps, f, None) is None, "the row serves every cell of this table (the cga1 ring or the multicast ring)"
+    row = [(kw_, r) for a, kw_, r in seen if a[0] == 32 and a[1] == 1 and kw_.get("pair")]
+    assert row, ("the row asked the pick for the pair item at cga1", seen)
+    assert {kw_["global_lengths"] for kw_, _ in row} == {want_global}, (s, row)
+    assert {r for _, r in row} == {want_mode}, (s, row)
 
 
 # --------------------------------------------------------------------------- tier 2: host rendering pins (sm_107a trace-compile)
@@ -557,9 +618,11 @@ _CASES = {
 }
 
 
-# Cells the multicast form DECLINES by its own contract (global lengths only): the harness serves a dense S_kv % 128 != 0 tail through the
-# padding path (per-batch lengths synthesised at build, test_sdpa_bias_sm107._build), which the form's typed decline refuses -- the cga1 ring
-# (bias_mode 2) serves the same cell.  Not in _CASES: a decline is pinned as a decline, never run as an oracle cell.
+# Cells the multicast form DECLINES by its own contract (global lengths only) when REQUESTED: the GRAPH path serves a dense S_kv % 128 != 0
+# tail through the kernel's padded path with per-batch lengths the LOWERING synthesizes (engines._synth_kv_padding -> seq_kv_lens_present=True),
+# which the form's typed decline refuses -- the row's (the same predicate, so no FROST plan is listed) and the adapter's twin.  The cga1 ring
+# (bias_mode 2) serves the same cell, and it is what the KNOB-LESS default picks there (the graph-path cell below).  Not in _CASES: a decline is
+# pinned as a decline, never run as an oracle cell.
 _DECLINED_CASES = {
     "nkv8_S1000_tail_tile_b8": dict(b=8, h=2, h_kv=2, s_q=1000, s_kv=1000, n_chunk=4, mode=3),
 }
@@ -638,15 +701,60 @@ def test_multicast_is_bitwise_the_resident_block_where_it_fits(case, _pins):
 @requires_rubin
 @pytest.mark.parametrize("case", list(_DECLINED_CASES))
 def test_multicast_declines_the_padded_dense_tail_the_cga1_ring_serves(case, _pins):
-    """A dense S_kv % 128 != 0 tail reaches the standalone adapter with per-batch lengths (the harness pads it), which the multicast form
-    declines TYPED (global lengths only: one kv-tile sequence for both CTAs of the cluster); the cga1 ring (bias_mode 2) serves the very
+    """A dense S_kv % 128 != 0 tail is served through the kernel's padded path with per-batch lengths the LOWERING synthesizes; the
+    multicast form REQUESTED there (the seam at 3) is a TYPED decline -- the engine row lists no FROST plan (its reason names the synthesized
+    lengths; the adapter's ``check_support`` is the twin), never a plan that fails late -- and the cga1 ring (bias_mode 2) serves the very
     same inputs and matches the fp64 oracle."""
+    import cudnn
+    from cudnn.sdpa.fwd import engines
+
     c = _DECLINED_CASES[case]
     q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, table=_DECLINED_CASES)
-    with pytest.raises((NotImplementedError, RuntimeError), match=r"global lengths|per-batch lengths|no unsplit"):
-        _run(q, k, v, kw, c, _pins, mode=_MCAST)
+    _pins(mode=_MCAST, n_chunk=c["n_chunk"])
+    g, *_ = _s13._build(q, k, v, scale=kw["scale"], bias=kw["bias"])
+    g.create_execution_plans([cudnn.heur_mode.A])
+    names, ours = _s13._frost_plans(g)
+    assert not ours, ("the requested multicast ring on a dense tail is the row's typed decline (no FROST plan listed)", names)
+    f = _s13._facts(
+        **_s13._resolve_dtypes(
+            dict(b=c["b"], h_q=c["h"], h_kv=c["h_kv"], s_q=c["s_q"], s_kv=c["s_kv"], **_s13._bias_kw(h=c["h"], s_q=c["s_q"], s_kv=c["s_kv"]))
+        )
+    )
+    why = engines.mismatch(_s13._caps(), f, None)
+    assert why and "multicast bias ring" in why and "synthesized" in why, why
     ring = _run(q, k, v, kw, c, _pins, mode=2)
     _s13._check(ring, ref)
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_DECLINED_CASES))
+def test_the_knob_less_dense_tail_runs_the_cga1_ring_through_the_graph_path(case, _pins, monkeypatch):
+    """The KNOB-LESS default on a dense S_kv % 128 != 0 tail through the GRAPH path (no seam, no knob): the row passes
+    ``global_lengths=False`` (the lowering synthesizes per-batch lengths for the tail), the adapter picks the cga1 ring (``bias_mode`` 2) for
+    the PAIR item at cga1 -- the row and the adapter agree on the plan's form -- and O / Stats match the fp64 oracle."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    c = _DECLINED_CASES[case]
+    q, k, v, kw, ref = _case_inputs(case, torch.bfloat16, table=_DECLINED_CASES)
+    _pins()  # knob-less: every seam off
+    row_picks = _spy_row_picks(monkeypatch)
+    adapter_modes = []
+    orig = api_dsl.SdpaFwdDslSm100._resident_arm_bias_mode  # the Blackwell / Rubin adapter class (the Rubin small tiles' arms live on it)
+
+    def spy(self):
+        m = orig(self)
+        adapter_modes.append((m, bool(self.seq_kv_lens_present), bool(self.seq_q_lens_present), self.bias_desc is not None))
+        return m
+
+    monkeypatch.setattr(api_dsl.SdpaFwdDslSm100, "_resident_arm_bias_mode", spy)
+    out = _s13._run(q, k, v, **kw)
+    assert out["knobs"].cga == 1, (case, out["knobs"])
+    pair_row = [(kw_, r) for a, kw_, r in row_picks if kw_.get("pair") and a[1] == 1]
+    assert pair_row and {kw_["global_lengths"] for kw_, _ in pair_row} == {False}, ("the row read the synthesized lengths", row_picks)
+    assert {r for _, r in pair_row} == {2}, ("the row computed the cga1 ring", pair_row)
+    assert adapter_modes and {m for m, *_ in adapter_modes} == {2}, ("the adapter built the cga1 ring", adapter_modes)
+    assert all(lens for _, lens, _q, _b in adapter_modes), ("the lowering passed seq_kv_lens_present=True for the tail", adapter_modes)
+    _s13._check(out, ref)
 
 
 @requires_rubin
