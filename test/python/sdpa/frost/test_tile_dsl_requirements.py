@@ -40,6 +40,7 @@ buffers._DSL_STATE = (True, ("nvidia-cutlass-dsl", "4.7.0"))  # at the floor: th
 buffers._cutedsl_has_sm107 = lambda: False
 out["arch_msg"] = tma_gather4_requirement_error((10, 7))
 out["served_msg"] = tma_gather4_requirement_error((10, 0))
+out["part_msg"] = tma_gather4_requirement_error((9, 0))  # below the gather4 part floor: refused before the DSL's target is asked
 out["cutlass_imported"] = "cutlass" in sys.modules
 print("PROBE " + json.dumps(out))
 """
@@ -57,8 +58,8 @@ def _run_below_floor_probe(timeout_s=300):
 def test_host_gate_is_importable_and_names_the_floor_below_the_dsl_floor():
     """Fresh process, ``cutlass.experimental`` blocked, version state 4.6.2: importing the gate through ``tile_dsl.tma`` dies
     with ``ModuleNotFoundError`` (the condition reproduced), while ``tile_dsl.requirements`` imports and returns the message
-    naming 4.6.2 and the 4.7.0 floor, the arch half names ``sm_107a`` on a cc 10.7 part and is silent on a served part, and
-    nothing of the DSL was imported along the way."""
+    naming 4.6.2 and the 4.7.0 floor, the arch half names ``sm_107a`` on a cc 10.7 part and is silent on a served part, a
+    pre-Blackwell part is refused by its cc, and nothing of the DSL was imported along the way."""
     out = _run_below_floor_probe()
     assert out["tma_import"].startswith("ModuleNotFoundError"), f"the probe must reproduce the below-floor import failure: {out['tma_import']}"
     msg = out["version_msg"]
@@ -66,6 +67,7 @@ def test_host_gate_is_importable_and_names_the_floor_below_the_dsl_floor():
     assert out["generic_msg"] is not None and "4.6.2" in out["generic_msg"] and "apply_membership_words" in out["generic_msg"], out["generic_msg"]
     assert out["arch_msg"] is not None and "sm_107a" in out["arch_msg"], out["arch_msg"]
     assert out["served_msg"] is None, out["served_msg"]
+    assert out["part_msg"] is not None and "cc 9.0" in out["part_msg"] and "10.0" in out["part_msg"], out["part_msg"]
     assert out["cutlass_imported"] is False, "the host gate must not import the DSL"
 
 
@@ -91,3 +93,20 @@ def test_host_gate_answers_in_this_process_for_the_installed_dsl():
         assert msg is not None and version[1] in msg and "tma_gather4" in msg, msg
     else:
         assert msg is None, msg
+
+
+def test_host_gate_refuses_a_part_below_the_gather4_floor_by_name(monkeypatch):
+    """``cp.async.bulk.tensor .tile::gather4`` exists from ``sm_100a`` on: a cc 9.0 / 8.0 part is refused by name BEFORE the DSL's
+    target is consulted (the DSL version satisfied, whatever its ``Arch`` knows), a cc 10.0 part is not refused on that ground."""
+    import cudnn.frost.buffers as buffers
+    from cudnn.frost.tile_dsl.requirements import TMA_GATHER4_MIN_CC, requirement_error, tma_gather4_requirement_error
+
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    assert TMA_GATHER4_MIN_CC == (10, 0)
+    for cc in ((9, 0), (8, 0), (8, 9)):
+        msg = tma_gather4_requirement_error(cc)
+        assert msg is not None and f"cc {cc[0]}.{cc[1]}" in msg and "10.0" in msg and "tma_gather4" in msg, (cc, msg)
+    assert tma_gather4_requirement_error((10, 0)) is None
+    assert requirement_error("tile_dsl.mask.apply_membership_words", (9, 0)) is None, "a primitive without a part floor refuses nothing on that ground"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    assert "4.6.2" in tma_gather4_requirement_error((9, 0)), "the version message comes first: the DSL is the first thing to fix"
