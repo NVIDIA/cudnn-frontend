@@ -138,11 +138,44 @@ def test_direct_decode_launch_rejects_wrong_packed_head_ratio(d):
         launch_f16(None, *([None] * 8), (1, 4, 2, 1, 128, 0), 1.0, 0, 0, host=mod._host)
 
 
-@requires_pre_rubin_blackwell
-def test_direct_d256_decode_launch_rejects_rows_outside_tile():
-    mod = _load("sm100", "decode_d256_f16", 256, 256)
+def _fixed_tile_host(n_q, heads_per_tile, token_units):
+    """A stand-in host entry whose module namespace carries the three fields the row guard reads."""
+    namespace = {"N_Q": n_q, "HEADS_PER_TILE": heads_per_tile}
+    if token_units is not None:
+        namespace["Q_TOKEN_UNITS"] = token_units
+    exec("def host():\n    pass", namespace)
+    return namespace["host"]
+
+
+def test_direct_decode_row_guard_yields_to_the_token_unit_axis():
+    """The direct driver's row guard is the fixed-tile contract: a body without ``Q_TOKEN_UNITS`` rejects
+    ``S_q x HEADS_PER_TILE > N_Q``; a body that declares the axis covers the same shape as token units."""
+    from frost_test_utils import check_decode_q_rows
+
+    check_decode_q_rows(_fixed_tile_host(16, 2, None), 8)
+    with pytest.raises(ValueError, match="decode Q rows exceed the compiled 16-row tile"):
+        check_decode_q_rows(_fixed_tile_host(16, 2, None), 17)
     with pytest.raises(ValueError, match="decode Q rows exceed"):
-        launch_f16(None, *([None] * 8), (1, 2, 2, 17, 128, 0), 1.0, 0, 0, host=mod._host)
+        check_decode_q_rows(_fixed_tile_host(16, 2, False), 17)
+    check_decode_q_rows(_fixed_tile_host(16, 2, True), 17)
+
+
+@requires_pre_rubin_blackwell
+def test_direct_d256_decode_launch_follows_the_token_unit_contract(monkeypatch):
+    """The compiled d256 decode body declares the token-unit axis, so ``S_q = 17`` on the 16-row tile is served as
+    ``ceil(17 / Q_BOX_TOKENS)`` units and the direct driver does not reject it; with the flag cleared on the same
+    namespace (a fixed-tile body) the old rejection holds."""
+    import inspect
+
+    from frost_test_utils import check_decode_q_rows
+
+    mod = _load("sm100", "decode_d256_f16", 256, 256)
+    namespace = inspect.unwrap(mod._host).__globals__
+    assert namespace["Q_TOKEN_UNITS"] is True and 17 * namespace["HEADS_PER_TILE"] > namespace["N_Q"]
+    check_decode_q_rows(mod._host, 17)
+    monkeypatch.setitem(namespace, "Q_TOKEN_UNITS", False)
+    with pytest.raises(ValueError, match="decode Q rows exceed"):
+        check_decode_q_rows(mod._host, 17)
 
 
 @requires_pre_rubin_blackwell

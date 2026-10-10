@@ -194,6 +194,18 @@ _CUTE_DTYPE = {
 }
 
 
+def check_decode_q_rows(host, sq):
+    """The direct driver's Q-row guard, the contract the production binder validates: a decode body WITHOUT the token-unit
+    axis covers ``S_q x HEADS_PER_TILE <= N_Q`` only and rejects more rows; a body that declares ``Q_TOKEN_UNITS`` serves
+    any ``S_q`` as ``ceil(S_q / Q_BOX_TOKENS)`` units per head group, so the guard yields.  ``host`` is the module's host
+    entry (its ``__globals__`` is the compiled module's namespace)."""
+    import inspect
+
+    namespace = inspect.unwrap(host).__globals__
+    if "N_Q" in namespace and not namespace.get("Q_TOKEN_UNITS", False) and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
+        raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
+
+
 def launch_f16(
     fn,
     q,
@@ -238,9 +250,7 @@ def launch_f16(
         cfg = namespace["CFG"]
         if cfg.PACK_GQA and h != kh * cfg.QH_PER_KH:
             raise ValueError(f"PACK_GQA requires H_q == H_kv * {cfg.QH_PER_KH}; got H_q={h}, H_kv={kh}")
-        # A decode tile with the token-unit axis (Q_TOKEN_UNITS) covers any S_q through ceil(S_q / Q_BOX_TOKENS) units.
-        if "N_Q" in namespace and not namespace.get("Q_TOKEN_UNITS", False) and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
-            raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
+        check_decode_q_rows(host, sq)
     if paged:
         skv, n_pages = block_table_tensor.shape[1] * page_size, k.shape[0]
         k_st, v_st = (k.stride(0), k.stride(1), k.stride(2)), (v.stride(0), v.stride(1), v.stride(2))
