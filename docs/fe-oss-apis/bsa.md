@@ -162,9 +162,9 @@ that budget raises `RuntimeError`.
 
 ## Sage FP8 forward
 
-Sage FP8 is a forward-only blk64 path. Its public wrapper accepts contiguous
-BF16 Q, K, and V tensors in `BHSD` layout and performs FP8 quantization
-internally:
+Sage FP8 is forward-only and supports blk64 on SM100/SM103 and SM120, plus
+native blk128 on SM120. Its public wrapper accepts contiguous BF16 Q, K, and V
+tensors in `BHSD` layout and performs FP8 quantization internally:
 
 ```python
 fp8_result = block_sparse_attention_fp8_forward(
@@ -173,15 +173,25 @@ fp8_result = block_sparse_attention_fp8_forward(
     v,
     q2k_block_index,
     block_sparse_num=4,
+    sparse_block_size=64,
 )
 o_fp8 = fp8_result["o_tensor"]
 ```
 
 Q, K, and V must be BF16 MHA tensors in contiguous BHSD layout, have matching
-batch and head counts, and use `D=128`. The wrapper accepts the same blk64
-sparse index metadata used by the regular forward API. It lazily loads the
-quantizer, creates the E4M3 tensors and FP32 scales needed by the kernel, and
-does not expose those implementation details as public inputs or outputs.
+batch and head counts, and use `D=128`. The wrapper accepts the same sparse
+index metadata used by the regular forward API for the selected block size.
+It lazily loads the quantizer, creates the E4M3 tensors and FP32 scales needed
+by the kernel, and does not expose those implementation details as public
+inputs or outputs.
+
+`sparse_block_size` defaults to 64. On SM120, pass `sparse_block_size=128` with
+`q2k_block_index` shaped `(B, H, ceil(S_q / 128), K_max)` and, when supplied,
+`q2k_block_nums` shaped `(B, H, ceil(S_q / 128))`. Active indices address
+physical 128-token KV blocks, so they must be in `[0, ceil(S_kv / 128))`.
+For `block_sizes`, use `N_kv = ceil(S_kv / 128)` and valid-token counts in
+`[1, 128]` for referenced blocks. The native kernel consumes this metadata
+directly. Other architectures reject `sparse_block_size=128` for FP8.
 
 The result is a one-key `TupleDict` containing `o_tensor`, a contiguous BF16
 tensor of shape `(B, H, S_q, 128)`. This API does not return LSE and has no
@@ -189,14 +199,15 @@ backward implementation.
 
 The architecture-specific FP8 contracts are:
 
-- SM100/SM103 accepts any positive batch and head counts and requires both
-  sequence lengths to be multiples of 64. It uses fixed `block_sparse_num`
-  with full 64-token KV blocks; `q2k_block_nums` and `block_sizes` are not
-  supported. Split-KV is selected internally, and the public FP8 API does not
-  expose `kv_splits` or `use_clc`.
-- SM120 accepts any positive batch and head counts, non-aligned Q/KV sequence
-  tails, fixed or per-query-block counts, and `block_sizes` shaped `(N_kv,)`,
-  `(B, N_kv)`, or `(B, H, N_kv)`. It does not use split-KV.
+- SM100/SM103 supports only blk64, accepts any positive batch and head counts,
+  and requires both sequence lengths to be multiples of 64. It uses fixed
+  `block_sparse_num` with full 64-token KV blocks; `q2k_block_nums` and
+  `block_sizes` are not supported. Split-KV is selected internally, and the
+  public FP8 API does not expose `kv_splits` or `use_clc`.
+- SM120 supports blk64 and blk128, accepts any positive batch and head counts,
+  non-aligned Q/KV sequence tails, fixed or per-query-block counts, and
+  `block_sizes` shaped `(N_kv,)`, `(B, N_kv)`, or `(B, H, N_kv)`. It does not
+  use split-KV.
 
 `block_sparse_attention_fp8_forward` relies on functionality introduced in
 CuTe DSL 4.6.1; package-supported installations provide CuTe DSL 4.6.2 or
@@ -249,6 +260,7 @@ therefore requires full physical KV blocks and `block_sizes=None`.
 | SM120 | 64 | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 128 (explicit) | FP16, BF16 | QK=128, V=128 | MHA, GQA, MQA |
 | SM120 | 64 | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
+| SM120 | 128 (explicit) | BF16 / FP8 E4M3 | QK=128, V=128 | MHA |
 
 SM90 blk64 requires `S_q` to be a multiple of 64; native blk128 supports
 positive arbitrary Q/KV lengths, including partial final blocks. Its fixed count may be

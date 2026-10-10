@@ -115,3 +115,5 @@ class SageFp8VQuantizerSm120Blk128:
             cute.copy(tma_atom, tVsV, tVgV)
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

@@ -930,3 +930,5 @@ class BlockSparseAttnForwardFp8Sm120Blk128(BatchedStaticSchedulerMixin):
                 cute.copy(tma_atom_O, tOsO, tOgO)
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
