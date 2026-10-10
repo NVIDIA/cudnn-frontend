@@ -367,7 +367,7 @@ class SparseGqaFwdDslSm107:
     def check_support(self) -> bool:
         """Typed declines in order: the DSL gate (Rule 7, before any kernel import), the arch, the unserved arms by name, the
         dtypes, the shapes, the stride contract, the index list.  Returns True when the record serves the request."""
-        from cudnn.frost.tile_dsl.tma import tma_gather4_requirement_error
+        from cudnn.frost.tile_dsl.requirements import tma_gather4_requirement_error  # the host entry: importable below the DSL floor
 
         cc = self._device_cc()
         msg = tma_gather4_requirement_error(cc)
