@@ -251,6 +251,12 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "DRMSNormNode node needs has_bias(bool) to be called.");
 
+        auto const scale_it = attributes.inputs.find(Rmsnorm_backward_attributes::input_names::SCALE);
+        RETURN_CUDNN_FRONTEND_ERROR_IF(
+            attributes.use_dbias.value() && (scale_it == attributes.inputs.end() || scale_it->second == nullptr),
+            error_code_t::INVALID_VALUE,
+            "Rmsnorm backward without a scale has no DBIAS; call has_dbias(false).");
+
         return {error_code_t::OK, ""};
     }
 
@@ -285,7 +291,12 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
             DX->set_stride(x_tensor_stride);
         }
 
-        auto scale = attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE];
+        // scale is optional (#188); without one there is no DSCALE or DBIAS
+        auto const scale_it = attributes.inputs.find(Rmsnorm_backward_attributes::input_names::SCALE);
+        auto scale          = scale_it != attributes.inputs.end() ? scale_it->second : nullptr;
+        if (scale == nullptr) {
+            return {error_code_t::OK, ""};
+        }
 
         // Infer dscale/dbias from scale
         auto infer_scale_bias_tensors = [&scale](std::shared_ptr<Tensor_attributes>& T) {
@@ -352,15 +363,18 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
                                                        1,
                                                        &dy_desc));
 
-        // Set scale tensor
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Rmsnorm_backward_attributes::input_names::SCALE);
-        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+        // Set scale tensor; optional (#188)
+        auto const SCALE     = attributes.inputs.find(Rmsnorm_backward_attributes::input_names::SCALE);
+        bool const has_scale = SCALE != attributes.inputs.end() && SCALE->second != nullptr;
+        if (has_scale) {
+            auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &scale_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &scale_desc));
+        }
 
         // Set inv_variance tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(INV_VARIANCE, Rmsnorm_backward_attributes::input_names::INV_VARIANCE);
@@ -373,14 +387,16 @@ class DRMSNormNode : public NodeCRTP<DRMSNormNode> {
                                                        &inv_var_desc));
 
         // Set DSCALE output tensor
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Rmsnorm_backward_attributes::output_names::DSCALE);
-        auto dscale_desc = tensors.at(DSCALE->second->get_uid())->get_raw_desc();
+        if (has_scale) {
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Rmsnorm_backward_attributes::output_names::DSCALE);
+            auto dscale_desc = tensors.at(DSCALE->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &dscale_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(drmsnorm_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &dscale_desc));
+        }
 
         // Set optional DBIAS output tensor
         if (attributes.use_dbias.value()) {

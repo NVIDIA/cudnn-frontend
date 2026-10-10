@@ -408,3 +408,71 @@ def test_rmsnorm_without_scale_refuses_ambiguous_axes(cudnn_handle):
     x = make_seeded_randn((2, 8, 64), torch.float32, 13)
     with pytest.raises(Exception, match="ambiguous"):
         _run_norm_leaving_stats_dims_to_inference(cudnn_handle, x, None, phase=cudnn.norm_forward_phase.INFERENCE)
+
+
+def _norm_backward_without_scale(cudnn_handle, x, dy, stats, *, layernorm, positional):
+    """Run ``rmsnorm_backward`` / ``layernorm_backward`` with no scale and return ``(DX, DScale, DBias, dx)``."""
+    graph = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
+    cudnn.set_stream(handle=cudnn_handle, stream=torch.cuda.current_stream().cuda_stream)
+
+    def t(name, v):
+        return graph.tensor(name=name, dim=list(v.shape), stride=list(v.stride()), data_type=v.dtype)
+
+    X, DY = t("X", x), t("DY", dy)
+    S = {name: t(name, v) for name, v in stats.items()}
+    if layernorm:
+        args = (DY, X, None, S["mean"], S["inv_var"]) if positional else ()
+        kwargs = {} if positional else dict(grad=DY, input=X, mean=S["mean"], inv_variance=S["inv_var"])
+        DX, DScale, DBias = graph.layernorm_backward(*args, **kwargs)
+    else:
+        args = (DY, X, None, S["inv_var"]) if positional else ()
+        kwargs = dict(has_dbias=False) if positional else dict(grad=DY, input=X, inv_variance=S["inv_var"], has_dbias=False)
+        DX, DScale, DBias = graph.rmsnorm_backward(*args, **kwargs)
+    DX.set_output(True).set_data_type(x.dtype)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
+    dx = torch.full_like(x, float("nan"))
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    graph.execute({X: x, DY: dy, DX: dx, **{S[name]: v for name, v in stats.items()}}, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+    return DX, DScale, DBias, dx
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("positional", [False, True], ids=["keyword", "positional_none"])
+@pytest.mark.parametrize("stats_shape", ["rows", "batch"])
+@pytest.mark.parametrize("layernorm", [False, True], ids=["rmsnorm", "layernorm"])
+def test_norm_backward_without_scale(layernorm, stats_shape, positional, cudnn_handle):
+    """``scale=None`` in the backward (#188): no DScale or DBias, and DX matches autograd of the scale-free forward.
+    The stats are inputs, so their dims state the axes: ``{B, S, 1}`` normalizes H, ``{B, 1, 1}`` normalizes S and H."""
+    B, S, H = 2, 8, 64
+    x = make_seeded_randn((B, S, H), torch.float32, 17)
+    dy = make_seeded_randn((B, S, H), torch.float32, 19)
+    axes = (-1,) if stats_shape == "rows" else (-2, -1)
+    xr = x.detach().clone().requires_grad_(True)
+    mean = xr.mean(axes, keepdim=True) if layernorm else torch.zeros((), device="cuda")
+    inv_var = torch.rsqrt((xr - mean).square().mean(axes, keepdim=True) + 1e-5)
+    ((xr - mean) * inv_var).backward(dy)
+    stats = {"inv_var": inv_var.detach()}
+    if layernorm:
+        stats["mean"] = mean.detach()
+    DX, DScale, DBias, dx = _norm_backward_without_scale(cudnn_handle, x, dy, stats, layernorm=layernorm, positional=positional)
+    assert DScale is None and DBias is None
+    torch.testing.assert_close(dx, xr.grad, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.L0
+def test_rmsnorm_backward_without_scale_refuses_dbias(cudnn_handle):
+    """DBIAS takes its dims from the scale, so ``has_dbias=True`` without one is refused at validate()."""
+    graph = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
+    X = graph.tensor(name="X", dim=[2, 8, 64], stride=[512, 64, 1], data_type=torch.float32)
+    DY = graph.tensor(name="DY", dim=[2, 8, 64], stride=[512, 64, 1], data_type=torch.float32)
+    IV = graph.tensor(name="IV", dim=[2, 8, 1], stride=[8, 1, 1], data_type=torch.float32)
+    DX, DScale, DBias = graph.rmsnorm_backward(grad=DY, input=X, inv_variance=IV, has_dbias=True)
+    assert DScale is None and DBias is None
+    DX.set_output(True)
+    with pytest.raises(Exception, match="has_dbias"):
+        graph.validate()
