@@ -653,6 +653,13 @@ same optimized gather path. Do not add a separate `local_to_global_wrapper`
 launch only for Indexer Backward; preserve the producer's id convention and
 set `topk_indices_global` to match it.
 
+The default SM100 backend accepts compact H32 `index_q`, `weights`,
+`d_index_q`, and `d_weights` tensors directly. TCGEN05 still executes its
+minimum M64 tile internally: the upper Q rows and weights are zero-filled, and
+the dQ/dW stores are clipped to the logical H32 extent. Callers must not pad
+these tensors to H64 or slice H64 outputs. Other sub-M64 head counts remain
+unsupported; H64 and larger head counts retain their existing behavior.
+
 On SM90, also prefer preserving the producer's id convention. The performance
 difference between local and global ids is generally small, so a separate
 conversion solely for Indexer Backward is unlikely to help.
