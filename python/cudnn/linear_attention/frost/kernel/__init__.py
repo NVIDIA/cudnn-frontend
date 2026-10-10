@@ -19,4 +19,4 @@
 ``*_bprop_f16.py``, ``*_recompute_f16.py`` (state / checkpoint-only recompute), ``*_bprop_summary_f16.py`` (the reverse
 state-gradient recurrence), ``*_summary_f16.py`` (fused H+M piece summary) and ``*_chain_prologue_f16.py``, each with its
 ``*_config.py``.  GDP shares the GDN kernels except its d_v = 64 backward fork ``gdp_bprop_v64_f16.py``; GDN also has the
-chunk-factor T pass ``gdn_tinv_f16.py``.  KDA / GDN-2 store no per-chunk H in the forward; the backward recomputes."""
+chunk-inverse T pass ``gdn_tinv_f16.py``.  KDA / GDN-2 store no per-chunk H in the forward; the backward recomputes."""

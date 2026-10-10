@@ -32,7 +32,6 @@ from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     ceil_div as _ceil_div,
     device_major as _get_device_capability,
-    maybe_contiguous,
     resolve_stream as _resolve_stream,
     torch_stream_context as _torch_stream_context,
     validate_q_causal_offsets,
@@ -44,6 +43,30 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
 }
+
+# CUDA exposes 227 KiB (232448 bytes) as B200's maximum opt-in dynamic shared
+# memory per block.  Budgeting the nominal 228 KiB asks the driver to launch an
+# impossible 233472-byte kernel at H128/D512.
+_SM100_SMEM_BYTES = 227 * 1024
+
+
+# Execute-path contract checks (Rule 1 / R5): raise, never .contiguous() / .to(dtype).
+def _require_unit_innermost(t: Optional[torch.Tensor], name: str) -> None:
+    # A size-1 innermost dim has no observable stride (e.g. the SM90 (B, H, 1) per-head view).
+    if t is not None and t.shape[-1] != 1 and t.stride(-1) != 1:
+        raise ValueError(f"{name} must have a unit innermost stride, got strides {tuple(t.stride())}")
+
+
+def _require_int32_contiguous(t: torch.Tensor, name: str) -> None:
+    if t.dtype != torch.int32 or not t.is_contiguous() or not t.is_cuda:
+        raise ValueError(f"{name} must be a contiguous int32 CUDA tensor, got dtype {t.dtype} strides {tuple(t.stride())} device {t.device}")
+
+
+def _require_fp32_output(t: torch.Tensor, name: str, shape: tuple[int, ...]) -> None:
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous, got strides {tuple(t.stride())}")
+    if t.dtype != torch.float32 or tuple(t.shape) != tuple(shape) or not t.is_cuda:
+        raise ValueError(f"{name} must be a float32 CUDA tensor of shape {tuple(shape)}, got dtype {t.dtype} shape {tuple(t.shape)}")
 
 
 def _normalize_dense_precision(
@@ -143,7 +166,8 @@ def _sparse_indexer_score_recompute(
     weights: torch.Tensor,
     topk_indices: torch.Tensor,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
+    *,
+    out: torch.Tensor,
     topk_length: Optional[torch.Tensor] = None,
     m_block_size: Optional[int] = None,
     n_block_size: int = 128,
@@ -155,22 +179,24 @@ def _sparse_indexer_score_recompute(
     Compute sparse index scores + softmax (predict) for backward pass.
 
     Args:
-        q_indexer: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
-        k_indexer: (bs, seqlen_k, head_dim) [BF16] — no head dim (MQA)
-        weights: (bs, seqlen_q, n_heads_q) [BF16]
-        topk_indices: (bs, seqlen_q, topk) [INT32]
+        q_indexer: (bs, seqlen_q, n_heads_q, head_dim) [BF16], unit innermost stride
+        k_indexer: (bs, seqlen_k, head_dim) [BF16] — no head dim (MQA), unit innermost stride
+        weights: (bs, seqlen_q, n_heads_q) [BF16], unit innermost stride
+        topk_indices: (bs, seqlen_q, topk) [INT32], contiguous
         qhead_per_kv_head: auto inferred if None
-        out: optional output tensor (bs, seqlen_q, topk) [FP32]
-        topk_length: (bs, seqlen_q) [INT32] — per-q valid topk count (compact layout), optional
+        out: required output tensor (bs, seqlen_q, topk) [FP32], contiguous
+        topk_length: (bs, seqlen_q) [INT32], contiguous — per-q valid topk count (compact layout), optional
         m_block_size: defaults to qhead_per_kv_head (must equal qhead_per_kv_head)
+
+    Layout/dtype mismatches raise ``ValueError``; nothing is copied or cast here.
 
     Returns:
         predict: (bs, seqlen_q, topk) [FP32] — softmax of sparse index scores
     """
     current_stream = _resolve_stream(current_stream)
-    q_indexer, k_indexer, weights = [maybe_contiguous(t, current_stream) for t in (q_indexer, k_indexer, weights)]
-    with _torch_stream_context(current_stream):
-        topk_indices = topk_indices.to(torch.int32).contiguous()
+    for t, name in ((q_indexer, "q_indexer"), (k_indexer, "k_indexer"), (weights, "weights")):
+        _require_unit_innermost(t, name)
+    _require_int32_contiguous(topk_indices, "topk_indices")
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = q_indexer.shape[2]
@@ -182,22 +208,12 @@ def _sparse_indexer_score_recompute(
     _, seqlen_k, _ = k_indexer.shape
     topk = topk_indices.shape[2]
 
-    device = q_indexer.device
     have_topk_length = topk_length is not None
+    if have_topk_length:
+        _require_int32_contiguous(topk_length, "topk_length")
+    _require_fp32_output(out, "out", (bs, seqlen_q, topk))
 
-    if topk_length is None:
-        with _torch_stream_context(current_stream):
-            topk_length = torch.empty((1, 1), dtype=torch.int32, device=device)
-    else:
-        with _torch_stream_context(current_stream):
-            topk_length = topk_length.to(torch.int32).contiguous()
-
-    if out is None:
-        with _torch_stream_context(current_stream):
-            out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
-
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
+    # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     sK_per_stage = n_block_size * head_dim_padded * 2  # BF16
     sQ_size = m_block_size * head_dim_padded * 2  # BF16
@@ -207,15 +223,15 @@ def _sparse_indexer_score_recompute(
 
     topk_in_smem = True
     smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+    kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
     total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
+    if total_smem_est > _SM100_SMEM_BYTES:
         topk_in_smem = False
         smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+        kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
         total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
+        assert total_smem_est <= _SM100_SMEM_BYTES, (
+            f"SMEM overflow ({total_smem_est} > {_SM100_SMEM_BYTES}) even without sTopkIdx: "
             f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
             f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
         )
@@ -247,7 +263,8 @@ def _sparse_indexer_score_recompute(
             w_cute = to_cute_tensor(weights)
             topk_cute = to_cute_tensor(topk_indices)
             out_cute = to_cute_tensor(out)
-            topk_length_cute = to_cute_tensor(topk_length)
+            # R3: the dead mTopkLength slot is compiled out (None at compile AND launch).
+            topk_length_cute = to_cute_tensor(topk_length) if have_topk_length else None
 
             kernel_obj = SparseScoreRecomputeSm100(
                 head_dim=head_dim,
@@ -303,7 +320,8 @@ def sparse_indexer_score_recompute(
     weights: torch.Tensor,
     topk_indices: torch.Tensor,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
+    *,
+    out: torch.Tensor,
     topk_length: Optional[torch.Tensor] = None,
     sm_scale: float = 1.0,
     topk_indices_global: bool = True,
@@ -320,13 +338,13 @@ def sparse_indexer_score_recompute(
     (preserves precision vs pre-multiplying onto bf16 weights on the host).
 
     Args:
-        q_indexer: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
-        k_indexer: (bs, seqlen_k, head_dim) [BF16]
-        weights: (bs, seqlen_q, n_heads_q) [BF16]
-        topk_indices: (bs, seqlen_q, topk) [INT32]
+        q_indexer: (bs, seqlen_q, n_heads_q, head_dim) [BF16], unit innermost stride
+        k_indexer: (bs, seqlen_k, head_dim) [BF16], unit innermost stride
+        weights: (bs, seqlen_q, n_heads_q) [BF16], unit innermost stride
+        topk_indices: (bs, seqlen_q, topk) [INT32], contiguous
         qhead_per_kv_head: auto inferred if None
-        out: pre-allocated output (bs, seqlen_q, topk) [FP32], optional
-        topk_length: (bs, seqlen_q) [INT32] — compact layout, optional
+        out: required pre-allocated output (bs, seqlen_q, topk) [FP32], contiguous
+        topk_length: (bs, seqlen_q) [INT32], contiguous — compact layout, optional
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
         topk_indices_global: when True (default, matches public fwd output),
             ``topk_indices`` are global ids ``b * seqlen_k + local`` and the
@@ -341,8 +359,8 @@ def sparse_indexer_score_recompute(
         weights,
         topk_indices,
         qhead_per_kv_head,
-        out,
-        topk_length,
+        out=out,
+        topk_length=topk_length,
         sm_scale=sm_scale,
         topk_indices_global=topk_indices_global,
         current_stream=current_stream,
@@ -361,7 +379,8 @@ def _sparse_attn_score_recompute(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
+    *,
+    out: torch.Tensor,
     topk_length: Optional[torch.Tensor] = None,
     m_block_size: Optional[int] = None,
     n_block_size: int = 64,
@@ -373,24 +392,26 @@ def _sparse_attn_score_recompute(
     Compute sparse attention target (L1-normalized head-summed softmax) for backward.
 
     Args:
-        q_attn: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
-        k_attn: (bs, seqlen_k, head_dim) [BF16]
-        lse: (bs, seqlen_q, n_heads_q) [FP32] — logsumexp from forward softmax
-        topk_indices: (bs, seqlen_q, topk) [INT32]
+        q_attn: (bs, seqlen_q, n_heads_q, head_dim) [BF16], unit innermost stride
+        k_attn: (bs, seqlen_k, head_dim) [BF16], unit innermost stride
+        lse: (bs, seqlen_q, n_heads_q) [FP32], unit innermost stride — logsumexp from forward softmax
+        topk_indices: (bs, seqlen_q, topk) [INT32], contiguous
         softmax_scale: float — attention softmax scale
         qhead_per_kv_head: auto inferred if None
-        out: optional output tensor (bs, seqlen_q, topk) [FP32]
-        topk_length: (bs, seqlen_q) [INT32] — per-q valid topk count (compact layout), optional
+        out: required output tensor (bs, seqlen_q, topk) [FP32], contiguous
+        topk_length: (bs, seqlen_q) [INT32], contiguous — per-q valid topk count (compact layout), optional
         m_block_size: defaults to qhead_per_kv_head (must equal qhead_per_kv_head)
+
+    Layout/dtype mismatches raise ``ValueError``; nothing is copied or cast here.
 
     Returns:
         target: (bs, seqlen_q, topk) [FP32] — L1-normalized attention scores
     """
 
     current_stream = _resolve_stream(current_stream)
-    q_attn, k_attn = [maybe_contiguous(t, current_stream) for t in (q_attn, k_attn)]
-    with _torch_stream_context(current_stream):
-        topk_indices = topk_indices.to(torch.int32).contiguous()
+    for t, name in ((q_attn, "q_attn"), (k_attn, "k_attn"), (lse, "lse")):
+        _require_unit_innermost(t, name)
+    _require_int32_contiguous(topk_indices, "topk_indices")
 
     if qhead_per_kv_head is None:
         qhead_per_kv_head = q_attn.shape[2]
@@ -402,24 +423,12 @@ def _sparse_attn_score_recompute(
     _, seqlen_k, _ = k_attn.shape
     topk = topk_indices.shape[2]
 
-    device = q_attn.device
     have_topk_length = topk_length is not None
+    if have_topk_length:
+        _require_int32_contiguous(topk_length, "topk_length")
+    _require_fp32_output(out, "out", (bs, seqlen_q, topk))
 
-    if topk_length is None:
-        with _torch_stream_context(current_stream):
-            topk_length = torch.empty((1, 1), dtype=torch.int32, device=device)
-    else:
-        with _torch_stream_context(current_stream):
-            topk_length = topk_length.to(torch.int32).contiguous()
-
-    lse = maybe_contiguous(lse, current_stream)
-
-    if out is None:
-        with _torch_stream_context(current_stream):
-            out = torch.empty((bs, seqlen_q, topk), dtype=torch.float32, device=device)
-
-    # Compute kv_stage and topk_in_smem from SMEM budget (SM100: 228 KB)
-    SM100_SMEM_BYTES = 228 * 1024
+    # Compute kv_stage and topk_in_smem from the usable SM100 SMEM budget.
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     k_block_size_eff = k_block_size if k_block_size is not None else head_dim_padded
     sK_per_stage = n_block_size * k_block_size_eff * 2  # BF16
@@ -430,15 +439,15 @@ def _sparse_attn_score_recompute(
 
     topk_in_smem = True
     smem_overhead = sTopkIdx_bytes + smem_fixed
-    kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+    kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
     total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-    if total_smem_est > SM100_SMEM_BYTES:
+    if total_smem_est > _SM100_SMEM_BYTES:
         topk_in_smem = False
         smem_overhead = smem_fixed
-        kv_stage = min(4, max(1, (SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
+        kv_stage = min(4, max(1, (_SM100_SMEM_BYTES - sQ_size - smem_overhead) // sK_per_stage))
         total_smem_est = sQ_size + sK_per_stage * kv_stage + smem_overhead
-        assert total_smem_est <= SM100_SMEM_BYTES, (
-            f"SMEM overflow ({total_smem_est} > {SM100_SMEM_BYTES}) even without sTopkIdx: "
+        assert total_smem_est <= _SM100_SMEM_BYTES, (
+            f"SMEM overflow ({total_smem_est} > {_SM100_SMEM_BYTES}) even without sTopkIdx: "
             f"topk={topk}, head_dim={head_dim}(padded={head_dim_padded}), "
             f"m_block={m_block_size}, n_block={n_block_size}, kv_stage={kv_stage}."
         )
@@ -467,7 +476,8 @@ def _sparse_attn_score_recompute(
             lse_cute = to_cute_tensor(lse)
             topk_cute = to_cute_tensor(topk_indices)
             out_cute = to_cute_tensor(out)
-            topk_length_cute = to_cute_tensor(topk_length)
+            # R3: the dead mTopkLength slot is compiled out (None at compile AND launch).
+            topk_length_cute = to_cute_tensor(topk_length) if have_topk_length else None
 
             kernel_obj = SparseScoreRecomputeSm100(
                 head_dim=head_dim,
@@ -576,7 +586,8 @@ def sparse_attn_score_recompute(
     topk_indices: torch.Tensor,
     softmax_scale: float,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
+    *,
+    out: torch.Tensor,
     topk_length: Optional[torch.Tensor] = None,
     topk_indices_global: bool = True,
     current_stream: Optional[cuda.CUstream] = None,
@@ -590,14 +601,14 @@ def sparse_attn_score_recompute(
       target = S / sum(S)  (L1-norm over topk dim)
 
     Args:
-        q_attn: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
-        k_attn: (bs, seqlen_k, head_dim) [BF16]
-        lse: (bs, seqlen_q, n_heads_q) [FP32]
-        topk_indices: (bs, seqlen_q, topk) [INT32]
+        q_attn: (bs, seqlen_q, n_heads_q, head_dim) [BF16], unit innermost stride
+        k_attn: (bs, seqlen_k, head_dim) [BF16], unit innermost stride
+        lse: (bs, seqlen_q, n_heads_q) [FP32], unit innermost stride
+        topk_indices: (bs, seqlen_q, topk) [INT32], contiguous
         softmax_scale: float
         qhead_per_kv_head: auto inferred if None
-        out: pre-allocated output (bs, seqlen_q, topk) [FP32], optional
-        topk_length: (bs, seqlen_q) [INT32] — compact layout, optional
+        out: required pre-allocated output (bs, seqlen_q, topk) [FP32], contiguous
+        topk_length: (bs, seqlen_q) [INT32], contiguous — compact layout, optional
 
     Returns:
         target: (bs, seqlen_q, topk) [FP32]
@@ -638,8 +649,8 @@ def sparse_attn_score_recompute(
         topk_indices,
         softmax_scale,
         qhead_per_kv_head,
-        out,
-        topk_length,
+        out=out,
+        topk_length=topk_length,
         m_block_size=m_block_size,
         n_block_size=n_block_size,
         k_block_size=k_block_size,
@@ -651,8 +662,6 @@ def sparse_attn_score_recompute(
 # =============================================================================
 # Dense backward: full KV via TMA, no topk
 # =============================================================================
-
-_SM100_SMEM_BYTES = 228 * 1024
 
 
 def _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes):
@@ -794,8 +803,6 @@ def _dense_indexer_score_recompute(
     k: torch.Tensor,
     weights: torch.Tensor,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    denom_out: Optional[torch.Tensor] = None,
     m_block_size: Optional[int] = None,
     n_block_size: int = 128,
     k_block_size: Optional[int] = None,
@@ -807,6 +814,8 @@ def _dense_indexer_score_recompute(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
+    out: torch.Tensor,
+    denom_out: torch.Tensor,
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
@@ -822,15 +831,18 @@ def _dense_indexer_score_recompute(
         q: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
         k: (bs, seqlen_k, n_heads_kv, head_dim) [BF16]
         weights: (bs, seqlen_q, n_heads_q) [BF16]
-        out: optional (bs, seqlen_q, seqlen_k) [FP32]
-        denom_out: optional (bs, seqlen_q) [FP32] — LogSumExp denom
+        out: required (bs, seqlen_q, seqlen_k) [FP32], contiguous
+        denom_out: required (bs, seqlen_q) [FP32], contiguous — LogSumExp denom
 
     THD layout (when cu_seqlens_q/k supplied):
         q: (total_q, n_heads_q, head_dim) [BF16]
         k: (total_k, n_heads_kv, head_dim) [BF16]
         weights: (total_q, n_heads_q) [BF16]
-        out: optional (total_q, max_seqlen_k) [FP32]
-        denom_out: optional (total_q,) [FP32]
+        out: required (total_q, max_seqlen_k) [FP32], contiguous
+        denom_out: required (total_q,) [FP32], contiguous
+
+    Inputs need a unit innermost stride; layout/dtype mismatches raise
+    ``ValueError`` (nothing is copied or cast here).
 
     Both dense-indexer implementations fill causal-invalid score entries
     with -inf, matching raw-logit mask semantics. Denom/LSE semantics are
@@ -840,9 +852,8 @@ def _dense_indexer_score_recompute(
         (out, denom_out)
     """
     current_stream = _resolve_stream(current_stream)
-    q, k, weights = [maybe_contiguous(t, current_stream) for t in (q, k, weights)]
-    q_scale = maybe_contiguous(q_scale, current_stream)
-    k_scale = maybe_contiguous(k_scale, current_stream)
+    for t, name in ((q, "q"), (k, "k"), (weights, "weights"), (q_scale, "q_scale"), (k_scale, "k_scale")):
+        _require_unit_innermost(t, name)
     precision = _normalize_dense_precision(
         precision,
         q_scale,
@@ -916,16 +927,8 @@ def _dense_indexer_score_recompute(
             is_varlen=is_varlen,
         )
 
-    device = q.device
-
-    if out is None:
-        out_shape = (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k)
-        with _torch_stream_context(current_stream):
-            out = torch.empty(out_shape, dtype=torch.float32, device=device)
-    if denom_out is None:
-        denom_shape = (q.shape[0],) if is_varlen else (bs, seqlen_q)
-        with _torch_stream_context(current_stream):
-            denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
+    _require_fp32_output(out, "out", (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k))
+    _require_fp32_output(denom_out, "denom_out", (q.shape[0],) if is_varlen else (bs, seqlen_q))
     head_dim_padded = int(math.ceil(head_dim / 16) * 16)
     if k_block_size is None:
         k_block_size = _select_dense_k_block_size(head_dim_padded, m_block_size, n_block_size, per_head_elem_bytes=2)
@@ -1116,8 +1119,6 @@ def _dense_attn_score_recompute(
     lse: torch.Tensor,
     softmax_scale: float,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    denom_out: Optional[torch.Tensor] = None,
     m_block_size: Optional[int] = None,
     n_block_size: int = 128,
     k_block_size: Optional[int] = None,
@@ -1128,6 +1129,8 @@ def _dense_attn_score_recompute(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
+    out: torch.Tensor,
+    denom_out: torch.Tensor,
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
@@ -1143,23 +1146,25 @@ def _dense_attn_score_recompute(
         q: (bs, seqlen_q, n_heads_q, head_dim) [BF16]
         k: (bs, seqlen_k, n_heads_kv, head_dim) [BF16]
         lse: (bs, seqlen_q, n_heads_q) [FP32]
-        out: optional (bs, seqlen_q, seqlen_k) [FP32]
-        denom_out: optional (bs, seqlen_q) [FP32] — L1-norm denom
+        out: required (bs, seqlen_q, seqlen_k) [FP32], contiguous
+        denom_out: required (bs, seqlen_q) [FP32], contiguous — L1-norm denom
 
     THD layout (when cu_seqlens_q/k supplied):
         q: (total_q, n_heads_q, head_dim) [BF16]
         k: (total_k, n_heads_kv, head_dim) [BF16]
         lse: (total_q, n_heads_q) [FP32]
-        out: optional (total_q, max_seqlen_k) [FP32]
-        denom_out: optional (total_q,) [FP32]
+        out: required (total_q, max_seqlen_k) [FP32], contiguous
+        denom_out: required (total_q,) [FP32], contiguous
+
+    Inputs need a unit innermost stride; layout/dtype mismatches raise
+    ``ValueError`` (nothing is copied or cast here).
 
     Returns:
         (out, denom_out)
     """
     current_stream = _resolve_stream(current_stream)
-    q, k = [maybe_contiguous(t, current_stream) for t in (q, k)]
-    q_scale = maybe_contiguous(q_scale, current_stream)
-    k_scale = maybe_contiguous(k_scale, current_stream)
+    for t, name in ((q, "q"), (k, "k"), (lse, "lse"), (q_scale, "q_scale"), (k_scale, "k_scale")):
+        _require_unit_innermost(t, name)
     precision = _normalize_dense_precision(
         precision,
         q_scale,
@@ -1199,10 +1204,6 @@ def _dense_attn_score_recompute(
     if m_block_size is None:
         m_block_size = qhead_per_kv_head
 
-    device = q.device
-
-    lse = maybe_contiguous(lse, current_stream)
-
     if precision == "mxfp8":
         _validate_dense_mxfp8_contract(
             q=q,
@@ -1224,14 +1225,8 @@ def _dense_attn_score_recompute(
             is_varlen=is_varlen,
         )
 
-    if out is None:
-        out_shape = (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k)
-        with _torch_stream_context(current_stream):
-            out = torch.empty(out_shape, dtype=torch.float32, device=device)
-    if denom_out is None:
-        denom_shape = (q.shape[0],) if is_varlen else (bs, seqlen_q)
-        with _torch_stream_context(current_stream):
-            denom_out = torch.empty(denom_shape, dtype=torch.float32, device=device)
+    _require_fp32_output(out, "out", (q.shape[0], seqlen_k) if is_varlen else (bs, seqlen_q, seqlen_k))
+    _require_fp32_output(denom_out, "denom_out", (q.shape[0],) if is_varlen else (bs, seqlen_q))
     if precision == "mxfp8" and ((head_dim == 512 and qhead_per_kv_head >= 128) or (head_dim == 128 and qhead_per_kv_head == 64)):
         with _torch_stream_context(current_stream):
             out.zero_()
@@ -1439,8 +1434,6 @@ def dense_indexer_score_recompute(
     k: torch.Tensor,
     weights: torch.Tensor,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    denom_out: Optional[torch.Tensor] = None,
     sm_scale: float = 1.0,
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -1449,6 +1442,8 @@ def dense_indexer_score_recompute(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
+    out: torch.Tensor,
+    denom_out: torch.Tensor,
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
@@ -1474,9 +1469,9 @@ def dense_indexer_score_recompute(
         k: BSHD ``(bs, seqlen_k, n_heads_kv, head_dim)`` or THD
            ``(total_k, n_heads_kv, head_dim)`` [BF16]
         weights: BSH ``(bs, seqlen_q, n_heads_q)`` or TH ``(total_q, n_heads_q)`` [BF16]
-        out: optional. BSHD ``(bs, seqlen_q, seqlen_k)``;
+        out: required, contiguous. BSHD ``(bs, seqlen_q, seqlen_k)``;
              THD ``(total_q, max_seqlen_k)`` [FP32]
-        denom_out: optional. BSHD ``(bs, seqlen_q)`` ; THD ``(total_q,)`` [FP32]
+        denom_out: required, contiguous. BSHD ``(bs, seqlen_q)`` ; THD ``(total_q,)`` [FP32]
         sm_scale: scalar applied to fp32 score post head-reduce; default 1.0
         ratio, cu_seqlens_*, max_seqlen_*: see causal mask + THD docs.
 
@@ -1499,8 +1494,8 @@ def dense_indexer_score_recompute(
         k,
         weights,
         qhead_per_kv_head,
-        out,
-        denom_out,
+        out=out,
+        denom_out=denom_out,
         m_block_size=m,
         n_block_size=n,
         k_block_size=kbs,
@@ -1527,8 +1522,6 @@ def dense_attn_score_recompute(
     lse: torch.Tensor,
     softmax_scale: float,
     qhead_per_kv_head: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    denom_out: Optional[torch.Tensor] = None,
     ratio: int = 1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
@@ -1536,6 +1529,8 @@ def dense_attn_score_recompute(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
+    out: torch.Tensor,
+    denom_out: torch.Tensor,
     precision: str = "bf16",
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
@@ -1557,9 +1552,9 @@ def dense_attn_score_recompute(
            ``(total_k, n_heads_kv, head_dim)`` [BF16]
         lse: BSH ``(bs, seqlen_q, n_heads_q)`` or TH ``(total_q, n_heads_q)`` [FP32]
         softmax_scale: float
-        out: optional. BSHD ``(bs, seqlen_q, seqlen_k)``;
+        out: required, contiguous. BSHD ``(bs, seqlen_q, seqlen_k)``;
              THD ``(total_q, max_seqlen_k)`` [FP32]
-        denom_out: optional. BSHD ``(bs, seqlen_q)`` ; THD ``(total_q,)`` [FP32]
+        denom_out: required, contiguous. BSHD ``(bs, seqlen_q)`` ; THD ``(total_q,)`` [FP32]
         ratio, cu_seqlens_*, max_seqlen_*: see causal mask + THD docs.
 
     Returns:
@@ -1585,8 +1580,8 @@ def dense_attn_score_recompute(
         lse,
         softmax_scale,
         qhead_per_kv_head,
-        out,
-        denom_out,
+        out=out,
+        denom_out=denom_out,
         m_block_size=m,
         n_block_size=n,
         k_block_size=kbs,

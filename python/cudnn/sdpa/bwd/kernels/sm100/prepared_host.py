@@ -1,0 +1,304 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Pointer host for the large-head SM100 backward chain."""
+
+from dataclasses import dataclass
+from typing import Optional
+
+import cutlass
+import cutlass.cute as cute
+from cuda.bindings import driver
+
+from cudnn.frost.compiled_cache import compile_cached
+from cudnn.frost.tile_dsl.tma import st_global_v4
+from cudnn.sdpa.bwd.kernels.bprop_chain_common import dkv_reduce_host, dot_do_o_host
+from cudnn.sdpa.bwd.kernels.sm120.prepared_host import _scratch, _view
+from cudnn.sdpa.bwd.kernels.thd_helpers import thd_bwd_setup_host
+
+
+@dataclass(frozen=True)
+class Params:
+    batch: int
+    heads: int
+    kv_heads: int
+    dim: int
+    q_max: int
+    kv_max: int
+    q_rows: int
+    kv_rows: int
+    chunk: int
+    thd: bool
+    zero_workspace: bool
+    units: int
+    granularity: int
+    # The dQ rendering's B head group (`MatmulTemplateParams.b_head_group`, copied off the record by the adapter): the GQA
+    # group = one dQ launch per head chunk, 1 = one per group member.  Part of the compile key (through `params`) and of
+    # the traced host, so the twin never gets served the shipped artifact.  Appended last (the config tuple is positional).
+    dq_b_head_group: int = 1
+
+
+@cute.kernel
+def _zero_workspace(first: cute.Tensor, second: cute.Tensor):
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    blocks, _, _ = cute.arch.grid_dim()
+    i = cutlass.Int64(bid) * 256 + tid
+    # S/dS are compact half-precision regions with tile-rounded dimensions and
+    # 128-byte-aligned bases. One 128-bit store clears eight elements; scalar
+    # stores launch excessive blocks and regress small packed-THD replay.
+    first_addr, second_addr = first.iterator.toint(), second.iterator.toint()
+    while i < cute.size(first) // 8:
+        zeros = [cutlass.Int32(0)] * 4
+        st_global_v4(first_addr + i * 16, zeros, cutlass.Int32)
+        st_global_v4(second_addr + i * 16, zeros, cutlass.Int32)
+        i += cutlass.Int64(blocks) * 256
+
+
+_zero_workspace.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def _heads(tensor: cute.Tensor, begin, count: cutlass.Constexpr, step: cutlass.Constexpr = 1):
+    shape = (tensor.shape[0], tensor.shape[1], count, tensor.shape[3])
+    strides = (tensor.stride[0], tensor.stride[1], tensor.stride[2] * step, tensor.stride[3])
+    return cute.make_tensor(tensor.iterator + cutlass.Int64(begin) * tensor.stride[2], cute.make_layout(shape, stride=strides))
+
+
+@cute.jit
+def _workspace_heads(tensor: cute.Tensor, begin, count: cutlass.Constexpr, step: cutlass.Constexpr):
+    shape = (tensor.shape[0], count, tensor.shape[2], tensor.shape[3])
+    strides = (tensor.stride[0], tensor.stride[1] * step, tensor.stride[2], tensor.stride[3])
+    return cute.make_tensor(tensor.iterator + cutlass.Int64(begin) * tensor.stride[1], cute.make_layout(shape, stride=strides))
+
+
+@cute.jit
+def _permuted(tensor: cute.Tensor, order: cutlass.Constexpr):
+    return cute.make_tensor(tensor.iterator, cute.make_layout(tuple(tensor.shape[i] for i in order), stride=tuple(tensor.stride[i] for i in order)))
+
+
+@cute.jit
+def _matmul(entry: cutlass.Constexpr, a, b, output, heads: cutlass.Constexpr, batches: cutlass.Constexpr, grid_m: cutlass.Constexpr, meta, desc, stream):
+    # Widen dimensions and strides before the stage-3 descriptor's byte products.
+    problem = tuple(
+        cutlass.Int64(x)
+        for x in (grid_m, b.shape[0], a.shape[1], heads, batches, *a.stride, *b.stride, *output.stride, b.shape[1], a.shape[0], output.shape[0])
+    )
+    entry(problem, a, b, output, meta, desc, stream)
+
+
+@cute.jit
+def host(
+    q_ptr: cute.Pointer,
+    k_ptr: cute.Pointer,
+    v_ptr: cute.Pointer,
+    o_ptr: cute.Pointer,
+    do_ptr: cute.Pointer,
+    stats_ptr: cute.Pointer,
+    dq_ptr: cute.Pointer,
+    dk_ptr: cute.Pointer,
+    dv_ptr: cute.Pointer,
+    q_lens_ptr: Optional[cute.Pointer],
+    kv_lens_ptr: Optional[cute.Pointer],
+    workspace: cute.Pointer,
+    scale_log2: cutlass.Float32,
+    scale: cutlass.Float32,
+    lens_form: cutlass.Int32,
+    stage2: cutlass.Constexpr,
+    mm_lo: cutlass.Constexpr,
+    mm_hi: cutlass.Constexpr,
+    config: cutlass.Constexpr,
+    geometry: cutlass.Constexpr,
+    regions: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    stream: driver.CUstream,
+):
+    batch, heads, kv_heads, dim, q_max, kv_max, q_rows, kv_rows, chunk, thd, zero_workspace, units, granularity, dq_b_head_group = config
+    q = _view(q_ptr, geometry[0])
+    k = _view(k_ptr, geometry[1])
+    v = _view(v_ptr, geometry[2])
+    o = _view(o_ptr, geometry[3])
+    do = _view(do_ptr, geometry[4])
+    stats = _view(stats_ptr, geometry[5])
+    dq = _view(dq_ptr, geometry[6])
+    dk = _view(dk_ptr, geometry[7])
+    dv = _view(dv_ptr, geometry[8])
+    delta = _scratch(workspace, regions[0], cutlass.Float32)
+    s_full = _scratch(workspace, regions[1], dtype)
+    ds_full = _scratch(workspace, regions[2], dtype)
+    meta = _scratch(workspace, regions[3], cutlass.Int32)
+    desc2 = _scratch(workspace, regions[4], cutlass.Int64)
+    desc3 = desc2
+    if cutlass.const_expr(thd):
+        # All three GEMMs patch this descriptor scratch immediately before
+        # launching; sequential launches on this stream serialize its reuse.
+        desc3 = _scratch(workspace, regions[5], cutlass.Int64)
+        # The setup kernel branches on lens_form before reading the prefix tail.
+        q_lens = _view(q_lens_ptr, ((batch + 1,), (1,)))
+        kv_lens = _view(kv_lens_ptr, ((batch + 1,), (1,)))
+        # `live` counts the units ONE stage-2 launch decodes: `chunk` heads, not
+        # `heads`.  Every launch of the head-chunk loop below hands the kernel
+        # `n_qh = chunk`, so a total published for all `heads` makes the
+        # persistent scheduler hand out `(heads - chunk) * q_units` dead units
+        # per launch.  The claim counter the same call seeds serves only the
+        # FIRST launch; stage 2's clamp kernel re-seeds it before each launch.
+        thd_bwd_setup_host(meta, q_lens, kv_lens, lens_form, chunk, batch, 128, granularity, units, stream)
+    # Zero once outside the head-chunk loop: stage 2 leaves mask-skipped tiles
+    # unwritten, and stage 3 can consume a wider tile. The skipped set is the
+    # same for every chunk, including THD (its per-sequence K-trim, THD_STAGE3_TRIM, still consumes a 512-row M tile
+    # that straddles two 256-row blocks).
+    if cutlass.const_expr(zero_workspace):
+        _zero_workspace(s_full, ds_full).launch(grid=(min((cute.size(s_full) // 8 + 255) // 256, 4096), 1, 1), block=(256, 1, 1), stream=stream)
+    padded_dim = (dim + 63) // 64 * 64
+    dot_do_o_host(o, do, delta, None, None, 128, padded_dim, padded_dim, 64, False, False, stream)
+    group = heads // kv_heads
+    dk_target, dv_target = dk, dv
+    if cutlass.const_expr(group > 1):
+        dk_target = _scratch(workspace, regions[6], dtype)
+        dv_target = _scratch(workspace, regions[7], dtype)
+    s_view, ds_view = s_full, ds_full
+    if cutlass.const_expr(not thd):
+        extent = (batch, chunk, q_max, kv_max)
+        s_view = cute.make_tensor(s_full.iterator, cute.make_layout(extent, stride=s_full.stride))
+        ds_view = cute.make_tensor(ds_full.iterator, cute.make_layout(extent, stride=ds_full.stride))
+    for chunk_id in range(heads // chunk):
+        head_base = chunk_id * chunk
+        problem = (batch, heads, q_rows, kv_rows, chunk, kv_heads, q_max, kv_max, units)
+        stage2(q, k, v, do, s_full, ds_full, stats, delta, meta, desc2, problem, scale, scale_log2, scale, head_base, 0, stream)
+        do_heads = _heads(do, head_base, chunk)
+        q_heads = _heads(q, head_base, chunk)
+        dv_heads = _heads(dv_target, head_base, chunk)
+        dk_heads = _heads(dk_target, head_base, chunk)
+        _matmul(
+            mm_lo,
+            _permuted(s_view, (3, 2, 1, 0)),
+            _permuted(do_heads, (3, 1, 2, 0)),
+            _permuted(dv_heads, (1, 3, 2, 0)),
+            chunk,
+            batch,
+            kv_max,
+            meta,
+            desc3,
+            stream,
+        )
+        _matmul(
+            mm_lo,
+            _permuted(ds_view, (3, 2, 1, 0)),
+            _permuted(q_heads, (3, 1, 2, 0)),
+            _permuted(dk_heads, (1, 3, 2, 0)),
+            chunk,
+            batch,
+            kv_max,
+            meta,
+            desc3,
+            stream,
+        )
+        if cutlass.const_expr(chunk % group != 0):
+            # A budget-limited chunk splits or crosses a GQA group: map each Q
+            # head to its own KV head instead of the group-strided batch below.
+            for local in range(chunk):
+                _matmul(
+                    mm_hi,
+                    _permuted(_workspace_heads(ds_view, local, 1, 1), (2, 3, 1, 0)),
+                    _permuted(_heads(k, (head_base + local) // group, 1), (3, 1, 2, 0)),
+                    _permuted(_heads(dq, head_base + local, 1), (1, 3, 2, 0)),
+                    1,
+                    batch,
+                    q_max,
+                    meta,
+                    desc3,
+                    stream,
+                )
+        else:
+            kv_count = chunk // group
+            k_heads = _heads(k, head_base // group, kv_count)
+            # dQ = dS . K.  Under GQA the K head is shared by `group` Q heads.  The shipped rendering (`dq_b_head_group ==
+            # group`) indexes B by `h // group` itself, so ONE launch covers the chunk's Q heads (A = the whole dS chunk, out =
+            # the whole dQ chunk, B = the chunk's kv_count K heads: `chunk` x M-tiles clusters instead of `kv_count` x M-tiles,
+            # `group` times).  The per-head rendering (`dq_b_head_group == 1`, the `DQ_SINGLE_LAUNCH = False` twin, THD, MHA)
+            # runs once per group MEMBER over every `group`-th Q head, so each launch's A / out heads line up with its B heads.
+            # Both walk the same k tiles per output tile: bitwise-equal dQ.  dK/dV instead write per-Q-head partials and
+            # reduce below.
+            n_launch = _dq_launches(group, dq_b_head_group)
+            heads_per_launch = chunk // n_launch  # Q heads per dQ launch: kv_count * dq_b_head_group
+            for member in range(n_launch):
+                a = _workspace_heads(ds_view, member, heads_per_launch, n_launch)
+                output = _heads(dq, head_base + member, heads_per_launch, n_launch)
+                _matmul(
+                    mm_hi,
+                    _permuted(a, (2, 3, 1, 0)),
+                    _permuted(k_heads, (3, 1, 2, 0)),
+                    _permuted(output, (1, 3, 2, 0)),
+                    heads_per_launch,
+                    batch,
+                    q_max,
+                    meta,
+                    desc3,
+                    stream,
+                )
+    if cutlass.const_expr(group > 1):
+        dkv_reduce_host(dk_target, dv_target, dk, dv, dim, dim, group, dtype, False, stream)
+
+
+def _dq_launches(group: int, dq_b_head_group: int) -> int:
+    """How many dQ GEMM launches one head chunk takes: ``group // dq_b_head_group`` -- 1 when the dQ rendering groups its B
+    head by the GQA group (``MatmulTemplateParams.b_head_group == group``), ``group`` when B is batched per head (the
+    per-member loop).  Plain Python at trace time, so a rendering / host mismatch -- which would silently pair a Q head with
+    the wrong K head -- raises instead of launching.  The cc 10.7 d256 chain's ``kernels.sm107.prepared_host._dq_launches``
+    is the same function; kept per chain because each host is traced from its own module."""
+    if dq_b_head_group not in (1, group):
+        raise ValueError(
+            f"SM100 bwd d512 stage 3: the dQ rendering's b_head_group ({dq_b_head_group}) must be 1 (one launch per GQA group member) or the group "
+            f"({group}, one launch per chunk); nothing in between pairs every Q head with its K head"
+        )
+    return group // dq_b_head_group
+
+
+def compile_host(stage2, mm_lo, mm_hi, params, geometry, regions, dtype, sm, cache_key, symbol="frost_sdpa_bwd_sm100_prepared"):
+    # Source codegen domain: the SM100 line proper (SM100 / SM103, where the ``sdpa_bwd_sm100`` row is qualified) and the
+    # Rubin line as a RANGE (cc 10.7 up to the SM100 line's end, the ``sdpa_bwd_sm107_d512`` row's ``_RUBIN`` span -- the
+    # part that ships next is not declined by a list).  Other targets are used for isolated lowering checks only.
+    # ``symbol`` is the artifact's exported entry (``frost_<engine name>_prepared``, Rule 6): one per engine row.
+    if not (sm in (100, 103) or 107 <= sm <= 119):
+        raise ValueError(f"SM100 SDPA bwd has codegen targets for SM100, SM103 and the Rubin line SM107-SM119; got SM{sm}")
+
+    def ptr(t, align=16):
+        return cute.runtime.make_ptr(t, 16, cute.AddressSpace.gmem, assumed_align=align)
+
+    args = [ptr(dtype) for _ in range(5)] + [ptr(cutlass.Float32, 4)] + [ptr(dtype) for _ in range(3)]
+    args += [ptr(cutlass.Int32, 4) if params.thd else None for _ in range(2)]
+    # The persistent artifact wrapper accepts primitive constexpr tuples; a
+    # dataclass argument prevents export even when it is compile-time-only.
+    return compile_cached(
+        host,
+        *args,
+        ptr(cutlass.Uint8),
+        cutlass.Float32(1),
+        cutlass.Float32(1),
+        cutlass.Int32(0),
+        stage2,
+        mm_lo,
+        mm_hi,
+        (
+            params.batch,
+            params.heads,
+            params.kv_heads,
+            params.dim,
+            params.q_max,
+            params.kv_max,
+            params.q_rows,
+            params.kv_rows,
+            params.chunk,
+            params.thd,
+            params.zero_workspace,
+            params.units,
+            params.granularity,
+            params.dq_b_head_group,
+        ),
+        geometry,
+        regions,
+        dtype,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+        options=f"--enable-tvm-ffi --gpu-arch sm_{sm}a",
+        cache_key=cache_key,
+        symbol=symbol,
+    )

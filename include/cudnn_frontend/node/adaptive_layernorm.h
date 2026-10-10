@@ -60,12 +60,14 @@ class AdaLayerNormNode : public NodeCRTP<AdaLayerNormNode> {
             scale->set_stride(detail::generate_stride(scale_dim, stride_order));
         }
 
-        auto bias = attributes.inputs[AdaLayernorm_attributes::input_names::BIAS];
+        // bias is optional (#188)
+        auto bias_it = attributes.inputs.find(AdaLayernorm_attributes::input_names::BIAS);
+        auto bias    = (bias_it != attributes.inputs.end()) ? bias_it->second : nullptr;
         // Only infer dims and strides if user did not set them
-        if (bias->get_dim().empty()) {
+        if (bias && bias->get_dim().empty()) {
             bias->set_dim(scale_bias_dim);
         }
-        if (bias->get_stride().empty()) {
+        if (bias && bias->get_stride().empty()) {
             auto const& bias_dim = bias->get_dim();
             std::vector<int64_t> stride_order;
             CHECK_CUDNN_FRONTEND_ERROR(
@@ -185,7 +187,7 @@ class AdaLayerNormNode : public NodeCRTP<AdaLayerNormNode> {
                                                        &backend_scale));
 
         auto Bias_iter = attributes.inputs.find(AdaLayernorm_attributes::input_names::BIAS);
-        if (Bias_iter != attributes.inputs.end() && Bias_iter->second->get_is_virtual() == false) {
+        if (Bias_iter != attributes.inputs.end() && Bias_iter->second && Bias_iter->second->get_is_virtual() == false) {
             auto backend_bias = tensors[Bias_iter->second->get_uid()]->get_desc()->get_backend_descriptor();
             _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(adalayernorm_operation->get_backend_descriptor(),
                                                            CUDNN_ATTR_OPERATION_NORM_FWD_BIAS_DESC,

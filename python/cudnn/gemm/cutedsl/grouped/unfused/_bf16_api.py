@@ -16,6 +16,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from cudnn.api_base import APIBase, TensorDesc
+from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
@@ -265,15 +266,7 @@ class GroupedGemmBf16API(APIBase):
         key = (b_ptrs.device, int(current_stream))
         launch_stream = self._launch_stream_cache.get(key)
         if launch_stream is None:
-            handle = int(current_stream)
-            torch_current = torch.cuda.current_stream(b_ptrs.device)
-            torch_default = torch.cuda.default_stream(b_ptrs.device)
-            if handle == torch_current.cuda_stream:
-                launch_stream = torch_current
-            elif handle == torch_default.cuda_stream:
-                launch_stream = torch_default
-            else:
-                launch_stream = torch.cuda.ExternalStream(handle, device=b_ptrs.device)
+            launch_stream = as_torch_stream(int(current_stream), b_ptrs.device)
             self._launch_stream_cache[key] = launch_stream
         b_ptrs.record_stream(launch_stream)
 
@@ -353,8 +346,10 @@ class GroupedGemmBf16API(APIBase):
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
         if self.m_aligned != MoEGroupedGemmBf16Kernel.FIX_PAD_SIZE:
             raise ValueError(f"m_aligned must be 256, got {self.m_aligned}")
-        if self.b_major != "k":
-            raise ValueError(f"b_major must be 'k' for the BF16 backend, got {self.b_major}")
+        if self.b_major not in ("k", "n"):
+            raise ValueError(f"b_major must be 'k' or 'n', got {self.b_major}")
+        if self.weight_mode == MoEWeightMode.DENSE and self.b_major != "k":
+            raise ValueError("Dense BF16 weights require b_major='k'")
         if self.expert_cnt <= 0 or self.expert_cnt > 1024:
             raise ValueError(f"expert count must be in [1, 1024], got {self.expert_cnt}")
         if tensor_m % 256 != 0:
@@ -388,7 +383,7 @@ class GroupedGemmBf16API(APIBase):
             k,
             self.expert_cnt,
             "k",
-            "k",
+            self.b_major,
             "n",
             self.m_aligned,
         ):
@@ -481,7 +476,7 @@ class GroupedGemmBf16API(APIBase):
             n, k = self.b_shape[:2]
             n_value = cutlass.Int32(n)
             k_value = cutlass.Int32(k)
-            b_stride = cutlass.Int64(k)
+            b_stride = cutlass.Int64(k if self.b_major == "k" else n)
 
         raw_compiled = cute.compile(
             kernel,
@@ -490,7 +485,7 @@ class GroupedGemmBf16API(APIBase):
             n=n_value,
             k=k_value,
             b_stride_size=b_stride,
-            b_major_mode=OperandMajorMode.K,
+            b_major_mode=OperandMajorMode.K if self.b_major == "k" else OperandMajorMode.MN,
             workspace_ptr=workspace_ptr,
             c=c_fake,
             d=d_fake,

@@ -6,7 +6,10 @@
 import math
 
 import pytest
+
 import torch
+
+from cudnn.frost.compiled_cache import positional_entry
 
 from frost_test_utils import requires_dsl, requires_pre_rubin_blackwell
 
@@ -77,7 +80,6 @@ def _check(o, lse, o_storage, o_used, lse_storage, lse_used, ref_o, ref_lse, sta
 @pytest.mark.parametrize("stats", ["none", "ln", "log2"])
 @pytest.mark.parametrize("layout", ["compact", "strided", "int64_singleton"])
 def test_pointer_combine_strided_outputs_and_dead_splits(dtype, stats, layout):
-    from cudnn.frost.compiled_cache import positional_entry
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     b, h, sq, d, splits = (1 if layout == "int64_singleton" else 2), 3, 5, 160, 3
@@ -102,8 +104,26 @@ def test_pointer_combine_strided_outputs_and_dead_splits(dtype, stats, layout):
     _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, stats == "log2")
 
 
+@pytest.mark.parametrize("layout", ["compact", "strided"])
+@pytest.mark.parametrize("d", [5, 66, 130], ids=lambda d: f"d{d}")
+def test_pointer_combine_head_dim_not_multiple_of_four(d, layout):
+    """The pointer entry takes a runtime d_v: a lane whose four columns run past
+    the row must neither read nor write the next row (the strided layout's
+    untouched storage would show an overwrite)."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
+
+    b, h, sq, splits = 2, 3, 5, 3
+    op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
+    ostride, lstride = _strides(b, h, sq, d, layout)
+    o, ostorage, oused = _output((b, sq, h, d), ostride, torch.bfloat16)
+    lse, lstorage, lused = _output((b, h, sq), lstride, torch.float32)
+    fn = positional_entry(comb.compile_ptr(dtype_o="bf16", has_lse=True))
+    assert fn is not None
+    fn(op.data_ptr(), lp.data_ptr(), o.data_ptr(), lse.data_ptr(), (b, h, sq, d), splits, ostride, lstride, torch.cuda.current_stream().cuda_stream)
+    _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, False)
+
+
 def test_pointer_combine_reuses_artifact_for_new_shapes():
-    from cudnn.frost.compiled_cache import positional_entry
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     owner = comb.compile_ptr(dtype_o="bf16", has_lse=True)
@@ -118,11 +138,72 @@ def test_pointer_combine_reuses_artifact_for_new_shapes():
         _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, False)
 
 
-@pytest.mark.parametrize("layout", ["compact", "strided", "int64_singleton"])
-def test_tensor_combine_strided_output(layout):
-    import cutlass
-    import cuda.bindings.driver as cuda_driver
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("stats", ["none", "ln", "log2"])
+def test_packed_combine_live_total_and_runtime_split_boundary(dtype, stats):
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
+    owner = comb.compile_ptr(dtype_o="f16" if dtype == torch.float16 else "bf16", has_lse=stats != "none", stats_log2=stats == "log2", packed=True)
+    fn = positional_entry(owner)
+    assert fn is not None
+    b, h, sq, d = 1, 3, 7, 160
+    ostride, lstride = _strides(b, h, sq, d, "int64_singleton")
+    for splits in (2, 8, 32, 33):
+        op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
+        o, ostorage, oused = _output((b, sq, h, d), ostride, dtype)
+        lse, lstorage, lused = _output((b, h, sq), lstride, torch.float32) if stats != "none" else (None, None, None)
+        total = torch.tensor([sq], device="cuda", dtype=torch.int32)
+
+        def run():
+            fn(
+                op.data_ptr(),
+                lp.data_ptr(),
+                o.data_ptr(),
+                lse.data_ptr() if lse is not None else None,
+                (b, h, sq, d),
+                splits,
+                ostride,
+                lstride,
+                total.data_ptr(),
+                torch.cuda.current_stream().cuda_stream,
+                None,  # This direct packed entry has no sink.
+            )
+
+        def check(live):
+            expected = torch.full_like(ref_o, -31)
+            expected[:, :live] = ref_o[:, :live]
+            torch.testing.assert_close(o.cpu().float(), expected.float(), atol=0.004, rtol=0.004)
+            assert torch.all(ostorage.cpu()[~oused] == -31)
+            if lse is not None:
+                expected_lse = torch.full_like(ref_lse, -31)
+                expected_lse[:, :, :live] = ref_lse[:, :, :live] * (math.log2(math.e) if stats == "log2" else 1)
+                torch.testing.assert_close(lse.cpu().double(), expected_lse, atol=2e-5, rtol=2e-5)
+                assert torch.all(lstorage.cpu()[~lused] == -31)
+
+        run()
+        check(sq)
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(captured):
+                run()
+            for live in (3, 0):
+                # The captured launch has seven rows of capacity. Device total
+                # changes must prevent both partial-tail reads and final stores.
+                total.fill_(live)
+                op[:, live:].fill_(torch.nan)
+                lp[:, :, live:].fill_(torch.nan)
+                ostorage.fill_(-31)
+                if lstorage is not None:
+                    lstorage.fill_(-31)
+                captured.replay()
+                check(live)
+        finally:
+            captured.reset()
+
+
+@pytest.mark.parametrize("layout", ["compact", "strided", "int64_singleton"])
+def test_pointer_combine_fp16_strided_output(layout):
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     b, h, sq, d, splits = (1 if layout == "int64_singleton" else 2), 3, 5, 160, 3
@@ -130,27 +211,40 @@ def test_tensor_combine_strided_output(layout):
     ostride, lstride = _strides(b, h, sq, d, layout)
     o, ostorage, oused = _output((b, sq, h, d), ostride, torch.float16)
     lse, lstorage, lused = _output((b, h, sq), lstride, torch.float32)
-    fn = comb.compile(b, h, sq, d, splits, has_lse=True, lse_stride=lstride, dtype_partial="f32", o_stride=ostride)
-    fn(op, lp, o, lse, None, None, (b, h, sq, d), cutlass.Int32(splits), stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream))
+    fn = positional_entry(comb.compile_ptr(has_lse=True, dtype_partial="f32"))
+    fn(op.data_ptr(), lp.data_ptr(), o.data_ptr(), lse.data_ptr(), (b, h, sq, d), splits, o.stride(), lse.stride(), torch.cuda.current_stream().cuda_stream)
     _check(o, lse, ostorage, oused, lstorage, lused, ref_o, ref_lse, False)
 
 
 @pytest.mark.parametrize("dtype,tag", [(torch.float8_e4m3fn, "e4m3"), (torch.float8_e5m2, "e5m2")])
-def test_quantized_tensor_combine_keeps_scale_and_amax(dtype, tag):
-    import cutlass
-    import cuda.bindings.driver as cuda_driver
-
+def test_quantized_pointer_combine_keeps_scale_and_amax(dtype, tag):
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine as comb
 
     b, h, sq, d, splits = 2, 3, 5, 160, 3
     op, lp, ref_o, ref_lse = _partials(b, h, sq, d, splits)
-    # Existing quantized callers keep the compact ABI (no o_stride argument).
+    # Quantized outputs bind current pointers and physical output strides.
     o = torch.empty((b, sq, h, d), device="cuda", dtype=dtype)
     lse = torch.full((b, h, sq), torch.nan, device="cuda")
     amax = torch.zeros(1, dtype=torch.float32, device="cuda")
     scale = torch.tensor([1.75], dtype=torch.float32, device="cuda")
-    fn = comb.compile(b, h, sq, d, splits, dtype_o=tag, has_lse=True, has_amax=True, dtype_partial="f32", has_scale_o=True, stats_log2=True)
-    fn(op, lp, o, lse, amax, scale, (b, h, sq, d), cutlass.Int32(splits), stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream))
+    fn = positional_entry(
+        comb.compile_ptr(
+            dtype_o=tag, has_lse=True, has_amax=True, dtype_partial="f32", has_scale_o=True, stats_log2=True, quantized=True, has_scale_o_input=True
+        )
+    )
+    fn(
+        op.data_ptr(),
+        lp.data_ptr(),
+        o.data_ptr(),
+        lse.data_ptr(),
+        (b, h, sq, d),
+        splits,
+        o.stride(),
+        lse.stride(),
+        amax.data_ptr(),
+        scale.data_ptr(),
+        torch.cuda.current_stream().cuda_stream,
+    )
     torch.cuda.synchronize()
     expected = (ref_o * 1.75).float().to(dtype).float()
     # A last-bit pre-quant reduction difference may cross one quantization midpoint.

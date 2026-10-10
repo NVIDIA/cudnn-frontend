@@ -18,9 +18,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cute.nvgpu import LoadCacheMode, OperandMajorMode, cpasync, warp, warpgroup
 from cutlass.cutlass_dsl import Arch, BaseDSL
-from cutlass.utils import (
-    LayoutEnum,
-)
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.block_sparse_attention.csrc.utils import copy_utils, kernel_utils as utils, layout_utils, pipeline, sm90_utils
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase, assume_tensor_aligned
@@ -739,7 +737,7 @@ class BlockSparseAttnBackwardSm90Blk64:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
         sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
@@ -1123,7 +1121,7 @@ class BlockSparseAttnBackwardSm90Blk64:
                 if const_expr(atom is not None):
                     cpasync.prefetch_descriptor(atom)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
@@ -1496,10 +1494,18 @@ class BlockSparseAttnBackwardSm90Blk64:
                     tdVrP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
                     copy_P_r2s(tdVrP, dst_idx=smem_idx_PdS)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.barrier_arrive(
-                        barrier_id=int(NamedBarrierBwd.PReady) + smem_idx_PdS,
-                        number_of_threads=self.num_mma_threads,
-                    )
+                    # WG2 loads V into registers before reaching PReady.
+                    # Wait once before sV can be reused as FP32 dV scratch.
+                    if pds_iter == 0:
+                        cute.arch.barrier(
+                            barrier_id=int(NamedBarrierBwd.PReady) + smem_idx_PdS,
+                            number_of_threads=self.num_mma_threads,
+                        )
+                    else:
+                        cute.arch.barrier_arrive(
+                            barrier_id=int(NamedBarrierBwd.PReady) + smem_idx_PdS,
+                            number_of_threads=self.num_mma_threads,
+                        )
 
                     pipeline_dO.consumer_wait(
                         consumer_state_dO_cur,

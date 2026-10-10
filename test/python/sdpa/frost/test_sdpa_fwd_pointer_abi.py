@@ -40,6 +40,7 @@ def _load(arch, template, d_qk, d_v, **overrides):
         ("sm107", "prefill_d128_f16", 128, 128),
         ("sm107", "prefill_d192_d128_f16", 192, 128),
         ("sm107", "prefill_d512_f16", 512, 512),
+        ("sm107", "decode_d256_f16", 256, 256),
     ],
 )
 def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
@@ -55,7 +56,8 @@ def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
 
     import cuda.bindings.driver as cuda_driver
 
-    paged = arch == "sm100" and template != "prefill_d512_f16"
+    # Every SM100 template but the d512 prefill wires paged KV; on the Rubin line only the decode tile does.
+    paged = template.startswith("decode") or (arch == "sm100" and template != "prefill_d512_f16")
     mod = _load(arch, template, d_qk, d_v, **(dict(paged_kv=True, page_size=128) if paged else {}))
     fn = mod.compile(d_qk=d_qk, d_v=d_v, has_lse=True, paged_hnd=False)
     gen = torch.Generator(device="cuda").manual_seed(17)
@@ -101,6 +103,32 @@ def test_page_table_singleton_batch_stride_is_int64(arch, template, d_qk, d_v):
     torch.testing.assert_close(lse[0], scores.logsumexp(-1).float(), atol=2e-3, rtol=2e-3)
 
 
+def test_gate_in_combine_binding_keeps_the_plans_device_check():
+    """The d256 decode tile's gated split binds G outside the native dense binder (prepared.CombineGate), whose
+    operand check therefore never sees it: the binding keeps the plan's CUDA device itself -- a gate observed on the
+    CPU or on another CUDA device is the native binder's own typed error before any launch, an unknown device (a bare
+    address) stays admitted, and the bound frame carries G's address with its strides in the combine's BSHD order."""
+    from cudnn.sdpa.fwd.prepared import _DLPACK_CPU, _DLPACK_CUDA, BufferFacts, CombineGate
+
+    seen = []
+    gate = CombineGate(lambda *frame: seen.append(frame), "bfloat16", (2, 4, 1, 256), (_DLPACK_CUDA, 1))
+    shape, strides = (2, 4, 1, 256), (1024, 256, 1024, 1)  # BHSD facts of a (B, S_q, H, D)-contiguous gate
+
+    def facts(device, ptr=4096):
+        return BufferFacts(ptr, "bfloat16", device, 2048, shape, strides)
+
+    for off in ((_DLPACK_CPU, 0), (_DLPACK_CUDA, 0)):
+        with pytest.raises(ValueError, match="gate must be on this plan's CUDA device"):
+            gate.bind(facts(off))
+        with pytest.raises(RuntimeError, match="no gate bound"):
+            gate(1, 2, 3, 4, 5, 6, 7, 8, 9)  # a refused bind leaves nothing for the launch to consume
+    gate.bind(facts((_DLPACK_CUDA, 1)))
+    gate(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    gate.bind(facts((-1, -1)))  # a bare address: device unknown, admitted as the native binder admits it
+    gate(1, 2, 3, 4, 5, 6, 7, 8, 9)
+    assert [f[8:10] for f in seen] == [(4096, (1024, 1024, 256, 1))] * 2, seen
+
+
 @requires_pre_rubin_blackwell
 @pytest.mark.parametrize("d", [128, 256])
 def test_direct_decode_launch_rejects_wrong_packed_head_ratio(d):
@@ -110,11 +138,44 @@ def test_direct_decode_launch_rejects_wrong_packed_head_ratio(d):
         launch_f16(None, *([None] * 8), (1, 4, 2, 1, 128, 0), 1.0, 0, 0, host=mod._host)
 
 
-@requires_pre_rubin_blackwell
-def test_direct_d256_decode_launch_rejects_rows_outside_tile():
-    mod = _load("sm100", "decode_d256_f16", 256, 256)
+def _fixed_tile_host(n_q, heads_per_tile, token_units):
+    """A stand-in host entry whose module namespace carries the three fields the row guard reads."""
+    namespace = {"N_Q": n_q, "HEADS_PER_TILE": heads_per_tile}
+    if token_units is not None:
+        namespace["Q_TOKEN_UNITS"] = token_units
+    exec("def host():\n    pass", namespace)
+    return namespace["host"]
+
+
+def test_direct_decode_row_guard_yields_to_the_token_unit_axis():
+    """The direct driver's row guard is the fixed-tile contract: a body without ``Q_TOKEN_UNITS`` rejects
+    ``S_q x HEADS_PER_TILE > N_Q``; a body that declares the axis covers the same shape as token units."""
+    from frost_test_utils import check_decode_q_rows
+
+    check_decode_q_rows(_fixed_tile_host(16, 2, None), 8)
+    with pytest.raises(ValueError, match="decode Q rows exceed the compiled 16-row tile"):
+        check_decode_q_rows(_fixed_tile_host(16, 2, None), 17)
     with pytest.raises(ValueError, match="decode Q rows exceed"):
-        launch_f16(None, *([None] * 8), (1, 2, 2, 17, 128, 0), 1.0, 0, 0, host=mod._host)
+        check_decode_q_rows(_fixed_tile_host(16, 2, False), 17)
+    check_decode_q_rows(_fixed_tile_host(16, 2, True), 17)
+
+
+@requires_pre_rubin_blackwell
+def test_direct_d256_decode_launch_follows_the_token_unit_contract(monkeypatch):
+    """The compiled d256 decode body declares the token-unit axis, so ``S_q = 17`` on the 16-row tile is served as
+    ``ceil(17 / Q_BOX_TOKENS)`` units and the direct driver does not reject it; with the flag cleared on the same
+    namespace (a fixed-tile body) the old rejection holds."""
+    import inspect
+
+    from frost_test_utils import check_decode_q_rows
+
+    mod = _load("sm100", "decode_d256_f16", 256, 256)
+    namespace = inspect.unwrap(mod._host).__globals__
+    assert namespace["Q_TOKEN_UNITS"] is True and 17 * namespace["HEADS_PER_TILE"] > namespace["N_Q"]
+    check_decode_q_rows(mod._host, 17)
+    monkeypatch.setitem(namespace, "Q_TOKEN_UNITS", False)
+    with pytest.raises(ValueError, match="decode Q rows exceed"):
+        check_decode_q_rows(mod._host, 17)
 
 
 @requires_pre_rubin_blackwell
@@ -191,3 +252,76 @@ def test_d256_paged_host_rebinds_table_column_stride(batch, splits):
                     expected = scores.softmax(-1) @ values[begin:end]
                     torch.testing.assert_close(o[out_index, 0].float(), expected.float(), atol=2e-3, rtol=2e-3)
                     torch.testing.assert_close(lse[out_index, :, 0], scores.logsumexp(-1).float(), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("d", [256, 512])
+def test_mxfp8_v_scale_plane_stride_multiplies_in_int64(d, monkeypatch):
+    """Trace the real descriptor expression; a late Int64 cast cannot repair overflow."""
+    import cutlass
+    import cutlass.cute as cute
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    mod = _load("sm100", f"prefill_d{d}_mxfp8", d, d, dtype_qkv=0, dtype_o=2, cta_mma=1)
+    original = mod.tmap.create_tensor_map_tiled
+    observed = []
+
+    def inspect_descriptor(*args, **kwargs):
+        # Q/K SF are rank five; dense V SF has a separate D-plane axis.
+        if len(kwargs.get("global_dims", ())) == 4 and kwargs.get("dtype") is cutlass.Uint8:
+            stride = kwargs["global_strides"][1]
+            widths = []
+
+            def visit(value):
+                owner = value.owner
+                if hasattr(owner, "operands"):
+                    if owner.name == "arith.muli":
+                        widths.append(str(value.type))
+                    for operand in owner.operands:
+                        visit(operand)
+
+            visit(stride.ir_value())
+            observed.append((type(stride), widths))
+            # This is a compiler arithmetic probe, never a device launch.
+            raise RuntimeError("inspected V scale plane stride")
+        return original(*args, **kwargs)
+
+    def uncached(fn, *args, **kwargs):
+        kwargs.pop("cache_key", None)
+        kwargs.pop("symbol", None)
+        kwargs["options"] += " --gpu-arch=sm_100a"
+        return cute.compile(fn, *args, **kwargs)
+
+    monkeypatch.setattr(mod.tmap, "create_tensor_map_tiled", inspect_descriptor)
+    monkeypatch.setattr(_mxfp8_host, "_compile_cached", uncached)
+    with pytest.raises(RuntimeError, match="inspected V scale plane stride"):
+        mod.compile_prepared(d_qk=d, d_v=d)
+    assert len(observed) == 1
+    dtype, widths = observed[0]
+    assert dtype is cutlass.Int64
+    assert len(widths) >= 3 and set(widths) == {"i64"}
+
+
+@pytest.mark.parametrize("d,dv", [(128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("has_amax", [False, True])
+def test_mxfp8_prepared_amax_flag_reaches_compiler(d, dv, has_amax, monkeypatch):
+    """The host artifact and specialization cache key must describe the same Amax flag."""
+    import inspect
+    from cudnn.sdpa.fwd.kernels import _mxfp8_host
+
+    template = "prefill_d192_d128_mxfp8" if d == 192 else f"prefill_d{d}_mxfp8"
+    mod = _load("sm100", template, d, dv, dtype_qkv=0, dtype_o=2, cta_mma=1)
+    observed = []
+    sentinel = object()
+
+    def compiler(fn, *args, **kwargs):
+        bound = inspect.signature(fn).bind(*args, stream=kwargs["stream"])
+        observed.append(bound.arguments["has_amax"])
+        return sentinel
+
+    mod.compile_prepared.cache_clear()
+    monkeypatch.setattr(_mxfp8_host, "_compile_cached", compiler)
+    try:
+        assert mod.compile_prepared(d_qk=d, d_v=dv, has_amax=has_amax) is sentinel
+        assert observed == [has_amax]
+    finally:
+        mod.compile_prepared.cache_clear()

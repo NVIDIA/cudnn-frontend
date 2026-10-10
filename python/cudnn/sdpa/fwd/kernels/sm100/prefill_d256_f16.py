@@ -60,7 +60,7 @@ from cudnn.frost.tile_dsl.pointwise import (
 )
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
 from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
-from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait
+from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
 from cudnn.frost.tile_dsl.mask import (
@@ -131,6 +131,9 @@ _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
 from cudnn.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
+
+from cudnn.frost.tile_dsl.thd import exit_if_dead_thd_cluster
+from cudnn.sdpa.fwd.kernels._thd_split_host import host as _host_thd_split, compile_host as _compile_thd_split_host
 
 _TENSOR_MAP_QWORDS = TENSOR_MAP_QWORDS
 # The setup kernel builds the THD metadata buffer DEVICE-side from the
@@ -274,6 +277,9 @@ def _kernel(
     bidx = cute.arch.block_idx()[0]
     bidy = cute.arch.block_idx()[1]
     bidz = cute.arch.block_idx()[2]
+
+    if cutlass.const_expr(CFG.THD_VARLEN and SPLIT_KV > 1):
+        exit_if_dead_thd_cluster(seq_kv_lens_tensor, n_batch, CFG.CGA_M)
 
     sQO_raw = cutlass.Array(STORAGE_DTYPE, qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_KV * kBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
@@ -622,6 +628,10 @@ def _tmaldg_warp_group(
         # GmemTileTma, so every load site below stays branch-free.
         _k_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
         _v_rt_ptr = (o_desc_words.iterator.raw_ptr() + (n_batch + cutlass.Int32(2)) * cutlass.Int32(TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+        # Setup publishes immutable packed-total descriptors before this kernel.
+        # Every loader warp, including both CTAs, acquires each map once.
+        tma_tensormap_acquire(_k_rt_ptr)
+        tma_tensormap_acquire(_v_rt_ptr)
         tma_k = lambda *coords: tma_slice_runtime_desc(_k_rt_ptr, *coords)  # noqa: E731
         tma_v = lambda *coords: tma_slice_runtime_desc(_v_rt_ptr, *coords)  # noqa: E731
     elif cutlass.const_expr(PAGED_KV and paged_hnd):
@@ -736,6 +746,7 @@ def _tmaldg_warp_group(
                         bars.mb_k_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                     )
 
                 bars.mb_v_empty[kv_state.idx].wait(kv_state.phase)
@@ -767,6 +778,7 @@ def _tmaldg_warp_group(
                         bars.mb_v_full[kv_state.idx].smem_ptr,
                         cta_group=CFG.CTA_MMA,
                         mcast_mask=tma_mcast_mask,
+                        acquire=not (CFG.THD_VARLEN and not PAGED_KV),
                     )
 
                 kv_state = advance(kv_state, CFG.STAGES_KV)
@@ -855,6 +867,9 @@ def _tmastg_warp_group(
     is_valid_tile = cutlass.Int32(1)
     sched_state = PipelineState.start()
 
+    # Each per-sequence O map is immutable for this launch.
+    last_o_batch = cutlass.Int32(-1)
+
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
@@ -881,8 +896,11 @@ def _tmastg_warp_group(
                 # skip the store; the barrier protocol below still runs.
                 if batch_idx < n_batch:
                     o_desc_ptr = (o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(_TENSOR_MAP_QWORDS)).tospace(cutlass.AddressSpace.generic)
+                    if batch_idx != last_o_batch:
+                        tma_tensormap_acquire(o_desc_ptr)
+                        last_o_batch = batch_idx
                     o_slice = tma_slice_runtime_desc(o_desc_ptr, cutlass.Int32(0), q_head_idx, q_row_coord, cutlass.Int32(0))
-                    tma_store_tile(sO[0], o_slice)
+                    tma_store_tile(sO[0], o_slice, acquire=False)
             else:
                 tma_store_tile(
                     sO[0],
@@ -956,6 +974,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -1781,7 +1800,7 @@ def _correction_warp_group(
             lse_val = cutlass.Float32(arith.select(row_trim.ir_value(), neg_inf_trim.ir_value(), lse_val.ir_value()))
             inv_sum = cutlass.Float32(arith.select(row_trim.ir_value(), cutlass.Float32(0.0).ir_value(), inv_sum.ir_value()))
         # Base-2 Stats (stats_use_log2): natural LSE * log2(e); -inf stays -inf.
-        if cutlass.const_expr(CFG.STATS_LOG2):
+        if cutlass.const_expr(CFG.STATS_LOG2 and SPLIT_KV == 1):
             lse_val = lse_val * cutlass.Float32(1.4426950408889634)
         if cutlass.const_expr(lse_tensor is None):
             pass  # has_lse=False: the Stats store is compiled out
@@ -1791,18 +1810,18 @@ def _correction_warp_group(
             _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
             if q_row_global < _s_q_b:
                 lse_arr = cutlass.make_array_view(lse_tensor)
-                if cutlass.const_expr(len(lse_tensor.shape) == 2):
+                if cutlass.const_expr(SPLIT_KV > 1):
+                    lse_arr[split_idx, row_head_idx, _cu_q_b + q_row_global] = lse_val
+                elif cutlass.const_expr(len(lse_tensor.shape) == 2):
                     # token-major packed (T, H)
-                    lse_row = lse_arr[_cu_q_b + q_row_global, :]
-                    lse_row[head_idx] = lse_val
+                    lse_arr[_cu_q_b + q_row_global, row_head_idx] = lse_val
                 else:
                     # head-major packed (1, QH, head_stride)
                     if cutlass.const_expr(len(lse_tensor.shape) == 4):
                         # rank-4 = per-batch padded Stats (B, QH, s_max, 1) in the declared strides, no ragged offsets
-                        lse_arr[batch_idx, head_idx, q_row_global, 0] = lse_val
+                        lse_arr[batch_idx, row_head_idx, q_row_global, 0] = lse_val
                     else:
-                        lse_row = lse_arr[cutlass.Int32(0), head_idx, :]
-                        lse_row[_cu_q_b + q_row_global] = lse_val
+                        lse_arr[cutlass.Int32(0), row_head_idx, _cu_q_b + q_row_global] = lse_val
         else:
             if q_row_global < seqlen_q:
                 lse_arr = cutlass.make_array_view(lse_tensor)
@@ -1829,15 +1848,25 @@ def _correction_warp_group(
             # staging and no TMA.  The staged path's barrier traffic still has
             # to happen: it consumes mb_o_empty once and publishes every
             # mb_o_full chunk, and the store warp waits on all of them.
+            partial_batch = _partial_batch(batch_idx, split_idx, n_batch)
+            partial_row = q_row_global
+            partial_live = q_row_global < seqlen_q
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                partial_cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                partial_q_base = cutlass.Int32(partial_cu[n_batch + batch_idx])
+                partial_q_len = cutlass.Int32(partial_cu[n_batch + batch_idx + cutlass.Int32(1)]) - partial_q_base
+                partial_batch = split_idx
+                partial_row = partial_q_base + q_row_global
+                partial_live = q_row_global < partial_q_len
             _store_fp32_partial_tile(
                 o_partial_f32,
                 tmem_base_epi,
                 LAYOUT.O_OFF,
                 inv_sum,
                 row_dead,
-                q_row_global < seqlen_q,
-                _partial_batch(batch_idx, split_idx, n_batch),
-                q_row_global,
+                partial_live,
+                partial_batch,
+                partial_row,
                 row_head_idx,
                 CFG.TILE_O,
                 O_CHUNK,
@@ -1924,7 +1953,7 @@ def _host(
     v_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     o_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
     lse_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64],
-    lse_ext: cutlass.Int32,
+    lse_ext: cutlass.Int64,
     scale_softmax_log2: cutlass.Float32,
     n_thd_units: cutlass.Int32,
     seq_q_lens_addr: cutlass.Int64,
@@ -2079,10 +2108,11 @@ def _host(
             thd_lens_form,
             cutlass.Int32(QH // HEADS_PER_TILE),
             cutlass.Int32(B),
-            cutlass.Int32(o_tensor.stride[1]),
-            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA),
+            cutlass.Int64(o_tensor.stride[1]),
+            cutlass.Int32(CFG.TILES_Q * CFG.TILE_M * CFG.CTA_MMA // HEADS_PER_TILE),
             n_thd_units,  # persistent cluster count; also seeds the claim counter
             not PAGED_KV,  # clamp_kv: paged pools have no packed KV total to clamp to
+            SPLIT_KV,
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         grid_shape = (n_thd_units * cutlass.Int32(CFG.CGA_M), cutlass.Int32(1), cutlass.Int32(1))
     else:
@@ -2125,6 +2155,15 @@ def _host(
 
 EXPLICIT_ABI = True  # pointer/int host entry; the adapter builds the argument list itself
 LSE_KINDS = ("dense", "token", "head", "padded")
+
+
+@lru_cache(maxsize=None)
+def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
+    """Compile only from plan facts; every token capacity and stride is dynamic."""
+    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and not CFG.PACK_GQA):
+        raise ValueError("packed D256 split requires THD without PackGQA")
+    cache_key = _template_key(globals(), locals(), "compile_thd_split")
+    return _compile_thd_split_host(_host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=False)
 
 
 @lru_cache(maxsize=None)
@@ -2186,7 +2225,7 @@ def compile(  # noqa: A001
         i64_3,
         i64_3,
         i64_3,
-        i32,
+        cutlass.Int64(0),
         cutlass.Float32(0.0),
         i32,
         cutlass.Int64(0),

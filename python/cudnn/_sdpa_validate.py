@@ -49,7 +49,8 @@ virtual O_v would surface as a bare ``ValueError`` out of planning
 (``create_execution_plans`` catches only the typed declines).  The native
 validator turns that into the typed not-supported with the fix in the message.
 Scope: the family's validator runs whenever a python SDPA engine is OFFERED
-(the SM100/SM120 f16 forward rows by default, the others with
+(the SM100/SM107/SM120/SM90 f16 forward rows, the SM100 per-tensor FP8 and SM107 MXFP8 forward rows and
+the SM100 d512 backward row by default, the others with
 ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``), on EVERY arch with such an engine
 -- not only where a row serves the tail -- so the tail validates natively there
 and the backend's own verdict on it is deferred to planning, as for every
@@ -341,23 +342,54 @@ def _validate_forward(node) -> None:
         if (d_qk % 16 != 0) or (d_v % 16 != 0):
             raise _not_supported("hidden_dim should be multiple of 16")
 
+    if node.node_type in (NodeType.SDPA_FP8, NodeType.SDPA_MXFP8):
+        # Block-scaled O (both quantized forwards): FP4_E2M1 O carries one E4M3
+        # scale per 16 d elements in sf_o; an FP8_E4M3 O with sf_o carries one
+        # UE8M0 scale per 32 (MXFP8 output).
+        sf_o = node.outputs.get("sf_o")
+        o_dtype = _dtype_name(o)
+        if o_dtype == "FP4_E2M1":
+            if sf_o is None:
+                raise _not_supported("An FP4_E2M1 O requires the sf_o output (E4M3 scale factors, one per 16 d elements).")
+            if _dtype_name(sf_o) not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o must be FP8_E4M3 for an FP4_E2M1 O.")
+        elif sf_o is not None:
+            if o_dtype not in (None, "FP8_E4M3"):
+                raise _not_supported("sf_o with a non-FP4 O requires an FP8_E4M3 O (MXFP8 output).")
+            if _dtype_name(sf_o) not in (None, "FP8_E8M0"):
+                raise _not_supported("sf_o must be FP8_E8M0 for an FP8_E4M3 O (MXFP8 output).")
+            if d_v % 32 != 0:
+                raise _not_supported("MXFP8 output needs d_v to be a multiple of 32.")
+        if sf_o is not None:
+            _check_dim_stride(node, "sf_o", sf_o)
+        if node.node_type == NodeType.SDPA_MXFP8:
+            # sdpa_mxfp8 has no per-tensor O scale: ``scale_o`` exists only as the
+            # block-scaled epilogue's global scale (an FP4 O cannot span its range
+            # through the E4M3 block scale alone, so it is REQUIRED there).
+            scale_o = node.inputs.get("scale_o")
+            if scale_o is not None and sf_o is None:
+                raise _not_supported("sdpa_mxfp8: scale_o is accepted only together with the sf_o output (block-scaled O).")
+            if o_dtype == "FP4_E2M1" and scale_o is None:
+                raise _not_supported("sdpa_mxfp8: an FP4_E2M1 O requires scale_o (the FP4 global scale; a 1-element FLOAT tensor).")
+            if scale_o is not None and _dtype_name(scale_o) not in (None, "FLOAT"):
+                raise _not_supported("sdpa_mxfp8: scale_o must be a FLOAT tensor.")
+
     if node.node_type == NodeType.SDPA_MXFP8:
-        _validate_mxfp8_descales(node, q, k, v, s_kv if s_kv is not None else k.get_dim()[2])
+        _validate_mxfp8_descales(node, q, k, v)
 
 
-def _validate_mxfp8_descales(node, q, k, v, s_kv: int) -> None:
-    """MXFP8 block-scale descale tensors: F8_128x4 reordering and batch/head dims matching
-    their base operand."""
-    b, h_q, _, d = q.get_dim()
-    h_k, h_v = k.get_dim()[1], v.get_dim()[1]
+def _validate_mxfp8_descales(node, q, k, v) -> None:
+    """MXFP8 descale tensors: F8_128x4 reordering and leading dims matching their base
+    operand (page pools under paged KV)."""
+    d = q.get_dim()[3]
     block_size = 32  # MXFP8 block size is fixed at 32
     d_scale = (d + block_size - 1) // block_size
-    s_scale = (s_kv + block_size - 1) // block_size
+    s_scale = (v.get_dim()[2] + block_size - 1) // block_size
 
-    for port, h, small_axis, small_min in (
-        ("descale_q", h_q, 3, d_scale),
-        ("descale_k", h_k, 3, d_scale),
-        ("descale_v", h_v, 2, s_scale),
+    for port, base, small_axis, small_min in (
+        ("descale_q", q, 3, d_scale),
+        ("descale_k", k, 3, d_scale),
+        ("descale_v", v, 2, s_scale),
     ):
         t = node.inputs.get(port)
         if t is None:
@@ -368,9 +400,8 @@ def _validate_mxfp8_descales(node, q, k, v, s_kv: int) -> None:
         if getattr(t.get_reordering_type(), "name", None) != "F8_128x4":
             raise ValueError(f"MXFP8 SDPA requires {cap} to have F8_128x4 reordering")
         dim = t.get_dim()
-        if dim[0] != b or dim[1] != h:
-            base = port.split("_")[1].upper()
-            raise ValueError(f"MXFP8 SDPA: {cap} batch/head dimensions must match {base}")
+        if dim[0] != base.get_dim()[0] or dim[1] != base.get_dim()[1]:
+            raise ValueError(f"MXFP8 SDPA: {cap} batch/head dimensions must match {port.split('_')[1].upper()}")
         if dim[small_axis] < small_min:
             what = "d_scale" if small_axis == 3 else "s_scale"
             raise ValueError(f"MXFP8 SDPA: {cap} {what} dimension too small (expected >= {small_min})")

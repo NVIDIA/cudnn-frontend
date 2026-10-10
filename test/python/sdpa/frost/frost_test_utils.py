@@ -10,6 +10,17 @@ re-derived per file. Five files each carried their own copy pinned to exactly
 while the engines they test serve the whole line.
 """
 
+import contextlib
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import threading
+from typing import NamedTuple
+
 import pytest
 
 
@@ -48,6 +59,13 @@ requires_blackwell_geforce = pytest.mark.skipif(
     _SM is None or not (120 <= _SM <= 129),
     reason="needs an SM120-line GPU, have " + ("none" if _SM is None else f"sm_{_SM}"),
 )
+# Rubin gate for the suites whose lowerings exist ONLY from cc 10.7 up (the
+# sm107 kernel trees; their engine rows declare sm_lo=107 / sm_hi=119, so the
+# marker mirrors that range rather than pinning (10, 7)).
+requires_rubin = pytest.mark.skipif(
+    _SM is None or not (107 <= _SM <= 119),
+    reason="needs a Rubin-line GPU (107 <= SM <= 119), have " + ("none" if _SM is None else f"sm_{_SM}"),
+)
 
 
 def _dsl_usable():
@@ -76,6 +94,31 @@ _DSL_OK, _DSL_WHY = _dsl_usable()
 requires_dsl = pytest.mark.skipif(not _DSL_OK, reason=_DSL_WHY or "cutedsl available")
 
 
+@contextlib.contextmanager
+def process_watchdog(seconds: float, what: str):
+    """Kill THIS process (``os._exit(70)``) if the block runs longer than ``seconds``.
+
+    For a kernel that can wedge its CUDA context: a wedged launch never returns to Python, so neither a pytest timeout
+    plugin (not installed here) nor a signal handler (``torch.cuda.synchronize`` holds the GIL inside C++) can end the
+    test -- only a daemon timer thread can, and exiting the whole process is the only way to free the GPU.  Exit code 70
+    marks a watchdog kill (under xdist the worker crash is reported and the rest of the suite continues).  Wrap only the
+    arm that can wedge, with a budget well above its compile + execute time.
+    """
+
+    def _abort():
+        sys.stderr.write(f"\n[process_watchdog] {what} exceeded {seconds:.0f} s -- killing the test process (exit 70)\n")
+        sys.stderr.flush()
+        os._exit(70)
+
+    timer = threading.Timer(seconds, _abort)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
 def _dsl_installed() -> bool:
     """For the few call sites that gate inside a test body rather than on it."""
     return _DSL_OK
@@ -87,13 +130,13 @@ def _is_plan_for(plan_name, engine) -> bool:
     return plan_name == engine or plan_name.startswith(engine + "[")
 
 
-def select_engine(graph, name, tiles=None, pack_gqa=None):
+def select_engine(graph, name, tiles=None, pack_gqa=None, split_kv=None):
     """Pin the ranked entry for engine ``name`` (graph.plans holds the backend's
     plans and the python engines' in one list). A pin is strict: check_support /
     build_plans raise if that engine declines the graph.
 
     The FIRST entry for that engine is the heuristics' own best guess for this
-    shape. ``tiles`` / ``pack_gqa`` pin a different one, so a test can run a
+    shape. ``tiles`` / ``pack_gqa`` / ``split_kv`` pin a different one, so a test can run a
     config the best guess would not choose. Filters match the STRUCTURED knobs,
     not the rendered plan name: substring matching a name would let a request
     for tile_n=128 select a tile_n=1280 plan, and the test would pass having
@@ -111,11 +154,11 @@ def select_engine(graph, name, tiles=None, pack_gqa=None):
             return False
         return all(
             want is None or getattr(graph.plans[i].knobs, field, None) == want
-            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa))
+            for field, want in (("tile_m", want_m), ("tile_n", want_n), ("pack_gqa", pack_gqa), ("split_kv", split_kv))
         )
 
     index = next((i for i in range(len(names)) if _wanted(i)), None)
-    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa}; plans={names}"
+    assert index is not None, f"no plan for engine {name!r} with tiles={tiles} pack_gqa={pack_gqa} split_kv={split_kv}; plans={names}"
     graph.select_plan(index)
     return graph.plans[index]
 
@@ -149,6 +192,18 @@ _CUTE_DTYPE = {
     "torch.float8_e4m3fn": "Float8E4M3FN",
     "torch.float8_e5m2": "Float8E5M2",
 }
+
+
+def check_decode_q_rows(host, sq):
+    """The direct driver's Q-row guard, the contract the production binder validates: a decode body WITHOUT the token-unit
+    axis covers ``S_q x HEADS_PER_TILE <= N_Q`` only and rejects more rows; a body that declares ``Q_TOKEN_UNITS`` serves
+    any ``S_q`` as ``ceil(S_q / Q_BOX_TOKENS)`` units per head group, so the guard yields.  ``host`` is the module's host
+    entry (its ``__globals__`` is the compiled module's namespace)."""
+    import inspect
+
+    namespace = inspect.unwrap(host).__globals__
+    if "N_Q" in namespace and not namespace.get("Q_TOKEN_UNITS", False) and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
+        raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
 
 
 def launch_f16(
@@ -195,8 +250,7 @@ def launch_f16(
         cfg = namespace["CFG"]
         if cfg.PACK_GQA and h != kh * cfg.QH_PER_KH:
             raise ValueError(f"PACK_GQA requires H_q == H_kv * {cfg.QH_PER_KH}; got H_q={h}, H_kv={kh}")
-        if "N_Q" in namespace and sq * namespace["HEADS_PER_TILE"] > namespace["N_Q"]:
-            raise ValueError(f"decode Q rows exceed the compiled {namespace['N_Q']}-row tile")
+        check_decode_q_rows(host, sq)
     if paged:
         skv, n_pages = block_table_tensor.shape[1] * page_size, k.shape[0]
         k_st, v_st = (k.stride(0), k.stride(1), k.stride(2)), (v.stride(0), v.stride(1), v.stride(2))
@@ -232,6 +286,324 @@ def launch_f16(
         block_table_v_ptr=P(block_table_v_tensor, 4),
         table_strides=t_st,
         n_pages=n_pages,
+        # The d128 decode tile's ragged-Q leg slots (dense launches leave them
+        # dead: RAGGED_Q is off in every direct test's params); filtered out for
+        # hosts that do not carry them.
+        ragged_q_addr=0,
+        ragged_q_div=1,
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)
+
+
+# ---------------------------------------------------------------------------- SASS pins: trace-compile a kernel for a target arch and count opcodes
+# A perf lever that is invisible to every numerics test (the exp2 MUFU / FMA split, the Amax_O FMNMX3 fold, a spill) has
+# exactly one tripwire: the SASS.  These helpers compile ONE kernel module for ONE arch in a fresh subprocess
+# (`CUTE_DSL_ARCH` needs no matching device -- the suite-level `requires_blackwell` is what confines the pins to the
+# Blackwell-line lanes), dump the cubin, disassemble it with the first nvdisasm on $CUDA_PATH/bin or $PATH that decodes
+# the arch, and hand the caller the opcode counts plus whatever module-derived expectations the probe body printed.
+# SKIPS (never fails) when no nvdisasm decodes the cubin; a compile failure IS a failure.
+
+# Opcode -> the substrings a listing line must all contain.  The leading space on the packed ops keeps `FFMA2` from
+# matching a hypothetical `XFFMA2`; `MUFU.EX2` also matches `MUFU.EX2.F16x2`-style variants on purpose.  `BSSY` and the
+# per-lane ` SYNCS.ARRIVE` (the leading space excludes the uniform `USYNCS.ARRIVE`) are the two opcodes that tell the
+# scheduler credit arrive's lowerings apart: the lane-compare branch form costs one BSSY reconverge and `cga_size` arrives
+# per call site, the predicated form none and one (`tile_dsl/scheduler.py::read_tile_id_arrive`).
+# A count spec is a tuple of substrings a line must ALL contain, or ``("regex:", <pattern>)`` for the few opcodes whose
+# name must not be spelled in this source (the CI guardword scan): the predicate-to-general-register move is counted through
+# the pattern ``" P\dR "`` (P, a digit, R -- the reverse of R2P).
+SASS_OPCODE_COUNTS = {
+    "MUFU_EX2": ("MUFU.EX2",),
+    "FFMA2": (" FFMA2",),
+    "FADD2": (" FADD2",),
+    "FSETP": ("FSETP",),
+    "FSEL": ("FSEL",),
+    "FMNMX3": ("FMNMX3",),
+    "STL": ("STL",),
+    "LDL": ("LDL",),
+    "BSSY": ("BSSY",),
+    "SYNCS_ARRIVE": (" SYNCS.ARRIVE",),
+}
+# The masked-softmax-arm pins (`tile_dsl.mask.apply_mask_chunk`, the bit-word form): every masked KV-tile body carries 4 R2P
+# per 32-column keep-word and ~0.04 ISETP per cell; the per-cell compare + select form it replaced carried 0 R2P and one ISETP
+# per cell per mask term, and a build that ran out of predicate registers spilled them into GPRs through predicate-to-register moves.
+MASK_SASS_OPCODE_COUNTS = {
+    **SASS_OPCODE_COUNTS,
+    "R2P": (" R2P ",),
+    "ISETP": (" ISETP",),
+    "PRED2GPR": ("regex:", r" P\dR "),
+}
+
+_SASS_PROBE_TEMPLATE = """
+import glob, hashlib, json, os, re, subprocess, sys
+dump, arch, params_json, cands = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
+os.environ["CUTE_DSL_KEEP"] = "cubin"            # keep the cubin, disassemble it ourselves
+os.environ["CUTE_DSL_ARCH"] = arch               # unconditional: an inherited value would pin the wrong target's SASS
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
+from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+params_kw = json.loads(params_json)
+%(body)s
+cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+if not cubins:
+    print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+print("CUBIN_MD5", hashlib.md5(open(cubins[-1], "rb").read()).hexdigest())
+nvd = None
+for c in cands:
+    try:
+        proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("REJECT", c, "->", repr(exc)); continue
+    if proc.returncode == 0 and proc.stdout.strip():
+        nvd = c; print("NVDISASM", c); break
+    print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+if nvd is None:
+    print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+def cnt(*subs):
+    if subs and subs[0] == "regex:":  # ("regex:", <pattern>): one match per line
+        pat = re.compile(subs[1])
+        return sum(1 for ln in sass if pat.search(ln))
+    return sum(1 for ln in sass if all(sb in ln for sb in subs))
+for key, subs in json.loads(%(counts)r).items():
+    print("SASS", key, cnt(*subs))
+print("SASS LINES", len(sass))
+"""
+
+
+def sass_probe_source(body: str, counts: dict = SASS_OPCODE_COUNTS) -> str:
+    """The source of a SASS-probe subprocess.  ``body`` (dedented, column-0 statements) builds ``params`` from
+    ``TemplateParams(..., **params_kw)``, loads the module with ``_load_sm100_kernel_module``, prints any
+    module-derived expectation as ``<UPPER_NAME> <int>`` lines (e.g. ``EXPECT_MUFU_EX2 194``) and calls
+    ``mod.compile(...)``; the template around it fixes the arch, dumps the cubin, picks an nvdisasm and prints one
+    ``SASS <key> <count>`` line per entry of ``counts``."""
+    return _SASS_PROBE_TEMPLATE % {"body": textwrap.dedent(body).strip("\n"), "counts": json.dumps(counts)}
+
+
+def nvdisasm_candidates() -> list:
+    """Every nvdisasm the pins may try, in preference order: $CUDA_PATH/bin first (an internal toolkit that decodes a
+    newer arch than the wheel's), then $PATH.  Only existing executables."""
+    cands = []
+    if os.environ.get("CUDA_PATH"):
+        cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
+    on_path = shutil.which("nvdisasm")
+    if on_path:
+        cands.append(on_path)
+    return [c for c in dict.fromkeys(cands) if os.path.isfile(c) and os.access(c, os.X_OK)]
+
+
+def arch_known_to_the_dsl(arch: str) -> bool:
+    try:
+        from cutlass.base_dsl.enums import Arch
+
+        Arch.from_string(arch)
+        return True
+    except Exception:
+        return False
+
+
+# Spill counts are a property of the TOOLCHAIN at a fixed geometry, so a pin on them is a BOUND, never a compiler-specific
+# literal.  The causal specializations of the three exp2-split kernels read STL / LDL 0 / 0 under cutlass-dsl 4.8.0.dev0 +
+# the CUDA 13.5 ptxas and 1 / 1 under the CI lane's 4.7.0 + CUDA 13.3 ptxas, on sm_100a and sm_103a alike, on develop AND
+# on the branch (review on PR #1178) -- an exact zero there fails a lane on which nothing changed.  A pin records the count
+# MEASURED on the branch's own toolchain and :func:`assert_no_new_spills` accepts up to SPILL_TOLERANCE more per opcode: a
+# real regression (a fold site or an emulated exp2 pair spilling its operands into local memory) adds tens of STL / LDL,
+# the DSL / ptxas jitter one or two.
+SPILL_TOLERANCE = 4
+
+
+def assert_no_new_spills(stats: dict, pins: dict, tag: str = "") -> None:
+    """``stats["STL"]`` / ``stats["LDL"]`` at or below ``pins["STL"]`` / ``pins["LDL"]`` plus :data:`SPILL_TOLERANCE`."""
+    for key in ("STL", "LDL"):
+        assert stats[key] <= pins[key] + SPILL_TOLERANCE, (
+            f"{tag}{key} {stats[key]} > {pins[key]} + {SPILL_TOLERANCE}: new spills -- the pin is the count measured on the branch's own "
+            f"toolchain, the tolerance the DSL / ptxas jitter (SPILL_TOLERANCE): {stats}"
+        )
+
+
+class SassProbe(NamedTuple):
+    stats: dict  # opcode key -> count, one per SASS_OPCODE_COUNTS entry (plus LINES)
+    expect: dict  # every `<UPPER_NAME> <int>` line the probe body printed (module-derived expectations)
+    cubin_md5: str
+
+
+def run_sass_probe(tmp_path, *, probe_src: str, arch: str, params: dict, tag: str, timeout: int = 1500) -> SassProbe:
+    """Run ``probe_src`` (from :func:`sass_probe_source`) for ``arch`` with the per-build ``params`` (the TemplateParams
+    fields the adapter would derive for that device -- JSON-serialised into ``params_kw``) in a fresh interpreter and
+    parse its output.  Skips when the DSL has no such arch or no nvdisasm decodes the cubin; a non-zero exit fails."""
+    if not arch_known_to_the_dsl(arch):
+        pytest.skip(f"this cutlass-dsl has no {arch}")
+    cands = nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    # One dump dir per (arch, tag, params): two probes of the same kernel that differ only in ``params`` (the dense and the
+    # causal specialization of one pin) must not share a dir, or the second compile trips over the first's.
+    dump = tmp_path / f"{arch}_{tag}_{hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()[:8]}"
+    dump.mkdir()
+    argv = [sys.executable, "-c", probe_src, str(dump), arch, json.dumps(params), *cands]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    assert proc.returncode == 0, f"{arch} trace-compile of {tag} failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    expect = {}
+    for ln in out:
+        parts = ln.split()
+        if len(parts) == 2 and parts[0].isupper() and parts[0] not in ("SASS", "CUBIN_MD5", "NVDISASM") and parts[1].lstrip("-").isdigit():
+            expect[parts[0]] = int(parts[1])
+    md5 = next((ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 ")), "")
+    print(f"\n{tag} {arch} {params} SASS: {stats}; module says {expect}; cubin md5 {md5}")
+    return SassProbe(stats, expect, md5)
+
+
+def cuda_launch_names(*runs):
+    """The CUDA kernel launches per callable under ``torch.profiler``, by name and in launch order (memset / memcpy excluded),
+    or ``None`` when the profiler records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this
+    swallows).  An exception raised by a callable propagates.  The caller skips EXPLICITLY on ``None`` (an empty capture is
+    unavailable validation, never a missing-kernel finding) and asserts on the returned names OUTSIDE any handler, so a wrong
+    launch census fails the test instead of printing "unverified" (the launch censuses of the MXFP8 backward, review of PR #1355)."""
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    names = []
+    for run in runs:
+        prof = profile(activities=[ProfilerActivity.CUDA])
+        try:
+            prof.start()
+        except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the caller's bitwise pins stand on their own
+            return None
+        try:
+            run()
+            torch.cuda.synchronize()
+        finally:
+            prof.stop()
+        names.append(
+            [
+                e.name
+                for e in prof.events()
+                if e.device_type == torch.autograd.DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()
+            ]
+        )
+    return names if names and names[0] else None
+
+
+def cuda_launch_counts(*runs):
+    """CUDA kernel launches per callable under ``torch.profiler`` (memset / memcpy excluded), or ``None`` when the profiler
+    records no CUDA activity here (CUPTI absent, or failing to start -- the ONLY failure this swallows).  An exception raised
+    by a callable propagates, and the caller asserts on the returned counts OUTSIDE any handler, so a wrong launch count
+    fails the test instead of printing "unverified" (the launch-count pins of the external-delta tests, review of PR #1352).
+    The capture itself is ``cuda_launch_names``."""
+    names = cuda_launch_names(*runs)
+    return None if names is None else [len(n) for n in names]
+
+
+def run_d512_delayed_observer(tmp_path, engine):
+    """Delay a passive CTA before observing a reused empty slot; check liveness and gradients.
+
+    The delay belongs only to the test's private template copy. No production knob or
+    scheduling probability is involved. A child process bounds an unfixed kernel's hang.
+    """
+    from pathlib import Path
+
+    import cudnn
+
+    script = tmp_path / "delayed_observer.py"
+    script.write_text(textwrap.dedent(r"""
+        import hashlib, json, os, sys
+        from pathlib import Path
+        test_root, expected_fe, engine, work = sys.argv[1:]
+        sys.path.insert(0, test_root)
+        import conftest  # Preserve allocator setup and Transformer Engine import ordering.
+        sys.path.insert(0, str(Path(test_root) / "sdpa/frost"))
+        import torch
+        import cudnn
+        from cudnn.sdpa.bwd import api_dsl
+        from frost_test_utils import process_watchdog, select_engine
+        import test_sdpa_bwd_dsl_sm100 as ref
+
+        assert Path(cudnn.__file__).resolve() == Path(expected_fe).resolve()
+        api_dsl.STAGE2_2X2 = True
+        original = api_dsl.load_template
+        served = []
+
+        def delayed(path, params, tag="template"):
+            p = Path(path)
+            if p.name == "bprop_d512_f16_2x2.py":
+                assert p.parent.name == ("sm107" if engine == "sdpa_bwd_sm107_d512" else "sm100")
+                source = p.read_text()
+                begin = source.index("def _ldg_kv_tile(")
+                end = source.index("\n@cute.jit\ndef _tmaldg_warp_group(", begin)
+                section = source[begin:end]
+                anchor = "    for c in cutlass.range_constexpr(CFG.N_CHUNKS):\n"
+                assert section.count(anchor) == 1
+                # Chunk 0 of the second KV tile reuses slot 0 on both the four-
+                # and eight-stage rings. CTA 3 is passive on this even chunk.
+                delay = (
+                    "        if cutlass.const_expr(c == 0):\n"
+                    "            if (pair_id == cutlass.Int32(1)) & (is_leader == False) & (kv_loop == cutlass.Int32(1)) & (tile_no == cutlass.Int32(0)):\n"
+                    "                observer_start = cute.arch.globaltimer()\n"
+                    "                while cute.arch.globaltimer() - observer_start < cutlass.Int64(10_000_000):\n"
+                    "                    pass\n"
+                )
+                patched = source[:begin] + section.replace(anchor, anchor + delay) + source[end:]
+                target = Path(work) / (p.parent.name + "_delayed_observer.py")
+                target.write_text(patched)
+                served.append(dict(path=str(p), sha256=hashlib.sha256(source.encode()).hexdigest(), params=repr(params)))
+                path = str(target)
+            return original(path, params, tag)
+
+        api_dsl.load_template = delayed
+        torch.manual_seed(1519)
+        b, h, sq, skv, d = 1, 4, 256, 1024, 512
+        tensors = {n: ref._bshd(b, s, h, d) for n, s in (("q", sq), ("k", skv), ("v", skv), ("do", sq))}
+        o, lse, _, dq, dk, dv = ref._reference(*(tensors[n] for n in ("q", "k", "v", "do")))
+        expected = (dq, dk, dv)
+        tensors["o"] = torch.empty_like(tensors["q"]).copy_(o)
+        tensors["stats"] = lse.unsqueeze(-1).contiguous()
+        for n, like in (("dq", "q"), ("dk", "k"), ("dv", "v")):
+            tensors[n] = torch.empty_like(tensors[like])
+        g, ports, outputs = ref._build_graph(b, h, h, sq, skv, d, d**-0.5)
+        select_engine(g, engine)
+        g.check_support()
+        g.build_plans()
+        ports.update(zip(("dq", "dk", "dv"), outputs))
+        pack = {ports[n]: t for n, t in tensors.items()}
+        workspace = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+        assert served, "the delayed twin template did not serve the graph"
+        print("DELAYED_OBSERVER_SOURCE", json.dumps(served), flush=True)
+
+        def check():
+            for name, want in zip(("dq", "dk", "dv"), expected):
+                got = tensors[name].float()
+                cos = torch.nn.functional.cosine_similarity(got.flatten(), want.flatten(), dim=0).item()
+                rel = ((got - want).abs().max() / max(want.abs().max().item(), 1e-30)).item()
+                assert cos > ref._TOL_COS and rel < ref._TOL_REL, (name, cos, rel)
+
+        # Compilation is outside the execution watchdog; a slow compiler is not a hang.
+        with process_watchdog(45.0, "D512 delayed empty-phase observer"):
+            g.execute(pack, workspace)
+            torch.cuda.synchronize()
+            check()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                g.execute(pack, workspace)
+            for _ in range(8):
+                for name in ("dq", "dk", "dv"):
+                    tensors[name].fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                check()
+        print("DELAYED_OBSERVER_PASS", flush=True)
+    """))
+    env = dict(os.environ, CUDNN_FRONTEND_ENABLE_FROST_ENGINES="1", CUDNN_FRONTEND_COMPILED_CACHE=str(tmp_path / "compiled"))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(Path(__file__).resolve().parents[2]), cudnn.__file__, engine, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    (tmp_path / "delayed_observer.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
+    assert proc.returncode == 0 and "DELAYED_OBSERVER_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"

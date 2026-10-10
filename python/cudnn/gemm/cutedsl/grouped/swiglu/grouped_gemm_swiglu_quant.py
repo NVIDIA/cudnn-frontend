@@ -13,6 +13,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
@@ -21,6 +22,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
+from ..moe_kernel_helpers import warp_amax_with_nan
 from ..utils import (
     PersistentTileSchedulerParams,
     StaticPersistentTileScheduler,
@@ -296,7 +298,7 @@ class BlockScaledContiguousGroupedGemmKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -577,10 +579,10 @@ class BlockScaledContiguousGroupedGemmKernel:
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         # Compute grid size
         m, n, l = cute.shape(d)
@@ -980,12 +982,7 @@ class BlockScaledContiguousGroupedGemmKernel:
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
         # Warp-level reduction using wrapper function
-        warp_amax = cute.arch.warp_redux_sync(
-            value=amax_fp32,
-            kind="fmax",
-            mask_and_clamp=0xFFFFFFFF,
-            nan=True,
-        )
+        warp_amax = warp_amax_with_nan(amax_fp32)
         # Each epilogue warp's lane 0 writes warp amax to shared memory
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx] = cutlass.Float32(warp_amax)
@@ -1084,14 +1081,9 @@ class BlockScaledContiguousGroupedGemmKernel:
         #
         # Manually store pvscale to avoid spilling
         #
-        if tile_idx == 0:
-            pvscale[0] = tmp_f32
-        elif tile_idx == 1:
-            pvscale[1] = tmp_f32
-        elif tile_idx == 2:
-            pvscale[2] = tmp_f32
-        elif tile_idx == 3:
-            pvscale[3] = tmp_f32
+        for scale_idx in cutlass.range_constexpr(cute.size(pvscale)):
+            if tile_idx == scale_idx:
+                pvscale[scale_idx] = tmp_f32
 
         #
         # Compute quantized output values and convert to D type
@@ -1144,18 +1136,7 @@ class BlockScaledContiguousGroupedGemmKernel:
 
         tmp_f32 = cutlass.Float32(0.0)
         for vi in cutlass.range_constexpr(acc_frg.shape[0]):
-            max_value_original = (
-                cutlass.Float32(
-                    cute.arch.warp_redux_sync(
-                        value=acc_frg[vi, 0],
-                        kind="fmax",
-                        mask_and_clamp=0xFFFFFFFF,
-                        nan=True,
-                    )
-                )
-                * rcp_limit
-                * norm_const
-            )
+            max_value_original = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0])) * rcp_limit * norm_const
             max_value_vec = cute.full(4, max_value_original, dtype=cutlass.Float32)
             max_value_vec_f8 = max_value_vec.to(cutlass.Float8E8M0FNU)
             max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)
@@ -1205,7 +1186,7 @@ class BlockScaledContiguousGroupedGemmKernel:
             (tokens_this_group, n_total, mSFDCol_mnl.shape[2]),
             (1, 2, 3),
         )
-        regPerSubtile = 4
+        regPerSubtile = self.mma_tiler_d[1] // 32
         sfd_tile = (
             cute.make_layout(128),
             cute.make_layout(32 * regPerSubtile),
@@ -1306,7 +1287,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -1351,7 +1332,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2136,7 +2117,7 @@ class BlockScaledContiguousGroupedGemmKernel:
 
             if cutlass.const_expr(self.generate_sfd):
                 norm_const = norm_const_tensor[0]
-                regPerSubtile = 4
+                regPerSubtile = self.mma_tiler_d[1] // 32
                 sfd_row_tile = (
                     cute.make_layout(128),
                     cute.make_layout(32 * regPerSubtile),
@@ -2531,7 +2512,7 @@ class BlockScaledContiguousGroupedGemmKernel:
                             )
                         ]
 
-                        if subtile_idx == 6:
+                        if subtile_idx == subtile_cnt - 2:
                             if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
                                 tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
                                 cute.autovec_copy(tCrSFDRow, tCgSFDRow)
@@ -2780,9 +2761,9 @@ class BlockScaledContiguousGroupedGemmKernel:
         epi_tile: cute.Tile,
         epi_tile_c: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: LayoutEnum,
         d_dtype: Type[cutlass.Numeric],
-        d_layout: utils.LayoutEnum,
+        d_layout: LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         num_smem_capacity: int,
@@ -2804,7 +2785,7 @@ class BlockScaledContiguousGroupedGemmKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param d_layout: Layout of operand D.
-        :type d_layout: utils.LayoutEnum
+        :type d_layout: LayoutEnum
         :param sf_dtype: Data type of scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Vector size of scale factor.

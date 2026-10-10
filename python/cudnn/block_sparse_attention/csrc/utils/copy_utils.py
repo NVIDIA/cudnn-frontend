@@ -1,6 +1,9 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 # Copyright (c) 2025-2026, QuACK team.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 #
 # Selected helpers are adapted from quack-kernels 0.4.1 (Apache-2.0) and
 # maintained locally so BSA does not require Quack at runtime.
@@ -12,12 +15,12 @@ from typing import Callable, Optional, Tuple, Type
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
-from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
+from cudnn._cutlass_compat import Arch
 
 # cute.copy elects a single lane internally for raw bulk-copy atoms only on
 # cute-dsl 4.6.0 and 4.6.1; on every other version the caller must elect.

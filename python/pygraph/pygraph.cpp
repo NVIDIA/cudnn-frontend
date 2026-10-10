@@ -20,6 +20,7 @@
 
 #include "cudnn_frontend.h"
 #include "pygraph.h"
+#include "variant_pack.h"
 
 namespace py = pybind11;
 using namespace pybind11::literals;
@@ -430,12 +431,14 @@ PyGraph::moe_grouped_matmul(std::shared_ptr<cudnn_frontend::graph::Tensor_attrib
                             cudnn_frontend::MoeGroupedMatmulMode_t const& mode,
                             cudnn_frontend::DataType_t const& compute_data_type,
                             int32_t const& top_k,
-                            std::string const& name) {
+                            std::string const& name,
+                            std::shared_ptr<cudnn_frontend::graph::Tensor_attributes> top_k_scores) {
     auto attributes = cudnn_frontend::graph::Moe_grouped_matmul_attributes()
                           .set_name(name)
                           .set_mode(mode)
                           .set_compute_data_type(compute_data_type)
-                          .set_top_k(top_k);
+                          .set_top_k(top_k)
+                          .set_top_k_scores(std::move(top_k_scores));
 
     auto output = graph->moe_grouped_matmul(token, weight, first_token_offset, token_index, token_ks, attributes);
     return output;
@@ -758,6 +761,55 @@ PyGraph::execute_with_raw_ptrs(std::intptr_t user_ptrs_array,
     auto status = plan_index < 0 ? graph->execute(h, ptrs, (int)n_user, (void*)workspace)
                                  : graph->execute_plan_at_index(h, ptrs, (int)n_user, (void*)workspace, plan_index);
     throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+void
+PyGraph::execute_ordered_pack(py::handle pack, std::intptr_t workspace, std::intptr_t exec_handle, int64_t plan_index) {
+    const auto frame      = read_native_execution_bindings(pack);
+    const auto& overrides = frame.overrides;
+    auto h                = exec_handle ? reinterpret_cast<cudnnHandle_t>(exec_handle) : handle;
+    auto ws               = reinterpret_cast<void*>(workspace);
+    error_t status;
+    if (plan_index >= 0) {
+        status = graph->execute_plan_at_index(h,
+                                              frame.pointers,
+                                              static_cast<int>(frame.size),
+                                              ws,
+                                              plan_index,
+                                              overrides.uids,
+                                              overrides.shapes,
+                                              overrides.strides);
+    } else if (overrides.uids.empty()) {
+        status = graph->execute(h, frame.pointers, static_cast<int>(frame.size), ws);
+    } else {
+        // The delegating C++ candidate has no sorted-pointer override overload.
+        // Preserve that rare path's semantics; concrete native plans stay sorted.
+        auto uids = graph->get_variant_pack_uids_sorted();
+        if (uids.size() != frame.size) throw py::value_error("Wrong number of ordered buffers");
+        std::unordered_map<int64_t, void*> pointers;
+        for (size_t i = 0; i < uids.size(); ++i) pointers.emplace(uids[i], frame.pointers[i]);
+        status = graph->execute(h, pointers, ws, overrides.uids, overrides.shapes, overrides.strides);
+    }
+    throw_if(status.is_bad(), status.get_code(), status.get_message());
+}
+
+py::object
+PyGraph::execute_ordered(py::handle schema,
+                         py::handle buffers,
+                         py::handle tensor_uids,
+                         const py::dict& auto_bindings,
+                         py::handle workspace,
+                         py::handle override_uids,
+                         py::handle override_shapes,
+                         py::handle override_strides,
+                         std::intptr_t exec_handle,
+                         int64_t plan_index) {
+    auto read = read_ordered_binding(
+        schema, buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
+    if (!read[1].cast<py::list>().empty() || read[2].is_none()) return read;
+    const auto extent = read[2].cast<py::tuple>();
+    execute_ordered_pack(read[0], extent[0].cast<std::intptr_t>(), exec_handle, plan_index);
+    return py::none();
 }
 
 void
@@ -1221,6 +1273,7 @@ init_pygraph_submodule(py::module_& m) {
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::FLOAT),
              py::arg_v("top_k", 0),
              py::arg_v("name", ""),
+             py::arg_v("top_k_scores", nullptr),
              R"pbdoc(
                 Perform MoE Grouped Matmul operation.
 
@@ -1234,6 +1287,7 @@ init_pygraph_submodule(py::module_& m) {
                     compute_data_type (cudnn.data_type): The data type for computation.
                     top_k (int): The top k value.
                     name (str): The name of the operation.
+                    top_k_scores (cudnn_tensor): COMBINE scores [1, tokens, top_k]. Frontend-only.
             )pbdoc")
         .def("moe_grouped_matmul_bwd",
              &PyGraph::moe_grouped_matmul_bwd,
@@ -1371,6 +1425,24 @@ init_pygraph_submodule(py::module_& m) {
              py::arg("workspace"),
              py::arg("handle"),
              py::arg("plan_index") = -1)
+        .def("_execute_ordered_pack",
+             &PyGraph::execute_ordered_pack,
+             py::arg("pack"),
+             py::arg("workspace"),
+             py::arg("handle"),
+             py::arg("plan_index") = -1)
+        .def("_execute_ordered",
+             &PyGraph::execute_ordered,
+             py::arg("schema"),
+             py::arg("buffers"),
+             py::arg("tensor_uids"),
+             py::arg("auto_bindings"),
+             py::arg("workspace"),
+             py::arg("override_uids"),
+             py::arg("override_shapes"),
+             py::arg("override_strides"),
+             py::arg("handle"),
+             py::arg("plan_index"))
         .def("populate_cuda_graph", &PyGraph::populate_cuda_graph)
         .def("update_cuda_graph", &PyGraph::update_cuda_graph)
         .def("serialize", &PyGraph::serialize)

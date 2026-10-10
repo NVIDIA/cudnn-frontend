@@ -269,6 +269,35 @@ MMA_GPU_ARCH_SPECIAL_CASES: dict[tuple[str, tuple], tuple[tuple[int, int], ...]]
 }
 
 
+def linear_token_sf_reject(dim, stride, rows, scale_k) -> str | None:
+    """GATHER SF layout support, shared by graph checks and runtime binding."""
+    if dim is None or stride is None or tuple(dim) != (1, rows, scale_k):
+        return f"MoE GATHER token SF must have shape [1, {rows}, {scale_k}]"
+    if len(stride) != 3 or stride[2] != 1 or stride[1] < ((scale_k + 15) // 16) * 16 or stride[1] % 16:
+        return "MoE GATHER token SF needs contiguous K scales and a row stride padded to a multiple of 16 bytes"
+    return None
+
+
+def moe_gather_sf_reject(chain: FusionChain) -> str | None:
+    """Token SF layouts supported by the block-scale GATHER producer."""
+    if not (chain.has_moe and chain.has_block_scale and chain.moe.mode == "gather"):
+        return None
+    bs = chain.block_scale
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    fake = bs.fake_dequant_b if swapped else bs.fake_dequant_a
+    reorder = bs.sfb_reorder if swapped else bs.sfa_reorder
+    if not fake:
+        if reorder is not None:
+            return "MoE block-scale GATHER requires token SF reorder=NONE; F8_128x4 is not supported"
+        dim, stride = (bs.sfb_dim, bs.sfb_stride) if swapped else (bs.sfa_dim, bs.sfa_stride)
+        if dim is None or stride is None or len(dim) != 3 or len(stride) != 3:
+            return "MoE GATHER token SF must have rank-3 shape and strides"
+        if swapped:
+            dim, stride = (dim[0], dim[2], dim[1]), (stride[0], stride[2], stride[1])
+        return linear_token_sf_reject(dim, stride, dim[1], chain.matmul.K // bs.block_size)
+    return None
+
+
 def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline: str) -> str | None:
     """Stage 2: does the ``template_pipeline`` family's pipeline support the
     graph's MMA type, and — for the rare :data:`MMA_GPU_ARCH_SPECIAL_CASES`
@@ -284,6 +313,20 @@ def mma_arch_reject(chain: FusionChain, graph_type: GraphType, template_pipeline
     if cases is None:
         return f"the {template_pipeline} family has no {graph_type.value} pipeline"
     key = key_fn(chain)
+    if chain.has_moe and chain.has_block_scale and chain.moe.mode == "gather":
+        reason = moe_gather_sf_reject(chain)
+        if reason is not None:
+            return reason
+        # The gather producer lowers the linear token SF to the same MMA atom.
+        # Preserve the instruction/architecture table, including special cases.
+        key = list(key)
+        bs = chain.block_scale
+        key[9 if isinstance(chain.moe, MoeSwapAbSpec) else 3] = "F8_128x4"
+        if bs.fake_dequant_a:
+            key[3] = "F8_128x4"
+        if bs.fake_dequant_b:
+            key[9] = "F8_128x4"
+        key = tuple(key)
     if key not in cases:
         if base_type is GraphType.MATMUL:
             mm = chain.matmul
@@ -445,6 +488,8 @@ class KernelTemplate:
         """``None`` if this template can compile (chain, config); else the first
         stage's rejection reason. Cheapest-first (short-circuits):
         pipeline/graph-type/mainloop → mma-type×arch → tile-config → other."""
+        if chain.has_moe and chain.moe.mode == "combine" and self.pipeline != "sm100":
+            return "MoE COMBINE is supported only by the SM100 pipeline"
         gt = classify_graph_type(chain)
         return (
             self.arch_active_reject()
@@ -496,6 +541,54 @@ class Sm120KernelTemplate(KernelTemplate):
     output only. Fronts both sm120 templates (dense and block-scale): a packed
     fp4 operand is 4-bit, so the MN-major gate keeps it K-major."""
 
+    # --- multi-GEMM (dual MoE / SwiGLU) feasibility ---------------------------
+    # The MoE template keeps one register accumulator per GEMM resident for the
+    # whole tile (warp_tile_m x warp_tile_n fp32 / 32 lanes each). How many
+    # registers that takes is NOT a support question: past what the compute
+    # warp's grant holds, ptxas spills to local memory and the plan still
+    # computes the same function, only slower -- a perf trade-off left to the
+    # autotuner and the auto pick (tile_config.select_config's shared 256-wide
+    # N budget keeps the auto pick spill-free), never a reason to reject a plan.
+    # The one hard gate is SMEM: a stage of every distinct operand tile plus the
+    # epilogue staging has to fit.
+    COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in both sm120 templates
+
+    def multi_gemm_ab_stages(self, chain: FusionChain, config: TileConfig) -> tuple[int, int, int]:
+        """``(ab_stages, per_stage_bytes, staging_bytes)`` of a multi-GEMM chain on
+        this template: one SMEM tile per DISTINCT operand per stage (+16 B slack,
+        as the template counts), with the transposed-STG epilogue staging taken
+        off the budget in BYTES before the ring is sized -- the block-scale
+        template's accounting, not the whole-stage deduction the single-GEMM
+        path keeps (a multi-operand stage is so large that giving one up can
+        leave none). The renderer emits the result verbatim and tells the
+        template not to deduct."""
+        from .dtypes import DTYPE_BYTES
+        from .tile_config import _SM120_STG_STAGE_ELEMS, smem_ab_stages
+
+        _m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
+        per_stage = (chain.num_a_operands * config.cta_tile_m + chain.num_b_operands * cta_smem_n) * config.cta_tile_k_bytes + 16
+        staging = 4 * _SM120_STG_STAGE_ELEMS * self.COMPUTE_WARPS
+        return smem_ab_stages(per_stage, smem_fixed_reserve=self.smem_fixed_reserve, extra_smem_bytes=staging), per_stage, staging
+
+    def multi_gemm_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        """Why a multi-GEMM chain CANNOT run on this template with ``config`` --
+        SMEM only: one stage of every distinct operand tile plus the epilogue
+        staging has to fit. ``None`` when it fits or the chain is a single GEMM.
+        Register pressure is deliberately not a reason here: spilling is a perf
+        trade-off, never grounds to disable a plan. Asked by the funnel
+        (``_extra_reject``) and by the sm120 renderer
+        (``_render_tile_constants``), so both agree."""
+        if not chain.is_multi_gemm:
+            return None
+        stages, per_stage, staging = self.multi_gemm_ab_stages(chain, config)
+        if stages < 1:
+            return (
+                f"one AB stage of {per_stage} B ({chain.num_a_operands} A + {chain.num_b_operands} B tiles) plus the "
+                f"{staging}-B epilogue staging does not fit the SMEM budget of the sm120 multi-GEMM kernel; "
+                f"pick a smaller CTA tile or K"
+            )
+        return None
+
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
 
@@ -522,6 +615,10 @@ class Sm120KernelTemplate(KernelTemplate):
                 return f"{self.file}: N-major B SMEM extent {cta_smem_n} is not a " f"whole number of {group}-element swizzle groups"
         if chain.output_dtype == "fp4_e2m1":
             return f"{self.file} does not support fp4 output"
+        if not self.block_scale:  # the block-scale template declines multi-GEMM by flag; its SMEM ring is sized elsewhere
+            _mg = self.multi_gemm_reject(chain, config)
+            if _mg is not None:
+                return f"{self.file}: {_mg}"
         from . import compiler as C
 
         try:
@@ -618,7 +715,10 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         # coordinate on one global descriptor (no tensormap scratch to reserve).
         "sm120_moe_grouped_matmul_fwd.py",
         graph_type=GraphType.MOE,
-        supports_multi_gemm=False,
+        # Multi-GEMM (SwiGLU-style dual MoE) runs on the same kernel: one register
+        # accumulator per GEMM; SMEM feasibility is `Sm120KernelTemplate.multi_gemm_reject`
+        # (register pressure is a perf trade-off, never a gate).
+        supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
     _mm(
@@ -662,7 +762,9 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
     block-scale MMA halves the instruction count at a wide tile, so take it
     whenever the ACTIVE GPU issues it — it is silicon, not a pipeline, so this
     asks the arch and not the config family. Everything else stays at 32."""
-    if classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
+    mm = chain.matmul
+    dense_fp8 = mm.a_dtype.startswith("fp8_") and mm.b_dtype.startswith("fp8_")
+    if not dense_fp8 and classify_graph_type(chain) not in (GraphType.BLOCK_SCALE_MATMUL, GraphType.MOE_BLOCK_SCALE, GraphType.MOE_BLOCK_SCALE_SWAP_AB):
         return 32
     from . import compiler as C
 
@@ -670,14 +772,42 @@ def preferred_mma_tile_k_bytes(chain: FusionChain) -> int:
     return 64 if arch is not None and any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) else 32
 
 
+def dense_k64_envelope(config: TileConfig) -> bool:
+    """Whether ``config`` is a geometry the DENSE 64-byte-K MMA is rendered for:
+    a 128-tall CTA in a 2-CTA pair -- the envelope :func:`tile_config.select_config`
+    emits it at and the one the sweep validated. The compiler rejects every other
+    geometry (``compiler._check_mma_k_dim``: dense K64 needs ``mma_tile_m == 128``
+    per CTA), so a shorter or 1-CTA pick must keep the 32-byte form. Block-scale
+    is a different instruction with its own rules and does not go through here."""
+    return config.cta_tile_m >= 128 and config.mma_tile_m == 128 and getattr(config, "cta_group", 1) == 2
+
+
 def preferred_strategy(chain: FusionChain, config: TileConfig) -> TileConfig:
     """Re-target an auto pick at the family :func:`preferred_pipeline` chooses and
     the MMA-inst K width :func:`preferred_mma_tile_k_bytes` wants. ``cta_group``
     rides the geometry, and family-fixed axes (sm120's warp-MMA pair, cluster and
     default warp grid) are snapped by :func:`as_pipeline`, so nothing is clamped
-    here."""
+    here.
+
+    The dense-FP8 64-byte-K width is taken only where the kernel exists for it
+    (:func:`dense_k64_envelope`). Re-stamping it onto a 64-tall or 1-CTA pick
+    produced a config the compiler rejects, and because the auto path probes its
+    ONE pick, that rejection declined the whole graph: every gated-attention-block
+    fp8 projection GEMM on sm_107 lost its ``frost_gemm`` plan at small M
+    (``CONFIG_sm100_64x32x128_64x32x64_cluster2x4_2ctamma`` ->
+    ``plain FP8 mma_tile_k_bytes=64 requires mma_tile_m=128 per CTA``)."""
     pipeline = preferred_pipeline(chain)
-    config = as_mma_tile_k(config, preferred_mma_tile_k_bytes(chain))
+    if config.pipeline == "sm120" and pipeline != "sm120":
+        # sm120 is warp-scoped MMA: its geometries (16x16 warp pairs) have no
+        # cluster-family equivalent, and the sm120 compiler only plans for
+        # sm120 silicon in production. A cross-family preference here can only
+        # mean this module is being driven off-device (unit tests on another
+        # runner), where the conversion is unrepresentable -- keep the family.
+        pipeline = config.pipeline
+    k_bytes = preferred_mma_tile_k_bytes(chain)
+    if k_bytes == 64 and not chain.has_block_scale and not dense_k64_envelope(config):
+        k_bytes = 32
+    config = as_mma_tile_k(config, k_bytes)
     if pipeline != config.pipeline:
         config = as_pipeline(config, pipeline)
     return config

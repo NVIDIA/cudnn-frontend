@@ -38,7 +38,7 @@ proposals or only the backend's.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .base import BaseEngine, PlanConfig, decline_types
 from .engine_ids import BACKEND_BLOCK_ENGINE_ID
@@ -88,6 +88,21 @@ def accepts(engine: BaseEngine, graph) -> bool:
         _LOG.debug("engine %s declined the graph: %s", engine.name, exc)
         return False
     return True
+
+
+def decline_reasons(engines: List[BaseEngine], graph) -> Tuple[Dict[str, str], List[str]]:
+    """Every candidate's verdict on ``graph``: ``{name: message}`` for the engines that decline it and the
+    names of those that accept.  The failure-path twin of :func:`accepts` -- when the ranked list comes out
+    empty, "which side had nothing, and why" is the first question and the backend's text answers half."""
+    declined, accepted = {}, []
+    for engine in engines:
+        try:
+            engine.check_support(graph)
+        except decline_types() as exc:
+            declined[engine.name] = str(exc)  # "<engine>: <reason>" already on the FROST engines
+        else:
+            accepted.append(engine.name)
+    return declined, accepted
 
 
 def _unranked(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig]) -> List[PlanConfig]:

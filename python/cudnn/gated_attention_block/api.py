@@ -121,8 +121,10 @@ is wired in TWO configurations** -- pass an e4m3 ``h``/weights and a
   -3.5 %; STATUS.md "SDPA decomposition".  Hence compact per tensor.)  The two
   are NOT bit-identical (the unfused path rounds to bf16 twice); both are
   scored against the fake-quant fp32 oracle.
-* Anything in between (one knob) is a typed decline naming both knobs; FP8 is
-  inference-only.  FP8 + ``seq_lens_present`` (a dense padding mask, incl. an
+* Anything in between (one knob) is a typed decline naming both knobs.  The
+  FULLY FUSED FP8 pipeline is inference-only; the UNFUSED one trains (see
+  "Training under FP8 / MXFP8" below).  FP8 + ``seq_lens_present`` (a dense
+  padding mask, incl. an
   EMPTY entry) is SERVED since 2026-09-15: the Rubin FP8 d256 SDPA's
   empty-KV-entry hang is gone (8/8 fresh processes at S=1000 / 512), and the
   block's dead-entry oracle test pins ``out[dead] == 0`` exactly.
@@ -154,7 +156,8 @@ declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
   fork twin is feature-detected on the runner name (``_fork_supports_field``),
   so the typed ``NotImplementedError`` returns only on a checkout without the
   twin -- never a silently un-quantized path.
-* Same envelope as FP8: inference-only, both knobs or neither, e4m3 only
+* Same envelope as FP8: both knobs or neither (the fully fused twin is
+  inference-only, the unfused pipeline trains), e4m3 only
   (E5M2 is a typed decline), ``d_model % 128 == 0`` (whole SF atoms along K),
   padding (``seq_lens_present``) served with the same dead-entry contract.
 
@@ -168,10 +171,12 @@ offset is byte-identical (pinned by a frozen layout snapshot):
   nibble = even k; the STORAGE shape is what ``check_support`` checks) with the
   UNCHANGED E8M0 / 32 ``w_qkvg_sf``; stage (1) runs the FROST catalog's MIXED
   block-scale row (``fp8_e4m3 x fp4_e2m1``, E8M0 per 32 on both sides) --
-  the same 9 launches, no new stage, no new slot.  UNFUSED only: the fused
-  MXFP8 projection fork is rendered for an e4m3 B, so ``fuse_norm_rope`` with
-  an e2m1 ``W_qkvg`` is a feature-detected typed ``NotImplementedError``
-  (``NormRopeFusionParams.weight_fp4``), inverting the day the arm lands.
+  the same 9 launches, no new stage, no new slot.  FULLY FUSED too: the fused
+  MXFP8 projection fork's e2m1-B arm (``NormRopeFusionParams.weight_fp4``,
+  feature-detected -- a checkout whose fork lacks the field declines typed)
+  reads the same packed codes and the same blob inside the norm+RoPE+quant
+  epilogue, so ``fuse_norm_rope`` with an e2m1 ``W_qkvg`` is the same 3
+  launches as the e4m3 fused pipeline (inference only, dense only, like it).
 * **fp4 O** (``o_fp4=Fp4Format.NVFP4 | Fp4Format.MXFP4``; ONE enum member =
   e2m1 codes x scale dtype x block, e4m3 / 16 or E8M0 / 32, so an illegal
   pairing cannot be spelled): the per-tensor tail (``quantize_o`` +
@@ -194,10 +199,36 @@ offset is byte-identical (pinned by a frozen layout snapshot):
   ``NotImplementedError``.  A dead ragged entry quantizes to codes 0 exactly
   (NVFP4 scale = the ``2^-9`` e4m3 floor, MXFP4 scale byte ``0x00``).
 * Both compose (row 9: the mixed GEMM at (1), the fp4 tail at (5q')/(6')); both
-  are inference-only like every quantized pipeline (``save_for_backward`` is
-  the same typed decline).  NOT served: an fp4 ``h``, an fp4 ``W_o`` against
-  an e4m3 O, e4m3 scales at block 32 / E8M0 at block 16, a global (per-tensor)
-  scale on either fp4 side.
+  TRAIN on the unfused pipeline (``save_for_backward=True`` writes the MXFP8
+  record byte for byte -- the fp4 tail changes only the workspace's ``o8`` into
+  ``o4`` / ``sf_o`` -- and ``GatedAttentionBlockBwd(quant=MxQuantSpec)`` differentiates
+  it over the caller's transposed e2m1 artifacts, ``api_bwd.py`` "The fp4 weight
+  modes"); the fused forks stay inference-only.  NOT served: an fp4 ``h``, an fp4
+  ``W_o`` against an e4m3 O, e4m3 scales at block 32 / E8M0 at block 16, a global
+  (per-tensor) scale on either fp4 side.
+
+**Training under FP8 / MXFP8 (2026-10-01): the UNFUSED quantized pipelines
+write the bf16 training record.**  ``save_for_backward=True`` with a
+:class:`QuantSpec` / :class:`MxQuantSpec` runs the same 9 launches as the
+quantized inference forward and writes the SAME :class:`SavedForBackward` the
+bf16 training forward writes -- the bf16 slab (stage (1)'s dequantized product)
+with PRE-norm Q/K bands, the bf16 pre-gate ``O``, the exact fp32 LSE,
+``rstd_q`` / ``rstd_k`` -- with ``h`` the caller's e4m3 codes (``h_sf`` is a
+forward input the record never carries).  What differs from quantized
+inference is ONE routing: norm+RoPE writes the normed Q/K OUT of place into
+compact bf16 workspace slots (``q`` / ``k``, +17 KiB/token at the 397B
+geometry) instead of back over the slab, so the slab's Q/K columns stay
+pre-norm for the record, and the quantize stages read those slots.  The hazard
+this guards: the inference pipeline norms IN PLACE, so lifting the training
+decline without the slots would hand the backward POST-norm bands that it
+differentiates as pre-norm -- wrong ``dQ``-side gradients and norm-weight
+gradients, no crash, and ``out`` still bitwise the inference block's.  ``out``,
+``O``, ``LSE`` and the GATE / V bands are bitwise the inference forward's (same
+kernels, different buffers).  The FULLY FUSED quantized pipelines (no slab,
+e4m3 ``O``) stay behind the fusion knobs' own training guards and the fp4 modes
+are a typed decline.  The bf16 backward consumes this record given the
+dequantized bf16 ``h`` and weights (``test_block_backward.py``); the native
+fp8 / mxfp8 backward is the follow-up.
 
 Three facts the MXFP8 design rests on, kept here because a port will drop them:
 
@@ -221,27 +252,59 @@ protocol): ``frost_dev/plans/qwen_gated_attention_block_plan.md``.
 Backward: :mod:`cudnn.gated_attention_block.api_bwd` — read this file first, the
 backward is defined against the :class:`SavedForBackward` contract below.
 PyTorch oracle and perf baseline:
-``test/python/fe_api/gated_attention_block/reference.py``.
+``test/python/gated_attention_block/cutedsl/reference.py``.
 
-Not in scope for v1, in the order they are likely to land: THD / varlen packing;
-an MXFP8 (e4m3 block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the
-block-scaled out projection exists only in the fp4 formats above); the graph-API
-engine row. This is a frontend-only OSS API first; a manifest family +
-``Capabilities`` comes when the stages exist to be honest about.
+**THD / packed sequences (``thd=True``):** ``h`` / ``cos`` / ``sin`` / ``out``
+are PACKED token matrices ``[T, .]`` (or ``[1, T, .]``) holding ``num_sequences``
+sequences of at most ``max_seq_len`` tokens each, and ``execute(seq_lens=)``
+carries the per-sequence lengths -- ``[B]`` int32 lengths, or ``[B+1]`` int32
+prefix sums under ``cu_seqlens=True`` -- for the Q and the KV side alike.  Every
+stage but the SDPA is token-wise and runs unchanged over the ``T`` rows; the
+SDPA runs the Rubin d256 kernels' varlen arm (packed ``(T, H, D)`` operands, the
+lengths read on device, the natural tile order) and writes the head-major packed
+LSE ``[1, H_q, T]`` -- the dense record's ``[B, H_q, S]`` at ``B = 1, S = T``, so
+the :class:`SavedForBackward` contract is unchanged (``seq_lens`` REQUIRED and
+``seq_lens_form`` naming its form).  ``cos`` / ``sin`` are PER-TOKEN tables whose
+positions restart at every sequence; the caller packs them.  Served: bf16 / fp16
+(inference and training), the UNFUSED per-tensor FP8 and MXFP8 pipelines
+(inference and training; the fp4 modes that ride MXFP8 included -- the three
+``quantize_mxfp8`` stages run their PACKED arm and write the SDPA row's
+per-sequence-tile-padded scale-factor layout at the slot capacity
+``_sf_slot_bytes_packed``; ``kernels/quantize_mxfp8.py`` "PACKED sequences"),
+``fuse_norm_rope`` for bf16 / fp16 inference.  Typed declines: ``fuse_gate`` (the
+SDPA's epilogue gate has no THD gate descriptor), the fully fused quantized
+pipelines (``fuse_gate`` again, and the fused MXFP8 projection fork decodes
+``(b, s_tile)`` once per 128-row GEMM tile, which a packed tile may straddle),
+``seq_lens_present`` (the two length contracts are mutually exclusive).  The
+lengths are device data, never read on the host:
+the caller's contract is every length in ``[0, max_seq_len]`` and
+``sum(lengths) == T`` -- the SDPA leaves rows past the live total UNWRITTEN, and
+the gate and the backward's weight-gradient GEMMs read every one of the ``T``
+rows (a contract violation, not a checked error).  A batch whose sequence count
+varies pads with zero-length sequences.
+
+Not in scope for v1, in the order they are likely to land: an MXFP8 (e4m3
+block-scaled) O / ``out_proj`` (D1 keeps the e4m3 O per-tensor; the block-scaled
+out projection exists only in the fp4 formats above); the graph-API engine row;
+the packed-sequence arms of ``fuse_gate`` and of the fully fused MXFP8 pipeline. This is a
+frontend-only OSS API first; a manifest family + ``Capabilities`` comes when the
+stages exist to be honest about.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 
 import torch
 from cuda.bindings import driver as cuda
 
+from cudnn._torch_stream import as_torch_stream
 from cudnn.api_base import APIBase, TensorDesc, TupleDict
 from cudnn.frost.workspace import WorkspaceLayout
 
@@ -274,6 +337,13 @@ _logger = logging.getLogger(__name__)
 #   397B:   0                 8192              16384     16896     17408
 #           |<--- 32 heads -->|<--- 32 heads --->|<- 2 ->|<- 2 ->|
 #
+# A geometry that declares block-sparse attention WITH an indexer band
+# (``GatedAttentionBlockGeometry.qsa.index_band``) appends a FIFTH block,
+# INDEX, below V: ``(index_heads + index_kv_heads) * index_head_dim`` columns
+# (640 at the Flash-Next geometry: 4 indexer query heads then 1 raw key head,
+# 128 each), so N = 13952 there.  Every geometry without it has exactly the
+# four blocks above and the same numbers it always had.
+#
 # Within a block, head ``j`` owns columns ``[j*D, (j+1)*D)``. Q and GATE are
 # adjacent because that is how the model produces them (one double-width
 # ``q_proj``), not for any kernel reason.
@@ -298,6 +368,14 @@ _logger = logging.getLogger(__name__)
 #
 # WHERE THE TILES ARE STORED: FOUR COMPACT BUFFERS, NOT ONE FUSED ONE
 # -------------------------------------------------------------------
+# DESIGN RECORD OF THE STAGE-(1) FORK -- NOT what the shipped UNFUSED path does
+# (2026-09-29).  Today stage (1) is the unforked FROST GEMM and writes ONE fused
+# ``[T, N]`` slab -- the workspace ``proj`` slot, or under ``save_for_backward``
+# the caller-owned ``SavedForBackward.proj_slab`` (its bands are the strided
+# views ``saved_slab_views`` spells) -- and stage (3b) compacts V out of it.  The
+# four-buffer epilogue below is what the fork writes when it lands; the
+# reasoning is kept because the fork is still the plan.
+#
 # The epilogue selects one of FOUR output descriptors from the N-tile index and
 # writes a BSHD-COMPACT buffer per block:
 #
@@ -310,10 +388,11 @@ _logger = logging.getLogger(__name__)
 # strided views -- is REJECTED, and the reason is specific rather than
 # aesthetic. Such a view has a padded token stride (N, not H*D). The SDPA's
 # dense path accepts that layout (``sdpa/graph_analyzer.dense_layout_ok``
-# explicitly allows padded strides) and then NORMALIZES it: ``_to_bshd`` is
-# ``transpose(1, 2)`` followed by ``.contiguous()`` if the view is neither already
-# contiguous nor at the strides the artifact was compiled for
-# (``SdpaFwdDsl._to_bshd`` in ``sdpa/fwd/api_dsl.py``). That is a **gather copy of Q**, which
+# explicitly allows padded strides). The historical tensor adapter normalized
+# layouts outside its direct-binding domain with an implicit gather. Current
+# plans bind TMA-compatible strides directly and prepare any required copies
+# with explicit scratch; the block still chooses a layout requiring no copies.
+# A **gather copy of Q**,
 # at 1M tokens is 16 GiB moved twice, silently, inside a block whose whole
 # premise is that it does not do that (AGENTS.md Rule 2).
 #
@@ -339,14 +418,25 @@ _logger = logging.getLogger(__name__)
 #
 # THE CALLER'S SIDE
 # -----------------
-# ``build_fused_qkvg_weight`` assembles ``W_qkvg`` from the three checkpoint
-# matrices ONCE, at load time. It takes ``q_gate_layout`` because the model's
-# own convention for splitting the double-width ``q_proj`` is not something to
-# guess: "flat" chunks ``[..., 2*H_q*D]`` into all-Q then all-GATE, "per_head"
-# views it as ``[..., H_q, 2*D]`` first and chunks the head dim. The two differ
-# by a row permutation of ``q_proj.weight``, and picking wrong is a silent wrong
-# answer -- so it is a parameter, checked by a round-trip test, and never a
-# hot-path conversion either way.
+# ``qkvg_from_hf`` is the documented entry point: it assembles ``W_qkvg`` and
+# the two norm weights from a HF Qwen checkpoint's five tensors ONCE, at load
+# time, applying the two conventions every Qwen checkpoint from Qwen3-Next on
+# shares -- the double-width ``q_proj`` is split PER HEAD (``view(..., H_q,
+# 2*D).chunk(2, dim=-1)``), and the QK-norm weight is zero-centered (applied as
+# ``1 + w``). ``build_fused_qkvg_weight`` is the layout-explicit assembler
+# underneath it. It takes ``q_gate_layout`` because the model's own convention
+# for splitting ``q_proj`` is not something to guess: "flat" chunks
+# ``[..., 2*H_q*D]`` into all-Q then all-GATE, "per_head" views it as
+# ``[..., H_q, 2*D]`` first and chunks the head dim. The two differ by a row
+# permutation of ``q_proj.weight``, and picking wrong is a silent wrong answer
+# -- so it is a parameter, checked by a round-trip test, never a hot-path
+# conversion either way, and an OMITTED layout (which still means "flat")
+# emits a ``FutureWarning`` rather than guessing silently. FutureWarning, not
+# DeprecationWarning: CPython's default filters show a ``DeprecationWarning``
+# only to a ``__main__`` caller, so from a model loader living in a library
+# module -- where every serving stack's model file lives -- it would be
+# dropped unseen, and the wrong gate layout it announces is a finite,
+# plausible, silently wrong output.
 
 
 QKVG_TILE_ALIGN = 64
@@ -371,18 +461,148 @@ straddles two blocks -- see the alignment invariant above.
 
 
 class ProjBlock(IntEnum):
-    """Which of stage (1)'s four outputs an N column belongs to.
+    """Which of stage (1)'s outputs an N column belongs to.
 
     The values are the block ORDER along N and are part of the layout contract:
     ``qkvg_offsets`` returns them in this order and ``dQKVG`` in the backward
     reuses it, so one wgrad GEMM produces ``dW_qkvg`` in the layout the forward
     consumes.
+
+    ``INDEX`` (appended) is the FIFTH band, present ONLY on a geometry that
+    declares it (``GatedAttentionBlockGeometry.qsa.index_band``): the sparse
+    attention indexer's projection -- its query heads then its single raw key
+    head, ``index_head_dim`` columns each -- below V.  Every geometry without it
+    keeps exactly the four bands, so its layout tuples are what they always
+    were.  A consumer that enumerates the bands iterates ``geometry.qkvg_blocks``
+    (never ``ProjBlock`` itself) and touches ``INDEX`` only when it addresses
+    the indexer columns on purpose: the norm / RoPE / gate / quantize stages and
+    the backward never do.
     """
 
     Q = 0
     GATE = 1
     K = 2
     V = 3
+    INDEX = 4
+
+
+# ---------------------------------------------------------------------------
+# 2a. QsaSpec -- block-sparse attention as a DECLARATION attribute
+# ---------------------------------------------------------------------------
+
+QSA_BLOCK_SIZE = 4
+"""Tokens per selectable KV block: the sparse loader fetches one 4-token block per gather transaction."""
+QSA_TOP_K_MAX = 512
+"""The most blocks a query's list may carry (a 2048-token budget at block size 4): the index staging is sized at it."""
+QSA_TOP_K_ALIGN = 4
+"""The per-query id list is copied in 16-byte units, so ``top_k`` int32 ids must be a multiple of 4."""
+# The sparse core packs the GQA group (query heads per KV head) on its N tile; this is the widest group the v1 body
+# takes.  The sparse adapter's capabilities record becomes the enforcement point (and this block reads the cap off it,
+# never a literal) the moment the core lands; until then the declaration-time decline below carries the same number.
+_N_MAX_SPARSE_V1 = 16
+
+
+@dataclass(frozen=True)
+class QsaSpec:
+    """Block-sparse attention (Qwen Sparse Attention) as the restriction of stage (4): every query attends to the keys
+    of its SELECTED ``block_size``-token blocks AND to the open tail block of its visible range, under the causal mask.
+
+    A DECLARATION ATTRIBUTE, never a knob: it changes the function -- which keys a query sees, who selects them, the
+    ``W_qkvg`` contract -- so a block declared with it is a different plan from the dense block, and no knob value may
+    route around it.  Attached as ``GatedAttentionBlockGeometry.qsa``.  The model provenance (Qwen3.8-Flash-Next: a
+    2048-token budget, block ratio 4, a 4-head x 128 MQA indexer over one raw key head) lives in comments only; the
+    fields are named by op geometry.
+
+    Fields
+    ------
+    block_size
+        Tokens per selectable block.  4 only: the sparse loader fetches one 4-token block per gather transaction;
+        another block size has no loader.
+    top_k
+        Blocks per query the caller's list carries: a multiple of 4 in ``[4, 512]``.  It SIZES the kernel's per-query
+        index staging (every ids byte count is ``top_k x 4``, copied in 16-byte units), so a longer list would be
+        silently truncated and an unaligned one over-read -- both refused by :meth:`validate`.
+    index_source
+        ``"caller"``: ``execute(block_ids=)`` carries the selection -- ``[T, top_k]`` int32, per query the ids of its
+        selected complete blocks (block ``b`` = tokens ``[4b, 4b + 4)`` of the query's own sequence), the valid prefix
+        then ``-1`` padding; ``block_lens`` optional.  ``"indexer"``: the block runs the indexer over its fifth band
+        itself -- a typed decline at declaration until that arm lands.
+    index_band
+        ``W_qkvg`` carries a FIFTH band, ``ProjBlock.INDEX``, of ``(index_heads + index_kv_heads) * index_head_dim``
+        columns below V: the indexer's query heads first, its single raw key head last (the checkpoint's own row
+        order, so the indexer weight concatenates unchanged).  Served on the UNFUSED projection (the FROST GEMM writes
+        the wider slab; :func:`index_k_raw_view` exposes the raw key); the fused projection fork renders 256-column
+        tiles and declines a 640-column band, typed.
+    index_heads, index_kv_heads, index_head_dim, index_norm_eps
+        The indexer's geometry.  They SIZE THE BAND ONLY today and are UNREAD by any kernel -- documented inert; the
+        in-block indexer that scores with them is the follow-up.  ``index_kv_heads`` is 1 (one raw key head, the
+        checkpoint's own validator pins it); ``index_head_dim`` is a multiple of ``QKVG_TILE_ALIGN`` so every indexer
+        head keeps the band tile-aligned.
+
+    Fixed semantics that are deliberately NOT fields: the open tail block is always visible, the causal mask is always
+    applied, and the id dtype is int32 (one legal value; an int64 list is refused at ``execute``).  A dense route below
+    the identity bound (:attr:`identity_bound` visible tokens -- 2051 at the defaults -- below which every query's
+    complete blocks fit the list and a full list reproduces dense causal attention) is a legal performance knob ONLY
+    under ``index_source="indexer"``, where the block derives the selection itself; under caller lists it would ignore
+    the list: numerics-changing, never a knob.
+    """
+
+    block_size: int = QSA_BLOCK_SIZE
+    top_k: int = QSA_TOP_K_MAX
+    index_source: str = "caller"
+    index_band: bool = False
+    index_heads: int = 4
+    index_kv_heads: int = 1
+    index_head_dim: int = 128
+    index_norm_eps: float = 1e-6
+
+    @property
+    def index_band_cols(self) -> int:
+        """Columns of the fifth band when declared: ``(index_heads + index_kv_heads) * index_head_dim`` (640 at the defaults)."""
+        return (int(self.index_heads) + int(self.index_kv_heads)) * int(self.index_head_dim)
+
+    @property
+    def identity_bound(self) -> int:
+        """The largest visible-token count at which every query's complete blocks still fit the list (2051 at the
+        defaults): ``floor(n / block_size) <= top_k`` for every ``n`` up to it, so a full list reproduces dense causal
+        attention exactly; one token more and the oldest complete block of that query is not representable."""
+        return int(self.top_k) * int(self.block_size) + int(self.block_size) - 1
+
+    def validate(self) -> None:
+        """Raise ``ValueError`` on a declaration no stage can express; each message names what the failure would have
+        LOOKED like (the geometry validator's own rule)."""
+        if self.block_size != QSA_BLOCK_SIZE:
+            raise ValueError(
+                f"QsaSpec.block_size must be {QSA_BLOCK_SIZE}: the sparse loader gathers one {QSA_BLOCK_SIZE}-token block per transaction, "
+                f"and block_size={self.block_size} has no loader"
+            )
+        if not (QSA_TOP_K_ALIGN <= self.top_k <= QSA_TOP_K_MAX) or self.top_k % QSA_TOP_K_ALIGN:
+            raise ValueError(
+                f"QsaSpec.top_k must be a multiple of {QSA_TOP_K_ALIGN} in [{QSA_TOP_K_ALIGN}, {QSA_TOP_K_MAX}], got {self.top_k}: the per-query "
+                f"index staging is sized at top_k blocks (at most {QSA_TOP_K_MAX}, the {QSA_TOP_K_MAX * QSA_BLOCK_SIZE}-token budget over "
+                f"{QSA_BLOCK_SIZE}-token blocks) and copied in 16-byte units -- a longer list would be silently truncated, an unaligned one over-read"
+            )
+        if self.index_source not in ("caller", "indexer"):
+            raise ValueError(
+                f"QsaSpec.index_source must be 'caller' (execute(block_ids=) carries the selection) or 'indexer' (the block runs the indexer), "
+                f"got {self.index_source!r}"
+            )
+        if self.index_source == "indexer" and not self.index_band:
+            raise ValueError(
+                "QsaSpec.index_source='indexer' requires index_band=True: the indexer projects its queries and keys from the fifth band of "
+                "W_qkvg; without the band there is nothing to score"
+            )
+        if self.index_heads < 1:
+            raise ValueError(f"QsaSpec.index_heads must be >= 1 (the indexer's query heads), got {self.index_heads}")
+        if self.index_kv_heads != 1:
+            raise ValueError(f"QsaSpec.index_kv_heads must be 1 (one raw key head; the checkpoint's own validator pins it), got {self.index_kv_heads}")
+        if self.index_head_dim < QKVG_TILE_ALIGN or self.index_head_dim % QKVG_TILE_ALIGN:
+            raise ValueError(
+                f"QsaSpec.index_head_dim must be a positive multiple of QKVG_TILE_ALIGN={QKVG_TILE_ALIGN} (every indexer head keeps the fifth band "
+                f"tile-aligned, else a GEMM output tile straddles the band and its neighbour), got {self.index_head_dim}"
+            )
+        if not self.index_norm_eps > 0.0:
+            raise ValueError(f"QsaSpec.index_norm_eps must be > 0, got {self.index_norm_eps}")
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +650,13 @@ class GatedAttentionBlockGeometry:
     # leak a post-eligibility ValueError.
     qk_norm: bool = True
 
+    # APPENDED: block-sparse attention.  None = the dense block.  A QsaSpec changes
+    # the FUNCTION (which keys a query sees, who selects them, the W_qkvg contract --
+    # a fifth band under `index_band`), so it is a declaration attribute, never a
+    # knob, and every layout tuple below grows its fifth entry exactly when the band
+    # is declared.  validate() runs QsaSpec's own rows and the cross-field ones.
+    qsa: Optional[QsaSpec] = None
+
     # -- derived scalars ----------------------------------------------------
 
     @property
@@ -450,18 +677,34 @@ class GatedAttentionBlockGeometry:
     # -- the N-axis map (see "Stage (1) layout" above) ----------------------
 
     @property
-    def qkvg_block_widths(self) -> tuple[int, int, int, int]:
-        """Column count of each block, in ``ProjBlock`` order."""
-        return (
+    def index_band(self) -> bool:
+        """``True`` iff ``W_qkvg`` carries the fifth (indexer) band: ``qsa`` declared with ``index_band``."""
+        return isinstance(self.qsa, QsaSpec) and bool(self.qsa.index_band)
+
+    @property
+    def qkvg_blocks(self) -> tuple[ProjBlock, ...]:
+        """The bands this geometry's ``W_qkvg`` has, in N order: ``(Q, GATE, K, V)``, plus ``INDEX`` iff declared.
+
+        Enumerate THIS, never ``ProjBlock`` itself -- the enum carries the fifth member for every geometry, the band
+        exists only where it is declared.
+        """
+        dense = (ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V)
+        return dense + (ProjBlock.INDEX,) if self.index_band else dense
+
+    @property
+    def qkvg_block_widths(self) -> tuple[int, ...]:
+        """Column count of each band, in ``qkvg_blocks`` order (four entries; five with the indexer band)."""
+        widths = (
             self.h_q * self.d_head,
             self.h_q * self.d_head,
             self.h_kv * self.d_head,
             self.h_kv * self.d_head,
         )
+        return widths + (self.qsa.index_band_cols,) if self.index_band else widths
 
     @property
-    def qkvg_offsets(self) -> tuple[int, int, int, int]:
-        """Starting column of each block, in ``ProjBlock`` order.
+    def qkvg_offsets(self) -> tuple[int, ...]:
+        """Starting column of each band, in ``qkvg_blocks`` order.
 
         **This ordering is API, append-only forever** — it is what a caller
         concatenates its checkpoint weights into, ONCE at load time (never per
@@ -477,25 +720,44 @@ class GatedAttentionBlockGeometry:
 
     @property
     def n_qkv(self) -> int:
-        """``n_qkvg`` minus the GATE band: the e4m3 bytes per token the fused
-        FP8 projection writes across its three COMPACT outputs ``q8`` / ``k8``
-        / ``v8`` (``h_q*d + 2*h_kv*d``).  A width, not a slab: since round 2
-        nothing in the block addresses a ``[T, n_qkv]`` buffer."""
-        return self.n_qkvg - self.h_q * self.d_head
+        """The Q + K + V width (no GATE band, no indexer band): the e4m3 bytes
+        per token the fused FP8 projection writes across its three COMPACT
+        outputs ``q8`` / ``k8`` / ``v8`` (``h_q*d + 2*h_kv*d``).  A width, not a
+        slab: since round 2 nothing in the block addresses a ``[T, n_qkv]``
+        buffer."""
+        w = self.qkvg_block_widths
+        return w[ProjBlock.Q] + w[ProjBlock.K] + w[ProjBlock.V]
 
     @property
-    def qkvg_heads(self) -> tuple[int, int, int, int]:
-        """Head count of each block, in ``ProjBlock`` order."""
-        return (self.h_q, self.h_q, self.h_kv, self.h_kv)
+    def qkvg_heads(self) -> tuple[int, ...]:
+        """Head count of each band, in ``qkvg_blocks`` order (the INDEX band's heads are the indexer's: its query
+        heads plus its raw key head, of ``qkvg_head_dims[INDEX]`` columns each, not ``d_head``)."""
+        heads = (self.h_q, self.h_q, self.h_kv, self.h_kv)
+        return heads + (self.qsa.index_heads + self.qsa.index_kv_heads,) if self.index_band else heads
+
+    @property
+    def qkvg_head_dims(self) -> tuple[int, ...]:
+        """Per-band head dim, in ``qkvg_blocks`` order: ``d_head`` for Q / GATE / K / V, ``index_head_dim`` for INDEX."""
+        dims = (self.d_head,) * 4
+        return dims + (self.qsa.index_head_dim,) if self.index_band else dims
+
+    @property
+    def index_k_raw_offset(self) -> int:
+        """First slab column of the RAW indexer key: the INDEX band's last ``index_kv_heads * index_head_dim`` columns
+        (pre-norm, un-rotated -- what a serving cache keeps for the indexer).  ``ValueError`` without the band."""
+        if not self.index_band:
+            raise ValueError("index_k_raw_offset: this geometry declares no indexer band (GatedAttentionBlockGeometry.qsa.index_band)")
+        return self.qkvg_offsets[ProjBlock.INDEX] + self.qsa.index_heads * self.qsa.index_head_dim
 
     def block_for_column(self, col: int) -> tuple[ProjBlock, int, int]:
-        """``col`` in ``[0, N)`` -> ``(block, head, column within head)``."""
+        """``col`` in ``[0, N)`` -> ``(block, head, column within head)`` -- the head and its width per band
+        (``qkvg_head_dims``: the INDEX band's heads are ``index_head_dim`` wide)."""
         if not 0 <= col < self.n_qkvg:
             raise ValueError(f"column {col} out of range [0, {self.n_qkvg})")
-        for block, (off, width) in enumerate(zip(self.qkvg_offsets, self.qkvg_block_widths)):
+        for block, off, width, hd in zip(self.qkvg_blocks, self.qkvg_offsets, self.qkvg_block_widths, self.qkvg_head_dims):
             if col < off + width:
                 local = col - off
-                return ProjBlock(block), local // self.d_head, local % self.d_head
+                return block, local // hd, local % hd
         raise AssertionError("unreachable: widths sum to n_qkvg")
 
     def qkvg_tile_plan(self, tile_n: int) -> tuple[ProjBlock, ...]:
@@ -529,6 +791,8 @@ class GatedAttentionBlockGeometry:
         message says what the failure would have LOOKED like, because a config
         error that reaches a kernel does not announce itself.
         """
+        if self.qsa is not None and not isinstance(self.qsa, QsaSpec):
+            raise TypeError(f"geometry.qsa must be a QsaSpec or None, got {type(self.qsa).__name__}")
         for label, value in (("d_model", self.d_model), ("h_q", self.h_q), ("h_kv", self.h_kv), ("d_head", self.d_head)):
             if value <= 0:
                 raise ValueError(f"{label} must be > 0, got {value}")
@@ -552,10 +816,10 @@ class GatedAttentionBlockGeometry:
         # straddle two blocks, and the epilogue would have to predicate per
         # column instead of specializing per tile -- which is not a correctness
         # bug today but forecloses the quantization epilogue entirely.
-        for block, width in zip(ProjBlock, self.qkvg_block_widths):
+        for block, width in zip(self.qkvg_blocks, self.qkvg_block_widths):
             if width % QKVG_TILE_ALIGN != 0:
                 raise ValueError(
-                    f"{block.name} block width {width} (= heads * d_head) must be a multiple of QKVG_TILE_ALIGN={QKVG_TILE_ALIGN}, "
+                    f"{block.name} block width {width} (= heads * head dim) must be a multiple of QKVG_TILE_ALIGN={QKVG_TILE_ALIGN}, "
                     f"else a GEMM output tile straddles two of Q/GATE/K/V"
                 )
 
@@ -572,6 +836,27 @@ class GatedAttentionBlockGeometry:
         if self.window_right >= 0 and not self.is_causal:
             raise ValueError("window_right requires is_causal=True (it widens the causal diagonal, it does not create one)")
 
+        # Block-sparse attention: the QsaSpec's own rows, then the cross-field ones.
+        # The selection IS the sparsity, so a window or a bidirectional mask has no
+        # definition under it; the indexer rotates the same leading rope_dim as Q / K.
+        if self.qsa is not None:
+            self.qsa.validate()
+            if self.rope_dim > self.qsa.index_head_dim:
+                raise ValueError(
+                    f"rope_dim ({self.rope_dim}) must be <= QsaSpec.index_head_dim ({self.qsa.index_head_dim}): the indexer rotates the same "
+                    "leading rope_dim of its heads, and a rotation wider than the head has no definition"
+                )
+            if not self.is_causal:
+                raise ValueError(
+                    "QsaSpec requires is_causal=True: block-sparse attention is defined under the causal mask (causal AND selected); a "
+                    "bidirectional sparse block is not a thing the model computes"
+                )
+            if self.window_left != -1 or self.window_right != -1:
+                raise ValueError(
+                    f"QsaSpec has no sliding window (the selection IS the sparsity): window_left / window_right must both be -1, got "
+                    f"{self.window_left} / {self.window_right}"
+                )
+
 
 def build_fused_qkvg_weight(
     w_q_gate: torch.Tensor,
@@ -579,12 +864,15 @@ def build_fused_qkvg_weight(
     w_v: torch.Tensor,
     geometry: GatedAttentionBlockGeometry,
     *,
-    q_gate_layout: str = "flat",
+    q_gate_layout: Optional[str] = None,
+    index_qk_proj_weight: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Assemble ``W_qkvg [N, d_model]`` from the checkpoint's three matrices.
+    """Assemble ``W_qkvg [N, d_model]`` from the checkpoint's three matrices (four under an indexer band).
 
     **Load time only.** The result is what stage (1) reads; nothing here ever
-    runs on the execute path.
+    runs on the execute path. Loading a HF Qwen checkpoint? Use
+    :func:`qkvg_from_hf`, which fixes the layout below to the one those
+    checkpoints use and also prepares the two norm weights.
 
     Parameters
     ----------
@@ -607,6 +895,22 @@ def build_fused_qkvg_weight(
         Get this wrong and every gate is applied to the wrong head: the output
         is finite, plausible, and wrong, with no error anywhere. Verify it
         against the model you are loading rather than trusting a default.
+
+        ``None`` (the default) is DEPRECATED: it still means ``"flat"`` so no
+        existing caller changes behaviour, but it emits a ``FutureWarning``
+        -- the deprecation category Python shows under its default warning
+        filters, so a caller inside a library module sees it too, where a
+        ``DeprecationWarning`` is shown only to ``__main__``. Every HF Qwen
+        checkpoint from Qwen3-Next on is ``"per_head"``
+        (``q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)``), so the silent
+        default was the trap the paragraph above describes. Pass the layout
+        explicitly, or load through :func:`qkvg_from_hf`.
+    index_qk_proj_weight
+        APPENDED.  The indexer projection ``[(index_heads + index_kv_heads) *
+        index_head_dim, d_model]`` of a block-sparse layer -- its query heads
+        then its raw key head, the checkpoint's own row order -- REQUIRED iff
+        ``geometry.qsa.index_band`` (it becomes the fifth band, below V) and
+        REFUSED otherwise (a geometry without the band has exactly four).
     """
     geometry.validate()
     d = geometry.d_head
@@ -620,6 +924,16 @@ def build_fused_qkvg_weight(
         if w.shape[1] != geometry.d_model:
             raise ValueError(f"{name} must have {geometry.d_model} columns (d_model), got {w.shape[1]}")
 
+    if q_gate_layout is None:
+        warnings.warn(
+            "build_fused_qkvg_weight: q_gate_layout was not given and defaults to 'flat' (all Q heads, then all GATE heads). "
+            "HF Qwen checkpoints from Qwen3-Next on split q_proj PER HEAD ([q_h | gate_h]): load those through qkvg_from_hf(...) "
+            "or pass q_gate_layout='per_head'. The implicit default is deprecated; pass the layout explicitly.",
+            # FutureWarning, not DeprecationWarning: the default filters drop a DeprecationWarning raised from library code.
+            FutureWarning,
+            stacklevel=2,
+        )
+        q_gate_layout = "flat"
     if q_gate_layout == "flat":
         w_q, w_gate = w_q_gate[: hq * d], w_q_gate[hq * d :]
     elif q_gate_layout == "per_head":
@@ -629,7 +943,126 @@ def build_fused_qkvg_weight(
     else:
         raise ValueError(f"q_gate_layout must be 'flat' or 'per_head', got {q_gate_layout!r}")
 
-    return torch.cat([w_q, w_gate, w_k, w_v], dim=0).contiguous()
+    bands = [w_q, w_gate, w_k, w_v]
+    if geometry.index_band:
+        q = geometry.qsa
+        if index_qk_proj_weight is None:
+            raise ValueError(
+                f"index_qk_proj_weight is required: geometry.qsa.index_band=True puts a fifth band of {q.index_band_cols} indexer columns "
+                f"([{q.index_heads} query heads | {q.index_kv_heads} raw key head] x {q.index_head_dim}) below V in W_qkvg"
+            )
+        if tuple(index_qk_proj_weight.shape) != (q.index_band_cols, geometry.d_model):
+            raise ValueError(
+                f"index_qk_proj_weight must be [{q.index_band_cols}, {geometry.d_model}] (the indexer's {q.index_heads} query heads then its "
+                f"{q.index_kv_heads} raw key head, {q.index_head_dim} rows each, over d_model), got {tuple(index_qk_proj_weight.shape)}"
+            )
+        if index_qk_proj_weight.dtype != w_q_gate.dtype:
+            raise ValueError(f"index_qk_proj_weight must have the other matrices' dtype {w_q_gate.dtype}, got {index_qk_proj_weight.dtype}")
+        bands.append(index_qk_proj_weight)
+    elif index_qk_proj_weight is not None:
+        raise ValueError(
+            "index_qk_proj_weight: this geometry declares no indexer band, so W_qkvg has exactly the four bands Q | GATE | K | V and the "
+            "indexer projection is not part of it; declare GatedAttentionBlockGeometry(qsa=QsaSpec(index_band=True)) for a fifth band, or pass None"
+        )
+    return torch.cat(bands, dim=0).contiguous()
+
+
+def qkvg_from_hf(
+    q_proj_weight: torch.Tensor,
+    k_proj_weight: torch.Tensor,
+    v_proj_weight: torch.Tensor,
+    q_norm_weight: Optional[torch.Tensor],
+    k_norm_weight: Optional[torch.Tensor],
+    geometry: GatedAttentionBlockGeometry,
+    *,
+    index_qk_proj_weight: Optional[torch.Tensor] = None,
+    act_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(w_qkvg, w_q_norm, w_k_norm)`` for the block from a HF Qwen attention layer's tensors.
+
+    **Load time only** -- the three results are what the block reads on every
+    ``execute``; nothing here runs on the hot path. "From HF" means the two
+    conventions every Qwen checkpoint from Qwen3-Next on shares (Qwen3-Next,
+    Qwen3.5, the Qwen3.8 family), applied here so the caller cannot get them
+    wrong:
+
+    * **The double-width ``q_proj`` is split PER HEAD.** The model computes
+      ``q, gate = q_proj(x).view(..., H_q, 2*D).chunk(2, dim=-1)``, so the
+      rows of ``q_proj.weight`` are ``[q_0 | gate_0 | q_1 | gate_1 | ...]`` --
+      :func:`build_fused_qkvg_weight` with ``q_gate_layout="per_head"``. The
+      other layout applies every gate to the wrong head with no error anywhere.
+    * **The QK-norm weights are zero-centered.** The model's RMSNorm is
+      ``x * rsqrt(mean(x^2) + eps) * (1 + w)`` with ``w`` initialised to zeros,
+      while the block multiplies by the ``[D]`` vector it is given. The form
+      handed over is DERIVED from the geometry's ``norm_weight_offset`` (0.0
+      when the geometry has no such field): at ``0.0`` the block adds nothing,
+      so it receives ``(1 + w)``; at ``1.0`` the block's norm kernels add the
+      ``1`` themselves in fp32, so it receives ``w`` as is. Deriving it from
+      the same geometry the block is declared with is what keeps the two
+      mechanisms from composing into ``1 + (1 + w)`` -- finite, plausible,
+      wrong -- which is why there is no free-standing argument for it.
+
+    ``(1 + w)`` is formed in fp32 and rounded ONCE into ``act_dtype``. bf16
+    has 8 significand bits, so near 1.0 that rounding is at most ``2^-8`` =
+    0.39 % relative per channel (``2^-11`` = 0.049 % in f16), and a trained
+    ``-2^-9 < w < 2^-8`` rounds to exactly 1.0 (an asymmetric interval: bf16's
+    spacing is ``2^-8`` just below 1.0 and ``2^-7`` just above; f16 loses
+    ``-2^-12 < w < 2^-11``); a systematic per-channel scale error inside the
+    block's accuracy budget but not HF-faithful -- the fp32 in-kernel offset
+    form is the faithful one once a geometry declares it.
+
+    Parameters
+    ----------
+    q_proj_weight
+        ``q_proj.weight``, ``[2*H_q*D, d_model]`` (Q and the output gate, per head).
+    k_proj_weight, v_proj_weight
+        ``k_proj.weight`` / ``v_proj.weight``, ``[H_kv*D, d_model]``.
+    q_norm_weight, k_norm_weight
+        ``q_norm.weight`` / ``k_norm.weight``, ``[D]``, zero-centered; both
+        ``None`` iff ``geometry.qk_norm`` is ``False`` (then the block takes no
+        norm weights and ``None`` is returned in their slots).
+    geometry
+        The block's geometry; also the source of ``norm_weight_offset``.
+    index_qk_proj_weight
+        The indexer projection ``index_qk_proj.weight`` of a block-sparse layer,
+        ``[(index_heads + index_kv_heads) * index_head_dim, d_model]``: REQUIRED
+        iff ``geometry.qsa.index_band`` (appended below V as the fifth band of
+        ``w_qkvg``, rows as the checkpoint stores them), REFUSED otherwise.
+    act_dtype
+        The block's ACTIVATION dtype (bf16 by default, f16 also served). All
+        three results are returned in it, contiguous. A quantized pipeline
+        quantizes the returned ``w_qkvg`` afterwards and keeps the norm weights
+        in this dtype, exactly as the block's descriptor contract requires.
+    """
+    if not isinstance(act_dtype, torch.dtype) or not act_dtype.is_floating_point:
+        raise ValueError(f"act_dtype must be a floating-point torch dtype (the block's activation dtype), got {act_dtype!r}")
+    offset = float(getattr(geometry, "norm_weight_offset", 0.0))
+    if offset not in (0.0, 1.0):
+        raise ValueError(
+            f"geometry.norm_weight_offset must be 0.0 (the block multiplies by the weight as given, so it receives 1 + w) or 1.0 "
+            f"(the block adds the 1 itself, so it receives w); got {offset}"
+        )
+    w_qkvg = (
+        build_fused_qkvg_weight(q_proj_weight, k_proj_weight, v_proj_weight, geometry, q_gate_layout="per_head", index_qk_proj_weight=index_qk_proj_weight)
+        .to(act_dtype)
+        .contiguous()
+    )
+
+    norms = []
+    for name, w in (("q_norm_weight", q_norm_weight), ("k_norm_weight", k_norm_weight)):
+        if not geometry.qk_norm:
+            if w is not None:
+                raise ValueError(f"{name}: geometry.qk_norm=False -- the block applies no QK-RMSNorm and takes no norm weights; pass None")
+            norms.append(None)
+            continue
+        if w is None:
+            raise ValueError(f"{name} is required when geometry.qk_norm=True (a zero-centered [d_head] vector; HF Qwen initialises it to zeros)")
+        if tuple(w.shape) != (geometry.d_head,):
+            raise ValueError(f"{name} must be [d_head={geometry.d_head}] (one RMSNorm weight per head dim), got {tuple(w.shape)}")
+        # (1 + w) in fp32 -- the model's own `output * (1.0 + self.weight.float())` -- then ONE rounding into the
+        # activation dtype; at offset 1.0 the kernel adds the 1 in fp32 and `w` travels as is.
+        norms.append(((1.0 + w.float()) if offset == 0.0 else w.float()).to(act_dtype).contiguous())
+    return w_qkvg, norms[0], norms[1]
 
 
 # ---------------------------------------------------------------------------
@@ -675,8 +1108,15 @@ def _align_up(n: int, a: int = _WS_ALIGN) -> int:
     return (n + a - 1) // a * a
 
 
+_ITEMSIZE: dict = {}
+
+
 def _itemsize(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
+    """Bytes per element of ``dtype`` -- memoised: the view builders asked torch for an empty tensor on every call."""
+    n = _ITEMSIZE.get(dtype)
+    if n is None:
+        n = _ITEMSIZE[dtype] = torch.empty((), dtype=dtype).element_size()
+    return n
 
 
 def _view(ws: torch.Tensor, offset: int, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
@@ -723,15 +1163,27 @@ class _Intermediates:
     projection writes the COMPACT e4m3 ``q8`` / ``k8`` / ``v8`` (the same three
     slots the unfused FP8 quantize passes fill) + ``gate16`` (bf16 GATE), and
     the gated FP8 SDPA writes ``o8`` directly.
+
+    Under the TRAINING forward (``_plan_workspace(want_saved=True)``, i.e.
+    ``save_for_backward``) the caller's :class:`SavedForBackward` takes two slots
+    over: ``o`` is ``-1`` (the SDPA writes the PRE-gate ``saved.o`` directly) and
+    ``o_gated`` is RESERVED (stage (5) gates OUT of place into it, stage (6) reads
+    it); ``proj`` is ``-1`` in the proj_slab save mode (stage (1) writes
+    ``saved.proj_slab``) and reserved as usual in the gate-copy mode
+    (``saved_gate_copy``: the GATE band is copied out of it into ``saved.gate``).
+    Under a QUANTIZED training forward (FP8 / MXFP8) the bf16 compact ``q`` /
+    ``k`` are reserved as well: norm+RoPE writes the normed Q/K there out of
+    place (the slab's Q/K bands stay PRE-norm for the record) and the quantize
+    stages read them.
     """
 
-    proj: int  # [T, N]            stage (1) output; holds Q | GATE | K | V  (-1 when FP8 fully fused)
-    q: int  # [T, H_q,  D]     compact, post-norm, post-RoPE
+    proj: int  # [T, N]            stage (1) output; holds Q | GATE | K | V  (-1 when FP8 fully fused, or when it is saved.proj_slab)
+    q: int  # [T, H_q,  D]     compact, post-norm, post-RoPE (bf16 out of place; and FP8 / MXFP8 TRAINING, where the quantize stages read it)
     gate: int  # -1: a column slice of proj
-    k: int  # [T, H_kv, D]     compact
+    k: int  # [T, H_kv, D]     compact (same rule as q)
     v: int  # [T, H_kv, D]     compact (stage 3b)
-    o: int  # [T, H_q,  D]     SDPA output, gated in place by (5)  (-1 when FP8 fully fused)
-    o_gated: int  # -1: aliases o
+    o: int  # [T, H_q,  D]     SDPA output, gated in place by (5)  (-1 when FP8 fully fused, or when it is saved.o under training)
+    o_gated: int  # -1: aliases o (inference).  Reserved under training: stage (5) gates saved.o OUT of place into it, stage (6) reads it
     engine_scratch: int  # the sub-engines' own workspace (GEMM / SDPA)
 
     total_bytes: int
@@ -782,6 +1234,20 @@ def _sf_slot_bytes(b: int, h: int, s: int, d: int) -> int:
     return b * h * _ceil_div(s, _SF_TILE_ROWS) * (_SF_TILE_ROWS * d // _SF_BLOCK)
 
 
+def _sf_slot_bytes_packed(num_sequences: int, h: int, t: int, d: int) -> int:
+    """Bytes of ONE SDPA scale-factor blob under THD (``thd=True``): the PACKED per-sequence-tile-padded layout the Rubin
+    d256 MXFP8 row reads, sized at its CAPACITY -- ``H * n_cap * (128 * D/32)`` with ``n_cap = (T + 127 * B) // 128``, the
+    host bound on the live tile total ``sum_b ceil(s_b / 128)`` (the lengths' VALUES are never read; ``B = num_sequences``).
+    The dense ``(1, T)`` count ``H * ceil(T/128)`` is short by up to ``B - 1`` tiles per head -- a slot sized that way is
+    an out-of-bounds write by the packed quantizer.  ``kernels/quantize_mxfp8.py::sf_bytes_packed`` is the ONE source of
+    the formula; K and V (both ``h_kv``) carry the same count by construction, which the SDPA's binder requires (it
+    derives the tile extent from the byte count, so the view handed over must be the WHOLE slot, never the live total).
+    """
+    from .kernels.quantize_mxfp8 import sf_bytes_packed
+
+    return sf_bytes_packed(num_sequences, h, t, d)
+
+
 def _plan_workspace(
     geom: GatedAttentionBlockGeometry,
     b: int,
@@ -794,12 +1260,39 @@ def _plan_workspace(
     fp8_fused: bool = False,
     mxfp8: bool = False,
     o_fp4: Optional[Fp4Format] = None,
+    want_saved: bool = False,
+    saved_gate_copy: bool = False,
+    thd_num_sequences: int = 0,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
+
+    ``want_saved`` / ``saved_gate_copy`` (appended): the TRAINING forward
+    (``save_for_backward=True``; out of place, on the UNFUSED bf16 / fp16 /
+    per-tensor FP8 / MXFP8 pipelines, the fp4 modes included -- a fully fused
+    quantized or an in-place training carve is a typed ``ValueError`` here,
+    mirroring the block's own declaration declines; under ``o_fp4`` the carve
+    reserves ``o_gated`` and appends ``o4`` / ``sf_o`` exactly as the inference
+    carve does, and never ``o8``).  Under ``fp8`` (per-tensor FP8 or MXFP8) the bf16
+    compact ``q`` / ``k`` are reserved as well: norm+RoPE writes the normed Q/K
+    there OUT of place so the slab's Q/K bands stay PRE-norm for the record, and
+    the quantize stages read them (+17 KiB/token at the 397B geometry; the
+    inference carve is untouched).  ``o`` is NOT reserved (the SDPA writes the
+    caller's PRE-gate ``saved.o``) and ``o_gated`` IS (stage (5) gates OUT of
+    place into it; stage (6) reads it); ``proj`` is not reserved in the
+    proj_slab save mode (stage (1) writes ``saved.proj_slab``) and reserved as
+    today under ``saved_gate_copy`` (the GATE band is copied out of it into the
+    compact ``saved.gate``).  Every ``want_saved=False`` layout is byte-identical
+    to before (pinned by ``test_block_training_forward.py::
+    test_workspace_layout_is_byte_identical_without_want_saved``).
 
     ``mxfp8`` (appended) adds the three SDPA scale-factor blobs ``sf_q`` /
     ``sf_k`` / ``sf_v`` (:func:`_sf_slot_bytes`) at the END of either layout, so
     every FP8 offset is byte-identical to before MXFP8 existed.
+    ``thd_num_sequences`` (appended; 0 = dense) sizes those three slots at the
+    PACKED capacity (:func:`_sf_slot_bytes_packed`, ``B = thd_num_sequences``,
+    ``T = b * s``) for a ``thd=True`` block -- the ONLY difference between the
+    packed MXFP8 carve and the dense ``(1, T)`` one (pinned by
+    ``test_block_thd_mxfp8.py``).
 
     ``o_fp4`` (appended; an :class:`Fp4Format`) appends ``o4`` (packed e2m1 gated O,
     ``t*h_q*d_head // 2`` bytes) and ``sf_o`` (its padded F8_128x4 blob,
@@ -819,6 +1312,25 @@ def _plan_workspace(
     tensor: it is an OUTPUT, not an intermediate.
     """
     del want_lse, want_rstd
+    if want_saved:
+        # The training carve must agree with the body that fills it.  The UNFUSED bf16 / fp16 / per-tensor FP8 / MXFP8
+        # pipelines write the record (a bf16 slab with PRE-norm Q/K bands, a bf16 pre-gate O, the LSE) -- the fp4 modes
+        # included: the fp4 tail replaces `o8` by `o4` / `sf_o` in THIS carve and the record it writes is byte for byte the
+        # MXFP8 record (the SDPA writes bf16 `o`, stage (5) gates out of place into `o_gated`, the fp4 quantize reads it);
+        # the FULLY FUSED quantized pipelines write no slab and no bf16 O, and in-place Q/K would destroy the slab's
+        # pre-norm columns the record hands over.
+        if fp8_fused:
+            raise ValueError(
+                "want_saved (the training forward's workspace carve) needs the UNFUSED pipeline: the FULLY FUSED FP8 / MXFP8 pipelines write "
+                "no bf16 slab and no pre-gate O (no q_pre / k_pre / pre-gate O contract), so they are inference-only"
+            )
+        if inplace_qkv:
+            raise ValueError(
+                "want_saved requires inplace_qkv=False: the training forward keeps the slab's Q/K columns as q_pre / k_pre and writes the "
+                "normed Q/K out of place (see SavedForBackward)"
+            )
+    elif saved_gate_copy:
+        raise ValueError("saved_gate_copy=True selects the gate-copy SAVE mode of a training forward and has no meaning without want_saved=True")
     e = _itemsize(dtype)
     t = b * s
     off = 0
@@ -841,7 +1353,7 @@ def _plan_workspace(
             ("o", t * geom.h_q * geom.d_head * e) if o_fp4 is not None else ("o8", t * geom.h_q * geom.d_head),
         ]
         if mxfp8:
-            slots += _sf_slots(geom, b, s)
+            slots += _sf_slots(geom, b, s, thd_num_sequences)
         if o_fp4 is not None:
             slots += _o_fp4_slots(geom, t, o_fp4)
         for name, nbytes in slots:
@@ -879,7 +1391,12 @@ def _plan_workspace(
     # It is NOT legal under save_for_backward: the slab IS q_pre/k_pre, which
     # the RMSNorm backward needs and cannot safely reconstruct -- see
     # SavedForBackward. The caller-facing guard is in GatedAttentionBlock.
-    slots = [("proj", t * geom.n_qkvg * e)]
+    #
+    # TRAINING, proj_slab save mode: stage (1) writes the caller-owned
+    # `saved.proj_slab` (bound by pointer as the GEMM output), so the slab is not
+    # reserved here at all -- 34 KiB/token at the 397B geometry that the caller
+    # keeps for the backward instead of the block scratching it.
+    slots = [] if (want_saved and not saved_gate_copy) else [("proj", t * geom.n_qkvg * e)]
     if not inplace_qkv and not fp8:
         slots += [
             ("q", t * geom.h_q * geom.d_head * e),
@@ -887,22 +1404,40 @@ def _plan_workspace(
             ("v", t * geom.h_kv * geom.d_head * e),
         ]
     if fp8:
-        # FP8: norm+RoPE stays in place on the bf16 slab; the quantize stages
-        # then write COMPACT e4m3 Q/K/V (1 B/elem -- half the size of the bf16
-        # compact buffers they replace, and they double as V's compaction), the
-        # SDPA writes bf16 O, the gate is in place, and O is quantized into o8
-        # for the FP8 out_proj.
+        # FP8 / MXFP8 INFERENCE: norm+RoPE stays in place on the bf16 slab; the
+        # quantize stages then write COMPACT e4m3 Q/K/V (1 B/elem -- half the size
+        # of the bf16 compact buffers they replace, and they double as V's
+        # compaction), the SDPA writes bf16 O, the gate is in place, and O is
+        # quantized into o8 for the FP8 out_proj.
+        if want_saved:
+            # FP8 / MXFP8 TRAINING: the slab's Q/K bands are the record's PRE-norm
+            # q_pre / k_pre, so norm+RoPE writes the normed Q/K OUT of place into
+            # these bf16 compact slots and the quantize stages read them (the same
+            # bytes the in-place norm would have written, to a different place:
+            # launch count and traffic unchanged).  V needs no slot: it is never
+            # normed, and its quantize reads the slab's V band.  +17 KiB/token at
+            # the 397B geometry; the inference carve (want_saved=False) is untouched.
+            slots += [
+                ("q", t * geom.h_q * geom.d_head * e),
+                ("k", t * geom.h_kv * geom.d_head * e),
+            ]
         slots += [
             ("q8", t * geom.h_q * geom.d_head),
             ("k8", t * geom.h_kv * geom.d_head),
             ("v8", t * geom.h_kv * geom.d_head),
         ]
-    slots += [("o", t * geom.h_q * geom.d_head * e)]
+    if want_saved:
+        # TRAINING: the SDPA writes the caller's PRE-gate `saved.o` (the backward's dG
+        # operand -- never gated in place); stage (5) gates OUT of place into `o_gated`,
+        # which stage (6) reads.  Same bytes as the inference `o` slot, one slot later.
+        slots += [("o_gated", t * geom.h_q * geom.d_head * e)]
+    else:
+        slots += [("o", t * geom.h_q * geom.d_head * e)]
     if fp8 and o_fp4 is None:
         slots += [("o8", t * geom.h_q * geom.d_head)]
     if mxfp8:
         # MXFP8: the SDPA's F8_128x4 SF blobs, written by the three quantize_mxfp8 stages.
-        slots += _sf_slots(geom, b, s)
+        slots += _sf_slots(geom, b, s, thd_num_sequences)
     if o_fp4 is not None:
         # fp4 O (rows 8 / 9): the quantize_fp4 stage's packed codes + the out_proj GEMM's scale blob, at the END.
         slots += _o_fp4_slots(geom, t, o_fp4)
@@ -911,13 +1446,13 @@ def _plan_workspace(
         off += _align_up(nbytes)
     engine = off
     return _Intermediates(
-        proj=offsets["proj"],
+        proj=offsets.get("proj", -1),
         q=offsets.get("q", -1),
         gate=-1,
         k=offsets.get("k", -1),
         v=offsets.get("v", -1),
-        o=offsets["o"],
-        o_gated=-1,
+        o=offsets.get("o", -1),
+        o_gated=offsets.get("o_gated", -1),
         engine_scratch=engine,
         total_bytes=engine,
         base_align=_WS_ALIGN,
@@ -933,13 +1468,16 @@ def _plan_workspace(
     )
 
 
-def _sf_slots(geom: GatedAttentionBlockGeometry, b: int, s: int) -> list:
-    """The three MXFP8 SDPA scale-factor slots, in (Q, K, V) order."""
-    return [
-        ("sf_q", _sf_slot_bytes(b, geom.h_q, s, geom.d_head)),
-        ("sf_k", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
-        ("sf_v", _sf_slot_bytes(b, geom.h_kv, s, geom.d_head)),
-    ]
+def _sf_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, thd_num_sequences: int = 0) -> list:
+    """The three MXFP8 SDPA scale-factor slots, in (Q, K, V) order.  ``thd_num_sequences`` (appended; 0 = dense) selects
+    the PACKED capacity count of :func:`_sf_slot_bytes_packed` at ``T = b * s`` for a ``thd=True`` block."""
+
+    def nbytes(h: int) -> int:
+        if thd_num_sequences:
+            return _sf_slot_bytes_packed(thd_num_sequences, h, b * s, geom.d_head)
+        return _sf_slot_bytes(b, h, s, geom.d_head)
+
+    return [("sf_q", nbytes(geom.h_q)), ("sf_k", nbytes(geom.h_kv)), ("sf_v", nbytes(geom.h_kv))]
 
 
 def _o_fp4_code_bytes(geom: GatedAttentionBlockGeometry, t: int) -> int:
@@ -986,7 +1524,32 @@ class SavedForBackward:
     ``rstd_k``    [B,S,H_kv] fp32   8 MiB        idem
     ``q_pre``     [B,S,H_q,D]       16 GiB       pre-norm Q -- SAVE or RECOMPUTE
     ``k_pre``     [B,S,H_kv,D]      1 GiB        idem
+    ``proj_slab`` [B*S, n_qkvg]     34 GiB       APPENDED: the stage-(1) slab itself;
+                                                 gate / q_pre / k_pre / V are its bands
+    ``seq_lens``  [B] int32          --          APPENDED: dense -- the padding the
+                                                 forward RAN with (identity, never
+                                                 read); THD -- the packed lengths,
+                                                 [B] or [B+1] prefix sums, REQUIRED,
+                                                 bound by the backward
+    ``seq_lens_form`` str            --          APPENDED: None (dense) / "lengths" /
+                                                 "prefix" -- what seq_lens IS, verified
+                                                 against the block's declaration
     ============ ================= ============ ===================================
+
+    **Two SAVE modes, chosen at declaration** (``GatedAttentionBlockFwd(saved_gate_copy=)``,
+    because the workspace carve differs; ``execute`` verifies the record agrees):
+
+    * **proj_slab** (the default): the caller allocates ``proj_slab`` and the
+      projection GEMM writes it directly (a per-call pointer bind, zero copies);
+      ``gate`` / ``q_pre`` / ``k_pre`` are its column bands -- pass them as
+      :func:`saved_slab_views` or leave them ``None`` and let the backward derive
+      them.  The whole 34 KiB/token slab is saved (the fastest backward: nothing
+      to recompute, and V comes for free), and the workspace loses its own slab.
+    * **gate-copy** (``saved_gate_copy=True``): ``proj_slab`` is ``None``, the slab
+      stays in the workspace and ONE elementwise launch copies the GATE band into
+      the compact ``gate`` (16 KiB/token saved); ``q_pre`` / ``k_pre`` are copied
+      too only if the caller passed buffers, else the backward recomputes them
+      from ``h`` (``RecomputePolicy.RECOMPUTE_QK_PRE``).
 
     **This dataclass is the block's one genuinely novel value proposition, and
     the reason to build it even if the first A/B is flat.** ``gate`` is the same
@@ -1007,20 +1570,127 @@ class SavedForBackward:
 
     A field left ``None`` means "recompute me", and the backward decides how
     from :class:`~cudnn.gated_attention_block.api_bwd.RecomputePolicy` --
-    EXCEPT ``rstd_q`` / ``rstd_k``, which are ``None`` iff
+    with two exceptions.  ``rstd_q`` / ``rstd_k`` are ``None`` iff
     ``geometry.qk_norm`` is False: there is no RMSNorm, stage (B6) does not
-    exist, and nothing could recompute them. The forward REQUIRES them to be
-    ``None`` in that case (and tensors otherwise), both directions typed.
+    exist, and nothing could recompute them; the forward REQUIRES them to be
+    ``None`` in that case (and tensors otherwise), both directions typed.  And
+    in the proj_slab save mode ``gate`` / ``q_pre`` / ``k_pre`` left ``None``
+    mean "a band of ``proj_slab``" (:func:`saved_slab_views` derives them, no
+    recompute) -- the only mode in which ``gate`` may be ``None`` at all.
     """
 
+    # The forward's input, verified to BE execute's `h` (same storage): bf16 / fp16, or the caller's e4m3 codes under a
+    # QuantSpec / MxQuantSpec (the MXFP8 `h_sf` blob is a forward input, never a record field).
     h: torch.Tensor
-    gate: torch.Tensor
-    o: torch.Tensor
-    lse: torch.Tensor
+    # Compact [B,S,H_q,D] (the gate-copy save mode), or the GATE column VIEW of proj_slab (see saved_slab_views).  None is
+    # legal ONLY in the proj_slab save mode, where the band is derivable -- saved_slab_views(proj_slab, geometry, B, S)[1]
+    # -- so the record ALWAYS carries the GATE one way or the other (api_bwd.RecomputePolicy.RECOMPUTE_GATE stays reserved).
+    # Type widened from torch.Tensor: append-only compatible, the positional slot is unchanged.
+    gate: Optional[torch.Tensor]
+    o: torch.Tensor  # PRE-gate O, compact [B,S,H_q,D], 16-B aligned; the SDPA writes it directly under save_for_backward
+    lse: torch.Tensor  # [B,H_q,S] fp32 natural log
     rstd_q: Optional[torch.Tensor]  # None iff geometry.qk_norm is False (positional slot kept: append-only)
     rstd_k: Optional[torch.Tensor]  # idem
     q_pre: Optional[torch.Tensor] = None
     k_pre: Optional[torch.Tensor] = None
+    # APPENDED. The caller-owned stage-(1) output, [B*S, n_qkvg] or [B, S, n_qkvg], act dtype, contiguous, 16-B
+    # aligned.  The SAVE MODE is declared on the block -- GatedAttentionBlockFwd(saved_gate_copy=), because the workspace
+    # carve differs -- and execute() verifies the record agrees with it (a typed ValueError either way):
+    #   * proj_slab mode (saved_gate_copy=False, the default): proj_slab is REQUIRED.  The forward's projection GEMM
+    #     writes it (per-call pointer bind, zero copies) and gate / q_pre / k_pre / V are its column bands at
+    #     geometry.qkvg_offsets -- pass them as saved_slab_views(...) or leave them None and let the backward derive them.
+    #   * gate-copy mode (saved_gate_copy=True): proj_slab must be None.  The slab stays in the workspace and the forward
+    #     copies the GATE band into `gate` (compact); q_pre / k_pre stay None unless the caller passes buffers for them
+    #     (then they are copied too).
+    proj_slab: Optional[torch.Tensor] = None
+    # APPENDED. The `seq_lens` tensor the forward was EXECUTED with (the same object; no copy, no D2H read), or None
+    # for a dense forward.  Dense: the per-batch KV padding mask -- lets the backward decline padding at check_support()
+    # time instead of silently consuming a save set whose dead entries carry O = 0 / LSE = -inf.  THD (thd=True): the
+    # packed per-sequence lengths ([B] int32, or [B+1] int32 prefix sums under cu_seqlens=True), REQUIRED -- the backward
+    # binds this very tensor to rebuild the packed metadata.  The record is frozen, so the CALLER puts it here and the
+    # forward VERIFIES identity (execute: `saved.seq_lens is seq_lens`), the way saved.h and lse are verified.
+    seq_lens: Optional[torch.Tensor] = None
+    # APPENDED. What `seq_lens` IS, so a record says which length contract it carries: None for a dense record (seq_lens is
+    # the per-batch KV padding mask, or None), "lengths" for a THD record whose seq_lens is the [B] int32 per-sequence
+    # lengths, "prefix" for one whose seq_lens is the [B+1] int32 prefix sums (GatedAttentionBlockFwd(thd=True, cu_seqlens=)).
+    # The CALLER writes it; the forward VERIFIES it against its declaration at execute (typed ValueError, like the identity
+    # check above) and the backward checks it against its own -- a padded dense record can never be consumed by a THD
+    # backward, nor a packed one by a dense backward, without a typed decline.
+    seq_lens_form: Optional[str] = None
+
+
+def saved_slab_views(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeometry, batch: int, seq_len: int) -> tuple:
+    """``(q_pre, gate, k_pre, v)`` as strided VIEWS of ``proj_slab`` (``_cols`` at ``qkvg_offsets``; token stride ``n_qkvg``,
+    head stride ``d_head``), each ``[B, S, heads, D]``.  No copy, no allocation.  The block's execute verifies that a
+    SavedForBackward built from these aliases proj_slab (data_ptr + shape + strides), typed ValueError otherwise.
+
+    ``proj_slab`` is the caller's ``[B*S, n_qkvg]`` (or ``[B, S, n_qkvg]``) contiguous, 16-B-aligned stage-(1) output in
+    the activation dtype -- the slab :class:`GatedAttentionBlockFwd` TMA-stores under ``save_for_backward`` in the
+    proj_slab save mode.  A wrong element count, a non-contiguous or a misaligned slab is a typed ``ValueError``.
+    """
+    proj, b, s = _slab_2d(proj_slab, geometry, batch, seq_len)
+    d = geometry.d_head
+    # `_cols` gives the [T, h, d] band at token stride n; splitting T into (B, S) is a legal `.view` on it (dim-0 stride n
+    # -> (S*n, n)), so every band keeps proj_slab's storage.  The four DENSE bands only: an indexer band (ProjBlock.INDEX,
+    # a block-sparse geometry) is not part of the training record -- the forward declines save_for_backward under it.
+    dense = (ProjBlock.Q, ProjBlock.GATE, ProjBlock.K, ProjBlock.V)
+    return tuple(_cols(proj, geometry.qkvg_offsets[blk], geometry.qkvg_heads[blk], d).view(b, s, geometry.qkvg_heads[blk], d) for blk in dense)
+
+
+def _slab_2d(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeometry, batch: int, seq_len: int) -> tuple[torch.Tensor, int, int]:
+    """The stage-(1) slab contract, typed: ``proj_slab`` has ``B*S x n_qkvg`` elements, is contiguous and 16-B aligned.
+    Returns ``(the [T, n_qkvg] view, B, S)`` -- what every band view is cut from."""
+    b, s = int(batch), int(seq_len)
+    t, n = b * s, geometry.n_qkvg
+    if proj_slab.numel() != t * n:
+        raise ValueError(
+            f"proj_slab has {proj_slab.numel()} elements; the stage-(1) slab over B*S={t} tokens x n_qkvg={n} columns is {t * n} "
+            "([B*S, n_qkvg] or [B, S, n_qkvg])"
+        )
+    if not proj_slab.is_contiguous():
+        raise ValueError(
+            f"proj_slab must be contiguous (the projection GEMM writes it as ONE row-major [B*S, n_qkvg] slab), got shape "
+            f"{tuple(proj_slab.shape)} strides {tuple(proj_slab.stride())}"
+        )
+    if proj_slab.data_ptr() % 16:
+        raise ValueError(f"proj_slab must be 16-byte aligned (the projection GEMM TMA-stores it), got data_ptr={proj_slab.data_ptr():#x}")
+    return proj_slab.view(t, n), b, s
+
+
+def index_k_raw_view(proj_slab: torch.Tensor, geometry: GatedAttentionBlockGeometry, batch: int, seq_len: int) -> torch.Tensor:
+    """The RAW indexer key as a ``[B, S, index_kv_heads, index_head_dim]`` strided VIEW of the stage-(1) slab.
+
+    It is the INDEX band's last ``index_kv_heads * index_head_dim`` columns (``geometry.index_k_raw_offset``), PRE-norm and
+    un-rotated -- exactly what a serving cache keeps for the indexer -- at token stride ``n_qkvg``.  No copy, no allocation:
+    a serving caller keeps ONE projection GEMM and reads the key off the slab the block already wrote
+    (:meth:`GatedAttentionBlockFwd.index_k_raw` locates that slab inside the workspace).  The indexer's query columns sit
+    just before it in the band and are computed and left in place.
+
+    ``proj_slab`` is the ``[B*S, n_qkvg]`` (or ``[B, S, n_qkvg]``) contiguous, 16-B-aligned slab in the activation dtype;
+    the contract of :func:`saved_slab_views` applies (typed ``ValueError``), as does a geometry without the band.
+    """
+    if not geometry.index_band:
+        raise ValueError(
+            "index_k_raw_view: this geometry declares no indexer band (GatedAttentionBlockGeometry.qsa.index_band), so the slab holds no raw indexer key"
+        )
+    proj, b, s = _slab_2d(proj_slab, geometry, batch, seq_len)
+    q = geometry.qsa
+    return _cols(proj, geometry.index_k_raw_offset, q.index_kv_heads, q.index_head_dim).view(b, s, q.index_kv_heads, q.index_head_dim)
+
+
+class _SavedBinding(NamedTuple):
+    """What ``GatedAttentionBlockFwd._check_saved_set`` hands ``execute`` once a :class:`SavedForBackward` record
+    passed every contract: the caller tensors the training forward writes THROUGH.  Views of caller storage, never
+    copies (Rule 1)."""
+
+    lse: torch.Tensor  # the LSE the SDPA writes -- saved.lse (an explicit `lse` must be that same storage)
+    rstd_q: Optional[torch.Tensor]  # saved.rstd_q / rstd_k (tensors iff geometry.qk_norm)
+    rstd_k: Optional[torch.Tensor]
+    proj: Optional[torch.Tensor]  # proj_slab mode: the [T, n_qkvg] view of saved.proj_slab stage (1) writes; None = the workspace slab (gate-copy mode)
+    o: torch.Tensor  # [T, H_q, D] view of saved.o -- the SDPA's PRE-gate output
+    gate_dst: Optional[torch.Tensor]  # gate-copy mode: the [T, H_q, D] view of saved.gate the GATE band is copied into; None in proj_slab mode
+    q_pre_dst: Optional[torch.Tensor]  # gate-copy mode with a caller q_pre buffer: its [T, H_q, D] view; None = not copied (recompute)
+    k_pre_dst: Optional[torch.Tensor]  # idem, [T, H_kv, D]
 
 
 def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str = "") -> None:
@@ -1052,6 +1722,55 @@ def _check_norm_weights_agree(qk_norm: bool, w_q_norm, w_k_norm, *, prefix: str 
         )
 
 
+def _check_index_tensor(x, name: str, flat_shape: tuple, dense_shape: tuple, device, *, hint: str = "") -> None:
+    """FORM checks of an index tensor of a block-sparse block (Rule 3: never a value read, never a sync): a contiguous
+    int32 ``torch.Tensor`` on ``device`` of exactly ``flat_shape`` (``[T, ...]``) or ``dense_shape`` (``[B, S, ...]``).
+    Typed ``ValueError`` naming the tensor; an int64 list is refused, not converted (the sparse core reads 32-bit ids and
+    a conversion would be a hot-path copy)."""
+    if not isinstance(x, torch.Tensor):
+        raise ValueError(f"{name} must be a torch.Tensor, got {type(x).__name__}")
+    if x.dtype != torch.int32:
+        why = (
+            " (int64 ids are refused, not converted: the sparse core reads 32-bit ids and a conversion would be a hot-path copy)"
+            if x.dtype == torch.int64
+            else ""
+        )
+        raise ValueError(f"{name} must be int32, got {x.dtype}{why}")
+    shape = tuple(int(n) for n in x.shape)
+    if shape not in (tuple(flat_shape), tuple(dense_shape)):
+        raise ValueError(f"{name} must be {list(flat_shape)} or {list(dense_shape)}, got {list(shape)}{hint}")
+    if not x.is_contiguous():
+        raise ValueError(f"{name} must be contiguous (the sparse core's index staging copies whole rows), got strides {tuple(x.stride())}")
+    if x.device != device:
+        raise ValueError(f"{name} must live on h's device {device}, got {x.device}")
+
+
+_THD_FORM_LENGTHS = "lengths"  # SavedForBackward.seq_lens_form of a THD record whose seq_lens is the [B] int32 lengths
+_THD_FORM_PREFIX = "prefix"  # ... the [B+1] int32 prefix sums (cu_seqlens=True)
+
+
+def _thd_seq_lens_form(cu_seqlens: bool) -> str:
+    """The ``SavedForBackward.seq_lens_form`` a THD block declared with ``cu_seqlens`` writes and verifies."""
+    return _THD_FORM_PREFIX if cu_seqlens else _THD_FORM_LENGTHS
+
+
+def _thd_token_matrix(sample: torch.Tensor, name: str, width: str) -> torch.Tensor:
+    """A PACKED sample as the rank-3 ``[1, T, width]`` the block declares internally (``batch = 1, seq_len = T``).
+
+    ``[T, width]`` gains a leading extent-1 axis (``unsqueeze(0)``: a view at any stride, never a copy); ``[1, T, width]``
+    passes as is; anything else -- a dense ``[B, S, .]`` with ``B > 1``, a wrong rank -- is a typed ``ValueError`` naming
+    the two packed forms.  ``execute`` takes the caller's tensors at either rank unchanged: every stage addresses them
+    through ``.view(T, ...)``.
+    """
+    if not isinstance(sample, torch.Tensor):
+        raise TypeError(f"thd=True: {name} must be a torch.Tensor sample ([T, {width}] or [1, T, {width}]), got {type(sample).__name__}")
+    if sample.ndim == 2:
+        return sample.unsqueeze(0)
+    if sample.ndim == 3 and int(sample.shape[0]) == 1:
+        return sample
+    raise ValueError(f"thd=True: {name} is the packed token matrix [T, {width}] (or [1, T, {width}]), got {tuple(sample.shape)}")
+
+
 # ---------------------------------------------------------------------------
 # 4b. FP8 (E4M3, per-tensor STATIC scales) — the QuantSpec contract
 # ---------------------------------------------------------------------------
@@ -1064,9 +1783,14 @@ class QuantSpec:
     Passing a ``QuantSpec`` (and FP8 ``h`` / weights) selects the FP8 pipeline;
     ``None`` is the bf16/f16 block.  All scales are Python floats fixed at plan
     time -- calibrated offline, like the weights' own scales -- so the execute
-    path does NO amax pass and NO host readback; the block materialises them as
-    1-element fp32 device tensors ONCE in ``compile()`` (the SDPA adapter does
-    the same for its identity descales).
+    path does NO amax pass and NO host readback; the block allocates them as
+    1-element fp32 device tensors ONCE in ``compile()`` and writes their values on
+    the launch stream at its first ``execute`` (the SDPA adapter materialises its
+    identity descales at compile time), and
+    :meth:`GatedAttentionBlockFwd.update_quant_scales` rewrites those tensors IN
+    PLACE on the launch stream for a per-step recalibration -- no recompile, no
+    new plan: the TE-style caller contract (quantize ``h`` / the weights each
+    step, recalibrate the activation scales from the previous step's record).
 
     Conventions (``x_real = x_fp8 * descale``; ``x_fp8 = sat_e4m3(x_real * scale)``):
 
@@ -1209,8 +1933,8 @@ class MxQuantSpec:
                      -- the FROST catalog's MIXED block-scale row (``fp8_e4m3 x
                      fp4_e2m1``, E8M0 scales per 32); ``w_qkvg_sf`` is UNCHANGED
                      (the same E8M0 / 32 F8_128x4 blob over ``n_qkvg x d_model``).
-                     Unfused pipeline only: the fused MXFP8 projection fork is
-                     rendered for an e4m3 B (typed decline at ``check_support``).
+                     Served on both pipelines: unfused, and fully fused through
+                     the MXFP8 projection fork's e2m1-B arm (3 launches).
     ``o_fp4``        (appended, default ``None`` = today's per-tensor e4m3 O).  An
                      :class:`Fp4Format` member selects the fp4 OUTPUT mode: the gated
                      O is block-quantized to e2m1 codes + that format's scale blob by
@@ -1618,9 +2342,54 @@ class _QuantizeMxfp8(_Stage):
     column slice; the destination is compact, so for Q/K/V this stage IS the
     compaction.  The fully fused MXFP8 pipeline folds all three into the
     projection fork's epilogue and builds none of them.
+
+    **The canonical arm** (``sf_layout="gemm"``, appended; the block-scale GEMMs
+    of the MXFP8 backward): the SF blob is cuDNN's PADDED F8_128x4 matrix over
+    ``[rows, K]`` with the batch folded into the rows -- the layout
+    ``build_proj_gemm`` declares for its SFA / SFB (``proj_gemm.sf_padded_dims``),
+    sized by ``proj_gemm.sf_blob_bytes``, NOT by ``_sf_slot_bytes``.  Rowwise
+    (``axis="row"``) it quantizes the ``[T, H, D]`` view of a ``[T, N]`` gradient
+    (blocks along N; ``(rows, K) = (T, H*D)``: the dgrad's A operand); with
+    ``transposed=True`` (``axis="col"`` only) it quantizes along the TOKENS and
+    stores the codes PHYSICALLY TRANSPOSED as the contiguous e4m3 ``[H*D, T]``
+    matrix (``(rows, K) = (H*D, T)``: the wgrad's K-major A operand), which needs
+    ``T % 32 == 0`` (whole 32-token blocks).  ``moved_bytes`` is the same count in
+    every mode; ``execute`` forwards the same operands (``dst`` is the ``[H*D, T]``
+    matrix when transposed).
+
+    **The packed arm** (``packed=True``, appended; the block's THD pipeline): the
+    unit is a ``(head, packed tile)`` of the PER-SEQUENCE-TILE-PADDED SF layout the
+    Rubin d256 MXFP8 SDPA's THD row reads (``kernels/quantize_mxfp8.py`` "PACKED
+    sequences": Q/K slabs at ``(h*n_cap + tile) * 1024``, V's two D-planes ADJACENT
+    inside the tile), the grid ``(H, n_cap)`` with ``n_cap = (T + 127 *
+    num_sequences) // 128`` the capacity bound on ``sum_b ceil(s_b/128)``, every
+    slack tile zero-filled; the kernel resolves each tile's sequence from the
+    lengths tensor on device.  ``execute(..., seq_lens=)`` then takes that tensor
+    (``[B]`` int32 lengths, or ``[B+1]`` prefix sums under ``cu_seqlens``) INSTEAD of
+    ``batch`` / ``seq_len`` -- REQUIRED under ``packed``, refused otherwise (Rule 1,
+    both ways; the kernel host checks the same).  ``sf_bytes()`` is then
+    :func:`_sf_slot_bytes_packed`.  ``batch`` / ``seq_len`` stay the block's ``(1,
+    T)`` so ``rows()`` / ``moved_bytes()`` read ``T``.
     """
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, axis: str, name: str) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype_in: torch.dtype,
+        heads: int,
+        axis: str,
+        name: str,
+        sf_layout: str = "sdpa",
+        transposed: bool = False,
+        dual: bool = False,
+        transposed_second: bool = False,
+        packed: bool = False,
+        num_sequences: int = 0,
+        cu_seqlens: bool = False,
+    ) -> None:
         self.name = name
         self.geom = geometry
         self.batch = int(batch)
@@ -1628,44 +2397,181 @@ class _QuantizeMxfp8(_Stage):
         self.dtype_in = dtype_in
         self.heads = int(heads)
         self.axis = str(axis)
+        self.sf_layout = str(sf_layout)
+        self.transposed = bool(transposed)
+        # Appended: the DUAL-AXIS arm (``kernels/quantize_mxfp8.py``, "The dual-axis arm") -- the rowwise AND the columnwise
+        # quantization from ONE read: under "sdpa" the second half is the row-major columnwise payload + the D-plane-major SF atoms
+        # (the row's do8 + do_T8); under "gemm" it is the TRANSPOSED [H*D, T] store + the blob over (H*D, T) (dqkvg8 + dqkvg_t8),
+        # ``transposed_second=True`` REQUIRED there (the canonical columnwise blob's one form).  ``axis`` must be "row" (the first
+        # half); ``execute`` then takes ``dst_T`` / ``sf_T`` (appended) -- REQUIRED under ``dual``, refused otherwise (Rule 1).
+        self.dual = bool(dual)
+        self.transposed_second = bool(transposed_second)
+        # Appended: the PACKED (THD) arm -- see the class docstring.  ``num_sequences`` is the packing's B (the lengths tensor has B
+        # entries, or B+1 prefix sums under ``cu_seqlens``); the lengths themselves ride ``execute(seq_lens=)``.
+        self.packed = bool(packed)
+        self.num_sequences = int(num_sequences)
+        self.cu_seqlens = bool(cu_seqlens)
         self._recipe = None
 
     def check_support(self) -> None:
-        from .kernels.quantize_mxfp8 import AXES, validate_shape
+        from .kernels.quantize_mxfp8 import (
+            AXES,
+            SF_LAYOUTS,
+            validate_dual_mode,
+            validate_dual_shape,
+            validate_mode,
+            validate_packed_mode,
+            validate_shape,
+        )
 
         if self.axis not in AXES:
             raise ValueError(f"{self.name}: axis must be one of {AXES} ('row' for Q/K, 'col' for V), got {self.axis!r}")
+        if self.sf_layout not in SF_LAYOUTS:
+            raise ValueError(f"{self.name}: sf_layout must be one of {SF_LAYOUTS}, got {self.sf_layout!r}")
+        if self.transposed and (self.axis != "col" or self.sf_layout != "gemm"):
+            raise ValueError(
+                f"{self.name}: transposed=True is the columnwise arm's GEMM-canonical [H*D, T] store -- it needs axis='col' and sf_layout='gemm', "
+                f"got axis={self.axis!r} sf_layout={self.sf_layout!r}"
+            )
         if self.dtype_in not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: the quantize source must be bf16/f16, got {self.dtype_in}")
+        if self.packed:
+            # The packed arm serves the SDPA layouts only (no canonical blob, no transposed store) and needs the packing's B.
+            validate_packed_mode(self.sf_layout, self.transposed, True)
+            if self.num_sequences < 1:
+                raise ValueError(
+                    f"{self.name}: packed=True needs num_sequences >= 1 (the packing's B: the lengths tensor has B entries, or B+1 prefix sums "
+                    f"under cu_seqlens), got {self.num_sequences}"
+                )
+        elif self.num_sequences or self.cu_seqlens:
+            raise ValueError(f"{self.name}: num_sequences / cu_seqlens are the packed (THD) arm's fields (packed=True); this stage is dense")
+        if self.dual:
+            if self.axis != "row" or self.transposed:
+                raise ValueError(
+                    f"{self.name}: dual=True is the rowwise arm plus its columnwise twin from one read -- it needs axis='row' and transposed=False (the "
+                    f"second half's form is transposed_second), got axis={self.axis!r} transposed={self.transposed}"
+                )
+            validate_dual_mode(self.sf_layout, self.transposed_second)
+            validate_dual_shape(self.geom.d_head, _QUANTIZE_MXFP8_THREADS)
+            return
+        if self.transposed_second:
+            raise ValueError(f"{self.name}: transposed_second=True is the dual arm's second-half form; it needs dual=True")
+        validate_mode(self.axis, self.sf_layout, self.transposed)
         validate_shape(self.geom.d_head, _QUANTIZE_MXFP8_THREADS, self.axis)
 
     def compile(self) -> None:
-        from .kernels.quantize_mxfp8 import compile_quantize_mxfp8
+        from .kernels.quantize_mxfp8 import compile_quantize_mxfp8, compile_quantize_mxfp8_dual
 
-        self._recipe = compile_quantize_mxfp8(dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, axis=self.axis, threads_per_cta=_QUANTIZE_MXFP8_THREADS)
+        if self.dual:
+            self._recipe = compile_quantize_mxfp8_dual(
+                dtype_in=self.dtype_in,
+                h=self.heads,
+                d=self.geom.d_head,
+                threads_per_cta=_QUANTIZE_MXFP8_THREADS,
+                sf_layout=self.sf_layout,
+                transposed_second=self.transposed_second,
+                packed=self.packed,
+            )
+            return
+        self._recipe = compile_quantize_mxfp8(
+            dtype_in=self.dtype_in,
+            h=self.heads,
+            d=self.geom.d_head,
+            axis=self.axis,
+            threads_per_cta=_QUANTIZE_MXFP8_THREADS,
+            sf_layout=self.sf_layout,
+            transposed=self.transposed,
+            packed=self.packed,
+        )
+
+    def rows(self) -> int:
+        return self.batch * self.seq_len
 
     def sf_bytes(self) -> int:
-        """Bytes of the SF blob this stage writes (== the SDPA adapter's ``_reshape_sf`` count)."""
+        """Bytes of the SF blob this stage writes, BY LAYOUT: ``"sdpa"`` -> ``_sf_slot_bytes`` (== the SDPA adapter's
+        ``_reshape_sf`` count); ``"gemm"`` -> ``proj_gemm.sf_blob_bytes(T, H*D)`` rowwise / ``sf_blob_bytes(H*D, T)``
+        transposed (the block-scale GEMM's padded F8_128x4 blob; the batch folds into the rows); under ``packed`` the
+        capacity count :func:`_sf_slot_bytes_packed` (``T = rows()``)."""
+        if self.sf_layout == "gemm":
+            from .kernels.proj_gemm import sf_blob_bytes
+
+            k = self.heads * self.geom.d_head
+            return sf_blob_bytes(k, self.rows()) if self.transposed else sf_blob_bytes(self.rows(), k)
+        if self.packed:
+            return _sf_slot_bytes_packed(self.num_sequences, self.heads, self.rows(), self.geom.d_head)
+        return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
+
+    def sf_bytes_second(self) -> int:
+        """Bytes of the dual arm's SECOND SF blob: the SDPA columnwise atoms (the same count as the rowwise tiles) under ``"sdpa"``,
+        ``proj_gemm.sf_blob_bytes(H*D, T)`` (the transposed canonical blob) under ``"gemm"``.  Needs ``dual``."""
+        if not self.dual:
+            raise ValueError(f"{self.name}: sf_bytes_second() is the dual arm's second blob; this stage is dual=False")
+        if self.sf_layout == "gemm":
+            from .kernels.proj_gemm import sf_blob_bytes
+
+            return sf_blob_bytes(self.heads * self.geom.d_head, self.rows())
+        if self.packed:
+            return _sf_slot_bytes_packed(self.num_sequences, self.heads, self.rows(), self.geom.d_head)
         return _sf_slot_bytes(self.batch, self.heads, self.seq_len, self.geom.d_head)
 
     def moved_bytes(self) -> int:
-        """HBM traffic of one launch: 2 B in, 1 B code + 1/32 B SF out per element."""
-        from .kernels.quantize_mxfp8 import moved_bytes
+        """HBM traffic of one launch: 2 B in, 1 B code + 1/32 B SF out per element (the dual arm: one read, two codes + two SF)."""
+        from .kernels.quantize_mxfp8 import moved_bytes, moved_bytes_dual
 
-        return moved_bytes(self.batch * self.seq_len, self.heads, self.geom.d_head, src_elem_bytes=_itemsize(self.dtype_in))
+        f = moved_bytes_dual if self.dual else moved_bytes
+        return f(self.batch * self.seq_len, self.heads, self.geom.d_head, src_elem_bytes=_itemsize(self.dtype_in))
 
     def execute(
-        self, src: torch.Tensor, dst: torch.Tensor, sf: torch.Tensor, *, batch: Optional[int] = None, seq_len: Optional[int] = None, current_stream=None
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        sf: torch.Tensor,
+        *,
+        batch: Optional[int] = None,
+        seq_len: Optional[int] = None,
+        current_stream=None,
+        dst_T: Optional[torch.Tensor] = None,
+        sf_T: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> None:
-        """``src`` ``[T, H, D]`` (strided ok), ``dst`` compact e4m3 ``[T, H, D]``, ``sf`` uint8 flat (``sf_bytes()`` bytes)."""
-        from .kernels.quantize_mxfp8 import run_quantize_mxfp8
+        """``src`` ``[T, H, D]`` (strided ok), ``dst`` compact e4m3 ``[T, H, D]`` (the contiguous ``[H*D, T]`` matrix when
+        ``transposed``), ``sf`` uint8 flat (``sf_bytes()`` bytes).  Under ``dual`` (appended) ``dst_T`` / ``sf_T`` are the second
+        half's outputs -- a compact e4m3 ``[T, H, D]`` + the D-plane-major blob under ``"sdpa"``, the contiguous ``[H*D, T]`` matrix +
+        ``sf_bytes_second()`` under ``"gemm"`` -- REQUIRED; without ``dual`` they are refused (Rule 1, both ways).
+
+        Under ``packed`` (appended; THD) ``seq_lens`` -- the ``[B]`` int32 lengths, or the ``[B+1]`` int32 prefix sums under
+        ``cu_seqlens``, on ``src``'s device -- REPLACES ``batch`` / ``seq_len`` (REQUIRED, and those two are refused; a dense stage
+        refuses ``seq_lens``: Rule 1, both ways).  The lengths are validated for FORM only and never read on the host (CUDA-graph
+        capturable): the caller's contract is every length in ``[0, max_seq_len]`` and ``sum(lengths) == T`` -- a violation writes
+        payload rows past ``T`` (the SF writes are bounded by the slot's capacity in every case)."""
+        from .kernels.quantize_mxfp8 import run_quantize_mxfp8, run_quantize_mxfp8_dual
 
         if self._recipe is None:
             raise RuntimeError("call compile() before execute()")
-        b = self.batch if batch is None else int(batch)
-        s = self.seq_len if seq_len is None else int(seq_len)
+        if self.packed:
+            if seq_lens is None:
+                raise ValueError(
+                    f"{self.name}: this stage is packed=True (THD): execute needs seq_lens (the [B] int32 lengths, or [B+1] int32 prefix sums under "
+                    "cu_seqlens) in place of batch / seq_len"
+                )
+            if batch is not None or seq_len is not None:
+                raise ValueError(
+                    f"{self.name}: packed=True: batch / seq_len are the dense geometry; the packed stage runs over (T, num_sequences, seq_lens) (Rule 1)"
+                )
+            geo = dict(seq_lens=seq_lens, num_sequences=self.num_sequences, cu_seqlens=self.cu_seqlens)
+        else:
+            if seq_lens is not None:
+                raise ValueError(f"{self.name}: seq_lens is the packed (THD) stage's lengths tensor; this stage is packed=False (Rule 1)")
+            geo = dict(batch=self.batch if batch is None else int(batch), seq_len=self.seq_len if seq_len is None else int(seq_len))
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(src.device).cuda_stream
-        run_quantize_mxfp8(self._recipe, src, dst, sf, batch=b, seq_len=s, stream=stream)
+        if self.dual:
+            if dst_T is None or sf_T is None:
+                raise ValueError(f"{self.name}: this stage is dual=True (rowwise + columnwise from one read): dst_T and sf_T must be bound at execute (Rule 1)")
+            run_quantize_mxfp8_dual(self._recipe, src, dst, sf, dst_T, sf_T, stream=stream, **geo)
+            return
+        if dst_T is not None or sf_T is not None:
+            raise ValueError(f"{self.name}: this stage is dual=False; passing dst_T / sf_T would silently ignore them (Rule 1)")
+        run_quantize_mxfp8(self._recipe, src, dst, sf, stream=stream, **geo)
 
 
 class _QuantizeFp4(_Stage):
@@ -1681,9 +2587,18 @@ class _QuantizeFp4(_Stage):
     block-scale out projection reads it with no re-layout.  The source is the compact gated ``o``; the
     stage is what turns it into the fp4 A operand of ``o4 @ W_o^T``.  Built under ``MxQuantSpec.o_fp4`` (config
     rows 8-10) in ``quantize_o``'s place, on the unfused and the fully fused MXFP8 pipeline.
+
+    ``scale_in`` (appended, default ``False`` = the forward's stage, byte-identical artifact): the kernel's
+    pre-scale slot read -- every element is multiplied by a 1-element fp32 device slot BEFORE the block amax
+    (``kernels/quantize_fp4.py``: the two-level NVFP4 cast of a GRADIENT, whose raw magnitude would otherwise fall
+    under the e4m3 scale floor).  The quantized backward builds the NVFP4 cast of ``dY`` (viewed ``[T, d_model / D,
+    D]``) with it, fed the live power-of-two ``scale_dy``; ``execute(scale_in=)`` is then REQUIRED and otherwise refused
+    (Rule 1, both ways, here and in the kernel's host wrapper).
     """
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, fmt, name: str) -> None:
+    def __init__(
+        self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype_in: torch.dtype, heads: int, fmt, name: str, scale_in: bool = False
+    ) -> None:
         self.name = name
         self.geom = geometry
         self.batch = int(batch)
@@ -1691,6 +2606,7 @@ class _QuantizeFp4(_Stage):
         self.dtype_in = dtype_in
         self.heads = int(heads)
         self.fmt = fmt
+        self.scale_in = bool(scale_in)
         self._recipe = None
 
     def _format(self) -> tuple:
@@ -1714,7 +2630,9 @@ class _QuantizeFp4(_Stage):
     def compile(self) -> None:
         from .kernels.quantize_fp4 import compile_quantize_fp4
 
-        self._recipe = compile_quantize_fp4(dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, fmt=self.fmt, threads_per_cta=_QUANTIZE_FP4_THREADS)
+        self._recipe = compile_quantize_fp4(
+            dtype_in=self.dtype_in, h=self.heads, d=self.geom.d_head, fmt=self.fmt, threads_per_cta=_QUANTIZE_FP4_THREADS, scale_in=self.scale_in
+        )
 
     def rows(self) -> int:
         return self.batch * self.seq_len
@@ -1737,14 +2655,25 @@ class _QuantizeFp4(_Stage):
         _, block, _ = self._format()
         return moved_bytes(self.rows(), self.heads, self.geom.d_head, block, src_elem_bytes=_itemsize(self.dtype_in))
 
-    def execute(self, src: torch.Tensor, dst4: torch.Tensor, sf: torch.Tensor, *, current_stream=None) -> None:
-        """``src`` compact ``[T, H_q, D]``; ``dst4`` uint8 / ``float4_e2m1fn_x2`` of ``code_bytes()``; ``sf`` uint8 of ``sf_bytes()``."""
+    def execute(self, src: torch.Tensor, dst4: torch.Tensor, sf: torch.Tensor, *, current_stream=None, scale_in: Optional[torch.Tensor] = None) -> None:
+        """``src`` compact ``[T, H_q, D]``; ``dst4`` uint8 / ``float4_e2m1fn_x2`` of ``code_bytes()``; ``sf`` uint8 of ``sf_bytes()``;
+        ``scale_in`` (appended) the 1-element fp32 device slot of a ``scale_in=True`` stage -- required then, refused otherwise (Rule 1)."""
         from .kernels.quantize_fp4 import run_quantize_fp4
 
         if self._recipe is None:
             raise RuntimeError("call compile() before execute()")
+        if self.scale_in != (scale_in is not None):
+            raise ValueError(
+                f"{self.name}: scale_in "
+                + (
+                    "is required: this stage was declared with scale_in=True (the pre-scale of the two-level fp4 cast) and never assumes 1.0 -- pass the "
+                    "slot's 1-element fp32 view"
+                    if self.scale_in
+                    else "was given but this stage was declared without scale_in (the forward's single-level cast); refusing to drop the value silently"
+                )
+            )
         stream = current_stream if current_stream is not None else torch.cuda.current_stream(src.device).cuda_stream
-        run_quantize_fp4(self._recipe, src, dst4, sf, stream=stream)
+        run_quantize_fp4(self._recipe, src, dst4, sf, stream=stream, scale_in=scale_in)
 
 
 class _FusedQkvProjection(_Stage):
@@ -1845,6 +2774,8 @@ class _FusedQkvProjection(_Stage):
         self.device = device
         self._plan = None
         self._qscal = None
+        self._qscal_written = False
+        self._qscal_ready = None  # the allocation stream's event, recorded in compile(); every write waits on it
 
     @property
     def fp8(self) -> bool:
@@ -1981,6 +2912,17 @@ class _FusedQkvProjection(_Stage):
 
         g = self.geom
         # Geometry first, so the declines below read the same on every device.
+        if g.index_band:
+            # The fork classifies every output tile by the band its first column falls in and renders _TILE_N-wide
+            # tiles; a 640-column indexer band is 2.5 of them, so its last tile would straddle the band's end.  The
+            # UNFUSED projection (the FROST GEMM over any N) serves the band; a band padded to whole tiles is the
+            # fork's own later arm, measured before it ships.
+            pad = -(-g.qsa.index_band_cols // self._TILE_N) * self._TILE_N
+            raise NotImplementedError(
+                f"{self.name}: the fused projection renders {self._TILE_N}-column tiles; a {g.qsa.index_band_cols}-column indexer band "
+                f"(geometry.qsa.index_band) is not a whole number of them (N={g.n_qkvg} = {g.n_qkvg / self._TILE_N:g} tiles). Use the "
+                f"unfused projection (fuse_norm_rope=False), or a band padded to {pad} columns once that arm exists."
+            )
         if g.d_head != self._TILE_N:
             raise NotImplementedError(
                 f"{self.name}: the fused epilogue needs one GEMM output tile == one head, i.e. d_head == {self._TILE_N} "
@@ -2047,11 +2989,19 @@ class _FusedQkvProjection(_Stage):
         # artifact for a norm-OFF geometry.
         self._plan = build_fused_proj_gemm(self.params())
         if self.fp8:
-            # Plan-time constant (contract § 10): the fork reads these four once
-            # per epilogue warp; the execute path never allocates or converts.
-            q = self.quant
+            # The fork reads these four once per epilogue warp from a device vector the execute path never allocates or converts.
+            # ALLOCATED here and written on a launch stream only (write_qscal: the block's first execute or update_quant_scales, or
+            # this stage's own first execute_fp8): a fill enqueued on the stream ambient at compile() would have no ordering against
+            # a later cross-stream recalibration -- pending work ahead of it could let it land after the update and restore the
+            # declared scales.
             dev = self.device if self.device is not None else torch.device("cuda")
-            self._qscal = torch.tensor([q.alpha_qkvg, q.scale_q, q.scale_k, q.scale_v], dtype=torch.float32, device=dev)
+            self._qscal = torch.empty(4, dtype=torch.float32, device=dev)
+            self._qscal_written = False
+            # The allocation is not free of stream work either: under torch.use_deterministic_algorithms(True) (with
+            # fill_uninitialized_memory, the default) torch.empty enqueues a NaN fill on the ambient stream.  Record it, so every
+            # writer orders itself behind whatever the allocation enqueued (write_qscal waits on this event).
+            self._qscal_ready = torch.cuda.Event()
+            self._qscal_ready.record(torch.cuda.current_stream(dev))
 
     def workspace_bytes(self) -> int:
         """None: no split-K, no scratch -- the kernel writes the slab directly."""
@@ -2087,7 +3037,9 @@ class _FusedQkvProjection(_Stage):
         ``a`` is the e4m3 ``[M, K]`` view of ``h`` (the runner binds it rank-3
         ``[1, M, K]`` exactly as the bf16 runner does), ``w`` the e4m3
         ``[N_qkvg, K]`` checkpoint-layout weight; ``qscal`` is the fp32 ``[4]``
-        ``[alpha_qkvg, scale_q, scale_k, scale_v]`` materialised in :meth:`compile`.
+        ``[alpha_qkvg, scale_q, scale_k, scale_v]`` allocated in :meth:`compile` and
+        written on the launch stream (:meth:`write_qscal`; the stage's own first
+        use writes the declared spec's values when nobody wrote them before).
         """
         from .kernels.proj_gemm import run_fused_proj_gemm_fp8
 
@@ -2099,7 +3051,27 @@ class _FusedQkvProjection(_Stage):
         if not self._runner_writes_compact_qkv():
             # Never hand the round-1 slab runner three compact buffers positionally.
             raise NotImplementedError(f"{self.name}: {self._fp8_fork_available()}")
+        if not self._qscal_written:
+            self.write_qscal(self.quant, stream)  # a standalone first use: the declared values, on this launch stream
         run_fused_proj_gemm_fp8(self._plan, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, self._qscal, stream=stream)
+
+    def write_qscal(self, spec, stream) -> None:
+        """Write ``spec``'s ``[alpha_qkvg, scale_q, scale_k, scale_v]`` into the fork's fp32 vector IN PLACE on ``stream`` (a raw
+        CUstream handle: the launch stream, so the next execute on it is ordered behind the write) and make ``spec`` the stage's spec.
+        The ONLY writer of that vector -- :meth:`compile` allocates it and never fills it -- so no compile-time write can land after a
+        later cross-stream recalibration and restore the declared scales; the write first waits on the allocation stream's event
+        (:meth:`compile` records it), so even a deterministic-mode fill of the allocation lands before it.  Inside a stream capture
+        the wait is skipped (an external event cannot be waited on there): warm the block up before capturing."""
+        if self._qscal is None:
+            raise RuntimeError("call compile() before write_qscal()")
+        ts = as_torch_stream(stream, self._qscal.device)
+        with torch.cuda.stream(ts):
+            if self._qscal_ready is not None and not torch.cuda.is_current_stream_capturing():
+                ts.wait_event(self._qscal_ready)  # the allocation's own stream work (a deterministic-mode fill) lands first
+            for i, v in enumerate((spec.alpha_qkvg, spec.scale_q, spec.scale_k, spec.scale_v)):
+                self._qscal[i : i + 1].fill_(float(v))
+        self.quant = spec
+        self._qscal_written = True
 
     def execute_mxfp8(
         self, a, sf_a, w, sf_w, out_q8, out_k8, out_v8, out_gate16, out_sf_q, out_sf_k, out_sf_v, w_q_norm, w_k_norm, cos, sin, *, stream
@@ -2442,10 +3414,9 @@ def _bhsd_desc(b: int, h: int, s: int, d: int, dtype: torch.dtype, device, name:
     The SDPA's operand contract is rank-4 ``(B, H, S, D)``; the block's buffers
     are ``[B, S, H, D]`` compact, so what it hands over is ``.transpose(1, 2)``
     — strides ``(S*H*D, D, H*D, 1)``. That is exactly the layout the SDPA's own
-    normalization recognises as already-canonical: ``_to_bshd`` transposes back
-    and finds it contiguous, so it returns the view unchanged and **no copy
-    happens** (``SdpaFwdDsl._to_bshd`` in ``sdpa/fwd/api_dsl.py``). This is the whole reason stage (1)
-    writes four compact buffers instead of one fused slab — see § 1.
+    prepared binder accepts directly: the pointer stays unchanged and the
+    BSHD strides go to the kernel without a copy. Stage (1) writes compact
+    buffers to keep that zero-copy handover explicit — see § 1.
 
     Built as a descriptor rather than from a sample tensor so declaring the
     block costs no device allocation.
@@ -2453,7 +3424,7 @@ def _bhsd_desc(b: int, h: int, s: int, d: int, dtype: torch.dtype, device, name:
     # token_stride = 0 means COMPACT (h*d). A larger value declares a column
     # slice of a wider row -- Q/K/V inside the fused projection, token stride
     # n_qkvg. The SDPA compiles its descriptors at whatever this declares and
-    # binds the view directly (api_dsl._bshd_zero_copy_stride), so a padded
+    # binds the view directly (config_sm100.dense_bind_strides), so a padded
     # stride costs no copy; what it must not do is OVERLAP, hence the >= check.
     ts = int(token_stride) if token_stride else h * d
     if ts < h * d:
@@ -2468,6 +3439,32 @@ def _lse_desc(b: int, h: int, s: int, device, name: str = "lse") -> TensorDesc:
     """Descriptor for the ``[B, H_q, S]`` fp32 log-sum-exp, head-major compact."""
     shape = (b, h, s)
     stride = (h * s, s, 1)
+    stride_order = tuple(i for i, _ in sorted(enumerate(stride), key=lambda x: (x[1], shape[x[0]])))
+    return TensorDesc(dtype=torch.float32, shape=shape, stride=stride, stride_order=stride_order, device=device, name=name)
+
+
+def _thd_lse_head_stride(t_total: int) -> int:
+    """The PACKED (THD) LSE's head stride: exactly the packed token total ``T``.
+
+    ONE definition for both directions of the training boundary.  The forward declares its THD Stats descriptor with it
+    (:func:`_thd_lse_desc`) and the backward hands it to the SDPA backward as the packed Stats head stride, so ``saved.lse``
+    is the contiguous ``[1, H_q, T]`` fp32 tensor on both sides -- the dense record's ``[B, H_q, S]`` at ``B = 1, S = T``,
+    never a rounded-up capacity one side spells and the other does not.
+    """
+    return int(t_total)
+
+
+def _thd_lse_desc(b_env: int, h: int, s_max: int, t_total: int, device, name: str = "lse") -> TensorDesc:
+    """Descriptor for the PACKED (THD) ``[1, H_q, T]`` fp32 log-sum-exp, as declared to the SDPA adapter.
+
+    Shape ``(B_env, H_q, S_max)`` -- the adapter checks the Stats declaration against the operands' envelope shape -- with
+    strides ``(H_q*T, T, 1)``: the token axis contiguous and the head stride exactly ``T`` (:func:`_thd_lse_head_stride`),
+    which the adapter classifies as the head-major packed Stats layout and binds at execute as the caller's contiguous
+    ``[1, H_q, T]`` tensor (head stride == the declared one, ``numel >= H_q * T``).  The batch stride is never read under THD.
+    """
+    hs = _thd_lse_head_stride(t_total)
+    shape = (b_env, h, s_max)
+    stride = (h * hs, hs, 1)
     stride_order = tuple(i for i, _ in sorted(enumerate(stride), key=lambda x: (x[1], shape[x[0]])))
     return TensorDesc(dtype=torch.float32, shape=shape, stride=stride, stride_order=stride_order, device=device, name=name)
 
@@ -2508,6 +3505,11 @@ class _Sdpa(_Stage):
     (``engine_name(arch, mxfp8=True)``: NATURAL at (256, 256) -- the per-tensor
     row's LPT claim does NOT transfer, D5) and ``cta_mma`` is left to the
     adapter (1 for the quantized d256 flavor).  ``has_amax_o=False`` as under FP8.
+    Under ``thd=True`` the three blobs are the row's PACKED per-sequence-tile-padded
+    layout at the block's slot CAPACITY (``_sf_slot_bytes_packed``: ``n_cap`` tiles
+    per head, K and V equal) -- the adapter's binder derives the tile extent from
+    the byte count, so each view handed over is the WHOLE slot, never the live
+    total; the block's packed ``quantize_mxfp8`` stages write every byte of it.
 
     **FP8** (``dtype == e4m3``): ``pertensor_fp8=True``, ``dtype_o`` (bf16 on the
     unfused pipeline, e4m3 on the fully fused one) and ``has_amax_o=False`` --
@@ -2537,9 +3539,23 @@ class _Sdpa(_Stage):
     * **Mask arms are ``const_expr``-folded**, so a dense PASS proves nothing
       about the causal/window path. Validate at least one config per arm.
 
-    ``seq_lens`` is the per-batch valid KV length (dense padding mask). Q-side
-    trimming (``seq_q_lens``) and THD/varlen are NOT wired — both are declines,
-    not silent no-ops.
+    ``seq_lens`` is the per-batch valid KV length (dense padding mask), or --
+    under ``thd=True`` -- the per-sequence PACKED lengths (``[B]`` int32, or
+    ``[B+1]`` int32 prefix sums under ``cu_seqlens``), handed to the adapter as
+    BOTH ``seq_q_lens`` and ``seq_kv_lens`` (self-attention; the adapter requires
+    both under THD).  **THD / varlen is the adapter's own ragged arm**: the stage
+    declares the ``(num_sequences, H, max_seq_len, D)`` ENVELOPE at the block's
+    token strides (the batch stride is never read -- every sequence base comes
+    from the on-device prefix sums), ``thd=True`` with the packed totals ``T``,
+    the head-major packed LSE ``[1, H_q, T]`` with head stride exactly ``T``
+    (:func:`_thd_lse_desc`) and ``SCHED_NATURAL`` -- the varlen grid is the
+    kernel's own persistent claim counter over the live (sequence, q-tile, head)
+    units, and the LPT decodes assume a dense rectangular tile space -- and at
+    ``execute`` hands RANK-3 packed ``(T, H, D)`` views (a slab column slice at
+    token stride ``n_qkvg``, or the compact buffers) that the adapter binds
+    without a copy; the dense arm's rank-4 ``(1, H, T, D)`` transpose is REFUSED
+    there once more than one sequence runs.  Dense Q-side trimming
+    (``seq_q_lens``) is NOT wired -- a decline, not a silent no-op.
     """
 
     name = "sdpa"
@@ -2560,6 +3576,10 @@ class _Sdpa(_Stage):
         o_dtype: Optional[torch.dtype] = None,
         gate_dtype: Optional[torch.dtype] = None,
         mxfp8: bool = False,
+        thd: bool = False,  # packed sequences: batch=1, seq_len=T; the adapter's varlen arm (see the class docstring)
+        num_sequences: Optional[int] = None,  # THD: B, the length tensor's [B] (or [B+1] prefix-sum) entries -- the envelope's batch
+        max_seq_len: Optional[int] = None,  # THD: S_max, the longest sequence the plan admits -- the envelope's S
+        cu_seqlens: bool = False,  # THD: seq_lens is [B+1] int32 prefix sums (True) or [B] int32 lengths (False)
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
         # and are read in place at that stride (the adapter compiles its TMA
@@ -2588,6 +3608,26 @@ class _Sdpa(_Stage):
         self.device = device
         self.want_lse = bool(want_lse)
         self.seq_lens_present = bool(seq_lens_present)
+        # THD (packed sequences).  The block validates the whole contract (typed, in order) before building this stage;
+        # the checks here keep the STAGE honest on its own: the envelope must be declared, and the two features whose
+        # SDPA specializations have no THD arm (the epilogue gate, the dense padding mask) are declined by name rather than
+        # left to the adapter's later message.  MXFP8 rides: the row's THD arm reads the packed per-sequence-tile-padded
+        # scale-factor layout the block's packed quantize stages write (class docstring).
+        self.thd = bool(thd)
+        self.cu_seqlens = bool(cu_seqlens)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        if self.thd:
+            if self.num_sequences is None or self.max_seq_len is None or self.num_sequences < 1 or self.max_seq_len < 1:
+                raise ValueError(f"{self.name}: thd=True needs num_sequences >= 1 and max_seq_len >= 1 (the (B, H, S_max, D) envelope the adapter declares)")
+            if self.fuse_gate:
+                raise NotImplementedError(
+                    f"{self.name}: fuse_gate=True has no THD arm (the adapter declines 'epilogue gate fusion is dense-only (no THD gate descriptor)')"
+                )
+            if self.seq_lens_present:
+                raise ValueError(f"{self.name}: thd=True and seq_lens_present=True are mutually exclusive (the packed lengths ARE the per-sequence lengths)")
+        elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
+            raise ValueError(f"{self.name}: num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True)")
         self._impl = None
 
     def _build_impl(self):
@@ -2607,19 +3647,38 @@ class _Sdpa(_Stage):
             # (template_params().epilogue_gate); its stride is compiled in like
             # Q/K/V's, so a slab column slice binds with no copy.
             kw["sample_gate"] = _bhsd_desc(b, g.h_q, s, d, self.gate_dtype or self.dtype, self.device, "gate", token_stride=self.gate_token_stride)
+        if self.thd:
+            # THD: the adapter takes the (B_env, H, S_max, D) ENVELOPE at the block's token strides -- the same `_bhsd_desc`
+            # the dense arm declares, at (num_sequences, max_seq_len) instead of (1, T); its (d, h, s) stride order is what
+            # the adapter's packed-layout gate reads, the batch stride never is.  The packed totals TIGHTEN the token
+            # extents to T (the adapter min's them against the bound buffers' capacity), the lengths' FORM is a
+            # declaration fact (n_q_lens = B or B+1), and the Stats descriptor is the head-major packed LSE whose head
+            # stride is exactly T (one helper, both directions).  NATURAL, stated: the varlen grid is the kernel's
+            # persistent claim counter over the live units; LPT's decodes assume a dense rectangular tile space.
+            from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
+
+            t = self.batch * self.seq_len
+            b_env, s_env = self.num_sequences, self.max_seq_len
+            kw.update(thd=True, max_total_seq_len_q=t, max_total_seq_len_kv=t, cu_seq_q_lens=self.cu_seqlens, cu_seq_kv_lens=self.cu_seqlens)
+            lse = _thd_lse_desc(b_env, g.h_q, s_env, t, self.device) if self.want_lse else None
+            sched = SCHED_NATURAL
+        else:
+            b_env, s_env = b, s
+            lse = _lse_desc(b, g.h_q, s, self.device) if self.want_lse else None
+            sched = self._sched_policy()
         return SdpaFwdDslSm100(
-            _bhsd_desc(b, g.h_q, s, d, self.dtype, self.device, "q", token_stride=ts),
-            _bhsd_desc(b, g.h_kv, s, d, self.dtype, self.device, "k", token_stride=ts),
-            _bhsd_desc(b, g.h_kv, s, d, self.dtype, self.device, "v", token_stride=ts),
-            _bhsd_desc(b, g.h_q, s, d, self.o_dtype, self.device, "o"),
-            _lse_desc(b, g.h_q, s, self.device) if self.want_lse else None,
+            _bhsd_desc(b_env, g.h_q, s_env, d, self.dtype, self.device, "q", token_stride=ts),
+            _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "k", token_stride=ts),
+            _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "v", token_stride=ts),
+            _bhsd_desc(b_env, g.h_q, s_env, d, self.o_dtype, self.device, "o"),
+            lse,
             is_causal=g.is_causal,
             causal_bottom_right=g.causal_bottom_right,
             window_size_left=None if g.window_left < 0 else g.window_left,
             window_size_right=None if g.window_right < 0 else g.window_right,
             scale_softmax=g.scale,
             seq_kv_lens_present=self.seq_lens_present,
-            sched_policy=self._sched_policy(),
+            sched_policy=sched,
             **kw,
         )
 
@@ -2759,7 +3818,7 @@ class _Sdpa(_Stage):
         if tuple(cc) != _SM107_CC:
             raise NotImplementedError(f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only for now; found SM{cc[0]}{cc[1]}")
         self._impl = self._build_impl()
-        # The adapter's own contract check: the dense S % 128 decline and the
+        # The adapter's own contract check: the dense S % 128 split-KV decline and the
         # FP8 envelope, the gate descriptor's shape / dtype / TMA-expressible
         # stride, and the standalone twins of the rows' gate claims (arch,
         # head dims, MXFP8, THD, paged, split, PackGQA -- engine-contract § 8b).
@@ -2773,9 +3832,16 @@ class _Sdpa(_Stage):
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch the SDPA carves from the block's workspace.
 
-        0 on every block configuration (dense, unsplit: ``api_dsl.py``
-        ``SdpaFwdDslSm100.scratch_workspace_bytes``); the block reserves
-        ``max(..., 1)`` so the carve stays well-formed either way.
+        0 on every DENSE block configuration (unsplit: ``api_dsl.py``
+        ``SdpaFwdDslSm100.scratch_workspace_bytes``).  NON-ZERO under ``thd=True``:
+        the adapter's packed metadata -- the per-sequence lengths / prefix sums the
+        setup launch normalizes on device, the per-sequence runtime descriptors and
+        (f16 / bf16) the sinks dummy, or (per-tensor FP8) the same three terms plus
+        its identity-scale words -- about 1 KiB at a handful of sequences (1024 B
+        bf16 / 1152 B FP8 at ``num_sequences=3``), growing 128 B per sequence.
+        The block folds it into ``get_workspace_size()`` through the same
+        ``max(proj, out_proj, sdpa, 1)`` as the GEMMs' scratch, so the size stays
+        honest either way.
         """
         if self._impl is None:
             raise RuntimeError("call check_support() before scratch_workspace_bytes()")
@@ -2787,8 +3853,8 @@ class _Sdpa(_Stage):
         k: torch.Tensor,  # [B, S, H_kv, D]
         v: torch.Tensor,  # [B, S, H_kv, D]
         o: torch.Tensor,  # [B, S, H_q,  D]  compact, written
-        lse: Optional[torch.Tensor] = None,  # [B, H_q, S] fp32
-        seq_lens: Optional[torch.Tensor] = None,  # [B] int32, per-batch valid KV length
+        lse: Optional[torch.Tensor] = None,  # [B, H_q, S] fp32; THD: [1, H_q, T] (head-major packed, head stride T)
+        seq_lens: Optional[torch.Tensor] = None,  # [B] int32, per-batch valid KV length; THD (REQUIRED): [B] lengths or [B+1] prefix sums
         workspace: Optional[torch.Tensor] = None,
         current_stream=None,
         gate: Optional[torch.Tensor] = None,  # [B, S, H_q, D] slab slice or compact gate16; fuse_gate only
@@ -2852,6 +3918,28 @@ class _Sdpa(_Stage):
             kw.update(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v)
         if self.fuse_gate:
             kw["gate"] = gate.transpose(1, 2)
+        if self.thd:
+            # RANK-3 PACKED (T, H, D) views, never the rank-4 transpose: the adapter's THD binder admits a rank-4 operand
+            # only with the RUNTIME sequence count as its leading extent (so (1, H, T, D) is refused once B > 1) and a
+            # rank-3 (T, H, D) buffer at any TMA-expressible token / head stride.  Dropping the extent-1 leading axis is an
+            # exact `.view` at any stride, so the slab column slice keeps its token stride n_qkvg and a compact buffer its
+            # H*D -- no copy, as on the dense arm.  ONE lengths tensor serves both sides (self-attention).
+            if seq_lens is None:
+                raise ValueError(f"{self.name}: thd=True requires seq_lens at execute (the packed per-sequence lengths, for the Q and the KV side alike)")
+            g, t = self.geom, self.batch * self.seq_len
+            self._impl.execute(
+                q.view(t, g.h_q, g.d_head),
+                k.view(t, g.h_kv, g.d_head),
+                v.view(t, g.h_kv, g.d_head),
+                o.view(t, g.h_q, g.d_head),
+                lse_tensor=lse,
+                seq_q_lens=seq_lens,
+                seq_kv_lens=seq_lens,
+                workspace=workspace,
+                current_stream=current_stream,
+                **kw,
+            )
+            return
         self._impl.execute(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -2863,6 +3951,68 @@ class _Sdpa(_Stage):
             current_stream=current_stream,
             **kw,
         )
+
+
+class _SparseSdpa(_Stage):
+    """(4) under a :class:`QsaSpec`: ``O = softmax(Q K^T * scale + mask) V`` over each query's SELECTED 4-token blocks
+    and its open tail block, causal, GQA-broadcast -- the index-list sparse attention core.
+
+    The core (the Rubin d256 swap-AB body under a gather loader) has not landed in this checkout, so this stage IS the
+    typed decline every sparse request meets at ``check_support``: it names the feature, and it is reached only after
+    every stage ahead of it -- the projection (with the indexer band) and norm + RoPE -- accepted the geometry, which is
+    what makes a declared block's slab usable through those stages today.  The block's declaration-time declines
+    (``GatedAttentionBlockFwd._check_qsa_declaration``) run first, so a request the core will never take as declared
+    (packed sequences, training, a quantized pipeline, the fused gate, a fused projection over the band, the
+    bottom-right diagonal, an fp32 activation, a GQA group wider than the N tile, the in-block indexer, another head
+    dim) hears about THAT feature instead of this one.
+
+    When the core lands this class reads its claims off the sparse adapter's capabilities record (never a literal),
+    declares the adapter at the block's strides, folds the adapter's scratch into the workspace and hands over the
+    block's BSHD views plus the index tensors exactly as :class:`_Sdpa` hands over its operands.
+    """
+
+    name = "sdpa_sparse"
+    _NOT_LANDED = (
+        "the index-list sparse attention core (stage (4) under QsaSpec) has not landed in this checkout: a block declared with "
+        "geometry.qsa is served up to and including its projection (with the indexer band) and norm + RoPE, and this stage declines "
+        "until the core lands. Declare the geometry without qsa for dense attention."
+    )
+
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device,
+        want_lse: bool,
+        seq_lens_present: bool = False,
+        token_stride: int = 0,
+        gate_token_stride: int = 0,
+    ) -> None:
+        self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
+        self.dtype = dtype
+        self.device = device
+        self.want_lse = bool(want_lse)
+        self.seq_lens_present = bool(seq_lens_present)
+        self.token_stride = int(token_stride)
+        self.gate_token_stride = int(gate_token_stride)
+        self._impl = None
+
+    def check_support(self) -> None:
+        raise NotImplementedError(f"{self.name}: {self._NOT_LANDED}")
+
+    def compile(self) -> None:
+        raise RuntimeError(f"{self.name}: call check_support() before compile()")
+
+    def scratch_workspace_bytes(self) -> int:
+        raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
+
+    def execute(self, *args, **kwargs) -> None:
+        raise RuntimeError(f"{self.name}: call compile() before execute()")
 
 
 class _ElementwiseStage(_Stage):
@@ -2930,7 +4080,11 @@ class _SigmoidGate(_ElementwiseStage):
     whose KV range is empty, so this is reachable, not theoretical.
 
     GATE is read as a strided COLUMN SLICE of the fused projection — no repack.
-    O is gated IN PLACE, so ``O_gated`` costs no buffer.
+    Under inference O is gated IN PLACE, so ``O_gated`` costs no buffer; under
+    training (``save_for_backward``) the SDPA wrote the PRE-gate O into the
+    caller's ``saved.o`` (the backward's ``dG`` operand, which must survive), so
+    the same kernel gates OUT of place into the workspace ``o_gated`` slot that
+    stage (6) then reads.
 
     **Fusion status: folding this into the SDPA epilogue is the obvious next
     increment** — a pure epilogue change, one extra input in O's exact layout,
@@ -2952,9 +4106,9 @@ class _VCompaction(_ElementwiseStage):
     **This stage exists only because stage (1) is the UNFORKED FROST GEMM.** Q
     and K are de-interleaved for free by (2)+(3), which already read and write
     them; V is untouched between the projection and the SDPA, so without this it
-    would reach the SDPA as a padded-stride view that ``_to_bshd`` silently
-    ``.contiguous()``-copies — a hidden kernel inside the adapter (Rule 2).
-    Doing it here makes the cost NAMED and MEASURED instead.
+    would reach the SDPA as a padded-stride view. The historical adapter copied
+    such layouts implicitly; this block keeps its explicit compaction stage
+    and hands compact storage to the prepared SDPA plan (Rule 2).
 
     Forking stage (1) to write four compact buffers (§ 1) deletes this outright.
     Until then it is 1/16 of Q's traffic, which is why it is an acceptable v1.
@@ -2965,6 +4119,31 @@ class _VCompaction(_ElementwiseStage):
 
     def execute(self, v_src: torch.Tensor, v_dst: torch.Tensor, current_stream=None) -> None:
         self._run(v_src, None, v_dst, current_stream)
+
+
+class _BandCopy(_ElementwiseStage):
+    """(3g) TRAINING, gate-copy save mode only: copy one ``h_q``-head band of the
+    fused projection into a compact caller buffer -- the GATE into ``saved.gate``
+    (always), the PRE-norm Q into ``saved.q_pre`` when the caller passed one
+    (``saved.k_pre`` rides :class:`_VCompaction`'s ``h_kv`` recipe on the bf16 pipeline; the
+    quantized pipelines build no ``_VCompaction`` -- their quantize stages compact V -- so a
+    quantized gate-copy block builds a second instance at ``h_kv`` heads, ``k_pre_compaction``).
+
+    The elementwise kernel's ``has_gate=False`` arm at ``h_q`` heads: zero new
+    kernel code, one launch per band, ``2 x 16 KiB/token`` moved at the 397B
+    geometry.  It exists because the gate-copy mode keeps the slab in the
+    WORKSPACE (dead the moment ``execute`` returns) and the backward needs the
+    GATE from caller-owned storage; the proj_slab save mode has no such stage
+    (the slab itself is the record).  Built only under ``saved_gate_copy``.
+    """
+
+    def __init__(self, geometry, *, batch, seq_len, dtype, heads: Optional[int] = None, name: str = "gate_compaction"):
+        """Build the band copy as a ``has_gate=False`` elementwise stage at ``h_q`` heads; ``heads`` / ``name`` (appended) select the
+        ``h_kv`` twin that copies ``k_pre`` on a quantized gate-copy block."""
+        super().__init__(geometry, batch=batch, seq_len=seq_len, dtype=dtype, heads=geometry.h_q if heads is None else int(heads), has_gate=False, name=name)
+
+    def execute(self, src: torch.Tensor, dst: torch.Tensor, current_stream=None) -> None:
+        self._run(src, None, dst, current_stream)
 
 
 # ---------------------------------------------------------------------------
@@ -2997,7 +4176,7 @@ class GatedAttentionBlockFwd(APIBase):
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
 
         (1)  proj          h8+sf_h, W8+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM (E8M0 dequant in-MMA, no alpha)
-        (2+3) norm+rope    in place                                this block's kernel
+        (2+3) norm+rope    in place (out of place into compact bf16 Q/K under save_for_backward)   this block's kernel
         (3q) quantize x3   PROJ[Q]/[K] rowwise, PROJ[V] columnwise -> q8/k8/v8 + sf_q/sf_k/sf_v   kernels/quantize_mxfp8.py
         (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, cga1)
         (5)  gate          O, PROJ[G] -> O in place                this block's kernel
@@ -3016,8 +4195,15 @@ class GatedAttentionBlockFwd(APIBase):
 
         (1)  proj          h8+sf_h, W4+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM, mixed row (fp8_e4m3 x fp4_e2m1, E8M0/32)
 
-    UNFUSED only -- ``fuse_norm_rope`` with an e2m1 ``W_qkvg`` is a typed decline (the fork twin is
-    rendered for an e4m3 B; feature-detected on ``NormRopeFusionParams.weight_fp4``).
+    and FULLY FUSED (``fuse_norm_rope=True, fuse_gate=True``, the SAME 3 launches as the e4m3 fused
+    pipeline: inference only, dense only, ``S % 128 == 0`` at ``B > 1``, ``scale_o == 1.0``) with stage (1)
+    on the fork's e2m1-B arm::
+
+        (1)  proj+norm+rope+quant  h8+sf_h, W4+sf_w -> q8/k8/v8 + sf_q/sf_k/sf_v + gate16   the fused MXFP8 fork, mixed row
+                                   (``NormRopeFusionParams.weight_fp4``: the same packed codes and the same blob; the
+                                   fused stage also checks the packed TMA format's 32-byte base / row-stride rules)
+
+    (feature-detected on ``NormRopeFusionParams.weight_fp4``: a checkout whose fork lacks the field declines typed).
 
     **fp4 O** (``MxQuantSpec.o_fp4 = Fp4Format.NVFP4 | MXFP4`` + an e2m1 ``W_o`` ``[d_model, H_q*D // 2]``
     with its F8_128x4 blob ``sample_w_o_sf`` / ``w_o_sf``): the per-tensor tail of BOTH MXFP8
@@ -3034,13 +4220,50 @@ class GatedAttentionBlockFwd(APIBase):
     Stage (3b) exists only because stage (1) is the UNFORKED FROST GEMM, which
     writes one fused ``[T, N]``. Q and K are de-interleaved for FREE by (2+3),
     which already reads and writes them; V is untouched between the projection
-    and the SDPA, so without (3b) it would reach the SDPA as a padded-stride view
-    that ``_to_bshd`` silently ``.contiguous()``-copies — a hidden kernel inside
-    the adapter, which Rule 2 bans. **Forking stage (1) to write four compact
+    and the SDPA. Stage (3b) makes V compaction explicit and hands compact
+    storage to the prepared SDPA plan (Rule 2).
+    **Forking stage (1) to write four compact
     buffers (§ 1) deletes (3b) outright**; until then it is the measurable price
     of not having forked, and V is 1/16 of Q so the price is small.
 
-    ``O_gated`` needs no buffer: stage (5) gates O in place.
+    Under inference ``O_gated`` needs no buffer: stage (5) gates O in place.
+    Under training it does.
+
+    **THD / packed sequences (``thd=True, num_sequences=B, max_seq_len=S_max,
+    cu_seqlens=``)**: ``h`` / ``cos`` / ``sin`` / ``out`` are ``[T, .]`` (or
+    ``[1, T, .]``) token matrices and ``execute(seq_lens=)`` is REQUIRED -- the
+    ``[B]`` int32 lengths (or ``[B+1]`` prefix sums) of the packed sequences, read
+    on device only.  Internally ``B = 1, S = T``: the same stages, the same
+    launches, the same workspace carve as the dense ``B=1, S=T`` block (plus the
+    SDPA's small packed-metadata scratch), the same record -- ``saved.lse`` is
+    the head-major ``[1, H_q, T]``, ``saved.seq_lens`` the lengths tensor itself,
+    ``saved.seq_lens_form`` its form.  Stage (4) runs the SDPA's varlen arm over
+    packed ``(T, H, D)`` views in the natural tile order.  bf16 / fp16 (inference
+    and training), the UNFUSED per-tensor FP8 and MXFP8 pipelines (the fp4 modes
+    included; the three MXFP8 quantize stages write the SDPA row's PACKED
+    per-sequence-tile-padded scale-factor layout into slots sized at the capacity
+    ``_sf_slot_bytes_packed``) and ``fuse_norm_rope`` (bf16 / fp16 inference) are
+    served; ``fuse_gate``, the fully fused quantized pipelines and
+    ``seq_lens_present`` are typed declines.  Module docstring, "THD".
+
+    **TRAINING (``save_for_backward=True``; bf16 / fp16, out of place, no fusion
+    knob)** writes THROUGH the caller's :class:`SavedForBackward` instead of the
+    workspace wherever the backward needs the tensor, same kernels, different
+    buffers (``out`` is bitwise the inference block's)::
+
+        (1) proj         h            -> saved.proj_slab [T, N]   (proj_slab mode)  |  workspace slab (gate-copy mode)
+        (2+3) norm+rope  slab[Q],[K]  -> compact q, k (workspace) + saved.rstd_q / rstd_k  (slab columns stay PRE-norm = q_pre / k_pre)
+        (3g) gate copy   slab[GATE]   -> saved.gate (compact)     gate-copy mode only; q_pre / k_pre likewise if buffers were passed
+        (3b) compact     slab[V]      -> V_c
+        (4) sdpa         q, k, V_c    -> saved.o (PRE-gate) + saved.lse
+        (5) gate         saved.o, slab[G] -> o_gated (workspace, OUT of place)
+        (6) out_proj     o_gated      -> out
+
+    Six launches (seven in gate-copy mode), the inference chain's six.  The save
+    mode is a declaration knob (``saved_gate_copy``) because the carve differs;
+    ``execute`` checks the record against it -- and that ``saved.h`` IS ``h``,
+    ``saved.seq_lens`` IS the ``seq_lens`` it runs with, and ``lse`` (optional)
+    IS ``saved.lse`` -- before any launch (:meth:`_check_saved_set`).
     """
 
     def __init__(
@@ -3065,7 +4288,17 @@ class GatedAttentionBlockFwd(APIBase):
         sample_h_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of h, proj_gemm.sf_blob_bytes(B*S, d_model) bytes (uint8 / e8m0)
         sample_w_qkvg_sf: Optional[torch.Tensor] = None,  # MXFP8 only: F8_128x4 E8M0 blob of W_qkvg, sf_blob_bytes(n_qkvg, d_model) bytes
         sample_w_o_sf: Optional[torch.Tensor] = None,  # fp4 O only (MxQuantSpec.o_fp4): the e2m1 W_o's F8_128x4 blob, sf_blob_bytes(d_model, h_q*d_head, block)
+        saved_gate_copy: bool = False,  # training SAVE mode: False = the GEMM writes saved.proj_slab; True = the GATE band is copied into a compact saved.gate
+        # APPENDED (THD): packed / ragged sequences.  h / cos / sin / out are PACKED token matrices [T, .] (or [1, T, .]) and
+        # execute(seq_lens=) carries the per-sequence lengths for the Q and the KV side alike -- module docstring, "THD".
+        thd: bool = False,
+        num_sequences: Optional[int] = None,  # B, REQUIRED under thd: the length tensor has B entries ([B] lengths) or B+1 ([B+1] prefix sums)
+        max_seq_len: Optional[int] = None,  # S_max, REQUIRED under thd: the longest sequence the plan admits (the SDPA's envelope)
+        cu_seqlens: bool = False,  # the FORM of execute(seq_lens=): False = [B] int32 lengths, True = [B+1] int32 prefix sums
     ):
+        """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
+        ``save_for_backward``, the THD envelope -- normalise the samples, record the knobs and build the stage list in pipeline
+        order (declared, not compiled: ``check_support`` / ``compile`` follow)."""
         super().__init__()
         self._warn_experimental_api()
         self.geom = geometry
@@ -3113,14 +4346,47 @@ class GatedAttentionBlockFwd(APIBase):
         # AttributeError in check_support's dtype loop.
         _check_norm_weights_agree(geometry.qk_norm, sample_w_q_norm, sample_w_k_norm, prefix="sample_")
         self.act_dtype = torch.bfloat16 if quant is not None else self.dtype
-        if sample_h.ndim != 3:
+        # THD (packed sequences).  The four appended knobs are one unit: a dense block takes none of them; a packed one
+        # takes h / cos / sin / out as [T, .] (or [1, T, .]) token matrices and is INTERNALLY B = 1, S = T -- every stage
+        # addresses tokens, so the dense carve, the dense record and the dense kernels serve it unchanged, and only the
+        # SDPA stage grows a THD arm.  The samples are normalized to rank 3 HERE so every later shape check speaks (1, T, .).
+        self.thd = bool(thd)
+        self.cu_seqlens = bool(cu_seqlens)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        if not self.thd and (self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens):
+            raise ValueError("num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True); a dense [B, S, d_model] block takes none of them")
+        if self.thd:
+            sample_h = _thd_token_matrix(sample_h, "sample_h", "d_model")
+            sample_cos = _thd_token_matrix(sample_cos, "sample_cos", "rope_dim")
+            sample_sin = _thd_token_matrix(sample_sin, "sample_sin", "rope_dim")
+            sample_out = _thd_token_matrix(sample_out, "sample_out", "d_model")
+        elif sample_h.ndim != 3:
             raise ValueError(f"sample_h must be [B, S, d_model], got {tuple(sample_h.shape)}")
         self.batch, self.seq_len, d_model = (int(x) for x in sample_h.shape)
         if d_model != geometry.d_model:
             raise ValueError(f"sample_h last dim {d_model} != geometry.d_model {geometry.d_model}")
+        if self.thd and self.seq_len == 0:
+            raise ValueError(
+                "thd=True needs T >= 1 packed tokens (sample_h has 0 rows): the SDPA adapters refuse a zero packed capacity ('the packed token "
+                "capacities must be positive') and a GEMM over M = 0 has nothing to launch -- an empty step is the caller's early-out"
+            )
         self.save_for_backward = bool(save_for_backward)
         self.return_lse = bool(return_lse) or self.save_for_backward
         self.seq_lens_present = bool(seq_lens_present)
+        # SAVE MODE (training only; appended, default = the proj_slab mode).  False:
+        # stage (1) writes the caller-owned SavedForBackward.proj_slab and gate /
+        # q_pre / k_pre / V are its column bands (saved_slab_views) -- zero copies,
+        # the whole 34 KiB/token slab kept at the 397B geometry, and the workspace
+        # loses its own slab.  True: the slab stays in the workspace and ONE
+        # elementwise launch copies the GATE band into a compact saved.gate (q_pre /
+        # k_pre only if the caller passed buffers) -- 16 KiB/token kept, the backward
+        # recomputes the rest (RecomputePolicy.RECOMPUTE_QK_PRE).  A DECLARATION
+        # knob because the workspace carve differs (_plan_workspace(saved_gate_copy=));
+        # execute() verifies the record agrees (proj_slab given iff proj_slab mode).
+        self.saved_gate_copy = bool(saved_gate_copy)
+        if self.saved_gate_copy and not self.save_for_backward:
+            raise ValueError("saved_gate_copy=True selects the gate-copy SAVE mode of a training forward and needs save_for_backward=True")
         # IN-PLACE Q/K/V. Norm+RoPE writes back over its own columns of the
         # fused projection and V is never moved, so stage (3b) disappears and
         # the three compact buffers with it -- 26% of the workspace.
@@ -3179,8 +4445,17 @@ class GatedAttentionBlockFwd(APIBase):
                 f"(3 launches) or BOTH be False ({'9' if self.mxfp8 else '7'} stages, 9 kernel launches); "
                 f"got fuse_norm_rope={self.fuse_norm_rope}, fuse_gate={self.fuse_gate}"
             )
-        if quant is not None and self.save_for_backward:
-            raise NotImplementedError(f"the {_family} pipeline is inference-only for now (no q_pre/k_pre/pre-gate O contract under quantization)")
+        # TRAINING under a quant spec (2026-10-01) serves the UNFUSED per-tensor FP8 and
+        # MXFP8 pipelines: they write the bf16 training record (the slab with PRE-norm
+        # Q/K bands, the bf16 pre-gate O, the exact fp32 LSE, rstd) exactly like the
+        # bf16 forward, with norm+RoPE routed OUT of place into compact bf16 Q/K slots
+        # (_plan_workspace: "FP8 / MXFP8 TRAINING").  The fp4 modes of the MXFP8 pipeline
+        # (an e2m1 W_qkvg, an fp4 gated O with an e2m1 W_o) train on the UNFUSED pipeline
+        # too: the record they write is byte for byte the MXFP8 record (the fp4 tail only
+        # replaces the per-tensor o8 by o4 / sf_o in the workspace), and the MXFP8 backward
+        # differentiates it over the caller's transposed e2m1 artifacts (api_bwd.py, "The
+        # fp4 weight modes").  The fused forks are caught by the fuse_norm_rope /
+        # inplace_qkv guards above and the fuse_gate guard below (typed, naming the knob).
         # seq_lens_present (a dense padding mask, incl. an EMPTY entry) is SERVED
         # under FP8 and MXFP8 since 2026-09-15.  The decline that used to sit here
         # ("the Rubin FP8 d256 SDPA hangs on seq_kv_lens == 0") is retired: the
@@ -3194,7 +4469,52 @@ class GatedAttentionBlockFwd(APIBase):
                 "dG needs (see SavedForBackward: `o` is saved because dG needs pre-gate O; o_gated is recomputable, o is not). "
                 "Pass fuse_gate=False for training."
             )
-
+        # THD, typed, in this order: the length contract, the PIPELINE (so a fully fused quantized request hears about the
+        # pipeline, not the knob), the knob, then the sizes.  Everything else -- the unfused per-tensor FP8 and MXFP8
+        # pipelines (the fp4 modes included: the three quantize_mxfp8 stages run their PACKED arm, module docstring "THD"),
+        # fuse_norm_rope for bf16 / fp16 inference, training -- is served at (1, T) with no further branch.
+        if self.thd:
+            if self.seq_lens_present:
+                raise ValueError(
+                    "thd=True and seq_lens_present=True are mutually exclusive: under THD execute(seq_lens=) carries the per-sequence packed "
+                    "lengths ([B] int32 lengths, or [B+1] int32 prefix sums with cu_seqlens=True) for the Q and the KV side alike, and there "
+                    "is no per-batch KV padding mask (the SDPA adapter sets its own seq_kv_lens_present under THD); pass seq_lens_present=False"
+                )
+            if quant is not None and (self.fuse_gate or self.fuse_norm_rope):
+                raise NotImplementedError(
+                    f"the fully fused {_family} pipeline (fuse_norm_rope + fuse_gate) is dense-only: its gated SDPA specialization has no THD "
+                    "arm ('epilogue gate fusion is dense-only (no THD gate descriptor)'), and the fused MXFP8 projection fork decodes (b, s_tile) "
+                    "once per 128-row GEMM tile, which a packed tile may straddle; under thd=True run the UNFUSED quantized pipeline "
+                    "(fuse_norm_rope=False, fuse_gate=False)"
+                )
+            if self.fuse_gate:
+                raise NotImplementedError(
+                    "fuse_gate=True is dense-only: the Rubin d256 SDPA's epilogue gate has no THD gate descriptor (sdpa/fwd/api_dsl.py declines "
+                    "'epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True use fuse_gate=False (stage (5) runs as its "
+                    "own launch)"
+                )
+            if self.num_sequences is None or self.max_seq_len is None:
+                raise ValueError(
+                    "thd=True needs num_sequences (B: the length tensor has B entries, or B+1 prefix sums under cu_seqlens=True) and max_seq_len "
+                    "(S_max, the longest sequence the plan admits): the SDPA's unit grid, metadata and the backward's kv-blocked workspace are "
+                    "sized from them at build time"
+                )
+            _t = self.batch * self.seq_len
+            if not (self.num_sequences >= 1 and 2 <= self.max_seq_len <= _t and self.num_sequences * self.max_seq_len >= _t):
+                # The product bound is THE guard against a silently truncated chain: the SDPA's packed capacity is
+                # min(num_sequences * max_seq_len, T), so a smaller product processes only the first B * S_max tokens --
+                # units past the plan envelope never run, their O / LSE rows stay unwritten -- with no message anywhere.
+                raise ValueError(
+                    f"thd=True: need num_sequences >= 1, 2 <= max_seq_len <= T and num_sequences * max_seq_len >= T (every length is <= "
+                    "max_seq_len and the lengths sum to T; S = 1 is decode, out of the prefill bodies' scope; a smaller product would cap the "
+                    f"SDPA backward's packed capacity below T); got num_sequences={self.num_sequences}, max_seq_len={self.max_seq_len}, T={_t}"
+                )
+        # BLOCK-SPARSE ATTENTION (geometry.qsa): the sparse path's declaration-time declines, typed, in one place --
+        # the geometry's own rows (ValueError) and then every pipeline knob the sparse core has no arm for
+        # (NotImplementedError naming the feature) -- so a sparse request hears about its feature, never a knob.
+        self.qsa: Optional[QsaSpec] = geometry.qsa
+        if self.qsa is not None:
+            self._check_qsa_declaration(quant)
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -3220,7 +4540,15 @@ class GatedAttentionBlockFwd(APIBase):
         self.mxfp8_fused = mxfp8 and self.fuse_gate and self.fuse_norm_rope
         self.quant_fused = self.fp8_fused or self.mxfp8_fused
         act = self.act_dtype
-        self._quant_dev = None  # the QuantSpec / MxQuantSpec as device scalars, materialised in compile()
+        self._quant_dev = None  # the QuantSpec / MxQuantSpec as device scalars: ALLOCATED in compile(), written on a launch stream
+        # compile() only allocates those scalars and enqueues nothing on the stream ambient then; the FIRST execute writes their
+        # VALUES on its own launch stream (_write_quant_dev), as does every update_quant_scales() on the caller's.  A compile-time
+        # fill would have no ordering against a cross-stream recalibration: pending work ahead of it on the compile stream would let
+        # it land AFTER the update and silently restore the declared scales for every later execute.  Reset at compile().
+        self._quant_dev_on_launch_stream = False
+        # The allocation itself is stream work under torch.use_deterministic_algorithms(True) (torch.empty enqueues a NaN fill on
+        # the ambient stream): compile() records an event behind it and every writer waits on that event first.
+        self._quant_dev_ready = None
         # rstd exists only where a norm exists: under qk_norm=False a training
         # block saves lse / q_pre / k_pre but no rstd (SavedForBackward.rstd_*
         # are None -- required, both directions, at execute).
@@ -3268,8 +4596,19 @@ class GatedAttentionBlockFwd(APIBase):
             self._quant_q = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_q")
             self._quant_kv = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_kv, name="quantize_kv")
         elif quantize:
+            # THD: the PACKED arm -- the per-sequence-tile-padded SF layout the MXFP8 row's THD arm reads, at the slot capacity
+            # (num_sequences is the packing's B; the lengths ride execute(seq_lens=) into each of the three launches).
             _mxq = lambda heads, axis, name: _QuantizeMxfp8(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=heads, axis=axis, name=name
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype_in=act,
+                heads=heads,
+                axis=axis,
+                name=name,
+                packed=self.thd,
+                num_sequences=self.num_sequences if self.thd else 0,
+                cu_seqlens=self.cu_seqlens,
             )  # noqa: E731
             self._quant_q = _mxq(geometry.h_q, "row", "quantize_mxfp8_q")
             self._quant_k = _mxq(geometry.h_kv, "row", "quantize_mxfp8_k")
@@ -3288,24 +4627,59 @@ class GatedAttentionBlockFwd(APIBase):
             # bf16: in-place reads the slab at its padded stride; FP8 / MXFP8
             # unfused read the compact e4m3 buffers.  GATE is always a slab column slice.
             sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = (geometry.n_qkvg if self.inplace_qkv else 0) if not fp8 else 0, geometry.n_qkvg, act
-        self._sdpa = _Sdpa(
-            geometry,
-            batch=self.batch,
-            seq_len=self.seq_len,
-            dtype=self.dtype,
-            device=self.device,
-            want_lse=self.return_lse,
-            seq_lens_present=self.seq_lens_present,
-            token_stride=sdpa_token_stride,
-            fuse_gate=self.fuse_gate,
-            gate_token_stride=sdpa_gate_token_stride,
-            o_dtype=sdpa_o_dtype,
-            gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
-            mxfp8=mxfp8,  # pertensor_fp8=False -> the production block-scale kernel; NATURAL read off the MXFP8 row (D5)
-        )
+        if self.qsa is not None:
+            # Stage (4) under QsaSpec: the index-list sparse core -- built or not built per declaration like every other
+            # stage.  Reads the slab (or the compact buffers) at the SAME strides the dense stage would; declines, typed,
+            # until the core lands (its own docstring).
+            self._sdpa = _SparseSdpa(
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=self.dtype,
+                device=self.device,
+                want_lse=self.return_lse,
+                seq_lens_present=self.seq_lens_present,
+                token_stride=sdpa_token_stride,
+                gate_token_stride=sdpa_gate_token_stride,
+            )
+        else:
+            self._sdpa = _Sdpa(
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=self.dtype,
+                device=self.device,
+                want_lse=self.return_lse,
+                seq_lens_present=self.seq_lens_present,
+                token_stride=sdpa_token_stride,
+                fuse_gate=self.fuse_gate,
+                gate_token_stride=sdpa_gate_token_stride,
+                o_dtype=sdpa_o_dtype,
+                gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
+                mxfp8=mxfp8,  # pertensor_fp8=False -> the production block-scale kernel; NATURAL read off the MXFP8 row (D5)
+                # THD: the (num_sequences, max_seq_len) envelope, the packed total T = batch * seq_len, the lengths' form.
+                thd=self.thd,
+                num_sequences=self.num_sequences,
+                max_seq_len=self.max_seq_len,
+                cu_seqlens=self.cu_seqlens,
+            )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
         self._gate = None if self.fuse_gate else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
+        # (3g) TRAINING, gate-copy save mode only: ONE strided copy of the slab's
+        # GATE band into the compact caller `saved.gate` (the elementwise kernel's
+        # has_gate=False arm at h_q heads; the same artifact serves an optional
+        # q_pre copy, k_pre rides `_compact_v`'s h_kv recipe).  Not built otherwise
+        # -- a stage that never runs is not in `_stages`.
+        self._gate_copy = _BandCopy(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act) if (self.save_for_backward and self.saved_gate_copy) else None
+        # (3g, K) the k_pre copy rides `_compact_v`'s h_kv recipe on the bf16 pipeline; the quantized pipelines build no
+        # `_compact_v` (their quantize stages compact V), so a quantized gate-copy block gets an h_kv band copy of its own.
+        # Runs only when the record carries a k_pre buffer (like the q_pre copy above); None wherever `_compact_v` serves.
+        self._kpre_copy = (
+            _BandCopy(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, heads=geometry.h_kv, name="k_pre_compaction")
+            if (self._gate_copy is not None and self._compact_v is None)
+            else None
+        )
         # (5q) UNFUSED FP8 only: bf16 gated O -> compact e4m3 for the out
         # projection (same [T, H_q, D] shape as Q, so the Q recipe serves it).
         # UNFUSED MXFP8: an EXPLICIT per-tensor recipe (D1) -- never the rowwise
@@ -3344,6 +4718,8 @@ class GatedAttentionBlockFwd(APIBase):
             for st in (
                 self._proj,
                 self._norm_rope,
+                self._gate_copy,
+                self._kpre_copy,
                 self._compact_v,
                 self._quant_q,
                 self._quant_kv,
@@ -3357,6 +4733,103 @@ class GatedAttentionBlockFwd(APIBase):
             if st is not None
         )
         self._ws = None
+
+    # -- block-sparse attention (QsaSpec) -----------------------------------
+
+    def _check_qsa_declaration(self, quant) -> None:
+        """Every sparse request this block cannot serve, declined at DECLARATION with the feature named: the geometry's
+        own rows first (``validate()``: block size, top_k range, index source, the indexer band, causal, no window --
+        ``ValueError``), then the pipeline knobs the sparse core has no arm for (``NotImplementedError``), in the order
+        a caller is most likely to have asked for them.  Device-free, so a test pins every row on any GPU; the arch gate
+        is the stages' own (``check_support``)."""
+        g = self.geom
+        g.validate()
+        q = g.qsa
+        if self.thd:
+            raise NotImplementedError("QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up")
+        if self.save_for_backward:
+            raise NotImplementedError(
+                "QsaSpec with save_for_backward=True: sparse-attention training (the sparse backward and the indexer loss) is out of scope; the "
+                "block's backward differentiates the dense record only"
+            )
+        if quant is not None:
+            raise NotImplementedError(
+                f"QsaSpec with quant={type(quant).__name__}: the sparse core is bf16 / f16; the quantized pipelines (per-tensor FP8, MXFP8, the "
+                "fp4 modes) have no sparse arm"
+            )
+        if self.fuse_gate:
+            raise NotImplementedError(
+                "QsaSpec with fuse_gate=True: the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch (fuse_gate=False)"
+            )
+        if self.fuse_norm_rope and q.index_band:
+            tile = _FusedQkvProjection._TILE_N
+            raise NotImplementedError(
+                f"QsaSpec(index_band=True) with fuse_norm_rope=True: the fused projection renders {tile}-column tiles; a {q.index_band_cols}-column "
+                f"indexer band is not a whole number of them -- use the unfused projection (fuse_norm_rope=False), or a band padded to "
+                f"{-(-q.index_band_cols // tile) * tile} columns once that arm exists"
+            )
+        if g.causal_bottom_right:
+            raise NotImplementedError(
+                "QsaSpec with causal_bottom_right=True: the bottom-right diagonal (speculative verify rows) arrives with the sparse decode mode; "
+                "the prefill form serves the top-left causal diagonal"
+            )
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(f"QsaSpec needs bf16 / f16 activations (the sparse core's dtypes), got {self.dtype}")
+        if g.gqa_ratio > _N_MAX_SPARSE_V1:
+            raise NotImplementedError(
+                f"QsaSpec needs h_q // h_kv <= {_N_MAX_SPARSE_V1} (the sparse core packs the GQA group on an N tile of at most "
+                f"{_N_MAX_SPARSE_V1} rows), got {g.h_q} // {g.h_kv} = {g.gqa_ratio}"
+            )
+        if q.index_source == "indexer":
+            raise NotImplementedError(
+                "QsaSpec(index_source='indexer'): the in-block indexer is a follow-up; pass the selection as execute(block_ids=) under " "index_source='caller'"
+            )
+        if g.d_head != 256:
+            raise NotImplementedError(f"QsaSpec needs d_head == 256 (the sparse core is the d256 swap-AB body), got d_head={g.d_head}")
+
+    def _check_qsa_execute_args(self, block_ids, block_lens, h: torch.Tensor) -> None:
+        """The index tensors against the declaration -- FORM only (dtype / rank / shape / contiguity / device), never a
+        value and never a sync (Rule 3): a QsaSpec block with caller lists needs ``block_ids``; a dense block refuses
+        them rather than ignoring a list it cannot consume."""
+        if self.qsa is None:
+            if block_ids is not None or block_lens is not None:
+                raise ValueError(
+                    "block_ids / block_lens are the index lists of a block-sparse (QsaSpec) block; this block was declared without geometry.qsa "
+                    "and attends densely -- a list it cannot consume is refused rather than silently ignored"
+                )
+            return
+        if block_ids is None:
+            raise ValueError(
+                "QsaSpec(index_source='caller') needs block_ids at execute: [T, top_k] int32 (or [B, S, top_k]) -- per query the ids of its "
+                f"selected complete {self.qsa.block_size}-token blocks (block b = tokens [{self.qsa.block_size}b, {self.qsa.block_size}b + "
+                f"{self.qsa.block_size}) of the query's own sequence), the valid prefix then -1 padding"
+            )
+        t, top_k = self.batch * self.seq_len, self.qsa.top_k
+        _check_index_tensor(
+            block_ids,
+            "block_ids",
+            (t, top_k),
+            (self.batch, self.seq_len, top_k),
+            h.device,
+            hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form, which this block does not declare)",
+        )
+        if block_lens is not None:
+            _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
+
+    def index_k_raw(self, workspace: torch.Tensor) -> torch.Tensor:
+        """The RAW indexer key the last ``execute`` left in ``workspace``, as a ``[B, S, index_kv_heads, index_head_dim]``
+        VIEW of the stage-(1) slab (:func:`index_k_raw_view` at this block's own slab offset; no copy, no allocation).
+        Valid after an ``execute`` with that workspace until the next one overwrites the slab.  ``ValueError`` on a
+        block whose geometry has no indexer band, or on a workspace too small to hold the slab."""
+        g = self.geom
+        if not g.index_band:
+            raise ValueError("index_k_raw: this block's geometry declares no indexer band (GatedAttentionBlockGeometry.qsa.index_band)")
+        lay = self._layout()
+        t = self.batch * self.seq_len
+        need = lay.proj + t * g.n_qkvg * _itemsize(self.act_dtype)
+        if workspace.numel() < need:
+            raise ValueError(f"workspace is {workspace.numel()} bytes; the stage-(1) slab ends at byte {need}")
+        return index_k_raw_view(_view(workspace, lay.proj, (t, g.n_qkvg), self.act_dtype), g, self.batch, self.seq_len)
 
     # -- support ------------------------------------------------------------
 
@@ -3526,6 +4999,9 @@ class GatedAttentionBlockFwd(APIBase):
             fp8_fused=self.quant_fused,
             mxfp8=self.mxfp8,
             o_fp4=self.o_fp4,
+            want_saved=self.save_for_backward,
+            saved_gate_copy=self.saved_gate_copy,
+            thd_num_sequences=self.num_sequences if self.thd else 0,
         )
 
     def get_workspace_size(self) -> int:
@@ -3550,42 +5026,337 @@ class GatedAttentionBlockFwd(APIBase):
             st.compile()
         self._ws = self._layout()
         self._quant_dev = self._make_quant_dev()
+        self._quant_dev_on_launch_stream = False
+        self._quant_dev_ready = None
+        if self._quant_dev:
+            # whatever the allocations above (and the fused fork's, in its stage compile) enqueued on the ambient stream -- under
+            # deterministic mode a NaN fill -- is behind this event; _write_quant_dev waits on it before writing on any stream
+            self._quant_dev_ready = torch.cuda.Event()
+            self._quant_dev_ready.record(torch.cuda.current_stream(self.device))
 
-    def _make_quant_dev(self) -> Optional[dict]:
-        """The quant spec's scalars as 1-element fp32 device tensors (plan-time constants, contract § 10;
-        the execute path never allocates).  ``None`` for bf16; ``{}`` under ``o_fp4`` -- neither ``alpha_o``
-        nor ``scale_o`` exists there (both pinned 1.0: the fp4 out_proj has no alpha epilogue and the fp4
-        quantizer takes no scale)."""
+    def _quant_dev_values(self, spec: Optional[Union[QuantSpec, MxQuantSpec]]) -> Optional[dict]:
+        """The per-tensor scalars of ``spec`` the block holds as 1-element fp32 device tensors, as ``{name: float}`` -- the ONE
+        spelling ``compile()`` materialises (:meth:`_make_quant_dev`) and :meth:`update_quant_scales` rewrites in place.  ``None``
+        for bf16; ``{}`` under ``o_fp4`` -- neither ``alpha_o`` nor ``scale_o`` exists there (both pinned 1.0: the fp4 out_proj has
+        no alpha epilogue and the fp4 quantizer takes no scale); under MXFP8 only the out projection's per-tensor pair survives
+        (D1) -- ``alpha_o`` for the GEMM epilogue, ``scale_o`` for the unfused quantize_o; under per-tensor FP8 the two GEMM alphas,
+        the four quantize scales and the fp8 SDPA's three descales."""
+        if spec is None:
+            return None
         if self.o_fp4 is not None:
             return {}
         if self.mxfp8:
-            # MXFP8: only the out projection's per-tensor pair survives (D1) --
-            # `alpha_o` for the GEMM epilogue, `scale_o` for the unfused quantize_o.
-            q = self.quant
-            return dict(
-                alpha_o=torch.full((1,), float(q.alpha_o), dtype=torch.float32, device=self.device),
-                scale_o=torch.full((1,), float(q.scale_o), dtype=torch.float32, device=self.device),
-            )
-        if self.quant is not None:
-            # Plan-time constants (contract § 10 allows compile-time buffers; the
-            # execute path never allocates): one fp32 device scalar per scale.
-            q = self.quant
+            return dict(alpha_o=float(spec.alpha_o), scale_o=float(spec.scale_o))
+        return dict(
+            alpha_qkvg=float(spec.alpha_qkvg),
+            alpha_o=float(spec.alpha_o),
+            scale_q=float(spec.scale_q),
+            scale_k=float(spec.scale_k),
+            scale_v=float(spec.scale_v),
+            scale_o=float(spec.scale_o),
+            descale_q=1.0 / float(spec.scale_q),
+            descale_k=1.0 / float(spec.scale_k),
+            descale_v=1.0 / float(spec.scale_v),
+        )
 
-            def _dev(v: float) -> torch.Tensor:
-                return torch.full((1,), float(v), dtype=torch.float32, device=self.device)
+    def _make_quant_dev(self) -> Optional[dict]:
+        """The quant spec's scalars as 1-element fp32 device tensors (plan-time constants; the execute path never allocates):
+        one ``torch.empty`` per name of :meth:`_quant_dev_values` -- ALLOCATED here, never filled here.  Their VALUES are written
+        on a launch stream only: by the FIRST ``execute`` on ITS launch stream (:meth:`_write_quant_dev`) and by every
+        :meth:`update_quant_scales` on the caller's.  A fill enqueued on the stream ambient at ``compile()`` would have no ordering
+        against a recalibration on another stream: pending work ahead of it would let it land after the update and restore the
+        declared values while ``self.quant`` already named the new spec.  The allocation is not free of stream work either
+        (``torch.use_deterministic_algorithms(True)`` makes ``torch.empty`` fill with NaN), which is why ``compile()`` records an
+        event behind it that every writer waits on."""
+        vals = self._quant_dev_values(self.quant)
+        if vals is None:
+            return None
+        return {name: torch.empty((1,), dtype=torch.float32, device=self.device) for name in vals}
 
-            return dict(
-                alpha_qkvg=_dev(q.alpha_qkvg),
-                alpha_o=_dev(q.alpha_o),
-                scale_q=_dev(q.scale_q),
-                scale_k=_dev(q.scale_k),
-                scale_v=_dev(q.scale_v),
-                scale_o=_dev(q.scale_o),
-                descale_q=_dev(1.0 / q.scale_q),
-                descale_k=_dev(1.0 / q.scale_k),
-                descale_v=_dev(1.0 / q.scale_v),
+    def _check_quant_update(self, spec) -> None:
+        """The typed refusals of :meth:`update_quant_scales`, every one BEFORE any write: a block declared without ``quant``
+        (``ValueError``); a spec of the other class (``TypeError``: the two classes select different pipelines); a differing plan
+        fact -- ``dtype``, and under MXFP8 ``block_size`` / ``w_qkvg_dtype`` / ``o_fp4`` -- (``ValueError`` naming the field: those
+        select kernels and the workspace carve, only the scales may move); ``spec``'s own ``validate`` EXACTLY as the declaration
+        applied it (``MxQuantSpec.validate(fused=...)`` -- the fully fused MXFP8 path pins ``scale_o == 1.0`` --, the bare
+        ``QuantSpec.validate()``: a zero / inf / NaN scale is refused there); a block not yet compiled (``RuntimeError``)."""
+        if self.quant is None:
+            raise ValueError(
+                "update_quant_scales() belongs to a quantized block (quant=QuantSpec / MxQuantSpec): this block was declared without quant and "
+                "holds no per-tensor scale to update"
             )
-        return None
+        if type(spec) is not type(self.quant):
+            raise TypeError(
+                f"update_quant_scales(): spec must be a {type(self.quant).__name__}, the class this block was declared with (QuantSpec and "
+                f"MxQuantSpec select different pipelines), got {type(spec).__name__}"
+            )
+        for name in ("dtype", "block_size", "w_qkvg_dtype", "o_fp4") if self.mxfp8 else ("dtype",):
+            if getattr(spec, name) != getattr(self.quant, name):
+                raise ValueError(
+                    f"update_quant_scales(): {type(spec).__name__}.{name} is a plan fact (it selects kernels and the workspace carve): declared "
+                    f"{getattr(self.quant, name)!r}, got {getattr(spec, name)!r}; only the scales may change -- declare a new block for a new {name}"
+                )
+        if self.mxfp8:
+            spec.validate(fused=bool(self.fuse_gate) and bool(self.fuse_norm_rope))
+        else:
+            spec.validate()
+        if self._ws is None:
+            raise RuntimeError("call compile() before update_quant_scales(): the device scalars it rewrites are materialised there")
+
+    def _write_quant_dev(self, spec, stream: int) -> None:
+        """Write ``spec``'s scalars into the device tensors of :meth:`_make_quant_dev` -- and, on the fully fused fp8 pipeline, into
+        the projection fork's fp32 ``[alpha_qkvg, scale_q, scale_k, scale_v]`` vector (:meth:`_FusedQkvProjection.write_qscal`) -- IN PLACE on ``stream`` (a raw CUstream
+        handle: the launch stream, so the next execute on it is ordered behind the writes by construction, Rule 5).  One fill
+        per value: nothing allocated, nothing read back, no recompile.  Nothing to write under ``o_fp4`` (``{}``).  The write
+        first waits on the event ``compile()`` recorded behind its allocations, so stream work the allocation itself enqueued (under
+        ``torch.use_deterministic_algorithms(True)`` ``torch.empty`` fills the tensors with NaN) lands before any value written on
+        another stream.  Inside a stream capture the wait is skipped (an external event cannot be waited on there) -- the documented
+        case: warm the block up before capturing."""
+        qd = self._quant_dev
+        if not qd:
+            return
+        vals = self._quant_dev_values(spec)
+        ts = as_torch_stream(stream, self.device)
+        with torch.cuda.stream(ts):
+            if self._quant_dev_ready is not None and not torch.cuda.is_current_stream_capturing():
+                ts.wait_event(self._quant_dev_ready)
+            for name, ten in qd.items():
+                ten.fill_(vals[name])
+        if self.fp8_fused:
+            # the fused fork's epilogue reads the four from the stage's own vector (allocated at its compile(), written only on a
+            # launch stream); the stage's spec follows, so a later recompile declares the same values
+            self._proj.write_qscal(spec, stream)
+
+    def update_quant_scales(self, spec: Union[QuantSpec, MxQuantSpec], *, current_stream: Optional[cuda.CUstream] = None) -> None:
+        """Re-point a COMPILED quantized block's per-tensor scales at ``spec`` without recompiling: an in-place write of the
+        device scalars of :meth:`_make_quant_dev` (``alpha_qkvg`` / ``alpha_o`` / ``scale_q`` / ``scale_k`` / ``scale_v`` /
+        ``scale_o`` / ``descale_q`` / ``descale_k`` / ``descale_v`` under a ``QuantSpec``; ``alpha_o`` / ``scale_o`` under an
+        ``MxQuantSpec``; and the fused fp8 fork's ``[alpha_qkvg, scale_q, scale_k, scale_v]`` vector where it exists) on the
+        launch stream -- ``current_stream`` (a raw ``CUstream``), else torch's current stream on the block's device (Rule 5) --
+        then ``self.quant = spec``.  Every consumer binds those tensors at ``execute``, so the next execute on that stream runs
+        at the new scales, and a CUDA graph that captured an execute of a WARMED-UP block replays with the LIVE values (the
+        scalars are read, never baked into the graph) -- unless the captured execute was the block's FIRST: its one-time scalar
+        write (:meth:`_write_quant_dev`, one fill kernel per value) is captured WITH the capture-time values, so every replay
+        re-writes them and overrides a later eager ``update_quant_scales``.  Run one eager execute on the capture stream before
+        capturing (every capture of the block does), or treat a graph that captured the first execute as pinned to the scales
+        it captured and re-capture after a recalibration.
+        No allocation, no host readback, no new plan: the training-loop recipe is one call per layer
+        right before its forward (``descale_h`` / ``descale_w_*`` from the tensors quantized this step, the activation scales
+        from the previous step's record), and the same ``spec`` handed to ``GatedAttentionBlockBwd.update_quant_scales`` so the
+        backward rebuilds the SDPA operands at the forward's scales.
+
+        Typed refusals, every one BEFORE any write (:meth:`_check_quant_update`): a block declared without ``quant``
+        (``ValueError``); a spec of the other class (``TypeError``); a differing plan fact -- ``dtype``, ``block_size``,
+        ``w_qkvg_dtype``, ``o_fp4`` -- (``ValueError`` naming the field: those select kernels and the carve); ``spec``'s own
+        ``validate`` exactly as the declaration applied it (the fully fused MXFP8 path keeps its ``scale_o == 1.0`` rule; a zero
+        / inf / NaN scale is its own ``ValueError``); a block not yet compiled (``RuntimeError``).  Under ``o_fp4``
+        there is nothing to write (both per-tensor scales are pinned 1.0): the call validates and records ``spec``.
+        """
+        self._check_quant_update(spec)
+        stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(self.device).cuda_stream
+        self._write_quant_dev(spec, stream)
+        self.quant = spec
+
+    # -- the training record --------------------------------------------------
+
+    @staticmethod
+    def _check_saved_tensor(name: str, ten, shape: tuple, dtype: torch.dtype, device, *, contiguous: bool = True) -> None:
+        """One caller-owned buffer of the record: a tensor of exactly ``shape`` / ``dtype`` on ``device`` (compact when
+        ``contiguous``) whose base is 16-B aligned -- every one of them is a TMA-store or a 16-B vector-store target, and a
+        misaligned base (a ``[1:]`` slice of a caller arena passes count / dtype / contiguity) would fail UNTYPED at the
+        tensor-map encode or the launch, after earlier stages ran; the package precedent is ``kernels/proj_gemm.py``'s
+        output checks and :func:`_check_sf_blob`.  Typed and naming the field -- no launch, no device read."""
+        if not isinstance(ten, torch.Tensor):
+            raise ValueError(f"{name} must be a caller-owned {list(shape)} {dtype} tensor on {device}, got {type(ten).__name__}")
+        if tuple(int(x) for x in ten.shape) != tuple(shape):
+            raise ValueError(f"{name} must be {list(shape)}, got {list(ten.shape)}")
+        if ten.dtype != dtype:
+            raise ValueError(f"{name} must be {dtype}, got {ten.dtype}")
+        if ten.device != device:
+            raise ValueError(f"{name} must live on h's device {device}, got {ten.device}")
+        if contiguous and not ten.is_contiguous():
+            raise ValueError(f"{name} must be contiguous (compact, the layout the kernels write), got strides {tuple(ten.stride())}")
+        if ten.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned (a TMA-store / 16-B vector-store target), got data_ptr={ten.data_ptr():#x}")
+
+    def _check_thd_seq_lens(self, seq_lens, device) -> None:
+        """The packed lengths' FORM, host-side and before any launch: a contiguous 1-D int32 CUDA tensor on ``h``'s device
+        with EXACTLY ``num_sequences`` (``[B]`` lengths) or ``num_sequences + 1`` (``[B+1]`` prefix sums, ``cu_seqlens``)
+        elements -- stricter than the forward adapter's ``1..B`` admission because the backward binds exactly ``B`` or
+        ``B+1`` and the training record must round-trip.  The VALUES are never read (Rule 3)."""
+        n = self.num_sequences + (1 if self.cu_seqlens else 0)
+        form = "[B+1] prefix sums" if self.cu_seqlens else "[B] lengths"
+        device = torch.device(device)
+        ok = (
+            isinstance(seq_lens, torch.Tensor)
+            and seq_lens.dtype == torch.int32
+            and seq_lens.dim() == 1
+            and seq_lens.is_contiguous()
+            and seq_lens.numel() == n
+            and seq_lens.is_cuda
+            and device.type == "cuda"
+            and (device.index is None or seq_lens.device.index == device.index)
+        )
+        if not ok:
+            got = (
+                f"dtype {seq_lens.dtype}, shape {tuple(seq_lens.shape)}, strides {tuple(seq_lens.stride())}, device {seq_lens.device}"
+                if isinstance(seq_lens, torch.Tensor)
+                else type(seq_lens).__name__
+            )
+            raise ValueError(f"thd=True: seq_lens must be a contiguous 1-D int32 CUDA tensor of {n} elements on {device} ({form}), got {got}")
+
+    def _check_saved_set(
+        self, h: torch.Tensor, seq_lens: Optional[torch.Tensor], lse: Optional[torch.Tensor], saved: Optional[SavedForBackward]
+    ) -> _SavedBinding:
+        """Validate the :class:`SavedForBackward` record against this declaration and bind the caller tensors the stages
+        write through.  Every miss is a ``ValueError`` naming the field; nothing here launches, allocates or reads the
+        device, and it runs on a DECLARED (uncompiled) block, so the contract is testable on any device.  ``execute``
+        calls it BEFORE its first launch.
+
+        The contracts:
+
+        1. ``saved.rstd_q`` / ``rstd_k`` are tensors iff ``geometry.qk_norm`` (both directions) -- and then ``[B, S, H_q]`` /
+           ``[B, S, H_kv]`` fp32 compact: the norm kernel writes them through raw fp32 pointer arithmetic over ``[T, H]``.
+        2. ``saved.h`` IS ``h`` (same storage) -- the backward reads it for the projection wgrad and the Q/K recompute.
+        3. ``saved.seq_lens`` IS the ``seq_lens`` this execute runs with (``is``, or both ``None``): the backward's
+           declaration-time padding decline rests on this identity, without a D2H read.  Under ``thd=True`` a tensor is
+           REQUIRED (it is the packed-lengths tensor the backward binds), and ``saved.seq_lens_form`` must name its form
+           (``"lengths"`` / ``"prefix"`` per ``cu_seqlens``); a dense record carries ``seq_lens_form=None``.  Both typed.
+        4. ``saved.lse`` is ``[B, H_q, S]`` fp32 compact; ``lse=None`` defaults to it and an explicit ``lse`` must be that
+           same storage (the SDPA adapter requires an LSE tensor once compiled with one).
+        5. ``saved.o`` is compact ``[B, S, H_q, D]`` in the activation dtype: the SDPA writes the PRE-gate O there.
+        6. proj_slab mode (``saved_gate_copy=False``): ``saved.proj_slab`` is REQUIRED (``B*S x n_qkvg`` elements, act dtype,
+           contiguous, on ``h``'s device) and becomes the stage-(1) output; ``saved.gate`` / ``q_pre`` / ``k_pre``, when
+           given, must alias it exactly as :func:`saved_slab_views` spells (data_ptr, dtype, shape AND strides) -- each may
+           be ``None`` here, the backward derives it from the slab.
+        7. gate-copy mode (``saved_gate_copy=True``): ``saved.proj_slab`` must be ``None``, ``saved.gate`` is a compact
+           ``[B, S, H_q, D]`` caller buffer the GATE band is copied into; ``q_pre`` / ``k_pre`` are copied only if given.
+        8. Every caller buffer a kernel WRITES -- ``proj_slab``, ``o``, ``lse``, ``rstd_*``, the gate-copy targets -- is
+           16-B aligned (:meth:`_check_saved_tensor`): they are TMA-store / 16-B vector-store targets, and a misaligned
+           base fails untyped at the tensor-map encode or the launch, after stage (1) already ran.
+        """
+        if saved is None:
+            raise ValueError("save_for_backward=True requires a SavedForBackward to write through")
+        g, b, s = self.geom, self.batch, self.seq_len
+        t, act, dev = b * s, self.act_dtype, h.device
+        if g.qk_norm:
+            if saved.rstd_q is None or saved.rstd_k is None:
+                raise ValueError("save_for_backward=True with geometry.qk_norm=True needs SavedForBackward.rstd_q and rstd_k tensors to write through")
+            # The norm kernel writes rstd by raw fp32 pointer arithmetic over [T, H]: a wrong count, dtype or layout here
+            # is a device OOB write or silently misplaced values, never an error.
+            self._check_saved_tensor("saved.rstd_q", saved.rstd_q, (b, s, g.h_q), torch.float32, dev)
+            self._check_saved_tensor("saved.rstd_k", saved.rstd_k, (b, s, g.h_kv), torch.float32, dev)
+        elif saved.rstd_q is not None or saved.rstd_k is not None:
+            raise ValueError(
+                "geometry.qk_norm=False (RoPE-only) computes no RMSNorm and writes no rstd: SavedForBackward.rstd_q and rstd_k must be None "
+                "(stage B6 does not exist)"
+            )
+        sh = saved.h
+        if not isinstance(sh, torch.Tensor) or sh.data_ptr() != h.data_ptr() or sh.numel() != h.numel() or sh.dtype != h.dtype:
+            raise ValueError(
+                "saved.h must be the SAME storage as the h this forward runs on (data_ptr, element count and dtype equal): the backward reads "
+                "saved.h for the projection wgrad and the Q/K recompute, so a copy or another tensor there would silently differentiate a "
+                "different input"
+            )
+        if saved.seq_lens is not seq_lens:
+            raise ValueError(
+                "saved.seq_lens must be the very tensor passed to execute(seq_lens=) -- the same object, or both None; got "
+                f"saved.seq_lens={'None' if saved.seq_lens is None else 'a tensor'}, seq_lens={'None' if seq_lens is None else 'a tensor'}. "
+                "The backward declines padding at declaration from this field (no device read), so the record must say what the forward ran with."
+                + (" -- under thd=True saved.seq_lens is REQUIRED: it is the packed-lengths tensor the backward binds" if self.thd else "")
+            )
+        # The record must SAY which length contract it carries (a frozen, caller-written field verified like the identity
+        # above): the backward checks it against its own declaration, so a padded dense record never reaches a THD backward
+        # and a packed one never reaches a dense backward without a typed decline.
+        want_form = _thd_seq_lens_form(self.cu_seqlens) if self.thd else None
+        if saved.seq_lens_form != want_form:
+            if self.thd:
+                raise ValueError(
+                    f"saved.seq_lens_form must be {want_form!r} for this block (thd=True, cu_seqlens={self.cu_seqlens}: seq_lens is the "
+                    f"{'[B+1] int32 prefix sums' if self.cu_seqlens else '[B] int32 lengths'}), got {saved.seq_lens_form!r}: the record must "
+                    "say which form of packed lengths it carries, so the backward can check it against its own declaration"
+                )
+            raise ValueError(
+                f"saved.seq_lens_form must be None for a dense block (thd=False): seq_lens there is the per-batch KV padding mask (or None), "
+                f"not packed lengths; got {saved.seq_lens_form!r}"
+            )
+        self._check_saved_tensor("saved.lse", saved.lse, (b, g.h_q, s), torch.float32, dev)
+        if lse is not None and lse.data_ptr() != saved.lse.data_ptr():
+            raise ValueError(
+                "lse and saved.lse are different storage; under save_for_backward the SDPA writes saved.lse -- pass lse=None (the default) "
+                "or saved.lse itself"
+            )
+        self._check_saved_tensor("saved.o", saved.o, (b, s, g.h_q, g.d_head), act, dev)
+        o = saved.o.view(t, g.h_q, g.d_head)
+        if self.saved_gate_copy:
+            if saved.proj_slab is not None:
+                raise ValueError(
+                    "this block was declared saved_gate_copy=True (the gate-copy save mode: the projection slab stays in the workspace and the "
+                    "GATE band is copied into a compact saved.gate), but saved.proj_slab was given -- declare saved_gate_copy=False for the "
+                    "proj_slab save mode, or pass proj_slab=None"
+                )
+            self._check_saved_tensor("saved.gate", saved.gate, (b, s, g.h_q, g.d_head), act, dev)
+            for nm, ten, hh in (("saved.q_pre", saved.q_pre, g.h_q), ("saved.k_pre", saved.k_pre, g.h_kv)):
+                if ten is not None:
+                    self._check_saved_tensor(nm, ten, (b, s, hh, g.d_head), act, dev)
+            return _SavedBinding(
+                lse=saved.lse,
+                rstd_q=saved.rstd_q,
+                rstd_k=saved.rstd_k,
+                proj=None,
+                o=o,
+                gate_dst=saved.gate.view(t, g.h_q, g.d_head),
+                q_pre_dst=None if saved.q_pre is None else saved.q_pre.view(t, g.h_q, g.d_head),
+                k_pre_dst=None if saved.k_pre is None else saved.k_pre.view(t, g.h_kv, g.d_head),
+            )
+        ps = saved.proj_slab
+        if ps is None:
+            raise ValueError(
+                "saved.proj_slab is required: this block was declared saved_gate_copy=False (the proj_slab save mode -- stage (1) writes the "
+                "caller-owned [B*S, n_qkvg] slab and gate / q_pre / k_pre / V are its column bands, saved_slab_views). Pass it, or declare "
+                "saved_gate_copy=True for the gate-copy save mode"
+            )
+        if not isinstance(ps, torch.Tensor) or ps.numel() != t * g.n_qkvg:
+            raise ValueError(
+                f"saved.proj_slab has {ps.numel() if isinstance(ps, torch.Tensor) else 'no'} elements; the stage-(1) slab over B*S={t} tokens x "
+                f"n_qkvg={g.n_qkvg} columns is {t * g.n_qkvg} ([B*S, n_qkvg] or [B, S, n_qkvg])"
+            )
+        if ps.dtype != act:
+            raise ValueError(f"saved.proj_slab must be the activation dtype {act} (the GEMM's output dtype), got {ps.dtype}")
+        if not ps.is_contiguous():
+            raise ValueError(
+                f"saved.proj_slab must be contiguous (bound by pointer as ONE row-major [B*S, n_qkvg] GEMM output), got strides {tuple(ps.stride())}"
+            )
+        if ps.device != dev:
+            raise ValueError(f"saved.proj_slab must live on h's device {dev}, got {ps.device}")
+        if ps.data_ptr() % 16:
+            raise ValueError(f"saved.proj_slab must be 16-byte aligned (the projection GEMM TMA-stores it), got data_ptr={ps.data_ptr():#x}")
+        want_q, want_gate, want_k, _want_v = saved_slab_views(ps, g, b, s)
+        for nm, given, want in (("gate", saved.gate, want_gate), ("q_pre", saved.q_pre, want_q), ("k_pre", saved.k_pre, want_k)):
+            if given is None:
+                continue
+            ok = (
+                isinstance(given, torch.Tensor)
+                and given.data_ptr() == want.data_ptr()
+                and given.dtype == want.dtype
+                and tuple(given.shape) == tuple(want.shape)
+                and tuple(given.stride()) == tuple(want.stride())
+            )
+            if not ok:
+                got = (
+                    f"data_ptr {given.data_ptr():#x} {given.dtype} shape {tuple(given.shape)} strides {tuple(given.stride())}"
+                    if isinstance(given, torch.Tensor)
+                    else type(given).__name__
+                )
+                raise ValueError(
+                    f"saved.{nm} must alias saved.proj_slab's {nm.upper() if nm == 'gate' else nm[0].upper()} band exactly as "
+                    "saved_slab_views(proj_slab, geometry, batch, seq_len) spells it ([B, S, heads, D], token stride n_qkvg, storage offset at "
+                    f"qkvg_offsets): expected data_ptr {want.data_ptr():#x} {want.dtype} shape {tuple(want.shape)} strides {tuple(want.stride())}, "
+                    f"got {got}. Leave it None to let the backward derive it from the slab."
+                )
+        return _SavedBinding(
+            lse=saved.lse, rstd_q=saved.rstd_q, rstd_k=saved.rstd_k, proj=ps.view(t, g.n_qkvg), o=o, gate_dst=None, q_pre_dst=None, k_pre_dst=None
+        )
 
     # -- execute ------------------------------------------------------------
 
@@ -3607,6 +5378,10 @@ class GatedAttentionBlockFwd(APIBase):
         h_sf: Optional[torch.Tensor] = None,  # MXFP8 only (both REQUIRED): the F8_128x4 E8M0 blobs of h and W_qkvg (sample_* byte counts)
         w_qkvg_sf: Optional[torch.Tensor] = None,
         w_o_sf: Optional[torch.Tensor] = None,  # fp4 O only (REQUIRED there): the F8_128x4 blob of the e2m1 W_o (sample_w_o_sf's byte count)
+        # APPENDED (block-sparse attention, geometry.qsa with index_source="caller"): the per-query selection.  REQUIRED there, REFUSED
+        # on a dense block.  Checked for FORM only (dtype / rank / shape / contiguity / device), never read on the host (Rule 3).
+        block_ids: Optional[torch.Tensor] = None,  # [T, top_k] int32 (or [B, S, top_k]): the ids of each query's selected complete blocks, valid prefix then -1
+        block_lens: Optional[torch.Tensor] = None,  # [T] int32 (or [B, S]), optional: the valid-prefix length per query (lowering-only; clamped on device)
     ) -> None:
         """Launch the five stages in pipeline order.
 
@@ -3621,10 +5396,57 @@ class GatedAttentionBlockFwd(APIBase):
         for dtype / byte count / contiguity / 16-B alignment, typed), REFUSED
         otherwise.  ``w_o_sf`` (appended): REQUIRED under ``MxQuantSpec.o_fp4``
         (same checks at the format's block and scale dtype), REFUSED otherwise.
+
+        ``saved``: REQUIRED under ``save_for_backward=True`` (the whole record is
+        validated by :meth:`_check_saved_set` before any launch), REFUSED on a
+        block declared without it -- an inference forward writes none of the
+        record's tensors, so a silently ignored ``saved=`` would hand the
+        backward an uninitialised save set.
+
+        ``seq_lens`` under ``thd=True``: REQUIRED -- the per-sequence packed lengths
+        (``[B]`` int32, or ``[B+1]`` int32 prefix sums under ``cu_seqlens=True``) on
+        ``h``'s device, validated for form (never read) and handed to the SDPA for
+        the Q and the KV side alike; ``h`` / ``cos`` / ``sin`` / ``out`` are the
+        packed ``[T, .]`` (or ``[1, T, .]``) tensors the block was declared with.
+        A training record then carries that very tensor as ``saved.seq_lens`` and
+        names its form in ``saved.seq_lens_form``.
+
+        ``block_ids`` / ``block_lens`` (appended): REQUIRED under ``geometry.qsa``
+        with ``index_source="caller"`` (``block_ids``; ``block_lens`` optional),
+        REFUSED on a block declared without ``qsa``.  Form checks only -- the ids
+        are device data the sparse core reads (block ``b`` = tokens ``[4b, 4b + 4)``
+        of the query's own sequence, ``-1`` = padding; the open tail block is
+        always visible).
         """
+        # Block-sparse attention: the index tensors are a DECLARATION-vs-argument contract and need no plan, so they are
+        # checked first and the refusal reads the same on every device (Rule 3: form only, never a value, never a sync).
+        self._check_qsa_execute_args(block_ids, block_lens, h)
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
+        # `saved=` is the training forward's write-through record.  On an inference
+        # block no stage targets saved.o / lse / rstd_* / proj_slab / gate, so
+        # accepting it would leave the caller holding an uninitialised record that
+        # the backward then consumes -- refused up front, like every other argument
+        # this declaration cannot consume (h_sf / w_qkvg_sf outside MXFP8, w_o_sf
+        # outside fp4 O).  The training-side validation stays in _check_saved_set.
+        if saved is not None and not self.save_for_backward:
+            raise ValueError(
+                "saved= is the SavedForBackward record a TRAINING forward writes through, but this block was declared "
+                "save_for_backward=False (inference): no stage would write saved.o / lse / rstd_q / rstd_k / proj_slab / gate, so the "
+                "record would stay uninitialised. Declare GatedAttentionBlockFwd(..., save_for_backward=True) for a training forward, "
+                "or drop saved="
+            )
+        if self.thd:
+            # THD: the packed lengths are REQUIRED and host-validated for FORM only (dtype / rank / contiguity / count /
+            # device) -- never read (Rule 3): their values -- each in [0, max_seq_len], summing to T -- are the caller's
+            # contract, normalized and consumed on device by the SDPA's setup launch.
+            if seq_lens is None:
+                raise ValueError(
+                    "thd=True: execute(seq_lens=) is required -- the per-sequence packed lengths ([B] int32 lengths, or [B+1] int32 prefix sums "
+                    "under cu_seqlens=True) on h's device; the SDPA builds its packed metadata from them"
+                )
+            self._check_thd_seq_lens(seq_lens, h.device)
         if self.mxfp8:
             if h_sf is None or w_qkvg_sf is None:
                 raise ValueError("MXFP8 execute needs both scale-factor blobs: h_sf (over B*S rows) and w_qkvg_sf (over n_qkvg rows); no silent unit scale")
@@ -3670,6 +5492,15 @@ class GatedAttentionBlockFwd(APIBase):
         req = self.get_workspace_size()
         if workspace.numel() < req:
             raise ValueError(f"workspace is {workspace.numel()} bytes, need {req}")
+        if self._quant_dev and not self._quant_dev_on_launch_stream:
+            # The FIRST execute writes the per-tensor scalars' VALUES on ITS launch stream: compile() only ALLOCATED them (a fill
+            # enqueued on the stream ambient at compile time would have no ordering against this stream, nor against a later
+            # cross-stream update_quant_scales(), which pending work on that stream could let it undo).  Once per compile(); a later
+            # update_quant_scales() writes on the caller's stream itself.  Nothing under o_fp4 ({}), nothing for bf16 (None).  A stream capture of this first
+            # execute records these fills WITH their values, so its replays re-write them: warm up before capturing
+            # (update_quant_scales's docstring).
+            self._write_quant_dev(self.quant, stream)
+            self._quant_dev_on_launch_stream = True
 
         fp8 = self.quant is not None
         mxfp8 = self.mxfp8
@@ -3680,7 +5511,20 @@ class GatedAttentionBlockFwd(APIBase):
         if self.mxfp8_fused:
             self._execute_mxfp8_fused(h, h_sf, w_qkvg, w_qkvg_sf, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_lens, lse, stream, w_o_sf=w_o_sf)
             return
-        proj = _view(workspace, ws.proj, (t, g.n_qkvg), act)
+        # TRAINING (save_for_backward): validate the whole SavedForBackward record
+        # FIRST -- before any launch -- and bind what the stages write THROUGH: the
+        # caller's slab (proj_slab mode), the PRE-gate O, the LSE, rstd, and the
+        # gate-copy destinations.  `_check_saved_set` is the contract (typed,
+        # device-free, callable on a declared block).  An inference block reached
+        # this line with saved=None: a record there was refused at the top.
+        sv = self._check_saved_set(h, seq_lens, lse, saved) if self.save_for_backward else None
+        rstd_q, rstd_k = (sv.rstd_q, sv.rstd_k) if sv is not None else (None, None)
+        if sv is not None:
+            lse = sv.lse
+        # Stage (1)'s output: the workspace slab, or the caller-owned saved.proj_slab
+        # (proj_slab save mode -- the GEMM binds `out` by pointer, so the slab the
+        # backward reads is written exactly once, in place of the workspace one).
+        proj = sv.proj if (sv is not None and sv.proj is not None) else _view(workspace, ws.proj, (t, g.n_qkvg), act)
         # In-place: there ARE no compact Q/K/V buffers -- the SDPA reads the
         # slab columns directly, so these are the same views stage (2)+(3)
         # normed over. Bound below, after `q_src`/`k_src`/`v_src` exist.
@@ -3689,7 +5533,19 @@ class GatedAttentionBlockFwd(APIBase):
             q_c = _view(workspace, ws.q, (t, g.h_q, g.d_head), act)
             k_c = _view(workspace, ws.k, (t, g.h_kv, g.d_head), act)
             v_c = _view(workspace, ws.v, (t, g.h_kv, g.d_head), act)
-        o = _view(workspace, ws.o, (t, g.h_q, g.d_head), act)
+        elif fp8 and ws.q >= 0:
+            # FP8 / MXFP8 TRAINING: the carve reserved compact bf16 Q/K, so stage (2)+(3)
+            # writes the normed Q/K OUT of place into them (the slab's Q/K bands stay
+            # PRE-norm for the record) and the quantize stages read them.  Inference
+            # (ws.q == -1) keeps the in-place norm and quantizes the slab bands.
+            q_c = _view(workspace, ws.q, (t, g.h_q, g.d_head), act)
+            k_c = _view(workspace, ws.k, (t, g.h_kv, g.d_head), act)
+        # O: the SDPA's output -- the workspace slot under inference (stage (5)
+        # then gates it IN PLACE: `o_gated is o`), the caller's PRE-gate saved.o
+        # under training, where stage (5) gates OUT of place into the workspace
+        # `o_gated` slot and stage (6) reads that.
+        o = sv.o if sv is not None else _view(workspace, ws.o, (t, g.h_q, g.d_head), act)
+        o_gated = _view(workspace, ws.o_gated, (t, g.h_q, g.d_head), act) if ws.o_gated >= 0 else o
         engine_ws = workspace[ws.engine_scratch :]
         sfq = sfk = sfv = None
         if fp8:
@@ -3703,32 +5559,17 @@ class GatedAttentionBlockFwd(APIBase):
         if self.o_fp4 is not None:
             o4, sfo = self._fp4_o_views(workspace, ws, t)
         if mxfp8:
-            # The SDPA's own F8_128x4 SF blobs (flat uint8), written by the three quantize stages.
-            sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(self.batch, g.h_q, self.seq_len, g.d_head),), torch.uint8)
-            sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
-            sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
+            # The SDPA's own F8_128x4 SF blobs (flat uint8), written by the three quantize stages -- under THD the WHOLE packed
+            # slot (the capacity count; the SDPA's binder derives the tile extent from the byte count), never the live total.
+            sfq, sfk, sfv = self._sf_views(workspace, ws)
 
-        o_q, o_g, o_k, o_v = g.qkvg_offsets
+        o_q, o_g, o_k, o_v = g.qkvg_offsets[:4]  # the four DENSE bands; a five-band (indexer) slab's band is never an SDPA operand
         # Column slices of the fused projection, as strided views. Every consumer
         # addresses these strides natively -- no repack anywhere (Rule 2).
         q_src = _cols(proj, o_q, g.h_q, g.d_head)
         gate_src = _cols(proj, o_g, g.h_q, g.d_head)
         k_src = _cols(proj, o_k, g.h_kv, g.d_head)
         v_src = _cols(proj, o_v, g.h_kv, g.d_head)
-
-        rstd_q = rstd_k = None
-        if self.save_for_backward:
-            if saved is None:
-                raise ValueError("save_for_backward=True requires a SavedForBackward to write through")
-            if g.qk_norm:
-                if saved.rstd_q is None or saved.rstd_k is None:
-                    raise ValueError("save_for_backward=True with geometry.qk_norm=True needs SavedForBackward.rstd_q and rstd_k tensors to write through")
-            elif saved.rstd_q is not None or saved.rstd_k is not None:
-                raise ValueError(
-                    "geometry.qk_norm=False (RoPE-only) computes no RMSNorm and writes no rstd: SavedForBackward.rstd_q and rstd_k must be None "
-                    "(stage B6 does not exist)"
-                )
-            rstd_q, rstd_k = saved.rstd_q, saved.rstd_k
 
         if self.fuse_norm_rope:
             # (1)+(2)+(3): the fork norms + rotates the Q/K tiles in its
@@ -3763,19 +5604,36 @@ class GatedAttentionBlockFwd(APIBase):
             self._norm_rope.execute(
                 q_src, k_src, w_q_norm, w_k_norm, cos, sin, q_out=q_c, k_out=k_c, rstd_q=rstd_q, rstd_k=rstd_k, current_stream=stream, flat=True
             )
+        if sv is not None and sv.gate_dst is not None:
+            # (3g) TRAINING, gate-copy save mode: the slab's GATE band -> the compact
+            # caller `saved.gate` (ONE strided copy).  q_pre / k_pre likewise, only
+            # when the caller passed buffers -- legal here because training is out
+            # of place, so the slab's Q/K columns are still PRE-norm after (2)+(3).
+            self._gate_copy.execute(gate_src, sv.gate_dst, current_stream=stream)
+            if sv.q_pre_dst is not None:
+                self._gate_copy.execute(q_src, sv.q_pre_dst, current_stream=stream)
+            if sv.k_pre_dst is not None:
+                (self._compact_v if self._compact_v is not None else self._kpre_copy).execute(k_src, sv.k_pre_dst, current_stream=stream)
+        # The NORMED Q/K the quantize stages read: the compact slots when stage (2)+(3)
+        # wrote out of place (training), else the slab bands it normed in place
+        # (inference).  Both quantize artifacts take a dynamic token stride, so one
+        # recipe serves either source.
+        q_n, k_n = (q_c, k_c) if q_c is not None else (q_src, k_src)
         if mxfp8:
-            # (3q) bf16 slab slices -> compact e4m3 + the SDPA's F8_128x4 SF blobs:
-            # Q / K ROWWISE (blocks along D), V COLUMNWISE (blocks along S,
-            # D-plane-major SF).  This IS the compaction the MXFP8 SDPA needs.
-            self._quant_q.execute(q_src, q8, sfq, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
-            self._quant_k.execute(k_src, k8, sfk, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
-            self._quant_v.execute(v_src, v8, sfv, batch=self.batch, seq_len=self.seq_len, current_stream=stream)
+            # (3q) bf16 normed Q/K (+ the slab's V band) -> compact e4m3 + the SDPA's
+            # F8_128x4 SF blobs: Q / K ROWWISE (blocks along D), V COLUMNWISE (blocks
+            # along S, D-plane-major SF).  This IS the compaction the MXFP8 SDPA needs.
+            # THD: the PACKED arm takes the lengths tensor (the very one the SDPA reads) in place of the (1, T) geometry.
+            qkw = dict(seq_lens=seq_lens) if self.thd else dict(batch=self.batch, seq_len=self.seq_len)
+            self._quant_q.execute(q_n, q8, sfq, current_stream=stream, **qkw)
+            self._quant_k.execute(k_n, k8, sfk, current_stream=stream, **qkw)
+            self._quant_v.execute(v_src, v8, sfv, current_stream=stream, **qkw)
             q_c, k_c, v_c = q8, k8, v8
         elif fp8:
-            # (3q) bf16 slab slices -> compact e4m3.  This IS the compaction the
-            # FP8 SDPA needs (its adapter path takes no declared slab strides).
-            self._quant_q.execute(q_src, q8, qd["scale_q"], current_stream=stream)
-            self._quant_kv.execute(k_src, k8, qd["scale_k"], current_stream=stream)
+            # (3q) bf16 normed Q/K (+ the slab's V band) -> compact e4m3.  This IS the
+            # compaction the FP8 SDPA needs (its adapter path takes no declared slab strides).
+            self._quant_q.execute(q_n, q8, qd["scale_q"], current_stream=stream)
+            self._quant_kv.execute(k_n, k8, qd["scale_k"], current_stream=stream)
             self._quant_kv.execute(v_src, v8, qd["scale_v"], current_stream=stream)
             q_c, k_c, v_c = q8, k8, v8
         elif self.inplace_qkv:
@@ -3808,22 +5666,41 @@ class GatedAttentionBlockFwd(APIBase):
         )
         if not self.fuse_gate:
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected
-            # O := 0 on dead rows, so no residue reaches the sigmoid.
-            self._gate.execute(o, gate_src, o, current_stream=stream)
+            # O := 0 on dead rows, so no residue reaches the sigmoid.  In place
+            # under inference (`o_gated is o`); OUT of place under training, where
+            # `o` is the caller's pre-gate saved.o and must survive for dG.
+            self._gate.execute(o, gate_src, o_gated, current_stream=stream)
         if self.o_fp4 is not None:
             # (5q') bf16 gated O -> e2m1 codes + the out_proj GEMM's F8_128x4 blob (block scales, no per-tensor
             # scale); (6') fp4 x fp4 block-scale out projection, both blobs dequantized IN the MMA (no alpha).
-            self._quant_o.execute(o, o4, sfo, current_stream=stream)
+            self._quant_o.execute(o_gated, o4, sfo, current_stream=stream)
             self._out_proj.execute(o4, w_o, out.view(t, g.d_model), engine_ws, sf_a=sfo, sf_w=w_o_sf, stream=stream)
         elif fp8:
             # (5q) bf16 gated O -> e4m3 for the FP8 out projection (PER-TENSOR
             # scale_o under both families, D1); (6) folds (1/scale_o) *
             # descale_w_o into its epilogue.
-            self._quant_o.execute(o, o8, qd["scale_o"], current_stream=stream)
+            self._quant_o.execute(o_gated, o8, qd["scale_o"], current_stream=stream)
             self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
         else:
-            # (6)
-            self._out_proj.execute(o.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
+            # (6) -- reads the gated O: the workspace `o` (inference) or `o_gated` (training).
+            self._out_proj.execute(o_gated.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, stream=stream)
+
+    def _sf_views(self, workspace: torch.Tensor, ws: "_Intermediates") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The three MXFP8 scale-factor slots as flat uint8 views, sized exactly as the carve reserved them: ``_sf_slot_bytes``
+        dense, ``_sf_slot_bytes_packed`` under ``thd`` (the capacity ``n_cap`` tiles per head -- the packed quantize stages write
+        every byte and the SDPA's binder reads the tile extent off the byte count, so Q / K / V are each handed the WHOLE slot)."""
+        g = self.geom
+
+        def nbytes(h: int) -> int:
+            if self.thd:
+                return _sf_slot_bytes_packed(self.num_sequences, h, self.batch * self.seq_len, g.d_head)
+            return _sf_slot_bytes(self.batch, h, self.seq_len, g.d_head)
+
+        return (
+            _view(workspace, ws.sf_q, (nbytes(g.h_q),), torch.uint8),
+            _view(workspace, ws.sf_k, (nbytes(g.h_kv),), torch.uint8),
+            _view(workspace, ws.sf_v, (nbytes(g.h_kv),), torch.uint8),
+        )
 
     def _fp4_o_views(self, workspace: torch.Tensor, ws: "_Intermediates", t: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """The two fp4-O workspace views: ``o4`` -- the packed e2m1 gated O as ``float4_e2m1fn_x2 [T, H_q*D/2]``
@@ -3936,9 +5813,7 @@ class GatedAttentionBlockFwd(APIBase):
         gate16 = _view(workspace, ws.gate16, (t, g.h_q, g.d_head), self.act_dtype)
         # e4m3 O for the per-tensor out_proj, or (o_fp4) bf16 O for the quantize_fp4 stage -- one slot exists, never both.
         o_sdpa = _view(workspace, ws.o8, (t, g.h_q, g.d_head), e4) if self.o_fp4 is None else _view(workspace, ws.o, (t, g.h_q, g.d_head), self.act_dtype)
-        sfq = _view(workspace, ws.sf_q, (_sf_slot_bytes(b, g.h_q, s, g.d_head),), torch.uint8)
-        sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
-        sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(b, g.h_kv, s, g.d_head),), torch.uint8)
+        sfq, sfk, sfv = self._sf_views(workspace, ws)  # the fully fused pipeline is dense-only: the dense slot sizes
         engine_ws = workspace[ws.engine_scratch :]
         # (1''): the runner takes the four data outputs 2-D ([T, h*d]) + the three SF blobs flat.
         self._proj.execute_mxfp8(

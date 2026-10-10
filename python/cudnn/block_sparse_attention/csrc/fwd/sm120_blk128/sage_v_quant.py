@@ -5,8 +5,9 @@
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cuda.bindings.driver as cuda
+
+from cudnn._cutlass_compat import SmemAllocator
 
 
 class SageFp8VQuantizerSm120Blk128:
@@ -74,7 +75,7 @@ class SageFp8VQuantizerSm120Blk128:
         batch_idx = group_idx // num_heads
         dim_idx = tidx % 128
         token_begin = (tidx // 128) * 64
-        sV = utils.SmemAllocator().allocate_tensor(
+        sV = SmemAllocator().allocate_tensor(
             cutlass.Float8E4M3FN,
             smem_layout.outer,
             byte_alignment=128,

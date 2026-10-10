@@ -92,7 +92,11 @@ covering the dense, grouped, and discrete_grouped families,
 native_sparse_attention, and related utilities) are derived from CUTLASS
 CuTe DSL examples. The descriptor definitions in
 python/cudnn/hstu/hstu_attention/_kernels/mma_sm100_desc.py are ported from CUTLASS
-C++ headers. CUTLASS is also consumed at runtime as the nvidia-cutlass-dsl PyPI
+C++ headers. The static persistent tile scheduler under
+python/cudnn/_cutlass_helpers/ is adapted from the BSD-licensed CUTLASS example;
+its source header records the upstream commit and local changes. The upstream
+code retains BSD-3-Clause; local modifications are licensed under Apache-2.0.
+CUTLASS is also consumed at runtime as the nvidia-cutlass-dsl PyPI
 package (optional dependency).
 
 License: BSD 3-Clause License
@@ -158,7 +162,7 @@ License: Apache License 2.0 (same text as this repository's LICENSE.txt)
 6. labml.ai Annotated Deep Learning Paper Implementations
    https://github.com/labmlai/annotated_deep_learning_paper_implementations
 
-The RoPE reference implementation in test/python/test_apply_rope.py is
+The RoPE reference implementation in test/python/rope/graph/test_apply_rope.py is
 derived from labml.ai's annotated implementations, as noted in that
 file.
 

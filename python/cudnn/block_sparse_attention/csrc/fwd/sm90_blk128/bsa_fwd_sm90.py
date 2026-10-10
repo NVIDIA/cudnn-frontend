@@ -11,6 +11,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as hopper
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 from cudnn.block_sparse_attention.csrc.fwd.sm90_blk64.bsa_fwd_sm90 import (
     gemm_zero_acc,
     mask,
@@ -54,8 +55,8 @@ class BlockSparseAttnForwardSm90Blk128:
         dtype = q.element_type
         self.dtype = dtype
         self.out_dtype = o.element_type
-        q_layout = utils.LayoutEnum.ROW_MAJOR
-        v_layout = utils.LayoutEnum.COL_MAJOR
+        q_layout = LayoutEnum.ROW_MAJOR
+        v_layout = LayoutEnum.COL_MAJOR
         qa = cute.nvgpu.warpgroup.make_smem_layout_atom(hopper.get_smem_layout_atom(q_layout, dtype, self.head_dim), dtype)
         va = cute.nvgpu.warpgroup.make_smem_layout_atom(hopper.get_smem_layout_atom(v_layout, dtype, self.value_dim), dtype)
         oa = cute.nvgpu.warpgroup.make_smem_layout_atom(hopper.get_smem_layout_atom(q_layout, o.element_type, self.value_dim), o.element_type)
@@ -155,7 +156,7 @@ class BlockSparseAttnForwardSm90Blk128:
         b = bh // q.shape[2]
         kh = h // self.gqa_ratio
         oh = split * q.shape[2] + h
-        smem = utils.SmemAllocator().allocate(Storage)
+        smem = SmemAllocator().allocate(Storage)
         sq = cute.make_tensor(cute.recast_ptr(smem.q.data_ptr(), qlayout.inner, self.dtype), qlayout.outer)
         sk = smem.k.get_tensor(klayout.outer, swizzle=klayout.inner)
         sv = smem.v.get_tensor(vlayout.outer, swizzle=vlayout.inner)

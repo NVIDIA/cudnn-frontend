@@ -109,6 +109,13 @@ class EngineFamily:
     # pygraph.validate() takes the classic eager C++ lowering instead. None means
     # the family has no native validator and always validates classically.
     validator: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_guard(graph, facts) -> Optional[str]``: a reason the cuDNN
+    # backend must NOT be consulted for this graph at planning (a backend whose heuristics take the
+    # process down on a contract a python engine serves). Planning records the reason as the backend's
+    # decline and ranks the family's own proposals alone; a graph nothing serves then fails with that
+    # reason instead of a dead process. None: the backend is always queried. Rare by contract: a
+    # documented backend defect on a measured domain, never placement policy.
+    backend_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -140,6 +147,7 @@ _ANCHOR_NODE_TO_FAMILY = {
     "SDPA_FP8": "frost_sdpa_fwd",
     "SDPA_MXFP8": "frost_sdpa_fwd",
     "SDPA_BWD": "frost_sdpa_bwd",
+    "SDPA_FP8_BWD": "frost_sdpa_bwd",
     "SDPA_MXFP8_BWD": "frost_sdpa_bwd",
     "GDN": "gdn",
     "GDN_BWD": "gdn",
@@ -241,14 +249,16 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm80": EngineSlot(8, opt_in=True),
             "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
-            "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13, opt_in=True),
+            "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
             "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
-            "sdpa_fwd_prefill_sm107": EngineSlot(15, opt_in=True),
-            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16, opt_in=True),
+            "sdpa_fwd_prefill_sm107": EngineSlot(15),
+            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
+            "sdpa_fwd_prefill_sm90": EngineSlot(17),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
+        backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -258,8 +268,13 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={
             "sdpa_bwd_sm120": EngineSlot(0, opt_in=True),
             "sdpa_bwd_sm80": EngineSlot(1, opt_in=True),
-            "sdpa_bwd_sm100": EngineSlot(2, opt_in=True),
+            "sdpa_bwd_sm100": EngineSlot(2),
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
+            "sdpa_bwd_sm107": EngineSlot(4, opt_in=True),
+            "sdpa_bwd_sm107_fp8": EngineSlot(5, opt_in=True),
+            "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
+            "sdpa_bwd_sm100_d256": EngineSlot(7, opt_in=True),
+            "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -349,6 +364,12 @@ def resolve_validator(family: EngineFamily):
     """The family's python-native graph validator, or None (see EngineFamily.validator)."""
 
     return _resolve(family, family.validator, "validator")
+
+
+def resolve_backend_guard(family: EngineFamily):
+    """The family's backend-query guard, or None (see EngineFamily.backend_guard)."""
+
+    return _resolve(family, family.backend_guard, "backend_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

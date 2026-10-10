@@ -153,8 +153,9 @@ TEST_CASE("Toy sdpa forward with block mask", "[graph][sdpa][flash][block_mask][
     int TILE_M          = 128;
     int TILE_N          = 128;
 
-    if (cudnnGetVersion() < 91400) {
-        SKIP("Test requires cudnn 9.14 or above");
+    // validate() rejects native SM10x block-mask plans on older backends (masked first KV tile bug).
+    if (cudnnGetVersion() < 92600) {
+        SKIP("SDPA block mask on SM10x requires cudnn 9.26 or above");
         return;
     }
 
@@ -184,7 +185,6 @@ TEST_CASE("Toy sdpa forward with block mask", "[graph][sdpa][flash][block_mask][
                                                            TILE_M,
                                                            TILE_N);
 
-    // Supported starting 9.14+
     auto status = graph->validate();
     REQUIRE(status.is_good());
 

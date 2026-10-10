@@ -113,7 +113,7 @@ def _build_graph(case: str, batch: int, m: int, n: int, k: int):
         weight = graph.tensor(name="weight", dim=[batch, k, n], stride=[k * n, 1, k])
         first_token_offset = graph.tensor(
             name="first_token_offset",
-            dim=[batch, 1, 1],
+            dim=[batch + 1, 1, 1],
             stride=[1, 1, 1],
             data_type=cudnn.data_type.INT32,
         )

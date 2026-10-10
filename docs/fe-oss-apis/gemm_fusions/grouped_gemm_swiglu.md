@@ -2,7 +2,7 @@
 
 **This is an experimental API and subject to change.**
 
-**Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified [Grouped GEMM + GLU](grouped_gemm_glu.md) API, which covers dense and discrete weight layouts.
+**Legacy contiguous-only API note:** This page documents the older contiguous-only SwiGLU API. For new integrations, prefer the unified [Grouped GEMM + GLU](grouped_gemm_glu.md) API, which covers dense and discrete weight layouts. This API keeps its signatures and runs the unified GLU kernel with `act_func="swiglu"`, for Torch and JAX.
 
 ## JAX support
 
@@ -282,7 +282,7 @@ api.execute(
 
 - `mma_tiler_mn: Tuple[int, int]`
   - Kernel tile size `(TILE_M, TILE_N)`. Default: `(256, 256)`
-  - `TILE_M ∈ {64, 128, 256}`
+  - `TILE_M ∈ {128, 256}`
   - `TILE_N ∈ {128, 256}`
 
 - `cluster_shape_mn: Tuple[int, int] | None`
@@ -425,8 +425,7 @@ result = compiled(**jax_inputs)
 
 On the wrapper's JAX path, unsupported options raise `ValueError`: non-FP32
 accumulation, non-`n` output layout, scale-vector size other than 32,
-`vector_f32=True`, non-default `m_aligned`, `discrete_col_sfd=True`, and caller
-streams.
+`vector_f32=True`, non-default `m_aligned`, and caller streams.
 
 The Torch alias preserves the existing wrapper signature, including its dtype and
 scale-vector defaults. For example, select MXFP8 explicitly:
@@ -439,10 +438,12 @@ result = grouped_gemm_swiglu(**torch_inputs, d_dtype=torch.float8_e4m3fn, sf_vec
 ```
 
 This initial bridge supports FP8 e4m3/e5m2 A/B and FP8 D, with E8M0 block
-scales of vector size 32. Packed FP4, BF16 D, bias, and discrete-column SF layout
-are outside its contract. Outputs are initialized to zero (raw zero bytes for SF)
-to define untouched padding; backward dprob also requires initialization for atomic
-accumulation. CUDA graph compatibility uses the standard CuTeDSL JAX bridge.
+scales of vector size 32. It is an alias of `grouped_gemm_glu_jax_sm100` with
+`act_func="swiglu"` and `generate_c=True`, so on Rubin (SM107) it runs the Rubin
+GLU kernel, as the Torch path does. `discrete_col_sfd=True` packs column scales
+by expert. Packed FP4, BF16 D, and bias are outside its contract. Outputs are not initialized:
+rows at or past `padded_offsets[-1]` are unspecified, as in the Torch path.
+CUDA graph compatibility uses the standard CuTeDSL JAX bridge.
 This API supplies the fused backward operation explicitly; it does not register
 an automatic `jax.grad` rule. Full TE training integration is separate validation.
 
@@ -496,4 +497,4 @@ an automatic `jax.grad` rule. Full TE training integration is separate validatio
 
 ## Usage Examples
 
-For usage examples, see test cases in `test/python/fe_api/grouped_gemm/test_grouped_gemm_swiglu.py` + `test/python/fe_api/grouped_gemm/test_grouped_gemm_swiglu_utils.py`
+For usage examples, see test cases in `test/python/gemm/cutedsl/test_grouped_gemm_swiglu.py` + `test/python/gemm/cutedsl/test_grouped_gemm_swiglu_utils.py`

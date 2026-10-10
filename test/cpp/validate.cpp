@@ -2,7 +2,9 @@
  * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_message.hpp>
@@ -107,6 +109,165 @@ TEST_CASE("Multiple validation", "[graph][validate]") {
     REQUIRE(graph.validate().is_good());
 }
 
+// ---- validation order for a derived output attribute (#703) ----------------
+//
+// The SDPA forward graph factory creates O with output_tensor(), i.e. as a virtual output that
+// carries no layout, and the node materializes a packed BHSD layout for it during inference.
+// Checking that layout in pre_validate_node() -- which runs before inference -- read "not yet
+// derived" as "invalid" and rejected every graph that left O unset. The node-author rule this
+// pins down lives next to INode::pre_validate_node() in include/cudnn_frontend/node_interface.h.
+namespace {
+namespace fe = cudnn_frontend;
+
+int64_t const kSdpaB = 3;
+int64_t const kSdpaH = 4;
+int64_t const kSdpaS = 128;
+int64_t const kSdpaD = 64;
+
+enum class ODecl {
+    kUndeclared,  // both dim and stride left to inference
+    kDeclared,    // equivalent explicit declaration
+    kDimOnly,     // partial declaration
+    kStrideOnly,  // partial declaration
+    kBadLayout,   // explicit, but the last dimension is strided
+};
+
+struct SdpaCase {
+    std::shared_ptr<fe::graph::Graph> graph;
+    std::shared_ptr<fe::graph::Tensor_attributes> O;
+};
+
+// One graph factory for every case, so that the cases differ only in what the caller declares.
+SdpaCase
+make_sdpa_forward_graph(ODecl o_decl, bool bad_k_stride = false, bool unset_max = false) {
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+    std::vector<int64_t> const bhsd          = {kSdpaB, kSdpaH, kSdpaS, kSdpaD};
+    std::vector<int64_t> const packed_stride = {kSdpaH * kSdpaS * kSdpaD, kSdpaS * kSdpaD, kSdpaD, 1};
+    std::vector<int64_t> const sample_stride = {kSdpaH * kSdpaD, kSdpaD, kSdpaB * kSdpaH * kSdpaD, 1};
+    std::vector<int64_t> const bad_stride    = {kSdpaH * kSdpaS * kSdpaD, kSdpaS * kSdpaD, 1, kSdpaS};
+
+    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q").set_dim(bhsd).set_stride(packed_stride));
+    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K").set_dim(bhsd).set_stride(
+        bad_k_stride ? bad_stride : packed_stride));
+    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V").set_dim(bhsd).set_stride(packed_stride));
+
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("sdpa");
+    if (unset_max) {
+        sdpa_options.set_logit_max(graph->tensor(fe::graph::Tensor_attributes().set_name("Max")));
+    }
+
+    auto results = graph->sdpa(Q, K, V, sdpa_options);
+    auto O       = results[0];
+
+    switch (o_decl) {
+        case ODecl::kUndeclared:
+            break;
+        case ODecl::kDeclared:
+            O->set_dim(bhsd).set_stride(sample_stride);
+            break;
+        case ODecl::kDimOnly:
+            O->set_dim(bhsd);
+            break;
+        case ODecl::kStrideOnly:
+            O->set_stride(sample_stride);
+            break;
+        case ODecl::kBadLayout:
+            O->set_dim(bhsd).set_stride(bad_stride);
+            break;
+    }
+
+    return {graph, O};
+}
+}  // namespace
+
+TEST_CASE("SDPA forward validates a derived output layout after inference",
+          "[graph][sdpa][validate][validation_order]") {
+    SECTION("an undeclared O layout is inferred, so validate() succeeds") {
+        auto c = make_sdpa_forward_graph(ODecl::kUndeclared);
+        REQUIRE(c.O->get_dim().empty());
+        REQUIRE(c.O->get_stride().empty());
+
+        REQUIRE(c.graph->validate().is_good());
+
+        // Inference materialized the packed BHSD layout.
+        REQUIRE(c.O->get_dim() == std::vector<int64_t>{kSdpaB, kSdpaH, kSdpaS, kSdpaD});
+        REQUIRE(c.O->get_stride() == std::vector<int64_t>{kSdpaH * kSdpaS * kSdpaD, kSdpaS * kSdpaD, kSdpaD, 1});
+    }
+
+    SECTION("an explicitly declared O layout is not rewritten") {
+        auto c = make_sdpa_forward_graph(ODecl::kDeclared);
+        REQUIRE(c.graph->validate().is_good());
+        REQUIRE(c.O->get_dim() == std::vector<int64_t>{kSdpaB, kSdpaH, kSdpaS, kSdpaD});
+        REQUIRE(c.O->get_stride() == std::vector<int64_t>{kSdpaH * kSdpaD, kSdpaD, kSdpaB * kSdpaH * kSdpaD, 1});
+    }
+
+    SECTION("a partial O declaration is still rejected") {
+        auto dim_only   = make_sdpa_forward_graph(ODecl::kDimOnly);
+        auto dim_status = dim_only.graph->validate();
+        REQUIRE(dim_status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+        REQUIRE(dim_status.get_message().find("output_names::O") != std::string::npos);
+
+        auto stride_only   = make_sdpa_forward_graph(ODecl::kStrideOnly);
+        auto stride_status = stride_only.graph->validate();
+        REQUIRE(stride_status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+        REQUIRE(stride_status.get_message().find("output_names::O") != std::string::npos);
+    }
+
+    SECTION("an explicitly declared unsupported O layout is still rejected") {
+        auto c      = make_sdpa_forward_graph(ODecl::kBadLayout);
+        auto status = c.graph->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+        REQUIRE(status.get_message().find("output_names::O") != std::string::npos);
+    }
+
+    SECTION("a required input with an unsupported layout is still rejected") {
+        auto c      = make_sdpa_forward_graph(ODecl::kUndeclared, true);
+        auto status = c.graph->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::GRAPH_NOT_SUPPORTED);
+        REQUIRE(status.get_message().find("input_names::K") != std::string::npos);
+    }
+
+    SECTION("repeated validate() stays green and keeps the inferred layout") {
+        auto c = make_sdpa_forward_graph(ODecl::kUndeclared);
+        REQUIRE(c.graph->validate().is_good());
+        auto const once_dim    = c.O->get_dim();
+        auto const once_stride = c.O->get_stride();
+        REQUIRE(c.graph->validate().is_good());
+        REQUIRE(c.graph->validate().is_good());
+        REQUIRE(c.O->get_dim() == once_dim);
+        REQUIRE(c.O->get_stride() == once_stride);
+    }
+
+    SECTION("an optional output the caller left unset is still an error") {
+        auto c      = make_sdpa_forward_graph(ODecl::kDeclared, false, true);
+        auto status = c.graph->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::ATTRIBUTE_NOT_SET);
+        REQUIRE(status.get_message().find("Max") != std::string::npos);
+    }
+}
+
+TEST_CASE("SDPA forward derived output layout survives the expand path", "[graph][sdpa][validate][validation_order]") {
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+
+    auto c = make_sdpa_forward_graph(ODecl::kUndeclared);
+    REQUIRE(c.graph->validate().is_good());
+    auto const inferred_dim    = c.O->get_dim();
+    auto const inferred_stride = c.O->get_stride();
+
+    // expand_subtree(): pre -> infer -> expand -> children -> post. The expansion must keep the
+    // layout inference materialized, not replace or re-derive it.
+    REQUIRE(c.graph->build_operation_graph(handle).is_good());
+    REQUIRE(c.O->get_dim() == inferred_dim);
+    REQUIRE(c.O->get_stride() == inferred_stride);
+
+    cudnnDestroy(handle);
+}
+
 TEST_CASE("SDPA block-mask backend support boundary", "[graph][sdpa][validate]") {
     namespace fe       = cudnn_frontend;
     using Impl         = fe::AttentionImplementation_t;
@@ -162,5 +323,121 @@ TEST_CASE("SDPA block-mask backend support boundary", "[graph][sdpa][validate]")
                 }
             }
         }
+    }
+}
+
+TEST_CASE("Rmsnorm forward without scale", "[graph][rmsnorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    auto make = [](std::vector<int64_t> x_dim, fe::NormFwdPhase_t phase, std::vector<int64_t> inv_var_dim) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        std::vector<int64_t> x_stride(x_dim.size(), 1);
+        for (int i = static_cast<int>(x_dim.size()) - 2; i >= 0; i--) x_stride[i] = x_stride[i + 1] * x_dim[i + 1];
+        auto X       = graph->tensor(fe::graph::Tensor_attributes().set_name("X").set_dim(x_dim).set_stride(x_stride));
+        auto epsilon = graph->tensor(1e-5f);
+        auto options = fe::graph::Rmsnorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        auto [Y, inv_var] = graph->rmsnorm(X, nullptr, options);
+        Y->set_output(true);
+        if (inv_var) {
+            inv_var->set_output(true);
+            if (!inv_var_dim.empty()) {
+                std::vector<int64_t> s(inv_var_dim.size(), 1);
+                for (int i = static_cast<int>(inv_var_dim.size()) - 2; i >= 0; i--)
+                    s[i] = s[i + 1] * inv_var_dim[i + 1];
+                inv_var->set_dim(inv_var_dim).set_stride(s);
+            }
+        }
+        return std::make_pair(graph, inv_var);
+    };
+
+    // One non-unit axis after the first: unambiguous. Training used to dereference the null scale here.
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        auto [graph, inv_var] = make({64, 128, 1, 1}, phase, {});
+        REQUIRE(graph->validate().is_good());
+        if (inv_var) REQUIRE(inv_var->get_dim() == std::vector<int64_t>{64, 1, 1, 1});
+    }
+
+    // {B, S, H}: the backend's inference default and the inferred INV_VARIANCE disagree, so refuse.
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        auto status = make({4, 16, 128}, phase, {}).first->validate();
+        REQUIRE(status.get_code() == fe::error_code_t::INVALID_VALUE);
+    }
+
+    // Explicit INV_VARIANCE dims state the axes.
+    REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, {4, 16, 1}).first->validate().is_good());
+}
+
+TEST_CASE("Layernorm forward with optional scale and bias", "[graph][layernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    // affine: 0 = scale only, 1 = bias only, 2 = neither (scale/bias over the last axis)
+    auto make = [](std::vector<int64_t> x_dim, fe::NormFwdPhase_t phase, int affine, std::vector<int64_t> stats_dim) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        auto packed = [](std::vector<int64_t> const& d) {
+            std::vector<int64_t> s(d.size(), 1);
+            for (int i = static_cast<int>(d.size()) - 2; i >= 0; i--) s[i] = s[i + 1] * d[i + 1];
+            return s;
+        };
+        auto X = graph->tensor(fe::graph::Tensor_attributes().set_name("X").set_dim(x_dim).set_stride(packed(x_dim)));
+        std::vector<int64_t> affine_dim(x_dim.size(), 1);
+        affine_dim.back() = x_dim.back();
+        auto make_affine  = [&](char const* name) {
+            return graph->tensor(
+                fe::graph::Tensor_attributes().set_name(name).set_dim(affine_dim).set_stride(packed(affine_dim)));
+        };
+        std::shared_ptr<fe::graph::Tensor_attributes> scale = affine == 0 ? make_affine("scale") : nullptr;
+        std::shared_ptr<fe::graph::Tensor_attributes> bias  = affine == 1 ? make_affine("bias") : nullptr;
+        auto epsilon                                        = graph->tensor(1e-5f);
+        auto options            = fe::graph::Layernorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        auto [Y, mean, inv_var] = graph->layernorm(X, scale, bias, options);
+        Y->set_output(true);
+        for (auto const& T : {mean, inv_var}) {
+            if (!T) continue;
+            T->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+            if (!stats_dim.empty()) T->set_dim(stats_dim).set_stride(packed(stats_dim));
+        }
+        return std::make_pair(graph, inv_var);
+    };
+
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        // Scale without bias (LayerNorm(bias=False)). This used to dereference the null bias.
+        auto [graph, inv_var] = make({4, 16, 128}, phase, 0, {});
+        REQUIRE(graph->validate().is_good());
+        if (inv_var) REQUIRE(inv_var->get_dim() == std::vector<int64_t>{4, 16, 1});
+
+        // The backend refuses a bias without a scale; say so before it does.
+        REQUIRE(make({4, 16, 128}, phase, 1, {}).first->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+
+        // Neither: unambiguous with one non-unit axis after the first, refused otherwise (as for rmsnorm).
+        auto [plain, plain_inv_var] = make({64, 128, 1, 1}, phase, 2, {});
+        REQUIRE(plain->validate().is_good());
+        if (plain_inv_var) REQUIRE(plain_inv_var->get_dim() == std::vector<int64_t>{64, 1, 1, 1});
+        REQUIRE(make({4, 16, 128}, phase, 2, {}).first->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+    }
+
+    // Explicit stats dims state the axes.
+    REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, 2, {4, 16, 1}).first->validate().is_good());
+}
+
+TEST_CASE("AdaLayernorm forward without bias", "[graph][adalayernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        auto X = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("X").set_dim({4, 16, 128}).set_stride({16 * 128, 128, 1}));
+        auto scale = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("scale").set_dim({4, 1, 128}).set_stride({128, 128, 1}));
+        auto epsilon = graph->tensor(1e-5f);
+        auto options = fe::graph::AdaLayernorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        // The Python binding has always defaulted bias to None; the C++ node used to dereference it.
+        auto [Y, mean, inv_var] = graph->adalayernorm(X, scale, nullptr, options);
+        Y->set_output(true);
+        if (mean) mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+        if (inv_var) inv_var->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+        REQUIRE(graph->validate().is_good());
     }
 }

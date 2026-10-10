@@ -4,33 +4,8 @@
 """Contiguous grouped MXFP8 SwiGLU with quantization through cudnn.jax.call."""
 
 import cutlass
-import cutlass.cute as cute
 
-from cudnn.api_base import TupleDict
-from ..canonical_jax import check_jax_inputs, grouped_call, grouped_plan, output_type, sf_array, sf_shape
-from .api import GroupedGemmSwigluSm100
-
-
-@cute.jit
-def grouped_swiglu_adapter(stream, a, b, sfa, sfb, padded_offsets, alpha, prob, norm_const, c, d, d_col, sfd_row, sfd_col, *, kernel, mac):
-    kernel(
-        a=a,
-        b=b,
-        c=c,
-        d=d,
-        d_col=d_col,
-        sfa=sfa,
-        sfb=sfb,
-        sfd_row_tensor=sfd_row,
-        sfd_col_tensor=sfd_col,
-        amax_tensor=None,
-        norm_const_tensor=norm_const,
-        padded_offsets=padded_offsets,
-        alpha=alpha,
-        prob=prob,
-        max_active_clusters=mac,
-        stream=stream,
-    )
+from ..glu.jax_api import blockscaled_glu_jax
 
 
 def grouped_gemm_swiglu(
@@ -46,6 +21,7 @@ def grouped_gemm_swiglu(
     d_dtype=cutlass.Float8E4M3FN,
     mma_tiler_mn=(256, 256),
     cluster_shape_mn=None,
+    discrete_col_sfd=False,
 ):
     """Canonical MXFP8 forward, eagerly or under jax.jit.
 
@@ -54,45 +30,31 @@ def grouped_gemm_swiglu(
     must be nondecreasing multiples of 256 within [0,m]; m is padded to 256.
     SF buffers contain packed E8M0 MMA-tiled bytes, at any dense rank (uint8
     bit patterns also accepted). Outputs use natural 2-D shapes and physical
-    6-D SF buffers. Output storage is zero-initialized for untouched padding.
+    6-D SF buffers. ``discrete_col_sfd=True`` packs column scales by expert.
+    Rows at or past padded_offsets[-1] are unspecified, as in the torch path.
     Only FP8 A/B and FP8 D are supported. No automatic differentiation rule;
     use cudnn.jax.grouped_gemm_dswiglu for the fused backward operation.
+    Alias of grouped_gemm_glu_jax_sm100's MXFP8 mode with act_func="swiglu"
+    and generate_c=True.
     """
-    inputs = dict(
-        a=a_tensor,
-        b=b_tensor,
-        sfa=sfa_tensor,
-        sfb=sfb_tensor,
+    return blockscaled_glu_jax(
+        a_tensor=a_tensor,
+        b_tensor=b_tensor,
+        sfa_tensor=sfa_tensor,
+        sfb_tensor=sfb_tensor,
         padded_offsets=padded_offsets,
-        alpha=alpha_tensor,
-        prob=prob_tensor,
-        norm_const=norm_const_tensor,
-    )
-    check_jax_inputs(inputs)
-    inputs["sfa"] = sf_array(sfa_tensor)
-    inputs["sfb"] = sf_array(sfb_tensor)
-    m = a_tensor.shape[0]
-    n = b_tensor.shape[1]
-    outputs = dict(
-        c=output_type((m, n), c_dtype),
-        d=output_type((m, n // 2), d_dtype),
-        d_col=output_type((m, n // 2), d_dtype),
-        sfd_row=output_type(sf_shape(m, n // 2), cutlass.Float8E8M0FNU),
-        sfd_col=output_type(sf_shape(n // 2, m), cutlass.Float8E8M0FNU),
-    )
-    kernel, mac = grouped_plan(GroupedGemmSwigluSm100, inputs, outputs, backward=False, mma_tiler_mn=mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
-    result = grouped_call(
-        grouped_swiglu_adapter,
-        kernel,
-        mac,
-        tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
-        tuple(outputs.values()),
-    )(*inputs.values())
-    return TupleDict(
-        c_tensor=result[0],
-        d_tensor=result[1],
-        d_col_tensor=result[2],
-        amax_tensor=None,
-        sfd_row_tensor=result[3],
-        sfd_col_tensor=result[4],
+        alpha_tensor=alpha_tensor,
+        prob_tensor=prob_tensor,
+        norm_const_tensor=norm_const_tensor,
+        c_dtype=c_dtype,
+        d_dtype=d_dtype,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        discrete_col_sfd=discrete_col_sfd,
+        act_func="swiglu",
+        linear_offset=None,
+        geglu_alpha=1.702,
+        glu_clamp_max=7.0,
+        glu_clamp_min=-7.0,
+        generate_c=True,
     )

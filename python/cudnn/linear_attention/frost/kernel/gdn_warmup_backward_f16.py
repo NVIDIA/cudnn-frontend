@@ -18,7 +18,7 @@
 """One compiled launch for everything ahead of the bprop on the GDN warmup and uncut backward: the T pass (with its own
 descriptor prologue), the split-K table (warmup only), the recompute prologue and the checkpoint-series recompute (unless
 the forward's per-chunk series is passed back) and the bprop prologue, all at ``--opt-level 2`` like their standalone
-builds; the bprop itself keeps its standalone ``--opt-level 2`` compile (the bprop module's ``chunk_gdn_bwd_sm100`` /
+builds; the bprop itself keeps its standalone ``--opt-level 2`` compile (the bprop module's ``chunk_gdn_bwd`` /
 ``run_bwd`` without their prologue), so the call sequence is two crossings into the DSL instead of six.  Every kernel, its
 host and the tensor placeholder each host was compiled with are the standalone modules' own; a buffer two hosts read
 through different placeholder types is passed twice (the table's 4-byte compact views of work_items, work_count and
@@ -46,11 +46,9 @@ def warmup_backward_host(
     scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
     safe_gate: cutlass.Constexpr[bool],
-    gate_channels: cutlass.Constexpr[int],
     overhead_chunks: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
-    full_scan: cutlass.Constexpr[bool],
     n_heads_out: cutlass.Int32,
     num_sms: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
@@ -69,7 +67,6 @@ def warmup_backward_host(
     ideal_chunks: cutlass.Int32,
     batch_size: cutlass.Int32,
     log2_thresh: cutlass.Float32,
-    gate_scale_log2: cutlass.Float32,
     n_scan_ctas: cutlass.Int32,
     n_scan_blocks: cutlass.Int32,
     n_walk_ctas: cutlass.Int32,
@@ -127,18 +124,15 @@ def warmup_backward_host(
             scan_rows,
             log_gate,
             safe_gate,
-            gate_channels,
             overhead_chunks,
             expand_num,
             warmup_cap,
-            full_scan,
             n_heads_out,
             num_sms,
             n_tiles,
             ideal_chunks,
             batch_size,
             log2_thresh,
-            gate_scale_log2,
             gate_table,
             a_log_table,
             dt_bias_table,
@@ -300,10 +294,10 @@ def build_warmup_backward(
 ):
     """Compile (cached per static config) the head of the warmup or uncut backward over the buffers of one plan.  The
     placeholders repeat the marks of the standalone builds so every kernel compiles as it does there."""
-    HQ, DK = q.shape[1], q.shape[2]
-    HK = k.shape[1]
-    HV, DV = v.shape[1], v.shape[2]
-    HO = gate.shape[1]
+    _HQ, DK = q.shape[1], q.shape[2]
+    k.shape[1]
+    _HV, DV = v.shape[1], v.shape[2]
+    gate.shape[1]
     if not safe_gate:
         a_log = None
         dt_bias = None
@@ -318,7 +312,6 @@ def build_warmup_backward(
         log2_threshold=None,
         log_gate=log_gate,
         safe_gate=safe_gate,
-        gate_lower_bound=None,
         expand_num=expand_num,
     )
     io_dtype = get_dtype(q.dtype)
@@ -421,11 +414,9 @@ def build_warmup_backward(
             facts.scan_rows,
             facts.log_gate,
             facts.safe_gate,
-            facts.gate_channels,
             facts.overhead_chunks,
             facts.expand_num,
             facts.warmup_cap,
-            facts.full_scan,
             cutlass.Int32(facts.n_heads_out),
             facts.num_sms,
             io_dtype,
@@ -444,7 +435,6 @@ def build_warmup_backward(
             cutlass.Int32(facts.ideal_chunks),
             cutlass.Int32(facts.batch_size),
             cutlass.Float32(facts.log2_threshold),
-            cutlass.Float32(facts.gate_scale_log2),
             cutlass.Int32(facts.n_scan_ctas),
             cutlass.Int32(facts.n_scan_blocks),
             cutlass.Int32(facts.n_walk_ctas),
@@ -549,7 +539,6 @@ def run_warmup_backward(
         facts.ideal_chunks,
         facts.batch_size,
         facts.log2_threshold,
-        facts.gate_scale_log2,
         facts.n_scan_ctas,
         facts.n_scan_blocks,
         facts.n_walk_ctas,

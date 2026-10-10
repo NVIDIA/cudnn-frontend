@@ -26,15 +26,18 @@ Skips cleanly otherwise.
 """
 
 import math
+import re
 from typing import NamedTuple, Optional
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from test_utils import torch_fork_set_rng
 
+from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES
 from cudnn.sdpa.fwd.engines import engine_name
-from frost_test_utils import _SM, make_dense_stats, requires_blackwell, requires_dsl
+from frost_test_utils import _SM, assert_no_new_spills, make_dense_stats, requires_blackwell, requires_dsl, requires_rubin, run_sass_probe, sass_probe_source
 
 
 from frost_test_utils import select_engine as _select_engine  # noqa: F401
@@ -56,15 +59,38 @@ _ARCH = "sm107" if _SM == 107 else "sm100"
 # Rubin.  It runs at cga2 there and only cga2 -- at cga1 that flavor's four
 # scale-factor tiles start past the 256 KiB version-0 tcgen05 descriptor window
 # -- which the row expresses by leaving (192, 128) on its default cgas={2}, so
-# nothing here needs to say so.  THD is still declined row-wide.
-# THD/varlen is not ported to the Rubin MXFP8 kernels: the setup-kernel call
-# site still speaks the pre-upstream 7-arg contract against a 14-arg helper and
-# the metadata layout differs (3B+2 vs 4B+4), so compile() raises and the row
-# declares thd=False.  Flip to False when the THD port lands.
-_skip_thd_mxfp8_on_rubin = pytest.mark.skipif(
-    _SM == 107,
-    reason="THD/varlen not ported to the Rubin MXFP8 kernels (row sets thd=False)",
-)
+# nothing here needs to say so.
+# THD/varlen on the Rubin MXFP8 line is PER SHAPE: the d256 body rides the FROST
+# THD contract with the packed per-sequence-tile-padded scale factors (2026-10-08),
+# the d128 / d192xd128 / d512 bodies still speak the pre-upstream 7-arg setup
+# contract against the 14-arg helper (3B+2 vs 4B+4 metadata), so the row declines
+# them through thd_d_shapes.  The skip reads the row's ONE constant
+# (config_sm107.SM107_MXFP8_THD_SHAPES, rule 8b') so widening the row widens the
+# suite's acceptance sweep with it -- flipping a shape in is a kernel port, never
+# an edit here.
+
+
+def _thd_mxfp8_rubin_skip(d_qk, d_v=None):
+    """Rubin skip for a THD MXFP8 cell at (d_qk, d_v): only the shapes the row's thd_d_shapes leave out."""
+    shape = (d_qk, d_qk if d_v is None else d_v)
+    return pytest.mark.skipif(
+        _SM == 107 and shape not in SM107_MXFP8_THD_SHAPES,
+        reason=f"THD/varlen on the Rubin MXFP8 line serves {sorted(SM107_MXFP8_THD_SHAPES)} only (row thd_d_shapes); {shape} keeps the pre-upstream arm",
+    )
+
+
+_skip_thd_mxfp8_d128_on_rubin = _thd_mxfp8_rubin_skip(128)
+_skip_thd_mxfp8_d192_on_rubin = _thd_mxfp8_rubin_skip(192, 128)
+# The per-d THD cells: one pytest.param per flavor, each carrying its own Rubin skip.
+_D_THD = [pytest.param(d, marks=_thd_mxfp8_rubin_skip(d), id=f"d{d}") for d in (128, 256, 512)]
+_DQK_DV_THD = [
+    pytest.param(dq, dv, marks=_thd_mxfp8_rubin_skip(dq, dv), id=f"d{dq}" if dq == dv else f"d{dq}_d{dv}")
+    for dq, dv in ((128, 128), (192, 128), (256, 256), (512, 512))
+]
+# A finite fp16 sentinel far above any attention output: a cell still holding it was never written.
+_O_SENTINEL = 60000.0
+# A padded Stats row past its sequence length must keep this (or read -inf, a trimmed row), never an LSE.
+_STATS_PAD_SENTINEL = 12345.0
 pytestmark = [requires_blackwell, requires_dsl]
 
 
@@ -73,6 +99,9 @@ _OUT = {"fp16": torch.float16, "bf16": torch.bfloat16, "e4m3": torch.float8_e4m3
 _CUDNN_ITYPE = {"e4m3": "FP8_E4M3", "e5m2": "FP8_E5M2"}
 _CUDNN_OTYPE = {torch.float16: "HALF", torch.bfloat16: "BFLOAT16", torch.float8_e4m3fn: "FP8_E4M3", torch.float8_e5m2: "FP8_E5M2"}
 _BLOCK = 32
+# Block-scaled O (sdpa_mxfp8 + sf_o): "nvfp4" = FP4_E2M1 O + E4M3 scale per 16 d (needs
+# scale_o, the FP4 global scale), "mxfp8" = FP8_E4M3 O + UE8M0 scale per 32 d.
+_BLOCK_SCALED_O = {"nvfp4": 16, "mxfp8": 32}
 
 
 class _ReferenceWithStats(NamedTuple):
@@ -183,6 +212,15 @@ def _ref(
     return finalize(o, torch.logsumexp(scores, dim=-1) if return_stats else None)
 
 
+class _BlockScaledRunResult(NamedTuple):
+    output: torch.Tensor  # dequantized O (B, H, S, d), fp32, in scale_o units
+    reference: torch.Tensor  # fp32 reference O * scale_o
+    amax: float
+    reference_amax: float
+    sf_pad_ok: bool
+    scale_o: float
+
+
 def _run(
     B,
     H_q,
@@ -205,6 +243,11 @@ def _run(
     k_tile_growth: float = 1.0,
     gate: Optional[torch.Tensor] = None,
     amax: bool = True,
+    block_scaled_o=None,
+    sf_o_layout="planes",
+    scale_o=None,
+    capture_first: bool = False,
+    negate_q: bool = False,
 ):
     """Quantize, build the sdpa_mxfp8 graph, route to the frost engine, execute.
 
@@ -230,6 +273,8 @@ def _run(
     dev = "cuda"
     fp8 = _FP8[in_key]
     Qf = torch.randn(B, H_q, S, d_qk, device=dev) * 0.5
+    if negate_q:
+        Qf = -Qf
     Kf = torch.randn(B, H_kv, S, d_qk, device=dev) * 0.5
     if k_tile_growth != 1.0:
         Kf = Kf * (k_tile_growth ** (torch.arange(S, device=dev) // 128).float()).view(1, 1, S, 1)
@@ -242,7 +287,14 @@ def _run(
         return x8.permute(0, 2, 1, 3).contiguous().transpose(1, 2)
 
     Qb, Kb, Vb = bshd(Q8), bshd(K8), bshd(V8)
-    Ob = torch.empty(B, S, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
+    blk = _BLOCK_SCALED_O.get(block_scaled_o, 0)
+    if blk == 16 and not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("the packed FP4 dtype (torch.float4_e2m1fn_x2) needs torch >= 2.8")
+    if blk == 16:
+        # FP4 O: the byte container (two E2M1 per byte) in torch's packed dtype.
+        Ob = torch.full((B, S, H_q, d_v // 2), 0x7F, device=dev, dtype=torch.uint8).view(torch.float4_e2m1fn_x2).transpose(1, 2)
+    else:
+        Ob = torch.empty(B, S, H_q, d_v, device=dev, dtype=out_dt).transpose(1, 2)
     lse = make_dense_stats(B, H_q, S, stats_layout)
     amax_buf = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
     sfq_g = sfq.view(torch.uint8).reshape(B, H_q, sqp, dsc)
@@ -282,6 +334,31 @@ def _run(
         vp[sq_h] = slq
         vp[skv_h] = slk
     kw.update(sdpa_kwargs)
+    sf_o_buf = None
+    if blk:
+        from sdpa.block_scale_o_ref import round_up
+
+        C = max(4, round_up(d_v // blk, 4))
+        if sf_o_layout == "planes":
+            R = round_up(S, 128)
+            sf_o_buf = torch.full((B, H_q, R, C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_stride = [H_q * R * C, R * C, C, 1]
+        else:
+            # token-major: one [B*S (padded to 128), H_q*C] matrix, declared BSHC;
+            # the rows past B*S are caller-owned (pre-zeroed here).
+            R = S
+            sf_o_buf = torch.full((round_up(B * S, 128), H_q * C), 0xAA, device=dev, dtype=torch.uint8)
+            sf_o_buf[B * S :] = 0
+            sf_o_stride = [R * H_q * C, C, H_q * C, 1]
+        sf_dtype = cudnn.data_type.FP8_E4M3 if blk == 16 else cudnn.data_type.FP8_E8M0
+        sf_o_t = g.tensor(dim=[B, H_q, R, C], stride=sf_o_stride, data_type=sf_dtype)
+        kw["sf_o"] = sf_o_t
+        if scale_o is not None:
+            # sdpa_mxfp8 has no per-tensor O scale otherwise: scale_o is the FP4
+            # global scale the block-scaled epilogue folds into O (python-only input).
+            so_g = g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
+            kw["scale_o"] = so_g
+            vp[so_g] = torch.tensor([[[[float(scale_o)]]]], dtype=torch.float32, device=dev)
     o, stats_t, amax_o = g.sdpa_mxfp8(**kw)
     if gate is not None:
         # Epilogue-gate tail: O_v stays VIRTUAL but DECLARED (dim + stride), the mul output is the real O.
@@ -289,7 +366,12 @@ def _run(
         gate_t = g.tensor_like(gate)
         vp[gate_t] = gate
         o = g.mul(a=o, b=g.sigmoid(input=gate_t, name="sig"), name="gated")
-    o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
+    if blk == 16:
+        assert gate is None, "the epilogue gate and a block-scaled O are separate epilogues"
+        # The FP4 O is declared with its LOGICAL element extent; the binding is the byte container.
+        o.set_output(True).set_dim([B, H_q, S, d_v]).set_stride([S * H_q * d_v, d_v, H_q * d_v, 1]).set_data_type(cudnn.data_type.FP4_E2M1)
+    else:
+        o.set_output(True).set_dim(list(Ob.shape)).set_stride(list(Ob.stride())).set_data_type(otype)
     if stats:
         stats_t.set_output(True).set_dim([B, H_q, S, 1]).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
     if amax:
@@ -305,12 +387,15 @@ def _run(
     g.check_support()
     g.build_plans()
     if not stats:
-        # No Stats output: the kernel compiles the LSE store out (has_lse=False)
-        # — no dummy buffer exists at any level, so the dense workspace is 0.
-        assert g.get_workspace_size() == 0
+        # No Stats allocation: prepared scalar-output plans declare only the
+        # quantized scratch words; retained tensor paths need no scratch here.
+        prepared = g._compiled_plans[g._plan_index]._prepared
+        assert g.get_workspace_size() == (128 if prepared is not None else 0)
     vp[o] = Ob
     if amax:
         vp[amax_o] = amax_buf
+    if blk:
+        vp[sf_o_t] = sf_o_buf
     if stats:
         vp[stats_t] = lse
     workspace = torch.empty(max(g.get_workspace_size(), 1), device=dev, dtype=torch.uint8)
@@ -322,6 +407,18 @@ def _run(
         g.execute(poison_vp, workspace)
         torch.cuda.synchronize()
         amax_buf.zero_()
+    if capture_first:
+        # The plan's FIRST execute is CAPTURED and never replayed here: anything
+        # a plan lazily creates and fills on its first execute (a cached identity
+        # scale, say) is allocated but its fill only captured, so the eager
+        # execute below would read it half-initialized (Rule 8; review on #1180).
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(captured):
+                g.execute(vp, workspace)
+            torch.cuda.synchronize()
+        finally:
+            captured.reset()
     g.execute(vp, workspace)
     torch.cuda.synchronize()
 
@@ -332,6 +429,15 @@ def _run(
     def _gated(o_ref):
         return o_ref * torch.sigmoid(gate.float()).to(o_ref.dtype) if gate is not None else o_ref
 
+    if blk:
+        # Dequantize O from (bytes, sf_o) in the declared layout; the reference is
+        # the fp32 O times scale_o (what the epilogue quantizes).
+        from sdpa.block_scale_o_ref import dequant_block_scaled_o
+
+        so = float(scale_o) if scale_o is not None else 1.0
+        o_ref = _ref(Q8.float() * dqq, K8.float() * dqk, V8.float() * dqv, scale=scale, seq_lens_q=seq_lens_q, seq_lens_kv=seq_lens_kv, **ref_kwargs)
+        o_deq, sf_pad_ok = dequant_block_scaled_o(Ob, sf_o_buf, blk, sf_o_layout, B, H_q, S, d_v, C)
+        return _BlockScaledRunResult(o_deq, o_ref * so, amax_buf.item(), o_ref.abs().max().item(), sf_pad_ok, so)
     if return_lse:
         assert stats, "return_lse requires stats=True"
         o_ref, lse_ref = _ref(
@@ -467,9 +573,10 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     )
     assert api.check_support()
     api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
     with pytest.raises(ValueError, match="without Amax_O"):
         api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=torch.empty(1, device=dev, dtype=torch.float32))
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, workspace=workspace)
     torch.cuda.synchronize()
 
     o_ref = _ref(q.float() * dq, k.float() * dk, v.float(), scale=scale, is_causal=True)
@@ -490,7 +597,8 @@ def test_mxfp8_qk_bf16_pv_direct_experiment(h_q, h_kv, d_qk, d_v):
     )
     assert api_amax.check_support()
     api_amax.compile()
-    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o)
+    workspace_amax = torch.empty(api_amax.scratch_workspace_bytes(), dtype=torch.uint8, device=dev)
+    api_amax.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, sf_q=sf_q, sf_k=sf_k, amax_o=amax_o, workspace=workspace_amax)
     torch.cuda.synchronize()
     torch.testing.assert_close(
         amax_o,
@@ -528,6 +636,12 @@ def test_mxfp8_d192_split_kv_publishes_amax_from_combined_output():
         dtype_o=torch.bfloat16,
         split_kv=2,
     )
+
+    if torch.cuda.get_device_capability() == (10, 7):
+        # This SM100 split algorithm is deliberately absent on SM107.
+        with pytest.raises(NotImplementedError, match=r"split_kv > 1 on cc10.7"):
+            api.check_support()
+        return
 
     assert api.check_support()
     api.compile()
@@ -1103,10 +1217,10 @@ def test_mxfp8_d512_strided_stats():
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
-def test_mxfp8_stats_less_zero_workspace(in_key):
+def test_mxfp8_stats_less_declared_workspace(in_key):
     """No Stats output: the kernel compiles the LSE store out (has_lse=False),
-    no dummy buffer exists at any level, and the dense graph reports
-    ``get_workspace_size() == 0`` (asserted inside ``_run``). The Amax_O
+    no LSE dummy exists and the graph reports only its declared quantized
+    scratch (asserted inside ``_run``). The Amax_O
     atomicMax write is independent of the LSE and still produced."""
     scale = 1.0 / math.sqrt(128)
     O, O_ref, _ = _run(2, 8, 8, 256, in_key, torch.float16, scale=scale, sdpa_kwargs=dict(use_causal_mask=True), stats=False)
@@ -1126,6 +1240,20 @@ def test_mxfp8_masks(in_key, mask):
     scale = 1.0 / math.sqrt(128)
     O, O_ref, _ = _run(B, H, H, S, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask])
     _check(O, O_ref, torch.float16, in_key)
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(_SM == 107, reason="the Rubin MXFP8 row has no d64 flavor (exact native shapes only: d_shapes without (64, 64), d_pad_multiple=0)")
+@pytest.mark.parametrize("in_key", _INS)
+@pytest.mark.parametrize("mask", list(_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d64_masks(in_key, mask):
+    """The native d64 leg of the d128 MXFP8 kernel (TemplateParams.d_flavor=64,
+    gpt-oss class): every mask family at d_qk = d_v = 64, cga1, half output."""
+    B, H, S = 2, 8, 256
+    scale = 1.0 / math.sqrt(64)
+    O, O_ref, _ = _run(B, H, H, S, in_key, torch.float16, scale=scale, sdpa_kwargs=_MASKS[mask], d_qk=64, d_v=64)
+    _check(O, O_ref, torch.float16, in_key, d_qk=64)
 
 
 @pytest.mark.L0
@@ -1414,6 +1542,39 @@ def test_mxfp8_dense_padding(in_key, causal):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
+@pytest.mark.L0
+@pytest.mark.parametrize("scale", [1.0, 1.0 / 16], ids=["scale1", "scale16"])
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192x128", "d256", "d512"])
+@torch_fork_set_rng(seed=0)
+def test_masked_leading_tile_with_live_keys_behind_it(d_qk, d_v, scale):
+    """Q 65 x KV 193, bottom-right causal with left bound 34: rows 33..64 see a fully masked FIRST KV tile and their legal
+    keys only in the second, on every MXFP8 prefill flavor.  A kernel that let that tile's mask sentinel become the row's
+    running max published, at |attn_scale * log2 e| >= 1, a shift of -inf - (-inf) = NaN (65,536 nonfinite O elements at
+    d256 on cc 10.7, the #1481 / #1488 reviews' native reproduction) and, at attn_scale 1/16, P = 1 per masked column that
+    only the next live tile's alpha = 0 wiped -- a multiply by zero; the online softmax's running-max step now keeps a tile
+    that is dead ahead of the row's first live key out of the state (alpha = 1, P = 0) on every flavor.  Dequantized Q / K
+    / V = 0.5, so O is exactly 0.5 wherever a row has a legal key and only a NaN / inf can fail this cell.  Paged twin:
+    test_sdpa_fwd_paged_mxfp8_sm107.py::test_masked_leading_tile_with_live_keys_behind_it."""
+    from unittest.mock import patch
+
+    with patch.object(torch, "randn", side_effect=lambda *a, **kw: torch.ones(*a, **kw)):
+        O, O_ref, _ = _run_rect(
+            1,
+            8,
+            65,
+            193,
+            "e5m2",
+            torch.float16,
+            scale=scale,
+            sdpa_kwargs=dict(use_causal_mask_bottom_right=True, diagonal_band_left_bound=34),
+            d_qk=d_qk,
+            d_v=d_v,
+        )
+    assert torch.isfinite(O.float()).all(), "NaN / inf in O: the masked leading tile poisoned rows with legal keys behind it"
+    assert torch.isfinite(O_ref).all()
+    _check(O, O_ref, torch.float16, "e5m2", d_qk=d_qk)
+
+
 def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     """Per-sequence MXFP8 quantization for the THD packing.
 
@@ -1459,9 +1620,23 @@ def _run_thd(
     declare_totals=False,
     d_qk=128,
     d_v=128,
+    sf_slack_tiles=0,
+    o_fill=0.0,
+    stats_layout="token",
+    with_lse_ref=False,
 ):
     """THD/varlen: packed [T,H,D] Q/K/V/O + ragged offsets + per-batch lengths
-    (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF."""
+    (or their cu prefix-sum form) + PACKED per-sequence-TILE-padded SF.
+
+    ``sf_slack_tiles`` appends that many ZERO-filled SF tiles per head to each packed SF
+    buffer (the capacity a packed producer hands the row: n_cap >= Σ_b ceil(s_b/128)); the
+    engine derives the tile extent from the byte size, so the live tiles are unchanged.
+    ``o_fill`` pre-fills the O storage (a sentinel exposes rows the kernel never wrote).
+    ``stats_layout`` picks the Stats declaration under ``stats``: ``"token"`` (ragged token-major TH1, the
+    default), ``"head"`` (ragged head-major ``[h, head_stride]``) or ``"padded"`` (per-batch ``[b, s_max, h]``
+    with NO ragged offsets); the LSE comes back as the live rows ``[T, H]`` in cu_seqlens order whatever the
+    layout.  ``with_lse_ref`` appends the per-sequence natural-log LSE reference (``-inf`` / the sink logit on
+    the rows of a sequence without keys) as a fifth return value."""
     import cudnn
 
     dev = "cuda"
@@ -1513,6 +1688,13 @@ def _run_thd(
     sfq_pk = torch.cat(sfq_seqs, dim=1).contiguous()
     sfk_pk = torch.cat(sfk_seqs, dim=1).contiguous()
     sfv_pk = torch.cat(sfv_seqs, dim=1).contiguous()
+    if sf_slack_tiles:
+        # Slack capacity past the live packed total, zero-filled (E8M0 0x00): the kernel's SF
+        # coordinates stay below cu_sf[B], K and V keep equal tile counts (the binder's rule).
+        def _slack(sf):
+            return torch.cat([sf, torch.zeros((sf.shape[0], sf_slack_tiles, sf.shape[2]), dtype=sf.dtype, device=sf.device)], dim=1).contiguous()
+
+        sfq_pk, sfk_pk, sfv_pk = _slack(sfq_pk), _slack(sfk_pk), _slack(sfv_pk)
 
     def _dense_buf(packed, s_max, h, d, dt):
         # Dense-capacity storage; packed tokens in the leading elements (THD
@@ -1530,7 +1712,7 @@ def _run_thd(
     _, k_gpu, stride_k = _dense_buf(k_pk, S_max_kv, H_kv, d_qk, k_pk.dtype)
     _, v_gpu, stride_v = _dense_buf(v_pk, S_max_kv, H_kv, d_v, v_pk.dtype)
     stride_o = (S_max_q * H_q * d_v, d_v, H_q * d_v, 1)
-    o_stor = torch.zeros(B * S_max_q * H_q * d_v, device=dev, dtype=out_dt)
+    o_stor = torch.full((B * S_max_q * H_q * d_v,), o_fill, device=dev, dtype=out_dt)
     o_gpu = o_stor.as_strided((B, H_q, S_max_q, d_v), stride_o)
     amax = torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.float32)
 
@@ -1619,15 +1801,35 @@ def _run_thd(
     o.set_ragged_offset(oro)
     amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
     stats_stor = None
+    head_stride = 0
     if stats:
-        # Ragged Stats, packed token-major TH1 ([t, h]; offsets = cu_q * h_q).
-        stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
         stats_t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
-        stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
-        stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
-        stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
-        stats_t.set_ragged_offset(stats_ro)
-        vp[stats_ro] = stats_ro_t
+        if stats_layout == "padded":
+            # Per-batch PADDED Stats: [b, s_max, h] storage, NO ragged offsets (that absence is what makes the
+            # graph a padded-Stats one).  Rows past s_b belong to the caller: the KERNEL never writes them (its
+            # row-validity predicate keeps the live tile's tail rows out), while the ENGINE seeds the whole declared
+            # region with -inf ahead of every launch (one memset per execute), so after the run a pad row reads -inf
+            # -- or the sentinel below, had the seed not covered it.  A FINITE value there is a kernel store past
+            # s_b; the check after the run admits -inf or the sentinel and nothing else.
+            stats_stor = torch.full((B * S_max_q * H_q,), _STATS_PAD_SENTINEL, dtype=torch.float32, device=dev)
+            stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
+        else:
+            if stats_layout == "head":
+                # Ragged Stats, packed HEAD-major: [h, head_stride] storage, the head stride a token capacity that
+                # covers the packed total (rounded up to 64 like the backward suite declares it); the kernel adds
+                # cu_q[b] itself, the ragged offsets keep the declaration a packed one (SDPA Rule S1).
+                head_stride = max(64, _cdiv(T_q, 64) * 64)
+                stats_stor = torch.zeros(H_q * head_stride, dtype=torch.float32, device=dev)
+                stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((H_q * head_stride, head_stride, 1, 1))
+            else:
+                assert stats_layout == "token", f"unknown THD Stats layout {stats_layout!r}"
+                # Ragged Stats, packed token-major TH1 ([t, h]; offsets = cu_q * h_q).
+                stats_stor = torch.zeros(B * S_max_q * H_q, dtype=torch.float32, device=dev)
+                stats_t.set_dim((B, H_q, S_max_q, 1)).set_stride((S_max_q * H_q, 1, H_q, 1))
+            stats_ro_t = (ro_q.flatten() // d_qk).view(B + 1, 1, 1, 1).contiguous()
+            stats_ro = g.tensor_like(stats_ro_t, name="stats_ro")
+            stats_t.set_ragged_offset(stats_ro)
+            vp[stats_ro] = stats_ro_t
         vp[stats_t] = stats_stor
 
     g.validate()
@@ -1641,10 +1843,16 @@ def _run_thd(
     torch.cuda.synchronize()
 
     o_ref = torch.zeros(T_q, H_q, d_v, device=dev, dtype=torch.float32)
+    lse_ref = torch.zeros(T_q, H_q, device=dev, dtype=torch.float32) if with_lse_ref else None
     for b in range(B):
-        if cu_q[b + 1] == cu_q[b] or cu_k[b + 1] == cu_k[b]:
-            # Zero-length Q contributes no rows; zero-length KV leaves every
-            # row of the sequence dead — O := 0 (o_ref is pre-zeroed).
+        if cu_q[b + 1] == cu_q[b]:
+            # Zero-length Q contributes no rows.
+            continue
+        if cu_k[b + 1] == cu_k[b]:
+            # Zero-length KV leaves every row of the sequence dead — O := 0 (o_ref is pre-zeroed) and,
+            # sink-less, LSE := -inf; with a sink the sink logit is the row's whole mass.
+            if lse_ref is not None:
+                lse_ref[cu_q[b] : cu_q[b + 1]] = sink.flatten().to(lse_ref) if sink is not None else float("-inf")
             continue
         qd = q8_seqs[b].float() * dq_seqs[b]
         kd = k8_seqs[b].float() * dk_seqs[b]
@@ -1656,15 +1864,30 @@ def _run_thd(
         )
         if sink is not None:
             ref_kw["sinks"] = sink.flatten()
-        ob = _ref(qd, kd, vd, scale=scale, **ref_kw)
+        ob = _ref(qd, kd, vd, scale=scale, return_stats=with_lse_ref, **ref_kw)
+        if with_lse_ref:
+            ob, lse_b = ob
+            lse_ref[cu_q[b] : cu_q[b + 1]] = lse_b.squeeze(0).T
         o_ref[cu_q[b] : cu_q[b + 1]] = ob.squeeze(0).permute(1, 0, 2)
 
     o_out = o_stor[: T_q * H_q * d_v].reshape(T_q, H_q, d_v)
-    lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q) if stats else None
+    lse_out = None
+    if stats:
+        if stats_layout == "padded":
+            padded = stats_stor.view(B, S_max_q, H_q)
+            lse_out = torch.cat([padded[b, : seq_lens_q[b]] for b in range(B)], dim=0)
+            pads = torch.cat([padded[b, seq_lens_q[b] :].reshape(-1) for b in range(B)])
+            assert bool(((pads == _STATS_PAD_SENTINEL) | torch.isneginf(pads)).all()), "a padded Stats row past its sequence length was written"
+        elif stats_layout == "head":
+            lse_out = stats_stor.view(H_q, head_stride)[:, :T_q].T
+        else:
+            lse_out = stats_stor[: T_q * H_q].reshape(T_q, H_q)
+    if with_lse_ref:
+        return o_out, o_ref, amax, lse_out, lse_ref
     return o_out, o_ref, amax, lse_out
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d128_on_rubin
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_declared_totals():
@@ -1689,7 +1912,7 @@ def test_mxfp8_thd_declared_totals():
     assert torch.equal(o_dec, o_inf), "declaring the packed totals must not change O"
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d128_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
@@ -1702,9 +1925,8 @@ def test_mxfp8_thd(in_key, causal):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192_d128", "d256", "d512"])
+@pytest.mark.parametrize("d_qk,d_v", _DQK_DV_THD)
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
@@ -1723,13 +1945,14 @@ def test_mxfp8_thd_multi_unit_per_cta(monkeypatch, in_key, d_qk, d_v):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("causal", [False, True])
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_d256_thd(in_key, causal):
-    """D256 MXFP8 THD uses packed per-sequence SF tiles."""
+    """D256 MXFP8 THD uses packed per-sequence SF tiles.  [160, 96]: a 2-tile sequence, so the second
+    KV tile reads its V scale factors one PACKED (plane-adjacent) slab past the first -- the cell that
+    exposes a plane / tile stride mix-up (LSE exact, O wrong from the second KV tile) on either arch."""
     scale = 1.0 / math.sqrt(256)
     o_out, o_ref, amax, _ = _run_thd(
         [160, 96],
@@ -1747,9 +1970,352 @@ def test_mxfp8_d256_thd(in_key, causal):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("causal", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_sf_slack_capacity(causal):
+    """D256 MXFP8 THD with SF buffers that carry SLACK tiles past the live packed total -- the layout a
+    packed producer hands the row (n_cap >= Σ_b ceil(s_b/128) zero-filled tiles per head) where this
+    suite otherwise binds the EXACT packed layout.  The engine derives the tile extent from the byte
+    size and every kernel SF coordinate stays below cu_sf[B], so O and Amax_O are BITWISE the
+    exact-buffer run (same seed, same draws)."""
+    scale = 1.0 / math.sqrt(256)
+    lens = [160, 96, 300]
+
+    def _run(slack):
+        torch.manual_seed(0)  # each call draws its own inputs -- pin them so the two runs are comparable
+        return _run_thd(lens, lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=causal, d_qk=256, d_v=256, sf_slack_tiles=slack)
+
+    o_exact, o_ref, amax_exact, _ = _run(0)
+    o_slack, _, amax_slack, _ = _run(len(lens))
+    _check(o_exact, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert torch.equal(o_slack, o_exact), "SF slack capacity past the packed total must not change O"
+    assert torch.equal(amax_slack, amax_exact)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_trailing_empty_sequence(causal):
+    """A zero-length sequence LAST ([300, 200, 0]; the existing zero-length cell puts it first or in the
+    middle): cu_sf[B] == cu_sf[B-1], so the slack begins right after the last live tile and the dead-unit
+    path runs with nothing behind it.  O is sentinel-filled before the launch: every live row must be
+    written (no sentinel survives) and match the per-sequence reference, and the NaN-poisoned capacity
+    tail of the inputs must not leak through the clamped K/V maps."""
+    scale = 1.0 / math.sqrt(256)
+    lens = [300, 200, 0]
+    o_out, o_ref, amax, _ = _run_thd(lens, lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=causal, d_qk=256, d_v=256, o_fill=_O_SENTINEL)
+    assert torch.isfinite(o_out.float()).all()
+    assert (o_out.float().abs() < _O_SENTINEL / 2).all(), "a live O row was never written (the sentinel survived)"
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+# The THD Stats VALUE bound: the per-tensor FP8 THD suite's own (test_sdpa_fwd_fp8_sm100.py::test_fp8_thd_stats), a
+# natural-log LSE of the dequantized problem against the kernel's fp32 one.
+_THD_STATS_ATOL, _THD_STATS_RTOL = 2e-2, 2e-2
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("layout", ["token", "head", "padded"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_layouts(layout):
+    """D256 MXFP8 THD Stats VALUES in each layout the row serves: ragged token-major TH1, ragged head-major
+    [h, head_stride] (the kernel adds cu_q[b] itself) and per-batch padded [b, s_max, h] (no ragged offsets; a row
+    past its sequence length is never written).  Every live row is the natural-log log-sum-exp of the dequantized
+    problem; [200, 150] causal, so the second sequence's rows sit past a tile boundary of the first."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        [200, 150],
+        [200, 150],
+        8,
+        8,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        causal=True,
+        stats=True,
+        d_qk=256,
+        d_v=256,
+        stats_layout=layout,
+        with_lse_ref=True,
+    )
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse is not None and lse.shape == lse_ref.shape and torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_zero_len_kv():
+    """The packed Stats of a sequence with NO key ([126, 0, 60] / [0, 83, 77]): every row of sequence 0 reads
+    LSE = -inf next to O = 0 (no sink), the zero-length-Q sequence writes nothing, and the live sequence's rows
+    are the log-sum-exp of its own keys -- the reference carries the -inf rows, so the comparison pins them."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, _, lse, lse_ref = _run_thd(
+        [126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale, stats=True, d_qk=256, d_v=256, with_lse_ref=True
+    )
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert torch.isneginf(lse[:126]).all(), "a keyless row's LSE must be -inf"
+    assert (o_out[:126].float() == 0).all(), "a keyless row's O must be 0"
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+# Per-sequence attribution shapes: tile-ragged lengths, one to three packed sequences; the bottom-right set keeps
+# every Q shorter than its KV so each sequence's diagonal is its own.
+_ATTRIBUTION_LENS = {1: ([300], [300]), 2: ([300, 200], [300, 200]), 3: ([300, 200, 129], [300, 200, 129])}
+_ATTRIBUTION_LENS_BR = {1: ([173], [257]), 2: ([173, 97], [257, 193]), 3: ([173, 97, 300], [257, 193, 384])}
+
+
+def _check_per_sequence(o_out, o_ref, seq_lens_q, in_key, d_qk):
+    """``_check`` per packed sequence, naming the one that misses: a wrong batch attribution leaves sequence 0
+    exact and a later sequence plausible-but-wrong, which a whole-buffer max|O - ref| reports without a name."""
+    cu = 0
+    for b, s in enumerate(seq_lens_q):
+        if s == 0:
+            continue  # a zero-length sequence owns no rows (and _check cannot reduce an empty slice)
+        try:
+            _check(o_out[cu : cu + s], o_ref[cu : cu + s], torch.float16, in_key, d_qk=d_qk)
+        except AssertionError as e:
+            raise AssertionError(f"sequence {b} of {len(seq_lens_q)} (packed rows {cu}:{cu + s}): {e}") from None
+        cu += s
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("mask", ["none", "causal", "br"])
+@pytest.mark.parametrize("n_seq", [1, 2, 3])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_attribution(n_seq, mask):
+    """Per-sequence attribution at d256: one to three packed sequences of tile-ragged length under none / causal /
+    bottom-right, each sequence checked on its own rows.  A Q / K / V / scale-factor coordinate that keeps a dense
+    form through the THD contract is SILENT in a whole-buffer check (sequence 0 exact, the later ones plausible)."""
+    q_lens, kv_lens = (_ATTRIBUTION_LENS_BR if mask == "br" else _ATTRIBUTION_LENS)[n_seq]
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, _ = _run_thd(
+        q_lens, kv_lens, 8, 8, "e4m3", torch.float16, scale=scale, causal=mask == "causal", bottom_right=mask == "br", d_qk=256, d_v=256
+    )
+    _check_per_sequence(o_out, o_ref, q_lens, "e4m3", 256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_single_unit():
+    """ONE live unit in the whole launch: one sequence of one Q tile and one KV tile, ONE head (B * H = 1, n_kv = 1),
+    so the persistent grid is a single CTA whose first claim off the counter is already the end-of-work handout; O, the
+    token-major LSE and Amax_O all pinned on it."""
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd([96], [96], 1, 1, "e4m3", torch.float16, scale=scale, stats=True, d_qk=256, d_v=256, with_lse_ref=True)
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_padded_stats_dead_units():
+    """Per-batch PADDED Stats next to DEAD units.  [300, 200, 0] causal puts the live total (40 units) below the
+    resident CTA count, so the persistent grid's initial claims past the live total are dead units, whose Stats write and
+    Amax_O fold must stay off a padded Stats buffer that has NO ragged offsets (rows at b * s_max); the trailing
+    zero-length sequence owns no rows at all.  O is sentinel-filled (every live row must be written), each live sequence
+    is checked on its own rows, every pad row of the padded Stats reads -inf or the sentinel (asserted inside _run_thd),
+    and the live rows are the per-sequence natural-log log-sum-exp."""
+    scale = 1.0 / math.sqrt(256)
+    lens = [300, 200, 0]
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        lens,
+        lens,
+        8,
+        8,
+        "e4m3",
+        torch.float16,
+        scale=scale,
+        causal=True,
+        stats=True,
+        d_qk=256,
+        d_v=256,
+        o_fill=_O_SENTINEL,
+        stats_layout="padded",
+        with_lse_ref=True,
+    )
+    assert torch.isfinite(o_out.float()).all()
+    assert (o_out.float().abs() < _O_SENTINEL / 2).all(), "a live O row was never written (the sentinel survived)"
+    _check_per_sequence(o_out, o_ref, lens, "e4m3", 256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse.shape == lse_ref.shape and torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_sink_zero_len_kv():
+    """A keyless sequence WITH an attention sink publishes LSE = its head's sink logit -- never -inf, the sink is mass
+    -- next to O = 0: [126, 0, 60] / [0, 83, 77] causal with a per-head sink and token-major Stats.  The reference carries
+    the sink rows for the keyless sequence; the live sequence's rows are its own log-sum-exp with the sink folded in."""
+    scale = 1.0 / math.sqrt(256)
+    sink = torch.randn(1, 8, 1, 1, dtype=torch.float32, device="cuda")
+    o_out, o_ref, _, lse, lse_ref = _run_thd(
+        [126, 0, 60], [0, 83, 77], 8, 8, "e4m3", torch.float16, scale=scale, causal=True, sink=sink, stats=True, d_qk=256, d_v=256, with_lse_ref=True
+    )
+    _check(o_out, o_ref, torch.float16, "e4m3", d_qk=256)
+    assert (o_out[:126].float() == 0).all(), "a keyless row's O must be 0"
+    assert torch.isfinite(lse).all(), "a keyless row's LSE under a sink is the sink logit, never -inf"
+    assert torch.equal(lse_ref[:126], sink.flatten().expand(126, 8))  # the reference's keyless rows ARE the sink logits
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_stats_e5m2_swa_br_gqa():
+    """E5M2 Stats VALUES under the masked arms at once: three packed sequences with Q shorter than KV
+    ([173, 97, 300] / [257, 193, 384]), bottom-right diagonal, sliding window 73, GQA 8/2, head-major Stats -- each
+    sequence's O on its own rows, every live row's LSE the natural-log log-sum-exp of the dequantized problem."""
+    q_lens, kv_lens = [173, 97, 300], [257, 193, 384]
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        q_lens,
+        kv_lens,
+        8,
+        2,
+        "e5m2",
+        torch.float16,
+        scale=scale,
+        bottom_right=True,
+        swa_window=73,
+        stats=True,
+        d_qk=256,
+        d_v=256,
+        stats_layout="head",
+        with_lse_ref=True,
+    )
+    _check_per_sequence(o_out, o_ref, q_lens, "e5m2", 256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+# A row whose FIRST KV tile is fully masked while a LATER tile holds its keys: Q 65 / KV 193 packed, bottom-right diagonal (the keys
+# sit 128 back), left bound 34 -> rows 33..64 have no key in tile 0 (keys 0..127) and their 34 keys in tile 1.  At attn_scale 1
+# (scale_log2 > 1) the finite mask sentinel, taken as the running max, overflowed to -inf and the exp2 shift read -inf - (-inf) =
+# NaN into P: 65,536 NaN O elements on those rows, and 256 non-finite Stats once a sink folded the NaN row-sum.  At attn_scale 1/16
+# the same tile published P = 1 per masked column and the next live tile's alpha = 0 wiped it (the control that passed).  The fix
+# selects a tile that is dead ahead of the row's first live key out of the running state (total_max kept, alpha = 1, P = 0).  The
+# inputs are the all-ones draw the report used: every logit equal, a flat softmax (O = V on every live row) the e5m2 P cast
+# resolves, so the cells are deterministic; the module's own oracle and tolerances judge them.
+def _thd_masked_leading_tile(*, scale, sink, swa_window=33):
+    sink_t = torch.zeros(1, 8, 1, 1, dtype=torch.float32, device="cuda") if sink else None
+    with patch.object(torch, "randn", side_effect=lambda *a, **k: torch.ones(*a, **k)):
+        return _run_thd(
+            [65],
+            [193],
+            8,
+            2,
+            "e5m2",
+            torch.float16,
+            scale=scale,
+            bottom_right=True,
+            swa_window=swa_window,
+            sink=sink_t,
+            stats=True,
+            d_qk=256,
+            d_v=256,
+            stats_layout="token",
+            with_lse_ref=True,
+        )
+
+
+def _assert_masked_leading_tile_cell(o_out, o_ref, amax, lse, lse_ref):
+    assert torch.isfinite(o_ref).all() and torch.isfinite(lse_ref).all(), "every row has keys: the oracle is finite"
+    assert torch.isfinite(o_out.float()).all(), f"{int((~torch.isfinite(o_out.float())).sum())} non-finite O elements"
+    assert torch.isfinite(lse).all(), f"{int((~torch.isfinite(lse)).sum())} non-finite Stats"
+    _check_per_sequence(o_out, o_ref, [65], "e5m2", 256)
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sink", [False, True], ids=["nosink", "sink0"])
+def test_mxfp8_d256_thd_masked_leading_tile_keeps_rows_with_later_keys_finite(sink):
+    """THD rows 33..64 of a 65-row sequence see their first KV tile fully masked and their keys in the next one (bottom-right,
+    left bound 34) at attn_scale 1: O and Stats finite and at the oracle, without a sink and with a zero-logit one (the sink
+    fold reads the same running max / row-sum)."""
+    _assert_masked_leading_tile_cell(*_thd_masked_leading_tile(scale=1.0, sink=sink))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale, sink, swa_window", [(1.0 / 16, False, 33), (1.0, True, None)], ids=["scale16-window", "scale1-sink-nowindow"])
+def test_mxfp8_d256_thd_masked_leading_tile_controls(scale, sink, swa_window):
+    """The two controls of the same geometry: attn_scale 1/16 under the window (the scaled sentinel stays finite) and attn_scale
+    1 with a sink and no window (no row has a dead leading tile) -- both at the oracle before and after the fix."""
+    _assert_masked_leading_tile_cell(*_thd_masked_leading_tile(scale=scale, sink=sink, swa_window=swa_window))
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("in_key", _INS)
+def test_mxfp8_d256_dense_masked_leading_tile_keeps_rows_with_later_keys_finite(in_key):
+    """The dense twin of the geometry on both FP8 formats: top-left causal with left bound 34 at S = 256 -- rows 161..255 have no key
+    in tile 0 and their 34 keys in tile 1 -- at attn_scale 1 (the same all-ones draw).  The body is shared by the dense and THD
+    launches, so a dense graph with this band hits the same rows."""
+    with patch.object(torch, "randn", side_effect=lambda *a, **k: torch.ones(*a, **k)):
+        res = _run(
+            1,
+            8,
+            2,
+            256,
+            in_key,
+            torch.float16,
+            scale=1.0,
+            sdpa_kwargs=dict(use_causal_mask=True, diagonal_band_left_bound=34),
+            stats=True,
+            d_qk=256,
+            d_v=256,
+            return_lse=True,
+        )
+    assert torch.isfinite(res.reference).all() and torch.isfinite(res.reference_stats).all()
+    assert torch.isfinite(res.output.float()).all(), f"{int((~torch.isfinite(res.output.float())).sum())} non-finite O elements"
+    assert torch.isfinite(res.stats).all(), f"{int((~torch.isfinite(res.stats)).sum())} non-finite Stats"
+    _check(res.output, res.reference, torch.float16, in_key, d_qk=256)
+    torch.testing.assert_close(res.stats, res.reference_stats, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_d256_thd_mqa():
+    """MQA -- eight Q heads over ONE K / V head -- at d256 under THD: [300, 129] causal with token-major Stats, two packed
+    sequences of tile-ragged length, each checked on its own rows.  The kernel keys every K / V tile and scale-factor load
+    on the KV head (head_idx // qh_per_kh) and the V scale factors' (batch, kv-head) coordinate on the KV head count, so
+    MQA is the degenerate end (n_kh = 1) of the arithmetic the GQA 8/2 cells share: a load keyed on the Q head instead
+    reads past the single packed K / V slab (TMA zero-fills it) -- head 0 exact, the other seven heads plausible-but-wrong
+    -- which the per-sequence O check and the Stats values catch."""
+    q_lens = [300, 129]
+    scale = 1.0 / math.sqrt(256)
+    o_out, o_ref, amax, lse, lse_ref = _run_thd(
+        q_lens, q_lens, 8, 1, "e4m3", torch.float16, scale=scale, causal=True, stats=True, d_qk=256, d_v=256, with_lse_ref=True
+    )
+    _check_per_sequence(o_out, o_ref, q_lens, "e4m3", 256)
+    assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
+    assert lse.shape == lse_ref.shape and torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_ref, atol=_THD_STATS_ATOL, rtol=_THD_STATS_RTOL)
+
+
+@requires_rubin
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (192, 128), (512, 512)], ids=["d128", "d192_d128", "d512"])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_unported_shapes_offer_no_rubin_plan(d_qk, d_v):
+    """The graph path at the three MXFP8 shapes whose Rubin body keeps the pre-upstream THD arm: the row's
+    thd_d_shapes (SM107_MXFP8_THD_SHAPES) leaves NO plan of the Rubin MXFP8 engine for a THD graph there, so the
+    suite's engine pin finds none (its assertion names the plan list) and no unported body is ever launched.  The
+    typed text behind it is mismatch()'s, pinned by the rows-iterating host test; the standalone wrapper's twin
+    decline is pinned next to it."""
+    assert (d_qk, d_v) not in SM107_MXFP8_THD_SHAPES
+    with pytest.raises(AssertionError, match="no plan for engine"):
+        _run_thd([160, 96], [160, 96], 8, 8, "e4m3", torch.float16, scale=1.0 / math.sqrt(d_qk), causal=True, d_qk=d_qk, d_v=d_v)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d", _D_THD)
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("bottom_right", [False, True])
 @torch_fork_set_rng(seed=0)
@@ -1778,9 +2344,8 @@ def test_mxfp8_thd_sliding_window(d, in_key, bottom_right):
     assert lse is not None and torch.isfinite(lse).all()
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cross_gqa(d):
     """THD cross-attention (unequal packed Q and K/V totals) with GQA heads."""
@@ -1789,9 +2354,8 @@ def test_mxfp8_thd_cross_gqa(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_sink(d):
     """THD causal + attention sink."""
@@ -1801,9 +2365,8 @@ def test_mxfp8_thd_sink(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_stats(d):
     """THD + generate_stats: the ragged token-major TH1 LSE is written next to O."""
@@ -1813,9 +2376,8 @@ def test_mxfp8_thd_stats(d):
     assert lse is not None and torch.isfinite(lse).all()
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_zero_len_kv(d):
     """Zero-length Q and KV sequences (test_mhas_v2 ragged parity): the
@@ -1826,9 +2388,8 @@ def test_mxfp8_thd_zero_len_kv(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256, 512], ids=["d128", "d256", "d512"])
+@pytest.mark.parametrize("d", _D_THD)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_cu_seq_len(d):
     """THD via the (B+1,) cu_seq_len prefix-sum length form."""
@@ -1848,7 +2409,7 @@ def test_mxfp8_thd_cu_seq_len(d):
     _check(o_out, o_ref, torch.float16, "e4m3", d_qk=d)
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d192_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
@@ -1874,7 +2435,7 @@ def test_mxfp8_d192_d128_thd_cross_gqa_stats(in_key):
     assert lse is not None and torch.isfinite(lse).all()
 
 
-@_skip_thd_mxfp8_on_rubin
+@_skip_thd_mxfp8_d192_on_rubin
 @pytest.mark.L0
 @pytest.mark.parametrize("in_key", _INS)
 @pytest.mark.parametrize("mask", ["causal_br", "swa"])
@@ -1902,9 +2463,8 @@ def test_mxfp8_d192_d128_thd_mask_variants(in_key, mask):
     assert abs(amax.item() - o_ref.abs().max().item()) <= 0.03
 
 
-@_skip_thd_mxfp8_on_rubin
 @pytest.mark.L0
-@pytest.mark.parametrize("d_qk", [128, 192])
+@pytest.mark.parametrize("d_qk", [pytest.param(128, marks=_thd_mxfp8_rubin_skip(128, 128)), pytest.param(192, marks=_thd_mxfp8_rubin_skip(192, 128))])
 @pytest.mark.parametrize("in_key", _INS)
 @torch_fork_set_rng(seed=0)
 def test_mxfp8_thd_nonfinite_v_sf_padding(d_qk, in_key, monkeypatch):
@@ -1963,10 +2523,488 @@ def test_mxfp8_stats_log2_every_flavor(d_qk, d_v):
         api = SdpaFwdDslSm100(sample_q=q, sample_k=k, sample_v=v, sample_o=o, sample_lse=lse, scale_softmax=d_qk**-0.5, stats_log2=log2, split_kv=1)
         assert api.check_support()
         api.compile()
-        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv)
+        workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=workspace)
         torch.cuda.synchronize()
         want = expected * (math.log2(math.e) if log2 else 1.0)
         torch.testing.assert_close(lse, torch.full_like(lse, want.item()), atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(o, torch.full_like(o, 0.5), atol=1e-2, rtol=1e-2)
         outputs.append(o)
     torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+
+
+# --- Block-scaled O (sf_o): NVFP4 / MXFP8 output on the MXFP8-input kernel -------------
+def _check_block_scaled(res: _BlockScaledRunResult, blk: int, in_key: str):
+    """Kernel dequant vs fp32 reference: within the MXFP8 pipeline tolerance (in
+    scale_o units) plus three times the pure block-quantization floor of the
+    reference itself; per-plane pad rows zero; Amax_O the pre-scale amax."""
+    from sdpa.block_scale_o_ref import quantize_o_mxfp8, quantize_o_nvfp4
+
+    ref = res.reference
+    _, _, ref_q = (quantize_o_nvfp4 if blk == 16 else quantize_o_mxfp8)(ref)
+    floor = (ref_q - ref).abs().max().item()
+    diff = (res.output - ref).abs().max().item()
+    atol = max(_half_atol(in_key, 128) * res.scale_o, 3.0 * floor)
+    assert not torch.isnan(res.output).any(), "NaN in dequantized O"
+    assert diff <= atol, f"max|O-ref|={diff:.4f} > {atol:.4f} (quantization floor {floor:.4f})"
+    assert res.sf_pad_ok, "sf_o pad rows past S must be zero"
+    assert abs(res.amax - res.reference_amax) <= 0.03, f"amax_o {res.amax:.4f} vs ref {res.reference_amax:.4f}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("sf_o_layout", ["planes", "token_major"])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+@pytest.mark.parametrize("mode", list(_BLOCK_SCALED_O))
+@torch_fork_set_rng(seed=71)
+def test_mxfp8_block_scaled_output(mode, mask, sf_o_layout):
+    """Block-scaled O epilogue (sf_o) on the d128 MXFP8-input kernel: FP4 O + E4M3/16
+    scales with scale_o as the FP4 global scale, or E4M3 O + UE8M0/32 scales without
+    a scale. The causal case runs S = 300 -- a partially valid tail tile whose
+    per-plane pad rows must come back zero (the MXFP8 kernel takes a dense KV
+    tail only under a mask that covers it, so the unmasked case runs S = 256) --
+    B > 1 the plane / token-major row bookkeeping, GQA the head -> plane mapping.
+    Runs on the whole SM100 line (_ARCH picks the Rubin kernel there)."""
+    blk = _BLOCK_SCALED_O[mode]
+    res = _run(
+        2,
+        4,
+        2,
+        300 if mask == "causal" else 256,
+        "e4m3",
+        torch.float8_e4m3fn,
+        scale=1.0 / math.sqrt(128),
+        sdpa_kwargs=_MASKS[mask],
+        block_scaled_o=mode,
+        sf_o_layout=sf_o_layout,
+        scale_o=3.0 if mode == "nvfp4" else None,
+    )
+    _check_block_scaled(res, blk, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=72)
+def test_mxfp8_block_scaled_mxfp8_out_with_scale_o():
+    """The UE8M0 mode accepts an optional scale_o too (folded into O, divided back
+    out of Amax_O), so both modes share one contract with sdpa_fp8."""
+    res = _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, block_scaled_o="mxfp8", scale_o=0.5)
+    _check_block_scaled(res, 32, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=75)
+def test_mxfp8_block_scaled_omitted_scale_o_first_execute_captured_then_eager():
+    """UE8M0 mode without scale_o: the identity scale is a compile-time fold of
+    the kernel, not a device constant the plan creates on its first execute.
+    First execute CAPTURED (never replayed), then an eager execute -- O and the
+    pre-scale Amax_O must be right (review on #1180: the cached-dummy version
+    returned all-zero O and a NaN amax here)."""
+    res = _run(2, 4, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, block_scaled_o="mxfp8", scale_o=None, capture_first=True)
+    _check_block_scaled(res, 32, "e4m3")
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=73)
+def test_mxfp8_block_scaled_fp4_requires_scale_o():
+    """An FP4 O without scale_o is rejected at validate: the E4M3 block scale alone
+    cannot span O's range, and sdpa_mxfp8 has no other per-tensor O scale."""
+    import cudnn
+
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
+        _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / math.sqrt(128), sdpa_kwargs={}, block_scaled_o="nvfp4", scale_o=None)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=74)
+def test_mxfp8_block_scaled_output_declines_wide_flavor():
+    """sf_o is a d128-only epilogue: a d256 MXFP8 graph requesting it has no engine."""
+    import cudnn
+
+    with pytest.raises((cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError)):
+        _run(1, 2, 2, 256, "e4m3", torch.float8_e4m3fn, scale=1.0 / 16, sdpa_kwargs={}, d_qk=256, d_v=256, block_scaled_o="mxfp8")
+
+
+# ============================================================================ sm100 d128 MXFP8: the exp2 MUFU / FMA split and the Amax_O fold, pinned on the SASS per arch
+# Both are invisible to every numerics test (O to the bf16 rounding, LSE within 6e-6, Amax_O exact before and after) and
+# worth +10.9 % at S=16K on B200 (`sm100/prefill_d128_mxfp8.py`, the `_E2E_*` block).  The only tripwire is the SASS, so
+# these pins compile the kernel here for the target arch (`CUTE_DSL_ARCH` needs no matching device -- the module-level
+# `requires_blackwell` is what confines them to the Blackwell-line lanes) and count the instructions.  Two arms, one per
+# cc the sm100 rows serve: sm_100a with the cc 10.0 record the adapter builds (exp2_fma_split=True: the split is ON) and
+# sm_103a with the cc 10.3 record (fused_ldtm_stat=True, exp2_fma_split=False: GB300's MUFU.EX2 runs at twice B200's rate,
+# so the split is folded OUT and the kernel issues develop's 258 MUFU.EX2).  SKIPS when no nvdisasm on $CUDA_PATH/bin or
+# $PATH decodes the cubin; a compile failure is a FAIL.
+_SM100_D128_MXFP8_SASS_PROBE = sass_probe_source("""
+    # The PRODUCTION geometry from the adapter itself (cga2), E4M3 in, BF16 out, GQA 24/8, Stats + Amax_O -- the shape
+    # the split was tuned and measured on (B=1 H=24/8 S=16K dense); the per-cc fields (fused_ldtm_stat, exp2_fma_split)
+    # come from the caller as the record api_dsl.template_params() builds for that device.
+    (cta_mma,) = supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False)
+    params = TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, qh_per_kh=3, sched_policy=0, emit_amax_o=True, **params_kw)
+    mod = _load_sm100_kernel_module((128, 128), params, fp8=True, pertensor=False, rubin=False)
+    # MUFU.EX2 the kernel must carry: per softmax body one alpha exp2 plus the non-emulated columns, traced once per
+    # softmax warpgroup (sub-tile) -- derived from the module, so the pin follows the pattern (and the gate) rather
+    # than a literal.
+    n_bodies = 2 if getattr(mod.CFG, "SOFTMAX_WARPGROUPS", 2) == 2 else 1
+    print("EXPECT_MUFU_EX2", n_bodies * (mod.CFG.TILE_N - mod._E2E_EMULATED_COLS + 1))
+    print("EMULATED_COLS", mod._E2E_EMULATED_COLS)
+    print("E2E_ENABLED", int(mod._E2E_ENABLED))
+    mod.compile_prepared(d_qk=128, d_v=128, has_lse=True)
+    """)
+
+# sm_100a counts of the shipped kernel (2026-09-22, PRODUCTION geometry, this probe's shape), all MEASURED on the
+# trace-compiled cubin that is md5-identical to the one A/B'd on B200:  MUFU.EX2 258 -> 194 (2 x 97), FFMA2 130 -> 226
+# and FADD2 126 -> 222 (+3 each per emulated pair), FSETP 782 -> 19, FSEL 780 -> 270 (the 256 row_dead selects stay),
+# FMNMX3 124 -> 252, STL 3 / LDL 3 unchanged (none in the softmax loops), REG 128.  Slack 16 tolerates unrelated ptxas
+# drift and still catches one site: a fold site regressing to compare+select adds >= 384 FSETP, one emulated pair
+# falling back to MUFU adds 2 MUFU.EX2 and drops 3 FFMA2 (the MUFU count is pinned EXACTLY, derived from the module).
+# The cc 10.3 arm (sm_103a, fused_ldtm_stat=True, exp2_fma_split=False), MEASURED the same day: MUFU.EX2 258, FFMA2 130,
+# FADD2 126 (develop's counts: no emulated pair), FSETP 19 (the fold stays), FMNMX3 128 (the fused LDTM.STAT row-max
+# replaces the software tree), STL 3 / LDL 3.  The STL / LDL entries are the counts of THIS toolchain (cutlass-dsl 4.8.0.dev0 +
+# CUDA 13.5 ptxas) and are bounds, not literals (frost_test_utils.SPILL_TOLERANCE): the CI lane's 4.7.0 + CUDA 13.3 ptxas spills
+# differently at the same geometry on develop and on the branch alike.
+_SM100_SASS_SLACK = 16
+_SM100_D128_MXFP8_SASS_PINS = {"FFMA2": 226, "FADD2": 222, "FSETP": 19, "FMNMX3": 252, "STL": 3, "LDL": 3}
+_SM103_D128_MXFP8_SASS_PINS = {"FFMA2": 130, "FADD2": 126, "FSETP": 19, "STL": 3, "LDL": 3}
+# The per-cc TemplateParams fields exactly as api_dsl.template_params() derives them for an MXFP8 d128 build.
+_CC100_D128_MXFP8_PARAMS = {"fused_ldtm_stat": False, "exp2_fma_split": True}
+_CC103_D128_MXFP8_PARAMS = {"fused_ldtm_stat": True, "exp2_fma_split": False}
+
+
+_D128_MXFP8_SASS_PROBES: dict = {}  # (arch, params) -> SassProbe: one trace-compile per cubin per session, however many pins read it
+
+
+def _d128_mxfp8_sass_probe(tmp_path, arch: str, params: dict):
+    """Trace-compile the d128 MXFP8 kernel for ``arch`` with the per-cc ``params`` and return (stats, expect):
+    the SASS opcode counts and the module-derived expectations (MUFU.EX2, emulated columns, gate state).  Memoized per
+    (arch, params): the exp2-split pin and the dense credit-arrive pin below read the SAME sm_100a cubin, so it is compiled once;
+    the causal credit-arrive pin (``window_right=0`` in ``params``) is its own compile."""
+    key = (arch, tuple(sorted(params.items())))
+    if key not in _D128_MXFP8_SASS_PROBES:
+        _D128_MXFP8_SASS_PROBES[key] = run_sass_probe(tmp_path, probe_src=_SM100_D128_MXFP8_SASS_PROBE, arch=arch, params=params, tag="mxfp8_d128")
+    probe = _D128_MXFP8_SASS_PROBES[key]
+    return probe.stats, probe.expect
+
+
+@pytest.mark.L0
+def test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins(tmp_path):
+    """cc 10.0 record (exp2_fma_split=True): 32 of the 128 softmax columns are evaluated on the FMA pipe (MUFU.EX2 ==
+    2 x 97 exactly, derived from the module's `_E2E_EMULATED_COLS`; FFMA2 / FADD2 at or above the measured 226 / 222
+    minus slack) and the Amax_O fold is FMNMX3, not a compare+select chain (FSETP <= 19 + 16, FMNMX3 >= 252 - 16); no
+    new spill (STL / LDL within SPILL_TOLERANCE of the pinned 3 / 3, this toolchain's count).  Compiled for sm_100a at the production geometry -- no
+    Blackwell device needed for the compile, only for this module's gate."""
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", _CC100_D128_MXFP8_PARAMS)
+    assert expect["E2E_ENABLED"] == 1, "the cc 10.0 record must switch the split ON"
+    assert expect["EMULATED_COLS"] == 32, f"the shipped pattern emulates 32 of 128 columns, the module says {expect['EMULATED_COLS']}"
+    assert (
+        stats["MUFU_EX2"] == expect["EXPECT_MUFU_EX2"] == 194
+    ), f"MUFU.EX2 {stats['MUFU_EX2']} != {expect['EXPECT_MUFU_EX2']}: an emulated pair fell back to MUFU (or the split leaked)"
+    for key in ("FFMA2", "FADD2", "FMNMX3"):
+        assert (
+            stats[key] >= _SM100_D128_MXFP8_SASS_PINS[key] - _SM100_SASS_SLACK
+        ), f"{key} {stats[key]} < {_SM100_D128_MXFP8_SASS_PINS[key]} - {_SM100_SASS_SLACK}: {stats}"
+    assert (
+        stats["FSETP"] <= _SM100_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
+    ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
+    assert_no_new_spills(stats, _SM100_D128_MXFP8_SASS_PINS)
+
+
+@pytest.mark.L0
+def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
+    """cc 10.3 record (fused_ldtm_stat=True, exp2_fma_split=False -- what api_dsl.template_params() builds on a GB300):
+    the split is OFF because GB300 doubles the MUFU.EX2 rate to Rubin's 32/clk/SM, where the same split MEASURED
+    -9..-10 %.  The kernel must issue develop's MUFU.EX2 count exactly (2 x 129 = 258, derived from the module's
+    `_E2E_EMULATED_COLS == 0`) with no emulated pair left behind (FFMA2 / FADD2 at or below develop's 130 / 126 plus
+    slack), while the arch-independent Amax_O fold stays FMNMX3 (FSETP <= 19 + 16) and nothing new spills (STL / LDL within SPILL_TOLERANCE of 3 / 3).
+    Compiled for sm_103a; skips where this cutlass-dsl has no sm_103a."""
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_103a", _CC103_D128_MXFP8_PARAMS)
+    assert expect["E2E_ENABLED"] == 0, "the cc 10.3 record must fold the split OUT"
+    assert expect["EMULATED_COLS"] == 0, f"no column may be emulated with the gate off, the module says {expect['EMULATED_COLS']}"
+    assert (
+        stats["MUFU_EX2"] == expect["EXPECT_MUFU_EX2"] == 258
+    ), f"MUFU.EX2 {stats['MUFU_EX2']} != {expect['EXPECT_MUFU_EX2']}: the gate leaked an emulated pair (or dropped an exp2)"
+    for key in ("FFMA2", "FADD2"):
+        assert (
+            stats[key] <= _SM103_D128_MXFP8_SASS_PINS[key] + _SM100_SASS_SLACK
+        ), f"{key} {stats[key]} > {_SM103_D128_MXFP8_SASS_PINS[key]} + {_SM100_SASS_SLACK}: emulation instructions with the gate off: {stats}"
+    assert (
+        stats["FSETP"] <= _SM103_D128_MXFP8_SASS_PINS["FSETP"] + _SM100_SASS_SLACK
+    ), f"{stats['FSETP']} FSETP: the Amax_O fold is lowering to compare+select again"
+    assert_no_new_spills(stats, _SM103_D128_MXFP8_SASS_PINS)
+
+
+# ============================================================================ sm100 MXFP8: the scheduler credit arrive's lowering is a PER-SPECIALIZATION constant (PREDICATED_CREDIT_ARRIVE = CFG.MASK_FLAGS != 0)
+# PR #1169 turned `tile_dsl.scheduler.read_tile_id_arrive` into ONE predicated arrive per warp.  On B200 that re-lowering is a
+# kernel-wide ptxas reschedule whose sign is per kernel AND per mask specialization (A/B/A x3, CUPTI medians, O / Stats / Amax_O
+# bit-identical): +3.1 % on per-tensor fp8 d128, +1.3 % on bf16 d192x128, neutral on bf16 d128 and fp8 d192x128; on the two MXFP8
+# prefill kernels the BRANCH form wins the UNMASKED specialization (stacked on this branch's exp2 split: d128 +8.14 % at B=1
+# H=24/8 S=16K dense, d192x128 +6.84 % at H=128 S=8K dense) and LOSES the d128 kernel's causal one (-5.13 % at the same shape,
+# top_left, under the LPT plan the heuristics propose; -0.84 % with NATURAL pinned).  So those two spell
+# `PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0` once -- the same compile-time bits that select the dense vs the masked
+# softmax arms -- and pass it at EVERY `read_tile_id_arrive` site: the branch form on the dense specialization (its sm_100a cubin
+# is the pre-#1169 one), develop's predicated form wherever a mask arm (causal / SWA / padded) is compiled in (that cubin is
+# develop's).  No other sm100 kernel passes the kwarg.  Three tripwires: the source scan (this exact expression, defined once,
+# every site passes it, no literal, no leak into a sibling); the module VALUE under a dense, a causal and a padded
+# TemplateParams; and the sm_100a SASS of BOTH d128 specializations -- the branch form costs one BSSY reconverge and `cga_size`
+# (= 2) per-lane SYNCS.ARRIVE per site against the predicated form's 0 and 1, so the 7 sites read BSSY 15 / SYNCS.ARRIVE 55 on
+# the dense cubin (8 / 48 with the predicated form) and BSSY 8 / SYNCS.ARRIVE 56 on the causal one (15 / 63 with the branch
+# form), MEASURED 2026-09-22 on the trace-compiled cubins: one site taking the other form moves both counts by one.  Exact pins,
+# like the sm107 wait-form pins: deterministic for a given DSL + ptxas, re-pinned deliberately on a toolchain move.
+_CREDIT_ARRIVE_SITES = {
+    (128, 128): 6,
+    (192, 128): 7,
+}  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the softmax (d128: one site at the loop top for every mask arm; d192x128: one per mask arm)
+_SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
+_PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0"  # the one spelling both kernels carry: derived, never a literal
+# The module value each mask specialization must resolve to, keyed by the TemplateParams fields that select it.
+_CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": ({}, False), "causal": ({"window_right": 0}, True), "padded": ({"seq_kv_lens_present": True}, True)}
+# d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).
+_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS = {
+    "dense": ({}, {"BSSY": 15, "SYNCS_ARRIVE": 55}),  # the branch form; the predicated form read 8 / 48 here
+    "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 56}),  # the predicated form (develop's cubin); the branch form read 15 / 63 here
+}
+
+
+def _code_lines(src):
+    """Source with whole-line comments dropped -- the prose in these modules quotes the spellings the scans look for."""
+    return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _credit_arrive_sites(code):
+    """Every ``read_tile_id_arrive(`` call site of a kernel source, as its balanced argument text (black wraps some calls, so
+    the kwarg is not necessarily on the ``read_tile_id_arrive(`` line)."""
+    out = []
+    for m in re.finditer(r"\bread_tile_id_arrive\(", code):
+        i, depth = m.end(), 1
+        while depth:
+            depth += (code[i] == "(") - (code[i] == ")")
+            i += 1
+        out.append(code[m.end() : i - 1])
+    return out
+
+
+def _sm100_kernel_dir():
+    import pathlib
+
+    import cudnn.sdpa.fwd.kernels.sm100 as _sm100
+
+    return pathlib.Path(_sm100.__file__).parent
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("flavor", sorted(_CREDIT_ARRIVE_SITES), ids=lambda f: f"d{f[0]}" if f[0] == f[1] else f"d{f[0]}x{f[1]}")
+def test_sm100_mxfp8_credit_arrive_takes_the_module_constant(flavor):
+    """The kernel's ``PREDICATED_CREDIT_ARRIVE`` is the mask-derived expression ``CFG.MASK_FLAGS != 0`` (the module's own value,
+    checked under a dense, a causal and a padded TemplateParams: False on the unmasked specialization, True wherever a mask arm
+    is compiled in), defined exactly once and never as a literal, no call site carries a ``predicated=True`` / ``False``
+    literal, and EVERY ``read_tile_id_arrive`` site -- the pinned count -- passes ``predicated=PREDICATED_CREDIT_ARRIVE``.  One
+    site dropping the kwarg re-lowers that warp role to the predicated arrive on the dense specialization and hands the
+    -5.5 % / -6.3 % back; a literal ``False`` re-lowers the causal specialization to the branch form and hands its -5.1 % back --
+    both with O / Stats / Amax_O bit-identical, so only this scan (and the SASS pins below) sees it."""
+    from cudnn.frost.tile_dsl.constants import MASK_NONE
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    cta_mma = max(supported_cgas_for(flavor, fp8=True, device_cc=(10, 0), pertensor=False))
+    mods = {}
+    for name, (extra, want) in _CREDIT_ARRIVE_SPECIALIZATIONS.items():
+        mod = _load_sm100_kernel_module(flavor, TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, **extra), fp8=True, pertensor=False, rubin=False)
+        assert (mod.CFG.MASK_FLAGS == MASK_NONE) == (
+            name == "dense"
+        ), f"{mod.__name__} [{name}]: MASK_FLAGS={mod.CFG.MASK_FLAGS}, the probe params select the wrong specialization"
+        assert (
+            isinstance(mod.PREDICATED_CREDIT_ARRIVE, bool) and mod.PREDICATED_CREDIT_ARRIVE is want
+        ), f"{mod.__name__} [{name}, MASK_FLAGS={mod.CFG.MASK_FLAGS}]: PREDICATED_CREDIT_ARRIVE={mod.PREDICATED_CREDIT_ARRIVE!r}, want {want}"
+        mods[name] = mod
+    assert len({m.__file__ for m in mods.values()}) == 1, "the three specializations must come from one kernel file"
+    with open(mods["dense"].__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    defs = re.findall(r"^PREDICATED_CREDIT_ARRIVE\b.*$", code, re.M)
+    assert defs == [
+        _PREDICATED_CREDIT_ARRIVE_DEF
+    ], f"{mods['dense'].__name__}: PREDICATED_CREDIT_ARRIVE must be defined exactly once as `{_PREDICATED_CREDIT_ARRIVE_DEF}`, found {defs}"
+    assert not re.search(
+        r"predicated=(?:True|False)\b", code
+    ), f"{mods['dense'].__name__}: a predicated= literal at a call site bypasses PREDICATED_CREDIT_ARRIVE"
+    sites = _credit_arrive_sites(code)
+    assert (
+        len(sites) == _CREDIT_ARRIVE_SITES[flavor]
+    ), f"{mods['dense'].__name__}: {len(sites)} read_tile_id_arrive sites, the pin says {_CREDIT_ARRIVE_SITES[flavor]}"
+    bare = [args for args in sites if "predicated=PREDICATED_CREDIT_ARRIVE" not in args]
+    assert not bare, f"{mods['dense'].__name__}: {len(bare)} read_tile_id_arrive site(s) take the default (predicated) lowering: {bare}"
+    assert code.count("predicated=") == len(sites), f"{mods['dense'].__name__}: a predicated= outside a read_tile_id_arrive call"
+
+
+@pytest.mark.L0
+def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
+    """Every OTHER sm100 kernel takes ``read_tile_id_arrive``'s default (the predicated arrive: +3.1 % on fp8 d128, +1.3 % on
+    bf16 d192x128, neutral elsewhere): no ``predicated=`` kwarg and no ``PREDICATED_CREDIT_ARRIVE`` constant anywhere else under
+    ``kernels/sm100/``.  Widening the opt-out to a third kernel is a MEASURED, per-specialization decision that adds its file to
+    ``_SM100_MXFP8_OPTED_OUT`` (and a row to ``_CREDIT_ARRIVE_SITES``), never a copy-paste."""
+    kdir = _sm100_kernel_dir()
+    files = sorted(p.name for p in kdir.glob("*.py") if p.name != "__init__.py")
+    assert set(_SM100_MXFP8_OPTED_OUT) <= set(files), f"opted-out kernels missing from {kdir}: {files}"
+    leaked = {}
+    for name in files:
+        if name in _SM100_MXFP8_OPTED_OUT:
+            continue
+        code = _code_lines((kdir / name).read_text(encoding="utf-8"))
+        hits = [tok for tok in ("predicated=", "PREDICATED_CREDIT_ARRIVE") if tok in code]
+        if hits:
+            leaked[name] = hits
+    assert not leaked, f"sm100 kernels other than the two MXFP8 prefill kernels touch the credit-arrive lowering: {leaked}"
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("specialization", sorted(_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS))
+def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
+    """On the sm_100a cubin at the production geometry the credit arrives lower to the form the specialization selects: the
+    DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 55 exactly; the predicated form reads 8 / 48)
+    and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 56; the branch
+    form reads 15 / 63), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin
+    (derived from the module) and 2 x 194 == 388 on the causal one, whose warpgroups each trace the softmax body twice (the
+    unmasked segment's and the masked one's, shared by the left- and right-masked segments).  The dense case reads the SAME
+    cubin as test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins (memoized probe); the causal one is a second compile."""
+    extra, pins = _SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS[specialization]
+    stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", {**_CC100_D128_MXFP8_PARAMS, **extra})
+    for key, want in pins.items():
+        assert (
+            stats[key] == want
+        ), f"[{specialization}] {key} {stats[key]} != {want}: a credit-arrive site lowered to the other form (or PREDICATED_CREDIT_ARRIVE no longer follows CFG.MASK_FLAGS): {stats}"
+    bodies = 1 if specialization == "dense" else 2
+    assert (
+        stats["MUFU_EX2"] == bodies * expect["EXPECT_MUFU_EX2"] == bodies * 194
+    ), f"[{specialization}] MUFU.EX2 {stats['MUFU_EX2']}: the credit-arrive lowering must not touch the exp2 split"
+
+
+# ============================================================================ sm100 d128 MXFP8: Stats is the exact fp32 log-sum-exp (fp64 reference), with the exp2 split in place
+@pytest.mark.L0
+@pytest.mark.skipif(
+    _SM is None or not (100 <= _SM <= 106),
+    reason="the sm100 MXFP8 d128 kernel serves cc 10.0-10.6 (the Rubin sibling has its own pin in test_sdpa_fwd_dsl_sm107.py)",
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+def test_mxfp8_d128_stats_is_the_exact_softmax_lse_sm100(causal):
+    """B=1 H=24/8 S=2048 (the split's tuning shape at a reference-friendly length): (1) the PUBLISHED Stats is within
+    1e-4 of the fp64 log-sum-exp of the DEQUANTIZED inputs -- the exp2 emulation's 8.8e-5 per-element error averages
+    to ~6e-6 on a dense row and ~2e-5 on a causal one (MEASURED on B200: 6.06e-6 / 1.90e-5; the all-MUFU kernel
+    1.6e-6, the cuDNN backend kernel 6.05e-6 / 3.07e-5); (2) O is finite and sentinel-free; (3) O is bit-identical
+    with and without Stats (sdpa-invariants s4).  This probe pins the LSE; O ACCURACY is covered by the suite's
+    kernel-numerics cases (the ``-k d128`` masks / output-dtype / GQA cases against the mxfp8 reference), not here:
+    the kernel's O error is set by the e4m3 quantization of P (max |O - O_fp64| 1.68e-3 dense / 2.63e-2 causal at this
+    shape, identical to four digits with and without the exp2 split), an order of magnitude above the bf16 output
+    rounding of the fp64 reference, so a bf16-floor bound on O would be miscalibrated by construction.  The O error
+    against the fp64 reference is still PRINTED as a diagnostic."""
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, supported_cgas_for
+
+    torch.manual_seed(0)
+    b, hq, hkv, s, d = 1, 24, 8, 2048, 128
+    dev = "cuda"
+    qf = torch.randn(b, hq, s, d, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+
+    def mx(x, h, columnwise):
+        data_d, sf_d, swz_d, data_s, sf_s, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=True)
+        data, sf, swz = (data_s, sf_s, swz_s) if columnwise else (data_d, sf_d, swz_d)
+        # sf_*_ref are the per-element fp32 DEQUANT SCALES [b, h, s, d]; fp64 so the reference logits are exact
+        # (fp32 matmul runs in TF32 in the DLFW containers, a 1e-4-class LSE error on a causal row with few columns).
+        deq = data.double().reshape(b, h, s, d) * sf.double().reshape(b, h, s, d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), deq, swz.contiguous()
+
+    q8, q_deq, sfq = mx(qf, hq, False)
+    k8, k_deq, sfk = mx(kf, hkv, False)
+    v8, v_deq, sfv = mx(vf, hkv, True)
+    (cga,) = supported_cgas_for((d, d), fp8=True, device_cc=torch.cuda.get_device_capability(), pertensor=False)
+    outs = {}
+    lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+    for with_stats in (True, False):
+        out = torch.full((b, s, hq, d), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)
+        api = SdpaFwdDslSm100(
+            q8, k8, v8, out, lse if with_stats else None, scale_softmax=d**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=cga
+        )
+        assert api.check_support()
+        api.compile()
+        workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+        api.execute(q8, k8, v8, out, lse_tensor=lse if with_stats else None, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=workspace)
+        torch.cuda.synchronize()
+        outs[with_stats] = out.clone()
+    assert torch.equal(outs[True], outs[False]), "O must not depend on whether Stats is requested"
+    rep = hq // hkv
+    logits = q_deq @ k_deq.repeat_interleave(rep, 1).transpose(-1, -2) * d**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    lse_ref = torch.logsumexp(logits, dim=-1)
+    o_ref = torch.softmax(logits, dim=-1) @ v_deq.repeat_interleave(rep, 1)
+    o = outs[True]
+    assert not (o.float() == 1.5e30).any(), "sentinel survived: O rows never written"
+    assert torch.isfinite(o.float()).all() and torch.isfinite(lse).all(), "non-finite O / unwritten LSE rows"
+    bf16_floor = (o_ref - o_ref.to(torch.bfloat16).double()).abs().max().item()
+    d_o = (o.double() - o_ref).abs().max().item()  # diagnostic only (docstring): the e4m3 P quantization sets it, not the split
+    err = (lse.double() - lse_ref).abs()
+    print(
+        f"\nsm100 d128 mxfp8 {'causal' if causal else 'dense'}: max|dLSE| {err.max().item():.3e} rms {err.pow(2).mean().sqrt().item():.3e}, max|dO| {d_o:.3e} (bf16 floor {bf16_floor:.3e})"
+    )
+    assert (
+        err.max().item() <= 1e-4
+    ), f"Stats is not the exact log-sum-exp: max |dLSE| {err.max().item():.3e}, rms {err.pow(2).mean().sqrt().item():.3e} (the exp2 emulation reads ~6e-6 dense / ~2e-5 causal; a quantized-sum LSE ~1e-3..1e-2)"
+
+
+# Explicit architecture CI entry; wide physical-stride probes remain opt-in L1.
+import test_sdpa_prepared_pv_bf16 as _prepared_pv_bf16_checks
+
+
+class TestPreparedPvBf16:
+    test_rebind_and_replay = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_prepared_rebind_and_replay)
+    test_staged_conversion = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_staged_conversion_omits_dead_operands)
+    test_explicit_no_amax = staticmethod(_prepared_pv_bf16_checks.test_pv_bf16_no_amax_flag_with_sample_descriptor)
+
+
+# Retain staged conversion coverage in the explicitly selected architecture CI entry.
+import test_sdpa_staged_forward_mxfp8 as _staged_mxfp8_checks
+
+
+@pytest.mark.L0
+class TestStagedMxfp8:
+    test_pointer_rebind = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_uses_pointer_host_and_current_scales)
+    test_fp8_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_fp8_output_without_optional_outputs)
+    test_invalid_scales = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_sf_rejects_before_copy)
+    test_wide_stride = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_physical_wide_batch_stride)
+    test_pv_bf16 = staticmethod(_staged_mxfp8_checks.test_staged_pv_bf16_keeps_v_width_and_omits_sf_v)
+    test_artifact_reload = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_artifact_reloads_without_jit)
+    test_block_output = staticmethod(_staged_mxfp8_checks.test_mxfp8_staged_block_output_matches_native_graph)
+    test_compile_cli = staticmethod(_staged_mxfp8_checks.test_mxfp8_compile_cli_uses_prepared_entry)
+
+
+@_skip_thd_mxfp8_d128_on_rubin
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [33, 129])
+@pytest.mark.parametrize("cu_lens", [False, True])
+@torch_fork_set_rng(seed=0)
+def test_mxfp8_thd_batched_setup(batch, cu_lens):
+    """Parallel setup crosses warp chunks and descriptor-owner strides.
+
+    Zero Q/KV lengths and NaN-poisoned capacity tails exercise prefix publication,
+    per-request O extents, and packed-total K/V clamps together.
+    """
+    q_lens = [([0, 1, 17, 65, 129][i % 5]) for i in range(batch)]
+    kv_lens = [([33, 0, 65, 127, 257][i % 5]) for i in range(batch)]
+    out, ref, amax, _ = _run_thd(q_lens, kv_lens, 2, 1, "e4m3", torch.float16, scale=1.0 / math.sqrt(128), cu_lens=cu_lens)
+    _check(out, ref, torch.float16, "e4m3")
+    assert abs(amax.item() - ref.abs().max().item()) <= 0.03
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)])
+@pytest.mark.parametrize("mask", ["none", "causal"])
+def test_mxfp8_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale negates S in the block-scaled BMM1 (a_negate) and runs at |scale| (#1435). Block
+    quantization is sign-symmetric, so the result must be bit-identical to the positive scale on -Q."""
+    scale = 0.7 / math.sqrt(d_qk)
+    runs = []
+    for sign in (-1.0, 1.0):
+        torch.manual_seed(0)
+        runs.append(_run(1, 8, 8, 256, "e4m3", torch.float16, scale=sign * scale, sdpa_kwargs=_MASKS[mask], d_qk=d_qk, d_v=d_v, negate_q=sign > 0))
+    (o_neg, _, a_neg), (o_pos, _, a_pos) = runs
+    assert not o_neg.isnan().any()
+    assert torch.equal(o_neg, o_pos)
+    assert torch.equal(a_neg, a_pos)
