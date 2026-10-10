@@ -930,8 +930,10 @@ class pygraph:
                             except Exception:  # noqa: BLE001 — best-effort
                                 d = None
                             if d:
+                                reinferred = bool(out_t.dim)
                                 out_t.dim = list(d)
-                                out_t.stride = _row_major_stride(out_t.dim)
+                                if not (reinferred and out_t.stride_assigned):  # a re-inferred port keeps the caller's stride
+                                    out_t.stride = _row_major_stride(out_t.dim)
                 node.validate()
         except ValueError:
             # Inference can reject shapes before the family validator runs

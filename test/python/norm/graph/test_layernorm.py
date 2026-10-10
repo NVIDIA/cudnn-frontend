@@ -412,6 +412,17 @@ def test_layernorm_without_scale_one_stat_dims_state_the_axes(set_stat, cudnn_ha
 
 
 @pytest.mark.L0
+def test_layernorm_stats_keep_a_stride_the_caller_set(cudnn_handle):
+    """Re-inferring the stats dims at validate() must not replace a stride the caller set without dims."""
+    x = make_seeded_randn((2, 8, 64), torch.float32, 2110)
+    graph, _, _, _, _, mean, inv_var = _layernorm_graph(cudnn_handle, x, scale_shape=(1, 1, 64))
+    for t in (mean, inv_var):
+        t.set_stride([16, 2, 1])
+    graph.validate()
+    assert [int(s) for s in mean.get_stride()] == [int(s) for s in inv_var.get_stride()] == [16, 2, 1]
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("scale_shape", [None, (1, 1, 64)], ids=["no_scale", "scale"])
 def test_layernorm_refuses_stats_with_different_dims(scale_shape, cudnn_handle):
     """``mean`` and ``inv_var`` with different dims are refused at validate(), not at build_operation_graph()."""
