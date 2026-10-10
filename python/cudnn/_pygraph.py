@@ -3023,7 +3023,21 @@ def _block_quant_scale_dims(node):
     return d
 
 
-_NORM_FWD_INFER = {"Y": _like("input"), "mean": _stats_like("input", (0,)), "inv_var": _stats_like("input", (0,))}
+def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever scale is not 1 (from first_axis on)
+    def infer(node):
+        d = node.inputs["input"].dim if "input" in node.inputs else None
+        s = node.inputs["scale"].dim if node.inputs.get("scale") is not None else None
+        if not d:
+            return None
+        if not s:  # no scale (rmsnorm, #188): every axis after the batch axis is normalized
+            return [x if i == 0 else 1 for i, x in enumerate(d)]
+        return [1 if i >= first_axis and s[i] != 1 else x for i, x in enumerate(d)]
+
+    return infer
+
+
+_NORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(0), "inv_var": _norm_stats_like(0)}
+_ADANORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(1), "inv_var": _norm_stats_like(1)}
 _NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
 
 
@@ -3042,7 +3056,7 @@ _STRUCTURED_OPS = {
         attrs=("norm_forward_phase",),
         outputs=("Y", "inv_var"),
         maybe={"inv_var": _training_phase},
-        infer={"Y": _like("input"), "inv_var": _stats_like("input", (0,))},
+        infer={"Y": _like("input"), "inv_var": _norm_stats_like(0)},
     ),
     "rmsnorm_backward": dict(
         node_type=NodeType.RMSNORM_BWD,
@@ -3075,7 +3089,7 @@ _STRUCTURED_OPS = {
         attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
-        infer=_NORM_FWD_INFER,
+        infer=_ADANORM_FWD_INFER,
     ),
     "adalayernorm_backward": dict(
         node_type=NodeType.ADALAYERNORM_BWD,

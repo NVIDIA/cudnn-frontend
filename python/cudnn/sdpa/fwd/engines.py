@@ -42,6 +42,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
     supports_thd_split,
+    supports_scalar_kv_tail_split,
     supports_paged_split_sink,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES, SM107_F16_THD_SHAPES, SM107_FP8_THD_SHAPES, SM107_MXFP8_THD_SHAPES
@@ -876,14 +877,13 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
                 or (facts.padded and not facts.has_paged_kv and not packed_split)
                 or facts.seq_q_trim
             ):
-                return "split_kv > 1 serves sink-free dense graphs without a KV-tail mask, the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
-            if _synth_kv_padding(capabilities, facts):
-                # The adapter would serve this ragged S_kv through the
-                # kernel's KV-tail mask (kv_tail_mask), which the split cannot
-                # ride. The SAME predicate as the adapter's so the plan is
-                # never listed; a paged
-                # graph never takes that path (its declared max only sizes
-                # the cost model), so it keeps its split.
+                return "split_kv > 1 serves sink-free dense graphs, the decode tile's ragged-Q leg, or native D128/D256 or nonpaged D192 packed split"
+            if _synth_kv_padding(capabilities, facts) and not supports_scalar_kv_tail_split(
+                (facts.d_qk, facts.d_v),
+                device_cc=facts.device_cc,
+                fp8=facts.is_fp8 or facts.is_mxfp8,
+                pertensor=facts.is_fp8,
+            ):
                 return "split_kv > 1 cannot ride the KV-tail mask this S_kv needs"
             # No gate on the O dtype: the partials are never narrower than it,
             # and the combine performs the only cast down to it.

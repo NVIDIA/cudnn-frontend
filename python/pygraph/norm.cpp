@@ -289,7 +289,7 @@ init_pygraph_norm_submodule(py::class_<PyGraph>& m) {
              &PyGraph::rmsnorm,
              py::arg("norm_forward_phase"),
              py::arg("input"),
-             py::arg("scale"),
+             py::arg_v("scale", nullptr),
              py::arg_v("bias", nullptr),
              py::arg("epsilon"),
              py::arg_v("compute_data_type", cudnn_frontend::DataType_t::NOT_SET),

@@ -54,6 +54,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPI
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
+    supports_scalar_kv_tail_split,
     supports_paged_split_sink,
     supports_paged_prefill_cga1,
     supports_paged_d256_pack_gqa,
@@ -2234,7 +2235,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             causal_covers_tail = self.is_causal and ((self.causal_bottom_right and _br == 0) or (not self.causal_bottom_right and int(s_qo) + _br <= int(s_kv)))
             self._kv_tail_mask = not (self.seq_kv_lens_present or causal_covers_tail)
             self._value_error_if(
-                self._kv_tail_mask and (self.split_kv or 1) > 1,
+                self._kv_tail_mask
+                and (self.split_kv or 1) > 1
+                and not supports_scalar_kv_tail_split((int(d_qk), int(d_v)), device_cc=self._device_cc, fp8=self._fp8, pertensor=self._pertensor),
                 f"S_kv ({s_kv}) is not a multiple of {_SM100_TILE_N}: split-KV needs a padding mask (seq_len_kv) or a causal mask covering the KV tail",
             )
 
