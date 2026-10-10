@@ -26,12 +26,13 @@ def _import_bsa():
         pytest.skip(f"block sparse attention optional dependencies are unavailable: {error}")
 
 
-def _require_sm100_fp8():
+def _require_sm100_fp8(*, allow_sm120=False):
     if not torch.cuda.is_available():
         pytest.skip("Sage FP8 block sparse attention requires CUDA")
     major, _ = torch.cuda.get_device_capability()
-    if major not in {10, 11}:
-        pytest.skip("this numerical Sage FP8 test requires SM100/SM110")
+    supported = {10, 11, 12} if allow_sm120 else {10, 11}
+    if major not in supported:
+        pytest.skip(f"this numerical Sage FP8 test requires architecture family {sorted(supported)}")
     interface = importlib.import_module("cudnn.block_sparse_attention._interface")
     if interface._cutlass_dsl_version() < (4, 6, 1):
         pytest.skip("Sage FP8 requires nvidia-cutlass-dsl>=4.6.1")
@@ -177,7 +178,7 @@ def test_bsa_fp8_forward_accepts_positive_batch_and_head_counts(monkeypatch, bat
 @pytest.mark.parametrize(("batch", "heads"), ((1, 4), (2, 3)))
 @torch_fork_set_rng(seed=20260709)
 def test_bsa_fp8_private_cutedsl_quantizer_matches_recipe(batch, heads):
-    _require_sm100_fp8()
+    _require_sm100_fp8(allow_sm120=True)
     quantizer = importlib.import_module("cudnn.block_sparse_attention._fp8_quant")
 
     seqlen_q, seqlen_k, head_dim = 128, 192, 128
