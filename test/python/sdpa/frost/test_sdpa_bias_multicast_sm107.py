@@ -412,7 +412,8 @@ def test_the_row_passes_the_lowerings_length_fact_to_the_pick(monkeypatch, s, pa
     f = _s13._facts(**_s13._resolve_dtypes(kw))
     assert engines._synth_kv_padding(caps, f) == (not padded and s % 128 != 0), "the lowering's predicate for this cell"
     assert engines.mismatch(caps, f, None) is None, "the row serves every cell of this table (the cga1 ring or the multicast ring)"
-    row = [(kw_, r) for a, kw_, r in seen if a[0] == 32 and a[1] == 1 and kw_.get("pair")]
+    # the ROW's calls pass the fact by keyword; the heuristics' width pick (sm107_bias_auto_cga) calls the same function WITHOUT it
+    row = [(kw_, r) for a, kw_, r in seen if a[0] == 32 and a[1] == 1 and kw_.get("pair") and "global_lengths" in kw_]
     assert row, ("the row asked the pick for the pair item at cga1", seen)
     assert {kw_["global_lengths"] for kw_, _ in row} == {want_global}, (s, row)
     assert {r for _, r in row} == {want_mode}, (s, row)
@@ -749,7 +750,8 @@ def test_the_knob_less_dense_tail_runs_the_cga1_ring_through_the_graph_path(case
     monkeypatch.setattr(api_dsl.SdpaFwdDslSm100, "_resident_arm_bias_mode", spy)
     out = _s13._run(q, k, v, **kw)
     assert out["knobs"].cga == 1, (case, out["knobs"])
-    pair_row = [(kw_, r) for a, kw_, r in row_picks if kw_.get("pair") and a[1] == 1]
+    # the ROW's calls carry the fact by keyword (the heuristics' width pick calls the same function without it on the graph path)
+    pair_row = [(kw_, r) for a, kw_, r in row_picks if kw_.get("pair") and a[1] == 1 and "global_lengths" in kw_]
     assert pair_row and {kw_["global_lengths"] for kw_, _ in pair_row} == {False}, ("the row read the synthesized lengths", row_picks)
     assert {r for _, r in pair_row} == {2}, ("the row computed the cga1 ring", pair_row)
     assert adapter_modes and {m for m, *_ in adapter_modes} == {2}, ("the adapter built the cga1 ring", adapter_modes)
