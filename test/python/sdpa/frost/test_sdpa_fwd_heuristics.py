@@ -709,11 +709,13 @@ def test_d128_decode_shaped_launch_leads_with_cga1(over):
     ids=["past_one_tile", "paged_prefill", "prefill_4k"],
 )
 def test_d128_prefill_shaped_launch_keeps_cga2(over):
-    """Above one decode tile's rows on every leg the plan list is what it was:
-    cga2 throughout. (A packed leg that overflows while its unpacked runner-up
+    """Above one decode tile's rows on every leg a paged plan list is cga2
+    throughout; a dense one lists the decode tile as the other-width runner
+    (issue #1518). (A packed leg that overflows while its unpacked runner-up
     fits is test_sdpa_fwd_decode_d128_sm100's per-candidate case.)"""
-    plans = _f16_plans(_decode_facts(**over))
-    assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+    facts = _decode_facts(**over)
+    plans = _f16_plans(facts)
+    assert {p.knobs.cga for p in plans} == ({2} if facts.has_paged_kv else {1, 2}), [p.knobs for p in plans]
 
 
 @pytest.mark.L0
@@ -755,14 +757,13 @@ def test_d128_small_batch_units_split_only_where_the_combine_is_cheap():
     chunk = dict(b=8, h_q=32, h_kv=8, s_q=64, causal=True)
     for facts in (_decode_facts(bottom_right=True, **chunk), _decode_facts(**chunk, **_DENSE)):
         lead = _f16_plans(facts)[0].knobs
-        assert (lead.cga, lead.split_kv, lead.pack_gqa, lead.sched_policy) == (2, 1, True, 0), lead
+        assert (lead.split_kv, lead.pack_gqa, lead.sched_policy) == (1, True, 0), lead
     short = _f16_plans(_decode_facts(bottom_right=True, **{**chunk, "s_q": 16}))
     assert (short[0].knobs.cga, short[0].knobs.split_kv) == (1, 2), short[0].knobs
     assert any(p.knobs.cga == 1 and p.knobs.split_kv == 1 for p in short), [p.knobs for p in short]
     decode = _f16_plans(_decode_facts(b=8))[0].knobs
     assert (decode.cga, decode.split_kv) == (1, 4), decode
     two_ctas = _f16_plans(_decode_facts(b=4, h_q=32, h_kv=8, s_q=128, causal=True, **_DENSE))
-    assert two_ctas[0].knobs.cga == 2, two_ctas[0].knobs
     assert all(p.knobs.split_kv == 1 for p in two_ctas), [p.knobs for p in two_ctas]
 
 
@@ -1177,12 +1178,12 @@ def test_sm107_d128_decode_shaped_sets_ride_the_decode_tile(sm107_metadata_targe
 
 @pytest.mark.L0
 @pytest.mark.parametrize("s_q", [512, 129], ids=["q512", "q129"])
-def test_sm107_d128_prefill_shaped_sets_keep_cga2(sm107_metadata_target, s_q):
-    """Above one decode tile's rows on every leg (129 rows overflow the unpacked tile too) the cc 10.7 half row keeps the
-    cga2 prefill width throughout and still lists a packed set (the shared SM100 prefill body) next to the unpacked
-    Rubin body."""
+def test_sm107_d128_prefill_shaped_sets_list_both_widths(sm107_metadata_target, s_q):
+    """Above one decode tile's rows on every leg (129 rows overflow the unpacked tile too) the cc 10.7 half row lists both
+    widths (the decode tile and the cga2 prefill pipeline; which leads is the wave rule's business, issue #1518) and a
+    packed set (the shared SM100 prefill body) next to the unpacked Rubin body."""
     plans = _sm107_f16_plans(_sm107_d128_facts(b=1, h_kv=4, s_q=s_q, s_kv=max(512, s_q)))
-    assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+    assert {p.knobs.cga for p in plans} == {1, 2}, [p.knobs for p in plans]
     assert {bool(p.knobs.pack_gqa) for p in plans} == {True, False}, [p.knobs for p in plans]
 
 
@@ -1627,7 +1628,7 @@ def test_sm107_dense_d128_gqa_packs_under_a_band_at_prefill_depth(sm107_metadata
         return
     assert plans[0].knobs.pack_gqa is packed_first, [p.knobs for p in plans]
     assert {p.knobs.pack_gqa for p in plans} >= {True, False}, [p.knobs for p in plans]
-    assert all(p.knobs.cga == 2 for p in plans), [p.knobs for p in plans]
+    assert {p.knobs.cga for p in plans} == {1, 2}, [p.knobs for p in plans]
 
 
 @pytest.mark.L0
@@ -1636,9 +1637,9 @@ def test_sm107_dense_d128_gqa_packs_under_a_band_at_prefill_depth(sm107_metadata
     [
         (dict(s_q=64), (False, 1)),
         (dict(s_q=128), (False, 1)),
-        (dict(s_q=256), (True, 2)),
+        (dict(s_q=256), (True, None)),
         (dict(b=8, h_kv=4, s_q=128, s_kv=2048), (False, 1)),
-        (dict(s_q=128, causal=True, bottom_right=True), (True, 2)),
+        (dict(s_q=128, causal=True, bottom_right=True), (True, None)),
         (dict(b=128, s_q=8, s_kv=2056), (True, 1)),
     ],
     ids=["q64_unpacked_tile", "q128_unpacked_tile", "q256_packed_body", "gqa16_q128_unpacked_tile", "banded_q128_packs", "decode_fit_packs"],
@@ -1646,12 +1647,14 @@ def test_sm107_dense_d128_gqa_packs_under_a_band_at_prefill_depth(sm107_metadata
 def test_sm107_mask_free_d128_gqa_rides_the_unpacked_decode_tile_where_only_it_fits(sm107_metadata_target, over, first):
     """Mask-free cc 10.7 dense d128 GQA (the opt-in order; placement keeps the backend first): when one head's rows fit the
     shared decode tile while the packed unit overflows it (S_q <= 128 < S_q x G) the unpacked decode tile leads, unsplit
-    (measured 32 us against the packed body's 91 / 98 at b2 64/8 q128 KV 4k); past the tile the packed cga2 body keeps the
+    (measured 32 us against the packed body's 91 / 98 at b2 64/8 q128 KV 4k); past the tile the packed body keeps the
     lead, a band packs first (_sm100_banded_gqa_packs) and a packed unit that fits the tile packs first.  The other packing
-    stays listed."""
+    stays listed.  ``None``: past one decode tile either width may lead (the wave rule, issue #1518)."""
     facts = _sm107_d128_facts(**{**dict(b=2, s_kv=4096, causal=False, bottom_right=False, has_sink=False), **over})
     plans = _sm107_f16_plans(facts)
-    assert (bool(plans[0].knobs.pack_gqa), plans[0].knobs.cga) == first, [p.knobs for p in plans]
+    assert bool(plans[0].knobs.pack_gqa) == first[0], [p.knobs for p in plans]
+    if first[1] is not None:
+        assert plans[0].knobs.cga == first[1], [p.knobs for p in plans]
     if first[1] == 1:
         assert plans[0].knobs.split_kv in (None, 1), plans[0].knobs  # the decode tile's unsplit leg (its split arms measured slower)
     assert {bool(p.knobs.pack_gqa) for p in plans} == {True, False}, [p.knobs for p in plans]
