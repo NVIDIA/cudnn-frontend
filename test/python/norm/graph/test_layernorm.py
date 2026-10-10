@@ -298,3 +298,111 @@ def test_layernorm_llm_mxfp8_output(phase, include_column_output, input_shape, p
     else:
         assert outputs.mean is None
         assert outputs.inv_variance is None
+
+
+_PHASES = [cudnn.norm_forward_phase.INFERENCE, cudnn.norm_forward_phase.TRAINING]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("input_type", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("phase", _PHASES, ids=["inference", "training"])
+def test_layernorm_forward_without_bias(phase, input_type, cudnn_handle):
+    """``bias=None`` (#188, ``nn.LayerNorm(bias=False)``): the C++ node used to dereference the absent bias."""
+    x_gpu = make_seeded_randn((2, 512, 1024), input_type, 2101, scale=2.0, shift=-0.5)
+    scale_gpu = make_seeded_randn((1, 1, 1024), input_type, 2102, scale=1.5, shift=0.25)
+    epsilon_cpu = torch.full((1, 1, 1), 1e-5, device="cpu", dtype=torch.float32)
+    y_expected, mean_expected, inv_variance_expected = _manual_layernorm(x_gpu, scale_gpu, None, 1e-5)
+
+    outputs = execute_layernorm_forward(phase=phase, x=x_gpu, scale=scale_gpu, bias=None, epsilon=epsilon_cpu, cudnn_handle=cudnn_handle)
+
+    tolerance = 8e-3 if input_type == torch.bfloat16 else 1e-4
+    torch.testing.assert_close(outputs.y, y_expected.to(input_type), atol=tolerance, rtol=tolerance)
+    if phase == cudnn.norm_forward_phase.TRAINING:
+        torch.testing.assert_close(outputs.mean, mean_expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(outputs.inv_variance, inv_variance_expected, atol=1e-5, rtol=1e-5)
+
+
+def _layernorm_graph(cudnn_handle, x, *, scale_shape=None, bias_shape=None, phase=cudnn.norm_forward_phase.TRAINING, ada=False):
+    graph = cudnn.pygraph(intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, handle=cudnn_handle)
+    X = graph.tensor(name="X", dim=list(x.shape), stride=list(x.stride()), data_type=x.dtype)
+
+    def param(name, shape):
+        return None if shape is None else graph.tensor(name=name, dim=list(shape), stride=list(torch.empty(shape).stride()), data_type=x.dtype)
+
+    S, Bt = param("scale", scale_shape), param("bias", bias_shape)
+    eps = graph.tensor(name="eps", dim=[1] * x.dim(), stride=[1] * x.dim(), is_pass_by_value=True, data_type=cudnn.data_type.FLOAT)
+    norm = graph.adalayernorm if ada else graph.layernorm
+    Y, mean, inv_var = norm(norm_forward_phase=phase, input=X, scale=S, bias=Bt, epsilon=eps)
+    Y.set_output(True).set_data_type(x.dtype)
+    for t in (mean, inv_var):
+        if t is not None:
+            t.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    return graph, X, S, eps, Y, mean, inv_var
+
+
+def _execute(graph, cudnn_handle, x, variant_pack, stats):
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    graph.check_support()
+    graph.build_plans()
+    cudnn.set_stream(handle=cudnn_handle, stream=torch.cuda.current_stream().cuda_stream)
+    out = {t: torch.full([int(d) for d in t.get_dim()], float("nan"), device="cuda") for t in stats if t is not None}
+    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    graph.execute({**variant_pack, **out}, workspace, handle=cudnn_handle)
+    torch.cuda.synchronize()
+    return out
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("phase", _PHASES, ids=["inference", "training"])
+def test_layernorm_forward_without_scale_or_bias(phase, cudnn_handle):
+    """No affine at all: ``{rows, H, 1, 1}`` states the normalization axes, so neither scale nor bias is needed."""
+    rows, H = 64, 128
+    x = make_seeded_randn((rows, H, 1, 1), torch.float32, 2103)
+    graph, X, _, eps, Y, mean, inv_var = _layernorm_graph(cudnn_handle, x, phase=phase)
+    y = torch.full_like(x, float("nan"))
+    stats = _execute(graph, cudnn_handle, x, {X: x, eps: torch.full((1, 1, 1, 1), 1e-5), Y: y}, (mean, inv_var))
+    y_expected, mean_expected, inv_variance_expected = _manual_layernorm(x.view(rows, H), torch.ones(H, device="cuda"), None, 1e-5)
+    torch.testing.assert_close(y, y_expected.view(rows, H, 1, 1), atol=1e-5, rtol=1e-5)
+    if phase == cudnn.norm_forward_phase.TRAINING:
+        assert [int(d) for d in mean.get_dim()] == [int(d) for d in inv_var.get_dim()] == [rows, 1, 1, 1]
+        torch.testing.assert_close(stats[mean].view(rows, 1), mean_expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(stats[inv_var].view(rows, 1), inv_variance_expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("phase", _PHASES, ids=["inference", "training"])
+def test_layernorm_refuses_bias_without_scale(phase, cudnn_handle):
+    """The backend rejects a bias without a scale (``hasBiasDesc() && !hasScaleDesc()``); the node says so at validate()."""
+    x = make_seeded_randn((2, 8, 64), torch.float32, 2104)
+    graph = _layernorm_graph(cudnn_handle, x, bias_shape=(1, 1, 64), phase=phase)[0]
+    with pytest.raises(Exception, match="requires a scale"):
+        graph.validate()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("phase", _PHASES, ids=["inference", "training"])
+def test_layernorm_without_scale_refuses_ambiguous_axes(phase, cudnn_handle):
+    """``{B, S, H}`` with no affine: the backend normalizes H in inference but S and H for ``{B, 1, 1}`` stats, so refuse."""
+    x = make_seeded_randn((2, 8, 64), torch.float32, 2105)
+    graph = _layernorm_graph(cudnn_handle, x, phase=phase)[0]
+    with pytest.raises(Exception, match="ambiguous"):
+        graph.validate()
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("phase", _PHASES, ids=["inference", "training"])
+def test_adalayernorm_forward_without_bias(phase, cudnn_handle):
+    """``adalayernorm``'s binding has always defaulted ``bias`` to ``None``; the C++ node used to dereference it."""
+    B, S, H = 2, 64, 256
+    x = make_seeded_randn((B, S, H), torch.float32, 2106)
+    scale = make_seeded_randn((B, 1, H), torch.float32, 2107, scale=1.5, shift=0.25)
+    graph, X, Sc, eps, Y, mean, inv_var = _layernorm_graph(cudnn_handle, x, scale_shape=(B, 1, H), phase=phase, ada=True)
+    y = torch.full_like(x, float("nan"))
+    stats = _execute(graph, cudnn_handle, x, {X: x, Sc: scale, eps: torch.full((1, 1, 1), 1e-5), Y: y}, (mean, inv_var))
+    y_expected, mean_expected, inv_variance_expected = _manual_layernorm(x, scale, None, 1e-5)
+    torch.testing.assert_close(y, y_expected, atol=1e-4, rtol=1e-4)
+    if phase == cudnn.norm_forward_phase.TRAINING:
+        torch.testing.assert_close(stats[mean].view(B, S, 1), mean_expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(stats[inv_var].view(B, S, 1), inv_variance_expected, atol=1e-5, rtol=1e-5)
