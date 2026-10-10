@@ -1926,7 +1926,7 @@ def test_paged_adapter_declines_sm107_device(monkeypatch, fp8):
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (10, 7))
-    with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries and MXFP8 pools"):
+    with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
         _api().check_support()
 
 
@@ -2710,7 +2710,7 @@ def test_paged_mxfp8_adapter_sm107_device_contract(monkeypatch, dims):
             assert "Rubin paged KV" not in str(e), e
             raise
     else:
-        with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries and MXFP8 pools"):
+        with pytest.raises(NotImplementedError, match="Rubin paged KV serves half THD queries, MXFP8 pools on D128/D256"):
             _api().check_support()
 
 
