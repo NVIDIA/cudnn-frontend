@@ -3036,7 +3036,15 @@ def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever
     return infer
 
 
-_NORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(0), "inv_var": _norm_stats_like(0)}
+def _layernorm_stat_like(other):  # the C++ layernorm node's rule: an unset stat takes the dims set on the other one
+    def infer(node):
+        t = node.outputs.get(other)
+        return list(t.dim) if t is not None and t.dim else _norm_stats_like(0)(node)
+
+    return infer
+
+
+_NORM_FWD_INFER = {"Y": _like("input"), "mean": _layernorm_stat_like("inv_var"), "inv_var": _layernorm_stat_like("mean")}
 _ADANORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(1), "inv_var": _norm_stats_like(1)}
 _NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
 
