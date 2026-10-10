@@ -58,6 +58,7 @@ QUAD_BYTES = BLOCK * COLS * 2  # 512 B per issue
 
 
 def blocks_per_warp(gw: int) -> int:
+    """Blocks each of ``gw`` gather warps owns per tile; the split must leave whole quads of ids (one 16-B ``ldg`` each)."""
     if gw < 1 or N_BLOCKS % gw or (N_BLOCKS // gw) % 4:
         raise ValueError(f"gather warps must divide {N_BLOCKS} blocks into quads of ids (16-B ldg): got {gw}")
     return N_BLOCKS // gw
@@ -180,10 +181,12 @@ def roundtrip_host(
 
 
 def _fake_1d(dtype, align=16):
+    """A fake 1-D tensor of ``dtype`` (symbolic length) for ``cute.compile``."""
     return make_fake_tensor(dtype, (cute.sym_int(),), (1,), assumed_align=align)
 
 
 def _fake_rows(width: int):
+    """A fake ``[rows, width]`` bf16 tensor (symbolic row count, 16-B aligned) for ``cute.compile``."""
     return make_fake_tensor(cutlass.BFloat16, (cute.sym_int(), width), (width, 1), assumed_align=16)
 
 

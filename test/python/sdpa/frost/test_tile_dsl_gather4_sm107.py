@@ -52,6 +52,7 @@ def _probe():
 
 
 def _tile_dsl_source(name: str) -> str:
+    """Source text of ``python/cudnn/frost/tile_dsl/<name>`` as installed (the module under test, not a copy)."""
     import cudnn.frost.tile_dsl as tile_dsl
 
     with open(os.path.join(os.path.dirname(tile_dsl.__file__), name)) as f:
@@ -59,6 +60,7 @@ def _tile_dsl_source(name: str) -> str:
 
 
 def _code_lines(src: str) -> str:
+    """``src`` without its comment lines (so a mention in a comment cannot satisfy or trip an import check)."""
     return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
 
 
@@ -86,6 +88,7 @@ def test_gather4_primitive_imports_nothing_private_and_nothing_of_the_old_dsl():
 
 
 def test_tma_gather4_rejects_a_cta_group_outside_1_2():
+    """The ``cta_group`` contract is checked first, by value, before any operand is touched."""
     from cudnn.frost.tile_dsl.tma import tma_gather4
 
     with pytest.raises(ValueError, match="cta_group must be 1 or 2"):
@@ -162,12 +165,14 @@ def test_sm107a_trace_compile_gather4_form(tmp_path, cta_group):
 
 # ============================================================================ Rubin: the roundtrip
 def _stream():
+    """The current torch stream as a ``CUstream`` for the compiled probe."""
     import cuda.bindings.driver as cuda
 
     return cuda.CUstream(int(torch.cuda.current_stream().cuda_stream))
 
 
 def _skip_unless_the_dsl_serves_this_part():
+    """Typed skip (the adapter's own gate message) on a DSL that lacks this part's target."""
     from cudnn.frost.tile_dsl.requirements import tma_gather4_requirement_error
 
     msg = tma_gather4_requirement_error(tuple(torch.cuda.get_device_capability()))
@@ -205,6 +210,7 @@ _S = 4096  # table rows (tokens) of every roundtrip case: 1024 blocks of 4
 
 
 def _run_roundtrip(h_kv: int, gw: int, cta_group: int, n_cta: int, n_tiles: int = 2, *, seed: int = 0):
+    """Gather ``n_tiles`` tiles per CTA from a random table through the probe; returns the probe module, the table, the ids and the outputs."""
     P = _probe()
     dev = torch.device("cuda")
     g = torch.Generator().manual_seed(seed)
@@ -228,6 +234,7 @@ def _run_roundtrip(h_kv: int, gw: int, cta_group: int, n_cta: int, n_tiles: int 
 
 
 def _assert_bitwise(out, want, ids, label):
+    """Bitwise comparison of a gathered tile against ``kv[ids]``, naming the first mismatching rows and their block ids."""
     P = _probe()
     bad = (out != want).any(dim=1).nonzero().flatten()
     if bad.numel():

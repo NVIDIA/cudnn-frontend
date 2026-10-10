@@ -20,6 +20,7 @@ pytestmark = [pytest.mark.L0, requires_dsl]
 
 
 def _stream():
+    """The current torch stream as a ``CUstream`` for the compiled probe."""
     import cuda.bindings.driver as cuda
 
     return cuda.CUstream(int(torch.cuda.current_stream().cuda_stream))
@@ -58,9 +59,11 @@ def _probe():
         membership_kernel(scores, words, out, N, NW).launch(grid=(n_blocks, 1, 1), block=(128, 1, 1), stream=stream)
 
     def fake_1d(dtype):
+        """A fake 1-D tensor of ``dtype`` (symbolic length, 16-B aligned) for ``cute.compile``."""
         return make_fake_tensor(dtype, (cute.sym_int(),), (1,), assumed_align=16)
 
     def compile_membership(N: int, NW: int):
+        """Compile the probe for an ``N``-wide chunk over ``NW`` words."""
         return cute.compile(
             membership_host,
             fake_1d(cutlass.Float32),
@@ -78,6 +81,7 @@ def _probe():
 
 # ============================================================================ trace-time contracts (no device)
 def test_apply_membership_chunk_rejects_a_chunk_wider_than_two_words():
+    """``apply_membership_chunk`` serves 1..64 columns (two words); a wider chunk is refused by value."""
     from cudnn.frost.tile_dsl.mask import apply_membership_chunk
 
     with pytest.raises(ValueError, match="n must be in 1..64"):
@@ -85,6 +89,7 @@ def test_apply_membership_chunk_rejects_a_chunk_wider_than_two_words():
 
 
 def test_apply_membership_words_rejects_too_few_words_for_the_chunk():
+    """``apply_membership_words`` refuses a word list that covers fewer columns than the chunk."""
     from cudnn.frost.tile_dsl.mask import apply_membership_words
 
     with pytest.raises(ValueError, match="2 word\\(s\\) cover 64 columns, chunk has 96"):
@@ -93,6 +98,7 @@ def test_apply_membership_words_rejects_too_few_words_for_the_chunk():
 
 # ============================================================================ numerics (any CUDA device)
 def _reference(scores: torch.Tensor, words: torch.Tensor, N: int) -> torch.Tensor:
+    """torch twin of the membership mask: keep ``scores[c]`` iff bit ``c % 32`` of word ``c // 32`` is set, else ``-inf``."""
     bits = torch.arange(N, device=scores.device)
     w = words.to(torch.int64) & 0xFFFFFFFF  # [rows, NW] as unsigned
     sel = w[:, bits // 32]  # [rows, N]
