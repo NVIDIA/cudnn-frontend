@@ -162,7 +162,10 @@ set_compute_data_type(DataType_t value)
 - **Bias without scale** is refused with `INVALID_VALUE`, because the backend rejects it. Pass a scale of ones.
 - **Neither:** nothing states the normalization axes, so the same rule as [RMSNorm without a scale](#rmsnorm-graph-api)
   applies. `input` may have at most one non-unit dimension after the first, or, in training, the caller sets the
-  `mean` and `variance` dims.
+  `mean` or `variance` dims.
+
+In training, a `mean` or `variance` whose dims are not set takes the dims set on the other one; `validate()` refuses
+the two with different dims.
 
 ### Python API
 

@@ -78,10 +78,11 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
                 }
             }
 
-            auto mean = attributes.outputs[Layernorm_attributes::output_names::MEAN];
-            // Only infer dims and strides if user did not set them
+            auto mean    = attributes.outputs[Layernorm_attributes::output_names::MEAN];
+            auto inv_var = attributes.outputs[Layernorm_attributes::output_names::INV_VARIANCE];
+            // Only infer dims and strides if user did not set them; an unset stat takes the dims set on the other one
             if (mean->get_dim().empty()) {
-                mean->set_dim(stats_dim);
+                mean->set_dim(inv_var->get_dim().empty() ? stats_dim : inv_var->get_dim());
             }
             if (mean->get_stride().empty()) {
                 auto const& mean_dim = mean->get_dim();
@@ -91,11 +92,13 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
                 mean->set_stride(detail::generate_stride(mean_dim, stride_order));
             }
 
-            auto inv_var = attributes.outputs[Layernorm_attributes::output_names::INV_VARIANCE];
             // Only infer dims and strides if user did not set them
             if (inv_var->get_dim().empty()) {
-                inv_var->set_dim(stats_dim);
+                inv_var->set_dim(mean->get_dim());
             }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(mean->get_dim() != inv_var->get_dim(),
+                                           error_code_t::INVALID_VALUE,
+                                           "Layernorm MEAN and INV_VARIANCE dims differ.");
             if (inv_var->get_stride().empty()) {
                 auto const& inv_var_dim = inv_var->get_dim();
                 std::vector<int64_t> stride_order;
@@ -150,15 +153,18 @@ class LayerNormNode : public NodeCRTP<LayerNormNode> {
                 x_dim.empty() ? 0 : std::count_if(x_dim.begin() + 1, x_dim.end(), [](int64_t d) { return d != 1; });
             bool stats_dims_set = false;
             if (attributes.forward_phase == NormFwdPhase_t::TRAINING) {
-                auto const inv_var_it = attributes.outputs.find(Layernorm_attributes::output_names::INV_VARIANCE);
-                stats_dims_set        = inv_var_it != attributes.outputs.end() && inv_var_it->second != nullptr &&
-                                 !inv_var_it->second->get_dim().empty();
+                for (auto name :
+                     {Layernorm_attributes::output_names::MEAN, Layernorm_attributes::output_names::INV_VARIANCE}) {
+                    auto const it = attributes.outputs.find(name);
+                    stats_dims_set |=
+                        it != attributes.outputs.end() && it->second != nullptr && !it->second->get_dim().empty();
+                }
             }
             RETURN_CUDNN_FRONTEND_ERROR_IF(
                 non_unit_axes > 1 && !stats_dims_set,
                 error_code_t::INVALID_VALUE,
                 "Layernorm without scale: X has more than one non-unit dimension after the first, so the normalization "
-                "axes are ambiguous. Pass a scale, reshape X to {rows, hidden, 1, 1}, or (training) set the MEAN and "
+                "axes are ambiguous. Pass a scale, reshape X to {rows, hidden, 1, 1}, or (training) set the MEAN or "
                 "INV_VARIANCE dims.");
         }
 

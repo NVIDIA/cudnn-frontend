@@ -392,6 +392,49 @@ def test_layernorm_without_scale_refuses_ambiguous_axes(phase, cudnn_handle):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("set_stat", ["mean", "inv_var"])
+def test_layernorm_without_scale_one_stat_dims_state_the_axes(set_stat, cudnn_handle):
+    """Training ``{B, S, H}`` with no affine: dims set on one stat are enough, and the other stat takes them."""
+    B, S, H = 2, 8, 64
+    x = make_seeded_randn((B, S, H), torch.float32, 2108)
+    graph, X, _, eps, Y, mean, inv_var = _layernorm_graph(cudnn_handle, x)
+    (mean if set_stat == "mean" else inv_var).set_dim([B, S, 1]).set_stride([S, 1, 1])
+    graph.validate()
+    # callers allocate the stats from these dims right after validate()
+    assert [int(d) for d in mean.get_dim()] == [int(d) for d in inv_var.get_dim()] == [B, S, 1]
+    y = torch.full_like(x, float("nan"))
+    stats = _execute(graph, cudnn_handle, x, {X: x, eps: torch.full((1, 1, 1), 1e-5), Y: y}, (mean, inv_var))
+    assert [int(d) for d in mean.get_dim()] == [int(d) for d in inv_var.get_dim()] == [B, S, 1]
+    y_expected, mean_expected, inv_variance_expected = _manual_layernorm(x, torch.ones(H, device="cuda"), None, 1e-5)
+    torch.testing.assert_close(y, y_expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(stats[mean], mean_expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(stats[inv_var], inv_variance_expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.L0
+def test_layernorm_stats_keep_a_stride_the_caller_set(cudnn_handle):
+    """Re-inferring the stats dims at validate() must not replace a stride the caller set without dims."""
+    x = make_seeded_randn((2, 8, 64), torch.float32, 2110)
+    graph, _, _, _, _, mean, inv_var = _layernorm_graph(cudnn_handle, x, scale_shape=(1, 1, 64))
+    for t in (mean, inv_var):
+        t.set_stride([16, 2, 1])
+    graph.validate()
+    assert [int(s) for s in mean.get_stride()] == [int(s) for s in inv_var.get_stride()] == [16, 2, 1]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale_shape", [None, (1, 1, 64)], ids=["no_scale", "scale"])
+def test_layernorm_refuses_stats_with_different_dims(scale_shape, cudnn_handle):
+    """``mean`` and ``inv_var`` with different dims are refused at validate(), not at build_operation_graph()."""
+    x = make_seeded_randn((2, 8, 64), torch.float32, 2109)
+    graph, _, _, _, _, mean, inv_var = _layernorm_graph(cudnn_handle, x, scale_shape=scale_shape)
+    mean.set_dim([2, 8, 1]).set_stride([8, 1, 1])
+    inv_var.set_dim([2, 1, 1]).set_stride([1, 1, 1])
+    with pytest.raises(Exception, match="MEAN and INV_VARIANCE dims differ"):
+        graph.validate()
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("phase", _PHASES, ids=["inference", "training"])
 def test_adalayernorm_forward_without_bias(phase, cudnn_handle):
     """``adalayernorm``'s binding has always defaulted ``bias`` to ``None``; the C++ node used to dereference it."""

@@ -4,6 +4,7 @@
  */
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -398,27 +399,44 @@ TEST_CASE("Layernorm forward with optional scale and bias", "[graph][layernorm][
             T->set_output(true).set_data_type(fe::DataType_t::FLOAT);
             if (!stats_dim.empty()) T->set_dim(stats_dim).set_stride(packed(stats_dim));
         }
-        return std::make_pair(graph, inv_var);
+        return std::make_tuple(graph, mean, inv_var);
     };
 
     for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
         // Scale without bias (LayerNorm(bias=False)). This used to dereference the null bias.
-        auto [graph, inv_var] = make({4, 16, 128}, phase, 0, {});
+        auto [graph, mean, inv_var] = make({4, 16, 128}, phase, 0, {});
         REQUIRE(graph->validate().is_good());
         if (inv_var) REQUIRE(inv_var->get_dim() == std::vector<int64_t>{4, 16, 1});
 
         // The backend refuses a bias without a scale; say so before it does.
-        REQUIRE(make({4, 16, 128}, phase, 1, {}).first->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+        REQUIRE(std::get<0>(make({4, 16, 128}, phase, 1, {}))->validate().get_code() ==
+                fe::error_code_t::INVALID_VALUE);
 
         // Neither: unambiguous with one non-unit axis after the first, refused otherwise (as for rmsnorm).
-        auto [plain, plain_inv_var] = make({64, 128, 1, 1}, phase, 2, {});
+        auto [plain, plain_mean, plain_inv_var] = make({64, 128, 1, 1}, phase, 2, {});
         REQUIRE(plain->validate().is_good());
         if (plain_inv_var) REQUIRE(plain_inv_var->get_dim() == std::vector<int64_t>{64, 1, 1, 1});
-        REQUIRE(make({4, 16, 128}, phase, 2, {}).first->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+        REQUIRE(std::get<0>(make({4, 16, 128}, phase, 2, {}))->validate().get_code() ==
+                fe::error_code_t::INVALID_VALUE);
     }
 
     // Explicit stats dims state the axes.
-    REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, 2, {4, 16, 1}).first->validate().is_good());
+    REQUIRE(std::get<0>(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, 2, {4, 16, 1}))->validate().is_good());
+
+    // Dims set on one stat are enough: the other takes them. Stats with different dims are refused.
+    for (int set_mean : {0, 1}) {
+        auto [graph, mean, inv_var] = make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, 2, {});
+        (set_mean ? mean : inv_var)->set_dim({4, 16, 1}).set_stride({16, 1, 1});
+        REQUIRE(graph->validate().is_good());
+        REQUIRE(mean->get_dim() == std::vector<int64_t>{4, 16, 1});
+        REQUIRE(inv_var->get_dim() == std::vector<int64_t>{4, 16, 1});
+    }
+    for (int affine : {0, 2}) {
+        auto [graph, mean, inv_var] = make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, affine, {});
+        mean->set_dim({4, 16, 1}).set_stride({16, 1, 1});
+        inv_var->set_dim({4, 1, 1}).set_stride({1, 1, 1});
+        REQUIRE(graph->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+    }
 }
 
 TEST_CASE("AdaLayernorm forward without bias", "[graph][adalayernorm][validate]") {
