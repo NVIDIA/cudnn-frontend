@@ -378,6 +378,13 @@ def _tma_gather4_k_rows(
 
 
 class IndexerBackwardSm100:
+    """Warp-specialized SM100 GEMM stage for sparse indexer backward.
+
+    Compact H32 tensors use the same internal M64 TCGEN05 schedule as H64:
+    out-of-range Q rows and weights are zero-filled, while dQ/dW stores are
+    clipped to the logical head count.
+    """
+
     arch = 100
     WARP_SIZE = 32
     WARPGROUP_SIZE = 128
@@ -411,6 +418,19 @@ class IndexerBackwardSm100:
         topk_indices_global: bool = True,
         enable_score_pdl: bool = False,
     ):
+        """Configure tiling, persistence, sparse-index convention, and PDL.
+
+        Args:
+            head_dim: Logical Q/K head dimension.
+            heads: Logical query-head count; H32 and H64-or-larger are valid.
+            block_I: Sparse top-k block width; ``topk`` must be divisible by it.
+            topk: Number of selected KV rows per query row.
+            total_seqlen_k: Runtime KV capacity metadata retained by the factory.
+            total_rows: Total query rows, used only to select launch policy.
+            persistent_grid_size: CTA count available to a persistent launch.
+            topk_indices_global: Whether indices are already flattened across batches.
+            enable_score_pdl: Allow dependency overlap with the preceding score grid.
+        """
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
@@ -742,6 +762,7 @@ class IndexerBackwardSm100:
         seqlen: Int32,
         batch_size: Int32,
     ):
+        """Run the warp-specialized GEMMs in serial-row or persistent-row mode."""
         # ScoreGrad launches this grid programmatically.  Serial rows wait at
         # entry; the cross-row persistent path delays the wait until its load
         # warp has issued the independent first-row Q TMA, allowing the Q/K

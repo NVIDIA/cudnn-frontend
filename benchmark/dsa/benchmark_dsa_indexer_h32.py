@@ -32,6 +32,7 @@ from cudnn import DSA
 
 
 def _make_case(batch: int, seqlen_q: int, seqlen_k: int, topk: int, seed: int):
+    """Allocate deterministic compact-H32 inputs and sparse-score operands."""
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     q32 = torch.randn((batch, seqlen_q, 32, 128), device="cuda", dtype=torch.bfloat16, generator=generator)
@@ -45,6 +46,7 @@ def _make_case(batch: int, seqlen_q: int, seqlen_k: int, topk: int, seed: int):
 
 
 def _outputs(q: torch.Tensor, w: torch.Tensor, k: torch.Tensor):
+    """Allocate caller-owned dQ/dW buffers and an FP32 dK accumulator."""
     return (
         torch.empty_like(q),
         torch.empty_like(w),
@@ -53,6 +55,7 @@ def _outputs(q: torch.Tensor, w: torch.Tensor, k: torch.Tensor):
 
 
 def _call(q, w, k, attn, predict, indices, grad_loss, outputs):
+    """Launch the default indexer-backward backend into supplied outputs."""
     d_index_q, d_weights, d_index_k = outputs
     return DSA.indexer_backward_wrapper(
         q,
@@ -74,6 +77,7 @@ def _call(q, w, k, attn, predict, indices, grad_loss, outputs):
 
 
 def _time_once(label, fn, attn, attn_base, l2_flush):
+    """Restore destructive input state, flush L2, and time one call in microseconds."""
     l2_flush.zero_()
     attn.copy_(attn_base)
     start = torch.cuda.Event(enable_timing=True)
@@ -87,6 +91,7 @@ def _time_once(label, fn, attn, attn_base, l2_flush):
 
 
 def main():
+    """Run the two-path benchmark or emit one profiler-delimited launch."""
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", nargs="?", default="benchmark", choices=("benchmark", "profile"))
     parser.add_argument("--batch", type=int, default=1)
@@ -103,8 +108,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if torch.cuda.get_device_capability() != (10, 0):
-        raise RuntimeError("benchmark requires an SM100 GPU")
+    if torch.cuda.get_device_capability()[0] != 10:
+        raise RuntimeError("benchmark requires an SM100-family GPU (compute capability 10.x)")
     if args.topk <= 0 or args.topk % 128 != 0:
         raise ValueError("topk must be a positive multiple of 128")
 
@@ -126,6 +131,7 @@ def main():
     compact_h32 = lambda: _call(q32, w32, k, attn32, predict, indices, grad_loss, out32)
 
     def eager_pad_h64():
+        """Materialize H64 inputs on every call before launching the baseline."""
         q64_runtime = torch.nn.functional.pad(q32, (0, 0, 0, 32))
         w64_runtime = torch.nn.functional.pad(w32, (0, 32))
         return _call(q64_runtime, w64_runtime, k, attn64_eager, predict, indices, grad_loss, out64_eager)

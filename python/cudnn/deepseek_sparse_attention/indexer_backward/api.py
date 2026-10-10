@@ -371,6 +371,7 @@ class IndexerBackward(APIBase):
         self._plan_layout_validated = True
 
     def check_support(self) -> bool:
+        """Validate the common tensor contract and selected backend envelope."""
         # The generic gate reads the plan's own device for backend="sm100_v2"
         # (its kernel is compiled under that device, and a param-less query
         # would reject a valid plan whenever an unrelated pre-SM90 device
