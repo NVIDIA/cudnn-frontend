@@ -392,6 +392,104 @@ def test_DSA_sparse_attention_backward_qcluster_matches_baseline_and_graph(heads
         plan.execute(q, kv, out, dout, lse, sink, topk_idxs, aliased_dq, direct_dkv, lengths, scale, workspace=direct_workspace, d_sink=direct_d_sink)
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize("heads", [16, 32])
+def test_DSA_sparse_attention_backward_qcluster_graph_replay_switches_overlap_path(heads):
+    """One captured graph follows in-place high/zero/high overlap changes."""
+    _require_exact_sm100()
+    from cudnn import DSA
+
+    torch.manual_seed(32)
+    q_len, topk, kv_len, dim = 4, 512, 2048, 576
+    overlap = 3 * topk // 4
+    rows = torch.arange(kv_len, dtype=torch.int32, device="cuda").view(q_len, topk)
+    high_overlap = rows.clone()
+    high_overlap[1] = torch.cat((rows[0, :overlap], rows[1, : topk - overlap]))
+    high_overlap[3] = torch.cat((rows[2, :overlap], rows[3, : topk - overlap]))
+    zero_overlap = rows.clone()
+
+    q = torch.randn(q_len, heads, dim, dtype=torch.bfloat16, device="cuda") / 10
+    kv = torch.randn(kv_len, dim, dtype=torch.bfloat16, device="cuda") / 10
+    sink = torch.randn(heads, dtype=torch.float32, device="cuda")
+    dout = torch.randn(q_len, heads, 512, dtype=torch.bfloat16, device="cuda") / 10
+    scale = dim**-0.5
+    high_out, high_lse = ref_sparse_attention_forward_chunked(q, kv, sink, high_overlap, softmax_scale=scale)
+    zero_out, zero_lse = ref_sparse_attention_forward_chunked(q, kv, sink, zero_overlap, softmax_scale=scale)
+    baselines = {
+        "high": DSA.sparse_attention_backward_wrapper(q, kv, high_out, dout, high_lse, sink, high_overlap, softmax_scale=scale),
+        "zero": DSA.sparse_attention_backward_wrapper(q, kv, zero_out, dout, zero_lse, sink, zero_overlap, softmax_scale=scale),
+    }
+
+    runtime_indices = high_overlap.clone()
+    runtime_out = high_out.clone()
+    runtime_lse = high_lse.clone()
+    plan = DSA.SparseAttentionBackward(
+        q,
+        kv,
+        runtime_out,
+        dout,
+        runtime_lse,
+        sink,
+        runtime_indices,
+        softmax_scale=scale,
+        q_cluster_mode="adaptive_pair",
+    )
+    assert plan.check_support()
+    plan.compile()
+    assert plan._qcluster_plan is not None
+    workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    dq, dkv, d_sink = torch.empty_like(q), torch.empty_like(kv), torch.empty_like(sink)
+
+    def run():
+        return plan.execute(
+            q,
+            kv,
+            runtime_out,
+            dout,
+            runtime_lse,
+            sink,
+            runtime_indices,
+            dq,
+            dkv,
+            softmax_scale=scale,
+            workspace=workspace,
+            d_sink=d_sink,
+        )
+
+    def assert_state(actual, expected, expected_shared):
+        for name, tensor in zip(("dq", "dkv", "d_sink"), actual):
+            torch.testing.assert_close(tensor, baselines[expected][name], rtol=5e-2, atol=5e-2, msg=f"{expected} {name}")
+        shared_lengths = plan._qcluster_plan._buffers(workspace)[4]
+        assert torch.equal(shared_lengths, torch.full_like(shared_lengths, expected_shared))
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run_outputs = run()
+
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_state(run_outputs, "high", overlap)
+
+        runtime_indices.copy_(zero_overlap)
+        runtime_out.copy_(zero_out)
+        runtime_lse.copy_(zero_lse)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_state(run_outputs, "zero", 0)
+
+        runtime_indices.copy_(high_overlap)
+        runtime_out.copy_(high_out)
+        runtime_lse.copy_(high_lse)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_state(run_outputs, "high", overlap)
+    finally:
+        graph.reset()
+
+
 @pytest.mark.L0
 def test_DSA_sparse_attention_backward_deterministic_policy_is_independent():
     """Keep deterministic scheduling policy separate from ordinary tuning."""

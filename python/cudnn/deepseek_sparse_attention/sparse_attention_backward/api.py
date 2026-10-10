@@ -50,7 +50,8 @@ class SparseAttentionBackward(APIBase):
 
         ``q_cluster_mode='adaptive_pair'`` opts H16/H32 Dqk576 into the
         graph-safe adjacent-query sharing plan; the default keeps the existing
-        backend unchanged.
+        backend unchanged. H16 ``topk_max <= 256`` and H32 ``topk_max <= 128``
+        accept the mode but retain the ordinary backend.
         """
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -445,7 +446,8 @@ def sparse_attention_backward_wrapper(
     the GPU and evaluates a profitable shared KV segment once. The opt-in
     SM100/SM103 BF16 H16/H32 Dqk576 path accepts contiguous raw top-k rows with
     ``topk_max <= 2048``, requires non-deterministic execution, and remains
-    graph-capturable. Low-overlap pairs fall back on device.
+    graph-capturable. Low-overlap pairs fall back on device; H16
+    ``topk_max <= 256`` and H32 ``topk_max <= 128`` use the ordinary backend.
     The wrapper stages strided inputs and outputs and allocates omitted outputs
     or workspace on the launch stream; the plan's ``execute()`` does neither.
     """

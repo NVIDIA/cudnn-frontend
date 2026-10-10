@@ -230,7 +230,8 @@ with `topk_max` rather than `total_S_kv`; invalid, duplicate, low-overlap, and
 an odd final query retain the ordinary per-query work. The mode is opt-in,
 non-deterministic, CUDA Graph compatible, and supports `topk_max <= 2048`.
 It is intended for high-overlap workloads; the device-side partition still
-runs when a pair falls back to ordinary work.
+runs when a pair falls back to ordinary work. H16 `topk_max <= 256` and H32
+`topk_max <= 128` accept the mode but compile the ordinary backend directly.
 
 The H128 specialization keeps the five tensor-core products in one
 two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
