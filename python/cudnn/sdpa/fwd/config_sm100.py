@@ -207,13 +207,15 @@ class TemplateParams:
     # Being a TemplateParams field it is part of the module-cache key: gate on/off are two coexisting
     # specializations of one template, and an ungated module traces byte-identically to before the field existed.
     epilogue_gate: bool = False
-    # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g <= D256_DECODE_ROUTED_MAX_Q_ROWS)
-    # lower onto sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride
-    # the MMA M axis and the packed Q rows ride N, so the MMA and exp work
-    # scale with the LIVE rows instead of a 128-row Q tile.  The value is the
-    # N extent the kernel is compiled for (16, or 32 at the template level, from
-    # decode_d256_q_tile); 0 = the prefill tile.  Plan-time only (S_q is a
-    # declared shape).
+    # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g within the arch line's routed
+    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's on cc 10.7, where the
+    # 32-column tile serves the MTP step in token units) lower onto
+    # sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride the MMA M axis
+    # and the packed Q rows ride N, so the MMA and exp work scale with the LIVE
+    # rows instead of a 128-row Q tile.  The value is the N extent the kernel is
+    # compiled for -- the rows of ONE token unit (16, or 32 at the template level
+    # and on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
+    # Plan-time only (S_q is a declared shape).
     decode_q_tile: int = 0
     # The 128-row DECODE tile (sm100/decode_d128_f16.py) for flavors that do not
     # key it off cta_mma.  d128 routes that tile by cga1, because its prefill
@@ -1070,28 +1072,68 @@ def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
 # 3-slot 64 KiB K/V ring, the Q tile and the two P^T buffers inside 227 KiB).
 D256_DECODE_MAX_Q_ROWS = 32
 _D256_DECODE_Q_TILES = (16, 32)
-# Largest packed Q-row count the adapter ROUTES onto the decode tile.  The
-# 32-column tile (two softmax column groups over the same 128 TMEM lanes) is
-# compiled and tested at the template level but issue-bound per CTA: at b=32
-# x 2 KV heads x 4096 keys (B200) it streams a KV tile in 2.8 us against the
-# 16-column tile's 1.75 us -- 90 us unsplit where the prefill tile takes 66
-# us -- and its split-2 plan (58 us of GPU time) costs an eager caller 96-103
-# us per execute for the second launch.  Until its per-CTA issue rate is
-# fixed, S_q x G in (16, 32] stays on the prefill tile, which serves those
-# shapes at its previous numbers in both regimes (eager and CUDA-graph
-# replay).  Raising this to D256_DECODE_MAX_Q_ROWS routes the wide tile.
+# Largest packed Q-row count the adapter ROUTES onto the decode tile ON THE
+# BLACKWELL LINE (SM100 / SM103).  The 32-column tile (two softmax column groups
+# over the same 128 TMEM lanes) is compiled and tested at the template level but
+# issue-bound per CTA there: at b=32 x 2 KV heads x 4096 keys (B200) it streams
+# a KV tile in 2.8 us against the 16-column tile's 1.75 us -- 90 us unsplit
+# where the prefill tile takes 66 us -- and its split-2 plan (58 us of GPU time)
+# costs an eager caller 96-103 us per execute for the second launch.  Until its
+# per-CTA issue rate is fixed, S_q x G in (16, 32] stays on the prefill tile on
+# this line, which serves those shapes at its previous numbers in both regimes
+# (eager and CUDA-graph replay).  The Rubin line routes the wide tile, in TOKEN
+# UNITS of two tokens for the MTP step: config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS
+# (32) / D256_DECODE_ROUTED_MAX_TOKEN_UNITS (2) and config_sm107.decode_d256_q_tile,
+# measured on cc 10.7 against the prefill body at the 24/2 geometry.
 D256_DECODE_ROUTED_MAX_Q_ROWS = 16
+# The 16-column tile: one unit covers S_q x pack_g <= 16 rows (today's decode step).
+_D256_DECODE_NARROW_Q_TILE = 16
 
 
-def decode_d256_q_tile(s_q: int, pack_g: int) -> int:
-    """The decode tile's N extent for ``s_q`` tokens packed ``pack_g`` heads per
-    token (1 = unpacked), or 0 when the prefill tile serves the graph: no rows,
-    or more than D256_DECODE_ROUTED_MAX_Q_ROWS of them (the 32-column tile is a
-    valid ``make_cfg_d256_decode`` record but is not routed)."""
-    rows = int(s_q) * int(pack_g)
-    if rows <= 0 or rows > D256_DECODE_ROUTED_MAX_Q_ROWS:
+def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE_ROUTED_MAX_Q_ROWS, max_token_units: int = 1) -> int:
+    """The decode tile's N extent -- the Q rows of ONE TOKEN UNIT -- for ``s_q``
+    tokens packed ``pack_g`` heads per token (1 = unpacked), or 0 when the
+    prefill tile serves the graph.
+
+    ``routed_max_rows`` is the widest tile the caller's arch line routes (16 on
+    SM100 / SM103, where the 32-column tile is a valid ``make_cfg_d256_decode``
+    record but is not routed; 32 on cc 10.7); ``max_token_units`` how many
+    token units of ``N // pack_g`` consecutive tokens a (head group, batch,
+    split) may be cut into (the kernel's ``Q_TOKEN_UNITS`` axis: each unit
+    streams the KV range once more, so a line admits it only where it measured
+    the trade -- 1 everywhere but cc 10.7, which measured the 24/2 MTP form and
+    admits two units for every packed group the tile holds).  The rule: rows that fit
+    the 16-column tile ride it in one unit (the KV streamed once, the cheapest
+    per-CTA stream); past 16 rows the 32-column tile serves
+    ``ceil(s_q / (32 // pack_g))`` units when that count is within the cap and
+    the group fits the tile, else 0.  With the defaults this is the SM100 rule
+    verbatim (16 for S_q x G <= 16 rows, 0 above)."""
+    s_q, pack_g = int(s_q), int(pack_g)
+    if s_q <= 0 or pack_g <= 0:
         return 0
-    return next(n for n in _D256_DECODE_Q_TILES if rows <= n)
+    rows = s_q * pack_g
+    if rows <= _D256_DECODE_NARROW_Q_TILE:
+        return _D256_DECODE_NARROW_Q_TILE
+    wide = D256_DECODE_MAX_Q_ROWS
+    if wide > int(routed_max_rows) or pack_g > wide:
+        return 0
+    if decode_d256_q_units(s_q, pack_g, wide) > int(max_token_units):
+        return 0
+    return wide
+
+
+def decode_d256_q_units(s_q: int, pack_g: int, n_q: int) -> int:
+    """How many TOKEN UNITS (CTAs per (head group, batch, split)) the decode tile of N
+    extent ``n_q`` launches for ``s_q`` tokens packed ``pack_g`` heads per token:
+    ``ceil(s_q / (n_q // pack_g))`` -- the kernel's own derivation (``Q_BOX_TOKENS =
+    N_Q // HEADS_PER_TILE``); 0 when ``n_q`` is 0 (the prefill tile) or the group does
+    not fit the tile.  The decode split model's unit count is ``batch x head groups x
+    this``."""
+    s_q, pack_g, n_q = int(s_q), int(pack_g), int(n_q)
+    if n_q <= 0 or pack_g <= 0 or s_q <= 0 or pack_g > n_q:
+        return 0
+    tokens_per_unit = n_q // pack_g
+    return -(-s_q // tokens_per_unit)
 
 
 @dataclass(frozen=True)

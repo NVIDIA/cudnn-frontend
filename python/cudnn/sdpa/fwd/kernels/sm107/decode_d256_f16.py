@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Decode-shaped SDPA forward for the SM100 d256 f16/bf16 flavor: the swap-AB tile.
+"""Decode-shaped SDPA forward for the SM107 (Rubin) d256 f16/bf16 flavor: the swap-AB tile.
 
 Why a second template.  The prefill tile (sm100/prefill_d256_f16.py) issues
 BMM1 / BMM2 over a 256-row collective Q tile per 128-key KV tile whatever the
@@ -29,15 +29,16 @@ and a 4-way exchange through shared memory across a 4-warp group, once per KV
 tile.  A group owns 16 columns; N_Q = 32 runs two groups (8 softmax warps)
 over the same 128 TMEM lanes, so the per-thread exp / shuffle / register load
 is the same at either tile width (one 4-warp group over 32 columns was
-issue-bound and lost to the prefill tile on the S_q = 2 MTP shape).  Even so
+issue-bound and lost to the prefill tile on the S_q = 2 MTP shape).  On B200
 the 32-column tile streams a KV tile 1.6x slower per CTA than the 16-column
 one (2.8 vs 1.75 us; 90 us unsplit at b=32 x 2 KV heads x 4096 keys where the
-prefill tile takes 66 us), so it compiles and is tested at the template level
-but the Blackwell adapter does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
-its per-CTA issue rate is the open kernel item here.  The Rubin sibling
-(sm107/decode_d256_f16.py) IS routed onto it, in up to two TOKEN UNITS for a
-packed MTP step (config_sm107.decode_d256_q_tile, measured on cc 10.7 at the
-24/2 geometry; the other geometries inside that route ride the rule unmeasured).
+prefill tile takes 66 us), so the Blackwell adapter compiles and tests it at
+the template level but does not route it (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS);
+the Rubin adapter ROUTES it (config_sm107.decode_d256_q_tile, measured on cc 10.7
+against the prefill body at the 24/2 geometry; the other geometries inside the
+route ride the same rule unmeasured): rows in (16, 32] in one unit, and a packed
+MTP step of up to four tokens (24/2: 48 rows) as TWO token units of two tokens x
+12 heads on the 32-column tile, each streaming the KV range once.
 P^T is stored to a small swizzled SMEM tile (the B operand of BMM2 is
 MN-major: the N_Q values of one key are contiguous), V is consumed in place
 as an MN-major A operand (d_v contiguous), and O^T accumulates in TMEM with
@@ -70,10 +71,23 @@ tables and the split chunking are all resolved on device. The host uses the
 explicit pointer ABI: extents and Int64 strides are runtime arguments, while
 head dimensions, Stats presence and the paged in-page layout specialize compile().
 
+Rubin (SM107) sibling of sm100/decode_d256_f16.py: the SAME body (cta_group::1,
+6 / 10 warps, f16 TILE_K_HW = 16 on both arch lines, 64 TMEM columns) under
+config_sm107.make_cfg_d256_decode, which re-validates the shared CfgD256Decode
+record against the Rubin facts -- the 320 KiB usable carveout (the tile's 209 /
+226 KiB at N_Q = 16 / 32 fit the STANDARD 227 KiB carveout, so no oversized-SMEM
+launch and no L1 shrink) and the 256 KiB version-0 tcgen05 descriptor window
+(every MMA-operand slab starts below it; DESC_VERSION is DERIVED from the layout,
+never assumed).  SPIN_RING_WAITS is this kernel's own measured constant (the
+sleeping form until its A/B on an exclusive Rubin GPU).  Kept line-for-line with
+the SM100 body apart from those declarations (pinned by the twin-diff test in
+test_sdpa_fwd_decode_d256_sm107.py): a fix to the tile lands in BOTH files.
+
 Not served here (the adapter keeps these on the prefill tile): THD queries,
-S_q * pack_g > 16 rows on the Blackwell line (N_Q = 32 compiles but is not
-routed there, see above; the body's token-unit axis is exercised by the Rubin
-route), FP8/MXFP8.
+graphs past the Rubin route (config_sm107.decode_d256_q_tile: more than two
+token units of the 32-column tile for a packed step, an unpacked / MHA step above
+32 tokens, a head group wider than the tile), FP8/MXFP8, the fused epilogue gate
+and the pre-folded softmax scale (the Rubin d256 prefill kernel carries both).
 """
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
@@ -90,13 +104,36 @@ from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
 import cuda.bindings.driver as _cuda_driver  # noqa: F401
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d256_decode
+from cudnn.frost.buffers import cutedsl_arch_requirement_error
+from cudnn.sdpa.fwd.config_sm107 import TemplateParams, d256_decode_desc_version, make_cfg_d256_decode
 
 # The per-graph params are injected as a module global by the loader
 # (api._load_kernel_module) before this body executes; a plain import gets a
 # padded fp16 decode config for N_Q = 16.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams(decode_q_tile=16, seq_kv_lens_present=True))
 CFG, _TMA = make_cfg_d256_decode(PARAMS)
+
+# CuTe DSL version gate (python/cudnn/AGENTS.md Rule 7): sm_107a needs the public 4.8.0 wheel; below it
+# every compile on a Rubin box dies inside the DSL (`KeyError: 'sm_107a'`).  The adapter declines first
+# (SdpaFwdDslSm100.check_support); this is the typed backstop for a direct template load, placed BEFORE
+# the kernel body is defined so the message names the installed version, never a DSL internal.
+_DSL_ARCH_ERROR = cutedsl_arch_requirement_error((10, 7))
+if _DSL_ARCH_ERROR is not None:
+    raise NotImplementedError(f"decode_d256_f16 (sm107): {_DSL_ARCH_ERROR}")
+
+# tcgen05 SMEM-descriptor version for EVERY SmemTile in this module -- ONE decision point, DERIVED from
+# the layout by config_sm107.d256_decode_desc_version (0: the highest MMA-operand slab, P^T, starts at
+# 200 / 208 KiB, under the 256 KiB version-0 window) and wired into every construction below, never a
+# per-tile literal (the sm107 discipline: a re-literalled descriptor version is how the d512 MXFP8 sibling
+# shipped NaN on 100 % of cells; test_sm107_decode_every_smem_tile_takes_the_module_desc_version).
+DESC_VERSION: int = d256_decode_desc_version(CFG)
+# Retry form of the per-KV-iteration RING waits (kv_full / kv_empty, s_full / s_empty, p_full and the
+# in-loop bmm2_done): every such site passes the constant as its spin keyword; the one-shot waits
+# (q_full, the epilogue's last bmm2_done, tmem_dealloc) keep the default sleeping form.  A MEASURED
+# per-kernel fact (frost-tile-dsl.md section 8b: +5.5 % on one sm107 kernel, -5.8 % on another): False =
+# the sleeping form the SM100 body runs, until this tile's own A/B on an exclusive Rubin GPU; flipping the
+# constant IS the whole experiment (test_sm107_decode_ring_waits_take_the_module_spin_constant).
+SPIN_RING_WAITS: bool = False
 
 from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, advance
 from cudnn.frost.tile_dsl.mma import mma_ss
@@ -401,14 +438,14 @@ def _tmaldg_warp_group(
         # K(t+1)'s slot frees (start of iteration t).  The MMA warp consumes in the
         # same order, so one 3-slot ring serves both operands (see _kv_slot).
         kv_state = PipelineState.start(phase=1)
-        bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase)
+        bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
         bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES, pred=nvvm.elect_sync())
         _load_kv(sKV[kv_state.idx], tma_k, block_table_tensor, batch_idx, kv_head_idx, n_pages_b, lo, bars.mb_kv_full[kv_state.idx].smem_ptr)
         kv_state = advance(kv_state, STAGES)
         for i in cutlass.range(0, n_tiles, 1, unroll=1):
             kv_tile = lo + i
             if i + cutlass.Int32(1) < n_tiles:
-                bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase)
+                bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                 bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES, pred=nvvm.elect_sync())
                 _load_kv(
                     sKV[kv_state.idx],
@@ -421,7 +458,7 @@ def _tmaldg_warp_group(
                     bars.mb_kv_full[kv_state.idx].smem_ptr,
                 )
                 kv_state = advance(kv_state, STAGES)
-            bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase)
+            bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
             bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES, pred=nvvm.elect_sync())
             _load_kv(sKV[kv_state.idx], tma_v, block_table_v_tensor, batch_idx, kv_head_idx, n_pages_b, kv_tile, bars.mb_kv_full[kv_state.idx].smem_ptr)
             kv_state = advance(kv_state, STAGES)
@@ -512,8 +549,8 @@ def _mma_warp_group(
 
         # Prologue: BMM1(0).
         slot0, phase0 = _kv_slot(cutlass.Int32(0), n_tiles)
-        bars.mb_kv_full[slot0].wait(phase0)
-        bars.mb_s_empty[0].wait(cutlass.Int32(1))
+        bars.mb_kv_full[slot0].wait(phase0, spin=SPIN_RING_WAITS)
+        bars.mb_s_empty[0].wait(cutlass.Int32(1), spin=SPIN_RING_WAITS)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
         mma_ss(bmm1_desc, sK[slot0].desc(), desc_Q, tmem_raw.subview(cutlass.Int32(S_ACC_OFF[0])))
         elect_p = nvvm.elect_sync()
@@ -528,8 +565,8 @@ def _mma_warp_group(
                 slot_k, phase_k = _kv_slot(cutlass.Int32(2) * t_next - cutlass.Int32(1), n_tiles)
                 par_next = t_next & cutlass.Int32(1)
                 phase_s_empty = ((t_next // cutlass.Int32(2)) - cutlass.Int32(1)) & cutlass.Int32(1)
-                bars.mb_kv_full[slot_k].wait(phase_k)
-                bars.mb_s_empty[par_next].wait(phase_s_empty)
+                bars.mb_kv_full[slot_k].wait(phase_k, spin=SPIN_RING_WAITS)
+                bars.mb_s_empty[par_next].wait(phase_s_empty, spin=SPIN_RING_WAITS)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
                 s_off_next = _select_i32(par_next == cutlass.Int32(0), S_ACC_OFF[0], S_ACC_OFF[1])
                 mma_ss(bmm1_desc, sK[slot_k].desc(), desc_Q, tmem_raw.subview(s_off_next))
@@ -541,8 +578,8 @@ def _mma_warp_group(
             slot_v, phase_v = _kv_slot(seq_v, n_tiles)
             par_cur = i & cutlass.Int32(1)
             phase_p = (i // cutlass.Int32(2)) & cutlass.Int32(1)
-            bars.mb_kv_full[slot_v].wait(phase_v)
-            bars.mb_p_full[par_cur].wait(phase_p)
+            bars.mb_kv_full[slot_v].wait(phase_v, spin=SPIN_RING_WAITS)
+            bars.mb_p_full[par_cur].wait(phase_p, spin=SPIN_RING_WAITS)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
             desc_P = sP[par_cur].desc()
             accum = cutlass.Boolean(i > cutlass.Int32(0))
@@ -631,7 +668,7 @@ def _softmax_warp_group(
         phase_i = (i // cutlass.Int32(2)) & cutlass.Int32(1)
         s_off = _select_i32(par == cutlass.Int32(0), S_ACC_OFF[0], S_ACC_OFF[1])
 
-        bars.mb_s_full[par].wait(phase_i)
+        bars.mb_s_full[par].wait(phase_i, spin=SPIN_RING_WAITS)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
         s_raw = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(tmem_base + s_off + col0, cutlass.Float32), num=COLS)
         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
@@ -717,7 +754,7 @@ def _softmax_warp_group(
         # column's max moved.
         if i > cutlass.Int32(0):
             t_prev = i - cutlass.Int32(1)
-            bars.mb_bmm2_done[t_prev & cutlass.Int32(1)].wait((t_prev // cutlass.Int32(2)) & cutlass.Int32(1))
+            bars.mb_bmm2_done[t_prev & cutlass.Int32(1)].wait((t_prev // cutlass.Int32(2)) & cutlass.Int32(1), spin=SPIN_RING_WAITS)
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
             if ~all_one:
                 for blk in cutlass.range_constexpr(O_BLOCKS):
@@ -894,6 +931,7 @@ def _kernel(
         tma_loads_per_tile=QK_ITERS,
         tma_granu_elems=GRANU_ELEMS,
         tma_subtile_stride_elems=N_Q * GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     # The K/V ring, seen as the K-major A operand of BMM1 (TILE_N rows x TILE_K) ...
     sK = SmemTile(
@@ -906,6 +944,7 @@ def _kernel(
         tma_loads_per_tile=QK_ITERS,
         tma_granu_elems=GRANU_ELEMS,
         tma_subtile_stride_elems=TILE_N * GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     # ... and as the MN-major A operand of BMM2 (V^T: d contiguous, LBO steps
     # the 64-wide d atoms).  Same storage, different descriptor.
@@ -919,6 +958,7 @@ def _kernel(
         tma_loads_per_tile=VO_ITERS,
         tma_granu_elems=GRANU_ELEMS,
         tma_subtile_stride_elems=TILE_N * GRANU_ELEMS,
+        desc_version=DESC_VERSION,
     )
     # P^T: the MN-major B operand of BMM2, two buffers of TILE_N key rows.
     sP = SmemTile(
@@ -928,6 +968,7 @@ def _kernel(
         leading_byte_offset=0,
         stride_byte_offset=STRIDE_BYTE_OFFSET_P,
         layout=SMEM_LAYOUT_P,
+        desc_version=DESC_VERSION,
     )
 
     bars = make_decode_bars()

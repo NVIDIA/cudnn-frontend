@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import threading
 from copy import copy
 from functools import lru_cache
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
@@ -510,7 +511,11 @@ _FILLED_PER_CALL_DENSE = frozenset(
 
 
 class SplitCombineSpec(NamedTuple):
-    """Immutable combine artifact and workspace geometry; addresses are bound per call."""
+    """Immutable combine artifact and workspace geometry; addresses are bound per call.
+
+    ``gate`` (appended; None on every plan but the gate-in-combine one) is the
+    :class:`CombineGate` that ``fn`` IS on such a plan: the gate's address is bound
+    per call before the native launch and appended to the combine frame."""
 
     fn: Any
     owner: Any
@@ -519,6 +524,67 @@ class SplitCombineSpec(NamedTuple):
     lse_offset: int
     output_dtype: str
     has_stats: bool
+    gate: Any = None
+
+
+class CombineGate:
+    """The gate-in-combine binding of a split plan whose kernel has no epilogue-gate
+    seams (the d256 decode tile): ``O *= sigmoid(G)`` is applied by the split combine
+    on the fp32 merged value (``sm100/split_combine.compile_ptr(gate=True)``).
+
+    The native dense binder refuses a gate on a split (its gate slot belongs to the
+    kernel's epilogue) and calls ``SplitCombineSpec.fn`` with a FIXED positional frame
+    (partials, O, Stats, geometry, splits, strides, stream), so the gate reaches the
+    combine here: :meth:`bind` records G's address and BSHD strides for the next
+    launch of the calling thread, and this object is the ``fn`` the binder calls -- it
+    appends G to the frame and forwards to the gated combine artifact.  One bind per
+    launch: the binding is consumed by exactly one call (a stale gate can never serve
+    a later launch), and a launch without one is an error, never an un-gated O.
+    Thread-local, like the binder's own per-call frame (two threads may execute one
+    plan concurrently with different buffers).  Under CUDA-graph capture the launch
+    is recorded with the bound address, exactly as every other pointer of the frame.
+    The binding also keeps the plan's CUDA-device check the native binder applies to
+    every operand it binds -- the gate is not one of them on this path -- with the
+    binder's own policy: a KNOWN device other than the plan's (a CPU gate, another
+    GPU) is refused before any launch, an unknown one (a bare address) is admitted.
+    """
+
+    __slots__ = ("entry", "dtype", "shape", "device", "_tls")
+
+    def __init__(self, entry, dtype: str, shape: Tuple[int, int, int, int], device: Tuple[int, int]):
+        self.entry = entry  # the gated combine's positional tvm-ffi entry
+        self.dtype = dtype  # G's dtype as a bare name ("bfloat16")
+        self.shape = tuple(int(x) for x in shape)  # (B, H_q, S_q, D_v): the logical BHSD gate = O's shape
+        self.device = (int(device[0]), int(device[1]))  # the plan's DLPack (device_type, device_id)
+        self._tls = threading.local()
+
+    def bind(self, facts: Optional[BufferFacts]) -> None:
+        """Record G (a logical BHSD ``(B, H_q, S_q, D_v)`` buffer's facts) for the next combine launch."""
+        if facts is None or not facts.ptr:
+            raise ValueError("cudnn.sdpa: the gate G is required by this gate-in-combine specialization and must have a non-null address")
+        if int(facts.device[0]) != -1 and (int(facts.device[0]), int(facts.device[1])) != self.device:
+            raise ValueError("cudnn.sdpa: gate must be on this plan's CUDA device")  # the native binder's operand rule, kept here
+        if facts.dtype != self.dtype:
+            raise ValueError(f"cudnn.sdpa: gate dtype {facts.dtype} does not match the compiled gate-in-combine dtype {self.dtype}")
+        shape = tuple(int(x) for x in facts.shape)
+        if shape != self.shape:
+            raise ValueError(f"cudnn.sdpa: gate must have O's logical shape {self.shape} (B, H_q, S_q, D_v); got {shape}")
+        strides = tuple(int(x) for x in facts.strides)
+        if len(strides) != 4 or any(st < 0 for st in strides):
+            raise ValueError(f"cudnn.sdpa: gate needs four non-negative BHSD strides; got {strides}")
+        if facts.span >= 0:
+            need = 1 + sum((n - 1) * st for n, st in zip(shape, strides) if n > 0)
+            if need > facts.span:
+                raise ValueError(f"cudnn.sdpa: gate buffer spans {facts.span} elements but its declaration addresses {need}")
+        sb, sh, ss, sd = strides
+        self._tls.frame = (int(facts.ptr), (sb, ss, sh, sd))  # the combine views G as [B, S_q, H, D]: BSHD stride order
+
+    def __call__(self, o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides, stream):
+        frame = getattr(self._tls, "frame", None)
+        if frame is None:
+            raise RuntimeError("cudnn.sdpa: the gate-in-combine launch has no gate bound for this thread (bind() precedes every native execute)")
+        self._tls.frame = None
+        return self.entry(o_partial_ptr, lse_partial_ptr, o_out_ptr, lse_out_ptr, problem_size, n_splits, o_strides, lse_strides, frame[0], frame[1], stream)
 
 
 class DenseLaunchSpec:
@@ -592,7 +658,9 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.s_q_max, s.s_k_max = int(api.s_q_max), int(api.s_k_max)
     if getattr(cfg, "PACK_GQA", False) and s.qh != s.kh * cfg.QH_PER_KH:
         raise ValueError("cudnn.sdpa: runtime head counts must match the compiled PackGQA ratio")
-    if hasattr(km, "N_Q") and s.s_q_max * km.HEADS_PER_TILE > km.N_Q:
+    # A decode tile with the TOKEN-UNIT axis (Q_TOKEN_UNITS) covers any S_q: its host entry cuts the tokens into
+    # ceil(S_q / Q_BOX_TOKENS) units per head group; a tile without it serves one Q box only.
+    if hasattr(km, "N_Q") and not getattr(km, "Q_TOKEN_UNITS", False) and s.s_q_max * km.HEADS_PER_TILE > km.N_Q:
         raise ValueError(f"cudnn.sdpa: decode query rows exceed the compiled {km.N_Q}-row tile")
     s.paged, s.page_size = bool(api.paged), int(api.paged_page_size or 0)
     s.paged_hnd = _compiled_paged_hnd(api) if s.paged else False
@@ -607,7 +675,12 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
     s.has_lse = (api.lse_desc is not None) or s.split > 1
     s.has_sink = bool(api.has_sink)
     s.seq_kv_present, s.seq_q_present = bool(api.seq_kv_lens_present), bool(api.seq_q_lens_present)
-    s.gate_expect = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
+    # The kernel's epilogue gate.  A gate that rides the split COMBINE instead
+    # (api._gate_in_combine: the d256 decode tile, split > 1) is NOT the binder's
+    # -- it refuses a gate on a split -- and binds through SplitCombineSpec.gate.
+    gate_dtype = str(api.gate_desc.dtype).split(".")[-1] if getattr(api, "gate_desc", None) is not None else None
+    gate_in_combine = bool(gate_dtype is not None and s.split > 1 and api._gate_in_combine())
+    s.gate_expect = None if gate_in_combine else gate_dtype
     s.tile_n = int(getattr(cfg, "TILE_N", getattr(api, "kv_tile", 128)))
     # SM120 always masks its rightmost KV tile; an SM100/SM107 plan compiled with kv_tail_mask masks it too.
     s.kv_tail_native = bool(getattr(km, "PREPARED_KV_TAIL_NATIVE", False) or getattr(api, "_kv_tail_mask", False))
@@ -659,21 +732,25 @@ def build_dense_spec(api, *, scale_softmax: Optional[float]) -> DenseLaunchSpec:
             has_amax=s.quant.has_amax if s.quant is not None else False,
             has_scale_o=api._split_scale_o() if s.quant is not None else False,
             has_scale_o_input=not (s.quant is not None and s.quant.sf_sizes),
+            gate=gate_in_combine,
+            dtype_gate=({"bfloat16": "bf16", "float16": "f16"}[gate_dtype] if gate_in_combine else None),
         )
         fn = positional_entry(owner)
         if fn is None:
             raise NotImplementedError("the split combine artifact exposes no positional tvm-ffi entry")
         rows, sq, h, d = s.split * s.b, s.s_q_max, s.qh, s.d_v
-        o_size, lse_size = rows * sq * h * d, rows * h * sq
         device = (_DLPACK_CUDA, s.device_index)
+        combine_gate = CombineGate(fn, gate_dtype, (s.b, h, sq, d), device) if gate_in_combine else None
+        o_size, lse_size = rows * sq * h * d, rows * h * sq
         s.combine = SplitCombineSpec(
-            fn,
+            combine_gate if combine_gate is not None else fn,
             owner,
             BufferFacts(0, s.expect["o"], device, o_size, (rows, h, sq, d), (sq * h * d, d, h * d, 1)),
             BufferFacts(0, "float32", device, lse_size, (rows, h, sq), (h * sq, sq, 1)),
             ws_align(o_size * s.elem_bytes["o"]),
             str(api.o_desc.dtype).split(".")[-1],
             api.lse_desc is not None,
+            combine_gate,
         )
     scale = float(api.scale_softmax if scale_softmax is None else scale_softmax)
 
@@ -850,6 +927,12 @@ class PreparedDenseLaunch:
             uids["block_table_v"] = binding.paged_v_table.get_uid()
         if spec.gate_expect is not None:
             uids["gate"] = gate_src.get_uid()
+        elif spec.combine is not None and spec.combine.gate is not None:
+            # The gate rides the combine: NOT a native role (the binder refuses a gate on a
+            # split) -- its facts are read off the pack per call and bound to the combine.
+            if gate_src is None:
+                raise ValueError("cudnn.sdpa: the gate-in-combine plan needs the graph's gate operand")
+            uids["combine_gate"] = gate_src.get_uid()
         if spec.ragged:
             uids["ragged_q"] = binding.ragged_q.get_uid()
             uids["ragged_o"] = binding.ragged_o.get_uid()
@@ -864,6 +947,7 @@ class PreparedDenseLaunch:
         self._uids = [uids[r] for r in self._roles]
         self._indices: Optional[List[int]] = None
         self._native_indices = None
+        self._combine_gate_index: Optional[int] = None
 
     def _prepare_indices(self, index_of):
         try:
@@ -872,12 +956,16 @@ class PreparedDenseLaunch:
             raise ValueError(f"cudnn.sdpa: tensor uid {exc} is bound by the plan but is not an operand of this graph") from exc
         roles = dict(zip(self._roles, self._indices))
         self._native_indices = tuple(roles.get(role, -1) for role in self.spec.native_roles)
+        self._combine_gate_index = roles.get("combine_gate")
         return self._indices
 
     def execute(self, pack, workspace_ptr: int, stream, stream_int: int) -> None:
         indices = self._indices
         if indices is None:
             indices = self._prepare_indices(pack.index_of)
+        if self._combine_gate_index is not None:
+            # One native crossing for G's facts, bound to the gated combine for this launch (no sync, no allocation).
+            self.spec.combine.gate.bind(facts_of_roles(pack, [self._combine_gate_index])[0])
         self.spec.native.execute(pack.native, self._native_indices, stream, workspace=workspace_ptr)
 
 
@@ -905,6 +993,12 @@ def execute_native_dense_tensors(spec, buffers, stream, scale, workspace_ptr=0):
     from cudnn import _pybind_module
 
     buffers = tuple(buffers) + (None,) * (len(_NATIVE_DENSE_ROLES) - len(buffers))
+    if spec.combine is not None and spec.combine.gate is not None:
+        # The gate rides the combine (the decode tile's split): bind it there and hand
+        # the native binder an empty gate slot (it refuses a gate on a split).
+        gi = _NATIVE_DENSE_ROLES.index("gate")
+        spec.combine.gate.bind(facts_of_tensor(buffers[gi]))
+        buffers = buffers[:gi] + (None,) + buffers[gi + 1 :]
     pack, unread = _pybind_module._read_buffer_sequence(buffers)
     for index in unread:
         _set_native_fact(pack, index, facts_of_tensor(buffers[index]))

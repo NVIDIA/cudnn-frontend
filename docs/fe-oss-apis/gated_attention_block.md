@@ -445,7 +445,9 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   token axis. A dense `[B, S, rope_dim]` table, or positions running across sequence boundaries, is a plausible-but-wrong
   RoPE after the first sequence.
 - **Declaration bounds** (typed `ValueError`): `num_sequences >= 1`, `2 <= max_seq_len <= T` (`S = 1` is decode, out of
-  the prefill bodies' scope) and `num_sequences * max_seq_len >= T` -- a smaller product would silently cap the SDPA
+  the prefill bodies' scope; on cc 10.7 the standalone SDPA forward serves decode-shaped `d = 256` graphs on its
+  decode tile -- `docs/operations/Attention.md`, "Paged attention" -- and the block's decode mode is a follow-up) and
+  `num_sequences * max_seq_len >= T` -- a smaller product would silently cap the SDPA
   chain's packed capacity below `T` (the tokens past it are not processed, with no message downstream). `seq_lens_present`
   is mutually exclusive with `thd` (there is no per-batch KV padding mask under THD); the three packing knobs on a dense
   block are refused.
