@@ -521,7 +521,10 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
         t_q = min(t_q, split.capacity)
     # Strided HN padding is storage, not logical tokens. The span check above
     # still requires all head slots; the logical descriptor covers bounded Q.
-    if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(t_q, lse_head_stride):
+    # Live rows are at most b * S_q, so a single-request view below the packed-Q capacity covers them (#1482).
+    s_q_max = getattr(spec, "s_q_max", None)
+    live_q = min(t_q, geo.b * s_q_max) if s_q_max else t_q
+    if spec.has_lse and spec.lse_head_major and lse_head_stride and lse.numel < spec.qh * min(live_q, lse_head_stride):
         raise ValueError("cudnn.sdpa: head-major lse_tensor logical shape must cover bounded packed Q")
     # Empty Q still initializes padded Stats or quantized Amax/scalars. Its
     # sink, workspace and paged bindings must pass validation before any write.

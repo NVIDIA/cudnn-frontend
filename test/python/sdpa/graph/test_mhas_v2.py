@@ -3533,9 +3533,9 @@ def _require_p2_env():
 
 def _p2_cfg(*, dtype, d, h_q, h_kv, b, s_q, seq_len_q, s_kv, seq_len_kv, page, left_bound=None, right_bound=0,
             diag_align=cudnn.diagonal_alignment.BOTTOM_RIGHT, stats=False, stats_layout="token_major", pool="hnd",
-            sink=None, poison=True, ragged=True, seed=10720, with_sink=True, cu_seq_len=False, declare_total=False, stats_log2=False):
+            sink=None, poison=True, ragged=True, seed=10720, with_sink=True, cu_seq_len=False, declare_total=False, stats_log2=False, paged=True):
     cfg = ExecConfig(
-        data_type=dtype, rng_data_seed=seed, rng_geom_seed=seed, is_alibi=False, is_infer=True, is_paged=True,
+        data_type=dtype, rng_data_seed=seed, rng_geom_seed=seed, is_alibi=False, is_infer=True, is_paged=paged,
         paged_nan_dead_pages=poison, is_bias=False, is_block_mask=False, is_padding=True, is_cu_seq_len=cu_seq_len,
         is_ragged=ragged, is_dropout=False, is_determin=False, batches=b, d_qk=d, d_v=d, s_q=s_q, s_kv=s_kv,
         h_q=h_q, h_k=h_kv, h_v=h_kv, block_size=page, diag_align=diag_align, left_bound=left_bound,
@@ -3643,8 +3643,8 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     8 / 16 / MQA / MHA / 12 (12 cannot pack: unpacked); page sizes 8..1024; bottom-right (or top-left) causal / left
     window / right band / band around the diagonal / no mask; the per-batch lengths as seq_len_q/kv or as the cu_seq_len
     (B+1 prefix-sum) form 3:1, the packed totals declared (max_total_seq_len_q/kv) 1:4; Stats off / token-major /
-    head-major (head-major on single-request batches only where the logical rows reach the packed capacity -- the b == 1
-    guard below and test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0); HND / NHD pools; dead pool pages
+    head-major (single-request head-major batches included, #1482: test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0);
+    HND / NHD pools; dead pool pages
     NaN-poisoned; f16:bf16 1:2.  The sink-free half is the control (served before this change); every case is strict
     and asserts routing onto the row and the f32 arm (_exec_cc107); a served sink graph is unsplit."""
     _require_p2_env()
@@ -3677,18 +3677,9 @@ def test_sdpa_fwd_paged_thd_sink_cc107_half_L0(env_info, test_no, request, cudnn
     cfg.paged_nan_dead_pages = True
     cfg.paged_pool_layout = "nhd" if rng.random() < 0.5 else "hnd"   # drawn AFTER the context: geometry unchanged
     cfg.declare_total_seq_len = rng.random() < 0.25   # also after the context: the packed totals declared (max_total_seq_len_q/kv)
-    if cfg.ragged_stats_layout == "head_major" and cfg.batches == 1 and cfg.s_q < cfg.total_q:
-        # A single-request batch declaring head-major Stats (1, h, s_q, 1) over the capacity-strided [h, t_q] buffer
-        # with s_q below the 64-rounded packed capacity t_q: check_support accepts it (it checks the packing only) and
-        # the native THD binder rejects it at execute ("head-major lse_tensor logical shape must cover bounded packed
-        # Q": the declaration's logical rows are bounded against the packed-Q capacity) -- a pre-existing, sink-
-        # independent gap on every THD leg, pinned by test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0 (strict
-        # xfail) and named in the tracker's Gaps table.  Only b == 1 trips it: the binder re-describes the harness's
-        # [h, t_q] buffer as the declared dims only when that declaration fits the buffer, which is the single-request
-        # case; multi-request head-major draws stay head-major and serve.  Keep the b == 1 draw token-major
-        # (deterministic, no rng consumed; the geometry is unchanged).
-        cfg.ragged_stats_layout = "token_major"
-        cfg.stride_stats = get_strides_from_layout(cfg.shape_stats, "bshd")
+    # A single-request batch declaring head-major Stats (1, h, s_q, 1) over the capacity-strided [h, t_q] buffer with
+    # s_q below the 64-rounded packed capacity t_q is served since #1482 (the native THD binder bounds the declaration's
+    # logical rows by b * s_q, not by the packed-Q capacity), so b == 1 head-major draws stay head-major.
     _assign_cc107_knob_set(cfg, test_no, "half")
     test.showConfig(test_no, request)
     with _must_run(request):
@@ -3855,7 +3846,8 @@ def test_sdpa_paged_sink_dense_queries_decline_cc107_L0(env_info, request, cudnn
 
 
 # The first MULT=4 sweep failure (test340): d256 64/8, one 4-token request in a packed batch of ONE, s_q 5, page 128,
-# head-major Stats over the 64-token capacity -- the single-request head-major declaration the native THD binder rejects.
+# head-major Stats over the 64-token capacity -- the single-request head-major declaration the native THD binder rejected
+# before #1482.
 _P2_HEAD_MAJOR_B1 = dict(dtype=torch.bfloat16, d=256, h_q=64, h_kv=8, b=1, s_q=5, seq_len_q=[4], s_kv=1731, seq_len_kv=[889], page=128,
                          right_bound=None, diag_align=cudnn.diagonal_alignment.TOP_LEFT, stats=True, stats_layout="head_major")
 
@@ -3863,22 +3855,34 @@ _P2_HEAD_MAJOR_B1 = dict(dtype=torch.bfloat16, d=256, h_q=64, h_kv=8, b=1, s_q=5
 @_cc107_only
 @pytest.mark.L0
 @pytest.mark.parametrize("with_sink", [True, False], ids=["sink", "no_sink"])
-@pytest.mark.xfail(strict=True, raises=ValueError, reason="single-request head-major packed Stats below the packed-Q capacity: accepted at check_support, rejected by the native THD binder at execute (SUPPORT_MATRIX_TRACKER.md, Gaps)")
 def test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0(env_info, with_sink, request, cudnn_handle):
-    """Detector (strict xfail) for a pre-existing, sink-independent Rule 2 gap on every THD leg: a single-request (b == 1)
-    packed batch declaring head-major Stats (1, h, s_q, 1) over a capacity-strided [h, t_q] buffer with s_q < t_q passes
-    check_support and build_plans (the row serves it, unsplit) and the first execute raises ``ValueError: cudnn.sdpa:
-    head-major lse_tensor logical shape must cover bounded packed Q`` -- the native THD binder bounds the declaration's
-    logical rows against the packed-Q capacity, and at execute no plan-walk fallback is possible.  Same failure on
-    develop with the sink removed and on nonpaged THD; the token-major twin and every multi-request head-major
-    declaration serve.  RED -> fixed when check_support pre-declines the declaration (then make this a typed-decline
-    cell) or the binder bounds against the logical rows (then make it a must-serve cell)."""
+    """Must-serve cell (#1482): a single-request (b == 1) packed batch declaring head-major Stats (1, h, s_q, 1) over a
+    capacity-strided [h, t_q] buffer with s_q < t_q.  check_support and build_plans accept it (the row serves it,
+    unsplit); before #1482 the first execute raised ``ValueError: cudnn.sdpa: head-major lse_tensor logical shape must
+    cover bounded packed Q`` because the native THD binder bounded the declaration's logical rows against the packed-Q
+    capacity.  It now bounds them by b * s_q, the most rows the kernel writes, so the graph serves and O / Stats are
+    checked.  The SM100 twin is test_sdpa_thd_head_major_batch_one_frost_L0."""
     _require_p2_env()
     test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
     test.cfg = _p2_cfg(**_P2_HEAD_MAJOR_B1, with_sink=with_sink)
     test.cfg.softmax_precision = cudnn.data_type.FLOAT
     test.showConfig((request.node.name, 2), request)
     _p2_frost(test.cfg, request, cudnn_handle)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "nonpaged"])
+@pytest.mark.parametrize("with_sink", [True, False], ids=["sink", "no_sink"])
+def test_sdpa_thd_head_major_batch_one_frost_L0(env_info, paged, with_sink, request, cudnn_handle):
+    """SM100 twin of test_sdpa_paged_thd_sink_head_major_batch_one_cc107_L0 (#1482): the single-request head-major
+    Stats declaration below the packed-Q capacity serves on sdpa_fwd_prefill_sm100, paged and nonpaged, with and
+    without a sink."""
+    _require_frost_sm100()
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = _p2_cfg(**_P2_HEAD_MAJOR_B1, with_sink=with_sink, paged=paged)
+    test.cfg.softmax_precision = cudnn.data_type.FLOAT
+    test.showConfig((request.node.name, 2), request)
+    _exec_sdpa_on_frost(test.cfg, request, cudnn_handle)
 
 
 def _p2_fp8_pools_graph(form):

@@ -242,6 +242,7 @@ class SdpaThdBinder {
         lse_head_stride_ = integer(spec, "lse_head_stride");
         lse_stride_override_ =
             py::hasattr(spec, "lse_stride_override") && spec.attr("lse_stride_override").cast<bool>();
+        live_sq_max_ = py::hasattr(spec, "s_q_max") ? optional_integer(spec, "s_q_max") : -1;
         if (b_ <= 0 || qh_ <= 0 || kh_ <= 0 || device_ < 0 || lens_form_ < 0 || lens_form_ > 3 || off_o_desc_ < 0 ||
             lse_head_stride_ < 0 || cga_tile_m_ <= 0)
             invalid("invalid native THD plan geometry");
@@ -427,8 +428,11 @@ class SdpaThdBinder {
         if (splits_ > 1) tq = std::min(tq, split_capacity_);
         // Head padding occupies storage, not logical tokens. Keep the full
         // observed-span check above and check logical rows against bounded Q.
+        // Live rows are at most b * S_q (seq_len_q <= S_q), so a single-request
+        // (1, H_q, S_q, 1) view below the packed-Q capacity still covers them (#1482).
+        const int64_t live_q = live_sq_max_ > 0 ? std::min(tq, multiply(b, live_sq_max_)) : tq;
         if (has_lse_ && !lse_padded_ && lse_head_major_ && lse_head_stride &&
-            numel(lse) < multiply(qh_, std::min(tq, lse_head_stride)))
+            numel(lse) < multiply(qh_, std::min(live_q, lse_head_stride)))
             invalid("head-major lse_tensor logical shape must cover bounded packed Q");
         // Empty Q still initializes padded Stats or quantized Amax/scalars.
         // Finish binding validation before authorizing those writes.
@@ -781,7 +785,7 @@ class SdpaThdBinder {
     int64_t b_, qh_, kh_, device_, lens_form_, off_o_desc_, total_q_, total_kv_, lse_head_stride_;
     int64_t cga_tile_m_, units_, page_size_, workspace_alignment_;
     int64_t splits_ = 1, split_capacity_ = 0, off_partial_o_ = 0, off_partial_lse_ = 0;
-    int64_t sq_max_ = 0, lse_elements_ = 0, lse_span_ = 0;
+    int64_t sq_max_ = 0, lse_elements_ = 0, lse_span_ = 0, live_sq_max_ = -1;
     std::array<int64_t, 3> lse_strides_{};
     bool lse_padded_ = false;
     bool has_lse_, has_sink_, lse_head_major_, lse_stride_override_, paged_, paged_hnd_, fixed_batch_;
