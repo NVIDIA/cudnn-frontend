@@ -1336,6 +1336,58 @@ def grouped_gemm_dglu_wrapper_sm100(
     ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
     no dbias). See docs/fe-oss-apis/gemm_fusions/grouped_gemm_dglu.md.
     """
+    if b_tensor is not None and sfa_tensor is not None and detect_framework(a_tensor) == "jax":
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_dglu_jax_sm100
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            epilogue_op=epilogue_op,
+            dprob_tensor_buf=dprob_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            b_major=b_major,
+            use_dynamic_sched=use_dynamic_sched,
+            use_single_group_runtime_offsets=use_single_group_runtime_offsets,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
+        )
+        for name, rejected in (
+            ("round_dgrad_to_input_dtype", round_dgrad_to_input_dtype),
+            ("activation_tensor", activation_tensor is not None),
+            ("deterministic", deterministic),
+            ("b_dtype", b_dtype is not None),
+        ):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        return grouped_gemm_dglu_jax_sm100(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            c_tensor=c_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=beta_tensor,
+            prob_tensor=prob_tensor,
+            norm_const_tensor=norm_const_tensor,
+            n=n,
+            acc_dtype=acc_dtype if acc_dtype is not None else cutlass.Float32,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            act_func=act_func,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            generate_dbias=generate_dbias,
+        )
     # Hot-loop memo; same shape as the unfused and GLU wrappers. Everything from here to
     # execute() is derivation -- dtype resolution, DgluCall construction, normalization and
     # the op cache-key rebuild -- and a pure function of the operands' metadata plus the

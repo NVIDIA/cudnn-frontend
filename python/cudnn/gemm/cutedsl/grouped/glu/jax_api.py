@@ -469,7 +469,7 @@ def blockscaled_glu_jax(
         mac,
         tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
         tuple(outputs.values()),
-        backward=False,
+        zero_dprob=False,
         linear_offset=float(linear_offset),
         geglu_alpha=float(geglu_alpha),
         glu_clamp_max=float(glu_clamp_max),

@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""JAX-native (XLA custom call) entry point for the BF16 grouped GEMM wgrad
-(discrete output mode), built on :func:`cudnn.jax.call`.
+"""JAX-native (XLA custom call) entry points for grouped GEMM wgrad, built on
+:func:`cudnn.jax.call`.
 
-BF16 backend, discrete (pointer-array) output mode only. The block-scaled
-backend stays rejected exactly as in the eager wrapper (its B operand requires a
-K-major, token-innermost layout and fp4 operands are K-packed — neither has a
-row-major JAX equivalent), and only bfloat16 operands reach this entry point.
+``grouped_gemm_wgrad_jax_sm100`` serves two modes. With ``sfa_tensor`` it is the
+canonical MXFP8 wgrad: row-major A ``(m, tokens)`` and B ``(tokens, n)`` with
+already MMA-packed scale bytes, writing a dense ``(experts, m, n)`` XLA output on
+the SM100 or Rubin (SM107) block-scaled wgrad kernel. Without it, it is the BF16
+wgrad in discrete output mode.
 
-Output pointer situation: the per-expert weight gradients are *not* XLA outputs.
+BF16 output pointer situation: the per-expert weight gradients are *not* XLA outputs.
 ``wgrad_ptrs`` is a regular input array whose values are raw device addresses of
 caller-owned ``(m, n)`` row-major buffers; the kernel writes through them, so
 under jit those buffers live outside XLA's buffer management. The caller must
@@ -26,6 +27,7 @@ responsibility here (the eager wrapper validates them). Only the total token
 count — a static shape — is checked for 256-alignment.
 """
 
+import math
 import os
 from typing import Any, Optional, Tuple, Union
 
@@ -36,11 +38,14 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils
 
+from cudnn.api_base import TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.tensor_adapter import framework_dtype
+from cudnn.tensor_adapter import detect_framework, framework_dtype, get_compute_capability
 from cudnn.jax import call, zeros_init
+from ..canonical_jax import grouped_call, output_type, sf_array
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from ..unfused.jax_api import _pointer_count
+from .moe_blockscaled_grouped_gemm_wgrad import BlockScaledMoEGroupedGemmWgradKernel
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
 
 # cache_key -> (kernel instance, max_active_clusters, workspace_bytes); reusing the
@@ -50,11 +55,7 @@ _kernel_cache: dict = {}
 
 _output_dtypes = (cutlass.BFloat16, cutlass.Float16, cutlass.Float32)
 
-_BLOCK_SCALED_JAX_ERROR = (
-    "only the BF16 wgrad backend is supported for JAX (the block-scaled wgrad backend is "
-    "not expressible as JAX arrays: its B operand requires a K-major, token-innermost "
-    "layout and fp4 operands are K-packed, neither of which has a row-major equivalent)"
-)
+_BLOCK_SCALED_JAX_ERROR = "pass sfa_tensor/sfb_tensor for MXFP8; FP4 wgrad is unsupported for JAX"
 
 
 @cute.jit
@@ -80,15 +81,30 @@ def grouped_gemm_wgrad_jax_sm100(
     a_tensor: Any,
     b_tensor: Any,
     offsets_tensor: Any,
-    wgrad_ptrs: Any,
+    wgrad_ptrs: Any = None,
     wgrad_dtype: Any = cutlass.BFloat16,
     acc_dtype: Any = cutlass.Float32,
     mma_tiler_mn: Tuple[int, int] = (256, 256),
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     accumulate_on_output: bool = False,
     input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
+    *,
+    sfa_tensor: Any = None,
+    sfb_tensor: Any = None,
 ) -> Any:
-    """BF16 grouped GEMM wgrad (discrete per-expert output pointers) as an XLA custom call.
+    """Grouped GEMM wgrad as an XLA custom call.
+
+    With ``sfa_tensor``: canonical MXFP8, eagerly or under jax.jit. A
+    (m,tokens) and B (tokens,n) row-major with the same FP8 dtype, int32
+    offsets_tensor (experts,) holding nondecreasing cumulative token ends that
+    are multiples of 128, and SFA/SFB with packed E8M0 MMA-tiled bytes at any
+    dense rank (uint8 bit patterns also accepted): for each expert in order,
+    its (round_up(m or n, 128), tokens_i / 32) scales in 128x4 atoms. Returns a
+    TupleDict with ``wgrad_tensor`` (experts, m, n) in ``wgrad_dtype``; experts
+    without tokens come back zero. Runs the Rubin wgrad kernel on SM107 and
+    the SM100 kernel otherwise.
+
+    With ``wgrad_ptrs``: BF16 discrete per-expert output pointers.
 
     Same contract as the eager wrapper's discrete mode with explicit ``wgrad_ptrs``:
     ``a_tensor (m, tokens_sum)`` K-major and ``b_tensor (tokens_sum, n)`` N-major (both
@@ -108,6 +124,28 @@ def grouped_gemm_wgrad_jax_sm100(
     wgrad_dtype = _convert_to_cutlass_data_type(wgrad_dtype)
     acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
     input_order = WGradInputOrder(input_order)
+    if sfa_tensor is not None:
+        unsupported = {
+            "wgrad_ptrs": wgrad_ptrs is not None,
+            "acc_dtype": acc_dtype is not cutlass.Float32,
+            "accumulate_on_output": accumulate_on_output,
+            "input_order": input_order is not WGradInputOrder.Tensor2D,
+        }
+        for name, rejected in unsupported.items():
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        return blockscaled_wgrad_jax(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            offsets_tensor=offsets_tensor,
+            wgrad_dtype=wgrad_dtype,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+        )
+    if wgrad_ptrs is None or sfb_tensor is not None:
+        raise ValueError("BF16 wgrad takes wgrad_ptrs and no scale tensors; pass sfa_tensor/sfb_tensor for canonical MXFP8")
 
     if len(a_tensor.shape) != 2:
         raise ValueError(f"a_tensor must have shape (m, tokens_sum), got {tuple(a_tensor.shape)}")
@@ -207,3 +245,112 @@ def grouped_gemm_wgrad_jax_sm100(
     )(a_tensor, b_tensor, offsets_tensor, wgrad_ptrs)
 
     return token
+
+
+kernel_cache = {}
+validated_configs = set()
+
+
+def wgrad_kernel_type():
+    if get_device_type() == "rubin":
+        from .moe_blockscaled_grouped_gemm_wgrad_rubin import BlockScaledMoEGroupedGemmWgradRubinKernel
+
+        return BlockScaledMoEGroupedGemmWgradRubinKernel
+    return BlockScaledMoEGroupedGemmWgradKernel
+
+
+@cute.jit
+def grouped_wgrad_adapter(stream, a, b, sfa, sfb, offsets, wgrad, workspace, *, kernel, mac, sfa_rows, sfb_rows):
+    # The kernel rebuilds the MMA-tiled scale layouts from these 2-D shapes and reads only the base pointers.
+    # The scale column count must stay dynamic, as in the torch path: a static count that fits in one K tile
+    # traps the kernel.
+    sf_cols = a.shape[1] // 32
+    kernel(
+        mat_a=a,
+        mat_b=b,
+        scale_a=cute.make_tensor(sfa.iterator, cute.make_layout((sfa_rows, sf_cols))),
+        scale_b=cute.make_tensor(sfb.iterator, cute.make_layout((sfb_rows, sf_cols))),
+        out=wgrad,
+        offs=offsets,
+        workspace=workspace,
+        max_active_clusters=mac,
+        stream=stream,
+    )
+
+
+def wgrad_plan(inputs, wgrad, mma_tiler_mn, cluster_shape_mn):
+    a, b = inputs["a"], inputs["b"]
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError("A must have shape (m, tokens) and B (tokens, n)")
+    m, tokens = a.shape
+    n = b.shape[1]
+    experts = wgrad.shape[0]
+    ab_dtype = _convert_to_cutlass_data_type(a.dtype)
+    if ab_dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2) or _convert_to_cutlass_data_type(b.dtype) is not ab_dtype:
+        raise ValueError("A and B must have the same MXFP8 dtype, e4m3 or e5m2; packed FP4 is unsupported")
+    for name in ("sfa", "sfb"):
+        if _convert_to_cutlass_data_type(inputs[name].dtype) is not cutlass.Float8E8M0FNU:
+            raise ValueError(f"{name} must contain E8M0 scale bytes")
+    if inputs["offsets"].shape != (experts,) or _convert_to_cutlass_data_type(inputs["offsets"].dtype) is not cutlass.Int32:
+        raise ValueError("offsets_tensor must have shape (experts,) and dtype int32")
+    if _convert_to_cutlass_data_type(wgrad.dtype) not in _output_dtypes:
+        raise ValueError(f"wgrad_dtype must be BF16, FP16, or FP32, got {wgrad.dtype}")
+    if m <= 0 or n <= 0 or experts <= 0 or tokens % 128:
+        raise ValueError("Expected nonempty A/B, at least one expert, and a token count that is a multiple of 128")
+    if any(size not in (128, 256) for size in mma_tiler_mn):
+        raise ValueError(f"mma_tiler_mn entries must be 128 or 256, got {mma_tiler_mn}")
+    use_2cta_instrs = mma_tiler_mn[0] == 256
+    cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if use_2cta_instrs else (1, 1)))
+    if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) or math.prod(cluster_shape_mn) > 16 or any(size & (size - 1) for size in cluster_shape_mn):
+        raise ValueError(f"Unsupported cluster_shape_mn {cluster_shape_mn}")
+    margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
+    config = (experts, tuple(mma_tiler_mn), cluster_shape_mn, margin)
+    validation_key = (config, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in inputs.items()))
+    if validation_key not in validated_configs:
+        for name, rows in (("sfa", m), ("sfb", n)):
+            if math.prod(inputs[name].shape) != 128 * ceil_div(rows, 128) * tokens // 32:
+                raise ValueError(f"{name.upper()} must contain the complete MMA-packed scale buffer")
+        validated_configs.add(validation_key)
+    if config not in kernel_cache:
+        major, minor = get_compute_capability()
+        if major * 10 + minor < 100:
+            raise RuntimeError(f"Grouped GEMM wgrad requires SM100+ compute capability, but found SM{major}{minor}")
+        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_shape_mn[0] * cluster_shape_mn[1]) - margin
+        if mac <= 0:
+            raise ValueError("CUDNNFE_CLUSTER_OVERLAP_MARGIN leaves no active clusters")
+        kernel = wgrad_kernel_type()(
+            sf_vec_size=32,
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=use_2cta_instrs,
+            mma_tiler_mn=tuple(mma_tiler_mn),
+            cluster_shape_mn=cluster_shape_mn,
+            expert_cnt=experts,
+            weight_mode=MoEWeightMode.DENSE,
+        )
+        kernel_cache[config] = (kernel, mac, max(kernel.get_workspace_bytes(), 1))
+    return kernel_cache[config]
+
+
+def blockscaled_wgrad_jax(*, a_tensor, b_tensor, sfa_tensor, sfb_tensor, offsets_tensor, wgrad_dtype, mma_tiler_mn, cluster_shape_mn):
+    inputs = dict(a=a_tensor, b=b_tensor, sfa=sfa_tensor, sfb=sfb_tensor, offsets=offsets_tensor)
+    for name, tensor in inputs.items():
+        if tensor is None:
+            raise ValueError(f"{name}_tensor is required for the JAX MXFP8 path")
+        if detect_framework(tensor) != "jax":
+            raise ValueError(f"{name}_tensor must be a JAX array or tracer")
+    inputs["sfa"] = sf_array(sfa_tensor)
+    inputs["sfb"] = sf_array(sfb_tensor)
+    m, n = a_tensor.shape[0], b_tensor.shape[-1]
+    wgrad = output_type((offsets_tensor.shape[0], m, n), wgrad_dtype)
+    kernel, mac, workspace_bytes = wgrad_plan(inputs, wgrad, mma_tiler_mn, cluster_shape_mn)
+    result = grouped_call(
+        grouped_wgrad_adapter,
+        kernel,
+        mac,
+        tuple(output_type(t.shape, t.dtype) for t in inputs.values()),
+        (wgrad, output_type((workspace_bytes,), cutlass.Uint8)),
+        zero_dprob=False,
+        sfa_rows=128 * ceil_div(m, 128),
+        sfb_rows=128 * ceil_div(n, 128),
+    )(*inputs.values())
+    return TupleDict(wgrad_tensor=result[0])

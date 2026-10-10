@@ -133,6 +133,194 @@ def test_canonical_jax_glu_parity(act_func, experts, shared_wrapper):
     assert bridge(**inputs, generate_c=False)["c_tensor"] is None
 
 
+def kernel_facing_torch(arrays):
+    """Torch dGLU takes the kernel-facing views of the canonical buffers."""
+    tensors = torch_inputs(arrays)
+    for name in ("a_tensor", "c_tensor"):
+        tensor = tensors[name]
+        tensors[name] = tensor.as_strided((*tensor.shape, 1), (*tensor.stride(), tensor.numel()))
+    m = tensors["prob_tensor"].numel()
+    tensors["prob_tensor"] = tensors["prob_tensor"].as_strided((m, 1, 1), (1, m, m))
+    tensors["b_tensor"] = tensors["b_tensor"].permute(1, 2, 0)
+    for name in ("sfa_tensor", "sfb_tensor"):
+        tensors[name] = tensors[name].permute(3, 4, 1, 5, 2, 0)
+    return tensors
+
+
+def dglu_reference(arrays, **options):
+    import cudnn
+
+    m = arrays["a_tensor"].shape[0]
+    dprob = torch.zeros((m, 1, 1), device="cuda")
+    result = cudnn.grouped_gemm_dglu_wrapper_sm100(**kernel_facing_torch(arrays), dprob_tensor=dprob, d_dtype=torch.float8_e4m3fn, sf_vec_size=32, **options)
+    for name in ("d_row_tensor", "d_col_tensor", "dprob_tensor"):
+        result[name] = result[name].reshape(result[name].shape[:-1] if name != "dprob_tensor" else (m,))
+    for name in ("sfd_row_tensor", "sfd_col_tensor"):
+        result[name] = result[name].permute(5, 2, 4, 0, 1, 3)
+    return result
+
+
+@pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
+@pytest.mark.parametrize("experts", [1, 4])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_dglu_parity(act_func, experts, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = problem(True, experts, False, False, n=512)
+    arrays["beta_tensor"] = np.linspace(0.5, 1.5, experts, dtype=np.float32)
+    options = dict(act_func=act_func, discrete_col_sfd=True)
+    bridge = partial(cudnn.grouped_gemm_dglu_wrapper_sm100, sf_vec_size=32, dprob_tensor=None) if shared_wrapper else cudnn.grouped_gemm_dglu_jax_sm100
+    bridge = partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn, **options)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    reference = dglu_reference(arrays, **options)
+    assert_outputs(bridge(**inputs), reference)
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference)
+    arrays["alpha_tensor"] *= 0.5
+    inputs["alpha_tensor"] = jnp.asarray(arrays["alpha_tensor"])
+    assert_outputs(compiled(**inputs), dglu_reference(arrays, **options))
+
+
+@pytest.mark.parametrize(
+    "option,value", [("sf_vec_size", 16), ("dprob_tensor", 1), ("generate_dbias", True), ("use_dynamic_sched", True), ("deterministic", True), ("n", 512)]
+)
+def test_jax_dglu_rejects_unsupported_options(option, value):
+    skip_unless_sm100()
+    import cudnn
+
+    inputs = {name: jnp.asarray(array) for name, array in problem(True, 1, True, False).items()}
+    options = dict(sf_vec_size=32, d_dtype=ml_dtypes.float8_e4m3fn, dprob_tensor=None)
+    options[option] = value
+    with pytest.raises(ValueError, match=option):
+        cudnn.grouped_gemm_dglu_wrapper_sm100(**inputs, **options)
+
+
+def wgrad_problem(splits):
+    rng = np.random.default_rng(796)
+    m, n, tokens = 384, 640, sum(splits)
+    return dict(
+        a_tensor=rng.integers(-2, 3, (m, tokens)).astype(ml_dtypes.float8_e4m3fn),
+        b_tensor=rng.integers(-2, 3, (tokens, n)).astype(ml_dtypes.float8_e4m3fn),
+        sfa_tensor=rng.integers(125, 129, (m, tokens // 32), dtype=np.uint8),
+        sfb_tensor=rng.integers(125, 129, (n, tokens // 32), dtype=np.uint8),
+        offsets_tensor=np.cumsum(splits).astype(np.int32),
+    )
+
+
+# One-expert splits span exactly one K tile (128 tokens on SM100, 256 on Rubin), the case a static
+# scale-factor column count broke.
+@pytest.mark.parametrize("splits", [(128,), (256,), (256, 384, 0, 128)], ids=["128tokens", "256tokens", "4experts"])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_wgrad_parity(splits, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = wgrad_problem(splits)
+    eager = partial(cudnn.grouped_gemm_wgrad_wrapper_sm100, sf_vec_size=32)
+    bridge = eager if shared_wrapper else cudnn.grouped_gemm_wgrad_jax_sm100
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    inputs["sfa_tensor"] = inputs["sfa_tensor"].reshape(-1)
+    # Poison the allocator so an empty expert's unwritten output cannot read back as zeros.
+    for _ in range(8):
+        jax.block_until_ready(jnp.full((1 << 22,), 0x55, jnp.uint8))
+    assert_outputs(bridge(**inputs), eager(**torch_inputs(arrays)))
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), eager(**torch_inputs(arrays)))
+    arrays["offsets_tensor"] = np.cumsum((0,) * (len(splits) - 1) + (sum(splits),)).astype(np.int32)
+    inputs["offsets_tensor"] = jnp.asarray(arrays["offsets_tensor"])
+    assert_outputs(compiled(**inputs), eager(**torch_inputs(arrays)))
+
+
+@pytest.mark.parametrize(
+    "shared_wrapper,option,value",
+    [
+        (True, "sf_vec_size", 16),
+        (True, "output_mode", "discrete"),
+        (True, "global_scale_a", 1),
+        (True, "sf_fp8_dtype_override", "e5m3"),
+        (True, "accumulate_on_output", True),
+        (False, "input_order", "tensor_ragged"),
+        (False, "acc_dtype", jnp.float16),
+        (False, "wgrad_ptrs", 1),
+    ],
+)
+def test_jax_wgrad_rejects_unsupported_options(shared_wrapper, option, value):
+    skip_unless_sm100()
+    import cudnn
+
+    inputs = {name: jnp.asarray(array) for name, array in wgrad_problem((256,)).items()}
+    fn = partial(cudnn.grouped_gemm_wgrad_wrapper_sm100, sf_vec_size=32) if shared_wrapper else cudnn.grouped_gemm_wgrad_jax_sm100
+    with pytest.raises(ValueError, match=option):
+        fn(**inputs, **{option: value})
+
+
+def test_jax_wgrad_rejects_invalid_sf():
+    skip_unless_sm100()
+    import cudnn
+
+    inputs = {name: jnp.asarray(array) for name, array in wgrad_problem((256,)).items()}
+    inputs["sfb_tensor"] = inputs["sfb_tensor"][:-1]
+    with pytest.raises(ValueError, match="SFB"):
+        jax.jit(cudnn.grouped_gemm_wgrad_jax_sm100)(**inputs)
+
+
+@pytest.mark.parametrize(
+    "operation,rubin,blackwell",
+    [
+        ("glu", "BlockScaledMoEGroupedGemmGluKernel", "BlockScaledMoEGroupedGemmGluBiasKernel"),
+        ("dglu", "BlockScaledMoEGroupedGemmDgluKernel", "BlockScaledMoEGroupedGemmDgluDbiasKernel"),
+        ("wgrad", "BlockScaledMoEGroupedGemmWgradRubinKernel", "BlockScaledMoEGroupedGemmWgradKernel"),
+    ],
+)
+def test_jax_kernel_dispatch(operation, rubin, blackwell, monkeypatch):
+    import importlib
+
+    api = importlib.import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.jax_api")
+    for family, name in (("rubin", rubin), ("blackwell", blackwell)):
+        monkeypatch.setattr(api, "get_device_type", lambda: family)
+        assert getattr(api, f"{operation}_kernel_type")().__name__ == name
+
+
+def test_canonical_jax_dglu_wgrad_without_torch():
+    skip_unless_sm100()
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        import sys
+        sys.modules['torch'] = None
+        import jax
+        import jax.numpy as jnp
+        import ml_dtypes
+        import numpy as np
+        from functools import partial
+        from cudnn import grouped_gemm_dglu_wrapper_sm100, grouped_gemm_wgrad_wrapper_sm100
+        fp8 = ml_dtypes.float8_e4m3fn
+        a = jnp.ones((256, 256), fp8)
+        b = jnp.ones((1, 256, 256), fp8)
+        c = jnp.ones((256, 512), jnp.bfloat16)
+        sf = jnp.full((1, 2, 2, 32, 4, 4), 127, jnp.uint8)
+        offsets = jnp.array([256], jnp.int32)
+        ones = jnp.ones((1,), jnp.float32)
+        prob = jnp.ones((256,), jnp.float32)
+        dglu = partial(grouped_gemm_dglu_wrapper_sm100, sfb_tensor=sf, norm_const_tensor=ones, dprob_tensor=None, d_dtype=fp8, sf_vec_size=32)
+        out = jax.jit(dglu)(a, c, sf, offsets, ones, ones, prob, b_tensor=b)
+        assert np.isfinite(np.asarray(out['dprob_tensor'])).all()
+        wgrad = partial(grouped_gemm_wgrad_wrapper_sm100, sf_vec_size=32)
+        sf_t = jnp.full((256, 8), 127, jnp.uint8)
+        out = jax.jit(wgrad)(a, a, sf_t, sf_t, offsets)
+        np.testing.assert_array_equal(np.asarray(out['wgrad_tensor']).astype(np.float32), 256)
+        assert sys.modules['torch'] is None
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script], env={**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}, capture_output=True, text=True, timeout=180
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "shared_wrapper,option,value",
     [
