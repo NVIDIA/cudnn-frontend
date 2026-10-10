@@ -183,6 +183,102 @@ def test_DSA_indexer_backward_wrapper(
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_DSA_indexer_backward_wrapper_compact_h32():
+    """SM100 keeps the public tensors at H32 while using an internal M64 tile."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_sm100()
+
+    cfg = {
+        "b": 1,
+        "s_q": 128,
+        "s_kv": 512,
+        "head_dim": 128,
+        "qhead_per_kv_head": 32,
+        "topk": 512,
+    }
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    attn_score_ref = attn_score.clone()
+    index_score_ref = index_score.clone()
+
+    # Back the compact outputs with canary tails. The internal M64 dQ tile
+    # must be clipped by the H32 tensor map, and dW must predicate heads 32:64.
+    guard_elems = 256
+    guard_value = 23.0
+    dq_storage = torch.full((index_q.numel() + guard_elems,), guard_value, dtype=index_q.dtype, device=index_q.device)
+    dw_storage = torch.full((weights.numel() + guard_elems,), guard_value, dtype=weights.dtype, device=weights.device)
+    d_index_q = dq_storage[: index_q.numel()].view_as(index_q)
+    d_weights = dw_storage[: weights.numel()].view_as(weights)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+
+    result = DSA.indexer_backward_wrapper(
+        index_q,
+        weights,
+        index_k,
+        attn_score,
+        index_score,
+        topk_indices,
+        sm_scale=1.0,
+        loss_coeff=float(cfg["b"] * cfg["s_q"]),
+        grad_loss=torch.ones((), dtype=torch.float32, device=index_q.device),
+        block_I=128,
+        d_index_q=d_index_q,
+        d_weights=d_weights,
+        d_index_k=d_index_k,
+        backend="default",
+    )
+
+    assert result["d_index_q"] is d_index_q
+    assert result["d_weights"] is d_weights
+    assert result["d_index_k"] is d_index_k
+    torch.testing.assert_close(dq_storage[index_q.numel() :], torch.full_like(dq_storage[index_q.numel() :], guard_value), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(dw_storage[weights.numel() :], torch.full_like(dw_storage[weights.numel() :], guard_value), rtol=0.0, atol=0.0)
+    check_ref_indexer_backward(
+        index_q,
+        weights,
+        index_k,
+        attn_score_ref,
+        index_score_ref,
+        topk_indices,
+        d_index_q,
+        d_weights,
+        d_index_k,
+        sm_scale=1.0,
+        grad_scale=1.0,
+    )
+
+
+@pytest.mark.L0
+def test_DSA_indexer_backward_sm100_rejects_untested_sub_m64_heads():
+    """The new compact contract adds H32 only; it does not silently widen the domain."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    _require_sm100()
+
+    b, s_q, s_k, h, d, topk = 1, 1, 128, 48, 128, 128
+    plan = DSA.IndexerBackward(
+        sample_index_q=torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda"),
+        sample_weights=torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda"),
+        sample_index_k=torch.empty((b, s_k, d), dtype=torch.bfloat16, device="cuda"),
+        sample_d_index_q=torch.empty((b, s_q, h, d), dtype=torch.bfloat16, device="cuda"),
+        sample_d_weights=torch.empty((b, s_q, h), dtype=torch.bfloat16, device="cuda"),
+        sample_d_index_k=torch.empty((b, s_k, d), dtype=torch.bfloat16, device="cuda"),
+        sample_attn_score=torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda"),
+        sample_index_score=torch.empty((b, s_q, topk), dtype=torch.float32, device="cuda"),
+        sample_topk_indices=torch.empty((b, s_q, topk), dtype=torch.int32, device="cuda"),
+        sm_scale=1.0,
+        block_I=128,
+    )
+    with pytest.raises(ValueError, match="requires H=32 or H>=64"):
+        plan.check_support()
+
+
+@pytest.mark.L0
 def test_DSA_indexer_backward_packed_shapes_reuse_compilation(monkeypatch):
     """GitHub #1188: packed training changes (B, Sq, Sk) every step; once a TopK bucket's
     kernels are compiled, new shapes must run without compiling again."""
