@@ -921,8 +921,10 @@ class pygraph:
                 if spec_entry:
                     _, spec = spec_entry
                     infer = spec.get("infer", {})
+                    # builder-time dims of a "reinfer" port are provisional: they depend on a sibling the caller may set later
+                    reinfer = spec.get("reinfer", ())
                     for oport, out_t in node.outputs.items():
-                        if out_t is not None and not out_t.dim:
+                        if out_t is not None and (not out_t.dim or (oport in reinfer and not out_t.dim_assigned)):
                             try:
                                 d = infer.get(oport, lambda n: None)(node)
                             except Exception:  # noqa: BLE001 — best-effort
@@ -2884,6 +2886,8 @@ _install_pointwise_builders()
 #                      whose predicate is False is skipped, and comes back None)
 #   infer              per-output IR-side shape inference (introspection; cuDNN
 #                      re-infers at build) — best-effort, None on failure
+#   reinfer            output ports whose builder-time inferred dims validate()
+#                      recomputes (they follow a sibling the caller may set later)
 #   dtype_like         per-output data_type copied from a named input port
 #   push_output_dims   True for ops whose output dims cuDNN cannot infer
 #                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
@@ -3039,7 +3043,7 @@ def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever
 def _layernorm_stat_like(other):  # the C++ layernorm node's rule: an unset stat takes the dims set on the other one
     def infer(node):
         t = node.outputs.get(other)
-        return list(t.dim) if t is not None and t.dim else _norm_stats_like(0)(node)
+        return list(t.dim) if t is not None and t.dim_assigned and t.dim else _norm_stats_like(0)(node)
 
     return infer
 
@@ -3084,6 +3088,7 @@ _STRUCTURED_OPS = {
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
         infer=_NORM_FWD_INFER,
+        reinfer=("mean", "inv_var"),
     ),
     "layernorm_backward": dict(
         node_type=NodeType.LAYERNORM_BWD,

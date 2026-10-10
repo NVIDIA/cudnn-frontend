@@ -399,6 +399,9 @@ def test_layernorm_without_scale_one_stat_dims_state_the_axes(set_stat, cudnn_ha
     x = make_seeded_randn((B, S, H), torch.float32, 2108)
     graph, X, _, eps, Y, mean, inv_var = _layernorm_graph(cudnn_handle, x)
     (mean if set_stat == "mean" else inv_var).set_dim([B, S, 1]).set_stride([S, 1, 1])
+    graph.validate()
+    # callers allocate the stats from these dims right after validate()
+    assert [int(d) for d in mean.get_dim()] == [int(d) for d in inv_var.get_dim()] == [B, S, 1]
     y = torch.full_like(x, float("nan"))
     stats = _execute(graph, cudnn_handle, x, {X: x, eps: torch.full((1, 1, 1), 1e-5), Y: y}, (mean, inv_var))
     assert [int(d) for d in mean.get_dim()] == [int(d) for d in inv_var.get_dim()] == [B, S, 1]
