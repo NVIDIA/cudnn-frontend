@@ -237,10 +237,10 @@ def test_sm107_placement_consumes_qualified_choices(monkeypatch, dtype, chooser,
         dict(thd=True, padded=True),
         dict(has_paged_kv=True, page_size=16, padded=True),
         dict(attn_scale_prefolded=True),
-        dict(has_sink=False),
+        dict(has_sink=False, causal=False, bottom_right=False, s_q=1),  # sink-free s_q 2-16 leads by the dense decode-shaped arm
         dict(window_left=128),
         dict(right_band_widening=True, right_bound=8),
-        dict(s_q=17),
+        dict(s_q=17, b=64),  # past the band; b=64 keeps it off the one-decode-tile-wave prefill arm
         dict(b=1),
         dict(s_kv=512),
         dict(s_kv=65536),
@@ -384,3 +384,23 @@ def test_propose_ranks_the_rubin_mxfp8_row_first_without_the_flag(monkeypatch, k
     quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True, s_q=4096)
     assert heuristics.propose(kind, _facts(device_cc=(10, 7), **quant), {name: _OFFERED[name]}) == plans + [BACKEND]
     assert heuristics.propose(kind, _facts(device_cc=(10, 0), **quant), {name: _OFFERED[name]}) == [BACKEND] + plans
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("arch, cc, sms", [("sm107", (10, 7), 216), ("sm100", (10, 0), 148)])
+@pytest.mark.parametrize("sink", [False, True])
+def test_dense_d128_one_decode_tile_wave_leads(monkeypatch, arch, cc, sms, sink):
+    """Past the decode-shaped band a causal dense d64/d128 graph, sink or not, leads exactly when its decode-tile launch fits
+    one wave (heuristics.d128_dense_waves, issue #1518); the wave counts are patched, so no measured boundary is pinned."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == f"sdpa_fwd_prefill_{arch}")
+    values = dict(
+        b=2, h_q=32, h_kv=8, s_q=384, s_kv=384, d_qk=128, d_v=128, dtype=cudnn.data_type.BFLOAT16, causal=True, has_sink=sink, device_cc=cc, device_sm_count=sms
+    )
+    for waves, causal, expected in (((1, 1), True, placement.LEAD), ((2, 1), True, placement.TRAIL), ((1, 1), False, placement.TRAIL)):
+        monkeypatch.setattr(heuristics, "d128_dense_waves", lambda caps, facts, pack_gqa=None, waves=waves: waves)
+        assert placement.place(spec, _facts(**dict(values, causal=causal))) == expected, (waves, causal)
+    monkeypatch.undo()
+    if not sink:
+        assert placement.place(spec, _facts(**dict(values, s_q=8, s_kv=32768, b=64))) == placement.LEAD  # decode-shaped: every unit count
