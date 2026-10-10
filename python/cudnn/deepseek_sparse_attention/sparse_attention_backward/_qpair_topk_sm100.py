@@ -213,3 +213,5 @@ class QPairTopKTransformSm100:
                 if (flags[slot] & Int32(4)) == Int32(0):
                     unique_pos = cute.arch.atomic_add((meta.iterator + Int32(8)).llvm_ptr, Int32(1), sem="relaxed", scope="cta")
                     mOutput[row1, Int32(self.shared_capacity) + unique_pos] = index
+
+    kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

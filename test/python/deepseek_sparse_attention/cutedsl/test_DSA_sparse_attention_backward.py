@@ -30,6 +30,16 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 _TWO_CTA_CAPABILITIES = ((10, 0), (10, 3))
 
 
+def _assert_qcluster_dq_close(actual, expected, msg):
+    """Reject erased dQ while allowing q-cluster accumulation-order noise."""
+    actual_float = actual.float()
+    expected_float = expected.float()
+    assert torch.count_nonzero(expected_float).item() > 0, f"{msg}: reference dq is zero"
+    assert torch.count_nonzero(actual_float).item() > 0, f"{msg}: computed dq is zero"
+    relative_l2 = (actual_float - expected_float).norm() / expected_float.norm()
+    assert relative_l2 < 2e-2, f"{msg}: relative L2 error {relative_l2.item():.3e}"
+
+
 def _spy_d576_two_cta_execute(monkeypatch):
     """Count calls into the D576 two-CTA launch path; the selector alone does not prove the route ran."""
     from cudnn.deepseek_sparse_attention.sparse_attention_backward import _interface_sm100_d576
@@ -367,7 +377,9 @@ def test_DSA_sparse_attention_backward_qcluster_matches_baseline_and_graph(heads
     graph.replay()
     torch.cuda.synchronize()
     try:
-        for name in ("dq", "dkv", "d_sink"):
+        _assert_qcluster_dq_close(result["dq"], baseline["dq"], "dq")
+        _assert_qcluster_dq_close(graph_result["dq"], baseline["dq"], "graph dq")
+        for name in ("dkv", "d_sink"):
             torch.testing.assert_close(result[name], baseline[name], rtol=5e-2, atol=5e-2, msg=name)
             torch.testing.assert_close(graph_result[name], baseline[name], rtol=5e-2, atol=5e-2, msg=f"graph {name}")
     finally:
@@ -384,7 +396,8 @@ def test_DSA_sparse_attention_backward_qcluster_matches_baseline_and_graph(heads
     offset += dkv_bytes
     direct_d_sink = carrier[offset : offset + sink_bytes].view(torch.float32).view_as(sink)
     direct = plan.execute(q, kv, out, dout, lse, sink, topk_idxs, direct_dq, direct_dkv, lengths, scale, workspace=direct_workspace, d_sink=direct_d_sink)
-    for name, actual in zip(("dq", "dkv", "d_sink"), direct):
+    _assert_qcluster_dq_close(direct[0], baseline["dq"], "direct dq")
+    for name, actual in zip(("dkv", "d_sink"), direct[1:]):
         torch.testing.assert_close(actual, baseline[name], rtol=5e-2, atol=5e-2, msg=f"direct {name}")
 
     aliased_dq = direct_workspace[:dq_bytes].view(torch.bfloat16).view_as(q)
@@ -457,7 +470,8 @@ def test_DSA_sparse_attention_backward_qcluster_graph_replay_switches_overlap_pa
         )
 
     def assert_state(actual, expected, expected_shared):
-        for name, tensor in zip(("dq", "dkv", "d_sink"), actual):
+        _assert_qcluster_dq_close(actual[0], baselines[expected]["dq"], f"{expected} dq")
+        for name, tensor in zip(("dkv", "d_sink"), actual[1:]):
             torch.testing.assert_close(tensor, baselines[expected][name], rtol=5e-2, atol=5e-2, msg=f"{expected} {name}")
         shared_lengths = plan._qcluster_plan._buffers(workspace)[4]
         assert torch.equal(shared_lengths, torch.full_like(shared_lengths, expected_shared))
