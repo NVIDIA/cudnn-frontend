@@ -436,7 +436,8 @@ tile, (16, 32] on the 32-column tile, a packed group in up to two token units) w
 runs on the d256 decode tile, and there the gate is applied by the split **combine** on the fp32 merged value
 before the single cast (the
 same `h * tanh(g / 2) + h` arithmetic as the fused epilogue: one rounding, so the split and the unsplit gated
-plans differ only by the attention's summation order), over a dense or a paged cache, packed or not. Two
+plans differ only by the attention's summation order), over a dense or a paged cache, packed or not -- not when the graph enables
+execute-time shape overrides (the combine binds `G` to the declared shape; such a graph keeps the unsplit fused kernel). Two
 contracts hold on the fused path: `Stats` (LSE) is
 independent of `G`, and `Amax_O` -- an output of the `sdpa` node, which precedes the gate on the graph -- is the
 amax of the **un-gated** normalised `O` (in `scale_o` units on FP8, unscaled on MXFP8), while the stored `O` is

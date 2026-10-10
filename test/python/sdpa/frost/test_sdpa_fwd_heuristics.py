@@ -1077,6 +1077,46 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
         assert any((p.knobs.split_kv or 1) == 1 for p in plans) == (not f.has_paged_kv), [p.knobs for p in plans]
 
 
+@pytest.mark.L0
+def test_rubin_gated_decode_tile_split_declines_execute_time_shape_overrides(sm107_metadata_target):
+    """The gate-in-combine split binds G to the plan's declared (B, H_q, S_q, D_v) (prepared.CombineGate), while a graph
+    that permits execute-time geometry (shape overrides) may change either at execute: the row never serves such a graph
+    on the decode tile's split -- the facts-level predicate says so (one definition for mismatch, the heuristics and the
+    adapter), mismatch names the overrides, the lowering-side admission agrees, and the proposal helpers emit no split or
+    packed set for it (its unsplit plan keeps the fused-gate prefill kernel).  The same graph WITHOUT overrides rides the
+    tile's split -- the control."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd.engines import _prepared_decline_reason, d256_decode_tile_selected
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible, _split_points
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    gated = _decode_d256_facts(
+        device_cc=(10, 7),
+        device_sm_count=204,
+        b=4,
+        h_q=24,
+        has_epilogue_gate=True,
+        epilogue_gate_dtype=cudnn.data_type.BFLOAT16,
+        has_paged_kv=False,
+        page_size=0,
+        padded=False,
+    )
+    assert d256_decode_tile_selected(row, gated, 12, 2) and engines.mismatch(row, gated, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2)) is None, "the control"
+    assert _split_points(row, gated, 128, 128, 2, pack_g=12)[0] >= 2 and _pack_gqa_eligible(row, gated, 128, 2), "the control proposes the gated split"
+    over = dataclasses.replace(gated, shape_overrides=True)
+    assert not d256_decode_tile_selected(row, over, 12, 2) and not d256_decode_tile_selected(row, over, 1, 2) and not d256_decode_tile_selected(row, over, 12)
+    why = engines.mismatch(row, over, engines.SdpaFwdKnobs(split_kv=2))
+    assert why and "shape overrides" in why, why
+    why = engines.mismatch(row, over, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2))
+    assert why and "decode tile" in why, why  # the packed request falls at the row's PackGQA rule first (the tile is not selected)
+    why = _prepared_decline_reason(row, over, 2)
+    assert why and "shape overrides" in why, why
+    assert "shape overrides" not in (_prepared_decline_reason(row, over, 1) or ""), "the unsplit question is not this decline"
+    assert _split_points(row, over, 128, 128, 2, pack_g=12) == [1], _split_points(row, over, 128, 128, 2, pack_g=12)
+    assert not _pack_gqa_eligible(row, over, 128, 2) and not _pack_gqa_eligible(row, over, 128)
+
+
 # --- cc 10.7 dense d128 half: the shared decode tile and PackGQA (issue #1472) --------------------------------------
 
 
@@ -1347,7 +1387,7 @@ def test_decode_tile_model_counts_the_whole_packed_group():
 
 
 @pytest.mark.L0
-def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_model():
+def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_model(sm107_metadata_target):
     """The Rubin half row's twin of the two SM100 decode-tile tests above, on cc 10.7 at 204 SMs:
     the row claims PackGQA at d256 for the decode tile ONLY (pack_gqa_d_shapes carries (256, 256);
     the d256 prefill kernel runs unpacked), so a decode-shaped graph -- paged OR dense, the dense
@@ -1436,6 +1476,30 @@ def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_mode
     assert engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True, cga=2, split_kv=1)) is None
     why = engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2))
     assert why and "decode tile" in why and "paged half THD" in why, why
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 4, 128, 512])
+def test_rubin_paged_thd_d256_keeps_its_packed_candidate(sm107_metadata_target, s_q):
+    """The paged half THD d256 graph on cc 10.7 packs on the paged prefill pipeline (CGA2, unsplit;
+    config_sm100.supports_paged_d256_pack_gqa) -- a route the Rubin d256 decode tile never touched, so the
+    proposal helpers keep emitting its packed candidate exactly as they did before the tile's d256 PackGQA
+    rule arrived (B = 32, 32/2 heads, page 128, 4096 keys, S_q from one token to a long prefill): one
+    pack_gqa=True set at CGA2 unsplit, admissible, and no packed SPLIT (the route has none).  The explicit
+    packed knobs passing mismatch() is not enough -- the candidate LIST is what a caller without knobs sees."""
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    f = _decode_d256_facts(device_cc=(10, 7), device_sm_count=212, s_q=s_q, thd=True, page_size=128, causal=True, bottom_right=True)
+    plans = [p.knobs for p in recommend("A", f, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+    assert plans, "the Rubin half row serves the paged THD d256 graph"
+    for k in plans:
+        assert engines.mismatch(row, f, k) is None, (k, engines.mismatch(row, f, k))
+    packed = [k for k in plans if k.pack_gqa is True]
+    assert packed and all(k.cga == 2 and (k.split_kv or 1) == 1 for k in packed), plans
+    assert _pack_gqa_eligible(row, f, 128) and _pack_gqa_eligible(row, f, 128, 1, 2), "the route: some plan / CGA2 unsplit"
+    assert not _pack_gqa_eligible(row, f, 128, 2) and not _pack_gqa_eligible(row, f, 128, 1, 1), "no packed split, no CGA1 packing"
+    assert engines.mismatch(row, f, engines.SdpaFwdKnobs(pack_gqa=True, cga=2, split_kv=1)) is None
 
 
 @pytest.mark.L0

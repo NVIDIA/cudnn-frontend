@@ -68,6 +68,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     decode_d256_q_units,
     pack_gqa_group_size,
     pack_gqa_supported,
+    supports_paged_d256_pack_gqa,
     supports_paged_prefill_cga1,
 )
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
@@ -1277,7 +1278,7 @@ def _decode_tile_pack_g(facts, pack_g: int) -> int:
     return (facts.h_q // facts.h_kv) if pack_g > 1 else 1
 
 
-def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optional[int] = None) -> bool:
+def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optional[int] = None, cga: Optional[int] = None) -> bool:
     """Whether a packed set can be built at ``tile_m``: the row offers packing,
     the graph carries no fused epilogue gate (its per-head
     gate tile cannot address a packed tile's interleaved rows -- mismatch()
@@ -1299,21 +1300,33 @@ def _pack_gqa_eligible(caps: Capabilities, facts, tile_m: int, split_kv: Optiona
 
     The d256 DECODE tile is the one packing that ignores ``tile_m``: it packs the
     WHOLE group into its 16-row Q tile (``HEADS_PER_TILE = QH_PER_KH``; 24/2 = 12
-    live rows + 4 zero tail rows), dense or paged.  On the Rubin half row it is
-    also the ONLY d256 packing (the d256 prefill kernel runs unpacked), so a
-    packed d256 proposal there is eligible exactly when the whole group rides
-    the tile -- the predicate ``mismatch()`` reads (``d256_decode_tile_selected``)
-    -- and the dense-cache exclusion of the Rubin half row does not apply to it.
+    live rows + 4 zero tail rows), dense or paged.  On the Rubin half row the
+    dense d256 prefill kernel runs unpacked, so a packed d256 proposal there is
+    eligible exactly when the whole group rides the tile -- the predicate
+    ``mismatch()`` reads (``d256_decode_tile_selected``) -- or when the graph is
+    the paged half THD prefill's own d256 packing (CGA2, unsplit;
+    ``config_sm100.supports_paged_d256_pack_gqa``, the route the row served
+    before the tile; ``cga`` is the set's CGA span, None = some plan); the
+    dense-cache exclusion of the Rubin half row applies to neither.
     The SM100 line keeps its rules: its partial PackGQA already admits such
     groups on the prefill tile."""
     half = not (facts.is_fp8 or facts.is_mxfp8)
     group = (facts.h_q // facts.h_kv) if facts.h_kv else 0
     rubin_decode_tile = caps.sm_lo == 107 and half and group > 1 and facts.h_q % facts.h_kv == 0 and _d256_decode_tile_selected(caps, facts, group, split_kv)
+    # The paged half THD prefill pipeline packs d256 too (CGA2, unsplit) -- the route the Rubin row served before the
+    # decode tile existed; the tile's d256 rule exempts it exactly as engines.mismatch does.
+    rubin_paged_thd_d256 = (
+        caps.sm_lo == 107
+        and half
+        and supports_paged_d256_pack_gqa(
+            (facts.d_qk, facts.d_v), device_cc=facts.device_cc, fp8=not half, thd=facts.thd, paged=facts.has_paged_kv, cga=cga, split_kv=split_kv or 1
+        )
+    )
     return (
         True in caps.pack_gqas
         and (caps.pack_gqa_d_shapes is None or _selected_d_shape(caps, facts) in caps.pack_gqa_d_shapes)
         and not (caps.sm_lo == 107 and half and not facts.has_paged_kv and not rubin_decode_tile and not rubin_dense_d128_shared_leg(caps, facts))
-        and not (caps.sm_lo == 107 and half and _selected_d_shape(caps, facts) == (256, 256) and not rubin_decode_tile)
+        and not (caps.sm_lo == 107 and half and _selected_d_shape(caps, facts) == (256, 256) and not rubin_decode_tile and not rubin_paged_thd_d256)
         and not (facts.thd and not _thd_decode_leg(caps, facts) and (facts.d_qk, facts.d_v) not in caps.thd_pack_gqa_d_shapes)
         and not (facts.has_epilogue_gate and not rubin_decode_tile)
         and facts.h_q != facts.h_kv
@@ -1376,7 +1389,7 @@ def _pack_gqa_points(caps: Capabilities, facts, tile_m: int, cga: Optional[int] 
     ``(False, True)`` when it is only eligible, ``(False,)`` when it is not.
     ``split_kv`` is the set's split (None = some plan): a GATED d256 graph packs
     only on the decode tile's split, whose combine applies the gate."""
-    if not _pack_gqa_eligible(caps, facts, tile_m, split_kv):
+    if not _pack_gqa_eligible(caps, facts, tile_m, split_kv, cga):
         return (False,)
     if facts.thd and not _thd_decode_leg(caps, facts):
         # On the admitted d128 half prefill tile, packing shortens the token

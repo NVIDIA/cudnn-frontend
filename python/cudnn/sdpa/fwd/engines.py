@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Optional
 
@@ -558,9 +558,14 @@ def d256_decode_tile_selected(capabilities: Capabilities, facts: "ga.SdpaGraphFa
     merged value, the fused kernels' own arithmetic; ``SdpaFwdDslSm100._gate_in_combine``)
     on the Rubin row, which claims the gate; unsplit, the d256 prefill kernel's fused
     epilogue serves it.  ``split_kv=None`` asks whether SOME plan rides the tile (the
-    facts-only question), so a gated graph answers True there.  Keep the three in
-    lockstep."""
-    gate_ok = not facts.has_epilogue_gate or (capabilities.sm_lo == 107 and capabilities.epilogue_gate and (split_kv is None or split_kv > 1))
+    facts-only question), so a gated graph answers True there.  A gated graph whose
+    caller enabled execute-time shape overrides never rides it: the split combine
+    binds G to the plan's declared (B, H_q, S_q, D_v) (``prepared.CombineGate``), so
+    such a graph keeps the unsplit fused-gate kernel (``mismatch`` names the
+    overrides).  Keep the three in lockstep."""
+    gate_ok = not facts.has_epilogue_gate or (
+        capabilities.sm_lo == 107 and capabilities.epilogue_gate and (split_kv is None or split_kv > 1) and not facts.shape_overrides
+    )
     return (
         capabilities.sm_lo in (100, 107)
         and capabilities.sm_hi <= _BLACKWELL[1]
@@ -692,6 +697,13 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
             # paged D128 THD leg instead owns bounded packed partial regions.
             return None if _thd_decode_leg(capabilities, facts) or thd_split_domain(capabilities, facts) else "prepared THD overrides cannot use split-KV"
         return None
+    if facts.has_epilogue_gate and (split_kv or 1) > 1 and facts.shape_overrides:
+        # The d256 decode tile's split applies the gate in its combine, whose gate binding is fixed to the declared
+        # (B, H_q, S_q, D_v) (prepared.CombineGate); an override-enabled graph may change either at execute.
+        return (
+            "prepared dense overrides cannot ride the gate-in-combine split (its gate binding is fixed to the declared (B, H_q, S_q, D_v)); "
+            "a graph with execute-time shape overrides keeps the unsplit fused-gate kernel"
+        )
     if facts.cu_seq_q_t is not None or facts.cu_seq_kv_t is not None:
         return "prepared dense overrides require per-batch lengths, not prefix sums"
     from cudnn.sdpa.fwd.config_sm100 import dense_bind_strides
@@ -931,6 +943,16 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             if not capabilities.split_kv_supported:
                 return "split_kv > 1 is not wired in this engine's lowering"
             if facts.has_epilogue_gate and not decode_tile:
+                if facts.shape_overrides and d256_decode_tile_selected(
+                    capabilities, replace(facts, shape_overrides=False), _decode_tile_pack_g(facts, knobs), knobs.split_kv
+                ):
+                    # The decode tile's split WOULD carry this gate, but its combine binds G to the plan's declared
+                    # (B, H_q, S_q, D_v) (prepared.CombineGate) while an override-enabled graph may change either at
+                    # execute: declined here by name, never a bind failure at launch.
+                    return (
+                        "split_kv > 1 with the fused epilogue gate rides the d256 decode tile's split combine only, whose gate binding is fixed to the "
+                        "declared (B, H_q, S_q, D_v): a graph with execute-time shape overrides cannot use it (its unsplit plan keeps the fused-gate kernel)"
+                    )
                 # The combine pass writes the recombined O from un-gated partials;
                 # the gate lives in the unsplit kernel's epilogue -- except on the
                 # d256 decode tile, whose split carries the gate IN the combine
