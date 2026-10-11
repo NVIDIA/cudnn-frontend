@@ -1313,9 +1313,11 @@ Two consequences for callers:
    lengths attend to the padding rows up to the tile boundary and return wrong
    output without an error. The `s_q` override is not affected, and the causal
    mask hides the extra rows. The KV tile is 128 on the first-ranked H100/B200
-   plans (`eng9`/`eng10`), so there even `s_kv = 64` is wrong. A declaration
-   off the KV tile (e.g. 255) served every override measured, on A100, L40S,
-   H100 and B200 with cuDNN 9.27
+   plans (`eng9`/`eng10`), so there even `s_kv = 64` is wrong. Two forms served
+   every override measured, on A100, L40S, H100 and B200 with cuDNN 9.27: a
+   declaration off the KV tile (e.g. 255), and a graph that also carries the
+   real lengths in `seq_len_q` / `seq_len_kv` with `use_padding_mask=True`
+   (dense and ragged)
    ([#1567](https://github.com/NVIDIA/cudnn-frontend/issues/1567)). Validate the
    window you intend to use against your own plan and shapes before relying on
    it.
