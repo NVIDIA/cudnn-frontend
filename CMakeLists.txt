@@ -47,10 +47,12 @@ target_include_directories(
 
 # Find the cuda compiler
 find_package(CUDAToolkit REQUIRED)
+find_package(CUDNN REQUIRED)
 
-target_include_directories(
+target_link_libraries(
     cudnn_frontend INTERFACE
-    ${CUDAToolkit_INCLUDE_DIRS}
+    CUDA::toolkit
+    CuDNN::CuDNN
 )
 
 target_compile_features(cudnn_frontend INTERFACE cxx_std_17)
