@@ -136,6 +136,41 @@ def test_mxfp8_scale_pack_qk_bshd_matches_individual_packers_host_only():
     assert torch.equal(k_packed, mxfp8_scale_utils.pack_k_scale_bshd(k))
 
 
+@pytest.mark.parametrize(
+    "batch,seqlen_q,seqlen_k",
+    [
+        pytest.param(1, 0, 0, id="both-sequences-empty"),
+        pytest.param(1, 0, 5, id="q-sequence-empty"),
+        pytest.param(1, 3, 0, id="k-sequence-empty"),
+        pytest.param(0, 3, 5, id="batch-empty"),
+    ],
+)
+def test_mxfp8_scale_pack_qk_bshd_accepts_empty_extents_host_only(batch, seqlen_q, seqlen_k):
+    """Do not mistake the null storage pointer of empty tensors for aliasing."""
+    qhpkv, hkv, groups = 64, 1, 5
+    q = torch.empty((batch, seqlen_q, hkv * qhpkv, groups), dtype=torch.int64)
+    k = torch.empty((batch, seqlen_k, hkv, groups), dtype=torch.int64)
+
+    q_packed, k_packed = mxfp8_scale_utils.pack_qk_scale_bshd(q, k, qhpkv)
+
+    assert torch.equal(q_packed, mxfp8_scale_utils.pack_q_scale_bshd(q, qhpkv))
+    assert torch.equal(k_packed, mxfp8_scale_utils.pack_k_scale_bshd(k))
+
+
+def test_mxfp8_scale_pack_qk_bshd_rejects_shared_nonempty_storage_host_only():
+    """Keep source/output and output/output alias rejection for live storage."""
+    q = torch.empty((1, 2, 64, 4), dtype=torch.int64)
+    k = torch.empty((1, 128, 1, 4), dtype=torch.int64)
+    packed_shape = (1, 128, 4)
+
+    with pytest.raises(ValueError, match="q_out must not alias either source"):
+        mxfp8_scale_utils.pack_qk_scale_bshd(q, k, 64, q_out=k.view(packed_shape))
+
+    shared_out = torch.empty(packed_shape, dtype=q.dtype)
+    with pytest.raises(ValueError, match="q_out and k_out must not alias"):
+        mxfp8_scale_utils.pack_qk_scale_bshd(q, k, 64, q_out=shared_out, k_out=shared_out)
+
+
 def test_mxfp8_scale_pack_order_thd_with_padding_host_only():
     """Preserve logical THD rows while zero-filling sequence padding."""
     cu_q = torch.tensor([0, 2, 3], dtype=torch.int32)
@@ -279,7 +314,8 @@ def test_mxfp8_scale_prefix_padding_127_128_host_only():
 @pytest.mark.parametrize(
     "total_tokens,num_sequences,alignment,expected",
     [
-        (0, 4, 128, 384),
+        (0, 4, 128, 0),
+        (1, 4, 128, 128),
         (255, 2, 128, 384),
         (3, 2, 32, 64),
         (8192, 1, 2, 8192),
@@ -339,6 +375,36 @@ def test_mxfp8_scale_pack_qk_bshd_cuda_matches_reference_and_reuses_outputs():
         q_out=q_out,
         k_out=k_out,
     )
+    torch.cuda.synchronize()
+
+    assert actual_q is q_out
+    assert actual_k is k_out
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        pytest.param(0, 0, id="both-sequences-empty"),
+        pytest.param(0, 5, id="q-sequence-empty"),
+        pytest.param(3, 0, id="k-sequence-empty"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_qk_bshd_cuda_accepts_empty_extents(seqlen_q, seqlen_k):
+    """Pack a live Q or K operand when the paired CUDA operand has null storage."""
+    qhpkv, hkv, groups = 64, 1, 5
+    q_cpu = torch.arange(seqlen_q * qhpkv * groups, dtype=torch.int64).to(torch.uint8).reshape(1, seqlen_q, qhpkv, groups)
+    k_cpu = torch.arange(seqlen_k * hkv * groups, dtype=torch.int64).to(torch.uint8).reshape(1, seqlen_k, hkv, groups)
+    q_ref = mxfp8_scale_utils.pack_q_scale_bshd(q_cpu, qhpkv)
+    k_ref = mxfp8_scale_utils.pack_k_scale_bshd(k_cpu)
+    q = q_cpu.cuda()
+    k = k_cpu.cuda()
+    q_out = torch.empty_like(q_ref, device="cuda")
+    k_out = torch.empty_like(k_ref, device="cuda")
+
+    actual_q, actual_k = mxfp8_scale_utils.pack_qk_scale_bshd(q, k, qhpkv, q_out=q_out, k_out=k_out)
     torch.cuda.synchronize()
 
     assert actual_q is q_out

@@ -82,7 +82,9 @@ def minimal_padded_token_capacity(
     :func:`make_scale_cu_seqlens_padded`, its final value is at most this
     capacity.  The formula depends only on declared tensor shapes, so callers
     can allocate reusable ``out`` storage without reading a device prefix:
-    ``floor((total_tokens + (alignment-1)*B) / alignment) * alignment``.
+    ``floor((T + (alignment-1)*min(T,B)) / alignment) * alignment``.  The
+    ``min(T,B)`` term excludes necessarily empty sequences from the padding
+    envelope.
     Custom prefixes with padding beyond the minimum must size ``out`` from
     their own host-side envelope instead.
     """
@@ -94,7 +96,11 @@ def minimal_padded_token_capacity(
         raise ValueError("num_sequences must be positive when total_tokens is nonzero")
     if token_alignment <= 0:
         raise ValueError("token_alignment must be positive")
-    return ((int(total_tokens) + (int(token_alignment) - 1) * int(num_sequences)) // int(token_alignment)) * int(token_alignment)
+    # At most one nonempty sequence can be created by each token.  Empty
+    # sequences contribute no padding, so using num_sequences directly would
+    # overestimate the envelope when total_tokens < num_sequences.
+    active_sequences = min(int(total_tokens), int(num_sequences))
+    return ((int(total_tokens) + (int(token_alignment) - 1) * active_sequences) // int(token_alignment)) * int(token_alignment)
 
 
 def _validate_scale_cu_seqlens_padded(
@@ -194,13 +200,18 @@ def _validate_pack_out(
     _validate_pack_out_storage(out, src)
 
 
+def _shares_nonempty_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Return whether two nonempty tensors share the same backing storage."""
+    return bool(lhs.numel() and rhs.numel() and lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr())
+
+
 def _validate_pack_out_storage(out: torch.Tensor, src: torch.Tensor) -> None:
     """Validate common dtype, device, layout, and aliasing requirements."""
     if out.dtype != src.dtype or out.device != src.device:
         raise ValueError(f"out must have dtype {src.dtype} on {src.device}, got {out.dtype} on {out.device}")
     if not out.is_contiguous():
         raise ValueError("out must be contiguous")
-    if out.numel() and src.numel() and out.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+    if _shares_nonempty_storage(out, src):
         raise ValueError("out must not alias the source scale tensor")
 
 
@@ -654,12 +665,9 @@ def pack_qk_scale_bshd(
     q_packed = _allocate_pack_out(q_scale, q_shape, q_out, stream)
     k_packed = _allocate_pack_out(k_scale, k_shape, k_out, stream)
     for packed, name in ((q_packed, "q_out"), (k_packed, "k_out")):
-        if packed.untyped_storage().data_ptr() in (
-            q_scale.untyped_storage().data_ptr(),
-            k_scale.untyped_storage().data_ptr(),
-        ):
+        if _shares_nonempty_storage(packed, q_scale) or _shares_nonempty_storage(packed, k_scale):
             raise ValueError(f"{name} must not alias either source scale tensor")
-    if q_packed.untyped_storage().data_ptr() == k_packed.untyped_storage().data_ptr():
+    if _shares_nonempty_storage(q_packed, k_packed):
         raise ValueError("q_out and k_out must not alias each other")
 
     if _can_use_cuda_packer(q_scale) and _can_use_cuda_packer(k_scale):
