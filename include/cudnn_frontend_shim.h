@@ -69,17 +69,34 @@ get_symbol(const char *function_name) {
 
 enum class CudaLibrary { CUDART, CUDA };
 
+// On Windows dlerror() is GetLastError(), an error code that successful calls do not reset (#809),
+// so success is judged by the returned handle or symbol alone and the code is only reported.
+inline std::string
+last_dl_error() {
+#ifdef _WIN32
+    return "Windows error " + std::to_string(GetLastError());
+#else
+    const char *error = dlerror();
+    return error ? error : "Unknown error";
+#endif
+}
+
 inline HMODULE
 load_cuda_so() {
     // Clear any existing error
     dlerror();
 
+#ifdef _WIN32
+    constexpr const char *lib = "nvcuda.dll";
+#else
+    constexpr const char *lib = "libcuda.so.1";
+#endif
+
     // Attempt to open the cuda library
-    HMODULE handle    = dlopen("libcuda.so.1", RTLD_NOW);
-    const char *error = reinterpret_cast<const char *>(dlerror());
-    if (!handle || error) {
+    HMODULE handle = dlopen(lib, RTLD_NOW);
+    if (!handle) {
         // If opening the library fails, throw an exception with the error message
-        throw std::runtime_error("Unable to dlopen libcuda.so.1 : " + std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to dlopen " + std::string(lib) + " : " + last_dl_error());
     }
 
     return handle;
@@ -100,29 +117,38 @@ load_cudart_so() {
     const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
     if (user_lib) {
         if (user_lib[0] != '\0') {
-            HMODULE handle    = dlopen(user_lib, RTLD_NOW);
-            const char *error = reinterpret_cast<const char *>(dlerror());
-            if (!handle || error) {
+            HMODULE handle = dlopen(user_lib, RTLD_NOW);
+            if (!handle) {
                 throw std::runtime_error(
                     "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
-                    std::string(user_lib) + "): " + std::string(error ? error : "Unknown error"));
+                    std::string(user_lib) + "): " + last_dl_error());
             }
             return handle;
         }
     }
 
     // List of potential libcudart libraries (Adding major version to support python package)
+#ifdef _WIN32
+    // Only the runtime matching the compiled CUDA major is ABI-compatible with the versioned
+    // entry points below (e.g. cudaStreamGetCaptureInfo), so there is no cross-major fallback.
+#if CUDART_VERSION >= 13000
+    constexpr const char *libs[] = {"cudart64_13.dll"};
+#else
+    constexpr const char *libs[] = {"cudart64_12.dll"};
+#endif
+#else
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
-    constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
+#endif
+    constexpr size_t num_libs = sizeof(libs) / sizeof(libs[0]);
 
     HMODULE lib_handle = nullptr;
     int loaded_index   = -1;
 
     for (size_t i = 0; i < num_libs; ++i) {
-        HMODULE handle    = dlopen(libs[i], RTLD_NOW);
-        const char *error = reinterpret_cast<const char *>(dlerror());
+        dlerror();
+        HMODULE handle = dlopen(libs[i], RTLD_NOW);
 
-        if (handle && !error) {
+        if (handle) {
             if (lib_handle) {
                 // Already loaded one -> multiple found. This is not fatal: warn on stderr and keep
                 // the first one found. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.
@@ -142,7 +168,11 @@ load_cudart_so() {
 
     // If opening the library fails, throw an exception with the error message
     if (!lib_handle) {
-        throw std::runtime_error("Unable to load any libcudart.so.* library.");
+        std::string tried;
+        for (size_t i = 0; i < num_libs; ++i) {
+            tried += (i ? ", " : "") + std::string(libs[i]);
+        }
+        throw std::runtime_error("Unable to load any libcudart library (tried " + tried + ").");
     }
 
     return lib_handle;
@@ -168,12 +198,10 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
     dlerror();
 
     // Try to find the symbol (function) in the library
-    void *symbol      = dlsym(dl_handles[library], function_name);
-    const char *error = reinterpret_cast<const char *>(dlerror());
-    if (!symbol || error) {
+    void *symbol = reinterpret_cast<void *>(dlsym(dl_handles[library], function_name));
+    if (!symbol) {
         // If the symbol is not found, throw an exception with details
-        throw std::runtime_error("Unable to find symbol " + std::string(function_name) + ": " +
-                                 std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to find symbol " + std::string(function_name) + ": " + last_dl_error());
     }
 
     // Return the pointer to the function
