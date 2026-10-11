@@ -129,7 +129,13 @@ load_cudart_so() {
 
     // List of potential libcudart libraries (Adding major version to support python package)
 #ifdef _WIN32
-    constexpr const char *libs[] = {"cudart64_12.dll", "cudart64_13.dll"};
+    // Only the runtime matching the compiled CUDA major is ABI-compatible with the versioned
+    // entry points below (e.g. cudaStreamGetCaptureInfo), so there is no cross-major fallback.
+#if CUDART_VERSION >= 13000
+    constexpr const char *libs[] = {"cudart64_13.dll"};
+#else
+    constexpr const char *libs[] = {"cudart64_12.dll"};
+#endif
 #else
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
 #endif
@@ -162,8 +168,11 @@ load_cudart_so() {
 
     // If opening the library fails, throw an exception with the error message
     if (!lib_handle) {
-        throw std::runtime_error("Unable to load any libcudart library (tried " + std::string(libs[0]) + ", " +
-                                 std::string(libs[num_libs - 1]) + ").");
+        std::string tried;
+        for (size_t i = 0; i < num_libs; ++i) {
+            tried += (i ? ", " : "") + std::string(libs[i]);
+        }
+        throw std::runtime_error("Unable to load any libcudart library (tried " + tried + ").");
     }
 
     return lib_handle;
