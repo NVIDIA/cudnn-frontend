@@ -313,12 +313,13 @@ def test_override_beyond_the_declared_extent_is_rejected():
     strict=True,
     raises=AssertionError,
     reason="non-causal s_kv override off the plan's KV tile attends the tile's padding rows, silently wrong "
-    "(measured: s=96 max|dO| 8.1e-01, s=160 4.9e-01) while the same shape declared outright is correct (#1567)",
+    "(measured with s_q == s_kv: s=96 max|dO| 8.1e-01, s=160 4.9e-01) while the same shape declared outright is correct (#1567)",
 )
 def test_non_causal_override_off_the_tile_grid_is_served():
+    # s_q stays on the grid so only the KV override can fail this case.
     case = OverrideCase()
-    got = case.execute(96, 96)
-    case.assert_served(96, 96, got=got)
+    got = case.execute(64, 96)
+    case.assert_served(64, 96, got=got)
 
 
 def test_override_triple_must_name_the_same_tensors():
