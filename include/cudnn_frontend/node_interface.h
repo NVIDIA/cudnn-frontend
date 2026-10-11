@@ -137,6 +137,12 @@ class INode {
         return {error_code_t::OK, ""};
     }
 
+    // uid -> byte alignment that execute() enforces on the caller's pointer for this node's operands.
+    virtual error_t
+    collect_aligned_operands_node(std::unordered_map<Tensor_attributes::uid_t, int64_t>&) const {
+        return {error_code_t::OK, ""};
+    }
+
    protected:
     // Type of each node. Nodes can either be a composite (value COMPOSITE) or
     // one of the other primitive types. Primitives types are nothing but
@@ -349,6 +355,15 @@ class INode {
         CHECK_CUDNN_FRONTEND_ERROR(collect_pass_by_value_tensors_node(tensor_to_pass_by_value));
         for (auto const& sub_node : sub_nodes) {
             CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_pass_by_value_tensors_subtree(tensor_to_pass_by_value));
+        }
+        return {error_code_t::OK, ""};
+    }
+
+    error_t
+    collect_aligned_operands_subtree(std::unordered_map<Tensor_attributes::uid_t, int64_t>& aligned_operands) const {
+        CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_node(aligned_operands));
+        for (auto const& sub_node : sub_nodes) {
+            CHECK_CUDNN_FRONTEND_ERROR(sub_node->collect_aligned_operands_subtree(aligned_operands));
         }
         return {error_code_t::OK, ""};
     }

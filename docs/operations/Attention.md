@@ -413,6 +413,7 @@ graph.sdpa(
 #### Limitations
 
 - Head dimension must be a multiple of 8.
+- Q, K, V and O (and dO, dQ, dK, dV in backward) must meet the tensor's declared alignment, 16 bytes by default. If a non-unit stride is not a whole number of alignments in bytes, the native lowering declines the graph. If a device pointer is misaligned, `execute` refuses it before launching. Without these checks, the native kernels returned wrong output on SM90/SM100 and faulted on SM80/SM89 ([#1571](https://github.com/NVIDIA/cudnn-frontend/issues/1571)).
 - ALiBi requires causal masking (`diagonal_band_right_bound=0`).
 - Block masking is only supported with the UNIFIED implementation.
 - Ampere/Ada architectures are limited to head dimensions up to 256 for prefill, 128 for decode and backward.
