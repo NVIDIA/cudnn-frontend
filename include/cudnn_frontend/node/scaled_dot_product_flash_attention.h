@@ -608,8 +608,7 @@ class SDPANodeBase : public NodeCRTP<DerivedT> {
     }
 
     error_t
-    collect_aligned_operands_node(
-        std::unordered_map<Tensor_attributes::uid_t, int64_t>& aligned_operands) const override final {
+    collect_aligned_operands_node(AlignedOperands& aligned_operands) const override final {
         add_sdpa_aligned_operand(attributes.inputs.at(input_names::Q), aligned_operands);
         add_sdpa_aligned_operand(attributes.inputs.at(input_names::K), aligned_operands);
         add_sdpa_aligned_operand(attributes.inputs.at(input_names::V), aligned_operands);
@@ -1674,8 +1673,7 @@ class CompositeSDPABackwardNode : public NodeCRTP<CompositeSDPABackwardNode> {
     }
 
     error_t
-    collect_aligned_operands_node(
-        std::unordered_map<Tensor_attributes::uid_t, int64_t>& aligned_operands) const override final {
+    collect_aligned_operands_node(AlignedOperands& aligned_operands) const override final {
         for (auto port : {input_names::Q, input_names::K, input_names::V, input_names::O, input_names::dO}) {
             add_sdpa_aligned_operand(attributes.inputs.at(port), aligned_operands);
         }

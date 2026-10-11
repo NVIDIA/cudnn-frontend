@@ -58,8 +58,8 @@ def _pin_native(g):
     g.build_plans()
 
 
-def _forward_graph(pitch):
-    g = pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+def _forward_graph(pitch, **graph_kwargs):
+    g = pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, **graph_kwargs)
     q, k, v = (g.tensor(name=n, dim=[B, H, S, D], stride=_strides(pitch), data_type=cudnn.data_type.HALF) for n in "qkv")
     o, _ = g.sdpa(q, k, v, is_inference=True, attn_scale=SCALE)
     o.set_output(True).set_data_type(cudnn.data_type.HALF).set_dim([B, H, S, D]).set_stride(_strides(pitch))
@@ -158,3 +158,39 @@ def test_serialized_graph_keeps_the_pointer_check(cudnn_handle):
     with pytest.raises(Exception, match="not aligned to the tensor's 16-byte alignment"):
         restored.execute(dict(zip(ports, (q, k, v, o))), workspace, handle=cudnn_handle)
     torch.cuda.synchronize()
+
+
+def test_override_stride_off_the_alignment_is_refused_before_launch():
+    """The build-time decline only sees the declared strides; an override is checked at execute."""
+    g, *ports = _forward_graph(64, is_override_shape_enabled=True)
+    _pin_native(g)
+    q, k, v = (_storage(68) for _ in range(3))
+    o = _storage(68, fill=float("nan"))
+    overrides = dict(override_uids=[t.get_uid() for t in ports], override_shapes=[[B, H, S, D]] * 4, override_strides=[_strides(68)] * 4)
+    workspace = torch.empty(max(int(g.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
+    with pytest.raises(Exception, match="override stride 68 of dimension 1 is 136 bytes"):
+        g.execute(dict(zip(ports, (q, k, v, o))), workspace, **overrides)
+    torch.cuda.synchronize()
+    assert torch.isnan(o).all(), "the kernel ran on a refused variant pack"
+
+
+@pytest.mark.skipif(cudnn.backend_version() >= 92200, reason="Slice is lowered by pointer offset only before cuDNN 9.22")
+def test_legacy_slice_offset_into_an_operand_is_checked():
+    """Q is a slice starting 4 elements into an aligned buffer: the caller's pointer is aligned, Q's is not."""
+    width = D + 8
+    g = pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q_full = g.tensor(name="q_full", dim=[B, H, S, width], stride=_strides(width), data_type=cudnn.data_type.HALF)
+    q = g.slice(q_full, [slice(None), slice(None), slice(None), slice(4, 4 + D)])
+    k, v = (g.tensor(name=n, dim=[B, H, S, D], stride=_strides(width), data_type=cudnn.data_type.HALF) for n in "kv")
+    o, _ = g.sdpa(q, k, v, is_inference=True, attn_scale=SCALE)
+    o.set_output(True).set_data_type(cudnn.data_type.HALF).set_dim([B, H, S, D]).set_stride(_strides(width))
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    _pin_native(g)
+    q_buf = torch.randn(B, S, H, width, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    k_buf, v_buf = (_storage(width) for _ in range(2))
+    o_buf = _storage(width, fill=float("nan"))
+    with pytest.raises(Exception, match="not aligned to the tensor's 16-byte alignment"):
+        _run_forward(g, (q_full, k, v, o), (q_buf, k_buf, v_buf, o_buf))
+    assert torch.isnan(o_buf).all(), "the kernel ran on a refused variant pack"

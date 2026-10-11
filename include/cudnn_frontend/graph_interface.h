@@ -72,14 +72,14 @@ class Graph : public ICudnn, public INode {
     std::unordered_set<std::shared_ptr<Tensor_attributes>> deserialized_tensor_properties;
     std::unordered_map<uid_t, pass_by_values_t> deserialized_pass_by_value;
     std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> deserialized_workspace_modifications;
-    std::unordered_map<uid_t, int64_t> deserialized_aligned_operands;
+    AlignedOperands deserialized_aligned_operands;
 
     // Cached values computed during build/deserialize, used during execute to avoid repeated collection.
     // These are mutable because execute() is const but needs non-const access for pointer extraction.
     mutable std::unordered_map<uid_t, pass_by_values_t> cached_pass_by_value;
     mutable std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> cached_workspace_modifications;
     // uid -> byte alignment execute() enforces on the caller's pointer (SDPA operands, #1571).
-    mutable std::unordered_map<uid_t, int64_t> cached_aligned_operands;
+    mutable AlignedOperands cached_aligned_operands;
 
     // Host sources of the host-to-device copies among cached_workspace_modifications (operation 0, e.g.
     // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
@@ -289,9 +289,9 @@ class Graph : public ICudnn, public INode {
     }
 
     virtual error_t
-    collect_aligned_operands_node(std::unordered_map<uid_t, int64_t> &aligned_operands) const override {
-        for (auto const &[uid, alignment] : deserialized_aligned_operands) {
-            aligned_operands[uid] = alignment;
+    collect_aligned_operands_node(AlignedOperands &aligned_operands) const override {
+        for (auto const &[uid, value] : deserialized_aligned_operands) {
+            aligned_operands[uid] = value;
         }
         return {error_code_t::OK, ""};
     }
@@ -1509,13 +1509,20 @@ class Graph : public ICudnn, public INode {
                                            std::to_string(varpack_template.user_slots.size()) + ").");
         RETURN_CUDNN_FRONTEND_ERROR_IF(
             n_user > 0 && sorted_user_ptrs == nullptr, error_code_t::INVALID_VARIANT_PACK, "sorted_user_ptrs is null.");
-        for (auto const &[user_index, alignment] : varpack_template.aligned_user_ptrs) {
+        for (size_t k = 0; k < override_uids.size() && k < override_shapes.size() && k < override_strides.size(); k++) {
+            auto it = cached_aligned_operands.find(override_uids[k]);
+            if (it == cached_aligned_operands.end()) {
+                continue;
+            }
+            auto const &[alignment, element_bytes] = it->second;
+            auto const &stride                     = override_strides[k];
+            auto const i = misaligned_stride_dimension(override_shapes[k], stride, element_bytes, alignment);
             RETURN_CUDNN_FRONTEND_ERROR_IF(
-                reinterpret_cast<uintptr_t>(sorted_user_ptrs[user_index]) % alignment != 0,
+                i >= 0,
                 error_code_t::INVALID_VARIANT_PACK,
-                "Uid " + std::to_string(varpack_template.all_uids[varpack_template.user_slots[user_index]]) +
-                    ": device pointer is not aligned to the tensor's " + std::to_string(alignment) +
-                    "-byte alignment.");
+                "Uid " + std::to_string(override_uids[k]) + ": override stride " + std::to_string(stride[i]) +
+                    " of dimension " + std::to_string(i) + " is " + std::to_string(stride[i] * element_bytes) +
+                    " bytes, not a multiple of the tensor's " + std::to_string(alignment) + "-byte alignment.");
         }
 
         // Thread-safe: copy template to local stack, then patch.
@@ -1545,6 +1552,14 @@ class Graph : public ICudnn, public INode {
         // 3. Re-apply replacements (currently only Slice nodes)
         for (auto const &[dst_slot, src_info] : varpack_template.replacement_slots) {
             ptrs[dst_slot] = static_cast<char *>(ptrs[src_info.first]) + src_info.second;
+        }
+
+        for (auto const &[slot, alignment] : varpack_template.aligned_slots) {
+            RETURN_CUDNN_FRONTEND_ERROR_IF(reinterpret_cast<uintptr_t>(ptrs[slot]) % alignment != 0,
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(varpack_template.all_uids[slot]) +
+                                               ": device pointer is not aligned to the tensor's " +
+                                               std::to_string(alignment) + "-byte alignment.");
         }
 
         // 4. Run auxiliary kernels (e.g. SDPA reduction accumulator init)
@@ -1760,15 +1775,15 @@ class Graph : public ICudnn, public INode {
         }
         j["workspace_modifications"] = workspace_modifications_json;
 
-        std::unordered_map<uid_t, int64_t> aligned_operands;
+        AlignedOperands aligned_operands;
         if (sub_nodes.empty()) {
             aligned_operands = cached_aligned_operands;
         } else {
             CHECK_CUDNN_FRONTEND_ERROR(collect_aligned_operands_subtree(aligned_operands));
         }
         json aligned_operands_json = json::object();
-        for (auto const &[uid, alignment] : aligned_operands) {
-            aligned_operands_json[std::to_string(uid)] = alignment;
+        for (auto const &[uid, value] : aligned_operands) {
+            aligned_operands_json[std::to_string(uid)] = json::array({value.first, value.second});
         }
         j["aligned_operands"] = aligned_operands_json;
 
@@ -1950,7 +1965,8 @@ class Graph : public ICudnn, public INode {
         if (j.contains("aligned_operands")) {
             auto const &aligned_operands_json = j["aligned_operands"];
             for (auto it = aligned_operands_json.begin(); it != aligned_operands_json.end(); ++it) {
-                deserialized_aligned_operands[std::stoll(it.key())] = it.value().get<int64_t>();
+                deserialized_aligned_operands[std::stoll(it.key())] = {it.value().at(0).get<int64_t>(),
+                                                                       it.value().at(1).get<int64_t>()};
             }
         }
 
@@ -2336,7 +2352,7 @@ class Graph : public ICudnn, public INode {
         std::vector<std::pair<int, int64_t>> workspace_slots;  // (slot, byte_offset)
         std::vector<std::pair<int, std::pair<int, int64_t>>>
             replacement_slots;  // (dst_slot, (src_slot, offset)) — only used by Slice nodes
-        std::vector<std::pair<int, int64_t>> aligned_user_ptrs;  // (index into the user pointers, byte alignment)
+        std::vector<std::pair<int, int64_t>> aligned_slots;  // (slot, byte alignment), user and replacement slots
     };
 
     VariantPackTemplate varpack_template;
@@ -2444,10 +2460,12 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        for (int i = 0; i < (int)t.user_slots.size(); i++) {
-            auto it = cached_aligned_operands.find(t.all_uids[t.user_slots[i]]);
-            if (it != cached_aligned_operands.end() && it->second > 1) {
-                t.aligned_user_ptrs.emplace_back(i, it->second);
+        // A legacy Slice destination is checked too: its pointer is the source pointer plus the slice offset.
+        for (int slot = 0; slot < (int)t.all_uids.size(); slot++) {
+            auto it = cached_aligned_operands.find(t.all_uids[slot]);
+            if (it != cached_aligned_operands.end() && it->second.first > 1 && t.template_ptrs[slot] == nullptr &&
+                workspace_uids.find(t.all_uids[slot]) == workspace_uids.end()) {
+                t.aligned_slots.emplace_back(slot, it->second.first);
             }
         }
 
