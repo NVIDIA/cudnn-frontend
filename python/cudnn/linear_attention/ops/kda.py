@@ -38,7 +38,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import cudnn
 
-from .common import get_handle, graph_workspace, make_summary_cache_key, select_plan, summary_backward, summary_setup_context, torch_dtype_to_cudnn
+from .common import execute_graph, make_execution_resources, make_summary_cache_key, select_plan, summary_backward, summary_setup_context, torch_dtype_to_cudnn
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -503,7 +503,8 @@ def run_kda_fwd(
         total_checkpoints = max(total // checkpoint + N, 1)
         state_checkpoints = torch.empty(total_checkpoints, HO, V, K, dtype=q.dtype, device=device)
         variant_pack[t["state_checkpoints"]] = state_checkpoints
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return o, final_state, state_checkpoints
 
 
@@ -1017,7 +1018,8 @@ def kda_bwd(
         variant_pack[t["dt_bias"]] = dt_bias
         d_dt_bias = torch.empty_like(dt_bias)
         variant_pack[t["d_dt_bias"]] = d_dt_bias
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     if dstate0 is None:
         dstate0 = torch.empty(0, dtype=dstate_dtype, device=device)
     return dq, dk, dv, dg, dbeta, dstate0, d_a_log, d_dt_bias
@@ -1610,7 +1612,8 @@ def kda_summary(
     if output_transition:
         transition = torch.empty(N, HO, K, K, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return final_state, transition
 
 
@@ -1904,7 +1907,8 @@ def kda_summary_bwd(
     if output_transition:
         transition = torch.empty(N, HO, K, K, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return d_initial_state, transition
 
 
