@@ -1265,7 +1265,10 @@ g.execute({Q: q, K: k, V: v, O: o}, workspace, **overrides)
 - **Buffers are sized for the declaration.** An override says how much of a
   declared buffer this run uses; it neither shrinks the allocation nor re-packs
   the layout, and the strides describe the declared storage. Allocating only the
-  run's extent leaves the kernel addressing past the buffer.
+  run's extent leaves the kernel addressing past the buffer. `override_strides`
+  that differ from the declared strides are accepted but not used: the kernel
+  reads and writes with the declared strides
+  ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)).
 - **The plan is chosen at build time.** `override_*` does not re-run the
   heuristic and does not reselect an engine, so grouping lengths into buckets is
   the caller's policy rather than something this feature does. Two graphs
@@ -1294,6 +1297,8 @@ extent, or the larger override for the explicitly oversized probe:
 | 256 | `s_q = 1` | **rejected**: `CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE` |
 | 256 | 96 / 160 (non-causal, `s_kv` off the plan's 64-row KV tile) | **not rejected, wrong output**: the KV tail up to the tile boundary is attended ([#1567](https://github.com/NVIDIA/cudnn-frontend/issues/1567)) |
 | 256 | 320 (beyond the declaration, with storage and strides for 320 rows) | **not rejected** on the measured plan; outside the declared envelope |
+| 256 | 256, buffers in BSHD layout with matching `override_strides` | **not rejected, wrong output**: the declared BHSD strides are used ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)) |
+| `b = 1` | `b = 2` | **not rejected**: batch 1 of O is not written ([#1570](https://github.com/NVIDIA/cudnn-frontend/issues/1570)) |
 | any | `override_uids` and `override_shapes` of different length | rejected at variant-pack finalize (`CUDNN_STATUS_BAD_PARAM`) |
 
 These are observations of this platform and plan, not a portable supported-shape
