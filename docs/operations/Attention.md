@@ -1292,7 +1292,7 @@ extent, or the larger override for the explicitly oversized probe:
 | 256, `generate_stats=True` | 64 | served, O and Stats both follow the override |
 | 1 (decode), KV declared 256 | `s_q=1`, `s_kv=64` | served |
 | 256 | `s_q = 1` | **rejected**: `CUDNN_STATUS_NOT_SUPPORTED_INVALID_DYNAMIC_SHAPE` |
-| 256 | 96 / 160 (non-causal, off the 64-row tile grid) | **not rejected, wrong output** |
+| 256 | 96 / 160 (non-causal, `s_kv` off the plan's 64-row KV tile) | **not rejected, wrong output**: the KV tail up to the tile boundary is attended ([#1567](https://github.com/NVIDIA/cudnn-frontend/issues/1567)) |
 | 256 | 320 (beyond the declaration, with storage and strides for 320 rows) | **not rejected** on the measured plan; outside the declared envelope |
 | any | `override_uids` and `override_shapes` of different length | rejected at variant-pack finalize (`CUDNN_STATUS_BAD_PARAM`) |
 
@@ -1307,12 +1307,18 @@ Two consequences for callers:
 1. **Decode and prefill are different engine classes.** A declared prefill graph
    cannot be overridden to `s_q == 1`, and a graph declared at `s_q == 1` should
    not be expected to serve prefill lengths. Keep one graph per class.
-2. **The legal window is narrower than "anything up to the declaration".** In the
-   non-causal class only multiples of the plan's Q tile were served on the
-   measured configuration; the other lengths produced wrong output without an
-   error. Validate the window you intend to use against your own plan and shapes
-   before relying on it, and prefer run extents that match the declaration's
-   tiling.
+2. **The legal window is narrower than "anything up to the declaration".** When
+   the declared `s_kv` is a multiple of the plan's KV tile, a non-causal run is
+   correct only at `s_kv` overrides that are also multiples of that tile; other
+   lengths attend to the padding rows up to the tile boundary and return wrong
+   output without an error. The `s_q` override is not affected, and the causal
+   mask hides the extra rows. The KV tile is 128 on the first-ranked H100/B200
+   plans (`eng9`/`eng10`), so there even `s_kv = 64` is wrong. A declaration
+   off the KV tile (e.g. 255) served every override measured, on A100, L40S,
+   H100 and B200 with cuDNN 9.27
+   ([#1567](https://github.com/NVIDIA/cudnn-frontend/issues/1567)). Validate the
+   window you intend to use against your own plan and shapes before relying on
+   it.
 
 The `s_q == 1` boundary and the declared-max-length sensitivity of the heuristic
 (an `eng8` -> `eng10` flip between a declared 128 and 256, and 2.0-2.3x cost on

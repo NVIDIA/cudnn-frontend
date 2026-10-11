@@ -312,8 +312,8 @@ def test_override_beyond_the_declared_extent_is_rejected():
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="non-causal override off the tile grid is silently wrong (measured: s=96 max|dO| 8.1e-01, "
-    "s=160 4.9e-01) while the same shape declared outright is correct",
+    reason="non-causal s_kv override off the plan's KV tile attends the tile's padding rows, silently wrong "
+    "(measured: s=96 max|dO| 8.1e-01, s=160 4.9e-01) while the same shape declared outright is correct (#1567)",
 )
 def test_non_causal_override_off_the_tile_grid_is_served():
     case = OverrideCase()
