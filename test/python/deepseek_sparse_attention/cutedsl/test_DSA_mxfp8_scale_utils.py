@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-only tests for the SM100 MXFP8 scale-layout contract."""
+"""Tests for the SM100 MXFP8 scale-layout contract."""
 
 import pytest
 import torch
@@ -20,6 +20,28 @@ def test_mxfp8_scale_pack_roundtrip_host_only():
     assert packed.is_contiguous()
     unpacked = mxfp8_scale_utils.unpack_blockscaled_scale_mkl(packed, mn=130, sf_groups=5)
     assert torch.equal(unpacked, logical)
+
+
+def test_mxfp8_scale_pack_reuses_caller_owned_output_host_only():
+    logical = torch.arange(130 * 5 * 3, dtype=torch.int64).reshape(130, 5, 3)
+    out = torch.full((3, 256, 8), -1, dtype=torch.int64)
+
+    packed = mxfp8_scale_utils.pack_blockscaled_scale_mkl(logical, out=out)
+
+    assert packed is out
+    unpacked = mxfp8_scale_utils.unpack_blockscaled_scale_mkl(packed, mn=130, sf_groups=5)
+    assert torch.equal(unpacked, logical)
+    assert torch.count_nonzero(packed == -1) == 0
+
+
+def test_mxfp8_scale_pack_rejects_invalid_caller_owned_output_host_only():
+    logical = torch.arange(128 * 4, dtype=torch.int64).reshape(128, 4, 1)
+    with pytest.raises(ValueError, match="out must have shape"):
+        mxfp8_scale_utils.pack_blockscaled_scale_mkl(logical, out=torch.empty((1, 64, 4), dtype=torch.int64))
+    with pytest.raises(ValueError, match="out must have dtype"):
+        mxfp8_scale_utils.pack_blockscaled_scale_mkl(logical, out=torch.empty((1, 128, 4), dtype=torch.int32))
+    with pytest.raises(ValueError, match="must not alias"):
+        mxfp8_scale_utils.pack_blockscaled_scale_mkl(logical, out=logical.reshape(1, 128, 4))
 
 
 def test_mxfp8_scale_pack_uses_blackwell_datapath_order_host_only():
@@ -90,6 +112,21 @@ def test_mxfp8_scale_pack_order_bshd_k_l_dimension_host_only():
     k_packed = mxfp8_scale_utils.pack_k_scale_bshd(k_scale)
     k_unpacked = mxfp8_scale_utils.unpack_blockscaled_scale_mkl(k_packed, mn=3, sf_groups=4)
     assert torch.equal(k_unpacked, k_mkl)
+
+
+def test_mxfp8_scale_pack_qk_bshd_matches_individual_packers_host_only():
+    bs, sq, sk, hq, hkv, groups, qhpkv = 2, 3, 5, 8, 2, 5, 4
+    q = torch.arange(bs * sq * hq * groups, dtype=torch.int64).reshape(bs, sq, hq, groups)
+    k = torch.arange(bs * sk * hkv * groups, dtype=torch.int64).reshape(bs, sk, hkv, groups)
+
+    q_packed, k_packed = mxfp8_scale_utils.pack_qk_scale_bshd(
+        q,
+        k,
+        qhead_per_kv_head=qhpkv,
+    )
+
+    assert torch.equal(q_packed, mxfp8_scale_utils.pack_q_scale_bshd(q, qhpkv))
+    assert torch.equal(k_packed, mxfp8_scale_utils.pack_k_scale_bshd(k))
 
 
 def test_mxfp8_scale_pack_order_thd_with_padding_host_only():
@@ -174,6 +211,221 @@ def test_mxfp8_scale_prefix_padding_127_128_host_only():
     expected = torch.tensor([0, 128, 256], dtype=torch.int32)
     assert torch.equal(q_padded, expected)
     assert torch.equal(k_padded, expected)
+
+
+@pytest.mark.parametrize(
+    "total_tokens,num_sequences,alignment,expected",
+    [
+        (0, 4, 128, 384),
+        (255, 2, 128, 384),
+        (3, 2, 32, 64),
+        (8192, 1, 2, 8192),
+    ],
+)
+def test_minimal_padded_token_capacity_host_only(total_tokens, num_sequences, alignment, expected):
+    assert mxfp8_scale_utils.minimal_padded_token_capacity(total_tokens, num_sequences, alignment) == expected
+
+
+def test_minimal_padded_token_capacity_rejects_tokens_without_sequences_host_only():
+    with pytest.raises(ValueError, match="num_sequences must be positive"):
+        mxfp8_scale_utils.minimal_padded_token_capacity(1, 0, 128)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_matches_reference_and_reuses_output():
+    device = torch.device("cuda")
+    bs, sq, sk, hq, hkv, groups, qhpkv = 2, 131, 259, 64, 1, 5, 64
+    q = torch.arange(bs * sq * hq * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sq, hq, groups)
+    k = torch.arange(bs * sk * hkv * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sk, hkv, groups)
+    q_ref = mxfp8_scale_utils.pack_q_scale_bshd(q, qhpkv)
+    k_ref = mxfp8_scale_utils.pack_k_scale_bshd(k)
+    q_cuda = q.to(device)
+    k_cuda = k.to(device)
+    q_out = torch.empty_like(q_ref, device=device)
+    k_out = torch.empty_like(k_ref, device=device)
+
+    assert mxfp8_scale_utils.pack_q_scale_bshd(q_cuda, qhpkv, out=q_out) is q_out
+    assert mxfp8_scale_utils.pack_k_scale_bshd(k_cuda, out=k_out) is k_out
+    torch.cuda.synchronize()
+
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_qk_bshd_cuda_matches_reference_and_reuses_outputs():
+    device = torch.device("cuda")
+    bs, sq, sk, hq, hkv, groups, qhpkv = 2, 131, 259, 64, 1, 5, 64
+    q_cpu = torch.arange(bs * sq * hq * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sq, hq, groups)
+    k_cpu = torch.arange(bs * sk * hkv * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sk, hkv, groups)
+    q_ref = mxfp8_scale_utils.pack_q_scale_bshd(q_cpu, qhpkv)
+    k_ref = mxfp8_scale_utils.pack_k_scale_bshd(k_cpu)
+    q = q_cpu.to(device)
+    k = k_cpu.to(device)
+    q_out = torch.empty_like(q_ref, device=device)
+    k_out = torch.empty_like(k_ref, device=device)
+
+    actual_q, actual_k = mxfp8_scale_utils.pack_qk_scale_bshd(
+        q,
+        k,
+        qhead_per_kv_head=qhpkv,
+        q_out=q_out,
+        k_out=k_out,
+    )
+    torch.cuda.synchronize()
+
+    assert actual_q is q_out
+    assert actual_k is k_out
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_qk_bshd_cuda_is_async_graph_capturable_and_honors_stream():
+    cuda = pytest.importorskip("cuda.bindings.driver")
+    q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
+    k = torch.arange(259 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 259, 1, 5)
+    q_ref = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu(), 64)
+    k_ref = mxfp8_scale_utils.pack_k_scale_bshd(k.cpu())
+    q_out = torch.empty_like(q_ref, device="cuda")
+    k_out = torch.empty_like(k_ref, device="cuda")
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        mxfp8_scale_utils.pack_qk_scale_bshd(
+            q,
+            k,
+            64,
+            q_out=q_out,
+            k_out=k_out,
+            stream=cuda.CUstream(side.cuda_stream),
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.current_stream().wait_stream(side)
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            mxfp8_scale_utils.pack_qk_scale_bshd(q, k, 64, q_out=q_out, k_out=k_out)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(q_out.cpu(), q_ref)
+        assert torch.equal(k_out.cpu(), k_ref)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_thd_caller_owned_output_matches_reference():
+    device = torch.device("cuda")
+    qhpkv, hkv, groups = 4, 2, 4
+    cu_q_cpu = torch.tensor([0, 2, 3], dtype=torch.int32)
+    cu_k_cpu = torch.tensor([0, 3, 5], dtype=torch.int32)
+    cu_q_scale_cpu = mxfp8_scale_utils.make_scale_cu_seqlens_padded(cu_q_cpu, 32)
+    cu_k_scale_cpu = mxfp8_scale_utils.make_scale_cu_seqlens_padded(cu_k_cpu, 128)
+    q_cpu = torch.arange(3 * (hkv * qhpkv) * groups, dtype=torch.int64).to(torch.uint8).reshape(3, hkv * qhpkv, groups)
+    k_cpu = torch.arange(5 * hkv * groups, dtype=torch.int64).to(torch.uint8).reshape(5, hkv, groups)
+    q_ref = mxfp8_scale_utils.pack_q_scale_thd(q_cpu, cu_q_cpu, cu_q_scale_cpu, qhpkv)
+    k_ref = mxfp8_scale_utils.pack_k_scale_thd(k_cpu, cu_k_cpu, cu_k_scale_cpu)
+
+    q = q_cpu.to(device)
+    k = k_cpu.to(device)
+    cu_q = cu_q_cpu.to(device)
+    cu_k = cu_k_cpu.to(device)
+    cu_q_scale = cu_q_scale_cpu.to(device)
+    cu_k_scale = cu_k_scale_cpu.to(device)
+    q_out = torch.empty_like(q_ref, device=device)
+    k_out = torch.empty_like(k_ref, device=device)
+    mxfp8_scale_utils.pack_q_scale_thd(q, cu_q, cu_q_scale, qhpkv, out=q_out)
+    mxfp8_scale_utils.pack_k_scale_thd(k, cu_k, cu_k_scale, out=k_out)
+    torch.cuda.synchronize()
+
+    assert torch.equal(q_out.cpu(), q_ref)
+    assert torch.equal(k_out.cpu(), k_ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_hot_path_does_not_synchronize():
+    device = torch.device("cuda")
+    q = torch.zeros((1, 128, 64, 4), dtype=torch.uint8, device=device)
+    out = torch.empty((1, 8192, 4), dtype=torch.uint8, device=device)
+    mxfp8_scale_utils.pack_q_scale_bshd(q, out=out)
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        mxfp8_scale_utils.pack_q_scale_bshd(q, out=out)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_caller_owned_path_is_graph_capturable():
+    q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
+    reference = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu(), 64)
+    out = torch.empty(reference.shape, dtype=torch.uint8, device="cuda")
+    mxfp8_scale_utils.pack_q_scale_bshd(q, 64, out=out)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            mxfp8_scale_utils.pack_q_scale_bshd(q, 64, out=out)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(out.cpu(), reference)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_honors_explicit_stream():
+    cuda = pytest.importorskip("cuda.bindings.driver")
+    q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
+    reference = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu(), 64)
+    out = torch.empty(reference.shape, dtype=torch.uint8, device="cuda")
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+
+    mxfp8_scale_utils.pack_q_scale_bshd(q, 64, out=out, stream=cuda.CUstream(side.cuda_stream))
+    torch.cuda.current_stream().wait_stream(side)
+
+    assert torch.equal(out.cpu(), reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_reference_fallback_honors_explicit_stream():
+    cuda = pytest.importorskip("cuda.bindings.driver")
+    storage = torch.arange(129 * 64 * 5 * 2, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 10)
+    q = storage[..., ::2]
+    assert not q.is_contiguous()
+    reference = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu().contiguous(), 64)
+    out = torch.empty(reference.shape, dtype=torch.uint8, device="cuda")
+    out.fill_(0xA5)
+    side = torch.cuda.Stream()
+    verifier = torch.cuda.Stream()
+    observed = torch.empty_like(reference, pin_memory=True)
+    mxfp8_scale_utils.pack_q_scale_bshd(q, 64, out=torch.empty_like(out))
+    torch.cuda.synchronize()
+
+    # Delay the ambient stream. A fallback that ignores the explicit stream
+    # leaves ``out`` poisoned when the verifier consumes it after ``side``.
+    torch.cuda._sleep(50_000_000)
+    mxfp8_scale_utils.pack_q_scale_bshd(q, 64, out=out, stream=cuda.CUstream(side.cuda_stream))
+    verifier.wait_stream(side)
+    with torch.cuda.stream(verifier):
+        observed.copy_(out, non_blocking=True)
+    verifier.synchronize()
+
+    assert torch.equal(observed, reference)
+    torch.cuda.synchronize()
 
 
 def test_mxfp8_scale_pack_thd_custom_256_padding_host_only():

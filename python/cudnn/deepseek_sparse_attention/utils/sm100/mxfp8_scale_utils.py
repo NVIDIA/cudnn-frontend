@@ -1,15 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-side MXFP8 scale packing helpers for the SM100 Indexer DSL path."""
+"""MXFP8 scale packing helpers for the SM100 Indexer DSL path.
+
+CUDA E8M0 inputs use a shape-generic single-launch packer.  CPU tensors and
+non-byte dtypes retain the PyTorch reference implementation used by tests.
+"""
 
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 
 import torch
 
-from cudnn.deepseek_sparse_attention.utils.runtime import ceil_div as _ceil_div
+from cudnn._torch_stream import device_context, record_streams
+from cudnn.deepseek_sparse_attention.utils.runtime import ceil_div as _ceil_div, resolve_stream, torch_stream_context
 
 _ATOM_MN = 128
 _ATOM_K = 4
@@ -64,6 +70,32 @@ def make_scale_cu_seqlens_padded(
     return out
 
 
+def minimal_padded_token_capacity(
+    total_tokens: int,
+    num_sequences: int,
+    token_alignment: int,
+) -> int:
+    """Return a host-only capacity for minimally padded THD scale prefixes.
+
+    If ``cu_seqlens_scale_padded`` was produced by
+    :func:`make_scale_cu_seqlens_padded`, its final value is at most this
+    capacity.  The formula depends only on declared tensor shapes, so callers
+    can allocate reusable ``out`` storage without reading a device prefix:
+    ``floor((total_tokens + (alignment-1)*B) / alignment) * alignment``.
+    Custom prefixes with padding beyond the minimum must size ``out`` from
+    their own host-side envelope instead.
+    """
+    if total_tokens < 0:
+        raise ValueError("total_tokens must be nonnegative")
+    if num_sequences < 0:
+        raise ValueError("num_sequences must be nonnegative")
+    if num_sequences == 0 and total_tokens != 0:
+        raise ValueError("num_sequences must be positive when total_tokens is nonzero")
+    if token_alignment <= 0:
+        raise ValueError("token_alignment must be positive")
+    return ((int(total_tokens) + (int(token_alignment) - 1) * int(num_sequences)) // int(token_alignment)) * int(token_alignment)
+
+
 def _validate_scale_cu_seqlens_padded(
     cu_seqlens: list[int],
     cu_seqlens_scale_padded: torch.Tensor,
@@ -88,6 +120,28 @@ def _validate_scale_cu_seqlens_padded(
         if padded_len < logical_len or padded_len % token_alignment != 0:
             raise ValueError(f"{name} batch {b} span must be at least {logical_len} and a " f"multiple of {token_alignment}, got {padded_len}")
     return values
+
+
+def _validate_thd_cuda_prefixes(
+    scale: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_scale_padded: torch.Tensor,
+) -> None:
+    """Validate THD prefix metadata without inspecting device values."""
+    for prefix, name in (
+        (cu_seqlens, "cu_seqlens"),
+        (cu_seqlens_scale_padded, "cu_seqlens_scale_padded"),
+    ):
+        if prefix.ndim != 1 or prefix.numel() < 2:
+            raise ValueError(f"{name} must be 1D with at least two elements")
+        if prefix.dtype != torch.int32:
+            raise ValueError(f"{name} must be int32")
+        if not prefix.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if prefix.device != scale.device:
+            raise ValueError(f"{name} must be on {scale.device}")
+    if cu_seqlens.shape != cu_seqlens_scale_padded.shape:
+        raise ValueError("cu_seqlens and cu_seqlens_scale_padded must have the same shape")
 
 
 def _blockscaled_indices(
@@ -118,25 +172,189 @@ def _blockscaled_indices(
     return base.unsqueeze(0) + l_offsets * sf_per_l
 
 
-def pack_blockscaled_scale_mkl(scale_mkl: torch.Tensor) -> torch.Tensor:
+def _packed_scale_shape(mn: int, sf_groups: int, l_size: int) -> tuple[int, int, int]:
+    return (
+        l_size,
+        _ceil_div(mn, _ATOM_MN) * _ATOM_MN,
+        _ceil_div(sf_groups, _ATOM_K) * _ATOM_K,
+    )
+
+
+def _validate_pack_out(
+    out: torch.Tensor,
+    src: torch.Tensor,
+    shape: tuple[int, int, int],
+) -> None:
+    if tuple(out.shape) != shape:
+        raise ValueError(f"out must have shape {shape}, got {tuple(out.shape)}")
+    if out.dtype != src.dtype or out.device != src.device:
+        raise ValueError(f"out must have dtype {src.dtype} on {src.device}, got {out.dtype} on {out.device}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if out.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+        raise ValueError("out must not alias the source scale tensor")
+
+
+def _allocate_pack_out(
+    src: torch.Tensor,
+    shape: tuple[int, int, int],
+    out: torch.Tensor | None,
+    stream,
+) -> torch.Tensor:
+    if out is not None:
+        _validate_pack_out(out, src, shape)
+        return out
+    if src.is_cuda:
+        from cudnn.deepseek_sparse_attention.utils.runtime import torch_stream_context
+
+        with torch_stream_context(stream, src.device):
+            return torch.empty(shape, device=src.device, dtype=src.dtype)
+    return torch.empty(shape, device=src.device, dtype=src.dtype)
+
+
+def _can_use_cuda_packer(scale: torch.Tensor) -> bool:
+    return scale.is_cuda and scale.element_size() == 1 and scale.is_contiguous()
+
+
+@lru_cache(maxsize=1)
+def _cuda_pack_launchers():
+    """Return gated CUDA launchers without repeating import/version work."""
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8 scale packing")
+    if requirement_error:
+        raise RuntimeError(requirement_error)
+
+    from cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_pack import (
+        _launch_pack,
+        _launch_qk_bshd_pack,
+    )
+
+    return _launch_pack, _launch_qk_bshd_pack
+
+
+def _launch_cuda_packer(
+    scale: torch.Tensor,
+    packed: torch.Tensor,
+    *,
+    mn: int,
+    sf_groups: int,
+    l_size: int,
+    source_layout: str,
+    stream=None,
+    seq_len: int = 0,
+    n_heads_kv: int = 0,
+    qhead_per_kv_head: int = 1,
+    cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_scale_padded: torch.Tensor | None = None,
+) -> torch.Tensor:
+    launch_pack, _ = _cuda_pack_launchers()
+    src_bytes = scale.view(torch.uint8).reshape(-1)
+    dst_bytes = packed.view(torch.uint8).reshape(-1)
+    with device_context(scale.device):
+        record_streams((scale, packed, cu_seqlens, cu_seqlens_scale_padded), stream, scale.device)
+        launch_stream = resolve_stream(stream)
+        launch_pack(
+            src_bytes,
+            dst_bytes,
+            mn=mn,
+            sf_groups=sf_groups,
+            l_size=l_size,
+            source_layout=source_layout,
+            stream=launch_stream,
+            seq_len=seq_len,
+            n_heads_kv=n_heads_kv,
+            qhead_per_kv_head=qhead_per_kv_head,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_scale_padded=cu_seqlens_scale_padded,
+        )
+    return packed
+
+
+def _launch_cuda_qk_bshd_packer(
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    q_packed: torch.Tensor,
+    k_packed: torch.Tensor,
+    *,
+    q_mn: int,
+    k_mn: int,
+    sf_groups: int,
+    l_size: int,
+    q_seq_len: int,
+    k_seq_len: int,
+    n_heads_kv: int,
+    qhead_per_kv_head: int,
+    stream=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _, launch_qk_bshd_pack = _cuda_pack_launchers()
+    q_src_bytes = q_scale.view(torch.uint8).reshape(-1)
+    k_src_bytes = k_scale.view(torch.uint8).reshape(-1)
+    q_dst_bytes = q_packed.view(torch.uint8).reshape(-1)
+    k_dst_bytes = k_packed.view(torch.uint8).reshape(-1)
+    with device_context(q_scale.device):
+        record_streams((q_scale, k_scale, q_packed, k_packed), stream, q_scale.device)
+        launch_stream = resolve_stream(stream)
+        launch_qk_bshd_pack(
+            q_src_bytes,
+            k_src_bytes,
+            q_dst_bytes,
+            k_dst_bytes,
+            q_mn=q_mn,
+            k_mn=k_mn,
+            sf_groups=sf_groups,
+            l_size=l_size,
+            q_seq_len=q_seq_len,
+            k_seq_len=k_seq_len,
+            n_heads_kv=n_heads_kv,
+            qhead_per_kv_head=qhead_per_kv_head,
+            stream=launch_stream,
+        )
+    return q_packed, k_packed
+
+
+def pack_blockscaled_scale_mkl(
+    scale_mkl: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    stream=None,
+) -> torch.Tensor:
     """Pack logical ``(MN, sf_groups, L)`` scales into Blackwell SF layout.
 
     The returned tensor has physical shape ``(L, padded_MN, padded_sf_groups)``.
-    ``sf_groups`` is ``ceil_div(head_dim, 32)`` for MXFP8.
+    ``sf_groups`` is ``ceil_div(head_dim, 32)`` for MXFP8.  For a contiguous
+    one-byte CUDA input, packing and padding use one asynchronous CuTe DSL
+    launch on ``stream``; ``out`` may provide caller-owned storage and makes
+    the operation allocation-free.  ``out`` must be contiguous, have the
+    returned shape/dtype/device, and must not alias ``scale_mkl``.  The return
+    value is ``out`` when it is supplied.  ``stream`` is an optional CUDA
+    driver stream and defaults to PyTorch's current stream on the input device.
+    The caller-owned CUDA path is graph-capturable after its first, compiling
+    call; input and output allocator lifetimes are recorded on the launch
+    stream.  CPU and non-byte inputs use the allocation-compatible PyTorch
+    reference path.
     """
     if scale_mkl.ndim != 3:
         raise ValueError(f"scale_mkl must have shape (MN, sf_groups, L), got {tuple(scale_mkl.shape)}")
     mn, sf_groups, l_size = scale_mkl.shape
-    m_padded = _ceil_div(mn, _ATOM_MN) * _ATOM_MN
-    sf_padded = _ceil_div(sf_groups, _ATOM_K) * _ATOM_K
-    packed = torch.zeros(
-        (l_size, m_padded, sf_padded),
-        device=scale_mkl.device,
-        dtype=scale_mkl.dtype,
-    )
-    idx = _blockscaled_indices(mn, sf_groups, l_size, device=scale_mkl.device)
-    packed.reshape(-1)[idx.reshape(-1)] = scale_mkl.permute(2, 0, 1).reshape(-1)
-    return packed.contiguous()
+    shape = _packed_scale_shape(mn, sf_groups, l_size)
+    packed = _allocate_pack_out(scale_mkl, shape, out, stream)
+    if _can_use_cuda_packer(scale_mkl):
+        return _launch_cuda_packer(
+            scale_mkl,
+            packed,
+            mn=mn,
+            sf_groups=sf_groups,
+            l_size=l_size,
+            source_layout="mkl",
+            stream=stream,
+        )
+    with torch_stream_context(stream, scale_mkl.device):
+        record_streams((scale_mkl, packed), stream, scale_mkl.device)
+        packed.zero_()
+        idx = _blockscaled_indices(mn, sf_groups, l_size, device=scale_mkl.device)
+        packed.reshape(-1)[idx.reshape(-1)] = scale_mkl.permute(2, 0, 1).reshape(-1)
+        return packed.contiguous()
 
 
 def unpack_blockscaled_scale_mkl(
@@ -267,14 +485,174 @@ def logical_k_scale_to_mkl_thd(
     return out.contiguous()
 
 
-def pack_q_scale_bshd(q_scale: torch.Tensor, qhead_per_kv_head: int = 64) -> torch.Tensor:
-    """Pack logical BSHD Q scales for the Indexer MXFP8 kernel."""
-    return pack_blockscaled_scale_mkl(logical_q_scale_to_mkl(q_scale, qhead_per_kv_head))
+def pack_q_scale_bshd(
+    q_scale: torch.Tensor,
+    qhead_per_kv_head: int = 64,
+    *,
+    out: torch.Tensor | None = None,
+    stream=None,
+) -> torch.Tensor:
+    """Pack logical ``(B,S_q,H_q,G)`` Q scales for the Indexer MXFP8 kernel.
+
+    Contiguous one-byte CUDA inputs are read directly in BSHD order and packed
+    in one asynchronous launch, without an intermediate MKL tensor.  ``out``
+    is an optional caller-owned contiguous ``(B*H_kv, ceil128(S_q*q),
+    ceil4(G))`` tensor of the same dtype/device, where
+    ``q=qhead_per_kv_head``.  It must not alias ``q_scale``.  The return value
+    aliases ``out`` when supplied.  ``stream`` is an optional CUDA driver
+    stream and otherwise means PyTorch's current stream on the input device.
+    The caller-owned path performs no allocation, records buffer lifetimes on
+    the launch stream, and is CUDA-graph capturable after the first JIT compile.
+    CPU and non-byte inputs use the PyTorch reference implementation.
+    """
+    if q_scale.ndim != 4:
+        raise ValueError(f"q_scale must have shape (B, S_q, H_q, sf_groups), got {tuple(q_scale.shape)}")
+    if qhead_per_kv_head <= 0:
+        raise ValueError("qhead_per_kv_head must be positive")
+    bs, seqlen_q, n_heads_q, sf_groups = q_scale.shape
+    if n_heads_q % qhead_per_kv_head != 0:
+        raise ValueError(f"n_heads_q ({n_heads_q}) must be divisible by qhead_per_kv_head ({qhead_per_kv_head})")
+    n_heads_kv = n_heads_q // qhead_per_kv_head
+    mn = seqlen_q * qhead_per_kv_head
+    shape = _packed_scale_shape(mn, sf_groups, bs * n_heads_kv)
+    packed = _allocate_pack_out(q_scale, shape, out, stream)
+    if _can_use_cuda_packer(q_scale):
+        return _launch_cuda_packer(
+            q_scale,
+            packed,
+            mn=mn,
+            sf_groups=sf_groups,
+            l_size=bs * n_heads_kv,
+            source_layout="q_bshd",
+            stream=stream,
+            seq_len=seqlen_q,
+            n_heads_kv=n_heads_kv,
+            qhead_per_kv_head=qhead_per_kv_head,
+        )
+    with torch_stream_context(stream, q_scale.device):
+        record_streams((q_scale, packed), stream, q_scale.device)
+        return pack_blockscaled_scale_mkl(logical_q_scale_to_mkl(q_scale, qhead_per_kv_head), out=packed, stream=stream)
 
 
-def pack_k_scale_bshd(k_scale: torch.Tensor) -> torch.Tensor:
-    """Pack logical BSHD K scales for the Indexer MXFP8 kernel."""
-    return pack_blockscaled_scale_mkl(logical_k_scale_to_mkl(k_scale))
+def pack_k_scale_bshd(
+    k_scale: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    stream=None,
+) -> torch.Tensor:
+    """Pack logical ``(B,S_k,H_kv,G)`` K scales for the Indexer MXFP8 kernel.
+
+    Contiguous one-byte CUDA inputs are packed directly in one asynchronous
+    launch.  ``out`` is an optional caller-owned contiguous
+    ``(B*H_kv, ceil128(S_k), ceil4(G))`` tensor of the same dtype/device; it
+    must not alias ``k_scale``.  The return value aliases ``out`` when supplied.
+    ``stream`` is an optional CUDA driver stream and otherwise means PyTorch's
+    current stream on the input device.  The caller-owned path performs no
+    allocation, records buffer lifetimes on the launch stream, and is
+    CUDA-graph capturable after the first JIT compile.  CPU and non-byte inputs
+    use the PyTorch reference implementation.
+    """
+    if k_scale.ndim != 4:
+        raise ValueError(f"k_scale must have shape (B, S_k, H_kv, sf_groups), got {tuple(k_scale.shape)}")
+    bs, seqlen_k, n_heads_kv, sf_groups = k_scale.shape
+    shape = _packed_scale_shape(seqlen_k, sf_groups, bs * n_heads_kv)
+    packed = _allocate_pack_out(k_scale, shape, out, stream)
+    if _can_use_cuda_packer(k_scale):
+        return _launch_cuda_packer(
+            k_scale,
+            packed,
+            mn=seqlen_k,
+            sf_groups=sf_groups,
+            l_size=bs * n_heads_kv,
+            source_layout="k_bshd",
+            stream=stream,
+            seq_len=seqlen_k,
+            n_heads_kv=n_heads_kv,
+        )
+    with torch_stream_context(stream, k_scale.device):
+        record_streams((k_scale, packed), stream, k_scale.device)
+        return pack_blockscaled_scale_mkl(logical_k_scale_to_mkl(k_scale), out=packed, stream=stream)
+
+
+def pack_qk_scale_bshd(
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    qhead_per_kv_head: int = 64,
+    *,
+    q_out: torch.Tensor | None = None,
+    k_out: torch.Tensor | None = None,
+    stream=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack logical BSHD Q and K scales together for the MXFP8 indexer.
+
+    ``q_scale`` has shape ``(B,S_q,H_q,G)`` and ``k_scale`` has shape
+    ``(B,S_k,H_kv,G)``.  They must share batch size, scale groups, dtype,
+    device, and ``H_q == H_kv * qhead_per_kv_head``.  Contiguous one-byte CUDA
+    inputs are packed in one asynchronous launch.  The returned tensors have
+    shapes ``(B*H_kv, ceil128(S_q*q), ceil4(G))`` and
+    ``(B*H_kv, ceil128(S_k), ceil4(G))``, where
+    ``q=qhead_per_kv_head``.
+
+    ``q_out`` and ``k_out`` optionally provide caller-owned contiguous storage
+    of those shapes, dtype, and device; neither may alias either input.  When
+    both are supplied the CUDA path allocates nothing, records all four buffer
+    lifetimes on ``stream``, and is CUDA-graph capturable after its first JIT
+    compile.  ``stream`` is an optional CUDA driver stream and otherwise means
+    PyTorch's current stream on the input device.  CPU, non-byte, or strided
+    inputs use the two reference packers and preserve the same return contract.
+    """
+    if q_scale.ndim != 4:
+        raise ValueError(f"q_scale must have shape (B, S_q, H_q, sf_groups), got {tuple(q_scale.shape)}")
+    if k_scale.ndim != 4:
+        raise ValueError(f"k_scale must have shape (B, S_k, H_kv, sf_groups), got {tuple(k_scale.shape)}")
+    if qhead_per_kv_head <= 0:
+        raise ValueError("qhead_per_kv_head must be positive")
+
+    bs, seqlen_q, n_heads_q, sf_groups = q_scale.shape
+    bs_k, seqlen_k, n_heads_kv, k_sf_groups = k_scale.shape
+    if bs != bs_k or sf_groups != k_sf_groups:
+        raise ValueError("q_scale and k_scale must have matching batch size and sf_groups")
+    if n_heads_q != n_heads_kv * qhead_per_kv_head:
+        raise ValueError(f"n_heads_q ({n_heads_q}) must equal n_heads_kv * qhead_per_kv_head " f"({n_heads_kv} * {qhead_per_kv_head})")
+    if q_scale.dtype != k_scale.dtype or q_scale.device != k_scale.device:
+        raise ValueError("q_scale and k_scale must have the same dtype and device")
+
+    q_mn = seqlen_q * qhead_per_kv_head
+    l_size = bs * n_heads_kv
+    q_shape = _packed_scale_shape(q_mn, sf_groups, l_size)
+    k_shape = _packed_scale_shape(seqlen_k, sf_groups, l_size)
+    q_packed = _allocate_pack_out(q_scale, q_shape, q_out, stream)
+    k_packed = _allocate_pack_out(k_scale, k_shape, k_out, stream)
+    for packed, name in ((q_packed, "q_out"), (k_packed, "k_out")):
+        if packed.untyped_storage().data_ptr() in (
+            q_scale.untyped_storage().data_ptr(),
+            k_scale.untyped_storage().data_ptr(),
+        ):
+            raise ValueError(f"{name} must not alias either source scale tensor")
+    if q_packed.untyped_storage().data_ptr() == k_packed.untyped_storage().data_ptr():
+        raise ValueError("q_out and k_out must not alias each other")
+
+    if _can_use_cuda_packer(q_scale) and _can_use_cuda_packer(k_scale):
+        return _launch_cuda_qk_bshd_packer(
+            q_scale,
+            k_scale,
+            q_packed,
+            k_packed,
+            q_mn=q_mn,
+            k_mn=seqlen_k,
+            sf_groups=sf_groups,
+            l_size=l_size,
+            q_seq_len=seqlen_q,
+            k_seq_len=seqlen_k,
+            n_heads_kv=n_heads_kv,
+            qhead_per_kv_head=qhead_per_kv_head,
+            stream=stream,
+        )
+
+    return (
+        pack_q_scale_bshd(q_scale, qhead_per_kv_head, out=q_packed, stream=stream),
+        pack_k_scale_bshd(k_scale, out=k_packed, stream=stream),
+    )
 
 
 def pack_q_scale_thd(
@@ -282,28 +660,126 @@ def pack_q_scale_thd(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_q_scale_padded: torch.Tensor,
     qhead_per_kv_head: int = 64,
+    *,
+    out: torch.Tensor | None = None,
+    stream=None,
 ) -> torch.Tensor:
-    """Pack logical THD Q scales for the Indexer MXFP8 kernel."""
-    return pack_blockscaled_scale_mkl(
-        logical_q_scale_to_mkl_thd(
+    """Pack logical ``(total_q,H_q,G)`` THD Q scales for the MXFP8 indexer.
+
+    For a contiguous one-byte CUDA input, supplying caller-owned ``out``
+    enables the fully asynchronous path: one kernel reads both device prefixes,
+    copies live scale bytes, and writes all per-sequence and capacity padding as
+    ``0x00``.  No prefix value is read on the host.  ``out`` must be contiguous, have the input dtype/device and
+    shape ``(H_kv, M_capacity, ceil4(G))`` with ``M_capacity`` a multiple of
+    128 large enough for ``cu_seqlens_q_scale_padded[-1] *
+    qhead_per_kv_head``.  It must not alias ``q_scale``.  Without ``out`` the
+    compatibility path allocates the exact live extent and therefore reads the
+    prefix on the host.  The return value aliases ``out`` when supplied.
+    ``stream`` is an optional CUDA driver stream and otherwise means PyTorch's
+    current stream on the input device.  The caller-owned path records all
+    buffer lifetimes on that stream and is CUDA-graph capturable after the
+    first JIT compile.  Both prefix tensors are contiguous CUDA int32 arrays of
+    length ``B+1`` on the input device.  ``cu_seqlens_q`` starts at zero, ends
+    at ``total_q``, and is nondecreasing; the padded prefix starts at zero, is
+    nondecreasing, and each span covers its logical sequence with the required
+    Q-token alignment.  Those device values are a caller contract and are not
+    read back for host validation on the asynchronous path.
+    """
+    if q_scale.ndim != 3:
+        raise ValueError(f"q_scale must have shape (total_q, H_q, sf_groups), got {tuple(q_scale.shape)}")
+    if qhead_per_kv_head <= 0:
+        raise ValueError("qhead_per_kv_head must be positive")
+    _total_q, n_heads_q, sf_groups = q_scale.shape
+    if n_heads_q % qhead_per_kv_head != 0:
+        raise ValueError(f"n_heads_q ({n_heads_q}) must be divisible by qhead_per_kv_head ({qhead_per_kv_head})")
+    n_heads_kv = n_heads_q // qhead_per_kv_head
+    _validate_thd_cuda_prefixes(q_scale, cu_seqlens_q, cu_seqlens_q_scale_padded)
+    if out is not None and _can_use_cuda_packer(q_scale):
+        expected_tail = _ceil_div(sf_groups, _ATOM_K) * _ATOM_K
+        if out.ndim != 3 or out.shape[0] != n_heads_kv or out.shape[1] % _ATOM_MN != 0 or out.shape[2] != expected_tail:
+            raise ValueError(f"out must have shape ({n_heads_kv}, multiple_of_128, {expected_tail}), got {tuple(out.shape)}")
+        _validate_pack_out(out, q_scale, tuple(out.shape))
+        return _launch_cuda_packer(
             q_scale,
-            cu_seqlens_q,
-            cu_seqlens_q_scale_padded,
-            qhead_per_kv_head,
+            out,
+            mn=out.shape[1],
+            sf_groups=sf_groups,
+            l_size=n_heads_kv,
+            source_layout="q_thd",
+            stream=stream,
+            qhead_per_kv_head=qhead_per_kv_head,
+            cu_seqlens=cu_seqlens_q,
+            cu_seqlens_scale_padded=cu_seqlens_q_scale_padded,
         )
-    )
+    with torch_stream_context(stream, q_scale.device):
+        record_streams((q_scale, out, cu_seqlens_q, cu_seqlens_q_scale_padded), stream, q_scale.device)
+        return pack_blockscaled_scale_mkl(
+            logical_q_scale_to_mkl_thd(
+                q_scale,
+                cu_seqlens_q,
+                cu_seqlens_q_scale_padded,
+                qhead_per_kv_head,
+            ),
+            out=out,
+            stream=stream,
+        )
 
 
 def pack_k_scale_thd(
     k_scale: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     cu_seqlens_k_scale_padded: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    stream=None,
 ) -> torch.Tensor:
-    """Pack logical THD K scales for the Indexer MXFP8 kernel."""
-    return pack_blockscaled_scale_mkl(
-        logical_k_scale_to_mkl_thd(
+    """Pack logical ``(total_k,H_kv,G)`` THD K scales for the MXFP8 indexer.
+
+    For a contiguous one-byte CUDA input, caller-owned ``out`` makes packing
+    one asynchronous launch with no allocation or device-to-host read.  ``out``
+    must be contiguous, have the input dtype/device, and have shape
+    ``(H_kv, M_capacity, ceil4(G))`` with a multiple-of-128 capacity covering
+    ``cu_seqlens_k_scale_padded[-1]``; it must not alias ``k_scale``.  Without
+    ``out`` the compatibility path allocates the exact live extent and reads
+    the prefix on the host.  The return value aliases ``out`` when supplied.
+    ``stream`` is an optional CUDA driver stream and otherwise means PyTorch's
+    current stream on the input device.  The caller-owned path records all
+    buffer lifetimes on that stream and is CUDA-graph capturable after the
+    first JIT compile.  Both prefix tensors are contiguous CUDA int32 arrays of
+    length ``B+1`` on the input device.  ``cu_seqlens_k`` starts at zero, ends
+    at ``total_k``, and is nondecreasing; the padded prefix starts at zero, is
+    nondecreasing, and each span covers its logical sequence with 128-token
+    alignment.  Those device values are a caller contract and are not read
+    back for host validation on the asynchronous path.
+    """
+    if k_scale.ndim != 3:
+        raise ValueError(f"k_scale must have shape (total_k, H_kv, sf_groups), got {tuple(k_scale.shape)}")
+    _total_k, n_heads_kv, sf_groups = k_scale.shape
+    _validate_thd_cuda_prefixes(k_scale, cu_seqlens_k, cu_seqlens_k_scale_padded)
+    if out is not None and _can_use_cuda_packer(k_scale):
+        expected_tail = _ceil_div(sf_groups, _ATOM_K) * _ATOM_K
+        if out.ndim != 3 or out.shape[0] != n_heads_kv or out.shape[1] % _ATOM_MN != 0 or out.shape[2] != expected_tail:
+            raise ValueError(f"out must have shape ({n_heads_kv}, multiple_of_128, {expected_tail}), got {tuple(out.shape)}")
+        _validate_pack_out(out, k_scale, tuple(out.shape))
+        return _launch_cuda_packer(
             k_scale,
-            cu_seqlens_k,
-            cu_seqlens_k_scale_padded,
+            out,
+            mn=out.shape[1],
+            sf_groups=sf_groups,
+            l_size=n_heads_kv,
+            source_layout="k_thd",
+            stream=stream,
+            cu_seqlens=cu_seqlens_k,
+            cu_seqlens_scale_padded=cu_seqlens_k_scale_padded,
         )
-    )
+    with torch_stream_context(stream, k_scale.device):
+        record_streams((k_scale, out, cu_seqlens_k, cu_seqlens_k_scale_padded), stream, k_scale.device)
+        return pack_blockscaled_scale_mkl(
+            logical_k_scale_to_mkl_thd(
+                k_scale,
+                cu_seqlens_k,
+                cu_seqlens_k_scale_padded,
+            ),
+            out=out,
+            stream=stream,
+        )
