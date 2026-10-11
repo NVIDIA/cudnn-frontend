@@ -222,6 +222,17 @@ The SM100 H16/H32/H96 D576 specializations compile the physical row stride of
 remain dynamic. H64 and the generic/H128 D512 paths retain their existing
 layout; H128 D576 already uses a static `topk_max` stride.
 
+For contiguous BF16 H16/H32 D576 inputs, `q_cluster_mode="adaptive_pair"`
+enables adjacent-query KV sharing. A device-side transform partitions each
+pair into one tile-aligned intersection and two unique segments, then evaluates
+the intersection with twice the head count. Its bounded hash storage scales
+with `topk_max` rather than `total_S_kv`; invalid, duplicate, low-overlap, and
+an odd final query retain the ordinary per-query work. The mode is opt-in,
+non-deterministic, CUDA Graph compatible, and supports `topk_max <= 2048`.
+It is intended for high-overlap workloads; the device-side partition still
+runs when a pair falls back to ordinary work. H16 `topk_max <= 256` and H32
+`topk_max <= 128` accept the mode but compile the ordinary backend directly.
+
 The H128 specialization keeps the five tensor-core products in one
 two-CTA main kernel. It publishes FP32 O-dot-dO and folded-LSE statistics to the
 caller-provided scratch workspace, converts the FP32 dKV workspace to the public BF16
@@ -269,7 +280,9 @@ atomically). `execute(q, kv, out, dout, lse, attn_sink, topk_idxs, dq, dkv,
 backend and never allocates or copies during execution; the H128/D576 two-CTA
 plan additionally compiles in `compile()`, while the other routes compile on
 their first execution. The high-level wrapper allocates the outputs and the
-scratch on the launch stream when they are omitted.
+scratch on the launch stream when they are omitted. Inputs, outputs, and the
+live workspace must not alias; concurrent executions need distinct output and
+workspace storage.
 
 - **Outputs** — tuple `(dq, dkv, d_sink)`
 - **Constraints** — SM90 or Blackwell SM100/SM103; SM90 supports flat MQA tensors with `head_dim ∈ {512, 576}`
@@ -280,6 +293,7 @@ result = DSA.sparse_attention_backward_wrapper(
     softmax_scale=1.0 / math.sqrt(D),
     topk_length=topk_length,
     deterministic=True,  # optional; SM100 H16/H32/H64/H96/H128
+    q_cluster_mode="off",  # optional: "adaptive_pair" for SM100 H16/H32 D576
 )
 dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
 ```
