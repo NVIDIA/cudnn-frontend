@@ -182,9 +182,11 @@ inline void *
 get_cuda_symbol(CudaLibrary library, const char *function_name) {
     // Static mutex to ensure thread-safety
     (void)function_name;
-    static std::mutex cuda_lib_mutex;
+    // Intentionally leaked: destructors of other statics (e.g. a cached execution plan releasing
+    // its CUDA graph user object) call back in here during process teardown (#1486).
+    static std::mutex &cuda_lib_mutex = *new std::mutex;
     // Static map to store handles for different libraries
-    static std::unordered_map<CudaLibrary, HMODULE> dl_handles;
+    static std::unordered_map<CudaLibrary, HMODULE> &dl_handles = *new std::unordered_map<CudaLibrary, HMODULE>;
 
     // Lock the mutex to ensure thread-safe access
     std::lock_guard<std::mutex> lock(cuda_lib_mutex);
