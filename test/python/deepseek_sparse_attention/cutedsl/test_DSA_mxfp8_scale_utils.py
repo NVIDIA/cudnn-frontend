@@ -12,6 +12,7 @@ pytestmark = pytest.mark.L0
 
 
 def test_mxfp8_scale_pack_roundtrip_host_only():
+    """Pack and unpack a non-tile-aligned logical scale tensor."""
     logical = torch.arange(130 * 5 * 3, dtype=torch.int64).reshape(130, 5, 3)
 
     packed = mxfp8_scale_utils.pack_blockscaled_scale_mkl(logical)
@@ -23,6 +24,7 @@ def test_mxfp8_scale_pack_roundtrip_host_only():
 
 
 def test_mxfp8_scale_pack_reuses_caller_owned_output_host_only():
+    """Reuse exact caller-owned storage in the reference packer."""
     logical = torch.arange(130 * 5 * 3, dtype=torch.int64).reshape(130, 5, 3)
     out = torch.full((3, 256, 8), -1, dtype=torch.int64)
 
@@ -35,6 +37,7 @@ def test_mxfp8_scale_pack_reuses_caller_owned_output_host_only():
 
 
 def test_mxfp8_scale_pack_rejects_invalid_caller_owned_output_host_only():
+    """Reject wrong shapes, dtypes, and aliased caller storage."""
     logical = torch.arange(128 * 4, dtype=torch.int64).reshape(128, 4, 1)
     with pytest.raises(ValueError, match="out must have shape"):
         mxfp8_scale_utils.pack_blockscaled_scale_mkl(logical, out=torch.empty((1, 64, 4), dtype=torch.int64))
@@ -45,6 +48,7 @@ def test_mxfp8_scale_pack_rejects_invalid_caller_owned_output_host_only():
 
 
 def test_mxfp8_scale_pack_uses_blackwell_datapath_order_host_only():
+    """Match the Blackwell blockscaled scale-factor datapath order."""
     logical = torch.arange(128 * 4, dtype=torch.int64).reshape(128, 4, 1)
 
     packed = mxfp8_scale_utils.pack_blockscaled_scale_mkl(logical).reshape(-1)
@@ -63,6 +67,7 @@ def test_mxfp8_scale_pack_uses_blackwell_datapath_order_host_only():
     ],
 )
 def test_mxfp8_scale_pack_order_bshd_q_host_only(qhead_per_kv_head, seqlen_q):
+    """Map BSHD Q scales to logical MKL order for supported GQA ratios."""
     bs, n_heads_q, sf_groups = 2, qhead_per_kv_head, 4
     batch = torch.arange(bs, dtype=torch.int64).view(bs, 1, 1, 1) * 100_000
     token = torch.arange(seqlen_q, dtype=torch.int64).view(1, seqlen_q, 1, 1) * 1_000
@@ -94,6 +99,7 @@ def test_mxfp8_scale_pack_order_bshd_q_host_only(qhead_per_kv_head, seqlen_q):
 
 
 def test_mxfp8_scale_pack_order_bshd_k_l_dimension_host_only():
+    """Flatten BSHD K batch and KV heads into the packed L dimension."""
     bs, seqlen_k, n_heads_kv, sf_groups = 2, 3, 2, 4
     batch = torch.arange(bs, dtype=torch.int64).view(bs, 1, 1, 1) * 100_000
     token = torch.arange(seqlen_k, dtype=torch.int64).view(1, seqlen_k, 1, 1) * 1_000
@@ -115,6 +121,7 @@ def test_mxfp8_scale_pack_order_bshd_k_l_dimension_host_only():
 
 
 def test_mxfp8_scale_pack_qk_bshd_matches_individual_packers_host_only():
+    """Match fused reference results to the individual BSHD packers."""
     bs, sq, sk, hq, hkv, groups, qhpkv = 2, 3, 5, 8, 2, 5, 4
     q = torch.arange(bs * sq * hq * groups, dtype=torch.int64).reshape(bs, sq, hq, groups)
     k = torch.arange(bs * sk * hkv * groups, dtype=torch.int64).reshape(bs, sk, hkv, groups)
@@ -130,6 +137,7 @@ def test_mxfp8_scale_pack_qk_bshd_matches_individual_packers_host_only():
 
 
 def test_mxfp8_scale_pack_order_thd_with_padding_host_only():
+    """Preserve logical THD rows while zero-filling sequence padding."""
     cu_q = torch.tensor([0, 2, 3], dtype=torch.int32)
     cu_k = torch.tensor([0, 3, 5], dtype=torch.int32)
     qhead_per_kv_head = 4
@@ -204,7 +212,62 @@ def test_mxfp8_scale_pack_order_thd_with_padding_host_only():
     assert torch.equal(k_unpacked, k_mkl)
 
 
+def test_mxfp8_scale_pack_thd_reference_fallback_accepts_capacity_output_host_only():
+    """Copy exact reference results into larger outputs and clear their tails."""
+    qhpkv, hkv, groups = 4, 2, 5
+    cu_q = torch.tensor([0, 2, 3], dtype=torch.int64)
+    cu_k = torch.tensor([0, 3, 5], dtype=torch.int64)
+    cu_q_scale = torch.tensor([0, 32, 64], dtype=torch.int32)
+    cu_k_scale = torch.tensor([0, 128, 256], dtype=torch.int32)
+    q = torch.arange(3 * hkv * qhpkv * groups, dtype=torch.int64).reshape(3, hkv * qhpkv, groups)
+    k = torch.arange(5 * hkv * groups, dtype=torch.int64).reshape(5, hkv, groups)
+    q_ref = mxfp8_scale_utils.pack_q_scale_thd(q, cu_q, cu_q_scale, qhpkv)
+    k_ref = mxfp8_scale_utils.pack_k_scale_thd(k, cu_k, cu_k_scale)
+    q_out = torch.full((hkv, q_ref.shape[1] + 128, q_ref.shape[2]), -1, dtype=q.dtype)
+    k_out = torch.full((hkv, k_ref.shape[1] + 128, k_ref.shape[2]), -1, dtype=k.dtype)
+
+    actual_q = mxfp8_scale_utils.pack_q_scale_thd(q, cu_q, cu_q_scale, qhpkv, out=q_out)
+    actual_k = mxfp8_scale_utils.pack_k_scale_thd(k, cu_k, cu_k_scale, out=k_out)
+
+    assert actual_q is q_out
+    assert actual_k is k_out
+    assert torch.equal(q_out[:, : q_ref.shape[1]], q_ref)
+    assert torch.equal(k_out[:, : k_ref.shape[1]], k_ref)
+    assert torch.count_nonzero(q_out[:, q_ref.shape[1] :]) == 0
+    assert torch.count_nonzero(k_out[:, k_ref.shape[1] :]) == 0
+
+
+def test_mxfp8_scale_pack_thd_reference_fallback_preserves_singleton_prefix_host_only():
+    """Keep the legacy empty-THD singleton-prefix case with capacity output."""
+    hkv, qhpkv, groups = 2, 4, 5
+    cu = torch.tensor([0], dtype=torch.int64)
+    cu_scale = torch.tensor([0], dtype=torch.int32)
+    q = torch.empty((0, hkv * qhpkv, groups), dtype=torch.int64)
+    k = torch.empty((0, hkv, groups), dtype=torch.int64)
+    q_out = torch.empty((hkv, 0, 8), dtype=q.dtype)
+    k_out = torch.empty((hkv, 0, 8), dtype=k.dtype)
+
+    actual_q = mxfp8_scale_utils.pack_q_scale_thd(q, cu, cu_scale, qhpkv, out=q_out)
+    actual_k = mxfp8_scale_utils.pack_k_scale_thd(k, cu, cu_scale, out=k_out)
+
+    assert actual_q is q_out
+    assert actual_k is k_out
+
+
+def test_mxfp8_scale_pack_thd_reference_fallback_rejects_small_capacity_host_only():
+    """Reject caller-owned THD storage smaller than the reference result."""
+    qhpkv, hkv, groups = 4, 2, 5
+    cu = torch.tensor([0, 2, 3], dtype=torch.int64)
+    cu_q_scale = torch.tensor([0, 32, 64], dtype=torch.int32)
+    q = torch.arange(3 * hkv * qhpkv * groups, dtype=torch.int64).reshape(3, hkv * qhpkv, groups)
+    out = torch.empty((hkv, 128, 8), dtype=q.dtype)
+
+    with pytest.raises(ValueError, match="cannot hold packed extent"):
+        mxfp8_scale_utils.pack_q_scale_thd(q, cu, cu_q_scale, qhpkv, out=out)
+
+
 def test_mxfp8_scale_prefix_padding_127_128_host_only():
+    """Round each THD scale-prefix span independently to alignment."""
     cu = torch.tensor([0, 127, 255], dtype=torch.int32)
     q_padded = mxfp8_scale_utils.make_scale_cu_seqlens_padded(cu, token_alignment=2)
     k_padded = mxfp8_scale_utils.make_scale_cu_seqlens_padded(cu, token_alignment=128)
@@ -223,16 +286,19 @@ def test_mxfp8_scale_prefix_padding_127_128_host_only():
     ],
 )
 def test_minimal_padded_token_capacity_host_only(total_tokens, num_sequences, alignment, expected):
+    """Compute a safe reusable capacity without reading device prefixes."""
     assert mxfp8_scale_utils.minimal_padded_token_capacity(total_tokens, num_sequences, alignment) == expected
 
 
 def test_minimal_padded_token_capacity_rejects_tokens_without_sequences_host_only():
+    """Reject a nonempty token extent with no declared sequences."""
     with pytest.raises(ValueError, match="num_sequences must be positive"):
         mxfp8_scale_utils.minimal_padded_token_capacity(1, 0, 128)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_cuda_matches_reference_and_reuses_output():
+    """Match individual CUDA BSHD packers to the host reference."""
     device = torch.device("cuda")
     bs, sq, sk, hq, hkv, groups, qhpkv = 2, 131, 259, 64, 1, 5, 64
     q = torch.arange(bs * sq * hq * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sq, hq, groups)
@@ -254,6 +320,7 @@ def test_mxfp8_scale_pack_cuda_matches_reference_and_reuses_output():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_qk_bshd_cuda_matches_reference_and_reuses_outputs():
+    """Match the fused CUDA BSHD packer and preserve output identities."""
     device = torch.device("cuda")
     bs, sq, sk, hq, hkv, groups, qhpkv = 2, 131, 259, 64, 1, 5, 64
     q_cpu = torch.arange(bs * sq * hq * groups, dtype=torch.int64).to(torch.uint8).reshape(bs, sq, hq, groups)
@@ -282,6 +349,7 @@ def test_mxfp8_scale_pack_qk_bshd_cuda_matches_reference_and_reuses_outputs():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_qk_bshd_cuda_is_async_graph_capturable_and_honors_stream():
+    """Keep the fused fast path asynchronous, stream-safe, and capturable."""
     cuda = pytest.importorskip("cuda.bindings.driver")
     q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
     k = torch.arange(259 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 259, 1, 5)
@@ -323,6 +391,7 @@ def test_mxfp8_scale_pack_qk_bshd_cuda_is_async_graph_capturable_and_honors_stre
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_cuda_thd_caller_owned_output_matches_reference():
+    """Match direct CUDA THD Q/K packing to the reference implementation."""
     device = torch.device("cuda")
     qhpkv, hkv, groups = 4, 2, 4
     cu_q_cpu = torch.tensor([0, 2, 3], dtype=torch.int32)
@@ -351,7 +420,39 @@ def test_mxfp8_scale_pack_cuda_thd_caller_owned_output_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mxfp8_scale_pack_cuda_thd_strided_fallback_accepts_capacity_output():
+    """Support larger caller outputs on the CUDA strided-input fallback."""
+    qhpkv, hkv, groups = 4, 2, 5
+    cu_q_cpu = torch.tensor([0, 2, 3], dtype=torch.int32)
+    cu_k_cpu = torch.tensor([0, 3, 5], dtype=torch.int32)
+    cu_q_scale_cpu = torch.tensor([0, 32, 64], dtype=torch.int32)
+    cu_k_scale_cpu = torch.tensor([0, 128, 256], dtype=torch.int32)
+    q_storage = torch.arange(3 * hkv * qhpkv * groups * 2, dtype=torch.int64).to(torch.uint8).reshape(3, hkv * qhpkv, groups * 2)
+    k_storage = torch.arange(5 * hkv * groups * 2, dtype=torch.int64).to(torch.uint8).reshape(5, hkv, groups * 2)
+    q_cpu = q_storage[..., ::2]
+    k_cpu = k_storage[..., ::2]
+    q_ref = mxfp8_scale_utils.pack_q_scale_thd(q_cpu.contiguous(), cu_q_cpu, cu_q_scale_cpu, qhpkv)
+    k_ref = mxfp8_scale_utils.pack_k_scale_thd(k_cpu.contiguous(), cu_k_cpu, cu_k_scale_cpu)
+    q = q_storage.cuda()[..., ::2]
+    k = k_storage.cuda()[..., ::2]
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    q_out = torch.full((hkv, q_ref.shape[1] + 128, q_ref.shape[2]), 0xA5, dtype=q.dtype, device=q.device)
+    k_out = torch.full((hkv, k_ref.shape[1] + 128, k_ref.shape[2]), 0xA5, dtype=k.dtype, device=k.device)
+
+    mxfp8_scale_utils.pack_q_scale_thd(q, cu_q_cpu.cuda(), cu_q_scale_cpu.cuda(), qhpkv, out=q_out)
+    mxfp8_scale_utils.pack_k_scale_thd(k, cu_k_cpu.cuda(), cu_k_scale_cpu.cuda(), out=k_out)
+    torch.cuda.synchronize()
+
+    assert torch.equal(q_out[:, : q_ref.shape[1]].cpu(), q_ref)
+    assert torch.equal(k_out[:, : k_ref.shape[1]].cpu(), k_ref)
+    assert torch.count_nonzero(q_out[:, q_ref.shape[1] :]) == 0
+    assert torch.count_nonzero(k_out[:, k_ref.shape[1] :]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_cuda_hot_path_does_not_synchronize():
+    """Avoid host synchronization on the direct CUDA packing path."""
     device = torch.device("cuda")
     q = torch.zeros((1, 128, 64, 4), dtype=torch.uint8, device=device)
     out = torch.empty((1, 8192, 4), dtype=torch.uint8, device=device)
@@ -367,6 +468,7 @@ def test_mxfp8_scale_pack_cuda_hot_path_does_not_synchronize():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_cuda_caller_owned_path_is_graph_capturable():
+    """Capture and replay direct caller-owned BSHD packing."""
     q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
     reference = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu(), 64)
     out = torch.empty(reference.shape, dtype=torch.uint8, device="cuda")
@@ -387,6 +489,7 @@ def test_mxfp8_scale_pack_cuda_caller_owned_path_is_graph_capturable():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_cuda_honors_explicit_stream():
+    """Enqueue direct BSHD packing on the requested driver stream."""
     cuda = pytest.importorskip("cuda.bindings.driver")
     q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
     reference = mxfp8_scale_utils.pack_q_scale_bshd(q.cpu(), 64)
@@ -402,6 +505,7 @@ def test_mxfp8_scale_pack_cuda_honors_explicit_stream():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp8_scale_pack_cuda_reference_fallback_honors_explicit_stream():
+    """Enqueue the strided-input reference fallback on the requested stream."""
     cuda = pytest.importorskip("cuda.bindings.driver")
     storage = torch.arange(129 * 64 * 5 * 2, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 10)
     q = storage[..., ::2]
@@ -429,6 +533,7 @@ def test_mxfp8_scale_pack_cuda_reference_fallback_honors_explicit_stream():
 
 
 def test_mxfp8_scale_pack_thd_custom_256_padding_host_only():
+    """Preserve caller-declared THD padding larger than the minimum."""
     cu = torch.tensor([0, 1, 2], dtype=torch.int32)
     cu_scale = torch.tensor([0, 256, 512], dtype=torch.int32)
     q_scale = torch.arange(2 * 64 * 4, dtype=torch.int64).reshape(2, 64, 4)
@@ -447,6 +552,7 @@ def test_mxfp8_scale_pack_thd_custom_256_padding_host_only():
 
 
 def test_blockscaled_umma_descriptor_bitfields_host_only():
+    """Encode every blockscaled UMMA descriptor field in its ABI bit."""
     cutlass = pytest.importorskip("cutlass")
     mma_desc = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mma_desc")
 
@@ -479,6 +585,7 @@ def test_blockscaled_umma_descriptor_bitfields_host_only():
 
 
 def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
+    """Map CuTe MMA operand modes and scale IDs to the descriptor ABI."""
     from types import SimpleNamespace
 
     cutlass = pytest.importorskip("cutlass")

@@ -227,6 +227,7 @@ def _pack_host(
     qhead_per_kv_head: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
+    """Launch the single-source shape-generic MXFP8 scale pack kernel."""
     mn_tiles = (mn + _ATOM_ROWS - 1) // _ATOM_ROWS
     sf_tiles = (sf_groups + _ATOM_COLS - 1) // _ATOM_COLS
     total_lines = l_size * mn_tiles * sf_tiles * _LINES_PER_ATOM
@@ -262,6 +263,7 @@ def _pack_qk_bshd_host(
     qhead_per_kv_head: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
+    """Launch the fused Q/K BSHD MXFP8 scale pack kernel."""
     sf_tiles = (sf_groups + _ATOM_COLS - 1) // _ATOM_COLS
     q_lines = l_size * ((q_mn + _ATOM_ROWS - 1) // _ATOM_ROWS) * sf_tiles * _LINES_PER_ATOM
     k_lines = l_size * ((k_mn + _ATOM_ROWS - 1) // _ATOM_ROWS) * sf_tiles * _LINES_PER_ATOM
@@ -282,6 +284,7 @@ def _pack_qk_bshd_host(
 
 
 def _pointer(dtype):
+    """Create an aligned global-memory pointer type for JIT signatures."""
     return cute.runtime.make_ptr(dtype, 1, cute.AddressSpace.gmem, assumed_align=1)
 
 
