@@ -1963,31 +1963,13 @@ def frost_kda_recompute_prologue(
 
 
 @cute.jit
-def prologue(
-    io_dtype: cutlass.Constexpr,
-    b_t: cutlass.Constexpr[int],
-    run_order: cutlass.Constexpr[bool],
-    gen_intervals: cutlass.Constexpr[bool],
-    k: cute.Tensor,
-    v: cute.Tensor,
-    gate: cute.Tensor,
-    state_checkpoints: cute.Tensor | None,
-    cu_seqlens: cute.Tensor,
-    work_count: cute.Tensor,
-    work_items: cute.Tensor | None,
-    scheduler_all: cute.Tensor | None,
-    tensormap_workspace: cute.Tensor,
-    checkpoint_every_n: cutlass.Int32,
-    seed_span_chunks: cutlass.Int32,
-    stream: cuda_driver.CUstream,
+def base_descriptors(
+    io_dtype: cutlass.Constexpr, b_t: cutlass.Constexpr[int], k: cute.Tensor, v: cute.Tensor, gate: cute.Tensor, state_checkpoints: cute.Tensor | None
 ):
-    """One-launch prologue: synthesize and LPT-order the uncut work items (when ``run_order``) and
-    build the per-batch K/V/Gate/checkpoint TMA-descriptor arrays into
-    ``tensormap_workspace``."""
+    """The whole-tensor TMA descriptors (K, V, the gate, checkpoints) the prologue's per-batch arrays are built from."""
     h_k = k.shape[1]
     h_v = v.shape[1]
     ho = gate.shape[1]
-    batch_size = cu_seqlens.shape[0] - 1
     d_k = k.shape[2]
     d_v = v.shape[2]
     bytes_per_element = io_dtype.width // 8
@@ -2018,6 +2000,33 @@ def prologue(
         base_checkpoint = cuda.create_tensor_map_tiled_from_view(
             checkpoint_view, box_dims=(box_elems, d_v_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle
         )
+    return base_k, base_v, base_gate, base_checkpoint
+
+
+@cute.jit
+def prologue(
+    io_dtype: cutlass.Constexpr,
+    b_t: cutlass.Constexpr[int],
+    run_order: cutlass.Constexpr[bool],
+    gen_intervals: cutlass.Constexpr[bool],
+    k: cute.Tensor,
+    v: cute.Tensor,
+    gate: cute.Tensor,
+    state_checkpoints: cute.Tensor | None,
+    cu_seqlens: cute.Tensor,
+    work_count: cute.Tensor,
+    work_items: cute.Tensor | None,
+    scheduler_all: cute.Tensor | None,
+    tensormap_workspace: cute.Tensor,
+    checkpoint_every_n: cutlass.Int32,
+    seed_span_chunks: cutlass.Int32,
+    stream: cuda_driver.CUstream,
+):
+    """One-launch prologue: synthesize and LPT-order the uncut work items (when ``run_order``) and
+    build the per-batch K/V/Gate/checkpoint TMA-descriptor arrays into
+    ``tensormap_workspace``."""
+    batch_size = cu_seqlens.shape[0] - 1
+    base_k, base_v, base_gate, base_checkpoint = base_descriptors(io_dtype, b_t, k, v, gate, state_checkpoints)
     frost_kda_recompute_prologue(
         run_order,
         gen_intervals,

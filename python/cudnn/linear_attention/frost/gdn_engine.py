@@ -193,7 +193,7 @@ class CompiledGdn:
         from .common.piece_chain import DV_SPLIT_TILES, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout
         from .kernel.gdn_chain_forward_f16 import build_chain_forward, run_chain_forward
         from .kernel.gdn_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
-        from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
 
         self.node = node
         self.chain_rows_per_cta = chain_rows_per_cta
@@ -320,7 +320,7 @@ class CompiledGdn:
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
             if self.split:
-                self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
+                self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         if self.tinv_pass:
@@ -512,7 +512,7 @@ class CompiledGdnBwd:
         from .common.piece_chain import chain_rows_per_cta, choose_pieces, piece_table_layout
         from .kernel.gdn_chain_backward_f16 import build_chain_backward, run_chain_backward
         from .kernel.gdn_warmup_backward_f16 import build_warmup_backward, run_warmup_backward
-        from .common.split_k import WORK_ITEM_FIELDS, chunk_scratch_rows, compute_ideal_chunks, max_work_items
+        from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
 
         self.node = node
         self.bwd = bwd_module
@@ -688,7 +688,7 @@ class CompiledGdnBwd:
         regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
         regions.append(("work_count", layout.add(4), "int32", (1,)))
         if self.split:
-            self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
+            self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
             regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         if self.chain:
@@ -1165,7 +1165,7 @@ class CompiledGdnSummary:
         from .common.l2norm import build_l2norm_qk, run_l2norm_qk
         from .common.piece_chain import DV_SPLIT_TILES, build_state_chain, chain_rows_per_cta, choose_pieces, is_dv_split, piece_table_layout, run_state_chain
         from .kernel.gdn_chain_prologue_f16 import run_chain_prologue
-        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
+        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, compute_ideal_chunks, max_work_items, split_scratch_rows, run_table
 
         self.node = node
         self.recompute = recompute_module
@@ -1303,7 +1303,7 @@ class CompiledGdnSummary:
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
             if self.split:
-                self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
+                self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         if self.use_qk_l2norm:
@@ -1655,7 +1655,7 @@ class CompiledGdnSummaryBwd:
         from .common.l2norm import build_l2norm_qk, run_l2norm_qk
         from .common.piece_chain import build_state_chain, chain_rows_per_cta, choose_pieces, piece_table_layout, run_state_chain
         from .kernel.gdn_chain_prologue_f16 import run_chain_prologue
-        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, chunk_scratch_rows, compute_ideal_chunks, max_work_items, run_table
+        from .common.split_k import WORK_ITEM_FIELDS, build_split_table, compute_ideal_chunks, max_work_items, split_scratch_rows, run_table
 
         self.node = node
         self.summary = summary_module
@@ -1797,7 +1797,7 @@ class CompiledGdnSummaryBwd:
             regions.append(("work_items", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
             regions.append(("work_count", layout.add(4), "int32", (1,)))
             if self.split:
-                self.chunk_scratch_rows = chunk_scratch_rows(total, B, self.b_t)
+                self.chunk_scratch_rows = split_scratch_rows(total, B, HO, self.b_t)
                 regions.append(("item_scratch", layout.add(self.work_item_rows * WORK_ITEM_FIELDS * 4), "int32", (self.work_item_rows, WORK_ITEM_FIELDS)))
                 regions.append(("chunk_scratch", layout.add(self.chunk_scratch_rows * HO * 4), "float32", (self.chunk_scratch_rows, HO)))
         self.needs_table = self.split
