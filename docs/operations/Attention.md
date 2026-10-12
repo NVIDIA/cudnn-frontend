@@ -1001,6 +1001,7 @@ Args:
     scale_s (cudnn_tensor): Scale factor for S tensor.
     scale_o (cudnn_tensor): Scale factor for output.
     attn_scale (Optional[Union[float, cudnn_tensor]]): The scale factor for attention. Default is None.
+    bias (Optional[cudnn_tensor]): The bias data for attention. Default is None. See the bias tensor contract in the Input Tensors table.
     use_causal_mask (Optional[bool]): Whether to use causal mask. Default is False.
     use_padding_mask (Optional[bool]): Enable variable sequence length masking. Requires seq_len_q/seq_len_kv or cu_seq_len_q/cu_seq_len_kv. Default is False.
     seq_len_q (Optional[cudnn_tensor]): Per-batch query sequence lengths with shape (B, 1, 1, 1).
