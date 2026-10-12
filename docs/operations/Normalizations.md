@@ -399,6 +399,10 @@ The output array has tensors in order of: `[input gradient, scale gradient, bias
 Instancenorm_backward_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:
 ```
 Instancenorm_backward_attributes&
+set_saved_mean_and_inv_variance(std::shared_ptr<Tensor_attributes> mean,
+                                std::shared_ptr<Tensor_attributes> inv_variance)
+
+Instancenorm_backward_attributes&
 set_name(std::string const&)
 
 Instancenorm_backward_attributes&

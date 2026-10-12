@@ -991,7 +991,7 @@ The current FP8 support is a subset of the options supported in FP16 and BF16 su
 
 - Requires Hopper (SM90) or newer architecture.
 - Head dimension must be a multiple of 16.
-- Masking support is limited compared to FP16/BF16; FP8 supports causal and padding masks only.
+- Masking support is limited compared to FP16/BF16; FP8 supports causal, padding and bias masks.
 - Requires explicit scale/descale tensors for all FP8 inputs and outputs.
 
 #### Tensors
