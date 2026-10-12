@@ -561,6 +561,44 @@ def _explain_unfit_row(tag, kind, row, rvec, tol, ops, flip_unit, by_q_row, h_q,
     print(msg)
 
 
+def describe_flip(tag, f, fp8_dtype, flip_unit):
+    """The one-line record of a proven flip ``f`` -- an attribution dict of ``flip_evidence`` / ``assert_close_fp8_grad`` -- in the
+    vocabulary every caller prints: the d-row, the (b, hq, i, j) position, the reference's scaled value and the two adjacent codes,
+    the step as ``u x flip_unit x gain`` times the operand row, and how well that one flip reproduces the row (against the ordinary
+    tolerance, against the output's own rounding, and the least-squares flip count)."""
+    return (f"%%%% '{tag}': d-row {f['row']} is ONE flipped fp8 intermediate at (b, hq, i, j)={f['position']}: x={f['x']:+.7g} rounds to "
+            f"{fp8_dtype} code {f['c_ref']:+g}, the kernel to {f['c_alt']:+g} ({f['off_mid_spacings']:.5f} spacings from their midpoint); "
+            f"step {f['u']:+g} x flip_unit {float(flip_unit):.5g} x gain {f['gain']:.5g} = {f['step']:+.5g} x operand row {f['operand_row']} "
+            f"reproduces the row to max |residual| / tol = {f['worst']:.2f}, {f['rounding']:.2f} x the output's own rounding, "
+            f"and fits it as {f['flips']:.3f} flips"
+            + (f" ({f['n_tied']} other valid near-midpoint candidate(s) of the reduction, identical operand rows, fit equally)" if f["n_tied"] else ""))
+
+
+def flip_evidence(actual, expected, bad_rows, atol, rtol, *, tag, kind, operand, flip_unit, fp8_dtype, intermediates, out_dtype=None):
+    """The flip proof on its own, for a caller whose tolerance is NOT the row recipe's -- the gated attention block's SDPA-stage
+    pin holds the stage's bf16 dQ / dK / dV to the bf16 block's bound (``atol = 2^-7 max|ref|``, ``rtol = 2^-6``) and must still
+    accept a d-row that is one e4m3 midpoint flip of a P / dS value.  ``bad_rows`` is the caller's bool mask over the d-rows of
+    ``actual`` (``actual.shape[:-1]`` flattened: the rows outside ITS bound); ``atol`` / ``rtol`` are the ordinary tolerance the
+    exact flip term must reproduce each such row within (the per-element rounding check adds half an ``out_dtype`` code spacing
+    from each side on top of ``atol``).  Everything else is ``assert_close_fp8_grad``'s: ``kind`` one of ``_FLIP_KINDS``, a dense
+    ``[b, s, h, d]`` output, ``operand`` the dequantized BSHD operand (K for dQ, Q for dK, dO for dV, V for O), ``flip_unit`` the
+    intermediate's descale, ``intermediates(selection)`` the reference re-run on the bad rows, ``out_dtype`` the grid both sides
+    were rounded to (default ``fp8_dtype``).  Returns the attributions -- one dict per bad row: ``row``, ``position`` = (b, q head,
+    i, j), ``x``, ``c_ref``, ``c_alt``, ``u``, ``step``, ``gain``, ``operand_row``, ``worst``, ``rounding``, ``flips``, ... -- or None after
+    printing why the first row that is not one flip is not one (``_explain_unfit_row``).  It never asserts: the caller's bound
+    does.  The caller is also responsible for the ROW BUDGET (``1e-5 x rows x keys``, at least 1): the proof replaces a magnitude
+    cap, never a count."""
+    if kind not in _FLIP_KINDS:
+        raise ValueError(f"kind={kind!r} must be one of {sorted(_FLIP_KINDS)} to attribute flips")
+    if actual.dim() != 4:
+        raise ValueError(f"flip attribution needs a dense [b, s, h, d] output (got {tuple(actual.shape)})")
+    bad_rows = torch.as_tensor(bad_rows, device=actual.device).reshape(-1)
+    if bad_rows.dtype != torch.bool or bad_rows.numel() != actual.shape[:-1].numel():
+        raise ValueError(f"bad_rows must be a bool mask over the {actual.shape[:-1].numel()} d-rows of actual (got {tuple(bad_rows.shape)} {bad_rows.dtype})")
+    return _flip_evidence(actual.detach().float(), expected.detach().float(), bad_rows, float(atol), float(rtol), tag=tag, kind=kind,
+                          operand=operand, flip_unit=flip_unit, fp8_dtype=fp8_dtype, out_dtype=out_dtype or fp8_dtype, intermediates=intermediates)
+
+
 def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=None, operand=None, flip_unit=None, intermediates=None, kind=None, fp8_dtype=None, out_dtype=None):
     """assert_close for fp8 SDPA outputs/gradients with a small mismatch budget.
 
@@ -630,7 +668,9 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
     flips on a row whose ``rtol * |expected|`` is two flips wide, or a step no adjacent pair of
     codes has (8192 in e4m3) all fit a scalar-multiple test and none fits this one.  Do not
     raise the cap for a "slightly" worse flip; pass the intermediates and let the evidence
-    decide.
+    decide.  The proof is also available on its own as ``flip_evidence`` for a caller with another
+    tolerance (the gated attention block's SDPA-stage pin holds the stage's bf16 gradients to the bf16
+    block's bound and must still accept one proven e4m3 flip); ``describe_flip`` is the line printed per fit.
     """
     actual = actual.detach().float()
     expected = expected.detach().float()
@@ -667,12 +707,7 @@ def assert_close_fp8_grad(actual, expected, atol, rtol, tag, budget=1e-5, keys=N
             fits = _flip_evidence(actual, expected, bad_rows, atol, rtol, tag=tag, kind=kind, operand=operand, flip_unit=flip_unit,
                                   fp8_dtype=fp8_dtype, out_dtype=out_dtype, intermediates=intermediates)
             for f in fits or ():
-                print(f"%%%% '{tag}': d-row {f['row']} is ONE flipped fp8 intermediate at (b, hq, i, j)={f['position']}: x={f['x']:+.7g} rounds to "
-                      f"{fp8_dtype} code {f['c_ref']:+g}, the kernel to {f['c_alt']:+g} ({f['off_mid_spacings']:.5f} spacings from their midpoint); "
-                      f"step {f['u']:+g} x flip_unit {float(flip_unit):.5g} x gain {f['gain']:.5g} = {f['step']:+.5g} x operand row {f['operand_row']} "
-                      f"reproduces the row to max |residual| / tol = {f['worst']:.2f}, {f['rounding']:.2f} x the output's own rounding, "
-                      f"and fits it as {f['flips']:.3f} flips"
-                      + (f" ({f['n_tied']} other valid near-midpoint candidate(s) of the reduction, identical operand rows, fit equally)" if f["n_tied"] else ""))
+                print(describe_flip(tag, f, fp8_dtype, flip_unit))
             within_budget = fits is not None
     if not within_budget or bool(nonfinite.any()):
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, equal_nan=False)
