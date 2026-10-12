@@ -40,7 +40,10 @@ def _parse_tensor_dump(line: str) -> Tuple[int, List[int]] | None:
     match = TENSOR_DUMP_PATTERN.search(line)
     if match is None:
         return None
-    return int(match.group(1)), [int(value) for value in json.loads(match.group(2))]
+    try:
+        return int(match.group(1)), [int(value) for value in json.loads(match.group(2))]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 def _apply_tensor_dumps(entry: Tuple[str, dict], tensor_dumps_by_uid: Dict[int, List[int]]) -> Tuple[str, dict]:

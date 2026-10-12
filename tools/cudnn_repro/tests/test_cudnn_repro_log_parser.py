@@ -101,3 +101,22 @@ def test_iter_context_entries_ignores_dumps_for_unknown_gid():
     entries = list(log_parser.iter_context_entries(lines))
 
     assert "pass_by_value" not in entries[-1][1]["tensors"][0]
+
+
+def test_parse_tensor_dump_skips_malformed_data():
+    assert log_parser._parse_tensor_dump("Tensor Dump uid: 3 Data: [1, 2, 3]") == (3, [1, 2, 3])
+    assert log_parser._parse_tensor_dump("Tensor Dump uid: 3 Data: [1, 2, oops]") is None
+    assert log_parser._parse_tensor_dump("Tensor Dump uid: 3 Data: [[1], [2]]") is None
+
+
+def test_iter_context_entries_ignores_malformed_tensor_dump_line():
+    payload1 = payload(11, "SDPA_FWD", "HALF")
+    lines = [
+        json.dumps(payload1),
+        "[cudnn_frontend] INFO: Executing gid 11",
+        "Tensor Dump uid: 3 Data: [1, 2, oops]",
+    ]
+
+    entries = list(log_parser.iter_context_entries(lines))
+
+    assert [p.get("gid") for _, p in entries] == [11]
