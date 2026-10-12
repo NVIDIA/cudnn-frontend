@@ -4,6 +4,8 @@
 // Half dense attention binding for SM90/SM100/SM103/SM107 and SM120/SM121. Pure geometry uses the Python admission
 // predicates on a cache miss; every invocation checks fresh storage observations.
 #include "variant_pack.h"
+#include "sdpa_mxfp8_binding.h"
+#include <memory>
 
 #include <algorithm>
 #include <array>
@@ -51,28 +53,21 @@ enum Role : size_t {
     DescaleV,
     ScaleO,
     AmaxO,
+    SfQ,
+    SfK,
+    SfV,
+    SfO,
     NumRoles
 };
+constexpr size_t MxNumRoles                        = SfO;
+constexpr size_t PerTensorNumRoles                 = SfQ;
 constexpr size_t HalfNumRoles                      = DescaleQ;
-constexpr std::array<const char *, NumRoles> names = {"q",
-                                                      "k",
-                                                      "v",
-                                                      "o",
-                                                      "lse_tensor",
-                                                      "sinks",
-                                                      "seq_kv_lens",
-                                                      "seq_q_lens",
-                                                      "block_table",
-                                                      "block_table_v",
-                                                      "gate",
-                                                      "ragged_q",
-                                                      "ragged_o",
-                                                      "ragged_lse",
-                                                      "descale_q",
-                                                      "descale_k",
-                                                      "descale_v",
-                                                      "scale_o",
-                                                      "amax_o"};
+constexpr std::array<const char *, NumRoles> names = {
+    "q",         "k",           "v",          "o",           "lse_tensor",
+    "sinks",     "seq_kv_lens", "seq_q_lens", "block_table", "block_table_v",
+    "gate",      "ragged_q",    "ragged_o",   "ragged_lse",  "descale_q",
+    "descale_k", "descale_v",   "scale_o",    "amax_o",      "sf_q",
+    "sf_k",      "sf_v",        "sf_o"};
 enum Slot : size_t {
     QPtr,
     KPtr,
@@ -98,6 +93,8 @@ enum Slot : size_t {
     Scale,
     Stream,
     RaggedQPtr,
+    GatePtr,
+    GateStrides,
     NumSlots
 };
 constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k_ptr",
@@ -111,7 +108,8 @@ constexpr std::array<const char *, NumSlots> slot_names = {"q_ptr",           "k
                                                            "table_strides",   "table_v_strides",
                                                            "n_pages",         "problem_size",
                                                            "o_partial_ptr",   "scale_softmax_log2",
-                                                           "stream",          "ragged_q_addr"};
+                                                           "stream",          "ragged_q_addr",
+                                                           "gate_ptr",        "gate_strides"};
 struct BoundGeometry {
     int64_t extent0 = 0, extent1 = 0, need = 0;
     py::tuple bound;
@@ -136,15 +134,28 @@ class SdpaDenseBinder {
         const auto quant = spec.attr("quant");
         quantized_       = !quant.is_none();
         if (quantized_) {
-            if (py::len(quant.attr("sf_sizes")) || !quant.attr("block_output").is_none())
-                invalid("native dense FP8 binding requires per-tensor scales and a scalar output dtype");
+            const auto sf_count = py::len(quant.attr("sf_sizes"));
+            if (sf_count != 0 && sf_count != 2 && sf_count != 3)
+                invalid("native dense FP8 binding requires per-tensor scales or two/three input scale factors");
+            pv_bf16_         = sf_count == 2;
+            const auto block = quant.attr("block_output");
+            block_output_    = !block.is_none();
+            if (block_output_) {
+                block_bytes_     = block.attr("nbytes").cast<int64_t>();
+                output_pack_     = block.attr("pack").cast<int64_t>();
+                block_has_scale_ = block.attr("has_scale").cast<bool>();
+                if (block_bytes_ <= 0 || (output_pack_ != 1 && output_pack_ != 2) || integer("split") != 1 ||
+                    flag("paged") || flag("ragged"))
+                    invalid("native block-scaled output requires a non-paged unsplit dense plan");
+            }
+            if (py::len(quant.attr("sf_sizes"))) mx_scales_ = std::make_unique<SdpaMxScaleBinding>(spec);
             quant_offset_ = quant.attr("scratch_offset").cast<int64_t>();
             add(quant_offset_, 8);
             has_amax_  = quant.attr("has_amax").cast<bool>();
             fill_word_ = py::module_::import("cudnn.frost.buffers").attr("fill_word_async");
         }
-        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink")) || !spec.attr("gate_expect").is_none())
-            invalid("native dense binding requires half attention without split sinks or gate");
+        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink")))
+            invalid("native dense binding requires attention without split sinks");
         const auto dq = integer("d_qk"), dv = integer("d_v");
         if (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8)
             invalid("native dense binding requires a supported half attention head dimension pair");
@@ -191,6 +202,10 @@ class SdpaDenseBinder {
         }
         auto expect  = spec.attr("expect").cast<py::dict>();
         auto combine = spec.attr("combine");
+        if (pv_bf16_ &&
+            (paged_ || ragged_ || split_ != 1 || block_output_ || (dq != 128 && dq != 192) || dv != 128 ||
+             expect["v"].cast<std::string>() != "bfloat16" || expect["o"].cast<std::string>() != "bfloat16"))
+            invalid("native PV-BF16 requires dense unsplit D128/D192x128 with BF16 V/O");
         if (split_ > 1) {
             if (combine.is_none()) invalid("native split binding requires a combine artifact");
             const auto partial_dtype = expect["o"].cast<std::string>();
@@ -214,14 +229,29 @@ class SdpaDenseBinder {
             workspace_bytes_ = add(lse_offset_, multiply(rows, 4));
         }
         for (size_t i = Q; i <= O; ++i) {
-            const auto dtype = i == O && split_ > 1 ? combine.attr("output_dtype").cast<std::string>()
-                                                    : expect[names[i]].cast<std::string>();
-            const bool fp8   = dtype == "float8_e4m3fn" || dtype == "float8_e5m2";
-            if ((quantized_ && i != O) ? !fp8 : (dtype != "float16" && dtype != "bfloat16" && !(quantized_ && fp8)))
+            const auto dtype    = i == O && split_ > 1 ? combine.attr("output_dtype").cast<std::string>()
+                                                       : expect[names[i]].cast<std::string>();
+            const bool fp8      = dtype == "float8_e4m3fn" || dtype == "float8_e5m2";
+            const bool packed_o = i == O && block_output_ && output_pack_ == 2 && dtype == "uint8";
+            if (i == O && block_output_ && !(output_pack_ == 2 ? packed_o : fp8))
+                invalid("block-scaled O dtype does not match its compiled packing");
+            if ((quantized_ && i != O && !(pv_bf16_ && i == V))
+                    ? !fp8
+                    : (!packed_o && dtype != "float16" && dtype != "bfloat16" && !(quantized_ && fp8)))
                 invalid("native dense binding has an unsupported operand dtype");
-            dtype_code_[i] = fp8 ? (dtype == "float8_e4m3fn" ? kDLFloat8_e4m3fn : kDLFloat8_e5m2)
-                                 : (dtype == "float16" ? kDLFloat : kDLBfloat);
-            dtype_bits_[i] = fp8 ? 8 : 16;
+            dtype_code_[i] = packed_o ? kDLUInt
+                             : fp8    ? (dtype == "float8_e4m3fn" ? kDLFloat8_e4m3fn : kDLFloat8_e5m2)
+                                      : (dtype == "float16" ? kDLFloat : kDLBfloat);
+            dtype_bits_[i] = packed_o || fp8 ? 8 : 16;
+        }
+        has_gate_ = !spec.attr("gate_expect").is_none();
+        if (has_gate_) {
+            const auto dtype = spec.attr("gate_expect").cast<std::string>();
+            if ((dtype != "float16" && dtype != "bfloat16") ||
+                (quantized_ ? dtype != "bfloat16" : dtype != expect["q"].cast<std::string>()) || split_ != 1 ||
+                paged_ || ragged_ || block_output_ || dq != 256 || dv != 256)
+                invalid("native epilogue gate requires an existing dense unsplit D256 half/BF16-gate plan");
+            gate_code_ = dtype == "float16" ? kDLFloat : kDLBfloat;
         }
         auto order = spec.attr("order").cast<std::vector<std::string>>();
         if (order.size() != template_.size()) invalid("native dense host template has the wrong size");
@@ -232,12 +262,13 @@ class SdpaDenseBinder {
             // use o_ptr; only FP32 partials require the separate output slot.
             const bool paged_slot = slot >= KTablePtr && slot <= NPages;
             if (found == order.end() && slot != VTableStrides && !(slot == PartialOPtr && !fp32_partial_) &&
-                !(paged_slot && !paged_) && !(slot == RaggedQPtr && !ragged_))
+                !(paged_slot && !paged_) && !(slot == RaggedQPtr && !ragged_) &&
+                !((slot == GatePtr || slot == GateStrides) && !has_gate_))
                 invalid(std::string("native dense host has no argument ") + slot_names[slot]);
             index_[slot] = static_cast<size_t>(found - order.begin());
         }
         if (quantized_) {
-            for (size_t role = DescaleQ; role <= AmaxO; ++role) {
+            for (size_t role = first_scalar_role(); role <= AmaxO; ++role) {
                 const auto name = std::string(names[role]) + "_ptr";
                 auto found      = std::find(order.begin(), order.end(), name);
                 if (found == order.end()) invalid("native dense FP8 host has no argument " + name);
@@ -245,6 +276,11 @@ class SdpaDenseBinder {
             }
             if (split_ > 1 && quant_offset_ < workspace_bytes_)
                 invalid("native dense FP8 split requires partial slabs before scalar scratch");
+            if (block_output_) {
+                const auto found = std::find(order.begin(), order.end(), "sf_o_ptr");
+                if (found == order.end()) invalid("block-scaled output host is missing sf_o_ptr");
+                block_index_ = static_cast<size_t>(found - order.begin());
+            }
         }
         auto prep          = py::module_::import("cudnn.sdpa.fwd.prepared");
         dense_layout_      = prep.attr("_dense_role_layout");
@@ -275,9 +311,17 @@ class SdpaDenseBinder {
     }
     BoundLaunch
     bind_launch(const py::handle &pack, const std::vector<int64_t> &indices, py::object stream, int64_t workspace) {
-        if (indices.size() != (quantized_ ? NumRoles : HalfNumRoles))
+        if (indices.size() != (block_output_ ? NumRoles
+                               : mx_scales_  ? MxNumRoles
+                                             : (quantized_ ? PerTensorNumRoles : HalfNumRoles)))
             invalid("native dense binding has the wrong number of role indices");
-        const auto facts = read_native_operand_views(pack, indices);
+        auto facts = read_native_operand_views(pack, indices);
+        if (block_output_ && output_pack_ == 2 && facts[O].filled && facts[O].dtype.code == kDLFloat4_e2m1fn &&
+            facts[O].dtype.bits == 4 && facts[O].dtype.lanes == 2) {
+            // The observer already normalized FP4 metadata to byte slots.
+            // Change only its storage type, never divide shape/strides twice.
+            facts[O].dtype = DLDataType{static_cast<uint8_t>(kDLUInt), 8, 1};
+        }
         if (split_ > 1) {
             // Adapters check observed workspace bytes; arithmetic is checked here
             // before either launch, including the ragged early no-work return.
@@ -400,7 +444,17 @@ class SdpaDenseBinder {
             if (facts[Sinks].filled) invalid("this specialization was compiled without a sink");
             put(frame, SinksPtr, py::int_(0));
         }
-        if (facts[Gate].filled) invalid("this specialization was compiled without an epilogue gate");
+        if (has_gate_) {
+            operand(facts[Gate], Gate, gate_code_, 16, 16);
+            const auto gate = geometry(facts[Gate], Gate);
+            if (gate.extent0 != b || gate.extent1 != sq) invalid("gate must match q batch and sequence extents");
+            if (!facts[Gate].pointer) invalid("gate must have a non-null address");
+            add(facts[Gate].pointer, multiply(gate.need, 2));
+            put(frame, GatePtr, py::int_(facts[Gate].pointer));
+            put(frame, GateStrides, gate.bound);
+        } else if (facts[Gate].filled) {
+            invalid("this specialization was compiled without an epilogue gate");
+        }
         put(frame, ODescPtr, py::int_(0));
         put(frame, MetaPtr, py::int_(seq_kv_ ? lengths(facts[KVLens], KVLens, b) : 0));
         if (seq_q_) put(frame, QLensPtr, py::int_(lengths(facts[QLens], QLens, b)));
@@ -488,6 +542,49 @@ class SdpaDenseBinder {
     }
 
    private:
+    size_t
+    first_scalar_role() const {
+        return !mx_scales_ ? DescaleQ : block_output_ && block_has_scale_ ? ScaleO : AmaxO;
+    }
+    static int64_t
+    storage_span(const NativeOperandView &f) {
+        if (f.observed_bytes >= 0) return f.observed_bytes;
+        if (!f.stride.empty() && f.stride.size() != f.shape.size())
+            invalid("operand shape and stride must have the same rank");
+        int64_t extent = 1, compact = 1;
+        bool empty = false;
+        for (size_t i = f.shape.size(); i-- > 0;) {
+            if (f.shape[i] < 0 || (!f.stride.empty() && f.stride[i] < 0))
+                invalid("operand geometry must be nonnegative");
+            empty |= f.shape[i] == 0;
+            if (f.shape[i]) extent = add(extent, multiply(f.shape[i] - 1, f.stride.empty() ? compact : f.stride[i]));
+            compact = multiply(compact, f.shape[i]);
+        }
+        return empty ? 0 : multiply(extent, (f.dtype.bits + 7) / 8);
+    }
+    void
+    bind_block_output(const std::vector<NativeOperandView> &facts, py::tuple &frame) const {
+        const auto &f = facts[SfO];
+        if (!f.filled) invalid("block-scaled output requires sf_o");
+        if (f.device_type != -1 && (f.device_type != kDLCUDA || f.device_id != device_))
+            invalid("sf_o must be on this plan's CUDA device");
+        if (f.dtype.bits != 8 || f.dtype.lanes != 1) invalid("sf_o requires byte storage");
+        SdpaMxScaleBinding::storage_bytes(f);  // validate dense physical storage, including axis permutations
+        if (f.observed_bytes >= 0 && f.observed_bytes < block_bytes_)
+            invalid("sf_o storage does not cover the compiled atom layout");
+        if (!f.pointer || f.pointer % 16) invalid("sf_o must be 16-byte aligned");
+        const auto end = add(f.pointer, block_bytes_);
+        for (size_t role = Q; role < facts.size(); ++role) {
+            const auto &other = facts[role];
+            if (role == SfO || !other.filled ||
+                std::find(other.shape.begin(), other.shape.end(), 0) != other.shape.end())
+                continue;
+            const auto bytes = storage_span(other);
+            if (bytes && f.pointer < add(other.pointer, bytes) && other.pointer < end)
+                invalid("sf_o overlaps " + std::string(names[role]));
+        }
+        frame[block_index_] = py::int_(f.pointer);
+    }
     int64_t
     bind_quantized_scalars(const std::vector<NativeOperandView> &facts,
                            py::tuple &frame,
@@ -497,8 +594,8 @@ class SdpaDenseBinder {
         if (!workspace || workspace % 16) invalid("prepared FP8 requires an aligned caller workspace");
         const auto scratch = add(workspace, quant_offset_), identity = add(scratch, 4), end = add(identity, 4);
         int64_t initialize_identity = 0;
-        std::array<int64_t, 5> pointers;
-        for (size_t role = DescaleQ; role <= AmaxO; ++role) {
+        std::array<int64_t, 5> pointers{};
+        for (size_t role = first_scalar_role(); role <= AmaxO; ++role) {
             const auto &f = facts[role];
             int64_t ptr;
             if (!f.filled) {
@@ -518,39 +615,37 @@ class SdpaDenseBinder {
         const auto amax = pointers[AmaxO - DescaleQ], amax_end = add(amax, 4);
         if (facts[AmaxO].filled && workspace < amax_end && amax < end)
             invalid("prepared FP8 workspace overlaps amax_o");
-        for (size_t role = Q; role < NumRoles; ++role) {
+        for (size_t role = Q; role < facts.size(); ++role) {
             const auto &f = facts[role];
             if (!f.filled || role == AmaxO) continue;
-            int64_t bytes = f.observed_bytes;
-            if (bytes < 0) {
-                if (!f.stride.empty() && f.stride.size() != f.shape.size())
-                    invalid("operand shape and stride must have the same rank");
-                int64_t extent = 1, compact = 1;
-                bool empty = false;
-                for (size_t i = f.shape.size(); i-- > 0;) {
-                    if (f.shape[i] < 0 || (!f.stride.empty() && f.stride[i] < 0))
-                        invalid("operand geometry must be nonnegative");
-                    empty |= f.shape[i] == 0;
-                    if (f.shape[i])
-                        extent = add(extent, multiply(f.shape[i] - 1, f.stride.empty() ? compact : f.stride[i]));
-                    compact = multiply(compact, f.shape[i]);
-                }
-                bytes = empty ? 0 : multiply(extent, (f.dtype.bits + 7) / 8);
-            }
+            int64_t bytes = storage_span(f);
+            if (block_output_ && role == SfO) bytes = std::max(bytes, block_bytes_);
             if (!bytes) continue;
             const auto operand_end = add(f.pointer, bytes);
             if (workspace < operand_end && f.pointer < end)
                 invalid("prepared FP8 workspace overlaps " + std::string(names[role]));
             if (amax < operand_end && f.pointer < amax_end) invalid("amax_o overlaps " + std::string(names[role]));
         }
+        if (mx_scales_) {
+            for (size_t role = DescaleQ; role <= ScaleO; ++role)
+                if (facts[role].filled && !(role == ScaleO && block_output_))
+                    invalid("MXFP8 plans do not consume per-tensor input scales");
+            if (block_output_ && facts[ScaleO].filled != block_has_scale_)
+                invalid("scale_o presence must match the block-output specialization");
+            mx_scales_->bind(facts, SfQ, &frame, false, paged_, b_, sq_, sk_, page_size_);
+        } else if (block_output_) {
+            for (size_t role = SfQ; role <= SfV; ++role)
+                if (facts[role].filled) invalid("per-tensor FP8 plans do not consume input scale factors");
+        }
+        if (block_output_) bind_block_output(facts, frame);
         if (split_ > 1) {
             py::tuple expanded(combine.size() + 2);
             for (size_t i = 0; i + 1 < combine.size(); ++i) expanded[i] = combine[i];
             expanded[combine.size() - 1] = has_amax_ ? py::cast(amax) : py::none();
-            expanded[combine.size()]     = py::int_(pointers[ScaleO - DescaleQ]);
+            expanded[combine.size()]     = mx_scales_ ? py::none() : py::cast(pointers[ScaleO - DescaleQ]);
             expanded[combine.size() + 1] = stream;
             combine                      = std::move(expanded);
-            if (dtype_bits_[O] == 8) frame[quant_indices_[ScaleO - DescaleQ]] = py::none();
+            if (!mx_scales_ && dtype_bits_[O] == 8) frame[quant_indices_[ScaleO - DescaleQ]] = py::none();
         }
         return initialize_identity;
     }
@@ -646,11 +741,13 @@ class SdpaDenseBinder {
         } else {
             auto value = dense_layout_(shape_tuple,
                                        stride_tuple,
-                                       role == Q || role == O ? qh_ : kh_,
-                                       role == Q || role == K ? d_qk_ : d_v_,
-                                       role == Q || role == O ? sq_ : sk_,
+                                       role == Q || role == O || role == Gate ? qh_ : kh_,
+                                       role == Q || role == K ? d_qk_
+                                       : role == O            ? d_v_ / output_pack_
+                                                              : d_v_,
+                                       role == Q || role == O || role == Gate ? sq_ : sk_,
                                        b_,
-                                       dtype_bits_[role] / 8,
+                                       role == Gate ? 2 : dtype_bits_[role] / 8,
                                        role != O || split_ == 1,
                                        names[role],
                                        dense_flex_)
@@ -729,9 +826,15 @@ class SdpaDenseBinder {
     }
     py::object fn_, owner_, dense_layout_, pool_layout_, table_layout_, lse_layout_;
     py::object combine_fn_, combine_owner_, fill_word_;
-    bool quantized_ = false, has_amax_ = false;
+    bool quantized_ = false, has_amax_ = false, pv_bf16_ = false;
     int64_t quant_offset_ = 0;
+    bool block_output_ = false, block_has_scale_ = false;
+    bool has_gate_       = false;
+    int gate_code_       = kDLBfloat;
+    int64_t block_bytes_ = 0, output_pack_ = 1;
+    size_t block_index_ = 0;
     std::array<size_t, 5> quant_indices_;
+    std::unique_ptr<SdpaMxScaleBinding> mx_scales_;
     py::object packed_layout_, ragged_lse_layout_;
     py::tuple ragged_divs_;
     py::tuple partial_o_strides_, partial_lse_strides_;

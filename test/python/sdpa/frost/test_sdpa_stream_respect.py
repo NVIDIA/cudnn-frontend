@@ -87,13 +87,16 @@ def test_frost_sdpa_respects_handle_stream_and_is_capturable(d):
             run()
     s.synchronize()
     cg = torch.cuda.CUDAGraph()
-    o_gpu.zero_()
-    with torch.cuda.graph(cg, stream=s):
-        run()
-    o_gpu.zero_()
-    cg.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(o_gpu.float(), ref.float(), rtol=0, atol=0)
+    try:
+        o_gpu.zero_()
+        with torch.cuda.graph(cg, stream=s):
+            run()
+        o_gpu.zero_()
+        cg.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o_gpu.float(), ref.float(), rtol=0, atol=0)
+    finally:
+        cg.reset()
 
 
 def test_frost_sdpa_staged_output_uses_handle_stream():

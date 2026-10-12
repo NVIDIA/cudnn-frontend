@@ -626,19 +626,18 @@ def test_sm90_pending_s_q_above_s_kv_is_ranked_by_the_row_and_declined_at_build(
 # --- Registration and the plans offered for the row -------
 
 
-def test_sm90_is_an_opt_in_row_at_its_shipped_id(monkeypatch):
+def test_sm90_is_a_default_row_at_its_shipped_id(monkeypatch):
     """A shipped slot is fixed forever: an autotune record is ``(engine_id, knobs)`` and downstream
-    caches persist the integer, so the id is pinned here rather than spelled at each use. FROST rows
-    are opt-in, so the row is WITHHELD until the env flag is set -- sdpa/frost/conftest.py sets it
-    for this directory, which is why every case above is offered one at all."""
+    caches persist the integer, so the id is pinned here rather than spelled at each use. The row is
+    offered without the env flag; ``placement._place_sm90_f16`` ranks it against the backend."""
     from cudnn.engines import manifest
 
     family = next(f for f in manifest.MANIFEST if f.name == "frost_sdpa_fwd")
     slot = family.slots[_ROW]
-    assert slot.opt_in and family.engine_id + slot.slot == 20517
+    assert not slot.opt_in and family.engine_id + slot.slot == 20517
     assert _offered_id() == 20517 and manifest.engine_for_id(20517).name == _ROW
     monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", raising=False)
-    assert _ROW not in family.offered_ids(), "an opt-in row must be withheld without the flag"
+    assert family.offered_ids().get(_ROW) == 20517
 
 
 def test_sm90_every_candidate_is_valid():

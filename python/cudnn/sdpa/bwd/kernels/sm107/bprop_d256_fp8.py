@@ -58,7 +58,8 @@ default e4m3 dS -- the bf16-dS twin's sdS is 3 x 32 KiB = 96 KiB @210 and the sl
                                                                                                                           256-B-row view and a 128-B-row view differ)
     4a sK          e4m3 x 128 x 256             32 @144   TMA (box 1,128,1,128 x2) MMA desc, A of BMM1 S  --              128 B, job 1
     4b sV          e4m3 x 128 x 256             32 @176   TMA                      MMA desc, A of BMM1 dP --              128 B, job 1  (alias offset kBufferElems in ELEMENTS)
-    4c sdV (=4a+4b post-loop) OUT x 128 x 256   32|64@144 compute lanes store_swizzled(Swizzle(3,4,3))  TMA store  64 elems = 128 B (bf16) / 64 B (e4m3) per lane per block
+    4c sdV (=4a+4b post-loop) OUT x 128 x 256   32|64|128@144 compute lanes store_swizzled(Swizzle(3,4,3))  TMA store  per lane per block: 64 elems = 128 B (bf16) /
+                                                          64 B (e4m3); fp32 (the GQA fold's partial): 32 elems = 128 B, a 64-col chunk as two subtile halves; slabs 322 KiB
                                                                                                                           Swizzle(3,4,3): row 128 B -> banks spread (job 2) AND matches the s128b store descriptor (job 1)
     5  sStats      fp32 x 2 x 256                2 @208   scheduler lanes (4 B stride, conflict-free)  compute lanes, same address on 32 lanes (broadcast)  LINEAR (job 2 by arithmetic; no descriptor)
     6  sdS         e4m3 x 3 x (128 x 128)       48 @210   compute lanes store_swizzled(Swizzle(3,4,3)) at slot + tid*128 + wg*64 (each wg's 64 q cols =
@@ -201,7 +202,7 @@ from cutlass.experimental.cuda import tensor_map as tmap
 
 from cudnn.frost.compiled_cache import compile_cached as _compile_cached, template_key as _template_key
 from cudnn.frost.tile_dsl.barrier import MBarrier, PipelineState, Producer, Scope, advance, arrive_expect_tx, cga_arrive, cga_wait, wait
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP16, DTYPE_FP32
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mask import (
     MASK_CAUSAL,
@@ -283,7 +284,12 @@ MMA_KIND = nvvm.Tcgen05MMAKind.F8F6F4
 # bf16 GEMM renderings read unchanged; the A/B twin).  The config validated the code; every dS-ring constant below is BPE_DS-driven.
 DS_STORAGE_DTYPE = {DTYPE_BF16: cutlass.BFloat16, DTYPE_E4M3: cutlass.Float8E4M3FN}[CFG.DTYPE_DS]
 DS_IS_FP8: bool = CFG.DTYPE_DS == DTYPE_E4M3
-_OUT_DTYPES = {DTYPE_E4M3: cutlass.Float8E4M3FN, DTYPE_BF16: cutlass.BFloat16, DTYPE_FP16: cutlass.Float16}
+# DTYPE_O: E4M3 = the quantized dV (the sdpa_fp8_backward contract); BF16 / FP16 = the pre-quantization dV_true (the A/B twin and
+# the MHA fold input); FP32 = dV_true UNROUNDED, the per-Q-head partial a GQA fold sums in fp32 and rounds once (a bf16 partial
+# would be rounded a second time by the fold).  The fp32 staging doubles the K + V alias slab to 128 KiB (322 KiB of slabs with the
+# e4m3 dS ring -- config_sm107.smem_layout); its 128-B store rows hold 32 elements, so a 64-column epilogue chunk lands as two
+# subtile halves (`_DV_STORES_PER_CHUNK`).
+_OUT_DTYPES = {DTYPE_E4M3: cutlass.Float8E4M3FN, DTYPE_BF16: cutlass.BFloat16, DTYPE_FP16: cutlass.Float16, DTYPE_FP32: cutlass.Float32}
 OUT_STORAGE_DTYPE = _OUT_DTYPES[CFG.DTYPE_O]
 OUT_IS_FP8: bool = CFG.DTYPE_O == DTYPE_E4M3
 
@@ -313,8 +319,8 @@ TMA_QK_GRANU_ELEMS = _B.TMA_QK_GRANU_ELEMS
 TMA_VO_GRANU_ELEMS = _B.TMA_VO_GRANU_ELEMS
 TMA_VO_SG1_ITERS = _B.TMA_VO_SG1_ITERS  # the dV view: 128 d_v per CTA = 1 subtile
 TMA_VO_SG1_GRANU_ELEMS = _B.TMA_VO_SG1_GRANU_ELEMS
-DV_D_BLOCK = _B.DV_D_BLOCK  # d_v elems per 128-B store subtile: 128 at e4m3 out, 64 at bf16 / fp16 out
-TMA_DV_ITERS = _B.TMA_DV_ITERS  # 2 (e4m3) / 4 (bf16) subtiles per dV row
+DV_D_BLOCK = _B.DV_D_BLOCK  # d_v elems per 128-B store subtile (dV_SWZ_BYTES / BPE_O): 128 at e4m3 out, 64 at bf16 / fp16, 32 at the fp32 partial
+TMA_DV_ITERS = _B.TMA_DV_ITERS  # 2 (e4m3) / 4 (bf16, fp16) / 8 (fp32) subtiles per dV row
 DV_BLOCK_SLAB = _B.DV_BLOCK_SLAB  # TILE_M x DV_D_BLOCK: one store subtile's slab
 P_TMA_ITERS = _B.P_TMA_ITERS  # dS store subtiles per 128-col row: 1 at e4m3 (one 128-B row), 2 at bf16
 P_D_BLOCK = _B.P_D_BLOCK  # q cols per dS subtile: 128 at e4m3 (both warpgroups' halves in one row), 64 at bf16 (one half)
@@ -348,12 +354,17 @@ SMEM_LAYOUT_dV = _B.SMEM_LAYOUT_dV
 # MBase + SShift = 4 + 3 = 7 = log2(128 B), so 32 lanes writing one row each hit 32 different bank groups (job 2), and it
 # is the s128b pattern the TMA-store descriptors of both buffers decode (job 1).  Both jobs by ONE swizzle.
 STAGING_SMEM_SWIZZLE = cutlass.Swizzle(3, 4, 3)
-_DV_EPI_CHUNK = 64  # d_v cols per epilogue TMEM load / store (register cap); each wg owns TILE_O / SOFTMAX_WARPGROUPS
+_DV_EPI_CHUNK = 64  # d_v cols per epilogue TMEM load (register cap); each wg owns TILE_O / SOFTMAX_WARPGROUPS
 _DV_CHUNKS_PER_WG = (CFG.TILE_O // CFG.SOFTMAX_WARPGROUPS) // _DV_EPI_CHUNK  # 2
-if (CFG.TILE_O // CFG.SOFTMAX_WARPGROUPS) % _DV_EPI_CHUNK or DV_D_BLOCK % _DV_EPI_CHUNK:
+# A chunk's store: ONE store_swizzled when the chunk fits a 128-B subtile row (e4m3: 128 cols per row, bf16: 64); at fp32 a row holds
+# 32 cols, so the chunk lands as two 32-col halves in ADJACENT subtile slabs (DV_BLOCK_SLAB apart) -- never one 256-B store
+# straddling two rows.  Both directions must divide: a chunk is whole rows or a row is whole chunks.
+if (CFG.TILE_O // CFG.SOFTMAX_WARPGROUPS) % _DV_EPI_CHUNK or (DV_D_BLOCK % _DV_EPI_CHUNK and _DV_EPI_CHUNK % DV_D_BLOCK):
     raise ValueError(
         f"{__name__}: the dV epilogue walks {_DV_EPI_CHUNK}-col chunks; TILE_O/WGS={CFG.TILE_O // CFG.SOFTMAX_WARPGROUPS}, DV_D_BLOCK={DV_D_BLOCK}"
     )
+_DV_STORES_PER_CHUNK = max(1, _DV_EPI_CHUNK // DV_D_BLOCK)  # 1 (e4m3 / bf16 / fp16), 2 (fp32)
+_DV_STORE_ELEMS = _DV_EPI_CHUNK // _DV_STORES_PER_CHUNK  # 64, or 32 at fp32 = one full 128-B row
 if P_D_BLOCK % _SMX_CHUNK:
     raise ValueError(
         f"{__name__}: a dS store subtile ({P_D_BLOCK} q cols) must be whole warpgroup q halves ({_SMX_CHUNK}); each wg stores its half at col_in_blk = q_half % P_D_BLOCK"
@@ -771,7 +782,8 @@ def _kernel(
     # cells to different bytes for the 256-B-row and the 128-B-row interpretations).
     sdOdv_raw = cutlass.Array(STORAGE_DTYPE, CFG.STAGES_dO_DV * dOBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     # K + V backing: sK [0, kBufferElems) | sV [kBufferElems, +vBufferElems) during the q loop; the dV epilogue staging
-    # ALIASES it post-loop (K, V dead).  Byte-sized for max(K + V, dV @ BPE_O) -- equal at bf16 out, dV smaller at e4m3.
+    # ALIASES it post-loop (K, V dead).  Byte-sized for max(K + V, dV @ BPE_O) -- equal at bf16 out, dV smaller at e4m3, dV
+    # twice K + V at the fp32 partial (128 KiB; the slabs after it move up, no descriptor root does).
     _KV_ALIAS_ELEMS = max((kBufferElems + vBufferElems) * CFG.BPE, dVBufferElems * CFG.BPE_O)
     sExcl_raw = cutlass.Array(STORAGE_DTYPE, _KV_ALIAS_ELEMS, alignment=1024, space=cutlass.AddressSpace.smem)
     sK_raw = cutlass.Array(sExcl_raw.data_ptr(), shape=kBufferElems, dtype=STORAGE_DTYPE)
@@ -1269,12 +1281,19 @@ def _softmax_warp_group(
             if cutlass.const_expr(OUT_IS_FP8):
                 dv_out = (dv_true * dv_out_scale).to(OUT_STORAGE_DTYPE)  # dV_q = e4m3(dV_true * scale_dV)
             else:
-                dv_out = dv_true.to(OUT_STORAGE_DTYPE)  # pre-quantization bf16 / fp16 output (the A/B path)
-            dv_blk = gcol // cutlass.Int32(DV_D_BLOCK)
-            dv_col_in_blk = gcol - dv_blk * cutlass.Int32(DV_D_BLOCK)
-            (sdV_raw.subview(dv_blk * cutlass.Int32(DV_BLOCK_SLAB) + tid_in_wg * cutlass.Int32(DV_D_BLOCK) + dv_col_in_blk)).data_ptr().store_swizzled(
-                dv_out, alignment=_DV_EPI_CHUNK * CFG.BPE_O, swizzle=STAGING_SMEM_SWIZZLE
-            )
+                # pre-quantization bf16 / fp16 output (the A/B path), or the UNROUNDED fp32 partial (`.to(Float32)` is the identity)
+                dv_out = dv_true.to(OUT_STORAGE_DTYPE)
+            for _s in cutlass.range_constexpr(_DV_STORES_PER_CHUNK):
+                scol = gcol + cutlass.Int32(_s * _DV_STORE_ELEMS)
+                if cutlass.const_expr(_DV_STORES_PER_CHUNK == 1):
+                    dv_piece = dv_out
+                else:
+                    dv_piece = cutlass.Vector.from_elements(tuple(dv_out[_s * _DV_STORE_ELEMS + i] for i in range(_DV_STORE_ELEMS)), OUT_STORAGE_DTYPE)
+                dv_blk = scol // cutlass.Int32(DV_D_BLOCK)
+                dv_col_in_blk = scol - dv_blk * cutlass.Int32(DV_D_BLOCK)
+                (sdV_raw.subview(dv_blk * cutlass.Int32(DV_BLOCK_SLAB) + tid_in_wg * cutlass.Int32(DV_D_BLOCK) + dv_col_in_blk)).data_ptr().store_swizzled(
+                    dv_piece, alignment=_DV_STORE_ELEMS * CFG.BPE_O, swizzle=STAGING_SMEM_SWIZZLE
+                )
         nvvm.fence_proxy("async.shared", space="cta")
         bars.mb_dv_stg_full.arrive()
         # Free the dV TMEM for the next kv tile's P.dO[0] (accumulate=False) overwrite.

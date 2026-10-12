@@ -29,7 +29,8 @@ Three tiers:
 - Graph API: decode / MTP shapes select the decode tile (partially packed GQA
   groups included), a prefill shape keeps
   the prefill tile, a pinned cga=2 on a decode shape is honored, a chunked-prefill
-  THD graph declines cga=1 while FlashInfer's ragged paged graph at one token per
+  THD graph uses the two-slab cga=1 prefill body on SM100 (declines on SM103),
+  while FlashInfer's ragged paged graph at one token per
   sequence rides the ragged-Q leg (int32 / int64 offsets, an empty sequence, no
   Stats), dense (non-paged) padded decode, a dense MTP graph whose keyless rows
   carry a sink, a small-batch split, and CUDA-graph replay under
@@ -185,7 +186,7 @@ def test_standalone_cga_domain_admits_cga1_on_d128_f16_only():
         2,
     ), "per-tensor FP8 d128: cga1 is a prefill CTA, not a decode tile"
     assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 0), pertensor=False) == (2,), "MXFP8 d128 keeps the prefill pair"
-    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (2,), "no Rubin sibling of the decode tile"
+    assert supported_cgas_for((128, 128), fp8=False, device_cc=(10, 7)) == (1, 2), "cc 10.7 loads the same decode tile compiled for sm_107a (issue #1472)"
     assert supported_cgas_for((256, 256), fp8=False, device_cc=(10, 0)) == (2,)
 
 
@@ -243,7 +244,8 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
     # The fit is judged on PACK_G, not G: 96/8 at S_q=33 overflows the packed tile
     # (33 * 4 = 132 > 128) while 33 unpacked rows fit; at S_q=32 both legs fit.
     glm33 = _plans(_facts(s_q=33, h_q=96, h_kv=8))
-    assert all(p.knobs.cga == (2 if p.knobs.pack_gqa else 1) for p in glm33), [p.knobs for p in glm33]
+    assert all(p.knobs.cga == 1 for p in glm33 if not p.knobs.pack_gqa), [p.knobs for p in glm33]
+    assert {p.knobs.cga for p in glm33 if p.knobs.pack_gqa} == {1, 2}, [p.knobs for p in glm33]
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=32, h_q=96, h_kv=8)))
     # 24/8: G=3 shares no factor with the tile -- unpacked only, decode tile.
     assert all((p.knobs.cga, p.knobs.pack_gqa) == (1, False) for p in _plans(_facts(h_q=24, h_kv=8)))
@@ -255,15 +257,17 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
 
 @pytest.mark.L0
 def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
-    """S_q * G > 128 on the packed leg, prefill shapes, THD and the other
+    """S_q * G > 128 on the packed leg and dense prefill shapes list both widths
+    (the wave rule picks the lead, issue #1518); THD, paged K/V and the other
     flavors stay on cga2.  The unpacked runner-up of an overflowing packed leg
     is judged on ITS rows (S_q per head): see
     test_heuristics_decode_geometry_follows_the_selected_packing."""
     nine = _plans(_facts(s_q=9))  # 9 * 16 = 144 packed rows; 9 unpacked
-    assert all(p.knobs.cga == 2 for p in nine if p.knobs.pack_gqa), "the packed legs overflow one tile"
+    assert {p.knobs.cga for p in nine if p.knobs.pack_gqa} == {1, 2}, "the packed legs overflow one tile: both widths"
     assert all(p.knobs.cga == 1 for p in nine if not p.knobs.pack_gqa), "the unpacked runner-up fits one tile"
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=512, h_q=8, h_kv=8, s_kv=512, padded=False)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=2048, causal=True, padded=False)))
+    assert {p.knobs.cga for p in _plans(_facts(s_q=512, h_q=8, h_kv=8, s_kv=512, padded=False))} == {1, 2}
+    assert {p.knobs.cga for p in _plans(_facts(s_q=2048, causal=True, padded=False))} == {1, 2}
+    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=9, has_paged_kv=True, page_size=16)) if p.knobs.pack_gqa)
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(h_q=32, h_kv=2, d_qk=256, d_v=256)))
     # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
@@ -278,24 +282,25 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
 def test_heuristics_decode_geometry_follows_the_selected_packing():
     """Review (PR #1094): the decode-tile fit is decided per CANDIDATE from its
     own packing, not once per graph from PackGQA eligibility.  G=16, S_q=16:
-    the packed leg carries 256 rows (prefill tile, and it still leads), the
-    unpacked runner-up 16 rows per head (decode tile) -- before the fix both
-    rode cga2 because the fit was computed as if every candidate were packed.
-    At S_q > 128 no leg fits; the heur_mode B fallback (unpacked, unsplit)
-    follows its own rows too; every emitted set re-validates."""
+    the packed leg carries 256 rows (it still leads, at either width: past one
+    tile both are listed, issue #1518), the unpacked runner-up 16 rows per head
+    (decode tile) -- before the fix both rode cga2 because the fit was computed
+    as if every candidate were packed.  At S_q > 128 no leg fits; the heur_mode
+    B fallback (unpacked, unsplit) follows its own rows too; every emitted set
+    re-validates."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.heuristics import recommend
 
     plans = _plans(_facts(s_q=16))
     legs = [(p.knobs.pack_gqa, p.knobs.cga) for p in plans]
-    assert legs[0] == (True, 2), legs
-    assert (False, 1) in legs and (False, 2) not in legs and (True, 1) not in legs, legs
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129))), "129 rows overflow one tile unpacked too"
+    assert legs[0][0] is True, legs
+    assert (False, 1) in legs and (False, 2) not in legs and {(True, 1), (True, 2)} <= set(legs), legs
+    assert {p.knobs.cga for p in _plans(_facts(s_q=129))} == {1, 2}, "129 rows overflow one tile unpacked too: both widths"
     fallback = recommend("B", _facts(s_q=16), {ENGINE: _SM100_ID})
     assert [(p.knobs.pack_gqa, p.knobs.cga) for p in fallback] == [(False, 1)], fallback
     # MHA has no group: one rule for the only leg.
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=64, h_q=8, h_kv=8)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129, h_q=8, h_kv=8)))
+    assert {p.knobs.cga for p in _plans(_facts(s_q=129, h_q=8, h_kv=8))} == {1, 2}
     caps = next(spec for spec in engines.ENGINE_SPECS if spec.name == ENGINE).capabilities
     for f in (_facts(s_q=16), _facts(s_q=9, causal=True, bottom_right=True)):
         for p in _plans(f):
@@ -870,8 +875,7 @@ def test_graph_small_batch_decode_splits_kv():
 
 @pytest.mark.L0
 def test_graph_thd_queries_never_get_the_decode_tile():
-    """Ragged (THD) queries over a paged cache: no cga=1 plan is offered for the
-    engine (the decode tile has no THD leg), and a pinned cga=1 declines."""
+    """An explicit single-CTA multi-query THD plan is prefill, never the decode tile."""
     import cudnn
     import cudnn.sdpa  # noqa: F401
     from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
@@ -923,15 +927,18 @@ def test_graph_thd_queries_never_get_the_decode_tile():
     g = _build()
     g.create_execution_plans([cudnn.heur_mode.A])
     assert offers_engine(g, ENGINE)
-    cgas = {g.plans[i].knobs.cga for i in range(len(g.plans)) if g.get_plan_name_at_index(i).startswith(ENGINE)}
-    assert cgas == {2}, f"THD must stay on the prefill tile; offered cga domain {cgas}"
-    # Pinned cga=1 on the THD graph is a typed decline, not a silent substitution.
+    # SM100 admits the two-slab single-CTA prefill body; SM103 keeps its existing domain.
     g2 = _build()
     g2.create_execution_plan(_SM100_ID, SdpaFwdKnobs(sched_policy=0, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1))
     g2.select_plan(0)
-    with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+    if torch.cuda.get_device_capability() == (10, 0):
         g2.check_support()
         g2.build_plans()
+        assert g2._compiled_plans[0]._compiled.kernel_template == "prefill_d128_f16"
+    else:
+        with pytest.raises((cudnn.cudnnGraphNotSupportedError, NotImplementedError, ValueError), match="decode tile|THD"):
+            g2.check_support()
+            g2.build_plans()
 
 
 # --- the ragged-Q leg: ragged Q/O/Stats over paged K/V at S_q(max) == 1 (nvbug 6607857) ---
@@ -1005,7 +1012,7 @@ def test_ragged_q_leg_predicate_and_heuristics():
     """engines._thd_decode_leg admits exactly FlashInfer's shape (ragged Q/O/Stats,
     paged, S_q(max) == 1, d128 half, one offset width whose multiplier divides the
     row) and the heuristics then propose the decode tile with PackGQA and a split
-    of at least 2. Multi-token THD has a separate packed split admission."""
+    of at least 2. Multi-token THD also admits the unsplit SM100 prefill tile."""
     import cudnn
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.engines import _thd_decode_leg, _thd_decode_leg_divisors, _thd_decode_leg_int64
@@ -1046,14 +1053,16 @@ def test_ragged_q_leg_predicate_and_heuristics():
     mtp = _ragged_paged_facts(s_q=2)
     mtp_plans = _plans(mtp)
     assert mtp_plans and all(engines.mismatch(caps, mtp, p.knobs) is None for p in mtp_plans)
-    # mismatch: cga=1 needs the split; cga=2 is the prefill THD leg (unsplit, unpacked).
+    # Q=1 at cga=1 still needs the decode split; cga=2 serves unsplit THD.
+    # Multi-token SM100 can also use the cga=1 prefill tile without a split.
     K = engines.SdpaFwdKnobs
     assert "split_kv >= 2" in (engines.mismatch(caps, leg, K(cga=1, split_kv=1)) or "")
     assert engines.mismatch(caps, leg, K(cga=1, split_kv=4, pack_gqa=True)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=1)) is None
     assert engines.mismatch(caps, leg, K(cga=2, split_kv=2)) is not None, "the prefill THD leg cannot split"
     assert engines.mismatch(caps, mtp, K(cga=1, split_kv=2)) is None
-    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is not None
+    assert engines.mismatch(caps, mtp, K(cga=1, split_kv=1)) is None
+    assert engines.mismatch(caps, _ragged_paged_facts(s_q=2, device_cc=(10, 3)), K(cga=1, split_kv=1)) is not None
     assert engines.mismatch(caps, mtp, K(cga=2, split_kv=1)) is None
 
 
@@ -1384,22 +1393,25 @@ def test_adapter_decode_tile_cuda_graph_replay_no_host_sync():
         api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
-    prev_sync_mode = torch.cuda.get_sync_debug_mode()
-    with torch.cuda.graph(g, stream=s):
-        torch.cuda.set_sync_debug_mode("error")
-        try:
-            api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
-        finally:
-            torch.cuda.set_sync_debug_mode(prev_sync_mode)
-    scale = 1.0 / math.sqrt(D)
-    for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
-        seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
-        g.replay()
-        torch.cuda.synchronize()
-        for b in range(B):
-            ref_o, ref_lse = _ref(
-                q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
-            )
-            torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
-            live = ~torch.isinf(ref_lse)
-            torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    try:
+        prev_sync_mode = torch.cuda.get_sync_debug_mode()
+        with torch.cuda.graph(g, stream=s):
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                api.execute(q_gpu, k_c, v_c, o_gpu, lse_tensor=lse, seq_kv_lens=seq_lens, seq_q_lens=seq_q, block_table=bt, workspace=ws)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev_sync_mode)
+        scale = 1.0 / math.sqrt(D)
+        for new_lens in ([5, 1024, 77, 128, 129, 1, 512, 1000], [1024] * B, [0, 1, 2, 3, 4, 5, 6, 7]):
+            seq_lens.copy_(torch.tensor(new_lens, dtype=torch.int32))
+            g.replay()
+            torch.cuda.synchronize()
+            for b in range(B):
+                ref_o, ref_lse = _ref(
+                    q_gpu[b].transpose(0, 1), _gather_kv(k_pool, bt[b], new_lens[b], False), _gather_kv(v_pool, bt[b], new_lens[b], False), 1, scale
+                )
+                torch.testing.assert_close(o_gpu[b].transpose(0, 1).float(), ref_o, atol=2e-2, rtol=0)
+                live = ~torch.isinf(ref_lse)
+                torch.testing.assert_close(lse[b][live], ref_lse[live], atol=5e-3, rtol=0)
+    finally:
+        g.reset()

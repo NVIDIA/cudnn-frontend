@@ -78,9 +78,10 @@ class FixedSdpaOperands {
             } else if (op.dtype == "float16" || op.dtype == "float32") {
                 op.code = kDLFloat;
                 op.bits = op.dtype == "float16" ? 16 : 32;
-            } else if (op.dtype == "int32") {
+            } else if (op.dtype == "int32" || op.dtype == "int64") {
+                // int64: bound ragged offsets (graph THD ports read on device).
                 op.code = kDLInt;
-                op.bits = 32;
+                op.bits = op.dtype == "int32" ? 32 : 64;
             } else {
                 invalid("native fixed binding does not support " + op.dtype);
             }

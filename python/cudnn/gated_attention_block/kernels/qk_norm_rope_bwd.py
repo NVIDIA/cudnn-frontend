@@ -55,6 +55,28 @@ the dW partial -- the select sits BEFORE the FMA, so a NaN dead row cannot poiso
 dW (the same row-validity gate the SDPA epilogues put on amax). Folded out
 when ``seq_lens`` is None.
 
+**The amax fold (``want_amax``; the quantized backward).** With ``amax_out`` bound every
+lane folds ``max |x|`` over the words it STORED into the three bands (the packed io-dtype
+words, unpacked -- exactly what the ``dqkvg`` quantize reads next; the V class's raw copied
+words likewise), valid rows only, across its whole persistent loop; at CTA end a warp
+butterfly, the warps combined through ``sRed`` behind one barrier, and thread 0 STORES
+``amax_out[cta]`` -- one PER-CTA PARTIAL per grid block (``n_ctas_q + n_ctas_k + n_ctas_v``
+words, every one overwritten; ``n_amax_partials_for``), a plain store, no atomic, no
+pre-zeroed slot.  The consumer (the quantized backward's fused epilogue) reduces these
+partials together with the gate backward's GATE-band partials; ``max`` is order-free, so the
+result is bitwise the standalone amax pass over the whole ``dqkvg`` slab -- and no second
+read of the slab exists.  (The fold shipped first as one ``atomicMax`` per warp into one
+slot; same-address atomics serialise at the L2 -- MEASURED on Rubin, the standalone pass
+ran 4.3x slower that way -- so every producer of the block's amax now writes partials.)
+Needs ``threads_per_cta % 32 == 0``; folded out when ``amax_out`` is None.
+
+**The dW reduce's per-column body** (``dw_reduce_column``) is a ``@cute.jit`` function
+taking the column, the row-lane and the SMEM array, so the quantized backward's fused
+epilogue launch (``fp8_bwd_fused.py``) runs it at ``cols = 1`` behind a block-range
+dispatch: every column's sum is the SAME fixed-order fp32 chain whatever ``cols`` is
+(the lanes are the residue classes; ``cols`` only decides how many columns share a
+block), so the two launch shapes are bitwise.
+
 SMEM buffer table (``rows_per_group in {1, 2}`` leaves it unchanged):
 
     buffer       dtype/elems/bytes            writer, how                          reader, how                       per-lane stride   swizzle + why
@@ -69,7 +91,12 @@ SMEM buffer table (``rows_per_group in {1, 2}`` leaves it unchanged):
 ``want_dw``), and handed to ``_row_class``: that body is inlined once per class
 arm, so an allocation inside it ships one instance PER ARM (Q and K = 8 KiB,
 read off the pre-fix artifact's MLIR ``constant(8192 : i64)``) -- the table
-above is the contract, 4 KiB at D=256.
+above is the contract, 4 KiB at D=256.  Under ``want_amax`` a second array, allocated the
+same way::
+
+    sRed         fp32, warps (4 at 128 thr),  lane 0 of every warp at CTA end:      thread 0 after its barrier: the    one word per      NONE -- 4 words, one
+                 16 B                         its warp's max |stored words|          warps words, max in fixed order,   warp (lane 0      wavefront each way
+                                                                                     one st.global (amax_out[cta])      only)
 
 Barrier table:
 
@@ -79,7 +106,12 @@ Barrier table:
                                   thread count (the persistent loop bound is                                          after the        generic proxy on both sides:
                                   CTA-uniform, so every thread reaches it)                                            row loop         no fence_proxy
 
-No mbarrier, no TMA. The barrier and the SMEM exist only under ``want_dw``.
+    nvvm.barrier_cta_sync()       ALL threads_per_cta threads (the same argument);      thread 0's ld.shared of       ONE per CTA,     under want_amax: after every
+    (bar.sync 0)                  SUM(issuing lanes) = 128                              sRed[0 .. warps)              at the tail      warp's sRed store, before
+                                                                                                                                       thread 0's loads; generic proxy
+
+No mbarrier, no TMA. The dW barrier and ``sDwPartial`` exist only under ``want_dw``, the amax barrier and ``sRed`` only
+under ``want_amax`` (two barriers at the tail of a CTA that has both; each is reached by every thread).
 
 **Bytes.** ``moved_bytes``: Q/K rows read dy and x and write dx (3 passes) plus
 4 B rstd per row; V rows read + write (2 passes): 54408 B per token at 397B
@@ -115,10 +147,19 @@ from cutlass.experimental import primitives as nvvm
 
 from cudnn.frost.device import current_device, multiprocessor_count
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, lane_group_sum, opaque_f32_zero
+from cudnn.frost.tile_dsl.pointwise import (
+    abs_max_tree,
+    f16x2_to_f32,
+    fmax_f32,
+    fp32_to_fp16,
+    lane_group_sum,
+    opaque_f32_zero,
+    warp_abs_max_f32_shfl,
+)
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, ld_shared_v4, st_global, st_global_v4, st_shared_v4
 
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, _fake, fake_rowmajor_dynamic_token_stride, lanes_per_row, validate_shape, vec_chunks
+from .quantize import check_partials
 from .sigmoid_gate_bwd import _check_one_cuda_device, _check_row_layout
 
 DEFAULT_THREADS_PER_CTA = 128
@@ -210,7 +251,9 @@ __all__ = [
     "DEFAULT_THREADS_PER_CTA",
     "QkNormRopeBwdRecipe",
     "compile_qk_norm_rope_bwd",
+    "dw_reduce_column",
     "moved_bytes",
+    "n_amax_partials_for",
     "n_ctas_for",
     "run_dw_norm_reduce",
     "run_qk_norm_rope_bwd",
@@ -252,6 +295,9 @@ def _row_class(
     has_seq_lens: cutlass.Constexpr[bool],
     is_copy: cutlass.Constexpr[bool],
     sdw,  # the ONE sDwPartial SMEM Array of the kernel (None without want_dw)
+    mAmaxOut: Optional[cute.Tensor],  # [>= grid] fp32: partials[cta] = max |stored words| of this CTA (plain store at CTA end); None = no fold
+    cta: cutlass.Int32,  # the GRID-level block index: the partial this CTA owns
+    sred,  # the ONE sRed SMEM Array of the kernel, fp32 [warps] (None without want_amax)
 ) -> None:
     """The persistent loop of ONE row class (Q, K or V) for one CTA.
 
@@ -271,10 +317,12 @@ def _row_class(
     half_lanes = cutlass.const_expr(rope_lanes // 2)
     n_acc = cutlass.const_expr(chunks * ELEMS_PER_ACCESS)
 
+    want_amax = cutlass.const_expr(mAmaxOut is not None)
     _h = cutlass.Int32(h_ct) if cutlass.const_expr(const_head_count) else h
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     lane = tidx % cutlass.Int32(lanes)
     grp = tidx // cutlass.Int32(lanes)
+    warp_lane = tidx % cutlass.Int32(32)
     lane_off = lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
     bpe = cutlass.Int64(_BPE)
     d64 = cutlass.Int64(d)
@@ -285,6 +333,8 @@ def _row_class(
     # ONE [D] dW accumulator per lane (8 fp32 per chunk), live across the whole
     # persistent loop: the class is CTA-uniform, so it never mixes Q and K.
     dw_acc = [cutlass.Float32(0.0) for _ in range(n_acc)]
+    # The amax fold of the STORED words, per lane across the whole loop (want_amax only; module docstring).
+    amax_lane = opaque_f32_zero()
 
     for it in cutlass.range(n_iters):
         g_idx = cta_in_class + it * n_ctas_class
@@ -344,13 +394,21 @@ def _row_class(
             if cutlass.const_expr(is_copy):
                 # V class: dx = dy, bit-exact. The dead-row select is on the raw words
                 # (0x00000000 == two +0.0 halves in either io dtype).
+                stored = []
                 for c in cutlass.range_constexpr(chunks):
                     words = list(dys[r][c])
                     if cutlass.const_expr(has_seq_lens):
                         words = [(cutlass.Int32(0) if deads[r] else w) for w in words]
+                    stored.append(words)
                     if valid:
                         off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
                         st_global_v4(out_addrs[r] + off, words, cutlass.Int32)
+                if cutlass.const_expr(want_amax):
+                    # max |dV| over the STORED words (what the dqkvg quantize reads next), valid rows only
+                    row_amax = abs_max_tree(
+                        [v for c in range(chunks) for w in range(ELEMS_PER_ACCESS // 2) for v in f16x2_to_f32(stored[c][w], dtype=io_dtype)]
+                    )
+                    amax_lane = fmax_f32(amax_lane, row_amax) if valid else amax_lane
             else:
                 g = [list(dys[r][c]) for c in range(chunks)]
                 if cutlass.const_expr(rope_dim > 0):
@@ -409,14 +467,34 @@ def _row_class(
                     for c in cutlass.range_constexpr(chunks):
                         for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
                             dx[c][i] = zero if deads[r] else dx[c][i]
+                # ONE rounding at the store: the packed io-dtype words (also what the amax fold reads back)
+                packed = [[fp32_to_fp16(dx[c][2 * i], dx[c][2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)] for c in range(chunks)]
                 if valid:
                     for c in cutlass.range_constexpr(chunks):
                         off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
-                        st_global_v4(
-                            out_addrs[r] + off,
-                            [fp32_to_fp16(dx[c][2 * i], dx[c][2 * i + 1], dtype=io_dtype) for i in range(ELEMS_PER_ACCESS // 2)],
-                            cutlass.Int32,
-                        )
+                        st_global_v4(out_addrs[r] + off, packed[c], cutlass.Int32)
+                if cutlass.const_expr(want_amax):
+                    # max |dx| over the STORED words (unpacked), valid rows only -- a dead row's dx is the selected zero
+                    row_amax = abs_max_tree(
+                        [v for c in range(chunks) for w in range(ELEMS_PER_ACCESS // 2) for v in f16x2_to_f32(packed[c][w], dtype=io_dtype)]
+                    )
+                    amax_lane = fmax_f32(amax_lane, row_amax) if valid else amax_lane
+
+    # --- CTA end: the amax fold -- every lane of the warp reaches the butterfly (the loop bound is CTA-uniform; the
+    # row loop diverges only around stores); the warps combine through sRed behind ONE barrier (barrier table) and
+    # thread 0 STORES this CTA's partial -- a plain store, no atomic (module docstring) ----
+    if cutlass.const_expr(want_amax):
+        warps = cutlass.const_expr(threads_per_cta // 32)
+        warp_id = tidx // cutlass.Int32(32)
+        warp_amax = warp_abs_max_f32_shfl(amax_lane)
+        if warp_lane == cutlass.Int32(0):
+            sred.subview(warp_id).store(warp_amax)
+        nvvm.barrier_cta_sync()
+        if tidx == cutlass.Int32(0):
+            m = sred.subview(0).load()
+            for w in cutlass.range_constexpr(1, warps):
+                m = fmax_f32(m, sred.subview(w).load())
+            st_global(mAmaxOut.iterator.toint() + cta.to(cutlass.Int64) * cutlass.Int64(4), m, cutlass.Float32)
 
     # --- CTA end: combine the four lane groups' dW in FIXED order, store the partial ----
     if cutlass.const_expr(want_dw):
@@ -467,6 +545,7 @@ def frost_qk_norm_rope_bwd(
     mDWq: Optional[cute.Tensor],  # [n_ctas_q, D] fp32 per-CTA partials (None: no dW)
     mDWk: Optional[cute.Tensor],  # [n_ctas_k, D]
     mSeqLens: Optional[cute.Tensor],  # [B] int32, or None (dense: the select is folded out)
+    mAmaxOut: Optional[cute.Tensor],  # [>= n_ctas_q + n_ctas_k + n_ctas_v] fp32 OUT: per-CTA partials of max |stored dqkvg words|; None = no fold
     n_ctas_q: cutlass.Int32,
     n_ctas_k: cutlass.Int32,
     n_ctas_v: cutlass.Int32,
@@ -508,6 +587,9 @@ def frost_qk_norm_rope_bwd(
     # 128 threads). Allocated here, not in _row_class: that body is inlined per
     # class arm and an allocation inside it ships once per arm (8 KiB).
     sdw = cutlass.Array(cutlass.Float32, (threads_per_cta // lanes) * d, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(want_dw) else None
+    # The ONE sRed of the amax fold (SMEM table): the warp maxima, combined by thread 0 into this CTA's partial.
+    want_amax = cutlass.const_expr(mAmaxOut is not None)
+    sred = cutlass.Array(cutlass.Float32, threads_per_cta // 32, alignment=16, space=cutlass.AddressSpace.smem) if cutlass.const_expr(want_amax) else None
 
     if cta < n_ctas_q:
         # ---- Q class -------------------------------------------------------------
@@ -551,6 +633,9 @@ def frost_qk_norm_rope_bwd(
             has_seq_lens,
             False,
             sdw,
+            mAmaxOut,
+            cta,
+            sred,
         )
     else:
         if cta < n_ctas_q + n_ctas_k:
@@ -596,6 +681,9 @@ def frost_qk_norm_rope_bwd(
                 has_seq_lens,
                 False,
                 sdw,
+                mAmaxOut,
+                cta,
+                sred,
             )
         else:
             # ---- V class: the band copy (no norm, no RoPE, no dW) --------------------
@@ -635,54 +723,33 @@ def frost_qk_norm_rope_bwd(
                 has_seq_lens,
                 True,
                 sdw,
+                mAmaxOut,
+                cta,
+                sred,
             )
 
     if cutlass.const_expr(use_pdl):
         launch_dependent_grids()
 
 
-@cute.kernel
-def frost_dw_norm_reduce(
-    mPq: cute.Tensor,  # [n_q, D] fp32 partials
-    mPk: cute.Tensor,  # [n_k, D]
-    mDWq: cute.Tensor,  # [D] fp32 OUT (overwritten)
-    mDWk: cute.Tensor,  # [D]
-    n_q: cutlass.Int32,
-    n_k: cutlass.Int32,
+@cute.jit
+def dw_reduce_column(
+    p_base: cutlass.Int64,  # this class's [n, D] fp32 partials plane
+    o_base: cutlass.Int64,  # this class's [D] fp32 output
+    n: cutlass.Int32,  # the plane's rows
+    col: cutlass.Int32,  # the column this thread sums (>= d: an idle thread that still takes the barrier)
+    l: cutlass.Int32,  # the row-lane (residue class) of this thread, in [0, lanes)
+    j: cutlass.Int32,  # the column slot within the block, in [0, cols)
     d: cutlass.Constexpr[int],
     cols: cutlass.Constexpr[int],
     lanes: cutlass.Constexpr[int],
     unroll: cutlass.Constexpr[int],
+    sPart,  # fp32 SMEM Array, lanes x cols
 ) -> None:
-    """The SECOND launch, class ``blockIdx.y`` (0 = Q, 1 = K), columns
-    ``[blockIdx.x * cols, +cols)``: a FIXED summation order, no atomics.
-
-    Thread ``(l, j)`` sums ``partials[c, col]`` for ``c = l, l + lanes, ...``
-    ASCENDING (its residue class), the ``lanes`` per-column partials go through
-    SMEM and row-lane 0 adds them for ``l`` ASCENDING, then OVERWRITES
-    ``dw_*_norm[col]`` (fp32). ``lanes``-way parallel over the rows instead of one
-    thread per column walking every row; the shipped ``(cols, lanes) = (8, 128)``
-    is the measured optimum on the SM-fill plane (the table above the module
-    constants). Every partial was produced by the preceding launch on the same
-    stream. Host mirror of the order:
-    ``test_norm_rope_bwd_fixed_n_ctas_policy_reduces_the_same_sum``.
-
-    SMEM: ``sPart`` fp32 ``lanes x cols`` (4 KiB at (8, 128)), written once per
-    thread at ``l * cols + j`` (a warp's 32 threads write 32 consecutive fp32 =
-    one 128-B line: conflict-free), read by row-lane 0. Barrier: ONE
-    ``barrier_cta_sync`` per block, all ``cols * lanes`` (= 1024) threads arrive
-    (no divergent path reaches it). Global reads: a warp covers ``32 / cols``
-    rows x ``cols * 4`` B -- whole 32-B sectors at every ``cols >= 8``.
-    """
-    tidx = cutlass.Int32(cute.arch.thread_idx()[0])
-    j = tidx % cutlass.Int32(cols)
-    l = tidx // cutlass.Int32(cols)
-    col = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(cols) + j
-    is_q = cutlass.Int32(cute.arch.block_idx()[1]) == cutlass.Int32(0)
-    p_base = mPq.iterator.toint() if is_q else mPk.iterator.toint()
-    o_base = mDWq.iterator.toint() if is_q else mDWk.iterator.toint()
-    n = n_q if is_q else n_k
-    sPart = cutlass.Array(cutlass.Float32, lanes * cols, alignment=16, space=cutlass.AddressSpace.smem)
+    """The fixed-order reduce of ONE column, by the ``lanes`` threads that share ``j``: thread ``(l, j)`` sums ``partials[c, col]``
+    for ``c = l, l + lanes, ...`` ASCENDING (its residue class), the ``lanes`` per-column partials go through SMEM and row-lane 0
+    adds them for ``l`` ASCENDING, then OVERWRITES ``dw[col]`` (fp32).  Every thread of the block takes the ONE barrier.  The
+    chain of a column never depends on ``cols``, so every launch shape over this body is bitwise the same sum (module docstring)."""
     acc = opaque_f32_zero()
     if col < cutlass.Int32(d):
         # rows of row-lane l's residue class: l, l + lanes, ... < n (0 of them when l >= n)
@@ -704,6 +771,48 @@ def frost_dw_norm_reduce(
             st_global(o_base + col.to(cutlass.Int64) * cutlass.Int64(4), tot, cutlass.Float32)
 
 
+@cute.kernel
+def frost_dw_norm_reduce(
+    mPq: cute.Tensor,  # [n_q, D] fp32 partials
+    mPk: cute.Tensor,  # [n_k, D]
+    mDWq: cute.Tensor,  # [D] fp32 OUT (overwritten)
+    mDWk: cute.Tensor,  # [D]
+    n_q: cutlass.Int32,
+    n_k: cutlass.Int32,
+    d: cutlass.Constexpr[int],
+    cols: cutlass.Constexpr[int],
+    lanes: cutlass.Constexpr[int],
+    unroll: cutlass.Constexpr[int],
+) -> None:
+    """The SECOND launch, class ``blockIdx.y`` (0 = Q, 1 = K), columns
+    ``[blockIdx.x * cols, +cols)``: a FIXED summation order, no atomics
+    (:func:`dw_reduce_column` per column).
+
+    ``lanes``-way parallel over the rows instead of one thread per column walking
+    every row; the shipped ``(cols, lanes) = (8, 128)`` is the measured optimum on
+    the SM-fill plane (the table above the module constants). Every partial was
+    produced by the preceding launch on the same stream. Host mirror of the order:
+    ``test_norm_rope_bwd_fixed_n_ctas_policy_reduces_the_same_sum``.
+
+    SMEM: ``sPart`` fp32 ``lanes x cols`` (4 KiB at (8, 128)), written once per
+    thread at ``l * cols + j`` (a warp's 32 threads write 32 consecutive fp32 =
+    one 128-B line: conflict-free), read by row-lane 0. Barrier: ONE
+    ``barrier_cta_sync`` per block, all ``cols * lanes`` (= 1024) threads arrive
+    (no divergent path reaches it). Global reads: a warp covers ``32 / cols``
+    rows x ``cols * 4`` B -- whole 32-B sectors at every ``cols >= 8``.
+    """
+    tidx = cutlass.Int32(cute.arch.thread_idx()[0])
+    j = tidx % cutlass.Int32(cols)
+    l = tidx // cutlass.Int32(cols)
+    col = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(cols) + j
+    is_q = cutlass.Int32(cute.arch.block_idx()[1]) == cutlass.Int32(0)
+    p_base = mPq.iterator.toint() if is_q else mPk.iterator.toint()
+    o_base = mDWq.iterator.toint() if is_q else mDWk.iterator.toint()
+    n = n_q if is_q else n_k
+    sPart = cutlass.Array(cutlass.Float32, lanes * cols, alignment=16, space=cutlass.AddressSpace.smem)
+    dw_reduce_column(p_base, o_base, n, col, l, j, d, cols, lanes, unroll, sPart)
+
+
 @cute.jit
 def qk_norm_rope_bwd_launch(
     dq: cute.Tensor,
@@ -723,6 +832,7 @@ def qk_norm_rope_bwd_launch(
     dw_q: Optional[cute.Tensor],
     dw_k: Optional[cute.Tensor],
     seq_lens: Optional[cute.Tensor],
+    amax_out: Optional[cute.Tensor],
     n_ctas_q: cutlass.Int32,
     n_ctas_k: cutlass.Int32,
     n_ctas_v: cutlass.Int32,
@@ -760,6 +870,7 @@ def qk_norm_rope_bwd_launch(
         dw_q,
         dw_k,
         seq_lens,
+        amax_out,
         n_ctas_q,
         n_ctas_k,
         n_ctas_v,
@@ -832,6 +943,8 @@ class QkNormRopeBwdRecipe(NamedTuple):
     # Appended (defaulted): the rows_per_group the artifact was traced with,
     # after the per-arm default resolution.
     rows_per_group: int = DEFAULT_ROWS_PER_GROUP
+    # Appended (default = today's artifact): the amax fold of the stored bands as per-CTA partials (``amax_out`` REQUIRED).
+    want_amax: bool = False
 
 
 def _resolve_n_ctas_cap(policy: str, device: int) -> int:
@@ -864,6 +977,7 @@ def compile_qk_norm_rope_bwd(
     const_head_counts: bool = DEFAULT_CONST_HEAD_COUNTS,
     use_pdl: bool = False,
     n_ctas_policy: str = DEFAULT_N_CTAS_POLICY,
+    want_amax: bool = False,
 ) -> QkNormRopeBwdRecipe:
     """Build both artifacts from SHAPES ALONE -- no allocation, no launch.
 
@@ -871,10 +985,16 @@ def compile_qk_norm_rope_bwd(
     adjoint: ``x / rstd / w / dW`` slots traced as ``None``. ``want_dw`` needs
     the norm (there is no dW without one). ``rows_per_group=None`` resolves per
     arm (``DEFAULT_ROWS_PER_GROUP`` with the norm, ``..._ROPE_ONLY`` without --
-    the measured optimum of each, see the module constants). Every knob, the
-    policy and the device are in the cache key.
+    the measured optimum of each, see the module constants). ``want_amax``
+    (appended) traces the amax fold of the stored bands as PER-CTA PARTIALS
+    (module docstring; ``amax_out`` REQUIRED at execute). Every knob, the policy
+    and the device are in the cache key.
     """
     global _FAKE_STREAM
+    if not isinstance(want_amax, bool):
+        raise ValueError(f"want_amax must be a bool (whether the stored bands' amax fold is traced), got {want_amax!r}")
+    if want_amax and threads_per_cta % 32 != 0:
+        raise ValueError(f"want_amax needs threads_per_cta % 32 == 0 (the fold ends in a full-warp butterfly), got {threads_per_cta}")
     if rows_per_group is None:
         rows_per_group = DEFAULT_ROWS_PER_GROUP if apply_norm else DEFAULT_ROWS_PER_GROUP_ROPE_ONLY
     # A row count per lane group: 0 would trace lane groups that own no rows and record
@@ -909,6 +1029,7 @@ def compile_qk_norm_rope_bwd(
         bool(has_seq_lens),
         str(n_ctas_policy),
         device,
+        bool(want_amax),
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -925,6 +1046,11 @@ def compile_qk_norm_rope_bwd(
         seq_lens = (
             cute.runtime.make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4) if has_seq_lens else None
         )
+        # the amax partials: contiguous fp32 [n] of SYMBOLIC length on a 16-byte-aligned base (quantize.py's partials contract);
+        # None folds the fold out
+        amax_out = (
+            cute.runtime.make_fake_compact_tensor(dtype=cutlass.Float32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=16) if want_amax else None
+        )
         compiled_cache[key] = cute.compile(
             qk_norm_rope_bwd_launch,
             *dense,
@@ -935,6 +1061,7 @@ def compile_qk_norm_rope_bwd(
             *outs,
             *dws,
             seq_lens,
+            amax_out,
             cutlass.Int32(0),  # n_ctas_q ) all runtime values; the zeros only pin
             cutlass.Int32(0),  # n_ctas_k ) their TYPE at trace time, the real ones
             cutlass.Int32(0),  # n_ctas_v ) are bound per launch.
@@ -988,6 +1115,7 @@ def compile_qk_norm_rope_bwd(
         n_ctas_cap=int(n_ctas_cap),
         dtype=dtype,
         rows_per_group=int(rows_per_group),
+        want_amax=bool(want_amax),
     )
 
 
@@ -1002,6 +1130,12 @@ def n_ctas_for(r: QkNormRopeBwdRecipe, t: int) -> tuple:
         groups = (n_rows + r.rows_per_cta - 1) // r.rows_per_cta
         out.append(max(1, min(groups, r.n_ctas_cap)))
     return tuple(out)
+
+
+def n_amax_partials_for(r: QkNormRopeBwdRecipe, t: int) -> int:
+    """The partials one ``want_amax`` launch over ``t`` tokens writes = its grid, ``sum(n_ctas_for(r, t))`` (one per CTA of
+    the three classes): the ``n_partials`` the consumer reduces and the minimum length of ``amax_out``."""
+    return int(sum(n_ctas_for(r, t)))
 
 
 def _check_dense(r: QkNormRopeBwdRecipe, name: str, ten, t: int, h: int) -> None:
@@ -1085,7 +1219,8 @@ def run_qk_norm_rope_bwd(
     *,
     s: Optional[int] = None,
     stream,
-) -> None:
+    amax_out: Optional[torch.Tensor] = None,
+) -> int:
     """The FIRST launch: dx into the Q / K / V bands, per-CTA dW partials.
 
     ``dq / dk / dv`` compact ``[T, H, D]`` (``T = B*S``); ``xq / xk`` bands or
@@ -1093,10 +1228,24 @@ def run_qk_norm_rope_bwd(
     ``[T, rope_dim]``; ``out_*`` the dqkvg bands (``out_q`` may alias ``dq``,
     ``out_k`` may alias ``dk``); ``dw_partials_*`` exactly ``[n_ctas_x, D]`` fp32
     per :func:`n_ctas_for`; ``seq_lens`` (``[B]`` int32) needs ``s``. Host-only
-    checks, no allocation, no key build.
+    checks, no allocation, no key build.  ``amax_out`` (appended): a ``want_amax``
+    artifact's contiguous fp32 ``[>= n_amax_partials_for(r, T)]`` CUDA partials array on a
+    16-byte-aligned base -- every one of its first ``n_amax_partials_for(r, T)`` words is
+    OVERWRITTEN (one per CTA, no pre-zero) -- REQUIRED there and refused otherwise (Rule 1).
+    Returns the partials written (the grid), 0 without the fold.
     """
     _check_presence(r, xq, xk, rstd_q, rstd_k, w_q, w_k, dw_partials_q, dw_partials_k, seq_lens)
+    want_amax = bool(getattr(r, "want_amax", False))
+    if want_amax and amax_out is None:
+        raise ValueError(
+            "this artifact was compiled WITH the amax fold (want_amax=True); amax_out (a contiguous fp32 [>= n_amax_partials_for(r, T)] CUDA partials "
+            "array) must be bound at execute (Rule 1: no silent fallback)"
+        )
+    if not want_amax and amax_out is not None:
+        raise ValueError("this artifact was compiled WITHOUT the amax fold (want_amax=False); passing amax_out would silently ignore it (Rule 1)")
     t = int(dq.shape[0])
+    if amax_out is not None:
+        check_partials("amax_out", amax_out, n_amax_partials_for(r, t))
     for name, ten, h in (
         ("dq", dq, r.h_q),
         ("dk", dk, r.h_kv),
@@ -1151,6 +1300,7 @@ def run_qk_norm_rope_bwd(
             ("dw_partials_q", dw_partials_q),
             ("dw_partials_k", dw_partials_k),
             ("seq_lens", seq_lens),
+            ("amax_out", amax_out),
         ),
     )
     # The optional slots stay in the ABI even when they traced to None (the
@@ -1173,6 +1323,7 @@ def run_qk_norm_rope_bwd(
         dw_partials_q,
         dw_partials_k,
         seq_lens,
+        amax_out,
         cutlass.Int32(n_ctas_q),
         cutlass.Int32(n_ctas_k),
         cutlass.Int32(n_ctas_v),
@@ -1184,6 +1335,7 @@ def run_qk_norm_rope_bwd(
         cutlass.Int32(n_ctas_q + n_ctas_k + n_ctas_v),
         cuda.CUstream(int(stream)),
     )
+    return (n_ctas_q + n_ctas_k + n_ctas_v) if want_amax else 0
 
 
 def run_dw_norm_reduce(r: QkNormRopeBwdRecipe, dw_partials_q, dw_partials_k, dw_q_norm, dw_k_norm, *, stream, t: Optional[int] = None) -> None:

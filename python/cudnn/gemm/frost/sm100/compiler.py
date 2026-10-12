@@ -4076,16 +4076,14 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         return config
     sm = sm_count if sm_count is not None else _sm_count()
     output_tiles = mm.batch * -(-mm.M // config.cta_tile_m) * -(-mm.N // config.cta_tile_n)
-    # On MMA_INST_K64_ARCH_RANGES silicon the one-wave target overshoots for
-    # nvfp4 block-scale: measured split-K curves pay only below 1/8 grid fill,
-    # near 64 total CTAs, with power-of-two S >= 4. fp8 keeps one-wave sizing
-    # (its shallow narrow-tile splits measure as real wins).
-    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
-
-    arch = _current_arch()
-    _k64_part = any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) if arch is not None else sm >= 190
+    # For nvfp4 block-scale the one-wave target overshoots: measured split-K
+    # curves pay only below 1/8 grid fill, near 64 total CTAs, with
+    # power-of-two S >= 4. First measured on MMA_INST_K64_ARCH_RANGES silicon
+    # and gated there; the weekly sweep shows the same curve on sm100/sm103
+    # (+15 layers / -5, net +0.5% fp4 geomean on both), so the gate is now
+    # dtype-driven, not arch-driven. fp8 keeps one-wave sizing.
     _fp4_bs = chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1"
-    eager_fill = not (_k64_part and _fp4_bs)
+    eager_fill = not _fp4_bs
     if output_tiles >= (sm if eager_fill else -(-sm // 8)):
         return config
     cta_k_elems = _cta_k_elems(chain, config)
@@ -4105,10 +4103,12 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         slices = 1 << (slices.bit_length() - 1)  # snap down to a power of two
     if slices <= 1:
         return config
-    # For matched FP4 operands, a two-way split does not amortize the
-    # partial-output traffic and reduction launch. Keep the unsplit tile;
-    # larger automatic splits and explicitly supplied knobs remain available.
-    if slices == 2 and chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1":
+    # A two-way split does not amortize the partial-output traffic and the
+    # reduction launch: the weekly exhaustive sweep measures every dense S=2
+    # pick as a loss on every architecture measured, while S>=3 keeps its
+    # wins, matching what was already measured for matched FP4 operands.
+    # Larger automatic splits and explicitly supplied knobs remain available.
+    if slices == 2:
         return config
     return replace(config, split_k_slices=slices)
 

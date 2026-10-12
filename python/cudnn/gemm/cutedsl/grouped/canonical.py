@@ -73,6 +73,27 @@ def is_flat_sf(tensor) -> bool:
     return tensor is not None and tensor.is_contiguous()
 
 
+def check_canonical_contiguous(a, b, prob):
+    for name, tensor, canonical in (
+        ("a_tensor", a, a.ndim == 2),
+        ("b_tensor", b, is_canonical_b(b)),
+        ("prob_tensor", prob, prob is not None and prob.ndim == 1),
+    ):
+        if canonical and not tensor.is_contiguous():
+            raise ValueError(f"Canonical {name} must be contiguous")
+
+
+def check_packed_sf(sfa, sfb, a_rows, b_rows, experts, rest_k):
+    for name, tensor, rows, groups in (("sfa_tensor", sfa, a_rows, 1), ("sfb_tensor", sfb, b_rows, experts)):
+        if tensor is None:
+            continue
+        if is_flat_sf(tensor):
+            if tensor.numel() != 512 * ((rows + 127) // 128) * rest_k * groups:
+                raise ValueError(f"{name} must contain the complete MMA-packed scale buffer")
+        elif tensor.ndim != 6:
+            raise ValueError(f"{name} must be a contiguous packed buffer or a legacy 6-D MMA view")
+
+
 def check_sf_shape(api, desc, flat: bool, mma_shape, name: str):
     """Check an SF descriptor against its MMA-tiled shape, or its element count when flat."""
     if desc is None:

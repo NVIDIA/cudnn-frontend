@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Prepared FP8 launches rebind device scales and storage through the public graph API."""
 
+import sdpa_binding_reference as binding_reference
+
 import math
 from contextlib import contextmanager
 
@@ -331,7 +333,7 @@ def test_prepared_fp8_invalid_scalars_do_not_launch(role, kind, monkeypatch):
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("invalid scalar reached the kernel"))
     monkeypatch.setattr(prep._buffers, "memset_zero_async", lambda *a: pytest.fail("invalid scalar mutated output"))
     with pytest.raises(ValueError, match=role):
-        prep.execute_quantized(spec, facts, ws.data_ptr(), None, 0)
+        binding_reference.execute_quantized(spec, facts, ws.data_ptr(), None, 0)
 
 
 @pytest.mark.parametrize("bare", [False, True])
@@ -345,7 +347,7 @@ def test_prepared_fp8_workspace_overlap_is_rejected(bare, monkeypatch):
         facts["q"] = facts["q"]._replace(span=-1)
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("aliased workspace reached the kernel"))
     with pytest.raises(ValueError, match="workspace overlaps"):
-        prep.execute_quantized(spec, facts, facts["q"].ptr, None, 0)
+        binding_reference.execute_quantized(spec, facts, facts["q"].ptr, None, 0)
 
 
 @pytest.mark.parametrize("thd", [False, True])
@@ -364,7 +366,7 @@ def test_prepared_fp8_graph_and_adapter_bind_the_same_frame(thd, monkeypatch, d,
 
     monkeypatch.setattr(prepared.spec, "fn", record)
     if prepared.spec.native is not None:
-        monkeypatch.setattr(prepared.spec, "native", cudnn._pybind_module._SdpaDenseBinder(prepared.spec))
+        monkeypatch.setattr(prepared.spec, "native", type(prepared.spec.native)(prepared.spec))
     g.execute(vp, ws)
     _check(bufs, thd=thd)
     plan._prepared, plan.takes_variant_pack = None, False
@@ -477,6 +479,8 @@ def test_prepared_fp8_empty_thd_resets_amax_without_attention(d, dv, monkeypatch
             vp[tensors[name]] = torch.zeros_like(vp[tensors[name]])
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("empty Q must not launch attention"))
+    if spec.native is not None:
+        monkeypatch.setattr(spec, "native", type(spec.native)(spec))
     bufs["amax_o"].fill_(999)
     g.execute(vp, ws)
     torch.testing.assert_close(bufs["amax_o"], torch.zeros_like(bufs["amax_o"]))

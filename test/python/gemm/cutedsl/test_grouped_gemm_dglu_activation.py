@@ -122,31 +122,34 @@ def test_dglu_recomputed_activation_changed_input_graph(discrete, vector_f32, n)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        run()
-    torch.cuda.current_stream().wait_stream(stream)
-    stale = None
-    for step, ends in enumerate(([256, 768, 768], [0, 256, 768], [256, 512, 1024])):
-        p["offsets"].copy_(torch.tensor(ends, device="cuda", dtype=torch.int32))
-        p["a"].normal_(std=0.125)
-        p["c"].normal_(std=8)
-        p["prob"].mul_(0.75)
-        p["prob"][::17] = 0
-        for key in ("d", "baseline_d", "dp", "baseline_dp", "activation"):
-            p[key].fill_(float("nan"))
-        graph.replay()
-        expected = reference(p, ends)
-        actual = p["activation"][: ends[-1]]
-        check_activation(actual, expected[: ends[-1]])
-        assert torch.equal(actual[::17], torch.zeros_like(actual[::17]))
-        torch.testing.assert_close(p["d"][: ends[-1]], p["baseline_d"][: ends[-1]], rtol=0, atol=0)
-        torch.testing.assert_close(p["dp"][: ends[-1]], p["baseline_dp"][: ends[-1]], rtol=2e-5, atol=2e-5)
-        assert torch.isnan(p["activation"][ends[-1] :]).all()
-        if step == 1:
-            for wrong in (stale, torch.zeros_like(actual), torch.full_like(actual, float("nan"))):
-                with pytest.raises(AssertionError):
-                    check_activation(wrong, expected[: ends[-1]])
-        stale = actual.clone()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        stale = None
+        for step, ends in enumerate(([256, 768, 768], [0, 256, 768], [256, 512, 1024])):
+            p["offsets"].copy_(torch.tensor(ends, device="cuda", dtype=torch.int32))
+            p["a"].normal_(std=0.125)
+            p["c"].normal_(std=8)
+            p["prob"].mul_(0.75)
+            p["prob"][::17] = 0
+            for key in ("d", "baseline_d", "dp", "baseline_dp", "activation"):
+                p[key].fill_(float("nan"))
+            graph.replay()
+            expected = reference(p, ends)
+            actual = p["activation"][: ends[-1]]
+            check_activation(actual, expected[: ends[-1]])
+            assert torch.equal(actual[::17], torch.zeros_like(actual[::17]))
+            torch.testing.assert_close(p["d"][: ends[-1]], p["baseline_d"][: ends[-1]], rtol=0, atol=0)
+            torch.testing.assert_close(p["dp"][: ends[-1]], p["baseline_dp"][: ends[-1]], rtol=2e-5, atol=2e-5)
+            assert torch.isnan(p["activation"][ends[-1] :]).all()
+            if step == 1:
+                for wrong in (stale, torch.zeros_like(actual), torch.full_like(actual, float("nan"))):
+                    with pytest.raises(AssertionError):
+                        check_activation(wrong, expected[: ends[-1]])
+            stale = actual.clone()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.parametrize("vector_f32", [False, True])
@@ -408,18 +411,21 @@ def test_dglu_activation_caller_workspace_and_first_capture(discrete, compile_al
         run(overlapping)
     auxiliary.fill_(float("nan"))
     graph = torch.cuda.CUDAGraph()
-    # No successful execute precedes capture, and the pointer/offset tensors are new.
-    with torch.cuda.graph(graph):
-        before = torch.cuda.memory_stats()["allocation.all.allocated"]
-        p["dp"].zero_()
-        run(view)
-        assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
-    for scale in (0.75, 0.5):
-        p["prob"].mul_(scale)
-        auxiliary.fill_(float("nan"))
-        graph.replay()
-        check_activation(auxiliary[:768], reference(p, [256, 768, 768])[:768])
-        assert torch.isnan(auxiliary[768:]).all()
+    try:
+        # No successful execute precedes capture, and the pointer/offset tensors are new.
+        with torch.cuda.graph(graph):
+            before = torch.cuda.memory_stats()["allocation.all.allocated"]
+            p["dp"].zero_()
+            run(view)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+        for scale in (0.75, 0.5):
+            p["prob"].mul_(scale)
+            auxiliary.fill_(float("nan"))
+            graph.replay()
+            check_activation(auxiliary[:768], reference(p, [256, 768, 768])[:768])
+            assert torch.isnan(auxiliary[768:]).all()
+    finally:
+        graph.reset()
 
 
 @pytest.fixture

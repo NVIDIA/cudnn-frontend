@@ -89,6 +89,9 @@ def _check(case):
 @pytest.mark.parametrize("roles", [("q", "do", "dq", "dv"), ("k", "v", "o", "dk")])
 def test_staged_rebind_stream_capture(dtype, d, hkv, causal, roles, monkeypatch):
     import cutlass.cute as cute
+    from cudnn.sdpa.bwd import prepared
+
+    monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half staged backward entered the Python binder"))
 
     def forbidden(*args, **kwargs):
         raise AssertionError("staged backward used the legacy tensor compiler or DLPack")
@@ -145,7 +148,9 @@ def test_staged_rebind_stream_capture(dtype, d, hkv, causal, roles, monkeypatch)
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 def test_staged_standalone_and_runtime_layout(dtype, monkeypatch):
-    from cudnn.sdpa.bwd import api_dsl, prepared_sm100
+    from cudnn.sdpa.bwd import api_dsl, prepared, prepared_sm100
+
+    monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half standalone backward entered the Python binder"))
 
     case = _case(dtype=dtype)
     api = api_dsl.SdpaBwdDslSm100(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=512**-0.5)
@@ -179,3 +184,77 @@ def test_sm100_direct_adapter_declines_old_dsl(staged, monkeypatch):
     monkeypatch.setattr(api_dsl, "load_template", lambda *a, **k: pytest.fail("old DSL reached a kernel template"))
     with pytest.raises(NotImplementedError, match=r"SdpaBwdDslSm100.*4\.7\.0.*4\.6\.2"):
         api.compile()
+
+
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("explicit_stream", (False, True))
+@pytest.mark.parametrize("adapter", ("sm100", "sm107"))
+def test_direct_standalone_with_another_device_current(dtype, explicit_stream, adapter, monkeypatch):
+    """Both tensor adapters must select the plan device before entering its host."""
+    from cuda.bindings import driver
+    from cudnn.sdpa.bwd import api_dsl, prepared, prepared_sm100, prepared_sm107
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    target = torch.cuda.current_device()
+    other = next(i for i in range(torch.cuda.device_count()) if i != target)
+    case = _case(dtype=dtype, roles=())
+    api = api_dsl.SdpaBwdDslSm100(**{"sample_" + name: value for name, value in case.tensors.items()}, is_causal=True, scale_softmax=512**-0.5)
+    api.compile()
+    assert api._prepared is not None and api._staged_prepared is None
+    workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=target)
+    args = {name + "_tensor": value for name, value in case.tensors.items()}
+    # The SM107 adapter consumes the same prepared spec contract. Exercise its
+    # device/stream boundary against a real SM100 host, independently of ISA.
+    if adapter == "sm107":
+        monkeypatch.setattr(prepared_sm100, "execute_standalone", prepared_sm107.execute_standalone)
+    monkeypatch.setattr(prepared, "_bind_python", lambda *a, **k: pytest.fail("half backward entered the Python binder"))
+    real_execute = prepared.execute
+    expected_stream = torch.cuda.default_stream(target).cuda_stream
+
+    def checked_execute(*a, **kw):
+        assert torch.cuda.current_device() == target, "direct backward launch must run in the operand context"
+        assert a[3] == expected_stream, "implicit stream must belong to the operand device"
+        return real_execute(*a, **kw)
+
+    monkeypatch.setattr(prepared, "execute", checked_execute)
+
+    def run():
+        with torch.cuda.device(other):
+            api.execute(**args, workspace=workspace, current_stream=driver.CUstream(expected_stream) if explicit_stream else None)
+            assert torch.cuda.current_device() == other
+
+    # Include the default-stream sentinel: a foreign current device makes its
+    # raw handle select the wrong context even though tensor facts are valid.
+    with torch.cuda.stream(torch.cuda.default_stream(target)):
+        run()
+    torch.cuda.synchronize(target)
+    _check_prepared(case)
+    stream = torch.cuda.Stream(device=target)
+    stream.wait_stream(torch.cuda.current_stream(target))
+    expected_stream = stream.cuda_stream
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream(target).wait_stream(stream)
+    _check_prepared(case)
+    captured = torch.cuda.CUDAGraph()
+    stream.wait_stream(torch.cuda.current_stream(target))
+    with torch.cuda.graph(captured, stream=stream):
+        run()
+    torch.cuda.current_stream(target).wait_stream(stream)
+    case.tensors["q"].mul_(0.75)
+    case.tensors["do"].mul_(1.25)
+    o, stats, _, *grads = _reference(*(case.tensors[n] for n in ("q", "k", "v", "do")), case.keep, case.group)
+    case.tensors["o"].copy_(o)
+    case.tensors["stats"].copy_(stats.unsqueeze(-1))
+    case.expected = grads
+    for name in ("dq", "dk", "dv"):
+        case.tensors[name].fill_(float("nan"))
+    captured.replay()
+    _check_prepared(case)
+    captured.reset()
+    args["k_tensor"] = case.tensors["k"].float()
+    with torch.cuda.stream(stream), torch.cuda.device(other):
+        with pytest.raises(ValueError, match="k must"):
+            run()
+        assert torch.cuda.current_device() == other

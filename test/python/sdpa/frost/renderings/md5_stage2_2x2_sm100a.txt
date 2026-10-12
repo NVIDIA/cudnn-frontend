@@ -1,0 +1,8 @@
+# Refreshed 2026-10-09 for the per-CTA empty-phase observer ACK protocol.
+# Each default rendering was repeated in an independent process with identical PTX.
+# THD is checked structurally by test_stage2_2x2_sass_pins: identical MLIR can lower
+# to different PTX under the same DSL build, so a byte-hash golden is not stable.
+dsl=nvidia-cutlass-dsl 4.7.0
+stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=b9998a204153156c13c326d394e0e92d
+stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=ea5dbd0bf1d533191a5a4a5ce852b258
+stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=6fd1425b025fbfc48f1c8e46e4e8d6d2

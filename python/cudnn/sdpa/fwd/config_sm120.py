@@ -143,6 +143,9 @@ class TemplateParams:
     # partial (O, LSE) that kernels/sm100/split_combine.py reduces.  1 = off.
     # Opt-in only -- the graph front door never selects it.
     split_kv: int = 1
+    # attn_scale < 0: the kernel negates Q as it loads it and runs at |attn_scale|, so the raw-score row max still
+    # bounds P (#1435). APPEND-ONLY, default False.
+    negate_scores: bool = False
 
 
 def validate_params(

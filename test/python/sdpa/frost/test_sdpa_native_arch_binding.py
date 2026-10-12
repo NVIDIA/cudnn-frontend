@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native binding preserves the SM103 and SM107 half attention host contracts."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 import cudnn
@@ -24,7 +26,7 @@ def test_sm107_native_matches_actual_host_abi_and_rebinds(dq, dv, dtype):
     s, facts, frames, _ = _prefill_fixture(dq, dv, False, 1, dtype, arch="sm107")
     for offset in (0, 0x100000):
         fresh = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
-        expected = prep.bind_dense(s, fresh, 17, 17)
+        expected = binding_reference.bind_dense(s, fresh, 17, 17)
         actual = s.native.bind(_pack(fresh), prep._NATIVE_DENSE_INDICES, 17)
         assert list(actual) == expected
         s.native.execute(_pack(fresh), prep._NATIVE_DENSE_INDICES, 17)
@@ -104,7 +106,7 @@ def test_sm103_native_decode_physical_wide_tables(d, monkeypatch, request):
 def test_sm107_native_split_matches_new_host_abi(dq, dv, dtype):
     s, facts, frames, combined = _prefill_fixture(dq, dv, False, 4, dtype, arch="sm107")
     for workspace in (0x400000, 0x800000):
-        expected = prep.bind_dense_split(s, facts, workspace, 17, 17)
+        expected = binding_reference.bind_dense_split(s, facts, workspace, 17, 17)
         actual = s.native.bind_split(_pack(facts), prep._NATIVE_DENSE_INDICES, workspace, 17)
         assert list(actual[0]) == expected[0] and actual[1] == expected[1]
         s.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=workspace)

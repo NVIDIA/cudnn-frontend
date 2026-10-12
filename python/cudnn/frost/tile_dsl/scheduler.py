@@ -56,6 +56,9 @@ def lpt_l2_tile_coords(linear, q_h, batch, q_tiles, heads_per_kv, seqlen_kv, kv_
             ag_min1.ir_value(),
         )
     )
+    # Same block count, groups spread evenly: a short last block leaves SMs idle at the tail.
+    budget_blocks = (num_groups + active_groups - cutlass.Int32(1)) // active_groups
+    active_groups = (num_groups + budget_blocks - cutlass.Int32(1)) // budget_blocks
 
     tiles_per_grp = q_tiles * heads_per_kv
     tiles_per_blk = active_groups * tiles_per_grp

@@ -651,7 +651,7 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
         raise ValueError(f"cd_major must be 'n', got {cd_major}")
     is_fp8_config = a_tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and sfa_tensor.dtype in (torch.float8_e8m0fnu, torch.float8_e4m3fn)
     sf_dtype = sfa_tensor.dtype if is_fp8_config else None
-    outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, a_tensor.device)
+    outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, a_tensor.device, call.current_stream)
     d_row_tensor, d_col_tensor, _, dbias_tensor, amax_tensor, sfd_row_tensor, sfd_col_tensor = outputs
     deterministic = call.deterministic
 
@@ -709,7 +709,9 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
             *tensor_signature(beta_tensor),
             *(dynamic_m_tensor_signature(prob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(prob_tensor)),
             *(dynamic_m_tensor_signature(dprob_tensor, (1, 1)) if not use_full_dynamic else dynamic_tensor_signature(dprob_tensor)),
-            *(dynamic_tensor_signature(dbias_tensor) if use_full_dynamic else tensor_signature(dbias_tensor)),
+            # dbias keeps its full shape even under full dynamic: its compiled descriptor bakes n, and
+            # nothing else in this key carries n (b_tensor.shape[2] is l).
+            *tensor_signature(dbias_tensor),
             *(dynamic_tensor_signature(sfb_tensor) if use_full_dynamic else tensor_signature(sfb_tensor)),
             norm_const_tensor.shape if norm_const_tensor is not None else None,
             norm_const_tensor.stride() if norm_const_tensor is not None else None,
@@ -878,31 +880,37 @@ def _grouped_gemm_dglu_block_scaled_call(call: DgluCall, memo_key: Optional[tupl
     return dglu_block_scaled_run(*memo, call, outputs)
 
 
-def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device) -> TupleDict:
+def dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, sf_vec_size, generate_dbias, dprob_tensor, device, current_stream) -> TupleDict:
     import torch
 
-    sfd_row_tensor = sfd_col_tensor = amax_tensor = dbias_tensor = None
-    if sf_dtype is not None:
-        sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device)
-    if d_dtype in (torch.bfloat16, torch.float16):
-        amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=device)
-    if generate_dbias:
-        dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=device)
-    return TupleDict(
-        d_row_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
-        d_col_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
-        dprob_tensor=dprob_tensor,
-        dbias_tensor=dbias_tensor,
-        amax_tensor=amax_tensor,
-        sfd_row_tensor=sfd_row_tensor,
-        sfd_col_tensor=sfd_col_tensor,
-    )
+    # Allocate on the launch stream, like the BF16 path: amax and dbias are accumulated into, so
+    # their initialization must be ordered before the kernel, and the caching allocator must see
+    # every output as used on the stream the kernel writes it on.
+    with _torch_stream_context(current_stream, device):
+        sfd_row_tensor = sfd_col_tensor = amax_tensor = dbias_tensor = None
+        if sf_dtype is not None:
+            sfd_row_tensor, sfd_col_tensor = block_scaled_sfd_tensors(valid_m, n_out, sf_dtype, sf_vec_size, device)
+        if d_dtype in (torch.bfloat16, torch.float16):
+            amax_tensor = torch.full((l, 2, 1), float("-inf"), dtype=torch.float32, device=device)
+        if generate_dbias:
+            dbias_tensor = torch.zeros((l, n_out, 1), dtype=torch.bfloat16, device=device)
+        return TupleDict(
+            d_row_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
+            d_col_tensor=torch.empty_strided((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), dtype=d_dtype, device=device),
+            dprob_tensor=dprob_tensor,
+            dbias_tensor=dbias_tensor,
+            amax_tensor=amax_tensor,
+            sfd_row_tensor=sfd_row_tensor,
+            sfd_col_tensor=sfd_col_tensor,
+        )
 
 
 def dglu_block_scaled_run(api, valid_m, n_out, l, d_dtype, sf_dtype, generate_dbias, call: DgluCall, outputs: Optional[TupleDict] = None) -> TupleDict:
     """Allocate fresh outputs and execute with the current call operands."""
     if outputs is None:
-        outputs = dglu_block_scaled_outputs(valid_m, n_out, l, d_dtype, sf_dtype, call.sf_vec_size, generate_dbias, call.dprob_tensor, call.a_tensor.device)
+        outputs = dglu_block_scaled_outputs(
+            valid_m, n_out, l, d_dtype, sf_dtype, call.sf_vec_size, generate_dbias, call.dprob_tensor, call.a_tensor.device, call.current_stream
+        )
     dprob_slots = _dglu_dprob_slots(call, n_out // 2, valid_m) if call.deterministic else None
     api.execute(
         a_tensor=call.a_tensor,

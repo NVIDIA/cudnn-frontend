@@ -36,6 +36,7 @@ def _case(
     hk=2,
     explicit_plan=False,
     gate=None,
+    padded_stats=False,
 ):
     dv = d if dv is None else dv
     torch.manual_seed(827)
@@ -131,7 +132,7 @@ def _case(
     buffers["o"], tensors["o"], vp[o] = out, o, out
     if stats:
         lse.set_output(True).set_data_type(cudnn.data_type.FLOAT).set_dim([b, hq, sq, 1])
-        if thd:
+        if thd and not padded_stats:
             lse.set_stride([sq * hq, 1, hq, 1])
             off = g.tensor(dim=[b + 1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.INT32)
             lse.set_ragged_offset(off)
@@ -257,6 +258,26 @@ def test_prepared_mxfp8_capture_reads_current_scales(thd, split, d, dv, output_d
         graph.replay()
         torch.cuda.synchronize()
         _check(bufs, thd=thd, skv=512)
+
+
+@pytest.mark.parametrize("hq,hk,sq", [(2, 1, 128), (4, 1, 64), (8, 1, 32)], ids=["g2-s128", "g4-s64", "g8-s32"])
+@pytest.mark.L0
+def test_prepared_mxfp8_packed_cluster_tail_rows(hq, hk, sq):
+    """PackGQA on the d128 flavor with the SECOND CTA of the cga2 pair entirely past S_q.
+
+    The grid is rounded up to whole clusters, so with G heads per tile the pair covers 2 * TILES_Q * (128 / G)
+    tokens; at these S_q the peer CTA's rows all lie past the sequence, and its loader's scale-factor gather
+    (plain global loads, not a bounds-checked TMA) must not address a Q scale-factor atom that was never
+    allocated -- Compute Sanitizer reported 4-byte out-of-bounds reads from that CTA before the gather
+    clamped dead rows and gave them the neutral scale.  The dead rows produce no O / LSE, so the check is the
+    ordinary one; the memory-safety part is what a sanitizer run of this case pins."""
+    g, vp, ws, bufs, _ = _case(thd=False, split_kv=1, d=128, dv=128, b=1, hq=hq, hk=hk, sq=sq, skv=128, output_dtype=torch.bfloat16)
+    knobs = g.plans[g._plan_index].knobs
+    if not knobs.pack_gqa or knobs.cga != 2:
+        pytest.skip(f"the heuristics did not pick a packed cga2 plan here ({knobs}); the cluster-tail rows need one")
+    g.execute(vp, ws)
+    torch.cuda.synchronize()
+    _check(bufs, thd=False, b=1, sq=sq, skv=128)
 
 
 @pytest.mark.gpu_exclusive
@@ -387,6 +408,8 @@ def test_prepared_mxfp8_graph_and_adapter_bind_same_frame(thd, d, dv, monkeypatc
         return original(*args)
 
     monkeypatch.setattr(prepared.spec, "fn", record)
+    if prepared.spec.native is not None:
+        prepared.spec.native = type(prepared.spec.native)(prepared.spec)
     g.execute(vp, ws)
     _check(bufs, thd=thd)
     plan._prepared, plan.takes_variant_pack = None, False

@@ -270,6 +270,35 @@ def test_a_replayed_plan_reports_its_own_notes():
         g._lowered_graph.get_behavior_notes_for_plan_at_index(g._lowered_graph.get_execution_plan_count())
 
 
+@pytest.mark.parametrize("pin", [False, True])
+def test_build_all_preserves_backend_selection_queries(cudnn_handle, pin):
+    """Selected-plan aliases must agree with indexed queries after building ALL."""
+    g = pygraph(handle=cudnn_handle, io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(dim=[1, 64, 64], stride=[4096, 64, 1])
+    b = g.tensor(dim=[1, 64, 64], stride=[4096, 64, 1])
+    g.matmul(A=a, B=b).set_output(True)
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    # Build a representative native plan, then retain its public identity.
+    # No engine id, ranking or metadata contents are assumed by the test.
+    selected = None
+    for index, cfg in enumerate(g.plans):
+        if cfg.cpp_index is None:
+            continue
+        try:
+            g.build_plan_at_index(index)
+        except cudnn.cudnnGraphNotSupportedError:
+            continue
+        selected = index
+        break
+    assert selected is not None, "the representative matmul must offer a buildable backend plan"
+    if pin:
+        g.select_plan(selected)
+    g.build_plans(cudnn.build_plan_policy.ALL)
+    assert g._plan_index == selected
+    assert g.get_behavior_notes() == g.get_behavior_notes_for_plan_at_index(selected)
+    assert g.get_workspace_size(handle=cudnn_handle) == g.get_workspace_size_plan_at_index(selected, handle=cudnn_handle)
+
+
 def test_key_before_planning_leaves_the_graph_buildable():
     """key() lowers, and lowering freezes the IR. Called first it froze a graph
     that had not been validated, so the validate() inside the next

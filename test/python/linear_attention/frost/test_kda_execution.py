@@ -159,3 +159,103 @@ def test_frost_native_kda_backward_respects_output_strides(total, heads):
     for name, reference in outputs.items():
         torch.testing.assert_close(strided[name], reference, rtol=0, atol=0)
         assert torch.isnan(padded[name][..., reference.shape[-1] :]).all(), f"{name} wrote into output padding"
+
+
+@pytest.mark.parametrize("optional", [False, True])
+@pytest.mark.parametrize("safe_gate", [False, True])
+@pytest.mark.parametrize("checkpoint", [0, 32])
+def test_kda_warm_chain_binds_current_operands(optional, safe_gate, checkpoint):
+    """Prepared indices preserve the cold launch ABI and never retain buffers."""
+    from types import SimpleNamespace
+    from cuda.bindings.driver import CUstream
+    from cudnn.linear_attention.frost.kda_engine import CompiledKda
+    from cudnn.linear_attention.frost.kernel.kda_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, run_chain_forward
+
+    plan = CompiledKda.__new__(CompiledKda)
+    plan.chain = True
+    plan.safe_gate = safe_gate
+    plan.has_state_checkpoints = optional
+    plan.checkpoint = checkpoint
+    plan.pieces, plan.n_heads_out, plan.num_seqs, plan.scale = 4, 2, 1, 0.125
+    plan.stream_type = CUstream
+    plan.chain_buffer_names = CHAIN_FORWARD_BUFFERS
+    plan.carve_names = (
+        "scheduler_all",
+        "scheduler_h",
+        "scheduler_prefill",
+        "work_items",
+        "work_items_summary",
+        "main_rows",
+        "summary_rows",
+        "cu_pieces",
+        "main_count",
+        "summary_count",
+        "state_h",
+        "state_m",
+        "state_x",
+        "fused_tensormaps",
+        "tensormaps",
+    )
+    names = ("q", "k", "v", "g", "beta", "cu_seqlens", "O")
+    if optional:
+        names += ("initial_state", "final_state", "state_indices", "state_checkpoints", "a_log", "dt_bias")
+    plan.bind(names)
+    calls = []
+    plan.chain_launch = lambda *args: calls.append(args)
+    plan.run_chain_forward = run_chain_forward
+    plan.carve = object()
+    for stream in (0, 17):
+        inputs = dict.fromkeys(names)
+        inputs.update({name: object() for name in names})
+        region = {name: object() for name in plan.carve_names}
+        workspace = SimpleNamespace(carve=lambda _: tuple(region.values()))
+        plan.run_chain(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            inputs["beta"],
+            inputs["cu_seqlens"],
+            inputs.get("initial_state"),
+            inputs["O"],
+            inputs.get("final_state"),
+            inputs.get("state_checkpoints"),
+            inputs.get("a_log"),
+            inputs.get("dt_bias"),
+            inputs.get("state_indices"),
+            region,
+            stream,
+        )
+        plan.run(tuple(inputs.values()), workspace, stream)
+        cold, warm = calls[-2:]
+        assert cold[:-1] == warm[:-1]
+        assert int(cold[-1]) == int(warm[-1]) == stream
+
+
+def test_kda_warm_chain_new_workspace_stream_and_capture():
+    """The warm launch uses new storage and captures on the caller's stream."""
+    plan, values, outputs, scratch, workspace = make_plan(512, (2, 2, 2), backward=False, invariant=False)
+    assert plan.chain
+    execute(plan, values, outputs, workspace)
+    values = {name: value.clone() for name, value in values.items()}
+    values["v"].add_(0.25)
+    actual = {name: torch.empty_like(value) for name, value in outputs.items()}
+    new_scratch = torch.empty_like(scratch)
+    new_workspace = Workspace(new_scratch, plan.workspace_bytes(), "KDA warm test")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.stream(stream):
+            execute(plan, values, actual, new_workspace)
+            with torch.cuda.graph(captured, stream=stream):
+                plan.run(tuple(values.values()) + tuple(actual.values()), new_workspace, stream.cuda_stream)
+            captured.replay()
+        stream.synchronize()
+        plan.chain_launch = None
+        execute(plan, values, outputs, workspace)
+        for name, expected in outputs.items():
+            torch.testing.assert_close(actual[name], expected, rtol=0, atol=0)
+    finally:
+        stream.synchronize()
+        captured.reset()

@@ -57,7 +57,8 @@ def test_second_process_reloads_the_sdpa_forward_kernel(tmp_path):
     entries = list((tmp_path / cc._SCHEMA).glob("*/*/entry.json"))
     assert entries, "no entry committed"
     record = json.loads(entries[0].read_text())
-    assert record["symbol"] == "frost_sdpa_fwd" and "|compile|" in record["key"], record
+    # the first plan rides the prefill body or the dense decode tile (issue #1518); either is a frost forward template
+    assert record["symbol"] in ("frost_sdpa_fwd", "frost_sdpa_fwd_decode") and "|compile|" in record["key"], record
     # the compile() arguments are part of the key: the layout kind and the head-dim envelope
     # (shapes and strides are runtime arguments of the explicit pointer entry, not keys)
     assert "('d_qk', 128)" in record["key"] and "('lse_kind', 'dense')" in record["key"], record["key"]

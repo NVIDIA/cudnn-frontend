@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Per-tensor FP8 binding preserves scalar storage, host frames and split ownership."""
 
+import sdpa_binding_reference as binding_reference
+
 import ast
 from pathlib import Path
 
@@ -72,7 +74,7 @@ def test_native_fp8_matches_actual_host_and_python(d, dv, split, dtype, output):
     for offset in (0, 0x100000000):
         fresh = {role: f._replace(ptr=f.ptr + offset) if f is not None else None for role, f in facts.items()}
         workspace = 0x50000000 + offset
-        prep.execute_quantized(s, fresh, workspace, 17, 17)
+        binding_reference.execute_quantized(s, fresh, workspace, 17, 17)
         expected, combine = frames.pop(), combined.pop() if split > 1 else ()
         actual, tail, identity = s.native.bind_quantized(_native_pack(fresh), _INDICES, workspace, 17)
         assert tuple(actual) == expected and tuple(tail) == combine and identity == 0
@@ -126,7 +128,7 @@ def test_native_fp8_graph_rebinds_scales_and_replays(d, dv, split, output, monke
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native FP8 rebuilt Python operand facts"))
-    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native FP8 entered Python binding"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native FP8 entered Python binding"), raising=False)
     g.execute(vp, workspace)
     _check(buffers, thd=False)
     for name in ("q", "k", "v", "o", "descale_q", "descale_k", "descale_v", "scale_o", "amax_o", "lse"):
@@ -154,7 +156,7 @@ def test_native_fp8_omitted_scalars_use_current_workspace(missing, split, monkey
     monkeypatch.setattr(prep._buffers, "fill_word_async", lambda *args: writes.append(args))
     s, facts, frames, combined = _fixture(128, 128, split, "float8_e4m3fn", "float8_e4m3fn", missing=missing)
     for workspace in (0x50000000, 0x60000000):
-        prep.execute_quantized(s, facts, workspace, 17, 17)
+        binding_reference.execute_quantized(s, facts, workspace, 17, 17)
         expected_frame = frames.pop()
         expected_combine = combined.pop() if split > 1 else ()
         expected_writes = writes[:]
@@ -239,5 +241,5 @@ def test_native_fp8_standalone_route_uses_caller_scalar_scratch(d, dv, dtype, mo
 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
         pytest.skip("SM100/SM103 and supported CuTe DSL required")
-    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("standalone FP8 entered Python binding"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("standalone FP8 entered Python binding"), raising=False)
     check("sm100", d, dv, dtype)

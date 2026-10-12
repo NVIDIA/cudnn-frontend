@@ -928,6 +928,8 @@ def select_config(
     sm_count: int | None = None,
     force_cta_group: int | None = None,
     m_is_group_average: bool = False,
+    _pipeline: str | None = None,
+    _batch: int = 1,
 ) -> TileConfig:
     """Pick a TileConfig from problem geometry.
 
@@ -941,7 +943,10 @@ def select_config(
     ``K`` is optional only for callers that do not have it to hand; without it the
     small-K bias is neutral and everything else is unchanged. The pick is an sm100
     geometry; a caller building for another template family passes it through
-    :func:`as_pipeline`. ``force_cta_group`` overrides only the 1-CTA/2-CTA
+    :func:`as_pipeline` — except sm120, which has selection axes of its own (warp
+    grid, CTA K-tile width): a caller that knows it is building for that family
+    passes ``_pipeline="sm120"`` (and ``_batch``) so they are chosen HERE, where
+    M/N/K and the SM count are in hand, instead of being pinned by the crossing. ``force_cta_group`` overrides only the 1-CTA/2-CTA
     strategy heuristic; tile and cluster geometry are still selected and scored
     normally for that final strategy.
     """
@@ -1051,6 +1056,44 @@ def select_config(
     prefer = ((2, 1), (2, 4)) if cta_m == 256 else ((cta_group, 4),)
     rank = {g: len(prefer) - i for i, g in enumerate(prefer)}
     cgrp_m, cgrp_n = max(pool, key=lambda g: (_cluster_score(M, N, cta_m, cta_n, cta_group, g[0], g[1], sm), -_launched(g), rank.get(g, 0)))
+
+    # --- sm120 ---------------------------------------------------------------
+    # The warp-scoped family has axes this scorer never sees (warp grid, CTA
+    # K-tile width), and crossing the sm100 pick onto the family's fixed 4x2
+    # grid at 128 K-bytes leaves half the measured performance behind on the
+    # machine-filling layers (weekly sweep, sm120: fp8 0.73 / fp4 0.72
+    # geomean efficiency for the crossing). Choose them here instead.
+    if _pipeline == "sm120":
+        if block_scale:
+            # A 256-wide N tile measures at roughly half the 128-wide rate on
+            # the sm120 block-scale template (every machine-filling fp4 layer:
+            # 128x256 best 0.61 vs 128x128 best 0.99 of the per-layer optimum).
+            cta_n = min(cta_n, 128)
+        out_tiles = max(1, _batch) * (-(-M // cta_m)) * (-(-N // cta_n))
+        grid_big = out_tiles >= sm
+        # Both re-mappings below pay for themselves only when the mainloop is
+        # long enough to amortize them; at a shallow K they measure as losses
+        # (fp16 K<=64: -0.10..-0.16, fp8 K=1024 at 64-tall tiles: -0.12..-0.17).
+        # A-operand bytes: fp4 packs two elements per byte.
+        deep_k = (K or 0) * (0.5 if block_scale else b_elem_bytes) >= 2048
+        # Dense 1-byte operands on a machine-filling grid with deep K: the
+        # 64-byte K tile (fp8: 64 elements) halves the per-stage SMEM and
+        # measures 0.95 of the per-layer optimum where the 128-byte tile
+        # measures 0.58-0.70. fp16 (128 B = 64 elements already), block-scale
+        # (SF swizzle needs the 128-B row) and 64-tall tiles keep 128.
+        kb120 = 64 if (grid_big and deep_k and not block_scale and b_elem_bytes == 1 and cta_m >= 128) else 128
+        # Warp grid: grids at >= 1/4 machine fill over a deep K want the
+        # squarer 2x4 cut (64-wide warp N at cta_n=256, 64x64 at 128x128);
+        # latency-bound small grids and shallow K keep the crossing's 4x2.
+        # First grid that cuts the CTA tile into whole 16x16 warp MMAs wins.
+        order = ((2, 4), (4, 2), (8, 1), (1, 8)) if (deep_k and 4 * out_tiles >= sm) else ((4, 2), (2, 4), (8, 1), (1, 8))
+        for wm, wn in order:
+            if cta_m % (wm * 16) == 0 and cta_n % (wn * 16) == 0:
+                cfg120 = _CATALOG_BY_NAME.get(f"CONFIG_sm120_{cta_m}x{cta_n}x{kb120}_16x16x32_cluster1x1_warps{wm}x{wn}")
+                if cfg120 is not None:
+                    return cfg120
+        # No cataloged sm120 geometry for this tile: fall through to the sm100
+        # spelling and let as_pipeline's crossing handle it as before.
 
     # The 64-byte-K MMA halves the mainloop instruction count and measures
     # faster at the same DENSE-fp8 geometry on every part that issues it, so it

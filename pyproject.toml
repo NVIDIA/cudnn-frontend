@@ -141,3 +141,4 @@ include = ["**/*"]
     "VENDOR.md",
 ]
 "cudnn.linear_attention.cake.kernels" = ["*.cu", "SHA256SUMS", "UPSTREAM.md"]
+"cudnn.linear_attention.hopper" = ["cuda_kernels/*.cu"]

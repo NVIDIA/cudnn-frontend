@@ -6,22 +6,8 @@ import pytest
 import torch
 from looseversion import LooseVersion
 
+from batchnorm_test_utils import execute_graph, finalize_graph_or_skip, new_batchnorm_graph, preserve_handle_stream
 from test_utils import torch_fork_set_rng
-
-
-def convert_to_cudnn_type(torch_type):
-    if torch_type == torch.float16:
-        return cudnn.data_type.HALF
-    elif torch_type == torch.bfloat16:
-        return cudnn.data_type.BFLOAT16
-    elif torch_type == torch.float32:
-        return cudnn.data_type.FLOAT
-    elif torch_type == torch.int32:
-        return cudnn.data_type.INT32
-    elif torch_type == torch.int64:
-        return cudnn.data_type.INT64
-    else:
-        raise ValueError("Unsupported tensor data type.")
 
 
 @pytest.mark.skipif(
@@ -30,6 +16,7 @@ def convert_to_cudnn_type(torch_type):
 )
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@preserve_handle_stream
 def test_bn_relu_with_mask(cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
     input_type = torch.float16
@@ -57,15 +44,7 @@ def test_bn_relu_with_mask(cudnn_handle):
     mask_gpu = torch.empty_like(x_gpu, dtype=torch.bool, device="cuda")
 
     # cudnn graph
-    stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=cudnn_handle, stream=stream)
-
-    graph = cudnn.pygraph(
-        io_data_type=convert_to_cudnn_type(input_type),
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-        handle=cudnn_handle,
-    )
+    graph = new_batchnorm_graph(cudnn_handle, input_type)
 
     x = graph.tensor_like(x_gpu)
     scale = graph.tensor_like(scale_gpu)
@@ -97,17 +76,7 @@ def test_bn_relu_with_mask(cudnn_handle):
     out_running_var.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     mask.set_output(True).set_data_type(cudnn.data_type.BOOLEAN)
 
-    graph.validate()
-    graph.build_operation_graph()
-
-    try:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-    except cudnn.cudnnGraphNotSupportedError as e:
-        print(f"TEST WAIVED: unsupported graph. {e}")
-        pytest.skip("TEST WAIVED: unsupported graph.")
-
-    graph.build_plans()
+    finalize_graph_or_skip(graph)
 
     # cudnn graph execution
     variant_pack = {
@@ -126,13 +95,7 @@ def test_bn_relu_with_mask(cudnn_handle):
         comparison: comparison_gpu,
         mask: mask_gpu,
     }
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-    graph.execute(
-        variant_pack,
-        workspace,
-        handle=cudnn_handle,
-    )
-    torch.cuda.synchronize()
+    execute_graph(graph, variant_pack, cudnn_handle)
 
     # reference computation
     x_ref = x_gpu.clone().float()
@@ -172,6 +135,7 @@ def test_bn_relu_with_mask(cudnn_handle):
 )
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@preserve_handle_stream
 def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
     input_type = torch.float16
@@ -194,15 +158,7 @@ def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
         dX_dRelu_gpu = torch.empty_like(dY_gpu)
 
     # cudnn graph
-    stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=cudnn_handle, stream=stream)
-
-    graph = cudnn.pygraph(
-        io_data_type=convert_to_cudnn_type(input_type),
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-        handle=cudnn_handle,
-    )
+    graph = new_batchnorm_graph(cudnn_handle, input_type)
 
     x = graph.tensor_like(x_gpu)
     x_mask = graph.tensor_like(x_mask_gpu)
@@ -230,17 +186,7 @@ def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
     dScale.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     dBias.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    graph.validate()
-    graph.build_operation_graph()
-
-    try:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-    except cudnn.cudnnGraphNotSupportedError as e:
-        print(f"TEST WAIVED: unsupported graph. {e}")
-        pytest.skip("TEST WAIVED: unsupported graph.")
-
-    graph.build_plans()
+    finalize_graph_or_skip(graph)
 
     variant_pack = {
         x: x_gpu,
@@ -256,10 +202,7 @@ def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
     if dump_dX_dRelu:
         variant_pack[dX_drelu] = dX_dRelu_gpu
 
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-
-    graph.execute(variant_pack, workspace, handle=cudnn_handle)
-    torch.cuda.synchronize()
+    execute_graph(graph, variant_pack, cudnn_handle)
 
 
 @pytest.mark.skipif(
@@ -268,6 +211,7 @@ def test_drelu_dadd_dbn(dump_dX_dRelu, cudnn_handle):
 )
 @pytest.mark.L0
 @torch_fork_set_rng(seed=0)
+@preserve_handle_stream
 def test_bn_infer_drelu_dbn(cudnn_handle):
     n, c, h, w = 4, 16, 56, 56
     input_type = torch.float16
@@ -287,15 +231,7 @@ def test_bn_infer_drelu_dbn(cudnn_handle):
     dX_gpu = torch.empty_like(x_gpu)
 
     # cudnn graph
-    stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=cudnn_handle, stream=stream)
-
-    graph = cudnn.pygraph(
-        io_data_type=cudnn.data_type.HALF,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-        handle=cudnn_handle,
-    )
+    graph = new_batchnorm_graph(cudnn_handle, input_type)
 
     x = graph.tensor(
         name="x",
@@ -348,17 +284,7 @@ def test_bn_infer_drelu_dbn(cudnn_handle):
     dScale.set_output(True).set_data_type(cudnn.data_type.FLOAT)
     dBias.set_output(True).set_data_type(cudnn.data_type.FLOAT)
 
-    graph.validate()
-    graph.build_operation_graph()
-
-    try:
-        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-    except cudnn.cudnnGraphNotSupportedError as e:
-        print(f"TEST WAIVED: unsupported graph. {e}")
-        pytest.skip("TEST WAIVED: unsupported graph.")
-
-    graph.build_plans()
+    finalize_graph_or_skip(graph)
 
     variant_pack = {
         x: x_gpu,
@@ -372,7 +298,4 @@ def test_bn_infer_drelu_dbn(cudnn_handle):
         dBias: dBias_gpu,
     }
 
-    workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
-
-    graph.execute(variant_pack, workspace, handle=cudnn_handle)
-    torch.cuda.synchronize()
+    execute_graph(graph, variant_pack, cudnn_handle)

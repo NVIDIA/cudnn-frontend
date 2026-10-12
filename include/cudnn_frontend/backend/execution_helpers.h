@@ -7,7 +7,7 @@
 
 #include <vector>
 
-#include "cudnn.h"
+#include <cudnn.h>
 
 #include "backend_descriptor.h"
 

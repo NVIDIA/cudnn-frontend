@@ -523,6 +523,17 @@ class SM120FusedMultiHeadAttentionForward:
         return q_regs
 
     @cute.jit
+    def negate_q_frags(self, basic_params: SimpleNamespace, q_regs: cutlass.Array):
+        """Flip the sign of the lane's Q fragments: the register part and its own ``sQ`` slots (#1435)."""
+        for i in cutlass.range_constexpr(self.q_reg_frags * 4):
+            q_regs[i] = q_regs[i] ^ cutlass.Int32(-2147450880)  # 0x80008000: every element's sign bit
+        q_smem_base = (basic_params.compute_warp_idx * self.q_smem_frags * 32 + basic_params.lane) * 4
+        for f in cutlass.range_constexpr(self.q_smem_frags):
+            for i in cutlass.range_constexpr(4):
+                idx = q_smem_base + f * 32 * 4 + i
+                basic_params.sQ[idx] = basic_params.sQ[idx] ^ cutlass.Int32(-2147450880)
+
+    @cute.jit
     def load_q_tile(
         self,
         basic_params: SimpleNamespace,
@@ -1352,6 +1363,8 @@ class SM120FusedMultiHeadAttentionForward:
             while not prims.mbarrier_try_wait_parity(q_tma_mbar, q_parity):
                 pass
             q_regs = self.load_q_frags_from_smem(basic_params, sKV)
+            if cutlass.const_expr(PARAMS.negate_scores):  # attn_scale < 0; the host passes |attn_scale| (#1435)
+                self.negate_q_frags(basic_params, q_regs)
             prims.barrier_cta_sync(self.bar_compute_sync, thread_count=self.threads_compute)
 
         # Warp 0 issues the first K/V tile's TMA loads; compute_one_kv_tile
@@ -1365,6 +1378,8 @@ class SM120FusedMultiHeadAttentionForward:
         # Load Q into registers.
         if cutlass.const_expr(not self.tma_q):
             q_regs = self.load_q_tile(basic_params)
+            if cutlass.const_expr(PARAMS.negate_scores):  # attn_scale < 0; the host passes |attn_scale| (#1435)
+                self.negate_q_frags(basic_params, q_regs)
 
         # Main attention loop.
         mask_steps = 1

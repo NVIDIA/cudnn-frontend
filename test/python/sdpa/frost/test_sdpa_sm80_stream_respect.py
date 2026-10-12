@@ -96,16 +96,19 @@ def _assert_stream_respect(run, out_bufs, handle):
             run()
     s.synchronize()
     cg = torch.cuda.CUDAGraph()
-    for b in out_bufs:
-        b.zero_()
-    with torch.cuda.graph(cg, stream=s):
-        run()
-    for b in out_bufs:
-        b.zero_()
-    cg.replay()
-    torch.cuda.synchronize()
-    for b, r in zip(out_bufs, refs):
-        torch.testing.assert_close(b.float(), r.float(), rtol=0, atol=0)
+    try:
+        for b in out_bufs:
+            b.zero_()
+        with torch.cuda.graph(cg, stream=s):
+            run()
+        for b in out_bufs:
+            b.zero_()
+        cg.replay()
+        torch.cuda.synchronize()
+        for b, r in zip(out_bufs, refs):
+            torch.testing.assert_close(b.float(), r.float(), rtol=0, atol=0)
+    finally:
+        cg.reset()
 
 
 def test_sm80_fwd_respects_handle_stream_and_is_capturable():

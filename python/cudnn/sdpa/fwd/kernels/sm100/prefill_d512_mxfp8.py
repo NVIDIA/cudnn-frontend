@@ -1393,8 +1393,9 @@ def _tmaldg_warp_group(
             )
 
             kv_main_start = cute.math.min(kv_left + cutlass.Int32(KV_PROLOGUE_TILES), kv_right)
+            # Not the prologue's names: quack-kernels rewrites `if const_expr(S) and D` process-wide and would carry them in maybe-unset
             for kv_loop in cutlass.range(kv_main_start, kv_right, 1, unroll=1):
-                k_row, k_page, k_sf_tile, v_row, v_page, v_sf_group = _kv_tile_coords(
+                k_row_loop, k_page_loop, k_sf_tile_loop, v_row_loop, v_page_loop, v_sf_group_loop = _kv_tile_coords(
                     kv_loop,
                     batch_idx,
                     tma_batch,
@@ -1415,7 +1416,7 @@ def _tmaldg_warp_group(
                     bars.mb_k_full[kv_state_K.idx].arrive(n_bytes=kTmaTransactionBytes + K_SF_EXPECT_BYTES, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sK[kv_state_K.idx],
-                    tma_k(cutlass.Int32(0), k_row + K_ROW_OFFSET_PEER, cutlass.Int32(0), kv_head_idx, k_page),
+                    tma_k(cutlass.Int32(0), k_row_loop + K_ROW_OFFSET_PEER, cutlass.Int32(0), kv_head_idx, k_page_loop),
                     bars.mb_k_full[kv_state_K.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1423,7 +1424,7 @@ def _tmaldg_warp_group(
                 )
                 tma_load_tile(
                     sK_SF[kv_state_K.idx],
-                    tma_k_sf(cutlass.Int32(0), k_sf_tile, kv_head_idx, k_page, coord_0=cutlass.Int32(0)),
+                    tma_k_sf(cutlass.Int32(0), k_sf_tile_loop, kv_head_idx, k_page_loop, coord_0=cutlass.Int32(0)),
                     bars.mb_k_full[kv_state_K.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1438,7 +1439,7 @@ def _tmaldg_warp_group(
                     bars.mb_v_full[kv_state_V.idx].arrive(n_bytes=vTmaTransactionBytes + V_SF_EXPECT_BYTES, pred=nvvm.elect_sync())
                 tma_load_tile(
                     sV[kv_state_V.idx],
-                    tma_v(cutlass.Int32(0), v_row, dv_slice * cutlass.Int32(TMA_VO_ITERS), kv_head_idx, v_page),
+                    tma_v(cutlass.Int32(0), v_row_loop, dv_slice * cutlass.Int32(TMA_VO_ITERS), kv_head_idx, v_page_loop),
                     bars.mb_v_full[kv_state_V.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1446,7 +1447,7 @@ def _tmaldg_warp_group(
                 )
                 tma_load_tile(
                     sV_SF[kv_state_V.idx],
-                    tma_v_sf(cutlass.Int32(0), cutlass.Int32(0), dv_slice * cutlass.Int32(SF_NUM_BLOCKS_V), v_sf_group),
+                    tma_v_sf(cutlass.Int32(0), cutlass.Int32(0), dv_slice * cutlass.Int32(SF_NUM_BLOCKS_V), v_sf_group_loop),
                     bars.mb_v_full[kv_state_V.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
                     mcast_mask=tma_mcast_mask,
@@ -1460,8 +1461,9 @@ def _tmaldg_warp_group(
         if cutlass.const_expr(_SWA_REUSE_P):
             # Reuse the retained P tiles for the second Dv256 slice.  V has its
             # own pipeline state because K is not replayed in this pass.
+            # Not the prologue's names: quack-kernels rewrites `if const_expr(S) and D` process-wide and would carry them in maybe-unset
             for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
-                k_row, k_page, k_sf_tile, v_row, v_page, v_sf_group = _kv_tile_coords(
+                k_row_loop, k_page_loop, k_sf_tile_loop, v_row_loop, v_page_loop, v_sf_group_loop = _kv_tile_coords(
                     kv_loop,
                     batch_idx,
                     tma_batch,
@@ -1483,10 +1485,10 @@ def _tmaldg_warp_group(
                     sV[kv_state_V.idx],
                     tma_v(
                         cutlass.Int32(0),
-                        v_row,
+                        v_row_loop,
                         (dv_slice + cutlass.Int32(1)) * cutlass.Int32(TMA_VO_ITERS),
                         kv_head_idx,
-                        v_page,
+                        v_page_loop,
                     ),
                     bars.mb_v_full[kv_state_V.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
@@ -1499,7 +1501,7 @@ def _tmaldg_warp_group(
                         cutlass.Int32(0),
                         cutlass.Int32(0),
                         (dv_slice + cutlass.Int32(1)) * cutlass.Int32(SF_NUM_BLOCKS_V),
-                        v_sf_group,
+                        v_sf_group_loop,
                     ),
                     bars.mb_v_full[kv_state_V.idx].smem_ptr,
                     cta_group=CFG.CTA_MMA,
@@ -1682,6 +1684,7 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=_MXFP8_K_DIM,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05MxInstrDesc.build(
         a_dtype=STORAGE_DTYPE,

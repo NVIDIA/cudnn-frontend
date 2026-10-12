@@ -167,6 +167,7 @@ def test_packed_combine_live_total_and_runtime_split_boundary(dtype, stats):
                 lstride,
                 total.data_ptr(),
                 torch.cuda.current_stream().cuda_stream,
+                None,  # This direct packed entry has no sink.
             )
 
         def check(live):
@@ -183,19 +184,22 @@ def test_packed_combine_live_total_and_runtime_split_boundary(dtype, stats):
         run()
         check(sq)
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
-            run()
-        for live in (3, 0):
-            # The captured launch has seven rows of capacity. Device total
-            # changes must prevent both partial-tail reads and final stores.
-            total.fill_(live)
-            op[:, live:].fill_(torch.nan)
-            lp[:, :, live:].fill_(torch.nan)
-            ostorage.fill_(-31)
-            if lstorage is not None:
-                lstorage.fill_(-31)
-            captured.replay()
-            check(live)
+        try:
+            with torch.cuda.graph(captured):
+                run()
+            for live in (3, 0):
+                # The captured launch has seven rows of capacity. Device total
+                # changes must prevent both partial-tail reads and final stores.
+                total.fill_(live)
+                op[:, live:].fill_(torch.nan)
+                lp[:, :, live:].fill_(torch.nan)
+                ostorage.fill_(-31)
+                if lstorage is not None:
+                    lstorage.fill_(-31)
+                captured.replay()
+                check(live)
+        finally:
+            captured.reset()
 
 
 @pytest.mark.parametrize("layout", ["compact", "strided", "int64_singleton"])

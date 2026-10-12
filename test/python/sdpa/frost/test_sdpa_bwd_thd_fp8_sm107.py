@@ -40,7 +40,7 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import requires_dsl, requires_rubin, requires_sm80, select_engine
+from frost_test_utils import cuda_launch_counts, requires_dsl, requires_rubin, requires_sm80, select_engine
 from test_sdpa_bwd_dsl_sm107 import _adapter
 from test_sdpa_bwd_fp8_sm107 import _AMAX, _AMAX_DS_TOL, _DS_KNOBS, _FP8_GRAD_TOL, _SCALARS, _ds_dtype_code, ds_knob  # noqa: F401  (ds_knob: fixture by import)
 from test_sdpa_bwd_thd_sm107 import (
@@ -52,10 +52,11 @@ from test_sdpa_bwd_thd_sm107 import (
     _plan_index,
     _rows_with_keys,
     _sentinel_tails,
+    _spec_without_compiling,
 )
 from test_sdpa_bwd_thd_sm107 import test_stage3_thd_band_arithmetic as _band_arithmetic  # the tk-parametrized body, called with the fp8 K tile
 
-from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
+from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_FP32
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -130,11 +131,14 @@ def _thd_fp8_case(
     quantize_ds=True,
     device="cuda",
     oracle=True,
+    external_delta=False,
 ):
     """Packed e4m3 Q / K / V / dO (one scalar per operand over the packed live tokens), the forward's packed e4m3 O and packed
     natural-log Stats (per sequence through ``sdpa.fp8_ref.compute_ref``, O quantized ONCE at the packed amax), the twelve
     scalars by delayed scaling from the per-sequence oracle's amaxes (ONE ``scale_dP`` / ``scale_dQ / dK / dV`` per packed batch),
-    and the per-sequence reference gradients quantized at those global scales.
+    and the per-sequence reference gradients quantized at those global scales.  ``external_delta`` adds the TRUE-unit delta recipe of
+    the dense adapter runner: the fp32 ``rowsum(dO * O)`` over the DEQUANTIZED payloads, PACKED head-major ``[1, H, ceil128(cap_q)]``,
+    zeros past the live total (``delta_t``), bound AS IS and fed to the oracle per sequence.
 
     ``cap_*`` over-allocates the packed buffers past the real totals; with ``poison`` the slack is NaN (e4m3 has a NaN code) --
     the declared totals only bound the buffers, so the rows between ``cu_*[B]`` and the capacity have to be kept out of reach by
@@ -198,6 +202,11 @@ def _thd_fp8_case(
     o_ds = 1.0 / o_scale
     o8 = pack((o32[0, :t_q] * o_scale).to(_T_E4M3), cap_q, h)
     q_p, k_p, v_p, do_p = pack(q8, cap_q, h), pack(k8, cap_kv, hkv), pack(v8, cap_kv, hkv), pack(do8, cap_q, h)
+    delta_t = None
+    if external_delta:
+        # the TRUE-unit contract: fp32 rowsum(dO * O) over the DEQUANTIZED payloads at the packed token index, zeros past the live total
+        delta_t = torch.zeros(1, h, -(-cap_q // 128) * 128, device=dev, dtype=torch.float32)
+        delta_t[0, :, :t_q] = (o8[0, :t_q].float() * o_ds * do8.float() * do_ds).sum(-1).transpose(0, 1)
 
     def ref_bwd(i, *, dP_scale=None, return_intermediates=False, quantize_grads=True, quantize_ds_=None):
         """The fp8 oracle on sequence ``i`` alone ([1, S, H, D] slices of the packed codes, the sequence's own Stats)."""
@@ -207,7 +216,7 @@ def _thd_fp8_case(
             q_ds, k_ds, v_ds, s_scale, s_descale, _T_E4M3, o_ds, do_ds, grad_dtype,
             left_bound=window_left, right_bound=right, diag_align=align, stats=lse[0, :, slq][None, :, :, None],
             return_intermediates=return_intermediates, quantize_ds=quantize_ds if quantize_ds_ is None else quantize_ds_,
-            dP_scale=dP_scale, quantize_grads=quantize_grads,
+            dP_scale=dP_scale, quantize_grads=quantize_grads, delta=None if delta_t is None else delta_t[:, :, slq],
         )  # fmt: skip
 
     live = [i for i in range(b) if lens_q[i] > 0 and lens_kv[i] > 0] if oracle else []
@@ -246,7 +255,7 @@ def _thd_fp8_case(
         lens_q=lens_q, lens_kv=lens_kv, cu_q=cu_q, cu_k=cu_k, t_q=t_q, t_kv=t_kv, cap_q=cap_q, cap_kv=cap_kv, live=live,
         q=q_p, k=k_p, v=v_p, o=o8, do=do_p, lse=lse, scalars=scalars, dp_scale=dp_scale, s_descale=s_descale, grad_scale=grad_scale,
         descales={name: 1.0 / s for name, s in grad_scale.items()}, refs=refs, ref_amax=dict(dQ=amax32["dQ"], dK=amax32["dK"], dV=amax32["dV"], dP=ds_amax),
-        deq=deq, ref_bwd=ref_bwd, quantize_ds=quantize_ds,
+        deq=deq, ref_bwd=ref_bwd, quantize_ds=quantize_ds, delta_t=delta_t,
     )  # fmt: skip
 
 
@@ -367,7 +376,7 @@ def _scalar_tensors(scalars):
     return {name: torch.tensor([float(v)], dtype=torch.float32, device="cuda") for name, v in scalars.items()}
 
 
-def _build_direct_api(case, *, token_major_stats=False, request_amax=_AMAX, envelope_q=None):
+def _build_direct_api(case, *, token_major_stats=False, request_amax=_AMAX, envelope_q=None, external_delta=False):
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107Fp8
 
     # The packed buffers are allocated at ``cap_q`` / ``cap_kv`` tokens (the live totals plus a capacity tail); the envelope must
@@ -399,6 +408,7 @@ def _build_direct_api(case, *, token_major_stats=False, request_amax=_AMAX, enve
         # port's stride; token-major (T, H) Stats is compact and takes no stride (``_run_fp8_direct`` slices it to the plan's cap).
         thd_stats_head_stride=None if token_major_stats else case.cap_q,
         amax_requested=tuple(request_amax),
+        external_delta=external_delta,
     )
     assert api.check_support()
     return api
@@ -424,18 +434,25 @@ def _run_fp8_direct(
     check=None,
     seed=7,
     envelope_q=None,
+    external_delta=False,
+    delta=None,
 ):
     """Build the case, drive ``SdpaBwdDslSm107Fp8(thd=True)`` directly on PACKED views over a 0xFF-poisoned workspace (NaN in every
     dtype the chain stores: a stage reading a scratch region before writing it surfaces as NaN), the gradient tails past the packed
     totals under the finite sentinel, the amax outputs NaN-filled per run; compare per sequence under the fp8 recipe.  The dS
     rounding the oracle composes follows the ``ds_knob`` fixture (``api_dsl_sm107.FP8_DS_DTYPE`` at construction).  Returns the
-    run (case, gradients, amax values, every run's outputs, the api and its arguments) for the caller's extra assertions."""
+    run (case, gradients, amax values, every run's outputs, the api and its arguments) for the caller's extra assertions.
+    ``external_delta`` builds the plan with the appended delta slot: a given ``delta`` (the PACKED ``[1, H, ceil128(cap_q)]`` fp32) is
+    bound AS IS (the bitwise cell reads the chain's own out of a sibling's region; the oracle keeps its own), ``delta=None`` hands the
+    kernel the case's TRUE-unit recipe (``_thd_fp8_case(external_delta=True)``) and feeds the oracle the SAME delta."""
     dev = "cuda"
     case = _thd_fp8_case(
         lens_q, lens_kv, h, hkv, cap_q=sum(lens_q) + pad_cap, cap_kv=sum(lens_kv) + pad_cap, poison=poison, seed=seed, causal=causal,
         bottom_right=bottom_right, window_left=window_left, grad_dtype=grad_dtype, quantize_ds=(_ds_dtype_code() == DTYPE_E4M3),
+        external_delta=bool(external_delta) and delta is None,
     )  # fmt: skip
-    api = _build_direct_api(case, token_major_stats=token_major_stats, request_amax=request_amax, envelope_q=envelope_q)
+    api = _build_direct_api(case, token_major_stats=token_major_stats, request_amax=request_amax, envelope_q=envelope_q, external_delta=external_delta)
+    delta_t = (delta if delta is not None else case.delta_t) if external_delta else None
     view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
     fill = float("nan") if poison_outputs else 0.0
     dq = torch.empty(1, case.cap_q, case.h, _D, device=dev, dtype=grad_dtype)
@@ -450,7 +467,7 @@ def _run_fp8_direct(
     lq = torch.tensor(case.lens_q, dtype=torch.int32, device=dev)
     lk = torch.tensor(case.lens_kv, dtype=torch.int32, device=dev)
     tensors = (view(case.q), view(case.k), view(case.v), view(case.o), view(case.do), stats, view(dq), view(dk), view(dv))
-    kwargs = dict(workspace=ws, seq_q_lens=lq, seq_kv_lens=lk, **scalars, **{name: amax_t.get(name) for name in _AMAX})
+    kwargs = dict(workspace=ws, seq_q_lens=lq, seq_kv_lens=lk, **scalars, **{name: amax_t.get(name) for name in _AMAX}, delta_tensor=delta_t)
     outs, amaxes = [], []
     for _ in range(runs):
         for x in (dq, dk, dv):
@@ -468,7 +485,74 @@ def _run_fp8_direct(
     _assert_tails_untouched(case, dq, dk, dv)
     amax = {name[len("amax_") :]: v for name, v in amaxes[-1].items()}
     (check or _check_fp8)(case, dq, dk, dv, amax)
-    return SimpleNamespace(case=case, dq=dq, dk=dk, dv=dv, amax=amax, amaxes=amaxes, outs=outs, api=api, tensors=tensors, kwargs=kwargs, ws=ws, amax_t=amax_t)
+    return SimpleNamespace(
+        case=case, dq=dq, dk=dk, dv=dv, amax=amax, amaxes=amaxes, outs=outs, api=api, tensors=tensors, kwargs=kwargs, ws=ws, amax_t=amax_t, delta_t=delta_t
+    )
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "lens_q, lens_kv, causal", (((300, 128, 200), (300, 128, 200), True), ((256, 100), (180, 300), False)), ids=("self-causal", "cross-Tq356-Tkv480-dense")
+)
+def test_thd_fp8_external_delta_is_bitwise_the_chains_own_pre_pass(ds_knob, lens_q, lens_kv, causal):
+    """A THD plan built with ``external_delta=True`` and fed the delta the chain's OWN scaled pre-pass wrote over the packed e4m3 O / dO
+    (read back out of the sibling plan's ``R_DELTA`` region: ``rowsum(dO8 * O8) * descale_o * descale_dO`` in fp32, the PACKED head-major
+    ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``) returns dQ / dK / dV and the four amax ``torch.equal`` the sibling's -- the same
+    artifact minus the ``dot`` launch -- over three ragged sequences, GQA and a causal band, on both dS workspace dtypes.  Also pinned:
+    the slot (27) binds on the external plan only, the carve lost exactly the delta region, one launch fewer (CUPTI, when available),
+    the compiled plan's refusals fire with no launch.  The CROSS-attention cell has Q and KV token capacities that round to DIFFERENT
+    tiles (356 -> 384 vs 480 -> 512): the slot's shape and the carve follow the Q capacity."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    t_pad, kv_pad = (-(-sum(x) // 128) * 128 for x in (lens_q, lens_kv))
+    assert (t_pad != kv_pad) is (lens_q != lens_kv), "the cross cell pins the Q capacity against a DIFFERENT KV one"
+    own = _run_fp8_direct(lens_q, lens_kv, h=4, hkv=2, causal=causal)
+    offset, shape, _strides = prepared_sm107._regions(own.api, prepared_sm107._REGION_SLOTS_FP8)[0][R_DELTA]
+    assert shape == own.api.external_delta_shape == (1, 4, t_pad), "the slot follows the Q token capacity"
+    delta = own.ws[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    assert torch.isfinite(delta).all() and torch.equal(delta[:, :, own.case.t_q :], torch.zeros_like(delta[:, :, own.case.t_q :]))
+    ext = _run_fp8_direct(lens_q, lens_kv, h=4, hkv=2, causal=causal, external_delta=True, delta=delta)
+    assert own.api._prepared.roles[27] == prepared_sm107.EXTERNAL_DELTA_ROLE and own.api._prepared.operands[27] is None
+    assert ext.api._prepared.operands[27] is not None, "the delta slot binds on the external plan only"
+    assert "delta" not in [n for n, _n, _d in ext.api._scratch_plan()] and "delta" in [n for n, _n, _d in own.api._scratch_plan()]
+    assert own.api.scratch_workspace_bytes() - ext.api.scratch_workspace_bytes() == ws_align(4 * t_pad * 4), "the carve lost exactly the delta region"
+    for name, x, y in zip(("dQ", "dK", "dV"), ext.outs[0], own.outs[0]):
+        _bitwise(f"{name}: the external-delta plan vs the chain's own pre-pass", x, y)
+    assert ext.amax == own.amax, (ext.amax, own.amax)
+    # one launch fewer (the scaled `dot` kernel), counted with CUPTI: only the profiler's own start may fail (-> None); a failure from a
+    # rerun propagates and the count assertion sits outside any handler, so a restored dot launch FAILS the test
+    counts = cuda_launch_counts(lambda: own.api.execute(*own.tensors, **own.kwargs), lambda: ext.api.execute(*ext.tensors, **ext.kwargs))
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        assert counts[1] == counts[0] - 1, counts
+        print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
+    launches = []
+    ext.api._prepared = replace(ext.api._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\]"):
+        ext.api.execute(
+            *ext.tensors, **dict(ext.kwargs, delta_tensor=torch.zeros(len(lens_q), 4, -(-max(lens_q) // 128) * 128, device="cuda"))
+        )  # the DENSE envelope shape
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.api.execute(*ext.tensors, **dict(ext.kwargs, delta_tensor=None))
+    assert not launches
+
+
+@requires_rubin
+def test_thd_fp8_external_delta_binds_true_units_as_is(ds_knob):
+    """The TRUE-unit contract of the fp8 row's external delta under THD: a producer's fp32 ``rowsum(dO * O)`` over the DEQUANTIZED packed
+    payloads (what a bf16-derived delta is) is bound AS IS -- the kernel reads delta unscaled at the packed token index and multiplies by
+    ``attn_scale * descale_s`` only, nobody applies ``descale_o * descale_dO`` -- and the gradients hold under the recipe against the
+    per-sequence fp8 oracle FED THE SAME DELTA (a different fp32 summation order than the chain's own pre-pass, so this cell is a recipe
+    compare, never bitwise: ``test_thd_fp8_external_delta_is_bitwise_the_chains_own_pre_pass`` is the bitwise one)."""
+    run = _run_fp8_direct((300, 128, 200), (300, 128, 200), h=4, hkv=2, causal=True, external_delta=True)
+    assert run.delta_t is not None and tuple(run.delta_t.shape) == (1, 4, 640) and run.api.external_delta is True
+    assert torch.equal(run.delta_t[:, :, run.case.t_q :], torch.zeros_like(run.delta_t[:, :, run.case.t_q :])), "zeros past the live total"
+    assert "delta" not in [n for n, _n, _d in run.api._scratch_plan()]
 
 
 @requires_rubin
@@ -548,7 +632,7 @@ def test_thd_fp8_nan_capacity_tail_unaligned_last_sequence():
 @requires_rubin
 @pytest.mark.parametrize("hkv", (2, 1), ids=("gqa_group2", "mqa"))
 def test_thd_fp8_gqa(hkv):
-    """Packed GQA / MQA: bf16 dK / dV partials ONE PER Q HEAD over the packed kv axis (``EPI_DESCALE`` on dK), folded and quantized
+    """Packed GQA / MQA: fp32 dK / dV partials ONE PER Q HEAD over the packed kv axis (``EPI_DESCALE`` on dK), folded and quantized
     onto the KV heads by the bounded ``fold_quant``; the reference SUMS a group's contributions."""
     _run_fp8_direct((300, 128, 200), (300, 128, 200), h=4, hkv=hkv)
 
@@ -773,21 +857,55 @@ def test_thd_fp8_two_launches_are_bitwise_and_race_free():
 
 
 @requires_rubin
-def test_thd_fp8_ds_workspace_dtypes_agree(monkeypatch):
+@pytest.mark.parametrize("hkv", [4, 2], ids=["mha", "gqa"])
+def test_thd_fp8_ds_workspace_dtypes_agree(monkeypatch, hkv):
     """The two chains side by side on one packed input: dV does not depend on dS and amax_dP is folded BEFORE the scale and the
-    cast, so both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change); amax_dV likewise.  dQ /
-    dK each pass the recipe against their OWN oracle inside ``_run_fp8_direct``."""
+    cast, so at MHA both are BITWISE across the knob (a difference is a kernel change, not a GEMM-arm change); amax_dV likewise.
+    Under GQA the e4m3 chain folds dV from fp32 per-Q-head partials (one rounding) while the bf16-dS twin keeps bf16 partials (no
+    SMEM for the fp32 dV staging beside its 96 KiB dS ring), so their dV codes differ where the twin's extra partial rounding
+    lands on an e4m3 midpoint (3.6 % of the live bytes at this case): pinned there are that the e4m3
+    chain's dV is never FARTHER from the once-rounded oracle than the twin's (0 live codes off it, measured), and that amax_dV
+    differs by at most ``group`` half-ulps of bf16 relative; no per-element bound between the chains (cancellation).  dQ / dK each pass the
+    recipe against their OWN oracle inside ``_run_fp8_direct``."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107
 
     runs = {}
     for knob in (DTYPE_E4M3, DTYPE_BF16):
         with monkeypatch.context() as patch:
             patch.setattr(sm107, "FP8_DS_DTYPE", knob)
-            runs[knob] = _run_fp8_direct((300, 128, 200), (300, 128, 200), h=4, hkv=2, causal=True)
+            runs[knob] = _run_fp8_direct((300, 128, 200), (300, 128, 200), h=4, hkv=hkv, causal=True)
     e4m3, bf16 = runs[DTYPE_E4M3], runs[DTYPE_BF16]
-    _bitwise("dV across the dS workspace dtype", e4m3.dv, bf16.dv)
     assert e4m3.amax["dP"] == bf16.amax["dP"], "amax_dP is the pre-quant fp32 max on both chains"
-    assert e4m3.amax["dV"] == bf16.amax["dV"]
+    group = 4 // hkv
+    if group == 1:
+        _bitwise("dV across the dS workspace dtype", e4m3.dv, bf16.dv)
+        assert e4m3.amax["dV"] == bf16.amax["dV"]
+        return
+    case = e4m3.case
+    n_ab = n_ar = n_br = n_live = 0
+    for i in case.live:
+        slk = slice(case.cu_k[i], case.cu_k[i] + case.lens_kv[i])
+        a8, b8, r8 = (
+            e4m3.dv[0, slk].contiguous().view(torch.uint8),
+            bf16.dv[0, slk].contiguous().view(torch.uint8),
+            case.refs[i]["dV"].contiguous().view(torch.uint8),
+        )
+        assert torch.equal(r8, bf16.case.refs[i]["dV"].contiguous().view(torch.uint8)), "dV does not depend on dS: one oracle dV behind both runs"
+        n_live += a8.numel()
+        n_ab += int((a8 != b8).sum())
+        n_ar += int((a8 != r8).sum())
+        n_br += int((b8 != r8).sum())
+    print(
+        f"\ndV e4m3-dS (fp32 partials) vs bf16-dS (bf16 partials) chain, packed GQA group {group}: {n_ab} of {n_live} live bytes differ; vs the oracle: "
+        f"{n_ar} (fp32 partials) / {n_br} (bf16 partials); amax_dV {e4m3.amax['dV']:.6g} / {bf16.amax['dV']:.6g}"
+    )
+    assert n_ar <= n_br, "the fp32 per-Q-head partials must leave the e4m3 chain's dV no farther from the once-rounded oracle than the twin's bf16 partials"
+    # the single rounding IS the oracle's up to fp32-vs-fp64 accumulation residue (0 of the live codes off, MEASURED 2026-10-06; the twin
+    # 11497 = 3.6 %); no per-element bound between the chains: a bf16 partial's rounding is relative to the PARTIAL (cancellation)
+    assert n_ar <= n_live // 1000, f"{n_ar} of {n_live} live dV codes off the once-rounded oracle with fp32 partials (> 0.1 %)"
+    assert abs(e4m3.amax["dV"] - bf16.amax["dV"]) <= group * 2.0**-9 * max(
+        e4m3.amax["dV"], bf16.amax["dV"]
+    ), "amax_dV: the twin's bf16 partial roundings move the fold's max by at most group half-ulps of bf16"
 
 
 @requires_rubin
@@ -1203,24 +1321,45 @@ def test_fp8_thd_refuses_the_dense_length_flags():
         _thd_adapter(seq_q_lens_present=True, **_TOTALS).check_support()
 
 
-def test_fp8_thd_declines_the_external_delta():
-    """A caller's delta is a DENSE contract ([B, H_q, S_q_pad] fp32); the THD chain's delta is its own scaled ``dot_do_o`` over the
-    packed e4m3 O / dO in the head-major ``[1, H_q, ceil128(T_q)]`` layout, and no producer emits that packed layout -- declined
-    typed before any plan is built, on the fp8 row exactly as on the bf16 row.  The THD roles carry no delta slot; the dense fp8
-    roles carry it LAST, after the appended per-batch kv lengths."""
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_FP8_THD, EXTERNAL_DELTA_ROLE, ROLES, ROLES_FP8, ROLES_FP8_THD
+def test_fp8_thd_serves_the_external_delta(monkeypatch):
+    """A caller's delta is SERVED under THD on the fp8 row exactly as on the bf16 row: the plan fact passes ``check_support``; its
+    contract is the packed head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout in TRUE units (the kernel reads it unscaled and nobody
+    applies ``descale_o * descale_dO`` -- the dense row's rule, so the chain's own scaled pre-pass is simply not launched); the THD
+    carve drops its own ``delta`` region exactly while the default plan keeps it; the THD roles carry the delta LAST -- slot 27,
+    after the two lengths at 9 / 10, the twelve scalars and the four amax -- on the roles AND the attributes, standalone-only on the
+    spec (the python binder finds the lengths by NAME, so an appended role has no positional coupling); the plan fact reaches the
+    host compile and keys the artifact.  The plan-fact check stays two-directional."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.prepared import Operand
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_FP8_THD, EXTERNAL_DELTA_ROLE, FP8_AMAX, FP8_SCALARS, ROLES, ROLES_FP8, ROLES_FP8_THD
+    from cudnn.sdpa.fwd.api_dsl import ws_align
 
-    with pytest.raises(ValueError, match="external_delta is not served on the packed chain"):
-        _thd_adapter(external_delta=True, **_TOTALS).check_support()
-    api = _thd_adapter(**_TOTALS)
+    h, t_pad = 2, -(-400 // 128) * 128
+    ext = _thd_adapter(h=h, external_delta=True, **_TOTALS)
+    assert ext.check_support() and ext.external_delta is True
+    api = _thd_adapter(h=h, **_TOTALS)
     assert api.check_support() and api.external_delta is False
-    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the THD carve keeps the chain's own (packed) delta region"
-    assert EXTERNAL_DELTA_ROLE not in ROLES_FP8_THD and EXTERNAL_DELTA_ROLE not in ATTRIBUTES_FP8_THD
+    assert ext.external_delta_shape == api.external_delta_shape == (1, h, t_pad)
+    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the default THD plan keeps the chain's own (packed) delta region"
+    assert "delta" not in [name for name, _n, _d in ext._scratch_plan()], "the external plan carves no delta region"
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(h * t_pad * 4), "the carve lost exactly the delta region"
     assert ROLES_FP8[-2:] == ("seq_kv", EXTERNAL_DELTA_ROLE), "the dense fp8 roles: the lengths, then the delta (appended)"
+    assert ROLES_FP8_THD == ROLES[:9] + ("seq_q", "seq_kv") + FP8_SCALARS + FP8_AMAX + (EXTERNAL_DELTA_ROLE,), "the THD roles: the delta LAST, slot 27"
     assert ROLES_FP8_THD[:11] == ROLES[:9] + ("seq_q", "seq_kv"), "the THD roles put the two length operands at slots 9 / 10 (the bf16 THD spec's order)"
-    assert ATTRIBUTES_FP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_FP8_THD) == len(ROLES_FP8_THD)
+    assert ATTRIBUTES_FP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_FP8_THD) == len(ROLES_FP8_THD) == 28
+    assert ATTRIBUTES_FP8_THD[-1] == EXTERNAL_DELTA_ROLE and ROLES_FP8_THD.index(EXTERNAL_DELTA_ROLE) == 27
     with pytest.raises(ValueError, match="external_delta=False"):
-        api._check_external_delta(torch.zeros(1, 2, 128))
+        api._check_external_delta(torch.zeros(1, h, t_pad))
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext._check_external_delta(None)
+    # the launch spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the key
+    own_spec, own_calls = _spec_without_compiling(monkeypatch, api, prepared_sm107.compile_plan_fp8_thd, "compile_host_fp8_thd")
+    ext_spec, ext_calls = _spec_without_compiling(monkeypatch, ext, prepared_sm107.compile_plan_fp8_thd, "compile_host_fp8_thd")
+    for spec in (own_spec, ext_spec):
+        assert not spec.native_binding and spec.length_form and spec.scale_log2 and spec.roles == ROLES_FP8_THD and len(spec.operands) == 28
+        assert spec.standalone_only_roles == (EXTERNAL_DELTA_ROLE,), "no graph declares a delta: framed absent on the graph path"
+    assert own_spec.operands[27] is None and ext_spec.operands[27] == Operand("float32", (1, h, t_pad), (h * t_pad, t_pad, 1), h * t_pad, 16, 4)
+    assert own_calls[0][1]["external_delta"] is False and ext_calls[0][1]["external_delta"] is True and own_calls[0][0][9] != ext_calls[0][0][9]
 
 
 def test_fp8_thd_execute_requires_both_lengths(monkeypatch):
@@ -1257,8 +1396,11 @@ def test_fp8_thd_scratch_plan_is_the_packed_carve(knob, monkeypatch):
     assert plan["ds_ws"][0] == (1, api._qh_chunk, api._ws_rows_cap, api._sq_pad) and plan["ds_ws"][1] == (_T_E4M3 if knob == DTYPE_E4M3 else torch.bfloat16)
     assert plan["seq_kv"] == ((THD_BWD_MAPS_META_WORDS(b, 5 + b),), torch.int32), "the metadata words + (5 + B) tensor maps, the bf16 THD layout"
     assert plan["desc_words"] == (((b + 1) * 16,), torch.int64)
-    assert plan["dv_part"] == ((1, tkv, h, _D), torch.bfloat16), "the per-Q-head dV_true partials over the packed kv capacity, bf16, always"
-    assert plan["dk_part"] == ((1, tkv, h, _D), torch.bfloat16), "GQA: the per-Q-head dK partials (EPI_DESCALE true units) over the packed kv capacity"
+    # The partials' dtype under GQA (h / hkv = 2 here): fp32 on the e4m3-dS chain -- the fold sums the group in fp32 and rounds ONCE
+    # (a bf16 partial was rounded twice) -- and bf16 on the bf16-dS twin (no SMEM for the fp32 dV staging beside its 96 KiB dS ring).
+    part = torch.float32 if knob == DTYPE_E4M3 else torch.bfloat16
+    assert plan["dv_part"] == ((1, tkv, h, _D), part), "the per-Q-head dV_true partials over the packed kv capacity, always (fp32 under GQA on the e4m3 chain)"
+    assert plan["dk_part"] == ((1, tkv, h, _D), part), "GQA: the per-Q-head dK partials (EPI_DESCALE true units) over the packed kv capacity"
     assert plan["amax_scratch"] == ((8,), torch.float32)
     twin = {"dq_ws": (1, tq, h, _D), "q_bf16": (1, tq, h, _D), "k_bf16": (1, tkv, hkv, _D)}
     if knob == DTYPE_E4M3:
@@ -1270,6 +1412,10 @@ def test_fp8_thd_scratch_plan_is_the_packed_carve(knob, monkeypatch):
         name not in plan for name in ("q_pad", "do_pad", "lse_pad", "k_pad", "v_pad")
     ), "no staging under THD: the packed path reads the caller's buffers"
     assert api.scratch_workspace_bytes() == sum(ws_align(math.prod(s) * dt.itemsize) for s, dt in plan.values())
+    # the external-delta plan: the SAME carve minus its first region, exactly
+    ext = _thd_adapter(b=b, h=h, hkv=hkv, external_delta=True, **_TOTALS)
+    assert ext.check_support() and [n for n, _s, _d in ext._scratch_shapes()] == names[1:]
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(math.prod(plan["delta"][0]) * 4)
 
 
 @pytest.mark.parametrize("b", [1, 2, 3, 8])
@@ -1331,8 +1477,8 @@ def test_stage3_fp8_thd_records_are_admitted_and_spelled():
         assert dk.dtype_qkv == dq.dtype_qkv == DTYPE_E4M3
         assert (dk.epi_mode, dq.epi_mode) == (dk_mode, EPI_QUANT)
         assert dq.dtype_out == DTYPE_E4M3 and dk.dtype_out == (
-            DTYPE_E4M3 if dk_mode == EPI_QUANT else -1
-        ), "QUANT stores the gradient dtype; DESCALE the inherited bf16"
+            DTYPE_E4M3 if dk_mode == EPI_QUANT else DTYPE_FP32
+        ), "QUANT stores the gradient dtype; DESCALE the fp32 per-Q-head partial the GQA fold rounds once"
 
         assert (dk.causal_mode, dq.causal_mode) == (CAUSAL_K_LO, CAUSAL_K_HI) and dk.causal_shift == dq.causal_shift == 0
         assert dk.thd_causal_bottom_right and dq.thd_causal_bottom_right
@@ -1354,6 +1500,7 @@ def test_fp8_thd_stage3_host_threads_the_epilogue_operands():
     """Source pin on the fp8 THD host: its stage-3 call hands the epilogue operands (``dk_epi`` / ``dq_epi``: the descale and
     quantize scalars, the amax pointers) to the THD stage-3 helper -- the dense fp8 host does; a THD host that reused the bf16
     helper's call shape would silently render EPI_NONE-shaped GEMMs (dQ wrong by ``descale_dP * descale_k``)."""
+    import re
     from pathlib import Path
 
     from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
@@ -1364,6 +1511,10 @@ def test_fp8_thd_stage3_host_threads_the_epilogue_operands():
     body = body[: body.index("\ndef ", 1)]
     assert "_stage3_thd(" in body and "dk_epi" in body and "dq_epi" in body, "host_fp8_thd must pass dk_epi / dq_epi into the THD stage-3 call"
     assert "fold_quant_host(" in body and "THD_CU_K_TOTAL_OFF" in body, "the fold + quantize pass is bounded at the live kv total on device"
+    # Under GQA the dV + dK folds are ONE launch, bounded the same way: every pair call on this host ends in the live kv total.
+    pair_calls = re.findall(r"fold_quant_pair_host\(([^()]*)\)", body)
+    assert pair_calls, "under GQA the THD host folds dV + dK in ONE launch (fold_quant_pair_host), bounded at the live kv total"
+    assert all(c.split(",")[-1].strip() == "live_kv" for c in pair_calls), f"every fold_quant_pair_host call must end in live_kv: {pair_calls}"
     assert "dot_do_o_scaled_host(" in body, "the packed delta is the scaled dot over the packed e4m3 O / dO"
 
 

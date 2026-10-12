@@ -22,7 +22,25 @@ struct DeviceBuffer {
     ~DeviceBuffer() { cudaFree(value); }
 };
 
+struct PlanMetadata {
+    int64_t engine = -1;
+    std::unordered_map<fe::KnobType_t, int64_t> knobs;
+    std::string name;
+    std::vector<fe::NumericalNote_t> numeric;
+    std::vector<fe::BehaviorNote_t> behavior;
+};
+
 struct InspectableGraph : fe::graph::Graph {
+    PlanMetadata
+    metadata(int64_t index) const {
+        PlanMetadata result;
+        REQUIRE(get_engine_and_knobs_at_index(index, result.engine, result.knobs).is_good());
+        REQUIRE(get_plan_name_at_index(index, result.name).is_good());
+        result.numeric = plans.numeric_notes.at(index);
+        REQUIRE(get_behavior_notes_for_plan_at_index(index, result.behavior).is_good());
+        return result;
+    }
+
     auto const&
     built_plans() const {
         return plans.execution_plans;
@@ -124,4 +142,102 @@ TEST_CASE("Graph autotune requires a built candidate", "[graph][autotune]") {
     REQUIRE(status.get_code() == fe::error_code_t::GRAPH_EXECUTION_FAILED);
     REQUIRE(graph->built_plans() == original_plans);
     REQUIRE(graph->selected_index() == original_candidate);
+}
+
+TEST_CASE("Graph autotune keeps plan identity through sorting and pruning", "[graph][autotune]") {
+    Handle handle;
+    auto graph = make_matmul(handle.value);
+    REQUIRE(graph->create_execution_plans({fe::HeurMode_t::A}).is_good());
+    REQUIRE(graph->build_plans(fe::BuildPlanPolicy_t::ALL).is_good());
+
+    SECTION("all built heuristic plans") {}
+    SECTION("a filtered prefix and unbuilt suffix are removed") {
+        // Pick two actually buildable configs with distinct names, without pinning
+        // engine IDs, knob choices, or which plan should win a timing comparison.
+        std::vector<PlanMetadata> configs;
+        for (int64_t i = 0; i < graph->get_execution_plan_count(); ++i) {
+            if (graph->built_plans()[i] == nullptr) continue;
+            auto metadata = graph->metadata(i);
+            if (configs.empty() || metadata.name.find(configs.front().name) == std::string::npos) {
+                configs.push_back(std::move(metadata));
+            }
+            if (configs.size() == 2) break;
+        }
+        if (configs.size() != 2) SKIP("Requires two buildable configs with distinct engine names");
+        graph = make_matmul(handle.value);
+        for (auto const& config : {configs[0], configs[1], configs[0]}) {
+            REQUIRE(graph->create_execution_plan(config.engine, config.knobs).is_good());
+        }
+        graph->deselect_engines({configs[0].name});
+        REQUIRE(graph->build_plan_at_index(0).is_bad());
+        REQUIRE(graph->build_plan_at_index(1).is_good());
+        REQUIRE(graph->built_plans()[0] == nullptr);
+        REQUIRE(graph->built_plans()[2] == nullptr);
+    }
+
+    std::unordered_map<fe::ExecutionPlan const*, PlanMetadata> original;
+    for (int64_t i = 0; i < graph->get_execution_plan_count(); ++i) {
+        if (graph->built_plans()[i]) original.emplace(graph->built_plans()[i].get(), graph->metadata(i));
+    }
+    REQUIRE_FALSE(original.empty());
+    Bindings bindings;
+    DeviceBuffer workspace(static_cast<size_t>(graph->get_autotune_workspace_size()));
+    REQUIRE(graph->autotune(handle.value, bindings.pointers, workspace.value).is_good());
+    REQUIRE(graph->selected_index() == 0);
+    REQUIRE(graph->get_execution_plan_count() == static_cast<int64_t>(original.size()));
+    for (int64_t i = 0; i < graph->get_execution_plan_count(); ++i) {
+        auto const& expected = original.at(graph->built_plans()[i].get());
+        auto const actual    = graph->metadata(i);
+        CHECK(actual.engine == expected.engine);
+        CHECK(actual.knobs == expected.knobs);
+        CHECK(actual.name == expected.name);
+        CHECK(actual.numeric == expected.numeric);
+        CHECK(actual.behavior == expected.behavior);
+        // A pruned rejected prefix must not leave a stale barred flag on the winner.
+        CHECK(graph->build_plan_at_index(i).is_good());
+    }
+    REQUIRE(graph->build_plan_at_index(0).is_good());
+    REQUIRE(graph->execute(handle.value, bindings.pointers, workspace.value).is_good());
+    bindings.check_output();
+
+    // The saved winner must reconstruct that same config on a fresh graph.
+    auto const expected_winner = original.at(graph->built_plans()[0].get());
+    auto const winner          = graph->metadata(0);
+    auto replay                = make_matmul(handle.value);
+    REQUIRE(replay->create_execution_plan(winner.engine, winner.knobs).is_good());
+    REQUIRE(replay->build_plan_at_index(0).is_good());
+    CHECK(replay->metadata(0).engine == expected_winner.engine);
+    CHECK(replay->metadata(0).knobs == expected_winner.knobs);
+    DeviceBuffer replay_workspace(static_cast<size_t>(replay->get_workspace_size()));
+    REQUIRE(cudaMemset(bindings.c.value, 0x7f, 1024) == cudaSuccess);
+    REQUIRE(replay->execute(handle.value, bindings.pointers, replay_workspace.value).is_good());
+    bindings.check_output();
+
+#ifndef CUDNN_FRONTEND_SKIP_JSON_LIB
+    // Serialized graphs have behavior notes but no engine-config/numeric-note list.
+    std::vector<uint8_t> blob;
+    REQUIRE(graph->serialize(blob).is_good());
+    InspectableGraph reloaded;
+    REQUIRE(reloaded.deserialize(handle.value, blob, false, false).is_good());
+    REQUIRE(reloaded.autotune(handle.value, bindings.pointers, workspace.value).is_good());
+    std::vector<fe::BehaviorNote_t> reloaded_notes;
+    REQUIRE(reloaded.get_behavior_notes(reloaded_notes).is_good());
+    CHECK(reloaded_notes == expected_winner.behavior);
+    REQUIRE(cudaMemset(bindings.c.value, 0x7f, 1024) == cudaSuccess);
+    REQUIRE(reloaded.execute(handle.value, bindings.pointers, workspace.value).is_good());
+    bindings.check_output();
+#endif
+
+    // Appending after compaction must add exactly one config, with its own notes.
+    auto const count = graph->get_execution_plan_count();
+    REQUIRE(graph->create_execution_plan(expected_winner.engine, expected_winner.knobs).is_good());
+    CHECK(graph->get_execution_plan_count() == count + 1);
+    auto const appended = graph->metadata(count);
+    CHECK(appended.engine == expected_winner.engine);
+    CHECK(appended.knobs == expected_winner.knobs);
+    CHECK(appended.numeric == expected_winner.numeric);
+    CHECK(appended.behavior == expected_winner.behavior);
+    REQUIRE(graph->build_plan_at_index(count).is_good());
+    REQUIRE(graph->execute(handle.value, bindings.pointers, workspace.value).is_good());
+    bindings.check_output();
 }

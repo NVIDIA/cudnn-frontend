@@ -6,6 +6,8 @@ The Python binder is an explicit reference here, never an exception-driven
 production fallback for native plans. No test pins a heuristic or timing.
 """
 
+import sdpa_binding_reference as binding_reference
+
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -17,7 +19,7 @@ pytestmark = [pytest.mark.L0]
 
 
 def _fixture(dtype="bfloat16", layout="NH", rank=4):
-    s = prep.ThdLaunchSpec()
+    s = binding_reference.ReferenceThdLaunchSpec()
     s.b, s.qh, s.kh, s.d_qk, s.d_v = 4, 8, 2, 128, 128
     s.cga_tile_m = 512
     s.paged, s.has_sink, s.lse_padded = False, False, False
@@ -57,7 +59,7 @@ def _native(s, facts, workspace=0x30000, stream=17):
 
 
 def _reference(s, facts, workspace=0x30000, stream=17):
-    return prep._bind_thd_python(s, facts, workspace, stream, stream)
+    return binding_reference._bind_thd_python(s, facts, workspace, stream, stream)
 
 
 def _equal(s, facts, **kwargs):
@@ -118,9 +120,9 @@ def test_native_rejects_invalid_runtime_contract_without_fallback(role, updates,
     changed = dict(facts, **{role: facts[role]._replace(**updates)})
     with pytest.raises(ValueError):
         _reference(s, changed)
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native plans must not fall back after a validation error"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native plans must not fall back after a validation error"), raising=False)
     with pytest.raises(ValueError):
-        prep.bind_thd(s, changed, 0x30000, 17, 17)
+        _native(s, changed)
     assert frames == []
 
 
@@ -343,9 +345,9 @@ def test_native_paged_revalidates_each_call(hnd, role, defect, monkeypatch):
         changed = dict(facts, **{role: f._replace(**update)})
     with pytest.raises(ValueError):
         _reference(s, changed)
-    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native paged plans must not fall back"))
+    monkeypatch.setattr(prep, "_bind_thd_python", lambda *args: pytest.fail("native paged plans must not fall back"), raising=False)
     with pytest.raises(ValueError):
-        prep.bind_thd(s, changed, 0x30000, 17, 17)
+        _native(s, changed)
     assert frames == []
 
 
@@ -458,32 +460,39 @@ def test_native_dynamic_hn_stride_keeps_invocation_frames_independent():
             _reference(s, changed)
 
 
-@pytest.mark.parametrize("hnd", [False, True, None], ids=["paged_nhd", "paged_hnd", "nonpaged_mla"])
+@pytest.mark.parametrize(
+    "hnd,d_qk,has_sink",
+    [(False, 128, False), (True, 128, False), (None, 192, False), (None, 128, False), (None, 256, False), (False, 128, True), (True, 128, True)],
+    ids=["paged_nhd", "paged_hnd", "nonpaged_mla", "nonpaged_d128", "nonpaged_d256", "paged_nhd_sink", "paged_hnd_sink"],
+)
 @pytest.mark.parametrize("layout", [None, "NH", "HN"])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("splits", [4, 16])
-def test_native_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, splits):
+def test_native_packed_split_matches_reference_and_rebinds(hnd, d_qk, layout, dtype, splits, has_sink):
     """Packed splits bind independent frames without weakening observed spans."""
     if hnd is None:
         s, facts, frames = _fixture(dtype, layout)
-        s.d_qk = 192
-        for role, heads in (("q", s.qh), ("k", s.kh)):
+        s.d_qk, s.d_v = d_qk, (256 if d_qk == 256 else 128)
+        for role, heads, width in (("q", s.qh, d_qk), ("k", s.kh, d_qk), ("v", s.kh, s.d_v), ("o", s.qh, s.d_v)):
             f = facts[role]
             facts[role] = f._replace(
-                span=f.span * 3 // 2,
-                shape=(*f.shape[:-1], 192),
-                strides=(*(x * 3 // 2 for x in f.strides[:-1]), 1),
+                span=f.span * width // 128,
+                shape=(*f.shape[:-1], width),
+                strides=(*(x * width // 128 for x in f.strides[:-1]), 1),
             )
-            s.decl[role] = (heads, 192, heads * 192, 192, 1, heads * 192)
+            s.decl[role] = (heads, width, heads * width, width, 1, heads * width)
     else:
         s, facts, frames = _paged_fixture(hnd, layout, dtype=dtype)
-    s.cga_tile_m = 128
+    if has_sink:
+        s.has_sink = True
+        facts["sinks"] = prep.BufferFacts(0x50000, "float32", (2, 0), s.qh, (s.qh,), (1,))
+    s.cga_tile_m = s.d_v
     s.order = list(s.order) + ["lse_partial_ptr", "partial_o_strides"]
     s.index = {name: i for i, name in enumerate(s.order)}
     s.template = list(s.template) + [None, None]
     s.template[s.index["n_thd_units"]] = 148
     capacity, off_o = 16, 8192
-    off_lse = off_o + splits * capacity * s.qh * 128 * 4
+    off_lse = off_o + splits * capacity * s.qh * s.d_v * 4
     s.split_workspace = prep.ThdSplitWorkspace(splits, capacity, off_o, off_lse)
     s.scratch_bytes = off_lse + splits * capacity * s.qh * 4
     s.native = cudnn._pybind_module._SdpaThdBinder(s)
@@ -493,9 +502,16 @@ def test_native_packed_split_matches_reference_and_rebinds(hnd, layout, dtype, s
     second = _equal(s, changed, workspace=0x8000000, stream=29)
     assert first[s.index["o_partial_ptr"]] == 0x4000000 + off_o
     assert second[s.index["lse_partial_ptr"]] == 0x8000000 + off_lse
-    assert second[s.index["partial_o_strides"]] == (16 * s.qh * 128, s.qh * 128, 128)
+    assert second[s.index["partial_o_strides"]] == (16 * s.qh * s.d_v, s.qh * s.d_v, s.d_v)
     if hnd is not None:
         assert second[s.index["block_table_v_ptr"]] == changed["block_table_v"].ptr
+    if has_sink:
+        assert first[s.index["sinks_ptr"]] == facts["sinks"].ptr
+        assert second[s.index["sinks_ptr"]] == changed["sinks"].ptr
+        for bad in (None, changed["sinks"]._replace(span=1), changed["sinks"]._replace(dtype="bfloat16"), changed["sinks"]._replace(device=(2, 1))):
+            for bind in (_native, _reference):
+                with pytest.raises(ValueError):
+                    bind(s, dict(changed, sinks=bad))
     assert tuple(s.template) == original
     s.native.execute(prep._native_pack_from_facts(changed), prep._NATIVE_THD_INDICES, 0x8000000, 29)
     assert frames[-1] == tuple(second)

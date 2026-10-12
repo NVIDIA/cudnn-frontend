@@ -61,10 +61,25 @@ DSA_INDEXER_FORWARD_PARAM_MARKS = [
 ]
 
 DSA_INDEXER_TOP_K_PARAM_MARKS = [
-    # 705: regression for odd top_k > threads-per-CTA, which used to fail the
-    # width-2 vectorized-store assert at JIT compile time.
-    pytest.mark.parametrize("top_k", [512, 705]),
-    pytest.mark.parametrize("next_n", [1]),
+    pytest.mark.parametrize("acc_dtype", [torch.float32]),
+    pytest.mark.parametrize(
+        "dtype,top_k,next_n,s_kv,input_pattern",
+        [
+            pytest.param(torch.bfloat16, 512, 1, 1024, "random", marks=pytest.mark.L0, id="bf16-k512"),
+            # Odd top_k above the CTA width previously failed vectorized stores.
+            pytest.param(torch.bfloat16, 705, 1, 1024, "random", marks=pytest.mark.L0, id="bf16-k705"),
+            pytest.param(torch.float32, 1, 2, 1024, "adversarial", marks=pytest.mark.L0, id="fp32-k1"),
+            pytest.param(torch.float32, 511, 2, 1024, "adversarial", marks=pytest.mark.L0, id="fp32-k511"),
+            pytest.param(torch.float32, 513, 2, 1024, "adversarial", marks=pytest.mark.L0, id="fp32-k513"),
+            pytest.param(torch.float16, 513, 2, 4096, "adversarial", marks=pytest.mark.L0, id="fp16-k513"),
+            pytest.param(torch.bfloat16, 513, 2, 4096, "adversarial", marks=pytest.mark.L0, id="bf16-k513"),
+            pytest.param(torch.float32, 2048, 2, 4096, "adversarial", marks=pytest.mark.L0, id="fp32-k2048"),
+            # Tie bins exceed the radix kernel's 32768-candidate buffer.
+            pytest.param(torch.float32, 705, 2, 65536, "adversarial", marks=pytest.mark.L1, id="fp32-spill-k705"),
+            pytest.param(torch.float32, 2048, 2, 65536, "adversarial", marks=pytest.mark.L1, id="fp32-spill-k2048"),
+        ],
+    ),
+    pytest.mark.parametrize("tie_break", [0, 1, 2], ids=["ties-none", "ties-small", "ties-large"]),
     pytest.mark.parametrize("return_val", [True, False]),
 ]
 
@@ -109,7 +124,7 @@ def with_dsa_indexer_forward_params(func):
 
 
 def with_dsa_indexer_top_k_params(func):
-    return _apply(DSA_PARAM_MARKS + DSA_INDEXER_TOP_K_PARAM_MARKS, func)
+    return _apply(DSA_INDEXER_TOP_K_PARAM_MARKS, func)
 
 
 def with_dsa_score_recompute_params(func):

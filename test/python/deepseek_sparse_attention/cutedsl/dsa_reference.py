@@ -347,30 +347,37 @@ def check_ref_compressed_topk(
         )
 
 
+def _indexer_top_k_ordered_keys(values: torch.Tensor) -> torch.Tensor:
+    # Match radix score ordering, including +0 before -0. NaNs are unspecified.
+    bits = values.to(torch.float32).view(torch.int32).to(torch.int64)
+    return torch.where(bits < 0, ~bits, bits ^ 0x80000000)
+
+
 def ref_indexer_top_k(
     input_values: torch.Tensor,  # (n_rows, num_cols)
     seq_lens: torch.Tensor,  # (batch_size,)
     top_k: int,
     next_n: int = 1,
+    tie_break: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-batch topk over the first seq_lens[b] columns. Returns (indices, values)."""
+    """Reference radix-score ordering with optional original-index tie priority."""
     n_rows, num_cols = input_values.shape
-    batch = seq_lens.shape[0]
-    rows_per_batch = n_rows // batch
+    assert n_rows == seq_lens.numel() * next_n
     device = input_values.device
-
+    row_lens = seq_lens.repeat_interleave(next_n) - next_n + torch.arange(n_rows, device=device) % next_n + 1
+    keys = _indexer_top_k_ordered_keys(input_values)
+    keys = keys.masked_fill(torch.arange(num_cols, device=device)[None, :] >= row_lens[:, None], -1)
+    # Stable sorting retains ascending indices, or descending indices after the
+    # reversal. Only modes 1/2 promise a particular selected set at a tie.
+    if tie_break == 2:
+        order = num_cols - 1 - torch.argsort(keys.flip(1), dim=1, descending=True, stable=True)
+    else:
+        order = torch.argsort(keys, dim=1, descending=True, stable=True)
+    k = min(top_k, num_cols)
     out_idx = torch.zeros(n_rows, top_k, dtype=torch.int32, device=device)
     out_val = torch.zeros(n_rows, top_k, dtype=input_values.dtype, device=device)
-    for b in range(batch):
-        L = int(seq_lens[b].item())
-        row_start = b * rows_per_batch
-        row_end = row_start + rows_per_batch
-        block = input_values[row_start:row_end, :L]
-        k_eff = min(top_k, L)
-        if k_eff > 0:
-            vals, idxs = torch.topk(block, k_eff, dim=1)
-            out_idx[row_start:row_end, :k_eff] = idxs.to(torch.int32)
-            out_val[row_start:row_end, :k_eff] = vals
+    out_idx[:, :k] = order[:, :k].to(torch.int32)
+    out_val[:, :k] = input_values.gather(1, order[:, :k])
     return out_idx, out_val
 
 
@@ -384,26 +391,39 @@ def check_ref_indexer_top_k(
     return_val: bool,
     atol: float = 0.0,
     rtol: float = 0.0,
+    tie_break: int = 0,
 ):
-    idx_ref, val_ref = ref_indexer_top_k(input_values, seq_lens, top_k, next_n)
-    # Topk order is permitted to differ; compare as sorted sets per row up to the
-    # effective length. The DSA kernel returns indices for a particular row; we
-    # verify that the set of picked indices matches the reference set.
+    idx_ref, val_ref = ref_indexer_top_k(input_values, seq_lens, top_k, next_n, tie_break)
     n_rows = input_values.shape[0]
-    batch = seq_lens.shape[0]
-    rows_per_batch = n_rows // batch
-    for r in range(n_rows):
-        # Only the first min(top_k, seq_lens[b]) entries of a row are picked.
-        # Past that the reference pads with zeros while the kernel leaves its
-        # sentinel init, so comparing whole rows compares two paddings.
-        k_eff = min(top_k, int(seq_lens[r // rows_per_batch].item()))
-        ref_set = set(int(i) for i in idx_ref[r, :k_eff].tolist())
-        act_set = set(int(i) for i in idx_actual[r, :k_eff].tolist())
-        # Values within the effective top-k slice should match after sorting.
-        if return_val:
-            ref_sorted = torch.sort(val_ref[r, :k_eff]).values
-            act_sorted = torch.sort(val_actual[r, :k_eff].to(val_ref.dtype)).values
-            torch.testing.assert_close(act_sorted, ref_sorted, atol=atol, rtol=rtol)
+    device = input_values.device
+    row_lens = seq_lens.repeat_interleave(next_n) - next_n + torch.arange(n_rows, device=device) % next_n + 1
+    valid = torch.arange(top_k, device=device)[None, :] < row_lens[:, None]
+    assert idx_actual.shape == (n_rows, top_k)
+    assert idx_actual.dtype == torch.int32
+    assert torch.all(~valid | ((idx_actual >= 0) & (idx_actual < row_lens[:, None])))
+
+    selected = torch.where(valid, idx_actual, 0).to(torch.int64)
+    gathered = input_values.gather(1, selected)
+    # Check values even when the caller requests indices only. Ordered keys also
+    # distinguish the two zero signs, which floating-point equality does not.
+    actual_keys = _indexer_top_k_ordered_keys(gathered).masked_fill(~valid, -1)
+    ref_keys = _indexer_top_k_ordered_keys(val_ref).masked_fill(~valid, -1)
+    torch.testing.assert_close(torch.sort(actual_keys, dim=1).values, torch.sort(ref_keys, dim=1).values, atol=0, rtol=0)
+
+    sorted_indices = torch.sort(idx_actual.masked_fill(~valid, -1), dim=1, descending=True).values
+    # No repeated index can substitute for distinct equal-scoring candidates.
+    assert torch.all((sorted_indices[:, 1:] < 0) | (sorted_indices[:, 1:] != sorted_indices[:, :-1]))
+    if tie_break:
+        expected_indices = torch.sort(idx_ref.masked_fill(~valid, -1), dim=1, descending=True).values
+        torch.testing.assert_close(sorted_indices, expected_indices, atol=0, rtol=0)
+
+    if return_val:
+        assert val_actual.shape == (n_rows, top_k)
+        assert val_actual.dtype == input_values.dtype
+        torch.testing.assert_close(val_actual[valid], gathered[valid], atol=atol, rtol=rtol)
+        assert torch.equal(_indexer_top_k_ordered_keys(val_actual)[valid], actual_keys[valid])
+    else:
+        assert val_actual is None
 
 
 def ref_sparse_indexer_score_recompute(

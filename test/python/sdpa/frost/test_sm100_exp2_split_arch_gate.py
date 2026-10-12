@@ -40,13 +40,16 @@ _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 # (+7.0 % causal / +5.7 % dense at the DSv3 layer, B=2 H=128/128 S=2K; -10 % / -6 % with it left on at cc 10.3),
 # and d192x128 MXFP8 on 2026-09-29, where it gates that kernel's own ex2_emulation_2 mix the same way (B200 keeps
 # it, its tuned default; off at cc 10.3: DSv3 dense S=2K 1.17x -> 1.02x of cuDNN, kimi-K3 1.16x -> 1.00x).
-_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128))}
-# Measured on B200 and deliberately OFF: d128 bf16 (dense +3.9 % but causal -1.9 / -2.4 %).  The ADDITIONAL _E2E_*
+# d128 bf16 / fp16 (2026-10-05, B200 / cuDNN 9.28 control): the kernel's _E2E_* block is a dense-band win and a causal
+# loss (dense +3.9 % alone, causal -1 .. -2.4 %), so the field is ON for the kernel and the kernel itself folds the split
+# out of the causal / sliding-window builds (``_E2E_DENSE_BAND``, see test_d128_f16_folds_the_split_out_of_the_band_builds).
+_ON = {("mxfp8", (128, 128)), ("fp8", (128, 128)), ("fp8", (192, 128)), ("mxfp8", (192, 128)), ("f16", (192, 128)), ("f16", (128, 128))}
+# Measured on B200 and deliberately OFF.  The ADDITIONAL _E2E_*
 # blocks measured on d192x128 fp8 (dense +1 %, causal -1.6 %) and d192x128 mxfp8 (-3.3..-4.0 % dense) were never
 # merged -- neither is what those kernels' ON entries gate (their own pre-existing emulation mixes, see _ON).
 # The native d64 quantized legs (gpt-oss, B=2 H=128 d=64 SWA=128, B200 2026-09-28): the split loses there too --
 # fp8 -7 % (1.19x -> 1.28x of cuDNN), mxfp8 -10 % (0.96x -> 1.06x).
-_MEASURED_OFF = {("f16", (128, 128)), ("fp8", (64, 64)), ("mxfp8", (64, 64))}
+_MEASURED_OFF = {("fp8", (64, 64)), ("mxfp8", (64, 64))}
 
 
 def test_quant_kind_is_the_kernel_file_spelling():
@@ -101,6 +104,7 @@ _GATED_KERNELS = [
     pytest.param("mxfp8", (128, 128), dict(fp8=True, pertensor=False), dict(dtype_qkv=0, dtype_o=2, qh_per_kh=3), id="d128_mxfp8"),
     pytest.param("fp8", (128, 128), dict(fp8=True, pertensor=True), dict(dtype_qkv=0, dtype_o=0, qh_per_kh=8, emit_amax_o=True), id="d128_fp8"),
     pytest.param("f16", (192, 128), dict(fp8=False, pertensor=False), dict(dtype_qkv=2, dtype_o=2, qh_per_kh=1), id="d192x128_bf16"),
+    pytest.param("f16", (128, 128), dict(fp8=False, pertensor=False), dict(dtype_qkv=2, dtype_o=2, qh_per_kh=8), id="d128_bf16"),
 ]
 
 
@@ -126,6 +130,26 @@ def test_gated_kernel_module_folds_the_split_on_the_param(kind, flavor, load_kw,
         assert mod._E2E_EMULATED_COLS == 0
         assert all(len(p) == 0 for p in mod._E2E_PAIRS), mod._E2E_PAIRS
     assert 2 * sum(len(p) for p in mod._E2E_PAIRS) == mod._E2E_EMULATED_COLS
+
+
+@requires_dsl
+@pytest.mark.parametrize(
+    "band_kw",
+    [dict(window_right=0), dict(window_left=128, window_right=0), dict(window_right=0, thd_varlen=True, seq_kv_lens_present=True)],
+    ids=["causal", "causal_swa", "causal_thd"],
+)
+def test_d128_f16_folds_the_split_out_of_the_band_builds(band_kw):
+    """The d128 f16 kernel takes the cc 10.0 field like the other gated kernels but folds its split OUT of every build
+    with a causal / sliding-window bit in CFG.MASK_FLAGS (``_E2E_DENSE_BAND``): the split measured a loss on those
+    builds on B200.  Padding alone is not a band and keeps the split.  Trace-time only."""
+    from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module
+
+    base = dict(dtype_qkv=2, dtype_o=2, cta_mma=2, qh_per_kh=8, exp2_fma_split=True)
+    band = _load_sm100_kernel_module((128, 128), TemplateParams(**base, **band_kw), rubin=False, fp8=False, pertensor=False)
+    assert band._E2E_DENSE_BAND is False and band._E2E_ENABLED is False and band._E2E_EMULATED_COLS == 0
+    assert all(len(p) == 0 for p in band._E2E_PAIRS), band._E2E_PAIRS
+    padded = _load_sm100_kernel_module((128, 128), TemplateParams(**base, thd_varlen=True, seq_kv_lens_present=True), rubin=False, fp8=False, pertensor=False)
+    assert padded._E2E_DENSE_BAND is True and padded._E2E_ENABLED is True and padded._E2E_EMULATED_COLS == 32
 
 
 @requires_dsl

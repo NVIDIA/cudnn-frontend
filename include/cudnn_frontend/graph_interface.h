@@ -1246,10 +1246,10 @@ class Graph : public ICudnn, public INode {
         const int maxIterCount = 100;
         const float threshold  = 0.95f;
 
-        auto plan_cmp = [](std::shared_ptr<ExecutionPlan> a, std::shared_ptr<ExecutionPlan> b) {
-            return a->getExecutionTime() < b->getExecutionTime();
+        auto plan_cmp = [this](int64_t a, int64_t b) {
+            return plans.execution_plans[a]->getExecutionTime() < plans.execution_plans[b]->getExecutionTime();
         };
-        std::multiset<std::shared_ptr<ExecutionPlan>, decltype(plan_cmp)> timed_plans(plan_cmp);
+        std::multiset<int64_t, decltype(plan_cmp)> timed_plan_indices(plan_cmp);
 
         // Release events on both successful tuning and any CUDA/cuDNN error.
         struct TimingEvents {
@@ -1316,21 +1316,18 @@ class Graph : public ICudnn, public INode {
             CUDNN_FE_LOG_LABEL_ENDL("Plan " << plans.execution_plans[i]->getTag() << " took " << std::setw(10)
                                             << min_time_ms);
             plans.execution_plans[i]->setExecutionTime(min_time_ms);
-            timed_plans.insert(plans.execution_plans[i]);
+            timed_plan_indices.insert(i);
         }
 
         CUDNN_FE_LOG_LABEL_ENDL("Autotuned " << successful_plan_count << " plans.");
         // Publish a winner only after a successful measurement. A failed tune
         // must leave the original plan list and selection available for retry.
-        RETURN_CUDNN_FRONTEND_ERROR_IF(timed_plans.empty(),
+        RETURN_CUDNN_FRONTEND_ERROR_IF(timed_plan_indices.empty(),
                                        error_code_t::GRAPH_EXECUTION_FAILED,
                                        "No execution plans were successfully timed." + failure_details);
 
-        // Re-order plans by measured time, winner at index 0
-        plans.execution_plans.clear();
-        for (auto sorted_plan : timed_plans) {
-            plans.execution_plans.push_back(sorted_plan);
-        }
+        // Re-order plans and their metadata by measured time, winner at index 0.
+        plans.reorder_plans(std::vector<int64_t>(timed_plan_indices.begin(), timed_plan_indices.end()));
         plans.candidate = 0;
 
         // Re-prepare OSS slot indices to match the new plan ordering
@@ -3299,9 +3296,14 @@ Graph::layernorm(std::shared_ptr<Tensor_attributes> x,
             output_tensor(attributes.name + "::INV_VARIANCE");
     }
     // Set inputs
-    attributes.inputs[Layernorm_attributes::input_names::X]     = x;
-    attributes.inputs[Layernorm_attributes::input_names::SCALE] = scale;
-    attributes.inputs[Layernorm_attributes::input_names::BIAS]  = bias;
+    attributes.inputs[Layernorm_attributes::input_names::X] = x;
+    // scale and bias are optional (#188); keep nullptr out of the inputs map
+    if (scale) {
+        attributes.inputs[Layernorm_attributes::input_names::SCALE] = scale;
+    }
+    if (bias) {
+        attributes.inputs[Layernorm_attributes::input_names::BIAS] = bias;
+    }
 
     sub_nodes.emplace_back(std::make_unique<LayerNormNode>(std::move(attributes), context));
 
@@ -3326,7 +3328,10 @@ Graph::adalayernorm(std::shared_ptr<Tensor_attributes> x,
     // Set inputs
     attributes.inputs[AdaLayernorm_attributes::input_names::X]     = x;
     attributes.inputs[AdaLayernorm_attributes::input_names::SCALE] = scale;
-    attributes.inputs[AdaLayernorm_attributes::input_names::BIAS]  = bias;
+    // bias is optional (#188); keep nullptr out of the inputs map
+    if (bias) {
+        attributes.inputs[AdaLayernorm_attributes::input_names::BIAS] = bias;
+    }
 
     sub_nodes.emplace_back(std::make_unique<AdaLayerNormNode>(std::move(attributes), context));
 
@@ -3467,15 +3472,22 @@ Graph::layernorm_backward(std::shared_ptr<Tensor_attributes> dy,
     // Set outputs
     auto DX = attributes.outputs[Layernorm_backward_attributes::output_names::DX] =
         output_tensor(attributes.name + "::DX");
-    auto DSCALE = attributes.outputs[Layernorm_backward_attributes::output_names::DSCALE] =
-        output_tensor(attributes.name + "::DSCALE");
-    auto DBIAS = attributes.outputs[Layernorm_backward_attributes::output_names::DBIAS] =
-        output_tensor(attributes.name + "::DBIAS");
+    // scale is optional (#188); without one there is no DSCALE or DBIAS
+    std::shared_ptr<Tensor_attributes> DSCALE = nullptr;
+    std::shared_ptr<Tensor_attributes> DBIAS  = nullptr;
+    if (scale) {
+        DSCALE = attributes.outputs[Layernorm_backward_attributes::output_names::DSCALE] =
+            output_tensor(attributes.name + "::DSCALE");
+        DBIAS = attributes.outputs[Layernorm_backward_attributes::output_names::DBIAS] =
+            output_tensor(attributes.name + "::DBIAS");
+    }
 
     // Set inputs
-    attributes.inputs[Layernorm_backward_attributes::input_names::DY]    = dy;
-    attributes.inputs[Layernorm_backward_attributes::input_names::X]     = x;
-    attributes.inputs[Layernorm_backward_attributes::input_names::SCALE] = scale;
+    attributes.inputs[Layernorm_backward_attributes::input_names::DY] = dy;
+    attributes.inputs[Layernorm_backward_attributes::input_names::X]  = x;
+    if (scale) {
+        attributes.inputs[Layernorm_backward_attributes::input_names::SCALE] = scale;
+    }
 
     sub_nodes.emplace_back(std::make_unique<DLNNode>(std::move(attributes), context));
 
@@ -3618,8 +3630,11 @@ Graph::rmsnorm(std::shared_ptr<Tensor_attributes> x,
             output_tensor(attributes.name + "::INV_VARIANCE");
     }
     // Set inputs
-    attributes.inputs[Rmsnorm_attributes::input_names::X]     = x;
-    attributes.inputs[Rmsnorm_attributes::input_names::SCALE] = scale;
+    attributes.inputs[Rmsnorm_attributes::input_names::X] = x;
+    // scale is optional (the backend accepts a null SCALE_DESC, #188); keep nullptr out of the inputs map
+    if (scale) {
+        attributes.inputs[Rmsnorm_attributes::input_names::SCALE] = scale;
+    }
 
     sub_nodes.emplace_back(std::make_unique<RMSNormNode>(std::move(attributes), context));
 
@@ -3671,18 +3686,24 @@ Graph::rmsnorm_backward(std::shared_ptr<Tensor_attributes> dy,
     // Set outputs
     auto DX = attributes.outputs[Rmsnorm_backward_attributes::output_names::DX] =
         output_tensor(attributes.name + "::DX");
-    auto DScale = attributes.outputs[Rmsnorm_backward_attributes::output_names::DSCALE] =
-        output_tensor(attributes.name + "::Dscale");
-    std::shared_ptr<Tensor_attributes> DBias = nullptr;
-    if (attributes.use_dbias.value_or(true)) {
-        DBias = attributes.outputs[Rmsnorm_backward_attributes::output_names::DBIAS] =
-            output_tensor(attributes.name + "::Dbias");
+    // scale is optional (#188); without one there is no DSCALE or DBIAS
+    std::shared_ptr<Tensor_attributes> DScale = nullptr;
+    std::shared_ptr<Tensor_attributes> DBias  = nullptr;
+    if (scale) {
+        DScale = attributes.outputs[Rmsnorm_backward_attributes::output_names::DSCALE] =
+            output_tensor(attributes.name + "::Dscale");
+        if (attributes.use_dbias.value_or(true)) {
+            DBias = attributes.outputs[Rmsnorm_backward_attributes::output_names::DBIAS] =
+                output_tensor(attributes.name + "::Dbias");
+        }
     }
 
     // Set inputs
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::DY]           = dy;
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::X]            = x;
-    attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE]        = scale;
+    attributes.inputs[Rmsnorm_backward_attributes::input_names::DY] = dy;
+    attributes.inputs[Rmsnorm_backward_attributes::input_names::X]  = x;
+    if (scale) {
+        attributes.inputs[Rmsnorm_backward_attributes::input_names::SCALE] = scale;
+    }
     attributes.inputs[Rmsnorm_backward_attributes::input_names::INV_VARIANCE] = inv_variance;
 
     sub_nodes.emplace_back(std::make_unique<DRMSNormNode>(std::move(attributes), context));

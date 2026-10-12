@@ -40,8 +40,8 @@ The convenience wrapper follows cuhyena's Python API:
 The medium path supports FP64 filters through 4096. Other dtypes support
 filters through 8192 before SM90 and through 16384 on SM90 or newer.
 
-The raw long backend path requires power-of-two `seq_len == kernel_size` in
-`[4096, 16777216]`. FP64 supports lengths through 8388608; length 16777216 for
+The raw long backend path requires `seq_len == kernel_size`, and that shared
+length must be a power of two in `[4096, 16777216]`. FP64 supports lengths through 8388608; length 16777216 for
 other dtypes requires SM90 or newer.
 
 ## Long FFT Buffers

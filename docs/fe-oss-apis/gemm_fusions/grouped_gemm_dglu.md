@@ -691,8 +691,8 @@ partial goes to its own fp32 slot, and the slots are summed in a fixed order int
 launch stream; `use_dynamic_sched` stays supported and the other outputs are unchanged.
 
 Cost per call: a zeroed `valid_m x ceil(N / 256)` fp32 workspace (default tile and cluster) and a
-two-op reduction. Supported for the dense SM100 block-scaled kernel with torch tensors and without
-dbias; other configurations raise when the flag is set.
+two-op reduction. Supported for the SM100 block-scaled kernel (dense or discrete weights) with
+torch tensors and without dbias; other configurations raise when the flag is set.
 
 ### Wrapper Return Values
 

@@ -372,6 +372,18 @@ def test_split_kv_and_cta_mma_flavor_gating():
         else:
             with pytest.raises(ValueError, match="cta_mma is not selectable"):
                 f(TemplateParams(cta_mma=1))
+    # The d512 2x2-datapath record (TemplateParams.mma_2x2): make_cfg_d512 dispatches on the field -- the default
+    # record keeps the role-split CfgD512; mma_2x2=True builds the CfgD512X2 and still honours split_kv (the fp32-partials
+    # arm is in the kernel body; the ADAPTER twin keeps split plans on the role split in phase 1 -- see
+    # test_sdpa_fwd_d512_2x2_sm100.test_twin_declines_split_and_g128).
+    from cudnn.sdpa.fwd.config_sm100 import CfgD512, CfgD512X2
+
+    assert isinstance(make_cfg_d512(TemplateParams())[0], CfgD512) and not isinstance(make_cfg_d512(TemplateParams())[0], CfgD512X2)
+    cfg_2x2 = make_cfg_d512(TemplateParams(mma_2x2=True))[0]
+    assert isinstance(cfg_2x2, CfgD512X2) and cfg_2x2.SPLIT_KV == 1 and cfg_2x2.TILE_M == 64
+    assert make_cfg_d512(TemplateParams(mma_2x2=True, split_kv=4))[0].SPLIT_KV == 4
+    with pytest.raises(ValueError, match="cta_mma is not selectable"):
+        make_cfg_d512(TemplateParams(mma_2x2=True, cta_mma=1))
 
 
 # --- empty-split coverage across every f16 flavor -------------------------
