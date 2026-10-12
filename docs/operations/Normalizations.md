@@ -396,20 +396,22 @@ std::array<std::shared_ptr<Tensor_attributes>, 3>
 ```
 The output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
 
-Instancenorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
+Instancenorm_backward_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:
 ```
-Instancenorm_attributes&
+Instancenorm_backward_attributes&
 set_name(std::string const&)
 
-Instancenorm_attributes&
+Instancenorm_backward_attributes&
 set_compute_data_type(DataType_t value)
 ```
 
 ### Python API
 
-- layernorm
+- instancenorm_backward
+    - grad
     - input
     - scale
-    - loss
+    - mean
+    - inv_variance
     - compute_data_type
     - name

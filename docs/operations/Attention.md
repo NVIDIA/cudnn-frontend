@@ -327,7 +327,7 @@ graph.sdpa(
 - `q` (cudnn_tensor): The query data with shape $(B, H_q, S_q, D_{qk})$.
 - `k` (cudnn_tensor): The key data. When `paged_attention_k_table` is provided, this is a container of non-contiguous key blocks.
 - `v` (cudnn_tensor): The value data. When `paged_attention_v_table` is provided, this is a container of non-contiguous value blocks.
-- `attn_scale` (Optional[Union[float, cudnn_tensor]]): Scale factor for attention scores. Typically $\frac{1}{\sqrt{d}}$. Default is None (no scaling).
+- `attn_scale` (Optional[Union[float, cudnn_tensor]]): Scale factor for attention scores. Typically $\frac{1}{\sqrt{d}}$. Default is None, which lowers to no scaling (1.0).
 - `bias` (Optional[cudnn_tensor]): Additive bias mask for attention scores. Supports broadcasting.
 - `block_mask` (Optional[cudnn_tensor]): Block-level mask for 128x128 tiles. Only supported with UNIFIED implementation. On SM10x, the native backend requires cuDNN 9.26.0 or newer: older kernels can return NaNs when the first KV tile is masked out. This restriction is checked during native validation/planning; ordinary attention and FROST admission are unaffected. Because mask contents may change between executions, the requirement applies to every graph with a block-mask tensor, including one initially containing an all-visible mask.
 - `use_alibi_mask` (Optional[bool]): Enable ALiBi (Attention with Linear Biases) positional encoding. Requires `diagonal_band_right_bound=0`.
@@ -359,7 +359,7 @@ graph.sdpa(
 
 #### Configurable Options
 
-- **Attention scale** (`attn_scale`): Applies a scaling factor to attention scores before the softmax, such as $\frac{1}{\sqrt{\text{d}}}$. Set to 1.0 by default. Can be passed as a float or as a tensor.
+- **Attention scale** (`attn_scale`): Applies a scaling factor to attention scores before the softmax, such as $\frac{1}{\sqrt{\text{d}}}$. Default is None, which lowers to no scaling (1.0). Can be passed as a float or as a tensor.
 
 - **Bias mask**: Applies an additive bias mask to attention scores. You must pass a bias tensor as specified in the tensors section below. The dimensions that are passed as 1 will apply a broadcasted mask over attention scores.
 
@@ -983,7 +983,7 @@ Returns:
 #### Configurable Options
 
 The current FP8 support is a subset of the options supported in FP16 and BF16 support.
-- Attention scale (`attn_scale`): Applies a scaling factor to attention scores before the softmax, such as $\frac{1}{\sqrt{\text{d}}}$. Set to 1.0 by default.
+- Attention scale (`attn_scale`): Applies a scaling factor to attention scores before the softmax, such as $\frac{1}{\sqrt{\text{d}}}$. Default is None, which lowers to no scaling (1.0).
 - Causal mask: Fills the upper triangular matrix of attention scores with negative infinity.
 - Padding mask (`use_padding_mask`): Variable sequence lengths, provided either as per-batch lengths (`seq_len_q`/`seq_len_kv`) or as cumulative sequence lengths (`cu_seq_len_q`/`cu_seq_len_kv`; cuDNN 9.25+, UNIFIED implementation only).
 
@@ -991,7 +991,7 @@ The current FP8 support is a subset of the options supported in FP16 and BF16 su
 
 - Requires Hopper (SM90) or newer architecture.
 - Head dimension must be a multiple of 16.
-- Limited masking options compared to FP16/BF16 (causal and padding masks only).
+- Masking support is limited compared to FP16/BF16; FP8 supports causal and padding masks only.
 - Requires explicit scale/descale tensors for all FP8 inputs and outputs.
 
 #### Tensors
