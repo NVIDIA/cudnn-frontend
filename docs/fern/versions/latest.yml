@@ -129,6 +129,9 @@ navigation:
               - page: GAT and GATv2 attention
                 path: ../../operations/gnn/mha_gat.md
                 slug: mha_gat
+              - page: Simple multi-head attention
+                path: ../../operations/gnn/mha_simple.md
+                slug: mha_simple
       - section: Utilities
         slug: utilities
         contents:
