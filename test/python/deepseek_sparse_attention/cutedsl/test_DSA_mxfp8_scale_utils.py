@@ -11,6 +11,23 @@ from cudnn.deepseek_sparse_attention.utils.sm100 import mxfp8_scale_utils
 pytestmark = pytest.mark.L0
 
 
+@pytest.fixture
+def cuda_scale_packer():
+    """Keep host coverage on lanes below the CUDA packer's requirements."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from cudnn.frost.buffers import cutedsl_requirement_error
+    from cudnn.deepseek_sparse_attention.utils.compiler import gpu_arch_flag
+
+    requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8 scale packing")
+    if requirement_error:
+        pytest.skip(requirement_error)
+    try:
+        gpu_arch_flag()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+
+
 def test_mxfp8_scale_pack_roundtrip_host_only():
     """Pack and unpack a non-tile-aligned logical scale tensor."""
     logical = torch.arange(130 * 5 * 3, dtype=torch.int64).reshape(130, 5, 3)
@@ -332,7 +349,7 @@ def test_minimal_padded_token_capacity_rejects_tokens_without_sequences_host_onl
         mxfp8_scale_utils.minimal_padded_token_capacity(1, 0, 128)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_cuda_matches_reference_and_reuses_output():
     """Match individual CUDA BSHD packers to the host reference."""
     device = torch.device("cuda")
@@ -354,7 +371,7 @@ def test_mxfp8_scale_pack_cuda_matches_reference_and_reuses_output():
     assert torch.equal(k_out.cpu(), k_ref)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_qk_bshd_cuda_matches_reference_and_reuses_outputs():
     """Match the fused CUDA BSHD packer and preserve output identities."""
     device = torch.device("cuda")
@@ -391,7 +408,7 @@ def test_mxfp8_scale_pack_qk_bshd_cuda_matches_reference_and_reuses_outputs():
         pytest.param(3, 0, id="k-sequence-empty"),
     ],
 )
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_qk_bshd_cuda_accepts_empty_extents(seqlen_q, seqlen_k):
     """Pack a live Q or K operand when the paired CUDA operand has null storage."""
     qhpkv, hkv, groups = 64, 1, 5
@@ -413,7 +430,7 @@ def test_mxfp8_scale_pack_qk_bshd_cuda_accepts_empty_extents(seqlen_q, seqlen_k)
     assert torch.equal(k_out.cpu(), k_ref)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_qk_bshd_cuda_is_async_graph_capturable_and_honors_stream():
     """Keep the fused fast path asynchronous, stream-safe, and capturable."""
     cuda = pytest.importorskip("cuda.bindings.driver")
@@ -455,7 +472,7 @@ def test_mxfp8_scale_pack_qk_bshd_cuda_is_async_graph_capturable_and_honors_stre
         graph.reset()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_cuda_thd_caller_owned_output_matches_reference():
     """Match direct CUDA THD Q/K packing to the reference implementation."""
     device = torch.device("cuda")
@@ -485,7 +502,7 @@ def test_mxfp8_scale_pack_cuda_thd_caller_owned_output_matches_reference():
     assert torch.equal(k_out.cpu(), k_ref)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_cuda_thd_strided_fallback_accepts_capacity_output():
     """Support larger caller outputs on the CUDA strided-input fallback."""
     qhpkv, hkv, groups = 4, 2, 5
@@ -516,7 +533,7 @@ def test_mxfp8_scale_pack_cuda_thd_strided_fallback_accepts_capacity_output():
     assert torch.count_nonzero(k_out[:, k_ref.shape[1] :]) == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_cuda_hot_path_does_not_synchronize():
     """Avoid host synchronization on the direct CUDA packing path."""
     device = torch.device("cuda")
@@ -532,7 +549,7 @@ def test_mxfp8_scale_pack_cuda_hot_path_does_not_synchronize():
         torch.cuda.set_sync_debug_mode("default")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_cuda_caller_owned_path_is_graph_capturable():
     """Capture and replay direct caller-owned BSHD packing."""
     q = torch.arange(129 * 64 * 5, dtype=torch.int64, device="cuda").to(torch.uint8).reshape(1, 129, 64, 5)
@@ -553,7 +570,7 @@ def test_mxfp8_scale_pack_cuda_caller_owned_path_is_graph_capturable():
         graph.reset()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_cuda_honors_explicit_stream():
     """Enqueue direct BSHD packing on the requested driver stream."""
     cuda = pytest.importorskip("cuda.bindings.driver")
@@ -569,7 +586,7 @@ def test_mxfp8_scale_pack_cuda_honors_explicit_stream():
     assert torch.equal(out.cpu(), reference)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.usefixtures("cuda_scale_packer")
 def test_mxfp8_scale_pack_cuda_reference_fallback_honors_explicit_stream():
     """Enqueue the strided-input reference fallback on the requested stream."""
     cuda = pytest.importorskip("cuda.bindings.driver")
