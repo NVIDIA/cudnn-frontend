@@ -212,23 +212,70 @@ def test_override_stride_off_the_alignment_is_refused_before_launch():
     assert torch.isnan(o).all(), "the kernel ran on a refused variant pack"
 
 
-@pytest.mark.skipif(cudnn.backend_version() >= 92200, reason="Slice is lowered by pointer offset only before cuDNN 9.22")
-def test_legacy_slice_offset_into_an_operand_is_checked():
-    """Q is a slice starting 4 elements into an aligned buffer: the caller's pointer is aligned, Q's is not."""
-    width = D + 8
+_WIDTH = D + 8
+
+
+def _legacy_slice_graph(start):
+    """Q is the slice [start, start + D) of the last dimension of a wider ``q_full``."""
     g = pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
-    q_full = g.tensor(name="q_full", dim=[B, H, S, width], stride=_strides(width), data_type=cudnn.data_type.HALF)
-    q = g.slice(q_full, [slice(None), slice(None), slice(None), slice(4, 4 + D)])
-    k, v = (g.tensor(name=n, dim=[B, H, S, D], stride=_strides(width), data_type=cudnn.data_type.HALF) for n in "kv")
+    q_full = g.tensor(name="q_full", dim=[B, H, S, _WIDTH], stride=_strides(_WIDTH), data_type=cudnn.data_type.HALF)
+    q = g.slice(q_full, [slice(None), slice(None), slice(None), slice(start, start + D)])
+    k, v = (g.tensor(name=n, dim=[B, H, S, D], stride=_strides(_WIDTH), data_type=cudnn.data_type.HALF) for n in "kv")
     o, _ = g.sdpa(q, k, v, is_inference=True, attn_scale=SCALE)
-    o.set_output(True).set_data_type(cudnn.data_type.HALF).set_dim([B, H, S, D]).set_stride(_strides(width))
+    o.set_output(True).set_data_type(cudnn.data_type.HALF).set_dim([B, H, S, D]).set_stride(_strides(_WIDTH))
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     _pin_native(g)
-    q_buf = torch.randn(B, S, H, width, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
-    k_buf, v_buf = (_storage(width) for _ in range(2))
-    o_buf = _storage(width, fill=float("nan"))
+    return g, (q_full, k, v, o)
+
+
+_legacy_slice = pytest.mark.skipif(cudnn.backend_version() >= 92200, reason="Slice is lowered by pointer offset only before cuDNN 9.22")
+
+
+@_legacy_slice
+def test_legacy_slice_offset_into_an_operand_is_checked():
+    """Q is a slice starting 4 elements into an aligned buffer: the caller's pointer is aligned, Q's is not."""
+    g, ports = _legacy_slice_graph(4)
+    q_buf = torch.randn(B, S, H, _WIDTH, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    k_buf, v_buf = (_storage(_WIDTH) for _ in range(2))
+    o_buf = _storage(_WIDTH, fill=float("nan"))
     with pytest.raises(Exception, match="not aligned to the tensor's 16-byte alignment"):
-        _run_forward(g, (q_full, k, v, o), (q_buf, k_buf, v_buf, o_buf))
+        _run_forward(g, ports, (q_buf, k_buf, v_buf, o_buf))
     assert torch.isnan(o_buf).all(), "the kernel ran on a refused variant pack"
+
+
+@_legacy_slice
+def test_legacy_slice_cuda_graph_binds_and_checks_the_sliced_pointer():
+    """populate_cuda_graph() applies the Slice offset to the caller's source pointer, as execute() does."""
+    cudart = pytest.importorskip("cuda.bindings.runtime")
+    q_buf = torch.randn(B, S, H, _WIDTH, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    k_buf, v_buf = (_storage(_WIDTH) for _ in range(2))
+    o_buf = _storage(_WIDTH, fill=float("nan"))
+    handle = cudnn.create_handle()
+    graphs, graph_exec = [], None
+    try:
+        for start in (4, 8):
+            g, ports = _legacy_slice_graph(start)
+            workspace = torch.empty(max(int(g.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
+            err, cuda_graph = cudart.cudaGraphCreate(0)
+            assert err == cudart.cudaError_t.cudaSuccess
+            graphs.append(cuda_graph)
+            uid_to_ptr = {t.get_uid(): buf.data_ptr() for t, buf in zip(ports, (q_buf, k_buf, v_buf, o_buf))}
+            if start == 4:
+                with pytest.raises(Exception, match="not aligned to the tensor's 16-byte alignment"):
+                    g.populate_cuda_graph(handle, uid_to_ptr, workspace.data_ptr(), int(cuda_graph))
+                continue
+            g.populate_cuda_graph(handle, uid_to_ptr, workspace.data_ptr(), int(cuda_graph))
+            err, graph_exec = cudart.cudaGraphInstantiate(cuda_graph, 0)
+            assert err == cudart.cudaError_t.cudaSuccess
+            torch.cuda.synchronize()
+            assert cudart.cudaGraphLaunch(graph_exec, 0)[0] == cudart.cudaError_t.cudaSuccess
+            torch.cuda.synchronize()
+            torch.testing.assert_close(o_buf.float(), _reference(q_buf[..., start : start + D], k_buf, v_buf), atol=5e-3, rtol=1e-2)
+    finally:
+        if graph_exec is not None:
+            cudart.cudaGraphExecDestroy(graph_exec)
+        for cuda_graph in graphs:
+            cudart.cudaGraphDestroy(cuda_graph)
+        cudnn.destroy_handle(handle)

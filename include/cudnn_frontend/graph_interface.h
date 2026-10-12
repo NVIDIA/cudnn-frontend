@@ -638,6 +638,21 @@ class Graph : public ICudnn, public INode {
         gid = next_gid.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Legacy Slice (cuDNN < 9.22) binds its output to the source pointer plus an offset, as execute() does.
+    // A caller that binds the destination uid itself keeps that binding.
+    void
+    apply_variant_pack_replacements_(std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs) const {
+        for (auto const &[from_uid, value] : variant_pack_replacements) {
+            auto const &[to_uid, start_offset] = value;
+            auto source                        = uid_to_device_ptrs.find(from_uid);
+            if (source == uid_to_device_ptrs.end() || uid_to_device_ptrs.count(to_uid) != 0) {
+                continue;
+            }
+            void *destination          = static_cast<char *>(source->second) + start_offset;
+            uid_to_device_ptrs[to_uid] = destination;
+        }
+    }
+
     // The CUDA-graph paths build their own variant pack, so they apply execute()'s pointer check here (#1571).
     error_t
     check_aligned_operand_pointers_(
@@ -687,6 +702,7 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
+        apply_variant_pack_replacements_(uid_to_device_ptrs);
         CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs));
 
         size_t num_root_nodes;
@@ -844,6 +860,7 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
+        apply_variant_pack_replacements_(uid_to_device_ptrs);
         CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs));
 
         // Check if the cuda graph is empty
