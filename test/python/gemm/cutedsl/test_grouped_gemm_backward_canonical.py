@@ -175,3 +175,24 @@ def test_wgrad_flat_scale_factors(monkeypatch):
     flat = wgrad_call(other, other["sfa_tensor"].reshape(-1), other["sfb_tensor"].reshape(-1))
     assert_same("wgrad", flat["wgrad_tensor"], legacy["wgrad_tensor"])
     assert len(api._cache_of_GroupedGemmWgradSm100Objects) == entries
+
+
+@torch_fork_set_rng(seed=0)
+def test_wgrad_rejects_malformed_flat_scale_factors(monkeypatch):
+    from cudnn.gemm.cutedsl.grouped.wgrad import api
+
+    monkeypatch.setattr(api, "_cache_of_GroupedGemmWgradSm100Objects", {})
+    monkeypatch.setattr(api, "_wgrad_wrapper_memo", {})
+    inputs = wgrad_inputs([256, 384])
+    sfa, sfb = inputs["sfa_tensor"].reshape(-1), inputs["sfb_tensor"].reshape(-1)
+
+    def strided(sf):
+        return sf.repeat_interleave(2)[::2]
+
+    with pytest.raises(ValueError, match="contiguous packed buffer"):
+        wgrad_call(inputs, strided(sfa), sfb)
+    expected = wgrad_call(inputs, sfa, sfb)["wgrad_tensor"]
+    for bad_sfa, bad_sfb in ((sfa[:16], sfb), (sfa, sfb[:16]), (strided(sfa), sfb), (sfa, strided(sfb))):
+        with pytest.raises(ValueError, match="contiguous packed buffer"):
+            wgrad_call(inputs, bad_sfa, bad_sfb)
+    assert_same("wgrad", wgrad_call(inputs, sfa, sfb)["wgrad_tensor"], expected)

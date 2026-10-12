@@ -587,6 +587,16 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         current_stream = self._get_default_stream(current_stream)
         self._runtime_error_if(self._compiled_kernel is None, "Kernel not compiled; call compile() first")
 
+        # The kernel rebuilds a flat SF layout from the A/B shapes, so the buffer itself is checked on every call.
+        if sfa_tensor.ndim == 1 or sfb_tensor.ndim == 1:
+            m, tokens = self._tensor_shape(a_tensor, name="a_tensor")
+            n = self._tensor_shape(b_tensor, name="b_tensor")[1]
+            scale_cols = _round_up(ceil_div(tokens, self.sf_vec_size), 4)
+            for name, sf, rows in (("sfa_tensor", sfa_tensor, m), ("sfb_tensor", sfb_tensor, n)):
+                numel = _round_up(rows, 128) * scale_cols
+                if sf.ndim == 1 and (sf.numel() != numel or not sf.is_contiguous()):
+                    raise ValueError(f"flat {name} must be a contiguous packed buffer of {numel} elements, got shape {tuple(sf.shape)} stride {sf.stride()}")
+
         if self.weight_mode == MoEWeightMode.DENSE:
             self._value_error_if(wgrad_tensor is None, "wgrad_tensor is required in dense mode")
             if descriptor_workspace is None:
