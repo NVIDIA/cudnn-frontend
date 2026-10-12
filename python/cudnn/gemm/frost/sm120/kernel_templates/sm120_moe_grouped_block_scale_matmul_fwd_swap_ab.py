@@ -29,8 +29,9 @@ scales travel with their data, so the SF roles swap with the operands):
   ``(tile_n * cta_n) % 128`` -- never the global token row.
 * GATHER: the token scales are LINEAR ``[source_rows, K / block_size]``; the
   producer gathers the tile's routed rows and repacks them into the F8_128x4
-  SFB stage (``tile_helpers.moe_gather_scales``), as the non-swapped kernel
-  does for its token SFA.
+  SFB stage (``tile_helpers.moe_gather_scales``'s repack, its GATHER4s
+  spread over the TMA warp's lanes), as the non-swapped kernel does for its
+  token SFA.
 
 KEEP IN SYNC WITH ``sm120_moe_grouped_block_scale_matmul_fwd.py`` /
 ``sm120_moe_grouped_matmul_fwd_swap_ab.py`` (this tree) and
@@ -77,7 +78,7 @@ from functools import lru_cache
 from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
-from cudnn.gemm.frost.tile_helpers import moe_scatter_row, moe_gather_row, tma_gather4, moe_gather_scales
+from cudnn.gemm.frost.tile_helpers import moe_scatter_row, moe_gather_row, tma_gather4
 from cudnn.gemm.frost.tile_helpers import moe_swizzle_tile as _moe_swizzle_tile
 import cutlass.experimental.cuda.tensor_map as _tma
 from cutlass import apply_swizzle as _apply_smem_swizzle
@@ -104,8 +105,9 @@ from cuda.bindings import driver as _cuda
 if b_is_n_major:
     raise NotImplementedError(f"{__name__}: the MoE token (B after swap-AB) is K-major only (the grouped token walk is a K-major TMA box)")
 # GATHER repacks the tile's routed token scales into the F8_128x4 SFB stage in
-# warp-wide passes of 32 SF words (tile_helpers.moe_gather_scales): the token
-# tile must hold a whole number of them.
+# warp-wide passes of 32 SF words (the TMA warp's repack, as in
+# tile_helpers.moe_gather_scales): the token tile must hold a whole number of
+# them.
 if moe_gather and (cta_tile_mnk[1] * sf_tma_box_k) % 32:
     raise NotImplementedError(
         f"{__name__}: GATHER needs cta_tile_n * sf_k4 to be a multiple of 32 SF words "
@@ -137,6 +139,8 @@ EPI_SYNC_BAR_ID = 1
 WARPS_M = cta_tile_mnk[0] // (mma_size_m * mma_inst_shape_mnk[0])
 WARPS_N = cta_tile_mnk[1] // (mma_size_n * mma_inst_shape_mnk[1])
 NUM_COMPUTE_WARPS = WARPS_M * WARPS_N
+# GATHER: the token tile's 4-row GATHER4 groups per TMA-warp lane.
+_GATHER_LANE_GROUPS = (cta_tile_mnk[1] // 4 + 31) // 32
 
 TMA_WARP_ID = NUM_COMPUTE_WARPS
 SCHEDULER_WARP_ID = NUM_COMPUTE_WARPS + 1
@@ -693,6 +697,18 @@ def _kernel(
                 sfa_m_block = coord_m // 128
                 sfb_n_block = start_sf_block_n + coord_n_local // 128
 
+                if cutlass.const_expr(moe_gather):
+                    # Lane l owns the tile's 4-row GATHER groups l, l + 32, ...:
+                    # it reads their source rows once per tile and issues their
+                    # GATHER4s itself, so no lane holds the whole tile's rows
+                    # (one lane holding them all spilled once the producer warps
+                    # drop to PROD_REG_COUNT registers).
+                    gather_lane = cute.arch.lane_idx()
+                    gather_rows = []
+                    for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
+                        _row = coord_n + (_lg * 32 + gather_lane) * 4
+                        gather_rows.append([moe_gather_row(token_index, _row + _j, group_end, source_rows) for _j in range(4)])
+
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
                     if stage == 0 and ab_iter != 0:
@@ -707,6 +723,10 @@ def _kernel(
                     # the TMA copies deliver exactly num_tma_copy_bytes once.
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
+                    if cutlass.const_expr(moe_gather):
+                        # Every lane's GATHER4 completes on this stage's barrier:
+                        # order them after the elected lane's expect_tx.
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
                     # The expert's weight is A's batch coordinate. K-major A: box
                     # [K_tile, cta_m] at (k, m, e) on the NATIVE dtype (fp4 packs via
                     # B4X16); OOB rows/cols are hardware zero-filled (K tails
@@ -747,38 +767,56 @@ def _kernel(
                     # the tile's linear token scales into the F8_128x4 SFB stage.
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         if cutlass.const_expr(moe_gather):
-                            for _gr in cutlass.range(cta_tile_mnk[1] // 4, unroll_full=True):
-                                if elect_one:
-                                    row = coord_n + _gr * 4
-                                    r0 = moe_gather_row(token_index, row, group_end, source_rows)
-                                    r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
-                                    r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
-                                    r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                            for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
+                                _gr = _lg * 32 + gather_lane
+                                if _gr < cta_tile_mnk[1] // 4:
                                     tma_gather4(
                                         smem_b_list[_bj].subview(sB_elems * stage + _gr * 4 * _CTA_K_PACKED),
                                         tma_b_descs[_bj].get_ptr(),
                                         coord_k,
-                                        r0,
-                                        r1,
-                                        r2,
-                                        r3,
+                                        gather_rows[_lg][0],
+                                        gather_rows[_lg][1],
+                                        gather_rows[_lg][2],
+                                        gather_rows[_lg][3],
                                         ab_full_mbar_ptr.subview(stage),
                                     )
-                            moe_gather_scales(
-                                smem_sfb_list[_bj].subview(_SFB_STAGE_WORDS * stage),
-                                sf_gather_scratch[_bj],
-                                sf_gather_mbar[_bj],
-                                ab_full_mbar_ptr.subview(stage),
-                                tma_sfb_descs[_bj].get_ptr(),
-                                token_index,
-                                coord_n,
-                                group_end,
-                                source_rows,
-                                coord_k // block_size,
-                                ab_iter % 2,
-                                cta_tile_mnk[1],
-                                cta_tile_mnk[2] // block_size,
-                            )
+                            # tile_helpers.moe_gather_scales with the same lane split: each
+                            # lane gathers its rows' linear token scales into the scratch,
+                            # then the warp repacks the tile into the F8_128x4 stage and
+                            # one lane releases it on the stage barrier.
+                            if elect_one:
+                                nvvm.mbarrier_arrive_expect_tx(sf_gather_mbar[_bj], cta_tile_mnk[1] * 16)
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
+                            scale_k = coord_k // block_size
+                            for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
+                                _gr = _lg * 32 + gather_lane
+                                if _gr < cta_tile_mnk[1] // 4:
+                                    tma_gather4(
+                                        sf_gather_scratch[_bj].subview(_gr * 128),
+                                        tma_sfb_descs[_bj].get_ptr(),
+                                        (scale_k // 16) * 16,
+                                        gather_rows[_lg][0],
+                                        gather_rows[_lg][1],
+                                        gather_rows[_lg][2],
+                                        gather_rows[_lg][3],
+                                        sf_gather_mbar[_bj],
+                                    )
+                            while not nvvm.mbarrier_try_wait_parity(sf_gather_mbar[_bj], ab_iter % 2, time_limit=10_000_000):
+                                pass
+                            sf_src_words = cutlass.inttoptr(sf_gather_scratch[_bj].data_ptr().toint(), 3, cutlass.Uint32)
+                            sf_dst_words = cutlass.inttoptr(smem_sfb_list[_bj].subview(_SFB_STAGE_WORDS * stage).data_ptr().toint(), 3, cutlass.Uint32)
+                            for _i in cutlass.range(cta_tile_mnk[1] * (cta_tile_mnk[2] // block_size // 4) // 32, unroll_full=True):
+                                sf_word = gather_lane + _i * 32
+                                sf_row = sf_word // (cta_tile_mnk[2] // block_size // 4)
+                                sf_kw = sf_word % (cta_tile_mnk[2] // block_size // 4)
+                                sf_packed = (
+                                    (sf_row // 128) * (128 * (cta_tile_mnk[2] // block_size // 4)) + sf_kw * 128 + (sf_row % 32) * 4 + (sf_row % 128) // 32
+                                )
+                                (sf_dst_words + sf_packed).store((sf_src_words + (sf_row // 4) * 32 + (sf_row % 4) * 4 + (scale_k % 16) // 4 + sf_kw).load())
+                            cute.arch.fence_view_async_shared()
+                            nvvm.bar_warp_sync(0xFFFFFFFF)
+                            if elect_one:
+                                nvvm.mbarrier_arrive(ab_full_mbar_ptr.subview(stage))
                         else:
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cta_global(

@@ -622,14 +622,15 @@ class Sm120KernelTemplate(KernelTemplate):
     def gather_sf_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         """Why a block-scale MoE GATHER chain CANNOT run on this template with
         ``config``: the producer repacks the tile's linear token scales into the
-        F8_128x4 stage in warp-wide passes of 32 SF words
-        (``tile_helpers.moe_gather_scales``), so the token tile's rows times its
-        4-scale words per row must be a whole number of passes -- otherwise the
-        stage is (partly) never written and the MMA reads stale scales (mxfp8 at
-        a 16-row token tile: 16 x 1 words). ``None`` when it holds or the chain
-        is not a block-scale GATHER. Asked by the funnel (``_extra_reject``), the
-        sm120 MoE block-scale precheck and the block-scale renderer, so all of
-        them agree; the templates keep an import-time check as a backstop."""
+        F8_128x4 stage in warp-wide passes of 32 SF words (the templates' TMA
+        warp, as ``tile_helpers.moe_gather_scales``), so the token tile's rows
+        times its 4-scale words per row must be a whole number of passes --
+        otherwise the stage is (partly) never written and the MMA reads stale
+        scales (mxfp8 at a 16-row token tile: 16 x 1 words). ``None`` when it
+        holds or the chain is not a block-scale GATHER. Asked by the funnel
+        (``_extra_reject``), the sm120 MoE block-scale precheck and the
+        block-scale renderer, so all of them agree; the templates keep an
+        import-time check as a backstop."""
         if not (self.block_scale and chain.has_moe and chain.moe.mode == "gather"):
             return None
         bs = chain.block_scale

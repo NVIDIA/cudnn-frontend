@@ -96,6 +96,8 @@ EPI_SYNC_BAR_ID = 1
 WARPS_M = cta_tile_mnk[0] // (mma_size_m * mma_inst_shape_mnk[0])
 WARPS_N = cta_tile_mnk[1] // (mma_size_n * mma_inst_shape_mnk[1])
 NUM_COMPUTE_WARPS = WARPS_M * WARPS_N
+# GATHER: the token tile's 4-row GATHER4 groups per TMA-warp lane.
+_GATHER_LANE_GROUPS = (cta_tile_mnk[1] // 4 + 31) // 32
 
 TMA_WARP_ID = NUM_COMPUTE_WARPS
 SCHEDULER_WARP_ID = NUM_COMPUTE_WARPS + 1
@@ -533,6 +535,18 @@ def _kernel(
                 coord_m = tile_m * cgrp_tile_mnk[0]
                 coord_n = group_begin + tile_n * cgrp_tile_mnk[1]
 
+                if cutlass.const_expr(moe_gather):
+                    # Lane l owns the tile's 4-row GATHER groups l, l + 32, ...:
+                    # it reads their source rows once per tile and issues their
+                    # GATHER4s itself, so no lane holds the whole tile's rows
+                    # (one lane holding them all spilled once the producer warps
+                    # drop to PROD_REG_COUNT registers).
+                    gather_lane = cute.arch.lane_idx()
+                    gather_rows = []
+                    for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
+                        _row = coord_n + (_lg * 32 + gather_lane) * 4
+                        gather_rows.append([moe_gather_row(token_index, _row + _j, group_end, source_rows) for _j in range(4)])
+
                 for k_tile_idx in range(num_k_tiles):
                     stage = ab_iter % ab_stages
                     if stage == 0 and ab_iter != 0:
@@ -546,6 +560,10 @@ def _kernel(
                     # the TMA copies deliver exactly num_tma_copy_bytes once.
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
+                    if cutlass.const_expr(moe_gather):
+                        # Every lane's GATHER4 completes on this stage's barrier:
+                        # order them after the elected lane's expect_tx.
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
                     # The expert's weight is A's batch coordinate. K-major A: box
                     # [K_tile, cta_m] at (k, m, e); M-major A (an N-major weight)
                     # walks M in a_tma_group_elems-wide groups (same row bytes as a
@@ -572,21 +590,17 @@ def _kernel(
                     # coordinate; hardware zero-fills K tails and rows past S.
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         if cutlass.const_expr(moe_gather):
-                            for _bn in cutlass.range(cta_tile_mnk[1] // 4, unroll_full=True):
-                                if elect_one:
-                                    row = coord_n + _bn * 4
-                                    r0 = moe_gather_row(token_index, row, group_end, source_rows)
-                                    r1 = moe_gather_row(token_index, row + 1, group_end, source_rows)
-                                    r2 = moe_gather_row(token_index, row + 2, group_end, source_rows)
-                                    r3 = moe_gather_row(token_index, row + 3, group_end, source_rows)
+                            for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
+                                _bn = _lg * 32 + gather_lane
+                                if _bn < cta_tile_mnk[1] // 4:
                                     tma_gather4(
                                         smem_b_list[_bj].subview(sB_elems * stage + _bn * 4 * _CTA_K_ELEMS),
                                         tma_b_descs[_bj].get_ptr(),
                                         coord_k,
-                                        r0,
-                                        r1,
-                                        r2,
-                                        r3,
+                                        gather_rows[_lg][0],
+                                        gather_rows[_lg][1],
+                                        gather_rows[_lg][2],
+                                        gather_rows[_lg][3],
                                         ab_full_mbar_ptr.subview(stage),
                                     )
                         else:
