@@ -79,10 +79,16 @@ this layer on another SM count is the dataset moving a cell, not the kernel: re-
 fix -- drawing this module's dataset on a CPU generator, SM-independent, and re-recording both tables -- is a follow-up.
 The SDPA
 stage's kernel-vs-reference difference is characterised per cell (``_report_stage_difference``: relative RMS, d-rows outside the
-bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form
-(``_assert_grad_close`` on the stage's bf16 dQ / dK / dV: 0 d-rows outside on every cell of both regimes), because the row
-recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true units (at any ``scale_dp``): it
-cannot tell a sparse flip class from a diffuse miss, nor an all-zero output from the right one.
+bf16 bound form, the d-rows carrying 90 % of the squared difference) AND asserted under the bf16 block's bound form in its e4m3
+FLIP-STRUCTURED shape (``_assert_sdpa_stage_flip_structured`` on the stage's bf16 dQ / dK / dV: 0 d-rows outside on every cell of
+both regimes on the 204-SM dataset, where the form is ``_assert_grad_close`` itself; a d-row outside the bound must be ONE proven
+e4m3 P / dS flip of the reference's own intermediates -- a valid position of its reduction, within 1/32 of a code spacing of a
+midpoint, the exact rank-1 term reproducing the row within the UNCHANGED bound, the fit 1 +- 1/2 -- the flipped rows under the row
+recipe's budget and the residual after the term inside the bound on every cell; measured: one dV d-row of one 128-token sequence of
+the packed dense GQA cell on a 212-SM part's dataset at 1.357 of the bound, two bf16 ulps at |ref| 0.33, cos 1.000000), because the
+row recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true units (at any ``scale_dp``): it
+cannot tell a sparse flip class from a diffuse miss, nor an all-zero output from the right one, and a per-cell bound cannot describe
+one e4m3 flip of a P / dS value, which moves a whole d-row by one code step times an operand row.
 
 Launch count: ``expected_fp8_launches`` (host-checkable) -- the block's own launches (10 with every gradient: the fused
 PROLOGUE (scalar init -- the zeroing, ``descale_dp`` and the plan-time constants from its kernel arguments -- + dY amax partials + the
@@ -1137,7 +1143,7 @@ def _assert_dw_o_flip_structured(res, v: dict, ref: dict, what: str) -> float:
 
 def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) -> None:
     """The SDPA stage's kernel-vs-reference difference CHARACTERISED (printed; the bf16 bound FORM it reports is then asserted by
-    the caller through ``_assert_grad_close``).  The row recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at
+    the caller through ``_assert_sdpa_stage_flip_structured``).  The row recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at
     this geometry in TRUE units -- at any ``scale_dp`` -- so the row pin alone cannot tell the row's flip class (SPARSE: a few
     d-rows, each one e4m3 step of a dS / P value times an operand row) from a diffuse miss (every row off by a few percent), nor
     an all-zero output from the right one; this print characterises the difference, and the bf16 bound form is the pin with
@@ -1157,6 +1163,131 @@ def _report_stage_difference(got: torch.Tensor, ref: torch.Tensor, what: str) ->
         f"{what} kernel vs the row's reference: rel RMS {rel_rms:.3g}, max|diff|/max|ref| {diff.abs().max().item() / max(ref_max, 1e-300):.3g}, "
         f"{int(outside.sum())} of {g2.shape[0]} d-rows outside the bf16 bound form, {n90} d-rows carry 90 % of the squared difference (the form is asserted next)"
     )
+
+
+def _assert_sdpa_stage_flip_structured(
+    got: torch.Tensor,
+    ref: torch.Tensor,
+    what: str,
+    *,
+    kind: str,
+    keys: int,
+    operand: torch.Tensor,
+    flip_unit: float,
+    intermediates,
+    fp8_dtype=_E4M3,
+    out_dtype=torch.bfloat16,
+) -> float:
+    """The SDPA stage's bf16 ``dQ / dK / dV`` under the bf16 block's bound FORM in its e4m3 FLIP-STRUCTURED shape -- the stricter pin
+    beside the fp8 row's recipe: the recipe's absolute ``atol 0.08`` is at or above ``max|dQ| / max|dK|`` at this geometry in true
+    units, so it cannot reject an all-zero dQ / dK; the per-cell bound can, and it is what every cell of both regimes measured green
+    against on the 204-SM dataset -- but a per-cell bound is not a bound of the e4m3 flip class.  The kernel and the reference
+    quantize ``P * 2^FP8_SCALE_S_LOG2`` and ``dS * scale_dp`` to e4m3 independently from fp32 values a few 1e-6 apart; where the two
+    straddle a rounding midpoint the codes differ by one step ``u`` and ONE WHOLE d-row of the output moves by the exact rank-1 term
+    ``u x flip_unit x operand_row`` -- dV row ``j`` by ``u / s_scale x dO[i, hq, :]``, dK row ``j`` by ``u / scale_dp x Q[i, hq, :]``, dQ row
+    ``i`` by ``u / scale_dp x K[j, hk, :]`` -- a magnitude set by the e4m3 spacing at that value and by the operand row, not by
+    ``max|ref|`` or ``|ref|``, so the bound absorbs it on most datasets and not on others (measured: one dV d-row of one 128-token
+    sequence of the packed dense GQA cell on a 212-SM part's dataset, ``max|diff| = 0.003906 = 2^-8`` = one code step (spacing 1 in
+    ``[8, 16)``) x ``1 / 256`` x ``|dO| = 1``, two bf16 ulps at ``|ref| 0.33``, 1.357 of the bound on a cell with ``|ref| ~ 0.017``,
+    ``cos 1.000000``, 1 of 256 d-rows; 0 d-rows outside on the 204-SM and 216-SM datasets; the fp8 recipe saw ``n_bad = 0`` at
+    ``atol 0.08`` so its flip proof never ran).  The flip count per cell is a dataset property, never a kernel property.
+
+    The form, asserted in this order (the bound ``_ATOL_FRAC max|ref| + _RTOL |ref|`` per cell is UNCHANGED throughout):
+
+      (0) finite; with NO d-row outside the bound the cell takes ``_assert_grad_close`` ITSELF -- same code path, same print, same
+          cosine floor, same return -- so a cell inside the bound passes exactly as before and the form adds nothing below it;
+      (1) the old statistics line is printed and ``cos >= _COS_MIN`` (a gross shift is named before its per-row details);
+      (2) the d-rows outside stay within the row recipe's budget ``_row_budget(rows, keys)`` = ``1e-5 x rows x keys``, at least 1
+          (``keys`` = the reduction length feeding each d-row: the sequence length) -- a systematic shift is many rows, each "one flip";
+      (3) EVERY d-row outside is PROVEN one flip from the reference's own intermediates by the fp8 row's own proof
+          (``sdpa.fp8.flip_evidence``, the engine behind ``assert_close_fp8_grad``) run with THIS bound as its ordinary tolerance: a
+          VALID position of the row's own reduction (same batch, a q head of the kv head's GQA group, unmasked -- ``intermediates`` is
+          the reference re-run on the bad rows, ``ref_bwd(selection)[8]``), the reference's scaled intermediate within 1/32 of a code
+          spacing of the midpoint of two ADJACENT e4m3 codes, the exact term reproducing the row within the bound on every cell and
+          within bf16's own rounding (``atol`` + half a bf16 code spacing from each side: each side rounded its fp32 row once), and the
+          least-squares flip count ``1 +- 1/2``; a row that is not one flip fails with the diagnosis printed (``_explain_unfit_row``:
+          the closest operand row and the FIRST condition it lacks);
+      (4) the proven flips' exact rank-1 terms are removed in fp64 and the residual is inside the unchanged bound on EVERY cell --
+          the proof's own tolerance condition restated in the suite's arithmetic and message: the magnitude cap a defect fails, and
+          the sentence a reader of the log needs.
+
+    Under this narrow bound the tolerance condition is the sharp one: three flips fail it before the fit (the two-flip residual is
+    twice the visible term), a corrupted cell fails it, a band of wrong weights fails it; the fit band protects the window where a
+    fraction of a flip hides inside the bound, and the midpoint / validity conditions reject a scalar-multiple look-alike.  Nothing
+    finer than bf16's spacing is observable; a kernel defect that is EXACTLY one adjacent code at a midpoint position is the class
+    itself.  (3) and (4) are keyed on rows OUTSIDE the bound: the form widens nothing and catches nothing new below it.  Printed on a
+    cell with rows outside: the statistics line, the rows and the budget, one ``describe_flip`` line per proven flip, the flip term's
+    and the residual's worst as fractions of the bound.  The host pins (``_sdpa_flip_fixture`` and its tests) are the RED halves of
+    every condition.  Returns the per-cell worst (the magnitude the per-cell bound would have judged), like ``_assert_dw_o_flip_structured``."""
+    _test_python_root()
+    from sdpa.fp8 import describe_flip, flip_evidence
+
+    got64, ref64 = got.detach().double(), ref.detach().double()
+    assert torch.isfinite(got64).all(), f"{what}: non-finite cells"  # a NaN compares False against the bound: never a row "outside"
+    rtol, atol_frac = _RTOL[got.dtype], _ATOL_FRAC[got.dtype]
+    ref_max = ref64.abs().max().item()
+    atol = atol_frac * ref_max
+    bound = atol + rtol * ref64.abs()
+    diff = (got64 - ref64).abs()
+    d = got.shape[-1]
+    rows_out = (diff > bound).reshape(-1, d).any(dim=1)
+    n_out, n_rows = int(rows_out.sum()), int(rows_out.numel())
+    if n_out == 0:
+        return _assert_grad_close(got, ref64, what)  # (0): the identical path -- print, cosine floor, assert_close, return
+    worst = (diff / bound).max().item()
+    cos = _cos(got64, ref64)
+    stats = (
+        f"{what}: max|diff|={diff.max().item():.4g} max|ref|={ref_max:.4g} worst cell {worst:.3f} of the bound "
+        f"(rtol={rtol}, atol={atol_frac}*max|ref|) cos={cos:.6f} {got.dtype}"
+    )
+    print(stats)
+    assert cos >= _COS_MIN, stats
+    budget = _row_budget(n_rows, keys)
+    rows = torch.nonzero(rows_out).flatten()
+    coords = [tuple(int(x) for x in torch.unravel_index(r, got.shape[:-1])) for r in rows[:8]]
+    which = "P" if kind == "dV" else "dS"
+    print(
+        f"{what} (flip-structured form): {n_out} of {n_rows} d-rows outside the bf16 bound {coords}{' ...' if n_out > 8 else ''} "
+        f"(row budget {budget:.3g} = max(1, 1e-5 x {n_rows} x {keys})); every one must be ONE proven {fp8_dtype} {which} flip"
+    )
+    assert (
+        n_out <= budget
+    ), f"{stats} -- {n_out} of {n_rows} d-rows outside the bf16 bound, over the row budget {budget:.3g} (1e-5 x rows x keys, at least 1): not the flip class"
+    fits = flip_evidence(
+        got.float(),
+        ref.float(),
+        rows_out,
+        atol,
+        rtol,
+        tag=what,
+        kind=kind,
+        operand=operand,
+        flip_unit=flip_unit,
+        fp8_dtype=fp8_dtype,
+        out_dtype=out_dtype,
+        intermediates=intermediates,
+    )
+    assert (
+        fits is not None
+    ), f"{stats} -- a d-row outside the bf16 bound is NOT one {fp8_dtype} {which} flip of the reference's own intermediates (the diagnosis is printed above)"
+    term = torch.zeros_like(got64)
+    op64 = operand.detach().double().to(got64.device)
+    for f in fits:
+        print(describe_flip(what, f, fp8_dtype, flip_unit))
+        b_, s_, h_ = f["operand_row"]
+        term[f["row"]] += f["u"] * float(flip_unit) * f["gain"] * op64[b_, s_, h_]
+    residual = (got64 - ref64 - term).abs()
+    res_worst = (residual / bound).max().item()
+    n_after = int((residual > bound).sum())
+    print(
+        f"{what} (flip-structured form): the flip term reaches {(term.abs() / bound).max().item():.3f} of the bound; "
+        f"the residual after it {res_worst:.3f} ({n_after} cells outside after)"
+    )
+    assert n_after == 0, (
+        f"{stats} -- after removing the proven flip's exact rank-1 term the residual is {res_worst:.3f} of the bf16 bound on {n_after} cells: "
+        f"the flip does not explain the row"
+    )
+    return worst
 
 
 def _row_tol() -> tuple:
@@ -1376,8 +1507,10 @@ def test_fp8_stage_localised_bounds(cell):
     ``saved.lse``, the block's ``delta`` and scalars under ``_FP8_GRAD_TOL`` + the flip budget -- a bad d-row above the magnitude
     cap PROVED one e4m3 midpoint flip from the reference's own intermediates (``operand`` / ``flip_unit`` / ``intermediates``),
     at the calibrated ``scale_dp`` the matrix runs at (module docstring) -- AND under the bf16 block's bound form on the stage's
-    bf16 output (``_assert_grad_close``: the stricter pin the characterisation measured green on every cell; the row recipe's
-    absolute ``atol 0.08`` alone cannot reject an all-zero dQ / dK at this geometry) -- ``amax_dP`` under
+    bf16 output in its e4m3 flip-structured shape (``_assert_sdpa_stage_flip_structured``: the stricter pin the characterisation
+    measured green on every cell of the 204-SM dataset; the row recipe's absolute ``atol 0.08`` alone cannot reject an all-zero dQ /
+    dK at this geometry, and a d-row outside the bound must be ONE proven e4m3 P / dS flip of the reference's own intermediates,
+    the bound unchanged) -- ``amax_dP`` under
     ``_AMAX_DS_TOL``; ``dh / dW_*_norm`` vs the oracle SEEDED with the block's own dQ / dK / dV under the bf16 block's bound,
     ``dW_o`` in the e4m3 flip-class form (``_assert_dw_o_flip_structured``), and ``dW_qkvg`` in the module's row-budgeted form with
     its attribution (``_assert_seeded_dw_qkvg_row_budgeted``: the rows
@@ -1437,11 +1570,20 @@ def test_fp8_stage_localised_bounds(cell):
             out_dtype=torch.bfloat16,
         )
         _report_stage_difference(v[name].view(b, s, h, d), refs[name], tag)
-        # The stricter pin the characterisation measured green on every cell of both regimes (0 d-rows outside): the bf16
-        # block's bound FORM (atol 2^-7 max|ref| + rtol 2^-6 |ref|, cos >= 0.999) on the stage's bf16 output -- an all-zero dQ
-        # / dK passes the row recipe's absolute atol 0.08 at this geometry (max|dQ| <= 0.08 in true units at any scale_dp);
-        # it does not pass this.
-        _assert_grad_close(v[name].view(b, s, h, d), refs[name].double(), f"{tag} vs the row's reference (the bf16 bound form)")
+        # The stricter pin: the bf16 block's bound FORM (atol 2^-7 max|ref| + rtol 2^-6 |ref|, cos >= 0.999) on the stage's bf16
+        # output -- an all-zero dQ / dK passes the row recipe's absolute atol 0.08 at this geometry (max|dQ| <= 0.08 in true units
+        # at any scale_dp); it does not pass this -- in the e4m3 flip-structured shape: a d-row outside the bound must be ONE
+        # proven P / dS flip of the reference's own intermediates (the helper's docstring), the bound itself unchanged.
+        _assert_sdpa_stage_flip_structured(
+            v[name].view(b, s, h, d),
+            refs[name],
+            f"{tag} vs the row's reference (the bf16 bound form)",
+            kind=tag,
+            keys=s,
+            operand=operands[name],
+            flip_unit=flip_unit[name],
+            intermediates=lambda sel: ref_bwd(sel)[8],
+        )
     amax_dp = sc["amax_dp"]
     print(f"amax_dP {amax_dp:.6g} vs the reference's max|dS| {amax_ds_ref:.6g} (scale_dp {res.scale_dp:g}, amax_dP * scale_dp = {amax_dp * res.scale_dp:.4g})")
     assert abs(amax_dp - amax_ds_ref) <= amax_tol["atol"] + amax_tol["rtol"] * amax_ds_ref, (amax_dp, amax_ds_ref)
