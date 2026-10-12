@@ -304,7 +304,7 @@ def wgrad_plan(inputs, wgrad, mma_tiler_mn, cluster_shape_mn):
     if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) or math.prod(cluster_shape_mn) > 16 or any(size & (size - 1) for size in cluster_shape_mn):
         raise ValueError(f"Unsupported cluster_shape_mn {cluster_shape_mn}")
     margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
-    config = (experts, tuple(mma_tiler_mn), cluster_shape_mn, margin)
+    config = (get_device_type(), experts, tuple(mma_tiler_mn), cluster_shape_mn, margin)
     validation_key = (config, tuple((name, tuple(t.shape), str(t.dtype)) for name, t in inputs.items()))
     if validation_key not in validated_configs:
         for name, rows in (("sfa", m), ("sfb", n)):

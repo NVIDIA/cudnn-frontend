@@ -12,7 +12,7 @@ jax = pytest.importorskip("jax")
 ml_dtypes = pytest.importorskip("ml_dtypes")
 torch = pytest.importorskip("torch")
 import jax.numpy as jnp
-from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
 requirement_error = cutedsl_requirement_error("JAX grouped GEMM tests")
 if requirement_error:
@@ -277,9 +277,35 @@ def test_jax_kernel_dispatch(operation, rubin, blackwell, monkeypatch):
     import importlib
 
     api = importlib.import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.jax_api")
-    for family, name in (("rubin", rubin), ("blackwell", blackwell)):
+    # CuTeDSL 4.7 runs the SM100 paths but cannot import the Rubin kernels.
+    families = [("blackwell", blackwell)] + ([] if cutedsl_arch_requirement_error((10, 7)) else [("rubin", rubin)])
+    for family, name in families:
         monkeypatch.setattr(api, "get_device_type", lambda: family)
         assert getattr(api, f"{operation}_kernel_type")().__name__ == name
+
+
+def test_jax_wgrad_plan_caches_kernel_per_architecture(monkeypatch):
+    skip_unless_sm100()
+    requirement = cutedsl_arch_requirement_error((10, 7))
+    if requirement:
+        pytest.skip(requirement)
+    from cudnn.gemm.cutedsl.grouped.wgrad import jax_api
+
+    arrays = wgrad_problem((256,))
+    inputs = {name.removesuffix("_tensor"): jnp.asarray(array) for name, array in arrays.items()}
+    inputs.update(sfa=inputs["sfa"].view(ml_dtypes.float8_e8m0fnu), sfb=inputs["sfb"].view(ml_dtypes.float8_e8m0fnu))
+    wgrad = jax.ShapeDtypeStruct((1, 384, 640), jnp.bfloat16)
+    monkeypatch.setattr(jax_api, "kernel_cache", {})
+    kernels = []
+    for family in ("blackwell", "rubin", "blackwell"):
+        monkeypatch.setattr(jax_api, "get_device_type", lambda: family)
+        kernels.append(jax_api.wgrad_plan(inputs, wgrad, (256, 256), None)[0])
+    assert [type(kernel).__name__ for kernel in kernels] == [
+        "BlockScaledMoEGroupedGemmWgradKernel",
+        "BlockScaledMoEGroupedGemmWgradRubinKernel",
+        "BlockScaledMoEGroupedGemmWgradKernel",
+    ]
+    assert kernels[0] is kernels[2]
 
 
 def test_canonical_jax_dglu_wgrad_without_torch():
