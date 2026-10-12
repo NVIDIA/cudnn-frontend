@@ -523,8 +523,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
         # template would read K/V densely and silently ignore the block list.  The selection is the FUNCTION -- a decline,
         # never a knob fallback (the sm100 twin's _validate_params / make_cfg_d256_decode decline the same way).
         raise ValueError(
-            f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} select the index-list sparse kernel; "
-            f"the dense templates do not consume them"
+            f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} / qsa_softmax_groups={k.qsa_softmax_groups} "
+            f"select the index-list sparse kernel; the dense templates do not consume them"
         )
     if k.epilogue_gate:
         if flavor not in _EPILOGUE_GATE_FLAVORS:
@@ -1569,8 +1569,9 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
 #
 # The kernel this config describes (its header carries the full tables): one CTA per SM, cga1, persistent; a work item is
 # (query token, KV head) -- the G query heads of the token on the MMA N axis (N_Q = 16), 128-key tiles of 32 four-token blocks
-# on the M axis, gathered by GATHER_WARPS warps with tma_gather4 from the token's block list.  Warp map (16 warps, every
-# warpgroup role-homogeneous because setmaxnreg is warpgroup-collective):
+# on the M axis, gathered by GATHER_WARPS warps with tma_gather4 from the token's block list.  Warp map of the ONE-column-group
+# record (16 warps; the DEFAULT record adds a second 4-warp softmax group = 20 warps -- the kernel header's table is the authority),
+# every warpgroup role-homogeneous because setmaxnreg is warpgroup-collective:
 #
 #     WG0  warps 0-3    softmax + epilogue (128 lanes = 128 key lanes of S^T / P^T = 128 d lanes of O^T)
 #     WG1-2 warps 4-11  gather issuers (blocks 4w..4w+3 of every K and V tile; one arrive_expect_tx per operand stage)
@@ -1582,11 +1583,12 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
 #     IDS_EMPTY_ARRIVERS = GATHER_WARPS + SOFTMAX_WARPS        (one elected lane per warp that reads the staged list)
 #     READ_TILE_ARRIVERS = SOFTMAX_WARPS + 1 (MMA) + 1 (TMA) + GATHER_WARPS   (the scheduler warp and the spare never credit)
 #
-# Registers: a 512-thread launch is capped at 65536 / 512 = 128 per thread FLAT (the DSL emits .reqntid, no .maxnreg, so every
+# Registers: a 640-thread launch is capped at 65536 / 640 -> 96 per thread FLAT, a 512-thread one at 128 (the DSL emits .reqntid, no .maxnreg, so every
 # setmaxnreg is dropped); the declared split for when .maxnreg lands must balance the ENTRY pool, SUM(role regs x warps) ==
 # entry x warps, or the last INCREASE warp parks forever.  Host trace-compile of the swap-AB decode body under a forced
-# 512-thread rendering (sm_107a): REG 104, STL 0, LDL 0 -- the 16-warp form is the default; gather_warps=4 (12 warps, entry 168)
-# is the named fallback.
+# 512-thread rendering (sm_107a): REG 104, STL 0, LDL 0.  The DEFAULT record is the two-column-group body (20 warps at 8 gather
+# warps, 96 entry registers, 0 spills on the host renderings but one register pair in the gated 16-head-group prologue); the
+# one-group body is 16 warps / 128; gather_warps=4 is the named fallback (12 warps / 168 at one group, 16 / 128 at two).
 
 _SPARSE_FLAVOR = "sm107 d256 sparse"
 # The standard per-CTA carveout (L1 keeps its 100 KiB); past it the launcher needs ALLOW_OVERSIZED_SHARED_MEMORY and the
@@ -1654,8 +1656,9 @@ def _align16(nbytes: int) -> int:
 @dataclass(frozen=True)
 class CfgD256Sparse:
     """d_qk = d_v = 256 index-list sparse prefill: the swap-AB tile (keys on the MMA M axis, the token's query heads on N) over
-    K/V tiles gathered block by block.  Every field is set by ``make_cfg_d256_sparse``; the defaults are the 16-warp record at
-    the 24/2 geometry and top_k = 512 so the dataclass is constructible in a doc / test context, not a fallback."""
+    K/V tiles gathered block by block.  Every field is set by ``make_cfg_d256_sparse``; the defaults are the ONE-column-group
+    16-warp record at the 24/2 geometry and top_k = 512 (the factory's default renders the two-group 20-warp record) so the
+    dataclass is constructible in a doc / test context, not a fallback."""
 
     # --- tile geometry: TILE_N keys per tile (the MMA M axis = the 128-lane TMEM layout), TILE_K / TILE_O the head dims,
     # N_Q the MMA N axis (the token's query heads, zero-padded to 16)
@@ -2095,8 +2098,10 @@ def _sparse_arms_requested(params: TemplateParams) -> Tuple[str, ...]:
 
 def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softmax_groups: int = 0) -> Tuple[CfgD256Sparse, TmaIters]:
     """Config for sm107/sparse_d256_f16.py from the adapter's TemplateParams (``qsa_block_topk`` = the list width, ``qh_per_kh`` =
-    the token's query heads on the N axis).  ``gather_warps`` selects the warp population: 8 (16 warps, the default; 128 entry
-    registers, 0 spills on the host rendering) or 4 (12 warps, 168 entry registers -- the named fallback; -25 % gather issue rate).
+    the token's query heads on the N axis).  ``gather_warps`` selects the gather population: 8 (the default) or 4 (the named
+    fallback; -25 % gather issue rate).  The warp total is 4 x groups softmax + gather + 4 auxiliary warps, the entry register count
+    the register file over it rounded down to the 8-register granule: 20 warps / 96 at the default (8 gather, two groups), 16 / 128
+    at one group with 8 gather warps or two groups with 4, 12 / 168 at one group with 4.
     ``softmax_groups`` (appended) selects the softmax SPLIT: 0 = the record's ``qsa_softmax_groups`` (itself 0 = the flavor default,
     TWO 4-warp groups of 8 columns: 20 warps at 8 gather warps, 96 entry registers flat; 16 warps / 128 at the 4-gather-warp fallback),
     1 = ONE 4-warp column group of 16 columns (the pre-split body, 16 warps) -- a performance knob: the same function, bitwise, at either value.
@@ -2132,9 +2137,18 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         or params.softmax_f16
         or params.softmax_scale_prefolded
         or params.exp2_fma_split
+        # the dense line's own compile-time options: the sparse body has no field for any of them, so a record that sets one would
+        # render a kernel that silently ignores it (negate_scores: the signed scale is applied in-kernel instead)
+        or params.negate_scores
+        or params.kv_tail_mask
+        or params.thd_batch_one
+        or params.lpt_head_group != 1
+        or params.lpt_q_tiles
+        or params.lpt_l2_size_mib
     ):
         raise ValueError(
-            f"{flavor}: decode_q_tile / decode_tile / ragged_q / mma_2x2 / pv_bf16 / softmax_f16 / softmax_scale_prefolded / exp2_fma_split are other kernels' specializations"
+            f"{flavor}: decode_q_tile / decode_tile / ragged_q / mma_2x2 / pv_bf16 / softmax_f16 / softmax_scale_prefolded / exp2_fma_split / "
+            f"negate_scores / kv_tail_mask / thd_batch_one / lpt_head_group / lpt_q_tiles / lpt_l2_size_mib are other kernels' specializations"
         )
     if params.sched_policy not in (None, SCHED_NATURAL):
         raise ValueError(f"{flavor}: sched_policy must be NATURAL or None in v1 (got {params.sched_policy})")
@@ -2148,7 +2162,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
             f"{flavor}: the kernel body does not carry the {', '.join(missing)} arm(s) yet (wired: {sorted(SPARSE_D256_WIRED_ARMS) or 'none'}); the adapter declines them"
         )
     if gather_warps not in (4, 8):
-        raise ValueError(f"{flavor}: gather_warps must be 8 (16 warps) or 4 (12 warps, the named fallback); got {gather_warps}")
+        raise ValueError(f"{flavor}: gather_warps must be 8 (the default) or 4 (the named fallback); got {gather_warps}")
     # 0 = the record's value, itself 0 = the flavor default: TWO column groups since the A/B/A on a 212-SM Rubin GPU (the split +20..+29 %
     # over the one-group body, bitwise); softmax_groups=1 renders the one-group body (the measured base, 16 warps).
     groups = int(softmax_groups) or int(getattr(params, "qsa_softmax_groups", 0) or 0) or 2
