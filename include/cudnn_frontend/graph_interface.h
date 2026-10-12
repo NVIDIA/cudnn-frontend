@@ -638,6 +638,26 @@ class Graph : public ICudnn, public INode {
         gid = next_gid.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // The CUDA-graph paths build their own variant pack, so they apply execute()'s pointer check here (#1571).
+    error_t
+    check_aligned_operand_pointers_(
+        std::unordered_map<Tensor_attributes::uid_t, void *> const &uid_to_device_ptrs) const {
+        for (auto const &[uid, alignment_and_bytes] : cached_aligned_operands) {
+            int64_t const alignment = alignment_and_bytes.first;
+            auto search             = uid_to_device_ptrs.find(uid);
+            if (alignment <= 1 || search == uid_to_device_ptrs.end() ||
+                cached_workspace_modifications.find(uid) != cached_workspace_modifications.end()) {
+                continue;
+            }
+            RETURN_CUDNN_FRONTEND_ERROR_IF(reinterpret_cast<uintptr_t>(search->second) % alignment != 0,
+                                           error_code_t::INVALID_VARIANT_PACK,
+                                           "Uid " + std::to_string(uid) +
+                                               ": device pointer is not aligned to the tensor's " +
+                                               std::to_string(alignment) + "-byte alignment.");
+        }
+        return {error_code_t::OK, ""};
+    }
+
     error_t
     update_cuda_graph(cudnnHandle_t handle,
                       std::unordered_map<std::shared_ptr<Tensor_attributes>, void *> &tensor_to_pointer_map,
@@ -667,6 +687,7 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs));
 
         size_t num_root_nodes;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, nullptr, &num_root_nodes));
@@ -823,6 +844,7 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs));
 
         // Check if the cuda graph is empty
         size_t numNodes = 0;

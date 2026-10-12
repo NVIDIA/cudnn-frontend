@@ -146,6 +146,44 @@ def test_backward_misaligned_pointer_is_refused_before_launch():
     torch.cuda.synchronize()
 
 
+def test_cuda_graph_populate_and_update_refuse_a_misaligned_pointer():
+    """populate_cuda_graph()/update_cuda_graph() build their own variant pack; they refuse before recording."""
+    cudart = pytest.importorskip("cuda.bindings.runtime")
+    g, *ports = _forward_graph(64)
+    _pin_native(g)
+    k, v = _storage(64), _storage(64)
+    o = _storage(64, fill=float("nan"))
+    workspace = torch.empty(max(int(g.get_workspace_size()), 1), dtype=torch.uint8, device="cuda")
+
+    def pack(q):
+        return {t.get_uid(): buf.data_ptr() for t, buf in zip(ports, (q, k, v, o))}
+
+    handle = cudnn.create_handle()
+    err, cuda_graph = cudart.cudaGraphCreate(0)
+    assert err == cudart.cudaError_t.cudaSuccess
+    graph_exec = None
+    try:
+        with pytest.raises(Exception, match="not aligned to the tensor's 16-byte alignment"):
+            g.populate_cuda_graph(handle, pack(_storage(64, off=4)), workspace.data_ptr(), int(cuda_graph))
+        # Nothing was recorded: populate requires an empty graph, and this one still is.
+        q = _storage(64)
+        g.populate_cuda_graph(handle, pack(q), workspace.data_ptr(), int(cuda_graph))
+        with pytest.raises(Exception, match="not aligned to the tensor's 16-byte alignment"):
+            g.update_cuda_graph(handle, pack(_storage(64, off=4)), workspace.data_ptr(), int(cuda_graph))
+        # The refused update left the aligned recording in place.
+        err, graph_exec = cudart.cudaGraphInstantiate(cuda_graph, 0)
+        assert err == cudart.cudaError_t.cudaSuccess
+        torch.cuda.synchronize()
+        assert cudart.cudaGraphLaunch(graph_exec, 0)[0] == cudart.cudaError_t.cudaSuccess
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o.float(), _reference(q, k, v), atol=5e-3, rtol=1e-2)
+    finally:
+        if graph_exec is not None:
+            cudart.cudaGraphExecDestroy(graph_exec)
+        cudart.cudaGraphDestroy(cuda_graph)
+        cudnn.destroy_handle(handle)
+
+
 def test_serialized_graph_keeps_the_pointer_check(cudnn_handle):
     g, *ports = _forward_graph(64)
     _pin_native(g)
