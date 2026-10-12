@@ -17,6 +17,9 @@ Tests cover:
   - Negative tests for unsupported problem sizes
 """
 
+import os
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -688,7 +691,10 @@ def test_native_cuda_graph_api_is_rejected():
 def test_failed_oss_build_is_reported_by_build_plans(tmp_path, monkeypatch):
     """When the OSS engine fails to compile and nothing else is built, build_plans raises with the
     compile error instead of succeeding and leaving execute() to fail with 'engine not built'."""
-    monkeypatch.setenv("CUDA_HOME", str(tmp_path))  # no toolkit headers there, so NVRTC fails
+    # $CUDA_HOME/include is searched first, so this header makes the NVRTC compile fail
+    (tmp_path / "include").mkdir()
+    (tmp_path / "include" / "cuda_fp16.h").write_text("#error injected by the test\n")
+    monkeypatch.setenv("CUDA_HOME", str(tmp_path))
     graph, X, scale, epsilon, Z = _build_rmsnorm_silu_graph(1560, 256)
     graph.validate()
     graph.build_operation_graph()
@@ -696,6 +702,30 @@ def test_failed_oss_build_is_reported_by_build_plans(tmp_path, monkeypatch):
     graph.check_support()
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="OSS RmsNorm\\+SiLU engine: NVRTC compilation failed"):
         graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+
+
+def _loaded_nvrtc_include_dir():
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            path = line.split()[-1]
+            if os.path.basename(path).startswith("libnvrtc.so"):
+                return os.path.normpath(os.path.join(os.path.dirname(path), "..", "include"))
+    return None
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Reads /proc/self/maps")
+def test_oss_build_finds_the_headers_next_to_the_loaded_nvrtc(tmp_path, monkeypatch):
+    """With CUDA_HOME pointing at a directory without headers (as in a pip-only install), the engine still compiles
+    against the headers next to the loaded NVRTC (toolkit lib64/../include, pip nvidia/cu13/lib/../include)."""
+    _built_oss_graph(1560, 256)  # loads NVRTC
+    nvrtc_include = _loaded_nvrtc_include_dir()
+    if nvrtc_include is None or not os.path.isfile(os.path.join(nvrtc_include, "cuda_fp16.h")):
+        pytest.skip(f"no CUDA headers next to the loaded NVRTC ({nvrtc_include})")
+    monkeypatch.setenv("CUDA_HOME", str(tmp_path))
+    result = _run_rmsnorm_silu_test(256, 1560)
+    assert result["passed"], f"{result['mismatches']}/{result['elements']} mismatches (max_diff={result['max_diff']:.6e})"
 
 
 if __name__ == "__main__":

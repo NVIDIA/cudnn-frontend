@@ -7,6 +7,7 @@
 
 #include <nvrtc.h>
 #include <cuda_runtime.h>  // for cudaError_t (needed by cudnn_frontend_shim.h wrappers)
+#include <string>
 
 // Pull in HMODULE, dlopen, dlsym, dlclose macros and platform definitions
 // from the existing cudnn_frontend shim infrastructure.
@@ -112,6 +113,23 @@ nvrtc_is_loaded() {
     return get_nvrtc_symbol("nvrtcVersion") != nullptr;
 }
 
+/// @brief Directory of the loaded NVRTC library, or an empty string when it cannot be determined.
+inline std::string
+nvrtc_library_dir() {
+#ifdef _WIN32
+    return {};
+#else
+    void *symbol = get_nvrtc_symbol("nvrtcVersion");
+    Dl_info info;
+    if (symbol == nullptr || dladdr(symbol, &info) == 0 || info.dli_fname == nullptr) {
+        return {};
+    }
+    std::string const path(info.dli_fname);
+    auto const slash = path.rfind('/');
+    return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+#endif
+}
+
 /// @brief Macro for calling an NVRTC function via dynamic loading.
 ///
 /// Looks up @p nvrtc_symbol by name, and if the symbol is nullptr
@@ -130,6 +148,12 @@ nvrtc_is_loaded() {
 inline bool
 nvrtc_is_loaded() {
     return true;
+}
+
+/// @brief Not determined under static linking; callers fall back to CUDA_HOME / CUDA_PATH.
+inline std::string
+nvrtc_library_dir() {
+    return {};
 }
 
 /// @brief Macro for calling an NVRTC function via static linking.
