@@ -743,6 +743,44 @@ _EPI_CHUNK_ELEMS_BY_PIPELINE = {
 }
 
 
+# A block-scale quantize needs one thread to own a whole quant block of a row
+# (row quant: thread-local amax over the chunk) and a warp to own 32 consecutive
+# rows of the same columns (col quant: warp redux) -- the sm100 TMEM-drain view
+# the quant emitters are written for. The transposed-STG drain gives a lane an
+# 8-column run instead, so quant chains on the MoE templates take their
+# ROW-PER-LANE drain (selected by the `row_per_lane_drain` tile constant): the
+# staging buffer is re-read row-major so lane l owns row l of a 32-row slab and
+# a run of up to 32 columns, and the chunk may grow to the quant block.
+_ROW_PER_LANE_CHUNK_ELEMS = 32
+
+
+def _row_per_lane_drain(chain: FusionChain, config: TileConfig) -> bool:
+    """Whether this (chain, config) renders the row-per-lane drain: block-scale
+    quantize chains on the four sm120 MoE templates (dense and block-scaled,
+    plain and swap-AB), the templates that carry the drain."""
+    return config.pipeline == "sm120" and bool(chain.quants) and chain.has_moe
+
+
+def _row_per_lane_bounded_rows(chain: FusionChain, config: TileConfig) -> bool:
+    """Whether the row-per-lane drain takes its routed-group row guard
+    unconditionally (the ``rpl_bounded_rows`` tile constant) and leaves the bound
+    to a per-store predicate (``generate(..., bounded_rows=True)``). A col
+    (M-axis) block quant on the plain MoE kernels reduces each
+    block's amax across the lanes that hold its rows, so no lane may branch
+    away from that (half-)warp redux on ``row < group_end``: the stores, scale
+    bytes, reduction atomics and row-dependent aux loads carry the bound
+    instead. A first_token_offset that breaks the col-quant alignment contract
+    then yields wrong values rather than a hung redux. Swap-AB rows are bounded
+    by M, which a col block never straddles (``M % block_size == 0`` is gated)."""
+    return _row_per_lane_drain(chain, config) and not isinstance(chain.moe, MoeSwapAbSpec) and any(q.axis == 1 for q in chain.quants)
+
+
+def _row_per_lane_tile_constants(chain: FusionChain, config: TileConfig) -> str:
+    """The tile constants the MoE templates' drains switch on (``cutlass.const_expr``):
+    which drain renders, and whether its routed-group row guard is bounded."""
+    return f"row_per_lane_drain = {_row_per_lane_drain(chain, config)}\nrpl_bounded_rows = {_row_per_lane_bounded_rows(chain, config)}"
+
+
 def _epi_vec_bytes(
     chain: FusionChain,
     config: TileConfig,
@@ -750,9 +788,11 @@ def _epi_vec_bytes(
     """The epilogue chunk width the kernel is rendered with: the chain-derived
     width additionally clamped so it divides every power-of-2 subtile span of
     this config's N-tile (see ``_compute_output_vec_bytes``), capped at the
-    pipeline's widest store run (:data:`_EPI_CHUNK_ELEMS_BY_PIPELINE`)."""
+    pipeline's widest store run (:data:`_EPI_CHUNK_ELEMS_BY_PIPELINE`), or at
+    :data:`_ROW_PER_LANE_CHUNK_ELEMS` when the row-per-lane drain is rendered."""
     vec = _compute_output_vec_bytes(chain, tile_cols=_epi_tile_cols(config))
-    return min(vec, _EPI_CHUNK_ELEMS_BY_PIPELINE[config.pipeline] * DTYPE_BYTES[chain.output_dtype])
+    cap = _ROW_PER_LANE_CHUNK_ELEMS if _row_per_lane_drain(chain, config) else _EPI_CHUNK_ELEMS_BY_PIPELINE[config.pipeline]
+    return min(vec, cap * DTYPE_BYTES[chain.output_dtype])
 
 
 def _epi_store_dtype(chain: FusionChain, config: TileConfig) -> str:
@@ -793,6 +833,9 @@ def _splitk_reduce_snippets(chain: FusionChain, config: TileConfig) -> EpilogueS
         tma_slots=frozenset(),
         packed_lanes=False,
         split_k_slices=1,
+        # The reducer's per-chunk epilogue function has no row guard or
+        # converged post-drain point to host the hooks.
+        drain_hooks=False,
     )
 
 
@@ -1277,6 +1320,31 @@ _SM120_BLOCK_SCALE_MMA: dict[tuple[bool, int, str], tuple[str, str, str]] = {
 _SM120_MMA_PTX_TYPE: dict[str, str] = {"fp4_e2m1": "e2m1", "fp8_e4m3": "e4m3", "fp8_e5m2": "e5m2"}
 
 
+def _check_block_scale_geometry(chain: FusionChain, cfg: TileConfig) -> None:
+    """The block-scale renderer's geometry declines, shared with the probe
+    (``_precheck_block_scale`` / ``_precheck_moe_block_scale``) so a config the
+    heuristics list is one the renderer accepts: the warp-MMA tile rules, fp4
+    operands K-major, and an MN-major (fp8) operand's SMEM extent a whole number
+    of swizzle groups -- the ldmatrix path has no per-MMA descriptors, the whole
+    extent is the rule."""
+    from ..tile_config import validate_block_scale_config_sm120
+
+    bs = chain.block_scale
+    validate_block_scale_config_sm120(cfg, bs.block_size, cfg.cta_tile_k_bytes * 8 // (4 if bs.is_fp4 else 8))
+    a_major, b_major = chain.matmul.a_major, chain.matmul.b_major
+    # A packed sub-byte operand has no transposed ldmatrix; fp8 (1 B/elem) rides
+    # the dense template's m16n16.trans.b8 path.
+    if bs.is_fp4 and (a_major != "k" or b_major != "k"):
+        raise ValueError(f"FP4 block-scaled inputs must be K-major (got A={a_major}-major, " f"B={b_major}-major); only mxfp8 supports M/N-major operands.")
+    group_elems = cfg.cta_tile_k_bytes  # 1 B/elem
+    for is_mn_major, mn_extent, operand_name in ((a_major == "m", cfg.cta_tile_m, "M"), (b_major == "n", cfg.cta_tile_n, "N")):
+        if is_mn_major and (mn_extent < group_elems or mn_extent % group_elems != 0):
+            raise ValueError(
+                f"block-scale config {cfg.name!r} cannot use {operand_name}-major input: "
+                f"SMEM extent {mn_extent} is not a multiple of the {group_elems}-element swizzle group"
+            )
+
+
 def _render_block_scale_tile_constants(
     cfg: TileConfig,
     chain: FusionChain,
@@ -1299,7 +1367,7 @@ def _render_block_scale_tile_constants(
     swap-AB lowering) through global descriptors.
     """
     _check_own_family(tmpl)
-    from ..tile_config import _SM120_STG_STAGE_ELEMS, ConfigSm120, smem_ab_stages, validate_block_scale_config_sm120
+    from ..tile_config import _SM120_STG_STAGE_ELEMS, ConfigSm120, smem_ab_stages
 
     if chain.is_multi_gemm or chain.has_mainloop_fusion:
         raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM block-scale matmul chains only")
@@ -1323,7 +1391,7 @@ def _render_block_scale_tile_constants(
     is_fp4 = bs.is_fp4
     data_elem_bits = 4 if is_fp4 else 8
     cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits
-    validate_block_scale_config_sm120(cfg, bs.block_size, cta_k_elems)
+    _check_block_scale_geometry(chain, cfg)
     try:
         mma_kind, scale_vec, sf_format = _SM120_BLOCK_SCALE_MMA[(is_fp4, bs.block_size, bs.sf_dtype)]
     except KeyError:
@@ -1334,29 +1402,14 @@ def _render_block_scale_tile_constants(
         ) from None
     a_major = chain.matmul.a_major
     b_major = chain.matmul.b_major
-    # A packed sub-byte operand has no transposed ldmatrix; fp8 (1 B/elem) rides
-    # the dense template's m16n16.trans.b8 path.
-    if is_fp4 and (a_major != "k" or b_major != "k"):
-        raise ValueError(f"FP4 block-scaled inputs must be K-major (got A={a_major}-major, " f"B={b_major}-major); only mxfp8 supports M/N-major operands.")
     cta_m = cfg.cta_tile_m
     cta_n = cfg.cta_tile_n
     # An MN-major (fp8) operand is TMA-loaded in swizzle-span-wide MN groups (one
-    # box each), so its SMEM extent must be a whole number of them -- the kernel's
-    # ldmatrix path has no per-MMA descriptors, the whole extent is the rule.
+    # box each); _check_block_scale_geometry has made its SMEM extent a whole
+    # number of them.
     group_elems = cfg.cta_tile_k_bytes  # 1 B/elem
-
-    def _tma_group_elems(is_mn_major: bool, mn_extent: int, operand_name: str) -> int:
-        if not is_mn_major:
-            return 1
-        if mn_extent < group_elems or mn_extent % group_elems != 0:
-            raise ValueError(
-                f"block-scale config {cfg.name!r} cannot use {operand_name}-major input: "
-                f"SMEM extent {mn_extent} is not a multiple of the {group_elems}-element swizzle group"
-            )
-        return group_elems
-
-    a_tma_group_elems = _tma_group_elems(a_major == "m", cta_m, "M")
-    b_tma_group_elems = _tma_group_elems(b_major == "n", cta_n, "N")
+    a_tma_group_elems = group_elems if a_major == "m" else 1
+    b_tma_group_elems = group_elems if b_major == "n" else 1
 
     # Packed (Float4E2M1FNx2 / Float8) element count per K row in SMEM.
     pack = 2 if is_fp4 else 1
@@ -1578,6 +1631,11 @@ def _render_template(
         src = _resolve_blocks(src, "SPLITK_ONLY", splitk)
     elif splitk:
         raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
+    # Row-per-lane drain (block-scale quantize chains) vs the transposed-STG
+    # lane-run drain: the MoE templates carry both, as the two arms of
+    # `if cutlass.const_expr(not row_per_lane_drain):` (a tile constant rendered below).
+    if _row_per_lane_drain(chain, config) and "cutlass.const_expr(not row_per_lane_drain)" not in src:
+        raise NotImplementedError(f"{tmpl.file} has no row-per-lane drain for a block_scale_quantize epilogue")
     # For splitK, `snippets` is is kernel 1's partials store. Re-generate epilogue for reduce kernel
     plumb = _splitk_reduce_snippets(chain, config) if splitk else snippets
 
@@ -1643,6 +1701,7 @@ def _render_template(
     )
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_tile_constants(config, chain, tmpl)
+    tile_constants += "\n" + _row_per_lane_tile_constants(chain, config)
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
     # Multi-output tap plumbing. Empty lists → markers expand to nothing (kernel
@@ -1660,7 +1719,9 @@ def _render_template(
     compile_tap_pass = ",\n".join(plumb.tap_compile_pass)
     if compile_tap_pass:
         compile_tap_pass += ","
-    tap_ptr_binds = "\n".join(plumb.tap_ptr_binds) if (plumb.tap_ptr_binds and not splitk) else "pass"
+    # Split-K kernel 1 binds no taps; its tile loop still hands the (empty)
+    # red_part_* helpers their argument tuple.
+    tap_ptr_binds = "\n".join(plumb.tap_ptr_binds) if (plumb.tap_ptr_binds and not splitk) else "_red_part_args = ()"
     red_kernel_stride_params = _reduction_stride_kernel_params(chain)
     red_host_stride_unpack = _reduction_stride_host_unpack(chain)
     red_host_stride_pass = _reduction_stride_host_pass(chain)
@@ -1775,6 +1836,11 @@ def _render_block_scale_template(
         src = _resolve_blocks(src, "SPLITK_ONLY", splitk)
     elif splitk:
         raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
+    # Row-per-lane drain (block-scale quantize chains) vs the transposed-STG
+    # lane-run drain: the MoE templates carry both, as the two arms of
+    # `if cutlass.const_expr(not row_per_lane_drain):` (a tile constant rendered below).
+    if _row_per_lane_drain(chain, config) and "cutlass.const_expr(not row_per_lane_drain)" not in src:
+        raise NotImplementedError(f"{tmpl.file} has no row-per-lane drain for a block_scale_quantize epilogue")
     # Under split-K `snippets` is kernel 1's partials store; kernel 2 renders the graph's epilogue.
     plumb = _splitk_reduce_snippets(chain, config) if splitk else snippets
 
@@ -1786,6 +1852,7 @@ def _render_block_scale_template(
     compile_aux_pass = _aux_call_block(aux_tensors, prefix="fake_")
     tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
     tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
+    tile_constants += "\n" + _row_per_lane_tile_constants(chain, config)
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
 
@@ -1802,7 +1869,9 @@ def _render_block_scale_template(
     compile_tap_pass = ",\n".join(plumb.tap_compile_pass)
     if compile_tap_pass:
         compile_tap_pass += ","
-    tap_ptr_binds = "\n".join(plumb.tap_ptr_binds) if (plumb.tap_ptr_binds and not splitk) else "pass"
+    # Split-K kernel 1 binds no taps; its tile loop still hands the (empty)
+    # red_part_* helpers their argument tuple.
+    tap_ptr_binds = "\n".join(plumb.tap_ptr_binds) if (plumb.tap_ptr_binds and not splitk) else "_red_part_args = ()"
     red_kernel_stride_params = _reduction_stride_kernel_params(chain)
     red_host_stride_unpack = _reduction_stride_host_unpack(chain) if chain.has_moe else _reduction_stride_host_unpack_from(chain, 10)
     red_host_stride_pass = _reduction_stride_host_pass(chain)
@@ -3147,18 +3216,24 @@ def _check_block_quant_supported(
     vec_bytes_epi: int,
     config: TileConfig,
 ) -> None:
+    """Gate a block_scale_quantize epilogue (sm100 #1090 semantics, swap-AB aware).
+
+    Semantic declines -- the layout of the scale tensor, the routed-group
+    alignment a token-axis block needs, the per-group scale prefix a segmented
+    scale needs -- run before the drain-shape ones, so a caller sees the reason
+    it can act on rather than a chunk-width one."""
     if not chain.quants:
         return
-    if chain.has_mainloop_fusion:
-        raise NotImplementedError("block_scale_quantize epilogue is not supported with mainloop fusion")
+    _check_block_quant_semantics(chain)
     elem_bytes = DTYPE_BYTES[chain.output_dtype]
     vsize = vec_bytes_epi // elem_bytes
     cols_per_acc_stage = _epi_tile_cols(config)
-    # A quant pins the chunk to its block size, so — unlike every other chain,
-    # where the chunk is derived from the outputs' own layouts — the two
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    # A quant pins the chunk to its block size, so -- unlike every other chain,
+    # where the chunk is derived from the outputs' own layouts -- the two
     # divisibility properties the epilogue relies on have to be asserted here:
-    # the drain walks whole chunks (`for j in range(subtile_w // vsize)`) and
-    # stores only whole chunks (`if col_j + vsize <= N`).
+    # the drain walks whole chunks and stores only whole chunks
+    # (`if col_j + vsize <= N`; swap-AB bounds every element by group_end instead).
     subtile_w = _pow2_floor(cols_per_acc_stage, MAX_EPI_CHUNK_ELEMS)
     if subtile_w % vsize != 0:
         raise NotImplementedError(
@@ -3167,13 +3242,14 @@ def _check_block_quant_supported(
             f"drain subtile of cols_per_acc_stage={cols_per_acc_stage} "
             f"(config={config.name})"
         )
-    if chain.matmul.N % vsize != 0:
+    if not swapped and chain.matmul.N % vsize != 0:
         raise NotImplementedError(
             f"block_scale_quantize requires N % chunk == 0 — the epilogue stores whole "
             f"chunks only, so a partial trailing chunk is dropped; got N={chain.matmul.N}, "
             f"chunk={vsize} elements"
         )
     for q in chain.quants:
+        segmented_rows = q.grouped_by_moe and ((q.axis == 1) == swapped)
         # Applies to col quants too: `_emit_block_quant_col` maps chunk column
         # i to lane i % block_size, so a chunk narrower than the block leaves
         # the upper lanes storing a scale they never computed.
@@ -3184,22 +3260,16 @@ def _check_block_quant_supported(
                 f"cols_per_acc_stage={cols_per_acc_stage} and to {MAX_EPI_CHUNK_ELEMS} "
                 f"elements); got block_size={q.block_size}, vsize={vsize}"
             )
-        if q.grouped_by_moe and q.axis != 1:
-            if not chain.has_moe:
-                raise NotImplementedError("grouped row block_scale_quantize requires a MoE grouped matmul graph")
-            if not chain.has_block_scale:
-                raise NotImplementedError(
-                    "grouped row block_scale_quantize currently requires a block-scaled MoE "
-                    "matmul whose scheduler supplies the per-group 128-row scale prefix"
-                )
         if q.axis == 1:
             # Col quant: a warp (block 32) or half-warp (block 16) of rows is
-            # one M block; the redux needs every row guard uniform across the
-            # reducing lanes. MoE CONTRACT (cannot be checked at JIT — fto is
-            # runtime device data): every first_token_offset value must be a
-            # multiple of block_size, so no column block spans a routed-group
-            # boundary (mirrors cutedsl's FIX_PAD_SIZE padding contract);
-            # grouped_by_moe tightens it to fto % (4 * block_size) == 0.
+            # one M block, reduced by a (half-)warp redux. On a plain MoE kernel
+            # the rows are tokens: the token-axis gate in
+            # _check_block_quant_semantics makes the DECLARED first_token_offset
+            # alignment cover the block (4 blocks when grouped_by_moe), so no
+            # column block spans a routed group; the row-per-lane drain keeps
+            # every lane on the redux (_row_per_lane_bounded_rows), so offsets
+            # that break the declared alignment give wrong values, never a hung
+            # warp.
             if q.grouped_by_moe and not chain.has_moe:
                 raise NotImplementedError("grouped (per-group segmented) col block_scale_quantize requires " "a MoE grouped matmul graph")
             if q.block_size not in (16, 32):
@@ -3210,11 +3280,7 @@ def _check_block_quant_supported(
                     f"reduction-uniform row guard; got M={chain.matmul.M}, "
                     f"block_size={q.block_size}"
                 )
-            if config.mma_tile_m == 64 and not config.is_cta_pair_mma and q.block_size != 16:
-                raise NotImplementedError(
-                    "col block_scale_quantize on the mma_inst_m=64 1-CTA-MMA epilogue " "(lane<16 packed layout, 16 rows per warp) supports only block_size 16"
-                )
-            if q.scale_reorder == "F8_128x4":
+            if q.scale_reorder == "F8_128x4" and not segmented_rows:
                 expected_scale_dim = (
                     chain.matmul.batch,
                     ((chain.matmul.N + 127) // 128) * 128,
@@ -3232,27 +3298,95 @@ def _check_block_quant_supported(
                 f"cols_per_acc_stage={cols_per_acc_stage}, block_size={q.block_size}, "
                 f"config={config.name}"
             )
-        if q.scale_reorder == "F8_128x4":
+        if q.scale_reorder == "F8_128x4" and not segmented_rows:
             padded_n_blocks = (((chain.matmul.N // q.block_size) + 3) // 4) * 4
-            if q.grouped_by_moe and q.axis != 1:
-                required_rows = segmented_row_scale_capacity_rows(chain.matmul.M, chain.moe.num_groups)
-                if q.scale_dim is None or q.scale_dim[0] != 1 or q.scale_dim[1] < required_rows or q.scale_dim[1] % 128 or q.scale_dim[2] != padded_n_blocks:
-                    raise NotImplementedError(
-                        "grouped F8_128x4 row block_scale_quantize requires "
-                        "scale_dim=(1, segmented_rows, padded_N_blocks), with "
-                        f"segmented_rows a multiple of 128 and >= the static worst-case {required_rows}, and "
-                        f"padded_N_blocks={padded_n_blocks}; got {q.scale_dim}"
-                    )
-            else:
-                expected_scale_dim = (
-                    chain.matmul.batch,
-                    ((chain.matmul.M + 127) // 128) * 128,
-                    padded_n_blocks,
+            expected_scale_dim = (
+                chain.matmul.batch,
+                ((chain.matmul.M + 127) // 128) * 128,
+                padded_n_blocks,
+            )
+            if q.scale_dim != expected_scale_dim:
+                raise NotImplementedError("F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}")
+    reason = _row_per_lane_gate_reason(chain, vsize, config)
+    if reason is not None:
+        raise NotImplementedError(reason)
+
+
+def _check_block_quant_semantics(chain: FusionChain) -> None:
+    """The config-independent declines of :func:`_check_block_quant_supported`,
+    which run first: the scale tensor's layout, the routed-group alignment a
+    token-axis block needs, the per-group scale prefix a segmented scale needs."""
+    if chain.has_mainloop_fusion:
+        raise NotImplementedError("block_scale_quantize epilogue is not supported with mainloop fusion")
+    swapped = isinstance(chain.moe, MoeSwapAbSpec)
+    for q in chain.quants:
+        if q.scale_reorder is None and q.scale_dim is not None:
+            expected_scale_dim = (
+                (chain.matmul.batch, chain.matmul.M // q.block_size, chain.matmul.N)
+                if q.axis == 1
+                else (chain.matmul.batch, chain.matmul.M, chain.matmul.N // q.block_size)
+            )
+            if q.scale_dim != expected_scale_dim:
+                raise NotImplementedError(f"block_scale_quantize requires scale_dim={expected_scale_dim}; got {q.scale_dim}")
+        # A segmented (per-routed-group) scale lives on the TOKEN axis: kernel rows
+        # on the plain MoE kernel, kernel columns after the swap-AB lowering.
+        segmented_rows = q.grouped_by_moe and ((q.axis == 1) == swapped)
+        if segmented_rows:
+            if not chain.has_moe:
+                raise NotImplementedError("grouped row block_scale_quantize requires a MoE grouped matmul graph")
+            if not chain.has_block_scale:
+                raise NotImplementedError(
+                    "grouped row block_scale_quantize currently requires a block-scaled MoE "
+                    "matmul whose scheduler supplies the per-group 128-row scale prefix"
                 )
-                if q.scale_dim != expected_scale_dim:
-                    raise NotImplementedError(
-                        "F8_128x4 block_scale_quantize scale output currently requires " f"scale_dim={expected_scale_dim}; got {q.scale_dim}"
-                    )
+        if chain.has_moe and (q.axis == 1) != swapped:
+            # Token-axis blocks run along the routed groups -- kernel rows (a col
+            # quant) on the plain MoE kernel, kernel columns after the swap-AB
+            # lowering -- and a tile starts at its group's first token, so a block
+            # may not straddle a group boundary: the DECLARED first_token_offset
+            # alignment has to cover it (four blocks, one F8_128x4 atom quad, when
+            # the scale is grouped). sm100 checks this for swap-AB only and leaves
+            # the plain kernel's col quant to an unchecked contract.
+            boundary = 4 * q.block_size if q.grouped_by_moe else q.block_size
+            tokens = chain.matmul.N if swapped else chain.matmul.M
+            if chain.moe.offset_multiple % boundary or tokens % q.block_size:
+                raise NotImplementedError(
+                    f"MoE token-axis block_scale_quantize requires first_token_offset value alignment divisible by {boundary} "
+                    f"and S divisible by block_size={q.block_size}"
+                )
+        if segmented_rows:
+            tokens = chain.matmul.N if swapped else chain.matmul.M
+            features = chain.matmul.M if swapped else chain.matmul.N
+            required_rows = segmented_row_scale_capacity_rows(tokens, chain.moe.num_groups)
+            padded_blocks = ((features // q.block_size + 3) // 4) * 4
+            if q.scale_dim is None or q.scale_dim[0] != 1 or q.scale_dim[1] < required_rows or q.scale_dim[1] % 128 or q.scale_dim[2] != padded_blocks:
+                raise NotImplementedError(
+                    f"grouped F8_128x4 feature-axis block_scale_quantize requires scale_dim=(1, segmented_rows, {padded_blocks}), "
+                    f"with segmented_rows a multiple of 128 and >= {required_rows}; got {q.scale_dim}"
+                )
+
+
+def _row_per_lane_gate_reason(chain: FusionChain, vsize: int, config: TileConfig) -> "str | None":
+    """Why the row-per-lane drain cannot walk this (chain, config) with
+    ``vsize``-element chunks, or ``None``. The drain walks each warp's
+    32-column groups (a tail group is 16 columns) in whole chunks, and hands one
+    warp 32 rows when the warp tile has two or more 16-row fragments, else 16
+    rows on lanes 0..15 -- one block of a 16-row col quant, never a 32-row one."""
+    if not _row_per_lane_drain(chain, config):
+        return None
+    if config.warp_tile_n % vsize:
+        return (
+            f"block_scale_quantize on sm120 needs warp_tile_n % chunk == 0: each lane drains whole "
+            f"{vsize}-column chunks of one warp's 32-column groups; config {config.name!r} has "
+            f"warp_tile_n={config.warp_tile_n}"
+        )
+    for q in chain.quants:
+        if q.axis == 1 and q.block_size == 32 and config.warp_tile_m % 32:
+            return (
+                f"col block_scale_quantize with block_size 32 on sm120 needs warp_tile_m % 32 == 0 (one warp "
+                f"holds the block's 32 rows); config {config.name!r} has warp_tile_m={config.warp_tile_m}"
+            )
+    return None
 
 
 _FORCE_STG_EPI = False
@@ -3335,6 +3469,13 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
     if config.split_k_slices != 1:
         return config
     if _splitk_reject_reason(chain, replace(config, split_k_slices=2)) is not None:
+        return config
+    if any(r.dim[1] == 1 and r.dim[2] == 1 and r.mode in ("add", "avg", "norm1", "norm2") and r.compute_dtype == "fp32" for r in chain.reductions):
+        # The split-K reducer folds a tile-invariant fp32 sum with one atomic per
+        # epilogue vector -- no register partial -- which drifts with the vector
+        # count (AVG 2.8% off at 3000x3000x1024 split 2, 1.8e-5 unsplit). Modes
+        # exact under atomics (max/min/amax, int32 sums) keep the split's gain;
+        # an explicit split-K config is honored as given.
         return config
     mm = chain.matmul
     if mm.K * DTYPE_BITS[_mma_a_dtype(chain)] < 2048 * 8:
@@ -3420,10 +3561,76 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
     config = preferred_strategy(chain, config)
+    config = _row_per_lane_quant_config(chain, config)
     # skip splitK for MoE and dynamic shapes
     if chain.has_moe or dynamic_shapes:
         return config
     return _auto_split_k(chain, config)
+
+
+# Per-thread accumulator registers (all GEMMs of the chain) the auto pick keeps a
+# quant chain under, and how many re-cut candidates it probes at most.
+_ROW_PER_LANE_QUANT_ACC_REGS = 64
+_ROW_PER_LANE_PICK_PROBES = 64
+
+
+def _row_per_lane_quant_config(chain: FusionChain, config: TileConfig) -> TileConfig:
+    """The automatic pick for a block-quantized MoE chain.
+
+    ``tile_config.select_config`` orders warp grids without the row-per-lane
+    drain's gates (:func:`_row_per_lane_gate_reason`), and the MoE planner
+    offers no alternative to its one pick -- so a quant graph would be declined
+    outright (64x32 warps4x2, a 16x16 warp tile, is the common pick). The quant
+    epilogue also needs register room: past
+    :data:`_ROW_PER_LANE_QUANT_ACC_REGS` accumulator registers per thread the
+    kernel spills inside the MMA loop (a 64x64 warp tile ran 2.3x slower than
+    its bf16-output twin; 64 accumulators cost about 4%). Keep the pick when it
+    passes both; else re-cut it -- same CTA height and K width first, then the
+    nearest CTA shape (the same tile re-gridded is nearest; the wider wins a
+    tie), then 32-row warp tiles, whose slabs keep all 32 lanes draining -- and
+    take the first config the full probe accepts. A chain no geometry can serve
+    keeps the pick, so the decline keeps its reason."""
+    if not _row_per_lane_drain(chain, config):
+        return config
+
+    def fits(cfg: TileConfig) -> bool:
+        if chain.num_gemms * cfg.warp_tile_m * cfg.warp_tile_n > 32 * _ROW_PER_LANE_QUANT_ACC_REGS:
+            return False
+        try:
+            vsize = _epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype]
+        except (NotImplementedError, ValueError):
+            return False
+        return _row_per_lane_gate_reason(chain, vsize, cfg) is None
+
+    if fits(config):
+        return config
+    try:
+        _check_block_quant_semantics(chain)
+    except NotImplementedError:
+        return config
+
+    def accepted(cfg: TileConfig) -> bool:
+        try:
+            probe_chain(chain, cfg)
+        except (NotImplementedError, ValueError):
+            return False
+        return True
+
+    from ..tile_config import CATALOG
+
+    def distance(c: TileConfig) -> tuple:
+        return (
+            (c.cta_tile_m, c.cta_tile_k_bytes) != (config.cta_tile_m, config.cta_tile_k_bytes),
+            abs(math.log2(c.cta_tile_m / config.cta_tile_m)) + abs(math.log2(c.cta_tile_n / config.cta_tile_n)),
+            -c.cta_tile_n,
+            c.warp_tile_m % 32 != 0,
+            c.name,
+        )
+
+    family = sorted((c for c in CATALOG if c.pipeline == config.pipeline and c.split_k_slices == 1 and fits(c)), key=distance)
+    # Bounded: a chain every geometry declines for a config-specific reason
+    # should not probe the whole catalog on each plan request.
+    return next((c for c in family[:_ROW_PER_LANE_PICK_PROBES] if accepted(c)), config)
 
 
 def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
@@ -3463,6 +3670,18 @@ def _precheck_plain(
     _check_own_family(select_template(chain, config))
 
 
+def _check_moe_output_dtypes(chain: FusionChain, tmpl) -> None:
+    """The sm120 MoE kernels store every output through an STG tap whose fake is
+    the Int8 carrier at the logical (M, N), while a packed fp4 output's call
+    contract is (1, S, N / 2) and ``graph.execute`` binds it as a
+    float4_e2m1fn_x2 slot -- so no buffer passes both the build and the call.
+    Decline it at probe and build alike (every output spec: a bf16 side output
+    may sit in slot 0). Supporting it needs the N / 2 fake, a carrier bridge for
+    the pack's fp4 slot, and tests through graph.execute."""
+    if any(spec.dtype == "fp4_e2m1" for spec in chain.output_specs):
+        raise NotImplementedError(f"{tmpl.file} does not support a packed fp4 output")
+
+
 def _precheck_moe(
     chain: FusionChain,
     config: TileConfig,
@@ -3480,14 +3699,24 @@ def _precheck_moe(
             "is a K-major TMA box offset to the routed group's first row "
             f"(got token {token_major}-major)"
         )
-    _arch_reason = select_template(chain, config).active_reject(config)
+    _tmpl = select_template(chain, config)
+    _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
+    _check_moe_output_dtypes(chain, _tmpl)
     _check_dtype_config_compat(chain, config)
+    # The renderer declines a multi-GEMM tile whose operand stages plus the
+    # epilogue staging miss the SMEM budget; probe the same rule so a plan the
+    # heuristics list is one the engine will build (after the geometry / TMA
+    # reasons, which no smaller K can clear).
+    if chain.is_multi_gemm and hasattr(_tmpl, "multi_gemm_reject"):
+        _mg = _tmpl.multi_gemm_reject(chain, config)
+        if _mg is not None:
+            raise NotImplementedError(f"{_tmpl.file}: {_mg}")
     _check_input_alignment(chain)
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
-    _check_own_family(select_template(chain, config))
+    _check_own_family(_tmpl)
 
 
 def _precheck_block_scale(
@@ -3516,6 +3745,7 @@ def _precheck_block_scale(
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
     _check_own_family(select_template(chain, config))
+    _check_block_scale_geometry(chain, config)
 
 
 def _precheck_moe_block_scale(
@@ -3542,12 +3772,17 @@ def _precheck_moe_block_scale(
             if red.compute_dtype != "fp32" or red.dtype != "fp32":
                 raise NotImplementedError("MoE block-scale reduction supports only fp32 compute/output")
     _check_input_alignment(chain)
-    _arch_reason = select_template(chain, config).active_reject(config)
+    _tmpl = select_template(chain, config)
+    if chain.is_multi_gemm and not _tmpl.supports_multi_gemm:
+        raise NotImplementedError(f"block-scale multi-GEMM ({chain.num_gemms} GEMMs) is not supported by " f"{_tmpl.file}.")
+    _arch_reason = _tmpl.active_reject(config)
     if _arch_reason is not None:
         raise NotImplementedError(_arch_reason)
+    _check_moe_output_dtypes(chain, _tmpl)
     _compute_output_vec_bytes(chain)
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
-    _check_own_family(select_template(chain, config))
+    _check_own_family(_tmpl)
+    _check_block_scale_geometry(chain, config)
 
 
 def precheck_path(
@@ -3730,6 +3965,7 @@ def jit_from_cudnn_graph(
         tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
         split_k_slices=config.split_k_slices,
+        drain_hooks=True,
     )
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
@@ -4028,6 +4264,7 @@ class CompiledMoeGemm:
         if len(snke) < 3:
             raise ValueError("MoE call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
+        _check_runtime_quant(self.chain, self.config, S, N)
         outputs_spec = self.chain.outputs
         outputs = list(output) if isinstance(output, (list, tuple)) else [output]
         if len(outputs) != len(outputs_spec):
@@ -4132,6 +4369,7 @@ class CompiledMoeGemm:
         if len(snke) < 3:
             raise ValueError(f"MoE call needs problem_size (S, N, K[, ...]); got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
+        _check_runtime_quant(chain, self.config, S, N)
 
         na, nb = chain.num_a_operands, chain.num_b_operands
         a_slots: list = [None] * na
@@ -4239,18 +4477,29 @@ def _moe_launch_tail(cs, aux=(), *, tma_slots: "frozenset[int]" = frozenset()) -
     return (*taps, *aux, *tmas)
 
 
+def _check_runtime_quant(chain: FusionChain, cfg: TileConfig, m: int, n: int) -> None:
+    """Re-run the quant gates at a call's runtime kernel-frame (M, N). A quant
+    scale output keeps the shape the build declared (recipe: CONST), while the
+    kernel writes the scales of every runtime row -- so a call whose extents
+    need another scale geometry (a compact table's row count, an F8_128x4
+    atom's 128-row padding, a segmented capacity) is refused here rather than
+    writing past the caller's scale buffer."""
+    if not chain.quants or (m, n) == (chain.matmul.M, chain.matmul.N):
+        return
+    runtime_chain = replace(chain, matmul=replace(chain.matmul, M=m, N=n))
+    try:
+        _check_block_quant_supported(runtime_chain, _epi_vec_bytes(chain, cfg), cfg)
+    except NotImplementedError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _launch_moe_swap_ab(compiled, weights, tokens, outputs, aux, offsets, weight_sf, token_sf, mnk, workspace, stream, token_index=None, token_ks=None):
     chain, cfg = compiled.chain, compiled.config
     m, n, k = map(int, mnk)
     e = int(weights[0].shape[0])
     offsets = _offset_vector(offsets)
     g = _moe_num_groups(offsets, e)
-    if chain.quants and (m, n) != (chain.matmul.M, chain.matmul.N):
-        runtime_chain = replace(chain, matmul=replace(chain.matmul, M=m, N=n))
-        try:
-            _check_block_quant_supported(runtime_chain, _epi_vec_bytes(chain, cfg), cfg)
-        except NotImplementedError as exc:
-            raise ValueError(str(exc)) from exc
+    _check_runtime_quant(chain, cfg, m, n)
     if n % math.gcd(_epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype], chain.moe.offset_multiple, chain.matmul.N):
         raise ValueError("MoE weight-by-token runtime S violates the compiled STG chunk alignment")
     for quant in chain.quants:
@@ -4329,6 +4578,8 @@ def _jit_moe(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
+        bounded_rows=_row_per_lane_bounded_rows(chain, config),
+        drain_hooks=True,
     )
     src = _render_template(chain, snippets, config)
     mod = _import_kernel(src)
@@ -4380,6 +4631,7 @@ def _jit_block_scale(
         tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
         split_k_slices=config.split_k_slices,
+        drain_hooks=True,
     )
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)
@@ -4479,6 +4731,7 @@ class CompiledMoeBlockScaleGemm:
         if len(snke) < 3:
             raise ValueError("MoE block-scale call needs problem_size (S, N, K[, ...]); " f"got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
+        _check_runtime_quant(self.chain, self.config, S, N)
         outputs_spec = self.chain.outputs
         outputs = list(output) if isinstance(output, (list, tuple)) else [output]
         if len(outputs) != len(outputs_spec):
@@ -4659,6 +4912,7 @@ class CompiledMoeBlockScaleGemm:
         if len(snke) < 3:
             raise ValueError(f"MoE block-scale call needs problem_size (S, N, K[, ...]); got {snke!r}")
         S, N, K = int(snke[0]), int(snke[1]), int(snke[2])
+        _check_runtime_quant(chain, self.config, S, N)
 
         na, nb = chain.num_a_operands, chain.num_b_operands
         a_slots: list = [None] * na  # (packed token, sfa)
@@ -4780,6 +5034,8 @@ def _jit_moe_block_scale(
         output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
         tma_slots=frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
         packed_lanes=_epi_packed_lanes(config),
+        bounded_rows=_row_per_lane_bounded_rows(chain, config),
+        drain_hooks=True,
     )
     src = _render_block_scale_template(chain, snippets, config)
     mod = _import_kernel(src)

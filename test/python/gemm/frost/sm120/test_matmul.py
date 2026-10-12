@@ -1,0 +1,3919 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Matmul correctness regression gate over (config × dtype-pair × shape).
+
+Each case builds a frontend graph, JITs through the GEMM hook, and asserts
+bit-tight equality vs torch-fp32 (small-integer inputs keep the reduction exact).
+Parametrize order is (config, dtype, shape) so each (config, dtype) block reuses
+one compiled kernel. CUDNN_GEMM_TEST_FULL=1 expands the config axis to the whole
+CATALOG. Also runnable as a script (forwards argv to pytest).
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import pathlib
+import sys
+import textwrap
+
+import pytest
+import torch
+
+from gemm_test_utils import (
+    requires_int8_mma,
+    requires_matmul_gpu,
+    requires_sm120,
+    skip_unless_pipeline_active as _skip_unless_active,
+    requires_sm100,
+    Plan as _plan,
+    vp as _vp,
+    resolve as _resolve,
+    e5m3_quant_ref as _e5m3_quant_ref,
+    e5m3_to_float as _e5m3_to_float,
+    requires_sm107,
+)
+
+# Module-wide GPU gate — every test here is end-to-end and needs Blackwell.
+pytestmark = [pytest.mark.L0, requires_matmul_gpu]
+
+
+import cudnn
+import cudnn.gemm.frost  # noqa: F401  — installs the cudnn.pygraph recorder hook
+from cudnn.gemm.frost.compiler import force_stg_epi as _force_stg_epi, _current_arch, _epi_chunk_elems, _epi_vec_bytes
+from cudnn.gemm.frost.arch_family import active_family, template_dir, template_files
+from cudnn.gemm.frost.kernel_registry import PIPELINE_ARCH_RANGES, PIPELINE_FAMILY
+from cudnn.gemm.frost.graph_analyzer import analyze
+from cudnn.gemm.frost.tile_config import CATALOG, ConfigSm120, by_name
+
+_TORCH_DTYPE = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp8_e4m3": torch.float8_e4m3fn,
+    "fp8_e5m2": torch.float8_e5m2,
+}
+_CUDNN_DTYPE = {
+    "bf16": cudnn.data_type.BFLOAT16,
+    "fp16": cudnn.data_type.HALF,
+    "fp8_e4m3": cudnn.data_type.FP8_E4M3,
+    "fp8_e5m2": cudnn.data_type.FP8_E5M2,
+}
+_ELEM_BYTES = {"bf16": 2, "fp16": 2, "fp8_e4m3": 1, "fp8_e5m2": 1}
+
+
+# Shape menu: tile-aligned baseline + M-OOB + K-OOB + combined M+K-OOB. N stays
+# aligned across the whole menu — see _compatible() for why.
+_WEIRD_SHAPES: tuple[tuple[int, int, int], ...] = (
+    # Tile-aligned baseline.
+    (384, 768, 384),
+    (640, 384, 512),
+    (256, 1280, 256),
+    (512, 1024, 640),  # K = 5×128
+    # M-OOB (N aligned, K aligned).
+    (255, 256, 256),  # one row short of a tile
+    (200, 256, 256),  # deep inside a partial tile
+    # K-OOB (M aligned, N aligned).
+    (
+        256,
+        256,
+        200,
+    ),  # partial K-tile (valid for BF16/FP16, SKIP for FP8: 16B TMA stride)
+    (256, 256, 96),  # smaller than one K_BYTES=128 BF16 tile
+    # M + K OOB.
+    (255, 256, 240),
+)
+
+# (input_dtype, output_dtype) pairs: same-dtype BF16/FP16, FP8 E4M3/E5M2 → FP16,
+# and one mixed FP8 → BF16.
+_CORE_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
+    ("bf16", "bf16"),
+    ("fp16", "fp16"),
+    ("fp8_e4m3", "fp16"),
+    ("fp8_e5m2", "fp16"),
+    ("fp8_e4m3", "bf16"),
+)
+
+# Curated config subset — each entry covers a distinct template-architectural
+# corner. Full CATALOG sweep is opt-in via CUDNN_GEMM_TEST_FULL=1.
+_BF16 = cudnn.data_type.BFLOAT16
+_QUICK_CONFIGS: tuple[str, ...] = (
+    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",  # baseline cta1 single-CTA
+    "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma",  # large N
+    "CONFIG_sm100_128x128x64_128x128x32_cluster1x1_1ctamma",  # K_BYTES=64
+    "CONFIG_sm100_128x32x128_128x32x32_cluster1x1_1ctamma",  # smallest N=32
+    "CONFIG_sm100_64x128x128_64x128x32_cluster2x1_1ctamma",  # cta1 + B-multicast
+    "CONFIG_sm100_128x64x128_128x64x32_cluster1x2_1ctamma",  # cta1 + A-multicast
+    "CONFIG_sm100_64x64x128_64x64x32_cluster2x2_1ctamma",  # cta1 both multicasts
+    "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",  # cta2 baseline
+    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",  # cta2 large N
+    "CONFIG_sm100_128x256x64_128x256x32_cluster2x1_2ctamma",  # cta2 K_BYTES=64
+    "CONFIG_sm100_128x128x128_128x128x32_cluster4x2_2ctamma",  # cta2 big cluster
+    "CONFIG_sm100_64x64x128_64x64x32_cluster2x4_2ctamma",  # cta2 cluster-m=128 (cta_tile_m=64)
+    # K_BYTES=64 large-cluster coverage — mirrors the K_BYTES=128 entries above.
+    "CONFIG_sm100_64x64x64_64x64x32_cluster2x2_1ctamma",  # cta1 both multicasts, K_BYTES=64
+    "CONFIG_sm100_128x128x64_128x128x32_cluster4x2_2ctamma",  # cta2 big cluster, K_BYTES=64
+    "CONFIG_sm100_64x64x64_64x64x32_cluster2x4_2ctamma",  # cta2 cluster-m=128, K_BYTES=64
+    # N not a multiple of 32 (pow2 epilogue subtile spans + tile-clamped vsize).
+    "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma",  # minimum N
+    "CONFIG_sm100_128x40x128_128x40x32_cluster1x1_1ctamma",  # 32+8 tail span
+    "CONFIG_sm100_64x24x128_64x24x32_cluster1x1_1ctamma",  # cta_m=64, 16+8 spans
+    "CONFIG_sm100_128x144x128_128x144x32_cluster2x1_2ctamma",  # cta2 (N%16), 16-col tail
+    # CTA tiles split across mma_size_m MMA instructions along M. Split is just
+    # another geometry axis, so it rides the same dtype x layout x shape matrix;
+    # the invariants it has to hold are pinned by the unit tests at the end.
+    "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma",  # mma_size_m=2
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_1ctamma",  # mma_size_m=2, acc_stages drops to 1
+    "CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma",  # mma_size_m=2 at mma_inst_m=64 (packed drain)
+    "CONFIG_sm100_256x256x128_128x256x32_cluster2x1_2ctamma",  # on the pair (cuBLAS geometry)
+    "CONFIG_sm100_256x128x128_128x128x32_cluster2x2_1ctamma",  # split + both multicasts
+    "CONFIG_sm100_256x256x64_128x256x32_cluster2x1_1ctamma",  # split + K_BYTES=64
+    # Split at mma_inst_m=64 on the pair drains N/2 per M block, so an N whose
+    # half is not a power of two exercises the tile-clamped epilogue chunk.
+    "CONFIG_sm100_128x48x128_64x48x32_cluster2x1_2ctamma",  # 2x2 DP, 24-col per-M-block drain
+    "CONFIG_sm100_128x16x128_64x16x32_cluster2x1_2ctamma",  # 2x2 DP, 8-col per-M-block drain
+    # sm120 (warp-scoped MMA, no cluster / no cta_group). Its arch range starts
+    # at SM 10.0, so it runs on the Blackwell datacenter parts too. The family
+    # is pinned to one geometry for now, so there is one entry to sweep.
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+)
+
+_BATCHED_CONFIGS: tuple[str, ...] = (
+    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",  # rank-3 baseline
+    "CONFIG_sm100_64x64x128_64x64x32_cluster2x2_1ctamma",  # rank-3 + TMA multicast
+    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",  # rank-3 + CTA_2 MMA
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",  # rank-3 on the warp-MMA family
+)
+
+_BATCHED_SHAPES: tuple[tuple[int, int, int, int], ...] = (
+    # _WEIRD_SHAPES classes prefixed with batch. Batches in {1,2,3}; the runtime
+    # binds to the graph batch, so each distinct batch needs its own compiled anchor.
+    (1, 384, 768, 384),
+    (2, 640, 384, 512),
+    (3, 256, 1280, 256),
+    (2, 512, 1024, 640),
+    (3, 255, 256, 256),  # M-OOB
+    (1, 200, 256, 256),  # M-OOB
+    (2, 256, 256, 200),  # K-OOB: SKIP for FP8
+    (3, 256, 256, 96),  # K-OOB
+    (2, 255, 256, 240),  # M + K OOB
+)
+
+_BATCH_BROADCAST_SHAPES: tuple[tuple[int, int, int, int], ...] = (
+    # _WEIRD_SHAPES M/N/K classes, output batch > 1 so one input is a real broadcast.
+    (2, 384, 768, 384),
+    (3, 640, 384, 512),
+    (2, 256, 1280, 256),
+    (3, 512, 1024, 640),
+    (2, 255, 256, 256),  # M-OOB
+    (3, 200, 256, 256),  # M-OOB
+    (2, 256, 256, 200),  # K-OOB: SKIP for FP8
+    (3, 256, 256, 96),  # K-OOB
+    (2, 255, 256, 240),  # M + K OOB
+)
+
+_BATCH_BROADCAST_CASES = tuple((side, shape) for side in ("A", "B") for shape in _BATCH_BROADCAST_SHAPES)
+
+_INPUT_LAYOUTS: tuple[tuple[str, str], ...] = (
+    ("k", "k"),
+    ("m", "k"),
+    ("k", "n"),
+    ("m", "n"),
+)
+# ("k", "k") is exactly test_matmul's matrix — sweep only the non-canonical combos.
+_NONCANONICAL_LAYOUTS: tuple[tuple[str, str], ...] = tuple(p for p in _INPUT_LAYOUTS if p != ("k", "k"))
+_NONPACKED_CONFIGS: tuple[str, ...] = (
+    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+    "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+)
+_NONPACKED_LAYOUTS: tuple[tuple[str, str], ...] = (
+    ("k", "k"),
+    ("m", "n"),
+)
+_NONPACKED_DTYPE_PAIRS: tuple[tuple[str, str], ...] = (
+    ("bf16", "bf16"),
+    ("fp8_e4m3", "fp16"),
+)
+
+
+def _sweep_config_names() -> list[str]:
+    """Quick subset by default; full catalog under CUDNN_GEMM_TEST_FULL=1.
+
+    The full sweep expands every catalog geometry of every family; combos the
+    engine rejects — sm103 configs (block-scale-only family), an sm120 config on
+    a non-K-major graph — SKIP via the engine's own clean rejection."""
+    if os.environ.get("CUDNN_GEMM_TEST_FULL", "0") == "1":
+        return [c.name for c in CATALOG]
+    return list(_QUICK_CONFIGS)
+
+
+# Pretty IDs (drive the `-k` filter and the failure report line).
+
+
+def _shape_id(s: tuple[int, int, int]) -> str:
+    return f"{s[0]}x{s[1]}x{s[2]}"
+
+
+def _batched_shape_id(s: tuple[int, int, int, int]) -> str:
+    return f"B{s[0]}_{s[1]}x{s[2]}x{s[3]}"
+
+
+def _batch_broadcast_id(p: tuple[str, tuple[int, int, int, int]]) -> str:
+    side, s = p
+    return f"broadcast{side}_B{s[0]}_{s[1]}x{s[2]}x{s[3]}"
+
+
+def _dtype_id(p: tuple[str, str]) -> str:
+    return f"{p[0]}->{p[1]}"
+
+
+def _config_id(name: str) -> str:
+    """Strip the redundant CONFIG_ prefix and _sm100 suffix from pytest IDs."""
+    out = name
+    if out.startswith("CONFIG_"):
+        out = out[len("CONFIG_") :]
+    if out.endswith("_sm100"):
+        out = out[: -len("_sm100")]
+    return out
+
+
+def _layout_id(p: tuple[str, str]) -> str:
+    return f"A{p[0]}_B{p[1]}"
+
+
+# Compatibility gate.
+
+
+def _compatible(
+    cfg,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+) -> tuple[bool, str]:
+    """Reject only shapes the kernel can't service. Returns (ok, reason)."""
+    in_eb = _ELEM_BYTES[in_dtype]
+    out_eb = _ELEM_BYTES[out_dtype]
+    if cfg.cta_tile_k_bytes % in_eb != 0:
+        return False, (f"K_BYTES={cfg.cta_tile_k_bytes} not divisible by in_elem_bytes={in_eb} " f"(catalog × dtype mismatch)")
+    a_contig_extent = K if a_major == "k" else M
+    b_contig_extent = K if b_major == "k" else N
+    if (a_contig_extent * in_eb) % 16 != 0:
+        return False, (
+            f"A {a_major}-major contiguous extent * in_eb="
+            f"{a_contig_extent * in_eb} not 16B-aligned. "
+            f"{in_dtype!r} needs that extent % {16 // in_eb} == 0."
+        )
+    if (b_contig_extent * in_eb) % 16 != 0:
+        return False, (
+            f"B {b_major}-major contiguous extent * in_eb="
+            f"{b_contig_extent * in_eb} not 16B-aligned. "
+            f"{in_dtype!r} needs that extent % {16 // in_eb} == 0."
+        )
+    cta_smem_m, cta_smem_n, _ = cfg.cta_smem_tile_mnk(in_eb)
+    mn_group_elems = cfg.cta_tile_k_bytes // in_eb
+    # Each tcgen05 MMA instruction reads its own M sub-block of the SMEM tile
+    # through its own descriptor, so the swizzle-group rule applies per MMA. A
+    # warp-scoped family (fixed mma tile: sm120) has no per-MMA descriptors --
+    # only the whole extent must cut into whole groups (the TMA group walk).
+    _per_mma = 1 if getattr(type(cfg), "FIXED_MMA_TILE_MN", None) is not None else cfg.mma_size_m
+    mma_smem_m = cta_smem_m // _per_mma
+    mma_smem_n = cta_smem_n
+    if a_major == "m" and (mma_smem_m < mn_group_elems or mma_smem_m % mn_group_elems != 0):
+        return False, (f"A M-major per-MMA SMEM M={mma_smem_m} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    if b_major == "n" and (mma_smem_n < mn_group_elems or mma_smem_n % mn_group_elems != 0):
+        return False, (f"B N-major per-MMA SMEM N={mma_smem_n} is not compatible with " f"the {mn_group_elems}-element swizzle group")
+    if not any(lo <= _current_arch() < hi for lo, hi in PIPELINE_ARCH_RANGES[cfg.pipeline]):
+        return False, f"the {cfg.pipeline} pipeline does not run on sm_{_current_arch()}"
+    if PIPELINE_FAMILY[cfg.pipeline] != active_family():
+        # Each arch tree's compiler renders its own pipelines only; the process
+        # picked its tree from the GPU (or CUDNN_FRONTEND_GEMM_ARCH_FAMILY).
+        return False, f"the {cfg.pipeline} pipeline is served by the {PIPELINE_FAMILY[cfg.pipeline]} arch tree; this process runs the {active_family()} tree"
+    if cfg.pipeline == "sm120":
+        # MN-major operands ride a transposing ldmatrix: b16 for 16-bit dtypes,
+        # the SM 12x byte-granule m16n16.trans.b8 form for 8-bit ones. Sub-byte
+        # dtypes have no transposed load and must be K-major. (The n-frag pair
+        # rule for 8-bit N-major B is met by every catalog config, whose
+        # warp_tile_n = mma_size_n * 16.)
+        in_bits = 4 if in_dtype == "fp4_e2m1" else in_eb * 8
+        if in_bits not in (16, 8) and (a_major == "m" or b_major == "n"):
+            return False, (
+                f"sm120 MN-major operands are 16- or 8-bit only (ldmatrix.trans " f"b16 / m16n16.b8), got {in_dtype} A {a_major}-major / B {b_major}-major"
+            )
+    out_contig_name, out_contig_extent = ("N", N) if out_major == "n" else ("M", M)
+    if (out_contig_extent * out_eb) % 32 != 0:
+        return False, (
+            f"{out_contig_name}*out_eb={out_contig_extent * out_eb} not 32B-aligned — "
+            f"STG full-vec store bakes alignment=VEC_BYTES=32 at JIT. "
+            f"{out_dtype!r} needs {out_contig_name} % {32 // out_eb} == 0."
+        )
+    return True, ""
+
+
+# Graph + data + reference.
+
+
+def _a_stride_batched(M: int, K: int, a_major: str) -> list[int]:
+    return [M * K, K, 1] if a_major == "k" else [M * K, 1, M]
+
+
+def _b_stride_batched(N: int, K: int, b_major: str) -> list[int]:
+    return [N * K, 1, K] if b_major == "k" else [N * K, N, 1]
+
+
+def _build_graph(
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+) -> cudnn.pygraph:
+    g = cudnn.pygraph(
+        io_data_type=_CUDNN_DTYPE[in_dtype],
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, a_major))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, b_major))
+    C = g.matmul(A=A, B=B, name="mm")
+    if out_major == "m":
+        C.set_stride([M * N, 1, M])
+    C.set_output(True)
+    if out_dtype != in_dtype:
+        C.set_data_type(_CUDNN_DTYPE[out_dtype])
+    return g
+
+
+def _build_block_quant_graph(
+    M: int,
+    N: int,
+    K: int,
+    block_size: int = 32,
+) -> cudnn.pygraph:
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    Q, QS = g.block_scale_quantize(input=C, block_size=block_size, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    return g
+
+
+def _build_batched_graph(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+) -> cudnn.pygraph:
+    g = cudnn.pygraph(
+        io_data_type=_CUDNN_DTYPE[in_dtype],
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[batch, M, K], stride=_a_stride_batched(M, K, a_major))
+    B = g.tensor(name="B", dim=[batch, K, N], stride=_b_stride_batched(N, K, b_major))
+    C = g.matmul(A=A, B=B, name="mm")
+    if out_major == "m":
+        C.set_stride([M * N, 1, M])
+    C.set_output(True)
+    if out_dtype != in_dtype:
+        C.set_data_type(_CUDNN_DTYPE[out_dtype])
+    return g
+
+
+def _build_batch_broadcast_graph(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    broadcast_side: str,
+    a_major: str = "k",
+    b_major: str = "k",
+) -> cudnn.pygraph:
+    g = cudnn.pygraph(
+        io_data_type=_CUDNN_DTYPE[in_dtype],
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    a_batch = 1 if broadcast_side == "A" else batch
+    b_batch = 1 if broadcast_side == "B" else batch
+    A = g.tensor(name="A", dim=[a_batch, M, K], stride=_a_stride_batched(M, K, a_major))
+    B = g.tensor(name="B", dim=[b_batch, K, N], stride=_b_stride_batched(N, K, b_major))
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True)
+    if out_dtype != in_dtype:
+        C.set_data_type(_CUDNN_DTYPE[out_dtype])
+    return g
+
+
+def _mkdata(
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    seed: int = 0,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+):
+    """Small-integer inputs ⇒ exact FP32 reduction ⇒ kernel and reference differ
+    only by the final deterministic downcast. All shapes rank-3, batch=1."""
+    torch.manual_seed(seed)
+    rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
+    a_shape = (1, M, K) if a_major == "k" else (1, K, M)
+    b_shape = (1, N, K) if b_major == "k" else (1, K, N)
+    a = torch.empty(*a_shape, dtype=torch.int32).random_(*rng).to(dtype=_TORCH_DTYPE[in_dtype], device="cuda")
+    b = torch.empty(*b_shape, dtype=torch.int32).random_(*rng).to(dtype=_TORCH_DTYPE[in_dtype], device="cuda")
+    if a_major == "m":
+        a = a.transpose(1, 2)
+    if b_major == "n":
+        b = b.transpose(1, 2)
+    if out_major == "m":
+        c = torch.empty(1, N, M, dtype=_TORCH_DTYPE[out_dtype], device="cuda").transpose(1, 2)
+    else:
+        c = torch.empty(1, M, N, dtype=_TORCH_DTYPE[out_dtype], device="cuda")
+    return a, b, c
+
+
+def _mkbatched_data(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    seed: int = 0,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+):
+    torch.manual_seed(seed)
+    rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
+    a_shape = (batch, M, K) if a_major == "k" else (batch, K, M)
+    b_shape = (batch, N, K) if b_major == "k" else (batch, K, N)
+    a = torch.empty(*a_shape, dtype=torch.int32).random_(*rng).to(dtype=_TORCH_DTYPE[in_dtype], device="cuda")
+    b = torch.empty(*b_shape, dtype=torch.int32).random_(*rng).to(dtype=_TORCH_DTYPE[in_dtype], device="cuda")
+    if a_major == "m":
+        a = a.transpose(1, 2)
+    if b_major == "n":
+        b = b.transpose(1, 2)
+    if out_major == "m":
+        c = torch.empty(batch, N, M, dtype=_TORCH_DTYPE[out_dtype], device="cuda").transpose(1, 2)
+    else:
+        c = torch.empty(batch, M, N, dtype=_TORCH_DTYPE[out_dtype], device="cuda")
+    return a, b, c
+
+
+def _mkbatch_broadcast_data(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    broadcast_side: str,
+    seed: int = 0,
+    a_major: str = "k",
+    b_major: str = "k",
+):
+    torch.manual_seed(seed)
+    rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
+    a_batch = 1 if broadcast_side == "A" else batch
+    b_batch = 1 if broadcast_side == "B" else batch
+    a_shape = (a_batch, M, K) if a_major == "k" else (a_batch, K, M)
+    b_shape = (b_batch, N, K) if b_major == "k" else (b_batch, K, N)
+    a = torch.empty(*a_shape, dtype=torch.int32).random_(*rng).to(dtype=_TORCH_DTYPE[in_dtype], device="cuda")
+    b = torch.empty(*b_shape, dtype=torch.int32).random_(*rng).to(dtype=_TORCH_DTYPE[in_dtype], device="cuda")
+    if a_major == "m":
+        a = a.transpose(1, 2)
+    if b_major == "n":
+        b = b.transpose(1, 2)
+    c = torch.empty(batch, M, N, dtype=_TORCH_DTYPE[out_dtype], device="cuda")
+    return a, b, c
+
+
+def _mkbatched_nonpacked_data(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    seed: int = 0,
+    a_major: str = "k",
+    b_major: str = "k",
+):
+    torch.manual_seed(seed)
+    rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
+    pad = 16
+    device = "cuda"
+    if a_major == "k":
+        a_storage = torch.empty(batch, M, K + pad, dtype=torch.int32, device=device).random_(*rng)
+        a_storage = a_storage.to(dtype=_TORCH_DTYPE[in_dtype])
+        a = a_storage[:, :, :K]
+    else:
+        a_storage = torch.empty(batch, K, M + pad, dtype=torch.int32, device=device).random_(*rng)
+        a_storage = a_storage.to(dtype=_TORCH_DTYPE[in_dtype])
+        a = a_storage[:, :, :M].transpose(1, 2)
+    if b_major == "k":
+        b_storage = torch.empty(batch, N, K + pad, dtype=torch.int32, device=device).random_(*rng)
+        b_storage = b_storage.to(dtype=_TORCH_DTYPE[in_dtype])
+        b = b_storage[:, :, :K]
+    else:
+        b_storage = torch.empty(batch, K, N + pad, dtype=torch.int32, device=device).random_(*rng)
+        b_storage = b_storage.to(dtype=_TORCH_DTYPE[in_dtype])
+        b = b_storage[:, :, :N].transpose(1, 2)
+    c_storage = torch.empty(batch, M, N + pad, dtype=_TORCH_DTYPE[out_dtype], device=device)
+    c = c_storage[:, :, :N]
+    return a, b, c
+
+
+def _mkbatched_zero_stride_input_data(
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: str,
+    out_dtype: str,
+    seed: int = 0,
+):
+    torch.manual_seed(seed)
+    rng = (-3, 3) if in_dtype.startswith("fp8") else (-2, 2)
+    device = "cuda"
+    a_base = torch.empty(K, dtype=torch.int32, device=device).random_(*rng)
+    b_base = torch.empty(K, dtype=torch.int32, device=device).random_(*rng)
+    a_base = a_base.to(dtype=_TORCH_DTYPE[in_dtype])
+    b_base = b_base.to(dtype=_TORCH_DTYPE[in_dtype])
+    a = torch.as_strided(a_base, (batch, M, K), (0, 0, 1))
+    b = torch.as_strided(b_base, (batch, N, K), (0, 0, 1))
+    c_storage = torch.empty(batch, M, N + 16, dtype=_TORCH_DTYPE[out_dtype], device=device)
+    c = c_storage[:, :, :N]
+    return a, b, c
+
+
+def _reference(a: torch.Tensor, b: torch.Tensor, out_dtype: str) -> torch.Tensor:
+    ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    return ref.to(_TORCH_DTYPE[out_dtype])
+
+
+def _block_quant_reference(
+    x: torch.Tensor,
+    block_size: int,
+    out_dtype: torch.dtype,
+    scale_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, M, N = x.shape
+    blocks = x.view(B, M, N // block_size, block_size)
+    output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
+    scale_f = blocks.abs().amax(dim=-1) / output_max
+    if scale_dtype is torch.float8_e8m0fnu:
+        safe = torch.where(scale_f > 0, scale_f, 1.0)
+        scale_f = torch.where(
+            scale_f > 0,
+            torch.pow(2.0, torch.ceil(torch.log2(safe))),
+            0.0,
+        )
+    scale = scale_f.to(scale_dtype)
+    inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
+    q = (blocks * inv.unsqueeze(-1)).clamp(-output_max, output_max)
+    return q.to(out_dtype).view(B, M, N), scale
+
+
+def _batch_broadcast_reference(a: torch.Tensor, b: torch.Tensor, batch: int, out_dtype: str) -> torch.Tensor:
+    a_full = a.to(torch.float32).expand(batch, -1, -1)
+    b_full = b.to(torch.float32).expand(batch, -1, -1)
+    ref = torch.einsum("bmk,bnk->bmn", a_full, b_full)
+    return ref.to(_TORCH_DTYPE[out_dtype])
+
+
+def _tolerance(in_dtype: str, out_dtype: str) -> float:
+    """One out-dtype ULP: both accumulator and reference are exact FP32, so the
+    only rounding is the deterministic downcast."""
+    return 1.0 if in_dtype.startswith("fp8") else 0.5
+
+
+# Compile cache (session-scoped) — one compile per (config, in_dt, out_dt).
+
+
+@pytest.fixture(scope="session")
+def _compile_cache() -> dict:
+    """Maps (config_name, in_dt, out_dt) → CompiledFusedGemm | ("skip"|"fail", msg).
+    Cases visit in (config, dtype, shape) order, so each (config, dtype) block
+    of 9 shapes shares one compile."""
+    return {}
+
+
+def _cached_outcome(entry):
+    """Replay a cached skip/fail; return a cached compiled kernel."""
+    if isinstance(entry, tuple) and entry[0] in ("skip", "fail"):
+        kind, msg = entry
+        if kind == "skip":
+            pytest.skip(msg)
+        pytest.fail(msg, pytrace=False)
+    return entry
+
+
+def _plan_or_skip(cache, key, build_graph, cfg):
+    """JIT the anchor graph; the engine's clean "unsupported" rejections —
+    NotImplementedError from the compiler gates, or the registry's "no kernel
+    template" — SKIP, any other compile error FAILS."""
+    try:
+        compiled = _plan(build_graph(), config=cfg)
+    except Exception as e:
+        first = str(e).splitlines()[0] if str(e) else ""
+        if isinstance(e, NotImplementedError) or (isinstance(e, ValueError) and "no kernel template" in str(e)):
+            msg = first[:300]
+            cache[key] = ("skip", msg)
+            pytest.skip(msg)
+        msg = f"JIT compile failed: {type(e).__name__}: {first[:200]}"
+        cache[key] = ("fail", msg)
+        pytest.fail(msg, pytrace=False)
+    cache[key] = compiled
+    return compiled
+
+
+def _pick_anchor(
+    cfg,
+    in_dt: str,
+    out_dt: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+) -> tuple[int, int, int] | None:
+    """First menu shape compatible with (cfg, in_dt, out_dt), as the JIT anchor.
+    The kernel is M/N/K-symbolic so any compatible shape works.
+
+    Foot-gun: the C row-stride alignment is baked at JIT from the anchor's
+    contiguous output dim (N, or M for M-major output), so the menu must be
+    uniform in that dim's alignment class (enforced by `_compatible`) for
+    runtime shapes to be drop-in.
+    """
+    for shape in _WEIRD_SHAPES:
+        ok, _ = _compatible(cfg, *shape, in_dt, out_dt, a_major, b_major, out_major)
+        if ok:
+            return shape
+    return None
+
+
+def _get_compiled(
+    cache: dict,
+    cfg,
+    in_dt: str,
+    out_dt: str,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+):
+    """Return the cached compiled kernel, building it on first miss."""
+    key = (cfg.name, in_dt, out_dt, a_major, b_major, out_major)
+    if key in cache:
+        return _cached_outcome(cache[key])
+
+    anchor = _pick_anchor(cfg, in_dt, out_dt, a_major, b_major, out_major)
+    if anchor is None:
+        # No compatible anchor to build against (rare; e.g. K_BYTES vs elem_bytes mismatch).
+        msg = f"no menu shape is compatible with ({cfg.name}, {in_dt}->{out_dt})"
+        cache[key] = ("skip", msg)
+        pytest.skip(msg)
+
+    return _plan_or_skip(
+        cache,
+        key,
+        lambda: _build_graph(*anchor, in_dt, out_dt, a_major, b_major, out_major),
+        cfg,
+    )
+
+
+def _pick_batched_anchor(
+    cfg,
+    in_dt: str,
+    out_dt: str,
+    batch: int,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+) -> tuple[int, int, int] | None:
+    """Pick a compatible M/N/K anchor for a fixed batch size."""
+    for b, M, N, K in _BATCHED_SHAPES:
+        if b != batch:
+            continue
+        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major, out_major)
+        if ok:
+            return M, N, K
+    return None
+
+
+def _get_batched_compiled(
+    cache: dict,
+    cfg,
+    in_dt: str,
+    out_dt: str,
+    batch: int,
+    a_major: str = "k",
+    b_major: str = "k",
+    out_major: str = "n",
+):
+    """Return the cached rank-3 compiled kernel for this graph batch."""
+    key = (
+        "batched",
+        cfg.name,
+        in_dt,
+        out_dt,
+        batch,
+        a_major,
+        b_major,
+        out_major,
+    )
+    if key in cache:
+        return _cached_outcome(cache[key])
+
+    anchor = _pick_batched_anchor(cfg, in_dt, out_dt, batch, a_major, b_major, out_major)
+    if anchor is None:
+        msg = f"no batched menu shape is compatible with " f"({cfg.name}, {in_dt}->{out_dt}, batch={batch})"
+        cache[key] = ("skip", msg)
+        pytest.skip(msg)
+
+    return _plan_or_skip(
+        cache,
+        key,
+        lambda: _build_batched_graph(batch, *anchor, in_dt, out_dt, a_major, b_major, out_major),
+        cfg,
+    )
+
+
+def _pick_batch_broadcast_anchor(
+    cfg,
+    in_dt: str,
+    out_dt: str,
+    batch: int,
+    a_major: str = "k",
+    b_major: str = "k",
+) -> tuple[int, int, int] | None:
+    """Pick a compatible M/N/K anchor for a fixed broadcast output batch."""
+    for b, M, N, K in _BATCH_BROADCAST_SHAPES:
+        if b != batch:
+            continue
+        ok, _ = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
+        if ok:
+            return M, N, K
+    return None
+
+
+def _get_batch_broadcast_compiled(
+    cache: dict,
+    cfg,
+    in_dt: str,
+    out_dt: str,
+    batch: int,
+    broadcast_side: str,
+    a_major: str = "k",
+    b_major: str = "k",
+):
+    """Return the cached rank-3 compiled kernel for a batch-broadcast graph."""
+    key = (
+        "batch_broadcast",
+        broadcast_side,
+        cfg.name,
+        in_dt,
+        out_dt,
+        batch,
+        a_major,
+        b_major,
+    )
+    if key in cache:
+        return _cached_outcome(cache[key])
+
+    anchor = _pick_batch_broadcast_anchor(cfg, in_dt, out_dt, batch, a_major, b_major)
+    if anchor is None:
+        msg = f"no batch-broadcast menu shape is compatible with " f"({cfg.name}, {in_dt}->{out_dt}, batch={batch})"
+        cache[key] = ("skip", msg)
+        pytest.skip(msg)
+
+    return _plan_or_skip(
+        cache,
+        key,
+        lambda: _build_batch_broadcast_graph(batch, *anchor, in_dt, out_dt, broadcast_side, a_major, b_major),
+        cfg,
+    )
+
+
+@pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
+@pytest.mark.parametrize(
+    "in_dt,out_dt",
+    _CORE_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _CORE_DTYPE_PAIRS],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    _sweep_config_names(),
+    ids=[_config_id(n) for n in _sweep_config_names()],
+)
+def test_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    shape: tuple[int, int, int],
+) -> None:
+    """One (config, dtype-pair, shape); incompatible combos SKIP, else bit-tight."""
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, *shape, in_dt, out_dt)
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_compiled(_compile_cache, cfg, in_dt, out_dt)
+
+    M, N, K = shape
+    a, b, c = _mkdata(M, N, K, in_dt, out_dt)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _reference(a, b, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance(in_dt, out_dt)
+    bad = int((diff > tol).sum().item())
+    max_diff = float(diff.max().item())
+    max_ref = float(ref.abs().max().item())
+
+    # Rich diagnostic so a CI failure is self-explanatory without re-running.
+    assert bad == 0, (
+        f"\n  config:    {config_name}"
+        f"\n  dtype:     {in_dt} -> {out_dt}"
+        f"\n  shape:     {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()} ({100 * bad / diff.numel():.2f}%)"
+        f"\n  max|diff|: {max_diff:.4g}  (tol={tol})"
+        f"\n  max|ref|:  {max_ref:.4g}"
+        f"\n  hint:      sample c[0,0,:8]   = {c[0, 0, :8].to(torch.float32).tolist()}"
+        f"\n             sample ref[0,0,:8] = {ref[0, 0, :8].to(torch.float32).tolist()}"
+    )
+
+
+# Every N in _WEIRD_SHAPES is a multiple of 256, so the epilogue's last chunk of
+# a tile is always whole and the partial-chunk store predicate is never exercised.
+# These two straddle it — the valid column count inside the final N tile is not a
+# multiple of the chunk — while M keeps a tail. N still clears the row-stride rule
+# (_compatible: N * out_eb % 32 == 0), so this is chunk overhang, not N-OOB.
+_N_CHUNK_STRADDLE_SHAPES: tuple[tuple[int, int, int], ...] = (
+    (200, 144, 256),
+    (255, 208, 240),
+)
+
+_STRADDLE_CONFIGS: tuple[str, ...] = (
+    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "CONFIG_sm100_128x256x128_128x256x32_cluster1x1_1ctamma",
+    # cta_group=2 with a per-CTA n of 16: the only TMA-store coverage of the
+    # narrow-N pair, which no _QUICK_CONFIGS entry reaches.
+    "CONFIG_sm100_128x32x128_128x32x32_cluster2x1_2ctamma",
+)
+
+
+def _straddle_graph(kind: str, M: int, N: int, K: int) -> cudnn.pygraph:
+    g = cudnn.pygraph(
+        io_data_type=_BF16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    if kind == "plain":
+        Y = C
+    elif kind == "relu":
+        Y = g.relu(input=C, name="r")
+    elif kind == "scalar_aux":
+        s = g.tensor(name="s", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+        Y = g.mul(a=C, b=s, name="sc")
+    elif kind == "row_aux":
+        r = g.tensor(name="r", dim=[1, M, 1], stride=[M, 1, 1], data_type=cudnn.data_type.FLOAT)
+        Y = g.mul(a=C, b=r, name="rw")
+    elif kind == "gen_index_axis1":
+        Y = g.add(a=C, b=g.gen_index(input=C, axis=1, name="gi"), name="ad")
+    elif kind == "per_col_aux":
+        xc = g.tensor(name="xc", dim=[1, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.FLOAT)
+        Y = g.mul(a=C, b=xc, name="cw")
+    elif kind == "per_elem_aux":
+        xe = g.tensor(name="xe", dim=[1, M, N], stride=[M * N, N, 1], data_type=cudnn.data_type.FLOAT)
+        Y = g.mul(a=C, b=xe, name="ew")
+    elif kind == "matmul_tap":
+        C.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        Y = g.relu(input=C, name="r")
+    elif kind == "two_taps":
+        C.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        R = g.relu(input=C, name="r")
+        R.set_output(True).set_data_type(cudnn.data_type.HALF)
+        Y = g.gelu_approx_tanh(input=R, name="ge")
+    else:
+        raise AssertionError(kind)
+    Y.set_output(True)
+    return g
+
+
+# _TORCH_DTYPE covers the INPUT dtypes; a tap may also be fp32 / int32.
+_TAP_TORCH_DTYPE = {**_TORCH_DTYPE, "fp32": torch.float32, "int32": torch.int32, "fp8_e8m0": torch.float8_e8m0fnu}
+
+
+def _straddle_outs(plan, M: int, N: int) -> list[torch.Tensor]:
+    return [torch.full((1, M, N), float("nan"), dtype=_TAP_TORCH_DTYPE[o.dtype], device="cuda") for o in plan.chain.outputs]
+
+
+def _straddle_aux(plan, M: int, N: int) -> list[torch.Tensor]:
+    out = []
+    for t in plan.chain.aux_tensors:
+        if t.name == "s":
+            out.append(torch.full((1, 1, 1), 2.0, device="cuda"))
+        elif t.name == "r":
+            out.append(torch.arange(M, dtype=torch.float32, device="cuda").reshape(1, M, 1) % 3 + 1)
+        elif t.name == "xc":
+            out.append(torch.arange(N, dtype=torch.float32, device="cuda").reshape(1, 1, N) % 5 + 1)
+        elif t.name == "xe":
+            out.append(torch.arange(M * N, dtype=torch.float32, device="cuda").reshape(1, M, N) % 7 + 1)
+        else:
+            raise AssertionError(t.name)
+    return out
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ("plain", "relu", "scalar_aux", "row_aux", "gen_index_axis1", "per_col_aux", "per_elem_aux", "matmul_tap", "two_taps"),
+)
+@pytest.mark.parametrize(
+    "shape",
+    _N_CHUNK_STRADDLE_SHAPES,
+    ids=[_shape_id(s) for s in _N_CHUNK_STRADDLE_SHAPES],
+)
+@pytest.mark.parametrize("config_name", _STRADDLE_CONFIGS, ids=[_config_id(n) for n in _STRADDLE_CONFIGS])
+def test_partial_n_chunk_store_matches_stg(config_name: str, shape: tuple[int, int, int], kind: str) -> None:
+    """The two store paths are bit-identical when the last chunk of the N tile is
+    partial. Guards the gate-relaxation work: a store rule that only holds for a
+    whole chunk passes every other shape in the suite."""
+    cfg = _resolve(config_name)
+    M, N, K = shape
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16")
+    if not ok:
+        pytest.skip(reason)
+
+    tma = _plan(_straddle_graph(kind, M, N, K), config=cfg)
+    if not tma._compiled.use_tma_store:
+        pytest.skip(f"{kind} does not take the TMA-store path on {config_name}")
+
+    chunk = _epi_chunk_elems(tma.chain, cfg, True)
+    assert N % chunk != 0, f"shape {shape} no longer straddles the {chunk}-element chunk — the test is vacuous"
+
+    stg = _plan(_straddle_graph(kind, M, N, K), config=cfg, force_stg_epi=True)
+    assert not stg._compiled.use_tma_store
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    outs_tma = _straddle_outs(tma, M, N)
+    outs_stg = _straddle_outs(stg, M, N)
+    tma(_vp(tma, a, b, outs_tma, *_straddle_aux(tma, M, N)))
+    stg(_vp(stg, a, b, outs_stg, *_straddle_aux(stg, M, N)))
+    torch.cuda.synchronize()
+
+    assert len(outs_tma) == len(tma.chain.outputs)
+    unwritten = sum(int(torch.isnan(o.float()).sum()) for o in outs_tma)
+    assert unwritten == 0, f"TMA store left {unwritten} cells unwritten across {len(outs_tma)} slots"
+    bad = sum(int((x.float() != y.float()).sum()) for x, y in zip(outs_tma, outs_stg))
+    assert bad == 0, (
+        f"\n  config: {config_name}"
+        f"\n  shape:  {M}x{N}x{K}  (chunk={chunk}, tail={N % chunk})"
+        f"\n  kind:   {kind}"
+        f"\n  slots:  {[o.dtype for o in tma.chain.outputs]}"
+        f"\n  TMA != STG at {bad} cells"
+    )
+
+
+def test_dense_block_scale_quant_epilogue() -> None:
+    """Plain dense GEMM can use terminal block_scale_quantize epilogue."""
+    config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+    cfg = _resolve(config_name)
+    M = N = K = 128
+    block_size = 32
+    g = _build_block_quant_graph(M, N, K, block_size)
+    compiled = _plan(
+        g,
+        config=cfg,
+    )
+    assert not compiled.block_scale
+    assert compiled.chain.quants
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q_scale = torch.empty(1, M, N // block_size, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    q_ref, scale_ref = _block_quant_reference(
+        ref_mm,
+        block_size,
+        torch.float8_e4m3fn,
+        torch.float8_e8m0fnu,
+    )
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("mode", ["mmajor", "swap_ab"])
+@pytest.mark.parametrize("reordered", [False, True])
+@pytest.mark.parametrize("stg", [False, True])
+def test_quantized_output_uses_normal_mmajor_store(mode, reordered, stg) -> None:
+    """Quantized data and scales must survive both M-major store paths and swap."""
+    from dataclasses import replace
+    from cudnn.gemm.frost.compiler import force_stg_epi, jit_from_cudnn_graph
+
+    M, N, K, bs = 128, 256, 128, 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B)
+    Q, SF = g.block_scale_quantize(input=C, block_size=bs, axis=-1)
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    Q.set_dim([1, M, N]).set_stride([M * N, 1, M] if mode == "mmajor" else [M * N, N, 1])
+    SF.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    SF.set_dim([1, M, N // bs]).set_stride([M * N // bs, N // bs, 1])
+    if reordered:
+        SF.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+
+    cfg = replace(_resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=mode == "swap_ab")
+    with force_stg_epi(stg):
+        compiled = jit_from_cudnn_graph(g, config=cfg)
+    assert compiled.chain.out_major == "m"
+    assert bool(compiled.tma_slots) == (not stg)
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty((1, N, M) if mode == "mmajor" else (1, M, N), dtype=torch.float8_e4m3fn, device="cuda")
+    if mode == "mmajor":
+        q = q.transpose(1, 2)
+    sf = torch.empty(1, M, N // bs, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled({A: a, B: b, Q: q, SF: sf})
+    torch.cuda.synchronize()
+    assert not compiled.deferrals
+
+    mm = torch.einsum("bmk,bnk->bmn", a.float(), b.float())
+    q_ref, sf_ref = _block_quant_reference(mm, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    sf_got = sf.float().flatten()[_f8_row_scale_addr(M, N, bs)].unsqueeze(0) if reordered else sf.float()
+    torch.testing.assert_close(sf_got, sf_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def _col_quant_reference(
+    x: torch.Tensor,
+    block_size: int,
+    out_dtype: torch.dtype,
+    scale_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    B, M, N = x.shape
+    blocks = x.view(B, M // block_size, block_size, N)
+    output_max = 448.0 if out_dtype is torch.float8_e4m3fn else 57344.0
+    scale_f = blocks.abs().amax(dim=2) / output_max
+    if scale_dtype == "e5m3":
+        scale = _e5m3_quant_ref(scale_f)
+        back = _e5m3_to_float(scale.to(torch.int32))
+        inv = torch.where(back > 0, back.reciprocal(), 0.0)
+        q = (blocks * inv.unsqueeze(2)).clamp(-output_max, output_max)
+        return q.to(out_dtype).view(B, M, N), scale
+    if scale_dtype is torch.float8_e8m0fnu:
+        safe = torch.where(scale_f > 0, scale_f, 1.0)
+        scale_f = torch.where(
+            scale_f > 0,
+            torch.pow(2.0, torch.ceil(torch.log2(safe))),
+            0.0,
+        )
+    scale = scale_f.to(scale_dtype)
+    inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
+    q = (blocks * inv.unsqueeze(2)).clamp(-output_max, output_max)
+    return q.to(out_dtype).view(B, M, N), scale
+
+
+def _f8_col_scale_addr(M: int, N: int, block_size: int) -> torch.Tensor:
+    """(N, M//bs) element offsets into the transposed F8_128x4 col-scale buffer."""
+    mb_cnt = M // block_size
+    mcb = (mb_cnt + 3) // 4
+    n = torch.arange(N, device="cuda").unsqueeze(1)
+    mb = torch.arange(mb_cnt, device="cuda").unsqueeze(0)
+    return ((n // 128) * mcb + (mb // 4)) * 512 + (n % 32) * 16 + ((n % 128) // 32) * 4 + (mb % 4)
+
+
+def _f8_row_scale_addr(M: int, N: int, block_size: int) -> torch.Tensor:
+    """(M, N//bs) element offsets into the F8_128x4 row-scale buffer."""
+    nb_cnt = N // block_size
+    ncb = (nb_cnt + 3) // 4
+    m = torch.arange(M, device="cuda").unsqueeze(1)
+    nb = torch.arange(nb_cnt, device="cuda").unsqueeze(0)
+    return ((m // 128) * ncb + (nb // 4)) * 512 + (m % 32) * 16 + ((m % 128) // 32) * 4 + (nb % 4)
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+    ],
+    ids=["1ctamma", "2ctamma"],
+)
+def test_dense_col_block_scale_quant(config_name) -> None:
+    """M-axis (col) quant: warp-redux amax, compact (B, M/32, N) scale."""
+    cfg = _resolve(config_name)
+    M, N, K = 256, 128, 128
+    block_size = 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q, QS = g.block_scale_quantize(input=S, block_size=block_size, axis=1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    assert compiled.chain.quants[0].axis == 1
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q_scale = torch.empty(1, M // block_size, N, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    q_ref, scale_ref = _col_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+@requires_sm107
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_dense_col_quant_e5m3_scale(block_size) -> None:
+    """COL block quantize with an E5M3 scale. This path keeps the scale in a
+    per-lane register (`_scale_mine_*`) before storing, so it exercises the
+    zero-init + assignment + store of the byte carrier that row quant does not."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q, QS = g.block_scale_quantize(input=S, block_size=block_size, axis=1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E5M3)
+
+    compiled = _plan(g, config=cfg)
+    assert compiled.chain.quants[0].axis == 1 and compiled.chain.quants[0].scale_dtype == "fp8_e5m3"
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q_scale = torch.empty(1, M // block_size, N, dtype=torch.int8, device="cuda")
+    compiled(_vp(compiled, a, b, [q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    q_ref, scale_ref = _col_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, "e5m3")
+    torch.testing.assert_close(q_scale.view(torch.uint8).float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_row_col_dual_quant_f8_reorder() -> None:
+    """The cutedsl dual-output pattern: one producer -> row quant + col quant,
+    both with F8_128x4 scale reordering."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    bs = 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Qr, QSr = g.block_scale_quantize(input=S, block_size=bs, axis=-1, name="qrow")
+    Qr.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QSr.set_dim([1, M, ((N // bs) + 3) // 4 * 4]).set_stride([M * (((N // bs) + 3) // 4 * 4), ((N // bs) + 3) // 4 * 4, 1])
+    QSr.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    QSr.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    Qc, QSc = g.block_scale_quantize(input=S, block_size=bs, axis=1, name="qcol")
+    Qc.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QSc.set_dim([1, ((N + 127) // 128) * 128, ((M // bs) + 3) // 4 * 4]).set_stride(
+        [((N + 127) // 128) * 128 * (((M // bs) + 3) // 4 * 4), ((M // bs) + 3) // 4 * 4, 1]
+    )
+    QSc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    QSc.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+
+    compiled = _plan(g, config=cfg)
+    chain = compiled.chain
+    assert len(chain.quants) == 2 and chain.quants[0].axis in (-1, 2) and chain.quants[1].axis == 1
+    from cudnn.gemm.frost.epilogue_codegen import generate
+
+    dual_epi = generate(chain, vec_bytes_epi=64, output_elem_bytes=1, tma_slots=frozenset({0, 1})).epilogue
+    assert dual_epi.index("_q1_lane") < dual_epi.index("_q0_frg"), "retire the register-heavy col quant before row quant"
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q_row = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qs_row = torch.zeros(1, M, ((N // bs) + 3) // 4 * 4, dtype=torch.float8_e8m0fnu, device="cuda")
+    q_col = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qs_col = torch.zeros(1, ((N + 127) // 128) * 128, ((M // bs) + 3) // 4 * 4, dtype=torch.float8_e8m0fnu, device="cuda")
+    # recorder slot order: row-quant data, col-quant data, then scales in
+    # quants order (row first).
+    compiled(_vp(compiled, a, b, [q_row, q_col, qs_row, qs_col]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    qr_ref, sr_ref = _block_quant_reference(ref_sw, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    qc_ref, sc_ref = _col_quant_reference(ref_sw, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(q_row.float(), qr_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q_col.float(), qc_ref.float(), atol=0, rtol=0)
+    got_sr = qs_row.view(1, -1)[:, _f8_row_scale_addr(M, N, bs)]
+    torch.testing.assert_close(got_sr.float(), sr_ref.float(), atol=0, rtol=0)
+    got_sc = qs_col.view(1, -1)[:, _f8_col_scale_addr(M, N, bs)]
+    torch.testing.assert_close(got_sc.float(), sc_ref.permute(0, 2, 1).float(), atol=0, rtol=0)
+
+
+_E2M1_VALS = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+def _unpack_e2m1(u8: torch.Tensor, N: int) -> torch.Tensor:
+    """(B, M, N/2) packed uint8 -> (B, M, N) float values, low nibble first."""
+    vals = torch.tensor(_E2M1_VALS, device=u8.device)
+    lo = vals[(u8 & 0xF).long()]
+    hi = vals[(u8 >> 4).long()]
+    return torch.stack([lo, hi], dim=-1).view(u8.shape[0], u8.shape[1], N)
+
+
+def _to_e2m1_rn(x: torch.Tensor) -> torch.Tensor:
+    cands = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=x.device)
+    bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    ax = x.abs().clamp(max=6.0)
+    idx = torch.bucketize(ax, bounds, right=True)
+    tie = (idx > 0) & (ax == bounds[(idx - 1).clamp(min=0)])
+    idx = torch.where(tie & (idx % 2 == 1), idx - 1, idx)
+    v = cands[idx]
+    return torch.where(x < 0, -v, v)
+
+
+def _fp4_quant_ref(x, bs, scale_dtype, axis):
+    B, M, N = x.shape
+    if axis == 1:
+        blocks = x.view(B, M // bs, bs, N)
+        s = blocks.abs().amax(dim=2) / 6.0
+    else:
+        blocks = x.view(B, M, N // bs, bs)
+        s = blocks.abs().amax(dim=-1) / 6.0
+    if scale_dtype is torch.float8_e8m0fnu:
+        safe = torch.where(s > 0, s, 1.0)
+        s = torch.where(s > 0, torch.pow(2.0, torch.ceil(torch.log2(safe))), 0.0)
+    scale = s.to(scale_dtype)
+    inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
+    inv = inv.unsqueeze(2) if axis == 1 else inv.unsqueeze(-1)
+    q = _to_e2m1_rn((blocks * inv).clamp(-6.0, 6.0))
+    return q.view(B, M, N), scale
+
+
+def _fp4_dual_graph(M, N, K, fp4_axis, fp4_bs, fp4_scale_dt):
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q4, QS4 = g.block_scale_quantize(input=S, block_size=fp4_bs, axis=fp4_axis, name="q4")
+    Q4.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
+    if fp4_axis == 1:
+        QS4.set_dim([1, M // fp4_bs, N]).set_stride([M // fp4_bs * N, N, 1])
+    else:
+        QS4.set_dim([1, M, N // fp4_bs]).set_stride([M * (N // fp4_bs), N // fp4_bs, 1])
+    QS4.set_output(True).set_data_type(fp4_scale_dt)
+    Q8, QS8 = g.block_scale_quantize(input=S, block_size=32, axis=-1, name="q8")
+    Q8.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS8.set_dim([1, M, N // 32]).set_stride([M * (N // 32), N // 32, 1])
+    QS8.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    return g
+
+
+@pytest.mark.parametrize("fp4_axis", [-1, 1], ids=["row", "col"])
+def test_dense_mxfp4_quant_output(fp4_axis) -> None:
+    """mxfp4 (fp4 data + e8m0 SF, block32) quant tap beside an fp8 row quant."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    g = _fp4_dual_graph(M, N, K, fp4_axis, 32, cudnn.data_type.FP8_E8M0)
+    compiled = _plan(g, config=cfg)
+    chain = compiled.chain
+    assert chain.output_specs[0].dtype == "fp4_e2m1" and chain.output_specs[1].dtype == "fp8_e4m3"
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q8 = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qs8 = torch.empty(1, M, N // 32, dtype=torch.float8_e8m0fnu, device="cuda")
+    q4 = torch.zeros(1, M, N // 2, dtype=torch.uint8, device="cuda")
+    qs4_shape = (1, M // 32, N) if fp4_axis == 1 else (1, M, N // 32)
+    qs4 = torch.empty(*qs4_shape, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [q4, q8, qs4, qs8]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    q4_ref, qs4_ref = _fp4_quant_ref(ref_sw, 32, torch.float8_e8m0fnu, fp4_axis)
+    torch.testing.assert_close(qs4.float(), qs4_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(_unpack_e2m1(q4, N), q4_ref, atol=0, rtol=0)
+    q8_ref, qs8_ref = _block_quant_reference(ref_sw, 32, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(qs8.float(), qs8_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q8.float(), q8_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_nvfp4_quant_output() -> None:
+    """nvfp4 (fp4 data + e4m3 SF, block16) quant tap; slot0 = bf16 pre-quant tap
+    (vsize 16). Dequantized-value tolerance (rcp_approx of a non-pow2 e4m3
+    scale is inexact vs the torch reference)."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    bs = 16
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q4, QS4 = g.block_scale_quantize(input=S, block_size=bs, axis=-1, name="q4")
+    Q4.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
+    QS4.set_dim([1, M, N // bs]).set_stride([M * (N // bs), N // bs, 1])
+    QS4.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    S.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+
+    compiled = _plan(g, config=cfg)
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    q4 = torch.zeros(1, M, N // 2, dtype=torch.uint8, device="cuda")
+    qs4 = torch.empty(1, M, N // bs, dtype=torch.float8_e4m3fn, device="cuda")
+    compiled(_vp(compiled, a, b, [tap, q4, qs4]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = (ref_mm * torch.sigmoid(ref_mm)).to(torch.bfloat16).float()
+    _, qs4_ref = _fp4_quant_ref(ref_sw, bs, torch.float8_e4m3fn, -1)
+    torch.testing.assert_close(qs4.float(), qs4_ref.float(), atol=0, rtol=0.07)
+    deq = _unpack_e2m1(q4, N) * qs4.float().repeat_interleave(bs, dim=2)
+    err = (deq - ref_sw).abs()
+    tol = 0.34 * ref_sw.abs() + 0.05 * ref_sw.abs().max()
+    assert (err <= tol).float().mean().item() > 0.999
+
+
+@pytest.mark.parametrize("fp4_axis,bs,scale_dt", [(-1, 16, "e4m3"), (-1, 32, "e8m0"), (1, 32, "e8m0")], ids=["nvfp4-row", "mxfp4-row", "mxfp4-col"])
+def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
+    """fp4 quant data as the ONLY output (slot 0): Phase C codegen-emitted store."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q4, QS4 = g.block_scale_quantize(input=S, block_size=bs, axis=fp4_axis, name="q4")
+    Q4.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
+    scale_cudnn = cudnn.data_type.FP8_E4M3 if scale_dt == "e4m3" else cudnn.data_type.FP8_E8M0
+    scale_torch = torch.float8_e4m3fn if scale_dt == "e4m3" else torch.float8_e8m0fnu
+    if fp4_axis == 1:
+        QS4.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
+    else:
+        QS4.set_dim([1, M, N // bs]).set_stride([M * (N // bs), N // bs, 1])
+    QS4.set_output(True).set_data_type(scale_cudnn)
+
+    compiled = _plan(g, config=cfg)
+    assert compiled.chain.output_specs[0].dtype == "fp4_e2m1"
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q4 = torch.zeros(1, M, N // 2, dtype=torch.uint8, device="cuda")
+    qs_shape = (1, M // bs, N) if fp4_axis == 1 else (1, M, N // bs)
+    qs4 = torch.empty(*qs_shape, dtype=scale_torch, device="cuda")
+    compiled(_vp(compiled, a, b, [q4, qs4]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    q4_ref, qs4_ref = _fp4_quant_ref(ref_sw, bs, scale_torch, fp4_axis)
+    if scale_dt == "e8m0":
+        torch.testing.assert_close(qs4.float(), qs4_ref.float(), atol=0, rtol=0)
+        torch.testing.assert_close(_unpack_e2m1(q4, N), q4_ref, atol=0, rtol=0)
+    else:
+        torch.testing.assert_close(qs4.float(), qs4_ref.float(), atol=0, rtol=0.07)
+        deq = _unpack_e2m1(q4, N) * (qs4.float().repeat_interleave(bs, dim=1) if fp4_axis == 1 else qs4.float().repeat_interleave(bs, dim=2))
+        err = (deq - ref_sw).abs()
+        tol = 0.34 * ref_sw.abs() + 0.05 * ref_sw.abs().max()
+        assert (err <= tol).float().mean().item() > 0.999
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_64x128x128_64x128x32_cluster1x1_1ctamma",
+        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+    ],
+    ids=["m128-1cta", "m64-1cta", "m128-2cta"],
+)
+def test_dense_col_block16_quant(config_name) -> None:
+    """block16 col quant: half-warp redux; the cta_tile_m=64 1-CTA packed
+    layout (16 active rows per warp = exactly one block) is supported."""
+    cfg = _resolve(config_name)
+    M, N, K, bs = 256, 128, 128, 16
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q, QS = g.block_scale_quantize(input=S, block_size=bs, axis=1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.zeros(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qs = torch.zeros(1, M // bs, N, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [q, qs]))
+    torch.cuda.synchronize()
+
+    mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    sw = mm * torch.sigmoid(mm)
+    q_ref, s_ref = _col_quant_reference(sw, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(qs.float(), s_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_block16_fp8_quant() -> None:
+    """block_size=16 row quant with fp8 data (vsize pinned to the block)."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K, bs = 256, 128, 128, 16
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q, QS = g.block_scale_quantize(input=S, block_size=bs, axis=-1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M, N // bs]).set_stride([M * (N // bs), N // bs, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qs = torch.empty(1, M, N // bs, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [q, qs]))
+    torch.cuda.synchronize()
+
+    mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    sw = mm * torch.sigmoid(mm)
+    q_ref, s_ref = _block_quant_reference(sw, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(qs.float(), s_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_mixed_block_quants() -> None:
+    """Two quants with DIFFERENT block sizes in one graph: nvfp4 row block16 +
+    fp8 row block32 (vsize = max block; the small block quantizes per
+    sub-chunk), plus a col16 alongside a row32 variant."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K = 256, 128, 128
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q4, QS4 = g.block_scale_quantize(input=S, block_size=16, axis=-1, name="q4")
+    Q4.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
+    QS4.set_dim([1, M, N // 16]).set_stride([M * (N // 16), N // 16, 1])
+    QS4.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    Q8, QS8 = g.block_scale_quantize(input=S, block_size=32, axis=-1, name="q8")
+    Q8.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS8.set_dim([1, M, N // 32]).set_stride([M * (N // 32), N // 32, 1])
+    QS8.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    Qc, QSc = g.block_scale_quantize(input=S, block_size=16, axis=1, name="qc")
+    Qc.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QSc.set_dim([1, M // 16, N]).set_stride([M // 16 * N, N, 1])
+    QSc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    assert sorted(q.block_size for q in compiled.chain.quants) == [16, 16, 32]
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q4 = torch.zeros(1, M, N // 2, dtype=torch.uint8, device="cuda")
+    qs4 = torch.zeros(1, M, N // 16, dtype=torch.float8_e4m3fn, device="cuda")
+    q8 = torch.zeros(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qs8 = torch.zeros(1, M, N // 32, dtype=torch.float8_e8m0fnu, device="cuda")
+    qc = torch.zeros(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qsc = torch.zeros(1, M // 16, N, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [q4, q8, qc, qs4, qs8, qsc]))
+    torch.cuda.synchronize()
+
+    mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    sw = mm * torch.sigmoid(mm)
+    # fp8 row block32: bit-exact (e8m0 scale)
+    q8_ref, s8_ref = _block_quant_reference(sw, 32, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(qs8.float(), s8_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q8.float(), q8_ref.float(), atol=0, rtol=0)
+    # col16: bit-exact (e8m0 scale)
+    qc_ref, sc_ref = _col_quant_reference(sw, 16, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(qsc.float(), sc_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(qc.float(), qc_ref.float(), atol=0, rtol=0)
+    # nvfp4 row block16: e4m3 scale 1-ulp + dequant tolerance
+    _, s4_ref = _fp4_quant_ref(sw, 16, torch.float8_e4m3fn, -1)
+    torch.testing.assert_close(qs4.float(), s4_ref.float(), atol=0, rtol=0.07)
+    deq = _unpack_e2m1(q4, N) * qs4.float().repeat_interleave(16, dim=2)
+    err = (deq - sw).abs()
+    tol = 0.34 * sw.abs() + 0.05 * sw.abs().max()
+    assert (err <= tol).float().mean().item() > 0.999
+
+
+def test_dense_col_quant_rejections() -> None:
+    def _col_graph(M, N, K, block_size):
+        g = cudnn.pygraph(
+            io_data_type=cudnn.data_type.BFLOAT16,
+            intermediate_data_type=cudnn.data_type.FLOAT,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+        B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+        C = g.matmul(A=A, B=B, name="mm")
+        S = g.swish(input=C, name="sw")
+        Q, QS = g.block_scale_quantize(input=S, block_size=block_size, axis=1, name="q")
+        Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+        QS.set_dim([1, M // block_size, N]).set_stride([M // block_size * N, N, 1])
+        QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+        return g
+
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    _skip_unless_active(cfg)  # the rules below sit behind the family's arch gate
+    with pytest.raises(ValueError, match="divisible by block_size"):
+        _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg)
+    with pytest.raises(NotImplementedError, match="block_size 32"):
+        _plan(_col_graph(256, 128, 128, 8), config=cfg)
+
+
+def test_dense_block_scale_quant_with_dense_tap() -> None:
+    """Quant data rides slot 0 while the pre-quant producer is also tapped."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M = N = K = 128
+    block_size = 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    S.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    Q, QS = g.block_scale_quantize(input=S, block_size=block_size, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    specs = compiled.chain.output_specs
+    assert len(specs) == 2 and specs[0].quant_idx is None and specs[1].quant_idx == 0
+    assert [o.source for o in compiled.chain.outputs] == ["op_0", "quant_0", "quant_scale_0"]
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    q_scale = torch.empty(1, M, N // block_size, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [tap, q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    # S's declared bf16 dtype rounds the swish output before every consumer —
+    # both the tap store and the quant read the rounded value.
+    ref_sw = ref_sw.to(torch.bfloat16).float()
+    q_ref, scale_ref = _block_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(tap.float(), ref_sw, atol=0, rtol=0)
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_block_scale_quant_with_fp32_dense_tap() -> None:
+    """The chunk stays pinned to the quant block even when the widest dense
+    output is 4 bytes: 32 elements x 4 B = 128 B, split into four 32 B stores."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M = N = K = 128
+    block_size = 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    Q, QS = g.block_scale_quantize(input=C, block_size=block_size, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    assert _epi_vec_bytes(compiled.chain, cfg) == block_size * 4
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    tap = torch.empty(1, M, N, dtype=torch.float32, device="cuda")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    q_scale = torch.empty(1, M, N // block_size, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [tap, q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    q_ref, scale_ref = _block_quant_reference(ref, block_size, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(tap, ref, atol=0, rtol=0)
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_col_block_scale_quant_with_dense_tap() -> None:
+    """Col quant behind a 2-byte dense tap. The chunk must stay as wide as the
+    32-lane block group: a narrower one has the upper lanes store a scale they
+    never computed, to columns past the chunk (and past the scale tensor on the
+    last chunk of a row block)."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M, N, K, bs = 256, 128, 128, 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    S.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    Q, QS = g.block_scale_quantize(input=S, block_size=bs, axis=1, name="q")
+    Q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS.set_dim([1, M // bs, N]).set_stride([M // bs * N, N, 1])
+    QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    assert _epi_vec_bytes(compiled.chain, cfg) == bs * 2
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    tap = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    # One guard row past the scale tensor catches an over-wide scale store.
+    n_scale = (M // bs) * N
+    scale_buf = torch.full((n_scale + N,), 0x7F, dtype=torch.uint8, device="cuda")
+    q_scale = scale_buf.view(torch.float8_e8m0fnu)[:n_scale].view(1, M // bs, N)
+    compiled(_vp(compiled, a, b, [tap, q, q_scale]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = (ref_mm * torch.sigmoid(ref_mm)).to(torch.bfloat16).float()
+    q_ref, scale_ref = _col_quant_reference(ref_sw, bs, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    torch.testing.assert_close(tap.float(), ref_sw, atol=0, rtol=0)
+    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+    assert (scale_buf[n_scale:] == 0x7F).all()
+
+
+def test_dense_dual_block_scale_quant() -> None:
+    """Two quant nodes fan out from one producer (e4m3 + e5m2 data)."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M = N = K = 128
+    block_size = 32
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    S = g.swish(input=C, name="sw")
+    Q1, QS1 = g.block_scale_quantize(input=S, block_size=block_size, name="q1")
+    Q1.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    QS1.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+    Q2, QS2 = g.block_scale_quantize(input=S, block_size=block_size, name="q2")
+    Q2.set_output(True).set_data_type(cudnn.data_type.FP8_E5M2)
+    QS2.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    compiled = _plan(g, config=cfg)
+    chain = compiled.chain
+    assert len(chain.quants) == 2
+    assert [o.source for o in chain.outputs] == ["quant_0", "quant_1", "quant_scale_0", "quant_scale_1"]
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q1 = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    qs1 = torch.empty(1, M, N // block_size, dtype=torch.float8_e8m0fnu, device="cuda")
+    q2 = torch.empty(1, M, N, dtype=torch.float8_e5m2, device="cuda")
+    qs2 = torch.empty(1, M, N // block_size, dtype=torch.float8_e8m0fnu, device="cuda")
+    compiled(_vp(compiled, a, b, [q1, q2, qs1, qs2]))
+    torch.cuda.synchronize()
+
+    ref_mm = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    ref_sw = ref_mm * torch.sigmoid(ref_mm)
+    q1_ref, qs1_ref = _block_quant_reference(ref_sw, block_size, torch.float8_e4m3fn, torch.float8_e8m0fnu)
+    q2_ref, qs2_ref = _block_quant_reference(ref_sw, block_size, torch.float8_e5m2, torch.float8_e8m0fnu)
+    torch.testing.assert_close(qs1.float(), qs1_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q1.float(), q1_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(qs2.float(), qs2_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q2.float(), q2_ref.float(), atol=0, rtol=0)
+
+
+def test_dense_amax_only_no_dense_output() -> None:
+    """Reduction-only graph: pointwise chain + AMAX, no dense output at all."""
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    M = N = K = 128
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    R = g.relu(input=C, name="r")
+    amax = g.reduction(input=R, mode=cudnn.reduction_mode.AMAX, name="amax")
+    amax.set_dim([1, 1, 1]).set_stride([1, 1, 1])
+    amax.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+
+    compiled = _plan(g, config=cfg)
+    assert not compiled.chain.output_specs
+    assert [o.source for o in compiled.chain.outputs] == ["reduction_0"]
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    out_am = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
+    compiled(_vp(compiled, a, b, [out_am]))
+    torch.cuda.synchronize()
+
+    ref = torch.relu(torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32)))
+    torch.testing.assert_close(out_am.flatten()[0], ref.abs().amax(), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
+@pytest.mark.parametrize(
+    "a_major,b_major",
+    _NONCANONICAL_LAYOUTS,
+    ids=[_layout_id(p) for p in _NONCANONICAL_LAYOUTS],
+)
+@pytest.mark.parametrize(
+    "in_dt,out_dt",
+    _CORE_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _CORE_DTYPE_PAIRS],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    _sweep_config_names(),
+    ids=[_config_id(n) for n in _sweep_config_names()],
+)
+def test_input_layout_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    a_major: str,
+    b_major: str,
+    shape: tuple[int, int, int],
+) -> None:
+    """A M-major / B N-major inputs over the full (config, dtype, shape) matrix."""
+    M, N, K = shape
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        a_major,
+        b_major,
+    )
+    a, b, c = _mkdata(M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _reference(a, b, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance(in_dt, out_dt)
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  config:    {config_name}"
+        f"\n  dtype:     {in_dt} -> {out_dt}"
+        f"\n  layout:    A{a_major}/B{b_major}"
+        f"\n  shape:     {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
+
+
+@pytest.mark.parametrize(
+    "a_major,b_major",
+    _NONPACKED_LAYOUTS,
+    ids=[_layout_id(p) for p in _NONPACKED_LAYOUTS],
+)
+@pytest.mark.parametrize(
+    "in_dt,out_dt",
+    _NONPACKED_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _NONPACKED_DTYPE_PAIRS],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    _NONPACKED_CONFIGS,
+    ids=[_config_id(n) for n in _NONPACKED_CONFIGS],
+)
+def test_nonpacked_batched_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    a_major: str,
+    b_major: str,
+) -> None:
+    """Padded A/B/C views exercise dynamic strides in TMA descriptors and stores."""
+    batch, M, N, K = 2, 256, 256, 256
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_batched_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        a_major,
+        b_major,
+    )
+    a, b, c = _mkbatched_nonpacked_data(batch, M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
+    assert not a.is_contiguous() and not b.is_contiguous() and not c.is_contiguous()
+
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _reference(a, b, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance(in_dt, out_dt)
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  config:    {config_name}"
+        f"\n  dtype:     {in_dt} -> {out_dt}"
+        f"\n  layout:    A{a_major}/B{b_major}"
+        f"\n  strides:   A{tuple(a.stride())} B{tuple(b.stride())} C{tuple(c.stride())}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    _NONPACKED_CONFIGS[:2],
+    ids=[_config_id(n) for n in _NONPACKED_CONFIGS[:2]],
+)
+def test_zero_stride_broadcast_input_matmul(
+    _compile_cache,
+    config_name: str,
+) -> None:
+    batch, M, N, K = 2, 256, 256, 256
+    in_dt = out_dt = "bf16"
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, "k", "k")
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_batched_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        "k",
+        "k",
+    )
+    a, b, c = _mkbatched_zero_stride_input_data(batch, M, N, K, in_dt, out_dt)
+    assert a.stride() == (0, 0, 1)
+    assert b.stride() == (0, 0, 1)
+    assert not c.is_contiguous()
+
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _reference(a, b, out_dt)
+    torch.testing.assert_close(c, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    _BATCHED_SHAPES,
+    ids=[_batched_shape_id(s) for s in _BATCHED_SHAPES],
+)
+@pytest.mark.parametrize(
+    "in_dt,out_dt",
+    _CORE_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _CORE_DTYPE_PAIRS],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    _BATCHED_CONFIGS,
+    ids=[_config_id(n) for n in _BATCHED_CONFIGS],
+)
+def test_batched_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    shape: tuple[int, int, int, int],
+) -> None:
+    """Rank-3 matmul keeps batch as the native L mode and maps it to grid.z."""
+    batch, M, N, K = shape
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt)
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_batched_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+    )
+
+    a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _reference(a, b, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance(in_dt, out_dt)
+    bad = int((diff > tol).sum().item())
+
+    assert bad == 0, (
+        f"\n  config:    {config_name}"
+        f"\n  dtype:     {in_dt} -> {out_dt}"
+        f"\n  shape:     B{batch} {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()} ({100 * bad / diff.numel():.2f}%)"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+        f"\n  max|ref|:  {float(ref.abs().max().item()):.4g}"
+        f"\n  hint:      sample c[0,0,:8]   = {c[0, 0, :8].to(torch.float32).tolist()}"
+        f"\n             sample ref[0,0,:8] = {ref[0, 0, :8].to(torch.float32).tolist()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "a_major,b_major",
+    _INPUT_LAYOUTS,
+    ids=[_layout_id(p) for p in _INPUT_LAYOUTS],
+)
+def test_input_layout_batched_matmul(
+    _compile_cache,
+    a_major: str,
+    b_major: str,
+) -> None:
+    """Rank-3 layout coverage keeps batch native while varying A/B major mode."""
+    config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+    cfg = _resolve(config_name)
+    batch, M, N, K = 2, 256, 256, 256
+    in_dt = out_dt = "bf16"
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_batched_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        a_major,
+        b_major,
+    )
+    a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, a_major=a_major, b_major=b_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _reference(a, b, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    assert int((diff > _tolerance(in_dt, out_dt)).sum().item()) == 0
+
+
+@pytest.mark.parametrize(
+    "broadcast_side,shape",
+    _BATCH_BROADCAST_CASES,
+    ids=[_batch_broadcast_id(p) for p in _BATCH_BROADCAST_CASES],
+)
+@pytest.mark.parametrize(
+    "in_dt,out_dt",
+    _CORE_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _CORE_DTYPE_PAIRS],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    _BATCHED_CONFIGS,
+    ids=[_config_id(n) for n in _BATCHED_CONFIGS],
+)
+def test_batch_broadcast_matmul(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    broadcast_side: str,
+    shape: tuple[int, int, int, int],
+) -> None:
+    """Rank-3 matmul with one input broadcast across the output batch."""
+    batch, M, N, K = shape
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt)
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_batch_broadcast_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        broadcast_side,
+    )
+
+    a, b, c = _mkbatch_broadcast_data(batch, M, N, K, in_dt, out_dt, broadcast_side)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _batch_broadcast_reference(a, b, batch, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance(in_dt, out_dt)
+    bad = int((diff > tol).sum().item())
+
+    assert bad == 0, (
+        f"\n  config:    {config_name}"
+        f"\n  dtype:     {in_dt} -> {out_dt}"
+        f"\n  broadcast: {broadcast_side}"
+        f"\n  shape:     B{batch} {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()} ({100 * bad / diff.numel():.2f}%)"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+        f"\n  max|ref|:  {float(ref.abs().max().item()):.4g}"
+        f"\n  hint:      sample c[0,0,:8]   = {c[0, 0, :8].to(torch.float32).tolist()}"
+        f"\n             sample ref[0,0,:8] = {ref[0, 0, :8].to(torch.float32).tolist()}"
+    )
+
+
+@pytest.mark.parametrize(
+    "a_major,b_major",
+    _INPUT_LAYOUTS,
+    ids=[_layout_id(p) for p in _INPUT_LAYOUTS],
+)
+@pytest.mark.parametrize("broadcast_side", ("A", "B"), ids=("bcastA", "bcastB"))
+def test_input_layout_batch_broadcast_matmul(
+    _compile_cache,
+    broadcast_side: str,
+    a_major: str,
+    b_major: str,
+) -> None:
+    """Input-layout coverage when one operand is broadcast across batch."""
+    config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+    cfg = _resolve(config_name)
+    batch, M, N, K = 3, 256, 256, 256
+    in_dt = out_dt = "bf16"
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, a_major, b_major)
+    if not ok:
+        pytest.skip(reason)
+
+    compiled = _get_batch_broadcast_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        broadcast_side,
+        a_major,
+        b_major,
+    )
+    a, b, c = _mkbatch_broadcast_data(
+        batch,
+        M,
+        N,
+        K,
+        in_dt,
+        out_dt,
+        broadcast_side,
+        a_major=a_major,
+        b_major=b_major,
+    )
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = _batch_broadcast_reference(a, b, batch, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    assert int((diff > _tolerance(in_dt, out_dt)).sum().item()) == 0
+
+
+# Mixed FP8: tcgen05 F8F6F4 takes A/B FP8 variants independently, so every
+# {E4M3,E5M2}² pair is valid. The main sweep only drives A==B; this covers mixed.
+
+_FP8_AB_PAIRS = [
+    ("fp8_e4m3", "fp8_e4m3"),
+    ("fp8_e5m2", "fp8_e5m2"),
+    ("fp8_e4m3", "fp8_e5m2"),  # mixed
+    ("fp8_e5m2", "fp8_e4m3"),  # mixed
+]
+_FP8_MIXED_CONFIGS = [
+    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+]
+
+
+@pytest.mark.parametrize("a_dt,b_dt", _FP8_AB_PAIRS, ids=[f"{a}_x_{b}" for a, b in _FP8_AB_PAIRS])
+@pytest.mark.parametrize("config_name", _FP8_MIXED_CONFIGS, ids=[_config_id(n) for n in _FP8_MIXED_CONFIGS])
+def test_mixed_fp8_matmul(config_name: str, a_dt: str, b_dt: str) -> None:
+    """A and B each an arbitrary FP8 variant -> FP16 out, bit-exact vs fp32."""
+    cfg = _resolve(config_name)
+    M = N = K = 256
+
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.FP8_E4M3,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(
+        name="A",
+        dim=[1, M, K],
+        stride=_a_stride_batched(M, K, "k"),
+        data_type=_CUDNN_DTYPE[a_dt],
+    )
+    B = g.tensor(
+        name="B",
+        dim=[1, K, N],
+        stride=_b_stride_batched(N, K, "k"),
+        data_type=_CUDNN_DTYPE[b_dt],
+    )
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True)
+    C.set_data_type(cudnn.data_type.HALF)
+
+    compiled = _plan(g, config=cfg)
+    assert compiled.chain.matmul.a_dtype == a_dt
+    assert compiled.chain.matmul.b_dtype == b_dt
+
+    torch.manual_seed(0)
+    a = torch.empty(1, M, K, dtype=torch.int32).random_(-3, 3).to(dtype=_TORCH_DTYPE[a_dt], device="cuda")
+    b = torch.empty(1, N, K, dtype=torch.int32).random_(-3, 3).to(dtype=_TORCH_DTYPE[b_dt], device="cuda")
+    c = torch.empty(1, M, N, dtype=torch.float16, device="cuda")
+
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    assert int((diff > 1e-1).sum().item()) == 0, f"{config_name} {a_dt} x {b_dt}: max|diff|={diff.max().item():.4g}"
+
+
+# INT8 × INT8 → INT32 (integer tensor-core MMA). Epilogue widens int32 → fp32;
+# bit-exact vs an fp32 reference (small-magnitude products are exact).
+
+_INT8_CONFIGS = [
+    "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+    "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+]
+
+
+# Output dtype → (cudnn enum, torch dtype, input value range). fp8 needs tiny
+# inputs so the int32 accumulator stays in fp8's range; others use a wider range.
+_INT8_OUT_DTYPES = {
+    "fp32": (cudnn.data_type.FLOAT, torch.float32, 8),
+    "bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16, 8),
+    "fp16": (cudnn.data_type.HALF, torch.float16, 8),
+    "int32": (cudnn.data_type.INT32, torch.int32, 8),
+    "fp8_e4m3": (cudnn.data_type.FP8_E4M3, torch.float8_e4m3fn, 1),
+}
+
+
+@requires_int8_mma
+@pytest.mark.parametrize("config_name", _INT8_CONFIGS, ids=[_config_id(n) for n in _INT8_CONFIGS])
+@pytest.mark.parametrize("out_dt", list(_INT8_OUT_DTYPES))
+def test_int8_matmul(config_name: str, out_dt: str) -> None:
+    """INT8×INT8→INT32, output ∈ {fp32,bf16,fp16,int32,fp8}; bit-exact vs a
+    rounded integer reference (values small enough that the rounding is exact)."""
+    cfg = _resolve(config_name)
+    M = N = K = 256
+    cudnn_dt, torch_dt, vmax = _INT8_OUT_DTYPES[out_dt]
+
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.INT8,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.INT32,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, "k"))
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True)
+    C.set_data_type(cudnn_dt)
+
+    compiled = _plan(g, config=cfg)
+    assert compiled.chain.matmul.accum_dtype == "int32"
+    assert compiled.chain.output_dtype == out_dt
+
+    torch.manual_seed(0)
+    a = torch.randint(-vmax, vmax, (1, M, K), dtype=torch.int8, device="cuda")
+    b = torch.randint(-vmax, vmax, (1, N, K), dtype=torch.int8, device="cuda")
+    c = torch.empty(1, M, N, dtype=torch_dt, device="cuda")
+
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bmk,bnk->bmn", a.cpu().to(torch.int64), b.cpu().to(torch.int64))
+    if out_dt == "int32":
+        diff = (c.cpu().to(torch.int64) - ref).abs().max().item()
+    else:
+        diff = (c.float().cpu() - ref.to(torch_dt).float()).abs().max().item()
+    assert diff == 0.0, f"{config_name} -> {out_dt}: max|diff|={diff} (expected bit-exact)"
+
+
+# M-major batched output. The 32B store-alignment rule moves from N to M
+# (out_major="m"), so M-OOB menu shapes SKIP here.
+
+
+@pytest.mark.parametrize("shape", _WEIRD_SHAPES, ids=[_shape_id(s) for s in _WEIRD_SHAPES])
+@pytest.mark.parametrize(
+    "in_dt,out_dt",
+    _CORE_DTYPE_PAIRS,
+    ids=[_dtype_id(p) for p in _CORE_DTYPE_PAIRS],
+)
+@pytest.mark.parametrize(
+    "config_name",
+    _sweep_config_names(),
+    ids=[_config_id(n) for n in _sweep_config_names()],
+)
+def test_m_major_output_batched(
+    _compile_cache,
+    config_name: str,
+    in_dt: str,
+    out_dt: str,
+    shape: tuple[int, int, int],
+) -> None:
+    """M-major + batch>1 over the full (config, dtype, shape) matrix: covers
+    the TMA-store and STG m-major store paths."""
+    batch = 3
+    M, N, K = shape
+    cfg = _resolve(config_name)
+    ok, reason = _compatible(cfg, M, N, K, in_dt, out_dt, out_major="m")
+    if not ok:
+        pytest.skip(reason)
+    compiled = _get_batched_compiled(
+        _compile_cache,
+        cfg,
+        in_dt,
+        out_dt,
+        batch,
+        out_major="m",
+    )
+    a, b, c = _mkbatched_data(batch, M, N, K, in_dt, out_dt, out_major="m")
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    ref = _reference(a, b, out_dt)
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance(in_dt, out_dt)
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  config:    {config_name}"
+        f"\n  dtype:     {in_dt} -> {out_dt}"
+        f"\n  shape:     B{batch}_{M}x{N}x{K} (M-major out)"
+        f"\n  bad:       {bad}/{diff.numel()}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
+
+
+def _mm_plan(b_major: str):
+    """A plain bf16 matmul plan (M=N=256, K=128) with B declared ``b_major``."""
+    M = N = 256
+    K = 128
+    g = cudnn.pygraph(
+        io_data_type=cudnn.data_type.BFLOAT16,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
+    B = g.tensor(name="B", dim=[1, K, N], stride=_b_stride_batched(N, K, b_major))
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    return _plan(g, config=cfg), M, N, K
+
+
+def test_operand_k_mismatch_rejected():
+    """M/N/K are inferred from the FIRST A and B buffer, so a B whose K disagrees
+    would be read past its end. Reject instead of running off the buffer."""
+    compiled, M, N, K = _mm_plan("k")
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
+    c = torch.empty(1, M, N, device="cuda", dtype=torch.bfloat16)
+    good = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16)
+    compiled(_vp(compiled, a, good, c))  # baseline: the matching operand runs
+    short = torch.randn(1, N, K // 2, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="operand shapes disagree"):
+        compiled(_vp(compiled, a, short, c))
+
+
+@pytest.mark.parametrize("b_major", ["k", "n"])
+def test_operand_major_mismatch_rejected(b_major: str):
+    """The B major is baked into the TMA/MMA descriptors at JIT time while the
+    launch reads the runtime strides — a mismatched buffer computes silently
+    wrong numbers, so it must be rejected."""
+    compiled, M, N, K = _mm_plan(b_major)
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
+    c = torch.empty(1, M, N, device="cuda", dtype=torch.bfloat16)
+    # (1, N, K) contiguous is K-major; its transpose-view is N-major.
+    b_k = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16)
+    b_n = torch.randn(1, K, N, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    matching, mismatched = (b_k, b_n) if b_major == "k" else (b_n, b_k)
+
+    compiled(_vp(compiled, a, matching, c))
+    torch.cuda.synchronize()
+    ref = torch.einsum("bmk,bnk->bmn", a.float(), matching.float())
+    torch.testing.assert_close(c.float(), ref, atol=2e-1, rtol=2e-2)
+
+    with pytest.raises(ValueError, match="operand layout does not match"):
+        compiled(_vp(compiled, a, mismatched, c))
+
+
+# Standalone CLI shim — forwards remaining argv to pytest on this file.
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
+
+
+def test_cache_dir_falls_back_when_unwritable(tmp_path, monkeypatch, caplog):
+    """An unwritable cache location must degrade to a temp dir with a warning,
+    not abort the compile with a raw PermissionError."""
+    import logging
+
+    from cudnn.gemm.frost.compiler import _cache_dir, _fallback_cache_dir, _usable_cache_dir
+
+    # A regular file as a path component makes mkdir raise even for root
+    # (CI runs as root, where a chmod-0o500 directory is still writable).
+    readonly = tmp_path / "readonly"
+    readonly.touch()
+    try:
+        _usable_cache_dir.cache_clear()
+        monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(readonly / "nested"))
+        with caplog.at_level(logging.WARNING, logger=_cache_dir.__module__):  # the active family's compiler
+            got = _cache_dir()
+        assert got == _fallback_cache_dir()
+        assert os.access(got, os.W_OK)
+        assert any("falling back" in r.getMessage() for r in caplog.records)
+        assert _cache_dir() == got  # cached: diagnosed once, not per compile
+    finally:
+        _usable_cache_dir.cache_clear()
+
+    _usable_cache_dir.cache_clear()
+    monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(tmp_path / "writable"))
+    assert _cache_dir() == tmp_path / "writable"
+    _usable_cache_dir.cache_clear()
+
+
+def test_generated_kernel_write_is_atomic(tmp_path, monkeypatch):
+    """Concurrent JITs of one kernel share a content-addressed path, so the write
+    must publish by rename: the target never holds partial source and a failed
+    write leaves neither a truncated target nor a stray temp file."""
+    from cudnn.gemm.frost.compiler import _write_atomic
+
+    target = tmp_path / "generated_kernel.py"
+    src = "X = [\n" + "".join(f"    {i},\n" for i in range(5000)) + "]\n"
+
+    _write_atomic(target, src)
+    assert target.read_text() == src
+
+    target.write_text("OLD")
+    boom = OSError("rename failed")
+
+    def _raise(*_a, **_k):
+        raise boom
+
+    monkeypatch.setattr(os, "replace", _raise)
+    with pytest.raises(OSError):
+        _write_atomic(target, src)
+    assert target.read_text() == "OLD"  # never truncated in place
+    monkeypatch.undo()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["generated_kernel.py"]
+
+
+def test_import_kernel_publishes_by_rename(tmp_path, monkeypatch):
+    """The atomic write must be wired into _import_kernel, not merely available:
+    the generated module has to reach its cache path through os.replace."""
+    from cudnn.gemm.frost.compiler import _import_kernel, _usable_cache_dir
+
+    _usable_cache_dir.cache_clear()
+    monkeypatch.setenv("CUDNN_FRONTEND_GEMM_KERNEL_CACHE", str(tmp_path))
+    real_replace = os.replace
+    renamed = []
+
+    def _spy(src, dst, *a, **k):
+        renamed.append(str(dst))
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(os, "replace", _spy)
+    try:
+        mod = _import_kernel("MARKER = 4321\n")
+    finally:
+        _usable_cache_dir.cache_clear()
+    assert mod.MARKER == 4321
+    assert any(name.endswith("generated_kernel.py") for name in renamed)
+
+
+# --- mma_size_m geometry invariants ------------------------------------------
+#
+# The CTA tile may span several `tcgen05.mma` along M (`mma_size_m = cta_tile_m /
+# mma_inst_m`). The e2e behaviour rides `_QUICK_CONFIGS` above; what needs its own
+# assertion is the geometry contract those configs rely on.
+
+
+@pytest.mark.parametrize(
+    "name,mma_size_m",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 2),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster1x1", 2),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 2),
+        ("CONFIG_sm100_256x128x128_64x128x32_cluster1x1", 4),
+        ("CONFIG_sm100_512x128x128_128x128x32_cluster1x1", 4),
+    ],
+)
+def test_num_mma_m_is_derived_from_the_two_tiles(name: str, mma_size_m: int) -> None:
+    cfg = by_name(name)
+    assert cfg.mma_size_m == mma_size_m
+    assert cfg.cta_tile_m == cfg.mma_size_m * cfg.mma_tile_m
+    assert cfg.mma_tile_n == cfg.cta_tile_n  # N is never split
+    # The epilogue drains one MMA-M block per pass, so its subtile height is the
+    # instruction's M, not the CTA tile's.
+    assert cfg.epi_tile_m == cfg.mma_tile_m
+
+
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        # The pre-existing M/N bounds read off the MMA INSTRUCTION tile now that
+        # the CTA tile can be several instructions wide.
+        ("CONFIG_sm100_128x128x128_32x128x32_cluster1x1", "mma_tile_m=32"),
+        ("CONFIG_sm100_128x512x128_128x512x32_cluster1x1", "mma_tile_n=512"),
+        ("CONFIG_sm100_128x24x128_128x12x32_cluster1x1", "mma_tile_n=12"),
+        # At most 4 instructions along M...
+        ("CONFIG_sm100_512x128x128_64x128x32_cluster1x1", "mma_size_m=8"),
+        ("CONFIG_sm100_1024x128x128_128x128x32_cluster1x1", "mma_size_m=8"),
+        # ... and N is not an instruction-count axis at all.
+        ("CONFIG_sm100_128x256x128_128x128x32_cluster1x1", "N is not split"),
+    ],
+)
+def test_illegal_mma_decomposition_rejected(name: str, reason: str) -> None:
+    with pytest.raises(NotImplementedError) as e:
+        by_name(name)
+    assert reason in str(e.value)
+
+
+def test_catalog_cta_pairs_stay_inside_clusters() -> None:
+    for cfg in CATALOG:
+        assert cfg.cga_size_m % cfg.ctas_per_mma == 0, cfg.name
+        assert cfg.multicast_b_factor >= 1, cfg.name
+
+
+@pytest.mark.parametrize("pipeline,k_bytes,mma_k_bytes", [("sm100", 128, 32), ("sm103", 384, 48)])
+@pytest.mark.parametrize("cga_m,cga_n", [(1, 2), (3, 1)])
+@pytest.mark.parametrize("source", ["by_name", "constructor"])
+def test_cta_pair_rejects_odd_cluster_m(pipeline, k_bytes, mma_k_bytes, cga_m, cga_n, source) -> None:
+    from dataclasses import replace
+
+    name = f"CONFIG_{pipeline}_128x128x{k_bytes}_128x128x{mma_k_bytes}_cluster{cga_m}x{cga_n}"
+    with pytest.raises(NotImplementedError, match="cga_size_m % 2 == 0"):
+        if source == "by_name":
+            by_name(f"{name}_2ctamma")
+        else:
+            replace(by_name(f"{name}_1ctamma"), cta_group=2)
+
+
+def test_catalog_enumerates_the_mma_m_axis() -> None:
+    """M is enumerated as (mma_inst_m, mma_size_m); `cta_tile_m` is their PRODUCT,
+    not an axis. So a split tile is an ordinary catalog geometry and reaches the
+    funnel, the CUDNN_GEMM_TEST_FULL sweep and the benchmarks' default config set.
+    `mma_size_m == 1` is enumerated first, so an unqualified `cta_tile_m` lookup
+    still lands on the unsplit tile — several suites rely on that."""
+    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.kernel_registry import candidates
+    from cudnn.gemm.frost.tile_config import _M_AXES
+
+    sm100 = [c for c in CATALOG if c.pipeline == "sm100"]
+    assert {(c.mma_tile_m, c.mma_size_m) for c in sm100} == set(_M_AXES)
+    # mma_size_m counts instructions per WARP tile; on the tcgen05 families a
+    # warp tile IS the CTA tile, on sm120 the CTA tile is warps_m of them.
+    assert all(c.warp_tile_m == c.mma_tile_m * c.mma_size_m for c in CATALOG)
+    # sm103 pins the INSTRUCTION M (the block-scale SF 128x4 swizzle needs
+    # mma_tile_m % 128 == 0) and does not split (MMA_SIZE_M_MAX = 1).
+    assert {c.mma_tile_m for c in CATALOG if c.pipeline == "sm103"} == {128}
+    # sm120's warp-scoped MMA has no M-split axis: mma_size_m IS the warp
+    # tile's fragment count, one value per swept warp-tile height.
+    sm120_axis = {c.mma_size_m for c in CATALOG if c.pipeline == "sm120"}
+    assert sm120_axis == {c.warp_tile_m // 16 for c in CATALOG if c.pipeline == "sm120"}
+    assert {1, 2} <= sm120_axis
+    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm100"} == {1, 2, 4}
+    assert {c.mma_size_m for c in CATALOG if c.pipeline == "sm103"} == {1}
+    # cta_tile_m=128 is the one value two axes produce (128x1 and 64x2).
+    assert next(c for c in sm100 if c.cta_tile_m == 128).mma_size_m == 1
+
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
+    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    # Split tiles reach the funnel: whichever families serve THIS device, the
+    # candidates carry more than the unsplit tile.
+    assert {1, 2, 4} <= {cfg.mma_size_m for _t, cfg in candidates(analyze(g))}
+
+
+@requires_sm100
+@pytest.mark.parametrize("mma_m", (64, 128))
+@pytest.mark.parametrize("cta_group,cluster", ((1, "1x1"), (2, "2x1"), (1, "2x2"), (2, "4x2")))
+@pytest.mark.parametrize("a_major,out_major,stg", (("k", "n", False), ("m", "m", False), ("k", "n", True)))
+def test_four_mma_m_tiles(mma_m, cta_group, cluster, a_major, out_major, stg):
+    """All four M blocks, a second CTA tile, M/K tails, both drains and multicast.
+
+    At MMA M=128 an unsliced A load needs two TMA boxes. Do not turn a build
+    rejection into a skip: these geometries must compile and execute.
+    """
+    cfg = by_name(f"CONFIG_sm100_{4 * mma_m}x64x128_{mma_m}x64x32_cluster{cluster}_{cta_group}ctamma")
+    M, N, K = 1152, 256, 264
+    g = _build_graph(M, N, K, "bf16", "bf16", a_major=a_major, out_major=out_major)
+    compiled = _plan(g, config=cfg, force_stg_epi=stg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major, out_major=out_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, _reference(a, b, "bf16"), rtol=0, atol=0)
+
+
+@requires_sm100
+def test_benchmark_sweeps_four_mma_m_configs(monkeypatch):
+    bench_dir = pathlib.Path(__file__).resolve().parents[4] / "benchmark" / "gemm" / "frost"
+    monkeypatch.syspath_prepend(str(bench_dir))
+    from benchmark_matmul import _build_spec_map
+    from benchmark_utils import select_config_variants
+
+    specs = _build_spec_map(_build_graph(1152, 256, 264, "bf16", "bf16"))
+    default = select_config_variants(None, specs)
+    globbed = select_config_variants("CONFIG_sm100_512x64x128_*", specs)
+    for cta_group, cluster in ((1, "1x1"), (2, "2x1")):
+        name = f"CONFIG_sm100_512x64x128_128x64x32_cluster{cluster}_{cta_group}ctamma"
+        assert name in default and name in globbed
+        assert specs[name][0].mma_size_m == 4
+
+
+@requires_sm107
+@pytest.mark.parametrize("mma_k_bytes", (32, 64))
+@pytest.mark.parametrize("cta_group", (1, 2))
+def test_four_mma_m_fp8(mma_k_bytes, cta_group):
+    cfg = by_name(f"CONFIG_sm100_512x128x128_128x128x{mma_k_bytes}_cluster{cta_group}x1_{cta_group}ctamma")
+    M, N, K = 1152, 256, 272
+    compiled = _plan(_build_graph(M, N, K, "fp8_e4m3", "bf16"), config=cfg)
+    a, b, c = _mkdata(M, N, K, "fp8_e4m3", "bf16")
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, _reference(a, b, "bf16"), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "name,cta_group,want",
+    [
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster2x1", 2, 128),  # mma_inst_m=128 -> full N
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, mma_size_m=1
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster2x1", 2, 64),  # mma_inst_m=64, mma_size_m=2
+        ("CONFIG_sm100_128x256x128_64x256x32_cluster2x1", 2, 128),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1, 128),  # 1-CTA never halves
+    ],
+)
+def test_drain_width_keys_on_the_mma_block_height(name: str, cta_group: int, want: int) -> None:
+    """The 2-CTA 2x2-DP drain splits N across the two 64-lane halves. That is a
+    property of the per-CTA MMA block height (cluster-MMA m=128), NOT of the CTA
+    tile — they agree only at mma_size_m == 1. Keying it on cta_tile_m made the
+    compiler over-report the drain width, which both over-reserved TMEM (losing an
+    acc stage) and let the baked STG chunk exceed the real subtile: the 2-CTA
+    cta_tile_n=48 split entry of _QUICK_CONFIGS faulted with `misaligned address`."""
+    from cudnn.gemm.frost.compiler import _epi_tile_cols
+
+    assert _epi_tile_cols(by_name(f"{name}_{cta_group}ctamma")) == want
+
+
+_MMAJOR_COORD_KINDS = ("gen_index_axis1", "gen_index_axis2", "per_row", "per_col", "per_elem")
+
+
+def _mmajor_coord_graph(kind: str, M: int, N: int, K: int) -> tuple[cudnn.pygraph, str | None]:
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    aux = None
+    if kind.startswith("gen_index"):
+        axis = int(kind[-1])
+        Y = g.add(a=C, b=g.gen_index(input=C, axis=axis, name="gi"), name="ad")
+    else:
+        dim, stride = {
+            "per_row": ([1, M, 1], [M, 1, 1]),
+            "per_col": ([1, 1, N], [N, N, 1]),
+            "per_elem": ([1, M, N], [M * N, N, 1]),
+        }[kind]
+        x = g.tensor(name="x", dim=dim, stride=stride, data_type=cudnn.data_type.FLOAT)
+        Y = g.mul(a=C, b=x, name="w")
+        aux = "x"
+    Y.set_stride([M * N, 1, M])
+    Y.set_output(True)
+    return g, aux
+
+
+@pytest.mark.parametrize("kind", _MMAJOR_COORD_KINDS)
+@pytest.mark.parametrize("shape", ((256, 256, 256), (512, 128, 256)), ids=("256x256x256", "512x128x256"))
+@pytest.mark.parametrize("config_name", _STRADDLE_CONFIGS[:2], ids=[_config_id(n) for n in _STRADDLE_CONFIGS[:2]])
+def test_m_major_tma_store_serves_coordinate_reading_pointwise(config_name: str, shape: tuple[int, int, int], kind: str) -> None:
+    """`row` / `col_j` on the M-major TMA arm are the subtile base, not the
+    coordinates of the fragment a lane holds -- that arm loads 16x256b and each
+    lane owns a TRANSPOSED patch. Anything asking "which row / column am I"
+    (gen_index, per_row / per_col / per_elem aux) goes through
+    `_mmajor_elem_coord`; before it did not, and gen_index measured wrong on
+    BOTH axes here while being exact through STG."""
+    cfg = _resolve(config_name)
+    M, N, K = shape
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", out_major="m")
+    if not ok:
+        pytest.skip(reason)
+
+    g, aux_name = _mmajor_coord_graph(kind, M, N, K)
+    plan = _plan(g, config=cfg)
+    if not plan._compiled.use_tma_store:
+        pytest.skip(f"{kind} does not take the M-major TMA-store path on {config_name}")
+
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", out_major="m")
+    args = []
+    if aux_name is not None:
+        n = {"per_row": M, "per_col": N, "per_elem": M * N}[kind]
+        shape3 = {"per_row": (1, M, 1), "per_col": (1, 1, N), "per_elem": (1, M, N)}[kind]
+        args.append((torch.arange(n, dtype=torch.float32, device="cuda") % 5 + 1).reshape(shape3))
+    plan(_vp(plan, a, b, [c], *args))
+    torch.cuda.synchronize()
+
+    ref = torch.einsum("bmk,bnk->bmn", a.to(torch.float32), b.to(torch.float32))
+    if kind == "gen_index_axis1":
+        ref = ref + torch.arange(M, device="cuda", dtype=torch.float32).reshape(1, M, 1)
+    elif kind == "gen_index_axis2":
+        ref = ref + torch.arange(N, device="cuda", dtype=torch.float32).reshape(1, 1, N)
+    else:
+        ref = ref * args[0]
+    ref = ref.to(torch.bfloat16)
+
+    bad = int((c.to(torch.float32) != ref.to(torch.float32)).sum())
+    assert bad == 0, f"\n  {config_name}\n  m-major {M}x{N}x{K}  {kind}\n  wrong at {bad}/{c.numel()}"
+
+
+def test_tma_arm_never_writes_past_the_output_rows() -> None:
+    """The TMA arm runs the epilogue for the whole tile and clips only its OWN
+    store; every other store must re-apply the row bound. A missed one is
+    INVISIBLE in the output tensor -- it writes past the last row, into whatever
+    the allocator put next -- so this test gives each output slack and poisons it.
+
+    The shape matters: M must not be a multiple of the CLUSTER tile height, or
+    there are no overhang rows to write. 384 with cluster2x1 x cta_tile_m=128
+    (cgrp_tile_m=256) leaves 128."""
+    M, N, K = 384, 256, 256
+    cfg = _resolve("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma")
+    assert M % (cfg.cta_tile_m * cfg.cga_size_m) != 0
+
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    q, sc = g.block_scale_quantize(input=R, block_size=32, axis=-1, name="qr")
+    q.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    sc.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
+
+    plan = _plan(g, config=cfg)
+    if not plan._compiled.use_tma_store:
+        pytest.skip("this graph does not take the TMA-store arm")
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    slack = 256
+    backing, views = [], []
+    for o in plan.chain.outputs:
+        shape = o.dim if o.dim is not None else (1, M, N)
+        buf = torch.empty(shape[0], shape[1] + slack, shape[2], dtype=_TAP_TORCH_DTYPE[o.dtype], device="cuda")
+        buf.view(torch.uint8).fill_(0xAB)
+        backing.append(buf)
+        views.append(buf[:, : shape[1]])
+    plan(_vp(plan, a, b, views))
+    torch.cuda.synchronize()
+
+    for o, buf in zip(plan.chain.outputs, backing):
+        rows = (o.dim if o.dim is not None else (1, M, N))[1]
+        tail = buf[:, rows:].view(torch.uint8)
+        touched = int((tail != 0xAB).sum())
+        assert touched == 0, f"{o.source}: the epilogue wrote {touched} bytes past its {rows} rows"
+
+
+@pytest.mark.parametrize("name", ["CONFIG_sm100_128x16x128_128x16x32_cluster2x1", "CONFIG_sm100_128x32x128_128x32x32_cluster2x1"])
+def test_narrow_n_under_two_cta_mma_still_takes_the_tma_store(name: str) -> None:
+    """`cta_group == 2 and cta_tile_n < 64` used to fall back to STG on the
+    theory that a subtile would split across the MMA pair. It does not: each
+    CTA drains its own half and the subtile span walk already halves to fit.
+    Measured bit-identical to STG on 16 (config) pairs."""
+    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
+    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    cfg = by_name(name)
+    assert cfg.cta_tile_n < 64
+    assert _use_tma_store_epi(analyze(g), cfg) is True
+
+
+@pytest.mark.parametrize(
+    "name,cta_group",
+    [
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2),
+    ],
+)
+@pytest.mark.parametrize("shape", [(4096, 4096, 512), (255, 256, 240)])
+def test_tma_store_serves_every_drain_height(name: str, cta_group: int, shape: tuple) -> None:
+    """`mma_inst_m` is 64 or 128 by construction, and the TMA-store epilogue
+    stages all three drain layouts: the full thread->row one at 128, the 1-CTA
+    packed `lane < 16` one at 64 (half the lanes carry nothing, so the staging
+    indexes by `row` and the side effects carry `row_active`), and the 2-CTA
+    2x2-DP one at 64 (two column halves per stage, one TMA box each)."""
+    from cudnn.gemm.frost.compiler import _epi_vec_bytes, _store_modes, jit_from_cudnn_graph
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    M, N, K = shape
+    cfg = by_name(name)
+
+    def build():
+        g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+        B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+        C = g.matmul(A=A, B=B, name="mm")
+        C.set_output(True).set_data_type(_BF16)
+        return g, A, B, C
+
+    g, _, _, _ = build()
+    assert _store_modes(analyze(g), cfg) == ("tma",)
+
+    torch.manual_seed(0)
+    a = torch.randn(1, M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, N, K, device="cuda", dtype=torch.bfloat16)
+
+    def run(force_stg: bool):
+        slack = 4096
+        raw = torch.full((2 * M * N + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+        c = raw.view(torch.bfloat16)[: M * N].view(1, M, N)
+        c.zero_()
+        tail = raw[2 * M * N :].clone()
+        gg, aa, bb, cc = build()
+        with _force_stg_epi(force_stg):
+            jit_from_cudnn_graph(gg, config=cfg)({aa: a, bb: b, cc: c})
+        torch.cuda.synchronize()
+        assert torch.equal(raw[2 * M * N :], tail), "the store ran past the output"
+        return c.clone()
+
+    assert torch.equal(run(False).view(torch.uint8), run(True).view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "name,cta_group,out_dt,want",
+    [
+        ("CONFIG_sm100_128x16x128_128x16x32_cluster1x1", 1, "bf16", 32),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1, "bf16", 64),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2, "bf16", 64),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster2x1", 1, "bf16", 128),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1, "fp32", 128),
+    ],
+)
+def test_epi_smem_row_bytes_is_the_real_staging_alignment(name: str, cta_group: int, out_dt: str, want: int) -> None:
+    """The TMA-store SMEM stage is written at `smem_subtile_ptr + tidx * epi_n`,
+    so the tightest true alignment is one subtile row -- `epi_n * elem_bytes`,
+    attained at odd tidx. It was a hardcoded 64, which over-claims at
+    cta_tile_n=16 (a 32-byte row) and under-claims at epi_n=64 / 4-byte output.
+    `store_swizzled` forwards it as `assumed_align`, so an over-claim is a false
+    promise the backend may exploit. It is per OUTPUT, not shared: `epi_n` is a
+    column count and only the element width differs."""
+    from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    cfg = by_name(name)
+    epi_n = _epi_n(cfg, out_dt)
+    assert epi_n * DTYPE_BYTES[out_dt] == want
+
+    # The width is no longer a shared constant -- it is per output, so it is a
+    # literal in the store sequence the renderer unrolls.
+    M, N, K = 256, cfg.cta_tile_n, 256
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    g.matmul(A=A, B=B, name="mm").set_output(True).set_data_type(_CUDNN_DTYPE.get(out_dt, cudnn.data_type.FLOAT))
+    seq = _tma_store_sequence(analyze(g), cfg, frozenset({0}), epi_n)
+    assert f"alignment={want}" in seq, seq
+
+
+def test_no_template_hardcodes_the_staging_alignment() -> None:
+    """The staging alignment is the SMEM row width, which is per output
+    (`epi_n * its own element width`), so no template carries it: every one hands
+    its store sequence to `@@INJECT_TMA_STORE_SEQUENCE@@` and the renderer
+    unrolls it per output with that output's own width. A LITERAL in a template
+    would go stale the next time `_epi_n` moves."""
+    import pathlib
+
+    from cudnn.gemm.frost.compiler import _epi_n, _tma_store_sequence
+    from cudnn.gemm.frost.graph_analyzer import analyze
+    from cudnn.gemm.frost.tile_config import by_name
+
+    from cudnn.gemm.frost.compiler import _TMA_STORE_EPI_PIPELINES
+
+    files = template_files()
+    assert len(files) == 12, [p.name for p in files]  # the template inventory; a new file lands here and in the parity groups
+    for path in files:
+        src = path.read_text()
+        assert "alignment=64" not in src, path.name
+        assert "alignment=epi_smem_row_bytes" not in src, path.name
+        # sm120 has no TMA-store arm at all (its pipeline always stores STG), so
+        # there is no store sequence for the renderer to unroll.
+        if path.name.split("_")[0] in _TMA_STORE_EPI_PIPELINES:
+            assert "@@INJECT_TMA_STORE_SEQUENCE@@" in src, path.name
+
+    # The renderer emits the row width the output's OWN dtype implies.
+    M = N = K = 256
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    chain = analyze(g)
+    cfg = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    epi_n = _epi_n(cfg, chain.output_dtype)
+    seq = _tma_store_sequence(chain, cfg, frozenset({0}), epi_n)
+    assert f"alignment={epi_n * 2}" in seq, seq  # bf16
+
+
+@pytest.mark.parametrize(
+    "name,cta_group",
+    [
+        ("CONFIG_sm100_128x16x128_128x16x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
+        ("CONFIG_sm100_256x256x128_128x256x32_cluster2x1", 1),
+    ],
+)
+def test_epilogue_chunk_is_the_width_the_arm_hands_the_snippet(name: str, cta_group: int) -> None:
+    """The injected snippet is handed the whole staged subtile on the TMA arm
+    and one store-vector slice on the STG arm, and the codegen must be told
+    which. Getting it wrong is silent: every `vsize`-keyed emitter (aux loads,
+    gen_index, the reduction unrolls, the quant block) then walks the wrong
+    number of elements."""
+    from cudnn.gemm.frost.compiler import _epi_chunk_elems, _epi_n, _epi_vec_bytes
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, 128], stride=[256 * 128, 128, 1])
+    B = g.tensor(name="B", dim=[1, 128, 256], stride=[128 * 256, 1, 128])
+    g.matmul(A=A, B=B, name="mm").set_output(True)
+    chain = analyze(g)
+    cfg = by_name(name)
+    assert _epi_chunk_elems(chain, cfg, True) == _epi_n(cfg, chain.output_dtype)
+    assert _epi_chunk_elems(chain, cfg, False) == _epi_vec_bytes(chain, cfg) // DTYPE_BYTES[chain.output_dtype]
+
+
+@pytest.mark.parametrize(
+    "name,cta_group",
+    [
+        ("CONFIG_sm100_128x8x128_128x8x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x16x128_128x16x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x128x128_128x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_128x256x128_128x256x32_cluster2x1", 2),
+        # the two `mma_inst_m == 64` drains: 1-CTA packed and 2-CTA 2x2-DP
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster1x1", 1),
+        ("CONFIG_sm100_64x128x128_64x128x32_cluster2x1", 2),
+    ],
+)
+def test_m_major_tma_store_serves_a_narrow_drain(name: str, cta_group: int) -> None:
+    """The M-major store stages an M-contiguous column with one scalar store per
+    drain column, so a narrow `epi_n` is just fewer stores. The arm it replaced
+    walked `range(epi_n // 16)` stmatrix blocks and emitted ZERO of them below
+    16 -- silent, not a fault -- which is what this geometry used to be rejected
+    for."""
+    from cudnn.gemm.frost.compiler import _store_modes, jit_from_cudnn_graph
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    m, n, k = 256, 256, 256
+    cfg = by_name(name)
+
+    def build():
+        g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        A = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+        B = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
+        C = g.matmul(A=A, B=B, name="mm")
+        C.set_output(True).set_data_type(_BF16)
+        C.set_stride([m * n, 1, m])
+        return g, A, B, C
+
+    g, _, _, _ = build()
+    chain = analyze(g)
+    assert chain.out_major == "m"
+    assert _store_modes(chain, cfg) == ("tma",)
+
+    torch.manual_seed(0)
+    a = torch.randn(1, m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, n, k, device="cuda", dtype=torch.bfloat16)
+
+    def run(force_stg: bool):
+        slack = 4096
+        raw = torch.full((2 * n * m + slack,), 0xAB, device="cuda", dtype=torch.uint8)
+        c = raw.view(torch.bfloat16)[: n * m].view(1, n, m).transpose(1, 2)
+        tail = raw[2 * n * m :].clone()
+        gg, aa, bb, cc = build()
+        with _force_stg_epi(force_stg):
+            jit_from_cudnn_graph(gg, config=cfg)({aa: a, bb: b, cc: c})
+        torch.cuda.synchronize()
+        assert torch.equal(raw[2 * n * m :], tail), "store ran past the output"
+        return c.contiguous()
+
+    assert torch.equal(run(False).view(torch.uint8), run(True).view(torch.uint8))
+
+
+@pytest.mark.parametrize("N,want_chunk", [(4096, 32), (384, 32), (40, 8), (24, 8), (8, 8)])
+def test_m_major_chunk_follows_n(N: int, want_chunk: int) -> None:
+    """An M-major output stores one element per chunk column through its own
+    strides, so its allowed store width does not bound the chunk -- N does. The
+    chunk walks N and the baked `sym_n` divisibility IS the chunk, so it must be
+    a power of two dividing N. An M-major output's own alignment measures the M
+    extent and says nothing about N, which is why it cannot supply this.
+
+    It used to be pinned at one element, which is always legal but costs ~1.5x on
+    the STG arm (4096^3 bf16 `64x128` 1ctamma: 160.5 -> 105.7 us)."""
+    from cudnn.gemm.frost.compiler import _epi_chunk_elems
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    M, K = 256, 256
+    cfg = by_name("CONFIG_sm100_64x128x128_64x128x32_cluster1x1")
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    C = g.matmul(A=A, B=B, name="mm")
+    C.set_output(True).set_data_type(_BF16)
+    C.set_stride([M * N, 1, M])
+    chain = analyze(g)
+    assert chain.out_major == "m"
+    # the STG chunk specifically -- `_epi_chunk_elems(..., use_tma=False)` -- which
+    # is what an M-major scatter walks, whichever arm this config ends up on.
+    assert _epi_chunk_elems(chain, cfg, False) == want_chunk
+
+
+def test_epi_n_divides_the_drain_width() -> None:
+    """`epi_n` is the TMA arm's subtile width, and an N-tile that is not a whole
+    number of subtiles would store a box past the tile edge into its neighbour
+    (TMA clamps only at the GLOBAL extent). So it must DIVIDE the drain width --
+    which is why it is a power of two dividing `cols`, not the power-of-two floor
+    OF `cols`. Flooring by value rejected every 8-multiple that is not a
+    32-multiple (48 -> 32, and 48 % 32 != 0), i.e. 65 % of the catalog."""
+    from cudnn.gemm.frost.compiler import _epi_n, _epi_tile_cols
+    from cudnn.gemm.frost.tile_config import CATALOG
+
+    seen_non_pow2_tile = False
+    for cfg in CATALOG:
+        for cta_group in (1, 2):
+            if cta_group == 2 and (cfg.cga_size_m % 2 or cfg.cta_tile_n % 16 or cfg.mma_tile_n % 16):
+                continue
+            cols = _epi_tile_cols(cfg)
+            seen_non_pow2_tile |= cols & (cols - 1) != 0
+            for dt in ("bf16", "fp32", "fp8_e4m3", "fp4_e2m1"):
+                n = _epi_n(cfg, dt)
+                assert n > 0 and n & (n - 1) == 0, (cfg.name, cta_group, dt, n)
+                assert cols % n == 0, f"{cfg.name} cta_group={cta_group} {dt}: epi_n {n} does not divide {cols}"
+    assert seen_non_pow2_tile, "the catalog no longer carries a non-power-of-2 drain width — the test is vacuous"
+
+
+def test_the_auto_path_only_picks_catalog_widths() -> None:
+    """`select_config` now scans every hardware-legal N width (multiples of 32
+    up to 256) on the plain single-GEMM path — the widths the epilogue divisor
+    rule admits are the engine's own choices there, not just forced configs.
+    The CONSTRAINED paths keep the power-of-two ladder: block-scale needs
+    cta_n % 128 == 0 and multi-GEMM squeezes a shared power-of-two budget."""
+    from cudnn.gemm.frost.tile_config import by_name, select_config
+
+    widths, constrained_widths = set(), set()
+    for M in (64, 128, 512, 4096, 16384):
+        for N in (64, 128, 512, 4096, 11008):
+            for num_gemms in (1, 2, 3):
+                for block_scale in (False, True):
+                    try:
+                        cfg = select_config(M, N, num_gemms=num_gemms, block_scale=block_scale)
+                    except NotImplementedError:
+                        continue
+                    by_name(cfg.name)  # every auto pick must resolve in the catalog
+                    widths.add(cfg.cta_tile_n)
+                    if num_gemms > 1 or block_scale:
+                        constrained_widths.add(cfg.cta_tile_n)
+    assert widths, "select_config produced nothing — the sweep is vacuous"
+    assert all(32 <= w <= 256 and w % 32 == 0 for w in widths), sorted(widths)
+    assert all(w & (w - 1) == 0 for w in constrained_widths), sorted(constrained_widths)
+
+
+def test_templates_take_the_chunk_from_the_rendered_constant() -> None:
+    """`vsize` is the fusion chunk, not a memory-access width -- it must come
+    from `epi_chunk_elems`, which differs per store arm."""
+    import pathlib
+
+    for path in template_files():
+        src = path.read_text()
+        assert "vsize = epi_chunk_elems" in src, path.name
+        assert "vsize = (VEC_BYTES" not in src, path.name
+
+
+# --- cutlass-dsl version-gated kwargs ----------------------------------------
+
+# `is_exclusive` (the >512-column TMEM grant) and `b_collector_op` (B-operand
+# collector reuse) only reached the cutlass-dsl `nvvm.*` wrappers in 4.8. Those
+# wrappers take no **kwargs, so NAMING one on an older DSL is a TypeError at JIT
+# regardless of the value -- `is_exclusive=False` is just as fatal as True.
+
+_VERSION_GATED_KWARGS = {
+    "tcgen05_alloc": "is_exclusive",
+    "tcgen05_dealloc": "is_exclusive",
+    "tcgen05_mma": "b_collector_op",
+    "tcgen05_mma_block_scale": "b_collector_op",
+}
+
+
+def test_templates_route_version_gated_kwargs_through_the_guarded_wrappers():
+    """Every template must reach these ops through `tile_helpers`, which emits
+    the kwarg only on the branch that wants it. Calling `nvvm.<op>` directly and
+    passing the inert False/None compiles on an internal wheel and fails every
+    single JIT on the public one -- which is how the whole gemm suite went red."""
+    import ast
+
+    offenders = []
+    for path in template_files():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "nvvm"
+                and node.func.attr in _VERSION_GATED_KWARGS
+            ):
+                offenders.append(f"{path.name}:{node.lineno} nvvm.{node.func.attr}(...)")
+    assert not offenders, "call the tile_helpers wrapper instead of nvvm directly:\n  " + "\n  ".join(offenders)
+
+
+def test_the_b_collector_is_off_at_the_64_row_mma():
+    """`.collector::b::*` is illegal on the 64-row MMA: measured
+    `cudaErrorIllegalInstruction` at `mma_tile_m == 64` under BOTH cta groups, so it
+    is the per-CTA instruction M that decides, not the hardware M (which is 128 for
+    the 2-CTA case that still faults). Block-scale never reaches it --
+    `validate_block_scale_config` requires `mma_tile_m % 128 == 0` -- which is why
+    this only surfaced once the plain templates grew a B collector."""
+    from cudnn.gemm.frost.compiler import _B_COLLECTOR_ARCH_RANGES, _b_collector_ok
+    from cudnn.gemm.frost.tile_config import by_name
+
+    good_arch = _B_COLLECTOR_ARCH_RANGES[0][0]
+    for name, want in (
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma", True),
+        ("CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma", True),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster2x1_2ctamma", False),
+        ("CONFIG_sm100_128x128x128_64x128x32_cluster1x1_1ctamma", False),
+    ):
+        cfg = by_name(name)
+        assert _b_collector_ok(cfg, good_arch) is want, f"{name}: mma_tile_m={cfg.mma_tile_m} mma_size_m={cfg.mma_size_m}"
+    # the silicon gate still bites on its own
+    assert not _b_collector_ok(by_name("CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma"), 100)
+
+
+def test_the_collector_helpers_are_one_text_across_every_template():
+    """Both helpers are the same predicate everywhere, so they are kept textually
+    identical -- same body, same parameter names, same A-then-B order, and both
+    immediately above the kernel. Divergence here is how the epilogue drifted
+    before test_template_epilogue_parity.py started pinning it."""
+    import ast
+
+    blobs = {}
+    for path in template_files():
+        lines = path.read_text().split("\n")
+        defs = [n for n in ast.parse("\n".join(lines)).body if isinstance(n, ast.FunctionDef) and n.name.endswith("_collector_op")]
+        if not defs:
+            continue
+        names = [n.name for n in defs]
+        assert names == ["_a_collector_op", "_b_collector_op"], f"{path.name}: expected both helpers in A-then-B order, got {names}"
+        blobs.setdefault("\n".join("\n".join(lines[n.lineno - 1 : n.end_lineno]) for n in defs), []).append(path.name)
+    assert blobs, "no template defines the collector helpers -- this check covered nothing"
+    if len(blobs) > 1:
+        groups = "\n  ".join(f"{sorted(v)}" for v in blobs.values())
+        raise AssertionError(f"the collector helpers have diverged into {len(blobs)} variants:\n  {groups}")
+
+
+def _load_collector_helpers(path, consts):
+    """Exec a template's collector helpers alone, with the injected constants
+    supplied and the DSL stubbed. The helpers are pure compile-time predicates,
+    so they run outside a kernel trace."""
+    import ast
+    import types
+
+    ns = dict(consts)
+    ns["cutlass"] = types.SimpleNamespace(const_expr=lambda x: x)
+    ns["nvvm"] = types.SimpleNamespace(Tcgen05MMACollectorOp=types.SimpleNamespace(FILL="FILL", USE="USE", LASTUSE="LASTUSE"))
+    tree = ast.parse(path.read_text())
+    found = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in ("_a_collector_op", "_b_collector_op"):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+            found[node.name] = ns[node.name]
+    return found
+
+
+def test_the_a_and_b_collectors_can_never_both_be_live():
+    """A marks an N-stack (A fixed while B varies across the GEMM loop), B marks
+    an M-stack (B fixed while A advances across the mma_size_m loop). The nest is
+    gemm-outer / mi-inner, so an interleaved pair would break the
+    first-marked-is-FILL / last-is-LASTUSE rule on one side. Today they exclude
+    each other only because the two helpers bail on `mma_size_m` from opposite
+    sides -- nothing else pins it, so this does."""
+    both = 0
+    for path in template_files():
+        fns = _load_collector_helpers(path, {})
+        if len(fns) < 2:
+            continue
+        both += 1
+        for mma_size_m in (1, 2, 4):
+            for num_gemms in (1, 2, 3):
+                for num_a_operands in (1, 2):
+                    for b_ok in (True, False):
+                        fns = _load_collector_helpers(
+                            path,
+                            dict(mma_size_m=mma_size_m, num_gemms=num_gemms, num_a_operands=num_a_operands, b_collector_ok=b_ok),
+                        )
+                        live_a = any(fns["_a_collector_op"](g) is not None for g in range(num_gemms))
+                        live_b = any(fns["_b_collector_op"](mi) is not None for mi in range(mma_size_m))
+                        assert not (
+                            live_a and live_b
+                        ), f"{path.name}: both collectors live at mma_size_m={mma_size_m} num_gemms={num_gemms} num_a={num_a_operands} b_ok={b_ok}"
+    assert both, "no template defines both collector helpers -- the check silently covered nothing"
+
+
+def test_every_a_collector_chain_starts_with_fill_and_ends_with_lastuse():
+    """The ISA's entry gate: the first marked MMA seeds the collector and the last
+    releases it. Both helpers key on a `range_constexpr` index, so this is a
+    compile-time property -- a chain that began with USE would pick up a stale
+    entry and silently multiply in the wrong operand."""
+    seen = 0
+    for path in template_files():
+        for name, n_key in (("_a_collector_op", "num_gemms"), ("_b_collector_op", "mma_size_m")):
+            for n in (1, 2, 3):
+                consts = dict(mma_size_m=1, num_gemms=1, num_a_operands=1, b_collector_ok=True)
+                consts[n_key] = n
+                fns = _load_collector_helpers(path, consts)
+                if name not in fns:
+                    continue
+                chain = [fns[name](i) for i in range(n)]
+                if all(c is None for c in chain):
+                    continue
+                seen += 1
+                assert chain[0] == "FILL", f"{path.name}:{name} chain of {n} starts with {chain[0]}"
+                assert chain[-1] == "LASTUSE", f"{path.name}:{name} chain of {n} ends with {chain[-1]}"
+                assert all(c == "USE" for c in chain[1:-1]), f"{path.name}:{name} middle of {chain} is not USE"
+    assert seen, "no collector chain was exercised"
+
+
+def test_the_guarded_wrappers_keep_the_kwarg_off_the_default_branch():
+    """...and the wrappers themselves only name it under the flag. Pinned as
+    source structure because the failure mode is a TypeError at trace time on a
+    DSL we cannot install here, so no runtime assertion can see it."""
+    import ast
+    import inspect
+
+    import cudnn.gemm.frost.tile_helpers as helpers
+
+    for fn_name, kwarg in _VERSION_GATED_KWARGS.items():
+        fn = getattr(helpers, fn_name)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == "nvvm"
+        ]
+        assert len(calls) == 2, f"{fn_name} should have exactly one guarded and one plain nvvm call, got {len(calls)}"
+        named = [c for c in calls if any(k.arg == kwarg for k in c.keywords)]
+        assert len(named) == 1, f"{fn_name}: exactly one branch may name {kwarg!r}, got {len(named)}"
+        # ...and the other branch must be reachable without the newer DSL.
+        assert len(calls) - len(named) == 1, f"{fn_name}: no branch left that omits {kwarg!r}"
+
+
+# =============================================================================
+# sm120 (consumer Blackwell, warp-scoped MMA) — the family's own wiring. The
+# e2e behaviour rides the config lists above like any other geometry; what is
+# sm120-SPECIFIC is the registry/config plumbing and the v1 scope contract.
+# =============================================================================
+
+
+def test_sm120_registry_wiring() -> None:
+    """The sm120 template is registered with its own family, class and gates."""
+    from cudnn.gemm.frost.kernel_registry import (
+        MMA_TYPE_SUPPORT,
+        TEMPLATES,
+        GraphType,
+        Sm120KernelTemplate,
+    )
+
+    # SM 12.x is in the family's active range (whatever else the range covers).
+    assert any(lo <= 120 < hi for lo, hi in PIPELINE_ARCH_RANGES["sm120"])
+
+    (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MATMUL]
+    assert tmpl.file == "sm120_matmul.py"
+    assert isinstance(tmpl, Sm120KernelTemplate)
+    # Warp-scoped MMA: 1-CTA only, no multi-GEMM (no per-GEMM operand indexing).
+    assert not tmpl.supports_multi_gemm
+    assert tmpl.graph_type is GraphType.MATMUL and not tmpl.supports_mainloop_fusion
+
+    # dtype support mirrors the sm100 matmul pipeline (incl. int8 and fp8 mixes)
+    assert ("bf16", "bf16", "fp32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
+    assert ("int8", "int8", "int32") in MMA_TYPE_SUPPORT["sm120"][GraphType.MATMUL]
+
+    # the template file itself ships with the package -- in the sm120 tree,
+    # whichever family's compiler this process runs
+    assert tmpl.path.is_file() and tmpl.path.parent == template_dir("sm120")
+
+
+def test_sm120_tile_config_family() -> None:
+    """ConfigSm120: the geometry axes (CTA tile, K width, warp grid) are real,
+    swept, VALIDATED choices; only the family facts are enforced (16x16x32B
+    warp-MMA pair, no CGA, no warp-level K split, block >= compute grid + 2).
+    The warp grid is ALWAYS named via a ``_warpsMxN`` suffix -- an unsuffixed
+    spelling implies nothing and is rejected."""
+    from cudnn.gemm.frost.tile_config import as_pipeline
+
+    sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
+    assert len(sm120) > 100  # the swept family
+    assert all(isinstance(c, ConfigSm120) for c in sm120)
+    assert len({c.name for c in sm120}) == len(sm120)  # names stay unique
+
+    # The default-grid flagship keeps its historical name and geometry.
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    assert (cfg.cta_tile_m, cfg.cta_tile_n, cfg.cta_tile_k_bytes) == (128, 128, 128)
+    assert (cfg.warp_tile_m, cfg.warp_tile_n, cfg.warp_tile_k_bytes) == (32, 64, 128)
+    assert (cfg.mma_tile_m, cfg.mma_tile_n, cfg.mma_tile_k_bytes) == (16, 16, 32)
+    assert cfg.mma_size_m == 2  # == the template's _M_FRAGS
+    assert cfg.cga_size_mn == (1, 1) and cfg.warps_per_cta == 12 and cfg.threads_per_cta == 384
+    # The CTA pair is not an axis here at all -- reading it is an error, not a 1.
+    assert not hasattr(cfg, "cta_group")
+    assert _resolve(cfg.name) is cfg
+
+    # A non-default warp grid is a REAL axis: named, resolvable, and the fields
+    # actually carry the passed geometry.
+    g81 = by_name("CONFIG_sm120_256x128x128_16x16x32_cluster1x1_warps8x1")
+    assert (g81.warp_tile_m, g81.warp_tile_n) == (32, 128)
+    assert (g81.mma_size_m, g81.mma_size_n) == (2, 8)
+    assert (g81.mma_tile_m, g81.mma_tile_n, g81.mma_tile_k_bytes) == (16, 16, 32)
+    assert by_name(g81.name) is g81 and g81.name.endswith("_warps8x1")
+
+    # The grid is NEVER implied: an unsuffixed sm120 spelling round-trips to
+    # its explicit `_warps1x1` reading and is rejected as non-canonical; family
+    # facts reject cleanly.
+    with pytest.raises(KeyError, match="round-trips"):
+        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1")
+    with pytest.raises(NotImplementedError, match="no CGA"):
+        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster2x1")
+    with pytest.raises(NotImplementedError):
+        by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps3x3")
+
+    # as_pipeline: an sm100 auto pick crosses over faithfully (CTA tile kept,
+    # family axes snapped). A tile the family cannot hold raises -- fine, since
+    # the only caller is the auto path and select_config never picks one.
+    conv = as_pipeline(by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"), "sm120")
+    assert isinstance(conv, ConfigSm120) and conv.cta_tile_mn == (128, 256)
+    assert conv.cga_size_mn == (1, 1) and (conv.mma_tile_m, conv.mma_tile_n) == (16, 16)
+    with pytest.raises(NotImplementedError):
+        as_pipeline(by_name("CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma"), "sm120")
+
+
+def test_sm120_template_routing() -> None:
+    """select_template routes on the CONFIG alone now that cta_group is geometry,
+    and sm120 has no such axis at all -- ConfigSm120 pins it, like its cluster."""
+    from cudnn.gemm.frost.kernel_registry import select_template
+    from cudnn.gemm.frost.tile_config import replace
+
+    chain = analyze(_build_graph(256, 256, 128, "bf16", "bf16"))
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    assert select_template(chain, cfg).file == "sm120_matmul.py"
+    # A 2-CTA sm120 config is not constructible: ConfigSm120 declares no
+    # cta_group field at all, so the mode is not an axis here rather than an
+    # axis the template declines. It still READS as 1 off the base class.
+    assert not hasattr(cfg, "cta_group")
+    with pytest.raises(TypeError, match="cta_group"):
+        replace(cfg, cta_group=2)
+    # sm100 configs keep routing to the sm100 family
+    cfg100 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    assert select_template(chain, cfg100).file == "sm100_matmul.py"
+
+
+def test_sm120_scope_gates() -> None:
+    """The scope contract rejects through the registry (never a template
+    AssertionError mid-render): all eight major combinations pass for both
+    16-bit inputs (b16 ldmatrix.trans) and 8-bit inputs (byte-granule
+    ldmatrix.m16n16.trans.b8), and an N-major output needs a pair-storable
+    epilogue chunk."""
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    tmpl = select_template(analyze(_build_graph(256, 256, 128, "bf16", "bf16")), cfg)
+
+    def scope_reject(in_dt="bf16", **graph_kw):
+        return tmpl._extra_reject(analyze(_build_graph(256, 256, 128, in_dt, "bf16", **graph_kw)), cfg)
+
+    # 16-bit and 8-bit inputs: every major combination is in scope.
+    for in_dt in ("bf16", "fp8_e4m3"):
+        for a_major in ("k", "m"):
+            for b_major in ("k", "n"):
+                for out_major in ("n", "m"):
+                    assert scope_reject(in_dt=in_dt, a_major=a_major, b_major=b_major, out_major=out_major) is None, (in_dt, a_major, b_major, out_major)
+    assert scope_reject(in_dt="fp8_e5m2", a_major="m", b_major="n") is None
+
+    # the funnel offers sm120 points for MN-major 16-bit AND 8-bit chains
+    from cudnn.gemm.frost.kernel_registry import candidates
+
+    for in_dt in ("bf16", "fp8_e4m3"):
+        nmaj = analyze(_build_graph(256, 256, 128, in_dt, "bf16", a_major="m", b_major="n"))
+        assert [t for t, _c in candidates(nmaj) if t.pipeline == "sm120"], in_dt
+
+
+def test_sm120_epi_vec_clamp_and_stg_only() -> None:
+    """sm120 always renders the transposed-STG epilogue, with the chunk capped
+    at the 8-element fragment row run; the sm100 derivation is untouched."""
+    from cudnn.gemm.frost.compiler import _use_tma_store_epi
+
+    chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16"))
+    for name in (
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+    ):
+        c = by_name(name)
+        v = _epi_vec_bytes(chain, c)
+        assert v == 16, name  # 8-element bf16 run (template: 8 % _STG_V == 0)
+        assert _use_tma_store_epi(chain, c) is False, name
+
+    # the sm100 chunk derivation and its TMA-store gate are untouched
+    cfg100 = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1")
+    v100 = _epi_vec_bytes(chain, cfg100)
+    assert v100 >= 16 and _use_tma_store_epi(chain, cfg100) is True
+
+    # 8B-aligned output rows (N=100 bf16) narrow the chunk to 4 elements
+    narrow = analyze(_build_graph(256, 100, 256, "bf16", "bf16"))
+    assert _epi_vec_bytes(narrow, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")) == 8
+
+
+@pytest.mark.parametrize(
+    "a_major,b_major,out_major",
+    [(a, b, o) for a in ("k", "m") for b in ("k", "n") for o in ("n", "m")],
+    ids=[f"A{a}_B{b}_C{o}" for a in ("k", "m") for b in ("k", "n") for o in ("n", "m")],
+)
+def test_sm120_all_major_combos(a_major: str, b_major: str, out_major: str) -> None:
+    """All eight A/B/output major combinations through the sm120 template on one
+    tail-heavy shape. The layout sweeps cover five of the eight; this pins the
+    three (MN-major input x M-major output) crosses they miss."""
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    M, N, K = 192, 192, 160
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major, b_major, out_major)
+    if not ok:
+        pytest.skip(reason)
+    compiled = _plan(_build_graph(M, N, K, "bf16", "bf16", a_major, b_major, out_major), config=cfg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major, b_major=b_major, out_major=out_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    ref = _reference(a, b, "bf16")
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance("bf16", "bf16")
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  layout:    A{a_major}/B{b_major}/C{out_major}"
+        f"\n  shape:     {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps1x8",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps8x1",
+        "CONFIG_sm120_256x128x64_16x16x32_cluster1x1_warps8x1",
+        "CONFIG_sm120_64x256x128_16x16x32_cluster1x1_warps2x4",
+    ],
+    ids=lambda n: n.removeprefix("CONFIG_sm120_"),
+)
+@pytest.mark.parametrize("a_major", ["k", "m"], ids=["Ak", "Am"])
+def test_sm120_warp_grid_axis(config_name: str, a_major: str) -> None:
+    """The warp grid is a real geometry axis: every grid (and a non-flagship
+    CTA tile) computes the same matmul on a tail-heavy shape. The Am cases pin
+    the combinations the old per-MMA swizzle-slice rule wrongly rejected (an
+    M-major A on the 2x4 / 1x8 grids has no per-MMA descriptor on sm120)."""
+    cfg = _resolve(config_name)
+    M, N, K = 192, 192, 160
+    ok, reason = _compatible(cfg, M, N, K, "bf16", "bf16", a_major=a_major)
+    if not ok:
+        pytest.skip(reason)
+    compiled = _plan(_build_graph(M, N, K, "bf16", "bf16", a_major=a_major), config=cfg)
+    a, b, c = _mkdata(M, N, K, "bf16", "bf16", a_major=a_major)
+    compiled(_vp(compiled, a, b, c))
+    torch.cuda.synchronize()
+    ref = _reference(a, b, "bf16")
+    diff = (c.to(torch.float32) - ref.to(torch.float32)).abs()
+    tol = _tolerance("bf16", "bf16")
+    bad = int((diff > tol).sum().item())
+    assert bad == 0, (
+        f"\n  config:    {config_name} A-{a_major}-major"
+        f"\n  shape:     {M}x{N}x{K}"
+        f"\n  bad:       {bad}/{diff.numel()}"
+        f"\n  max|diff|: {float(diff.max().item()):.4g}  (tol={tol})"
+    )
+
+
+def test_sm120_render_smoke() -> None:
+    """Render the sm120 template end-to-end (real tile constants + epilogue
+    snippets) on whatever GPU is active — no cute.compile, and through the
+    sm120 tree's compiler by name (the facade is the active GPU's tree), so this
+    covers the sm100 CI too. The source must be marker-free, parseable, and
+    carry the STG-only sm120 contract constants."""
+    from cudnn.gemm.frost.sm120.compiler import _render_template
+    from cudnn.gemm.frost.sm120.epilogue_codegen import generate
+
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    for a_major in ("k", "m"):
+        for b_major in ("k", "n"):
+            for out_major in ("n", "m"):
+                chain = analyze(_build_graph(384, 768, 384, "bf16", "bf16", a_major=a_major, b_major=b_major, out_major=out_major))
+                vec = _epi_vec_bytes(chain, cfg)
+                snippets = generate(chain, vec_bytes_epi=vec, output_elem_bytes=2)  # empty tma_slots == STG everywhere
+                src = _render_template(chain, snippets, cfg)
+                combo = (a_major, b_major, out_major)
+                assert "@@" not in src, f"leftover injection markers {combo}"
+                ast.parse(src)
+                assert "frost_sm120_matmul_" in src
+                assert "threads_per_cta = 384" in src
+                assert f"vec_bytes_epi = {vec}" in src
+                assert "_STG_EPI_BYTES" in src, "transposed-STG arm must be rendered"
+                assert "tma_c_desc" not in src, "TMA-store arm must be stripped"
+                assert f"a_is_m_major = {a_major == 'm'}" in src, combo
+                assert f"b_is_n_major = {b_major == 'n'}" in src, combo
+
+
+# ---------------------------------------------------------------------------
+# Two-kernel split-K
+# ---------------------------------------------------------------------------
+
+
+def _splitk_graph(B, M, N, K, io_dt=cudnn.data_type.BFLOAT16, out_dt=cudnn.data_type.BFLOAT16, dynamic=False):
+    g = cudnn.pygraph(
+        io_data_type=io_dt, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_dynamic_shape_enabled=dynamic
+    )
+    A = g.tensor(name="A", dim=[B, M, K], stride=[M * K, K, 1])
+    Bt = g.tensor(name="B", dim=[B, K, N], stride=[K * N, 1, K])
+    C = g.matmul(name="mm", A=A, B=Bt)
+    C.set_output(True).set_data_type(out_dt)
+    return g, A, Bt, C
+
+
+def _splitk_fused_graph(K):
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, 256, K], stride=[256 * K, K, 1])
+    Bt = g.tensor(name="B", dim=[1, K, 256], stride=[K * 256, 1, K])
+    Bias = g.tensor(name="bias", dim=[1, 1, 256], stride=[256, 256, 1])
+    out = g.add(name="add", a=g.matmul(name="mm", A=A, B=Bt), b=Bias)
+    out.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    return g
+
+
+_SM120_SPLITK_CFG = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"
+_SPLITK_EPI_CFG = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+
+
+def _splitk_cfg(sm100_name=None):
+    """sm120 runs every split-K test on one config; sm100 keeps its per-test pick."""
+    from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG
+
+    if _current_arch() == 120:
+        return by_name(_SM120_SPLITK_CFG)
+    return by_name(sm100_name) if sm100_name else DEFAULT_CONFIG
+
+
+def _jit_splitk(g, S, base_cfg=None):
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
+
+    return jit_from_cudnn_graph(g, replace(base_cfg or _splitk_cfg(), split_k_slices=S))
+
+
+def _run_splitk(compiled, vp):
+    from cudnn.frost.workspace import Workspace
+
+    ws = None
+    if compiled.workspace_bytes:
+        buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+        ws = Workspace(buf, compiled.workspace_bytes, "test_splitk")
+    compiled(vp, workspace=ws)
+    torch.cuda.synchronize()
+
+
+def _splitk_data(B, M, N, K, torch_in=torch.bfloat16, torch_out=torch.bfloat16):
+    torch.manual_seed(0)
+    a = torch.empty(B, M, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch_in, device="cuda")
+    b = torch.empty(B, N, K, dtype=torch.int32).random_(-2, 2).to(dtype=torch_in, device="cuda")
+    c = torch.zeros(B, M, N, dtype=torch_out, device="cuda")
+    ref = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch_out)
+    return a, b, c, ref
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "B,M,N,K,normal",
+    [
+        (1, 128, 128, 1024, False),
+        (1, 128, 4096, 8192, False),
+        (1, 256, 256, 16384, False),
+        (3, 96, 160, 4096, True),
+        (1, 192, 160, 2112, True),
+        (1, 129, 96, 8192, True),
+    ],
+)
+def test_joint_strategy_selected_config_executes(B, M, N, K, normal):
+    """Numerics only: replay B200-profile choices on the active tcgen05 GPU."""
+    from cudnn.gemm.frost.compiler import _auto_split_k, jit_from_cudnn_graph, probe_chain
+    from cudnn.gemm.frost.planning import DeviceProperties, select_strategy
+    from cudnn.gemm.frost.tile_config import select_config
+
+    graph, A, Bt, C = _splitk_graph(B, M, N, K)
+    chain = analyze(graph)
+    baseline = _auto_split_k(chain, select_config(M, N, 1, K=K, sm_count=148), sm_count=148)
+    config = select_strategy(chain, baseline, device=DeviceProperties(100, "NVIDIA B200", 148, 132644864), probe=probe_chain)
+    if (M, N, K) == (128, 128, 1024):
+        assert config.split_k_slices == 1
+    elif (M, N, K) == (128, 4096, 8192):
+        assert config.cta_tile_m == config.cta_tile_n == 128 and config.split_k_slices == 4
+    elif (M, N, K) == (256, 256, 16384):
+        assert config.split_k_slices > 4 and config.split_k_slices & (config.split_k_slices - 1)
+    compiled = jit_from_cudnn_graph(graph, config=config)
+    if normal:
+        torch.manual_seed(917)
+        a = torch.randn(B, M, K, dtype=torch.bfloat16, device="cuda") * 0.25
+        b = torch.randn(B, N, K, dtype=torch.bfloat16, device="cuda") * 0.25
+        out = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
+        reference = torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16)
+    else:
+        a, b, out, reference = _splitk_data(B, M, N, K)
+    out.fill_(float("nan"))
+    _run_splitk(compiled, {A: a, Bt: b, C: out})
+    torch.testing.assert_close(out, reference, rtol=0.01 if normal else 0, atol=0.005 if normal else 0)
+
+
+# Shapes cover what split-K changes: K tails, M tails, batch.
+_SPLITK_SHAPES = (
+    (1, 256, 256, 4096),
+    (1, 256, 256, 4160),
+    (1, 300, 256, 4096),
+    (3, 256, 512, 4096),
+)
+
+
+@pytest.mark.parametrize("S", (2, 3, 8))
+@pytest.mark.parametrize("shape", _SPLITK_SHAPES, ids=lambda s: "x".join(map(str, s)))
+def test_splitk_parity(shape, S):
+    # shape x S interact (which slice owns the K tail depends on S); the store
+    # dtype does not, so it is swept separately in test_splitk_output_dtypes.
+    B, M, N, K = shape
+    g, A, Bt, C = _splitk_graph(B, M, N, K)
+    compiled = _jit_splitk(g, S)
+    a, b, c, ref = _splitk_data(B, M, N, K)
+    _run_splitk(compiled, {A: a, Bt: b, C: c})
+    assert torch.equal(c, ref), f"{(c != ref).sum().item()}/{c.numel()} elements differ"
+
+
+@pytest.mark.parametrize(
+    ("io_dt", "out_dt", "torch_in", "torch_out"),
+    (
+        (cudnn.data_type.HALF, cudnn.data_type.HALF, torch.float16, torch.float16),
+        (cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT, torch.bfloat16, torch.float32),
+    ),
+    ids=("fp16", "bf16_to_fp32"),
+)
+def test_splitk_output_dtypes(io_dt, out_dt, torch_in, torch_out):
+    # The reducer's store cast is the only dtype-sensitive step; one K-tail shape suffices.
+    g, A, Bt, C = _splitk_graph(1, 256, 256, 4160, io_dt, out_dt)
+    compiled = _jit_splitk(g, 3)
+    a, b, c, ref = _splitk_data(1, 256, 256, 4160, torch_in, torch_out)
+    _run_splitk(compiled, {A: a, Bt: b, C: c})
+    assert torch.equal(c, ref)
+
+
+@pytest.mark.parametrize("N", (250, 255), ids=("Nmod4", "Nodd"))
+def test_splitk_n_not_multiple_of_4(N):
+    # splitk_reduce_elems clamps to divide N (2 for 250, 1 for 255), so reducer
+    # groups never cross a workspace row. The output store may narrow further
+    # to a byte or halfword according to its own dtype and layout alignment.
+    if N % 2 and _current_arch() == 120:
+        pytest.skip("the sm120 template stores whole (n, n+1) accumulator pairs; odd N is rejected")
+    g, A, Bt, C = _splitk_graph(1, 256, N, 4096, out_dt=cudnn.data_type.FLOAT)
+    compiled = _jit_splitk(g, 8)
+    a, b, c, ref = _splitk_data(1, 256, N, 4096, torch_out=torch.float32)
+    _run_splitk(compiled, {A: a, Bt: b, C: c})
+    assert torch.equal(c, ref)
+
+
+@requires_sm100
+def test_splitk_cta_group1():
+    g, A, Bt, C = _splitk_graph(1, 256, 256, 4096)
+    compiled = _jit_splitk(g, 4, base_cfg=by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+    assert compiled.store_modes == ("stg",)
+    assert compiled.use_tma_store
+    a, b, c, ref = _splitk_data(1, 256, 256, 4096)
+    _run_splitk(compiled, {A: a, Bt: b, C: c})
+    assert torch.equal(c, ref)
+
+
+@requires_sm100
+def test_splitk_narrow_epi_row():
+    g, A, Bt, C = _splitk_graph(1, 256, 256, 3840)
+    compiled = _jit_splitk(g, 8, base_cfg=by_name("CONFIG_sm100_64x32x128_64x32x32_cluster2x4_2ctamma"))
+    a, b, c, ref = _splitk_data(1, 256, 256, 3840)
+    _run_splitk(compiled, {A: a, Bt: b, C: c})
+    assert torch.equal(c, ref)
+
+
+def test_splitk_deterministic():
+    g, A, Bt, C = _splitk_graph(1, 256, 256, 4096)
+    compiled = _jit_splitk(g, 8)
+    a, b, c1, _ = _splitk_data(1, 256, 256, 4096)
+    c2 = torch.zeros_like(c1)
+    _run_splitk(compiled, {A: a, Bt: b, C: c1})
+    _run_splitk(compiled, {A: a, Bt: b, C: c2})
+    assert torch.equal(c1, c2)
+
+
+def test_splitk_workspace_size_and_missing_workspace():
+    B, M, N, K, S = 2, 256, 384, 4096, 4
+    g, A, Bt, C = _splitk_graph(B, M, N, K)
+    compiled = _jit_splitk(g, S)
+    assert compiled.workspace_bytes == -(-S * B * M * N * 4 // 128) * 128
+    a, b, c, _ = _splitk_data(B, M, N, K)
+    with pytest.raises(ValueError, match="needs a workspace"):
+        compiled({A: a, Bt: b, C: c})
+
+
+def test_splitk_more_slices_than_k_tiles():
+    # DEFAULT_CONFIG cta_tile_k = 64 bf16 elems -> K=128 has 2 tiles < S=4.
+    from cudnn.frost.workspace import Workspace
+
+    g, A, Bt, C = _splitk_graph(1, 256, 256, 128)
+    compiled = _jit_splitk(g, 4)
+    a, b, c, _ = _splitk_data(1, 256, 256, 128)
+    buf = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match=r"exceeds the .* K tile"):
+        compiled({A: a, Bt: b, C: c}, workspace=Workspace(buf, compiled.workspace_bytes, "t"))
+
+
+def test_splitk_rejects_more_than_32_slices():
+    # The reducer unrolls its accumulation at trace time; the gate bounds S.
+    g, *_ = _splitk_graph(1, 256, 256, 65536)
+    with pytest.raises(NotImplementedError, match="more than 32 slices"):
+        _jit_splitk(g, 64)
+
+
+def test_splitk_rejects_grid_z_overflow():
+    # Kernel 1's grid.z = batch * S; an explicit config must not bypass the limit.
+    g, *_ = _splitk_graph(40000, 32, 32, 4096)
+    with pytest.raises(NotImplementedError, match=r"grid\.z"):
+        _jit_splitk(g, 2)
+
+
+def _run_splitk_vs_dense(g, S, M, N, K, outs_fn, aux_fn=lambda p: []):
+    """Same graph built dense (S=1) and split (S): every output must match bit
+    for bit, since small-integer data keeps the partial sums exact."""
+    dense = _jit_splitk(g, 1, base_cfg=_splitk_cfg(_SPLITK_EPI_CFG))
+    split = _jit_splitk(g, S, base_cfg=_splitk_cfg(_SPLITK_EPI_CFG))
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    outs_d, outs_s = outs_fn(dense), outs_fn(split)
+    _run_splitk(dense, _vp(dense, a, b, outs_d, *aux_fn(dense)))
+    _run_splitk(split, _vp(split, a, b, outs_s, *aux_fn(split)))
+    assert not any(torch.isnan(o.float()).any() for o in outs_s), "split-K left cells unwritten"
+    assert all(torch.equal(x.float(), y.float()) for x, y in zip(outs_d, outs_s)), "split-K != dense"
+
+
+@pytest.mark.parametrize(
+    ("kind", "N", "S"),
+    (
+        ("row_aux", 256, 8),  # per-row aux prefetched before the ops
+        ("per_col_aux", 256, 8),  # aux vector loaded per chunk; partials via TMA store
+        ("two_taps", 250, 6),  # two dense outputs; N % 4 != 0 -> STG partials, 2-elem chunks
+    ),
+    ids=("row_aux", "per_col_aux", "two_taps_stg"),
+)
+def test_splitk_epilogue_fusion(kind, N, S):
+    """The graph's epilogue runs in kernel 2 on the reduced sum."""
+    if kind == "row_aux" and _current_arch() == 120:
+        pytest.skip("the dense sm120 template hoists per-row aux loads before `row` is defined (no S=1 reference)")
+    M, K = 256, 4096
+    _run_splitk_vs_dense(_straddle_graph(kind, M, N, K), S, M, N, K, lambda p: _straddle_outs(p, M, N), lambda p: _straddle_aux(p, M, N))
+
+
+def test_splitk_epilogue_m_major_output():
+    M, N, K = 256, 256, 4096
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    Y = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    Y.set_stride([M * N, 1, M])
+    Y.set_output(True)
+    _run_splitk_vs_dense(g, 8, M, N, K, lambda p: [torch.full((1, N, M), float("nan"), dtype=torch.bfloat16, device="cuda").transpose(1, 2)])
+
+
+def test_splitk_epilogue_reduction():
+    """relu + AMAX beside the dense output: the atomic runs in kernel 2."""
+    M, N, K = 256, 256, 4096
+    g = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    R.set_output(True)
+    amax = g.reduction(input=R, mode=cudnn.reduction_mode.AMAX, name="amax")
+    amax.set_dim([1, 1, 1]).set_stride([1, 1, 1])
+    amax.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = _jit_splitk(g, 8, base_cfg=_splitk_cfg(_SPLITK_EPI_CFG))
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    out = torch.empty(1, M, N, dtype=torch.bfloat16, device="cuda")
+    out_am = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
+    _run_splitk(compiled, _vp(compiled, a, b, [out, out_am]))
+    # The matmul output is bf16, so the chain (and the AMAX) sees the rounded value.
+    ref = torch.relu(torch.einsum("bmk,bnk->bmn", a.float(), b.float()).to(torch.bfloat16).float())
+    assert torch.equal(out, ref.to(torch.bfloat16))
+    assert out_am.flatten()[0] == ref.abs().amax()
+
+
+def test_splitk_auto_select():
+    """Pure-function checks of the auto-split heuristic (fixed sm_count so no
+    GPU work is issued)."""
+    from cudnn.gemm.frost.compiler import _auto_split_k
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG
+
+    def slices(g, sm=148):
+        chain, _ = analyze_with_binding(g)
+        return _auto_split_k(chain, DEFAULT_CONFIG, sm_count=sm).split_k_slices
+
+    # Latency-bound + deep K: one full wave (148 // 2 = 74) hits the S=32 cap
+    # (the reducer unrolls chained loads only up to S=32).
+    assert slices(_splitk_graph(1, 256, 256, 16384)[0]) == 32
+    # Compute-bound: grid already fills the GPU.
+    assert slices(_splitk_graph(1, 4096, 4096, 8192)[0]) == 1
+    # Shallow K: per-slice floor (2 CTA-K tiles of 64 bf16 elems) wins.
+    assert slices(_splitk_graph(1, 256, 256, 1024)[0]) == 8
+    # K below the 2048-byte enable threshold.
+    assert slices(_splitk_graph(1, 256, 256, 512)[0]) == 1
+    # grid.z cap: batch * S <= 65535.
+    assert 60000 * slices(_splitk_graph(60000, 128, 128, 65536)[0]) <= 65535
+    assert slices(_splitk_fused_graph(K=8192)) == 32
+    # A dynamic-shape graph never auto-splits: S is baked at compile, and a
+    # runtime K below S CTA-K tiles cannot be served without a rebuild.
+    from cudnn.gemm.frost.compiler import _graph_dynamic_shapes, plan_config
+    from cudnn.gemm.frost.graph_analyzer import analyze
+
+    g_dyn = _splitk_graph(1, 256, 256, 16384, dynamic=True)[0]
+    assert _graph_dynamic_shapes(g_dyn)
+    assert plan_config(analyze(g_dyn), dynamic_shapes=_graph_dynamic_shapes(g_dyn)).split_k_slices == 1
+
+
+def test_splitk_config_name_round_trip():
+    cfg = by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_splitK4")
+    assert cfg.split_k_slices == 4
+    assert by_name(cfg.name) == cfg
+    assert by_name("CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma").split_k_slices == 1
+    sm120 = by_name(_SM120_SPLITK_CFG + "_splitK4")
+    assert sm120.split_k_slices == 4 and by_name(sm120.name) == sm120
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: scalar-reduction AVG counts and the split-K default.
+# --------------------------------------------------------------------------- #
+
+
+def _sm120_avg_graph(M, N, K, dims, mode=cudnn.reduction_mode.AVG):
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    Cc = g.matmul(A=A, B=B, name="mm")
+    Cc.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    R = g.reduction(input=Cc, mode=mode, name="red")
+    R.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    return g, A, B, Cc, R
+
+
+@requires_sm120
+@pytest.mark.parametrize("red", ["scalar", "per_row", "per_col"])
+def test_sm120_avg_reduction_counts_runtime_extents(red):
+    """AVG divides by the call-time M / N: one compiled plan serves any runtime
+    extent (the count was once the build shape's M * N, so a plan built at
+    256x256 averaged a 128x256 call to half its value)."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    dims_of = {"scalar": lambda m, n: (1, 1, 1), "per_row": lambda m, n: (1, m, 1), "per_col": lambda m, n: (1, 1, n)}[red]
+    K = 64
+    g, A, B, Cc, R = _sm120_avg_graph(256, 256, K, dims_of(256, 256))
+    compiled = C.jit_from_cudnn_graph(g, config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))
+    for m, n in ((256, 256), (128, 256), (384, 512)):
+        a = torch.randint(1, 4, (1, m, K), device="cuda").to(torch.bfloat16)
+        b = torch.randint(1, 4, (1, n, K), device="cuda").to(torch.bfloat16)
+        out = torch.empty(1, m, n, device="cuda")
+        dims = dims_of(m, n)
+        r = torch.empty(*dims, device="cuda")
+        compiled({A: a, B: b, Cc: out, R: r})
+        torch.cuda.synchronize()
+        mm = torch.einsum("bmk,bnk->bmn", a.double(), b.double())
+        ref = mm.mean(dim=tuple(i for i in range(3) if dims[i] == 1), keepdim=True)
+        torch.testing.assert_close(r.double(), ref, atol=0, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "mode,unsplit",
+    [
+        (cudnn.reduction_mode.AVG, True),
+        (cudnn.reduction_mode.ADD, True),
+        (cudnn.reduction_mode.NORM2, True),
+        (cudnn.reduction_mode.AMAX, False),
+        (cudnn.reduction_mode.MAX, False),
+    ],
+)
+def test_sm120_auto_split_k_keeps_additive_scalar_reductions_unsplit(mode, unsplit):
+    """A tile-invariant fp32 sum stays unsplit by default: the split-K reducer
+    folds it with one atomic per epilogue vector (AVG 2.8% off at
+    3000x3000x1024 split 2), where the unsplit kernel folds a register partial.
+    Modes exact under atomics keep the split's mainloop gain."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    slices = C._auto_split_k(analyze(_sm120_avg_graph(768, 640, 16384, (1, 1, 1), mode)[0]), cfg, sm_count=188).split_k_slices
+    assert (slices == 1) == unsplit

@@ -169,6 +169,22 @@ _STG_EPI_WARP_ELEMS = _STG_EPI_GROUP_FRAGS * _STG_EPI_BATCH_STRIDE  # 528
 _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
+# Row-per-lane drain (block-scale quantize chains; the row_per_lane_drain tile
+# constant picks it over the lane-run drain). A 32-row slab is two 16-row m-fragments staged
+# in two sub-passes; a warp tile of one 16-row fragment gives a 16-row slab
+# owned by lanes 0..15.
+_RPL_SUBPASSES = 2 if _M_FRAGS % 2 == 0 else 1
+_RPL_SLABS = _M_FRAGS // _RPL_SUBPASSES
+
+
+def _rpl_swz(r):
+    """XOR key of the 16-byte granules of row-major staging row ``r``: keeps
+    the drain's STS.64 writes and LDS.128 reads of a 16x32 fp32 tile at the
+    two-words-per-bank minimum (an unswizzled tile hits eight)."""
+    rr = r % 8
+    return ((rr & 3) << 1) | (rr >> 2)
+
+
 # One AB stage = packed A + packed B + both SF boxes. The injected ab_stages
 # already has the STG staging taken off the budget in bytes, so it is used as is.
 assert ab_stages >= 1, f"{__name__}: the renderer emitted an empty AB ring"
@@ -789,6 +805,13 @@ def _kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = sched_full_phase ^ 1
 
+        # Tile-invariant (scalar) reductions fold every epilogue vector into one
+        # register slot per thread; the red_part_* helpers, rendered with the tile
+        # constants (empty when the chain has none), seed the slots here and flush
+        # them -- one warp shuffle and one atomic per warp -- after each tile's
+        # drain and after the tile loop, where all 32 lanes are converged.
+        _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
+        red_part_seed(_red_part)
         while is_valid != 0:
             coord_m_local = tile_m * cgrp_tile_mnk[0]
             coord_m = group_begin + coord_m_local
@@ -946,51 +969,112 @@ def _kernel(
             # @@INJECT_AUX_VIEWS@@
 
             _stg_stage = smem_stg_epi.subview(warp_idx * _STG_EPI_WARP_ELEMS)
-            for mf in cutlass.range_constexpr(_M_FRAGS):
-                for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
-                    _nf0 = grp * _STG_EPI_GROUP_FRAGS
-                    _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
-                    # -- STS_128: reg-index-order dump, one batch per fragment --
-                    for b in cutlass.range_constexpr(_grp_frags):
-                        _o = (mf * _N_FRAGS + _nf0 + b) * 4
-                        _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
-                        (_stg_stage.data_ptr() + _s_off).store(acc[_o:4], alignment=16)
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
-                    # -- LDS: 16 contiguous elems = both row-halves of one frag --
-                    _seg = (_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16)
-                    # Short tail group: trailing lanes own no fragment there
-                    # (True at trace time for full groups -- no guard emitted).
-                    _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
-                    if _lane_active:
-                        for half in cutlass.range_constexpr(2):
-                            row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
+            if cutlass.const_expr(not row_per_lane_drain):
+                for mf in cutlass.range_constexpr(_M_FRAGS):
+                    for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
+                        _nf0 = grp * _STG_EPI_GROUP_FRAGS
+                        _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
+                        # -- STS_128: reg-index-order dump, one batch per fragment --
+                        for b in cutlass.range_constexpr(_grp_frags):
+                            _o = (mf * _N_FRAGS + _nf0 + b) * 4
+                            _s_off = b * _STG_EPI_BATCH_STRIDE + lane * _STG_EPI_LANE_QUAD
+                            (_stg_stage.data_ptr() + _s_off).store(acc[_o:4], alignment=16)
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
+                        # -- LDS: 16 contiguous elems = both row-halves of one frag --
+                        _seg = (_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16)
+                        # Short tail group: trailing lanes own no fragment there
+                        # (True at trace time for full groups -- no guard emitted).
+                        _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
+                        if _lane_active:
+                            for half in cutlass.range_constexpr(2):
+                                row_in_cta = warp_row * _WARP_TILE_M + mf * 16 + half * 8 + lane_div4
+                                row = coord_m + row_in_cta
+                                # The ragged tail of a group: rows at or past group_end
+                                # hold the next group's tokens (or zero-fill) scaled by
+                                # padding SF words, and are not this expert's output.
+                                if row < group_end:
+                                    _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
+                                    for sj in cutlass.range_constexpr(4):
+                                        _row[2 * sj] = _seg[4 * sj + 2 * half]
+                                        _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
+                                    for sv in cutlass.range_constexpr(8 // _STG_V):
+                                        col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
+                                        col_j = col
+                                        if col_j + vsize <= N:
+                                            # NB: Array slices are [start:COUNT], not
+                                            # [start:stop] (matches acc[_o:2] above).
+                                            _vec = _row[sv * _STG_V : _STG_V]
+                                            if cutlass.const_expr(acc_widen_to_fp32):
+                                                _pf = _vec.to(cutlass.Float32)
+                                                vec_f32 = _pf + cutlass.full_like(_pf, 0.0)
+                                            else:
+                                                vec_f32 = _vec
+                                            # Every store carries its own output's offset: no template-level
+                                            # linear_idx, so a reduction-only chain (no output 0) renders.
+
+                                            # @@INJECT_STG_VEC_BINDINGS@@
+
+                                            # @@INJECT_EPILOGUE@@
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
+            else:
+                # Row-per-lane drain: re-read the warp's accumulators row-major through the
+                # warp-private staging buffer so lane l owns row l of a 32-row slab (lanes
+                # 0..15 of a 16-row slab when the warp tile is one m-fragment) and a
+                # contiguous run of the slab's 32-column group -- the sm100 TMEM-drain view
+                # (thread = row, warp = 32 consecutive rows) the block-quantize emitters are
+                # written for. Each 16x32 sub-pass uses 512 of the warp's 528 staging floats.
+                for slab in cutlass.range_constexpr(_RPL_SLABS):
+                    for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
+                        _nf0 = grp * _STG_EPI_GROUP_FRAGS
+                        _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
+                        _run = cutlass.Array(mma_c_dtype, 32, alignment=16)
+                        if True:
+                            for _sp in cutlass.range_constexpr(_RPL_SUBPASSES):
+                                _mf = slab * _RPL_SUBPASSES + _sp
+                                # STS.64: regs (0,1) are row lane//4, regs (2,3) row lane//4 + 8,
+                                # columns 8b + 2*(lane%4) of n-fragment b.
+                                for b in cutlass.range_constexpr(_grp_frags):
+                                    for _hr in cutlass.range_constexpr(2):
+                                        _rr = lane_div4 + 8 * _hr
+                                        _off = _rr * 32 + ((2 * b + lane_mod4 // 2) ^ _rpl_swz(_rr)) * 4 + (lane_mod4 % 2) * 2
+                                        _o = (_mf * _N_FRAGS + _nf0 + b) * 4 + 2 * _hr
+                                        (_stg_stage.data_ptr() + _off).store(acc[_o:2], alignment=8)
+                                nvvm.bar_warp_sync(0xFFFFFFFF)
+                                # LDS.128: lanes 16*_sp .. 16*_sp + 15 take this fragment's rows.
+                                if lane // 16 == _sp:
+                                    _r = lane % 16
+                                    for _j in cutlass.range_constexpr(2 * _grp_frags):
+                                        _run[_j * 4 : 4] = (_stg_stage.data_ptr() + _r * 32 + (_j ^ _rpl_swz(_r)) * 4).load(alignment=16, count=4)
+                                nvvm.bar_warp_sync(0xFFFFFFFF)  # the next sub-pass reuses the buffer
+                        # Lanes 16..31 own no row when the slab is a single 16-row fragment.
+                        _rows_owned = True if _RPL_SUBPASSES == 2 else lane < 16
+                        if _rows_owned:
+                            row_in_cta = warp_row * _WARP_TILE_M + slab * (16 * _RPL_SUBPASSES) + lane
                             row = coord_m + row_in_cta
-                            # The ragged tail of a group: rows at or past group_end
-                            # hold the next group's tokens (or zero-fill) scaled by
-                            # padding SF words, and are not this expert's output.
-                            if row < group_end:
-                                _row = cutlass.Array(mma_c_dtype, 8, alignment=16)
-                                for sj in cutlass.range_constexpr(4):
-                                    _row[2 * sj] = _seg[4 * sj + 2 * half]
-                                    _row[2 * sj + 1] = _seg[4 * sj + 2 * half + 1]
-                                for sv in cutlass.range_constexpr(8 // _STG_V):
-                                    col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
+                            # A col quant reduces a block's amax across the lanes of a
+                            # (half-)warp, so under rpl_bounded_rows every lane reaches it:
+                            # the guard is always taken and each store carries
+                            # row < group_end itself (generate(..., bounded_rows=True)).
+                            if cutlass.const_expr(rpl_bounded_rows):
+                                _row_live = True
+                            else:
+                                _row_live = row < group_end
+                            if _row_live:
+                                for _jv in cutlass.range_constexpr((_grp_frags * 8) // vsize):
+                                    col = coord_n + warp_col * _WARP_TILE_N + _nf0 * 8 + _jv * vsize
                                     col_j = col
                                     if col_j + vsize <= N:
-                                        # NB: Array slices are [start:COUNT], not
-                                        # [start:stop] (matches acc[_o:2] above).
-                                        _vec = _row[sv * _STG_V : _STG_V]
+                                        _vec = _run[_jv * vsize : vsize]
                                         if cutlass.const_expr(acc_widen_to_fp32):
                                             _pf = _vec.to(cutlass.Float32)
                                             vec_f32 = _pf + cutlass.full_like(_pf, 0.0)
                                         else:
                                             vec_f32 = _vec
-                                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
 
                                         # @@INJECT_STG_VEC_BINDINGS@@
 
                                         # @@INJECT_EPILOGUE@@
-                    nvvm.bar_warp_sync(0xFFFFFFFF)
+            red_part_flush_tile(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
 
             # Next record.
             while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
@@ -1011,6 +1095,7 @@ def _kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = sched_full_phase ^ 1
 
+        red_part_flush_cta(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
         # No more tiles for this CTA: all its global A/B reads have been issued.
         if cutlass.const_expr(USE_PDL):
             if warp_idx == 0:

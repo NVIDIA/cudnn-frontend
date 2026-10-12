@@ -667,6 +667,13 @@ def _kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
+        # Tile-invariant (scalar) reductions fold every epilogue vector into one
+        # register slot per thread; the red_part_* helpers, rendered with the tile
+        # constants (empty when the chain has none), seed the slots here and flush
+        # them -- one warp shuffle and one atomic per warp -- after each tile's
+        # drain and after the tile loop, where all 32 lanes are converged.
+        _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
+        red_part_seed(_red_part)
         while is_valid != 0:
             coord_m = tile_m * cgrp_tile_mnk[0]
             coord_n = tile_n * cgrp_tile_mnk[1]
@@ -891,12 +898,14 @@ def _kernel(
                                             vec_f32 = _pf + cutlass.full_like(_pf, 0.0)
                                         else:
                                             vec_f32 = _vec
-                                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                                        # Every store carries its own output's offset: no template-level
+                                        # linear_idx, so a reduction-only chain (no output 0) renders.
 
                                         # @@INJECT_STG_VEC_BINDINGS@@
 
                                         # @@INJECT_EPILOGUE@@
                     nvvm.bar_warp_sync(0xFFFFFFFF)
+            red_part_flush_tile(_red_part, lane, M, N, (tile_l,), _red_part_args)
 
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
@@ -918,6 +927,7 @@ def _kernel(
 
             tile_iter += 1
 
+        red_part_flush_cta(_red_part, lane, M, N, (tile_l,), _red_part_args)
         # No more tiles for this CTA: all its global A/B reads have been issued
         # (fort fires launch_dependent_grids at the same point).
         # Dense only: an early-launched reducer would pile its many small CTAs
