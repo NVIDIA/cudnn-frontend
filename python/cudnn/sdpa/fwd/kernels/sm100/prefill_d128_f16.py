@@ -1995,7 +1995,7 @@ def _softmax_warp_group(
     # Phase trackers persist across tile boundaries (barriers don't reset).
     bmm1_phase = cutlass.Int32(0)
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
-    # init phase=1; both softmax wgs wait on slot [0] not [SoftmaxGid].
+    # init phase=1; each softmax wg waits its own O slot (see the top-of-tile wait).
     epilogue_state = cutlass.Int32(1)
 
     # total_sum kept as Vector[Float32, 2] (even/odd partials) so per-iter update lowers to packed FMUL2 + FADD2.
@@ -2032,9 +2032,14 @@ def _softmax_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        # Top-of-tile mb_o_empty[0] wait: without it softmax can race into the
+        # Top-of-tile mb_o_empty wait: without it softmax can race into the
         # next tile while TMA-STG is still draining the prior tile's O slot.
-        bars.mb_o_empty[0].wait(epilogue_state)
+        # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
+        # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
+        # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
+        # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
+        # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
+        bars.mb_o_empty[sub_tile_id].wait(epilogue_state)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF

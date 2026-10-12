@@ -126,8 +126,9 @@ different function; the indexer and the sparse core are not part of the block to
 
 ### Weights and tables
 
-- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V`; the block's tile alignment
-  is `QKVG_TILE_ALIGN = 64` columns. Build it ONCE at load time, never per call:
+- `W_qkvg [N, d_model]` with `N = (2*H_q + 2*H_kv) * D`, column blocks `Q | GATE | K | V` (a fifth block `INDEX` under a
+  block-sparse geometry's indexer band, below); the block's tile alignment is `QKVG_TILE_ALIGN = 64` columns. Build it ONCE
+  at load time, never per call:
   - **from a HF Qwen checkpoint** (Qwen3-Next, Qwen3.5, the Qwen3.8 family / Flash-Next) with the documented entry
     point, which also prepares the two QK-norm weights:
 
@@ -187,6 +188,48 @@ different function; the indexer and the sparse core are not part of the block to
     16 for `Fp4Format.NVFP4`, `float8_e8m0fnu` per 32 for `Fp4Format.MXFP4` (either as `uint8` or as that dtype),
     `sf_blob_bytes(d_model, H_q * D, block)` bytes in F8_128x4 order (padded to whole 128-row x 4-block atoms; pad
     bytes, if any, `0x00`).
+
+### Sparse attention (QSA) -- declaration, layout and loader; the sparse core is a typed decline
+
+`QsaSpec` (frozen dataclass; attached as `GatedAttentionBlockGeometry(qsa=...)`; `validate()` raises `ValueError`) declares
+block-sparse attention: every query attends to the keys of its SELECTED 4-token blocks and to the open tail block of its visible
+range, under the causal mask (Qwen Sparse Attention: a 2048-token budget at block size 4 = the defaults `block_size=4,
+top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a knob.
+
+| field | meaning |
+|---|---|
+| `block_size` (`4`) | tokens per selectable block; 4 only (one gather of four rows per block) |
+| `top_k` (`512`) | blocks per query in the caller's list: a multiple of 4 in `[4, 512]` (it sizes the kernel's index staging) |
+| `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer (not served yet) |
+| `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
+| `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band only and are unread by any kernel today |
+
+`QsaSpec.identity_bound` (`top_k * block_size + block_size - 1` = 2051 at the defaults) is the visible-token count up to which
+every query's complete blocks fit the list, so a full list reproduces dense causal attention exactly. `is_causal=False` or a
+sliding window together with `qsa` is a `ValueError` (the selection IS the sparsity).
+
+Served today:
+
+- the layout: `qkvg_blocks` / `qkvg_block_widths` / `qkvg_offsets` / `qkvg_heads` / `qkvg_head_dims` grow a fifth entry iff
+  `index_band` (at `d_model=2560, h_q=24, h_kv=2`: `N = 13312 + 640 = 13952`, offsets `0, 6144, 12288, 12800, 13312`; a
+  256-column tile plan is not defined there, a 64- or 128-column one is); a geometry without the band keeps exactly its four-band
+  tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
+- the loader: `qkvg_from_hf(..., index_qk_proj_weight=attn.index_qk_proj.weight)` and `build_fused_qkvg_weight(...,
+  index_qk_proj_weight=)` append the band (required iff declared, refused otherwise).
+- the UNFUSED projection writes the wider slab; `index_k_raw_view(proj_slab, geometry, B, S)` and
+  `GatedAttentionBlockFwd.index_k_raw(workspace)` expose the raw indexer key (the band's last `index_kv_heads * index_head_dim`
+  columns, pre-norm, un-rotated -- what a serving cache keeps) as a zero-copy `[B, S, index_kv_heads, index_head_dim]` view.
+- `execute(..., block_ids=, block_lens=)` (appended): `block_ids` `[T, top_k]` int32 (or `[B, S, top_k]`), per query the ids of its
+  selected complete blocks (block `b` = tokens `[4b, 4b + 4)` of its own sequence), the valid prefix then `-1`; `block_lens` `[T]`
+  int32 optional. Checked for form only (dtype, rank, shape, contiguity, device -- never read on the host; an int64 list is
+  refused, not converted); refused on a block declared without `qsa`.
+
+A typed decline today -- the sparse attention core has not landed: a block declared with `qsa` declines at `check_support`
+after its projection (with the band) and norm + RoPE stages accepted the geometry; and at declaration, naming the feature:
+`thd`, `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
+`fuse_gate`, `fuse_norm_rope` together with `index_band` (the fused projection renders 256-column tiles; 640 is not a whole
+number of them -- the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`,
+`index_source="indexer"`, `d_head != 256`.
 
 ### Forward
 
@@ -338,6 +381,36 @@ Quantization specs:
   zero-length) row quantizes to codes `0` exactly. The `O` codes are round-to-nearest-even on the e2m1 grid,
   saturating at 6.
 
+**Per-step recalibration -- `update_quant_scales`.** The scales of a `QuantSpec` / `MxQuantSpec` are plan-time constants, and a
+training step moves them: the weights change, so `descale_w_qkvg` / `descale_w_o` (and `descale_h`, the normed residual stream's)
+are recomputed from the tensors quantized this step, and a per-tensor fp8 recipe recalibrates `scale_q` / `scale_k` / `scale_v` /
+`scale_o` from a previous step's activation amax -- the block itself runs no amax pass, the caller computes them from the record it
+already holds. `GatedAttentionBlockFwd.update_quant_scales(spec, *, current_stream=None)` re-points a COMPILED block at a new spec
+without recompiling: an in-place write of the block's device scalars (the GEMM alphas, the quantize scales, the fp8 SDPA's descales,
+and the fully fused fp8 fork's scale vector) on the launch stream (`current_stream`, else torch's current stream), then
+`blk.quant = spec`; every consumer binds those tensors at `execute`, so the next execute on that stream runs at the new scales, and a
+CUDA graph that captured an execute of a warmed-up block replays with the live values -- unless the captured execute was the block's
+first: its one-time scalar write (one fill kernel per value; the first-execute write below) is captured with the capture-time values,
+so every replay re-writes them and overrides a later eager `update_quant_scales`; warm up with one eager execute on the capture stream
+before capturing (as every capture of the block does), or treat such a graph as pinned to the scales it captured and re-capture after
+a recalibration. `GatedAttentionBlockBwd.update_quant_scales(spec)` is the
+backward half: the plan-time constants the next execute's prologue launch stores from its kernel arguments are re-resolved on the
+host (no device write; a CUDA graph captured before the call keeps the old constants -- re-capture after a recalibration). Typed
+refusals, before any write: a block declared without `quant` (`ValueError`), a spec of the other class (`TypeError`), a differing
+plan fact -- `dtype`, `block_size`, `w_qkvg_dtype`, `o_fp4` -- (`ValueError` naming it: those select kernels and the carve), the
+spec class's own `validate` exactly as the declaration applied it (the fully fused MXFP8 path keeps `scale_o == 1.0`; a zero / inf /
+NaN scale is its `ValueError`), and a block not yet compiled (`RuntimeError`); under `o_fp4` there is nothing to write and the call
+validates and records it. The per-layer recipe of a training loop: one compiled block pair per dtype configuration,
+`fwd.update_quant_scales(spec_l)` right before layer `l`'s forward and `bwd.update_quant_scales(spec_l)` right before its backward
+(autograd runs the backward long after every layer's forward, so the step's spec travels with the layer), `spec_l`'s `descale_*`
+from the tensors quantized this step and its activation scales from the previous step's record of that layer. `compile()` only
+allocates those scalars; their values are written on the launch stream -- by the first `execute` of a compiled block and by every
+`update_quant_scales` -- never on the stream ambient at compile time, and every such write first waits on an event `compile()`
+records behind its allocations (under `torch.use_deterministic_algorithms(True)` an allocation itself fills with NaN on that
+stream), so a block compiled on one stream and recalibrated or first executed on another reads what its execution stream wrote,
+and nothing enqueued at compile time can land later and undo an update. Inside a CUDA-graph capture that wait is skipped: warm the
+block up with one eager execute before capturing (the rule below).
+
 #### Packed sequences (THD)
 
 `thd=True` runs the block over ONE packed token matrix holding `B` sequences back to back -- the layout a varlen caller
@@ -372,7 +445,9 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   token axis. A dense `[B, S, rope_dim]` table, or positions running across sequence boundaries, is a plausible-but-wrong
   RoPE after the first sequence.
 - **Declaration bounds** (typed `ValueError`): `num_sequences >= 1`, `2 <= max_seq_len <= T` (`S = 1` is decode, out of
-  the prefill bodies' scope) and `num_sequences * max_seq_len >= T` -- a smaller product would silently cap the SDPA
+  the prefill bodies' scope; on cc 10.7 the standalone SDPA forward serves decode-shaped `d = 256` graphs on its
+  decode tile -- `docs/operations/Attention.md`, "Paged attention" -- and the block's decode mode is a follow-up) and
+  `num_sequences * max_seq_len >= T` -- a smaller product would silently cap the SDPA
   chain's packed capacity below `T` (the tokens past it are not processed, with no message downstream). `seq_lens_present`
   is mutually exclusive with `thd` (there is no per-batch KV padding mask under THD); the three packing knobs on a dense
   block are refused.
@@ -389,13 +464,21 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   refused under `thd`). Both save modes serve.
 - **Served / declined.** Served: bf16 / fp16 (inference and training, in place and out of place), the per-tensor FP8
   unfused pipeline (`QuantSpec`; inference and training -- a packed FP8 training forward writes the same bf16 record at
-  `(1, T)` as the dense quantized training forward, with `saved.h` the e4m3 `h`, and the packed bf16 backward
-  differentiates it given the dequantized bf16 `h` and weights, exactly as on the dense side), `fuse_norm_rope` (bf16 /
-  fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined, typed:
-  `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
-  stage (5) runs as its own launch), MXFP8 and the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale
-  quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid), the fully fused quantized
-  pipelines.
+  `(1, T)` as the dense quantized training forward, with `saved.h` the e4m3 `h`; the packed per-tensor fp8 backward
+  (`quant=QuantSpec`) differentiates it as written, the packed bf16 backward given the dequantized bf16 `h` and weights,
+  exactly as on the dense side), the MXFP8 unfused
+  pipeline (`MxQuantSpec`, the fp4 modes `w_qkvg_dtype` / `o_fp4` included; inference and training, the same bf16 record
+  at `(1, T)`): its three `quantize_mxfp8` stages run their PACKED arm and write the Rubin d256 MXFP8 SDPA's
+  per-sequence-tile-padded scale-factor layout -- per head the tiles of every sequence in `cu_seqlens` order, V's two
+  D-planes adjacent inside a tile, the slot sized at the capacity `H * ((T + 127 * B) // 128) * 1024` bytes (the only
+  carve difference to the dense `B=1, S=T` block; slack tiles and pad bytes `0x00`), each tile's sequence resolved on
+  device from the lengths tensor (no cap on `B`; at `B = 1` the packed block is bitwise the dense one on its outputs, record and e4m3 payload, and V's scale-factor slot holds the dense atoms in plane-adjacent order); `fuse_norm_rope`
+  (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined,
+  typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor; stage (5) runs as its own launch), the fully
+  fused quantized pipelines (`fuse_gate` again, and the fused MXFP8 projection fork decodes `(b, s_tile)` once per
+  128-row GEMM tile, which a packed tile may straddle), the MXFP8 block BACKWARD over a packed record (its SDPA-layout MX
+  quantize stages run the quantizer's dense arm only; the packed record and the packed delta exist, the packed MXFP8
+  backward is a follow-up).
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
 
@@ -405,7 +488,7 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
 sample_sin, sample_w_o, geometry, *, recompute=RecomputePolicy.RECOMPUTE_QK_PRE, need_dh=True,
 need_dw_qkvg=True, need_dw_o=True, need_dw_norms=None, seq_lens_present=False, dw_norm_dtype=torch.float32,
 fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, num_sequences=None, max_seq_len=None, cu_seqlens=False,
-quant=None, grad_scaling="current")` is the
+quant=None, grad_scaling="current", grad_scale_margin_log2=0)` is the
 block backward: eight stages on ONE launch stream (the two
 weight-gradient GEMMs on a block-owned side stream under `fuse_wgrad_overlap`, joined back before `execute` returns), no
 allocation, against the forward's
@@ -428,14 +511,15 @@ bwd.execute(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, dh=dh, dw_qkvg
 
 `gated_attention_block_backward(dy, saved, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, geometry, *, seq_lens=None,
 recompute=..., current_stream=None, fuse_gate_bwd=False, fuse_wgrad_overlap=False, thd=False, max_seq_len=None, quant=None,
-grad_scaling="current", scale_dp=None, scale_dy=None, scale_do=None, scale_dqkvg=None)` allocates the gradients and the workspace on the launch stream (`current_stream`,
+grad_scaling="current", scale_dp=None, scale_dy=None, scale_do=None, scale_dqkvg=None, h_t=None, h_t_sf=None, w_qkvg_t=None,
+w_qkvg_t_sf=None, w_o_t=None, w_o_t_sf=None, grad_scale_margin_log2=0)` allocates the gradients and the workspace on the launch stream (`current_stream`,
 else torch's current stream -- the caching allocator orders a buffer's reuse only against the stream it was allocated on),
 caches the compiled block per declaration and returns `{"dh", "dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm"}`; which entries exist follows `requires_grad` on
 `saved.h` / `w_qkvg` / `w_o` / `w_q_norm` / `w_k_norm` (the tensors are handed to the block detached). Under `thd=True` it
 derives `num_sequences` and `cu_seqlens` from the record (`saved.seq_lens.numel()`, `saved.seq_lens_form`) and requires
 `max_seq_len` (a `ValueError` naming it alone otherwise); both, with `max_seq_len`, are part of its cache key. `quant` /
-`grad_scaling` (the quantized backward below) join the key too, and `scale_dp` / `scale_dy` / `scale_do` / `scale_dqkvg` pass
-through to `execute`; the gradients are allocated in `dy`'s dtype (bf16 under `quant`, where `saved.h` and the weights are e4m3 codes).
+`grad_scaling` (the quantized backward below) join the key too, and `scale_dp` / `scale_dy` / `scale_do` / `scale_dqkvg` and the
+transposed artifacts `h_t` / `h_t_sf` / `w_qkvg_t` / `w_qkvg_t_sf` / `w_o_t` / `w_o_t_sf` pass through to `execute`; the gradients are allocated in `dy`'s dtype (bf16 under `quant`, where `saved.h` and the weights are e4m3 codes).
 
 **Packed sequences (THD).** `GatedAttentionBlockBwd(..., thd=True, num_sequences=B, max_seq_len=S_max, cu_seqlens=False)` --
 the forward's four knobs, appended last -- differentiates the packed training record of the section above: `dy` is
@@ -551,7 +635,11 @@ setup is one launch; +3 when `S % 128 != 0`, the q-side staging pads, and +2 whe
 padded causal S such as 992 or 1000, 17 at S = 384; 17 before the SDPA backward merged its setup and fold launches, 24 before
 the launch fusion), counted by CUPTI in the quantized backward's own suite. Gradient scales (`grad_scaling`, a declaration attribute -- it moves
 the e4m3 rounding points, so it is never a knob): `"current"` derives every gradient's per-tensor scale ON DEVICE from its own
-amax pass in this step (`2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`, with `FP8_GRAD_SCALE_MARGIN_LOG2 = 0`);
+amax pass in this step (`2**(floor(log2(448 / amax)) - FP8_GRAD_SCALE_MARGIN_LOG2)`, with `FP8_GRAD_SCALE_MARGIN_LOG2 = 0`); the margin
+is the appended declaration attribute `grad_scale_margin_log2` (an int in `[0, 8]`, the module constant by default): a compile-time
+constant of EVERY gradient quantize -- `dY`, `dO`, `dQKVG` here, `dY` alone under `MxQuantSpec` -- so a non-default value is a
+different compiled block (never a knob, never a scalar slot), refused without `quant` and under `"delayed"` (the caller's scales
+carry their own headroom there); `quant_scalars()` publishes the scales that ran;
 `"delayed"` reads the previous step's `scale_dy` / `scale_do` / `scale_dqkvg` from `execute(...)` instead (each a 1-element fp32
 CUDA tensor, required there and refused under `"current"`) while the amax passes still publish this step's amax. The softmax
 scale `scale_s = 2**FP8_SCALE_S_LOG2` (`= 2**8`) is a module constant; `scale_dp` -- the fp8 SDPA backward's dP scale, cuDNN's
@@ -570,10 +658,13 @@ and the fp32 `dY` amax partials (one word per CTA of the prologue's amax job, at
 bf16 one). Determinism: the block's own kernels run no atomic (every gradient amax is a `max` over per-CTA partials); the one
 `atomicMax` left is the fp8 SDPA row's `amax_dP`, an int32 fold of non-negative fp32 bit patterns and therefore order-free -- so
 two executes are bitwise equal under every knob set (pinned by `test_fp8_two_runs_are_bitwise`). `fuse_gate_bwd` is accepted and
-inert under `quant`: the fused delta is mandatory there. `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after the slots and operands they read are written).
+inert under `quant`: the fused delta is mandatory there. `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after the slots and operands they read are written). Packed sequences
+(`thd=True`, the THD section below) are served over the packed per-tensor fp8 training record as written: every stage but the SDPA
+row is token-wise at `B = 1, S = T`, and the fp8 SDPA row runs its THD chain with the gate backward's delta as its external one --
+at `B = 1, S = T` that is the packed head-major `[1, H_q, ceil128(T)]` delta the packed chain reads -- so no `dot` pre-pass runs
+over the e4m3 payloads (one rounding of dO, the dense arm's delta contract).
 Declined (typed, naming the attribute): e5m2 codes, an fp16 `dy` (the quantized
-backward is bf16), a bf16 `saved.h` or bf16 weights with a `QuantSpec` and e4m3 codes without one (both ways), `thd=True` with
-`quant` -- dense-only for now, its packed arm a follow-up --, and a geometry whose Q / K
+backward is bf16), a bf16 `saved.h` or bf16 weights with a `QuantSpec` and e4m3 codes without one (both ways), and a geometry whose Q / K
 rebuild only the LDG norm + RoPE kernel can tile: the fused prologue runs the TMA kernel, whose `tile_rows` must divide `h_q`,
 be a multiple of `h_kv` and of 4 (nothing in 1..16 does for `h_q = 20` MHA or `h_q = 6` over `h_kv = 2`; the bf16 backward
 serves such a geometry through the LDG rebuild). There is no `B*S` rule: the
@@ -653,8 +744,8 @@ dS: two e4m3 payloads plus their E8M0 atoms, `2 + 2/32` bytes per element; under
 partials). Determinism: no atomic anywhere on the MXFP8 chain -- the one amax (`dY`) is a max over per-CTA partials, the row's GQA
 fold is a fixed-order reduce, the block-scale GEMMs are deterministic -- so two executes are bitwise equal under every knob set.
 `fuse_gate_bwd` is accepted and inert (the fused delta is mandatory); `fuse_wgrad_overlap` is served (the side-stream GEMMs fork after
-the operands and blobs they read are written). Declined (typed, naming the attribute) on top of the per-tensor fp8 arm's: `thd=True` with an MxQuantSpec (dense-only; no packed
-MXFP8 record exists), `B*S % 32 != 0` when a projection weight gradient is requested -- the weight-gradient GEMM contracts over the
+the operands and blobs they read are written). Declined (typed, naming the attribute) on top of the per-tensor fp8 arm's: `thd=True` with an MxQuantSpec (dense-only: the
+backward's SDPA-layout MX quantize stages run the quantizer's dense arm only; the packed MXFP8 record the forward writes and the packed head-major delta both exist, the packed MXFP8 backward is a follow-up -- the per-tensor fp8 backward is served packed), `B*S % 32 != 0` when a projection weight gradient is requested -- the weight-gradient GEMM contracts over the
 token axis through one E8M0 scale per 32-element K block, and the transposed quantize writes whole 32-token blocks -- (pass
 `need_dw_qkvg=False`, pad or batch the sequence to a multiple of 32, or run the per-tensor fp8 backward, whose weight gradients take
 no block scales; the data gradients `dh` / `dW_o` are served at any `T`), an artifact given without its need or a need without its
@@ -720,7 +811,7 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   directly and does not consult the flag.
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
-  training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense only, any `B*S`, head counts the TMA Q / K rebuild tiles),
+  training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense or packed (`thd=True`), any `B*S`, head counts the TMA Q / K rebuild tiles),
   and MXFP8 over the MXFP8 training record (`quant=MxQuantSpec`: bf16 `dy` and gradients, dense only, `B*S % 32 == 0` when
   a projection weight gradient is requested, the caller's transposed artifacts `h_t` / `h_t_sf` / `w_qkvg_t` / `w_qkvg_t_sf`
   at `execute`; the fp4 weight modes on the same record -- a packed e2m1 `w_qkvg_t` under an MXFP4 `W_qkvg`, `w_o_t` / `w_o_t_sf`
@@ -737,14 +828,17 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   (or -1), `window_right` unbounded or 0 only; `dw_norm_dtype=torch.float32` only; `rope_dim > 0`;
   `get_workspace_size()` after `compile()`. A dense `S % 128 != 0` is differentiated like any other record: the
   forward's SDPA row masks its KV tail in-kernel (#1520); causal covers the tail.
-- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 unfused forward, inference and
-  training (its packed record goes through the packed bf16 backward with the dequantized `h` and weights; a record handed
-  through with its e4m3 `h` is the same typed decline as on the dense side, after the packed-length checks);
-  `fuse_norm_rope` (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
+- Packed sequences (`thd=True`), forward and backward: bf16 / fp16; the per-tensor FP8 and MXFP8 unfused forwards (the
+  fp4 modes included), inference and training, and the per-tensor fp8 BACKWARD over its packed record as written
+  (`quant=QuantSpec` with the packing knobs: the fp8 SDPA row's THD chain reading the gate backward's packed delta, every
+  other stage token-wise at `B = 1, S = T`); the packed bf16 backward takes a packed quantized record with the dequantized
+  `h` and weights (a record handed to it with its e4m3 `h` is the same typed decline as on the dense side, after the
+  packed-length checks); `fuse_norm_rope` (bf16 / fp16 inference). `num_sequences >= 1`, `2 <= max_seq_len <= T`, `num_sequences * max_seq_len >= T`; the lengths
   tensor contiguous 1-D int32 on `h`'s device with `B` (`cu_seqlens=False`) or `B+1` (`cu_seqlens=True`) entries; every
   length `<= max_seq_len`, the lengths summing to `T` (the caller contract, not host-validated); the training record
   carries `saved.seq_lens` and `saved.seq_lens_form`. Declined (typed): `seq_lens_present` together with `thd`,
-  `fuse_gate`, MXFP8 / fp4, the fully fused quantized pipelines, the packing knobs on a dense block.
+  `fuse_gate`, the fully fused quantized pipelines, the MXFP8 backward over a packed record, the packing knobs on a dense
+  block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
 - FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above), the fp4
   modes of the MXFP8 pipeline included; the fully fused quantized pipelines are inference only. The backward is bf16 / fp16
@@ -756,6 +850,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   the fully fused MXFP8 path needs `scale_o == 1.0` and, at `B > 1`, `S % 128 == 0` (a scale-factor atom is per
   sequence).
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).
+- Block-sparse attention (`QsaSpec`): the declaration, the layout, the loader and the indexer band on the UNFUSED projection
+  are served; the sparse SDPA stage is a typed decline until the sparse core lands ("Sparse attention (QSA)" above).
 - fp4 (`MxQuantSpec.w_qkvg_dtype` / `o_fp4`): MXFP8 pipeline only (unrepresentable on `QuantSpec` / bf16); trained on the
   unfused pipeline (`save_for_backward=True` writes the MXFP8 record; the fused forks stay inference-only) and differentiated
   by `GatedAttentionBlockBwd(quant=MxQuantSpec)` over the caller's transposed e2m1 artifacts; no global per-tensor scale in
@@ -877,58 +973,76 @@ us, `dW_qkvg` for 31-32 us). The gain is therefore largest at small S and shrink
 was locked but power-capped under the sustained 8K / 32K chain, so only the interleaved ratios are quoted. The knob
 stays off by default.
 
-Packed sequences (THD) -- the packed block against the dense block, Rubin (cc 10.7, 204 SMs, SM clock 2376 MHz), both
-geometries 32/2 (`h_q=32 h_kv=2`) and 64/8 (`h_q=64 h_kv=8`) at `d_model = 4096` (not the 5120 of the forward tables
-above), `d_head = 256`, RoPE 64, Q/K RMSNorm on, causal and dense (no mask), bf16 (the forward also the unfused FP8
-block). Every cell is one process holding the packed block and its dense twin (identical FLOPs, identical kernels except
-the SDPA's packed specialization), slots round-robin by launch with the slot order shuffled per iteration, 3 rounds of
-at least 60 ms per slot, median per slot per round then the median of rounds (CUDA events around the whole block; the
-backward rows add the CUPTI device time of every launch over 30 iterations), the packed arm timed twice as the control
-pair (within 0.9 % in every cell). `packed overhead = packed ms / dense ms - 1` on uniform packings (`B` sequences of
-`S` tokens each: the same FLOPs; positive = the packed block is slower); the varlen cell packs `[2048, 4096, 6144,
-8192]` (`B=4`, `max_seq_len = 8192`, 20480 tokens) and reports TFLOP/s on its exact per-sequence FLOPs (causal: the
-exact masked pair count) beside a FLOP-scaled estimate of the dense block's time (`dense ms at B x S_max x FLOPs_varlen / FLOPs_dense`, which assumes time scales
-linearly with work -- an estimate, not a measured equal-work dense run), a dense torch run at `B x S_max` (which attends
-over the padding) and a per-sequence torch loop (exact FLOPs, one dense call per sequence); speed-ups are positive
-numbers, `base ms / new ms - 1`. The percentage of peak is against 8192 FLOP/clk/SM (bf16) x 204 SMs x the SM clock
-sampled during the cell (2052-2352 MHz: the lock holds on the short cells, the long ones power-cap below it); FP8
-against the K32 cap of 16384 FLOP/clk/SM (the part's K64 peak is 32768, twice that, so halve the FP8 percentage for it).
-Every packed arm is gated per sequence (fp32 / fp64 oracles at `S <= 4096`, else the dense block's own rows or the
-per-sequence torch chain); the FP8 varlen rows have no per-sequence FP8 reference above `S_max = 4096` and are reported
-ungated. The 32K forward cells pack B=2 (32/2) and B=1 (64/8) sequences, the 32K backward cells B=1: the backward
-protocol keeps four blocks resident (dense and packed, with and without `fuse_wgrad_overlap`), each with its dS head
-chunk (about 36 GiB at 32 heads x 32K), which does not fit the device at B=2.
+Packed sequences (THD), forward -- the packed block against the dense block, Rubin (cc 10.7, 212 SMs, SM clock locked at
+2376 MHz and sampled during every cell: 1872-2328 MHz, the lock power-caps under the long cells), both geometries 32/2
+(`h_q=32 h_kv=2`) and 64/8 (`h_q=64 h_kv=8`) at `d_model = 4096` (not the 5120 of the forward tables above), `d_head = 256`,
+RoPE 64, Q/K RMSNorm on, causal and dense (no mask), bf16, the unfused FP8 block and the unfused MXFP8 block (the three
+quantized / unquantized pipelines over the SAME bf16 draws). Every cell is one process holding the six FROST blocks (each dtype's
+packed block and its dense twin: identical FLOPs, identical kernels except the SDPA's packed specialization and, for MXFP8, the
+packed scale-factor layout of its three `quantize_mxfp8` stages) and the bf16 torch chain, slots round-robin by launch with the slot
+order shuffled per iteration, 3 rounds of 150 / 60 / 20 launches per slot (2K / 8K / 32K; varlen 60), median per slot per round then
+the median of rounds (CUDA events around the whole block), the packed bf16 arm timed twice as the control pair (-1.97 .. +0.74 % over the cells: within 0.9 % in 15 of the 16, the 64/8
+causal 32K x 1 cell at -1.97 % makes that cell's numbers a weak claim). `packed overhead = packed ms / dense ms - 1` on uniform packings (`B` sequences of `S` tokens each: the same FLOPs;
+positive = the packed block is slower); the varlen cell packs `[2048, 4096, 6144, 8192]` (`B=4`, `max_seq_len = 8192`, 20480
+tokens) and reports TFLOP/s on its exact per-sequence FLOPs -- the sum over the four sequences of the one FLOP model every row of
+these tables uses, `analytic_flops` of `test/python/gated_attention_block/cutedsl/benchmark_baseline.py`: both attention BMMs over
+`S_i^2`, halved under the causal mask, plus the dense `qkv_gate` and output projections over the `S_i` tokens, so a row's bf16, FP8
+and MXFP8 arms share one FLOP count -- beside a FLOP-scaled estimate of the dense block's time (`dense ms at B x S_max x
+FLOPs_varlen / FLOPs_dense`: the dense twin timed in the same process as the packed arm, not the uniform tables' 8K row, and the
+same FLOP model at `B x S_max`; it assumes time scales linearly with work -- an estimate, not a measured equal-work dense run), a
+dense torch run at `B x S_max` (which attends over the padding) and a
+per-sequence torch loop (exact FLOPs, one dense call per sequence); speed-ups are positive numbers, `base ms / new ms - 1`. The
+percentage of peak is against 8192 FLOP/clk/SM (bf16) x 212 SMs x the SM clock sampled during the cell; FP8 and MXFP8 against the
+K32 cap of 16384 FLOP/clk/SM (the part's K64 peak is 32768, twice that, so halve those percentages for it). Every packed arm is
+gated per sequence (the fp32 oracle for bf16 and the fake-quant oracles of the two quantized pipelines at `S <= 4096`, else the
+dense block's own rows or the per-sequence torch chain); the FP8 and MXFP8 varlen rows have no per-sequence quantized reference
+above `S_max = 4096` and are reported ungated. The 32K cells pack B=2 (32/2) and B=1 (64/8) sequences.
 
-Forward, uniform packings (geomean packed overhead bf16 +1.6 %, FP8 -1.9 %):
+Forward, uniform packings (geomean packed overhead bf16 +2.3 %, FP8 -2.1 %, MXFP8 +0.8 %):
 
-| heads Q/KV | mask | S | B (tokens) | dense bf16 ms | packed bf16 ms | packed bf16 overhead | packed bf16 TFLOP/s (% of peak) | dense FP8 ms | packed FP8 ms | packed FP8 overhead | packed FP8 TFLOP/s (% of the K32 cap) |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 32/2 | causal | 2048 | 4 (8192) | 0.718 | 0.756 | +5.2 % | 2638 (68 %) | 0.485 | 0.523 | +7.8 % | 3813 (49 %) |
-| 32/2 | causal | 8192 | 4 (32768) | 3.699 | 3.781 | +2.2 % | 2981 (80 %) | 2.285 | 2.372 | +3.8 % | 4751 (64 %) |
-| 32/2 | causal | 32768 | 2 (65536) | 15.709 | 15.640 | -0.4 % | 3128 (91 %) | 9.467 | 9.073 | -4.2 % | 5393 (78 %) |
-| 32/2 | dense | 2048 | 4 (8192) | 0.786 | 0.825 | +4.9 % | 2750 (71 %) | 0.518 | 0.556 | +7.3 % | 4077 (52 %) |
-| 32/2 | dense | 8192 | 4 (32768) | 5.086 | 5.067 | -0.4 % | 3092 (85 %) | 2.971 | 3.150 | +6.0 % | 4974 (68 %) |
-| 32/2 | dense | 32768 | 2 (65536) | 26.450 | 26.874 | +1.6 % | 3130 (90 %) | 16.914 | 14.177 | -16.2 % | 5933 (86 %) |
-| 64/8 | causal | 2048 | 4 (8192) | 1.455 | 1.502 | +3.2 % | 2746 (71 %) | 0.960 | 1.018 | +6.0 % | 4050 (52 %) |
-| 64/8 | causal | 8192 | 4 (32768) | 7.810 | 7.850 | +0.5 % | 2942 (81 %) | 5.110 | 4.952 | -3.1 % | 4663 (65 %) |
-| 64/8 | causal | 32768 | 1 (32768) | 15.956 | 15.751 | -1.3 % | 3141 (89 %) | 10.115 | 9.065 | -10.4 % | 5458 (77 %) |
-| 64/8 | dense | 2048 | 4 (8192) | 1.600 | 1.641 | +2.6 % | 2847 (74 %) | 1.042 | 1.088 | +4.4 % | 4295 (56 %) |
-| 64/8 | dense | 8192 | 4 (32768) | 10.476 | 10.473 | -0.0 % | 3045 (84 %) | 6.823 | 6.421 | -5.9 % | 4966 (69 %) |
-| 64/8 | dense | 32768 | 1 (32768) | 26.723 | 27.100 | +1.4 % | 3124 (90 %) | 16.973 | 14.548 | -14.3 % | 5820 (83 %) |
+| heads Q/KV | mask | S | B (tokens) | dense bf16 ms | packed bf16 ms | packed bf16 overhead | packed bf16 TFLOP/s (% of peak) | dense FP8 ms | packed FP8 ms | packed FP8 overhead | packed FP8 TFLOP/s (% of the K32 cap) | dense MXFP8 ms | packed MXFP8 ms | packed MXFP8 overhead | packed MXFP8 TFLOP/s (% of the K32 cap) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 32/2 | causal | 2048 | 4 (8192) | 0.664 | 0.702 | +5.7 % | 2838 (71 %) | 0.453 | 0.491 | +8.3 % | 4062 (50 %) | 0.449 | 0.461 | +2.7 % | 4321 (54 %) |
+| 32/2 | causal | 8192 | 4 (32768) | 3.626 | 3.704 | +2.1 % | 3043 (81 %) | 2.194 | 2.310 | +5.3 % | 4879 (65 %) | 2.182 | 2.170 | -0.6 % | 5194 (69 %) |
+| 32/2 | causal | 32768 | 2 (65536) | 15.914 | 15.898 | -0.1 % | 3078 (90 %) | 9.463 | 8.944 | -5.5 % | 5470 (80 %) | 8.830 | 8.928 | +1.1 % | 5480 (80 %) |
+| 32/2 | dense | 2048 | 4 (8192) | 0.733 | 0.776 | +6.0 % | 2921 (73 %) | 0.489 | 0.530 | +8.4 % | 4282 (54 %) | 0.490 | 0.500 | +2.1 % | 4536 (57 %) |
+| 32/2 | dense | 8192 | 4 (32768) | 5.043 | 5.049 | +0.1 % | 3103 (85 %) | 2.898 | 3.054 | +5.4 % | 5130 (70 %) | 2.882 | 2.891 | +0.3 % | 5420 (74 %) |
+| 32/2 | dense | 32768 | 2 (65536) | 27.198 | 27.171 | -0.1 % | 3096 (90 %) | 17.437 | 14.315 | -17.9 % | 5876 (85 %) | 14.307 | 14.330 | +0.2 % | 5870 (85 %) |
+| 64/8 | causal | 2048 | 4 (8192) | 1.375 | 1.430 | +4.1 % | 2882 (74 %) | 0.913 | 0.971 | +6.4 % | 4246 (54 %) | 0.895 | 0.907 | +1.3 % | 4545 (58 %) |
+| 64/8 | causal | 8192 | 4 (32768) | 7.909 | 7.914 | +0.1 % | 2918 (83 %) | 5.158 | 4.920 | -4.6 % | 4693 (67 %) | 4.614 | 4.609 | -0.1 % | 5010 (72 %) |
+| 64/8 | causal | 32768 | 1 (32768) | 16.293 | 16.830 | +3.3 % | 2940 (89 %) | 10.485 | 9.417 | -10.2 % | 5254 (79 %) | 9.297 | 9.571 | +2.9 % | 5170 (78 %) |
+| 64/8 | dense | 2048 | 4 (8192) | 1.518 | 1.593 | +4.9 % | 2934 (77 %) | 0.991 | 1.061 | +7.1 % | 4405 (57 %) | 0.989 | 0.993 | +0.3 % | 4707 (61 %) |
+| 64/8 | dense | 8192 | 4 (32768) | 10.871 | 10.882 | +0.1 % | 2930 (86 %) | 6.988 | 6.475 | -7.3 % | 4924 (72 %) | 6.228 | 6.236 | +0.1 % | 5114 (75 %) |
+| 64/8 | dense | 32768 | 1 (32768) | 27.940 | 28.374 | +1.6 % | 2984 (92 %) | 17.941 | 15.143 | -15.6 % | 5591 (86 %) | 15.419 | 15.267 | -1.0 % | 5545 (85 %) |
 
 Forward, varlen packing `[2048, 4096, 6144, 8192]` (the FLOP-scaled column is `packed ms / (dense ms at B x S_max x FLOPs_varlen /
 FLOPs_dense) - 1`, an estimate that assumes time scales linearly with work; positive = the packed block is slower than that estimate):
 
-| heads Q/KV | mask | dtype | packed ms | TFLOP/s (% of peak; FP8: of the K32 cap) | vs the FLOP-scaled dense-time estimate | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
+| heads Q/KV | mask | dtype | packed ms | TFLOP/s (% of peak; FP8 / MXFP8: of the K32 cap) | vs the FLOP-scaled dense-time estimate | speed-up vs dense torch at B x S_max | speed-up vs the per-sequence torch loop |
 |---|---|---|---|---|---|---|---|
-| 32/2 | causal | bf16 | 2.093 | 3037 (77 %) | +5.7 % | +371.3 % | +200.2 % |
-| 32/2 | causal | FP8 | 1.357 | 4686 (60 %) | +11.0 % | +627.2 % | +363.1 % |
-| 32/2 | dense | bf16 | 2.638 | 3191 (82 %) | +2.9 % | +322.1 % | +162.0 % |
-| 32/2 | dense | FP8 | 1.669 | 5044 (65 %) | +12.9 % | +567.0 % | +314.1 % |
-| 64/8 | causal | bf16 | 4.275 | 3054 (81 %) | +2.6 % | +391.5 % | +210.6 % |
-| 64/8 | causal | FP8 | 2.772 | 4710 (62 %) | +1.5 % | +658.1 % | +379.0 % |
-| 64/8 | dense | bf16 | 5.383 | 3192 (83 %) | +0.7 % | +336.8 % | +171.9 % |
-| 64/8 | dense | FP8 | 3.392 | 5065 (66 %) | -3.5 % | +593.2 % | +331.5 % |
+| 32/2 | causal | bf16 | 2.018 | 3151 (78 %) | +5.9 % | +378.0 % | +204.4 % |
+| 32/2 | causal | FP8 | 1.288 | 4934 (61 %) | +11.1 % | +648.7 % | +376.7 % |
+| 32/2 | causal | MXFP8 | 1.210 | 5252 (65 %) | +6.6 % | +696.8 % | +407.4 % |
+| 32/2 | dense | bf16 | 2.554 | 3297 (83 %) | +3.3 % | +324.3 % | +164.3 % |
+| 32/2 | dense | FP8 | 1.580 | 5329 (67 %) | +10.8 % | +585.9 % | +327.3 % |
+| 32/2 | dense | MXFP8 | 1.505 | 5594 (70 %) | +7.2 % | +620.0 % | +348.5 % |
+| 64/8 | causal | bf16 | 4.173 | 3129 (81 %) | +3.6 % | +392.0 % | +207.3 % |
+| 64/8 | causal | FP8 | 2.654 | 4920 (63 %) | +1.7 % | +673.6 % | +383.2 % |
+| 64/8 | causal | MXFP8 | 2.508 | 5206 (67 %) | +6.6 % | +718.5 % | +411.2 % |
+| 64/8 | dense | bf16 | 5.285 | 3251 (83 %) | +2.0 % | +335.3 % | +167.3 % |
+| 64/8 | dense | FP8 | 3.287 | 5227 (67 %) | -3.5 % | +599.9 % | +329.8 % |
+| 64/8 | dense | MXFP8 | 3.123 | 5501 (70 %) | +5.9 % | +636.7 % | +352.4 % |
+
+Packed sequences (THD), backward -- the packed block backward against the dense one, Rubin (cc 10.7, 204 SMs, SM clock 2376 MHz,
+sampled 2052-2352 MHz: the lock holds on the short cells, the long ones power-cap below it), the same two geometries at
+`d_model = 4096`, bf16. Every cell is one process holding the packed block and its dense twin, slots round-robin by launch with the
+slot order shuffled per iteration, 3 rounds of at least 60 ms per slot, median per slot per round then the median of rounds (CUDA
+events around the whole block, plus the CUPTI device time of every launch over 30 iterations), the packed arm timed twice as the
+control pair (within 0.9 % in every cell); the same overhead / varlen conventions as the forward tables, the percentage of peak against
+8192 FLOP/clk/SM x 204 SMs x the sampled clock. Every packed arm is gated per sequence (fp32 / fp64 oracles at `S <= 4096`, else the
+dense block's own rows or the per-sequence torch chain). The 32K backward cells pack B=1: the backward protocol keeps four blocks
+resident (dense and packed, with and without `fuse_wgrad_overlap`), each with its dS head chunk (about 36 GiB at 32 heads x 32K),
+which does not fit the device at B=2.
 
 Backward (the block backward alone; the training-step column is the packed overhead of one training forward + backward; geomean packed overhead +1.0 %):
 
@@ -1003,5 +1117,5 @@ decode ignores the policy: 32/2 -0.0 %, 64/8 -0.3 %), so NATURAL stays.
 - Tests: `test/python/gated_attention_block/cutedsl/` (layout contract, reference oracle, end to end, FP8, MXFP8,
   fp4 weights / fp4 O (`test_block_fp4.py`, `test_proj_gemm_fp4.py`, `test_quantize_fp4.py`) and their backward
   (`test_block_backward_fp4.py`), packed sequences
-  (`test_block_thd.py`, `test_block_thd_backward.py`: the per-sequence oracle, the typed declines, the dense-vs-packed
-  pins), per-stage kernels, stream ordering).
+  (`test_block_thd.py`, `test_block_thd_backward.py`, `test_block_thd_mxfp8.py`: the per-sequence oracles, the typed declines,
+  the dense-vs-packed pins), per-stage kernels, stream ordering).

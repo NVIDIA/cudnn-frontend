@@ -67,7 +67,7 @@ from gated_block_reference import (  # noqa: E402
     quantize_block_inputs,
     sequence_slices,
 )
-from test_block_backward import _alloc_grads, _assert_dw_norm_close, _assert_grad_close, _cos, _fp64_oracle, _fp64_oracle_from_record, _make_dy  # noqa: E402
+from test_block_backward import _alloc_grads, _assert_dw_norm, _assert_grad_close, _cos, _fp64_oracle, _fp64_oracle_from_record, _make_dy  # noqa: E402
 from test_block_backward import _execute as _execute_bwd  # noqa: E402
 from test_block_thd import _COMMON, _LENS, _alloc_packed_saved, _declare_thd, _form, _lens, _no_device_sync, _run_fp8_thd, _run_thd, _thd_kw  # noqa: E402
 
@@ -112,6 +112,10 @@ def _declare_bwd_thd(geom_kw=_COMMON, lens=_LENS, *, cu=False, dtype=torch.bfloa
     return SimpleNamespace(blk=bwd, fwd=fwd, inp=inp, saved=saved, dy=dy, out=out, meta=meta, geom=fwd.geom, geom_kw=geom_kw, seq_lens=seq_lens)
 
 
+# The oracle's per-token quantities packed back row by row beside ``dh`` (the structured dW_norm form, ``test_block_backward._assert_dw_norm``).
+_PACKED_PER_TOKEN = ("dq_post", "dk_post", "q_pre", "k_pre", "rstd_q", "rstd_k")
+
+
 def _packed_oracle(inp, geom_kw, dy, lens, *, saved=None) -> dict:
     """The fp64 oracle per sequence: ``dh`` packed back row by row, every weight gradient the SUM over the sequences, the
     ``dW_norm`` masses combined as ``sqrt(sum mass_i^2)``; ``per_seq`` keeps each sequence's dict for localisation.
@@ -121,6 +125,7 @@ def _packed_oracle(inp, geom_kw, dy, lens, *, saved=None) -> dict:
     per_seq = []
     total = None
     dh = torch.zeros(1, dy.shape[1], dy.shape[2], dtype=torch.float64, device=dy.device)
+    per_token: dict = {}  # appended: the oracle's per-token quantities the structured dW_norm form reads, packed back row by row
     for lo, hi in sequence_slices(lens):
         if hi == lo:
             per_seq.append(None)
@@ -132,6 +137,11 @@ def _packed_oracle(inp, geom_kw, dy, lens, *, saved=None) -> dict:
             o = _fp64_oracle_from_record(inp_i, geom_kw, dy[:, lo:hi], saved.o[:, lo:hi], saved.lse[:, :, lo:hi])
         per_seq.append(o)
         dh[0, lo:hi] = o["dh"][0]
+        for k in _PACKED_PER_TOKEN:
+            if o.get(k) is not None:
+                if k not in per_token:
+                    per_token[k] = torch.zeros(dy.shape[1], *o[k].shape[1:], dtype=torch.float64, device=dy.device)
+                per_token[k][lo:hi] = o[k]
         if total is None:
             total = {k: (o[k].clone() if o[k] is not None else None) for k in ("dw_qkvg", "dw_o", "dw_q_norm", "dw_k_norm")}
             total.update({k: (o[k] ** 2 if o.get(k) is not None else None) for k in ("dw_q_norm_mass", "dw_k_norm_mass")})
@@ -148,6 +158,8 @@ def _packed_oracle(inp, geom_kw, dy, lens, *, saved=None) -> dict:
             total[k] = total[k].sqrt()
     total["dh"] = dh
     total["per_seq"] = per_seq
+    for k in _PACKED_PER_TOKEN:
+        total[k] = per_token.get(k)
     return total
 
 
@@ -240,7 +252,7 @@ def _check_all_grads_packed(res) -> dict:
             worst[name] = _assert_grad_close(res.grads[name], res.oracle[name], name)
     for name in ("dw_q_norm", "dw_k_norm"):
         if res.grads[name] is not None:
-            worst[name] = _assert_dw_norm_close(res.grads[name], res.oracle[name], res.oracle[name + "_mass"], name)
+            worst[name] = _assert_dw_norm(res, name, res.oracle, name)
     print(f"worst cells: {worst}")
     return worst
 

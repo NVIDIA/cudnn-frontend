@@ -710,24 +710,40 @@ def test_dsl_sm100_band_right_uncovered_tail_via_padding():
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize(
+    "input_dtype,output_dtype,splits,cga",
+    [(dt, dt, sp, cga) for dt in (torch.float16, torch.bfloat16) for sp, cga in ((1, 2), (4, 1), (4, 2), (16, 1))]
+    + [(dt, torch.bfloat16, sp, 2) for dt in (torch.float8_e4m3fn, torch.float8_e5m2) for sp in (1, 4, 16)]
+    + [(dt, dt, 4, 2) for dt in (torch.float8_e4m3fn, torch.float8_e5m2)],
+)
 @torch_fork_set_rng(seed=0)
-def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(fp8, monkeypatch):
+def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(input_dtype, output_dtype, monkeypatch, splits, cga):
     """A mask-free S_kv off the KV tile compiles the padded mask against the scalar S_kv (#1425): no lengths buffer,
     the native prepared launch, and execute-time S_kv overrides on and off the tile within the declared envelope."""
     _require_dsl()
     import cudnn
     from cudnn.sdpa.fwd import prepared as prep
 
-    b, hq, hk, s_q, d, declared = 2, 4, 2, 64, 128, 200
-    io = cudnn.data_type.FP8_E4M3 if fp8 else cudnn.data_type.BFLOAT16
+    b, hq, hk, s_q, d, declared = 2, 4, 2, 64, 128, 257
+    fp8 = input_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    dtype_enum = {
+        torch.float16: cudnn.data_type.HALF,
+        torch.bfloat16: cudnn.data_type.BFLOAT16,
+        torch.float8_e4m3fn: cudnn.data_type.FP8_E4M3,
+        torch.float8_e5m2: cudnn.data_type.FP8_E5M2,
+    }
+    io = dtype_enum[input_dtype]
 
     def make(h, s):
-        x = torch.randn(b, s, h, d, device="cuda").transpose(1, 2)
-        return x.to(torch.float8_e4m3fn) if fp8 else x.to(torch.bfloat16)
+        # Poison backing storage beyond the live logical tensor extent. TMA
+        # must zero-fill it; masking logits alone cannot remove NaNs from PV.
+        x = torch.randn(b, s + 16, h, d, device="cuda")
+        x[:, s:] = torch.nan
+        x = x.to(input_dtype)
+        return x[:, :s].transpose(1, 2)
 
     def bshd_stride(h, s):
-        return [s * h * d, d, h * d, 1]
+        return [(s + 16) * h * d, d, h * d, 1]
 
     g = cudnn.pygraph(io_data_type=io, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT, is_override_shape_enabled=True)
     q0, k0, v0 = make(hq, s_q), make(hk, declared), make(hk, declared)
@@ -735,7 +751,7 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(fp8, monkeypatc
     pack = {}
     if fp8:
         scales = [g.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT) for _ in range(6)]
-        od, _, _, ad = g.sdpa_fp8(
+        od, stats, _, ad = g.sdpa_fp8(
             q=qd,
             k=kd,
             v=vd,
@@ -746,45 +762,66 @@ def test_dsl_sm100_kv_tail_mask_takes_the_native_prepared_launch(fp8, monkeypatc
             scale_s=scales[4],
             scale_o=scales[5],
             attn_scale=d**-0.5,
-            generate_stats=False,
+            generate_stats=True,
         )
         ad.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
-        one = torch.ones(1, 1, 1, 1, device="cuda")
-        pack.update({t: one for t in scales})
+        pack.update({t: torch.full((1, 1, 1, 1), val, device="cuda") for t, val in zip(scales, (2.0, 0.5, 0.25, 1.0, 1.0, 2.0))})
         pack[ad] = torch.zeros(1, 1, 1, 1, device="cuda")
     else:
-        od, _ = g.sdpa(q=qd, k=kd, v=vd, attn_scale=d**-0.5, generate_stats=False)
-    o = torch.empty(b, s_q, hq, d, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
-    od.set_output(True).set_dim(list(o.shape)).set_stride(list(o.stride())).set_data_type(cudnn.data_type.BFLOAT16)
+        od, stats = g.sdpa(q=qd, k=kd, v=vd, attn_scale=d**-0.5, generate_stats=True)
+    o = torch.empty(b, s_q, hq, d, device="cuda", dtype=output_dtype).transpose(1, 2)
+    od.set_output(True).set_dim(list(o.shape)).set_stride(list(o.stride())).set_data_type(dtype_enum[output_dtype])
+    lse = torch.empty(b, hq, s_q, 1, device="cuda")
+    stats.set_output(True).set_dim(list(lse.shape)).set_stride(list(lse.stride())).set_data_type(cudnn.data_type.FLOAT)
+    pack[stats] = lse
     g.validate()
     g.build_operation_graph()
     g.create_execution_plans([cudnn.heur_mode.A])
     _select_engine(g, engine_name(arch="sm107" if _SM == 107 else "sm100", fp8=fp8))
+    engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
+    g.create_execution_plan(engine, {**knobs, cudnn.knob_type.SPLIT_KV: splits, cudnn.knob_type.TILE_CGA_M: cga})
+    g.select_plan(g.get_execution_plan_count() - 1)
     g.check_support()
     g.build_plans()
     launch = g._compiled_plans[g._plan_index]._prepared
     assert isinstance(launch, prep.PreparedDenseLaunch) and launch.spec.native is not None and launch.spec.kv_tail_native
     assert not launch.spec.seq_kv_present
-    if not fp8:  # prepared FP8 always carves its amax / identity-scale words
+    if not fp8 and splits == 1:  # split partials and FP8 auxiliaries use caller-owned workspace
         assert g.get_workspace_size() == 0
     from sdpa.frost.native_binding_utils import forbid_python_forward_binding
 
     forbid_python_forward_binding(monkeypatch)
     ws = torch.empty(max(g.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
-    for s_kv in (declared, 72, 128, 129, 199):
+    for s_kv in (declared, 1, 127, 128, 129, 255):
         q, k, v = q0, make(hk, s_kv), make(hk, s_kv)
         o.zero_()
-        g.execute(
-            {**pack, qd: q, kd: k, vd: v, od: o},
-            ws,
-            override_uids=[kd.get_uid(), vd.get_uid()],
-            override_shapes=[[b, hk, s_kv, d]] * 2,
-            override_strides=[bshd_stride(hk, s_kv)] * 2,
-        )
-        torch.cuda.synchronize()
-        qf, kf, vf = (t.float().repeat_interleave(hq // t.shape[1], dim=1) for t in (q, k, v))
-        o_ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, scale=d**-0.5)
-        torch.testing.assert_close(o.float(), o_ref, atol=5e-2 if fp8 else 2e-2, rtol=3e-2, msg=lambda m: f"S_kv={s_kv}: {m}")
+
+        def run():
+            g.execute(
+                {**pack, qd: q, kd: k, vd: v, od: o},
+                ws,
+                override_uids=[kd.get_uid(), vd.get_uid()],
+                override_shapes=[[b, hk, s_kv, d]] * 2,
+                override_strides=[bshd_stride(hk, s_kv)] * 2,
+            )
+
+        run()
+        captured = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(captured):
+                run()
+            v.copy_((-v.float()).to(input_dtype))
+            captured.replay()
+            torch.cuda.synchronize()
+            qf, kf, vf = (t.float().repeat_interleave(hq // t.shape[1], dim=1) for t in (q, k, v))
+            o_ref = torch.nn.functional.scaled_dot_product_attention(qf, kf, vf, scale=d**-0.5)
+            torch.testing.assert_close(lse[..., 0], (qf.double() @ kf.double().transpose(-1, -2) * d**-0.5).logsumexp(-1).float(), atol=1e-3, rtol=1e-3)
+            if fp8:
+                torch.testing.assert_close(pack[ad].flatten()[0], o_ref.abs().max() * 0.25, atol=0.03, rtol=0.03)
+                o_ref = o_ref * 0.25 * 2.0  # descale_v, then scale_o; Amax excludes scale_o
+            torch.testing.assert_close(o.float(), o_ref, atol=5e-2 if fp8 else 2e-2, rtol=3e-2, msg=lambda m: f"S_kv={s_kv}: {m}")
+        finally:
+            captured.reset()
 
 
 @pytest.mark.L0

@@ -256,9 +256,8 @@ def _facts():
 
 def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     """A ragged S_kv on a skv_tail_via_padding row is served through the
-    kernel's KV-tail mask (kv_tail_mask, #1425) — the one path the split
-    cannot ride. The gate must mirror the adapter's predicate so
-    the plan is never listed, not declined at build."""
+    kernel's KV-tail mask (kv_tail_mask, #1425). Outside the qualified
+    exact-D128 architectures this remains declined before plan build."""
     from cudnn.sdpa import graph_analyzer as ga
 
     caps = Capabilities(
@@ -279,6 +278,33 @@ def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     assert "split_kv" not in why
 
 
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_explicit_scalar_tail_split_admission(device_cc, fp8):
+    """Tail admission follows the native lowerings, without pinning a heuristic winner."""
+    from dataclasses import replace
+    from cudnn.sdpa import graph_analyzer as ga
+
+    caps = Capabilities(
+        sm_lo=100,
+        sm_hi=107,
+        phase="prefill",
+        d_shapes=frozenset({(128, 128)}),
+        skv_tail_via_padding=True,
+        split_kv_supported=True,
+    )
+    facts = ga.SdpaGraphFacts(s_q=64, s_kv=257, d_qk=128, d_v=128, device_cc=device_cc, is_fp8=fp8)
+    knobs = SdpaFwdKnobs(split_kv=4)
+    assert "split_kv" not in (mismatch(caps, facts, knobs) or "")
+    for other in (
+        replace(facts, device_cc=(10, 8)),
+        replace(facts, d_qk=112),
+        replace(facts, d_qk=192),
+        replace(facts, is_fp8=False, is_mxfp8=True),
+    ):
+        assert "split_kv" in (mismatch(caps, other, knobs) or "")
+
+
 def test_split_kv_tail_rule_exempts_paged_but_not_dense_padded():
     """The synthesized-padding exclusion is about the DENSE mask-free path. A
     paged graph is padded by construction (per-batch KV lengths are mandatory
@@ -286,7 +312,8 @@ def test_split_kv_tail_rule_exempts_paged_but_not_dense_padded():
     that is not a 128-multiple — FlashInfer passes its true max, e.g. 4000 —
     must not block the split. The neighbouring dense cases keep their verdicts:
     a dense padded graph still declines the split (its padded path yields no
-    per-split partials) and a dense mask-free ragged S_kv still declines."""
+    per-split partials), and scalar-tail splitting still needs a qualified
+    native dimension and architecture."""
     from cudnn.sdpa import graph_analyzer as ga
 
     caps = Capabilities(

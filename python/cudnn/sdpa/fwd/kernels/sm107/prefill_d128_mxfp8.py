@@ -278,6 +278,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     lpt_tile_coords,
     make_sdpa_helpers,
     assert_tile_n_supported,
+    running_max_step_finite_sentinel,
 )
 
 assert_tile_n_supported(CFG)
@@ -2075,42 +2076,31 @@ def _softmax_kv_body(
         max_a = max_a_vec[0]
         max_b = max_b_vec[0]
 
+    # The tile's RAW row max -- exactly NEG_INF (the finite mask sentinel) iff every column of this tile is masked;
+    # running_max_step_finite_sentinel keys its dead-tile select on it.
+    raw_max = cute.math.max(max_a, max_b)
     if cutlass.const_expr(SCALE_PREFOLDED):
-        # Raw-domain max.  A fully-masked tile leaves it exactly at the finite mask sentinel (== NEG_INF), so
-        # is_first re-fires on consecutive keyless tiles (alpha = 0) where the scaled path runs alpha = 1 between
-        # them; both publish P = exp2(0) = 1 there and the first live tile wipes the accumulator, and keyless rows
-        # are overridden by the correction's _kv_empty select -- same O either way.
-        current_max = cute.math.max(max_a, max_b)
+        # Raw-domain max (Q carries attn_scale * log2 e).
+        current_max = raw_max
     else:
-        # The scaled max of a fully-masked tile must stay at the finite sentinel (== NEG_INF), as the pre-folded
-        # arm's raw max does: at |attn_scale * log2 e| >= 1 the product overflows to -inf, the first tile's select
-        # then seeds total_max = -inf and every later shift reads -inf - (-inf) = NaN, which no rescale recovers --
-        # a row with legal keys behind a masked leading tile (a left window at attn_scale 1) came out NaN.  Clamped,
-        # is_first re-fires on the next live tile and the masked tile contributes exp2(-inf) = 0, nothing else moves.
-        current_max = cute.math.max(cute.math.max(max_a, max_b) * scale_log2, NEG_INF)
+        # The scaled max of a fully-masked tile is clamped to the finite sentinel (== NEG_INF): at |attn_scale * log2 e| >= 1
+        # the product overflows to -inf.  The dead-tile select below keys on raw_max, not on this value; the clamp predates it
+        # and is kept as is, so the dense (MASK_NONE) cubin stays byte-identical.
+        current_max = cute.math.max(raw_max * scale_log2, NEG_INF)
 
     if sub_tile_id == 1:
         nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
 
-    old_total_max = total_max
-    is_first = total_max == NEG_INF
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that and under the pre-folded scale every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF, 0) and is published by the
+    # epilogue's _kv_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        raw_max, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
-    new_total_max = total_max
 
     alpha_vec = cutlass.Vector.from_elements((alpha,), cutlass.Float32)
     nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
@@ -2264,8 +2254,13 @@ def _softmax_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-        # Both softmax wgs wait on slot [0]; without this softmax races ahead while TMA-STG drains prior tile.
-        bars.mb_o_empty[0].wait(epilogue_state, spin=SPIN_RING_WAITS)
+        # Each softmax wg waits its own O slot; without this softmax races ahead while TMA-STG drains prior tile.
+        # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
+        # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
+        # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
+        # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
+        # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
+        bars.mb_o_empty[sub_tile_id].wait(epilogue_state, spin=SPIN_RING_WAITS)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
         total_max = NEG_INF

@@ -161,6 +161,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 # The appended keyword-only tail of the quantized backward: the fp8 scalars, the MXFP8 artifacts, then the fp4 W_o artifacts (append-only).
 _QUANT_INIT_KWARGS = ("quant", "grad_scaling")
+_MARGIN_INIT_KWARGS = ("grad_scale_margin_log2",)  # appended after grad_scaling on __init__, LAST on the wrapper
 _QUANT_EXECUTE_KWARGS = ("scale_dp", "scale_dy", "scale_do", "scale_dqkvg")
 _MX_EXECUTE_KWARGS = ("h_t", "h_t_sf", "w_qkvg_t", "w_qkvg_t_sf")
 _FP4_EXECUTE_KWARGS = ("w_o_t", "w_o_t_sf")
@@ -169,12 +170,13 @@ _FP4_ARTIFACTS = _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS
 
 def test_the_fp4_surface_is_an_appended_keyword_only_tail():
     """Host, no GPU: ``w_o_t`` / ``w_o_t_sf`` are the LAST two parameters of ``execute`` and of the convenience wrapper, after the MXFP8
-    artifacts, keyword-only and defaulted (public signatures evolve append-only); ``__init__``'s tail is unchanged (the fp4 modes are fields
-    of ``MxQuantSpec``, nothing appended)."""
+    artifacts, keyword-only and defaulted (public signatures evolve append-only), with the gradient-scale margin ``grad_scale_margin_log2``
+    appended after them on the wrapper and after ``grad_scaling`` on ``__init__`` (the fp4 modes are fields of ``MxQuantSpec``, nothing of
+    their own appended)."""
     for fn, names in (
-        (GatedAttentionBlockBwd.__init__, _QUANT_INIT_KWARGS),
+        (GatedAttentionBlockBwd.__init__, _QUANT_INIT_KWARGS + _MARGIN_INIT_KWARGS),
         (GatedAttentionBlockBwd.execute, _QUANT_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
-        (gated_attention_block_backward, _QUANT_INIT_KWARGS + _QUANT_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS),
+        (gated_attention_block_backward, _QUANT_INIT_KWARGS + _QUANT_EXECUTE_KWARGS + _MX_EXECUTE_KWARGS + _FP4_EXECUTE_KWARGS + _MARGIN_INIT_KWARGS),
     ):
         tail = list(inspect.signature(fn).parameters.values())[-len(names) :]
         assert [p.name for p in tail] == list(names), (fn.__qualname__, [p.name for p in tail])

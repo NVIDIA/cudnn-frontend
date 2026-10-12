@@ -1543,24 +1543,36 @@ def test_mxfp8_dense_padding(in_key, causal):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize("scale", [1.0, 1.0 / 16], ids=["scale1", "scale16"])
+@pytest.mark.parametrize("d_qk, d_v", [(128, 128), (192, 128), (256, 256), (512, 512)], ids=["d128", "d192x128", "d256", "d512"])
 @torch_fork_set_rng(seed=0)
-def test_masked_leading_tile_with_live_keys_behind_it(d):
-    """Q 65 x KV 193, bottom-right causal with left bound 34 at attn_scale 1: rows 33..64 see a fully masked FIRST KV tile
-    and their legal keys only in the second.  At |attn_scale * log2 e| >= 1 the scaled mask sentinel overflows to -inf and
-    the online softmax's shift read -inf - (-inf) = NaN for those rows (the #1481 / #1488 reviews' native reproduction on
-    cc 10.7, 65,536 nonfinite O elements at d256; the scale-1/16 twin was finite): the tile max is clamped to the finite
-    sentinel now.  Dequantized Q / K / V = 0.5, so O is exactly 0.5 wherever a row has a legal key and only a NaN / inf can
-    fail this cell.  Paged twin: test_sdpa_fwd_paged_mxfp8_sm107.py::test_masked_leading_tile_with_live_keys_behind_it."""
+def test_masked_leading_tile_with_live_keys_behind_it(d_qk, d_v, scale):
+    """Q 65 x KV 193, bottom-right causal with left bound 34: rows 33..64 see a fully masked FIRST KV tile and their legal
+    keys only in the second, on every MXFP8 prefill flavor.  A kernel that let that tile's mask sentinel become the row's
+    running max published, at |attn_scale * log2 e| >= 1, a shift of -inf - (-inf) = NaN (65,536 nonfinite O elements at
+    d256 on cc 10.7, the #1481 / #1488 reviews' native reproduction) and, at attn_scale 1/16, P = 1 per masked column that
+    only the next live tile's alpha = 0 wiped -- a multiply by zero; the online softmax's running-max step now keeps a tile
+    that is dead ahead of the row's first live key out of the state (alpha = 1, P = 0) on every flavor.  Dequantized Q / K
+    / V = 0.5, so O is exactly 0.5 wherever a row has a legal key and only a NaN / inf can fail this cell.  Paged twin:
+    test_sdpa_fwd_paged_mxfp8_sm107.py::test_masked_leading_tile_with_live_keys_behind_it."""
     from unittest.mock import patch
 
     with patch.object(torch, "randn", side_effect=lambda *a, **kw: torch.ones(*a, **kw)):
         O, O_ref, _ = _run_rect(
-            1, 8, 65, 193, "e5m2", torch.float16, scale=1.0, sdpa_kwargs=dict(use_causal_mask_bottom_right=True, diagonal_band_left_bound=34), d_qk=d, d_v=d
+            1,
+            8,
+            65,
+            193,
+            "e5m2",
+            torch.float16,
+            scale=scale,
+            sdpa_kwargs=dict(use_causal_mask_bottom_right=True, diagonal_band_left_bound=34),
+            d_qk=d_qk,
+            d_v=d_v,
         )
     assert torch.isfinite(O.float()).all(), "NaN / inf in O: the masked leading tile poisoned rows with legal keys behind it"
     assert torch.isfinite(O_ref).all()
-    _check(O, O_ref, torch.float16, "e5m2", d_qk=d)
+    _check(O, O_ref, torch.float16, "e5m2", d_qk=d_qk)
 
 
 def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):

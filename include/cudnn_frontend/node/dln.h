@@ -59,7 +59,12 @@ class DLNNode : public NodeCRTP<DLNNode> {
             DX->set_stride(x_tensor_stride);
         }
 
-        auto scale = attributes.inputs[Layernorm_backward_attributes::input_names::SCALE];
+        // scale is optional (#188); without one there is no DSCALE or DBIAS
+        auto const scale_it = attributes.inputs.find(Layernorm_backward_attributes::input_names::SCALE);
+        auto scale          = scale_it != attributes.inputs.end() ? scale_it->second : nullptr;
+        if (scale == nullptr) {
+            return {error_code_t::OK, ""};
+        }
 
         // Infer dscale/dbias from scale
         auto infer_scale_bias_tensors = [&scale](std::shared_ptr<Tensor_attributes>& T) {
@@ -124,15 +129,18 @@ class DLNNode : public NodeCRTP<DLNNode> {
                                                        1,
                                                        &dy_desc));
 
-        // Set scale tensor
-        CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(SCALE, Layernorm_backward_attributes::input_names::SCALE);
-        auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
+        // Set scale tensor; optional (#188)
+        auto const SCALE     = attributes.inputs.find(Layernorm_backward_attributes::input_names::SCALE);
+        bool const has_scale = SCALE != attributes.inputs.end() && SCALE->second != nullptr;
+        if (has_scale) {
+            auto scale_desc = tensors.at(SCALE->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(dln_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &scale_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(dln_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_BWD_SCALE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &scale_desc));
+        }
 
         // Set mean and inv_variance tensors
         CUDNN_FE_VALIDATE_AND_ASSIGN_INPUT_TENSOR(MEAN, Layernorm_backward_attributes::input_names::MEAN);
@@ -155,23 +163,25 @@ class DLNNode : public NodeCRTP<DLNNode> {
                                                        &inv_var_desc));
 
         // Set DSCALE and DBIAS output tensors
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Layernorm_backward_attributes::output_names::DSCALE);
-        auto dscale_desc = tensors.at(DSCALE->second->get_uid())->get_raw_desc();
+        if (has_scale) {
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DSCALE, Layernorm_backward_attributes::output_names::DSCALE);
+            auto dscale_desc = tensors.at(DSCALE->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(dln_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &dscale_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(dln_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_BWD_DSCALE_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &dscale_desc));
 
-        CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Layernorm_backward_attributes::output_names::DBIAS);
-        auto dbias_desc = tensors.at(DBIAS->second->get_uid())->get_raw_desc();
+            CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DBIAS, Layernorm_backward_attributes::output_names::DBIAS);
+            auto dbias_desc = tensors.at(DBIAS->second->get_uid())->get_raw_desc();
 
-        _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(dln_operation.get_raw_desc(),
-                                                       CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC,
-                                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
-                                                       1,
-                                                       &dbias_desc));
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(dln_operation.get_raw_desc(),
+                                                           CUDNN_ATTR_OPERATION_NORM_BWD_DBIAS_DESC,
+                                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                                           1,
+                                                           &dbias_desc));
+        }
 
         // Set DX output tensor
         CUDNN_FE_VALIDATE_AND_ASSIGN_OUTPUT_TENSOR(DX, Layernorm_backward_attributes::output_names::DX);

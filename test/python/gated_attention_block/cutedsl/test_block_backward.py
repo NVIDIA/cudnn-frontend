@@ -253,6 +253,15 @@ def _fp64_oracle(inp: dict, geom_kw: dict, dy: torch.Tensor) -> dict:
     if g64.qk_norm:
         out["dw_q_norm_mass"] = _dw_norm_noise_mass(dq_post, ref.q_pre, ref.rstd_q, inp["cos"].double(), inp["sin"].double(), g64.rope_dim)
         out["dw_k_norm_mass"] = _dw_norm_noise_mass(dk_post, ref.k_pre, ref.rstd_k, inp["cos"].double(), inp["sin"].double(), g64.rope_dim)
+    # Appended (the structured dW_norm form, ``_assert_dw_norm_structured``): the oracle's post-norm gradients, pre-norm bands and rstd per token.
+    out.update(
+        dq_post=dq_post.detach().reshape(t, g64.h_q, g64.d_head),
+        dk_post=dk_post.detach().reshape(t, g64.h_kv, g64.d_head),
+        q_pre=ref.q_pre.detach().reshape(t, g64.h_q, g64.d_head),
+        k_pre=ref.k_pre.detach().reshape(t, g64.h_kv, g64.d_head),
+        rstd_q=None if ref.rstd_q is None else ref.rstd_q.detach().reshape(t, g64.h_q),
+        rstd_k=None if ref.rstd_k is None else ref.rstd_k.detach().reshape(t, g64.h_kv),
+    )
     return out
 
 
@@ -297,6 +306,144 @@ def _assert_dw_norm_close(got: torch.Tensor, ref64: torch.Tensor, mass: torch.Te
     assert cos >= _COS_MIN, msg
     assert bool((diff <= bound).all()), msg
     return worst
+
+
+# The random-walk coefficient ``_DW_NORM_NOISE`` was calibrated on reductions of >= 512 rows (11 norm cells at S >= 256: ``|diff| / mass``
+# 0.0156-0.0195), where the max over the 256 columns of a sum of many bf16-level deviations concentrates.  At a 5-token packing the dW_k_norm
+# reduction has 10 rows (5 tokens x 2 heads): measured on a 212-SM Rubin part's dataset, the same chain reads 0.027 / 0.043 of the mass
+# (dW_q_norm / dW_k_norm) with the norm backward's OWN arithmetic at 2e-7 of the mass -- the whole deviation is B4's bf16 dK deviation (0.60 of
+# the SDPA stage's bf16 bound, 0 of 10 rows outside) propagated through ten terms whose signs do not average out.  Below this many rows the
+# STRUCTURED form ``_assert_dw_norm_structured`` is asserted and the statistic is printed.  The threshold is the calibration floor, not a
+# measured crossover: on one dataset the statistic sits inside its coefficient from 26 rows up (0.017-0.026 of the mass at 26-512 rows), while
+# at 10 rows it is exceeded on 4 of 9 datasets (1.14-1.58 of the bound) and at 40 rows on 1 of 9 (1.05).
+_DW_NORM_STRUCTURED_BELOW_ROWS = 512
+
+
+def _rope_adjoint_abs(bound: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    """An elementwise UPPER bound of ``|_rope_adjoint(e)|`` over every ``|e| <= bound`` (same shapes as ``_rope_adjoint``): ``|cos| bound +
+    |sin| x the rotate_half partner's bound`` on the leading ``rope_dim`` columns, ``bound`` itself beyond."""
+    rot, rest = bound[..., :rope_dim], bound[..., rope_dim:]
+    c, sn = cos[:, :, None, :rope_dim].abs(), sin[:, :, None, :rope_dim].abs()
+    ys = rot * sn
+    half = rope_dim // 2
+    g_rot = rot * c + torch.cat((ys[..., half:], ys[..., :half]), dim=-1)
+    return torch.cat((g_rot, rest), dim=-1) if rest.shape[-1] else g_rot
+
+
+def _dw_norm_rows(oracle: dict, name: str) -> int:
+    """The number of rows (tokens x heads) the ``dW_norm`` reduction sums -- the quantity that decides the assertion's form -- read off
+    the oracle's appended per-token post-norm gradient (``dq_post`` / ``dk_post``, ``[T, H, D]``), so a run that carries only ``grads``
+    and ``oracle`` (the record-seeded ``test_gradients_over_a_quantized_record_match_the_record_seeded_fp64_oracle``) is served too."""
+    post = oracle["dq_post" if name == "dw_q_norm" else "dk_post"]
+    return int(post.shape[0]) * int(post.shape[1])
+
+
+# The dense ``_check_all_grads`` cells below ``_DW_NORM_STRUCTURED_BELOW_ROWS`` rows: ONE -- ``test_gqa_ratio_and_batch[1-1]`` (B = 1, S = 256,
+# h_kv = 1: 256 ``dW_k_norm`` rows); the B = 1, S = 256, h_kv = 2 cells (fp16, causal bottom-right, SAVE_ALL, ``[2-1]``) sit AT 512 and keep the
+# statistic.  Of the packed cells it moves ``(5, 0, 0)``, ``(5,)``, ``(129, 5)`` / ``(130, 5)``, ``(128,)`` and the two-heads ``(5,)`` cell.
+
+
+def _dw_norm_own_sum(res, name: str):
+    """The norm + RoPE backward's EXACT function of the block's OWN inputs, in fp64: ``S[d] = sum_rows RoPE^T(slot)[r, d] * (x_pre[r, d] * rstd[r])``
+    over B4's bf16 dQ / dK slot (intact after execute: B5 + B6 read it, nothing writes it again), the slab's bf16 pre-norm band, the saved fp32 rstd
+    and the bf16 cos / sin.  Returns ``(S, mass_S, slot_view, slot64, x_hat_blk, cos64, sin64)``: the slot as the block's own bf16 view and as
+    ``[1, T, H, D]`` fp64, ``x_hat_blk`` ``[1, T, H, D]`` fp64, the tables ``[1, T, rope_dim]`` fp64 -- for a dense (``B, S``) or a packed (``T``) run."""
+    blk, g, saved, inp = res.blk, res.geom, res.saved, res.inp
+    d, act = g.d_head, blk.act_dtype
+    lay = blk._layout()
+    proj = saved.proj_slab.view(-1, g.n_qkvg)
+    t = int(proj.shape[0])
+    o_q, _o_g, o_k, _o_v = g.qkvg_offsets
+    slot_off, heads, off, rstd = (lay.dq, g.h_q, o_q, saved.rstd_q) if name == "dw_q_norm" else (lay.dk, g.h_kv, o_k, saved.rstd_k)
+    slot_view = _view(res.ws, slot_off, (t, heads, d), act)
+    slot64 = slot_view.view(1, t, heads, d).double()
+    assert inp["cos"].shape[0] * inp["cos"].shape[1] == t, f"cos table {tuple(inp['cos'].shape)} does not cover the run's {t} tokens"
+    cos64, sin64 = inp["cos"].double().reshape(1, t, -1), inp["sin"].double().reshape(1, t, -1)  # [B, S, rope] dense / [1, T, rope] packed
+    x_hat = _cols(proj, off, heads, d).reshape(1, t, heads, d).double() * rstd.double().reshape(1, t, heads)[..., None]
+    terms = (_rope_adjoint(slot64, cos64, sin64, g.rope_dim) * x_hat).reshape(-1, d)
+    return terms.sum(0), terms.pow(2).sum(0).sqrt(), slot_view, slot64, x_hat, cos64, sin64
+
+
+def _assert_dw_norm_structured(res, name: str, oracle: dict, what: str) -> float:
+    """``dW_norm`` in the STRUCTURED form -- for reductions of fewer than ``_DW_NORM_STRUCTURED_BELOW_ROWS`` rows, where the random-walk statistic
+    of ``_assert_dw_norm_close`` is not the quantity it was calibrated as.  The deviation from the fp64 oracle is split along the block's chain and
+    each part is held to the bound of the stage that produces it; nothing here is a new tolerance:
+
+      (1) the norm + RoPE backward kernel + reduce against the fp64 sum over its OWN inputs (``_dw_norm_own_sum``): ``|got - S| <= 1e-4 mass_S +
+          1e-3 |S|`` -- the fp32 tightness of ``test_stage_localisation_via_autograd_grad`` (an fp32 sum of products that are exact in fp32;
+          measured 2e-7..5e-7 of the mass at the 5-token cell);
+      (2) the dQ / dK slot against the oracle's post-norm gradient under the bf16 block's bound form (``_assert_grad_close``: the tolerance every
+          other bf16 band of the block is held to) -- the SDPA stage's output as the norm backward's input (measured 0.35 / 0.60 of it, 0 rows outside);
+      (3) the propagated cap on the whole deviation: ``|got - ref| <= bound_1 + sum_rows |RoPE^T|(bound_2)[r] |x_hat_ref[r]| + sum_rows |g_ref[r]|
+          |x_hat_blk[r] - x_hat_ref[r]|`` -- (1), (2) and the forward record's own slab / rstd rounding (measured; 0.15 of the noise bound at the
+          5-token cell), each propagated through the reduction row by row.  A CONSISTENCY check, not a third detector: by the identity
+          ``got - ref = (got - S) + A + B + AB`` it is implied by (1) and (2) up to the second-order cross term ``AB`` (measured 1.2e-3 of the
+          noise bound), and its cap is 1.4-28x the random-walk bound per column at the 10-row cell (median 5x over the non-RoPE columns, 28x
+          at the seed-0 miss column; 3-67x, median 12-13x, at the 40-row ``dW_q_norm``) -- it names a miss no stage explains, nothing finer.
+          A defect in any stage breaks that stage's bound first: one dropped row term alone is 0.57-0.69 of the mass at the 5-token cell,
+          18-22x the noise coefficient, 7600x the fp32 bound of (1).
+
+    So below the threshold the end-to-end deviation from the fp64 oracle is held through (1) + (2) (and the cosine floor), not through a
+    bound of its own: the random-walk statistic (``_DW_NORM_NOISE * mass + _DW_NORM_RTOL * |ref|``) is PRINTED with its worst cell, never
+    asserted here, and is the value returned (so the suites' ``worst`` tables keep their meaning).  ``res`` must be the full run (``blk``,
+    ``geom``, ``saved``, ``ws``, ``inp``): the form reads the block's own slot / slab / rstd.  ``oracle`` carries ``<name>``, ``<name>_mass`` and the appended
+    ``dq_post / dk_post``, ``q_pre / k_pre``, ``rstd_q / rstd_k`` (``_fp64_oracle`` / ``_fp64_oracle_from_record`` / the packed oracle)."""
+    side = "q" if name == "dw_q_norm" else "k"
+    missing = [f for f in ("blk", "geom", "saved", "ws", "inp") if not hasattr(res, f)]
+    assert not missing, f"{what}: the structured dW_norm form reads the block's own slot / slab / rstd -- the run carries no {missing}"
+    got64, ref64, mass = res.grads[name].detach().double(), oracle[name].detach().double(), oracle[name + "_mass"].detach().double()
+    assert torch.isfinite(got64).all(), f"{what}: non-finite cells"
+    S, mass_S, slot_view, slot64, x_hat_blk, cos64, sin64 = _dw_norm_own_sum(res, name)
+    _b, t, heads, d = slot64.shape
+    post_ref = oracle[f"d{side}_post"].detach().double().reshape(1, t, heads, d)
+    x_hat_ref = oracle[f"{side}_pre"].detach().double().reshape(1, t, heads, d) * oracle[f"rstd_{side}"].detach().double().reshape(1, t, heads)[..., None]
+    rope_dim = res.geom.rope_dim
+    # (1) the stage's own arithmetic
+    bound_1 = 1e-4 * mass_S + 1e-3 * S.abs()
+    own = (got64 - S).abs()
+    worst_1 = (own / bound_1).max().item()
+    # (2) the slot against the oracle's post-norm gradient, the bf16 block's bound form
+    worst_2 = _assert_grad_close(slot_view, post_ref.reshape(slot_view.shape), f"{what}: the d{side} slot vs the oracle's post-norm gradient")
+    bound_2 = _ATOL_FRAC[slot_view.dtype] * post_ref.abs().max() + _RTOL[slot_view.dtype] * post_ref.abs()
+    # (3) the propagated cap
+    g_ref = _rope_adjoint(post_ref, cos64, sin64, rope_dim)
+    cap = (
+        bound_1
+        + (_rope_adjoint_abs(bound_2, cos64, sin64, rope_dim) * x_hat_ref.abs()).reshape(-1, d).sum(0)
+        + (g_ref.abs() * (x_hat_blk - x_hat_ref).abs()).reshape(-1, d).sum(0)
+    )
+    diff = (got64 - ref64).abs()
+    worst_3 = (diff / cap).max().item()
+    noise_bound = _DW_NORM_NOISE * mass + _DW_NORM_RTOL * ref64.abs()
+    worst_noise = (diff / noise_bound).max().item()
+    cap_ratio = cap / noise_bound  # how much looser the consistency cap (3) is than the random-walk bound, per column
+    cos = _cos(got64, ref64)
+    msg = (
+        f"{what} (structured form, {t * heads} rows): kernel vs the fp64 sum over its own inputs {worst_1:.3f} of the fp32 bound (1e-4*mass + 1e-3*|S|); "
+        f"the d{side} slot {worst_2:.3f} of the bf16 bound; whole deviation {worst_3:.3f} of the propagated cap (the cap is "
+        f"{cap_ratio.median().item():.1f}x median / {cap_ratio.max().item():.1f}x max the random-walk bound per column); the random-walk statistic "
+        f"|diff|/mass max={(diff / mass.clamp_min(1e-300)).max().item():.4g}, worst cell {worst_noise:.3f} of ({_DW_NORM_NOISE:.4g}*mass + {_DW_NORM_RTOL}*|ref|) "
+        f"PRINTED, not asserted at this length; max|diff|={diff.max().item():.4g} max|ref|={ref64.abs().max().item():.4g} cos={cos:.6f}"
+    )
+    print(msg)
+    assert bool((own <= bound_1).all()), (
+        f"{what}: the norm + RoPE backward deviates from the fp64 sum over the block's own d{side} slot / slab / rstd ({worst_1:.3f} of the fp32 bound) "
+        f"-- the stage's arithmetic, not its inputs"
+    )
+    assert bool((diff <= cap).all()), (
+        f"{what}: the deviation from the oracle exceeds the stage bounds propagated through the reduction ({worst_3:.3f} of the cap) -- a miss no stage's "
+        f"own bound explains"
+    )
+    assert cos >= _COS_MIN, msg
+    return worst_noise
+
+
+def _assert_dw_norm(res, name: str, oracle: dict, what: str) -> float:
+    """``dW_norm`` in the form its reduction length admits: the calibrated random-walk statistic (``_assert_dw_norm_close``) at
+    ``_DW_NORM_STRUCTURED_BELOW_ROWS`` rows or more, the structured form (``_assert_dw_norm_structured``) below it, the statistic printed there."""
+    if _dw_norm_rows(oracle, name) >= _DW_NORM_STRUCTURED_BELOW_ROWS:
+        return _assert_dw_norm_close(res.grads[name], oracle[name], oracle[name + "_mass"], what)
+    return _assert_dw_norm_structured(res, name, oracle, what)
 
 
 def _declare_bwd(geom_kw, batch, seq_len, *, save_mode="proj_slab", dtype=torch.bfloat16, seq_lens=None, **bwd_kw):
@@ -384,7 +531,7 @@ def _check_all_grads(res) -> dict:
             worst[name] = _assert_grad_close(res.grads[name], res.oracle[name], name)
     for name in ("dw_q_norm", "dw_k_norm"):
         if res.grads[name] is not None:
-            worst[name] = _assert_dw_norm_close(res.grads[name], res.oracle[name], res.oracle[name + "_mass"], name)
+            worst[name] = _assert_dw_norm(res, name, res.oracle, name)
     return worst
 
 
@@ -2199,6 +2346,16 @@ def _fp64_oracle_from_record(inp: dict, geom_kw: dict, dy: torch.Tensor, o_rec: 
     if g64.qk_norm:
         res["dw_q_norm_mass"] = _dw_norm_noise_mass(dq_post, q_pre, rstd_q, cos, sin, g64.rope_dim)
         res["dw_k_norm_mass"] = _dw_norm_noise_mass(dk_post, k_pre, rstd_k, cos, sin, g64.rope_dim)
+    # Appended (the structured dW_norm form, ``_assert_dw_norm_structured``): the oracle's post-norm gradients, pre-norm bands and rstd per token.
+    t = b * s
+    res.update(
+        dq_post=dq_post.detach().reshape(t, hq, d),
+        dk_post=dk_post.detach().reshape(t, hkv, d),
+        q_pre=q_pre.detach().reshape(t, hq, d),
+        k_pre=k_pre.detach().reshape(t, hkv, d),
+        rstd_q=None if rstd_q is None else rstd_q.detach().reshape(t, hq),
+        rstd_k=None if rstd_k is None else rstd_k.detach().reshape(t, hkv),
+    )
     return res
 
 
@@ -2296,14 +2453,18 @@ def _passes_the_block_level_checks(blk, *, attr: str) -> None:
 def test_fp8_declaration_declines_are_typed():
     """Every typed decline of the quantized backward's DECLARATION, on any CUDA device, before the Rubin gate and before any
     stage is asked -- and the ONE place its message texts are pinned (every other test matches the attribute name only).
-    At construction: a ``quant`` of a wrong type (``TypeError``), an ``MxQuantSpec`` (a typed ``NotImplementedError``: the
-    MXFP8 backward is a follow-up), e5m2 codes (``QuantSpec.validate``), ``grad_scaling`` outside its vocabulary or given
-    without ``quant``.  At ``check_support``: an fp16 ``sample_dy`` under ``quant`` (the quantized backward is bf16); the
-    record / weight dtype gates BOTH ways (a bf16 ``saved.h`` with a spec, e4m3 codes without one -- the Q0 message extended
-    with the ``quant=QuantSpec`` declaration --, bf16 weights with a spec, e4m3 weights without one); ``thd=True`` with
-    ``quant`` (names BOTH attributes and never the row's flag, so the caller is not told to drop the delta the block
-    requires).  There is NO ``B*S % 16`` decline: the weight-gradient GEMMs are MN-major (no K-contiguous operand), so S = 1000
-    at B = 1 passes the block-level checks with its weight gradients, with one of them, without them, and at B = 2 alike."""
+    At construction: a ``quant`` of a wrong type (``TypeError``), e5m2 codes (``QuantSpec.validate``), ``grad_scaling`` outside
+    its vocabulary or given without ``quant``; an ``MxQuantSpec`` is NO decline -- it selects the MXFP8 backward's own
+    declaration (``test_mxfp8_declaration_declines_are_typed`` pins its declines).  At ``check_support``: an fp16 ``sample_dy``
+    under ``quant`` (the quantized backward is bf16); the record / weight dtype gates BOTH ways (a bf16 ``saved.h`` with a spec,
+    e4m3 codes without one -- the Q0 message extended with the ``quant=QuantSpec`` declaration --, bf16 weights with a spec,
+    e4m3 weights without one).  ``thd=True`` with ``quant=QuantSpec`` is SERVED, not declined: the packed per-tensor fp8
+    backward constructs over any record (a placeholder without a proj_slab included -- the gate-copy decline is
+    ``check_support``'s) with the dense stage list at ``B = 1, S = T`` and the SDPA stage declared PACKED over the fp8 row,
+    the facts read off the declared stage without a compile (the packed suite owns the record's buffers); the ``MxQuantSpec``
+    x ``thd`` decline is the MXFP8 test's.  There is NO ``B*S % 16`` decline: the weight-gradient GEMMs are MN-major (no
+    K-contiguous operand), so S = 1000 at B = 1 passes the block-level checks with its weight gradients, with one of them,
+    without them, and at B = 2 alike."""
     b, s = 1, 256
     # -- construction --
     with pytest.raises(TypeError, match="quant"):
@@ -2343,34 +2504,42 @@ def test_fp8_declaration_declines_are_typed():
     with pytest.raises(ValueError, match="w_o") as ei:
         r.blk.check_support()
     assert "without quant" in str(ei.value) and "DEQUANTIZED" in str(ei.value)
-    # -- thd + quant: both attributes named, the row's flag never (the message must not tell the caller to drop the delta) --
+    # -- thd + quant=QuantSpec: SERVED packed at CONSTRUCTION (before any stage is built), whatever the record carries -- the dense
+    #    stage list at B = 1, S = T with the SDPA stage declared PACKED over the fp8 row; the facts read off the declared stage, no
+    #    compile (the packed suite, test_block_thd_backward_fp8.py, runs the record); an MxQuantSpec under thd is the typed decline
+    #    (test_mxfp8_declaration_declines_are_typed) --
     lens = torch.tensor([128, 128], dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError) as ei:  # at CONSTRUCTION (before any stage is built), whatever the record carries
-        _declare_bwd_fp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
-    msg = str(ei.value)
-    assert "thd=True" in msg and "quant=QuantSpec" in msg and "dense-only" in msg, msg
-    assert "external_delta" not in msg, msg
-    z = torch.empty(0, device="cuda")  # a placeholder record without a proj_slab gets the same answer, not the gate-copy decline
+    r = _declare_bwd_fp8(dict(_COMMON), 1, 256, thd=True, num_sequences=2, max_seq_len=128, saved_replace=dict(seq_lens=lens, seq_lens_form="lengths"))
+    assert r.blk.thd and r.blk.quant is _QSPEC and (r.blk.batch, r.blk.seq_len) == (1, 256) and (r.blk.num_sequences, r.blk.max_seq_len) == (2, 128)
+    assert [type(st).__name__ for st in r.blk._stages] == _FP8_STAGES, "the dense fp8 stage list, packed at the SDPA stage only"
+    st = r.blk._sdpa
+    assert type(st).__name__ == "_SdpaBwdFp8" and st.thd and (st.num_sequences, st.max_seq_len, st.cu_seqlens) == (2, 128, False)
+    impl = st._ensure_impl()
+    assert impl.thd is True and impl.external_delta is True and impl.seq_kv_lens_present is False and impl.amax_requested == frozenset({"amax_dP"})
+    assert (impl.max_total_seq_len_q, impl.max_total_seq_len_kv) == (256, 256)
+    assert tuple(impl.external_delta_shape) == st.delta_shape == (1, _COMMON["h_q"], 256), "the packed delta: the dense layout at B = 1, S = T"
+    assert tuple(int(x) for x in impl.stats_desc.shape) == (2, _COMMON["h_q"], 128, 1), "Stats declared over the envelope (B, H_q, S_max, 1)"
+    z = torch.empty(0, device="cuda")  # a placeholder record without a proj_slab constructs the same way (the gate-copy decline is check_support's)
     placeholder = SavedForBackward(
         h=torch.empty(256, _COMMON["d_model"], dtype=_E4M3, device="cuda"), gate=z, o=z, lse=z, rstd_q=z, rstd_k=z, seq_lens=lens, seq_lens_form="lengths"
     )
     inp = _declare_bwd(dict(_COMMON), 1, 256).inp
-    with pytest.raises(ValueError, match="thd=True with quant=QuantSpec"):
-        GatedAttentionBlockBwd(
-            torch.empty(256, _COMMON["d_model"], dtype=torch.bfloat16, device="cuda"),
-            placeholder,
-            inp["w_qkvg"].to(_E4M3),
-            inp["w_q_norm"],
-            inp["w_k_norm"],
-            inp["cos"],
-            inp["sin"],
-            inp["w_o"].to(_E4M3),
-            GatedAttentionBlockGeometry(**_COMMON),
-            quant=_QSPEC,
-            thd=True,
-            num_sequences=2,
-            max_seq_len=256,
-        )
+    blk = GatedAttentionBlockBwd(
+        torch.empty(256, _COMMON["d_model"], dtype=torch.bfloat16, device="cuda"),
+        placeholder,
+        inp["w_qkvg"].to(_E4M3),
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        inp["cos"],
+        inp["sin"],
+        inp["w_o"].to(_E4M3),
+        GatedAttentionBlockGeometry(**_COMMON),
+        quant=_QSPEC,
+        thd=True,
+        num_sequences=2,
+        max_seq_len=256,
+    )
+    assert blk.thd and type(blk._sdpa).__name__ == "_SdpaBwdFp8" and blk._sdpa.thd and (blk._sdpa.num_sequences, blk._sdpa.max_seq_len) == (2, 256)
     # -- no B*S % 16 rule: S = 1000 at B = 1 passes the block-level checks WITH its weight gradients (T = 1000 is a ragged K the
     #    MN-major wgrads zero-fill), with one of them, without them, and at B = 2 --
     for kw, (bb, ss) in (({}, (1, 1000)), (dict(need_dw_qkvg=False), (1, 1000)), (dict(need_dw_o=False, need_dw_qkvg=False), (1, 1000)), ({}, (2, 1000))):

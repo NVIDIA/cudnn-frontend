@@ -2160,8 +2160,8 @@ LSE_KINDS = ("dense", "token", "head", "padded")
 @lru_cache(maxsize=None)
 def compile_thd_split(*, has_lse: bool = True, lse_kind: str = "head", paged_hnd: bool = False) -> Callable:
     """Compile only from plan facts; every token capacity and stride is dynamic."""
-    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and PAGED_KV and not CFG.PACK_GQA):
-        raise ValueError("packed D256 split requires paged THD without PackGQA")
+    if not (CFG.THD_VARLEN and SPLIT_KV > 1 and CFG.TILE_O == 256 and CFG.TILE_K == 256 and not CFG.PACK_GQA):
+        raise ValueError("packed D256 split requires THD without PackGQA")
     cache_key = _template_key(globals(), locals(), "compile_thd_split")
     return _compile_thd_split_host(_host, CFG, STORAGE_DTYPE, cache_key, has_lse=has_lse, lse_kind=lse_kind, paged_hnd=paged_hnd, ragged_q_slots=False)
 

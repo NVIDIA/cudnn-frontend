@@ -16,7 +16,11 @@ $$\text{Output}[1,\ S \times \text{topK},\ N] = \text{Token}[1,\ S,\ K]\ \times\
 
 **Scatter mode** (scatter output back to token order after matmul):
 
-$$\text{Output}[1,\ S \times \text{topK},\ N] = \text{Token}[1,\ S \times \text{topK},\ K]\ \times\ \text{Weight}[E,\ K,\ N]$$
+First compute the grouped matmul for each routed row, then scatter each result back to the expanded token/top-k output slot using `TokenIndex` and `TokenKs`:
+
+$$\text{GroupedResult}[r,\ N] = \text{Token}[1,\ r,\ K]\ \times\ \text{Weight}[\text{expert}(r),\ K,\ N]$$
+
+$$\text{Output}[1,\ \text{TokenIndex}[r] \times \text{topK} + \text{TokenKs}[r],\ N] = \text{GroupedResult}[r,\ N]$$
 
 **Combine mode** performs FC2, routing-score multiplication, and summation across selected experts, producing `[1, S, N]`. See the FROST COMBINE contract below.
 
@@ -269,7 +273,7 @@ output = graph.moe_grouped_matmul(
 
 **Args:**
 - `token` (cudnn_tensor): Token data.
-  - None/Scatter mode: shape `(1, S*topK, K)`
+  - None/Scatter modes: shape `(1, S*topK, K)`
   - Gather mode: shape `(1, S, K)`
 - `weight` (cudnn_tensor): Expert weight data with shape `(E, K, N)`.
 - `first_token_offset` (cudnn_tensor): INT32/INT64 tensor of shape `(B*E+1, 1, 1)` including the final endpoint. See [deprecated implicit offsets](#deprecated-implicit-offsets) for compatibility.

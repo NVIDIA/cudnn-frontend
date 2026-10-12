@@ -921,15 +921,19 @@ class pygraph:
                 if spec_entry:
                     _, spec = spec_entry
                     infer = spec.get("infer", {})
+                    # builder-time dims of a "reinfer" port are provisional: they depend on a sibling the caller may set later
+                    reinfer = spec.get("reinfer", ())
                     for oport, out_t in node.outputs.items():
-                        if out_t is not None and not out_t.dim:
+                        if out_t is not None and (not out_t.dim or (oport in reinfer and not out_t.dim_assigned)):
                             try:
                                 d = infer.get(oport, lambda n: None)(node)
                             except Exception:  # noqa: BLE001 — best-effort
                                 d = None
                             if d:
+                                reinferred = bool(out_t.dim)
                                 out_t.dim = list(d)
-                                out_t.stride = _row_major_stride(out_t.dim)
+                                if not (reinferred and out_t.stride_assigned):  # a re-inferred port keeps the caller's stride
+                                    out_t.stride = _row_major_stride(out_t.dim)
                 node.validate()
         except ValueError:
             # Inference can reject shapes before the family validator runs
@@ -2884,6 +2888,8 @@ _install_pointwise_builders()
 #                      whose predicate is False is skipped, and comes back None)
 #   infer              per-output IR-side shape inference (introspection; cuDNN
 #                      re-infers at build) — best-effort, None on failure
+#   reinfer            output ports whose builder-time inferred dims validate()
+#                      recomputes (they follow a sibling the caller may set later)
 #   dtype_like         per-output data_type copied from a named input port
 #   push_output_dims   True for ops whose output dims cuDNN cannot infer
 #                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
@@ -3023,7 +3029,29 @@ def _block_quant_scale_dims(node):
     return d
 
 
-_NORM_FWD_INFER = {"Y": _like("input"), "mean": _stats_like("input", (0,)), "inv_var": _stats_like("input", (0,))}
+def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever scale is not 1 (from first_axis on)
+    def infer(node):
+        d = node.inputs["input"].dim if "input" in node.inputs else None
+        s = node.inputs["scale"].dim if node.inputs.get("scale") is not None else None
+        if not d:
+            return None
+        if not s:  # no scale (rmsnorm, #188): every axis after the batch axis is normalized
+            return [x if i == 0 else 1 for i, x in enumerate(d)]
+        return [1 if i >= first_axis and s[i] != 1 else x for i, x in enumerate(d)]
+
+    return infer
+
+
+def _layernorm_stat_like(other):  # the C++ layernorm node's rule: an unset stat takes the dims set on the other one
+    def infer(node):
+        t = node.outputs.get(other)
+        return list(t.dim) if t is not None and t.dim_assigned and t.dim else _norm_stats_like(0)(node)
+
+    return infer
+
+
+_NORM_FWD_INFER = {"Y": _like("input"), "mean": _layernorm_stat_like("inv_var"), "inv_var": _layernorm_stat_like("mean")}
+_ADANORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(1), "inv_var": _norm_stats_like(1)}
 _NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
 
 
@@ -3034,6 +3062,11 @@ def _training_phase(node):  # norm stats exist only in TRAINING forward phase
 
 _NORM_FWD_MAYBE = {"mean": _training_phase, "inv_var": _training_phase}
 
+
+def _has_scale(node):  # rmsnorm/layernorm backward without a scale have no DScale or DBias (#188)
+    return node.inputs.get("scale") is not None
+
+
 _STRUCTURED_OPS = {
     # ---- norms --------------------------------------------------------------
     "rmsnorm": dict(
@@ -3042,7 +3075,7 @@ _STRUCTURED_OPS = {
         attrs=("norm_forward_phase",),
         outputs=("Y", "inv_var"),
         maybe={"inv_var": _training_phase},
-        infer={"Y": _like("input"), "inv_var": _stats_like("input", (0,))},
+        infer={"Y": _like("input"), "inv_var": _norm_stats_like(0)},
     ),
     "rmsnorm_backward": dict(
         node_type=NodeType.RMSNORM_BWD,
@@ -3052,7 +3085,7 @@ _STRUCTURED_OPS = {
         # classic rmsnorm_backward names its outputs ::Dscale/::Dbias (mixed
         # case), unlike the other norm backwards (::DSCALE/::DBIAS)
         out_suffix={"DScale": "Dscale", "DBias": "Dbias"},
-        maybe={"DBias": lambda n: n.params.get("has_dbias", True) is not False},
+        maybe={"DScale": _has_scale, "DBias": lambda n: _has_scale(n) and n.params.get("has_dbias", True) is not False},
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
@@ -3062,11 +3095,13 @@ _STRUCTURED_OPS = {
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
         infer=_NORM_FWD_INFER,
+        reinfer=("mean", "inv_var"),
     ),
     "layernorm_backward": dict(
         node_type=NodeType.LAYERNORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
         outputs=("DX", "DScale", "DBias"),
+        maybe={"DScale": _has_scale, "DBias": _has_scale},
         infer=_NORM_BWD_INFER,
     ),
     "adalayernorm": dict(
@@ -3075,7 +3110,7 @@ _STRUCTURED_OPS = {
         attrs=("norm_forward_phase",),
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
-        infer=_NORM_FWD_INFER,
+        infer=_ADANORM_FWD_INFER,
     ),
     "adalayernorm_backward": dict(
         node_type=NodeType.ADALAYERNORM_BWD,
@@ -3640,7 +3675,8 @@ def _install_structured_builders() -> None:
                 kwargs[ak] = v
             args = args[:n_p]
             for port, v in zip(input_ports, args):
-                node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+                if v is not None:  # an optional port passed positionally as None (e.g. scale, #188)
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
             for port in input_ports[len(args) :]:
                 v = kwargs.pop(port, None)
                 if v is not None:

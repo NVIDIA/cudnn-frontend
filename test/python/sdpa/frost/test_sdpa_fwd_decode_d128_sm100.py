@@ -244,7 +244,8 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
     # The fit is judged on PACK_G, not G: 96/8 at S_q=33 overflows the packed tile
     # (33 * 4 = 132 > 128) while 33 unpacked rows fit; at S_q=32 both legs fit.
     glm33 = _plans(_facts(s_q=33, h_q=96, h_kv=8))
-    assert all(p.knobs.cga == (2 if p.knobs.pack_gqa else 1) for p in glm33), [p.knobs for p in glm33]
+    assert all(p.knobs.cga == 1 for p in glm33 if not p.knobs.pack_gqa), [p.knobs for p in glm33]
+    assert {p.knobs.cga for p in glm33 if p.knobs.pack_gqa} == {1, 2}, [p.knobs for p in glm33]
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=32, h_q=96, h_kv=8)))
     # 24/8: G=3 shares no factor with the tile -- unpacked only, decode tile.
     assert all((p.knobs.cga, p.knobs.pack_gqa) == (1, False) for p in _plans(_facts(h_q=24, h_kv=8)))
@@ -256,15 +257,17 @@ def test_heuristics_propose_the_decode_tile_for_decode_and_mtp_shapes():
 
 @pytest.mark.L0
 def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
-    """S_q * G > 128 on the packed leg, prefill shapes, THD and the other
+    """S_q * G > 128 on the packed leg and dense prefill shapes list both widths
+    (the wave rule picks the lead, issue #1518); THD, paged K/V and the other
     flavors stay on cga2.  The unpacked runner-up of an overflowing packed leg
     is judged on ITS rows (S_q per head): see
     test_heuristics_decode_geometry_follows_the_selected_packing."""
     nine = _plans(_facts(s_q=9))  # 9 * 16 = 144 packed rows; 9 unpacked
-    assert all(p.knobs.cga == 2 for p in nine if p.knobs.pack_gqa), "the packed legs overflow one tile"
+    assert {p.knobs.cga for p in nine if p.knobs.pack_gqa} == {1, 2}, "the packed legs overflow one tile: both widths"
     assert all(p.knobs.cga == 1 for p in nine if not p.knobs.pack_gqa), "the unpacked runner-up fits one tile"
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=512, h_q=8, h_kv=8, s_kv=512, padded=False)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=2048, causal=True, padded=False)))
+    assert {p.knobs.cga for p in _plans(_facts(s_q=512, h_q=8, h_kv=8, s_kv=512, padded=False))} == {1, 2}
+    assert {p.knobs.cga for p in _plans(_facts(s_q=2048, causal=True, padded=False))} == {1, 2}
+    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=9, has_paged_kv=True, page_size=16)) if p.knobs.pack_gqa)
     assert all(p.knobs.cga == 2 for p in _plans(_facts(thd=True)))
     assert all(p.knobs.cga == 2 for p in _plans(_facts(h_q=32, h_kv=2, d_qk=256, d_v=256)))
     # A causal prefill keeps its measured LPT primary: the decode NATURAL rule is decode-shaped only.  (Plain LPT, not
@@ -279,24 +282,25 @@ def test_heuristics_keep_the_prefill_tile_when_the_rows_overflow_one_tile():
 def test_heuristics_decode_geometry_follows_the_selected_packing():
     """Review (PR #1094): the decode-tile fit is decided per CANDIDATE from its
     own packing, not once per graph from PackGQA eligibility.  G=16, S_q=16:
-    the packed leg carries 256 rows (prefill tile, and it still leads), the
-    unpacked runner-up 16 rows per head (decode tile) -- before the fix both
-    rode cga2 because the fit was computed as if every candidate were packed.
-    At S_q > 128 no leg fits; the heur_mode B fallback (unpacked, unsplit)
-    follows its own rows too; every emitted set re-validates."""
+    the packed leg carries 256 rows (it still leads, at either width: past one
+    tile both are listed, issue #1518), the unpacked runner-up 16 rows per head
+    (decode tile) -- before the fix both rode cga2 because the fit was computed
+    as if every candidate were packed.  At S_q > 128 no leg fits; the heur_mode
+    B fallback (unpacked, unsplit) follows its own rows too; every emitted set
+    re-validates."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.heuristics import recommend
 
     plans = _plans(_facts(s_q=16))
     legs = [(p.knobs.pack_gqa, p.knobs.cga) for p in plans]
-    assert legs[0] == (True, 2), legs
-    assert (False, 1) in legs and (False, 2) not in legs and (True, 1) not in legs, legs
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129))), "129 rows overflow one tile unpacked too"
+    assert legs[0][0] is True, legs
+    assert (False, 1) in legs and (False, 2) not in legs and {(True, 1), (True, 2)} <= set(legs), legs
+    assert {p.knobs.cga for p in _plans(_facts(s_q=129))} == {1, 2}, "129 rows overflow one tile unpacked too: both widths"
     fallback = recommend("B", _facts(s_q=16), {ENGINE: _SM100_ID})
     assert [(p.knobs.pack_gqa, p.knobs.cga) for p in fallback] == [(False, 1)], fallback
     # MHA has no group: one rule for the only leg.
     assert all(p.knobs.cga == 1 for p in _plans(_facts(s_q=64, h_q=8, h_kv=8)))
-    assert all(p.knobs.cga == 2 for p in _plans(_facts(s_q=129, h_q=8, h_kv=8)))
+    assert {p.knobs.cga for p in _plans(_facts(s_q=129, h_q=8, h_kv=8))} == {1, 2}
     caps = next(spec for spec in engines.ENGINE_SPECS if spec.name == ENGINE).capabilities
     for f in (_facts(s_q=16), _facts(s_q=9, causal=True, bottom_right=True)):
         for p in _plans(f):
