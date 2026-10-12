@@ -82,9 +82,9 @@ def _target_tests():
     if raw is None:
         raw = ",".join(
             [
-                *(f"test/python/test_mhas_v2.py::test_sdpa_random_fwd_L0[test{i}]" for i in range(1, 11)),
-                *(f"test/python/test_mhas_v2.py::test_sdpa_random_fwd_ragged_L0[test{i}]" for i in range(1, 11)),
-                *(f"test/python/test_mhas_v2.py::test_sdpa_random_bwd_L0[test{i}]" for i in range(1, 6)),
+                *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_L0[test{i}]" for i in range(1, 11)),
+                *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_fwd_ragged_L0[test{i}]" for i in range(1, 11)),
+                *(f"test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_random_bwd_L0[test{i}]" for i in range(1, 6)),
             ]
         )
     return [item.strip() for item in raw.split(",") if item.strip()]

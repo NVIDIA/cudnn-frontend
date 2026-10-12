@@ -219,6 +219,12 @@ Use `get_autotune_workspace` to run autotune on all plans.
 get_autotune_workspace_size() const
 ```
 
+`Graph::autotune(...)` selects a winner only after a successful timed execution.
+If no built candidate can be timed, it returns `GRAPH_EXECUTION_FAILED` with
+candidate failure details and preserves the original plan list and selection,
+so callers can correct their bindings and retry. CUDA timing failures return
+`CUDA_API_FAILED` and also leave that list and selection unchanged.
+
 ### Serialization
 
 The frontend API provides two flavors of serialization. One is to checkpoint after the initial graph specification (before calling validate) and other after building the execution plan (to save on plan creation).

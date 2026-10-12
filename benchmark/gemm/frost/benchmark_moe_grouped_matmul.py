@@ -76,9 +76,9 @@ def _build_spec_map():
         moe=_MoeS(num_experts=8),
     )
     m = {}
-    for t, cfg in _candidates(chain):
+    for t, cfg in _candidates(chain, sweep_swap_ab=True):
         label = cfg.name
-        m[label] = (cfg, cfg.cta_group)
+        m[label] = (cfg, getattr(cfg, "cta_group", 1))
     return m
 
 
@@ -109,7 +109,7 @@ def _graph_moe(S: int, N: int, K: int, E: int, alignment: int = 1):
     )
     fto = g.tensor(
         name="first_token_offset",
-        dim=[E, 1, 1],
+        dim=[E + 1, 1, 1],
         stride=[1, 1, 1],
         data_type=cudnn.data_type.INT32,
         alignment_value=alignment,

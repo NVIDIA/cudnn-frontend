@@ -33,7 +33,17 @@ from .graph_types import NodeType
 _MOE_FWD_INPUTS = ("token", "weight", "first_token_offset")
 _MOE_BWD_INPUTS = ("doutput", "token", "first_token_offset")
 
-COVERED_NODE_TYPES = frozenset({NodeType.MATMUL, NodeType.MOE_GROUPED_MATMUL, NodeType.MOE_GROUPED_MATMUL_BWD})
+COVERED_NODE_TYPES = frozenset(
+    {
+        NodeType.MATMUL,
+        NodeType.MOE_GROUPED_MATMUL,
+        NodeType.MOE_GROUPED_MATMUL_BWD,
+        NodeType.BLOCK_SCALE_DEQUANTIZE,
+        NodeType.BLOCK_SCALE_QUANTIZE,
+        NodeType.POINTWISE,
+        NodeType.REDUCTION,
+    }
+)
 
 
 def _not_supported(message: str) -> Exception:
@@ -49,10 +59,8 @@ def _dims(t: Any):
 
 
 def validate_graph(graph) -> bool:
-    """Validate every node when all of them are GEMM-family (MATMUL / MoE grouped
-    matmul fwd+bwd); return False without raising when the graph holds a node
-    this module does not cover (a pointwise epilogue, a reshape, ...), so the
-    caller falls back to the classic eager C++ lowering."""
+    """Validate GEMM/MoE graphs and their fusion nodes in Python.
+    Return False for uncovered nodes so they retain classic eager lowering."""
     nodes = list(graph._nodes)
     if not nodes or any(n.node_type not in COVERED_NODE_TYPES for n in nodes):
         return False
@@ -67,8 +75,63 @@ def validate_node(node) -> None:
         _validate_matmul(node)
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL:
         _validate_required(node, "MoeGroupedMatmul", _MOE_FWD_INPUTS, ("OUT_0",))
+        _validate_moe_offsets(node)
+        mode = getattr(node.params.get("mode"), "name", None)
+        if mode in ("GATHER", "SCATTER", "COMBINE"):
+            _validate_required(node, "MoeGroupedMatmul", ("token_index",), ())
+        if mode in ("SCATTER", "COMBINE"):
+            _validate_required(node, "MoeGroupedMatmul", ("token_ks",), ())
+        if mode == "COMBINE":
+            _validate_required(node, "MoeGroupedMatmul", ("top_k_scores",), ())
+            _validate_moe_combine(node)
+        elif node.inputs.get("top_k_scores") is not None:
+            raise ValueError("top_k_scores is only valid for MoE COMBINE")
     elif node.node_type == NodeType.MOE_GROUPED_MATMUL_BWD:
         _validate_required(node, "MoeGroupedMatmulBwd", _MOE_BWD_INPUTS, ("dweight",))
+        _validate_moe_offsets(node)
+    elif node.node_type == NodeType.BLOCK_SCALE_DEQUANTIZE:
+        _validate_required(node, "BlockScaleDequantize", ("input", "descale"), ("OUT_0",))
+        if not node.params.get("block_size"):
+            raise ValueError("Block size not set")
+        if not node.outputs["OUT_0"].get_is_virtual():
+            raise ValueError("Output tensor of dequantize node should be virtual")
+    elif node.node_type == NodeType.BLOCK_SCALE_QUANTIZE:
+        _validate_required(node, "BlockScaleQuantize", ("input",), ("Y", "scale"))
+        if not node.params.get("block_size"):
+            raise ValueError("Block size not set")
+    elif node.node_type == NodeType.REDUCTION:
+        _validate_required(node, "Reduction", ("input",), ("OUT_0",))
+        if not node.params.get("mode"):
+            raise ValueError("Reduction mode not set")
+    elif node.node_type == NodeType.POINTWISE:
+        _validate_required(node, "Pointwise", ("IN_0",), ("OUT_0",))
+        if not node.params.get("mode"):
+            raise ValueError("Pointwise mode not set")
+        # Node.infer_properties checks input broadcasting when inferring an
+        # output. Also check it when callers supplied an explicit output shape.
+        out = _dims(node.outputs["OUT_0"])
+        for tensor in node.inputs.values():
+            dim = _dims(tensor)
+            if dim and out and (len(dim) > len(out) or any(x != 1 and x != y for x, y in zip(reversed(dim), reversed(out)))):
+                raise _not_supported("Pointwise inputs do not broadcast to the output shape")
+
+
+def _validate_moe_combine(node) -> None:
+    """COMBINE changes the token extent; preserve that public graph contract."""
+    token, weight = _dims(node.inputs["token"]), _dims(node.inputs["weight"])
+    scores = _dims(node.inputs["top_k_scores"])
+    top_k = node.params.get("top_k")
+    if not token or not weight or len(token) != 3 or len(weight) != 3:
+        raise ValueError("MoE COMBINE token and weight must have rank 3")
+    if not isinstance(top_k, int) or not 1 <= top_k <= weight[0]:
+        raise ValueError("MoE COMBINE requires 1 <= top_k <= num_experts")
+    if not scores or len(scores) != 3 or scores[0] != 1 or scores[1] <= 0 or scores[2] != top_k:
+        raise ValueError("MoE COMBINE top_k_scores must have shape [1, tokens, top_k]")
+    for role in ("token_index", "token_ks"):
+        if _dims(node.inputs[role]) != [1, token[1], 1]:
+            raise ValueError(f"MoE COMBINE {role} must have shape [1, routed_rows, 1]")
+    if _dims(node.outputs["OUT_0"]) != [1, scores[1], weight[2]]:
+        raise ValueError("MoE COMBINE output must have shape [1, tokens, N] matching top_k_scores")
 
 
 def _validate_matmul(node) -> None:
@@ -99,10 +162,35 @@ def _validate_matmul(node) -> None:
 
 
 def _validate_required(node, label: str, inputs, outputs) -> None:
-    """Classic ATTRIBUTE_NOT_SET parity for the MoE grouped-matmul nodes."""
+    """Classic ATTRIBUTE_NOT_SET parity for required node ports."""
     for port in inputs:
         if node.inputs.get(port) is None:
             raise ValueError(f"{label} input {port} not set.")
     for port in outputs:
         if node.outputs.get(port) is None:
             raise ValueError(f"{label} output {port} not set.")
+
+
+def moe_offset_mode(offset_count: int, num_experts: int) -> bool:
+    """Infer G starts vs G+1 boundaries, with G a positive multiple of E.
+
+    E=1 always uses explicit boundaries. For E>1, the length modulo E
+    distinguishes the two modes without adding an operation attribute.
+    """
+    if num_experts > 0 and offset_count > 0:
+        if num_experts == 1:
+            if offset_count >= 2:
+                return True
+        elif offset_count % num_experts == 0:
+            return False
+        if offset_count > 1 and (offset_count - 1) % num_experts == 0:
+            return True
+    raise ValueError("first_token_offset must contain G starts or G+1 boundaries, where G is a positive multiple of the expert count (E=1 requires G+1)")
+
+
+def _validate_moe_offsets(node) -> None:
+    offsets = _dims(node.inputs["first_token_offset"])
+    expert_tensor = node.inputs["weight"] if node.node_type == NodeType.MOE_GROUPED_MATMUL else node.outputs["dweight"]
+    experts = _dims(expert_tensor)
+    if offsets and experts:
+        moe_offset_mode(offsets[0], experts[0])

@@ -81,6 +81,7 @@ Fixed-length tensor shapes are:
 | `mask_func` | `[Hmask, nfunc, B * Sq]` | CUDA INT32 |
 | `out` | `[B, Sq, Hq, Dv]` | same as `q` |
 | `lse` | `[B, Hq, Sq]` | FP32 |
+| `max_logit` (optional) | `[Hq]` | FP32 |
 
 `Hq` must be divisible by `Hkv`, supporting MHA, GQA, and MQA. `Hmask` must
 be `1` for a mask shared by all query heads or `Hq` for per-head masks.
@@ -88,9 +89,30 @@ be `1` for a mask shared by all query heads or `Hq` for per-head masks.
 batch-major order, but every endpoint remains a sample-local key coordinate
 in `[0, Sk]`. Endpoints must be nondecreasing within each query row.
 
-With `return_lse=False` (the default), `flex_attn_func` returns only `out`.
-With `return_lse=True`, it returns `(out, lse)`. LSE is still maintained
-internally when gradients require it.
+With both output flags disabled (the default), `flex_attn_func` returns `out`.
+The optional statistics are returned in this order:
+
+| `return_lse` | `return_max_logit` | Return value |
+|---|---|---|
+| `False` | `False` | `out` |
+| `True` | `False` | `(out, lse)` |
+| `False` | `True` | `(out, max_logit)` |
+| `True` | `True` | `(out, lse, max_logit)` |
+
+LSE is still maintained internally when gradients require it. `max_logit[h]`
+is the maximum of `softmax_scale * dot(q[b, i, h], k[b, j, h // (Hq/Hkv)])`
+over all batches and mask-visible query/key pairs for query head `h`.
+This is a signed maximum, not an absolute maximum. A head with no visible
+pair returns `-inf`. The same `[Hq]` reduction applies to variable-length
+THD inputs across all sequences. `return_max_logit=True` requires a
+non-negative scale; at zero scale a head with visible pairs returns zero.
+`max_logit` is non-differentiable; output and LSE retain their gradient support.
+
+```python
+out, lse, max_logit = flex_attn_func(
+    q, k, v, mask_plan=plan, return_lse=True, return_max_logit=True
+)
+```
 
 ## Variable-length THD API
 
@@ -150,7 +172,7 @@ them, so later mutations of the caller's tensors do not change plan geometry.
   an autograd-enabled call requiring gradients.
 
 The execution function accepts `softmax_scale` (default
-`1 / sqrt(Dqk)`), `deterministic`, and `return_lse`. Plan reuse requires the
+`1 / sqrt(Dqk)`), `deterministic`, `return_lse`, and `return_max_logit`. Plan reuse requires the
 same fixed/variable mode, sequence and head geometry, dtype, and device used
 at construction.
 
@@ -171,6 +193,16 @@ buffers are per-execution workspace rather than plan state, so one plan can be
 used by independent calls.
 
 ## Explicit compile and execute APIs
+
+To enable the maximum statistic in the explicit API, provide a contiguous CUDA
+FP32 `[Hq]` sample buffer as `FlexAttentionFwd(..., sample_max_logit=max_logit)`
+and supply `max_logit_tensor=max_logit` on every `execute()` call. Its presence,
+shape, dtype, stride, and device must match the compiled descriptor. Each call
+resets this buffer to `-inf` on the launch stream before the attention kernel
+reduces into it, including during CUDA graph replay. `execute()` requires no
+additional allocation for this output. The statistic uses the kernel's row
+maxima and CTA-local/global atomic reductions; enabling it specializes the
+kernel and may affect performance.
 
 Most PyTorch users should use `flex_attn_func`. Framework integrations can use
 `FlexAttentionFwd` and `FlexAttentionBwd` directly. Constructors capture sample

@@ -184,9 +184,12 @@ Alternatively, you can control logging programmatically via `cudnn_frontend::isL
 
 **OSS engine selection:**
 
-The open-source engines are opt-in while they mature: set the flag below and they become candidates
-for every graph they can serve, ranked against the cuDNN backend's own engines in one list. Engines
-that are the only implementation of their operation (GDN/KDA) need no flag.
+The FROST SDPA forward engines for SM100 and SM120 (f16/bf16) are candidates by default, ranked
+against the cuDNN backend's own engines per measured shape class (`python/cudnn/sdpa/fwd/placement.py`:
+FROST first where it is timed ahead, the backend first where it is not). The other open-source
+engines are opt-in while they mature: set the flag below and they become candidates for every graph
+they can serve; the flag also ranks every FROST engine first. Engines that are the only
+implementation of their operation (GDN/KDA) need no flag.
 
 ```bash
 # Offer the maturing open-source engines (FROST GEMM / SDPA) as plan candidates.

@@ -18,7 +18,7 @@ import math
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
-from cutlass.utils.smem_allocator import SmemAllocator
+from cudnn._cutlass_compat import SmemAllocator
 
 """
 block prefix sum kernel (input is loading from shared memory) in CuTe DSL.

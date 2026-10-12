@@ -56,6 +56,7 @@ class IndexerTopKKernelVarlen:
         chunk_size_per_cta: int = 16384,
         num_ctas_per_row: int = 1,
         merge_blocks: bool = False,
+        tie_break: int = 0,
     ):
         self.dtype = dtype
         self.max_num_cols = max_num_cols
@@ -65,6 +66,11 @@ class IndexerTopKKernelVarlen:
         self.chunk_size_per_cta = chunk_size_per_cta
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
+        self.tie_break = tie_break
+        if tie_break not in (0, 1, 2):
+            raise ValueError("tie_break must be 0 (none), 1 (small), or 2 (large)")
+        if tie_break and merge_blocks:
+            raise ValueError("tie_break requires original source-column order, not merged candidates")
 
         # Note: now we only support top_k <= 2048, we could change the code here to support larger top_k.
         self.indexer_topk_max_k = 2048
@@ -194,6 +200,53 @@ class IndexerTopKKernelVarlen:
             else:
                 key = (bits ^ cute.Uint16(0xFFFF)) & cute.Uint16(0x7FFF)
             return cute.Uint16(key)
+
+    @cute.jit
+    def collect_boundary_ties(self, score, row_start, length, remaining, s_indices, scan_scratch):
+        """Select cutoff ties in source-column order without sorting output slots."""
+        tidx, _, _ = cute.arch.thread_idx()
+        # The radix pass already found the exact cutoff and filled these slots.
+        # Read its key before any thread replaces one of the provisional winners.
+        pivot_index = cutlass.Int32(cutlass.Uint32(s_indices[self.top_k - 1]))
+        pivot_key = self.to_ordered(score[pivot_index])
+        cute.arch.barrier()
+        selected = cutlass.Int32(0)
+        tile_start = cutlass.Int32(0)
+        # Four adjacent items per thread amortize the block scan and barriers
+        # when sparse cutoff ties require traversing a long row.
+        items_per_thread = 4
+        flags = cute.make_rmem_tensor((items_per_thread,), cutlass.Int32)
+        while (tile_start < length) and (selected < remaining):
+            count = cutlass.Int32(0)
+            for item in cutlass.range(items_per_thread, unroll_full=True):
+                offset = tile_start + tidx * items_per_thread + item
+                index = row_start + offset
+                if cutlass.const_expr(self.tie_break == 2):
+                    index = row_start + length - 1 - offset
+                flags[item] = 0
+                if offset < length:
+                    flags[item] = cutlass.Int32(self.to_ordered(score[index]) == pivot_key)
+                count += flags[item]
+            prefix, total = block_prefix_sum_kernel(
+                count,
+                scan_scratch,
+                tidx,
+                self.num_threads_per_cta,
+                self.num_threads_per_cta // 32,
+                need_total_sum=True,
+            )
+            position = selected + prefix - count
+            for item in cutlass.range(items_per_thread, unroll_full=True):
+                position += flags[item]
+                if flags[item] != 0 and position <= remaining:
+                    index = row_start + tile_start + tidx * items_per_thread + item
+                    if cutlass.const_expr(self.tie_break == 2):
+                        index = row_start + length - 1 - (tile_start + tidx * items_per_thread + item)
+                    s_indices[self.top_k - remaining + position - 1] = self.index_type(index)
+            # All threads must consume the scan totals before reusing scratch.
+            cute.arch.barrier()
+            selected += total
+            tile_start += self.num_threads_per_cta * items_per_thread
 
     @cute.jit
     def prefix_sum_and_find_threshold_coarse(
@@ -437,6 +490,9 @@ class IndexerTopKKernelVarlen:
             fix_bytes = align_bytes - misalign
 
         prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
+        # A row shorter than the bytes up to the next aligned address is all prologue.
+        if prologue_elems > length:
+            prologue_elems = length
 
         remaining = length - prologue_elems
         aligned_size = (remaining // self.vec_size) * self.vec_size
@@ -966,6 +1022,11 @@ class IndexerTopKKernelVarlen:
                                                     )
                             fence_acq_rel_cta()
                             cute.arch.barrier()
+                            if cutlass.const_expr(self.tie_break != 0):
+                                if is_last_round:
+                                    # Only an overfull exact-score boundary reaches this
+                                    # branch. Reuse the now-dead histogram for scan scratch.
+                                    self.collect_boundary_ties(score, row_start, length, topk_remaining, s_indices, s_histogram)
 
             # Phase 3: Output phase
             vecsize_out = cutlass.const_expr(

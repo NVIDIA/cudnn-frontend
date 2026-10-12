@@ -14,7 +14,7 @@
 
 TEST_CASE("WoQ MoeGroupedMatmul", "[MoeGroupedMatmul][graph]") {
 #if (CUDNN_VERSION < 91800)
-    SKIP("MoE is not supported in cudnn versions prior to 9.18.0");
+    SKIP("MoE grouped matmul requires cudnn 9.18.0 or newer");
 #endif
 
     if (is_arch_supported_by_cudnn() == false) {
@@ -30,6 +30,11 @@ TEST_CASE("WoQ MoeGroupedMatmul", "[MoeGroupedMatmul][graph]") {
     int64_t const weight_size = 256;
     int64_t const hidden_size = 512;
     int64_t const block_size  = 128;
+    std::vector<int32_t> first_token_offset_cpu({0, 128, 512, 768, 1152, 1536});
+    if (cudnnGetVersion() >= 92800) {
+        first_token_offset_cpu.push_back(batch_size * token_num * top_k);
+    }
+    int64_t const offset_count = static_cast<int64_t>(first_token_offset_cpu.size());
 
     // Initialize input tensors
     Surface<int8_t> token_gpu(
@@ -44,15 +49,13 @@ TEST_CASE("WoQ MoeGroupedMatmul", "[MoeGroupedMatmul][graph]") {
         div_up(num_experts * div_up(hidden_size, block_size) * weight_size *
                    cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::HALF),
                8));
-    Surface<int8_t> first_token_offset_gpu(div_up(
-        batch_size * num_experts * cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::INT32),
-        8));
+    Surface<int8_t> first_token_offset_gpu(
+        div_up(offset_count * cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::INT32), 8));
     Surface<int8_t> moe_grouped_matmul_gpu(
         div_up(batch_size * token_num * top_k * weight_size *
                    cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::HALF),
                8));
 
-    std::vector<int32_t> first_token_offset_cpu({0, 128, 512, 768, 1152, 1536});
     CUDA_CHECK(cudaMemcpy(first_token_offset_gpu.devPtr,
                           first_token_offset_cpu.data(),
                           first_token_offset_cpu.size() * sizeof(int32_t),
@@ -85,7 +88,7 @@ TEST_CASE("WoQ MoeGroupedMatmul", "[MoeGroupedMatmul][graph]") {
 
     auto tensor_first_token_offset = graph.tensor(fe::graph::Tensor_attributes()
                                                       .set_name("first_token_offset")
-                                                      .set_dim({batch_size * num_experts, 1, 1})
+                                                      .set_dim({offset_count, 1, 1})
                                                       .set_stride({1, 1, 1})
                                                       .set_data_type(fe::DataType_t::INT32));
 
@@ -138,7 +141,7 @@ TEST_CASE("WoQ MoeGroupedMatmul", "[MoeGroupedMatmul][graph]") {
 
 TEST_CASE("BF16 MoeGroupedMatmulBwd", "[MoeGroupedMatmulBwd][graph]") {
 #if (CUDNN_VERSION < 92200)
-    SKIP("MoE is not supported in cudnn versions prior to 9.22.0");
+    SKIP("MoE grouped matmul backward requires cudnn 9.22.0 or newer");
 #endif
 
     if (cublasLtGetVersion() < 130500) {
@@ -162,6 +165,10 @@ TEST_CASE("BF16 MoeGroupedMatmulBwd", "[MoeGroupedMatmulBwd][graph]") {
     std::vector<int32_t> first_token_offset_cpu({0,   1,   2,   3,    4,    5,    6,    7,    8,    9,    10,   11,
                                                  12,  13,  14,  15,   16,   17,   18,   127,  255,  383,  483,  515,
                                                  643, 718, 924, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900});
+    if (cudnnGetVersion() >= 92800) {
+        first_token_offset_cpu.push_back(token_num);
+    }
+    int64_t const offset_count = static_cast<int64_t>(first_token_offset_cpu.size());
 
     // Initialize input tensors
     Surface<int8_t> doutput_gpu(
@@ -173,7 +180,7 @@ TEST_CASE("BF16 MoeGroupedMatmulBwd", "[MoeGroupedMatmulBwd][graph]") {
                    cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::BFLOAT16),
                8));
     Surface<int8_t> first_token_offset_gpu(
-        div_up(num_experts * cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::INT32), 8));
+        div_up(offset_count * cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::INT32), 8));
     Surface<int8_t> dweight_gpu(
         div_up(num_experts * hidden_size * weight_size *
                    cudnn_frontend::detail::get_element_size_in_bits(cudnn_frontend::DataType_t::BFLOAT16),
@@ -204,7 +211,7 @@ TEST_CASE("BF16 MoeGroupedMatmulBwd", "[MoeGroupedMatmulBwd][graph]") {
 
     auto tensor_first_token_offset = graph.tensor(fe::graph::Tensor_attributes()
                                                       .set_name("first_token_offset")
-                                                      .set_dim({num_experts, 1, 1})
+                                                      .set_dim({offset_count, 1, 1})
                                                       .set_stride({1, 1, 1})
                                                       .set_data_type(fe::DataType_t::INT32));
 
@@ -215,6 +222,7 @@ TEST_CASE("BF16 MoeGroupedMatmulBwd", "[MoeGroupedMatmulBwd][graph]") {
     auto tensor_dweight = graph.moe_grouped_matmul_bwd(
         tensor_doutput, tensor_token, tensor_first_token_offset, moe_grouped_matmul_bwd_attr);
 
+    tensor_dweight->set_dim({num_experts, hidden_size, weight_size});
     tensor_dweight->set_data_type(fe::DataType_t::BFLOAT16);
     tensor_dweight->set_output(true);
 

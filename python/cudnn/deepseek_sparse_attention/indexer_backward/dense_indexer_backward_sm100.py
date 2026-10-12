@@ -74,9 +74,9 @@ from cutlass.utils.blackwell_helpers import (
     make_smem_layout_b as _make_smem_layout_b,
     make_smem_layout_epi as _make_smem_layout_epi,
 )
-from cutlass.utils.layout import LayoutEnum
 
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 
@@ -268,7 +268,7 @@ class ScoreGradDense:
         # CuTe DSL forbids early `return`, so wrap the body in an `if` block.
         if seq_local < seqlen_q_b:
             # SMEM: 4 fp32 for cross-warp reduction scratch
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
 
             @cute.struct
             class SharedStorage:
@@ -454,6 +454,10 @@ class DenseIndexerBackward2QGemmSm100:
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=4,
             num_threads=self.WARP_SIZE + 2 * self.WARPGROUP_SIZE,
+        )
+        self.dk_reduce_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=self.WARPGROUP_SIZE,
         )
 
     @cute.jit
@@ -817,14 +821,14 @@ class DenseIndexerBackward2QGemmSm100:
             sW: cute.struct.Align[cute.struct.MemRange[self.q_dtype, self.heads * 2], 128]
             sdK_reduce: cute.struct.Align[cute.struct.MemRange[Float32, self.block_I * self.head_dim_padded], 128]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
         Q_q0_mbar_ptr = storage.Q_q0_mbar.data_ptr()
         Q_q1_mbar_ptr = storage.Q_q1_mbar.data_ptr()
         K_mbar_ptr = storage.K_mbar.data_ptr()
         mbar = storage.mbar.data_ptr()
         tmem_holding_buf = storage.tmem_holding_buf.ptr
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id[0],
@@ -2139,6 +2143,7 @@ class DenseIndexerBackward2QGemmSm100:
             # 4. Wait for previous bulk reduce to finish, then signal TMA engine is free
             if bi > 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
+            self.dk_reduce_sync_barrier.arrive_and_wait()
 
             # 5. Scatter-write: registers → sdK_reduce
             for pair in cutlass.range(cute.size(tDKrDK) // 2, unroll_full=True):
@@ -2151,6 +2156,7 @@ class DenseIndexerBackward2QGemmSm100:
                     sdK_reduce[n, d + 1] = tDKrDK[ei + 1] * Float32(sm_scale)
 
             cute.arch.fence_proxy("async.shared", space="cta")
+            self.dk_reduce_sync_barrier.arrive_and_wait()
 
             # 6. Single-thread bulk reduce DMA — only ONE thread in the
             # reduce warpgroup must issue cp.async.bulk; otherwise each

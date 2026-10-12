@@ -399,6 +399,7 @@ def _prepare_flex_attn_fwd(
     block_sparse_tensors: BlockSparseTensorsTorch = None,
     has_lse: bool = False,
     sm90_use_smem_mask_pipeline: bool = True,
+    has_max_logit: bool = False,
 ) -> _FwdDispatch:
     """Resolve and validate one forward launch without compiling or allocating."""
 
@@ -512,6 +513,7 @@ def _prepare_flex_attn_fwd(
         pack_gqa,
         is_varlen,
         not has_lse,
+        not has_max_logit,
         plan_signature.compile_key,
         get_broadcast_dims(q),
         get_broadcast_dims(k),
@@ -563,12 +565,14 @@ def _compile_flex_attn_fwd(
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     scheduler_tile_counter: Optional[torch.Tensor],
+    max_logit: Optional[torch.Tensor] = None,
 ):
     """Compile or reuse the forward callable for a resolved launch."""
 
     kernel_compile_key = dispatch.compile_key + (
         get_broadcast_dims(out),
         get_broadcast_dims(lse) if lse is not None else None,
+        get_broadcast_dims(max_logit) if max_logit is not None else None,
     )
     if kernel_compile_key in _flex_attn_fwd.compile_cache:
         return _flex_attn_fwd.compile_cache[kernel_compile_key]
@@ -576,6 +580,7 @@ def _compile_flex_attn_fwd(
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     q_tensor, k_tensor, v_tensor, o_tensor = [to_cute_tensor(tensor) for tensor in (q, k, v, out)]
     lse_tensor = to_cute_tensor(lse, assumed_align=4) if lse is not None else None
+    max_logit_tensor = to_cute_tensor(max_logit, assumed_align=4, leading_dim=0) if max_logit is not None else None
     cu_q_tensor, cu_k_tensor = [
         to_cute_tensor(tensor, assumed_align=4, leading_dim=0) if tensor is not None else None for tensor in (cu_seqlens_q, cu_seqlens_k)
     ]
@@ -612,6 +617,7 @@ def _compile_flex_attn_fwd(
             v_tensor,
             o_tensor,
             lse_tensor,
+            max_logit_tensor,
             softmax_scale,
             cu_q_tensor,
             cu_k_tensor,
@@ -633,6 +639,7 @@ def _compile_flex_attn_fwd(
             v_tensor,
             o_tensor,
             lse_tensor,
+            max_logit_tensor,
             softmax_scale,
             cu_q_tensor,
             cu_k_tensor,
@@ -666,6 +673,7 @@ def _compile_flex_attn_fwd(
             v_tensor,
             o_tensor,
             lse_tensor,
+            max_logit_tensor,
             softmax_scale,
             cu_q_tensor,
             cu_k_tensor,
@@ -693,10 +701,13 @@ def _launch_flex_attn_fwd(
     cu_seqlens_q: Optional[torch.Tensor],
     cu_seqlens_k: Optional[torch.Tensor],
     scheduler_tile_counter: Optional[torch.Tensor],
+    max_logit: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch a previously compiled forward callable."""
 
     if not is_fake_mode():
+        if max_logit is not None:
+            max_logit.fill_(float("-inf"))
         if scheduler_tile_counter is not None:
             scheduler_tile_counter.zero_()
         sparse_args = _block_sparse_runtime_tuple(dispatch.normalized_plan)
@@ -707,6 +718,7 @@ def _launch_flex_attn_fwd(
                 v.detach(),
                 out.detach(),
                 lse,
+                max_logit,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -721,6 +733,7 @@ def _launch_flex_attn_fwd(
                 v.detach(),
                 out.detach(),
                 lse,
+                max_logit,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -733,6 +746,7 @@ def _launch_flex_attn_fwd(
                 v.detach(),
                 out.detach(),
                 lse,
+                max_logit,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,

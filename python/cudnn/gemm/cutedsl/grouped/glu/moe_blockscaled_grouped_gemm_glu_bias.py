@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
@@ -33,6 +34,7 @@ from ..moe_persistent_scheduler import (
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
@@ -55,6 +57,7 @@ from ..moe_kernel_helpers import (
     get_dtype_rcp_limits,
     can_implement,
     amax_reduction_per_thread,
+    warp_amax_with_nan,
     epilog_gmem_copy_and_partition,
 )
 
@@ -367,7 +370,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -734,6 +737,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         glu_clamp_min: cutlass.Float32 = -7.0,
         situ_beta1: cutlass.Float32 = 4.0,
         situ_beta2: cutlass.Float32 = 25.0,
+        scheduler_counter: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM.
 
@@ -757,18 +761,27 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         GeGLU parameters are ignored unless ``act_func == "geglu"`` and SiTU
         parameters are ignored unless ``act_func == "situglu"``.
         """
+        if cutlass.const_expr(scheduler_counter is not None):
+            workspace_ptr = scheduler_counter.iterator
+        a = kernel_facing_mx(a)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b)
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -947,7 +960,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         )
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or self.use_dynamic_sched)
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and scheduler_counter is None))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -1176,12 +1189,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
         # Warp-level reduction using wrapper function
-        warp_amax = cute.arch.warp_redux_sync(
-            value=amax_fp32,
-            kind="fmax",
-            mask_and_clamp=0xFFFFFFFF,
-            nan=True,
-        )
+        warp_amax = warp_amax_with_nan(amax_fp32)
         # Each epilogue warp's lane 0 writes warp amax to shared memory
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx] = cutlass.Float32(warp_amax)
@@ -1277,14 +1285,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         #
         # Manually store pvscale to avoid spilling
         #
-        if tile_idx == 0:
-            pvscale[0] = tmp_f32
-        elif tile_idx == 1:
-            pvscale[1] = tmp_f32
-        elif tile_idx == 2:
-            pvscale[2] = tmp_f32
-        elif tile_idx == 3:
-            pvscale[3] = tmp_f32
+        for scale_idx in cutlass.range_constexpr(cute.size(pvscale)):
+            if tile_idx == scale_idx:
+                pvscale[scale_idx] = tmp_f32
 
         #
         # Compute quantized output values and convert to D type
@@ -1337,18 +1340,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
         tmp_f32 = cutlass.Float32(0.0)
         for vi in cutlass.range_constexpr(acc_frg.shape[0]):
-            max_value_original = (
-                cutlass.Float32(
-                    cute.arch.warp_redux_sync(
-                        value=acc_frg[vi, 0],
-                        kind="fmax",
-                        mask_and_clamp=0xFFFFFFFF,
-                        nan=True,
-                    )
-                )
-                * rcp_limit
-                * norm_const
-            )
+            max_value_original = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0])) * rcp_limit * norm_const
             max_value_vec = cute.full(4, max_value_original, dtype=cutlass.Float32)
             max_value_vec_f8 = max_value_vec.to(cutlass.Float8E8M0FNU)
             max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)
@@ -1399,7 +1391,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             (tokens_this_group, n_total, mSFDCol_mnl.shape[2]),
             (1, 2, 3),
         )
-        regPerSubtile = 4
+        regPerSubtile = self.mma_tiler_d[1] // 32
         sfd_tile = (
             cute.make_layout(128),
             cute.make_layout(32 * regPerSubtile),
@@ -1688,7 +1680,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1764,7 +1756,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             gBias_nl = cute.local_tile(mBias_nl, cute.slice_(self.mma_tiler[:2], (0, None)), (None, None))
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2456,7 +2448,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
             if cutlass.const_expr(self.generate_sfd):
                 norm_const = cutlass.Float32(norm_const_tensor[0])
-                regPerSubtile = 4
+                regPerSubtile = self.mma_tiler_d[1] // 32
                 sfd_row_tile = (
                     cute.make_layout(128),
                     cute.make_layout(32 * regPerSubtile),
@@ -2646,7 +2638,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 mProb = cutlass.Float32(1.0)
                 if cutlass.const_expr(self.has_prob):
                     real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
-                    mProb = real_prob[mPosition, 0, 0]
+                    mProb = real_prob[mPosition, 0, 0].to(cutlass.Float32)
 
                 #
                 # Wait for accumulator buffer full
@@ -2850,7 +2842,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                             )
                         ]
 
-                        if subtile_idx == 6:
+                        if subtile_idx == subtile_cnt - 2:
                             if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
                                 tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
                                 cute.autovec_copy(tCrSFDRow, tCgSFDRow)

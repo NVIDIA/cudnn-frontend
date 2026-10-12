@@ -3,6 +3,7 @@
 
 """CUTE DSL kernel for fused RMSNorm + RHT + per-CTA amax."""
 
+from cudnn._cutlass_compat import SmemAllocator
 import math
 import operator
 
@@ -101,7 +102,7 @@ class RMSNormRHTAmaxKernel:
         bid = cute.arch.block_idx()[0]
         inv_sqrt_had = cutlass.Float32(cfg.inv_sqrt_had)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         s_x = smem.allocate_tensor(
             cutlass.BFloat16,
             cute.make_ordered_layout(tiler_mn, order=(1, 0)),

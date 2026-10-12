@@ -9,10 +9,8 @@ turns the graph into facts once, ``recommend`` proposes complete
 listed plan carries the exact tile config the engine will build -- so a recorded
 ``(engine_id, knobs)`` replays the same kernel after the automatic pick changes.
 
-The proposal set is deliberately ONE entry today: the automatic strategy the
-engine picked before this module existed, now spelled out. Widening it
-(neighbouring tiles, cluster shapes, split-K) is a change confined to
-:func:`recommend`; the engine, the analyzer and the vocabulary stay as they are.
+The shared planner proposes up to eight entries in calibrated paths, including
+geometry, split-K and swapAB choices, with the single-plan recommendation first.
 """
 
 from __future__ import annotations
@@ -55,24 +53,28 @@ def analyze_facts(graph) -> Optional[GemmFacts]:
 
 
 def recommend(kind: str, facts: GemmFacts, offered: Dict[str, int]) -> List[PlanConfig]:
-    """Ordered candidate plans for ``facts`` (``kind`` is ``"A"`` or ``"FALLBACK"``).
-
-    One candidate: the automatic tile strategy, gated exactly as
-    ``check_support`` gates it (cutedsl floor + the chain-level probes), so a
-    plan is listed only when the engine will build it. Its knobs are the
-    config's canonical name in the shared vocabulary.
-    """
+    """Ordered, supported plans carrying exact public-replay knobs."""
     engine_id = offered.get(ENGINE)
     if engine_id is None:
         return []
-    from .compiler import plan_config, probe_chain, probe_cutedsl
+    from .compiler import plan_configs, probe_chain, probe_cutedsl
+    from .planning import MAX_PLAN_CONFIGS
 
     try:
         probe_cutedsl()
-        config = plan_config(facts.chain, dynamic_shapes=facts.dynamic_shapes)
-        probe_chain(facts.chain, config)
-        knobs = GemmKnobs.from_config(config)
+        configs = plan_configs(facts.chain, dynamic_shapes=facts.dynamic_shapes)
     except (NotImplementedError, ValueError, KeyError) as exc:
         _LOG.debug("frost_gemm proposes nothing (%s): %s", kind, exc)
         return []
-    return [PlanConfig(engine_id, knobs)]
+    plans = {}
+    for config in configs:
+        try:
+            probe_chain(facts.chain, config)
+            knobs = GemmKnobs.from_config(config)
+        except (NotImplementedError, ValueError, KeyError) as exc:
+            _LOG.debug("frost_gemm skips candidate %s (%s): %s", config.name, kind, exc)
+            continue
+        plans.setdefault(knobs, PlanConfig(engine_id, knobs))
+        if len(plans) == MAX_PLAN_CONFIGS:
+            break
+    return list(plans.values())

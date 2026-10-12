@@ -13,6 +13,7 @@ already in sys.modules, so probing sys.modules never triggers an import.
 
 from __future__ import annotations
 
+import functools
 import sys
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
@@ -145,11 +146,11 @@ def cuda_is_available() -> bool:
     return err == cudart.cudaError_t.cudaSuccess and count > 0
 
 
-def get_compute_capability() -> Tuple[int, int]:
-    """(major, minor) of the current CUDA device, without requiring torch."""
+def get_compute_capability(device_index: Optional[int] = None) -> Tuple[int, int]:
+    """(major, minor) of the selected CUDA device (current if omitted), without requiring torch."""
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_available():
-        return torch.cuda.get_device_capability(torch.cuda.current_device())
+        return torch.cuda.get_device_capability(torch.cuda.current_device() if device_index is None else device_index)
     from cuda.bindings import runtime as cudart
 
     def _check(result):
@@ -158,12 +159,15 @@ def get_compute_capability() -> Tuple[int, int]:
             raise RuntimeError(f"CUDA runtime error: {err}")
         return values[0] if len(values) == 1 else values
 
-    device = _check(cudart.cudaGetDevice())
+    device = _check(cudart.cudaGetDevice()) if device_index is None else device_index
     major = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMajor, device))
     minor = _check(cudart.cudaDeviceGetAttribute(cudart.cudaDeviceAttr.cudaDevAttrComputeCapabilityMinor, device))
     return major, minor
 
 
+# Memoized: pure function of (shape, stride), called per input tensor on every
+# CuTeDSL launch to build the cache key; bounded since keys are shape-derived.
+@functools.lru_cache(maxsize=4096)
 def canonicalize_unit_dim_strides(shape: Tuple[int, ...], stride: Tuple[int, ...]) -> Tuple[int, ...]:
     """Give extent-1 dims the dense "outermost" stride (numel) so that layouts that differ
     only in unit-dim strides -- which the kernels cannot observe -- compare and compile equal."""

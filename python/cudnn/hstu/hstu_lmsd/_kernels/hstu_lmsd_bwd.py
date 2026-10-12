@@ -215,7 +215,7 @@ class HSTULMSDBackward:
                         xh = _cm.fma(xf, rstd, norm_bias)
                         ln = _cm.fma(xh, rW_tiles[j][e].to(cutlass.Float32), rB_tiles[j][e].to(cutlass.Float32))
                         if const_expr(self.apply_u_silu):
-                            den = cutlass.Float32(1.0) + cute.arch.exp2(-uf * cutlass.Float32(LOG2E))
+                            den = cutlass.Float32(1.0) + cute.math.exp2(-uf * cutlass.Float32(LOG2E), fastmath=True)
                             sig = cute.arch.rcp_approx(den)
                             activated_u = uf * sig
                             dactivated_u = _cm.fma(activated_u, cutlass.Float32(1.0) - sig, sig)

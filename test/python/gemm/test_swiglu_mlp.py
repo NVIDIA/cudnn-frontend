@@ -66,6 +66,82 @@ _TOL = 2e-2
 
 
 @pytest.mark.L0
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and _cc() >= 100),
+    reason="cuDNN SwiGLU-MLP fusion requires SM100 (Blackwell)",
+)
+@pytest.mark.parametrize(
+    "kind,activation",
+    [("mm", "silu")] + [(kind, activation) for kind in ("h-only", "preacts", "derivative") for activation in ("silu", "situ")],
+)
+def test_ordered_mlp_helpers_rebind_and_replay(monkeypatch, kind, activation):
+    """Cached graph metadata must not retain old inputs or captured values."""
+    import importlib
+
+    import cudnn
+
+    mod = importlib.import_module("cudnn.gemm.ops.swiglu_mlp")
+    torch.manual_seed(17)
+    M, H, inter = 128, 256, 256
+    shapes = ((M, H), (H, inter)) if kind == "mm" else ((M, inter),) * 3 if kind == "derivative" else ((M, H), (inter, H), (inter, H))
+    config = {} if activation == "silu" else {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0}
+
+    def invoke(inputs):
+        if kind == "mm":
+            return (mod._mm(*inputs),)
+        if kind == "derivative":
+            return mod._dswiglu(*inputs, **config)
+        return tuple(t for t in mod._swiglu_act(*inputs, save_preacts=kind == "preacts", **config) if t is not None)
+
+    def reference(inputs):
+        if kind == "mm":
+            return (inputs[0] @ inputs[1],)
+        if kind == "derivative":
+            return _dswiglu_ref(*inputs, **config)
+        x, Wg, Wu = inputs
+        gate, up = x @ Wg.t(), x @ Wu.t()
+        if activation == "situ":
+            gate_f, up_f = gate.float(), up.float()
+            h = (4.0 * torch.tanh(gate_f / 4.0) * torch.sigmoid(gate_f) * 25.0 * torch.tanh(up_f / 25.0)).to(x.dtype)
+        else:
+            h = (F.silu(gate.float()) * up.float()).to(x.dtype)
+        return (h, gate, up) if kind == "preacts" else (h,)
+
+    def check(outputs, inputs):
+        for got, expected in zip(outputs, reference(inputs), strict=True):
+            assert _rel_l2(got, expected) < _TOL
+
+    def forbid_mapping(*args, **kwargs):
+        raise AssertionError("a warmed MLP helper must use ordered bindings")
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        first = tuple(torch.randn(shape, device="cuda", dtype=torch.bfloat16) * 0.2 for shape in shapes)
+        invoke(first)
+        # Keep the original tensors alive, so fresh allocations cannot accidentally
+        # reuse their addresses and hide stale input bindings.
+        current = tuple(torch.randn_like(t) * 0.2 for t in first)
+        monkeypatch.setattr(cudnn.pygraph, "_uid_to_data", forbid_mapping)
+        rebound = invoke(current)
+    stream.synchronize()
+    check(rebound, current)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = invoke(current)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for tensor in current:
+            tensor.mul_(-0.75)
+        for output in captured:
+            output.fill_(float("nan"))
+        graph.replay()
+    stream.synchronize()
+    check(captured, current)
+
+
+@pytest.mark.L0
 def test_situ_mlp_has_a_distinct_semantic_entry_point():
     """Do not overload the public SwiGLU symbol with an activation string."""
     import cudnn.gemm as gemm

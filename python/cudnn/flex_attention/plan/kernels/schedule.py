@@ -1,4 +1,7 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """Architecture-neutral forward work descriptor materialization."""
 
 from typing import Optional
@@ -7,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Boolean, Int32, Int64, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 
 import cuda.bindings.driver as cuda
 
@@ -362,7 +366,7 @@ class ForwardScheduleOrder:
     ) -> None:
         lane_idx, _, _ = cute.arch.thread_idx()
         section, _, _ = cute.arch.block_idx()
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sCost = smem.allocate_tensor(
             element_type=Int32,
             layout=cute.make_layout((32,)),

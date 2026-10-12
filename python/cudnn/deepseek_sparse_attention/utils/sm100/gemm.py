@@ -11,6 +11,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
+from cudnn._cutlass_compat import OperandMajorMode
 
 
 from cudnn.deepseek_sparse_attention.utils.sm100 import mma_desc as sm100_desc
@@ -66,7 +67,7 @@ def gemm_ptx_partial(
             sm100_desc.make_smem_desc_base(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
-                sm100_desc.Major.K if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN,
+                sm100_desc.Major.K if const_expr(op.a_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
             )
         )
         smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
@@ -80,7 +81,7 @@ def gemm_ptx_partial(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
-            sm100_desc.Major.K if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN,
+            sm100_desc.Major.K if const_expr(op.b_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
         )
     )
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
@@ -249,7 +250,7 @@ def gemm_ptx_partial_mxfp8(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
             sA_swizzle,
-            sm100_desc.Major.K if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN,
+            sm100_desc.Major.K if const_expr(op.a_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
         )
     )
     smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
@@ -261,7 +262,7 @@ def gemm_ptx_partial_mxfp8(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
-            sm100_desc.Major.K if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN,
+            sm100_desc.Major.K if const_expr(op.b_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
         )
     )
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)

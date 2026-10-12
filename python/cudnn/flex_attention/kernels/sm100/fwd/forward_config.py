@@ -1,4 +1,7 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """Shared SM100 forward consumer configuration and layout constructors.
 
 The resolved dataclass contains host-side, hashable metadata only.  The CuTe
@@ -16,6 +19,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import torch
 from cutlass import Float32, cute
 from cutlass.cute.nvgpu import tcgen05
+from cudnn._cutlass_compat import OperandMajorMode
 from cudnn.flex_attention.plan.mask_plan import (
     ArbitraryPlanSignature,
     ArbitraryPlanTopology,
@@ -364,8 +368,9 @@ def make_sm100_fwd_tiled_mma_qk(
 
     return sm100_utils_basic.make_trivial_tiled_mma(
         dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
+        dtype,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
         Float32,
         cta_group,
         (tile_m * cta_group_size, tile_n),

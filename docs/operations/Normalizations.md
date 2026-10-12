@@ -154,16 +154,36 @@ Layernorm_attributes&
 set_compute_data_type(DataType_t value)
 ```
 
+`scale` and `bias` are optional; pass `nullptr` (Python: `None`). Verified on Hopper with cuDNN 9.12, 9.14, 9.18, 9.20, 9.24 and
+9.27, and on Ampere and Blackwell with 9.27; older backends were not qualified.
+
+- **Scale without bias** (`nn.LayerNorm(bias=False)`) works for any shape. As with a bias, the training `mean` and
+  `variance` dims are `input`'s dims with 1 wherever `scale` is not 1.
+- **Bias without scale** is refused with `INVALID_VALUE`, because the backend rejects it. Pass a scale of ones.
+- **Neither:** nothing states the normalization axes, so the same rule as [RMSNorm without a scale](#rmsnorm-graph-api)
+  applies. `input` may have at most one non-unit dimension after the first, or, in training, the caller sets the
+  `mean` or `variance` dims.
+
+In training, a `mean` or `variance` whose dims are not set takes the dims set on the other one; `validate()` refuses
+the two with different dims.
+
 ### Python API
 
 - layernorm
     - norm_forward_phase
     - input
-    - scale
-    - bias
+    - scale (optional)
+    - bias (optional)
     - epsilon
     - compute_data_type
     - name
+
+### Experimental PyTorch API
+
+`cudnn.experimental.ops.layer_norm(input, normalized_shape, weight=None,
+bias=None, eps=1e-5)` provides a graph-backed PyTorch custom op with autograd
+and `torch.compile` support. It currently supports normalization over one final
+dimension on nonempty CUDA tensors with FP16, BF16, or FP32 activations.
 
 
 ## Layernorm Backward (DLN)
@@ -180,6 +200,10 @@ std::array<std::shared_ptr<Tensor_attributes>, 3>
                           Layernorm_backward_attributes options);
 ```
 The output array has tensors in order of: `[input gradient, scale gradient, bias gradient]`.
+
+`scale` is optional (Python: `scale=None`). Without it there is no scale or bias gradient (both returned as `nullptr` /
+`None`). The saved `mean` and `inv_variance` dims state the normalization axes, as in the forward. Verified on Hopper with cuDNN 9.12, 9.14, 9.18, 9.20, 9.24 and 9.27, and on
+Ampere and Blackwell with 9.27; older backends were not qualified.
 
 Layernorm_attributes is a lightweight structure with setters for providing optional input tensors and other operation attributes:  
 ```
@@ -199,6 +223,46 @@ set_compute_data_type(DataType_t value)
     - compute_data_type
     - name
 
+## RMSNorm Graph API
+
+`Graph::rmsnorm(x, scale, attributes)` (Python: `graph.rmsnorm(norm_forward_phase, input, scale=None, bias=None, epsilon)`)
+normalizes `x` by its root mean square and multiplies by `scale`. Training also returns `INV_VARIANCE`. Its dims are `x`'s
+dims, with 1 on every axis where `scale` is not 1. Those are the normalization axes.
+
+`scale` is optional. This was verified on Hopper with cuDNN 9.20, 9.24 and 9.27, and on Ampere and Blackwell with 9.27;
+older backends were not qualified. Without a scale, nothing states the normalization axes, so the node accepts only these cases:
+
+- `x` has at most one non-unit dimension after the first, e.g. `{rows, hidden, 1, 1}`. That dimension is normalized.
+- In training, the caller sets the `INV_VARIANCE` dims explicitly, e.g. `{B, S, 1}` for `x = {B, S, H}`.
+
+Any other shape is refused with `INVALID_VALUE`. Pass a scale of ones, or reshape, to get the axes you want.
+
+`Graph::rmsnorm_backward(dy, x, scale, inv_variance, attributes)` also takes an optional `scale` (Python: `scale=None`).
+Without it there is no `DSCALE` or `DBIAS`, so `has_dbias(true)` is refused. The `INV_VARIANCE` dims state the
+normalization axes. Verified on Hopper with cuDNN 9.12, 9.14, 9.18, 9.20, 9.24 and 9.27, and on
+Ampere and Blackwell with 9.27; older backends were not qualified.
+
+## RMSNorm PyTorch API
+
+`cudnn.experimental.ops.rms_norm(input, weight, bias=None, eps=1e-5)` applies
+RMS normalization over the final input dimension using a cuDNN graph and
+supports autograd and `torch.compile`.
+
+This experimental signature intentionally includes an optional additive bias
+and requires a weight tensor. It is therefore not a drop-in replacement for
+`torch.nn.functional.rms_norm`, whose signature includes `normalized_shape`
+and no bias argument. Inputs, weights, and optional bias must be CUDA tensors
+with matching FP16, BF16, or FP32 dtypes, and the input must contain at least
+one normalization row.
+
+## RMSNorm + SiLU + Padding
+
+The experimental direct Python API `RmsNormSiluPadSm100` combines optional
+bias/residual addition, normalization, SiLU, padding, and history/cache copies
+for C160/C320/C640 BF16 tensors. It does not perform convolution. See
+[fused Conv3D + post-operations](Convolutions.md#cute-dsl-fused-conv3d--post-operations) for
+requirements and the [API reference](../fe-oss-apis/conv3d_postops.md) for the
+exact normalization and tensor-layout contracts.
 
 ## Adaptive Layernorm Forward
 
@@ -229,13 +293,15 @@ AdaLayernorm_attributes&
 set_compute_data_type(DataType_t value)
 ```
 
+`bias` is optional; pass `nullptr` (Python: `None`, the default). `scale` is required.
+
 ### Python API
 
 - adalayernorm
     - norm_forward_phase
     - input
     - scale
-    - bias
+    - bias (optional)
     - epsilon
     - compute_data_type
     - name

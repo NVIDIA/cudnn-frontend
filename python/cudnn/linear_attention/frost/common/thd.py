@@ -96,7 +96,7 @@ def emit_tile_seq_descs(
     expand_num: cutlass.Constexpr[int] = 1,
     lanes: cutlass.Constexpr[int] = 1,
 ) -> None:
-    """Per-BATCH descriptor array for the chunk-factor tile buffer ``(row, head, b_t, b_t)`` of gdn_tinv_f16.  Sequence b
+    """Per-BATCH descriptor array for the chunk-inverse tile buffer ``(row, head, b_t, b_t)`` of gdn_tinv_f16.  Sequence b
     owns the tile rows from ``cu[b] // b_t + b`` (one padding row per sequence keeps that base closed-form), so
     GLOBAL_ADDRESS advances by that row times ``base_ptr.stride[0]`` and GLOBAL_DIM[``seq_ord``] is capped to the
     sequence's chunk count.  ``expand_num`` scales the loaded ``cu`` values onto GDP's sub-token timeline (1 = off);

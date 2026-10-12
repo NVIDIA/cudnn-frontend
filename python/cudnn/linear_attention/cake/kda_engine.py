@@ -22,7 +22,7 @@ bit-for-bit on the C16 route. It is opt-in: ``check_support`` declines unless
 ``plan_name="kda_cake"``), because the frozen kernels' forward token output differs from FLA ``chunk_kda``
 and from ``kda_frost`` by ~0.12 relative RMS in FlashInfer's own input regime,
 while the recurrent state and the data gradients agree to ~5e-3; see
-``test/python/linear_attention/test_kda_cake.py`` for the measured surface.
+``test/python/linear_attention/cake/test_kda_cake.py`` for the measured surface.
 """
 
 from __future__ import annotations

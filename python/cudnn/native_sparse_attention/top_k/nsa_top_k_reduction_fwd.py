@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
+
 from typing import Tuple, Type, Optional
 
 import cuda.bindings.driver as cuda
@@ -12,6 +14,7 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Int32, Float32, Int64
 
 from cutlass._mlir.dialects import cute_nvgpu
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 """
 A NSA(Native Sparse Attention) Top-K Reduction Forward Pass for NVIDIA Blackwell SM100 architecture using Cute DSL.
@@ -147,8 +150,8 @@ class FineGrainedReductionQK:
             ),
         )
 
-        self.q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
-        self.k_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
+        self.q_major_mode = LayoutEnum.from_tensor(Q).mma_major_mode()
+        self.k_major_mode = LayoutEnum.from_tensor(K).mma_major_mode()
         self.load_mma_Q_stage = 2
         self.load_mma_K_stage = 1
         self.load_compute_LSE_stage = 1
@@ -344,7 +347,7 @@ class FineGrainedReductionQK:
         b, s_q_max, s_k_max, h_q, h_k, head_dim = problem_size
         h_r = h_q // h_k
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mma_Q_pipeline = self.make_and_init_load_mma_Q_pipeline(storage.load_mma_Q_mbar_ptr.data_ptr())

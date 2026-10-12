@@ -1,5 +1,9 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 # Copyright (c) 2025, Tri Dao.
+
 from typing import Optional, Tuple
 
 import cutlass
@@ -7,6 +11,7 @@ import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
+from cudnn._cutlass_compat import OperandMajorMode
 
 import cudnn.flex_attention.kernels.sm100.mma_desc as sm100_desc
 
@@ -103,7 +108,7 @@ def gemm_ptx_partial(
             sm100_desc.make_smem_desc_base(
                 cute.recast_layout(128, op.a_dtype.width, sA_layout[0]),
                 sA_swizzle,
-                sm100_desc.Major.K if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN,
+                sm100_desc.Major.K if const_expr(op.a_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
             )
         )
         smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
@@ -116,7 +121,7 @@ def gemm_ptx_partial(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, op.b_dtype.width, sB_layout[0]),
             sB_swizzle,
-            sm100_desc.Major.K if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K) else sm100_desc.Major.MN,
+            sm100_desc.Major.K if const_expr(op.b_major_mode == OperandMajorMode.K) else sm100_desc.Major.MN,
         )
     )
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)

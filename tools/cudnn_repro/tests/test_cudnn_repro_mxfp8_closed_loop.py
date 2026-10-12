@@ -10,8 +10,8 @@ from .test_cudnn_repro_closed_loop import _assert_reproducer_json_matches_target
 @pytest.mark.parametrize(
     "target",
     [
-        "test/python/test_mhas_v2.py::test_sdpa_mxfp8_fwd_L0[test1]",
-        "test/python/test_mhas_v2.py::test_sdpa_mxfp8_bwd_L0[test1]",
+        "test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_fwd_L0[test1]",
+        "test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_mxfp8_bwd_L0[test1]",
     ],
 )
 def test_mxfp8_reproducer_json_matches(tmp_path, target):

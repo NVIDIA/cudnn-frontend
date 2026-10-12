@@ -71,7 +71,7 @@ def test_cli_emits_last_context_entry_by_default(tmp_path):
 
     proc = run_cli(tmp_path, str(log_path))
 
-    assert proc.stdout.count("test/python/test_mhas_v2.py::test_repro") == 1
+    assert proc.stdout.count("test/python/sdpa/graph/test_mhas_v2.py::test_repro") == 1
     assert "cudnn.diagonal_alignment.BOTTOM_RIGHT" in proc.stdout
     assert "cudnn.diagonal_alignment.TOP_LEFT" not in proc.stdout
 
@@ -81,7 +81,7 @@ def test_cli_all_emits_every_context_entry(tmp_path):
 
     proc = run_cli(tmp_path, "--all", str(log_path))
 
-    assert proc.stdout.count("test/python/test_mhas_v2.py::test_repro") == 2
+    assert proc.stdout.count("test/python/sdpa/graph/test_mhas_v2.py::test_repro") == 2
     assert "cudnn.diagonal_alignment.TOP_LEFT" in proc.stdout
     assert "cudnn.diagonal_alignment.BOTTOM_RIGHT" in proc.stdout
 
@@ -93,7 +93,7 @@ def test_cli_debug_writes_default_files(tmp_path):
 
     payload = json.loads((tmp_path / "cudnn_repro_payload.json").read_text())
     assert (tmp_path / "cudnn_repro_log.txt").read_text().splitlines() == log_path.read_text().splitlines()
-    assert "test/python/test_mhas_v2.py::test_repro" in (tmp_path / "cudnn_repro_command.txt").read_text()
+    assert "test/python/sdpa/graph/test_mhas_v2.py::test_repro" in (tmp_path / "cudnn_repro_command.txt").read_text()
     assert payload["gid"] == 22
     assert "repro_metadata" in payload
 
@@ -106,5 +106,5 @@ def test_cli_debug_all_writes_indexed_files(tmp_path):
     for idx, gid in enumerate((11, 22)):
         payload = json.loads((tmp_path / f"cudnn_repro_payload_{idx}.json").read_text())
         assert (tmp_path / f"cudnn_repro_log_{idx}.txt").read_text().splitlines() == log_path.read_text().splitlines()
-        assert "test/python/test_mhas_v2.py::test_repro" in (tmp_path / f"cudnn_repro_command_{idx}.txt").read_text()
+        assert "test/python/sdpa/graph/test_mhas_v2.py::test_repro" in (tmp_path / f"cudnn_repro_command_{idx}.txt").read_text()
         assert payload["gid"] == gid

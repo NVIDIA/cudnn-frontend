@@ -37,6 +37,7 @@ from cutlass.utils.blackwell_helpers import (
     cluster_shape_to_tma_atom_SFB as _cluster_shape_to_tma_atom_SFB,
 )
 from cutlass.utils import blockscaled_layout as _blockscaled_layout
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils import copy as copy_utils
 from cudnn.deepseek_sparse_attention.utils.seqlen import SeqlenInfoQK
@@ -278,10 +279,11 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
         mQ = cute.make_tensor(mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed))
 
         cta_group = tcgen05.CtaGroup.ONE
-        self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
-        self.k_major_mode = cutlass.utils.LayoutEnum.from_tensor(mK).mma_major_mode()
+        self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
+        self.k_major_mode = LayoutEnum.from_tensor(mK).mma_major_mode()
 
         tiled_mma_qk = _make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             self.k_major_mode,
             self.q_major_mode,
@@ -290,6 +292,7 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
             self.mma_tiler_qk[:2],
         )
         blockscaled_tiled_mma_qk = _make_blockscaled_trivial_tiled_mma(
+            self.k_dtype,
             self.k_dtype,
             self.k_major_mode,
             self.q_major_mode,
@@ -1130,7 +1133,7 @@ class BwdDenseAttnScoreSm100Mxfp8(DenseScoreRecomputeSm100):
                 self.buffer_align_bytes,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         Q_mbar_ptr = storage.Q_mbar_ptr.data_ptr()

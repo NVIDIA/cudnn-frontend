@@ -3,10 +3,8 @@
 
 """Pre-routed BF16 SwiGLU Mixture-of-Experts operation.
 
-The caller owns routing.  Tokens are already grouped by expert and
-``first_token_offset[e]`` is the first row belonging to expert ``e``; the last
-expert ends at ``routed_x.shape[1]``.  One fused FROST kernel computes the two
-FC1 grouped GEMMs and SwiGLU, then a grouped GEMM computes the down projection.
+The caller supplies expert-grouped tokens and E+1 explicit boundaries.
+One FROST kernel fuses the FC1 GEMMs and SwiGLU; a grouped GEMM projects down.
 The custom autograd function supplies gradients for the tokens and all three
 expert weights.
 """
@@ -66,7 +64,7 @@ def _frost_fc1(routed_x, Wg, Wu, offsets):
         X = graph.tensor(name="x", dim=[1, S, H], stride=[S * H, H, 1], data_type=_BF16)
         WG = graph.tensor(name="Wg", dim=[E, H, interm], stride=[H * interm, 1, H], data_type=_BF16)
         WU = graph.tensor(name="Wu", dim=[E, H, interm], stride=[H * interm, 1, H], data_type=_BF16)
-        FTO = graph.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        FTO = graph.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
         gate_raw = graph.moe_grouped_matmul(X, WG, FTO, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=_FP32, name="gate")
         up_raw = graph.moe_grouped_matmul(X, WU, FTO, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=_FP32, name="up")
         # Match BF16 nn.Linear semantics before evaluating SiLU in FP32.
@@ -124,14 +122,15 @@ def _frost_mm(token, weight, offsets):
         A = graph.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=_BF16)
         logical_weight = weight.transpose(1, 2)
         B = graph.tensor(name="weight", dim=[E, K, N], stride=list(logical_weight.stride()), data_type=_BF16)
-        FTO = graph.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        FTO = graph.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
         Y = graph.moe_grouped_matmul(A, B, FTO, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=_FP32, name="out")
         Y.set_output(True).set_data_type(_BF16)
         plan = _frost_plan(graph)
         _MM_CACHE[key] = plan
 
     binding = plan.binding
-    output = torch.empty(1, S, N, dtype=token.dtype, device=token.device)
+    # Unused token rows have zero gradients.
+    output = torch.zeros(1, S, N, dtype=token.dtype, device=token.device)
     workspace, stream = _frost_workspace(plan, token)
     plan(
         {
@@ -158,7 +157,7 @@ def _frost_dswiglu(dout, Wd, gate, up, offsets):
         graph = cudnn.pygraph(io_data_type=_BF16, intermediate_data_type=_FP32, compute_data_type=_FP32)
         DY = graph.tensor(name="dout", dim=[1, S, H], stride=[S * H, H, 1], data_type=_BF16)
         WD = graph.tensor(name="Wd", dim=[E, H, interm], stride=[H * interm, interm, 1], data_type=_BF16)
-        FTO = graph.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        FTO = graph.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
         G = graph.tensor(name="gate", dim=[1, S, interm], stride=[S * interm, interm, 1], data_type=_BF16)
         U = graph.tensor(name="up", dim=[1, S, interm], stride=[S * interm, interm, 1], data_type=_BF16)
         dh = graph.moe_grouped_matmul(DY, WD, FTO, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=_FP32, name="dh")
@@ -202,11 +201,10 @@ def _cudnn_handle(tensor):
     return handle
 
 
-def _moe_wgrad(doutput, token, offsets):
+def _moe_wgrad(doutput, token, offsets, E):
     """Native cuDNN grouped wgrad with arbitrary expert token counts."""
     _, S, N = doutput.shape
     _, token_s, K = token.shape
-    E = offsets.numel()
     if token_s != S:
         raise ValueError(f"internal grouped wgrad token mismatch: {S} and {token_s}")
     key = (S, N, K, E, doutput.dtype, *_device_key(doutput))
@@ -216,11 +214,11 @@ def _moe_wgrad(doutput, token, offsets):
         graph = cudnn.pygraph(intermediate_data_type=_FP32, compute_data_type=_FP32, handle=handle)
         DY = graph.tensor(name="doutput", dim=[1, S, N], stride=[S * N, N, 1], data_type=_BF16)
         X = graph.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=_BF16)
-        FTO = graph.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+        FTO = graph.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
         DW = graph.moe_grouped_matmul_bwd(DY, X, FTO, compute_data_type=_FP32, name="wgrad")
         # Logical [E,K,N], column-major inner dimensions.  Its physical storage
         # is a contiguous [E,N,K] tensor, exactly the public weight layout.
-        DW.set_output(True).set_data_type(_BF16)
+        DW.set_dim([E, K, N]).set_output(True).set_data_type(_BF16)
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A])
@@ -263,9 +261,9 @@ class _SwiGLUMoE(torch.autograd.Function):
             dx = None
             if need_x:
                 dx = _frost_mm(dgate, Wg.transpose(1, 2), offsets) + _frost_mm(dup, Wu.transpose(1, 2), offsets)
-            dWg = _moe_wgrad(dgate, routed_x, offsets) if need_wg else None
-            dWu = _moe_wgrad(dup, routed_x, offsets) if need_wu else None
-            dWd = _moe_wgrad(dout.contiguous(), h, offsets) if need_wd else None
+            dWg = _moe_wgrad(dgate, routed_x, offsets, Wg.shape[0]) if need_wg else None
+            dWu = _moe_wgrad(dup, routed_x, offsets, Wu.shape[0]) if need_wu else None
+            dWd = _moe_wgrad(dout.contiguous(), h, offsets, Wd.shape[0]) if need_wd else None
         return dx, dWg, dWu, dWd, None
 
 
@@ -280,10 +278,10 @@ def swiglu_moe(routed_x, Wg, Wu, Wd, first_token_offset):
         routed_x: Expert-grouped tokens ``[1,S,H]`` in row-major BF16.
         Wg, Wu: Contiguous expert gate/up weights ``[E,I,H]`` in BF16.
         Wd: Contiguous expert down weights ``[E,H,I]`` in BF16.
-        first_token_offset: Contiguous INT32 starts ``[E]`` (``[E,1,1]`` is
+        first_token_offset: Contiguous INT32 boundaries ``[E+1]`` (``[E+1,1,1]`` is
             also accepted). The first value must be 0; all values must be in
-            ``[0, S]`` and monotonically nondecreasing. The last expert ends at
-            ``S``, so the final value is its start and need not equal ``S``.
+            ``[0, S]`` and monotonically nondecreasing. The final boundary may
+            be smaller than S; unused output rows and token gradients are zero.
             Tokens remain in routed order; routing and combine probabilities
             are intentionally outside this operation. These value invariants
             are a device-data contract and are not host-validated on the hot
@@ -315,16 +313,15 @@ def swiglu_moe(routed_x, Wg, Wu, Wd, first_token_offset):
             f"{prefix}: expected x[1,S,{H}], Wg/Wu[{E},{interm},{H}], Wd[{E},{H},{interm}]; "
             f"got x{tuple(routed_x.shape)}, Wg{tuple(Wg.shape)}, Wu{tuple(Wu.shape)}, Wd{tuple(Wd.shape)}"
         )
-    if first_token_offset.dtype != torch.int32 or first_token_offset.numel() != E or not first_token_offset.is_contiguous():
-        raise ValueError(f"{prefix}: first_token_offset must be contiguous int32 with E={E} elements")
+    if first_token_offset.dtype != torch.int32 or first_token_offset.numel() != E + 1 or not first_token_offset.is_contiguous():
+        raise ValueError(f"{prefix}: first_token_offset must be contiguous int32 with E+1={E+1} explicit boundaries")
     if H % 8 or interm % 8 or routed_x.shape[1] == 0:
         raise ValueError(f"{prefix}: S must be nonzero and H/I multiples of 8; " f"got S={routed_x.shape[1]}, H={H}, I={interm}")
     capability = torch.cuda.get_device_capability(routed_x.device)
     if not ((10, 0) <= capability < (12, 0)):
         raise RuntimeError(f"{prefix}: FROST MoE requires SM100-SM119, got SM{capability[0]}{capability[1]}")
-    # The graph declares cuDNN's [E,1,1] descriptor, while FROST's runtime
-    # contract consumes the same storage as a rank-1 offsets vector.
-    offsets = first_token_offset.reshape(E)
+    # Bind the boundaries as a flat view.
+    offsets = first_token_offset.view(-1)
     return _SwiGLUMoE.apply(routed_x, Wg, Wu, Wd, offsets)
 
 

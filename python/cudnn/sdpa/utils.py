@@ -10,47 +10,11 @@ from functools import partial
 import cutlass
 from cutlass import Float32, cute
 from cutlass._mlir.dialects import llvm, nvvm  # noqa: PLC2701
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 ARCH_SM90 = 90
 ARCH_SM100 = 100
 LAYOUT_RANK_CONSTANT = 3
-
-
-def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
-    """Convert tensor from dlpack protocol."""
-    return (
-        from_dlpack(x, assumed_align=alignment)
-        .mark_layout_dynamic(leading_dim=leading_dim)
-        .mark_compact_shape_dynamic(mode=leading_dim, stride_order=x.dim_order(), divisibility=divisibility)
-    )
-
-
-def convert_from_dlpack_compact_dynamic(
-    x,
-    *,
-    dynamic_modes: tuple[int, ...],
-    alignment: int = 16,
-    stride_order=None,
-    divisibility: int = 1,
-    enable_tvm_ffi: bool = False,
-) -> cute.Tensor:
-    """Convert a torch tensor via DLPack and mark only selected modes as dynamic (compact layout).
-
-    This is useful when tensor is contiguous (or a view of a contiguous tensor) and you want
-    only some dimensions (e.g. batch / seqlen) to be dynamic, while keeping others (e.g.
-    num_heads / head_dim) static to enable compile-time specialization.
-    """
-    # Be forgiving: allow passing a single int (e.g. dynamic_modes=(1)) which is easy to do by mistake.
-    if isinstance(dynamic_modes, int):
-        dynamic_modes = (dynamic_modes,)
-    if stride_order is None:
-        stride_order = x.dim_order()
-    t = from_dlpack(x, assumed_align=alignment, enable_tvm_ffi=True) if enable_tvm_ffi else from_dlpack(x, assumed_align=alignment)
-    for m in dynamic_modes:
-        t = t.mark_compact_shape_dynamic(mode=m, stride_order=stride_order, divisibility=divisibility)
-    return t
 
 
 @cute.jit

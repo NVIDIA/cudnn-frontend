@@ -7,7 +7,10 @@
 
 #include <cuda.h>
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
 #ifdef _WIN32
@@ -66,17 +69,34 @@ get_symbol(const char *function_name) {
 
 enum class CudaLibrary { CUDART, CUDA };
 
+// On Windows dlerror() is GetLastError(), an error code that successful calls do not reset (#809),
+// so success is judged by the returned handle or symbol alone and the code is only reported.
+inline std::string
+last_dl_error() {
+#ifdef _WIN32
+    return "Windows error " + std::to_string(GetLastError());
+#else
+    const char *error = dlerror();
+    return error ? error : "Unknown error";
+#endif
+}
+
 inline HMODULE
 load_cuda_so() {
     // Clear any existing error
     dlerror();
 
+#ifdef _WIN32
+    constexpr const char *lib = "nvcuda.dll";
+#else
+    constexpr const char *lib = "libcuda.so.1";
+#endif
+
     // Attempt to open the cuda library
-    HMODULE handle    = dlopen("libcuda.so.1", RTLD_NOW);
-    const char *error = reinterpret_cast<const char *>(dlerror());
-    if (!handle || error) {
+    HMODULE handle = dlopen(lib, RTLD_NOW);
+    if (!handle) {
         // If opening the library fails, throw an exception with the error message
-        throw std::runtime_error("Unable to dlopen libcuda.so.1 : " + std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to dlopen " + std::string(lib) + " : " + last_dl_error());
     }
 
     return handle;
@@ -97,29 +117,38 @@ load_cudart_so() {
     const char *user_lib = get_environment("CUDNN_FRONTEND_CUDART_LIB_NAME");
     if (user_lib) {
         if (user_lib[0] != '\0') {
-            HMODULE handle    = dlopen(user_lib, RTLD_NOW);
-            const char *error = reinterpret_cast<const char *>(dlerror());
-            if (!handle || error) {
+            HMODULE handle = dlopen(user_lib, RTLD_NOW);
+            if (!handle) {
                 throw std::runtime_error(
                     "Unable to load libcudart library specified by CUDNN_FRONTEND_CUDART_LIB_NAME (" +
-                    std::string(user_lib) + "): " + std::string(error ? error : "Unknown error"));
+                    std::string(user_lib) + "): " + last_dl_error());
             }
             return handle;
         }
     }
 
     // List of potential libcudart libraries (Adding major version to support python package)
+#ifdef _WIN32
+    // Only the runtime matching the compiled CUDA major is ABI-compatible with the versioned
+    // entry points below (e.g. cudaStreamGetCaptureInfo), so there is no cross-major fallback.
+#if CUDART_VERSION >= 13000
+    constexpr const char *libs[] = {"cudart64_13.dll"};
+#else
+    constexpr const char *libs[] = {"cudart64_12.dll"};
+#endif
+#else
     constexpr const char *libs[] = {"libcudart.so.12", "libcudart.so.13"};
-    constexpr size_t num_libs    = sizeof(libs) / sizeof(libs[0]);
+#endif
+    constexpr size_t num_libs = sizeof(libs) / sizeof(libs[0]);
 
     HMODULE lib_handle = nullptr;
     int loaded_index   = -1;
 
     for (size_t i = 0; i < num_libs; ++i) {
-        HMODULE handle    = dlopen(libs[i], RTLD_NOW);
-        const char *error = reinterpret_cast<const char *>(dlerror());
+        dlerror();
+        HMODULE handle = dlopen(libs[i], RTLD_NOW);
 
-        if (handle && !error) {
+        if (handle) {
             if (lib_handle) {
                 // Already loaded one -> multiple found. This is not fatal: warn on stderr and keep
                 // the first one found. Set CUDNN_FRONTEND_CUDART_LIB_NAME to select one explicitly.
@@ -139,7 +168,11 @@ load_cudart_so() {
 
     // If opening the library fails, throw an exception with the error message
     if (!lib_handle) {
-        throw std::runtime_error("Unable to load any libcudart.so.* library.");
+        std::string tried;
+        for (size_t i = 0; i < num_libs; ++i) {
+            tried += (i ? ", " : "") + std::string(libs[i]);
+        }
+        throw std::runtime_error("Unable to load any libcudart library (tried " + tried + ").");
     }
 
     return lib_handle;
@@ -149,9 +182,11 @@ inline void *
 get_cuda_symbol(CudaLibrary library, const char *function_name) {
     // Static mutex to ensure thread-safety
     (void)function_name;
-    static std::mutex cuda_lib_mutex;
+    // Intentionally leaked: destructors of other statics (e.g. a cached execution plan releasing
+    // its CUDA graph user object) call back in here during process teardown (#1486).
+    static std::mutex &cuda_lib_mutex = *new std::mutex;
     // Static map to store handles for different libraries
-    static std::unordered_map<CudaLibrary, HMODULE> dl_handles;
+    static std::unordered_map<CudaLibrary, HMODULE> &dl_handles = *new std::unordered_map<CudaLibrary, HMODULE>;
 
     // Lock the mutex to ensure thread-safe access
     std::lock_guard<std::mutex> lock(cuda_lib_mutex);
@@ -165,12 +200,10 @@ get_cuda_symbol(CudaLibrary library, const char *function_name) {
     dlerror();
 
     // Try to find the symbol (function) in the library
-    void *symbol      = dlsym(dl_handles[library], function_name);
-    const char *error = reinterpret_cast<const char *>(dlerror());
-    if (!symbol || error) {
+    void *symbol = reinterpret_cast<void *>(dlsym(dl_handles[library], function_name));
+    if (!symbol) {
         // If the symbol is not found, throw an exception with details
-        throw std::runtime_error("Unable to find symbol " + std::string(function_name) + ": " +
-                                 std::string(error ? error : "Unknown error"));
+        throw std::runtime_error("Unable to find symbol " + std::string(function_name) + ": " + last_dl_error());
     }
 
     // Return the pointer to the function
@@ -347,9 +380,94 @@ cuda_graph_begin_capture(cudaStream_t stream, cudaStreamCaptureMode mode) {
     NV_FE_CALL_TO_CUDA(cuda_graph_begin_capture, cudaStreamBeginCapture, stream, mode);
 }
 
+inline CUresult
+cu_thread_exchange_stream_capture_mode(CUstreamCaptureMode *mode) {
+    NV_FE_CALL_TO_CU(cu_thread_exchange_stream_capture_mode, cuThreadExchangeStreamCaptureMode, mode);
+}
+
 inline cudaError_t
 cuda_stream_is_capturing(cudaStream_t stream, cudaStreamCaptureStatus *capture_status) {
     NV_FE_CALL_TO_CUDA(cuda_stream_is_capturing, cudaStreamIsCapturing, stream, capture_status);
+}
+
+inline cudaError_t
+cuda_thread_exchange_stream_capture_mode(cudaStreamCaptureMode *mode) {
+    NV_FE_CALL_TO_CUDA(cuda_thread_exchange_stream_capture_mode, cudaThreadExchangeStreamCaptureMode, mode);
+}
+
+// cudaStreamGetCaptureInfo: CUDA 12 exports the graph-returning variant as
+// cudaStreamGetCaptureInfo_v2 (6 parameters); CUDA 13 exports it as cudaStreamGetCaptureInfo
+// with an additional edge-data out-parameter. The shims mirror the exact prototypes.
+#if (CUDART_VERSION >= 13000)
+inline cudaError_t
+cuda_stream_get_capture_info_v3(cudaStream_t stream,
+                                cudaStreamCaptureStatus *captureStatus_out,
+                                unsigned long long *id_out,
+                                cudaGraph_t *graph_out,
+                                const cudaGraphNode_t **dependencies_out,
+                                const cudaGraphEdgeData **edgeData_out,
+                                size_t *numDependencies_out) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_get_capture_info_v3,
+                       cudaStreamGetCaptureInfo,
+                       stream,
+                       captureStatus_out,
+                       id_out,
+                       graph_out,
+                       dependencies_out,
+                       edgeData_out,
+                       numDependencies_out);
+}
+#else
+inline cudaError_t
+cuda_stream_get_capture_info_v2(cudaStream_t stream,
+                                cudaStreamCaptureStatus *captureStatus_out,
+                                unsigned long long *id_out,
+                                cudaGraph_t *graph_out,
+                                const cudaGraphNode_t **dependencies_out,
+                                size_t *numDependencies_out) {
+    NV_FE_CALL_TO_CUDA(cuda_stream_get_capture_info_v2,
+                       cudaStreamGetCaptureInfo_v2,
+                       stream,
+                       captureStatus_out,
+                       id_out,
+                       graph_out,
+                       dependencies_out,
+                       numDependencies_out);
+}
+#endif
+
+// Reports the capture status of `stream` and, when it is capturing, the graph it records into.
+inline cudaError_t
+cuda_stream_get_capture_info(cudaStream_t stream, cudaStreamCaptureStatus *capture_status, cudaGraph_t *graph) {
+#if (CUDART_VERSION >= 13000)
+    return cuda_stream_get_capture_info_v3(stream, capture_status, nullptr, graph, nullptr, nullptr, nullptr);
+#else
+    return cuda_stream_get_capture_info_v2(stream, capture_status, nullptr, graph, nullptr, nullptr);
+#endif
+}
+
+inline cudaError_t
+cuda_user_object_create(cudaUserObject_t *object_out,
+                        void *ptr,
+                        cudaHostFn_t destroy,
+                        unsigned int initialRefcount,
+                        unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_user_object_create, cudaUserObjectCreate, object_out, ptr, destroy, initialRefcount, flags);
+}
+
+inline cudaError_t
+cuda_user_object_release(cudaUserObject_t object, unsigned int count) {
+    NV_FE_CALL_TO_CUDA(cuda_user_object_release, cudaUserObjectRelease, object, count);
+}
+
+inline cudaError_t
+cuda_graph_retain_user_object(cudaGraph_t graph, cudaUserObject_t object, unsigned int count, unsigned int flags) {
+    NV_FE_CALL_TO_CUDA(cuda_graph_retain_user_object, cudaGraphRetainUserObject, graph, object, count, flags);
+}
+
+inline cudaError_t
+cuda_get_last_error() {
+    NV_FE_CALL_TO_CUDA(cuda_get_last_error, cudaGetLastError);
 }
 
 inline cudaError_t
@@ -655,66 +773,6 @@ causal_conv1d_backward(cudaStream_t stream,
 }
 #endif
 
-#if CUDNN_VERSION >= 92600 && !defined(_WIN32)
-inline cudnnStatus_t
-gnn_agg_simple_forward(cudaStream_t stream,
-                       const cudnnGnnCscGraph_t *graph,
-                       const void *node_features,
-                       const void *edge_features,
-                       const void *concat_features,
-                       void *output,
-                       void *out_positions,
-                       int node_feat_dim,
-                       int edge_feat_dim,
-                       int concat_feat_dim,
-                       cudnnDataType_t data_type,
-                       cudnnGnnAggOp_t agg_op) {
-    NV_FE_CALL_TO_BACKEND(gnn_agg_simple_forward,
-                          cudnnGnnAggSimpleForward,
-                          stream,
-                          graph,
-                          node_features,
-                          edge_features,
-                          concat_features,
-                          output,
-                          out_positions,
-                          node_feat_dim,
-                          edge_feat_dim,
-                          concat_feat_dim,
-                          data_type,
-                          agg_op);
-}
-
-inline cudnnStatus_t
-gnn_agg_simple_backward(cudaStream_t stream,
-                        const cudnnGnnCscGraph_t *graph,
-                        const void *grad_output,
-                        const void *out_positions,
-                        void *grad_node_features,
-                        void *grad_edge_features,
-                        void *grad_concat_features,
-                        int node_feat_dim,
-                        int edge_feat_dim,
-                        int concat_feat_dim,
-                        cudnnDataType_t data_type,
-                        cudnnGnnAggOp_t agg_op) {
-    NV_FE_CALL_TO_BACKEND(gnn_agg_simple_backward,
-                          cudnnGnnAggSimpleBackward,
-                          stream,
-                          graph,
-                          grad_output,
-                          out_positions,
-                          grad_node_features,
-                          grad_edge_features,
-                          grad_concat_features,
-                          node_feat_dim,
-                          edge_feat_dim,
-                          concat_feat_dim,
-                          data_type,
-                          agg_op);
-}
-#endif
-
 inline size_t
 get_backend_version(void) {
 #if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
@@ -732,6 +790,500 @@ inline constexpr size_t
 get_compiled_version(void) {
     return CUDNN_VERSION;
 }
+
+#if !defined(_WIN32)
+
+// Version-neutral ABI definitions for direct-call GNN APIs. The Python extension
+// dynamically resolves these APIs, so its exported bindings must not depend on
+// the cuDNN headers that happened to be installed when the extension was built.
+enum class gnn_activation_op_t : std::int32_t {
+    LINEAR     = 0,
+    RELU       = 1,
+    SIGMOID    = 2,
+    TANH       = 3,
+    ELU        = 4,
+    SCALAR     = 5,
+    LEAKY_RELU = 6,
+};
+
+struct gnn_csc_graph_t {
+    const void *csc_offsets;
+    const void *csc_indices;
+    const void *map_csc_to_coo;
+    const void *map_rev_to_coo;
+    std::int64_t n_src_nodes;
+    std::int64_t n_dst_nodes;
+    std::int64_t n_indices;
+    cudnnDataType_t idx_type;
+    const void *csc_rev_offsets;
+};
+
+struct gnn_mha_params_t {
+    gnn_activation_op_t activation;
+    float activation_alpha;
+    int num_heads;
+    int concat_heads;
+};
+
+static_assert(std::is_standard_layout_v<gnn_csc_graph_t>);
+static_assert(std::is_standard_layout_v<gnn_mha_params_t>);
+
+#if CUDNN_VERSION >= 92600
+static_assert(offsetof(gnn_csc_graph_t, csc_offsets) == offsetof(cudnnGnnCscGraph_t, cscOffsets));
+static_assert(offsetof(gnn_csc_graph_t, csc_indices) == offsetof(cudnnGnnCscGraph_t, cscIndices));
+static_assert(offsetof(gnn_csc_graph_t, map_csc_to_coo) == offsetof(cudnnGnnCscGraph_t, mapCscToCoo));
+static_assert(offsetof(gnn_csc_graph_t, map_rev_to_coo) == offsetof(cudnnGnnCscGraph_t, mapRevToCoo));
+static_assert(offsetof(gnn_csc_graph_t, n_src_nodes) == offsetof(cudnnGnnCscGraph_t, nSrcNodes));
+static_assert(offsetof(gnn_csc_graph_t, n_dst_nodes) == offsetof(cudnnGnnCscGraph_t, nDstNodes));
+static_assert(offsetof(gnn_csc_graph_t, n_indices) == offsetof(cudnnGnnCscGraph_t, nIndices));
+static_assert(offsetof(gnn_csc_graph_t, idx_type) == offsetof(cudnnGnnCscGraph_t, idxType));
+#endif
+
+#if CUDNN_VERSION >= 92800
+static_assert(sizeof(gnn_csc_graph_t) == sizeof(cudnnGnnCscGraph_t));
+static_assert(alignof(gnn_csc_graph_t) == alignof(cudnnGnnCscGraph_t));
+static_assert(offsetof(gnn_csc_graph_t, csc_rev_offsets) == offsetof(cudnnGnnCscGraph_t, cscRevOffsets));
+static_assert(sizeof(gnn_mha_params_t) == sizeof(cudnnGnnMhaParams_t));
+static_assert(alignof(gnn_mha_params_t) == alignof(cudnnGnnMhaParams_t));
+static_assert(offsetof(gnn_mha_params_t, activation) == offsetof(cudnnGnnMhaParams_t, activation));
+static_assert(offsetof(gnn_mha_params_t, activation_alpha) == offsetof(cudnnGnnMhaParams_t, activationAlpha));
+static_assert(offsetof(gnn_mha_params_t, num_heads) == offsetof(cudnnGnnMhaParams_t, numHeads));
+static_assert(offsetof(gnn_mha_params_t, concat_heads) == offsetof(cudnnGnnMhaParams_t, concatHeads));
+static_assert(static_cast<std::int32_t>(gnn_activation_op_t::LINEAR) == CUDNN_GNN_ACT_LINEAR);
+static_assert(static_cast<std::int32_t>(gnn_activation_op_t::RELU) == CUDNN_GNN_ACT_RELU);
+static_assert(static_cast<std::int32_t>(gnn_activation_op_t::SIGMOID) == CUDNN_GNN_ACT_SIGMOID);
+static_assert(static_cast<std::int32_t>(gnn_activation_op_t::TANH) == CUDNN_GNN_ACT_TANH);
+static_assert(static_cast<std::int32_t>(gnn_activation_op_t::ELU) == CUDNN_GNN_ACT_ELU);
+static_assert(static_cast<std::int32_t>(gnn_activation_op_t::SCALAR) == CUDNN_GNN_ACT_SCALAR);
+static_assert(static_cast<std::int32_t>(gnn_activation_op_t::LEAKY_RELU) == CUDNN_GNN_ACT_LEAKY_RELU);
+#endif
+
+#if CUDNN_VERSION >= 92600
+inline cudnnStatus_t
+gnn_agg_simple_forward(cudaStream_t stream,
+                       const gnn_csc_graph_t *graph,
+                       const void *node_features,
+                       const void *edge_features,
+                       const void *concat_features,
+                       void *output,
+                       void *out_positions,
+                       int node_feat_dim,
+                       int edge_feat_dim,
+                       int concat_feat_dim,
+                       cudnnDataType_t data_type,
+                       cudnnGnnAggOp_t agg_op) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    NV_FE_CALL_TO_BACKEND(gnn_agg_simple_forward,
+                          cudnnGnnAggSimpleForward,
+                          stream,
+                          graph,
+                          node_features,
+                          edge_features,
+                          concat_features,
+                          output,
+                          out_positions,
+                          node_feat_dim,
+                          edge_feat_dim,
+                          concat_feat_dim,
+                          data_type,
+                          agg_op);
+#else
+    return cudnnGnnAggSimpleForward(stream,
+                                    reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                    node_features,
+                                    edge_features,
+                                    concat_features,
+                                    output,
+                                    out_positions,
+                                    node_feat_dim,
+                                    edge_feat_dim,
+                                    concat_feat_dim,
+                                    data_type,
+                                    agg_op);
+#endif
+}
+
+inline cudnnStatus_t
+gnn_agg_simple_backward(cudaStream_t stream,
+                        const gnn_csc_graph_t *graph,
+                        const void *grad_output,
+                        const void *out_positions,
+                        void *grad_node_features,
+                        void *grad_edge_features,
+                        void *grad_concat_features,
+                        int node_feat_dim,
+                        int edge_feat_dim,
+                        int concat_feat_dim,
+                        cudnnDataType_t data_type,
+                        cudnnGnnAggOp_t agg_op) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    NV_FE_CALL_TO_BACKEND(gnn_agg_simple_backward,
+                          cudnnGnnAggSimpleBackward,
+                          stream,
+                          graph,
+                          grad_output,
+                          out_positions,
+                          grad_node_features,
+                          grad_edge_features,
+                          grad_concat_features,
+                          node_feat_dim,
+                          edge_feat_dim,
+                          concat_feat_dim,
+                          data_type,
+                          agg_op);
+#else
+    return cudnnGnnAggSimpleBackward(stream,
+                                     reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                     grad_output,
+                                     out_positions,
+                                     grad_node_features,
+                                     grad_edge_features,
+                                     grad_concat_features,
+                                     node_feat_dim,
+                                     edge_feat_dim,
+                                     concat_feat_dim,
+                                     data_type,
+                                     agg_op);
+#endif
+}
+#endif
+
+inline cudnnStatus_t
+gnn_mha_gat_forward(cudaStream_t stream,
+                    const gnn_csc_graph_t *graph,
+                    const void *src_features,
+                    const void *dst_features,
+                    const void *edge_features,
+                    const void *attn_weights,
+                    const float *dropout_mask,
+                    void *output,
+                    void *sm_scores,
+                    int node_feat_dim,
+                    int edge_feat_dim,
+                    const gnn_mha_params_t *params,
+                    cudnnDataType_t data_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92800) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(gnn_mha_gat_forward,
+                          cudnnGnnMhaGatForward,
+                          stream,
+                          graph,
+                          src_features,
+                          dst_features,
+                          edge_features,
+                          attn_weights,
+                          dropout_mask,
+                          output,
+                          sm_scores,
+                          node_feat_dim,
+                          edge_feat_dim,
+                          params,
+                          data_type);
+#elif CUDNN_VERSION >= 92800
+    return cudnnGnnMhaGatForward(stream,
+                                 reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                 src_features,
+                                 dst_features,
+                                 edge_features,
+                                 attn_weights,
+                                 dropout_mask,
+                                 output,
+                                 sm_scores,
+                                 node_feat_dim,
+                                 edge_feat_dim,
+                                 reinterpret_cast<const cudnnGnnMhaParams_t *>(params),
+                                 data_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)src_features;
+    (void)dst_features;
+    (void)edge_features;
+    (void)attn_weights;
+    (void)dropout_mask;
+    (void)output;
+    (void)sm_scores;
+    (void)node_feat_dim;
+    (void)edge_feat_dim;
+    (void)params;
+    (void)data_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+gnn_mha_gat_backward(cudaStream_t stream,
+                     const gnn_csc_graph_t *graph,
+                     const void *grad_output,
+                     const void *src_features,
+                     const void *dst_features,
+                     const void *edge_features,
+                     const void *attn_weights,
+                     const void *sm_scores,
+                     const float *dropout_mask,
+                     const float *grad_attention,
+                     void *grad_src_features,
+                     void *grad_dst_features,
+                     void *grad_edge_features,
+                     void *grad_weights,
+                     void *grad_sm_scores,
+                     void *grad_workspace_features,
+                     void *grad_workspace_weights,
+                     int node_feat_dim,
+                     int edge_feat_dim,
+                     const gnn_mha_params_t *params,
+                     cudnnDataType_t data_type,
+                     cudnnDataType_t grad_data_type,
+                     cudnnDataType_t grad_weight_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92800) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(gnn_mha_gat_backward,
+                          cudnnGnnMhaGatBackward,
+                          stream,
+                          graph,
+                          grad_output,
+                          src_features,
+                          dst_features,
+                          edge_features,
+                          attn_weights,
+                          sm_scores,
+                          dropout_mask,
+                          grad_attention,
+                          grad_src_features,
+                          grad_dst_features,
+                          grad_edge_features,
+                          grad_weights,
+                          grad_sm_scores,
+                          grad_workspace_features,
+                          grad_workspace_weights,
+                          node_feat_dim,
+                          edge_feat_dim,
+                          params,
+                          data_type,
+                          grad_data_type,
+                          grad_weight_type);
+#elif CUDNN_VERSION >= 92800
+    return cudnnGnnMhaGatBackward(stream,
+                                  reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                  grad_output,
+                                  src_features,
+                                  dst_features,
+                                  edge_features,
+                                  attn_weights,
+                                  sm_scores,
+                                  dropout_mask,
+                                  grad_attention,
+                                  grad_src_features,
+                                  grad_dst_features,
+                                  grad_edge_features,
+                                  grad_weights,
+                                  grad_sm_scores,
+                                  grad_workspace_features,
+                                  grad_workspace_weights,
+                                  node_feat_dim,
+                                  edge_feat_dim,
+                                  reinterpret_cast<const cudnnGnnMhaParams_t *>(params),
+                                  data_type,
+                                  grad_data_type,
+                                  grad_weight_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)grad_output;
+    (void)src_features;
+    (void)dst_features;
+    (void)edge_features;
+    (void)attn_weights;
+    (void)sm_scores;
+    (void)dropout_mask;
+    (void)grad_attention;
+    (void)grad_src_features;
+    (void)grad_dst_features;
+    (void)grad_edge_features;
+    (void)grad_weights;
+    (void)grad_sm_scores;
+    (void)grad_workspace_features;
+    (void)grad_workspace_weights;
+    (void)node_feat_dim;
+    (void)edge_feat_dim;
+    (void)params;
+    (void)data_type;
+    (void)grad_data_type;
+    (void)grad_weight_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+gnn_mha_gat_v2_forward(cudaStream_t stream,
+                       const gnn_csc_graph_t *graph,
+                       const void *src_features,
+                       const void *dst_features,
+                       const void *edge_features,
+                       const void *attn_weights,
+                       const float *dropout_mask,
+                       void *output,
+                       void *sm_scores,
+                       void *act_scores,
+                       int node_feat_dim,
+                       const gnn_mha_params_t *params,
+                       cudnnDataType_t data_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92800) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(gnn_mha_gat_v2_forward,
+                          cudnnGnnMhaGatV2Forward,
+                          stream,
+                          graph,
+                          src_features,
+                          dst_features,
+                          edge_features,
+                          attn_weights,
+                          dropout_mask,
+                          output,
+                          sm_scores,
+                          act_scores,
+                          node_feat_dim,
+                          params,
+                          data_type);
+#elif CUDNN_VERSION >= 92800
+    return cudnnGnnMhaGatV2Forward(stream,
+                                   reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                   src_features,
+                                   dst_features,
+                                   edge_features,
+                                   attn_weights,
+                                   dropout_mask,
+                                   output,
+                                   sm_scores,
+                                   act_scores,
+                                   node_feat_dim,
+                                   reinterpret_cast<const cudnnGnnMhaParams_t *>(params),
+                                   data_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)src_features;
+    (void)dst_features;
+    (void)edge_features;
+    (void)attn_weights;
+    (void)dropout_mask;
+    (void)output;
+    (void)sm_scores;
+    (void)act_scores;
+    (void)node_feat_dim;
+    (void)params;
+    (void)data_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+inline cudnnStatus_t
+gnn_mha_gat_v2_backward(cudaStream_t stream,
+                        const gnn_csc_graph_t *graph,
+                        const void *grad_output,
+                        const void *src_features,
+                        const void *dst_features,
+                        const void *edge_features,
+                        const void *attn_weights,
+                        const void *sm_scores,
+                        const void *act_scores,
+                        const float *dropout_mask,
+                        const float *grad_attention,
+                        void *grad_src_features,
+                        void *grad_dst_features,
+                        void *grad_edge_features,
+                        void *grad_weights,
+                        void *grad_sm_scores,
+                        void *grad_workspace_features,
+                        void *grad_workspace_weights,
+                        int node_feat_dim,
+                        const gnn_mha_params_t *params,
+                        cudnnDataType_t data_type,
+                        cudnnDataType_t grad_type) {
+#if defined NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING
+    if (get_backend_version() < 92800) {
+        return CUDNN_STATUS_NOT_SUPPORTED;
+    }
+    NV_FE_CALL_TO_BACKEND(gnn_mha_gat_v2_backward,
+                          cudnnGnnMhaGatV2Backward,
+                          stream,
+                          graph,
+                          grad_output,
+                          src_features,
+                          dst_features,
+                          edge_features,
+                          attn_weights,
+                          sm_scores,
+                          act_scores,
+                          dropout_mask,
+                          grad_attention,
+                          grad_src_features,
+                          grad_dst_features,
+                          grad_edge_features,
+                          grad_weights,
+                          grad_sm_scores,
+                          grad_workspace_features,
+                          grad_workspace_weights,
+                          node_feat_dim,
+                          params,
+                          data_type,
+                          grad_type);
+#elif CUDNN_VERSION >= 92800
+    return cudnnGnnMhaGatV2Backward(stream,
+                                    reinterpret_cast<const cudnnGnnCscGraph_t *>(graph),
+                                    grad_output,
+                                    src_features,
+                                    dst_features,
+                                    edge_features,
+                                    attn_weights,
+                                    sm_scores,
+                                    act_scores,
+                                    dropout_mask,
+                                    grad_attention,
+                                    grad_src_features,
+                                    grad_dst_features,
+                                    grad_edge_features,
+                                    grad_weights,
+                                    grad_sm_scores,
+                                    grad_workspace_features,
+                                    grad_workspace_weights,
+                                    node_feat_dim,
+                                    reinterpret_cast<const cudnnGnnMhaParams_t *>(params),
+                                    data_type,
+                                    grad_type);
+#else
+    (void)stream;
+    (void)graph;
+    (void)grad_output;
+    (void)src_features;
+    (void)dst_features;
+    (void)edge_features;
+    (void)attn_weights;
+    (void)sm_scores;
+    (void)act_scores;
+    (void)dropout_mask;
+    (void)grad_attention;
+    (void)grad_src_features;
+    (void)grad_dst_features;
+    (void)grad_edge_features;
+    (void)grad_weights;
+    (void)grad_sm_scores;
+    (void)grad_workspace_features;
+    (void)grad_workspace_weights;
+    (void)node_feat_dim;
+    (void)params;
+    (void)data_type;
+    (void)grad_type;
+    return CUDNN_STATUS_NOT_SUPPORTED;
+#endif
+}
+#endif
 
 #if CUDNN_VERSION >= 92200
 inline cudnnStatus_t

@@ -13,7 +13,7 @@ if [ -n "${2:-}" ]; then
 fi
 shift; [ $# -gt 0 ] && shift
 CONFIGS=("$@")
-[ ${#CONFIGS[@]} -eq 0 ] && CONFIGS=(deepseek_v4)
+[ ${#CONFIGS[@]} -eq 0 ] && CONFIGS=(deepseek_v4 deepseek_v41 glm53)
 cd "$(dirname "$0")/../.." || exit 1
 
 mkdir -p benchmark/dsa/results

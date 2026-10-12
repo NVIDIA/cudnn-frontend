@@ -21,6 +21,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05, warp
 from cutlass.cute.typing import BFloat16, Float32, Int32
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 U64x4 = Tuple[cutlass.Uint64, cutlass.Uint64, cutlass.Uint64, cutlass.Uint64]
 F32x16 = Tuple[
@@ -1309,7 +1310,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         dq_a_layout_staged = sm100_utils.make_smem_layout_a(dq_tiled_mma, self.DQ_MMA_TILER, self.element_dtype, 1)
         dq_b_layout_staged = sm100_utils.make_smem_layout_b(dq_tiled_mma, self.DQ_MMA_TILER, self.element_dtype, 1)
         dq_epi_tile = (self.H_TILE_CLUSTER, self.D_TILE_CTA)
-        dq_epi_layout_staged = sm100_utils.make_smem_layout_epi(self.element_dtype, utils.LayoutEnum.from_tensor(mdQ_epi), dq_epi_tile, 1)
+        dq_epi_layout_staged = sm100_utils.make_smem_layout_epi(self.element_dtype, LayoutEnum.from_tensor(mdQ_epi), dq_epi_tile, 1)
         dq_epi_layout = cute.select(dq_epi_layout_staged, mode=[0, 1])
         dq_epi_bytes = cute.size_in_bytes(self.element_dtype, dq_epi_layout_staged)
         assert dq_epi_bytes <= 32 * 1024
@@ -1356,8 +1357,8 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         assert self.shared_storage_bytes <= self.MAX_SMEM_BYTES
         score_tmem_load = self._make_score_tmem_load()
         dq_cta_shape = (self.D_TILE_CTA, self.H_TILE_CLUSTER, self.N_TILE)
-        dq_epi_tile = sm100_utils.compute_epilogue_tile_shape(dq_cta_shape, True, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype)
-        dq_tmem_load = sm100_utils.get_tmem_load_op(dq_cta_shape, utils.LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype, dq_epi_tile, True)
+        dq_epi_tile = sm100_utils.compute_epilogue_tile_shape(dq_cta_shape, True, LayoutEnum.ROW_MAJOR, self.acc_dtype)
+        dq_tmem_load = sm100_utils.get_tmem_load_op(dq_cta_shape, LayoutEnum.ROW_MAJOR, self.acc_dtype, self.acc_dtype, dq_epi_tile, True)
         sum_odo, scaled_lse = self._get_stats_workspace(
             workspace_LSE_OdO,
             mQ.shape[2][0],
@@ -2213,7 +2214,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             cpasync.prefetch_descriptor(tma_atom_do)
             cpasync.prefetch_descriptor(round_tma_atom_qt)
             cpasync.prefetch_descriptor(round_tma_atom_dot)
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         tmem_holding_buf_ptr = storage.tmem_holding_buf.ptr
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar.ptr
@@ -2311,7 +2312,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             ),
         )
         ds_image = storage.ds_image.get_tensor(dq_b_layout_staged.outer, swizzle=dq_b_layout_staged.inner)
-        score_store_layout = sm100_utils.make_smem_layout_epi(self.element_dtype, utils.LayoutEnum.COL_MAJOR, (self.H_TILE_CTA, self.N_TILE), 1)
+        score_store_layout = sm100_utils.make_smem_layout_epi(self.element_dtype, LayoutEnum.COL_MAJOR, (self.H_TILE_CTA, self.N_TILE), 1)
         assert cute.cosize(score_store_layout) == cute.cosize(dq_b_layout_staged)
         assert score_store_layout.inner == dq_b_layout_staged.inner
         assert score_store_layout.inner == dkv_b_layout_staged.inner
@@ -2442,7 +2443,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
         cute.arch.fence_view_async_shared()
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=False)
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             tmem_holding_buf_ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.MATH_WARP_BEGIN,
@@ -2629,7 +2630,7 @@ class FlashAttentionDSABackwardSm100H128TwoCTA:
             score_source_pp = score_copy_pp.get_slice(mtx).partition_S(t_score_pp)
             dp_copy_pp = tcgen05.make_tmem_copy(score_tmem_load, t_dp_pp)
             dp_source_pp = dp_copy_pp.get_slice(mtx).partition_S(t_dp_pp)
-            smem_store_atom = sm100_utils.get_smem_store_op(utils.LayoutEnum.COL_MAJOR, self.element_dtype, self.acc_dtype, score_copy)
+            smem_store_atom = sm100_utils.get_smem_store_op(LayoutEnum.COL_MAJOR, self.element_dtype, self.acc_dtype, score_copy)
             assert isinstance(smem_store_atom.op, warp.StMatrix8x8x16bOp)
             assert smem_store_atom.op.num_matrices == 4
             tiled_copy_r2s = cute.make_tiled_copy_D(smem_store_atom, score_copy)

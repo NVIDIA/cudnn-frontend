@@ -24,12 +24,16 @@ add_executable(
     tests
 
     pointwise_tests.cpp
+    plans.cpp
     serialize.cpp
     validate.cpp
     version.cpp
     tensor.cpp
+    autotune.cpp
+    autotune_workspace.cpp
     get_engine_and_knobs.cpp
     kernel_cache.cpp
+    plan_selection.cpp
 )
 
 if (MSVC)

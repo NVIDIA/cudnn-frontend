@@ -13,6 +13,7 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
+from cudnn._cutlass_compat import SmemAllocator
 
 from .utils import tanhf, warp_reduce
 
@@ -251,7 +252,7 @@ class HSTUAttentionBackwardQlen1Sm100:
                 cute.copy(vector_copy_atom, tDrdV, tDgdV)
             warp_k_base += row_stride
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         sdQ = smem.allocate_tensor(
             Float32,
             cute.make_layout((self.head_dim, self.num_warps), stride=(1, self.head_dim)),

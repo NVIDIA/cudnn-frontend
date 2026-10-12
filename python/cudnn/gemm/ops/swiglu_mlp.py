@@ -151,7 +151,7 @@ def _handle(device):
     return h, stream
 
 
-def _autotune(g, handle, var_pack):
+def _autotune(g, handle, buffers, tensor_uids):
     """Build every candidate plan, time each on the graph's device, and return
     ``(best_index, workspace)``. The top heuristic plan is not always fastest, so
     every plan that builds and executes is timed and the fastest kept. If no plan
@@ -161,7 +161,7 @@ def _autotune(g, handle, var_pack):
     n = g.get_execution_plan_count()
     if n == 0:
         raise RuntimeError("cudnn.gemm.swiglu_mlp: no execution plan was generated for this graph")
-    dev = next(iter(var_pack.values())).device
+    dev = buffers[0].device
     times = [float("inf")] * n
     errors = {}
     with torch.cuda.device(dev):  # events/workspace/sync must be on the graph's device
@@ -169,11 +169,11 @@ def _autotune(g, handle, var_pack):
         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         for i in range(n):
             try:
-                g.execute_plan_at_index(var_pack, ws, index=i, handle=handle)  # warm up / validity
+                g.execute_plan_at_index(buffers, ws, index=i, handle=handle, tensor_uids=tensor_uids)  # warm up / validity
                 torch.cuda.synchronize(dev)
                 start.record()
                 for _ in range(_AUTOTUNE_ITERS):
-                    g.execute_plan_at_index(var_pack, ws, index=i, handle=handle)
+                    g.execute_plan_at_index(buffers, ws, index=i, handle=handle, tensor_uids=tensor_uids)
                 stop.record()
                 stop.synchronize()
                 times[i] = start.elapsed_time(stop) / _AUTOTUNE_ITERS
@@ -201,12 +201,13 @@ def _mm(a2, b2):
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         out = torch.empty((1, a.shape[1], b.shape[2]), device=a2.device, dtype=a2.dtype)
-        best, ws = _autotune(g, h, {A: a, B: b, C: out})
-        e = (g, A, B, C, best, ws)
+        tensor_uids = (A.get_uid(), B.get_uid(), C.get_uid())
+        best, ws = _autotune(g, h, [a, b, out], tensor_uids)
+        e = (g, tensor_uids, best, ws)
         _MM_CACHE[key] = e
-    g, A, B, C, best, ws = e
+    g, tensor_uids, best, ws = e
     out = torch.empty((1, a.shape[1], b.shape[2]), device=a2.device, dtype=a2.dtype)
-    g.execute_plan_at_index({A: a, B: b, C: out}, ws, index=best, handle=h)
+    g.execute_plan_at_index([a, b, out], ws, index=best, handle=h, tensor_uids=tensor_uids)
     return out.squeeze(0)
 
 
@@ -278,24 +279,27 @@ def _swiglu_act(
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         hb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-        vp = {X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0)}
+        tensors = (X, WG, WU, hh)
+        buffers = [xv, wg, wu, hb.unsqueeze(0)]
         if save_preacts:
             gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
             ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-            vp.update({gate: gb.unsqueeze(0), up: ub.unsqueeze(0)})
-        best, ws = _autotune(g, h, vp)
-        e = (g, X, WG, WU, hh, gate, up, best, ws)
+            tensors += (gate, up)
+            buffers.extend((gb.unsqueeze(0), ub.unsqueeze(0)))
+        tensor_uids = tuple(t.get_uid() for t in tensors)
+        best, ws = _autotune(g, h, buffers, tensor_uids)
+        e = (g, tensor_uids, best, ws)
         _SWIGLU_CACHE[key] = e
-    g, X, WG, WU, hh, gate, up, best, ws = e
+    g, tensor_uids, best, ws = e
     hb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-    vp = {X: xv, WG: wg, WU: wu, hh: hb.unsqueeze(0)}
+    buffers = [xv, wg, wu, hb.unsqueeze(0)]
     if save_preacts:
         gb = torch.empty(M, interm, device=x.device, dtype=x.dtype)
         ub = torch.empty(M, interm, device=x.device, dtype=x.dtype)
-        vp.update({gate: gb.unsqueeze(0), up: ub.unsqueeze(0)})
+        buffers.extend((gb.unsqueeze(0), ub.unsqueeze(0)))
     else:
         gb = ub = None
-    g.execute_plan_at_index(vp, ws, index=best, handle=h)
+    g.execute_plan_at_index(buffers, ws, index=best, handle=h, tensor_uids=tensor_uids)
     return hb, gb, ub
 
 
@@ -354,15 +358,16 @@ def _dswiglu(
         g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         dgb = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
         dub = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
-        vp = {DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), dup: dub.unsqueeze(0), dgate: dgb.unsqueeze(0)}
-        best, ws = _autotune(g, h, vp)
-        e = (g, DH, GATE, UP, dup, dgate, best, ws)
+        tensor_uids = (DH.get_uid(), GATE.get_uid(), UP.get_uid(), dup.get_uid(), dgate.get_uid())
+        buffers = [dh.unsqueeze(0), gate.unsqueeze(0), up.unsqueeze(0), dub.unsqueeze(0), dgb.unsqueeze(0)]
+        best, ws = _autotune(g, h, buffers, tensor_uids)
+        e = (g, tensor_uids, best, ws)
         _DSWIGLU_CACHE[key] = e
-    g, DH, GATE, UP, dup, dgate, best, ws = e
+    g, tensor_uids, best, ws = e
     dgb = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
     dub = torch.empty(M, interm, device=dh.device, dtype=dh.dtype)
     g.execute_plan_at_index(
-        {DH: dh.unsqueeze(0), GATE: gate.unsqueeze(0), UP: up.unsqueeze(0), dup: dub.unsqueeze(0), dgate: dgb.unsqueeze(0)}, ws, index=best, handle=h
+        [dh.unsqueeze(0), gate.unsqueeze(0), up.unsqueeze(0), dub.unsqueeze(0), dgb.unsqueeze(0)], ws, index=best, handle=h, tensor_uids=tensor_uids
     )
     return dgb, dub
 

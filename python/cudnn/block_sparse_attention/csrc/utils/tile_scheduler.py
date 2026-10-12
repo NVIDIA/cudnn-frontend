@@ -1,5 +1,8 @@
 # Copyright (c) 2025, Tri Dao, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 from enum import IntEnum, auto
 from typing import Optional, Tuple
@@ -15,8 +18,8 @@ from cutlass.pipeline import PipelineClcFetchAsync, PipelineState
 from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
+from cudnn._cutlass_compat import FastDivmodDivisor
 
 from cudnn.block_sparse_attention.csrc.utils.cute_dsl_utils import ParamsBase
 

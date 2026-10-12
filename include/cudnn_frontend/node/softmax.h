@@ -110,6 +110,11 @@ class CompositeSoftmaxNode : public SoftmaxNodeBase<CompositeSoftmaxNode> {
             "CompositeSoftmaxNode can only output certain combinations of stats, max and sum_exp: "
             "stats only, max and sum_exp only, or none of the above.");
 
+        RETURN_CUDNN_FRONTEND_ERROR_IF(attributes.stats_use_log2 && has_stats(),
+                                       error_code_t::GRAPH_NOT_SUPPORTED,
+                                       "CompositeSoftmaxNode doesn't support stats_use_log2 (requires the unified "
+                                       "softmax operation on cuDNN 9.27.0+)");
+
         return {error_code_t::OK, ""};
     }
 
@@ -298,6 +303,23 @@ class UnifiedSoftmaxNode : public SoftmaxNodeBase<UnifiedSoftmaxNode> {
                                                            CUDNN_TYPE_BACKEND_DESCRIPTOR,
                                                            1,
                                                            &backend_stats));
+        }
+
+        // Base-2 Stats scales the entire natural-log LSE by log2(e).
+        if (attributes.stats_use_log2 && has_stats()) {
+#if (CUDNN_VERSION >= 92700)
+            auto stats_log2_cudnn_ver_error = error_t{error_code_t::GRAPH_NOT_SUPPORTED,
+                                                      "stats_use_log2 in unified softmax node requires cuDNN 9.27.0"};
+            NV_CUDNN_FE_DYNAMIC_CHECK_CUDNN_BACKEND_VERSION(92700, stats_log2_cudnn_ver_error);
+            bool stats_log2_value = true;
+            _CUDNN_CHECK_CUDNN_ERROR(detail::set_attribute(softmax_operation->get_backend_descriptor(),
+                                                           CUDNN_ATTR_OPERATION_SOFTMAX_STATS_LOG2,
+                                                           CUDNN_TYPE_BOOLEAN,
+                                                           1,
+                                                           &stats_log2_value));
+#else
+            return {error_code_t::GRAPH_NOT_SUPPORTED, "stats_use_log2 requires cuDNN 9.27.0 headers"};
+#endif
         }
 
         // Set optional Max output tensor if present

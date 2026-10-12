@@ -17,9 +17,9 @@ def _targets():
     if raw:
         return [item.strip() for item in raw.split(",") if item.strip()]
     return [
-        "test/python/test_mhas_v2.py::test_sdpa_fp8_fwd_L0[test1]",
-        "test/python/test_mhas_v2.py::test_sdpa_fp8_fwd_paged_L0[test1]",
-        "test/python/test_mhas_v2.py::test_sdpa_fp8_bwd_L0[test1]",
+        "test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_fwd_L0[test1]",
+        "test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_fwd_paged_L0[test1]",
+        "test/python/sdpa/graph/test_mhas_v2.py::test_sdpa_fp8_bwd_L0[test1]",
     ]
 
 

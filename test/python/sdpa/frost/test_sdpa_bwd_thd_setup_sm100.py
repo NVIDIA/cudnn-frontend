@@ -65,6 +65,12 @@ if _dsl_installed():
             cutlass.Int32(8),  # n_clusters
         ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
 
+    @cute.jit
+    def _dynamic_setup_host(meta_t, ql, kl, lens_form, n_batch, gran, stream):
+        build_thd_bwd_setup_kernel(meta_t, ql, kl, lens_form, cutlass.Int32(3), n_batch, gran, cutlass.Int32(128), cutlass.Int32(8)).launch(
+            grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream
+        )
+
 
 def _build(dev):
     """Run the setup kernel over ``_LENS_*``; returns the metadata as a list."""
@@ -113,3 +119,47 @@ def test_thd_bwd_setup_metadata():
     for s in _LENS_Q:
         row.append(row[-1] + -(-s // _GRAN) * _GRAN)
     assert meta[THD_ROWOFF_OFF(b) : THD_ROWOFF_OFF(b) + b + 1] == row, "row_off"
+
+
+@pytest.fixture(scope="module")
+def parallel_bwd_setup():
+    def tensor(t):
+        return from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=0)
+
+    buf = torch.empty(16, device="cuda", dtype=torch.int32)
+    stream = _cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled = cute.compile(_dynamic_setup_host, tensor(buf), tensor(buf), tensor(buf), cutlass.Int32(0), cutlass.Int32(1), cutlass.Int32(128), stream)
+    return compiled, tensor, stream
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("batch", [0, 1, 2, 31, 32, 33, 127, 128, 129, 1024])
+@pytest.mark.parametrize("lens_form", [0, 1, 2, 3])
+@pytest.mark.parametrize("gran", [64, 128, 256])
+def test_parallel_bwd_setup_prefixes(parallel_bwd_setup, batch, lens_form, gran):
+    """Raw/cumulative lengths and rounded workspace prefixes share no writes."""
+    compiled, tensor, stream = parallel_bwd_setup
+    q = [(17 * i) % 193 for i in range(batch)]
+    k = [(29 * i) % 257 for i in range(batch)]
+
+    def prefix(values):
+        out = [0]
+        for value in values:
+            out.append(out[-1] + value)
+        return out
+
+    cu_q, cu_k = prefix(q), prefix(k)
+    # Nonzero cumulative origins must not enter normalized or rounded offsets.
+    q_in = [v + 17 for v in cu_q] if lens_form & 1 else q
+    k_in = [v + 31 for v in cu_k] if lens_form & 2 else k
+    ql = torch.tensor(q_in, device="cuda", dtype=torch.int32)
+    kl = torch.tensor(k_in, device="cuda", dtype=torch.int32)
+    words = THD_BWD_META_WORDS(batch)
+    meta = torch.full((words + 16,), -999, device="cuda", dtype=torch.int32)
+    compiled(tensor(meta), tensor(ql), tensor(kl), cutlass.Int32(lens_form), cutlass.Int32(batch), cutlass.Int32(gran), stream)
+    remap = sorted(range(batch), key=lambda i: (-q[i], i))
+    live = sum((value + 127) // 128 for value in q) * 3
+    rounded = prefix([((value + gran - 1) // gran) * gran for value in q])
+    expected = k + cu_q + cu_k + remap + [live, 8] + rounded
+    assert len(expected) == words
+    assert meta.cpu().tolist() == expected + [-999] * 16

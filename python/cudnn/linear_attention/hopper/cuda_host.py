@@ -1,0 +1,164 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Host half of the fused sm90 KDA prefill kernel.
+
+The kernel is one ``__global__``; this reproduces its launch through the driver
+API, reusing ``linear_attention/cake/compiler.py`` for NVRTC compilation, module
+caching and the dynamic shared-memory attribute. The campaign artifact's own
+``kda_launch`` is not vendored -- NVRTC compiles device code only -- so the grid
+and the residency heuristic are restated here and nowhere else.
+
+``compiler.library()`` resolves bodies against ``cake/kernels``, so this keeps
+its own equivalent cache over ``hopper/cuda_kernels`` rather than putting an
+unrelated kernel in cake's directory.
+"""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+from typing import Dict, Tuple
+
+from cudnn.frost.device import compute_capability, device_context
+
+from ..cake import compiler
+
+HOPPER_CC = (9, 0)
+
+KERNEL_DIR = Path(__file__).resolve().parent / "cuda_kernels"
+KERNEL_BODY = "kda_fused_sm90.cu"
+KERNEL_NAME = "kda_fused"
+CHUNK = 16
+BLOCK = 128
+
+# Input fusions the kernel can apply to the staged tile. Mirrors the
+# KDA_FLAG_* defines in kda_fused_sm90.cu; the body has no way to check these
+# against us, so they are named in one place and passed through untouched.
+FLAG_L2NORM = 1
+FLAG_SAFE_GATE = 2
+FLAG_BETA_SIGMOID = 4
+
+# 1/sqrt(128): the kernel's documented default query scale.
+DEFAULT_Q_SCALE = 0.08838834764831845
+
+# sizeof(FusedSmem) in the kernel body. Restated here because NVRTC internalises
+# an unreferenced __device__ variable, so the value cannot be read back out of
+# the module. The body carries a static_assert against the -D below, so if the
+# struct ever changes this becomes a compile error naming this constant rather
+# than an undersized shared-memory allocation.
+SMEM_BYTES = 94464
+_SMEM_DEFINE = (f"-DKDA_FUSED_SMEM_BYTES={SMEM_BYTES}",)
+
+
+def _defines(flags: int, gqa: bool = False):
+    """Compile options for one fusion combination.
+
+    The flags are fixed per graph node, so they are baked in rather than
+    branched on: as runtime branches they cost the no-fusion path 2.7-7.9%.
+    compile_cubin keys its on-disk cache on the option list, so each combination
+    gets its own cubin and they cannot collide.
+    """
+    return (*_SMEM_DEFINE, f"-DKDA_FUSED_FLAGS={int(flags)}", f"-DKDA_FUSED_GQA={int(bool(gqa))}")
+
+
+# The campaign kernel targets ~264 resident CTAs; a launch splits each sequence
+# into P pieces so N*H*P lands near that without exceeding the number of chunks
+# a sequence actually has. Restated from the artifact's kda_launch.
+TARGET_CTAS = 264
+
+_LOCK = threading.Lock()
+_LIBRARIES: Dict[Tuple[str, int], "compiler.KernelLibrary"] = {}
+
+
+def _arch_for_device(device: int) -> str:
+    """``sm_90a`` for Hopper.
+
+    Deliberately NOT ``compiler.arch_for_device``: that one hard-gates to
+    compute capability 10.0/10.3 because cake's frozen bodies are Blackwell-only,
+    and it raises ``CakeCompileError`` on sm90. Everything else in
+    ``cake/compiler`` -- ``compile_cubin``, ``KernelLibrary``, ``Params``,
+    ``launch`` -- takes the arch as a parameter and is architecture-agnostic, so
+    only this one function needs replacing.
+    """
+    major, minor = compute_capability(device)
+    if (major, minor) != HOPPER_CC:
+        raise NotImplementedError(f"the fused sm90 KDA kernel targets compute capability 9.0, got {major}.{minor}")
+    return "sm_90a"
+
+
+def _library(device: int, flags: int = 0, gqa: bool = False) -> "compiler.KernelLibrary":
+    key = (KERNEL_BODY, int(device), int(flags), bool(gqa))
+    with _LOCK:
+        lib = _LIBRARIES.get(key)
+        if lib is None:
+            lib = compiler.KernelLibrary(KERNEL_DIR / KERNEL_BODY, _arch_for_device(device), int(device), _defines(flags, gqa))
+            _LIBRARIES[key] = lib
+        return lib
+
+
+def pieces_per_sequence(total_tokens: int, n_seqs: int, n_heads: int) -> int:
+    """``P`` from the artifact's launcher: fill the machine, but never split a
+    sequence into more pieces than it has chunks."""
+    approx = ((total_tokens + n_seqs - 1) // n_seqs + CHUNK - 1) // CHUNK
+    p = TARGET_CTAS // max(n_seqs * n_heads, 1)
+    if p < 1:
+        p = 1
+    if p > approx:
+        p = approx if approx >= 1 else 1
+    return p
+
+
+def launch(
+    device: int,
+    stream: int,
+    q: int,
+    k: int,
+    v: int,
+    g: int,
+    beta: int,
+    cu_seqlens: int,
+    initial_state: int,
+    o: int,
+    final_state: int,
+    total_tokens: int,
+    n_seqs: int,
+    n_heads: int,
+    a_log: int = 0,
+    dt_bias: int = 0,
+    gate_lower_bound: float = -5.0,
+    flags: int = 0,
+    q_scale: float = DEFAULT_Q_SCALE,
+    n_qk_heads: int = 0,
+) -> None:
+    """One ``kda_fused`` launch. All tensor arguments are device addresses.
+
+    ``flags`` selects the in-kernel input fusions (see ``FLAG_*``); ``a_log`` and
+    ``dt_bias`` are read only when ``FLAG_SAFE_GATE`` is set and may be 0
+    otherwise.
+    """
+    smem = SMEM_BYTES
+    func = _library(device, flags, (n_qk_heads or n_heads) != n_heads).function(KERNEL_NAME, dynamic_smem=smem)
+    p = pieces_per_sequence(total_tokens, n_seqs, n_heads)
+
+    params = compiler.Params()
+    for address in (q, k, v, g, beta, cu_seqlens, initial_state, o, final_state):
+        params.ptr(address)
+    for scalar in (n_seqs, n_heads, p):
+        params.i32(scalar)
+    params.ptr(a_log)
+    params.ptr(dt_bias)
+    params.f32(gate_lower_bound)
+    params.f32(q_scale)
+    # q/k head count; equal to n_heads unless value heads are grouped.
+    params.i32(n_qk_heads or n_heads)
+
+    compiler.launch(
+        func,
+        grid=(n_heads, n_seqs * p, 1),
+        block=(BLOCK, 1, 1),
+        dynamic_smem=smem,
+        stream=stream,
+        params=params,
+        what=f"{KERNEL_NAME}(T={total_tokens}, N={n_seqs}, H={n_heads}, P={p})",
+    )

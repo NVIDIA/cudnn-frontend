@@ -19,7 +19,7 @@
 constants; the per-compile attributes live on ``GdnBpropCfg`` in the kernel
 file).
 
-Target arch: Blackwell SM100 (GB200) / SM103 (GB300).
+Target arch: SM100 / SM103 / SM107.
 """
 
 from dataclasses import dataclass

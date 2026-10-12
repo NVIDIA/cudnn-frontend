@@ -589,6 +589,7 @@ def _empty_bwd_workspace_with_zeroed_accum(
     round_d_to: int,
     zero_dq_accum: bool,
     device: torch.device,
+    zero_kv_accum: bool = True,
     include_dkv_accum: bool = True,
 ) -> torch.Tensor:
     q_rounded = ((seqlen_q + round_q_to - 1) // round_q_to) * round_q_to
@@ -618,7 +619,9 @@ def _empty_bwd_workspace_with_zeroed_accum(
     if not zero_dq_accum:
         accum_offset += q_rounded * d_rounded
     flat_accum_offset = batch_size * num_heads * accum_offset
-    workspace.reshape(-1)[flat_accum_offset:].zero_()
+    flat_accum_end = workspace.numel() if zero_kv_accum else batch_size * num_heads * (2 * q_rounded + q_rounded * d_rounded)
+    if flat_accum_offset < flat_accum_end:
+        workspace.reshape(-1)[flat_accum_offset:flat_accum_end].zero_()
     return workspace
 
 
@@ -1046,7 +1049,7 @@ def _bsa_attn_fwd_sm120_blk128(
     )
 
 
-def _bsa_attn_fwd_sm120_fp8_blk64(
+def _bsa_attn_fwd_sm120_fp8(
     q_fp8: torch.Tensor,
     k_fp8: torch.Tensor,
     v_fp8: torch.Tensor,
@@ -1058,25 +1061,40 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
     softmax_scale: float,
     block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    *,
+    sparse_block_size: int = 64,
+    v_block_size: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Launch the JIT-only SM120 Sage FP8 blk64 kernel on BHSD tensors."""
+    """Launch native SM120 Sage FP8 with unchanged 64- or 128-block metadata."""
     _require_sage_fp8_cutedsl()
-    from cudnn.block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8 import (
-        BlockSparseAttnForwardFp8Sm120Blk64,
-    )
+    assert sparse_block_size in (64, 128)
+    assert v_block_size in (0, 128)
+    assert v_block_size == 0 or sparse_block_size == 128
+    if sparse_block_size == 128:
+        from cudnn.block_sparse_attention.csrc.fwd.sm120_blk128.bsa_fwd_sm120_fp8 import (
+            BlockSparseAttnForwardFp8Sm120Blk128 as Kernel,
+        )
+    else:
+        from cudnn.block_sparse_attention.csrc.fwd.sm120_blk64.bsa_fwd_sm120_fp8 import (
+            BlockSparseAttnForwardFp8Sm120Blk64 as Kernel,
+        )
 
     batch, num_heads, seqlen_q, head_dim = q_fp8.shape
     seqlen_k = k_fp8.shape[2]
     assert q_fp8.dtype == torch.float8_e4m3fn
     assert k_fp8.dtype == q_fp8.dtype and v_fp8.dtype == q_fp8.dtype
     assert k_fp8.shape == (batch, num_heads, seqlen_k, head_dim)
-    assert v_fp8.shape == k_fp8.shape
+    if v_block_size == 128:
+        assert v_fp8.shape == (batch, num_heads, _ceil_div_int(seqlen_k, 128), head_dim, 128)
+        assert v_fp8.is_contiguous()
+    else:
+        assert v_fp8.shape == k_fp8.shape
     assert q_scale.shape == (batch, num_heads, seqlen_q)
     assert k_scale.shape == (batch, num_heads, _ceil_div_int(seqlen_k, 16))
     assert v_scale.shape == (num_heads, head_dim)
 
-    num_q_blocks = _ceil_div_int(seqlen_q, SM120_FWD_BLOCK_SIZE)
-    num_kv_blocks = _ceil_div_int(seqlen_k, SM120_FWD_BLOCK_SIZE)
+    num_q_blocks = _ceil_div_int(seqlen_q, sparse_block_size)
+    num_kv_blocks = _ceil_div_int(seqlen_k, sparse_block_size)
     assert q2k_block_index.dtype == torch.int32
     assert q2k_block_index.shape[:3] == (batch, num_heads, num_q_blocks)
     q2k_block_index = q2k_block_index.contiguous()
@@ -1122,7 +1140,7 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
 
     q_t = q_fp8.permute(2, 3, 1, 0)
     k_t = k_fp8.permute(2, 3, 1, 0)
-    v_t = v_fp8.permute(3, 2, 1, 0)
+    v_t = v_fp8.permute(3, 4, 2, 1, 0) if v_block_size == 128 else v_fp8.permute(3, 2, 1, 0)
     out_t = out.permute(2, 3, 1, 0)
     lse_t = lse.permute(2, 1, 0)
     q_scale_t = q_scale.permute(2, 1, 0)
@@ -1150,35 +1168,41 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
         _to_cute_tensor(
             tensor,
             assumed_align=(128 if index < 4 else 4 if index in (4, 5, 6, 7) else None),
-            leading_dim=(1 if index in (0, 1, 3) else 0),
+            leading_dim=(1 if index in (0, 1, 3) or (index == 2 and v_block_size == 128) else 0),
             enable_tvm_ffi=False,
         )
         for index, tensor in enumerate(runtime_tensors)
     )
     current_stream = cuda.CUstream(torch.cuda.current_stream(torch.cuda.current_device()).cuda_stream)
-    fwd_kernel = BlockSparseAttnForwardFp8Sm120Blk64(
+    fwd_kernel = Kernel(
         gqa_ratio=1,
         head_dim=head_dim,
         value_dim=head_dim,
-        blocksparse_blocksize_q=SM120_FWD_BLOCK_SIZE,
-        blocksparse_blocksize_k=SM120_FWD_BLOCK_SIZE,
+        blocksparse_blocksize_q=sparse_block_size,
+        blocksparse_blocksize_k=sparse_block_size,
         dtype=cutlass.Float8E4M3FN,
         acc_dtype=cutlass.Float32,
         has_block_sizes=has_block_sizes,
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
+        **({"v_block_size": v_block_size} if v_block_size else {}),
     )
+    compile_options = getattr(fwd_kernel, "_compile_options", "")
+    if has_block_nums or fixed_block_sparse_num < getattr(fwd_kernel, "_compile_min_blocks", 0):
+        compile_options = ""
     compile_key = _dynamic_tensors_compile_key(
-        "sm120_fp8_blk64",
+        f"sm120_fp8_blk{sparse_block_size}",
         (
             _get_device_arch(),
+            v_block_size,
             head_dim,
             has_block_nums,
             has_block_sizes,
             block_sizes_mode,
+            compile_options,
         ),
         runtime_tensors,
-        leading_dims=(1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0),
+        leading_dims=(1, 1, 1 if v_block_size == 128 else 0, 1, 0, 0, 0, 0, 0, 0, 0),
     )
     args = (
         *cute_tensors[:10],
@@ -1186,22 +1210,31 @@ def _bsa_attn_fwd_sm120_fp8_blk64(
         cute_tensors[10],
         softmax_scale,
     )
-    if compile_key not in _bsa_attn_fwd_sm120_fp8_blk64.compile_cache:
-        _bsa_attn_fwd_sm120_fp8_blk64.compile_cache[compile_key] = cute.compile(
+    if compile_key not in _bsa_attn_fwd_sm120_fp8.compile_cache:
+        _bsa_attn_fwd_sm120_fp8.compile_cache[compile_key] = cute.compile(
             fwd_kernel,
             *args,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
+            **({"options": compile_options} if compile_options else {}),
         )
 
-    with torch.cuda.nvtx.range("bsa_attn_fwd_sm120_fp8_blk64_kernel"):
-        _bsa_attn_fwd_sm120_fp8_blk64.compile_cache[compile_key](
+    with torch.cuda.nvtx.range(f"bsa_attn_fwd_sm120_fp8_blk{sparse_block_size}_kernel"):
+        _bsa_attn_fwd_sm120_fp8.compile_cache[compile_key](
             *args,
             current_stream,
         )
     return out, lse
 
 
-_bsa_attn_fwd_sm120_fp8_blk64.compile_cache = {}
+_bsa_attn_fwd_sm120_fp8.compile_cache = {}
+
+
+def _bsa_attn_fwd_sm120_fp8_blk64(*args, **kwargs):
+    """Keep the existing private blk64 launch entry point."""
+    return _bsa_attn_fwd_sm120_fp8(*args, **kwargs)
+
+
+_bsa_attn_fwd_sm120_fp8_blk64.compile_cache = _bsa_attn_fwd_sm120_fp8.compile_cache
 
 
 def _combine_blk64_kv_bucketed_partials(
@@ -1708,6 +1741,37 @@ bsa_attn_fwd_blk64_cutedsl.compile_cache = {}
 bsa_attn_fwd_blk64 = bsa_attn_fwd_blk64_cutedsl
 
 
+def bsa_fp8_blk128_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    block_sparse_num: int,
+    softmax_scale: Optional[float] = None,
+    *,
+    block_sizes: Optional[torch.Tensor] = None,
+    q2k_block_nums: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Quantize with the existing Sage recipe and launch native SM120 KV128."""
+    _require_sage_fp8_cutedsl()
+    if _get_device_arch() // 10 != 12:
+        raise NotImplementedError("Sage FP8 native blk128 requires SM120")
+    from cudnn.block_sparse_attention._fp8_quant import _quantize_sage_bhsd
+
+    quantized = _quantize_sage_bhsd(q, k, v, v_block_size=128)
+    out, _ = _bsa_attn_fwd_sm120_fp8(
+        *quantized,
+        q2k_block_index,
+        block_sparse_num,
+        128**-0.5 if softmax_scale is None else softmax_scale,
+        block_sizes=block_sizes,
+        q2k_block_nums=q2k_block_nums,
+        sparse_block_size=128,
+        v_block_size=128,
+    )
+    return out
+
+
 def bsa_fp8_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1845,7 +1909,7 @@ def bsa_attn_fwd(
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
             (batch, num_heads, num_q_blocks) int32, each value >= 0.
             When None, uses fixed block_sparse_num for all Q blocks.
-        sparse_block_size: Sparse Q/KV block size. SM90 supports 64, SM120
+        sparse_block_size: Sparse Q/KV block size. SM90 supports 64 or 128, SM120
             supports 64 or 128, and this SM100/SM110 path supports 128.
         allow_empty_block_nums: When True (default), q2k_block_nums may contain 0 (empty tiles
             produce O=0, LSE=-inf). When False, all values must be >= 1, enabling compile-time
@@ -1881,8 +1945,15 @@ def bsa_attn_fwd(
     assert num_head % num_head_kv == 0
     if sparse_block_size is None:
         sparse_block_size = 64 if arch // 10 in (9, 12) else 128
+    if arch // 10 == 9 and sparse_block_size == 128:
+        from ._sm90_blk128 import forward
+
+        if out is not None or lse is not None:
+            raise NotImplementedError("SM90 blk128 forward allocates its outputs")
+        result = forward(q, k, v, q2k_block_index, block_sparse_num, block_sizes, q2k_block_nums, softmax_scale, layout, int(kv_splits))
+        return result if return_lse else result[0]
     if arch // 10 == 9:
-        assert sparse_block_size == 64, "SM90 fwd only supports sparse_block_size=64"
+        assert sparse_block_size == 64, "SM90 fwd only supports sparse_block_size=64 or 128"
     elif arch // 10 == 12:
         assert sparse_block_size in (64, 128), "SM120 fwd only supports sparse_block_size=64 or 128"
     else:
@@ -2245,7 +2316,7 @@ def bsa_attn_bwd(
         bwd_head_dim = SM90_BWD_HEAD_DIM
         if sparse_block_size is None:
             sparse_block_size = SM90_BWD_SPARSE_BLOCK_SIZE
-        assert sparse_block_size == SM90_BWD_SPARSE_BLOCK_SIZE, "SM90 bwd only supports sparse_block_size=64"
+        assert sparse_block_size in (64, 128), "SM90 bwd only supports sparse_block_size=64 or 128"
         assert head_dim == bwd_head_dim, f"sm90 bwd only supports head_dim={bwd_head_dim}, got {head_dim}"
     else:
         bwd_head_dim = SM100_BWD_HEAD_DIM
@@ -2308,6 +2379,28 @@ def bsa_attn_bwd(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    if arch // 10 == 9 and sparse_block_size == 128:
+        from ._sm90_blk128 import backward
+
+        result = backward(
+            dout_bwd,
+            q_bwd,
+            k_bwd,
+            v_bwd,
+            out_bwd,
+            lse,
+            q2k_block_index,
+            block_sparse_num,
+            block_sizes,
+            q2k_block_nums,
+            softmax_scale,
+            dq_bwd,
+            dk_bwd,
+            dv_bwd,
+            bucket_size_blocks,
+        )
+        return tuple(t.transpose(1, 2) for t in result) if layout == "bshd" else result
 
     if arch // 10 != 9 and sparse_block_size == SM100_BLK128_BWD_SPARSE_BLOCK_SIZE:
         if bucket_size_blocks is None or bucket_size_blocks <= 0:

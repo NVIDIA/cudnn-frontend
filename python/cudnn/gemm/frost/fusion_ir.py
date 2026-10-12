@@ -346,10 +346,10 @@ class TensorRef:
         if self.grouped_by_moe:
             if len(self.dim) != 3:
                 raise ValueError(f"per-group aux {self.name!r} must be rank-3; got dim {self.dim}")
-            if self.dim[1] != 1:
-                raise ValueError(f"per-group aux {self.name!r} must broadcast the M axis (dim[1] == 1); got dim {self.dim}")
-            if self.bcast_mode not in ("scalar", "per_col"):
-                raise ValueError(f"per-group aux {self.name!r} supports scalar or per_col broadcast; " f"got {self.bcast_mode!r}")
+            if self.dim[1] != 1 and self.dim[2] != 1:
+                raise ValueError(f"per-group aux {self.name!r} must broadcast an M/N axis; got dim {self.dim}")
+            if self.bcast_mode not in ("scalar", "per_col", "per_row"):
+                raise ValueError(f"per-group aux {self.name!r} supports scalar, per_col or per_row broadcast; " f"got {self.bcast_mode!r}")
 
 
 # Producing-operation references — "where does this op's input come from?".
@@ -505,9 +505,10 @@ class BlockScaleSpec:
     while Rubin additionally provides a native-packed K64 form. E5M3 scales
     require SM 10.7+.
 
-    SF tensors are runtime-positional (not ``TensorRef``s), fully described here
-    by per-side scalars; their logical dims derive from M/N/K/block_size. Passed
-    at runtime in the ``F8_128x4`` swizzled layout (128-row × 4-K blocked)."""
+    SF tensors are runtime-positional (not ``TensorRef``s). F8_128x4 inputs are
+    packed byte blobs; MoE GATHER instead requires linear token SF with explicit
+    source-token dimensions and strides. Weight SF retains F8_128x4. GATHER's
+    producer packs the linear rows into the same 128-row × 4-K MMA atoms."""
 
     a_dtype: Dtype  # packed data dtype of A (mirror of matmul.a_dtype)
     b_dtype: Dtype  # packed data dtype of B
@@ -522,6 +523,10 @@ class BlockScaleSpec:
     # SF reorder layout per side (cuDNN name, e.g. "F8_128x4"; None = NONE).
     sfa_reorder: "str | None" = None
     sfb_reorder: "str | None" = None
+    sfa_dim: tuple[int, ...] | None = None
+    sfa_stride: tuple[int, ...] | None = None
+    sfb_dim: tuple[int, ...] | None = None
+    sfb_stride: tuple[int, ...] | None = None
     # Each dequant op's compute + output dtype (dequant OUTPUT = the MMA's input
     # type for that operand). None for a non-dequantized side. Recorded for the
     # compile-stage check (cuDNN requires dequant math precision = FLOAT).
@@ -623,27 +628,39 @@ class MoeSpec:
     MatmulSpec dims: M=total tokens, K=hidden, N=weight; a_batch=1,
     b_batch=num_experts. Compiler routes to ``sm100_moe_grouped_matmul_fwd_*``
     (grouped persistent scheduler + per-group A TMA descriptor replacement).
-    POC scope: ``mode == "none"`` only (gather/scatter rejected)."""
+    In ``gather`` mode, M counts routed rows and ``token_index`` maps each
+    routed row to a source token. In ``scatter`` mode, the input stays grouped
+    and output row is ``token_index[row] * top_k + token_ks[row]``.
+    COMBINE weights those contributions by top-k scores and sums into token rows.
+    Template capabilities gate execution."""
 
     num_experts: int  # E — the weight batch; routed group g uses expert g % E
-    mode: str = "none"  # "none" only in the POC
+    mode: str = "none"
     # first_token_offset dtype (INT32 or INT64; cuDNN accepts both). Baked at JIT
     # time; the scheduler casts reads to Int32 so the math is dtype-agnostic.
     offset_dtype: Dtype = "int32"
     num_groups: int = 0
     offset_multiple: int = 1
+    top_k: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts < 1:
             raise ValueError(f"num_experts must be positive; got {self.num_experts}")
         if self.num_groups < 1:
             object.__setattr__(self, "num_groups", self.num_experts)
-        if self.mode != "none":
-            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is out of POC scope; " "only 'none' is supported (gather / scatter rejected)")
+        if self.mode not in ("none", "gather", "scatter", "combine"):
+            raise ValueError(f"MoE grouped matmul mode {self.mode!r} is unsupported")
+        if self.top_k < 1:
+            raise ValueError("MoE top_k must be positive")
         if self.offset_dtype not in ("int32", "int64"):
             raise ValueError(f"first_token_offset dtype must be int32 or int64; " f"got {self.offset_dtype!r}")
         if self.offset_multiple < 1:
             raise ValueError(f"first_token_offset alignment_value must be >= 1; " f"got {self.offset_multiple}")
+
+
+@dataclass(frozen=True)
+class MoeSwapAbSpec(MoeSpec):
+    """Internal weight-by-token grouped matmul, with groups partitioning N."""
 
 
 def _walk_dtype_fields(obj: object, found: "set[Dtype]", *, in_dtype_field: bool = False) -> None:
@@ -730,6 +747,10 @@ class FusionChain:
         for g, (ai, bi) in enumerate(self.gemm_operands):
             if not (0 <= ai < self.num_a_operands) or not (0 <= bi < self.num_b_operands):
                 raise ValueError(f"gemm_operands[{g}]=({ai},{bi}) out of range for " f"{self.num_a_operands} A / {self.num_b_operands} B operands")
+        token_axis = 2 if isinstance(self.moe, MoeSwapAbSpec) else 1
+        for aux in self.aux_tensors:
+            if aux.grouped_by_moe and (self.moe is None or aux.dim[token_axis] != 1):
+                raise ValueError(f"per-group aux {aux.name!r} must broadcast the MoE token axis {token_axis}; got dim {aux.dim}")
         names = {t.name for t in self.aux_tensors}
         if len(names) != len(self.aux_tensors):
             raise ValueError("aux_tensors contain duplicate names")
@@ -953,11 +974,8 @@ def swap_ab(chain: FusionChain) -> FusionChain:
 
     Quantization axes and scale metadata follow the transpose; the ordinary
     quantization support checks decide whether the resulting layout can run.
-    MoE still requires a scheduler that routes ranges along N instead of M.
+    MoE lowers to a distinct internal operation whose groups partition N.
     """
-
-    if chain.has_moe:
-        raise NotImplementedError("swap_ab is not supported for MoE: routed groups partition M, not N")
 
     def _mn(values):
         if values is None or len(values) < 2:
@@ -1031,6 +1049,10 @@ def swap_ab(chain: FusionChain) -> FusionChain:
             sf_dtype_b=block_scale.sf_dtype_a,
             sfa_reorder=block_scale.sfb_reorder,
             sfb_reorder=block_scale.sfa_reorder,
+            sfa_dim=_mn(block_scale.sfb_dim),
+            sfa_stride=_mn(block_scale.sfb_stride),
+            sfb_dim=_mn(block_scale.sfa_dim),
+            sfb_stride=_mn(block_scale.sfa_stride),
             dequant_compute_a=block_scale.dequant_compute_b,
             dequant_compute_b=block_scale.dequant_compute_a,
             dequant_out_a=block_scale.dequant_out_b,
@@ -1055,4 +1077,5 @@ def swap_ab(chain: FusionChain) -> FusionChain:
         mainloop_a_load_dtype=chain.mainloop_b_load_dtype,
         mainloop_b_load_dtype=chain.mainloop_a_load_dtype,
         block_scale=block_scale,
+        moe=(MoeSpec if isinstance(chain.moe, MoeSwapAbSpec) else MoeSwapAbSpec)(**dataclasses.asdict(chain.moe)) if chain.has_moe else None,
     )

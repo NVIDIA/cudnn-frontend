@@ -39,22 +39,11 @@ def _ref_sdpa(q, k, v, *, scale):
     return torch.matmul(probs, v_ref).to(q.dtype)
 
 
-@pytest.mark.L0
-def test_get_default_stream_follows_torch_current_stream():
-    """APIBase._get_default_stream(None) must resolve to torch's *current*
-    stream (not legacy stream 0), so wrapper default paths stay ordered."""
-    from types import SimpleNamespace
-    import logging
-
-    from cudnn.api_base import APIBase
-
-    dummy = SimpleNamespace(_logger=logging.getLogger("test"))
-    s = torch.cuda.Stream()
-    with torch.cuda.stream(s):
-        resolved = APIBase._get_default_stream(dummy, None)
-        assert int(resolved) == s.cuda_stream
-    resolved_default = APIBase._get_default_stream(dummy, None)
-    assert int(resolved_default) == torch.cuda.current_stream().cuda_stream
+# The architecture-independent helper cases that used to live here moved to
+# sdpa/test_stream_context_contract.py, which is not gated to the Blackwell
+# line: this module's `requires_pre_rubin_blackwell` gate was hiding
+# `_get_default_stream` / `_torch_stream_context` coverage on every other part.
+# Kernel-level side-stream ordering stays here.
 
 
 @pytest.mark.L0
@@ -157,8 +146,10 @@ def test_fp8_dense_postprocessing_follows_explicit_stream(mxfp8):
     )
     assert api.check_support()
     api.compile()
+    budget = api.scratch_workspace_bytes()
+    workspace = torch.empty(budget, device=dev, dtype=torch.uint8) if budget else None
 
-    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=output, amax_o=amax, **execute_args)
+    api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=output, amax_o=amax, workspace=workspace, **execute_args)
     torch.cuda.synchronize()
     expected_output, expected_amax = output.clone(), amax.clone()
 
@@ -174,6 +165,7 @@ def test_fp8_dense_postprocessing_follows_explicit_stream(mxfp8):
         o_tensor=output,
         amax_o=amax,
         current_stream=cuda_driver.CUstream(side.cuda_stream),
+        workspace=workspace,
         **execute_args,
     )
     torch.cuda.synchronize()

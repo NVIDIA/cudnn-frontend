@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 import cuda.bindings.driver as cuda
 import math
 from typing import Tuple, Type, Optional
@@ -13,6 +14,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils as utils
 from cutlass._mlir.dialects import arith, llvm, nvvm, vector
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 
 class FlashAttentionDSABackwardSm100:
@@ -453,9 +455,7 @@ class FlashAttentionDSABackwardSm100:
 
         dOT_smem_layout_staged = sm100_utils.make_smem_layout_a(dOP_tiled_mma, self.dOP_cta_tiler, self.element_dtype, self.load_mma_QdO_stage)
         P_smem_layout_staged = sm100_utils.make_smem_layout_b(dOP_tiled_mma, self.dOP_mma_tiler, self.element_dtype, self.compute_mma_P_stage)
-        P_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], self.compute_mma_P_stage
-        )
+        P_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(self.element_dtype, LayoutEnum.COL_MAJOR, self.QK_mma_tiler[:2], self.compute_mma_P_stage)
         K_smem_layout_staged_2 = sm100_utils.make_smem_layout_a(KdS_tiled_mma, self.KdS_cta_tiler, self.element_dtype, self.load_mma_K_stage)
         if cutlass.const_expr(not self.same_hdim_kv):
             # Tail view: partition sK with 64-wide blocks, giving head_dim/64 sub-tiles
@@ -475,16 +475,16 @@ class FlashAttentionDSABackwardSm100:
             QT_tail_smem_layout_staged = None
         dS_smem_layout_staged = sm100_utils.make_smem_layout_b(QdS_tiled_mma, self.QdS_mma_tiler, self.element_dtype, self.compute_mma_dS_stage)
         dS_smem_layout_store_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], self.compute_mma_dS_stage
+            self.element_dtype, LayoutEnum.COL_MAJOR, self.dOV_mma_tiler[:2], self.compute_mma_dS_stage
         )
 
         dQ_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.element_dtype, utils.LayoutEnum.from_tensor(mdQ), (self.KdS_mma_tiler[0], self.KdS_mma_tiler[1]), self.num_dq_blocks
+            self.element_dtype, LayoutEnum.from_tensor(mdQ), (self.KdS_mma_tiler[0], self.KdS_mma_tiler[1]), self.num_dq_blocks
         )
         assert cute.cosize(dQ_smem_layout_staged) <= cute.cosize(K_smem_layout_staged)
 
         dKV_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.acc_dtype, utils.LayoutEnum.from_tensor(mdKV), (self.dOP_mma_tiler[0], self.dOP_mma_tiler[1] // 2), self.mma_reduce_dKV_stage
+            self.acc_dtype, LayoutEnum.from_tensor(mdKV), (self.dOP_mma_tiler[0], self.dOP_mma_tiler[1] // 2), self.mma_reduce_dKV_stage
         )
 
         LSE_smem_layout = cute.make_layout((self.QK_mma_tiler[0], self.load_compute_LSE_stage))
@@ -514,7 +514,7 @@ class FlashAttentionDSABackwardSm100:
 
         if cutlass.const_expr(not self.same_hdim_kv):
             dQ4_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.element_dtype, utils.LayoutEnum.from_tensor(mdQ), (self.dQ4_mma_tiler[0], self.dQ4_mma_tiler[1]), self.mma_compute_dQ_stage
+                self.element_dtype, LayoutEnum.from_tensor(mdQ), (self.dQ4_mma_tiler[0], self.dQ4_mma_tiler[1]), self.mma_compute_dQ_stage
             )
             # dQ4 stages through the dead P buffer (see sdQ4); today an exact
             # fit, so catch any future stage bump here.
@@ -941,7 +941,7 @@ class FlashAttentionDSABackwardSm100:
             cpasync.prefetch_descriptor(tma_atom_dO)
             cpasync.prefetch_descriptor(tma_atom_dQ)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mma_QdO_pipeline = self.make_and_init_load_mma_QdO_pipeline(
@@ -976,7 +976,7 @@ class FlashAttentionDSABackwardSm100:
         )
         compute_tmastore_dQ_pipeline = self.make_and_init_compute_tmastore_dQ_pipeline()
 
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_warp_id[0],

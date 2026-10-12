@@ -8,7 +8,6 @@ quant terminal."""
 from __future__ import annotations
 
 import cudnn
-import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
 import torch
 
@@ -32,7 +31,7 @@ _GEOMETRIES = [
 ]
 
 _E, _S, _N, _K, _G = 4, 512, 256, 256, 4
-_OFFSETS = (0, 128, 130, 384)
+_OFFSETS = (0, 128, 130, 384, _S)
 
 
 def _graph(io=cudnn.data_type.BFLOAT16):
@@ -43,7 +42,7 @@ def _graph(io=cudnn.data_type.BFLOAT16):
     )
     tok = g.tensor(name="token", dim=[1, _S, _K], stride=[_S * _K, _K, 1], data_type=cudnn.data_type.BFLOAT16)
     w = g.tensor(name="weight", dim=[_E, _K, _N], stride=[_K * _N, 1, _K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="fto", dim=[_G, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="fto", dim=[_G + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     c = g.moe_grouped_matmul(
         tok,
         w,
@@ -67,7 +66,7 @@ def _ref_c(token, weight):
     c = torch.zeros(_S, _N, device="cuda", dtype=torch.float32)
     starts = list(_OFFSETS)
     for gi in range(_G):
-        b, e = starts[gi], (starts[gi + 1] if gi + 1 < _G else _S)
+        b, e = starts[gi], starts[gi + 1]
         if b < e:
             c[b:e] = token[0, b:e].float() @ weight[gi % _E].float().T
     return c
@@ -119,7 +118,7 @@ def test_single_moe_srelu_prob_epilogue(config_name, cta_group):
 
 def _group_ranges(offsets):
     starts = list(offsets)
-    return [(starts[gi], starts[gi + 1] if gi + 1 < len(starts) else _S) for gi in range(len(starts))]
+    return list(zip(starts, starts[1:]))
 
 
 @pytest.mark.parametrize("config_name,cta_group", _GEOMETRIES, ids=lambda v: str(v))
@@ -147,7 +146,7 @@ def test_single_moe_per_group_alpha(config_name, cta_group):
 
 
 def test_single_moe_per_group_bias_empty_group():
-    offsets = (0, 128, 128, 384)
+    offsets = (0, 128, 128, 384, _S)
     g, c, _fto = _graph()
     bias = g.tensor(name="bias", dim=[_G, 1, _N], stride=[_N, _N, 1], data_type=cudnn.data_type.FLOAT)
     y = g.add(a=c, b=bias, name="b")
@@ -181,7 +180,7 @@ def test_dual_moe_swiglu_per_group_alpha():
     tok = g.tensor(name="token", dim=[1, _S, _K], stride=[_S * _K, _K, 1], data_type=cudnn.data_type.BFLOAT16)
     w0 = g.tensor(name="weight0", dim=[_E, _K, _N], stride=[_K * _N, 1, _K], data_type=cudnn.data_type.BFLOAT16)
     w1 = g.tensor(name="weight1", dim=[_E, _K, _N], stride=[_K * _N, 1, _K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="fto", dim=[_G, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="fto", dim=[_G + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     c0 = g.moe_grouped_matmul(tok, w0, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe0")
     c1 = g.moe_grouped_matmul(tok, w1, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe1")
     alpha = g.tensor(name="alpha", dim=[_G, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
@@ -325,7 +324,7 @@ def test_single_moe_col_quant_aligned_groups(bs):
     a multiple of block_size, so no column block spans a group boundary."""
     # group row counts are blocksize*4 multiples (bs=32 -> 128-multiples,
     # bs=16 -> 64-multiples), aligning with the F8_128x4 4-block atom quads.
-    offsets = (0, 128, 256, 384) if bs == 32 else (0, 128, 192, 384)
+    offsets = (0, 128, 256, 384, _S) if bs == 32 else (0, 128, 192, 384, _S)
     g, c, _fto = _graph()
     sw = g.swish(input=c, name="sw")
     q, qs = g.block_scale_quantize(input=sw, block_size=bs, axis=1, name="qc")
@@ -382,7 +381,7 @@ def test_single_moe_col_quant_grouped_segmented(bs):
     """Grouped (per-group segmented) col quant: passing the MoE fto as the
     quant node's group_offset selects the cutedsl discrete_col_sfd layout.
     CONTRACT: every fto value is a multiple of 4*block_size (atom quads)."""
-    offsets = (0, 128, 256, 384) if bs == 32 else (0, 128, 192, 384)
+    offsets = (0, 128, 256, 384, _S) if bs == 32 else (0, 128, 192, 384, _S)
     g, c, fto = _graph()
     sw = g.swish(input=c, name="sw")
     q, qs = g.block_scale_quantize(input=sw, block_size=bs, axis=1, group_offset=fto, name="qc")
@@ -432,7 +431,7 @@ def test_single_moe_quant_group_offset_rejections():
 
     # group_offset that is not the MoE fto: rejected.
     g, c, fto = _graph()
-    other = g.tensor(name="other", dim=[_G, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    other = g.tensor(name="other", dim=[_G + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     sw = g.swish(input=c, name="sw")
     q, qs = g.block_scale_quantize(input=sw, block_size=32, axis=1, group_offset=other, name="q")
     q.set_data_type(cudnn.data_type.FP8_E4M3).set_output(True)
@@ -488,14 +487,7 @@ def test_single_moe_swish_quant_grouped_amax():
 
     starts = list(_OFFSETS)
     am_ref = torch.stack(
-        [
-            (
-                csw[starts[gi] : (starts[gi + 1] if gi + 1 < _G else _S)].abs().amax()
-                if starts[gi] < (starts[gi + 1] if gi + 1 < _G else _S)
-                else torch.tensor(0.0, device="cuda")
-            )
-            for gi in range(_G)
-        ]
+        [(csw[starts[gi] : starts[gi + 1]].abs().amax() if starts[gi] < starts[gi + 1] else torch.tensor(0.0, device="cuda")) for gi in range(_G)]
     )
     torch.testing.assert_close(out_am.flatten(), am_ref, atol=1e-3, rtol=1e-3)
 
@@ -509,7 +501,7 @@ def test_single_moe_srelu_full_cutedsl_mirror():
     from test_matmul import _block_quant_reference, _f8_row_scale_addr, _f8_col_scale_addr
 
     bs = 32
-    offsets = (0, 128, 256, 384)  # col-quant MoE CONTRACT: fto % bs == 0
+    offsets = (0, 128, 256, 384, _S)  # col-quant MoE CONTRACT: fto % bs == 0
     g, c, fto = _graph()
     alpha = g.tensor(name="alpha", dim=[_G, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
     bias = g.tensor(name="bias", dim=[_G, 1, _N], stride=[_N, _N, 1], data_type=cudnn.data_type.FLOAT)

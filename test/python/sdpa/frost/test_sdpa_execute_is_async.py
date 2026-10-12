@@ -152,10 +152,13 @@ def test_execute_without_a_handle_is_cuda_graph_capturable():
     torch.cuda.synchronize()
 
     captured = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(captured):
-        g.execute(vp, ws)
-    out.zero_()
-    torch.cuda.synchronize()
-    captured.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, expected), "replay did not reproduce the eager result — the launch did not land on the capturing stream"
+    try:
+        with torch.cuda.graph(captured):
+            g.execute(vp, ws)
+        out.zero_()
+        torch.cuda.synchronize()
+        captured.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected), "replay did not reproduce the eager result — the launch did not land on the capturing stream"
+    finally:
+        captured.reset()

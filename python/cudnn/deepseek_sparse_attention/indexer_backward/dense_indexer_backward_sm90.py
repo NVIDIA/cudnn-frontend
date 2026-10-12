@@ -11,12 +11,10 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
-from cudnn.deepseek_sparse_attention.utils.runtime import (
-    resolve_stream as _resolve_stream,
-    torch_stream_context as _torch_stream_context,
-)
+from cudnn.deepseek_sparse_attention.utils.runtime import resolve_stream as _resolve_stream
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 from .indexer_backward_sm90 import (
@@ -157,7 +155,7 @@ class ScoreGradDenseSm90:
         grad_scale_f32 = Float32(grad_scale) * Float32(mGradLoss[0])
 
         if seq_local < seqlen_q_b:
-            smem = cutlass.utils.SmemAllocator()
+            smem = SmemAllocator()
 
             @cute.struct
             class SharedStorage:
@@ -298,13 +296,8 @@ def _build_cute_dsl_dense_kernel(
     # dense mode, K-block traversal is runtime-sized by seqlen_k.
     score_grad_key = (is_varlen, ratio, block_I, bool(has_q_causal_offsets))
     gemm_key = (is_varlen, heads, dim, block_I, ratio, bool(has_q_causal_offsets))
-    dummy_topk_holder = [None]
-
-    def _get_dummy_topk(device, current_stream=None):
-        if dummy_topk_holder[0] is None or dummy_topk_holder[0].device != device:
-            with _torch_stream_context(current_stream):
-                dummy_topk_holder[0] = torch.zeros(batch, seqlen, seqlen_k, device=device, dtype=torch.int32)
-        return dummy_topk_holder[0]
+    # mTopkIdx is a sparse-only slot (the kernel reads it under const_expr(not is_dense));
+    # dense mode passes None at compile and at launch, never a dummy tensor (Rule 8).
 
     def _ensure_compiled(
         IndexQ,
@@ -321,7 +314,6 @@ def _build_cute_dsl_dense_kernel(
     ):
         s = _resolve_stream(current_stream)
         if gemm_key not in _dense_compile_cache:
-            dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
             cuq_arg = to_cute_tensor(CuSeqlensQ) if CuSeqlensQ is not None else None
             cuk_arg = to_cute_tensor(CuSeqlensK) if CuSeqlensK is not None else None
             q_offsets_arg = to_cute_tensor(QCausalOffsets) if QCausalOffsets is not None else None
@@ -335,12 +327,12 @@ def _build_cute_dsl_dense_kernel(
                     dWeights,
                     dIndexK_f32,
                     GradSignal,
-                    dummy_topk,
                 ]
             ]
             _dense_compile_cache[gemm_key] = cute.compile(
                 kernel_obj,
                 *cute_args,
+                None,  # mTopkIdx: sparse-only, compiled out in dense mode
                 cutlass.Float32(sm_scale),
                 s,
                 cuq_arg,
@@ -457,7 +449,6 @@ def _build_cute_dsl_dense_kernel(
             assert QCausalOffsets is not None, "offset-compiled kernel requires q_causal_offsets at runtime"
         else:
             assert QCausalOffsets is None, "non-offset compiled kernel must not receive q_causal_offsets"
-        dummy_topk = _get_dummy_topk(IndexQ.device, current_stream=current_stream)
         s = _resolve_stream(current_stream)
 
         _ensure_compiled(
@@ -481,7 +472,7 @@ def _build_cute_dsl_dense_kernel(
             dWeights,
             dIndexK_f32,
             GradSignal,
-            dummy_topk,
+            None,  # mTopkIdx (sparse-only)
             cutlass.Float32(sm_scale),
             s,
             CuSeqlensQ,
@@ -527,38 +518,22 @@ def _build_cute_dsl_dense_kernel(
         )
         grad_signal = idx_scores_raw
 
-        if dIndexK.dtype == torch.float32:
-            _run_gemm_only(
-                IndexQ,
-                Weights,
-                IndexK,
-                dIndexQ,
-                dWeights,
-                dIndexK,
-                grad_signal,
-                CuSeqlensQ,
-                CuSeqlensK,
-                QCausalOffsets,
-                current_stream=current_stream,
-            )
-        else:
-            with _torch_stream_context(current_stream):
-                dIndexK_f32 = torch.zeros_like(dIndexK, dtype=torch.float32)
-            _run_gemm_only(
-                IndexQ,
-                Weights,
-                IndexK,
-                dIndexQ,
-                dWeights,
-                dIndexK_f32,
-                grad_signal,
-                CuSeqlensQ,
-                CuSeqlensK,
-                QCausalOffsets,
-                current_stream=current_stream,
-            )
-            with _torch_stream_context(current_stream):
-                dIndexK.copy_(dIndexK_f32)
+        # The caller (DenseIndexerBackward.execute) hands over the pre-zeroed
+        # fp32 accumulator and performs any trailing cast itself.
+        assert dIndexK.dtype == torch.float32, f"dense sm90 kernel 2 accumulates into an fp32 dIndexK, got {dIndexK.dtype}"
+        _run_gemm_only(
+            IndexQ,
+            Weights,
+            IndexK,
+            dIndexQ,
+            dWeights,
+            dIndexK,
+            grad_signal,
+            CuSeqlensQ,
+            CuSeqlensK,
+            QCausalOffsets,
+            current_stream=current_stream,
+        )
 
     _run.score_grad = _run_score_grad_only
     _run.gemm_only = _run_gemm_only

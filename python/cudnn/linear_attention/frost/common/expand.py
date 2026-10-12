@@ -21,13 +21,6 @@ BLOCK = 256
 
 
 @cute.jit
-def strided_row_addr(m, tok, h_idx, w_off):
-    bpe = cutlass.const_expr(m.element_type.width // 8)
-    elems = tok * cutlass.Int64(m.stride[0]) + h_idx * cutlass.Int64(m.stride[1])
-    return m.iterator.toint() + elems * cutlass.Int64(bpe) + w_off * cutlass.Int64(4)
-
-
-@cute.jit
 def expand_rows(mSrc, mDst, chunk, h_count, inner_words, num_householder, phase):
     """One chunk of zero-fill expansion: every expanded row is stored, only
     the ``phase`` sub-token loads the source."""
@@ -39,7 +32,9 @@ def expand_rows(mSrc, mDst, chunk, h_count, inner_words, num_householder, phase)
     h_idx = cutlass.Int64(h_idx)
     tok = row_out // cutlass.Int64(num_householder)
     slot = row_out - tok * cutlass.Int64(num_householder)
-    src_addr = strided_row_addr(mSrc, tok, h_idx, w_off)
+    bytes_per_element = cutlass.const_expr(mSrc.element_type.width // 8)
+    src_elems = tok * cutlass.Int64(mSrc.stride[0]) + h_idx * cutlass.Int64(mSrc.stride[1])
+    src_addr = mSrc.iterator.toint() + src_elems * cutlass.Int64(bytes_per_element) + w_off * cutlass.Int64(4)
     dst_addr = mDst.iterator.toint() + chunk * cutlass.Int64(16)
     w0 = cutlass.Int32(0)
     w1 = cutlass.Int32(0)
@@ -62,7 +57,9 @@ def gather_rows(mSrc, mDst, chunk, h_count, inner_words, num_householder, phase)
     h_idx = cutlass.Int64(h_idx)
     src_words = ((tok * cutlass.Int64(num_householder) + cutlass.Int64(phase)) * cutlass.Int64(h_count.divisor) + h_idx) * cutlass.Int64(inner_words) + w_off
     src_addr = mSrc.iterator.toint() + src_words * cutlass.Int64(4)
-    dst_addr = strided_row_addr(mDst, tok, h_idx, w_off)
+    bytes_per_element = cutlass.const_expr(mDst.element_type.width // 8)
+    dst_elems = tok * cutlass.Int64(mDst.stride[0]) + h_idx * cutlass.Int64(mDst.stride[1])
+    dst_addr = mDst.iterator.toint() + dst_elems * cutlass.Int64(bytes_per_element) + w_off * cutlass.Int64(4)
     w0, w1, w2, w3 = ld_global_v4(src_addr, cutlass.Int32)
     st_global_v4(dst_addr, (w0, w1, w2, w3), cutlass.Int32)
 

@@ -10,6 +10,7 @@
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
+
 import math
 import types
 from dataclasses import dataclass
@@ -23,11 +24,11 @@ import cutlass.cute as cute
 import cutlass.pipeline as cutlass_pipeline
 from cutlass import Boolean, Float32, Int32, Int64, Uint32, const_expr, pipeline
 from cutlass._mlir.dialects import llvm
-from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL, T
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cudnn._cutlass_compat import Arch, LayoutEnum, SmemAllocator, TmemAllocator
 
 from cudnn.block_sparse_attention.csrc.utils import (
     copy_utils,
@@ -277,7 +278,7 @@ class BlockSparseAttnForwardSm100Blk128:
         q_major_mode = cute.nvgpu.OperandMajorMode.K
         k_major_mode = cute.nvgpu.OperandMajorMode.K
         v_major_mode = cute.nvgpu.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.o_layout = LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -547,7 +548,7 @@ class BlockSparseAttnForwardSm100Blk128:
                     cpasync.prefetch_descriptor(tma_atom)
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -555,7 +556,7 @@ class BlockSparseAttnForwardSm100Blk128:
             num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.softmax0_warp_ids, *self.softmax1_warp_ids, *self.correction_warp_ids)),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

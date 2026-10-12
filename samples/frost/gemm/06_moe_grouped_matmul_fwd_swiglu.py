@@ -66,7 +66,7 @@ def _swiglu_ref(tok_f32, w0_f32, w1_f32, offsets_list, S, N, num_groups, E, scal
     ref = torch.zeros((S, N), dtype=torch.float32, device="cuda")
     for gi in range(num_groups):
         b = offsets_list[gi]
-        e = offsets_list[gi + 1] if gi + 1 < num_groups else S
+        e = offsets_list[gi + 1]
         if b == e:
             continue
         mm0 = tok_f32[b:e] @ w0_f32[gi % E].T
@@ -100,6 +100,7 @@ def _dense_case() -> None:
     for gs in group_sizes:
         starts.append(cur)
         cur += gs
+    starts.append(cur)  # Explicit final endpoint; it may be smaller than S.
 
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -110,7 +111,7 @@ def _dense_case() -> None:
     # weights [E, K, N] K-major (== (E, N, K) row-major in memory)
     w0 = g.tensor(name="weight0", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
     w1 = g.tensor(name="weight1", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
-    fto = g.tensor(name="first_token_offset", dim=[E, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     sf = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
 
     c0 = g.moe_grouped_matmul(tok, w0, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe0")
@@ -130,7 +131,8 @@ def _dense_case() -> None:
     scale_t = torch.tensor([[[0.5]]], dtype=torch.float32, device="cuda")
     output = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
 
-    compiled({tok: token, w0: weight0, w1: weight1, fto: offsets, sf: scale_t, dq: output})
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    compiled({tok: token, w0: weight0, w1: weight1, fto: offsets, sf: scale_t, dq: output}, workspace=workspace)
     torch.cuda.synchronize()
 
     ref = _swiglu_ref(token[0].float(), weight0.float(), weight1.float(), starts, S, N, E, E, 0.5)
@@ -152,8 +154,8 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     sf_k = K // block_size
     rk = dict(reordering_type=cudnn.tensor_reordering.F8_128x4)
     # 4 routed groups over E=2 experts (BxE > E).
-    offsets_list = [0, 256, 384, 512]
-    num_groups = len(offsets_list)
+    offsets_list = [0, 256, 384, 512, S - 128]
+    num_groups = len(offsets_list) - 1
 
     if combo == "nvfp4":
         lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
@@ -188,7 +190,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     SFA = g.tensor(name="SFA", dim=[1, S, sf_k], stride=[S * sf_k, sf_k, 1], data_type=sf_dt, **rk)
     SFB0 = g.tensor(name="SFB0", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, **rk)
     SFB1 = g.tensor(name="SFB1", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, **rk)
-    fto = g.tensor(name="first_token_offset", dim=[num_groups, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    fto = g.tensor(name="first_token_offset", dim=[num_groups + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
     sf = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
 
     tok_d = g.block_scale_dequantize(input=tok, descale=SFA, block_size=[1, block_size])  # shared by both GEMMs
@@ -211,7 +213,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     sfa_parts = []
     for gi in range(num_groups):
         b = offsets_list[gi]
-        e = offsets_list[gi + 1] if gi + 1 < num_groups else S
+        e = offsets_list[gi + 1]
         sfa_parts.append(_to_blocked(sfa_log[b:e]))
     sfa_live = torch.cat(sfa_parts)
     # Reserve for any partition with this S and group count. Keep the live
@@ -226,6 +228,7 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     q_out = torch.zeros(1, S, N, dtype=torch.float8_e4m3fn, device=dev)
     q_scale = torch.zeros(1, S, N // qblock, dtype=torch.float8_e8m0fnu, device=dev)
 
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
     compiled(
         {
             tok: tok_rt,
@@ -238,7 +241,8 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
             sf: scale_t,
             Q: q_out,
             QS: q_scale,
-        }
+        },
+        workspace=workspace,
     )
     torch.cuda.synchronize()
 
@@ -247,7 +251,8 @@ def _block_scale_case(combo: str, S: int = 1024, N: int = 256, K: int = 512, E: 
     w1_deq = w1_f32 * sfb1_log.float().repeat_interleave(block_size, 2)
     ref = _swiglu_ref(tok_deq, w0_deq, w1_deq, offsets_list, S, N, num_groups, E, 0.5)
     q_ref, scale_ref = _block_quant_ref(ref, qblock, torch.float8_e4m3fn, torch.float8_e8m0fnu)
-    torch.testing.assert_close(q_scale.float(), scale_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(q_scale[:, : offsets_list[-1]].float(), scale_ref[:, : offsets_list[-1]].float(), atol=0, rtol=0)
+    assert torch.all(q_scale[:, offsets_list[-1] :].view(torch.uint8) == 0)
     torch.testing.assert_close(q_out.float(), q_ref.float(), atol=0, rtol=0)
     print(f"[06] PASS  {combo:10s} S={S} N={N} K={K} E={E} groups={offsets_list} block_size={block_size} -> fp8+e8m0/{qblock}")
 

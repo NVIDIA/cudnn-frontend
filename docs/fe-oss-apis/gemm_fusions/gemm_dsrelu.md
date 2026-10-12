@@ -251,5 +251,5 @@ Tuple unpacking order is: `(d_tensor, dprob_tensor, amax_tensor, sfd_tensor)`.
 
 For end-to-end usage and regression coverage, see:
 
-- `test/python/fe_api/gemm/test_gemm_dsrelu.py`
-- `test/python/fe_api/gemm/test_gemm_dsrelu_utils.py`
+- `test/python/gemm/cutedsl/test_gemm_dsrelu.py`
+- `test/python/gemm/cutedsl/test_gemm_dsrelu_utils.py`

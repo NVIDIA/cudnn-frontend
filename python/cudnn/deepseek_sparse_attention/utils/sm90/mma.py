@@ -1,6 +1,9 @@
 # Copyright (c) 2025, Tri Dao.
 # Copyright (c) 2026, Jerry Chen
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """SM90 WGMMA and shared-memory layout helpers."""
 
 from typing import Type, Union, Optional
@@ -9,8 +12,8 @@ import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.cute.nvgpu import warpgroup
 from cutlass.cutlass_dsl import Numeric, dsl_user_op
-from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_og
+from cudnn._cutlass_compat import LayoutEnum
 
 
 @cute.jit

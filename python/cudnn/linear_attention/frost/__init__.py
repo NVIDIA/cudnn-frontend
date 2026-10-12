@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""cudnn.linear_attention.frost: the FROST linear-attention engines (GDN, KDA, GDN-2, GDP) on the SM100 chunked kernels
-built on Cutlass primitives; forward and backward on SM100/SM103/SM107, ranked ahead of the cuTile fallbacks."""
+"""cudnn.linear_attention.frost: the FROST linear-attention engines (GDN, KDA, GDN-2, GDP) on the SM100 / SM103 / SM107 chunked kernels
+built on Cutlass primitives; forward and backward on SM100 / SM103 / SM107, ranked ahead of the cuTile fallbacks."""
 
 # Lazy: importing one family's engine must not drag its neighbours in.
 import importlib

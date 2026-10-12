@@ -209,6 +209,23 @@ python benchmark_single_sdpa.py \
     --sdpa_backend cudnn --data_type fp8 \
     --attn_mask top_left --fwd_bwd
 
+# cuDNN OSS FROST engines, FP8 or MXFP8 inputs with a block-scaled O epilogue
+# (forward-only inference): `fp8_nvfp4` / `mxfp8_nvfp4` write O as FP4 (E2M1,
+# two per byte) with one E4M3 scale per 16 head-dim elements, `fp8_mxfp8` /
+# `mxfp8_mxfp8` write E4M3 O with one UE8M0 scale per 32, all into the extra
+# `sf_o` output of `sdpa_fp8` / `sdpa_mxfp8` in the F8_128x4 atom order a
+# block-scaled GEMM consumes directly. d = 128 only.
+python benchmark_single_sdpa.py \
+    --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
+    --sdpa_backend cudnn_oss --data_type fp8_nvfp4 \
+    --attn_mask no_mask --profile_pass fwd
+python benchmark_single_sdpa.py \
+    --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
+    --num_q_heads 64 --num_kv_heads 8 --head_dim 128 \
+    --sdpa_backend cudnn_oss --data_type mxfp8_mxfp8 \
+    --attn_mask no_mask --profile_pass fwd
+
 # FlashAttention 4
 python benchmark_single_sdpa.py \
     --batch_size 1 --q_seqlen 8192 --kv_seqlen 8192 \
@@ -249,7 +266,7 @@ python benchmark/attention_training/benchmark_single_sdpa.py \
     --attn_mask top_left --skip_ref --fwd_bwd
 
 # test_repro --perf (CUPTI by default)
-pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --repro "{
+pytest -vv -s test/python/sdpa/graph/test_mhas_v2.py::test_repro --perf --repro "{
     'data_type': 'torch.bfloat16',
     'is_infer': False,
     'is_padding': False, 'is_alibi': None, 'is_bias': None, 'is_dropout': None,
@@ -267,7 +284,7 @@ pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --repro "{
 }"
 
 # test_repro --perf with CUDA events instead of CUPTI
-pytest -vv -s test/python/test_mhas_v2.py::test_repro --perf --timing_method events --repro "{
+pytest -vv -s test/python/sdpa/graph/test_mhas_v2.py::test_repro --perf --timing_method events --repro "{
     'data_type': 'torch.bfloat16',
     'is_infer': False,
     'is_padding': False, 'is_alibi': None, 'is_bias': None, 'is_dropout': None,

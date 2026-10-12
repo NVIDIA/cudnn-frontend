@@ -283,7 +283,7 @@ def test_build_mxfp8_bwd_cfg_uses_mxfp8_tag_without_flag():
 
 def test_build_fp8_forward_command_preserves_fp8_fields():
     command = repro_command.build_command(sdpa_fp8_fwd.build_cfg("{}", _fp8_fwd_payload(output_dtype="FP8_E5M2"), seed=7))
-    assert "test/python/test_mhas_v2.py::test_repro" in command
+    assert "test/python/sdpa/graph/test_mhas_v2.py::test_repro" in command
     assert "torch.float8_e4m3fn" in command
     assert "torch.float8_e5m2" in command
     assert "'is_mxfp8': False" in command
@@ -292,7 +292,7 @@ def test_build_fp8_forward_command_preserves_fp8_fields():
 
 def test_build_fp8_backward_command_preserves_bwd_fields():
     command = repro_command.build_command(sdpa_fp8_bwd.build_cfg("{}", _fp8_bwd_payload(output_dtype="FP8_E4M3"), seed=9))
-    assert "test/python/test_mhas_v2.py::test_repro" in command
+    assert "test/python/sdpa/graph/test_mhas_v2.py::test_repro" in command
     assert "'is_infer': False" in command
     assert "torch.float8_e4m3fn" in command
     assert "'is_mxfp8': False" in command

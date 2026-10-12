@@ -18,6 +18,7 @@ from typing import Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum
 import cutlass.cute.testing as testing
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -905,9 +906,9 @@ def compute_stages(
     epi_tile: cute.Tile,
     epi_tile_c: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     d_dtype: Type[cutlass.Numeric],
-    d_layout: utils.LayoutEnum,
+    d_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,
@@ -1026,7 +1027,7 @@ def compute_stages_wgrad(
     b_dtype: Type[cutlass.Numeric],
     epi_tile: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     sf_dtype: Type[cutlass.Numeric],
     sf_vec_size: int,
     num_smem_capacity: int,
@@ -1066,7 +1067,7 @@ def compute_stages_wgrad_bf16(
     b_dtype: Type[cutlass.Numeric],
     epi_tile: cute.Tile,
     c_dtype: Type[cutlass.Numeric],
-    c_layout: utils.LayoutEnum,
+    c_layout: LayoutEnum,
     num_smem_capacity: int,
     occupancy: int,
 ) -> Tuple[int, int, int]:
@@ -1126,6 +1127,24 @@ def get_tma_atom_kind(atom_sm_cnt: cutlass.Int32, mcast: cutlass.Boolean) -> Uni
 # ---------------------------------------------------------------------------
 # Kernel helper functions (no kernel instance state needed)
 # ---------------------------------------------------------------------------
+
+
+def _target_needs_shuffle_amax():
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    arch = CuTeDSL._get_dsl().get_arch_enum()
+    return (int(arch.major), int(arch.minor)) == (11, 0)
+
+
+@cute.jit
+def warp_amax_with_nan(value):
+    # SM110 cannot assemble redux.f32. Keep the original path on other targets.
+    if cutlass.const_expr(_target_needs_shuffle_amax()):
+        for shift in cutlass.range_constexpr(5):
+            value = cute.arch.fmax(value, cute.arch.shuffle_sync_bfly(value, offset=1 << shift), nan=True)
+    else:
+        value = cute.arch.warp_redux_sync(value=value, kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True)
+    return value
 
 
 @cute.jit

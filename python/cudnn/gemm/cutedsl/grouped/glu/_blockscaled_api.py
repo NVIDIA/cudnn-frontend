@@ -19,9 +19,23 @@ Discrete mode
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 from ..backend_utils import rubin_single_group_offsets_kwarg
+from ..canonical import (
+    canonical_b_fake,
+    canonical_mx_fake,
+    canonical_prob_fake,
+    check_sf_shape,
+    is_flat_sf,
+    make_flat_sf_fake,
+    normalize_b,
+    normalize_mx,
+    normalize_prob,
+)
 from ..moe_utils import MoEWeightMode
+from ..scheduler_counter import validate_scheduler_counter
 from cuda.bindings import driver as cuda
 import math
 import os
@@ -36,6 +50,12 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.api_base import APIBase, ceil_div, is_power_of_2
 
 
+def layout_desc(api, tensor, name):
+    if tensor is None:
+        return None
+    return replace(api._make_tensor_desc(tensor, name=name, canonical=True), dtype=tensor.dtype)
+
+
 def _get_rubin_kernel():
     from .moe_blockscaled_grouped_gemm_glu_rubin import (
         BlockScaledMoEGroupedGemmGluKernel as RubinBlockScaledMoEGroupedGemmGluKernel,
@@ -47,16 +67,6 @@ def _get_rubin_kernel():
 _GEGGLU_ALPHA_DEFAULT = 1.702
 _GLU_CLAMP_MAX_DEFAULT = 7.0
 _GLU_CLAMP_MIN_DEFAULT = -7.0
-
-
-def _reject_unsupported_rubin_glu_tune_params(
-    is_rubin_kernel: bool,
-    geglu_alpha: float,
-    glu_clamp_max: float,
-    glu_clamp_min: float,
-) -> None:
-    if is_rubin_kernel and (geglu_alpha != _GEGGLU_ALPHA_DEFAULT or glu_clamp_max != _GLU_CLAMP_MAX_DEFAULT or glu_clamp_min != _GLU_CLAMP_MIN_DEFAULT):
-        raise NotImplementedError("Rubin grouped GEMM GLU does not support geglu_alpha, glu_clamp_max, or glu_clamp_min tuning")
 
 
 class GroupedGemmGluBlockScaledAPI(APIBase):
@@ -132,6 +142,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         b_major: str = "k",
         use_dynamic_sched: bool = False,
         use_single_group_runtime_offsets: bool = False,
+        *,
+        sample_scheduler_counter: Optional[torch.Tensor] = None,
     ):
         """Initialize the GroupedGemmGluSm100 API.
 
@@ -201,15 +213,26 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         else:
             raise ValueError("Provide either (sample_b, sample_sfb) for dense mode " "or (num_experts, b_shape, b_dtype) for discrete mode, but not both.")
 
+        self.canonical_a, sample_a = normalize_mx(sample_a)
+        self.canonical_b, sample_b = normalize_b(sample_b)
+        self.canonical_c, sample_c = normalize_mx(sample_c)
+        self.canonical_d, sample_d = normalize_mx(sample_d)
+        self.canonical_d_col, sample_d_col = normalize_mx(sample_d_col)
+        self.canonical_prob, sample_prob = normalize_prob(sample_prob)
+        self.sfa_is_flat = is_flat_sf(sample_sfa)
+        self.sfb_is_flat = is_flat_sf(sample_sfb)
+        self.sfd_row_is_flat = is_flat_sf(sample_sfd_row)
+        self.sfd_col_is_flat = is_flat_sf(sample_sfd_col)
+
         # ---- Common tensor descriptors ----
-        self.a_desc = self._make_tensor_desc(sample_a, name="sample_a")
-        self.c_desc = self._make_tensor_desc(sample_c, name="sample_c")
-        self.d_desc = self._make_tensor_desc(sample_d, name="sample_d")
+        self.a_desc = layout_desc(self, sample_a, "sample_a")
+        self.c_desc = layout_desc(self, sample_c, "sample_c")
+        self.d_desc = layout_desc(self, sample_d, "sample_d")
         self.sfa_desc = self._make_tensor_desc(sample_sfa, name="sample_sfa")
         self.padded_offsets_desc = self._make_tensor_desc(sample_padded_offsets, name="sample_padded_offsets")
         self.alpha_desc = self._make_tensor_desc(sample_alpha, name="sample_alpha")
 
-        self.d_col_desc = self._make_tensor_desc(sample_d_col, name="sample_d_col")
+        self.d_col_desc = layout_desc(self, sample_d_col, "sample_d_col")
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias")
         self.sfd_row_desc = self._make_tensor_desc(sample_sfd_row, name="sample_sfd_row")
         self.sfd_col_desc = self._make_tensor_desc(sample_sfd_col, name="sample_sfd_col")
@@ -219,11 +242,11 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             1,
             "norm_const",
         )
-        self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob")
+        self.prob_desc = layout_desc(self, sample_prob, "sample_prob")
 
         # ---- Mode-specific state ----
         if self.weight_mode == MoEWeightMode.DENSE:
-            self.b_desc = self._make_tensor_desc(sample_b, name="sample_b")
+            self.b_desc = layout_desc(self, sample_b, "sample_b")
             self.sfb_desc = self._make_tensor_desc(sample_sfb, name="sample_sfb")
             self.expert_cnt = self.padded_offsets_desc.shape[0]
         else:
@@ -274,6 +297,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
         self._logger.debug(f"setting num_cluster_overlap_margin: {self.num_cluster_overlap_margin}")
 
+        validate_scheduler_counter(sample_scheduler_counter, sample_a, sample_b is not None and use_dynamic_sched)
+        self.scheduler_counter_desc = layout_desc(self, sample_scheduler_counter, "scheduler_counter")
         self._workspace = None
 
         self._logger.debug("__init__ completed")
@@ -334,21 +359,25 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         self._check_tensor_shape(self.bias_desc, (n, l), "bias")
 
         rest_k = ceil_div(ceil_div(k, self.sf_vec_size), 4)
-        self._check_tensor_shape(self.sfa_desc, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
+        check_sf_shape(self, self.sfa_desc, self.sfa_is_flat, (32, 4, ceil_div(tensor_m, 128), 4, rest_k, 1), "SFA")
         if self.weight_mode == MoEWeightMode.DENSE:
-            self._check_tensor_shape(self.sfb_desc, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
+            check_sf_shape(self, self.sfb_desc, self.sfb_is_flat, (32, 4, ceil_div(n, 128), 4, rest_k, l), "SFB")
 
         rest_n2 = ceil_div(ceil_div(n // 2, self.sf_vec_size), 4)
-        self._check_tensor_shape(
+        check_sf_shape(
+            self,
             self.sfd_row_desc,
+            self.sfd_row_is_flat,
             (32, 4, ceil_div(tensor_m, 128), 4, rest_n2, 1),
             "SFD_row",
         )
         rest_m = ceil_div(ceil_div(tensor_m, self.sf_vec_size), 4)
-        self._check_tensor_shape(self.sfd_col_desc, (32, 4, ceil_div(n // 2, 128), 4, rest_m, 1), "SFD_col")
+        check_sf_shape(self, self.sfd_col_desc, self.sfd_col_is_flat, (32, 4, ceil_div(n // 2, 128), 4, rest_m, 1), "SFD_col")
 
         self._check_tensor_shape(self.alpha_desc, (self.expert_cnt,), "alpha")
         self._check_tensor_shape(self.prob_desc, (tensor_m, 1, 1), "prob")
+        if self.canonical_prob:
+            self._check_tensor_stride(self.prob_desc, stride=[(1, tensor_m, tensor_m)], extra_error_msg="prob must be contiguous")
         self._check_tensor_shape(self.amax_desc, (self.expert_cnt, 1), "amax")
         self._check_tensor_shape(self.norm_const_desc, (1,), "norm_const")
         self._check_tensor_shape(self.padded_offsets_desc, (self.expert_cnt,), "padded_offsets")
@@ -565,9 +594,10 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             self.use_2cta_instrs and self.mma_tiler_mn[0] != 256,
             f"MMA tiler M must be 256 when use_2cta_instrs=True, got {self.mma_tiler_mn[0]}",
         )
+        supported_tile_n = (128, 256) if self.weight_mode == MoEWeightMode.DENSE and not self._is_rubin_kernel else (256,)
         self._value_error_if(
-            self.mma_tiler_mn[1] != 256,
-            f"MMA tiler N must be 256, got {self.mma_tiler_mn[1]}",
+            self.mma_tiler_mn[1] not in supported_tile_n,
+            f"MMA tiler N must be in {supported_tile_n}, got {self.mma_tiler_mn[1]}",
         )
         self._value_error_if(
             self.cluster_shape_mn[0] % (2 if self.use_2cta_instrs else 1) != 0,
@@ -754,13 +784,19 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
             tensor_m_128 = cute.sym_int()
             stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
-                stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
-            )
+            if self.sfa_is_flat:
+                sfa_cute_fake = make_flat_sf_fake(self, self.sfa_desc)
+            else:
+                sfa_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfa_desc.dtype,
+                    shape=(32, 4, tensor_m_128, 4, self.sfa_desc.shape[4], 1),
+                    stride=(16, 4, self.sfa_desc.stride[2], 1, 512, stride_tensor_m_128),
+                )
 
-            sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
+            if self.sfb_is_flat:
+                sfb_cute_fake = make_flat_sf_fake(self, self.sfb_desc)
+            else:
+                sfb_cute_fake = self._make_fake_cute_tensor_from_desc(self.sfb_desc, assumed_align=16)
 
             prob_cute_fake = None
             if self.prob_desc is not None:
@@ -774,20 +810,26 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             sfd_col_fake = None
             if self.sfd_row_desc is not None:
                 stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
-                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
-                )
+                if self.sfd_row_is_flat:
+                    sfd_row_fake = make_flat_sf_fake(self, self.sfd_row_desc)
+                else:
+                    sfd_row_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_row_desc.dtype,
+                        shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
+                        stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
+                    )
             if self.sfd_col_desc is not None:
                 rest_m = cute.sym_int(divisibility=1)
                 stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
                 stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
-                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                )
+                if self.sfd_col_is_flat:
+                    sfd_col_fake = make_flat_sf_fake(self, self.sfd_col_desc)
+                else:
+                    sfd_col_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_col_desc.dtype,
+                        shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
+                        stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                    )
             bias_cute_fake = self._make_fake_cute_tensor_from_desc(self.bias_desc, assumed_align=16)
         else:
             valid_m = cute.sym_int(divisibility=256)
@@ -836,26 +878,32 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             rest_k = cute.sym_int()
             stride_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
             stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfa_shape = list(self.sfa_desc.shape)
-            sfa_shape[2] = tensor_m_128
-            sfa_shape[4] = rest_k
-            sfa_stride = list(self.sfa_desc.stride)
-            sfa_stride[2] = stride_rest_k
-            sfa_stride[5] = stride_tensor_m_128
-            sfa_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfa_desc.dtype,
-                shape=tuple(sfa_shape),
-                stride=tuple(sfa_stride),
-            )
+            if self.sfa_is_flat:
+                sfa_cute_fake = make_flat_sf_fake(self, self.sfa_desc)
+            else:
+                sfa_shape = list(self.sfa_desc.shape)
+                sfa_shape[2] = tensor_m_128
+                sfa_shape[4] = rest_k
+                sfa_stride = list(self.sfa_desc.stride)
+                sfa_stride[2] = stride_rest_k
+                sfa_stride[5] = stride_tensor_m_128
+                sfa_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfa_desc.dtype,
+                    shape=tuple(sfa_shape),
+                    stride=tuple(sfa_stride),
+                )
 
             tensor_n_128 = cute.sym_int()
             stride_sfb_rest_k = cute.sym_int(divisibility=32 * 4 * 4)
             stride_sfb_tensor_n_128 = cute.sym_int(divisibility=32 * 4 * 4)
-            sfb_cute_fake = self._make_fake_cute_tensor(
-                dtype=self.sfb_desc.dtype,
-                shape=(32, 4, tensor_n_128, 4, rest_k, l_sym),
-                stride=(16, 4, stride_sfb_tensor_n_128, 1, 512, stride_sfb_rest_k),
-            )
+            if self.sfb_is_flat:
+                sfb_cute_fake = make_flat_sf_fake(self, self.sfb_desc)
+            else:
+                sfb_cute_fake = self._make_fake_cute_tensor(
+                    dtype=self.sfb_desc.dtype,
+                    shape=(32, 4, tensor_n_128, 4, rest_k, l_sym),
+                    stride=(16, 4, stride_sfb_tensor_n_128, 1, 512, stride_sfb_rest_k),
+                )
 
             prob_cute_fake = None
             if self.prob_desc is not None:
@@ -871,21 +919,27 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 rest_n2 = cute.sym_int()
                 stride_sfd_rest_n2 = cute.sym_int(divisibility=32 * 4 * 4)
                 stride_sfd_rest_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_row_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_row_desc.dtype,
-                    shape=(32, 4, tensor_m_128, 4, rest_n2, 1),
-                    stride=(16, 4, stride_sfd_rest_n2, 1, 512, stride_sfd_rest_tensor_m_128),
-                )
+                if self.sfd_row_is_flat:
+                    sfd_row_fake = make_flat_sf_fake(self, self.sfd_row_desc)
+                else:
+                    sfd_row_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_row_desc.dtype,
+                        shape=(32, 4, tensor_m_128, 4, rest_n2, 1),
+                        stride=(16, 4, stride_sfd_rest_n2, 1, 512, stride_sfd_rest_tensor_m_128),
+                    )
             if self.sfd_col_desc is not None:
                 tensor_n2_128 = cute.sym_int()
                 rest_m_dyn = cute.sym_int()
                 stride_sfd_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
                 stride_sfd_n2 = cute.sym_int(divisibility=32 * 4 * 4)
-                sfd_col_fake = self._make_fake_cute_tensor(
-                    dtype=self.sfd_col_desc.dtype,
-                    shape=(32, 4, tensor_n2_128, 4, rest_m_dyn, 1),
-                    stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n2),
-                )
+                if self.sfd_col_is_flat:
+                    sfd_col_fake = make_flat_sf_fake(self, self.sfd_col_desc)
+                else:
+                    sfd_col_fake = self._make_fake_cute_tensor(
+                        dtype=self.sfd_col_desc.dtype,
+                        shape=(32, 4, tensor_n2_128, 4, rest_m_dyn, 1),
+                        stride=(16, 4, stride_sfd_rest_m, 1, 512, stride_sfd_n2),
+                    )
             bias_cute_fake = None
             if self.bias_desc is not None:
                 bias_cute_fake = self._make_fake_cute_tensor(
@@ -895,20 +949,19 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 )
 
         # Compile with keyword args (dense mode uses the unified __call__ positional order).
-        # linear_offset is a runtime cutlass.Float32 on both paths. geglu_alpha and the
-        # clamp limits are only supported on the SM100 kernel.
+        # Activation offset, alpha, and clamp bounds are runtime scalars on both architectures.
         compile_kwargs = dict(
-            a=a_cute_fake,
-            b=b_cute_fake,
+            a=canonical_mx_fake(a_cute_fake, self.canonical_a),
+            b=canonical_b_fake(b_cute_fake, self.canonical_b),
             sfb=sfb_cute_fake,
             n=cutlass.Int32(0),
             k=cutlass.Int32(0),
             b_stride_size=cutlass.Int64(0),
             b_major_mode=OperandMajorMode.K,
             workspace_ptr=fake_workspace_ptr,
-            c=c_cute_fake,
-            d=d_cute_fake,
-            d_col=d_col_cute_fake,
+            c=canonical_mx_fake(c_cute_fake, self.canonical_c),
+            d=canonical_mx_fake(d_cute_fake, self.canonical_d),
+            d_col=canonical_mx_fake(d_col_cute_fake, self.canonical_d_col),
             sfa=sfa_cute_fake,
             sfd_row_tensor=sfd_row_fake,
             sfd_col_tensor=sfd_col_fake,
@@ -916,20 +969,21 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             norm_const_tensor=self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16),
             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16),
             alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc, assumed_align=16),
-            prob=prob_cute_fake,
+            prob=canonical_prob_fake(prob_cute_fake, self.canonical_prob),
             bias=bias_cute_fake,
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
             epilogue_op=lambda x: x,
             linear_offset=cutlass.Float32(0.0),
+            geglu_alpha=cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
+            glu_clamp_max=cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
+            glu_clamp_min=cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
+            scheduler_counter=self._make_fake_cute_tensor_from_desc(self.scheduler_counter_desc, assumed_align=4),
             options="--enable-tvm-ffi",
         )
         if not self._is_rubin_kernel:
             compile_kwargs.update(
                 {
-                    "geglu_alpha": cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
-                    "glu_clamp_max": cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
-                    "glu_clamp_min": cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
                     "situ_beta1": cutlass.Float32(4.0),
                     "situ_beta2": cutlass.Float32(25.0),
                 }
@@ -962,15 +1016,16 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             glu_clamp_min: float = -7.0,
             situ_beta1: float = 4.0,
             situ_beta2: float = 25.0,
+            scheduler_counter_tensor: Optional[torch.Tensor] = None,
         ) -> None:
             norm_const_tensor = self._unpad_tensor_to_ndim(norm_const_tensor, 1, "norm_const")
             kernel_args = (
                 a_tensor,
                 b_tensor,
                 sfb_tensor,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                cutlass.Int64(0),
+                0,
+                0,
+                0,
                 cached_workspace_ptr,
                 c_tensor,
                 d_tensor,
@@ -985,18 +1040,19 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 prob_tensor,
                 bias_tensor,
                 stream,
-                cutlass.Float32(linear_offset),
+                linear_offset,
+                geglu_alpha,
+                glu_clamp_max,
+                glu_clamp_min,
             )
             if self._is_rubin_kernel:
-                _compiled_kernel(*kernel_args)
+                _compiled_kernel(*kernel_args, scheduler_counter_tensor)
             else:
                 _compiled_kernel(
                     *kernel_args,
-                    cutlass.Float32(geglu_alpha),
-                    cutlass.Float32(glu_clamp_max),
-                    cutlass.Float32(glu_clamp_min),
-                    cutlass.Float32(situ_beta1),
-                    cutlass.Float32(situ_beta2),
+                    situ_beta1,
+                    situ_beta2,
+                    scheduler_counter_tensor,
                 )
 
         self._compiled_kernel = tensor_api
@@ -1046,36 +1102,45 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         tensor_m_128 = cute.sym_int()
         stride_tensor_m_128 = cute.sym_int(divisibility=32 * 4 * 4)
-        sfa_shape = list(self.sfa_desc.shape)
-        sfa_shape[2] = tensor_m_128
-        sfa_stride = list(self.sfa_desc.stride)
-        sfa_stride[5] = stride_tensor_m_128
-        sfa_tensor = self._make_fake_cute_tensor(
-            dtype=self.sfa_desc.dtype,
-            shape=tuple(sfa_shape),
-            stride=tuple(sfa_stride),
-            assumed_align=16,
-        )
+        if self.sfa_is_flat:
+            sfa_tensor = make_flat_sf_fake(self, self.sfa_desc)
+        else:
+            sfa_shape = list(self.sfa_desc.shape)
+            sfa_shape[2] = tensor_m_128
+            sfa_stride = list(self.sfa_desc.stride)
+            sfa_stride[5] = stride_tensor_m_128
+            sfa_tensor = self._make_fake_cute_tensor(
+                dtype=self.sfa_desc.dtype,
+                shape=tuple(sfa_shape),
+                stride=tuple(sfa_stride),
+                assumed_align=16,
+            )
         sfd_row_tensor = None
         if self.sfd_row_desc is not None:
             stride_sfd_m = cute.sym_int(divisibility=32 * 4 * 4)
-            sfd_row_tensor = self._make_fake_cute_tensor(
-                dtype=self.sfd_row_desc.dtype,
-                shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
-                stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
-                assumed_align=16,
-            )
+            if self.sfd_row_is_flat:
+                sfd_row_tensor = make_flat_sf_fake(self, self.sfd_row_desc)
+            else:
+                sfd_row_tensor = self._make_fake_cute_tensor(
+                    dtype=self.sfd_row_desc.dtype,
+                    shape=(32, 4, tensor_m_128, 4, self.sfd_row_desc.shape[4], 1),
+                    stride=(16, 4, self.sfd_row_desc.stride[2], 1, 512, stride_sfd_m),
+                    assumed_align=16,
+                )
         sfd_col_tensor = None
         if self.sfd_col_desc is not None:
             rest_m = cute.sym_int(divisibility=1)
             stride_sfd_n = cute.sym_int(divisibility=32 * 4 * 4)
             stride_rest_m = cute.sym_int(divisibility=32 * 4 * 4)
-            sfd_col_tensor = self._make_fake_cute_tensor(
-                dtype=self.sfd_col_desc.dtype,
-                shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
-                stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
-                assumed_align=16,
-            )
+            if self.sfd_col_is_flat:
+                sfd_col_tensor = make_flat_sf_fake(self, self.sfd_col_desc)
+            else:
+                sfd_col_tensor = self._make_fake_cute_tensor(
+                    dtype=self.sfd_col_desc.dtype,
+                    shape=(32, 4, self.sfd_col_desc.shape[2], 4, rest_m, 1),
+                    stride=(16, 4, stride_rest_m, 1, 512, stride_sfd_n),
+                    assumed_align=16,
+                )
         amax_tensor = self._make_fake_cute_tensor_from_desc(self.amax_desc, assumed_align=16)
         norm_const_tensor_cute = self._make_fake_cute_tensor_from_desc(self.norm_const_desc, assumed_align=16)
         padded_offsets_tensor = self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc, assumed_align=16)
@@ -1098,11 +1163,11 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
 
         workspace_ptr_cute = from_dlpack(self._workspace, assumed_align=128).iterator
 
-        # linear_offset is runtime on both paths; clamp/alpha tuning kwargs are SM100-only.
+        # Activation offset, alpha, and clamp bounds are runtime scalars on both architectures.
         self._logger.debug("Compiling discrete grouped GEMM GLU kernel")
         discrete_compile_args = (
             gemm_glu,
-            a_tensor,
+            canonical_mx_fake(a_tensor, self.canonical_a),
             b_ptrs_cute,
             sfb_ptrs_cute,
             cutlass.Int32(n),
@@ -1110,9 +1175,9 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             cutlass.Int64(b_stride_size),
             b_major_mode,
             workspace_ptr_cute,
-            c_tensor,
-            d_tensor,
-            d_col_tensor,
+            canonical_mx_fake(c_tensor, self.canonical_c),
+            canonical_mx_fake(d_tensor, self.canonical_d),
+            canonical_mx_fake(d_col_tensor, self.canonical_d_col),
             sfa_tensor,
             sfd_row_tensor,
             sfd_col_tensor,
@@ -1120,21 +1185,21 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
             norm_const_tensor_cute,
             padded_offsets_tensor,
             alpha_tensor,
-            prob_tensor,
+            canonical_prob_fake(prob_tensor, self.canonical_prob),
             bias_tensor,
             max_active_clusters,
             fake_stream,
             lambda x: x,  # epilogue_op (Constexpr, baked in)
             cutlass.Float32(0.0),
+            cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
+            cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
+            cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
         )
         if self._is_rubin_kernel:
             _compiled_kernel = cute.compile(*discrete_compile_args, options="--enable-tvm-ffi")
         else:
             _compiled_kernel = cute.compile(
                 *discrete_compile_args,
-                cutlass.Float32(_GEGGLU_ALPHA_DEFAULT),
-                cutlass.Float32(_GLU_CLAMP_MAX_DEFAULT),
-                cutlass.Float32(_GLU_CLAMP_MIN_DEFAULT),
                 cutlass.Float32(4.0),
                 cutlass.Float32(25.0),
                 options="--enable-tvm-ffi",
@@ -1199,18 +1264,18 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 prob_tensor,
                 bias_tensor,
                 stream,
-                cutlass.Float32(linear_offset),
+                linear_offset,
+                geglu_alpha,
+                glu_clamp_max,
+                glu_clamp_min,
             )
             if self._is_rubin_kernel:
                 _compiled_kernel(*kernel_args)
             else:
                 _compiled_kernel(
                     *kernel_args,
-                    cutlass.Float32(geglu_alpha),
-                    cutlass.Float32(glu_clamp_max),
-                    cutlass.Float32(glu_clamp_min),
-                    cutlass.Float32(situ_beta1),
-                    cutlass.Float32(situ_beta2),
+                    situ_beta1,
+                    situ_beta2,
                 )
 
         self._compiled_kernel = tensor_api
@@ -1248,6 +1313,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         situ_beta1: float = 4.0,
         situ_beta2: float = 25.0,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        scheduler_counter_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         """Execute the compiled kernel.
 
@@ -1281,7 +1348,8 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param geglu_alpha: Pre-sigmoid scaling factor for the GeGLU activation.
             The fused activation is
             ``out = (clamp(up, glu_clamp_min, glu_clamp_max) + linear_offset)
-                    * silu(geglu_alpha * clamp(gate, max=glu_clamp_max))``.
+                    * gate_clamped * sigmoid(geglu_alpha * gate_clamped)``,
+            where ``gate_clamped = min(gate, glu_clamp_max)``.
             Defaults to ``1.702`` (GPT-OSS / scaled-GeGLU). Ignored when
             ``act_func == "swiglu"``.
         :param glu_clamp_max: Upper clamp limit applied to both ``gate`` and
@@ -1293,7 +1361,14 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
         :param situ_beta1: Gate tanh scale for SiTU-GLU. Default ``4.0``.
         :param situ_beta2: Up-branch tanh scale for SiTU-GLU. Default ``25.0``.
         :param current_stream: CUDA stream
+        :param scheduler_counter_tensor: Caller-owned contiguous CUDA int32 counter,
+            initialized to zero on the execution stream before each invocation.
+            Dense dynamic scheduling only; presence must match construction.
+            Overlapping invocations require distinct counters.
         """
+        if (scheduler_counter_tensor is None) != (self.scheduler_counter_desc is None):
+            raise ValueError("scheduler_counter_tensor presence must match sample_scheduler_counter at compilation")
+        validate_scheduler_counter(scheduler_counter_tensor, a_tensor)
         self._logger.debug("Entering execute")
         current_stream = self._get_default_stream(current_stream)
 
@@ -1323,12 +1398,6 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 float(situ_beta1) != self.situ_beta1,
                 "situ_beta1 is specialized at compile time; construct and compile " f"the API with situ_beta1={situ_beta1}",
             )
-        _reject_unsupported_rubin_glu_tune_params(
-            self._is_rubin_kernel,
-            geglu_alpha,
-            glu_clamp_max,
-            glu_clamp_min,
-        )
 
         self._logger.debug("Executing grouped GEMM GLU kernel")
         if self._has_bias:
@@ -1355,6 +1424,7 @@ class GroupedGemmGluBlockScaledAPI(APIBase):
                 bias_tensor=bias_tensor,
                 prob_tensor=prob_tensor,
                 stream=current_stream,
+                scheduler_counter_tensor=scheduler_counter_tensor,
                 linear_offset=linear_offset,
                 geglu_alpha=geglu_alpha,
                 glu_clamp_max=glu_clamp_max,

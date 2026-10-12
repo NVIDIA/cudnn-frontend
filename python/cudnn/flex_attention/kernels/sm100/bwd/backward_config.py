@@ -1,4 +1,7 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """Shared SM100 backward consumer configuration for mask planning.
 
 The arbitrary mask payload must follow the score TMEM-to-register ownership
@@ -16,6 +19,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import torch
 from cutlass import Float32, cute
 from cutlass.cute.nvgpu import tcgen05
+from cudnn._cutlass_compat import OperandMajorMode
 from cudnn.flex_attention.kernels.common import copy_utils
 from cudnn.flex_attention.plan.mask_plan import (
     ArbitraryPlanSignature,
@@ -208,8 +212,9 @@ def make_sm100_bwd_tiled_mma_sdp(
 
     return sm100_utils_basic.make_trivial_tiled_mma(
         dtype,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
+        dtype,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
         Float32,
         tcgen05.CtaGroup.TWO if cta_group_size == 2 else tcgen05.CtaGroup.ONE,
         (sparse_tile_n, tile_m),

@@ -4,7 +4,7 @@
 """Compile-time flavor configs for the SM80 SDPA backward kernel.
 
 Single source of truth for the shared 2-sub-group backward pipeline
-(``kernels/bprop_f16_sm80.py``); all shape-dependent sizes are derived in the
+(``kernels/sm80/bprop_f16.py``); all shape-dependent sizes are derived in the
 kernel from these fields — do NOT inline ``128`` / ``64`` literals there.
 The pipeline shape the knobs describe:
 
@@ -29,7 +29,7 @@ Flavors (d is read from the tensor shapes; the kernel runs both unchanged):
   SMEM at TILE_Q=128 is ~144 KiB < the A100 163 KiB dynamic-SMEM cap. SQ must
   be a multiple of TILE_Q=128; SKV a multiple of TILE_KV=64.
   NOTE: the shipped gptoss-sm80 (d=64) BPROP kernel is
-  ``kernels/bprop_d64_f16_sm80.py``, which uses a FIXED tile shape
+  ``kernels/sm80/bprop_d64_f16.py``, which uses a FIXED tile shape
   (m_block=64, n_block=128) and does not read this config. GPTOSS_CFG
   configures the shared path when run at d=64.
 """

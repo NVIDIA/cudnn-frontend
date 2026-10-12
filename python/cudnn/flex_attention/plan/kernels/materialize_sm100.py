@@ -1,4 +1,7 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 """SM100 packed-predicate materialization kernels."""
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Int32, Uint32, const_expr
+from cudnn._cutlass_compat import SmemAllocator
 import cuda.bindings.driver as cuda
 
 from cudnn.flex_attention.kernels.sm100.bwd.backward_config import (
@@ -393,7 +397,7 @@ class _ArbitraryPlanK2QMaterializeSm100(_ArbitraryPlanK2QMaterializeSm90):
 
         canonical_words = self.tile_n // 32
         canonical_stride = canonical_words + 1
-        smem = cutlass_utils.SmemAllocator()
+        smem = SmemAllocator()
         sMask = smem.allocate_tensor(
             element_type=Uint32,
             layout=cute.make_layout(

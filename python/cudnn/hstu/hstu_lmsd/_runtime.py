@@ -10,6 +10,8 @@ from contextlib import nullcontext
 from cuda.bindings import driver as cuda
 import torch
 
+from cudnn._torch_stream import as_torch_stream as _as_torch_stream
+
 
 def tensor_signature(tensor: torch.Tensor, *, dynamic_rows: bool = False) -> tuple:
     """Return the stride-independent plan-time tensor contract."""
@@ -21,13 +23,7 @@ def tensor_signature(tensor: torch.Tensor, *, dynamic_rows: bool = False) -> tup
 
 def as_torch_stream(stream, device: torch.device) -> torch.cuda.Stream:
     """Return a PyTorch stream view for a torch stream or CUDA stream handle."""
-    if isinstance(stream, torch.cuda.Stream):
-        if stream.device != device:
-            raise ValueError(f"stream must be on {device}, got {stream.device}")
-        return stream
-    if int(stream) == 0:
-        return torch.cuda.default_stream(device)
-    return torch.cuda.ExternalStream(int(stream), device=device)
+    return _as_torch_stream(stream, device)
 
 
 def allocation_context(stream, device: torch.device):

@@ -10,10 +10,13 @@ d128 geometry: a cga2 cluster covers TILES_Q * TILE_M * CTA_MMA = 512 Q rows on
 2 CTAs, and TILE_N = 128 sets the KV tile.
 """
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 from cudnn.sdpa.fwd.engines import Capabilities, SdpaFwdKnobs, mismatch
-from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_split_kv, split_kv_candidates
+from frost_test_utils import requires_dsl
+from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_MIN_TILES, choose_decode_tile_split_kv, choose_split_kv, split_kv_candidates
 
 # Pure arithmetic — no device, no kernel build — so every case is L0.
 pytestmark = pytest.mark.L0
@@ -253,9 +256,8 @@ def _facts():
 
 def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     """A ragged S_kv on a skv_tail_via_padding row is served through the
-    padded kernel path (synthesized per-batch KV lengths) — the one path the
-    split cannot ride. The gate must mirror lower_dsl_prefill's predicate so
-    the plan is never listed, not declined at build."""
+    kernel's KV-tail mask (kv_tail_mask, #1425). Outside the qualified
+    exact-D128 architectures this remains declined before plan build."""
     from cudnn.sdpa import graph_analyzer as ga
 
     caps = Capabilities(
@@ -276,6 +278,68 @@ def test_split_declines_when_the_kv_tail_needs_synthesized_padding():
     assert "split_kv" not in why
 
 
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_explicit_scalar_tail_split_admission(device_cc, fp8):
+    """Tail admission follows the native lowerings, without pinning a heuristic winner."""
+    from dataclasses import replace
+    from cudnn.sdpa import graph_analyzer as ga
+
+    caps = Capabilities(
+        sm_lo=100,
+        sm_hi=107,
+        phase="prefill",
+        d_shapes=frozenset({(128, 128)}),
+        skv_tail_via_padding=True,
+        split_kv_supported=True,
+    )
+    facts = ga.SdpaGraphFacts(s_q=64, s_kv=257, d_qk=128, d_v=128, device_cc=device_cc, is_fp8=fp8)
+    knobs = SdpaFwdKnobs(split_kv=4)
+    assert "split_kv" not in (mismatch(caps, facts, knobs) or "")
+    for other in (
+        replace(facts, device_cc=(10, 8)),
+        replace(facts, d_qk=112),
+        replace(facts, d_qk=192),
+        replace(facts, is_fp8=False, is_mxfp8=True),
+    ):
+        assert "split_kv" in (mismatch(caps, other, knobs) or "")
+
+
+def test_split_kv_tail_rule_exempts_paged_but_not_dense_padded():
+    """The synthesized-padding exclusion is about the DENSE mask-free path. A
+    paged graph is padded by construction (per-batch KV lengths are mandatory
+    and bound the walk on device), so a declared ``paged_attention_max_seq_len_kv``
+    that is not a 128-multiple — FlashInfer passes its true max, e.g. 4000 —
+    must not block the split. The neighbouring dense cases keep their verdicts:
+    a dense padded graph still declines the split (its padded path yields no
+    per-split partials), and scalar-tail splitting still needs a qualified
+    native dimension and architecture."""
+    from cudnn.sdpa import graph_analyzer as ga
+
+    caps = Capabilities(
+        sm_lo=100,
+        sm_hi=100,
+        phase="prefill",
+        d_shapes=frozenset({(128, 128)}),
+        skv_tail_via_padding=True,
+        split_kv_supported=True,
+        paged_kv=True,
+        padded=True,
+    )
+    paged = ga.SdpaGraphFacts(s_q=1, s_kv=4000, padded=True, has_paged_kv=True, page_size=16)
+    why = mismatch(caps, paged, SdpaFwdKnobs(split_kv=2)) or ""
+    assert "split_kv" not in why, why
+    # Unchanged: a dense padded graph never splits, whatever its S_kv.
+    for s_kv in (4000, 4096):
+        dense_padded = ga.SdpaGraphFacts(s_q=1, s_kv=s_kv, padded=True)
+        why = mismatch(caps, dense_padded, SdpaFwdKnobs(split_kv=2))
+        assert why is not None and "split_kv" in why, (s_kv, why)
+    # Unchanged: a dense mask-free ragged S_kv rides the synthesized padding.
+    dense_ragged = ga.SdpaGraphFacts(s_q=1, s_kv=4000)
+    why = mismatch(caps, dense_ragged, SdpaFwdKnobs(split_kv=2))
+    assert why is not None and "split_kv" in why, why
+
+
 def test_split_domains_match_the_wired_lowerings():
     """Guards the pairing: a row sets split_kv_supported exactly when its
     adapter forwards the knob into TemplateParams and launches the combine.
@@ -287,6 +351,7 @@ def test_split_domains_match_the_wired_lowerings():
         "sdpa_fwd_prefill_sm100",
         "sdpa_fwd_prefill_sm100_mxfp8",
         "sdpa_fwd_prefill_sm100_fp8",
+        "sdpa_fwd_prefill_sm107",
         "sdpa_fwd_prefill_sm107_fp8",
         "sdpa_fwd_prefill_sm120",
         "sdpa_fwd_prefill_sm120_fp8",
@@ -384,6 +449,170 @@ def test_decode_rows_barely_pay_for_the_combine():
     assert decode >= prefill
 
 
+def test_unsplit_leg_pays_no_combine():
+    """The unsplit leg runs ONE kernel -- no combine is launched -- so the model
+    charges it none. Charging it one combine wave-set (``s = 1`` in the combine
+    term) under-priced the reduction a split adds by exactly that much, which
+    flipped small-KV launches with many output rows to a split that measures
+    slower (B200, d128 bf16, S_kv=4096 = 32 KV tiles, kernel time):
+
+        b=8 h=32/8 S_q=64 paged, cga1, 16384 rows:  unsplit 67.6 us, split 2 75.0 us
+        b=4 h=32/8 S_q=128 dense causal, cga2:      unsplit 120.2 us, split 2 155.5 us
+
+    while a cheap combine still lets the model split where that pays:
+
+        b=8 h=32/8 S_q=16 paged, cga1, 4096 rows:   split 2 49.4 us, unsplit 65.3 us
+        b=8 h=64/4 S_q=1 paged, cga1, 512 rows:     split 4 27.5 us, unsplit 63.6 us
+    """
+    common = dict(q_tiles=1, kv_tiles=32, sm_count=B200_SMS)
+    assert choose_split_kv(heads_q=8, batch=8, ctas_per_tile=1, combine_rows=64 * 32 * 8, **common) == 1
+    assert choose_split_kv(heads_q=8, batch=4, ctas_per_tile=2, combine_rows=128 * 32 * 4, **common) == 1
+    assert choose_split_kv(heads_q=8, batch=8, ctas_per_tile=1, combine_rows=16 * 32 * 8, **common) == 2
+    assert choose_split_kv(heads_q=4, batch=8, ctas_per_tile=1, combine_rows=1 * 64 * 8, **common) == 4
+
+
+def test_unsplit_leg_accounting_reaches_the_wide_head_flavors():
+    """The unsplit leg carrying no combine term is not a d128 rule: every
+    flavor's split leg runs the same arithmetic. On the d192x128 and d256 f16
+    flavors (cga2 clusters, 128-row KV tiles) the launches it moves are
+    few-unit 2k-KV chunks with thousands of output rows, where the phantom
+    combine wave-set used to outweigh halving a 16-tile loop. Measured on B200
+    (bf16 dense, kernel time, heuristic lead against the split 2 the old
+    accounting led with, pinned by knobs):
+
+        d256 b=1 h=64/4 S_q=128 S_kv=2048 mask-free:  unsplit 51.7 us, split 2 75.3 us
+        d192 b=1 h=32/8 S_q=256 S_kv=2048 causal:     unsplit 35.3 us, split 2 60.9 us
+    """
+    wide = dict(batch=1, kv_tiles=16, sm_count=B200_SMS, ctas_per_tile=2, combine_rows=8192)
+    # d256: a 256-row cga2 cluster, packed G=16 -> 2048 rows per unit -> 8 Q tiles x 4 KV heads.
+    assert choose_split_kv(q_tiles=8, heads_q=4, **wide) == 1
+    # d192: a 512-row cga2 cluster, packed G=4 -> 1024 rows per unit -> 2 Q tiles x 8 KV heads.
+    assert choose_split_kv(q_tiles=2, heads_q=8, **wide) == 1
+
+
+def test_lone_combine_blocks_pay_the_latency_floor():
+    """A combine block walks its ``s`` partials serially; with fewer output rows
+    than the machine holds at once nothing hides that chain, so a partial costs
+    the lone-block price (_SPLIT_KV_COMBINE_FLOOR) however few combine waves
+    the rows make. Fed the per-wave price alone, a few-unit launch read the
+    combine as nearly free and split until the wave was full -- one power of
+    two past the measured optimum (B200, d128 bf16 paged, kernel time, the
+    grid inside one wave throughout):
+
+        b=1 h=16/2 S_q=1 S_kv=32k, cga1 (2 units, 16 rows):  split 64 50.8 us, split 32 39.7 us
+        b=1 h=64/4 S_q=1 S_kv=4k,  cga1 (4 units, 64 rows):  split 16 22.3 us, split 8  20.3 us
+        b=1 h=32/8 S_q=1 S_kv=4k,  cga1 (8 units, 32 rows):  split 16 23.6 us, split 8  20.3 us
+
+    while a ladder the wave boundary already stops keeps its choice:
+
+        b=1 h=64/4 S_q=1 S_kv=32k, cga1:  split 32 43.0 us (split 16 47.2 us)
+        b=4 h=64/4 S_q=1 S_kv=4k,  cga1:  split 8  21.5 us (split 4  25.4 us)
+        b=8 h=64/4 S_q=1 S_kv=4k,  cga1 (512 rows: four combine waves, above the floor):  split 4 26.6 us
+    """
+    lone = dict(q_tiles=1, batch=1, sm_count=B200_SMS, ctas_per_tile=1)
+    assert choose_split_kv(heads_q=2, kv_tiles=256, combine_rows=16, **lone) == 32
+    assert choose_split_kv(heads_q=4, kv_tiles=32, combine_rows=64, **lone) == 8
+    assert choose_split_kv(heads_q=8, kv_tiles=32, combine_rows=32, **lone) == 8
+    assert choose_split_kv(heads_q=4, kv_tiles=256, combine_rows=64, **lone) == 32
+    assert choose_split_kv(q_tiles=1, heads_q=4, batch=4, kv_tiles=32, combine_rows=256, sm_count=B200_SMS, ctas_per_tile=1) == 8
+    assert choose_split_kv(q_tiles=1, heads_q=4, batch=8, kv_tiles=32, combine_rows=512, sm_count=B200_SMS, ctas_per_tile=1) == 4
+    # The floor is a lone block's price and nothing more: it must sit below the
+    # per-wave price of the smallest launch _B300_FIT pins (2048 rows), or a
+    # future retune of either constant would move the fitted choices. (Imported
+    # here so the behaviour asserts above collect on a tree without the floor.)
+    from cudnn.sdpa.fwd.heuristics import _SPLIT_KV_COMBINE_COST, _SPLIT_KV_COMBINE_FLOOR
+
+    assert _SPLIT_KV_COMBINE_FLOOR <= -(-(_FIT_S_Q * 4) // B200_SMS) * _SPLIT_KV_COMBINE_COST
+
+
+# --- the d256 decode tile's own model ----------------------------------------
+#
+# sm100/decode_d256_f16.py runs one cta_group::1 CTA per (KV-head group, batch,
+# split) unit and is HBM-bound, so its split trades the device's idle SMs
+# against the split path's second launch. Pinned at the B200 fit (148 SMs,
+# 128-key tiles); the shapes are Qwen3.5 32/2 (2 KV heads, packed 16:1).
+
+
+def _decode_tile(units, s_kv, sm_count=B200_SMS, **kw):
+    return choose_decode_tile_split_kv(units=units, kv_tiles=-(-s_kv // 128), sm_count=sm_count, **kw)
+
+
+def test_decode_tile_serving_shape_stays_unsplit_for_eager_callers():
+    """b=32 x 2 KV heads (64 units) over 4096 keys: split 2 saves ~6 us of GPU
+    time (56.9 -> 51.0 us CUDA-graph replay) and costs an eager caller ~30 us
+    of host time per execute (62 -> 92 us), so the default does not split. A
+    captured caller's optimum -- the launch term at 0 -- is the split."""
+    assert _decode_tile(64, 4096) == 1
+    assert _decode_tile(64, 4096, launch_cost=0.0) == 2
+
+
+def test_decode_tile_small_batch_splits_to_fill_the_machine():
+    """16 units (b=8) over 4096 keys: unsplit, 16 of 148 SMs stream 32 tiles
+    each; split 8 puts 128 streams on the device and the GPU saving (~56 ->
+    ~20 us) pays for the launch. Fewer units split at least as much."""
+    assert _decode_tile(16, 4096) == 8
+    assert _decode_tile(8, 4096) >= 8
+    assert _decode_tile(2, 4096) == 16  # 32 tiles: the thinnest split keeps two
+
+
+def test_decode_tile_wide_q_tile_splits_the_serving_shape():
+    """The same 64 units on the 32-column tile (S_q=2 x 16:1, the MTP step):
+    a lone CTA there streams a tile 1.6x slower (90.2 vs 57.1 us unsplit), so
+    split 2 saves ~32 us of GPU time -- enough to pay for the launch -- and
+    leads in both regimes; a saturated launch still does not split.  The
+    adapter does not route that tile today (config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS
+    keeps (16, 32] rows on the prefill tile: even split, 96-103 us eager against
+    the prefill tile's 66 us); its fit stays pinned for when it is routed."""
+    assert _decode_tile(64, 4096, q_tile=32) == 2
+    assert _decode_tile(64, 4096, q_tile=32, launch_cost=0.0) == 2
+    assert _decode_tile(16, 4096, q_tile=32) == 8
+    assert _decode_tile(256, 4096, q_tile=32) == 1
+
+
+def test_decode_tile_saturated_launch_never_splits():
+    """256 units (b=128) already saturate HBM twice over, 128 once: the bytes
+    do not change with the split, only the fixed costs, so neither regime
+    splits."""
+    for units in (128, 256):
+        assert _decode_tile(units, 4096) == 1
+        assert _decode_tile(units, 4096, launch_cost=0.0) == 1
+
+
+def test_decode_tile_long_kv_pays_for_the_launch():
+    """At 64 units the GPU saving of a split grows with the KV length: 8192
+    keys (~22 us) does not cover the eager launch, 16384 (~45 us) does; past
+    saturation a finer split only adds fixed cost."""
+    assert _decode_tile(64, 8192) == 1
+    assert _decode_tile(64, 8192, launch_cost=0.0) == 2
+    assert _decode_tile(64, 16384) == 2
+    assert _decode_tile(64, 65536) == 2
+
+
+def test_decode_tile_short_kv_does_not_split():
+    """Two or three tiles cannot be cut (the thinnest split keeps two); a
+    handful can be, but saves too little GPU time to pay for a launch."""
+    assert _decode_tile(2, 256) == 1
+    assert _decode_tile(2, 384) == 1
+    assert _decode_tile(2, 1024) == 1
+    assert _decode_tile(2, 1024, launch_cost=0.0) > 1
+
+
+@pytest.mark.parametrize("q_tile", [16, 32])
+@pytest.mark.parametrize("units", [2, 16, 64, 128])
+def test_decode_tile_longer_kv_never_splits_less(units, q_tile):
+    """On tile-aligned KV lengths the choice is monotone in the length and a
+    power of two (split_kv is a kernel-module cache key)."""
+    got = [_decode_tile(units, 128 << i, q_tile=q_tile) for i in range(12)]
+    assert all(a <= b for a, b in zip(got, got[1:])), got
+    assert all(s & (s - 1) == 0 for s in got), got
+
+
+def test_decode_tile_degenerate_inputs_do_not_split():
+    assert choose_decode_tile_split_kv(units=0, kv_tiles=32, sm_count=B200_SMS) == 1
+    assert choose_decode_tile_split_kv(units=64, kv_tiles=0, sm_count=B200_SMS) == 1
+    assert choose_decode_tile_split_kv(units=64, kv_tiles=32, sm_count=0) == 1
+
+
 # --- a quantized O is a legal split target ---------------------------------
 #
 # The split kernels write HALF partials whatever the O dtype and the combine
@@ -455,29 +684,66 @@ def test_quantized_and_half_outputs_choose_the_same_split():
     assert fp8 == half, f"O dtype moved the split choice: {fp8} vs {half}"
 
 
-def test_every_combine_call_site_matches_the_compiled_arity():
-    """The combine is invoked POSITIONALLY, so adding a parameter to its host
-    silently breaks every call site that was not updated with it.
+@requires_dsl
+@pytest.mark.parametrize("kind", ["dense", "ragged", "quantized"])
+@pytest.mark.parametrize("stats", [False, True])
+def test_every_combine_call_site_matches_the_compiled_arity(kind, stats):
+    """Actual prepared frames must match each pointer host's runtime ABI.
 
-    The failure is a TypeError raised only when a split actually runs, so a
-    missed site hides until some shape happens to split -- and the arms that
-    never split (dense half, THD) look fine either way. Compare the sites
-    against the signature instead of waiting for a shape to find them."""
-    import ast
+    The fixture contains metadata and sentinel addresses only. Both compiled
+    launch functions are intercepted; no CUDA operation receives these addresses.
+    """
     import inspect
+    from typing import get_origin
 
-    from cudnn.sdpa.fwd import api_dsl
+    import cutlass
+    from cudnn.sdpa.fwd import prepared as prep
     from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    from test_sdpa_prepared_geometry import _split_fixture
 
-    # _host's parameters, minus the trailing `stream` keyword.
-    params = [p for p in inspect.signature(split_combine._host).parameters if p != "stream"]
-    expected = len(params)
+    host = {"dense": split_combine._host_ptr, "ragged": split_combine._host_ptr_ragged, "quantized": split_combine._host_ptr_quantized}[kind]
+    params = [
+        param
+        for param in inspect.signature(host).parameters.values()
+        if param.annotation is not cutlass.Constexpr and get_origin(param.annotation) is not cutlass.Constexpr
+    ]
+    signature = inspect.Signature(params)
+    seen = []
 
-    tree = ast.parse(inspect.getsource(api_dsl))
-    sites = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "_combine_kernel"]
-    assert sites, "no combine call sites found — did the attribute get renamed?"
-    bad = [(n.lineno, len(n.args)) for n in sites if len(n.args) != expected]
-    assert not bad, f"combine call sites passing != {expected} positional args ({params}): {bad}"
+    def check_frame(*args):
+        assert len(args) == len(params), (kind, len(args), list(signature.parameters))
+        signature.bind(*args)
+        assert args[-1] == 17
+        seen.append(args)
+
+    spec, facts = _split_fixture(stats)
+    spec.fn = lambda *args: None
+    spec.combine = spec.combine._replace(fn=check_frame)
+    if kind == "ragged":
+        spec.ragged, spec.ragged_i64 = True, False
+        spec.ragged_lse_head_major = False  # The fixture below declares token-major Stats.
+        spec.total_q = spec.b * spec.s_q_max
+        spec.ragged_divs = (spec.qh * spec.d_qk, spec.qh * spec.d_v, spec.qh)
+        for i, role in enumerate(("ragged_q", "ragged_o", "ragged_lse")):
+            if role != "ragged_lse" or stats:
+                facts[role] = prep.BufferFacts(0x50000 + i * 0x1000, "int32", (2, 0), spec.b + 1, (spec.b + 1,), (1,))
+        if stats:
+            facts["lse"] = facts["lse"]._replace(shape=(spec.total_q, spec.qh), strides=(spec.qh, 1))
+    if kind == "quantized":
+        spec.quant = prep.QuantizedLaunchSpec(True, 65536)
+        for role in ("q", "k", "v"):
+            spec.expect[role] = "float8_e4m3fn"
+            facts[role] = facts[role]._replace(dtype="float8_e4m3fn")
+        for i, role in enumerate(("descale_q", "descale_k", "descale_v", "scale_o", "amax_o")):
+            facts[role] = prep.BufferFacts(0x60000 + i * 0x1000, "float32", (2, 0), 1, (1,), (1,))
+            spec.index[role + "_ptr"] = len(spec.template)
+            spec.template.append(None)
+        # All scalars are present, so execute_quantized needs no CUDA fill.
+        assert binding_reference.execute_quantized(spec, facts, 0x100000, 17, 17)
+    else:
+        _, args = binding_reference.bind_dense_split(spec, facts, 0x100000, 17, 17)
+        spec.combine.fn(*args)
+    assert len(seen) == 1, "no prepared combine frame checked"
 
 
 def test_every_split_capable_sm100_kernel_has_the_slot():
@@ -505,11 +771,20 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     assert kdir.is_dir(), f"kernel directory moved: {kdir}"
 
     offenders = []
+
+    def has_slot(src: str) -> bool:
+        if "\nEXPLICIT_ABI = True" in src:
+            # explicit host entry: the slot is the o_partial_ptr parameter (the shared prologue
+            # names o_partial_f32 in every host, so the source string is no evidence)
+            sig = src[src.index("\ndef _host(") : src.index(") -> None:", src.index("\ndef _host("))]
+            return "o_partial_ptr" in sig
+        return "o_partial_f32" in src
+
     for f in sorted(kdir.glob("prefill_*.py")):
         src = f.read_text()
         if "make_split_helpers" not in src:
             continue  # not split-capable, nothing to carry
-        if "o_partial_f32" in src:
+        if has_slot(src):
             continue  # wired
         if f.name in _SLOTLESS_FLAVORS:
             continue  # known, and excluded by _fp32_partial_split
@@ -525,4 +800,12 @@ def test_every_split_capable_sm100_kernel_has_the_slot():
     for name in _SLOTLESS_FLAVORS:
         src = (kdir / name).read_text()
         assert "make_split_helpers" in src, f"{name}: no longer split-capable; drop it from _SLOTLESS_FLAVORS"
-        assert "o_partial_f32" not in src, f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"
+        assert not has_slot(src), f"{name}: now carries the slot; drop it from _SLOTLESS_FLAVORS and let the predicate return True"
+
+
+@pytest.mark.parametrize("min_tiles", [1, 2, 4])
+def test_candidates_and_choice_respect_a_supplied_min_tiles(min_tiles):
+    for kv_tiles in (1, 3, 16, 17, 512):
+        assert all(kv_tiles // s >= min_tiles for s in split_kv_candidates(sm_count=188, kv_tiles=kv_tiles, min_tiles=min_tiles) if s > 1)
+        s = choose_split_kv(q_tiles=1, heads_q=1, batch=1, kv_tiles=kv_tiles, sm_count=188, combine_rows=8, min_tiles=min_tiles, combine_floor=0.1)
+        assert s == 1 or kv_tiles // s >= min_tiles

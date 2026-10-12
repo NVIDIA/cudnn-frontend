@@ -214,12 +214,10 @@ def block_sparse_attention_forward(
         if isinstance(kv_splits, str) or not 1 <= int(kv_splits) <= 256:
             raise ValueError("SM90 kv_splits must be an integer in [1, 256]")
 
-    if arch_family == 9 and sparse_block_size != 64:
-        raise NotImplementedError(f"SM{arch} only provides a blk64 forward path")
     if arch_family == 9:
         if head_dim not in {64, 96, 128} or value_dim not in {64, 96, 128}:
             raise NotImplementedError("SM90 forward supports QK and V dimensions 64, 96, or 128")
-        if seqlen_q % 64:
+        if sparse_block_size == 64 and seqlen_q % 64:
             raise NotImplementedError("SM90 forward requires seqlen_q to be a multiple of 64")
     elif arch_family == 12:
         if head_dim != 128 or value_dim != 128:
@@ -322,26 +320,31 @@ def block_sparse_attention_fp8_forward(
     q2k_block_nums: Optional[torch.Tensor] = None,
     *,
     softmax_scale: Optional[float] = None,
+    sparse_block_size: int = 64,
 ) -> TupleDict:
-    """Quantize BF16 inputs internally and run forward-only Sage FP8 blk64 BSA."""
+    """Run Sage FP8 BSA; SM120 additionally supports native sparse_block_size=128."""
     batch, heads, seqlen_q, seqlen_k = _validate_sage_inputs(q_tensor, k_tensor, v_tensor)
     arch = _device_arch(q_tensor)
     arch_family = arch // 10
     if arch_family not in {10, 11, 12}:
         raise RuntimeError(f"Sage FP8 block sparse attention requires SM100-SM120, found SM{arch}")
+    if sparse_block_size not in (64, 128):
+        raise ValueError("Sage FP8 sparse_block_size must be 64 or 128")
+    if sparse_block_size == 128 and arch_family != 12:
+        raise NotImplementedError("Sage FP8 native blk128 requires SM120")
     if arch_family in {10, 11}:
         if seqlen_q % 64 or seqlen_k % 64:
             raise NotImplementedError("SM100/SM110 Sage FP8 requires Sq and Sk to be multiples of 64")
         if q2k_block_nums is not None or block_sizes is not None:
             raise NotImplementedError("q2k_block_nums and block_sizes are supported by Sage FP8 only on SM120")
 
-    expected_prefix = (batch, heads, (seqlen_q + 63) // 64)
+    expected_prefix = (batch, heads, (seqlen_q + sparse_block_size - 1) // sparse_block_size)
     _validate_sparse_metadata(
         q2k_block_index,
         q2k_block_nums,
         block_sizes,
         expected_prefix=expected_prefix,
-        num_kv_blocks=(seqlen_k + 63) // 64,
+        num_kv_blocks=(seqlen_k + sparse_block_size - 1) // sparse_block_size,
         device=q_tensor.device,
         allowed_block_size_ranks=(1, 2, 3) if arch_family == 12 else (1,),
     )
@@ -357,7 +360,8 @@ def block_sparse_attention_fp8_forward(
     with torch.cuda.device(q_tensor.device):
         from . import _interface
 
-        out = _interface.bsa_fp8_blk64_fwd(
+        forward = _interface.bsa_fp8_blk128_fwd if sparse_block_size == 128 else _interface.bsa_fp8_blk64_fwd
+        out = forward(
             q_tensor,
             k_tensor,
             v_tensor,
@@ -412,13 +416,13 @@ def block_sparse_attention_backward(
         sparse_block_size = 64 if arch_family == 9 else 128
     if sparse_block_size not in {64, 128}:
         raise ValueError("sparse_block_size must be 64 or 128")
-    if arch_family == 9 and sparse_block_size != 64:
-        raise NotImplementedError("SM90 backward only provides a blk64 path")
+    if arch_family == 9 and head_dim != 128:
+        raise NotImplementedError("SM90 backward requires head_dim=128")
     if sparse_block_size == 64 and head_dim != 128:
         raise NotImplementedError("blk64 backward requires head_dim=128")
     if sparse_block_size == 128 and head_dim not in {64, 128}:
         raise NotImplementedError("SM100/SM110 blk128 backward requires head_dim=64 or 128")
-    if sparse_block_size == 128 and block_sizes is not None:
+    if arch_family != 9 and sparse_block_size == 128 and block_sizes is not None:
         raise NotImplementedError("SM100/SM110 blk128 backward does not yet support block_sizes; " "use full physical KV blocks and pass block_sizes=None")
 
     expected_prefix = (
@@ -441,7 +445,7 @@ def block_sparse_attention_backward(
         _validate_fixed_block_count(
             block_sparse_num,
             q2k_block_index.shape[-1],
-            require_even=sparse_block_size == 128,
+            require_even=arch_family != 9 and sparse_block_size == 128,
         )
 
     expected_lse_shape = (batch, num_q_heads, seqlen_q)

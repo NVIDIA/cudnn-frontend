@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
 from functools import partial
 from typing import Callable, Optional, Tuple, Type, Union
 
@@ -13,6 +14,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Float32, Boolean
+from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator, TmemAllocator
 
 from . import blackwell_helpers as hstu_sm100_utils
 from .block_info import BWDBlockInfo
@@ -279,24 +281,24 @@ class HSTUAttentionBackwardSm100:
         dV = make_kv_like_tensor(dV)
         dO = make_q_like_tensor(dO)
 
-        self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
-        self.dQ_major_mode = utils.LayoutEnum.from_tensor(dQ).mma_major_mode()
-        self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
-        self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
-        self.V_major_mode = utils.LayoutEnum.from_tensor(V).mma_major_mode()
-        self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
+        self.Q_major_mode = LayoutEnum.from_tensor(Q).mma_major_mode()
+        self.dQ_major_mode = LayoutEnum.from_tensor(dQ).mma_major_mode()
+        self.K_major_mode = LayoutEnum.from_tensor(K).mma_major_mode()
+        self.dK_major_mode = LayoutEnum.from_tensor(dK).mma_major_mode()
+        self.V_major_mode = LayoutEnum.from_tensor(V).mma_major_mode()
+        self.dV_major_mode = LayoutEnum.from_tensor(dV).mma_major_mode()
 
-        if cutlass.const_expr(self.Q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.Q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.dQ_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.dQ_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of dq is not supported")
-        if cutlass.const_expr(self.K_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.K_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.dK_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.dK_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of dk is not supported")
-        if cutlass.const_expr(self.V_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.V_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
-        if cutlass.const_expr(self.dV_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.dV_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of dv is not supported")
 
         self._setup_attributes()
@@ -306,8 +308,9 @@ class HSTUAttentionBackwardSm100:
         # compute S
         tiled_mma_S = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.mma_tiler_kq[:2],
@@ -315,8 +318,9 @@ class HSTUAttentionBackwardSm100:
         # compute dP
         tiled_mma_dP = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
             self.acc_dtype,
             cta_group,
             self.mma_tiler_vdo[:2],
@@ -324,8 +328,9 @@ class HSTUAttentionBackwardSm100:
         # compute dV
         tiled_mma_dV = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.mma_tiler_pdo[:2],
@@ -334,8 +339,9 @@ class HSTUAttentionBackwardSm100:
         # compute dK
         tiled_mma_dK = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.element_dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.mma_tiler_dsq[:2],
@@ -344,8 +350,9 @@ class HSTUAttentionBackwardSm100:
         # compute dQ
         tiled_mma_dQ = sm100_utils.make_trivial_tiled_mma(
             self.element_dtype,
-            tcgen05.OperandMajorMode.MN,
-            tcgen05.OperandMajorMode.MN,
+            self.element_dtype,
+            OperandMajorMode.MN,
+            OperandMajorMode.MN,
             self.acc_dtype,
             cta_group,
             self.mma_tiler_dsk[:2],
@@ -426,7 +433,7 @@ class HSTUAttentionBackwardSm100:
 
         dQ_smem_layout_atom = sm100_utils.make_smem_layout_atom(
             sm100_utils.get_smem_layout_atom_ab(
-                tcgen05.OperandMajorMode.K,
+                OperandMajorMode.K,
                 self.acc_dtype,
                 (self.tile_m, 32),
             ),
@@ -457,13 +464,13 @@ class HSTUAttentionBackwardSm100:
         )
         dK_smem_layout_epi = sm100_utils.make_smem_layout_epi(
             self.element_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             self.dKV_epi_tile,
             self.num_compute_warps // 4,
         )
         dV_smem_layout_epi = sm100_utils.make_smem_layout_epi(
             self.element_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            LayoutEnum.ROW_MAJOR,
             self.dKV_epi_tile,
             self.num_compute_warps // 4,
         )
@@ -933,7 +940,7 @@ class HSTUAttentionBackwardSm100:
                 cpasync.prefetch_descriptor(tma_atom_dK)
                 cpasync.prefetch_descriptor(tma_atom_dV)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr.ptr
         dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr.ptr
@@ -945,7 +952,7 @@ class HSTUAttentionBackwardSm100:
             cute.make_layout(self.cluster_shape_mn),
             (tiled_mma_S.thr_id.shape,),
         )
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -1154,7 +1161,7 @@ class HSTUAttentionBackwardSm100:
         )
 
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
+            cute.arch.setmaxregister_decrease(self.num_regs_load)
             self.load_persistent(
                 K_in,
                 V_in,
@@ -1197,7 +1204,7 @@ class HSTUAttentionBackwardSm100:
                 TileSchedulerCls,
             )
         elif warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
+            cute.arch.setmaxregister_increase(self.num_regs_compute)
             tmem.wait_for_alloc()
             self.compute_persistent(
                 tSTtST,
@@ -1243,9 +1250,9 @@ class HSTUAttentionBackwardSm100:
             self.tmem_alloc_barrier.arrive()
         elif warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             if cutlass.const_expr(self.num_regs_reduce < 128):
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_reduce)
+                cute.arch.setmaxregister_decrease(self.num_regs_reduce)
             else:
-                cute.arch.warpgroup_reg_alloc(self.num_regs_reduce)
+                cute.arch.setmaxregister_increase(self.num_regs_reduce)
             tmem.wait_for_alloc()
             self.reduce_persistent(
                 thr_mma_dQ,
@@ -1266,7 +1273,7 @@ class HSTUAttentionBackwardSm100:
             )
             self.tmem_alloc_barrier.arrive()
         elif warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
+            cute.arch.setmaxregister_decrease(self.num_regs_mma)
             tmem.allocate(self.tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1318,7 +1325,7 @@ class HSTUAttentionBackwardSm100:
             self.tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
         elif warp_idx == self.relay_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_mma)
+            cute.arch.setmaxregister_decrease(self.num_regs_mma)
             if cutlass.const_expr(self.use_2cta_instrs):
                 self.relay_persistent(
                     dS_cluster_full_mbar_ptr,
@@ -1332,7 +1339,7 @@ class HSTUAttentionBackwardSm100:
                     TileSchedulerCls,
                 )
         else:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            cute.arch.setmaxregister_decrease(self.num_regs_empty)
             # Keep the fourth producer warp alive for the persistent schedule.
             self.empty_warp(TileSchedulerCls)
 
@@ -3634,7 +3641,7 @@ class HSTUAttentionBackwardSm100:
         tRS_sdS_xchg = None
         if cutlass.const_expr(self.use_2cta_instrs):
             copy_atom_r2s = sm100_utils.get_smem_store_op(
-                utils.LayoutEnum.ROW_MAJOR,
+                LayoutEnum.ROW_MAJOR,
                 self.element_dtype,
                 self.acc_dtype,
                 tiled_t2r,
@@ -3645,7 +3652,7 @@ class HSTUAttentionBackwardSm100:
             ).get_slice(dp_idx)
             sdS_epi_layout = sm100_utils.make_smem_layout_epi(
                 self.element_dtype,
-                utils.LayoutEnum.ROW_MAJOR,
+                LayoutEnum.ROW_MAJOR,
                 (self.tile_n, self.tile_m),
                 1,
             )

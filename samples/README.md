@@ -24,6 +24,7 @@ Samples leveraging FE's Python interface are located in [samples/python](python/
 Standalone scripts for the FROST (CuTeDSL) engines, pure cuDNN frontend Python API, each checked against a torch or fp64 reference:
 * [frost/gemm](frost/gemm/): matmul across dtypes, fused epilogues, mainloop fusion, mixed input types, dual-GEMM SwiGLU, MoE grouped matmul.
 * [frost/linear_attention](frost/linear_attention/): GDN, KDA, GDN-2 and GDP prefill and backward, plus the per-span summary nodes (forward and backward) used for context parallelism.
+* [frost/gated_attention_block](frost/gated_attention_block/): the gated attention block's training forward (`save_for_backward=True`) -- the caller-owned `SavedForBackward` record and the zero-copy `saved_slab_views` of its projection slab, checked against torch (Rubin only).
 
 ```
 python samples/frost/linear_attention/01_gdn_prefill.py

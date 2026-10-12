@@ -72,12 +72,56 @@ def test_classic_path_without_candidates(no_candidates):
 
 
 def test_mixed_graph_still_lowers(frost_candidate):
-    """A node the GEMM validator does not cover (pointwise epilogue) keeps the
+    """A node the GEMM validator does not cover (reshape) keeps the
     classic eager lowering even with a candidate: the rule is every-node-covered."""
     g, c = _matmul_graph()
-    g.relu(input=c).set_output(True)
+    g.reshape(input=c).set_dim([2, 32, 96]).set_stride([3072, 96, 1]).set_output(True)
     g.validate()
     assert g._lowered_graph is not None
+
+
+@pytest.mark.parametrize("candidate", ["frost_candidate", "no_candidates"])
+@pytest.mark.parametrize("dequant", [False, True])
+@pytest.mark.parametrize("epilogue", ["pointwise", "quantize", "reduction"])
+def test_gemm_fusions_validation(candidate, dequant, epilogue, request):
+    """GEMM fusions use Python validation whenever a candidate exists."""
+    request.getfixturevalue(candidate)
+    if dequant:
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        a = g.tensor(dim=[1, 64, 128], stride=[8192, 128, 1], data_type=cudnn.data_type.FP4_E2M1)
+        sf = g.tensor(dim=[1, 64, 8], stride=[512, 8, 1], data_type=cudnn.data_type.FP8_E4M3)
+        b = g.tensor(dim=[1, 128, 48], stride=[6144, 48, 1])
+        a = g.block_scale_dequantize(input=a, descale=sf, block_size=[1, 16])
+        c = g.matmul(A=a, B=b)
+    else:
+        g, c = _matmul_graph()
+    y = g.relu(input=c)
+    if epilogue == "quantize":
+        q, sf = g.block_scale_quantize(input=y, block_size=16)
+        q.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
+        sf.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    elif epilogue == "reduction":
+        g.reduction(input=y, mode=cudnn.reduction_mode.ADD).set_dim([1 if dequant else 2, 64, 1]).set_stride([64, 1, 1]).set_output(True)
+    else:
+        y.set_output(True)
+    g.validate()
+    assert (g._lowered_graph is None) == (candidate == "frost_candidate")
+
+
+@pytest.mark.parametrize("op, attribute, message", [("quantize", "block_size", "Block size not set"), ("reduction", "mode", "Reduction mode not set")])
+def test_fusion_required_attributes(frost_candidate, op, attribute, message):
+    """Skipping C++ validation still checks required operation attributes."""
+    g, c = _matmul_graph(c_dim=(2, 64, 48))
+    if op == "quantize":
+        q, sf = g.block_scale_quantize(input=c, block_size=16)
+        q.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
+        sf.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    else:
+        g.reduction(input=c, mode=cudnn.reduction_mode.ADD).set_dim([2, 64, 1]).set_stride([64, 1, 1]).set_output(True)
+    del g._nodes[-1].params[attribute]
+    with pytest.raises(ValueError, match=message):
+        g.validate()
+    assert g._lowered_graph is None and g._is_validated is False
 
 
 @pytest.mark.parametrize("candidate", ["frost_candidate", "no_candidates"])

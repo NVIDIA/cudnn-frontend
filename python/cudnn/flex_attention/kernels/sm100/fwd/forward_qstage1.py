@@ -12,6 +12,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import Boolean, Float32, Int32, const_expr
 
+from cudnn.flex_attention.kernels.common.max_logit import init_max_logit, store_max_logit, update_max_logit
 from cudnn.flex_attention.kernels.sm100 import blackwell_helpers as sm100_utils
 from cudnn.flex_attention.kernels.sm100 import mma_desc as sm100_desc
 from cudnn.flex_attention.kernels.sm100.fwd.forward_config import (
@@ -158,8 +159,10 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
         tOtO: cute.Tensor,
         sScale: cute.Tensor,
         mO: cute.Tensor,
-        mLSE: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        mMaxLogit: Optional[cute.Tensor],
         sO: cute.Tensor,
+        sMaxLogit: Optional[cute.Tensor],
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_o_acc: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
@@ -168,6 +171,7 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
         pipeline_load_epi: Optional[pipeline.PipelineAsync],
         gmem_tiled_copy_O: cute.TiledCopy,
         softmax_scale_log2: Float32,
+        softmax_scale: Float32,
         SeqlenInfoCls: Callable,
         blocksparse_tensors: BlockSparseTensors,
         tile_scheduler=None,
@@ -188,6 +192,12 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            if const_expr(mMaxLogit is not None):
+                init_max_logit(sMaxLogit, tidx)
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                    number_of_threads=len(self.correction_warp_ids) * cute.arch.WARP_SIZE,
+                )
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
             gO = None
             if const_expr(self.use_tma_O or not self.pack_gqa):
@@ -336,6 +346,32 @@ class FlexAttentionForwardQStage1Sm100(_FlexAttentionForwardSm100Base):
                     tidx,
                     seqlen.seqlen_q,
                     m_tile_idx,
+                )
+
+            if const_expr(mMaxLogit is not None):
+                m_tile_idx = m_block * self.cta_group_size + mma_tile_coord_v
+                row = m_tile_idx * self.m_block_size + tidx
+                seqlen_q = seqlen.seqlen_q * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+                update_max_logit(
+                    sMaxLogit,
+                    row_max_combined,
+                    row < seqlen_q and (not combined_invalid or softmax_scale == Float32(0.0)),
+                    row % self.qhead_per_kvhead if const_expr(self.pack_gqa) else Int32(0),
+                    softmax_scale,
+                )
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                    number_of_threads=len(self.correction_warp_ids) * cute.arch.WARP_SIZE,
+                )
+                store_max_logit(
+                    sMaxLogit,
+                    mMaxLogit,
+                    tidx,
+                    head_idx * self.qhead_per_kvhead if const_expr(self.pack_gqa) else head_idx,
+                )
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwdSm100.Epilogue),
+                    number_of_threads=len(self.correction_warp_ids) * cute.arch.WARP_SIZE,
                 )
 
             if const_expr(mLSE is not None):

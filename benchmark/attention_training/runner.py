@@ -151,6 +151,11 @@ class BenchmarkRunner:
                 if data_type in ("fp8", "mxfp8"):
                     if backend not in ("cudnn", "cudnn_oss"):
                         continue
+                # Block-scaled O modes (fp8 or mxfp8 inputs, FP4 / MXFP8 O + sf_o): a
+                # forward-only inference epilogue of the FROST OSS fp8 / mxfp8 kernels.
+                if data_type in ("fp8_nvfp4", "fp8_mxfp8", "mxfp8_nvfp4", "mxfp8_mxfp8"):
+                    if backend != "cudnn_oss" or profile_pass != "fwd":
+                        continue
 
                 yield {
                     "config_name": config.name,

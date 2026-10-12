@@ -1,7 +1,12 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_bwd_postprocess_kernel.h
 # from Cutlass C++ to Cute-DSL.
+
+
 import math
 from typing import Callable, Optional, Type
 
@@ -13,7 +18,6 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass import Float32, const_expr
-from cutlass.utils import LayoutEnum
 
 from cudnn.flex_attention._compat import copy_utils
 from cudnn.flex_attention._compat import layout_utils
@@ -23,6 +27,7 @@ from cudnn.flex_attention.kernels.common import device_utils as utils
 from cudnn.flex_attention.runtime.dsl_utils import assume_tensor_aligned
 from cudnn.flex_attention.kernels.common.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator
 from cudnn.flex_attention._compat.cute_dsl_utils import ParamsBase
 from cudnn.flex_attention.kernels.common.tile_scheduler import (
     SingleTileScheduler,
@@ -71,8 +76,8 @@ class FlexAttentionBackwardPostprocess:
             tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                warpgroup.OperandMajorMode.K,  # These don't matter, we only care about the accum
-                warpgroup.OperandMajorMode.K,
+                OperandMajorMode.K,  # These don't matter, we only care about the accum
+                OperandMajorMode.K,
                 Float32,
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1]) + (1,),
                 tiler_mn=(tiler_mn_dQ if not self.dQ_swapAB else (64, tiler_mn_dQ[0])),
@@ -82,8 +87,9 @@ class FlexAttentionBackwardPostprocess:
             cta_group = tcgen05.CtaGroup.ONE
             tiled_mma = sm100_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
-                tcgen05.OperandMajorMode.MN,  # dS_major_mode
-                tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+                self.dtype,
+                OperandMajorMode.MN,  # dS_major_mode
+                OperandMajorMode.MN,  # Kt_major_mode
                 Float32,
                 cta_group,
                 (self.tile_m, self.tile_hdim),
@@ -317,7 +323,7 @@ class FlexAttentionBackwardPostprocess:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
         if const_expr(self.arch == 90):

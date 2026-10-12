@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
+
 from typing import Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -13,6 +15,7 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator
 
 from cudnn.native_sparse_attention.compression import fmha_helpers as fmha_utils
 
@@ -330,10 +333,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.is_persistent,
         )
 
-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
-        self.o_layout = utils.LayoutEnum.from_tensor(o)
+        self.q_major_mode = LayoutEnum.from_tensor(q).mma_major_mode()
+        self.k_major_mode = LayoutEnum.from_tensor(k).mma_major_mode()
+        self.v_major_mode = LayoutEnum.from_tensor(v).mma_major_mode()
+        self.o_layout = LayoutEnum.from_tensor(o)
 
         if cutlass.const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
@@ -623,7 +626,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(

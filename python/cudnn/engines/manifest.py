@@ -97,9 +97,10 @@ class EngineFamily:
     # while a family still reads the graph inside its engines.
     analyzer: Optional[Tuple[str, str]] = None
     # ("module", "callable") ranking (engine_id, knobs) for this family, given
-    # its facts and the backend's entries. The family is the smallest scope that
-    # can rank -- an engine cannot see its siblings. None falls back to one
-    # default plan per accepting engine, ahead of the backend's.
+    # its facts and offered ids; a BACKEND marker in the list says where the
+    # backend's own block goes (engines/heuristics). The family is the smallest
+    # scope that can rank -- an engine cannot see its siblings. None falls back
+    # to one default plan per accepting engine, ahead of the backend's.
     heuristics: Optional[Tuple[str, str]] = None
     # ("module", "callable") validating a graph of this family natively in
     # python -- ``validate_graph(graph) -> bool`` runs the family's version- and
@@ -108,6 +109,13 @@ class EngineFamily:
     # pygraph.validate() takes the classic eager C++ lowering instead. None means
     # the family has no native validator and always validates classically.
     validator: Optional[Tuple[str, str]] = None
+    # ("module", "callable") naming ``backend_guard(graph, facts) -> Optional[str]``: a reason the cuDNN
+    # backend must NOT be consulted for this graph at planning (a backend whose heuristics take the
+    # process down on a contract a python engine serves). Planning records the reason as the backend's
+    # decline and ranks the family's own proposals alone; a graph nothing serves then fails with that
+    # reason instead of a dead process. None: the backend is always queried. Rare by contract: a
+    # documented backend defect on a measured domain, never placement policy.
+    backend_guard: Optional[Tuple[str, str]] = None
 
     @property
     def id_end(self) -> int:
@@ -139,6 +147,7 @@ _ANCHOR_NODE_TO_FAMILY = {
     "SDPA_FP8": "frost_sdpa_fwd",
     "SDPA_MXFP8": "frost_sdpa_fwd",
     "SDPA_BWD": "frost_sdpa_bwd",
+    "SDPA_FP8_BWD": "frost_sdpa_bwd",
     "SDPA_MXFP8_BWD": "frost_sdpa_bwd",
     "GDN": "gdn",
     "GDN_BWD": "gdn",
@@ -186,8 +195,13 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "kda_summary_frost": EngineSlot(2),
             "kda_cake": EngineSlot(3),
             "kda_hopper": EngineSlot(4),
+            "kda_hopper_cuda": EngineSlot(5),
         },
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+        # Ordering only, and only on Hopper: slot order is identity, not
+        # preference, so without this the slot-1 cuTile engine wins every sm90
+        # graph by default despite the two sm90 engines being faster there.
+        heuristics=("cudnn.linear_attention.kda_heuristics", "recommend"),
     ),
     EngineFamily(
         GDN2_ID_BASE,
@@ -230,19 +244,21 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         #   4 sm100_d128_fp8, 6 sm100_d192_d128, 9 sm100_d192_d128_fp8,
         #   10 sm100_d192_d128_mxfp8
         slots={
-            "sdpa_fwd_prefill_sm120": EngineSlot(5, opt_in=True),
+            "sdpa_fwd_prefill_sm120": EngineSlot(5),
             "sdpa_fwd_prefill_sm120_fp8": EngineSlot(7, opt_in=True),
             "sdpa_fwd_prefill_sm80": EngineSlot(8, opt_in=True),
-            "sdpa_fwd_prefill_sm100": EngineSlot(11, opt_in=True),
+            "sdpa_fwd_prefill_sm100": EngineSlot(11),
             "sdpa_fwd_prefill_sm100_mxfp8": EngineSlot(12, opt_in=True),
-            "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13, opt_in=True),
+            "sdpa_fwd_prefill_sm100_fp8": EngineSlot(13),
             "sdpa_fwd_prefill_sm107_fp8": EngineSlot(14, opt_in=True),
-            "sdpa_fwd_prefill_sm107": EngineSlot(15, opt_in=True),
-            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16, opt_in=True),
+            "sdpa_fwd_prefill_sm107": EngineSlot(15),
+            "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
+            "sdpa_fwd_prefill_sm90": EngineSlot(17),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
-        heuristics=("cudnn.sdpa.fwd.heuristics", "recommend"),
+        heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),
         validator=("cudnn._sdpa_validate", "validate_graph"),
+        backend_guard=("cudnn.sdpa.fwd.backend_guard", "backend_guard"),
     ),
     EngineFamily(
         FROST_SDPA_BWD_ID_BASE,
@@ -252,8 +268,13 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         slots={
             "sdpa_bwd_sm120": EngineSlot(0, opt_in=True),
             "sdpa_bwd_sm80": EngineSlot(1, opt_in=True),
-            "sdpa_bwd_sm100": EngineSlot(2, opt_in=True),
+            "sdpa_bwd_sm100": EngineSlot(2),
             "sdpa_bwd_sm100_mxfp8": EngineSlot(3, opt_in=True),
+            "sdpa_bwd_sm107": EngineSlot(4, opt_in=True),
+            "sdpa_bwd_sm107_fp8": EngineSlot(5, opt_in=True),
+            "sdpa_bwd_sm107_mxfp8": EngineSlot(6, opt_in=True),
+            "sdpa_bwd_sm100_d256": EngineSlot(7, opt_in=True),
+            "sdpa_bwd_sm107_d512": EngineSlot(8, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         # One entry per eligible row, WITH the tiles the lowering would pick
@@ -322,9 +343,10 @@ def _resolve(family: EngineFamily, ref: Optional[Tuple[str, str]], what: str):
 def resolve_heuristics(family: EngineFamily):
     """The family's proposal callable, or None when it declares none.
 
-    The contract is ``recommend(kind, facts, offered) -> [PlanConfig]`` — pure
-    and backend-blind; placement against the backend's entries happens once
-    for every family in ``engines/heuristics._assemble``.
+    The contract is ``recommend(kind, facts, offered) -> [PlanConfig]``; the
+    list may hold the ``BACKEND`` marker once to say where the backend's own
+    block goes (ours first when absent). Mode blocks, the delegating entry and
+    dedup happen once for every family in ``engines/heuristics._assemble``.
     """
     return _resolve(family, family.heuristics, "heuristics")
 
@@ -342,6 +364,12 @@ def resolve_validator(family: EngineFamily):
     """The family's python-native graph validator, or None (see EngineFamily.validator)."""
 
     return _resolve(family, family.validator, "validator")
+
+
+def resolve_backend_guard(family: EngineFamily):
+    """The family's backend-query guard, or None (see EngineFamily.backend_guard)."""
+
+    return _resolve(family, family.backend_guard, "backend_guard")
 
 
 def instantiate(family: EngineFamily, ids: Dict[str, int]):

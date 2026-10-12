@@ -1,4 +1,8 @@
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its BSD-3-Clause terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
+
 import math
 from typing import Callable, Optional, Type
 from functools import partial
@@ -9,9 +13,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
-from cutlass.utils import LayoutEnum
+from cudnn._cutlass_compat import FastDivmodDivisor, LayoutEnum, OperandMajorMode, SmemAllocator
 
 from cudnn.flex_attention._compat import copy_utils
 from cudnn.flex_attention._compat import layout_utils
@@ -204,8 +207,8 @@ class FlexAttentionBackwardSm90:
             sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
                 self.dtype,
-                warpgroup.OperandMajorMode.MN if not self.mma_dkv_is_rs else warpgroup.OperandMajorMode.K,
-                warpgroup.OperandMajorMode.MN,
+                OperandMajorMode.MN if not self.mma_dkv_is_rs else OperandMajorMode.K,
+                OperandMajorMode.MN,
                 Float32,
                 atom_layout_mnk=maybe_swap_mn(atom_layout_dKV, self.dKV_swapAB),
                 tiler_mn=(64, tiler_mn_d[1] if not self.dKV_swapAB else tiler_mn_d[0]),
@@ -220,8 +223,8 @@ class FlexAttentionBackwardSm90:
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
-            warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.MN,
+            OperandMajorMode.K,
+            OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=atom_layout_dQ,
             tiler_mn=(64, tiler_mn_dQ[1]),
@@ -557,7 +560,7 @@ class FlexAttentionBackwardSm90:
                 if const_expr(atom is not None):
                     cpasync.prefetch_descriptor(atom)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)

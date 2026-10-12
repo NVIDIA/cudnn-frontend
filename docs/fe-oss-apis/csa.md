@@ -413,7 +413,7 @@ committed scripts `benchmark/csa/gate_csa_compressor_r128.py` and
 ## Testing
 
 ```bash
-(cd test/python && pytest fe_api/csa/test_CSA_compressor.py)
+(cd test/python && pytest compressed_sparse_attention/cutedsl/test_CSA_compressor.py)
 ```
 
 The tests validate numerics against an fp32-intermediate eager reference (bitwise

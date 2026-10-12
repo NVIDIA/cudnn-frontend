@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu import OperandMajorMode
 import cutlass.utils as utils
@@ -33,6 +34,7 @@ from ..moe_persistent_scheduler import (
     MoESchedulerParams,
     MoEWorkTileInfo,
 )
+from ..canonical import kernel_facing_mx, kernel_facing_b, kernel_facing_prob
 from ..moe_utils import (
     compute_expert_token_range,
     MoEWeightMode,
@@ -191,7 +193,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -575,6 +577,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        scheduler_counter: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM.
 
@@ -583,16 +586,24 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         arrays of per-expert base addresses; ``n``, ``k``, ``b_stride_size``,
         ``b_major_mode`` describe the uniform per-expert layout.
         """
+        if cutlass.const_expr(scheduler_counter is not None):
+            workspace_ptr = scheduler_counter.iterator
+        a = kernel_facing_mx(a)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b)
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.d_layout = LayoutEnum.from_tensor(d)
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -755,7 +766,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         )
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or self.use_dynamic_sched)
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and scheduler_counter is None))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -1150,7 +1161,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -1210,7 +1221,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         )
         scheduler.internal_init()
 
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],

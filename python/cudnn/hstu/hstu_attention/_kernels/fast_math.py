@@ -1,5 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Modifications are licensed under Apache-2.0. Pre-existing code retains
+# its MIT terms; see LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 from typing import Callable, Optional
 
@@ -113,7 +116,7 @@ class FastSilU:
         mask_fn: Optional[Callable] = None,
         r2p_mask_fn: Optional[Callable] = None,
     ):
-        for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+        for i in cutlass.range(0, cute.size(acc_S), 2, unroll_full=True):
             v0, v1 = mul_packed_f32x2(
                 (acc_S[i], acc_S[i + 1]),
                 (self.score_scale_half, self.score_scale_half),
@@ -128,7 +131,7 @@ class FastSilU:
             acc_S[i] = out_v0
             acc_S[i + 1] = out_v1
         if const_expr(mask_fn is not None):
-            for i in cutlass.range_constexpr(cute.size(acc_S), unroll_full=True):
+            for i in cutlass.range(cute.size(acc_S), unroll_full=True):
                 acc_S[i] = acc_S[i] if preds[i] else acc_S.element_type(0)
         if const_expr(r2p_mask_fn is not None):
             for chunk in cutlass.range_constexpr(cute.size(r2p_masks), unroll_full=True):
@@ -148,7 +151,7 @@ class FastSilU:
         score_scale: Float32,
         mask_fn: Optional[Callable] = None,
     ):
-        for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+        for i in cutlass.range(0, cute.size(acc_S), 2, unroll_full=True):
             v0, v1 = mul_packed_f32x2((acc_S[i], acc_S[i + 1]), (score_scale, score_scale))
             tanh_in0, tanh_in1 = mul_packed_f32x2((v0, v1), (0.5, 0.5))
             tanh_v0 = tanhf(tanh_in0)
@@ -176,7 +179,7 @@ class FastSilU:
     ):
         """Compute FP32 SiLU derivative and quantized SiLU output."""
         if const_expr(r2p_mask is not None):
-            for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+            for i in cutlass.range(0, cute.size(acc_S), 2, unroll_full=True):
                 acc_S[i], acc_S[i + 1] = mul_packed_f32x2(
                     (acc_S[i], acc_S[i + 1]),
                     (self.score_scale_half, self.score_scale_half),
@@ -188,7 +191,7 @@ class FastSilU:
                 valid = cutlass.Boolean(r2p_mask & (Uint32(1) << i))
                 # tanh.approx(-128) saturates to -1, so both outputs become zero.
                 acc_S[i] = acc_S[i] if valid else acc_S.element_type(-128.0)
-        for i in cutlass.range_constexpr(0, cute.size(acc_S), 2):
+        for i in cutlass.range(0, cute.size(acc_S), 2, unroll_full=True):
             if const_expr(r2p_mask is not None):
                 half_x0, half_x1 = acc_S[i], acc_S[i + 1]
             else:

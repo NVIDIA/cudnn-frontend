@@ -272,7 +272,7 @@ def bench_grouped_gemm_glu_vs_cudnn(warmup: int, repeat: int):
     import sys
 
     _REPO = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(_REPO / "test/python/fe_api"))
+    sys.path.insert(0, str(_REPO / "test/python/core/cutedsl"))
     sys.path.insert(0, str(_REPO / "test/python"))
 
     print()

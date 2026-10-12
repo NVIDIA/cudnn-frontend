@@ -37,6 +37,7 @@ import atexit
 import itertools
 import inspect
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cudnn
@@ -57,8 +58,10 @@ except ImportError:
 __all__ = ["Graph", "data_type", "heur_mode", "cudnn"]
 
 # typedefs for readability
-CudnnHandle = int
-_default_cudnn_handle = None
+CudnnHandle = cudnn.Handle
+_default_handles = threading.local()
+_default_handle_registry: List[CudnnHandle] = []
+_default_handle_lock = threading.Lock()
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -179,22 +182,48 @@ def _tensor_like(cudnn_tensor: cudnn.tensor, tensor_type: str = "pyt") -> "torch
     return tensor
 
 
-def get_default_handle(stream: Optional["torch.cuda.Stream"] = None) -> CudnnHandle:
-    """Get the default cuDNN handle and set to torch's current stream"""
-    global _default_cudnn_handle
+def get_default_handle(stream: Optional[Union["torch.cuda.Stream", int]] = None) -> CudnnHandle:
+    """Get this thread's cuDNN handle for the stream's device (current device for a raw handle)."""
     if torch is None:
         raise RuntimeError("PyTorch is not available")
-    if _default_cudnn_handle is None:
-        _default_cudnn_handle = cudnn.create_handle()
     if stream is None:
-        stream = torch.cuda.current_stream().cuda_stream
-    cudnn.set_stream(handle=_default_cudnn_handle, stream=stream)
-    return _default_cudnn_handle
+        stream = torch.cuda.current_stream()
+    device = stream.device.index if isinstance(stream, torch.cuda.Stream) else torch.cuda.current_device()
+    raw_stream = stream.cuda_stream if isinstance(stream, torch.cuda.Stream) else int(stream)
+    by_device = getattr(_default_handles, "by_device", None)
+    if by_device is None:
+        by_device = _default_handles.by_device = {}
+    handle = by_device.get(device)
+    if handle is None or handle.backend_handle is None:
+        with torch.cuda.device(device):
+            handle = cudnn.create_handle()
+        by_device[device] = handle
+        # Retain worker-thread handles until explicit cleanup or interpreter exit;
+        # dropping a thread must not destroy CUDA resources during another capture.
+        with _default_handle_lock:
+            _default_handle_registry.append(handle)
+    cudnn.set_stream(handle=handle, stream=raw_stream)
+    return handle
 
 
 def destroy_default_handle():
-    if _default_cudnn_handle is not None:
-        cudnn.destroy_handle(_default_cudnn_handle)
+    """Release cached automatic handles; later calls recreate them on demand."""
+    with _default_handle_lock:
+        handles, _default_handle_registry[:] = list(_default_handle_registry), []
+    failed = []
+    first_error = None
+    for handle in handles:
+        try:
+            with torch.cuda.device(handle.device.ordinal):
+                cudnn.destroy_handle(handle)
+        except Exception as error:
+            failed.append(handle)
+            if first_error is None:
+                first_error = error
+    if failed:
+        with _default_handle_lock:
+            _default_handle_registry.extend(failed)
+        raise first_error
 
 
 atexit.register(destroy_default_handle)
@@ -220,6 +249,11 @@ class Graph:
     """
 
     __handle: Optional[CudnnHandle] = None  # holding the cudnn handle pointer
+    # None: allocate one on __exit__. False: the caller owns it (workspace_alloc=False),
+    # and execute() demands a workspace= kwarg. A class attribute, not a hasattr()
+    # probe: "__workspace" inside hasattr is a plain string, so it is NOT name-mangled
+    # and never matched the _Graph__workspace the assignments below produce.
+    __workspace: Any = None
 
     def __init__(
         self,
@@ -305,7 +339,7 @@ class Graph:
         self.__graph.check_support()
         self.__graph.build_plans()
         # Set up workspace if not forbidden by user, then set up I/O tensor orders
-        if not hasattr(self, "__workspace"):
+        if self.__workspace is None:
             self.__workspace = torch.empty(
                 self.__graph.get_workspace_size(),
                 device="cuda",

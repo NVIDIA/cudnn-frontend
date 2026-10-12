@@ -16,15 +16,6 @@ def _require_gnn_agg_simple() -> None:
         pytest.skip("cudnn-frontend was built without cudnnGnnAggSimple support")
 
 
-@pytest.fixture
-def graph_data(request):
-    index_dtype = request.param
-    offsets = torch.tensor([0, 2, 4, 6], device="cuda", dtype=index_dtype)
-    indices = torch.tensor([0, 1, 1, 2, 2, 3], device="cuda", dtype=index_dtype)
-    edge_map = torch.tensor([4, 0, 5, 1, 3, 2], device="cuda", dtype=index_dtype)
-    return CscGraph(offsets, indices, num_src_nodes=4, map_csc_to_coo=edge_map)
-
-
 def _reduce(values: torch.Tensor, aggr: str) -> torch.Tensor:
     if aggr == "sum":
         return values.sum(dim=0)
@@ -69,7 +60,6 @@ def _reference(
     return torch.empty((0, dtype_source.shape[1] + concat_dim), device=dtype_source.device, dtype=dtype_source.dtype)
 
 
-@pytest.mark.parametrize("graph_data", [torch.int32, torch.int64], indirect=True)
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -80,20 +70,20 @@ def _reference(
 )
 @pytest.mark.parametrize("aggr", ["sum", "mean", "max", "min"])
 @pytest.mark.parametrize("mode", ["node", "edge", "node_edge_concat"])
-def test_agg_simple_forward_backward(graph_data, dtype, aggr, mode):
+def test_agg_simple_forward_backward(small_csc_graph, dtype, aggr, mode):
     _require_gnn_agg_simple()
-    graph = graph_data
+    graph = small_csc_graph
     torch.manual_seed(1234)
 
     node_features = None
     edge_features = None
     concat_features = None
     if mode in ("node", "node_edge_concat"):
-        node_features = torch.randn((4, 5), device="cuda", dtype=dtype, requires_grad=True)
+        node_features = torch.randn((graph.num_src_nodes, 5), device="cuda", dtype=dtype, requires_grad=True)
     if mode in ("edge", "node_edge_concat"):
-        edge_features = torch.randn((6, 3), device="cuda", dtype=dtype, requires_grad=True)
+        edge_features = torch.randn((graph.num_edges, 3), device="cuda", dtype=dtype, requires_grad=True)
     if mode == "node_edge_concat":
-        concat_features = torch.randn((3, 2), device="cuda", dtype=dtype, requires_grad=True)
+        concat_features = torch.randn((graph.num_dst_nodes, 2), device="cuda", dtype=dtype, requires_grad=True)
 
     actual = agg_simple(
         graph,
@@ -121,6 +111,39 @@ def test_agg_simple_forward_backward(graph_data, dtype, aggr, mode):
     actual_inputs = [tensor for tensor in (node_features, edge_features, concat_features) if tensor is not None]
     for actual_input, reference_input in zip(actual_inputs, reference_inputs):
         torch.testing.assert_close(actual_input.grad, reference_input.grad, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.L2
+def test_agg_simple_medium_graph(medium_csc_graph):
+    _require_gnn_agg_simple()
+    torch.manual_seed(2345)
+    graph = medium_csc_graph
+    node_features = torch.randn((graph.num_src_nodes, 16), device="cuda", requires_grad=True)
+    edge_features = torch.randn((graph.num_edges, 8), device="cuda", requires_grad=True)
+    concat_features = torch.randn((graph.num_dst_nodes, 4), device="cuda", requires_grad=True)
+
+    actual = agg_simple(
+        graph,
+        node_features=node_features,
+        edge_features=edge_features,
+        concat_features=concat_features,
+        aggr="mean",
+    )
+    reference_node = node_features.detach().clone().requires_grad_()
+    reference_edge = edge_features.detach().clone().requires_grad_()
+    reference_concat = concat_features.detach().clone().requires_grad_()
+    expected = _reference(graph, reference_node, reference_edge, reference_concat, "mean")
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+    grad = torch.randn_like(actual)
+    actual.backward(grad)
+    expected.backward(grad)
+    for actual_input, reference_input in (
+        (node_features, reference_node),
+        (edge_features, reference_edge),
+        (concat_features, reference_concat),
+    ):
+        torch.testing.assert_close(actual_input.grad, reference_input.grad, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.L0

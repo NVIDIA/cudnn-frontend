@@ -20,6 +20,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes, get_num_tmem_alloc_cols
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -171,7 +172,7 @@ class MoEGroupedGemmBf16Kernel:
             num_threads=self.threads_per_warp,
         )
 
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = get_smem_capacity_in_bytes("sm_100")
         self.vectorized_f32 = vectorized_f32
         self.generate_c = generate_c
         self.enable_bias = enable_bias
@@ -273,7 +274,7 @@ class MoEGroupedGemmBf16Kernel:
 
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
-        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.num_tmem_alloc_cols = get_num_tmem_alloc_cols(tCtAcc_fake)
         self.num_accumulator_tmem_cols = self.cta_tile_shape_mnk[1] * self.num_acc_stage
 
     # ------------------------------------------------------------------
@@ -454,13 +455,13 @@ class MoEGroupedGemmBf16Kernel:
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
-        self.d_layout = utils.LayoutEnum.from_tensor(d)
+        self.a_major_mode = LayoutEnum.from_tensor(a).mma_major_mode()
+        self.c_layout = LayoutEnum.from_tensor(c)
+        self.d_layout = LayoutEnum.from_tensor(d)
         self.bias_dtype = bias.element_type if cutlass.const_expr(self.enable_bias) else cutlass.BFloat16
 
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+            self.b_major_mode = LayoutEnum.from_tensor(b).mma_major_mode()
         else:
             self.b_major_mode = b_major_mode
 
@@ -757,7 +758,7 @@ class MoEGroupedGemmBf16Kernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
 
@@ -819,7 +820,7 @@ class MoEGroupedGemmBf16Kernel:
         )
         scheduler.internal_init()
 
-        tmem = utils.TmemAllocator(
+        tmem = TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],

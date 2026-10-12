@@ -20,6 +20,7 @@ from cutlass.cute.typing import Int32, Float32, Boolean
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cudnn._cutlass_compat import LayoutEnum, OperandMajorMode, SmemAllocator, TmemAllocator
 
 from . import utils
 from .mask import AttentionMask
@@ -440,16 +441,16 @@ class HSTUAttentionForwardSm100:
         mPagedV = cute.make_tensor(mPagedKV.iterator, cute.select(mPagedKV.layout, mode=KV_layout_transpose)) if mPagedKV is not None else None
         mPagedV = cute.make_tensor(mPagedV.iterator, cute.select(mPagedV.layout, mode=V_layout_transpose)) if mPagedV is not None else None
 
-        self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
-        self.k_major_mode = cutlass.utils.LayoutEnum.from_tensor(mK).mma_major_mode()
-        self.v_major_mode = cutlass.utils.LayoutEnum.from_tensor(mV).mma_major_mode()
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.q_major_mode = LayoutEnum.from_tensor(mQ).mma_major_mode()
+        self.k_major_mode = LayoutEnum.from_tensor(mK).mma_major_mode()
+        self.v_major_mode = LayoutEnum.from_tensor(mV).mma_major_mode()
+        self.o_layout = LayoutEnum.from_tensor(mO)
 
-        if const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of mQ is not supported")
-        if const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if const_expr(self.k_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of mK is not supported")
-        if const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if const_expr(self.v_major_mode != OperandMajorMode.MN):
             raise RuntimeError("The layout of mV is not supported")
 
         # check type consistency
@@ -462,8 +463,9 @@ class HSTUAttentionForwardSm100:
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = OperandMajorMode.K
         tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
@@ -472,6 +474,7 @@ class HSTUAttentionForwardSm100:
             self.mma_tiler_qk[:2],
         )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -849,7 +852,7 @@ class HSTUAttentionForwardSm100:
                     cpasync.prefetch_descriptor(tma_atom)
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         mbar_ptr = storage.mbar_ptr.data_ptr()
@@ -919,7 +922,7 @@ class HSTUAttentionForwardSm100:
                 barrier_id=TMEM_RELEASE_BARRIER,
                 num_threads=cute.arch.WARP_SIZE * (1 + len(self.silu0_warp_ids) + len(self.silu1_warp_ids)),
             )
-            tmem = cutlass.utils.TmemAllocator(
+            tmem = TmemAllocator(
                 storage.tmem_holding_buf.ptr,
                 barrier_for_retrieve=tmem_alloc_barrier,
                 allocator_warp_id=self.mma_warp_id,
@@ -1157,7 +1160,7 @@ class HSTUAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(len(self.empty_warp_ids) > 0):
             if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
         if const_expr(self.use_clc_scheduler):
             if warp_idx == self.clc_scheduler_warp_id:
                 if const_expr(self.use_2cta_instrs):
@@ -1175,7 +1178,7 @@ class HSTUAttentionForwardSm100:
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             if const_expr(self.use_2cta_instrs):
                 self.load_2cta(
                     thr_mma_qk,
@@ -1237,7 +1240,7 @@ class HSTUAttentionForwardSm100:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             if const_expr(self.use_2cta_instrs):
                 tmem.allocate(self.tmem_alloc_cols)
                 tmem.wait_for_alloc()
@@ -1324,7 +1327,7 @@ class HSTUAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.silu0_warp_ids[0] and warp_idx <= self.silu1_warp_ids[-1]:
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_silu)
+            cute.arch.setmaxregister_increase(self.num_regs_silu)
             store_O = partial(
                 self.store_O,
                 gmem_tiled_copy_O=gmem_tiled_copy_O,

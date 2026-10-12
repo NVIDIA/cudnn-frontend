@@ -21,7 +21,7 @@ def frost_la_gate(engine: str, facts, op: str) -> None:
         raise NotImplementedError(f"{engine}: {facts.invalid}")
     sm = buffers.current_sm()
     if sm is None or not (100 <= sm <= 103 or sm == 107):
-        raise NotImplementedError(f"{engine} requires SM100-SM103 or SM107 (found {sm})")
+        raise NotImplementedError(f"{engine} requires SM100 / SM103 / SM107 (found {sm})")
     installed, version = buffers.cutedsl_state()
     if not installed:
         raise NotImplementedError(f"{engine} requires the cutedsl extra (nvidia-cutlass-dsl), which is not installed")
