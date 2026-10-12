@@ -280,7 +280,9 @@ def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
     "mutate, exc, word",
     [
         (lambda o: o.update(device_cc=(10, 0)), NotImplementedError, "Rubin-line"),
-        (lambda o: o.update(device_cc=(8, 0)), NotImplementedError, "Rubin-line"),
+        # cc 8.0 is refused one gate EARLIER: the gather4 part floor (tile_dsl.requirements, cc 10.0+) answers before the record's
+        # Rubin-line check does -- the typed decline names the instruction's floor, not the record
+        (lambda o: o.update(device_cc=(8, 0)), NotImplementedError, "requires a cc 10.0+ part"),
         (lambda o: o.update(top_k=501), NotImplementedError, "top_k"),
         (lambda o: o.update(top_k=516), NotImplementedError, "top_k"),
         (lambda o: o.update(block_size=8), NotImplementedError, "block_size"),
