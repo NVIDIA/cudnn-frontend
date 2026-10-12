@@ -2048,6 +2048,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 
 | Missing | Where |
 |---|---|
+| Gated attention block (frontend-only, no graph form): attention over the paged pools (the serving EXTEND form's prefix read over `block_table` / `kv_lens`, the DECODE form), e4m3 (`kv_cache_dtype`) pools, the write-through folded into the projection epilogue | SM107 -- the block's paged KV-cache WRITE-THROUGH is served (`paged_kv_page_size`: bf16 / f16, dense and packed, HND / NHD / unified-row pools at pages 16 / 32 / 64 / 128; the `Rubin d256 gated attention block -- serving forms` section below); `block_table` / `kv_lens` at `execute` are a typed decline until the paged read lands |
 | Backward pass entirely | SM90 |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs; on the d512 row THD, `dense_flex`, the dense padding mask, sink / dSink, bias / dBias, deterministic, decode | SM107 — the three d256 rows plus the d512 2x2-datapath row (`sdpa_bwd_sm107_d512`, opt_in, since 2026-10-01) are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ and ᵇ³) |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the three backward engines there serve exactly those bands (f16/bf16 d = 256 via the 2x2-datapath row ᵇ², opt_in, since 2026-10-01) |
@@ -2529,3 +2530,48 @@ padded Stats and fused gates remain outside this extension. Tests cover GQA/MHA,
 changed device lengths and sinks under graph replay, empty/keyless rows, runtime
 pointer validation, output tail canaries, and combine split counts on both sides
 of the warp reduction boundary. No timing or preferred split count is asserted.
+
+
+### Rubin d256 gated attention block -- serving forms (frontend-only, no graph form)
+
+The gated attention block (`cudnn.gated_attention_block`; `docs/fe-oss-apis/gated_attention_block.md`) has no engine row and no
+`sdpa` graph form: its serving forms are claims of the BLOCK, recorded here one row per form x pool layout x page size x dtype,
+each written in the same change as its accept cell (Rule S2). Rubin (cc 10.7) only. The pool contract is the SDPA adapter's own
+paged contract -- a 4-D view `[num_pages, H_kv, page_size, D]`, `D` contiguous, the other three strides free: **L1** HND compact
+`(H*P*D, P*D, D, 1)`; **L2** NHD by strides `(P*H*D, D, H*D, 1)`; **L3** a serving stack's unified `[num_pages, H_kv, P, 2D]`
+content row (K at `+0`, V at `+D`, token stride `2D`) bound as its two halves -- nothing is repacked; every non-innermost stride a
+whole number of 16-byte vectors (a typed `ValueError` otherwise), `page_size` a positive multiple of 16, `slot_mapping [T]` int32 or
+int64 (a negative slot writes nothing; a slot past the pool writes nothing either).
+
+**Served since 2026-10-12 -- the paged KV-cache WRITE-THROUGH** (`paged_kv_page_size > 0`, the block's `(4w)` stage: the post-RoPE
+K / V of every token into the caller's pools at `execute(k_cache=, v_cache=, slot_mapping=)`, after norm + RoPE and before the SDPA,
+which still attends over the block's own K / V; `out` bitwise the block's without it; `get_workspace_size()` unchanged; `quant`
+and `save_for_backward` with it are typed declines; a CuTe DSL below the floor is declined at `check_support`, named with the
+installed version). Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim) at the 8 / 2 d256
+geometry, T = 512 (dense B = 2 x S = 256; packed sequences 300 / 0 / 128 / 84 -- a zero-length sequence in the packing), the
+default in-place pipeline, every 9th token padded (`-1`) on NaN-poisoned pools, int32 slots at pages 16 / 64 and int64 at 32 / 128:
+the live pool rows BITWISE the slab's post-RoPE K / V bands attention consumed and within the dense suite's bars of the
+per-sequence oracle (V at the band bar rtol 2^-7 / atol 1e-3; K at rtol 2^-7 / atol 8e-3), padded tokens unwritten, every
+unwritten slot still NaN (`test/python/gated_attention_block/cutedsl/test_block_serving_extend.py`):
+
+| form | pool layout | page 16 | page 32 | page 64 | page 128 |
+|---|---|---|---|---|---|
+| dense `[B, S, d_model]` write-through | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| dense | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| dense | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| packed `thd=True` write-through (`B = 1, S = T` inside) | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| packed | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| packed | L3 unified content row | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+
+Also validated (bf16, L3 at page 16): the other inference pipelines -- `fuse_norm_rope` (the fork-written slab; the pool's K
+within one bf16 ulp of the fp32-accumulator oracle rounded once), out-of-place Q / K / V (`inplace_qkv=False`: the compact buffers
+are the operands and the pool rows), `fuse_gate` (dense only) -- dense and, for the first two, packed; a second execute with
+another slot mapping on the same compiled block re-places every row; two launches bitwise on the pools and on `out`. The indexer
+band's raw-key pool (`index_k_raw`, `QsaSpec(index_band=True)`) is written by the same stage, bitwise `index_k_raw_view`, through
+the block's stage objects (the sparse attention core is a typed decline on this tree, so the block itself declines after the
+write-through stage accepted the geometry).
+
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the paged-READ
+inputs `block_table` / `kv_lens` at `execute` (attention over the pools: the serving EXTEND form's prefix read and the DECODE
+form), e4m3 pools (`kv_cache_dtype`), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together
+with the attribute.

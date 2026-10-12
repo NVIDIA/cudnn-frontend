@@ -501,6 +501,15 @@ QSA_TOP_K_ALIGN = 4
 # never a literal) the moment the core lands; until then the declaration-time decline below carries the same number.
 _N_MAX_SPARSE_V1 = 16
 
+# A DECLARATION ATTRIBUTE of the serving surface sits beside QsaSpec, on ``GatedAttentionBlockFwd`` itself, as a compile-key
+# field that never enters a knob dataclass or an autotuner: ``paged_kv_page_size`` changes the INPUT CONTRACT -- the post-RoPE
+# K / V are written through into paged pools at a slot mapping, so ``execute`` takes pools and a slot mapping it otherwise
+# refuses.  (A cache dtype other than the activation dtype would be a NUMERICS change -- fp8 rounding of the cached K / V -- so
+# it too arrives as an attribute, never a knob.)
+PAGED_KV_PAGE_ALIGN = 16
+"""``paged_kv_page_size`` must be a positive multiple of this: the serving stacks allocate pages in multiples of 16 tokens,
+and 4 | 16 keeps every 4-token sparse block inside one page (a block never straddles a page boundary)."""
+
 
 @dataclass(frozen=True)
 class QsaSpec:
@@ -4231,6 +4240,135 @@ class _BandCopy(_ElementwiseStage):
 # ---------------------------------------------------------------------------
 
 
+class _CacheWrite(_Stage):
+    """(4w) SERVING write-through: the post-norm, post-RoPE K and the V of every token into PAGED pools
+    ``[num_pages, H_kv, page_size, D]`` at ``slot_mapping [T]`` (flat slot = page x page_size + offset), and the RAW
+    indexer key (``index_k_raw``: the fifth band's key head, pre-norm, un-rotated) into its own
+    ``[num_pages, page_size, index_head_dim]`` pool when the geometry declares the band.
+
+    Built only under ``paged_kv_page_size > 0`` -- a declaration ATTRIBUTE (it changes the input contract), never a knob.
+    ONE launch for K and V (``kernels/cache_write.py`` writes two operands per launch), a second for the indexer key.
+    Runs AFTER norm + RoPE and reads the very operands stage (4) consumes -- the slab's K / V column bands in place, or
+    the compact buffers of the out-of-place layout -- so a pool row is bitwise the row attention saw.  The pools are
+    the activation dtype (bf16 / f16); the e4m3 pools of a quantized cache arrive with the cache-dtype attribute and
+    its cast kernel.  Needs no workspace: the pools and the slot mapping are the caller's.  Token-addressed: under
+    ``thd=True`` (the block is ``B = 1, S = T`` inside) it is the same launch over the same ``[T, H_kv, D]`` views, so
+    the packed form needs no arm of its own -- a pad token's slot is the caller's ``-1``.
+
+    The pool contract is the SDPA adapter's own paged contract: a 4-D view ``[num_pages, H_kv, page_size, D]`` with ``D``
+    contiguous and the other three strides FREE -- HND compact ``(H x P x D, P x D, D, 1)``, NHD by strides
+    ``(P x H x D, D, H x D, 1)``, or a serving stack's unified ``[num_pages, H_kv, P, 2D]`` content row with K at ``+0``
+    and V at ``+D`` (token stride ``2D``; the two halves bound as the two pool views) -- nothing is repacked, and every
+    non-innermost stride has to be a whole number of 16-byte vectors (a typed ``ValueError`` otherwise).
+
+    The row the kernel addresses is a copy, so the two pre-development tables of a FROST kernel are empty here (no SMEM,
+    no mbarrier).  A negative slot is the serving stacks' padding convention and writes nothing; a slot past the pool's
+    capacity writes nothing either (the kernel range-checks on device; slot VALUES are never read on the host).
+    """
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, page_size: int) -> None:
+        self.name = "cache_write"
+        self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
+        self.dtype = dtype
+        self.page_size = int(page_size)
+        self.index_band = bool(geometry.index_band)
+        self._recipes = None  # {slot dtype: (K / V recipe, indexer recipe or None)}
+
+    def check_support(self) -> None:
+        # Rule 7: a too-old CuTe DSL reads as a VERSION decline here, before the kernel module (which imports the DSL) is loaded.
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        too_old = cutedsl_requirement_error("the gated attention block's paged KV-cache write-through")
+        if too_old is not None:
+            raise NotImplementedError(too_old)
+        from .kernels.cache_write import validate_cache_write_shape
+
+        if self.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(f"{self.name}: bf16 / f16 pools only (the activation dtype), got {self.dtype}")
+        validate_cache_write_shape(self.geom.d_head, self.page_size, _ELEMENTWISE_THREADS)
+        if self.index_band:
+            validate_cache_write_shape(self.geom.qsa.index_head_dim, self.page_size, _ELEMENTWISE_THREADS)
+
+    def compile(self) -> None:
+        """Both slot dtypes are compiled (int32 and int64 are the two the serving stacks hand over; the dtype is a
+        compile key), so ``execute`` dispatches on a guaranteed cache hit (Rule 4) whichever one arrives."""
+        from .kernels.cache_write import compile_cache_write
+
+        g = self.geom
+        self._recipes = {}
+        for slot_dtype in (torch.int32, torch.int64):
+            kv = compile_cache_write(
+                dtype=self.dtype,
+                h=g.h_kv,
+                d=g.d_head,
+                page_size=self.page_size,
+                slot_dtype=slot_dtype,
+                two_operands=True,
+                threads_per_cta=_ELEMENTWISE_THREADS,
+                rows_per_group=_ELEMENTWISE_ROWS_PER_GROUP,
+                const_head_count=_ELEMENTWISE_CONST_HEAD_COUNT,
+            )
+            idx = (
+                compile_cache_write(
+                    dtype=self.dtype,
+                    h=g.qsa.index_kv_heads,
+                    d=g.qsa.index_head_dim,
+                    page_size=self.page_size,
+                    slot_dtype=slot_dtype,
+                    two_operands=False,
+                    threads_per_cta=_ELEMENTWISE_THREADS,
+                    rows_per_group=_ELEMENTWISE_ROWS_PER_GROUP,
+                    const_head_count=_ELEMENTWISE_CONST_HEAD_COUNT,
+                )
+                if self.index_band
+                else None
+            )
+            self._recipes[slot_dtype] = (kv, idx)
+
+    def moved_bytes(self, slot_dtype=torch.int32) -> int:
+        """HBM traffic of the K / V launch (+ the indexer launch when the band is declared) -- the denominator for the SOL number."""
+        from .kernels.cache_write import moved_bytes
+
+        g = self.geom
+        t, es, sb = self.batch * self.seq_len, _itemsize(self.dtype), _itemsize(slot_dtype)
+        total = moved_bytes(t, g.h_kv, g.d_head, elem_bytes=es, n_ops=2, slot_bytes=sb)
+        if self.index_band:
+            total += moved_bytes(t, g.qsa.index_kv_heads, g.qsa.index_head_dim, elem_bytes=es, n_ops=1, slot_bytes=sb)
+        return total
+
+    def execute(
+        self,
+        k_src: torch.Tensor,
+        v_src: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        index_src: Optional[torch.Tensor] = None,
+        index_cache: Optional[torch.Tensor] = None,
+        current_stream=None,
+    ) -> None:
+        """``k_src`` / ``v_src`` are the ``[T, H_kv, D]`` operands stage (4) reads (any token stride); ``k_cache`` /
+        ``v_cache`` the ``[num_pages, H_kv, page_size, D]`` pools; ``slot_mapping`` ``[T]`` int32 / int64; ``index_src``
+        the ``[T, index_kv_heads, index_head_dim]`` raw-key slice and ``index_cache`` its ``[num_pages, page_size, index_head_dim]``
+        pool -- both given iff the band is declared."""
+        from .kernels.cache_write import run_cache_write
+
+        if self._recipes is None:
+            raise RuntimeError("call compile() before execute()")
+        if (index_src is None) != (index_cache is None) or (index_cache is not None) != self.index_band:
+            raise ValueError(f"{self.name}: index_src / index_cache are given together, and exactly when the geometry declares the indexer band")
+        if slot_mapping.dtype not in self._recipes:
+            raise ValueError(f"{self.name}: slot_mapping must be int32 or int64, got {slot_mapping.dtype}")
+        kv, idx = self._recipes[slot_mapping.dtype]
+        stream = current_stream if current_stream is not None else torch.cuda.current_stream(k_src.device).cuda_stream
+        run_cache_write(kv, k_src, v_src, k_cache, v_cache, slot_mapping, stream=stream)
+        if idx is not None:
+            # The 3-D indexer pool as the kernel's 4-D [P, 1, page_size, D] view (one raw key head; its head stride is never scaled).
+            run_cache_write(idx, index_src, None, index_cache.unsqueeze(1), None, slot_mapping, stream=stream)
+
+
 class GatedAttentionBlockFwd(APIBase):
     """Gated attention block, forward. One call, one workspace, three to five launches.
 
@@ -4251,6 +4389,13 @@ class GatedAttentionBlockFwd(APIBase):
 
     Both fusions are inference-only: each overwrites a tensor the backward needs
     (``q_pre``/``k_pre``, pre-gate ``O``) and is declined with ``save_for_backward``.
+
+    **Serving write-through (``paged_kv_page_size > 0``; bf16 / f16 inference, dense or packed)** adds ONE launch
+    between (2+3) and (4) -- ``(4w) cache write: PROJ[K], PROJ[V] -> k_cache / v_cache at slot_mapping`` (and the raw
+    indexer key into ``index_k_raw`` when the geometry declares the band) -- and changes nothing stage (4) reads, so
+    ``out`` is bitwise the block's without it.  A declaration ATTRIBUTE: ``execute`` then REQUIRES the pools and the
+    slot mapping and refuses them otherwise.  The stage addresses TOKENS, so under ``thd=True`` (the block is
+    ``B = 1, S = T`` inside) it is the same launch over the same ``[T, H_kv, D]`` views; a pad token's slot is ``-1``.
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -4375,10 +4520,14 @@ class GatedAttentionBlockFwd(APIBase):
         num_sequences: Optional[int] = None,  # B, REQUIRED under thd: the length tensor has B entries ([B] lengths) or B+1 ([B+1] prefix sums)
         max_seq_len: Optional[int] = None,  # S_max, REQUIRED under thd: the longest sequence the plan admits (the SDPA's envelope)
         cu_seqlens: bool = False,  # the FORM of execute(seq_lens=): False = [B] int32 lengths, True = [B+1] int32 prefix sums
+        # APPENDED (serving): write the post-RoPE K / V (and the raw indexer key, when the band is declared) THROUGH into paged
+        # pools at execute(slot_mapping=).  A declaration ATTRIBUTE (it changes the input contract: execute then REQUIRES
+        # k_cache / v_cache / slot_mapping and refuses them otherwise), never a knob.  0 = off.  Positive: a multiple of 16.
+        paged_kv_page_size: int = 0,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
-        ``save_for_backward``, the THD envelope -- normalise the samples, record the knobs and build the stage list in pipeline
-        order (declared, not compiled: ``check_support`` / ``compile`` follow)."""
+        ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
+        build the stage list in pipeline order (declared, not compiled: ``check_support`` / ``compile`` follow)."""
         super().__init__()
         self._warn_experimental_api()
         self.geom = geometry
@@ -4595,6 +4744,9 @@ class GatedAttentionBlockFwd(APIBase):
         self.qsa: Optional[QsaSpec] = geometry.qsa
         if self.qsa is not None:
             self._check_qsa_declaration(quant)
+        # PAGED-CACHE WRITE-THROUGH (serving): the attribute's own rows (type, the multiple-of-16 contract) and the
+        # pipelines the stage has no arm for, typed and naming the feature -- device-free, so a test pins every row anywhere.
+        self.paged_kv_page_size = self._check_cache_write_declaration(paged_kv_page_size, quant)
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -4746,6 +4898,11 @@ class GatedAttentionBlockFwd(APIBase):
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
         self._gate = None if self.fuse_gate else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
+        # (4w) SERVING write-through of the post-RoPE K / V (+ the raw indexer key) into paged pools -- built only when
+        # the declaration carries a page size; not built rather than built and skipped (it would still compile).
+        self._cache_write = (
+            _CacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size) if self.paged_kv_page_size else None
+        )
         # (3g) TRAINING, gate-copy save mode only: ONE strided copy of the slab's
         # GATE band into the compact caller `saved.gate` (the elementwise kernel's
         # has_gate=False arm at h_q heads; the same artifact serves an optional
@@ -4805,6 +4962,7 @@ class GatedAttentionBlockFwd(APIBase):
                 self._quant_kv,
                 self._quant_k,
                 self._quant_v,
+                self._cache_write,
                 self._sdpa,
                 self._gate,
                 self._quant_o if quant_o_distinct else None,
@@ -4895,6 +5053,100 @@ class GatedAttentionBlockFwd(APIBase):
         )
         if block_lens is not None:
             _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
+
+    # -- paged-cache write-through (serving) ---------------------------------
+
+    def _check_cache_write_declaration(self, page_size, quant) -> int:
+        """``paged_kv_page_size`` at declaration: an ``int >= 0`` (``ValueError`` otherwise), a positive one a multiple of
+        :data:`PAGED_KV_PAGE_ALIGN` (the serving stacks' page granularity; it also keeps every 4-token sparse block inside
+        one page); then the pipelines the write-through stage has no arm for, typed, naming the feature.  Returns the
+        normalised page size (0 = off).  Device-free.  The packed form (``thd=True``) is SERVED: the stage addresses tokens,
+        so a packed block runs the same launch over its ``[T, H_kv, D]`` views."""
+        if isinstance(page_size, bool) or not isinstance(page_size, int):
+            raise TypeError(f"paged_kv_page_size must be an int (0 = no write-through; else the pools' tokens per page), got {type(page_size).__name__}")
+        if page_size < 0:
+            raise ValueError(f"paged_kv_page_size must be >= 0 (0 = no write-through), got {page_size}")
+        if page_size == 0:
+            return 0
+        if page_size % PAGED_KV_PAGE_ALIGN:
+            raise ValueError(
+                f"paged_kv_page_size must be a positive multiple of {PAGED_KV_PAGE_ALIGN} (the serving stacks' page granularity; a 4-token "
+                f"sparse block then never straddles a page), got {page_size}"
+            )
+        if self.qsa is not None and page_size % self.qsa.block_size:
+            raise ValueError(
+                f"paged_kv_page_size={page_size} must be a multiple of QsaSpec.block_size={self.qsa.block_size}: a selectable block is gathered "
+                "as one unit and may not straddle two pages"
+            )
+        if quant is not None:
+            raise NotImplementedError(
+                f"paged_kv_page_size with quant={type(quant).__name__}: the write-through pools are bf16 / f16 (the activation dtype of the "
+                "post-RoPE K / V); a quantized cache (e4m3 pools) arrives with the cache-dtype attribute and its cast kernel -- declare "
+                "paged_kv_page_size on the bf16 / f16 pipeline"
+            )
+        if self.save_for_backward:
+            raise NotImplementedError(
+                "paged_kv_page_size with save_for_backward=True: the paged-cache write-through is a serving (inference) feature; a training "
+                "forward keeps its K / V in the SavedForBackward record, not in a paged pool"
+            )
+        return page_size
+
+    def _check_cache_write_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw) -> None:
+        """The serving inputs against the declaration -- FORM only (dtype / rank / shape / strides / alignment / device),
+        never a value and never a sync (Rule 3).  A block declared with ``paged_kv_page_size`` REQUIRES ``k_cache`` /
+        ``v_cache`` / ``slot_mapping`` (and ``index_k_raw`` iff its geometry declares the indexer band); a block declared
+        without it REFUSES every one of them rather than ignoring a pool it would never write (the ``h_sf`` pattern).
+        ``block_table`` / ``kv_lens`` are the paged-READ mode's inputs: refused on an undeclared block, a typed
+        ``NotImplementedError`` on a declared one until that mode lands."""
+        from .kernels.cache_write import check_pool, check_slot_mapping
+
+        given = [nm for nm, x in (("k_cache", k_cache), ("v_cache", v_cache), ("slot_mapping", slot_mapping), ("index_k_raw", index_k_raw)) if x is not None]
+        read_mode = [nm for nm, x in (("block_table", block_table), ("kv_lens", kv_lens)) if x is not None]
+        if not self.paged_kv_page_size:
+            if given or read_mode:
+                raise ValueError(
+                    f"{', '.join(given + read_mode)}: the paged KV-cache inputs belong to a block declared with paged_kv_page_size > 0 (the "
+                    "write-through of the post-RoPE K / V into paged pools); this block was declared without it (paged_kv_page_size=0) and "
+                    "would never write them -- refused rather than silently ignored"
+                )
+            return
+        if read_mode:
+            raise NotImplementedError(
+                f"{', '.join(read_mode)}: the paged-READ mode (attention over the pools: decode and prefix reads) is a follow-up; this block "
+                "writes the pools through at slot_mapping and attends over its own K / V"
+            )
+        g, ps = self.geom, self.paged_kv_page_size
+        for nm, x in (("k_cache", k_cache), ("v_cache", v_cache), ("slot_mapping", slot_mapping)):
+            if x is None:
+                raise ValueError(
+                    f"paged_kv_page_size={ps} needs {nm} at execute: k_cache / v_cache [num_pages, {g.h_kv}, {ps}, {g.d_head}] {self.act_dtype} pools "
+                    f"(HND compact, NHD by strides, or the two halves of a unified [num_pages, {g.h_kv}, {ps}, {2 * g.d_head}] content row) and "
+                    f"slot_mapping [{self.batch * self.seq_len}] int32 / int64 (one flat slot per token, page * page_size + offset; a negative "
+                    "slot writes nothing)"
+                )
+        t = self.batch * self.seq_len
+        check_pool(k_cache, "k_cache", h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=h.device)
+        check_pool(v_cache, "v_cache", h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=h.device)
+        check_slot_mapping(slot_mapping, "slot_mapping", t=t, device=h.device)
+        if g.index_band:
+            if index_k_raw is None:
+                raise ValueError(
+                    f"paged_kv_page_size={ps} with the indexer band needs index_k_raw at execute: the raw indexer key's pool "
+                    f"[num_pages, {ps}, {g.qsa.index_head_dim}] {self.act_dtype} (D contiguous; written at the same slot_mapping)"
+                )
+            if not isinstance(index_k_raw, torch.Tensor) or index_k_raw.dim() != 3:
+                raise ValueError(
+                    f"index_k_raw must be a 3-D [num_pages, {ps}, {g.qsa.index_head_dim}] tensor (one raw key head per token), got "
+                    f"{tuple(index_k_raw.shape) if isinstance(index_k_raw, torch.Tensor) else type(index_k_raw).__name__}"
+                )
+            check_pool(
+                index_k_raw.unsqueeze(1), "index_k_raw", h=g.qsa.index_kv_heads, page_size=ps, d=g.qsa.index_head_dim, dtype=self.act_dtype, device=h.device
+            )
+        elif index_k_raw is not None:
+            raise ValueError(
+                "index_k_raw is the raw indexer key's pool of a geometry that declares the indexer band (QsaSpec.index_band=True); this block's "
+                "geometry has no band, so there is no raw key to write -- refused rather than silently ignored"
+            )
 
     def index_k_raw(self, workspace: torch.Tensor) -> torch.Tensor:
         """The RAW indexer key the last ``execute`` left in ``workspace``, as a ``[B, S, index_kv_heads, index_head_dim]``
@@ -5462,6 +5714,17 @@ class GatedAttentionBlockFwd(APIBase):
         # on a dense block.  Checked for FORM only (dtype / rank / shape / contiguity / device), never read on the host (Rule 3).
         block_ids: Optional[torch.Tensor] = None,  # [T, top_k] int32 (or [B, S, top_k]): the ids of each query's selected complete blocks, valid prefix then -1
         block_lens: Optional[torch.Tensor] = None,  # [T] int32 (or [B, S]), optional: the valid-prefix length per query (lowering-only; clamped on device)
+        # APPENDED (serving, paged_kv_page_size > 0): the paged KV cache.  k_cache / v_cache / slot_mapping REQUIRED there (index_k_raw
+        # too iff the geometry declares the indexer band), every one of them REFUSED on a block declared without the attribute.
+        # Checked for FORM only (dtype / rank / shape / strides / alignment / device), never read on the host (Rule 3).
+        k_cache: Optional[
+            torch.Tensor
+        ] = None,  # [num_pages, H_kv, page_size, D] activation dtype (HND compact, NHD by strides, or a unified-row half): post-RoPE K lands here
+        v_cache: Optional[torch.Tensor] = None,  # same shape: V lands here
+        block_table: Optional[torch.Tensor] = None,  # (B, max_pages) int32 -- the paged-READ mode's page table: a typed decline until that mode lands
+        kv_lens: Optional[torch.Tensor] = None,  # [B] int32 -- the paged-READ mode's logical KV lengths: a typed decline until that mode lands
+        slot_mapping: Optional[torch.Tensor] = None,  # [T] int32 / int64: the flat slot (page * page_size + offset) of every token; negative = no write
+        index_k_raw: Optional[torch.Tensor] = None,  # [num_pages, page_size, index_head_dim] activation dtype: the raw indexer key's pool (index band only)
     ) -> None:
         """Launch the five stages in pipeline order.
 
@@ -5497,10 +5760,27 @@ class GatedAttentionBlockFwd(APIBase):
         are device data the sparse core reads (block ``b`` = tokens ``[4b, 4b + 4)``
         of the query's own sequence, ``-1`` = padding; the open tail block is
         always visible).
+
+        ``k_cache`` / ``v_cache`` / ``slot_mapping`` (appended): REQUIRED under
+        ``paged_kv_page_size > 0`` -- after norm + RoPE the block writes every
+        token's post-RoPE K and V row into the pools at ``slot_mapping[token]``
+        (flat slot = ``page * page_size + offset``; a negative slot writes nothing,
+        the serving stacks' padding convention; a slot past the pool writes
+        nothing either), then attends over its own K / V as before, so ``out`` is
+        bitwise the block's without write-through.  Dense and packed (``thd=True``:
+        ``slot_mapping`` is ``[T]`` over the packed tokens) alike.  ``index_k_raw``
+        (appended): the raw indexer key's pool, REQUIRED there iff the geometry
+        declares the indexer band.  ``block_table`` / ``kv_lens`` (appended): the
+        paged-READ mode's inputs -- a typed ``NotImplementedError`` until that mode
+        lands.  Every one of the six is REFUSED on a block declared without the
+        attribute.  Form checks only; slot VALUES are device data the kernel
+        range-checks.
         """
         # Block-sparse attention: the index tensors are a DECLARATION-vs-argument contract and need no plan, so they are
         # checked first and the refusal reads the same on every device (Rule 3: form only, never a value, never a sync).
         self._check_qsa_execute_args(block_ids, block_lens, h)
+        # The paged-cache inputs: the same kind of contract (declared with paged_kv_page_size -> required; without -> refused).
+        self._check_cache_write_args(h, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw)
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
@@ -5724,6 +6004,24 @@ class GatedAttentionBlockFwd(APIBase):
         else:
             # (3b) -- exists only to hand the SDPA a compact V.
             self._compact_v.execute(v_src, v_c, current_stream=stream)
+        if self._cache_write is not None:
+            # (4w) SERVING write-through: the VERY operands stage (4) is about to read -- the post-RoPE K and the V (the
+            # slab bands in place, or the compact buffers out of place) -- into the paged pools at slot_mapping, so a
+            # pool row is bitwise the row attention consumes; the raw indexer key (the fifth band's key head, pre-norm,
+            # un-rotated: what a serving indexer cache keeps) into its own pool when the band is declared.  Nothing the
+            # SDPA reads is touched, so `out` is bitwise the block's without write-through.  Only the bf16 / f16
+            # pipelines reach here (the quantized ones declined at declaration); their k_c / v_c are 16-bit views -- the
+            # packed block's too (B = 1, S = T: the same [T, H_kv, D] views at the slab's token stride).
+            self._cache_write.execute(
+                k_c,
+                v_c,
+                k_cache,
+                v_cache,
+                slot_mapping,
+                index_src=_cols(proj, g.index_k_raw_offset, g.qsa.index_kv_heads, g.qsa.index_head_dim) if g.index_band else None,
+                index_cache=index_k_raw if g.index_band else None,
+                current_stream=stream,
+            )
         # (4) [+ (5) under fuse_gate: the SDPA gates the SUBSTITUTED O inside
         # its epilogue, after the dead-row select, and writes O_gated.]
         self._sdpa.execute(

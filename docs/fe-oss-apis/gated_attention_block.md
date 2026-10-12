@@ -264,18 +264,21 @@ blk = GatedAttentionBlockFwd(
     num_sequences=None,          # THD only, REQUIRED there: B, the number of sequences in the packing
     max_seq_len=None,            # THD only, REQUIRED there: S_max, the longest sequence the plan admits
     cu_seqlens=False,            # THD only: execute(seq_lens=) is [B+1] int32 prefix sums instead of [B] int32 lengths
+    paged_kv_page_size=0,        # serving: write the post-RoPE K / V through into paged pools at execute(slot_mapping=) -- see "Serving: write-through"
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
             seq_lens=None,       # dense: the [B] int32 KV lengths iff seq_lens_present; THD: REQUIRED, the [B] lengths / [B+1] prefix sums
             lse=None, saved=None, current_stream=None, h_sf=None, w_qkvg_sf=None,
-            w_o_sf=None)         # required iff MxQuantSpec.o_fp4, refused otherwise
+            w_o_sf=None,         # required iff MxQuantSpec.o_fp4, refused otherwise
+            k_cache=None, v_cache=None, slot_mapping=None)   # REQUIRED iff paged_kv_page_size > 0, refused otherwise -- "Serving: write-through"
 ```
 
-Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, and the four packing knobs `thd` / `num_sequences` /
-`max_seq_len` / `cu_seqlens`) sits at the end with a default, so positional callers of the bf16, FP8 and MXFP8 pipelines are
-unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together (a typed `ValueError` names the missing half), and
-`num_sequences` / `max_seq_len` / `cu_seqlens` are refused without `thd=True`.
+Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, the four packing knobs `thd` / `num_sequences` /
+`max_seq_len` / `cu_seqlens`, the serving attribute `paged_kv_page_size` and its execute inputs) sits at the end with a default,
+so positional callers of the bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given
+together (a typed `ValueError` names the missing half), and `num_sequences` / `max_seq_len` / `cu_seqlens` are refused without
+`thd=True`.
 
 #### Training forward (`save_for_backward=True`)
 
@@ -486,7 +489,9 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   D-planes adjacent inside a tile, the slot sized at the capacity `H * ((T + 127 * B) // 128) * 1024` bytes (the only
   carve difference to the dense `B=1, S=T` block; slack tiles and pad bytes `0x00`), each tile's sequence resolved on
   device from the lengths tensor (no cap on `B`; at `B = 1` the packed block is bitwise the dense one on its outputs, record and e4m3 payload, and V's scale-factor slot holds the dense atoms in plane-adjacent order); `fuse_norm_rope`
-  (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined,
+  (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables); the paged
+  KV-cache write-through (`paged_kv_page_size`: `slot_mapping` is `[T]` over the packed tokens, a pad token's slot `-1` --
+  "Serving: write-through into a paged KV cache" below). Declined,
   typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor; stage (5) runs as its own launch), the fully
   fused quantized pipelines (`fuse_gate` again, and the fused MXFP8 projection fork decodes `(b, s_tile)` once per
   128-row GEMM tile, which a packed tile may straddle), the MXFP8 block BACKWARD over a packed record (its SDPA-layout MX
@@ -494,6 +499,32 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   backward is a follow-up).
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
+
+### Serving: write-through into a paged KV cache (`paged_kv_page_size`)
+
+A serving stack keeps every token's post-norm, post-RoPE K and its V in a paged cache. `GatedAttentionBlockFwd(...,
+paged_kv_page_size=P)` (appended; `0` = off, the default) declares that write-through: after norm + RoPE the block writes
+each token's K and V row into the caller's pools at `execute(slot_mapping=)` -- ONE extra launch (two with the indexer band's
+raw-key pool) -- and then attends over its own K / V exactly as before, so `out` is bitwise the block's without it and
+`get_workspace_size()` does not change. It is a declaration ATTRIBUTE (it changes the input contract), never a knob. Dense
+`[B, S, d_model]` and packed (`thd=True`) blocks alike: the stage addresses tokens, so the packed block (`B = 1, S = T` inside)
+runs the same launch over the same `[T, H_kv, D]` views.
+
+| input (appended to `execute`) | shape / dtype | contract |
+|---|---|---|
+| `k_cache`, `v_cache` | `[num_pages, H_kv, P, D]` views in the activation dtype (bf16 / f16), `D` contiguous, the other three strides FREE: HND compact `(H*P*D, P*D, D, 1)`; NHD storage by strides `(P*H*D, D, H*D, 1)`; or a stack's UNIFIED content row `[num_pages, H_kv, P, 2D]` with K at `+0` and V at `+D` (token stride `2D`) -- `kv_cache[..., :D]` and `kv_cache[..., D:]` are the two views. Every non-innermost stride a whole number of 16-byte vectors and a 16-byte-aligned base (a typed `ValueError` otherwise: each row is written in 16-byte vectors) | REQUIRED under `paged_kv_page_size > 0`; post-RoPE K lands in `k_cache`, V in `v_cache`; nothing is repacked |
+| `slot_mapping` | `[T]` int32 or int64, contiguous; the flat slot `page * P + offset` of every token (`T = B*S`, or the packed token count) | REQUIRED; a NEGATIVE slot (a padded token) writes nothing; a slot past the pool's capacity writes nothing either -- never a write past the pool; slot VALUES are device data, never read on the host |
+| `index_k_raw` | `[num_pages, P, index_head_dim]` activation dtype, `D` contiguous: the raw indexer key's pool, written at the same slots | REQUIRED iff the geometry declares the indexer band (`QsaSpec.index_band`), refused otherwise |
+| `block_table`, `kv_lens` | the paged-READ mode's page table and logical lengths | a typed `NotImplementedError` until attention over the pools lands |
+
+`P` is a positive multiple of 16 (the serving stacks' page granularity; a 4-token sparse block then never straddles a page);
+a block declared without the attribute REFUSES every one of these inputs (`ValueError`) rather than ignoring a pool it would
+never write. Served on the bf16 / f16 inference pipelines (`inplace_qkv` on or off, `fuse_norm_rope` on or off, `fuse_gate`
+on or off, dense or packed); validated on Rubin at pages 16 / 32 / 64 / 128 on all three pool layouts, dense and packed, bf16
+and f16 (the live pool rows bitwise the K / V rows attention consumed; padded tokens unwritten). `quant` (the pools of a
+quantized cache arrive with a cache-dtype attribute and its cast kernel) and `save_for_backward` with `paged_kv_page_size` are
+typed `NotImplementedError`s naming the feature; a CuTe DSL below FROST's floor is declined at `check_support`, named with
+the installed version, before the kernel module is imported.
 
 ### Backward
 
@@ -853,6 +884,11 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   `fuse_gate`, the fully fused quantized pipelines, the MXFP8 backward over a packed record, the packing knobs on a dense
   block.
 - `d_head = 256` (the Rubin d256 SDPA flavor with the fused gate); `d_model % 128 == 0` under MXFP8.
+- Paged KV-cache write-through (`paged_kv_page_size`, a positive multiple of 16): bf16 / f16 inference, dense `[B, S, d_model]`
+  and packed (`thd=True`); the pools are the activation dtype, `[num_pages, H_kv, P, D]` views with `D` contiguous and every other
+  stride a whole number of 16-byte vectors (HND compact, NHD by strides, or the two halves of a unified `[num_pages, H_kv, P, 2D]`
+  row); `quant` and `save_for_backward` together with it are typed declines; the paged-READ mode (`block_table` / `kv_lens`) is a
+  typed decline ("Serving: write-through into a paged KV cache" above).
 - FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above), the fp4
   modes of the MXFP8 pipeline included; the fully fused quantized pipelines are inference only. The backward is bf16 / fp16
   -- and per-tensor fp8 / MXFP8 over the quantized training records (`quant=QuantSpec` / `quant=MxQuantSpec`, the record as
