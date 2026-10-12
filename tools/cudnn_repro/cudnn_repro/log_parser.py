@@ -8,7 +8,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 def read_lines(source: str) -> List[str]:
@@ -25,7 +25,7 @@ EXECUTE_GRAPH_PATTERN = re.compile(r"Executing gid (\d+)")
 TENSOR_DUMP_PATTERN = re.compile(r"Tensor Dump uid:\s*(-?\d+).*?Data:\s*(\[.*\])")
 
 
-def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
+def _parse_context_entry(line: str) -> Optional[Tuple[str, dict]]:
     stripped = line.strip()
     if '"context"' not in stripped:
         return None
@@ -36,7 +36,7 @@ def _parse_context_entry(line: str) -> Tuple[str, dict] | None:
     return stripped, payload
 
 
-def _parse_tensor_dump(line: str) -> Tuple[int, List[int]] | None:
+def _parse_tensor_dump(line: str) -> Optional[Tuple[int, List[int]]]:
     match = TENSOR_DUMP_PATTERN.search(line)
     if match is None:
         return None

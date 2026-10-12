@@ -5,131 +5,70 @@ navigation:
   - page: Quick Start
     path: ../../quickstart.mdx
     slug: quickstart
+    hidden: true
   - page: Samples
     path: ../../samples.mdx
     slug: samples
   - link: Release Notes
     href: https://github.com/NVIDIA/cudnn-frontend/releases
-  - section: Installation
-    slug: installation
-    contents:
-      - section: Installing cuDNN Backend
-        path: ../../installation/backend.mdx
-        slug: backend
-        contents:
-          - page: Prerequisites
-            path: ../../installation/prerequisites.mdx
-            slug: prerequisites
-          - page: Installing cuDNN Backend on Linux
-            path: ../../installation/linux.mdx
-            slug: linux
-          - page: Installing cuDNN Backend on Windows
-            path: ../../installation/windows.mdx
-            slug: windows
-      - section: Installing cuDNN Frontend
-        path: ../../installation/frontend.mdx
-        slug: frontend
-        contents:
-          - page: cuDNN Frontend Dependencies
-            path: ../../installation/frontend-dependencies.mdx
-            slug: frontend-dependencies
-          - page: Installing the cuDNN Python Frontend
-            path: ../../installation/python-frontend-install.mdx
-            slug: python-frontend-install
-          - page: Installing the cuDNN C++ Frontend
-            path: ../../installation/cpp-frontend-install.mdx
-            slug: cpp-frontend-install
-          - page: Next Steps
-            path: ../../installation/frontend-next-steps.mdx
-            slug: frontend-next-steps
-      - page: Building and Running a cuDNN Dependent Program
-        path: ../../installation/build-run-cudnn.mdx
-        slug: build-run-cudnn
-      - page: Cross-Compiling cuDNN Samples
-        path: ../../installation/cross-compiling.mdx
-        slug: cross-compiling
-  - section: Developer Guide
-    slug: developer
-    contents:
-      - page: Overview
-        path: ../../developer/overview.mdx
-        slug: overview
-      - page: Core Concepts
-        path: ../../developer/core-concepts.mdx
-        slug: core-concepts
-      - page: Graphs
-        path: ../../developer/graph-api.mdx
-        slug: graph-api
-      - page: Hardware Forward Compatibility
-        path: ../../developer/forward-compatibility.mdx
-        slug: forward-compatibility
-      - page: Odds and Ends
-        path: ../../developer/misc.mdx
-        slug: misc
-      - page: Debugging
-        path: ../../developer/debugging.mdx
-        slug: debugging
-  - section: Frontend API
+  - section: API Reference
     skip-slug: true
     contents:
-      - section: Operations
-        slug: operations
+      - page: Attention
+        path: ../../operations/Attention.md
+        slug: operations/Attention
+      - page: Block Scaling
+        path: ../../operations/BlockScaling.md
+        slug: operations/BlockScaling
+      - page: Causal Conv1d
+        path: ../../operations/CausalConv1d.md
+        slug: operations/CausalConv1d
+      - page: Concatenate
+        path: ../../operations/Concatenate.md
+        slug: operations/Concatenate
+      - page: Convolutions
+        path: ../../operations/Convolutions.md
+        slug: operations/Convolutions
+      - page: FFT Causal Conv1d
+        path: ../../operations/FFTCausalConv1d.md
+        slug: operations/FFTCausalConv1d
+      - page: Matmul
+        path: ../../operations/Matmul.md
+        slug: operations/Matmul
+      - page: MoE Grouped Matmul
+        path: ../../operations/MoeGroupedMatmul.md
+        slug: operations/MoeGroupedMatmul
+      - page: Normalizations
+        path: ../../operations/Normalizations.md
+        slug: operations/Normalizations
+      - page: Pointwise and Reduction
+        path: ../../operations/Pointwise.md
+        slug: operations/Pointwise
+      - page: Resampling
+        path: ../../operations/Resampling.md
+        slug: operations/Resampling
+      - page: Reshape
+        path: ../../operations/Reshape.md
+        slug: operations/Reshape
+      - page: RoPE (Rotary Position Embedding)
+        path: ../../operations/RoPE.md
+        slug: operations/RoPE
+      - page: Slice
+        path: ../../operations/Slice.md
+        slug: operations/Slice
+      - page: Transpose
+        path: ../../operations/Transpose.md
+        slug: operations/Transpose
+      - section: GNN
+        slug: operations/gnn
         contents:
-          - page: Attention
-            path: ../../operations/Attention.md
-            slug: Attention
-          - page: Block Scaling
-            path: ../../operations/BlockScaling.md
-            slug: BlockScaling
-          - page: Causal Conv1d
-            path: ../../operations/CausalConv1d.md
-            slug: CausalConv1d
-          - page: Concatenate
-            path: ../../operations/Concatenate.md
-            slug: Concatenate
-          - page: Convolutions
-            path: ../../operations/Convolutions.md
-            slug: Convolutions
-          - page: FFT Causal Conv1d
-            path: ../../operations/FFTCausalConv1d.md
-            slug: FFTCausalConv1d
-          - page: Matmul
-            path: ../../operations/Matmul.md
-            slug: Matmul
-          - page: MoE Grouped Matmul
-            path: ../../operations/MoeGroupedMatmul.md
-            slug: MoeGroupedMatmul
-          - page: Normalizations
-            path: ../../operations/Normalizations.md
-            slug: Normalizations
-          - page: Pointwise and Reduction
-            path: ../../operations/Pointwise.md
-            slug: Pointwise
-          - page: Resampling
-            path: ../../operations/Resampling.md
-            slug: Resampling
-          - page: Reshape
-            path: ../../operations/Reshape.md
-            slug: Reshape
-          - page: RoPE (Rotary Position Embedding)
-            path: ../../operations/RoPE.md
-            slug: RoPE
-          - page: Slice
-            path: ../../operations/Slice.md
-            slug: Slice
-          - page: Transpose
-            path: ../../operations/Transpose.md
-            slug: Transpose
-          - section: GNN
-            slug: gnn
-            contents:
-              - page: GNN simple aggregation
-                path: ../../operations/gnn/agg_simple.md
-                slug: agg_simple
-              - page: GAT and GATv2 attention
-                path: ../../operations/gnn/mha_gat.md
-                slug: mha_gat
-      - section: Utilities
+          - page: GNN simple aggregation
+            path: ../../operations/gnn/agg_simple.md
+            slug: agg_simple
+          - page: GAT and GATv2 attention
+            path: ../../operations/gnn/mha_gat.md
+            slug: mha_gat
+      - section: For Agents
         slug: utilities
         contents:
           - page: Compile-time constant tensors
@@ -162,7 +101,8 @@ navigation:
           - page: Composing multi-kernel blocks in Python
             path: ../../utilities/composing_kernel_blocks.md
             slug: composing_kernel_blocks
-      - section: Frontend OSS APIs
+      - section: Experimental APIs
+        collapsed: true
         slug: fe-oss-apis
         contents:
           - page: FE-OSS APIs Overview
@@ -297,6 +237,65 @@ navigation:
               - page: HSTU LayerNorm-Multiply-SiLU-Dropout (LMSD)
                 path: ../../fe-oss-apis/hstu/hstu_lmsd.md
                 slug: hstu_lmsd
+  - section: Developer Guide
+    slug: developer
+    contents:
+      - page: Overview
+        path: ../../developer/overview.mdx
+        slug: overview
+      - page: Core Concepts
+        path: ../../developer/core-concepts.mdx
+        slug: core-concepts
+      - page: Graphs
+        path: ../../developer/graph-api.mdx
+        slug: graph-api
+      - page: Hardware Forward Compatibility
+        path: ../../developer/forward-compatibility.mdx
+        slug: forward-compatibility
+      - page: Odds and Ends
+        path: ../../developer/misc.mdx
+        slug: misc
+      - page: Debugging
+        path: ../../developer/debugging.mdx
+        slug: debugging
+  - section: Installation
+    slug: installation
+    contents:
+      - section: Installing cuDNN Backend
+        path: ../../installation/backend.mdx
+        slug: backend
+        contents:
+          - page: Prerequisites
+            path: ../../installation/prerequisites.mdx
+            slug: prerequisites
+          - page: Installing cuDNN Backend on Linux
+            path: ../../installation/linux.mdx
+            slug: linux
+          - page: Installing cuDNN Backend on Windows
+            path: ../../installation/windows.mdx
+            slug: windows
+      - section: Installing cuDNN Frontend
+        path: ../../installation/frontend.mdx
+        slug: frontend
+        contents:
+          - page: cuDNN Frontend Dependencies
+            path: ../../installation/frontend-dependencies.mdx
+            slug: frontend-dependencies
+          - page: Installing the cuDNN Python Frontend
+            path: ../../installation/python-frontend-install.mdx
+            slug: python-frontend-install
+          - page: Installing the cuDNN C++ Frontend
+            path: ../../installation/cpp-frontend-install.mdx
+            slug: cpp-frontend-install
+          - page: Next Steps
+            path: ../../installation/frontend-next-steps.mdx
+            slug: frontend-next-steps
+      - page: Building and Running a cuDNN Dependent Program
+        path: ../../installation/build-run-cudnn.mdx
+        slug: build-run-cudnn
+      - page: Cross-Compiling cuDNN Samples
+        path: ../../installation/cross-compiling.mdx
+        slug: cross-compiling
   - section: Reference
     slug: reference
     contents:
