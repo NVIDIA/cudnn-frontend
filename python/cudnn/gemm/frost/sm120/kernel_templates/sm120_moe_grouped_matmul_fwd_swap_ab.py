@@ -1084,6 +1084,15 @@ def _host(
         block=(threads_per_cta, 1, 1),
         use_pdl=USE_PDL,
         stream=stream,
+        # .minnctapersm 1. With .reqntid alone ptxas cannot tell the register
+        # count at entry, so it drops every setmaxnreg above (C7508): the compute
+        # warps never get EPI_REG_COUNT, and ptxas may also size every warp for
+        # several CTAs per SM (the dual MoE kernels fell to 40 registers). The
+        # SMEM ring is sized to the per-CTA budget, so one CTA per SM is all that
+        # fits anyway -- except the two smallest catalog tiles (32x64 / 64x32 at
+        # a 32-byte K, whose ring caps at 16 stages), which now run one per SM
+        # instead of two.
+        min_blocks_per_mp=1,
     )
 
 

@@ -1369,8 +1369,13 @@ def _render_block_scale_tile_constants(
     _check_own_family(tmpl)
     from ..tile_config import _SM120_STG_STAGE_ELEMS, ConfigSm120, smem_ab_stages
 
-    if chain.is_multi_gemm or chain.has_mainloop_fusion:
-        raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM block-scale matmul chains only")
+    if chain.has_mainloop_fusion:
+        raise NotImplementedError(f"{tmpl.file} renders plain block-scale matmul chains only (no mainloop fusion)")
+    if chain.is_multi_gemm and not tmpl.supports_multi_gemm:
+        raise NotImplementedError(
+            f"{tmpl.file} renders plain single-GEMM block-scale matmul chains only; block-scale multi-GEMM "
+            f"({chain.num_gemms} GEMMs) is not supported by this template"
+        )
     if chain.has_moe:
         # The token is A on the ordinary MoE kernel and B after the swap-AB
         # lowering; either way it rides a K-major TMA box.
@@ -1392,6 +1397,9 @@ def _render_block_scale_tile_constants(
     data_elem_bits = 4 if is_fp4 else 8
     cta_k_elems = cfg.cta_tile_k_bytes * 8 // data_elem_bits
     _check_block_scale_geometry(chain, cfg)
+    _gs = tmpl.gather_sf_reject(chain, cfg)
+    if _gs is not None:
+        raise NotImplementedError(f"{tmpl.file}: {_gs}")
     try:
         mma_kind, scale_vec, sf_format = _SM120_BLOCK_SCALE_MMA[(is_fp4, bs.block_size, bs.sf_dtype)]
     except KeyError:
@@ -1440,20 +1448,32 @@ def _render_block_scale_tile_constants(
     # a 128x128 tile its second stage (2 x 36 KB + 16.5 KB fits; 3 x 36 KB does
     # not). The catalog's SMEM sweep counts data only, so a cataloged tile can
     # still leave no stage here; the engine then declines the graph.
-    per_stage = sA_packed_elems + sB_packed_elems + sfa_smem_bytes + sfb_smem_bytes + 16
-    compute_warps = (cta_m // cfg.warp_tile_m) * (cta_n // cfg.warp_tile_n)
-    staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
-    if chain.has_moe and chain.moe.mode == "gather":
-        # GATHER's linear-scale scratch: 32 B per routed token row of the tile,
-        # per token operand -- the token is B after the swap-AB lowering.
-        token_rows, token_operands = (cta_n, chain.num_b_operands) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, chain.num_a_operands)
-        staging_bytes += token_rows * 32 * token_operands
-    ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=staging_bytes)
-    if ab_stages < 1:
-        raise NotImplementedError(
-            f"block-scale {cfg.name!r}: one stage of {per_stage} B (packed A/B + SF) plus the "
-            f"{staging_bytes}-B epilogue staging does not fit the SMEM budget -- pick a smaller CTA tile"
-        )
+    if chain.is_multi_gemm:
+        # One packed tile + SF box per DISTINCT operand per stage. Sm120KernelTemplate
+        # owns that rule; the funnel's _extra_reject and the MoE block-scale
+        # precheck ask the same method, so all of them agree. Register pressure
+        # is a perf trade-off, not a gate: ptxas spills the extra accumulators.
+        _mg = tmpl.multi_gemm_reject(chain, cfg)
+        if _mg is not None:
+            raise NotImplementedError(f"{tmpl.file}: {_mg}")
+        ab_stages, _, _ = tmpl.multi_gemm_ab_stages(chain, cfg)
+    else:
+        # Sm120KernelTemplate.multi_gemm_ab_stages counts the same per distinct
+        # operand; change the two together.
+        per_stage = sA_packed_elems + sB_packed_elems + sfa_smem_bytes + sfb_smem_bytes + 16
+        compute_warps = (cta_m // cfg.warp_tile_m) * (cta_n // cfg.warp_tile_n)
+        staging_bytes = 4 * _SM120_STG_STAGE_ELEMS * compute_warps
+        if chain.has_moe and chain.moe.mode == "gather":
+            # GATHER's linear-scale scratch: 32 B per routed token row of the tile,
+            # per token operand -- the token is B after the swap-AB lowering.
+            token_rows, token_operands = (cta_n, chain.num_b_operands) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, chain.num_a_operands)
+            staging_bytes += token_rows * 32 * token_operands
+        ab_stages = smem_ab_stages(per_stage, smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=staging_bytes)
+        if ab_stages < 1:
+            raise NotImplementedError(
+                f"block-scale {cfg.name!r}: one stage of {per_stage} B (packed A/B + SF) plus the "
+                f"{staging_bytes}-B epilogue staging does not fit the SMEM budget -- pick a smaller CTA tile"
+            )
 
     out_dt = chain.output_dtype
     # The template always stores STG straight from registers: no TMA-store ring,
@@ -1509,8 +1529,13 @@ def _render_block_scale_tile_constants(
         # walk is never pinned, the kernel picks it per launch from the budget.
         "tile_swizzle_n = 0",
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
-        "num_a_operands = 1",
-        "num_b_operands = 1",
+        f"num_a_operands = {chain.num_a_operands}",
+        f"num_b_operands = {chain.num_b_operands}",
+        # gemm_a_idx[g] / gemm_b_idx[g] pick GEMM g's operands (single GEMM: (0,), (0,));
+        # an operand's scale factors travel with its packed data.
+        f"num_gemms = {chain.num_gemms}",
+        f"gemm_a_idx = {tuple(a for a, _ in chain.gemm_operands)}",
+        f"gemm_b_idx = {tuple(b for _, b in chain.gemm_operands)}",
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
         f"split_k_slices = {cfg.split_k_slices}",
@@ -1942,7 +1967,11 @@ def _render_block_scale_template(
         )
         + ","
     )
-    stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}][j * vsize : (j + 1) * vsize]" for g in range(1, chain.num_gemms)) or "pass"
+    # Per-GEMM register-vector bindings in the STG inner loop: GEMM 0 is bound by
+    # the template (vec_f32); the rest (vec_f32_1, ...) are injected here. The
+    # sm120 STG arm builds one vsize-wide fp32 vector per GEMM, so the binding is
+    # the whole vector -- no sub-slicing by chunk index as on the tcgen05 arm.
+    stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}]" for g in range(1, chain.num_gemms)) or "pass"
     # SM120 reads grouped data/scales through global descriptors. GATHER and
     # SCATTER add routing metadata to the device signature.
     moe_kernel_ma_params = moe_host_ma_pass = ""
@@ -1999,7 +2028,7 @@ def _render_block_scale_template(
         elif chain.reductions or chain.quants:
             raise RuntimeError(f"block-scale template missing marker @@{marker}@@")
     # Multi-GEMM A/B + SF operand plumbing — only block-scale templates that
-    # carry these markers (MoE block-scale lacks them).
+    # carry these markers (every sm120 block-scale template does).
     if "@@INJECT_KERNEL_AB_DESC_PARAMS@@" in src:
         replacements.update(
             {
@@ -3783,6 +3812,20 @@ def _precheck_moe_block_scale(
     _check_block_quant_supported(chain, _epi_vec_bytes(chain, config), config)
     _check_own_family(_tmpl)
     _check_block_scale_geometry(chain, config)
+    # The renderer declines a multi-GEMM tile whose operand stages (packed data +
+    # SF boxes) plus the epilogue staging miss the SMEM budget; probe the same
+    # rule so a plan the heuristics list is one the engine will build (after the
+    # geometry reasons, so a geometry the template can never run reports that).
+    if chain.is_multi_gemm and hasattr(_tmpl, "multi_gemm_reject"):
+        _mg = _tmpl.multi_gemm_reject(chain, config)
+        if _mg is not None:
+            raise NotImplementedError(f"{_tmpl.file}: {_mg}")
+    # GATHER's token-scale repack works in 32-word passes; the template would
+    # otherwise leave part of the SF stage unwritten (the renderer asks the same).
+    if hasattr(_tmpl, "gather_sf_reject"):
+        _gs = _tmpl.gather_sf_reject(chain, config)
+        if _gs is not None:
+            raise NotImplementedError(f"{_tmpl.file}: {_gs}")
 
 
 def precheck_path(
@@ -4963,7 +5006,9 @@ class CompiledMoeBlockScaleGemm:
         b_stride_perms = [t.permute(1, 2, 0) for (t, _sf) in b_slots]
         c_perms = [ci.permute(1, 2, 0) for ci in outs]
         dense_bad = chain.output_specs and _moe_dense_layout_bad(out)
-        if _moe_operand_layout_bad(chain, a0, b0) or dense_bad:
+        # Every distinct token and weight: a multi-GEMM chain may carry several of each.
+        operand_bad = any(_moe_operand_layout_bad(chain, t, b0) for t, _sf in a_slots) or any(_moe_operand_layout_bad(chain, a0, w) for w, _sf in b_slots)
+        if operand_bad or dense_bad:
             raise ValueError("multi-GEMM MoE block-scale tensors require contiguous innermost dim")
         output_strides = tuple(stride for _spec, ci in zip(outputs_spec, c_perms) for stride in ci.stride())
         problem_size = (
