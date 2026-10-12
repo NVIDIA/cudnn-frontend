@@ -36,6 +36,7 @@ from .grouped_gemm_quant import (
 from ..moe_utils import MoEWeightMode
 from ..backend_utils import _torch_stream_context, rubin_single_group_offsets_kwarg, wrapper_operand_meta, block_scaled_sfd_tensors, row_major_layout
 from ..canonical import (
+    b_nkl,
     check_canonical_contiguous,
     check_packed_sf,
     normalize_mx,
@@ -185,7 +186,8 @@ class GroupedGemmQuantSm100(APIBase):
             raise ValueError("Provide either (sample_b, sample_sfb) for dense mode " "or (num_experts, b_shape, b_dtype) for discrete mode, but not both.")
 
         self.canonical_a, sample_a = normalize_mx(sample_a)
-        self.canonical_b, sample_b = normalize_b(sample_b)
+        self.canonical_b, sample_b = normalize_b(sample_b, n_major=b_major == "n")
+        self.canonical_b_n_major = self.canonical_b and b_major == "n"
         self.canonical_d, sample_d = normalize_mx(sample_d)
         self.canonical_d_col, sample_d_col = normalize_mx(sample_d_col)
         if sample_d_col is None:
@@ -890,7 +892,7 @@ class GroupedGemmQuantSm100(APIBase):
                 )
 
         a_cute_fake = canonical_mx_fake(a_cute_fake, self.canonical_a)
-        b_cute_fake = canonical_b_fake(b_cute_fake, self.canonical_b)
+        b_cute_fake = canonical_b_fake(b_cute_fake, self.canonical_b, self.canonical_b_n_major)
         d_cute_fake = canonical_mx_fake(d_cute_fake, self.canonical_d)
         d_col_cute_fake = canonical_mx_fake(d_col_cute_fake, self.canonical_d_col)
         prob_cute_fake = canonical_prob_fake(prob_cute_fake, self.canonical_prob)
@@ -902,7 +904,7 @@ class GroupedGemmQuantSm100(APIBase):
             n=cutlass.Int32(0),
             k=cutlass.Int32(0),
             b_stride_size=cutlass.Int64(0),
-            b_major_mode=OperandMajorMode.K,
+            b_major_mode=OperandMajorMode.MN if self.canonical_b_n_major else OperandMajorMode.K,
             workspace_ptr=fake_workspace_ptr,
             d=d_cute_fake,
             d_col=d_col_cute_fake,
@@ -1656,10 +1658,7 @@ def grouped_gemm_quant_wrapper_sm100(
     valid_m, k_physical = a_tensor.shape[:2]
     if is_dense:
         weight_mode = MoEWeightMode.DENSE
-        if is_canonical_b(b_tensor):
-            l, n_out, _ = b_tensor.shape
-        else:
-            n_out, _, l = b_tensor.shape
+        n_out, _, l = b_nkl(b_tensor, b_major)
         if bias_tensor is not None and tuple(bias_tensor.shape) != (n_out, l):
             raise ValueError(f"bias_tensor must have shape {(n_out, l)}, got {tuple(bias_tensor.shape)}")
     else:
@@ -1857,6 +1856,7 @@ def grouped_gemm_quant_wrapper_sm100(
         generate_amax,
         is_flat_sf(sfa_tensor),
         is_flat_sf(sfb_tensor),
+        b_major if is_canonical_b(b_tensor) else None,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
     )
 
@@ -1893,6 +1893,7 @@ def grouped_gemm_quant_wrapper_sm100(
                 discrete_col_sfd=discrete_col_sfd,
                 use_dynamic_sched=use_dynamic_sched,
                 use_single_group_runtime_offsets=use_single_group_runtime_offsets,
+                b_major=b_major,
             )
         else:
             grouped_gemm_quant = GroupedGemmQuantSm100(
