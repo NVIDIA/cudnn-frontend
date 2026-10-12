@@ -169,6 +169,7 @@ import dataclasses
 import gc
 import inspect
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -1288,6 +1289,297 @@ def _assert_sdpa_stage_flip_structured(
         f"the flip does not explain the row"
     )
     return worst
+
+
+# ---------------------------------------------------------------------------
+# The SDPA-stage flip-structured form's host pins (CPU, no device): a seeded fixture of the stage's own reduction with the reference's
+# intermediates PLANTED -- one e4m3 midpoint flip at a known position -- and the mutants each condition of the form was built to reject.
+# ---------------------------------------------------------------------------
+
+_SDPA_FLIP_POS = (1, 3, 5)  # (q head, query i, key j) of the planted flip
+_SDPA_FLIP_MIDPOINT = 12.5  # the midpoint of the adjacent e4m3 codes 12 and 13 (spacing 1 in [8, 16)): torch's RNE rounds it to 12
+_SDPA_FLIP_KINDS = ("dV", "dK", "dQ")
+_SDPA_FLIP_MATRIX = pytest.mark.parametrize("kind", _SDPA_FLIP_KINDS)
+
+
+def _sdpa_flip_fixture(
+    kind: str, *, factor=1.0, op_amp=2.0, midpoint=True, off_midpoints=False, garbage=0.0, second_flip=None, seed=0, s=32, h_q=2, h_kv=1, d=256
+):
+    """A CPU fixture of the SDPA stage's reduction for ``_assert_sdpa_stage_flip_structured`` (no device, no reference run): the
+    DEQUANTIZED operand as e4m3-exact values (``dO [1, s, h_q, d]`` for dV, ``Q`` for dK, ``K [1, s, h_kv, d]`` for dQ; the row the flip
+    multiplies set to ``+-op_amp``, an e4m3-exact amplitude), the reference's SCALED fp32 intermediate ``x [1, h_q, s, s]`` (``softmax *
+    2^FP8_SCALE_S_LOG2`` for P, ``randn * 6`` for dS at a ``scale_dp`` of 64) with the planted position ``(0, *_SDPA_FLIP_POS)`` set to
+    ``_SDPA_FLIP_MIDPOINT`` (``12.25``, a quarter spacing off, with ``midpoint=False``; ``off_midpoints=True`` moves EVERY other value a
+    quarter spacing off its own midpoint so no tie exists anywhere), ``valid`` all True (dense).  The reference's codes are torch's
+    cast of ``x``; the kernel's are the same with the planted code moved by ``factor x u`` (1 = one flip, 3 = three, 1.6 = a fraction),
+    ``second_flip = (q head, i, j)`` plants a second midpoint flip (its operand row amplified too).  ``ref`` is the stage's own
+    contraction of the reference's codes in fp64 rounded to bf16 (held fp32 like ``_row_reference`` returns it), ``got`` the kernel's
+    codes' contraction rounded to bf16, ``garbage`` added to the first three cells of the flipped row.  ``intermediates(selection)``
+    slices the planted ``x`` / ``valid`` into the reference's gathered layout (``kv_cols`` -> ``[n, g, s_q]`` per ``(b, kv head, j)``,
+    ``q_rows`` -> ``[n, s_kv]`` per ``(b, q head, i)``).  Returns a namespace with ``got / ref / operand / flip_unit / intermediates /
+    keys``, the planted ``row`` (of the output) and ``pos`` (b, hq, i, j), the exact one-flip ``term`` on that row, ``factor``, ``seed``."""
+    _test_python_root()
+    from sdpa.fp8 import _fp8_codes_around  # the proof's own code-neighbour arithmetic: the fixture plants what it will be asked to find
+
+    assert float(torch.tensor(op_amp).to(_E4M3)) == op_amp, f"op_amp {op_amp} is not e4m3-exact"
+    g = torch.Generator().manual_seed(seed)
+    grp = h_q // h_kv
+    hq, i, j = _SDPA_FLIP_POS
+    by_q_row = kind == "dQ"
+    s_scale, scale_dp = 2.0 ** _api_const("FP8_SCALE_S_LOG2"), 64.0
+    if kind == "dV":
+        op = (torch.randn(1, s, h_q, d, generator=g) * 0.5).to(_E4M3).float()
+        x, unit = torch.softmax(torch.randn(1, h_q, s, s, generator=g), dim=-1) * s_scale, 1.0 / s_scale
+    elif kind == "dK":
+        op = (torch.randn(1, s, h_q, d, generator=g) * 0.5).to(_E4M3).float()
+        x, unit = torch.randn(1, h_q, s, s, generator=g) * 6.0, 1.0 / scale_dp
+    else:
+        op = (torch.randn(1, s, h_kv, d, generator=g) * 0.5).to(_E4M3).float()
+        x, unit = torch.randn(1, h_q, s, s, generator=g) * 6.0, 1.0 / scale_dp
+    flips = [(hq, i, j)] + ([tuple(second_flip)] if second_flip is not None else [])
+    for fh, fi, fj in flips:  # the operand row the flip multiplies: +-op_amp (K row j of the kv head for dQ; the dO / Q row i of q head fh otherwise)
+        signs = torch.sign(torch.randn(d, generator=g))
+        if by_q_row:
+            op[0, fj, fh // grp] = (op_amp * signs).to(_E4M3).float()
+        else:
+            op[0, fi, fh] = (op_amp * signs).to(_E4M3).float()
+    if off_midpoints:
+        c_ref0, c_alt0, u0 = _fp8_codes_around(x, _E4M3)
+        x = torch.where(u0 != 0, c_ref0 + 0.25 * (c_alt0 - c_ref0), x)
+    for fh, fi, fj in flips:
+        x[0, fh, fi, fj] = _SDPA_FLIP_MIDPOINT if midpoint else _SDPA_FLIP_MIDPOINT - 0.25
+    c_ref, c_alt, u = _fp8_codes_around(x, _E4M3)
+    valid = torch.ones_like(x, dtype=torch.bool)
+    codes_k = c_ref.clone()
+    for fh, fi, fj in flips:
+        codes_k[0, fh, fi, fj] = c_ref[0, fh, fi, fj] + factor * u[0, fh, fi, fj]
+
+    def reduce(codes):  # the stage's own contraction, in fp64 (exact: e4m3 codes times e4m3-exact operands)
+        if by_q_row:
+            out = torch.zeros(1, s, h_q, d, dtype=torch.float64)
+            for q_ in range(h_q):
+                out[0, :, q_, :] = codes[0, q_].double() @ op[0, :, q_ // grp, :].double()
+        else:
+            out = torch.zeros(1, s, h_kv, d, dtype=torch.float64)
+            for hk in range(h_kv):
+                for q_ in range(hk * grp, (hk + 1) * grp):
+                    out[0, :, hk, :] += codes[0, q_].double().t() @ op[0, :, q_, :].double()
+        return out * unit
+
+    ref64, got64 = reduce(c_ref), reduce(codes_k)
+    row = (0, i, hq) if by_q_row else (0, j, hq // grp)
+    if garbage:
+        got64[row][:3] += garbage
+    ref, got = ref64.to(torch.bfloat16).float(), got64.to(torch.bfloat16)
+    key = "p_scaled" if kind == "dV" else "ds_scaled"
+
+    def intermediates(selection):
+        mode, coords = next(iter(selection.items()))
+        coords = torch.as_tensor(coords).reshape(-1, 3).tolist()
+        if mode == "kv_cols":
+            xs = torch.stack([x[b_, hk * grp : (hk + 1) * grp, :, jj] for b_, hk, jj in coords])
+            vs = torch.stack([valid[b_, hk * grp : (hk + 1) * grp, :, jj] for b_, hk, jj in coords])
+        else:
+            xs = torch.stack([x[b_, q_, ii, :] for b_, q_, ii in coords])
+            vs = torch.stack([valid[b_, q_, ii, :] for b_, q_, ii in coords])
+        return {key: xs, "valid": vs, "gain": None, "h_q": h_q, "h_kv": h_kv, "mode": mode}
+
+    op_row = op[0, j, hq // grp] if by_q_row else op[0, i, hq]
+    term = (u[0, hq, i, j] * unit * op_row).double()
+    operand_row = (0, j, hq // grp) if by_q_row else (0, i, hq)
+    return SimpleNamespace(
+        kind=kind, got=got, ref=ref, operand=op, flip_unit=unit, intermediates=intermediates, keys=s, row=row, pos=(0, hq, i, j), operand_row=operand_row,
+        term=term, factor=factor, seed=seed, what=f"{kind} fixture (seed {seed})"
+    )  # fmt: skip
+
+
+def _sdpa_flip_preconditions(f) -> tuple:
+    """What the fixture must satisfy for a pin to mean what it says (the fp8 self-tests' ``_is_bad_row`` / ``_decisive`` pattern):
+    ``visible`` -- ONE flip puts a cell of the planted row outside the bf16 bound; ``hidden`` -- the ``(factor - 1)`` residual against
+    one flip is inside the bound AND inside ``atol`` + half a bf16 spacing from each side on every cell (so only the flip COUNT can
+    reject it).  Also returns the one-flip term and that residual as fractions of the row's bound."""
+    _test_python_root()
+    from sdpa.fp8 import _grid_spacing
+
+    ref64 = f.ref.double()
+    atol = _ATOL_FRAC[torch.bfloat16] * ref64.abs().max().item()
+    bound_row = atol + _RTOL[torch.bfloat16] * ref64[f.row].abs()
+    one = f.term.abs()
+    resid = ((f.factor - 1.0) * f.term).abs()
+    a_row, e_row = f.got[f.row].float(), f.ref[f.row]
+    tol_out = atol + (_grid_spacing(a_row, torch.bfloat16) + _grid_spacing(e_row, torch.bfloat16)).double() / 2
+    visible = bool((one > bound_row).any())
+    hidden = bool((resid <= bound_row).all() and (resid <= tol_out).all())
+    return visible, hidden, (one / bound_row).max().item(), (resid / bound_row).max().item()
+
+
+def _sdpa_flip_case(kind: str, *, want_visible=True, want_hidden=None, seeds=range(16), **kw):
+    """The first seed whose fixture satisfies the pin's preconditions (``_sdpa_flip_preconditions``), printed; a torch RNG-stream change
+    surfaces here as a precondition failure with every tried seed listed, never as a pin that passes for the wrong reason."""
+    tried = []
+    for seed in seeds:
+        f = _sdpa_flip_fixture(kind, seed=seed, **kw)
+        visible, hidden, one_r, res_r = _sdpa_flip_preconditions(f)
+        tried.append((seed, visible, hidden, round(one_r, 3), round(res_r, 3)))
+        if visible == want_visible and (want_hidden is None or hidden == want_hidden):
+            print(f"{f.what}: one flip {one_r:.3f} of the bound (visible={visible}); the (factor - 1) residual {res_r:.3f} (hidden={hidden}); {kw}")
+            return f
+    raise AssertionError(
+        f"no seed in {list(seeds)} builds the {kind} fixture with visible={want_visible} hidden={want_hidden} for {kw}: (seed, visible, hidden, one, resid) {tried}"
+    )
+
+
+def _run_sdpa_flip_form(f, what_suffix="(the bf16 bound form)") -> float:
+    return _assert_sdpa_stage_flip_structured(
+        f.got, f.ref, f"{f.what} {what_suffix}", kind=f.kind, keys=f.keys, operand=f.operand, flip_unit=f.flip_unit, intermediates=f.intermediates
+    )
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_accepts_one_proven_flip(kind, capsys):
+    """The control, with its RED half: one planted e4m3 midpoint flip (``x = 12.5``, codes ``+12 -> +13``, step ``+1 x flip_unit``) times an
+    operand row of amplitude 2 puts ONE d-row outside the bf16 bound -- the plain bound form (``_assert_grad_close``, the pin as it
+    stood) REJECTS it with the statistics line -- and the flip-structured form PROVES it: the printed attribution names the planted
+    position, the two codes and the operand row, fits it as one flip within 5 %, and the residual after the exact term leaves no cell
+    outside; the returned worst is the magnitude the plain form judged (> 1)."""
+    f = _sdpa_flip_case(kind, want_visible=True)
+    with pytest.raises(AssertionError, match=r"worst cell [1-9][0-9]*\.[0-9]+ of the bound") as red:
+        _assert_grad_close(f.got, f.ref.double(), f"{f.what} (the bf16 bound form, plain)")
+    print(f"RED half (the plain bound form): {red.value}")
+    capsys.readouterr()
+    worst = _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert worst > 1.0, worst
+    assert "(flip-structured form): 1 of" in out and "d-rows outside the bf16 bound" in out and "(row budget 1 =" in out, out
+    assert f"is ONE flipped fp8 intermediate at (b, hq, i, j)={f.pos}: x=+12.5 rounds to {_E4M3} code +12, the kernel to +13" in out, out
+    assert f"x operand row {f.operand_row} reproduces the row" in out, out
+    fit = float(re.search(r"and fits it as ([0-9.]+) flips", out).group(1))
+    assert abs(fit - 1.0) < 0.05, fit
+    assert re.search(r"the residual after it 0\.[0-9]+ \(0 cells outside after\)", out), out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_catches_nothing_new_below_the_bound(kind, capsys):
+    """An operand row of amplitude 0.25 keeps the same flip INSIDE the bound (0 d-rows outside): the form returns exactly what
+    ``_assert_grad_close`` returns and prints nothing of its own -- keyed on rows OUTSIDE the bound, it widens nothing and catches
+    nothing new below it."""
+    f = _sdpa_flip_case(kind, want_visible=False, op_amp=0.25)
+    assert int(_rows_outside_mask(f.got, f.ref.double()).sum()) == 0
+    plain = _assert_grad_close(f.got, f.ref.double(), f"{f.what} (the bf16 bound form, plain)")
+    capsys.readouterr()
+    worst = _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert worst == plain and 0 < worst < 1.0, (worst, plain)
+    assert "flip-structured" not in out and "%%%%" not in out, out
+
+
+@_SDPA_FLIP_MATRIX
+@pytest.mark.parametrize(
+    "off_midpoints, said",
+    [(False, "lies 0.2500 code spacings from the midpoint"), (True, "No valid position of the row's reduction has an intermediate within the midpoint window")],
+    ids=["planted_value_off_the_midpoint", "every_value_off_every_midpoint"],
+)
+def test_sdpa_stage_flip_form_rejects_a_row_with_no_near_midpoint_intermediate(kind, off_midpoints, said, capsys):
+    """The same shifted row with the planted intermediate a quarter spacing OFF the midpoint (12.25) is a power-of-two multiple of an
+    operand row and nothing more: rejected at the midpoint condition, the diagnosis naming the distance; with EVERY intermediate off
+    every midpoint no candidate of the reduction is left at all."""
+    f = _sdpa_flip_case(kind, want_visible=True, midpoint=False, off_midpoints=off_midpoints)
+    with pytest.raises(AssertionError, match=rf"is NOT one {re.escape(str(_E4M3))} (P|dS) flip of the reference's own intermediates"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert "is NOT one flipped fp8 intermediate" in out and said in out, out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_rejects_three_flips(kind, capsys):
+    """Three flips of the planted code: the one-flip candidate leaves a two-flip residual -- twice the visible term -- so the row fails
+    the tolerance condition (the exact term must reproduce the row within the UNCHANGED bound) before any fit is weighed."""
+    f = _sdpa_flip_case(kind, want_visible=True, want_hidden=False, factor=3.0)
+    with pytest.raises(AssertionError, match="is NOT one"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert "which predicts the row to max |residual| / tol = " in out, out
+
+
+def test_sdpa_stage_flip_form_rejects_a_fraction_of_a_flip_by_the_fit_alone(capsys):
+    """dV, the finest step (``1 / 2^FP8_SCALE_S_LOG2``): 1.6 flips of the planted code with the 0.6-flip residual HIDDEN inside the bound and
+    inside bf16's rounding on every cell (the precondition), so the tolerance and the rounding conditions both hold and ONLY the
+    least-squares flip count (``1 +- 1/2``) rejects it.  1.5 is the band's knife edge; dK / dQ at these amplitudes fail the tolerance
+    instead (their step is 1.7-2.6x the bound), so this pin is dV's."""
+    f = _sdpa_flip_case("dV", want_visible=True, want_hidden=True, factor=1.6, op_amp=2.0)
+    with pytest.raises(AssertionError, match="is NOT one"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert re.search(r"which fits the row as 1\.6[0-9] flips of itself", out), out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_rejects_a_flip_touched_row_with_a_corrupted_cell(kind, capsys):
+    """A legitimate flip plus 0.05 of garbage on three cells of its row: the proof's tolerance condition fails on those cells -- a flip
+    explains a row entirely or not at all."""
+    f = _sdpa_flip_case(kind, want_visible=True, garbage=0.05)
+    with pytest.raises(AssertionError, match="is NOT one"):
+        _run_sdpa_flip_form(f)
+    out = capsys.readouterr().out
+    assert "which predicts the row to max |residual| / tol = " in out, out
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_residual_guard_rejects_what_a_permissive_proof_accepts(kind, monkeypatch, capsys):
+    """Condition (4) stands on its own.  With the proof REPLACED by one that attributes every bad row to the planted flip whatever the
+    row holds (the failure mode of a proof that is too permissive), the legitimate flip still passes and the flip-touched row with a
+    corrupted cell is still rejected -- by the fp64 residual after the exact rank-1 term against the unchanged bound."""
+    import sdpa.fp8 as fp8_module
+
+    f_ok = _sdpa_flip_case(kind, want_visible=True)
+    f_bad = _sdpa_flip_fixture(kind, seed=f_ok.seed, garbage=0.05)
+    fake = dict(
+        row=f_ok.row, position=f_ok.pos, x=_SDPA_FLIP_MIDPOINT, c_ref=12.0, c_alt=13.0, u=1.0, off_mid_spacings=0.0, step=f_ok.flip_unit, gain=1.0,
+        worst=0.0, rounding=0.0, flips=1.0, n_tied=0, operand_row=f_ok.operand_row
+    )  # fmt: skip
+    monkeypatch.setattr(fp8_module, "flip_evidence", lambda *a, **k: [fake])
+    worst = _run_sdpa_flip_form(f_ok, "(permissive proof, legitimate flip)")
+    assert worst > 1.0 and "0 cells outside after" in capsys.readouterr().out
+    with pytest.raises(AssertionError, match="after removing the proven flip's exact rank-1 term the residual is"):
+        _run_sdpa_flip_form(f_bad, "(permissive proof, corrupted row)")
+
+
+@_SDPA_FLIP_MATRIX
+def test_sdpa_stage_flip_form_holds_the_row_budget_floor(kind, capsys):
+    """Two legitimate flips in two d-rows at the row budget's FLOOR (32 d-rows x 32 keys: ``1e-5 x rows x keys < 1``, budget 1): the
+    count condition rejects the cell before any proof runs -- a systematic shift is many rows, each 'one flip', and the budget is
+    where it is named."""
+    for seed in range(16):
+        f = _sdpa_flip_fixture(kind, seed=seed, second_flip=(0, 7, 11))
+        rows = torch.nonzero(_rows_outside_mask(f.got, f.ref.double())).flatten().tolist()
+        if len(rows) == 2:
+            break
+    else:
+        raise AssertionError(f"no seed puts exactly the two flipped {kind} rows outside the bound")
+    n_rows = f.got.shape[0] * f.got.shape[1] * f.got.shape[2]
+    assert _row_budget(n_rows, f.keys) == _ROW_BUDGET_FLOOR, _row_budget(n_rows, f.keys)
+    with pytest.raises(AssertionError, match=r"2 of \d+ d-rows outside the bf16 bound, over the row budget 1"):
+        _run_sdpa_flip_form(f)
+    assert "%%%%" not in capsys.readouterr().out  # no proof ran
+
+
+def test_both_sdpa_stage_pins_take_the_flip_structured_form():
+    """The dense and the packed suites hold the SDPA stage's bf16 output to ONE form: each stage block calls
+    ``_assert_sdpa_stage_flip_structured`` with ``kind=`` and ``keys=``, and no plain ``_assert_grad_close`` on the ``(the bf16 bound
+    form)`` string survives in either (host, no device: reads both modules' source)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for module, head in (
+        ("test_block_backward_fp8.py", "def test_fp8_stage_localised_bounds("),
+        ("test_block_thd_backward_fp8.py", "def _assert_sdpa_stage_per_sequence("),
+    ):
+        src = open(os.path.join(here, module)).read()
+        start = src.index("\n" + head) + 1  # the column-0 definition, not this test's own mention of it
+        end = src.find("\ndef ", start + 1)
+        block = src[start : end if end > 0 else len(src)]
+        assert "_assert_sdpa_stage_flip_structured(" in block and "kind=tag," in block and "keys=" in block, module
+        assert "(the bf16 bound form)" in block, module
+        plain = [ln for ln in block.splitlines() if "_assert_grad_close(" in ln and "bf16 bound form" in ln]
+        assert not plain, (module, plain)
 
 
 def _row_tol() -> tuple:
