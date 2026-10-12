@@ -565,6 +565,120 @@ def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("kv_splits", (1, 2))
+@pytest.mark.parametrize("with_block_sizes", (True, False), ids=("block_sizes", "short_last_tile"))
+@torch_fork_set_rng(seed=6)
+def test_bsa_attention_forward_sm90_blk64_partial_kv_blocks(with_block_sizes, kv_splits):
+    """Partial KV blocks are masked, full ones skip the mask. They come from block_sizes or, without it, from a short
+    last KV tile. Each list is walked from its last slot, so row 0 masks in the prologue and row 1 in the loop."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    seqlen_q, seqlen_k = 2 * 64, 4 * 64 - (0 if with_block_sizes else 17)
+    q = torch.randn((1, 2, seqlen_q, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, seqlen_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    q2k = torch.tensor([[0, 1, 3], [3, 2, 0]], device="cuda", dtype=torch.int32).expand(1, 2, 2, 3).contiguous()
+    block_sizes = torch.tensor([64, 40, 64, 23], device="cuda", dtype=torch.int32) if with_block_sizes else None
+
+    result = BSA.block_sparse_attention_forward(q, k, v, q2k, 3, block_sizes, sparse_block_size=64, kv_splits=kv_splits)
+    reference_sizes = block_sizes if with_block_sizes else torch.full((4,), 64, device="cuda", dtype=torch.int32)
+    mask = block_sparse_mask(q2k, 3, reference_sizes, seqlen_q, seqlen_k, 64)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("head_dim", (64, 96, 128))
+@pytest.mark.parametrize("value_dim", (96, 128))
+@pytest.mark.parametrize("with_block_sizes", (False, True))
+@torch_fork_set_rng(seed=28)
+def test_bsa_attention_forward_sm90_blk64_ring_head_dims(dtype, head_dim, value_dim, with_block_sizes):
+    """Exercise real K-ring dispatch, short lists, wraparound, empty rows, and both partial-block paths.
+
+    Repeat five query tiles to cross the large-grid gate without constructing a large dense reference.
+    Counts 0/1/2/3/8 cover first fill, first reuse, multiple barrier phases, and drain.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    copies, seqlen_q, seqlen_k = 256, 5 * 64, 16 * 64 - 17
+    q = torch.randn((1, 1, seqlen_q, head_dim), device="cuda", dtype=dtype)
+    k = torch.randn((1, 1, seqlen_k, head_dim), device="cuda", dtype=dtype)
+    v = torch.randn((1, 1, seqlen_k, value_dim), device="cuda", dtype=dtype)
+    counts = torch.tensor([[[0, 1, 2, 3, 8]]], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([15, 1, 4, 6, 8, 10, 12, 14], device="cuda", dtype=torch.int32).repeat(1, 1, 5, 1)
+    indices[:, :, 4] = indices[:, :, 4].flip(-1)  # The tail occurs in both prologue and steady state.
+    indices.masked_fill_(torch.arange(8, device="cuda") >= counts[..., None], 2147483647)
+    sizes = torch.full((16,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        sizes[1::2] = 23
+    mask = block_sparse_mask(indices, 8, sizes, seqlen_q, seqlen_k, 64, counts)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+
+    result = BSA.block_sparse_attention_forward(
+        q.repeat(1, 1, copies, 1),
+        k,
+        v,
+        indices.repeat(1, 1, copies, 1),
+        8,
+        sizes if with_block_sizes else None,
+        q2k_block_nums=counts.repeat(1, 1, copies),
+        sparse_block_size=64,
+        kv_splits=1,
+        allow_empty_block_nums=True,
+    )
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref.repeat(1, 1, copies, 1), atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref.repeat(1, 1, copies), atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("head_dim", (64, 96, 128))
+@pytest.mark.parametrize("value_dim", (64, 96, 128))
+@pytest.mark.parametrize("with_block_sizes", (False, True))
+@torch_fork_set_rng(seed=29)
+def test_bsa_attention_forward_sm90_blk64_rescale_row_slots(dtype, head_dim, value_dim, with_block_sizes):
+    """Cover unchanged/increasing maxima, different row slots, and mixed rows within a warp vote."""
+    if not torch.cuda.is_available():
+        pytest.skip("block sparse attention tests require CUDA")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("the blk64 forward kernel under test is specific to SM90")
+
+    BSA = _import_bsa()
+    seqlen_q, seqlen_k = 5 * 64, 16 * 64 - 17
+    q = torch.zeros((1, 1, seqlen_q, head_dim), device="cuda", dtype=dtype)
+    row = torch.arange(64, device="cuda")
+    q[0, 0, 64:128, 0] = 8
+    q[0, 0, 128:192, 0] = torch.where(row % 16 < 8, -8, 8)
+    q[0, 0, 192:256, 0] = torch.where(row % 16 < 8, 8, -8)
+    q[0, 0, 256:320, 0] = torch.where(row % 2 == 0, 8, -8)
+    k = torch.zeros((1, 1, seqlen_k, head_dim), device="cuda", dtype=dtype)
+    k[0, 0, :, 0] = (torch.arange(seqlen_k, device="cuda") // 64).to(dtype) * 0.5
+    v = torch.randn((1, 1, seqlen_k, value_dim), device="cuda", dtype=dtype)
+    # Reverse traversal visits blocks in increasing logit order for positive Q rows.
+    indices = torch.tensor([15, 6, 5, 4, 3, 2, 1, 0], device="cuda", dtype=torch.int32).repeat(1, 1, 5, 1)
+    sizes = torch.full((16,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        sizes[:2] = 0  # Two fully masked blocks before the first finite maximum.
+        sizes[15] = 23
+    result = BSA.block_sparse_attention_forward(q, k, v, indices, 8, sizes if with_block_sizes else None, sparse_block_size=64, kv_splits=1)
+    mask = block_sparse_mask(indices, 8, sizes, seqlen_q, seqlen_k, 64)
+    o_ref, lse_ref = attention_reference(q, k, v, mask)
+    torch.testing.assert_close(result["o_tensor"].float(), o_ref, atol=3e-2, rtol=3e-2)
+    torch.testing.assert_close(result["lse_tensor"], lse_ref, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.L0
 @torch_fork_set_rng(seed=4)
 def test_bsa_attention_forward_sm100_blk64():
     if not torch.cuda.is_available():
