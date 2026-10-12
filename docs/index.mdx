@@ -1,21 +1,143 @@
 ---
 title: "NVIDIA cuDNN"
+subtitle: "GPU-accelerated building blocks for deep learning."
 ---
-The NVIDIA CUDA Deep Neural Network library (cuDNN) is a GPU-accelerated library of primitives for deep neural networks. It provides highly tuned implementations of operations arising frequently in deep neural network (DNN) applications:
 
-- Scaled dot-product attention
-- Convolution, including cross-correlation
-- Matrix multiplication
-- Normalizations, softmax, and pooling
-- Arithmetic, mathematical, relational, and logical pointwise operations
+The NVIDIA CUDA Deep Neural Network library (cuDNN) provides optimized operations for training and inference on NVIDIA GPUs. Use attention, matrix multiplication, convolution, and multi-operation fusion through your framework or the cuDNN Python and C++ APIs.
 
-Beyond just providing high-performance implementations of individual operations, cuDNN also supports a flexible set of multi-operation fusion patterns for further optimization. The goal is to achieve the best available performance on NVIDIA GPUs for important deep learning use cases.
+<CardGroup cols={3}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Build and run your first computation graph in Python or C++.
+  </Card>
+  <Card title="Samples" icon="code" href="/samples">
+    Explore examples for attention, matrix multiplication, and more.
+  </Card>
+  <Card title="Open-source kernels" icon="microchip" href="/fe-oss-apis/overview">
+    Explore specialized attention, GEMM fusions, and normalization kernels.
+  </Card>
+</CardGroup>
 
-In cuDNN, both single-operation and multi-operation computations are expressed as operation graphs. The following APIs are available for constructing these graphs:
+## Integrations
 
-- Python API
-- C++ API
+Use cuDNN through the tools in your AI stack, or build directly on its graph APIs. These paths show how selected frameworks and libraries reach cuDNN. Support depends on the operation, selected backend, library versions, and GPU.
 
-The [NVIDIA cuDNN frontend API](/developer/overview) provides a simplified programming model that is sufficient for most use cases.
+<Tabs>
+  <Tab title="Frameworks and training">
+    **Direct framework paths**
 
-Use the [NVIDIA cuDNN backend API](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html#api-overview) only if you want to use the legacy fixed-function routines that are not graph-based interfaces and are not exposed by the frontend API layers, or if you need a C-only interface.
+    ```mermaid
+    flowchart LR
+      pytorch[PyTorch] --> cudnn[cuDNN]
+      tokamax[Tokamax] --> jax[JAX / XLA]
+      jax --> cudnn
+    ```
+
+    **Training through Transformer Engine**
+
+    ```mermaid
+    flowchart LR
+      jax[JAX] --> te[Transformer Engine]
+      megatron[Megatron Core] --> te
+      te --> cudnn[cuDNN]
+    ```
+
+    - **[PyTorch](https://docs.pytorch.org/docs/stable/backends.html#torch-backends-cudnn)** uses cuDNN for supported GPU operations.
+    - **[JAX / XLA](https://docs.jax.dev/en/latest/_autosummary/jax.nn.dot_product_attention.html)** provides a cuDNN implementation of dot-product attention. **[Tokamax](https://github.com/openxla/tokamax)** can select this implementation through JAX.
+    - **[Transformer Engine](https://docs.nvidia.com/deeplearning/transformer-engine/examples/attention/attention.html)** uses cuDNN for fused attention. **[Megatron Core](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)** and Transformer Engine's JAX API provide paths to these kernels.
+  </Tab>
+  <Tab title="Inference">
+    ```mermaid
+    flowchart LR
+      vllm[vLLM] --> flashinfer[FlashInfer]
+      sglang[SGLang] --> flashinfer
+      flashinfer --> cudnn[cuDNN]
+      rtx[TensorRT for RTX] --> cudnn
+    ```
+
+    - **[FlashInfer](https://docs.flashinfer.ai/generated/flashinfer.prefill.cudnn_batch_prefill_with_kv_cache.html)** exposes cuDNN attention kernels, including paged KV-cache prefill.
+    - **[vLLM](https://docs.vllm.ai/en/stable/)** and **[SGLang](https://docs.sglang.ai/)** can reach cuDNN through their FlashInfer integrations. Check each framework's backend options and supported workloads.
+    - **[TensorRT for RTX](https://docs.nvidia.com/deeplearning/tensorrt-rtx/latest/index.html)** uses cuDNN within its inference stack for supported computations.
+  </Tab>
+  <Tab title="Custom applications">
+    ```mermaid
+    flowchart LR
+      app[Your application] --> python[Python API]
+      app --> cpp[C++ API]
+      python --> cudnn[cuDNN]
+      cpp --> cudnn
+      cudnn --> gpu[NVIDIA GPUs]
+    ```
+
+    Use the **[cuDNN frontend](/developer/overview)** to describe operations, build an execution plan, and run it on your GPU. The Python and C++ APIs support custom applications, research, and benchmarks.
+
+    Learn how to [construct operation graphs](/developer/graph-api) or [integrate the frontend with a framework](/utilities/framework_integration_performance).
+  </Tab>
+</Tabs>
+
+## Get started
+
+Set up a compatible NVIDIA GPU, CUDA, and cuDNN backend before using the frontend. Check the [supported products](/reference/support-matrix) and [installation guide](/installation/frontend) for your environment.
+
+<Tabs>
+  <Tab title="Python">
+    Install the Python frontend:
+
+    ```bash
+    pip install nvidia-cudnn-frontend
+    ```
+
+    Check that Python can load the cuDNN backend:
+
+    ```python
+    import cudnn
+
+    print(cudnn.backend_version())
+    ```
+
+    Follow the [Python installation guide](/installation/frontend/python-frontend-install), then [build and execute your first graph](/quickstart).
+  </Tab>
+  <Tab title="C++">
+    Set up the headers and libraries with the [C++ installation guide](/installation/frontend/cpp-frontend-install). Include the frontend and create an empty graph:
+
+    ```cpp
+    #include <cudnn_frontend.h>
+
+    auto graph = cudnn_frontend::graph::Graph();
+    ```
+
+    Follow the [quick start](/quickstart) for a complete example that defines tensors, adds an operation, builds an execution plan, and runs the graph.
+  </Tab>
+</Tabs>
+
+For most applications, start with the frontend APIs. Use the [cuDNN backend API](https://docs.nvidia.com/deeplearning/cudnn/backend/latest/api/overview.html#api-overview) if you need a C-only interface or legacy fixed-function routines that the frontend does not expose.
+
+## Operations
+
+cuDNN supports individual operations and flexible fusion patterns. Describe a computation as an [operation graph](/developer/graph-api) so cuDNN can select an execution plan for your GPU.
+
+<CardGroup cols={2}>
+  <Card title="Attention" href="/operations/Attention">
+    Scaled dot-product attention for transformer training and inference.
+  </Card>
+  <Card title="Matrix multiplication" href="/operations/Matmul">
+    Matrix products and supported fusion patterns.
+  </Card>
+  <Card title="Convolution" href="/operations/Convolutions">
+    Convolution and cross-correlation for vision and other workloads.
+  </Card>
+  <Card title="Normalization" href="/operations/Normalizations">
+    Batch, layer, instance, and RMS normalization.
+  </Card>
+  <Card title="Mixture of experts" href="/operations/MoeGroupedMatmul">
+    Grouped matrix multiplication for expert workloads.
+  </Card>
+  <Card title="Pointwise and reduction" href="/operations/Pointwise">
+    Arithmetic, activations, comparisons, and reductions.
+  </Card>
+</CardGroup>
+
+cuDNN also supports softmax and [pooling](/operations/Resampling).
+
+## Contribute and get help
+
+The cuDNN frontend is open source. [Explore the code](https://github.com/NVIDIA/cudnn-frontend), [contribute](https://github.com/NVIDIA/cudnn-frontend/blob/develop/CONTRIBUTING.md), or [report an issue](https://github.com/NVIDIA/cudnn-frontend/issues). See the [release notes](https://github.com/NVIDIA/cudnn-frontend/releases) for updates and [support resources](/reference/support) for help.
