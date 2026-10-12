@@ -13,7 +13,7 @@ using the FlashAttention-2 algorithm as described in the paper [FlashAttention-2
 
 cudnn SDPA operation requires SM80 (Ampere) or newer architectures and cuda toolkit 12.x or newer.
 
-The support matrix is based on the latest cudnn backend version 9.18.1
+The support matrix is based on cuDNN backend version 9.18.1. Later sections note support changes introduced in newer cuDNN versions.
 
 
 | Arch <br /> | Datatype  <br />  | Layout  <br />                      | Paged  <br />  Attn| Masking     | Deterministic | Head dim |  
@@ -387,8 +387,8 @@ graph.sdpa(
 
 - **Paged attention**: Enables non-contiguous K/V caches to reduce memory fragmentation. See the [PagedAttention paper](https://arxiv.org/abs/2309.06180).
   - **Requirements**:
-    - Pass `page_table_k` tensor with block offsets into the K container (optional if K is not paged)
-    - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
+    - Pass the `paged_attention_k_table` tensor with block offsets into the K container (optional if K is not paged)
+    - Pass the `paged_attention_v_table` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
   - **FROST engines** (opt-in, f16/bf16): paged decode and MTP graphs run a dedicated decode tile instead of the prefill pipeline. On the SM100 line: `S_q * pack_g <= 128` on the d128 flavor (`pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise; `TILE_CGA_M=1`). On cc 10.7 (Rubin): the d256 flavor's swap-AB decode tile over a dense or a paged cache — PackGQA packs the whole group into the tile's Q rows (24/2 = 12 rows), the KV range splits (dense or paged) through the shared combine, which also applies the fused epilogue gate when the plan splits, and an MTP step rides it in token units (`S_q * G <= 16` packed rows in one unit of the 16-column tile, rows in (16, 32] on the 32-column tile, a packed group in up to two token units). Other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`. On cc 10.7 (SM107) the f16/bf16 row serves paged KV for packed (THD / ragged-Q) queries on the d128 and d256 flavors, with or without `sink_token` -- prefill- and decode-shaped packed batches (per-request Q of 1 / 4 / 8), GQA with PackGQA, HND and NHD pools -- through the paged prefill pipeline; dense (BSHD) paged queries are declined there except the decode-shaped d256 graphs the decode tile serves (above), and a sink graph is never split on any row.
@@ -949,6 +949,25 @@ set_is_inference(bool const value);
 
 
 #### Python API
+```python
+graph.sdpa_fp8(
+    q, k, v,
+    descale_q, descale_k, descale_v, descale_s,
+    scale_s, scale_o,
+    attn_scale=None,
+    use_causal_mask=False,
+    use_padding_mask=False,
+    seq_len_q=None,
+    seq_len_kv=None,
+    cu_seq_len_q=None,
+    cu_seq_len_kv=None,
+    compute_data_type=cudnn.data_type.NOT_SET,
+    name=None,
+    generate_stats=None,
+    is_inference=None,
+)
+```
+
 ```
 Args:
     q (cudnn_tensor): The query data.
@@ -1101,6 +1120,23 @@ set_max_total_seq_len_kv(int64_t const value);
 `set_max_total_seq_len_q` / `set_max_total_seq_len_kv` declare the packed token totals of a ragged (THD) layout, exactly as on `SDPA_backward_attributes` (see the glossary above); they are accepted only when the Q/K/V/O/dO/Stats or the gradients carry a ragged offset. The same two attributes serve the MXFP8 backward (`sdpa_mxfp8_backward` builds `SDPA_fp8_backward_attributes` too).
 
 #### Python API
+```python
+graph.sdpa_fp8_backward(
+    q, k, v, o, dO, stats,
+    descale_q, descale_k, descale_v, descale_o, descale_dO, descale_s, descale_dP,
+    scale_s, scale_dQ, scale_dK, scale_dV, scale_dP,
+    attn_scale=None,
+    use_padding_mask=False,
+    seq_len_q=None,
+    seq_len_kv=None,
+    use_causal_mask=False,
+    compute_data_type=cudnn.data_type.NOT_SET,
+    name=None,
+    max_total_seq_len_q=None,
+    max_total_seq_len_kv=None,
+)
+```
+
 ```
 Args:
     q (cudnn_tensor): The query data.
@@ -1361,7 +1397,7 @@ SM90 - Determinism is supported.
 
 ### cuDNN Flex Attention API
 
-SDPA and SDPA backward operations now accept the functions `set_score_mod` and `set_score_mod_bprop`, which allows modification of the attention score matrix. These functions can be used to program a sub-graph of pointwise operations that can subsequently be used to program the score modifier. Note that this function usage is mutually exclusive to the usage of ready made options. Also, note that the graph argument in the score_mod function is not the same as the sdpa graph. So, any tensor to be passed as input to the score-mod sub-graph must first be registered with main graph and subsequently passed as argument to the score_mod function. The SDPA operation also now accepts the function `set_block_mask`, which applies a block mask to the score matrix. The implementation assumes a 128 x 128 block size.
+SDPA forward operations accept `set_score_mod`, and SDPA backward operations accept both `set_score_mod` and `set_score_mod_bprop`, which allow modification of the attention score matrix and its backward propagation. These functions can be used to program a sub-graph of pointwise operations that can subsequently be used to program the score modifier. Note that this function usage is mutually exclusive to the usage of ready made options. Also, note that the graph argument in the score_mod function is not the same as the sdpa graph. So, any tensor to be passed as input to the score-mod sub-graph must first be registered with main graph and subsequently passed as argument to the score_mod function. The SDPA operation also now accepts the function `set_block_mask`, which applies a block mask to the score matrix. The implementation assumes a 128 x 128 block size.
 
 ## cuDNN Version History for SDPA
 
