@@ -767,6 +767,37 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     return capabilities.sched_policies
 
 
+# CUDA caps gridDim.y and gridDim.z at 65535 (#1573).
+_GRID_YZ_MAX = 65535
+
+
+def launch_grid_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: SdpaFwdKnobs) -> Optional[str]:
+    """Why these knobs' launch grid puts more than 65535 on gridDim.y or .z, else ``None``.
+
+    The NATURAL scheduler launches heads and batch x split_kv on y/z; the LPT
+    policies and the SM100+/SM120 ragged grids are flat. The d256 decode tile
+    keeps batch on y, and the SM80/SM90 ragged grids keep heads and batch on y/z,
+    under every policy.
+    """
+    batch, heads = facts.b * (knobs.split_kv or 1), facts.h_q
+    if max(batch, heads) <= _GRID_YZ_MAX:
+        return None
+    if d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _decode_tile_split_kv(knobs)):
+        if facts.b <= _GRID_YZ_MAX:
+            return None
+        return f"the d256 decode tile launches batch={facts.b} on gridDim.y, past the CUDA limit of {_GRID_YZ_MAX}"
+    if facts.thd:
+        if capabilities.sm_lo not in (80, 90):
+            return None
+        return f"the ragged grid launches heads={heads} and batch={facts.b} on gridDim.y/z, past the CUDA limit of {_GRID_YZ_MAX}"
+    if knobs.sched_policy not in (None, SCHED_NATURAL):
+        return None
+    return (
+        f"SCHED_POLICY=NATURAL launches heads={heads} and batch x split_kv={batch} on gridDim.y/z, "
+        f"past the CUDA limit of {_GRID_YZ_MAX}; the LPT policies launch a flat grid"
+    )
+
+
 def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
     """CGA domain of the native flavor and split leg selected by the graph."""
 
@@ -856,6 +887,9 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
+        grid_reason = launch_grid_mismatch(capabilities, facts, knobs)
+        if grid_reason is not None:
+            return grid_reason
         # D128 half cga1 uses the decode tile for ragged Q=1 and the split
         # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
         # Other ragged graphs keep the cga2 prefill tile.

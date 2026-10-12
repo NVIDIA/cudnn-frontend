@@ -206,6 +206,23 @@ def test_recommend_every_set_is_admissible():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("b,h", [(65536, 1), (1, 65536)], ids=["batch", "heads"])
+def test_grid_past_65535_rides_the_flat_lpt_grid(b, h):
+    """#1573: NATURAL launches heads and batch on gridDim.y/z, capped at 65535 by CUDA."""
+    facts = _facts(b=b, h_q=h, h_kv=h, s_q=128, s_kv=64, d_qk=64, d_v=64, causal=False)
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    natural = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    assert "gridDim.y/z" in engines.mismatch(caps, facts, natural)
+    for kind in ("A", "FALLBACK"):
+        plans = [p for p in recommend(kind, facts, _OFFERED) if p.engine_id == 20500]
+        assert plans, kind
+        assert all(p.knobs.sched_policy in (SCHED_LPT, SCHED_LPT_L2) for p in plans), [p.knobs for p in plans]
+    control = _facts(b=65535, h_q=1, h_kv=1, s_q=128, s_kv=64, d_qk=64, d_v=64, causal=False)
+    assert engines.mismatch(caps, control, natural) is None
+    assert recommend("A", control, _OFFERED)[0].knobs.sched_policy == SCHED_NATURAL
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "engine_name,dtype,is_fp8",
     [
