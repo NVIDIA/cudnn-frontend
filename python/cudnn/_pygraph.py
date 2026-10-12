@@ -192,6 +192,16 @@ class pygraph:
     All graph structure and attributes are kept in Python. C++ is only
     used for execution via lazy lowering.
 
+    Two constructor arguments are statements about the CALLER, not graph
+    properties, and integrations pass them: ``is_override_shape_enabled``
+    (the graph will execute with shape / stride overrides; forwarded to the
+    backend graph) and the keyword-only ``is_cuda_graph_replay_expected``
+    (``execute`` is captured into a CUDA graph and replayed, so the python
+    engines' heuristics may lead with the plan that is fastest on the GPU
+    alone; never forwarded to the backend, changes no numerics). After
+    planning, ``selected_engine`` and ``backend_plan_entries()`` report which
+    side serves the graph -- see their docstrings.
+
     Example:
         >>> graph = pygraph(io_data_type=cudnn.data_type.HALF)
         >>> A = graph.tensor(dim=[8, 64, 128], name="A")
@@ -368,6 +378,15 @@ class pygraph:
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected plan entry, or None for
         the backend path. Populated after create_execution_plans().
+
+        Public API, read by integrations after planning: ``None`` means the
+        cuDNN backend serves the selected entry; otherwise ``.name`` is the
+        engine's manifest name (``sdpa_fwd_prefill_sm100`` /
+        ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
+        identifier -- manifest names and slots are append-only, never renamed
+        or reused -- so a caller may compare against one.
+        ``get_plan_name_at_index`` reports the same name with the plan's
+        public knobs appended in brackets.
 
         Cached, because ``execute()`` asks on every call and answering means
         walking every registered engine for the one declaring this id, re-deriving
@@ -1261,6 +1280,13 @@ class pygraph:
     def backend_plan_entries(self) -> List[Any]:
         """The backend's own ranked ``(engine_id, knobs)`` recommendation, as
         PlanConfig entries carrying their C++ plan index.
+
+        Public API: an integration that must keep the cuDNN backend reachable
+        for a graph (a Stats layout only the backend serves everywhere) asks
+        this after ``create_execution_plans()`` and reads ``[]`` as "the
+        backend does not serve it" -- the answer is the backend's own (or the
+        family's recorded backend guard), independent of which python engines
+        are offered.
 
         Returns [] for the two things that legitimately mean "no backend entries":
         the backend DECLINED the graph (``cudnnGraphNotSupportedError``) or is not

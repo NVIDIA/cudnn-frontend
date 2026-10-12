@@ -724,6 +724,31 @@ only to decline is why `closed_under` existed.
   function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
   commit.
 
+### Consumed by FlashInfer: the public surface, kept stable
+
+FlashInfer's cuDNN backend (`flashinfer/cudnn/{prefill,decode,utils}.py`)
+programs against this graph API and probes a handful of frontend facts before
+it routes work here. Those names are a caller boundary whatever their spelling
+(`python/cudnn/AGENTS.md` Rule 9: "a private method consumed outside FE is
+still a caller boundary"), so every one of them is public API, kept as
+spelled, with a public twin where the spelling was private.
+`test/python/sdpa/frost/test_flashinfer_consumed_surface.py` (host-only, L0)
+pins each name with its signature, so a rename fails this repository's CI
+instead of silently degrading FlashInfer to its fallback path.
+
+| what the caller asks | spelled today (kept) | public spelling |
+|---|---|---|
+| does the native SDPA binder honor a packed-split / stride contract? | `cudnn._pybind_module._SdpaThdBinder.supports_stats_stride_override`, `.supports_nonpaged_packed_split`, `.supports_paged_split_sink`, ... (static read-only properties, `True`) | `"<cap>" in cudnn.sdpa_capabilities()` -- the frozenset of every `supports_<cap>` flag the build provides; append-only, never renamed |
+| which engine serves the selected plan? | `graph.selected_engine` (`None` = the cuDNN backend; else `.name`) | the same property, documented: `.name` is the engine's manifest name, a stable identifier (`sdpa_fwd_prefill_sm100` / `sdpa_fwd_prefill_sm107` / `sdpa_fwd_prefill_sm120`, ...; manifest names and slots are append-only) |
+| can the cuDNN backend still serve this graph? | `graph.backend_plan_entries()` after `create_execution_plans` (`[]` = declined, guarded or not installed) | the same method, documented above |
+| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7** (the first public wheel whose `Arch` knows `sm_107a`): a device-blind probe on a cc 10.7 part with a 4.7.x DSL says True while every FROST row declines, so pass the GPU you route to |
+| the cuDNN dtype of a torch dtype | `cudnn.datatypes._torch_to_cudnn_data_type(dtype)` | `cudnn.datatypes.torch_to_cudnn_data_type(dtype)` (the private name is an alias of it) |
+| the unified attention implementation, the graph helpers, the caller hints | `cudnn.attention_implementation.UNIFIED`, `cudnn.graph_cache(key_fn=)`, `cudnn.jit(heur_modes=)`, `cudnn.graph(handle, **graph_kwargs)`, `cudnn.pygraph(is_override_shape_enabled=, is_cuda_graph_replay_expected=)` | already public; listed so the pin covers them |
+
+Nothing here changes a `Capabilities` row: the probes report what the engines
+already decide, and `import cudnn` stays as cheap as before (the device-blind
+probe reads package metadata; only the cc 10.7 target check imports the DSL).
+
 ### Knobs: one public vocabulary, and every python plan lists the knobs it will build
 
 - `KnobType_t` (`include/cudnn_frontend/knobs.h`, mirrored as `cudnn.knob_type`)
@@ -985,7 +1010,7 @@ the wrong arch — a green sweep on one box says nothing about the others:
 
 | target | covers |
 |---|---|
-| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification |
+| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py`, `sdpa/frost/test_flashinfer_consumed_surface.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification, the surface FlashInfer consumes |
 | SM100 | every FROST SDPA-forward cell except sm120; the FROST GEMM family; `linear_attention` (GDN / KDA / GDN-2), which is where the cuTile-vs-FROST pin lives |
 | SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies |
 
