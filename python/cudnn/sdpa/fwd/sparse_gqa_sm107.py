@@ -208,6 +208,18 @@ def _strides(t) -> Tuple[int, ...]:
     return tuple(int(x) for x in t.stride())
 
 
+def _require_16b_base(name: str, t) -> None:
+    """The launch binds ``t`` with ``assumed_align=16`` (a TMA tensor map's base, the bulk-copy source of an ids row), so a view that
+    starts off a 16-byte boundary (a storage offset of a few elements) is refused by name here, never handed to the hardware with a
+    false alignment promise.  A storage-free :class:`SparseOperandDesc` (or any shape-only stand-in without ``data_ptr``) has no
+    address yet: nothing to check until execute, where every bound tensor is real."""
+    if t is None or isinstance(t, SparseOperandDesc) or getattr(t, "data_ptr", None) is None:
+        return
+    ptr = int(t.data_ptr())
+    if ptr % 16 != 0:
+        raise ValueError(f"sparse d256 forward (sm107): {name} must start at a 16-byte aligned address (the TMA / bulk-copy base rule); got data_ptr=0x{ptr:x}")
+
+
 def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int, int, int, int, int]:
     """The gather map's view of one page pool ``[num_pages, H_kv, page_size, D]`` from its strides: ``(page_stride,
     token_stride, col_head_stride, rows_per_page, rows_per_head)`` in elements / rows.  The map's rows are the pool's token
@@ -540,6 +552,14 @@ class SparseGqaFwdDslSm107:
             st = _strides(t)
             if st[3] != 1:
                 raise ValueError(f"sparse d256 forward (sm107): {name} head dim must be contiguous (stride 1); got strides {st}")
+        # Q is TMA-loaded (the Q^T box): its (batch, seq, head) strides are the tensor map's, encoded in 16-byte units -- the same rule the
+        # gate tile follows; O is stored through generic stores and needs no such rule
+        qst = _strides(self.q)
+        if any(s % 8 != 0 for s in qst[:3]):
+            raise ValueError(f"sparse d256 forward (sm107): Q (batch, seq, head) strides must be multiples of 8 elements (TMA's 16-byte rule); got {qst}")
+        # a declared tensor (not a storage-free descriptor) is checked for its base alignment here as well as at execute
+        for name, t in (("Q", self.q), ("K", self.k), ("V", self.v), ("O", self.o), ("block_ids", self.block_ids), ("the epilogue gate", self.gate)):
+            _require_16b_base(name, t)
         if self.paged_kv:
             geom_k = _paged_pool_geometry("K", self.k, KH, self.page_size)
             geom_v = _paged_pool_geometry("V", self.v, KH, self.page_size)
@@ -803,6 +823,9 @@ class SparseGqaFwdDslSm107:
                 raise ValueError("sparse d256 forward (sm107): thd=True needs the metadata workspace at execute(workspace=) (scratch_workspace_bytes() bytes)")
             self._check_workspace(ws, self._NSEQ)
         gate = self._bind("gate", gate, self.gate, required=self.gate is not None)
+        # every pointer handed to the kernel with assumed_align=16 starts on a 16-byte boundary (a storage-offset view is refused by name)
+        for name, t in (("Q", q), ("K", k), ("V", v), ("O", o), ("block_ids", ids), ("the epilogue gate", gate)):
+            _require_16b_base(name, t)
         if self.split_kv > 1:
             ws = self.workspace if workspace is None else workspace
             if ws is None or isinstance(ws, SparseOperandDesc):

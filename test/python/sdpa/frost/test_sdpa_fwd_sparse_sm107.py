@@ -381,6 +381,8 @@ def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
         ),
         (lambda o: o.update(block_ids=_T((8, 512), (1024, 1), "torch.int64")), ValueError, "int32"),
         (lambda o: o.update(block_ids=_T((8, 256), (256, 1), "torch.int32")), ValueError, "block_ids must be"),
+        # Q is TMA-loaded: a (batch, seq, head) stride off the 16-byte grid (seq stride 24 x 256 + 4) is refused like the gate's
+        (lambda o: o.update(q=_T((1, 8, 24, D), (8 * (24 * D + 4), 24 * D + 4, D, 1), "torch.bfloat16")), ValueError, "multiples of 8 elements"),
     ],
 )
 def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word):
@@ -527,6 +529,27 @@ def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1():
     k1 = _T((1, 8, 2, D), (16 * 2 * D, 2 * D, D, 1), "torch.bfloat16")
     o1.update(k=k1, v=k1)
     assert SparseGqaFwdDslSm107(**o1).check_support()
+
+
+def test_adapter_refuses_a_misaligned_operand_base_by_name():
+    """Every operand pointer reaches the kernel with ``assumed_align=16`` (a TMA tensor map's base, the bulk-copy source of an ids
+    row), so a view that starts a few elements into its storage is refused BY NAME -- at execute for the bound tensors and at
+    check_support for a declared tensor; a storage-free declaration has no address yet and is skipped.  Host-only: the rule is
+    about addresses, not devices."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc, _require_16b_base
+
+    base = torch.empty(64 + 16, dtype=torch.bfloat16)
+    k0 = next(k for k in range(8) if (base.data_ptr() + 2 * k) % 16 == 0)  # the first element on a 16-byte boundary
+    _require_16b_base("Q", base[k0 : k0 + 64].view(1, 1, 8, 8))  # aligned: silent
+    with pytest.raises(ValueError, match="Q must start at a 16-byte aligned address"):
+        _require_16b_base("Q", base[k0 + 1 : k0 + 65].view(1, 1, 8, 8))  # 2 bytes off the boundary
+    _require_16b_base("K", SparseOperandDesc((1, 8, 2, 256), (4096, 512, 256, 1), torch.bfloat16))  # no storage: nothing to check
+    _require_16b_base("the epilogue gate", None)
+    # the call sites: the six pointers of a launch at execute and the declared tensors at check_support
+    src = _adapter_source()
+    assert src.count("_require_16b_base(name, t)") == 2, "execute and check_support each run the alignment rule over the operand list"
+    for name in ('("Q", q)', '("K", k)', '("V", v)', '("O", o)', '("block_ids", ids)', '("the epilogue gate", gate)'):
+        assert name in src, f"execute binds {name} through the alignment rule"
 
 
 def test_adapter_dsl_gate_declines_by_name_before_the_kernel_import(monkeypatch):
