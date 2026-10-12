@@ -91,7 +91,16 @@ def piece_budget(*, num_seqs, heads_out, num_sm, total_tokens, b_t, expand_num, 
     return min(int(num_sm) // tiles, CHAIN_MAX_PIECES, total_chunks // (num_seqs * CHAIN_MIN_UNITS_PER_PIECE * int(unit_chunks)))
 
 
-def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False):
+def chain_min_tokens(*, reverse):
+    """Total tokens below which the KDA chain lost to the uncut schedule at every head count measured (B200 and a 68-SM
+    SM100, CUDA-graph replay): the chain's own passes cost a fixed amount however short the pieces.  GDN does not use it:
+    its alternative, split-K, cuts only where the gates decay, so how it compares with the chain depends on the data."""
+    return 192 if reverse else 1024
+
+
+def choose_pieces(
+    *, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tokens, batch_invariant, expand_num, reverse=False, compose_tail=False, min_tokens=0
+):
     """``(pieces, unit_chunks)`` of one plan, a pure function of shapes shared by forward and backward; ``pieces`` is the
     slot budget per sequence, ``num_seqs * pieces`` the wave the piece table hands out, 0 when the plan does not chain.
     Boundaries are multiples of ``unit_chunks = lcm(expand_num, cadence_chunks)`` chunks.  Without ``batch_invariant`` the
@@ -102,7 +111,7 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
     ``batch_invariant`` the length rule applies: ``clamp(ceil(total / LENGTH_RULE_PIECE_TOKENS), 1, CHAIN_MAX_PIECES)``
     slots, each sequence filling ``ceil(len_b / LENGTH_RULE_PIECE_TOKENS)`` of them on device, so outputs are bitwise the
     same alone and in any batch; a provably one-piece batch runs uncut unless ``compose_tail`` (the summaries chain even
-    then)."""
+    then).  Below ``min_tokens`` total tokens the non-invariant plan does not chain."""
     b_t = int(b_t)
     expand_num = max(1, int(expand_num))
     cadence_chunks = max(1, int(cadence_tokens) // b_t)
@@ -112,6 +121,8 @@ def choose_pieces(*, num_seqs, heads_out, num_sm, total_tokens, b_t, cadence_tok
         if pieces == 1 and not compose_tail:
             return 0, unit_chunks
         return pieces, unit_chunks
+    if int(total_tokens) < int(min_tokens):
+        return 0, unit_chunks
     pieces = piece_budget(
         num_seqs=num_seqs, heads_out=heads_out, num_sm=num_sm, total_tokens=total_tokens, b_t=b_t, expand_num=expand_num, unit_chunks=unit_chunks
     )

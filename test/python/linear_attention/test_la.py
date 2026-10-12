@@ -440,6 +440,30 @@ def test_plan_name_pins_the_backend(backend, variant):
         op(variant)(*op_args(case), plan_name=f"{variant}_{backend.name}_absent")
 
 
+@pytest.mark.parametrize("variant", CUTILE_VARIANTS)
+def test_default_engine_is_frost(variant):
+    """Unpinned GDN/KDA graphs run FROST on SM100 / SM103 / SM107, where the cuTile engines also accept them.
+
+    The family factories' candidate order gives this today, and it is measured rather than incidental: reordering
+    them, a new engine or a family hook must keep it or bring its own B200 measurement.
+    """
+    major, minor = torch.cuda.get_device_capability()
+    if not (major == 10 and minor in (0, 3, 7)):
+        pytest.skip("FROST LA serves SM100 / SM103 / SM107 only")
+    from cudnn.linear_attention.ops import gdn, kda
+
+    cache = {"gdn": gdn, "kda": kda}[variant].fprop_cache
+    clear_caches()
+    try:
+        case = make_case(variant, torch.bfloat16, T=4 * CHUNK[variant])
+        with waive_declined(f"default {variant}"):
+            op(variant)(*op_args(case))
+        ((graph, *_),) = cache.values()
+        assert graph.selected_engine.name == f"{variant}_frost"
+    finally:
+        clear_caches()
+
+
 # ---------------------------------------------------------------------------
 # Forward parity
 # ---------------------------------------------------------------------------
@@ -3346,6 +3370,34 @@ CHAIN_BWD_TOL = 4e-2
 CHAIN_STATE_GRAD_TOL = 6e-2
 PIECE_TOKENS = 8192
 CHAIN_GATE_MODES = ("l2norm", "safe", "sigmoid_beta", "neg_eigval", "beta_guard")
+
+
+@pytest.fixture(autouse=True)
+def open_chain_floor(request, monkeypatch):
+    """``test_piece_chain_*`` and the ``schedule="chain"`` cases test the chain itself, so they chain wherever the slot
+    budget allows, below the KDA ``chain_min_tokens`` floor too."""
+    callspec = getattr(request.node, "callspec", None)
+    if request.node.originalname.startswith("test_piece_chain_") or (callspec is not None and callspec.params.get("schedule") == "chain"):
+        from cudnn.linear_attention.frost.common import piece_chain
+
+        monkeypatch.setattr(piece_chain, "chain_min_tokens", lambda **_: 0)
+
+
+def test_chain_min_tokens_floor():
+    """Below ``min_tokens`` the plan does not chain; the batch-invariant length rule ignores the floor."""
+    from cudnn.linear_attention.frost.common.piece_chain import chain_min_tokens, choose_pieces
+
+    def pieces(total, *, reverse, batch_invariant=False, compose_tail=False):
+        kw = dict(num_seqs=1, heads_out=32, num_sm=148, b_t=16, cadence_tokens=0, expand_num=1)
+        return choose_pieces(
+            total_tokens=total, batch_invariant=batch_invariant, reverse=reverse, compose_tail=compose_tail, min_tokens=chain_min_tokens(reverse=reverse), **kw
+        )[0]
+
+    assert pieces(1023, reverse=False) == 0
+    assert pieces(1024, reverse=False) == 4
+    assert pieces(191, reverse=True) == 0
+    assert pieces(192, reverse=True) == 3
+    assert pieces(512, reverse=False, batch_invariant=True, compose_tail=True) == 1
 
 
 def chain_case(variant, seq_lens, *, H=4, HK=None, HV=None, K=128, V=128, cu_dtype=torch.int32, seed=SEED):
