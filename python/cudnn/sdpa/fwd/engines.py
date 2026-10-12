@@ -776,12 +776,16 @@ def launch_grid_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts",
 
     The NATURAL scheduler launches heads and batch x split_kv on y/z; the LPT
     policies and the SM100+/SM120 ragged grids are flat. The d256 decode tile
-    keeps batch on y, and the SM80/SM90 ragged grids keep heads and batch on y/z,
-    under every policy.
+    keeps batch on y, the SM80/SM90 ragged grids keep heads and batch on y/z, and
+    the split-KV combine keeps heads and batch on y/z, under every policy. Packed
+    GQA launches fewer head rows; ``h_q`` bounds them from above because the
+    packing factor is per kernel flavor.
     """
     batch, heads = facts.b * (knobs.split_kv or 1), facts.h_q
     if max(batch, heads) <= _GRID_YZ_MAX:
         return None
+    if (knobs.split_kv or 1) > 1 and max(facts.b, heads) > _GRID_YZ_MAX:
+        return f"the split-KV combine launches heads={heads} and batch={facts.b} on gridDim.y/z, past the CUDA limit of {_GRID_YZ_MAX}"
     if d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _decode_tile_split_kv(knobs)):
         if facts.b <= _GRID_YZ_MAX:
             return None

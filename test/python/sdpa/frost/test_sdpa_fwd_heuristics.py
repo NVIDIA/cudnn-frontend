@@ -213,10 +213,13 @@ def test_grid_past_65535_rides_the_flat_lpt_grid(b, h):
     caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
     natural = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
     assert "gridDim.y/z" in engines.mismatch(caps, facts, natural)
+    # The split-KV combine launches heads and batch on y/z whatever the scheduler.
+    split_lpt = engines.SdpaFwdKnobs(sched_policy=SCHED_LPT, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+    assert "split-KV combine" in engines.launch_grid_mismatch(caps, facts, split_lpt)
     for kind in ("A", "FALLBACK"):
         plans = [p for p in recommend(kind, facts, _OFFERED) if p.engine_id == 20500]
         assert plans, kind
-        assert all(p.knobs.sched_policy in (SCHED_LPT, SCHED_LPT_L2) for p in plans), [p.knobs for p in plans]
+        assert all(p.knobs.sched_policy in (SCHED_LPT, SCHED_LPT_L2) and (p.knobs.split_kv or 1) == 1 for p in plans), [p.knobs for p in plans]
     control = _facts(b=65535, h_q=1, h_kv=1, s_q=128, s_kv=64, d_qk=64, d_v=64, causal=False)
     assert engines.mismatch(caps, control, natural) is None
     assert recommend("A", control, _OFFERED)[0].knobs.sched_policy == SCHED_NATURAL
