@@ -101,7 +101,7 @@ navigation:
           - page: Composing multi-kernel blocks in Python
             path: ../../utilities/composing_kernel_blocks.md
             slug: composing_kernel_blocks
-      - section: Graph API
+      - section: Experimental APIs
         collapsed: true
         slug: fe-oss-apis
         contents:
