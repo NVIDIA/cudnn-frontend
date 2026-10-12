@@ -2692,6 +2692,7 @@ def _softmax_warp_group(
         if cutlass.const_expr(PHANTOM_ENABLED):
             kv_last = bounds.right - cutlass.Int32(1)
             phantom_kv = cutlass.Int32(-1)
+            tail_phantom = cutlass.Boolean(False)
             _n_steps = bounds.right - bounds.left
             _pair_base = q_super_idx - cta_in_pair
             _diag = (eff_seqlen_kv - eff_seqlen_q) if cutlass.const_expr(CFG.BOTTOM_RIGHT) else cutlass.Int32(0)
@@ -2707,6 +2708,9 @@ def _softmax_warp_group(
                     (bounds.left + cutlass.Int32(1)) * cutlass.Int32(CFG.TILE_N) - cutlass.Int32(1) < _s1_first_q + _diag - cutlass.Int32(CFG.WINDOW_LEFT)
                 ):
                     phantom_kv = bounds.left
+            # An empty tile ([0, 0): every row of a bottom-right rectangle above the first key) has kv_last == -1 == the
+            # sentinel, and its MMA warp never arrives on mb_bmm1_done: only a real step index selects the tail phantom.
+            tail_phantom = (phantom_kv >= cutlass.Int32(0)) & (phantom_kv == kv_last)
         alpha_addr = tmem_ptr_i32.load() + cutlass.Int32((LAYOUT.O0_OFF if sub_tile_id == 0 else LAYOUT.O1_OFF) + CFG.TILE_O - 1)
         # 3-segment kv loop: LEFT-masked / unmasked (fast HW max) / RIGHT-masked.
         # MASK_NONE: bounds collapse so masked sub-loops fold out at trace time.
@@ -2751,7 +2755,7 @@ def _softmax_warp_group(
                         leader_cta_id,
                         pv0_done_phase,
                     )
-                if phantom_kv == kv_last:
+                if tail_phantom:
                     seg_hi = seg_hi - cutlass.Int32(1)
             for kv_loop in cutlass.range(seg_lo, bounds.unmasked_lo, 1, unroll=1):
                 total_max, total_sum, bmm1_phase, stat_empty_phase, p_inplace_phase, alpha_addr = _softmax_kv_body(
@@ -2818,7 +2822,7 @@ def _softmax_warp_group(
                 )
 
         if cutlass.const_expr(PHANTOM_ENABLED):
-            if phantom_kv == kv_last:
+            if tail_phantom:
                 bmm1_phase, stat_empty_phase, p_inplace_phase = _softmax_phantom_step(
                     sub_tile_id, tmem_ptr_i32, bars, mb_softmax_ldtm, mb_p_inplace, bmm1_phase, stat_empty_phase, p_inplace_phase, leader_cta_id, pv0_done_phase
                 )
