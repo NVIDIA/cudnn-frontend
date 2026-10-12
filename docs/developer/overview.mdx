@@ -148,7 +148,7 @@ There are two flavors of this API:
 
   ```
   cudnn_frontend::error_t
-  cudnn_frontend::Graph::build_plan_at_index(
+  cudnn_frontend::graph::Graph::build_plan_at_index(
       cudnnHandle_t const &handle,
       int64_t plan_index
   );
@@ -191,11 +191,11 @@ cudnn_frontend::graph::Graph::execute(
 );
 ```
 
-The execute API also takes a plan index to target a specific plan. This may be used when autotuning, in conjunction with the `build_plan_at_index(...)` API.
+Use `execute_plan_at_index(...)` to target a specific plan. This may be used when autotuning, in conjunction with the `build_plan_at_index(...)` API.
 
 ```
 cudnn_frontend::error_t
-cudnn_frontend::graph::Graph::execute(
+cudnn_frontend::graph::Graph::execute_plan_at_index(
     cudnnHandle_t handle,
     std::unordered_map<std::shared_ptr<Tensor>, void *> var_pack,
     void* workspace,
