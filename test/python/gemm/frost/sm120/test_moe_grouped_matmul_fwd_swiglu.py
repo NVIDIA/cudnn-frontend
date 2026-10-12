@@ -928,3 +928,36 @@ def test_dual_moe_grouped_matmul_fwd_swiglu_spilling_config_runs(cfg_name, cta_g
         atol=5e-2,
         rtol=5e-2,
     )
+
+
+@requires_sm120
+def test_dual_moe_grouped_matmul_fwd_swiglu_auto_pick_keeps_two_ab_stages() -> None:
+    """The automatic dual-GEMM pick keeps a two-stage AB ring: select_config's
+    128x128 holds one stage of the token and both weights' tiles next to the
+    epilogue staging, which serializes every K tile's load and MMA (the re-cut
+    ran 1.13-1.67x faster on the measured layers). The pick keeps the CTA height
+    and computes the same function -- here 128x96, whose last N tile is ragged."""
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    S, N, K, E = 8192, 2048, 4096, 8
+    offset_values = [0, 5, 5, 1029, 2100, 3000, 4800, 6000, 6001, 7000, 7000, 7500, 7600, 8000, 8100, 8150, S]
+    num_groups = len(offset_values) - 1
+    graph = _build_graph(E, S, N, K, num_groups)
+    chain = analyze(graph)
+    cfg = C.plan_config(chain)
+    assert cfg.pipeline == "sm120" and cfg.cta_tile_m == 128, cfg.name
+    assert select_template(chain, cfg).multi_gemm_ab_stages(chain, cfg)[0] >= 2, cfg.name
+    compiled = _plan(graph, config=cfg)
+
+    torch.manual_seed(0)
+    token = torch.randn(1, S, K, dtype=torch.bfloat16, device="cuda") * 0.25
+    w0 = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda") * 0.05
+    w1 = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda") * 0.05
+    scale = torch.tensor([[[0.5]]], dtype=torch.float32, device="cuda")
+    out = torch.zeros(1, S, N, dtype=torch.bfloat16, device="cuda")
+    offsets = torch.tensor(offset_values, dtype=torch.int32, device="cuda")
+
+    compiled(_vp_mg(compiled, [(token, w0), (token, w1)], out, scale, fto=offsets))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[0], _ref(token, w0, w1, offsets, scale, S, N, E, num_groups), atol=5e-2, rtol=5e-2)

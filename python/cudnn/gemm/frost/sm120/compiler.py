@@ -3590,11 +3590,74 @@ def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
     config = preferred_strategy(chain, config)
+    config = _multi_gemm_stage_config(chain, config)
     config = _row_per_lane_quant_config(chain, config)
     # skip splitK for MoE and dynamic shapes
     if chain.has_moe or dynamic_shapes:
         return config
     return _auto_split_k(chain, config)
+
+
+# The AB ring depth the automatic multi-GEMM pick keeps: a one-stage ring
+# serializes every K tile's TMA load and MMA.
+_MULTI_GEMM_MIN_AB_STAGES = 2
+# Re-cut warp grids, most preferred first (4x2 measured fastest at 128x64).
+_MULTI_GEMM_WARP_GRIDS = ((4, 2), (2, 4), (8, 1), (1, 8))
+
+
+def _multi_gemm_stage_config(chain: FusionChain, config: TileConfig) -> TileConfig:
+    """The automatic pick for a multi-GEMM chain.
+
+    ``tile_config.select_config`` sizes the tile without the operand count, yet
+    each parallel GEMM adds a B tile (with its scale-factor box) to every AB
+    stage: at two GEMMs one 128x128 stage already fills the SMEM next to the
+    epilogue staging. On 24 measured MoE layers (bf16 and block-scaled, NONE
+    and GATHER, 2 and 3 GEMMs) this re-cut beat the one-stage pick by 1.19x
+    geomean (0.97x-1.67x). Keep the pick when its ring holds
+    :data:`_MULTI_GEMM_MIN_AB_STAGES`; else keep the CTA height and narrow the N
+    tile (preferred warp grid first) until a cataloged geometry holds them and
+    the full probe accepts it. A chain no narrower tile serves keeps the pick,
+    so the decline keeps its reason."""
+    if chain.num_gemms < 2 or config.swap_ab or config.pipeline != "sm120":
+        return config
+    from ..kernel_registry import select_template
+    from ..tile_config import CATALOG
+
+    def stages(cfg: TileConfig) -> int:
+        try:
+            return select_template(chain, cfg).multi_gemm_ab_stages(chain, cfg)[0]
+        except (NotImplementedError, ValueError, KeyError):
+            return 0
+
+    if stages(config) >= _MULTI_GEMM_MIN_AB_STAGES:
+        return config
+
+    def order(c: TileConfig) -> tuple:
+        grid = (c.cta_tile_m // c.warp_tile_m, c.cta_tile_n // c.warp_tile_n)
+        return (-c.cta_tile_n, _MULTI_GEMM_WARP_GRIDS.index(grid) if grid in _MULTI_GEMM_WARP_GRIDS else len(_MULTI_GEMM_WARP_GRIDS), c.name)
+
+    narrower = sorted(
+        (
+            c
+            for c in CATALOG
+            if c.pipeline == config.pipeline
+            and c.split_k_slices == 1
+            and not c.swap_ab
+            and c.cta_tile_m == config.cta_tile_m
+            and c.cta_tile_k_bytes == config.cta_tile_k_bytes
+            and c.cta_tile_n < config.cta_tile_n
+        ),
+        key=order,
+    )
+    for cand in narrower:
+        if stages(cand) < _MULTI_GEMM_MIN_AB_STAGES:
+            continue
+        try:
+            probe_chain(chain, cand)
+        except (NotImplementedError, ValueError):
+            continue
+        return cand
+    return config
 
 
 # Per-thread accumulator registers (all GEMMs of the chain) the auto pick keeps a

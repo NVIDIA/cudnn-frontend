@@ -691,3 +691,95 @@ def test_dual_moe_grouped_block_scale_matmul_fwd_swiglu_n_major_weights(swap_ab)
         ex = gi % E
         ref[b:e] = torch.nn.functional.silu(tok_s[b:e] @ w0_s[ex].T) * (tok_s[b:e] @ w1_s[ex].T) * 0.5
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_dual_moe_block_scale_auto_pick_keeps_two_ab_stages(combo) -> None:
+    """The automatic dual block-scale pick keeps a two-stage AB ring:
+    select_config's 128x128 holds one stage of the token, both weights and their
+    scale-factor boxes next to the epilogue staging, which serializes every K
+    tile's load and MMA (the 128x64 re-cut ran up to 1.41x faster)."""
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    chain = analyze(_build_graph(8, 8192, 2048, 4096, 8, combo))
+    cfg = C.plan_config(chain)
+    assert cfg.pipeline == "sm120" and cfg.cta_tile_m == 128, cfg.name
+    assert select_template(chain, cfg).multi_gemm_ab_stages(chain, cfg)[0] >= 2, cfg.name
+
+
+@requires_sm120
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp8"])
+def test_triple_moe_block_scale_auto_pick(combo) -> None:
+    """Three parallel block-scaled GEMMs cap the N tile at 64. select_config used
+    to apply the tcgen05 rule (whole 128-wide SF blocks) and raise, so the graph
+    had no automatic plan on sm120, whose warp MMA takes any CTA tile that
+    divides the 128-row block. The pick now keeps a two-stage ring and computes
+    silu(A @ B0) * (A @ B1) * scale + A @ B2 over ragged groups with an empty one."""
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    dt = cudnn.data_type
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, S, N, K = 2, 1024, 256, 512
+    offsets_list = [0, 1, 1, 304, 401, 513, S]
+    num_groups = len(offsets_list) - 1
+    block_size, a_dt, sf_dt = _COMBOS[combo]
+    sf_k = K // block_size
+
+    g = cudnn.pygraph(io_data_type=dt.BFLOAT16, intermediate_data_type=dt.FLOAT, compute_data_type=dt.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=a_dt)
+    sfa = g.tensor(name="SFA", dim=[1, S, sf_k], stride=[S * sf_k, sf_k, 1], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
+    fto = g.tensor(name="first_token_offset", dim=[num_groups + 1, 1, 1], stride=[1, 1, 1], data_type=dt.INT32)
+    sf = g.tensor(name="scaleFactor", dim=[1, 1, 1], stride=[1, 1, 1], data_type=dt.FLOAT)
+    tok_d = g.block_scale_dequantize(input=tok, descale=sfa, block_size=[1, block_size])
+    cs = []
+    for i in range(3):
+        w = g.tensor(name=f"weight{i}", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
+        sfb = g.tensor(name=f"SFB{i}", dim=[E, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4)
+        w_d = g.block_scale_dequantize(input=w, descale=sfb, block_size=[block_size, 1])
+        cs.append(g.moe_grouped_matmul(tok_d, w_d, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=dt.FLOAT))
+    y = g.add(a=g.mul(a=g.mul(a=g.swish(input=cs[0]), b=cs[1]), b=sf), b=cs[2])
+    y.set_output(True).set_data_type(dt.BFLOAT16)
+
+    chain = analyze(g)
+    assert chain.num_gemms == 3
+    cfg = C.plan_config(chain)
+    assert cfg.pipeline == "sm120" and cfg.cta_tile_n < 128, cfg.name
+    assert select_template(chain, cfg).multi_gemm_ab_stages(chain, cfg)[0] >= 2, cfg.name
+    compiled = _plan(g, config=cfg)
+
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    tok_rt, tok_deq = _mk_operand(combo, 1, S, K, dev, lut)
+    tok_deq = tok_deq.view(S, K)
+    ws = [_mk_operand(combo, E, N, K, dev, lut) for _ in range(3)]
+    sfa_log = _mk_sf(combo, (S, sf_k), dev)
+    sfb_logs = [_mk_sf(combo, (E, N, sf_k), dev) for _ in range(3)]
+    scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
+
+    # torch.cat has no CUDA E8M0 kernel once an (empty) group's slice is in the
+    # list: join the scale blocks as bytes.
+    def _cat(parts):
+        return torch.cat([p.view(torch.uint8) for p in parts]).view(parts[0].dtype)
+
+    sfa_blk = _with_static_segmented_capacity(
+        _cat([_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]) for gi in range(num_groups)]), S, num_groups, sf_k
+    )
+    sfb_blks = [_cat([_to_blocked(s[e]) for e in range(E)]).view(E, sf_k, N) for s in sfb_logs]
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.zeros(1, S, N, dtype=torch.bfloat16, device=dev)
+    compiled(_vp_moe_bs_mg(compiled, [((tok_rt, sfa_blk), (w_rt, sfb)) for (w_rt, _), sfb in zip(ws, sfb_blks)], offsets, output, scale))
+    torch.cuda.synchronize()
+
+    tok_s = tok_deq * sfa_log.float().repeat_interleave(block_size, 1)
+    w_s = [w_deq * s.float().repeat_interleave(block_size, 2) for (_, w_deq), s in zip(ws, sfb_logs)]
+    ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
+    for gi in range(num_groups):
+        b, e = offsets_list[gi], offsets_list[gi + 1]
+        if b == e:
+            continue
+        a, ex = tok_s[b:e], gi % E
+        ref[b:e] = torch.nn.functional.silu(a @ w_s[0][ex].T) * (a @ w_s[1][ex].T) * 0.5 + a @ w_s[2][ex].T
+    torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)

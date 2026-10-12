@@ -1013,7 +1013,11 @@ def select_config(
         early_pair = block_scale and not m_is_group_average and 2 * (-(-N // cta_n)) <= sm
         cta_group = 2 if (M > cta_m or early_pair) else 1
 
-    if block_scale:
+    # The tcgen05 SF swizzle needs whole 128-wide blocks per MMA. The sm120 warp
+    # MMA reads its scales from registers, so a CTA tile there only has to be a
+    # multiple or a divisor of the 128-row block (validate_block_scale_config_sm120)
+    # -- every n_axis width is -- and 3+ parallel GEMMs keep their sub-128 N tile.
+    if block_scale and _pipeline != "sm120":
         cta_m = max(cta_m, 128)
         cta_n = max(cta_n, 128)
         if cta_n > cta_n_max:
