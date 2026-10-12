@@ -66,7 +66,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import opaque_f32_zero, softplus
 
 from .host import get_dtype
@@ -484,7 +484,6 @@ def frost_split_k_plan(
     rerunning the span choice; with the plan at -1 nothing more is written."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     sCut = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
@@ -635,8 +634,6 @@ def frost_split_k_scan_scalar(
                     total = total + sPartial[cutlass.Int32(w * WARP_SIZE) + lane_idx]
                 if h_ok:
                     mChunkVals[chunk_value_base + c, h] = total
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.kernel
@@ -836,8 +833,6 @@ def frost_split_k_walk(
                 batch_end,
                 batch_num_chunks,
             )
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit

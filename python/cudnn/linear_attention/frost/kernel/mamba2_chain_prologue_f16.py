@@ -25,7 +25,7 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda.tensor_map as tma
 import cutlass.experimental.primitives as nvvm
 
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common.piece_chain import piece_table_body
 from ..common.gate_bwd import exit_slot_table_body
@@ -82,7 +82,6 @@ def frost_mamba2_chain_prologue(
 ) -> None:
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     widx = tidx // cutlass.Int32(32)
     bidx = cutlass.Int32(cute.arch.block_idx()[0])
@@ -268,18 +267,18 @@ def chain_prologue(
         base_desc_o = tma.create_tensor_map_tiled_from_view(o_headed, box_dims=(box_elements, 1, bt), stride_order=(0, 1, 2), swizzle=swizzle_128b)
     base_desc_checkpoint = base_desc_v
     if cutlass.const_expr(checkpoints is not None):
-        d_k_state = checkpoints.shape[2]
-        d_v_state = checkpoints.shape[3]
+        d_v_state = checkpoints.shape[2]
+        d_k_state = checkpoints.shape[3]
         checkpoint_box_elements = 128 // (checkpoints.element_type.width // 8)
         checkpoint_view = cute.make_tensor(
             checkpoints.iterator,
             cute.make_layout(
-                (d_v_state, d_k_state, checkpoints.shape[0], heads_out_q),
+                (d_k_state, d_v_state, checkpoints.shape[0], heads_out_q),
                 stride=(checkpoints.stride[3], checkpoints.stride[2], checkpoints.stride[0], checkpoints.stride[1]),
             ),
         )
         base_desc_checkpoint = tma.create_tensor_map_tiled_from_view(
-            checkpoint_view, box_dims=(checkpoint_box_elements, d_k_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle_128b
+            checkpoint_view, box_dims=(checkpoint_box_elements, d_v_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle_128b
         )
     base_desc_z = base_desc_v
     if cutlass.const_expr(z is not None):

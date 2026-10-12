@@ -72,7 +72,6 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
     PipelineState,
     advance,
-    launch_dependent_grids,
     wait_on_dependent_grids,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
@@ -534,8 +533,6 @@ def tmaldg_warp(
     for _ in range(cfg.smem_v_stages):
         bars.mb_v_done[v_index.idx].wait(v_index.phase)
         v_index = advance(v_index, cfg.smem_v_stages)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1157,7 +1154,6 @@ def frost_mamba2_recompute_prologue(
     one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -1349,7 +1345,7 @@ def host(
     num_descs = batch_size
 
     # ---- launch ----------------------------------------------------------------------
-    grid_shape = (cfg.max_active_clusters, 1, 1)
+    grid_shape = (cutlass.min(cutlass.Int32(cfg.max_active_clusters), cutlass.max(cutlass.Int32(work_items.shape[0]), cutlass.Int32(1))), 1, 1)
 
     frost_mamba2_recompute(
         cfg,

@@ -33,7 +33,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fp32_to_fp16
 from cudnn.frost.tile_dsl.tma import (
     cp_async_commit,
@@ -822,8 +822,6 @@ def frost_state_chain(
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 8):
                             st_global_v4(summary_m_addr + cutlass.Int64(16 * q), summary_words[4 * q : 4 * q + 4], cutlass.Int32)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1050,8 +1048,9 @@ def frost_scalar_state_chain(
     one) and ``X[j + 1] = gamma[j] X[j] + H[j]``, every slot's incoming state.  ``reverse`` (the backward chain):
     ``X[last] = seed`` and ``X[j - 1] = gamma[j] X[j] + H[j]`` with ``H`` the per-slot gradient summaries, every slot's
     outgoing gradient.  A one-slot sequence receives the seed copy.  Every lane owns four consecutive state columns.
-    The summaries and transitions of every slot (at most ``CHAIN_MAX_PIECES``) are loaded before the walk, from one base
-    address per tensor advanced by the slot stride, so the walk is the stores and packed fma steps with no round trip.
+    The slots go ``CHAIN_MAX_PIECES`` at a time (a long sequence of an uneven batch holds more): every summary and
+    transition of a burst is loaded before its walk, from one base address per tensor advanced by the slot stride, so the
+    walk is the stores and packed fma steps with no round trip.
     ``H`` / ``X`` fp32 ``[slots, HO, V, K]``, ``mTransition`` fp32 ``[slots, HO]`` the log2 of each slot's decay product,
     ``seed`` fp32 or 16-bit ``[num_seqs, HO, V, K]`` (``mSeedIndices`` names its row per sequence)."""
     K = cutlass.const_expr(dim_k)
@@ -1138,33 +1137,38 @@ def frost_scalar_state_chain(
                 for e in cutlass.range_constexpr(4):
                     cur[4 * i + e] = seed_vals[e]
 
-    # ---- every slot's summary and transition in one burst before the walk --------------------
+    # ---- the slots in bursts of CHAIN_MAX_PIECES: every summary and transition of the burst, then its walk ------
     gamma = cutlass.Array(cutlass.Float32, CHAIN_MAX_PIECES)
     summary = cutlass.Array(cutlass.Float32, 4 * per_thread * CHAIN_MAX_PIECES)
-    for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
-        if cutlass.Int32(j + 1) < count:
-            gamma[j] = cute.math.exp2(ld_global(transition_base + cutlass.Int64(j) * transition_step, cutlass.Float32), fastmath=True)
-            for i in cutlass.range_constexpr(per_thread):
-                vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
-                if vec < cutlass.Int32(n_vec):
-                    summary_vals = ld_global_v4(h_base[i] + cutlass.Int64(j) * h_step, cutlass.Float32)
-                    for e in cutlass.range_constexpr(4):
-                        summary[(j * per_thread + i) * 4 + e] = summary_vals[e]
-
-    # ---- the walk: store this slot's incoming value, then fold its summary toward the next ---
-    for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
-        if cutlass.Int32(j) < count:
-            for i in cutlass.range_constexpr(per_thread):
-                vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
-                if vec < cutlass.Int32(n_vec):
-                    st_global_v4(x_base[i] + cutlass.Int64(j) * x_step, [cur[4 * i + e] for e in range(4)], cutlass.Float32)
-            if cutlass.Int32(j + 1) < count:
+    burst_first = cutlass.Int32(0)
+    while burst_first < count:
+        left = count - burst_first
+        burst_x = cutlass.Int64(burst_first) * x_step
+        burst_h = cutlass.Int64(burst_first) * h_step
+        burst_transition = cutlass.Int64(burst_first) * transition_step
+        for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
+            if cutlass.Int32(j + 1) < left:
+                gamma[j] = cute.math.exp2(ld_global(transition_base + burst_transition + cutlass.Int64(j) * transition_step, cutlass.Float32), fastmath=True)
                 for i in cutlass.range_constexpr(per_thread):
-                    base = (j * per_thread + i) * 4
-                    cur[4 * i], cur[4 * i + 1] = ffma2(gamma[j], gamma[j], cur[4 * i], cur[4 * i + 1], summary[base], summary[base + 1])
-                    cur[4 * i + 2], cur[4 * i + 3] = ffma2(gamma[j], gamma[j], cur[4 * i + 2], cur[4 * i + 3], summary[base + 2], summary[base + 3])
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
+                    vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+                    if vec < cutlass.Int32(n_vec):
+                        summary_vals = ld_global_v4(h_base[i] + burst_h + cutlass.Int64(j) * h_step, cutlass.Float32)
+                        for e in cutlass.range_constexpr(4):
+                            summary[(j * per_thread + i) * 4 + e] = summary_vals[e]
+
+        # ---- the walk: store this slot's incoming value, then fold its summary toward the next ---
+        for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
+            if cutlass.Int32(j) < left:
+                for i in cutlass.range_constexpr(per_thread):
+                    vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+                    if vec < cutlass.Int32(n_vec):
+                        st_global_v4(x_base[i] + burst_x + cutlass.Int64(j) * x_step, [cur[4 * i + e] for e in range(4)], cutlass.Float32)
+                if cutlass.Int32(j + 1) < left:
+                    for i in cutlass.range_constexpr(per_thread):
+                        base = (j * per_thread + i) * 4
+                        cur[4 * i], cur[4 * i + 1] = ffma2(gamma[j], gamma[j], cur[4 * i], cur[4 * i + 1], summary[base], summary[base + 1])
+                        cur[4 * i + 2], cur[4 * i + 3] = ffma2(gamma[j], gamma[j], cur[4 * i + 2], cur[4 * i + 3], summary[base + 2], summary[base + 3])
+        burst_first = burst_first + cutlass.Int32(CHAIN_MAX_PIECES)
 
 
 @cute.jit
@@ -1246,3 +1250,6 @@ def run_scalar_state_chain(compiled: CompiledScalarStateChain, num_seqs, H, tran
     ``transition`` fp32 ``[slots, HO]`` (log2 decay products), ``seed`` ``[num_seqs, HO, V, K]`` in its built dtype (None
     when not built), ``main_rows`` int32 ``[num_seqs + 1]``, ``seed_indices`` int32 ``[num_seqs]`` when built with them."""
     compiled.compiled(int(num_seqs), H, transition, X, seed, main_rows, seed_indices, cuda.CUstream(int(stream)))
+
+
+frost_scalar_state_chain.set_name_prefix("cudnn", remove_cutlass_symbol=False)

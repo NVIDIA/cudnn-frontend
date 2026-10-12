@@ -33,7 +33,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 import cutlass.experimental.cuda.tensor_map as tma
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 from ..common import split_k
 from ..common.host import get_dtype
@@ -99,7 +99,6 @@ def frost_gdn_regenerate_prologue(
     warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)

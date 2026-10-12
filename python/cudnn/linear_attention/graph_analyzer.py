@@ -252,6 +252,8 @@ def analyze(graph: "cudnn.pygraph") -> Optional[LaGraphFacts]:
         invalid = "MAMBA2 d must be [HO] (per head) or [HO, V] (per channel)"
     elif is_mamba2 and "O_pre" in (outs if not is_bwd else ins) and "z" not in ins:
         invalid = "the pre-gate output O_pre exists only with the z gate"
+    elif is_mamba2 and is_bwd and "z" in ins and "O_pre" not in ins:
+        invalid = "the z-gate backward needs the forward's pre-gate output O_pre"
     elif is_mamba2 and not is_bwd and not is_summary and bool(params.get("output_pre_gate", False)) and "O_pre" not in outs:
         invalid = "output_pre_gate requires the O_pre output"
     elif is_mamba2 and float(params.get("dt_min", 0.0) or 0.0) > float(

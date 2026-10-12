@@ -88,7 +88,6 @@ from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_
 from .kda_recompute_config import CFG
 
 from cudnn.frost.tile_dsl.barrier import (
-    launch_dependent_grids,
     wait_on_dependent_grids,
     advance,
     MBarrier,
@@ -739,8 +738,6 @@ def tmaldg_warp(
 
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         tile_idx, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1866,9 +1863,8 @@ def build_descs_body(
         nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
     if cutlass.const_expr(state_checkpoints is not None):
         if widx == 3:
-            if nvvm.elect_sync():
-                emit_checkpoint_seq_descs(base_checkpoint, desc_words_checkpoint, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2)
-                nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
+            emit_checkpoint_seq_descs(base_checkpoint, desc_words_checkpoint, cu_seqlens, state_checkpoints, n_batch, checkpoint_every_n, 2, lanes=32)
+            nvvm.fence_proxy_release(nvvm.MemScope.GPU, from_proxy=nvvm.Proxy.GENERIC, to_proxy=nvvm.Proxy.TENSORMAP)
 
 
 @cute.kernel
@@ -1902,7 +1898,6 @@ def frost_kda_recompute_prologue(
     arrays via :func:`build_descs_body`, one warp per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)

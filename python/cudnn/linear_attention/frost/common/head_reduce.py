@@ -34,7 +34,7 @@ from .host import get_dtype
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, fp32_to_fp16, opaque_f32_zero
 from cudnn.frost.tile_dsl.tma import ld_global_v4, st_global_v4
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 
 USE_PDL = True
 
@@ -87,8 +87,6 @@ def frost_head_reduce(
                 acc_hi = hi if i == 0 else acc_hi + hi
                 addr = addr + cutlass.Int64(inner_words)
             (out_p + out_off).store(fp32_to_fp16(acc_lo, acc_hi, dtype=io_dtype))
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -229,8 +227,6 @@ def frost_mamba2_head_group_reduce_dot_product(
                 cutlass.Int64(row) * cutlass.Int64(mDst.stride[0]) + cutlass.Int64(g) * cutlass.Int64(mDst.stride[1]) + k0
             ) * cutlass.Int64(2)
             st_global_v4(destination_address, out, cutlass.Int32)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit

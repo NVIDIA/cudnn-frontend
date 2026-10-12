@@ -34,6 +34,39 @@ from ..common.host import get_dtype
 from ..common.piece_chain import dtype_name, launch_scalar_state_chain
 from . import mamba2_chain_prologue_f16, mamba2_prefill_f16, mamba2_recompute_f16
 
+CHAIN_FORWARD_BUFFERS = (
+    "q",
+    "k",
+    "v",
+    "gate",
+    "a",
+    "dt_bias",
+    "d",
+    "z",
+    "o",
+    "o_pre",
+    "cu_seqlens",
+    "cu_pieces",
+    "main_rows",
+    "summary_rows",
+    "main_count",
+    "summary_count",
+    "work_items",
+    "work_items_summary",
+    "scheduler_all",
+    "scheduler_summary",
+    "scheduler_prefill",
+    "words",
+    "state_h",
+    "transition",
+    "state_x",
+    "seed",
+    "seed_indices",
+    "final_state",
+    "final_indices",
+    "checkpoints",
+)
+
 chain_forward_cache = {}
 
 
@@ -418,6 +451,8 @@ def run_chain_forward(
     stream,
 ) -> None:
     """Replay the chain forward: one crossing into the DSL for the four launches."""
+    buffers = dict(locals())
+    buffers["checkpoints"] = checkpoints if int(checkpoint_every_n_tokens) > 0 else None
     compiled(
         int(pieces),
         int(heads_out),
@@ -425,35 +460,6 @@ def run_chain_forward(
         int(checkpoint_every_n_tokens),
         float(dt_min),
         float(dt_max),
-        q,
-        k,
-        v,
-        gate,
-        a,
-        dt_bias,
-        d,
-        z,
-        o,
-        o_pre,
-        cu_seqlens,
-        cu_pieces,
-        main_rows,
-        summary_rows,
-        main_count,
-        summary_count,
-        work_items,
-        work_items_summary,
-        scheduler_all,
-        scheduler_summary,
-        scheduler_prefill,
-        words,
-        state_h,
-        transition,
-        state_x,
-        seed,
-        seed_indices,
-        final_state,
-        final_indices,
-        checkpoints if int(checkpoint_every_n_tokens) > 0 else None,
+        *(buffers[name] for name in CHAIN_FORWARD_BUFFERS),
         cuda.CUstream(int(stream)),
     )

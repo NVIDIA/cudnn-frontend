@@ -132,7 +132,6 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
     PipelineState,
     advance,
-    launch_dependent_grids,
     wait_on_dependent_grids,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
@@ -1694,8 +1693,6 @@ def tmaldg_warp(
         for _ in range(cfg.smem_t_inv_stages):
             bars.mb_t_inv_done[tinv_index.idx].wait(tinv_index.phase)
             tinv_index = advance(tinv_index, cfg.smem_t_inv_stages)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -3318,7 +3315,6 @@ def frost_gdn_bprop_prologue(
     per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)

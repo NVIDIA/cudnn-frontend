@@ -3046,16 +3046,6 @@ def _gdp_o_dims(node):
     return [q[0], max(q[1], v[1]), v[2]]
 
 
-def _mamba2_state_checkpoints_dims(node):
-    # [rows, HO, K, V]: the Mamba-2 checkpoint tile is the kernel's state orientation (d_k rows, d_v contiguous)
-    n = int(node.params.get("checkpoint_every_n_tokens", 0) or 0)
-    q, v = node.inputs["q"].dim, node.inputs["v"].dim
-    cu = node.inputs["cu_seqlens"].dim if node.inputs.get("cu_seqlens") is not None else None
-    if not n or not q or not v or not cu:
-        return None
-    return [max(v[0] // n + (cu[0] - 1), 1), max(q[1], v[1]), q[2], v[2]]
-
-
 def _mamba2_transition_dims(node):
     # [N, HO]: the Mamba-2 piece transition is one scalar (log2 of the decay product) per sequence and head
     g = node.inputs["g"].dim
@@ -3359,7 +3349,7 @@ _STRUCTURED_OPS = {
         infer={
             "O": _linear_attention_o_dims,
             "final_state": _linear_attention_final_state_dims,
-            "state_checkpoints": _mamba2_state_checkpoints_dims,
+            "state_checkpoints": _linear_attention_state_checkpoints_dims,
             "O_pre": _linear_attention_o_dims,
         },
         python_only=True,

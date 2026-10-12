@@ -970,6 +970,33 @@ def test_bwd_skip_gate(backend, variant, per_channel, with_z):
         assert_rms_close(f"d{name}", got, want, BWD_TOL[case.dtype])
 
 
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", ["mamba2"])
+def test_bwd_z_gate_strided_views_bitwise(backend, variant):
+    """z and dO handed in as head-padded views (stride-1 innermost dim, wider outer strides) give o, dz and the data
+    gradients bitwise equal to their dense copies: the z-gate backward reads every tensor through its own strides."""
+    case = make_case(variant, torch.bfloat16, B=2, T=320)
+    tensors = case_tensors(case)
+    set_seed(SEED + 2)
+    z_store = torch.randn(case.B * case.T, case.HV + 1, case.V, device="cuda").to(case.dtype)
+    do_store = torch.randn(case.B * case.T, case.HO + 1, case.V, device="cuda").to(case.dtype)
+    params = {name: t.detach().clone() for name, t in family_params(case).items()}
+    results = []
+    for dense in (True, False):
+        leaves = {name: to_thd(t).detach().clone().requires_grad_(True) for name, t in tensors.items()}
+        z = z_store[:, : case.HV].contiguous() if dense else z_store[:, : case.HV]
+        dO = do_store[:, : case.HO].contiguous() if dense else do_store[:, : case.HO]
+        assert dense or not (z.is_contiguous() or dO.is_contiguous())
+        z = z.detach().requires_grad_(True)
+        with waive_unsupported(backend, variant):
+            o, _ = pinned_op(backend, variant)(*leaves.values(), case.cu, *params.values(), z=z)
+            grads = torch.autograd.grad(o, list(leaves.values()) + [z], dO)
+        results.append((o, grads))
+    assert_bitwise("o", results[1][0], results[0][0])
+    for name, got, want in zip(list(leaves) + ["z"], results[1][1], results[0][1]):
+        assert_bitwise(f"d{name}", got, want)
+
+
 @pytest.mark.parametrize("H,HK,HV,V", [(H, HK, HV, 128) for H, HK, HV in GQA_CONFIGS] + [(4, 4, 1, 64), (4, 1, 1, 64), (1, 2, 2, 64)])
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_bwd_gqa_qk_l2norm(backend, variant, H, HK, HV, V):
@@ -3590,6 +3617,7 @@ def test_gate_domain_summary_linear(backend, variant):
 CHAIN_RAGGED = [497, 16, 1, 480, 0, 253, 4096]
 CHAIN_SHAPES = [([4096], 4), ([4096], 37), (CHAIN_RAGGED, 4)]
 CHAIN_SHAPE_IDS = ["1x4096x4", "1x4096x37", "ragged"]
+MANY_SLOT_LENGTHS = [16256, 128]
 CHAIN_VS_UNCUT_TOL = 1e-2
 CHAIN_GATE_GRAD_TOL = 2e-2
 CHAIN_FWD_TOL = 2e-2
@@ -3903,6 +3931,21 @@ def test_piece_chain_bwd_matches_uncut_and_reference(backend, variant, seq_lens,
     if cadence == 0:
         for name, want in chain_reference_grads(case, state0, dO, d_final).items():
             assert_rms_close(f"d{name} vs fp64", grads[name], want, CHAIN_STATE_GRAD_TOL if name == "initial_state" else CHAIN_BWD_TOL)
+
+
+@pytest.mark.parametrize("backend", ["frost"], indirect=True)
+@pytest.mark.parametrize("variant", ["mamba2"])
+def test_piece_chain_many_slots_matches_uncut(backend, variant):
+    """An uneven two-sequence batch on one head: the one-wave budget is 16 slots per sequence and the long sequence takes
+    most of the wave, more slots than one burst of the scalar chain; o, final_state and every gradient against the batch
+    run whole."""
+    case = chain_case(variant, MANY_SLOT_LENGTHS, H=1)
+    state0, d_final = random_state(case), random_state(case, scale=0.1, seed=SEED + 3)
+    o, fs, grads, dO, _ = chain_grads(backend, case, initial_state=state0, d_final_state=d_final)
+    o_uncut, fs_uncut, grads_uncut, _, _ = chain_grads(backend, case, batch_invariant=True, initial_state=state0, d_final_state=d_final, dO=dO)
+    assert_rms_close("o chain-vs-uncut", o, o_uncut.float(), CHAIN_VS_UNCUT_TOL)
+    assert_rms_close("final_state chain-vs-uncut", fs, fs_uncut.float(), CHAIN_VS_UNCUT_TOL)
+    assert_chain_grads_close(grads, grads_uncut)
 
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)

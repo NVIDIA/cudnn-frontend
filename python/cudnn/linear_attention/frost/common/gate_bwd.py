@@ -34,6 +34,7 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.tile_dsl.pointwise import (
+    f16x2_to_f32,
     fadd2,
     ffma2,
     fmul2,
@@ -44,7 +45,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     sigmoid2,
     softplus,
 )
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global_v2, ld_global_v4, st_global_v2, st_global_v4
 
 from .host import get_dtype
@@ -128,8 +129,6 @@ def frost_scalar_gate_bwd_partial(
             mPartA[stripe_idx * h_o + h] = acc_a
         if cutlass.const_expr(mPartDt is not None):
             mPartDt[stripe_idx * h_o + h] = acc_dt
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.kernel
@@ -221,8 +220,6 @@ def frost_scalar_gate_bwd_sum(
     if cutlass.const_expr(mDDt is not None):
         if lane_idx == 0:
             mDDt[h] = acc_dt.to(mDDt.element_type)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.kernel
@@ -352,8 +349,6 @@ def frost_channel_gate_bwd_partial(
                     for p in cutlass.range_constexpr(1, phases):
                         fdt = fdt + sDt[cutlass.Int32(p * d_k) + d]
                     mPartDt[base] = fdt
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.kernel
@@ -422,8 +417,6 @@ def frost_channel_gate_bwd_sum(
             for w in cutlass.range_constexpr(1, n_warps):
                 col = col + sWa[w]
             mDA[h] = col.to(mDA.element_type)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -599,44 +592,53 @@ def frost_mamba2_zgate_bwd(
     mDoPre: cute.Tensor,
     mDz: cute.Tensor,
     num_vectors: cutlass.Int32,
+    d_v: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
 ) -> None:
-    """Grid-stride over 16-byte vectors of the flat ``[total, HO, d_v]`` tensors, two vectors per step with their six
-    loads in flight before the math: dO_pre = dO silu(z) and dz = dO y_pre sigmoid(z) (1 + z (1 - sigmoid(z))), the
-    eight elements of a vector as four packed fp32 pairs."""
+    """CTA column ``blockIdx.y`` owns one head: its threads grid-stride over that head's ``num_vectors = total * d_v /
+    vector_width`` 16-byte vectors of the ``[total, HO, d_v]`` tensors, every tensor through its own row and head strides
+    (one byte address and one loop-invariant step per tensor), two vectors per step with their six loads in flight before
+    the math: dO_pre = dO silu(z) and dz = dO y_pre sigmoid(z) (1 + z (1 - sigmoid(z))), the eight elements of a vector
+    as four packed fp32 pairs."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-    vector_width = 16 // (io_dtype.width // 8)
+    element_bytes = io_dtype.width // 8
+    vector_width = 16 // element_bytes
     pairs = vector_width // 2
+    vectors_per_row = d_v // vector_width
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     bidx = cutlass.Int32(cute.arch.block_idx()[0])
+    head = cutlass.Int64(cute.arch.block_idx()[1])
     nblk = cutlass.Int32(cute.arch.grid_dim()[0])
-    do_ptr = mDoOut.iterator.raw_ptr()
-    z_ptr = mZ.iterator.raw_ptr()
-    y_ptr = mYpre.iterator.raw_ptr()
-    do_prime_ptr = mDoPre.iterator.raw_ptr()
-    dz_ptr = mDz.iterator.raw_ptr()
     one = opaque_f32_zero() + cutlass.Float32(1.0)
     stride = nblk * cutlass.Int32(MAMBA2_ZGATE_THREADS)
     idx = bidx * cutlass.Int32(MAMBA2_ZGATE_THREADS) + tidx
-    off = cutlass.Int64(idx) * cutlass.Int64(vector_width)
-    off_step = cutlass.Int64(stride) * cutlass.Int64(vector_width)
+    row = cutlass.Int64(idx // cutlass.Int32(vectors_per_row))
+    col = cutlass.Int64((idx % cutlass.Int32(vectors_per_row)) * cutlass.Int32(vector_width))
+    step_rows = cutlass.Int64(stride // cutlass.Int32(vectors_per_row)) * cutlass.Int64(element_bytes)
+    do_addr = mDoOut.iterator.toint() + (row * cutlass.Int64(mDoOut.stride[0]) + head * cutlass.Int64(mDoOut.stride[1]) + col) * cutlass.Int64(element_bytes)
+    z_addr = mZ.iterator.toint() + (row * cutlass.Int64(mZ.stride[0]) + head * cutlass.Int64(mZ.stride[1]) + col) * cutlass.Int64(element_bytes)
+    y_addr = mYpre.iterator.toint() + (row * cutlass.Int64(mYpre.stride[0]) + head * cutlass.Int64(mYpre.stride[1]) + col) * cutlass.Int64(element_bytes)
+    do_prime_addr = mDoPre.iterator.toint() + (row * cutlass.Int64(mDoPre.stride[0]) + head * cutlass.Int64(mDoPre.stride[1]) + col) * cutlass.Int64(
+        element_bytes
+    )
+    dz_addr = mDz.iterator.toint() + (row * cutlass.Int64(mDz.stride[0]) + head * cutlass.Int64(mDz.stride[1]) + col) * cutlass.Int64(element_bytes)
+    do_step = step_rows * cutlass.Int64(mDoOut.stride[0])
+    z_step = step_rows * cutlass.Int64(mZ.stride[0])
+    y_step = step_rows * cutlass.Int64(mYpre.stride[0])
+    do_prime_step = step_rows * cutlass.Int64(mDoPre.stride[0])
+    dz_step = step_rows * cutlass.Int64(mDz.stride[0])
     while idx + stride < num_vectors:
-        off_next = off + off_step
-        offsets = [off, off_next]
-        do_vectors = [(do_ptr + o).load(count=vector_width, alignment=16) for o in offsets]
-        z_vectors = [(z_ptr + o).load(count=vector_width, alignment=16) for o in offsets]
-        y_vectors = [(y_ptr + o).load(count=vector_width, alignment=16) for o in offsets]
+        do_words = [ld_global_v4(do_addr, cutlass.Int32), ld_global_v4(do_addr + do_step, cutlass.Int32)]
+        z_words = [ld_global_v4(z_addr, cutlass.Int32), ld_global_v4(z_addr + z_step, cutlass.Int32)]
+        y_words = [ld_global_v4(y_addr, cutlass.Int32), ld_global_v4(y_addr + y_step, cutlass.Int32)]
         for u in cutlass.range_constexpr(2):
             do_prime_values = []
             dz_values = []
             for m in cutlass.range_constexpr(pairs):
-                do_lo = do_vectors[u][2 * m].to(cutlass.Float32)
-                do_hi = do_vectors[u][2 * m + 1].to(cutlass.Float32)
-                z_lo = z_vectors[u][2 * m].to(cutlass.Float32)
-                z_hi = z_vectors[u][2 * m + 1].to(cutlass.Float32)
-                y_lo = y_vectors[u][2 * m].to(cutlass.Float32)
-                y_hi = y_vectors[u][2 * m + 1].to(cutlass.Float32)
+                do_lo, do_hi = f16x2_to_f32(do_words[u][m], dtype=io_dtype)
+                z_lo, z_hi = f16x2_to_f32(z_words[u][m], dtype=io_dtype)
+                y_lo, y_hi = f16x2_to_f32(y_words[u][m], dtype=io_dtype)
                 sig_lo, sig_hi = sigmoid2(z_lo, z_hi)
                 zsig_lo, zsig_hi = fmul2(z_lo, z_hi, sig_lo, sig_hi)
                 do_prime_lo, do_prime_hi = fmul2(do_lo, do_hi, zsig_lo, zsig_hi)
@@ -649,23 +651,24 @@ def frost_mamba2_zgate_bwd(
                 dz_values += [dz_lo, dz_hi]
             do_prime_words = [fp32_to_fp16(do_prime_values[2 * m], do_prime_values[2 * m + 1], dtype=io_dtype) for m in range(pairs)]
             dz_words = [fp32_to_fp16(dz_values[2 * m], dz_values[2 * m + 1], dtype=io_dtype) for m in range(pairs)]
-            (do_prime_ptr + offsets[u]).store(cutlass.Vector.from_elements(tuple(do_prime_words), cutlass.Int32).bitcast(io_dtype), alignment=16)
-            (dz_ptr + offsets[u]).store(cutlass.Vector.from_elements(tuple(dz_words), cutlass.Int32).bitcast(io_dtype), alignment=16)
+            st_global_v4(do_prime_addr + do_prime_step * cutlass.Int64(u), do_prime_words, cutlass.Int32)
+            st_global_v4(dz_addr + dz_step * cutlass.Int64(u), dz_words, cutlass.Int32)
         idx = idx + stride * cutlass.Int32(2)
-        off = off_next + off_step
+        do_addr = do_addr + do_step * cutlass.Int64(2)
+        z_addr = z_addr + z_step * cutlass.Int64(2)
+        y_addr = y_addr + y_step * cutlass.Int64(2)
+        do_prime_addr = do_prime_addr + do_prime_step * cutlass.Int64(2)
+        dz_addr = dz_addr + dz_step * cutlass.Int64(2)
     if idx < num_vectors:
-        do_vector = (do_ptr + off).load(count=vector_width, alignment=16)
-        z_vector = (z_ptr + off).load(count=vector_width, alignment=16)
-        y_vector = (y_ptr + off).load(count=vector_width, alignment=16)
+        do_word = ld_global_v4(do_addr, cutlass.Int32)
+        z_word = ld_global_v4(z_addr, cutlass.Int32)
+        y_word = ld_global_v4(y_addr, cutlass.Int32)
         do_prime_values = []
         dz_values = []
         for m in cutlass.range_constexpr(pairs):
-            do_lo = do_vector[2 * m].to(cutlass.Float32)
-            do_hi = do_vector[2 * m + 1].to(cutlass.Float32)
-            z_lo = z_vector[2 * m].to(cutlass.Float32)
-            z_hi = z_vector[2 * m + 1].to(cutlass.Float32)
-            y_lo = y_vector[2 * m].to(cutlass.Float32)
-            y_hi = y_vector[2 * m + 1].to(cutlass.Float32)
+            do_lo, do_hi = f16x2_to_f32(do_word[m], dtype=io_dtype)
+            z_lo, z_hi = f16x2_to_f32(z_word[m], dtype=io_dtype)
+            y_lo, y_hi = f16x2_to_f32(y_word[m], dtype=io_dtype)
             sig_lo, sig_hi = sigmoid2(z_lo, z_hi)
             zsig_lo, zsig_hi = fmul2(z_lo, z_hi, sig_lo, sig_hi)
             do_prime_lo, do_prime_hi = fmul2(do_lo, do_hi, zsig_lo, zsig_hi)
@@ -678,10 +681,8 @@ def frost_mamba2_zgate_bwd(
             dz_values += [dz_lo, dz_hi]
         do_prime_words = [fp32_to_fp16(do_prime_values[2 * m], do_prime_values[2 * m + 1], dtype=io_dtype) for m in range(pairs)]
         dz_words = [fp32_to_fp16(dz_values[2 * m], dz_values[2 * m + 1], dtype=io_dtype) for m in range(pairs)]
-        (do_prime_ptr + off).store(cutlass.Vector.from_elements(tuple(do_prime_words), cutlass.Int32).bitcast(io_dtype), alignment=16)
-        (dz_ptr + off).store(cutlass.Vector.from_elements(tuple(dz_words), cutlass.Int32).bitcast(io_dtype), alignment=16)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
+        st_global_v4(do_prime_addr, do_prime_words, cutlass.Int32)
+        st_global_v4(dz_addr, dz_words, cutlass.Int32)
 
 
 @cute.kernel
@@ -866,8 +867,6 @@ def frost_mamba2_gate_bwd_partial(
                 mPartA[slot * h_o + out_head] = cutlass.Float32(0.0)
                 if cutlass.const_expr(mPartDt is not None):
                     mPartDt[slot * h_o + out_head] = cutlass.Float32(0.0)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.kernel
@@ -921,8 +920,6 @@ def frost_mamba2_skip_bwd_sum(
             + (sGroup[cutlass.Int32(6 * d_v) + p] + sGroup[cutlass.Int32(7 * d_v) + p])
         )
         mDD[h, p] = total.to(mDD.element_type)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -933,12 +930,14 @@ def mamba2_zgate_bwd_launch(
     mDoPre: cute.Tensor,
     mDz: cute.Tensor,
     num_vectors: cutlass.Int32,
+    d_v: cutlass.Constexpr[int],
     io_dtype: cutlass.Constexpr,
+    h_o: cutlass.Int32,
     n_blocks: cutlass.Int32,
     stream: cuda.CUstream,
 ):
-    frost_mamba2_zgate_bwd(mDoOut, mZ, mYpre, mDoPre, mDz, num_vectors, io_dtype).launch(
-        grid=(n_blocks, 1, 1), block=(MAMBA2_ZGATE_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL
+    frost_mamba2_zgate_bwd(mDoOut, mZ, mYpre, mDoPre, mDz, num_vectors, d_v, io_dtype).launch(
+        grid=(n_blocks, h_o, 1), block=(MAMBA2_ZGATE_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL
     )
 
 
@@ -983,21 +982,30 @@ def mamba2_gate_bwd_launch(
 
 
 def mamba2_zgate_bwd(do_out, z, y_pre, do_pre, dz, *, stream) -> None:
-    """z-gate backward over contiguous ``[total, HO, d_v]`` io-dtype tensors: ``do_pre`` (the bprop's dO) and ``dz``."""
+    """z-gate backward over ``[total, HO, d_v]`` io-dtype tensors with a stride-1 innermost dim and free outer strides:
+    writes ``do_pre`` (the bprop's dO) and ``dz``."""
     io_dtype = get_dtype(z.dtype)
     total, h_o, d_v = (int(dim) for dim in z.shape)
     vector_width = 16 // (io_dtype.width // 8)
-    num_vectors = total * h_o * d_v // vector_width
-    n_blocks = max(1, min(-(-num_vectors // MAMBA2_ZGATE_THREADS), 4096))
+    num_vectors = total * (d_v // vector_width)
+    n_blocks = max(1, min(-(-num_vectors // MAMBA2_ZGATE_THREADS), max(1, 4096 // h_o)))
     cu_stream = cuda.CUstream(int(stream))
     tensors = (do_out, z, y_pre, do_pre, dz)
-    cache = gate_bwd_cache(("mamba2_zgate", str(z.dtype), current_device()))
+    cache = gate_bwd_cache(("mamba2_zgate", str(z.dtype), d_v, current_device()))
     if "compiled" not in cache:
         traced = [from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=2) for t in tensors]
         cache["compiled"] = cute.compile(
-            mamba2_zgate_bwd_launch, *traced, cutlass.Int32(num_vectors), io_dtype, cutlass.Int32(n_blocks), cu_stream, options="--enable-tvm-ffi"
+            mamba2_zgate_bwd_launch,
+            *traced,
+            cutlass.Int32(num_vectors),
+            d_v,
+            io_dtype,
+            cutlass.Int32(h_o),
+            cutlass.Int32(n_blocks),
+            cu_stream,
+            options="--enable-tvm-ffi",
         )
-    cache["compiled"](*tensors, num_vectors, n_blocks, cu_stream)
+    cache["compiled"](*tensors, num_vectors, h_o, n_blocks, cu_stream)
 
 
 def mamba2_gate_bwd(

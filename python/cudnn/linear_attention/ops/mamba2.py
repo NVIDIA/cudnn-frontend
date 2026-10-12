@@ -263,6 +263,9 @@ def run_mamba2_fwd(
     device = x.device
     if cu_seqlens.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"mamba2: cu_seqlens must be int32 or int64; got {cu_seqlens.dtype}")
+    check_dtype("x", x, (torch.float16, torch.bfloat16))
+    check_dtype("B", B, x.dtype)
+    check_dtype("C", C, x.dtype)
     check_dtype("dt", dt, (torch.float32, torch.bfloat16, torch.float16))
     check_dtype("A", A, (torch.float32, torch.bfloat16, torch.float16))
     if dt_bias is not None:
@@ -738,7 +741,9 @@ def mamba2_bwd_op(
     device = x.device
     if 0 in dy.stride():
         dy = dy.contiguous()
-    dy = dy.contiguous()
+    check_dtype("x", x, (torch.float16, torch.bfloat16))
+    check_dtype("B", B, x.dtype)
+    check_dtype("C", C, x.dtype)
     check_dtype("dy", dy, x.dtype)
     if d_final_state is not None and 0 in d_final_state.stride():
         d_final_state = d_final_state.contiguous()
@@ -1422,7 +1427,6 @@ def mamba2_summary_bwd_op(
         raise ValueError(f"mamba2_summary_bwd: dt_min ({dt_min}) must not exceed dt_max ({dt_max_value})")
     if 0 in dy.stride():
         dy = dy.contiguous()
-    dy = dy.contiguous()
     cache_key = make_bprop_cache_key(
         "mamba2_summary_bwd",
         total,

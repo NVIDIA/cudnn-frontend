@@ -9,6 +9,7 @@ transform.  Long sequences on few (sequence, head) tiles run the decay-warmup sp
 from __future__ import annotations
 
 import math
+from operator import itemgetter
 
 from cudnn import behavior_note
 from cudnn.engines.base import BaseEngine, CompiledPlan
@@ -128,12 +129,16 @@ class CompiledMamba2:
     def __init__(self, node, kernel_module):
         from .common.piece_chain import CHAIN_THREADS, LENGTH_RULE_PIECE_TOKENS, choose_pieces, piece_table_layout
         from .common.split_k import WORK_ITEM_FIELDS, compute_ideal_chunks, max_work_items, split_scratch_rows
-        from .kernel.mamba2_chain_forward_f16 import build_chain_forward, run_chain_forward
+        from cuda.bindings.driver import CUstream
+
+        from .kernel.mamba2_chain_forward_f16 import CHAIN_FORWARD_BUFFERS, build_chain_forward, run_chain_forward
         from .kernel.mamba2_warmup_forward_f16 import build_warmup_forward, run_warmup_forward
 
         self.node = node
         self.warmup_launch = None
         self.chain_launch = None
+        self.chain_buffer_names = CHAIN_FORWARD_BUFFERS
+        self.stream_type = CUstream
         self.build_warmup_forward = build_warmup_forward
         self.run_warmup_forward = run_warmup_forward
         self.build_chain_forward = build_chain_forward
@@ -255,9 +260,38 @@ class CompiledMamba2:
         self.index_final_state = pos.get("final_state")
         self.index_state_checkpoints = pos.get("state_checkpoints")
         self.index_o_pre = pos.get("O_pre")
+        if self.chain:
+            positions = pos | {name: len(names) + i for i, name in enumerate(self.carve_names)}
+            aliases = {
+                "gate": "g",
+                "o": "O",
+                "seed": "initial_state",
+                "seed_indices": "state_indices",
+                "final_indices": "state_indices",
+                "checkpoints": "state_checkpoints",
+                "o_pre": "O_pre",
+                "words": "tensormaps",
+            }
+            absent = len(names) + len(self.carve_names)
+            if not (self.has_state_checkpoints and self.checkpoint):
+                positions.pop("state_checkpoints", None)
+            indices = [positions.get(aliases.get(name, name), absent) for name in self.chain_buffer_names]
+            self.chain_buffers = itemgetter(*indices)
+            self.chain_scalars = (
+                int(self.pieces),
+                int(self.n_heads_out),
+                int(self.num_seqs),
+                int(self.checkpoint if self.has_state_checkpoints else 0),
+                float(self.dt_min),
+                float(self.dt_max),
+            )
 
     def run(self, views, workspace, stream) -> None:
         q = views[self.index_q]
+        if self.chain and self.chain_launch is not None:
+            carved = workspace.carve(self.carve)
+            self.chain_launch(*self.chain_scalars, *self.chain_buffers((*views, *carved, None)), self.stream_type(int(stream or 0)))
+            return
         k = views[self.index_k]
         v = views[self.index_v]
         g = views[self.index_g]
