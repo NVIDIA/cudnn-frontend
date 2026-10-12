@@ -506,14 +506,13 @@ def test_nvfp4_sweep(C, num_tokens):
 # ============================================================
 
 
+@pytest.mark.L0
 @pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
 @pytest.mark.parametrize(
     "C,num_tokens",
     [
-        (48, 1560),  # C=48 not in LUT
-        (512, 10000),  # tokens=10000 not in LUT
-        (2048, 24960),  # C=2048 not in LUT
-        (100, 100),  # Neither C nor tokens in LUT
+        (48, 1560),  # C=48 not in LUT, and no fallback vector width divides it
+        (100, 100),  # Neither C nor tokens in LUT, and no fallback vector width divides C
     ],
 )
 def test_unsupported_problem_sizes(C, num_tokens):
@@ -526,6 +525,22 @@ def test_unsupported_problem_sizes(C, num_tokens):
     with pytest.raises(cudnn.cudnnGraphNotSupportedError):
         graph.create_execution_plans([cudnn.heur_mode.OPENSOURCE])
         graph.check_support()
+
+
+@pytest.mark.L0
+@pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
+@pytest.mark.parametrize(
+    "C,num_tokens",
+    [
+        (512, 10000),  # tokens=10000 not in LUT
+        (2048, 24960),  # C=2048 not in LUT
+    ],
+)
+def test_non_lut_problem_sizes_run_on_the_fallback_knobs(C, num_tokens):
+    """Sizes outside the sweep-tuned LUT are served by the conservative fallback knobs and must be correct."""
+    result = _run_rmsnorm_silu_test(C, num_tokens)
+    assert result["nan_count"] == 0, f"Output has {result['nan_count']} NaN values"
+    assert result["passed"], f"C={C}, tokens={num_tokens}: {result['mismatches']}/{result['elements']} mismatches (max_diff={result['max_diff']:.6e})"
 
 
 # ============================================================
