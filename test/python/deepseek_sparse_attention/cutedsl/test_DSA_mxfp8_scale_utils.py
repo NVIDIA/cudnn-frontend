@@ -16,9 +16,11 @@ def cuda_scale_packer():
     """Keep host coverage on lanes below the CUDA packer's requirements."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    from cudnn.frost.buffers import cutedsl_requirement_error
+    from cudnn.frost.buffers import cutedsl_requirement_error, cutedsl_state
     from cudnn.deepseek_sparse_attention.utils.compiler import gpu_arch_flag
 
+    if not cutedsl_state()[0]:
+        pytest.skip("requires CuTe DSL")
     requirement_error = cutedsl_requirement_error("SM100 DSA MXFP8 scale packing")
     if requirement_error:
         pytest.skip(requirement_error)
@@ -698,3 +700,52 @@ def test_blockscaled_mma_op_adapter_maps_scale_and_major_modes_host_only():
         a_sf_id=2,
         b_sf_id=2,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("unavailable", ["old_dsl", "no_dsl", "unsupported_arch"])
+def test_mxfp8_scale_pack_cuda_preserves_reference_without_fast_path(monkeypatch, unavailable):
+    """Existing CUDA callers still pack correctly when the optimized route is unavailable."""
+    from cudnn.frost import buffers
+    from cudnn.deepseek_sparse_attention.utils import runtime
+
+    q_cpu = torch.arange(3 * 8 * 5, dtype=torch.int64).to(torch.uint8).reshape(1, 3, 8, 5)
+    k_cpu = torch.arange(3 * 2 * 5, dtype=torch.int64).to(torch.uint8).reshape(1, 3, 2, 5)
+    q_ref, k_ref = mxfp8_scale_utils.pack_qk_scale_bshd(q_cpu, k_cpu, 4)
+    cu_cpu = torch.tensor([0, 0, 2, 3], dtype=torch.int32)
+    pq_cpu = mxfp8_scale_utils.make_scale_cu_seqlens_padded(cu_cpu, 32)
+    pk_cpu = mxfp8_scale_utils.make_scale_cu_seqlens_padded(cu_cpu, 128)
+    qt_ref = mxfp8_scale_utils.pack_q_scale_thd(q_cpu[0], cu_cpu, pq_cpu, 4)
+    kt_ref = mxfp8_scale_utils.pack_k_scale_thd(k_cpu[0], cu_cpu, pk_cpu)
+    q, k = q_cpu.cuda(), k_cpu.cuda()
+    cu, pq, pk = cu_cpu.cuda(), pq_cpu.cuda(), pk_cpu.cuda()
+    q_out, k_out = torch.empty_like(q_ref, device="cuda"), torch.empty_like(k_ref, device="cuda")
+    qt_out = torch.full((2, qt_ref.shape[1] + 128, 8), 0xA5, dtype=torch.uint8, device="cuda")
+    kt_out = torch.full((2, kt_ref.shape[1] + 128, 8), 0xA5, dtype=torch.uint8, device="cuda")
+
+    state = (False, None) if unavailable == "no_dsl" else (True, ("nvidia-cutlass-dsl", "4.6.2" if unavailable == "old_dsl" else "4.7.1"))
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: state)
+    if unavailable == "unsupported_arch":
+        monkeypatch.setattr(runtime, "device_capability", lambda device: (8, 0))
+
+    def unexpected_fast_path():
+        raise AssertionError("unsupported environment entered the CUDA packer")
+
+    monkeypatch.setattr(mxfp8_scale_utils, "_cuda_pack_launchers", unexpected_fast_path)
+    supports_device = getattr(mxfp8_scale_utils, "_cuda_packer_supports_device", None)
+    if supports_device is not None:
+        supports_device.cache_clear()
+    try:
+        actual_q, actual_k = mxfp8_scale_utils.pack_qk_scale_bshd(q, k, 4, q_out=q_out, k_out=k_out)
+        assert actual_q is q_out and actual_k is k_out
+        assert torch.equal(actual_q.cpu(), q_ref)
+        assert torch.equal(actual_k.cpu(), k_ref)
+        assert mxfp8_scale_utils.pack_q_scale_thd(q[0], cu, pq, 4, out=qt_out) is qt_out
+        assert mxfp8_scale_utils.pack_k_scale_thd(k[0], cu, pk, out=kt_out) is kt_out
+        assert torch.equal(qt_out[:, : qt_ref.shape[1]].cpu(), qt_ref)
+        assert torch.equal(kt_out[:, : kt_ref.shape[1]].cpu(), kt_ref)
+        assert torch.count_nonzero(qt_out[:, qt_ref.shape[1] :]) == 0
+        assert torch.count_nonzero(kt_out[:, kt_ref.shape[1] :]) == 0
+    finally:
+        if supports_device is not None:
+            supports_device.cache_clear()

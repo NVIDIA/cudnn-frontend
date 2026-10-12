@@ -3,8 +3,9 @@
 
 """MXFP8 scale packing helpers for the SM100 Indexer DSL path.
 
-CUDA E8M0 inputs use a shape-generic single-launch packer.  CPU tensors and
-non-byte dtypes retain the PyTorch reference implementation used by tests.
+CUDA E8M0 inputs use a shape-generic single-launch packer when the GPU and
+CuTe DSL version support it. Other environments, CPU tensors, non-byte dtypes
+and strided inputs retain the PyTorch reference implementation.
 """
 
 from __future__ import annotations
@@ -250,9 +251,23 @@ def _allocate_pack_out(
     return torch.empty(shape, device=src.device, dtype=src.dtype)
 
 
+@lru_cache(maxsize=None)
+def _cuda_packer_supports_device(device_index: int) -> bool:
+    """Keep the reference path on the package's older DSL floor and other GPUs."""
+    from cudnn.frost.buffers import cutedsl_state, cutedsl_too_old
+
+    installed, version = cutedsl_state()
+    if not installed or cutedsl_too_old(version):
+        return False
+    from cudnn.deepseek_sparse_attention.utils.compiler import _ARCH_MAP
+    from cudnn.deepseek_sparse_attention.utils.runtime import device_capability
+
+    return device_capability(device_index) in _ARCH_MAP
+
+
 def _can_use_cuda_packer(scale: torch.Tensor) -> bool:
-    """Return whether ``scale`` supports the direct raw-byte CUDA packer."""
-    return scale.is_cuda and scale.element_size() == 1 and scale.is_contiguous()
+    """Return whether both the tensor and environment support direct packing."""
+    return scale.is_cuda and scale.element_size() == 1 and scale.is_contiguous() and _cuda_packer_supports_device(scale.device.index)
 
 
 @lru_cache(maxsize=1)
@@ -372,8 +387,8 @@ def pack_blockscaled_scale_mkl(
     driver stream and defaults to PyTorch's current stream on the input device.
     The caller-owned CUDA path is graph-capturable after its first, compiling
     call; input and output allocator lifetimes are recorded on the launch
-    stream.  CPU and non-byte inputs use the allocation-compatible PyTorch
-    reference path.
+    stream.  CPU, non-byte, and unsupported GPU/DSL environments use the
+    allocation-compatible PyTorch reference path.
     """
     if scale_mkl.ndim != 3:
         raise ValueError(f"scale_mkl must have shape (MN, sf_groups, L), got {tuple(scale_mkl.shape)}")
@@ -544,7 +559,8 @@ def pack_q_scale_bshd(
     stream and otherwise means PyTorch's current stream on the input device.
     The caller-owned path performs no allocation, records buffer lifetimes on
     the launch stream, and is CUDA-graph capturable after the first JIT compile.
-    CPU and non-byte inputs use the PyTorch reference implementation.
+    CPU, non-byte, and unsupported GPU/DSL environments use the PyTorch
+    reference implementation.
     """
     if q_scale.ndim != 4:
         raise ValueError(f"q_scale must have shape (B, S_q, H_q, sf_groups), got {tuple(q_scale.shape)}")
@@ -590,7 +606,7 @@ def pack_k_scale_bshd(
     ``stream`` is an optional CUDA driver stream and otherwise means PyTorch's
     current stream on the input device.  The caller-owned path performs no
     allocation, records buffer lifetimes on the launch stream, and is
-    CUDA-graph capturable after the first JIT compile.  CPU and non-byte inputs
+    CUDA-graph capturable after the first JIT compile.  CPU, non-byte, and unsupported GPU/DSL environments
     use the PyTorch reference implementation.
     """
     if k_scale.ndim != 4:
@@ -639,7 +655,7 @@ def pack_qk_scale_bshd(
     both are supplied the CUDA path allocates nothing, records all four buffer
     lifetimes on ``stream``, and is CUDA-graph capturable after its first JIT
     compile.  ``stream`` is an optional CUDA driver stream and otherwise means
-    PyTorch's current stream on the input device.  CPU, non-byte, or strided
+    PyTorch's current stream on the input device.  CPU, non-byte, strided, or unsupported GPU/DSL
     inputs use the two reference packers and preserve the same return contract.
     """
     if q_scale.ndim != 4:
@@ -712,7 +728,7 @@ def pack_q_scale_thd(
     ``(H_kv, M_capacity, ceil4(G))`` with ``M_capacity`` a multiple of
     128 large enough for ``cu_seqlens_q_scale_padded[-1] *
     qhead_per_kv_head``.  It must not alias ``q_scale``.  Any reference
-    fallback (CPU, non-byte, or strided input) reads both prefix tensors on the
+    fallback (CPU, non-byte, strided input, or unsupported GPU/DSL) reads both prefix tensors on the
     host, allocates an exact-size temporary, then copies it into ``out`` and
     zero-fills unused capacity; that path cannot run during CUDA Graph capture.
     Without ``out`` the reference path returns its exact live extent.  The
@@ -788,7 +804,7 @@ def pack_k_scale_thd(
     must be contiguous, have the input dtype/device, and have shape
     ``(H_kv, M_capacity, ceil4(G))`` with a multiple-of-128 capacity covering
     ``cu_seqlens_k_scale_padded[-1]``; it must not alias ``k_scale``.  Any
-    reference fallback (CPU, non-byte, or strided input) reads both prefix
+    reference fallback (CPU, non-byte, strided input, or unsupported GPU/DSL) reads both prefix
     tensors on the host, allocates an exact-size temporary, then copies it into
     ``out`` and zero-fills unused capacity; that path cannot run during CUDA
     Graph capture.  Without ``out`` the reference path returns its exact live
