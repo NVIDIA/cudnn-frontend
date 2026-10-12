@@ -638,33 +638,45 @@ class Graph : public ICudnn, public INode {
         gid = next_gid.fetch_add(1, std::memory_order_relaxed);
     }
 
+    using UidBindings = std::unordered_map<Tensor_attributes::uid_t, void *>;
+
     // Legacy Slice (cuDNN < 9.22) binds its output to the source pointer plus an offset, as execute() does.
-    // A caller that binds the destination uid itself keeps that binding.
-    void
-    apply_variant_pack_replacements_(std::unordered_map<Tensor_attributes::uid_t, void *> &uid_to_device_ptrs) const {
+    // Derived per call and never written back, so a reused caller map re-derives from its current source;
+    // a destination the caller binds itself wins.
+    UidBindings
+    derive_variant_pack_replacements_(UidBindings const &uid_to_device_ptrs) const {
+        UidBindings derived;
         for (auto const &[from_uid, value] : variant_pack_replacements) {
             auto const &[to_uid, start_offset] = value;
             auto source                        = uid_to_device_ptrs.find(from_uid);
-            if (source == uid_to_device_ptrs.end() || uid_to_device_ptrs.count(to_uid) != 0) {
-                continue;
+            if (source != uid_to_device_ptrs.end() && uid_to_device_ptrs.count(to_uid) == 0) {
+                derived[to_uid] = static_cast<char *>(source->second) + start_offset;
             }
-            void *destination          = static_cast<char *>(source->second) + start_offset;
-            uid_to_device_ptrs[to_uid] = destination;
         }
+        return derived;
+    }
+
+    static void *const *
+    find_binding_(Tensor_attributes::uid_t uid, UidBindings const &uid_to_device_ptrs, UidBindings const &derived) {
+        auto search = uid_to_device_ptrs.find(uid);
+        if (search != uid_to_device_ptrs.end()) {
+            return &search->second;
+        }
+        search = derived.find(uid);
+        return search != derived.end() ? &search->second : nullptr;
     }
 
     // The CUDA-graph paths build their own variant pack, so they apply execute()'s pointer check here (#1571).
     error_t
-    check_aligned_operand_pointers_(
-        std::unordered_map<Tensor_attributes::uid_t, void *> const &uid_to_device_ptrs) const {
+    check_aligned_operand_pointers_(UidBindings const &uid_to_device_ptrs, UidBindings const &derived) const {
         for (auto const &[uid, alignment_and_bytes] : cached_aligned_operands) {
             int64_t const alignment = alignment_and_bytes.first;
-            auto search             = uid_to_device_ptrs.find(uid);
-            if (alignment <= 1 || search == uid_to_device_ptrs.end() ||
+            void *const *binding    = find_binding_(uid, uid_to_device_ptrs, derived);
+            if (alignment <= 1 || binding == nullptr ||
                 cached_workspace_modifications.find(uid) != cached_workspace_modifications.end()) {
                 continue;
             }
-            RETURN_CUDNN_FRONTEND_ERROR_IF(reinterpret_cast<uintptr_t>(search->second) % alignment != 0,
+            RETURN_CUDNN_FRONTEND_ERROR_IF(reinterpret_cast<uintptr_t>(*binding) % alignment != 0,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) +
                                                ": device pointer is not aligned to the tensor's " +
@@ -702,8 +714,8 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so update_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
-        apply_variant_pack_replacements_(uid_to_device_ptrs);
-        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs));
+        UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
         size_t num_root_nodes;
         _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_get_root_nodes(cudnn_cuda_graph, nullptr, &num_root_nodes));
@@ -790,11 +802,11 @@ class Graph : public ICudnn, public INode {
         uids.reserve(variant_pack_uids.size());
 
         for (auto const &uid : variant_pack_uids) {
-            auto search = uid_to_device_ptrs.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+            void *const *binding = find_binding_(uid, uid_to_device_ptrs, derived_bindings);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(binding == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " does not exist in variant pack.");
-            device_ptrs.push_back(search->second);
+            device_ptrs.push_back(*binding);
             uids.push_back(uid);
         }
 
@@ -860,8 +872,8 @@ class Graph : public ICudnn, public INode {
             error_code_t::GRAPH_NOT_SUPPORTED,
             "The selected engine is not backed by a cuDNN execution plan, so populate_cuda_graph() cannot "
             "record it; capture execute() on a stream instead.");
-        apply_variant_pack_replacements_(uid_to_device_ptrs);
-        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs));
+        UidBindings const derived_bindings = derive_variant_pack_replacements_(uid_to_device_ptrs);
+        CHECK_CUDNN_FRONTEND_ERROR(check_aligned_operand_pointers_(uid_to_device_ptrs, derived_bindings));
 
         // Check if the cuda graph is empty
         size_t numNodes = 0;
@@ -954,11 +966,11 @@ class Graph : public ICudnn, public INode {
         std::vector<uid_t> uids;
         uids.reserve(variant_pack_uids.size());
         for (auto const &uid : variant_pack_uids) {
-            auto search = uid_to_device_ptrs.find(uid);
-            RETURN_CUDNN_FRONTEND_ERROR_IF(search == uid_to_device_ptrs.end(),
+            void *const *binding = find_binding_(uid, uid_to_device_ptrs, derived_bindings);
+            RETURN_CUDNN_FRONTEND_ERROR_IF(binding == nullptr,
                                            error_code_t::INVALID_VARIANT_PACK,
                                            "Uid " + std::to_string(uid) + " does not exist in variant pack.");
-            device_ptrs.push_back(search->second);
+            device_ptrs.push_back(*binding);
             uids.push_back(uid);
         }
 
