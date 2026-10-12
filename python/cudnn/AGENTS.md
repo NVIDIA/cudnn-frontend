@@ -661,6 +661,24 @@ rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
 
+**A `setmaxnreg` register split needs `min_blocks_per_mp=1` on the launch.**
+With `.reqntid` alone (what `block=` emits) ptxas cannot bound the register
+count at entry: it prints C7508 and drops every `setmaxnreg`. The SASS then has
+no `USETMAXREG`, the consumer warps never get their raised budget, and ptxas may
+size every warp for several CTAs per SM — the sm120 dual MoE GEMM fell to 40
+registers with 11 KB of spills and ran 4-6x slower. `.launch(...,
+min_blocks_per_mp=1)` emits `.minnctapersm 1` and makes the split live. The DSL
+never surfaces C7508 (not even under `CUTE_DSL_COMPILER_OPT=warnings`), so the
+numerics tests cannot see a lost split. Once the split is live, the producer
+budget is a hard limit: keep per-lane producer state small (one elected lane
+holding a tile's worth of GATHER rows spilled at 24 registers and made sm120 MoE
+GATHER up to 1.45x slower; each TMA-warp lane now issues its own GATHER4s), and
+accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`).
+**Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
+`TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
+(`gemm/frost/sm120/test_sm120_register_split.py`; the SDPA pins in
+`sdpa/frost/test_sdpa_bwd_d256_sm100.py` do the same).
+
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged
 map it already acquired. Track the sequence/expert per consuming warp, reacquire
