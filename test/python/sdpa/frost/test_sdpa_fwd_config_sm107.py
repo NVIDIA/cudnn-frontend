@@ -265,6 +265,11 @@ def test_sparse_accepts_the_padding_and_stats_fields():
         (dict(decode_q_tile=16), "other kernels' specializations"),
         (dict(mma_2x2=True), "other kernels' specializations"),
         (dict(softmax_f16=True), "other kernels' specializations"),
+        # the dense line's compile-time options the sparse body has no field for: refused, never silently ignored
+        (dict(negate_scores=True), "other kernels' specializations"),
+        (dict(kv_tail_mask=True), "other kernels' specializations"),
+        (dict(thd_batch_one=True), "other kernels' specializations"),
+        (dict(lpt_head_group=2), "other kernels' specializations"),
         (dict(sched_policy=1), "sched_policy must be NATURAL"),
         (dict(paged_kv=True, page_size=6, seq_kv_lens_present=True), "multiple of 4"),
         (dict(thd_varlen=True, paged_kv=True, page_size=16, seq_kv_lens_present=True), "THD x paged is not served"),  # both arms wired, never together
@@ -629,6 +634,7 @@ _DENSE_CASES = [
     ("sm107.d128.mxfp8", c107.make_cfg_d128_mxfp8, dict(dtype_qkv=E4M3, dtype_o=BF16)),
     ("sm107.d192", c107.make_cfg_d192, {}),
     ("sm107.d256", c107.make_cfg_d256, {}),
+    ("sm107.d256.decode", c107.make_cfg_d256_decode, dict(decode_q_tile=16, seq_kv_lens_present=True, pack_gqa=True, qh_per_kh=12)),
     ("sm107.d256.gate", c107.make_cfg_d256, dict(epilogue_gate=True)),
     ("sm107.d256.mxfp8", c107.make_cfg_d256_mxfp8, dict(dtype_qkv=E4M3, dtype_o=BF16, cta_mma=1)),
     ("sm107.d512", c107.make_cfg_d512, {}),
