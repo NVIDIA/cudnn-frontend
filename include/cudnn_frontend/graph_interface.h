@@ -1633,14 +1633,28 @@ class Graph : public ICudnn, public INode {
         }
 
         // Backend path
+        std::vector<int64_t> const *backend_uids = &varpack_template.all_uids;
+        void *backend_stack_ptrs[STACK_MAX];
+        std::vector<void *> backend_heap_ptrs;
+        if (!varpack_template.backend_slots.empty()) {
+            int const n_backend = (int)varpack_template.backend_slots.size();
+            void **backend_ptrs = n_backend <= STACK_MAX
+                                      ? backend_stack_ptrs
+                                      : (backend_heap_ptrs.resize(n_backend), backend_heap_ptrs.data());
+            for (int i = 0; i < n_backend; i++) {
+                backend_ptrs[i] = ptrs[varpack_template.backend_slots[i]];
+            }
+            ptrs         = backend_ptrs;
+            backend_uids = &varpack_template.backend_uids;
+        }
         if (override_uids.empty()) {
             CHECK_CUDNN_FRONTEND_ERROR(detail::execute(
-                handle, plans.execution_plans[plan_index].get(), ptrs, varpack_template.all_uids, engine_workspace));
+                handle, plans.execution_plans[plan_index].get(), ptrs, *backend_uids, engine_workspace));
         } else {
             CHECK_CUDNN_FRONTEND_ERROR(detail::execute(handle,
                                                        plans.execution_plans[plan_index].get(),
                                                        ptrs,
-                                                       varpack_template.all_uids,
+                                                       *backend_uids,
                                                        engine_workspace,
                                                        override_uids,
                                                        override_shapes,
@@ -2404,6 +2418,10 @@ class Graph : public ICudnn, public INode {
         std::vector<std::pair<int, std::pair<int, int64_t>>>
             replacement_slots;  // (dst_slot, (src_slot, offset)) — only used by Slice nodes
         std::vector<std::pair<int, int64_t>> aligned_slots;  // (slot, byte alignment), user and replacement slots
+        // Slots and uids handed to the backend, when a legacy Slice source the backend graph does not consume must be
+        // left out (the backend rejects an unknown uid). Empty when every slot goes to the backend.
+        std::vector<int> backend_slots;
+        std::vector<int64_t> backend_uids;
     };
 
     VariantPackTemplate varpack_template;
@@ -2540,6 +2558,18 @@ class Graph : public ICudnn, public INode {
             if (it_src != uid_to_slot.end() && it_dst != uid_to_slot.end()) {
                 t.replacement_slots.emplace_back(it_dst->second, std::make_pair(it_src->second, byte_offset));
             }
+        }
+
+        for (int slot = 0; slot < (int)t.all_uids.size(); slot++) {
+            int64_t uid = t.all_uids[slot];
+            if (variant_pack_replacements.count(uid) == 0 || variant_pack_uids.count(uid) != 0) {
+                t.backend_slots.push_back(slot);
+                t.backend_uids.push_back(uid);
+            }
+        }
+        if (t.backend_slots.size() == t.all_uids.size()) {
+            t.backend_slots.clear();
+            t.backend_uids.clear();
         }
 
         varpack_template = std::move(t);

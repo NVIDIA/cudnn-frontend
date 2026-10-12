@@ -246,6 +246,17 @@ def test_legacy_slice_offset_into_an_operand_is_checked():
 
 
 @_legacy_slice
+def test_legacy_slice_execute_matches_the_reference():
+    """execute() hands the backend the sliced pointer only; the source uid is not part of the backend graph."""
+    g, ports = _legacy_slice_graph(8)
+    q_buf = torch.randn(B, S, H, _WIDTH, dtype=torch.float16, device="cuda").permute(0, 2, 1, 3)
+    k_buf, v_buf = (_storage(_WIDTH) for _ in range(2))
+    o_buf = _storage(_WIDTH, fill=float("nan"))
+    _run_forward(g, ports, (q_buf, k_buf, v_buf, o_buf))
+    torch.testing.assert_close(o_buf.float(), _reference(q_buf[..., 8 : 8 + D], k_buf, v_buf), atol=5e-3, rtol=1e-2)
+
+
+@_legacy_slice
 def test_legacy_slice_cuda_graph_binds_and_checks_the_sliced_pointer():
     """populate_cuda_graph() applies the Slice offset to the caller's source pointer, as execute() does."""
     cudart = pytest.importorskip("cuda.bindings.runtime")
