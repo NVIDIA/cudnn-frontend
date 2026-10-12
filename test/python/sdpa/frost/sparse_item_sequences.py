@@ -329,7 +329,10 @@ def evaluate(wl: ItemSequenceWorkList, o: torch.Tensor, lse: torch.Tensor, ref_o
     ref_lse_bsh = ref_lse.permute(0, 2, 1)
     failures: List[str] = []
 
-    sent_o_rows = int((of == sent).any(dim=-1).sum())
+    # the sentinel AS THE OUTPUT DTYPE STORES IT: 1.5e30 is not a bf16 value (it lands at 1.4954e30), so a detector that compared
+    # the widened output against the Python float would never fire on bf16 -- the kernel module's `_stored_sentinel` rule
+    sent_o = float(torch.full((), sent, dtype=o.dtype).float())
+    sent_o_rows = int((of == sent_o).any(dim=-1).sum())
     sent_lse = int((lse == sent).sum())
     if sent_o_rows or sent_lse:
         failures.append(f"sentinel survived on {sent_o_rows} O rows / {sent_lse} LSE cells (never written)")
