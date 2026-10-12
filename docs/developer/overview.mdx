@@ -106,7 +106,7 @@ This method internally queries the heuristics for engine configs for the given h
 
 ```
 cudnn_frontend::error_t
-cudnn_frontend::graph::Graph::get_execution_plans(std::vector<heur_mode_t>)
+cudnn_frontend::graph::Graph::create_execution_plans(std::vector<HeurMode_t> const&)
 ```
 
 ### Getting the Execution Plan Count
@@ -115,7 +115,7 @@ This method returns the number of execution plans returned by cuDNN heuristics. 
 
 ```
 cudnn_frontend::int64_t
-cudnn_frontend::Graph::get_execution_plan_count() const;
+cudnn_frontend::graph::Graph::get_execution_plan_count() const;
 ```
 
 ### Checking Graph Support
