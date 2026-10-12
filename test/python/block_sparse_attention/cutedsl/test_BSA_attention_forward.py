@@ -14,7 +14,9 @@ From the repository root:
     (cd test/python && CUDA_VISIBLE_DEVICES=0 python -m pytest -q block_sparse_attention/cutedsl)
 
 The full directory also contains other BSA tests. Unsupported configurations
-skip.
+skip. SM100/SM110 large-logit regressions use the same operation/backend layout:
+
+    (cd test/python && python -m pytest -q block_sparse_attention/cutedsl/test_BSA_attention_forward.py -k sm100_large)
 
 For a fresh single-GPU comparison with PyTorch's cuDNN dense SDPA backend:
 
