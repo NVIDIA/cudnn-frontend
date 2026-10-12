@@ -1065,6 +1065,86 @@ def qkvg_from_hf(
     return w_qkvg, norms[0], norms[1]
 
 
+def qkvg_from_vllm(
+    qkv_proj_weight: torch.Tensor,
+    q_norm_weight: Optional[torch.Tensor],
+    k_norm_weight: Optional[torch.Tensor],
+    geometry: GatedAttentionBlockGeometry,
+    *,
+    act_dtype: torch.dtype = torch.bfloat16,
+    index_qk_proj_weight: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(w_qkvg, w_q_norm, w_k_norm)`` for the block from a serving stack's MERGED QKV linear at THIS rank's geometry.
+
+    **Load time only.** vLLM's ``QKVParallelLinear`` (SGLang's likewise) holds one ``qkv_proj.weight`` per tensor-parallel
+    rank whose rows are the HF attention layer's three matrices, cut to the rank's heads and concatenated:
+    ``[q_proj | k_proj | v_proj]`` -- ``2 * H_q * D`` rows of ``q_proj`` in the checkpoint's per-head ``[q_h | gate_h]``
+    order (the layer declares ``2 * H_q`` query heads to carry the gate), then ``H_kv * D`` rows of ``k_proj`` and
+    ``H_kv * D`` of ``v_proj`` -- all at the RANK's ``H_q`` / ``H_kv``: ``geometry`` describes the shard, not the whole
+    model (8 / 1 for a 32 / 2 model at TP 4, the KV head replicated across the ranks that share it).  This twin cuts those
+    three row ranges and hands them to :func:`qkvg_from_hf`, so all three results are BITWISE what ``qkvg_from_hf`` returns
+    for the same HF tensors: the per-head split is fixed to the one those checkpoints use (there is no layout argument to get
+    wrong), and the two QK-norm weights -- replicated on every rank, zero-centered -- take the form ``qkvg_from_hf`` derives
+    from ``geometry.norm_weight_offset`` (``(1 + w)`` formed in fp32 and rounded once into ``act_dtype`` at the default
+    ``0.0``; ``w`` as is at ``1.0``).  ``w_qkvg`` is a row PERMUTATION of the input into the block's ``Q | GATE | K | V``
+    bands with the same byte count, so a layer may replace its merged weight by it in place and run the block against the
+    model's own ``o_proj.weight`` as ``W_o``; nothing is left to convert on the execute path.
+
+    Parameters
+    ----------
+    qkv_proj_weight
+        The rank's merged weight, ``[2*H_q*D + 2*H_kv*D, d_model]`` at the rank's head counts.  Under an indexer band
+        (``geometry.qsa.index_band``) it may instead carry the indexer projection's rows APPENDED -- ``[..., +
+        (index_heads + index_kv_heads) * index_head_dim]``, the form of a serving stack that packs the (replicated) indexer
+        projection into the same GEMM -- with ``index_qk_proj_weight`` left ``None``.
+    q_norm_weight, k_norm_weight
+        ``q_norm.weight`` / ``k_norm.weight``, ``[D]``, zero-centered; both ``None`` iff ``geometry.qk_norm`` is ``False``.
+    geometry
+        The block's geometry AT THIS RANK (``h_q``, ``h_kv`` = the shard's heads); also the source of ``norm_weight_offset``.
+    act_dtype
+        The block's activation dtype (bf16 by default, f16 also served); all three results come back in it, contiguous.
+    index_qk_proj_weight
+        The indexer projection ``[(index_heads + index_kv_heads) * index_head_dim, d_model]`` of a block-sparse layer -- its
+        query heads then its raw key head, the checkpoint's row order: REQUIRED under ``geometry.qsa.index_band`` unless
+        those rows ride ``qkv_proj_weight`` (above; giving both is refused), REFUSED without the band -- exactly
+        :func:`qkvg_from_hf`'s arm.
+    """
+    geometry.validate()
+    if not isinstance(qkv_proj_weight, torch.Tensor) or qkv_proj_weight.dim() != 2:
+        got = tuple(qkv_proj_weight.shape) if isinstance(qkv_proj_weight, torch.Tensor) else type(qkv_proj_weight).__name__
+        raise ValueError(f"qkv_proj_weight must be a 2-D [rows, d_model] weight (a merged QKV linear's weight at this rank), got {got}")
+    d, hq, hkv, dm = geometry.d_head, geometry.h_q, geometry.h_kv, geometry.d_model
+    rows_q, rows_kv = 2 * hq * d, hkv * d
+    rows_qkv = rows_q + 2 * rows_kv
+    rows_band = geometry.qsa.index_band_cols if geometry.index_band else 0
+    n_rows = qkv_proj_weight.shape[0]
+    if qkv_proj_weight.shape[1] != dm:
+        raise ValueError(f"qkv_proj_weight must have {dm} columns (d_model), got {qkv_proj_weight.shape[1]}")
+    layout = (
+        f"[{rows_q} q_proj rows (per-head [q_h | gate_h]) | {rows_kv} k_proj | {rows_kv} v_proj] at this rank's geometry " f"(h_q={hq}, h_kv={hkv}, d_head={d})"
+    )
+    if geometry.index_band and n_rows == rows_qkv + rows_band:
+        # The packed form: the indexer projection's rows ride the merged weight, below v_proj.
+        if index_qk_proj_weight is not None:
+            raise ValueError(
+                f"index_qk_proj_weight: the indexer band's {rows_band} rows were given twice -- appended to qkv_proj_weight "
+                f"({n_rows} = {rows_qkv} + {rows_band} rows) AND as index_qk_proj_weight; pass one of the two"
+            )
+        index_qk_proj_weight = qkv_proj_weight[rows_qkv:]
+    elif n_rows != rows_qkv:
+        packed = f", or {rows_qkv + rows_band} with the indexer band's {rows_band} rows appended" if geometry.index_band else ""
+        raise ValueError(f"qkv_proj_weight must have {rows_qkv} rows = {layout}{packed}; got {n_rows}")
+    elif geometry.index_band and index_qk_proj_weight is None:
+        raise ValueError(
+            f"index_qk_proj_weight is required: geometry.qsa.index_band=True puts a fifth band of {rows_band} indexer columns below V "
+            f"in W_qkvg; pass the indexer projection, or hand qkv_proj_weight with its {rows_band} rows appended ({rows_qkv + rows_band} rows)"
+        )
+    w_q_gate = qkv_proj_weight[:rows_q]
+    w_k = qkv_proj_weight[rows_q : rows_q + rows_kv]
+    w_v = qkv_proj_weight[rows_q + rows_kv : rows_qkv]
+    return qkvg_from_hf(w_q_gate, w_k, w_v, q_norm_weight, k_norm_weight, geometry, index_qk_proj_weight=index_qk_proj_weight, act_dtype=act_dtype)
+
+
 # ---------------------------------------------------------------------------
 # RoPE table contract
 # ---------------------------------------------------------------------------

@@ -72,7 +72,7 @@ produced, the backward drops the norm-weight gradients).
 import cudnn
 from cudnn.gated_attention_block import (
     GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QuantSpec, MxQuantSpec, Fp4Format,
-    build_fused_qkvg_weight, qkvg_from_hf, GatedAttentionBlockBwd, RecomputePolicy, SavedForBackward,
+    build_fused_qkvg_weight, qkvg_from_hf, qkvg_from_vllm, GatedAttentionBlockBwd, RecomputePolicy, SavedForBackward,
 )
 ```
 
@@ -148,6 +148,18 @@ different function; the indexer and the sparse core are not part of the block to
     tensor (`"flat"` = all Q heads, then all GATE heads); getting it wrong applies every gate to the wrong head with
     no error anywhere. Omitting `q_gate_layout` still means `"flat"` but emits a `FutureWarning` (the deprecation
     category Python shows under its default filters, so a loader in a library module sees it too) -- pass it explicitly.
+  - **from a serving stack's merged `qkv_proj.weight` at a tensor-parallel rank** (vLLM's `QKVParallelLinear`, SGLang's
+    likewise): `qkvg_from_vllm(qkv_proj_weight, q_norm_weight, k_norm_weight, geometry, act_dtype=torch.bfloat16)`. The
+    merged weight's rows are `[q_proj | k_proj | v_proj]` at the RANK's head counts -- `2*H_q*D` rows of `q_proj` in the
+    checkpoint's per-head `[q_h | gate_h]` order, then `H_kv*D` of `k_proj` and `H_kv*D` of `v_proj` -- and `geometry`
+    describes the shard (`h_q`, `h_kv` = the rank's heads: 8 / 1 for a 32 / 2 model at TP 4, the KV head replicated across
+    the ranks that share it). The twin cuts the three row ranges and hands them to `qkvg_from_hf`, so all three results are
+    bitwise `qkvg_from_hf`'s on the same HF tensors: the per-head split is fixed (there is no layout argument), and the norm
+    weights -- replicated on every rank -- take the `(1 + w)` form derived from the geometry. `w_qkvg` is a row permutation of
+    the input with the same byte count, so a layer may replace its merged weight by it in place and keep its `o_proj.weight`
+    as `W_o`. Under an indexer band the indexer projection arrives as `index_qk_proj_weight=`, or appended to the merged
+    weight's rows as a stack that packs the (replicated) indexer projection into the same GEMM holds it -- one of the two,
+    never both.
 - `W_o [d_model, H_q * D]`.
 - `cos`, `sin` `[B, S, rope_dim]` rotary tables in the activation dtype (rotate-half convention on the first
   `rope_dim` dims of every head).
@@ -215,7 +227,8 @@ Served today:
   256-column tile plan is not defined there, a 64- or 128-column one is); a geometry without the band keeps exactly its four-band
   tuples. Enumerate `geometry.qkvg_blocks`, never `ProjBlock` itself.
 - the loader: `qkvg_from_hf(..., index_qk_proj_weight=attn.index_qk_proj.weight)` and `build_fused_qkvg_weight(...,
-  index_qk_proj_weight=)` append the band (required iff declared, refused otherwise).
+  index_qk_proj_weight=)` append the band (required iff declared, refused otherwise); `qkvg_from_vllm` takes it the same way, or
+  appended to the merged weight's rows (a serving stack that packs the indexer projection into its QKV GEMM).
 - the UNFUSED projection writes the wider slab; `index_k_raw_view(proj_slab, geometry, B, S)` and
   `GatedAttentionBlockFwd.index_k_raw(workspace)` expose the raw indexer key (the band's last `index_kv_heads * index_head_dim`
   columns, pre-norm, un-rotated -- what a serving cache keeps) as a zero-copy `[B, S, index_kv_heads, index_head_dim]` view.

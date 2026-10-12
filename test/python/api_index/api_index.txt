@@ -483,6 +483,7 @@ cudnn.gated_attention_block.gated_attention_block_backward
 cudnn.gated_attention_block.gated_attention_block_forward
 cudnn.gated_attention_block.index_k_raw_view
 cudnn.gated_attention_block.qkvg_from_hf
+cudnn.gated_attention_block.qkvg_from_vllm
 cudnn.gated_attention_block.saved_slab_views
 cudnn.gemm
 cudnn.gemm.MhcProjectionBackward
