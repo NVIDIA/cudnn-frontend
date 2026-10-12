@@ -668,6 +668,21 @@ def test_native_cuda_graph_api_is_rejected():
         cudnn.destroy_handle(handle)
 
 
+@pytest.mark.L0
+@pytest.mark.skipif(not _is_blackwell(), reason="Requires SM100 (Blackwell)")
+def test_failed_oss_build_is_reported_by_build_plans(tmp_path, monkeypatch):
+    """When the OSS engine fails to compile and nothing else is built, build_plans raises with the
+    compile error instead of succeeding and leaving execute() to fail with 'engine not built'."""
+    monkeypatch.setenv("CUDA_HOME", str(tmp_path))  # no toolkit headers there, so NVRTC fails
+    graph, X, scale, epsilon, Z = _build_rmsnorm_silu_graph(1560, 256)
+    graph.validate()
+    graph.build_operation_graph()
+    graph.create_execution_plans([cudnn.heur_mode.OPENSOURCE])
+    graph.check_support()
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="OSS RmsNorm\\+SiLU engine: NVRTC compilation failed"):
+        graph.build_plans(cudnn.build_plan_policy.HEURISTICS_CHOICE)
+
+
 if __name__ == "__main__":
     if not _is_blackwell():
         print("Skipping — requires SM100 (Blackwell)")

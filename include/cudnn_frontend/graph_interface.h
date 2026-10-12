@@ -3030,8 +3030,10 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
 #endif
 
     // Build OSS RmsNorm+SiLU engine if it passed check_support
+    std::string oss_build_failure;
     if (plans.has_oss_rms_norm_silu_engine()) {
-        auto oss_status = plans.build_oss_rms_norm_silu_engine();
+        bool const oss_selected = plans.is_oss_rms_norm_silu_candidate();
+        auto oss_status         = plans.build_oss_rms_norm_silu_engine();
         if (oss_status.is_good()) {
             CUDNN_FE_LOG_LABEL_ENDL("INFO: OSS RmsNorm+SiLU engine built successfully (NVRTC compilation done)");
             if (policy == BuildPlanPolicy_t::HEURISTICS_CHOICE) {
@@ -3040,10 +3042,17 @@ Graph::build_plans(BuildPlanPolicy_t const policy, bool const do_multithreaded_b
             }
         } else {
             CUDNN_FE_LOG_LABEL_ENDL("WARN: OSS RmsNorm+SiLU engine build failed: " << oss_status.get_message());
+            if (oss_selected) {
+                oss_build_failure = oss_status.get_message();
+            }
         }
     }
 
-    CHECK_CUDNN_FRONTEND_ERROR(plans.build_plans(policy, do_multithreaded_builds));
+    auto plans_status = plans.build_plans(policy, do_multithreaded_builds);
+    RETURN_CUDNN_FRONTEND_ERROR_IF(plans_status.is_bad() && !oss_build_failure.empty(),
+                                   plans_status.get_code(),
+                                   plans_status.get_message() + "\nOSS RmsNorm+SiLU engine: " + oss_build_failure);
+    CHECK_CUDNN_FRONTEND_ERROR(plans_status);
 
     // Prepare the variant pack template for fast execution.
     // This pre-computes slot indices so execute() can skip map operations.
