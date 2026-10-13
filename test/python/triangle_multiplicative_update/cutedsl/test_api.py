@@ -728,12 +728,14 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     assert th.recommend(384, 256, 4, "incoming").k_block == 128 and th.recommend(640, 128, 1).k_block == 128  # N mod 256 in 1..128: fewer rows at 128
     assert th.recommend(300, 128, 1).k_block == 128 and th.recommend(400, 128, 1).k_block == 256  # 400: 512 rows per bi either way -> the rule's 256
     assert th.recommend(768, 128, 1).k_block == 256 and th.recommend(217, 128, 1).k_block == 256  # multiples of 256 and N < 256 keep the rule
-    # the two substrate forms (bitwise the register / scalar rendering): c = 256 runs the rolled re-read LayerNorm form + the packed epilogue on
-    # every bucket (the K = 256 register residency was the whole story); c = 128 runs the packed epilogue everywhere and the rolled form where it
-    # measured ahead of the packed-only pick (N 256 at B = 1, N 384, N 512 at B >= 4, N >= 1024), the register form elsewhere
+    # the substrate forms (bitwise the register / scalar rendering): c = 256 runs the PIPELINED rolled re-read LayerNorm form (`smem_rolled_pf`: the
+    # rolled form with the next chunk's loads carried one iteration ahead; K1 +2.9..+5.6 %, K3 +20..+34 % over the rolled form on every measured
+    # N >= 256 cell of both bias arms, 212-SM Rubin class) + the packed epilogue on every bucket the flip covers; c = 128 runs the packed epilogue
+    # everywhere and the rolled form where it measured ahead of the packed-only pick (N 256 at B = 1, N 384, N 512 at B >= 4, N >= 1024), the
+    # register form elsewhere -- the pipelined form's c = 128 sign is mixed by cell (-1.4..+2.6 %) and flips nothing there
     for n in (33, 128, 217, 256, 384, 512, 768, 1024, 4096):
         for b in (1, 4):
-            assert th.recommend(n, 256, b).ln_pass_form == "smem_rolled" and th.recommend(n, 256, b).epi_math == "packed", (n, b)
+            assert th.recommend(n, 256, b).ln_pass_form == "smem_rolled_pf" and th.recommend(n, 256, b).epi_math == "packed", (n, b)
             assert th.recommend(n, 128, b).epi_math == "packed", (n, b)
     assert th.recommend(256, 128, 1).ln_pass_form == th.recommend(384, 128, 1).ln_pass_form == th.recommend(384, 128, 4).ln_pass_form == "smem_rolled"
     assert th.recommend(1024, 128, 1).ln_pass_form == th.recommend(1024, 128, 4).ln_pass_form == th.recommend(4096, 128, 1).ln_pass_form == "smem_rolled"

@@ -163,6 +163,20 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 #            128 (three SMEM passes with nothing to buy) -- two passes on two nodes of the class, the same sign on every cell.  The unrolled re-read form
 #            ("smem") is not in the table: -4.5..-12.7 % at c = 128 and a third of the rolled form's gain at c = 256 (its normalise pass
 #            still spills half).
+#
+# The PIPELINED rolled form (`ln_pass_form="smem_rolled_pf"`: the rolled re-read with chunk (q + 1)'s loads carried one loop iteration ahead -- the same
+# words into the same additions in the same order, bitwise), measured STANDALONE on both LayerNorm-prologue kernels over the heuristics' complete pick
+# (graph replay, 100 x 3, control pair <= 0.4 %, every arm bitwise the pick, the 212-SM Rubin class at the 2376 lock; bias off AND on):
+#   c = 256: K1 +2.9 / +2.9 / +3.0 / +3.2 % (bias off) and +5.2 / +5.1 / +5.2 / +5.6 % (bias on) at N 512 x 1 / 384 x 1 / 256 x 4 / 1024 x 1, K3
+#            +32.3 / +30.2 / +32.5 / +33.5 % (bias off: the shipped rolled K3 rendering spills at REG 80 without the biases, 298 -> 226 us at N 512)
+#            and +21.9 / +20.2 / +21.9 / +22.5 % (bias on, no spill in either: 278 -> 228 us) -- every cell of every measured bucket, the same sign in
+#            both bias arms, outside 10x the control spread.  Every c = 256 pick: pipelined rolled + packed.
+#   c = 128: MIXED by cell and by bias arm on K1 (the only stage the knob reaches there; K3's transpose prologue keeps the register form): -1.4 % (off) /
+#            +0.6 % (on) at N 1024 x 1, +0.9 / +2.6 % at N 384 x 1, and -11 / -0.4 % against the REGISTER picks at N 512 x 1 and 256 x 4 (the register
+#            form + packed epilogue leads every rolled form there by 9-11 % without the biases) -- no bucket flips; the register / rolled picks stand.
+# The tree form (`"smem_rolled_tree"`: the pipelined form with four partial sums per statistics pass -- a different fp32 ORDER, LN_PASS_FORMS_REORDERED)
+# adds +0.2..+3.5 % on top (K3 c 256 +25.0..+25.3 % vs the pick with the biases, +32.5..+36.0 % without; K1 c 256 +5.3..+6.1 %) and is NEVER a pick of
+# this table: a caller's knob, reported with its oracle distance.
 def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str) -> TriMulKnobs:
     """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`)."""
     return TriMulKnobs(
@@ -181,13 +195,13 @@ _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
         (0, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed")),
     ),
     256: (
-        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
-        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
-        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
-        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
-        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
-        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled", "packed")),
-        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled", "packed")),
+        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
+        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
+        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed")),
     ),
 }
 
