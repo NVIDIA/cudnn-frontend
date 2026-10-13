@@ -92,7 +92,7 @@ from cudnn.sdpa.fwd.engines import (
 )
 
 # Cells whose (tile_m, tile_n) choice _sm120_tiles makes.
-_TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8"})
+_TILE_RULE_CELLS = frozenset({"sdpa_fwd_prefill_sm120", "sdpa_fwd_prefill_sm120_fp8", "sdpa_fwd_prefill_sm120_mxfp8"})
 
 # Cap on complete knob sets emitted per engine per kind. The combiner grows
 # Σ|axis runners|, never the cartesian product; this bound keeps the plan list
@@ -476,6 +476,23 @@ def choose_decode_tile_split_kv(
     return best
 
 
+def _sm120_envelope(facts) -> Tuple[int, int]:
+    """(D_QK, D_V) rounded up to the head-tile granule: the ENVELOPE tiles the
+    SM120 kernels stage, so a fit check must use them or a tile offered here
+    declines at build (and a knob-carried tile skips the adapter's fallback)."""
+    granule = FP8_HEAD_TILE_GRANULE if (facts.is_fp8 or facts.is_mxfp8) else HEAD_TILE_GRANULE
+    return -(-facts.d_qk // granule) * granule, -(-facts.d_v // granule) * granule
+
+
+def _sm120_fits_smem(facts, tile_m: int, tile_n: int) -> bool:
+    """Whether a (tile_m, tile_n) CTA fits SM120 SMEM. FP8 stages a byte per KV
+    element but still writes O in half, so the two SMEM terms size differently
+    (config_sm120.smem_bytes); MXFP8 adds its K/V scale tiles."""
+    quantized = facts.is_fp8 or facts.is_mxfp8
+    d_qp, d_vp = _sm120_envelope(facts)
+    return smem_bytes(d_qp, d_vp, tile_m, tile_n, 1 if quantized else 2, 2, mxfp8=facts.is_mxfp8) <= SMEM_CAPACITY_BYTES
+
+
 def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     """(tile_m, tile_n) for the SM120 SDPA-forward prefill cell.
 
@@ -506,25 +523,16 @@ def _sm120_tiles(caps: Capabilities, facts) -> Tuple[int, int]:
     kv_tiles = -(-facts.s_kv // 128)
     fine = sm_count > 0 and (grid * 2 <= sm_count or (grid * 2 <= 3 * sm_count and kv_tiles >= 12))
     preferred_tile_m = 64 if fine else 128
-    # FP8 stages a byte per KV element but still writes O in half, so the two
-    # SMEM terms size differently -- see config_sm120.smem_bytes. The kernel
-    # stages ENVELOPE head tiles (actual dims round up to the granule), so
-    # the fit check must round the same way or a tile offered here declines
-    # at build -- and a knob-carried tile skips the adapter's fallback.
-    qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
-    granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
-    d_qp = -(-facts.d_qk // granule) * granule
-    d_vp = -(-facts.d_v // granule) * granule
     # Prefer the selected query tile, then larger query and KV tiles.
     candidate_tiles = sorted(
-        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8),
+        tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8),
         key=lambda tile: (tile[0] == preferred_tile_m, tile[0], tile[1]),
         reverse=True,
     )
     for m, n in candidate_tiles:
         if m not in caps.tile_ms or n not in caps.tile_ns:
             continue
-        if smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES:
+        if _sm120_fits_smem(facts, m, n):
             return m, n
     # Nothing fits: fall back to the smallest tile the kernel table admits for
     # the row, so the decline comes from the SMEM check rather than at build.
@@ -543,18 +551,8 @@ def _tile_points(spec: EngineSpec, facts) -> List[Tuple[Optional[int], Optional[
         # axis, so there is nothing to choose between anyway.
         return [(_sole(caps.tile_ms), _sole(caps.tile_ns))]
     best = _sm120_tiles(caps, facts)
-    qkv_itemsize, o_itemsize = (1, 2) if facts.is_fp8 else (2, 2)
-    # Same envelope rounding as _sm120_tiles / the adapter's SMEM check.
-    granule = FP8_HEAD_TILE_GRANULE if facts.is_fp8 else HEAD_TILE_GRANULE
-    d_qp = -(-facts.d_qk // granule) * granule
-    d_vp = -(-facts.d_v // granule) * granule
-    tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8)
-    domain = [
-        (m, n)
-        for m in caps.tile_ms
-        for n in caps.tile_ns
-        if (m, n) in tile_choices and smem_bytes(d_qp, d_vp, m, n, qkv_itemsize, o_itemsize) <= SMEM_CAPACITY_BYTES
-    ]
+    tile_choices = tile_domain(facts.d_qk, facts.d_v, facts.is_fp8 or facts.is_mxfp8)
+    domain = [(m, n) for m in caps.tile_ms for n in caps.tile_ns if (m, n) in tile_choices and _sm120_fits_smem(facts, m, n)]
     return sorted(domain or [best], key=lambda mn: (mn != best, mn[1] != best[1], -mn[0]))
 
 
@@ -1081,6 +1079,12 @@ def _d128_decode_tile_fits(caps: Capabilities, facts, pack_gqa: Optional[bool] =
     return select_d128_auto_cga(s_q=facts.s_q, pack_g=pack_g, thd=facts.thd, thd_decode_leg=thd_decode_leg) == 1
 
 
+# Longest average per-tile K/V walk (keys) at which the packed MXFP8 d128 leg still takes the single 256-row CTA
+# (causal: half of S_kv; sliding window: the window plus one tile).  Causal S=2K / S=4K and window 1024 sit at or
+# below it, causal S=8K and above keep the cga2 pair -- see _auto_sched_cga.
+_SM100_MXFP8_D128_CGA1_MAX_WALK = 2048
+
+
 def _in_flavor_sched_domain(caps: Capabilities, facts, selected: int, seed: int) -> int:
     """``selected`` when the selected flavor's scheduler domain honours it, else ``seed`` (drawn from that
     domain by the caller), else the domain's lowest policy.  The measured D192 / D256 / D512 pickers answer
@@ -1119,6 +1123,23 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
         # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
         return sched_policy, 1
+    if selected_shape == (128, 128) and facts.is_mxfp8 and caps.sm_lo == 100 and 1 in domain and not facts.thd and not facts.has_paged_kv:
+        # MXFP8 d128 on a dense graph.  cga1 = one 256-row CTA of the prefill body (the geometry cuDNN's own MXFP8
+        # d128 kernel runs; no pair handshake at the tile boundary, but no K/V multicast either).  MEASURED 2026-10-07
+        # against the cga2 pair in the benchmark regime (same-node A/B, cuDNN 9.27; O bit-identical between the
+        # widths): the PACKED GQA leg wins at cga1 while its K/V walk is short -- llama 64/8 causal S=2K 0.97x (B200)
+        # / 0.97x (B300) with the three-stage cga1 ring, S=4K 1.00x / 0.99x, sliding window 1024 at S=2K 0.96x /
+        # 0.95x -- and loses once it is long (causal S=8K 1.01x / 1.00x, S=16K 1.07x on B300), where the pair's
+        # shared K/V stream pays; an unpacked leg (dense GQA, any MHA) and the split leg keep the pair (dense S=2K
+        # +3 % at cga1 on B200; AR-DiT split +2..3 %).
+        packed = pack_gqa if pack_gqa is not None else _sm100_banded_gqa_packs(caps, facts)
+        if (split_kv or 1) > 1 or not packed:
+            return sched_policy, 2
+        if facts.window_left is not None:
+            kv_walk = min(facts.s_kv, facts.window_left + 128)
+        else:
+            kv_walk = facts.s_kv // 2 if facts.causal else facts.s_kv
+        return sched_policy, 1 if kv_walk <= _SM100_MXFP8_D128_CGA1_MAX_WALK else 2
     if facts.device_cc == (10, 7) and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,

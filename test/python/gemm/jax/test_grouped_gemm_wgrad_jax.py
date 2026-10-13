@@ -8,9 +8,8 @@ JAX contract: BF16 backend only, with A K-major and B N-major (both plain C-cont
 JAX arrays); dense outputs are C-contiguous (expert, M, N) arrays, and discrete outputs
 take a packed-uint8 wgrad_ptrs array (8 bytes per pointer, since JAX truncates int64
 without x64 mode). Outputs are checked bit-identical against the torch wrapper run on
-identical input bytes. The block-scaled backend is rejected (its B operand is K-major,
-i.e. column-major, and fp4 operands are K-packed -- neither is expressible as a
-row-major JAX array).
+identical input bytes. MXFP8 wgrad is covered in test_grouped_gemm_canonical_jax.py; the
+block-scaled class API stays torch-only.
 """
 
 import numpy as np
@@ -217,31 +216,18 @@ def test_grouped_gemm_wgrad_jax_jit_matches_eager():
 
 
 @pytest.mark.L0
-def test_grouped_gemm_wgrad_jax_block_scaled_rejected():
+def test_grouped_gemm_wgrad_jax_block_scaled_class_api_rejected():
     skip_unless_sm100()
     import cudnn
-    from cudnn import grouped_gemm_wgrad_wrapper_sm100
 
     rng = np.random.default_rng(0)
     m, n, tokens = 128, 128, 512
     a_j = jnp.asarray(rng.integers(0, 100, (m, tokens), dtype=np.uint8).view(ml_dtypes.float8_e4m3fn))
     b_j = jnp.asarray(rng.integers(0, 100, (tokens, n), dtype=np.uint8).view(ml_dtypes.float8_e4m3fn))
-    sfa_j = jnp.asarray(np.full((128, 32), 127, dtype=np.uint8).view(ml_dtypes.float8_e8m0fnu))
-    sfb_j = jnp.asarray(np.full((128, 32), 127, dtype=np.uint8).view(ml_dtypes.float8_e8m0fnu))
+    sfa_j = jnp.asarray(np.full((128, 16), 127, dtype=np.uint8).view(ml_dtypes.float8_e8m0fnu))
+    sfb_j = jnp.asarray(np.full((128, 16), 127, dtype=np.uint8).view(ml_dtypes.float8_e8m0fnu))
     offsets_j = jnp.asarray(np.array([256, 512], dtype=np.int32))
 
-    with pytest.raises(ValueError, match="not expressible as JAX arrays"):
-        grouped_gemm_wgrad_wrapper_sm100(
-            a_tensor=a_j,
-            b_tensor=b_j,
-            sfa_tensor=sfa_j,
-            sfb_tensor=sfb_j,
-            offsets_tensor=offsets_j,
-            output_mode="dense",
-            sf_vec_size=32,
-        )
-
-    # Class API path rejects too.
     op = cudnn.GroupedGemmWgradSm100(
         sample_a=a_j,
         sample_b=b_j,
@@ -251,5 +237,5 @@ def test_grouped_gemm_wgrad_jax_block_scaled_rejected():
         sample_wgrad=jnp.zeros((2, m, n), dtype=ml_dtypes.bfloat16),
         sf_vec_size=32,
     )
-    with pytest.raises(ValueError, match="not expressible as JAX arrays"):
+    with pytest.raises(ValueError, match="torch-only"):
         op.check_support()

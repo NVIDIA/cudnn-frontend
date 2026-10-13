@@ -29,14 +29,17 @@ DEBUG_VALIDATE_DEVICE_VALUES = os.getenv(DEBUG_VALIDATE_DEVICE_VALUES_ENV, "0") 
 
 
 def _check_not_capturing(stream, what: str) -> None:
-    err, status = cuda.cuStreamIsCapturing(cuda.CUstream(int(stream)))
-    if int(err) != 0:
-        raise RuntimeError(f"cuStreamIsCapturing failed: {err}")
-    if status != cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
-        raise RuntimeError(
-            f"{what}: {DEBUG_VALIDATE_DEVICE_VALUES_ENV}=1 reads device values back to the host "
-            "and cannot run under CUDA graph capture; unset it for captured graphs"
-        )
+    """The debug validation's refusal under stream capture: the shared status query and typed refusal of
+    ``cudnn.frost.capture`` (one spelling for every FROST host path), with THIS module's remedy -- the env var
+    that turned the blocking host read on is the thing to unset.  Kept under its own name here so the two
+    call sites below (and the test that stubs them) keep reading it off this module."""
+    from cudnn.frost.capture import check_not_capturing
+
+    check_not_capturing(
+        stream,
+        what,
+        remedy=f"{DEBUG_VALIDATE_DEVICE_VALUES_ENV}=1 reads device values back to the host and cannot run under CUDA graph capture; unset it for captured graphs",
+    )
 
 
 def _host_int_values(tensor) -> Tuple[int, ...]:

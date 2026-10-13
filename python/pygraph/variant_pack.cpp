@@ -25,12 +25,16 @@
 #include <unordered_set>
 #include <vector>
 
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/vector.h>
 
 #include "dlpack/dlpack.h"
 
-namespace py = pybind11;
+namespace py = nanobind;
 
 namespace cudnn_frontend {
 namespace python_bindings {
@@ -100,7 +104,7 @@ exchange_api_for(PyObject *obj) {
     // at the same address, and this would hand out its vtable. The cache never
     // evicts, so this pins at most kTypeCacheSlots types.
     if (api != nullptr && cache.count < kTypeCacheSlots) {
-        Py_INCREF(type);
+        Py_INCREF(reinterpret_cast<PyObject *>(type));
         cache.types[cache.count] = type;
         cache.apis[cache.count]  = api;
         cache.count++;
@@ -172,8 +176,8 @@ struct Operand {
     int32_t observed_device_id   = -1;
 };
 
-// Emit effective strides into either a native vector or a Python tuple without
-// materializing an intermediate container. Empty producer strides mean compact.
+// Emit effective strides into either a native vector or a Python list.
+// Empty producer strides mean compact.
 template <typename Store>
 void
 write_effective_strides(const Operand &operand, Store &&store) {
@@ -283,9 +287,10 @@ class DeclaredLayout {
         int dtype_lanes      = 1,
         bool preserve_extent = false) {
         if (shape.size() != stride.size()) {
-            throw py::value_error("declared shape and stride must have the same rank; got " +
-                                  std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
-                                  " for slot " + std::to_string(index));
+            throw py::value_error(("declared shape and stride must have the same rank; got " +
+                                   std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
+                                   " for slot " + std::to_string(index))
+                                      .c_str());
         }
         Slot &slot      = slots_.at(index);
         slot.span       = span_of(shape, stride);
@@ -374,8 +379,9 @@ class OperandBuffer {
     stride_at(int64_t dim) const {
         int64_t axis = dim < 0 ? dim + operand_.ndim : dim;
         if (axis < 0 || axis >= operand_.ndim)
-            throw py::index_error("stride(): dimension " + std::to_string(dim) + " is out of range for a " +
-                                  std::to_string(operand_.ndim) + "-D operand");
+            throw py::index_error(("stride(): dimension " + std::to_string(dim) + " is out of range for a " +
+                                   std::to_string(operand_.ndim) + "-D operand")
+                                      .c_str());
         return stride()[axis];
     }
 
@@ -436,10 +442,12 @@ class OperandBuffer {
         }
         if (wildcard >= 0) {
             if (fixed == 0 || numel % fixed != 0)
-                throw py::value_error("cannot reshape " + std::to_string(numel) + " elements to the requested shape");
+                throw py::value_error(
+                    ("cannot reshape " + std::to_string(numel) + " elements to the requested shape").c_str());
             shape[wildcard] = numel / fixed;
         } else if (fixed != numel) {
-            throw py::value_error("cannot reshape " + std::to_string(numel) + " elements to " + std::to_string(fixed));
+            throw py::value_error(
+                ("cannot reshape " + std::to_string(numel) + " elements to " + std::to_string(fixed)).c_str());
         }
         Operand out = operand_;
         out.shape   = std::move(shape);
@@ -452,8 +460,9 @@ class OperandBuffer {
     OperandBuffer *
     permute(const std::vector<int64_t> &axes) const {
         if (axes.size() != static_cast<size_t>(operand_.ndim))
-            throw py::value_error("permute needs one axis per dimension: this operand is " +
-                                  std::to_string(operand_.ndim) + "-D");
+            throw py::value_error(
+                ("permute needs one axis per dimension: this operand is " + std::to_string(operand_.ndim) + "-D")
+                    .c_str());
         std::vector<bool> seen(axes.size(), false);
         Operand out = operand_;
         out.stride.assign(operand_.ndim, 1);
@@ -507,7 +516,7 @@ class OperandBuffer {
         owned->managed.dl_tensor.strides = owned->stride.empty() ? nullptr : owned->stride.data();
         owned->managed.manager_ctx       = owned;
         owned->managed.deleter = [](DLManagedTensor *self) { delete static_cast<Owned *>(self->manager_ctx); };
-        return py::capsule(&owned->managed, "dltensor", [](PyObject *capsule) {
+        PyObject *capsule      = PyCapsule_New(&owned->managed, "dltensor", [](PyObject *capsule) {
             // only reached when nobody consumed it: a consumer renames the
             // capsule to "used_dltensor" and takes the deleter over
             if (PyCapsule_IsValid(capsule, "dltensor")) {
@@ -515,6 +524,11 @@ class OperandBuffer {
                 if (managed != nullptr && managed->deleter != nullptr) managed->deleter(managed);
             }
         });
+        if (capsule == nullptr) {
+            delete owned;
+            throw py::python_error();
+        }
+        return py::steal<py::capsule>(capsule);
     }
 
    private:
@@ -623,7 +637,7 @@ class VariantPackNative {
         DLPackExchangeAPI *api = exchange_api_for(buffer.ptr());
         if (api == nullptr || api->dltensor_from_py_object_no_sync == nullptr) return false;
         DLTensor t{};
-        if (api->dltensor_from_py_object_no_sync(buffer.ptr(), &t) != 0) throw py::error_already_set();
+        if (api->dltensor_from_py_object_no_sync(buffer.ptr(), &t) != 0) throw py::python_error();
         operand.data  = static_cast<char *>(t.data) + t.byte_offset;
         operand.ndim  = t.ndim;
         operand.dtype = t.dtype;
@@ -721,7 +735,8 @@ class VariantPackNative {
                      int dtype_lanes = 1) {
         Operand &operand = operands_.at(index);
         if (!operand.filled) {
-            throw py::value_error("variant-pack operand " + std::to_string(index) + " has no buffer to re-describe");
+            throw py::value_error(
+                ("variant-pack operand " + std::to_string(index) + " has no buffer to re-describe").c_str());
         }
         if (dtype_bits > 0) {
             const int64_t own_bytes  = (static_cast<int64_t>(operand.dtype.bits) * operand.dtype.lanes + 7) / 8;
@@ -735,9 +750,10 @@ class VariantPackNative {
         // ndim comes from the shape and the stride array is read ndim deep, and
         // this is the one place the two arrive from different lists.
         if (shape.size() != stride.size()) {
-            throw py::value_error("override shape and stride must have the same rank; got " +
-                                  std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
-                                  " for operand " + std::to_string(index));
+            throw py::value_error(("override shape and stride must have the same rank; got " +
+                                   std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
+                                   " for operand " + std::to_string(index))
+                                      .c_str());
         }
         operand.ndim   = static_cast<int32_t>(shape.size());
         operand.shape  = std::move(shape);
@@ -760,27 +776,30 @@ class VariantPackNative {
         for (size_t j = 0; j < indices.size(); j++) {
             const size_t i = indices[j];
             if (i >= operands_.size())
-                throw py::index_error("override_many: slot " + std::to_string(i) + " out of range");
+                throw py::index_error(("override_many: slot " + std::to_string(i) + " out of range").c_str());
             const DLDataType dtype      = i < slots.size() ? slots[i].dtype : DLDataType{0, 0, 1};
             const bool fp4              = dtype.bits == 4 && dtype.lanes == 2;
             std::vector<int64_t> shape  = std::move(shapes[j]);
             std::vector<int64_t> stride = std::move(strides[j]);
             if (shape.size() != stride.size() && !stride.empty()) {
-                throw py::value_error("override shape and stride must have the same rank; got " +
-                                      std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
-                                      " for operand " + std::to_string(i));
+                throw py::value_error(("override shape and stride must have the same rank; got " +
+                                       std::to_string(shape.size()) + " and " + std::to_string(stride.size()) +
+                                       " for operand " + std::to_string(i))
+                                          .c_str());
             }
             if (!storage_geometry_of(shape, stride, fp4)) {
                 std::string geom;
                 for (size_t d = 0; d < shape.size(); d++) geom += (d ? ", " : "") + std::to_string(shape[d]);
-                throw py::value_error("override_shapes for operand " + std::to_string(i) +
-                                      ": an fp4 tensor packs two elements per storage slot, so its unit-stride extent "
-                                      "must be even; got (" +
-                                      geom + ")");
+                throw py::value_error(("override_shapes for operand " + std::to_string(i) +
+                                       ": an fp4 tensor packs two elements per storage slot, so its unit-stride extent "
+                                       "must be even; got (" +
+                                       geom + ")")
+                                          .c_str());
             }
             Operand &operand = operands_[i];
             if (!operand.filled) {
-                throw py::value_error("variant-pack operand " + std::to_string(i) + " has no buffer to re-describe");
+                throw py::value_error(
+                    ("variant-pack operand " + std::to_string(i) + " has no buffer to re-describe").c_str());
             }
             override_storage(i, std::move(shape), std::move(stride), dtype);
         }
@@ -790,7 +809,8 @@ class VariantPackNative {
     override_storage(size_t i, std::vector<int64_t> shape, std::vector<int64_t> stride, DLDataType dtype) {
         const auto &operand = operands_.at(i);
         if (!operand.filled)
-            throw py::value_error("variant-pack operand " + std::to_string(i) + " has no buffer to re-describe");
+            throw py::value_error(
+                ("variant-pack operand " + std::to_string(i) + " has no buffer to re-describe").c_str());
         // Axis order remains a property of THIS producer, never of a cached call.
         const auto reference = operand.stride.empty() ? dense_stride_of(operand.shape) : operand.stride;
         in_axis_order_of(shape, stride, reference);
@@ -934,19 +954,21 @@ class VariantPackNative {
     }
 
     // Build the consumer's immutable records in one native crossing, without
-    // intermediate Python lists or a second observation/validation path.
+    // a second observation/validation path.
     // Effective dtype/geometry and observed producer span/device remain separate.
     py::list
     facts_as(const std::vector<size_t> &indices, const py::object &constructor, const py::dict &dtype_names) const {
-        py::list out(indices.size());
+        py::list out;
         const py::str unknown_dtype("");
         for (size_t i = 0; i < indices.size(); ++i) {
             const size_t index     = indices[i];
             const Operand &operand = operands_.at(index);
-            py::tuple shape(operand.shape.size());
-            for (size_t d = 0; d < operand.shape.size(); ++d) shape[d] = py::int_(operand.shape[d]);
+            py::list shape;
+            for (size_t d = 0; d < operand.shape.size(); ++d) shape.append(py::int_(operand.shape[d]));
 
-            py::tuple strides(operand.stride.empty() ? operand.shape.size() : operand.stride.size());
+            py::list strides;
+            for (size_t d = 0; d < (operand.stride.empty() ? operand.shape.size() : operand.stride.size()); ++d)
+                strides.append(py::none());
             write_effective_strides(operand, [&strides](size_t d, int64_t value) { strides[d] = py::int_(value); });
             const auto dtype_key =
                 py::make_tuple(static_cast<int>(operand.dtype.code), static_cast<int>(operand.dtype.bits));
@@ -954,13 +976,12 @@ class VariantPackNative {
             // Match the facts consumer: producer bytes in the EFFECTIVE element width.
             const int64_t width = std::max<int64_t>(1, (static_cast<int64_t>(operand.dtype.bits) + 7) / 8);
             const int64_t span  = operand.observed_bytes < 0 ? -1 : operand.observed_bytes / width;
-            out[i] =
-                constructor(reinterpret_cast<int64_t>(pointers_.at(index)),
-                            dtype == nullptr ? py::object(unknown_dtype) : py::reinterpret_borrow<py::object>(dtype),
-                            py::make_tuple(operand.observed_device_type, operand.observed_device_id),
-                            span,
-                            shape,
-                            strides);
+            out.append(constructor(reinterpret_cast<int64_t>(pointers_.at(index)),
+                                   dtype == nullptr ? py::object(unknown_dtype) : py::borrow<py::object>(dtype),
+                                   py::make_tuple(operand.observed_device_type, operand.observed_device_id),
+                                   span,
+                                   py::tuple(shape),
+                                   py::tuple(strides)));
         }
         return out;
     }
@@ -1021,7 +1042,8 @@ class VariantPackNative {
     operand(size_t index, int32_t device_id) const {
         const Operand &operand = operands_.at(index);
         if (!operand.filled)
-            throw py::value_error("variant-pack operand " + std::to_string(index) + " was not filled by the caller");
+            throw py::value_error(
+                ("variant-pack operand " + std::to_string(index) + " was not filled by the caller").c_str());
         return new OperandBuffer(operand, device_id);
     }
 
@@ -1032,7 +1054,7 @@ class VariantPackNative {
 
 std::vector<NativeOperandView>
 read_native_operand_views(py::handle object, const std::vector<int64_t> &indices) {
-    const auto &pack = object.cast<const VariantPackNative &>();
+    const auto &pack = py::cast<const VariantPackNative &>(object);
     std::vector<NativeOperandView> views;
     views.reserve(indices.size());
     for (int64_t index : indices) {
@@ -1049,9 +1071,9 @@ read_native_operand_views(py::handle object, const std::vector<int64_t> &indices
 // producers without the exchange API take the existing Python observation path.
 py::tuple
 read_native_buffer_sequence(const py::sequence &buffers) {
-    auto pack = std::make_unique<VariantPackNative>(buffers.size());
+    auto pack = std::make_unique<VariantPackNative>(py::len(buffers));
     std::vector<size_t> unread;
-    for (size_t i = 0; i < static_cast<size_t>(buffers.size()); ++i) {
+    for (size_t i = 0; i < static_cast<size_t>(py::len(buffers)); ++i) {
         auto buffer = buffers[i];
         if (!buffer.is_none() && !pack->read_operand(i, buffer)) unread.push_back(i);
     }
@@ -1072,34 +1094,34 @@ native_pack_from_facts(const py::dict &facts,
     for (size_t i = 0; i < static_cast<size_t>(count); ++i) {
         auto role = names[i];
         if (!facts.contains(role) || facts[role].is_none()) continue;
-        auto fact = facts[role].cast<py::tuple>();
+        auto fact = py::cast<py::tuple>(facts[role]);
         if (fact.size() != 6)
             throw py::value_error("buffer facts require pointer, dtype, device, span, shape and strides");
         const auto dtype = fact[1];
-        const auto type  = dtypes.contains(dtype) ? dtypes[dtype].cast<py::tuple>() : py::make_tuple(0, 0);
-        const auto width = itemsize.contains(dtype) ? itemsize[dtype].cast<int64_t>() : 1;
-        const auto span  = fact[3].cast<int64_t>();
+        const auto type  = dtypes.contains(dtype) ? py::cast<py::tuple>(dtypes[dtype]) : py::make_tuple(0, 0);
+        const auto width = itemsize.contains(dtype) ? py::cast<int64_t>(itemsize[dtype]) : 1;
+        const auto span  = py::cast<int64_t>(fact[3]);
         if (width <= 0 || (span >= 0 && span > std::numeric_limits<int64_t>::max() / width))
             throw py::value_error("observed storage bytes must fit in int64");
-        const auto device = fact[2].cast<py::tuple>();
+        const auto device = py::cast<py::tuple>(fact[2]);
         if (device.size() != 2) throw py::value_error("buffer facts require device type and ordinal");
         pack->set_operand(i,
-                          fact[0].cast<int64_t>(),
-                          fact[4].cast<std::vector<int64_t>>(),
-                          fact[5].cast<std::vector<int64_t>>(),
-                          type[0].cast<int>(),
-                          type[1].cast<int>(),
+                          py::cast<int64_t>(fact[0]),
+                          py::cast<std::vector<int64_t>>(fact[4]),
+                          py::cast<std::vector<int64_t>>(fact[5]),
+                          py::cast<int>(type[0]),
+                          py::cast<int>(type[1]),
                           1,
                           span < 0 ? -1 : span * width,
-                          device[0].cast<int>(),
-                          device[1].cast<int>());
+                          py::cast<int>(device[0]),
+                          py::cast<int>(device[1]));
     }
     return pack;
 }
 
 NativeExecutionBindings
 read_native_execution_bindings(py::handle object) {
-    const auto &pack = object.cast<const VariantPackNative &>();
+    const auto &pack = py::cast<const VariantPackNative &>(object);
     if (!pack.ordered_geometry) throw py::value_error("Expected an ordered execution pack");
     return {pack.pointers(), pack.size(), pack.ordered_geometry->overrides};
 }
@@ -1127,7 +1149,7 @@ read_buffer_extent(py::handle buffer) {
     DLPackExchangeAPI *api = exchange_api_for(buffer.ptr());
     if (api == nullptr || api->dltensor_from_py_object_no_sync == nullptr) return py::none();
     DLTensor t{};
-    if (api->dltensor_from_py_object_no_sync(buffer.ptr(), &t) != 0) throw py::error_already_set();
+    if (api->dltensor_from_py_object_no_sync(buffer.ptr(), &t) != 0) throw py::python_error();
     // A byte count is only a byte RANGE when the buffer is dense; a carve
     // bounds-checked against a strided one would write outside the allocation.
     if (!is_dense(t)) return py::none();
@@ -1150,17 +1172,17 @@ class OrderedBindingSchema {
     static py::sequence
     sequence(py::handle object, const char *name) {
         if (!PyTuple_Check(object.ptr()) && !PyList_Check(object.ptr()))
-            throw py::type_error(std::string(name) + " must be a tuple or list");
-        return py::reinterpret_borrow<py::sequence>(object);
+            throw py::type_error((std::string(name) + " must be a tuple or list").c_str());
+        return py::borrow<py::sequence>(object);
     }
 
     static bool
     same_vector(py::handle object, const std::vector<int64_t> &values) {
         if (object.is_none()) return values.empty();
         auto input = sequence(object, "binding metadata");
-        if (input.size() != values.size()) return false;
+        if (py::len(input) != values.size()) return false;
         for (size_t i = 0; i < values.size(); ++i)
-            if (input[i].cast<int64_t>() != values[i]) return false;
+            if (py::cast<int64_t>(input[i]) != values[i]) return false;
         return true;
     }
 
@@ -1168,7 +1190,7 @@ class OrderedBindingSchema {
     same_matrix(py::handle object, const std::vector<std::vector<int64_t>> &values) {
         if (object.is_none()) return values.empty();
         auto input = sequence(object, "override metadata");
-        if (input.size() != values.size()) return false;
+        if (py::len(input) != values.size()) return false;
         for (size_t i = 0; i < values.size(); ++i) {
             sequence(input[i], "override geometry");
             if (!same_vector(input[i], values[i])) return false;
@@ -1180,8 +1202,8 @@ class OrderedBindingSchema {
     matrix(py::handle object, const char *name) {
         auto rows = sequence(object, name);
         std::vector<std::vector<int64_t>> result;
-        result.reserve(rows.size());
-        for (auto row : rows) result.push_back(sequence(row, "override geometry").cast<std::vector<int64_t>>());
+        result.reserve(py::len(rows));
+        for (auto row : rows) result.push_back(py::cast<std::vector<int64_t>>(sequence(row, "override geometry")));
         return result;
     }
 
@@ -1189,7 +1211,7 @@ class OrderedBindingSchema {
     slot(int64_t uid) const {
         auto found = std::lower_bound(uids_.begin(), uids_.end(), uid);
         if (found == uids_.end() || *found != uid)
-            throw py::value_error("tensor uid " + std::to_string(uid) + " is not an operand of this graph");
+            throw py::value_error(("tensor uid " + std::to_string(uid) + " is not an operand of this graph").c_str());
         return static_cast<size_t>(found - uids_.begin());
     }
 
@@ -1207,7 +1229,7 @@ class OrderedBindingSchema {
             same_matrix(strides, cached->overrides.strides))
             return cached;
         auto next        = std::make_shared<OrderedGeometry>();
-        next->input_uids = sequence(input_uids, "tensor_uids").cast<std::vector<int64_t>>();
+        next->input_uids = py::cast<std::vector<int64_t>>(sequence(input_uids, "tensor_uids"));
         next->input_at_slot.assign(uids_.size(), -1);
         std::unordered_set<int64_t> supplied_uids;
         for (size_t i = 0; i < next->input_uids.size(); ++i) {
@@ -1221,7 +1243,7 @@ class OrderedBindingSchema {
         }
         auto &overrides = next->overrides;
         if (!override_uids.is_none())
-            overrides.uids = sequence(override_uids, "override_uids").cast<std::vector<int64_t>>();
+            overrides.uids = py::cast<std::vector<int64_t>>(sequence(override_uids, "override_uids"));
         if (!shapes.is_none()) overrides.shapes = matrix(shapes, "override_shapes");
         if (!strides.is_none()) overrides.strides = matrix(strides, "override_strides");
         if (overrides.uids.size() != overrides.shapes.size() || overrides.uids.size() != overrides.strides.size())
@@ -1284,8 +1306,8 @@ class OrderedBindingSchema {
         if (strict_) {
             auto hole = pack.first_unfilled();
             if (hole >= 0)
-                throw py::value_error("the variant pack is missing a buffer for tensor uid " +
-                                      std::to_string(uids_[hole]));
+                throw py::value_error(
+                    ("the variant pack is missing a buffer for tensor uid " + std::to_string(uids_[hole])).c_str());
         }
         auto described       = pack.describe_from(declared_, from_graph);
         const auto &geometry = *pack.ordered_geometry;
@@ -1307,7 +1329,7 @@ class OrderedBindingSchema {
          py::handle strides) {
         auto buffers = sequence(buffers_object, "ordered buffers");
         auto current = geometry(input_uids, override_uids, shapes, strides);
-        if (buffers.size() != current->input_uids.size())
+        if (py::len(buffers) != current->input_uids.size())
             throw py::value_error("tensor_uids and ordered buffers must have the same length");
         auto pack              = std::make_unique<VariantPackNative>(uids_.size());
         pack->ordered_geometry = current;
@@ -1319,13 +1341,13 @@ class OrderedBindingSchema {
                 buffer = buffers[static_cast<size_t>(source)];
             } else if (!auto_bindings.empty()) {
                 auto value = PyDict_GetItem(auto_bindings.ptr(), py::int_(uids_[i]).ptr());
-                if (value) buffer = py::reinterpret_borrow<py::object>(value);
+                if (value) buffer = py::borrow<py::object>(value);
             }
             if (buffer && !buffer.is_none() && !pack->read_operand(i, buffer)) unread.append(py::make_tuple(i, buffer));
         }
         std::vector<size_t> described;
         if (unread.empty()) described = finish(*pack, {});
-        auto extent = workspace.is_none() ? py::make_tuple(0, 0).cast<py::object>() : read_buffer_extent(workspace);
+        auto extent = workspace.is_none() ? py::cast<py::object>(py::make_tuple(0, 0)) : read_buffer_extent(workspace);
         return py::make_tuple(py::cast(std::move(pack)), unread, std::move(extent), described);
     }
 };
@@ -1339,7 +1361,7 @@ read_ordered_binding(py::handle schema,
                      py::handle override_uids,
                      py::handle override_shapes,
                      py::handle override_strides) {
-    return schema.cast<OrderedBindingSchema &>().read(
+    return py::cast<OrderedBindingSchema &>(schema).read(
         buffers, tensor_uids, auto_bindings, workspace, override_uids, override_shapes, override_strides);
 }
 
@@ -1355,10 +1377,10 @@ class WorkspaceCarve {
             if (region.size() != 4) {
                 throw py::value_error("a carve region is (offset, dtype_code, dtype_bits, shape)");
             }
-            int64_t offset = region[0].cast<int64_t>();
+            int64_t offset = py::cast<int64_t>(region[0]);
             Operand proto;
-            proto.dtype   = DLDataType{region[1].cast<uint8_t>(), region[2].cast<uint8_t>(), 1};
-            proto.shape   = region[3].cast<std::vector<int64_t>>();
+            proto.dtype   = DLDataType{py::cast<uint8_t>(region[1]), py::cast<uint8_t>(region[2]), 1};
+            proto.shape   = py::cast<std::vector<int64_t>>(region[3]);
             proto.ndim    = static_cast<int32_t>(proto.shape.size());
             proto.filled  = true;  // stride left empty: a carve is dense by construction
             int64_t numel = 1;
@@ -1371,14 +1393,16 @@ class WorkspaceCarve {
 
     std::vector<OperandBuffer *>
     carve(int64_t base, std::optional<int64_t> nbytes, int32_t device_id) const {
-        if (nbytes && *nbytes < 0) throw py::value_error(owner_ + ": workspace capacity must be nonnegative or None");
+        if (nbytes && *nbytes < 0)
+            throw py::value_error((owner_ + ": workspace capacity must be nonnegative or None").c_str());
         // Validate every region before creating owned views. None is the only
         // unknown capacity; a measured zero-byte view cannot hold any scratch.
         for (size_t i = 0; i < protos_.size(); i++) {
             if (nbytes && ends_[i] > *nbytes) {
-                throw py::value_error(owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
-                                      std::to_string(ends_[i]) + ") exceeds the " + std::to_string(*nbytes) +
-                                      "-byte buffer (sizing bug)");
+                throw py::value_error((owner_ + ": workspace overrun -- region [" + std::to_string(offsets_[i]) + ", " +
+                                       std::to_string(ends_[i]) + ") exceeds the " + std::to_string(*nbytes) +
+                                       "-byte buffer (sizing bug)")
+                                          .c_str());
             }
         }
         std::vector<OperandBuffer *> out;
@@ -1405,71 +1429,66 @@ class WorkspaceCarve {
 
 void
 init_variant_pack(py::module_ &m) {
-    auto operand_class =
-        py::class_<OperandBuffer>(m, "OperandBuffer", R"(
+    auto operand_class = py::class_<OperandBuffer>(m, "OperandBuffer", R"(
 One operand of a variant pack, as a DLPack producer.
 
 Implements ``__dlpack_c_exchange_api__``, so a consumer reads it through the
 same C function table it uses for a framework tensor rather than through a
 capsule built in python.
 )")
-            .def("data_ptr", &OperandBuffer::data_ptr)
-            .def_property_readonly("shape", &OperandBuffer::shape)
-            // ndim, because `__len__` is the first EXTENT and a caller
-            // reaching for a rank through getattr(.., "ndim", default)
-            // silently gets the default instead.
-            .def_property_readonly("ndim", [](const OperandBuffer &self) { return self.shape().size(); })
-            .def_property_readonly("dtype", &OperandBuffer::dtype)
-            .def_property_readonly("nbytes", &OperandBuffer::nbytes)
-            .def(
-                "stride",
-                [](const OperandBuffer &self, py::object dim) -> py::object {
-                    if (dim.is_none()) return py::cast(self.stride());
-                    return py::cast(self.stride_at(dim.cast<int64_t>()));
-                },
-                py::arg("dim") = py::none())
-            .def("element_size", &OperandBuffer::element_size)
-            .def("numel", &OperandBuffer::numel)
-            .def("__len__", &OperandBuffer::length)
-            .def("reshape",
-                 [](const OperandBuffer &self, py::args dims) {
-                     std::vector<int64_t> shape;
-                     if (dims.size() == 1 && py::isinstance<py::sequence>(dims[0]) &&
-                         !py::isinstance<py::int_>(dims[0])) {
-                         shape = dims[0].cast<std::vector<int64_t>>();
-                     } else {
-                         for (auto d : dims) shape.push_back(d.cast<int64_t>());
-                     }
-                     return self.reshape(std::move(shape));
-                 })
-            .def("permute",
-                 [](const OperandBuffer &self, py::args axes) {
-                     std::vector<int64_t> order;
-                     if (axes.size() == 1 && py::isinstance<py::sequence>(axes[0]) &&
-                         !py::isinstance<py::int_>(axes[0])) {
-                         order = axes[0].cast<std::vector<int64_t>>();
-                     } else {
-                         for (auto a : axes) order.push_back(a.cast<int64_t>());
-                     }
-                     return self.permute(order);
-                 })
-            .def("contiguous", [](py::object self) { return self; })
-            .def("__dlpack_device__", &OperandBuffer::dlpack_device)
-            .def("__dlpack__",
-                 &OperandBuffer::dlpack,
-                 py::kw_only(),
-                 py::arg("stream")      = py::none(),
-                 py::arg("max_version") = py::none());
+                             .def("data_ptr", &OperandBuffer::data_ptr)
+                             .def_prop_ro("shape", &OperandBuffer::shape)
+                             // ndim, because `__len__` is the first EXTENT and a caller
+                             // reaching for a rank through getattr(.., "ndim", default)
+                             // silently gets the default instead.
+                             .def_prop_ro("ndim", [](const OperandBuffer &self) { return self.shape().size(); })
+                             .def_prop_ro("dtype", &OperandBuffer::dtype)
+                             .def_prop_ro("nbytes", &OperandBuffer::nbytes)
+                             .def(
+                                 "stride",
+                                 [](const OperandBuffer &self, py::object dim) -> py::object {
+                                     if (dim.is_none()) return py::cast(self.stride());
+                                     return py::cast(self.stride_at(py::cast<int64_t>(dim)));
+                                 },
+                                 py::arg("dim") = py::none())
+                             .def("element_size", &OperandBuffer::element_size)
+                             .def("numel", &OperandBuffer::numel)
+                             .def("__len__", &OperandBuffer::length)
+                             .def("reshape",
+                                  [](const OperandBuffer &self, py::args dims) {
+                                      std::vector<int64_t> shape;
+                                      if (dims.size() == 1 && py::isinstance<py::sequence>(dims[0]) &&
+                                          !py::isinstance<py::int_>(dims[0])) {
+                                          shape = py::cast<std::vector<int64_t>>(dims[0]);
+                                      } else {
+                                          for (auto d : dims) shape.push_back(py::cast<int64_t>(d));
+                                      }
+                                      return self.reshape(std::move(shape));
+                                  })
+                             .def("permute",
+                                  [](const OperandBuffer &self, py::args axes) {
+                                      std::vector<int64_t> order;
+                                      if (axes.size() == 1 && py::isinstance<py::sequence>(axes[0]) &&
+                                          !py::isinstance<py::int_>(axes[0])) {
+                                          order = py::cast<std::vector<int64_t>>(axes[0]);
+                                      } else {
+                                          for (auto a : axes) order.push_back(py::cast<int64_t>(a));
+                                      }
+                                      return self.permute(order);
+                                  })
+                             .def("contiguous", [](py::object self) { return self; })
+                             .def("__dlpack_device__", &OperandBuffer::dlpack_device)
+                             .def("__dlpack__",
+                                  &OperandBuffer::dlpack,
+                                  py::kw_only(),
+                                  py::arg("stream")      = py::none(),
+                                  py::arg("max_version") = py::none());
 
-    // The protocol looks the attribute up on the TYPE, and a pybind11 class is
+    // The protocol looks the attribute up on the TYPE, and a nanobind class is
     // a heap type, so it takes a plain setattr.
-    PyObject *capsule = PyCapsule_New(&buffer_exchange_api(), "dlpack_exchange_api", nullptr);
-    if (capsule == nullptr) throw py::error_already_set();
-    if (PyObject_SetAttrString(operand_class.ptr(), "__dlpack_c_exchange_api__", capsule) < 0) {
-        Py_DECREF(capsule);
-        throw py::error_already_set();
-    }
-    Py_DECREF(capsule);
+    py::capsule capsule(&buffer_exchange_api(), "dlpack_exchange_api");
+    if (PyObject_SetAttrString(operand_class.ptr(), "__dlpack_c_exchange_api__", capsule.ptr()) < 0)
+        throw py::python_error();
 
     m.def("make_operand_buffer",
           &make_operand_buffer,
@@ -1490,7 +1509,7 @@ capsule built in python.
 
     m.def("read_buffer_extent",
           &read_buffer_extent,
-          py::arg("buffer"),
+          py::arg("buffer").none(),
           "(pointer, bytes) through the exchange vtable, or None when the type does not publish one.");
 
     py::class_<WorkspaceCarve>(m, "WorkspaceCarve", R"(
@@ -1501,7 +1520,7 @@ arrives per execute, so ``carve`` hands back every region in one crossing
 instead of one per region.
 )")
         .def(py::init<std::string, std::vector<py::tuple>>(), py::arg("owner"), py::arg("regions"))
-        .def("carve", &WorkspaceCarve::carve, py::arg("base"), py::arg("nbytes"), py::arg("device_id"))
+        .def("carve", &WorkspaceCarve::carve, py::arg("base"), py::arg("nbytes").none(), py::arg("device_id"))
         .def("__len__", &WorkspaceCarve::size);
 
     operand_class.attr("view") = operand_class.attr("reshape");
@@ -1531,7 +1550,15 @@ per graph; ``VariantPackNative.describe_from`` compares a whole pack against it.
 
     py::class_<OrderedBindingSchema>(m, "_OrderedBindingSchema")
         .def(py::init<std::vector<int64_t>, const DeclaredLayout &, bool>())
-        .def("read", &OrderedBindingSchema::read)
+        .def("read",
+             &OrderedBindingSchema::read,
+             py::arg("buffers"),
+             py::arg("tensor_uids"),
+             py::arg("auto_bindings"),
+             py::arg("workspace").none(),
+             py::arg("override_uids").none(),
+             py::arg("override_shapes").none(),
+             py::arg("override_strides").none())
         .def("finish", &OrderedBindingSchema::finish);
 
     py::class_<VariantPackNative>(m, "VariantPackNative", R"(
@@ -1585,7 +1612,7 @@ its parts.
         .def("dtype", &VariantPackNative::dtype)
         .def("operand", &VariantPackNative::operand)
         .def("operands", &VariantPackNative::operands)
-        .def_property_readonly("address", &VariantPackNative::pointer_array)
+        .def_prop_ro("address", &VariantPackNative::pointer_array)
         .def("__len__", &VariantPackNative::size)
         .def("all_contiguous",
              [](const VariantPackNative &self) {

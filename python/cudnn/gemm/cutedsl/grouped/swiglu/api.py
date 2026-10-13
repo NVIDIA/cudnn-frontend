@@ -28,7 +28,7 @@ _JAX_SF_LAYOUT_ERROR = (
     "the block scale-factor tensors (sfa/sfb and the sfd outputs) are MMA-tiled "
     "(32, 4, m//128, 4, rest_k, l) strided views that are not expressible as JAX arrays "
     "(a row-major JAX array of that shape has different memory); pass torch tensors. "
-    "For canonical MXFP8 JAX arrays, use cudnn.jax.grouped_gemm_swiglu"
+    "For canonical MXFP8 JAX arrays, use cudnn.grouped_gemm_glu_jax_sm100"
 )
 
 
@@ -284,7 +284,12 @@ def grouped_gemm_swiglu_wrapper_sm100(
     """
     framework = detect_framework(a_tensor)
     if framework == "jax":
-        from cudnn.jax import grouped_gemm_swiglu
+        from cudnn.frost.buffers import cutedsl_requirement_error
+
+        requirement = cutedsl_requirement_error("grouped_gemm_swiglu")
+        if requirement:
+            raise ImportError(requirement)
+        from .jax_api import grouped_gemm_swiglu
         from ..canonical_jax import check_jax_wrapper_options
 
         check_jax_wrapper_options(

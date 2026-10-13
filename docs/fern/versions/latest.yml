@@ -32,6 +32,9 @@ navigation:
       - page: FFT Causal Conv1d
         path: ../../operations/FFTCausalConv1d.md
         slug: operations/FFTCausalConv1d
+      - page: Linear Attention
+        path: ../../operations/LinearAttention.md
+        slug: operations/LinearAttention
       - page: Matmul
         path: ../../operations/Matmul.md
         slug: operations/Matmul
@@ -108,6 +111,9 @@ navigation:
           - page: FE-OSS APIs Overview
             path: ../../fe-oss-apis/overview.md
             slug: overview
+          - page: Python API Naming Conventions
+            path: ../../fe-oss-apis/api_conventions.md
+            slug: api_conventions
           - page: Block Sparse Attention (BSA)
             path: ../../fe-oss-apis/bsa.md
             slug: bsa

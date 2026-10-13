@@ -190,6 +190,15 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 - **A standalone FROST adapter is compiled at plan time, so every test driver calls `compile()` before `execute()`.** The sparse d256 adapter refuses to compile on the execute path (plan-time keys only), and the helpers that still relied on an execute-time compile failed every GPU cell of two modules while the host tier, where those cells skip, stayed green — so a change to an adapter's execute contract re-runs the GPU tier of every suite that drives it, and the detector is an `.execute(` with no preceding `.compile(` in the same driver (`sdpa/frost/test_sdpa_fwd_sparse_sm107.py`, `sdpa/frost/sparse_item_sequences.py`).
 
+### Binding introspection
+
+Binding migrations can change introspection without changing the public API.
+Python Enum hides instance properties such as `name` and `value` from
+`dir(enum_class)`; the API-index scanner must inspect their descriptors without
+evaluating them (`api_index/test_api_index.py` covers Enum, IntEnum and aliases).
+Signature tests should accept both `object` and `object | None` for an argument
+defaulting to `None`, while retaining argument order and default checks.
+
 ### Confirm you are testing the code you edited
 
 Bind tensor views in the graph's declared axis order. A BSHD allocation and

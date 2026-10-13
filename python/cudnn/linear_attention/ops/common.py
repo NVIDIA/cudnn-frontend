@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Helpers shared by the linear-attention torch custom ops: the cuDNN handle and workspace plumbing, plan pinning,
-the dtype map and the summary ops' cache key and autograd hooks."""
+"""Helpers shared by the linear-attention torch custom ops: per-call execution resources, plan pinning, the dtype map
+and the summary ops' cache key and autograd hooks."""
 
-from typing import Dict
+import threading
 
 import torch
 import cudnn
@@ -18,7 +18,27 @@ TORCH_DTYPE_TO_CUDNN = {
 }
 
 
-cudnn_handles: Dict[int, int] = {}
+# cuDNN handles are not thread-safe. Each host thread keeps one per device and
+# rebinds it to the launch stream before every execution.
+_tls = threading.local()
+_graph_lock_guard = threading.Lock()
+
+
+def _graph_lock(graph):
+    """Return the lock that protects one graph's build and lazy initialization."""
+    lock = getattr(graph, "_la_ops_execution_lock", None)
+    if lock is None:
+        with _graph_lock_guard:
+            lock = getattr(graph, "_la_ops_execution_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                graph._la_ops_execution_lock = lock
+    return lock
+
+
+def _stream_handle(stream):
+    """Return a raw CUDA stream handle from a torch stream or integer-like handle."""
+    return int(stream.cuda_stream if hasattr(stream, "cuda_stream") else stream)
 
 
 def select_plan(graph, plan_name):
@@ -35,33 +55,66 @@ def select_plan(graph, plan_name):
     graph.check_support()
 
 
-def graph_workspace(graph, device):
-    """Caller-side workspace for a compiled graph (grow-only, held on the graph object itself)."""
+def graph_workspace(graph, device, stream=None):
+    """Build ``graph`` if needed, then allocate caller-owned scratch on ``stream``."""
+    stream = torch.cuda.current_stream(device) if stream is None else stream
+    lock = _graph_lock(graph)
     if not graph._is_built:
-        if not graph._planning_done:
-            graph.create_execution_plans()
-        if graph.selected_engine is None:
-            graph.build()
-        else:
-            graph.build_plans()
-    size = graph.get_workspace_size()
-    workspace = getattr(graph, "la_ops_workspace", None)
-    if workspace is None or workspace.numel() < size or workspace.device != device:
-        workspace = torch.empty(max(size, 1), dtype=torch.uint8, device=device)
-        graph.la_ops_workspace = workspace
-    return workspace
+        with lock:
+            if not graph._is_built:
+                if not graph._planning_done:
+                    graph.create_execution_plans()
+                if graph.selected_engine is None:
+                    graph.build()
+                else:
+                    graph.build_plans()
+    with torch.cuda.device(device), torch.cuda.stream(stream):
+        return torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device=device)
 
 
-def get_handle(device):
-    """Per-device cuDNN handle carrying the caller's current stream."""
+def get_handle(device, stream=None):
+    """This thread's cuDNN handle for ``device``, rebound to ``stream``."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    handle = cudnn_handles.get(idx)
+    stream = torch.cuda.current_stream(device) if stream is None else stream
+    handles = getattr(_tls, "handles", None)
+    if handles is None:
+        handles = _tls.handles = {}
+    handle = handles.get(idx)
     if handle is None:
         with torch.cuda.device(idx):
             handle = cudnn.create_handle()
-        cudnn_handles[idx] = handle
-    cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
+        handles[idx] = handle
+    cudnn.set_stream(handle=handle, stream=_stream_handle(stream))
     return handle
+
+
+def make_execution_resources(graph, device):
+    """Return per-call scratch and this thread's handle for one launch stream.
+
+    The caller owns the returned workspace only for this invocation. PyTorch's
+    stream-aware allocator delays eager reuse and retains capture allocations in
+    the CUDA graph's private memory pool.
+    """
+    stream = torch.cuda.current_stream(device)
+    return graph_workspace(graph, device, stream), get_handle(device, stream)
+
+
+def execute_graph(graph, variant_pack, workspace, handle):
+    """Execute a cached graph with caller-owned scratch and a thread-private handle.
+
+    The first call is serialized because FROST plans finish lazy compilation and
+    initialize immutable launch records there. Steady-state launches stay lock-free.
+    """
+    if getattr(graph, "_la_ops_execution_ready", False):
+        graph.execute(variant_pack, workspace=workspace, handle=handle)
+        return
+    lock = _graph_lock(graph)
+    with lock:
+        if not getattr(graph, "_la_ops_execution_ready", False):
+            graph.execute(variant_pack, workspace=workspace, handle=handle)
+            graph._la_ops_execution_ready = True
+            return
+    graph.execute(variant_pack, workspace=workspace, handle=handle)
 
 
 def torch_dtype_to_cudnn(dtype: torch.dtype):
@@ -151,9 +204,11 @@ def make_summary_cache_key(
 
 
 def summary_setup_context(ctx, inputs, output):
+    """Mark summary outputs as non-differentiable for the torch autograd wrapper."""
     ctx.set_materialize_grads(False)
     ctx.mark_non_differentiable(output[0], output[1])
 
 
 def summary_backward(ctx, d_output, d_transition):
+    """Reject differentiation through summary-only custom ops."""
     raise RuntimeError("summaries are non-differentiable")

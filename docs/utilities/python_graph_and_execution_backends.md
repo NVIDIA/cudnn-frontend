@@ -416,6 +416,35 @@ are close.
   checkpoint on a real-token boundary). `safe_gate`, `use_beta_sigmoid` and
   `allow_neg_eigval` (beta as `2 * sigmoid(x)`) all pass through. The op is
   `cudnn.linear_attention.ops.gated_delta_product`.
+- Mamba-2 SSD (`mamba2` / `mamba2_bwd`) is the gated delta rule without the
+  erase term: one scalar `g` per token (the raw `dt`, `[total_T, HO]`) is both
+  the decay exponent and the write strength, `dt_t = clamp(softplus(g_t +
+  dt_bias), dt_min, dt_max)`, `S_t = exp(A dt_t) S_{t-1} + dt_t k_t^T v_t`. The
+  node has no `beta`; it takes the decay rate `a` (A, `[HO]`), optional
+  `dt_bias`, an optional skip `d` (`[HO]` or
+  `[HO, V]`, `O += d v`) and an optional output gate `z` (`O *= z sigmoid(z)`,
+  with the pre-gate `O_pre` output the backward consumes). `q` / `k` (C / B)
+  may be grouped over the `v` (x) heads; `v` carries every head. `dt_softplus`,
+  `dt_min` and `dt_max` are attributes (the clamp zeroes the gate gradient
+  where active). `Mamba2FrostEngine` (`cudnn.linear_attention.frost.mamba2_engine`,
+  SM100/SM103/SM107, `d_qk == 128`, `d_v == 64`, chunk 128) is its only
+  engine; `mamba2_bwd` returns `dQ, dK, dV, dG, dA, d_initial_state,
+  d_dt_bias, dD, dZ` and regenerates the chunk-cadence state series with the
+  prefill when the graph passes none (or a coarser one). Long sequences on few
+  (sequence, head) tiles run the piece chain in both passes: the prefill in its
+  state-only mode summarizes every piece from a zero state (end state and the
+  log2 of the piece's decay product), a scalar axpy chain seeds the pieces, and
+  the main pass runs them as independent sequences; the backward adds the bprop
+  in its dstate-only mode (every piece's start gradient) and the reverse chain.
+  The CP summaries are the same two modes over whole sequences:
+  `mamba2_summary` (`k, v, g, a, cu_seqlens[, initial_state, dt_bias]` to
+  `final_state` and `transition`, `[N, HO]` fp32, the log2 decay product, so
+  that across spans `S_final = exp2(transition) S_init + S_H`) and
+  `mamba2_summary_bwd` (`q, k, g, a, cu_seqlens, dO[, d_final_state, dt_bias]`
+  to `d_initial_state` and `transition`), served by `Mamba2SummaryFrostEngine`.
+  The torch ops are `cudnn.linear_attention.ops.mamba2` (`A` bound to `a`
+  as is, `dA` returned as is),
+  `mamba2_summary` and `mamba2_summary_bwd`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32/bf16/fp16 gates — io-dtype `beta`/`w` for GDN-2
   — int32 or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching
@@ -724,6 +753,31 @@ only to decline is why `closed_under` existed.
   function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
   commit.
 
+### Consumed by FlashInfer: the public surface, kept stable
+
+FlashInfer's cuDNN backend (`flashinfer/cudnn/{prefill,decode,utils}.py`)
+programs against this graph API and probes a handful of frontend facts before
+it routes work here. Those names are a caller boundary whatever their spelling
+(`python/cudnn/AGENTS.md` Rule 9: "a private method consumed outside FE is
+still a caller boundary"), so every one of them is public API, kept as
+spelled, with a public twin where the spelling was private.
+`test/python/sdpa/frost/test_flashinfer_consumed_surface.py` (host-only, L0)
+pins each name with its signature, so a rename fails this repository's CI
+instead of silently degrading FlashInfer to its fallback path.
+
+| what the caller asks | spelled today (kept) | public spelling |
+|---|---|---|
+| does the native SDPA binder honor a packed-split / stride contract? | `cudnn._pybind_module._SdpaThdBinder.supports_stats_stride_override`, `.supports_nonpaged_packed_split`, `.supports_paged_split_sink`, ... (static read-only properties, `True`) | `"<cap>" in cudnn.sdpa_capabilities()` -- the frozenset of every `supports_<cap>` flag the build provides; append-only, never renamed |
+| which engine serves the selected plan? | `graph.selected_engine` (`None` = the cuDNN backend; else `.name`) | the same property, documented: `.name` is the engine's manifest name, a stable identifier (`sdpa_fwd_prefill_sm100` / `sdpa_fwd_prefill_sm107` / `sdpa_fwd_prefill_sm120`, ...; manifest names and slots are append-only) |
+| can the cuDNN backend still serve this graph? | `graph.backend_plan_entries()` after `create_execution_plans` (`[]` = declined, guarded or not installed) | the same method, documented above |
+| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7** (the first public wheel whose `Arch` knows `sm_107a`): a device-blind probe on a cc 10.7 part with a 4.7.x DSL says True while every FROST row declines, so pass the GPU you route to |
+| the cuDNN dtype of a torch dtype | `cudnn.datatypes._torch_to_cudnn_data_type(dtype)` | `cudnn.datatypes.torch_to_cudnn_data_type(dtype)` (the private name is an alias of it) |
+| the unified attention implementation, the graph helpers, the caller hints | `cudnn.attention_implementation.UNIFIED`, `cudnn.graph_cache(key_fn=)`, `cudnn.jit(heur_modes=)`, `cudnn.graph(handle, **graph_kwargs)`, `cudnn.pygraph(is_override_shape_enabled=, is_cuda_graph_replay_expected=)` | already public; listed so the pin covers them |
+
+Nothing here changes a `Capabilities` row: the probes report what the engines
+already decide, and `import cudnn` stays as cheap as before (the device-blind
+probe reads package metadata; only the cc 10.7 target check imports the DSL).
+
 ### Knobs: one public vocabulary, and every python plan lists the knobs it will build
 
 - `KnobType_t` (`include/cudnn_frontend/knobs.h`, mirrored as `cudnn.knob_type`)
@@ -985,7 +1039,7 @@ the wrong arch — a green sweep on one box says nothing about the others:
 
 | target | covers |
 |---|---|
-| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification |
+| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py`, `sdpa/frost/test_flashinfer_consumed_surface.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification, the surface FlashInfer consumes |
 | SM100 | every FROST SDPA-forward cell except sm120; the FROST GEMM family; `linear_attention` (GDN / KDA / GDN-2), which is where the cuTile-vs-FROST pin lives |
 | SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies |
 

@@ -540,9 +540,11 @@ def test_bsa_attention_forward_sm90_blk64_large_logits_max_rises(dtype, q_value,
 @pytest.mark.L0
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @torch_fork_set_rng(seed=5)
-def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype):
+def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype, monkeypatch):
     """Even query rows see equal ~1e10 logits on every key (O = mean V); odd rows are ordinary attention. Every warp
     holds both kinds, so centering the large rows must leave the ordinary rows as accurate as before."""
+    # A TF32 reference is off by ~7e4 on the even-row LSE (~5.7e8), past the 1e3 bound; the kernel is within ~10.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -994,7 +996,14 @@ def test_bsa_attention_forward_sm100_blk64_auto_uses_workspace_fallback(monkeypa
     class WorkspaceFallbackCalled(Exception):
         pass
 
-    monkeypatch.setattr(interface, "_sm100_blk64_auto_kv_splits", lambda *args, **kwargs: 2)
+    def choose_splits(q_arg, index_arg, count_arg, *, k, v):
+        assert q_arg is q
+        assert index_arg is q2k
+        assert count_arg == 2
+        assert k.shape == v.shape == (1, 1, 256, 128)
+        return 2
+
+    monkeypatch.setattr(interface, "_sm100_blk64_auto_kv_splits", choose_splits)
 
     def workspace_fallback(q_arg, value_dim, kv_splits, allow_fallback, output_dtype=None):
         assert q_arg is not None
@@ -1019,7 +1028,8 @@ def test_bsa_attention_forward_sm100_blk64_auto_uses_workspace_fallback(monkeypa
 
 
 @pytest.mark.L0
-def test_bsa_attention_forward_sm100_blk64_large_q_auto_scheduler_policy():
+def test_bsa_attention_forward_sm100_blk64_auto_split_counts_stay_valid(monkeypatch):
+    """Automatic counts stay within the supported domain and the caller's cap."""
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
@@ -1032,10 +1042,22 @@ def test_bsa_attention_forward_sm100_blk64_large_q_auto_scheduler_policy():
     q_small = torch.empty((1, 4, 128, 1), device="cuda", dtype=torch.int8)
     q2k_block_index = torch.empty((1, 1, 1, 2048), device="cuda", dtype=torch.int32)
 
-    assert interface._sm100_blk64_auto_kv_splits(q_large, q2k_block_index, 2048) == 1
-    assert interface._sm100_blk64_auto_kv_splits(q_small, q2k_block_index, 2048) == 8
-    assert interface.choose_blk64_use_clc(q_large, 256)
-    assert interface.choose_blk64_use_clc(q_large, 2048)
+    for q in (q_large, q_small):
+        for count in (0, 1, 256, 2048):
+            for cap in (1, 2, 4, 8):
+                splits = interface._sm100_blk64_auto_kv_splits(q, q2k_block_index, count, max_kv_splits=cap)
+                assert 1 <= splits <= min(cap, count or q2k_block_index.shape[-1])
+                assert splits in {1, 2, 4, 8, 16}
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(L2_cache_size=126 * 1024**2))
+    for heads in (1, 2, 4, 8):
+        q_metadata = SimpleNamespace(is_cuda=True, device=torch.device("cuda"), dtype=torch.bfloat16, shape=(1, heads, 349440, 128))
+        for count in (548, 900, 1089):
+            kv_metadata = SimpleNamespace(shape=(1, heads, count * 10 * 64, 128), element_size=lambda: 2)
+            for cap in (1, 2, 4, 8):
+                splits = interface._sm100_blk64_auto_kv_splits(q_metadata, q2k_block_index, count, cap, k=kv_metadata, v=kv_metadata)
+                assert 1 <= splits <= min(cap, count)
+                assert splits in {1, 2, 4, 8, 16}
 
 
 @pytest.mark.L0
