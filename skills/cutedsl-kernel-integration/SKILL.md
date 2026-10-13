@@ -1,11 +1,11 @@
 ---
 name: cutedsl-kernel-integration
-description: Use when integrating a CuTeDSL/CUTE DSL kernel into cuDNN Frontend as a frontend-only Python API, including APIBase wrappers, lazy cudnn exports, optional cutedsl dependencies, FE OSS documentation, and pytest coverage.
+description: Use when integrating a CuTeDSL/CUTE DSL kernel into cuDNN Frontend as a frontend-only Python API, including the public op functions, lazy cudnn exports, optional cutedsl dependencies, FE OSS documentation, and pytest coverage.
 ---
 
 # CuTeDSL Kernel Integration
 
-Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. The goal is a complete integration: Python API, wrapper, exports, docs, and tests.
+Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. The goal is a complete integration: public functions, exports, docs, and tests.
 
 ## Before Editing
 
@@ -15,22 +15,21 @@ Use this skill to add or update a CuTeDSL frontend-only API in cuDNN Frontend. T
 4. Classify the kernel before choosing a template:
    - Kernel family: dense GEMM, GEMM fusion, grouped GEMM, discrete grouped GEMM, MoE, attention, sparse attention, or another frontend-only API family.
    - Execution topology: single kernel, paired forward/backward APIs, multi-kernel orchestrator, helper-kernel setup, distributed/runtime-coordinated execution, or internal scheduler.
-   - Public surface: class API, high-level wrapper, returned tensors, optional outputs, workspace ownership, and import/export namespace.
+   - Public surface: `<op_name>_<direction>` / `<op_name>_jax_<direction>` functions (see `docs/fe-oss-apis/api_conventions.md`), returned tensors, optional outputs, workspace ownership, and import/export namespace.
    - Internal support: source helper modules, schedulers, metadata utilities, and generated descriptors that must stay private to the package.
-   - Architecture variant: whether the public API needs transparent dispatch to an alternate CuTeDSL module for a newer GPU (for example Rubin `sm107` vs the default SM100 kernel). Keep the public class and wrapper unchanged when dispatch is internal.
+   - Architecture variant: whether the public API needs transparent dispatch to an alternate CuTeDSL module for a newer GPU (for example Rubin `sm107` vs the default SM100 kernel). Keep the public functions unchanged when dispatch is internal.
 5. Read `references/integration-pattern.md` for the detailed repo conventions before implementing.
 
 ## Integration Workflow
 
 1. Add or update the operation package under the closest existing family, such as `python/cudnn/<operation>/`, `python/cudnn/gemm/cutedsl/dense/<operation>/`, `python/cudnn/gemm/cutedsl/grouped/<operation>/`, `python/cudnn/gemm/cutedsl/discrete_grouped/<operation>/`, or `python/cudnn/sdpa/<direction>/`.
-2. Implement the class API by extending `APIBase`; keep constructor descriptors, `check_support()`, `compile()`, and `execute()` consistent with the closest template.
-3. Add a high-level wrapper that allocates outputs, caches/reuses compiled kernels where the template does, and returns a `TupleDict`.
-4. Export the public class and wrapper through the operation/family `__init__.py` files and `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`.
-5. Reuse the existing CuTeDSL dependencies in `[project] dependencies` unless the new kernel truly needs an additional package. The `cutedsl` extra now holds only `cuda-python`.
-6. Add FE OSS documentation and update the relevant overview or operation index links.
-7. Add tests under `test/python/<operation>/cutedsl/`, including support validation and numerical/reference coverage when executable.
-8. For grouped/discrete/MoE/SDPA kernels, preserve the source helper and scheduler topology; shared helper modules should be internal package files, not public `cudnn` exports.
-9. When an existing SM100 kernel needs a Rubin (`sm107`) variant, follow the architecture-dispatch pattern in `references/integration-pattern.md` instead of exposing a new public API. Current examples: `grouped_gemm_quant`, `grouped_gemm_glu`, and `grouped_gemm_dglu`.
+2. Implement the public functions in `api.py`: validate the configuration, allocate outputs, cache/reuse compiled kernels where the template does, and return a `TupleDict`.
+3. Export the public functions through the operation/family `__init__.py` files and `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`.
+4. Reuse the existing CuTeDSL dependencies in `[project] dependencies` unless the new kernel truly needs an additional package. The `cutedsl` extra now holds only `cuda-python`.
+5. Add FE OSS documentation and update the relevant overview or operation index links.
+6. Add tests under `test/python/<operation>/cutedsl/`, including support validation and numerical/reference coverage when executable.
+7. For grouped/discrete/MoE/SDPA kernels, preserve the source helper and scheduler topology; shared helper modules should be internal package files, not public `cudnn` exports.
+8. When an existing SM100 kernel needs a Rubin (`sm107`) variant, follow the architecture-dispatch pattern in `references/integration-pattern.md` instead of exposing a new public API. Current examples: `grouped_gemm_quant`, `grouped_gemm_glu`, and `grouped_gemm_dglu`.
 
 ## Verification
 
