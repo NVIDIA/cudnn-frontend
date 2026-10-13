@@ -29,7 +29,7 @@ TEST_ROOT = Path(__file__).resolve().parent
 # (operation, backend) directories whose tests the detector arms for; a renamed or new frontend-only
 # API directory must be added here (test_rule8_detector.py fails when a listed one disappears). An
 # operation joins once its APIs are migrated, in the same change.
-COVERED_DIRS = frozenset({("deepseek_sparse_attention", "cutedsl")})
+COVERED_DIRS = frozenset({("deepseek_sparse_attention", "cutedsl"), ("qwen_sparse_attention", "cutedsl")})
 
 
 _WRAPPED = "_rule8_sync_guarded"

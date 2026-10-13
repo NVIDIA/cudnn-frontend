@@ -201,6 +201,9 @@ navigation:
           - page: Native Sparse Attention (NSA)
             path: ../../fe-oss-apis/nsa.md
             slug: nsa
+          - page: Qwen Sparse Attention (QSA)
+            path: ../../fe-oss-apis/qsa.md
+            slug: qsa
           - page: RMSNorm + RHT + Amax (SM100)
             path: ../../fe-oss-apis/rmsnorm_rht_amax.md
             slug: rmsnorm_rht_amax

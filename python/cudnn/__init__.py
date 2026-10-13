@@ -446,6 +446,7 @@ _LAZY_OPTIONAL_IMPORTS = {
     "csa_compressor_forward_wrapper": (".csa", "csa_compressor_forward_wrapper"),
     "csa_compressor_backward_wrapper": (".csa", "csa_compressor_backward_wrapper"),
     "NSA": (".native_sparse_attention", "NSA"),
+    "QSA": (".qwen_sparse_attention", "QSA"),
     "GemmSwigluSm100": (".gemm.cutedsl.dense.swiglu", "GemmSwigluSm100"),
     "gemm_swiglu_wrapper_sm100": (
         ".gemm.cutedsl.dense.swiglu",

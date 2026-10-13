@@ -1286,6 +1286,14 @@ cudnn.pygraph.tensors
 cudnn.pygraph.transpose
 cudnn.pygraph.update_cuda_graph
 cudnn.pygraph.validate
+cudnn.qwen_sparse_attention
+cudnn.qwen_sparse_attention.QSA
+cudnn.qwen_sparse_attention.SparseAttentionBackward
+cudnn.qwen_sparse_attention.SparseAttentionBackward.check_support
+cudnn.qwen_sparse_attention.SparseAttentionBackward.compile
+cudnn.qwen_sparse_attention.SparseAttentionBackward.execute
+cudnn.qwen_sparse_attention.SparseAttentionBackward.scratch_workspace_bytes
+cudnn.qwen_sparse_attention.sparse_attention_backward_wrapper
 cudnn.reduction_mode
 cudnn.reduction_mode.ADD
 cudnn.reduction_mode.AMAX
