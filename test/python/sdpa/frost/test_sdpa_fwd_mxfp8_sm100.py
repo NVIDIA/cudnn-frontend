@@ -1594,9 +1594,9 @@ def _quantize_seq(t_1hsd, h, s, d, fp8, *, columnwise):
     if columnwise:
         # Columnwise F8_128x4 is plane-major for D > 128. THD's packed
         # contract keeps every sequence tile contiguous, so transpose
-        # [D/128, H, tile, 512] into [H, tile, D/128, 512] before sequences
-        # are concatenated in cu_seqlens order.
-        planes = d // 128
+        # [ceil(D/128), H, tile, 512] into [H, tile, ceil(D/128), 512] before
+        # sequences are concatenated in cu_seqlens order.
+        planes = _cdiv(d, 128)
         sf = swz_s.view(torch.uint8).reshape(planes, h, n_tiles, 512).permute(1, 2, 0, 3).contiguous().reshape(h, n_tiles, -1)
         return data_s, dq_s.reshape(1, h, s, d), sf
     return data_d, dq_d.reshape(1, h, s, d), swz_d.view(torch.uint8).reshape(h, n_tiles, -1)

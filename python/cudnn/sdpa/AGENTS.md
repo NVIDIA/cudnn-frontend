@@ -201,7 +201,7 @@ other-arch lowerings are smoke-compiled from whatever GPU you have.**
 - The DSL traces the kernel in Python before any arch-specific codegen, so a
   lowering for an arch you do not have still fails or passes its trace here:
   `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
-  fp8=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
+  fp8=True, pertensor=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
   skv=256, d_qk=128, d_v=128)` on an SM100 box reproduced the SM120 lane's
   `'NoneType' object has no attribute 'iterator'` exactly. Run it for every
   template variant you touched before pushing.

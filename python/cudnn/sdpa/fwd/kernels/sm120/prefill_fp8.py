@@ -89,6 +89,7 @@ from cudnn.sdpa.fwd.kernels.sm120._common import (
     ceil_div,
     nvvm_threadquad_reduction_max,
     nvvm_threadquad_reduction_sum,
+    sfo_atom_offset,
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     FP8_HEAD_TILE_GRANULE,
@@ -163,13 +164,6 @@ fma2 = partial(prims.fma_packed_f32x2, ftz=False, rnd=prims.FPRoundingMode.RN)
 # ---------------------------------------------------------------------------
 # Main kernel class
 # ---------------------------------------------------------------------------
-
-
-def _sfo_atom_offset(plane, r, c, cols):
-    """Byte offset of scale (r, c) in a [rows, cols] SF_O matrix stored in the F8_128x4 atom
-    order at ``plane``: ``plane + (r//128)*128*cols + (c//4)*512 + (r%32)*16 + ((r//32)%4)*4 + c%4``."""
-    off = plane + (r >> cutlass.Int32(7)) * (cols << cutlass.Int32(7)) + (c >> cutlass.Int32(2)) * cutlass.Int32(512)
-    return off + (r & cutlass.Int32(31)) * cutlass.Int32(16) + ((r >> cutlass.Int32(5)) & cutlass.Int32(3)) * cutlass.Int32(4) + (c & cutlass.Int32(3))
 
 
 class SM120FusedMultiHeadAttentionForward:
@@ -1511,7 +1505,7 @@ class SM120FusedMultiHeadAttentionForward:
                         c = cutlass.Int32(p0 // npairs) + q_head_base * sfo_col_off_h
                         r = row_q + batch_idx * sfo_row_off_b
                         plane = (cutlass.Int64(batch_idx) * num_heads_q + q_head_base) * sfo_plane_stride
-                        sf_ptr = sfo_base_ptr + _sfo_atom_offset(plane, r, c, sfo_cols)
+                        sf_ptr = sfo_base_ptr + sfo_atom_offset(plane, r, c, sfo_cols)
                         if row_valid:
                             sf_ptr.store(cutlass.Vector.from_elements((cutlass.Int8(sf_byte),), cutlass.Int8), alignment=1)
                         else:
@@ -1526,7 +1520,7 @@ class SM120FusedMultiHeadAttentionForward:
                                 if q_seq_idx + cutlass.Int32(self.q_tile) >= seqlen_q:
                                     r2 = row_q + cutlass.Int32(self.q_tile)
                                     if r2 < _rows_pad:
-                                        sf_ptr2 = sfo_base_ptr + _sfo_atom_offset(plane, r2, c, sfo_cols)
+                                        sf_ptr2 = sfo_base_ptr + sfo_atom_offset(plane, r2, c, sfo_cols)
                                         sf_ptr2.store(cutlass.Vector.from_elements((cutlass.Int8(0),), cutlass.Int8), alignment=1)
 
             for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
