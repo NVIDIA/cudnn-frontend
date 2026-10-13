@@ -625,6 +625,16 @@ class Capabilities:
     warp_spec_cfgs: frozenset[int] = frozenset({0})
     swap_abs: frozenset[int] = frozenset()
 
+    # Per-d-shape Q tile-height domain, the tile_m twin of tile_ns_by_d_shape above, for a
+    # row whose Q tile differs by head dims (planned: the SM90 row, whose exact (128, 128)
+    # graphs also take a 128 x 128 tile, the dedicated D128 template, beside the 64 x 64
+    # tile of the D512 body).  The sched_policies_by_d_shape idiom: an entry OVERRIDES
+    # tile_ms for the d-shape the lowering SELECTS (effective_tile_ms, as effective_tile_ns
+    # reads tile_ns_by_d_shape).  () = the row-wide tile_ms holds for every d-shape (every
+    # row today).  APPENDED after warp_spec_cfgs (append-only contract above; the same test
+    # pins it).
+    tile_ms_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
     return (
@@ -1174,9 +1184,20 @@ def effective_swap_abs(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", k
 
 
 def effective_tile_ms(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:
-    """Explicit native query tiles; keep the default proposal domain unchanged."""
+    """Q tile-height domain of the d-shape the lowering will pick.  Explicit SM80 tile knobs read the native query
+    tiles of the graph's head dims (``_sm80_explicit_tile_domains``), which keeps the default proposal domain
+    unchanged.  Otherwise row-wide ``tile_ms`` is the floor, and a ``tile_ms_by_d_shape`` entry for the selected
+    d-shape replaces it, as ``effective_sched_policies`` does for the scheduler and ``effective_tile_ns`` for the KV
+    tile."""
     sm80_domains = _sm80_explicit_tile_domains(capabilities, facts, knobs)
-    return sm80_domains[0] if sm80_domains is not None else capabilities.tile_ms
+    if sm80_domains is not None:
+        return sm80_domains[0]
+    selected = _selected_d_shape(capabilities, facts, knobs)
+    if selected is not None:
+        for shape, shape_domain in capabilities.tile_ms_by_d_shape:
+            if shape == selected:
+                return shape_domain
+    return capabilities.tile_ms
 
 
 def effective_tile_ns(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> frozenset[int]:

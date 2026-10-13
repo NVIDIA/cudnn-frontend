@@ -428,6 +428,81 @@ def test_dsl_sm90_wrapper_matches_the_reference(sm100):
     torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=2e-2, rtol=2e-2)
 
 
+# --- The adapter's kernel flavor (issue #378) -------
+#
+# check_support picks its template first (config_sm90.pick_flavor over the flavors that have a
+# file in api_dsl._SM90_KERNEL_FILES), then reads that flavor's tile for the tile, band and PackGQA
+# checks; compile() loads the flavor's file under a per-flavor tag. D512 is the only template.
+
+
+class _TemplateNamed(Exception):
+    """Raised by the loader spy: the adapter named its template, and the test stops there (no JIT)."""
+
+
+def _spy_template_loads(monkeypatch):
+    """Record the (file, tag) each compile() asks for, and stop before anything is traced."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    loads = []
+
+    def spy(filename, params, tag="template", part=None):
+        loads.append((filename, tag))
+        raise _TemplateNamed(filename)
+
+    monkeypatch.setattr(api_dsl, "_load_kernel_template", spy)
+    return loads
+
+
+def _api_at(d, h_q=8, h_kv=8, s=96, **kw):
+    """A dense SM90 adapter at head dims ``d`` (an int for D_QK == D_V, else a pair)."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+
+    d_qk, d_v = (d, d) if isinstance(d, int) else d
+    q, k, v, o = (_bhsd(2, h, s, dim, torch.float16) for h, dim in ((h_q, d_qk), (h_kv, d_qk), (h_kv, d_v), (h_q, d_v)))
+    return SdpaFwdDslSm90(q, k, v, o, **kw)
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [{}, dict(has_sink=True), dict(is_causal=True, window_size_left=16), dict(seq_q_lens_present=True, seq_kv_lens_present=True)],
+    ids=["dense", "sink", "swa", "lengths"],
+)
+@pytest.mark.parametrize("d", [128, 512, (96, 128)], ids=["d128", "d512", "d96x128"])
+def test_sm90_adapter_selects_d512_until_d128_has_a_template(monkeypatch, d, declared):
+    """Every declaration, (128, 128) included, still compiles sm90/prefill_d512_f16.py under its old tag."""
+    loads = _spy_template_loads(monkeypatch)
+    api = _api_at(d, **declared)
+    assert api.check_support() and api.flavor == (512, 512)
+    with pytest.raises(_TemplateNamed):
+        api.compile()
+    assert loads == [("sm90/prefill_d512_f16.py", "sdpa_fwd_sm90_d512")], loads
+
+
+def test_sm90_adapter_reads_the_flavor_tile_and_template(monkeypatch):
+    """D512's tile and PackGQA refusals keep their messages. With the picker forced to D128 (standing
+    in for the template entry #378 step 3 adds), the same checks read D128's tile and compile() asks
+    for D128's file under its own tag."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    loads = _spy_template_loads(monkeypatch)
+    with pytest.raises(NotImplementedError, match="does not support tiles other than 64/64$"):
+        _api_at(512, tile_m=128, tile_n=128).check_support()
+    with pytest.raises(NotImplementedError, match="SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64$"):
+        _api_at(512, h_q=3, h_kv=1, pack_gqa=True).check_support()
+
+    monkeypatch.setattr(api_dsl, "_sm90_pick_flavor", lambda *args: (128, 128))
+    monkeypatch.setitem(api_dsl._SM90_KERNEL_FILES, (128, 128), "sm90/prefill_d128_f16.py")
+    with pytest.raises(NotImplementedError, match="does not support tiles other than 128/128$"):
+        _api_at(128, tile_m=64, tile_n=64).check_support()
+    with pytest.raises(NotImplementedError, match="SM90 D128 PackGQA requires a head ratio sharing a factor with tile_m=128$"):
+        _api_at(128, h_q=3, h_kv=1, pack_gqa=True).check_support()
+    api = _api_at(128, tile_m=128, tile_n=128)
+    assert api.check_support() and api.flavor == (128, 128)
+    with pytest.raises(_TemplateNamed):
+        api.compile()
+    assert loads == [("sm90/prefill_d128_f16.py", "sdpa_fwd_sm90_d128")], loads
+
+
 # --- The row's head-dim envelope, floored above the template's -------
 
 

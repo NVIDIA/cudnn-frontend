@@ -1223,6 +1223,7 @@ def test_capabilities_positional_prefix_is_append_only():
     assert caps.pack_gqa_requires_divisible is True
     assert caps.zero_scale is False
     assert caps.attn_scale_prefolded_d_shapes is None
+    assert caps.tile_ms_by_d_shape == ()
     assert caps.epilogue_gate is False
     assert engines.pack_gqa_partial(caps, ga.SdpaGraphFacts(d_qk=128, d_v=128)) is False
 
@@ -1239,6 +1240,12 @@ def test_capabilities_positional_prefix_is_append_only():
     band_segment = ["band", "independent_paged_pool_counts", "warp_spec_cfgs"]
     assert names[band_start : band_start + len(band_segment)] == band_segment, names[band_start:]
     assert caps.warp_spec_cfgs == frozenset({0})
+    # The per-d-shape Q tile domain is appended after warp_spec_cfgs. Pin its own segment, permitting future fields after
+    # it.
+    flavor_start = names.index("tile_ms_by_d_shape")
+    flavor_segment = ["tile_ms_by_d_shape"]
+    assert flavor_start > names.index("warp_spec_cfgs"), names
+    assert names[flavor_start : flavor_start + len(flavor_segment)] == flavor_segment, names[flavor_start:]
 
     # Positional construction in the PRE-BAND order (every row's spelling before the canonical model landed) still binds every
     # field, and the appended band set is DERIVED from those flags rather than shadowing them.  The row built here carries the

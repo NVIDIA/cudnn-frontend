@@ -40,13 +40,16 @@ from cudnn.frost.tile_dsl.constants import (
 )
 from cudnn.sdpa.fwd.config_sm90 import (
     BAND_COORDINATE_LIMIT as _SM90_BAND_COORDINATE_LIMIT,
+    D512_FLAVOR as _SM90_D512_FLAVOR,
+    FLAVORS as _SM90_FLAVORS,
+    FLAVOR_TILES as _SM90_FLAVOR_TILES,
     SCALE_NEGATIVE as _SM90_SCALE_NEGATIVE,
     SCALE_POSITIVE as _SM90_SCALE_POSITIVE,
     SCALE_ZERO as _SM90_SCALE_ZERO,
     TILE_M as _SM90_TILE_M,
-    TILE_N as _SM90_TILE_N,
     TemplateParams as Sm90TemplateParams,
     head_dims_mismatch as _sm90_head_dims_mismatch,
+    pick_flavor as _sm90_pick_flavor,
     validate_params as _sm90_validate_params,
 )
 from cudnn.sdpa.fwd.config_sm107 import supports_native_small_half_dense_paged
@@ -389,6 +392,11 @@ _SM120_KERNEL_FILES = {
 _SM120_DECODE_KERNEL_FILE = "sm120/decode_f16.py"
 _SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_fp8.py", None: "sm120/prefill_fp8.py"}
 _SM120_MXFP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_mxfp8.py", None: "sm120/prefill_mxfp8.py"}
+# Keyed by kernel flavor (config_sm90.FLAVORS), as the SM120 maps above. A flavor is
+# selectable only once it has an entry here: SdpaFwdDslSm90.check_support builds the
+# config_sm90.pick_flavor pool from these keys, so every declaration runs the D512
+# body until a native flavor's template joins (D128, issue #378).
+_SM90_KERNEL_FILES = {_SM90_D512_FLAVOR: "sm90/prefill_d512_f16.py"}
 
 
 _SM120_DTYPE_QKV_CODE = {
@@ -867,6 +875,15 @@ def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120Te
     if flavor is not None:
         tag = f"{tag}_{_flavor_tag(flavor)}"
     return _load_kernel_template(files[flavor], params, tag=tag)
+
+
+def _load_sm90_kernel_module(flavor: tuple[int, int], params: Sm90TemplateParams, *, native_d64: bool = False):
+    """One SM90 template module per (flavor, params); the tag names the template (``sdpa_fwd_sm90_d512``). The D512
+    flavor's exact dense D64 subset (``native_d64``: SdpaFwdDslSm90._native_d64, config_sm90.native_d64_mismatch) loads
+    the D64 body."""
+    if native_d64:
+        return _load_kernel_template("sm90/prefill_d64_f16.py", params, tag="sdpa_fwd_sm90_d64")
+    return _load_kernel_template(_SM90_KERNEL_FILES[flavor], params, tag=f"sdpa_fwd_sm90_{_flavor_tag(flavor)}")
 
 
 # SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
@@ -5573,6 +5590,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._native_d64 = False
         self.thd_stats_head_major = False
         self.thd_stats_head_stride = 0
+        # Kernel flavor (config_sm90.FLAVORS), chosen by check_support.
+        self.flavor: Optional[tuple[int, int]] = None
 
     def check_support(self) -> bool:
         """Validate the Hopper tile geometry and native operand layouts."""
@@ -5643,6 +5662,12 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
         self._value_error_if(self.window_size_right is not None and not self.is_causal, "SM90 SDPA: window_size_right requires is_causal=True")
         self._value_error_if(self.causal_bottom_right and not self.is_causal, "SM90 SDPA: causal_bottom_right requires is_causal=True")
 
+        # The template this declaration lowers onto. The pool is the flavors that have a
+        # template (_SM90_KERNEL_FILES), so D512 serves every declaration until a native
+        # flavor joins; the tile, band, PackGQA and split checks below read that flavor's tile.
+        self.flavor = _sm90_pick_flavor(d_qk, d_v, tuple(f for f in _SM90_FLAVORS if f in _SM90_KERNEL_FILES))
+        tile_m, tile_n = _SM90_FLAVOR_TILES[self.flavor]
+
         # Well-formed declarations this engine does not serve.
         refusals = (
             (self.gate_desc is not None, "epilogue gate fusion (served by the SM107 d256 SDPA engines only)"),
@@ -5656,7 +5681,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             ),
             (self.softmax_scale_prefolded, "pre-folded softmax scale (the cc10.7 kernels only)"),
             (self.thd and self.split_kv > 1, "THD split-KV"),
-            (self.tile_m not in (None, _SM90_TILE_M) or self.tile_n not in (None, _SM90_TILE_N), "tiles other than 64/64"),
+            (self.tile_m not in (None, tile_m) or self.tile_n not in (None, tile_n), f"tiles other than {tile_m}/{tile_n}"),
             (self.cga not in (None, 1), "CGA other than 1"),
             (self.q_desc.dtype not in (torch.float16, torch.bfloat16), "Q/K/V/O other than FP16/BF16"),
             (self.lse_desc is not None and self.lse_desc.dtype != torch.float32, "Stats other than FP32"),
@@ -5716,7 +5741,7 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             band = dict(causal=False)
         else:
             self._not_implemented_error_if(
-                envelope + 2 * _SM90_TILE_M >= _SM90_BAND_COORDINATE_LIMIT,
+                envelope + 2 * tile_m >= _SM90_BAND_COORDINATE_LIMIT,
                 "SM90 SDPA: a diagonal band needs S_q + S_kv below 2**30 (Int32 band coordinates)",
             )
             causal = right == 0
@@ -5748,16 +5773,16 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             "SM90 SDPA: THD walks its live units with the natural single-tile work decoder; SCHED_LPT and SCHED_LPT_L2 are dense-only",
         )
         self._not_implemented_error_if(
-            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, _SM90_TILE_M, partial=True),
-            "SM90 D512 PackGQA requires a head ratio sharing a factor with tile_m=64",
+            self.pack_gqa and not pack_gqa_supported(h_q, h_kv, tile_m, partial=True),
+            f"SM90 {_flavor_tag(self.flavor).upper()} PackGQA requires a head ratio sharing a factor with tile_m={tile_m}",
         )
 
         self._value_error_if(type(self.split_kv) is not int or not 1 <= self.split_kv <= 65535, "SM90 split_kv must be an integer in [1, 65535]")
         self._not_implemented_error_if(self.split_kv > 1 and max(b, h_q) > 65535, "SM90 split combine requires batch and heads at most 65535")
         if self.split_kv > 1:
-            pack_g = pack_gqa_group_size(h_q // h_kv, _SM90_TILE_M, partial=True) if self.pack_gqa else 1
+            pack_g = pack_gqa_group_size(h_q // h_kv, tile_m, partial=True) if self.pack_gqa else 1
             packed_heads = h_q // pack_g
-            tokens_per_tile = _SM90_TILE_M // pack_g
+            tokens_per_tile = tile_m // pack_g
             units = b * packed_heads * ((s_q + tokens_per_tile - 1) // tokens_per_tile)
             self._not_implemented_error_if(max(b * self.split_kv, units) >= 2**31, "SM90 split-KV batch planes and flat grid must fit positive Int32")
         self.params = Sm90TemplateParams(
@@ -5816,9 +5841,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             # The graph lowering bound per-port physical offsets (thd_origins.graph_origin_specs): every
             # (row, multiplier, token stride, bits) entry becomes the template's (bits, multiplier).
             self.params = replace(self.params, thd_origins=tuple((spec[3], spec[1]) if spec is not None else None for spec in origin_specs))
-            _sm90_validate_params(self.params)
-        flavor = "d64" if self._native_d64 else "d512"
-        self._k_mod = template = _load_kernel_template(f"sm90/prefill_{flavor}_f16.py", self.params, tag=f"sdpa_fwd_sm90_{flavor}")
+            _sm90_validate_params(self.params, self.flavor)
+        self._k_mod = template = _load_sm90_kernel_module(self.flavor, self.params, native_d64=self._native_d64)
         strides, lse_stride = self._strides, self._lse_stride
         if self.split_kv > 1:
             # The producer TMA maps describe split-major partials; final layouts

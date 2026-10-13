@@ -3,10 +3,14 @@
 
 """Kernel-facing configuration for the FROST SM90 SDPA forward templates.
 
-The frozen ``TemplateParams`` record contains only graph declarations and
-selected tuning knobs. Runtime lengths, pointers, and packed token totals stay
-out of compile keys. Graph-adapter declaration logic lives with the adapter;
-this module keeps the small interface consumed by the native D64/D128/D256/D512 kernels.
+One flavor ships today, the D512 body (``sm90/prefill_d512_f16.py``, with its
+native 128/256/512-column storage and the exact dense D64 body beside it);
+``pick_flavor`` and ``FLAVOR_TILES`` are the seams through which a dedicated
+D128 template joins (issue #378). The frozen ``TemplateParams`` record contains
+only graph declarations and selected tuning knobs. Runtime lengths, pointers,
+and packed token totals stay out of compile keys. Graph-adapter declaration
+logic lives with the adapter; this module keeps the small interface consumed by
+the native D64/D128/D256/D512 kernels.
 """
 
 from __future__ import annotations
@@ -30,6 +34,28 @@ D_ALIGN = 8
 # Sequence tile geometry shared by the native head widths.
 TILE_M = 64
 TILE_N = 64
+
+# Kernel flavors: the SM90 templates a declaration lowers onto, keyed by (D_QK, D_V),
+# smallest first. D512 is the D512 body: every head-dim pair up to its tile
+# (head_dims_mismatch), on its native 128/256/512-column storage (head_tile) or, for
+# the exact dense D64 subset, the D64 body (native_d64_mismatch). D128 (issue #378) is
+# the dedicated 128 x 128 template for exact (128, 128) declarations; it is named here so
+# the adapter, the engine row and the tests share one spelling, and no declaration
+# selects it until its template is in the adapter's kernel-file map
+# (api_dsl._SM90_KERNEL_FILES).
+D512_FLAVOR = (D_TILE, D_TILE)
+D128_FLAVOR = (128, 128)
+FLAVORS = (D128_FLAVOR, D512_FLAVOR)
+# Each flavor's fixed CTA tile, (tile_m, tile_n): Q rows by keys. A pinned tile names the
+# flavor whose tile it is (a 128 tile the D128 template, a 64 tile the D512 body), and the
+# adapter refuses a tile no flavor of the declaration has; the engine row states the same
+# (Capabilities.tile_ms_by_d_shape / tile_ns_by_d_shape).
+FLAVOR_TILES = {D512_FLAVOR: (TILE_M, TILE_N), D128_FLAVOR: (128, 128)}
+# Native-range floor per flavor, in the engine row's d_envelope_floors vocabulary: D128
+# serves head dims in (127, 128], i.e. exactly (128, 128). D512 has no template floor: it
+# serves every pair up to its tile (the engine row's floors are ROW decisions,
+# engines._sm90_spec).
+FLAVOR_FLOORS = {D128_FLAVOR: 127}
 
 
 def native_d64_mismatch(
@@ -65,6 +91,25 @@ def head_dims_mismatch(d_qk, d_v) -> str | None:
                 f"(TMA 16-byte global-stride rule); graph has D_QK={d_qk}/D_V={d_v}"
             )
     return None
+
+
+def pick_flavor(d_qk: int, d_v: int, flavors: tuple[tuple[int, int], ...] = (D512_FLAVOR,)) -> tuple[int, int]:
+    """The template that serves a ``(d_qk, d_v)`` declaration, among ``flavors``.
+
+    The smallest native flavor in ``flavors`` that covers the pair above its floor
+    (``FLAVOR_FLOORS``), else D512, the D512 body. Total: an out-of-envelope pair
+    still answers D512, and ``head_dims_mismatch`` declines it, so the adapter's
+    existing NotImplementedError is unchanged. ``flavors`` is the caller's pool (the
+    flavors with a template, ``api_dsl._SM90_KERNEL_FILES``, as
+    ``api_dsl._pick_flavor``'s ``candidates`` on the SM100 line); the default pool is
+    D512 alone, so every declaration selects D512.
+    """
+    for flavor in FLAVORS:
+        if flavor == D512_FLAVOR or flavor not in flavors:
+            continue
+        if d_qk <= flavor[0] and d_v <= flavor[1] and min(d_qk, d_v) > FLAVOR_FLOORS.get(flavor, 0):
+            return flavor
+    return D512_FLAVOR
 
 
 def dense_bind_strides(shape: tuple, strides: tuple, elem_bytes: int) -> tuple | None:
@@ -150,8 +195,31 @@ def thd_meta_words(b: int, origins: bool) -> int:
 BAND_COORDINATE_LIMIT = 2**30
 
 
-def validate_params(params: TemplateParams) -> None:
-    """Validate the immutable specialization before constructing a kernel."""
+def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVOR) -> None:
+    """Validate the immutable specialization before constructing a kernel.
+
+    ``flavor`` names the template asking. D512 (the default, and the only caller
+    today) runs the checks below unchanged, messages included. D128 first refuses
+    what its kernel never serves (the declarations its tile declines), then runs the
+    same checks under its own name.
+    """
+    if flavor == D128_FLAVOR:
+        for refused, feature in (
+            (params.thd_varlen, "THD (ragged) layouts"),
+            (params.page_size != 0, "paged KV"),
+            (params.split_kv != 1, "split-KV"),
+            (params.has_sink, "attention sinks"),
+            (params.window_left is not None, "a sliding window"),
+            (params.window_right is not None, "a widened right band"),
+            (params.seq_q_lens_present or params.seq_kv_lens_present, "per-batch lengths"),
+            (params.pack_gqa, "PackGQA"),
+        ):
+            if refused:
+                raise ValueError(f"SM90 D128 does not serve {feature}; the D512 body (tile 64) serves such declarations")
+    elif flavor != D512_FLAVOR:
+        raise ValueError(f"SM90 has no {flavor} template; flavors: {sorted(FLAVORS)}")
+    name = f"SM90 D{flavor[0]}"
+    tile_m = FLAVOR_TILES[flavor][0]
     if type(params.page_size) is not int or params.page_size < 0:
         raise ValueError("SM90 page_size must be a nonnegative integer")
     if params.page_size:
@@ -167,37 +235,37 @@ def validate_params(params: TemplateParams) -> None:
     if params.thd_varlen and params.split_kv > 1:
         raise ValueError("SM90 split-KV requires dense Q")
     if params.dtype_qkv not in (DTYPE_FP16, DTYPE_BF16):
-        raise ValueError("SM90 D512 requires uniform FP16 or BF16 Q/K/V/O")
+        raise ValueError(f"{name} requires uniform FP16 or BF16 Q/K/V/O")
     from .config_sm100 import pack_gqa_supported
 
-    if params.qh_per_kh < 1 or (params.pack_gqa and not pack_gqa_supported(params.qh_per_kh, 1, TILE_M, partial=True)):
-        raise ValueError("SM90 D512 PackGQA requires a positive head ratio sharing a factor with tile_m=64")
+    if params.qh_per_kh < 1 or (params.pack_gqa and not pack_gqa_supported(params.qh_per_kh, 1, tile_m, partial=True)):
+        raise ValueError(f"{name} PackGQA requires a positive head ratio sharing a factor with tile_m={tile_m}")
     if params.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2):
-        raise ValueError("SM90 D512 supports only NATURAL/LPT/LPT_L2 single-tile scheduling")
+        raise ValueError(f"{name} supports only NATURAL/LPT/LPT_L2 single-tile scheduling")
     if params.thd_varlen and params.sched_policy != SCHED_NATURAL:
-        raise ValueError("SM90 D512 THD uses the natural single-tile work decoder")
+        raise ValueError(f"{name} THD uses the natural single-tile work decoder")
     if params.scale_mode not in (SCALE_POSITIVE, SCALE_ZERO, SCALE_NEGATIVE):
-        raise ValueError("SM90 D512 scale mode must be positive, zero, or negative")
+        raise ValueError(f"{name} scale mode must be positive, zero, or negative")
     if params.thd_varlen:
         if not params.seq_kv_lens_present:
-            raise ValueError("SM90 D512 thd_varlen requires seq_kv_lens_present (the THD metadata tensor)")
+            raise ValueError(f"{name} thd_varlen requires seq_kv_lens_present (the THD metadata tensor)")
         if params.seq_q_lens_present:
-            raise ValueError("SM90 D512 seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
+            raise ValueError(f"{name} seq_q_lens_present is dense-only (THD carries per-sequence Q lengths via cu_seqlens)")
     if params.thd_origins is not None:
         if not params.thd_varlen or len(params.thd_origins) != len(THD_ORIGIN_PORTS):
-            raise ValueError("SM90 D512 thd_origins is THD-only and lists Q, K, V, O and Stats")
+            raise ValueError(f"{name} thd_origins is THD-only and lists Q, K, V, O and Stats")
         for port, entry in zip(THD_ORIGIN_PORTS, params.thd_origins):
             if entry is not None and (len(entry) != 2 or entry[0] not in (32, 64) or type(entry[1]) is not int or entry[1] < 1):
-                raise ValueError(f"SM90 D512 thd_origins[{port}] must be (32 or 64, multiplier >= 1)")
+                raise ValueError(f"{name} thd_origins[{port}] must be (32 or 64, multiplier >= 1)")
         if params.thd_origins[4] is not None and not params.has_lse:
-            raise ValueError("SM90 D512 Stats origins require has_lse")
+            raise ValueError(f"{name} Stats origins require has_lse")
     if params.causal and params.window_right is not None:
-        raise ValueError("SM90 D512 plain causal is causal=True; window_right holds only a widened right bound")
-    for name, bound, low in (("window_left", params.window_left, 0), ("window_right", params.window_right, 1)):
+        raise ValueError(f"{name} plain causal is causal=True; window_right holds only a widened right bound")
+    for bound_name, bound, low in (("window_left", params.window_left, 0), ("window_right", params.window_right, 1)):
         if bound is not None and (type(bound) is not int or not low <= bound < BAND_COORDINATE_LIMIT):
-            raise ValueError(f"SM90 D512 {name} must be an integer in [{low}, 2**30)")
+            raise ValueError(f"{name} {bound_name} must be an integer in [{low}, 2**30)")
     if params.bottom_right is not None:
         if params.window_left is None and params.window_right is None and not params.causal:
-            raise ValueError("SM90 D512 diagonal alignment needs a band bound")
+            raise ValueError(f"{name} diagonal alignment needs a band bound")
         if params.bottom_right == params.causal:
-            raise ValueError("SM90 D512 bottom_right repeats the alignment causal implies; the canonical spelling is None")
+            raise ValueError(f"{name} bottom_right repeats the alignment causal implies; the canonical spelling is None")
