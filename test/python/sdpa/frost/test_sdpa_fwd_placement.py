@@ -409,17 +409,18 @@ def test_dense_d128_one_decode_tile_wave_leads(monkeypatch, arch, cc, sms, sink)
 def _hnd_pool(h_kv, page_size, d=256):
     from types import SimpleNamespace
 
-    return SimpleNamespace(get_stride=lambda: (h_kv * page_size * d, page_size * d, d, 1))  # [pages, H_kv, page, D]: the head stride above the page stride
+    return SimpleNamespace(get_stride=lambda: (h_kv * page_size * d, page_size * d, d, 1))  # [pages, H_kv, page, D] head-major: each head's page contiguous
 
 
 def _nhd_pool(h_kv, page_size, d=256):
     from types import SimpleNamespace
 
-    return SimpleNamespace(get_stride=lambda: (page_size * h_kv * d, d, h_kv * d, 1))  # [pages, page, H_kv, D]: the page stride above the head stride
+    return SimpleNamespace(get_stride=lambda: (page_size * h_kv * d, d, h_kv * d, 1))  # [pages, H_kv, page, D] token-major in the page: the band's pool
 
 
 def _sm107_paged_d256_decode_facts(**over):
-    """FlashInfer's cuDNN decode graph shape on cc 10.7: a dense Q, an HND page pool with the padding mask, no mask / sink / Stats."""
+    """FlashInfer's cuDNN decode graph shape on cc 10.7: a dense Q over a page pool with the padding mask, no mask / sink / Stats (the pool
+    strided as FlashInfer's benchmark strides it: token-major in the page; the head-major pool is the admitted twin)."""
     values = dict(
         b=4,
         h_q=24,
@@ -438,7 +439,7 @@ def _sm107_paged_d256_decode_facts(**over):
         device_sm_count=212,
     )
     values.update(over)
-    values.setdefault("k_t", _hnd_pool(values["h_kv"], values["page_size"]))
+    values.setdefault("k_t", _nhd_pool(values["h_kv"], values["page_size"]))
     return _facts(**values)
 
 
@@ -521,7 +522,6 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
         dict(attn_scale_prefolded=True),
         dict(has_epilogue_gate=True),
         dict(page_size=128),
-        dict(k_t=_nhd_pool(2, 16)),  # an NHD pool: the band measured HND
         dict(thd=True),  # ragged queries never ride the dense-Q decode tile
     ],
     ids=[
@@ -544,15 +544,15 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
         "prefolded",
         "gate",
         "page128",
-        "nhd",
         "thd",
     ],
 )
 def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outside):
     """Inside the band the shard's SHAPE is FlashInfer's decode graph on the Rubin d256 decode tile (``engines.d256_decode_tile_selected``
-    with the whole group packed; an HND pool of a measured page size; no mask / window / sink / Stats / gate); every variant outside it
+    with the whole group packed; a page pool of a measured page size; no mask / window / sink / Stats / gate); every variant outside it
     keeps the backend first.  The leading cell (24/2, b 32, declared KV 8k = 64 units x 8k) holds for f16, pages 32 / 64, the CUDA-graph
-    replay hint and execute-time shape overrides alike (every one a measured cell or a declaration the rule reads the same way)."""
+    replay hint, execute-time shape overrides and both in-page pool layouts alike (the token-major one FlashInfer's benchmark strides --
+    the band's pool -- and the head-major contiguous one, admitted on its structure)."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
@@ -565,3 +565,4 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, page_size=64)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, cuda_graph_replay=True)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, shape_overrides=True)) == placement.LEAD
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, k_t=_hnd_pool(2, 16))) == placement.LEAD

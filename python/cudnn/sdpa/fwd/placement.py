@@ -154,8 +154,11 @@ Rubin row remains opt-in.
 
 - PAGED dense-Q d256 half decode, ``s_q == 1``, on the Rubin d256 decode tile (``sm107/decode_d256_f16.py``: the whole GQA group
   packed into one 16-row Q tile per (batch, KV head) unit, ``engines.d256_decode_tile_selected``) -- FlashInfer's cuDNN decode graph
-  shape: a 4-D dense Q, an HND page pool, the padding mask (per-request KV lengths), no causal mask / window / sink / Stats, the KV
-  declared as ``paged_attention_max_seq_len_kv``. Measured 2026-10-13 on an EXCLUSIVE GPU of the 212-SM cc 10.7 perf class (SM clock
+  shape: a 4-D dense Q, a page pool with the padding mask (per-request KV lengths), no causal mask / window / sink / Stats, the KV
+  declared as ``paged_attention_max_seq_len_kv``; the pool as FlashInfer's benchmark strides it -- ``[pages, H_kv, page, D]`` dims
+  with the token-major in-page layout (head stride ``D``, token stride ``H_kv x D``); the head-major pool (each head's page
+  contiguous, vLLM's ``[blocks, 2, H_kv, block, D]``) reads the same bytes per page in a friendlier order and is admitted on that
+  structure, its own cell owed (SUPPORT_MATRIX_TRACKER.md's gaps table). Measured 2026-10-13 on an EXCLUSIVE GPU of the 212-SM cc 10.7 perf class (SM clock
   locked at 2376 MHz and SAMPLED: busy median 2364), cudnn-frontend 1.32.0 (the develop tree carrying #1543's tile and route, plus
   the serving integration commits), cuDNN 9.27.0 build 9.27.0.21 (the pre-release build the harness loads),
   CuTeDSL 4.8.0, FlashInfer's ``bench_gpu_time`` (CUPTI kernel time, L2 flushed per iteration), the backend's default plan and the
@@ -176,8 +179,8 @@ Rubin row remains opt-in.
   in up to two token units) are held the same way: the tile ran 0.01-0.31 of the backend's plan (which costs 6.8-142 ms per launch
   at KV 128k) on all 576 (cell, regime) pairs but trails fa2 by 6 % (q = 2) and 21-22 % (q = 3 / 4) at the medians -- the kernel gap
   in SUPPORT_MATRIX_TRACKER.md's gaps table; both holds reopen with the kernel. Stats, a sink, a causal mask or window at ``s_q ==
-  1``, an NHD pool, page 128, a dense (unpaged) d256 cache (measured against the prefill body only, above), THD queries and the fused
-  gate were not measured -> TRAIL.
+  1``, page 128, a dense (unpaged) d256 cache (measured against the prefill body only, above), THD queries and the fused gate were
+  not measured -> TRAIL.
 
 SM107 MXFP8 row (``sdpa_fwd_prefill_sm107_mxfp8``, offered by default since 2026-10): LEAD on exact
 cc 10.7 for every graph the row admits -- dense BSHD, exact d128 / d192x128 / d256 / d512, E4M3 / E5M2
@@ -352,11 +355,12 @@ def _d128_one_decode_tile_wave(caps: Capabilities, facts) -> bool:
 def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     """Paged dense-Q d256 decode (``s_q == 1``) on the Rubin d256 decode tile inside its measured band (module docstring, "PAGED
     dense-Q d256 half decode"): a measured GQA group packed whole onto the tile (``engines.d256_decode_tile_selected`` -- half
-    inputs, dense queries, the (256, 256) flavor, no pre-folded scale), an HND page pool of a measured page size, no mask / window /
-    sink / Stats / gate, ``SM107_PAGED_D256_DECODE_MIN_UNITS <= b * h_kv <= SM107_PAGED_D256_DECODE_MAX_UNITS`` units, the declared
-    KV inside ``SM107_PAGED_D256_DECODE_KV_TOKENS`` and ``units * KV >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT`` tokens in
-    flight -- the frontier both regimes (CUDA-graph replay and eager) share.  The MTP rows (``s_q >= 2``) and group 32 are held
-    (module docstring)."""
+    inputs, dense queries, the (256, 256) flavor, no pre-folded scale), a page pool of a measured page size in either in-page layout
+    (the token-major one the band measured, the head-major one admitted on its structure), no mask / window / sink / Stats / gate,
+    ``SM107_PAGED_D256_DECODE_MIN_UNITS <= b * h_kv <= SM107_PAGED_D256_DECODE_MAX_UNITS`` units, the declared KV inside
+    ``SM107_PAGED_D256_DECODE_KV_TOKENS`` and ``units * KV >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT`` tokens in flight --
+    the frontier both regimes (CUDA-graph replay and eager) share.  The MTP rows (``s_q >= 2``) and group 32 are held (module
+    docstring)."""
     if not (facts.has_paged_kv and facts.s_q == 1 and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0):
         return False
     group = facts.h_q // facts.h_kv
@@ -365,8 +369,6 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     if facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16) or facts.page_size not in SM107_PAGED_D256_DECODE_PAGE_SIZES:
         return False
     if facts.causal or facts.window_left is not None or facts.right_band_widening or facts.has_sink or facts.wants_stats or facts.has_epilogue_gate:
-        return False
-    if facts.k_t is None or not (facts.k_t.get_stride()[2] < facts.k_t.get_stride()[1]):  # [pages, H_kv, page, D]: the HND pool the band measured
         return False
     units = facts.b * facts.h_kv
     kv_lo, kv_hi = SM107_PAGED_D256_DECODE_KV_TOKENS
