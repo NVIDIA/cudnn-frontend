@@ -542,32 +542,58 @@ class Sm120KernelTemplate(KernelTemplate):
     fp4 operand is 4-bit, so the MN-major gate keeps it K-major."""
 
     # --- multi-GEMM (dual MoE / SwiGLU) feasibility ---------------------------
-    # The MoE template keeps one register accumulator per GEMM resident for the
-    # whole tile (warp_tile_m x warp_tile_n fp32 / 32 lanes each). How many
-    # registers that takes is NOT a support question: past what the compute
-    # warp's grant holds, ptxas spills to local memory and the plan still
-    # computes the same function, only slower -- a perf trade-off left to the
-    # autotuner and the auto pick (tile_config.select_config's shared 256-wide
-    # N budget keeps the auto pick spill-free), never a reason to reject a plan.
-    # The one hard gate is SMEM: a stage of every distinct operand tile plus the
-    # epilogue staging has to fit.
-    COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in both sm120 templates
+    # The MoE templates (dense and block-scale) keep one register accumulator
+    # per GEMM resident for the whole tile (warp_tile_m x warp_tile_n fp32 / 32
+    # lanes each). How many registers that takes is NOT a support question:
+    # past what the compute warp's grant holds, ptxas spills to local memory
+    # and the plan still computes the same function, only slower -- a perf
+    # trade-off left to the autotuner and the auto pick
+    # (tile_config.select_config's shared 256-wide N budget keeps the auto pick
+    # spill-free), never a reason to reject a plan. The one hard gate is SMEM:
+    # a stage of every distinct operand tile plus the epilogue staging has to fit.
+    COMPUTE_WARPS = 8  # WARPS_M * WARPS_N in every sm120 template
 
     def multi_gemm_ab_stages(self, chain: FusionChain, config: TileConfig) -> tuple[int, int, int]:
         """``(ab_stages, per_stage_bytes, staging_bytes)`` of a multi-GEMM chain on
         this template: one SMEM tile per DISTINCT operand per stage (+16 B slack,
         as the template counts), with the transposed-STG epilogue staging taken
-        off the budget in BYTES before the ring is sized -- the block-scale
-        template's accounting, not the whole-stage deduction the single-GEMM
-        path keeps (a multi-operand stage is so large that giving one up can
-        leave none). The renderer emits the result verbatim and tells the
-        template not to deduct."""
+        off the budget in BYTES before the ring is sized. On the dense MoE
+        template that replaces the whole-stage deduction its single-GEMM path
+        keeps (a multi-operand stage is so large that giving one up can leave
+        none): the renderer emits the result verbatim and tells the template not
+        to deduct (``stg_epi_prefunded``). The block-scale templates always take
+        the injected ring depth as is.
+
+        On the block-scale MoE templates (both orientations) an operand's tile
+        is its PACKED K-tile (``cta_tile_k_bytes`` per row) plus its F8_128x4
+        scale-factor box (the whole K-tile of scales for every 128-row block the
+        tile touches), and a GATHER chain also holds the linear token-scale
+        scratch per token operand -- the single-GEMM accounting of the sm120
+        block-scale renderer (``_render_block_scale_tile_constants``), per
+        distinct operand; change the two together. The ``smem_fixed_reserve``
+        covers what this linear count leaves out: the 1024-B block of barriers
+        and scheduler ring in front of the rings, the at most 512-B pad of the SF
+        rings (512-B aligned in both templates) before the 1024-aligned staging,
+        and GATHER's 8-B mbarrier per token operand."""
         from .dtypes import DTYPE_BYTES
         from .tile_config import _SM120_STG_STAGE_ELEMS, smem_ab_stages
 
-        _m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
-        per_stage = (chain.num_a_operands * config.cta_tile_m + chain.num_b_operands * cta_smem_n) * config.cta_tile_k_bytes + 16
         staging = 4 * _SM120_STG_STAGE_ELEMS * self.COMPUTE_WARPS
+        if self.block_scale:
+            bs = chain.block_scale
+            kb = config.cta_tile_k_bytes
+            sf_k = kb * 8 // (4 if bs.is_fp4 else 8) // bs.block_size
+            sfa_bytes = -(-config.cta_tile_m // 128) * 128 * sf_k
+            sfb_bytes = -(-config.cta_tile_n // 128) * 128 * sf_k
+            per_stage = chain.num_a_operands * (config.cta_tile_m * kb + sfa_bytes) + chain.num_b_operands * (config.cta_tile_n * kb + sfb_bytes) + 16
+            if chain.has_moe and chain.moe.mode == "gather":
+                # 32 B per routed token row of the tile, per token operand (the
+                # token is B after the swap-AB lowering).
+                swapped = isinstance(chain.moe, MoeSwapAbSpec)
+                staging += (config.cta_tile_n if swapped else config.cta_tile_m) * 32 * (chain.num_b_operands if swapped else chain.num_a_operands)
+        else:
+            _m, cta_smem_n, _k = config.cta_smem_tile_mnk(DTYPE_BYTES[chain.matmul.a_dtype])
+            per_stage = (chain.num_a_operands * config.cta_tile_m + chain.num_b_operands * cta_smem_n) * config.cta_tile_k_bytes + 16
         return smem_ab_stages(per_stage, smem_fixed_reserve=self.smem_fixed_reserve, extra_smem_bytes=staging), per_stage, staging
 
     def multi_gemm_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
@@ -576,22 +602,76 @@ class Sm120KernelTemplate(KernelTemplate):
         staging has to fit. ``None`` when it fits or the chain is a single GEMM.
         Register pressure is deliberately not a reason here: spilling is a perf
         trade-off, never grounds to disable a plan. Asked by the funnel
-        (``_extra_reject``) and by the sm120 renderer
-        (``_render_tile_constants``), so both agree."""
+        (``_extra_reject``), the sm120 MoE prechecks and the sm120 renderers
+        (``_render_tile_constants`` / ``_render_block_scale_tile_constants``),
+        so all of them agree."""
         if not chain.is_multi_gemm:
             return None
         stages, per_stage, staging = self.multi_gemm_ab_stages(chain, config)
         if stages < 1:
+            tiles = f"{chain.num_a_operands} A + {chain.num_b_operands} B tiles" + (" with their scale-factor boxes" if self.block_scale else "")
+            # The block-scale K tile is pinned at 128 bytes (validate_block_scale_config_sm120).
+            advice = "pick a smaller CTA tile" if self.block_scale else "pick a smaller CTA tile or K"
             return (
-                f"one AB stage of {per_stage} B ({chain.num_a_operands} A + {chain.num_b_operands} B tiles) plus the "
+                f"one AB stage of {per_stage} B ({tiles}) plus the "
                 f"{staging}-B epilogue staging does not fit the SMEM budget of the sm120 multi-GEMM kernel; "
-                f"pick a smaller CTA tile or K"
+                f"{advice}"
             )
         return None
+
+    def gather_sf_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
+        """Why a block-scale MoE GATHER chain CANNOT run on this template with
+        ``config``: the producer repacks the tile's linear token scales into the
+        F8_128x4 stage in warp-wide passes of 32 SF words (the templates' TMA
+        warp, as ``tile_helpers.moe_gather_scales``), so the token tile's rows
+        times its 4-scale words per row must be a whole number of passes --
+        otherwise the stage is (partly) never written and the MMA reads stale
+        scales (mxfp8 at a 16-row token tile: 16 x 1 words). ``None`` when it
+        holds or the chain is not a block-scale GATHER. Asked by the funnel
+        (``_extra_reject``), the sm120 MoE block-scale precheck and the
+        block-scale renderer, so all of them agree; the templates keep an
+        import-time check as a backstop."""
+        if not (self.block_scale and chain.has_moe and chain.moe.mode == "gather"):
+            return None
+        bs = chain.block_scale
+        sf_k4 = config.cta_tile_k_bytes * 8 // (4 if bs.is_fp4 else 8) // bs.block_size // 4
+        swapped = isinstance(chain.moe, MoeSwapAbSpec)
+        token_rows, axis = (config.cta_tile_n, "N") if swapped else (config.cta_tile_m, "M")
+        if (token_rows * sf_k4) % 32:
+            return (
+                f"GATHER repacks the token scales in passes of 32 SF words, but the {token_rows}-row token tile "
+                f"(CTA {axis}) holds {token_rows * sf_k4} per K-tile ({sf_k4} per row); pick a wider token tile"
+            )
+        return None
+
+    def warp_layout_reject(self, config: TileConfig) -> str | None:
+        """Why this template cannot run ``config``'s warp layout. The producer
+        warps (TMA, scheduler, donors) hand their registers to the compute warps
+        with setmaxnreg, which acts on whole warpgroups, so the compute grid
+        must fill whole warpgroups and leave at least one producer warpgroup: 4
+        or 8 compute warps in the 12-warp block -- the only grids whose
+        232-register compute split also fits the CTA's register pool. Any other
+        grid would hang in setmaxnreg.inc instead of declining. Asked by the
+        funnel (``_extra_reject``) and by every JIT path (``active_reject``)."""
+        compute_warps = (config.cta_tile_m // config.warp_tile_m) * (config.cta_tile_n // config.warp_tile_n)
+        warps = self.warps_per_cta or config.warps_per_cta
+        if compute_warps % 4 or compute_warps + 4 > warps:
+            return (
+                f"{self.file}: {compute_warps} compute warps do not fill whole warpgroups beside a producer "
+                f"warpgroup (warps_per_cta={warps}); the register hand-off (setmaxnreg) needs a multiple of "
+                f"4 compute warps, at most warps_per_cta - 4"
+            )
+        return None
+
+    def active_reject(self, config: TileConfig, chain: FusionChain | None = None) -> str | None:
+        return super().active_reject(config, chain) or self.warp_layout_reject(config)
 
     def _extra_reject(self, chain: FusionChain, config: TileConfig) -> str | None:
         from .dtypes import DTYPE_BITS, DTYPE_BYTES
 
+        _wl = self.warp_layout_reject(config)
+        if _wl is not None:
+            return _wl
         mm = chain.matmul
         if mm.a_major == "m" and DTYPE_BITS[mm.a_dtype] not in (16, 8):
             return f"{self.file} loads MN-major operands with ldmatrix.trans (b16) / " f"ldmatrix.m16n16.trans.b8; {mm.a_dtype} A must be K-major"
@@ -615,10 +695,15 @@ class Sm120KernelTemplate(KernelTemplate):
                 return f"{self.file}: N-major B SMEM extent {cta_smem_n} is not a " f"whole number of {group}-element swizzle groups"
         if chain.output_dtype == "fp4_e2m1":
             return f"{self.file} does not support fp4 output"
-        if not self.block_scale:  # the block-scale template declines multi-GEMM by flag; its SMEM ring is sized elsewhere
+        try:
             _mg = self.multi_gemm_reject(chain, config)
-            if _mg is not None:
-                return f"{self.file}: {_mg}"
+        except NotImplementedError as e:  # no device to size the SMEM ring against (render-only / CI host)
+            return f"{self.file}: {e}"
+        if _mg is not None:
+            return f"{self.file}: {_mg}"
+        _gs = self.gather_sf_reject(chain, config)
+        if _gs is not None:
+            return f"{self.file}: {_gs}"
         from . import compiler as C
 
         try:
@@ -726,7 +811,30 @@ TEMPLATES: tuple[KernelTemplate, ...] = (
         # SFA block; A and SFA both addressed by coordinate.
         "sm120_moe_grouped_block_scale_matmul_fwd.py",
         graph_type=GraphType.MOE_BLOCK_SCALE,
-        supports_multi_gemm=False,
+        # Multi-GEMM as on the dense MoE kernel: one register accumulator per
+        # GEMM, each distinct operand's packed tile + SF box per stage; SMEM
+        # feasibility is `Sm120KernelTemplate.multi_gemm_reject`.
+        supports_multi_gemm=True,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        # The weight-by-token (swap-AB) lowering of the warp-MMA MoE kernel: the
+        # expert's weight is A (batched by expert), the routed token matrix is B
+        # (addressed by coordinate), and the routed groups partition N.
+        "sm120_moe_grouped_matmul_fwd_swap_ab.py",
+        graph_type=GraphType.MOE_SWAP_AB,
+        supports_multi_gemm=True,
+        template_cls=Sm120KernelTemplate,
+    ),
+    _mm(
+        # Its block-scale sibling: the weight and its per-expert SFA are A; the
+        # token and its segmented SFB are B, both addressed by coordinate, with
+        # the scheduler carrying each group's first SFB block.
+        "sm120_moe_grouped_block_scale_matmul_fwd_swap_ab.py",
+        graph_type=GraphType.MOE_BLOCK_SCALE_SWAP_AB,
+        # Multi-GEMM as on its non-swapped sibling (the weights are the distinct
+        # A operands after the swap); SMEM feasibility is `multi_gemm_reject`.
+        supports_multi_gemm=True,
         template_cls=Sm120KernelTemplate,
     ),
 )

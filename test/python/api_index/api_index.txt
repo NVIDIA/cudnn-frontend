@@ -378,6 +378,8 @@ cudnn.flex_attention.MaskPlan.debug_snapshot
 cudnn.flex_attention.MaskPlan.metadata
 cudnn.flex_attention.create_mask_plan
 cudnn.flex_attention.flex_attn_func
+cudnn.frost
+cudnn.frost.cutedsl_runtime_available
 cudnn.gated_attention_block
 cudnn.gated_attention_block.Fp4Format
 cudnn.gated_attention_block.Fp4Format.MXFP4
@@ -1430,6 +1432,7 @@ cudnn.sdpa.fwd.sdpa_fwd_wrapper_dsl_sm90
 cudnn.sdpa.fwd.sdpa_fwd_wrapper_sm80
 cudnn.sdpa.fwd.torch_op
 cudnn.sdpa.fwd.torch_op.sdpa
+cudnn.sdpa_capabilities
 cudnn.set_stream
 cudnn.tensor
 cudnn.tensor.get_alignment

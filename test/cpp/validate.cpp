@@ -4,6 +4,7 @@
  */
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -366,4 +367,143 @@ TEST_CASE("Rmsnorm forward without scale", "[graph][rmsnorm][validate]") {
 
     // Explicit INV_VARIANCE dims state the axes.
     REQUIRE(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, {4, 16, 1}).first->validate().is_good());
+}
+
+TEST_CASE("Rmsnorm and Layernorm backward without scale", "[graph][rmsnorm][layernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    auto packed = [](std::vector<int64_t> const& d) {
+        std::vector<int64_t> s(d.size(), 1);
+        for (int i = static_cast<int>(d.size()) - 2; i >= 0; i--) s[i] = s[i + 1] * d[i + 1];
+        return s;
+    };
+    std::vector<int64_t> const x_dim = {4, 16, 128}, stats_dim = {4, 16, 1};
+    auto make_graph = [] {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        return graph;
+    };
+    auto tensor = [&](std::shared_ptr<fe::graph::Graph>& graph, char const* name, std::vector<int64_t> const& d) {
+        return graph->tensor(fe::graph::Tensor_attributes().set_name(name).set_dim(d).set_stride(packed(d)));
+    };
+
+    // These used to dereference the null scale. The stats dims state the axes, so no scale is needed.
+    for (bool dbias : {false, true}) {
+        auto graph               = make_graph();
+        auto [DX, DScale, DBias] = graph->rmsnorm_backward(tensor(graph, "DY", x_dim),
+                                                           tensor(graph, "X", x_dim),
+                                                           nullptr,
+                                                           tensor(graph, "inv_var", stats_dim),
+                                                           fe::graph::Rmsnorm_backward_attributes().has_dbias(dbias));
+        DX->set_output(true);
+        REQUIRE(DScale == nullptr);
+        REQUIRE(DBias == nullptr);
+        // DBIAS needs a scale to take its dims from.
+        REQUIRE(graph->validate().get_code() == (dbias ? fe::error_code_t::INVALID_VALUE : fe::error_code_t::OK));
+        if (!dbias) REQUIRE(DX->get_dim() == x_dim);
+    }
+
+    auto graph = make_graph();
+    auto [DX, DScale, DBias] =
+        graph->layernorm_backward(tensor(graph, "DY", x_dim),
+                                  tensor(graph, "X", x_dim),
+                                  nullptr,
+                                  fe::graph::Layernorm_backward_attributes().set_saved_mean_and_inv_variance(
+                                      tensor(graph, "mean", stats_dim), tensor(graph, "inv_var", stats_dim)));
+    DX->set_output(true);
+    REQUIRE(DScale == nullptr);
+    REQUIRE(DBias == nullptr);
+    REQUIRE(graph->validate().is_good());
+    REQUIRE(DX->get_dim() == x_dim);
+}
+
+TEST_CASE("Layernorm forward with optional scale and bias", "[graph][layernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    // affine: 0 = scale only, 1 = bias only, 2 = neither (scale/bias over the last axis)
+    auto make = [](std::vector<int64_t> x_dim, fe::NormFwdPhase_t phase, int affine, std::vector<int64_t> stats_dim) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        auto packed = [](std::vector<int64_t> const& d) {
+            std::vector<int64_t> s(d.size(), 1);
+            for (int i = static_cast<int>(d.size()) - 2; i >= 0; i--) s[i] = s[i + 1] * d[i + 1];
+            return s;
+        };
+        auto X = graph->tensor(fe::graph::Tensor_attributes().set_name("X").set_dim(x_dim).set_stride(packed(x_dim)));
+        std::vector<int64_t> affine_dim(x_dim.size(), 1);
+        affine_dim.back() = x_dim.back();
+        auto make_affine  = [&](char const* name) {
+            return graph->tensor(
+                fe::graph::Tensor_attributes().set_name(name).set_dim(affine_dim).set_stride(packed(affine_dim)));
+        };
+        std::shared_ptr<fe::graph::Tensor_attributes> scale = affine == 0 ? make_affine("scale") : nullptr;
+        std::shared_ptr<fe::graph::Tensor_attributes> bias  = affine == 1 ? make_affine("bias") : nullptr;
+        auto epsilon                                        = graph->tensor(1e-5f);
+        auto options            = fe::graph::Layernorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        auto [Y, mean, inv_var] = graph->layernorm(X, scale, bias, options);
+        Y->set_output(true);
+        for (auto const& T : {mean, inv_var}) {
+            if (!T) continue;
+            T->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+            if (!stats_dim.empty()) T->set_dim(stats_dim).set_stride(packed(stats_dim));
+        }
+        return std::make_tuple(graph, mean, inv_var);
+    };
+
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        // Scale without bias (LayerNorm(bias=False)). This used to dereference the null bias.
+        auto [graph, mean, inv_var] = make({4, 16, 128}, phase, 0, {});
+        REQUIRE(graph->validate().is_good());
+        if (inv_var) REQUIRE(inv_var->get_dim() == std::vector<int64_t>{4, 16, 1});
+
+        // The backend refuses a bias without a scale; say so before it does.
+        REQUIRE(std::get<0>(make({4, 16, 128}, phase, 1, {}))->validate().get_code() ==
+                fe::error_code_t::INVALID_VALUE);
+
+        // Neither: unambiguous with one non-unit axis after the first, refused otherwise (as for rmsnorm).
+        auto [plain, plain_mean, plain_inv_var] = make({64, 128, 1, 1}, phase, 2, {});
+        REQUIRE(plain->validate().is_good());
+        if (plain_inv_var) REQUIRE(plain_inv_var->get_dim() == std::vector<int64_t>{64, 1, 1, 1});
+        REQUIRE(std::get<0>(make({4, 16, 128}, phase, 2, {}))->validate().get_code() ==
+                fe::error_code_t::INVALID_VALUE);
+    }
+
+    // Explicit stats dims state the axes.
+    REQUIRE(std::get<0>(make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, 2, {4, 16, 1}))->validate().is_good());
+
+    // Dims set on one stat are enough: the other takes them. Stats with different dims are refused.
+    for (int set_mean : {0, 1}) {
+        auto [graph, mean, inv_var] = make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, 2, {});
+        (set_mean ? mean : inv_var)->set_dim({4, 16, 1}).set_stride({16, 1, 1});
+        REQUIRE(graph->validate().is_good());
+        REQUIRE(mean->get_dim() == std::vector<int64_t>{4, 16, 1});
+        REQUIRE(inv_var->get_dim() == std::vector<int64_t>{4, 16, 1});
+    }
+    for (int affine : {0, 2}) {
+        auto [graph, mean, inv_var] = make({4, 16, 128}, fe::NormFwdPhase_t::TRAINING, affine, {});
+        mean->set_dim({4, 16, 1}).set_stride({16, 1, 1});
+        inv_var->set_dim({4, 1, 1}).set_stride({1, 1, 1});
+        REQUIRE(graph->validate().get_code() == fe::error_code_t::INVALID_VALUE);
+    }
+}
+
+TEST_CASE("AdaLayernorm forward without bias", "[graph][adalayernorm][validate]") {
+    namespace fe = cudnn_frontend;
+
+    for (auto phase : {fe::NormFwdPhase_t::INFERENCE, fe::NormFwdPhase_t::TRAINING}) {
+        auto graph = std::make_shared<fe::graph::Graph>();
+        graph->set_io_data_type(fe::DataType_t::FLOAT).set_compute_data_type(fe::DataType_t::FLOAT);
+        auto X = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("X").set_dim({4, 16, 128}).set_stride({16 * 128, 128, 1}));
+        auto scale = graph->tensor(
+            fe::graph::Tensor_attributes().set_name("scale").set_dim({4, 1, 128}).set_stride({128, 128, 1}));
+        auto epsilon = graph->tensor(1e-5f);
+        auto options = fe::graph::AdaLayernorm_attributes().set_forward_phase(phase).set_epsilon(epsilon);
+        // The Python binding has always defaulted bias to None; the C++ node used to dereference it.
+        auto [Y, mean, inv_var] = graph->adalayernorm(X, scale, nullptr, options);
+        Y->set_output(true);
+        if (mean) mean->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+        if (inv_var) inv_var->set_output(true).set_data_type(fe::DataType_t::FLOAT);
+        REQUIRE(graph->validate().is_good());
+    }
 }

@@ -116,10 +116,14 @@ measured packed-GQA paged prefill contract. Selected native splits retain
 priority. Dense graphs (no THD, paging, window or sink), measured 2026-10-08 on a gr100 board
 (216 SMs) against public cuDNN 9.27.0.42, 620 cases (decode, chunked prefill, squares, d512
 envelope, random hold-out); develop led none of them (mean regret 116%):
-- ``2 <= s_q <= 16``: d192/d256/d512 lead (0.04-0.75; the backend runs these 2-10x slower);
-  d64/d128 lead at one KV unit or <= 8 units with >= 8k KV (0.07-0.63), 64+ units lose 1.1-1.6x.
+- ``2 <= s_q <= 16``: every flavor leads. d192/d256/d512 0.04-0.75 (the backend runs these 2-10x slower);
+  d64/d128 0.02-0.93 on the shared decode tile (#1484; re-measured 2026-10-09, 144 cases, causal and mask-free,
+  s_q 2-16, 1-512 KV units, 2k-128k KV), where the 2026-10-08 sweep on the Rubin body had 64+ units losing.
 - prefill: d512 and its envelope lead (0.08-0.67); chunks of <= 128 Q tiles from a 4k cache lead
-  (d64-d256, 0.04-1.00). Squares and wider chunks are mixed (up to 1.98x) -> TRAIL.
+  (d64-d256, 0.04-1.00); a causal d64/d128 graph whose decode-tile launch fits one wave leads, with or
+  without a sink (_d128_one_decode_tile_wave, shared with SM100; issue #1518). Other squares and wider chunks are
+  mixed (up to 1.98x) -> TRAIL. Over the 386-case 2026-10-09 d64/d128 set the mean regret is 1.8%
+  (develop placement 179.5%), with no lead slower than 1.03x warm or cold.
 - ``s_q == 1`` keeps the backend (d64/d128/d256/d512 1.6-25x; d192 mixed).
 New mean regret 3.2%, no lead slower than 1.03x warm or cold. The board's timing is noisy for the
 first arm measured (FROST), which biases these ratios against FROST. The per-tensor FP8
@@ -240,8 +244,6 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
-SM107_DECODE_SHAPED_MAX_UNITS = 8  # 2 <= s_q <= 16, d64/d128: b * h_kv above this lost to the backend
-SM107_DECODE_SHAPED_MIN_KV_TOKENS = 8192  # ... and at 8 units a 2k cache is parity (0.91-1.06)
 SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
 
@@ -294,6 +296,19 @@ def place(spec, facts) -> str:
     return LEAD
 
 
+def _d128_one_decode_tile_wave(caps: Capabilities, facts) -> bool:
+    """Causal dense d64/d128 prefill whose decode-tile launch fits one wave (heuristics.d128_dense_waves), sink or not.
+
+    B200 / B300 / cc 10.7, cuDNN 9.27, 2026-10-09 (issue #1518): the first FROST plan ran 0.03-0.88 of the backend's, warm and
+    cold, on all 146 qualifying cases (79 A/B, 67 candidate audit); windows and right bands were not measured."""
+    from .heuristics import d128_dense_waves
+
+    if facts.s_q <= DECODE_SHAPED_MAX_S_Q or not facts.causal or facts.window_left is not None or facts.right_band_widening:
+        return False
+    waves = d128_dense_waves(caps, facts)
+    return waves is not None and waves[0] == 1
+
+
 def _place_sm107_f16(caps: Capabilities, facts) -> str:
     from .heuristics import _prefer_paged_d256_lpt, _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_d256_prefix_launch, paged_thd_split_choice
 
@@ -325,15 +340,13 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     # Share the qualified prefix envelope with candidate generation.
     if paged_d256_prefix_launch(caps, facts) is not None or nonpaged_thd_split_choice(caps, facts)[0] > 1 or paged_thd_split_choice(caps, facts)[0] > 1:
         return LEAD
+    if _d128_one_decode_tile_wave(caps, facts):
+        return LEAD
     if not (facts.thd or facts.has_paged_kv or facts.has_sink) and facts.window_left is None:
         # Dense, measured on a gr100 board (216 SMs) against cuDNN 9.27 (2026-10-08).
         flavor = _selected_d_shape(caps, facts)
         if 2 <= facts.s_q <= DECODE_SHAPED_MAX_S_Q:
-            if flavor in ((192, 128), (256, 256), (512, 512)):
-                return LEAD  # 0.04-0.75 of the backend
-            units = facts.b * facts.h_kv
-            if units == 1 or (units <= SM107_DECODE_SHAPED_MAX_UNITS and facts.s_kv >= SM107_DECODE_SHAPED_MIN_KV_TOKENS):
-                return LEAD  # d64/d128: 0.07-0.63; 64+ units lost 1.1-1.6x
+            return LEAD  # d192-d512 0.04-0.75 of the backend; d64/d128 on the decode tile 0.02-0.93 (144 cases)
         elif facts.s_q > DECODE_SHAPED_MAX_S_Q:
             if flavor == (512, 512):
                 return LEAD  # d512 and its d320-d448 envelope: 0.08-0.67
@@ -482,7 +495,7 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
             return TRAIL
         return TRAIL  # d64 / d128 / d192: the backend decode engine is ahead (1.04-2.4x)
     # prefill-shaped
-    if _in_paged_d256_prefill_domain(facts):
+    if _in_paged_d256_prefill_domain(facts) or _d128_one_decode_tile_wave(caps, facts):
         return LEAD
     if (
         facts.thd

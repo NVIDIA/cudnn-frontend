@@ -72,6 +72,25 @@ for _optional_symbol in [
         globals()[_optional_symbol] = getattr(_pybind_module, _optional_symbol)
 
 
+def sdpa_capabilities() -> frozenset:
+    """Names of the SDPA binding capabilities this build of cudnn-frontend provides, as a frozenset of ``str``.
+
+    Each name ``<cap>`` is a ``supports_<cap>`` flag of the native SDPA binder (``_SdpaThdBinder``): a packed (THD)
+    split or stride contract the compiled extension honors -- ``"stats_stride_override"``, ``"nonpaged_packed_split"``,
+    ``"paged_split_sink"``, ... A caller that needs one asks ``"<cap>" in cudnn.sdpa_capabilities()``; the binder's
+    flags stay as they are, so a caller written against them keeps working. The set is append-only: a capability is
+    never renamed or removed. Empty on a build without the binder. Host Python only: no device, no framework import.
+    """
+    binder = getattr(_pybind_module, "_SdpaThdBinder", None)
+    if binder is None:
+        return frozenset()
+    names = []
+    for attr in dir(binder):
+        if attr.startswith("supports_") and getattr(binder, attr, False) is True:
+            names.append(attr[len("supports_") :])
+    return frozenset(names)
+
+
 from ._handle import Handle, DeviceInfo
 
 # Type alias for the annotations that reference ``cudnn.handle`` (a supplied handle
@@ -314,6 +333,7 @@ _EAGER_PUBLIC_NAMES = (
     "graph",
     "jit",
     "graph_cache",
+    "sdpa_capabilities",
 )
 __all__ = [*_EAGER_PUBLIC_NAMES, "Graph", "wrapper"]
 

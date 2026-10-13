@@ -192,6 +192,16 @@ class pygraph:
     All graph structure and attributes are kept in Python. C++ is only
     used for execution via lazy lowering.
 
+    Two constructor arguments are statements about the CALLER, not graph
+    properties, and integrations pass them: ``is_override_shape_enabled``
+    (the graph will execute with shape / stride overrides; forwarded to the
+    backend graph) and the keyword-only ``is_cuda_graph_replay_expected``
+    (``execute`` is captured into a CUDA graph and replayed, so the python
+    engines' heuristics may lead with the plan that is fastest on the GPU
+    alone; never forwarded to the backend, changes no numerics). After
+    planning, ``selected_engine`` and ``backend_plan_entries()`` report which
+    side serves the graph -- see their docstrings.
+
     Example:
         >>> graph = pygraph(io_data_type=cudnn.data_type.HALF)
         >>> A = graph.tensor(dim=[8, 64, 128], name="A")
@@ -368,6 +378,15 @@ class pygraph:
     def selected_engine(self) -> Optional["BaseEngine"]:
         """The python engine for the currently selected plan entry, or None for
         the backend path. Populated after create_execution_plans().
+
+        Public API, read by integrations after planning: ``None`` means the
+        cuDNN backend serves the selected entry; otherwise ``.name`` is the
+        engine's manifest name (``sdpa_fwd_prefill_sm100`` /
+        ``sdpa_fwd_prefill_sm107`` / ``sdpa_fwd_prefill_sm120``, ...), a stable
+        identifier -- manifest names and slots are append-only, never renamed
+        or reused -- so a caller may compare against one.
+        ``get_plan_name_at_index`` reports the same name with the plan's
+        public knobs appended in brackets.
 
         Cached, because ``execute()`` asks on every call and answering means
         walking every registered engine for the one declaring this id, re-deriving
@@ -921,15 +940,19 @@ class pygraph:
                 if spec_entry:
                     _, spec = spec_entry
                     infer = spec.get("infer", {})
+                    # builder-time dims of a "reinfer" port are provisional: they depend on a sibling the caller may set later
+                    reinfer = spec.get("reinfer", ())
                     for oport, out_t in node.outputs.items():
-                        if out_t is not None and not out_t.dim:
+                        if out_t is not None and (not out_t.dim or (oport in reinfer and not out_t.dim_assigned)):
                             try:
                                 d = infer.get(oport, lambda n: None)(node)
                             except Exception:  # noqa: BLE001 — best-effort
                                 d = None
                             if d:
+                                reinferred = bool(out_t.dim)
                                 out_t.dim = list(d)
-                                out_t.stride = _row_major_stride(out_t.dim)
+                                if not (reinferred and out_t.stride_assigned):  # a re-inferred port keeps the caller's stride
+                                    out_t.stride = _row_major_stride(out_t.dim)
                 node.validate()
         except ValueError:
             # Inference can reject shapes before the family validator runs
@@ -1257,6 +1280,13 @@ class pygraph:
     def backend_plan_entries(self) -> List[Any]:
         """The backend's own ranked ``(engine_id, knobs)`` recommendation, as
         PlanConfig entries carrying their C++ plan index.
+
+        Public API: an integration that must keep the cuDNN backend reachable
+        for a graph (a Stats layout only the backend serves everywhere) asks
+        this after ``create_execution_plans()`` and reads ``[]`` as "the
+        backend does not serve it" -- the answer is the backend's own (or the
+        family's recorded backend guard), independent of which python engines
+        are offered.
 
         Returns [] for the two things that legitimately mean "no backend entries":
         the backend DECLINED the graph (``cudnnGraphNotSupportedError``) or is not
@@ -2884,6 +2914,8 @@ _install_pointwise_builders()
 #                      whose predicate is False is skipped, and comes back None)
 #   infer              per-output IR-side shape inference (introspection; cuDNN
 #                      re-infers at build) — best-effort, None on failure
+#   reinfer            output ports whose builder-time inferred dims validate()
+#                      recomputes (they follow a sibling the caller may set later)
 #   dtype_like         per-output data_type copied from a named input port
 #   push_output_dims   True for ops whose output dims cuDNN cannot infer
 #                      (dgrad/wgrad/reduction/reshape/...): IR dims are pushed
@@ -3036,7 +3068,15 @@ def _norm_stats_like(first_axis):  # the C++ node's rule: input dims, 1 wherever
     return infer
 
 
-_NORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(0), "inv_var": _norm_stats_like(0)}
+def _layernorm_stat_like(other):  # the C++ layernorm node's rule: an unset stat takes the dims set on the other one
+    def infer(node):
+        t = node.outputs.get(other)
+        return list(t.dim) if t is not None and t.dim_assigned and t.dim else _norm_stats_like(0)(node)
+
+    return infer
+
+
+_NORM_FWD_INFER = {"Y": _like("input"), "mean": _layernorm_stat_like("inv_var"), "inv_var": _layernorm_stat_like("mean")}
 _ADANORM_FWD_INFER = {"Y": _like("input"), "mean": _norm_stats_like(1), "inv_var": _norm_stats_like(1)}
 _NORM_BWD_INFER = {"DX": _like("input"), "DScale": _like("scale"), "DBias": _like("scale")}
 
@@ -3047,6 +3087,11 @@ def _training_phase(node):  # norm stats exist only in TRAINING forward phase
 
 
 _NORM_FWD_MAYBE = {"mean": _training_phase, "inv_var": _training_phase}
+
+
+def _has_scale(node):  # rmsnorm/layernorm backward without a scale have no DScale or DBias (#188)
+    return node.inputs.get("scale") is not None
+
 
 _STRUCTURED_OPS = {
     # ---- norms --------------------------------------------------------------
@@ -3066,7 +3111,7 @@ _STRUCTURED_OPS = {
         # classic rmsnorm_backward names its outputs ::Dscale/::Dbias (mixed
         # case), unlike the other norm backwards (::DSCALE/::DBIAS)
         out_suffix={"DScale": "Dscale", "DBias": "Dbias"},
-        maybe={"DBias": lambda n: n.params.get("has_dbias", True) is not False},
+        maybe={"DScale": _has_scale, "DBias": lambda n: _has_scale(n) and n.params.get("has_dbias", True) is not False},
         infer=_NORM_BWD_INFER,
     ),
     "layernorm": dict(
@@ -3076,11 +3121,13 @@ _STRUCTURED_OPS = {
         outputs=("Y", "mean", "inv_var"),
         maybe=_NORM_FWD_MAYBE,
         infer=_NORM_FWD_INFER,
+        reinfer=("mean", "inv_var"),
     ),
     "layernorm_backward": dict(
         node_type=NodeType.LAYERNORM_BWD,
         inputs=("grad", "input", "scale", "mean", "inv_variance"),
         outputs=("DX", "DScale", "DBias"),
+        maybe={"DScale": _has_scale, "DBias": _has_scale},
         infer=_NORM_BWD_INFER,
     ),
     "adalayernorm": dict(
@@ -3654,7 +3701,8 @@ def _install_structured_builders() -> None:
                 kwargs[ak] = v
             args = args[:n_p]
             for port, v in zip(input_ports, args):
-                node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
+                if v is not None:  # an optional port passed positionally as None (e.g. scale, #188)
+                    node.inputs[port] = self._ensure_tensor(v, name=f"{name_}::{port}")
             for port in input_ports[len(args) :]:
                 v = kwargs.pop(port, None)
                 if v is not None:

@@ -97,7 +97,11 @@ NUM_WARPS = threads_per_cta // 32
 NUM_CLC_CONSUMER_WARPS = NUM_COMPUTE_WARPS + 2
 
 EPI_REG_COUNT = 232
+# One budget for the whole producer warpgroup (TMA, scheduler and donor warps).
+# PTX setmaxnreg is .sync.aligned over the warpgroup: it is issued once, before
+# the per-warp roles diverge, so the count cannot differ per warp.
 PROD_REG_COUNT = 24
+assert NUM_COMPUTE_WARPS % 4 == 0, "the producer warps must form whole warpgroups"
 
 # ---------------------------------------------------------------------------
 # Geometry derived from the injected tile constants (all plain Python ints --
@@ -324,12 +328,6 @@ def _kernel(
             nvvm.prefetch_tensormap(tma_b_descs[_j].get_ptr())
             nvvm.prefetch_tensormap(tma_sfb_descs[_j].get_ptr())
 
-    # First tile from the launch grid (grid == tile grid); later tiles come
-    # from canceled-CTA ids delivered through the CLC response ring.
-    swizzle_w = _auto_swizzle_w(m, n, k, gridy)
-    init_tile_m, init_tile_n = _l2_swizzle_tile(bidx, bidy, gridx, gridy, swizzle_w)
-    init_tile_l = bidz
-
     ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
     ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
 
@@ -433,14 +431,19 @@ def _kernel(
 
     M = m
     N = n
-    num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
+
+    # -- Producer warpgroup ---------------------------------------------------
+    # Warps NUM_COMPUTE_WARPS.. (TMA, scheduler, donors) are whole warpgroups:
+    # release their registers once, warpgroup-uniformly, before the roles below
+    # diverge per warp. Donor warps have no further role and simply exit.
+    if warp_idx >= NUM_COMPUTE_WARPS:
+        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
 
     # -- CLC scheduler warp ---------------------------------------------------
     # fort's scheduler warp: wait empty(slot) -> arm 16 tx bytes -> try_cancel
     # into the slot -> wait full(slot) -> read validity -> arrive empty. No
     # cluster: every CTA is its own leader and the response is CTA-local.
     if warp_idx == SCHEDULER_WARP_ID:
-        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
         sched_iter = cutlass.Int32(0)
         clc_empty_phase = cutlass.Int32(1)
         clc_full_phase = cutlass.Int32(0)
@@ -478,7 +481,14 @@ def _kernel(
 
     # -- TMA producer warp ----------------------------------------------------
     if warp_idx == TMA_WARP_ID:
-        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
+        # First tile from the launch grid (grid == tile grid); later tiles come
+        # from canceled-CTA ids delivered through the CLC response ring. Derived
+        # per role, after its setmaxnreg: a value computed before the register
+        # hand-off and live across it is spilled to local memory.
+        swizzle_w = _auto_swizzle_w(m, n, k, gridy)
+        init_tile_m, init_tile_n = _l2_swizzle_tile(bidx, bidy, gridx, gridy, swizzle_w)
+        init_tile_l = bidz
+        num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
         ab_empty_phase_bit = cutlass.Int32(1)
@@ -627,6 +637,14 @@ def _kernel(
     # -- Compute warps: block-scaled mma.sync mainloop + epilogue ------------
     if warp_idx < NUM_COMPUTE_WARPS:
         nvvm.setmaxregister(EPI_REG_COUNT, nvvm.SetMaxRegisterAction.INCREASE)
+        # First tile from the launch grid (grid == tile grid); later tiles come
+        # from canceled-CTA ids delivered through the CLC response ring. Derived
+        # per role, after its setmaxnreg: a value computed before the register
+        # hand-off and live across it is spilled to local memory.
+        swizzle_w = _auto_swizzle_w(m, n, k, gridy)
+        init_tile_m, init_tile_n = _l2_swizzle_tile(bidx, bidy, gridx, gridy, swizzle_w)
+        init_tile_l = bidz
+        num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
 
@@ -667,6 +685,13 @@ def _kernel(
         tile_iter = cutlass.Int32(0)
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
+        # Tile-invariant (scalar) reductions fold every epilogue vector into one
+        # register slot per thread; the red_part_* helpers, rendered with the tile
+        # constants (empty when the chain has none), seed the slots here and flush
+        # them -- one warp shuffle and one atomic per warp -- after each tile's
+        # drain and after the tile loop, where all 32 lanes are converged.
+        _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
+        red_part_seed(_red_part)
         while is_valid != 0:
             coord_m = tile_m * cgrp_tile_mnk[0]
             coord_n = tile_n * cgrp_tile_mnk[1]
@@ -891,12 +916,14 @@ def _kernel(
                                             vec_f32 = _pf + cutlass.full_like(_pf, 0.0)
                                         else:
                                             vec_f32 = _vec
-                                        linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                                        # Every store carries its own output's offset: no template-level
+                                        # linear_idx, so a reduction-only chain (no output 0) renders.
 
                                         # @@INJECT_STG_VEC_BINDINGS@@
 
                                         # @@INJECT_EPILOGUE@@
                     nvvm.bar_warp_sync(0xFFFFFFFF)
+            red_part_flush_tile(_red_part, lane, M, N, (tile_l,), _red_part_args)
 
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
@@ -918,6 +945,7 @@ def _kernel(
 
             tile_iter += 1
 
+        red_part_flush_cta(_red_part, lane, M, N, (tile_l,), _red_part_args)
         # No more tiles for this CTA: all its global A/B reads have been issued
         # (fort fires launch_dependent_grids at the same point).
         # Dense only: an early-launched reducer would pile its many small CTAs
@@ -926,10 +954,6 @@ def _kernel(
             if warp_idx == 0:
                 if elect_one:
                     nvvm.griddepcontrol("launch_dependents")
-
-    # -- Unused donor warps ---------------------------------------------------
-    if warp_idx > SCHEDULER_WARP_ID:
-        nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1112,6 +1136,15 @@ def _host(
         block=(threads_per_cta, 1, 1),
         use_pdl=USE_PDL,
         stream=stream,
+        # .minnctapersm 1. With .reqntid alone ptxas cannot tell the register
+        # count at entry, so it drops every setmaxnreg above (C7508): the compute
+        # warps never get EPI_REG_COUNT, and ptxas may also size every warp for
+        # several CTAs per SM (the dual MoE kernels fell to 40 registers). The
+        # SMEM ring is sized to the per-CTA budget, so one CTA per SM is all that
+        # fits anyway -- except the two smallest catalog tiles (32x64 / 64x32 at
+        # a 32-byte K, whose ring caps at 16 stages), which now run one per SM
+        # instead of two.
+        min_blocks_per_mp=1,
     )
 
     # @@SPLITK_ONLY:BEGIN@@
