@@ -10,6 +10,7 @@ bytes.  Inputs come from seeded generators, so the two processes see identical o
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import sys
@@ -231,9 +232,12 @@ SITES = {
     "fork_bf16": fork_bf16,
     "fork_fp8": fork_fp8,
     "fork_mxfp8": fork_mxfp8,
-    "cache_write_kv": lambda: cache_write("kv"),
-    "cache_write_index": lambda: cache_write("index"),
 }
+# the serving cache-write kernel is a separate change: its two arms exist exactly where the module is in the tree (the parent test
+# guards its expectations the same way), so a run with no site names never asks a tree for a kernel it does not carry
+if importlib.util.find_spec("cudnn.gated_attention_block.kernels.cache_write") is not None:
+    SITES["cache_write_kv"] = lambda: cache_write("kv")
+    SITES["cache_write_index"] = lambda: cache_write("index")
 
 
 def main() -> int:

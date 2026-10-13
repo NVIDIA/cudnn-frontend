@@ -33,7 +33,6 @@ if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
 from cudnn.frost import compiled_cache as cc  # noqa: E402
-from cudnn.gated_attention_block.kernels import cache_write as kern_cw  # noqa: E402
 from cudnn.gated_attention_block.kernels import elementwise as kern_ew  # noqa: E402
 from cudnn.gated_attention_block.kernels import proj_gemm as kern_pg  # noqa: E402
 from cudnn.gated_attention_block.kernels import qk_norm_rope_tma as kern_tma  # noqa: E402
@@ -41,16 +40,26 @@ from cudnn.gated_attention_block.kernels import qk_norm_rope_tma as kern_tma  # 
 pytestmark = pytest.mark.L0
 requires_rubin = pytest.mark.requires_rubin  # the suite conftest's registered marker: an accept test, skipped off SM107
 
+# The serving cache-write kernel (``kernels/cache_write.py``, the paged-KV serving form's write-through) is a separate change: its
+# site is pinned here exactly where the module is in the tree and skipped BY NAME where it is not -- the pins turn on the day the
+# kernel lands and never leave this suite red on a tree without it.  The probe is the import itself, not a version or a flag.
+try:
+    from cudnn.gated_attention_block.kernels import cache_write as kern_cw  # noqa: E402
+except ImportError:  # the serving form's kernel is not in this tree
+    kern_cw = None
+requires_cache_write_kernel = pytest.mark.skipif(kern_cw is None, reason="kernels/cache_write.py (the serving cache-write kernel) is not in this tree")
+
 _KERNELS = Path(kern_ew.__file__).parent
 # file -> (the function tag template_key joins, the exported symbol)
 _SITES = {
     "elementwise.py": ("compile_elementwise_gate", "cudnn_block_elementwise_gate"),
     "qk_norm_rope_tma.py": ("compile_qk_norm_rope_tma", "cudnn_block_qk_norm_rope_tma"),
-    "cache_write.py": ("compile_cache_write", "cudnn_block_cache_write"),
     "proj_gemm_norm_rope.py": ("compile", "frost_gemm_norm_rope"),
     "proj_gemm_norm_rope_fp8.py": ("compile", "frost_gemm_norm_rope_fp8"),
     "proj_gemm_norm_rope_mxfp8.py": ("compile", "frost_gemm_norm_rope_mxfp8"),
 }
+if kern_cw is not None:
+    _SITES["cache_write.py"] = ("compile_cache_write", "cudnn_block_cache_write")
 _CHILD = str(Path(__file__).with_name("block_compiled_cache_child.py"))
 # every arm the child runs; the elementwise, TMA and cache-write arms share their module's symbol, each is its own compiled object
 _CHILD_SITES = (
@@ -63,9 +72,7 @@ _CHILD_SITES = (
     "fork_bf16",
     "fork_fp8",
     "fork_mxfp8",
-    "cache_write_kv",
-    "cache_write_index",
-)
+) + (("cache_write_kv", "cache_write_index") if kern_cw is not None else ())
 
 
 @pytest.fixture(autouse=True)
@@ -100,12 +107,13 @@ def _stub_cute_compile(monkeypatch, calls):
 
 
 def test_every_block_compile_site_goes_through_the_compiled_plan_cache():
-    """No bare ``cute.compile(`` is left in the six kernel files; each passes ``compile_cached`` its key and symbol."""
+    """No bare ``cute.compile(`` is left in the kernel files (the five develop sites, plus the cache write where its module is in the
+    tree); each passes ``compile_cached`` its key and symbol."""
     for name, (tag, symbol) in _SITES.items():
         src = (_KERNELS / name).read_text()
         assert "cute.compile(" not in src, f"{name}: a bare cute.compile( site bypasses the compiled-plan cache"
         assert "compile_cached(" in src and f'symbol="{symbol}"' in src and f'"{tag}")' in src, f"{name}: the site must pass cache_key= and symbol={symbol!r}"
-    for mod in (kern_ew, kern_tma, kern_cw):
+    for mod in (m for m in (kern_ew, kern_tma, kern_cw) if m is not None):
         # imported normally, so each names its own source identity (the loader stamps the forks')
         assert mod.FROST_SOURCE_DIGEST == hashlib.sha256(Path(mod.__file__).read_bytes()).hexdigest()[:16]
 
@@ -145,6 +153,7 @@ def test_the_plain_modules_key_on_their_file_digest_and_the_memo_dict_key(monkey
     assert r.compiled is kern_tma.compiled_cache[key]
 
 
+@requires_cache_write_kernel
 def test_the_cache_write_site_keys_on_its_file_digest_and_the_memo_dict_key(monkeypatch):
     """``cache_write`` (the serving write-through) hands ``compile_cached`` ``template_key(globals(), {"key": <the dict key>},
     "compile_cache_write")`` -- the file digest, the tag, and exactly the Constexpr tuple the dict memoises under (the slot dtype and
