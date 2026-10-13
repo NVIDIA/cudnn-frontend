@@ -5,12 +5,12 @@
 
 One flavor ships today, the D512 body (``sm90/prefill_d512_f16.py``, with its
 native 128/256/512-column storage and the exact dense D64 body beside it);
-``pick_flavor`` and ``FLAVOR_TILES`` are the seams through which a dedicated
-D128 template joins (issue #378). The frozen ``TemplateParams`` record contains
-only graph declarations and selected tuning knobs. Runtime lengths, pointers,
-and packed token totals stay out of compile keys. Graph-adapter declaration
-logic lives with the adapter; this module keeps the small interface consumed by
-the native D64/D128/D256/D512 kernels.
+``pick_flavor``, ``FLAVOR_TILES`` and ``NOT_SERVED`` are the seams through which
+a dedicated D128 template joins (issue #378). The frozen ``TemplateParams``
+record contains only graph declarations and selected tuning knobs. Runtime
+lengths, pointers, and packed token totals stay out of compile keys.
+Graph-adapter declaration logic lives with the adapter; this module keeps the
+small interface consumed by the native D64/D128/D256/D512 kernels.
 """
 
 from __future__ import annotations
@@ -56,6 +56,42 @@ FLAVOR_TILES = {D512_FLAVOR: (TILE_M, TILE_N), D128_FLAVOR: (128, 128)}
 # serves every pair up to its tile (the engine row's floors are ROW decisions,
 # engines._sm90_spec).
 FLAVOR_FLOORS = {D128_FLAVOR: 127}
+# What a native flavor does not serve, by declared feature (declared_features' vocabulary),
+# with the label its refusal names. pick_flavor never selects a flavor for a declaration that
+# names one of its features, so such a declaration runs on the D512 body, which serves them
+# all; validate_params(flavor=...) refuses them with these labels, in this order.
+D128_NOT_SERVED = {
+    "thd": "THD (ragged) layouts",
+    "paged": "paged KV",
+    "split_kv": "split-KV",
+    "sink": "attention sinks",
+    "window_left": "a sliding window",
+    "window_right": "a widened right band",
+    "lengths": "per-batch lengths",
+    "pack_gqa": "PackGQA",
+}
+NOT_SERVED = {D128_FLAVOR: D128_NOT_SERVED}
+
+
+def declared_features(*, thd=False, sink=False, window_left=None, window_right=None, lengths=False, pack_gqa=False, paged=False, split_kv=1) -> frozenset[str]:
+    """The features one declaration names, in the vocabulary of ``NOT_SERVED``.
+
+    ``window_left`` is the sliding-window offset and ``window_right`` a widened right bound,
+    each None when absent; a ``window_right`` of 0 is plain causal and names nothing.
+    ``lengths`` is any per-batch Q or KV length tensor, ``paged`` a paged K/V pool and
+    ``split_kv`` the KV partition count (1, unsplit, names nothing).
+    """
+    named = (
+        ("thd", thd),
+        ("paged", paged),
+        ("split_kv", split_kv != 1),
+        ("sink", sink),
+        ("window_left", window_left is not None),
+        ("window_right", bool(window_right)),
+        ("lengths", lengths),
+        ("pack_gqa", pack_gqa),
+    )
+    return frozenset(feature for feature, on in named if on)
 
 
 def native_d64_mismatch(
@@ -93,19 +129,20 @@ def head_dims_mismatch(d_qk, d_v) -> str | None:
     return None
 
 
-def pick_flavor(d_qk: int, d_v: int, flavors: tuple[tuple[int, int], ...] = (D512_FLAVOR,)) -> tuple[int, int]:
-    """The template that serves a ``(d_qk, d_v)`` declaration, among ``flavors``.
+def pick_flavor(d_qk: int, d_v: int, flavors: tuple[tuple[int, int], ...] = (D512_FLAVOR,), declared: frozenset[str] = frozenset()) -> tuple[int, int]:
+    """The template that serves a ``(d_qk, d_v)`` declaration naming ``declared``, among ``flavors``.
 
     The smallest native flavor in ``flavors`` that covers the pair above its floor
-    (``FLAVOR_FLOORS``), else D512, the D512 body. Total: an out-of-envelope pair
-    still answers D512, and ``head_dims_mismatch`` declines it, so the adapter's
-    existing NotImplementedError is unchanged. ``flavors`` is the caller's pool (the
-    flavors with a template, ``api_dsl._SM90_KERNEL_FILES``, as
-    ``api_dsl._pick_flavor``'s ``candidates`` on the SM100 line); the default pool is
-    D512 alone, so every declaration selects D512.
+    (``FLAVOR_FLOORS``) and serves every declared feature (``NOT_SERVED``), else D512,
+    the D512 body. Total: an out-of-envelope pair still answers D512, and
+    ``head_dims_mismatch`` declines it, so the adapter's existing NotImplementedError is
+    unchanged. ``flavors`` is the caller's pool (the flavors with a template,
+    ``api_dsl._SM90_KERNEL_FILES``, as ``api_dsl._pick_flavor``'s ``candidates`` on the
+    SM100 line); the default pool is D512 alone, so every declaration selects D512.
+    ``declared`` is ``declared_features`` of the declaration.
     """
     for flavor in FLAVORS:
-        if flavor == D512_FLAVOR or flavor not in flavors:
+        if flavor == D512_FLAVOR or flavor not in flavors or declared & NOT_SERVED.get(flavor, {}).keys():
             continue
         if d_qk <= flavor[0] and d_v <= flavor[1] and min(d_qk, d_v) > FLAVOR_FLOORS.get(flavor, 0):
             return flavor
@@ -198,24 +235,25 @@ BAND_COORDINATE_LIMIT = 2**30
 def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVOR) -> None:
     """Validate the immutable specialization before constructing a kernel.
 
-    ``flavor`` names the template asking. D512 (the default, and the only caller
-    today) runs the checks below unchanged, messages included. D128 first refuses
-    what its kernel never serves (the declarations its tile declines), then runs the
-    same checks under its own name.
+    ``flavor`` names the template asking. D512 (the default) runs the checks below
+    unchanged, messages included. D128 first refuses its ``NOT_SERVED`` features (the
+    declarations pick_flavor keeps on D512, so the adapter never reaches this refusal),
+    then runs the same checks under its own name.
     """
     if flavor == D128_FLAVOR:
-        for refused, feature in (
-            (params.thd_varlen, "THD (ragged) layouts"),
-            (params.page_size != 0, "paged KV"),
-            (params.split_kv != 1, "split-KV"),
-            (params.has_sink, "attention sinks"),
-            (params.window_left is not None, "a sliding window"),
-            (params.window_right is not None, "a widened right band"),
-            (params.seq_q_lens_present or params.seq_kv_lens_present, "per-batch lengths"),
-            (params.pack_gqa, "PackGQA"),
-        ):
-            if refused:
-                raise ValueError(f"SM90 D128 does not serve {feature}; the D512 body (tile 64) serves such declarations")
+        declared = declared_features(
+            thd=params.thd_varlen,
+            sink=params.has_sink,
+            window_left=params.window_left,
+            window_right=params.window_right,
+            lengths=params.seq_q_lens_present or params.seq_kv_lens_present,
+            pack_gqa=params.pack_gqa,
+            paged=params.page_size != 0,
+            split_kv=params.split_kv,
+        )
+        for feature, label in D128_NOT_SERVED.items():
+            if feature in declared:
+                raise ValueError(f"SM90 D128 does not serve {label}; the D512 body (tile 64) serves such declarations")
     elif flavor != D512_FLAVOR:
         raise ValueError(f"SM90 has no {flavor} template; flavors: {sorted(FLAVORS)}")
     name = f"SM90 D{flavor[0]}"

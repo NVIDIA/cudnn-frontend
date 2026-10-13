@@ -151,10 +151,10 @@ def test_every_flavor_spelled_out_equals_the_defaults_on_every_shipped_row(monke
 # --- config_sm90: flavors, tiles and the template backstop -------
 
 
-def test_pick_flavor_answers_d512_until_d128_has_a_template():
-    """Over the default pool (D512 alone, which the adapter passes while _SM90_KERNEL_FILES has no
-    D128 entry) every declaration selects D512. Over the full pool D128 is picked at exactly
-    (128, 128), its floor of 127 as the row will declare it, and D512 everywhere else."""
+def test_pick_flavor_without_features_takes_d128_at_exactly_128():
+    """Over the default pool (D512 alone) every declaration selects D512. Over the full pool, with no
+    declared feature, D128 is picked at exactly (128, 128), its floor of 127 as the row will declare
+    it, and D512 everywhere else."""
     from cudnn.sdpa.fwd import config_sm90 as c
 
     pairs = [(a, b) for a in range(8, 513, 8) for b in range(8, 513, 8)]
@@ -163,6 +163,65 @@ def test_pick_flavor_answers_d512_until_d128_has_a_template():
     assert c.pick_flavor(520, 512, c.FLAVORS) == c.D512_FLAVOR, "total: head_dims_mismatch, not the picker, declines it"
     assert c.FLAVORS == (c.D128_FLAVOR, c.D512_FLAVOR)
     assert c.FLAVOR_TILES == {c.D512_FLAVOR: (c.TILE_M, c.TILE_N), c.D128_FLAVOR: (128, 128)}
+
+
+@pytest.mark.parametrize("feature", ["thd", "paged", "split_kv", "sink", "window_left", "window_right", "lengths", "pack_gqa"])
+def test_pick_flavor_keeps_each_not_served_feature_on_d512(feature):
+    """Decided once, up front: a (128, 128) declaration naming a feature D128 does not serve selects
+    D512 directly, with or without other features; one D128 serves selects D128."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    assert feature in c.D128_NOT_SERVED and c.NOT_SERVED[c.D128_FLAVOR] is c.D128_NOT_SERVED
+    assert c.pick_flavor(128, 128, c.FLAVORS, frozenset({feature})) == c.D512_FLAVOR
+    assert c.pick_flavor(128, 128, c.FLAVORS, frozenset({feature, "lengths"})) == c.D512_FLAVOR
+    assert c.pick_flavor(128, 128, c.FLAVORS, frozenset({"a_feature_d128_serves"})) == c.D128_FLAVOR
+
+
+def test_declared_features_spells_each_flag_once():
+    """Absent bounds and plain causal (a right bound of 0) name nothing; each other flag names itself."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    assert c.declared_features() == c.declared_features(window_left=None, window_right=0, split_kv=1) == frozenset()
+    assert c.declared_features(window_left=0) == {"window_left"}
+    assert c.declared_features(window_right=1) == {"window_right"}
+    named = c.declared_features(thd=True, sink=True, window_left=4, window_right=2, lengths=True, pack_gqa=True, paged=True, split_kv=2)
+    assert named == set(c.D128_NOT_SERVED)
+
+
+def test_d128_refusal_and_the_picker_read_one_table():
+    """validate_params(flavor=D128) refuses a specialization for a feature exactly when pick_flavor
+    keeps the same declaration on D512, so the D128 template's backstop never fires on the
+    adapter's path and never lets through what the picker would keep away."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    flags = dict(
+        thd_varlen=(False, True),
+        has_sink=(False, True),
+        window_left=(None, 16),
+        window_right=(None, 4),
+        seq_kv_lens_present=(False, True),
+        pack_gqa=(False, True),
+        page_size=(0, 64),
+        split_kv=(1, 2),
+    )
+    for values in itertools.product(*flags.values()):
+        params = dataclasses.replace(c.TemplateParams(), **dict(zip(flags, values)))
+        declared = c.declared_features(
+            thd=params.thd_varlen,
+            sink=params.has_sink,
+            window_left=params.window_left,
+            window_right=params.window_right,
+            lengths=params.seq_q_lens_present or params.seq_kv_lens_present,
+            pack_gqa=params.pack_gqa,
+            paged=params.page_size != 0,
+            split_kv=params.split_kv,
+        )
+        try:
+            c.validate_params(params, flavor=c.D128_FLAVOR)
+            refused = False
+        except ValueError as exc:
+            refused = str(exc).startswith("SM90 D128 does not serve ")
+        assert refused == (c.pick_flavor(128, 128, c.FLAVORS, declared) == c.D512_FLAVOR), (values, declared)
 
 
 def test_d512_template_params_messages_are_unchanged():
