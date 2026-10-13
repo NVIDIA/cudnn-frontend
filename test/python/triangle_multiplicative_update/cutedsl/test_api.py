@@ -891,7 +891,7 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
                             1 if (stage, c, lnf, epm, order) in _BIAS_ON_ROWS else 0
                         ), "a bias-ON rendering is hinted only by its measured row (the exact form)"
                         assert th.register_split_hint(stage, c, False, lnf, epm, order) in MIN_BLOCKS_PER_MP_DOMAIN
-    for (stage, c, has_bias, lnf, epm, order), hint in th._REGISTER_SPLIT_HINTS.items():
+    for (stage, c, has_bias, lnf, epm, order, item), hint in th._REGISTER_SPLIT_HINTS.items():
         assert stage in ("k1", "k3") and c in (128, 256) and isinstance(has_bias, bool) and lnf in LN_PASS_FORMS and epm in EPI_MATHS and hint == 1, (
             stage,
             c,
@@ -899,11 +899,17 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
             lnf,
             epm,
             order,
+            item,
             hint,
         )
         # a K1 row names its tile order (the interleaved renderings spill 4 / 13 under the hint where the major ones carry none); a K3 row has none
         assert (order in PASS_ORDERS) if stage == "k1" else (order is None), (stage, order)
-        assert th.register_split_hint(stage, c, False, lnf, epm, order) == 1
+        # every row names the PER-TILE item: under the LayerNorm-once item the honoured split spills (the c 128 register form 0 / 0 -> 4 / 13, the
+        # rolled form 1 / 1 -> 9 / 15) and the whole call runs 0.5-1.3 % faster unhinted on every bias-off cell, within the noise with the biases
+        assert item == "", (stage, c, has_bias, lnf, epm, order, item)
+        assert th.register_split_hint(stage, c, has_bias, lnf, epm, order) == 1 and th.register_split_hint(stage, c, has_bias, lnf, epm, order, "") == 1
+        for other_item in ("block", "passes"):
+            assert th.register_split_hint(stage, c, has_bias, lnf, epm, order, other_item) == 0, (stage, c, has_bias, lnf, epm, order, other_item)
     # the measured rows (the A/B/A on the 212-SM Rubin perf-node class): the projection stage at c 128, bias off, pass-major tile order -- the
     # register form (+1.5..+1.8 % on the call) and the rolled form (+1.1..+1.2 %); the interleaved rolled renderings (-0.1..-0.7 %) and the
     # output stage at c 256 (its spill vanishes, its time does not move) are NOT rows
@@ -925,23 +931,42 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     assert th.register_split_hint("k1", 128, True, "registers", "packed_biasfold", "major") == 1
     assert th.register_split_hint("k3", 128, True, "registers", "packed_biasfold") == 0
     assert th.register_split_hint("k1", 128, True, "smem_rolled", "packed_biasfold", "major") == 0  # a rolled K1 with biases: inside the bar
-    # the API's wiring, GPU-free: a bare declaration hands the two stages the rule with THEIR bias flags (K1 its tile order), the knob overrides both
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=False)._register_split_hints() == (1, 0)
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=1024), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=True)._register_split_hints() == (1, 0)
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=False)._register_split_hints() == (1, 0)
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True)._register_split_hints() == (1, 0)
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=1024), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True)._register_split_hints() == (
+    # the API's wiring, GPU-free: a bare declaration hands the two stages the rule with THEIR bias flags, K1 its tile order AND its work item -- every
+    # c 128 pick from N = 256 carries the LayerNorm-once item, so a bare declaration runs UNHINTED there (no row names that item: its renderings
+    # spill under the hint and the whole call runs faster without it); the per-tile item (a caller's `ln_once=""`) keeps the measured rows; the knob
+    # `min_blocks_per_mp` overrides both stages
+    for N, hb_in, hb_out in ((512, False, False), (1024, False, True), (512, True, False), (512, True, True), (1024, True, True), (256, False, False)):
+        assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=N), "outgoing", c_hidden=128, has_in_bias=hb_in, has_out_bias=hb_out)._register_split_hints() == (
+            0,
+            0,
+        ), (N, hb_in, hb_out)
+    per_tile = tapi.TriMulKnobs(ln_once="")
+    assert tapi.TriangleMultiplicativeUpdateFwd(
+        _desc(N=512), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=False, knobs=per_tile
+    )._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(
+        _desc(N=1024), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=True, knobs=per_tile
+    )._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(
+        _desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=False, knobs=per_tile
+    )._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(
+        _desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True, knobs=per_tile
+    )._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(
+        _desc(N=1024), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True, knobs=per_tile
+    )._register_split_hints() == (
         0,
         0,
-    )  # rolled K1, packed K3
+    )  # rolled K1 with biases, packed K3: no row either item
     assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=200), "outgoing", c_hidden=128, has_in_bias=False)._register_split_hints() == (
         0,
         0,
-    )  # interleaved K1 (N < 256)
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256), "outgoing", c_hidden=128, has_in_bias=False)._register_split_hints() == (
+    )  # interleaved K1 (N < 256; the per-tile item): no row for the interleaved order
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256), "outgoing", c_hidden=128, has_in_bias=False, knobs=per_tile)._register_split_hints() == (
         1,
         0,
-    )  # major from N = 256 (the LayerNorm-once item): the rolled form's row
+    )  # major from N = 256 with the per-tile item: the rolled form's row
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=512, cz=256), "outgoing", c_hidden=256, has_in_bias=False, has_out_bias=False
     )._register_split_hints() == (0, 0)

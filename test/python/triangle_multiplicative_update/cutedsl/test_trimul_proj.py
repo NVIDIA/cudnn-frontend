@@ -460,12 +460,15 @@ print("EXPECT_K", kk)
 # shipped knobs (the pass-major order the lever requires).  Keyed (arm, K, ln_pass_form, has_bias, ln_once); the values are BOUNDS measured on the
 # branch's toolchain (nvdisasm of the trace-time cubin) like the tables above: the bias-off c_out 256 renderings sit at ptxas's flat 80-register
 # allocation (the two-CTAs-per-SM target) and spill a few words -- K1 2 / 2 (STACK 8; its production twin 0 / 0), K3 5 / 6 (STACK 24; the twin 0 / 0 at
-# REG 106) -- the register-split hint lifts that allocation where measured worth it; the bias-on twins and the c 128 renderings spill nothing (the K1 c 128
-# register-form twin's 1 / 1 at STACK 8 is GONE under the lever).  USETMAXREG 0 (the split dropped, as the twins), CGAERRBAR 0 (no non-relaxed cluster
-# arrive: the new a_empty commit is a tcgen05.commit, the release arrives the helpers').
+# REG 106) -- the register-split hint does NOT lift it worth the spills it adds (the table below); the bias-on twins and the c 128 register-form
+# renderings spill nothing (the K1 c 128 register-form twin's 1 / 1 at STACK 8 is GONE under the lever); the c 128 ROLLED bias-off rendering reads 1 / 1
+# at REG 80 / STACK 8 under the lever (its production twin 0 / 0 at REG 80), its bias-on twin 0 / 0 at REG 112.  USETMAXREG 0 (the split dropped, as the
+# twins), CGAERRBAR 0 (no non-relaxed cluster arrive: the new a_empty commit is a tcgen05.commit, the release arrives the helpers').
 _SASS_LN_ONCE_PINS = {
     ("k1", 128, "registers", False, "block"): dict(STL=0, LDL=0),
     ("k1", 128, "registers", True, "block"): dict(STL=0, LDL=0),
+    ("k1", 128, "smem_rolled", False, "block"): dict(STL=1, LDL=1),
+    ("k1", 128, "smem_rolled", True, "block"): dict(STL=0, LDL=0),
     ("k1", 256, "smem_rolled_pf", False, "block"): dict(STL=2, LDL=2),
     ("k1", 256, "smem_rolled_pf", True, "block"): dict(STL=0, LDL=0),
     ("k1", 256, "smem_rolled_pf", False, "passes"): dict(STL=1, LDL=1),
@@ -494,6 +497,50 @@ def test_sm107_ln_once_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, has
     )
     assert st["USETMAXREG"] == 0, f"{arm} K={k} ln_once={ln_once}: a REAL register split (USETMAXREG {st['USETMAXREG']}) -- re-measure the roles and the pins"
     assert st["CGAERRBAR"] == 0, f"{arm} K={k} ln_once={ln_once}: a non-relaxed cluster arrive (CGAERRBAR {st['CGAERRBAR']}) -- a GPU-scope drain per arrive"
+
+
+# The LayerNorm-once renderings UNDER the `.minnctapersm` hint (a caller's `min_blocks_per_mp=1`; the rule never hands the hint to the item --
+# `heuristics.register_split_hint` keys on `ln_once` and every measured row names the per-tile item): the honoured split (USETMAXREG 6) puts the
+# item's +4 live words of the 24-register producer roles on the stack -- MEASURED on the branch's toolchain like the tables above: the c 128 register
+# form 4 / 13 (STACK 16; 0 / 0 unhinted), the rolled form 9 / 15-16 (STACK 24; 1 / 1 and 0 / 0 unhinted), the c 256 pf forms 9 / 16 (K1; 2 / 2 and 0 / 0
+# unhinted) and 25 / 26 at STACK 144 (K3; 5 / 6 and 0 / 0 unhinted) -- and the whole call runs 0.5-1.3 % FASTER unhinted on every bias-off c 128 cell
+# (within the noise with the biases; the c 256 forms lose 6-12 % standalone under the hint), which is why the rows stay with the per-tile item.  Keyed
+# (arm, K, ln_pass_form, epi_math, has_bias, min_blocks_per_mp, order, ln_once); the spill counts are BOUNDS, USETMAXREG is exact.
+_SASS_LN_ONCE_HINT_PINS = {
+    ("k1", 128, "registers", "packed", False, 1, "major", "block"): dict(STL=4, LDL=13, USETMAXREG=6),
+    ("k1", 128, "registers", "packed_biasfold", True, 1, "major", "block"): dict(STL=4, LDL=13, USETMAXREG=6),
+    ("k1", 128, "smem_rolled", "packed", False, 1, "major", "block"): dict(STL=9, LDL=15, USETMAXREG=6),
+    ("k1", 128, "smem_rolled", "packed", True, 1, "major", "block"): dict(STL=9, LDL=16, USETMAXREG=6),
+    ("k1", 256, "smem_rolled_pf", "packed", False, 1, "major", "block"): dict(STL=9, LDL=16, USETMAXREG=6),
+    ("k1", 256, "smem_rolled_pf", "packed", True, 1, "major", "block"): dict(STL=9, LDL=16, USETMAXREG=6),
+    ("k3", 256, "smem_rolled_pf", "packed", False, 1, "mn_major", "block"): dict(STL=25, LDL=26, USETMAXREG=6),
+    ("k3", 256, "smem_rolled_pf", "packed", True, 1, "mn_major", "block"): dict(STL=25, LDL=26, USETMAXREG=6),
+}
+
+
+@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint,order,ln_once", sorted(_SASS_LN_ONCE_HINT_PINS))
+def test_sm107_ln_once_renderings_under_the_hint_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once):
+    """Trace-compile the LayerNorm-once renderings WITH the `.minnctapersm` hint for sm_107a (no GPU): the spills within the measured bounds,
+    USETMAXREG EXACTLY 6 (the honoured split -- the reason they spill), CGAERRBAR 0.  The rule never composes the two (`register_split_hint` returns 0
+    for every LayerNorm-once item); this pins what a caller's `min_blocks_per_mp=1` buys under the lever."""
+    probe = sass_utils.run_sass_probe(
+        tmp_path,
+        probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
+        arch="sm_107a",
+        params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math=epi_math, has_bias=has_bias, min_blocks_per_mp=hint, pass_order=order, ln_once=ln_once),
+        tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_{epi_math}_bias{int(has_bias)}_hint{hint}_{order}_ln_once_{ln_once}",
+    )
+    st = probe.stats
+    pins = _SASS_LN_ONCE_HINT_PINS[(arm, k, ln_pass_form, epi_math, has_bias, hint, order, ln_once)]
+    print(
+        f"{arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint} ln_once={ln_once}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} "
+        f"CGAERRBAR {st['CGAERRBAR']} lines {st['LINES']} cubin {probe.cubin_md5}"
+    )
+    sass_utils.assert_no_new_spills(st, pins, tag=f"{arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint} ln_once={ln_once}: ")
+    assert (
+        st["USETMAXREG"] == pins["USETMAXREG"]
+    ), f"{arm} K={k} ln_once={ln_once} hint {hint}: USETMAXREG {st['USETMAXREG']} != {pins['USETMAXREG']} -- re-measure the roles and the pins"
+    assert st["CGAERRBAR"] == 0, f"{arm} K={k} ln_once={ln_once} hint {hint}: a non-relaxed cluster arrive (CGAERRBAR {st['CGAERRBAR']})"
 
 
 # The `.minnctapersm` hint (`min_blocks_per_mp`; `heuristics.register_split_hint`) on the renderings the hint exists for -- the bias-OFF forms, where

@@ -442,15 +442,18 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
 
     def _register_split_hints(self) -> Tuple[int, int]:
         """The `.minnctapersm` launch hint of (K1, K3): the caller's `min_blocks_per_mp` override for both stages, else the per-RENDERING rule with
-        each stage's own bias flag, LayerNorm form and (K1) tile order (`heuristics.register_split_hint`: whether a rendering spills at the flat
-        allocation is a property of the rendering, not of the geometry); the width is the heuristics' (`c`, = `c_z` on every served plan).  GPU-free
-        (pinned by the API tests)."""
+        each stage's own bias flag, LayerNorm form, (K1) tile order and LayerNorm work item (`heuristics.register_split_hint`: whether a rendering
+        spills at the flat allocation is a property of the rendering, not of the geometry -- and the LayerNorm-once item's rendering spills UNDER
+        the hint where the per-tile item's did without it, so the rows name the per-tile item); the width is the heuristics' (`c`, = `c_z` on every
+        served plan).  GPU-free (pinned by the API tests)."""
         hint = self.knobs.min_blocks_per_mp
         if hint is not None:
             return int(hint), int(hint)
         return (
-            th.register_split_hint("k1", self.c, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math, self.knobs.k1_pass_order),
-            th.register_split_hint("k3", self.c, self.has_out_bias, self._k3_ln_pass_form(), self.knobs.epi_math),
+            th.register_split_hint(
+                "k1", self.c, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math, self.knobs.k1_pass_order, self.knobs.ln_once or ""
+            ),
+            th.register_split_hint("k3", self.c, self.has_out_bias, self._k3_ln_pass_form(), self.knobs.epi_math, None, self._k3_ln_once()),
         )
 
     def compile(self) -> None:

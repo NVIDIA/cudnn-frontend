@@ -351,31 +351,48 @@ def default_k_block(n_res: int) -> int:
 # USETMAXREG 6, the epilogue + LayerNorm warps at 232, the producers at 24; the cubin byte-identical to a `.maxnreg 168` build); a row enters this
 # table only with its A/B/A on the 212-SM Rubin perf-node class (the same protocol as the geometry table), and the default 0 keeps every other
 # production rendering's cubin byte-identical to the one measured before the axis existed.
-# Keyed (stage, width, has_bias, ln_pass_form, epi_math, pass_order) -- the projection stage's tile ORDER is part of the rendering (the `interleaved` K1
-# renderings carry 4 STL / 13 LDL of role-prologue values UNDER the hint where the `major` ones carry none); the output stage has no order (None).
+# Keyed (stage, width, has_bias, ln_pass_form, epi_math, pass_order, ln_once) -- the projection stage's tile ORDER is part of the rendering (the
+# `interleaved` K1 renderings carry 4 STL / 13 LDL of role-prologue values UNDER the hint where the `major` ones carry none); the output stage has no
+# order (None); the LayerNorm WORK ITEM (`ln_once`) is part of it too (below: every row names the per-tile item).
 # MEASURED ROWS (the A/B/A of the rule as it lands; the bias-OFF rows first, then the bias-ON rows of the c 128 register-form renderings that run
 # the bias-path epilogue fold -- a bias-ON rendering is allocated its demand (no spill either way), and the honoured split still pays there):
 # the projection stage at c 128 with the pass-MAJOR tile order (the heuristics' pick from N = 512 and at 256 B 4): whole-call A/B/A on one exclusive GPU of the 212-SM Rubin perf-node class (lock 2376), in-process arm + control twins, 100-400 x 3 graph replay, two passes with the same sign -- the register form +1.6 / +1.5 / +1.7 / +1.8 % at 512:128:1 / 256:128:4 / 768:128:1 / 768:128:4 (its 1 / 1 STACK-8 spill gone; K1 itself +3.8 %), the rolled form +1.1..+1.2 % at 1024:128:1 / 512:128:4 / 1024:128:4 (REG 80 flat -> the 232 / 24 split, no spill either way; K1 +2.5 %);
 # NOT a row: the INTERLEAVED rolled projection renderings (N 256 B 1, 384) -0.1..-0.7 % (4 / 13 role-prologue spills under the hint), the output stage at c 256 bias off -0.1 / -0.1 / +0.0 % (its 5 / 7 epilogue spills vanish, the kernel time does not move: 298 vs 297 us -- the bias-off deficit against the bias-on body is elsewhere), the bias-ON renderings NOT named below (the identity controls +0.0 %; the rolled-form K1 bias-on cells +0.33 / +0.35 % under the hint = inside the bar).
 # the hint rows (whole call, bias ON, the same node class): the K1-only row +2.57 / +2.39 / +2.52 / +2.52 % at 512:128:1 / 768:128:1 / 256:128:4 / 768:128:4 (the CUPTI split: K1 71.8 -> 68.1 us = -5.2 %, K3 unchanged), +0.23 / +0.26 % on the rolled-form K1 cells 1024:128:1 / 512:128:4 (inside the bar), -1.15 % on the interleaved 384:128:4 (role-prologue spills under the split, as at bias off); the K3-only row -0.10..+0.11 % on every cell (neutral: not a row); both stages hinted together +2.37..+2.61 % = the K1 row's gain
-_REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str]], int] = {
-    ("k1", 128, False, "registers", "packed", "major"): 1,
-    ("k1", 128, False, "smem_rolled", "packed", "major"): 1,
-    ("k1", 128, True, "registers", "packed_biasfold", "major"): 1,
+# THE WORK ITEM IS PART OF THE KEY (the LayerNorm-once item `ln_once`, measured 2026-10-13 on the landed picks, the same node class and protocol):
+# under `ln_once="block"` the item's +4 live words in the 24-register producer roles turn the honoured split into spills the per-tile item never
+# had (host SASS, sm_107a: the c 128 register form 0 / 0 -> 4 STL / 13 LDL at STACK 16, the rolled form 1 / 1 -> 9 / 15 at STACK 24, the c 256
+# pf forms 2 / 2 -> 9 / 16 (K1) and 5 / 6 -> 25 / 26 at STACK 144 (K3)), and the whole call does not pay for them: the rule's hint vs
+# `min_blocks_per_mp=0` over the landed picks (one process per knob set, in-process control twins, graph replay, the fp64 oracle on every cell;
+# the three cells unhinted under both as the identity control: +0.01 / -0.31 / +0.11 %) -- the UNHINTED call is faster by 1.10 / 1.28 / 0.69 /
+# 1.15 / 0.46 % at 512:128:1 / 768:128:1 / 1024:128:4 / 256:128:4 / 384:128:1 bias off (the register AND the rolled form) and within the noise at
+# 512:128:1 / 768:128:1 / 256:128:4 bias on (-0.15 / +0.17 / -0.15 %); standalone the rolled K1 loses 2.5 / 3.2 % hinted at 1024:4 / 256:1 and the
+# c 256 forms lose 6.1-7.0 % (K1) and 12.0 % (K3) (the standalone register-form K1 reads +0.7..+1.1 % hinted -- a `want_stats=True` rendering the
+# API never builds; the whole call is the landing evidence, as for every row above).  So every row names the PER-TILE item (`ln_once=""`): a bare
+# declaration whose pick carries the item (every c 128 bucket from N = 256, every c 256 bucket) runs UNHINTED -- the renderings the pins measured
+# at 0 / 0 (register) and 1 / 1 (rolled); a caller's `TriMulKnobs(ln_once="")` keeps the measured hint; "passes" has no row (unmeasured -> as shipped).
+_REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str], str], int] = {
+    ("k1", 128, False, "registers", "packed", "major", ""): 1,
+    ("k1", 128, False, "smem_rolled", "packed", "major", ""): 1,
+    ("k1", 128, True, "registers", "packed_biasfold", "major", ""): 1,
 }
 
 
-def register_split_hint(stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str, pass_order: Optional[str] = None) -> int:
+def register_split_hint(
+    stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str, pass_order: Optional[str] = None, ln_once: str = ""
+) -> int:
     """The ``.minnctapersm`` hint a bare declaration hands the ``stage`` (``"k1"`` = the projection, ``"k3"`` = the output stage) rendering at this
-    hidden width, bias arm, LayerNorm / epilogue form and (K1) tile order: the MEASURED rows of :data:`_REGISTER_SPLIT_HINTS`, else 0 (the rendering
-    as shipped).  A caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages."""
+    hidden width, bias arm, LayerNorm / epilogue form, (K1) tile order and LayerNorm work item (``ln_once``; the stage's OWN item -- the output stage's
+    is ``""`` where the substrate declines a one-tile item): the MEASURED rows of :data:`_REGISTER_SPLIT_HINTS`, else 0 (the rendering as shipped;
+    every row names the per-tile item -- under the LayerNorm-once item the honoured split spills and the whole call runs faster unhinted).  A
+    caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages."""
     if stage not in ("k1", "k3"):
         raise ValueError(f"stage must be 'k1' or 'k3', got {stage!r}")
     order = (str(pass_order) if pass_order is not None else None) if stage == "k1" else None
     # the rows are keyed by RENDERING: the three packed epilogue forms differ only under `has_bias` and render ONE cubin without biases, so a
     # bias-off lookup reads the family's row (`EPI_MATHS_PACKED`); a bias-on rendering is hinted only by a row naming its EXACT form
     epm = "packed" if (not has_bias and str(epi_math) in EPI_MATHS_PACKED) else str(epi_math)
-    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), epm, order), 0)
+    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), epm, order, str(ln_once or "")), 0)
 
 
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:
