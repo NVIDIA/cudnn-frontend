@@ -80,8 +80,17 @@ MIN_K_BLOCK_MN_MAJOR = 64
 #: The LayerNorm warps' pass form (performance only; bitwise the same operand): ``"registers"`` = the row's ``K / 2`` packed words stay in
 #: registers between the statistics passes and the normalise pass (the residency that spills from K = 256 up at the flat entry allocation);
 #: ``"smem"`` = every pass re-reads the row's 16-byte chunks from the (unchanged) SMEM stage at the same swizzled offsets -- no residency;
-#: ``"smem_rolled"`` = the same with the per-stage chunk loops as runtime loops (the code-size lever against the instruction-cache stall).
-LN_PASS_FORMS = ("registers", "smem", "smem_rolled")
+#: ``"smem_rolled"`` = the same with the per-stage chunk loops as runtime loops (the code-size lever against the instruction-cache stall);
+#: ``"smem_rolled_pf"`` = the rolled form with a 2-deep software pipeline over every chunk loop (the next chunk's loads issued before the
+#: current chunk's arithmetic; the same words into the same additions in the same order: bitwise the register form);
+#: ``"smem_rolled_tree"`` = the pipelined form with FOUR partial sums per statistics pass (word w of every chunk accumulates into partial w,
+#: combined once per pass as (t0 + t1) + (t2 + t3)) -- a 2-deep dependent chain per chunk instead of 8, at a DIFFERENT fp32 summation
+#: order: the one member of the vocabulary that is NOT bitwise the register form (:data:`LN_PASS_FORMS_REORDERED`; the fp64 oracle's
+#: bound decides, never a silent default).
+LN_PASS_FORMS = ("registers", "smem", "smem_rolled", "smem_rolled_pf", "smem_rolled_tree")
+#: The pass forms whose fp32 summation ORDER differs from the register form's: the same function to the oracle's bound, not bitwise --
+#: a bitwise pin excludes them, a heuristics default never names them without a decision on the measured oracle distance.
+LN_PASS_FORMS_REORDERED = ("smem_rolled_tree",)
 #: The gated epilogue's arithmetic form (performance only; the same fp32 operations per element): ``"scalar"`` = one element at a time;
 #: ``"packed"`` = channel PAIRS on the packed fp32x2 ALU (``add.f32x2`` / ``mul.f32x2`` / ``fma.rn.f32x2``: half the ALU issue per element).
 EPI_MATHS = ("scalar", "packed")
@@ -155,7 +164,8 @@ class LnDualGemmParams:
     fuse_residual: bool = False
     #: the TMA warp prefetches the tile's A boxes into L2 before waiting for a ring slot (performance only).
     prefetch_a_l2: bool = False
-    #: :data:`LN_PASS_FORMS` -- how the LayerNorm warps hold the row between their passes (performance only; bitwise the same operand).  The
+    #: :data:`LN_PASS_FORMS` -- how the LayerNorm warps hold the row between their passes (performance only; bitwise the same operand for every
+    #: form outside :data:`LN_PASS_FORMS_REORDERED`, whose partial sums change the fp32 summation order -- the oracle's bound, not a bitwise pin).  The
     #: default stays the rendering's register residency; a consumer picks the re-read form per width (its value is in the spill counts).
     #: Under ``pairing = "accumulators"`` the re-read forms require ``a0_prologue = "mn_major"`` (the transpose form's K-major writes overlap
     #: the channel rows every lane still re-reads -- the register form keeps all reads before its LN_SYNC barrier, the re-read form cannot).

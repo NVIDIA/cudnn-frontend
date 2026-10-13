@@ -74,7 +74,7 @@ def test_re_read_ln_form_declines_the_transpose_prologue():
     """`ln_pass_form` "smem" / "smem_rolled" re-read operand 0's MN-major stage in every LayerNorm pass; the transpose form's K-major row writes
     overwrite channel rows other lanes still re-read (the register form reads everything before its LN_SYNC barrier), so the pair is a typed decline
     on the host, never a race on the device."""
-    for lnf in ("smem", "smem_rolled"):
+    for lnf in ("smem", "smem_rolled", "smem_rolled_pf", "smem_rolled_tree"):
         with pytest.raises(ValueError, match="a0_prologue='mn_major'"):
             sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, a0_prologue="transpose", ln_pass_form=lnf))
         sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, a0_prologue="mn_major", ln_pass_form=lnf))  # the served pair
@@ -459,7 +459,9 @@ def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batc
 
 @requires_rubin
 @pytest.mark.parametrize("n_res,batch,c_z", [(217, 2, 128), (128, 1, 256)])
-@pytest.mark.parametrize("ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed")])
+@pytest.mark.parametrize(
+    "ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed"), ("smem_rolled_pf", "packed")]
+)
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, ln_pass_form, epi_math):
     """On the accumulators arm (mn_major prologue): the re-read LayerNorm forms and the packed epilogue are BITWISE the default forms (output and
     the LN2 statistics) -- the same bf16 words summed in the same order, the same fp32 operations per element."""
@@ -514,6 +516,38 @@ def test_register_split_hint_is_bitwise_the_default_rendering(n_res, batch, c_z,
         outs.append((out, stats))
     assert torch.equal(outs[0][0], outs[1][0]), "the register-split hint changed the output"
     assert torch.equal(outs[0][1], outs[1][1]), "the register-split hint changed the statistics"
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,c_z", [(217, 2, 128), (128, 1, 256)])
+def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form_is_measured(n_res, batch, c_z):
+    """`ln_pass_form="smem_rolled_tree"` on the accumulators arm: both operands' statistics summed in FOUR partials (a different fp32 ORDER,
+    :data:`LN_PASS_FORMS_REORDERED`) -- the output and the LN2 statistics meet the SAME oracle bound as every form (nothing widened), and the
+    distance to the bitwise rolled form is REPORTED (cells differing, the statistics' max |diff|): a named form, never a bitwise pin or a default."""
+    eps = 1e-5
+    inp = _inputs(n_res, batch, c_z, c_z, True, seed=17)
+    ref, mean64, rstd64 = _reference(inp, eps)
+    outs = {}
+    for lnf in ("smem_rolled", "smem_rolled_tree"):
+        plan = k3.build_trimul_tail(
+            k3.tail_params(c_z, c_z, has_bias=True, want_stats=True, eps=eps, a0_prologue="mn_major", ln_pass_form=lnf, epi_math="packed")
+        )
+        out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, out, stats, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert not (out.float() == _SENTINEL).any(), f"{lnf}: a never-written cell"
+        _check_oracle(out, ref, f"K3 {lnf} {n_res}:{batch}:{c_z}")
+        torch.testing.assert_close(stats[:, 0].double(), mean64, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(stats[:, 1].double(), rstd64, rtol=1e-4, atol=1e-5)
+        outs[lnf] = (out, stats)
+    n_diff = int((outs["smem_rolled"][0].view(torch.int16) != outs["smem_rolled_tree"][0].view(torch.int16)).sum().item())
+    d_stats = (outs["smem_rolled"][1] - outs["smem_rolled_tree"][1]).abs()
+    print(
+        f"tree vs rolled {n_res}:{batch}:{c_z}: {n_diff} output cells differ (of {outs['smem_rolled'][0].numel()}); "
+        f"max |d mean| {d_stats[:, 0].max().item():.3g}, max |d rstd| {d_stats[:, 1].max().item():.3g}"
+    )
+    assert sub.LN_PASS_FORMS_REORDERED == ("smem_rolled_tree",)
 
 
 @requires_rubin

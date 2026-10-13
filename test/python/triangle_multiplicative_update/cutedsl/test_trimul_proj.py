@@ -365,6 +365,15 @@ _SASS_SPILL_PINS = {
     # unrolled broadcast gamma / beta loads are hoisted by the compiler and the row re-appears as live registers -- which is why the rolled form exists.
     ("k1", 256, "smem_rolled", "packed"): dict(STL=0, LDL=0),
     ("k3", 256, "smem_rolled", "packed"): dict(STL=0, LDL=0),
+    # The PIPELINED rolled forms (`smem_rolled_pf` = the next chunk's loads carried across the loop back-edge; `smem_rolled_tree` = + four partial
+    # sums per statistics pass): +4 / +20 live words per lane in the statistics / normalise passes, no spill on either kernel at either width
+    # (0 / 0 measured; the bias-off K3 K = 256 rendering, REG 80 / STACK 24 / STL 5 / LDL 7 on the shipped rolled form, renders at REG 106 / STACK 0
+    # under them -- the extra live words move ptxas off the 80-register target it spilled for).
+    ("k1", 128, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
+    ("k1", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
+    ("k1", 256, "smem_rolled_tree", "packed"): dict(STL=0, LDL=0),
+    ("k3", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
+    ("k3", 256, "smem_rolled_tree", "packed"): dict(STL=0, LDL=0),
 }
 _SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",)}
 _SASS_PROBE_BODY = """
@@ -468,7 +477,9 @@ def test_ln_pass_form_and_epi_math_decline_typed(kw, axis):
 
 @requires_rubin
 @pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
-@pytest.mark.parametrize("ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed")])
+@pytest.mark.parametrize(
+    "ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed"), ("smem_rolled_pf", "packed")]
+)
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, c, mask_kind, ln_pass_form, epi_math):
     """The re-read LayerNorm forms sum the same bf16 words in the same order (a re-load of the unchanged stage replaces a register), and the packed
     epilogue runs the scalar form's fp32 operations in its association on fp32x2 pairs: planes AND statistics BITWISE equal to the default forms."""
@@ -484,6 +495,42 @@ def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res,
         outs.append((planes, stats))
     assert torch.equal(outs[0][0], outs[1][0]), f"{ln_pass_form}/{epi_math} changed the planes"
     assert torch.equal(outs[0][1], outs[1][1]), f"{ln_pass_form}/{epi_math} changed the statistics"
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
+def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form_is_measured(n_res, batch, c_z, c, mask_kind):
+    """`ln_pass_form="smem_rolled_tree"` sums each statistics pass in FOUR partials (a different fp32 ORDER, :data:`LN_PASS_FORMS_REORDERED`): the
+    planes and the statistics meet the SAME fp64-oracle bound as every form (nothing widened), and its distance to the bitwise forms is REPORTED
+    (cells differing, the statistics' max |diff|) -- it is a measured, named form, never a bitwise pin and never a silent default."""
+    eps = 1e-5
+    inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=13)
+    ref, mean64, rstd64 = _reference(inp, c, eps)
+    outs = {}
+    for lnf in ("smem_rolled", "smem_rolled_tree"):
+        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, eps=eps, ln_pass_form=lnf, epi_math="packed"))
+        planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        valid = planes[:, :, :, :n_res].float()
+        assert not (valid == _SENTINEL).any(), f"{lnf}: a never-written cell in the valid region"
+        diff = (valid.double() - ref).abs()
+        tol = 4e-3 + ref.abs() / 128.0  # the module's derived bound (test_k1_matches_the_fp64_oracle), unchanged
+        bad = int((diff > tol).sum().item())
+        rel_rms = (diff.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
+        print(f"{lnf} {n_res}:{batch}:{c_z}: {bad} cells beyond the derived tolerance; max |diff| {diff.max().item():.4g}; rel RMS {rel_rms:.3g}")
+        assert bad == 0 and rel_rms < 2e-3, f"{lnf}: {bad} cells beyond the derived tolerance, rel RMS {rel_rms:.3g}"
+        torch.testing.assert_close(stats[:, 0].double(), mean64, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(stats[:, 1].double(), rstd64, rtol=1e-4, atol=1e-5)
+        outs[lnf] = (planes, stats)
+    n_diff = int((outs["smem_rolled"][0].view(torch.int16) != outs["smem_rolled_tree"][0].view(torch.int16)).sum().item())
+    d_stats = (outs["smem_rolled"][1] - outs["smem_rolled_tree"][1]).abs()
+    print(
+        f"tree vs rolled {n_res}:{batch}:{c_z}: {n_diff} plane cells differ (of {outs['smem_rolled'][0].numel()}); "
+        f"max |d mean| {d_stats[:, 0].max().item():.3g}, max |d rstd| {d_stats[:, 1].max().item():.3g}"
+    )
+    assert sub.LN_PASS_FORMS_REORDERED == ("smem_rolled_tree",)  # the one form outside the bitwise pins, by name
 
 
 @requires_rubin

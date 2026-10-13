@@ -17,7 +17,10 @@ function and stay op attributes the API never sets.
                      rule's 256 pads 25 % of every pair tile's rows; 128 pads none (the lever measured in the perf campaign).
   ``ln_pass_form``   the two stages' LayerNorm pass form (:data:`LN_PASS_FORMS`: ``"registers"`` = the row held in registers between the passes;
                      ``"smem"`` / ``"smem_rolled"`` = the row re-read from the SMEM stage in every pass, unrolled / rolled chunk loops -- the
-                     rolled form has no K = 256 spills; bitwise the same output).
+                     rolled form has no K = 256 spills; ``"smem_rolled_pf"`` = the rolled form with the next chunk's loads pipelined one
+                     iteration ahead; all bitwise the same output.  ``"smem_rolled_tree"`` = the pipelined form with four partial sums per
+                     statistics pass: a different fp32 summation order (:data:`LN_PASS_FORMS_REORDERED`), admitted as a caller's knob, never
+                     a pick of this table).
   ``epi_math``       the two stages' gated-epilogue arithmetic form (:data:`EPI_MATHS`: ``"scalar"`` / ``"packed"`` fp32x2 pairs; bitwise).
   ``min_blocks_per_mp``  the two stages' ``.minnctapersm`` launch hint (:data:`MIN_BLOCKS_PER_MP_DOMAIN`: 0 = the rendering as shipped, its
                      register split dropped by ptxas; 1 = the hint under which ptxas honours the split -- bitwise the same output).  An OVERRIDE

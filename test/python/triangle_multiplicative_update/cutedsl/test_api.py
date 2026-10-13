@@ -666,6 +666,7 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     direction and always COMPLETE; the per-cell refinements override one axis each and never overlap; the API's K1 tile-order pin equals the
     c = 128 default; a caller's PARTIAL record merges over the table (an unset axis keeps the measured pick); the vocabulary check is typed per
     axis."""
+    from cudnn.gemm.frost.ln_prologue import LN_PASS_FORMS, LN_PASS_FORMS_REORDERED
     from cudnn.gemm.frost.tile_config import by_name
     from cudnn.triangle_multiplicative_update import heuristics as th
 
@@ -678,9 +679,15 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
                     kn = th.recommend(n, c, b, d)
                     assert kn.is_complete()
                     th.validate_knobs(kn)
+                    assert kn.ln_pass_form not in LN_PASS_FORMS_REORDERED, (n, c, b, d, kn)  # a summation-ORDER-changing form is never a default
                     assert k2.tile_config_for(n, channels=c, batch=b, direction=d) == kn.k2_tile
                     assert th.recommend(n, c, th.batch_bucket(b), d) == kn  # a batch takes its measured bucket's pick (B >= 4 -> 4, else 1)
     assert th.batch_bucket(1) == th.batch_bucket(3) == 1 and th.batch_bucket(4) == th.batch_bucket(16) == 4
+    # the LayerNorm pass-form vocabulary: every member (the pipelined `smem_rolled_pf` and the reordered `smem_rolled_tree` included) is admitted as a
+    # caller's knob over any pick -- a typed check, no device work; the reordered one is named by the substrate
+    for form in LN_PASS_FORMS:
+        th.validate_knobs(th.TriMulKnobs(ln_pass_form=form).merged_over(th.recommend(512, 256, 1)))
+    assert "smem_rolled_pf" in LN_PASS_FORMS and set(LN_PASS_FORMS_REORDERED) == {"smem_rolled_tree"} <= set(LN_PASS_FORMS)
     # the refinement table: one axis per row, the keys disjoint on that axis, every (floor, batch bucket) a real bucket of the width
     for width, rows in th._REFINEMENTS.items():
         floors = {f for f, _ in th._PICKS[width]}
@@ -894,6 +901,9 @@ def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_declin
         tapi.TriMulKnobs(k_block=64),  # the row tile: 4 bi x 64 k per pair tile instead of the rule's 2 x 128 at N = 128
         tapi.TriMulKnobs(k_block=256),  # 1 bi x 256 k: the second half of every pair tile is padding at N = 128 (legal, wasteful)
         tapi.TriMulKnobs(min_blocks_per_mp=1),  # the .minnctapersm hint: ptxas honours the two stages' register split (a launch attribute, the same body)
+        tapi.TriMulKnobs(
+            ln_pass_form="smem_rolled_pf"
+        ),  # the pipelined rolled LayerNorm re-read: the same words, the same order (K1 here; K3 keeps the transpose form)
     ):
         plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True, knobs=knobs)
         assert plan.check_support()
@@ -917,6 +927,36 @@ def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_declin
     plan.k2_tile = other_family
     with pytest.raises(NotImplementedError, match="cannot serve|sm120|arch"):
         plan._probe_contraction_tile()
+
+
+@requires_rubin
+def test_tree_ln_form_knob_is_admitted_meets_the_oracle_and_its_distance_to_the_default_plan_is_measured():
+    """`TriMulKnobs(ln_pass_form="smem_rolled_tree")` (the LayerNorm statistics in four partial sums -- a different fp32 ORDER) is a caller's knob the
+    API admits: the output meets the SAME three-part oracle as the default plan (nothing widened) and its distance to the default plan's output is
+    REPORTED, not pinned bitwise (the one form in LN_PASS_FORMS_REORDERED); the two-launch check holds on it."""
+    n_res, batch, c = 128, 1, 256  # c = 256: both the projection and the output stage run the re-read forms (the c 128 output stage keeps the transpose form)
+    x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=31)
+    w = tapi.prepare_weights(*[p[n] for n in CUEQ_PARAMS[3:15]])
+    outs = {}
+    for name, knobs in (("default", None), ("tree", tapi.TriMulKnobs(ln_pass_form="smem_rolled_tree"))):
+        plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True, knobs=knobs)
+        assert plan.check_support()
+        plan.compile()
+        out = torch.full_like(x, _SENTINEL)
+        ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+        plan.execute(x, mask, w, out, ws)
+        out2 = torch.full_like(x, _SENTINEL)
+        plan.execute(x, mask, w, out2, ws)
+        torch.cuda.synchronize()
+        assert not (out.float() == _SENTINEL).any() and torch.isfinite(out.float()).all(), name
+        assert torch.equal(out, out2), f"{name}: the two-launch check"
+        outs[name] = out
+    ref = tref.triangle_multiplicative_update_reference(x, "outgoing", mask, **{k: p[k] for k in CUEQ_PARAMS[3:15]}, rounding="kernel")
+    _check_oracle(outs["default"], ref, "default plan")
+    _check_oracle(outs["tree"], ref, "ln_pass_form=smem_rolled_tree")
+    n_diff = int((outs["default"].view(torch.int16) != outs["tree"].view(torch.int16)).sum().item())
+    d = (outs["default"].float() - outs["tree"].float()).abs()
+    print(f"tree vs default plan: {n_diff} cells differ (of {d.numel()}); max |diff| {d.max().item():.4g}")
 
 
 @requires_rubin
