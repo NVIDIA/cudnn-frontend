@@ -1860,27 +1860,9 @@ zero-padding, with the same MMA and on-chip storage cost.
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
 **multiples of 16** and a **64 x 64 CTA**. BPROP remains limited to 256.
 
-MXFP8 FPROP (`sdpa_fwd_prefill_sm120_mxfp8`, opt_in) runs its own template,
-`sm120/prefill_mxfp8.py`: the SM120 FP8 pipeline with every
-MMA lowered to the block-scaled `mma.sync.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32`:
-Q/K scale per 32 along D, V per 32 along S, P takes the unit scale. Head tiles
-are the FP8 row's (multiples of 32 up to 256 on each side, independent) and
-**native**, because each 32-element scale block is one k32 MMA step; dims that
-are multiples of 16 are **envelope-served** (TMA zero-fills the columns inside
-the last scaled block). The d512 band is not served. Dense scale tensors are
-the F8_128x4 `(B, H, ceil(S/128) tiles)` layout, so prepared dense plans keep
-batch, S_q and S_kv fixed; THD packs, per head, each sequence's ceil(S/128) tiles in
-cu_seqlens order with the planes of a tile contiguous. Rows past the valid Q
-length, 32-key V blocks wholly past the valid KV length and the V-scale rows of
-envelope pad columns past d_v use the unit scale, so NaN pad encodings never
-reach O or Amax_O. A block-scaled MXFP8 O (E4M3 with one UE8M0
-scale per 32 d elements in `sf_o`, after the optional global `scale_o`) is served
-at d_qk = d_v = 128 on dense, untrimmed, unsplit, unpacked graphs, as on the FP8
-row; the FP4 (NVFP4) O stays per-tensor only. Validated on an RTX 5080 and an RTX PRO 6000
-Blackwell Server Edition (both cc 12.0) by `test_sdpa_fwd_mxfp8_sm120.py` and the
-prepared-launch contracts in `test_sdpa_prepared_sm120_mxfp8.py` (its >2**32-byte
-K/V scale-stride case needs ~17 GiB free, so it runs on the RTX PRO 6000 only);
-SM121 is not validated.
+MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
+`m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
+16**; the d512 band is not served.
 
 | Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8 / MXFP8<br>both ≤256 or (FP8 only) both ∈ (256, 512], any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
