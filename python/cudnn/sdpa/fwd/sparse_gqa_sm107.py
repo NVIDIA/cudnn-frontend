@@ -220,6 +220,24 @@ def _require_16b_base(name: str, t) -> None:
         raise ValueError(f"sparse d256 forward (sm107): {name} must start at a 16-byte aligned address (the TMA / bulk-copy base rule); got data_ptr=0x{ptr:x}")
 
 
+def _require_cuda_device(name: str, t, expected=None, *, allow_unbound: bool = False):
+    """Validate storage residency without reading its values; declarations may omit storage and its device."""
+    if t is None:
+        return expected
+    device = getattr(t, "device", None)
+    if allow_unbound and device is None and (isinstance(t, SparseOperandDesc) or getattr(t, "data_ptr", None) is None):
+        return expected
+    import torch
+
+    if device is None or torch.device(device).type != "cuda":
+        raise ValueError(f"sparse d256 forward (sm107): {name} must be CUDA storage; got device {device}")
+    index = torch.device(device).index
+    index = torch.cuda.current_device() if index is None else int(index)
+    if expected is not None and index != expected:
+        raise ValueError(f"sparse d256 forward (sm107): {name} must be on cuda:{expected}, the execution device; got cuda:{index}")
+    return index
+
+
 def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int, int, int, int, int]:
     """The gather map's view of one page pool ``[num_pages, H_kv, page_size, D]`` from its strides: ``(page_stride,
     token_stride, col_head_stride, rows_per_page, rows_per_head)`` in elements / rows.  The map's rows are the pool's token
@@ -359,6 +377,7 @@ class SparseGqaFwdDslSm107:
         self._NSEQ = 0  # THD: the number of sequences (the lens tensors' shape); == _B on a dense batch
         self._n_ctas = 0  # THD: the occupancy-sized grid, resolved once per device at the first execute
         self._dtype_code = 0
+        self._device_index = None  # pinned by declarations with a device; otherwise resolved from the current device at compile
         self._paged = None  # the paged arm's derived geometry (set by check_support): num_pages, max_pages, per-operand row terms
 
     # --- the claims ------------------------------------------------------------------------------------------------------
@@ -374,6 +393,7 @@ class SparseGqaFwdDslSm107:
             return self.device_cc
         import torch  # the framework is the caller's; imported here, never at module import
 
+        _require_cuda_device("q", self.q, allow_unbound=True)
         return tuple(torch.cuda.get_device_capability(self.q.device))
 
     def check_support(self) -> bool:
@@ -388,6 +408,23 @@ class SparseGqaFwdDslSm107:
         cc_code = cc[0] * 10 + cc[1]
         if not (SPARSE_CAPABILITIES.sm_lo <= cc_code <= SPARSE_CAPABILITIES.sm_hi):
             raise NotImplementedError(f"sparse d256 forward (sm107): needs a Rubin-line GPU (cc 10.7 .. 11.9); got cc {cc[0]}.{cc[1]}")
+        device = self._device_index
+        for name, t in (
+            ("q", self.q),
+            ("k", self.k),
+            ("v", self.v),
+            ("o", self.o),
+            ("lse", self.lse),
+            ("block_ids", self.block_ids),
+            ("block_lens", self.block_lens),
+            ("seq_kv_lens", self.seq_kv_lens),
+            ("block_table", self.block_table),
+            ("seq_q_lens", self.seq_q_lens),
+            ("gate", self.gate),
+            ("workspace", self.workspace),
+        ):
+            device = _require_cuda_device(name, t, device, allow_unbound=True)
+        self._device_index = device
         for name, requested in self.unserved.items():
             if requested:
                 raise NotImplementedError(f"sparse d256 forward (sm107): {name} is not served by the kernel body yet (the record declines it by name)")
@@ -565,10 +602,10 @@ class SparseGqaFwdDslSm107:
             geom_v = _paged_pool_geometry("V", self.v, KH, self.page_size)
             self._paged = (num_pages, max_pages, geom_k, geom_v)
         else:
-            if (KH - 1) * _strides(self.k)[2] + _D > _INT32_MAX:
-                raise NotImplementedError("sparse d256 forward (sm107): an extent exceeds the Int32 coordinate range")
             for name, t in (("K", self.k), ("V", self.v)):
                 bs, ss, hs, _ = _strides(t)
+                if (KH - 1) * hs + _D > _INT32_MAX:
+                    raise NotImplementedError(f"sparse d256 forward (sm107): {name} gather columns exceed the Int32 coordinate range")
                 if hs % 64 != 0:
                     raise ValueError(f"sparse d256 forward (sm107): {name} head stride must be a multiple of 64 elements (a 128-B column box start); got {hs}")
                 if ss % 8 != 0:
@@ -645,7 +682,12 @@ class SparseGqaFwdDslSm107:
     def _check_workspace(self, ws, n_seq: int) -> None:
         need = self._thd_meta_bytes(n_seq) if self.thd else self._split_workspace_bytes()
         what = "thd=True" if self.thd else f"split_kv={self.split_kv}"
-        nbytes = int(ws.numel()) * int(ws.element_size())
+        if not ws.is_contiguous():
+            raise ValueError(f"sparse d256 forward (sm107): the {what} workspace must be contiguous (a flat scratch span)")
+        nbytes = min(
+            int(ws.numel()) * int(ws.element_size()),
+            int(ws.untyped_storage().nbytes()) - int(ws.storage_offset()) * int(ws.element_size()),
+        )
         if nbytes < need:
             raise ValueError(f"sparse d256 forward (sm107): {what} needs a workspace of {need} bytes (scratch_workspace_bytes()); got {nbytes}")
         if int(ws.data_ptr()) % 16 != 0:
@@ -728,6 +770,16 @@ class SparseGqaFwdDslSm107:
         if fn is not None:
             return fn
         self.check_support()
+        import torch
+
+        # CuTe launchables belong to the compilation context. Storage-free declarations select the current device once;
+        # later block_lens variants and launches must use that same device, even if the caller changes its current device.
+        if self._device_index is None:
+            self._device_index = int(torch.cuda.current_device())
+        with torch.cuda.device(self._device_index):
+            return self._compile_on_device(has_block_lens)
+
+    def _compile_on_device(self, has_block_lens: bool):
         if self._module is None:
             from cudnn.frost.template_loader import load_template
 
@@ -736,7 +788,10 @@ class SparseGqaFwdDslSm107:
             self._module = load_template(path, params, tag="sdpa_fwd_sm107_sparse_d256")
         # Under a split the kernel's LSE is the fp32 PARTIAL (always written: it drives the combine); the caller's LSE presence
         # selects the combine's final-LSE target (the output, or the workspace scratch).
-        fn = self._module.compile(has_lse=(self.lse is not None) or self.split_kv > 1, has_block_lens=has_block_lens)
+        # Their outer functools.lru_cache keys only on arguments. Bypass it so compiled_cache's device/context-aware memo
+        # owns reuse: the same specialization compiled by another plan on another GPU is a different launchable.
+        compile_kernel = getattr(self._module.compile, "__wrapped__", self._module.compile)
+        fn = compile_kernel(has_lse=(self.lse is not None) or self.split_kv > 1, has_block_lens=has_block_lens)
         self._fns[has_block_lens] = fn
         if has_block_lens == (self.block_lens is not None):
             self._fn = fn
@@ -747,7 +802,8 @@ class SparseGqaFwdDslSm107:
             from cudnn.sdpa.fwd.kernels.sm100 import split_combine
 
             tag = "bf16" if self._dtype_code == 2 else "f16"
-            owner = split_combine.compile_ptr(
+            compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
+            owner = compile_combine(
                 dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=self.gate is not None, dtype_gate=tag if self.gate is not None else None
             )
             entry = positional_entry(owner)
@@ -842,12 +898,34 @@ class SparseGqaFwdDslSm107:
             lens = self.block_lens
         else:
             lens = None  # declared as a descriptor (or not at all) and not handed over: the derived default count
+        # Check declared and rebound operands alike, including every optional pointer, before any launch or pointer lowering.
+        device = _require_cuda_device("q", q, self._device_index)
+        for name, t in (
+            ("k", k),
+            ("v", v),
+            ("o", o),
+            ("lse", lse),
+            ("block_ids", ids),
+            ("block_lens", lens),
+            ("seq_kv_lens", seq_kv_lens),
+            ("block_table", table),
+            ("seq_q_lens", seq_q_lens),
+            ("gate", gate),
+            ("workspace", ws),
+        ):
+            _require_cuda_device(name, t, device)
         fn = self._fns.get(lens is not None)
         if fn is None:
             raise RuntimeError(
                 f"sparse d256 forward (sm107): call compile(has_block_lens={lens is not None}) before execute() -- the {'with' if lens is not None else 'without'}-block_lens "
                 "variant is not compiled (plan-time keys only: nothing compiles on the execute path)"
             )
+        import torch
+
+        with torch.cuda.device(device):
+            return self._execute_on_device(q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream)
+
+    def _execute_on_device(self, q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream):
         import torch
         import cutlass
         import cuda.bindings.driver as cuda_driver

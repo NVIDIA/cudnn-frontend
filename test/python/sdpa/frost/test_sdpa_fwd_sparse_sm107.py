@@ -151,6 +151,212 @@ def _pool_strides(KH, P, hnd):
     return (KH * P * D, P * D, D, 1) if hnd else (P * KH * D, D, KH * D, 1)
 
 
+@pytest.mark.parametrize("operand", ["k", "v"])
+@pytest.mark.parametrize("KH,head_stride", [(2, 2**32 + D), (3, 2**30 + D)])
+def test_gather_column_range_checks_each_operand(operand, KH, head_stride):
+    """Both the stride itself and the head-index product must fit the gather descriptor's Int32 column coordinate."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    args = _operands(B=1, S=1, H=KH, KH=KH, top_k=4)
+    args[operand] = _T((1, 1, KH, D), (KH * head_stride, KH * head_stride, head_stride, 1), "torch.bfloat16")
+    with pytest.raises(NotImplementedError, match="Int32"):
+        SparseGqaFwdDslSm107(**args).check_support()
+
+
+@pytest.mark.parametrize("kind", ["expanded", "strided", "overlapping"])
+@pytest.mark.parametrize("thd", [False, True])
+def test_workspace_requires_contiguous_backing_storage(kind, thd):
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    args = _operands(B=1, S=1, H=2, KH=1, top_k=64)
+    if thd:
+        args.update(thd=True, seq_q_lens=_T((1,), (1,), "torch.int32"), seq_kv_lens=_T((1,), (1,), "torch.int32"))
+    else:
+        args.update(split_kv=2)
+    plan = SparseGqaFwdDslSm107(**args)
+    assert plan.check_support()
+    need = plan.scratch_workspace_bytes()
+    if kind == "expanded":
+        ws = torch.empty(1, dtype=torch.uint8).expand(need)
+    elif kind == "strided":
+        ws = torch.empty(2 * need, dtype=torch.uint8)[::2]
+    else:
+        ws = torch.empty(need, dtype=torch.uint8).as_strided((2, need // 2), (1, 1))
+    with pytest.raises(ValueError, match="workspace.*contiguous"):
+        plan._check_workspace(ws, 1)
+    # A contiguous suballocation is valid, but only its remaining bytes count.
+    backing = torch.empty(need + 32, dtype=torch.uint8)
+    plan._check_workspace(backing[16 : 16 + need], 1)
+    with pytest.raises(ValueError, match="workspace of.*bytes"):
+        plan._check_workspace(backing[16 : 16 + need - 1], 1)
+
+
+def _device_validation_plan(operand):
+    """Tiny real buffers, with entry interception below: even the RED test never dispatches an invalid pointer."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q = torch.zeros((1, 4, 2, D), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((1, 4, 1, D), dtype=q.dtype, device=q.device)
+    args = dict(
+        q=q,
+        k=k,
+        v=k.clone(),
+        o=torch.empty_like(q),
+        lse=torch.empty((1, 2, 4), device=q.device),
+        block_ids=torch.zeros((1, 4, 64), dtype=torch.int32, device=q.device),
+        block_lens=torch.zeros((1, 4), dtype=torch.int32, device=q.device),
+        seq_kv_lens=torch.tensor([4], dtype=torch.int32, device=q.device),
+        epilogue_gate=torch.zeros_like(q),
+        top_k=64,
+        device_cc=(10, 7),
+    )
+    if operand == "block_table":
+        args.update(
+            paged_kv=True, page_size=4, k=k.transpose(1, 2), v=k.clone().transpose(1, 2), block_table=torch.zeros((1, 1), dtype=torch.int32, device=q.device)
+        )
+    if operand == "seq_q_lens":
+        args.update(thd=True, seq_q_lens=torch.tensor([4], dtype=torch.int32, device=q.device))
+    if operand == "workspace":
+        args.update(split_kv=2)
+    plan = SparseGqaFwdDslSm107(**args)
+    assert plan.check_support()
+    if plan.thd or plan.split_kv > 1:
+        plan.workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
+    return plan
+
+
+@pytest.mark.parametrize("operand", ["q", "k", "v", "o", "lse", "block_ids", "block_lens", "seq_kv_lens", "block_table", "seq_q_lens", "gate", "workspace"])
+@pytest.mark.parametrize("binding", ["declared", "rebound"])
+def test_execute_rejects_cpu_storage_before_pointer_lowering(operand, binding, monkeypatch):
+    import cutlass.cute.runtime as runtime
+
+    plan = _device_validation_plan(operand)
+    invalid = getattr(plan, operand).cpu()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid operand reached pointer lowering or a kernel entry")
+
+    plan._fns = {False: forbidden, True: forbidden}
+    plan._combine = forbidden
+    monkeypatch.setattr(runtime, "make_ptr", forbidden)
+    if binding == "declared":
+        setattr(plan, operand, invalid)
+        bindings = {}
+    else:
+        bindings = {operand: invalid}
+    with pytest.raises(ValueError, match=operand + ".*CUDA storage"):
+        plan.execute(**bindings)
+
+
+@pytest.mark.parametrize("operand", ["q", "k", "v", "o", "lse", "block_ids", "block_lens", "seq_kv_lens", "block_table", "seq_q_lens", "gate", "workspace"])
+@pytest.mark.parametrize("device", ["cpu", "cuda:1"])
+def test_declarations_reject_non_cuda_or_mixed_devices(operand, device):
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
+
+    plan = _device_validation_plan(operand)
+    tensor = getattr(plan, operand)
+    # No second GPU is touched: descriptor device metadata alone must reject this binding.
+    other = SparseOperandDesc(tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, torch.device(device))
+    setattr(plan, operand, other)
+    with pytest.raises(ValueError, match="CUDA storage|execution device"):
+        plan.check_support()
+
+
+@pytest.mark.parametrize("declared_device", [None, "cuda:1"])
+def test_compilation_and_launch_preserve_the_declared_or_resolved_device(declared_device, monkeypatch):
+    """Intercept context changes/compilation: no second GPU or invalid launch is needed to prove context ownership."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107, SparseOperandDesc
+    import cudnn.frost.template_loader as loader
+
+    args = _operands(B=1, S=1, H=2, KH=1, top_k=4)
+    for key in ("q", "k", "v", "o", "block_ids"):
+        t = args[key]
+        args[key] = SparseOperandDesc(t.shape, t.stride(), t.dtype, declared_device)
+    current, compiled, launched = [0], [], []
+
+    @contextmanager
+    def device_context(index):
+        old, current[0] = current[0], int(index)
+        try:
+            yield
+        finally:
+            current[0] = old
+
+    def compile_entry(**kwargs):
+        compiled.append(current[0])
+        return lambda **kw: None
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    monkeypatch.setattr(loader, "load_template", lambda *a, **kw: SimpleNamespace(compile=compile_entry))
+    plan = SparseGqaFwdDslSm107(**args)
+    plan.compile()
+    expected = 0 if declared_device is None else 1
+    current[0] = 1 - expected
+    plan.compile(has_block_lens=True)
+    assert compiled == [expected, expected]
+    assert current[0] == 1 - expected
+
+    bindings = {
+        key: SparseOperandDesc(args[key].shape, args[key].stride(), args[key].dtype, f"cuda:{1 - expected}") for key in ("q", "k", "v", "o", "block_ids")
+    }
+    with pytest.raises(ValueError, match="q.*execution device"):
+        plan.execute(**bindings)
+    # Matching bindings enter the pinned context even when the caller's current device differs.
+    bindings = {key: SparseOperandDesc(args[key].shape, args[key].stride(), args[key].dtype, f"cuda:{expected}") for key in bindings}
+    monkeypatch.setattr(plan, "_execute_on_device", lambda *a: launched.append(current[0]))
+    plan.execute(**bindings)
+    assert launched == [expected]
+    assert current[0] == 1 - expected
+
+
+def test_compilation_bypasses_argument_only_caches_across_devices(monkeypatch):
+    from contextlib import contextmanager
+    from functools import lru_cache
+    from types import SimpleNamespace
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107, SparseOperandDesc
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    import cudnn.frost.compiled_cache as cache
+    import cudnn.frost.template_loader as loader
+
+    current, kernels, combines = [0], [], []
+
+    @contextmanager
+    def context(index):
+        old, current[0] = current[0], int(index)
+        try:
+            yield
+        finally:
+            current[0] = old
+
+    @lru_cache(None)
+    def kernel(**kwargs):
+        kernels.append(current[0])
+        return lambda **kw: None
+
+    @lru_cache(None)
+    def combine(**kwargs):
+        combines.append(current[0])
+        return lambda *a: None
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "device", context)
+    monkeypatch.setattr(loader, "load_template", lambda *a, **kw: SimpleNamespace(compile=kernel))
+    monkeypatch.setattr(split_combine, "compile_ptr", combine)
+    monkeypatch.setattr(cache, "positional_entry", lambda owner: owner)
+    for device in (0, 1):
+        args = _operands(B=1, S=1, H=2, KH=1, top_k=64)
+        for key in ("q", "k", "v", "o", "block_ids"):
+            t = args[key]
+            args[key] = SparseOperandDesc(t.shape, t.stride(), t.dtype, f"cuda:{device}")
+        SparseGqaFwdDslSm107(**args, split_kv=2).compile()
+    assert kernels == [0, 1]
+    assert combines == [0, 1]
+    assert current[0] == 0
+
+
 def _paged_operands(B=1, S=64, H=24, KH=2, P=16, dtype="torch.bfloat16", top_k=512, hnd=True, max_pages=None, extra_pages=2):
     """The paged form's stand-ins: pools of ``B x max_pages + extra_pages`` pages, a ``(B, max_pages)`` table, ``[B]`` lengths."""
     max_pages = -(-S // P) if max_pages is None else max_pages
@@ -704,7 +910,9 @@ def test_sparse_kernel_decode_form_source_pins():
     # the list reads offset by the chunk's first tile; the stores at the partial batch
     assert "_gather_block_ids(sIds_raw, slot_base, tile0, w, count, n_tail, tail_lo, dead)" in code
     assert "t_next = tile0 + t_next" in code and "t_abs = tile0 + i" in code
-    assert "part_batch = out_batch + split * n_batch" in code and code.count("oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]") == 2
+    assert "part_batch = out_batch + split * n_batch" in code
+    # All four gated/ungated store arms widen BEFORE forming an address; a narrow row subview can wrap a legal O stride.
+    assert code.count("cutlass.Int64(part_batch)") == 4 and "oo[part_batch" not in code
     assert "lse_arr[part_batch, head_base + col, out_tok] = lse_cols[j]" in code  # col = the group's head row (j at one column group)
     # the host: the grid, the partial slabs, the per-sequence list rows, the fp32 pointer + the LSE requirement
     assert "grid_shape = (SQ * SPLIT_KV, KH, B)" in code and "n_o_batches = B * SPLIT_KV" in code
@@ -885,6 +1093,131 @@ def _launch(q, k, v, ids, lens, kv_lens, top_k, scale, launches=2, o_shape=None,
         torch.cuda.synchronize()
         outs.append((o, lse))
     return outs
+
+
+@requires_rubin
+@pytest.mark.parametrize("mode", ["dense", "split", "thd"])
+@pytest.mark.parametrize("gated", [False, True])
+def test_valid_bindings_remain_capture_safe_with_changed_input_replays(mode, gated):
+    plan = _device_validation_plan({"dense": "o", "split": "workspace", "thd": "seq_q_lens"}[mode])
+    if not gated:
+        plan.gate = None
+    plan.v.fill_(3)
+    plan.compile()
+    plan.execute()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.execute()
+    for value in (4, 6, 8):
+        plan.v.fill_(value)
+        plan.o.fill_(-17)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.zeros_like(plan.o)
+        expected[:, :3] = value * (0.5 if gated else 1)
+        assert torch.equal(plan.o, expected)
+        assert torch.isneginf(plan.lse[:, :, 3]).all()
+        expected_lse = torch.arange(1, 4, dtype=torch.float32, device=plan.q.device).log().expand(1, 2, 3)
+        torch.testing.assert_close(plan.lse[:, :, :3], expected_lse, atol=ATOL, rtol=0)
+
+
+@requires_rubin
+@pytest.mark.parametrize("layout", ["dense", "paged", "thd"])
+@pytest.mark.parametrize("bad_id", [2**29, 2**30, 2**31 - 1, -(2**31)])
+@pytest.mark.parametrize("softmax_groups", [1, 2])
+def test_extreme_block_ids_cannot_wrap_to_live_keys(layout, bad_id, softmax_groups):
+    """Block IDs are bounded BEFORE multiplying by four, in both the gather and softmax paths."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q = torch.zeros((1, 4, 2, D), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((1, 4, 1, D), dtype=q.dtype, device=q.device)
+    v = torch.full_like(k, 3)
+    o, lse = torch.full_like(q, -17), torch.full((1, 2, 4), -17.0, device=q.device)
+    ids = torch.full((1, 4, 4), -1, dtype=torch.int32, device=q.device)
+    ids[0, 3, 0] = bad_id
+    lens = torch.zeros((1, 4), dtype=torch.int32, device=q.device)
+    lens[0, 3] = 1
+    args = dict(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, top_k=4, softmax_groups=softmax_groups)
+    if layout == "paged":
+        args.update(
+            paged_kv=True,
+            page_size=4,
+            k=k.transpose(1, 2),
+            v=v.transpose(1, 2),
+            block_table=torch.zeros((1, 1), dtype=torch.int32, device=q.device),
+            seq_kv_lens=torch.tensor([4], dtype=torch.int32, device=q.device),
+        )
+    if layout == "thd":
+        args.update(
+            thd=True, seq_q_lens=torch.tensor([4], dtype=torch.int32, device=q.device), seq_kv_lens=torch.tensor([4], dtype=torch.int32, device=q.device)
+        )
+    plan = SparseGqaFwdDslSm107(**args)
+    assert plan.check_support()
+    if plan.thd:
+        plan.workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
+    plan.compile()
+    for _ in range(2):
+        o.fill_(-17)
+        lse.fill_(-17)
+        plan.execute(stream=_stream())
+        torch.cuda.synchronize()
+        assert torch.equal(o[0, 3], torch.zeros_like(o[0, 3]))
+        assert torch.isneginf(lse[0, :, 3]).all()
+        assert torch.equal(o[0, :3], torch.full_like(o[0, :3], 3))
+
+
+@requires_rubin
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("softmax_groups", [1, 2])
+@pytest.mark.parametrize("wide_stride", [True, False])
+def test_output_address_uses_int64_before_any_subview(gated, softmax_groups, wide_stride):
+    """Exercise a >32-bit stride AND a <31-bit stride whose batch-index product overflows; guard the old wrapped addresses."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    H, KH, S = 12, 1, 1
+    B = 2 if wide_stride else 5
+    stride = (2**32 if wide_stride else 2**30) + H * D
+    offset = 0 if wide_stride else 2**31  # keeps even signed wrapped addresses inside this allocation in the RED run
+    elements = offset + (B - 1) * stride + H * D
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < elements * 2 + (1 << 30):
+        pytest.skip("the wide-output regression needs an 8–12 GiB allocation plus 1 GiB headroom")
+    try:
+        storage = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+    except torch.OutOfMemoryError:
+        pytest.skip("the wide-output backing allocation no longer fits in available GPU memory")
+    o = storage.as_strided((B, S, H, D), (stride, H * D, D, 1), storage_offset=offset)
+    live_offsets = {offset + b * stride for b in range(B)}
+    wrapped_offsets = set()
+    for b in range(B):
+        unsigned = (b * stride) % 2**32
+        signed = unsigned if unsigned < 2**31 else unsigned - 2**32
+        wrapped_offsets.update((offset + unsigned, offset + signed))
+    guards = [storage[start : start + H * D] for start in sorted(wrapped_offsets - live_offsets)]
+    q = torch.zeros((B, S, H, D), dtype=o.dtype, device=o.device)
+    k = torch.zeros((B, S, KH, D), dtype=o.dtype, device=o.device)
+    v = torch.arange(1, B + 1, device=o.device, dtype=torch.float32).to(o.dtype).view(B, 1, 1, 1).expand_as(k).contiguous()
+    lse = torch.empty((B, H, S), device=o.device)
+    ids = torch.full((B, S, 4), -1, dtype=torch.int32, device=o.device)
+    lens = torch.zeros((B, S), dtype=torch.int32, device=o.device)
+    gate = torch.zeros_like(q) if gated else None
+    plan = SparseGqaFwdDslSm107(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, top_k=4, epilogue_gate=gate, softmax_groups=softmax_groups)
+    assert plan.check_support()
+    plan.compile()
+    for _ in range(2):
+        o.fill_(-17)
+        for guard in guards:
+            guard.fill_(-17)
+        plan.execute(stream=_stream())
+        torch.cuda.synchronize()
+        expected = v.expand_as(q) * (0.5 if gated else 1)
+        assert torch.equal(o, expected), "a valid output row was missed or written at a wrapped address"
+        assert torch.equal(lse, torch.zeros_like(lse))
+        assert all(torch.equal(guard, torch.full_like(guard, -17)) for guard in guards), "wrapped-address guard was overwritten"
 
 
 def _check(outs, ref_o, ref_lse):

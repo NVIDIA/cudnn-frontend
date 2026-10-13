@@ -202,6 +202,16 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
+  when compiling storage-free declarations; compile and execute under that device,
+  and reject differently placed bindings before lowering pointers. An outer
+  argument-only `functools.lru_cache` can bypass `compiled_cache`'s device/context
+  key and return another GPU's launchable: delegate reuse to the device-aware
+  cache. Detector: intercept device contexts and compilation, build identical
+  plans for two device ordinals, and verify each reaches compilation in its own
+  context; no invalid cross-device GPU launch is needed. See the sparse SDPA
+  tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
+  and `test_compilation_bypasses_argument_only_caches_across_devices`.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter

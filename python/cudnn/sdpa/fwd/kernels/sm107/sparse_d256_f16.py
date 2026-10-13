@@ -698,7 +698,9 @@ def _block_id_at(idx, loaded, count, n_tail, tail_lo, dead):
         # one tail id at most (n_tail in {0, 1}): the prefill form's spelling, so the dense rendering traces its own program
         tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))
     blk = _select_i32(idx < count, loaded, tail)
-    return _select_i32(dead, cutlass.Int32(-1), blk)
+    # Bound the block domain BEFORE forming 4 * blk + lane: a large positive Int32 id must not wrap into a live key.
+    invalid = dead | (blk < cutlass.Int32(0)) | (blk > cutlass.Int32((2**31 - 1) // BLOCK_SIZE))
+    return _select_i32(invalid, cutlass.Int32(-1), blk)
 
 
 @cute.jit
@@ -1672,11 +1674,16 @@ def _softmax_warp_group(
                             val = _select_f32(dead_cols[j], ZERO, gated[j])
                             if cutlass.const_expr(SOFTMAX_GROUPS > 1):
                                 if cutlass.Int32(j) < n_live_cols:  # the group's columns at or past G are the zero tail: never stored
-                                    o_row = oo[part_batch, out_tok, head_base + col0 + cutlass.Int32(j), :]
-                                    o_row[d_idx] = val.to(o_tensor.element_type)
+                                    oo[
+                                        cutlass.Int64(part_batch),
+                                        cutlass.Int64(out_tok),
+                                        cutlass.Int64(head_base + col0 + cutlass.Int32(j)),
+                                        cutlass.Int64(d_idx),
+                                    ] = val.to(o_tensor.element_type)
                             else:
-                                o_row = oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]
-                                o_row[d_idx] = val.to(o_tensor.element_type)
+                                oo[cutlass.Int64(part_batch), cutlass.Int64(out_tok), cutlass.Int64(head_base + cutlass.Int32(j)), cutlass.Int64(d_idx)] = (
+                                    val.to(o_tensor.element_type)
+                                )
                 else:
                     if (d_idx < cutlass.Int32(D_V)) & live_row:
                         for j in cutlass.range_constexpr(COLS):
@@ -1684,11 +1691,16 @@ def _softmax_warp_group(
                                 val = _select_f32(dead_cols[j], ZERO, cutlass.Float32(o_vals[j]) * inv_cols[j])
                                 if cutlass.const_expr(SOFTMAX_GROUPS > 1):
                                     if cutlass.Int32(j) < n_live_cols:  # the group's columns at or past G are the zero tail: never stored
-                                        o_row = oo[part_batch, out_tok, head_base + col0 + cutlass.Int32(j), :]
-                                        o_row[d_idx] = val.to(o_tensor.element_type)
+                                        oo[
+                                            cutlass.Int64(part_batch),
+                                            cutlass.Int64(out_tok),
+                                            cutlass.Int64(head_base + col0 + cutlass.Int32(j)),
+                                            cutlass.Int64(d_idx),
+                                        ] = val.to(o_tensor.element_type)
                                 else:
-                                    o_row = oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]
-                                    o_row[d_idx] = val.to(o_tensor.element_type)
+                                    oo[cutlass.Int64(part_batch), cutlass.Int64(out_tok), cutlass.Int64(head_base + cutlass.Int32(j)), cutlass.Int64(d_idx)] = (
+                                        val.to(o_tensor.element_type)
+                                    )
         if cutlass.const_expr(CFG.EPILOGUE_GATE):
             # Release the gate's slot to the TMA warp (row 12: a BARE arrive from every softmax lane after the item's last gate
             # LDS; generic read -> arrive -> producer wait -> TMA write needs no proxy fence).
