@@ -488,3 +488,74 @@ def test_cluster_axis_keeps_cga1_on_the_small_tiles():
             knobs, _ = _primary(_facts(64, s, 1, form))
             assert knobs.cga == 1, (s, form, knobs)
     assert c.sm107_f16_tile_width(32, 32, cga=2) == 64 and c.sm107_f16_tile_width(32, 32) == 32
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# THE TRAINING CROPS.  Columns: (D, S, B) -> (TILE_N / n_chunk of the bias-only graph, TILE_N / n_chunk of the bias graph WITH a kv_mask
+# or with per-batch KV lengths).  bf16, H 4, B x S flattened rows, S_q = S_kv = S in {256, 384, 512, 640, 768} (the crop sizes a training
+# step pads its sequences to), B 1 and B 4 at S 256 / 384; the padded cells at live fractions 0.75 and 0.5 of S on every row.  MEASURED on a
+# 212-SM cc 10.7 node at the 2376 MHz lock (same-process arm-vs-arm, CUDA-graph replay 100 x 3, a control twin per process at 0.00-0.53 %,
+# the SW Power Capping counter unmoved): every chunk arm against the pick -- the clamp-2 pick at S 256 B 1 (D 32 / 64, f 1.0 / 0.75 / 0.5:
+# n4 -3..-9 %, n8 -17..-30 %), the cap at 8 at 1024 / 1536 rows (n16 -6..-16 % on every form at every f; n4 -0.3..-2.5 % on the
+# padded and 128-wide bias cells, +1.3..+1.6 % on three dense 64-wide cells at D 64 B 4 -- under the two-of-three-f rule a default
+# keeps), the one-batch-entry guard at TILE_N 128 (the pair n8 -4.4 % at S 512 D 32), the ring's n8 within 1 % of n4 at D 64 S 640 / 768.
+# The one single-f exception: the pair n2 beats the n4 pick on the padded S 384 B 1 cells at f 0.75 (+3.0 % D 32, +1.7 % D 64) and not at
+# f 0.5 (+1.0 / -0.7 %) -- recorded, not a rule (the pick sees S_kv, never the lengths).
+_TRAINING_CROPS = {
+    (32, 256, 1): ((128, 0), (64, 2)),
+    (32, 256, 4): ((128, 0), (64, 8)),
+    (32, 384, 1): ((128, 4), (64, 4)),
+    (32, 384, 4): ((128, 8), (64, 8)),
+    (32, 512, 1): ((128, 0), (64, 8)),
+    (32, 640, 1): ((128, 8), (64, 8)),
+    (32, 768, 1): ((128, 0), (64, 8)),
+    (64, 256, 1): ((64, 2), (64, 2)),
+    (64, 256, 4): ((64, 8), (64, 8)),
+    (64, 384, 1): ((128, 4), (64, 4)),
+    (64, 384, 4): ((128, 8), (64, 8)),
+    (64, 512, 1): ((128, 8), (64, 8)),
+    (64, 640, 1): ((128, 8), (64, 8)),
+    (64, 768, 1): ((128, 8), (64, 8)),
+}
+
+
+@pytest.mark.parametrize("cell", sorted(_TRAINING_CROPS))
+def test_training_crop_picks_are_the_measured_ones(cell):
+    """The width and the chunk every training crop gets, pinned to the measured record above: the bias-only graph (the FINAL's `bias` cell)
+    and the masked / padded graph (`both`, `bias@pad<k>`: the kv_mask word or the per-batch lengths put the body on the 64-wide tile)."""
+    d, s, b = cell
+    (tn_bias, n_bias), (tn_masked, n_masked) = _TRAINING_CROPS[cell]
+    assert c.sm107_tile_n_pick(d, s, has_bias=True, has_kv_mask=False) == tn_bias
+    assert c.sm107_n_chunk_pick(1, b * s, _H, s, _SMS, 1, s_kv=s, d_flavor=d, tile_n=tn_bias) == n_bias, "the bias-only graph's chunk"
+    for kv, pad in ((True, False), (False, True), (True, True)):
+        assert c.sm107_tile_n_pick(d, s, has_bias=True, has_kv_mask=kv, padded=pad) == tn_masked
+        assert c.sm107_n_chunk_pick(1, b * s, _H, s, _SMS, 1, s_kv=s, d_flavor=d, tile_n=tn_masked) == n_masked, (kv, pad)
+
+
+def test_training_crop_preload_is_the_width_table_on_every_form():
+    """`BIAS_PRELOAD_CHUNKS` per FORM on the training crops (0 / 1 / 2 against the width's value, same process, the seam
+    `_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS`): the 128-wide forms LOSE with one chunk ahead of the wait (the pair resident -0.9..-1.7 %,
+    the one-batch-entry ring -0.5..-1.0 %, two chunks -1.7..-5.9 %), the 64-wide bias + kv_mask resident body loses WITHOUT it
+    (-2.2..-3.3 % at S 256 / 384 / 512, two chunks -0.1..-0.6 %), the 64-wide bias RING at D 64 S 768 loses without it too (-1.8 % at
+    f 0.75, -0.9 % at f 0.5 -- the per-form split the width table left open closes on the table's side), the padded 64-wide resident body
+    is neutral either way (-0.7..+0.9 %), the 64-wide bias-only resident pair is neutral on its pick cells (-0.4 / +0.1 % without the
+    chunk at D 64 S 256 with 256 / 1024 rows) and the three-warp-group body derives its effective pre-load 0 whatever the constant: the
+    per-width table {128: 0, 64: 1} is the measured default of every training form, no per-form key."""
+    assert c.SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N == {128: 0, 64: 1}
+    assert c.BIAS_PRELOAD_CHUNKS_DOMAIN == frozenset({0, 1, 2})
+    assert c._BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS is None, "the seam is a per-sweep pin, never a module default"
+    for (d, s, b), ((tn_bias, _), (tn_masked, _)) in _TRAINING_CROPS.items():
+        assert c.sm107_bias_preload_chunks(tn_bias) == (0 if tn_bias == 128 else 1), (d, s, b)
+        assert c.sm107_bias_preload_chunks(tn_masked) == 1, (d, s, b)
+
+
+def test_the_preload_seam_is_in_the_module_cache_key(monkeypatch):
+    """A pinned pre-load count renders a DIFFERENT instruction stream from the same TemplateParams record, so the seam must key the
+    template-module cache (``sweep_seam_state``) like the ring-depth / tile-height seams; a value outside the kernel's domain raises."""
+    assert c.sweep_seam_state() is None
+    monkeypatch.setattr(c, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", 2)
+    assert c.sm107_bias_preload_chunks(128) == 2 and c.sm107_bias_preload_chunks(64) == 2
+    assert c.sweep_seam_state() == ("sm107_sweep_seams", None, None, None, None, None, 2)
+    monkeypatch.setattr(c, "_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS", 3)
+    with pytest.raises(ValueError, match="BIAS_PRELOAD_CHUNKS domain"):
+        c.sm107_bias_preload_chunks(128)

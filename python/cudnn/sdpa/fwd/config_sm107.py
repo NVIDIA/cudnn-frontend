@@ -446,7 +446,16 @@ SM107_NARROW_TILE_S_KV_MAX = 256
 # has nothing to overlap the row read with), the resident bias-only forms gain +0.3..+1.4 %, the streamed ring loses 2.6 % without
 # a mask and gains 1.4 % with one (S 768, one cell each) -- so that width keeps one chunk ahead of the wait for its served masked
 # body; two chunks ahead is -1.0 % (64 words live across the wait).  Read by the kernel module at render time (one arithmetic, rule
-# 8b'); the domain {0, 1, 2} is the kernel's.
+# 8b'); the domain {0, 1, 2} is the kernel's.  RE-MEASURED per FORM on the training crops (S 256 / 384 / 512 / 768, B 1 / 4, live fractions
+# 1.0 / 0.75 / 0.5; the three values of one form interleaved in ONE process through the sweep seam below, a 212-SM cc 10.7 node at the 2376
+# lock, control twins 0.00-0.53 %): every 128-wide form loses with a chunk ahead of the wait (the pair resident -0.9..-1.7 %, the
+# one-batch-entry ring -0.5..-1.0 %, two chunks -1.1..-5.9 %; the 128-wide pair RING +0.1 % with one chunk, -1.7 % with two), the 64-wide
+# bias + kv_mask resident body loses WITHOUT its chunk (-2.2..-3.3 %; two chunks -0.6..+0.5 %), the 64-wide bias RING (D 64 S 768, the
+# per-form split the first table left open) loses without it too (-1.8 % at 0.75 of the keys live, -0.9 % at 0.5), the padded 64-wide
+# resident body is within noise either way (-0.6..+0.8 %), the three-warp-group body derives its effective pre-load 0 whatever the
+# constant, and the 64-wide bias-only RESIDENT pair reads +1.1 / +0.5 / -0.6 % without the chunk where it is NOT the pick (D 32 S 256 /
+# 384, D 64 S 384) and -0.4 / +0.1 % on its two pick cells (D 64 S 256, 256 / 1024 rows) -- so the per-width table stands as the default
+# of every training form and gains no per-form key.
 SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N = {SM107_SMALL_TILE_N_DEFAULT: 0, SM107_SMALL_TILE_N_NARROW: 1}
 # The kernel's domain of the constant (``prefill_d128_f16_sm107`` raises outside it): 0 / 1 / 2 chunks ahead of the ``bmm1_done`` wait.
 BIAS_PRELOAD_CHUNKS_DOMAIN = frozenset({0, 1, 2})
@@ -1084,7 +1093,14 @@ SM107_PAIR_N_CHUNK_MAX = 8
 # At ONE 128-wide kv tile the per-item fixed cost (the block fill, the item barriers) dominates and a 4-row chunk amortises it -- as
 # long as the chunking leaves the grid under-filled: n4 beats the clamp-2 pick by +8..+16 % at 128 flattened rows (every D, both
 # widths) while at 512 rows (4.8 waves of 2-row items) n2 wins back by +8 % on the 64-wide tile.  The floor applies while the 2-row
-# items number at most this many waves.
+# items number at most this many waves.  CONFIRMED on the training crops (same node class, same protocol, same-process arm vs pick): at
+# S 256 with 256 rows the clamp-2 pick wins at every live fraction (1.0 / 0.75 / 0.5 of the keys -- the 0.5 crop is ONE live 128-wide
+# tile, where the floor does not reach because the 2-row items fill 4.8 waves: n4 -3..-9 %, n8 -17..-30 %, both D), the cap at 8 wins
+# at 1024 / 1536 rows (n16 -6..-16 % on every form at every fraction; n4 -0.3..-2.5 % on the padded and the 128-wide bias cells and
+# +1.3..+1.6 % on three DENSE 64-wide cells at D 64 B 4 -- a single-fraction reading, not a default), the D 64 pair ring's n8 is within
+# 1 % of n4 at S 640 / 768.  The one reproducible exception: on the padded S 384 cells with 384 rows the pair n2 beats the n4 pick at
+# 0.75 of the keys live (+3.0 / +3.2 % D 32, +1.7 / +1.5 % D 64; +2.7..+3.9 % with a kv_mask on top) and not at 0.5 (+1.0 / +0.2 %) or
+# at the full length (-0.9 / -1.6 %) -- the pick sees S_kv, never the lengths, and a single-fraction win is recorded, not folded.
 SM107_ONE_TILE_N_CHUNK_FLOOR, SM107_ONE_TILE_FLOOR_MAX_WAVES = 4, 2
 
 
