@@ -1,8 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The gated attention block's EXTEND (serving prefill) form, part one: the write-through of post-RoPE K / V (and the raw
-indexer key) into paged pools at a slot mapping -- ``paged_kv_page_size``.
+"""The gated attention block's EXTEND (serving prefill) form: part one, the write-through of post-RoPE K / V (and the raw
+indexer key) into paged pools at a slot mapping -- ``paged_kv_page_size``; part two (the second half of this module, "The EXTEND
+form"), attention OVER the pools -- ``kv_source="paged"`` on a packed, bounded (``token_capacity``) declaration whose SDPA reads
+every sequence's prefix and its new tokens from ``k_cache`` / ``v_cache`` through ``execute(block_table=, kv_lens=)`` on the
+bottom-right diagonal: the declaration rows and the envelope that predicts them, the stream-order / no-PDL pin, the execute form
+checks, and the Rubin cells -- the empty-prefix step vs the dense block, the 2-chunk extend and the prefix-hit step vs the
+single-shot oracle on L3, L1 vs L3 bitwise, the degenerate matrix on serving buffers (padded entries with kv_len 0 and the NULL
+block, a live-Q dead-KV entry, mid-page prefixes, tail tiles, n_kv 1 / 3 / 4 and the ring wrap, pads at the END and in the
+MIDDLE, a row-sliced block table), the bounded-token contract (live rows bitwise the tight declaration, pad rows exactly 0 on a
+sentinel-filled out over a zeroed workspace), and a CUDA-graph replay over new lengths / tables / slots.
 
 The pool contract a serving stack binds: a 4-D view ``[num_pages, H_kv, P, D]`` with ``D`` contiguous and the other strides
 free -- HND compact pools, NHD storage by strides, and a stack's UNIFIED content row ``[num_pages, H_kv, P, 2D]`` whose two
@@ -28,8 +36,20 @@ import pytest
 import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
-from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, QuantSpec, index_k_raw_view
-from cudnn.gated_attention_block.api import PAGED_KV_PAGE_ALIGN, _align_up, _CacheWrite, _cols, _SparseSdpa, _view
+from cudnn.gated_attention_block import (
+    KV_SOURCE_PAGED,
+    KV_SOURCE_SELF,
+    SERVING_PAGE_SIZES,
+    SERVING_POOL_LAYOUTS,
+    ExtendEnvelope,
+    GatedAttentionBlockFwd,
+    GatedAttentionBlockGeometry,
+    QsaSpec,
+    QuantSpec,
+    ServingEnvelope,
+    index_k_raw_view,
+)
+from cudnn.gated_attention_block.api import _EXTEND_DECLINES, PAGED_KV_PAGE_ALIGN, _align_up, _CacheWrite, _cols, _Projection, _Sdpa, _SparseSdpa, _view
 
 # Below FROST's CuTe DSL floor the block's stages cannot import their kernels: the module skips as a whole there (the sibling
 # block modules' convention); the typed decline itself is pinned by ``test_the_stage_declines_a_dsl_below_the_floor_by_version``.
@@ -46,6 +66,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gated_block_reference import (  # noqa: E402
     RefGeometry,
     build_rope_tables,
+    cu_seqlens_of,
     gated_attention_block_reference,
     gated_attention_block_reference_packed,
     make_inputs,
@@ -90,18 +111,19 @@ def _bits(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().view(torch.int16)
 
 
-def _pools(n_pages: int, h: int, page_size: int, d: int, layout: str, dtype=torch.bfloat16, device=_DEV):
-    """Two NaN-filled pools as the kernel's 4-D ``[P, H, page_size, D]`` views -- ``(k_cache, v_cache)``.
+def _pools(n_pages: int, h: int, page_size: int, d: int, layout: str, dtype=torch.bfloat16, device=_DEV, fill: float = float("nan")):
+    """Two ``fill``-filled pools (NaN by default: the write-through cells' poison) as the kernel's 4-D ``[P, H, page_size, D]``
+    views -- ``(k_cache, v_cache)``.
 
     ``hnd``: HND compact storage, one tensor per pool.  ``nhd``: NHD storage (``[P, page_size, H, D]`` in memory) permuted
     into the same logical order -- the layout is nothing but the strides.  ``unified``: ONE ``[P, H, page_size, 2D]``
     content row per token (K at ``+0``, V at ``+D``; token stride ``2D``), the two pools being its two halves."""
     if layout == "hnd":
-        return tuple(torch.full((n_pages, h, page_size, d), float("nan"), device=device, dtype=dtype) for _ in range(2))
+        return tuple(torch.full((n_pages, h, page_size, d), fill, device=device, dtype=dtype) for _ in range(2))
     if layout == "nhd":
-        return tuple(torch.full((n_pages, page_size, h, d), float("nan"), device=device, dtype=dtype).permute(0, 2, 1, 3) for _ in range(2))
+        return tuple(torch.full((n_pages, page_size, h, d), fill, device=device, dtype=dtype).permute(0, 2, 1, 3) for _ in range(2))
     assert layout == "unified"
-    row = torch.full((n_pages, h, page_size, 2 * d), float("nan"), device=device, dtype=dtype)
+    row = torch.full((n_pages, h, page_size, 2 * d), fill, device=device, dtype=dtype)
     return row[..., :d], row[..., d:]
 
 
@@ -364,7 +386,10 @@ def test_a_block_declared_without_write_through_refuses_every_cache_input(name):
             _exec(blk, inp, out, ws, **{name: args[name]})
 
 
-def test_a_declared_block_requires_the_pools_and_the_slot_mapping_and_declines_the_read_mode():
+def test_a_declared_block_requires_the_pools_and_the_slot_mapping_and_refuses_the_extend_inputs():
+    """A write-through-only block (``kv_source="self"``) attends over its own K / V: the EXTEND form's ``block_table`` / ``kv_lens``
+    are REFUSED there with a ``ValueError`` naming the declaration that takes them -- the former typed "paged-READ mode is a
+    follow-up" decline, INVERTED (the read mode landed as ``kv_source="paged"``; its own cells are below), never deleted."""
     blk, inp, out, _ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16)
     ws = torch.empty(16, dtype=torch.uint8, device=_DEV)
     args = _cache_args(blk, _SMALL_D256)
@@ -375,7 +400,7 @@ def test_a_declared_block_requires_the_pools_and_the_slot_mapping_and_declines_t
         with pytest.raises(ValueError, match="paged_kv_page_size=16 needs"):
             _exec(blk, inp, out, ws)
         for read in (dict(block_table=torch.zeros(1, 4, device=_DEV, dtype=torch.int32)), dict(kv_lens=torch.zeros(1, device=_DEV, dtype=torch.int32))):
-            with pytest.raises(NotImplementedError, match="paged-READ mode"):
+            with pytest.raises(ValueError, match="belong to a block declared kv_source='paged'"):
                 _exec(blk, inp, out, ws, **args, **read)
         # No indexer band on this geometry: a raw-key pool is refused, not ignored.
         with pytest.raises(ValueError, match="index_k_raw.*indexer band"):
@@ -892,3 +917,900 @@ def test_raw_indexer_key_pool_at_flash_next():
     assert torch.equal(_bits(pooled), _bits(raw[0, live, 0])), "the raw-key pool is not the slab's raw indexer key"
     assert _written_rows(index_cache) == int(live.sum())
     assert blk._cache_write.moved_bytes() == 2 * 2 * t * geom.h_kv * geom.d_head * 2 + t * 4 + 2 * t * 128 * 2 + t * 4
+
+
+# ===========================================================================
+# The EXTEND form: kv_source="paged" on a packed, bounded declaration -- attention OVER the pools
+# ===========================================================================
+
+_EXTEND_GEOM = dict(_SMALL_D256, causal_bottom_right=True)  # the 8 / 2 d256 geometry on the extend (bottom-right) diagonal
+_STALE = 777.0  # every unaddressed pool row of a READ cell holds this FINITE value: a serving pool is zero-initialised and then holds stale rows, never NaN
+_NULL_PAGE = 0  # the serving stacks' NULL block: a padded entry's table row points here; the kernel reads page -1 (TMA OOB zeros) past a sequence's live pages
+_OUT_SENTINEL = {torch.bfloat16: 1.5e30, torch.float16: 6.0e4}  # a finite magnitude no correct output cell holds; a survivor is an unwritten / untouched cell
+_MATRIX_PACKING = dict(q_lens=[128, 84, 0, 200], prefix_lens=[0, 300, 0, 77])
+# T_live 412 of 512 (pads at the END); kv_lens 128 / 384 / 0 / 277: n_kv = 1 (one KV tile; B x H_kv > 1 with it), a 300-row prefix ending
+# mid-page at every page size with kv_len a 128-multiple, a PADDED entry (kv_len 0, the NULL block, no rows), a 77-row prefix (mid-page)
+# with kv_len 277 (a tail tile, n_kv = 3)
+_SECOND_PACKING = dict(q_lens=[100, 80, 0, 120], prefix_lens=[128, 384, 0, 277])  # the next chunk of the same sequences: T_live 300
+
+
+def _cos(a, b):
+    return torch.nn.functional.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def _kernel_source(module_name):
+    """The SOURCE TEXT of a kernel module -- read from its file, never imported (a kernel module builds its config and traces at import)."""
+    import importlib.util
+
+    return open(importlib.util.find_spec(module_name).origin).read()
+
+
+def _extend_samples(page, n_pages, b_max, max_pages, layout="hnd", dtype=torch.bfloat16, row_stride=None, h_kv=2, d=256, device=_DEV):
+    """The EXTEND form's three declaration samples -- and, in the cells, the LIVE tensors (a serving stack hands the block views of
+    its one cache): two ``_STALE``-filled pools with the NULL page zeroed and a ``[B_max, max_pages]`` int32 block table -- a
+    ``[:, :max_pages]`` row slice of a wider ``[B_max, row_stride]`` table when ``row_stride`` is given: the serving stacks slice their tables)."""
+    k, v = _pools(n_pages, h_kv, page, d, layout, dtype, device, fill=_STALE)
+    k[_NULL_PAGE].zero_()
+    v[_NULL_PAGE].zero_()
+    table = torch.zeros(b_max, max_pages if row_stride is None else row_stride, device=device, dtype=torch.int32)
+    return dict(sample_k_cache=k, sample_v_cache=v, sample_block_table=table[:, :max_pages])
+
+
+def _declare_extend_with(
+    b_max, t_max, samples, *, page=16, kv_source=KV_SOURCE_PAGED, cu=True, token_capacity="T", geom_kw=_EXTEND_GEOM, dtype=torch.bfloat16, seed=0, **blk_kw
+):
+    """A declared (not compiled) EXTEND block over EXPLICIT samples (the pools' shape / dtype / strides, the block table).  ``inp``
+    carries the WEIGHTS every step shares and the step's token tensors (``h`` / ``cos`` / ``sin`` as ``[T_max, .]`` matrices the
+    steps rewrite in place).  Returns ``(blk, inp, out)``."""
+    geom = GatedAttentionBlockGeometry(**geom_kw)
+    ref_geom = RefGeometry(
+        **{k: v for k, v in geom_kw.items() if k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")}
+    )  # the dims; the oracle's mask is its own
+    inp = make_inputs(ref_geom, batch=1, seq_len=t_max, dtype=dtype, device=_DEV, seed=seed)
+    inp = dict(inp, h=inp["h"].view(t_max, geom.d_model), cos=inp["cos"].view(t_max, -1).contiguous(), sin=inp["sin"].view(t_max, -1).contiguous())
+    out = torch.empty(t_max, geom.d_model, device=_DEV, dtype=dtype)
+    blk = GatedAttentionBlockFwd(
+        inp["h"],
+        inp["w_qkvg"],
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        inp["cos"],
+        inp["sin"],
+        inp["w_o"],
+        out,
+        geom,
+        thd=True,
+        num_sequences=b_max,
+        max_seq_len=t_max,
+        cu_seqlens=cu,
+        token_capacity=t_max if token_capacity == "T" else token_capacity,
+        paged_kv_page_size=page,
+        kv_source=kv_source,
+        **samples,
+        **blk_kw,
+    )
+    return blk, inp, out
+
+
+def _declare_extend(b_max, t_max, *, max_kv_len, page=16, layout="hnd", dtype=torch.bfloat16, row_stride=None, n_pages=None, geom_kw=_EXTEND_GEOM, **kw):
+    """A declared (not compiled) EXTEND block: a packed declaration at the bounded capacity ``t_max`` for ``b_max`` sequences whose
+    logical KV length may reach ``max_kv_len`` (``max_pages = ceil(max_kv_len / page)`` table columns; pools of ``n_pages`` pages,
+    default one full allotment per sequence plus the NULL page).  Returns ``(blk, inp, out, samples)``."""
+    geom = GatedAttentionBlockGeometry(**geom_kw)
+    max_pages = -(-max_kv_len // page)
+    n_pages = n_pages if n_pages is not None else b_max * max_pages + 1
+    samples = _extend_samples(page, n_pages, b_max, max_pages, layout, dtype, row_stride, geom.h_kv, geom.d_head, _DEV)
+    blk, inp, out = _declare_extend_with(b_max, t_max, samples, page=page, geom_kw=geom_kw, dtype=dtype, **kw)
+    return blk, inp, out, samples
+
+
+def _declaration_facts(blk, samples):
+    """What an EXTEND declaration must have recorded: the attribute, the paged SDPA stage with the samples' descriptors, the
+    capture-safe route on both dense projections, the write-through stage in position."""
+    assert blk.kv_source == KV_SOURCE_PAGED and blk.thd and blk.token_capacity == blk.batch * blk.seq_len
+    sd = blk._sdpa
+    assert isinstance(sd, _Sdpa) and sd.kv_source == KV_SOURCE_PAGED and sd.paged_page_size == blk.paged_kv_page_size
+    for nm in ("k_cache", "v_cache", "block_table"):
+        d = blk._descs[nm]
+        assert tuple(d.shape) == tuple(samples[f"sample_{nm}"].shape) and tuple(d.stride) == tuple(samples[f"sample_{nm}"].stride()), nm
+    assert sd.k_cache_desc is blk._descs["k_cache"] and sd.v_cache_desc is blk._descs["v_cache"] and sd.block_table_desc is blk._descs["block_table"]
+    for st in (blk._proj, blk._out_proj):
+        if isinstance(st, _Projection):
+            assert st.capture_safe is True
+    if blk._norm_rope is not None:
+        _assert_stage_in_pipeline_position(blk, blk.paged_kv_page_size)
+    else:  # fuse_norm_rope: the fork writes the post-RoPE slab; the write-through sits right after it, before the paged read
+        stages = list(blk._stages)
+        assert stages.index(blk._proj) < stages.index(blk._cache_write) < stages.index(blk._sdpa)
+
+
+def _slot_table(lay, geom, t, act_dtype):
+    """``{slot: (offset, nbytes)}`` of every RESERVED workspace slot of a carve (the host assertion of the bounded-token contract
+    reads it): a slot may never overlap another, and ``o`` in particular is aliased by no other stage's scratch."""
+    e = torch.empty((), dtype=act_dtype).element_size()
+    sizes = dict(
+        proj=t * geom.n_qkvg * e,
+        q=t * geom.h_q * geom.d_head * e,
+        k=t * geom.h_kv * geom.d_head * e,
+        v=t * geom.h_kv * geom.d_head * e,
+        o=t * geom.h_q * geom.d_head * e,
+        o_gated=t * geom.h_q * geom.d_head * e,
+        q8=t * geom.h_q * geom.d_head,
+        k8=t * geom.h_kv * geom.d_head,
+        v8=t * geom.h_kv * geom.d_head,
+        o8=t * geom.h_q * geom.d_head,
+        gate16=t * geom.h_q * geom.d_head * e,
+    )
+    table = {name: (getattr(lay, name), nbytes) for name, nbytes in sizes.items() if getattr(lay, name) >= 0}
+    table["engine_scratch"] = (lay.engine_scratch, None)
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Declaration rows, the envelope, the stage facts -- host, any device
+# ---------------------------------------------------------------------------
+
+
+def test_extend_declaration_builds_the_paged_sdpa_stage_and_the_capture_safe_projections():
+    blk, inp, out, samples = _declare_extend(4, 512, max_kv_len=512, page=16)
+    _declaration_facts(blk, samples)
+    assert blk.num_sequences == 4 and blk.max_seq_len == 512 and blk.cu_seqlens
+    # lengths form, dtype, layout, page, a row-sliced table, the other bf16 pipelines, fp16: every served spelling builds the same stage
+    for kw in (
+        dict(cu=False),
+        dict(dtype=torch.float16),
+        dict(layout="nhd"),
+        dict(layout="unified"),
+        dict(page=128),
+        dict(row_stride=70),
+        dict(fuse_norm_rope=True),
+        dict(inplace_qkv=False),
+    ):
+        blk2, _, _, samples2 = _declare_extend(3, 256, max_kv_len=1024, **kw)
+        _declaration_facts(blk2, samples2)
+    # the carve is the plain THD block's (the pools, the table and the lengths are the caller's; the paged read reserves nothing)
+    plain, *_ = _make_packed_block(_SMALL_D256, (200, 0, 184, 128))
+    assert blk._layout() == plain._layout()
+
+
+def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
+    """The bounded-token contract (pad rows of ``out`` exactly 0 over a once-zeroed workspace) rests on the ``o`` slot being written by
+    the SDPA alone: ``o_gated`` IS ``o`` under inference (the gate's own in-place write), and no other reserved slot -- nor the
+    engines' scratch -- overlaps a byte of it.  Asserted on the carve itself, so a future slot sharing flips this RED instead of
+    turning pad rows into garbage."""
+    for kw in (dict(), dict(inplace_qkv=False), dict(fuse_norm_rope=True)):
+        blk, *_ = _declare_extend(4, 512, max_kv_len=512, **kw)
+        lay = blk._layout()
+        assert lay.o >= 0 and lay.o_gated == -1, "inference: o_gated aliases o in place; o is reserved"
+        table = _slot_table(lay, blk.geom, blk.batch * blk.seq_len, blk.act_dtype)
+        o_lo, o_n = table["o"]
+        o_hi = o_lo + o_n
+        for name, (lo, n) in table.items():
+            if name == "o":
+                continue
+            hi = lo + n if n is not None else lay.total_bytes + 1  # the engine scratch starts at engine_scratch and runs to the end
+            assert hi <= o_lo or lo >= o_hi, f"{name} [{lo}, {hi}) overlaps o [{o_lo}, {o_hi})"
+        assert lay.engine_scratch >= o_hi
+
+
+def test_extend_typed_declines_match_the_envelope_row_by_row():
+    """Every row of the EXTEND declines table is reachable at declaration with exactly the message the envelope publishes for it --
+    the CPU proof that no declaration-time decline escapes ``serving_envelope``."""
+    import re
+
+    env = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
+    assert isinstance(env, ServingEnvelope) and isinstance(env.extend, ExtendEnvelope) and env.decode is None
+    names = [name for name, *_ in _EXTEND_DECLINES]
+    assert set(env.extend.declines) == set(names) and len(names) == len(set(names))
+    assert env.extend.requires and env.extend.page_sizes == SERVING_PAGE_SIZES == (16, 32, 64, 128) and env.extend.pool_layouts == SERVING_POOL_LAYOUTS
+    assert env.extend.inference_only and not env.extend.writes_lse and env.extend.dtypes == (torch.bfloat16, torch.float16)
+    good = _extend_samples(16, 9, 2, 8)
+    d128 = dict(_EXTEND_GEOM, d_head=128, d_model=256)
+    trips = {
+        "write_through": lambda: _declare_extend_with(2, 128, good, page=0),
+        "dense_declaration": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
+        "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
+        "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
+        "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
+        "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
+        "token_capacity_dense": lambda: _make_block(_SMALL_D256, 1, 64, token_capacity=64),
+        "token_capacity_training": lambda: _make_packed_block(
+            _SMALL_D256, _PACKED_LENS, token_capacity=sum(_PACKED_LENS), save_for_backward=True, inplace_qkv=False
+        ),
+    }
+    assert set(trips) == set(names)
+    for name, exc, _pred, msg in _EXTEND_DECLINES:
+        with pytest.raises(exc, match=re.escape(msg[:80])) as e:
+            trips[name]()
+        assert str(e.value) == msg == env.extend.declines[name], name
+    # the served verdict reads the device: Rubin serves the form, every other part names itself in the reason
+    cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+    assert env.device_cc == cc
+    if cc == (10, 7):
+        assert env.extend.served and env.forms == ("extend",) and env.extend.reason is None and env.cutedsl_ok
+        fp32 = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.float32, _DEV)
+        assert not fp32.extend.served and "bf16 / f16" in fp32.extend.reason
+        for geom_kw, row in ((dict(_EXTEND_GEOM, window_left=64), "window"), (_SMALL_D256, "diagonal"), (d128, "head_dim")):
+            bad = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**geom_kw), torch.bfloat16, _DEV)
+            assert not bad.extend.served and bad.extend.reason == env.extend.declines[row] and bad.forms == (), row
+    else:
+        assert not env.extend.served and env.forms == () and "targets Rubin" in env.extend.reason
+    # a sparse geometry: the THD-only form meets the sparse declaration's own `thd=True` row first -- the envelope says so wherever the
+    # device / dtype facts let it speak (on Rubin: the very message the block raises for that declaration)
+    sparse = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV)
+    assert not sparse.extend.served
+    with pytest.raises(NotImplementedError, match="QsaSpec with thd=True") as e:
+        _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec()))
+    if cc == (10, 7):
+        assert sparse.extend.reason == str(e.value)
+
+
+def test_extend_argument_rows_are_typed():
+    """The argument contract around the table: ``kv_source`` values, ``token_capacity``'s type / value / equality with the samples'
+    rows, the three samples REQUIRED under ``kv_source="paged"`` and REFUSED under ``"self"``, each pool's form (``check_pool``'s
+    rules), K and V of one layout kind, the block table's rank / dtype / shape / page-axis stride / device."""
+    good = _extend_samples(16, 9, 2, 8)
+    with pytest.raises(ValueError, match="kv_source must be one of"):
+        _declare_extend_with(2, 128, good, kv_source="pool")
+    with pytest.raises(TypeError, match="token_capacity must be an int"):
+        _declare_extend_with(2, 128, good, token_capacity=128.0)
+    with pytest.raises(TypeError, match="token_capacity must be an int"):
+        _declare_extend_with(2, 128, good, token_capacity=True)
+    with pytest.raises(ValueError, match="token_capacity must be >= 1"):
+        _declare_extend_with(2, 128, good, token_capacity=0)
+    with pytest.raises(ValueError, match="token_capacity=100 must equal the samples' packed token rows T=128"):
+        _declare_extend_with(2, 128, good, token_capacity=100)
+    # token_capacity alone (kv_source="self") is a served THD declaration; None keeps the tight contract on the EXTEND form
+    blk, *_ = _make_packed_block(_SMALL_D256, _PACKED_LENS, token_capacity=sum(_PACKED_LENS))
+    assert blk.token_capacity == sum(_PACKED_LENS) and blk.kv_source == KV_SOURCE_SELF
+    blk, *_ = _declare_extend_with(2, 128, good, token_capacity=None)
+    assert blk.token_capacity is None and blk.kv_source == KV_SOURCE_PAGED
+    # the samples: refused on "self", required on "paged"
+    for kw in (dict(sample_k_cache=good["sample_k_cache"]), dict(sample_block_table=good["sample_block_table"]), good):
+        with pytest.raises(ValueError, match="belong to the EXTEND form"):
+            _make_packed_block(_SMALL_D256, _PACKED_LENS, paged_kv_page_size=16, **kw)
+    for missing in ("sample_k_cache", "sample_v_cache", "sample_block_table"):
+        with pytest.raises(ValueError, match=f"needs {missing} at declaration"):
+            _declare_extend_with(2, 128, {k2: v2 for k2, v2 in good.items() if k2 != missing})
+    # pool forms: every check_pool row names the sample
+    for bad, match in _bad_pool_forms(_SMALL_D256):
+        with pytest.raises(ValueError, match=f"sample_k_cache.*{match}" if match != "must be a" else match):
+            _declare_extend_with(2, 128, dict(good, sample_k_cache=bad))
+    # one layout kind for K and V
+    k_n, _ = _pools(9, 2, 16, 256, "nhd")
+    with pytest.raises(ValueError, match="share one layout kind"):
+        _declare_extend_with(2, 128, dict(good, sample_k_cache=k_n))
+    # the block table rows
+    for bad, match in (
+        (torch.zeros(2, 4, device=_DEV, dtype=torch.int64), "2-D int32"),
+        (torch.zeros(2, 4, 1, device=_DEV, dtype=torch.int32), "2-D int32"),
+        (torch.zeros(3, 4, device=_DEV, dtype=torch.int32), r"num_sequences=2, max_pages >= 1"),
+        (torch.zeros(2, 0, device=_DEV, dtype=torch.int32), r"num_sequences=2, max_pages >= 1"),
+        (torch.zeros(4, 2, device=_DEV, dtype=torch.int32).t(), "page axis must be contiguous"),
+        ("table", "2-D int32"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            _declare_extend_with(2, 128, dict(good, sample_block_table=bad))
+    if _DEV == "cuda":
+        with pytest.raises(ValueError, match="must live on"):
+            _declare_extend_with(2, 128, dict(good, sample_block_table=torch.zeros(2, 4, dtype=torch.int32)))
+
+
+def test_extend_write_through_declines_still_fire_first():
+    """``quant`` / ``save_for_backward`` with the attribute are the write-through's typed declines, heard before anything of the
+    EXTEND form (the form requires the attribute): no row of the EXTEND table repeats them."""
+    good = _extend_samples(16, 9, 2, 8)
+    with pytest.raises(NotImplementedError, match="paged_kv_page_size with save_for_backward=True"):
+        _declare_extend_with(2, 128, good, save_for_backward=True, inplace_qkv=False)
+    assert not any("quant" in name or "save_for_backward" in name for name, *_ in _EXTEND_DECLINES)
+
+
+def test_extend_execute_form_checks_are_host_side_and_typed():
+    """On a DECLARED (uncompiled) EXTEND block, under ``set_sync_debug_mode("error")``: ``block_table`` / ``kv_lens`` REQUIRED, the pools
+    matching the declared samples exactly (another page count or layout is another plan), the block table's dtype / shape / strides /
+    device, ``kv_lens``'s form; a wider table at the declared row stride passes; the well-formed call reaches the plan check."""
+    blk, inp, out, samples = _declare_extend(3, 256, max_kv_len=512, page=16, row_stride=50)
+    ws = torch.empty(16, dtype=torch.uint8, device=_DEV)
+    k, v, bt = samples["sample_k_cache"], samples["sample_v_cache"], samples["sample_block_table"]
+    t = blk.batch * blk.seq_len
+    slot = torch.full((t,), -1, device=_DEV, dtype=torch.int32)
+    kv_lens = torch.zeros(3, device=_DEV, dtype=torch.int32)
+    seq_lens = torch.zeros(4, device=_DEV, dtype=torch.int32)
+    base = dict(seq_lens=seq_lens, k_cache=k, v_cache=v, slot_mapping=slot, block_table=bt, kv_lens=kv_lens)
+    with _no_host_sync():
+        for missing in ("block_table", "kv_lens"):
+            with pytest.raises(ValueError, match=f"kv_source='paged' needs {missing} at execute"):
+                _exec(blk, inp, out, ws, **{kk: vv for kk, vv in base.items() if kk != missing})
+        for nm, bad in (("k_cache", _pools(9, 2, 16, 256, "hnd", fill=0.0)[0]), ("v_cache", _pools(k.shape[0], 2, 16, 256, "nhd", fill=0.0)[1])):
+            with pytest.raises(ValueError, match=f"{nm} must match sample_{nm} exactly"):
+                _exec(blk, inp, out, ws, **{**base, nm: bad})
+        for bad, match in (
+            (bt.to(torch.int64), "2-D int32"),
+            (bt[:2], r"\[num_sequences=3, >= max_pages=32\]"),
+            (bt[:, :31], r"\[num_sequences=3, >= max_pages=32\]"),
+            (bt.contiguous(), r"declared \(row stride 50, 1\)"),
+            (torch.zeros(3, 2 * 32, device=_DEV, dtype=torch.int32)[:, ::2], r"declared \(row stride 50, 1\)"),
+        ):
+            with pytest.raises(ValueError, match=match):
+                _exec(blk, inp, out, ws, **{**base, "block_table": bad})
+        for bad, match in (
+            (kv_lens.to(torch.int64), "contiguous 1-D int32"),
+            (torch.zeros(4, device=_DEV, dtype=torch.int32), "contiguous 1-D int32"),
+            (torch.zeros(6, device=_DEV, dtype=torch.int32)[::2], "contiguous 1-D int32"),
+            (torch.zeros(3, 1, device=_DEV, dtype=torch.int32), "contiguous 1-D int32"),
+        ):
+            with pytest.raises(ValueError, match=match):
+                _exec(blk, inp, out, ws, **{**base, "kv_lens": bad})
+        if _DEV == "cuda":
+            with pytest.raises(ValueError, match="must live on"):
+                _exec(blk, inp, out, ws, **{**base, "block_table": torch.zeros(3, 50, dtype=torch.int32)[:, :32]})
+            with pytest.raises(ValueError, match="contiguous 1-D int32 CUDA"):
+                _exec(blk, inp, out, ws, **{**base, "kv_lens": torch.zeros(3, dtype=torch.int32)})
+        wide = torch.zeros(3, 50, device=_DEV, dtype=torch.int32)[:, :40]  # >= max_pages at the declared row stride: a view the adapter binds
+        with pytest.raises(RuntimeError, match="compile"):
+            _exec(blk, inp, out, ws, **{**base, "block_table": wide})
+        with pytest.raises(RuntimeError, match="compile"):
+            _exec(blk, inp, out, ws, **base)
+
+
+def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_dependent_grid(monkeypatch):
+    """The ONLY ordering between the cache write and the paged read is STREAM order.  Pinned: (1) the write-through stage compiles
+    its kernels with ``use_pdl`` False (the runner's default; the stage passes nothing else -- a spy on the compile entry records
+    every call's kwargs), so the cache write never launches as a programmatic dependent launch; (2) no SDPA body the form can
+    run -- the shared d256 paged body compiled for Rubin and the Rubin sibling -- waits on a dependent grid or launches with
+    PDL (a static detector over their SOURCE TEXT: a kernel adopting PDL after a pool write must wait before its first K / V load);
+    (3) the runner's compile entry defaults ``use_pdl`` to False."""
+    import inspect
+
+    import cudnn.gated_attention_block.kernels.cache_write as cw
+
+    assert inspect.signature(cw.compile_cache_write).parameters["use_pdl"].default is False
+    calls = []
+
+    def spy(**kw):
+        calls.append(dict(kw))
+        return cw.CacheWriteRecipe(
+            compiled=None,
+            h=kw["h"],
+            d=kw["d"],
+            page_size=kw["page_size"],
+            rows_per_cta=1,
+            two_operands=kw["two_operands"],
+            dtype=kw["dtype"],
+            slot_dtype=kw["slot_dtype"],
+        )
+
+    monkeypatch.setattr(cw, "compile_cache_write", spy)
+    blk, *_ = _declare_extend(2, 128, max_kv_len=128)
+    blk._cache_write.compile()
+    assert len(calls) == 2 and all(c.get("use_pdl", False) is False for c in calls), calls
+    assert "use_pdl" not in inspect.getsource(_CacheWrite.compile)
+    for mod in ("cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16", "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16"):
+        src = _kernel_source(mod)
+        for token in ("griddepcontrol", "wait_on_dependent_grids", "launch_dependent_grids", "use_pdl=True"):
+            assert token not in src, (mod, token)
+
+
+# ---------------------------------------------------------------------------
+# The step harness: histories, pages, slots, the pools' prefix rows, the per-sequence oracle
+# ---------------------------------------------------------------------------
+
+
+class _ExtendHarness:
+    """A declared + compiled EXTEND block and the serving state the cells drive it with: per sequence the FULL token history
+    (prefix + new tokens, drawn once and extended per step), its pages (distinct, from a shuffled pool; the NULL page for a padded
+    entry), the pools (``_STALE`` everywhere nobody wrote, the NULL page zero), the once-zeroed workspace (the serving stack's
+    convention under ``token_capacity``) and the step's PERSISTENT device tensors (``h`` / ``cos`` / ``sin`` / ``slot`` / ``table`` /
+    ``kv_lens`` / ``seq_lens``: rewritten in place every step, so a CUDA graph captured once replays new steps through them)."""
+
+    def __init__(
+        self, b_max, t_max, *, max_kv_len, page=16, layout="hnd", dtype=torch.bfloat16, cu=True, row_stride=None, slot_dtype=torch.int32, seed=0, **blk_kw
+    ):
+        self.blk, self.inp, self.out, self.samples = _declare_extend(
+            b_max, t_max, max_kv_len=max_kv_len, page=page, layout=layout, dtype=dtype, cu=cu, row_stride=row_stride, seed=seed, **blk_kw
+        )
+        self.b_max, self.t_max, self.page, self.layout, self.dtype, self.cu = b_max, t_max, page, layout, dtype, cu
+        self.geom, self.ref_geom = self.blk.geom, RefGeometry(**_SMALL_D256)
+        self.k_cache, self.v_cache, self.table = self.samples["sample_k_cache"], self.samples["sample_v_cache"], self.samples["sample_block_table"]
+        self.n_pages, self.max_pages = int(self.k_cache.shape[0]), int(self.table.shape[1])
+        self.slot = torch.full((t_max,), -1, device="cuda", dtype=slot_dtype)
+        self.kv_t = torch.zeros(b_max, device="cuda", dtype=torch.int32)
+        self.seq_t = torch.zeros(b_max + 1 if cu else b_max, device="cuda", dtype=torch.int32)
+        self.gen = torch.Generator(device="cuda").manual_seed(1000 + seed)
+        self.hist = [None] * b_max
+        self.pages = [[] for _ in range(b_max)]
+        self.free = torch.randperm(self.n_pages - 1, generator=self.gen, device="cuda").add(1).tolist()  # never the NULL page
+        self.blk.check_support()
+        self.blk.compile()
+        self.ws = torch.zeros(self.blk.get_workspace_size(), dtype=torch.uint8, device="cuda")  # zeroed ONCE: pad rows read zeros forever
+
+    # -- state --------------------------------------------------------------
+
+    def reset(self):
+        """Fresh sequences: forget the histories and the pages, re-fill the pools with the stale value (NULL page zero)."""
+        self.hist = [None] * self.b_max
+        self.free = self.free + [p for row in self.pages for p in row]
+        self.pages = [[] for _ in range(self.b_max)]
+        for pool in (self.k_cache, self.v_cache):
+            pool.fill_(_STALE)
+            pool[_NULL_PAGE].zero_()
+
+    def refill_pools(self):
+        """The pools back to the stale value (NULL page zero) with the histories and the pages KEPT: the next step re-runs the same
+        sequences (the prefix rows are re-written by the step's prefill, the new tokens by the block)."""
+        for pool in (self.k_cache, self.v_cache):
+            pool.fill_(_STALE)
+            pool[_NULL_PAGE].zero_()
+
+    def adopt(self, other):
+        """Take another harness's histories and pages (the tight twin of a bounded declaration runs the SAME sequences)."""
+        self.hist = [None if h is None else h.clone() for h in other.hist]
+        self.pages = [list(p) for p in other.pages]
+        self.free = list(other.free)
+
+    def _extend_history(self, b, kv_len):
+        have = 0 if self.hist[b] is None else int(self.hist[b].shape[0])
+        if kv_len > have:
+            new = torch.randn(kv_len - have, self.geom.d_model, generator=self.gen, device="cuda", dtype=torch.float32).to(self.dtype)
+            self.hist[b] = new if self.hist[b] is None else torch.cat([self.hist[b], new])
+        need = -(-kv_len // self.page)
+        while len(self.pages[b]) < need:
+            self.pages[b].append(self.free.pop())
+
+    def oracle(self, b):
+        """The dense fp32 oracle over sequence ``b``'s FULL history (positions 0 .. kv_len - 1): its ``out`` / ``o_gated`` rows past the
+        prefix are the step's expected rows, its ``k`` / ``v`` the pool rows."""
+        h = self.hist[b]
+        cos, sin = build_rope_tables(int(h.shape[0]), self.geom.rope_dim, base=self.ref_geom.rope_base, batch=1, device="cuda", dtype=self.dtype)
+        return gated_attention_block_reference(
+            h[None], self.inp["w_qkvg"], self.inp["w_q_norm"], self.inp["w_k_norm"], cos, sin, self.inp["w_o"], self.ref_geom
+        )
+
+    def slot_of(self, b, j):
+        return self.pages[b][j // self.page] * self.page + j % self.page
+
+    def pool_rows(self, b, lo, hi):
+        """Logical rows ``[lo, hi)`` of sequence ``b`` read back through the stack's own views: ``(K [n, H_kv, D], V [n, H_kv, D])``."""
+        s = torch.tensor([self.slot_of(b, j) for j in range(lo, hi)], device="cuda")
+        return self.k_cache[s // self.page, :, s % self.page, :], self.v_cache[s // self.page, :, s % self.page, :]
+
+    def write_pool_rows(self, b, lo, hi, k_rows, v_rows):
+        """Write logical rows ``[lo, hi)`` of sequence ``b`` into the pools as a torch caller would (the layout proof's other half)."""
+        s = torch.tensor([self.slot_of(b, j) for j in range(lo, hi)], device="cuda")
+        self.k_cache[s // self.page, :, s % self.page, :] = k_rows
+        self.v_cache[s // self.page, :, s % self.page, :] = v_rows
+
+    # -- one step -----------------------------------------------------------
+
+    def prepare(self, q_lens, *, prefix_lens=None, prefill="reference", kv_lens=None, out_fill=None, cos_pad=1.0):
+        """Build ONE step's state IN PLACE (no execute): ``q_lens[b]`` new tokens per sequence (0 = a padded / absent entry) after a
+        prefix of ``prefix_lens[b]`` (default: the sequence's current history = a continuing chunk); the pools' prefix rows from the
+        torch reference (``"reference"``: the prefix-hit case), from the previous step (``"keep"``: the chunked case) or none
+        (``"none"``, prefix 0); ``kv_lens`` overrides the logical lengths (the dead-KV cell); ``out_fill`` sentinel-fills ``out``.
+        Returns the step record (the oracle per live sequence included)."""
+        b_max, t_max, page = self.b_max, self.t_max, self.page
+        prefix_lens = [0 if self.hist[b] is None else int(self.hist[b].shape[0]) for b in range(b_max)] if prefix_lens is None else list(prefix_lens)
+        q_lens = list(q_lens)
+        assert len(q_lens) == len(prefix_lens) == b_max
+        logical = [p + q for p, q in zip(prefix_lens, q_lens)]
+        kv_lens = logical if kv_lens is None else list(kv_lens)
+        t_live = sum(q_lens)
+        assert t_live <= t_max
+        for b in range(b_max):
+            if logical[b] > 0:
+                self._extend_history(b, logical[b])
+        refs = [self.oracle(b) if logical[b] > 0 else None for b in range(b_max)]
+        if prefill == "reference":
+            for b in range(b_max):
+                if prefix_lens[b] > 0:
+                    self.write_pool_rows(b, 0, prefix_lens[b], refs[b].k[0, : prefix_lens[b]], refs[b].v[0, : prefix_lens[b]])
+        elif prefill != "keep":
+            assert prefill == "none" and all(p == 0 for p in prefix_lens)
+        h, cos, sin = self.inp["h"], self.inp["cos"], self.inp["sin"]
+        h.zero_()
+        cos.fill_(cos_pad)
+        sin.zero_()
+        slots = [-1] * t_max
+        row = 0
+        rows = []
+        for b in range(b_max):
+            q, p = q_lens[b], prefix_lens[b]
+            rows.append((row, row + q))
+            if q:
+                h[row : row + q] = self.hist[b][p : p + q]
+                c, s = build_rope_tables(
+                    q,
+                    self.geom.rope_dim,
+                    base=self.ref_geom.rope_base,
+                    batch=1,
+                    device="cuda",
+                    dtype=self.dtype,
+                    positions=torch.arange(p, p + q, device="cuda")[None],
+                )
+                cos[row : row + q] = c[0]
+                sin[row : row + q] = s[0]
+                if kv_lens[b] >= p + q:  # the step's tokens have slots iff they are inside the logical range (a dead-KV entry writes nothing)
+                    slots[row : row + q] = [self.slot_of(b, j) for j in range(p, p + q)]
+            row += q
+        self.slot.copy_(torch.tensor(slots, dtype=self.slot.dtype))
+        self.table.zero_()
+        for b in range(b_max):
+            if kv_lens[b] > 0:
+                n = -(-kv_lens[b] // page)
+                self.table[b, :n] = torch.tensor(self.pages[b][:n], device="cuda", dtype=torch.int32)
+        self.kv_t.copy_(torch.tensor(kv_lens, dtype=torch.int32))
+        self.seq_t.copy_(torch.tensor(cu_seqlens_of(q_lens) if self.cu else q_lens, dtype=torch.int32))
+        if out_fill is not None:
+            self.out.fill_(out_fill)
+        torch.cuda.synchronize()
+        return dict(q_lens=q_lens, prefix_lens=prefix_lens, kv_lens=kv_lens, t_live=t_live, rows=rows, refs=refs)
+
+    def execute(self, current_stream=None):
+        """The block's execute over the prepared state (the ONE call a serving stack captures)."""
+        self.blk.execute(
+            self.inp["h"],
+            self.inp["w_qkvg"],
+            self.inp["w_q_norm"],
+            self.inp["w_k_norm"],
+            self.inp["cos"],
+            self.inp["sin"],
+            self.inp["w_o"],
+            self.out,
+            self.ws,
+            seq_lens=self.seq_t,
+            current_stream=current_stream,
+            k_cache=self.k_cache,
+            v_cache=self.v_cache,
+            block_table=self.table,
+            kv_lens=self.kv_t,
+            slot_mapping=self.slot,
+        )
+
+    def step(self, q_lens, **kw):
+        """``prepare`` + ``execute`` eagerly; the record carries ``out``."""
+        rec = self.prepare(q_lens, **kw)
+        self.execute()
+        torch.cuda.synchronize()
+        rec["out"] = self.out.clone()
+        return rec
+
+    # -- the checks ---------------------------------------------------------
+
+    def slab_rows(self):
+        """The post-RoPE K / V rows attention would consume, as ``[T_max, H_kv, D]`` views of the workspace (the slab bands in place,
+        the compact buffers out of place)."""
+        g, t, lay = self.geom, self.t_max, self.blk._layout()
+        if not self.blk.inplace_qkv:
+            return _view(self.ws, lay.k, (t, g.h_kv, g.d_head), self.dtype), _view(self.ws, lay.v, (t, g.h_kv, g.d_head), self.dtype)
+        proj = _view(self.ws, lay.proj, (t, g.n_qkvg), self.dtype)
+        return _cols(proj, g.qkvg_offsets[2], g.h_kv, g.d_head), _cols(proj, g.qkvg_offsets[3], g.h_kv, g.d_head)
+
+    def o_gated(self):
+        """The gated O the SDPA + gate left in the ``o`` slot (in place under inference), ``[T_max, H_q, D]``."""
+        g, lay = self.geom, self.blk._layout()
+        return _view(self.ws, lay.o, (self.t_max, g.h_q, g.d_head), self.dtype)
+
+    def check(self, rec, *, label, out_cos=0.999, o_atol=2e-2):
+        """Every assertion a step owes: ``isfinite(out)`` over EVERY row first; per live sequence the dense suite's budget vs the
+        oracle over its full history (``out`` cos, gated ``O`` cos + atol 2e-2); a live-Q dead-KV sequence's rows exactly 0; the new
+        tokens' pool rows bitwise the slab rows attention consumed; every pool row nobody addressed still stale (NULL page zero).
+        Collects per-sequence verdicts, prints one line each, asserts at the end."""
+        out, g = rec["out"], self.geom
+        assert torch.isfinite(out.float()).all(), f"{label}: non-finite out rows: {int((~torch.isfinite(out.float())).any(-1).sum())}"
+        og = self.o_gated()
+        failures = []
+        for b, ((lo, hi), ref) in enumerate(zip(rec["rows"], rec["refs"])):
+            q, p = rec["q_lens"][b], rec["prefix_lens"][b]
+            if q == 0:
+                print(f"{label} seq {b}: no new tokens (kv_len {rec['kv_lens'][b]})")
+                continue
+            if rec["kv_lens"][b] == 0:
+                dead = out[lo:hi]
+                if not bool((dead == 0).all()):
+                    failures.append(f"seq {b}: dead-KV rows not exactly 0 (max |out| {dead.float().abs().max().item():.3e})")
+                else:
+                    print(f"{label} seq {b}: live Q over kv_len 0 -> {q} out rows exactly 0")
+                continue
+            want_out, want_og = ref.out[0, p : p + q], ref.o_gated[0, p : p + q]
+            c = _cos(out[lo:hi], want_out)
+            co = _cos(og[lo:hi], want_og)
+            err = (og[lo:hi].float() - want_og.float()).abs().max().item()
+            print(f"{label} seq {b}: q {q} prefix {p} kv_len {rec['kv_lens'][b]}: out cos {c:.6f}, gated-O cos {co:.6f} max|err| {err:.3e}")
+            if not (c > out_cos and co > out_cos and err <= o_atol and torch.isfinite(og[lo:hi].float()).all()):
+                failures.append(f"seq {b}: out cos {c:.6f} gated-O cos {co:.6f} max|err| {err:.3e}")
+        assert not failures, f"{label}: " + "; ".join(failures)
+        # the write-through half on the step's tokens, then the stale rows
+        slot = self.slot
+        live = slot >= 0
+        k_rows, v_rows = self.slab_rows()
+        if bool(live.any()):
+            assert torch.equal(_bits(_rows_at(self.k_cache, slot, self.page)), _bits(k_rows[live])), f"{label}: the K pool is not the K attention consumed"
+            assert torch.equal(_bits(_rows_at(self.v_cache, slot, self.page)), _bits(v_rows[live])), f"{label}: the V pool is not the V attention consumed"
+        addressed = sorted({self.slot_of(b, j) for b in range(self.b_max) for j in range(rec["kv_lens"][b])})
+        mask = torch.ones(self.n_pages * self.page, dtype=torch.bool, device="cuda")
+        if addressed:
+            mask[torch.tensor(addressed, device="cuda")] = False
+        mask[: self.page] = False  # the NULL page is zero, never stale
+        for pool in (self.k_cache, self.v_cache):
+            flat = pool.permute(0, 2, 1, 3).reshape(self.n_pages * self.page, g.h_kv, g.d_head)
+            assert bool((flat[mask] == _STALE).all()), f"{label}: a pool row nobody addressed was written"
+            assert bool((pool[_NULL_PAGE] == 0).all()), f"{label}: the NULL page was written"
+
+
+_HARNESS = {}  # the declaration key -> _ExtendHarness: ONE compiled block per declaration, the cells vary the packing (device data)
+
+
+def _harness(b_max, t_max, *, max_kv_len, page=16, layout="hnd", dtype=torch.bfloat16, cu=True, row_stride=None, slot_dtype=torch.int32, seed=0, **blk_kw):
+    key = (dtype, page, layout, cu, b_max, t_max, max_kv_len, row_stride, slot_dtype, seed, tuple(sorted(blk_kw.items())))
+    if key not in _HARNESS:
+        _HARNESS[key] = _ExtendHarness(
+            b_max, t_max, max_kv_len=max_kv_len, page=page, layout=layout, dtype=dtype, cu=cu, row_stride=row_stride, slot_dtype=slot_dtype, seed=seed, **blk_kw
+        )
+    hz = _HARNESS[key]
+    hz.reset()
+    return hz
+
+
+def _dense_block_on(hz, h_full):
+    """The dense ``B = 1, S = kv_len`` block on a sequence's full history, on the SAME weights and the same (bottom-right) geometry:
+    returns ``(out [S, d_model], o_gated [S, H_q, D])``."""
+    s = int(h_full.shape[0])
+    cos, sin = build_rope_tables(s, hz.geom.rope_dim, base=hz.ref_geom.rope_base, batch=1, device="cuda", dtype=hz.dtype)
+    out = torch.empty(1, s, hz.geom.d_model, device="cuda", dtype=hz.dtype)
+    blk = GatedAttentionBlockFwd(h_full[None], hz.inp["w_qkvg"], hz.inp["w_q_norm"], hz.inp["w_k_norm"], cos, sin, hz.inp["w_o"], out, hz.geom)
+    blk.check_support()
+    blk.compile()
+    ws = torch.zeros(blk.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    blk.execute(h_full[None], hz.inp["w_qkvg"], hz.inp["w_q_norm"], hz.inp["w_k_norm"], cos, sin, hz.inp["w_o"], out, ws)
+    torch.cuda.synchronize()
+    og = _view(ws, blk._layout().o, (s, hz.geom.h_q, hz.geom.d_head), hz.dtype).clone()
+    return out[0].clone(), og
+
+
+# ---------------------------------------------------------------------------
+# Rubin: the EXTEND cells
+# ---------------------------------------------------------------------------
+
+
+@requires_rubin
+def test_extend_one_sequence_empty_prefix_at_a_tight_declaration_vs_the_dense_block():
+    """(a) ONE sequence, EMPTY prefix, the TIGHT declaration (T_live = T_max = S = 384, a tail tile): the EXTEND step reads the step's
+    own tokens back from the pool it just wrote and must equal the dense ``B = 1`` block on the same tokens -- the SAME bytes in the same
+    tile order; the two legs are DIFFERENT bodies (the shared d256 paged THD body compiled for Rubin vs the Rubin sibling) and MEASURED
+    bitwise on both ``out`` and the gated O (0 of 196 608 / 786 432 elements differ on the Rubin development node, 2026-10-13), so bitwise
+    is pinned here -- a legitimately changed arithmetic order on either body relaxes this to the recorded one-rounding bound in the
+    open, never silently; both legs stay within the dense suite's budget against the oracle."""
+    hz = _harness(1, 384, max_kv_len=384, page=16, layout="hnd")
+    rec = hz.step([384], prefix_lens=[0], prefill="none")
+    hz.check(rec, label="(a) empty prefix tight")
+    out_dense, og_dense = _dense_block_on(hz, hz.hist[0])
+    out_ext, og_ext = rec["out"], hz.o_gated()
+    d_out = (out_ext.float() - out_dense.float()).abs().max().item()
+    d_og = (og_ext.float() - og_dense.float()).abs().max().item()
+    bitwise = torch.equal(out_ext, out_dense) and torch.equal(og_ext, og_dense)
+    print(
+        f"(a) EXTEND vs dense B=1 S=384: bitwise={bitwise} max|diff| out {d_out:.3e} (|out| max {out_dense.float().abs().max().item():.3f}), "
+        f"gated O {d_og:.3e} (|O| max {og_dense.float().abs().max().item():.3f})"
+    )
+    ref = rec["refs"][0]
+    assert torch.isfinite(out_dense.float()).all() and _cos(out_dense, ref.out[0]) > 0.999 and _cos(out_ext, ref.out[0]) > 0.999
+    torch.testing.assert_close(og_dense.float(), ref.o_gated[0].float(), rtol=0, atol=2e-2)
+    assert bitwise, f"the EXTEND step is no longer bitwise the dense block: max|diff| out {d_out:.3e}, gated O {d_og:.3e} (recorded bitwise)"
+
+
+@requires_rubin
+def test_extend_two_chunks_match_the_single_shot_dense_block_and_the_oracle():
+    """(b) a 512-token sequence as TWO chunks on ONE compiled block (T_max 320 > both chunks: a bounded declaration with pad rows):
+    chunk 1 = tokens [0, 300) with an empty prefix (kv_len 300), chunk 2 = tokens [300, 512) reading chunk 1's pool rows (kv_len 512).
+    Each chunk's rows vs the single-shot dense block over [0, 512) and vs the oracle within the dense suite's budget (cos >= 0.999 on
+    ``out``, atol 2e-2 on the gated O); the pool after both chunks within the write-through's bars of the oracle's K / V over all 512
+    positions (the token-wise stages at the same positions).  MEASURED bitwise the single-shot block on both chunks' ``out`` and gated O
+    (the Rubin development node, 2026-10-13): pinned, with the budget kept."""
+    hz = _harness(1, 320, max_kv_len=512, page=16, layout="hnd")
+    rec1 = hz.step([300], prefix_lens=[0], prefill="none")
+    hz.check(rec1, label="(b) chunk 1")
+    og1 = hz.o_gated()[:300].clone()
+    rec2 = hz.step([212], prefill="keep")
+    hz.check(rec2, label="(b) chunk 2 over chunk 1's pool rows")
+    og2 = hz.o_gated()[:212].clone()
+    out_dense, og_dense = _dense_block_on(hz, hz.hist[0])
+    ref = rec2["refs"][0]
+    for label, rec, og, lo, hi in (("chunk 1", rec1, og1, 0, 300), ("chunk 2", rec2, og2, 300, 512)):
+        o = rec["out"][: hi - lo]
+        c_d, c_r = _cos(o, out_dense[lo:hi]), _cos(o, ref.out[0, lo:hi])
+        d = (o.float() - out_dense[lo:hi].float()).abs().max().item()
+        d_og = (og.float() - og_dense[lo:hi].float()).abs().max().item()
+        print(f"(b) {label} vs single-shot dense: out cos {c_d:.6f} max|diff| {d:.3e}, gated O max|diff| {d_og:.3e}; vs oracle out cos {c_r:.6f}")
+        assert c_d > 0.999 and c_r > 0.999
+        torch.testing.assert_close(og.float(), ref.o_gated[0, lo:hi].float(), rtol=0, atol=2e-2)
+        assert torch.equal(o, out_dense[lo:hi]) and torch.equal(og, og_dense[lo:hi]), f"{label}: no longer bitwise the single-shot block (recorded bitwise)"
+    k_all, v_all = hz.pool_rows(0, 0, 512)
+    torch.testing.assert_close(v_all.float(), ref.v[0].float(), **_BAND_BAR)
+    torch.testing.assert_close(k_all.float(), ref.k[0].float(), rtol=_BAND_BAR["rtol"], atol=_NORM_ATOL[hz.dtype])
+
+
+@requires_rubin
+def test_extend_prefix_hit_pool_prefilled_by_the_torch_reference_on_l3():
+    """(c) the prefix-hit step on the UNIFIED content row (L3): three sequences whose prefixes (200 / 0 / 77 rows) were written into
+    the pool by the TORCH REFERENCE through the stack's own views (``kv_cache[page, :, offset, :D]`` / ``[..., D:]``) -- FROST reads
+    what torch wrote (the step's rows vs the oracle over the full history), and torch reads back what FROST wrote (the new tokens'
+    rows read through the same views are bitwise the slab rows, ``check``): the cross-implementation LAYOUT proof, both directions."""
+    hz = _harness(3, 512, max_kv_len=512, page=16, layout="unified")
+    assert hz.k_cache.data_ptr() + hz.geom.d_head * hz.k_cache.element_size() == hz.v_cache.data_ptr() and hz.k_cache.stride(2) == 2 * hz.geom.d_head
+    rec = hz.step([56, 128, 300], prefix_lens=[200, 0, 77], prefill="reference")
+    hz.check(rec, label="(c) prefix hit on L3")
+    # the prefix rows torch wrote are untouched by the step (the SDPA reads, the write-through addresses the new tokens only)
+    for b, p in ((0, 200), (2, 77)):
+        k_p, v_p = hz.pool_rows(b, 0, p)
+        assert torch.equal(_bits(k_p), _bits(rec["refs"][b].k[0, :p])) and torch.equal(_bits(v_p), _bits(rec["refs"][b].v[0, :p]))
+
+
+@requires_rubin
+def test_extend_l1_and_l3_pools_holding_the_same_values_are_bitwise():
+    """(d) the three pool layouts on the paged THD read: the same step (histories, prefixes, pages) on an L1 (HND compact), an L2 (NHD by strides) and
+    an L3 (unified row) declaration -- three compiled plans (the pool layout is compiled in) over pools holding the same values --
+    give a bitwise identical ``out``."""
+    outs = {}
+    for layout in SERVING_POOL_LAYOUTS:
+        hz = _harness(3, 512, max_kv_len=512, page=32, layout=layout, seed=3)
+        rec = hz.step([56, 128, 300], prefix_lens=[200, 0, 77], prefill="reference")
+        hz.check(rec, label=f"(d) {layout}")
+        outs[layout] = rec["out"].clone()
+    for layout in ("nhd", "unified"):
+        assert torch.equal(outs["hnd"], outs[layout]), f"(d) {layout} differs from hnd"
+
+
+@requires_rubin
+@pytest.mark.parametrize("page", _PAGES)
+@pytest.mark.parametrize("layout", _LAYOUTS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_extend_matrix_on_every_layout_and_page(dtype, layout, page):
+    """(e) the degenerate matrix on serving buffers, one declaration per (dtype, layout, page): four sequences at T_max 512 -- a
+    128-token sequence with an empty prefix (n_kv = 1; B x H_kv > 1 with it), an 84-token step over a 300-row prefix ending mid-page
+    (kv_len 384 = 3 tiles), a PADDED entry (kv_len 0, the NULL block, no rows), a 200-token step over a 77-row prefix (kv_len 277: a
+    tail tile, n_kv = 3) -- T_live 412 < 512 (pads at the END, slot -1); isfinite(out) before any cosine; every live sequence within the
+    dense suite's budget of the oracle; the pools bitwise the slab rows at the step's slots, stale everywhere else; the int64 slot
+    dtype at pages 32 / 128."""
+    hz = _harness(4, 512, max_kv_len=512, page=page, layout=layout, dtype=dtype, slot_dtype=torch.int32 if page in (16, 64) else torch.int64)
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    assert rec["t_live"] == 412
+    hz.check(rec, label=f"(e) 8/2 {dtype} {layout} p{page}")
+
+
+@requires_rubin
+def test_extend_padded_entries_in_the_middle_and_a_live_q_over_kv_len_0():
+    """(e) the general packing: a zero-length sequence in the MIDDLE (B_live < B_max), and -- the serving stacks' padded request in
+    its THD form -- a LIVE Q range (5 new tokens) over kv_len 0 with the NULL block and slot -1: those 5 ``out`` rows are
+    EXACTLY 0 (the dead-row SELECT, never a residue), nothing is written to the NULL block, the neighbours are unaffected."""
+    hz = _harness(4, 512, max_kv_len=512, page=16, layout="hnd")
+    rec = hz.step([100, 0, 60, 5], prefix_lens=[0, 0, 0, 0], prefill="none", kv_lens=[100, 0, 60, 0])
+    hz.check(rec, label="(e) middle pad + dead KV")
+    lo, hi = rec["rows"][3]
+    assert bool((rec["out"][lo:hi] == 0).all()) and bool((hz.o_gated()[lo:hi] == 0).all())
+    assert rec["t_live"] == 165 and bool((hz.slot[lo:hi] == -1).all())
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_kv", [1, 2, 3, 4, 8])
+def test_extend_n_kv_tiles_and_the_ring_wrap(n_kv):
+    """(e) one sequence of 64 new tokens over a prefix bringing kv_len to exactly 128 x n_kv (whole tiles: 1, 2, the ring depth 3 and 4,
+    the wrap at 8) and to 128 x n_kv - 37 (a tail tile), on L2 at page 64 -- the prefix from the reference."""
+    hz = _harness(1, 64, max_kv_len=1024, page=64, layout="nhd", seed=n_kv)
+    for kv_len in (128 * n_kv, 128 * n_kv - 37):
+        hz.reset()
+        rec = hz.step([64], prefix_lens=[kv_len - 64], prefill="reference")
+        hz.check(rec, label=f"(e) n_kv {n_kv} kv_len {kv_len}")
+
+
+@requires_rubin
+def test_extend_block_table_row_slice_at_an_arbitrary_row_stride():
+    """(e) a row-sliced block table through the BLOCK API: the block table is a ``[:, :max_pages]`` slice of a wider ``[B_max, 50]`` table (row stride 50,
+    declared by the sample) -- the step over it equals the same step over a compact table bitwise."""
+    hz_sliced = _harness(3, 256, max_kv_len=256, page=16, layout="hnd", row_stride=50, seed=5)
+    rec_s = hz_sliced.step([100, 0, 156], prefix_lens=[60, 0, 100], prefill="reference")
+    hz_sliced.check(rec_s, label="(e) row-sliced table")
+    hz = _harness(3, 256, max_kv_len=256, page=16, layout="hnd", seed=5)
+    rec = hz.step([100, 0, 156], prefix_lens=[60, 0, 100], prefill="reference")
+    hz.check(rec, label="(e) compact table")
+    assert torch.equal(rec_s["out"], rec["out"])
+
+
+@requires_rubin
+def test_extend_finite_stale_rows_past_kv_len_do_not_change_out():
+    """(e) a prefix ending mid-page: the rows of the last live page past kv_len hold another sequence's stale values -- FINITE, the
+    serving pools' contract (zero-initialised, then stale rows) -- and never change the result: the step over a 777-filled tail is
+    bitwise the step over a zero-filled tail (the masked columns' P is exactly 0, and 0 x finite = 0)."""
+    hz = _harness(2, 256, max_kv_len=512, page=64, layout="hnd", seed=7)
+    rec_stale = hz.step([40, 200], prefix_lens=[300, 77], prefill="reference")
+    hz.check(rec_stale, label="(e) stale tail 777")
+    for b in range(2):
+        kv = rec_stale["kv_lens"][b]
+        last = hz.pages[b][(kv - 1) // 64]
+        hz.k_cache[last, :, kv % 64 :, :] = 0
+        hz.v_cache[last, :, kv % 64 :, :] = 0
+    rec_zero = hz.step([40, 200], prefix_lens=[300, 77], prefill="reference")
+    assert torch.equal(rec_stale["out"], rec_zero["out"])
+
+
+@requires_rubin
+def test_extend_bounded_tokens_live_rows_bitwise_the_tight_declaration_and_pad_rows_exactly_zero():
+    """(f) the bounded token form: the matrix packing (T_live 412) at T_max 512 vs the SAME packing on a TIGHT declaration (T_max =
+    412): live rows BITWISE; on a sentinel-filled ``out`` over the once-zeroed workspace the pad rows [412, 512) are EXACTLY 0 (an
+    unwritten ``o`` row is 0, so ``0 x sigmoid(G_pad) = 0`` and ``0 @ W_o = 0``) and the pad tokens' slots (-1) write nothing; a
+    SECOND step with fewer live tokens (300) on the same workspace leaves [300, 412) FINITE (stale O rows -- unspecified, as the
+    contract says) and [412, 512) still exactly 0."""
+    hz = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=11)
+    sentinel = _OUT_SENTINEL[hz.dtype]
+    rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference", out_fill=sentinel)
+    hz.check(rec, label="(f) bounded T_live 412 / 512")
+    out = rec["out"]
+    assert bool((out[412:] == 0).all()), f"pad rows not exactly 0: {int((out[412:] != 0).any(-1).sum())} rows"
+    assert not bool((out == sentinel).any())
+    og_bounded = hz.o_gated()[:412].clone()
+    tight = _harness(4, 412, max_kv_len=512, page=16, layout="hnd", seed=11)
+    tight.adopt(hz)
+    rec_t = tight.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference", out_fill=sentinel)
+    tight.check(rec_t, label="(f) tight T_live = T_max = 412")
+    assert torch.equal(out[:412], rec_t["out"]), "live rows differ between the bounded and the tight declaration"
+    assert torch.equal(_bits(og_bounded), _bits(tight.o_gated()))
+    rec2 = hz.step(_SECOND_PACKING["q_lens"], prefix_lens=_SECOND_PACKING["prefix_lens"], prefill="keep", out_fill=sentinel)
+    hz.check(rec2, label="(f) second step T_live 300")
+    assert rec2["t_live"] == 300
+    assert torch.isfinite(rec2["out"].float()).all() and bool((rec2["out"][412:] == 0).all()) and not bool((rec2["out"] == sentinel).any())
+
+
+@requires_rubin
+def test_extend_two_launches_are_bitwise():
+    """The SAME step twice (histories and pages kept, the pools re-filled with the stale value in between): ``out``, the gated O and the
+    pools bitwise across the two launches (a first-launch race would show here first)."""
+    hz = _harness(4, 512, max_kv_len=512, page=32, layout="unified", seed=13)
+    runs = []
+    for _ in range(2):
+        hz.refill_pools()
+        rec = hz.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+        hz.check(rec, label="(e) two launches")
+        runs.append((rec["out"], hz.o_gated().clone(), _bits(hz.k_cache).clone(), _bits(hz.v_cache).clone()))
+    for a, b in zip(runs[0], runs[1]):
+        assert torch.equal(a, b)
+
+
+@requires_rubin
+def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and_slots():
+    """(g) vLLM's defaults: a FRESH EXTEND declaration whose FIRST execute is captured inside ``torch.cuda.graph`` on a NEW stream
+    with no eager warm-up, under ``set_sync_debug_mode("error")`` (no host sync in the capture); the capture launches nothing (the
+    sentinel survives), the replay is bitwise a fresh eager run; then a NEW step -- new lengths, tables, slots and pool contents
+    written through the captured tensors (the next chunk of the same sequences) -- replays to the eager result over it."""
+    hz = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=17)
+    twin = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=17)
+    sentinel = _OUT_SENTINEL[hz.dtype]
+    rec = hz.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference", out_fill=sentinel)
+    stream = torch.cuda.Stream()  # NEW: the block never ran on it, nothing ran on it
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                hz.execute()  # the FIRST execute of this declaration, captured
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert bool((hz.out == sentinel).all()), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        rec["out"] = hz.out.clone()
+        hz.check(rec, label="(g) replay of the captured first execute")
+        rec_e = twin.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference", out_fill=sentinel)
+        twin.check(rec_e, label="(g) eager twin")
+        assert torch.equal(rec["out"], rec_e["out"]), "the replay of the captured first execute differs from the eager run"
+        # the next chunk: new lengths / tables / slots / pool contents through the captured tensors
+        rec2 = hz.prepare(_SECOND_PACKING["q_lens"], prefix_lens=_SECOND_PACKING["prefix_lens"], prefill="keep", out_fill=sentinel)
+        graph.replay()
+        torch.cuda.synchronize()
+        rec2["out"] = hz.out.clone()
+        hz.check(rec2, label="(g) replay over the next chunk")
+        rec2_e = twin.step(_SECOND_PACKING["q_lens"], prefix_lens=_SECOND_PACKING["prefix_lens"], prefill="keep", out_fill=sentinel)
+        twin.check(rec2_e, label="(g) eager twin, next chunk")
+        assert torch.equal(rec2["out"], rec2_e["out"]), "the replay over new lengths / tables / slots differs from the eager run over them"
+    finally:
+        graph.reset()

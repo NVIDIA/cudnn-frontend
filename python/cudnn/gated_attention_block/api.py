@@ -297,9 +297,10 @@ import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
+import dataclasses
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import torch
 from cuda.bindings import driver as cuda
@@ -509,6 +510,63 @@ _N_MAX_SPARSE_V1 = 16
 PAGED_KV_PAGE_ALIGN = 16
 """``paged_kv_page_size`` must be a positive multiple of this: the serving stacks allocate pages in multiples of 16 tokens,
 and 4 | 16 keeps every 4-token sparse block inside one page (a block never straddles a page boundary)."""
+
+# The SECOND serving attribute: where stage (4) reads K / V from.  ``"self"`` (the default) is the block as it always was --
+# attention over the step's own K / V (the slab bands or the compact buffers).  ``"paged"`` is the EXTEND form: the step's
+# tokens are written through into the pools first (the write-through above, which it therefore requires) and the SDPA reads
+# every sequence's K / V -- its prefix AND the step's new tokens -- from the POOLS through a block table and the per-sequence
+# logical KV lengths, on the bottom-right causal diagonal.  A declaration attribute (it changes the input contract: ``execute``
+# then REQUIRES ``block_table`` / ``kv_lens`` and the pools' layout is compiled in from the samples), never a knob.
+KV_SOURCE_SELF = "self"
+"""``kv_source``: stage (4) attends over the block's own K / V (the default; the dense and the packed block as before)."""
+KV_SOURCE_PAGED = "paged"
+"""``kv_source``: the EXTEND form -- stage (4) reads K / V from the paged pools via ``execute(block_table=, kv_lens=)``."""
+_KV_SOURCES = (KV_SOURCE_SELF, KV_SOURCE_PAGED)
+SERVING_PAGE_SIZES = (16, 32, 64, 128)
+"""The page sizes the serving forms are VALIDATED at (the kernel block sizes the serving stacks allocate); the attribute itself
+takes any positive multiple of :data:`PAGED_KV_PAGE_ALIGN` and the SDPA adapter's own page rule still applies."""
+SERVING_POOL_LAYOUTS = ("hnd", "nhd", "unified")
+"""The three pool stride patterns the serving forms are validated on: HND compact ``(H*P*D, P*D, D, 1)``, NHD by strides
+``(P*H*D, D, H*D, 1)``, and a unified ``[num_pages, H_kv, P, 2D]`` content row (K at ``+0``, V at ``+D``) bound as its two halves."""
+
+
+@dataclass(frozen=True)
+class ExtendEnvelope:
+    """What :meth:`GatedAttentionBlockFwd.serving_envelope` says about the EXTEND form (``kv_source="paged"`` on a packed
+    declaration) for one ``(geometry, dtype, device)``.
+
+    ``served`` is True iff a block declared as ``requires`` spells it would pass ``check_support`` on that device for that
+    geometry and dtype -- the device / DSL facts (``reason`` names the first one that fails), the dtype (``dtypes``), the head
+    dim and the geometry rows below.  ``declines`` maps every typed decline the form raises AT DECLARATION to the message it
+    raises with -- the SAME table the constructor reads (:data:`_EXTEND_DECLINES`), so a caller's dispatch predicate and the
+    block's declines cannot drift: no decline is reachable at declaration that this record did not predict.  ``page_sizes``
+    / ``pool_layouts`` are the validated matrix (every entry an accept cell on the target body).
+    """
+
+    served: bool
+    reason: Optional[str]
+    requires: Tuple[str, ...]
+    dtypes: Tuple[torch.dtype, ...]
+    page_sizes: Tuple[int, ...]
+    pool_layouts: Tuple[str, ...]
+    declines: Dict[str, str]
+    inference_only: bool = True
+    writes_lse: bool = False
+
+
+@dataclass(frozen=True)
+class ServingEnvelope:
+    """The static serving envelope of the block for one ``(geometry, dtype, device)``: the device / DSL facts and one record per
+    serving form.  Read by a serving stack's INIT-time dispatch predicate instead of catching the block's exceptions; derived from
+    the same code ``check_support`` runs.  ``forms`` lists the forms this record serves; ``extend`` is the EXTEND form's record;
+    ``decode`` is ``None`` until the DECODE form lands (appended then, with its own record type)."""
+
+    device_cc: Optional[Tuple[int, int]]
+    cutedsl_ok: bool
+    cutedsl_reason: Optional[str]
+    forms: Tuple[str, ...]
+    extend: ExtendEnvelope
+    decode: Optional[object] = None
 
 
 @dataclass(frozen=True)
@@ -3669,6 +3727,16 @@ class _Sdpa(_Stage):
         num_sequences: Optional[int] = None,  # THD: B, the length tensor's [B] (or [B+1] prefix-sum) entries -- the envelope's batch
         max_seq_len: Optional[int] = None,  # THD: S_max, the longest sequence the plan admits -- the envelope's S
         cu_seqlens: bool = False,  # THD: seq_lens is [B+1] int32 prefix sums (True) or [B] int32 lengths (False)
+        # APPENDED (serving, the EXTEND form): K / V come from PAGED POOLS instead of the block's own operands.  The stage then
+        # declares the adapter's paged THD leg -- the pools' descriptors (their layout kind and strides are compiled in), the
+        # page size, the block table's declared strides, the logical S_kv = max_pages x page_size -- and execute() takes the
+        # pools, the block table and the per-sequence logical KV lengths.  Only the sm107 f16 row's paged THD leg (bf16 / f16,
+        # unsplit, no gate, no LSE) is bound here; everything else is a typed decline of the stage itself.
+        kv_source: str = KV_SOURCE_SELF,
+        paged_page_size: int = 0,  # kv_source="paged": the pools' tokens per page (the block's paged_kv_page_size)
+        k_cache_desc: Optional[TensorDesc] = None,  # kv_source="paged": the K pool's [num_pages, H_kv, P, D] descriptor (shape + strides)
+        v_cache_desc: Optional[TensorDesc] = None,  # kv_source="paged": the V pool's descriptor
+        block_table_desc: Optional[TensorDesc] = None,  # kv_source="paged": the [num_sequences, max_pages] int32 block table's descriptor (row stride free)
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
         # and are read in place at that stride (the adapter compiles its TMA
@@ -3717,6 +3785,29 @@ class _Sdpa(_Stage):
                 raise ValueError(f"{self.name}: thd=True and seq_lens_present=True are mutually exclusive (the packed lengths ARE the per-sequence lengths)")
         elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
             raise ValueError(f"{self.name}: num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True)")
+        # The EXTEND form (kv_source="paged"): the stage's own honesty about the ONE leg it binds -- the adapter's paged THD
+        # leg of the f16 / bf16 d256 flavor: packed queries, pools with the page size compiled in, no gate (that body has no
+        # gate seam), no LSE (the form writes none), no quantized Q / K / V (the FP8 THD path clamps runtime descriptors to a
+        # packed total and serves no pools).  The block's declaration-time checks say the same in the caller's vocabulary
+        # first; these keep a standalone stage from binding a leg nobody validated.
+        if kv_source not in _KV_SOURCES:
+            raise ValueError(f"{self.name}: kv_source must be one of {_KV_SOURCES}, got {kv_source!r}")
+        self.kv_source = kv_source
+        self.paged_page_size = int(paged_page_size)
+        self.k_cache_desc, self.v_cache_desc, self.block_table_desc = k_cache_desc, v_cache_desc, block_table_desc
+        if self.kv_source == KV_SOURCE_PAGED:
+            if not self.thd:
+                raise NotImplementedError(f"{self.name}: kv_source='paged' binds the adapter's paged THD leg; a dense (thd=False) paged read is not bound here")
+            if self.paged_page_size <= 0 or k_cache_desc is None or v_cache_desc is None or block_table_desc is None:
+                raise ValueError(f"{self.name}: kv_source='paged' needs paged_page_size > 0 and the k_cache / v_cache / block_table descriptors")
+            if self.fuse_gate:
+                raise NotImplementedError(f"{self.name}: kv_source='paged' has no gate arm (the paged THD body carries no epilogue-gate seam)")
+            if self.want_lse:
+                raise NotImplementedError(f"{self.name}: kv_source='paged' writes no LSE (the EXTEND form is an inference form)")
+            if self.fp8:
+                raise NotImplementedError(f"{self.name}: kv_source='paged' serves bf16 / f16 operands and pools only (no quantized paged THD leg)")
+        elif self.paged_page_size or k_cache_desc is not None or v_cache_desc is not None or block_table_desc is not None:
+            raise ValueError(f"{self.name}: paged_page_size / k_cache_desc / v_cache_desc / block_table_desc belong to kv_source='paged'")
         self._impl = None
 
     def _build_impl(self):
@@ -3748,9 +3839,46 @@ class _Sdpa(_Stage):
 
             t = self.batch * self.seq_len
             b_env, s_env = self.num_sequences, self.max_seq_len
-            kw.update(thd=True, max_total_seq_len_q=t, max_total_seq_len_kv=t, cu_seq_q_lens=self.cu_seqlens, cu_seq_kv_lens=self.cu_seqlens)
             lse = _thd_lse_desc(b_env, g.h_q, s_env, t, self.device) if self.want_lse else None
             sched = SCHED_NATURAL
+            if self.kv_source == KV_SOURCE_PAGED:
+                # The EXTEND form: the adapter's PAGED THD leg.  Q is the packed envelope as above; K / V are the caller's POOLS
+                # (the sample descriptors as declared: [num_pages, H_kv, P, D] with the pool's own strides -- HND / NHD /
+                # a unified row's half -- which the adapter compiles in and matches at execute); the logical S_kv the block
+                # tables address is max_pages x P; the block table's declared strides let a row slice of a wider table bind as
+                # a view (the same tuple for the V table: the block hands ONE table for both pools); the Q lengths keep the
+                # block's own form (lengths or prefix sums), the KV lengths are the serving stack's [B] logical lengths
+                # (never a prefix form); per-sequence KV lengths are REQUIRED by the paged leg (seq_kv_lens_present=True --
+                # the adapter forces it under THD anyway, after its paged gate reads it).  No packed KV total: pools have no
+                # packed capacity to clamp a runtime descriptor to.
+                bt = self.block_table_desc
+                table_stride = tuple(int(x) for x in bt.stride)
+                kw.update(
+                    thd=True,
+                    max_total_seq_len_q=t,
+                    cu_seq_q_lens=self.cu_seqlens,
+                    cu_seq_kv_lens=False,
+                    paged_page_size=self.paged_page_size,
+                    paged_max_seq_len_kv=int(bt.shape[1]) * self.paged_page_size,
+                    paged_table_stride=table_stride,
+                    paged_table_v_stride=table_stride,
+                )
+                return SdpaFwdDslSm100(
+                    _bhsd_desc(b_env, g.h_q, s_env, d, self.dtype, self.device, "q", token_stride=ts),
+                    dataclasses.replace(self.k_cache_desc, name="k"),
+                    dataclasses.replace(self.v_cache_desc, name="v"),
+                    _bhsd_desc(b_env, g.h_q, s_env, d, self.o_dtype, self.device, "o"),
+                    lse,
+                    is_causal=g.is_causal,
+                    causal_bottom_right=g.causal_bottom_right,
+                    window_size_left=None if g.window_left < 0 else g.window_left,
+                    window_size_right=None if g.window_right < 0 else g.window_right,
+                    scale_softmax=g.scale,
+                    seq_kv_lens_present=True,
+                    sched_policy=sched,
+                    **kw,
+                )
+            kw.update(thd=True, max_total_seq_len_q=t, max_total_seq_len_kv=t, cu_seq_q_lens=self.cu_seqlens, cu_seq_kv_lens=self.cu_seqlens)
         else:
             b_env, s_env = b, s
             lse = _lse_desc(b, g.h_q, s, self.device) if self.want_lse else None
@@ -3954,6 +4082,13 @@ class _Sdpa(_Stage):
         sf_q: Optional[torch.Tensor] = None,  # MXFP8 only (all three REQUIRED): F8_128x4 E8M0 blobs, uint8, the adapter's _reshape_sf byte count
         sf_k: Optional[torch.Tensor] = None,
         sf_v: Optional[torch.Tensor] = None,
+        # APPENDED (kv_source="paged", all four REQUIRED there, REFUSED otherwise): the pools stage (4) reads K / V from (the
+        # declared descriptors' shape and strides exactly), the [num_sequences, >= max_pages] int32 block table at the declared
+        # strides, the [num_sequences] int32 LOGICAL KV lengths (prefix + the step's tokens).  `k` / `v` above are then unread.
+        block_table: Optional[torch.Tensor] = None,
+        kv_lens: Optional[torch.Tensor] = None,
+        k_cache: Optional[torch.Tensor] = None,
+        v_cache: Optional[torch.Tensor] = None,
     ) -> None:
         """Hand the BSHD buffers over as BHSD views. No copy — see :func:`_bhsd_desc`.
 
@@ -4000,6 +4135,33 @@ class _Sdpa(_Stage):
             raise ValueError(f"{self.name}: fuse_gate=True requires the GATE tensor at execute")
         if not self.fuse_gate and gate is not None:
             raise ValueError(f"{self.name}: gate is only consumed under fuse_gate=True (the SDPA's epilogue gate); this stage was declared without it")
+        paged_args = (block_table, kv_lens, k_cache, v_cache)
+        if self.kv_source == KV_SOURCE_PAGED:
+            if any(x is None for x in paged_args):
+                raise ValueError(f"{self.name}: kv_source='paged' requires block_table, kv_lens, k_cache and v_cache at execute")
+            if seq_lens is None:
+                raise ValueError(f"{self.name}: kv_source='paged' requires seq_lens at execute (the packed per-sequence Q lengths)")
+            # The adapter's paged THD leg: the packed (T, H, D) Q / O views as on the THD arm, the POOLS as K / V (the adapter
+            # matches their shape and strides against the declared descriptors), the Q lengths in the block's form, the
+            # LOGICAL KV lengths as [B] lengths, the block table (one table for both pools).  `k` / `v` are not read.
+            g, t = self.geom, self.batch * self.seq_len
+            self._impl.execute(
+                q.view(t, g.h_q, g.d_head),
+                k_cache,
+                v_cache,
+                o.view(t, g.h_q, g.d_head),
+                lse_tensor=lse,
+                seq_q_lens=seq_lens,
+                seq_kv_lens=kv_lens,
+                workspace=workspace,
+                current_stream=current_stream,
+                block_table=block_table,
+            )
+            return
+        if any(x is not None for x in paged_args):
+            raise ValueError(
+                f"{self.name}: block_table / kv_lens / k_cache / v_cache are consumed under kv_source='paged' only; this stage was declared kv_source='self'"
+            )
         kw = {}
         if self.pertensor:
             kw.update(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o)
@@ -4369,6 +4531,117 @@ class _CacheWrite(_Stage):
             run_cache_write(idx, index_src, None, index_cache.unsqueeze(1), None, slot_mapping, stream=stream)
 
 
+@dataclass(frozen=True)
+class _ServingDecl:
+    """The declaration facts the serving forms' typed declines read -- ONE record, built by the constructor from its arguments and
+    by :meth:`GatedAttentionBlockFwd.serving_envelope` from a hypothetical EXTEND declaration, so both read the same table."""
+
+    kv_source: str
+    thd: bool
+    paged_kv_page_size: int
+    token_capacity: Optional[int]
+    save_for_backward: bool
+    return_lse: bool
+    geometry: GatedAttentionBlockGeometry
+
+
+def _is_paged(d: _ServingDecl) -> bool:
+    return d.kv_source == KV_SOURCE_PAGED
+
+
+# (name, exception class, predicate over the declaration facts, the message) -- the typed declines of the EXTEND form and of
+# the bounded token form, in the order a caller hears them.  A QsaSpec geometry is not a row: the sparse declaration's own rows run
+# first and refuse thd=True (:data:`_QSA_THD_DECLINE`), which the EXTEND form requires, so the envelope reads that decline for
+# it.  The constructor raises the FIRST row whose predicate holds
+# (``_check_serving_declaration``); ``serving_envelope`` publishes every row's name and message (``ExtendEnvelope.declines``)
+# and evaluates the geometry rows for its ``served`` verdict -- one table, so no decline is reachable at declaration that the
+# envelope did not predict.  Rows the write-through attribute already declines for every ``kv_source`` (``quant``,
+# ``save_for_backward`` with ``paged_kv_page_size``) are not repeated here: the EXTEND form requires that attribute and hears
+# those declines from it first.
+_EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], ...] = (
+    (
+        "write_through",
+        ValueError,
+        lambda d: _is_paged(d) and d.paged_kv_page_size <= 0,
+        "kv_source='paged' needs paged_kv_page_size > 0: the EXTEND form writes the step's tokens through into the pools first and then "
+        "attends over the pools, so the write-through attribute is part of its declaration",
+    ),
+    (
+        "dense_declaration",
+        NotImplementedError,
+        lambda d: _is_paged(d) and not d.thd,
+        "kv_source='paged' on a dense [B, S, d_model] declaration is the DECODE form (uniform S_q <= 4 per sequence over the pools), which "
+        "has not landed; the EXTEND form is the packed declaration -- thd=True, num_sequences=B_max, max_seq_len=token_capacity, "
+        "token_capacity=T_max, paged_kv_page_size=P, kv_source='paged', geometry.causal_bottom_right=True",
+    ),
+    (
+        "diagonal",
+        ValueError,
+        lambda d: _is_paged(d) and not (d.geometry.is_causal and d.geometry.causal_bottom_right),
+        "kv_source='paged' needs geometry.is_causal=True and geometry.causal_bottom_right=True: a sequence's new tokens sit at the END of its "
+        "logical KV range [0, kv_len), so query row i of a sequence with q_len new tokens attends keys k <= i + kv_len - q_len (the "
+        "bottom-right diagonal; top-left would let the first new token see one key only)",
+    ),
+    (
+        "window",
+        NotImplementedError,
+        lambda d: _is_paged(d) and (d.geometry.window_left >= 0 or d.geometry.window_right > 0),
+        "kv_source='paged' is validated on the plain bottom-right causal diagonal only (window_left=-1, window_right in (-1, 0)); a sliding "
+        "window or a right-widened band over the pools is a follow-up",
+    ),
+    (
+        "head_dim",
+        NotImplementedError,
+        lambda d: _is_paged(d) and d.geometry.d_head != 256,
+        "kv_source='paged' is validated at d_head == 256 only (the Rubin d256 paged THD leg); other head dims are a follow-up",
+    ),
+    (
+        "return_lse",
+        NotImplementedError,
+        lambda d: _is_paged(d) and d.return_lse,
+        "kv_source='paged' writes no LSE: the EXTEND form is an inference form (return_lse=False); an LSE over the pools is a follow-up",
+    ),
+    (
+        "token_capacity_dense",
+        ValueError,
+        lambda d: d.token_capacity is not None and not d.thd,
+        "token_capacity is THD-only (thd=True): it bounds the PACKED token rows a step may leave as pad rows; a dense [B, S, d_model] block "
+        "has no packed capacity",
+    ),
+    (
+        "token_capacity_training",
+        NotImplementedError,
+        lambda d: d.token_capacity is not None and d.save_for_backward,
+        "token_capacity with save_for_backward=True: the backward's weight-gradient GEMMs contract over every one of the T rows, so a step "
+        "with fewer live tokens than the capacity would contaminate dW_qkvg / dW_o; the bounded token form is inference-only",
+    ),
+)
+
+
+def _first_serving_decline(decl: _ServingDecl) -> Optional[Tuple[str, type, str]]:
+    """The first row of :data:`_EXTEND_DECLINES` whose predicate holds for ``decl`` -- ``(name, exception class, message)`` -- or None."""
+    for name, exc, pred, msg in _EXTEND_DECLINES:
+        if pred(decl):
+            return name, exc, msg
+    return None
+
+
+_QSA_THD_DECLINE = "QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up"
+"""The sparse declaration's own THD decline (``_check_qsa_declaration``), the reason the envelope gives a QsaSpec geometry for the EXTEND
+form: the form is THD-only, so no row of :data:`_EXTEND_DECLINES` is ever reached on a sparse geometry."""
+
+_EXTEND_REQUIRES = (
+    "thd=True (the packed declaration: h / cos / sin / out as [T_max, .] token matrices)",
+    "num_sequences=B_max, max_seq_len=token_capacity (one sequence may own the whole chunk), cu_seqlens as the stack hands the Q lengths",
+    "token_capacity=T_max (the samples' packed row count; a step hands lengths summing to T_live <= T_max)",
+    "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
+    "kv_source='paged'",
+    "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
+    "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B_max, max_pages] int32)",
+    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False, fuse_gate=False",
+)
+
+
 class GatedAttentionBlockFwd(APIBase):
     """Gated attention block, forward. One call, one workspace, three to five launches.
 
@@ -4396,6 +4669,28 @@ class GatedAttentionBlockFwd(APIBase):
     ``out`` is bitwise the block's without it.  A declaration ATTRIBUTE: ``execute`` then REQUIRES the pools and the
     slot mapping and refuses them otherwise.  The stage addresses TOKENS, so under ``thd=True`` (the block is
     ``B = 1, S = T`` inside) it is the same launch over the same ``[T, H_kv, D]`` views; a pad token's slot is ``-1``.
+
+    **The EXTEND form (``kv_source="paged"``; bf16 / f16 inference, PACKED, bottom-right)** -- every serving prefill of a
+    sequence with a cached prefix (a chunked prefill, a prefix-cache hit, a speculative verify): the step's ``T_max``-row
+    token matrices hold ``B_max`` sequences' NEW tokens (``execute(seq_lens=)`` as under THD), the write-through puts them
+    into the pools, and stage (4) then reads EVERY sequence's K / V -- its prefix and the new tokens -- from the POOLS
+    over ``[0, kv_lens[b])`` through ``block_table[b]`` on the bottom-right diagonal (``k <= i + kv_len - q_len``)::
+
+        (1)+(2)+(3) proj + norm + rope   h [T_max, d_model]        -> slab          (or (1) then (2+3) unfused)
+        (4w) cache write                  slab[K], slab[V]          -> k_cache / v_cache at slot_mapping
+        (4)  sdpa (paged THD leg)         slab[Q], k_cache, v_cache -> O             block_table, kv_lens, seq_lens
+        (5)  gate                         O, slab[G]                -> O in place
+        (6)  out_proj                     O                         -> out [T_max, d_model]
+
+    Five launches, one stream (the write is ordered before the read by STREAM order alone -- no programmatic dependent
+    launch on the chain).  Declared as ``thd=True, num_sequences=B_max, max_seq_len=token_capacity, token_capacity=T_max,
+    paged_kv_page_size=P, kv_source="paged", geometry.causal_bottom_right=True`` with the pools' and the block table's
+    SAMPLES (their layout and row stride are compiled in; ``serving_envelope`` lists the rest).  ``token_capacity`` makes
+    the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
+    (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite).  Typed declines, in
+    :data:`_EXTEND_DECLINES`'s order: a dense declaration (the DECODE form, not landed), a missing bottom-right diagonal, a
+    window, another head dim, an LSE; ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse
+    declaration's (``QsaSpec`` refuses ``thd=True``).
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -4524,6 +4819,21 @@ class GatedAttentionBlockFwd(APIBase):
         # pools at execute(slot_mapping=).  A declaration ATTRIBUTE (it changes the input contract: execute then REQUIRES
         # k_cache / v_cache / slot_mapping and refuses them otherwise), never a knob.  0 = off.  Positive: a multiple of 16.
         paged_kv_page_size: int = 0,
+        # APPENDED (serving, the EXTEND form): where stage (4) reads K / V from.  "self" = the block's own K / V (as before).
+        # "paged" = the pools: every sequence's prefix AND the step's new tokens (written through first) are read from
+        # k_cache / v_cache via execute(block_table=, kv_lens=) on the bottom-right diagonal -- the serving prefill of every
+        # sequence with a cached prefix.  Requires paged_kv_page_size > 0, thd=True and geometry.causal_bottom_right=True; the
+        # three samples below (REQUIRED there, REFUSED otherwise) carry the pools' layout and the block table's row stride,
+        # which are compiled in.  A declaration ATTRIBUTE, never a knob.  Class docstring, "The EXTEND form".
+        kv_source: str = KV_SOURCE_SELF,
+        # APPENDED (serving, THD only): the BOUNDED token form.  The samples' T packed rows are a CAPACITY: a step may hand
+        # lengths summing to T_live <= T (rows [T_live, T) are PAD rows -- finite inputs, out rows unspecified but finite, never
+        # written to the cache under slot -1, never attended).  Must equal the samples' row count when given; None = the tight
+        # contract (sum == T) as before.  Inference only (the backward's weight-gradient GEMMs contract over every row).
+        token_capacity: Optional[int] = None,
+        sample_k_cache: Optional[torch.Tensor] = None,  # kv_source="paged": the K pool [num_pages, H_kv, P, D] (shape / dtype / strides only)
+        sample_v_cache: Optional[torch.Tensor] = None,  # kv_source="paged": the V pool (same contract; the same HND / NHD kind as K)
+        sample_block_table: Optional[torch.Tensor] = None,  # kv_source="paged": the [num_sequences, max_pages] int32 block table (row stride free)
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -4747,6 +5057,11 @@ class GatedAttentionBlockFwd(APIBase):
         # PAGED-CACHE WRITE-THROUGH (serving): the attribute's own rows (type, the multiple-of-16 contract) and the
         # pipelines the stage has no arm for, typed and naming the feature -- device-free, so a test pins every row anywhere.
         self.paged_kv_page_size = self._check_cache_write_declaration(paged_kv_page_size, quant)
+        # THE EXTEND FORM (kv_source) and the BOUNDED token form (token_capacity): the typed declines of the table every caller's
+        # dispatch predicate can read back (serving_envelope), then the three samples' contract -- device-free, before any descriptor.
+        self.kv_source, self.token_capacity = self._check_serving_declaration(
+            kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, sample_h.device
+        )
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -4760,6 +5075,11 @@ class GatedAttentionBlockFwd(APIBase):
             "w_qkvg_sf": self._make_tensor_desc(sample_w_qkvg_sf, name="w_qkvg_sf"),
             # fp4 O only (None otherwise): the e2m1 W_o's F8_128x4 blob, validated in check_support.
             "w_o_sf": self._make_tensor_desc(sample_w_o_sf, name="w_o_sf"),
+            # kv_source="paged" only (None otherwise): the pools' and the block table's shape / dtype / strides, validated above;
+            # the SDPA stage compiles the paged THD leg against them and execute matches the real tensors to them.
+            "k_cache": self._make_tensor_desc(sample_k_cache, name="k_cache"),
+            "v_cache": self._make_tensor_desc(sample_v_cache, name="v_cache"),
+            "block_table": self._make_tensor_desc(sample_block_table, name="block_table"),
         }
 
         fp8 = quant is not None  # fp8-CLASS pipeline (per-tensor FP8 or MXFP8): e4m3 h / weights, bf16 activations
@@ -4894,6 +5214,12 @@ class GatedAttentionBlockFwd(APIBase):
                 num_sequences=self.num_sequences,
                 max_seq_len=self.max_seq_len,
                 cu_seqlens=self.cu_seqlens,
+                # The EXTEND form: K / V from the pools (their descriptors as declared), the block table's strides, the page size.
+                kv_source=self.kv_source,
+                paged_page_size=self.paged_kv_page_size if self.kv_source == KV_SOURCE_PAGED else 0,
+                k_cache_desc=self._descs["k_cache"],
+                v_cache_desc=self._descs["v_cache"],
+                block_table_desc=self._descs["block_table"],
             )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
@@ -4947,6 +5273,16 @@ class GatedAttentionBlockFwd(APIBase):
             else:
                 self._quant_o = self._quant_q
             self._out_proj = _out_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
+        # The SERVING declaration (kv_source="paged") is captured by a serving stack with vLLM's defaults -- the FIRST execute
+        # of a fresh declaration inside a CUDA-graph capture on a new stream, no eager warm-up -- so both dense projections
+        # take the GEMM driver's capture-safe route (build_proj_gemm(capture_safe=True): the forced-tile JIT route by
+        # construction, never a ranked list, no cuDNN handle at the first execute; a shape without a forced tile is a typed
+        # NotImplementedError at compile()).  Read by `_Projection.compile` alone (the fused norm + RoPE projection builds no
+        # build_proj_gemm plan), so the flag is set on the two dense projection stages only.
+        if self.kv_source == KV_SOURCE_PAGED:
+            for st in (self._proj, self._out_proj):
+                if isinstance(st, _Projection):
+                    st.capture_safe = True
         # Stage order == pipeline order.  `_quant_o` is listed only where it is a
         # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4); under
         # FP8 it aliases `_quant_q`, listed once.
@@ -4984,7 +5320,7 @@ class GatedAttentionBlockFwd(APIBase):
         g.validate()
         q = g.qsa
         if self.thd:
-            raise NotImplementedError("QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up")
+            raise NotImplementedError(_QSA_THD_DECLINE)
         if self.save_for_backward:
             raise NotImplementedError(
                 "QsaSpec with save_for_backward=True: sparse-attention training (the sparse backward and the indexer loss) is out of scope; the "
@@ -5096,8 +5432,9 @@ class GatedAttentionBlockFwd(APIBase):
         never a value and never a sync (Rule 3).  A block declared with ``paged_kv_page_size`` REQUIRES ``k_cache`` /
         ``v_cache`` / ``slot_mapping`` (and ``index_k_raw`` iff its geometry declares the indexer band); a block declared
         without it REFUSES every one of them rather than ignoring a pool it would never write (the ``h_sf`` pattern).
-        ``block_table`` / ``kv_lens`` are the paged-READ mode's inputs: refused on an undeclared block, a typed
-        ``NotImplementedError`` on a declared one until that mode lands."""
+        ``block_table`` / ``kv_lens`` are the EXTEND form's inputs (``kv_source="paged"``): REQUIRED there -- and the pools
+        must then match the declared samples' shape and strides exactly (their layout is compiled in) -- and refused on a
+        block declared ``kv_source="self"`` (the write-through alone attends over the block's own K / V)."""
         from .kernels.cache_write import check_pool, check_slot_mapping
 
         given = [nm for nm, x in (("k_cache", k_cache), ("v_cache", v_cache), ("slot_mapping", slot_mapping), ("index_k_raw", index_k_raw)) if x is not None]
@@ -5110,10 +5447,12 @@ class GatedAttentionBlockFwd(APIBase):
                     "would never write them -- refused rather than silently ignored"
                 )
             return
-        if read_mode:
-            raise NotImplementedError(
-                f"{', '.join(read_mode)}: the paged-READ mode (attention over the pools: decode and prefix reads) is a follow-up; this block "
-                "writes the pools through at slot_mapping and attends over its own K / V"
+        paged = self.kv_source == KV_SOURCE_PAGED
+        if read_mode and not paged:
+            raise ValueError(
+                f"{', '.join(read_mode)}: the EXTEND form's inputs (attention over the pools through a block table and the per-sequence logical "
+                "KV lengths) belong to a block declared kv_source='paged'; this block was declared kv_source='self' and attends over its own "
+                "K / V after the write-through -- refused rather than silently ignored"
             )
         g, ps = self.geom, self.paged_kv_page_size
         for nm, x in (("k_cache", k_cache), ("v_cache", v_cache), ("slot_mapping", slot_mapping)):
@@ -5124,10 +5463,21 @@ class GatedAttentionBlockFwd(APIBase):
                     f"slot_mapping [{self.batch * self.seq_len}] int32 / int64 (one flat slot per token, page * page_size + offset; a negative "
                     "slot writes nothing)"
                 )
+        if paged:
+            bt = self._descs["block_table"]
+            for nm, x in (("block_table", block_table), ("kv_lens", kv_lens)):
+                if x is None:
+                    raise ValueError(
+                        f"kv_source='paged' needs {nm} at execute: block_table [num_sequences={self.num_sequences}, >= max_pages={int(bt.shape[1])}] int32 "
+                        f"(every sequence's page ids, at the row stride sample_block_table declared) and kv_lens [{self.num_sequences}] int32 (each "
+                        "sequence's LOGICAL KV length INCLUDING this step's tokens; 0 = a padded entry)"
+                    )
         t = self.batch * self.seq_len
         check_pool(k_cache, "k_cache", h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=h.device)
         check_pool(v_cache, "v_cache", h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=h.device)
         check_slot_mapping(slot_mapping, "slot_mapping", t=t, device=h.device)
+        if paged:
+            self._check_extend_args(h, k_cache, v_cache, block_table, kv_lens)
         if g.index_band:
             if index_k_raw is None:
                 raise ValueError(
@@ -5147,6 +5497,198 @@ class GatedAttentionBlockFwd(APIBase):
                 "index_k_raw is the raw indexer key's pool of a geometry that declares the indexer band (QsaSpec.index_band=True); this block's "
                 "geometry has no band, so there is no raw key to write -- refused rather than silently ignored"
             )
+
+    def _check_extend_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens) -> None:
+        """The EXTEND form's execute inputs against the declaration, FORM only (Rule 3): the pools match the declared samples'
+        shape and strides EXACTLY (the SDPA stage compiled the paged THD leg against them -- a pool of another page count or
+        layout is a different plan, never a view the adapter would silently re-bind); ``block_table`` is a 2-D int32 CUDA tensor
+        ``[num_sequences, >= max_pages]`` whose page axis is contiguous and whose row stride is the declared one (a row slice of
+        a wider table binds as a view; the SDPA reads page ids on device); ``kv_lens`` a contiguous 1-D int32 CUDA tensor of
+        exactly ``num_sequences`` entries (values -- the logical lengths -- are device data, never read here)."""
+        for nm, x in (("k_cache", k_cache), ("v_cache", v_cache)):
+            d = self._descs[nm]
+            if tuple(int(s) for s in x.shape) != tuple(d.shape) or tuple(int(s) for s in x.stride()) != tuple(d.stride):
+                raise ValueError(
+                    f"{nm} must match sample_{nm} exactly -- shape {tuple(d.shape)} / strides {tuple(d.stride)} (the pool's page count and layout are "
+                    f"compiled into the paged read); got shape {tuple(x.shape)} / strides {tuple(x.stride())}. Declare a block per pool geometry"
+                )
+        bt = self._descs["block_table"]
+        b, max_pages, row_stride = self.num_sequences, int(bt.shape[1]), int(bt.stride[0])
+        dev = torch.device(h.device)
+        if not isinstance(block_table, torch.Tensor) or block_table.dtype != torch.int32 or block_table.dim() != 2:
+            got = f"{block_table.dtype} {tuple(block_table.shape)}" if isinstance(block_table, torch.Tensor) else type(block_table).__name__
+            raise ValueError(f"block_table must be a 2-D int32 tensor [num_sequences={b}, >= max_pages={max_pages}], got {got}")
+        if int(block_table.shape[0]) != b or int(block_table.shape[1]) < max_pages:
+            raise ValueError(
+                f"block_table must be [num_sequences={b}, >= max_pages={max_pages}] (the declared sample_block_table's page axis bounds the logical "
+                f"S_kv = {max_pages * self.paged_kv_page_size}); got {tuple(block_table.shape)}"
+            )
+        if int(block_table.stride(1)) != 1 or (b > 1 and int(block_table.stride(0)) != row_stride):
+            raise ValueError(
+                f"block_table strides must be the declared (row stride {row_stride}, 1) -- the page axis contiguous, the row stride as sample_block_table "
+                f"declared it (a row slice of a wider table); got {tuple(block_table.stride())}"
+            )
+        if not block_table.is_cuda or block_table.device != dev:
+            raise ValueError(f"block_table must live on h's device {dev}, got {block_table.device}")
+        ok = (
+            isinstance(kv_lens, torch.Tensor)
+            and kv_lens.dtype == torch.int32
+            and kv_lens.dim() == 1
+            and kv_lens.is_contiguous()
+            and int(kv_lens.numel()) == b
+            and kv_lens.is_cuda
+            and kv_lens.device == dev
+        )
+        if not ok:
+            got = (
+                f"dtype {kv_lens.dtype}, shape {tuple(kv_lens.shape)}, strides {tuple(kv_lens.stride())}, device {kv_lens.device}"
+                if isinstance(kv_lens, torch.Tensor)
+                else type(kv_lens).__name__
+            )
+            raise ValueError(
+                f"kv_lens must be a contiguous 1-D int32 CUDA tensor of {b} entries on {dev} (each sequence's logical KV length INCLUDING this "
+                f"step's tokens; 0 = a padded entry), got {got}"
+            )
+
+    # -- the serving forms: the declaration table and the envelope ------------
+
+    def _check_serving_declaration(self, kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, device):
+        """``kv_source`` / ``token_capacity`` at declaration -- the argument contract first (``kv_source`` one of
+        :data:`_KV_SOURCES`; ``token_capacity`` None or a positive int equal to the samples' packed row count), then the
+        typed declines of :data:`_EXTEND_DECLINES` in order (the table :meth:`serving_envelope` publishes), then the three
+        samples' contract under ``kv_source="paged"`` (REQUIRED there, REFUSED otherwise; each pool as :func:`check_pool`
+        spells it, in the activation dtype, on ``device``, K and V of the SAME HND / NHD kind; the block table a 2-D int32
+        ``[num_sequences, max_pages >= 1]`` tensor with a contiguous page axis).  Device-free: a test pins every row anywhere.
+        Returns ``(kv_source, token_capacity)`` normalised.  Runs AFTER the write-through's own validator, so ``quant`` /
+        ``save_for_backward`` with the attribute are heard from there."""
+        from .kernels.cache_write import check_pool
+
+        if not isinstance(kv_source, str) or kv_source not in _KV_SOURCES:
+            raise ValueError(
+                f"kv_source must be one of {_KV_SOURCES} ('self' = the block's own K / V, 'paged' = the EXTEND form over the pools), got {kv_source!r}"
+            )
+        t = self.batch * self.seq_len
+        if token_capacity is not None:
+            if isinstance(token_capacity, bool) or not isinstance(token_capacity, int):
+                raise TypeError(f"token_capacity must be an int (the packed token capacity T_max) or None, got {type(token_capacity).__name__}")
+            if token_capacity < 1:
+                raise ValueError(f"token_capacity must be >= 1, got {token_capacity}")
+        decl = _ServingDecl(
+            kv_source=kv_source,
+            thd=self.thd,
+            paged_kv_page_size=self.paged_kv_page_size,
+            token_capacity=token_capacity,
+            save_for_backward=self.save_for_backward,
+            return_lse=self.return_lse,
+            geometry=self.geom,
+        )
+        hit = _first_serving_decline(decl)
+        if hit is not None:
+            _name, exc, msg = hit
+            raise exc(msg)
+        if token_capacity is not None and token_capacity != t:
+            raise ValueError(
+                f"token_capacity={token_capacity} must equal the samples' packed token rows T={t}: the samples ARE the capacity (declare sample_h / "
+                "sample_cos / sample_sin / sample_out with T_max rows); a step then hands lengths summing to T_live <= T_max"
+            )
+        samples = (("sample_k_cache", sample_k_cache), ("sample_v_cache", sample_v_cache), ("sample_block_table", sample_block_table))
+        if kv_source != KV_SOURCE_PAGED:
+            given = [nm for nm, x in samples if x is not None]
+            if given:
+                raise ValueError(
+                    f"{', '.join(given)}: the pool / block-table samples belong to the EXTEND form (kv_source='paged'); this block was declared "
+                    f"kv_source={kv_source!r} and never reads the pools -- refused rather than silently ignored"
+                )
+            return kv_source, token_capacity
+        g, ps = self.geom, self.paged_kv_page_size
+        missing = [nm for nm, x in samples if x is None]
+        if missing:
+            raise ValueError(
+                f"kv_source='paged' needs {', '.join(missing)} at declaration: sample_k_cache / sample_v_cache [num_pages, {g.h_kv}, {ps}, {g.d_head}] "
+                f"{self.act_dtype} (the pools' shape / dtype / strides -- HND compact, NHD by strides, or the two halves of a unified row; the "
+                f"layout is compiled in) and sample_block_table [{self.num_sequences}, max_pages] int32 (its row stride is compiled in too)"
+            )
+        for nm, x in samples[:2]:
+            check_pool(x, nm, h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=device)
+        if (sample_k_cache.stride(2) < sample_k_cache.stride(1)) != (sample_v_cache.stride(2) < sample_v_cache.stride(1)):
+            raise ValueError(
+                "sample_k_cache and sample_v_cache must share one layout kind (both HND -- the page-row stride below the head stride -- or both "
+                f"NHD): got K strides {tuple(sample_k_cache.stride())}, V strides {tuple(sample_v_cache.stride())}"
+            )
+        bt = sample_block_table
+        if not isinstance(bt, torch.Tensor) or bt.dtype != torch.int32 or bt.dim() != 2:
+            got = f"{bt.dtype} {tuple(bt.shape)}" if isinstance(bt, torch.Tensor) else type(bt).__name__
+            raise ValueError(f"sample_block_table must be a 2-D int32 tensor [num_sequences={self.num_sequences}, max_pages >= 1], got {got}")
+        if int(bt.shape[0]) != self.num_sequences or int(bt.shape[1]) < 1:
+            raise ValueError(
+                f"sample_block_table must be [num_sequences={self.num_sequences}, max_pages >= 1] (num_sequences = the packed declaration's B_max; "
+                f"max_pages x {ps} = the logical S_kv the block tables may address), got {tuple(bt.shape)}"
+            )
+        if int(bt.stride(1)) != 1:
+            raise ValueError(f"sample_block_table's page axis must be contiguous (stride 1; the row stride is free), got strides {tuple(bt.stride())}")
+        if bt.device != torch.device(device):
+            raise ValueError(f"sample_block_table must live on sample_h's device {device}, got {bt.device}")
+        return kv_source, token_capacity
+
+    @classmethod
+    def serving_envelope(cls, geometry: GatedAttentionBlockGeometry, dtype: torch.dtype, device) -> ServingEnvelope:
+        """The static serving envelope for ``(geometry, dtype, device)`` -- what a serving stack's INIT-time dispatch predicate
+        reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
+        the device fact (Rubin, cc 10.7, the one arch every stage binds), the CuTe DSL facts (the version floor and the Rubin
+        target, exactly as the stages' ``check_support`` gates them), the dtype (bf16 / f16 activations), and the EXTEND form's
+        geometry rows of :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``head_dim``; a QsaSpec geometry reads
+        :data:`_QSA_THD_DECLINE`, the sparse declaration's own row the THD-only form always meets first) evaluated on
+        ``geometry`` -- so ``extend.served`` is True iff a block declared as ``extend.requires`` spells it passes its
+        declaration and ``check_support`` here, and ``extend.declines`` lists every typed decline the form raises at
+        declaration with its message.  ``forms`` holds ``"extend"`` when it is served; ``decode`` is ``None`` until the DECODE
+        form lands.  No allocation, no launch; safe to call on any device (``extend.served`` is simply False off Rubin)."""
+        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+
+        cc = tuple(torch.cuda.get_device_capability(device)) if torch.cuda.is_available() else None
+        dsl_reason = cutedsl_requirement_error("the gated attention block's serving forms")
+        if dsl_reason is None and cc == _SM107_CC:
+            dsl_reason = cutedsl_arch_requirement_error(cc)
+        reason = None
+        if cc != _SM107_CC:
+            reason = (
+                f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only; found {'no CUDA device' if cc is None else f'SM{cc[0]}{cc[1]}'}"
+            )
+        elif dsl_reason is not None:
+            reason = dsl_reason
+        elif dtype not in (torch.bfloat16, torch.float16):
+            reason = f"the EXTEND form serves bf16 / f16 activations and pools only (quant=None), got {dtype}"
+        elif geometry.qsa is not None:
+            reason = _QSA_THD_DECLINE
+        else:
+            probe = _ServingDecl(
+                kv_source=KV_SOURCE_PAGED,
+                thd=True,
+                paged_kv_page_size=SERVING_PAGE_SIZES[0],
+                token_capacity=None,
+                save_for_backward=False,
+                return_lse=False,
+                geometry=geometry,
+            )
+            hit = _first_serving_decline(probe)
+            if hit is not None:
+                reason = hit[2]
+        extend = ExtendEnvelope(
+            served=reason is None,
+            reason=reason,
+            requires=_EXTEND_REQUIRES,
+            dtypes=(torch.bfloat16, torch.float16),
+            page_sizes=SERVING_PAGE_SIZES,
+            pool_layouts=SERVING_POOL_LAYOUTS,
+            declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES},
+        )
+        return ServingEnvelope(
+            device_cc=cc,
+            cutedsl_ok=dsl_reason is None,
+            cutedsl_reason=dsl_reason,
+            forms=("extend",) if extend.served else (),
+            extend=extend,
+            decode=None,
+        )
 
     def index_k_raw(self, workspace: torch.Tensor) -> torch.Tensor:
         """The RAW indexer key the last ``execute`` left in ``workspace``, as a ``[B, S, index_kv_heads, index_head_dim]``
@@ -5721,8 +6263,10 @@ class GatedAttentionBlockFwd(APIBase):
             torch.Tensor
         ] = None,  # [num_pages, H_kv, page_size, D] activation dtype (HND compact, NHD by strides, or a unified-row half): post-RoPE K lands here
         v_cache: Optional[torch.Tensor] = None,  # same shape: V lands here
-        block_table: Optional[torch.Tensor] = None,  # (B, max_pages) int32 -- the paged-READ mode's page table: a typed decline until that mode lands
-        kv_lens: Optional[torch.Tensor] = None,  # [B] int32 -- the paged-READ mode's logical KV lengths: a typed decline until that mode lands
+        block_table: Optional[
+            torch.Tensor
+        ] = None,  # [num_sequences, >= max_pages] int32 -- the EXTEND form's page table (kv_source="paged"); refused otherwise
+        kv_lens: Optional[torch.Tensor] = None,  # [num_sequences] int32 -- the EXTEND form's LOGICAL KV lengths incl. this step's tokens; refused otherwise
         slot_mapping: Optional[torch.Tensor] = None,  # [T] int32 / int64: the flat slot (page * page_size + offset) of every token; negative = no write
         index_k_raw: Optional[torch.Tensor] = None,  # [num_pages, page_size, index_head_dim] activation dtype: the raw indexer key's pool (index band only)
     ) -> None:
@@ -5771,10 +6315,16 @@ class GatedAttentionBlockFwd(APIBase):
         ``slot_mapping`` is ``[T]`` over the packed tokens) alike.  ``index_k_raw``
         (appended): the raw indexer key's pool, REQUIRED there iff the geometry
         declares the indexer band.  ``block_table`` / ``kv_lens`` (appended): the
-        paged-READ mode's inputs -- a typed ``NotImplementedError`` until that mode
-        lands.  Every one of the six is REFUSED on a block declared without the
-        attribute.  Form checks only; slot VALUES are device data the kernel
-        range-checks.
+        EXTEND form's inputs, REQUIRED under ``kv_source="paged"`` -- the SDPA then
+        reads every sequence's K / V from the pools (the step's tokens written
+        through first, on the same stream) over ``[0, kv_lens[b])`` through
+        ``block_table[b]`` on the bottom-right diagonal; the pools must match the
+        declared samples exactly -- and refused under ``kv_source="self"``.  Every
+        one of the six is REFUSED on a block declared without the attribute.  Form
+        checks only; slot VALUES, page ids and lengths are device data the kernels
+        read.  Under ``token_capacity`` the lengths may sum to ``T_live <= T``; rows
+        ``[T_live, T)`` of ``out`` are then unspecified but finite given finite
+        inputs (hand them slot ``-1`` and finite ``cos`` / ``sin`` rows).
         """
         # Block-sparse attention: the index tensors are a DECLARATION-vs-argument contract and need no plan, so they are
         # checked first and the refusal reads the same on every device (Rule 3: form only, never a value, never a sync).
@@ -6024,6 +6574,12 @@ class GatedAttentionBlockFwd(APIBase):
             )
         # (4) [+ (5) under fuse_gate: the SDPA gates the SUBSTITUTED O inside
         # its epilogue, after the dead-row select, and writes O_gated.]
+        # The EXTEND form (kv_source="paged"): K / V are read from the POOLS the write-through just filled -- every sequence's
+        # prefix and this step's tokens -- through the block table over [0, kv_lens[b]); the slab's K / V bands are unread by
+        # the SDPA.  Stream order is the ONLY ordering between the write and the read: the cache write launches without
+        # programmatic dependent launch (no PDL attribute on its launch; the SDPA bodies wait on no dependent grid), so a
+        # later kernel that adopts PDL after a pool write must wait on its dependent grid before its first K / V load.
+        paged = self.kv_source == KV_SOURCE_PAGED
         self._sdpa.execute(
             q_c.view(self.batch, self.seq_len, g.h_q, g.d_head),
             k_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
@@ -6041,6 +6597,10 @@ class GatedAttentionBlockFwd(APIBase):
             sf_q=sfq,
             sf_k=sfk,
             sf_v=sfv,
+            block_table=block_table if paged else None,
+            kv_lens=kv_lens if paged else None,
+            k_cache=k_cache if paged else None,
+            v_cache=v_cache if paged else None,
         )
         if not self.fuse_gate:
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected

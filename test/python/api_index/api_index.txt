@@ -381,6 +381,9 @@ cudnn.flex_attention.flex_attn_func
 cudnn.frost
 cudnn.frost.cutedsl_runtime_available
 cudnn.gated_attention_block
+cudnn.gated_attention_block.ExtendEnvelope
+cudnn.gated_attention_block.ExtendEnvelope.inference_only
+cudnn.gated_attention_block.ExtendEnvelope.writes_lse
 cudnn.gated_attention_block.Fp4Format
 cudnn.gated_attention_block.Fp4Format.MXFP4
 cudnn.gated_attention_block.Fp4Format.NVFP4
@@ -400,6 +403,7 @@ cudnn.gated_attention_block.GatedAttentionBlockFwd.compile
 cudnn.gated_attention_block.GatedAttentionBlockFwd.execute
 cudnn.gated_attention_block.GatedAttentionBlockFwd.get_workspace_size
 cudnn.gated_attention_block.GatedAttentionBlockFwd.index_k_raw
+cudnn.gated_attention_block.GatedAttentionBlockFwd.serving_envelope
 cudnn.gated_attention_block.GatedAttentionBlockFwd.update_quant_scales
 cudnn.gated_attention_block.GatedAttentionBlockGeometry
 cudnn.gated_attention_block.GatedAttentionBlockGeometry.attn_scale
@@ -424,6 +428,8 @@ cudnn.gated_attention_block.GatedAttentionBlockGeometry.scale
 cudnn.gated_attention_block.GatedAttentionBlockGeometry.validate
 cudnn.gated_attention_block.GatedAttentionBlockGeometry.window_left
 cudnn.gated_attention_block.GatedAttentionBlockGeometry.window_right
+cudnn.gated_attention_block.KV_SOURCE_PAGED
+cudnn.gated_attention_block.KV_SOURCE_SELF
 cudnn.gated_attention_block.MxQuantSpec
 cudnn.gated_attention_block.MxQuantSpec.alpha_o
 cudnn.gated_attention_block.MxQuantSpec.block_size
@@ -472,12 +478,16 @@ cudnn.gated_attention_block.RecomputePolicy
 cudnn.gated_attention_block.RecomputePolicy.RECOMPUTE_GATE
 cudnn.gated_attention_block.RecomputePolicy.RECOMPUTE_QK_PRE
 cudnn.gated_attention_block.RecomputePolicy.SAVE_ALL
+cudnn.gated_attention_block.SERVING_PAGE_SIZES
+cudnn.gated_attention_block.SERVING_POOL_LAYOUTS
 cudnn.gated_attention_block.SavedForBackward
 cudnn.gated_attention_block.SavedForBackward.k_pre
 cudnn.gated_attention_block.SavedForBackward.proj_slab
 cudnn.gated_attention_block.SavedForBackward.q_pre
 cudnn.gated_attention_block.SavedForBackward.seq_lens
 cudnn.gated_attention_block.SavedForBackward.seq_lens_form
+cudnn.gated_attention_block.ServingEnvelope
+cudnn.gated_attention_block.ServingEnvelope.decode
 cudnn.gated_attention_block.build_fused_qkvg_weight
 cudnn.gated_attention_block.gated_attention_block_backward
 cudnn.gated_attention_block.gated_attention_block_forward

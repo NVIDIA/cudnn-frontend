@@ -2048,7 +2048,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 
 | Missing | Where |
 |---|---|
-| Gated attention block (frontend-only, no graph form): attention over the paged pools (the serving EXTEND form's prefix read over `block_table` / `kv_lens`, the DECODE form), e4m3 (`kv_cache_dtype`) pools, the write-through folded into the projection epilogue | SM107 -- the block's paged KV-cache WRITE-THROUGH is served (`paged_kv_page_size`: bf16 / f16, dense and packed, HND / NHD / unified-row pools at pages 16 / 32 / 64 / 128; the `Rubin d256 gated attention block -- serving forms` section below); `block_table` / `kv_lens` at `execute` are a typed decline until the paged read lands |
+| Gated attention block (frontend-only, no graph form): the DECODE form (a dense `S_q <= 4` declaration over the pools), e4m3 (`kv_cache_dtype`) pools, the write-through folded into the projection epilogue, an LSE / a window / a `QsaSpec` on the EXTEND form | SM107 -- the block's paged KV-cache WRITE-THROUGH (`paged_kv_page_size`: bf16 / f16, dense and packed) AND the EXTEND form (`kv_source="paged"` + `token_capacity`: the packed step's attention over the pools through `block_table` / `kv_lens` on the bottom-right diagonal) are served on HND / NHD / unified-row pools at pages 16 / 32 / 64 / 128 (the `Rubin d256 gated attention block -- serving forms` section below); a dense `kv_source="paged"` declaration is the typed `dense_declaration` decline until the DECODE form lands |
 | Backward pass entirely | SM90 |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs; on the d512 row THD, `dense_flex`, the dense padding mask, sink / dSink, bias / dBias, deterministic, decode | SM107 — the three d256 rows plus the d512 2x2-datapath row (`sdpa_bwd_sm107_d512`, opt_in, since 2026-10-01) are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ and ᵇ³) |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the three backward engines there serve exactly those bands (f16/bf16 d = 256 via the 2x2-datapath row ᵇ², opt_in, since 2026-10-01) |
@@ -2571,7 +2571,44 @@ band's raw-key pool (`index_k_raw`, `QsaSpec(index_band=True)`) is written by th
 the block's stage objects (the sparse attention core is a typed decline on this tree, so the block itself declines after the
 write-through stage accepted the geometry).
 
-Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the paged-READ
-inputs `block_table` / `kv_lens` at `execute` (attention over the pools: the serving EXTEND form's prefix read and the DECODE
-form), e4m3 pools (`kv_cache_dtype`), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together
-with the attribute.
+**Served since 2026-10-13 -- the EXTEND form** (`kv_source="paged"` on a packed, bounded declaration: `thd=True, num_sequences=B_max,
+max_seq_len=token_capacity, token_capacity=T_max, paged_kv_page_size=P, kv_source="paged", geometry.causal_bottom_right=True` + the pools' and
+the block table's samples; `execute(seq_lens=, k_cache=, v_cache=, slot_mapping=, block_table=, kv_lens=)`): the step's new tokens are written
+through, then stage (4) reads EVERY sequence's K / V -- its prefix and the new tokens -- from the pools over `[0, kv_lens[b])` through
+`block_table[b]` on the bottom-right diagonal, on the sm107 f16 row's paged THD leg (the shared SM100 d256 paged / THD body compiled for
+sm_107a, CGA2, unsplit, unpacked, NATURAL, no gate, no LSE); five launches on one stream (the write ordered before the read by stream order:
+no kernel on the chain launches with programmatic dependent launch -- pinned). Validated on a Rubin development node (cc 10.7, 204 SMs;
+functional cells, no perf claim) at the 8 / 2 d256 geometry: one declaration per (dtype, layout, page) over four sequences at `T_max` 512 --
+kv_len 128 (one KV tile; `B x H_kv > 1` with it), an 84-token step over a 300-row prefix ending mid-page (kv_len 384), a PADDED entry
+(kv_len 0, the NULL block 0, no rows), a 200-token step over a 77-row prefix (kv_len 277: a tail tile, three KV tiles) -- `T_live` 412 of 512
+(pad rows at the END, slot -1), the prefix rows written by the torch reference, `isfinite(out)` on every row first, every live sequence
+within the dense suite's budget of the per-sequence oracle over its FULL history (`out` cos >= 0.999, the gated O within atol 2e-2), the new
+tokens' pool rows bitwise the slab rows attention consumed, every unaddressed pool row still its finite stale value, the NULL page untouched
+(`test/python/gated_attention_block/cutedsl/test_block_serving_extend.py`, the "EXTEND form" half):
+
+| form | pool layout | page 16 | page 32 | page 64 | page 128 |
+|---|---|---|---|---|---|
+| EXTEND `kv_source="paged"` (the paged THD read; bottom-right; bounded tokens) | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| EXTEND | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| EXTEND | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+
+Also validated (bf16): a one-sequence EXTEND with an EMPTY prefix at a tight declaration (`T_live = T_max = 384`) against the dense `B = 1`
+block on the same tokens -- the two bodies differ (the shared SM100 paged THD body vs the Rubin sibling): BITWISE on `out` and on the gated O (0 of 196 608 / 786 432 elements differ; both legs within the oracle budget, out cos 0.999995), pinned; a 512-token sequence
+as TWO chunks (300 + 212, `T_max` 320 -- a bounded declaration) on one compiled block against the single-shot dense block and the oracle,
+the pool after both chunks within the write-through's bars of the oracle's K / V over all 512 positions; the prefix-hit step on L3 with the
+prefix rows written by the torch reference through the stack's own `[..., :D]` / `[..., D:]` views and read back the same way (the layout
+proof, both directions); L1 / L2 / L3 declarations over pools holding the same values bitwise on `out`; a zero-length sequence in the
+MIDDLE of the packing and a live-Q entry over kv_len 0 with the NULL block and slot -1 (its `out` rows exactly 0, nothing written to the
+NULL block); kv_len = 128 x n_kv for n_kv in {1, 2, 3, 4, 8} and the tail twin 128 x n_kv - 37 (one tile, the ring depth, the wrap) on L2 at
+page 64; a `[:, :max_pages]` row slice of a wider block table (row stride 50) bitwise the compact table; a finite stale tail inside the last
+live page (777 vs 0) bitwise on `out`; the bounded token contract -- live rows BITWISE the tight declaration, pad rows of a sentinel-filled
+`out` EXACTLY 0 over a once-zeroed workspace (the `o` slot aliased by no other stage's scratch, pinned on the carve), a shorter second step
+leaving the previously live rows finite and the pad rows 0; two launches bitwise; the FIRST execute of a fresh declaration captured into a
+CUDA graph on a new stream with no warm-up under `set_sync_debug_mode("error")`, replayed bitwise an eager run and then replayed over the
+next chunk's lengths / tables / slots written through the captured tensors; 16 fresh processes (one launch each, under `timeout`: n_kv in {1, 2, 4, 8} x 3 seeds at kv_len = 128 x n_kv, plus the tail twins 128 x n_kv - 37 at n_kv in {1, 3, 4, 8}; B_max 2, L2, page 64) exit 0 / 124 / other = 16 / 0 / 0. `serving_envelope(geometry, dtype, device)`
+publishes the form's declines (every row reachable at declaration with the published message, pinned on the CPU) and its served verdict.
+
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the DECODE form (a
+dense `[B, S_q <= 4, d_model]` declaration with `kv_source="paged"`: the `dense_declaration` row), an LSE / a sliding window / a
+`QsaSpec` / another head dim / `save_for_backward` / `quant` on the EXTEND form, e4m3 pools (`kv_cache_dtype`), the write-through
+folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute.
