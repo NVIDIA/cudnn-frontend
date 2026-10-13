@@ -48,19 +48,20 @@ issue-bound: every non-MMA instruction in the Q-loop shows up in the runtime.
 atomicAdd is order-non-deterministic (fp32 add is non-associative → bitwise
 varies run-to-run once a sequence spans >1 KV-tile).  The deterministic path
 orders the adds by ``kv_tile`` via a per-(seq,head,q_tile) int32 GMEM semaphore
-(``DQ_SEM``): each KV-tile CTA spins (acquire) until the counter == its
-``kv_tile``, does its (coalesced/direct) atomicAdds, then releases the token to
-``kv_tile+1`` (FlashAttention-2 deterministic pattern).  Ordering by
-``kv_tile == blockIdx.x`` of the SCHED_DEFAULT 3-D grid makes the awaited
-predecessor strictly lower-blockIdx (scheduled first) → deadlock-free; the relay
-is q-skip-safe because ``q_lo_tile`` is monotonic in ``kv_tile`` so every lower
-KV-tile reaching a q-tile relays before us (wait target is exactly ``kv_tile``).
-Forces SCHED_DEFAULT (LPT remaps ``kv_tile`` and would break the order); zero
-extra GMEM beyond the small counter; perf-insensitive (gated knob).  dK/dV are
-already deterministic (each CTA owns distinct K rows → no cross-tile atomic).
-All semaphore code folds out under ``const_expr(deterministic)`` → the default
-(non-deterministic) path is byte-identical.  Under a sliding window the relay
-counts turns from a q-tile's first visiting kv-tile (``relay_turn``).
+(``DQ_SEM``), from the q-tile's HIGHEST visiting kv-tile down: each KV-tile CTA
+spins (acquire) until the counter == its rank from the top, does its
+(coalesced/direct) atomicAdds, then hands the token to the next lower kv-tile.
+Descending order is what keeps causal fast: a kv-tile starts at its diagonal
+q-tile, where it is the first visitor, so with a sequence's kv-tiles resident
+nobody waits (ascending order made kv-tile k wait for tiles 0..k-1 to walk up to
+its diagonal: about 1/3 utilization).  The SCHED_DEFAULT 3-D grid decodes
+``kv_tile = gridDim.x - 1 - blockIdx.x`` so every awaited (higher) kv-tile has a
+lower blockIdx (scheduled first) → deadlock-free.  Forces SCHED_DEFAULT (LPT
+remaps ``kv_tile`` and would break the order); zero extra GMEM beyond the small
+counter.  dK/dV are already deterministic (each CTA owns distinct K rows → no
+cross-tile atomic).  All semaphore code folds out under
+``const_expr(deterministic)`` → the default (non-deterministic) path is
+byte-identical.
 
 Why two sub-groups: register capacity.  dV_acc + dK_acc + frags at d=128 bust
 the 255-reg/thread Ampere cap in a single group; splitting halves the live
@@ -110,7 +111,7 @@ from cudnn.frost.tile_dsl.mma import load_b_smem_x4, mma_step  # noqa: E402
 from cudnn.frost.tile_dsl.pointwise import fp32_to_fp16  # noqa: E402
 from cudnn.frost.tile_dsl.swizzle import swizzle_xor_128b  # noqa: E402
 from cudnn.frost.tile_dsl.tma import load_tile_2d, cp_async_commit, cp_async_wait  # noqa: E402
-from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA, compute_q_loop_bounds, swa_kv_lo_tile  # noqa: E402
+from cudnn.frost.tile_dsl.mask import MASK_NONE, MASK_PADDED, MASK_CAUSAL, MASK_SWA, compute_q_loop_bounds, q_tile_kv_hi  # noqa: E402
 from cudnn.frost.tile_dsl.rope import rope_rotate_smem_tile  # noqa: E402
 from cudnn.frost.tile_dsl.scheduler import lpt_l2_tile_coords  # noqa: E402
 from cudnn.frost.tile_dsl.thd import thd_port_origin  # noqa: E402
@@ -329,6 +330,11 @@ def _bprop_kernel(
         kv_tile = (_nkv - cutlass.Int32(1)) - _row
     else:
         kv_tile = bx
+        if cutlass.const_expr(deterministic):
+            # The deterministic relay hands each dQ slot from the highest visiting
+            # kv-tile down, so a kv-tile waits on HIGHER ones: schedule those first
+            # (lower blockIdx) to keep every awaited predecessor resident.
+            kv_tile = cutlass.Int32(cute.arch.grid_dim()[0]) - cutlass.Int32(1) - bx
         head = by
         batch = bz
     # GQA: CTA processes ONE query head `head`; its KV head = head // (H//Hkv).
@@ -479,6 +485,14 @@ def _bprop_kernel(
     if cutlass.const_expr(THD_VARLEN):
         n_iters = cutlass.Int32(arith.select((kv_base >= s_kv_b).ir_value(), cutlass.Int32(0).ir_value(), n_iters.ir_value()))
     q_lo_base = q_lo_tile * cutlass.Int32(tile_q)
+    if cutlass.const_expr(deterministic):
+        # The deterministic relay's last kv-tile that runs any q-iter: THD skips
+        # tiles past the packed sequence's KV length; dense tiles past a padded
+        # length still iterate (and relay).
+        if cutlass.const_expr(THD_VARLEN):
+            relay_kv_last = (s_kv_b + cutlass.Int32(tile_kv - 1)) // cutlass.Int32(tile_kv) - cutlass.Int32(1)
+        else:
+            relay_kv_last = cutlass.Int32(cute.arch.grid_dim()[0]) - cutlass.Int32(1)
 
     # K/V tile (row 0) GMEM element pointers — at the KV head (GQA-mapped).
     # kv_row_origin = batch*SKV (dense) or cu_k[b] (THD packed).
@@ -1033,25 +1047,33 @@ def _bprop_kernel(
 
         # ---- dQ atomicAdd ---------------------------------------------------
         # Deterministic relay (acquire): the fp32 dQ atomicAdds of a (seq, head,
-        # q_tile) land in ascending kv_tile order, gated by a per-slot counter.
-        # A kv-tile's turn is its rank among the q-tile's visitors.  The visitor
-        # set is contiguous in kv_tile: the causal q_lo skip removes only higher
-        # kv-tiles, the window q_hi cap removes only lower ones, so it starts at
-        # the window's first kv-tile for the q-tile's first row (the forward's
-        # KV-loop lower bound, swa_kv_lo_tile; 0 without a window) and turn =
-        # kv_tile - kv_first.  Every visitor computes the same kv_first, so
-        # acquire (== turn) and release (turn + 1) agree.  Folds out when
-        # deterministic=False.
+        # q_tile) land in DESCENDING kv_tile order, gated by a per-slot counter.
+        # A kv-tile's turn is its rank among the q-tile's visitors, counted from
+        # the highest.  The visitor set is contiguous in kv_tile: the causal q_lo
+        # skip removes only higher kv-tiles, the window q_hi cap removes only
+        # lower ones, so it ends at q_tile_kv_hi (the inverse of
+        # compute_q_loop_bounds' causal lo, capped at the last kv-tile that runs).  Descending order is what makes causal fast: a
+        # kv-tile starts at its diagonal q-tile, where it is the first visitor,
+        # and lower kv-tiles reach each q-tile exactly when their turn comes, so
+        # nobody waits once a sequence's kv-tiles are resident (ascending order
+        # stalled kv-tile k until tiles 0..k-1 walked up to its diagonal).
+        # Every visitor computes the same kv_hi, so acquire (== turn) and release
+        # (turn + 1) agree.  Folds out when deterministic=False.
         if cutlass.const_expr(deterministic):
             sem_idx = (batch * cutlass.Int32(H) + head) * sem_q_stride + q_iter
             sem_ptr = Pointer(cutlass.make_array_view(DQ_SEM).data_ptr() + sem_idx, dtype=cutlass.Int32)
-            if cutlass.const_expr(mask_flags & MASK_SWA):
-                _q_row0 = q_iter * cutlass.Int32(tile_q)
-                if cutlass.const_expr(causal_bottom_right):
-                    _q_row0 = _q_row0 + causal_diag
-                relay_turn = kv_tile - swa_kv_lo_tile(_q_row0, swa_window, tile_kv)
-            else:
-                relay_turn = kv_tile
+            relay_kv_hi = q_tile_kv_hi(
+                q_iter,
+                seqlen_q=s_q_b if cutlass.const_expr(THD_VARLEN) else q_bound,
+                seq_kv_len=s_kv_b if cutlass.const_expr(THD_VARLEN) else eff_skv,
+                kv_last=relay_kv_last,
+                mask_flags=mask_flags,
+                tile_q=tile_q,
+                tile_kv=tile_kv,
+                bottom_right=bool(causal_bottom_right),
+                window_right=right_bound,
+            )
+            relay_turn = relay_kv_hi - kv_tile
             if tidx == cutlass.Int32(0):
                 _dq_sem_wait(sem_ptr, relay_turn)
             nvvm.barrier_cta_sync()
@@ -1140,7 +1162,7 @@ def _bprop_kernel(
         #      to the slot have completed (atom.global.add returns → done at L2);
         #      the CTA barrier orders all 256 threads' adds before we publish, and
         #      the GPU acq_rel fence makes them visible before the next kv-tile's
-        #      acquire returns.  Hand the token to kv_tile+1. ---------------------
+        #      acquire returns.  Hand the token to the next lower kv-tile. -------
         if cutlass.const_expr(deterministic):
             nvvm.barrier_cta_sync()
             cute.arch.fence_acq_rel_gpu()
@@ -1328,10 +1350,11 @@ def _dq_sem_wait(sem_ptr, target):
     """Spin (acquire) on an int32 GMEM semaphore until it reads ``target``.
 
     The FlashAttention-2 deterministic-dQ relay: every kv-tile CTA adds its dQ
-    contribution to a (seq,head,q_tile) slot in strict ``kv_tile`` order, gated by
-    this counter.  ``sem_ptr`` is a ``Pointer(Int32)`` to the slot.  Ordering by
-    ``kv_tile == blockIdx.x`` (deterministic 3-D grid) makes the awaited
-    predecessor strictly lower-blockIdx (scheduled first) → deadlock-free."""
+    contribution to a (seq,head,q_tile) slot in strict descending ``kv_tile``
+    order, gated by this counter.  ``sem_ptr`` is a ``Pointer(Int32)`` to the slot.
+    The deterministic grid decodes ``kv_tile = gridDim.x - 1 - blockIdx.x``, so the
+    awaited predecessor is strictly lower-blockIdx (scheduled first) →
+    deadlock-free."""
     cur = cute.arch.atomic_add(sem_ptr, cutlass.Int32(0), sem="acquire", scope="gpu")
     wl = cutlass.while_generate([cur], lambda c: c != target)
     with wl as [c]:
