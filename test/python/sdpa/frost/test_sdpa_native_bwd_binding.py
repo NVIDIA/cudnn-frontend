@@ -39,7 +39,12 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
             ops.append(None)
             declared.append(None)
             continue
-        dt = "int32" if role.startswith("seq_") else "float32" if role in ("stats", "sink", "dsink", "bias", "dbias") else dtype
+        # ro_*: the SM80 bound ragged offsets, int64 like the graph's.
+        dt = (
+            "int32"
+            if role.startswith("seq_")
+            else "int64" if role.startswith("ro_") else "float32" if role in ("stats", "sink", "dsink", "bias", "dbias") else dtype
+        )
         shape, strides = ((2,), (1,)) if i >= 9 else ((2, 3, 5, 8), (160, 8, 32, 1))
         if role == "stats":
             shape, strides = (2, 3, 5, 1), (21, 7, 1, 1)
@@ -47,7 +52,7 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
             strides = ((2**32 + strides[0]) if wide == 1 else 2**30, *strides[1:])
             shape = ((2 if wide == 1 else 6), *shape[1:])
         span = 1 + sum((n - 1) * st for n, st in zip(shape, strides))
-        size = 2 if dt in ("float16", "bfloat16") else 4
+        size = 2 if dt in ("float16", "bfloat16") else 8 if dt == "int64" else 4
         alignment = 16 if i < 9 and role != "stats" else size
         ops.append(prep.Operand(dt, shape, strides, span, alignment, size))
         declared.append((shape, strides))

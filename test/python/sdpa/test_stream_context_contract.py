@@ -168,7 +168,7 @@ def test_verify_current_makes_the_handle_authoritative_over_the_raw_fast_path():
 
 @pytest.mark.L0
 def test_none_is_a_noop_and_sentinels_enter_the_torch_default_stream():
-    """None preserves the ambient stream; 0/1/2 enter the device's default.
+    """None preserves the ambient stream; 0/1 enter the device's default.
 
     Default-stream sentinels must never reach ExternalStream, whose handling of
     handle 0 differs across torch versions. Each entry restores the caller.
@@ -184,7 +184,7 @@ def test_none_is_a_noop_and_sentinels_enter_the_torch_default_stream():
         with mock.patch.object(torch.cuda, "ExternalStream", side_effect=AssertionError("a sentinel reached ExternalStream")):
             with _torch_stream_context(None, device):
                 assert _current_handle(device) == _handle(ambient)
-            for handle in (0, 1, 2):
+            for handle in (0, 1):
                 with _torch_stream_context(cuda_driver.CUstream(handle), device):
                     assert _current_handle(device) == default_handle
                 assert _current_handle(device) == _handle(ambient)

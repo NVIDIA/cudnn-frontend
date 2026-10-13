@@ -61,6 +61,13 @@ class CostProfile:
     mn_bounds: tuple[int, int] = (32, 4096)
     k_bounds: tuple[int, int] = (1024, 16384)
     max_batch: int = 8
+    # Opt-in eligibility relaxations. The strict gate rejects nearly every real
+    # priority workload (measured on real chains: block-scale and per-tensor
+    # scale GEMMs carry trailing scalar-scale MULs; fp16 GEMMs commonly carry an
+    # n-major B), so a profile fitted on such workloads must opt in to govern
+    # them. Profiles that do not opt in keep the strict gate bit-for-bit.
+    b_n_major_ok: bool = False
+    scalar_scale_epilogue_ok: bool = False
 
 
 _SM100_EXTRA_GEOMETRIES = (
@@ -122,17 +129,63 @@ _PROFILES = {
         coefficients=CostFeatures(3.716719, 1.445248, 0.127218, 0.092622, 0.080023, 0.145638, 0.148422, 4.498155, 0.0, 0.568267, 6.559288),
         extra_geometries=_SM100_EXTRA_GEOMETRIES,
     ),
+    # sm120 (RTX PRO 6000 Blackwell Server Edition). Coefficients fitted by
+    # non-negative least squares on the weekly exhaustive sweep's measured
+    # kernel times (every eligible config built and timed per layer), rows
+    # weighted by the layer's best time so small and large layers count
+    # equally; selection validated by replaying the full candidate ranking
+    # against the same measurements. The fp16 and block-scale fp4 entries
+    # carry a wider switch margin: at the default margin the model overrides
+    # baselines it cannot beat on this part.
+    (120, "sm120", "fp32", 16, 16, 16, False): CostProfile(
+        name="rtx_pro_6000_f16",
+        b_n_major_ok=True,
+        scalar_scale_epilogue_ok=True,
+        device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        coefficients=CostFeatures(
+            10.742818, 0.000000, 0.290090, 0.268702, 0.773501, 0.361878, 0.000000, 0.000000, 0.000000, 6.027293, 4.269089, 0.000000, 0.000000
+        ),
+        extra_geometries=(
+            "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+            "CONFIG_sm120_128x64x128_16x16x32_cluster1x1_warps4x2",
+        ),
+        switch_margin=0.15,
+    ),
+    (120, "sm120", "fp32", 8, 8, 16, False): CostProfile(
+        name="rtx_pro_6000_f8",
+        b_n_major_ok=True,
+        scalar_scale_epilogue_ok=True,
+        device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        coefficients=CostFeatures(
+            11.486993, 1.290724, 0.218370, 0.286799, 0.716421, 0.232828, 0.000000, 0.000000, 0.000000, 2.733481, 6.148131, 0.000000, 0.000000
+        ),
+        extra_geometries=(
+            "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps4x2",
+            "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4",
+        ),
+    ),
+    (120, "sm120", "fp32", 4, 4, 16, True): CostProfile(
+        name="rtx_pro_6000_block_f4",
+        b_n_major_ok=True,
+        scalar_scale_epilogue_ok=True,
+        device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        coefficients=CostFeatures(
+            8.148357, 0.451229, 0.272887, 0.946870, 1.139299, 0.224587, 0.000000, 0.636982, 0.000000, 2.322341, 6.716882, 0.028324, 0.000000
+        ),
+        extra_geometries=(
+            "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+            "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
+        ),
+        switch_margin=0.15,
+    ),
 }
 
 
-def _simple_graph(chain: FusionChain) -> bool:
-    mm = chain.matmul
-    if chain.has_moe or chain.is_multi_gemm or chain.has_mainloop_fusion:
-        return False
-    if chain.ops or chain.aux_tensors or chain.reductions or chain.quants or len(chain.output_specs) != 1:
-        return False
+def _block_scale_supported(chain: FusionChain) -> bool:
     bs = chain.block_scale
-    if bs is not None and (
+    if bs is None:
+        return True
+    return not (
         bs.fake_dequant_a
         or bs.fake_dequant_b
         or bs.block_size_a not in ((1, 16), (1, 32))
@@ -141,7 +194,16 @@ def _simple_graph(chain: FusionChain) -> bool:
         or bs.sfb_reorder != "F8_128x4"
         or DTYPE_BITS.get(bs.sf_dtype_a) != 8
         or DTYPE_BITS.get(bs.sf_dtype_b) != 8
-    ):
+    )
+
+
+def _simple_graph(chain: FusionChain) -> bool:
+    mm = chain.matmul
+    if chain.has_moe or chain.is_multi_gemm or chain.has_mainloop_fusion:
+        return False
+    if chain.ops or chain.aux_tensors or chain.reductions or chain.quants or len(chain.output_specs) != 1:
+        return False
+    if not _block_scale_supported(chain):
         return False
     out = chain.output_specs[0]
     return (
@@ -152,6 +214,48 @@ def _simple_graph(chain: FusionChain) -> bool:
         and out.major == "n"
         and out.stride in (None, (mm.M * mm.N, mm.N, 1))
     )
+
+
+def _eligible_graph(chain: FusionChain, profile: "CostProfile") -> bool:
+    """The strict gate, plus the relaxations this profile opted into.
+
+    Both relaxations preserve the cost model's validity by construction:
+    scalar-scale MUL epilogues add a near-constant per-element cost that is
+    identical for every candidate of the same layer (so the RANKING the model
+    produces is unchanged by ignoring it), and operand majorness does not
+    enter any cost feature. Candidate generation passes the view's B-layout
+    to select_config, so relaxed-eligibility candidates stay geometry-legal.
+    """
+    if _simple_graph(chain):
+        return True
+    mm = chain.matmul
+    if chain.has_moe or chain.is_multi_gemm or chain.has_mainloop_fusion:
+        return False
+    if chain.reductions or chain.quants or len(chain.output_specs) != 1:
+        return False
+    if not _block_scale_supported(chain):
+        return False
+    out = chain.output_specs[0]
+    if not (mm.a_major == "k" and mm.a_batch == mm.b_batch == mm.batch and out.major == "n" and out.stride in (None, (mm.M * mm.N, mm.N, 1))):
+        return False
+    if mm.b_major != "k" and not (profile.b_n_major_ok and mm.b_major == "n"):
+        return False
+    if chain.ops or chain.aux_tensors:
+        if not profile.scalar_scale_epilogue_ok:
+            return False
+        # Each op must be a scalar-scale MUL consuming an aux constant: a fan-in
+        # mul (both operands in-chain, no aux) multiplies two chain values and
+        # is not a constant epilogue, so it would break the equal-cost-per-
+        # candidate assumption this relaxation rests on.
+        if not all(op.op == "mul" and op.aux is not None and op.parent_idx_b is None and op.parent_idx_c is None for op in chain.ops):
+            return False
+        if not all(getattr(t, "bcast_mode", None) == "scalar" for t in chain.aux_tensors):
+            return False
+        if out.source_ref < 0:
+            return False
+    elif not (mm.out_dtype == out.dtype and out.source_ref == -1):
+        return False
+    return True
 
 
 def profile_for(chain: FusionChain, baseline: TileConfig, device: DeviceProperties) -> CostProfile | None:
@@ -166,7 +270,7 @@ def profile_for(chain: FusionChain, baseline: TileConfig, device: DeviceProperti
         chain.has_block_scale,
     )
     profile = _PROFILES.get(key)
-    if profile is None or profile.device_name != device.name or not _simple_graph(chain):
+    if profile is None or profile.device_name != device.name or not _eligible_graph(chain, profile):
         return None
     if not (profile.mn_bounds[0] <= mm.M <= profile.mn_bounds[1] and profile.mn_bounds[0] <= mm.N <= profile.mn_bounds[1]):
         return None
@@ -191,8 +295,26 @@ def candidate_configs(chain: FusionChain, baseline: TileConfig, device: DevicePr
     candidates = {baseline: None}
     for swapped, view in ((False, chain), (True, swap_ab(chain))):
         mm = view.matmul
+        if swapped and mm.a_major != "k":
+            # Swapping an n-major-B graph yields an m-major A, which the warp-
+            # scoped kernels do not serve: every such candidate would fail the
+            # probe. Skip the orientation instead of generating doomed picks.
+            # Strict-gate graphs (B k-major) always swap to a k-major A, so
+            # existing architectures never take this branch.
+            continue
         auto = (
-            select_config(mm.M, mm.N, 1, K=mm.K, block_scale=view.has_block_scale, sm_count=device.sm_count) if swapped else replace(baseline, split_k_slices=1)
+            select_config(
+                mm.M,
+                mm.N,
+                1,
+                K=mm.K,
+                block_scale=view.has_block_scale,
+                b_n_major=mm.b_major == "n",
+                b_elem_bytes=max(1, DTYPE_BITS[mm.b_dtype] // 8),
+                sm_count=device.sm_count,
+            )
+            if swapped
+            else replace(baseline, split_k_slices=1)
         )
         for geometry in (auto, *(by_name(name) for name in profile.extra_geometries)):
             geometry = as_mma_tile_k(as_pipeline(geometry, baseline.pipeline), baseline.mma_tile_k_bytes)
@@ -267,8 +389,6 @@ def select_strategies(
 ) -> list[TileConfig]:
     if not 1 <= limit <= MAX_PLAN_CONFIGS:
         raise ValueError(f"strategy limit must be between 1 and {MAX_PLAN_CONFIGS}")
-    if not _simple_graph(chain):
-        return [baseline]
     device = current_device_properties() if device is None else device
     if device is None:
         return [baseline]

@@ -400,6 +400,7 @@ def _run_thd_case(
     stats_layout: str = "token_major",
     cu_lens: bool = False,
     nan_capacity_tail: bool = False,
+    scale: float | None = None,
 ) -> None:
     """Run a THD (ragged) graph on the SM120 engine vs per-sequence references.
 
@@ -418,7 +419,7 @@ def _run_thd_case(
     s_q_max = max(max(seq_q_lens), 1)
     s_kv_max = max(max(seq_kv_lens), 1)
     d_v = head_dim if head_dim_v is None else head_dim_v
-    scale = 1.0 / math.sqrt(head_dim)
+    scale = 1.0 / math.sqrt(head_dim) if scale is None else scale
     q_seqs = [_bhsd(1, h_q, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_q_lens]
     k_seqs = [_bhsd(1, h_kv, max(n, 1), head_dim, dtype)[:, :, :n] for n in seq_kv_lens]
     v_seqs = [_bhsd(1, h_kv, max(n, 1), d_v, dtype)[:, :, :n] for n in seq_kv_lens]
@@ -1960,3 +1961,65 @@ def test_dsl_sm120_thd_parallel_prefix_batches(batch, cu_lens):
     q = [(0, 17, 63, 65, 129)[i % 5] for i in range(batch)]
     kv = [(31, 0, 65, 127, 257)[i % 5] for i in range(batch)]
     _run_thd_case(seq_q_lens=q, seq_kv_lens=kv, h_q=4, h_kv=2, head_dim=128, cu_lens=cu_lens, nan_capacity_tail=True, check_stats=True)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)], ids=["d64", "d128", "d192x128", "d256", "d512"])
+@pytest.mark.parametrize("mask", ["none", "causal", "padded_sink_bottom_right"])
+@torch_fork_set_rng(seed=31)
+def test_dsl_sm120_negative_attn_scale(d_qk, d_v, mask):
+    """A negative attn_scale is folded into Q's sign so the raw-score row max still bounds P (#1435); before, every
+    masked case returned NaN. The KV length is not a tile multiple, so "none" also masks a tail."""
+    kw = dict(batch=2, h_q=4, h_kv=2, s_q=160, s_kv=200, head_dim=d_qk, head_dim_v=d_v, scale=-0.7 / math.sqrt(d_qk), check_stats=True)
+    if mask == "causal":
+        kw.update(is_causal=True)
+    elif mask == "padded_sink_bottom_right":
+        kw.update(
+            is_causal=True,
+            causal_bottom_right=True,
+            with_sink=True,
+            seq_q_lens=torch.tensor([150, 160], dtype=torch.int32, device="cuda").view(2, 1, 1, 1),
+            seq_kv_lens=torch.tensor([180, 200], dtype=torch.int32, device="cuda").view(2, 1, 1, 1),
+        )
+    _run_case(**kw)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(128, 128), (256, 256), (512, 512)], ids=["d128", "d256", "d512"])
+@torch_fork_set_rng(seed=32)
+def test_dsl_sm120_thd_negative_attn_scale(d_qk, d_v):
+    """The packed path loads Q without TMA (the d512 kernel's register/shared-slot split included)."""
+    _run_thd_case(
+        seq_q_lens=[96, 0, 41],
+        seq_kv_lens=[130, 7, 41],
+        h_q=4,
+        h_kv=2,
+        head_dim=d_qk,
+        head_dim_v=d_v,
+        is_causal=True,
+        causal_bottom_right=True,
+        with_sink=True,
+        check_stats=True,
+        scale=-0.7 / math.sqrt(d_qk),
+    )
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=33)
+def test_dsl_sm120_execute_scale_sign_must_match_the_plan():
+    """The scale's sign is compiled into the plan (negate_scores), so an execute-time scale of the other sign is refused."""
+    _require_dsl()
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm120
+
+    b, h, s, d = 1, 2, 128, 128
+    q, k, v = (_bhsd(b, h, s, d, torch.float16) for _ in range(3))
+    o = torch.empty_like(q)
+    for planned in (d**-0.5, -(d**-0.5)):
+        api = SdpaFwdDslSm120(sample_q=q, sample_k=k, sample_v=v, sample_o=o, scale_softmax=planned)
+        assert api.check_support()
+        api.compile()
+        with pytest.raises(ValueError, match="sign"):
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=-planned)
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, scale_softmax=2 * planned)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(o.float(), _ref_sdpa_full(q, k, v, scale=2 * planned), atol=0.1, rtol=5e-2)

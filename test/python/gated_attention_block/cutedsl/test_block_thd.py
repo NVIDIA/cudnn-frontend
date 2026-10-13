@@ -444,18 +444,21 @@ def test_thd_declines_fuse_gate():
 
 
 @requires_cuda
-def test_thd_declines_mxfp8():
-    """An MxQuantSpec (and the fp4 modes that ride it) is dense-only under THD: the MXFP8 SDPA row serves no THD and
-    the block's MXFP8 quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid."""
-    args, kw = _decl_fp8_thd_args(mxfp8=True)
-    with _no_device_sync(), pytest.raises(NotImplementedError, match="MXFP8") as ei:
-        GatedAttentionBlockFwd(*args, **kw)
-    assert "dense-only under thd=True" in str(ei.value)
-    # The unfused per-tensor FP8 pipeline IS declared under THD (served; the accept cell is test_thd_fp8_unfused_matches_the_fake_quant_oracle).
+def test_thd_serves_the_unfused_quantized_pipelines():
+    """Both UNFUSED quantized pipelines are DECLARED under THD: per-tensor FP8 (the accept cell is
+    test_thd_fp8_unfused_matches_the_fake_quant_oracle) and MXFP8 -- its three quantize stages on the PACKED arm (the SDPA row's
+    per-sequence-tile-padded scale-factor layout, the packing's B recorded), the SDPA stage on the MXFP8 row's THD arm; the accept
+    cells are test_block_thd_mxfp8.py's.  (This pin used to assert the MXFP8 decline; the block's MXFP8 quantize now writes the
+    packed layout, so the decline is retired.)"""
     args8, kw8 = _decl_fp8_thd_args(mxfp8=False)
     with _no_device_sync():
         blk = GatedAttentionBlockFwd(*args8, **kw8)
-    assert blk.thd and blk._sdpa.fp8 and blk._sdpa.token_stride == 0 and not blk.fuse_gate
+    assert blk.thd and blk._sdpa.fp8 and blk._sdpa.pertensor and blk._sdpa.token_stride == 0 and not blk.fuse_gate
+    args, kw = _decl_fp8_thd_args(mxfp8=True)
+    with _no_device_sync():
+        mx = GatedAttentionBlockFwd(*args, **kw)
+    assert mx.thd and mx.mxfp8 and mx._sdpa.thd and mx._sdpa.mxfp8 and not mx._sdpa.pertensor and mx._sdpa.token_stride == 0 and not mx.fuse_gate
+    assert all(st.packed and st.num_sequences == len(_LENS) and not st.cu_seqlens for st in (mx._quant_q, mx._quant_k, mx._quant_v))
 
 
 @requires_cuda
@@ -1172,12 +1175,13 @@ def test_thd_fp8_unfused_with_a_zero_length_sequence():
     _check_fp8_per_sequence(res)
 
 
-def _run_fp8_thd(lens, *, max_seq_len=None, training=False):
+def _run_fp8_thd(lens, *, max_seq_len=None, training=False, geom_kw=_COMMON):
     """The UNFUSED per-tensor FP8 packed forward over ``lens`` (``QuantSpec`` calibrated on the packed data as the FP8 suite
     does), INFERENCE by default; ``training=True`` (appended) declares ``save_for_backward=True`` and writes the bf16 training
     record (``_alloc_packed_saved`` at ``act_dtype=torch.bfloat16``, sentinel-filled; ``saved.h`` IS the e4m3 ``h``).  The
-    namespace carries the per-sequence fake-quant references, the QuantSpec, the e4m3 inputs, the workspace and the record."""
-    geom_kw = _COMMON
+    namespace carries the per-sequence fake-quant references, the QuantSpec, the e4m3 inputs, the workspace and the record.
+    ``geom_kw`` (appended): the block geometry, ``_COMMON`` by default (the packed fp8 BACKWARD suite varies the mask and the
+    GQA group through it)."""
     g = GatedAttentionBlockGeometry(**geom_kw)
     inp, meta = make_packed_inputs(RefGeometry(**geom_kw), lens, max_seq_len=max_seq_len)
     inp8, desc = quantize_block_inputs(inp)

@@ -27,6 +27,25 @@ quantize passes = 5 launches unfused) is ONE launch writing FOUR compact tensors
 THREE scale-factor blobs, byte-for-byte what the unfused path
 (``kernels/quantize_mxfp8.py``) hands ``sm107/prefill_d256_mxfp8.py``.
 
+THE e2m1-B ARM (``NormRopeFusionParams.weight_fp4``)
+----------------------------------------------------
+An MXFP4 ``W_qkvg`` -- e2m1 codes packed two per byte along K (``torch.float4_e2m1fn_x2``, storage
+``[N, K // 2]``) with the UNCHANGED E8M0 / 32 scale-factor blob -- is served by the SAME kernel body on
+the block-scale catalog's MIXED row: ``kind::mxf8f6f4`` decodes a per-side format (e4m3 for A, E2M1 for
+B) over the same 32-element K blocks with the same number of 32-byte-K instructions, so the MMA term
+does not move.  At this config's ``mma_tile_k_bytes=32`` that is the PADDED E2M1 SMEM form: the B TMA
+descriptor takes the padded sub-byte format (a 64-byte payload row of 128 codes lands as a 128-byte SMEM
+row -- 8 payload bytes + 8 padding bytes per 16 codes), so the B ring keeps its 16 KiB-per-stage
+footprint and its 128-byte swizzle, and only the bytes the TMA COMPLETES halve: ``sB_tma_bytes``
+16384 -> 8192, hence ``ab_full``'s expect-tx (``ab_only_copy_bytes``, DERIVED from it) 65536 -> 49152 --
+the ONE barrier-table entry that changes; the SMEM table changes the dtype label of ``smem_b`` only.
+The switch is a LOAD-TIME ternary on ``PARAMS.weight_fp4`` over the B-side constants of the header below
+(seven constants + the guard), never a traced branch, and it was derived by rendering the mixed row and
+the e4m3 row from the same tree and diffing: exactly those lines differ.  The runner declines the padded
+format's three tensor-map rules on the host (``K % 128``, a 32-byte-aligned base, 32-byte row strides):
+the descriptor here is built on a symbolic K and a dynamic base, so the DSL cannot.  Not expressible: an
+NVFP4 ``W_qkvg`` (the catalog has no mixed row with e4m3 scales) and an fp4 A.
+
 SCALE-FACTOR LAYOUT (PR-B plan section 2.3; ``mma-tma-matrix.md`` section 7)
 ------------------------------------------------------------------------------
 Every SF byte below is read by the SDPA's TMA descriptors as WHOLE tiles, so a wrong
@@ -100,7 +119,9 @@ the LAST ``tcgen05.ld`` of the tile.
 ``const_w`` / ``const_cs`` exactly as the FP8 fork defines them (NOT correct; they price
 the load classes).  There is no ``off`` here: no single bf16 slab to degenerate to.
 
-BARRIER TABLE: UNCHANGED.  SMEM TABLE: UNCHANGED.  This fork adds no mbarrier, no
+BARRIER TABLE: UNCHANGED (the e2m1-B arm changes ONE constant of one row -- ``ab_full``'s
+expect-tx, see above -- and no count, guard or consumer).  SMEM TABLE: UNCHANGED (the e2m1-B
+arm relabels ``smem_b``'s dtype only).  This fork adds no mbarrier, no
 named barrier and no SMEM buffer to the block-scale rendering (whose SF rings are
 declared FIRST so every tcgen05 descriptor root stays below 256 KiB -- see the
 rendering's own comment).  It adds THREE TMA-store descriptors (q8 / k8 / v8 e4m3 + the
@@ -118,12 +139,18 @@ FUSION`` markers, with the ``alpha`` / ``qscal`` reads dropped and the per-tenso
 replaced by the per-block E8M0.  It was NOT produced by patching the FP8 fork's
 constants header (``frost-tile-dsl.md`` S5: diff the RENDERINGS, not the edit).
 Mainloop / SF rings / UTCCP / scheduler / TMEM pipeline / register split are the
-rendering's, verbatim; any fix there applies to ALL of them.
+rendering's, verbatim; any fix there applies to ALL of them.  The e2m1-B arm is the
+mixed-row rendering of the SAME template at ``mma_tile_k_bytes=32``: re-render it through
+``build_proj_gemm(block_scale=True, w_dtype=torch.float4_e2m1fn_x2, mma_tile_k_bytes=32,
+tile_config=<this config's name>)`` (``plan.jit.generated_path``) and diff -- the explicit
+``mma_tile_k_bytes`` is REQUIRED because a forced block-scale name is otherwise re-targeted
+to the GPU's preferred width (64 on cc 10.7), whose native-packed e2m1 form is a different
+mainloop, not this header with other constants.
 
 Parameters come from the FROST template loader as ``FROST_TEMPLATE_PARAMS``
 (a :class:`~cudnn.gated_attention_block.kernels.proj_gemm.NormRopeFusionParams`
-with ``quant_mxfp8=True``); a plain import gets the 397B geometry so the file runs
-standalone.
+with ``quant_mxfp8=True``, and ``weight_fp4=True`` for the e2m1-B arm); a plain import
+gets the 397B geometry with an e4m3 B so the file runs standalone.
 """
 
 from __future__ import annotations
@@ -155,6 +182,7 @@ from cuda.bindings import driver as _cuda
 from cutlass.cute.arch import clc as cute_clc
 
 # Block-scale config: CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma data=fp8_e4m3xfp8_e4m3 sf=fp8_e8m0 block=32
+# (the e2m1-B arm is the SAME config's data=fp8_e4m3xfp4_e2m1 rendering: see PARAMS / _W4 before the packed data SMEM constants)
 cta_group = 2
 cta_tile_mnk = (128, 128, 128)
 mma_size_m = 1
@@ -198,24 +226,43 @@ a_tma_box_m = 128
 b_mcast_slices = 1
 ab_empty_full_mask = False
 
+# ---- MXFP8 NORM+ROPE+QUANT FUSION: the template parameters are read HERE, above the rendered constants,
+# because the B-side constants below are a LOAD-TIME switch on PARAMS.weight_fp4 (the e2m1-B arm) ----
+PARAMS: NormRopeFusionParams = globals().get("FROST_TEMPLATE_PARAMS", NormRopeFusionParams(quant_mxfp8=True))
+if not PARAMS.quant_mxfp8:
+    raise ValueError(
+        f"{__name__}: this is the MXFP8 fork; it needs NormRopeFusionParams(quant_mxfp8=True) "
+        "(the FP8 fork is proj_gemm_norm_rope_fp8.py, the bf16 fork proj_gemm_norm_rope.py)"
+    )
+validate_norm_rope_params(PARAMS)
+# The e2m1-B arm: the block-scale catalog's MIXED row (e4m3 A x e2m1 B, E8M0 / 32 on both sides) rendered for THIS config
+# at mma_tile_k_bytes=32 = the PADDED E2M1 SMEM form.  Exactly the B-side constants below differ from the e4m3 rendering
+# (verified by rendering both rows from the same tree and diffing): b_dtype / b_fake_dtype / b_tma_desc_dtype / idesc_b_dtype
+# (the packed e2m1 dtype), b_smem_dtype (Uint8: a 64-byte payload row is expanded to a 128-byte padded SMEM row, so the ring
+# keeps its footprint and its 128-byte swizzle), b_tma_format (the padded sub-byte TMA format) and sB_tma_bytes (the GMEM
+# payload the TMA completes: half).  The kernel body is unchanged; ab_full's expect-tx is DERIVED from sB_tma_bytes below.
+_W4: bool = PARAMS.weight_fp4
+_B_DATA_BITS: int = 4 if _W4 else 8  # bits per B code: what the B TMA completion counts (the SMEM footprint stays 8 bits per code)
+
 # packed data SMEM
 a_dtype = cutlass.Float8E4M3FN
-b_dtype = cutlass.Float8E4M3FN
+b_dtype = cutlass.Float4E2M1FNx2 if _W4 else cutlass.Float8E4M3FN
 a_smem_dtype = cutlass.Float8E4M3FN
-b_smem_dtype = cutlass.Float8E4M3FN
+b_smem_dtype = cutlass.Uint8 if _W4 else cutlass.Float8E4M3FN
 ab_max_data_bits = 8
 a_fake_dtype = cutlass.Float8E4M3FN
-b_fake_dtype = cutlass.Float8E4M3FN
+b_fake_dtype = cutlass.Float4E2M1FNx2 if _W4 else cutlass.Float8E4M3FN
 a_packed_per_row = 128
 b_packed_per_row = 128
 sA_packed_elems = 16384
 sB_packed_elems = 16384
 sA_tma_bytes = 16384
-sB_tma_bytes = 16384
+# the GMEM payload bytes ONE B box ([128 codes, 128 rows]) delivers: 16384 e4m3 / 8192 e2m1 -- derived from the code width, never a literal
+sB_tma_bytes = cta_tile_mnk[1] * cta_tile_mnk[2] * _B_DATA_BITS // 8
 a_tma_desc_dtype = cutlass.Float8E4M3FN
-b_tma_desc_dtype = cutlass.Float8E4M3FN
+b_tma_desc_dtype = cutlass.Float4E2M1FNx2 if _W4 else cutlass.Float8E4M3FN
 a_tma_format = None
-b_tma_format = None
+b_tma_format = _tma.TensorMapDataFormat.B4X16_P64 if _W4 else None
 a_tma_swizzle = _tma.TensorMapSwizzle.s128b
 b_tma_swizzle = _tma.TensorMapSwizzle.s128b
 a_smem_swizzle = cutlass.experimental.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B
@@ -251,7 +298,7 @@ epi_row_elems = 32
 mma_block_scale_kind = nvvm.MMABlockScaleKind.MXF8F6F4
 scale_vec_size = nvvm.Tcgen05MMABlockScale.BLOCK32
 idesc_a_dtype = cutlass.Float8E4M3FN
-idesc_b_dtype = cutlass.Float8E4M3FN
+idesc_b_dtype = cutlass.Float4E2M1FNx2 if _W4 else cutlass.Float8E4M3FN  # MX instruction-descriptor format 5 (E2M1) for the e2m1 B
 sf_scale_format = 1
 sf_one_word = 2139062143
 mma_m_dim = 256
@@ -292,15 +339,9 @@ mixed_a_pattern_fb = 1
 mixed_b_pattern_fb = 1
 
 # ---------------------------------------------------------------------------
-# MXFP8 NORM+ROPE+QUANT FUSION: geometry + knobs (compile-time; every use is const_expr)
+# MXFP8 NORM+ROPE+QUANT FUSION: geometry + knobs (compile-time; every use is const_expr).
+# PARAMS itself is read above the rendered constants (the e2m1-B arm switches B-side constants on it).
 # ---------------------------------------------------------------------------
-PARAMS: NormRopeFusionParams = globals().get("FROST_TEMPLATE_PARAMS", NormRopeFusionParams(quant_mxfp8=True))
-if not PARAMS.quant_mxfp8:
-    raise ValueError(
-        f"{__name__}: this is the MXFP8 fork; it needs NormRopeFusionParams(quant_mxfp8=True) "
-        "(the FP8 fork is proj_gemm_norm_rope_fp8.py, the bf16 fork proj_gemm_norm_rope.py)"
-    )
-validate_norm_rope_params(PARAMS)
 _D: int = PARAMS.d_head
 _ROPE_DIM: int = PARAMS.rope_dim
 _H_Q: int = PARAMS.h_q
@@ -348,9 +389,31 @@ if use_acc_overlap or (cgrp_tile_mnk[1] // cluster_shape_mnk[1]) != _D or epi_co
     )
 if _ROPE_DIM % (2 * epi_n) != 0 or _ROPE_DIM >= _D:
     raise ValueError(f"{__name__}: rope_dim={_ROPE_DIM} must be a multiple of {2 * epi_n} (two whole subtiles per rotate_half pair) and < d_head={_D}")
-if a_dtype is not cutlass.Float8E4M3FN or b_dtype is not cutlass.Float8E4M3FN or mma_c_dtype is not cutlass.Float32 or cd_dtype is not cutlass.BFloat16:
+_B_DTYPE = cutlass.Float4E2M1FNx2 if _W4 else cutlass.Float8E4M3FN  # the ONE B dtype every B-side constant must agree on
+if a_dtype is not cutlass.Float8E4M3FN or b_dtype is not _B_DTYPE or mma_c_dtype is not cutlass.Float32 or cd_dtype is not cutlass.BFloat16:
     raise ValueError(
-        f"{__name__}: this fork was rendered for an e4m3 x e4m3 block-scale GEMM -> fp32 with a bf16 C (the gate slab); the rendering's constants say otherwise"
+        f"{__name__}: this fork was rendered for an e4m3 x {'e2m1' if _W4 else 'e4m3'} block-scale GEMM -> fp32 with a bf16 C (the gate slab); "
+        f"the rendering's constants say otherwise (a_dtype {a_dtype}, b_dtype {b_dtype}, weight_fp4={_W4})"
+    )
+if b_fake_dtype is not _B_DTYPE or b_tma_desc_dtype is not _B_DTYPE or idesc_b_dtype is not _B_DTYPE:
+    raise ValueError(f"{__name__}: the B-side dtypes disagree for weight_fp4={_W4}: fake {b_fake_dtype}, TMA {b_tma_desc_dtype}, idesc {idesc_b_dtype}")
+if _W4:
+    # The padded E2M1 SMEM form exists at the K32 instruction width only: a K64 rendering reads NATIVE packed e2m1 through a
+    # different SMEM geometry (64-byte rows, a 64-byte swizzle, half the ring footprint) and must come from a fresh rendering.
+    if mma_size_k != 4 or b_smem_dtype is not cutlass.Uint8 or b_tma_format is not _tma.TensorMapDataFormat.B4X16_P64:
+        raise ValueError(
+            f"{__name__}: the e2m1-B arm is the K32 PADDED form (mma_size_k 4, Uint8 B SMEM, the padded sub-byte TMA format); got mma_size_k={mma_size_k}, "
+            f"b_smem_dtype={b_smem_dtype}, b_tma_format={b_tma_format} -- a K64 rendering is a different mainloop, re-render instead of patching"
+        )
+    # The TMA completes the GMEM payload (64 bytes per 128-code row) while the ring holds the padded 128-byte rows under the 128-byte swizzle:
+    if sB_tma_bytes * 2 != sB_packed_elems * (b_smem_dtype.width // 8) or b_smem_swizzle is not cutlass.experimental.primitives.Tcgen05SmemSwizzle.SWIZZLE_128B:
+        raise ValueError(
+            f"{__name__}: under the padded e2m1 form the B TMA payload must be HALF the B SMEM stage ({sB_tma_bytes} x 2 vs {sB_packed_elems} x "
+            f"{b_smem_dtype.width // 8}) under SWIZZLE_128B ({b_smem_swizzle}); a wrong pair here is a hang (payload too small for the expect-tx) or a race"
+        )
+elif b_smem_dtype is not cutlass.Float8E4M3FN or b_tma_format is not None or sB_tma_bytes != sB_packed_elems:
+    raise ValueError(
+        f"{__name__}: the e4m3-B rendering stores one byte per code with no TMA format; got b_smem_dtype={b_smem_dtype}, b_tma_format={b_tma_format}, sB_tma_bytes={sB_tma_bytes}"
     )
 if sf_cutlass_dtype is not cutlass.Float8E8M0FNU or block_size != _SF_BLOCK or fake_dequant_a or fake_dequant_b:
     raise ValueError(

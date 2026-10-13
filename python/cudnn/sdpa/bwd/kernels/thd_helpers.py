@@ -41,6 +41,8 @@ from cutlass._mlir.dialects import arith
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental import primitives as nvvm
 
+from typing import Optional
+
 import cutlass
 import cutlass.cute as cute
 
@@ -52,6 +54,7 @@ from cudnn.frost.tile_dsl.thd import (
     write_thd_live_and_ctr,
     write_thd_meta,
     write_thd_prefix_warp,
+    write_thd_port_origins,
     write_thd_row_offsets,
 )
 from cudnn.sdpa.bwd.config_sm100 import STAGE3_THD_SF_CU_K_OFF, STAGE3_THD_SF_CU_Q_OFF, STAGE3_THD_SF_META_WORDS
@@ -72,6 +75,9 @@ __all__ = [
     "thd_meta_host",
     "thd_claim_unit",
     "pad_sf_atoms_thd_host",
+    "ORIGIN_PORTS",
+    "build_thd_meta_origins_kernel",
+    "thd_meta_origins_host",
 ]
 
 # The MXFP8 row's per-sequence SF TILE prefixes: ONE layout, the block-scale stage-3 arm's (``config_sm100.STAGE3_THD_SF_*``),
@@ -416,3 +422,57 @@ def pad_sf_atoms_thd_host(
     _pad_sf_atoms_thd(src, dst, meta_t, sf_meta_t, n_batch, n_heads, n_tiles, kv_side, columnwise).launch(
         grid=(grid_x, 1, 1), block=(_PAD_SF_THREADS, 1, 1), stream=stream
     )
+
+
+# Ports whose caller buffers a backward may address at bound ragged offsets, in
+# the order the origin spec and the offset pointers use.
+ORIGIN_PORTS = ("q", "k", "v", "o", "do", "dq", "dk", "dv", "stats")
+
+
+@cute.kernel
+def build_thd_meta_origins_kernel(
+    meta_t: cute.Tensor,
+    q_lens_t: cute.Tensor,
+    kv_lens_t: cute.Tensor,
+    lens_form: cutlass.Int32,
+    n_batch: cutlass.Int32,
+    org_t: cute.Tensor,
+    ro_q: Optional[cute.Tensor],
+    ro_k: Optional[cute.Tensor],
+    ro_v: Optional[cute.Tensor],
+    ro_o: Optional[cute.Tensor],
+    ro_do: Optional[cute.Tensor],
+    ro_dq: Optional[cute.Tensor],
+    ro_dk: Optional[cute.Tensor],
+    ro_dv: Optional[cute.Tensor],
+    ro_stats: Optional[cute.Tensor],
+    origins: cutlass.Constexpr,
+) -> None:
+    """:func:`build_thd_meta_kernel` plus the caller-buffer token origins of the
+    ports ``origins`` materializes (one ``(row, mult, ts)`` or ``None`` per
+    :data:`ORIGIN_PORTS` entry).  Warp 0 builds the compact metadata exactly as
+    :func:`build_thd_meta_kernel` does; every thread then writes origins, which
+    do not depend on it."""
+    tidx, _, _ = cute.arch.thread_idx()
+    nthreads, _, _ = cute.arch.block_dim()
+    meta = cutlass.make_array_view(meta_t)
+    if n_batch <= cutlass.Int32(1):
+        if tidx == cutlass.Int32(0):
+            write_thd_meta(meta, cutlass.make_array_view(q_lens_t), cutlass.make_array_view(kv_lens_t), lens_form, n_batch)
+    elif tidx < cutlass.Int32(32):
+        write_thd_prefix_warp(meta, cutlass.make_array_view(q_lens_t), n_batch, n_batch, (lens_form & 1) != 0, cutlass.Int32(tidx), store_lengths=False)
+        write_thd_prefix_warp(meta, cutlass.make_array_view(kv_lens_t), n_batch, 2 * n_batch + 1, (lens_form & 2) != 0, cutlass.Int32(tidx), store_lengths=True)
+    ro = (ro_q, ro_k, ro_v, ro_o, ro_do, ro_dq, ro_dk, ro_dv, ro_stats)
+    for i in cutlass.range_constexpr(len(ORIGIN_PORTS)):
+        if cutlass.const_expr(origins[i] is not None):
+            write_thd_port_origins(org_t, ro[i], origins[i][0], origins[i][1], origins[i][2], n_batch, cutlass.Int32(tidx), cutlass.Int32(nthreads))
+
+
+build_thd_meta_origins_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
+@cute.jit
+def thd_meta_origins_host(meta_t, q_lens_t, kv_lens_t, lens_form, n_batch, org_t, ro, origins: cutlass.Constexpr, stream=None):
+    """One-block launch of :func:`build_thd_meta_origins_kernel`; ``ro`` is the
+    nine offset tensors (``None`` for a port without origins)."""
+    build_thd_meta_origins_kernel(meta_t, q_lens_t, kv_lens_t, lens_form, n_batch, org_t, *ro, origins).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)

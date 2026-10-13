@@ -207,13 +207,15 @@ class TemplateParams:
     # Being a TemplateParams field it is part of the module-cache key: gate on/off are two coexisting
     # specializations of one template, and an ungated module traces byte-identically to before the field existed.
     epilogue_gate: bool = False
-    # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g <= D256_DECODE_ROUTED_MAX_Q_ROWS)
-    # lower onto sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride
-    # the MMA M axis and the packed Q rows ride N, so the MMA and exp work
-    # scale with the LIVE rows instead of a 128-row Q tile.  The value is the
-    # N extent the kernel is compiled for (16, or 32 at the template level, from
-    # decode_d256_q_tile); 0 = the prefill tile.  Plan-time only (S_q is a
-    # declared shape).
+    # Decode-shaped d256 f16/bf16 graphs (S_q * pack_g within the arch line's routed
+    # rows: D256_DECODE_ROUTED_MAX_Q_ROWS here, config_sm107's on cc 10.7, where the
+    # 32-column tile serves the MTP step in token units) lower onto
+    # sm100/decode_d256_f16.py, the swap-AB tile: the KV tokens ride the MMA M axis
+    # and the packed Q rows ride N, so the MMA and exp work scale with the LIVE
+    # rows instead of a 128-row Q tile.  The value is the N extent the kernel is
+    # compiled for -- the rows of ONE token unit (16, or 32 at the template level
+    # and on the Rubin route, from decode_d256_q_tile); 0 = the prefill tile.
+    # Plan-time only (S_q is a declared shape).
     decode_q_tile: int = 0
     # The 128-row DECODE tile (sm100/decode_d128_f16.py) for flavors that do not
     # key it off cta_mma.  d128 routes that tile by cga1, because its prefill
@@ -237,6 +239,12 @@ class TemplateParams:
     # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
     # role-split A/B arm).
     mma_2x2: bool = False
+    # attn_scale < 0: BMM1 negates Q (tcgen05 a_negate), so the kernel's raw-score max, masks and exp2 run on -S at
+    # |attn_scale| (#1435). APPEND-ONLY, default False.
+    negate_scores: bool = False
+    # A dense S_kv off the KV tile with no mask covering the tail: compile the padded mask against the scalar
+    # S_kv, with no per-batch lengths buffer (MASK_PADDED without SEQ_KV_LENS_PRESENT; #1425).
+    kv_tail_mask: bool = False
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -265,23 +273,40 @@ _CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
 
 
 def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
-    """Packed half partials: D128, nonpaged D192/V128, and SM107 paged D256."""
+    """Packed half partials for the explicitly wired native head geometries."""
     return (
         device_cc in ((10, 0), (10, 3), (10, 7))
         and not fp8
         and thd
         and not padded_stats
         and (
-            (d_shape == (128, 128) and max_q > (1 if paged else 0))
+            (device_cc in ((10, 0), (10, 3)) and paged and d_shape == (64, 64) and max_q > 0)
+            or (d_shape == (128, 128) and max_q > (1 if paged else 0))
             or (not paged and d_shape == (192, 128) and max_q > 0)
-            or (device_cc == (10, 7) and paged and d_shape == (256, 256) and max_q > 0)
+            or (d_shape == (256, 256) and max_q > 0)
         )
     )
 
 
-def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv):
+def supports_scalar_kv_tail_split(d_shape, *, device_cc, fp8, pertensor):
+    """Native scalar-tail masking composes with D128 half/per-tensor FP8 split."""
+    return device_cc in ((10, 0), (10, 3), (10, 7)) and d_shape == (128, 128) and (not fp8 or pertensor)
+
+
+def supports_paged_split_sink(d_shape, *, device_cc, fp8, thd, paged, max_q):
+    """Sink-aware packed combine, qualified on Rubin D128 paged half Q>1."""
+    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and max_q > 1
+
+
+def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
     """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
-    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+    # SM100 Q=1 keeps the existing ragged-Q decode/combine contract.
+    return (device_cc == (10, 7) or (device_cc == (10, 0) and max_q > 1)) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+
+
+def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
+    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
 def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
@@ -357,7 +382,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         # Each of these would need extra machinery in the combine pass, so the
         # backstop rejects them rather than silently producing a wrong answer.
         if k.thd_varlen and not (
-            (flavor == "d256" and k.cta_mma == 2 and k.paged_kv and not fp8 and not k.pack_gqa)
+            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8)
+            or (flavor == "d256" and k.cta_mma == 2 and not fp8 and not k.pack_gqa)
             or (
                 flavor == "d128"
                 and k.cta_mma == 1
@@ -377,13 +403,20 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
         if k.thd_varlen and not (
-            flavor == "d128"
-            and not fp8
+            not fp8
             and (
-                ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1) or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and k.split_kv > 1)
+                or (
+                    flavor == "d128"
+                    and (
+                        ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1)
+                        or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                    )
+                )
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
             )
         ):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128, cga2 unsplit or cga1 split")
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, or paged half d256 cga2 unsplit")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
@@ -448,7 +481,7 @@ def _mask_flags_from(params: TemplateParams) -> int:
         flags |= MASK_CAUSAL
     if params.window_left is not None:
         flags |= MASK_SWA
-    if params.thd_varlen or params.seq_kv_lens_present:
+    if params.thd_varlen or params.seq_kv_lens_present or params.kv_tail_mask:
         flags |= MASK_PADDED
     return flags
 
@@ -1039,28 +1072,68 @@ def make_cfg_d256_mxfp8(params: TemplateParams) -> Tuple[CfgD256, TmaIters]:
 # 3-slot 64 KiB K/V ring, the Q tile and the two P^T buffers inside 227 KiB).
 D256_DECODE_MAX_Q_ROWS = 32
 _D256_DECODE_Q_TILES = (16, 32)
-# Largest packed Q-row count the adapter ROUTES onto the decode tile.  The
-# 32-column tile (two softmax column groups over the same 128 TMEM lanes) is
-# compiled and tested at the template level but issue-bound per CTA: at b=32
-# x 2 KV heads x 4096 keys (B200) it streams a KV tile in 2.8 us against the
-# 16-column tile's 1.75 us -- 90 us unsplit where the prefill tile takes 66
-# us -- and its split-2 plan (58 us of GPU time) costs an eager caller 96-103
-# us per execute for the second launch.  Until its per-CTA issue rate is
-# fixed, S_q x G in (16, 32] stays on the prefill tile, which serves those
-# shapes at its previous numbers in both regimes (eager and CUDA-graph
-# replay).  Raising this to D256_DECODE_MAX_Q_ROWS routes the wide tile.
+# Largest packed Q-row count the adapter ROUTES onto the decode tile ON THE
+# BLACKWELL LINE (SM100 / SM103).  The 32-column tile (two softmax column groups
+# over the same 128 TMEM lanes) is compiled and tested at the template level but
+# issue-bound per CTA there: at b=32 x 2 KV heads x 4096 keys (B200) it streams
+# a KV tile in 2.8 us against the 16-column tile's 1.75 us -- 90 us unsplit
+# where the prefill tile takes 66 us -- and its split-2 plan (58 us of GPU time)
+# costs an eager caller 96-103 us per execute for the second launch.  Until its
+# per-CTA issue rate is fixed, S_q x G in (16, 32] stays on the prefill tile on
+# this line, which serves those shapes at its previous numbers in both regimes
+# (eager and CUDA-graph replay).  The Rubin line routes the wide tile, in TOKEN
+# UNITS of two tokens for the MTP step: config_sm107.D256_DECODE_ROUTED_MAX_Q_ROWS
+# (32) / D256_DECODE_ROUTED_MAX_TOKEN_UNITS (2) and config_sm107.decode_d256_q_tile,
+# measured on cc 10.7 against the prefill body at the 24/2 geometry.
 D256_DECODE_ROUTED_MAX_Q_ROWS = 16
+# The 16-column tile: one unit covers S_q x pack_g <= 16 rows (today's decode step).
+_D256_DECODE_NARROW_Q_TILE = 16
 
 
-def decode_d256_q_tile(s_q: int, pack_g: int) -> int:
-    """The decode tile's N extent for ``s_q`` tokens packed ``pack_g`` heads per
-    token (1 = unpacked), or 0 when the prefill tile serves the graph: no rows,
-    or more than D256_DECODE_ROUTED_MAX_Q_ROWS of them (the 32-column tile is a
-    valid ``make_cfg_d256_decode`` record but is not routed)."""
-    rows = int(s_q) * int(pack_g)
-    if rows <= 0 or rows > D256_DECODE_ROUTED_MAX_Q_ROWS:
+def decode_d256_q_tile(s_q: int, pack_g: int, routed_max_rows: int = D256_DECODE_ROUTED_MAX_Q_ROWS, max_token_units: int = 1) -> int:
+    """The decode tile's N extent -- the Q rows of ONE TOKEN UNIT -- for ``s_q``
+    tokens packed ``pack_g`` heads per token (1 = unpacked), or 0 when the
+    prefill tile serves the graph.
+
+    ``routed_max_rows`` is the widest tile the caller's arch line routes (16 on
+    SM100 / SM103, where the 32-column tile is a valid ``make_cfg_d256_decode``
+    record but is not routed; 32 on cc 10.7); ``max_token_units`` how many
+    token units of ``N // pack_g`` consecutive tokens a (head group, batch,
+    split) may be cut into (the kernel's ``Q_TOKEN_UNITS`` axis: each unit
+    streams the KV range once more, so a line admits it only where it measured
+    the trade -- 1 everywhere but cc 10.7, which measured the 24/2 MTP form and
+    admits two units for every packed group the tile holds).  The rule: rows that fit
+    the 16-column tile ride it in one unit (the KV streamed once, the cheapest
+    per-CTA stream); past 16 rows the 32-column tile serves
+    ``ceil(s_q / (32 // pack_g))`` units when that count is within the cap and
+    the group fits the tile, else 0.  With the defaults this is the SM100 rule
+    verbatim (16 for S_q x G <= 16 rows, 0 above)."""
+    s_q, pack_g = int(s_q), int(pack_g)
+    if s_q <= 0 or pack_g <= 0:
         return 0
-    return next(n for n in _D256_DECODE_Q_TILES if rows <= n)
+    rows = s_q * pack_g
+    if rows <= _D256_DECODE_NARROW_Q_TILE:
+        return _D256_DECODE_NARROW_Q_TILE
+    wide = D256_DECODE_MAX_Q_ROWS
+    if wide > int(routed_max_rows) or pack_g > wide:
+        return 0
+    if decode_d256_q_units(s_q, pack_g, wide) > int(max_token_units):
+        return 0
+    return wide
+
+
+def decode_d256_q_units(s_q: int, pack_g: int, n_q: int) -> int:
+    """How many TOKEN UNITS (CTAs per (head group, batch, split)) the decode tile of N
+    extent ``n_q`` launches for ``s_q`` tokens packed ``pack_g`` heads per token:
+    ``ceil(s_q / (n_q // pack_g))`` -- the kernel's own derivation (``Q_BOX_TOKENS =
+    N_Q // HEADS_PER_TILE``); 0 when ``n_q`` is 0 (the prefill tile) or the group does
+    not fit the tile.  The decode split model's unit count is ``batch x head groups x
+    this``."""
+    s_q, pack_g, n_q = int(s_q), int(pack_g), int(n_q)
+    if n_q <= 0 or pack_g <= 0 or s_q <= 0 or pack_g > n_q:
+        return 0
+    tokens_per_unit = n_q // pack_g
+    return -(-s_q // tokens_per_unit)
 
 
 @dataclass(frozen=True)
@@ -1964,8 +2037,8 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d128 (llama): 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d128 llama: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
         (
-            cfg.STAGES_KV == ((2 if cfg.CTA_MMA == 1 else 4) if _fp8 else 2),
-            "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 at cga1 — "
+            (cfg.STAGES_KV in (2, 3) if cfg.CTA_MMA == 1 else cfg.STAGES_KV == 4) if _fp8 else cfg.STAGES_KV == 2,
+            "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 or 3 at cga1 — "
             "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
         ),
         (
@@ -1994,7 +2067,9 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
             raise ValueError(msg)
 
 
-def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
+def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[CfgD128, TmaIters]:
+    """``cga1_kv_stages``: K/V ring depth of the fp8 family's single-CTA (cga1) configuration -- 2 by default (the
+    per-tensor fp8 kernel's verified geometry); the MXFP8 kernel asks for 3 (see STAGES_KV below)."""
     _validate_params("d128", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs → MXFP8 kernel
@@ -2035,7 +2110,10 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         # cga1 configuration keeps STAGES_KV=2.  mxfp8 additionally stages E8M0
         # scale factors that the SMEM model cannot see, and at STAGES_KV=4 that
         # pushed a cga1 CTA to 237024 B against the 232448 B cap.
-        STAGES_KV=(2 if params.cta_mma == 1 else 4) if fp8 else 2,
+        # The MXFP8 kernel takes a THIRD full-width stage at cga1 (cga1_kv_stages=3): Q and O already share a slab
+        # there, so 3 x (16 K + 16 V) KiB plus the scale factors still fit, and the deeper prefetch covers the
+        # tile boundary of the short packed GQA legs that run cga1.
+        STAGES_KV=(cga1_kv_stages if params.cta_mma == 1 else 4) if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,
@@ -2478,7 +2556,7 @@ def _validate_cfg_d64_decode(cfg: CfgD64Decode) -> None:
         ),
         (cfg.READ_TILE_ARRIVERS == 11, f"d64 decode: expected READ_TILE_ARRIVERS=11, got {cfg.READ_TILE_ARRIVERS}"),
         (cfg.TILE_K_HW_BMM1 == 16 and cfg.TILE_K_HW_BMM2 == 16, "d64 decode: f16 K=16 MMA phases"),
-        (cfg.THD_VARLEN == 0, "d64 decode: dense graphs only"),
+        (not cfg.THD_VARLEN or (cfg.SPLIT_KV > 1 and cfg.PAGED_KV), "d64 decode: THD requires paged split"),
         (cfg.N_BMM2_CHUNKS * cfg.BMM2_CHUNK_SIZE == cfg.TILE_N, "d64 decode: BMM2 chunking is TILE_N-derived"),
         (
             cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128 and cfg.O_SWZ_BYTES == 128,
@@ -2500,13 +2578,14 @@ def make_cfg_d64_decode(params: TemplateParams) -> Tuple[CfgD64Decode, TmaIters]
         raise ValueError(f"d64 decode: the decode tile is cga1 only (cta_mma=1); got cta_mma={params.cta_mma}")
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d64 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
-    if params.thd_varlen:
-        raise ValueError("d64 decode: THD/varlen is not wired on the decode tile (dense graphs only)")
+    if params.thd_varlen and not (params.split_kv > 1 and params.paged_kv):
+        raise ValueError("d64 decode: THD requires paged split")
     if params.pv_bf16 or not params.emit_amax_o:
         raise ValueError("d64 decode: pv_bf16 / emit_amax_o are MXFP8-only experiment axes")
     b = bpe(params.dtype_qkv)
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD64Decode(
+        THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
@@ -2648,7 +2727,7 @@ def canonicalize_d192_lowering(
     window_right = params.window_right
 
     template_window_right = window_right
-    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present:
+    if fp8 and pertensor and window_left is None and window_right is None and not params.seq_kv_lens_present and not params.kv_tail_mask:
         # CUTLASS DSL 4.7 does not finish lowering the large-shape FP8
         # MASK_NONE x32 path, so the dense plan is lowered as MASK_CAUSAL with a
         # right band no sequence reaches.  The band is a compile-time

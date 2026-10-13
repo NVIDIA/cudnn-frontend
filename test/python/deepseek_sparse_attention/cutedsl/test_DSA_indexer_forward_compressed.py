@@ -67,32 +67,55 @@ def test_compressed_indexer_rejects_unsupported_qhead_group_before_launch():
 
 
 @pytest.mark.L0
-def test_indexer_denom_placeholders_use_stable_power_of_two_buckets():
+@torch_fork_set_rng(seed=35)
+def test_compressed_denom_slot_compiled_out():
+    """Without LSE the stage-1 kernel takes denom=None (Rule 8, R3): no placeholder pool, and a fully pre-allocated call allocates nothing."""
     _require_sm100()
     try:
+        from cudnn import DSA
         from cudnn.deepseek_sparse_attention.indexer_forward import _compressed_top_k_sm100 as compressed_impl
-        from cudnn.deepseek_sparse_attention.indexer_forward import _interface as dense_impl
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    device = torch.device("cuda")
-    for getter in (
-        compressed_impl._get_fwd_unified_denom_placeholder,
-        dense_impl._get_fwd_denom_placeholder,
-    ):
-        bucket_8_view_5 = getter((5,), device)
-        bucket_8_view_8 = getter((8,), device)
-        bucket_16_view_9 = getter((9,), device)
-        bucket_8_view_5_again = getter((5,), device)
-        rank_2_bucket_8 = getter((1, 5), device)
+    for name in ("_denom_placeholder_cache", "_denom_placeholder_cache_lock", "_get_fwd_unified_denom_placeholder"):
+        assert not hasattr(compressed_impl, name), f"{name} still exists"
 
-        assert bucket_8_view_5.shape == (5,)
-        assert bucket_8_view_5.untyped_storage().nbytes() == 8 * bucket_8_view_5.element_size()
-        assert bucket_8_view_5.data_ptr() == bucket_8_view_8.data_ptr()
-        assert bucket_16_view_9.untyped_storage().nbytes() == 16 * bucket_16_view_9.element_size()
-        assert bucket_16_view_9.data_ptr() != bucket_8_view_5.data_ptr()
-        assert bucket_8_view_5_again.data_ptr() == bucket_8_view_5.data_ptr()
-        assert rank_2_bucket_8.data_ptr() != bucket_8_view_5.data_ptr()
+    device = torch.device("cuda")
+    b, s_q, s_k, h_q, d = 2, 128, 64, 64, 128
+    ratio, top_k = 4, 16
+    q = torch.randn((b, s_q, h_q, d), dtype=torch.bfloat16, device=device)
+    k = torch.randn((b, s_k, 1, d), dtype=torch.bfloat16, device=device)
+    w = torch.randn((b, s_q, h_q), dtype=torch.bfloat16, device=device).abs() * 0.1
+    cand = torch.empty(DSA.compress_topk_cand_buffer_size(b, s_q, s_k, ratio, microbatch_rows=0), dtype=torch.float32, device=device)
+    out_indices = torch.empty((b, s_q, top_k), dtype=torch.int32, device=device)
+    out_logits = torch.empty((b, s_q, top_k), dtype=torch.float32, device=device)
+
+    def run():
+        return DSA.indexer_forward_top_k_wrapper(
+            q,
+            k,
+            w,
+            top_k=top_k,
+            ratio=ratio,
+            microbatch_rows=0,
+            topk_indices_global=False,
+            return_softmax=False,
+            cand_buffer=cand,
+            out_indices=out_indices,
+            out_logits=out_logits,
+        )
+
+    run()  # lazy compile with denom=None
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+
+    result = run()
+    torch.cuda.synchronize()
+    check_ref_compressed_topk(ref_indexer_forward(q, k, w, ratio), result["indices"], result["logits"], top_k, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.L0

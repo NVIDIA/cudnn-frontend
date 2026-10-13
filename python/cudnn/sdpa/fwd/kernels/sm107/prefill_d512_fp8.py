@@ -82,6 +82,7 @@ from cutlass._mlir.dialects import arith
 import cutlass
 from cutlass.experimental import primitives as prims
 import cutlass.cute as cute
+from cudnn.sdpa.fwd.kernels._quantized import _descale_qk_negate_bit
 from cutlass.base_dsl.typing import Pointer
 from cutlass.experimental.cuda import tensor_map as tmap
 from cudnn.frost.tile_dsl.tma import cp_async_bulk_shared_cluster_shared_cta
@@ -248,6 +249,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     compute_kv_loop_bounds,
     lpt_tile_coords,
     make_sdpa_helpers,
+    running_max_step_finite_sentinel,
 )
 
 # ----------------------------------------------------------------------------
@@ -704,7 +706,7 @@ def _kernel(
     _dsc_k = cutlass.Float32(cutlass.make_array_view(descale_k_t)[0])
     _dsc_v = cutlass.Float32(cutlass.make_array_view(descale_v_t)[0])
     _scl_o = cutlass.Float32(cutlass.make_array_view(scale_o_t)[0])
-    scale_softmax_log2 = scale_softmax_log2 * _dsc_q * _dsc_k
+    scale_softmax_log2 = cute.math.abs(scale_softmax_log2 * _dsc_q * _dsc_k)
     o_scale_fused = o_scale_fused * _dsc_v * _scl_o
 
     # ------------------------------------------------------------------
@@ -983,6 +985,8 @@ def _kernel(
                 mcast_mask=mcast_mask,
                 sg0_mcast_mask=sg0_mcast_mask,
                 cta_in_pair=cta_in_pair,
+                descale_q_t=descale_q_t,
+                descale_k_t=descale_k_t,
             )
         else:
             _mma_warp_non_leader(
@@ -1173,33 +1177,28 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
+    # current_max_raw is the tile's RAW row max -- exactly NEG_INF_F32 (the finite mask sentinel) iff every column of this
+    # tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.  scale_log2 carries the per-tensor
+    # descale fold, so the scaled sentinel stays finite under the quantizer's descales and overflows under unit ones.
     current_max = current_max_raw * scale_log2
 
-    # Online softmax (RESCALE_THRESHOLD skip).
-    old_total_max = total_max
-    is_first = total_max == NEG_INF_F32
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD_F32)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF_F32, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF_F32, 0) and is published by the
+    # epilogue's _row_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_raw, current_max, total_max, NEG_INF_F32, RESCALE_THRESHOLD_F32, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF_F32.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max (one FFMA2 per pair -- the per-tensor descale fold rides in scale_log2, so
-    # there is no pre-folded arm here); then exp2 and the FP8 pack.  Keep the FP32 RegTile (slice via .vec slicing) and
+    # reg_S = reg_S * scale_log2 - new_total_max (one FFMA2 per pair -- the per-tensor descale fold rides in scale_log2, so
+    # there is no pre-folded arm here; new_total_max is the running max, or 0 on a dead leading tile, whose columns then land
+    # at exp2(sentinel) = +0); then exp2 and the FP8 pack.  Keep the FP32 RegTile (slice via .vec slicing) and
     # cast each chunk to FP8 inside the P_TMA_ITERS loop — RegTile(Float8E4M3FN) is illegal at JIT, but slicing the FP32
     # RegTile then casting the slice is fine (per d256_fp8 pattern).
-    reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+    reg_S_scaled = reg_S_tile.vec * scale_log2 - new_total_max
 
     # ---- Write P[tid, :] to SMEM xfer ring slot[parity] (K1 swizzle hoist + K2 fp8 pack) ----
     # K1: the Swizzle(3,4,3) XOR term of every 16-B vector of this lane's P row is LOOP-INVARIANT: the swizzle XORs bits
@@ -1984,17 +1983,25 @@ def _compute_warp_group(
             # Write LSE — under cga2 each sg1 peer writes its half of O+LSE
             # rows (leader = [0:128], peer = [128:256]).  Per-thread row.
             q_row_global = q_super_idx * cutlass.Int32(CFG.TILES_Q * CFG.TILE_M) + tid_in_wg
-            # Gated exactly like the LSE write below.
-            if q_row_global < seqlen_q:
+            # ONE row bound for BOTH the LSE write and the amax atomic below.  They must stay tied: amax is an
+            # atomicMax, which only GROWS, so a single row past the sequence's own length folded in permanently
+            # inflates the graph's Amax_O for the whole tensor and no per-row check ever shows it.  Under THD the
+            # bound is the per-sequence Q length S_q_b, not the dense seqlen_q: with that bound the single-query
+            # THD draws of the cc 10.7 FP8 sweep reported Amax_O 2 % to 7x above the O they stored (the tile's
+            # other 127 rows, stale Q, are stored as zero but were still reduced).  Mirrors prefill_d512_mxfp8.
+            q_row_limit = seqlen_q
+            if cutlass.const_expr(CFG.THD_VARLEN):
+                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
+                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
+                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
+                q_row_limit = _s_q_b
+            if q_row_global < q_row_limit:
                 nvvm.atomicrmw(nvvm.AtomicOp.MAX, _amax_o_ptr, _amax_o_local.bitcast(cutlass.Int32))
             if cutlass.const_expr(CFG.THD_VARLEN):
                 # THD: q_row_global is sequence-local; LSE is packed [1,QH,T] →
                 # index [0, head, cu_q[b] + local], bound by per-sequence Q len S_q_b.
-                _cu = cutlass.make_array_view(seq_kv_lens_tensor)
-                _cu_q_b = cutlass.Int32(_cu[n_batch + batch_idx])
-                _s_q_b = cutlass.Int32(_cu[n_batch + batch_idx + cutlass.Int32(1)]) - _cu_q_b
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < _s_q_b:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         # Written in the CALLER's layout, picked by the STATIC rank compile()
                         # baked in: token-major rank-2 [T, QH] (the DEFAULT) or head-major
@@ -2010,7 +2017,7 @@ def _compute_warp_group(
                                 lse_arr[cutlass.Int32(0), head_idx, _cu_q_b + q_row_global] = lse
             else:
                 if cutlass.const_expr(lse_tensor is not None):
-                    if q_row_global < seqlen_q:
+                    if q_row_global < q_row_limit:
                         lse_arr = cutlass.make_array_view(lse_tensor)
                         lse_arr[batch_idx, head_idx, q_row_global] = lse
 
@@ -2086,6 +2093,8 @@ def _mma_warp_group(
     mcast_mask,
     sg0_mcast_mask,
     cta_in_pair,
+    descale_q_t,
+    descale_k_t,
 ):
     """MMA warp leader — sg-conditional BMM1 (sg0 leader) or BMM2 (sg1 leader).
 
@@ -2133,7 +2142,9 @@ def _mma_warp_group(
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
         k_dim=1,
+        a_negate=int(PARAMS.negate_scores),
     )
+    idesc_qk = idesc_qk ^ _descale_qk_negate_bit(descale_q_t, descale_k_t)
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,

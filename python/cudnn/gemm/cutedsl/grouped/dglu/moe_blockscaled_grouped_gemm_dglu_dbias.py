@@ -35,6 +35,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import math, llvm
 from cutlass._mlir.dialects import vector, arith
 
+from ..canonical import kernel_facing_b, kernel_facing_mx, kernel_facing_prob
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
     MoESchedulerParams,
@@ -760,6 +761,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         derivative. GeGLU parameters are ignored unless ``act_func == "dgeglu"``
         and SiTU parameters are ignored unless ``act_func == "dsituglu"``.
         """
+        a = kernel_facing_mx(a)
+        c = kernel_facing_mx(c)
+        d = kernel_facing_mx(d)
+        d_col = kernel_facing_mx(d_col)
+        prob = kernel_facing_prob(prob)
+        dprob = kernel_facing_prob(dprob)
+        if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
+            b = kernel_facing_b(b, b_major_mode == OperandMajorMode.MN)
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type  # B must match A dtype

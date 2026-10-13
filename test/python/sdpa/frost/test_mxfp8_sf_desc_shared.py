@@ -13,7 +13,8 @@ module for a dense and a THD geometry.  The byte-identity of the refactor itself
 sm_107a cubin, PTX and clean-MLIR md5s of both forward kernels before / after (4 builds, identical; md5 records retained
 internally -- re-check the cubin md5s before and after any edit to the builders), plus the forwards' own Rubin accept
 tests (``test_sdpa_fwd_dsl_sm107.py -k mxfp8``,
-``test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d192_d128``).
+``test_sdpa_fwd_mxfp8_sm100.py::test_mxfp8_d192_d128``).  The d128 forward's descriptor move (2026-10, paged KV) re-ran
+the cubin md5 gate on w2u1g-lc-0614 (16 dense sm_107a builds of the d128 / d256 forwards, identical before / after).
 """
 
 import os
@@ -80,6 +81,18 @@ def test_forward_kernels_take_the_sf_descriptors_and_the_peer_split_from_the_sha
     if "d256" in rel:
         assert "build_columnwise_sf_desc(" in src, "the d256 forward's V SF is the columnwise (D-plane-major) descriptor"
         assert "_v_plane_stride_16" not in src, "the columnwise stride arithmetic must live in the shared module"
+
+
+def test_d128_forward_takes_the_rowwise_sf_descriptor_from_the_shared_module():
+    """The Rubin d128 MXFP8 forward builds its three rowwise SF descriptors through the shared module too (moved with
+    the paged-KV port, which sizes the K / V descriptors per POOL PAGE: ``num_batches = n_pages``, ``num_tiles =
+    page_size / 128``).  A LIGHT pin: the kernel still carries its own cga2 peer-split arithmetic (``K_SF_BYTES_PER_PEER
+    = SF_SMEM_SIZE_K // CFG.CTA_MMA`` and the module-level ``SF_TMA_ROW_BYTES``); lifting that onto ``sf_peer_split`` is a
+    named follow-up with its own cubin gate, so this test does not join the full pin above yet."""
+    src = _kernel_source("sm107/prefill_d128_mxfp8.py")
+    assert "from cudnn.sdpa.kernels._mxfp8_sf import" in src, "the d128 forward must import the shared SF module"
+    assert "def _build_sf_desc(" not in src, "a private copy of the rowwise SF descriptor closure survives in the d128 forward"
+    assert "build_rowwise_sf_desc(" in src
 
 
 # ---------------------------------------------------------------------------

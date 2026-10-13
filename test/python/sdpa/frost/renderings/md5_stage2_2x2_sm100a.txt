@@ -1,14 +1,8 @@
-# PTX md5 of the 2x2-twin SM100 d512 stage-2 DEFAULT renderings (kernels/sm100/bprop_d512_f16_2x2.py at the SM100 arm:
-# stages_kv 4 / cast_stages 1, every debug lever off), CUTE_DSL_ARCH=sm_100a.  All four lines were rendered on 2026-10-06 from
-# the tree of PR #1323's review follow-up (the end-of-kernel ring drains walk the whole ring and the compute warp group
-# synchronizes before its mb_tmem_dealloc arrive), twice in independent processes with identical md5s, through the probe
-# test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_default_rendering_ptx_md5_is_unchanged renders (host trace-compile; the test
-# harness itself needs a CUDA device).  The PTX text is a function of the DSL build: the test compares only when the installed
-# DSL matches the `dsl=` line and skips otherwise -- re-render from the current tree to refresh (render each line twice).
-# The attribution lever (TemplateParams2x2.debug_clk) is zero traced code when off: test_stage2_2x2_debug_clk_lever_renders_code
-# pins that its ARMED rendering differs from every line below.
+# Refreshed 2026-10-09 for the per-CTA empty-phase observer ACK protocol.
+# Each default rendering was repeated in an independent process with identical PTX.
+# THD is checked structurally by test_stage2_2x2_sass_pins: identical MLIR can lower
+# to different PTX under the same DSL build, so a byte-hash golden is not stable.
 dsl=nvidia-cutlass-dsl 4.7.0
-stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=04ec937f54125a2a9349fa5e88122113
-stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=cb1c175817c5dcd29403558f8e9ab8d3
-stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=6e5281e556ef3b3041b83b08a4ae05b7
-stage2_2x2 sm_100a thd_bf16 rc=0 ptx_md5=025daeeb410c5d0922077b12206f02e4
+stage2_2x2 sm_100a dense_bf16 rc=0 ptx_md5=b9998a204153156c13c326d394e0e92d
+stage2_2x2 sm_100a causal_bf16 rc=0 ptx_md5=ea5dbd0bf1d533191a5a4a5ce852b258
+stage2_2x2 sm_100a dense_fp16 rc=0 ptx_md5=6fd1425b025fbfc48f1c8e46e4e8d6d2

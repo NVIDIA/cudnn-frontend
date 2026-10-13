@@ -2450,7 +2450,10 @@ def _host(
     # strides are in BYTES:
     #   sfa_0  (512 B atom, K tiles, M tiles, H, B)   over the A operand's F8_128x4 atoms [B, H, M/128, K/128, 512]
     #   sfb_0  (512 B atom, D planes, K tiles, H, B)  over the columnwise B SF, D-plane-major (plane stride = B*H*tiles atoms)
-    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1)
+    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1).
+    #          Its H is B's OWN head extent, `n_head // b_head_group`: under a grouped dQ record the host hands the view windowed
+    #          to the kv heads and the SFB coordinate takes `tile_h_b = _b_head(tile_h)` exactly like B's (dense and THD alike),
+    #          so one launch covers a whole head chunk; the tensor map is sized from this view's shape.
     sfa_0: Optional[cute.Tensor] = None,
     sfb_0: Optional[cute.Tensor] = None,
     # The block-scale arm's THD leg (TRAILING, defaulted): the int32 `[cu_sf_q(B+1) | cu_sf_k(B+1)]` per-sequence SF TILE prefixes

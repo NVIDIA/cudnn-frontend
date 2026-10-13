@@ -300,7 +300,7 @@ def compile_thd_host(
         lse_stride,
         initialize_outputs,
         driver.CUstream(0),
-        options="--enable-tvm-ffi",
+        options="--enable-tvm-ffi --gpu-arch=sm_80",
         cache_key=key,
         symbol="frost_sdpa_fwd_thd",
     )

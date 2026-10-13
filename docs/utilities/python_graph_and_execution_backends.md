@@ -724,6 +724,31 @@ only to decline is why `closed_under` existed.
   function, list the cell in `_TILE_RULE_CELLS`, and put the measurement in the
   commit.
 
+### Consumed by FlashInfer: the public surface, kept stable
+
+FlashInfer's cuDNN backend (`flashinfer/cudnn/{prefill,decode,utils}.py`)
+programs against this graph API and probes a handful of frontend facts before
+it routes work here. Those names are a caller boundary whatever their spelling
+(`python/cudnn/AGENTS.md` Rule 9: "a private method consumed outside FE is
+still a caller boundary"), so every one of them is public API, kept as
+spelled, with a public twin where the spelling was private.
+`test/python/sdpa/frost/test_flashinfer_consumed_surface.py` (host-only, L0)
+pins each name with its signature, so a rename fails this repository's CI
+instead of silently degrading FlashInfer to its fallback path.
+
+| what the caller asks | spelled today (kept) | public spelling |
+|---|---|---|
+| does the native SDPA binder honor a packed-split / stride contract? | `cudnn._pybind_module._SdpaThdBinder.supports_stats_stride_override`, `.supports_nonpaged_packed_split`, `.supports_paged_split_sink`, ... (static read-only properties, `True`) | `"<cap>" in cudnn.sdpa_capabilities()` -- the frozenset of every `supports_<cap>` flag the build provides; append-only, never renamed |
+| which engine serves the selected plan? | `graph.selected_engine` (`None` = the cuDNN backend; else `.name`) | the same property, documented: `.name` is the engine's manifest name, a stable identifier (`sdpa_fwd_prefill_sm100` / `sdpa_fwd_prefill_sm107` / `sdpa_fwd_prefill_sm120`, ...; manifest names and slots are append-only) |
+| can the cuDNN backend still serve this graph? | `graph.backend_plan_entries()` after `create_execution_plans` (`[]` = declined, guarded or not installed) | the same method, documented above |
+| can the FROST engines run on this install, for this GPU? | `cudnn.frost.buffers.cutedsl_state()` / `cutedsl_too_old(version)` / `CUTEDSL_MIN_VERSION` -- the version half only | `cudnn.frost.cutedsl_runtime_available(device_cc=None)`: the version half, plus -- given a `(major, minor)` cc -- the target half (`cutedsl_arch_requirement_error`). **The floor is 4.7.0 everywhere and 4.8.0 on cc 10.7** (the first public wheel whose `Arch` knows `sm_107a`): a device-blind probe on a cc 10.7 part with a 4.7.x DSL says True while every FROST row declines, so pass the GPU you route to |
+| the cuDNN dtype of a torch dtype | `cudnn.datatypes._torch_to_cudnn_data_type(dtype)` | `cudnn.datatypes.torch_to_cudnn_data_type(dtype)` (the private name is an alias of it) |
+| the unified attention implementation, the graph helpers, the caller hints | `cudnn.attention_implementation.UNIFIED`, `cudnn.graph_cache(key_fn=)`, `cudnn.jit(heur_modes=)`, `cudnn.graph(handle, **graph_kwargs)`, `cudnn.pygraph(is_override_shape_enabled=, is_cuda_graph_replay_expected=)` | already public; listed so the pin covers them |
+
+Nothing here changes a `Capabilities` row: the probes report what the engines
+already decide, and `import cudnn` stays as cheap as before (the device-blind
+probe reads package metadata; only the cc 10.7 target check imports the DSL).
+
 ### Knobs: one public vocabulary, and every python plan lists the knobs it will build
 
 - `KnobType_t` (`include/cudnn_frontend/knobs.h`, mirrored as `cudnn.knob_type`)
@@ -781,6 +806,36 @@ facts shaped this: `and` is staged, so `const_expr(CFG.PACK_GQA and
 q.shape[2] != ...)` must nest its constant test outside; a `const_expr` on a
 dynamic extent or stride is an error, which is why the padded-Stats store
 selects on the fake's RANK (rank-4) and not on `shape[0] > 1`.
+
+### Per-port token origins from the bound ragged offsets (SDPA THD backward, SM80)
+
+A ragged graph binds one ragged-offset tensor per port, and a padded THD layout
+(TE's `cu_seqlens_padded`) puts a sequence's rows somewhere other than
+`prefix(lengths)`. The SM80 backward reads those values on device (issue
+#737). Its existing setup launch, which turns the lengths into the compact
+`cu_seqlens`, also writes one **token origin per port and sequence**,
+`org_p[b] = ro_p[b] × M_p / ts_p` (`M_p` the port's `ragged_offset_multiplier`,
+`ts_p` its token stride in the CALLER's buffer, Int64 arithmetic), into an Int64
+`[rows, B]` workspace region with one row per port that binds offsets. No extra
+launch; the host only binds the current offset pointers, so the origins follow
+the bound values on every execute and CUDA-graph replay.
+
+Two kinds of row origin then coexist. The **internal** packed buffers (the fp32
+dQ accumulator, `do_dot`, the GQA dK/dV partials) stay at `prefix(lengths)`,
+so their sizing and the masks and loop bounds do not change. The **caller's**
+ports are addressed at their origins: the Q/dO and K/V loads, the Stats read,
+the direct-bound dK/dV stores, and the O·dO dot, dQ cast and dK/dV fold, which
+walk `(sequence, row)` over the envelope and touch `origin + row` for
+`row < len[b]` only. Gap rows are never read or written. A staged port (a head
+dim inside the flavor envelope) keeps its origins: the staging copy moves every
+row in place, which is why origins are computed from the caller's token stride.
+
+`tile_dsl.thd.write_thd_port_origins` / `thd_port_origin` are the shared
+helpers; each path materializes only the ports it needs. Whole-token offsets
+are a supported-input precondition of the FROST engines, not a restriction of
+the cuDNN tensor API, and are not checked on device. When the backend cannot
+lower a graph, the Python-side variant-pack order includes each port's ragged
+offset tensor, so the offsets reach the engine as bound slots.
 
 ### Accept means run
 
@@ -955,7 +1010,7 @@ the wrong arch — a green sweep on one box says nothing about the others:
 
 | target | covers |
 |---|---|
-| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification |
+| any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py`, `sdpa/frost/test_flashinfer_consumed_surface.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification, the surface FlashInfer consumes |
 | SM100 | every FROST SDPA-forward cell except sm120; the FROST GEMM family; `linear_attention` (GDN / KDA / GDN-2), which is where the cuTile-vs-FROST pin lives |
 | SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies |
 

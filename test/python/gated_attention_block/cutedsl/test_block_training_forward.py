@@ -90,6 +90,9 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 _COMMON = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 _QK_NORM = pytest.mark.parametrize("qk_norm", [True, False], ids=["norm", "rope_only"])
 _SAVE_MODE = pytest.mark.parametrize("save_mode", ["proj_slab", "gate_copy"])
+# The record's two NAMED bounds (the quantized backward suites import them rather than re-deriving a bound):
+_BAND_TOL = dict(rtol=2**-7, atol=1e-3)  # a stage-(1) band: one bf16 rounding of an fp32-accumulated GEMM
+_RSTD_EQUAL_INPUT_TOL = dict(rtol=1e-5, atol=1e-6)  # rstd vs the oracle norm of the block's OWN band (equal inputs; max rel 1.2e-7 measured)
 
 
 def _cos(a, b):
@@ -662,7 +665,7 @@ def _assert_saved_set_matches_the_oracle(out, ref, blk, saved, inp, *, qk_norm, 
     copy of it, at the bounds ``test_saved_set_matches_the_oracle`` states."""
     g = blk.geom
     assert torch.isfinite(out.float()).all() and _cos(out, ref.out) > 0.999
-    tol = dict(rtol=2**-7, atol=1e-3)
+    tol = _BAND_TOL
     torch.testing.assert_close(saved.q_pre, ref.q_pre, **tol)
     torch.testing.assert_close(saved.k_pre, ref.k_pre, **tol)
     torch.testing.assert_close(saved.gate, ref.gate, **tol)
@@ -681,8 +684,8 @@ def _assert_saved_set_matches_the_oracle(out, ref, blk, saved, inp, *, qk_norm, 
     if qk_norm:
         _, rstd_q_ref = qk_norm_rope_reference(saved.q_pre, inp["w_q_norm"], inp["cos"], inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
         _, rstd_k_ref = qk_norm_rope_reference(saved.k_pre, inp["w_k_norm"], inp["cos"], inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
-        torch.testing.assert_close(saved.rstd_q, rstd_q_ref, rtol=1e-5, atol=1e-6)
-        torch.testing.assert_close(saved.rstd_k, rstd_k_ref, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(saved.rstd_q, rstd_q_ref, **_RSTD_EQUAL_INPUT_TOL)
+        torch.testing.assert_close(saved.rstd_k, rstd_k_ref, **_RSTD_EQUAL_INPUT_TOL)
         # Cross-check against the oracle's OWN rstd, whose q_pre / k_pre come from torch's GEMM (a different fp32
         # accumulation order rounds a few of the 256 elements to the other bf16 neighbour).  Measured on Rubin (cc 10.7,
         # 204 SMs; B=2 S=512, this geometry, rstd in [1.79, 2.78]): max rel 1.88e-4 bf16 / 3.2e-5 fp16, ~1 % of rows
@@ -820,8 +823,8 @@ _FP8_STAGES = ["qkv_gate_proj", "qk_norm_rope", "quantize_q", "quantize_kv", "sd
 _MX_STAGES = ["qkv_gate_proj", "qk_norm_rope", "quantize_mxfp8_q", "quantize_mxfp8_k", "quantize_mxfp8_v", "sdpa", "sigmoid_gate", "quantize_o", "out_proj"]
 # The quantized training forward's accept geometry, crossed with ``_QK_NORM`` (the norm kernel's ``apply_norm`` trace and
 # whether rstd is written are the axis that changes what the out-of-place norm writes): S in {256, 512, 992, 1024} -- 992 is
-# ``S % 128 != 0`` (the causal tail tile and, under MXFP8, the SF-pad arm); a DENSE 992 is the quantized SDPA rows' typed
-# ``S % 128`` decline, pinned in the cell -- plus S = 1000 causal (``S % 32 != 0``), B in {1, 2}, GQA 8/2 and MHA.
+# ``S % 128 != 0`` (the causal tail tile and, under MXFP8, the SF-pad arm); a DENSE 992 is the KV tail the SDPA rows mask
+# in-kernel (kv_tail_mask, #1520) -- plus S = 1000 causal (``S % 32 != 0``), B in {1, 2}, GQA 8/2 and MHA.
 _QUANT_GEOMS = pytest.mark.parametrize(
     "seq_len, causal, batch, h_kv",
     [(256, True, 1, 2), (512, True, 2, 2), (992, True, 1, 2), (992, False, 2, 2), (1000, True, 2, 2), (1024, False, 1, 8)],
@@ -833,14 +836,6 @@ def _quant_geom(qk_norm, causal, h_kv):
     """The geometry kwargs of one quantized training cell: ``_COMMON`` with the three axes the cells cross -- ``h_kv``, ``qk_norm``,
     ``is_causal`` -- overridden."""
     return {**_COMMON, "h_kv": h_kv, "qk_norm": qk_norm, "is_causal": causal}
-
-
-def _dense_tail_declined(geom_kw, batch, seq_len, family):
-    """A DENSE ``S % 128 != 0`` is the quantized SDPA rows' typed decline (no padding mask and no causal mask covering the KV
-    tail), on the training forward exactly as on inference (``test_fp8_dense_kv_tail_is_declined_not_computed_wrong`` and
-    its MXFP8 twin): pinned at ``check_support``, before any launch."""
-    with pytest.raises((ValueError, NotImplementedError), match="multiple of 128"):
-        _run_training_quant(geom_kw, batch, seq_len, family)
 
 
 def _quant_inputs(geom_kw, batch, seq_len, family):
@@ -1041,7 +1036,8 @@ def test_workspace_layout_under_want_saved_quantized(shape, family):
     is reserved, the e4m3 slots and the MXFP8 SF blobs stay; ``proj`` is gone in the proj_slab mode and first in the
     gate-copy mode.  Slots follow stage order and stay 256-B aligned; against the INFERENCE carve (byte-identical to the
     frozen snapshot, which never asked for a training forward) the only growth is the compact normed Q/K -- 17408 B/token at
-    the 397B geometry.  The fully fused quantized and the fp4-O training carves are typed ``ValueError``s.  No GPU."""
+    the 397B geometry.  The fully fused quantized training carve is a typed ``ValueError``; the fp4-O training carve is the MXFP8 one with
+    ``o4`` / ``sf_o`` appended and ``o8`` gone (the fp4 modes train on the unfused pipeline).  No GPU."""
     from cudnn.gated_attention_block.api import _WS_ALIGN, _align_up
 
     geom_kw, b, s = _SNAPSHOT_SHAPES[shape]
@@ -1087,8 +1083,11 @@ def test_workspace_layout_under_want_saved_quantized(shape, family):
     if mx:
         from cudnn.gated_attention_block import Fp4Format
 
-        with pytest.raises(ValueError, match="fp4"):
-            _plan_workspace(g, b, s, torch.bfloat16, True, True, False, fp8=True, mxfp8=True, o_fp4=Fp4Format.MXFP4, want_saved=True)
+        # the fp4 O mode's training carve is the MXFP8 training carve with the fp4 tail: o_gated kept, o8 gone, o4 / sf_o appended LAST
+        for fmt in Fp4Format:
+            lay4 = _plan_workspace(g, b, s, torch.bfloat16, True, True, False, fp8=True, mxfp8=True, o_fp4=fmt, want_saved=True)
+            assert lay4.o8 == -1 and lay4.o_gated == slab.o_gated >= 0 and lay4.q == slab.q and lay4.k == slab.k and lay4.v8 == slab.v8
+            assert lay4.o4 > lay4.sf_v >= 0 and lay4.sf_o > lay4.o4 and lay4.total_bytes > lay4.sf_o
 
 
 @requires_cuda
@@ -1159,7 +1158,8 @@ def test_quantized_training_block_routes_the_norm_out_of_place_into_the_compact_
 def test_quantized_fused_forks_stay_declined_for_training(family):
     """The FULLY FUSED quantized forward writes no bf16 slab and no pre-gate O, so it cannot write the record: with
     ``save_for_backward`` its knobs' own training guards fire (typed, naming the knob), a single fusion knob stays the
-    both-or-neither decline, and in-place Q/K stays refused.  The fp4 modes' decline is pinned in ``test_block_fp4.py``."""
+    both-or-neither decline, and in-place Q/K stays refused.  The fp4 modes train on the unfused pipeline (pinned in ``test_block_fp4.py``
+    and in ``test_block_backward_fp4.py``)."""
     b, s = 1, 256
     with pytest.raises(ValueError, match="incompatible with save_for_backward"):
         _declare_quant(_COMMON, b, s, family, fuse_norm_rope=True, fuse_gate=True, scale_o=1.0)
@@ -1185,11 +1185,8 @@ def test_quantized_training_forward_is_bitwise_the_inference_block(family, qk_no
     GATE / V bands of the quantized TRAINING forward equal the quantized INFERENCE block's bit for bit.  The slab's Q/K bands
     do NOT: the inference block normed (or, ``rope_only``, rotated) them IN PLACE, the record keeps them PRE-norm -- and the
     forward's own norm+RoPE over the record's bands reproduces the inference slab's normed bands (and the saved rstd, when the
-    geometry norms) bitwise.  Over ``_QUANT_GEOMS`` x ``_QK_NORM``; the dense ``S % 128 != 0`` cell pins the rows' decline."""
+    geometry norms) bitwise.  Over ``_QUANT_GEOMS`` x ``_QK_NORM``."""
     geom_kw = _quant_geom(qk_norm, causal, h_kv)
-    if not causal and seq_len % 128:
-        _dense_tail_declined(geom_kw, batch, seq_len, family)
-        return
     b, s = batch, seq_len
     r = _run_training_quant(geom_kw, b, s, family)
     inf = _run_inference_quant(r)
@@ -1225,11 +1222,8 @@ def test_quantized_training_record_keeps_pre_norm_bands(family, qk_norm, seq_len
     -- or, ``rope_only``, the rotation -- of a band is far from the band).  The forward's OWN norm+RoPE then quantize,
     replayed over the record's bands into fresh buffers, reproduce the workspace ``q8`` / ``k8`` (and the MXFP8 scale-factor
     blobs) bitwise: the quantizers consumed exactly the normed form of what the record keeps.  Over ``_QUANT_GEOMS`` x
-    ``_QK_NORM``; the dense ``S % 128 != 0`` cell pins the rows' decline."""
+    ``_QK_NORM``."""
     geom_kw = _quant_geom(qk_norm, causal, h_kv)
-    if not causal and seq_len % 128:
-        _dense_tail_declined(geom_kw, batch, seq_len, family)
-        return
     b, s = batch, seq_len
     r = _run_training_quant(geom_kw, b, s, family)
     g, t, d = r.geom, b * s, r.geom.d_head
@@ -1240,7 +1234,7 @@ def test_quantized_training_record_keeps_pre_norm_bands(family, qk_norm, seq_len
     ref_k = proj[:, o_k : o_k + g.h_kv * d].view(b, s, g.h_kv, d)
     ref_v = proj[:, o_v : o_v + g.h_kv * d].view(b, s, g.h_kv, d)
     tq, tgate, tk, tv = saved_slab_views(r.saved.proj_slab, g, b, s)
-    tol = dict(rtol=2**-7, atol=1e-3)
+    tol = _BAND_TOL
     for nm, got, want in (("q_pre", tq, ref_q), ("gate", tgate, ref_gate), ("k_pre", tk, ref_k), ("v", tv, ref_v)):
         rel = ((got.float() - want.float()).abs().max() / want.float().abs().max()).item()
         print(f"\n{family} S={s} B={b} causal={causal} qk_norm={qk_norm} record {nm} vs the dequantized GEMM: max_rel={rel:.3e}")
@@ -1284,8 +1278,8 @@ def test_quantized_saved_set_matches_the_oracle(family):
     tq, _tgate, tk, _tv = saved_slab_views(saved.proj_slab, g, b, s)
     _, rstd_q_ref = qk_norm_rope_reference(tq, r.inp["w_q_norm"], r.inp["cos"], r.inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
     _, rstd_k_ref = qk_norm_rope_reference(tk, r.inp["w_k_norm"], r.inp["cos"], r.inp["sin"], g.rope_dim, g.qk_norm_eps, qk_norm=True)
-    torch.testing.assert_close(saved.rstd_q, rstd_q_ref, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(saved.rstd_k, rstd_k_ref, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(saved.rstd_q, rstd_q_ref, **_RSTD_EQUAL_INPUT_TOL)
+    torch.testing.assert_close(saved.rstd_k, rstd_k_ref, **_RSTD_EQUAL_INPUT_TOL)
     q64, k64, v64 = _sdpa_operands_fp64(r)
     o64, lse64 = _attention_fp64(q64, k64, v64, g)
     d_lse = (saved.lse.double() - lse64).abs().max().item()

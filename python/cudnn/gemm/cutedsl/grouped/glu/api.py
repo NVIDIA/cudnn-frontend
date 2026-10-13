@@ -55,7 +55,7 @@ from cudnn.tensor_adapter import (
 _JAX_DENSE_B_ERROR = (
     "Dense weight mode (b_tensor) is not expressible as JAX arrays "
     "(the expert-outermost strided B layout has no row-major equivalent); "
-    "use discrete mode (b_ptrs) with per-expert weight pointers"
+    "use discrete mode (b_ptrs) with per-expert weight pointers, or canonical MXFP8 b_tensor with sfa_tensor/sfb_tensor"
 )
 _JAX_BIAS_ERROR = (
     "bias_tensor is not expressible as a JAX array (its (n, experts) column-major layout has no row-major equivalent); " "omit bias for JAX inputs"
@@ -63,7 +63,7 @@ _JAX_BIAS_ERROR = (
 _JAX_BLOCK_SCALED_ERROR = (
     "The block-scaled grouped GEMM GLU backend is not expressible as JAX arrays "
     "(its scale-factor tensors use an MMA-interleaved layout with no row-major equivalent); "
-    "only the BF16 backend supports JAX inputs"
+    "use canonical MXFP8 b_tensor with sfa_tensor/sfb_tensor, or the BF16 backend"
 )
 
 
@@ -1286,10 +1286,54 @@ def grouped_gemm_glu_wrapper_sm100(
     prob (m,), and contiguous SFA/SFB buffers containing already MMA-packed bytes.
     A 2-D A selects 2-D C/D/D_col and physical contiguous 6-D SFD outputs.
     BF16 inputs retain the legacy layout contract.
+    Canonical MXFP8 JAX arrays and tracers (dense b_tensor with sfa_tensor)
+    dispatch to grouped_gemm_glu_jax_sm100, including under jax.jit. Set
+    sf_vec_size=32 and an explicit FP8 d_dtype; unsupported options raise.
     scheduler_counter_tensor optionally supplies a caller-owned CUDA int32 counter
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
     """
+    if b_tensor is not None and sfa_tensor is not None and detect_framework(a_tensor) == "jax":
+        from ..canonical_jax import check_jax_wrapper_options
+        from .jax_api import grouped_gemm_glu_jax_sm100
+
+        check_jax_wrapper_options(
+            acc_dtype=acc_dtype,
+            cd_major=cd_major,
+            sf_vec_size=sf_vec_size,
+            vector_f32=vector_f32,
+            m_aligned=m_aligned,
+            current_stream=current_stream,
+            bias_tensor=bias_tensor,
+            b_ptrs=b_ptrs,
+            sfb_ptrs=sfb_ptrs,
+            b_major=b_major,
+            use_dynamic_sched=use_dynamic_sched,
+            use_single_group_runtime_offsets=use_single_group_runtime_offsets,
+            sf_fp8_dtype_override=sf_fp8_dtype_override,
+            scheduler_counter_tensor=scheduler_counter_tensor,
+        )
+        return grouped_gemm_glu_jax_sm100(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            prob_tensor=prob_tensor,
+            norm_const_tensor=norm_const_tensor,
+            c_dtype=c_dtype if c_dtype is not None else cutlass.BFloat16,
+            d_dtype=d_dtype if d_dtype is not None else cutlass.BFloat16,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            discrete_col_sfd=discrete_col_sfd,
+            act_func=act_func,
+            linear_offset=linear_offset,
+            geglu_alpha=geglu_alpha,
+            glu_clamp_max=glu_clamp_max,
+            glu_clamp_min=glu_clamp_min,
+            generate_c=generate_c,
+        )
     # Hot-loop memo; see wrapper_operand_meta for the rationale. Everything
     # from here to api.execute() is derivation -- dtype resolution, GluCall construction,
     # normalization, and the op cache-key rebuild -- and is a pure function of the

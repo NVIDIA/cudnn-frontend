@@ -416,7 +416,7 @@ def test_fork_source_pins():
     assert sorted(polled) == ["empty", "empty", "full"] and src.count("poll=_KV_SHARED,") == 3, polled
     inits = re.findall(r"init_count=CFG\.(\w+)", src)
     assert sorted(inits) == sorted(
-        ["ONE_LANE", "ONE_LANE", "ONE_LANE", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
+        ["ONE_LANE", "ONE_LANE", "CGA_M", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
     )
     assert src.count("@cute.kernel") == 2 == src.count('.set_name_prefix("cudnn", remove_cutlass_symbol=True)')
     assert _code_only(src).count(".launch(") == 2, "plain launches (the THD clamp kernel + the main kernel); the DSL launcher sets the oversized-SMEM attribute"
@@ -531,8 +531,7 @@ def _parse_md5_record_2x2(f):
 
 @pytest.mark.parametrize("record", list(_S2_MASKS))
 def test_fork_rendering_ptx_md5_is_recorded(tmp_path, record):
-    """The fork's sm_107a rendering is the committed record's (rendered on the board from the fork commit; the SM100 body at
-    the same parameters rendered the SAME md5s before the fork existed).  Compares only when the installed DSL build is the
+    """The fork's sm_107a rendering matches the committed record, refreshed deliberately for protocol changes.  Compares only when the installed DSL build is the
     recorded one (PTX text is a function of it) and knows sm_107a; skips otherwise (Rule 7)."""
     from cudnn.frost.buffers import cutedsl_state
 
@@ -1004,6 +1003,8 @@ def _dq_arm(monkeypatch, single, *, hq, hkv, sq, skv, chunks=False, **kw):
 
     monkeypatch.setattr(api_dsl, "DQ_SINGLE_LAUNCH", single)
     monkeypatch.setenv("CUDNN_FRONTEND_DISABLE_COMPILED_CACHE", "1")
+    # This probe observes host tracing, so bypass both disk reuse and the in-process memo.
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")
     records, apis, dq_calls = {}, [], []
     original_load = api_dsl.load_template
 
@@ -1204,3 +1205,12 @@ def test_chain_survives_gpu_time_slicing(tmp_path):
         load.wait()
     (tmp_path / "twin.log").write_text(twin.stdout + "\n--- stderr ---\n" + twin.stderr)
     assert twin.returncode == 0 and "[twin] done 100 launches" in twin.stdout, f"rc={twin.returncode}\n{twin.stdout[-3000:]}\n{twin.stderr[-3000:]}"
+
+
+@requires_rubin
+@pytest.mark.xdist_group(name="gpu_exclusive")
+def test_chain_waits_for_delayed_empty_observer(tmp_path):
+    """The eight-stage ring also orders a passive observer before slot reuse across KV tiles."""
+    from frost_test_utils import run_d512_delayed_observer
+
+    run_d512_delayed_observer(tmp_path, _ENGINE)

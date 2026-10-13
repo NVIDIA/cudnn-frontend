@@ -36,7 +36,11 @@ leader's ``mb_tma_ring_full`` (destination-pair-leader routing, probe
 ``mcast_twin`` 2026-10-01), so ONLY pair leaders arm ``expect_tx`` and ONLY the
 leader's MMA warp waits it.  A ring slot is refilled only after BOTH pairs'
 MMAs have read it: ``mb_tma_ring_empty`` has init 2 and both pair leaders'
-``tcgen05.commit`` carry mask 0xF.
+``tcgen05.commit`` carry mask 0xF.  Each shared ``ring_full`` has init 4:
+its leader's ``expect_tx`` arrival plus one ACK from each other CTA, sent only
+after that CTA observes its local ``ring_empty`` phase.  This gates both MMAs
+and therefore the next empty release on all four observations.  Without ACKs,
+a passive follower can miss a phase while its slot is recycled (parity ABA).
 
 **There is no online softmax.**  LSE arrives as a kernel input, so there is no
 running max, no rescale, no alpha/stats ship, no correction warp -- and no
@@ -54,7 +58,7 @@ output is correct on every launch that completes.
 trials per slot, L2 flushed, one process per slot, every slot started AND ended
 with an empty ``nvidia-smi`` compute-apps list, A/B/A against the 4x1 role split;
 MEDIANS over 3 slots per arm, ``lane_d512_bprop/fix/ab_table_fix_medians.md``).**
-This SHIPPED kernel (the cross-pair ring barriers polled, ``POLL_TIGHT_ITERS``
+The October 1 polling version, before the observer ACK fix (``POLL_TIGHT_ITERS``
 128 / ``POLL_SLEEP_NS`` 128), B=1 H=128 d=512 bf16:
 
     dense  S=8192  stage 2  42049 -> 40861 us  (+2.9 %;  6855 -> 6661 clk per SM per kv tile, floor 2304)
@@ -80,36 +84,29 @@ clk/tile; the remaining gap is not attributed here (levers to A/B: ``d_chunk``
 identical to the role split (S / dS workspace and dQ / dK / dV, ``torch.equal``
 on int16 views) on dense, causal, SWA, bottom-right, GQA, fp16.
 
-**The GPU-sharing hang and its fix (2026-10-01; ``lane_d512_bprop/fix/HANDOFF2.md``).**
-With another process time-slicing the GPU (a 4x1 chain looping in a second
-process) the first version of this kernel hung within 2-74 launches, every
-time; alone it ran 680+ launches clean, and the 4x1 never hangs under the same
-load.  The heartbeat dump (every warp records its position before / after each
-wait, ``debug_heartbeat``; ``fix/e2_heartbeat_wf0.log``) froze ONE cluster mid
-kv loop: the pair-1 FOLLOWER's TMA-LDG warp sat in ``ring_empty[0]`` waiting for
-a release -- both leaders' ``tcgen05.commit`` multicasts (mask 0xF, one of them
-from the OTHER pair) -- that the other three CTAs' copies of the same barrier had
-already completed and moved five chunks past; it never issued its half of the
-next odd chunk, both leaders' ``ring_full`` sat at 16384 of 32768 bytes, and
-everything downstream waited.  Every count was right; the event was delivered to
-three of four copies.  The waiter was parked: tile_dsl ``wait()`` lowers to
-``SYNCS.PHASECHK.TRANS64.TRYWAIT`` + ``NANOSLEEP.SYNCS`` (woken by the barrier
-event), and under time-slicing that wake-up can be lost for a barrier whose
-completing event is issued from outside the pair.  Measured forms (same load,
-``wait_form`` lever): sleeping ``try_wait`` 1 ns hint -> hangs at launch 2 and
-25; 10 ms hint -> launch 23; hint-less spin (``wait(spin=True)``) -> launch 74;
-a ``mbarrier.test_wait.parity`` POLL loop -> 200 / 200; the debug lever's bounded
-poll -> 200 / 200 and 300 / 300; ``kv_share = 1`` (pair-local ring, no cross-pair
-event) -> 200 / 200.  THE RULE, applied in ``_wait_plain`` / ``_poll_wait``: a
-barrier whose completing event is issued from OUTSIDE the pair -- ``ring_empty``
-(the partner leader's commit) and ``ring_full`` (the partner's TMA
-``complete_tx``) under ``KV_SHARE = 2`` -- is POLLED, never parked; pair-local
-barriers keep tile_dsl ``wait()``.  Runnable detector:
-``test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_survives_gpu_time_slicing`` (a
-4x1 load process + the twin, 100 launches, exit 3 on a hang) and its negative
-control ``test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing``
-(``wait_form = 4`` = the pre-fix kernel; L1).  Besides the hang the twin stays
-default-off for the S=2048 regression; a default flip is a separate decision.
+**The GPU-sharing hang: historical polling experiment and observer fix.**
+The October 1 heartbeat dump (``lane_d512_bprop/fix/HANDOFF2.md``,
+``fix/e2_heartbeat_wf0.log``) found a passive follower at ``ring_empty[0]``
+while the other CTAs had advanced five chunks.  Sleeping and hint-less
+``try_wait`` forms hung within 2-74 launches; polling completed 200/200 and
+300/300.  Those finite passes did not establish correctness or prove a lost
+hardware wake-up.  Polling also leaves the observer lifecycle unordered:
+a local empty barrier can advance twice before the passive CTA observes it.
+
+The shared-ring ACK protocol above preserves every CTA's empty wait and
+prevents that phase overrun.  Removing the passive wait is not sufficient:
+the multicast still advances that CTA's barrier object, whose phase must be
+observed before reuse.  Keep polling and the existing diagnostics; the ACKs
+supply the missing ordering.  ``KV_SHARE = 1`` keeps its existing pair-local
+protocol.  Runnable detectors:
+``test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_waits_for_delayed_empty_observer``
+and ``test_sdpa_bwd_d512_sm107.py::test_chain_waits_for_delayed_empty_observer``
+delay a passive observer at a reused slot, then check gradients and capture /
+replay.  The natural GPU-sharing positive tests remain.  The old must-hang
+``wait_form = 4`` negative control was probabilistic and is replaced by the
+delayed-observer regression.  ``debug_heartbeat`` / ``debug_dump_addr`` and
+all wait-form levers remain available for diagnosis.  Performance and a
+default-dispatch change are separate decisions.
 """
 
 from typing import NamedTuple, Optional, Tuple
@@ -662,12 +659,19 @@ def _make_bwd_d512_2x2_bars(CFG) -> Bars:
         mb_tma_op_full=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         # ONE_LANE: the leader MMA warp's elected lane, one tcgen05.commit (mask = pair) after the tile's last MMA.
         mb_tma_op_empty=MBarrier(_alloc(1), stages=1, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        # ONE_LANE: the pair-leader TMA-LDG warp's elected lane arms `expect_tx(ringTmaTransactionBytes)` on EVERY
+        # The leader arms expect_tx on every chunk. In shared-KV mode the other three CTAs also acknowledge
+        # observing their local empty phase, so neither MMA pair can release the next phase before every CTA waits.
+        # The pair-leader TMA-LDG warp's elected lane arms `expect_tx(ringTmaTransactionBytes)` on EVERY
         # chunk stage, whether this pair or the partner pair issues the chunk -- the bytes complete where they LAND
         # (destination pair leader).  Followers never arm or wait their copy (that accounting hangs: probe mcast_twin).
         # WAIT FORM: under KV_SHARE 2 half of the completing bytes are the PARTNER pair's TMA complete_tx, so the MMA
         # warp POLLS this barrier (`_wait_b(..., poll=_KV_SHARED)`), never parks -- see `_poll_wait`.
-        mb_tma_ring_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_tma_ring_full=MBarrier(
+            _alloc(CFG.STAGES_KV),
+            stages=CFG.STAGES_KV,
+            init_count=CFG.CGA_M if _KV_SHARED else CFG.ONE_LANE,
+            producer=Producer.TMA_LOAD,
+        ),
         # RING_EMPTY_ARRIVERS (= KV_SHARE = 2 pairs): CTA 0's AND CTA 2's leader MMA warps, one elected lane each, one
         # tcgen05.commit with mask 0xF after BMM1 + BMM2 of the chunk.  CTA c's multicast writes CTA c ^ 2's slot too, so a
         # stage may be refilled only once BOTH pairs have read it; every CTA's TMA-LDG warp waits its own copy.
@@ -746,6 +750,16 @@ def _ldg_kv_tile(
             ring_total,
             poll=_KV_SHARED,
         )
+        if cutlass.const_expr(_KV_SHARED):
+            # All four empty copies must be observed before either pair can release this slot again.
+            # The local leader's expect_tx below supplies its own acknowledgment; everyone else
+            # acknowledges both leader copies. A passive follower must gate reuse even on chunks
+            # it does not load, or it can miss two phase transitions while descheduled.
+            ack_lane = nvvm.elect_sync()
+            bars.mb_tma_ring_full[ring_state.idx].arrive_on_peer(cutlass.Int32(0), pred=((is_leader == False) | (pair_id != cutlass.Int32(0))) & ack_lane)
+            bars.mb_tma_ring_full[ring_state.idx].arrive_on_peer(
+                cutlass.Int32(CFG.CTA_MMA), pred=((is_leader == False) | (pair_id != cutlass.Int32(1))) & ack_lane
+            )
         if cutlass.const_expr(_DBG_CLK):
             t_issue = cute.arch.clock64()
         bars.mb_tma_ring_full[ring_state.idx].arrive(n_bytes=ringTmaTransactionBytes, pred=is_leader & nvvm.elect_sync())

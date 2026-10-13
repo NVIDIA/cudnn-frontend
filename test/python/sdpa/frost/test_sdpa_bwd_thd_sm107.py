@@ -28,7 +28,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_rubin, requires_sm80
+from frost_test_utils import cuda_launch_counts, requires_dsl, requires_rubin, requires_sm80
 from test_sdpa_bwd_dsl_sm107 import _TOL, _TOL_COS, _adapter
 
 import cudnn
@@ -410,24 +410,265 @@ def test_thd_plan_facts_are_in_the_adapter_constructors_own_signature():
         assert "external_delta" in own
 
 
-def test_thd_declines_the_external_delta():
-    """The externally computed delta (``SdpaBwdDslSm107(external_delta=True)``, the dense standalone surface: a contiguous
-    ``[B, H_q, S_q_pad]`` fp32 ``rowsum(dO * O)``) is DECLINED under THD, typed and before any plan is built: the THD chain's delta
-    is its own ``dot_do_o`` over the packed O / dO in the head-major ``[1, H_q, ceil128(T_q)]`` layout the THD main kernel reads,
-    and no producer emits that packed layout.  The THD plan's roles carry no delta slot and no standalone-only role, the THD carve
-    keeps its own delta region, and a ``delta_tensor`` handed to a THD plan's execute is refused by the plan-fact check
-    (``external_delta=False``) -- never silently ignored."""
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, EXTERNAL_DELTA_ROLE, ROLES_F16, ROLES_F16_THD
+def _spec_without_compiling(monkeypatch, api, builder, entry_name, frames=None):
+    """Build a THD plan's ``BwdLaunchSpec`` through its REAL spec builder (``prepared_sm107.compile_plan_*_thd``: roles, operands,
+    geometry, carve, the binder) over a FAKE artifact entry -- the host compile ``prepared_host.<entry_name>`` is monkeypatched to
+    record its call and hand back an object ``positional_entry`` unwraps to a frame recorder -- so a slot / frame pin runs on any
+    CUDA host in milliseconds (the host ABI itself is ``test_sdpa_native_bwd_binding.py``'s).  The prepared plan's device query is
+    faked to SM107 as the other host pins do.  Returns ``(spec, calls)`` with ``calls`` the fake compile's ``(args, kwargs)``."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+
+    frames = [] if frames is None else frames
+    calls = []
+
+    def fake_compile(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(_compiled_cache_raw=lambda *frame: frames.append(frame))
+
+    monkeypatch.setattr(prepared_host, entry_name, fake_compile)
+    monkeypatch.setattr(prepared_sm107, "_sm", lambda api: 107)
+    mod = SimpleNamespace(FROST_SOURCE_DIGEST="probe", _host=None)
+    assert api.check_support()
+    return builder(api, mod, mod, mod), calls
+
+
+def test_thd_serves_the_external_delta():
+    """The externally computed delta (``SdpaBwdDslSm107(external_delta=True)``) is SERVED under THD: the plan fact passes
+    ``check_support`` with the declared totals; its contract is the PACKED head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout the THD
+    main kernel reads (``external_delta_shape``; ``T_q`` = the plan's token capacity, the declared packed total tightened to the
+    envelope's ``B * S_max`` -- an oversized declaration does not widen the shape, and the refusal names the capacity's shape; the dense
+    ``(B, H_q, S_q_pad)`` form of the same envelope is a different shape and is refused with the packed one named); the THD carve drops
+    its own ``delta`` region exactly (``scratch_workspace_bytes`` shrinks by it) while the default plan keeps it; the launch spec's
+    roles carry the delta as the LAST, appended, standalone-only slot (11, after the two lengths at 9 / 10) on the roles AND the
+    attributes, as the dense roles do.  The plan-fact check stays two-directional: a ``delta_tensor`` on the default plan is refused
+    for being given at all, before any device read; a missing one on the external plan is refused as required."""
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES, ATTRIBUTES_F16_THD, EXTERNAL_DELTA_ROLE, ROLES, ROLES_F16, ROLES_F16_THD
+    from cudnn.sdpa.fwd.api_dsl import ws_align
 
     totals = dict(max_total_seq_len_q=400, max_total_seq_len_kv=400)
-    with pytest.raises(ValueError, match="external_delta is not served on the packed chain"):
-        _thd_adapter(external_delta=True, **totals).check_support()
-    api = _thd_adapter(**totals)
+    h, t_pad = 2, -(-400 // 128) * 128  # the declared packed total (within the envelope's B * S_max = 512, so it IS the capacity), to the q tile
+    ext = _thd_adapter(h=h, external_delta=True, **totals)
+    assert ext.check_support() and ext.external_delta is True
+    api = _thd_adapter(h=h, **totals)
     assert api.check_support() and api.external_delta is False
-    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the THD carve keeps the chain's own delta region"
-    assert EXTERNAL_DELTA_ROLE in ROLES_F16 and EXTERNAL_DELTA_ROLE not in ROLES_F16_THD and EXTERNAL_DELTA_ROLE not in ATTRIBUTES_F16_THD
+    assert ext.external_delta_shape == api.external_delta_shape == (1, h, t_pad) == (1, h, -(-ext._t_q_cap // 128) * 128)
+    # an OVERSIZED declaration is tightened to the envelope's B * S_max tokens (``_thd_total``: a MIN) and the contract follows the
+    # capacity, not the declaration: the shape is ceil128(min(B * S_max, declared)) and the refusal names that shape with the reason
+    wide = _thd_adapter(h=h, external_delta=True, max_total_seq_len_q=1000, max_total_seq_len_kv=1000)
+    assert wide.check_support() and wide._t_q_cap == 2 * 256 and wide.external_delta_shape == (1, h, 512)
+    with pytest.raises(
+        ValueError, match=r"= \(1, 2, 512\) tensor \(the PACKED head-major layout .*token capacity \(the declared packed total, tightened to B\*S_max\)"
+    ):
+        wide._check_external_delta(torch.zeros(1, h, -(-1000 // 128) * 128))  # the DECLARATION's shape, fp32 and contiguous
+    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the default THD plan keeps the chain's own delta region"
+    assert "delta" not in [name for name, _n, _d in ext._scratch_plan()], "the external plan carves no delta region"
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(h * t_pad * 4), "the carve lost exactly the delta region"
+    assert ROLES_F16_THD == ROLES[:9] + ("seq_q", "seq_kv") + (EXTERNAL_DELTA_ROLE,), "the THD roles: the nine packed tensors, the two lengths, the delta LAST"
+    assert ATTRIBUTES_F16_THD == ATTRIBUTES[:9] + ("seq_len_q", "seq_len_kv") + (EXTERNAL_DELTA_ROLE,), "the delta's attribute is the role name itself"
+    assert ROLES_F16[-1] == EXTERNAL_DELTA_ROLE and len(ROLES_F16_THD) == len(ATTRIBUTES_F16_THD) == 12
     with pytest.raises(ValueError, match="external_delta=False"):
-        api._check_external_delta(torch.zeros(1, 2, 128))  # refused for being given at all, before any device read
+        api._check_external_delta(torch.zeros(1, h, t_pad))  # refused for being given at all, before any device read
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext._check_external_delta(None)
+    with pytest.raises(ValueError, match=r"\[1, H_q, ceil128\(T_q\)\]"):
+        ext._check_external_delta(torch.zeros(2, h, 256))  # the DENSE (B, H_q, S_q_pad) shape of this envelope: not the packed contract
+
+
+def test_thd_external_delta_host_view_is_the_carved_geometry():
+    """The THD hosts view a caller's delta from two ``config`` entries -- ``prepared_host._thd_delta_geometry(h, t_q)`` with
+    ``(h, t_q) = (config[1], config[4]) = (H_q, the token capacity)`` -- and that view must be EXACTLY the geometry of the region the
+    default plan carves and the contract names (``prepared_sm107._delta_geometry``: ``external_delta_shape``, fp32 contiguous), or the
+    main kernel reads a caller's tensor through another layout than the chain's own -- finite and wrong, never a fault.  Pinned on the
+    host for a declaration within the envelope (``ceil128(300) = 384``) and an oversized one tightened to the envelope's ``B * S_max``
+    (512); the device twin is the bitwise cell below."""
+    from cudnn.sdpa.bwd.kernels.sm107 import prepared_host
+    from cudnn.sdpa.bwd.prepared_sm107 import _delta_geometry, _thd_config
+
+    for totals, t_pad in ((300, 384), (1000, 512)):
+        plan = _thd_adapter(h=2, external_delta=True, max_total_seq_len_q=totals, max_total_seq_len_kv=totals)
+        assert plan.check_support()
+        config = _thd_config(plan)
+        assert (config[1], config[4]) == (plan.h_q, plan._t_q_cap), "the hosts unpack (b, h, hk, d, t_q, ...) = config"
+        shape, strides = prepared_host._thd_delta_geometry(config[1], config[4])
+        assert (shape, strides) == _delta_geometry(plan) == ((1, 2, t_pad), (2 * t_pad, t_pad, 1))
+        assert shape == plan.external_delta_shape
+
+
+def test_thd_external_delta_execute_contract_fires_before_compile(monkeypatch):
+    """At execute, BEFORE ``compile()`` (no artifact, no launch -- so it runs on any CUDA host): both directions of the plan fact on a THD
+    plan, then the exact PACKED layout -- fp32, contiguous ``(1, H_q, ceil128(T_q))`` (the dense ``(B, H_q, S_q_pad)`` of the same envelope
+    is refused with the packed form named), the plan's device, a 16-byte base -- each a ValueError naming ``delta_tensor``.  The Rubin
+    half of the claim is ``test_thd_external_delta_is_bitwise_the_chains_own_pre_pass``."""
+    b, h, totals = 3, 2, dict(max_total_seq_len_q=628, max_total_seq_len_kv=628)
+    own = _thd_adapter(b=b, h=h, s_max=300, **totals)
+    ext = _thd_adapter(b=b, h=h, s_max=300, external_delta=True, **totals)
+    for api in (own, ext):
+        assert api.check_support()
+        monkeypatch.setattr(api, "compile", lambda: pytest.fail("a reject must fire before compile()"))
+    assert ext.external_delta_shape == (1, h, 640) and own._sq_pad == 384, "the packed contract, not the dense (B, H_q, S_q_pad) = (3, 2, 384)"
+    dummy = torch.empty(1, device="cuda")  # never bound: every reject below fires before the bind
+    args = {name + "_tensor": dummy for name in ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv")}
+    lens = torch.tensor([300, 128, 200], dtype=torch.int32, device="cuda")
+    kw = dict(workspace=dummy, seq_q_lens=lens, seq_kv_lens=lens)
+    good = torch.zeros(1, h, 640, device="cuda")
+    with pytest.raises(ValueError, match="external_delta=False"):
+        own.execute(**args, **kw, delta_tensor=good)
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.execute(**args, **kw)
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\] = \(1, 2, 640\)"):
+        ext.execute(**args, **kw, delta_tensor=torch.zeros(b, h, 384, device="cuda"))  # the DENSE envelope shape of this plan
+    with pytest.raises(ValueError, match="CONTIGUOUS"):
+        ext.execute(**args, **kw, delta_tensor=good.transpose(1, 2))
+    with pytest.raises(ValueError, match="must be fp32"):
+        ext.execute(**args, **kw, delta_tensor=good.to(torch.bfloat16))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        ext.execute(**args, **kw, delta_tensor=torch.zeros(h * 640 + 1, device="cuda")[1:].view(1, h, 640))
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "dt, lens_q, lens_kv, causal",
+    (
+        (torch.bfloat16, (300, 128, 200), (300, 128, 200), True),
+        (torch.float16, (300, 128, 200), (300, 128, 200), True),
+        (torch.bfloat16, (256, 100), (180, 300), False),
+    ),
+    ids=("bf16", "fp16", "bf16-cross-Tq356-Tkv480-dense"),
+)
+def test_thd_external_delta_is_bitwise_the_chains_own_pre_pass(dt, lens_q, lens_kv, causal):
+    """A THD plan built with ``external_delta=True`` and fed the delta the chain's OWN first launch wrote over the packed O / dO (read back
+    out of the sibling plan's ``R_DELTA`` region: the PACKED head-major ``[1, H_q, ceil128(T_q)]``, zeros past ``T_q``) returns dQ / dK / dV
+    ``torch.equal`` the sibling's -- the same artifact minus the ``dot`` launch, reading the caller's tensor where the sibling reads its
+    region -- over three ragged sequences, GQA and a causal band.  Also pinned: the slot (11) binds on the external plan only, the carve
+    lost exactly the delta region, the external plan launches exactly one kernel fewer (CUPTI over ``execute`` alone, when available),
+    and the compiled plan's refusals (a dense-shaped delta, a missing one) fire with no launch.  The CROSS-attention cell has Q and KV
+    token capacities that round to DIFFERENT tiles (356 -> 384 vs 480 -> 512): the slot's shape and the carve follow the Q capacity."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    t_pad, kv_pad = (-(-sum(x) // 128) * 128 for x in (lens_q, lens_kv))
+    assert (t_pad != kv_pad) is (lens_q != lens_kv), "the cross cell pins the Q capacity against a DIFFERENT KV one"
+    case = _thd_case(lens_q, lens_kv, 4, _D, dt, causal=causal, hkv=2)
+    eq, ekv, e_stats = _envelope_samples(case)
+    view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
+    lq, lk = (torch.tensor(x, dtype=torch.int32, device="cuda") for x in (lens_q, lens_kv))
+
+    def build(external):
+        api = SdpaBwdDslSm107(
+            sample_q=eq, sample_k=ekv, sample_v=ekv, sample_o=eq, sample_do=eq, sample_stats=e_stats, sample_dq=eq, sample_dk=ekv, sample_dv=ekv,
+            scale_softmax=case.scale, is_causal=causal, thd=True, max_total_seq_len_q=case.t_q, max_total_seq_len_kv=case.t_kv, external_delta=external,
+        )  # fmt: skip
+        assert api.check_support()
+        api.compile()
+        return api
+
+    def buffers(api):
+        # NaN-filled gradients and a 0xFF-poisoned workspace, allocated and filled OUTSIDE the profiled region of the launch census
+        dq, dk, dv = (torch.full_like(case.q, float("nan")), torch.full_like(case.k, float("nan")), torch.full_like(case.v, float("nan")))
+        ws = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda").fill_(0xFF)
+        return (dq, dk, dv), ws
+
+    def execute(api, bufs, delta=None):
+        (dq, dk, dv), ws = bufs
+        api.execute(
+            view(case.q), view(case.k), view(case.v), view(case.o), view(case.do), case.lse, view(dq), view(dk), view(dv),
+            workspace=ws, seq_q_lens=lq, seq_kv_lens=lk, delta_tensor=delta,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        return bufs
+
+    def run(api, delta=None):
+        return execute(api, buffers(api), delta)
+
+    own, ext = build(False), build(True)
+    assert t_pad == -(-case.t_q // 128) * 128
+    assert own.external_delta_shape == ext.external_delta_shape == (1, case.h, t_pad), "the slot follows the Q token capacity"
+    assert own._prepared.roles[11] == prepared_sm107.EXTERNAL_DELTA_ROLE and own._prepared.operands[11] is None and ext._prepared.operands[11] is not None
+    assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(case.h * t_pad * 4), "the carve lost exactly the delta region"
+    grads_own, ws_own = run(own)
+    _check(case, *grads_own)
+    # the chain's own delta: region R_DELTA of the sibling's carve, [1, H_q, ceil128(T_q)] fp32, zeros past the packed total
+    offset, shape, _strides = prepared_sm107._regions(own, prepared_sm107._REGION_SLOTS_F16)[0][R_DELTA]
+    assert shape == own.external_delta_shape
+    delta = ws_own[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    assert torch.isfinite(delta).all() and torch.equal(delta[:, :, case.t_q :], torch.zeros_like(delta[:, :, case.t_q :]))
+    grads_ext, _ws_ext = run(ext, delta)
+    for name, x, y in zip(("dQ", "dK", "dV"), grads_ext, grads_own):
+        assert torch.equal(x, y), f"{name}: the external-delta plan differs from the chain's own (max|diff|={(x.float() - y.float()).abs().max().item():.3e})"
+    # one launch fewer (the `dot` kernel), counted with CUPTI over `execute` ALONE: the buffers are filled before the profiled region,
+    # as on the fp8 / MXFP8 cells, so the counts are the chain's own and not the test's fills.  Only the profiler's own start may
+    # fail (-> None); a failure from execute() propagates and the count assertion sits outside any handler, so a restored dot launch
+    # FAILS the test
+    bufs_own, bufs_ext = buffers(own), buffers(ext)
+    counts = cuda_launch_counts(lambda: execute(own, bufs_own, None), lambda: execute(ext, bufs_ext, delta))
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        assert counts[1] == counts[0] - 1, counts
+        print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
+    launches = []
+    ext._prepared = replace(ext._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\]"):
+        run(ext, torch.zeros(case.b, case.h, -(-max(lens_q) // 128) * 128, device="cuda"))  # the DENSE (B, H_q, S_q_pad) shape of this envelope
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        run(ext, None)
+    assert not launches
+
+
+def test_thd_external_delta_is_the_appended_native_slot(monkeypatch):
+    """The bf16 THD spec is bound by the C++ binder (``native_binding=True``), and that binder is generic over an APPENDED role: the
+    delta rides as operand 11 (after the two lengths at 9 / 10), None-specialized on the default plan, ``standalone_only`` on both
+    (the graph path frames it absent and keeps the chain's own ``dot``), and the frame grows by exactly one entry -- 12 operands +
+    workspace + scale + length form + stream = 16 (``scale_log2=False``) -- with no pybind change.  The launch spec comes from the REAL
+    ``compile_plan_thd`` over a fake artifact entry (``_spec_without_compiling``), so this runs on any CUDA host; the plan fact reaches
+    the host compile as its appended ``external_delta`` kwarg and keys the artifact.  The binder's own two refusals (``delta was not
+    compiled into this specialization`` / ``delta is required by this specialization``) sit behind the adapter's earlier plan-fact
+    check (``external_delta=False`` / ``delta_tensor is required``), which ``test_thd_serves_the_external_delta`` keeps."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.prepared import Operand, bind
+    from cudnn.sdpa.fwd.prepared import facts_of_tensor
+
+    b, h, totals = 2, 2, dict(max_total_seq_len_q=400, max_total_seq_len_kv=400)
+    t_cap, t_pad = 400, -(-400 // 128) * 128
+    own, own_calls = _spec_without_compiling(monkeypatch, _thd_adapter(b=b, h=h, **totals), prepared_sm107.compile_plan_thd, "compile_host_f16_thd")
+    ext, ext_calls = _spec_without_compiling(
+        monkeypatch, _thd_adapter(b=b, h=h, external_delta=True, **totals), prepared_sm107.compile_plan_thd, "compile_host_f16_thd"
+    )
+    for spec in (own, ext):
+        assert spec.native_binding and spec.length_form and not spec.scale_log2
+        assert spec.roles == prepared_sm107.ROLES_F16_THD and spec.attributes == prepared_sm107.ATTRIBUTES_F16_THD
+        assert len(spec.operands) == len(spec.native_roles) == 12 and spec.roles.index(prepared_sm107.EXTERNAL_DELTA_ROLE) == 11
+        assert spec.standalone_only_roles == (prepared_sm107.EXTERNAL_DELTA_ROLE,), "no graph declares a delta: framed absent on the graph path"
+        assert spec.operands[9] is not None and spec.operands[10] is not None, "the two lengths are always bound"
+    assert own.operands[11] is None, "the default plan: None-specialized (the chain's own dot fills its region)"
+    assert ext.operands[11] == Operand("float32", (1, h, t_pad), (h * t_pad, t_pad, 1), h * t_pad, 16, 4), "the packed head-major delta, 16-B aligned"
+    assert own_calls[0][1]["external_delta"] is False and ext_calls[0][1]["external_delta"] is True, "the plan fact reaches the host compile"
+    assert own_calls[0][0][8] != ext_calls[0][0][8], "and keys the artifact (two cache keys)"
+    # the frame, slot by slot, over real buffers of the plans' packed geometry (bind only builds it: nothing launches)
+    dev = torch.device("cuda", 0)
+
+    def packed(tokens, heads, dt):
+        return torch.zeros(1, tokens, heads, _D, device=dev, dtype=dt).permute(0, 2, 1, 3)  # logical [1, H, T, D] over BSHD storage
+
+    tensors = {name: packed(t_cap, h, torch.bfloat16) for name in ("q", "k", "v", "o", "do", "dq", "dk", "dv")}
+    tensors["stats"] = torch.zeros(1, h, t_cap, device=dev)  # head-major (1, H_q, head_stride = T_cap), the forward's packing
+    tensors["seq_q"] = tensors["seq_kv"] = torch.tensor([300, 100], dtype=torch.int32, device=dev)
+    delta = torch.zeros(1, h, t_pad, device=dev)
+    ws = torch.empty(max(own.workspace_bytes, ext.workspace_bytes), device=dev, dtype=torch.uint8)
+    facts = {name: facts_of_tensor(t) for name, t in tensors.items()}
+    frame = bind(own, dict(facts, delta=None), ws.data_ptr(), 17)
+    assert len(frame) == 16 and frame[11] is None and frame[12] == ws.data_ptr() and frame[13] == own.scale and frame[14] == 0 and frame[15] == 17
+    frame = bind(ext, dict(facts, delta=facts_of_tensor(delta)), ws.data_ptr(), 17)
+    assert len(frame) == 16 and frame[11] == delta.data_ptr() and frame[12] == ws.data_ptr() and frame[15] == 17
+    with pytest.raises(ValueError, match="delta was not compiled into this specialization"):
+        bind(own, dict(facts, delta=facts_of_tensor(delta)), ws.data_ptr(), 17)
+    with pytest.raises(ValueError, match="delta is required by this specialization"):
+        bind(ext, dict(facts, delta=None), ws.data_ptr(), 17)
 
 
 def test_thd_execute_requires_both_lengths(monkeypatch):

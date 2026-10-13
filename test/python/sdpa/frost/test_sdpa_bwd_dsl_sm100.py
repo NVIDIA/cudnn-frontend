@@ -1109,8 +1109,9 @@ _STAGE2_2X2_RECORDS = {
     "dense_bf16": dict(dtype_qkv=2),
     "causal_bf16": dict(dtype_qkv=2, window_right=0),
     "dense_fp16": dict(dtype_qkv=3),
-    "thd_bf16": dict(dtype_qkv=2, thd_varlen=True),
 }
+# THD can lower identical MLIR to different PTX with the same DSL build. Its codegen
+# coverage is the THD arm of test_stage2_2x2_sass_pins, not a byte-hash golden.
 # The RED side (an armed lever renders different PTX) needs no fp16 / THD render: the lever is dtype- and
 # layout-independent code, and each render is a ~1 min host trace-compile.
 _STAGE2_2X2_RED_RECORDS = ("dense_bf16", "causal_bf16")
@@ -1159,9 +1160,9 @@ def _stage2_2x2_md5_want(record):
 
 @pytest.mark.parametrize("record", list(_STAGE2_2X2_RECORDS))
 def test_stage2_2x2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
-    """The 2x2 twin's DEFAULT rendering (every debug lever off) is PTX-IDENTICAL to the committed pre-lever record
-    (``renderings/md5_stage2_2x2_sm100a.txt``, rendered at d4b024671 before ``TemplateParams2x2.debug_clk`` landed): the
-    attribution lever is zero traced code when off.  Host trace-compile for sm_100a, no device."""
+    """The default rendering matches the committed record, refreshed deliberately for protocol changes.
+    All debug levers are off; the armed-lever test below checks that instrumentation renders different code.
+    Host trace-compile for sm_100a, no device."""
     want = _stage2_2x2_md5_want(record)
     kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True)
     got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_{record}", kw)
@@ -1647,6 +1648,20 @@ _STAGE2_SASS_PROBE = _textwrap.dedent(r"""
     if nvd is None:
         print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
     sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    # THD also emits a descriptor helper. Count only the main stage-2 kernel:
+    # the helper's required GPU fence is not a drain in the attention loop.
+    sections, current = {}, None
+    for line in sass:
+        match = re.match(r'\s*\.section\s+\.text\.([^,\s]+)', line)
+        if match:
+            current = match.group(1)
+            sections[current] = []
+        if current is not None:
+            sections[current].append(line)
+    main = [lines for name, lines in sections.items() if name.startswith("cudnn_kernel__kernel_")]
+    assert len(main) == 1, f"expected one stage-2 main kernel, got {list(sections)}"
+    print("SASS_FUNCTIONS", list(sections))
+    sass = main[0]
     def cnt(*subs):
         return sum(1 for ln in sass if all(sb in ln for sb in subs))
     for key, subs in json.loads(%(counts)r).items():
@@ -1679,19 +1694,20 @@ def _stage2_sass_probe(tmp_path, arch, params, tag):
     return stats, expect
 
 
-@pytest.mark.parametrize("arch,arm", [("sm_100a", "dense"), ("sm_100a", "causal_swa"), ("sm_107a", "dense"), ("sm_107a", "causal")])
+@pytest.mark.parametrize("arch,arm", [("sm_100a", "dense"), ("sm_100a", "causal_swa"), ("sm_100a", "thd"), ("sm_107a", "dense"), ("sm_107a", "causal")])
 def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
     """Also the Rule S6 trace-compile of the Rubin arm (8-stage ring, 2 cast stages, 320 KiB, DESC_VERSION 0) from whatever
     GPU runs this suite: ``CUTE_DSL_ARCH=sm_107a`` needs no device.  Skips where the DSL predates sm_107a."""
     from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
 
-    masks = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=256)}
+    masks = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=256), "thd": dict(thd_varlen=True)}
     params = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, **masks[arm])
     if arch == "sm_107a":
         params.update(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
     st, expect = _stage2_sass_probe(tmp_path, arch, params, tag=f"stage2_2x2_{arm}")
     # The compute WG's three-range split traces ITS kv body once per range; the MMA warp's kv loop is one body.
-    n_compute_bodies = 1 if arm == "dense" else 3
+    # Without SWA the low-edge range is [left, left) and the compiler drops it, so causal keeps two bodies.
+    n_compute_bodies = {"dense": 1, "causal": 2, "causal_swa": 3, "thd": 2}[arm]
     assert expect["DESC_VERSION"] == 0 and expect["CLUSTER_Q_ROWS"] == 256 and expect["N_CHUNKS"] == 8
     # USETMAXREG is 0 here as on the 4x1 sibling: ptxas C7508 drops every setmaxregister of these 8-warp d512 bodies (it
     # cannot determine the entry count) -- recorded, not required; the 12-warp sm107 bodies pin > 0 (see that file).
@@ -1814,20 +1830,11 @@ def test_stage2_2x2_survives_gpu_time_slicing(tmp_path):
 
 
 @pytest.mark.xdist_group(name="gpu_exclusive")
-@pytest.mark.gpu_exclusive
-def test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing(tmp_path):
-    """The NEGATIVE CONTROL of the detector above: ``wait_form = 4`` renders the pre-fix kernel (the sleeping ``try_wait``
-    on the cross-pair ring barriers too) and must HANG within 300 time-sliced launches (observed at launch 2, 23, 25 and
-    74 in four of four runs).  It deliberately wedges a kernel for the 45 s budget before the child dies, which is why it
-    carries ``gpu_exclusive`` and sits in the ``gpu_exclusive`` xdist group with the detector above (the marker alone
-    does not serialize xdist: the CI lane runs 16 workers over 4 GPUs, adjacent ungrouped items start together, and
-    the detector failed exactly while this control sat wedged, twice -- pipelines 71863093 and 71991279, the detector
-    at ~63 s = compile + its 45 s budget; a wedged neighbour does not slow the twin on a time-sliced B200, so the CI
-    node's sharing mode is the difference).
-    Deselect it on a GPU other jobs share.  If this test ever PASSES (no hang), the mechanism
-    has moved: re-run the heartbeat lever (``debug_heartbeat``) before trusting the fix."""
-    twin = _contention_run(tmp_path, twin_levers={"wait_form": 4}, n_twin=300, budget_s=45.0, tag="prefix")
-    assert twin.returncode == 3 and "HANG" in twin.stdout, f"the pre-fix wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-2000:]}"
+def test_stage2_2x2_waits_for_delayed_empty_observer(tmp_path):
+    """All CTA observers gate reuse, including a follower that does not issue this chunk's TMA."""
+    from frost_test_utils import run_d512_delayed_observer
+
+    run_d512_delayed_observer(tmp_path, _ENGINE)
 
 
 # --------------------------------------------------------------------------- #

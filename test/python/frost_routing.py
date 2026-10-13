@@ -23,9 +23,20 @@ LAST_PLAN: "tuple" = (None, None)
 # record them.  Lets a sweep assert that the lever it requested is the arm that ran.
 LAST_ARMS: "str | None" = None
 
+# Measurements a test wants in the run's terminal summary: key -> one line of text.  conftest.py prints them under
+# "measured" next to the routing tally, aggregated across xdist workers the same way, so a record that qualifies a
+# constant in the package (the cc 10.7 MXFP8 backend planning guard's version bound) reaches the CI job log of a PASSING
+# run -- a passed test's captured stdout never does (the lanes run without -rA).  Not cleared by reset(): a measurement
+# outlives the tally of the test that took it.
+MEASURED: "dict[str, str]" = {}
+
 
 def note(key: str) -> None:
     COUNTS[key] = COUNTS.get(key, 0) + 1
+
+
+def measured(key: str, text: str) -> None:
+    MEASURED[key] = " ".join(str(text).split())
 
 
 def snapshot() -> "dict[str, int]":

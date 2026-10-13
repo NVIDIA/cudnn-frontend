@@ -9,7 +9,7 @@ The `cudnn` Python package: pybind11-backed graph API plus pure-Python **fronten
   submodule directly on its parent, bypassing module `__getattr__`. Check direct-submodule,
   sibling-symbol, and public-symbol import orders in fresh interpreters; the detector is
   `test_ops_callable_exports_survive_import_order` in `test/python/core/test_import_boundaries.py`.
-- Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. `api_base.py` itself imports them at top level, which is why kernel classes must only be reachable through the lazy table.
+- Never add an eager `import torch` / `import cutlass` to `__init__.py` or anything it imports transitively. Kernel modules import them at top level, which is why they must only be reachable through the lazy table.
 - Reuse the existing required CuTeDSL dependencies (`pyproject.toml` `[project] dependencies`) unless a kernel truly needs a new package. The `[cutedsl]` extra now holds only `cuda-python`.
 
 ## Hard rules
@@ -257,7 +257,7 @@ the kernel that reads it).
   flagged in review on PR #517.
 - **A raw stream handle never goes straight into `torch.cuda.ExternalStream`.**
   Every eager caller on torch's default stream hands us a default-stream
-  sentinel (`0`, `cudaStreamLegacy` = 1, `cudaStreamPerThread` = 2), and torch
+  legacy sentinel (`0`, `cudaStreamLegacy` = 1), and torch
   before PR pytorch/pytorch#183258 (in v2.13.0; NGC 26.06 and torch <= 2.12
   lack it) returns a fresh NON-BLOCKING pool stream for `ExternalStream(0)`.
   Torch work issued in that context is unordered with a kernel launched on
@@ -265,7 +265,7 @@ the kernel that reads it).
   test passes; under xdist load the kernel reads stale conversion buffers and
   a staged output is copied back before it is written (the qa sm90
   `hopper_cuda` reds, PR #1165 — the same trap FROST SDPA hit in #682/#717/#860).
-  Map the sentinels and torch's own default stream to
+  Map the legacy sentinels and torch's own default stream to
   `torch.cuda.default_stream(device)`, the current stream to itself, and only a
   genuine side stream to `ExternalStream(handle, device=device)`. The one
   implementation is `cudnn._torch_stream` (`as_torch_stream`, `stream_context`,
@@ -338,6 +338,16 @@ DSL satisfies your kernel.**
   must slice by the lengths recorded during extraction, rather than assuming
   one value per field. Static coordinates can contribute zero values, too.
   `test_cutlass_schedulers.py` checks these round trips on real MLIR values.
+- **The installed DSL's preprocessor may be patched by a co-resident library.**
+  quack-kernels (>= 0.6.2, pinned by vLLM and SGLang, and present in the CI
+  test image) replaces `DSLPreprocessor.visit_If` process-wide on
+  `import quack`. It rewrites `if const_expr(S) and D: ... else: body` into a
+  constexpr `if` that holds a copy of `body`, so a name assigned in `body`
+  becomes function-scoped. If a later dynamic loop reassigns that name, the
+  loop carries it as maybe-unset (`TYPE_UNSTABLE_JOIN ... None on one path`)
+  whenever `S` is true. Give such loop-local names their own spelling.
+  Detector: rerun the kernel's tests with quack imported first (for example,
+  a `-p` plugin that does `import quack`).
 - Why: PR #799's `causal_conv1d_update` imported `frost.tile_dsl` from a route
   with no version check and broke the 4.6.2 lane — the version vLLM and SGLang
   ship — with a bare `ModuleNotFoundError: cutlass.experimental`; the bulk
@@ -420,8 +430,18 @@ tensor.record_stream(as_torch_stream(ctx.stream, device))
 ```
 Never call `torch.cuda.ExternalStream` / `get_stream_from_external` directly.
 `stream_context(None)` is a no-op; a handle equal to torch's current stream is
-a no-op via the raw-handle fast path; `0`/`1`/`2` and torch's default stream
-resolve to `torch.cuda.default_stream(device)`.
+a no-op via the raw-handle fast path; `0`/`1` and torch's default stream
+resolve to `torch.cuda.default_stream(device)`. `CUstream(2)` is a per-thread
+stream, NOT the legacy default. Torch interop rejects this sentinel: a cache
+key or allocator stream record based on `(device, 2)` aliases distinct host
+threads, and mapping it to the legacy default misorders scratch lifetimes.
+Use a concrete `torch.cuda.Stream` or its raw handle. The rejection must happen
+before the raw-current-stream shortcut too. Detector:
+`core/cutedsl/test_torch_stream_sentinels.py`. When staging a caller tensor,
+record its storage on the consuming stream even when `stream=None`: the caller
+may have entered a side-stream context after allocating it elsewhere. Use
+`contiguous_on_stream` / `copy_into_on_stream`; `core/cutedsl/test_torch_stream_staging.py`
+checks both explicit and implicit current streams with allocator reuse controls.
 
 **R2 — execute needs scratch (metadata, on-device descriptors, an output the
 kernel always writes but the graph did not request, staging for a dead-but-
@@ -433,7 +453,7 @@ def execute(self, graph, variant_pack, ctx):
     ws = Workspace.over(variant_pack, self.get_workspace_size(), type(self).__name__)  # frost/workspace.py
     meta = ws.take(4 * b + 4, "int32"); desc = ws.view(off, "int64", (slots * 16,))
 ```
-(APIBase adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
+(Adapters: `scratch_workspace_bytes()` + `WorkspaceCarver(workspace, bytes, label).take(numel, dtype)`
 in `sdpa/fwd/api_dsl.py`.) `Workspace(None, ...)` already raises
 `"<owner> requires a N-byte workspace but execute() received none; allocate
 graph.get_workspace_size() bytes and pass the buffer to execute()"` — reuse
@@ -569,13 +589,44 @@ treatment at the caller boundary.**
   calls. `core/graph/test_ensure_current_context.py` covers cold threads,
   foreign contexts, first native use, lazy import and retain count; its
   foreign-device cases require two visible GPUs.
+- **A guard that keeps the backend's planner away from a graph covers EVERY
+  path that creates a backend plan, not only the heuristics query.** The cc 10.7
+  single-query MXFP8 guard (`manifest.EngineFamily.backend_guard`,
+  `sdpa/fwd/backend_guard.py`: the cuDNN 9.26 / 9.27 planner SIGSEGVs there)
+  first intercepted the planning sequence only -- `_finalize_backend_layout`
+  and `backend_plan_entries`. `create_execution_plan(<backend engine id>,
+  knobs)`, a replayed autotune record, still reached the C++
+  `Graph::create_execution_plan` and took the process down the same way (rc 139
+  on 9.26.0.51, no exception to catch), so "explicit diagnostic selection stays
+  available" was a crash for exactly the selection it named. The two
+  out-of-sequence creators, `_append_backend_plan` (the explicit pin and the
+  materialization of a replayed entry) and `_lower_backend_plan` (a late
+  heuristics query for a classic call), go through
+  `_pygraph._refuse_guarded_backend` and raise the typed decline with the guard's
+  reason; `key()` / `serialize()` only lower, which completes on that domain.
+  Detector: `sdpa/frost/test_sdpa_backend_guard.py::test_explicit_backend_pin_on_a_guarded_graph_is_a_typed_decline`
+  (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
+  the first guard. A version-bounded guard also needs the detector that
+  re-measures its bound (test/AGENTS.md).
+- **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
+  `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
+  `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
+  `.backend_plan_entries()` and the private spellings FlashInfer still uses
+  (`_SdpaThdBinder.supports_*`, `datatypes._torch_to_cudnn_data_type`) are a
+  caller boundary: `test/python/sdpa/frost/test_flashinfer_consumed_surface.py`
+  (host-only) pins each with its signature, including the cc 10.7 + 4.7.x DSL
+  -> False cell of the arch-aware probe. Renaming one means updating
+  FlashInfer's fallbacks first; that test failing is the reminder. The runtime
+  probe takes the part because the DSL floor is 4.7.0 everywhere and 4.8.0 on
+  cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
+  cc 10.7 graph to the backend engine.
 
 ## Frontend-only kernel package layout
 
 ```
 python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
-├── __init__.py                      # exports API class + wrapper via __all__
-├── api.py                           # APIBase subclass + <operation>_wrapper() function
+├── __init__.py                      # exports the public functions via __all__
+├── api.py                           # <op>_<direction>() / <op>_jax_<direction>() functions
 └── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
 ```
 
@@ -622,6 +673,24 @@ rewritten into a dynamic `ir_loop` and cannot iterate heterogeneous objects
 and `pytest --collect-only` both stay green. After any refactor of a kernel
 body, run that flavor's own tests.
 
+**A `setmaxnreg` register split needs `min_blocks_per_mp=1` on the launch.**
+With `.reqntid` alone (what `block=` emits) ptxas cannot bound the register
+count at entry: it prints C7508 and drops every `setmaxnreg`. The SASS then has
+no `USETMAXREG`, the consumer warps never get their raised budget, and ptxas may
+size every warp for several CTAs per SM — the sm120 dual MoE GEMM fell to 40
+registers with 11 KB of spills and ran 4-6x slower. `.launch(...,
+min_blocks_per_mp=1)` emits `.minnctapersm 1` and makes the split live. The DSL
+never surfaces C7508 (not even under `CUTE_DSL_COMPILER_OPT=warnings`), so the
+numerics tests cannot see a lost split. Once the split is live, the producer
+budget is a hard limit: keep per-lane producer state small (one elected lane
+holding a tile's worth of GATHER rows spilled at 24 registers and made sm120 MoE
+GATHER up to 1.45x slower; each TMA-warp lane now issues its own GATHER4s), and
+accept only warp grids the split fits (`Sm120KernelTemplate.warp_layout_reject`).
+**Detector:** a compile-only SASS pin — one `USETMAXREG.DEALLOC` and one
+`TRY_ALLOC` at the template's counts, plus a spill bound on producer-heavy cases
+(`gemm/frost/sm120/test_sm120_register_split.py`; the SDPA pins in
+`sdpa/frost/test_sdpa_bwd_d256_sm100.py` do the same).
+
 **Immutable tensor-map reuse is local to a consumer and a launch.** A persistent
 loader or store warp may skip acquisition only while it keeps using an unchanged
 map it already acquired. Track the sequence/expert per consuming warp, reacquire
@@ -642,24 +711,18 @@ repository benchmark shapes or a documented target workload. A favorable
 synthetic shape establishes a local effect, not representative benefit; it does
 not by itself justify another compile-cache specialization.
 
-## The APIBase contract (`api_base.py`)
+## The public function contract
 
-Every OSS kernel API extends `APIBase` and implements:
-
-- `check_support() -> bool` — validate dtype/shape/stride/arch/config via the `_check_tensor_*` / `_value_error_if` helpers; must set `self._is_supported`. Works on `TensorDesc` (metadata-only tensors), so it runs without GPU storage.
-- `compile()` — calls `self._ensure_support_checked()`, builds and `cute.compile`s the kernel, caches in `self._compiled_kernel`.
-- `execute(..., current_stream=None)` — runs the cached kernel.
-
-`__call__` = compile-if-needed + execute. High-level wrappers (`<op>_wrapper_sm100(...)`) allocate outputs and return a **`TupleDict`** (dict that also unpacks as a tuple) with stable, documented key order. FP4x2 packing: use `_tensor_shape`/`_tensor_stride`, which double the innermost dim when `interpret_uint8_as_fp4x2` is set.
+Public functions (`<op>_<direction>(...)` / `<op>_jax_<direction>(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
 ## Adding a new frontend-only API — required checklist
 
 1. Kernel package under the closest existing family (layout above).
-2. `APIBase` subclass + wrapper in `api.py`.
+2. Public functions in `api.py`.
 3. Exports: family `__init__.py` `__all__` **and** `_LAZY_OPTIONAL_IMPORTS` in `python/cudnn/__init__.py`; register any new package dir in `pyproject.toml` packages list.
 4. Docs: page under `docs/fe-oss-apis/` (family subdir) + link it from `docs/fe-oss-apis/overview.md`.
-5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering check_support pass/fail and numerical reference comparison.
-6. DSL version gate (Rule 7): the route/`check_support` declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
+5. Tests: `test/python/<op>/cutedsl/test_<op>.py` (+ `_utils.py`/reference), covering supported and unsupported configurations and numerical reference comparison.
+6. DSL version gate (Rule 7): the route declines with a version-naming error below `CUTEDSL_MIN_VERSION`, and the tests skip there instead of failing.
 
 The `cutedsl-kernel-integration` skill (`skills/cutedsl-kernel-integration/`) documents this workflow in detail, including how to classify a kernel into a family — follow it for any kernel integration.
 

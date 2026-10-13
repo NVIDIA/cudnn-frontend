@@ -227,6 +227,51 @@ def test_graph_thd_forward_unequal_lengths(dtype, hkv, d, dv, causal, bottom_rig
             torch.testing.assert_close(got_lse, ref_lse.float(), rtol=3e-2, atol=5e-2)
 
 
+def _check_graph_thd_scale_and_replay(scale, d, dv):
+    torch.manual_seed(13)
+    graph, vp, nodes, (cu_q, cu_kv) = _make_graph((129, 64), (65, 95), hkv=1, d=d, dv=dv, bottom_right=True, cap_extra=32, sdpa_kwargs={"attn_scale": scale})
+    q, k, v, o, stats = nodes
+    workspace = _plan(graph)
+
+    def check():
+        for batch in range(2):
+            qs = vp[q][0, cu_q[batch] : cu_q[batch + 1]].transpose(0, 1).double()
+            ks = vp[k][0, cu_kv[batch] : cu_kv[batch + 1]].transpose(0, 1).double().repeat_interleave(2, dim=0)
+            vs = vp[v][0, cu_kv[batch] : cu_kv[batch + 1]].transpose(0, 1).double().repeat_interleave(2, dim=0)
+            nq, nkv = qs.shape[1], ks.shape[1]
+            qi = torch.arange(nq, device=qs.device).view(nq, 1)
+            ki = torch.arange(nkv, device=qs.device).view(1, nkv)
+            scores = ((qs @ ks.transpose(-1, -2)) * scale).masked_fill(ki > qi + nkv - nq, float("-inf"))
+            expected = (scores.softmax(-1).nan_to_num() @ vs).transpose(0, 1).float()
+            torch.testing.assert_close(vp[o][0, cu_q[batch] : cu_q[batch + 1]].float(), expected, rtol=1e-2, atol=4e-3)
+            torch.testing.assert_close(vp[stats][0, :, cu_q[batch] : cu_q[batch + 1]], scores.logsumexp(-1).float(), rtol=3e-2, atol=5e-2)
+        assert torch.count_nonzero(vp[o][0, :64]) == 0
+        assert torch.isneginf(vp[stats][0, :, :64]).all()
+        assert torch.isnan(vp[o][0, cu_q[-1] :]).all()
+
+    graph.execute(vp, workspace)
+    torch.cuda.synchronize()
+    check()
+    captured = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(captured):
+            graph.execute(vp, workspace)
+        vp[v].mul_(0.5)
+        vp[o].fill_(float("nan"))
+        vp[stats].fill_(float("nan"))
+        captured.replay()
+        torch.cuda.synchronize()
+        check()
+    finally:
+        captured.reset()
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.125, 0.125])
+@pytest.mark.parametrize("d,dv", [(64, 64), (192, 128)])
+def test_graph_thd_nonpositive_scale_and_replay(scale, d, dv):
+    _check_graph_thd_scale_and_replay(scale, d, dv)
+
+
 def test_graph_thd_zero_kv_and_poisoned_tail():
     """A keyless sequence is zero/-inf; unused capacity must not contaminate its neighbor."""
     torch.manual_seed(11)

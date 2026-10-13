@@ -153,7 +153,18 @@ needs one owner per word, hence the persistent grid under the fold (``min(row gr
 PARTIALS_CTAS_PER_SM)`` CTAs, each striding over the row groups ``cta, cta + n_ctas, ...``); the
 bf16 arms keep their one-row-group-per-block grid.
 
-The defaults (``og_fp8=False``, ``has_amax_do=False``, ``has_amax_dg=False``) trace today's
+**``has_dy_descale`` (appended) -- the dY descale of the two-level NVFP4 cast** (``compile_sigmoid_gate_bwd(has_dy_descale=)`` /
+``run_sigmoid_gate_bwd(descale_dy=)``): under an NVFP4 out-projection weight the block casts ``dY`` to NVFP4 at its live per-tensor
+power-of-two ``scale_dy`` (``quantize_fp4``'s ``scale_in``: the block-scale cast of a raw gradient would otherwise zero every 16-block
+below the e4m3 scale floor), and the block-scale dgrad GEMM has no alpha -- so B2's ``dO_gated`` arrives as ``scale_dy x dO_gated``.
+This arm reads ``descale_dy = 1 / scale_dy`` from its 1-element fp32 slot (exactly as ``scale_o`` is read) and multiplies ``dO_gated``
+by it BEFORE EVERY use: ``dO`` and ``dG`` directly, and through the stored ``dO`` the ``delta`` and the ``amax_do`` fold; ``og``
+(``O * s``) does not involve ``dO_gated`` and is untouched.  Exact for a power of two: ``fp32(bf16(scale x g)) x (1 / scale) ==
+fp32(bf16(g))`` wherever nothing over- or underflows, so every output is BITWISE the plain artifact's over the unscaled gradient
+(pinned by ``test_gate_bwd_dy_descale_arm_is_bitwise_the_explicit_multiply``); a non-power-of-two value is one fp32 multiply,
+rounded once.  OFF on every existing recipe (``False`` is appended to the cache key; the default artifact is byte-identical).
+
+The defaults (``og_fp8=False``, ``has_amax_do=False``, ``has_amax_dg=False``, ``has_dy_descale=False``) trace today's
 artifact: the new operands are ``None`` and the arms ``const_expr``-folded out.  The e4m3
 arm needs the fp8 ``cvt`` (sm_89+) and declines a pre-Ada device by name (Rule 7).
 """
@@ -240,6 +251,7 @@ def frost_sigmoid_gate_bwd(
     mScaleO: Optional[cute.Tensor],  # [1] fp32: the forward's scale_o (og_fp8); None otherwise
     mAmaxDo: Optional[cute.Tensor],  # [>= n_ctas] fp32 OUT: partials[cta] = max |dO_stored| over this CTA's rows (plain store); None = not wanted
     mAmaxDg: Optional[cute.Tensor],  # [>= n_ctas] fp32 OUT: the same over the stored dG (the dqkvg amax's GATE half); None = not wanted
+    mDescaleDy: Optional[cute.Tensor],  # [1] fp32: the dY descale multiplied into dO_gated before every use (has_dy_descale); None otherwise
     n_rows: cutlass.Int32,
     h: cutlass.Int32,
     s: cutlass.Int32,
@@ -271,6 +283,7 @@ def frost_sigmoid_gate_bwd(
     has_delta = cutlass.const_expr(mDelta is not None)
     has_amax_do = cutlass.const_expr(mAmaxDo is not None)
     has_amax_dg = cutlass.const_expr(mAmaxDg is not None)
+    has_dy_descale = cutlass.const_expr(mDescaleDy is not None)
     needs_pos = cutlass.const_expr(has_seq_lens or has_delta)
     io_dtype = mDOg.element_type
 
@@ -304,6 +317,11 @@ def frost_sigmoid_gate_bwd(
     quarter = cutlass.Float32(0.25)
     # The forward's per-tensor scale_o, once per thread, from device memory (og_fp8 only; an unused 1.0 otherwise).
     scale_o = cutlass.Float32(cutlass.make_array_view(mScaleO)[0]) if cutlass.const_expr(og_fp8) else one
+    # The dY descale of the two-level NVFP4 cast (has_dy_descale only; module docstring): B2's block-scale GEMM has no alpha, so under
+    # an NVFP4 W_o its dO_gated carries the per-tensor power-of-two scale_dy of the dY cast -- undone HERE, once per element, before
+    # EVERY use of dO_gated (dO and dG; the stored dO feeds the delta and the dO amax fold; og = O * s is untouched).  An unused 1.0
+    # otherwise, and the multiply is folded out.
+    descale_dy = cutlass.Float32(cutlass.make_array_view(mDescaleDy)[0]) if cutlass.const_expr(has_dy_descale) else one
     # The amax folds of the STORED dO / dG, per lane across every row of this CTA's loop (has_amax_do / has_amax_dg only).
     amax_lane = zero
     amax_dg_lane = zero
@@ -386,9 +404,12 @@ def frost_sigmoid_gate_bwd(
                     t = cute.math.tanh(g * half, approx=True)
                     sg = t * half + half
                     ds = ((one - t) * (one + t)) * quarter  # == s * (1 - s), holds to |g| = 18.5, EXACT 0 at saturation
-                    do = dogs[r][c][i] * sg
+                    dog_v = dogs[r][c][i]
+                    if cutlass.const_expr(has_dy_descale):
+                        dog_v = dog_v * descale_dy  # the dY descale, before EVERY use of dO_gated (exact for a power of two)
+                    do = dog_v * sg
                     # dOg (NOT the gated dO) times O: with the gated dO the product would carry an extra s.
-                    dg = (dogs[r][c][i] * os_[r][c][i]) * ds
+                    dg = (dog_v * os_[r][c][i]) * ds
                     og = os_[r][c][i] * sg
                     if cutlass.const_expr(has_seq_lens):
                         # SELECT, never `* 0`: a dead row's O residue may be NaN.
@@ -512,6 +533,7 @@ def sigmoid_gate_bwd_launch(
     scale_o: Optional[cute.Tensor],
     amax_do: Optional[cute.Tensor],
     amax_dg: Optional[cute.Tensor],
+    descale_dy: Optional[cute.Tensor],
     n_rows: cutlass.Int32,
     h: cutlass.Int32,
     s: cutlass.Int32,
@@ -538,6 +560,7 @@ def sigmoid_gate_bwd_launch(
         scale_o,
         amax_do,
         amax_dg,
+        descale_dy,
         n_rows,
         h,
         s,
@@ -581,6 +604,9 @@ class SigmoidGateBwdRecipe(NamedTuple):
     # APPENDED: the persistent-grid cap of the amax folds (SMs x PARTIALS_CTAS_PER_SM on the compiling device); 0 without a fold
     # (the grid is the row-group count).  ``n_partials_for`` is the partial count one launch writes.
     n_ctas_cap: int = 0
+    # APPENDED (default = today's artifact): the dY descale read from its slot and multiplied into dO_gated before every use (the two-level
+    # NVFP4 cast's descale, module docstring); ``run_sigmoid_gate_bwd`` checks ``descale_dy`` both ways against it (Rule 1).
+    has_dy_descale: bool = False
 
 
 def compile_sigmoid_gate_bwd(
@@ -598,6 +624,7 @@ def compile_sigmoid_gate_bwd(
     og_fp8: bool = False,
     has_amax_do: bool = False,
     has_amax_dg: bool = False,
+    has_dy_descale: bool = False,
 ) -> SigmoidGateBwdRecipe:
     """Build from SHAPES ALONE -- no allocation, no launch. Every knob is in the cache key.
 
@@ -610,7 +637,10 @@ def compile_sigmoid_gate_bwd(
     declined by name below -- Rule 7).  ``has_amax_do`` (appended): PER-CTA PARTIALS of ``max |dO|`` over the
     STORED dO words, live rows only, on a persistent grid of at most ``SMs x PARTIALS_CTAS_PER_SM`` CTAs (one
     plain store each; module docstring); needs ``threads_per_cta % 32 == 0`` (a full-warp butterfly) and no fp8
-    instruction.  ``has_amax_dg`` (appended): the same over the STORED dG words into a second partials array."""
+    instruction.  ``has_amax_dg`` (appended): the same over the STORED dG words into a second partials array.
+    ``has_dy_descale`` (appended): read ``descale_dy`` from a 1-element fp32 slot and multiply ``dO_gated`` by it before every use --
+    the dY descale of the two-level NVFP4 cast (module docstring); ``run_sigmoid_gate_bwd(descale_dy=)`` is then REQUIRED.  No
+    instruction gate (an fp32 multiply; every CUDA device)."""
     global _FAKE_STREAM
     validate_shape(d, threads_per_cta)
     if dtype not in (torch.bfloat16, torch.float16):
@@ -654,6 +684,7 @@ def compile_sigmoid_gate_bwd(
         bool(has_amax_do),
         bool(has_amax_dg),
         n_ctas_cap,
+        bool(has_dy_descale),
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -681,6 +712,7 @@ def compile_sigmoid_gate_bwd(
         scale_o = slot() if og_fp8 else None
         amax_do = parts() if has_amax_do else None
         amax_dg = parts() if has_amax_dg else None
+        descale_dy = slot() if has_dy_descale else None  # the dY descale's fp32 slot (the scale_o shape), or None = folded out
         compiled_cache[key] = cute.compile(
             sigmoid_gate_bwd_launch,
             *dense,
@@ -690,6 +722,7 @@ def compile_sigmoid_gate_bwd(
             scale_o,
             amax_do,
             amax_dg,
+            descale_dy,
             cutlass.Int32(0),  # n_rows   ) runtime; the zeros pin the TYPE only
             cutlass.Int32(h),  # h        )
             cutlass.Int32(0),  # s        )
@@ -718,6 +751,7 @@ def compile_sigmoid_gate_bwd(
         has_amax_do=bool(has_amax_do),
         has_amax_dg=bool(has_amax_dg),
         n_ctas_cap=n_ctas_cap,
+        has_dy_descale=bool(has_dy_descale),
     )
 
 
@@ -788,6 +822,7 @@ def run_sigmoid_gate_bwd(
     scale_o: Optional[torch.Tensor] = None,
     amax_do: Optional[torch.Tensor] = None,
     amax_dg: Optional[torch.Tensor] = None,
+    descale_dy: Optional[torch.Tensor] = None,
 ) -> int:
     """Launch. ``dog / o / gate / do / dg (/ og)`` are ``[T, H, D]`` (``T = B*S``);
     ``do`` may alias ``dog``. ``seq_lens`` (``[B]`` int32 on the device) needs
@@ -801,8 +836,9 @@ def run_sigmoid_gate_bwd(
     base; every one of its first ``n_partials_for(r, T)`` words is OVERWRITTEN -- no pre-zero).  Under
     ``og_fp8`` ``og`` is a ``float8_e4m3fn`` ``[T, H, D]`` whose token stride keeps every row 16-byte
     aligned (the quantize pass's destination rule; compact ``H*D`` satisfies it).  ``amax_dg`` (appended;
-    a ``has_amax_dg`` artifact's partials array) likewise, and the two arrays must not overlap.  Returns the
-    grid = the partials written (``n_partials_for``)."""
+    a ``has_amax_dg`` artifact's partials array) likewise, and the two arrays must not overlap.  ``descale_dy`` (appended; a
+    ``has_dy_descale`` artifact's 1-element fp32 CUDA slot, read in-kernel and multiplied into ``dO_gated`` before every use) is
+    checked both ways too.  Returns the grid = the partials written (``n_partials_for``)."""
     if r.og_fp8 and scale_o is None:
         raise ValueError(
             "this artifact was compiled WITH the e4m3 O_gated output (og_fp8=True); scale_o (1-element fp32 CUDA, read in-kernel) must be bound at "
@@ -825,8 +861,18 @@ def run_sigmoid_gate_bwd(
         )
     if not has_amax_dg and amax_dg is not None:
         raise ValueError("this artifact was compiled WITHOUT the dG amax output (has_amax_dg=False); passing amax_dg would silently ignore it (Rule 1)")
+    has_dy_descale = bool(getattr(r, "has_dy_descale", False))
+    if has_dy_descale and descale_dy is None:
+        raise ValueError(
+            "this artifact was compiled WITH the dY descale (has_dy_descale=True); descale_dy (1-element fp32 CUDA, read in-kernel) must be bound at "
+            "execute (Rule 1: no silent unit scale)"
+        )
+    if not has_dy_descale and descale_dy is not None:
+        raise ValueError("this artifact was compiled WITHOUT the dY descale (has_dy_descale=False); passing descale_dy would silently ignore it (Rule 1)")
     if scale_o is not None:
         check_scalar_slot("scale_o", scale_o)
+    if descale_dy is not None:
+        check_scalar_slot("descale_dy", descale_dy)
     t = int(dog.shape[0])
     n_partials = n_partials_for(r, t)
     for name, ten in (("amax_do", amax_do), ("amax_dg", amax_dg)):
@@ -897,6 +943,7 @@ def run_sigmoid_gate_bwd(
             ("scale_o", scale_o),
             ("amax_do", amax_do),
             ("amax_dg", amax_dg),
+            ("descale_dy", descale_dy),
         ),
     )
     n_rows = t * r.h
@@ -915,6 +962,7 @@ def run_sigmoid_gate_bwd(
         scale_o.reshape(1) if scale_o is not None else None,  # a 1-element reshape never copies (Rule 1)
         amax_do,
         amax_dg,
+        descale_dy.reshape(1) if descale_dy is not None else None,
         cutlass.Int32(n_rows),
         cutlass.Int32(r.h),
         cutlass.Int32(int(s) if s is not None else 0),

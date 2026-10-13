@@ -17,7 +17,6 @@ python/cudnn/
 ├── graph.py                        # Low-level graph helpers (graph, jit, graph_cache)
 ├── wrapper.py                      # High-level Graph wrapper class
 ├── datatypes.py                    # Data type conversions and helpers
-├── api_base.py                     # Abstract API base class for frontend-only APIs
 ├── gemm/                           # GEMM operation family (operation-first layout)
 │   ├── ops/                        # Backend-independent contracts (torch custom ops)
 │   ├── frost/                      # FROST GEMM engine (graph analysis, codegen, JIT)
@@ -56,7 +55,7 @@ is the supported entry point — the directory layout is an implementation detai
 
 To add a new frontend-only API, follow these steps:
 1. Choose the operation family first. GEMM-family kernels go under `python/cudnn/gemm/cutedsl/{dense,grouped,discrete_grouped}/{api-name}/`; only non-GEMM families still use a top-level directory.
-2. Add your kernel implementation and implement the high level API implementation in `api.py`, extending the `APIBase` class in `api_base.py`.
+2. Add your kernel implementation and implement the public functions in `api.py`.
 3. Expose the API import in `python/cudnn/__init__.py` and register the folder in `pyproject.toml`. Register any optional dependences if required.
 4. Add a sample usage/test file in `test/python/{operation}/cutedsl/`.
 
@@ -93,8 +92,6 @@ To add a new frontend-only API, follow these steps:
 
 ## Discrete grouped API notes
 
-The discrete grouped APIs (`DiscreteGroupedGemmSwigluSm100` and `DiscreteGroupedGemmDswigluSm100`) use per-expert pointer arrays instead of a packed `B` tensor:
+The discrete grouped APIs use per-expert pointer arrays instead of a packed `B` tensor:
 
 - Runtime pointer inputs are CUDA `torch.int64` tensors (`b_ptrs`, `sfb_ptrs`) with shape `(num_experts,)`.
-- `compile()` is no-arg and compiles from descriptors captured in the constructor.
-- For CUDA graph capture, call `compile()` before capture and capture only `execute()` with preallocated tensors.

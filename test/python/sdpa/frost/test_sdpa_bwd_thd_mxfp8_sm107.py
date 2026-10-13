@@ -48,7 +48,7 @@ import pytest
 import torch
 
 import cudnn
-from frost_test_utils import cuda_launch_names, requires_dsl, requires_rubin, requires_sm80, select_engine
+from frost_test_utils import cuda_launch_counts, cuda_launch_names, requires_dsl, requires_rubin, requires_sm80, select_engine
 from test_sdpa_bwd_mxfp8_sm107 import (  # noqa: F401  (ds_policy: fixture by import)
     _BF16_GRAD_TOL,
     _GRAD_TOL,
@@ -73,6 +73,7 @@ from test_sdpa_bwd_thd_sm107 import (
     _plan_index,
     _rows_with_keys,
     _sentinel_tails,
+    _spec_without_compiling,
 )
 
 pytestmark = [pytest.mark.L0, requires_dsl]
@@ -465,7 +466,7 @@ def _envelope(n, s, nh, dt, dev="cuda", pad_heads=0):
     return torch.empty(1, n, s, nh + pad_heads, _D, device=dev, dtype=dt)[0, :, :, :nh].permute(0, 2, 1, 3)
 
 
-def _build_direct_api(case, *, token_major_stats=False, envelope_q=None, envelope_kv=None):
+def _build_direct_api(case, *, token_major_stats=False, envelope_q=None, envelope_kv=None, external_delta=False):
     """``SdpaBwdDslSm107Mxfp8(thd=True, ...)`` over envelope SAMPLES and the case's PACKED scale-factor tensors (the packed tile count is
     read off their byte sizes).  The packed buffers are allocated at ``cap_q`` / ``cap_kv`` tokens; the envelope must cover them
     (``B * S_max >= cap``) or the adapter tightens the plan's capacity below the buffers and the standalone surface refuses the
@@ -506,6 +507,7 @@ def _build_direct_api(case, *, token_major_stats=False, envelope_q=None, envelop
         # head-major Stats allocated at the capacity names its own head stride (the graph path derives it from the port's stride);
         # token-major (T, H) Stats is compact and takes no stride (``_run_mx_direct`` slices it to the plan's cap)
         thd_stats_head_stride=None if token_major_stats else case.cap_q,
+        external_delta=external_delta,
     )
     assert api.check_support()
     return api
@@ -534,6 +536,8 @@ def _run_mx_direct(
     envelope_q=None,
     token_pad_heads=0,
     sf_dense_capacity=False,
+    external_delta=False,
+    delta=None,
 ):
     """Build the case, drive ``SdpaBwdDslSm107Mxfp8(thd=True)`` directly on PACKED views over a 0xFF-poisoned workspace (NaN in every
     dtype the chain stores, an E8M0 NaN in every atom: a stage reading a scratch region before writing it surfaces as NaN), the
@@ -556,7 +560,8 @@ def _run_mx_direct(
         poison_sf_pads=poison_sf_pads, poison_sf_seqs=poison_sf_seqs, seed=seed, causal=causal, bottom_right=bottom_right, window_left=window_left,
         quantize_ds=_block_scaled(),
     )  # fmt: skip
-    api = _build_direct_api(case, token_major_stats=token_major_stats, envelope_q=envelope_q)
+    api = _build_direct_api(case, token_major_stats=token_major_stats, envelope_q=envelope_q, external_delta=external_delta)
+    assert delta is None or external_delta, "a delta binds on an external_delta plan only"
     view = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731  [1,T,H,D] -> logical [1,H,T,D], the dense path's orientation
     fill = float("nan") if poison_outputs else 0.0
 
@@ -575,7 +580,7 @@ def _run_mx_direct(
     kwargs = dict(
         workspace=ws, seq_q_lens=lq, seq_kv_lens=lk,
         q_T_tensor=view(case.q_T), k_T_tensor=view(case.k_T), do_T_tensor=view(case.do_T), do_f16_tensor=view(case.do_f16),
-        **{name: case.sf[name] for name in _SF_ALL},
+        **{name: case.sf[name] for name in _SF_ALL}, delta_tensor=delta,
     )  # fmt: skip
     outs = []
     for _ in range(runs):
@@ -594,6 +599,55 @@ def _run_mx_direct(
     return SimpleNamespace(
         case=case, dq=dq, dk=dk, dv=dv, outs=outs, api=api, tensors=tensors, kwargs=kwargs, ws=ws, stats=stats, grad_storage=(dq_stor, dk_stor, dv_stor)
     )
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "lens_q, lens_kv, causal", (((300, 128, 200), (300, 128, 200), True), ((256, 100), (180, 300), False)), ids=("self-causal", "cross-Tq356-Tkv480-dense")
+)
+def test_thd_mxfp8_external_delta_is_bitwise_the_rows_own_pre_pass(ds_policy, lens_q, lens_kv, causal):
+    """A THD plan built with ``external_delta=True`` and fed the delta the row's OWN pre-pass wrote (the fp32 dot of the packed bf16
+    ``o_f16`` / ``dO_f16`` ports, read back out of the sibling plan's ``R_DELTA`` region: the PACKED head-major ``[1, H_q, ceil128(T_q)]``,
+    zeros past ``T_q``) returns dQ / dK / dV ``torch.equal`` the sibling's under BOTH dS policies -- the same artifact minus the ``dot``
+    launch -- over three ragged sequences, GQA and a causal band.  Also pinned: the slot (22) binds on the external plan only, the carve
+    lost exactly the delta region, one launch fewer (CUPTI, when available), the compiled plan's refusals fire with no launch.  The
+    CROSS-attention cell has Q and KV token capacities that round to DIFFERENT tiles (356 -> 384 vs 480 -> 512): the slot's shape and the
+    carve follow the Q capacity."""
+    from dataclasses import replace
+
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.kernels.sm107.prepared_host import R_DELTA
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    t_pad, kv_pad = (-(-sum(x) // 128) * 128 for x in (lens_q, lens_kv))
+    assert (t_pad != kv_pad) is (lens_q != lens_kv), "the cross cell pins the Q capacity against a DIFFERENT KV one"
+    own = _run_mx_direct(lens_q, lens_kv, h=4, hkv=2, causal=causal)
+    offset, shape, _strides = prepared_sm107._regions(own.api, prepared_sm107._REGION_SLOTS_MXFP8)[0][R_DELTA]
+    assert shape == own.api.external_delta_shape == (1, 4, t_pad), "the slot follows the Q token capacity"
+    delta = own.ws[offset : offset + 4 * math.prod(shape)].view(torch.float32).view(*shape).clone()
+    assert torch.isfinite(delta).all() and torch.equal(delta[:, :, own.case.t_q :], torch.zeros_like(delta[:, :, own.case.t_q :]))
+    ext = _run_mx_direct(lens_q, lens_kv, h=4, hkv=2, causal=causal, external_delta=True, delta=delta)
+    assert own.api._prepared.roles[22] == prepared_sm107.EXTERNAL_DELTA_ROLE and own.api._prepared.operands[22] is None
+    assert ext.api._prepared.operands[22] is not None, "the delta slot binds on the external plan only"
+    assert "delta" not in [n for n, _n, _d in ext.api._scratch_plan()] and "delta" in [n for n, _n, _d in own.api._scratch_plan()]
+    assert own.api.scratch_workspace_bytes() - ext.api.scratch_workspace_bytes() == ws_align(4 * t_pad * 4), "the carve lost exactly the delta region"
+    for name, x, y in zip(("dQ", "dK", "dV"), ext.outs[0], own.outs[0]):
+        _bitwise(f"{name}: the external-delta plan vs the row's own pre-pass", x, y)
+    counts = cuda_launch_counts(lambda: own.api.execute(*own.tensors, **own.kwargs), lambda: ext.api.execute(*ext.tensors, **ext.kwargs))
+    if counts is None:
+        print("\nlaunch count unverified here (no CUDA profiler activity: CUPTI unavailable)")
+    else:
+        assert counts[1] == counts[0] - 1, counts
+        print(f"\nlaunches: own {counts[0]}, external delta {counts[1]}")
+    launches = []
+    ext.api._prepared = replace(ext.api._prepared, fn=lambda *args: launches.append(args))
+    with pytest.raises(ValueError, match=r"CONTIGUOUS \[1, H_q, ceil128\(T_q\)\]"):
+        ext.api.execute(
+            *ext.tensors, **dict(ext.kwargs, delta_tensor=torch.zeros(len(lens_q), 4, -(-max(lens_q) // 128) * 128, device="cuda"))
+        )  # the DENSE envelope shape
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext.api.execute(*ext.tensors, **dict(ext.kwargs, delta_tensor=None))
+    assert not launches
 
 
 @requires_rubin
@@ -839,22 +893,27 @@ def test_thd_mxfp8_trimmed_stage3_is_bitwise_the_untrimmed_rendering_over_a_pois
 
 @requires_rubin
 @pytest.mark.parametrize("case", list(_GQA_TWIN_CASES), ids=list(_GQA_TWIN_CASES))
-def test_thd_mxfp8_p_c_single_launch_dq_is_bitwise_the_per_member_launches(case, monkeypatch):
-    """Under GQA the bf16-dS twin's THD dQ GEMM is ONE launch per head chunk (the plain renderings' ``b_head_group = group``) where it
-    used to be one per group MEMBER: dQ the SAME BITS (and dK / dV, untouched).  ``DQ_SINGLE_LAUNCH = False`` is the per-member twin.
-    P-c only: the block-scaled chain keeps ``b_head_group == 1`` whatever the constant says (its SFB descriptor is indexed per A / C
-    head; lifting that is a measured lever of its own) -- ``test_thd_mxfp8_launch_census`` pins its per-member launches."""
+def test_thd_mxfp8_single_launch_dq_is_bitwise_the_per_member_launches(case, monkeypatch, ds_policy):
+    """Under GQA the THD dQ GEMM is ONE launch per head chunk on BOTH dS policies -- the dQ record takes ``b_head_group = group``:
+    P-c through the plain THD rendering, P-b through the block-scale arm's THD leg, whose packed B = k_T AND its packed scale-factor
+    planes are indexed by ``h // group`` (the per-sequence SF tile prefix is a token-side term, the B descriptor's clamp touches only
+    the token extent) -- where it used to be one per group MEMBER: dQ the SAME BITS (and dK / dV, untouched).  ``DQ_SINGLE_LAUNCH =
+    False`` is the per-member twin; both runs are held to the per-sequence fp64 oracle over a 0xFF-poisoned workspace.  Covers GQA
+    32/2 and 64/8, tails that are no multiple of 256, dense / causal / bottom-right / a window, and a sequence empty on either side."""
     import cudnn.sdpa.bwd.api_dsl_sm107 as sm107
 
-    _p_c(monkeypatch)
     kw = dict(_GQA_TWIN_CASES[case])
     lens_q, lens_kv = kw.pop("lens_q"), kw.pop("lens_kv")
+    group = kw["h"] // kw["hkv"]
     assert sm107.DQ_SINGLE_LAUNCH, "one dQ launch per chunk is what ships; the pin flips it OFF for the twin"
     single = _run_mx_direct(lens_q, lens_kv, **_graph_kw_to_direct(kw))
     monkeypatch.setattr(sm107, "DQ_SINGLE_LAUNCH", False)
     members = _run_mx_direct(lens_q, lens_kv, **_graph_kw_to_direct(kw))
+    # the dQ record's b_head_group, copied off it at compile: the group on the shipped arm, 1 on the twin -- on BOTH policies
+    assert (single.api._ds_block_scaled, members.api._ds_block_scaled) == (_block_scaled(), _block_scaled())
+    assert (int(single.api._dq_b_head_group), int(members.api._dq_b_head_group)) == (group, 1), (single.api._dq_b_head_group, members.api._dq_b_head_group)
     for name, a, b in zip(("dQ", "dK", "dV"), (single.dq, single.dk, single.dv), (members.dq, members.dk, members.dv)):
-        _bitwise(f"{name} (single dQ launch vs per-member launches)", a, b)
+        _bitwise(f"{name} (single dQ launch vs per-member launches, {'P-b' if _block_scaled() else 'P-c'})", a, b)
 
 
 @requires_rubin
@@ -1138,8 +1197,9 @@ def test_thd_mxfp8_p_b_payloads_and_atoms_dequantize_per_sequence(monkeypatch):
 def test_thd_mxfp8_launch_census(monkeypatch):
     """The launch census of one THD execute per dS policy (torch.profiler / CUPTI): the bf16-dS twin P-c runs its two SF-aware dequant
     passes (packed q_T, k_T) ahead of the bf16 GEMMs and ONE dQ launch per head chunk under ``DQ_SINGLE_LAUNCH``; the block-scaled
-    chain P-b runs NO dequant pass and dQ ONCE PER GQA GROUP MEMBER (its SFB descriptor is indexed per A / C head; the single launch is
-    a lever of its own); both run the main kernel, the THD setup launches and the scale-factor pad pre-pass."""
+    chain P-b runs NO dequant pass and the SAME single dQ launch per chunk (its dQ record takes ``b_head_group = group``: the packed
+    B and its scale factors indexed by ``h // group``); both run the main kernel, the THD setup launches and the scale-factor pad
+    pre-pass."""
     from cudnn.sdpa.bwd import api_dsl_sm107 as sm107, config_sm107 as cfg
 
     counts = {}
@@ -1163,7 +1223,7 @@ def test_thd_mxfp8_launch_census(monkeypatch):
         print(f"\npolicy {policy}: {counts[policy]} from {sorted(set(launches))}")
     group = 4 // 2
     assert counts[cfg.DS_SF_P_C]["dequant"] == 2 and counts[cfg.DS_SF_P_B]["dequant"] == 0, counts
-    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + group, counts  # dK + one dQ launch per GQA group member (the block-scale arm)
+    assert counts[cfg.DS_SF_P_B]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts  # dK + ONE dQ launch per chunk (the block-scale arm too)
     assert counts[cfg.DS_SF_P_C]["gemm"] == 1 + (1 if sm107.DQ_SINGLE_LAUNCH else group), counts
     assert counts[cfg.DS_SF_P_B]["main"] == counts[cfg.DS_SF_P_C]["main"] >= 1, counts
     for policy in counts:
@@ -1632,26 +1692,78 @@ def test_mxfp8_thd_refuses_the_dense_length_flags():
     assert _thd_mx_adapter(**_TOTALS).check_support()
 
 
-def test_mxfp8_thd_declines_the_external_delta():
-    """A caller's delta is a DENSE contract ([B, H_q, S_q_pad] fp32); the THD chain's delta is its own ``dot_do_o`` over the packed bf16
-    ``o_f16`` / ``dO_f16`` ports in the head-major ``[1, H_q, ceil128(T_q)]`` layout, and no producer emits that packed layout -- declined
-    typed before any plan is built, on the MXFP8 row exactly as on the other two.  The THD roles carry no delta slot and put the two
-    length operands at slots 9 / 10 (the other THD specs' order); the dense MXFP8 roles carry the delta LAST."""
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_MXFP8_THD, EXTERNAL_DELTA_ROLE, MXFP8_PAYLOADS, MXFP8_SF, ROLES, ROLES_MXFP8, ROLES_MXFP8_THD
+def test_thd_host_helpers_keep_their_forms():
+    """The THD columnwise dequant kernel (``_dequant_mxfp8_to_bf16_thd``, a ``@cute.kernel``) traces two helpers that must stay
+    ``@cute.jit`` -- ``_thd_prefix_bases`` (the token / tile prefix bases of one side) and ``_thd_seq_of`` (the sequence lookup) --
+    while the THD hosts' delta-geometry helper ``_thd_delta_geometry`` is plain Python (int arithmetic on two ``config`` entries, the
+    form of ``_dq_launches``).  Read from the SOURCE: ``cute.jit`` returns an ordinary function object, so a decorator displaced by an
+    insertion between it and its ``def`` changes which helper is traced as device code and nothing at run time reports it."""
+    import ast
+    from pathlib import Path
 
-    with pytest.raises(ValueError, match="external_delta is not served on the packed chain"):
-        _thd_mx_adapter(external_delta=True, **_TOTALS).check_support()
-    api = _thd_mx_adapter(**_TOTALS)
+    from cudnn.sdpa.bwd import prepared as prep
+
+    path = Path(prep.__file__).parent / "kernels" / "sm107" / "prepared_host.py"
+    forms = {n.name: [ast.unparse(d) for d in n.decorator_list] for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef)}
+    assert forms["_dequant_mxfp8_to_bf16_thd"] == ["cute.kernel"]
+    assert forms["_thd_prefix_bases"] == ["cute.jit"] and forms["_thd_seq_of"] == ["cute.jit"], "the dequant kernel's helpers are traced as device code"
+    assert forms["_thd_delta_geometry"] == [] and forms["_dq_launches"] == [], "plan-time int arithmetic stays plain Python"
+
+
+def test_mxfp8_thd_serves_the_external_delta(monkeypatch):
+    """A caller's delta is SERVED under THD on the MXFP8 row exactly as on the other two: the plan fact passes ``check_support``;
+    its contract is the packed head-major ``[1, H_q, ceil128(T_q)]`` fp32 layout in TRUE units (bitwise the row's own ``dot_do_o``
+    over the packed bf16 ``o_f16`` / ``dO_f16`` ports when a producer reproduces that order -- which is why the chain's own pre-pass
+    is simply not launched); the THD carve drops its own ``delta`` region exactly while the default plan keeps it; the THD roles
+    carry the delta LAST -- slot 22, after the two lengths at 9 / 10, the four payloads and the seven scale-factor blobs -- on the
+    roles AND the attributes, standalone-only on the launch spec, whose ``geometry`` carries a trailing None for it (the host views
+    the delta from ``config``), and the plan fact reaches the host compile and keys the artifact."""
+    from cudnn.sdpa.bwd import prepared_sm107
+    from cudnn.sdpa.bwd.prepared import Operand
+    from cudnn.sdpa.bwd.prepared_sm107 import (
+        ATTRIBUTES_MXFP8_THD,
+        EXTERNAL_DELTA_ROLE,
+        MXFP8_PAYLOADS,
+        MXFP8_SF,
+        MXFP8_SF_KV_SIDE,
+        MXFP8_SF_Q_SIDE,
+        ROLES,
+        ROLES_MXFP8,
+        ROLES_MXFP8_THD,
+    )
+    from cudnn.sdpa.fwd.api_dsl import ws_align
+
+    h, t_pad = 2, -(-400 // 128) * 128
+    ext = _thd_mx_adapter(h=h, external_delta=True, **_TOTALS)
+    assert ext.check_support() and ext.external_delta is True
+    api = _thd_mx_adapter(h=h, **_TOTALS)
     assert api.check_support() and api.external_delta is False
-    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the THD carve keeps the chain's own (packed) delta region"
-    assert EXTERNAL_DELTA_ROLE not in ROLES_MXFP8_THD and EXTERNAL_DELTA_ROLE not in ATTRIBUTES_MXFP8_THD
+    assert ext.external_delta_shape == api.external_delta_shape == (1, h, t_pad)
+    assert "delta" in [name for name, _n, _d in api._scratch_plan()], "the default THD plan keeps the chain's own (packed) delta region"
+    assert "delta" not in [name for name, _n, _d in ext._scratch_plan()], "the external plan carves no delta region"
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(h * t_pad * 4), "the carve lost exactly the delta region"
     assert ROLES_MXFP8[-2:] == ("seq_kv", EXTERNAL_DELTA_ROLE), "the dense MXFP8 roles: the lengths, then the delta (appended)"
-    assert (
-        ROLES_MXFP8_THD == ROLES[:9] + ("seq_q", "seq_kv") + MXFP8_PAYLOADS + MXFP8_SF
-    ), "the THD roles: the nine packed tensors, the two lengths at slots 9 / 10, the family's extras"
-    assert ATTRIBUTES_MXFP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_MXFP8_THD) == len(ROLES_MXFP8_THD)
+    assert ROLES_MXFP8_THD == ROLES[:9] + ("seq_q", "seq_kv") + MXFP8_PAYLOADS + MXFP8_SF + (
+        EXTERNAL_DELTA_ROLE,
+    ), "the THD roles: the nine packed tensors, the two lengths at slots 9 / 10, the family's extras, the delta LAST (slot 22)"
+    assert ATTRIBUTES_MXFP8_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ATTRIBUTES_MXFP8_THD) == len(ROLES_MXFP8_THD) == 23
+    assert ATTRIBUTES_MXFP8_THD[-1] == EXTERNAL_DELTA_ROLE and ROLES_MXFP8_THD.index(EXTERNAL_DELTA_ROLE) == 22
     with pytest.raises(ValueError, match="external_delta=False"):
-        api._check_external_delta(torch.zeros(1, 2, 128))
+        api._check_external_delta(torch.zeros(1, h, t_pad))
+    with pytest.raises(ValueError, match="delta_tensor is required"):
+        ext._check_external_delta(None)
+    # the launch spec (the real builder over a fake artifact entry): the slot, its specialization per plan, the standalone-only role, the
+    # trailing geometry entry, the key
+    own_spec, own_calls = _spec_without_compiling(monkeypatch, api, prepared_sm107.compile_plan_mxfp8_thd, "compile_host_mxfp8_thd")
+    ext_spec, ext_calls = _spec_without_compiling(monkeypatch, ext, prepared_sm107.compile_plan_mxfp8_thd, "compile_host_mxfp8_thd")
+    for spec, calls in ((own_spec, own_calls), (ext_spec, ext_calls)):
+        assert not spec.native_binding and spec.length_form and spec.scale_log2 and spec.roles == ROLES_MXFP8_THD and len(spec.operands) == 23
+        assert spec.standalone_only_roles == (EXTERNAL_DELTA_ROLE,), "no graph declares a delta: framed absent on the graph path"
+        assert spec.packed_tile_groups == (MXFP8_SF_Q_SIDE, MXFP8_SF_KV_SIDE)
+        geometry = calls[0][0][4]
+        assert len(geometry) == 23 and geometry[-1] is None and geometry[9] is None and geometry[10] is None, "geometry[i] is operand i's layout"
+    assert own_spec.operands[22] is None and ext_spec.operands[22] == Operand("float32", (1, h, t_pad), (h * t_pad, t_pad, 1), h * t_pad, 16, 4)
+    assert own_calls[0][1]["external_delta"] is False and ext_calls[0][1]["external_delta"] is True and own_calls[0][0][7] != ext_calls[0][0][7]
 
 
 def test_mxfp8_thd_execute_requires_both_lengths(monkeypatch):
@@ -1842,13 +1954,18 @@ def test_mxfp8_thd_scratch_plan_is_the_packed_carve(ds_policy):
         name in plan for name in ("q_pad", "do_pad", "lse_pad", "k_pad", "v_pad", "do_T_pad", "sf_q_pad", "sf_k_pad", "dk_fold", "dv_fold")
     ), "no dense staging slab under THD: the packed path reads the caller's buffers; the harmless sf_q / sf_k are never re-staged"
     assert api.scratch_workspace_bytes() == sum(ws_align(math.prod(s) * dt.itemsize) for s, dt in plan.values())
+    # the external-delta plan: the SAME carve minus its first region, exactly
+    ext = _thd_mx_adapter(b=b, h=h, hkv=hkv, external_delta=True, **_TOTALS)
+    assert ext.check_support() and [n for n, _s, _d in ext._scratch_shapes()] == names[1:]
+    assert api.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(math.prod(plan["delta"][0]) * 4)
 
 
 def test_mxfp8_thd_stage3_records_are_the_thd_arm_of_each_policy(ds_policy):
     """The adapter's THD stage-3 records: under P-c the base THD arm (bf16 renderings over the bf16 dS, ``thd_varlen`` +
     ``thd_rows_kv``, EPI_NONE, ``causal_shift`` 0 with the per-sequence diagonal read from the metadata, the window KEPT, dQ's
-    ``b_head_group`` the GQA group under the single launch); under P-b the block-scale arm with the same THD fields and
-    ``b_head_group == 1`` (one dQ launch per group member) -- both admitted by the template's validator."""
+    ``b_head_group`` the GQA group under the single launch); under P-b the block-scale arm with the same THD fields and the SAME
+    ``b_head_group`` (one dQ launch per head chunk: the arm indexes its packed B scale factors by the grouped head too) -- both
+    admitted by the template's validator."""
     import types
 
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3
@@ -1866,7 +1983,7 @@ def test_mxfp8_thd_stage3_records_are_the_thd_arm_of_each_policy(ds_policy):
     assert (dk.causal_mode, dq.causal_mode) == (CAUSAL_K_LO, CAUSAL_K_HI)
     if api._ds_block_scaled:
         assert dk.block_scale and dq.block_scale and dk.dtype_qkv == dq.dtype_qkv == DTYPE_E4M3
-        assert dq.b_head_group == 1 and dk.b_head_group == 1, "the block-scale arm launches dQ once per GQA group member"
+        assert dq.b_head_group == (2 if sm107.DQ_SINGLE_LAUNCH else 1) and dk.b_head_group == 1, "the block-scale arm's dQ takes the group like the plain one"
     else:
         assert not dk.block_scale and not dq.block_scale and dk.dtype_qkv == dq.dtype_qkv == DTYPE_BF16
         assert dq.b_head_group == (2 if sm107.DQ_SINGLE_LAUNCH else 1) and dk.b_head_group == 1
