@@ -40,9 +40,14 @@ def __getattr__(name: str) -> Any:
     # imported. pyproject's floor is the downstream one (4.6.2) and is below what these
     # kernels need, so an install that satisfies pip can still be too old -- and the
     # failure must read as a version problem, not as a missing dependency.
-    from cudnn.frost.buffers import cutedsl_requirement_error
+    from cudnn.frost.buffers import cutedsl_primitives_error, cutedsl_requirement_error
 
     error = cutedsl_requirement_error("cudnn.norm")
+    # A DSL can clear the version floor and still not export cutlass.primitives
+    # (public wheels have carried it as cutlass.experimental.primitives). Say so
+    # here rather than letting the kernel import raise a bare "No module named".
+    if error is None:
+        error = cutedsl_primitives_error("cudnn.norm")
     if error is not None:
         raise ImportError(error)
     import importlib

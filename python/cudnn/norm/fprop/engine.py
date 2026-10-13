@@ -53,7 +53,7 @@ class FrostNormFwdEngine(BaseEngine):
     def _decline_reason(self, graph, knobs) -> Optional[str]:
         from cudnn.norm.fprop.engines import analyze_for, mismatch
 
-        from cudnn.frost.buffers import cutedsl_requirement_error
+        from cudnn.frost.buffers import cutedsl_primitives_error, cutedsl_requirement_error
 
         # Rule 7: decline at CHECK time, not when lowering imports the kernels.
         error = cutedsl_requirement_error(self.name)
@@ -67,7 +67,12 @@ class FrostNormFwdEngine(BaseEngine):
             # graph would be read wrong rather than merely be slow.
             return "scale/bias/DY must share the input dtype; mixed-precision parameters are not supported"
 
-        return mismatch(self._spec.capabilities, facts, knobs)
+        reason = mismatch(self._spec.capabilities, facts, knobs)
+        if reason is not None:
+            return reason
+        # Last, because it imports the DSL (~1 s): only reached when the engine
+        # would otherwise accept, where lowering is about to import it anyway.
+        return cutedsl_primitives_error(self.name)
 
     def check_support(self, graph) -> None:
         reason = self._decline_reason(graph, None)
