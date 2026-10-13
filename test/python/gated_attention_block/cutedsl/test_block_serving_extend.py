@@ -60,8 +60,6 @@ requirement_error = cutedsl_requirement_error("the gated attention block's servi
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
-pytestmark = pytest.mark.L0
-
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 # The capture cell (g) needs the projection GEMM driver's capture-safe route (``build_proj_gemm(capture_safe=True)``: the forced-tile JIT
 # route, no cuDNN handle at the first execute).  Where the driver has no such route, a fresh declaration's first execute inside a capture
@@ -218,16 +216,19 @@ def _assert_stage_in_pipeline_position(blk, page_size):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.L0
 def test_page_size_align_is_the_serving_stacks_granularity():
     assert PAGED_KV_PAGE_ALIGN == 16 and PAGED_KV_PAGE_ALIGN % 4 == 0  # a 4-token sparse block never straddles a page
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("page_size", list(_PAGES) + [48, 256])
 def test_a_legal_page_size_builds_the_stage_in_pipeline_position(page_size):
     blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=page_size)
     _assert_stage_in_pipeline_position(blk, page_size)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("page_size", _PAGES)
 def test_a_packed_declaration_builds_the_same_stage(page_size):
     """The write-through under ``thd=True`` is SERVED (the former typed decline is inverted, not deleted): the stage
@@ -239,6 +240,7 @@ def test_a_packed_declaration_builds_the_same_stage(page_size):
     assert blk._cache_write.batch * blk._cache_write.seq_len == meta["t"]
 
 
+@pytest.mark.L0
 def test_zero_is_off_and_builds_no_stage():
     blk, *_ = _make_block(_SMALL_D256, 1, 64)
     assert blk.paged_kv_page_size == 0 and blk._cache_write is None and all(not isinstance(st, _CacheWrite) for st in blk._stages)
@@ -248,6 +250,7 @@ def test_zero_is_off_and_builds_no_stage():
     assert blk_thd.paged_kv_page_size == 0 and blk_thd._cache_write is None
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "page_size, exc, match",
     [
@@ -267,6 +270,7 @@ def test_page_size_validator_rows(page_size, exc, match):
         _make_packed_block(_SMALL_D256, _PACKED_LENS, paged_kv_page_size=page_size)
 
 
+@pytest.mark.L0
 def test_page_size_must_hold_whole_sparse_blocks_on_a_qsa_geometry():
     # 16 % 4 == 0 is implied by the alignment row; the cross-field row still exists so the message names the block size
     # should either constant ever move.
@@ -280,6 +284,7 @@ def test_page_size_must_hold_whole_sparse_blocks_on_a_qsa_geometry():
     assert blk.paged_kv_page_size == 32 and isinstance(blk._sdpa, _SparseSdpa) and isinstance(blk._cache_write, _CacheWrite)
 
 
+@pytest.mark.L0
 def test_typed_declines_at_declaration_name_the_feature():
     with pytest.raises(NotImplementedError, match="save_for_backward"):
         _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, save_for_backward=True, inplace_qkv=False)
@@ -336,6 +341,7 @@ def test_typed_declines_at_declaration_name_the_feature():
     assert blk16p._cache_write.dtype == torch.float16
 
 
+@pytest.mark.L0
 def test_the_workspace_carve_is_unchanged_by_write_through():
     """The pools and the slot mapping are the caller's; the stage reserves nothing, so the carve is the dense block's --
     and the packed block's."""
@@ -348,6 +354,7 @@ def test_the_workspace_carve_is_unchanged_by_write_through():
     assert plain_p._layout() == wt_p._layout()
 
 
+@pytest.mark.L0
 def test_moved_bytes_counts_every_operand_once_in_and_once_out():
     from cudnn.gated_attention_block.kernels.cache_write import moved_bytes
 
@@ -358,6 +365,7 @@ def test_moved_bytes_counts_every_operand_once_in_and_once_out():
     assert blk._cache_write.moved_bytes(torch.int64) == 2 * 2 * t * 2 * 256 * 2 + t * 8
 
 
+@pytest.mark.L0
 def test_the_stage_declines_a_dsl_below_the_floor_by_version(monkeypatch):
     """Rule 7: the stage's ``check_support`` reads the installed CuTe DSL version BEFORE importing its kernel module and
     declines a wheel below FROST's floor with the typed message naming the version and the fix -- probed here by
@@ -384,6 +392,7 @@ def _cache_args(blk, geom_kw, page_size=16, n_pages=4, slot_dtype=torch.int32, l
     return dict(k_cache=k, v_cache=v, slot_mapping=slot)
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("name", ["k_cache", "v_cache", "slot_mapping", "index_k_raw", "block_table", "kv_lens"])
 def test_a_block_declared_without_write_through_refuses_every_cache_input(name):
     blk, inp, out, _ = _make_block(_SMALL_D256, 1, 64)
@@ -397,6 +406,7 @@ def test_a_block_declared_without_write_through_refuses_every_cache_input(name):
             _exec(blk, inp, out, ws, **{name: args[name]})
 
 
+@pytest.mark.L0
 def test_a_declared_block_requires_the_pools_and_the_slot_mapping_and_refuses_the_extend_inputs():
     """A write-through-only block (``kv_source="self"``) attends over its own K / V: the EXTEND form's ``block_table`` / ``kv_lens``
     are REFUSED there with a ``ValueError`` naming the declaration that takes them -- the former typed "paged-READ mode is a
@@ -421,6 +431,7 @@ def test_a_declared_block_requires_the_pools_and_the_slot_mapping_and_refuses_th
             _exec(blk, inp, out, ws, **args)
 
 
+@pytest.mark.L0
 def test_a_packed_block_takes_a_slot_per_packed_token():
     """Under ``thd=True`` the slot mapping has exactly T entries (one per packed token, pads included) -- the dense
     count rule at ``B = 1, S = T``; the lengths tensor stays the packed block's own requirement (``test_block_thd.py``)."""
@@ -435,6 +446,7 @@ def test_a_packed_block_takes_a_slot_per_packed_token():
             _exec(blk, inp, out, ws, seq_lens=meta["seq_lens"], k_cache=k, v_cache=v, slot_mapping=torch.arange(t, device=_DEV, dtype=torch.int32))
 
 
+@pytest.mark.L0
 def test_a_band_geometry_requires_the_raw_key_pool():
     geom = GatedAttentionBlockGeometry(**_FLASH_NEXT, qsa=QsaSpec(index_band=True))
     ref_geom = RefGeometry(**_FLASH_NEXT)
@@ -492,6 +504,7 @@ def _bad_pool_forms(geom_kw, page_size=16):
     yield "not a tensor", "must be a"
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("which", ["k_cache", "v_cache"])
 def test_pool_form_checks(which):
     blk, inp, out, _ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16)
@@ -513,6 +526,7 @@ def test_pool_form_checks(which):
             _exec(blk, inp, out, ws, **{**args, "k_cache": wide[..., :256], "v_cache": wide[..., 256:512]})
 
 
+@pytest.mark.L0
 def test_slot_mapping_form_checks():
     blk, inp, out, _ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16)
     ws = torch.empty(16, dtype=torch.uint8, device=_DEV)
@@ -544,6 +558,7 @@ def test_slot_mapping_form_checks():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.L2
 @_GPU
 @pytest.mark.gpu_exclusive
 @pytest.mark.xdist_group(name="gpu_exclusive")
@@ -577,17 +592,30 @@ def test_cache_write_binds_int64_pool_strides():
 
 
 @_GPU
-@pytest.mark.parametrize("layout", _LAYOUTS)
-@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
 @pytest.mark.parametrize(
-    "dtype, h, d, page_size, t, n_pages",
+    "dtype, h, d, page_size, t, n_pages, slot_dtype, layout",
     [
-        (torch.bfloat16, 2, 256, 16, 512, 40),
-        (torch.float16, 2, 256, 32, 300, 12),
-        (torch.bfloat16, 1, 128, 64, 700, 20),
-        (torch.float16, 2, 256, 128, 520, 6),
+        pytest.param(
+            dtype,
+            h,
+            d,
+            page_size,
+            t,
+            n_pages,
+            slot_dtype,
+            layout,
+            marks=pytest.mark.L0 if case_id == "bf16_h2_d256_p16" and slot_dtype == torch.int32 and layout == "hnd" else pytest.mark.L1,
+            id=f"{case_id}-{slot_id}-{layout}",
+        )
+        for dtype, h, d, page_size, t, n_pages, case_id in [
+            (torch.bfloat16, 2, 256, 16, 512, 40, "bf16_h2_d256_p16"),
+            (torch.float16, 2, 256, 32, 300, 12, "f16_h2_d256_p32"),
+            (torch.bfloat16, 1, 128, 64, 700, 20, "bf16_h1_d128_p64"),
+            (torch.float16, 2, 256, 128, 520, 6, "f16_h2_d256_p128"),
+        ]
+        for slot_dtype, slot_id in [(torch.int32, "i32"), (torch.int64, "i64")]
+        for layout in _LAYOUTS
     ],
-    ids=["bf16_h2_d256_p16", "f16_h2_d256_p32", "bf16_h1_d128_p64", "f16_h2_d256_p128"],
 )
 def test_kernel_scatters_bitwise_with_padded_and_out_of_range_slots(dtype, h, d, page_size, t, n_pages, slot_dtype, layout):
     """Two operands (or one) as COLUMN SLICES of a wider slab -> pools at a random injective slot mapping; padded (-1)
@@ -623,6 +651,7 @@ def test_kernel_scatters_bitwise_with_padded_and_out_of_range_slots(dtype, h, d,
         assert _written_rows(pool) == int(live.sum()) * h  # exactly the live rows, nothing else
 
 
+@pytest.mark.L0
 @_GPU
 def test_kernel_runner_refuses_a_mismatched_binding():
     from cudnn.gated_attention_block.kernels.cache_write import compile_cache_write, run_cache_write
@@ -658,6 +687,7 @@ def test_kernel_runner_refuses_a_mismatched_binding():
         compile_cache_write(dtype=torch.bfloat16, h=2, d=256, page_size=16, slot_dtype=torch.int16)
 
 
+@pytest.mark.L0
 @_GPU
 def test_the_stage_writes_the_slab_bands_and_the_raw_key_pool():
     """The block's own stage object on a synthetic slab (the block's SDPA stage gates the arch, the stage itself runs
@@ -800,10 +830,23 @@ def _check_pools_against(k_cache, v_cache, slot, page_size, k_rows, v_rows, ref_
 
 
 @requires_rubin
-@pytest.mark.parametrize("page_size", _PAGES)
-@pytest.mark.parametrize("layout", _LAYOUTS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
-@pytest.mark.parametrize("form", ["dense", "packed"])
+@pytest.mark.parametrize(
+    "form, dtype, layout, page_size",
+    [
+        pytest.param(
+            form,
+            dtype,
+            layout,
+            page_size,
+            marks=pytest.mark.L0 if dtype == torch.bfloat16 and layout == "hnd" and page_size == 16 else pytest.mark.L1,
+            id=f"{form}-{dtype_id}-{layout}-{page_size}",
+        )
+        for form in ["dense", "packed"]
+        for dtype, dtype_id in [(torch.bfloat16, "bf16"), (torch.float16, "f16")]
+        for layout in _LAYOUTS
+        for page_size in _PAGES
+    ],
+)
 def test_write_through_matches_the_slab_and_the_oracle_on_every_layout_and_page(form, dtype, layout, page_size):
     """The 8 / 2 d256 geometry at T = 512 (dense B=2 x S=256; packed sequences 300 / 0 / 128 / 84), the default inference
     pipeline (in-place Q / K / V), on NaN-poisoned pools of the given layout and page size with every 9th token padded
@@ -828,6 +871,7 @@ def test_write_through_matches_the_slab_and_the_oracle_on_every_layout_and_page(
     assert blk._stages.index(blk._cache_write) == rec["plain"]._stages.index(rec["plain"]._sdpa)  # the one extra stage sits where the SDPA was
 
 
+@pytest.mark.L1
 @requires_rubin
 @pytest.mark.parametrize("pipeline", ["fuse_norm_rope", "out_of_place", "fuse_gate", "packed_fuse_norm_rope", "packed_out_of_place"])
 def test_write_through_on_the_other_bf16_pipelines(pipeline):
@@ -889,6 +933,7 @@ def test_write_through_on_the_other_bf16_pipelines(pipeline):
     assert torch.equal(_bits(_rows_at(k_cache, slot2, page_size)), _bits(k_rows)) and torch.equal(_bits(_rows_at(v_cache, slot2, page_size)), _bits(v_rows))
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_two_launches_are_bitwise_on_the_pools_and_the_output():
     """The same packed block twice on fresh NaN pools: pools and ``out`` bitwise equal across the two launches (a
@@ -908,6 +953,7 @@ def test_two_launches_are_bitwise_on_the_pools_and_the_output():
         assert torch.equal(a, b)
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_raw_indexer_key_pool_at_flash_next():
     """The band geometry's write-through stages -- the unfused projection over the five-band slab, norm + RoPE, the cache
@@ -1094,6 +1140,7 @@ def _slot_table(lay, geom, t, act_dtype):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.L0
 def test_extend_declaration_builds_the_paged_sdpa_stage_and_the_capture_safe_projections():
     blk, inp, out, samples = _declare_extend(4, 512, max_kv_len=512, page=16)
     _declaration_facts(blk, samples)
@@ -1116,6 +1163,7 @@ def test_extend_declaration_builds_the_paged_sdpa_stage_and_the_capture_safe_pro
     assert blk._layout() == plain._layout()
 
 
+@pytest.mark.L0
 def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
     """The bounded-token contract (pad rows of ``out`` exactly 0 over a once-zeroed workspace) rests on the ``o`` slot being written by
     the SDPA alone: ``o_gated`` IS ``o`` under inference (the gate's own in-place write), and no other reserved slot -- nor the
@@ -1136,6 +1184,7 @@ def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
         assert lay.engine_scratch >= o_hi
 
 
+@pytest.mark.L0
 def test_extend_typed_declines_match_the_envelope_row_by_row():
     """Every row of the EXTEND declines table is reachable at declaration with exactly the message the envelope publishes for it --
     the CPU proof that no declaration-time decline escapes ``serving_envelope``."""
@@ -1188,6 +1237,7 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
         assert sparse.extend.reason == str(e.value)
 
 
+@pytest.mark.L0
 def test_extend_argument_rows_are_typed():
     """The argument contract around the table: ``kv_source`` values, ``token_capacity``'s type / value / equality with the samples'
     rows, the three samples REQUIRED under ``kv_source="paged"`` and REFUSED under ``"self"``, each pool's form (``check_pool``'s
@@ -1239,6 +1289,7 @@ def test_extend_argument_rows_are_typed():
             _declare_extend_with(2, 128, dict(good, sample_block_table=torch.zeros(2, 4, dtype=torch.int32)))
 
 
+@pytest.mark.L0
 def test_extend_write_through_declines_still_fire_first():
     """``quant`` / ``save_for_backward`` with the attribute are the write-through's typed declines, heard before anything of the
     EXTEND form (the form requires the attribute): no row of the EXTEND table repeats them."""
@@ -1248,6 +1299,7 @@ def test_extend_write_through_declines_still_fire_first():
     assert not any("quant" in name or "save_for_backward" in name for name, *_ in _EXTEND_DECLINES)
 
 
+@pytest.mark.L0
 def test_extend_execute_form_checks_are_host_side_and_typed():
     """On a DECLARED (uncompiled) EXTEND block, under ``set_sync_debug_mode("error")``: ``block_table`` / ``kv_lens`` REQUIRED, the pools
     matching the declared samples exactly (another page count or layout is another plan), the block table's dtype / shape / strides /
@@ -1296,6 +1348,7 @@ def test_extend_execute_form_checks_are_host_side_and_typed():
             _exec(blk, inp, out, ws, **base)
 
 
+@pytest.mark.L0
 def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_dependent_grid(monkeypatch):
     """The ONLY ordering between the cache write and the paged read is STREAM order.  Pinned: (1) the write-through stage compiles
     its kernels with ``use_pdl`` False (the runner's default; the stage passes nothing else -- a spy on the compile entry records
@@ -1615,6 +1668,7 @@ def _dense_block_on(hz, h_full):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_one_sequence_empty_prefix_at_a_tight_declaration_vs_the_dense_block():
     """(a) ONE sequence, EMPTY prefix, the TIGHT declaration (T_live = T_max = S = 384, a tail tile): the EXTEND step reads the step's
@@ -1641,6 +1695,7 @@ def test_extend_one_sequence_empty_prefix_at_a_tight_declaration_vs_the_dense_bl
     assert bitwise, f"the EXTEND step is no longer bitwise the dense block: max|diff| out {d_out:.3e}, gated O {d_og:.3e} (recorded bitwise)"
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_two_chunks_match_the_single_shot_dense_block_and_the_oracle():
     """(b) a 512-token sequence as TWO chunks on ONE compiled block (T_max 320 > both chunks: a bounded declaration with pad rows):
@@ -1672,6 +1727,7 @@ def test_extend_two_chunks_match_the_single_shot_dense_block_and_the_oracle():
     torch.testing.assert_close(k_all.float(), ref.k[0].float(), rtol=_BAND_BAR["rtol"], atol=_NORM_ATOL[hz.dtype])
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_prefix_hit_pool_prefilled_by_the_torch_reference_on_l3():
     """(c) the prefix-hit step on the UNIFIED content row (L3): three sequences whose prefixes (200 / 0 / 77 rows) were written into
@@ -1688,6 +1744,7 @@ def test_extend_prefix_hit_pool_prefilled_by_the_torch_reference_on_l3():
         assert torch.equal(_bits(k_p), _bits(rec["refs"][b].k[0, :p])) and torch.equal(_bits(v_p), _bits(rec["refs"][b].v[0, :p]))
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_l1_and_l3_pools_holding_the_same_values_are_bitwise():
     """(d) the three pool layouts on the paged THD read: the same step (histories, prefixes, pages) on an L1 (HND compact), an L2 (NHD by strides) and
@@ -1704,9 +1761,21 @@ def test_extend_l1_and_l3_pools_holding_the_same_values_are_bitwise():
 
 
 @requires_rubin
-@pytest.mark.parametrize("page", _PAGES)
-@pytest.mark.parametrize("layout", _LAYOUTS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize(
+    "dtype, layout, page",
+    [
+        pytest.param(
+            dtype,
+            layout,
+            page,
+            marks=pytest.mark.L0 if dtype == torch.bfloat16 and layout == "hnd" and page == 16 else pytest.mark.L1,
+            id=f"{dtype_id}-{layout}-{page}",
+        )
+        for dtype, dtype_id in [(torch.bfloat16, "bf16"), (torch.float16, "f16")]
+        for layout in _LAYOUTS
+        for page in _PAGES
+    ],
+)
 def test_extend_matrix_on_every_layout_and_page(dtype, layout, page):
     """(e) the degenerate matrix on serving buffers, one declaration per (dtype, layout, page): four sequences at T_max 512 -- a
     128-token sequence with an empty prefix (n_kv = 1; B x H_kv > 1 with it), an 84-token step over a 300-row prefix ending mid-page
@@ -1720,6 +1789,7 @@ def test_extend_matrix_on_every_layout_and_page(dtype, layout, page):
     hz.check(rec, label=f"(e) 8/2 {dtype} {layout} p{page}")
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_padded_entries_in_the_middle_and_a_live_q_over_kv_len_0():
     """(e) the general packing: a zero-length sequence in the MIDDLE (B_live < B_max), and -- the serving stacks' padded request in
@@ -1733,6 +1803,7 @@ def test_extend_padded_entries_in_the_middle_and_a_live_q_over_kv_len_0():
     assert rec["t_live"] == 165 and bool((hz.slot[lo:hi] == -1).all())
 
 
+@pytest.mark.L1
 @requires_rubin
 @pytest.mark.parametrize("n_kv", [1, 2, 3, 4, 8])
 def test_extend_n_kv_tiles_and_the_ring_wrap(n_kv):
@@ -1745,6 +1816,7 @@ def test_extend_n_kv_tiles_and_the_ring_wrap(n_kv):
         hz.check(rec, label=f"(e) n_kv {n_kv} kv_len {kv_len}")
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_block_table_row_slice_at_an_arbitrary_row_stride():
     """(e) a row-sliced block table through the BLOCK API: the block table is a ``[:, :max_pages]`` slice of a wider ``[B_max, 50]`` table (row stride 50,
@@ -1758,6 +1830,7 @@ def test_extend_block_table_row_slice_at_an_arbitrary_row_stride():
     assert torch.equal(rec_s["out"], rec["out"])
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_finite_stale_rows_past_kv_len_do_not_change_out():
     """(e) a prefix ending mid-page: the rows of the last live page past kv_len hold another sequence's stale values -- FINITE, the
@@ -1775,6 +1848,7 @@ def test_extend_finite_stale_rows_past_kv_len_do_not_change_out():
     assert torch.equal(rec_stale["out"], rec_zero["out"])
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_bounded_tokens_live_rows_bitwise_the_tight_declaration_and_pad_rows_exactly_zero():
     """(f) the bounded token form: the matrix packing (T_live 412) at T_max 512 vs the SAME packing on a TIGHT declaration (T_max =
@@ -1802,6 +1876,7 @@ def test_extend_bounded_tokens_live_rows_bitwise_the_tight_declaration_and_pad_r
     assert torch.isfinite(rec2["out"].float()).all() and bool((rec2["out"][412:] == 0).all()) and not bool((rec2["out"] == sentinel).any())
 
 
+@pytest.mark.L1
 @requires_rubin
 def test_extend_two_launches_are_bitwise():
     """The SAME step twice (histories and pages kept, the pools re-filled with the stale value in between): ``out``, the gated O and the
@@ -1817,6 +1892,7 @@ def test_extend_two_launches_are_bitwise():
         assert torch.equal(a, b)
 
 
+@pytest.mark.L1
 @requires_rubin
 @requires_capture_safe_gemm_route
 def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and_slots():
@@ -1895,6 +1971,7 @@ _ADMITTED_SPELLINGS = {
 }
 
 
+@pytest.mark.L1
 @requires_rubin
 @pytest.mark.parametrize("spelling", list(_ADMITTED_SPELLINGS), ids=list(_ADMITTED_SPELLINGS))
 def test_extend_admitted_spellings_execute_within_the_budget(spelling):
