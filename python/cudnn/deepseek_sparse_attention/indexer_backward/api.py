@@ -14,9 +14,9 @@ When the ``dIndexK`` output buffer is bf16, a trailing pure-torch cast
 ``dIndexK`` buffer receives the accumulator directly, with no cast. The fp32
 ordinary accumulator behind a bf16 ``dIndexK`` (and the ordinary sm100_v2
 ticket counter) is carved from the caller's workspace; deterministic execution
-uses 128 FP32 dK shards instead. ``scratch_workspace_bytes()`` reports the
-selected policy's exact size for ``execute(..., workspace=)``; the plans own no
-device memory (Rule 8, R2).
+uses 16 cluster-private FP32 dK planes plus 16 relay counters instead.
+``scratch_workspace_bytes()`` reports the selected policy's exact size for
+``execute(..., workspace=)``; the plans own no device memory (Rule 8, R2).
 """
 
 from __future__ import annotations
@@ -227,12 +227,15 @@ class IndexerBackward(APIBase):
 
     ``deterministic=True`` is an SM100 request-or-fail policy for H=64,
     D=128, block_I=128, and 128-multiple top-k in [128, 2048]. It gives each
-    of 128 persistent CTAs a private FP32 dK shard and fixed grid-stride query
-    rows, then folds groups of eight shards and the 16 group totals in two
-    fixed-order kernels. dQ/dW remain single-writer. The deterministic scratch
-    is ``128 * B * S_k * D * 4`` bytes (aligned, for either backend),
-    independent of output dtype. A warmed plan with caller-owned outputs and
-    scratch is CUDA Graph compatible.
+    up to 128 persistent CTAs fixed grid-stride query rows, groups them into
+    co-resident 8-CTA clusters, and relays each cluster's dK updates in fixed
+    rank order into one FP32 plane. A final fixed-order kernel folds the 16
+    cluster planes. dQ/dW remain single-writer. The deterministic scratch is
+    ``16 * B * S_k * D * 4`` bytes plus an aligned 16-counter region,
+    independent of output dtype. As with a top-k result, valid indices within
+    each query row must be unique; duplicate scatter targets inside one row
+    are outside the deterministic contract. A warmed plan with caller-owned
+    outputs and scratch is CUDA Graph compatible.
 
     ``backend="sm100_v2"`` (SM100 only, request-or-fail: ``check_support``
     raises outside the envelope, there is no silent fallback) selects an
@@ -257,8 +260,8 @@ class IndexerBackward(APIBase):
     8 bytes of the caller's ``workspace`` (the first ``ws_align(8)`` bytes,
     ahead of the bf16 dK accumulator), zeroed on the launch stream at every
     ``execute``. Deterministic execution replaces both regions with its dK
-    shards. The plan owns nothing and is bound to no device; executions that
-    share one workspace buffer must not overlap on the device
+    planes and relay counters. The plan owns nothing and is bound to no device;
+    executions that share one workspace buffer must not overlap on the device
     (``indexer_backward_wrapper`` allocates a fresh one per call). The
     workspace must live on ``index_q.device``. ``backend`` must be one of
     ``{"default", "sm100_v2"}``.
@@ -610,13 +613,13 @@ class IndexerBackward(APIBase):
         """Return caller-owned scratch bytes for the selected dK policy.
 
         The ordinary sm100_v2 counter region comes first. Deterministic
-        execution instead uses 128 dense FP32 shards regardless of output
-        dtype; ordinary execution needs one dense accumulator only for a bf16
-        ``d_index_k``.
+        execution instead uses 16 dense FP32 cluster planes plus 16 int32
+        relay counters regardless of output dtype; ordinary execution needs
+        one dense accumulator only for a bf16 ``d_index_k``.
         """
         counter = ws_align(8) if self.use_v2 and not self.deterministic else 0
         if self.deterministic:
-            accumulator = ws_align(deterministic_dk_workspace_bytes(self.batch, self.seqlen_k, self.head_dim))
+            accumulator = deterministic_dk_workspace_bytes(self.batch, self.seqlen_k, self.head_dim)
         else:
             accumulator = 0 if self.dik_desc.dtype == torch.float32 else ws_align(self.batch * self.seqlen_k * self.head_dim * 4)
         return counter + accumulator
@@ -996,8 +999,8 @@ def indexer_backward_wrapper(
             representation floor. fp32 ``d_index_k`` is zeroed internally.
             Ordinarily, the backend's dynamic-ticket counter is 8 bytes of the
             per-call ``workspace`` below, zeroed on the launch stream at every
-            call; ``deterministic=True`` replaces it with the dK shards. The
-            plan owns no device memory. The wrapper additionally keys its plan
+            call; ``deterministic=True`` replaces it with the cluster dK
+            planes and relay counters. The plan owns no device memory. The wrapper additionally keys its plan
             cache on the **resolved** stream (``stream`` when given, otherwise
             ``torch.cuda.current_stream()`` at call time), so one cached plan's
             executes are stream-ordered.
@@ -1005,16 +1008,17 @@ def indexer_backward_wrapper(
             ``IndexerBackward.scratch_workspace_bytes()`` bytes on
             ``index_q.device`` (the ordinary fp32 dK accumulator behind a
             bf16 ``d_index_k``, plus the ordinary sm100_v2 ticket counter, or
-            the deterministic dK shards). When omitted the wrapper allocates
-            it per call on the launch stream. Calls sharing one buffer must not
-            overlap on the device.
+            the deterministic cluster planes and relay counters). When omitted
+            the wrapper allocates it per call on the launch stream. Calls
+            sharing one buffer must not overlap on the device.
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
-            on SM100. The dK GEMM accumulates into 128 CTA-private FP32 shards
-            and a fixed-order two-level reduction writes ``d_index_k``. The
-            caller-owned workspace is correspondingly 128 times the dense
-            FP32 dK size for either backend. No global semaphore or
-            cooperative launch is used, so a warmed plan with preallocated
-            outputs and workspace remains CUDA Graph compatible.
+            on SM100. Eight co-resident producer CTAs relay their dK updates
+            in fixed rank order into each of 16 cluster-private FP32 planes;
+            a fixed-order reduction writes ``d_index_k``. The caller-owned
+            workspace is correspondingly 16 times the dense FP32 dK size plus
+            16 int32 relay counters for either backend. A warmed plan with
+            preallocated outputs and workspace remains CUDA Graph compatible.
+            Valid top-k indices within each query row must be unique.
     """
     _validate_indexer_backward_backend(backend)
     # Validate ranks explicitly before any allocation or the dimension

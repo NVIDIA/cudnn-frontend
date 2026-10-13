@@ -41,8 +41,9 @@ a **two-term bf16-expansion** formulation:
 * Ordinarily, ``d_index_k`` is accumulated with vectorized fp32 atomics
   (four-element ``cute.arch.atomic_add``), the same numerics class as the
   default backend. The deterministic specialization assigns fixed query
-  stripes to 128 persistent CTAs, redirects each CTA's atomics to its private
-  FP32 shard, then performs a fixed two-level shard reduction.
+  stripes to 128 persistent CTAs. Each co-resident 8-CTA cluster relays those
+  atomics in fixed rank order into one private FP32 plane, then a fixed-order
+  reduction folds the 16 planes.
 
 Semantics (H = indexer heads, D = head dim; per query row ``s`` and top-k
 slot ``t`` with id ``n = idx[s, t]``; invalid slots contribute nothing —
@@ -146,17 +147,18 @@ Requires SM100, H == 64, D == 128, and topk % 128 == 0 with
 Workspace / concurrency contract (Rule 8, R2): the plan owns no device
 memory. Ordinarily, the dynamic-ticket counter is the first ``ws_align(8)``
 bytes of the caller's ``workspace`` and the fp32 dK accumulator a bf16
-``d_index_k`` needs follows it. Deterministic execution uses only its 128 FP32
-dK shards; ``IndexerBackward.scratch_workspace_bytes()`` is the size, and the
-buffer must live on ``index_q.device``. Every ordinary execute zeroes the
-counter on the launch stream with one async memset; every deterministic
-execute similarly zeroes all shards. A buffer another engine used in between
-is therefore fine, and a launch killed mid-way leaves nothing behind (the
+``d_index_k`` needs follows it. Deterministic execution uses 16 cluster-private
+FP32 dK planes plus 16 relay counters; ``IndexerBackward.scratch_workspace_bytes()``
+is the size, and the buffer must live on ``index_q.device``. Every ordinary
+execute zeroes the counter on the launch stream with one async memset;
+deterministic execution zeroes its planes and relay counters. A buffer
+another engine used in between is therefore fine, and a launch killed midway
+leaves nothing behind (the
 ordinary kernel's own self-reset by the final ticket drawer stays,
 harmlessly). What must not happen is two ordinary launches sharing one
 counter in flight: they would interleave ticket draws. Executions that share one workspace buffer
 must therefore not overlap on the device; deterministic launches do not draw
-tickets but likewise cannot share their dK shard array in flight.
+tickets but likewise cannot share their dK planes or relay counters in flight.
 ``indexer_backward_wrapper``
 allocates a fresh buffer per call (on the launch stream) and additionally
 keys its plan cache on the *resolved* stream so one cached plan's executes
@@ -193,9 +195,15 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 from .deterministic_dk_sm100 import (
-    NUM_DK_SHARDS,
+    DK_RELAY_CLUSTER_SIZE,
+    NUM_DK_PRODUCER_CTAS,
+    NUM_DK_PLANES,
+    advance_dk_relay_turn,
+    deterministic_dk_relay_bytes,
+    deterministic_dk_planes_bytes,
     deterministic_dk_workspace_bytes,
     reduce_deterministic_dk,
+    wait_dk_relay_turn,
 )
 from .indexer_backward_sm100 import _score_grad_inplace
 
@@ -402,11 +410,11 @@ class IndexerBackwardV2Sm100:
         # straight from gmem (mW is read-only), so weights are never staged
         # in smem.
         self.stage_barrier = pipeline.NamedBarrier(barrier_id=5, num_threads=128)
-        # Deterministic dK row boundary. Fixed CTA-to-shard ownership removes
-        # cross-CTA atomic races; this barrier additionally prevents the four
-        # dK warps from interleaving atomics from consecutive query rows when
-        # the same KV id appears in different top-k slot positions. Ordinary
-        # dynamic-ticket execution retains the fully overlapped schedule.
+        # Deterministic dK row boundary. The cluster relay removes cross-CTA
+        # atomic races; this barrier also keeps the four dK warps inside one
+        # acquire/release turn and prevents consecutive query rows from
+        # interleaving. Ordinary dynamic-ticket execution retains the fully
+        # overlapped schedule.
         self.dk_row_barrier = pipeline.NamedBarrier(barrier_id=6, num_threads=128)
 
     # -----------------------------------------------------------------
@@ -427,7 +435,7 @@ class IndexerBackwardV2Sm100:
         s_q_per_batch: Int32,  # rows per batch (idx_local row -> batch map)
         s_k_local: Int32,  # per-batch KV extent (idx_local mask bound)
         stream: cuda.CUstream,
-        mCnt: cute.Tensor,  # (2,) i32 persistent ticket counter
+        mCnt: cute.Tensor,  # ordinary ticket counter or deterministic relay counters
     ):
         # (S, H, D) -> (H, D, S): B-operand view (N=heads, K=dim, rest=row)
         mQ_v = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 2, 0]))
@@ -506,7 +514,7 @@ class IndexerBackwardV2Sm100:
         ).launch(
             grid=(self.num_ctas, 1, 1),
             block=[self.threads_per_cta, 1, 1],
-            cluster=(1, 1, 1),
+            cluster=(DK_RELAY_CLUSTER_SIZE, 1, 1) if self.deterministic else (1, 1, 1),
             min_blocks_per_mp=1,
             stream=stream,
         )
@@ -535,7 +543,7 @@ class IndexerBackwardV2Sm100:
         sQT_layout: cute.ComposedLayout,
         sA_layout: cute.ComposedLayout,
         sAT_layout: cute.ComposedLayout,
-        mCnt: cute.Tensor,  # (2,) i32 ticket counter
+        mCnt: cute.Tensor,  # ordinary ticket counter or deterministic relay counters
         sm_scale: Float32,
         s_q_per_batch: Int32,
         s_k_local: Int32,
@@ -545,9 +553,11 @@ class IndexerBackwardV2Sm100:
         seq_k = cute.size(mK.shape[0])
         seq_len = cute.size(mIdx.shape[0])
         if const_expr(self.deterministic):
-            shard_offset = cutlass.Int64(cute.arch.block_idx()[0]) * cutlass.Int64(seq_k) * cutlass.Int64(self.head_dim)
+            cluster_idx = Int32(cute.arch.block_idx()[0] // DK_RELAY_CLUSTER_SIZE)
+            cluster_rank = Int32(cute.arch.block_idx_in_cluster())
+            plane_offset = cutlass.Int64(cluster_idx) * cutlass.Int64(seq_k) * cutlass.Int64(self.head_dim)
             mdK = cute.make_tensor(
-                mdK.iterator + shard_offset,
+                mdK.iterator + plane_offset,
                 cute.make_layout(
                     (seq_k, self.head_dim),
                     stride=(cutlass.Int64(self.head_dim), 1),
@@ -934,7 +944,7 @@ class IndexerBackwardV2Sm100:
                             pipe_T.producer_acquire(tw_tst)
                             if const_expr(self.deterministic):
                                 # Fixed grid-stride ownership is required for
-                                # reproducible shard membership and summation
+                                # reproducible plane membership and relay turn
                                 # order. CTA i always consumes rows
                                 # i, i + num_ctas, ... in that order.
                                 tw_raw = Int32(cute.arch.block_idx()[0] + tw_k * self.num_ctas)
@@ -1373,6 +1383,14 @@ class IndexerBackwardV2Sm100:
                 pk_ok = pk_ticket_row >= 0
                 pk_buf = pk_vcnt % 2
                 pk_vcnt = pk_vcnt + (Int32(1) if pk_ok else Int32(0))
+                if const_expr(self.deterministic):
+                    # All eight CTAs in this hardware cluster share one dense
+                    # dK plane.  Each fixed ticket slot gets one turn even
+                    # when its row is out of range, so the final partial round
+                    # cannot leave a hole in the relay sequence.
+                    relay_turn = Int32(pk_k * DK_RELAY_CLUSTER_SIZE) + cluster_rank
+                    wait_dk_relay_turn(mCnt.iterator, tidx_wg, cluster_idx, relay_turn)
+                    self.dk_row_barrier.arrive_and_wait()
                 if pk_ok:
                     # local-id mode: this row's batch offset (the ticket row
                     # value is load-bearing here), applied after the validity
@@ -1595,13 +1613,12 @@ class IndexerBackwardV2Sm100:
                         if tidx_wg % 32 == 0:
                             pipe_M.consumer_release(pk_mst)
                         pk_mst.advance()
-                    if const_expr(self.deterministic):
-                        # All dK atomics for this fixed-owner row precede every
-                        # atomic from the CTA's next row. This makes the
-                        # within-shard accumulation order independent of warp
-                        # scheduling; the trailing kernels then fold shards in
-                        # their fixed numeric order.
-                        self.dk_row_barrier.arrive_and_wait()
+                if const_expr(self.deterministic):
+                    # Complete every atomic in this CTA turn before publishing
+                    # the next rank. Acquire/release scopes the shared plane;
+                    # cluster co-residency makes the rank chain deadlock-free.
+                    self.dk_row_barrier.arrive_and_wait()
+                    advance_dk_relay_turn(mCnt.iterator, tidx_wg, cluster_idx)
             self.tmem_dealloc_barrier.arrive_and_wait()
 
 
@@ -1652,7 +1669,8 @@ def indexer_backward_v2_sm100(
     The returned callable allocates nothing. Ordinarily, its ticket counter
     (8 B) and, for a bf16 ``d_index_k``, the ``B * S_k * D`` fp32 accumulator
     are carved from the ``workspace`` argument (counter first). Deterministic
-    execution carves 128 FP32 dK shards instead. Scratch is sized by
+    execution carves 16 cluster-private FP32 dK planes plus 16 relay counters
+    instead. Scratch is sized by
     ``IndexerBackward.scratch_workspace_bytes()`` and zeroed on the launch
     stream at every call. A missing or undersized workspace raises
     ``ValueError`` before kernel 1 overwrites ``attn_score``. Executions that
@@ -1750,19 +1768,21 @@ def indexer_backward_v2_sm100(
         s = _resolve_stream(current_stream)
         # Scratch (R2): ordinary execution carves the ticket counter first,
         # then the fp32 dK accumulator a bf16 output needs; deterministic
-        # execution carves only its shards. Validate/carve before kernel 1 so
-        # a missing workspace cannot leave AttnScore overwritten.
-        shard_bytes = deterministic_dk_workspace_bytes(batch, seqlen_k, dim) if deterministic else 0
-        required = ws_align(shard_bytes) if deterministic else ws_align(8) + (0 if dIndexK.dtype == torch.float32 else ws_align(seq_k_total * d * 4))
+        # execution carves its planes and relay counters. Validate/carve before
+        # kernel 1 so a missing workspace cannot leave AttnScore overwritten.
+        planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim) if deterministic else 0
+        required = (
+            deterministic_dk_workspace_bytes(batch, seqlen_k, dim)
+            if deterministic
+            else ws_align(8) + (0 if dIndexK.dtype == torch.float32 else ws_align(seq_k_total * d * 4))
+        )
         carver = WorkspaceCarver(workspace, required, "IndexerBackward (sm100_v2)")
         _check(workspace.device == IndexQ.device, f"workspace must be on {IndexQ.device} (got {workspace.device})")
         if deterministic:
-            dIndexK_shards = carver.take(shard_bytes // 4, torch.float32).view(NUM_DK_SHARDS, seq_k_total, d)
-            dk_f32_flat = dIndexK_shards.view(NUM_DK_SHARDS * seq_k_total, d)
-            # The deterministic kernel const-eliminates every counter access;
-            # preserve its compiled signature with an aligned two-int view of
-            # scratch instead of reserving dead workspace.
-            cnt = dIndexK_shards.view(torch.int32).view(-1)[:2]
+            dIndexK_planes = carver.take(planes_bytes // 4, torch.float32).view(NUM_DK_PLANES, seq_k_total, d)
+            dk_f32_flat = dIndexK_planes.view(NUM_DK_PLANES * seq_k_total, d)
+            cnt = carver.take(deterministic_dk_relay_bytes() // 4, torch.int32)
+            memset_zero_async(cnt.data_ptr(), deterministic_dk_relay_bytes(), s)
         else:
             cnt = carver.take(2, torch.int32)
             memset_zero_async(cnt.data_ptr(), 8, s)
@@ -1770,7 +1790,7 @@ def indexer_backward_v2_sm100(
                 dk_f32_flat = dIndexK.view(seq_k_total, d)
             else:
                 dk_f32_flat = carver.take(seq_k_total * d, torch.float32).view(seq_k_total, d)
-        memset_zero_async(dk_f32_flat.data_ptr(), shard_bytes if deterministic else seq_k_total * d * 4, s)
+        memset_zero_async(dk_f32_flat.data_ptr(), planes_bytes if deterministic else seq_k_total * d * 4, s)
 
         # Kernel 1: shared in-place score-grad precompute.
         #   AttnScore <- grad_signal; IndexScore is read-only and preserved.
@@ -1785,7 +1805,7 @@ def indexer_backward_v2_sm100(
         dq_flat = dIndexQ.view(rows, h, d)
         dw_flat = dWeights.view(rows, h)
 
-        num_ctas = NUM_DK_SHARDS if deterministic else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
+        num_ctas = NUM_DK_PRODUCER_CTAS if deterministic else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
         # per-CTA ring-slot trip count; the +8 surplus slots are the
         # work-stealing headroom (they come back as -1 tickets)
         if deterministic:
@@ -1847,7 +1867,7 @@ def indexer_backward_v2_sm100(
             )
 
         if deterministic:
-            reduce_deterministic_dk(dIndexK_shards, dIndexK, current_stream)
+            reduce_deterministic_dk(dIndexK_planes, dIndexK, current_stream)
         # Trailing cast only for ordinary bf16 d_index_k buffers (fp32 atomic
         # accumulator -> output dtype); fp32 buffers were written directly.
         elif dIndexK.dtype != torch.float32:

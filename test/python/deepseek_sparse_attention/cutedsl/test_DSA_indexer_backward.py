@@ -1034,18 +1034,20 @@ _V2_TOPK_PARAMS = [
 @torch_fork_set_rng(seed=1701)
 def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats, topk_indices_global):
     """The opt-in path owns/reset its exact scratch and reproduces every
-    output bitwise across the 128-row shard boundary."""
+    output bitwise across the 128-CTA producer-grid boundary."""
     try:
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import (
-            NUM_DK_SHARDS,
+            NUM_DK_PRODUCER_CTAS,
+            NUM_DK_RELAY_COUNTERS,
+            NUM_DK_PLANES,
             deterministic_dk_workspace_bytes,
         )
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_exact_sm100()
 
-    cfg = dict(b=2, s_q=NUM_DK_SHARDS // 2 + 1, s_kv=257, head_dim=128, qhead_per_kv_head=64, topk=512)
+    cfg = dict(b=2, s_q=NUM_DK_PRODUCER_CTAS // 2 + 1, s_kv=257, head_dim=128, qhead_per_kv_head=64, topk=512)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
     reference_topk_indices = topk_indices
     if topk_indices_global:
@@ -1074,7 +1076,8 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
     )
     assert plan.check_support()
     plan.compile()
-    expected = ws_align(deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"]))
+    expected = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"])
+    assert expected == ws_align(NUM_DK_PLANES * cfg["b"] * cfg["s_kv"] * cfg["head_dim"] * 4) + ws_align(NUM_DK_RELAY_COUNTERS * 4)
     assert plan.scratch_workspace_bytes() == expected
     workspace = torch.empty(expected, dtype=torch.uint8, device="cuda")
 
@@ -1143,16 +1146,17 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
 
 @pytest.mark.L1
 @pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+@pytest.mark.parametrize("s_q", [7, 17], ids=["short-cluster1", "uneven-cluster8"])
 @torch_fork_set_rng(seed=1703)
-def test_DSA_indexer_backward_deterministic_cuda_graph(backend):
-    """A warmed plan with fixed outputs/workspace is replay-safe."""
+def test_DSA_indexer_backward_deterministic_cuda_graph(backend, s_q):
+    """Short and uneven warmed plans with fixed scratch are replay-safe."""
     try:
         from cudnn import DSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_exact_sm100()
 
-    cfg = dict(b=1, s_q=17, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    cfg = dict(b=1, s_q=s_q, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
     attn = attn_source.clone()
     d_index_q = torch.empty_like(index_q)
