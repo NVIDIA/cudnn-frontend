@@ -20,12 +20,13 @@ from global (``STAGE_NONE``). The DX store (and, unstaged, the X/DY loads) are
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn, smem_capacity
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_capacity
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm._common_sm100 import (
     STAGE_BULK,
@@ -203,6 +204,7 @@ def _ln_bwd_host(
     vec: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     _ln_bwd_kernel(
         mDY,
@@ -221,7 +223,7 @@ def _ln_bwd_host(
         vec,
         has_mean,
         has_beta,
-    ).launch(grid=(R, 1, 1), block=(bt, 1, 1))
+    ).launch(stream=stream, grid=(R, 1, 1), block=(bt, 1, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +491,7 @@ def _ln_bwd_pipe_host(
     nchunk: cutlass.Constexpr,
     CHUNK: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDXi = cute.recast_tensor(mDX, it_ty)
     mGi = cute.recast_tensor(mGamma, it_ty)
@@ -516,8 +519,8 @@ def _ln_bwd_pipe_host(
         cache_xd,
         has_mean,
         has_beta,
-    ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1), smem=smem_bytes)
-    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, C, FB, CHUNK, has_beta).launch(grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
+    ).launch(stream=stream, grid=(ctas, 1, 1), block=(block_threads, 1, 1), smem=smem_bytes)
+    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, C, FB, CHUNK, has_beta).launch(stream=stream, grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +674,7 @@ def _ln_bwd_tiled_host(
     nchunk: cutlass.Constexpr,
     CHUNK: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDXi = cute.recast_tensor(mDX, it_ty)
     mGi = cute.recast_tensor(mGamma, it_ty)
@@ -692,8 +696,8 @@ def _ln_bwd_tiled_host(
         it_ty,
         eb,
         STAGES,
-    ).launch(grid=(ctas, 1, 1), block=(64, 1, 1), smem=smem_bytes)
-    _ln_bwd_finalize_kernel(mDGp, mDGp, mDGamma, mDGamma, ctas, C, FB, CHUNK, False).launch(grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
+    ).launch(stream=stream, grid=(ctas, 1, 1), block=(64, 1, 1), smem=smem_bytes)
+    _ln_bwd_finalize_kernel(mDGp, mDGp, mDGamma, mDGamma, ctas, C, FB, CHUNK, False).launch(stream=stream, grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
 _PIPE_STAGES = 2
@@ -840,9 +844,9 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
     key = ("pipe", params.io_dtype) + ce
     fn = _KPIPE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_pipe_host, *args, *ce)
+        fn = cute.compile(_ln_bwd_pipe_host, *args, *ce, fake_stream())
         _KPIPE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)
 
 
@@ -885,9 +889,9 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
     key = ("tiled", params.io_dtype) + ce
     fn = _KTILED.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_tiled_host, *args, *ce)
+        fn = cute.compile(_ln_bwd_tiled_host, *args, *ce, fake_stream())
         _KTILED[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return dx, dgamma, None
 
 
@@ -939,7 +943,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_host, *args, *ce)
+        fn = cute.compile(_ln_bwd_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

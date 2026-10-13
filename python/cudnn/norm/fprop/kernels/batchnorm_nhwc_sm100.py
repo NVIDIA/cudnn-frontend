@@ -27,12 +27,13 @@ See ``cudnn/norm/fprop/BN_FWD_NOTES.md`` for the measurements behind the knobs.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn, smem_budget, smem_per_sm
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -449,6 +450,7 @@ def _bn_nhwc_host(
     update_running: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
@@ -482,7 +484,7 @@ def _bn_nhwc_host(
         eps,
         has_beta,
         update_running,
-    ).launch(grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
+    ).launch(stream=stream, grid=(cblks, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
 
 
 # ---------------------------------------------------------------------------
@@ -560,10 +562,13 @@ def _bn_nhwc_infer_host(
     et: cutlass.Constexpr,
     eps: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
-    _bn_nhwc_infer_kernel(mXi, mYi, mG, mB, mRunMean, mRunVar, M, C, V, TPP, PPL, BT, it_ty, et, eps, has_beta).launch(grid=(cblks, nblk, 1), block=(BT, 1, 1))
+    _bn_nhwc_infer_kernel(mXi, mYi, mG, mB, mRunMean, mRunVar, M, C, V, TPP, PPL, BT, it_ty, et, eps, has_beta).launch(
+        stream=stream, grid=(cblks, nblk, 1), block=(BT, 1, 1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -650,9 +655,9 @@ def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, ru
         args = (dyn(x2d), dyn(y2d), dyn(gamma), dyn(beta), dyn(rm), dyn(rv), cutlass.Int32(M))
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_bn_nhwc_infer_host, *args, *ce)
+            fn = cute.compile(_bn_nhwc_infer_host, *args, *ce, fake_stream())
             _KCACHE[key] = fn
-        fn(*args)
+        fn(*args, cur_stream())
         # Inference still reports the statistics it normalised with.
         saved_mean.copy_(rm.float())
         saved_rstd.copy_((rv.float() + eps).rsqrt())
@@ -704,10 +709,10 @@ def forward(spec, x2d, gamma, beta, *, eps, momentum, training, running_mean, ru
             cutlass.Float32(momentum),
         )
         if fn is None:
-            fn = cute.compile(_bn_nhwc_host, *args, *ce)
+            fn = cute.compile(_bn_nhwc_host, *args, *ce, fake_stream())
             _KCACHE[key] = fn
         try:
-            fn(*args)
+            fn(*args, cur_stream())
             _OCC[okey] = occ
             return y2d, saved_mean, saved_rstd
         except Exception as e:  # COOPERATIVE_LAUNCH_TOO_LARGE -> retry at occ=1

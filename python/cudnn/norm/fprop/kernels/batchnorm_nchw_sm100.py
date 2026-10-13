@@ -43,12 +43,13 @@ See ``cudnn/norm/fprop/BN_FWD_NOTES.md``.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn, smem_budget, smem_per_sm
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -575,6 +576,7 @@ def _bn_nchw_host(
     update_running: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
@@ -612,7 +614,7 @@ def _bn_nchw_host(
         eps,
         has_beta,
         update_running,
-    ).launch(grid=(cparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
+    ).launch(stream=stream, grid=(cparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
 
 
 # ---------------------------------------------------------------------------
@@ -734,11 +736,12 @@ def _bn_nchw_infer_host(
     et: cutlass.Constexpr,
     eps: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
     _bn_nchw_infer_kernel(mX, mXi, mY, mYi, mG, mB, mRunMean, mRunVar, N, C, S, VS, UF, WPB, CPW, CT, BT, it_ty, et, eps, has_beta).launch(
-        grid=(cparts, nblk, 1), block=(BT, 1, 1)
+        stream=stream, grid=(cparts, nblk, 1), block=(BT, 1, 1)
     )
 
 
@@ -835,9 +838,9 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
         args = (dyn(xf), dyn(yf), dyn(gamma), dyn(beta), dyn(rm), dyn(rv), cutlass.Int32(N))
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_bn_nchw_infer_host, *args, *ce)
+            fn = cute.compile(_bn_nchw_infer_host, *args, *ce, fake_stream())
             _KCACHE[key] = fn
-        fn(*args)
+        fn(*args, cur_stream())
         saved_mean.copy_(rm.float())
         saved_rstd.copy_((rv.float() + eps).rsqrt())
         return y3d, saved_mean, saved_rstd
@@ -893,10 +896,10 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
         )
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_bn_nchw_host, *args, *ce)
+            fn = cute.compile(_bn_nchw_host, *args, *ce, fake_stream())
             _KCACHE[key] = fn
         try:
-            fn(*args)
+            fn(*args, cur_stream())
             _OCC[okey] = occ
             return y3d, saved_mean, saved_rstd
         except Exception as e:

@@ -27,13 +27,14 @@ never wait on each other.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn, run_coop, sm_count
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, run_coop, sm_count
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -365,6 +366,7 @@ def _in_bwd_nhwc_host(
     fcw: cutlass.Constexpr,
     fr: cutlass.Constexpr,
     fsmem: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
@@ -395,8 +397,8 @@ def _in_bwd_nhwc_host(
         it_ty,
         et,
         Mf,
-    ).launch(grid=(cblks, mparts, gridz), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
-    _in_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, N, C, fcw, fr, has_beta).launch(grid=(fgrid, 1, 1), block=(fcw * fr, 1, 1), smem=fsmem)
+    ).launch(stream=stream, grid=(cblks, mparts, gridz), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
+    _in_bwd_nhwc_finalize(mS1, mS2, mDGamma, mDBeta, N, C, fcw, fr, has_beta).launch(stream=stream, grid=(fgrid, 1, 1), block=(fcw * fr, 1, 1), smem=fsmem)
 
 
 _KCACHE = {}
@@ -459,9 +461,9 @@ def backward(spec, dy4d, x4d, gamma, mean, rstd, *, has_beta, cfg, params, knobs
         key = (params.io_dtype,) + ce
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_in_bwd_nhwc_host, *args, *ce)
+            fn = cute.compile(_in_bwd_nhwc_host, *args, *ce, fake_stream())
             _KCACHE[key] = fn
-        fn(*args)
+        fn(*args, cur_stream())
         return dx, dgamma, (dbeta if has_beta else None)
 
     return run_coop(("in_bwd", params.io_dtype, C, HW, N, KC, KS, has_beta), _run)

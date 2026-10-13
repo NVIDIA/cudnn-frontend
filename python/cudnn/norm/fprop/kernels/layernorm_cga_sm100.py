@@ -32,6 +32,7 @@ reproduce reliably.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
@@ -39,7 +40,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm._common_sm100 import shifted_stats
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import cur_stream, dyn, fake_stream
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
@@ -288,6 +289,7 @@ def _ln_fwd_cga_host(
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
     nctas: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
@@ -313,7 +315,7 @@ def _ln_fwd_cga_host(
         eps,
         has_mean,
         has_beta,
-    ).launch(grid=(nctas, 1, 1), block=(BT, 1, 1), cluster=(CGA, 1, 1))
+    ).launch(stream=stream, grid=(nctas, 1, 1), block=(BT, 1, 1), cluster=(CGA, 1, 1))
 
 
 _KCACHE = {}
@@ -348,7 +350,7 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None):
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_fwd_cga_host, *args, *ce)
+        fn = cute.compile(_ln_fwd_cga_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return y, mean, rstd

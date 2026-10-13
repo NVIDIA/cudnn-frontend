@@ -35,12 +35,13 @@ See ``cudnn/norm/fprop/BN_FWD_NOTES.md``.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn, smem_budget
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
@@ -434,6 +435,7 @@ def _bn_flat_host(
     STRADDLE: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
@@ -473,7 +475,7 @@ def _bn_flat_host(
         has_beta,
         update_running,
         STRADDLE,
-    ).launch(grid=(pparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
+    ).launch(stream=stream, grid=(pparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
 
 
 _KCACHE = {}
@@ -556,7 +558,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
     )
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_bn_flat_host, *args, *ce)
+        fn = cute.compile(_bn_flat_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return y3d, saved_mean, saved_rstd

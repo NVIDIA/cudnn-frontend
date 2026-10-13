@@ -35,13 +35,14 @@ row-too-big-but-enough-rows case, where the bounded staging alone is the fix.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn, sm_count, smem_capacity
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, sm_count, smem_capacity
 
 from .groupnorm_fast_sm100 import _gn_bwd_finalize_kernel, _vec_for, red_scratch_len
 
@@ -336,6 +337,7 @@ def _gn_bwd_cga_host(
     smem_bytes: cutlass.Constexpr,
     fbt: cutlass.Constexpr,
     fgrid: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
@@ -365,8 +367,8 @@ def _gn_bwd_cga_host(
         et,
         has_mean,
         has_beta,
-    ).launch(grid=(nctas, 1, 1), block=(bt, 1, 1), smem=smem_bytes, cluster=(CGA, 1, 1))
-    _gn_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, nparts, CPG, GPS, fbt, has_beta).launch(grid=(fgrid, 1, 1), block=(fbt, 1, 1))
+    ).launch(stream=stream, grid=(nctas, 1, 1), block=(bt, 1, 1), smem=smem_bytes, cluster=(CGA, 1, 1))
+    _gn_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, nparts, CPG, GPS, fbt, has_beta).launch(stream=stream, grid=(fgrid, 1, 1), block=(fbt, 1, 1))
 
 
 _KCACHE = {}
@@ -424,7 +426,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_bwd_cga_host, *args, *ce)
+        fn = cute.compile(_gn_bwd_cga_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

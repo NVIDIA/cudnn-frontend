@@ -18,13 +18,14 @@ fits is read exactly once (1R + 1W).
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn, run_coop, sm_count
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, run_coop, sm_count
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -256,6 +257,7 @@ def _in_fwd_nhwc_host(
     smem_bytes: cutlass.Constexpr,
     gridm: cutlass.Constexpr,
     gridn: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
@@ -284,7 +286,7 @@ def _in_fwd_nhwc_host(
         Mf,
         eps,
         has_beta,
-    ).launch(grid=(cblks, gridm, gridn), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
+    ).launch(stream=stream, grid=(cblks, gridm, gridn), block=(BT, 1, 1), smem=smem_bytes, cooperative=COOP)
 
 
 _KCACHE = {}
@@ -339,9 +341,9 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None):
         key = (params.io_dtype,) + ce
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_in_fwd_nhwc_host, *args, *ce)
+            fn = cute.compile(_in_fwd_nhwc_host, *args, *ce, fake_stream())
             _KCACHE[key] = fn
-        fn(*args)
+        fn(*args, cur_stream())
         return y, mean, rstd
 
     return run_coop(("in_fwd", params.io_dtype, C, HW, N, KC, has_beta), _run)

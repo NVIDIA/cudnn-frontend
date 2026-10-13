@@ -26,6 +26,7 @@ registers once, so the normalize is a pure streaming pass.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
@@ -33,7 +34,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.batchnorm_nchw_sm100 import nchw_cfg
-from cudnn.norm.utils import dyn, smem_budget, smem_per_sm
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget, smem_per_sm
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -409,6 +410,7 @@ def _bn_bwd_nchw_host(
     has_beta: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
@@ -442,7 +444,7 @@ def _bn_bwd_nchw_host(
         et,
         Mf,
         has_beta,
-    ).launch(grid=(cparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
+    ).launch(stream=stream, grid=(cparts, mparts, 1), block=(BT, 1, 1), smem=smem_bytes, cooperative=True, min_blocks_per_mp=mbpm)
 
 
 _KCACHE = {}
@@ -505,10 +507,10 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         )
         fn = _KCACHE.get(key)
         if fn is None:
-            fn = cute.compile(_bn_bwd_nchw_host, *args, *ce)
+            fn = cute.compile(_bn_bwd_nchw_host, *args, *ce, fake_stream())
             _KCACHE[key] = fn
         try:
-            fn(*args)
+            fn(*args, cur_stream())
             _OCC[okey] = occ
             return dx, dgamma, (dbeta if has_beta else None)
         except Exception as e:

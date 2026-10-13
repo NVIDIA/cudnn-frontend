@@ -40,6 +40,7 @@ byte budget and only the remainder, if any, is re-read.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
@@ -47,7 +48,7 @@ from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.fprop.kernels.layernorm_cga_sm100 import _MAX_CGA, _pick_cga
-from cudnn.norm.utils import dyn, sm_count
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, sm_count
 
 from .layernorm_sm100 import _ln_bwd_finalize_kernel
 
@@ -318,6 +319,7 @@ def _ln_bwd_cga_host(
     nchunk: cutlass.Constexpr,
     CHUNK: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
@@ -346,8 +348,8 @@ def _ln_bwd_cga_host(
         Cf,
         has_mean,
         has_beta,
-    ).launch(grid=(nctas, 1, 1), block=(BT, 1, 1), cluster=(CGA, 1, 1), smem=smem_bytes)
-    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, nclusters, C, FB, CHUNK, has_beta).launch(grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
+    ).launch(stream=stream, grid=(nctas, 1, 1), block=(BT, 1, 1), cluster=(CGA, 1, 1), smem=smem_bytes)
+    _ln_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, nclusters, C, FB, CHUNK, has_beta).launch(stream=stream, grid=(fgrid, nchunk, 1), block=(FB, 1, 1))
 
 
 _KCACHE = {}
@@ -402,7 +404,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
     key = (params.io_dtype, nclusters) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_bwd_cga_host, *args, *ce)
+        fn = cute.compile(_ln_bwd_cga_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

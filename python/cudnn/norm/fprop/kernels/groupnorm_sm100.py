@@ -13,11 +13,12 @@ but the affine channel for element ``(r, j)`` is
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import cur_stream, dyn, fake_stream
 from cudnn.norm._common_sm100 import (
     STAGE_BULK,
     STAGE_NONE,
@@ -162,6 +163,7 @@ def _gn_fwd_host(
     stage_mode: cutlass.Constexpr,
     vec: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     _gn_fwd_kernel(
         mX,
@@ -181,7 +183,7 @@ def _gn_fwd_host(
         stage_mode,
         vec,
         has_beta,
-    ).launch(grid=(R, 1, 1), block=(bt, 1, 1))
+    ).launch(stream=stream, grid=(R, 1, 1), block=(bt, 1, 1))
 
 
 _KCACHE = {}
@@ -216,7 +218,7 @@ def forward(spec, x2d, gamma, beta, *, eps, cfg, params):
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_fwd_host, *args, *ce)
+        fn = cute.compile(_gn_fwd_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return y, mean, rstd

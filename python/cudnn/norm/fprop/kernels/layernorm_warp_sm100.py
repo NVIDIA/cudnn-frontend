@@ -20,13 +20,14 @@ Selected by ``make_warp_cfg`` for LN/RMS (norm dim C == gamma length).
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn, smem_capacity
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_capacity
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
@@ -216,6 +217,7 @@ def _warp_fwd_host(
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
     mbpm: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
@@ -243,7 +245,7 @@ def _warp_fwd_host(
         full_warp,
         has_mean,
         has_beta,
-    ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1), min_blocks_per_mp=mbpm)
+    ).launch(stream=stream, grid=(ctas, 1, 1), block=(block_threads, 1, 1), min_blocks_per_mp=mbpm)
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +449,7 @@ def _warp_fwd_pipe_host(
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
     smem_bytes: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mXi = cute.recast_tensor(mX, it_ty)
     mYi = cute.recast_tensor(mY, it_ty)
@@ -475,7 +478,7 @@ def _warp_fwd_pipe_host(
         STAGES,
         has_mean,
         has_beta,
-    ).launch(grid=(ctas, 1, 1), block=(block_threads, 1, 1), smem=smem_bytes)
+    ).launch(stream=stream, grid=(ctas, 1, 1), block=(block_threads, 1, 1), smem=smem_bytes)
 
 
 # min CTAs/SM (launch_bounds minnctapersm). 0 = compiler default (measured: forcing
@@ -608,9 +611,9 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_warp_fwd_host, *args, *ce)
+        fn = cute.compile(_warp_fwd_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return y, mean, rstd
 
 
@@ -641,7 +644,7 @@ def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta):
     key = ("pipe", params.io_dtype) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_warp_fwd_pipe_host, *args, *ce)
+        fn = cute.compile(_warp_fwd_pipe_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return y, mean, rstd

@@ -28,12 +28,13 @@ short row is read exactly once.
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import cur_stream, dyn, fake_stream
 
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 _FULL = 0xFFFFFFFF
@@ -250,6 +251,7 @@ def _in_bwd_warp_host(
     ctas: cutlass.Constexpr,
     fgrid: cutlass.Constexpr,
     fbt: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
@@ -277,8 +279,8 @@ def _in_bwd_warp_host(
         et,
         has_mean,
         has_beta,
-    ).launch(grid=(ctas, 1, 1), block=(WPB * 32, 1, 1))
-    _in_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, W, GPS, fbt, has_beta).launch(grid=(fgrid, 1, 1), block=(fbt, 1, 1))
+    ).launch(stream=stream, grid=(ctas, 1, 1), block=(WPB * 32, 1, 1))
+    _in_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, W, GPS, fbt, has_beta).launch(stream=stream, grid=(fgrid, 1, 1), block=(fbt, 1, 1))
 
 
 _KCACHE = {}
@@ -342,7 +344,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     key = (params.io_dtype, ctas) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_in_bwd_warp_host, *args, *ce)
+        fn = cute.compile(_in_bwd_warp_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

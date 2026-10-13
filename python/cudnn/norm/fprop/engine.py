@@ -32,7 +32,13 @@ class _FrostNormPlan(CompiledPlan):
         return 0
 
     def execute(self, graph, variant_pack, ctx: ExecutionContext) -> None:
-        self._run(variant_pack)
+        from cudnn.norm.utils import on_stream
+
+        # Both the kernel launches and the output copies follow torch's current
+        # stream, so the handle's stream has to be made current for the whole
+        # call -- see on_stream().
+        with on_stream(getattr(ctx, "stream", None)):
+            self._run(variant_pack)
 
 
 class FrostNormFwdEngine(BaseEngine):

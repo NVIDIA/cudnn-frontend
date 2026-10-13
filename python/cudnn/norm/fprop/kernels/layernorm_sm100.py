@@ -19,11 +19,12 @@ Also serves RMSNorm via ``has_mean=False`` (see :mod:`rmsnorm_sm100`).
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.memory import SmemAllocator
 
-from cudnn.norm.utils import dyn
+from cudnn.norm.utils import cur_stream, dyn, fake_stream
 from cudnn.norm._common_sm100 import (
     STAGE_BULK,
     STAGE_CPASYNC,
@@ -165,6 +166,7 @@ def _ln_fwd_host(
     vec: cutlass.Constexpr,
     has_mean: cutlass.Constexpr,
     has_beta: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     _ln_fwd_kernel(
         mX,
@@ -182,7 +184,7 @@ def _ln_fwd_host(
         vec,
         has_mean,
         has_beta,
-    ).launch(grid=(R, 1, 1), block=(bt, 1, 1))
+    ).launch(stream=stream, grid=(R, 1, 1), block=(bt, 1, 1))
 
 
 _KCACHE = {}
@@ -214,7 +216,7 @@ def forward(spec, x2d, gamma, beta, *, eps, cfg, params):
     key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_ln_fwd_host, *args, *ce)
+        fn = cute.compile(_ln_fwd_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return y, mean, rstd

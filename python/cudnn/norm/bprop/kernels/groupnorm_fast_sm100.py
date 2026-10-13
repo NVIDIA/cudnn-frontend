@@ -30,13 +30,14 @@ back to global: traffic is then the minimal 3 units (read dy, read x, write dx).
 
 from __future__ import annotations
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
-from cudnn.norm.utils import dyn, smem_budget
+from cudnn.norm.utils import cur_stream, dyn, fake_stream, smem_budget
 
 _CTA_SS = nvvm.SharedSpace.shared_cta
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
@@ -279,6 +280,7 @@ def _gn_bwd_fast_host(
     smem_bytes: cutlass.Constexpr,
     fgrid: cutlass.Constexpr,
     fbt: cutlass.Constexpr,
+    stream: cuda.CUstream,
 ) -> None:
     mDYi = cute.recast_tensor(mDY, it_ty)
     mXi = cute.recast_tensor(mX, it_ty)
@@ -307,8 +309,8 @@ def _gn_bwd_fast_host(
         et,
         has_mean,
         has_beta,
-    ).launch(grid=(ctas, 1, 1), block=(bt, 1, 1), smem=smem_bytes)
-    _gn_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, CPG, GPS, fbt, has_beta).launch(grid=(fgrid, 1, 1), block=(fbt, 1, 1))
+    ).launch(stream=stream, grid=(ctas, 1, 1), block=(bt, 1, 1), smem=smem_bytes)
+    _gn_bwd_finalize_kernel(mDGp, mDBp, mDGamma, mDBeta, ctas, CPG, GPS, fbt, has_beta).launch(stream=stream, grid=(fgrid, 1, 1), block=(fbt, 1, 1))
 
 
 _KCACHE = {}
@@ -389,7 +391,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, cfg, params):
     key = (params.io_dtype, ctas) + ce
     fn = _KCACHE.get(key)
     if fn is None:
-        fn = cute.compile(_gn_bwd_fast_host, *args, *ce)
+        fn = cute.compile(_gn_bwd_fast_host, *args, *ce, fake_stream())
         _KCACHE[key] = fn
-    fn(*args)
+    fn(*args, cur_stream())
     return dx, dgamma, (dbeta if has_beta else None)

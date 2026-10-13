@@ -129,3 +129,69 @@ def smem_per_sm():
         prop = torch.cuda.get_device_properties(0)
         _SMEM_PER_SM = int(getattr(prop, "shared_memory_per_multiprocessor", 0)) or smem_capacity()
     return _SMEM_PER_SM
+
+
+_EXT_STREAMS: dict = {}
+
+
+def on_stream(raw):
+    """Context manager putting torch's current stream on the graph's execution stream.
+
+    The engines reach the GPU two ways -- CuTe kernel launches and torch ``copy_``
+    into the graph's output buffers -- and BOTH follow torch's current stream.
+    ``ExecutionContext.stream`` is the stream cuDNN was asked to run on
+    (``cudnn.set_stream(handle, ...)``), which is not necessarily torch's current
+    one, so without this the work lands on the wrong stream: a producer ordered
+    ahead of the norm on the requested stream was not waited for, and the norm
+    read the pre-producer input.
+
+    ``None`` means the context carried no stream, and torch's current one is
+    already the right answer. ``ExternalStream`` objects are cached because
+    building one per execute is pure overhead on the hot path.
+    """
+    import torch
+
+    if raw is None:
+        return torch.cuda.stream(None)  # no-op context
+    handle = int(raw)
+    if handle == 0:
+        return torch.cuda.stream(None)  # legacy default stream: torch's default already
+    s = _EXT_STREAMS.get(handle)
+    if s is None:
+        s = _EXT_STREAMS[handle] = torch.cuda.ExternalStream(handle)
+    return torch.cuda.stream(s)
+
+
+def fake_stream():
+    """The compile-time placeholder for a host function's trailing stream argument.
+
+    CuTe host functions do not pick up torch's current stream: a kernel launched
+    without an explicit ``stream=`` goes to the default stream whatever torch is
+    doing. So every norm host function takes a trailing ``stream`` and threads it
+    into each ``.launch``; this is what ``cute.compile`` is handed in its place.
+    """
+    from cutlass.cute.runtime import make_fake_stream
+
+    return make_fake_stream(use_tvm_ffi_env_stream=False)
+
+
+def cur_stream():
+    """Torch's current stream as a ``CUstream``, for the matching runtime argument.
+
+    The engines make the graph's execution stream current around the whole call
+    (see :func:`on_stream`), so reading it here is what carries
+    ``ExecutionContext.stream`` down to the launches. Cached per handle: building
+    a CUstream per launch is measurable on small norms.
+    """
+    import torch
+
+    h = torch.cuda.current_stream().cuda_stream
+    s = _CU_STREAMS.get(h)
+    if s is None:
+        from cuda.bindings import driver as _drv
+
+        s = _CU_STREAMS[h] = _drv.CUstream(h)
+    return s
+
+
+_CU_STREAMS: dict = {}
