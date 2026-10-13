@@ -877,6 +877,7 @@ def _on_plan_device(spec, name: str, f: BufferFacts) -> None:
     if f.device[0] != -1 and f.device != (_DLPACK_CUDA, spec.device_index):
         raise ValueError(f"cudnn.sdpa: " + (f"{name} must be on CUDA device {spec.device_index} (this plan's); got DLPack device {f.device}"))
 
+
 def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, Optional[BufferFacts]], k: BufferFacts, v: BufferFacts, b: int) -> int:
     """Bind the page pools and tables of a paged launch; returns SKV = max_pages * page_size. Shared by
     the THD and dense binders (one implementation of the paged domain)."""
@@ -934,6 +935,7 @@ def _bind_paged_kv(spec, frame: List[Any], ix: Dict[str, int], facts: Dict[str, 
     frame[ix["n_pages"]] = int(k.shape[0])
     return t_kv
 
+
 def _packed_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], name: str, heads: int, d: int, expect: str, *, tma: bool):
     """One PACKED (THD) operand of the ragged-Q leg -- the graph's (B, H, S_max, D) declaration or a
     (T, H, D) buffer -- as ``(ptr, token_stride, head_stride, token_capacity)``.  The batch stride is
@@ -953,11 +955,13 @@ def _packed_role(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]],
     capacity = _capacity(f, (ts, hs, 1, row), name)
     return f.ptr, ts, hs, capacity
 
+
 class _DenseRole(NamedTuple):
     ptr: int
     strides: Tuple[int, int, int]  # (batch, seq, head) element strides
     b: int
     s: int
+
 
 def _dense_role(
     spec: DenseLaunchSpec,
@@ -990,6 +994,7 @@ def _dense_role(
     if f.span >= 0 and f.span < need:
         raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; its geometry {tuple(f.shape)} / {tuple(f.strides)} needs {need}")
     return _DenseRole(f.ptr, bound, b, seq)
+
 
 def _ragged_lse(spec: DenseLaunchSpec, lse: Optional[BufferFacts], *, required: bool):
     """The ragged-Q leg's final Stats: the caller's PACKED ragged Stats buffer (Rule S1: token-major
@@ -1513,7 +1518,22 @@ class PreparedDenseLaunch:
         if self._combine_gate_index is not None:
             # One native crossing for G's facts, bound to the gated combine for this launch (no sync, no allocation).
             self.spec.combine.gate.bind(facts_of_roles(pack, [self._combine_gate_index])[0])
-        self.spec.native.execute(pack.native, self._native_indices, stream, workspace=workspace_ptr)
+        if self.spec.native is not None:
+            self.spec.native.execute(pack.native, self._native_indices, stream, workspace=workspace_ptr)
+            return
+        # The plans without a native binder (the score side outputs, the bias / kv_mask arms -- build_dense_spec leaves
+        # ``native`` None for exactly those; always dense half plans, never quantized) bind through the python frame from
+        # the pack's facts, validated per call by bind_dense / bind_dense_split.
+        facts = dict(zip(self._roles, facts_of_roles(pack, indices)))
+        if self.spec.combine is not None:
+            bound = bind_dense_split(self.spec, facts, workspace_ptr, stream, stream_int)
+            if bound is None:
+                return  # ragged-Q leg: no addressable token / empty producer -> no launch
+            frame, combine_args = bound
+            self.spec.fn(*frame)
+            self.spec.combine.fn(*combine_args)
+        else:
+            self.spec.fn(*bind_dense(self.spec, facts, stream, stream_int))
 
 
 _NATIVE_DENSE_ROLES = (
