@@ -49,7 +49,7 @@ def frost_l2norm_qk(
 ) -> None:
     """Grid over all q rows then all k rows, FWD_LANES lanes x (d // FWD_LANES)
     elements per row, FWD_ROWS_PER_GROUP consecutive rows per lane group: fp32 sums
-    of squares, rsqrt with the shared epsilon floor, normalized rows to the
+    of squares, rsqrt with the shared additive epsilon, normalized rows to the
     compact io workspace, inverse norms to their fp32 slots when the slots are
     given.  Accesses are
     indexed chunk-major, so the lanes of one access cover a contiguous span of

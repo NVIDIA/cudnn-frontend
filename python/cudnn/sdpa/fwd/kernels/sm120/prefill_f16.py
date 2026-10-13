@@ -1081,6 +1081,9 @@ class SM120FusedMultiHeadAttentionForward:
 
             # Load Q into registers.
             q_regs = self.load_q_tile(basic_params)
+            if cutlass.const_expr(PARAMS.negate_scores):  # attn_scale < 0; the host passes |attn_scale| (#1435)
+                for i in cutlass.range_constexpr(self.qk_d_frags * 4):
+                    q_regs[i] = q_regs[i] ^ cutlass.Int32(-2147450880)  # 0x80008000: every element's sign bit
 
             # Main attention loop.
             mask_steps = 1

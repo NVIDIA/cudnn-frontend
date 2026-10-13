@@ -84,9 +84,8 @@ from ._blockscaled_api import (
 )
 
 _BLOCK_SCALED_JAX_ERROR = (
-    "the block-scaled wgrad backend is not expressible as JAX arrays "
-    "(its B operand requires a K-major, token-innermost layout and fp4 operands are K-packed, "
-    "neither of which has a row-major equivalent); use torch tensors, or bfloat16 operands for the BF16 backend"
+    "the block-scaled wgrad class API is torch-only; for JAX MXFP8 pass sfa_tensor/sfb_tensor to "
+    "grouped_gemm_wgrad_wrapper_sm100 or grouped_gemm_wgrad_jax_sm100"
 )
 
 
@@ -270,7 +269,8 @@ def _wgrad_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_dims: tup
         return None
     tensor_shape = get_shape(tensor)
     tensor_stride = canonicalize_unit_dim_strides(tensor_shape, get_strides(tensor))
-    shape = tuple(None if index in dynamic_dims else int(value) for index, value in enumerate(tensor_shape))
+    dynamic = {dim % len(tensor_shape) for dim in dynamic_dims}
+    shape = tuple(None if index in dynamic else int(value) for index, value in enumerate(tensor_shape))
     stride = tuple(int(value) for value in tensor_stride)
     layout = stride if exact_stride else tuple(index for index, _ in sorted(enumerate(stride), key=lambda item: (item[1], tensor_shape[item[0]])))
     return (shape, layout, _convert_to_cutlass_data_type(tensor.dtype), get_device(tensor))
@@ -320,6 +320,35 @@ def grouped_gemm_wgrad_wrapper_sm100(
     descriptor_workspace: Optional[torch.Tensor] = None,
 ) -> TupleDict:
     """Compile and execute grouped GEMM wgrad through the selected backend API."""
+    if sfa_tensor is not None and detect_framework(a_tensor) == "jax":
+        from .jax_api import grouped_gemm_wgrad_jax_sm100
+
+        for name, rejected in (
+            ("output_mode", output_mode != "dense"),
+            ("wgrad_tensor", wgrad_tensor is not None),
+            ("wgrad_ptrs", wgrad_ptrs is not None),
+            ("global_scale_a", global_scale_a is not None),
+            ("global_scale_b", global_scale_b is not None),
+            ("sf_vec_size", sf_vec_size != 32),
+            ("sf_fp8_dtype_override", sf_fp8_dtype_override is not None),
+            ("current_stream", current_stream is not None),
+            ("descriptor_workspace", descriptor_workspace is not None),
+        ):
+            if rejected:
+                raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
+        return grouped_gemm_wgrad_jax_sm100(
+            a_tensor,
+            b_tensor,
+            offsets_tensor,
+            wgrad_dtype=wgrad_dtype if wgrad_dtype is not None else cutlass.BFloat16,
+            acc_dtype=acc_dtype if acc_dtype is not None else cutlass.Float32,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            accumulate_on_output=accumulate_on_output,
+            input_order=input_order,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+        )
     memo_key = (
         type(a_tensor),
         wrapper_operand_meta(a_tensor),
@@ -412,8 +441,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         output_mode,
         _wgrad_tensor_signature(a_tensor, dynamic_dims=(1,), exact_stride=False),
         _wgrad_tensor_signature(b_tensor, dynamic_dims=(0,), exact_stride=False),
-        _wgrad_tensor_signature(sfa_tensor, dynamic_dims=(1,), exact_stride=False),
-        _wgrad_tensor_signature(sfb_tensor, dynamic_dims=(1,), exact_stride=False),
+        _wgrad_tensor_signature(sfa_tensor, dynamic_dims=(-1,), exact_stride=False),
+        _wgrad_tensor_signature(sfb_tensor, dynamic_dims=(-1,), exact_stride=False),
         _wgrad_tensor_signature(offsets_tensor, exact_stride=True),
         _wgrad_tensor_signature(wgrad_tensor, exact_stride=True),
         _wgrad_tensor_signature(wgrad_ptrs, exact_stride=True),
@@ -489,3 +518,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
         current_stream=current_stream,
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)
+
+
+grouped_gemm_wgrad_wrapper_sm100.supports_canonical_layouts = True

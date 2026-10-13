@@ -579,6 +579,66 @@ def test_empty_ranking_output_rejected(monkeypatch):
     assert not g._planning_done
 
 
+def _any_facts(graph):
+    """A family analyzer for the empty-plan-list test: any record, so the family hook is consulted."""
+    return object()
+
+
+def _no_proposals(kind, facts, offered):
+    """A family hook that proposes nothing for every mode."""
+    return []
+
+
+def test_an_empty_plan_list_names_every_side(monkeypatch):
+    """When nothing proposes a plan the error says WHY on both sides: the backend's own rejection, every
+    python engine's decline reason, and the engines that accepted the graph but whose family proposed
+    nothing -- the failure-path twin of accepts() (heuristics.decline_reasons)."""
+    import cudnn
+    from cudnn._pygraph import cudnn_graph_not_supported
+    from cudnn._pygraph import pygraph as _graph_cls
+
+    class _Declines(StubEngine):
+        name = "stub_a"
+        engine_id = _FAKE + 1
+
+        def check_support(self, graph):
+            raise NotImplementedError("stub_a: no")
+
+    class _Accepts(StubEngine):
+        name = "stub_b"
+        engine_id = _FAKE + 2
+
+    _offer(monkeypatch, _Declines(), _Accepts(), analyzer=(__name__, "_any_facts"), heuristics=(__name__, "_no_proposals"))
+
+    def declining_backend(self):
+        raise cudnn_graph_not_supported("fake backend: no engine for this graph")
+
+    monkeypatch.setattr(_graph_cls, "_lower_backend_graph", declining_backend)
+    g = pygraph()
+    g.matmul(torch.randn(2, 2), torch.randn(2, 2))
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError) as exc:
+        g.create_execution_plans()
+    msg = str(exc.value)
+    assert msg.startswith("no engine — python or backend — proposed a plan for this graph"), msg
+    assert "the backend declined: fake backend: no engine for this graph" in msg, msg
+    assert "python engines declined: stub_a: no" in msg, msg
+    assert "python engines that accepted the graph but proposed no plan: stub_b" in msg, msg
+    assert not g._planning_done
+
+
+def test_decline_reasons_splits_the_decliners_from_the_accepters():
+    from unittest.mock import Mock
+
+    from cudnn.engines.heuristics import decline_reasons
+
+    a, b, c = Mock(), Mock(), Mock()
+    a.name, b.name, c.name = "a", "b", "c"
+    a.check_support.side_effect = NotImplementedError("a: nope")
+    b.check_support.return_value = None
+    c.check_support.side_effect = ImportError("c: no cutedsl extra")
+    assert decline_reasons([a, b, c], object()) == ({"a": "a: nope", "c": "c: no cutedsl extra"}, ["b"])
+
+
 def test_plan_count_is_the_whole_ranked_list(monkeypatch):
     """get_execution_plan_count() counts ONE list — python engines and backend
     engines alike (``graph.plans``), so a python-only graph reports its python

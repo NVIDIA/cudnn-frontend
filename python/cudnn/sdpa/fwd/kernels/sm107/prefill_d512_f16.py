@@ -242,6 +242,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     lpt_tile_coords,
     make_sdpa_helpers,
     o_epilogue_convert_store,
+    running_max_step_finite_sentinel,
 )
 
 # ----------------------------------------------------------------------------
@@ -270,6 +271,31 @@ else:
         f"prefill_sdpa_d512_f16 (SM107): DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 2=BF16, 3=FP16, or 4=TF32; FP8/MXFP8 ship in a separate kernel)"
     )
 OUT_STORAGE_DTYPE = STORAGE_DTYPE
+
+# softmax_scale_prefolded (graph.sdpa attn_scale_prefolded=True -> TemplateParams.softmax_scale_prefolded): the caller
+# multiplied Q by attn_scale * log2(e), so the raw QK^T already sits in the log2 domain and the softmax traces no
+# per-score scale -- the running max is the RAW tile max and the shift is `reg_S - m` (an FADD2 for the FFMA2 of the
+# scaled chain; numerically neutral, the adapter pins scale_softmax_log2 to exactly 1.0 and the kernel ignores the
+# argument).  Everything downstream of the shift -- alpha, the register row-sum, the (ell, max) ship to sg1, the sink
+# fold, the LSE and STATS_LOG2 -- consumes the log2-domain max and is unchanged.  A fully-masked tile leaves the raw
+# max exactly at the finite mask sentinel (== NEG_INF_F32); a tile that is dead AHEAD of the row's first live key is
+# selected out of the running state by running_max_step_finite_sentinel on both chains (total_max kept at the
+# sentinel, alpha = 1, shift 0 -> P = 0 on every column), the first live tile then starts the online softmax, and a
+# row with no live key at all is overridden by the epilogue's _row_empty geometry select.  The sentinel is never
+# multiplied under the fold, so the scaled-sentinel overflow the select also guards the other chain against
+# (-FLT_MAX * scale_log2 -> -inf, P = NaN) cannot occur here.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+if SCALE_PREFOLDED and IS_TF32:
+    raise ValueError(
+        "prefill_sdpa_d512_f16 (cc 10.7): softmax_scale_prefolded is wired for the BF16 / FP16 variants only (the TF32 variant applies the scale in-kernel)"
+    )
+# softmax_f16 (softmax_precision=HALF) is a quantized-kernel specialization: this body stores P in the input half
+# format straight off the f32 exponent, so it carries no f16x2 exponent arm and the fused shift + convert never traces.
+# The config backstop declines the knob for half inputs; the import-time check keeps a stale record from tracing the
+# default chain under the request (a silent no-op).
+if PARAMS.softmax_f16:
+    raise ValueError("prefill_sdpa_d512_f16 (cc 10.7): softmax_f16 is a quantized-kernel (FP8 / MXFP8) specialization (half inputs run the f32 exponent)")
+_FUSED_SHIFT_CVT = False
 
 
 # ----------------------------------------------------------------------------
@@ -1110,34 +1136,35 @@ def _sg0_softmax_kv_iter(
             s_addr_base,
             num_elems=CFG.TILE_N,
         )
-    current_max = current_max_raw * scale_log2
+    # current_max_raw is the tile's RAW row max -- exactly NEG_INF_F32 (the finite mask sentinel) iff every column of this
+    # tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Raw-domain max: Q carries attn_scale * log2(e) (SCALE_PREFOLDED, module header).
+        current_max = current_max_raw
+    else:
+        current_max = current_max_raw * scale_log2
 
     # All-thread DSMEM arrive on sg0 leader's mb_s_acc_empty (P11) —
     # doubles as the tmem_load_fence cross-warp sync.
     bars.mb_s_acc_empty[cur_parity_S].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-    # Online softmax (RESCALE_THRESHOLD skip).
-    old_total_max = total_max
-    is_first = total_max == NEG_INF_F32
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD_F32)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF_F32, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that and under the pre-folded scale every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF_F32, 0) and is published by the
+    # epilogue's _row_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_raw, current_max, total_max, NEG_INF_F32, RESCALE_THRESHOLD_F32, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF_F32.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
 
-    # reg_S = reg_S * scale_log2 - total_max; then exp2.
-    reg_S_scaled = reg_S_tile.vec * scale_log2 - total_max
+    # reg_S = reg_S * scale_log2 - new_total_max (pre-folded scale: reg_S - new_total_max); then exp2.  new_total_max is the
+    # running max, or 0 on a dead leading tile (every column of it then lands at exp2(sentinel) = +0).
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        reg_S_scaled = reg_S_tile.vec - new_total_max
+    else:
+        reg_S_scaled = reg_S_tile.vec * scale_log2 - new_total_max
     reg_P_fp32 = cute.math.exp2(reg_S_scaled, fastmath=True)
     reg_P_half_vec = reg_P_fp32.to(P_STORAGE_DTYPE)
     reg_P_half = RegTile(reg_P_half_vec, size=CFG.TILE_N)
@@ -2011,6 +2038,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     # BMM2 idesc — N per call = 256 (NOT TILE_O); 2 calls per BMM2.
     idesc_pv = prims.Tcgen05InstrDesc.build(

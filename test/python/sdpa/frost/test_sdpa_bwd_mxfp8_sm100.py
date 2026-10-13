@@ -201,6 +201,8 @@ def _run(
     d, dev = _D, "cuda"
     scale = 1.0 / math.sqrt(d)
     q, dO = torch.randn(b, hq, sq, d, device=dev), torch.randn(b, hq, sq, d, device=dev)
+    if omit_scale:  # attn_scale off the graph = no scaling (1.0); pre-scaled Q keeps the logits in their usual range
+        q, scale = q * scale, 1.0
     k, v = torch.randn(b, hkv, skv, d, device=dev), torch.randn(b, hkv, skv, d, device=dev)
     Q, K, V, DO = (_quantize(x, b, h, s, d) for x, h, s in ((q, hq, sq), (k, hkv, skv), (v, hkv, skv), (dO, hq, sq)))
 
@@ -326,7 +328,7 @@ def test_dense(out):
 
 @pytest.mark.L0
 def test_default_attn_scale():
-    """attn_scale is optional on the graph; the engine must default to 1/sqrt(d)."""
+    """attn_scale is optional on the graph; omitting it means no scaling (1.0), the backend's meaning."""
     _run(omit_scale=True)
 
 

@@ -630,7 +630,9 @@ def _run(
     stores) pre-fills the WORKSPACE before every run: a stage that reads a scratch region before writing it -- a stage-3
     GEMM reaching a dS tile the main kernel skipped -- then surfaces as NaN in an output instead of riding a stale zero.
     ``seq_lens=(seq_q_lens, seq_kv_lens)`` adds the padding mask.  ``attn_scale`` (None = 1/sqrt(d) on the graph and the
-    oracle alike) declares an EXPLICIT scale on both -- 0.0 included, a valid scale the adapters must preserve."""
+    oracle alike) declares an EXPLICIT scale on both -- 0.0 included, a valid scale the adapters must preserve.
+    ``omit_scale`` leaves attn_scale off the graph (no scaling, 1.0) and pre-scales Q by 1/sqrt(d) so the logits keep
+    their usual range."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -640,9 +642,11 @@ def _run(
 
     q, do = draw(b, sq, hq), draw(b, sq, hq)
     k, v = draw(b, skv, hkv), draw(b, skv, hkv)
+    if omit_scale:
+        q.mul_(_D**-0.5)
     if seq_lens is not None:
         keep = _padded_keep(sq, skv, *seq_lens) if keep is None else (keep & _padded_keep(sq, skv, *seq_lens))
-    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=attn_scale)
+    o64, lse64, all_masked, dq_r, dk_r, dv_r = _reference64(q, k, v, do, keep, group, scale=1.0 if omit_scale else attn_scale)
     o = _bshd_empty(b, sq, hq, _D, dt)
     o.copy_(o64.to(dt))
     lse = lse64.float()
@@ -739,7 +743,7 @@ def test_non_tile_multiple_causal(sq, skv):
 
 @requires_rubin
 def test_default_attn_scale():
-    """attn_scale is OPTIONAL on the graph; omitting it must mean 1/sqrt(d), which the oracle assumes either way."""
+    """attn_scale is OPTIONAL on the graph; omitting it means no scaling (1.0), the backend's meaning."""
     _run(omit_scale=True).check()
 
 
@@ -2218,10 +2222,11 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     """The half row's THD plan: declared totals tighten the token capacity (a MIN), the dS workspace is kv-BLOCKED at the
     kernel's 256-row block with every sequence padded to it, no staging and no batch chunking, the metadata region carries the
     main kernel's (5 + B) tensor maps, the GQA partials ride the packed kv capacity, and the two length operands join the launch record
-    (``length_form``)."""
+    (``length_form``) at slots 9 / 10, ahead of the appended standalone-only delta slot (``test_sdpa_bwd_thd_sm107.py`` holds its
+    contract)."""
     from cudnn.frost.tile_dsl.thd import THD_BWD_MAPS_META_WORDS
     from cudnn.sdpa.bwd.api_dsl_sm107 import SdpaBwdDslSm107
-    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, ROLES_F16_THD
+    from cudnn.sdpa.bwd.prepared_sm107 import ATTRIBUTES_F16_THD, EXTERNAL_DELTA_ROLE, ROLES_F16_THD
 
     api = _adapter(SdpaBwdDslSm107, b=3, hq=4, hkv=2, sq=300, skv=500, thd=True, max_total_seq_len_q=628, max_total_seq_len_kv=5000)
     assert api.check_support()
@@ -2233,7 +2238,8 @@ def test_half_adapter_admits_thd_and_sizes_its_packed_workspace_at_build():
     assert plan["seq_kv"] == (THD_BWD_MAPS_META_WORDS(3, 8),) and plan["desc_words"] == (4 * 16,)
     assert plan["dv_part"] == (1, 1500, 4, 256) and plan["dk_part"] == (1, 1500, 4, 256) and "q_pad" not in plan and "k_pad" not in plan
     assert api._template_params().thd_varlen and not api._template_params().seq_kv_lens_present
-    assert ROLES_F16_THD[-2:] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[-2:] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 11
+    assert ROLES_F16_THD[9:11] == ("seq_q", "seq_kv") and ATTRIBUTES_F16_THD[9:11] == ("seq_len_q", "seq_len_kv") and len(ROLES_F16_THD) == 12
+    assert ROLES_F16_THD[-1] == ATTRIBUTES_F16_THD[-1] == EXTERNAL_DELTA_ROLE, "the delta slot is appended LAST, after the two lengths"
     # The stage-3 records under THD: the THD arm on, rows KV-major, the SAME two-sided trim as the dense records (per sequence
     # in the template: a constant shift of 0, bottom-right spelled as `thd_causal_bottom_right`), dQ once per head chunk.
     from cudnn.sdpa.bwd.config_sm100 import CAUSAL_K_HI, CAUSAL_K_LO, CAUSAL_K_NONE, validate_matmul_params
@@ -2437,8 +2443,9 @@ def test_half_adapter_external_delta_is_a_plan_fact_that_drops_the_region(monkey
     assert own.scratch_workspace_bytes() - ext.scratch_workspace_bytes() == ws_align(2 * 8 * 512 * 4)
     assert (own._b_chunk, own._qh_chunk, own._sq_pad, own._skv_pad) == (ext._b_chunk, ext._qh_chunk, ext._sq_pad, ext._skv_pad)
     e4m3 = torch.float8_e4m3fn
-    # The quantized rows take the flag too (DENSE only; their THD plans decline it): the carve drops ``delta`` under it and the
-    # standalone-only role is appended LAST on both role lists (after the per-batch kv lengths).  The fp8 kernel reads delta in
+    # The quantized rows take the flag too (the dense plans here; their THD plans serve it as well -- test_sdpa_bwd_thd_*_sm107.py):
+    # the carve drops ``delta`` under it and the standalone-only role is appended LAST on both role lists (after the per-batch kv
+    # lengths).  The fp8 kernel reads delta in
     # TRUE units unscaled, so a caller's bf16-derived delta binds AS IS; the mxfp8 delta is the dot of the f16 ports.
     for api_ext, api_own in (
         (_adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3, external_delta=True), _adapter(SdpaBwdDslSm107Fp8, dt=e4m3, grad_dt=e4m3)),
@@ -2496,7 +2503,7 @@ def test_prepared_bwd_launch_frames_only_the_declared_standalone_only_roles_as_a
         assert roles[-2:] == ("seq_kv", delta) and attributes[-2:] == ("seq_len_kv", delta) and len(roles) == len(attributes), roles[-2:]
     binding = SimpleNamespace(q=_Bound(11, (1, 2, 512, 256), (262144, 256, 512, 1)), stats=_Bound(12, (1, 2, 512, 1), (1024, 512, 1, 1)))
     base = dict(artifact=None, fn=None, operands=(), workspace_bytes=0, device_index=0, scale=1.0, name="probe")
-    spec = BwdLaunchSpec(**base, roles=("q", "stats", delta), attributes=("q", "stats", delta), standalone_only_roles=(delta,))
+    spec = BwdLaunchSpec(**base, roles=("q", "stats", delta), attributes=("q", "stats", delta), standalone_only_roles=(delta,), native_binding=False)
     launch = PreparedBwdLaunch(spec, binding)
     assert launch._roles == ["q", "stats"] and launch._uids == [11, 12]
     assert launch._geometry[:2] == (((1, 2, 512, 256), (262144, 256, 512, 1)), ((1, 2, 512, 1), (1024, 512, 1, 1))) and launch._geometry[2] is None
@@ -2504,7 +2511,7 @@ def test_prepared_bwd_launch_frames_only_the_declared_standalone_only_roles_as_a
         PreparedBwdLaunch(replace(spec, standalone_only_roles=()), binding)
     with pytest.raises(AttributeError, match="statz"):  # a misspelled role is still a plan-build failure, declaration or not
         PreparedBwdLaunch(replace(spec, attributes=("q", "statz", delta)), binding)
-    assert BwdLaunchSpec(**base).standalone_only_roles == (), "the default: every role is a graph attribute"
+    assert BwdLaunchSpec(**base, native_binding=False).standalone_only_roles == (), "the default: every role is a graph attribute"
 
 
 def test_prepared_sm107_bind_holds_the_two_appended_slots_independently():
@@ -2545,6 +2552,7 @@ def test_prepared_sm107_bind_holds_the_two_appended_slots_independently():
             attributes=attributes,
             scale_log2=False,
             standalone_only_roles=(prepared_sm107.EXTERNAL_DELTA_ROLE,),
+            native_binding=False,
         )
         for give_lens, give_delta in product((False, True), repeat=2):
             facts = {"seq_kv": facts_of_tensor(lens if give_lens else None), "delta": facts_of_tensor(delta if give_delta else None)}

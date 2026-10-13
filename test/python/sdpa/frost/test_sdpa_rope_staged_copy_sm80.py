@@ -91,6 +91,7 @@ def _forward_case(dtype=torch.bfloat16, *, staged=True, wide=None):
     )
     assert api.check_support()
     api.compile()
+    assert api._sm80_copy_spec.core.native is not None
     size = api.scratch_workspace_bytes()
     workspace = torch.empty(size, device="cuda", dtype=torch.uint8) if size else None
     return api, values, workspace, owners

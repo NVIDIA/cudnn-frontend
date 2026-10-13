@@ -91,6 +91,8 @@ def workspace_bytes(api):
 def compile_plan(api):
     compact, operands, regions, required = _layout(api)
     compact.compile()
+    if compact._dense_spec.native is None:
+        raise RuntimeError("staged forward requires its core template's native binder")
     api._k_mod = compact._k_mod
     if hasattr(compact, "kernel_template"):
         api.kernel_template = compact.kernel_template
@@ -124,12 +126,31 @@ def _copy(entry, frame, stream):
     entry[1](*frame, stream)
 
 
+def _bind_core(spec, facts, workspace, stream, scale):
+    """Bind the same native contract as direct execution, before any staging write."""
+    from .prepared import _native_pack_from_facts
+
+    pack = _native_pack_from_facts(facts, spec.native_roles)
+    indices = spec.native_indices
+    combine, identity = None, 0
+    if spec.quant is not None:
+        frame, combine, identity = spec.native.bind_quantized(pack, indices, workspace, stream)
+    elif spec.combine is not None:
+        frame, combine = spec.native.bind_split(pack, indices, workspace, stream)
+    else:
+        frame = spec.native.bind(pack, indices, stream)
+    frame = list(frame)
+    frame[spec.index["scale_softmax_log2"]] = scale * math.log2(math.e)
+    return frame, combine, identity
+
+
 def execute(api, tensors, workspace, stream, scale):
     from cudnn._device import ensure_current_context as _ensure_current_context
     from .api_dsl import _torch_stream_context
     from cudnn._torch_stream import _raw_current_stream
     from cuda.bindings import driver as cuda
-    from .prepared import BufferFacts, _bind_block_output, bind_dense, bind_dense_split, execute_quantized, facts_of_tensor
+    from cudnn.frost import buffers as _buffers
+    from .prepared import BufferFacts, facts_of_tensor
 
     staged = api._staged_spec
     label = staged.label
@@ -167,10 +188,8 @@ def execute(api, tensors, workspace, stream, scale):
             facts[role] = facts_of_tensor(t)
         f = facts[role]
         ends.append((role, f.ptr, f.ptr + f.span * t.element_size()))
-    if spec.quant is not None and spec.quant.block_output is not None:
-        # SF output must not alias the original Q/K/V/O either: after gather,
-        # the core binder sees only their workspace replacements.
-        _bind_block_output(spec, facts)
+    sf_o = facts.get("sf_o")
+    block = spec.quant.block_output if spec.quant is not None else None
     amax = facts.get("amax_o")
     ws_end = base + staged.workspace_bytes
     for role, ptr, end in ends:
@@ -180,6 +199,11 @@ def execute(api, tensors, workspace, stream, scale):
         # check against the caller's original operands as well.
         if amax is not None and role != "amax_o" and amax.device == facts[role].device and amax.ptr < end and ptr < amax.ptr + 4:
             raise ValueError(f"{label} amax_o overlaps {role}")
+        # The native core validates SF_O's dtype, atom extent and aliases
+        # against its compact operands. Preserve aliases against the original
+        # carriers too: staging replaces those addresses in the core frame.
+        if block is not None and sf_o is not None and role != "sf_o" and sf_o.device == facts[role].device and sf_o.ptr < end and ptr < sf_o.ptr + block.nbytes:
+            raise ValueError(f"{label} sf_o overlaps {role}")
     # Each copy binds fresh source/destination pointers. No torch views or
     # allocations are needed to expose the caller's scratch storage.
     copy_frames = []
@@ -204,10 +228,6 @@ def execute(api, tensors, workspace, stream, scale):
             facts[role] = temp
         copy_frames.append((tuple(sources), tuple(destinations), tuple(source_strides), tuple(destination_strides)))
 
-    def gather():
-        if copy_frames[0] is not None:
-            _copy(staged.copies[0], copy_frames[0], stream_int)
-
     # Resolve the Q device's current stream, even if another GPU is ambient.
     # Keep that device active through both the torch copies and driver launches.
     device_context = nullcontext() if torch.cuda.current_device() == device.index else torch.cuda.device(device)
@@ -219,25 +239,21 @@ def execute(api, tensors, workspace, stream, scale):
         stream_int = int(stream)
         _ensure_current_context(stream_int, device.index)
         with context:
+            frame, combine, identity = _bind_core(spec, facts, base, stream, scale)
+            if copy_frames[0] is not None:
+                _copy(staged.copies[0], copy_frames[0], stream_int)
+            if identity:
+                _buffers.fill_word_async(identity, 1, _buffers.init_word("fp32", 1.0), stream_int)
+            spec.fn(*frame)
+            if spec.combine is not None:
+                spec.combine.fn(*combine)
             if spec.quant is not None:
-                execute_quantized(spec, facts, base, stream, stream_int, scale_softmax_log2=scale * math.log2(math.e), stage_inputs=gather)
                 if label.startswith("SM12"):
                     api._logger.debug("execute (SM120 FP8 per-tensor) completed")
                 elif api._pertensor:
                     api._logger.debug("execute (FP8 per-tensor) completed")
                 else:
                     api._logger.debug("execute (MXFP8) completed")
-            else:
-                combine = None
-                if spec.combine is not None:
-                    frame, combine = bind_dense_split(spec, facts, base, stream, stream_int)
-                else:
-                    frame = bind_dense(spec, facts, stream, stream_int)
-                frame[spec.index["scale_softmax_log2"]] = scale * math.log2(math.e)
-                gather()
-                spec.fn(*frame)
-                if combine is not None:
-                    spec.combine.fn(*combine)
             if copy_frames[1] is not None:
                 _copy(staged.copies[1], copy_frames[1], stream_int)
             if spec.quant is None:

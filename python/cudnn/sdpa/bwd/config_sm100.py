@@ -227,7 +227,9 @@ class MatmulTemplateParams:
     # BF16 on the fp8 arm (the DESCALE true-unit value).  E4M3 needs EPI_QUANT;
     # FP32 (the per-Q-head partial a GQA fold sums in fp32 and rounds ONCE --
     # a bf16 partial would be rounded a second time by the fold) needs
-    # EPI_DESCALE and renders the 32-element (128-B) epilogue staging row.
+    # EPI_DESCALE on the per-tensor fp8 arm or EPI_NONE on the block-scale arm
+    # (there the MMA dequantizes: the accumulator IS the true-unit value), and
+    # renders the 32-element (128-B) epilogue staging row either way.
     dtype_out: int = -1
     # The band's SECOND edge (append-only, defaulted: every rendering that existed
     # before these two fields -- the SM100 d512 chain's ten, the sm107 dense and
@@ -390,17 +392,11 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
             f"SDPA bwd stage 3: block_scale dequantizes IN the MMA (the fp32 accumulator is the true-unit gradient), so its epilogue is EPI_NONE -- "
             f"a descale / quantize epilogue (epi_mode={epi_mode}) belongs to the per-tensor fp8 arm."
         )
-    if block_scale and int(getattr(params, "b_head_group", 1)) != 1:
-        # The ONE check that lifts this: the SFB load already takes B's grouped head (`_b_head(tile_h)`), so a grouped block-scale
-        # dQ needs only the host's SFB view windowed to the `n_head // b_head_group` kv heads -- and a Rubin twin of
-        # `test_stage3_single_launch_dq_is_bitwise_the_per_member_launches` on the block-scale arm (dense and THD) proving the
-        # single launch bitwise the per-member launches.  Until that twin is green the arm launches dQ once per group member.
-        raise ValueError(
-            f"SDPA bwd stage 3: block_scale indexes its B scale-factor descriptor per A / C head, so a block-scale record keeps b_head_group == 1 "
-            f"(the dQ GEMM runs once per GQA group member); got b_head_group={params.b_head_group}.  The single-launch dQ (b_head_group == the "
-            f"group) is the plain renderings' form; the block-scale arm takes it once its SFB view is windowed to the kv heads and the "
-            f"single launch is proven bitwise the per-member launches on the device."
-        )
+    # `b_head_group` is admitted on the block-scale arm exactly as on the plain renderings (1, or the GQA group of the dQ GEMM): the
+    # SFB load takes B's grouped head (`_b_head(tile_h)`) and the host windows the SFB view to the `n_head // b_head_group` kv heads
+    # (`prepared_host._stage3_block_scale`), so one launch over a whole head chunk pairs every Q head with its K head and its K
+    # scales -- bitwise the per-member launches (the Rubin twins on the MXFP8 row, dense and THD).  The positive-int check is below;
+    # a value that is neither 1 nor the runtime group is refused by `prepared_host._dq_launches` at trace time.
     if (epi_mode != EPI_NONE) != (fp8 and not block_scale):
         raise ValueError(
             f"SDPA bwd stage 3: the descale / quantize epilogue (epi_mode={epi_mode}) belongs to the fp8 arm and the fp8 arm requires one: an e4m3 dS "
@@ -412,10 +408,12 @@ def validate_matmul_params(params: MatmulTemplateParams) -> None:
         raise ValueError(f"SDPA bwd stage 3: dtype_out must be -1 (inherit), DTYPE_BF16, DTYPE_FP16, DTYPE_E4M3 or DTYPE_FP32; got {params.dtype_out}.")
     if out == DTYPE_E4M3 and epi_mode != EPI_QUANT:
         raise ValueError("SDPA bwd stage 3: an E4M3 output needs EPI_QUANT (an unscaled fp8 store of the accumulator has no consumer).")
-    if out == DTYPE_FP32 and epi_mode != EPI_DESCALE:
+    if out == DTYPE_FP32 and not (epi_mode == EPI_DESCALE or (block_scale and epi_mode == EPI_NONE)):
         raise ValueError(
-            "SDPA bwd stage 3: an FP32 output is the DESCALE epilogue's per-Q-head true-unit partial (a GQA fold sums it in fp32 and rounds "
-            f"once); a quantized gradient (EPI_QUANT) or an unscaled accumulator store (EPI_NONE) has no fp32 consumer; got epi_mode={epi_mode}."
+            "SDPA bwd stage 3: an FP32 output is the DESCALE epilogue's per-Q-head true-unit partial on the per-tensor fp8 arm, or the "
+            "block-scale arm's EPI_NONE partial (the MMA dequantizes: the accumulator is the true-unit value) -- a GQA fold sums either in fp32 "
+            "and rounds once; a quantized gradient (EPI_QUANT) or an unscaled per-tensor accumulator store (EPI_NONE without block_scale) has "
+            f"no fp32 consumer; got epi_mode={epi_mode}, block_scale={block_scale}."
         )
     if not fp8 and out != params.dtype_qkv:
         raise ValueError(f"SDPA bwd stage 3: the bf16 / fp16 rows store the io dtype (dtype_out must be -1 or dtype_qkv={params.dtype_qkv}); got {out}.")

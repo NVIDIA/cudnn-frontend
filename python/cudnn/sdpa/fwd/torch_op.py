@@ -46,6 +46,8 @@ import torch
 import cudnn
 from cudnn.sdpa.varlen_metadata import prepare_varlen_metadata
 
+__all__ = ["sdpa"]
+
 _logger = logging.getLogger(__name__)
 
 _TORCH_DTYPE_TO_CUDNN = {

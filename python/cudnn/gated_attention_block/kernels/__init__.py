@@ -25,6 +25,11 @@ stage of the pipeline in ``api.py``::
     fp8_bwd_fused.py            the quantized BACKWARD's two fused small-kernel launches -- PROLOGUE (scalar init,
                                 dY amax partials, the Q / K rebuild with its e4m3 epilogue, v8) and EPILOGUE (dW_norm
                                 reduce, dqkvg quantize): block-range dispatch over the standalone kernels' bodies
+    quantize_mxfp8.py           (3q, MXFP8): the block quantize pass -- rowwise / columnwise, the SDPA and the GEMM-canonical
+                                SF layouts, and the DUAL-AXIS arm (both quantizations from one read)
+    mxfp8_bwd_fused.py          the MXFP8 BACKWARD's two fused launches -- PROLOGUE (scalar init, dY amax partials, the Q / K
+                                rebuild with its MX epilogue: q8 / q_T8 / k8 / k_T8 from a 32-token tile, v8) and EPILOGUE
+                                (dW_norm reduce, the dual-axis canonical dqkvg cast): block-range dispatch over the bodies
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the

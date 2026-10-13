@@ -176,8 +176,9 @@ _IO_DTYPE = _DSL_DTYPES[int(PARAMS.dtype_qkv)]
 _IS_FP8 = int(PARAMS.dtype_qkv) == DTYPE_E4M3
 _AB_BPE = _IO_DTYPE.width // 8
 # D dtype: the io dtype on the bf16 / fp16 rows; on the fp8 arm the gradient dtype (QUANT) or the fp32 per-Q-head true-unit
-# partial (DESCALE: the GQA fold sums it in fp32 and rounds ONCE -- `validate_matmul_params` pins FP32 to DESCALE).  FP32 is an
-# OUTPUT-only code: it never reaches `_IO_DTYPE`.
+# partial (DESCALE on the per-tensor arm, EPI_NONE on the block-scale arm whose MMA already dequantized: the GQA fold sums it in
+# fp32 and rounds ONCE -- `validate_matmul_params` admits FP32 for exactly those two).  FP32 is an OUTPUT-only code: it never
+# reaches `_IO_DTYPE`.
 _OUT_DTYPE = {**_DSL_DTYPES, DTYPE_FP32: cutlass.Float32}[matmul_out_dtype(PARAMS)]
 _CD_BPE = _OUT_DTYPE.width // 8
 epi_mode = int(getattr(PARAMS, "epi_mode", EPI_NONE))
@@ -432,8 +433,9 @@ acc_widen_to_fp32 = False
 ab_tma_dtype = _IO_DTYPE
 mma_kind = nvvm.Tcgen05MMAKind.F8F6F4 if _IS_FP8 else nvvm.Tcgen05MMAKind.F16
 # The epilogue drains a tile in `epi_n`-column subtiles, one staging ROW of `epi_row_elems` D elements per lane: 64 elements
-# = 128 B (bf16 / fp16) or 64 B (e4m3 out), 32 elements = 128 B at the fp32 DESCALE partial (a 64-element fp32 row would be
-# 256 B -- past the 128-B swizzle atom and a 2-way bank conflict per lane).  Same SMEM bytes per stage either way; the fp32
+# = 128 B (bf16 / fp16) or 64 B (e4m3 out), 32 elements = 128 B at the fp32 partial (the DESCALE partial or the block-scale arm's
+# EPI_NONE partial; a 64-element fp32 row would be 256 B -- past the 128-B swizzle atom and a 2-way bank conflict per lane).  Same
+# SMEM bytes per stage either way; the fp32
 # arm drains twice the subtiles (8 x 32 at d = 256) and stores twice the bytes, which IS the fp32 partial's cost.
 epi_row_elems = 32 if _CD_BPE == 4 else 64
 epi_n = epi_row_elems
@@ -2448,7 +2450,10 @@ def _host(
     # strides are in BYTES:
     #   sfa_0  (512 B atom, K tiles, M tiles, H, B)   over the A operand's F8_128x4 atoms [B, H, M/128, K/128, 512]
     #   sfb_0  (512 B atom, D planes, K tiles, H, B)  over the columnwise B SF, D-plane-major (plane stride = B*H*tiles atoms)
-    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1)
+    #          -- or, under THD, the PACKED per-sequence-tile view `_sf_planes_view_thd` (plane stride one atom, B = 1).
+    #          Its H is B's OWN head extent, `n_head // b_head_group`: under a grouped dQ record the host hands the view windowed
+    #          to the kv heads and the SFB coordinate takes `tile_h_b = _b_head(tile_h)` exactly like B's (dense and THD alike),
+    #          so one launch covers a whole head chunk; the tensor map is sized from this view's shape.
     sfa_0: Optional[cute.Tensor] = None,
     sfb_0: Optional[cute.Tensor] = None,
     # The block-scale arm's THD leg (TRAILING, defaulted): the int32 `[cu_sf_q(B+1) | cu_sf_k(B+1)]` per-sequence SF TILE prefixes

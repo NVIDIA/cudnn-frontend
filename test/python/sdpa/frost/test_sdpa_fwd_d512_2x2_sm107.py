@@ -11,7 +11,11 @@ S_q = S_kv = 512 = the cluster-union bounds; SWA with empty tiles + q-trim; sink
 bitwise twin through the direct template ABI, and the multi-tile PERSISTENT detector for the pair-wide O u V alias gate
 (several tiles per CTA so every tile boundary runs the twin-multicast V(t+1) against the previous O(t) store; two
 back-to-back launches must be bitwise equal).  The shared cells and helpers come from the SM100 2x2 test module, which
-this file imports the way the per-arch dsl suites import test_sdpa_fwd_dsl_sm100."""
+this file imports the way the per-arch dsl suites import test_sdpa_fwd_dsl_sm100.
+
+The pre-folded softmax scale (TemplateParams.softmax_scale_prefolded / graph.sdpa ``attn_scale_prefolded``, the kernel's
+SCALE_PREFOLDED arm) runs as a second arm of the graph-API, SWA + q-trim, sink + Stats, THD, directed-numerics and
+CGA twin cells ("fold" ids), plus the exact-elision oracle against the scaled chain on the direct template ABI."""
 
 import importlib.util
 import math
@@ -36,6 +40,57 @@ _D = 512
 _TOL = _t2x2._TOL
 _run_graph = _t2x2._run_graph
 _DTYPES, _DTYPE_IDS = _t2x2._DTYPES, _t2x2._DTYPE_IDS
+
+# ------------------------------------------------------------------------------ the pre-folded softmax scale (fold arm)
+# TemplateParams.softmax_scale_prefolded / graph.sdpa attn_scale_prefolded on the 2x2 kernel (SCALE_PREFOLDED: the raw row
+# max and the FADD2 shift, no per-score scale).  The HOST multiplies Q by attn_scale * log2(e) (in f32, then the input
+# dtype), the graph leaves attn_scale unset, and the reference runs on the Q the kernel saw with ln 2 as its logit scale.
+# Every lever-bearing cell below runs both arms: "float" (the scaled chain) and "fold".
+_FOLD = [False, True]
+_FOLD_IDS = ["float", "fold"]
+_LOG2E = math.log2(math.e)
+_LN2 = math.log(2.0)  # _LN2 * _LOG2E == 1.0 exactly in double: the fold's direct-ABI launches hand the kernel scale_log2 = 1.0
+_LSE_TOL = dict(atol=5e-4, rtol=0.0)  # natural-log LSE against the float64 oracle, both arms (the fold keeps the Stats domain)
+_GARBAGE_SCALE = -5.0  # a runtime scale no live chain survives: a negative max flips the shift, the P tail overflows
+
+
+def _fold_q(q, scale):
+    """The caller's side of the pre-folded contract: Q * attn_scale * log2(e), rounded once to the input dtype."""
+    return (q.float() * (scale * _LOG2E)).to(q.dtype)
+
+
+def _arm(q, scale, fold, sdpa_kwargs=None):
+    """(q_in, graph attn_scale, sdpa kwargs, reference scale) for one arm.  The fold pre-multiplies Q on the host, leaves
+    attn_scale unset (None is dropped by the graph builder) and sets the op attribute; its reference uses ln 2 on the
+    folded Q -- exactly the logits the kernel saw."""
+    kw = dict(sdpa_kwargs or {})
+    if not fold:
+        return q, scale, kw, scale
+    kw["attn_scale_prefolded"] = True
+    return _fold_q(q, scale), None, kw, _LN2
+
+
+def _lse64(q, k, scale, *, causal=False, swa_window=None, seq_q_lens=None, seq_kv_lens=None, sink=None):
+    """float64 natural-log LSE oracle on BHSD inputs with _dsl._ref_sdpa_full's top-left mask semantics: GQA by expansion,
+    causal, sliding window, per-batch q / kv lengths (rows at or past seq_len_q are -inf), the sink as one extra column."""
+    b, hq, sq, _ = q.shape
+    skv = k.shape[2]
+    dev = q.device
+    s = (q.double() @ k.double().repeat_interleave(hq // k.shape[1], 1).transpose(-1, -2)) * scale
+    i = torch.arange(sq, device=dev).view(1, 1, sq, 1)
+    j = torch.arange(skv, device=dev).view(1, 1, 1, skv)
+    q_lens = seq_q_lens.view(b, 1, 1, 1).long() if seq_q_lens is not None else torch.full((b, 1, 1, 1), sq, device=dev)
+    kv_lens = seq_kv_lens.view(b, 1, 1, 1).long() if seq_kv_lens is not None else torch.full((b, 1, 1, 1), skv, device=dev)
+    dead_q = i >= q_lens
+    masked = dead_q | (j >= kv_lens)
+    if causal:
+        masked = masked | (j > i)
+    if swa_window is not None:
+        masked = masked | (j < i - swa_window)
+    s = s.masked_fill(masked, float("-inf"))
+    if sink is not None:
+        s = torch.cat([s, sink.double().view(1, hq, 1, 1).expand(b, hq, sq, 1)], dim=-1)
+    return torch.logsumexp(s, dim=-1).masked_fill(dead_q.squeeze(-1), float("-inf"))
 
 
 @pytest.fixture
@@ -66,19 +121,22 @@ def _load_2x2(params, cga_m, tag):
 
 @requires_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("fold", _FOLD, ids=_FOLD_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @pytest.mark.parametrize("is_causal", [False, True], ids=["dense", "causal"])
 @torch_fork_set_rng(seed=0)
-def test_two_by_two_graph_api(two_by_two, dtype, is_causal):
-    """The existing dsv4_d512 graph-API case served by the sm107 2x2 kernel (b=2 h=8 s=256 -> one 4-CTA cluster per head)."""
+def test_two_by_two_graph_api(two_by_two, dtype, is_causal, fold):
+    """The existing dsv4_d512 graph-API case served by the sm107 2x2 kernel (b=2 h=8 s=256 -> one 4-CTA cluster per head);
+    the fold arm carries attn_scale_prefolded=True on a host-folded Q.  O within the family bound, the LSE within 5e-4 of the
+    float64 oracle on both arms."""
     _dsl._require_dsl()
     b, h, s = 2, 8, 256
     scale = 1.0 / math.sqrt(_D)
     q, k, v = (_dsl._bhsd(b, h, s, _D, dtype) for _ in range(3))
-    o, stats = _run_graph(q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=is_causal), return_stats=True)
-    o_ref, lse_ref = _dsl._ref_sdpa_full(q, k, v, scale=scale, is_causal=is_causal, return_stats=True)
-    torch.testing.assert_close(o, o_ref, **_TOL)
-    torch.testing.assert_close(stats.squeeze(-1), lse_ref, **_TOL)
+    q_in, g_scale, kw, ref_scale = _arm(q, scale, fold, dict(use_causal_mask=is_causal))
+    o, stats = _run_graph(q_in, k, v, scale=g_scale, dtype=dtype, sdpa_kwargs=kw, return_stats=True)
+    torch.testing.assert_close(o, _dsl._ref_sdpa_full(q_in, k, v, scale=ref_scale, is_causal=is_causal), **_TOL)
+    torch.testing.assert_close(stats.squeeze(-1).double(), _lse64(q_in, k, ref_scale, causal=is_causal), **_LSE_TOL)
 
 
 @requires_rubin
@@ -160,10 +218,12 @@ def test_two_by_two_non_tile_multiple_seqlens(two_by_two, s_q, s_kv):
 
 @requires_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("fold", _FOLD, ids=_FOLD_IDS)
 @torch_fork_set_rng(seed=5)
-def test_two_by_two_swa_empty_tiles_and_q_trim(two_by_two):
+def test_two_by_two_swa_empty_tiles_and_q_trim(two_by_two, fold):
     """Sliding window past the padded KV tail (empty KV loops: the empty-mainloop protocol and the O u V alias phase
-    bookkeeping, now pair-wide) plus the dense padded-Q trim (rows >= seq_len_q[b] -> O = 0, LSE = -inf)."""
+    bookkeeping, now pair-wide) plus the dense padded-Q trim (rows >= seq_len_q[b] -> O = 0, LSE = -inf).  Both arms: the
+    keyless rows (windowed out, trimmed) must come back as the empty-row select under the fold too."""
     _dsl._require_dsl()
     dtype = torch.float16
     b, h, s_q, s_kv, W = 2, 2, 512, 512, 100
@@ -171,54 +231,47 @@ def test_two_by_two_swa_empty_tiles_and_q_trim(two_by_two):
     q, k, v = (_dsl._bhsd(b, h, s_q, _D, dtype) for _ in range(3))
     seq_len_kv = torch.tensor([160, 512], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
     seq_len_q = torch.tensor([300, 450], dtype=torch.int32, device="cuda").view(b, 1, 1, 1)
-    o, stats = _run_graph(
-        q,
-        k,
-        v,
-        scale=scale,
-        dtype=dtype,
-        sdpa_kwargs=dict(use_causal_mask=True, sliding_window_length=W + 1),
-        seq_len_kv=seq_len_kv,
-        seq_len_q=seq_len_q,
-        return_stats=True,
-    )
-    o_ref, lse_ref = _dsl._ref_sdpa_full(
-        q, k, v, scale=scale, is_causal=True, swa_window=W, seq_q_lens=seq_len_q.flatten(), seq_kv_lens=seq_len_kv.flatten(), return_stats=True
-    )
+    q_in, g_scale, kw, ref_scale = _arm(q, scale, fold, dict(use_causal_mask=True, sliding_window_length=W + 1))
+    o, stats = _run_graph(q_in, k, v, scale=g_scale, dtype=dtype, sdpa_kwargs=kw, seq_len_kv=seq_len_kv, seq_len_q=seq_len_q, return_stats=True)
+    lens = dict(seq_q_lens=seq_len_q.flatten(), seq_kv_lens=seq_len_kv.flatten())
+    o_ref = _dsl._ref_sdpa_full(q_in, k, v, scale=ref_scale, is_causal=True, swa_window=W, **lens)
+    lse_ref = _lse64(q_in, k, ref_scale, causal=True, swa_window=W, **lens)
     torch.testing.assert_close(o, o_ref.nan_to_num(0.0), **_TOL)
     finite = torch.isfinite(lse_ref)
-    torch.testing.assert_close(stats.squeeze(-1)[finite], lse_ref[finite], **_TOL)
+    torch.testing.assert_close(stats.squeeze(-1).double()[finite], lse_ref[finite], **_LSE_TOL)
     assert torch.isneginf(stats.squeeze(-1)[~finite]).all(), "trimmed / windowed-out rows must carry LSE = -inf"
 
 
 @requires_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("fold", _FOLD, ids=_FOLD_IDS)
 @pytest.mark.parametrize("stats_use_log2", [False, True], ids=["ln", "log2"])
 @torch_fork_set_rng(seed=6)
-def test_two_by_two_sink_and_stats(two_by_two, stats_use_log2):
+def test_two_by_two_sink_and_stats(two_by_two, stats_use_log2, fold):
+    """Sink + Stats (ln / log2 units) on both arms: the sink logit stays a NATURAL-domain scalar under the fold (the kernel
+    folds it against final_max * ln 2, which is scale-free), and the published LSE keeps its domain."""
     _dsl._require_dsl()
     dtype = torch.bfloat16
     b, h, s = 1, 4, 384
     scale = 1.0 / math.sqrt(_D)
     q, k, v = (_dsl._bhsd(b, h, s, _D, dtype) for _ in range(3))
     sink = torch.randn(1, h, 1, 1, device="cuda", dtype=torch.float32)
-    o, stats = _run_graph(
-        q, k, v, scale=scale, dtype=dtype, sdpa_kwargs=dict(use_causal_mask=True, stats_use_log2=stats_use_log2), sink=sink, return_stats=True
-    )
-    o_ref, lse_ref = _dsl._ref_sdpa_full(q, k, v, scale=scale, is_causal=True, sinks=sink.flatten(), return_stats=True)
-    if stats_use_log2:
-        lse_ref = lse_ref * math.log2(math.e)
-    torch.testing.assert_close(o, o_ref, **_TOL)
-    torch.testing.assert_close(stats.squeeze(-1), lse_ref, **_TOL)
+    q_in, g_scale, kw, ref_scale = _arm(q, scale, fold, dict(use_causal_mask=True, stats_use_log2=stats_use_log2))
+    o, stats = _run_graph(q_in, k, v, scale=g_scale, dtype=dtype, sdpa_kwargs=kw, sink=sink, return_stats=True)
+    torch.testing.assert_close(o, _dsl._ref_sdpa_full(q_in, k, v, scale=ref_scale, is_causal=True, sinks=sink.flatten()), **_TOL)
+    lse_nat = stats.squeeze(-1).double() / (_LOG2E if stats_use_log2 else 1.0)
+    torch.testing.assert_close(lse_nat, _lse64(q_in, k, ref_scale, causal=True, sink=sink.flatten()), **_LSE_TOL)
 
 
 @requires_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("fold", _FOLD, ids=_FOLD_IDS)
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
 @torch_fork_set_rng(seed=8)
-def test_two_by_two_thd(two_by_two, dtype):
+def test_two_by_two_thd(two_by_two, dtype, fold):
     """Packed THD (two sequences of unequal length, per-sequence causal) through the persistent scheduler with 256-row
-    units on the sm107 2x2 kernel; the sentinel outside the packed region must come back untouched."""
+    units on the sm107 2x2 kernel, with the token-major Stats; the sentinel outside the packed region must come back
+    untouched.  Both arms: the fold's packed Q is host-folded as a whole, the per-sequence references use ln 2."""
     from cudnn.sdpa.fwd.config_sm107 import SM107_F16_THD_SHAPES
 
     _dsl._require_dsl()
@@ -231,12 +284,17 @@ def test_two_by_two_thd(two_by_two, dtype):
     T = cu[-1]
     scale = 1.0 / math.sqrt(_D)
     q_pk, k_pk, v_pk = (torch.randn(T, H, _D, device="cuda", dtype=dtype) for _ in range(3))
-    o_stor = _dsl._run_dsl_thd_graph(q_pk, k_pk, v_pk, cu, cu, seq_lens, seq_lens, scale=scale, dtype=dtype, H_q=H, H_kv=H, d=_D, mask="causal")
+    q_in, g_scale, kw, ref_scale = _arm(q_pk, scale, fold)
+    o_stor, lse_stor, _ = _dsl._run_dsl_thd_graph(
+        q_in, k_pk, v_pk, cu, cu, seq_lens, seq_lens, scale=g_scale, dtype=dtype, H_q=H, H_kv=H, d=_D, mask="causal", check_stats=True, sdpa_kwargs=kw
+    )
     o_pk = o_stor[: T * H * _D].view(T, H, _D)
+    lse_pk = lse_stor[: T * H].view(T, H)  # token-major [t, h]
     for bi, s in enumerate(seq_lens):
-        qs, ks, vs = (t[cu[bi] : cu[bi + 1]].permute(1, 0, 2).unsqueeze(0) for t in (q_pk, k_pk, v_pk))
-        o_ref = _dsl._ref_sdpa_full(qs, ks, vs, scale=scale, is_causal=True)[0].permute(1, 0, 2)
+        qs, ks, vs = (t[cu[bi] : cu[bi + 1]].permute(1, 0, 2).unsqueeze(0) for t in (q_in, k_pk, v_pk))
+        o_ref = _dsl._ref_sdpa_full(qs, ks, vs, scale=ref_scale, is_causal=True)[0].permute(1, 0, 2)
         torch.testing.assert_close(o_pk[cu[bi] : cu[bi + 1]], o_ref, **_TOL)
+        torch.testing.assert_close(lse_pk[cu[bi] : cu[bi + 1]].double(), _lse64(qs, ks, ref_scale, causal=True)[0].t(), **_LSE_TOL)
     assert (o_stor[T * H * _D :] == _dsl._THD_SENTINEL).all()
 
 
@@ -245,10 +303,12 @@ def test_two_by_two_thd(two_by_two, dtype):
 
 @requires_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("fold", _FOLD, ids=_FOLD_IDS)
 @torch_fork_set_rng(seed=9)
-def test_two_by_two_cga2_vs_cga4_bitwise():
+def test_two_by_two_cga2_vs_cga4_bitwise(fold):
     """The CGA_M=2 bring-up arm (one pair, own-bit loads, own-warp O-empty gate) and the CGA_M=4 twin-multicast arm
-    (pair-wide gate) run the same per-pair arithmetic: O and LSE must be BITWISE identical."""
+    (pair-wide gate) run the same per-pair arithmetic: O and LSE must be BITWISE identical -- on the scaled chain and on
+    the fold (the direct ABI then takes scale_log2 = 1.0 on a host-folded Q)."""
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     dtype = torch.float16
@@ -257,16 +317,51 @@ def test_two_by_two_cga2_vs_cga4_bitwise():
     q = torch.randn(B, SQ, H, _D, device="cuda", dtype=dtype)
     k = torch.randn(B, SKV, KH, _D, device="cuda", dtype=dtype)
     v = torch.randn(B, SKV, KH, _D, device="cuda", dtype=dtype)
-    params = TemplateParams(mma_2x2=True, dtype_qkv=3, dtype_o=3, window_right=0)
+    params = TemplateParams(mma_2x2=True, dtype_qkv=3, dtype_o=3, window_right=0, softmax_scale_prefolded=fold)
+    q_in, _, _, ref_scale = _arm(q, scale, fold)
     outs = {}
     for cga_m in (4, 2):
-        mod = _load_2x2(params, cga_m, "twin")
+        mod = _load_2x2(params, cga_m, "twin_fold" if fold else "twin")
         assert mod.CFG.CGA_M == cga_m and mod.KV_SHARE == cga_m // 2 and mod.CFG.O_EMPTY_ARRIVERS == 32 * (cga_m // 2)
-        outs[cga_m] = _t2x2._direct_launch(mod, q, k, v, scale, causal=True)
+        assert mod.SCALE_PREFOLDED == int(fold)
+        outs[cga_m] = _t2x2._direct_launch(mod, q_in, k, v, ref_scale, causal=True)
     assert torch.equal(outs[4][0], outs[2][0]) and torch.equal(outs[4][1], outs[2][1])
-    o_ref, lse_ref = _t2x2._ref_bshd(q, k, v, scale, True)
+    o_ref, lse_ref = _t2x2._ref_bshd(q_in, k, v, ref_scale, True)
     torch.testing.assert_close(outs[4][0].float(), o_ref, **_TOL)
     torch.testing.assert_close(outs[4][1], lse_ref, **_TOL)
+
+
+@requires_rubin
+@pytest.mark.L0
+@torch_fork_set_rng(seed=24)
+def test_two_by_two_prefolded_scale_is_an_exact_elision_of_the_scaled_chain():
+    """The fold arm against the scaled chain on the SAME host-folded Q, causal S_q = S_kv = 512 (the cluster-union bounds
+    make CTAs 0 / 1 run a FULLY-MASKED iteration, where the raw max must be -inf exactly as the scaled chain's).  (1) The
+    fold module launched with a GARBAGE scale_softmax_log2 matches the reference: both lever sites are dead under
+    SCALE_PREFOLDED (a surviving multiply at the max site flips the shift, one at the shift site scales every logit --
+    either blows O / LSE).  (2) Its O and LSE are BITWISE the scaled chain's at scale_log2 = 1.0 (x * 1.0 and an FFMA2 at a
+    unit scale round exactly like the FADD2): the kernel-level statement of 'numerically neutral'."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    dtype = torch.float16
+    B, H, S = 1, 2, 512
+    scale = 1.0 / math.sqrt(_D)
+    q = torch.randn(B, S, H, _D, device="cuda", dtype=dtype)
+    k = torch.randn(B, S, H, _D, device="cuda", dtype=dtype)
+    v = torch.randn(B, S, H, _D, device="cuda", dtype=dtype)
+    q_in = _fold_q(q, scale)
+    base = dict(mma_2x2=True, dtype_qkv=3, dtype_o=3, window_right=0)
+    fold_mod = _load_2x2(TemplateParams(**base, softmax_scale_prefolded=True), 4, "twin_fold")
+    scaled_mod = _load_2x2(TemplateParams(**base), 4, "twin")
+    assert fold_mod.SCALE_PREFOLDED == 1 and scaled_mod.SCALE_PREFOLDED == 0
+    o_f, lse_f = _t2x2._direct_launch(fold_mod, q_in, k, v, _GARBAGE_SCALE, causal=True)  # scale_log2 = -5 log2 e: dead under the fold
+    o_s, lse_s = _t2x2._direct_launch(scaled_mod, q_in, k, v, _LN2, causal=True)  # scale_log2 = 1.0 exactly
+    assert torch.isfinite(o_f).all() and torch.isfinite(lse_f).all(), "the fold read the runtime scale"
+    assert torch.equal(o_f, o_s) and torch.equal(lse_f, lse_s), "the fold must be bit-for-bit the scaled chain at a unit scale"
+    o_ref, lse_ref = _t2x2._ref_bshd(q_in, k, v, _LN2, True)
+    torch.testing.assert_close(o_f.float(), o_ref, **_TOL)
+    bhsd = lambda t: t.permute(0, 2, 1, 3)  # noqa: E731
+    torch.testing.assert_close(lse_f.double(), _lse64(bhsd(q_in), bhsd(k), _LN2, causal=True), **_LSE_TOL)
 
 
 @requires_rubin
@@ -302,13 +397,16 @@ def test_two_by_two_trimmed_rows_with_nan_inputs_store_zero():
 
 @requires_rubin
 @pytest.mark.L0
+@pytest.mark.parametrize("fold", _FOLD, ids=_FOLD_IDS)
 @pytest.mark.parametrize("cell", ["skewed_halves", "rescale_storm"])
 @torch_fork_set_rng(seed=10)
-def test_two_by_two_directed_numerics(cell):
+def test_two_by_two_directed_numerics(cell, fold):
     """skewed_halves: every odd 64-key half of each 128-key tile is scaled by 2^10, so lanes r and r + 64 see row maxima
     ~1000x apart -- wrong without the row-max exchange (on Rubin the dense arm's ld.red.max returns exactly that HALF-row
     max).  rescale_storm: K tile t scaled by 2^t drives alpha != 1 on every iteration (the slow correction arm and the
-    per-N-block credits on every step)."""
+    per-N-block credits on every step).  Both arms (the fold exchanges and thresholds the RAW max); the logits reach ~60
+    here, where the f32 reference's own accumulation noise exceeds the 5e-4 LSE bound, so these cells keep the family
+    tolerance on the LSE."""
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
     dtype = torch.bfloat16
@@ -327,9 +425,10 @@ def test_two_by_two_directed_numerics(cell):
         for t in range(SKV // 128):
             kf[:, t] *= 2.0 ** min(t, 12)
         k = (kf.view(B, SKV, H, _D) / 2.0**6).to(dtype)
-    mod = _load_2x2(TemplateParams(mma_2x2=True, dtype_qkv=2, dtype_o=2), 4, "directed")
-    o, lse = _t2x2._direct_launch(mod, q, k, v, scale, causal=False)
-    o_ref, lse_ref = _t2x2._ref_bshd(q, k, v, scale, False)
+    mod = _load_2x2(TemplateParams(mma_2x2=True, dtype_qkv=2, dtype_o=2, softmax_scale_prefolded=fold), 4, "directed_fold" if fold else "directed")
+    q_in, _, _, ref_scale = _arm(q, scale, fold)
+    o, lse = _t2x2._direct_launch(mod, q_in, k, v, ref_scale, causal=False)  # the fold hands the ABI scale_log2 = ln 2 * log2 e = 1.0
+    o_ref, lse_ref = _t2x2._ref_bshd(q_in, k, v, ref_scale, False)
     assert not torch.isnan(o).any()
     torch.testing.assert_close(o.float(), o_ref, **_TOL)
     torch.testing.assert_close(lse, lse_ref, **_TOL)

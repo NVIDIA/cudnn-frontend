@@ -80,11 +80,11 @@ def _bshd(b, s, h, d, dev="cuda", dt=torch.bfloat16, fill=True):
     return t.mul_(0.1).permute(0, 2, 1, 3) if fill else t.permute(0, 2, 1, 3)
 
 
-def _reference(q, k, v, do, keep=None, group=1):
-    """fp32 attention backward. ``keep`` is a [S_q, S_kv] bool mask."""
+def _reference(q, k, v, do, keep=None, group=1, scale=None):
+    """fp32 attention backward. ``keep`` is a [S_q, S_kv] bool mask; ``scale`` None = 1/sqrt(d)."""
     kx = k.repeat_interleave(group, dim=1) if group > 1 else k
     vx = v.repeat_interleave(group, dim=1) if group > 1 else v
-    scale = 1.0 / math.sqrt(q.shape[3])
+    scale = 1.0 / math.sqrt(q.shape[3]) if scale is None else scale
     sa = (q.float() @ kx.float().transpose(-1, -2)) * scale
     if keep is not None:
         sa = sa.masked_fill(~keep, float("-inf"))
@@ -137,12 +137,11 @@ def _run(b=2, hq=2, hkv=None, sq=512, skv=512, d=_D, keep=None, dt=torch.bfloat1
     """Build, pin the engine, execute, and compare against fp32 torch."""
     hkv = hq if hkv is None else hkv
     group = hq // hkv
-    # None => omit attn_scale on the graph; the engine must then default it to
-    # 1/sqrt(d), which is what _reference assumes either way.
+    # None => omit attn_scale on the graph, which means no scaling (1.0), as on the backend.
     scale = None if omit_scale else 1.0 / math.sqrt(d)
     q, do = _bshd(b, sq, hq, d, dt=dt), _bshd(b, sq, hq, d, dt=dt)
     k, v = _bshd(b, skv, hkv, d, dt=dt), _bshd(b, skv, hkv, d, dt=dt)
-    o_ref, lse, all_masked, dq_r, dk_r, dv_r = _reference(q, k, v, do, keep, group)
+    o_ref, lse, all_masked, dq_r, dk_r, dv_r = _reference(q, k, v, do, keep, group, scale=1.0 if omit_scale else None)
     o = _bshd(b, sq, hq, d, dt=dt, fill=False)
     o.copy_(o_ref.to(dt))
 
@@ -346,12 +345,12 @@ def test_dense_skv_96_zero_filled_tail(stage2_datapath):
 
 
 def test_default_attn_scale(stage2_datapath):
-    """attn_scale is OPTIONAL on the graph; omitting it must mean 1/sqrt(d).
+    """attn_scale is OPTIONAL on the graph; omitting it means no scaling (1.0), the backend's meaning.
 
     The adapter used to leave `scale_softmax` at None and die in execute with
     `TypeError: unsupported operand type(s) for *: 'NoneType' and 'float'`,
     after the row had already admitted the graph and check_support had passed.
-    _reference always uses 1/sqrt(d), so a wrong default fails the comparison
+    The reference runs at 1.0, so a 1/sqrt(d) default fails the comparison
     rather than merely not raising.
     """
     _run(omit_scale=True)
@@ -713,12 +712,13 @@ def test_capabilities_match_what_is_implemented():
     assert c.sm_lo == 100 and c.sm_hi == 103
 
 
-def test_engine_is_registered_and_opt_in():
+def test_engine_is_registered_and_offered_by_default():
     from cudnn.engines.manifest import MANIFEST
 
     fam = next(f for f in MANIFEST if f.name == "frost_sdpa_bwd")
     assert _ENGINE in fam.slots
-    assert fam.slots[_ENGINE].opt_in, "new engines stay opt-in until they earn arch coverage + benchmarks"
+    # The cuDNN backend has no SM100 engine for d in (256, 512], so this row is the only provider there.
+    assert not fam.slots[_ENGINE].opt_in
 
 
 def _prepared_case(*, dtype=torch.bfloat16, causal=True, hkv=2, chunks=False, wide=None, wide_product=False):
@@ -1109,8 +1109,9 @@ _STAGE2_2X2_RECORDS = {
     "dense_bf16": dict(dtype_qkv=2),
     "causal_bf16": dict(dtype_qkv=2, window_right=0),
     "dense_fp16": dict(dtype_qkv=3),
-    "thd_bf16": dict(dtype_qkv=2, thd_varlen=True),
 }
+# THD can lower identical MLIR to different PTX with the same DSL build. Its codegen
+# coverage is the THD arm of test_stage2_2x2_sass_pins, not a byte-hash golden.
 # The RED side (an armed lever renders different PTX) needs no fp16 / THD render: the lever is dtype- and
 # layout-independent code, and each render is a ~1 min host trace-compile.
 _STAGE2_2X2_RED_RECORDS = ("dense_bf16", "causal_bf16")
@@ -1159,9 +1160,9 @@ def _stage2_2x2_md5_want(record):
 
 @pytest.mark.parametrize("record", list(_STAGE2_2X2_RECORDS))
 def test_stage2_2x2_default_rendering_ptx_md5_is_unchanged(tmp_path, record):
-    """The 2x2 twin's DEFAULT rendering (every debug lever off) is PTX-IDENTICAL to the committed pre-lever record
-    (``renderings/md5_stage2_2x2_sm100a.txt``, rendered at d4b024671 before ``TemplateParams2x2.debug_clk`` landed): the
-    attribution lever is zero traced code when off.  Host trace-compile for sm_100a, no device."""
+    """The default rendering matches the committed record, refreshed deliberately for protocol changes.
+    All debug levers are off; the armed-lever test below checks that instrumentation renders different code.
+    Host trace-compile for sm_100a, no device."""
     want = _stage2_2x2_md5_want(record)
     kw = dict(_STAGE2_2X2_RECORDS[record], kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True)
     got, out = _render_stage2_ptx_md5(tmp_path, f"sm100a_stage2_2x2_{record}", kw)
@@ -1647,6 +1648,20 @@ _STAGE2_SASS_PROBE = _textwrap.dedent(r"""
     if nvd is None:
         print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
     sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    # THD also emits a descriptor helper. Count only the main stage-2 kernel:
+    # the helper's required GPU fence is not a drain in the attention loop.
+    sections, current = {}, None
+    for line in sass:
+        match = re.match(r'\s*\.section\s+\.text\.([^,\s]+)', line)
+        if match:
+            current = match.group(1)
+            sections[current] = []
+        if current is not None:
+            sections[current].append(line)
+    main = [lines for name, lines in sections.items() if name.startswith("cudnn_kernel__kernel_")]
+    assert len(main) == 1, f"expected one stage-2 main kernel, got {list(sections)}"
+    print("SASS_FUNCTIONS", list(sections))
+    sass = main[0]
     def cnt(*subs):
         return sum(1 for ln in sass if all(sb in ln for sb in subs))
     for key, subs in json.loads(%(counts)r).items():
@@ -1679,19 +1694,20 @@ def _stage2_sass_probe(tmp_path, arch, params, tag):
     return stats, expect
 
 
-@pytest.mark.parametrize("arch,arm", [("sm_100a", "dense"), ("sm_100a", "causal_swa"), ("sm_107a", "dense"), ("sm_107a", "causal")])
+@pytest.mark.parametrize("arch,arm", [("sm_100a", "dense"), ("sm_100a", "causal_swa"), ("sm_100a", "thd"), ("sm_107a", "dense"), ("sm_107a", "causal")])
 def test_stage2_2x2_sass_pins(tmp_path, arch, arm):
     """Also the Rule S6 trace-compile of the Rubin arm (8-stage ring, 2 cast stages, 320 KiB, DESC_VERSION 0) from whatever
     GPU runs this suite: ``CUTE_DSL_ARCH=sm_107a`` needs no device.  Skips where the DSL predates sm_107a."""
     from cudnn.sdpa.bwd.config_sm100 import SM107_USABLE_DYN_SMEM_2X2
 
-    masks = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=256)}
+    masks = {"dense": {}, "causal": dict(window_right=0), "causal_swa": dict(window_right=0, window_left=256), "thd": dict(thd_varlen=True)}
     params = dict(dtype_qkv=2, kernel_file="sm100/bprop_d512_f16_2x2.py", twin=True, **masks[arm])
     if arch == "sm_107a":
         params.update(stages_kv=8, cast_stages=2, smem_cap_bytes=SM107_USABLE_DYN_SMEM_2X2)
     st, expect = _stage2_sass_probe(tmp_path, arch, params, tag=f"stage2_2x2_{arm}")
     # The compute WG's three-range split traces ITS kv body once per range; the MMA warp's kv loop is one body.
-    n_compute_bodies = 1 if arm == "dense" else 3
+    # Without SWA the low-edge range is [left, left) and the compiler drops it, so causal keeps two bodies.
+    n_compute_bodies = {"dense": 1, "causal": 2, "causal_swa": 3, "thd": 2}[arm]
     assert expect["DESC_VERSION"] == 0 and expect["CLUSTER_Q_ROWS"] == 256 and expect["N_CHUNKS"] == 8
     # USETMAXREG is 0 here as on the 4x1 sibling: ptxas C7508 drops every setmaxregister of these 8-warp d512 bodies (it
     # cannot determine the entry count) -- recorded, not required; the 12-warp sm107 bodies pin > 0 (see that file).
@@ -1757,11 +1773,12 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
             if time.time() - t0 > budget_s:
                 import subprocess
                 try:
-                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10).stdout
+                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10, check=True).stdout
                 except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
                     apps = f"<nvidia-smi unavailable: {e!r}>"
                 print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
-                print(f"[{role}] other compute processes on the device at the hang: {apps.strip().splitlines()}", flush=True)
+                print(f"[{role}] compute processes at the hang (all GPUs; may include this child; GPU UUID, PID, process name), "
+                      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}: {apps.strip().splitlines()}", flush=True)
                 os._exit(3)
         hist.append(time.time() - t0)
         if i == 0:
@@ -1813,20 +1830,11 @@ def test_stage2_2x2_survives_gpu_time_slicing(tmp_path):
 
 
 @pytest.mark.xdist_group(name="gpu_exclusive")
-@pytest.mark.gpu_exclusive
-def test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing(tmp_path):
-    """The NEGATIVE CONTROL of the detector above: ``wait_form = 4`` renders the pre-fix kernel (the sleeping ``try_wait``
-    on the cross-pair ring barriers too) and must HANG within 300 time-sliced launches (observed at launch 2, 23, 25 and
-    74 in four of four runs).  It deliberately wedges a kernel for the 45 s budget before the child dies, which is why it
-    carries ``gpu_exclusive`` and sits in the ``gpu_exclusive`` xdist group with the detector above (the marker alone
-    does not serialize xdist: the CI lane runs 16 workers over 4 GPUs, adjacent ungrouped items start together, and
-    the detector failed exactly while this control sat wedged, twice -- pipelines 71863093 and 71991279, the detector
-    at ~63 s = compile + its 45 s budget; a wedged neighbour does not slow the twin on a time-sliced B200, so the CI
-    node's sharing mode is the difference).
-    Deselect it on a GPU other jobs share.  If this test ever PASSES (no hang), the mechanism
-    has moved: re-run the heartbeat lever (``debug_heartbeat``) before trusting the fix."""
-    twin = _contention_run(tmp_path, twin_levers={"wait_form": 4}, n_twin=300, budget_s=45.0, tag="prefix")
-    assert twin.returncode == 3 and "HANG" in twin.stdout, f"the pre-fix wait form did not hang in 300 launches: rc={twin.returncode}\n{twin.stdout[-2000:]}"
+def test_stage2_2x2_waits_for_delayed_empty_observer(tmp_path):
+    """All CTA observers gate reuse, including a follower that does not issue this chunk's TMA."""
+    from frost_test_utils import run_d512_delayed_observer
+
+    run_d512_delayed_observer(tmp_path, _ENGINE)
 
 
 # --------------------------------------------------------------------------- #

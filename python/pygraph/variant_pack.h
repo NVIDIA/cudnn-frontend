@@ -41,6 +41,9 @@ init_sdpa_bwd_binding(pybind11::module_ &);
 void
 init_sdpa_sm80_binding(pybind11::module_ &);
 
+void
+init_sdpa_sm80_thd_binding(pybind11::module_ &);
+
 // Call-local packs retain immutable geometry independently of the graph's
 // bounded cache. No runtime tensor addresses or Python owners live here.
 struct BindingOverrides {

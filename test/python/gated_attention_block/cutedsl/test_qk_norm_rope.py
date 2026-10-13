@@ -711,6 +711,229 @@ def test_tma_e4m3_epilogue_is_bitwise_the_bf16_output_quantized(qk_norm, t):
     assert torch.equal(q8.view(torch.uint8), _quant(q16, sq).view(torch.uint8)), "the scale is not read from the tensor"
 
 
+# ---------------------------------------------------------------------------
+# The MX epilogue (mx_out): the 32-token tile, the rowwise + columnwise MXFP8 quantizes of Q and K
+# ---------------------------------------------------------------------------
+
+requires_mx_tma = pytest.mark.skipif(
+    not torch.cuda.is_available() or tuple(torch.cuda.get_device_capability()) < (10, 0),
+    reason="the MX epilogue needs the TMA kernel (sm_90+), the fp8 cvt (sm_89+) and cvt.rp.satfinite.ue8m0x2 (sm_100+)",
+)
+
+
+def _mx_blobs(b, s, h_q, h_kv, d, poison=0xFF):
+    """0xFF-poisoned MX outputs: the four e4m3 payloads and the four SF blobs (every byte a NaN in its format until written)."""
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import sf_bytes
+
+    t = b * s
+    pay = lambda h: torch.full((t, h, d), poison, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)  # noqa: E731
+    blob = lambda h: torch.full((sf_bytes(b, h, s, d),), poison, dtype=torch.uint8, device="cuda")  # noqa: E731
+    return dict(q8=pay(h_q), sf_q=blob(h_q), q_T8=pay(h_q), sf_q_T=blob(h_q), k8=pay(h_kv), sf_k=blob(h_kv), k_T8=pay(h_kv), sf_k_T=blob(h_kv))
+
+
+def _standalone_mx(src, *, batch, seq_len, h, d):
+    """The standalone rowwise and columnwise MXFP8 quantizes of a compact ``[T, H, D]`` buffer: ``(row_d, row_sf, col_d, col_sf)``."""
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import compile_quantize_mxfp8, run_quantize_mxfp8, sf_bytes
+
+    st = torch.cuda.current_stream().cuda_stream
+    out = []
+    for axis in ("row", "col"):
+        r = compile_quantize_mxfp8(dtype_in=src.dtype, h=h, d=d, axis=axis)
+        dst = torch.full((batch * seq_len, h, d), 0xFF, dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+        sf = torch.full((sf_bytes(batch, h, seq_len, d),), 0xFF, dtype=torch.uint8, device="cuda")
+        run_quantize_mxfp8(r, src, dst, sf, batch=batch, seq_len=seq_len, stream=st)
+        out += [dst, sf]
+    torch.cuda.synchronize()
+    return tuple(out)
+
+
+@requires_mx_tma
+@_QK_NORM
+@pytest.mark.parametrize(
+    "b, s, h_q, h_kv, strided",
+    [(1, 512, 8, 2, False), (2, 1008, 8, 2, False), (1, 992, 8, 2, True), (1, 256, 32, 2, True), (2, 96, 8, 2, False)],
+    ids=["s512", "s1008-b2", "s992-slab", "h32-slab", "s96-b2"],
+)
+def test_tma_mx_epilogue_is_bitwise_the_rebuild_plus_four_quantizes(qk_norm, b, s, h_q, h_kv, strided):
+    """The ``mx_out`` artifact's eight outputs == {the bf16 TMA rebuild, then the standalone rowwise AND columnwise MXFP8
+    quantizes of ``q16`` and of ``k16``}, byte for byte, on 0xFF-POISONED destinations: every SF byte of every ceil128(S) unit is
+    written (``s992``: the 992..1023 block of every (b, h) is a pad block -> ``0x00``), every payload byte is written, and at
+    ``s1008`` with B = 2 batch 1's first 16 tokens keep THEIR bytes (an unpredicated pad-row store would land there).  ``strided``
+    reads the bands as column slices of a ``[T, N]`` slab (the backward's source); ``h32`` is the 397B head count."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import compile_qk_norm_rope_tma, mx_tile_counts, run_qk_norm_rope_tma
+
+    d, rope_dim = 256, 64
+    t = b * s
+    q, k, w_q, w_k, cos, sin = _make(t, h_q, h_kv, d, rope_dim, torch.bfloat16, seed=1000 * b + s + h_q)
+    if strided:
+        n = (2 * h_q + 2 * h_kv) * d
+        slab = torch.randn(t, n, device="cuda").to(torch.bfloat16)
+        qb = torch.as_strided(slab, (t, h_q, d), (n, d, 1), 0)
+        kb = torch.as_strided(slab, (t, h_kv, d), (n, d, 1), 2 * h_q * d)
+        qb.copy_(q)
+        kb.copy_(k)
+        q, k = qb, kb
+    w_q, w_k = _weights(w_q, w_k, qk_norm)
+    st = torch.cuda.current_stream().cuda_stream
+    kw = dict(dtype=torch.bfloat16, h_q=h_q, h_kv=h_kv, d=d, rope_dim=rope_dim, eps=_EPS, want_rstd=False, tile_rows=8, apply_norm=qk_norm)
+    r16 = compile_qk_norm_rope_tma(**kw)
+    rmx = compile_qk_norm_rope_tma(**kw, mx_out=True)
+    assert rmx.mx_out is True and r16.mx_out is False and rmx.compiled is not r16.compiled
+    q16 = torch.empty(t, h_q, d, dtype=torch.bfloat16, device="cuda")
+    k16 = torch.empty(t, h_kv, d, dtype=torch.bfloat16, device="cuda")
+    run_qk_norm_rope_tma(r16, q, k, q16, k16, w_q, w_k, cos, sin, stream=st)
+    o = _mx_blobs(b, s, h_q, h_kv, d)
+    run_qk_norm_rope_tma(rmx, q, k, None, None, w_q, w_k, cos, sin, stream=st, batch=b, seq_len=s, **o)
+    torch.cuda.synchronize()
+    rq_d, rq_sf, cq_d, cq_sf = _standalone_mx(q16, batch=b, seq_len=s, h=h_q, d=d)
+    rk_d, rk_sf, ck_d, ck_sf = _standalone_mx(k16, batch=b, seq_len=s, h=h_kv, d=d)
+    u8 = torch.uint8
+    assert torch.equal(o["q8"].view(u8), rq_d.view(u8)), "q8 differs from the rowwise quantize of the bf16 rebuild"
+    assert torch.equal(o["sf_q"], rq_sf), "sf_q differs from the rowwise quantize of the bf16 rebuild"
+    assert torch.equal(o["q_T8"].view(u8), cq_d.view(u8)), "q_T8 differs from the columnwise quantize of the bf16 rebuild"
+    assert torch.equal(o["sf_q_T"], cq_sf), "sf_q_T differs from the columnwise quantize of the bf16 rebuild"
+    assert torch.equal(o["k8"].view(u8), rk_d.view(u8)), "k8 differs from the rowwise quantize of the bf16 rebuild"
+    assert torch.equal(o["sf_k"], rk_sf), "sf_k differs from the rowwise quantize of the bf16 rebuild"
+    assert torch.equal(o["k_T8"].view(u8), ck_d.view(u8)), "k_T8 differs from the columnwise quantize of the bf16 rebuild"
+    assert torch.equal(o["sf_k_T"], ck_sf), "sf_k_T differs from the columnwise quantize of the bf16 rebuild"
+    for name in ("sf_q", "sf_q_T", "sf_k", "sf_k_T"):
+        assert not (o[name] == 0xFF).any(), f"{name}: an SF byte was never written (E8M0 NaN under the SDPA's whole-tile SF TMA)"
+    for name in ("q8", "q_T8", "k8", "k_T8"):
+        assert not (o[name].view(u8) == 0xFF).all(dim=-1).any(), f"{name}: a row kept its poison"
+    n_blk, n_sft, n_tiles = mx_tile_counts(b, s, h_q, h_kv)
+    assert (n_blk, n_sft, n_tiles) == (4 * -(-s // 128), -(-s // 128), b * 4 * -(-s // 128) * (h_q + h_kv))
+    if s % 128:
+        # the pad blocks' SF bytes are 0x00 (the standalone's byte for a zeroed block); the rowwise tile's pad ROWS likewise
+        from cudnn.gated_attention_block.kernels.quantize_mxfp8 import sf_byte_columnwise, sf_byte_rowwise
+
+        pad_rows = [
+            sf_byte_rowwise(bb, hh, ss, dd, n_heads=h_q, n_tiles=n_sft, d=d)
+            for bb in range(b)
+            for hh in range(h_q)
+            for ss in range(s, n_sft * 128)
+            for dd in range(0, d, 32)
+        ]
+        assert int(o["sf_q"][pad_rows].max().item()) == 0
+        pad_cols = [
+            sf_byte_columnwise(bb, hh, ss, dd, n_heads=h_q, n_tiles=n_sft, batch=b)
+            for bb in range(b)
+            for hh in range(h_q)
+            for ss in range(-(-s // 32) * 32, n_sft * 128, 32)
+            for dd in range(d)
+        ]
+        if pad_cols:
+            assert int(o["sf_q_T"][pad_cols].max().item()) == 0
+
+
+@requires_mx_tma
+def test_tma_mx_epilogue_subnormal_block_takes_the_exact_arm():
+    """A RoPE passthrough block (d >= rope_dim, RoPE-only: the values pass bit-exact) whose amax is the bf16 min normal 2^-126 and
+    which holds the bf16 SUBNORMAL 2^-130: the E8M0 byte is 0x00 (scale 2^127) and the subnormal element quantizes to e4m3 0.125 =
+    byte 0x20 on the EXACT ``x * rcp -> cvt.rn.satfinite.e4m3x2`` arm -- the fused scaled cvt would flush it to 0x00 (its docstring:
+    fp32-subnormal inputs are flushed), which is why the MX epilogue never uses it.  Pinned against the standalone quantizer too."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import compile_qk_norm_rope_tma, run_qk_norm_rope_tma
+    from cudnn.gated_attention_block.kernels.quantize_mxfp8 import sf_byte_columnwise, sf_byte_rowwise
+
+    b, s, h_q, h_kv, d, rope_dim = 1, 128, 8, 2, 256, 64
+    t = b * s
+    q, k, _, _, cos, sin = _make(t, h_q, h_kv, d, rope_dim, torch.bfloat16, seed=3)
+    q.zero_()
+    q[5, 1, 64] = 2.0**-126  # block c = 2 (d 64..95) of token 5, head 1: the amax
+    q[5, 1, 65] = 2.0**-130  # a bf16 subnormal in the same block
+    q[9, 1, 70] = 2.0**-130  # the columnwise block of (head 1, d 70), tokens 0..31: amax 2^-130 itself -> its scale 2^127 too, code 0x20
+    assert float(q[5, 1, 64]) == 2.0**-126 and float(q[5, 1, 65]) == 2.0**-130 and float(q[9, 1, 70]) == 2.0**-130
+    st = torch.cuda.current_stream().cuda_stream
+    rmx = compile_qk_norm_rope_tma(
+        dtype=torch.bfloat16, h_q=h_q, h_kv=h_kv, d=d, rope_dim=rope_dim, eps=_EPS, want_rstd=False, tile_rows=8, apply_norm=False, mx_out=True
+    )
+    o = _mx_blobs(b, s, h_q, h_kv, d)
+    run_qk_norm_rope_tma(rmx, q, k, None, None, None, None, cos, sin, stream=st, batch=b, seq_len=s, **o)
+    # the reference is the standalone chain over the REBUILT bf16 rows (the RoPE of an all-zero row yields -0.0 where cos < 0, which both
+    # chains quantize to e4m3 0x80 -- the raw input is not the quantizer's input), exactly as the bitwise test above
+    r16 = compile_qk_norm_rope_tma(dtype=torch.bfloat16, h_q=h_q, h_kv=h_kv, d=d, rope_dim=rope_dim, eps=_EPS, want_rstd=False, tile_rows=8, apply_norm=False)
+    q16 = torch.empty(t, h_q, d, dtype=torch.bfloat16, device="cuda")
+    k16 = torch.empty(t, h_kv, d, dtype=torch.bfloat16, device="cuda")
+    run_qk_norm_rope_tma(r16, q, k, q16, k16, None, None, cos, sin, stream=st)
+    torch.cuda.synchronize()
+    assert torch.equal(q16[:, :, rope_dim:], q[:, :, rope_dim:]), "the passthrough dims are not bit-exact through the rebuild"
+    rq_d, rq_sf, cq_d, cq_sf = _standalone_mx(q16, batch=b, seq_len=s, h=h_q, d=d)
+    assert torch.equal(o["q8"].view(torch.uint8), rq_d.view(torch.uint8)) and torch.equal(o["sf_q"], rq_sf)
+    assert torch.equal(o["q_T8"].view(torch.uint8), cq_d.view(torch.uint8)) and torch.equal(o["sf_q_T"], cq_sf)
+    n_sft = 1
+    assert int(o["sf_q"][sf_byte_rowwise(0, 1, 5, 64, n_heads=h_q, n_tiles=n_sft, d=d)].item()) == 0x00, "the block's E8M0 is not 0x00 (scale 2^127)"
+    assert int(o["q8"].view(torch.uint8)[5, 1, 64].item()) == 0x40, "2^-126 * 2^127 = 2.0 is e4m3 0x40"
+    assert int(o["q8"].view(torch.uint8)[5, 1, 65].item()) == 0x20, "the subnormal element must quantize to 0.125 (0x20): the exact arm, not a flushed 0x00"
+    assert int(o["sf_q_T"][sf_byte_columnwise(0, 1, 9, 70, n_heads=h_q, n_tiles=n_sft, batch=b)].item()) == 0x00
+    assert int(o["q_T8"].view(torch.uint8)[9, 1, 70].item()) == 0x20, "the columnwise pass must take the exact arm too"
+
+
+@pytest.mark.L0
+def test_tma_mx_epilogue_contract_is_typed():
+    """``mx_out`` at compile (a bool, exclusive with ``fp8_out``, no rstd, the default refill placement only, the MX geometry rules)
+    and at execute both ways (Rule 1): the eight MX outputs + batch / seq_len REQUIRED on an ``mx_out`` artifact and refused on a
+    bf16 one; the bf16 outputs and the per-tensor scales refused on it; an SF blob of the wrong size; ``T != batch * seq_len``.
+    The shape algebra: ``mx_tile_counts`` over the PADDED sequence."""
+    from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import (
+        MX_TILE_TOKENS,
+        QkNormRopeTmaRecipe,
+        compile_qk_norm_rope_tma,
+        mx_tile_counts,
+        run_qk_norm_rope_tma,
+        validate_mx_shape,
+    )
+
+    assert MX_TILE_TOKENS == 32
+    assert mx_tile_counts(1, 128, 8, 2) == (4, 1, 40) and mx_tile_counts(2, 992, 8, 2) == (32, 8, 640) and mx_tile_counts(1, 1000, 32, 2) == (32, 8, 1088)
+    validate_mx_shape(256, 64, 128)
+    validate_mx_shape(256, 0, 256)
+    with pytest.raises(ValueError, match="warp-per-row"):
+        validate_mx_shape(128, 64, 128)
+    with pytest.raises(ValueError, match="spread evenly over the 3 warps"):
+        validate_mx_shape(256, 64, 96)
+    with pytest.raises(ValueError, match="rope_dim must be a multiple"):
+        validate_mx_shape(256, 24, 128)
+    base = dict(dtype=torch.bfloat16, h_q=8, h_kv=2, d=256, rope_dim=64, eps=_EPS, want_rstd=False, tile_rows=8)
+    with pytest.raises(ValueError, match="mx_out must be a bool"):
+        compile_qk_norm_rope_tma(**base, mx_out=1)
+    with pytest.raises(ValueError, match="two epilogues of one tile"):
+        compile_qk_norm_rope_tma(**base, fp8_out=True, mx_out=True)
+    with pytest.raises(ValueError, match="emits no rstd"):
+        compile_qk_norm_rope_tma(**{**base, "want_rstd": True}, mx_out=True)
+    with pytest.raises(ValueError, match="refills after its second barrier only"):
+        compile_qk_norm_rope_tma(**base, refill_pos=0, mx_out=True)
+    if not torch.cuda.is_available():
+        return
+    rb = dict(compiled=None, h_q=8, h_kv=2, d=256, eps=_EPS, tile_rows=8, stages=2, stages_o=1, threads=128, want_rstd=False, ctas_per_sm=8, apply_norm=True)
+    r16 = QkNormRopeTmaRecipe(**rb)
+    rmx = QkNormRopeTmaRecipe(**rb, mx_out=True)
+    assert r16.mx_out is False and rmx.fp8_out is False
+    b, s = 2, 64
+    t = b * s
+    x = torch.empty(t, 8, 256, dtype=torch.bfloat16, device="cuda")
+    kx = torch.empty(t, 2, 256, dtype=torch.bfloat16, device="cuda")
+    w = torch.ones(256, dtype=torch.bfloat16, device="cuda")
+    tab = torch.empty(t, 64, dtype=torch.bfloat16, device="cuda")
+    o = _mx_blobs(b, s, 8, 2, 256)
+    with pytest.raises(ValueError, match="WITH the MX epilogue .*must all be bound"):
+        run_qk_norm_rope_tma(rmx, x, kx, None, None, w, w, tab, tab, stream=0, batch=b, seq_len=s, **{**o, "sf_k_T": None})
+    with pytest.raises(ValueError, match="WITH the MX epilogue .*must all be bound"):
+        run_qk_norm_rope_tma(rmx, x, kx, None, None, w, w, tab, tab, stream=0, seq_len=s, **o)
+    with pytest.raises(ValueError, match="pass q_out=k_out=None and no"):
+        run_qk_norm_rope_tma(rmx, x, kx, x, kx, w, w, tab, tab, stream=0, batch=b, seq_len=s, **o)
+    with pytest.raises(ValueError, match="pass q_out=k_out=None and no"):
+        run_qk_norm_rope_tma(rmx, x, kx, None, None, w, w, tab, tab, stream=0, batch=b, seq_len=s, scale_q=torch.ones(1, device="cuda"), **o)
+    with pytest.raises(ValueError, match="T must equal batch\\*seq_len"):
+        run_qk_norm_rope_tma(rmx, x, kx, None, None, w, w, tab, tab, stream=0, batch=b, seq_len=s + 1, **o)
+    with pytest.raises(ValueError, match="sf_q_T must hold exactly"):
+        run_qk_norm_rope_tma(rmx, x, kx, None, None, w, w, tab, tab, stream=0, batch=b, seq_len=s, **{**o, "sf_q_T": o["sf_q_T"][:-16]})
+    with pytest.raises(ValueError, match="q_T8 must be a torch.float8_e4m3fn"):
+        run_qk_norm_rope_tma(rmx, x, kx, None, None, w, w, tab, tab, stream=0, batch=b, seq_len=s, **{**o, "q_T8": x})
+    with pytest.raises(ValueError, match="WITHOUT the MX epilogue"):
+        run_qk_norm_rope_tma(r16, x, kx, x, kx, w, w, tab, tab, stream=0, sf_q=o["sf_q"])
+    with pytest.raises(ValueError, match="WITHOUT the MX epilogue"):
+        run_qk_norm_rope_tma(r16, x, kx, x, kx, w, w, tab, tab, stream=0, batch=b, seq_len=s)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_tma_e4m3_epilogue_contract_is_typed():
     """``fp8_out`` both directions at execute (Rule 1): the e4m3 outputs and scales REQUIRED on an fp8_out artifact and refused on a

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Declared padded Stats: pure binding, ordered initialization, and actual stores."""
 
+import sdpa_binding_reference as binding_reference
+
 import math
 
 import pytest
@@ -42,7 +44,7 @@ def _execute(s, facts, native, stream=17, workspace=0x50000000):
         return s.native.execute(prep._native_pack_from_facts(facts, roles), tuple(range(len(roles))), workspace, stream)
     saved, s.native = s.native, None
     try:
-        fn = prep.execute_quantized if getattr(s, "quant", None) is not None else prep.execute_thd
+        fn = binding_reference.execute_quantized if getattr(s, "quant", None) is not None else binding_reference.execute_thd
         return fn(s, facts, workspace, stream, stream)
     finally:
         s.native = saved
@@ -57,7 +59,7 @@ def test_padded_bind_is_pure_and_execute_seeds_once(monkeypatch, quantized, empt
     # Both low-level binders leave storage untouched, even for empty Q.
     roles = prep._NATIVE_THD_ROLES + (prep._QUANT_ROLES if quantized else ())
     native_frame = s.native.bind(prep._native_pack_from_facts(facts, roles), tuple(range(len(roles))), 0x50000000, 17)
-    python_frame = prep._bind_thd_python(s, facts, 0x50000000, 17, 17)
+    python_frame = binding_reference._bind_thd_python(s, facts, 0x50000000, 17, 17)
     if not quantized and not empty:
         assert tuple(native_frame) == tuple(python_frame)
     assert frames == writes == []
@@ -293,7 +295,7 @@ def test_empty_padded_standalone_rejection_does_not_write(native, bad):
     api.compile()
     assert api._thd_spec.native is not None
     if not native:
-        api._thd_spec.native = None
+        binding_reference.use_reference(api._thd_spec)
     ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
     lens = torch.zeros(b, device="cuda", dtype=torch.int32)
     sink = torch.ones(h, device="cuda")
@@ -331,7 +333,7 @@ def test_empty_quantized_standalone_rejection_does_not_write(native):
     api.compile()
     assert api._thd_spec.native is not None and not api._thd_spec.has_lse
     if not native:
-        api._thd_spec.native = None
+        binding_reference.use_reference(api._thd_spec)
     ws = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
     lens = torch.zeros(b, device="cuda", dtype=torch.int32)
     sink = torch.ones(h, device="cuda")
@@ -364,7 +366,7 @@ def test_padded_graph_contiguous_storage_uses_declared_strides(native, fp8, rank
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.lse_padded and spec.native is not None
     if not native:
-        spec.native = None
+        binding_reference.use_reference(spec)
     b, h, s = buf["lse"].shape
     for _ in range(2):
         # The graph declares BHS axes with BSH strides; the bound tensor is
@@ -455,7 +457,7 @@ def test_padded_stats_physical_int64(fp8, native, layout):
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None
     if not native:
-        spec.native = None
+        binding_reference.use_reference(spec)
     # Poison unused low addresses reached by byte-offset narrowing, without
     # initializing the multi-GB holes in the true sparse layout.
     guard = buf["lse"].as_strided((64,), (1,), storage_offset=256)
@@ -496,7 +498,7 @@ def test_padded_mxfp8_graph_current_scales(ordered, native):
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.lse_padded and spec.native is not None
     if not native:
-        spec.native = None
+        binding_reference.use_reference(spec)
     uids, values = tuple(t.get_uid() for t in vp), tuple(vp.values())
 
     def call():

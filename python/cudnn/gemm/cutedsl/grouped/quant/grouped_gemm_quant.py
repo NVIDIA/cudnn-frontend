@@ -593,7 +593,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         d_col = kernel_facing_mx(d_col)
         prob = kernel_facing_prob(prob)
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
-            b = kernel_facing_b(b)
+            b = kernel_facing_b(b, b_major_mode == OperandMajorMode.MN)
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = a.element_type
         self.d_dtype: Type[cutlass.Numeric] = d.element_type

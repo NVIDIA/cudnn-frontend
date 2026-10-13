@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Opaque MXFP8 scale storage has one native contract for dense and THD."""
 
+import sdpa_binding_reference as binding_reference
+
 import ast
 from pathlib import Path
 
@@ -71,7 +73,7 @@ def test_mxfp8_native_actual_host_frames(thd, split, d, dv, output, carrier):
         fresh = {role: f._replace(ptr=f.ptr + offset) if f is not None else None for role, f in facts.items()}
         native, s.native = s.native, None
         try:
-            prep.execute_quantized(s, fresh, 0x50000000 + offset, 17, 17)
+            binding_reference.execute_quantized(s, fresh, 0x50000000 + offset, 17, 17)
         finally:
             s.native = native
         expected, tail = frames.pop(), combined.pop() if split > 1 else None
@@ -142,7 +144,7 @@ def test_mxfp8_native_graph_rebind_and_capture(thd, split, d, dv, output, monkey
     g, vp, ws, bufs, ts = _case(thd=thd, split_kv=split, d=d, dv=dv, output_dtype=output, arch=arch, explicit_plan=True)
     assert g._compiled_plans[g._plan_index]._prepared.spec.native is not None
     monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native MXFP8 rebuilt Python facts"))
-    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native MXFP8 entered Python binding"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native MXFP8 entered Python binding"), raising=False)
     g.execute(vp, ws)
     _check(bufs, thd=thd)
     for name in ("q", "k", "v", "o", "sf_q", "sf_k", "sf_v", "lse", "amax_o"):
@@ -172,8 +174,12 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     from cudnn.engines import MANIFEST
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS, SdpaFwdKnobs, engine_name
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)) or not _dsl_installed():
+    cc = torch.cuda.get_device_capability()
+    if cc not in ((10, 0), (10, 3), (10, 7)) or not _dsl_installed():
         pytest.skip("requires an existing paged MXFP8 graph row")
+    rubin = cc == (10, 7)
+    if rubin and split > 1:
+        pytest.skip("the cc 10.7 MXFP8 row serves paged pools unsplit")
     g, vp, out, stats, amax, reference = _build_mxfp8(
         2,
         4,
@@ -192,7 +198,9 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     )
     g.validate()
     g.build_operation_graph()
-    name = engine_name(arch="sm100", mxfp8=True)
+    # The cc 10.7 row serves the same pool contract on d128 (cga2) / d256 (cga1): separate V table, batch-innermost
+    # tables, e4m3 O, Stats, CUDA-graph replay after mutating the SF bytes, native-binder-only execution.
+    name = engine_name(arch="sm107" if rubin else "sm100", mxfp8=True)
     family = next(f for f in MANIFEST if f.name == "frost_sdpa_fwd")
     caps = next(s.capabilities for s in ENGINE_SPECS if s.name == name)
     cga = max(dict(caps.cgas_by_d_shape).get((d, d), caps.cgas))
@@ -207,7 +215,7 @@ def test_mxfp8_native_paged_scales_and_replay(d, split, output, monkeypatch):
     scale_ports = [t for t in vp if t.get_data_type() == cudnn.data_type.FP8_E8M0]
     assert len(scale_ports) == 3
     monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native paged MXFP8 rebuilt Python facts"))
-    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native paged MXFP8 entered Python binding"))
+    monkeypatch.setattr(prep, "execute_quantized", lambda *a, **k: pytest.fail("native paged MXFP8 entered Python binding"), raising=False)
 
     def check():
         expected, lse = _ref_mxfp8(**reference)

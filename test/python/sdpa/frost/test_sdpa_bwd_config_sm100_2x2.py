@@ -337,9 +337,9 @@ def test_kernel_source_pins():
     # The init-count ledger: every MBarrier init is a named CFG constant.
     inits = re.findall(r"init_count=CFG\.(\w+)", src)
     assert sorted(inits) == sorted(
-        ["ONE_LANE", "ONE_LANE", "ONE_LANE", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
+        ["ONE_LANE", "ONE_LANE", "CGA_M", "RING_EMPTY_ARRIVERS", "ONE_LANE", "ACC_EMPTY_ARRIVERS", "COMPUTE_LANES", "ONE_WARP", "TMEM_DEALLOC_ARRIVERS"]
     )
-    # The GPU-sharing hang fix: the two barriers whose completing event comes from outside the pair are POLLED (never
+    # The cross-pair waits remain polled; the observer ACK protocol also orders phase reuse. The waits are never
     # parked in NANOSLEEP.SYNCS) under KV_SHARE 2, at every wait site -- the kv-loop ring waits and the end-of-kernel drain.
     polled = re.findall(r"_wait_b\(\s*bars\.mb_tma_ring_(empty|full)\[[^\]]+\]\.smem_ptr,(?:[^()]|\([^()]*\))*?poll=_KV_SHARED,", src, flags=re.S)
     assert sorted(polled) == ["empty", "empty", "full"], polled

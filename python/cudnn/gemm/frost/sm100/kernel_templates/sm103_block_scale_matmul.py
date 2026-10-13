@@ -434,6 +434,7 @@ def _kernel(
             ab_empty_count = cluster_m + cluster_n - 1
         else:
             ab_empty_count = (cluster_m // cta_group) + cluster_n - 1
+    sf_empty_count = cluster_size // cta_group
     num_consumer_warps_per_cta = 8
     clc_empty_count = num_consumer_warps_per_cta * cluster_size
     if warp_idx == 0:
@@ -454,7 +455,7 @@ def _kernel(
                 if elect_one:
                     nvvm.mbarrier_init(sf_full_mbar_ptr.subview(i), 1)
                 if elect_one:
-                    nvvm.mbarrier_init(sf_empty_mbar_ptr.subview(i), ab_empty_count)
+                    nvvm.mbarrier_init(sf_empty_mbar_ptr.subview(i), sf_empty_count)
             for i in range(acc_stages):
                 if elect_one:
                     nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
@@ -473,7 +474,7 @@ def _kernel(
                 if elect_one:
                     nvvm.mbarrier_init(sf_full_mbar_ptr.subview(i), 1)
                 if elect_one:
-                    nvvm.mbarrier_init(sf_empty_mbar_ptr.subview(i), ab_empty_count)
+                    nvvm.mbarrier_init(sf_empty_mbar_ptr.subview(i), sf_empty_count)
             for i in range(acc_stages):
                 if elect_one:
                     nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
@@ -1001,6 +1002,7 @@ def _kernel(
         ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
     else:
         ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
+    sf_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
     if cutlass.const_expr(cta_group == 2):
         acc_full_mcast = cutlass.Int16(3) << pair_leader_rank
     else:
@@ -1265,7 +1267,7 @@ def _kernel(
                             if is_mma_leader:
                                 nvvm.tcgen05_commit(
                                     sf_empty_mbar_ptr.subview(mma_sf_stage),
-                                    multicast_mask=ab_empty_arrive_mask,
+                                    multicast_mask=sf_empty_arrive_mask,
                                     group=_CTA_GROUP,
                                 )
                             _sfw = mma_sf_stage == (sf_stages - 1)

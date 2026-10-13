@@ -279,6 +279,17 @@ elif CFG.DTYPE_QKV == 4:
 else:
     raise ValueError(f"prefill_sdpa_f16: DTYPE_QKV={CFG.DTYPE_QKV} not supported " f"(expected 2=BF16, 3=FP16, or 4=TF32)")
 
+# softmax_scale_prefolded (the graph attribute attn_scale_prefolded): the caller multiplied Q by
+# attn_scale * log2(e), so the raw QK^T already sits in the log2 domain.  The softmax body then takes the
+# RAW row max (no `* scale_log2`) and shifts with `reg_S - m` (one FADD2 per pair where the scaled path
+# issues an FFMA2); `scale_log2` stays a runtime argument of every signature (the adapter pins it to
+# exactly 1.0) and is simply dead under the fold.  Numerically neutral: the running max, the published
+# Stats, the LSE, the sink fold and the split partials all consume the same log2-domain values either way,
+# and the f32 exponent chain is unchanged (softmax_f16 is a quantized-kernel specialization; the config
+# declines it on half inputs).  Instruction-neutral on its own -- it keeps the knob matrix uniform across
+# the cc 10.7 forward flavors.
+SCALE_PREFOLDED = int(PARAMS.softmax_scale_prefolded)
+
 
 from cudnn.sdpa.fwd.kernels._common_blackwell import (
     sdpa_operand_tensors,
@@ -294,6 +305,7 @@ from cudnn.sdpa.fwd.kernels._common_blackwell import (
     make_sdpa_helpers,
     make_split_helpers,
     store_fp32_partial_tile as _store_fp32_partial_tile,
+    running_max_step_finite_sentinel,
 )
 from cudnn.frost.tile_dsl.bias import (
     bias_block_geometry,
@@ -2234,6 +2246,7 @@ def _mma_warp_group(
         b_dtype=STORAGE_DTYPE,
         n_dim=CFG.TILE_N,
         m_dim=CFG.TILE_M * CFG.CTA_MMA,
+        a_negate=int(PARAMS.negate_scores),
     )
     idesc_pv = prims.Tcgen05InstrDesc.build(
         c_dtype=cutlass.Float32,
@@ -3168,7 +3181,13 @@ def _softmax_kv_body(
     # Pass size=CFG.TILE_N explicitly — Vector.shape[0] is an MLIR value
     # (not Python int) for vec_concat-built vectors, so auto-detect can't recover the length.
     reg_S = RegTile(reg_S_vec, size=CFG.TILE_N)
-    current_max = current_max_unscaled * scale_log2
+    # current_max_unscaled is the tile's RAW row max -- exactly NEG_INF (the finite mask sentinel) iff every column of
+    # this tile is masked; running_max_step_finite_sentinel keys its dead-tile select on it.
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Raw-domain max (Q carries the scale).
+        current_max = current_max_unscaled
+    else:
+        current_max = current_max_unscaled * scale_log2
 
     # Named-barrier wg0/wg1 sync: sub_tile_id==1 waits at TOP for sub_tile_id==0's bottom arrive.
     if sub_tile_id == 1:
@@ -3178,26 +3197,16 @@ def _softmax_kv_body(
         # WG1 waits for WG0 on barrier 8 -- the three groups publish their P in sub-tile order and never contend for the MUFU at once.
         nvvm.barrier_cta_sync(barrier_id=9, thread_count=256)
 
-    # Online softmax with RESCALE_THRESHOLD skip.
-    old_total_max = total_max
-    is_first = total_max == NEG_INF
-    update_cond = is_first | ((current_max - total_max) > RESCALE_THRESHOLD)
-    total_max = cutlass.Float32(
-        arith.select(
-            update_cond.ir_value(),
-            current_max.ir_value(),
-            total_max.ir_value(),
-        )
+    # Online softmax with the RESCALE_THRESHOLD skip: the running max, alpha and the exp2 shift of this tile.  A tile that
+    # is fully masked AHEAD of the row's first live key is selected out of the state (total_max stays NEG_INF, alpha = 1,
+    # shift 0 -> P = 0 on every column): the finite mask sentinel never becomes the running max (scaled by scale_log2 > 1
+    # it overflowed to -inf and the shift read -inf - (-inf) = NaN into P; below that and under the pre-folded scale every masked
+    # column published P = 1, mass that only alpha = 0 at the next live tile wiped -- a multiply by zero).  Folded out
+    # of the MASK_NONE build; a row with no live key at all still ends its loop at (NEG_INF, 0) and is published by the
+    # epilogue's _kv_empty select.
+    total_max, alpha, new_total_max = running_max_step_finite_sentinel(
+        current_max_unscaled, current_max, total_max, NEG_INF, RESCALE_THRESHOLD, masked=CFG.MASK_FLAGS != MASK_NONE
     )
-    exp_input = cutlass.Float32(
-        arith.select(
-            is_first.ir_value(),
-            NEG_INF.ir_value(),
-            (old_total_max - total_max).ir_value(),
-        )
-    )
-    alpha = cute.math.exp2(exp_input, fastmath=True)
-    new_total_max = total_max
     if cutlass.const_expr(track_true_max):
         true_max = cute.math.max(true_max, current_max, ftz=True)
 
@@ -3207,7 +3216,11 @@ def _softmax_kv_body(
     bars.mb_stat_full[sub_tile_id].arrive()
 
     # Rescale full reg_S in one vector op — emits same FFMA2 sequence as explicit half-tile rescales.
-    reg_S = reg_S * scale_log2 - new_total_max
+    if cutlass.const_expr(SCALE_PREFOLDED):
+        # Pre-folded scale: the shift alone (FADD2 pairs) -- the scores are already log2-domain.
+        reg_S = reg_S - new_total_max
+    else:
+        reg_S = reg_S * scale_log2 - new_total_max
 
     # Chunk 0 manual unroll — the DSL's @cute.jit tracer makes the loop iter an
     # MLIR value, breaking Python slice.indices() math inside RegTile[].
@@ -3581,7 +3594,7 @@ def _softmax_warp_group(
     # MMA warp's s_prod / s_cons and the correction's s_corr.  None on the one-slot body (never assigned there).
     s_idx = cutlass.Int32(0) if _S2 else None
     stat_empty_phase = cutlass.Int32(1)  # bootstrap pre-armed at phase 1 so first wait passes immediately
-    # init phase=1; both softmax wgs wait on slot [0] not [SoftmaxGid].
+    # init phase=1; each softmax wg waits its own O slot (see the top-of-tile wait).
     epilogue_state = cutlass.Int32(1)
     # mb_bias_full consumer phase (wait-then-arrive, start(0)); flips once per NON-empty item, like the producer's.
     bias_full_phase = cutlass.Int32(0)
@@ -3679,9 +3692,14 @@ def _softmax_warp_group(
         while is_valid_tile > cutlass.Int32(0):
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-            # Top-of-tile mb_o_empty[0] wait: without it softmax can race into the
+            # Top-of-tile mb_o_empty wait: without it softmax can race into the
             # next tile while TMA-STG is still draining the prior tile's O slot.
-            bars.mb_o_empty[0].wait(epilogue_state, spin=SPIN_RING_WAITS)
+            # Each softmax warpgroup waits ITS OWN O slot.  Slot 0's producer chain (MMA bmm2_done[0] -> correction qs=0 epilogue ->
+            # o_full[0] -> TMA-STG -> o_empty[0]) never passes through warpgroup 1, so TMA-STG could complete a SECOND phase of slot 0
+            # before warpgroup 1 performed this parity wait -- shortest on an EMPTY (q-tile, split) unit -- and the wait aliased: warpgroup 1
+            # never published that tile's stats and the correction (stat_full[1]) and TMA-STG (o_full[1]) deadlocked (GitHub #1532, #1525).
+            # Slot sub_tile_id's chain runs through this warpgroup's own stats publish, so its producer is bounded to one phase ahead.
+            bars.mb_o_empty[sub_tile_id].wait(epilogue_state, spin=SPIN_RING_WAITS)
             epilogue_state = epilogue_state ^ cutlass.Int32(1)
 
             total_max = NEG_INF
@@ -3953,7 +3971,7 @@ def _softmax_item_pair(
 ):
     """One (n, n+1) pair work item of a softmax warp group (CFG.N_CHUNK > 0): this sub-tile is row rows[sub_tile_id] of every
     step (two sub-tiles on the pair item, three with the third softmax warp group); the resident block is waited ONCE per live item before step 0 and released ONCE after the last step (the SAME
-    global-length predicate the TMA-LDG warp fills on); per step the one-batch-entry tile body -- the top-of-step `mb_o_empty[0]`
+    global-length predicate the TMA-LDG warp fills on); per step the one-batch-entry tile body -- the top-of-step `mb_o_empty[sub_tile_id]`
     wait, the stat_empty bootstrap, the -inf masked kv body at THIS row's lengths (`_softmax_kv_body_inf` with block row
     `tid_in_wg`: both sub-tiles read the 128-row block) over the PAIR's union of kv tiles, the stats publish.  On the STREAMED
     ring the per-item wait / release fold out and the body waits / releases ONE ring stage per kv tile (`bias_ring_state`,
@@ -3977,8 +3995,9 @@ def _softmax_item_pair(
         nb = rows[sub_tile_id]  # a trace-time select: sub_tile_id is the warp group's Python int
         sb = _pair_step_bounds(q_tile_idx, seqlen_q, seqlen_kv, seq_kv_lens_tensor, seq_q_lens_addr, rows)
         eff_seqlen_kv = _resolve_seqlen_kv(seq_kv_lens_tensor, nb, seqlen_kv)
-        # Top-of-step mb_o_empty[0] wait (the TMA-STG drains the previous step's O slot before this one is reused).
-        bars.mb_o_empty[0].wait(epilogue_state, spin=SPIN_RING_WAITS)
+        # Top-of-step mb_o_empty wait (the TMA-STG drains the previous step's O slot before this one is reused); each softmax
+        # warp group waits ITS OWN O slot, as at the top of the one-batch-entry tile (GitHub #1532, #1525).
+        bars.mb_o_empty[sub_tile_id].wait(epilogue_state, spin=SPIN_RING_WAITS)
         epilogue_state = epilogue_state ^ cutlass.Int32(1)
         total_max = NEG_INF_TRUE
         total_max_safe = NEG_INF_TRUE

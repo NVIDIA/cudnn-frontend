@@ -57,6 +57,7 @@ from ..moe_kernel_helpers import (
     get_dtype_rcp_limits,
     can_implement,
     amax_reduction_per_thread,
+    warp_amax_with_nan,
     epilog_gmem_copy_and_partition,
 )
 
@@ -1188,12 +1189,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
     @cute.jit
     def amax_reduction_per_warp_and_cta(self, amax_fp32, warp_idx, amax_smem, amax_gmem) -> None:
         # Warp-level reduction using wrapper function
-        warp_amax = cute.arch.warp_redux_sync(
-            value=amax_fp32,
-            kind="fmax",
-            mask_and_clamp=0xFFFFFFFF,
-            nan=True,
-        )
+        warp_amax = warp_amax_with_nan(amax_fp32)
         # Each epilogue warp's lane 0 writes warp amax to shared memory
         if cute.arch.lane_idx() == 0:
             amax_smem[warp_idx] = cutlass.Float32(warp_amax)
@@ -1289,14 +1285,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         #
         # Manually store pvscale to avoid spilling
         #
-        if tile_idx == 0:
-            pvscale[0] = tmp_f32
-        elif tile_idx == 1:
-            pvscale[1] = tmp_f32
-        elif tile_idx == 2:
-            pvscale[2] = tmp_f32
-        elif tile_idx == 3:
-            pvscale[3] = tmp_f32
+        for scale_idx in cutlass.range_constexpr(cute.size(pvscale)):
+            if tile_idx == scale_idx:
+                pvscale[scale_idx] = tmp_f32
 
         #
         # Compute quantized output values and convert to D type
@@ -1349,18 +1340,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
         tmp_f32 = cutlass.Float32(0.0)
         for vi in cutlass.range_constexpr(acc_frg.shape[0]):
-            max_value_original = (
-                cutlass.Float32(
-                    cute.arch.warp_redux_sync(
-                        value=acc_frg[vi, 0],
-                        kind="fmax",
-                        mask_and_clamp=0xFFFFFFFF,
-                        nan=True,
-                    )
-                )
-                * rcp_limit
-                * norm_const
-            )
+            max_value_original = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0])) * rcp_limit * norm_const
             max_value_vec = cute.full(4, max_value_original, dtype=cutlass.Float32)
             max_value_vec_f8 = max_value_vec.to(cutlass.Float8E8M0FNU)
             max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)
@@ -1411,7 +1391,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             (tokens_this_group, n_total, mSFDCol_mnl.shape[2]),
             (1, 2, 3),
         )
-        regPerSubtile = 4
+        regPerSubtile = self.mma_tiler_d[1] // 32
         sfd_tile = (
             cute.make_layout(128),
             cute.make_layout(32 * regPerSubtile),
@@ -2468,7 +2448,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
             if cutlass.const_expr(self.generate_sfd):
                 norm_const = cutlass.Float32(norm_const_tensor[0])
-                regPerSubtile = 4
+                regPerSubtile = self.mma_tiler_d[1] // 32
                 sfd_row_tile = (
                     cute.make_layout(128),
                     cute.make_layout(32 * regPerSubtile),
@@ -2862,7 +2842,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                             )
                         ]
 
-                        if subtile_idx == 6:
+                        if subtile_idx == subtile_cnt - 2:
                             if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
                                 tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
                                 cute.autovec_copy(tCrSFDRow, tCgSFDRow)

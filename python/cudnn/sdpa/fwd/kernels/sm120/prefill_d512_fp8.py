@@ -1124,7 +1124,11 @@ class SM120FusedMultiHeadAttentionForward:
         """
         # Raw-score maxima bound P only for a nonnegative multiplier. Fold
         # its sign into Q once per unit, including the device Q/K descales.
-        negate_q = softmax_scale_log2 < 0.0
+        if cutlass.const_expr(PARAMS.negate_scores):
+            # attn_scale < 0 arrives as |attn_scale| (#1435); a negative descale product still flips at run time.
+            negate_q = softmax_scale_log2 > 0.0
+        else:
+            negate_q = softmax_scale_log2 < 0.0
         softmax_scale_log2 = cute.math.abs(softmax_scale_log2)
         q_seq_idx = q_tile_idx * (self.q_tile // self.qh_per_kh if self.pack_gqa else self.q_tile)
 

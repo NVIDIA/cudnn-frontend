@@ -300,47 +300,36 @@ Shared protocol (both passes):
   from the current state: unused slots pass at their pre-armed parity, used slots wait their last release.  Detector:
   `test_sdpa_bwd_dsl_sm100.py::test_ring_drain_walks_every_used_slot` (a pure-Python twin of the protocol over every issue
   count; the old rule misses every `0 < total < stages`) plus the single-kv-tile GPU cells on both arch lines.
-- **Barriers completed by events from ANOTHER cta_group::2 pair (cross-pair commit multicast, cross-pair TMA
-  complete_tx, a twin's remote arrive) must be waited with a non-blocking `mbarrier.test_wait.parity` poll;
-  `try_wait` -- hinted (`NANOSLEEP.SYNCS`) or hint-less (`wait(spin=True)`, a suspended `TRYWAIT`) -- parks the warp
-  and can miss the wake-up under GPU time-slicing.** Measured on the d512 2x2 backward (2026-10-01): hang within
-  2-74 launches on every parking form, 200/200 and 300/300 with the poll. Declare such barriers `MBarrier(poll=True)`
-  (`barrier.wait_poll`; the 2x2 forward: `make_d512_2x2_bars(cross_pair_poll=True)` on k/v_full, k/v_empty,
-  o_empty, i.e. every kv-loop wait AND the end-of-kernel drains on them); pair-local barriers keep the default.
-  The scheduler payload barrier belongs to the same class on a 4-CTA cluster: the cluster lead completes it by DSMEM
-  `st.async` + complete_tx into every CTA, an outside-pair event for the second pair -- the d512 2x2 backward bodies poll
-  it as a precaution (#1323 round 2). The CI hang that prompted it -- the detector at launch 22/100 -- was later
-  attributed to the detector's OWN negative control wedging the shared GPU (the xdist lesson below), not to this
-  barrier; the poll stays because the event is outside-pair by construction.
-  The poll is two-phase with a PER-KERNEL shape (`wait_poll(mb, phase, tight_iters, sleep_ns)` /
-  `MBarrier(poll=True, poll_tight, poll_sleep_ns)`: `tight_iters` back-to-back tests, then a TIMER `nanosleep(sleep_ns)`
-  between tests; `sleep_ns = 0` is the pure tight loop). A tight loop on the MMA / TMA-LDG warp starves the compute
-  warps sharing its SMSP when the waits are long (the d512 backward ran 2.2x slower with it; it ships 128 / 128), while
-  the forwards' short waits lose nothing to it (both forwards 32 / 128; on the cc 10.7 forward the tight loop and
-  32 / 128 measured within 0.15 % of each other);
-  the timer sleep is `NANOSLEEP`, not the event-sleep `NANOSLEEP.SYNCS`, so the warp still never parks on the barrier.
-  Backward evidence: the heartbeat dump showed one cluster frozen with a follower's
-  TMA-LDG warp still waiting for a release the other three CTAs' copies of the
-  same barrier had completed five chunks earlier; the sleeping `try_wait` (1 ns
-  and 10 ms hints) and the hint-less `try_wait` spin all hung within 2-74
-  time-sliced launches, the poll never did (200/200, 300/300), and nothing was
-  wrong with any count. Backward detectors:
-  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_survives_gpu_time_slicing` (a 4x1
-  load child + the twin for 100 launches; a hang exits 3 after a 45 s budget)
-  and its negative control
-  `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing`
-  (`TemplateParams2x2.wait_form = 4` = the pre-fix form, `gpu_exclusive`);
-  `test_sdpa_bwd_config_sm100_2x2.py::test_kernel_source_pins` pins
-  `poll=_KV_SHARED` on the three ring wait sites. To localise a future hang,
-  arm `debug_heartbeat` + `debug_dump_addr` (every warp records its barrier,
-  stage, phase, kv_loop and chunk before each wait into a host-pinned buffer;
-  `lane_d512_bprop/fix/hang_dbg.py` decodes it) -- the bounded-wait lever
-  (`debug_wait_ms`) changes the wait's shape and does NOT reproduce this hang.
-  Detectors (test_sdpa_fwd_d512_2x2_sm100.py): `test_two_by_two_cross_pair_waits_poll` (source pin: exactly those
-  barriers poll, the constant is threaded, default on), `test_two_by_two_survives_gpu_time_slicing` (a role-split
-  load child + 100 watchdogged twin launches, exit 3 on a hang) and its `gpu_exclusive` negative control
-  `test_two_by_two_parking_wait_form_under_time_slicing` (pre-fix form; xfail(strict=False) until the forward
-  reproduces the hang -- the backward's `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` does).
+- **Do not pin a nondeterministic compiler output by its byte hash.** The SM100 D512 THD backward ACK body can
+  produce different PTX from identical raw/clean MLIR under the same DSL build, even with a fixed Python hash seed.
+  Use `test_stage2_2x2_sass_pins[sm_100a-thd]` for its structural lowering checks and retain THD numerical/capture
+  tests. Archive both outputs when diagnosing this; do not retry until a chosen golden happens to match.
+- **Every local barrier object needs a successful phase observation before it can be advanced again.**
+  Matching arrival counts and a different wait instruction do not establish this ordering. In the D512 shared backward
+  ring, multicast commits advance all four local empty objects. A passive follower could lag while the other CTAs recycle
+  its slot, losing the expected parity (ABA). Keep its wait: deleting it leaves an unobserved object in the multicast.
+  Gate both consumers on all four observations instead: each leader's full barrier counts its own expect-tx arrival and
+  three remote ACKs, sent only after the sending CTA's successful local empty wait. Then both MMAs and the next empty
+  release follow all four observations. Keep whole-ring drains and the KV_SHARE=1 protocol unchanged. Detectors:
+  `test_sdpa_bwd_dsl_sm100.py::test_stage2_2x2_waits_for_delayed_empty_observer` and
+  `test_sdpa_bwd_d512_sm107.py::test_chain_waits_for_delayed_empty_observer` delay a passive CTA at chunk 0 of the SECOND
+  KV tile, so both four- and eight-stage rings reuse a slot. They check reference gradients and capture/replay in a
+  watchdogged child. Check generated wait -> ACK ordering as well as source when changing this protocol.
+- **Keep cross-pair polling separate from the phase-lifetime proof.** The historical October 1 backward experiment
+  hung within 2-74 launches with sleeping/hint-less try-wait, while polling completed 200/200 and 300/300. Those finite
+  observations did not prove a lost wake-up or a correct ring; polling alone does not fix the observer ordering above.
+  Existing cross-pair polling remains in place (ring full/empty and scheduler payload); pair-local waits retain their
+  current form. `test_sdpa_bwd_config_sm100_2x2.py::test_kernel_source_pins` pins the three ring poll sites.
+  Poll shape is per kernel: backward 128 tight tests / 128 ns timer sleep, forward 32 / 128. A timer sleep is not
+  `NANOSLEEP.SYNCS`; a tight poll can starve compute warps sharing the SMSP. The historical backward tight-poll experiment
+  was 2.2x slower. Do not change polling as part of a lifecycle fix without separate attribution.
+  Keep `test_stage2_2x2_survives_gpu_time_slicing` as a natural positive stress test; the old probabilistic must-hang
+  `test_stage2_2x2_prefix_wait_form_hangs_under_time_slicing` is replaced by the delayed-observer regression above.
+  Keep all diagnostic levers: `debug_heartbeat` + `debug_dump_addr` record barrier, stage, phase, kv_loop and chunk
+  before each wait (`lane_d512_bprop/fix/hang_dbg.py` decodes them). `debug_wait_ms` changes the wait's shape, so failure
+  to reproduce with it is not a waiver. Forward detectors remain `test_two_by_two_cross_pair_waits_poll`,
+  `test_two_by_two_survives_gpu_time_slicing`, and `test_two_by_two_parking_wait_form_under_time_slicing`; forward hangs
+  require their own diagnosis, not an inference from this backward fix.
 - **A watchdogged detector and the negative control that deliberately WEDGES the GPU must never share a device at
   the same time: put BOTH in `@pytest.mark.xdist_group(name="gpu_exclusive")`, the repo's convention next to the
   `gpu_exclusive` marker (which xdist does not enforce by itself).** The CI FROST lane runs 16 workers over 4 GPUs
@@ -348,12 +337,17 @@ Shared protocol (both passes):
   tests start together and share a GPU one time in four. The d512 backward detector then read its own control's
   45 s wedge as a hang: pipelines 71863093 (launch 22) and 71991279 (launch 35), the detector at ~63 s = compile
   + its 45 s budget with the control passing at 60-62 s, against ~25 s in the two green pipelines. Junit durations
-  are the tell. The children print the launch-time history and the device's other compute processes on HANG, so
+  are the tell. The children print the launch-time history and compute processes on HANG, so
   a starved launch (ms ... ms, one 45 s wall, neighbours listed) reads differently from a wedged one. The coupling
   mechanism is NOT the obvious one: on a time-sliced B200 a kernel wedged for 180 s beside the shipped twin did not
   slow it at all (six 100-launch runs at 0.24 s median, `jobs/c9d07061/tmp/rebase/wedge/run_wedge.sh`, 2026-10-06), so
   the CI node shares its GPUs differently (concurrent contexts with the wedged clusters holding 136 of 148 SMs is
-  the candidate). The isolation makes the question moot in CI; the history print settles the next occurrence.
+  the candidate). Grouping prevents these controls from overlapping on one worker; it does not reserve a GPU against
+  unrelated workers or other jobs. A timeout with grouping enabled still needs diagnosis. The process query enumerates
+  all GPUs: retain GPU UUIDs with the PIDs and the child's `CUDA_VISIBLE_DEVICES`, and correlate them with the runner's
+  device map before attributing a neighbour to the test GPU. The list may include the reporting child; not every row is
+  another process. A bare PID list is not a per-GPU process count, and a failed `nvidia-smi` query must be reported as
+  unavailable rather than an empty device.
 - **Two pairs sharing an operand ring by cross-pair TMA multicast need an
   `empty` barrier with init = number of PAIRS, released by EVERY pair leader's
   `tcgen05.commit` with the whole-cluster mask (0xF).** CTA c's multicast lands
@@ -406,16 +400,14 @@ Forward (d512 prefill):
   KV range or the shared `k/v_empty` ring deadlocks; `make_sdpa_helpers(kv_shared_cluster=True)` derives the bounds
   over the cluster's 256 rows and the per-cell mask trims. Detector:
   `test_two_by_two_causal_512_cluster_union_bounds`.
-- **A new kernel FILE is a new `kernel_template` name, and the native dense binder gate
-  (`fwd/prepared.py`, `native_family`) admits templates BY NAME.** A twin that becomes the default without being named
-  there keeps passing every numerics suite -- the Python observation path serves it -- while every dense graph and
-  standalone call silently loses the native binding (the d512 2x2 flip, 2026-10-06: 10 width-512 cells of
-  `test_sdpa_native_prefill_binding` red on the sm100 CI lane, `_dense_spec.native is None`, nothing else moved). The
-  binder is slot-name driven, so a twin whose `_host` runtime slot list equals its parent's is served unchanged once
-  named. Detectors: `test_two_by_two_host_slots_match_role_split` (host: the three d512 `_host` signatures agree and
-  the gate names the twin) and `test_two_by_two_default_plan_binds_natively` (GPU: the default d512 plan is the twin
-  AND carries a binder; the role-split arm still does); the width-512 cells of `test_sdpa_native_prefill_binding.py`
-  are the repo-wide tripwire -- run that file after any change to which kernel a default plan lowers onto.
+- **Forward prepared hosts always use native binding, including a new kernel-template name.**
+  The old name allowlist silently demoted a new d512 twin to Python while numerics still passed.
+  That fallback and allowlist are removed: dense and THD builders construct their native binder
+  unconditionally. A new host ABI must update the native binder and frame-parity tests in the
+  same change. `test_two_by_two_host_slots_match_role_split` checks the d512 ABI;
+  `test_two_by_two_default_plan_binds_natively` and `test_sdpa_native_prefill_binding.py` check
+  default and alternate plans on device. `test_sdpa_binder_ownership.py` prevents restoring
+  production Python forward framing or implicit backward ownership.
 
 Backward (d512 stage 2):
 
@@ -473,6 +465,11 @@ Backward (d512 stage 2):
   read cos 0.9996 until the convention was applied). Detector: run the same case
   through the graph API with the engine pinned (`test_sliding_window`); a graph
   pass with a direct-adapter fail is the convention, not the kernel.
+- **An omitted graph `attn_scale` is 1.0; an adapter's `scale_softmax=None` is 1/sqrt(d).** The backend inserts no
+  scale multiply when `attn_scale` is absent, and the analyzer turns absence into `facts.scale = 1.0`, so None never
+  reaches an adapter from a graph. A graph test that omits the scale needs a 1.0 oracle. When it passed None through,
+  FROST computed 1/sqrt(d) on the same graph: O differed by ~4 and Stats by 48-100 from backend engines 8/10 on B200.
+  Detector: `test_omitted_attn_scale_is_no_scaling` (analyzer) and the `test_default_attn_scale` cases.
 - **The `LDTM` SASS count of the masked (three-range) compute body is a
   TOOLCHAIN fact, not a kernel fact.** The public DSL 4.7.0 + CUDA 13.3 ptxas
   keeps three traced range bodies (6 `LDTM`, the SM100 twin's pin); the board's
@@ -610,7 +607,36 @@ replay after previously active rows become fully masked. The detector is
 `test_wrapper_aux_outputs_need_no_torch_clear` for SM80 backward dBias/dSink.
 
 
+## Adapter declines that other suites pin
+
+`gated_attention_block` runs the SDPA forward adapter as its attention stage, and
+its tests pin the adapter's declines by message (`match="multiple of 128"`).
+Those tests run only on the `oss` CI lanes (`python/*/cutedsl`, SM107). A change
+that serves a previously declined shape needs `@cudnn-ci-bot run ...,oss`, not
+only `frost`. #1520 (the KV-tail mask) turned 15 GAB decline pins red because its
+CI ran `python_tests,frost` (#1522). Detector: `git grep -n "match=" test/python/gated_attention_block`
+for the old message.
+
+
 ## Prepared THD launch bounds and setup
+
+Each compiled host contract has one production binder across graph, standalone,
+and staged entry points. Forward and half backward use native binding. Quantized
+backward and standalone compact-GQA backward remain Python until migrated as a
+whole. Backward builders must explicitly choose ownership; omission fails at plan
+construction. A native validation error is never a reason to retry in Python.
+Legacy forward framing exists only in test-only reference modules for differential
+checks; production must not import them. Pure geometry helpers still used by native
+binding stay in production.
+
+Staged forward adapters bind their compact core through the same native binder
+as direct calls. Validate the complete core before any gather, scalar seed, or
+output write; keep alias checks against original carriers as well as workspace
+replacements. The staged half/FP8/MXFP8/SM120 tests forbid Python core binding
+while checking current storage, split outputs and replay. Include legal head-dim
+envelopes: native template ownership must not silently disappear at non-exact
+head dims. `test_half_staged_has_no_execute_allocations_and_replays_current_storage`
+covers those dimensions and the split path.
 
 A cached graph envelope does not describe the current packed allocation.
 Bound its launch using host-known token capacity and effective batch count,
@@ -945,3 +971,21 @@ Without an explicit packed-total hint, the split workspace is still bounded by
 coverage and binding descriptors, partial strides or combine arguments; retain
 physical storage checks. Cover omitted total hints with oversized Q/O/Stats,
 changed device lengths and untouched tail canaries in both binding paths.
+
+
+Standalone prepared calls must enter Q's CUDA device before resolving an
+implicit stream or invoking a compiled host, and restore the caller's device on
+success and validation failure. A matching device in buffer metadata alone does
+not set the calling thread's CUDA context. The SM80 regression is
+`test_sm80_direct_standalone_with_another_device_current`: run with two GPUs,
+check the launch context and stream, then verify changed-input graph replay.
+
+
+Sink-aware packed split partials must exclude the sink. Combine adds its
+per-query-head virtual-key mass once to the stable denominator and never to
+the value numerator. Partial LSE remains natural-log; convert only the final
+Stats. Test keyless rows (O=0, LSE=sink), negative-infinite sinks, poisoned dead
+partials, both runtime reduction branches, and changed sink contents/pointers
+under retained captures. `test_packed_sink_combine_counts_virtual_key_once`
+and the sink cells of `test_paged_thd_split_capture_lengths_and_stats` are the
+detectors; a sink in each partial silently counts it once per partition.

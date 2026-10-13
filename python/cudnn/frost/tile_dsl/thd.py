@@ -516,6 +516,47 @@ def emit_clamped_desc(
     nvvm.tensormap_replace(nvvm.TensormapField.GLOBAL_DIM, dptr, new_value=extent, ord=seq_ord)
 
 
+# --- caller-buffer token origins (issue #737) -------------------------------
+# A ragged port's sequence b starts at element ``ro[b] * M`` of its buffer (M
+# the port's ragged_offset_multiplier).  FROST engines take whole-token offsets
+# as a supported-input precondition, so that is token ``ro[b] * M // ts`` (ts
+# the port's token stride in elements).  Origins are a separate Int64
+# ``[rows, B]`` array, one row per port a path materializes; they never replace
+# the compact cu_seqlens above, which keep addressing internal packed buffers.
+
+
+@cute.jit
+def write_thd_port_origins(
+    org,
+    ro,
+    row: cutlass.Constexpr[int],
+    mult: cutlass.Constexpr[int],
+    ts: cutlass.Constexpr[int],
+    n_batch: cutlass.Int32,
+    tid: cutlass.Int32,
+    nthreads: cutlass.Int32,
+) -> None:
+    """``org[row, b] = ro[b] * mult // ts`` for this thread's batches (strided by
+    ``nthreads``).  ``org`` is the Int64 origins tensor; ``ro`` the bound offset
+    tensor (Int32 or Int64).  Arithmetic is Int64 throughout."""
+    org_p = cutlass.make_array_view(org).data_ptr() + cutlass.Int64(row) * cutlass.Int64(org.stride[0])
+    ro_p = cutlass.make_array_view(ro).data_ptr()
+    for b in cutlass.range(tid, n_batch, nthreads, unroll=1):
+        v = cutlass.Int64(Pointer(ro_p + b, dtype=ro.element_type).load())
+        Pointer(org_p + b, dtype=cutlass.Int64).store((v * cutlass.Int64(mult)) // cutlass.Int64(ts))
+
+
+@cute.jit
+def thd_port_origin(org, row: cutlass.Constexpr[int], b: cutlass.Int32, compact: cutlass.Int32) -> cutlass.Int64:
+    """Token origin of sequence ``b`` in a port's buffer: the materialized origin
+    when ``row >= 0``, else the compact prefix ``compact`` (a port bound without
+    offsets, or an internal buffer; ``org`` is then never read)."""
+    origin = cutlass.Int64(compact)
+    if cutlass.const_expr(row >= 0):
+        origin = Pointer(cutlass.make_array_view(org).data_ptr() + cutlass.Int64(row) * cutlass.Int64(org.stride[0]) + b, dtype=cutlass.Int64).load()
+    return origin
+
+
 __all__ = [
     "TENSOR_MAP_ALIGN",
     "TENSOR_MAP_QWORDS",
@@ -536,9 +577,11 @@ __all__ = [
     "set_tensor_map_bit21",
     "thd_claim_next",
     "thd_decode_unit",
+    "thd_port_origin",
     "write_thd_batch_remap",
     "write_thd_live_and_ctr",
     "write_thd_meta",
     "write_thd_prefix_warp",
+    "write_thd_port_origins",
     "write_thd_row_offsets",
 ]

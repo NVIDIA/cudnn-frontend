@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native ragged decode preserves per-port offsets and current packed capacities."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 import cudnn
@@ -33,7 +35,7 @@ def _fixture(dtype="bfloat16", i64=False, stats="NH", rank=3, total=None):
 
 
 def _equal(s, facts, workspace=0x100000, stream=17):
-    expected = prep.bind_dense_split(s, facts, workspace, stream, stream)
+    expected = binding_reference.bind_dense_split(s, facts, workspace, stream, stream)
     actual = s.native.bind_split(_pack(facts), prep._NATIVE_DENSE_INDICES, workspace, stream)
     assert (actual is None) == (expected is None)
     if actual is not None:
@@ -78,7 +80,7 @@ def test_ragged_bad_offsets_rejected_before_either_launch_after_warmup(i64, role
     else:
         bad[role] = value._replace(**updates[change])
     with pytest.raises(ValueError):
-        prep.bind_dense_split(s, bad, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(s, bad, 0x100000, 17, 17)
     with pytest.raises(ValueError):
         s.native.execute(_pack(bad), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
     assert frames == combined == []
@@ -119,7 +121,7 @@ def test_ragged_unknown_producer_span_is_rejected(role):
     _equal(s, facts)
     facts[role] = facts[role]._replace(span=-1)
     with pytest.raises(ValueError, match="sized buffer"):
-        prep.bind_dense_split(s, facts, 0x100000, 17, 17)
+        binding_reference.bind_dense_split(s, facts, 0x100000, 17, 17)
     with pytest.raises(ValueError, match="sized buffer"):
         s.native.execute(_pack(facts), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
     assert frames == combined == []
@@ -132,7 +134,7 @@ def test_ragged_declared_total_requires_final_capacity_and_clamps_query(stats):
     for role in ("o",) if stats is None else ("o", "lse"):
         bad = dict(facts, **{role: facts[role]._replace(span=0)})
         with pytest.raises(ValueError, match="packed Q total"):
-            prep.bind_dense_split(s, bad, 0x100000, 17, 17)
+            binding_reference.bind_dense_split(s, bad, 0x100000, 17, 17)
         with pytest.raises(ValueError, match="packed Q total"):
             s.native.execute(_pack(bad), prep._NATIVE_DENSE_INDICES, 17, workspace=0x100000)
     assert frames == combined == []
@@ -240,11 +242,11 @@ def _graph_case(monkeypatch, request, *, i64, hnd, stats, wide=False, python_bin
     launch = graph._compiled_plans[graph._plan_index]._prepared
     assert isinstance(launch, prep.PreparedDenseLaunch) and launch.spec.ragged
     if python_binding:
-        launch.spec.native = None
+        binding_reference.use_reference(launch.spec)
     else:
         assert launch.spec.native is not None, "ragged decode must bind natively"
         monkeypatch.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native ragged path rebuilt Python facts"))
-        monkeypatch.setattr(prep, "bind_dense_split", lambda *a: pytest.fail("native ragged path used the Python binder"))
+        monkeypatch.setattr(prep, "bind_dense_split", lambda *a: pytest.fail("native ragged path used the Python binder"), raising=False)
     workspace = torch.empty(graph.get_workspace_size(), device="cuda", dtype=torch.uint8)
 
     def pack():

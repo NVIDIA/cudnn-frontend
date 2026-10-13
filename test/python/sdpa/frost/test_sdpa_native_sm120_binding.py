@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Shared binding preserves SM120 envelope widths and half split partials."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 
 import cudnn
@@ -35,12 +37,12 @@ def test_sm120_actual_host_frames_and_half_partial_offsets(dq, dv, split, dtype)
     for offset in (0, 0x100000):
         fresh = {role: f._replace(ptr=f.ptr + offset) for role, f in facts.items()}
         if split == 1:
-            expected = prep.bind_dense(s, fresh, 17, 17)
+            expected = binding_reference.bind_dense(s, fresh, 17, 17)
             actual = s.native.bind(_pack(fresh), prep._NATIVE_DENSE_INDICES, 17)
             assert list(actual) == expected
         else:
             workspace = 0x400000 + offset
-            expected = prep.bind_dense_split(s, fresh, workspace, 17, 17)
+            expected = binding_reference.bind_dense_split(s, fresh, workspace, 17, 17)
             actual = s.native.bind_split(_pack(fresh), prep._NATIVE_DENSE_INDICES, workspace, 17)
             assert list(actual[0]) == expected[0]
             assert actual[1] == expected[1]

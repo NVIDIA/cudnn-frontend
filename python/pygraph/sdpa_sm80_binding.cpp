@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 // SM80 fixed forward contracts share native storage checks with half backward.
+#include <cmath>
+
 #include "sdpa_fixed_binding.h"
 
 namespace py = pybind11;
@@ -40,9 +42,9 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
           fn_(spec.attr("fn")),
           owner_(spec.attr("artifact")),
           scale_(spec.attr("scale").cast<double>()) {
-        const std::vector<std::string> roles{"q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias"};
+        const std::vector<std::string> roles{"q", "k", "v", "o", "stats", "seq_kv", "seq_q", "sink", "bias", "rope"};
         const auto ops = spec.attr("operands").cast<py::tuple>();
-        if (ops.size() != roles.size()) invalid("invalid native forward operand declarations");
+        if (ops.size() != 9 && ops.size() != roles.size()) invalid("invalid native forward operand declarations");
         for (size_t i = 0; i < ops.size(); ++i) {
             Carrier carrier;
             py::object declared = py::none();
@@ -100,14 +102,14 @@ class SdpaSm80FwdBinder : private FixedSdpaOperands {
             }
             frame[i] = py::int_(f.pointer);
         }
-        double current_scale = scale.is_none() ? scale_ : scale.cast<double>();
-        if (current_scale == 0.0) current_scale = scale_;
-        if (current_scale == 0.0) {
-            PyErr_SetString(PyExc_ZeroDivisionError, "float division by zero");
-            throw py::error_already_set();
-        }
-        frame[operands_.size()]     = py::float_(current_scale * 1.4426950408889634);
-        frame[operands_.size() + 1] = py::float_(1.0 / current_scale);
+        const double current_scale = scale.is_none() ? scale_ : scale.cast<double>();
+        // The kernel folds the scale's sign into the scores at compile time (score_sign) and runs at |scale|, or 1 for
+        // 0.
+        if ((current_scale > 0) != (scale_ > 0) || (current_scale < 0) != (scale_ < 0))
+            throw py::value_error("sdpa_fwd_sm80: attn_scale sign must match the compiled plan's");
+        const double kernel_scale   = current_scale == 0.0 ? 1.0 : std::fabs(current_scale);
+        frame[operands_.size()]     = py::float_(kernel_scale * 1.4426950408889634);
+        frame[operands_.size() + 1] = py::float_(1.0 / kernel_scale);
         frame[operands_.size() + 2] = py::int_(stream);
         return frame;
     }

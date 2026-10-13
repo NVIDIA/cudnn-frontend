@@ -918,6 +918,7 @@ def test_graph_thd_compile_key_is_plan_time_only(tmp_path, monkeypatch):
     from cudnn.sdpa.bwd.kernels.sm80.prepared_host import _compile_thd_artifact
 
     monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE", str(tmp_path))
+    monkeypatch.setenv("CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO", "0")  # the reload path is under test; the memo would hand plan 2 the object plan 1 got
     _compile_thd_artifact.cache_clear()
     before = compiled_cache.stats()
     _, graph, _, _, _ = _run_graph((300, 128), (300, 128), stats_layout="token_major")

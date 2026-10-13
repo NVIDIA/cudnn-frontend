@@ -2224,7 +2224,7 @@ def test_sm120_moe_block_scale_template_is_registered_in_the_sm120_tree() -> Non
 
     (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MOE_BLOCK_SCALE]
     assert tmpl.file == "sm120_moe_grouped_block_scale_matmul_fwd.py" and tmpl.family == "sm120"
-    assert isinstance(tmpl, Sm120KernelTemplate) and not tmpl.supports_multi_gemm
+    assert isinstance(tmpl, Sm120KernelTemplate) and tmpl.supports_multi_gemm
     assert tmpl.path.is_file()
 
     chain = analyze(_build_graph(2, 1024, 256, 512, num_groups=4))

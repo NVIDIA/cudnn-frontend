@@ -64,14 +64,12 @@ def test_config_default_arm_is_unchanged():
 
 @pytest.mark.L0
 def test_two_by_two_host_slots_match_role_split():
-    """The native dense binder (`fwd/prepared.py`) admits kernel templates BY NAME and fills host slots BY NAME, so the twin
-    is served natively iff (a) the gate names `prefill_d512_f16_2x2` and (b) its `_host` takes the role split's runtime slot
-    list -- both arch lines' twins against sm100/prefill_d512_f16.py.  RED-first: flipping `D512_2X2 = True` without (a)
-    demoted every dense d512 plan to the Python observation path (10 width-512 cells of test_sdpa_native_prefill_binding
-    red on the sm100 CI lane, `_dense_spec.native is None`, every numerics suite still green)."""
-    import ast
+    """Both twins retain the role-split host ABI consumed by the native binder.
 
-    from cudnn.sdpa.fwd import prepared
+    Binder ownership no longer depends on a kernel-name allowlist; the ownership
+    suite prevents restoring the former silent Python fallback.
+    """
+    import ast
 
     def runtime_slots(rel):
         with open(os.path.join(_kernels_dir(), rel)) as f:
@@ -82,14 +80,6 @@ def test_two_by_two_host_slots_match_role_split():
     parent = runtime_slots("sm100/prefill_d512_f16.py")
     assert runtime_slots(_KERNEL_FILE) == parent
     assert runtime_slots("sm107/prefill_d512_f16_2x2.py") == parent
-    with open(prepared.__file__) as f:
-        tree = ast.parse(f.read())
-    gates = [
-        {e.value for e in node.elts if isinstance(e, ast.Constant)}
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Tuple) and any(isinstance(e, ast.Constant) and e.value == _ROLE_SPLIT_TEMPLATE for e in node.elts)
-    ]
-    assert gates and all(_TEMPLATE in g for g in gates), gates
 
 
 @pytest.mark.L0
@@ -994,11 +984,12 @@ _CONTENTION_CHILD = _textwrap.dedent(r"""
             if time.time() - t0 > budget_s:
                 import subprocess
                 try:
-                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10).stdout
+                    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader"], capture_output=True, text=True, timeout=10, check=True).stdout
                 except Exception as e:  # a missing or stuck nvidia-smi must not turn the 45 s hang exit into a 40 min one
                     apps = f"<nvidia-smi unavailable: {e!r}>"
                 print(f"[{role}] HANG: launch {i + 1} exceeded {budget_s:.0f} s; history (s): " + " ".join(f"{h:.2f}" for h in hist[-30:]), flush=True)
-                print(f"[{role}] other compute processes on the device at the hang: {apps.strip().splitlines()}", flush=True)
+                print(f"[{role}] compute processes at the hang (all GPUs; may include this child; GPU UUID, PID, process name), "
+                      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}: {apps.strip().splitlines()}", flush=True)
                 os._exit(3)
         hist.append(time.time() - t0)
         if i == 0:

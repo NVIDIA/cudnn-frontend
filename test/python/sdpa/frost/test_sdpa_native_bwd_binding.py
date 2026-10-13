@@ -3,6 +3,7 @@
 """Fixed backward host ABI parity and current-storage validation."""
 
 import ast
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -38,7 +39,12 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
             ops.append(None)
             declared.append(None)
             continue
-        dt = "int32" if role.startswith("seq_") else "float32" if role in ("stats", "sink", "dsink", "bias", "dbias") else dtype
+        # ro_*: the SM80 bound ragged offsets, int64 like the graph's.
+        dt = (
+            "int32"
+            if role.startswith("seq_")
+            else "int64" if role.startswith("ro_") else "float32" if role in ("stats", "sink", "dsink", "bias", "dbias") else dtype
+        )
         shape, strides = ((2,), (1,)) if i >= 9 else ((2, 3, 5, 8), (160, 8, 32, 1))
         if role == "stats":
             shape, strides = (2, 3, 5, 1), (21, 7, 1, 1)
@@ -46,7 +52,7 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
             strides = ((2**32 + strides[0]) if wide == 1 else 2**30, *strides[1:])
             shape = ((2 if wide == 1 else 6), *shape[1:])
         span = 1 + sum((n - 1) * st for n, st in zip(shape, strides))
-        size = 2 if dt in ("float16", "bfloat16") else 4
+        size = 2 if dt in ("float16", "bfloat16") else 8 if dt == "int64" else 4
         alignment = 16 if i < 9 and role != "stats" else size
         ops.append(prep.Operand(dt, shape, strides, span, alignment, size))
         declared.append((shape, strides))
@@ -68,6 +74,7 @@ def _fixture(arch="sm100", dtype="bfloat16", features=True, wide=0):
         roles=roles,
         scale_log2="scale_log2" in names,
         length_form=any(n in names for n in ("lens_form", "length_form")),
+        native_binding=False,
     )
     native = cudnn._pybind_module._SdpaBwdBinder(spec, tuple(declared))
     return spec, native, facts, tuple(declared), frames
@@ -82,6 +89,48 @@ def _pack(spec, facts):
 
 def _native(spec, native, facts, workspace=_WORKSPACE, stream=17, overridden=()):
     return native.bind(_pack(spec, facts), tuple(range(len(spec.operands))), workspace, stream, overridden)
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+@pytest.mark.parametrize("scale", [None, 0.0, -0.0, 0.375])
+def test_standalone_uses_the_native_host_contract(arch, scale, monkeypatch):
+    spec, _, facts, geometry, frames = _fixture(arch)
+    expected = prep._bind_python(spec, facts, _WORKSPACE, 29, scale=scale, geometry=geometry)
+    # An explicit 0 is a zero scale; only an omitted scale takes the plan's. hex() keeps -0.0 distinct from 0.0.
+    slot = len(spec.operands) + 1 + spec.scale_log2
+    assert expected[slot].hex() == float(spec.scale if scale is None else scale).hex()
+    spec = replace(spec, native_binding=True)
+    monkeypatch.setattr(prep, "_bind_python", lambda *a, **k: pytest.fail("half template entered the Python binder"))
+    prep.execute(spec, facts, _WORKSPACE, 29, scale=scale, geometry=geometry)
+    assert frames == [tuple(expected)]
+    assert frames[0][slot].hex() == expected[slot].hex()
+    changed = {role: fact._replace(ptr=fact.ptr + 0x10000) for role, fact in facts.items()}
+    rebound = prep.bind(spec, changed, _WORKSPACE, 31, geometry=geometry)
+    for i, role in enumerate(spec.roles):
+        if role in changed:
+            assert rebound[i] == changed[role].ptr
+    assert rebound[-1] == 31
+
+
+@pytest.mark.parametrize("arch", ["sm80", "sm100", "sm107_thd"])
+@pytest.mark.parametrize("q_prefix,kv_prefix", [(False, False), (True, False), (False, True), (True, True)])
+def test_native_standalone_prefix_form_and_storage(arch, q_prefix, kv_prefix):
+    spec, _, facts, _, _ = _fixture(arch)
+    ops = list(spec.operands)
+    for role, prefix in (("seq_q", q_prefix), ("seq_kv", kv_prefix)):
+        i = spec.roles.index(role)
+        ops[i] = replace(ops[i], allowed_numels=(2, 3))
+        count = 3 if prefix else 2
+        facts[role] = facts[role]._replace(shape=(count,), strides=(1,), span=count)
+    spec = replace(spec, operands=tuple(ops), native_binding=True)
+    frame = prep.bind(spec, facts, _WORKSPACE, 17)
+    assert frame[-2] == int(q_prefix) | (int(kv_prefix) << 1)
+    for role, prefix in (("seq_q", q_prefix), ("seq_kv", kv_prefix)):
+        if prefix:
+            with pytest.raises(ValueError, match="backing storage"):
+                prep.bind(spec, dict(facts, **{role: facts[role]._replace(span=2)}), _WORKSPACE, 17)
+        with pytest.raises(ValueError, match="contiguous"):
+            prep.bind(spec, dict(facts, **{role: facts[role]._replace(strides=(2,), span=6)}), _WORKSPACE, 17)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)

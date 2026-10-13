@@ -783,7 +783,7 @@ def sigmoid_f16x2(logit_pair: cutlass.Int32, input_dtype: cutlass.Constexpr):
     return sigmoid2(logit_vec_f32[0], logit_vec_f32[1])
 
 
-L2_NORM_EPS = 1.0e-12
+L2_NORM_EPS = 1.0e-6
 
 
 @cute.jit
@@ -799,10 +799,8 @@ def lane_group_sum(value: cutlass.Float32, lanes: cutlass.Constexpr[int]) -> cut
 
 @cute.jit
 def l2norm_inv(sum_sq: cutlass.Float32) -> cutlass.Float32:
-    """Inverse L2 norm with the shared epsilon floor: rows at or below the
-    floor normalize by ``1 / L2_NORM_EPS`` instead of dividing by zero."""
-    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-    return cute.math.rsqrt(cute.math.max(sum_sq, norm_floor_sq), fastmath=True)
+    """Inverse L2 norm, ``rsqrt(sum_sq + L2_NORM_EPS)``; a zero row normalizes to zero."""
+    return cute.math.rsqrt(sum_sq + cutlass.Float32(L2_NORM_EPS), fastmath=True)
 
 
 @cute.jit

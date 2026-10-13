@@ -30,7 +30,7 @@ from cudnn.frost.tile_dsl.mask import (  # noqa: F401
 )
 from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, Scope
 from cudnn.frost.tile_dsl.pointwise import fmul2, ffma2, opaque_f32_zero, fmax_f32
-from cudnn.frost.tile_dsl.tma import st_global_v4, tma_load_tile
+from cudnn.frost.tile_dsl.tma import ld_shared_v4, st_global_v4, st_shared_v4, tma_load_tile
 
 # The O-swizzle selector lives on the base config line (config_sm107 carries a
 # byte-identical copy).  Importing it from config_sm100 keeps this cross-arch
@@ -385,6 +385,7 @@ def make_classic_bars(
     *,
     epilogue_gate: bool = False,
     q_full_arrivers: int = 1,
+    o_parts: int = 1,
     bias_resident: bool = False,
     bias_ring_stages: int = 0,
     bias_ring_empty_arrivers: Optional[int] = None,
@@ -464,7 +465,8 @@ def make_classic_bars(
         mb_stat_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.SOFTMAX_LANES, producer=Producer.THREAD),
         mb_stat_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_stats_read=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
-        mb_o_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
+        # ``o_parts`` > 1: the O slab of each sub-tile is published (and TMA-stored) per column block.
+        mb_o_full=MBarrier(_alloc(CFG.TILES_Q * o_parts), stages=CFG.TILES_Q * o_parts, init_count=CFG.CORR_LANES, producer=Producer.THREAD),
         mb_o_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_WARP, producer=Producer.THREAD),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.THREAD),
         mb_empty_mainloop=MBarrier(_alloc(1), stages=1, init_count=CORR_LANES_TOTAL, producer=Producer.LEADER, scope=Scope.LEADER),
@@ -529,6 +531,48 @@ def row_max_for_exp2(total_max):
             total_max.ir_value(),
         )
     )
+
+
+@cute.jit
+def running_max_step_finite_sentinel(raw_max, current_max, total_max, neg_inf, rescale_threshold, masked: cutlass.Constexpr[bool]):
+    """One KV tile's online-softmax running-max step for the kernels that mask with the FINITE sentinel
+    (``apply_mask_chunk``'s default ``_NEG_INF_BITS``, the ``neg_inf`` their running ``total_max`` also starts at).
+
+    ``raw_max`` is the tile's UNSCALED row max -- exactly ``neg_inf`` iff every column of this tile is masked --
+    and ``current_max`` the same max in the exp2 domain (``raw_max * scale_log2``, or ``raw_max`` itself under a
+    pre-folded scale).  Returns ``(total_max, alpha, exp_shift)``: the running max, the rescale factor of the
+    accumulator and the row-sum (``exp2(old - new)``; ``exp2(neg_inf) == 0`` on the row's first live tile, whose
+    stat the correction warp consumes unread), and the value this tile's scores are shifted by before ``exp2``.
+
+    The guard (``masked``; a MASK_NONE build has no masked column and folds it out, byte-identical): a tile that
+    is fully masked BEFORE the row's first live key -- a left band or a bottom-right diagonal clearing a whole
+    tile, the row's keys in a LATER tile -- is ``tile_dead``.  Letting the sentinel become the running max breaks
+    the shift: scaled by ``scale_log2 > 1`` it overflows to -inf and ``-inf - (-inf)`` is NaN (NaN P into BMM2,
+    NaN O); below that the shift reads 0 and every masked column publishes P = 1, mass that only ``alpha = 0`` at
+    the next live tile wipes -- a multiply by zero of garbage.  So the dead tile is SELECTED out of the state:
+    ``total_max`` stays ``neg_inf`` (``is_first`` then starts the online softmax at the first live tile), ``alpha``
+    is ``exp2(neg_inf - neg_inf) = 1`` exactly (the accumulator and the row-sum are still their zero-trip state)
+    and ``exp_shift`` is 0 -- :func:`row_max_for_exp2`'s form for the finite sentinel -- so every column lands at
+    ``exp2(sentinel * scale)`` = +0 on every arm (f32 ``ex2.approx``, the f16x2 arms, the fused f32x2 -> f16x2
+    shift): the path a masked column of a LIVE tile already takes, with a finite shift.  A dead tile AFTER a live
+    one needs nothing: the finite running max never clears the threshold, alpha is ``exp2(0) = 1`` and the masked
+    columns read ``sentinel * scale - m`` -> 0.  A row with no live key at all ends its loop at ``(neg_inf, 0)``
+    and stays with the epilogue's geometry select (``_kv_empty`` / ``_row_empty``)."""
+    old_total_max = total_max
+    is_first = total_max == neg_inf
+    update_cond = is_first | ((current_max - total_max) > rescale_threshold)
+    first_live = is_first
+    if cutlass.const_expr(masked):
+        tile_dead = is_first & (raw_max == neg_inf)
+        update_cond = update_cond & ~tile_dead
+        first_live = is_first & ~tile_dead
+    total_max = cutlass.Float32(arith.select(update_cond.ir_value(), current_max.ir_value(), total_max.ir_value()))
+    exp_input = cutlass.Float32(arith.select(first_live.ir_value(), neg_inf.ir_value(), (old_total_max - total_max).ir_value()))
+    alpha = cute.math.exp2(exp_input, fastmath=True)
+    exp_shift = total_max
+    if cutlass.const_expr(masked):
+        exp_shift = cutlass.Float32(arith.select(tile_dead.ir_value(), cutlass.Float32(0.0).ir_value(), total_max.ir_value()))
+    return total_max, alpha, exp_shift
 
 
 def assert_tile_n_supported(CFG):
@@ -609,6 +653,81 @@ def store_fp32_partial_tile(
                         row_out[cutlass.Int32(blk * chunk + j)] = cutlass.Float32(
                             arith.select(row_dead.ir_value(), cutlass.Float32(0.0).ir_value(), scaled[j].ir_value())
                         )
+
+
+@cute.jit
+def store_fp32_partial_tile_coalesced(
+    o_partial_f32,
+    tmem_base,
+    tmem_o_off,
+    inv_sum,
+    row_dead,
+    row_valid,
+    o_batch,
+    q_row_global,
+    row_head_idx,
+    tile_o: cutlass.Constexpr[int],
+    chunk: cutlass.Constexpr[int],
+    scratch_addr,
+    lane,
+) -> None:
+    """:func:`store_fp32_partial_tile` with whole-line global stores.
+
+    The direct store writes one 16-byte piece of 32 DIFFERENT rows per warp
+    instruction (rows are D*4 or H*D*4 bytes apart), so every instruction is a
+    32-sector request with half of each sector unused, and a 256-row CTA's
+    128 KiB of partials costs ~8k sector writes.  Here each warp first parks
+    its 32-row x ``chunk``-column fp32 block in SMEM (``scratch_addr``: this
+    WARP's 32 * chunk * 4 bytes in the shared window, idle under the split
+    epilogue -- the O tile is never staged there), then reads it back
+    column-major: lane l stores 16-byte segment ``l % SEGS`` of row
+    ``l // SEGS``, so one instruction writes ``32 / SEGS`` complete rows of
+    ``chunk * 4`` contiguous bytes (whole 128-byte lines at chunk 32).  The
+    target row's coordinates come from the lane that owns it (three warp
+    shuffles); invalid rows (past S_q) are skipped, dead rows store zeros as
+    before.  The 16-byte segments are rotated by the row inside each 128-byte
+    bank row so both the row-major write and the column-major read are
+    bank-conflict free.  Requires the 16-byte-store conditions of the direct
+    path (d_v % 4 == 0, chunk % 4 == 0, unit D stride, 16-byte aligned slab);
+    the caller falls back to :func:`store_fp32_partial_tile` otherwise.
+    """
+    op = cutlass.make_array_view(o_partial_f32)
+    d_v = cutlass.const_expr(o_partial_f32.shape[3])
+    SEGS = chunk // 4
+    RPI = 32 // SEGS
+    ROW_BYTES = chunk * 4
+    ROWS_PER_BANKROW = max(1, 128 // ROW_BYTES)
+    zero = cutlass.Float32(0.0)
+    valid_i = cutlass.Int32(arith.select(row_valid.ir_value(), cutlass.Int32(1).ir_value(), cutlass.Int32(0).ir_value()))
+    my_seg_rot = lane // cutlass.Int32(ROWS_PER_BANKROW)
+    rd_row0 = lane // cutlass.Int32(SEGS)
+    rd_seg = lane % cutlass.Int32(SEGS)
+    for blk in cutlass.range_constexpr(tile_o // chunk):
+        addr = tmem_base + cutlass.Int32(tmem_o_off + blk * chunk)
+        vals = nvvm.tcgen05_ld("32x32b", nvvm.make_tmem_ptr(addr, cutlass.Float32), num=chunk)
+        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+        scaled = vals * inv_sum
+        for seg in cutlass.range_constexpr(SEGS):
+            values = [cutlass.Float32(arith.select(row_dead.ir_value(), zero.ir_value(), scaled[seg * 4 + j].ir_value())) for j in range(4)]
+            rot = (cutlass.Int32(seg) + my_seg_rot) % cutlass.Int32(SEGS)
+            st_shared_v4(scratch_addr + lane * cutlass.Int32(ROW_BYTES) + rot * cutlass.Int32(16), values, cutlass.Float32)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+        for k in cutlass.range_constexpr(SEGS):
+            row = rd_row0 + cutlass.Int32(k * RPI)
+            rot = (rd_seg + row // cutlass.Int32(ROWS_PER_BANKROW)) % cutlass.Int32(SEGS)
+            v = ld_shared_v4(scratch_addr + row * cutlass.Int32(ROW_BYTES) + rot * cutlass.Int32(16), cutlass.Float32)
+            q_t = nvvm.shfl_sync(0xFFFFFFFF, q_row_global, row, 31, kind=nvvm.Shfl.IDX)
+            h_t = nvvm.shfl_sync(0xFFFFFFFF, row_head_idx, row, 31, kind=nvvm.Shfl.IDX)
+            ok_t = nvvm.shfl_sync(0xFFFFFFFF, valid_i, row, 31, kind=nvvm.Shfl.IDX)
+            col = cutlass.Int32(blk * chunk) + rd_seg * cutlass.Int32(4)
+            if (ok_t != cutlass.Int32(0)) & (col < cutlass.Int32(d_v)):
+                row_ptr = op.data_ptr((o_batch, q_t, h_t, 0))
+                st_global_v4(
+                    row_ptr.toint(cutlass.Int64) + cutlass.Int64(col) * cutlass.Int64(4),
+                    [cutlass.Float32(v[0]), cutlass.Float32(v[1]), cutlass.Float32(v[2]), cutlass.Float32(v[3])],
+                    cutlass.Float32,
+                )
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class SplitHelpers(NamedTuple):

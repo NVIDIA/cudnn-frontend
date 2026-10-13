@@ -1085,6 +1085,13 @@ def _sdpa_kernel(
             #     over the 4*QK_N_FRAGS lane elements injects the whole tile.
             #     Added before the mask block (masked cols overwritten to
             #     -FLT_MAX) — matches the reference order ``s += bias`` then mask.
+            # Non-positive attn_scale: fold its sign into S here, so the raw-score max and mask fill below hold (#1435).
+            if cutlass.const_expr(PARAMS.score_sign != 1):
+                for j in cutlass.range_constexpr(QK_N_FRAGS * 4):
+                    if cutlass.const_expr(PARAMS.score_sign == 0):
+                        S_acc[s_base + j] = cutlass.Float32(0.0)
+                    else:
+                        S_acc[s_base + j] = cutlass.Float32(0.0) - S_acc[s_base + j]
             if cutlass.const_expr(has_bias):
                 for j in cutlass.range_constexpr(QK_N_FRAGS * 4):
                     S_acc[s_base + j] = S_acc[s_base + j] + bias_frag[s_base + j]
@@ -1171,6 +1178,12 @@ def _sdpa_kernel(
             m_bot_iter = cutlass.Float32(cute.math.max(m_bot_iter, nvvm.shfl_sync(0xFFFFFFFF, m_bot_iter, 2, 0x1F, nvvm.Shfl.BFLY), ftz=True))
             m_bot_iter = cutlass.Float32(cute.math.max(m_bot_iter, nvvm.shfl_sync(0xFFFFFFFF, m_bot_iter, 1, 0x1F, nvvm.Shfl.BFLY), ftz=True))
             m_bot_iter = m_bot_iter * softmax_scale_log2
+            # Under a mask, a fully masked row's -FLT_MAX overflows to -inf once scale_log2 > 1 (attn_scale > ln 2), and
+            # -inf - -inf is NaN in alpha and P below; clamping the scaled max keeps it finite.
+            if cutlass.const_expr(_effective_mask != MASK_NONE):
+                if needs_mask:
+                    m_top_iter = cutlass.Float32(cute.math.max(m_top_iter, NEG_MASK_VAL, ftz=True))
+                    m_bot_iter = cutlass.Float32(cute.math.max(m_bot_iter, NEG_MASK_VAL, ftz=True))
 
             # 3) Merge with global row-max state under RESCALE_THRESHOLD skip
             #    (only update the running max when the new iter exceeds it

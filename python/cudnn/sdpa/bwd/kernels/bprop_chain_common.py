@@ -249,7 +249,7 @@ def dot_do_o_scaled_host(
 
 
 # ---------------------------------------------------------------------------
-# Reduce kernel: per-q-head dk_ws/dv_ws partials (io dtype) -> dK/dV over the group
+# Reduce kernel: per-q-head dk_ws/dv_ws partials (each in ITS OWN dtype: fp32 or the io dtype) -> dK/dV (io dtype) over the group
 # ---------------------------------------------------------------------------
 
 
@@ -272,10 +272,13 @@ def _reduce_group_vec(
     wide: cutlass.Constexpr[bool] = False,
 ):
     """Sum one 16 B output vector over the group's q-head partials (fp32,
-    fixed order -> deterministic) and store it in the io dtype.  ``wide``: the
-    partials' or the output's span passes 2^31 elements, so the vector index is
-    promoted to Int64 BEFORE the element multiply (Rule S7); off, the Int32 math
-    renders unchanged."""
+    fixed order -> deterministic) and store it in the io dtype.  Each partial is
+    loaded in the POINTER's dtype -- fp32 partials (the fp8 and MXFP8 rows' dK
+    under GQA) take two 16-B loads per 8-element vector, bf16 ones take one --
+    and ``.to(Float32)`` is the identity on fp32, so an fp32 partial is rounded
+    exactly once, by the final cast.  ``wide``: the partials' or the output's span
+    passes 2^31 elements, so the vector index is promoted to Int64 BEFORE the
+    element multiply (Rule S7); off, the Int32 math renders unchanged."""
     VEC = 8  # 8 elements per vector (16 bytes)
     pos = (cutlass.Int64(idx) if cutlass.const_expr(wide) else idx) * VEC
     col = pos % D
@@ -374,8 +377,8 @@ def _span_exceeds_int32(*tensors) -> bool:
 
 @cute.kernel
 def dkv_reduce_kernel(
-    dk_ws: cute.Tensor,  # [B, S_KV, H_Q, D] io dtype (one dK partial per q head)
-    dv_ws: cute.Tensor,  # [B, S_KV, H_Q, DV] io dtype (one dV partial per q head)
+    dk_ws: cute.Tensor,  # [B, S_KV, H_Q, D] one dK partial per q head, in the PARTIAL's own dtype (fp32 or the io dtype; the load is typed by the pointer)
+    dv_ws: cute.Tensor,  # [B, S_KV, H_Q, DV] one dV partial per q head, likewise (``io_dtype`` types the OUTPUT only)
     dk: cute.Tensor,  # [B, S_KV, H_KV, D] io dtype out
     dv: cute.Tensor,  # [B, S_KV, H_KV, DV] io dtype out
     D_QK: cutlass.Constexpr[int],

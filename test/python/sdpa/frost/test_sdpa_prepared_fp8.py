@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Prepared FP8 launches rebind device scales and storage through the public graph API."""
 
+import sdpa_binding_reference as binding_reference
+
 import math
 from contextlib import contextmanager
 
@@ -331,7 +333,7 @@ def test_prepared_fp8_invalid_scalars_do_not_launch(role, kind, monkeypatch):
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("invalid scalar reached the kernel"))
     monkeypatch.setattr(prep._buffers, "memset_zero_async", lambda *a: pytest.fail("invalid scalar mutated output"))
     with pytest.raises(ValueError, match=role):
-        prep.execute_quantized(spec, facts, ws.data_ptr(), None, 0)
+        binding_reference.execute_quantized(spec, facts, ws.data_ptr(), None, 0)
 
 
 @pytest.mark.parametrize("bare", [False, True])
@@ -345,7 +347,7 @@ def test_prepared_fp8_workspace_overlap_is_rejected(bare, monkeypatch):
         facts["q"] = facts["q"]._replace(span=-1)
     monkeypatch.setattr(spec, "fn", lambda *a: pytest.fail("aliased workspace reached the kernel"))
     with pytest.raises(ValueError, match="workspace overlaps"):
-        prep.execute_quantized(spec, facts, facts["q"].ptr, None, 0)
+        binding_reference.execute_quantized(spec, facts, facts["q"].ptr, None, 0)
 
 
 @pytest.mark.parametrize("thd", [False, True])

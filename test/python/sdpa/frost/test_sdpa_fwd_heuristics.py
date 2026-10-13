@@ -25,7 +25,7 @@ from cudnn.sdpa.fwd import engines
 from cudnn.engines.heuristics import _assemble
 from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
-from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2
+from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
 
 _F16 = "sdpa_fwd_prefill_sm100"
 _OFFERED = {_F16: 20500, "sdpa_fwd_prefill_sm100_fp8": 20501}
@@ -352,7 +352,10 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
     ("mxfp8", "d_qk", "d_v", "expected_cga"),
     # Per-tensor FP8 d128 runs its unsplit leg at cga1 (one 256-row CTA, the
     # geometry cuDNN's fp8 kernel uses; B200: llama causal S=2K 1.18x -> 1.14x,
-    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair.
+    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair on a dense
+    # unsplit graph -- its cga1 serves only the packed-GQA banded leg while the
+    # per-tile K/V walk is at most _SM100_MXFP8_D128_CGA1_MAX_WALK keys; the split
+    # leg and the unpacked legs keep the pair (heuristics._auto_sched_cga).
     [(False, 128, 128, 1), (True, 128, 128, 2), (False, 256, 256, 1), (True, 256, 256, 1)],
     ids=["per_tensor-d128", "block_scale-d128", "per_tensor-d256", "block_scale-d256"],
 )
@@ -372,9 +375,10 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     assert plans
     unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
     assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        # Per-tensor FP8 d128 offers both widths; the split leg stays on the cga2
-        # pair (split_cgas_by_d_shape), so the plan list may carry both.
+    if (d_qk, d_v) == (128, 128):
+        # Both d128 quantized rows offer both widths (per-tensor: the split leg
+        # stays on the cga2 pair; MXFP8: cga1 only for the short-walk packed banded
+        # leg, the split leg keeps the pair), so the plan list may carry both.
         assert {plan.knobs.cga for plan in plans} <= {1, 2}
     else:
         assert {plan.knobs.cga for plan in plans} == {expected_cga}
@@ -382,8 +386,8 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=expected_cga)) is None
     wrong_cga = 1 if expected_cga == 2 else 2
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "per-tensor FP8 d128 builds at both widths"
+    if (d_qk, d_v) == (128, 128):
+        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "the quantized d128 rows build at both widths"
     else:
         assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
@@ -457,6 +461,59 @@ def test_d256_quantized_primary_uses_measured_scheduler(mxfp8, expected_sched):
     assert plans[0].knobs.cga == 1
     assert plans[0].knobs.split_kv == 1
     assert plans[0].knobs.sched_policy == expected_sched
+
+
+@pytest.mark.L0
+def test_rubin_mxfp8_row_names_its_thd_and_paged_gap(sm107_metadata_target):
+    """The cc 10.7 MXFP8 row claims THD (at d256 only, #1488's thd_d_shapes) AND paged pools (d128 / d256 with dense
+    queries), so its former gap clause has no live case and is gone; every decline reads the clause that governs it:
+    THD at another head dim the generic THD-shape clause, a THD query over pools the paged MXFP8 clause, a page that
+    does not hold whole 128-row SF atoms the page-size clause.  The SM100 MXFP8 row, which serves THD and pools, is
+    untouched."""
+    caps = {s.name: s.capabilities for s in engines.ENGINE_SPECS}
+    rubin, sm100 = caps[engines.engine_name(mxfp8=True, arch="sm107")], caps[engines.engine_name(mxfp8=True)]
+    thd_leg = "THD (ragged) rides the packed native-tile leg on this engine (shapes [(256, 256)]); the head-dim envelope is dense-only"
+    quant = dict(dtype=cudnn.data_type.FP8_E4M3, dtype_o=cudnn.data_type.BFLOAT16, is_mxfp8=True)
+    thd = dict(thd=True, padded=True, **quant)
+    paged = dict(has_paged_kv=True, padded=True, page_size=128, **quant)
+    paged64 = dict(has_paged_kv=True, padded=True, page_size=64, **quant)
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **thd)) == thd_leg, "THD at d128: the THD-shape clause"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), d_qk=256, d_v=256, **thd)) is None, "THD at d256 is served (#1488)"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **paged)) is None, "page-128 pools with dense queries are served"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), d_qk=256, d_v=256, thd=True, **paged)) == "paged MXFP8 KV with THD queries is not wired"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **paged64)) == "paged MXFP8 KV needs page_size to be a multiple of 128; got 64"
+    assert engines.mismatch(rubin, _facts(device_cc=(10, 7), **quant)) is None, "dense BSHD stays admitted"
+    assert engines.mismatch(sm100, _facts(**thd)) is None
+    assert engines.mismatch(sm100, _facts(**paged)) is None
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["A", "FALLBACK"])
+def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm107_metadata_target):
+    """The measured D256 picker says LPT for a masked block-scale graph; the cc 10.7 MXFP8 row claims NATURAL only at
+    (256, 256), so every proposed set must be clamped into that domain -- the FALLBACK block had no entry at all and
+    the A block kept only its NATURAL runner (test_d256_quantized_primary_uses_measured_scheduler keeps the SM100 row's
+    LPT, which that row's domain honours)."""
+    name = engines.engine_name(mxfp8=True, arch="sm107")
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
+    facts = _facts(
+        b=2,
+        h_q=8,
+        h_kv=2,
+        s_q=4096,
+        s_kv=4096,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_mxfp8=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    plans = recommend(kind, facts, {name: 20516})
+    assert plans, f"{kind}: the row admits the graph (mismatch={engines.mismatch(spec.capabilities, facts)!r}) and must propose a set"
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    assert (plans[0].knobs.sched_policy, plans[0].knobs.cga, plans[0].knobs.split_kv) == (SCHED_NATURAL, 1, 1)
 
 
 @pytest.mark.L0
@@ -583,6 +640,237 @@ def test_fallback_kind_is_least_demanding():
     for p in recommend("FALLBACK", _facts(), _OFFERED):
         assert p.knobs.split_kv == 1
         assert p.knobs.sched_policy == 0  # SCHED_NATURAL
+
+
+# ---------------------------------------------------------------------------
+# d128 decode-shaped launches (FlashInfer paged GQA decode, MTP S_q in [2, 8])
+# ---------------------------------------------------------------------------
+#
+# The SM100 f16 row's d128 flavor: cga1 is the decode tile (one 128-row CTA per
+# (batch, packed head) unit, PR #1094), cga2 the prefill pipeline (512 rows per
+# cluster). The rules under test read the unit's live rows S_q * PACK_G: the
+# width (one decode tile), the causal scheduler (NATURAL first while one cga2
+# cluster covers the unit) and the split model's true CTA count plus its two
+# combine corrections. The measured B200 numbers live in the heuristics module
+# next to the rules; test_sdpa_fwd_decode_d128_sm100.py pins the decode tile's
+# own selection and kernel.
+
+
+def _decode_facts(**over):
+    """FlashInfer's paged GQA decode graph: b=32, 64/4 heads, d128 bf16, 4k KV."""
+    base = dict(b=32, h_q=64, h_kv=4, s_q=1, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, causal=False, padded=True, has_paged_kv=True, page_size=16)
+    base.update(over)
+    return _facts(**base)
+
+
+def _f16_plans(facts):
+    plans = [p for p in recommend("A", facts, _OFFERED) if p.engine_id == 20500]
+    assert plans, "the f16 row must serve this graph"
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
+    return plans
+
+
+_DENSE = dict(has_paged_kv=False, padded=False, page_size=0)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(),  # S_q=1, G=16 packed: 16 live rows
+        dict(h_kv=8),  # G=8
+        dict(h_q=8, h_kv=8),  # MHA, nothing to pack: 1 live row
+        dict(h_q=96, h_kv=8),  # G=12 does not divide the tile -> packs 4 of 12 (partial PackGQA): 4 live rows per packed head
+        dict(s_q=4, causal=True, bottom_right=True),  # MTP
+        dict(s_q=8),  # 8 * 16 = 128 rows: exactly one decode tile
+        dict(**_DENSE),  # dense decode
+        dict(s_q=8, causal=True, bottom_right=True, window_left=255, has_paged_kv=False, padded=True, page_size=0),  # dense padded MTP + SWA
+    ],
+    ids=["fi_64_4", "fi_64_8", "mha", "partial_pack_96_8", "mtp4_br", "one_tile_exactly", "dense_decode", "dense_mtp_swa"],
+)
+def test_d128_decode_shaped_launch_leads_with_cga1(over):
+    """S_q * PACK_G <= 128: every set rides the decode tile (cga1 -- the only
+    width in this band, as test_sdpa_fwd_decode_d128_sm100 pins) and the lead
+    walks the plain scheduler even under a causal band (the one-cluster rule;
+    the LPT variants stay behind it as runners for autotune, as on every
+    causal graph). A pinned cga2 is still honored (test_d128_cga_request_domain)."""
+    plans = _f16_plans(_decode_facts(**over))
+    lead = plans[0].knobs
+    assert lead.cga == 1, lead
+    assert lead.sched_policy == 0, lead  # SCHED_NATURAL, even under a causal band
+    assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [
+        dict(s_q=129),  # 129 rows overflow one decode tile unpacked too (16 * 129 packed)
+        dict(s_q=300, h_q=8, h_kv=8),  # paged prefill, MHA
+        dict(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE),  # prefill
+    ],
+    ids=["past_one_tile", "paged_prefill", "prefill_4k"],
+)
+def test_d128_prefill_shaped_launch_keeps_cga2(over):
+    """Above one decode tile's rows on every leg a paged plan list is cga2
+    throughout; a dense one lists the decode tile as the other-width runner
+    (issue #1518). (A packed leg that overflows while its unpacked runner-up
+    fits is test_sdpa_fwd_decode_d128_sm100's per-candidate case.)"""
+    facts = _decode_facts(**over)
+    plans = _f16_plans(facts)
+    assert {p.knobs.cga for p in plans} == ({2} if facts.has_paged_kv else {1, 2}), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_d128_causal_scheduler_rule_stops_at_one_q_cluster():
+    """The one-cluster NATURAL rule ends exactly where the LPT remaps gain rows
+    to balance: at S_q * PACK_G <= 512 (one cga2 cluster) NATURAL leads with
+    the LPT variants behind it as runners -- on the prefill tile here, past
+    the decode tile's 128 rows -- and one row more restores the L2-budget
+    rule's causal primary with its runners: plain LPT at this 2 MiB-per-head
+    working set (_SM100_D128_LPT_L2_MIN_BYTES), LPT_L2 on a 32k cache; a 4k
+    causal prefill is untouched."""
+    one = _f16_plans(_decode_facts(s_q=32, causal=True, bottom_right=True))  # 32 * 16 = 512 rows
+    assert one[0].knobs.sched_policy == 0, one[0].knobs
+    assert {SCHED_LPT, SCHED_LPT_L2} <= {p.knobs.sched_policy for p in one}, [p.knobs for p in one]
+    assert one[0].knobs.cga == 2, "512 packed rows are four decode tiles' worth: the prefill tile leads"
+    two = _f16_plans(_decode_facts(s_q=33, causal=True, bottom_right=True))  # 528 rows: two clusters
+    assert two[0].knobs.sched_policy == SCHED_LPT, two[0].knobs
+    assert {SCHED_LPT_L2, 0} <= {p.knobs.sched_policy for p in two}, [p.knobs for p in two]
+    two_long = _f16_plans(_decode_facts(s_q=33, s_kv=32768, causal=True, bottom_right=True))  # 16 MiB per head
+    assert two_long[0].knobs.sched_policy == SCHED_LPT_L2, two_long[0].knobs
+    prefill = _f16_plans(_decode_facts(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE))
+    assert (prefill[0].knobs.sched_policy, prefill[0].knobs.cga) == (SCHED_LPT, 2), prefill[0].knobs
+
+
+@pytest.mark.L0
+def test_d128_small_batch_units_split_only_where_the_combine_is_cheap():
+    """On the decode tile the wave model sees the true CTA count, so a small
+    batch splits finer than it did at cga2 -- right where the combine is one
+    wave, wrong where the output rows make it many: the unsplit leg runs no
+    combine and must not be charged one. Pinned to the B200 kernel times in
+    the heuristics module: b=8 h=32/8 S_q=64 paged bottom-right (256 rows per
+    unit -- one cga2 cluster, the prefill tile -- 16384 combine rows) and its
+    dense causal twin lead UNSPLIT on the plain scheduler (their split 2
+    measured 11% slower); S_q=16 at the same batch (64 rows: the decode tile,
+    4096 combine rows) leads with the split that pays, no-split reachable
+    behind it; the b=8 h=64/4 decode keeps its four splits; and the dense b=4
+    h=32/8 S_q=128 causal launch -- a cga2 unit -- stops proposing the split 2
+    that measured 29% slower than unsplit."""
+    chunk = dict(b=8, h_q=32, h_kv=8, s_q=64, causal=True)
+    for facts in (_decode_facts(bottom_right=True, **chunk), _decode_facts(**chunk, **_DENSE)):
+        lead = _f16_plans(facts)[0].knobs
+        assert (lead.split_kv, lead.pack_gqa, lead.sched_policy) == (1, True, 0), lead
+    short = _f16_plans(_decode_facts(bottom_right=True, **{**chunk, "s_q": 16}))
+    assert (short[0].knobs.cga, short[0].knobs.split_kv) == (1, 2), short[0].knobs
+    assert any(p.knobs.cga == 1 and p.knobs.split_kv == 1 for p in short), [p.knobs for p in short]
+    decode = _f16_plans(_decode_facts(b=8))[0].knobs
+    assert (decode.cga, decode.split_kv) == (1, 4), decode
+    two_ctas = _f16_plans(_decode_facts(b=4, h_q=32, h_kv=8, s_q=128, causal=True, **_DENSE))
+    assert all(p.knobs.split_kv == 1 for p in two_ctas), [p.knobs for p in two_ctas]
+
+
+@pytest.mark.L0
+def test_d128_few_unit_long_kv_splits_to_the_combine_latency_floor():
+    """b=1 with a handful of KV heads: the whole launch is a few decode-tile
+    CTAs, so the split leg fills the wave with partials -- and once each split is a few
+    KV tiles, the combine's serial walk over them costs more than the loop
+    saves. The wave model prices that walk at a lone block's latency
+    (choose_split_kv's COMBINE_FLOOR), so the lead stops one power of two short
+    of the full wave where that is what measures (B200, paged bf16, kernel
+    time, heuristic lead against the split one step finer): h=16/2 S_kv=32k
+    32 splits at 39.7 us (64: 50.8); h=64/4 S_kv=4k 8 at 20.3 us (16: 22.3),
+    the same at S_q=4 MTP (25.4 vs 28.3) and for h=32/8 (20.3 vs 23.6). Where
+    the wave boundary already stops the split the lead is what it was:
+    h=64/4 S_kv=32k 32 splits (43.0 us; the base cga2 split 16: 48.5), b=4
+    h=64/4 S_kv=4k 8 (21.5 vs base 26.9) and b=8 4 (26.6 vs base 38.9)."""
+
+    def lead(**over):
+        knobs = _f16_plans(_decode_facts(**{"b": 1, **over}))[0].knobs
+        assert knobs.cga == 1 and knobs.pack_gqa is True and knobs.sched_policy == 0, knobs
+        return knobs.split_kv
+
+    assert lead(h_q=16, h_kv=2, s_kv=32768) == 32
+    assert lead(h_q=64, h_kv=4, s_kv=4096) == 8
+    assert lead(h_q=64, h_kv=4, s_kv=4096, s_q=4, causal=True, bottom_right=True) == 8
+    assert lead(h_q=32, h_kv=8, s_kv=4096) == 8
+    assert lead(h_q=64, h_kv=4, s_kv=32768) == 32
+    assert lead(b=4, h_q=64, h_kv=4, s_kv=4096) == 8
+    assert lead(b=8, h_q=64, h_kv=4, s_kv=4096) == 4
+
+
+@pytest.mark.L0
+def test_unsplit_leg_accounting_moves_the_wide_head_flavors_too():
+    """The unsplit leg paying no combine (choose_split_kv) is shared by every
+    flavor's split leg, so the d192x128 and d256 f16 leads it moves belong to
+    this change: few-unit 2k-KV chunks with thousands of output rows, whose
+    split 2 the phantom combine wave-set used to buy. Measured B200 bf16 dense
+    (heuristic lead against the old split 2 pinned): d256 b=1 h=64/4 S_q=128
+    mask-free 51.7 vs 75.3 us; d192 b=1 h=32/8 S_q=256 causal 35.3 vs 60.9 us.
+    Both stay on cga2 -- the cga1 rule is d128's alone -- and neither list
+    proposes a split any more."""
+    wide = dict(b=1, s_kv=2048, **_DENSE)
+    d256 = _f16_plans(_decode_facts(d_qk=256, d_v=256, h_q=64, h_kv=4, s_q=128, **wide))
+    d192 = _f16_plans(_decode_facts(d_qk=192, d_v=128, h_q=32, h_kv=8, s_q=256, causal=True, **wide))
+    for plans in (d256, d192):
+        assert (plans[0].knobs.cga, plans[0].knobs.split_kv) == (2, 1), plans[0].knobs
+        assert all(p.knobs.split_kv == 1 for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_d128_cga_request_domain():
+    """The f16 row admits cga1 AND cga2 on d128, split or not (cga1 is the
+    decode tile, validated split and unsplit); a width the flavor has no
+    configuration for is declined, as is cga1 on the f16 d256 flavor, whose
+    kernel mandates CTA2. The fp8 d128 row keeps cga2 only
+    (test_quantized_cga_follows_selected_native_flavor pins that side)."""
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _F16)
+    for facts in (_decode_facts(), _decode_facts(s_q=4096, s_kv=4096, b=1, h_q=32, h_kv=8, causal=True, **_DENSE)):
+        for cga in (1, 2):
+            assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga)) is None
+            assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=cga, split_kv=2)) is None
+        assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=4))
+    d256 = _decode_facts(d_qk=256, d_v=256)
+    assert engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=2)) is None
+    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, d256, engines.SdpaFwdKnobs(cga=1))
+
+
+@pytest.mark.L0
+def test_d128_width_rule_is_one_rule_for_graph_and_adapter():
+    """select_d128_auto_cga is the rule behind both the graph path
+    (_d128_decode_tile_fits derives pack_g from the candidate's packing) and
+    the standalone adapter's default width (api_dsl.SdpaFwdDslSm100, which
+    derives it from its pack_gqa request through pack_gqa_group_size): one
+    decode tile's rows decide (cga_tile_m(128, 1) == _D128_DECODE_TILE_ROWS);
+    a ragged graph keeps cga2 unless it is the decode tile's ragged-Q leg.
+    (The adapter's cga DOMAIN is #1094's
+    test_standalone_cga_domain_cga1_is_a_decode_tile_only_on_d128_f16.)"""
+    from cudnn.sdpa.fwd.config_sm100 import cga_tile_m, pack_gqa_group_size
+    from cudnn.sdpa.fwd.heuristics import _D128_DECODE_TILE_ROWS, _d128_decode_tile_fits, select_d128_auto_cga
+
+    assert cga_tile_m(128, 1) == _D128_DECODE_TILE_ROWS == 128
+    assert cga_tile_m(128, 2) == 512
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    cases = (
+        (1, 64, 4, True),
+        (8, 64, 4, True),
+        (9, 64, 4, True),
+        (9, 64, 4, False),
+        (32, 96, 8, True),
+        (33, 96, 8, True),
+        (128, 8, 8, False),
+        (129, 8, 8, False),
+    )
+    for s_q, h_q, h_kv, packed in cases:
+        facts = _decode_facts(s_q=s_q, h_q=h_q, h_kv=h_kv)
+        pack_g = pack_gqa_group_size(h_q // h_kv, 128, partial=True) if packed else 1
+        want = 1 if _d128_decode_tile_fits(caps, facts, packed) else 2
+        assert select_d128_auto_cga(s_q=s_q, pack_g=pack_g, thd=False) == want, (s_q, h_q, h_kv, packed, want)
+        assert want == (1 if s_q * pack_g <= 128 else 2), (s_q, h_q, h_kv, packed, want)
+    assert select_d128_auto_cga(s_q=1, pack_g=1, thd=True) == 2
+    assert select_d128_auto_cga(s_q=1, pack_g=16, thd=True, thd_decode_leg=True) == 1
+    assert select_d128_auto_cga(s_q=129, pack_g=1, thd=True, thd_decode_leg=True) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +1053,244 @@ def test_heuristics_never_propose_split_or_pack_for_a_gated_graph(sm107_metadata
     assert all((p.knobs.split_kv or 1) == 1 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
     # ...and a gated graph on a flavor that does not carry the gate proposes nothing at all.
     assert not recommend("A", _facts(**dict(gated, d_qk=128, d_v=128)), _RUBIN_OFFERED)
+    # The ONE exception: a DECODE-shaped gated half graph (S_q x G <= 16 packed rows) splits on the d256 decode
+    # tile, whose combine applies the gate -- the split proposal LEADS, floored at 2, packed; an unsplit set stays
+    # unpacked (the prefill kernel's fused epilogue) and exists on a dense cache only.  The decode suite pins the
+    # full contract; here the proposal helpers and the admissibility of every emitted set.
+    decode = dict(
+        gated,
+        dtype=cudnn.data_type.BFLOAT16,
+        epilogue_gate_dtype=cudnn.data_type.BFLOAT16,
+        s_q=1,
+        s_kv=4096,
+        b=4,
+        h_q=24,
+        h_kv=2,
+        causal=False,
+        device_sm_count=204,
+    )
+    for cache in (dict(has_paged_kv=True, page_size=16, padded=True), dict(padded=False)):
+        f = _facts(**decode, **cache)
+        assert _pack_gqa_eligible(row, f, 128, 2) and not _pack_gqa_eligible(row, f, 128, 1) and _pack_gqa_eligible(row, f, 128), cache  # None = some plan
+        points = _split_points(row, f, 128, 128, 2, pack_g=12)
+        assert points[0] >= 2 and (1 in points) == (not f.has_paged_kv), (cache, points)
+        plans = recommend("A", f, _RUBIN_OFFERED)
+        assert plans and plans[0].knobs.pack_gqa is True and plans[0].knobs.split_kv >= 2, [p.knobs for p in plans]
+        for p in plans:
+            assert engines.mismatch(row, f, p.knobs) is None, (cache, p.knobs, engines.mismatch(row, f, p.knobs))
+            assert not (p.knobs.pack_gqa and (p.knobs.split_kv or 1) == 1), p.knobs
+        assert any((p.knobs.split_kv or 1) == 1 for p in plans) == (not f.has_paged_kv), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_rubin_gated_decode_tile_split_declines_execute_time_shape_overrides(sm107_metadata_target):
+    """The gate-in-combine split binds G to the plan's declared (B, H_q, S_q, D_v) (prepared.CombineGate), while a graph
+    that permits execute-time geometry (shape overrides) may change either at execute: the row never serves such a graph
+    on the decode tile's split -- the facts-level predicate says so (one definition for mismatch, the heuristics and the
+    adapter), mismatch names the overrides, the lowering-side admission agrees, and the proposal helpers emit no split or
+    packed set for it (its unsplit plan keeps the fused-gate prefill kernel).  The same graph WITHOUT overrides rides the
+    tile's split -- the control."""
+    import dataclasses
+
+    from cudnn.sdpa.fwd.engines import _prepared_decline_reason, d256_decode_tile_selected
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible, _split_points
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    gated = _decode_d256_facts(
+        device_cc=(10, 7),
+        device_sm_count=204,
+        b=4,
+        h_q=24,
+        has_epilogue_gate=True,
+        epilogue_gate_dtype=cudnn.data_type.BFLOAT16,
+        has_paged_kv=False,
+        page_size=0,
+        padded=False,
+    )
+    assert d256_decode_tile_selected(row, gated, 12, 2) and engines.mismatch(row, gated, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2)) is None, "the control"
+    assert _split_points(row, gated, 128, 128, 2, pack_g=12)[0] >= 2 and _pack_gqa_eligible(row, gated, 128, 2), "the control proposes the gated split"
+    over = dataclasses.replace(gated, shape_overrides=True)
+    assert not d256_decode_tile_selected(row, over, 12, 2) and not d256_decode_tile_selected(row, over, 1, 2) and not d256_decode_tile_selected(row, over, 12)
+    why = engines.mismatch(row, over, engines.SdpaFwdKnobs(split_kv=2))
+    assert why and "shape overrides" in why, why
+    why = engines.mismatch(row, over, engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2))
+    assert why and "decode tile" in why, why  # the packed request falls at the row's PackGQA rule first (the tile is not selected)
+    why = _prepared_decline_reason(row, over, 2)
+    assert why and "shape overrides" in why, why
+    assert "shape overrides" not in (_prepared_decline_reason(row, over, 1) or ""), "the unsplit question is not this decline"
+    assert _split_points(row, over, 128, 128, 2, pack_g=12) == [1], _split_points(row, over, 128, 128, 2, pack_g=12)
+    assert not _pack_gqa_eligible(row, over, 128, 2) and not _pack_gqa_eligible(row, over, 128)
+
+
+# --- cc 10.7 dense d128 half: the shared decode tile and PackGQA (issue #1472) --------------------------------------
+
+
+def _sm107_d128_facts(**over):
+    """Issue #1472's verify cell on cc 10.7: dense bf16 d128 64/8 at S_q 8 over a 2056-token cache, bottom-right
+    causal, an attention sink, 216 SMs (the board the levers were measured on)."""
+    base = dict(
+        b=128,
+        h_q=64,
+        h_kv=8,
+        s_q=8,
+        s_kv=2056,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_sink=True,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    base.update(over)
+    return _facts(**base)
+
+
+def _sm107_f16_plans(facts):
+    """The cc 10.7 half row's proposals for ``facts``, each re-admitted by mismatch() (honored-or-never-listed)."""
+    plans = [p for p in recommend("A", facts, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+    assert plans, "the cc 10.7 half row must serve this graph"
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans), [p.knobs for p in plans]
+    return plans
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over",
+    [dict(), dict(h_kv=4, s_q=4, s_kv=2052), dict(s_q=1, causal=False, bottom_right=False), dict(s_q=16, h_kv=16), dict(padded=True), dict(h_q=8, h_kv=8)],
+    ids=["issue_64_8_q8", "issue_64_4_q4", "plain_decode_q1", "q16_g4_one_tile", "padded_mtp", "mha_q8"],
+)
+def test_sm107_d128_decode_shaped_sets_ride_the_decode_tile(sm107_metadata_target, over):
+    """S_q * pack_g <= 128 on the cc 10.7 half row (issue #1472): every proposed set runs the shared decode tile (cga1 --
+    the tile-fit contract, as test_sdpa_fwd_decode_d128_sm100 pins on the SM100 row), none splits (the sink), a GQA
+    graph lists BOTH packings (admission; which leads is the ranking's business), an MHA graph none packed, and a causal
+    graph lists NATURAL and LPT both (which leads follows the measured tables,
+    test_sm107_shared_d128_scheduler_follows_the_measured_tables; both reachable for autotune)."""
+    facts = _sm107_d128_facts(**over)
+    plans = _sm107_f16_plans(facts)
+    assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
+    assert all((p.knobs.split_kv or 1) == 1 for p in plans), [p.knobs for p in plans]
+    packings = {bool(p.knobs.pack_gqa) for p in plans}
+    assert packings == ({True, False} if facts.h_q != facts.h_kv else {False}), [p.knobs for p in plans]
+    scheds = {p.knobs.sched_policy for p in plans}
+    assert 0 in scheds, scheds  # SCHED_NATURAL
+    if facts.causal:
+        assert SCHED_LPT in scheds, scheds
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [512, 129], ids=["q512", "q129"])
+def test_sm107_d128_prefill_shaped_sets_list_both_widths(sm107_metadata_target, s_q):
+    """Above one decode tile's rows on every leg (129 rows overflow the unpacked tile too) the cc 10.7 half row lists both
+    widths (the decode tile and the cga2 prefill pipeline; which leads is the wave rule's business, issue #1518) and a
+    packed set (the shared SM100 prefill body) next to the unpacked Rubin body."""
+    plans = _sm107_f16_plans(_sm107_d128_facts(b=1, h_kv=4, s_q=s_q, s_kv=max(512, s_q)))
+    assert {p.knobs.cga for p in plans} == {1, 2}, [p.knobs for p in plans]
+    assert {bool(p.knobs.pack_gqa) for p in plans} == {True, False}, [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_sm107_d128_prefolded_graphs_keep_the_native_body(sm107_metadata_target):
+    """The pre-folded scale (attn_scale_prefolded) is an arm of the Rubin prefill body only -- the shared SM100 bodies
+    apply the scale in-kernel -- so a pre-folded dense d128 graph keeps the cga2 domain, proposes no packed set, and an
+    explicit cga=1 or PackGQA pin is a typed decline (the heuristics never propose them; the cc 10.7 lever sweeps'
+    FLOAT+fold cases keep their plan)."""
+    from cudnn.sdpa.fwd.engines import effective_cgas
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    facts = _sm107_d128_facts(attn_scale_prefolded=True)
+    assert effective_cgas(spec.capabilities, facts) == frozenset({2})
+    plans = _sm107_f16_plans(facts)
+    assert all(p.knobs.cga == 2 and not p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+    assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=1))
+    assert "pre-folded" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(pack_gqa=True))
+
+
+@pytest.mark.L0
+def test_sm107_d128_cga_and_pack_admission(sm107_metadata_target):
+    """Explicit pins on the cc 10.7 half row (issue #1472): dense d128 half admits cga=1 (the shared decode tile) and
+    cga=2, and PackGQA for every group that divides the 128-row tile (4 / 8 / 16; the d64 envelope too); a group that
+    does not (96/8) is declined with the divisibility reason, dense d256 packs on the d256 decode tile within its route
+    (S_q x G within two token units of the 32-column tile) and keeps its paged-THD-only PackGQA past it, THD nonpaged
+    keeps the cga2 prefill pipeline (cga=1 outside its domain, no packed leg), and dense PAGED queries -- not wired on
+    cc 10.7 outside the d256 decode tile -- never see the d128 tile."""
+    from cudnn.sdpa.fwd.engines import effective_cgas
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16).capabilities
+    pack = engines.SdpaFwdKnobs(pack_gqa=True)
+    for cga in (1, 2):
+        assert engines.mismatch(caps, _sm107_d128_facts(), engines.SdpaFwdKnobs(cga=cga)) is None, cga
+    for h_kv in (16, 8, 4):
+        assert engines.mismatch(caps, _sm107_d128_facts(h_kv=h_kv), pack) is None, h_kv
+    assert engines.mismatch(caps, _sm107_d128_facts(d_qk=64, d_v=64), pack) is None
+    assert "divide" in engines.mismatch(caps, _sm107_d128_facts(h_q=96, h_kv=8), pack)
+    # dense d256 (64/8 at S_q 8 = 64 packed rows = two token units of the 32-column tile): the d256 decode tile packs the whole
+    # group, so the request is ADMITTED; past the route (S_q 16 = 128 rows) the dense d256 prefill kernel runs unpacked and the
+    # packed request is a typed decline naming the decode tile among the routes
+    assert engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256), pack) is None
+    past_route = engines.mismatch(caps, _sm107_d128_facts(d_qk=256, d_v=256, s_q=16), pack)
+    assert past_route is not None and "decode tile" in past_route, past_route
+    thd = _sm107_d128_facts(thd=True, padded=True)
+    assert "outside this engine's domain" in engines.mismatch(caps, thd, engines.SdpaFwdKnobs(cga=1))
+    assert engines.mismatch(caps, thd, pack) is not None
+    assert 1 not in effective_cgas(caps, _sm107_d128_facts(has_paged_kv=True, page_size=16, padded=True))
+
+
+@pytest.mark.L0
+def test_sm107_d128_sink_free_decode_sets_are_admissible(sm107_metadata_target):
+    """Sink-free small-batch long-KV decode on cc 10.7 (b=1, 64/8, S_q 1, 32k keys, no mask): the proposals ride the
+    decode tile, a packed set is among them, and every set -- the split ones included (the shared dense combine on
+    cc 10.7) -- passes mismatch().  The split COUNT is the wave model's choice and is not asserted."""
+    facts = _sm107_d128_facts(b=1, s_q=1, s_kv=32768, causal=False, bottom_right=False, has_sink=False)
+    plans = _sm107_f16_plans(facts)
+    assert all(p.knobs.cga == 1 for p in plans), [p.knobs for p in plans]
+    assert any(p.knobs.pack_gqa for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, first_sched",
+    [
+        (dict(), SCHED_LPT),
+        (dict(b=1, s_q=1, s_kv=32768), SCHED_LPT),
+        (dict(b=32, s_q=16, s_kv=8192), SCHED_LPT),
+        (dict(b=8, s_q=1, s_kv=1024), 0),
+        (dict(b=8, s_q=4, s_kv=4096, d_qk=64, d_v=64, window_left=128), 0),
+        (dict(h_kv=4, s_q=16, s_kv=2048), 0),
+        (dict(b=2, s_q=4096, s_kv=4096, window_left=1024), 0),
+        (dict(b=2, s_q=4096, s_kv=4096, window_left=1024, has_sink=False), 0),
+    ],
+    ids=[
+        "issue_cell_lpt",
+        "long_cache_b1_lpt",
+        "q16_g8_one_tile_lpt",
+        "short_cache_natural",
+        "swa_decode_natural",
+        "packed_cga2_band_natural",
+        "swa_prefill_natural",
+        "swa_prefill_sink_free_natural",
+    ],
+)
+def test_sm107_shared_d128_scheduler_follows_the_measured_tables(sm107_metadata_target, over, first_sched):
+    """The scheduler lead of the cc 10.7 shared dense d128 legs (issue #1472's tables, heuristics._SM107_DECODE_TILE_LPT_MIN_KV
+    and the two cc 10.7 arms of _sched_points): the packed decode tile walks plain LPT first from a 2k cache on; a short
+    cache, a sliding window (on the decode tile and on the packed cga2 prefill body alike) and the one-cluster packed cga2
+    band keep NATURAL first.  The other policy is always listed as a runner and every proposed set stays admissible; the
+    SM100 row's one-cluster NATURAL lead on the same decode shape is untouched."""
+    facts = _sm107_d128_facts(**over)
+    plans = _sm107_f16_plans(facts)
+    first = plans[0].knobs
+    assert first.pack_gqa is True, first
+    assert first.sched_policy == first_sched, [p.knobs for p in plans]
+    other = SCHED_LPT if first_sched == 0 else 0
+    assert any(p.knobs.sched_policy == other for p in plans), [p.knobs for p in plans]
+    sm100 = _facts(
+        b=32, h_q=64, h_kv=4, s_q=4, s_kv=4096, dtype=cudnn.data_type.BFLOAT16, causal=True, bottom_right=True, padded=True, has_paged_kv=True, page_size=16
+    )
+    sm100_plans = [p for p in recommend("A", sm100, {_F16: 20500}) if p.engine_id == 20500]
+    assert sm100_plans and sm100_plans[0].knobs.sched_policy in (None, 0), sm100_plans[0].knobs
 
 
 def _decode_d256_facts(**over):
@@ -866,6 +1392,122 @@ def test_decode_tile_model_counts_the_whole_packed_group():
 
 
 @pytest.mark.L0
+def test_rubin_decode_tile_packs_the_whole_group_and_takes_the_decode_split_model(sm107_metadata_target):
+    """The Rubin half row's twin of the two SM100 decode-tile tests above, on cc 10.7 at 204 SMs:
+    the row claims PackGQA at d256 for the decode tile ONLY (pack_gqa_d_shapes carries (256, 256);
+    the d256 prefill kernel runs unpacked), so a decode-shaped graph -- paged OR dense, the dense
+    cache no longer excluded -- leads PACKED with the decode split model's eager-safe choice (the
+    captured optimum under cuda_graph_replay), every emitted set admissible by mismatch; the 24/2
+    geometry (G = 12, which no prefill tile can pack: 128 % 12 != 0 and the Rubin row has no partial
+    form) packs the WHOLE group, its group read as 12 so the model sees 2 x B units; the MTP steps
+    ride the 32-column tile on this row (config_sm107.decode_d256_q_tile): 32/2 at S_q = 2 (32 rows)
+    packs in ONE unit, 24/2 at S_q = 4 (48 rows) in TWO token units of two tokens, so the model sees
+    2 x 2 x B units streaming the KV range -- the split picks follow; past the route (24/2 at S_q = 5:
+    three units) there is no packed set and a packed request is a typed decline; a prefill-shaped
+    dense d256 graph stays unpacked / unsplit; the padded dense cache and the sink keep the shared
+    no-split rules."""
+    from cudnn.sdpa.fwd.heuristics import _d256_decode_tile_selected, _pack_gqa_eligible, _pack_gqa_group
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert (256, 256) in row.pack_gqa_d_shapes and (256, 256) in row.split_d_shapes
+
+    def facts(**over):
+        return _decode_d256_facts(device_cc=(10, 7), device_sm_count=204, **over)
+
+    def sets(**over):
+        f = facts(**over)
+        out = [p.knobs for p in recommend("A", f, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+        assert out, over
+        for k in out:
+            assert engines.mismatch(row, f, k) is None, (over, k, engines.mismatch(row, f, k))
+        return out
+
+    serving = sets()
+    assert serving[0].pack_gqa is True and serving[0].split_kv == 1, serving[0]
+    assert [k.split_kv for k in serving if k.split_kv > 1] == [2], serving
+    replay = sets(cuda_graph_replay=True)
+    assert replay[0].pack_gqa is True and replay[0].split_kv == 2 and any(k.split_kv == 1 and k.pack_gqa is True for k in replay[1:]), replay
+    small = sets(b=8)
+    assert small[0].pack_gqa is True and small[0].split_kv == 8 and any(k.split_kv == 1 for k in small[1:]), small
+    assert sets(b=3)[0].split_kv == 16
+    assert all(k.split_kv == 1 for k in sets(b=128))
+    # The 24/2 geometry: the whole group, dense or paged.
+    q24 = facts(h_q=24, b=3, s_kv=1000)
+    assert _pack_gqa_eligible(row, q24, 128) and _pack_gqa_group(row, q24, 128, True) == 12
+    assert _d256_decode_tile_selected(row, q24, 12) and _d256_decode_tile_selected(row, facts(h_q=24, s_q=2), 12)  # S_q = 2: the 32-column tile
+    assert _d256_decode_tile_selected(row, facts(h_q=24, s_q=4), 12) and not _d256_decode_tile_selected(row, facts(h_q=24, s_q=5), 12)
+    assert sets(h_q=24, b=3, s_kv=1000)[0].pack_gqa is True
+    dense_padded = sets(h_q=24, b=3, s_kv=1000, has_paged_kv=False, page_size=0)
+    assert dense_padded[0].pack_gqa is True and all(k.split_kv == 1 for k in dense_padded), dense_padded
+    dense_unpadded = sets(h_q=24, b=3, s_kv=1024, has_paged_kv=False, page_size=0, padded=False)
+    assert dense_unpadded[0].pack_gqa is True and any(k.split_kv > 1 for k in dense_unpadded), dense_unpadded
+    # MTP: 16 rows pack and follow the serving policy; 32 rows (32/2 at S_q = 2) pack on the 32-column tile
+    # in one unit (the Rubin route), 48 rows (24/2 at S_q = 4) in two TOKEN UNITS the model counts as streams.
+    mtp16 = sets(h_q=16, s_q=2, causal=True, bottom_right=True)
+    assert mtp16[0].pack_gqa is True and mtp16[0].split_kv == 1 and [k.split_kv for k in mtp16 if k.split_kv > 1] == [2], mtp16
+    mtp32 = sets(s_q=2, causal=True, bottom_right=True)
+    assert mtp32[0].pack_gqa is True, mtp32
+    assert _pack_gqa_eligible(row, facts(s_q=2), 128) and _pack_gqa_group(row, facts(s_q=2), 128, True) == 16
+    assert engines.mismatch(row, facts(s_q=2), engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    assert engines.mismatch(row, facts(s_q=2, has_paged_kv=False, page_size=0), engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
+    from cudnn.sdpa.fwd.heuristics import _split_points, choose_decode_tile_split_kv
+    from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as rubin_q_tile
+
+    mtp4 = facts(h_q=24, s_q=4, causal=True, bottom_right=True)  # 24/2 at S_q = 4: two units of two tokens x 12 heads
+    assert rubin_q_tile(4, 12) == 32 and decode_d256_q_units(4, 12, 32) == 2
+    assert _pack_gqa_eligible(row, mtp4, 128) and _pack_gqa_group(row, mtp4, 128, True) == 12
+    want = choose_decode_tile_split_kv(units=32 * 2 * 2, kv_tiles=4096 // 128, sm_count=204, q_tile=32)
+    assert _split_points(row, mtp4, 128, 128, 2, pack_g=12)[0] == want, (_split_points(row, mtp4, 128, 128, 2, pack_g=12), want)
+    assert sets(h_q=24, s_q=4, causal=True, bottom_right=True)[0].pack_gqa is True
+    # Past the route (a third token unit): no packed set, the packed request a typed decline.
+    mtp5 = facts(h_q=24, s_q=5, causal=True, bottom_right=True)
+    assert rubin_q_tile(5, 12) == 0 and not _pack_gqa_eligible(row, mtp5, 128)
+    assert all(k.pack_gqa is not True for k in sets(h_q=24, s_q=5, causal=True, bottom_right=True))
+    why = engines.mismatch(row, mtp5, engines.SdpaFwdKnobs(pack_gqa=True))
+    assert why and "decode tile" in why, why
+    # MHA, the sink, and a prefill-shaped dense graph: unpacked / unsplit as the shared rules say.
+    assert all(k.pack_gqa is not True for k in sets(h_q=4, h_kv=4, b=3, s_kv=1000))
+    sink = sets(h_q=16, b=3, s_kv=700, has_sink=True)
+    assert sink[0].pack_gqa is True and all(k.split_kv == 1 for k in sink), sink
+    prefill = facts(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False)
+    assert all(k.pack_gqa is not True and k.split_kv == 1 for k in sets(s_q=512, h_q=16, causal=True, has_paged_kv=False, page_size=0, padded=False))
+    why = engines.mismatch(row, prefill, engines.SdpaFwdKnobs(split_kv=2))
+    assert why and "decode tile" in why, why
+    # The paged THD d256 packed graph is NOT the decode tile's (it has no THD scheduler): unsplit at CGA2 it is served by
+    # the paged half prefill pipeline's own D256 PackGQA (config_sm100.supports_paged_d256_pack_gqa); a SPLIT packed
+    # request has no route on either path and the decline names both.
+    assert engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True)) is None
+    assert engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True, cga=2, split_kv=1)) is None
+    why = engines.mismatch(row, facts(thd=True), engines.SdpaFwdKnobs(pack_gqa=True, split_kv=2))
+    assert why and "decode tile" in why and "paged half THD" in why, why
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("s_q", [1, 4, 128, 512])
+def test_rubin_paged_thd_d256_keeps_its_packed_candidate(sm107_metadata_target, s_q):
+    """The paged half THD d256 graph on cc 10.7 packs on the paged prefill pipeline (CGA2, unsplit;
+    config_sm100.supports_paged_d256_pack_gqa) -- a route the Rubin d256 decode tile never touched, so the
+    proposal helpers keep emitting its packed candidate exactly as they did before the tile's d256 PackGQA
+    rule arrived (B = 32, 32/2 heads, page 128, 4096 keys, S_q from one token to a long prefill): one
+    pack_gqa=True set at CGA2 unsplit, admissible, and no packed SPLIT (the route has none).  The explicit
+    packed knobs passing mismatch() is not enough -- the candidate LIST is what a caller without knobs sees."""
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_eligible
+
+    row = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    f = _decode_d256_facts(device_cc=(10, 7), device_sm_count=212, s_q=s_q, thd=True, page_size=128, causal=True, bottom_right=True)
+    plans = [p.knobs for p in recommend("A", f, _RUBIN_OFFERED) if p.engine_id == _RUBIN_OFFERED[_RUBIN_F16]]
+    assert plans, "the Rubin half row serves the paged THD d256 graph"
+    for k in plans:
+        assert engines.mismatch(row, f, k) is None, (k, engines.mismatch(row, f, k))
+    packed = [k for k in plans if k.pack_gqa is True]
+    assert packed and all(k.cga == 2 and (k.split_kv or 1) == 1 for k in packed), plans
+    assert _pack_gqa_eligible(row, f, 128) and _pack_gqa_eligible(row, f, 128, 1, 2), "the route: some plan / CGA2 unsplit"
+    assert not _pack_gqa_eligible(row, f, 128, 2) and not _pack_gqa_eligible(row, f, 128, 1, 1), "no packed split, no CGA1 packing"
+    assert engines.mismatch(row, f, engines.SdpaFwdKnobs(pack_gqa=True, cga=2, split_kv=1)) is None
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize("d", [96, 128, 200, 256])
 @pytest.mark.parametrize("paged", [False, True])
 def test_thd_half_admits_explicit_live_worklist_policies(d, paged):
@@ -886,3 +1528,156 @@ def test_quantized_thd_proposals_are_admissible(quant):
     caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == name)
     plans = recommend("A", facts, {name: 20501 if quant == "fp8" else 20510})
     assert plans and all(engines.mismatch(caps, facts, p.knobs) is None for p in plans)
+
+
+def _sm107_paged_thd_facts(**over):
+    """The paged THD + sink serving contract on cc 10.7 (issue #1472's paged table): packed queries over page-16 HND pools,
+    bottom-right causal, 2056-token caches, b128 64/8 with four tokens per request."""
+    base = dict(
+        b=128,
+        h_q=64,
+        h_kv=8,
+        s_q=4,
+        s_kv=2056,
+        d_qk=128,
+        d_v=128,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=True,
+        bottom_right=True,
+        has_sink=True,
+        thd=True,
+        padded=True,
+        has_paged_kv=True,
+        page_size=16,
+        device_cc=(10, 7),
+        device_sm_count=216,
+    )
+    base.update(over)
+    return _facts(**base)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, cga",
+    [
+        (dict(), 1),
+        (dict(s_q=1), 1),
+        (dict(s_q=8), 1),
+        (dict(has_sink=False), 1),
+        (dict(h_kv=4), 1),
+        (dict(b=24, h_kv=4, s_q=8), 2),
+        (dict(dtype=cudnn.data_type.HALF), 2),
+        (dict(page_size=128), 1),
+    ],
+    ids=["b128_64_8_q4_sink", "q1_sink", "q8_sink", "sink_free", "gqa16_b128", "gqa16_b24_one_wave", "f16_keeps_cga2", "page128"],
+)
+def test_sm107_paged_thd_sink_sets_pack_and_order_like_their_sink_free_twins(sm107_metadata_target, over, cga):
+    """The cc 10.7 paged THD plan ordering measured with and without an attention sink (issue #1472's paged table): the
+    first proposal packs the group (GQA 8 and 16 alike), walks the live tiles LPT, and takes the two-slab cga1 tile where
+    the wave rule prefers it (b128: 1024 / 512 units over 216 SMs) -- cga2 where one wave fits either way (b24 64/4: 96
+    units) or outside the measured bf16 family (f16).  A sink changes none of that (the sink cells ranked like their
+    sink-free twins), and every proposed set stays admissible."""
+    from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, _sm107_paged_half
+
+    facts = _sm107_paged_thd_facts(**over)
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _RUBIN_F16)
+    assert _sm107_paged_half(spec.capabilities, facts) and _prefer_thd_pack_gqa(spec.capabilities, facts)
+    plans = _sm107_f16_plans(facts)
+    first = plans[0].knobs
+    assert first.pack_gqa is True, first
+    assert first.sched_policy == SCHED_LPT, first
+    assert first.cga == cga, first
+    assert first.split_kv in (None, 1), first
+    # the unpacked set stays listed as a runner (autotune), never first
+    assert any(p.knobs.pack_gqa is False for p in plans), [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+def test_sm107_paged_thd_rules_do_not_move_the_sm100_row():
+    """The cc 10.7 paged measurements widen nothing on the SM100 line: paged GQA16 stays unpacked-first there, a sink keeps
+    the NATURAL lead and the cga2 width (its own measured family, #1468 / PR #1469's domain)."""
+    from cudnn.sdpa.fwd.heuristics import _prefer_thd_pack_gqa, _sm107_paged_half
+
+    caps = next(s.capabilities for s in engines.ENGINE_SPECS if s.name == _F16)
+    sm100 = dict(device_cc=(10, 0), device_sm_count=148)
+    gqa16 = _sm107_paged_thd_facts(h_kv=4, has_sink=False, **sm100)
+    assert not _sm107_paged_half(caps, gqa16) and not _prefer_thd_pack_gqa(caps, gqa16)
+    sink = _sm107_paged_thd_facts(**sm100)
+    plans = [p for p in recommend("A", sink, {_F16: 20500}) if p.engine_id == 20500]
+    assert plans and all(engines.mismatch(caps, sink, p.knobs) is None for p in plans)
+    assert plans[0].knobs.sched_policy in (None, 0) and plans[0].knobs.cga == 2, plans[0].knobs
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, packed_first",
+    [
+        (dict(), True),
+        (dict(b=4, h_kv=4, s_q=1024, s_kv=1024), True),
+        (dict(b=1, h_q=32, s_q=4096, s_kv=4096), True),
+        (dict(b=1, h_kv=4, s_q=512, s_kv=512, has_sink=False), True),
+        (dict(causal=False, bottom_right=False), False),
+        (dict(h_q=8, h_kv=8), None),
+    ],
+    ids=["b2_64_8_s2048", "b4_64_4_s1024", "b1_32_8_s4096", "b1_64_4_s512_sink_free", "no_band", "mha"],
+)
+def test_sm107_dense_d128_gqa_packs_under_a_band_at_prefill_depth(sm107_metadata_target, over, packed_first):
+    """The cc 10.7 shared dense d128 leg packs a GQA group under a diagonal band at any S_q (the SM100 rule,
+    heuristics._sm100_banded_gqa_packs, measured on cc 10.7 at S 512-4096: packed 6-16 % ahead of the unpacked Rubin
+    tile, with and without a sink); a mask-free graph keeps the unpacked lead, an MHA graph proposes no packed set."""
+    facts = _sm107_d128_facts(**{**dict(b=2, s_q=2048, s_kv=2048), **over})
+    plans = _sm107_f16_plans(facts)
+    if packed_first is None:
+        assert all(p.knobs.pack_gqa is not True for p in plans), [p.knobs for p in plans]
+        return
+    assert plans[0].knobs.pack_gqa is packed_first, [p.knobs for p in plans]
+    assert {p.knobs.pack_gqa for p in plans} >= {True, False}, [p.knobs for p in plans]
+    assert {p.knobs.cga for p in plans} == {1, 2}, [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "over, first",
+    [
+        (dict(s_q=64), (False, 1)),
+        (dict(s_q=128), (False, 1)),
+        (dict(s_q=256), (True, None)),
+        (dict(b=8, h_kv=4, s_q=128, s_kv=2048), (False, 1)),
+        (dict(s_q=128, causal=True, bottom_right=True), (True, None)),
+        (dict(b=128, s_q=8, s_kv=2056), (True, 1)),
+    ],
+    ids=["q64_unpacked_tile", "q128_unpacked_tile", "q256_packed_body", "gqa16_q128_unpacked_tile", "banded_q128_packs", "decode_fit_packs"],
+)
+def test_sm107_mask_free_d128_gqa_rides_the_unpacked_decode_tile_where_only_it_fits(sm107_metadata_target, over, first):
+    """Mask-free cc 10.7 dense d128 GQA (the opt-in order; placement keeps the backend first): when one head's rows fit the
+    shared decode tile while the packed unit overflows it (S_q <= 128 < S_q x G) the unpacked decode tile leads, unsplit
+    (measured 32 us against the packed body's 91 / 98 at b2 64/8 q128 KV 4k); past the tile the packed body keeps the
+    lead, a band packs first (_sm100_banded_gqa_packs) and a packed unit that fits the tile packs first.  The other packing
+    stays listed.  ``None``: past one decode tile either width may lead (the wave rule, issue #1518)."""
+    facts = _sm107_d128_facts(**{**dict(b=2, s_kv=4096, causal=False, bottom_right=False, has_sink=False), **over})
+    plans = _sm107_f16_plans(facts)
+    assert bool(plans[0].knobs.pack_gqa) == first[0], [p.knobs for p in plans]
+    if first[1] is not None:
+        assert plans[0].knobs.cga == first[1], [p.knobs for p in plans]
+    if first[1] == 1:
+        assert plans[0].knobs.split_kv in (None, 1), plans[0].knobs  # the decode tile's unsplit leg (its split arms measured slower)
+    assert {bool(p.knobs.pack_gqa) for p in plans} == {True, False}, [p.knobs for p in plans]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", [cudnn.data_type.HALF, cudnn.data_type.BFLOAT16])
+@pytest.mark.parametrize("s_q", [2, 257])
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_explicit_paged_prefill_cga1_domain_and_tile_geometry(dtype, s_q, cc):
+    """An admitted unsplit plan uses both prefill slabs; split keeps its own tile."""
+    from cudnn.sdpa.fwd.heuristics import _pack_gqa_tile_q
+
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    facts = _facts(dtype=dtype, device_cc=cc, s_q=s_q, h_q=16, h_kv=4, thd=True, padded=True, has_paged_kv=True, page_size=16)
+    reason = engines.mismatch(caps, facts, engines.SdpaFwdKnobs(cga=1, split_kv=1, pack_gqa=True))
+    if cc == (10, 0):
+        assert reason is None, reason
+        assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=1) == 2 * 128
+    else:
+        assert reason is not None
+    assert _pack_gqa_tile_q(caps, facts, 128, cga=1, split_kv=2) == 128

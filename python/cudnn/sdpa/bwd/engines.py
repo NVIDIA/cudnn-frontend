@@ -257,6 +257,12 @@ class Capabilities:
     # THD ports may be head-interleaved (head stride >= D, a multiple of 8
     # elements); rows without it require head stride == D.
     thd_head_stride: bool = False
+    # attn_scale = 0, claimed by rows qualified on GPU at zero scale, masked and unmasked (#1435).
+    zero_scale: bool = False
+    # THD caller buffers are addressed at the bound ragged offsets (per-port
+    # token origins, whole tokens by precondition), not at prefix(lengths).
+    # Appended last: Capabilities is positional-append-only.
+    thd_ragged_offsets: bool = False
 
 
 def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: Any = None) -> Optional[str]:
@@ -361,6 +367,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", requested: 
         (facts.has_score_max, capabilities.score_max, "score_max"),
         (facts.has_score_sum_exp, capabilities.score_sum_exp, "score_sum_exp"),
         (facts.dynamic_scale, capabilities.dynamic_scale, "tensor attn_scale"),
+        (facts.scale == 0.0, capabilities.zero_scale, "attn_scale = 0"),
         (facts.has_unfuse_fma, capabilities.unfuse_fma, "unfuse_fma"),
         (facts.seq_q_trim, capabilities.seq_q_trim, "seq_len_q without padding mask"),
         (facts.right_band_widening, capabilities.right_band_widening, "causal right-band widening"),
@@ -571,7 +578,7 @@ def _thd_ctor_facts(facts: "ga.SdpaGraphFacts", stats_geom) -> dict:
     """The THD plan-time facts every sm107-line adapter constructor takes, derived ONCE for the three lowerings: ``thd``, the
     caller-declared packed token totals (under THD they SIZE the blocked S/dS workspace, which ``scratch_workspace_bytes()``
     has to answer at build time -- why ``mismatch()`` requires them there) and the packed Stats packing, read off the ragged
-    declaration exactly as the forward reads it (``fwd/prepared.py``, ``bind_thd``): token-major ``(T, H)`` -- cuDNN's ragged-Stats
+    declaration exactly as the forward reads it (native forward THD binding): token-major ``(T, H)`` -- cuDNN's ragged-Stats
     recipe -- or head-major ``(1, QH, head_stride)``, which is what the FROST forward emits natively (``mismatch()`` has already
     rejected anything that is neither).  Off a dense graph every fact is its default."""
     thd = facts.thd
@@ -662,6 +669,27 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
     dbias_geom = (tuple(facts.dbias_t.get_dim()), tuple(facts.dbias_t.get_stride())) if facts.has_dbias else None
 
     adapter_cls = _adapter(api_type)
+    # Bound ragged offsets, read on device by rows that declare it: per port,
+    # the IR tensor's offset tensor, dtype and multiplier.
+    _ragged = {}
+    if thd and spec.capabilities.thd_ragged_offsets:
+        _ro_dtypes = {cudnn.data_type.INT32: torch.int32, cudnn.data_type.INT64: torch.int64}
+        for port, t in (
+            ("q", facts.q_t),
+            ("k", facts.k_t),
+            ("v", facts.v_t),
+            ("o", facts.o_t),
+            ("do", facts.do_t),
+            ("dq", facts.dq_t),
+            ("dk", facts.dk_t),
+            ("dv", facts.dv_t),
+            ("stats", facts.stats_t),
+        ):
+            ro = getattr(t, "ragged_offset", None) if t is not None else None
+            if ro is not None:
+                if ro.get_data_type() not in _ro_dtypes:
+                    raise NotImplementedError(f"{port} ragged offset must be INT32 or INT64; got {ro.get_data_type()}")
+                _ragged[port] = (ro, _ro_dtypes[ro.get_data_type()], int(getattr(t, "ragged_offset_multiplier", 1) or 1))
     # SM80-only plan-time facts, forwarded only to adapters declaring them.
     _extra_ctor = {
         # THD / ragged (base-ctor parameters, so every adapter declares them;
@@ -671,6 +699,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         "bias_is_fp32": (facts.bias_t.get_data_type() == cudnn.data_type.FLOAT) if facts.bias_t is not None else True,
         "bias_batch": int(facts.bias_t.get_dim()[0]) if facts.bias_t is not None else 1,
         "has_rope": False,  # RoPE-fused multi-node graphs never reach the analyzer
+        "thd_ragged_offsets": {port: (dtype, mult) for port, (_, dtype, mult) in _ragged.items()},
     }
     _extra_ctor = {k: v for k, v in _extra_ctor.items() if k in inspect.signature(adapter_cls.__init__).parameters}
     api = adapter_cls(
@@ -724,6 +753,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
         dsink=facts.dsink_t if facts.has_dsink else None,
         bias=facts.bias_t if facts.has_bias else None,
         dbias=facts.dbias_t if facts.has_dbias else None,
+        **{"ragged_" + port: ro for port, (ro, _, _) in _ragged.items()},
     )
 
     # Every adapter that records a prepared spec is launched through it (SM120, SM100, SM80 native, SM107); the
@@ -835,6 +865,7 @@ def lower_dsl_bwd(spec: EngineSpec, facts: "ga.SdpaGraphFacts", requested: Any =
             # engine plan passes ctx.stream); None keeps the adapter's
             # torch-current-stream fallback.
             current_stream=_cuda_driver().CUstream(stream) if stream is not None else None,
+            **({"thd_ragged_offsets": {port: resolved[id(ro)].reshape(-1) for port, (ro, _, _) in _ragged.items()}} if _ragged else {}),
         )
         return None
 
@@ -866,14 +897,16 @@ def _sm80_spec() -> EngineSpec:
     launch, Stats read in either packed packing, declared totals sizing
     the carved scratch -- hence ``thd_declared_totals``).  Deterministic dQ,
     sinks, GQA, the causal family and head-dim envelope padding all ride it;
-    bias / dBias is dense-only (a path property, see mismatch()).  As on every
-    FROST THD row the packed addressing is ``prefix(lengths) x token stride``
-    and the bound ragged-offset values are not read: sequences must be
-    adjacent (padded THD with inter-sequence gaps is issue #737).
+    bias / dBias is dense-only (a path property, see mismatch()).  The
+    setup launch also reads every port's bound ragged offsets into per-port
+    token origins (``thd_ragged_offsets``), so padded THD with gaps between
+    sequences (TE's ``cu_seqlens_padded``) is served; whole-token offsets are
+    a supported-input precondition.
     """
     return EngineSpec(
         name="sdpa_bwd_sm80",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=80,
             sm_hi=80,
             d=frozenset({256}),
@@ -899,6 +932,7 @@ def _sm80_spec() -> EngineSpec:
             # than any packed buffer.
             thd_declared_totals=True,
             thd_head_stride=True,
+            thd_ragged_offsets=True,
             decode=False,  # prefill kernels only
             layouts=frozenset({"bshd", "dense_flex"}),
             # The kernels READ the declared stats strides natively (the
@@ -956,6 +990,7 @@ def _sm100_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=100,
             sm_hi=103,
             d=frozenset({512}),
@@ -1216,6 +1251,7 @@ def _sm107_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1380,7 +1416,7 @@ def _sm107_fp8_spec() -> EngineSpec:
     amax folds on them, so the adapter serves ``seq_kv_lens_present=True`` +
     ``execute(seq_kv_lens=)`` on the standalone surface (the K / V rows past a length
     must be finite), and takes a caller's TRUE-unit delta under ``external_delta=True``
-    (dense plans; ``api_dsl_sm107`` module doc).
+    (dense and THD plans; ``api_dsl_sm107`` module doc).
 
     THD / ragged is served on the packed path exactly as on the half row (the same
     kv-blocked workspace, metadata, claim counter and per-sequence clipped stores, in
@@ -1399,6 +1435,7 @@ def _sm107_fp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_fp8",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1497,6 +1534,7 @@ def _sm107_mxfp8_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_mxfp8",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({256}),
@@ -1547,6 +1585,7 @@ def _sm100_d256_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm100_d256",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=100,
             sm_hi=106,
             d=frozenset({256}),
@@ -1589,6 +1628,7 @@ def _sm107_d512_spec() -> EngineSpec:
     return EngineSpec(
         name="sdpa_bwd_sm107_d512",
         capabilities=Capabilities(
+            zero_scale=True,
             sm_lo=_RUBIN[0],
             sm_hi=_RUBIN[1],
             d=frozenset({512}),

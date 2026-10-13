@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Native output gates retain current storage, full-width strides and ungated statistics."""
 
+import sdpa_binding_reference as binding_reference
+
 import pytest
 import torch
 
@@ -40,11 +42,11 @@ def test_native_gate_actual_host_frames_and_changed_pointers(kind):
     for offset, stream in ((0, 17), (2**33, 23)):
         fresh = {name: f._replace(ptr=f.ptr + offset) if f is not None else None for name, f in facts.items()}
         if s.quant is None:
-            expected = tuple(prep.bind_dense(s, fresh, stream, stream))
+            expected = tuple(binding_reference.bind_dense(s, fresh, stream, stream))
         else:
             native, s.native = s.native, None
             try:
-                prep.execute_quantized(s, fresh, 0x50000000 + offset, stream, stream)
+                binding_reference.execute_quantized(s, fresh, 0x50000000 + offset, stream, stream)
             finally:
                 s.native = native
             expected = frames.pop()
@@ -143,7 +145,7 @@ def test_native_gate_fresh_buffers_and_changed_replay(kind, ordered, monkeypatch
     ref, rvp, rws, rb, rt = _case(kind, gate.clone())
     spec = g._compiled_plans[g._plan_index]._prepared.spec
     assert spec.native is not None, "parent still binds the epilogue gate in Python"
-    ref._compiled_plans[ref._plan_index]._prepared.spec.native = None
+    binding_reference.use_reference(ref._compiled_plans[ref._plan_index]._prepared.spec)
     for name, t in ts.items():
         if name in bufs:
             bufs[name] = bufs[name].clone()
@@ -162,7 +164,7 @@ def test_native_gate_fresh_buffers_and_changed_replay(kind, ordered, monkeypatch
     try:
         with monkeypatch.context() as guard:
             guard.setattr(prep, "facts_of_roles", lambda *a: pytest.fail("native gate rebuilt Python facts"))
-            guard.setattr(prep, "execute_quantized", lambda *a, **kw: pytest.fail("native gate entered Python binding"))
+            guard.setattr(prep, "execute_quantized", lambda *a, **kw: pytest.fail("native gate entered Python binding"), raising=False)
             call()
             _same_outputs(bufs, rb)
             with torch.cuda.graph(capture):
@@ -199,7 +201,7 @@ def test_native_gate_physical_int64_stride_and_product(kind, product):
     g, vp, ws, bufs, ts = _case(kind, gate, b=batch)
     ref, rvp, rws, rb, _ = _case(kind, gate.transpose(1, 2).contiguous().transpose(1, 2), b=batch)
     assert g._compiled_plans[g._plan_index]._prepared.spec.native is not None
-    ref._compiled_plans[ref._plan_index]._prepared.spec.native = None
+    binding_reference.use_reference(ref._compiled_plans[ref._plan_index]._prepared.spec)
     ref.execute(rvp, rws)
     g.execute(vp, ws)
     _same_outputs(bufs, rb)

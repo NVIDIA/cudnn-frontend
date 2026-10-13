@@ -2,17 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Immutable backward launch metadata and per-call pointer binding.
 
-Half graph plans share a native fixed-contract binder on SM80, SM100/SM103,
-SM107 and SM120. It consumes normalized storage observations without Python
-BufferFacts construction. The Python binder remains the standalone/quantized
-executor and the differential reference; both call the same compiled host.
+Half graph, standalone and staged plans share a native fixed-contract binder
+on SM80, SM100/SM103, SM107 and SM120. Each half host declares that ownership
+when building its spec. Quantized contracts retain the Python implementation;
+graph raw storage and standalone carrier rules meet in the same half binder.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 
 from cudnn.frost.compiled_cache import positional_entry
-from cudnn.sdpa.fwd.prepared import facts_of_roles
+from cudnn.sdpa.fwd.prepared import _native_pack_from_facts, facts_of_roles
 
 ROLES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "seq_q", "seq_kv", "sink", "dsink", "bias", "dbias")
 ATTRIBUTES = ("q", "k", "v", "o", "do", "stats", "dq", "dk", "dv", "seq_len_q", "seq_len_kv", "sink_token", "dsink", "bias", "dbias")
@@ -30,7 +30,7 @@ class Operand:
     opaque_bytes: bool = False
     # A PACKED per-tile byte blob (appended; 0 = fixed): the MXFP8 THD scale-factor tensors, laid out per (head, 128-token tile)
     # in cu_seqlens order at ``packed_tile_bytes`` per tile row.  Their LIVE byte count is a per-call fact of the bound buffer
-    # (the forward's convention, ``fwd/prepared._bind_mxfp8_scales``): ``bind()`` requires whole tile rows, derives
+    # (the forward's convention, native forward scale-factor binding): ``bind()`` requires whole tile rows, derives
     # ``count = nbytes // packed_tile_bytes`` and refuses a count above the plan's capacity (``span`` = the capacity in bytes: the
     # larger of ``ceil(T_cap / 128) + B`` tiles per head and the declared scale-factor sample's own count);
     # the counts reach the artifact as appended Int32 frame entries (``BwdLaunchSpec.packed_tile_groups``).
@@ -60,6 +60,18 @@ class BwdLaunchSpec:
     # the q side (``sf_q``, ``sf_q_T``, ``sf_do``, ``sf_do_T``) and the kv side (``sf_k``, ``sf_k_T``, ``sf_v``); a count of 0 (no live
     # tile on that side) is framed as 1 -- a tensor map needs a positive extent, and the kernels' clamped maps never read it.
     packed_tile_groups: tuple = ()
+    native_binding: bool = field(kw_only=True)
+    native: object = field(init=False, default=None, repr=False, compare=False)
+    native_roles: tuple = field(init=False, default=(), repr=False, compare=False)
+    native_indices: tuple = field(init=False, default=(), repr=False, compare=False)
+
+    def __post_init__(self):
+        if self.native_binding:
+            from cudnn import _pybind_module
+
+            object.__setattr__(self, "native_roles", self.roles[: len(self.operands)])
+            object.__setattr__(self, "native_indices", tuple(range(len(self.operands))))
+            object.__setattr__(self, "native", _pybind_module._SdpaBwdBinder(self, (None,) * len(self.operands)))
 
 
 def build_sm120_spec(api):
@@ -84,7 +96,7 @@ def build_sm120_spec(api):
     fn = positional_entry(owner.entry)
     if fn is None:
         raise NotImplementedError("SM120 backward requires a positional tvm-ffi entry")
-    return BwdLaunchSpec(owner, fn, tuple(operands), owner.workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax)
+    return BwdLaunchSpec(owner, fn, tuple(operands), owner.workspace_bytes, int(api.q_desc.device.index or 0), api.scale_softmax, native_binding=True)
 
 
 def _same_geometry(actual, expected):
@@ -95,6 +107,14 @@ def _same_geometry(actual, expected):
 
 def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
     """Validate every operand before launching any stage, including bias initialization."""
+    if spec.native_binding:
+        pack = _native_pack_from_facts(facts, spec.native_roles)
+        return list(spec.native.bind(pack, spec.native_indices, workspace_ptr, stream_int, (), scale, raw_storage, geometry))
+    return _bind_python(spec, facts, workspace_ptr, stream_int, scale=scale, geometry=geometry, raw_storage=raw_storage)
+
+
+def _bind_python(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, raw_storage=False):
+    """Python-owned quantized backward contracts (also the differential test reference)."""
     if not workspace_ptr or workspace_ptr % 16:
         raise ValueError(f"{spec.name} needs an aligned caller workspace")
     frame = []
@@ -158,7 +178,7 @@ def bind(spec, facts, workspace_ptr, stream_int, *, scale=None, geometry=None, r
         if workspace_ptr < f.ptr + extent and f.ptr < workspace_ptr + spec.workspace_bytes:
             raise ValueError(f"{spec.name}: caller workspace overlaps {name}")
         frame.append(f.ptr)
-    scale = spec.scale if scale is None or scale == 0 else float(scale)
+    scale = spec.scale if scale is None else float(scale)
     frame.append(workspace_ptr)
     if spec.scale_log2:
         frame.append(scale * math.log2(math.e))
@@ -210,7 +230,7 @@ class PreparedBwdLaunch:
         self._indices = None
         self._native_indices = None
         self._native = None
-        if spec.name in ("sdpa_bwd_sm80", "sdpa_bwd_sm100", "sdpa_bwd_sm107", "sdpa_bwd_sm120"):
+        if spec.native_binding:
             from cudnn import _pybind_module
 
             self._native = _pybind_module._SdpaBwdBinder(spec, self._geometry)
