@@ -670,14 +670,14 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if facts.o_block_scale and (facts.thd or facts.has_paged_kv or (split_kv or 1) > 1 or facts.shape_overrides or facts.has_epilogue_gate):
         return "prepared block-scaled outputs require fixed dense unsplit plans"
     if facts.is_mxfp8 and (
-        capabilities.sm_lo not in (100, 107)
+        capabilities.sm_lo not in (100, 107, 120)
         or (capabilities.sm_lo == 107 and (split_kv or 1) > 1)
         or not capabilities.is_mxfp8
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
         or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
         or (facts.shape_overrides and not facts.thd)
     ):
-        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense or bounded THD scalar outputs"
+        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, SM107 fixed dense or bounded THD scalar outputs, and SM120 fixed dense or THD plans"
     if facts.is_fp8 and (
         capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
@@ -1101,6 +1101,17 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         return f"serves exact native shapes {shapes} (no envelope padding); graph has D_QK={facts.d_qk}/D_V={facts.d_v}"
     if facts.thd and capabilities.thd_d_shapes is not None and (facts.d_qk, facts.d_v) not in capabilities.thd_d_shapes:
         return f"THD (ragged) rides the packed native-tile leg on this engine (shapes {sorted(capabilities.thd_d_shapes)}); the head-dim envelope is dense-only"
+    if facts.thd and capabilities.sm_lo == capabilities.sm_hi == 80 and capabilities.phase == "prefill":
+        if knobs is not None and knobs.sched_policy not in (None, SCHED_NATURAL):
+            return "SM80 THD forward requires the natural scheduler (the varlen grid is 3-D)"
+        for name, tensor in (("Q", facts.q_t), ("K", facts.k_t), ("V", facts.v_t), ("O", facts.o_t)):
+            dim, stride = tuple(tensor.get_dim()), tuple(tensor.get_stride())
+            if (stride[2], stride[1], stride[3]) != (dim[1] * dim[3], dim[3], 1):
+                return f"SM80 THD {name} requires compact packed BSHD strides"
+        if (facts.seq_q_t is None and facts.cu_seq_q_t is None) or (facts.seq_kv_t is None and facts.cu_seq_kv_t is None):
+            return "SM80 THD forward requires Q and KV lengths (seq_len_* or cu_seq_len_*)"
+        if facts.has_bias or facts.has_sink:
+            return "SM80 THD forward does not support bias or sink fusion"
     if facts.s_q == 1 and not capabilities.decode:
         return "s_q == 1 (decode) is out of scope for the SM80 prefill kernels"
     if facts.dtype not in capabilities.dtypes:
@@ -2182,9 +2193,9 @@ def _sm80_spec() -> EngineSpec:
     ``SdpaFwdDslSm80`` adapter (``fwd/api_dsl.py``), which owns kernel-flavor
     selection (gptoss/llama/dsv3/qwen), host-side head-dim padding (hence
     ``d_pad_multiple=1``), BHSD<->BSHD normalization, and per-shape kernel
-    caching — the CuTe-DSL JIT happens on the first execute.  THD graphs are
-    gated off (the standalone wrapper's varlen path serves THD); knob domains
-    are empty (no tunables wired)."""
+    caching. Native-flavor packed THD graphs bind the varlen template directly;
+    the dense head-dim envelope is not offered to THD. Dense graphs expose
+    scheduler tuning; THD requires the natural 3-D grid."""
     return EngineSpec(
         name="sdpa_fwd_prefill_sm80",
         capabilities=Capabilities(
@@ -2194,6 +2205,7 @@ def _sm80_spec() -> EngineSpec:
             phase="prefill",
             d_shapes=frozenset({(256, 256)}),  # flavor envelopes; host-side zero-padding
             d_pad_multiple=1,
+            thd_d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256)}),
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             bias=True,
             right_band_widening=True,
@@ -2201,6 +2213,8 @@ def _sm80_spec() -> EngineSpec:
             bottom_right=True,
             swa=True,
             padded=True,
+            thd=True,
+            cu_seq_len=True,
             sink=True,
             stats=True,
             stats_log2=True,
@@ -2212,9 +2226,8 @@ def _sm80_spec() -> EngineSpec:
             lse_optional=True,
             layouts=frozenset({"bshd", "dense_flex"}),
             skv_tile=0,  # the kernels' is_even_k path serves ragged S_kv
-            # The static-grid remap serves all three policies (the template's
-            # sched_policy field); the adapter maps the explicit int to its
-            # kernel token and derives only when the knob is None.
+            # Dense graphs serve all three schedulers; the THD grid is 3-D
+            # and the THD-only mismatch above accepts natural scheduling only.
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
         ),
         lower=partial(lower_dsl_prefill, api_type=_SM80),
@@ -2823,6 +2836,49 @@ def _sm120_fp8_spec() -> EngineSpec:
     )
 
 
+def _sm120_mxfp8_spec() -> EngineSpec:
+    """SM120 block-scaled MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF, FP16/BF16/FP8 out)."""
+    from cudnn.sdpa.fwd.config_sm120 import FP8_GENERAL_HEAD_TILES
+
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm120_mxfp8",
+        capabilities=Capabilities(
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
+            phase="prefill",
+            d_shapes=frozenset((tq, tv) for tq in FP8_GENERAL_HEAD_TILES for tv in FP8_GENERAL_HEAD_TILES),
+            # No floors: the d512 flavor is per-tensor only, and the smallest
+            # covering general tile pads at most 16 columns per side.
+            d_envelope_floors=(),
+            d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            o_block_scales=frozenset({0, 32}),
+            is_mxfp8=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            right_band_widening=True,
+            padded=True,
+            sink=True,
+            stats=True,
+            stats_log2=True,
+            lse_optional=True,
+            padded_stats=True,
+            thd=True,
+            skv_tile=0,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            split_kv_supported=True,
+            tile_ms=frozenset({64, 128}),
+            tile_ns=frozenset({64, 128}),
+            cgas=frozenset({1}),
+            pack_gqas=frozenset({False, True}),
+        ),
+        lower=partial(lower_dsl_prefill, api_type=_SM120),
+    )
+
+
 def _sm90_spec() -> EngineSpec:
     """D512 tile with TMA padding; the adapter declines unserved native declarations at build."""
     from cudnn.sdpa.fwd.config_sm90 import D_ALIGN, D_TILE, TILE_M, TILE_N
@@ -2880,6 +2936,7 @@ ENGINE_SPECS = (
     _sm107_mxfp8_spec(),
     _sm120_spec(),
     _sm120_fp8_spec(),
+    _sm120_mxfp8_spec(),
     _sm80_spec(),
     _sm90_spec(),
 )

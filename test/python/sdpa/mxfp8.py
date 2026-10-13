@@ -869,14 +869,14 @@ def _kv_tail_masked_or_whole(s_qo, s_kv, right_bound, diag_align):
     return s_qo + right_bound <= s_kv
 
 
-def _mxfp8_block_scaled_engine_covers(sm):
-    """Whether a FROST MXFP8 forward engine row that carries the block-scaled O
-    epilogue serves this arch (``engines.py`` is the source of truth: the SM100
-    and SM107 lines today; SM120 has no MXFP8 kernel, so a draw there must fold)."""
+def _mxfp8_block_scaled_engine_covers(sm, o_block_scale):
+    """Whether a FROST MXFP8 forward engine row serves this block-scaled O on this arch
+    (``engines.py`` is the source of truth: both block sizes on the SM100 and SM107
+    lines; the 32-element MXFP8 O only on SM120, so an NVFP4 draw there must fold)."""
     from cudnn.sdpa.fwd import engines
 
     return any(
-        c.is_mxfp8 and c.phase == "prefill" and {16, 32} <= set(c.o_block_scales) and c.sm_lo <= sm <= c.sm_hi
+        c.is_mxfp8 and c.phase == "prefill" and o_block_scale in c.o_block_scales and c.sm_lo <= sm <= c.sm_hi
         for c in (spec.capabilities for spec in engines.ENGINE_SPECS)
     )
 
@@ -923,7 +923,7 @@ def block_scaled_o_draw(o_block_scale, *, sm, is_infer, is_paged, with_unfuse_fm
     has_fp4 = hasattr(torch, "float4_e2m1fn_x2") if has_fp4 is None else has_fp4
     if not (
         engines_enabled
-        and _mxfp8_block_scaled_engine_covers(sm)
+        and _mxfp8_block_scaled_engine_covers(sm, o_block_scale)
         and is_infer
         and not is_paged
         and not with_unfuse_fma

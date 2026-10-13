@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The linear-attention operation family (GDN, KDA, GDN-2, GDP)."""
+"""The linear-attention operation family (GDN, KDA, GDN-2, GDP, Mamba-2)."""
 
 from typing import Any
 
@@ -18,6 +18,9 @@ _LAZY_EXPORTS = {
     "kimi_delta_attention_summary_bwd": ("cudnn.linear_attention.ops", "kimi_delta_attention_summary_bwd"),
     "gated_delta_net_v2_summary_bwd": ("cudnn.linear_attention.ops", "gated_delta_net_v2_summary_bwd"),
     "gated_delta_product_summary_bwd": ("cudnn.linear_attention.ops", "gated_delta_product_summary_bwd"),
+    "mamba2": ("cudnn.linear_attention.ops", "mamba2"),
+    "mamba2_summary": ("cudnn.linear_attention.ops", "mamba2_summary"),
+    "mamba2_summary_bwd": ("cudnn.linear_attention.ops", "mamba2_summary_bwd"),
 }
 
 
@@ -100,4 +103,13 @@ def GdpEngines(ids):
         ids,
         ("gdp_frost", "cudnn.linear_attention.frost.gdp_engine", "GdpFrostEngine"),
         ("gdp_summary_frost", "cudnn.linear_attention.frost.gdp_engine", "GdpSummaryFrostEngine"),
+    )
+
+
+def Mamba2Engines(ids):
+    """The Mamba-2 SSD family: the FROST chunk-128 kernels in the natural orientation."""
+    return _collect(
+        ids,
+        ("mamba2_frost", "cudnn.linear_attention.frost.mamba2_engine", "Mamba2FrostEngine"),
+        ("mamba2_summary_frost", "cudnn.linear_attention.frost.mamba2_engine", "Mamba2SummaryFrostEngine"),
     )

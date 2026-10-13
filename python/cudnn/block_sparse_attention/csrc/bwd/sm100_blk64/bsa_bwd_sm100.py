@@ -263,13 +263,14 @@ class BlockSparseAttnBackwardSm100Blk64:
         K = cute.make_tensor(K.iterator, cute.group_modes(cute.select(K.layout, mode=[2, 3, 1, 0]), 2, 4))
         # (b, h, s, d) -> (s, d, (h, b))
         V = cute.make_tensor(V.iterator, cute.group_modes(cute.select(V.layout, mode=[2, 3, 1, 0]), 2, 4))
-        O = cute.make_tensor(O.iterator, Q.layout)
+        # O, dO and caller-provided dQ can have different physical layouts from Q.
+        O = cute.make_tensor(O.iterator, cute.group_modes(cute.select(O.layout, mode=[2, 3, 1, 0]), 2, 4))
 
-        dQ = cute.make_tensor(dQ.iterator, Q.layout)
+        dQ = cute.make_tensor(dQ.iterator, cute.group_modes(cute.select(dQ.layout, mode=[2, 3, 1, 0]), 2, 4))
         dK = cute.make_tensor(dK.iterator, cute.group_modes(cute.select(dK.layout, mode=[3, 2, 1, 0]), 2, 4))
         # (b, h, s, d) -> (d, s, (h, b))
         dV = cute.make_tensor(dV.iterator, cute.group_modes(cute.select(dV.layout, mode=[3, 2, 1, 0]), 2, 4))
-        dO = cute.make_tensor(dO.iterator, O.layout)
+        dO = cute.make_tensor(dO.iterator, cute.group_modes(cute.select(dO.layout, mode=[2, 3, 1, 0]), 2, 4))
 
         # (b, h, s) -> (s, (h, b))
         LSE = cute.make_tensor(LSE.iterator, cute.group_modes(cute.select(LSE.layout, mode=[2, 1, 0]), 1, 3))

@@ -914,12 +914,29 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 
 ## Requirements and limits
 
-- `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` in the environment BEFORE `import cudnn`: every FROST engine is opt-in, and the
-  block drives them. Without the flag the bf16 / f16 / per-tensor-fp8 projection GEMMs refuse to run -- a `RuntimeError`
-  at `compile()` whose message names the flag (the GEMM plan is built there, not at `check_support()`) -- and the
-  block-scale (MXFP8 / fp4-weight) projections log a warning and take FROST's JIT-only route instead. Neither ever falls
-  back to a cuDNN backend plan, so an unset flag is never a silently slower block. The SDPA stage binds its FROST class
-  directly and does not consult the flag.
+- `CUDNN_FRONTEND_ENABLE_FROST_ENGINES`: every FROST engine is opt-in, and the block drives them. The flag is read LIVE, when a
+  GEMM plan's ranked list is built at `compile()` -- not once at `import cudnn` -- and a host module must never set it for
+  the process (it flips every opt-in engine into every FE graph the process builds). The block does not need it: a dense
+  bf16 / f16 projection whose `N` the forced 256-wide GEMM tile divides (`n_qkvg`, `d_model` and `h_q * d_head` all
+  `% 256 == 0`, as at every served geometry) compiles with the flag UNSET on FROST's JIT-only route (`plan.route ==
+  "jit-only"`: no backend plan, no cuDNN handle at execute; `frost_gemm` never enters a ranked list), and the block-scale
+  (MXFP8 / fp4-weight) projections log a warning and take the same route. With the flag set a plain declaration's backend
+  admits the graph and pins the same JIT by name (`graph+jit`); a `capture_safe=True` declaration never enters the ranked
+  list whatever the flag says. What still needs the flag: a dense shape WITHOUT a forced tile (the graph
+  route IS the plan there) and the per-tensor-fp8 projections -- a `RuntimeError` at `compile()` whose message names the
+  flag (the GEMM plan is built there, not at `check_support()`). Nothing ever falls back to a cuDNN backend plan, so an
+  unset flag is never a silently slower block. The SDPA stage binds its FROST class directly and does not consult the flag.
+- CUDA-graph capture of a serving stack (the FIRST execute of a fresh declaration captured on a NEW stream, with no eager
+  warm-up): on the forced-tile JIT route the captured first execute launches nothing and replays bitwise an eager run; the
+  GRAPH GEMM route (no forced tile) creates a cuDNN handle at its first execute per `(device, stream)`, which cannot happen
+  inside a capture -- a typed `RuntimeError` naming the route and the remedy (one eager execute on the capture stream first,
+  or the forced-tile route), and no handle is created inside the capture; `compile()` under capture is refused the same
+  way (the GEMM plan builds a cuDNN graph and JIT-compiles a kernel there). The GEMM driver's serving declaration,
+  `build_proj_gemm(capture_safe=True)`, never enters the ranked list -- no backend plan, no FROST-engine compile, whether
+  the flag is set or not -- so the plan is on the JIT route by construction: a refused forced compile is a typed
+  `NotImplementedError` naming the tile and the reason, never the warning + graph-heuristic fallback the plain declaration
+  takes. The quantized block's first-execute scale write is NOT refused under capture (the warm-up / re-capture contract
+  above is the rule): `test_block_serving_capture.py`.
 - Rubin (SM107) only; cuDNN 9.x, `nvidia-cutlass-dsl >= 4.8.0.dev0` (the Rubin arch names), torch.
 - Backward: bf16 / fp16 (both against fp64 autograd on Rubin: `test_block_backward.py`) -- and per-tensor fp8 over the fp8
   training record (`quant=QuantSpec`: bf16 `dy` and gradients, dense or packed (`thd=True`), any `B*S`, head counts the TMA Q / K rebuild tiles),
