@@ -157,11 +157,14 @@ class SdpaDenseBinder {
             has_amax_  = py::cast<bool>(quant.attr("has_amax"));
             fill_word_ = py::module_::import_("cudnn.frost.buffers").attr("fill_word_async");
         }
+        if (integer("split") < 1) invalid("native dense binding requires split >= 1");
         // The half flavors fold an attention sink once in the combine pass (the
         // sink combine entries take the fp32 [H] pointer); the FP8 epilogues
         // still fold it per tile, so a quantized sink cannot split.
-        if (integer("split") < 1 || (integer("split") > 1 && flag("has_sink") && quantized_))
-            invalid("native dense binding requires FP8 attention without split sinks");
+        if (integer("split") > 1 && flag("has_sink") && quantized_)
+            invalid(
+                "native dense binding does not split FP8 attention with a sink (the FP8 epilogues fold the sink per "
+                "tile)");
         const auto dq = integer("d_qk"), dv = integer("d_v");
         if (dq <= 0 || dv <= 0 || dq > 512 || dv > 512 || dq % 8 || dv % 8)
             invalid("native dense binding requires a supported half attention head dimension pair");
