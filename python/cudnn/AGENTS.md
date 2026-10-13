@@ -608,6 +608,18 @@ treatment at the caller boundary.**
   (host-only, cc 10.7 modelled, a `_lower_backend_graph` tripwire), seen RED on
   the first guard. A version-bounded guard also needs the detector that
   re-measures its bound (test/AGENTS.md).
+- **The names FlashInfer reads are pinned.** `cudnn.sdpa_capabilities()`,
+  `cudnn.frost.cutedsl_runtime_available(device_cc=None)`,
+  `cudnn.datatypes.torch_to_cudnn_data_type`, `pygraph.selected_engine` /
+  `.backend_plan_entries()` and the private spellings FlashInfer still uses
+  (`_SdpaThdBinder.supports_*`, `datatypes._torch_to_cudnn_data_type`) are a
+  caller boundary: `test/python/sdpa/frost/test_flashinfer_consumed_surface.py`
+  (host-only) pins each with its signature, including the cc 10.7 + 4.7.x DSL
+  -> False cell of the arch-aware probe. Renaming one means updating
+  FlashInfer's fallbacks first; that test failing is the reminder. The runtime
+  probe takes the part because the DSL floor is 4.7.0 everywhere and 4.8.0 on
+  cc 10.7 (Rule 7): a device-blind "available" is the blind spot that routes a
+  cc 10.7 graph to the backend engine.
 
 ## Frontend-only kernel package layout
 
