@@ -58,6 +58,13 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **A runtime SF expert stride needs a per-plane contract.** FROST MoE weight
+  scales in `F8_128x4` require E outermost, dense byte storage within each expert
+  plane, sufficient blocked capacity per plane, and a non-overlapping 16-byte
+  aligned expert pitch. Whole-blob density does not establish this: an
+  interleaved expert view can pass it and silently select the wrong scales.
+  Detector: `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py`'s
+  `test_moe_weight_sf_plane_binding` and `test_moe_weight_sf_runtime_stride`.
 - **Native geometry caches retain no storage observations.** A geometry hit must
   still check the current dtype, device, address alignment and observed byte span.
   Mark an uninitialized cache entry explicitly: an empty shape is an input to
