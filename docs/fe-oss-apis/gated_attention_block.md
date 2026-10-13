@@ -59,7 +59,9 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   MXFP8 the same epilogue also quantizes: compact e4m3 `q8` / `k8` / `v8` (and the MXFP8 scale factors) come
   straight out of the GEMM, so the quantize passes disappear.
 - `fuse_gate=True` folds stage (5) into the SDPA epilogue: `O *= sigmoid(GATE)` after the dead-row select, with
-  the gate tile TMA-staged by the load warp (inference only: no pre-gate `O` for the backward).
+  the gate tile TMA-staged by the load warp (inference only: no pre-gate `O` for the backward). Dense and packed
+  (`thd=True`): under THD the gate rides the packed d256 prefill's epilogue through the SDPA's THD gate descriptor
+  (G mapped like Q / O, at the slab's gate column stride), so the packed block is one launch fewer too.
 
 With both on, the block is **three launches**: `proj(+norm+RoPE[+quant]) -> sdpa(+gate) -> out_proj`.
 
@@ -494,15 +496,18 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   D-planes adjacent inside a tile, the slot sized at the capacity `H * ((T + 127 * B) // 128) * 1024` bytes (the only
   carve difference to the dense `B=1, S=T` block; slack tiles and pad bytes `0x00`), each tile's sequence resolved on
   device from the lengths tensor (no cap on `B`; at `B = 1` the packed block is bitwise the dense one on its outputs, record and e4m3 payload, and V's scale-factor slot holds the dense atoms in plane-adjacent order); `fuse_norm_rope`
-  (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables); the paged
+  (bf16 / fp16 inference in place: the projection fork norms and rotates per token with the per-token tables); `fuse_gate`
+  (bf16 / fp16 inference: stage (5) folds into the packed SDPA's epilogue through the SDPA's THD gate descriptor -- the
+  packed block at `B = 1` is bitwise the dense gated block, the fused gate within one output rounding of the separate
+  stage, one launch fewer: `proj(+norm+RoPE) -> sdpa(+gate) -> out_proj` plus the packed SDPA's setup launch); the paged
   KV-cache write-through (`paged_kv_page_size`: `slot_mapping` is `[T]` over the packed tokens, a pad token's slot `-1` --
   "Serving: write-through into a paged KV cache" below) and, on top of it, the EXTEND form (`kv_source="paged"`: the SDPA reads
-  every sequence's K / V from the pools; `token_capacity` makes `T` a capacity -- "Serving: the extend form" below). Declined,
-  typed: `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor; stage (5) runs as its own launch), the fully
-  fused quantized pipelines (`fuse_gate` again, and the fused MXFP8 projection fork decodes `(b, s_tile)` once per
-  128-row GEMM tile, which a packed tile may straddle), the MXFP8 block BACKWARD over a packed record (its SDPA-layout MX
-  quantize stages run the quantizer's dense arm only; the packed record and the packed delta exist, the packed MXFP8
-  backward is a follow-up).
+  every sequence's K / V from the pools; `token_capacity` makes `T` a capacity -- "Serving: the extend form" below; `fuse_gate`
+  stays declined there, the paged body carrying no gate seam). Declined,
+  typed: the fully fused quantized pipelines (the quantized THD SDPA bodies have no THD gate descriptor, and the fused
+  MXFP8 projection fork decodes `(b, s_tile)` once per 128-row GEMM tile, which a packed tile may straddle), the MXFP8
+  block BACKWARD over a packed record (its SDPA-layout MX quantize stages run the quantizer's dense arm only; the packed
+  record and the packed delta exist, the packed MXFP8 backward is a follow-up).
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
 

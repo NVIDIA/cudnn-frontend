@@ -327,7 +327,7 @@ def test_typed_declines_at_declaration_name_the_feature():
     for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, **kw)
         assert isinstance(blk._cache_write, _CacheWrite)
-    for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False)):  # fuse_gate under thd is the block's own (unrelated) typed decline
+    for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_packed_block(_SMALL_D256, _PACKED_LENS, paged_kv_page_size=16, **kw)
         assert isinstance(blk._cache_write, _CacheWrite)
     blk16, *_ = _make_block(_SMALL_D256, 1, 64, dtype=torch.float16, paged_kv_page_size=16)
