@@ -480,6 +480,10 @@ else:
         run_bwd = False
     dtype_by_name = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     narrow_kda_gates = args.variant == "kda" and args.la_backend != "fla"
+    if args.la_backend == "flash_qla" and args.variant != "gdn":
+        raise ValueError("flash_qla only supports the 'gdn' variant")
+    if args.la_backend == "flash_kda" and args.variant != "kda":
+        raise ValueError("flash_kda only supports the 'kda' variant")
     gate_dtype = target_dtype if narrow_kda_gates else torch.float32
     beta_dtype = target_dtype if (narrow_kda_gates or args.variant == "gdn2") else torch.float32
     state_dtype = torch.float32
@@ -552,13 +556,9 @@ else:
     if mamba2_d_skip and args.variant != "mamba2":
         raise ValueError(f"--d_skip and --d_per_channel are the Mamba-2 skip connection; {args.variant} has no D")
     if args.la_backend == "flash_qla":
-        if args.variant != "gdn":
-            raise ValueError("flash_qla only supports the 'gdn' variant")
         if num_q_heads > num_kv_heads:
             raise ValueError("flash_qla does not support GQA (num_q_heads > num_kv_heads)")
     if args.la_backend == "flash_kda":
-        if args.variant != "kda":
-            raise ValueError("flash_kda only supports the 'kda' variant")
         if num_q_heads != num_kv_heads:
             raise ValueError("flash_kda requires equal q/kv head counts")
         if head_dim_qk != 128 or head_dim_vo != 128:
