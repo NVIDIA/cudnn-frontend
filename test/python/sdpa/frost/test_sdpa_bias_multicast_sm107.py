@@ -187,7 +187,10 @@ def test_the_ring_bars_count_both_ctas_releases():
     with pytest.raises(ValueError, match="needs a ring"):
         make_classic_bars(ring, bias_ring_stages=3, bias_ring_empty_arrivers=0)
     src = inspect.getsource(make_classic_bars)
-    assert "ring_empty_count = int(bias_ring_empty_arrivers) if bias_ring_empty_arrivers is not None else (CFG.BIAS_EMPTY_ARRIVERS if bias_ring_stages else 0)" in src
+    assert (
+        "ring_empty_count = int(bias_ring_empty_arrivers) if bias_ring_empty_arrivers is not None else (CFG.BIAS_EMPTY_ARRIVERS if bias_ring_stages else 0)"
+        in src
+    )
     assert "init_count=ring_empty_count, producer=Producer.THREAD" in src
 
 
