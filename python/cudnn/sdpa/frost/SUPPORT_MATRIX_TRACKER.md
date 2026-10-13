@@ -1081,7 +1081,7 @@ red (2026-09-08).
 | Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2; the decode tile's dense (unpadded) / paged split, packed or not (fp32 partials + the shared combine, `choose_decode_tile_split_kv`)ᵈʳ | ❌ᵛⁱⁱ | — |  —  |
 | d128 decode tile (`TILE_CGA_M=1`, dense; the shared `sm100/decode_d128_f16.py` compiled for sm_107a; `S_q × packed group ≤ 128` proposes it first; past one tile the dense SM100 and cc 10.7 rows list both widths and lead with the decode tile while its waves stay within 1.6x the cga2 cluster's below a 16k cache, issue #1518; THD and the pre-folded scale keep the prefill tile) | envelope (d64 via d128) | ✅ (issue #1472) | ❌ (prefill) | ❌ (prefill) | ❌ (prefill) | — | — |
 | Paged KV (half THD; the attention sink composes ᵖˢ -- keyless rows O := 0 / LSE := sink; dense paged queries ❌ except decode-shaped dense Q on the cc 10.7 d256 decode tile ᵈʳ; MXFP8 pools with dense queries, sinks compose)ᵖ | envelope | half THD ✅ (sink: unsplit, PackGQA on / off, cga1 / cga2, HND / NHD, page 8–1024) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, HND / NHD, cga2) | ❌ | half THD ✅, including unpacked split (sink: unsplit, PackGQA on / off) · mxfp8 pools ✅ (page 128 / 256 / 384 / 512, cga1) · decode-shaped dense Q on the d256 decode tile ✅ (sink, PackGQA and split included)ᵈʳ | ❌ | — | — |
-| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ (+ on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or not; not under execute-time shape overridesᵈʳ) · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
+| Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense; and THD / packed sequences on the d256 prefill through the STANDALONE adapter -- `SdpaFwdDslSm100(thd=True, sample_gate=...)`, the gated attention block's packed `fuse_gate`; the graph tail stays dense-onlyᵛⁱⁱⁱ; + on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or not; not under execute-time shape overridesᵈʳ) · fp8 ✅ (bf16 G; dense only) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled; dense only) | ❌ | — |  —  |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
@@ -1527,7 +1527,8 @@ is the three-node tail `sdpa(virtual O_v) -> sigmoid(G) -> mul(O_v, s)`
 (`cudnn._sdpa_tail.match_gate_tail`; either mul operand order), validated
 python-natively and lowered with the mul output bound as the kernel's O — the
 virtual `O_v` / `s` are never bound or materialised. Served **exactly** at
-(256, 256) (not through the head-dim envelope), dense only (no THD), unsplit,
+(256, 256) (not through the head-dim envelope), dense on the graph (the standalone
+adapter adds THD on the f16/bf16 row, below), unsplit,
 non-PackGQA, non-paged -- with ONE exception on the f16/bf16 row: a decode-shaped
 graph (`S_q · G` packed rows within the Rubin route, footnote ᵐᵗᵖ) whose plan SPLITS rides the d256 decode tile, which
 applies the gate in its split COMBINE (dense or paged, packed or not; the same
@@ -1535,7 +1536,31 @@ one-rounding arithmetic -- footnote ᵈʳ); the padding mask (`seq_len_kv`) comp
 the final O must be DECLARED (dim + stride, BSHD) — the classic C++
 `pre_validate_node` needs both on the sdpa output and only user-assigned values
 are pushed at lowering, so an undeclared `O_v` is a typed not-supported from
-`validate()` rather than a bare `ValueError` out of planning. `G` is Q's dtype on
+`validate()` rather than a bare `ValueError` out of planning. **THD (packed
+sequences) x gate -- the standalone adapter only, f16/bf16 d256 prefill only
+(the THD gate descriptor).** `SdpaFwdDslSm100(thd=True, sample_gate=G)` with G
+declared like O -- the `(B, H_q, S_max, D_v)` envelope at G's (token, head)
+strides (a gate sliced out of a fused projection slab at token stride N binds
+zero-copy, exactly as under dense) -- and handed to `execute(gate=)` as the
+packed `(T, H_q, D_v)` buffer: the kernel host maps G through the SAME packed
+`[1, T, H_q, D_v]` tensor map Q / O take and the TMA-LDG warp's gate load runs
+on the THD coordinates, so the kernel body is the dense gated body byte for
+byte; the prepared THD binder binds G per call (validated like Q / O: Q's dtype,
+16-byte-aligned base, TMA-expressible strides, a capacity covering every packed
+Q token -- a shorter gate is a typed `ValueError`, never a shortened launch).
+Validated on the cc 10.7 development class: per sequence against the fp32
+oracle at the gate suite's bounds, within one output ulp of the ungated THD run
+followed by the separate `O * sigmoid(G)` stage (the one-rounding convention
+the dense gate keeps), `B = 1` packed BITWISE the dense gated plan (O and LSE),
+LSE bitwise the ungated THD run's, a sequence with Q rows and ZERO keys exactly
+0 / −inf under a ±1e4 gate, a zero-length sequence in the packing, storage past
+the packed total untouched. NOT served under THD: the quantized (per-tensor FP8
+and MXFP8) THD bodies (they build the dense gate map; declined by name), and the
+GRAPH tail (the graph's THD lowering binds no gate operand: the rows keep the
+"dense-only (no THD gate descriptor)" decline for a THD gated graph -- the
+adapter is wider than the row here by design, never the reverse). A pybind
+extension older than the binder's gate role (`_SdpaThdBinder.supports_epilogue_gate`)
+declines a gated THD plan typed at `check_support`. `G` is Q's dtype on
 the f16/bf16 row and BF16 on the FP8 and MXFP8 rows (the kernels stage it in bf16), and must
 be **BSHD-physical with 16-byte-aligned, non-overlapping seq/head strides**: G is
 TMA-loaded zero-copy (no normalisation copy, unlike Q/K/V/O), so the row declines
