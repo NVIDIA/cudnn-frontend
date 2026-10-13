@@ -7,7 +7,7 @@ A serving stack captures a block's execute into a CUDA graph with no eager warm-
 Anything a FROST host path creates lazily on its first use -- a cuDNN handle bound to the launch stream, a compiled plan,
 a blocking host read of device values -- is then either illegal inside the capture (the capture is invalidated, or the
 call fails with a stream-capture error) or, worse, captured with its first-use values and replayed for ever.  The host
-paths that have such a lazy step ask here first and refuse TYPED, naming the route that would have broken the capture
+paths that have such a lazy step ask here first and refuse TYPED, naming the route that would have invalidated the capture
 and the remedy, instead of letting the driver report an "operation not permitted when stream is capturing" from the
 middle of a launch sequence.
 
