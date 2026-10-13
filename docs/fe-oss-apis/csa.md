@@ -15,9 +15,10 @@ and numerics in
 [Megatron-LM issue #5968](https://github.com/NVIDIA/Megatron-LM/issues/5968)). The eager
 region they replace decomposes into ~39 forward and ~51 backward kernel launches per
 call (at `compress_ratio = 4`, `coff = 2`) and materializes `(total_comp, 2*ratio, 1, head_dim)`
-window intermediates; the fused path is 1 + 1 kernels (plus one fp32 `dAPE`-buffer
-zero-fill in backward — the backward kernel writes `dKV`/`dScore` in full, including
-exact zeros to never-consumed positions, so those buffers need no fills).
+window intermediates. The default fused path is one forward and one backward kernel
+plus one fp32 `dAPE`-buffer zero-fill. Deterministic dAPE replaces that fill with a
+second reduction kernel. Both backward modes write `dKV`/`dScore` in full, including
+exact zeros to never-consumed positions, so those buffers need no fills.
 
 ### Semantics
 
@@ -248,12 +249,15 @@ never-consumed positions — segment tails, the last block's first-half columns
 token-capacity padding beyond `cu_seqlens[-1]` — get exact zeros
 from their unique owning CTA, matching autograd). When `total_comp == 0` the kernel is
 not launched and the buffers are left untouched (zero them yourself if you need
-autograd's exact zeros; the high-level wrapper does). `grad_ape` must be
-**zero-initialized before every `execute` call and before every CUDA-graph replay
-that reuses the buffer** — the kernel only accumulates into it (fp32 atomics) and
-never clears it. (The high-level wrapper allocates a fresh zeroed `grad_ape` per
-call; the zero-fill is captured together with the kernel, so wrapper graph replays
-re-zero automatically.)
+autograd's exact zeros; the high-level wrapper does). With the default
+`deterministic=False`, `grad_ape` must be **zero-initialized before every `execute`
+call and before every CUDA-graph replay that reuses the buffer**: the kernel only
+accumulates into it with fp32 atomics. The high-level wrapper supplies this zero-fill,
+including during graph replay. With
+`CSACompressorBackward(..., deterministic=True)`, call
+`scratch_workspace_bytes()` after `check_support()`, provide a contiguous CUDA uint8
+`workspace` of at least that size to `execute(..., workspace=...)`, and `grad_ape` is
+fully overwritten without a zero-fill.
 
 ### CUDA graphs
 
