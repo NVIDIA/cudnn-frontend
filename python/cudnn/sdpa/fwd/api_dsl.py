@@ -1639,7 +1639,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         s_q, s_kv = int(self.q_desc.shape[2]), int(self.k_desc.shape[2])
         if s_kv % _SM100_TILE_N != 0:
             _br = int(self.window_size_right or 0)
-            causal_covers_tail = bool(self.is_causal) and ((bool(self.causal_bottom_right) and _br == 0) or (not self.causal_bottom_right and s_q + _br <= s_kv))
+            causal_covers_tail = bool(self.is_causal) and (
+                (bool(self.causal_bottom_right) and _br == 0) or (not self.causal_bottom_right and s_q + _br <= s_kv)
+            )
             return not causal_covers_tail
         return False
 
