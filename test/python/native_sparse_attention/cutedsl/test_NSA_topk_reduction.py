@@ -103,6 +103,8 @@ def test_nsa_topk_reduction_thd_ignores_keys_past_the_sequence(is_causal):
         from cudnn import NSA
     except ImportError:
         pytest.skip("Environment not supported: cudnn optional dependencies not installed")
+    if not torch.cuda.is_available():
+        pytest.skip("Environment not supported: requires CUDA")
     major, minor = torch.cuda.get_device_capability()
     if major * 10 + minor < 100:
         pytest.skip(f"Environment not supported: requires compute capability >= 10, found {major}")
