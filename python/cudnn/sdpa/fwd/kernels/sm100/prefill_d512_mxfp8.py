@@ -338,6 +338,7 @@ _SWA_REUSE_P = (
     and SPLIT_KV == 1
 )
 _SWA_MAY_BE_EMPTY = CFG.THD_VARLEN == 1 or CFG.SEQ_Q_LENS_PRESENT == 1 or CFG.SEQ_KV_LENS_PRESENT == 1
+assert not (_SWA_REUSE_P and CFG.FUSED_CORR_SPLIT_P), "SWA P reuse and split-P correction require different alias phases"
 _SWA_DENSE_EXACT_MASK = _SWA_REUSE_P and not _SWA_MAY_BE_EMPTY
 V_STAGES = max(2, CFG.STAGES_KV) if _SWA_DENSE_EXACT_MASK else CFG.STAGES_KV
 

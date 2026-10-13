@@ -281,7 +281,7 @@ on the address path shows the wrap before any GPU run.
   with the existing `thd_over_launched_units_are_dead` and
   `thd_multi_unit_per_cta` regressions.
 
-## Scheduler readers and output-phase cadence
+**Rule S9 — Every scheduler reader needs a reuse back-edge; match output-phase cadence.**
 
 Every scheduler payload reader must either return a reuse credit or have a
 back-edge that gates the next publication on its observation. An idle role
@@ -290,8 +290,11 @@ the terminal response. Remove that role's loop when it has no work. If this
 also removes the only waiter on a credit barrier, stop arriving that object:
 common dense CLC routes credits only to its leader, while persistent THD and
 local predecode retain broadcast credits and their local scheduler roles.
-Check the scheduler selection at each caller; THD does not imply persistent
-scheduling in every kernel family.
+Peer credit barriers then receive zero arrives and have no waiters. Credit
+helpers require converged warps; retain their per-specialization lowering
+choice when changing the target. Check scheduler and credit-helper selection
+together at each caller; THD does not imply persistent scheduling in every
+kernel family.
 
 Match barrier completion cadence to the consumer's loop. SM100 D512 MXFP8
 SWA=128 drains two Dv slices per tile, so a once-per-tile softmax wait must use

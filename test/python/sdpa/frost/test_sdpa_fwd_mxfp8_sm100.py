@@ -2751,6 +2751,12 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
 # 55 / 56 to 62 / 75 (dense / causal, re-pinned 2026-10-12) with BSSY unchanged -- the branch-vs-predicated check lives in BSSY
 # plus the 7-per-form SYNCS.ARRIVE delta, not in the absolute count.  Exact pins, like the sm107 wait-form pins: deterministic
 # for a given DSL + ptxas, re-pinned deliberately on a toolchain or protocol move.
+# PR #1547 routes common CLC credits only to CTA 0. With one branch target,
+# ptxas if-converts the dense lane-compare arm: measured BSSY 8 / SYNCS.ARRIVE
+# 55 with DSL 4.7.0 + CUDA 13.5, rather than the broadcast form's 15 / 62.
+# The per-specialization choice is still consumed (the lane/primitive test in
+# test_sdpa_fwd_o_empty_backedge.py checks it); these counts describe codegen,
+# not a claim that the previous B200 tuning benefit survives the protocol change.
 _CREDIT_ARRIVE_SITES = {
     (128, 128): 6,
     (192, 128): 7,
@@ -2761,8 +2767,8 @@ _PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS
 _CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": ({}, False), "causal": ({"window_right": 0}, True), "padded": ({"seq_kv_lens_present": True}, True)}
 # d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).
 _SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS = {
-    "dense": ({}, {"BSSY": 15, "SYNCS_ARRIVE": 62}),  # the branch form; the predicated form reads 8 / 55 here (7 fewer of each)
-    "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 75}),  # the predicated form; the branch form reads 15 / 82 here (7 more of each)
+    "dense": ({}, {"BSSY": 8, "SYNCS_ARRIVE": 55}),  # the leader-only branch is if-converted by ptxas
+    "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 75}),  # the predicated form; other pipeline arrivals are unchanged
 }
 
 
@@ -2799,10 +2805,11 @@ def test_sm100_mxfp8_credit_arrive_takes_the_module_constant(flavor):
     checked under a dense, a causal and a padded TemplateParams: False on the unmasked specialization, True wherever a mask arm
     is compiled in), defined exactly once and never as a literal, no call site carries a ``predicated=True`` / ``False``
     literal, and EVERY ``read_tile_id_arrive`` site -- the pinned count -- passes ``predicated=PREDICATED_CREDIT_ARRIVE``.  One
-    site dropping the kwarg re-lowers that warp role to the predicated arrive on the dense specialization and hands the
-    -5.5 % / -6.3 % back; a literal ``False`` re-lowers the causal specialization to the branch form and hands its -5.1 % back --
-    both with O / Stats / Amax_O bit-identical, so only this scan (and the SASS pins below) sees it."""
+    site dropping the kwarg silently discards a per-specialization tuning choice. The historical broadcast measurements
+    motivated that choice; leader-only codegen and performance need separate qualification. Check the actual imported
+    helper as well as the constant and call sites; the helper's lane/primitive test covers consumption of the argument."""
     from cudnn.frost.tile_dsl.constants import MASK_NONE
+    from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
@@ -2816,6 +2823,7 @@ def test_sm100_mxfp8_credit_arrive_takes_the_module_constant(flavor):
         assert (
             isinstance(mod.PREDICATED_CREDIT_ARRIVE, bool) and mod.PREDICATED_CREDIT_ARRIVE is want
         ), f"{mod.__name__} [{name}, MASK_FLAGS={mod.CFG.MASK_FLAGS}]: PREDICATED_CREDIT_ARRIVE={mod.PREDICATED_CREDIT_ARRIVE!r}, want {want}"
+        assert mod.read_tile_id_arrive is read_tile_id_arrive_on_leader, "dense CLC must use the leader credit helper"
         mods[name] = mod
     assert len({m.__file__ for m in mods.values()}) == 1, "the three specializations must come from one kernel file"
     with open(mods["dense"].__file__, encoding="utf-8") as fh:
@@ -2859,19 +2867,16 @@ def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
 @pytest.mark.L0
 @pytest.mark.parametrize("specialization", sorted(_SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS))
 def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
-    """On the sm_100a cubin at the production geometry the credit arrives lower to the form the specialization selects: the
-    DENSE cubin carries the BRANCH form (BSSY == 15, per-lane SYNCS.ARRIVE == 62 exactly; the predicated form reads 8 / 55)
-    and the CAUSAL cubin (`window_right=0`, the same shape) develop's PREDICATED form (BSSY == 8, SYNCS.ARRIVE == 75; the branch
-    form reads 15 / 82), while the exp2 split stays where the sibling pin holds it -- MUFU.EX2 == 194 on the dense cubin
-    (derived from the module) and 2 x 194 == 388 on the causal one, whose warpgroups each trace the softmax body twice (the
-    unmasked segment's and the masked one's, shared by the left- and right-masked segments).  The dense case reads the SAME
-    cubin as test_sm100_d128_mxfp8_exp2_split_and_amax_fold_sass_pins (memoized probe); the causal one is a second compile."""
+    """Pin the leader-only credit protocol's measured instruction counts.
+
+    The one-target dense branch is if-converted by ptxas. The source/primitive
+    tests separately check that each specialization's lowering choice is used;
+    this cubin check also retains the independent exp2 split invariant.
+    """
     extra, pins = _SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS[specialization]
     stats, expect = _d128_mxfp8_sass_probe(tmp_path, "sm_100a", {**_CC100_D128_MXFP8_PARAMS, **extra})
     for key, want in pins.items():
-        assert (
-            stats[key] == want
-        ), f"[{specialization}] {key} {stats[key]} != {want}: a credit-arrive site lowered to the other form (or PREDICATED_CREDIT_ARRIVE no longer follows CFG.MASK_FLAGS): {stats}"
+        assert stats[key] == want, f"[{specialization}] {key} {stats[key]} != {want}: the measured leader-only credit rendering changed: {stats}"
     bodies = 1 if specialization == "dense" else 2
     assert (
         stats["MUFU_EX2"] == bodies * expect["EXPECT_MUFU_EX2"] == bodies * 194

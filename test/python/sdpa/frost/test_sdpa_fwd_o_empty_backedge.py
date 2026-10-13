@@ -196,7 +196,9 @@ _D512_SWA_CHILD = textwrap.dedent(r"""
     assert served, "the delayed D512 template did not serve the graph"
     assert torch.isfinite(output).all()
     ref._check(output, expected, torch.float16, "e4m3", d_qk=512)
-    torch.testing.assert_close(lse.float(), expected_lse.float(), atol=3e-3, rtol=3e-3)
+    # MXFP8 P quantization also perturbs the denominator; use the existing
+    # MXFP8 Stats contract for both layouts, independent of observer timing.
+    torch.testing.assert_close(lse.float(), expected_lse.float(), atol=ref._THD_STATS_ATOL, rtol=ref._THD_STATS_RTOL)
     assert abs(amax.item() - expected.abs().max().item()) <= 0.03
     print("D512_DELAYED_SOFTMAX_PASS", json.dumps(served), flush=True)
     """)
@@ -228,3 +230,86 @@ def test_d512_swa_waits_for_both_output_slices(tmp_path, layout):
     )
     (tmp_path / "delayed_softmax.log").write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
     assert proc.returncode == 0 and "D512_DELAYED_SOFTMAX_PASS" in proc.stdout, f"rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+
+
+def test_scheduler_and_credit_target_select_the_same_layouts():
+    """A local scheduler cannot wait for credits routed only to the CLC leader.
+
+    Inspect the layout guards, independently of warp-role dispatch and source
+    formatting. This is a protocol invariant, not a heuristic or timing pin.
+    """
+    import ast
+    from pathlib import Path
+
+    def layouts(node, parents):
+        allowed = {False, True}
+        while node in parents:
+            parent = parents[node]
+            if isinstance(parent, ast.If):
+                test = parent.test
+                if isinstance(test, ast.Call) and ast.unparse(test.func) == "cutlass.const_expr":
+                    test = test.args[0]
+                negate = isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+                value = test.operand if negate else test
+                if ast.unparse(value) in ("CFG.THD_VARLEN", "_THD"):
+                    allowed &= {(node in parent.body) != negate}
+            node = parent
+        return allowed
+
+    scanned = []
+    for path in (Path(_KERNELS).parents[1]).rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        aliases = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and any(a.name == "read_tile_id_arrive_on_leader" for a in n.names)]
+        clc = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "scheduler_warp_loop"]
+        if not (aliases or clc):
+            continue
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        assert len(aliases) == len(clc) == 1, str(path)
+        assert layouts(aliases[0], parents) == layouts(clc[0], parents), f"{path}: scheduler/credit layout mismatch"
+        # The default import must still supply broadcasts on the other arm.
+        if layouts(aliases[0], parents) != {False, True}:
+            broadcasts = [
+                n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and any(a.name == "read_tile_id_arrive" and a.asname is None for a in n.names)
+            ]
+            assert any(layouts(n, parents) == {False, True} for n in broadcasts), f"{path}: missing default broadcast credits"
+        scanned.append(path)
+    assert scanned, "no common CLC callers were checked"
+
+
+@pytest.mark.parametrize("cga_size", [1, 2, 4])
+@pytest.mark.parametrize("predicated", [False, True])
+def test_leader_credit_honors_the_lowering_choice(cga_size, predicated):
+    """Exercise every lane of the helper, including its constexpr branch choice.
+
+    Plain-Python evaluation checks routing and the chosen DSL primitive; the
+    existing whole-kernel SASS tests separately cover compiler lowering.
+    """
+    import ast
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    path = Path(_KERNELS).parents[2] / "frost/tile_dsl/scheduler.py"
+    functions = [
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name in ("_read_tile_id_lane_geometry", "read_tile_id_arrive_on_leader")
+    ]
+    for fn in functions:
+        fn.decorator_list = []
+        for arg in fn.args.args:
+            arg.annotation = None
+    arrived = []
+    for lane in range(32):
+        nvvm = SimpleNamespace(
+            elect_sync=lambda: lane == 0,
+            mapa=lambda mb, peer: peer,
+            MemScope=SimpleNamespace(CTA="cta"),
+            mbarrier_arrive=lambda mb, **kw: arrived.append(("branch", mb)),
+            inline_ptx=lambda text, read_only_args, predicate: arrived.append(("predicated", read_only_args[0])) if predicate else None,
+        )
+        namespace = dict(
+            cutlass=SimpleNamespace(Int32=int, const_expr=bool), nvvm=nvvm, cute=SimpleNamespace(arch=SimpleNamespace(thread_idx=lambda: (lane, 0, 0)))
+        )
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
+        namespace["read_tile_id_arrive_on_leader"](0, cga_size, predicated)
+    assert arrived == [("predicated" if predicated and cga_size > 1 else "branch", 0)]

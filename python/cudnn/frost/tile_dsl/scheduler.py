@@ -202,21 +202,39 @@ def read_tile_id_arrive(mb, cga_size: int, predicated: cutlass.Constexpr[bool] =
 
 @cute.jit
 def read_tile_id_arrive_on_leader(mb, cga_size: int, predicated: cutlass.Constexpr[bool] = True):
-    """Credit the sole CLC publisher; peer credit objects are never advanced.
+    """Credit the sole CLC publisher from a converged warp.
 
     Dense CLC has no peer scheduler role. Its workers still wait for their
-    local payload, but credit only CTA 0 after decoding it. Broadcasting
-    credits would advance peer barriers with no successful phase observer.
+    local payload, but credit only CTA 0 after decoding it. Peer credit
+    barriers receive zero arrives, never complete, and have no waiters.
     Persistent THD and local predecode schedulers must keep the broadcast
-    helper above. ``predicated`` preserves that helper's call signature;
-    a single target needs only one elected lane for either lowering choice.
+    helper above. As there, ``predicated`` selects the branch or predicated
+    DSL form; ptxas may if-convert a single-target branch. Both forms issue
+    one release-arrive to CTA 0 per warp.
     """
-    if nvvm.elect_sync():
-        if cutlass.const_expr(cga_size == 1):
+    if cutlass.const_expr(cga_size == 1):
+        if nvvm.elect_sync():
             nvvm.mbarrier_arrive(mb)
-        else:
+    elif cutlass.const_expr(not predicated):
+        lane = cute.arch.thread_idx()[0] & cutlass.Int32(31)
+        if lane == cutlass.Int32(0):
             peer_mb = nvvm.mapa(mb, cutlass.Int32(0))
             nvvm.mbarrier_arrive(peer_mb, scope=nvvm.MemScope.CTA)
+    else:
+        # Keep the broadcast helper's lane/address geometry for codegen.
+        # Only peer zero's designated lane arrives; other lanes merely map a
+        # valid shared address. Narrowing the predicate preserves CTA-0-only
+        # credits; this spelling avoids the extra softmax spills seen when
+        # the mapped address is uniform (DSL 4.7.0, sm_100a/sm_103a).
+        lane_stride, shift = _read_tile_id_lane_geometry(cga_size)
+        lane = cute.arch.thread_idx()[0] & cutlass.Int32(31)
+        peer = lane >> cutlass.Int32(shift)
+        peer_mb = nvvm.mapa(mb, peer)
+        nvvm.inline_ptx(
+            "mbarrier.arrive.release.cta.shared::cluster.b64 _, [{$r0}];",
+            read_only_args=[peer_mb],
+            predicate=((lane & cutlass.Int32(lane_stride - 1)) == cutlass.Int32(0)) & (peer == cutlass.Int32(0)),
+        )
 
 
 class Sched(NamedTuple):
