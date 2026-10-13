@@ -8,11 +8,12 @@ SDPA engine, behind cuEquivariance's ``triangle_attention`` signature (pinned to
     mask     (B, N, 1, 1, S_kv)     a dense boolean key mask (False = the key is masked for every query of that row)
     kv_lengths (B, N, 1, 1, 1)      the right-padded alternative: keys ``j < kv_lengths[b, n]`` are live
     mask + mask_is_prefix=True      the SAME boolean mask ASSERTED prefix-shaped (every row True on ``[0, len)``, False after): its row
-                                    lengths are derived on the DEVICE (a row count into the caller's workspace, no host synchronisation,
-                                    captured by a CUDA graph) and the call rides the ``kv_lengths`` route
+                                    lengths are derived on the DEVICE (ONE small kernel -- a row count into the caller's workspace, no
+                                    cast pass, no host synchronisation, captured by a CUDA graph) and the call rides the ``kv_lengths`` route
     -> o (B, N, H, S_q, D), and with ``return_aux`` the fp32 row statistics (lse, max) (B, N, H, S_q)
 
-This module writes no kernel.  The attention core is the shipped ``sdpa`` graph node served by the FROST row ``sdpa_fwd_prefill_sm107``
+This module writes no attention kernel (its one kernel is the prefix-length derivation, ``kernels/prefix_lengths.py``).  The attention
+core is the shipped ``sdpa`` graph node served by the FROST row ``sdpa_fwd_prefill_sm107``
 on its 32- / 64-wide head-dim tiles -- the additive bias held as a resident SMEM row-block or streamed per kv tile, the boolean
 key mask folded into the kernel's bit-word mask, the right-padded lengths through the graph's padding path (``seq_len_kv`` = the
 caller's lengths; the ``seq_len_q`` the graph contract requires beside it is the constant ``S_q`` -- every Q row live -- written into the
@@ -51,8 +52,9 @@ cuEquivariance's ``kv_lengths`` route zeroes such a row (``o = lse = max = 0``) 
 reads only on cuEquivariance; here both forms agree -- and so does the ``mask_is_prefix`` form, which IS the lengths route.
 
 The prefix-mask contract (``mask_is_prefix=True`` on both surfaces, :func:`prefix_mask_to_kv_lengths` for a caller with a plan of its own):
-the CALLER asserts the mask is prefix-shaped; the API computes each row's True count on the device and binds it as that row's length,
-reading the mask on the host NEVER.  The count of a non-prefix row is still a length: such a row is served as the prefix of its True
+the CALLER asserts the mask is prefix-shaped; the API computes each row's True count on the device -- one launch of the row-popcount
+kernel ``kernels/prefix_lengths.py`` (a warp per row, byte loads, ``popc(ballot)``, one int32 store into the caller's memory) -- and
+binds it as that row's length, reading the mask on the host NEVER.  The count of a non-prefix row is still a length: such a row is served as the prefix of its True
 count -- the WRONG keys, no error.  :data:`CHECK_PREFIX_MASK_ENV` ``= 1`` (or ``check_prefix_mask=True`` per call) turns on the debug
 check, the device-wide prefix test with its ONE host synchronisation, which raises a typed ``ValueError`` naming the rows that violate
 the contract; it is off by default and never runs inside a CUDA-graph capture.
@@ -68,7 +70,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from cudnn._torch_stream import stream_context
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 from cudnn.sdpa.fwd.api_dsl import WorkspaceCarver, ws_align
@@ -157,10 +158,10 @@ def _stream_int(stream, device) -> int:
 def workspace_bytes(plan_bytes: int, n_q_lens: int, n_kv_lens: int = 0, n_mask_stage: int = 0) -> int:
     """Bytes ``execute`` needs: the plan's own ``plan_bytes`` and, on the ``kv_lengths`` form (``n_q_lens > 0``), ``n_q_lens`` int32
     words for the Q-side lengths -- two chunks of the SDPA adapters' shared carve (``ws_align``: 128-byte chunks dealt in order), so the
-    lengths start at ``ws_align(plan_bytes)``.  The ``prefix_mask`` form adds two more chunks in this order: ``n_kv_lens`` int32 words
-    (the KV lengths the device derives, ``B * N``) and ``n_mask_stage`` int32 words (the mask staged as int32, ``B * N * S_kv`` -- the one
-    cast of the mask, into the caller's memory, so the row count that follows is a same-dtype reduction with no temporary).  The other
-    forms need exactly the plan's own bytes."""
+    lengths start at ``ws_align(plan_bytes)``.  The ``prefix_mask`` form adds one more chunk: ``n_kv_lens`` int32 words (the KV lengths
+    the device derives, ``B * N``).  ``n_mask_stage`` (appended) sizes a fourth chunk after it -- the int32 mask staging of the two-kernel
+    derivation this form shipped with first; the fused kernel stages nothing, the plan requests 0 words, and the parameter stays so a
+    caller sizing by the four-chunk arithmetic still carves.  The other forms need exactly the plan's own bytes."""
     if n_q_lens <= 0 and n_kv_lens <= 0 and n_mask_stage <= 0:
         return int(plan_bytes)
     total = ws_align(plan_bytes)
@@ -207,16 +208,43 @@ def _check_mask_arg(mask) -> Tuple[int, int, int]:
     return int(b), int(n), int(s_kv)
 
 
-def _row_counts_on_device(mask: torch.Tensor, stage5: torch.Tensor, lens4: torch.Tensor, stream) -> None:
-    """Each row's True count into ``lens4`` ``(B, N, 1, 1)`` int32, through ``stage5`` ``(B, N, 1, 1, S_kv)`` int32 -- BOTH views of memory
-    the caller owns -- on ``stream`` (a raw handle, a torch stream or None = torch's current stream).  Two stream-ordered kernels and no
-    allocation: the cast of the mask lands in the staging chunk (``copy_``), and the reduction that follows is a same-dtype ``sum`` into
-    ``lens4`` -- torch's reduction of a bool input into an int32 output would stage its own cast in a hidden temporary (``self.to(dtype)``
-    inside the reduction), which is what the explicit staging chunk replaces.  Nothing here reads the mask on the host; a CUDA graph
-    captures both kernels and a replay re-derives the lengths from the mask's contents at replay time."""
-    with stream_context(stream, mask.device):
-        stage5.copy_(mask)
-        torch.sum(stage5, dim=-1, dtype=torch.int32, out=lens4)
+def _row_counts_on_device(mask: torch.Tensor, lens: torch.Tensor, stream) -> None:
+    """Each row's True count of the boolean ``(B, N, 1, 1, S_kv)`` ``mask`` into ``lens`` -- ``B * N`` contiguous int32 words of memory the
+    caller owns (any view of them, row-major over ``(b, n)``) -- on ``stream`` (a raw handle, a torch stream or None = torch's current
+    stream on the mask's device).  On a CUDA mask this is ONE launch of the row-popcount kernel (``kernels/prefix_lengths.py``: a warp per
+    row, byte loads, ``popc(ballot)``, one int32 store): no cast pass, no staging, no allocation, nothing read on the host, and a CUDA
+    graph captures it like any launch (a replay re-derives the lengths from the mask's contents at replay time).  The count is bitwise
+    ``mask.sum(-1, dtype=torch.int32)`` on every mask and every layout (a batch slice, a padded row, a strided key view): a non-prefix
+    row counts its True keys -- the asserted form's documented behaviour -- and a row with no True key reads 0.  A CPU mask takes torch's
+    reduction (the GPU-free contract tests; no kernel, no stream).  A DSL below the floor, or one without this device's target, is a
+    typed ``NotImplementedError`` naming the version (the kernel module's own gate)."""
+    global _launch_prefix_lengths
+    shape = mask.shape
+    b, n, s_kv = shape[0], shape[1], shape[4]
+    if not mask.is_cuda:
+        torch.sum(mask.reshape(b, n, s_kv), dim=-1, dtype=torch.int32, out=lens.view(b, n))
+        return
+    if _launch_prefix_lengths is None:
+        from .kernels.prefix_lengths import launch_prefix_lengths
+
+        _launch_prefix_lengths = launch_prefix_lengths
+    strides = mask.stride()
+    # a unit axis carries an arbitrary stride in torch; it is never walked, so it is passed as 0
+    _launch_prefix_lengths(
+        mask.data_ptr(),
+        lens.data_ptr(),
+        b,
+        n,
+        s_kv,
+        strides[0] if b > 1 else 0,
+        strides[1] if n > 1 else 0,
+        strides[4] if s_kv > 1 else 0,
+        stream if isinstance(stream, int) else _stream_int(stream, mask.device),
+        mask.get_device(),
+    )
+
+
+_launch_prefix_lengths = None  # the kernel module's launcher, imported on the first CUDA derivation (the package import stays torch- and DSL-free)
 
 
 def assert_prefix_mask(mask: torch.Tensor, lengths: torch.Tensor) -> None:
@@ -236,8 +264,10 @@ def assert_prefix_mask(mask: torch.Tensor, lengths: torch.Tensor) -> None:
 
 
 def prefix_mask_workspace_bytes(b: int, n: int, s_kv: int) -> int:
-    """Bytes of the ``workspace`` :func:`prefix_mask_to_kv_lengths` stages the mask in: ``4 * B * N * S_kv`` (the mask cast to int32)."""
-    return _ALIGN_WORD * int(b) * int(n) * int(s_kv)
+    """Bytes of the ``workspace`` :func:`prefix_mask_to_kv_lengths` needs: **0** -- the fused kernel reads the mask's bytes and writes the
+    counts, staging nothing.  (The two-kernel form this function sized for staged the mask as int32, ``4 * B * N * S_kv`` bytes; the
+    function and the ``workspace`` keyword stay so a caller written against it keeps working.)"""
+    return 0
 
 
 def prefix_mask_to_kv_lengths(
@@ -248,13 +278,17 @@ def prefix_mask_to_kv_lengths(
     kv_lengths=True)``, the graph's ``seq_len_kv``, cuEquivariance's ``kv_lengths``).  The sync-free twin of :func:`mask_to_kv_lengths`:
     that one TESTS the shape (and returns None when it fails) at the price of one synchronisation; this one TRUSTS the assertion.
 
-    ``out`` -- the int32 ``(B, N, 1, 1, 1)`` contiguous tensor to write (allocated when None).  ``workspace`` -- a uint8 buffer of at least
-    :func:`prefix_mask_workspace_bytes` bytes the mask is staged in as int32 (allocated when None).  With both given the call allocates
-    nothing and a CUDA graph captures it (a replay re-derives the lengths from the mask's contents).  ``stream`` -- the raw handle or
-    torch stream the two kernels are ordered on (None = torch's current stream).  ``check`` -- run :func:`assert_prefix_mask` after the
-    count (ONE host synchronisation; a typed ``ValueError`` on a non-prefix mask); None = :data:`CHECK_PREFIX_MASK_ENV` decides.  Without
-    the check a non-prefix row yields its True count, i.e. the prefix of that length (documented, not detected).  A row with no True key
-    yields 0 -- the ``kv_lengths`` route's fully masked row (``o = 0``, ``lse = max = -inf`` on this provider)."""
+    ONE launch of the row-popcount kernel (``kernels/prefix_lengths.py``: a warp per row, byte loads, ``popc(ballot)``, one int32 store):
+    no cast pass, no staging, no allocation beyond ``out``, nothing read on the host.  ``out`` -- the int32 ``(B, N, 1, 1, 1)`` contiguous
+    tensor to write (allocated when None); with it given the call allocates nothing and a CUDA graph captures it (a replay re-derives
+    the lengths from the mask's contents).  ``workspace`` -- accepted for compatibility with the two-kernel form this function shipped
+    with first and UNUSED: the fused kernel stages nothing (:func:`prefix_mask_workspace_bytes` is 0); a value must still be a contiguous
+    uint8 tensor on the mask's device.  ``stream`` -- the raw handle or torch stream the launch is ordered on (None = torch's current
+    stream).  ``check`` -- run :func:`assert_prefix_mask` after the count (ONE host synchronisation; a typed ``ValueError`` on a non-prefix
+    mask); None = :data:`CHECK_PREFIX_MASK_ENV` decides.  Without the check a non-prefix row yields its True count, i.e. the prefix of
+    that length (documented, not detected).  A row with no True key yields 0 -- the ``kv_lengths`` route's fully masked row (``o = 0``,
+    ``lse = max = -inf`` on this provider).  Any mask layout is served (a batch slice, a padded row stride, a strided key view); a CPU
+    mask takes torch's reduction.  A DSL below the floor is a typed ``NotImplementedError`` naming the version."""
     b, n, s_kv = _check_mask_arg(mask)
     dev = mask.device
     if out is None:
@@ -266,20 +300,14 @@ def prefix_mask_to_kv_lengths(
             )
         if not out.is_contiguous() or out.device != dev:
             raise ValueError(f"out must be contiguous and on the mask's device {dev}, got strides {tuple(out.stride())} on {out.device}")
-    if workspace is None:
-        stage5 = torch.empty((b, n, 1, 1, s_kv), dtype=torch.int32, device=dev)
-    else:
-        need = prefix_mask_workspace_bytes(b, n, s_kv)
-        if not isinstance(workspace, torch.Tensor) or workspace.dtype != torch.uint8 or not workspace.is_contiguous() or workspace.device != dev:
-            raise ValueError(
-                f"workspace must be a contiguous uint8 tensor on the mask's device {dev}, got {type(workspace).__name__} {getattr(workspace, 'dtype', None)} on {getattr(workspace, 'device', None)}"
-            )
-        if workspace.numel() < need:
-            raise ValueError(f"workspace must hold at least {need} bytes (prefix_mask_workspace_bytes({b}, {n}, {s_kv})), got {workspace.numel()}")
-        if workspace.data_ptr() % _TMA_ALIGN:
-            raise ValueError(f"workspace must be {_TMA_ALIGN}-byte aligned (its base address is {workspace.data_ptr() % _TMA_ALIGN} bytes past one)")
-        stage5 = workspace[:need].view(torch.int32).view(b, n, 1, 1, s_kv)
-    _row_counts_on_device(mask, stage5, out.view(b, n, 1, 1), stream)
+    if workspace is not None and (
+        not isinstance(workspace, torch.Tensor) or workspace.dtype != torch.uint8 or not workspace.is_contiguous() or workspace.device != dev
+    ):
+        raise ValueError(
+            f"workspace must be a contiguous uint8 tensor on the mask's device {dev} (unused by the fused derivation; accepted for compatibility), "
+            f"got {type(workspace).__name__} {getattr(workspace, 'dtype', None)} on {getattr(workspace, 'device', None)}"
+        )
+    _row_counts_on_device(mask, out, stream)
     if check if check is not None else prefix_check_enabled():
         assert_prefix_mask(mask, out)
     return out
@@ -416,8 +444,9 @@ class TriangleAttentionFwd(APIBase):
 
     @property
     def _n_mask_stage(self) -> int:
-        """The int32 words the ``prefix_mask`` form stages the boolean mask in (its one cast, into the caller's memory): ``B * N * S_kv``, else 0."""
-        return self.batch * self.n * self.s_kv if self.mask_form == "prefix_mask" else 0
+        """The int32 words of mask staging the caller's workspace carries: 0 on every form -- the fused derivation kernel reads the boolean
+        mask directly (the two-kernel form staged it as ``B * N * S_kv`` words; the chunk slot stays in the carve, empty)."""
+        return 0
 
     def check_support(self) -> bool:
         """Typed declines: malformed declarations first (``ValueError``), then the serving envelope -- dtype, arch, the DSL, the FROST
@@ -570,6 +599,11 @@ class TriangleAttentionFwd(APIBase):
             self._plan_workspace_bytes = int(g.get_workspace_size())
             self._handle = cudnn.create_handle()
         self._workspace_bytes = workspace_bytes(self._plan_workspace_bytes, self._n_q_lens, self._n_kv_lens, self._n_mask_stage)
+        if self.mask_form == "prefix_mask":
+            # The derivation kernel's artifact for this device, built HERE so the first execute (a graph capture included) compiles nothing.
+            from .kernels.prefix_lengths import prefix_lengths_plan
+
+            prefix_lengths_plan(self.device_index)
         _engine_id, record = g.get_engine_and_knobs_at_index(self._plan_index)
         self.knobs = dict(record) if record else {}
         self._uids = tuple(t.uid for t in self._order)
@@ -599,8 +633,8 @@ class TriangleAttentionFwd(APIBase):
         ``S_kv`` that is not a multiple of the kv tile carries the engine's synthesized padding lengths) plus, on the ``kv_lengths`` and
         ``prefix_mask`` forms, ``N`` int32 words for the Q-side lengths the graph's padding contract requires -- ``execute`` writes ``S_q``
         there on its stream before the launches -- and, on the ``prefix_mask`` form, ``B * N`` int32 words for the KV lengths the device
-        derives plus ``B * N * S_kv`` int32 words the mask is staged in.  Sized and carved by the SDPA adapters' shared recipe
-        (:func:`workspace_bytes`, :func:`carve_workspace_chunks`)."""
+        derives (the fused kernel stages nothing).  Sized and carved by the SDPA adapters' shared recipe (:func:`workspace_bytes`,
+        :func:`carve_workspace_chunks`)."""
         if self._compiled_kernel is None:
             raise RuntimeError("compile() must run before get_workspace_size()")
         return self._workspace_bytes
@@ -716,8 +750,8 @@ class TriangleAttentionFwd(APIBase):
         native binder) runs through the graph's execute with the same operands.  The ``kv_lengths`` form first writes the Q-side lengths
         (``S_q`` on every entry) into the caller's workspace on the same stream -- one driver memset, stream-ordered before the launches,
         a memset node in a captured graph.  The ``prefix_mask`` form then derives the KV lengths from the boolean ``mask`` on the same
-        stream (:func:`_row_counts_on_device`: the mask cast into its staging chunk, a same-dtype row count into the lengths chunk -- two
-        kernels, no allocation, nothing read on the host; both captured by a graph) and binds them as the ``kv_lengths`` form does.
+        stream (:func:`_row_counts_on_device`: ONE launch of the row-popcount kernel into the lengths chunk -- no cast pass, no staging,
+        no allocation, nothing read on the host; captured by a graph) and binds them as the ``kv_lengths`` form does.
         ``check_prefix_mask`` (that form only): True runs :func:`assert_prefix_mask` after the derivation -- the device-wide prefix test
         with its ONE host synchronisation, a typed ``ValueError`` on a mask that is not prefix-shaped -- False skips it, None (default)
         lets :data:`CHECK_PREFIX_MASK_ENV` decide; never True inside a CUDA-graph capture."""
@@ -733,7 +767,7 @@ class TriangleAttentionFwd(APIBase):
         if q_lens is not None:
             self._write_q_lengths(q_lens, stream_int)
         if self.mask_form == "prefix_mask":
-            kv_lengths = self._derive_kv_lengths(mask, stage, kv_lens, stream_int, check_prefix_mask)
+            kv_lengths = self._derive_kv_lengths(mask, kv_lens, stream_int, check_prefix_mask)
             mask = None  # from here on the call IS the kv_lengths form
         if self._fast_spec is not None:
             self._execute_frames(q, k, v, bias, kv_lengths, mask, o, lse, q_lens, stream_int)
@@ -750,13 +784,12 @@ class TriangleAttentionFwd(APIBase):
         ensure_current_context(stream_int, self.device_index)
         fill_word_async(q_lens.data_ptr(), self.n, self.s_q, stream_int)
 
-    def _derive_kv_lengths(self, mask: torch.Tensor, stage: torch.Tensor, kv_lens: torch.Tensor, stream_int: int, check: Optional[bool]) -> torch.Tensor:
-        """The ``prefix_mask`` form: each row's True count, computed on the execute stream into the carved ``kv_lens`` chunk through the
-        carved ``stage`` chunk (the mask's one cast, in the caller's memory), returned as the ``(B, N, 1, 1, 1)`` int32 view the
-        ``kv_lengths`` form binds.  The mask is never read on the host; the optional debug check is."""
-        b, n, s_kv = self.batch, self.n, self.s_kv
-        _row_counts_on_device(mask, stage.view(b, n, 1, 1, s_kv), kv_lens.view(b, n, 1, 1), stream_int)
-        lengths = kv_lens.view(b, n, 1, 1, 1)
+    def _derive_kv_lengths(self, mask: torch.Tensor, kv_lens: torch.Tensor, stream_int: int, check: Optional[bool]) -> torch.Tensor:
+        """The ``prefix_mask`` form: each row's True count, computed on the execute stream into the carved ``kv_lens`` chunk by ONE launch
+        of the row-popcount kernel (the artifact :meth:`compile` built for this device), returned as the ``(B, N, 1, 1, 1)`` int32 view
+        the ``kv_lengths`` form binds.  The mask is never read on the host; the optional debug check is."""
+        _row_counts_on_device(mask, kv_lens, stream_int)
+        lengths = kv_lens.view(self.batch, self.n, 1, 1, 1)
         if check if check is not None else prefix_check_enabled():
             assert_prefix_mask(mask, lengths)
         return lengths
@@ -868,7 +901,7 @@ class TriangleAttentionFwd(APIBase):
         """Capture the launches for THESE buffers into one ``torch.cuda.CUDAGraph`` (replay = one graph launch per call; the buffers'
         contents may change between replays, their addresses may not).  ``warmup`` eager calls run first on a side stream.  The
         ``kv_lengths`` form's workspace fill is captured with the launches (a memset node), so the workspace is required here as in
-        ``execute``; the ``prefix_mask`` form's two derivation kernels are captured too (a replay follows the mask's contents).  The
+        ``execute``; the ``prefix_mask`` form's derivation kernel is captured too (a replay follows the mask's contents).  The
         warm-up calls run the prefix-mask debug check as the environment decides; the captured call never does (a synchronisation
         inside a capture is an error)."""
         side = torch.cuda.Stream(device=q.device)
@@ -1076,8 +1109,8 @@ def _route_for(q, k, v, bias, mask, kv_lengths, mask_form: str, want_lse: bool, 
 
 def _run(plan: TriangleAttentionFwd, q, k, v, bias, kv_lengths, mask, o, lse, stream, check_prefix_mask: Optional[bool] = None) -> None:
     # The workspace per call (the torch allocator recycles it): the plan's own bytes and, on the kv_lengths form, the Q-side lengths the
-    # graph's padding contract requires (the prefix_mask form adds its derived lengths and the mask staging) -- never a cached or
-    # plan-owned tensor.
+    # graph's padding contract requires (the prefix_mask form adds its derived lengths, B * N words) -- never a cached or plan-owned
+    # tensor.
     ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device=q.device) if plan._workspace_bytes else None
     plan.execute(q, k, v, bias, kv_lengths, o, lse, None, ws, stream, mask=mask, check_prefix_mask=check_prefix_mask)
 

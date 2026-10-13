@@ -125,10 +125,11 @@ The models' key masks are padding masks -- every row True on `[0, len)` and Fals
 kernel trims the kv loop to the live tiles where the dense-mask route visits every tile. `mask_to_kv_lengths` buys that route at the
 price of one host synchronisation per mask (the prefix test is a device-wide `all`); `mask_is_prefix=True` buys it without one:
 
-- **The contract.** The CALLER asserts the mask is prefix-shaped. The API computes each row's True count on the device -- the mask cast
-  to int32 into a staging chunk of the workspace, then a same-dtype row count into a lengths chunk: two stream-ordered kernels, no
-  allocation, no host synchronisation, both captured by a CUDA graph -- and binds the counts as the `kv_lengths` form. The mask is never
-  read on the host, so a captured graph re-derives the lengths from the mask's contents at every replay.
+- **The contract.** The CALLER asserts the mask is prefix-shaped. The API computes each row's True count on the device -- ONE launch of a
+  small row-popcount kernel (a warp per row, byte loads, `popc(ballot)`, one int32 store into a lengths chunk of the workspace: no cast
+  pass, no staging, no allocation, no host synchronisation, captured by a CUDA graph) -- and binds the counts as the `kv_lengths` form.
+  The kernel is arch-generic (it runs on every CUDA device the DSL targets) and serves any mask layout; the mask is never read on the
+  host, so a captured graph re-derives the lengths from the mask's contents at every replay.
 - **What a violation does.** The count of a non-prefix row is still a length: such a row is served as the prefix of its True count --
   the WRONG keys, no error. A mask that may not be prefix-shaped belongs on `mask=` (the in-kernel dense mask) or on
   `mask_to_kv_lengths`, which tests and falls back.
@@ -141,11 +142,13 @@ price of one host synchronisation per mask (the prefix test is a device-wide `al
 - **The device-side helper.** A caller that holds a mask and a plan of its own (a `kv_lengths=True` plan, the graph's `seq_len_kv`, or
   cuEquivariance's `kv_lengths`) gets the same derivation from
   `prefix_mask_to_kv_lengths(mask, out=None, *, workspace=None, check=None, stream=None) -> (B, N, 1, 1, 1) int32`: with `out` (an int32
-  `(B, N, 1, 1, 1)` contiguous tensor) and `workspace` (a contiguous uint8 buffer of `prefix_mask_workspace_bytes(B, N, S_kv)` =
-  `4 * B * N * S_kv` bytes) the call allocates nothing and a CUDA graph captures it; without them it allocates both (the convenience
-  form); `check` is the debug check (None = the environment); `stream` the raw handle or torch stream the two kernels are ordered on.
-  It is the sync-free twin of `mask_to_kv_lengths`: that one TESTS the shape and returns `None` when it fails, this one TRUSTS the
-  assertion.
+  `(B, N, 1, 1, 1)` contiguous tensor) the call allocates nothing and a CUDA graph captures it; without it the output is allocated (the
+  convenience form); `workspace` is accepted for compatibility with the two-kernel form this function shipped with first and unused
+  (`prefix_mask_workspace_bytes(B, N, S_kv)` is 0: the fused kernel stages nothing); `check` is the debug check (None = the
+  environment); `stream` the raw handle or torch stream the launch is ordered on. Any mask layout is served (a batch slice, a padded
+  row stride, a strided key view); a CPU mask takes torch's reduction; a DSL below the floor is a typed `NotImplementedError` naming the
+  version. It is the sync-free twin of `mask_to_kv_lengths`: that one TESTS the shape and returns `None` when it fails, this one TRUSTS
+  the assertion.
 
 ### Layouts: the zero-copy forms and the counted fallbacks
 
@@ -198,10 +201,9 @@ debug check above. A plan is bound to the device it was declared on; declare and
 no device memory. The graph's padding contract takes a length tensor on both sides and the kernel bounds the live Q rows by `seq_len_q`;
 every Q row of a triangle-attention call is live, so on the `kv_lengths` and prefix-mask forms `get_workspace_size()` adds `N` int32 words
 that `execute` fills with `S_q` on its stream before the launches -- one driver memset, stream-ordered, a memset node in a captured CUDA
-graph; the prefix-mask form adds `B * N` int32 words for the KV lengths it derives and `B * N * S_kv` int32 words the mask is staged in
-(its one cast, into the caller's memory: torch's own bool-to-int32 reduction would stage a hidden temporary). The
-workspace is sized and carved by the SDPA adapters' shared recipe (`ws_align` 128-byte chunks dealt in order by `WorkspaceCarver`: the
-plan's own bytes first, the Q-side lengths next, then the derived KV lengths and the mask staging); a missing, undersized or misaligned
+graph; the prefix-mask form adds `B * N` int32 words for the KV lengths it derives (the fused kernel reads the boolean mask directly and
+stages nothing). The workspace is sized and carved by the SDPA adapters' shared recipe (`ws_align` 128-byte chunks dealt in order by
+`WorkspaceCarver`: the plan's own bytes first, the Q-side lengths next, then the derived KV lengths); a missing, undersized or misaligned
 buffer raises the carver's own error -- its base rule is
 16-byte alignment, which a torch allocation satisfies (the lengths' reader itself needs 4) -- and the buffer must be contiguous and on the
 plan's device. Nothing is allocated at build or at execute, and no per-plan tensor exists to be released at garbage-collection time inside

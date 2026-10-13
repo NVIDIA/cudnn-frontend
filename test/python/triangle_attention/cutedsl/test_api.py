@@ -5,8 +5,10 @@ reference on the acceptance grid (S x D x B x the three key-mask forms), the lay
 repacks elsewhere, the output following q), the masked-row contract (o = 0, lse = -inf), CUDA-graph capture, the execute-path contract
 (no allocation, no synchronisation), autograd (forward served, backward a typed decline) and the typed declines quoting the engine; plus
 the GPU-free contract tests (the lazy export in every import order, the signature pin, mask_to_kv_lengths, the reference, the declines
-a declaration raises before any device work); the prefix-mask form (``mask_is_prefix=True``: the lengths derived on the device, no host
-synchronisation) bitwise against both lengths routes, its debug check, its allocation-free execute and its CUDA-graph capture.
+a declaration raises before any device work); the prefix-mask form (``mask_is_prefix=True``: the lengths derived on the device by ONE
+launch of the row-popcount kernel, no cast pass, no host synchronisation) bitwise against both lengths routes, its debug check, its
+allocation-free execute, its CUDA-graph capture, the kernel's own pins (bitwise the torch row count on every shape and layout on ANY
+CUDA device, allocation- and sync-free with ``out`` given, graph-captured, the typed DSL-floor decline) and the one-kernel CUPTI evidence.
 
 Tolerances are the SM107 f16 row's own (test_sdpa_bias_sm107.py), not widened for this layer: O against the fp64 oracle at
 atol 5e-2 / rtol 3e-2 (an fp32 accumulation, one 16-bit rounding at the store), the LSE at 1e-4 / 1e-4 (the bias enters the fp32 score
@@ -144,18 +146,20 @@ def test_mask_to_kv_lengths_detects_prefix_masks():
 
 def test_prefix_mask_to_kv_lengths_is_the_sync_free_twin(monkeypatch):
     """GPU-free (CPU tensors): the device-side helper returns each row's True count as int32 (B, N, 1, 1, 1) -- equal to mask_to_kv_lengths
-    on a prefix mask -- writes into a caller's ``out`` through a caller's ``workspace`` (the mask staged as int32 there), raises the typed
-    contract error on a non-prefix mask ONLY with the check on (kwarg or the environment), and serves the count otherwise (documented)."""
+    on a prefix mask -- writes into a caller's ``out`` (the ``workspace`` keyword of the two-kernel form is accepted and unused: the fused
+    kernel stages nothing, ``prefix_mask_workspace_bytes`` is 0), raises the typed contract error on a non-prefix mask ONLY with the check
+    on (kwarg or the environment), and serves the count otherwise (documented)."""
     b, n, s = 2, 5, 11
     lengths = torch.tensor([[7, 0, 11, 1, 5], [3, 11, 0, 4, 9]], dtype=torch.int32).view(b, n, 1, 1, 1)
     prefix = torch.arange(s).view(1, 1, 1, 1, s) < lengths
     got = tapi.prefix_mask_to_kv_lengths(prefix)
     assert got.dtype == torch.int32 and tuple(got.shape) == (b, n, 1, 1, 1) and torch.equal(got, lengths) and torch.equal(got, tapi.mask_to_kv_lengths(prefix))
     out = torch.empty(b, n, 1, 1, 1, dtype=torch.int32)
-    ws = torch.empty(tapi.prefix_mask_workspace_bytes(b, n, s), dtype=torch.uint8)
-    assert tapi.prefix_mask_workspace_bytes(b, n, s) == 4 * b * n * s
+    assert tapi.prefix_mask_workspace_bytes(b, n, s) == 0, "the fused derivation stages nothing"
+    ws = torch.empty(4 * b * n * s, dtype=torch.uint8)  # a buffer sized by the two-kernel form's recipe: accepted, untouched
+    ws.fill_(0xA5)
     assert tapi.prefix_mask_to_kv_lengths(prefix, out, workspace=ws, check=True) is out and torch.equal(out, lengths)
-    assert torch.equal(ws.view(torch.int32).view(b, n, 1, 1, s), prefix.to(torch.int32)), "the workspace holds the mask's one cast"
+    assert (ws == 0xA5).all(), "the workspace is not written by the fused derivation"
     holed = prefix.clone()
     holed[0, 0, 0, 0, 2] = False  # a hole inside the live prefix: not a prefix mask
     assert tapi.mask_to_kv_lengths(holed) is None
@@ -175,8 +179,7 @@ def test_prefix_mask_to_kv_lengths_is_the_sync_free_twin(monkeypatch):
         tapi.prefix_mask_to_kv_lengths(prefix.view(b, n, s))
     with pytest.raises(ValueError, match="out must be an int32"):
         tapi.prefix_mask_to_kv_lengths(prefix, torch.empty(b, n, dtype=torch.int32))
-    with pytest.raises(ValueError, match="workspace must hold at least 440 bytes"):
-        tapi.prefix_mask_to_kv_lengths(prefix, workspace=torch.empty(8, dtype=torch.uint8))
+    assert torch.equal(tapi.prefix_mask_to_kv_lengths(prefix, workspace=torch.empty(8, dtype=torch.uint8)), lengths)  # any size: unused
     with pytest.raises(ValueError, match="workspace must be a contiguous uint8"):
         tapi.prefix_mask_to_kv_lengths(prefix, workspace=torch.empty(440, dtype=torch.int32))
 
@@ -703,9 +706,9 @@ def test_workspace_is_sized_and_carved_by_the_sdpa_adapters_recipe():
 def test_execute_allocates_nothing_and_never_synchronizes(form):
     """Every key-mask form: a warm execute allocates no device memory (the allocator's allocation COUNT is unchanged too, so no temporary
     hides behind a freed buffer) and issues no host synchronisation -- on the kv_lengths form the Q-side lengths the graph's padding
-    contract requires are written into the CALLER's workspace (an async memset), never allocated; on the prefix_mask form the mask's one
-    cast and the derived KV lengths land in the caller's workspace as well (torch's own bool -> int32 reduction would stage a hidden
-    temporary, which the staging chunk replaces)."""
+    contract requires are written into the CALLER's workspace (an async memset), never allocated; on the prefix_mask form the derived KV
+    lengths land in the caller's workspace as well, written by the one-launch derivation kernel straight from the boolean mask (no cast
+    pass, no staging: the workspace carries no mask chunk)."""
     s = 128
     q, k, v, bias, gen = _inputs(s, 32, seed=17)
     mask = _dense_mask(1, s, s, gen) if form == "mask" else None
@@ -718,7 +721,10 @@ def test_execute_allocates_nothing_and_never_synchronizes(form):
     if form == "kv_lengths":
         assert plan.get_workspace_size() == tapi.workspace_bytes(plan._plan_workspace_bytes, s) >= 4 * s
     elif form == "prefix_mask":
-        assert plan.get_workspace_size() == tapi.workspace_bytes(plan._plan_workspace_bytes, s, s, s * s) >= 4 * s + 4 * s + 4 * s * s
+        assert plan.get_workspace_size() == tapi.workspace_bytes(plan._plan_workspace_bytes, s, s) >= 4 * s + 4 * s
+        assert plan.get_workspace_size() < tapi.workspace_bytes(
+            plan._plan_workspace_bytes, s, s, s * s
+        ), "no mask staging chunk: the fused kernel reads the mask"
     o = tapi._bshd_empty(*q.shape, q.dtype, q.device)
     ws = torch.empty(max(plan.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
     plan.execute(q, k, v, bias, lengths, o, None, None, ws if plan.get_workspace_size() else None, mask=mask)
@@ -740,9 +746,9 @@ def test_execute_allocates_nothing_and_never_synchronizes(form):
         assert (q_lens == s).all(), "the Q-side lengths chunk must hold S_q on every entry"
         assert (o[0, 4] == 0).all()
     elif form == "prefix_mask":
-        _plan_ws, q_lens, kv_lens, stage = tapi.carve_workspace_chunks(ws, plan._plan_workspace_bytes, s, s, s * s, "TriangleAttentionFwd")
+        _plan_ws, q_lens, kv_lens, stage = tapi.carve_workspace_chunks(ws, plan._plan_workspace_bytes, s, s, 0, "TriangleAttentionFwd")
         assert (q_lens == s).all() and torch.equal(kv_lens.view(1, s, 1, 1, 1), ref_lengths), "the derived KV lengths live in the caller's workspace"
-        assert torch.equal(stage.view(1, s, 1, 1, s), mask.to(torch.int32)) and (o[0, 4] == 0).all()
+        assert stage is None and (o[0, 4] == 0).all()
 
 
 @requires_rubin
@@ -832,7 +838,7 @@ def test_prefix_mask_form_equals_both_lengths_routes_bitwise(s, d, b):
         plan.check_support()
         plan.compile()
     assert plan_p.mask_form == "prefix_mask" and plan_p.plan_name == plan_l.plan_name, (plan_p.plan_name, plan_l.plan_name)
-    assert plan_p.get_workspace_size() == tapi.workspace_bytes(plan_p._plan_workspace_bytes, s, b * s, b * s * s)
+    assert plan_p.get_workspace_size() == tapi.workspace_bytes(plan_p._plan_workspace_bytes, s, b * s)  # no mask staging chunk
     o_l, o_p = (tapi._bshd_empty(*q.shape, q.dtype, q.device).fill_(float("nan")) for _ in range(2))
     lse_l, lse_p = (torch.full((b, s, 4, s), float("nan"), device="cuda", dtype=torch.float32) for _ in range(2))
     ws_l = torch.empty(plan_l.get_workspace_size(), dtype=torch.uint8, device="cuda")
@@ -842,7 +848,7 @@ def test_prefix_mask_form_equals_both_lengths_routes_bitwise(s, d, b):
     torch.cuda.synchronize()
     assert torch.equal(o_p, o_l) and torch.equal(lse_p, lse_l) and torch.equal(o_p, o_pre)
     assert torch.isneginf(lse_p[0, 0]).all() and torch.isneginf(lse_p[b - 1, 17]).all()
-    _plan_ws, q_lens, kv_lens, _stage = tapi.carve_workspace_chunks(ws_p, plan_p._plan_workspace_bytes, s, b * s, b * s * s, "TriangleAttentionFwd")
+    _plan_ws, q_lens, kv_lens, _stage = tapi.carve_workspace_chunks(ws_p, plan_p._plan_workspace_bytes, s, b * s, 0, "TriangleAttentionFwd")
     assert (q_lens == s).all() and torch.equal(kv_lens.view(b, s, 1, 1, 1), lengths)
     _check(o_p, _reference(q, k, v, bias, kv_lengths=lengths), lse_p)
 
@@ -945,6 +951,130 @@ def test_prefix_mask_form_captures_into_a_cuda_graph_and_follows_the_mask_conten
     gf.replay()
     torch.cuda.synchronize()
     assert torch.equal(out_f, eager)
+
+
+@requires_cuda
+@pytest.mark.parametrize("b,n,s", [(1, 1, 1), (1, 3, 7), (2, 5, 11), (1, 256, 217), (2, 64, 384), (1, 128, 768), (1, 8, 5000), (3, 33, 1023), (1, 2, 0)])
+def test_prefix_lengths_kernel_is_bitwise_the_torch_row_count_on_every_shape(b, n, s):
+    """The one-launch derivation on ANY CUDA device (the kernel is arch-generic): the counts of a random, NON-prefix mask with all-False and
+    all-True rows equal ``mask.sum(-1, dtype=int32)`` bitwise -- S_kv not a multiple of 8 / 32 / 128, S_kv = 0 and S_kv = 1 included -- on
+    the contiguous mask and on strided views of a wider buffer (a batch slice, a padded row stride, two strided key views)."""
+    gen = torch.Generator(device="cuda").manual_seed(b * 1000003 + n * 1009 + s)
+    mask = torch.rand(b, n, 1, 1, s, generator=gen, device="cuda") < 0.6 if s else torch.zeros(b, n, 1, 1, 0, dtype=torch.bool, device="cuda")
+    if n > 2:
+        mask[0, 1] = False
+        mask[-1, 2] = True
+    ref = mask.sum(-1, dtype=torch.int32).view(b, n, 1, 1, 1)
+    out = torch.full((b, n, 1, 1, 1), -7, dtype=torch.int32, device="cuda")
+    assert tapi.prefix_mask_to_kv_lengths(mask, out, check=False) is out
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    assert torch.equal(tapi.prefix_mask_to_kv_lengths(mask, check=False), ref)  # the allocating form
+    if s == 0:
+        return
+    wide = torch.rand(b + 1, n + 6, 1, 1, 3 * s + 16, generator=gen, device="cuda") < 0.5
+    views = (wide[1:, :n, :, :, :s], wide[:b, 3 : 3 + n, :, :, 7 : 7 + s], wide[:b, :n, :, :, ::2][..., :s], wide[:b, 2 : 2 + n, :, :, 1::3][..., :s])
+    for view in views:
+        assert tuple(view.shape) == (b, n, 1, 1, s)
+        got = tapi.prefix_mask_to_kv_lengths(view, check=False)
+        torch.cuda.synchronize()
+        assert torch.equal(got, view.sum(-1, dtype=torch.int32).view(b, n, 1, 1, 1)), tuple(view.stride())
+
+
+@requires_cuda
+def test_prefix_mask_to_kv_lengths_allocates_nothing_never_synchronizes_and_captures():
+    """With ``out`` given the derivation is ONE launch into the caller's memory: a warm call allocates nothing (the allocator's allocation
+    COUNT is unchanged, so no temporary hides behind a freed buffer) and issues no host synchronisation; a CUDA graph captures it and a
+    replay re-derives the counts from the mask's CURRENT contents, bitwise the torch row count."""
+    b, n, s = 2, 300, 333
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    mask = torch.rand(b, n, 1, 1, s, generator=gen, device="cuda") < 0.5
+    out = torch.empty(b, n, 1, 1, 1, dtype=torch.int32, device="cuda")
+    tapi.prefix_mask_to_kv_lengths(mask, out, check=False)  # warm: the artifact is built / loaded
+    torch.cuda.synchronize()
+    before, before_count = torch.cuda.memory_allocated(), torch.cuda.memory_stats()["allocation.all.allocated"]
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        tapi.prefix_mask_to_kv_lengths(mask, out, check=False)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert torch.cuda.memory_allocated() == before
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before_count, "a device allocation (even a freed temporary) inside the derivation"
+    torch.cuda.synchronize()
+    assert torch.equal(out, mask.sum(-1, dtype=torch.int32).view(b, n, 1, 1, 1))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        tapi.prefix_mask_to_kv_lengths(mask, out, check=False)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=side):
+        tapi.prefix_mask_to_kv_lengths(mask, out, check=False)
+    out.fill_(-1)
+    torch.cuda.synchronize()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, mask.sum(-1, dtype=torch.int32).view(b, n, 1, 1, 1))
+    mask.copy_(torch.rand(b, n, 1, 1, s, generator=gen, device="cuda") < 0.2)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, mask.sum(-1, dtype=torch.int32).view(b, n, 1, 1, 1))
+
+
+@requires_cuda
+def test_prefix_lengths_kernel_declines_a_too_old_dsl_typed(monkeypatch):
+    """Rule 7: a DSL below the FROST floor is a typed NotImplementedError naming the installed version and the floor, raised by the kernel
+    module's own gate before any compile (the per-device plan cache is cleared around the probe so the gate runs; the cleared cache is
+    rebuilt by the call that follows)."""
+    from cudnn.frost import buffers
+    from cudnn.triangle_attention.kernels import prefix_lengths as pl
+
+    mask = torch.ones(1, 2, 1, 1, 9, dtype=torch.bool, device="cuda")
+    pl.prefix_lengths_plan.cache_clear()
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    try:
+        assert "4.6.2" in pl.requirement_error(mask.device.index or 0)
+        with pytest.raises(NotImplementedError, match=r"requires nvidia-cutlass-dsl >= 4\.7\.0; found 4\.6\.2"):
+            tapi.prefix_mask_to_kv_lengths(mask, check=False)
+    finally:
+        monkeypatch.undo()
+        pl.prefix_lengths_plan.cache_clear()
+    assert pl.requirement_error(mask.device.index or 0) is None
+    assert torch.equal(tapi.prefix_mask_to_kv_lengths(mask, check=False).view(-1), torch.tensor([9, 9], dtype=torch.int32, device="cuda"))
+
+
+@requires_rubin
+def test_prefix_mask_form_launches_one_derivation_kernel():
+    """The device-side evidence of the fused form: the profiler (CUPTI) over one warm execute of the prefix plan records exactly ONE
+    kernel besides the attention launches -- the derivation kernel, named after its module -- and no cast / reduce kernel.  Skipped when
+    the profiler yields no device kernel at all (a CUPTI older than the part)."""
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile
+
+    s = 256
+    q, k, v, bias, gen = _inputs(s, 32, seed=29)
+    lengths = _lengths(1, s, s, gen, empty_rows=((0, 3),))
+    mask = torch.arange(s, device="cuda").view(1, 1, 1, 1, s) < lengths
+    plan = tapi.TriangleAttentionFwd(q, k, v, bias, mask=True, mask_is_prefix=True)
+    plan.check_support()
+    plan.compile()
+    o = tapi._bshd_empty(*q.shape, q.dtype, q.device)
+    ws = torch.empty(plan.get_workspace_size(), dtype=torch.uint8, device="cuda")
+    for _ in range(3):
+        plan.execute(q, k, v, bias, None, o, None, None, ws, mask=mask, check_prefix_mask=False)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        plan.execute(q, k, v, bias, None, o, None, None, ws, mask=mask, check_prefix_mask=False)
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type == DeviceType.CUDA and "memset" not in e.name.lower() and "memcpy" not in e.name.lower()]
+    if not names:
+        pytest.skip("the profiler recorded no device kernel (CUPTI unavailable for this part)")
+    derivation = [n_ for n_ in names if "prefix_lengths" in n_]
+    assert len(derivation) == 1 and len(names) == 1 + plan.launches_per_call, names
+    assert not any("elementwise" in n_ or "reduce_kernel" in n_ for n_ in names), names
+    torch.cuda.synchronize()
+    assert torch.equal(o, tapi.triangle_attention(q, k, v, bias, kv_lengths=lengths))
 
 
 @requires_rubin
