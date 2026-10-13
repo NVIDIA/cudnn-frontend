@@ -18,6 +18,175 @@
 namespace cudnn_frontend {
 namespace detail {
 
+// Device memory holding constant data that work reads when it runs: uploaded once, then read in place by
+// kernels launched directly or from CUDA graphs. Shared by its owner and by the CUDA graphs that keep it
+// alive (as part of a CudaGraphRetainedResource payload).
+//
+// Freeing it takes CUDA calls, which CUDA user-object destructors may not make, and must not overtake work
+// launched directly that still reads it. So dropping the last reference makes no CUDA call: it queues the
+// memory, and CudaGraphRetainedResource::drain_deferred_releases() frees it once every stream recorded with
+// record_use() has passed that point.
+class DeviceConstantBuffer {
+   public:
+    DeviceConstantBuffer(DeviceConstantBuffer const &) = delete;
+    DeviceConstantBuffer &
+    operator=(DeviceConstantBuffer const &) = delete;
+
+    // Upload `size` bytes from `host` to new device memory on the current device. Safe while a stream on
+    // this or another thread is being captured: relaxed capture mode, private non-blocking stream.
+    static cudaError_t
+    create(void const *host, size_t size, std::shared_ptr<DeviceConstantBuffer> &out) {
+        out.reset();
+        std::shared_ptr<DeviceConstantBuffer> buffer(new DeviceConstantBuffer, queue_free);
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        bool const relaxed         = cuda_thread_exchange_stream_capture_mode(&mode) == cudaSuccess;
+        cudaError_t status         = cuda_get_device(&buffer->device);
+        if (status == cudaSuccess) {
+            status = cuda_malloc(&buffer->ptr, size);
+        }
+        cudaStream_t stream = nullptr;
+        if (status == cudaSuccess) {
+            status = cuda_stream_create_with_flags(&stream, cudaStreamNonBlocking);
+        }
+        if (status == cudaSuccess) {
+            status = cuda_mem_cpy_async(buffer->ptr, host, size, cudaMemcpyHostToDevice, stream);
+            if (status == cudaSuccess) {
+                status = cuda_stream_synchronize(stream);
+            }
+            (void)cuda_stream_destroy(stream);
+        }
+        if (relaxed) {
+            (void)cuda_thread_exchange_stream_capture_mode(&mode);
+        }
+        if (status == cudaSuccess) {
+            out = std::move(buffer);
+        }
+        return status;  // On failure, `buffer` is queued for a free like any other.
+    }
+
+    void *
+    data() const {
+        return ptr;
+    }
+
+    // Order this memory's eventual release after the work queued so far on `stream`, which must not be
+    // capturing. Call it after launching work that reads the memory.
+    cudaError_t
+    record_use(cudaStream_t stream) {
+        std::lock_guard<std::mutex> lock(mutex);
+        cudaEvent_t event = nullptr;
+        for (auto const &[used_stream, used_event] : uses) {
+            if (used_stream == stream) {
+                event = used_event;
+            }
+        }
+        if (event == nullptr) {
+            cudaError_t const status = cuda_event_create_with_flags(&event, cudaEventDisableTiming);
+            if (status != cudaSuccess) {
+                return status;
+            }
+            uses.emplace_back(stream, event);
+        }
+        return cuda_event_record(event, stream);
+    }
+
+    // Whether released memory awaits a free.
+    static bool
+    has_deferred_frees() {
+        return deferred_frees().pending.load(std::memory_order_acquire);
+    }
+
+    // Free released memory that no recorded use still reads. Call in relaxed capture mode, from a thread
+    // whose stream is not being captured.
+    static void
+    drain_deferred_frees() {
+        DeferredFrees &deferred = deferred_frees();
+        if (!deferred.pending.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::vector<DeviceConstantBuffer *> buffers;
+        {
+            std::lock_guard<std::mutex> lock(deferred.mutex);
+            buffers.swap(deferred.buffers);
+            deferred.pending.store(false, std::memory_order_release);
+        }
+        std::vector<DeviceConstantBuffer *> in_use;
+        for (DeviceConstantBuffer *buffer : buffers) {
+            bool busy = false;
+            for (auto const &[stream, event] : buffer->uses) {
+                (void)stream;
+                busy = busy || cuda_event_query(event) == cudaErrorNotReady;
+            }
+            (void)cuda_get_last_error();
+            if (busy) {
+                in_use.push_back(buffer);
+                continue;
+            }
+            // The draining thread may have another device current.
+            int current_device       = buffer->device;
+            bool const switch_device = cuda_get_device(&current_device) == cudaSuccess &&
+                                       current_device != buffer->device &&
+                                       cuda_set_device(buffer->device) == cudaSuccess;
+            for (auto const &[stream, event] : buffer->uses) {
+                (void)stream;
+                (void)cuda_event_destroy(event);
+            }
+            if (buffer->ptr != nullptr) {
+                (void)cuda_free(buffer->ptr);
+            }
+            if (switch_device) {
+                (void)cuda_set_device(current_device);
+            }
+            (void)cuda_get_last_error();
+            delete buffer;
+        }
+        if (!in_use.empty()) {
+            std::lock_guard<std::mutex> lock(deferred.mutex);
+            deferred.buffers.insert(deferred.buffers.end(), in_use.begin(), in_use.end());
+            deferred.pending.store(true, std::memory_order_release);
+        }
+    }
+
+    // For tests: released memory not freed yet.
+    static size_t
+    deferred_free_count() {
+        DeferredFrees &deferred = deferred_frees();
+        std::lock_guard<std::mutex> lock(deferred.mutex);
+        return deferred.buffers.size();
+    }
+
+   private:
+    DeviceConstantBuffer()  = default;
+    ~DeviceConstantBuffer() = default;
+
+    struct DeferredFrees {
+        std::mutex mutex;
+        std::vector<DeviceConstantBuffer *> buffers;
+        std::atomic<bool> pending{false};
+    };
+
+    // Intentionally leaked, like CudaGraphRetainedResource's queue.
+    static DeferredFrees &
+    deferred_frees() {
+        static DeferredFrees &instance = *new DeferredFrees;
+        return instance;
+    }
+
+    // shared_ptr deleter; may run in a CUDA user-object destructor, so it makes no CUDA call.
+    static void
+    queue_free(DeviceConstantBuffer *buffer) {
+        DeferredFrees &deferred = deferred_frees();
+        std::lock_guard<std::mutex> lock(deferred.mutex);
+        deferred.buffers.push_back(buffer);
+        deferred.pending.store(true, std::memory_order_release);
+    }
+
+    void *ptr  = nullptr;
+    int device = 0;
+    std::mutex mutex;
+    std::vector<std::pair<cudaStream_t, cudaEvent_t>> uses;  // one event per stream
+};
+
 // Keeps a host-side resource alive for as long as any CUDA graph that was recorded against it
 // exists, including graphExecs instantiated from it and clones of it.
 //
@@ -104,7 +273,8 @@ class CudaGraphRetainedResource {
     // Whether user-object destructors have handed back payloads that still await release.
     static bool
     has_deferred_releases() {
-        return deferred_releases().pending.load(std::memory_order_acquire);
+        return deferred_releases().pending.load(std::memory_order_acquire) ||
+               DeviceConstantBuffer::has_deferred_frees();
     }
 
     // Release queued payloads if `stream` is not being captured. For callers that retain nothing
@@ -134,7 +304,7 @@ class CudaGraphRetainedResource {
     static void
     drain_deferred_releases() {
         DeferredReleases &deferred = deferred_releases();
-        if (!deferred.pending.load(std::memory_order_acquire)) {
+        if (!has_deferred_releases()) {
             return;
         }
         std::vector<std::shared_ptr<void>> releases;
@@ -150,6 +320,7 @@ class CudaGraphRetainedResource {
         cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
         bool const relaxed         = cuda_thread_exchange_stream_capture_mode(&mode) == cudaSuccess;
         releases.clear();
+        DeviceConstantBuffer::drain_deferred_frees();  // including memory the payloads just released
         if (relaxed) {
             (void)cuda_thread_exchange_stream_capture_mode(&mode);
         }

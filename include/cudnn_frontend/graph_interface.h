@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -78,45 +79,59 @@ class Graph : public ICudnn, public INode {
     mutable std::unordered_map<uid_t, pass_by_values_t> cached_pass_by_value;
     mutable std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> cached_workspace_modifications;
 
-    // Host sources of the host-to-device copies among cached_workspace_modifications (operation 0, e.g.
-    // ALiBi slopes), keyed by uid, in immutable shared storage. A CUDA graph that copies from them, whether
-    // recorded by populate_cuda_graph()/update_cuda_graph() or by stream capture of execute(), holds a
-    // reference to this storage (a CUDA user object), so it may outlive this Graph.
-    //
-    // The storage is pageable. Current drivers write a 1-D pageable host-to-device copy of up to 64 KiB
-    // straight into the command stream at launch, so neither execute() nor a CUDA graph replay waits for
-    // prior work; larger pageable copies may stall on the driver's staging buffers. These arrays (one
-    // float per head, one int per batch entry) stay far below that. A much larger one should be uploaded
-    // to device memory once instead, or pinned; pinned memory must then be freed through the deferred
-    // release path, never from the user-object destructor, which may not call CUDA.
-    using host_copy_sources_t                                    = std::unordered_map<uid_t, std::vector<float>>;
-    std::shared_ptr<host_copy_sources_t const> host_copy_sources = std::make_shared<host_copy_sources_t const>();
-    mutable cudnn_frontend::detail::CudaGraphRetainedResource host_copy_sources_retention;
+    // Device copies of the constant arrays among cached_workspace_modifications (operation 0: ALiBi slopes,
+    // sequence lengths of the padding-mask workaround), uploaded once when the graph is built or deserialized.
+    // Kernels read them in place: execute() and the CUDA graphs recorded from this Graph point those tensors at
+    // this buffer, so no copy runs per execution and no recorded work reads host memory. (Launching a copy
+    // from pageable host memory may stall on driver staging buffers, and conditional-node bodies reject
+    // host-to-device copies outright.) CUDA graphs recorded from this Graph hold a reference to the buffer (a
+    // CUDA user object), so it may outlive this Graph; work launched directly orders its release instead.
+    struct ConstantTensors {
+        std::shared_ptr<detail::DeviceConstantBuffer> buffer;  // null when there are none
+        std::unordered_map<uid_t, void *> device_ptrs;
+    };
+    std::shared_ptr<ConstantTensors const> constant_tensors = std::make_shared<ConstantTensors const>();
+    mutable detail::CudaGraphRetainedResource constant_tensors_retention;
 
-    // Rebuild host_copy_sources from cached_workspace_modifications.
-    void
-    refresh_host_copy_sources_() {
-        auto sources = std::make_shared<host_copy_sources_t>();
+    // Rebuild constant_tensors from cached_workspace_modifications.
+    error_t
+    refresh_constant_tensors_() {
+        auto tensors          = std::make_shared<ConstantTensors>();
+        constexpr size_t kPad = 16;
+        std::vector<char> staging;
+        std::unordered_map<uid_t, size_t> offsets;
         for (auto const &[uid, data] : cached_workspace_modifications) {
             if (std::get<0>(data) == 0) {
-                sources->emplace(uid, std::get<2>(data));
+                auto const &values = std::get<2>(data);
+                size_t const bytes = values.size() * sizeof(float);
+                offsets.emplace(uid, staging.size());
+                staging.resize(staging.size() + (bytes + kPad - 1) / kPad * kPad);
+                std::memcpy(staging.data() + offsets.at(uid), values.data(), bytes);
             }
         }
-        host_copy_sources = std::move(sources);
-        // CUDA graphs recorded against the previous storage keep their own references to it.
-        host_copy_sources_retention = cudnn_frontend::detail::CudaGraphRetainedResource{};
+        if (!staging.empty()) {
+            _CUDNN_CHECK_CUDA_ERROR(
+                detail::DeviceConstantBuffer::create(staging.data(), staging.size(), tensors->buffer));
+            for (auto const &[uid, offset] : offsets) {
+                tensors->device_ptrs.emplace(uid, static_cast<char *>(tensors->buffer->data()) + offset);
+            }
+        }
+        constant_tensors = std::move(tensors);
+        // CUDA graphs recorded against the previous buffer keep their own references to it.
+        constant_tensors_retention = detail::CudaGraphRetainedResource{};
+        return {error_code_t::OK, ""};
     }
 
-    // The host source of the host-to-device copy for `uid`, or nullptr if there is none.
-    float const *
-    host_copy_source_(uid_t uid) const {
-        auto it = host_copy_sources->find(uid);
-        return it == host_copy_sources->end() ? nullptr : it->second.data();
+    // The device address of the constant tensor `uid`, or nullptr if there is none.
+    void *
+    constant_tensor_ptr_(uid_t uid) const {
+        auto it = constant_tensors->device_ptrs.find(uid);
+        return it == constant_tensors->device_ptrs.end() ? nullptr : it->second;
     }
 
     std::shared_ptr<void>
-    host_copy_sources_payload_() const {
-        return std::const_pointer_cast<host_copy_sources_t>(host_copy_sources);
+    constant_tensors_payload_() const {
+        return std::const_pointer_cast<ConstantTensors>(constant_tensors);
     }
 
     // char: 'x'=hex, 'd'=decimal, 'b'=base64
@@ -357,35 +372,45 @@ class Graph : public ICudnn, public INode {
     std::unordered_map<Tensor_attributes::uid_t, std::pair<Tensor_attributes::uid_t, int64_t>>
         variant_pack_replacements;
 
+    // Initializes the workspace (memsets) on the handle's stream, and keeps the constant tensors alive for
+    // the work about to read them: if the stream is being captured, the CUDA graph it records into gets a
+    // reference to them; otherwise `constant_use_stream` is set, and the caller must record the use with
+    // record_constant_tensors_use_() after launching that work.
     error_t
     run_auxiliary_kernels(
         cudnnHandle_t handle,
         void *fe_workspace,
-        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> &workspace_modifications) const {
+        std::unordered_map<uid_t, std::tuple<int64_t, int64_t, std::vector<float>>> &workspace_modifications,
+        cudaStream_t &constant_use_stream,
+        bool &record_constant_use) const {
         cudaStream_t stream;
         _CUDNN_CHECK_CUDNN_ERROR(detail::get_stream(handle, &stream));
-        char *workspace = static_cast<char *>(fe_workspace);
+        char *workspace     = static_cast<char *>(fe_workspace);
+        record_constant_use = false;
 
-        // If `stream` is being captured, the recorded host-to-device copies read their host sources on every
-        // replay; give the CUDA graph being recorded a reference to them first.
-        if (!host_copy_sources->empty()) {
-            _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_capturing_stream(
-                stream, [this]() { return host_copy_sources_payload_(); }));
+        if (constant_tensors->buffer != nullptr) {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            cudaGraph_t capture_graph              = nullptr;
+            cudaError_t const query_status =
+                detail::cuda_stream_get_capture_info(stream, &capture_status, &capture_graph);
+            if (query_status == cudaErrorStreamCaptureImplicit) {
+                (void)detail::cuda_get_last_error();  // reported by the launch itself
+            } else {
+                _CUDNN_CHECK_CUDA_ERROR(query_status);
+                if (capture_status == cudaStreamCaptureStatusActive && capture_graph != nullptr) {
+                    _CUDNN_CHECK_CUDA_ERROR(constant_tensors_retention.retain_on_graph(
+                        capture_graph, [this]() { return constant_tensors_payload_(); }));
+                } else if (capture_status == cudaStreamCaptureStatusNone) {
+                    constant_use_stream = stream;
+                    record_constant_use = true;
+                }
+            }
         }
 
         for (auto const &[uid, data] : workspace_modifications) {
-            if (std::get<0>(data) == 0) {
-                auto const &vec_data = std::get<2>(data);
-                float const *source  = host_copy_source_(uid);
-                RETURN_CUDNN_FRONTEND_ERROR_IF(source == nullptr,
-                                               error_code_t::INVALID_VALUE,
-                                               "No host source for workspace uid " + std::to_string(uid));
-                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_mem_cpy_async(workspace + std::get<1>(data),
-                                                                   source,
-                                                                   vec_data.size() * sizeof(float),
-                                                                   cudaMemcpyHostToDevice,
-                                                                   stream));
-            } else if (std::get<0>(data) == 1) {
+            (void)uid;
+            // Operation 0 (constant tensors) needs no work: kernels read the device buffer in place.
+            if (std::get<0>(data) == 1) {
                 int64_t memset_size = (int64_t)std::get<2>(data)[0];
                 _CUDNN_CHECK_CUDA_ERROR(
                     detail::cuda_mem_set_async(workspace + std::get<1>(data), 0, memset_size, stream));
@@ -679,28 +704,24 @@ class Graph : public ICudnn, public INode {
         ////////////////////////////
         //// WORKSPACE HANDLING ////
         ////////////////////////////
-        // The memcpy nodes below read their host sources on every launch of the CUDA graph.
-        if (!host_copy_sources->empty()) {
-            _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_graph(
-                cudnn_cuda_graph, [this]() { return host_copy_sources_payload_(); }));
+        // Kernels of the CUDA graph read the constant tensors on every launch.
+        if (constant_tensors->buffer != nullptr) {
+            _CUDNN_CHECK_CUDA_ERROR(constant_tensors_retention.retain_on_graph(
+                cudnn_cuda_graph, [this]() { return constant_tensors_payload_(); }));
         }
         // Using cached workspace modifications to avoid repeated tree traversal.
         for (auto const &[uid, data] : cached_workspace_modifications) {
             const auto &[operation_type, offset, vec_data] = data;
             uid_to_device_ptrs[uid]                        = static_cast<char *>(workspace) + offset;
 
-            // 0 means memcpy
+            // 0 means a constant tensor, read in place from the device buffer: no node
             if (operation_type == 0) {
-                float const *source = host_copy_source_(uid);
-                RETURN_CUDNN_FRONTEND_ERROR_IF(source == nullptr,
+                void *device_ptr = constant_tensor_ptr_(uid);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(device_ptr == nullptr,
                                                error_code_t::INVALID_VALUE,
-                                               "No host source for workspace uid " + std::to_string(uid));
-                _CUDNN_CHECK_CUDA_ERROR(
-                    detail::cuda_graph_add_memcpy_node_set_params_1D(current_node,
-                                                                     static_cast<char *>(workspace) + offset,
-                                                                     source,
-                                                                     vec_data.size() * sizeof(float),
-                                                                     cudaMemcpyHostToDevice));
+                                               "No device copy of constant tensor uid " + std::to_string(uid));
+                uid_to_device_ptrs[uid] = device_ptr;
+                continue;
             }
             // 1 means memset
             else if (operation_type == 1) {
@@ -840,10 +861,10 @@ class Graph : public ICudnn, public INode {
         /////////////////////////////////
         //// WORKSPACE HANDLING ////
         /////////////////////////////////
-        // The memcpy nodes below read their host sources on every launch of the CUDA graph.
-        if (!host_copy_sources->empty()) {
-            _CUDNN_CHECK_CUDA_ERROR(host_copy_sources_retention.retain_on_graph(
-                cudnn_cuda_graph, [this]() { return host_copy_sources_payload_(); }));
+        // Kernels of the CUDA graph read the constant tensors on every launch.
+        if (constant_tensors->buffer != nullptr) {
+            _CUDNN_CHECK_CUDA_ERROR(constant_tensors_retention.retain_on_graph(
+                cudnn_cuda_graph, [this]() { return constant_tensors_payload_(); }));
         }
         // Using cached workspace modifications to avoid repeated tree traversal.
         for (auto const &[uid, data] : cached_workspace_modifications) {
@@ -852,20 +873,14 @@ class Graph : public ICudnn, public INode {
 
             cudaGraphNode_t node = nullptr;
 
-            // 0 means memcpy
+            // 0 means a constant tensor, read in place from the device buffer: no node
             if (operation_type == 0) {
-                float const *source = host_copy_source_(uid);
-                RETURN_CUDNN_FRONTEND_ERROR_IF(source == nullptr,
+                void *device_ptr = constant_tensor_ptr_(uid);
+                RETURN_CUDNN_FRONTEND_ERROR_IF(device_ptr == nullptr,
                                                error_code_t::INVALID_VALUE,
-                                               "No host source for workspace uid " + std::to_string(uid));
-                _CUDNN_CHECK_CUDA_ERROR(detail::cuda_graph_add_memcpy_node_1D(&node,
-                                                                              cudnn_cuda_graph,
-                                                                              &last_node,
-                                                                              last_node != nullptr,
-                                                                              static_cast<char *>(workspace) + offset,
-                                                                              source,
-                                                                              vec_data.size() * sizeof(float),
-                                                                              cudaMemcpyHostToDevice));
+                                               "No device copy of constant tensor uid " + std::to_string(uid));
+                uid_to_device_ptrs[uid] = device_ptr;
+                continue;
             }
             // 1 means memset
             else if (operation_type == 1) {
@@ -1039,7 +1054,7 @@ class Graph : public ICudnn, public INode {
             CHECK_CUDNN_FRONTEND_ERROR(
                 collect_tensors_in_workspace_subtree(cached_workspace_modifications, temp_offset));
         }
-        refresh_host_copy_sources_();
+        CHECK_CUDNN_FRONTEND_ERROR(refresh_constant_tensors_());
 
         CUDNN_FE_LOG_BANNER("  4/4 LOWERING TO BACKEND OPERATION GRAPH  ");
 
@@ -1528,7 +1543,10 @@ class Graph : public ICudnn, public INode {
         }
 
         // 4. Run auxiliary kernels (e.g. SDPA reduction accumulator init)
-        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(handle, workspace, cached_workspace_modifications));
+        cudaStream_t constant_use_stream = nullptr;
+        bool record_constant_use         = false;
+        CHECK_CUDNN_FRONTEND_ERROR(run_auxiliary_kernels(
+            handle, workspace, cached_workspace_modifications, constant_use_stream, record_constant_use));
 
         CUDNN_FE_LOG_LABEL_ENDL("INFO: Executing gid " << gid);
         CHECK_CUDNN_FRONTEND_ERROR(log_tensors_to_dump_(handle, varpack_template.all_uids, ptrs));
@@ -1543,7 +1561,7 @@ class Graph : public ICudnn, public INode {
             detail::cuda_get_device(&device_ordinal);
             CHECK_CUDNN_FRONTEND_ERROR(
                 plans.execute_oss_rms_norm_silu_engine(ptrs, engine_workspace, device_ordinal, stream));
-            return {error_code_t::OK, ""};
+            return record_constant_tensors_use_(record_constant_use, constant_use_stream);
         }
 
         // Backend path
@@ -1559,6 +1577,18 @@ class Graph : public ICudnn, public INode {
                                                        override_uids,
                                                        override_shapes,
                                                        override_strides));
+        }
+        return record_constant_tensors_use_(record_constant_use, constant_use_stream);
+    }
+
+    // After launching work that reads the constant tensors directly (not into a CUDA graph): their device
+    // buffer must not be freed before `stream` has passed that work. Also the moment to free what earlier
+    // releases queued.
+    error_t
+    record_constant_tensors_use_(bool record, cudaStream_t stream) const {
+        if (record) {
+            _CUDNN_CHECK_CUDA_ERROR(constant_tensors->buffer->record_use(stream));
+            detail::CudaGraphRetainedResource::drain_deferred_releases();
         }
         return {error_code_t::OK, ""};
     }
@@ -1920,7 +1950,7 @@ class Graph : public ICudnn, public INode {
         // Initialize the execution caches from deserialized data
         cached_pass_by_value           = deserialized_pass_by_value;
         cached_workspace_modifications = deserialized_workspace_modifications;
-        refresh_host_copy_sources_();
+        CHECK_CUDNN_FRONTEND_ERROR(refresh_constant_tensors_());
 
         // Reset prep state in case this Graph is being re-deserialized; otherwise the
         // eager prep below would early-return with the old slot layout.
@@ -2372,14 +2402,21 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        // 4. Register workspace entries (slots allocated, pointers filled at execute time)
+        // 4. Register workspace entries (slots allocated, pointers filled at execute time). Constant tensors
+        //    (operation 0) point at their device buffer, which does not change between executions.
         for (auto const &[uid, data] : cached_workspace_modifications) {
+            void *const fixed_ptr = std::get<0>(data) == 0 ? constant_tensor_ptr_(uid) : nullptr;
+            RETURN_CUDNN_FRONTEND_ERROR_IF(std::get<0>(data) == 0 && fixed_ptr == nullptr,
+                                           error_code_t::INVALID_VALUE,
+                                           "No device copy of constant tensor uid " + std::to_string(uid));
             auto it = uid_to_slot.find(uid);
             if (it == uid_to_slot.end()) {
                 int slot = (int)t.all_uids.size();
                 t.all_uids.push_back(uid);
-                t.template_ptrs.push_back(nullptr);  // filled at execute time
+                t.template_ptrs.push_back(fixed_ptr);  // workspace entries: filled at execute time
                 uid_to_slot[uid] = slot;
+            } else if (fixed_ptr != nullptr) {
+                t.template_ptrs[it->second] = fixed_ptr;
             }
         }
 
@@ -2401,11 +2438,11 @@ class Graph : public ICudnn, public INode {
             }
         }
 
-        // 6. Pre-compute workspace slot indices
+        // 6. Pre-compute workspace slot indices (constant tensors excepted: see step 4)
         for (auto const &[uid, data] : cached_workspace_modifications) {
             const auto &[operation_type, offset, vec_data] = data;
             auto it                                        = uid_to_slot.find(uid);
-            if (it != uid_to_slot.end()) {
+            if (operation_type != 0 && it != uid_to_slot.end()) {
                 t.workspace_slots.emplace_back(it->second, offset);
             }
         }
