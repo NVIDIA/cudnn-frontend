@@ -112,7 +112,6 @@ from ..common.thd import TENSOR_MAP_QWORDS, emit_checkpoint_seq_descs, emit_seq_
 from .gdn2_bprop_config import CFG
 
 from cudnn.frost.tile_dsl.barrier import (
-    launch_dependent_grids,
     wait_on_dependent_grids,
     advance,
     MBarrier,
@@ -1647,8 +1646,6 @@ def tmaldg_warp(
             raw_index = advance(raw_index, cfg.smem_raw_stages)
         next_tile, scheduler_state = scheduler_publish_next(cfg, bars, sScheduler, mScheduler, scheduler_state, num_ctas, elect_one)
         tile_idx = next_tile
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -3399,7 +3396,6 @@ def frost_gdn2_bprop_prologue(
     per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -3466,10 +3462,9 @@ def frost_gdn2_bprop_prologue(
 
 
 @cute.jit
-def prologue(
+def base_descriptors(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
-    run_order: cutlass.Constexpr[bool],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -3484,21 +3479,13 @@ def prologue(
     dwo: cute.Tensor,
     dbo: cute.Tensor,
     state_checkpoints: cute.Tensor,
-    cu_seqlens: cute.Tensor,
-    work_count: cute.Tensor,
-    work_items: cute.Tensor,
-    scheduler_all: cute.Tensor | None,
-    tensormap_workspace: cute.Tensor,
-    stream: cuda_driver.CUstream,
 ):
-    """One-launch prologue. Synthesizes and LPT-orders the uncut work items (when this kernel is
-    the table's first consumer) and builds the 14 per-batch TMA-descriptor
-    arrays into ``tensormap_workspace``."""
+    """The whole-tensor TMA descriptors (Q, K, V, the gate, dO, beta, w, dQ, dK, dV, dGate, dW, dBeta, checkpoints) the
+    prologue's per-batch arrays are built from."""
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
     ho = gate.shape[1]
-    batch_size = cu_seqlens.shape[0] - 1
     d_k = q.shape[2]
     d_v = v.shape[2]
     bytes_per_element = io_dtype.width // 8
@@ -3546,6 +3533,42 @@ def prologue(
     )
     base_checkpoint = cuda.create_tensor_map_tiled_from_view(checkpoint_view, box_dims=(64, d_v, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle)
 
+    return base_q, base_k, base_v, base_gate, base_do, base_beta, base_w, base_dq, base_dk, base_dv, base_dgate, base_dwo, base_dbo, base_checkpoint
+
+
+@cute.jit
+def prologue(
+    io_dtype: cutlass.Constexpr,
+    b_t: cutlass.Constexpr[int],
+    run_order: cutlass.Constexpr[bool],
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    gate: cute.Tensor,
+    do: cute.Tensor,
+    beta: cute.Tensor,
+    w: cute.Tensor,
+    dq: cute.Tensor,
+    dk: cute.Tensor,
+    dv: cute.Tensor,
+    dgate: cute.Tensor,
+    dwo: cute.Tensor,
+    dbo: cute.Tensor,
+    state_checkpoints: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    work_count: cute.Tensor,
+    work_items: cute.Tensor,
+    scheduler_all: cute.Tensor | None,
+    tensormap_workspace: cute.Tensor,
+    stream: cuda_driver.CUstream,
+):
+    """One-launch prologue. Synthesizes and LPT-orders the uncut work items (when this kernel is
+    the table's first consumer) and builds the 14 per-batch TMA-descriptor
+    arrays into ``tensormap_workspace``."""
+    batch_size = cu_seqlens.shape[0] - 1
+    base_q, base_k, base_v, base_gate, base_do, base_beta, base_w, base_dq, base_dk, base_dv, base_dgate, base_dwo, base_dbo, base_checkpoint = (
+        base_descriptors(io_dtype, b_t, q, k, v, gate, do, beta, w, dq, dk, dv, dgate, dwo, dbo, state_checkpoints)
+    )
     frost_gdn2_bprop_prologue(
         run_order,
         b_t,

@@ -33,8 +33,8 @@ import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
 from cudnn.frost.buffers import DeviceView
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, ffma2, fp32_to_fp16
 from cudnn.frost.tile_dsl.tma import (
     cp_async_commit,
     cp_async_wait,
@@ -539,20 +539,42 @@ def frost_state_chain(
                 else:
                     for q in cutlass.range_constexpr(cols_per_lane // 4):
                         st_shared_v4(seed_product_ptr + 4 * q, seed_product_vals[4 * q : 4 * q + 4], cutlass.Float32)
+        # ---- the M staging offsets of this thread, the same for every slot ----------------------------
+        m_dst_words = []
+        m_src_elems = []
+        for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
+            chunk_id = tidx + cutlass.Int32(q * CHAIN_THREADS)
+            m_row = chunk_id // cutlass.Int32(K // 4)
+            m_chunk = chunk_id % cutlass.Int32(K // 4)
+            m_dst_words.append(m_row * K + (m_chunk ^ ((m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
+            m_src_elems.append(cutlass.Int64(m_row) * cutlass.Int64(K) + cutlass.Int64(m_chunk) * cutlass.Int64(4))
+        m_slot_elems = cutlass.Int64(HO) * cutlass.Int64(K * K)
+        m_head_elems = cutlass.Int64(h) * cutlass.Int64(K * K)
+        x_row_addrs = []
+        h_row_addrs = []
+        x_slot_bytes = cutlass.Int64(0)
+        h_slot_bytes = cutlass.Int64(0)
+        if cutlass.const_expr(walk_state):
+            x_slot_bytes = cutlass.Int64(mX.stride[0]) * cutlass.Int64(mX.element_type.width // 8)
+            h_slot_bytes = cutlass.Int64(mH.stride[0]) * cutlass.Int64(mH.element_type.width // 8)
+            for rr in cutlass.range_constexpr(walk_own_rows):
+                row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
+                x_row_addrs.append(
+                    mX.iterator.toint()
+                    + (cutlass.Int64(h) * cutlass.Int64(mX.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mX.stride[2]) + cutlass.Int64(col0))
+                    * cutlass.Int64(mX.element_type.width // 8)
+                )
+                h_row_addrs.append(
+                    mH.iterator.toint()
+                    + (cutlass.Int64(h) * cutlass.Int64(mH.stride[1]) + cutlass.Int64(row) * cutlass.Int64(mH.stride[2]) + cutlass.Int64(col0))
+                    * cutlass.Int64(mH.element_type.width // 8)
+                )
         first_step = cutlass.Int32(0) if cutlass.const_expr(not transpose) else count - cutlass.Int32(1)
         first_buf_words = cutlass.Int32(0)
-        first_slot = seq_base + first_step
+        first_slot_elems = cutlass.Int64(seq_base + first_step) * m_slot_elems + m_head_elems
         for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
-            first_chunk_id = tidx + cutlass.Int32(q * CHAIN_THREADS)
-            first_m_row = first_chunk_id // cutlass.Int32(K // 4)
-            first_m_chunk = first_chunk_id % cutlass.Int32(K // 4)
             nvvm.cp_async_shared_global(
-                sM.data_ptr(first_buf_words + (first_m_row * K + (first_m_chunk ^ ((first_m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))),
-                mM.iterator
-                + ((cutlass.Int64(first_slot) * cutlass.Int64(HO) + cutlass.Int64(h)) * cutlass.Int64(K) + cutlass.Int64(first_m_row)) * cutlass.Int64(K)
-                + cutlass.Int64(first_m_chunk) * cutlass.Int64(4),
-                16,
-                nvvm.LoadCacheModifier.CG,
+                sM.data_ptr(first_buf_words + m_dst_words[q]), mM.iterator + first_slot_elems + m_src_elems[q], 16, nvvm.LoadCacheModifier.CG
             )
         cp_async_commit()
 
@@ -562,30 +584,17 @@ def frost_state_chain(
             step = i if cutlass.const_expr(not transpose) else count - cutlass.Int32(1) - i
             slot = seq_base + step
             if cutlass.const_expr(walk_state):
+                x_slot_off = cutlass.Int64(slot) * x_slot_bytes
+                h_slot_off = cutlass.Int64(slot) * h_slot_bytes
                 for rr in cutlass.range_constexpr(walk_own_rows):
-                    row = row0 + row_group * cutlass.Int32(walk_group_rows) + k_warp * cutlass.Int32(walk_own_rows) + cutlass.Int32(rr)
-                    x_offset = (
-                        cutlass.Int64(slot) * cutlass.Int64(mX.stride[0])
-                        + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
-                        + cutlass.Int64(row) * cutlass.Int64(mX.stride[2])
-                        + cutlass.Int64(col0)
-                    )
-                    x_iter = mX.iterator
-                    x_addr = x_iter.toint() + x_offset * cutlass.Int64(mX.element_type.width // 8)
+                    x_addr = x_row_addrs[rr] + x_slot_off
                     x_vals = [cur[rr * cols_per_lane + c] for c in range(cols_per_lane)]
                     if cutlass.const_expr(cols_per_lane == 2):
                         st_global_v2(x_addr, x_vals, cutlass.Float32)
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 4):
                             st_global_v4(x_addr + cutlass.Int64(16 * q), x_vals[4 * q : 4 * q + 4], cutlass.Float32)
-                    h_offset = (
-                        cutlass.Int64(slot) * cutlass.Int64(mH.stride[0])
-                        + cutlass.Int64(h) * cutlass.Int64(mH.stride[1])
-                        + cutlass.Int64(row) * cutlass.Int64(mH.stride[2])
-                        + cutlass.Int64(col0)
-                    )
-                    h_iter = mH.iterator
-                    h_addr = h_iter.toint() + h_offset * cutlass.Int64(mH.element_type.width // 8)
+                    h_addr = h_row_addrs[rr] + h_slot_off
                     if cutlass.const_expr(cols_per_lane == 2):
                         h_vals = list(ld_global_v2(h_addr, cutlass.Float32))
                     else:
@@ -595,20 +604,10 @@ def frost_state_chain(
             if i + cutlass.Int32(1) < count:
                 next_step = step + cutlass.Int32(1) if cutlass.const_expr(not transpose) else step - cutlass.Int32(1)
                 next_buf_words = ((i + cutlass.Int32(1)) % cutlass.Int32(CHAIN_M_BUFFERS)) * cutlass.Int32(m_words)
-                next_slot = seq_base + next_step
+                next_slot_elems = cutlass.Int64(seq_base + next_step) * m_slot_elems + m_head_elems
                 for q in cutlass.range_constexpr(K * K // 4 // CHAIN_THREADS):
-                    next_chunk_id = tidx + cutlass.Int32(q * CHAIN_THREADS)
-                    next_m_row = next_chunk_id // cutlass.Int32(K // 4)
-                    next_m_chunk = next_chunk_id % cutlass.Int32(K // 4)
                     nvvm.cp_async_shared_global(
-                        sM.data_ptr(
-                            next_buf_words + (next_m_row * K + (next_m_chunk ^ ((next_m_row // cutlass.Int32(4)) % cutlass.Int32(8))) * cutlass.Int32(4))
-                        ),
-                        mM.iterator
-                        + ((cutlass.Int64(next_slot) * cutlass.Int64(HO) + cutlass.Int64(h)) * cutlass.Int64(K) + cutlass.Int64(next_m_row)) * cutlass.Int64(K)
-                        + cutlass.Int64(next_m_chunk) * cutlass.Int64(4),
-                        16,
-                        nvvm.LoadCacheModifier.CG,
+                        sM.data_ptr(next_buf_words + m_dst_words[q]), mM.iterator + next_slot_elems + m_src_elems[q], 16, nvvm.LoadCacheModifier.CG
                     )
                 cp_async_commit()
                 cp_async_wait(1)
@@ -659,24 +658,49 @@ def frost_state_chain(
                                 m_vals += list(ld_shared_v2(m_ptr, cutlass.Float32))
                         for c in cutlass.range_constexpr(cols_per_lane):
                             m_tile[kk * cols_per_lane + c] = m_vals[c]
+                # packed fma pairs (c, c + 1) where the pair sits in one 16-byte M load (the row-major read); the
+                # transposed read gathers c and c + 1 from different loads, and packing them would cost two moves per
+                # FFMA2 (census 10-11: 971 moves for 512 FFMA2), so it keeps the scalar fma
                 if cutlass.const_expr(walk_state):
                     for r in cutlass.range_constexpr(walk_group_rows):
                         op_row = row_group * cutlass.Int32(walk_group_rows) + cutlass.Int32(r)
                         for kq in cutlass.range_constexpr(CHAIN_K_TILE // 4):
                             x4 = ld_shared_v4(sWalk.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)), cutlass.Float32)
                             for e in cutlass.range_constexpr(4):
-                                for c in cutlass.range_constexpr(cols_per_lane):
-                                    acc[r * cols_per_lane + c] = cute.math.fma(x4[e], m_tile[(4 * kq + e) * cols_per_lane + c], acc[r * cols_per_lane + c])
+                                if cutlass.const_expr(transpose):
+                                    for c in cutlass.range_constexpr(cols_per_lane):
+                                        acc[r * cols_per_lane + c] = cute.math.fma(x4[e], m_tile[(4 * kq + e) * cols_per_lane + c], acc[r * cols_per_lane + c])
+                                else:
+                                    for c in cutlass.range_constexpr(0, cols_per_lane, 2):
+                                        acc[r * cols_per_lane + c], acc[r * cols_per_lane + c + 1] = ffma2(
+                                            x4[e],
+                                            x4[e],
+                                            m_tile[(4 * kq + e) * cols_per_lane + c],
+                                            m_tile[(4 * kq + e) * cols_per_lane + c + 1],
+                                            acc[r * cols_per_lane + c],
+                                            acc[r * cols_per_lane + c + 1],
+                                        )
                 if cutlass.const_expr(emit_summary):
                     for r in cutlass.range_constexpr(product_group_rows):
                         op_row = row_group * cutlass.Int32(product_group_rows) + cutlass.Int32(r)
                         for kq in cutlass.range_constexpr(CHAIN_K_TILE // 4):
                             x4 = ld_shared_v4(sProduct.data_ptr(op_row * K + k0 + cutlass.Int32(4 * kq)), cutlass.Float32)
                             for e in cutlass.range_constexpr(4):
-                                for c in cutlass.range_constexpr(cols_per_lane):
-                                    acc_product[r * cols_per_lane + c] = cute.math.fma(
-                                        x4[e], m_tile[(4 * kq + e) * cols_per_lane + c], acc_product[r * cols_per_lane + c]
-                                    )
+                                if cutlass.const_expr(transpose):
+                                    for c in cutlass.range_constexpr(cols_per_lane):
+                                        acc_product[r * cols_per_lane + c] = cute.math.fma(
+                                            x4[e], m_tile[(4 * kq + e) * cols_per_lane + c], acc_product[r * cols_per_lane + c]
+                                        )
+                                else:
+                                    for c in cutlass.range_constexpr(0, cols_per_lane, 2):
+                                        acc_product[r * cols_per_lane + c], acc_product[r * cols_per_lane + c + 1] = ffma2(
+                                            x4[e],
+                                            x4[e],
+                                            m_tile[(4 * kq + e) * cols_per_lane + c],
+                                            m_tile[(4 * kq + e) * cols_per_lane + c + 1],
+                                            acc_product[r * cols_per_lane + c],
+                                            acc_product[r * cols_per_lane + c + 1],
+                                        )
 
             # ---- slice partials ------------------------------------------------------------------
             if cutlass.const_expr(walk_state):
@@ -712,8 +736,8 @@ def frost_state_chain(
                             part = list(ld_shared_v2(part_ptr, cutlass.Float32))
                         else:
                             part = [x for q in range(cols_per_lane // 4) for x in ld_shared_v4(part_ptr + 4 * q, cutlass.Float32)]
-                        for c in cutlass.range_constexpr(cols_per_lane):
-                            total[c] = total[c] + part[c]
+                        for c in cutlass.range_constexpr(0, cols_per_lane, 2):
+                            total[c], total[c + 1] = fadd2(total[c], total[c + 1], part[c], part[c + 1])
                     for c in cutlass.range_constexpr(cols_per_lane):
                         cur[rr * cols_per_lane + c] = total[c]
                     walk_ptr = sWalk.data_ptr(op_row * K + col0)
@@ -732,8 +756,8 @@ def frost_state_chain(
                             part = list(ld_shared_v2(part_ptr, cutlass.Float32))
                         else:
                             part = [x for q in range(cols_per_lane // 4) for x in ld_shared_v4(part_ptr + 4 * q, cutlass.Float32)]
-                        for c in cutlass.range_constexpr(cols_per_lane):
-                            total[c] = total[c] + part[c]
+                        for c in cutlass.range_constexpr(0, cols_per_lane, 2):
+                            total[c], total[c + 1] = fadd2(total[c], total[c + 1], part[c], part[c + 1])
                     for c in cutlass.range_constexpr(cols_per_lane):
                         cur_product[rr * cols_per_lane + c] = total[c]
                     product_ptr = sProduct.data_ptr(op_row * K + col0)
@@ -798,8 +822,6 @@ def frost_state_chain(
                     else:
                         for q in cutlass.range_constexpr(cols_per_lane // 8):
                             st_global_v4(summary_m_addr + cutlass.Int64(16 * q), summary_words[4 * q : 4 * q + 4], cutlass.Int32)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1001,3 +1023,233 @@ def run_state_chain(compiled: CompiledStateChain, num_seqs, H, M, X, seed, tail,
 
 
 frost_state_chain.set_name_prefix("cudnn", remove_cutlass_symbol=False)
+
+
+# ---- scalar-transition chain (Mamba-2: the transition of a piece is one decay product per head) ------------------
+
+
+@cute.kernel
+def frost_scalar_state_chain(
+    heads_out: cutlass.Int32,
+    dim_v: cutlass.Constexpr[int],
+    dim_k: cutlass.Constexpr[int],
+    rows: cutlass.Constexpr[int],
+    has_seed: cutlass.Constexpr[bool],
+    reverse: cutlass.Constexpr[bool],
+    mH: cute.Tensor,
+    mTransition: cute.Tensor,
+    mX: cute.Tensor,
+    mSeed: cute.Tensor | None,
+    mMainRows: cute.Tensor,
+    mSeedIndices: cute.Tensor | None,
+):
+    """CTA ``(seq, h, c)`` chains rows ``[c * rows, (c + 1) * rows)`` of the state over the sequence's filled slots
+    ``main_rows[seq] // HO .. main_rows[seq + 1] // HO`` (the piece table).  Forward: ``X[first] = seed`` (zero without
+    one) and ``X[j + 1] = gamma[j] X[j] + H[j]``, every slot's incoming state.  ``reverse`` (the backward chain):
+    ``X[last] = seed`` and ``X[j - 1] = gamma[j] X[j] + H[j]`` with ``H`` the per-slot gradient summaries, every slot's
+    outgoing gradient.  A one-slot sequence receives the seed copy.  Every lane owns four consecutive state columns.
+    The slots go ``CHAIN_MAX_PIECES`` at a time (a long sequence of an uneven batch holds more): every summary and
+    transition of a burst is loaded before its walk, from one base address per tensor advanced by the slot stride, so the
+    walk is the stores and packed fma steps with no round trip.
+    ``H`` / ``X`` fp32 ``[slots, HO, V, K]``, ``mTransition`` fp32 ``[slots, HO]`` the log2 of each slot's decay product,
+    ``seed`` fp32 or 16-bit ``[num_seqs, HO, V, K]`` (``mSeedIndices`` names its row per sequence)."""
+    K = cutlass.const_expr(dim_k)
+    HO = heads_out
+    n_vec = cutlass.const_expr(rows * K // 4)
+    per_thread = cutlass.const_expr((n_vec + CHAIN_THREADS - 1) // CHAIN_THREADS)
+    step_bytes = cutlass.const_expr(-4 if reverse else 4)
+
+    if cutlass.const_expr(USE_PDL):
+        wait_on_dependent_grids()
+    tidx = cutlass.Int32(cute.arch.thread_idx()[0])
+    bid = cute.arch.block_idx()
+    seq = cutlass.Int32(bid[0])
+    h = cutlass.Int32(bid[1])
+    row0 = cutlass.Int32(bid[2]) * cutlass.Int32(rows)
+    seed_seq = seq
+    if cutlass.const_expr(mSeedIndices is not None):
+        seed_seq = cutlass.Int32(mSeedIndices[seq])
+
+    # ---- walk bounds --------------------------------------------------------------------------
+    row_base = cutlass.Int32(mMainRows[seq])
+    first = row_base // HO
+    filled = (cutlass.Int32(mMainRows[seq + 1]) - row_base) // HO
+    count = filled if filled > cutlass.Int32(0) else cutlass.Int32(1)
+    slot0 = first + count - cutlass.Int32(1) if reverse else first
+
+    # ---- one base address per tensor, advanced by the slot stride ----------------------------
+    x_step = cutlass.Int64(mX.stride[0]) * cutlass.Int64(step_bytes)
+    h_step = cutlass.Int64(mH.stride[0]) * cutlass.Int64(step_bytes)
+    transition_step = cutlass.Int64(mTransition.stride[0]) * cutlass.Int64(step_bytes)
+    transition_base = mTransition.iterator.toint() + (
+        cutlass.Int64(slot0) * cutlass.Int64(mTransition.stride[0]) + cutlass.Int64(h) * cutlass.Int64(mTransition.stride[1])
+    ) * cutlass.Int64(4)
+    x_base = []
+    h_base = []
+    for i in cutlass.range_constexpr(per_thread):
+        vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+        vec_owned = vec if vec < cutlass.Int32(n_vec) else cutlass.Int32(0)
+        r = row0 + (vec_owned * cutlass.Int32(4)) // cutlass.Int32(K)
+        c = (vec_owned * cutlass.Int32(4)) % cutlass.Int32(K)
+        x_base.append(
+            mX.iterator.toint()
+            + (
+                cutlass.Int64(slot0) * cutlass.Int64(mX.stride[0])
+                + cutlass.Int64(h) * cutlass.Int64(mX.stride[1])
+                + cutlass.Int64(r) * cutlass.Int64(mX.stride[2])
+                + cutlass.Int64(c)
+            )
+            * cutlass.Int64(4)
+        )
+        h_base.append(
+            mH.iterator.toint()
+            + (
+                cutlass.Int64(slot0) * cutlass.Int64(mH.stride[0])
+                + cutlass.Int64(h) * cutlass.Int64(mH.stride[1])
+                + cutlass.Int64(r) * cutlass.Int64(mH.stride[2])
+                + cutlass.Int64(c)
+            )
+            * cutlass.Int64(4)
+        )
+
+    # ---- the seed: this lane's four columns of every owned row -------------------------------
+    cur = cutlass.Array(cutlass.Float32, 4 * per_thread)
+    for i in cutlass.range_constexpr(per_thread):
+        vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+        for e in cutlass.range_constexpr(4):
+            cur[4 * i + e] = cutlass.Float32(0.0)
+        if vec < cutlass.Int32(n_vec):
+            r = row0 + (vec * cutlass.Int32(4)) // cutlass.Int32(K)
+            c = (vec * cutlass.Int32(4)) % cutlass.Int32(K)
+            if cutlass.const_expr(has_seed):
+                seed_offset = (
+                    cutlass.Int64(seed_seq) * cutlass.Int64(mSeed.stride[0])
+                    + cutlass.Int64(h) * cutlass.Int64(mSeed.stride[1])
+                    + cutlass.Int64(r) * cutlass.Int64(mSeed.stride[2])
+                    + cutlass.Int64(c)
+                )
+                seed_addr = mSeed.iterator.toint() + seed_offset * cutlass.Int64(mSeed.element_type.width // 8)
+                if cutlass.const_expr(mSeed.element_type == cutlass.Float32):
+                    seed_vals = list(ld_global_v4(seed_addr, cutlass.Float32))
+                else:
+                    seed_words = list(ld_global_v2(seed_addr, cutlass.Int32))
+                    seed_vals = [x for word in seed_words for x in f16x2_to_f32(word, dtype=mSeed.element_type)]
+                for e in cutlass.range_constexpr(4):
+                    cur[4 * i + e] = seed_vals[e]
+
+    # ---- the slots in bursts of CHAIN_MAX_PIECES: every summary and transition of the burst, then its walk ------
+    gamma = cutlass.Array(cutlass.Float32, CHAIN_MAX_PIECES)
+    summary = cutlass.Array(cutlass.Float32, 4 * per_thread * CHAIN_MAX_PIECES)
+    burst_first = cutlass.Int32(0)
+    while burst_first < count:
+        left = count - burst_first
+        burst_x = cutlass.Int64(burst_first) * x_step
+        burst_h = cutlass.Int64(burst_first) * h_step
+        burst_transition = cutlass.Int64(burst_first) * transition_step
+        for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
+            if cutlass.Int32(j + 1) < left:
+                gamma[j] = cute.math.exp2(ld_global(transition_base + burst_transition + cutlass.Int64(j) * transition_step, cutlass.Float32), fastmath=True)
+                for i in cutlass.range_constexpr(per_thread):
+                    vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+                    if vec < cutlass.Int32(n_vec):
+                        summary_vals = ld_global_v4(h_base[i] + burst_h + cutlass.Int64(j) * h_step, cutlass.Float32)
+                        for e in cutlass.range_constexpr(4):
+                            summary[(j * per_thread + i) * 4 + e] = summary_vals[e]
+
+        # ---- the walk: store this slot's incoming value, then fold its summary toward the next ---
+        for j in cutlass.range_constexpr(CHAIN_MAX_PIECES):
+            if cutlass.Int32(j) < left:
+                for i in cutlass.range_constexpr(per_thread):
+                    vec = tidx + cutlass.Int32(i * CHAIN_THREADS)
+                    if vec < cutlass.Int32(n_vec):
+                        st_global_v4(x_base[i] + burst_x + cutlass.Int64(j) * x_step, [cur[4 * i + e] for e in range(4)], cutlass.Float32)
+                if cutlass.Int32(j + 1) < left:
+                    for i in cutlass.range_constexpr(per_thread):
+                        base = (j * per_thread + i) * 4
+                        cur[4 * i], cur[4 * i + 1] = ffma2(gamma[j], gamma[j], cur[4 * i], cur[4 * i + 1], summary[base], summary[base + 1])
+                        cur[4 * i + 2], cur[4 * i + 3] = ffma2(gamma[j], gamma[j], cur[4 * i + 2], cur[4 * i + 3], summary[base + 2], summary[base + 3])
+        burst_first = burst_first + cutlass.Int32(CHAIN_MAX_PIECES)
+
+
+@cute.jit
+def launch_scalar_state_chain(
+    heads_out: cutlass.Int32,
+    dim_v: cutlass.Constexpr[int],
+    dim_k: cutlass.Constexpr[int],
+    rows: cutlass.Constexpr[int],
+    has_seed: cutlass.Constexpr[bool],
+    reverse: cutlass.Constexpr[bool],
+    num_seqs: cutlass.Int32,
+    mH: cute.Tensor,
+    mTransition: cute.Tensor,
+    mX: cute.Tensor,
+    mSeed: cute.Tensor | None,
+    mMainRows: cute.Tensor,
+    mSeedIndices: cute.Tensor | None,
+    stream: cuda.CUstream,
+) -> None:
+    slices = cutlass.const_expr(dim_v // rows)
+    frost_scalar_state_chain(heads_out, dim_v, dim_k, rows, has_seed, reverse, mH, mTransition, mX, mSeed, mMainRows, mSeedIndices).launch(
+        grid=(num_seqs, heads_out, slices), block=(CHAIN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL
+    )
+
+
+scalar_state_chain_cache = {}
+
+
+class CompiledScalarStateChain(NamedTuple):
+    """Build-time facts of one scalar-transition chain launch, produced by :func:`build_scalar_state_chain`."""
+
+    compiled: object
+    heads_out: int
+    dim_v: int
+    dim_k: int
+    rows_per_cta: int
+    has_seed: bool
+    reverse: bool
+    seed_dtype: str
+    device: int
+    has_seed_indices: bool
+
+
+def build_scalar_state_chain(
+    *, heads_out, dim_v, dim_k, rows_per_cta, has_seed, reverse=False, seed_dtype="float32", device, opt_level, has_seed_indices=False
+):
+    """Compile (cached per state geometry, flags, seed dtype, device and ``opt_level``) the scalar-transition chain;
+    ``heads_out`` and ``num_seqs`` are launch arguments and every tensor's layout is dynamic."""
+    HO, V, K = int(heads_out), int(dim_v), int(dim_k)
+    rows = int(rows_per_cta)
+    seed_name = dtype_name(seed_dtype) if has_seed else "float32"
+    key = (V, K, rows, bool(has_seed), bool(reverse), seed_name, int(device), int(opt_level), bool(has_seed_indices))
+    if key not in scalar_state_chain_cache:
+        scalar_state_chain_cache[key] = cute.compile(
+            launch_scalar_state_chain,
+            cutlass.Int32(HO),
+            V,
+            K,
+            rows,
+            bool(has_seed),
+            bool(reverse),
+            cutlass.Int32(1),
+            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO), "float32", int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(DeviceView(256, (1, HO, V, K), "float32", int(device)), assumed_align=16).mark_layout_dynamic(leading_dim=3),
+            from_dlpack(DeviceView(256, (1, HO, V, K), seed_name, int(device)), assumed_align=4).mark_layout_dynamic(leading_dim=3) if has_seed else None,
+            from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic(),
+            from_dlpack(DeviceView(256, (1,), "int32", int(device)), assumed_align=4).mark_layout_dynamic() if has_seed_indices else None,
+            cuda.CUstream(0),
+            options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
+        )
+    return CompiledScalarStateChain(
+        scalar_state_chain_cache[key], HO, V, K, rows, bool(has_seed), bool(reverse), seed_name, int(device), bool(has_seed_indices)
+    )
+
+
+def run_scalar_state_chain(compiled: CompiledScalarStateChain, num_seqs, H, transition, X, seed, main_rows, stream, seed_indices=None) -> None:
+    """Chain ``num_seqs`` sequences over the piece table's filled slots: ``H`` / ``X`` fp32 ``[slots, HO, V, K]``,
+    ``transition`` fp32 ``[slots, HO]`` (log2 decay products), ``seed`` ``[num_seqs, HO, V, K]`` in its built dtype (None
+    when not built), ``main_rows`` int32 ``[num_seqs + 1]``, ``seed_indices`` int32 ``[num_seqs]`` when built with them."""
+    compiled.compiled(int(num_seqs), H, transition, X, seed, main_rows, seed_indices, cuda.CUstream(int(stream)))
+
+
+frost_scalar_state_chain.set_name_prefix("cudnn", remove_cutlass_symbol=False)

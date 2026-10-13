@@ -416,6 +416,35 @@ are close.
   checkpoint on a real-token boundary). `safe_gate`, `use_beta_sigmoid` and
   `allow_neg_eigval` (beta as `2 * sigmoid(x)`) all pass through. The op is
   `cudnn.linear_attention.ops.gated_delta_product`.
+- Mamba-2 SSD (`mamba2` / `mamba2_bwd`) is the gated delta rule without the
+  erase term: one scalar `g` per token (the raw `dt`, `[total_T, HO]`) is both
+  the decay exponent and the write strength, `dt_t = clamp(softplus(g_t +
+  dt_bias), dt_min, dt_max)`, `S_t = exp(A dt_t) S_{t-1} + dt_t k_t^T v_t`. The
+  node has no `beta`; it takes the decay rate `a` (A, `[HO]`), optional
+  `dt_bias`, an optional skip `d` (`[HO]` or
+  `[HO, V]`, `O += d v`) and an optional output gate `z` (`O *= z sigmoid(z)`,
+  with the pre-gate `O_pre` output the backward consumes). `q` / `k` (C / B)
+  may be grouped over the `v` (x) heads; `v` carries every head. `dt_softplus`,
+  `dt_min` and `dt_max` are attributes (the clamp zeroes the gate gradient
+  where active). `Mamba2FrostEngine` (`cudnn.linear_attention.frost.mamba2_engine`,
+  SM100/SM103/SM107, `d_qk == 128`, `d_v == 64`, chunk 128) is its only
+  engine; `mamba2_bwd` returns `dQ, dK, dV, dG, dA, d_initial_state,
+  d_dt_bias, dD, dZ` and regenerates the chunk-cadence state series with the
+  prefill when the graph passes none (or a coarser one). Long sequences on few
+  (sequence, head) tiles run the piece chain in both passes: the prefill in its
+  state-only mode summarizes every piece from a zero state (end state and the
+  log2 of the piece's decay product), a scalar axpy chain seeds the pieces, and
+  the main pass runs them as independent sequences; the backward adds the bprop
+  in its dstate-only mode (every piece's start gradient) and the reverse chain.
+  The CP summaries are the same two modes over whole sequences:
+  `mamba2_summary` (`k, v, g, a, cu_seqlens[, initial_state, dt_bias]` to
+  `final_state` and `transition`, `[N, HO]` fp32, the log2 decay product, so
+  that across spans `S_final = exp2(transition) S_init + S_H`) and
+  `mamba2_summary_bwd` (`q, k, g, a, cu_seqlens, dO[, d_final_state, dt_bias]`
+  to `d_initial_state` and `transition`), served by `Mamba2SummaryFrostEngine`.
+  The torch ops are `cudnn.linear_attention.ops.mamba2` (`A` bound to `a`
+  as is, `dA` returned as is),
+  `mamba2_summary` and `mamba2_summary_bwd`.
 - The FROST engines are pure pass-through: `check_support` requires the
   kernel-native dtypes (fp32/bf16/fp16 gates — io-dtype `beta`/`w` for GDN-2
   — int32 or int64 `cu_seqlens`, fp32-or-bf16 state ports with matching

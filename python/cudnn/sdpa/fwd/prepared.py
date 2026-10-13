@@ -109,7 +109,12 @@ def _quant_spec(api):
     sizes = ()
     if getattr(api, "_prepared_mxfp8", False):
         km = api._k_mod
-        sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K) + (() if getattr(api, "pv_bf16", False) else (km.SF_SMEM_SIZE_V,))
+        # A template compiled per head geometry (SM120) sizes its scale tiles from
+        # the head dims; fixed-geometry templates carry them as module constants.
+        if hasattr(km, "mxfp8_sf_sizes"):
+            sizes = km.mxfp8_sf_sizes(int(api.head_dim_qk), int(api.head_dim_v))
+        else:
+            sizes = (km.SF_SMEM_SIZE_Q, km.SF_SMEM_SIZE_K) + (() if getattr(api, "pv_bf16", False) else (km.SF_SMEM_SIZE_V,))
     return QuantizedLaunchSpec(bool(api.has_amax_o), api._prepared_quant_offset(), sizes, block)
 
 

@@ -57,7 +57,7 @@ import cutlass.experimental.primitives as nvvm
 import cutlass.experimental.cuda.tensor_map as tma
 
 from ..common.thd import emit_seq_descs, emit_tile_seq_descs, TENSOR_MAP_QWORDS
-from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.handles import SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import mma_step
 from cudnn.frost.tile_dsl.pointwise import fadd2, ffma2, fmul2, fp32_to_fp16, movmatrix_16b, opaque_f32_zero, opaque_i32, sigmoid
@@ -1047,8 +1047,6 @@ def frost_kda_prep(
         desc_q_decay_base,
         desc_t_base,
     )
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @dataclass

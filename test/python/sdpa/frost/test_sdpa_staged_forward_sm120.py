@@ -300,6 +300,19 @@ def test_staged_invalid_operand_is_rejected_before_any_copy(fp8, bad, monkeypatc
         _execute(api, tensors, workspace)
 
 
+def test_staged_rejects_mxfp8_input_scales(monkeypatch):
+    """A per-tensor FP8 conversion plan has no MXFP8 scale operand: one passed to execute raises before any
+    staging copy or attention launch."""
+    api, tensors, _ = _case(fp8=True)
+    api.compile()
+    workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    tensors["sf_q"] = torch.full((1, 4, 1, 512), 127, device="cuda", dtype=torch.uint8)
+    _forbid_staging(monkeypatch)
+    monkeypatch.setattr(api._staged_spec.core, "fn", lambda *a, **k: pytest.fail("MXFP8 scales reached attention"))
+    with pytest.raises(ValueError, match="MXFP8 plans only"):
+        _execute(api, tensors, workspace)
+
+
 @pytest.mark.parametrize("role", ["q", "o"])
 def test_staged_amax_alias_checks_original_operand(role, monkeypatch):
     api, tensors, _ = _case(fp8=True)

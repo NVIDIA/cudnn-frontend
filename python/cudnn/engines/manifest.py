@@ -44,6 +44,7 @@ from .engine_ids import (
     GDP_ID_BASE,
     KDA_ID_BASE,
     FROST_CONV_ID_BASE,
+    MAMBA2_ID_BASE,
 )
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
@@ -165,6 +166,10 @@ _ANCHOR_NODE_TO_FAMILY = {
     "GDP_BWD": "gdp",
     "GDP_SUMMARY": "gdp",
     "GDP_SUMMARY_BWD": "gdp",
+    "MAMBA2": "mamba2",
+    "MAMBA2_BWD": "mamba2",
+    "MAMBA2_SUMMARY": "mamba2",
+    "MAMBA2_SUMMARY_BWD": "mamba2",
 }
 
 # ---------------------------------------------------------------------------
@@ -220,6 +225,14 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(
+        MAMBA2_ID_BASE,
+        "mamba2",
+        "cudnn.linear_attention",
+        "Mamba2Engines",
+        slots={"mamba2_frost": EngineSlot(0), "mamba2_summary_frost": EngineSlot(1)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+    ),
+    EngineFamily(
         FROST_GEMM_ID_BASE,
         "frost_gemm",
         "cudnn.gemm.frost.engine",
@@ -254,6 +267,7 @@ MANIFEST: Tuple[EngineFamily, ...] = (
             "sdpa_fwd_prefill_sm107": EngineSlot(15),
             "sdpa_fwd_prefill_sm107_mxfp8": EngineSlot(16),
             "sdpa_fwd_prefill_sm90": EngineSlot(17),
+            "sdpa_fwd_prefill_sm120_mxfp8": EngineSlot(18, opt_in=True),
         },
         analyzer=("cudnn.sdpa.graph_analyzer", "analyze"),
         heuristics=("cudnn.sdpa.fwd.heuristics", "propose"),

@@ -2457,6 +2457,8 @@ class _Projection(_Stage):
             sf_dtype=self.sf_dtype,
             w_dtype=self.w_dtype,
             block_size=self.block_size,
+            # capture_safe: the serving declaration's flag (default off); a capture-safe block sets it on both projection stages before compile()
+            capture_safe=bool(getattr(self, "capture_safe", False)),
         )
 
     def workspace_bytes(self) -> int:
