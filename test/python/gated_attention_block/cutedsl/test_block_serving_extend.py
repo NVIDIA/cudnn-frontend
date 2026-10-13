@@ -9,8 +9,9 @@ bottom-right diagonal: the declaration rows and the envelope that predicts them,
 checks, and the Rubin cells -- the empty-prefix step vs the dense block, the 2-chunk extend and the prefix-hit step vs the
 single-shot oracle on L3, L1 vs L3 bitwise, the degenerate matrix on serving buffers (padded entries with kv_len 0 and the NULL
 block, a live-Q dead-KV entry, mid-page prefixes, tail tiles, n_kv 1 / 3 / 4 and the ring wrap, pads at the END and in the
-MIDDLE, a row-sliced block table), the bounded-token contract (live rows bitwise the tight declaration, pad rows exactly 0 on a
-sentinel-filled out over a zeroed workspace), and a CUDA-graph replay over new lengths / tables / slots.
+MIDDLE, a row-sliced block table), the admitted spellings executed (the lengths form, the fused norm + RoPE and the out-of-place
+pipelines, a full and a wider block table), the bounded-token contract (live rows bitwise the tight declaration, pad rows exactly
+0 on a sentinel-filled out over a zeroed workspace), and a CUDA-graph replay over new lengths / tables / slots.
 
 The pool contract a serving stack binds: a 4-D view ``[num_pages, H_kv, P, D]`` with ``D`` contiguous and the other strides
 free -- HND compact pools, NHD storage by strides, and a stack's UNIFIED content row ``[num_pages, H_kv, P, 2D]`` whose two
@@ -1814,3 +1815,73 @@ def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and
         assert torch.equal(rec2["out"], rec2_e["out"]), "the replay over new lengths / tables / slots differs from the eager run over them"
     finally:
         graph.reset()
+
+
+_ADMITTED_SPELLINGS = {
+    # id: (harness kwargs -- b_max / t_max first, q_lens, prefix_lens, the EXECUTED block table's column count or None = the declared max_pages)
+    "lengths_form_bf16_hnd_p16": (
+        dict(b_max=4, t_max=512, max_kv_len=512, page=16, layout="hnd", cu=False, seed=21),
+        _MATRIX_PACKING["q_lens"],
+        _MATRIX_PACKING["prefix_lens"],
+        None,
+    ),
+    "fuse_norm_rope_bf16_nhd_p32": (
+        dict(b_max=4, t_max=512, max_kv_len=512, page=32, layout="nhd", seed=22, fuse_norm_rope=True),
+        _MATRIX_PACKING["q_lens"],
+        _MATRIX_PACKING["prefix_lens"],
+        None,
+    ),
+    "out_of_place_qkv_f16_unified_p64": (
+        dict(b_max=4, t_max=512, max_kv_len=512, page=64, layout="unified", dtype=torch.float16, seed=23, inplace_qkv=False),
+        _MATRIX_PACKING["q_lens"],
+        _MATRIX_PACKING["prefix_lens"],
+        None,
+    ),
+    "full_table_row_on_a_sliced_table_lengths_form": (
+        dict(b_max=2, t_max=256, max_kv_len=256, page=16, layout="hnd", row_stride=50, cu=False, seed=24),
+        [128, 16],
+        [128, 0],
+        None,
+    ),
+    "wider_table_40_columns_at_row_stride_50_max_pages_16": (
+        dict(b_max=2, t_max=256, max_kv_len=256, page=16, layout="hnd", row_stride=50, seed=25),
+        [100, 156],
+        [60, 100],
+        40,
+    ),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize("spelling", list(_ADMITTED_SPELLINGS), ids=list(_ADMITTED_SPELLINGS))
+def test_extend_admitted_spellings_execute_within_the_budget(spelling):
+    """The spellings the declaration cell ADMITS ("every served spelling builds the same stage") or the docs CLAIM at execute, each
+    EXECUTED on the target body through the suite's own harness and ``check`` (the dense suite's budget, the pool bitwise the slab rows,
+    the stale rows untouched -- nothing widened): the [B] lengths form (``cu_seqlens=False``) on the matrix packing; the fused norm +
+    RoPE pipeline (the fork writes the post-RoPE slab the write-through reads); the out-of-place Q / K / V pipeline (f16); a FULL table
+    row (kv_len = max_pages x P = 256) on a ``[:, :max_pages]`` slice of a wider table under the lengths form; and a block table WIDER
+    than ``max_pages`` (``[2, 40]`` at the declared row stride 50, ``max_pages`` 16 -- the docs' ``[num_sequences, >= max_pages]``).
+    MEASURED on the Rubin development node (2026-10-13): 5 / 5 within the budget, worst ``out`` cos 0.999988 (the fused pipeline),
+    gated-O max|err| 3.906e-03 bf16 / 4.883e-04 f16."""
+    kw, q_lens, prefix_lens, table_cols = _ADMITTED_SPELLINGS[spelling]
+    kw = dict(kw)
+    hz = _harness(kw.pop("b_max"), kw.pop("t_max"), **kw)
+    declared = hz.table
+    if table_cols is not None:  # the SAME storage with more columns than the declared max_pages, at the declared row stride
+        assert table_cols > hz.max_pages
+        hz.table = declared.as_strided((hz.b_max, table_cols), (declared.stride(0), 1))
+    try:
+        rec = hz.step(q_lens, prefix_lens=prefix_lens, prefill="reference")
+        hz.check(rec, label=f"(admitted) {spelling}")
+    finally:
+        hz.table = declared
+    if spelling.startswith("full_table_row"):
+        assert rec["kv_lens"][0] == hz.max_pages * hz.page, rec["kv_lens"]  # the row addresses every one of its max_pages columns
+    og = hz.o_gated()
+    worst_cos, worst_err = 1.0, 0.0
+    for b, ((lo, hi), ref) in enumerate(zip(rec["rows"], rec["refs"])):
+        q, p = rec["q_lens"][b], rec["prefix_lens"][b]
+        if q and rec["kv_lens"][b]:
+            worst_cos = min(worst_cos, _cos(rec["out"][lo:hi], ref.out[0, p : p + q]))
+            worst_err = max(worst_err, (og[lo:hi].float() - ref.o_gated[0, p : p + q].float()).abs().max().item())
+    print(f"(admitted) {spelling}: t_live {rec['t_live']} kv_lens {rec['kv_lens']} worst out cos {worst_cos:.6f} gated-O max|err| {worst_err:.3e}")
