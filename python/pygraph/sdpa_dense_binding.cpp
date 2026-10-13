@@ -614,7 +614,7 @@ class SdpaDenseBinder {
                 if (role == AmaxO && !has_amax_) invalid("this specialization does not produce amax_o");
                 ptr = f.pointer;
             }
-            pointers[role - DescaleQ] = ptr;
+            pointers[role - DescaleQ]              = ptr;
             frame[quant_indices_[role - DescaleQ]] = py::int_(ptr);
         }
         const auto amax = pointers[AmaxO - DescaleQ], amax_end = add(amax, 4);
@@ -649,8 +649,7 @@ class SdpaDenseBinder {
             expanded.append(mx_scales_ ? py::none() : py::cast(pointers[ScaleO - DescaleQ]));
             expanded.append(stream);
             combine = py::tuple(expanded);
-            if (!mx_scales_ && dtype_bits_[O] == 8)
-                frame[quant_indices_[ScaleO - DescaleQ]] = py::none();
+            if (!mx_scales_ && dtype_bits_[O] == 8) frame[quant_indices_[ScaleO - DescaleQ]] = py::none();
         }
         return initialize_identity;
     }

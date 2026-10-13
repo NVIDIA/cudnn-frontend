@@ -154,7 +154,8 @@ class SdpaBwdBinder : private FixedSdpaOperands {
         if (scale_log2_) frame.append(py::float_(scale_value * 1.4426950408889634));
         frame.append(py::float_(scale_value));
         if (length_form_)
-            frame.append(py::int_(length_form));  // Graph declarations bind B lengths; standalone also accepts B+1 prefixes.
+            frame.append(
+                py::int_(length_form));  // Graph declarations bind B lengths; standalone also accepts B+1 prefixes.
         frame.append(py::int_(stream));
         return py::tuple(frame);
     }
