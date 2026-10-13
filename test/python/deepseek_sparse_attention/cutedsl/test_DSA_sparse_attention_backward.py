@@ -2823,6 +2823,8 @@ def test_DSA_sparse_attention_backward_nondefault_stream_zero_init_ordering(num_
         _require_exact_sm100()
     if num_heads == 128 and head_dim == 576 and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
+    if q_cluster_mode == "adaptive_pair" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("q_cluster_mode='adaptive_pair' requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     device = torch.device("cuda")
     s_q, s_kv = 256, 1024
     softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -3423,6 +3425,8 @@ def test_DSA_sparse_attention_backward_sm100_execute_allocates_nothing_and_never
         _require_exact_sm100()
     if expected_backend == "h128_d576_2cta_m64" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
         pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
+    if q_cluster_mode == "adaptive_pair" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("q_cluster_mode='adaptive_pair' requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(
         num_heads,
         head_dim,
@@ -3463,6 +3467,8 @@ def test_DSA_sparse_attention_backward_execute_requires_preallocated_outputs(num
         _require_sm100()
         if route == "sm100-d576-2cta" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
             pytest.skip("D576 2-CTA requires an SM100-class GPU (compute capability 10.0 or 10.3)")
+    if q_cluster_mode == "adaptive_pair" and torch.cuda.get_device_capability() not in _TWO_CTA_CAPABILITIES:
+        pytest.skip("q_cluster_mode='adaptive_pair' requires an SM100-class GPU (compute capability 10.0 or 10.3)")
     plan, inputs, outputs, topk_length, softmax_scale, workspace = _plan_case(num_heads, head_dim, topk, s_kv=max(256, 2 * topk), q_cluster_mode=q_cluster_mode)
     dq, dkv, d_sink = outputs
 

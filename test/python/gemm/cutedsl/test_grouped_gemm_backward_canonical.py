@@ -87,6 +87,10 @@ def test_dglu_canonical_matches_legacy(request, b_major, flat_sf):
 
 @torch_fork_set_rng(seed=0)
 def test_dglu_canonical_deterministic_dprob(request):
+    from cudnn.api_base import is_sm107_device
+
+    if is_sm107_device():
+        pytest.skip("deterministic dprob is implemented only for the SM100 kernel, not Rubin")
     cfg, inputs = dswiglu_case(request)
     legacy = run_dglu(cfg, inputs, canonical=False, b_major="n", deterministic=True)
     canonical = run_dglu(cfg, inputs, canonical=True, b_major="n", flat_sf=True, deterministic=True)
