@@ -202,6 +202,20 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 # The tree form (`"smem_rolled_tree"`: the pipelined form with four partial sums per statistics pass -- a different fp32 ORDER, LN_PASS_FORMS_REORDERED)
 # adds +0.2..+3.5 % on top (K3 c 256 +25.0..+25.3 % vs the pick with the biases, +32.5..+36.0 % without; K1 c 256 +5.3..+6.1 %) and is NEVER a pick of
 # this table: a caller's knob, reported with its oracle distance.
+#
+# The LayerNorm-ONCE work item (`ln_once="block"`: the row block's A operand(s) resident in SMEM across its passes x N tiles, LayerNormed once; the
+# per-tile B ring unchanged; bitwise the per-tile item), measured STANDALONE on both stages over the heuristics' complete pick (graph replay 300 x 3,
+# control pair <= 0.2 %, every arm bitwise the pick, the 212-SM Rubin class at the 2376 lock; bias off AND on; the busy clock sampled per cell, the
+# 1.0-1.5 %-under-the-lock windows read as LOWER bounds):
+#   c = 256: K1 +118 / +118 / +139 / +98 / +72 % (bias off) and +105 / +105 / +120 / +88 / +64 % (bias on) at N 512 x 1 / 256 x 4 / 1024 x 1 / 384 x 1 /
+#            256 x 1 (219 -> 101 us at 512 x 1 off); K3 +60 / +60 / +68 / +48 / +31 % (off) and +60 / +60 / +68 / +49 / +32 % (on) (223 -> 139 us) --
+#            every cell of every bucket, both bias arms, decisively; the small-N tail of the coarser item (256 x 1: 2.4 item-waves) costs less than the
+#            LayerNorm it removes.  Every c = 256 pick: ln_once="block" (the "passes" item, LN 4 -> 2 per block, takes roughly half the gain: K1 +46..+80 %).
+#   c = 128: K1 only (the output stage's one-tile item is the substrate's typed decline there), on the buckets whose pick is the pass-MAJOR order:
+#            +43 / +44 / +53 / +53 % (bias off) and +45 / +45 / +49 / +53 % (bias on) at N 512 x 1 / 256 x 4 / 1024 x 4 / 768 x 1 (65 -> 45 us at 512 x 1
+#            off; 1000 x 3, CLEAN windows) -> ln_once="block" on the 512 / 768 / 1024 floors and on the (256, B >= 4) refinement (whose order is major);
+#            the buckets picking the INTERLEAVED order (256 x 1, 384) cannot take the lever as is (the pass must live inside the item: a typed decline) --
+#            the candidate there is ln_once="block" + the major order, measured against the interleaved pick before it enters this table.
 def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str, ln_once: str = "") -> TriMulKnobs:
     """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`; the LayerNorm-once item ``ln_once`` is OFF
     unless a bucket's A/B/A set it)."""
@@ -228,22 +242,22 @@ def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, l
 # the hoisted-load half alone (packed_hoist) -0.16..+0.47 % everywhere: neutral
 _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     128: (
-        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "transpose", 1, "smem_rolled", "packed")),
-        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold")),
-        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold")),
+        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "transpose", 1, "smem_rolled", "packed", ln_once="block")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold", ln_once="block")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold", ln_once="block")),
         (384, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 1, "smem_rolled", "packed")),
         (256, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 2, "smem_rolled", "packed")),
         (129, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed")),
         (0, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed")),
     ),
     256: (
-        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
-        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
-        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
-        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
-        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
-        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed")),
-        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed")),
+        (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (129, _pick(k2.DESIGN_TILE_CONFIG, "major", "mn_major", 1, "smem_rolled_pf", "packed", ln_once="block")),
+        (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", ln_once="block")),
     ),
 }
 
@@ -259,6 +273,8 @@ _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
 #                                             REGISTER LN form: the rolled re-read form loses 1.8 / 1.7 % against the packed-only pick on
 #                                             this cell (standalone K1, two passes; the same work as N = 512 B = 1, where it loses 1.8 / 1.4 %)
 #                                             while B = 1 gains 3.7 / 3.7 %
+#                                             and the LayerNorm-ONCE item (ln_once="block": +43.8 / +45.2 % standalone K1, bias off / on; the bucket's
+#                                             B = 1 pick is the interleaved order, which the lever declines)
 #   c = 128, 384 <= N < 512, B = 1:           ring depth 4   +1.02 / +1.04 % (as base +0.93 / +1.04 %; B = 4 loses 1.9 %)
 #   c = 128, 512 <= N < 768, B >= 4:          ROLLED LN form +0.7 / +0.7 % over the packed-only pick (standalone K1, two passes; B = 1 loses
 #                                             1.8 / 1.4 % -- the sign follows the amount of work: 512 x 4 computes the rows of 1024 x 1, where
@@ -277,6 +293,7 @@ _REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]
         (256, 4, None, TriMulKnobs(clc_stages=1)),
         (256, 4, None, TriMulKnobs(k1_pass_order="major")),
         (256, 4, None, TriMulKnobs(ln_pass_form="registers")),
+        (256, 4, None, TriMulKnobs(ln_once="block")),
         (384, 1, None, TriMulKnobs(clc_stages=4)),
         (512, 4, None, TriMulKnobs(ln_pass_form="smem_rolled")),
         (256, 4, None, TriMulKnobs(epi_math="packed_biasfold")),

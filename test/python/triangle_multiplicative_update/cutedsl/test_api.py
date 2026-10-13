@@ -698,6 +698,31 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     with pytest.raises(ValueError, match="ln_once"):
         th.validate_knobs(th.TriMulKnobs(ln_once="tile"))
     assert th.resolve(512, 256, 1, "outgoing", knobs=th.TriMulKnobs(ln_once="block")).ln_once == "block"
+    # the measured default (T27, the 212-SM Rubin class): every c = 256 bucket runs the LayerNorm-once BLOCK item (K1 +64..+139 %, K3 +31..+68 % standalone,
+    # both bias arms, bitwise); the c = 128 buckets keep today's item until their own A/B/A lands a value
+    for n in (33, 128, 217, 256, 384, 512, 768, 1024, 2048):
+        for b in (1, 4):
+            for d in ("outgoing", "incoming"):
+                assert th.recommend(n, 256, b, d).ln_once == "block", (n, b, d)
+    assert th.resolve(512, 256, 1, "outgoing", knobs=th.TriMulKnobs(ln_once="")).ln_once == ""  # a caller's "" over the pick = today's item
+    # c = 128: the pass-MAJOR buckets (N >= 512; 256 x B >= 4 by its refinement) run the block item (+43..+53 % standalone K1); the interleaved
+    # buckets (256 x 1, 384) keep today's item until their major-order candidate is measured against the interleaved pick
+    for n, b, want in (
+        (512, 1, "block"),
+        (768, 1, "block"),
+        (1024, 4, "block"),
+        (2048, 1, "block"),
+        (256, 4, "block"),
+        (512, 4, "block"),
+        (256, 1, ""),
+        (384, 1, ""),
+        (384, 4, ""),
+        (128, 1, ""),
+        (33, 1, ""),
+    ):
+        kn = th.recommend(n, 128, b, "outgoing")
+        assert kn.ln_once == want, (n, b, kn)
+        assert not (kn.ln_once and kn.k1_pass_order != "major"), (n, b, kn)  # the lever never meets the interleaved order in a pick
     assert (
         tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512, cz=256), "outgoing", c_hidden=256, knobs=tapi.TriMulKnobs(ln_once="block"))._k3_ln_once() == "block"
     )
