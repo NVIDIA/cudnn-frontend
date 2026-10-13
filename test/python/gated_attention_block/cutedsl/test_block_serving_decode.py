@@ -8,7 +8,7 @@ partials in the workspace, the sigmoid gate in the split COMBINE under ``fuse_ga
 CTA) past the packed route up to 32 rows, and a typed decline beyond (no wider dense step has a kernel over the pools).
 
 Host cells (any device, the declaration cells even on the CPU): the constants and the route table per ``(group, S_q)`` at the
-four served groups (16 = 32 / 2, 12 = 24 / 2, 8 = 8 / 1, 6 = 24 / 4) against the design's table; the static
+four served groups (16 = 32 / 2, 12 = 24 / 2, 8 = 8 / 1, 6 = 24 / 4) against the module's route table; the static
 ``serving_envelope`` -- every decline the declaration raises is predicted by it, on this part and on a Rubin reading; the
 declaration rows (typed, naming the feature); the declaration FACTS (route, split, where the gate runs, the stage list, the
 capture-safe projections); the execute-time refusals on an UNCOMPILED block -- the Q-side length tensor ``seq_lens`` REFUSED
@@ -78,11 +78,11 @@ _ROPE = 64
 _GROUPS = {16: (32, 2), 12: (24, 2), 8: (8, 1), 6: (24, 4), 4: (4, 1)}
 _D_MODEL = 512
 _LAYOUTS = SERVING_POOL_LAYOUTS
-# The route table the ADAPTER applies, (group, S_q) -> (N_Q, token units, packed): the PACKED route (the design's table, M0D 2.4 /
-# PLAN 2.3 -- the claimed envelope S_q <= 4 at every group; 8 / 1 rides the packed tile to S_q 8, 24 / 4 to S_q 10), then the
+# The route table the ADAPTER applies, (group, S_q) -> (N_Q, token units, packed): the PACKED route (the docs' decode route table
+# -- the claimed envelope S_q <= 4 at every group; 8 / 1 rides the packed tile to S_q 8, 24 / 4 to S_q 10), then the
 # adapter's UNPACKED arm (pack_g = 1: one head per CTA, one unit, S_q <= 16 on the 16-column tile, <= 32 on the 32-column one),
-# then NOTHING: a dense step past 32 rows has no kernel over the pools (the adapter's decline -- the design's "the prefill kernel
-# serves past the route" was wrong on both counts: the prefill body serves PACKED queries, the EXTEND form).
+# then NOTHING: a dense step past 32 rows has no kernel over the pools (the adapter's decline -- an earlier reading, "the prefill kernel
+# serves past the route", was wrong on both counts: the prefill body serves PACKED queries, the EXTEND form).
 _ROUTE_TABLE = {
     16: {
         1: (16, 1, True),
@@ -796,7 +796,7 @@ def test_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
 @requires_rubin
 def test_s_q_five_rides_the_unpacked_tile_at_sixteen_and_twelve_and_the_packed_tile_at_eight_and_six():
     """Past the PACKED route (S_q = 5 at 32 / 2 and 24 / 2) the adapter's rule rides the decode tile UNPACKED -- one head per
-    CTA (HEADS_PER_TILE 1), one token unit -- not the prefill body the design's table named; at 8 / 1 and 24 / 4 the packed
+    CTA (HEADS_PER_TILE 1), one token unit -- not the prefill body an earlier route table named; at 8 / 1 and 24 / 4 the packed
     tile's second token unit serves it, at 4 / 1 one unit of the 32-column tile (20 packed rows).  Every arm declared by the
     route and pinned on the compiled module."""
     for group in sorted(_GROUPS):
@@ -810,7 +810,7 @@ def test_past_thirty_two_rows_the_step_is_a_typed_decline_the_envelope_predicts(
     """A dense step wider than the 32-column tile has no kernel over the pools on this part (the adapter: "Rubin paged KV serves
     half THD queries, MXFP8 pools on D128 / D256, and decode-shaped half D256 graphs on the decode tile"): the route says not
     served with the reason (the EXTEND form), the declaration raises it, the envelope predicts it -- no silent fall-through to
-    a prefill body the design's table assumed."""
+    a prefill body an earlier route table assumed."""
     for group in sorted(_GROUPS):
         geom, _ = _geom(group)
         r = decode_route(geom, DECODE_MAX_ROWS + 1)
@@ -891,7 +891,7 @@ def test_ring_wrap_and_tail_lengths(lens):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
 @pytest.mark.parametrize("page", SERVING_PAGE_SIZES)
 def test_l1_l2_l3_pools_are_bitwise_on_the_decode_tile_at_every_page_size(page, dtype):
-    """R-KV1 on the decode tile, the tracker's matrix: the three stride patterns holding the same values give a BITWISE ``out``
+    """The pool-layout matrix on the decode tile (the tracker's matrix): the three stride patterns holding the same values give a BITWISE ``out``
     at pages 16 / 32 / 64 / 128, bf16 and f16 (f16 on the unfused norm + RoPE), and each matches the oracle."""
     outs = {}
     for layout in _LAYOUTS:
@@ -906,7 +906,7 @@ def test_l1_l2_l3_pools_are_bitwise_on_the_decode_tile_at_every_page_size(page, 
 
 @requires_rubin
 def test_padded_entries_yield_exact_zero_and_write_nothing_to_block_zero():
-    """R-KV3 / the serving stacks' padded full-graph entry: ``kv_lens = 0`` + block table row 0 + slot -1 at EVERY padded
+    """The serving stacks' padded full-graph entry: ``kv_lens = 0`` + block table row 0 + slot -1 at EVERY padded
     position of a batch (first, middle, last), ``out`` rows exactly 0, block 0's bytes untouched, nothing written anywhere
     for the padded tokens (the live entries' rows are the only finite ones)."""
     lens = (0, 300, 0, 129, 0)
@@ -928,7 +928,7 @@ def _written(pool):
 
 @requires_rubin
 def test_a_block_table_row_slice_at_an_arbitrary_row_stride_binds_as_a_view():
-    """R-KV4: the serving stack's table is ``[num_reqs, max_blocks_per_req]`` and the decode batch's rows are a SLICE of it;
+    """A block-table row slice: the serving stack's table is ``[num_reqs, max_blocks_per_req]`` and the decode batch's rows are a SLICE of it;
     the block declares and binds that view (its row stride compiled in) -- bitwise the compact table."""
     lens = (300, 0, 500, 77)  # 32 pages at most: the 37-wide table rows leave 5 unused columns past the declared max_pages
     compact = _case(("rowstride", "compact"), 16, 3, lens, seed=5)

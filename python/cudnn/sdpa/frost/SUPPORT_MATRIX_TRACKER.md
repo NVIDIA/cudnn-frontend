@@ -2641,7 +2641,7 @@ against the declared route (template, packing, split, `epilogue_gate` False):
 
 The CLAIMED envelope (`DecodeRoute.claimed`) is the packed tile at `S_q <= 4`; the packed route reaches `S_q = 8` at 8 / 1,
 `S_q = 10` at 24 / 4 and `S_q = 16` at 4 / 1 and the unpacked tile `S_q = 32` at every group -- routed, declared by the envelope,
-correct on the cells run, unmeasured (QS09). The pool matrix on the decode tile (R-KV1: the three stride patterns holding the
+correct on the cells run, unmeasured (the serving perf cells). The pool matrix on the decode tile (the three stride patterns holding the
 same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0 / 77 / 1000 at 24 / 2, `S_q = 2`):
 
 | form | pool layout | page 16 | page 32 | page 64 | page 128 |
@@ -2655,7 +2655,7 @@ same split and packing; paged == dense BITWISE (O and LSE) at the unsplit plan o
 adapter has no split); split == unsplit within the combine's derived two-term budget on the pre-gate O (max |diff| / budget
 0.26 at 32 / 2 and 0.16 at 8 / 1; the fp32 LSEs to 1e-5); the gate in the combine vs the separate gate launch at the same split
 within the stated one-rounding budget (max |diff| on O 9.766e-04 bf16 / 1.221e-04 f16 at split 2, 0.73 / 0.83 of the budget; `out` cos > 0.9999 between them);
-a block table that is a row SLICE of a wider table (row stride 37) bitwise the compact table (R-KV4); `kv_lens` 128 / 384 / 512 /
+a block table that is a row SLICE of a wider table (row stride 37) bitwise the compact table (a block-table row slice); `kv_lens` 128 / 384 / 512 /
 1024 (one tile, the ring depth, four, eight) and an entry whose whole content is the step (`kv_lens == S_q`); the FIRST execute
 of a fresh declaration captured on a new stream with no warm-up under `set_sync_debug_mode("error")` (the capture launches
 nothing, the replay bitwise the eager run; the replay over new `kv_lens` / table / slots / inputs bitwise the eager run over them);
@@ -2684,4 +2684,4 @@ the route table -- its rows of the route table); 16 / 1 rides group 16's route w
 `S_q`, pinned on the CPU. The shards' `S_q > 1` decode steps and every page / layout cell beyond the ones named are functional
 claims only -- no perf claim before the serving perf cells land.
 
-Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows (the DECODE form's `decode_rows` row: the EXTEND form's packed business), `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before QS09.
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows (the DECODE form's `decode_rows` row: the EXTEND form's packed business), `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before the serving perf cells land.
