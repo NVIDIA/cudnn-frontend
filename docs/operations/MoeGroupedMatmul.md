@@ -89,6 +89,15 @@ token data. Token SFA in `F8_128x4` is not supported for GATHER. Weight scale
 factors (SFB) retain the per-expert `F8_128x4` layout. These public operand
 roles and layout requirements also apply with `SWAP_AB=1`.
 
+For all block-scaled FROST MoE modes, bind weight SF as a rank-3 byte buffer
+with E as its outermost axis. Each expert plane must be a dense packed
+`F8_128x4` blob containing at least
+`512 * ceil(N/128) * ceil((K/block)/4)` bytes. Its two inner axes may be
+permuted. The expert stride must be a multiple of 16 bytes and at least the
+full inner-plane byte span; padding between experts is supported. The base
+pointer must also be 16-byte aligned. Views that interleave experts, overlap
+planes, or expose insufficient plane capacity raise `ValueError` before launch.
+
 ```python
 fc1 = graph.moe_grouped_matmul(
     token, weight, first_token_offset,
