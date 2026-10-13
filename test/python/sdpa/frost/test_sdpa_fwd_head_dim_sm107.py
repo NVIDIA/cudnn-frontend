@@ -246,7 +246,7 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     assert heuristics._auto_sched_cga(spec, _facts(d_qk=24, d_v=24, has_score_max=True, has_score_sum_exp=True), split_kv=1, sched_policy=0) == (0, 2)
     # a cga nobody serves is still a typed decline naming the domain of the flavor it would land on
     why = engines.mismatch(caps, f24, SdpaFwdKnobs(cga=3))
-    assert why is not None and "cga=3" in why and "[2]" in why, why
+    assert why is not None and "cga=3" in why and "[1, 2]" in why, why
 
 
 def test_one_constant_feeds_the_row_the_adapter_and_the_factory():
