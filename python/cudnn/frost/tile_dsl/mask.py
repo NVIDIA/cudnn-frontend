@@ -384,17 +384,18 @@ def compute_q_loop_bounds(
     return QLoopBounds(lo=lo, hi=hi)
 
 
+@cute.jit
 def q_tile_kv_hi(
-    q_tile,
-    seqlen_q,
-    seq_kv_len,
-    kv_last,
-    mask_flags: int,
-    tile_q: int,
-    tile_kv: int,
-    bottom_right: bool = False,
-    window_right=0,
-):
+    q_tile: cutlass.Int32,
+    seqlen_q: cutlass.Int32,
+    seq_kv_len: cutlass.Int32,
+    kv_last: cutlass.Int32,
+    mask_flags: cutlass.Constexpr[int],
+    tile_q: cutlass.Constexpr[int],
+    tile_kv: cutlass.Constexpr[int],
+    bottom_right: cutlass.Constexpr[bool],
+    window_right: cutlass.Int32,
+) -> cutlass.Int32:
     """Highest kv tile whose compute_q_loop_bounds range contains ``q_tile``,
     capped at ``kv_last`` (the last kv tile that runs).
 
@@ -402,7 +403,8 @@ def q_tile_kv_hi(
     ``(k * tile_kv - diag - window_right) // tile_q <= j``.  The window only
     removes LOW kv tiles, so it does not move this bound.  The backward's
     deterministic dQ relay counts turns down from it.  Meaningless for a q tile
-    no kv tile visits (nobody relays on it).
+    no kv tile visits (nobody relays on it).  ``@cute.jit`` because the relay
+    calls it inside the kernel's dynamic q loop.
     """
     hi = kv_last
     if cutlass.const_expr(mask_flags & MASK_CAUSAL):
