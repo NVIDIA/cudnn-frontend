@@ -1001,6 +1001,48 @@ def test_backward_deterministic_workspace_contract(ratio, coff):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("lens", [[8], [2]], ids=["nonempty", "empty"])
+def test_backward_atomic_rejects_workspace_before_launch(monkeypatch, lens):
+    """An atomic plan rejects deterministic scratch before launch or stream recording."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, ratio, coff = 128, 4, 2
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs(lens, d, ratio, coff)
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+    bwd = compressor.CSACompressorBackward(
+        sample_kv=kv2,
+        sample_score=score2,
+        sample_ape=ape,
+        sample_cu_seqlens=cu,
+        sample_cu_seqlens_comp=cuc,
+        sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+        ratio=ratio,
+        coff=coff,
+        deterministic=False,
+    )
+    assert bwd.check_support()
+    calls = []
+    monkeypatch.setattr(bwd, "_compiled_kernel", lambda *_args: calls.append("kernel"))
+    monkeypatch.setattr(bwd, "_record_streams", lambda *_args: calls.append("record_streams"))
+
+    with pytest.raises(ValueError, match="atomic dAPE path"):
+        bwd.execute(
+            kv2,
+            score2,
+            ape,
+            cu,
+            cuc,
+            go2,
+            torch.empty_like(kv2),
+            torch.empty_like(score2),
+            torch.zeros_like(ape),
+            workspace=torch.empty(1, dtype=torch.uint8, device="cuda"),
+        )
+    assert calls == []
+
+
+@pytest.mark.L0
 @pytest.mark.filterwarnings("ignore::UserWarning")
 @pytest.mark.parametrize("ratio", [2, 4, 128])
 def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):

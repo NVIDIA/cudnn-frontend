@@ -450,8 +450,10 @@ class CSACompressorBackward(_CSACompressorBase):
     aligned, must not overlap any operand, and must have at least the reported
     capacity. ``execute(..., workspace=...)`` launches a fixed-order second-stage
     reduction, and ``grad_ape`` is fully overwritten (so it need not be initialized
-    and graph replays do not accumulate). Incoming gradients on static-capacity
-    padding rows (``[cu_seqlens_comp[-1], total_comp)``) are ignored.
+    and graph replays do not accumulate). The atomic plan requires ``workspace=None``;
+    supplying deterministic scratch to it is rejected rather than changing the
+    compiled reduction. Incoming gradients on static-capacity padding rows
+    (``[cu_seqlens_comp[-1], total_comp)``) are ignored.
     """
 
     def __init__(
@@ -591,7 +593,7 @@ class CSACompressorBackward(_CSACompressorBase):
         current_stream: Optional[cuda.CUstream] = None,
         workspace: Optional[torch.Tensor] = None,
     ) -> None:
-        """Run the compiled backward kernel into the gradient buffers (see class docs)."""
+        """Run the compiled backward kernel with workspace matching the compiled reduction (see class docs)."""
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise ValueError("CSACompressorBackward kernel not compiled")
@@ -607,6 +609,8 @@ class CSACompressorBackward(_CSACompressorBase):
         self._validate_runtime_tensor(grad_kv, "grad_kv", (self.total_tokens, width), torch.bfloat16, device, PTR_ALIGN_BYTES)
         self._validate_runtime_tensor(grad_score, "grad_score", (self.total_tokens, width), torch.bfloat16, device, PTR_ALIGN_BYTES)
         self._validate_runtime_tensor(grad_ape, "grad_ape", (self.ratio, width), torch.float32, device, PTR_ALIGN_BYTES)
+        if not self.deterministic and workspace is not None:
+            raise ValueError("workspace was provided, but this CSACompressorBackward plan uses the atomic dAPE path (deterministic=False)")
         if grad_out.numel() == 0:
             return
         if self.deterministic:

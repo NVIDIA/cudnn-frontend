@@ -130,6 +130,8 @@ policies:
 - `deterministic=False` (default) keeps one fp32 atomic per `(k, dim)` per CTA.
   This fastest path is not bitwise deterministic and raises under strict
   `torch.use_deterministic_algorithms(True)` (warn-only mode warns and runs).
+  Its class plan requires `workspace=None`; workspace never switches a compiled
+  atomic plan to deterministic execution.
 - `deterministic=True` writes each CTA's register-local dAPE sums to caller-owned
   fp32 partial planes and launches a second fixed-order reduction kernel. Ratio 4
   partitions the CTA planes into 32 contiguous ranges: 32 warps sum those ranges in
