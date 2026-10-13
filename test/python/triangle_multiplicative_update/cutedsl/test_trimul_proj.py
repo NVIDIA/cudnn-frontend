@@ -396,7 +396,7 @@ order = params_kw.get("pass_order", "interleaved")  # the K1 tile order of the r
 if arm == "k1":
     p = k1.proj_params(kk, kk, has_bias=has_bias, has_mask=True, want_stats=False, pass_order=order, clc_stages=2, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
 else:
-    p = k3.tail_params(kk, kk, has_bias=has_bias, want_stats=False, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
+    p = k3.tail_params(kk, kk, has_bias=has_bias, want_stats=False, a0_prologue=(order if order in ("mn_major", "transpose") else "mn_major"), ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
 plan = ln_prologue.build_ln_dual_gemm(p)
 print("EXPECT_K", kk)
 """
@@ -425,6 +425,10 @@ _SASS_SPLIT_HINT_PINS = {
     ("k1", 128, "registers", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
     ("k1", 128, "smem_rolled", "packed", False, 0, "major"): dict(STL=0, LDL=0, USETMAXREG=0),
     ("k1", 128, "smem_rolled", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
+    # the bias-ON register-form renderings the rule hints with the bias-path epilogue fold (the K3 tuple's last field is its a0_prologue):
+    # allocated their demand either way (0 / 0), the split honoured under the hint
+    ("k1", 128, "registers", "packed_biasfold", True, 0, "major"): dict(STL=0, LDL=0, USETMAXREG=0),
+    ("k1", 128, "registers", "packed_biasfold", True, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
 }
 
 

@@ -732,14 +732,37 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     # rolled form with the next chunk's loads carried one iteration ahead; K1 +2.9..+5.6 %, K3 +20..+34 % over the rolled form on every measured
     # N >= 256 cell of both bias arms, 212-SM Rubin class) + the packed epilogue on every bucket the flip covers; c = 128 runs the packed epilogue
     # everywhere and the rolled form where it measured ahead of the packed-only pick (N 256 at B = 1, N 384, N 512 at B >= 4, N >= 1024), the
-    # register form elsewhere -- the pipelined form's c = 128 sign is mixed by cell (-1.4..+2.6 %) and flips nothing there
+    # register form elsewhere -- the pipelined form's c = 128 sign is mixed by cell (-1.4..+2.6 %) and flips nothing there; the packed
+    # epilogue's BIAS-PATH form `packed_biasfold` (the gate bias folded into the tanh argument's fma) rides on the register-form K1 cells
     for n in (33, 128, 217, 256, 384, 512, 768, 1024, 4096):
         for b in (1, 4):
             assert th.recommend(n, 256, b).ln_pass_form == "smem_rolled_pf" and th.recommend(n, 256, b).epi_math == "packed", (n, b)
-            assert th.recommend(n, 128, b).epi_math == "packed", (n, b)
+            kn = th.recommend(n, 128, b)
+            # the bias-path fold is picked EXACTLY where the projection stage runs the register LayerNorm form at N >= 256 (the
+            # epilogue-bound rendering: +1.0..+1.7 % with the biases; a rolled K1 loses ~0.7 % under it): 768 <= N < 1024, 512 <= N < 768 at
+            # B = 1, 256 <= N < 384 at B >= 4 -- bitwise the packed form, byte-identical to it without biases
+            assert (kn.epi_math == "packed_biasfold") == (kn.ln_pass_form == "registers" and n >= 256), (n, b, kn)
+            assert kn.epi_math in ("packed", "packed_biasfold"), (n, b)
     assert th.recommend(256, 128, 1).ln_pass_form == th.recommend(384, 128, 1).ln_pass_form == th.recommend(384, 128, 4).ln_pass_form == "smem_rolled"
     assert th.recommend(1024, 128, 1).ln_pass_form == th.recommend(1024, 128, 4).ln_pass_form == th.recommend(4096, 128, 1).ln_pass_form == "smem_rolled"
     assert th.recommend(256, 128, 4).ln_pass_form == "registers" and th.recommend(512, 128, 4).ln_pass_form == "smem_rolled"  # the batch-keyed LN forms
+    assert (
+        th.recommend(512, 128, 1).epi_math
+        == th.recommend(768, 128, 1).epi_math
+        == th.recommend(768, 128, 4).epi_math
+        == th.recommend(256, 128, 4).epi_math
+        == "packed_biasfold"
+    )
+    assert (
+        th.recommend(512, 128, 4).epi_math
+        == th.recommend(1024, 128, 1).epi_math
+        == th.recommend(384, 128, 1).epi_math
+        == th.recommend(256, 128, 1).epi_math
+        == "packed"
+    )
+    assert (
+        th.recommend(512, 128, 1, "incoming").epi_math == "packed_biasfold" and th.recommend(128, 128, 1).epi_math == "packed"
+    )  # both directions; N < 256 unmeasured
     for n in (33, 128, 217, 512, 768):
         assert th.recommend(n, 128, 1).ln_pass_form == "registers", n
     assert th.recommend(768, 128, 4).ln_pass_form == th.recommend(128, 128, 4).ln_pass_form == th.recommend(217, 128, 4).ln_pass_form == "registers"
@@ -793,6 +816,9 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     API can build (0 = as shipped unless a measured row says 1), the bias-ON renderings are never hinted, and a caller's `knobs=` value overrides
     the rule for both stages at compile time (pinned on the params the API hands the substrate, GPU-free)."""
     from cudnn.gemm.frost.ln_prologue import LN_PASS_FORMS, EPI_MATHS, MIN_BLOCKS_PER_MP_DOMAIN
+
+    # the measured bias-ON rows: the c 128 register-form renderings running the bias-path epilogue fold (K1 pass-major)
+    _BIAS_ON_ROWS = {("k1", 128, "registers", "packed_biasfold", "major")}
     from cudnn.triangle_multiplicative_update import heuristics as th
 
     assert th.MIN_BLOCKS_PER_MP_DOMAIN == MIN_BLOCKS_PER_MP_DOMAIN == (0, 1)
@@ -808,10 +834,12 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
             for lnf in LN_PASS_FORMS:
                 for epm in EPI_MATHS:
                     for order in PASS_ORDERS + (None,):
-                        assert th.register_split_hint(stage, c, True, lnf, epm, order) == 0, "a bias-ON rendering is never hinted (no measured row)"
+                        assert th.register_split_hint(stage, c, True, lnf, epm, order) == (
+                            1 if (stage, c, lnf, epm, order) in _BIAS_ON_ROWS else 0
+                        ), "a bias-ON rendering is hinted only by its measured row (the exact form)"
                         assert th.register_split_hint(stage, c, False, lnf, epm, order) in MIN_BLOCKS_PER_MP_DOMAIN
     for (stage, c, has_bias, lnf, epm, order), hint in th._REGISTER_SPLIT_HINTS.items():
-        assert stage in ("k1", "k3") and c in (128, 256) and has_bias is False and lnf in LN_PASS_FORMS and epm in EPI_MATHS and hint == 1, (
+        assert stage in ("k1", "k3") and c in (128, 256) and isinstance(has_bias, bool) and lnf in LN_PASS_FORMS and epm in EPI_MATHS and hint == 1, (
             stage,
             c,
             has_bias,
@@ -833,16 +861,24 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     for epm in ("packed_hoist", "packed_biasfold"):
         assert th.register_split_hint("k1", 128, False, "registers", epm, "major") == 1, epm
         assert th.register_split_hint("k1", 128, False, "smem_rolled", epm, "major") == 1, epm
-        assert th.register_split_hint("k1", 128, True, "registers", epm, "major") == 0, epm
+        assert th.register_split_hint("k1", 128, True, "registers", epm, "major") == (1 if epm == "packed_biasfold" else 0), epm  # the bias-ON row names the fold form exactly
         assert th.register_split_hint("k1", 128, False, "smem_rolled", epm, "interleaved") == 0, epm
     assert th.register_split_hint("k1", 128, False, "registers", "scalar", "major") == 0
     assert th.register_split_hint("k1", 128, False, "smem_rolled", "packed", "interleaved") == 0
     assert th.register_split_hint("k3", 256, False, "smem_rolled", "packed") == 0
-    assert th.register_split_hint("k1", 128, True, "registers", "packed", "major") == 0
+    assert th.register_split_hint("k1", 128, True, "registers", "packed", "major") == 0  # the packed form with biases: no row
+    assert th.register_split_hint("k1", 128, True, "registers", "packed_biasfold", "major") == 1
+    assert th.register_split_hint("k3", 128, True, "registers", "packed_biasfold") == 0
+    assert th.register_split_hint("k1", 128, True, "smem_rolled", "packed_biasfold", "major") == 0  # a rolled K1 with biases: inside the bar
     # the API's wiring, GPU-free: a bare declaration hands the two stages the rule with THEIR bias flags (K1 its tile order), the knob overrides both
     assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=False)._register_split_hints() == (1, 0)
     assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=1024), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=True)._register_split_hints() == (1, 0)
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=False)._register_split_hints() == (0, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=False)._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True)._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=1024), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True)._register_split_hints() == (
+        0,
+        0,
+    )  # rolled K1, packed K3
     assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256), "outgoing", c_hidden=128, has_in_bias=False)._register_split_hints() == (0, 0)  # interleaved K1
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=512, cz=256), "outgoing", c_hidden=256, has_in_bias=False, has_out_bias=False

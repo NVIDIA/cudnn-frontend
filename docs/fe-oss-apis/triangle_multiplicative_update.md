@@ -148,7 +148,12 @@ value of every domain computes the same function (bitwise; the tests pin it). On
 LayerNorm-prologue stages' `.minnctapersm` launch hint (0 = the rendering as shipped, whose register split ptxas drops; 1 = the hint under
 which ptxas honours it), is resolved per RENDERING by `heuristics.register_split_hint(stage, c, has_bias, ln_pass_form, epi_math)` from the
 measured rows -- whether a rendering spills at the flat allocation depends on its bias arm and forms, not on N or B -- and a `knobs=` value
-overrides it for both stages.
+overrides it for both stages.  The epilogue arithmetic form has a bias-path member, `epi_math="packed_biasfold"` (the gate bias staged
+halved and folded into the tanh argument's fused multiply-add: 16 fewer packed adds per 32-channel subtile per lane; output-bitwise the
+`packed` form, and byte-identical to it when the stage has no biases), which the table picks where the projection stage runs the register
+LayerNorm form at N >= 256 (+1.0..+1.7 % on the whole call with the biases on the 212-SM Rubin class; a rolled-form projection stage loses
+~0.7 % under it, so those cells keep `packed`); `"packed_hoist"` (the bias loads issued ahead of the TMEM loads) is admitted as a knob and
+measured neutral.
 
 ## Traffic model and measured performance
 

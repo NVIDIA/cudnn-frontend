@@ -193,11 +193,21 @@ def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, l
     )
 
 
+# THE BIAS-PATH EPILOGUE FORM (`epi_math="packed_biasfold"`: the gate bias staged halved and folded into the tanh argument's fma, -16 FADD2 per
+# 32-channel subtile per lane on the renderings WITH biases; OUTPUT-BITWISE the packed form; byte-identical to it WITHOUT biases), measured as a
+# whole-call A/B/A on one exclusive GPU of the 212-SM Rubin perf-node class (lock 2376; in-process arm + control twins, slots shuffled, graph
+# replay >= 100 x 3, the arm bitwise the base on every cell, the fp64 oracle within its element budget).  Its sign follows the projection
+# stage's RENDERING, not N or B: a WIN wherever K1 runs the `registers` LayerNorm form (the epilogue-bound rendering), a LOSS of ~0.7 % wherever
+# K1 runs a rolled form -- so the pick below follows the LayerNorm form per (bucket, batch): the 768 bucket (both batches) and the 512 bucket
+# at B = 1 take the fold, the (512, B >= 4) refinement (rolled K1) keeps `packed`, the (256, B >= 4) refinement (register K1) takes the fold;
+# the 1024 and 384 buckets (rolled K1), the 256 bucket at B = 1 (interleaved rolled, neutral) and the unmeasured N < 256 buckets keep `packed`.
+# the fold vs the shipped pick (whole call, bias ON, one exclusive GPU of the 212-SM Rubin perf-node class): 512:128:1 +1.08 % outgoing / +0.98 % incoming, 768:128:1 +1.62 %, 256:128:4 +1.07 %, 768:128:4 +1.73 % (register-form K1: WIN); 1024:128:1 -0.68 %, 512:128:4 -0.68 %, 1024:128:4 -0.63 %, 384:128:4 -0.91 % (rolled-form K1: LOSS -- the CUPTI split puts it in K1, 260 -> 268 us at 1024:128:1, K3 gains 222 -> 218); 256:128:1 +0.06 %, 384:128:1 +0.23 % (interleaved: NEUTRAL); the 11 bias-OFF twins -0.12..+0.07 % (byte-identical renderings)
+# the hoisted-load half alone (packed_hoist) -0.16..+0.47 % everywhere: neutral
 _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
     128: (
         (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "transpose", 1, "smem_rolled", "packed")),
-        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed")),
-        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed")),
+        (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold")),
+        (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold")),
         (384, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 1, "smem_rolled", "packed")),
         (256, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 2, "smem_rolled", "packed")),
         (129, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed")),
@@ -231,6 +241,10 @@ _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
 #                                             1.8 / 1.4 % -- the sign follows the amount of work: 512 x 4 computes the rows of 1024 x 1, where
 #                                             the rolled form wins too)
 #   c = 256, N <= 128, B >= 4:                ring depth 1   +0.53 / +0.57 % (as base +0.59 / +0.71 %; B = 1 loses 3.4 %)
+#   c = 128, 256 <= N < 384, B >= 4:          the BIAS-PATH epilogue fold (`packed_biasfold`) +1.07 % on the whole call with the biases (this
+#                                             cell's K1 is the register form; the B = 1 cell's interleaved rolled K1 is neutral, +0.06 %)
+#   c = 128, 512 <= N < 768, B >= 4:          `packed` kept over the bucket's fold pick: -0.68 % with the biases on this cell's ROLLED K1
+#                                             (B = 1, the register form, +1.08 / +0.98 % outgoing / incoming)
 # Not adopted: the 1-CTA tile with B multicast at c = 128, 256 <= N < 384, B = 1 -- +0.5..+0.6 % over the pair tile as an arm in three passes but
 # +0.26 % inside a 0.53 % control spread when measured as the base (a light-load cell at the 2352 MHz step); the pair tile stays, the residue is
 # at most 0.6 % on those two cells.
@@ -242,6 +256,8 @@ _REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]
         (256, 4, None, TriMulKnobs(ln_pass_form="registers")),
         (384, 1, None, TriMulKnobs(clc_stages=4)),
         (512, 4, None, TriMulKnobs(ln_pass_form="smem_rolled")),
+        (256, 4, None, TriMulKnobs(epi_math="packed_biasfold")),
+        (512, 4, None, TriMulKnobs(epi_math="packed")),
     ),
     256: ((0, 4, None, TriMulKnobs(clc_stages=1)),),
 }
@@ -296,12 +312,15 @@ def default_k_block(n_res: int) -> int:
 # production rendering's cubin byte-identical to the one measured before the axis existed.
 # Keyed (stage, width, has_bias, ln_pass_form, epi_math, pass_order) -- the projection stage's tile ORDER is part of the rendering (the `interleaved` K1
 # renderings carry 4 STL / 13 LDL of role-prologue values UNDER the hint where the `major` ones carry none); the output stage has no order (None).
-# MEASURED ROWS (the A/B/A of the rule as it lands, bias OFF only -- the bias-ON renderings are allocated their demand and never hinted):
+# MEASURED ROWS (the A/B/A of the rule as it lands; the bias-OFF rows first, then the bias-ON rows of the c 128 register-form renderings that run
+# the bias-path epilogue fold -- a bias-ON rendering is allocated its demand (no spill either way), and the honoured split still pays there):
 # the projection stage at c 128 with the pass-MAJOR tile order (the heuristics' pick from N = 512 and at 256 B 4): whole-call A/B/A on one exclusive GPU of the 212-SM Rubin perf-node class (lock 2376), in-process arm + control twins, 100-400 x 3 graph replay, two passes with the same sign -- the register form +1.6 / +1.5 / +1.7 / +1.8 % at 512:128:1 / 256:128:4 / 768:128:1 / 768:128:4 (its 1 / 1 STACK-8 spill gone; K1 itself +3.8 %), the rolled form +1.1..+1.2 % at 1024:128:1 / 512:128:4 / 1024:128:4 (REG 80 flat -> the 232 / 24 split, no spill either way; K1 +2.5 %);
-# NOT a row: the INTERLEAVED rolled projection renderings (N 256 B 1, 384) -0.1..-0.7 % (4 / 13 role-prologue spills under the hint), the output stage at c 256 bias off -0.1 / -0.1 / +0.0 % (its 5 / 7 epilogue spills vanish, the kernel time does not move: 298 vs 297 us -- the bias-off deficit against the bias-on body is elsewhere), every bias-ON rendering (never hinted; the identity controls +0.0 %).
+# NOT a row: the INTERLEAVED rolled projection renderings (N 256 B 1, 384) -0.1..-0.7 % (4 / 13 role-prologue spills under the hint), the output stage at c 256 bias off -0.1 / -0.1 / +0.0 % (its 5 / 7 epilogue spills vanish, the kernel time does not move: 298 vs 297 us -- the bias-off deficit against the bias-on body is elsewhere), the bias-ON renderings NOT named below (the identity controls +0.0 %; the rolled-form K1 bias-on cells +0.33 / +0.35 % under the hint = inside the bar).
+# the hint rows (whole call, bias ON, the same node class): the K1-only row +2.57 / +2.39 / +2.52 / +2.52 % at 512:128:1 / 768:128:1 / 256:128:4 / 768:128:4 (the CUPTI split: K1 71.8 -> 68.1 us = -5.2 %, K3 unchanged), +0.23 / +0.26 % on the rolled-form K1 cells 1024:128:1 / 512:128:4 (inside the bar), -1.15 % on the interleaved 384:128:4 (role-prologue spills under the split, as at bias off); the K3-only row -0.10..+0.11 % on every cell (neutral: not a row); both stages hinted together +2.37..+2.61 % = the K1 row's gain
 _REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str]], int] = {
     ("k1", 128, False, "registers", "packed", "major"): 1,
     ("k1", 128, False, "smem_rolled", "packed", "major"): 1,
+    ("k1", 128, True, "registers", "packed_biasfold", "major"): 1,
 }
 
 
@@ -313,7 +332,7 @@ def register_split_hint(stage: str, channels: int, has_bias: bool, ln_pass_form:
         raise ValueError(f"stage must be 'k1' or 'k3', got {stage!r}")
     order = (str(pass_order) if pass_order is not None else None) if stage == "k1" else None
     # the rows are keyed by RENDERING: the three packed epilogue forms differ only under `has_bias` and render ONE cubin without biases, so a
-    # bias-off lookup reads the family's row (`EPI_MATHS_PACKED`); a bias-on rendering is never hinted, whichever form it runs
+    # bias-off lookup reads the family's row (`EPI_MATHS_PACKED`); a bias-on rendering is hinted only by a row naming its EXACT form
     epm = "packed" if (not has_bias and str(epi_math) in EPI_MATHS_PACKED) else str(epi_math)
     return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), epm, order), 0)
 
