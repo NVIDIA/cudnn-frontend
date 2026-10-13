@@ -43,6 +43,7 @@ from cudnn.gated_attention_block import (
     KV_SOURCE_SELF,
     SERVING_PAGE_SIZES,
     SERVING_POOL_LAYOUTS,
+    DecodeEnvelope,
     ExtendEnvelope,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
@@ -1104,13 +1105,33 @@ def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
         assert lay.engine_scratch >= o_hi
 
 
+def _declare_dense_sparse_paged():
+    """A DENSE paged declaration on a QsaSpec geometry: the serving table's `sparse` row (the packed form meets the sparse declaration's
+    own thd=True refusal first, so the dense form is the one that reaches the row)."""
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    return GatedAttentionBlockFwd(
+        mk(1, 16, geom.d_model),  # S <= 32: the decode_rows row sits before the sparse row
+        mk(geom.n_qkvg, geom.d_model),
+        mk(geom.d_head),
+        mk(geom.d_head),
+        mk(1, 16, geom.rope_dim),
+        mk(1, 16, geom.rope_dim),
+        mk(geom.d_model, geom.h_q * geom.d_head),
+        mk(1, 16, geom.d_model),  # S <= 32: the decode_rows row sits before the sparse row
+        geom,
+        paged_kv_page_size=16,
+        kv_source=KV_SOURCE_PAGED,
+    )
+
+
 def test_extend_typed_declines_match_the_envelope_row_by_row():
     """Every row of the EXTEND declines table is reachable at declaration with exactly the message the envelope publishes for it --
     the CPU proof that no declaration-time decline escapes ``serving_envelope``."""
     import re
 
     env = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
-    assert isinstance(env, ServingEnvelope) and isinstance(env.extend, ExtendEnvelope) and env.decode is None
+    assert isinstance(env, ServingEnvelope) and isinstance(env.extend, ExtendEnvelope) and isinstance(env.decode, DecodeEnvelope)
     names = [name for name, *_ in _EXTEND_DECLINES]
     assert set(env.extend.declines) == set(names) and len(names) == len(set(names))
     assert env.extend.requires and env.extend.page_sizes == SERVING_PAGE_SIZES == (16, 32, 64, 128) and env.extend.pool_layouts == SERVING_POOL_LAYOUTS
@@ -1119,8 +1140,10 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
     d128 = dict(_EXTEND_GEOM, d_head=128, d_model=256)
     trips = {
         "write_through": lambda: _declare_extend_with(2, 128, good, page=0),
-        "dense_declaration": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
+        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py); past the decode tile's 32 rows it is this row
+        "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
+        "sparse": _declare_dense_sparse_paged,
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
         "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
@@ -1138,7 +1161,7 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
     cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
     assert env.device_cc == cc
     if cc == (10, 7):
-        assert env.extend.served and env.forms == ("extend",) and env.extend.reason is None and env.cutedsl_ok
+        assert env.extend.served and env.forms == ("extend", "decode") and env.extend.reason is None and env.cutedsl_ok
         fp32 = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.float32, _DEV)
         assert not fp32.extend.served and "bf16 / f16" in fp32.extend.reason
         for geom_kw, row in ((dict(_EXTEND_GEOM, window_left=64), "window"), (_SMALL_D256, "diagonal"), (d128, "head_dim")):

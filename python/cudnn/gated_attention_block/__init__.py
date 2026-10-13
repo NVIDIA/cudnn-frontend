@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .api import (
+    DECODE_MAX_ROWS,
+    DECODE_MAX_S_Q,
     KV_SOURCE_PAGED,
     KV_SOURCE_SELF,
     QKVG_TILE_ALIGN,
     SERVING_PAGE_SIZES,
     SERVING_POOL_LAYOUTS,
+    DecodeEnvelope,
+    DecodeRoute,
     ExtendEnvelope,
     Fp4Format,
     GatedAttentionBlockFwd,
@@ -18,6 +22,7 @@ from .api import (
     SavedForBackward,
     ServingEnvelope,
     build_fused_qkvg_weight,
+    decode_route,
     gated_attention_block_forward,
     index_k_raw_view,
     qkvg_from_hf,
@@ -31,11 +36,15 @@ from .api_bwd import (
 )
 
 __all__ = [
+    "DECODE_MAX_ROWS",
+    "DECODE_MAX_S_Q",
     "KV_SOURCE_PAGED",
     "KV_SOURCE_SELF",
     "QKVG_TILE_ALIGN",
     "SERVING_PAGE_SIZES",
     "SERVING_POOL_LAYOUTS",
+    "DecodeEnvelope",
+    "DecodeRoute",
     "ExtendEnvelope",
     "Fp4Format",
     "GatedAttentionBlockBwd",
@@ -49,6 +58,7 @@ __all__ = [
     "SavedForBackward",
     "ServingEnvelope",
     "build_fused_qkvg_weight",
+    "decode_route",
     "gated_attention_block_backward",
     "gated_attention_block_forward",
     "index_k_raw_view",

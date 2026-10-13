@@ -2048,7 +2048,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 
 | Missing | Where |
 |---|---|
-| Gated attention block (frontend-only, no graph form): the DECODE form (a dense `S_q <= 4` declaration over the pools), e4m3 (`kv_cache_dtype`) pools, the write-through folded into the projection epilogue, an LSE / a window / a `QsaSpec` on the EXTEND form | SM107 -- the block's paged KV-cache WRITE-THROUGH (`paged_kv_page_size`: bf16 / f16, dense and packed) AND the EXTEND form (`kv_source="paged"` + `token_capacity`: the packed step's attention over the pools through `block_table` / `kv_lens` on the bottom-right diagonal) are served on HND / NHD / unified-row pools at pages 16 / 32 / 64 / 128 (the `Rubin d256 gated attention block -- serving forms` section below); a dense `kv_source="paged"` declaration is the typed `dense_declaration` decline until the DECODE form lands |
+| Gated attention block (frontend-only, no graph form): e4m3 (`kv_cache_dtype`) pools, the write-through folded into the projection epilogue, an LSE / a window / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows | SM107 -- the block's paged KV-cache WRITE-THROUGH (`paged_kv_page_size`: bf16 / f16, dense and packed), the EXTEND form (`kv_source="paged"` + `token_capacity`: the packed step's attention over the pools through `block_table` / `kv_lens` on the bottom-right diagonal) AND the DECODE form (`kv_source="paged"` on a dense `[B, S_q <= 4]` block: the Rubin d256 decode tile, PackGQA + split-KV with the gate in the combine; the unpacked tile up to 32 rows declared, unmeasured) are served on HND / NHD / unified-row pools at pages 16 / 32 / 64 / 128, bf16 / f16 (the `Rubin d256 gated attention block -- serving forms` section below) |
 | Backward pass entirely | SM90 |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs; on the d512 row THD, `dense_flex`, the dense padding mask, sink / dSink, bias / dBias, deterministic, decode | SM107 — the three d256 rows plus the d512 2x2-datapath row (`sdpa_bwd_sm107_d512`, opt_in, since 2026-10-01) are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ and ᵇ³) |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the three backward engines there serve exactly those bands (f16/bf16 d = 256 via the 2x2-datapath row ᵇ², opt_in, since 2026-10-01) |
@@ -2615,7 +2615,51 @@ nothing widened): the five spellings the declaration admits -- the `[B]` lengths
 (`inplace_qkv=False`, f16, L3, page 64), a FULL table row (`kv_len = max_pages x P` = 256) on a `[:, :max_pages]` slice of a wider table
 under the lengths form, and a block table WIDER than `max_pages` (`[2, 40]` at the declared row stride 50, `max_pages` 16).
 
-Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the DECODE form (a
-dense `[B, S_q <= 4, d_model]` declaration with `kv_source="paged"`: the `dense_declaration` row), an LSE / a sliding window / a
-`QsaSpec` / another head dim / `fuse_gate` (the paged body carries no gate seam) / `save_for_backward` / `quant` on the EXTEND form, e4m3 pools (`kv_cache_dtype`), the write-through
-folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute.
+**Served since 2026-10-13 -- the DECODE form** (`kv_source="paged"` on a dense `[B, S_q]` declaration over `paged_kv_page_size > 0`:
+the step's tokens written through, then stage (4) over the first `kv_lens[b]` keys of every sequence's `block_table` row --
+`seq_kv_lens = kv_lens`, `seq_q_lens = None`, the batch uniform, bottom-right causal -- on the Rubin d256 DECODE tile
+(`sm107/decode_d256_f16.py`: PackGQA over the whole group, the decode split model's split-KV with fp32 partials in the block's
+workspace and one combine launch, `fuse_gate` applied IN THE COMBINE), the same tile unpacked past the packed route (one head per
+CTA, `S_q <= 32`); a wider dense step is a typed decline at declaration (the adapter serves dense half queries over paged K / V
+on the decode tile only -- the paged prefill body is the EXTEND form's). `GatedAttentionBlockFwd.serving_envelope()` is the static record
+(forms, page sizes, pool layouts, the route per `(group, S_q)`). Validated on a Rubin development node (cc 10.7, 204 SMs;
+functional cells, no perf claim; `test/python/gated_attention_block/cutedsl/test_block_serving_decode.py`) at a shrunk
+`d_model = 512` with `B = 4` batches holding one KV tile with a tail (`kv_lens` 100), the ring depth exactly (384), four tiles
+with a tail (500) and a PADDED entry (`kv_lens = 0`, block table row 0, slot -1) -- `out` within the dense suite's budget of the
+per-sequence fp32 oracle (the block on the full sequence, its last `S_q` rows; the prefix K / V of the pools ARE the oracle's bf16
+rows; cos > 0.999 on every live row, the padded entry's rows EXACTLY 0, block 0's bytes untouched), the compiled kernel pinned
+against the declared route (template, packing, split, `epilogue_gate` False):
+
+| group (`H_q / H_kv`) | `S_q = 1` | `S_q = 2` | `S_q = 3` | `S_q = 4` | `S_q = 5` | `S_q > 32` |
+|---|---|---|---|---|---|---|
+| 16 (32 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline (the EXTEND form) |
+| 12 (24 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline |
+| 8 (8 / 1) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units (declared, unmeasured) ✅ | typed decline |
+| 6 (24 / 4) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
+
+The CLAIMED envelope (`DecodeRoute.claimed`) is the packed tile at `S_q <= 4`; the packed route reaches `S_q = 8` at 8 / 1 and
+`S_q = 10` at 24 / 4 and the unpacked tile `S_q = 32` at every group -- routed, declared by the envelope, correct on the cells run,
+unmeasured (QS09). The pool matrix on the decode tile (R-KV1: the three stride patterns holding the
+same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0 / 77 / 1000 at 24 / 2, `S_q = 2`):
+
+| form | pool layout | page 16 | page 32 | page 64 | page 128 |
+|---|---|---|---|---|---|
+| DECODE `[B, S_q]` over the pools | L1 HND compact | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| DECODE | L2 NHD by strides | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+| DECODE | L3 unified content row (K `+0`, V `+D`) | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ | bf16 ✅ f16 ✅ |
+
+Also validated: the block's form BITWISE the standalone `SdpaFwdDslSm100` on the same slab Q views / pools / table / gate at the
+same split and packing; paged == dense BITWISE (O and LSE) at the unsplit plan on the block's own operands (the padded dense
+adapter has no split); split == unsplit within the combine's derived two-term budget on the pre-gate O (max |diff| / budget
+QS06_SPLIT_RATIO at 32 / 2 and 8 / 1; the fp32 LSEs to 1e-5); the gate in the combine vs the separate gate launch at the same split
+within the stated one-rounding budget (max |diff| on O 9.766e-04 bf16 / 1.221e-04 f16 at split 2, 0.73 / 0.83 of the budget; `out` cos > 0.9999 between them);
+a block table that is a row SLICE of a wider table (row stride 37) bitwise the compact table (R-KV4); `kv_lens` 128 / 384 / 512 /
+1024 (one tile, the ring depth, four, eight) and an entry whose whole content is the step (`kv_lens == S_q`); the FIRST execute
+of a fresh declaration captured on a new stream with no warm-up under `set_sync_debug_mode("error")` (the capture launches
+nothing, the replay bitwise the eager run; the replay over new `kv_lens` / table / slots / inputs bitwise the eager run over them);
+`get_workspace_size()` honest (the split partials inside; a sentinel past it untouched); two launches bitwise; 12 fresh processes
+at `kv_lens = 128 x n_kv`, `n_kv` in {1, 2, 4, 8} (ok 12 / hang 0 / other 0). The tail tile
+READS the pool rows past `kv_lens[b]` (the last page's stale rows, block 0 for unlisted pages) and masks them to `P = 0`: they
+must be FINITE, as a zero-initialized cache's are (a NaN there is `0 x NaN` -- the suite's pools carry a finite sentinel).
+
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows (the DECODE form's `decode_rows` row: the EXTEND form's packed business), `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before QS09.
