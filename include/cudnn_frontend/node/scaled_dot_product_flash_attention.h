@@ -85,7 +85,8 @@ inline std::shared_ptr<Tensor_attributes> sliding_window_mask(
     std::shared_ptr<Tensor_attributes> s_q_ptr,
     std::shared_ptr<Tensor_attributes> s_kv_ptr,
     std::shared_ptr<Tensor_attributes> cu_s_q_ptr = nullptr,
-    std::shared_ptr<Tensor_attributes> cu_s_kv_ptr = nullptr
+    std::shared_ptr<Tensor_attributes> cu_s_kv_ptr = nullptr,
+    bool compile_time_fill = false
 );
 
 inline std::shared_ptr<Tensor_attributes> alibi_mask(
@@ -2441,17 +2442,23 @@ class UnifiedSDPABackwardNode : public SDPABackwardNodeBase<UnifiedSDPABackwardN
             auto cu_s_q_ptr =
                 has_input(input_names::CU_SEQ_LEN_Q) ? attributes.inputs[input_names::CU_SEQ_LEN_Q] : nullptr;
 
-            subgraph_output = attn::score_modifiers::sliding_window_mask(subgraph,
-                                                                         subgraph_output,
-                                                                         attributes.diagonal_alignment,
-                                                                         attributes.left_bound,
-                                                                         attributes.right_bound,
-                                                                         s_q,
-                                                                         s_kv,
-                                                                         s_q_ptr,
-                                                                         s_kv_ptr,
-                                                                         cu_s_q_ptr,
-                                                                         cu_s_kv_ptr);
+            // As a compile-time constant the backend sees the -inf mask fill when it builds the plan and can apply the
+            // masks after the softmax stats subtraction (cuDNN 9.29: earlier backends read a by-value fill only from
+            // the variant pack, which has no entry for a compile-time constant).
+            bool const backend_binds_constant_fill = detail::get_backend_version() >= 92900;
+            subgraph_output =
+                attn::score_modifiers::sliding_window_mask(subgraph,
+                                                           subgraph_output,
+                                                           attributes.diagonal_alignment,
+                                                           attributes.left_bound,
+                                                           attributes.right_bound,
+                                                           s_q,
+                                                           s_kv,
+                                                           s_q_ptr,
+                                                           s_kv_ptr,
+                                                           cu_s_q_ptr,
+                                                           cu_s_kv_ptr,
+                                                           /*compile_time_fill=*/backend_binds_constant_fill);
         }
 
         if (subgraph) {
