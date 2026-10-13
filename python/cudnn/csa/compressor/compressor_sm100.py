@@ -1166,7 +1166,6 @@ def run_bwd(
     dev = kv.device.index
     key = ("bwd", ratio, d, coff, bool(deterministic), dev)
     total_tokens = kv.numel() // (coff * d)
-    partials = (nb_total + _BWD_ROWS - 1) // _BWD_ROWS
     partial_buffer = workspace if deterministic else gape
     if stream_handle is None:
         stream_handle = _raw_stream(dev)
@@ -1211,4 +1210,5 @@ def run_bwd(
             fn(*args)
             _FAST.put(key, fn, args)
         if deterministic:
+            partials = (nb_total + _BWD_ROWS - 1) // _BWD_ROWS
             _run_dape_reduce(workspace, gape, partials, ratio * coff * d, stream_handle, split=ratio == 4)

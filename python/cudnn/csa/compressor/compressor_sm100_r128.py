@@ -1275,7 +1275,6 @@ def run_bwd_r128(
     key = ("r128bwd", ratio, d, coff, schedule, bool(deterministic), dev)
     total_tokens = kv.numel() // (coff * d)
     rows = _bwd_rows_per_cta(nb_total, ratio, d, coff, dev)
-    partials = (nb_total + rows - 1) // rows
     partial_buffer = workspace if deterministic else gape
     if stream_handle is None:
         stream_handle = _raw_stream(dev)
@@ -1322,4 +1321,5 @@ def run_bwd_r128(
             fn(*args)
             _FAST.put(key, fn, args)
         if deterministic:
+            partials = (nb_total + rows - 1) // rows
             _run_dape_reduce(workspace, gape, partials, ratio * coff * d, stream_handle)

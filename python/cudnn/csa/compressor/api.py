@@ -446,10 +446,12 @@ class CSACompressorBackward(_CSACompressorBase):
     The default atomic path requires caller-zeroed ``grad_ape`` before every execute
     or graph replay and raises under strict torch deterministic mode. With
     ``deterministic=True``, ``scratch_workspace_bytes()`` reports the required
-    caller-owned contiguous uint8 scratch, ``execute(..., workspace=...)`` launches a
-    fixed-order second-stage reduction, and ``grad_ape`` is fully overwritten (so it
-    need not be initialized and graph replays do not accumulate). Incoming gradients
-    on static-capacity padding rows (``[cu_seqlens_comp[-1], total_comp)``) are ignored.
+    caller-owned same-device contiguous uint8 scratch. The buffer must be 16-byte
+    aligned, must not overlap any operand, and must have at least the reported
+    capacity. ``execute(..., workspace=...)`` launches a fixed-order second-stage
+    reduction, and ``grad_ape`` is fully overwritten (so it need not be initialized
+    and graph replays do not accumulate). Incoming gradients on static-capacity
+    padding rows (``[cu_seqlens_comp[-1], total_comp)``) are ignored.
     """
 
     def __init__(
@@ -632,7 +634,7 @@ class CSACompressorBackward(_CSACompressorBase):
 
 
 # module-level bounded LRU cache of compiled API instances (thread-safe):
-#   (kind, ratio, head_dim, coff, deterministic, total_tokens, total_comp, n_seg, device) -> api
+#   (kind, ratio, coff, deterministic, head_dim, kv_shape, total_comp, n_seg, device) -> api
 # The compiled kernel underneath is shared per (ratio, head_dim, coff, device) through
 # compressor_sm100's compile cache, so shape changes only rebuild the cheap wrapper
 # object, never the JIT.
@@ -754,9 +756,10 @@ def csa_compressor_backward_wrapper(
     ``grad_kv``/``grad_score`` are allocated UNINITIALIZED — the kernel writes every
     position, storing exact zeros to never-consumed positions itself, so no zero-fill
     kernels run. By default ``grad_ape`` is zeroed for fp32 atomic accumulation. With
-    ``deterministic=True`` it is uninitialized and fully overwritten through a
-    caller-owned partial workspace plus fixed-order reduction; the complete backward
-    is then bitwise reproducible and accepted by strict torch deterministic mode.
+    ``deterministic=True`` it is uninitialized and fully overwritten through an
+    internally allocated partial workspace plus fixed-order reduction; the complete
+    backward is then bitwise reproducible and accepted by strict torch deterministic
+    mode.
     When ``total_comp == 0`` no kernel is launched and all three grads are zeroed.
 
     Returns:
