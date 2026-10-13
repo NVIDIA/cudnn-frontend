@@ -7,8 +7,8 @@
 The gated attention block is the first **model-level** FE-OSS API: a set of FROST CuTe-DSL kernels behind one
 Python class, one workspace and one `execute()` call. It implements the gated attention sub-layer used by
 Qwen3.5- and Qwen3.8-style models (the API is named by op geometry, the model is provenance only; the Qwen3.8
-family's geometries and the bound up to which the block is Qwen3.8-Flash-Next's sparse layer are under
-[Qwen3.8 family / Qwen3.8-Flash-Next](#qwen38-family--qwen38-flash-next)):
+family's geometries, the Qwen3.5-397B tensor-parallel shards and the bound up to which the block is Qwen3.8-Flash-Next's
+sparse layer are under [Qwen3.8 family / Qwen3.8-Flash-Next](#qwen38-family--qwen38-flash-next)):
 
 ```text
 h [B, S, d_model]                                       (post input-layernorm)
@@ -113,6 +113,30 @@ All five share `d_head = 256`, `rope_dim = 64`, QK-RMSNorm with zero-centered we
 of `q_proj` -- load them through `qkvg_from_hf` (next section). The 27B and 2.4T members are dense gated attention: the block
 IS their attention layer at every sequence length it serves (a prefill block: `S = 1` is decode, out of the prefill bodies'
 scope).
+
+**Qwen3.5-397B tensor-parallel shards.** The 397B's full-attention layer (32 / 2 at TP 1, `d_model` 4096; the same `d_head` 256,
+`rope_dim` 64, QK-RMSNorm and per-head `[q_h | gate_h]` split, loaded through `qkvg_from_hf` or `qkvg_from_vllm`) as the serving
+stacks shard it -- the query heads divided across the ranks, the two KV heads divided at TP 2 and REPLICATED from TP 4 on (one KV
+head per rank; the TP 4 shard is the serving deployment's) -- is pinned the same way (`test_layout_contract.py`, the `qwen35_shard`
+cells: the N-axis map, the tile plans at 64 / 128 / 256, the fitted norm tile) and runs end to end on Rubin in all three forms, one
+cell per shard within the dense suite's budget: dense (`test_block_end_to_end.py`: B = 1, S = 512, HF-form weights against both
+oracles), EXTEND (`test_block_serving_extend.py`: two sequences, a 100-token step over a 60-row prefix and a 156-token step over a
+100-row prefix) and DECODE (`test_block_serving_decode.py`: `S_q = 1` over `kv_lens` 100 / 384 / 500 and a padded entry), each shard
+on the kernel block size its deployment allocates:
+
+| shard | `d_model` | `h_q` / `h_kv` | `N` (= `n_qkvg`) | GQA group | stages (2)+(3) kernel | end-to-end cells (bf16) |
+|---|---|---|---|---|---|---|
+| Qwen3.5-397B, TP 1 | 4096 | 32 / 2 | 17408 | 16 | TMA, 16-row tile | the perf tables below (the kernel cell); the serving suites' 32 / 2 matrix at a shrunk width |
+| Qwen3.5-397B, TP 2 | 4096 | 16 / 1 | 8704 | 16 | TMA, 16-row tile | dense; EXTEND and DECODE at page 16 |
+| Qwen3.5-397B, TP 4 | 4096 | 8 / 1 | 4608 | 8 | TMA, 8-row tile | dense; EXTEND and DECODE at page 32 |
+| Qwen3.5-397B, TP 8 | 4096 | 4 / 1 | 2560 | 4 | TMA, 4-row tile (one row per warp) | dense; EXTEND and DECODE at page 64 |
+
+Every `N` is a whole number of 256-column tiles, so the forced 256-wide GEMM tile of the serving route holds at every shard and
+`qkvg_tile_plan(64 / 128 / 256)` is well defined; the replicated single KV head lets every power-of-two head count fit a TMA norm
+tile (the 3.8 family's 6 / 1 is the one pinned geometry that takes the LDG kernel). A shard's decode route is its GROUP's (the rule
+reads `h_q / h_kv` and `d_head` only, never `d_model` or the KV-head count): 16 / 1 takes the 32 / 2 entries of the table under
+"Serving: the decode form", 8 / 1 its own, 4 / 1 the group-4 entries -- packed up to `S_q = 16` in two token units, unpacked to 32,
+a typed decline past that.
 
 **Flash-Next: exact for `<= 2051` visible tokens.** Flash-Next's attention layer is Qwen Sparse Attention (QSA): the same
 gated core restricted, per query, to indexer-selected 4-token blocks under a 2048-token budget -- the top `min(512, n_blocks)`
@@ -586,7 +610,9 @@ entries (`kv_len = 0`, the NULL block `0`, slot `-1`), prefixes ending mid-page,
 end and in the middle of the packing, a row-sliced block table, the 2-chunk extend and the prefix-hit step against the single-shot oracle
 within the dense suite's budget (`cos >= 0.999` on `out`, `atol 2e-2` on the gated O), live rows bitwise between a bounded and a tight
 declaration, and -- with the projection GEMM driver's capture-safe route in the tree -- a CUDA-graph capture of the first execute replayed
-over new lengths / tables / slots -- the rows of the support-matrix
+over new lengths / tables / slots; the three Qwen3.5-397B tensor-parallel shards (16 / 1, 8 / 1, 4 / 1 over `d_model` 4096, one replicated
+KV head -- the table under "Qwen3.8 family" above) each with one EXTEND step at pages 16 / 32 / 64 and one DECODE step at the same
+pages -- the rows of the support-matrix
 tracker's `Rubin d256 gated attention block -- serving forms` section; the standalone adapter's own paged-prefill contract applies to the
 pools (`docs/operations/Attention.md`, "Paged attention").
 
@@ -605,12 +631,12 @@ pipeline is `(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)`; the fused ke
 | `(group = H_q / H_kv, S_q)` | stage (4) | `decode_route(geometry, S_q)` |
 |---|---|---|
 | `S_q x group <= 16` packed rows | the Rubin d256 **decode tile** (`sm107/decode_d256_f16.py`, the 16-column swap-AB tile), the whole group packed into one tile, one token unit | `n_q = 16`, `token_units = 1` |
-| up to two token units of `32 // group` tokens (32 / 2 and 24 / 2: `S_q <= 4`; 8 / 1: `S_q <= 8`; 24 / 4: `S_q <= 10`) | the 32-column decode tile, `ceil(S_q / (32 // group))` CTAs per (KV head, sequence, split), each streaming the KV range once | `n_q = 32`, `token_units` 1 or 2, `pack_gqa = True` |
+| up to two token units of `32 // group` tokens (32 / 2, 16 / 1 and 24 / 2: `S_q <= 4`; 8 / 1: `S_q <= 8`; 24 / 4: `S_q <= 10`; 4 / 1: `S_q <= 16`) | the 32-column decode tile, `ceil(S_q / (32 // group))` CTAs per (KV head, sequence, split), each streaming the KV range once | `n_q = 32`, `token_units` 1 or 2, `pack_gqa = True` |
 | past the packed route, `S_q <= 32` | the decode tile UNPACKED (the SDPA adapter's own rule for a group it does not pack): one Q head per CTA, one token unit, `S_q` live rows of the 16- or 32-column tile | `n_q = 16` / `32`, `token_units = 1`, `pack_gqa = False` |
 | `S_q > 32` (`DECODE_MAX_ROWS`) | NOT served -- a typed `NotImplementedError` at declaration: the SDPA adapter serves dense half queries over paged K / V on the decode tile only; the paged d256 prefill body serves PACKED queries (the EXTEND form) | `tile = None`, `reason` set |
 
 The CLAIMED envelope is `1 <= S_q <= DECODE_MAX_S_Q = 4` on the PACKED tile at every served group (`DecodeRoute.claimed`);
-the wider packed cells of 8 / 1 and 24 / 4 and the unpacked arm are routed and declared, unmeasured. The tail
+the wider packed cells of 8 / 1, 24 / 4 and 4 / 1 and the unpacked arm are routed and declared, unmeasured. The tail
 tile READS the pool rows past `kv_lens[b]` -- the last page's stale rows, and block `0` for the pages a short row does not list
 -- and masks them to `P = 0`: they contribute nothing as long as they are FINITE, as a zero-initialized cache's are (a NaN
 there is `0 x NaN`). On the decode tile the plan is a split-KV plan whenever the SDPA

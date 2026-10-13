@@ -72,9 +72,10 @@ _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 _SM107 = (10, 7)
 _D = 256
 _ROPE = 64
-# The four served groups (h_q / h_kv): the 397B TP 1 shard (32 / 2), Flash-Next TP 1 (24 / 2), the 397B TP 4 shard (8 / 1), the 27B
-# members (24 / 4) -- at a shrunk d_model so the projections stay cheap; every width a multiple of the forced 256-wide GEMM tile.
-_GROUPS = {16: (32, 2), 12: (24, 2), 8: (8, 1), 6: (24, 4)}
+# The five served groups (h_q / h_kv): the 397B TP 1 shard (32 / 2), Flash-Next TP 1 (24 / 2), the 397B TP 4 shard (8 / 1), the 27B
+# members (24 / 4), the 397B TP 8 shard (4 / 1) -- at a shrunk d_model so the projections stay cheap; every width a multiple of the
+# forced 256-wide GEMM tile.  The 397B TP 2 shard (16 / 1) is group 16 with ONE KV head: its own cells sit in _SHARDS below.
+_GROUPS = {16: (32, 2), 12: (24, 2), 8: (8, 1), 6: (24, 4), 4: (4, 1)}
 _D_MODEL = 512
 _LAYOUTS = SERVING_POOL_LAYOUTS
 # The route table the ADAPTER applies, (group, S_q) -> (N_Q, token units, packed): the PACKED route (the design's table, M0D 2.4 /
@@ -97,6 +98,17 @@ _ROUTE_TABLE = {
     12: {1: (16, 1, True), 2: (32, 1, True), 3: (32, 2, True), 4: (32, 2, True), 5: (16, 1, False), 33: (0, 0, False)},
     8: {1: (16, 1, True), 2: (16, 1, True), 3: (32, 1, True), 4: (32, 1, True), 5: (32, 2, True), 8: (32, 2, True), 9: (16, 1, False), 33: (0, 0, False)},
     6: {1: (16, 1, True), 2: (16, 1, True), 3: (32, 1, True), 5: (32, 1, True), 6: (32, 2, True), 10: (32, 2, True), 11: (16, 1, False), 33: (0, 0, False)},
+    4: {
+        1: (16, 1, True),
+        4: (16, 1, True),
+        5: (32, 1, True),
+        8: (32, 1, True),
+        9: (32, 2, True),
+        16: (32, 2, True),
+        17: (32, 1, False),
+        32: (32, 1, False),
+        33: (0, 0, False),
+    },
 }
 _SENTINEL = 1024.0  # the pools' fill: FINITE (a serving stack's cache is zero-initialized; the tail tile reads and masks the rows past kv_len)
 
@@ -119,8 +131,11 @@ def _no_host_sync():
         torch.cuda.set_sync_debug_mode(prev)
 
 
-def _geom(group, **over):
-    h_q, h_kv = _GROUPS[group]
+def _geom(group, heads=None, **over):
+    """The block geometry (and the oracle's mirror) of ``group``: the shrunk matrix's heads, or an explicit ``(h_q, h_kv)`` of that
+    group (the 397B shards at their real ``d_model``, passed through ``over``)."""
+    h_q, h_kv = _GROUPS[group] if heads is None else heads
+    assert h_q % h_kv == 0 and h_q // h_kv == group, (group, heads)
     kw = dict(d_model=_D_MODEL, h_q=h_q, h_kv=h_kv, d_head=_D, rope_dim=_ROPE, causal_bottom_right=True)
     kw.update(over)
     return GatedAttentionBlockGeometry(**kw), RefGeometry(**kw)
@@ -558,10 +573,26 @@ class _Case:
     prefix K / V, the block table (block 0 = the NULL block, never allocated), the slot mapping of the step's tokens (-1 on a
     padded entry), and the per-sequence fp32 oracle of the step's ``out`` rows."""
 
-    def __init__(self, group, s_q, kv_lens, *, page=16, layout="hnd", dtype=torch.bfloat16, seed=0, n_pages=None, table_row_stride=None, blk_kw=None):
+    def __init__(
+        self,
+        group,
+        s_q,
+        kv_lens,
+        *,
+        page=16,
+        layout="hnd",
+        dtype=torch.bfloat16,
+        seed=0,
+        n_pages=None,
+        table_row_stride=None,
+        blk_kw=None,
+        heads=None,
+        d_model=None,
+    ):
         self.group, self.s_q, self.kv_lens, self.page, self.layout, self.dtype = group, int(s_q), [int(x) for x in kv_lens], page, layout, dtype
-        self.geom, self.ref_geom = _geom(group)
-        h_q, h_kv = _GROUPS[group]
+        self.d_model = _D_MODEL if d_model is None else int(d_model)  # the shrunk matrix width, or a shard's real one
+        self.geom, self.ref_geom = _geom(group, heads=heads, d_model=self.d_model)
+        h_q, h_kv = _GROUPS[group] if heads is None else heads
         g = torch.Generator(device=_DEV).manual_seed(seed)
         B = len(self.kv_lens)
         assert all(L == 0 or L >= s_q for L in self.kv_lens), "a live entry holds at least the step's tokens"
@@ -571,20 +602,20 @@ class _Case:
             return (torch.randn(*shape, generator=g, device=_DEV, dtype=torch.float32) * std).to(dtype)
 
         self.w = dict(
-            w_qkvg=randn(self.geom.n_qkvg, _D_MODEL),
+            w_qkvg=randn(self.geom.n_qkvg, self.d_model),
             w_q_norm=torch.ones(_D, dtype=dtype, device=_DEV),
             w_k_norm=torch.ones(_D, dtype=dtype, device=_DEV),
-            w_o=randn(_D_MODEL, h_q * _D),
+            w_o=randn(self.d_model, h_q * _D),
         )
         cos_t, sin_t = _rope_tables(L_max, dtype, self.ref_geom)
-        self.h_full = [randn(1, max(L, s_q), _D_MODEL, std=1.0) for L in self.kv_lens]
+        self.h_full = [randn(1, max(L, s_q), self.d_model, std=1.0) for L in self.kv_lens]
         # the step's inputs: the LAST s_q rows (and their positions' RoPE rows); a padded entry takes its row 0 .. s_q-1 (never read)
         self.h = torch.stack([hf[0, -s_q:] for hf in self.h_full])  # [B, s_q, d_model]
         pos = [list(range(L - s_q, L)) if L else list(range(s_q)) for L in self.kv_lens]
         self.cos = torch.stack([cos_t[0, p] for p in pos])
         self.sin = torch.stack([sin_t[0, p] for p in pos])
         # the oracle per live entry over the FULL sequence: its K / V rows (bf16 -- the oracle's single rounding) fill the pools
-        self.ref_out = torch.zeros(B, s_q, _D_MODEL, dtype=dtype, device=_DEV)
+        self.ref_out = torch.zeros(B, s_q, self.d_model, dtype=dtype, device=_DEV)
         self.ref_rows = {}
         for b, L in enumerate(self.kv_lens):
             if L == 0:
@@ -637,7 +668,7 @@ class _Case:
         )
         kw.update(blk_kw or {})
         self.blk_kw = kw
-        self.out = torch.empty(B, s_q, _D_MODEL, dtype=dtype, device=_DEV)
+        self.out = torch.empty(B, s_q, self.d_model, dtype=dtype, device=_DEV)
         self.blk = GatedAttentionBlockFwd(
             self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], self.cos, self.sin, self.w["w_o"], self.out, self.geom, **kw
         )
@@ -766,11 +797,12 @@ def test_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
 def test_s_q_five_rides_the_unpacked_tile_at_sixteen_and_twelve_and_the_packed_tile_at_eight_and_six():
     """Past the PACKED route (S_q = 5 at 32 / 2 and 24 / 2) the adapter's rule rides the decode tile UNPACKED -- one head per
     CTA (HEADS_PER_TILE 1), one token unit -- not the prefill body the design's table named; at 8 / 1 and 24 / 4 the packed
-    tile's second token unit serves it.  Every arm declared by the route and pinned on the compiled module."""
+    tile's second token unit serves it, at 4 / 1 one unit of the 32-column tile (20 packed rows).  Every arm declared by the
+    route and pinned on the compiled module."""
     for group in sorted(_GROUPS):
         case = _std_case(group, 5)
         r, rb = case.blk.decode_route, case.route_readback()
-        assert r.tile == DECODE_TILE == rb["template"] and r.pack_gqa is (group in (8, 6)), (group, r, rb)
+        assert r.tile == DECODE_TILE == rb["template"] and r.pack_gqa is (group in (8, 6, 4)), (group, r, rb)
         assert rb["heads_per_tile"] == (group if r.pack_gqa else 1) and rb["adapter_pack"] is (True if r.pack_gqa else False)
 
 
@@ -788,6 +820,61 @@ def test_past_thirty_two_rows_the_step_is_a_typed_decline_the_envelope_predicts(
             _make_block(group, 2, DECODE_MAX_ROWS + 1)
         env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107)
         assert not env.decode.route(DECODE_MAX_ROWS + 1).served and env.decode.max_rows == DECODE_MAX_ROWS
+
+
+# The 397B shards at their REAL width (d_model 4096; the layout contract pins n_qkvg 8704 / 4608 / 2560): 16 / 1 (TP 2) rides group
+# 16's route with ONE KV head, 8 / 1 (TP 4, the serving deployment) group 8's, 4 / 1 (TP 8) group 4's -- one kernel block size per
+# shard, so the three cells also walk the page sizes the deployments allocate.  (h_q, h_kv, page)
+_SHARDS = {"q35_397b_tp2_16_1": (16, 1, 16), "q35_397b_tp4_8_1": (8, 1, 32), "q35_397b_tp8_4_1": (4, 1, 64)}
+_D_MODEL_397B = 4096
+
+
+def test_the_397b_shards_ride_their_groups_routes_and_the_envelope_serves_both_forms():
+    """A shard's decode route is its GROUP's (the rule reads ``h_q // h_kv`` and ``d_head`` only, never ``d_model`` or the KV head
+    count): 16 / 1 = the 32 / 2 rows, 8 / 1 = group 8's, 4 / 1 = group 4's (packed to ``S_q = 16`` in two token units, unpacked to
+    32, a typed decline past that); the envelope on a Rubin reading serves the EXTEND and the DECODE form at every shard."""
+    for name, (h_q, h_kv, _page) in _SHARDS.items():
+        group = h_q // h_kv
+        geom, _ = _geom(group, heads=(h_q, h_kv), d_model=_D_MODEL_397B)
+        small, _ = _geom(group)
+        assert geom.n_qkvg % 256 == 0 and geom.d_model == _D_MODEL_397B
+        for s_q in list(range(1, 11)) + [16, 17, 32, 33]:
+            r, t = decode_route(geom, s_q), decode_route(small, s_q)
+            assert (r.group, r.n_q, r.token_units, r.pack_gqa, r.claimed, r.served) == (group, t.n_q, t.token_units, t.pack_gqa, t.claimed, t.served), (
+                name,
+                s_q,
+                r,
+                t,
+            )
+        for s_q, (n_q, units, packed) in _ROUTE_TABLE[group].items():
+            r = decode_route(geom, s_q)
+            assert (r.n_q, r.token_units, r.pack_gqa) == (n_q, units, packed), (name, s_q, r)
+        env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107)
+        assert env.forms == ("extend", "decode") and env.extend.served and env.decode.served, (name, env.extend.reason, env.decode.reason)
+        assert env.decode.route(1).claimed and env.decode.route(DECODE_MAX_S_Q).claimed and not env.decode.route(DECODE_MAX_ROWS + 1).served
+
+
+@requires_rubin
+@pytest.mark.parametrize("name", list(_SHARDS), ids=list(_SHARDS))
+def test_qwen35_shards_decode_match_the_oracle(name):
+    """One DECODE step (``S_q = 1``: the pure decode step, inside the claimed envelope) per 397B shard at d_model 4096 -- 16 / 1 at
+    page 16, 8 / 1 at page 32, 4 / 1 at page 64 -- over the standard lengths (a tail tile, the ring depth, four tiles with a tail, a
+    padded entry) against the per-sequence fp32 oracle under the dense suite's budget; the route pinned on the compiled kernel (the
+    16-column tile with the WHOLE group packed per tile: HEADS_PER_TILE 16 / 8 / 4 over the one KV head), the gate in the combine,
+    block 0 untouched."""
+    h_q, h_kv, page = _SHARDS[name]
+    group = h_q // h_kv
+    case = _case(("shard", name), group, 1, _LENS, page=page, heads=(h_q, h_kv), d_model=_D_MODEL_397B)
+    case.run()
+    case.check_against_oracle(what=f"{name} p{page} out")
+    r, rb = case.blk.decode_route, case.route_readback()
+    assert r.claimed and r.pack_gqa and r.n_q == 16 and r.token_units == 1, r
+    assert rb["template"] == r.tile == DECODE_TILE and rb["file"].endswith("/sm107/decode_d256_f16.py"), rb
+    assert rb["heads_per_tile"] == group and rb["adapter_pack"] is True and rb["n_q"] == 16, rb
+    assert rb["epilogue_gate"] is False and case.blk.gate_fused and case.blk.decode_split_kv >= 2, "the gate rides the COMBINE, never the tile"
+    assert case.geom.d_model == _D_MODEL_397B and case.geom.h_kv == 1 and case.k_cache.shape[1] == 1
+    k0, v0 = case.block0_bits
+    assert torch.equal(_bits(case.k_cache[0]), k0) and torch.equal(_bits(case.v_cache[0]), v0), "block 0 (the NULL block) must never be written"
 
 
 @requires_rubin

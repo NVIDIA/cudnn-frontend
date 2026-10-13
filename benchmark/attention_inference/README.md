@@ -24,14 +24,18 @@ The configs sweep the two cuDNN frontend paths only:
 Unsupported combinations are recorded (not hidden) and show up as blank slots
 in the charts. Additional reference backends (`flashinfer`, `flash_mla`,
 `b12x`, `flash_attention_4`) remain implemented in
-`benchmark_single_attention.py` for ad-hoc runs via `--backend`.
+`benchmark_single_attention.py` for ad-hoc runs via `--backend` -- on the
+single-case script, or on the runner, where a backend the config does not
+list runs alone over the config's models, shapes and (for the paged-KV
+backends) `page_sizes`, e.g. `--config qwen35 --backend flashinfer --phase
+generation` sweeps the Qwen 3.5 shards at pages 16 / 32 / 64.
 
 ## Model configs
 
 | Config | Attention | Notes |
 |---|---|---|
 | `llama` | GQA d=128: 64/8 | bf16 + fp8 KV |
-| `qwen35` | GQA d=256: 32/2 | wide-head GQA; bf16 + fp8 KV |
+| `qwen35` | GQA d=256: 32/2 (TP shards 16/1, 8/1, 4/1) | wide-head GQA; bf16 + fp8 KV; the paged-KV backends sweep pages 16 / 32 / 64 (`page_sizes`) |
 | `gpt_oss` | GQA d=64 + per-head sinks: SWA-128 and full-attention layer types | bf16 + fp8 KV, page 16 |
 | `deepseek_v4` | shared-K=V MQA, 64 or 128 q-heads, d=512 | official HF configs; dense core only (CSA/HCA pools out of scope) |
 | `kimi_k3` | absorbed MLA, 96 heads, 576/512, scale 1/√192, page 32 | context swept but structurally unabsorbed at prefill → blank slots (see training suite) |

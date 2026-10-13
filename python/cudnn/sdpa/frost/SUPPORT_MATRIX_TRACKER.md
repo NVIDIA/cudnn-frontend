@@ -2636,10 +2636,12 @@ against the declared route (template, packing, split, `epilogue_gate` False):
 | 12 (24 / 2) | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units ✅ | tile 32, packed, 2 units ✅ | tile 16, UNPACKED (declared, unmeasured) ✅ | typed decline |
 | 8 (8 / 1) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 2 units (declared, unmeasured) ✅ | typed decline |
 | 6 (24 / 4) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
+| 4 (4 / 1, the 397B TP 8 shard; 2026-10-13) | tile 16, packed, 1 unit ✅ (also at `d_model` 4096, page 64) | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 16, packed, 1 unit ✅ | tile 32, packed, 1 unit (declared, unmeasured) ✅ | typed decline |
+| 16 (16 / 1, the 397B TP 2 shard, ONE KV head; 2026-10-13) | tile 16, packed, 1 unit ✅ (at `d_model` 4096, page 16) | the 32 / 2 row's route (declared; not re-run at 16 / 1) | same | same | same | typed decline |
 
-The CLAIMED envelope (`DecodeRoute.claimed`) is the packed tile at `S_q <= 4`; the packed route reaches `S_q = 8` at 8 / 1 and
-`S_q = 10` at 24 / 4 and the unpacked tile `S_q = 32` at every group -- routed, declared by the envelope, correct on the cells run,
-unmeasured (QS09). The pool matrix on the decode tile (R-KV1: the three stride patterns holding the
+The CLAIMED envelope (`DecodeRoute.claimed`) is the packed tile at `S_q <= 4`; the packed route reaches `S_q = 8` at 8 / 1,
+`S_q = 10` at 24 / 4 and `S_q = 16` at 4 / 1 and the unpacked tile `S_q = 32` at every group -- routed, declared by the envelope,
+correct on the cells run, unmeasured (QS09). The pool matrix on the decode tile (R-KV1: the three stride patterns holding the
 same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0 / 77 / 1000 at 24 / 2, `S_q = 2`):
 
 | form | pool layout | page 16 | page 32 | page 64 | page 128 |
@@ -2661,5 +2663,25 @@ nothing, the replay bitwise the eager run; the replay over new `kv_lens` / table
 at `kv_lens = 128 x n_kv`, `n_kv` in {1, 2, 4, 8} (ok 12 / hang 0 / other 0). The tail tile
 READS the pool rows past `kv_lens[b]` (the last page's stale rows, block 0 for unlisted pages) and masks them to `P = 0`: they
 must be FINITE, as a zero-initialized cache's are (a NaN there is `0 x NaN` -- the suite's pools carry a finite sentinel).
+
+**Pinned 2026-10-13 -- the Qwen3.5-397B tensor-parallel shards end to end** (16 / 1 = TP 2, 8 / 1 = TP 4 -- the serving
+deployment's shard --, 4 / 1 = TP 8; `d_model` 4096, `d_head` 256, the ONE replicated KV head from TP 4 on; the layout contract
+`test/python/gated_attention_block/cutedsl/test_layout_contract.py` pins `n_qkvg` 8704 / 4608 / 2560 -- every band a whole number of
+256 columns, so the forced 256-wide GEMM tile holds and `qkvg_tile_plan(64 / 128 / 256)` is well defined -- and the TMA norm kernel's
+fitted tile 16 / 8 / 4 rows, the 4-row tile one row per warp). Validated on a Rubin development node (cc 10.7, 204 SMs; functional
+cells, no perf claim), bf16, L1 HND pools, one cell per shard and form within the dense suite's budget (`out` cos >= 0.999, the gated
+O within atol 2e-2 on the EXTEND cells; nothing widened), each shard on the kernel block size its deployment allocates:
+
+| shard | DENSE `[B, S]` (`test_block_end_to_end.py`: B = 1, S = 512, HF-form weights; `out` cos vs the oracle on the block's weights / vs the HF-faithful fp32 `(1 + w)` oracle) | EXTEND (`test_block_serving_extend.py`: two sequences at `T_max` 256, a 100-token step over a 60-row prefix and a 156-token step over a 100-row prefix; worst `out` cos / gated-O max abs err) | DECODE (`test_block_serving_decode.py`: `S_q = 1` over `kv_lens` 100 / 384 / 500 / 0, the whole group packed per tile, the gate in the combine; `out` cos / max abs diff) |
+|---|---|---|---|
+| 16 / 1 (TP 2) | ✅ 0.999995 / 0.999987 (TMA 16-row norm tile) | ✅ page 16: 0.999994 / 7.812e-03 | ✅ page 16: 0.999988 / 2.823e-03 (tile 16, HEADS_PER_TILE 16) |
+| 8 / 1 (TP 4) | ✅ 0.999996 / 0.999988 (TMA 8-row norm tile) | ✅ page 32: 0.999994 / 3.906e-03 | ✅ page 32: 0.999988 / 1.953e-03 (tile 16, HEADS_PER_TILE 8) |
+| 4 / 1 (TP 8) | ✅ 0.999995 / 0.999988 (TMA 4-row norm tile) | ✅ page 64: 0.999995 / 3.906e-03 | ✅ page 64: 0.999987 / 1.221e-03 (tile 16, HEADS_PER_TILE 4) |
+
+Group 4 also joined the shrunk-width DECODE matrix above (4 / 1 at `d_model` 512: `S_q` 1 .. 5 vs the oracle, the declaration facts,
+the route table -- its rows of the route table); 16 / 1 rides group 16's route with one KV head (its `S_q = 1` cell above; the wider
+`S_q` are the 32 / 2 cells' route, declared and not re-run at 16 / 1); a shard's route equals its group's shrunk-width route at every
+`S_q`, pinned on the CPU. The shards' `S_q > 1` decode steps and every page / layout cell beyond the ones named are functional
+claims only -- no perf claim before the serving perf cells land.
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): an LSE / a sliding window or a right band / a `QsaSpec` / another head dim on the paged forms, a dense step wider than 32 rows (the DECODE form's `decode_rows` row: the EXTEND form's packed business), `save_for_backward` / `quant` on the paged forms, e4m3 pools (`kv_cache_dtype`), the write-through folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute; the DECODE form's `S_q > 4` arms and every page / layout cell above are functional claims only -- no perf claim before QS09.
