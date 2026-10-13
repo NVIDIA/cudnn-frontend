@@ -255,9 +255,11 @@ call and before every CUDA-graph replay that reuses the buffer**: the kernel onl
 accumulates into it with fp32 atomics. The high-level wrapper supplies this zero-fill,
 including during graph replay. With
 `CSACompressorBackward(..., deterministic=True)`, call
-`scratch_workspace_bytes()` after `check_support()`, provide a contiguous CUDA uint8
-`workspace` of at least that size to `execute(..., workspace=...)`, and `grad_ape` is
-fully overwritten without a zero-fill.
+`scratch_workspace_bytes()` after `check_support()`, then provide
+`execute(..., workspace=...)` a same-device, contiguous CUDA uint8 buffer that is
+16-byte aligned, does not overlap any input or gradient tensor, and has at least the
+reported capacity. The deterministic path fully overwrites `grad_ape` without a
+zero-fill.
 
 ### CUDA graphs
 
