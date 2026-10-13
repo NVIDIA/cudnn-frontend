@@ -734,8 +734,9 @@ def test_multicast_declines_the_padded_dense_tail_the_cga1_ring_serves(case, _pi
 @pytest.mark.parametrize("case", list(_DECLINED_CASES))
 def test_the_knob_less_dense_tail_runs_the_cga1_ring_through_the_graph_path(case, _pins, monkeypatch):
     """The KNOB-LESS default on a dense S_kv % 128 != 0 tail through the GRAPH path (no seam, no knob): the row passes
-    ``global_lengths=False`` (the lowering synthesizes per-batch lengths for the tail), the adapter picks the cga1 ring (``bias_mode`` 2) for
-    the PAIR item at cga1 -- the row and the adapter agree on the plan's form -- and O / Stats match the fp64 oracle."""
+    ``global_lengths=False`` (the tail is padded: the plan compiles its padded mask against the scalar S_kv -- ``_kv_padded()`` -- with no
+    lengths buffer), the adapter picks the cga1 ring (``bias_mode`` 2) for the PAIR item at cga1 -- the row and the adapter agree on the
+    plan's form -- and O / Stats match the fp64 oracle."""
     from cudnn.sdpa.fwd import api_dsl
 
     c = _DECLINED_CASES[case]
@@ -747,7 +748,7 @@ def test_the_knob_less_dense_tail_runs_the_cga1_ring_through_the_graph_path(case
 
     def spy(self):
         m = orig(self)
-        adapter_modes.append((m, bool(self.seq_kv_lens_present), bool(self.seq_q_lens_present), self.bias_desc is not None))
+        adapter_modes.append((m, bool(self.seq_kv_lens_present), bool(self.seq_q_lens_present), self.bias_desc is not None, bool(self._kv_padded())))
         return m
 
     monkeypatch.setattr(api_dsl.SdpaFwdDslSm100, "_resident_arm_bias_mode", spy)
@@ -758,7 +759,8 @@ def test_the_knob_less_dense_tail_runs_the_cga1_ring_through_the_graph_path(case
     assert pair_row and {kw_["global_lengths"] for kw_, _ in pair_row} == {False}, ("the row read the synthesized lengths", row_picks)
     assert {r for _, r in pair_row} == {2}, ("the row computed the cga1 ring", pair_row)
     assert adapter_modes and {m for m, *_ in adapter_modes} == {2}, ("the adapter built the cga1 ring", adapter_modes)
-    assert all(lens for _, lens, _q, _b in adapter_modes), ("the lowering passed seq_kv_lens_present=True for the tail", adapter_modes)
+    # the dense tail is padded WITHOUT a lengths buffer: the plan's padded mask is compiled against the scalar S_kv
+    assert all(padded and not lens for _, lens, _q, _b, padded in adapter_modes), ("the dense tail reads padded with no lengths buffer", adapter_modes)
     _s13._check(out, ref)
 
 
