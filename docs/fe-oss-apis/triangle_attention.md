@@ -223,17 +223,19 @@ host floor as a first-class column (eager CPU wall without a synchronisation vs 
 hundreds of pinned calls) and the comparison against cuEquivariance on Rubin follows this API.
 
 **The prefix-mask form's price, measured** (the 212-SM Rubin perf-node class at the 2376 MHz lock, sampled 2364 MHz; D 32, H 4, bf16, N = S
-rows, 75 % live keys; CUDA-graph replay of the class API's call, 100 x 3 with a control pair; the three routes bitwise equal on every cell):
-the derivation costs 7-11 us of device time (two torch kernels -- the mask's cast and the row count -- launch-bound: 7.2 us at S = 256, 11.5 us
-at S = 1024) and ~22 us of host time per call (two torch dispatches) over the explicit `kv_lengths` route: -22 / -11 / -7 / -2 % at
-S = 256 / 384 / 512 / 1024 (25.1 -> 32.1, 60.1 -> 67.4, 105.5 -> 113.2, 709.6 -> 720.8 us).  Against the in-kernel dense mask fed the SAME mask it
-reads -9 % at S = 256 and +8 / +26 / +47 % at 384 / 512 / 1024 (29.3 / 73.0 / 142.1 / 1062.7 us: the dense route visits every kv tile, the
-padded route the live ones).  Host floor of the class API's `execute` (CPU-pinned, 500 calls, min / median): `kv_lengths` 21-23 / 23-25 us,
-the prefix form 43-45 / 45-48 us, the dense mask 12-13 / 13-14 us; the drop-in function adds ~10 us to each (the output and workspace
-allocations).  So: a caller who holds lengths passes `kv_lengths`; one who holds a prefix mask and can afford one host synchronisation per
-mask uses `mask_to_kv_lengths`; one who needs a synchronisation-free, capturable call uses `mask_is_prefix=True` -- a win over the dense mask
-from S >= 384, a loss of the derivation's ~7 us at S = 256 where the attention kernel itself is 25 us.  A fused single-kernel derivation
-would remove most of both prices; it is the next item of this form.
+rows; CUDA-graph replay of the class API's call, 100 x 3 with a control pair; every route bitwise equal on every cell): the derivation is ONE
+kernel of 2.2-3.6 us (a warp per row, byte loads, `popc(ballot)`; its replay alone 4.6 / 5.2 / 5.2 / 6.0 us at S = 256 / 384 / 512 / 768,
+where the two torch kernels it replaced -- the mask's cast and the row count -- read 9.6 / 9.8 / 10.4 / 10.9 us), so the prefix form costs
++2.3 / +2.9 / +2.9 / +4.0 us over the explicit `kv_lengths` route at 75 % live keys: -9.0 / -4.8 / -2.7 / -1.3 % (23.2 -> 25.5, 57.3 -> 60.3,
+103.4 -> 106.3, 308.0 -> 311.9 us; at 50 % live keys +3.0 / +3.9 us = -3.8 / -1.8 % at S = 512 / 768), where the two-kernel form cost
++8.1 / +8.5 / +9.0 / +9.6 us (-25.8 / -12.9 / -8.0 / -3.0 %).  Against the in-kernel dense mask fed the SAME mask the prefix form wins at every
+crop: +7.8 / +16.7 / +33.0 / +24.2 % at 75 % live keys (27.5 / 70.3 / 141.4 / 387.3 us: the dense route visits every kv tile, the padded route
+the live ones) and +77.8 / +73.5 % at 50 % (S = 512 / 768).  Host floor of the class API's `execute` (CPU-pinned, 500 calls, min / median):
+`kv_lengths` 19-20 / 20-23 us, the prefix form 26-27 / 27-28 us (the two-kernel form read 43-45 / 45-48 us), the dense mask 11-12 / 12 us;
+the derivation alone 3.8-4.1 / 3.9-5.9 us (the two torch kernels 8.5-8.9 / 8.8-9.4 us); the drop-in function adds ~9 us to each (the output
+and workspace allocations).  So: a caller who holds lengths passes `kv_lengths`; one who holds a prefix mask uses `mask_is_prefix=True` --
+within one launch (~3 us) of the lengths route and ahead of the dense mask at every training crop; `mask_to_kv_lengths` remains for a caller
+who prefers the tested conversion with its one host synchronisation per mask.
 
 ## Tests
 
