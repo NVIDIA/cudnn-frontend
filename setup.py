@@ -15,6 +15,11 @@ if stable_abi_value not in ("", "0", "OFF", "NO", "FALSE", "1", "ON", "YES", "TR
     raise ValueError("CUDNN_FRONTEND_PYTHON_STABLE_ABI must be ON or OFF")
 stable_abi_requested = stable_abi_value in ("1", "ON", "YES", "TRUE")
 stable_abi = stable_abi_requested and sys.implementation.name == "cpython" and sys.version_info >= (3, 12) and not sysconfig.get_config_var("Py_GIL_DISABLED")
+if stable_abi_requested and not stable_abi:
+    raise ValueError(
+        "CUDNN_FRONTEND_PYTHON_STABLE_ABI=ON requires CPython 3.12 or newer with the GIL enabled. "
+        "Set CUDNN_FRONTEND_PYTHON_STABLE_ABI=OFF to build an ordinary wheel."
+    )
 
 
 # A CMakeExtension needs a sourcedir instead of a file list.
