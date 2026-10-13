@@ -231,6 +231,7 @@ class pygraph:
         device_property: Any = None,
         is_dynamic_shape_enabled: bool = False,
         is_override_shape_enabled: bool = False,
+        cuda_graph_retention: Any = None,
         *,
         is_cuda_graph_replay_expected: bool = False,
         **kwargs,
@@ -250,6 +251,7 @@ class pygraph:
             ("sm_version", sm_version),
             ("kernel_cache", kernel_cache),
             ("device_property", device_property),
+            ("cuda_graph_retention", cuda_graph_retention),
         ):
             if _v is not None:
                 self._cpp_graph_kwargs[_k] = _v
@@ -2628,7 +2630,7 @@ class pygraph:
                 # a deserialized plan carries its own context; forcing FLOAT here
                 # would change existing one-argument deserialize(blob) callers.
                 deser_kwargs = {}
-                for _k in ("name", "kernel_cache", "device_property"):
+                for _k in ("name", "kernel_cache", "device_property", "cuda_graph_retention"):
                     if _k in self._cpp_graph_kwargs:
                         deser_kwargs[_k] = self._cpp_graph_kwargs[_k]
                 backend_handle = self._backend_handle_for_lowering(deser_kwargs)

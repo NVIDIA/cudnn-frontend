@@ -150,3 +150,42 @@ def test_device_buffer_finalizer_restores_capture_mode(monkeypatch, free_raises)
         assert state[0] == initial
     finally:
         buf._ptr = 0
+
+
+@pytest.mark.parametrize("retention", ["PER_GRAPH", "NONE"])
+def test_cuda_graph_retention_option(retention, cudnn_handle):
+    """pygraph(cuda_graph_retention=...) reaches the C++ graph (also through deserialize), and a graph
+    built with it executes and replays from a CUDA graph as usual while the graph is alive."""
+    mode = getattr(cudnn.cuda_graph_retention, retention)
+    graph = cudnn.pygraph(
+        handle=cudnn_handle,
+        io_data_type=cudnn.data_type.FLOAT,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.FLOAT,
+        cuda_graph_retention=mode,
+    )
+    tx = graph.tensor(dim=[1, 32, 32], stride=[1024, 32, 1], data_type=cudnn.data_type.FLOAT)
+    ty = graph.relu(tx).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    assert graph.get_cuda_graph_retention() == mode
+
+    x = torch.linspace(-2, 2, 1024, device="cuda").reshape(1, 32, 32)
+    y = torch.empty_like(x)
+    workspace = torch.empty(max(graph.get_workspace_size(), 1), device="cuda", dtype=torch.uint8)
+    stream = torch.cuda.ExternalStream(cudnn_handle.stream)
+    stream.wait_stream(torch.cuda.current_stream())
+    capture = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(capture, stream=stream):
+        graph.execute({tx: x, ty: y}, workspace, handle=cudnn_handle)
+    y.fill_(float("nan"))
+    capture.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, x.relu())
+
+    loaded = cudnn.pygraph(handle=cudnn_handle, cuda_graph_retention=mode)
+    loaded.deserialize(cudnn_handle, graph.serialize())
+    assert loaded.get_cuda_graph_retention() == mode
+
+
+def test_cuda_graph_retention_enum():
+    assert {m.name for m in cudnn.cuda_graph_retention.__members__.values()} == {"PER_GRAPH", "NONE"}

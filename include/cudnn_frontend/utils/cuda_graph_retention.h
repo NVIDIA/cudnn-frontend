@@ -5,9 +5,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -16,7 +20,57 @@
 #include "../../cudnn_frontend_shim.h"
 
 namespace cudnn_frontend {
+
+//! How the CUDA graphs recorded from a graph's execution plans keep the plans' resources alive.
+//!
+//! A CUDA graph recorded from a graph (by populate_cuda_graph()/update_cuda_graph(), or by stream capture
+//! of execute()) keeps launching its execution plans' kernels for as long as the CUDA graph, any clone of
+//! it, or any graph exec instantiated from it exists. cuDNN releases runtime-compiled code with the plan.
+//!
+//! - PER_GRAPH (default): each such CUDA graph holds a reference (a CUDA user object) to what it uses, so
+//!   it stays valid after the graph is destroyed. Launching a CUDA graph that holds a user object takes
+//!   slightly longer.
+//! - NONE: no references; the application keeps the graph alive for as long as any CUDA graph recorded
+//!   from it exists.
+//!
+//! Set per graph with Graph::set_cuda_graph_retention(). Otherwise the CUDNN_CUDA_GRAPH_RETENTION
+//! environment variable ("per_graph" or "none"), which the cuDNN backend reads too, selects the mode.
+enum class CudaGraphRetention_t { PER_GRAPH, NONE };
+
 namespace detail {
+
+//! The mode selected by the CUDNN_CUDA_GRAPH_RETENTION environment variable, if any (read once). The
+//! variable is shared with the cuDNN backend (9.28+), which applies it to its own retention.
+inline std::optional<CudaGraphRetention_t>
+cuda_graph_retention_from_environment() {
+    static const std::optional<CudaGraphRetention_t> retention = []() -> std::optional<CudaGraphRetention_t> {
+        const char *value = get_environment("CUDNN_CUDA_GRAPH_RETENTION");
+        if (value == nullptr) {
+            return std::nullopt;
+        }
+        std::string lower(value);
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (lower == "per_graph") {
+            return CudaGraphRetention_t::PER_GRAPH;
+        }
+        if (lower == "none") {
+            return CudaGraphRetention_t::NONE;
+        }
+        return std::nullopt;  // invalid values are ignored (the backend warns about them)
+    }();
+    return retention;
+}
+
+//! The mode in effect: `explicit_retention` if set, else the environment variable, else PER_GRAPH.
+inline CudaGraphRetention_t
+effective_cuda_graph_retention(std::optional<CudaGraphRetention_t> const &explicit_retention) {
+    if (explicit_retention.has_value()) {
+        return *explicit_retention;
+    }
+    return cuda_graph_retention_from_environment().value_or(CudaGraphRetention_t::PER_GRAPH);
+}
 
 // Keeps a host-side resource alive for as long as any CUDA graph that was recorded against it
 // exists, including graphExecs instantiated from it and clones of it.

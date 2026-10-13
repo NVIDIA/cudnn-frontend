@@ -206,8 +206,10 @@ inline error_t
 create_cudnn_execution_plan_impl(std::shared_ptr<ExecutionPlan>& plan,
                                  std::string const& serialized_data,
                                  cudnnHandle_t handle,
-                                 std::shared_ptr<const DeviceProperties> device_properties) {
+                                 std::shared_ptr<const DeviceProperties> device_properties,
+                                 std::optional<CudaGraphRetention_t> cuda_graph_retention = std::nullopt) {
     auto&& plan_builder = cudnn_frontend::ExecutionPlanBuilder();
+    plan_builder.setCudaGraphRetention(cuda_graph_retention);
 
     if (device_properties != nullptr) {
         plan_builder.setDeviceProperties(device_properties);
@@ -247,25 +249,31 @@ create_cudnn_execution_plan_impl(std::shared_ptr<ExecutionPlan>& plan,
 inline error_t
 create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
                             std::string const& serialized_data,
-                            cudnnHandle_t handle) {
-    return create_cudnn_execution_plan_impl(plan, serialized_data, handle, nullptr);
+                            cudnnHandle_t handle,
+                            std::optional<CudaGraphRetention_t> cuda_graph_retention = std::nullopt) {
+    return create_cudnn_execution_plan_impl(plan, serialized_data, handle, nullptr, cuda_graph_retention);
 }
 
 inline error_t
 create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
                             std::string const& serialized_data,
-                            std::shared_ptr<const DeviceProperties> device_properties) {
-    return create_cudnn_execution_plan_impl(plan, serialized_data, nullptr, std::move(device_properties));
+                            std::shared_ptr<const DeviceProperties> device_properties,
+                            std::optional<CudaGraphRetention_t> cuda_graph_retention = std::nullopt) {
+    return create_cudnn_execution_plan_impl(
+        plan, serialized_data, nullptr, std::move(device_properties), cuda_graph_retention);
 }
 
 inline error_t
 create_cudnn_execution_plan(std::shared_ptr<ExecutionPlan>& plan,
                             ManagedOpaqueDescriptor const& config,
                             std::string const& operation_graph_tag,
-                            std::shared_ptr<KernelCache> kernel_cache) {
+                            std::shared_ptr<KernelCache> kernel_cache,
+                            std::optional<CudaGraphRetention_t> cuda_graph_retention = std::nullopt) {
     auto&& plan_builder = cudnn_frontend::ExecutionPlanBuilder();
 
-    plan_builder.setEngineConfig(config, operation_graph_tag).setKernelCache(kernel_cache);
+    plan_builder.setEngineConfig(config, operation_graph_tag)
+        .setKernelCache(kernel_cache)
+        .setCudaGraphRetention(cuda_graph_retention);
 
 #ifdef NV_CUDNN_DISABLE_EXCEPTION
     // disable exception macro is defined. Calling build will not throw.
@@ -304,6 +312,7 @@ class Execution_plan_list {
 
     std::vector<bool> barred_indices;
     std::shared_ptr<KernelCache> kernel_cache = nullptr;
+    std::optional<CudaGraphRetention_t> cuda_graph_retention;  // Graph::set_cuda_graph_retention(), if called
 
     int64_t max_workspace_allowed  = std::numeric_limits<int64_t>::max();
     int64_t max_shared_mem_allowed = 1024 * 1024 * 1024;  // Crazy high number (2GB) which will never be hit
@@ -315,7 +324,7 @@ class Execution_plan_list {
     _build_plan_at_index_impl(int64_t index) {
         if (execution_plans[index] == nullptr) {
             CHECK_CUDNN_FRONTEND_ERROR(detail::create_cudnn_execution_plan(
-                execution_plans[index], engine_configs[index], operation_tag, kernel_cache));
+                execution_plans[index], engine_configs[index], operation_tag, kernel_cache, cuda_graph_retention));
         }
 
         auto is_blocked = [](std::string const& full_name, std::vector<std::string> const& blocked_names) -> bool {
@@ -372,6 +381,10 @@ class Execution_plan_list {
     void
     set_kernel_cache(std::shared_ptr<KernelCache> kernel_cache_) {
         kernel_cache = kernel_cache_;
+    }
+    void
+    set_cuda_graph_retention(std::optional<CudaGraphRetention_t> retention) {
+        cuda_graph_retention = retention;
     }
 
     std::vector<std::shared_ptr<ExecutionPlan>>&
@@ -675,7 +688,8 @@ class Execution_plan_list {
     error_t
     build_plans(cudnnHandle_t handle, std::string const& json) {
         execution_plans.resize(1);
-        auto const& fe_status = detail::create_cudnn_execution_plan(execution_plans[0], json, handle);
+        auto const& fe_status =
+            detail::create_cudnn_execution_plan(execution_plans[0], json, handle, cuda_graph_retention);
 
         if (fe_status.is_good()) {
             candidate = 0;
@@ -690,8 +704,8 @@ class Execution_plan_list {
                                        error_code_t::ATTRIBUTE_NOT_SET,
                                        "build_plans: device_properties must not be null");
         execution_plans.resize(1);
-        auto const& fe_status =
-            detail::create_cudnn_execution_plan(execution_plans[0], json, std::move(device_properties));
+        auto const& fe_status = detail::create_cudnn_execution_plan(
+            execution_plans[0], json, std::move(device_properties), cuda_graph_retention);
 
         if (fe_status.is_good()) {
             candidate = 0;
@@ -1029,9 +1043,14 @@ class Execution_plan_list {
 
         // If `stream` is being captured, the CUDA graph being recorded keeps launching this engine's
         // kernel after the frontend graph is gone, and the engine unloads its kernel library when it
-        // is destroyed. Give the graph a reference to the engine first.
-        _CUDNN_CHECK_CUDA_ERROR(oss_rms_norm_silu_graph_retention_.retain_on_capturing_stream(
-            stream, [this]() -> std::shared_ptr<void> { return oss_rms_norm_silu_engine_; }));
+        // is destroyed. Give the graph a reference to the engine first (unless the application keeps
+        // the graph alive itself: CudaGraphRetention_t::NONE).
+        if (detail::effective_cuda_graph_retention(cuda_graph_retention) == CudaGraphRetention_t::PER_GRAPH) {
+            _CUDNN_CHECK_CUDA_ERROR(oss_rms_norm_silu_graph_retention_.retain_on_capturing_stream(
+                stream, [this]() -> std::shared_ptr<void> { return oss_rms_norm_silu_engine_; }));
+        } else {
+            _CUDNN_CHECK_CUDA_ERROR(detail::CudaGraphRetainedResource::drain_deferred_releases_on_stream(stream));
+        }
 
         return oss_rms_norm_silu_engine_->execute(x_ptr,
                                                   y_ptr,
