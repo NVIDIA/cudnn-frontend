@@ -287,7 +287,7 @@ def test_template_params_and_cfg_are_appended():
 def test_kernel_carries_the_pair_arm_as_one_const_expr_axis():
     """The pair item is one const_expr axis of the five warp roles: every role branches on _PAIR_ARM OUTSIDE its persistent loop (a
     dead arm inside the loop would add loop-carried names to the one-batch-entry rendering and move its cubin), the row / bounds
-    arithmetic is shared by every role, the block row of the pair is the lane's row of the q tile."""
+    arithmetic is shared by every role, the block row of the pair is each lane's row of the q tile."""
     src = _KERNEL.read_text()
     assert "_PAIR_ARM = CFG.N_CHUNK > 0" in src
     for fn in (

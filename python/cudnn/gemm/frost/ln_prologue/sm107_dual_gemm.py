@@ -85,7 +85,7 @@ SMEM TABLE (what writes it, what reads it, the per-lane stride, the swizzle and 
   sB[9 x 128 x 64 bf16 = 144 KiB]   TMA -> MMA descriptor.  SWIZZLE_128B (descriptor-read).
   sD[2 x 32 x 128 bf16 = 16 KiB]    epilogue lanes write (lane = row r: one bf16 at [channel][r], 32 lanes = 64 contiguous bytes
                     per instruction, per-lane stride 2 B -> conflict-free as is) -> TMA store (unswizzled box: the inner run is
-                    2 * kbc <= 256 B > the 128-B swizzle span).  NO swizzle: the lane stride is not a multiple of 128 B and the
+                    2 * kbc <= 256 B > the 128-B swizzle span).  NO swizzle: the per-lane stride is not a multiple of 128 B and the
                     unswizzled box needs the dense layout -- the two jobs agree.
   sLn[2 x K fp32 <= 2 KiB]          LN lanes write once at start (gamma | beta, bf16 -> fp32) -> LN lanes read (broadcast
                     LDS.128, every lane the same address: conflict-free).  No swizzle.
@@ -1596,7 +1596,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     # =====================================================================================================================
     if warp_idx >= ln_warp_base:
         nvvm.setmaxregister(ln_reg_count, nvvm.SetMaxRegisterAction.INCREASE)
-        ln_tid = tidx - ln_warp_base * 32  # this CTA's row 0..127 == the SMEM A-stage row this lane normalises
+        ln_tid = tidx - ln_warp_base * 32  # this CTA's row 0..127 == the SMEM A-stage row normalised by the calling lane
         ln_warp = warp_idx - ln_warp_base
         ln_lane = ln_tid & 31
         ln_swz = ln_tid & 7  # the SWIZZLE_128B chunk XOR of this row

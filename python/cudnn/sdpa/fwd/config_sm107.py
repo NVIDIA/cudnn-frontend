@@ -2193,7 +2193,7 @@ SM107_BIAS_D_SHAPES = frozenset(
 
 def operand_region_end_bytes(cfg) -> int:
     """Where the descriptor-fed region of a d128-family kernel ENDS: sQ, sO, sK, sV in the body's declaration order, each a
-    1024-B-aligned slab -- the roots every tcgen05 SMEM descriptor is built from.  The lane-read bias block is declared
+    1024-B-aligned slab -- the roots every tcgen05 SMEM descriptor is built from.  The bias block that lanes read directly is declared
     AFTER them, so with this below ``TCGEN05_V0_ADDR_LIMIT`` every descriptor root stays inside the version-0 window
     whatever the block's size (the block itself may sit past 256 KiB: no descriptor touches it)."""
     s_q = _align_slab(cfg.TILES_Q * cfg.TILE_M * cfg.TILE_K * cfg.BPE)

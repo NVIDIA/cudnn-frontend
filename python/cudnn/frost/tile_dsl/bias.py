@@ -75,7 +75,7 @@ def bias_block_geometry(cfg, *, swz_enum: dict, n_tiles=None) -> BiasBlockGeomet
     Every term comes from the Cfg: a literal here would be the canonical silent-wrong-answer bug (the box count
     and the expect_tx must agree with the SMEM extent the softmax lanes index).  ``n_tiles`` = the SMEM extent in
     tiles: the resident block's ``BIAS_RESIDENT_TILES`` (the default) or the STREAMED ring's stage count -- the
-    caller passes its Cfg's answer so the box count, the expect_tx and the lane offsets stay ONE arithmetic."""
+    caller passes its Cfg's answer so the box count, the expect_tx and the per-lane offsets stay ONE arithmetic."""
     if cfg.BIAS_SWZ_BYTES != BIAS_SWZ_BYTES:
         raise ValueError(
             f"bias_block_geometry: the resident block is written and read under the {BIAS_SWZ_BYTES}-B swizzle (CFG.BIAS_SWZ_BYTES={cfg.BIAS_SWZ_BYTES})"
@@ -157,7 +157,7 @@ def issue_bias_ring_tile_multicast(
 def bias_chunk_smem_offset(gg: BiasBlockGeometry, tile_idx, chunk: int, row) -> cutlass.Int32:
     """Trace-time helper: the LINEAR (pre-swizzle) SMEM element offset of one lane's 64-column row slice -- tile
     ``tile_idx`` (runtime, relative to the item's first kv tile), box ``chunk`` (0..boxes_per_tile-1), row ``row``
-    (the lane's query row inside the block).  Box-major inside a tile, 128 bytes per row inside a box."""
+    (each lane's query row inside the block).  Box-major inside a tile, 128 bytes per row inside a box."""
     return tile_idx * cutlass.Int32(gg.tile_elems) + cutlass.Int32(chunk * gg.subtile_stride_elems) + row * cutlass.Int32(gg.granu_elems)
 
 

@@ -1609,7 +1609,7 @@ it (`config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N`), a requested 128 declines
 path), THD / paged KV / split-KV / PackGQA /
 the epilogue gate / the score side outputs with either operand.  **The additive kv_mask forms** (`kv_mask_form = 2` /
 `3`: the io dtype's 16-bit pairs / fp32, 2026-10-08): the same softmax body loads the tile's 64-column slice of the
-vector as warp-uniform 16-byte granules (nothing staged in SMEM, no barrier row -- the lane ledger of the bit-word
+vector as warp-uniform 16-byte granules (nothing staged in SMEM, no barrier row -- the issuing-lane ledger of the bit-word
 form is the ledger of every form) and folds it into the raw scores pre-scale exactly like the bias (one packed FFMA
 per pair, after the bias add, before the band mask), so the models' finite -1e9 fold is preserved as a VALUE: a key at
 -1e9 contributes exp(-1e9) = 0, a row whose every key is -1e9 is the uniform average of V (eager math), a -inf vector

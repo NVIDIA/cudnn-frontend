@@ -400,7 +400,7 @@ def make_classic_bars(
     per-sub-tile count.
 
     ``bias_resident``: the two item-level rows of the resident additive-bias
-    block (``Bars.mb_bias_full`` / ``mb_bias_empty``; the lane ledger is on the
+    block (``Bars.mb_bias_full`` / ``mb_bias_empty``; the issuing-lane ledger is on the
     fields).  Init counts: ONE_LANE (one elected expect_tx arrive per item) and
     ``CFG.BIAS_EMPTY_ARRIVERS`` (one elected THREAD arrive per softmax warp per
     item = SOFTMAX_WARPGROUPS x SOFTMAX_WG_WARPS, pinned by the config

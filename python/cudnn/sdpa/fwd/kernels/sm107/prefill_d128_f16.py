@@ -1008,7 +1008,7 @@ def _kernel(
         tma_subtile_stride_elems=CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST,
         desc_version=DESC_VERSION,
     )
-    # The bias block -- LAST in SMEM (the lane-read buffer sits after every descriptor-fed operand; see the SMEM BUFFER ROW at
+    # The bias block -- LAST in SMEM (the buffer lanes read directly sits after every descriptor-fed operand; see the SMEM BUFFER ROW at
     # the top of the file).  One stage per resident kv tile (BIAS_MODE 1) or per RING stage (BIAS_MODE 2: STAGES_BIAS stages,
     # one kv tile each); each tile is BIAS_BOXES_PER_TILE 64-column boxes, box-major, 128 B per row per box (the geometry of
     # tile_dsl.bias.bias_block_geometry, all from CFG; n_tiles = the form's SMEM extent, config_sm107.bias_smem_tiles).
@@ -2165,7 +2165,7 @@ SMEM_LAYOUT_QKO = SMEM_LAYOUT_Q
 _O_SWZ_B = {128: 3, 64: 2, 32: 1}[CFG.O_SWZ_BYTES]
 _O_SMEM_SWIZZLE = cutlass.Swizzle(_O_SWZ_B, 4, 3)
 
-# Resident bias block geometry (CFG.BIAS_MODE): the TMA box, the box count per tile, the lane read offsets and the 128-B
+# Resident bias block geometry (CFG.BIAS_MODE): the TMA box, the box count per tile, the per-lane read offsets and the 128-B
 # swizzle, all from CFG (tile_dsl.bias.bias_block_geometry); None folds every bias seam out.
 _BIAS_GG = bias_block_geometry(CFG, swz_enum=_SWZ_ENUM, n_tiles=bias_smem_tiles(CFG)) if _BIAS_ARM else None
 SMEM_LAYOUT_BIAS = _BIAS_GG.layout_enum if _BIAS_ARM else SMEM_LAYOUT_QKO
@@ -3311,7 +3311,7 @@ def _softmax_kv_body_inf(
 
     1. BEFORE the ``bmm1_done`` wait (no dependency on BMM1): the kv_mask keep words of this tile (4 byte loads + 4
        ballots per warp; ``tile_dsl.mask.kv_mask_keep_words``) and the first ``BIAS_PRELOAD_CHUNKS`` 64-column bias chunks
-       of this lane's row from the resident block (one swizzled 128-B load each, kept as 32 packed 16-bit pairs).
+       of the calling lane's row from the resident block (one swizzled 128-B load each, kept as 32 packed 16-bit pairs).
     2. Per 64-column chunk after the raw S load: ``s = bias * inv_scale + s`` as one ``fma.rn.f32x2`` per pair (the bias in
        NATURAL units added pre-scale, so the exp2 argument ``s * scale_log2 - m`` is unchanged in form), then the band mask
        AND the kv_mask word in ONE bit-word pass with the TRUE -inf mask value.

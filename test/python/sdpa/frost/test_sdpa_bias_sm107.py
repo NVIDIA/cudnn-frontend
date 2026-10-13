@@ -417,7 +417,7 @@ def test_config_factory_derives_the_block_and_raises_on_each_coupling():
         c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=1, pack_gqa=True, qh_per_kh=2))
     with pytest.raises(ValueError, match="bias_mode must be 0 / 1"):  # 2 is the streamed ring, 3 its cluster-multicast form (their own modules); 4 is nothing
         c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, bias_mode=4))
-    # TILE_N as a Cfg field (M-2): 64 traces the one-chunk arm, 256 is refused by the TMEM predicate at two sub-tiles.
+    # TILE_N as a Cfg field: 64 traces the one-chunk arm, 256 is refused by the TMEM predicate at two sub-tiles.
     cfg64, _ = c.make_cfg_d32(TemplateParams(dtype_qkv=2, cta_mma=1, tile_n=64))
     assert cfg64.TILE_N == 64 and cfg64.N_BMM2_CHUNKS == 1 and cfg64.BMM2_CHUNK_SIZE == 64
     with pytest.raises(ValueError, match="STATS"):
