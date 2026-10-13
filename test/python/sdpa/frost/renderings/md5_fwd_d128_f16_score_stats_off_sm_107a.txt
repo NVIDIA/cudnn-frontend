@@ -1,7 +1,9 @@
-# The d128 f16/bf16 prefill kernel's cubin md5 with the score side outputs (score_max / score_sum_exp) COMPILED OUT, rendered
-# BEFORE the side outputs landed (host trace-compile of the tree at 973a1e40; the probe body is test_sdpa_fwd_score_stats.py's).
+# The d128 f16/bf16 prefill kernel's cubin md5 with the score side outputs (score_max / score_sum_exp) COMPILED OUT (host
+# trace-compile; the probe body is test_sdpa_fwd_score_stats.py's).  First rendered BEFORE the side outputs landed (the tree at
+# 973a1e40); re-recorded on the tree with origin/develop b01222e76 merged in -- develop's d128 f16 kernel edits between those two
+# trees move every rendering of this kernel, score arm or not.  The pin is the no-score arm's byte identity to THIS record.
 # Lines: dsl=<distribution> <version>; fwd_d128_f16 <arch> <record> rc=0 cubin_md5=<md5>.  A record stays valid for the DSL build it names.
 dsl=nvidia-cutlass-dsl 4.8.0
-fwd_d128_f16 sm_107a dense_bf16 rc=0 cubin_md5=ee4df6dfd4d694f34df1c669b3cc1594
-fwd_d128_f16 sm_107a causal_f16 rc=0 cubin_md5=9638eecbd11579c1b66e8082d0b352f1
-fwd_d128_f16 sm_107a dense_bf16_nolse rc=0 cubin_md5=f41d35744b311a85555646587fee9d5e
+fwd_d128_f16 sm_107a dense_bf16 rc=0 cubin_md5=1be86d0863c723ee5d27ddda1d64c86f
+fwd_d128_f16 sm_107a causal_f16 rc=0 cubin_md5=0adfed5786001e0b5914a7b1dddf26c8
+fwd_d128_f16 sm_107a dense_bf16_nolse rc=0 cubin_md5=f8e5d29bde3b685faac0d191f37fbc3c
