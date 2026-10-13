@@ -1488,6 +1488,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
     def check_support(self) -> bool:
+        """Validate the call against the kernel contract on metadata alone (dtypes, shapes, strides, masks, knobs, the CGA
+        width) and record the outcome in ``_is_supported``; raises the typed decline for an unsupported combination."""
         self._logger.debug("Entering check_support")
 
         if self.pv_bf16:

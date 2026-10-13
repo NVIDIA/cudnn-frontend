@@ -1359,7 +1359,7 @@ def _tmastg_warp_group(
 
 
 @cute.jit
-def _rowsum_chunk(c: int, desc, tmem_a_base, desc_b_base, tmem_c, accumulate_first):
+def _rowsum_chunk(c: cutlass.Constexpr[int], desc, tmem_a_base, desc_b_base, tmem_c, accumulate_first):
     """The ones-MMA row-sum K-phases that read BMM2 chunk ``c`` of P (keys c*64 .. c*64+63 of the tile), issued right
     after that chunk's PV phases instead of once after the whole tile: the k-loop of ``tile_dsl.mma.mma_ts`` restricted
     to the chunk's k range with the same A / B advance arithmetic, so the instruction stream and the accumulation

@@ -493,7 +493,8 @@ def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm10
     """The measured D256 picker says LPT for a masked block-scale graph; the cc 10.7 MXFP8 row claims NATURAL only at
     (256, 256), so every proposed set must be clamped into that domain -- the FALLBACK block had no entry at all and
     the A block kept only its NATURAL runner (test_d256_quantized_primary_uses_measured_scheduler keeps the SM100 row's
-    LPT, which that row's domain honours)."""
+    LPT, which that row's domain honours).  The width is the 2-CTA pair: the graph is a dense unsplit d256 MXFP8
+    leg on cc 10.7 (config_sm100.d256_mxfp8_pair_leg)."""
     name = engines.engine_name(mxfp8=True, arch="sm107")
     spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
     facts = _facts(
@@ -513,7 +514,9 @@ def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm10
     plans = recommend(kind, facts, {name: 20516})
     assert plans, f"{kind}: the row admits the graph (mismatch={engines.mismatch(spec.capabilities, facts)!r}) and must propose a set"
     assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
-    assert (plans[0].knobs.sched_policy, plans[0].knobs.cga, plans[0].knobs.split_kv) == (SCHED_NATURAL, 1, 1)
+    # the dense unsplit d256 MXFP8 graph leads with the 2-CTA pair (config_sm100.d256_mxfp8_pair_leg); the policy stays
+    # clamped to NATURAL and the leg unsplit
+    assert (plans[0].knobs.sched_policy, plans[0].knobs.cga, plans[0].knobs.split_kv) == (SCHED_NATURAL, 2, 1)
 
 
 @pytest.mark.L0

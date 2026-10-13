@@ -1091,6 +1091,8 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 
 
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
+    """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
+    checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
     _validate_params(flavor, params)
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)

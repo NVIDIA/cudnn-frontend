@@ -3455,7 +3455,7 @@ def test_sdpa_fp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
 def test_sdpa_mxfp8_fwd_cc107_L0(env_info, test_no, request, cudnn_handle):
     """MXFP8 prefill + decode on the cc 10.7 MXFP8 row (s_q_min = 1, so s_q == 1 is drawn; that row
     runs decode on its prefill bodies): test_sdpa_mxfp8_fwd_L0's draw over the four exact flavors
-    (d192x128 is cga2-only, d256 cga1-only -- the heuristics pick), FULL layout, both output dtypes,
+    (d192x128 is cga2-only, dense d256 leads with the cga2 pair and its THD / split / paged legs with cga1 -- the heuristics pick), FULL layout, both output dtypes,
     block-scaled O on d128, Stats on / off (the fused HALF+fold arm is stats-less only, so both must be
     drawn); all four knob sets {FLOAT, HALF} x {in-kernel scale, fold}."""
     _require_frost_sm107(_cc107_engine("mxfp8"))
