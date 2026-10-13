@@ -2607,8 +2607,14 @@ leaving the previously live rows finite and the pad rows 0; two launches bitwise
 CUDA graph on a new stream with no warm-up under `set_sync_debug_mode("error")`, replayed bitwise an eager run and then replayed over the
 next chunk's lengths / tables / slots written through the captured tensors; 16 fresh processes (one launch each, under `timeout`: n_kv in {1, 2, 4, 8} x 3 seeds at kv_len = 128 x n_kv, plus the tail twins 128 x n_kv - 37 at n_kv in {1, 3, 4, 8}; B_max 2, L2, page 64) exit 0 / 124 / other = 16 / 0 / 0. `serving_envelope(geometry, dtype, device)`
 publishes the form's declines (every row reachable at declaration with the published message, pinned on the CPU) and its served verdict.
+Also executed on the same node, each through the suite's own harness and check (`test_extend_admitted_spellings_execute_within_the_budget`:
+5 / 5 within the dense suite's budget, worst `out` cos 0.999988 -- the fused pipeline -- and gated-O max|err| 3.906e-03 bf16 / 4.883e-04 f16;
+nothing widened): the five spellings the declaration admits -- the `[B]` lengths form (`cu_seqlens=False`) on the matrix packing (L1, page
+16), `fuse_norm_rope=True` (the fork-written slab the write-through reads; L2, page 32), the out-of-place Q / K / V pipeline
+(`inplace_qkv=False`, f16, L3, page 64), a FULL table row (`kv_len = max_pages x P` = 256) on a `[:, :max_pages]` slice of a wider table
+under the lengths form, and a block table WIDER than `max_pages` (`[2, 40]` at the declared row stride 50, `max_pages` 16).
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the DECODE form (a
 dense `[B, S_q <= 4, d_model]` declaration with `kv_source="paged"`: the `dense_declaration` row), an LSE / a sliding window / a
-`QsaSpec` / another head dim / `save_for_backward` / `quant` on the EXTEND form, e4m3 pools (`kv_cache_dtype`), the write-through
+`QsaSpec` / another head dim / `fuse_gate` (the paged body carries no gate seam) / `save_for_backward` / `quant` on the EXTEND form, e4m3 pools (`kv_cache_dtype`), the write-through
 folded into the projection epilogue, `quant` / `save_for_backward` together with the write-through attribute.
