@@ -215,8 +215,9 @@ get_last_error_string() {
 template <typename Enum, typename... Extra>
 static py::enum_<Enum>
 bind_enum(py::module_& m, char const* name, Extra const&... extra) {
-    return py::enum_<Enum>(m, name, extra...).def("__int__",
-                                                  [](Enum value) { return static_cast<std::underlying_type_t<Enum>>(value); });
+    return py::enum_<Enum>(m, name, extra...).def("__int__", [](Enum value) {
+        return static_cast<std::underlying_type_t<Enum>>(value);
+    });
 }
 
 void
