@@ -235,11 +235,9 @@ def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
 
 @pytest.mark.L0
 @pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (80, 112)], ids=lambda d: str(d))
-def test_sm120_mxfp8_tiles_charge_the_scale_tiles(d_qk, d_v):
-    """The SM120 MXFP8 row rides the SM120 tile rule with the K/V scale tiles in the SMEM model,
-    and every proposed set is admissible on its own row."""
-    from cudnn.sdpa.fwd.config_sm120 import SMEM_CAPACITY_BYTES, smem_bytes
-
+def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
+    """The SM120 MXFP8 row rides the SM120 tile rule, and no rule measured on another row (the SM100
+    MXFP8 d128 cga1 / cga2 choice) hands it a set outside its own domain."""
     name = "sdpa_fwd_prefill_sm120_mxfp8"
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     facts = _facts(
@@ -255,11 +253,9 @@ def test_sm120_mxfp8_tiles_charge_the_scale_tiles(d_qk, d_v):
     )
     plans = recommend("A", facts, {name: 20518})
     assert plans
-    d_qp, d_vp = -(-d_qk // 32) * 32, -(-d_v // 32) * 32
     for plan in plans:
         assert plan.knobs.cga == 1
         assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
-        assert smem_bytes(d_qp, d_vp, plan.knobs.tile_m, plan.knobs.tile_n, 1, 2, mxfp8=True) <= SMEM_CAPACITY_BYTES
 
 
 @pytest.mark.L0

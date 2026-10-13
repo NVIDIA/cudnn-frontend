@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16  # noqa: F401  (DTYPE_E4M3 re-exported for the FP8 template)
+from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_ROWS
 
 SEQ_Q_TILES = (128, 64)
 SEQ_KV_TILES = (128, 64, 32)
@@ -23,21 +24,13 @@ FP8_GENERAL_HEAD_TILE_MAX = 256
 FP8_GENERAL_HEAD_TILES = tuple(range(FP8_HEAD_TILE_GRANULE, FP8_GENERAL_HEAD_TILE_MAX + 1, FP8_HEAD_TILE_GRANULE))
 
 
-# MXFP8 scale factors: one E8M0 byte per 32 elements, stored in cuDNN's
-# F8_128x4 order -- 512-byte atoms of 128 rows x 4 blocks, one atom per
-# 128-element head-dim plane (see sdpa/kernels/_mxfp8_sf.py).
-MXFP8_SF_BLOCK = 32
-MXFP8_SF_ATOM_ROWS = 128
-MXFP8_SF_ATOM_BYTES = 512
-
-
 def mxfp8_sf_tile_bytes(head_dim: int) -> int:
     """Bytes of one 128-row scale-factor tile covering every head-dim plane.
 
     The same count serves Q/K (rows = tokens, blocks along D) and V (rows = D
     columns, blocks along a 128-key span; a 64-key KV tile reads half of it).
     """
-    return MXFP8_SF_ATOM_BYTES * ((head_dim + MXFP8_SF_ATOM_ROWS - 1) // MXFP8_SF_ATOM_ROWS)
+    return SF_ATOM_BYTES * ((head_dim + SF_ATOM_ROWS - 1) // SF_ATOM_ROWS)
 
 
 D256_FLAVOR = (256, 256)

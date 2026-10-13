@@ -1871,8 +1871,9 @@ the last scaled block). The d512 band is not served. Dense scale tensors are
 the F8_128x4 `(B, H, ceil(S/128) tiles)` layout, so prepared dense plans keep
 batch, S_q and S_kv fixed; THD packs, per head, each sequence's ceil(S/128) tiles in
 cu_seqlens order with the planes of a tile contiguous. Rows past the valid Q
-length and 32-key V blocks wholly past the valid KV length use the unit scale,
-so NaN pad encodings never reach O. A block-scaled MXFP8 O (E4M3 with one UE8M0
+length, 32-key V blocks wholly past the valid KV length and the V-scale rows of
+envelope pad columns past d_v use the unit scale, so NaN pad encodings never
+reach O or Amax_O. A block-scaled MXFP8 O (E4M3 with one UE8M0
 scale per 32 d elements in `sf_o`, after the optional global `scale_o`) is served
 at d_qk = d_v = 128 on dense, untrimmed, unsplit, unpacked graphs, as on the FP8
 row; the FP4 (NVFP4) O stays per-tensor only. Validated on an RTX 5080 and an RTX PRO 6000

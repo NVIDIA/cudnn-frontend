@@ -645,7 +645,7 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     return _load_kernel_template(filename, params, tag)
 
 
-def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = True):
+def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = False):
     files = (_SM120_FP8_KERNEL_FILES if pertensor else _SM120_MXFP8_KERNEL_FILES) if fp8 else _SM120_KERNEL_FILES
     tag = f"sdpa_fwd_sm120_{'fp8' if pertensor else 'mxfp8'}" if fp8 else "sdpa_fwd_sm120"
     if flavor is not None:
@@ -1770,7 +1770,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes and not _fp8_envelope_ok,
             f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires a native shape in {sorted(fp8_shapes)}"
             + (
-                f" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16; floors {sorted(_SM100_FP8_ENVELOPE_FLOORS.items())})"
+                f" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16; " f"floors {sorted(_SM100_FP8_ENVELOPE_FLOORS.items())})"
                 if self._pertensor
                 else " (no envelope padding)"
             )
@@ -2173,7 +2173,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         _thd_fp8_shapes = set(_SM100_FP8_KERNEL_FILES if self._pertensor else _SM100_MXFP8_KERNEL_FILES) - {(64, 64)}
         self._not_implemented_error_if(
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
-            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; got (D_QK={d_qk}, D_V={d_v})",
+            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
         )
         # THD on the Rubin line: the per-tensor FP8 kernels at every ported
         # shape (SM107_FP8_THD_SHAPES: d128, d192xd128, d256, d512), the
@@ -5199,7 +5199,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         self._not_implemented_error_if(
             self.thd or self.cu_seq_q_lens or self.cu_seq_kv_lens,
-            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; sdpa_fwd_wrapper_sm80's varlen path launches them directly",
+            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's varlen path launches them directly",
         )
         self._not_implemented_error_if(
             self.window_size_right is not None and not self.is_causal,

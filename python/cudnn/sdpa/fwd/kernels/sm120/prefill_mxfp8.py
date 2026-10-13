@@ -75,6 +75,7 @@ from cutlass.experimental import primitives as prims
 from cudnn.frost.tile_dsl.constants import DTYPE_BF16, DTYPE_E4M3, DTYPE_E5M2, DTYPE_FP16, DTYPE_O_MXFP8, O_BLOCK_SCALE_BY_DTYPE
 from cudnn.frost.tile_dsl.mma import mma_m16n8k32_mxf8_f32
 from cudnn.frost.tile_dsl.pointwise import amax_to_ue8m0_rp, fp32_to_fp8x2, pack_fp8x2_pairs
+from cudnn.frost.tile_dsl.sf_layout import SF_ATOM_BYTES, SF_ATOM_ROWS, sf_atom_byte
 from cudnn.frost.tile_dsl.scheduler import (
     SCHED_LPT_L2,
     SCHED_NATURAL,
@@ -98,9 +99,6 @@ from cudnn.sdpa.fwd.kernels.sm120._common import (
 )
 from cudnn.sdpa.fwd.config_sm120 import (
     FP8_HEAD_TILE_GRANULE,
-    MXFP8_SF_ATOM_BYTES,
-    MXFP8_SF_ATOM_ROWS,
-    MXFP8_SF_BLOCK,
     SEQ_KV_TILES as _SEQ_KV_TILES,
     SEQ_Q_TILES as _SEQ_Q_TILES,
     FP8_GENERAL_HEAD_TILES as _FP8_GENERAL_HEAD_TILES,
@@ -132,6 +130,9 @@ P_CAST_LOG2_SCALE = 4.0
 # folded form changes how the PV loop forms its V shared-memory addresses, which
 # runs slower at some head tiles.
 O_SCALE = 2.0**-P_CAST_LOG2_SCALE
+# MXFP8 SF constants -- E8M0 scale factor, 32 elems share one SF (the K of one
+# block-scaled m16n8k32 MMA).
+BLOCK_SCALE_BLOCK_SIZE = 32
 validate_params(
     PARAMS,
     allowed_dtypes=(DTYPE_E4M3, DTYPE_E5M2),
@@ -173,12 +174,6 @@ fma2 = partial(prims.fma_packed_f32x2, ftz=False, rnd=prims.FPRoundingMode.RN)
 
 # Four E8M0 unit scales (2**0 = 127), one per byte of a scale register.
 SF_UNIT_X4 = 0x7F7F7F7F
-
-
-def _sf_row_word(r):
-    """Word index of row ``r`` (0..127) inside one F8_128x4 plane of 32-bit words:
-    byte ``(r % 32) * 16 + ((r // 32) % 4) * 4`` holds the row's four block scales."""
-    return (r % 32) * 4 + (r // 32) % 4
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +382,8 @@ class SM120FusedMultiHeadAttentionForward:
         # a 128-key span per row). SMEM keeps one K and one V tile.
         self.qk_sf_tile_bytes = mxfp8_sf_tile_bytes(self.head_tile_qk)
         self.v_sf_tile_bytes = mxfp8_sf_tile_bytes(self.head_tile_v)
-        self.qk_sf_planes = self.qk_sf_tile_bytes // MXFP8_SF_ATOM_BYTES
-        self.v_sf_planes = self.v_sf_tile_bytes // MXFP8_SF_ATOM_BYTES
+        self.qk_sf_planes = self.qk_sf_tile_bytes // SF_ATOM_BYTES
+        self.v_sf_planes = self.v_sf_tile_bytes // SF_ATOM_BYTES
 
     @cute.jit
     def load_one_kv_tile(
@@ -485,14 +480,14 @@ class SM120FusedMultiHeadAttentionForward:
         covering keys ``[kv_seq_idx, kv_seq_idx + kv_tile)``.
 
         Straight-line address arithmetic only, traced at the call site."""
-        tile = sf_coords.kv_tile_base + kv_seq_idx // MXFP8_SF_ATOM_ROWS
+        tile = sf_coords.kv_tile_base + kv_seq_idx // SF_ATOM_ROWS
         if is_v:
             return dict(
                 sf_dst=sf_dst,
                 sf_src=sf_coords.v_ptr + tile * sf_coords.v_tile_stride,
                 sf_src_stride=sf_coords.v_plane_stride,
                 sf_copies=self.v_sf_planes,
-                sf_copy_bytes=MXFP8_SF_ATOM_BYTES,
+                sf_copy_bytes=SF_ATOM_BYTES,
             )
         return dict(
             sf_dst=sf_dst,
@@ -577,14 +572,12 @@ class SM120FusedMultiHeadAttentionForward:
         if cutlass.const_expr(self.pack_gqa and self.qh_per_kh != 1):
             q_head = q_head + row_in_cta % self.qh_per_kh
         # Int64 before every product: the scale tensor spans B * H * tiles tiles.
-        tile = (
-            (cutlass.Int64(basic_params.sf_q_bh0) + cutlass.Int64(q_head)) * basic_params.sf_q_tiles + basic_params.sf_q_tile0 + q_token // MXFP8_SF_ATOM_ROWS
-        )
-        row_off = tile * self.qk_sf_tile_bytes + _sf_row_word(q_token % MXFP8_SF_ATOM_ROWS) * 4
+        tile = (cutlass.Int64(basic_params.sf_q_bh0) + cutlass.Int64(q_head)) * basic_params.sf_q_tiles + basic_params.sf_q_tile0 + q_token // SF_ATOM_ROWS
+        row_off = sf_atom_byte(q_token % SF_ATOM_ROWS, 0, base=tile * self.qk_sf_tile_bytes)
         for plane in cutlass.range_constexpr(self.qk_sf_planes):
             word = cutlass.Int32(SF_UNIT_X4)
             if q_token < basic_params.seqlen_q:
-                word = (basic_params.sf_q_ptr + row_off + plane * MXFP8_SF_ATOM_BYTES).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
+                word = (basic_params.sf_q_ptr + row_off + plane * SF_ATOM_BYTES).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
             q_sf[plane] = word
         return q_sf
 
@@ -650,7 +643,7 @@ class SM120FusedMultiHeadAttentionForward:
             key_lo = kv_sf_row0 + k_frag_pair * 16 + basic_params.lane // 4
             for plane in cutlass.range_constexpr(self.qk_sf_planes):
                 for half in cutlass.range_constexpr(2):
-                    sf_off = plane * MXFP8_SF_ATOM_BYTES + _sf_row_word(key_lo + half * 8) * 4
+                    sf_off = sf_atom_byte(key_lo + half * 8, 0, base=plane * SF_ATOM_BYTES)
                     sf_k[2 * plane + half] = (mma_params.sKSF.data_ptr() + sf_off).load(count=4, alignment=4).bitcast(cutlass.Int32)[0]
             for d_frag in cutlass.range_constexpr(self.qk_d_frags):
                 k_vec = load_k_frag_pair(k_frag_pair, d_frag)
@@ -886,8 +879,12 @@ class SM120FusedMultiHeadAttentionForward:
             block scales share a word, but holding a word per column across the
             k32 steps adds register pressure to the PV loop."""
             col = d_frag_pair * 16 + half * 8
-            block = v_frag if cutlass.const_expr(self.kv_tile >= MXFP8_SF_ATOM_ROWS) else kv_sf_row0 // MXFP8_SF_BLOCK + v_frag
-            sf_off = (col // MXFP8_SF_ATOM_ROWS) * MXFP8_SF_ATOM_BYTES + _sf_row_word(col % MXFP8_SF_ATOM_ROWS + lane // 4) * 4 + block
+            if cutlass.const_expr(col >= basic_params.head_dim_v):
+                # A pad D column of the envelope (d_v is a multiple of 16, so each 8-column group is wholly
+                # valid or wholly pad): its V data is TMA zero-fill, and its stored scale byte may encode NaN.
+                return cutlass.Int32(SF_UNIT_X4 & 0xFF)
+            block = v_frag if cutlass.const_expr(self.kv_tile >= SF_ATOM_ROWS) else kv_sf_row0 // BLOCK_SCALE_BLOCK_SIZE + v_frag
+            sf_off = sf_atom_byte(col % SF_ATOM_ROWS + lane // 4, block, base=(col // SF_ATOM_ROWS) * SF_ATOM_BYTES)
             sf = cutlass.Int32((mma_params.sVSF.data_ptr() + sf_off).load(count=1, alignment=1)[0])
             if cutlass.const_expr(v_sf_valid_blocks is not None):
                 sf = sf if block < v_sf_valid_blocks else cutlass.Int32(SF_UNIT_X4 & 0xFF)
@@ -1019,8 +1016,8 @@ class SM120FusedMultiHeadAttentionForward:
         """
         # The first key of this tile inside its 128-key scale span.
         kv_sf_row0 = cutlass.Int32(0)
-        if cutlass.const_expr(self.kv_tile < MXFP8_SF_ATOM_ROWS):
-            kv_sf_row0 = (kv_tile_idx * self.kv_tile) % MXFP8_SF_ATOM_ROWS
+        if cutlass.const_expr(self.kv_tile < SF_ATOM_ROWS):
+            kv_sf_row0 = (kv_tile_idx * self.kv_tile) % SF_ATOM_ROWS
         v_sf_valid_blocks = None
         if cutlass.const_expr(in_mask_steps and is_first_kv_tile):
             # The rightmost tile holds the KV tail: 32-key blocks wholly past
@@ -1029,7 +1026,7 @@ class SM120FusedMultiHeadAttentionForward:
             span_start = kv_tile_idx * self.kv_tile - kv_sf_row0
             v_sf_valid_blocks = cute.math.max(
                 cutlass.Int32(0),
-                cute.math.min(cutlass.Int32(MXFP8_SF_ATOM_ROWS // MXFP8_SF_BLOCK), ceil_div(basic_params.seqlen_k - span_start, MXFP8_SF_BLOCK)),
+                cute.math.min(cutlass.Int32(SF_ATOM_ROWS // BLOCK_SCALE_BLOCK_SIZE), ceil_div(basic_params.seqlen_k - span_start, BLOCK_SCALE_BLOCK_SIZE)),
             )
 
         # The K/V loop walks tile indices in reverse order. The mbarrier parity
@@ -1241,18 +1238,23 @@ class SM120FusedMultiHeadAttentionForward:
             sf_kv_bh0 = cutlass.Int32(0)
             n_batch_meta = (seq_kv_lens.shape[0] - 4) // 4
             meta_sf = cutlass.make_array_view(seq_kv_lens)
-            for prev in cutlass.range(0, batch_idx, 1, unroll=1):
+            # The lanes split the earlier sequences and a butterfly sums their tile counts, so a unit
+            # reads ceil(batch_idx / 32) sequences' lengths per lane rather than batch_idx.
+            for prev in cutlass.range(lane, batch_idx, cute.arch.WARP_SIZE, unroll=1):
                 len_q_prev = cutlass.Int32(meta_sf[n_batch_meta + prev + 1]) - cutlass.Int32(meta_sf[n_batch_meta + prev])
                 len_kv_prev = cutlass.Int32(meta_sf[2 * n_batch_meta + 2 + prev]) - cutlass.Int32(meta_sf[2 * n_batch_meta + 1 + prev])
-                sf_q_tile0 = sf_q_tile0 + ceil_div(len_q_prev, MXFP8_SF_ATOM_ROWS)
-                sf_kv_tile0 = sf_kv_tile0 + ceil_div(len_kv_prev, MXFP8_SF_ATOM_ROWS)
+                sf_q_tile0 = sf_q_tile0 + ceil_div(len_q_prev, SF_ATOM_ROWS)
+                sf_kv_tile0 = sf_kv_tile0 + ceil_div(len_kv_prev, SF_ATOM_ROWS)
+            for i in cutlass.range_constexpr(5):
+                sf_q_tile0 = sf_q_tile0 + prims.shfl_sync(thread_mask=0xFFFFFFFF, val=sf_q_tile0, offset=16 >> i, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY)
+                sf_kv_tile0 = sf_kv_tile0 + prims.shfl_sync(thread_mask=0xFFFFFFFF, val=sf_kv_tile0, offset=16 >> i, mask_and_clamp=0x1F, kind=prims.Shfl.BFLY)
         sf_kv_tiles = cutlass.Int32(sf_k.shape[2])
         # Dense V planes sit a whole plane of B * H_kv * tiles atoms apart;
         # THD keeps the planes of one tile contiguous.
-        v_sf_tile_stride = self.v_sf_tile_bytes if cutlass.const_expr(self.thd_varlen) else MXFP8_SF_ATOM_BYTES
-        v_sf_plane_stride = cutlass.Int64(MXFP8_SF_ATOM_BYTES)
+        v_sf_tile_stride = self.v_sf_tile_bytes if cutlass.const_expr(self.thd_varlen) else SF_ATOM_BYTES
+        v_sf_plane_stride = cutlass.Int64(SF_ATOM_BYTES)
         if cutlass.const_expr(not self.thd_varlen):
-            v_sf_plane_stride = cutlass.Int64(sf_v.shape[0]) * cutlass.Int64(sf_v.shape[1]) * cutlass.Int64(sf_v.shape[2]) * MXFP8_SF_ATOM_BYTES
+            v_sf_plane_stride = cutlass.Int64(sf_v.shape[0]) * cutlass.Int64(sf_v.shape[1]) * cutlass.Int64(sf_v.shape[2]) * SF_ATOM_BYTES
         sf_coords = SimpleNamespace(
             q_ptr=sf_q.iterator.raw_ptr(),
             k_ptr=sf_k.iterator.raw_ptr(),
@@ -1388,6 +1390,7 @@ class SM120FusedMultiHeadAttentionForward:
                 seqlen_q=seqlen_q,
                 seqlen_k=seqlen_k,
                 head_dim_qk=head_dim_qk,
+                head_dim_v=head_dim_v,
                 q_ptr=q_ptr,
                 batch_idx=batch_idx,
                 head_idx=head_idx,

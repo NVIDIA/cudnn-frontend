@@ -250,6 +250,7 @@ def _run(
     pack_gqa=None,
     split_kv=None,
     poison_pad=False,
+    poison_v_sf_pad_cols=False,
     sync_debug=False,
     layout="bshd",
     sf_o_layout=None,
@@ -293,6 +294,11 @@ def _run(
             if rows:
                 off = _rowwise_sf_offsets(B, H_q, S_q, d_qk, rows, list(range(_cdiv(d_qk, _BLOCK))))[b]
                 sfq.view(-1)[off.reshape(-1)] = 0xFF
+    if poison_v_sf_pad_cols:
+        # V-scale rows past d_v inside its last 128-row atom carry the NaN encoding (caller-owned pad bytes).
+        sfv = sfv.clone()
+        off = _columnwise_sf_offsets(B, H_kv, S_kv, d_v, list(range(_cdiv(S_kv, _BLOCK))), list(range(d_v, _cdiv(d_v, 128) * 128)))
+        sfv.view(-1)[off.reshape(-1)] = 0xFF
 
     Ob = _nan_output((B, S_q, H_q, d_v), out_dt).transpose(1, 2)
     Qb, Kb, Vb, Ob = (_LAYOUTS[layout](x) for x in (Qb, Kb, Vb, Ob))
@@ -454,8 +460,9 @@ def test_mxfp8_sm120_head_dims(d_qk, d_v):
 @pytest.mark.parametrize("d_qk,d_v", [(80, 80), (112, 112), (112, 80), pytest.param(144, 208, marks=pytest.mark.L1)], ids=lambda d: str(d))
 @torch_fork_set_rng(seed=19)
 def test_mxfp8_sm120_head_dim_envelope(d_qk, d_v):
-    """Multiples of 16 ride the next 32-multiple tile: TMA zero-fills the columns inside the last scaled block."""
-    _check(_run(1, 2, 2, 192, 256, d_qk=d_qk, d_v=d_v, sdpa_kwargs=_MASKS["causal"]), d_qk=d_qk)
+    """Multiples of 16 ride the next 32-multiple tile: TMA zero-fills the columns inside the last scaled block,
+    and the NaN-encoded V-scale rows past d_v stay out of O and Amax_O."""
+    _check(_run(1, 2, 2, 192, 256, d_qk=d_qk, d_v=d_v, sdpa_kwargs=_MASKS["causal"], poison_v_sf_pad_cols=True), d_qk=d_qk)
 
 
 @pytest.mark.L0
@@ -675,7 +682,7 @@ def _graph_offers(d_qk=128, d_v=128):
         g.validate()
         g.build_operation_graph()
         g.create_execution_plans([cudnn.heur_mode.A])
-    except (cudnn.cudnnGraphNotSupportedError, RuntimeError, ValueError):
+    except cudnn.cudnnGraphNotSupportedError:
         # No engine at all serves the graph: for "this engine must not claim it" that is the same answer.
         return False
     return offers_engine(g, _ENGINE)
@@ -683,12 +690,12 @@ def _graph_offers(d_qk=128, d_v=128):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "kwargs",
-    [dict(d_qk=512, d_v=512), dict(d_qk=24, d_v=24)],
-    ids=["d512", "off_granule"],
+    "kwargs,offered",
+    [(dict(d_qk=128, d_v=128), True), (dict(d_qk=512, d_v=512), False), (dict(d_qk=24, d_v=24), False)],
+    ids=["d128", "d512", "off_granule"],
 )
-def test_mxfp8_sm120_declines_outside_the_envelope(kwargs):
-    assert not _graph_offers(**kwargs)
+def test_mxfp8_sm120_offers_only_inside_the_envelope(kwargs, offered):
+    assert _graph_offers(**kwargs) == offered
 
 
 # --- THD (ragged) ----------------------------------------------------------------------------
@@ -900,6 +907,16 @@ def test_mxfp8_sm120_thd(mask):
     """Each sequence's scale tiles start after every earlier sequence's ceil(S / 128) tiles; empty
     sequences contribute none."""
     _check(_run_thd(*_THD_LENS, 4, 2, sdpa_kwargs=_MASKS[mask]))
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=149)
+def test_mxfp8_sm120_thd_many_sequences():
+    """More sequences than a warp has lanes: each lane sums the tile counts of several earlier sequences
+    (empty and multi-tile ones included) before the warp combines them."""
+    lens_q = [(0, 17, 130, 64, 1, 257)[i % 6] for i in range(70)]
+    lens_kv = [(31, 0, 129, 200, 64, 300)[i % 6] for i in range(70)]
+    _check(_run_thd(lens_q, lens_kv, 2, 1, sdpa_kwargs=_MASKS["causal_br"]))
 
 
 @pytest.mark.L0

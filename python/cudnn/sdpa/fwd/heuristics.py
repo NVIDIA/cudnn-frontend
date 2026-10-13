@@ -1123,7 +1123,7 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         # no-split 1.07x -> 1.05x, dense S=2K unchanged.  The split leg keeps
         # cga2 (split_cgas_by_d_shape); the THD and paged legs are cga2-only.
         return sched_policy, 1
-    if selected_shape == (128, 128) and facts.is_mxfp8 and {1, 2} <= domain and not facts.thd and not facts.has_paged_kv:
+    if selected_shape == (128, 128) and facts.is_mxfp8 and caps.sm_lo == 100 and 1 in domain and not facts.thd and not facts.has_paged_kv:
         # MXFP8 d128 on a dense graph.  cga1 = one 256-row CTA of the prefill body (the geometry cuDNN's own MXFP8
         # d128 kernel runs; no pair handshake at the tile boundary, but no K/V multicast either).  MEASURED 2026-10-07
         # against the cga2 pair in the benchmark regime (same-node A/B, cuDNN 9.27; O bit-identical between the
