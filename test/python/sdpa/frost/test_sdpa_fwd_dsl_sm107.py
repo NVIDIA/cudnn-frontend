@@ -1336,6 +1336,8 @@ def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
     assert supported_cgas_for((192, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
     assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (2,)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7)) == (1,)
+    # ...while d256 MXFP8 admits the pair too (test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair pins where it is used)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
 
 
 # --- LPT on Rubin, advertised PER D-SHAPE -----------------------------------
@@ -3299,10 +3301,10 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    # The PRODUCTION CTA geometry, from the adapter itself: cga2 for d128 / d512, cga1 for d256 (review on #1129: a d256 fp8 row
-    # compiled at cga2 was a configuration the adapter never builds).  One width per Rubin quantized flavor today; if that ever
-    # widens, the unpack fails here and the row has to say which geometry it pins.
-    (cta_mma,) = supported_cgas_for((d, d), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    # The PRODUCTION dense geometry, from the adapter itself: the widest width the row serves the flavor at -- the cga2 pair for
+    # d128 / d512 and for d256 MXFP8 (config_sm100.d256_mxfp8_pair_leg), cga1 for d256 per-tensor FP8 (review on #1129: a d256
+    # fp8 row compiled at cga2 was a configuration the adapter never builds).
+    cta_mma = max(supported_cgas_for((d, d), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8")))
     params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma, **MASKS[mask])  # E4M3 in; the row picks the O dtype
     mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
@@ -3475,7 +3477,7 @@ _SM107_O_STORE_PROBE = textwrap.dedent("""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     fp8 = quant not in ("f16", "f16_2x2")
-    (cta_mma,) = supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    cta_mma = max(supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 7), pertensor=(quant == "fp8")))  # the production dense width (the pair where the row serves it)
     # E4M3 in on the quantized rows, BF16 in on the f16 rows; the row picks the O dtype.  "f16_2x2" is the d512
     # 2x2-datapath sibling (TemplateParams.mma_2x2); the role-split rows pass the field's default.
     params = TemplateParams(dtype_qkv=(0 if fp8 else 2), dtype_o=dtype_o, cta_mma=cta_mma, mma_2x2=(quant == "f16_2x2"))
@@ -7673,3 +7675,105 @@ def test_d256_pack_gqa_divisibility_rule_is_exempted_on_the_rubin_decode_tile_on
     a = api()
     assert a.check_support()
     assert a._decode_q_tile() == 16 and a._decode_q_tile_for(1, 15, 5) == 16
+
+
+# --- d256 MXFP8: the 2-CTA pair on the dense legs (cc 10.7) ------------------
+
+
+@pytest.mark.L0
+def test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair():
+    """d256 MXFP8 on cc 10.7 serves both CTA widths and runs the 2-CTA pair on the dense unsplit legs, where it measured
+    8-13 % faster (dense) / 6-7 % (causal) than one CTA with a bitwise-identical O; THD (the pair's untested arm),
+    split-KV and paged graphs stay at cga1.  ONE predicate (config_sm100.d256_mxfp8_pair_leg) drives the row domain,
+    the ranking and the standalone adapter -- pin all three, plus the per-tensor FP8 row, which keeps cga1."""
+    from dataclasses import replace
+
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines, heuristics
+    from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams, d256_mxfp8_pair_leg
+
+    base = dict(device_cc=(10, 7), pertensor=False, thd=False, paged=False, split_kv=1)
+    assert d256_mxfp8_pair_leg(**base)
+    for off in (dict(pertensor=True), dict(thd=True), dict(paged=True), dict(split_kv=2), dict(device_cc=(10, 0))):
+        assert not d256_mxfp8_pair_leg(**{**base, **off}), off
+    # the standalone adapter admits both widths for MXFP8 on cc 10.7 only
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=True) == (1,)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 0), pertensor=False) == (1,)
+    # the row domain, narrowed per graph
+    caps = _caps("sdpa_fwd_prefill_sm107_mxfp8")
+    assert dict(caps.cgas_by_d_shape)[(256, 256)] == frozenset({1, 2})
+    assert dict(_caps("sdpa_fwd_prefill_sm107_fp8").cgas_by_d_shape)[(256, 256)] == frozenset({1})
+    dense = _mxfp8_facts(d_qk=256, d_v=256)
+    assert engines.effective_cgas(caps, dense) == frozenset({1, 2})
+    assert engines.effective_cgas(caps, _mxfp8_facts(d_qk=256, d_v=256, causal=True)) == frozenset({1, 2})
+    assert engines.effective_cgas(caps, _mxfp8_facts(d_qk=256, d_v=256, thd=True)) == frozenset({1})
+    assert engines.effective_cgas(caps, dense, split_kv=2) == frozenset({1})
+    # the knob selector and the ranking pick the pair exactly on the pair legs
+    tp = TemplateParams(dtype_qkv=0, dtype_o=2)
+    at = dict(s_q=4096, s_kv=4096, device_cc=(10, 7))
+    assert heuristics.select_d256_auto_knobs(tp, pertensor=False, **at) == (SCHED_NATURAL, 2)
+    assert heuristics.select_d256_auto_knobs(replace(tp, window_right=0), pertensor=False, **at) == (SCHED_LPT, 2)
+    assert heuristics.select_d256_auto_knobs(tp, pertensor=True, **at) == (SCHED_NATURAL, 1)
+    assert heuristics.select_d256_auto_knobs(replace(tp, thd_varlen=True), pertensor=False, **at) == (SCHED_NATURAL, 1)
+    assert heuristics.select_d256_auto_knobs(tp, pertensor=False, paged=True, **at) == (SCHED_NATURAL, 1)
+    assert heuristics.select_d256_auto_knobs(tp, pertensor=False, s_q=4096, s_kv=4096) == (SCHED_NATURAL, 1), "no device given: the one-CTA default"
+    spec = {s.name: s for s in engines.ENGINE_SPECS}["sdpa_fwd_prefill_sm107_mxfp8"]
+    assert heuristics._auto_sched_cga(spec, dense, split_kv=1, sched_policy=SCHED_NATURAL)[1] == 2
+    assert heuristics._auto_sched_cga(spec, _mxfp8_facts(d_qk=256, d_v=256, thd=True), split_kv=1, sched_policy=SCHED_NATURAL)[1] == 1
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm107_d256_mxfp8_pair_is_bitwise_the_one_cta_build(causal):
+    """cc 10.7 e2e: the same block-scaled d256 problem at cga1, at cga2 and with the knob unset (which must pick the
+    pair).  The pair halves the K/V slabs per CTA and runs the collective MMA; the per-row arithmetic is unchanged, so O
+    and LSE must be BIT-IDENTICAL across the widths and within the fp32 oracle bound."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the sm107 MXFP8 kernels serve cc10.7 only")
+    from sdpa.mxfp8_quant import quantize_to_mxfp8
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    b, hq, hkv, s, d = 1, 4, 2, 2048, 256
+    torch.manual_seed(0)
+    dev = "cuda"
+    qf = torch.randn(b, hq, s, d, device=dev) * 0.5
+    kf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+    vf = torch.randn(b, hkv, s, d, device=dev) * 0.5
+
+    def mx(x, h, columnwise):
+        data_d, _, swz_d, data_s, _, swz_s = quantize_to_mxfp8(x.contiguous(), b, h, s, d, 32, torch.float8_e4m3fn, with_ref=False)
+        data, swz = (data_s, swz_s) if columnwise else (data_d, swz_d)
+        return data.permute(0, 2, 1, 3).contiguous().transpose(1, 2), swz.contiguous()  # BHSD view over BSHD storage
+
+    q8, sfq = mx(qf, hq, False)
+    k8, sfk = mx(kf, hkv, False)
+    v8, sfv = mx(vf, hkv, True)
+    outs = {}
+    for cga in (1, 2, None):
+        out = torch.full((b, s, hq, d), 1.5e30, device=dev, dtype=torch.bfloat16).transpose(1, 2)  # sentinel: an unclaimed tile stays visible
+        lse = torch.full((b, hq, s), float("nan"), device=dev, dtype=torch.float32)
+        api = SdpaFwdDslSm100(q8, k8, v8, out, lse, scale_softmax=d**-0.5, is_causal=causal, pertensor_fp8=False, dtype_o=torch.bfloat16, cga=cga)
+        assert api.check_support()
+        assert api.template_params().cta_mma == (cga or 2), (cga, api.template_params().cta_mma)
+        api.compile()
+        ws = torch.empty(max(api.scratch_workspace_bytes(), 1), device=dev, dtype=torch.uint8)
+        api.execute(q8, k8, v8, out, lse_tensor=lse, sf_q=sfq, sf_k=sfk, sf_v=sfv, workspace=ws)
+        torch.cuda.synchronize()
+        outs[cga] = (out.clone(), lse.clone())
+    rep = hq // hkv
+    logits = qf @ kf.repeat_interleave(rep, 1).transpose(-1, -2) * d**-0.5
+    if causal:
+        logits = logits.masked_fill(~torch.tril(torch.ones(s, s, dtype=torch.bool, device=dev)), float("-inf"))
+    ref = torch.softmax(logits, dim=-1) @ vf.repeat_interleave(rep, 1)
+    scale = ref.abs().max().item()
+    for cga, (o, l) in outs.items():
+        assert torch.isfinite(o).all() and torch.isfinite(l).all(), f"cga {cga}: unwritten cells"
+        err = (o.float() - ref).abs().max().item()
+        assert err <= 0.1 * scale, f"cga {cga}: max err {err} vs fp32 reference (scale {scale})"
+    assert torch.equal(outs[1][0], outs[2][0]) and torch.equal(outs[1][1], outs[2][1]), "O / LSE must be bit-identical across the CTA widths"
+    assert torch.equal(outs[None][0], outs[2][0]) and torch.equal(outs[None][1], outs[2][1]), "the unset knob must be the pair"

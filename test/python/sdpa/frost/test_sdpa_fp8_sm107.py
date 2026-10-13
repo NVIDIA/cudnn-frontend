@@ -299,7 +299,7 @@ def test_mxfp8_thd_leg_loads():
         return _load_sm100_kernel_module(flavor, params, fp8=True, pertensor=False, rubin=True)
 
     assert SM107_MXFP8_THD_SHAPES == frozenset({(256, 256)})
-    mod = load((256, 256), cta_mma=1)  # the row serves d256 MXFP8 at cga1 only (cgas_by_d_shape)
+    mod = load((256, 256), cta_mma=1)  # THD runs at cga1 (effective_cgas keeps the d256 MXFP8 pair to the dense unsplit legs)
     assert "sm107" in mod.__name__ and "mxfp8" in mod.__name__
     assert mod.CFG.THD_VARLEN == 1
     assert mod.CFG.SEQ_KV_LENS_PRESENT == 1  # THD overloads the metadata buffer

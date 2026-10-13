@@ -309,6 +309,15 @@ def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, sp
     return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
+def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
+    """The d256 MXFP8 legs that run the 2-CTA pair (cta_group::2, K/V halved per CTA) on cc 10.7: dense queries,
+    unsplit, not THD, not paged.  Measured 2026-10-12 on cc 10.7 (B1 H32/8 GQA, CUDA-graph replay interleaved with the
+    one-CTA build, O bitwise identical between the widths): dense S=8k / 16k / 32k -8.5 / -10.1 / -13.3 %, causal (LPT)
+    -5.9 / -6.6 / -7.4 %.  The kernel's THD arm at the pair is untested, the split leg keeps one-CTA partials and the
+    paged loader was not measured at the pair, so those legs stay at cga1; per-tensor FP8 d256 keeps cga1 as well."""
+    return tuple(device_cc or ()) == (10, 7) and not pertensor and not thd and not paged and (split_kv or 1) == 1
+
+
 def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
