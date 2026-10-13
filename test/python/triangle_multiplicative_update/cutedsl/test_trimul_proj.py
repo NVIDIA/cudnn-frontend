@@ -390,12 +390,13 @@ print("EXPECT_K", kk)
 #     swizzled staging-store addresses + two row-decode constants reloaded per tile ahead of the TMEM loads: +7-8 % on the kernel vs the bias-on
 #     twin, 69.8 k local requests in ncu); the bias-off K1 K = 128 rolled rendering 1 / 1 at STACK 8; USETMAXREG 0 (the split dropped, C7508).
 #   hint 1 (.minnctapersm 1 -- the SAME cubin as a .maxnreg 168 build): ptxas honours the six setmaxnreg requests, USETMAXREG 6 (2 TRY_ALLOC 232 +
-#     4 DEALLOC 24), REG = the 168 entry count, and ONE per-launch spill remains (the scheduler's tile count stored at kernel ENTRY and reloaded once
-#     in four role prologues: STL 1 / LDL 4 per thread per launch, never per tile) -- on the bias-on rendering too (the identity: no new spill).
+#     4 DEALLOC 24), REG = the 168 entry count, STACK 0 and NO spill on the K3 renderings (bias off and on: the identity, no new spill); the K1
+#     INTERLEAVED rolled renderings carry 4 STL / 13 LDL of role-prologue values under the hint (stored at kernel entry / at the INCREASE warps'
+#     entry, reloaded once per role prologue) -- the per-rendering sign the rule keys on the tile order for.
 _SASS_SPLIT_HINT_PINS = {
     ("k3", 256, "smem_rolled", "packed", False, 0): dict(STL=5, LDL=7, USETMAXREG=0),
-    ("k3", 256, "smem_rolled", "packed", False, 1): dict(STL=1, LDL=4, USETMAXREG=6),
-    ("k3", 256, "smem_rolled", "packed", True, 1): dict(STL=1, LDL=4, USETMAXREG=6),
+    ("k3", 256, "smem_rolled", "packed", False, 1): dict(STL=0, LDL=0, USETMAXREG=6),
+    ("k3", 256, "smem_rolled", "packed", True, 1): dict(STL=0, LDL=0, USETMAXREG=6),
     ("k1", 128, "smem_rolled", "packed", False, 0): dict(STL=1, LDL=1, USETMAXREG=0),
     # the K1 K = 128 rolled bias-off rendering under the hint: the split honoured (USETMAXREG 6) but 4 / 13 spills at the 24-register producer
     # roles (MEASURED on the branch's toolchain; the flat form's 1 / 1 at STACK 8 sat in a role that now holds 168) -- a per-rendering sign the

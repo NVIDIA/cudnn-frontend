@@ -440,7 +440,11 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         # the `.minnctapersm` launch hint: the caller's override for both stages, else the per-RENDERING rule with each stage's own bias flag
         # (heuristics.register_split_hint: the fact is a property of the rendering, not of the geometry)
         hint = self.knobs.min_blocks_per_mp
-        k1_hint = hint if hint is not None else th.register_split_hint("k1", self.c_z, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math)
+        k1_hint = (
+            hint
+            if hint is not None
+            else th.register_split_hint("k1", self.c_z, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math, self.knobs.k1_pass_order)
+        )
         k3_hint = hint if hint is not None else th.register_split_hint("k3", self.c_z, self.has_out_bias, k3_ln_pass_form, self.knobs.epi_math)
         with torch.cuda.device(self.device_index):
             self._plan_k1 = _substrate_plan_on(

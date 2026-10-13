@@ -268,16 +268,19 @@ def default_k_block(n_res: int) -> int:
 # USETMAXREG 6, the epilogue + LayerNorm warps at 232, the producers at 24; the cubin byte-identical to a `.maxnreg 168` build); a row enters this
 # table only with its A/B/A on the 212-SM Rubin perf-node class (the same protocol as the geometry table), and the default 0 keeps every other
 # production rendering's cubin byte-identical to the one measured before the axis existed.
-_REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str], int] = {}
+# Keyed (stage, width, has_bias, ln_pass_form, epi_math, pass_order) -- the projection stage's tile ORDER is part of the rendering (the `interleaved` K1
+# renderings carry 4 STL / 13 LDL of role-prologue values UNDER the hint where the `major` ones carry none); the output stage has no order (None).
+_REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str]], int] = {}
 
 
-def register_split_hint(stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str) -> int:
+def register_split_hint(stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str, pass_order: Optional[str] = None) -> int:
     """The ``.minnctapersm`` hint a bare declaration hands the ``stage`` (``"k1"`` = the projection, ``"k3"`` = the output stage) rendering at this
-    hidden width, bias arm and LayerNorm / epilogue form: the MEASURED rows of :data:`_REGISTER_SPLIT_HINTS`, else 0 (the rendering as shipped).
-    A caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages."""
+    hidden width, bias arm, LayerNorm / epilogue form and (K1) tile order: the MEASURED rows of :data:`_REGISTER_SPLIT_HINTS`, else 0 (the rendering
+    as shipped).  A caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages."""
     if stage not in ("k1", "k3"):
         raise ValueError(f"stage must be 'k1' or 'k3', got {stage!r}")
-    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), str(epi_math)), 0)
+    order = (str(pass_order) if pass_order is not None else None) if stage == "k1" else None
+    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), str(epi_math), order), 0)
 
 
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:

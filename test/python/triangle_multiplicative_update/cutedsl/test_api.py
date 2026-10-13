@@ -792,21 +792,28 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
             for b in (1, 4):
                 kn = th.recommend(n, c, b, "outgoing")
                 assert kn.min_blocks_per_mp is None and kn.is_complete()
+    from cudnn.gemm.frost.ln_prologue import PASS_ORDERS
+
     for stage in ("k1", "k3"):
         for c in (128, 256):
             for lnf in LN_PASS_FORMS:
                 for epm in EPI_MATHS:
-                    assert th.register_split_hint(stage, c, True, lnf, epm) == 0, "a bias-ON rendering is never hinted (no measured row)"
-                    assert th.register_split_hint(stage, c, False, lnf, epm) in MIN_BLOCKS_PER_MP_DOMAIN
-    for (stage, c, has_bias, lnf, epm), hint in th._REGISTER_SPLIT_HINTS.items():
+                    for order in PASS_ORDERS + (None,):
+                        assert th.register_split_hint(stage, c, True, lnf, epm, order) == 0, "a bias-ON rendering is never hinted (no measured row)"
+                        assert th.register_split_hint(stage, c, False, lnf, epm, order) in MIN_BLOCKS_PER_MP_DOMAIN
+    for (stage, c, has_bias, lnf, epm, order), hint in th._REGISTER_SPLIT_HINTS.items():
         assert stage in ("k1", "k3") and c in (128, 256) and has_bias is False and lnf in LN_PASS_FORMS and epm in EPI_MATHS and hint == 1, (
             stage,
             c,
             has_bias,
             lnf,
             epm,
+            order,
             hint,
         )
+        # a K1 row names its tile order (the interleaved renderings spill 4 / 13 under the hint where the major ones carry none); a K3 row has none
+        assert (order in PASS_ORDERS) if stage == "k1" else (order is None), (stage, order)
+        assert th.register_split_hint(stage, c, False, lnf, epm, order) == 1
     with pytest.raises(ValueError, match="stage"):
         th.register_split_hint("k2", 128, False, "smem_rolled", "packed")
     # the override reaches both stages' params; None hands each stage the rule with ITS bias flag
