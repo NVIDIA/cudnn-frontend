@@ -7,10 +7,8 @@
 ## JAX support
 
 `cudnn.grouped_gemm_swiglu_wrapper_sm100` accepts Torch tensors and canonical
-MXFP8 JAX arrays or tracers. Torch execution is unchanged; JAX dispatches to
-`cudnn.jax.grouped_gemm_swiglu`, eagerly or under `jax.jit`, with XLA-owned
-buffers and stream ordering. `cudnn.torch.grouped_gemm_swiglu` remains an
-alias to the same wrapper and inherits its dispatch. Direct API-class construction
+MXFP8 JAX arrays or tracers. Torch execution is unchanged; JAX runs
+eagerly or under `jax.jit`, with XLA-owned buffers and stream ordering. Direct API-class construction
 with JAX samples remains unsupported.
 
 Wrapper signatures and defaults are unchanged. JAX wrapper calls must set
@@ -376,10 +374,13 @@ C-contiguous physical `(1, ceil(mn/128), rest, 32, 4, 4)` buffers.
 
 ### JAX execution
 
+**Deprecated:** `cudnn.jax.grouped_gemm_swiglu` and `cudnn.torch.grouped_gemm_swiglu`
+emit a `FutureWarning` and will be removed. Use `grouped_gemm_glu_jax_sm100` or
+`grouped_gemm_glu_wrapper_sm100` with `act_func="swiglu"`.
+
 `cudnn.jax.grouped_gemm_swiglu` runs the contiguous-weight MXFP8 fusion
 through `cudnn.jax.call`, eagerly or under `jax.jit`. All operands are ordinary
-JAX arrays managed by XLA. Torch callers use `cudnn.torch.grouped_gemm_swiglu`
-or the existing top-level wrapper name.
+JAX arrays managed by XLA. Torch callers use the top-level wrapper name.
 Both paths return `TupleDict` with the same key order and tuple-unpacking behavior.
 The JAX path registers this output type as a JAX pytree.
 

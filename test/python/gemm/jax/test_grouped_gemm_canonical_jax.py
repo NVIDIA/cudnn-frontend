@@ -624,3 +624,13 @@ def test_shared_wrapper_keeps_existing_defaults(backward):
         wrapper(**inputs)
     with pytest.raises(ValueError, match="FP8 output dtype"):
         wrapper(**inputs, sf_vec_size=32)
+
+
+@pytest.mark.parametrize("namespace", ["jax", "torch"])
+@pytest.mark.parametrize("name", ["grouped_gemm_swiglu", "grouped_gemm_dswiglu"])
+def test_namespace_alias_is_deprecated(namespace, name):
+    import importlib
+
+    module = importlib.import_module(f"cudnn.{namespace}")
+    with pytest.warns(FutureWarning, match=f"cudnn.{namespace}.{name} is deprecated"):
+        getattr(module, name)
