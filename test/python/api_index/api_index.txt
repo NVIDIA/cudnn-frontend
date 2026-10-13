@@ -186,6 +186,7 @@ cudnn.csa.CSACompressorBackward
 cudnn.csa.CSACompressorBackward.check_support
 cudnn.csa.CSACompressorBackward.compile
 cudnn.csa.CSACompressorBackward.execute
+cudnn.csa.CSACompressorBackward.scratch_workspace_bytes
 cudnn.csa.CSACompressorForward
 cudnn.csa.CSACompressorForward.check_support
 cudnn.csa.CSACompressorForward.compile
