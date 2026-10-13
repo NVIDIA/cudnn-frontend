@@ -44,6 +44,7 @@ from .engine_ids import (
     GDP_ID_BASE,
     KDA_ID_BASE,
     FROST_CONV_ID_BASE,
+    MAMBA2_ID_BASE,
 )
 
 _LOG = logging.getLogger("cudnn.engines.manifest")
@@ -165,6 +166,10 @@ _ANCHOR_NODE_TO_FAMILY = {
     "GDP_BWD": "gdp",
     "GDP_SUMMARY": "gdp",
     "GDP_SUMMARY_BWD": "gdp",
+    "MAMBA2": "mamba2",
+    "MAMBA2_BWD": "mamba2",
+    "MAMBA2_SUMMARY": "mamba2",
+    "MAMBA2_SUMMARY_BWD": "mamba2",
 }
 
 # ---------------------------------------------------------------------------
@@ -217,6 +222,14 @@ MANIFEST: Tuple[EngineFamily, ...] = (
         "cudnn.linear_attention",
         "GdpEngines",
         slots={"gdp_frost": EngineSlot(0), "gdp_summary_frost": EngineSlot(1)},
+        analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
+    ),
+    EngineFamily(
+        MAMBA2_ID_BASE,
+        "mamba2",
+        "cudnn.linear_attention",
+        "Mamba2Engines",
+        slots={"mamba2_frost": EngineSlot(0), "mamba2_summary_frost": EngineSlot(1)},
         analyzer=("cudnn.linear_attention.graph_analyzer", "analyze"),
     ),
     EngineFamily(

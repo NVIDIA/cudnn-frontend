@@ -66,7 +66,7 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
 from cutlass.cute.runtime import from_dlpack
 
-from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import opaque_f32_zero, softplus
 
 from .host import get_dtype
@@ -83,12 +83,9 @@ MAX_BLOCKS = 2048  # piece-count ceiling; host clamps ideal_chunks so the per-ti
 WARP_SIZE = 32
 WARPS = 8
 THREADS_PER_BLOCK = WARPS * WARP_SIZE
-SCAN_WARPS = 4
+SCAN_WARPS = 32  # scan warps per chunk row, each over b_t / SCAN_WARPS tokens; lane = head
 SCAN_THREADS = SCAN_WARPS * WARP_SIZE
 PLAN_THREADS = 128
-SCAN_CTA_CAP = 16  # scan CTAs per SM before the block axis becomes a grid-stride loop
-SCAN_BLOCK_LOOP_MAX = 4  # block-loop trips the cap may cost
-SCAN_ROWS_PER_WARP_MAX = 4  # consecutive chunk rows per scan warp; scan_rows_per_warp() shrinks it to fill the SMs
 SCAN_TOKEN_STRIDE = 1  # tokens sampled per chunk; a stride > 1 scales the effective threshold by it
 OVERHEAD_TOKENS = 256  # per-item fixed cost for the piece model: state reseed + pipeline refill + typical warmup
 P_WINDOW = 16  # fill-regime piece-count search width
@@ -118,21 +115,19 @@ def warmup_cap_chunks(expand_num: int) -> int:
     return WALK_WINDOW_CHUNKS // 2 - SNAP_CHUNKS * expand_num
 
 
-def scan_rows_per_warp(need_rows: int, grid_y: int, num_sms: int) -> int:
-    """Chunk rows each scan warp walks.  The largest of ``SCAN_ROWS_PER_WARP_MAX``,
-    2, 1 whose grid (``ceil(need_rows / (SCAN_WARPS * rows)) * grid_y`` blocks)
-    still covers the SMs."""
-    for rows in (SCAN_ROWS_PER_WARP_MAX, 2, 1):
-        if rows == 1 or -(-need_rows // (SCAN_WARPS * rows)) * grid_y >= num_sms:
-            return rows
-
-
 def chunk_scratch_rows(total_tokens: int, batch_size: int, b_t: int) -> int:
-    """Rows of the ``(rows, HO)`` fp32 chunk-value scratch: per-batch chunk
+    """Rows of the ``(rows, HO)`` fp32 chunk-value scratch the scan covers: per-batch chunk
     ranges are based at ``cu[b] // b_t + b``, so one extra row per sequence
     covers the ceil rounding, plus the last row, which carries the plan
     (:func:`frost_split_k_plan`) rather than a chunk value."""
     return total_tokens // b_t + batch_size + 1
+
+
+def split_scratch_rows(total_tokens: int, batch_size: int, n_heads_out: int, b_t: int) -> int:
+    """Rows the engines carve for the chunk scratch: :func:`chunk_scratch_rows` plus the plan kernel's table rows,
+    two words per chunk row (sequence, chunk) and two per sequence (span, num_blocks), small integers kept as fp32."""
+    rows = chunk_scratch_rows(total_tokens, batch_size, b_t)
+    return rows + -(-(2 * rows + 2 * batch_size) // int(n_heads_out))
 
 
 def max_work_items(total_tokens: int, batch_size: int, n_heads_out: int, ideal_chunks: int, b_t: int, num_sms: int) -> int:
@@ -371,10 +366,13 @@ def window_prefix(window_len: cutlass.Constexpr[int], sPre, base, lo_c, n_w, lan
     ``sPre[base + 1 .. base + n_w]`` with ``sPre[base] = 0``.  The window is
     staged lane-strided, then each lane sums a contiguous run and the run
     totals are scanned across the warp."""
+    value_ptr = mChunkVals.iterator.raw_ptr()
+    value_off = cutlass.Int64(chunk_value_base + lo_c + lane_idx) * cutlass.Int64(mChunkVals.stride[0]) + cutlass.Int64(head_idx)
+    value_step = cutlass.Int64(WARP_SIZE) * cutlass.Int64(mChunkVals.stride[0])
     for kk in cutlass.range_constexpr((window_len + WARP_SIZE - 1) // WARP_SIZE):
         i = cutlass.Int32(kk * WARP_SIZE) + lane_idx
         if i < n_w:
-            sPre[base + cutlass.Int32(1) + i] = mChunkVals[chunk_value_base + lo_c + i, head_idx]
+            sPre[base + cutlass.Int32(1) + i] = (value_ptr + (value_off + cutlass.Int64(kk) * value_step)).load()
     nvvm.bar_warp_sync(cute.arch.FULL_MASK)
     run = (n_w + cutlass.Int32(WARP_SIZE - 1)) // cutlass.Int32(WARP_SIZE)
     start = lane_idx * run
@@ -442,11 +440,23 @@ def search_bwd(sPre, base, xi, n_w, cap: cutlass.Constexpr[int], thresh):
 
 
 @cute.jit
-def read_plan(mChunkVals):
+def read_plan(mChunkVals, n_scan_ctas):
     """The batch-wide span :func:`frost_split_k_plan` left in the scratch's
-    last row, or -1 when no tile of this batch can be cut.  Spans are small
-    integers, exact in fp32."""
-    return mChunkVals[mChunkVals.shape[0] - cutlass.Int32(1), 0].to(cutlass.Int32)
+    plan row (the row after the chunk rows), or -1 when no tile of this batch
+    can be cut.  Spans are small integers, exact in fp32."""
+    return mChunkVals[n_scan_ctas - cutlass.Int32(1), 0].to(cutlass.Int32)
+
+
+@cute.jit
+def read_table_word(mChunkVals, n_scan_ctas, n_heads_out, word):
+    """Word ``word`` of the plan kernel's table, the fp32 rows after the plan row read back as an integer."""
+    return mChunkVals[n_scan_ctas + word // n_heads_out, word % n_heads_out].to(cutlass.Int32)
+
+
+@cute.jit
+def write_table_word(mChunkVals, n_scan_ctas, n_heads_out, word, value):
+    """Word ``word`` of the plan kernel's table, an integer stored as fp32."""
+    mChunkVals[n_scan_ctas + word // n_heads_out, word % n_heads_out] = cutlass.Float32(value)
 
 
 @cute.kernel
@@ -462,17 +472,22 @@ def frost_split_k_plan(
     mCuSeqlens: cute.Tensor,
     mChunkVals: cute.Tensor,
     mCount: cute.Tensor,
+    n_scan_ctas: cutlass.Int32,
 ):
     """One CTA: settle the batch-wide span once and leave it in the chunk
-    scratch's last row for the scan and the walk, -1 there when no tile of the
+    scratch's plan row for the scan and the walk, -1 there when no tile of the
     batch admits a cut, and zero the item count.  Both answers are batch-global;
-    the scan and the walk read them."""
+    the scan and the walk read them.  When cuts are possible the CTA also
+    writes the table rows after the plan row: (sequence, chunk) per chunk row,
+    -1 past a sequence's chunks, and (span, num_blocks) per sequence, so the
+    scan and the walk read one entry instead of searching ``cu_seqlens`` and
+    rerunning the span choice; with the plan at -1 nothing more is written."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     sCut = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    sPlan = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=8)
     if tidx == 0:
         sCut[0] = cutlass.Int32(0)
     nvvm.barrier_cta_sync()
@@ -493,16 +508,46 @@ def frost_split_k_plan(
         any_cut = sCut[0]
         common = common_span(b_t, overhead_chunks, expand_num, n_heads_out, num_sms, n_tiles, ideal_chunks, batch_size, mCuSeqlens)
         any_cut = cutlass.Int32(1) if common > cutlass.Int32(0) else any_cut
-        plan = cutlass.Float32(common) if any_cut > cutlass.Int32(0) else cutlass.Float32(-1.0)
-        mChunkVals[mChunkVals.shape[0] - cutlass.Int32(1), 0] = plan
+        plan_word = common if any_cut > cutlass.Int32(0) else cutlass.Int32(-1)
+        mChunkVals[n_scan_ctas - cutlass.Int32(1), 0] = cutlass.Float32(plan_word)
+        sPlan[0] = plan_word
+    nvvm.barrier_cta_sync()
+    plan_word = sPlan[0]
+    if plan_word >= cutlass.Int32(0):
+        # ---- the row table: (sequence, chunk) per chunk row, -1 past a sequence's chunks -------------------------
+        row = tidx
+        while row < n_scan_ctas:
+            lo = cutlass.Int32(0)
+            hi = batch_size - cutlass.Int32(1)
+            while lo < hi:
+                mid = (lo + hi + cutlass.Int32(1)) // cutlass.Int32(2)
+                take = expanded_cu_seqlen(expand_num, mCuSeqlens, mid) // cutlass.Int32(b_t) + mid <= row
+                lo = mid if take else lo
+                hi = hi if take else mid - cutlass.Int32(1)
+            start = expanded_cu_seqlen(expand_num, mCuSeqlens, lo)
+            end = expanded_cu_seqlen(expand_num, mCuSeqlens, lo + cutlass.Int32(1))
+            c = row - (start // cutlass.Int32(b_t) + lo)
+            inside = (c >= cutlass.Int32(0)) and (c < cute.ceil_div(end - start, b_t))
+            write_table_word(mChunkVals, n_scan_ctas, n_heads_out, cutlass.Int32(2) * row, lo if inside else cutlass.Int32(-1))
+            write_table_word(mChunkVals, n_scan_ctas, n_heads_out, cutlass.Int32(2) * row + cutlass.Int32(1), c if inside else cutlass.Int32(-1))
+            row = row + cutlass.Int32(PLAN_THREADS)
+        # ---- the sequence table: (span, num_blocks) under the batch-wide span --------------------------------------
+        seq = tidx
+        while seq < batch_size:
+            nc = cute.ceil_div(expanded_cu_seqlen(expand_num, mCuSeqlens, seq + cutlass.Int32(1)) - expanded_cu_seqlen(expand_num, mCuSeqlens, seq), b_t)
+            span, num_blocks = span_choice(overhead_chunks, num_sms, nc, n_tiles, ideal_chunks, plan_word, cutlass.Int32(0), expand_num)
+            word = cutlass.Int32(2) * n_scan_ctas + cutlass.Int32(2) * seq
+            write_table_word(mChunkVals, n_scan_ctas, n_heads_out, word, span)
+            write_table_word(mChunkVals, n_scan_ctas, n_heads_out, word + cutlass.Int32(1), num_blocks)
+            seq = seq + cutlass.Int32(PLAN_THREADS)
 
 
 @cute.kernel
 def frost_split_k_scan_scalar(
     b_t: cutlass.Constexpr[int],
-    scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
     safe_gate: cutlass.Constexpr[bool],
+    a_is_log: cutlass.Constexpr[bool],
     overhead_chunks: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     n_heads_out: cutlass.Int32,
@@ -510,21 +555,21 @@ def frost_split_k_scan_scalar(
     n_tiles: cutlass.Int32,
     ideal_chunks: cutlass.Int32,
     batch_size: cutlass.Int32,
-    n_scan_blocks: cutlass.Int32,
     mGate: cute.Tensor,
-    mALog: cute.Tensor | None,
+    mA: cute.Tensor | None,
     mDtBias: cute.Tensor | None,
     mCuSeqlens: cute.Tensor,
     mChunkVals: cute.Tensor,
     mCount: cute.Tensor,
+    n_scan_ctas: cutlass.Int32,
 ):
-    """Chunk scan: CTA ``(x, hg)`` covers 16 chunk-scratch rows for heads
-    ``[hg*32, (hg+1)*32)``; lane ``l`` owns head ``hg*32 + l``, so reads and
-    writes coalesce and no reduction is needed.  Every chunk of a tile with
-    more than one block is read; the walk sums the whole tile.
-    With ``safe_gate`` each token contributes ``-exp(A_log[h]) * softplus(g +
-    dt_bias[h]) * RCP_LN2``; an absent ``mALog`` is unit amplitude, an absent
-    ``mDtBias`` zero bias.  The item count is the plan kernel's."""
+    """Chunk scan: CTA ``(row, hg)`` covers chunk-scratch row ``row`` for heads ``[hg*32, (hg+1)*32)``; lane ``l`` owns
+    head ``hg*32 + l`` (coalesced reads and writes), warp ``w`` the tokens ``[w * tpw, (w + 1) * tpw)`` of the chunk with
+    ``tpw = b_t / SCAN_WARPS``; the warp partials meet in SMEM and warp 0 sums them in warp order into the row.  Every
+    chunk of a tile with more than one block is read; the walk sums the whole tile.  With ``safe_gate`` each token
+    contributes ``A[h] * softplus(g + dt_bias[h]) * RCP_LN2``, ``mA`` holding ``log(-A)`` under ``a_is_log`` (the GDN
+    parameter) and ``A`` itself otherwise (Mamba-2); an absent ``mA`` is unit amplitude, an absent ``mDtBias`` zero
+    bias.  The item count is the plan kernel's."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
@@ -535,73 +580,60 @@ def frost_split_k_scan_scalar(
     h = cutlass.Int32(bidx[1]) * cutlass.Int32(WARP_SIZE) + lane_idx
     h_ok = h < n_heads_out
     h_r = h if h_ok else cutlass.Int32(n_heads_out - 1)
+    sPartial = cutlass.Array(cutlass.Float32, SCAN_THREADS, space=cutlass.AddressSpace.smem, alignment=16)
     a = cutlass.Float32(0.0)
     bias = cutlass.Float32(0.0)
     if cutlass.const_expr(safe_gate):
-        if cutlass.const_expr(mALog is not None):
-            a = -cute.math.exp2(mALog[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+        if cutlass.const_expr(mA is not None and a_is_log):
+            a = -cute.math.exp2(mA[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2), fastmath=True) * cutlass.Float32(RCP_LN2)
+        elif cutlass.const_expr(mA is not None):
+            a = mA[h_r].to(cutlass.Float32) * cutlass.Float32(RCP_LN2)
         else:
             a = -(opaque_f32_zero() + cutlass.Float32(1.0)) * cutlass.Float32(RCP_LN2)
         if cutlass.const_expr(mDtBias is not None):
             bias = mDtBias[h_r].to(cutlass.Float32)
         else:
             bias = opaque_f32_zero()
-    common = read_plan(mChunkVals)
+    common = read_plan(mChunkVals, n_scan_ctas)
     if common >= cutlass.Int32(0):
-        blk = cutlass.Int32(bidx[0])
-        while blk < n_scan_blocks:
-            row0 = (blk * cutlass.Int32(SCAN_WARPS) + widx) * cutlass.Int32(scan_rows)
-
-            lo = cutlass.Int32(0)
-            hi = batch_size - cutlass.Int32(1)
-            while lo < hi:
-                mid = (lo + hi + cutlass.Int32(1)) // cutlass.Int32(2)
-                take = expanded_cu_seqlen(expand_num, mCuSeqlens, mid) // cutlass.Int32(b_t) + mid <= row0
-                lo = mid if take else lo
-                hi = hi if take else mid - cutlass.Int32(1)
-            batch_idx = lo
-            batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
-            batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
-            batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
-            chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
-            _, num_blocks = span_choice(overhead_chunks, num_sms, batch_num_chunks, n_tiles, ideal_chunks, common, cutlass.Int32(0), expand_num)
-
-            for rr in cutlass.range_constexpr(scan_rows):
-                row = row0 + cutlass.Int32(rr)
-                while (batch_idx + cutlass.Int32(1) < batch_size) and (
-                    expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1) // cutlass.Int32(b_t) + batch_idx + cutlass.Int32(1) <= row
-                ):
-                    batch_idx = batch_idx + cutlass.Int32(1)
-                    batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx)
-                    batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_idx + 1)
-                    batch_num_chunks = cute.ceil_div(batch_end - batch_start, b_t)
-                    chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_idx
-                    _, num_blocks = span_choice(overhead_chunks, num_sms, batch_num_chunks, n_tiles, ideal_chunks, common, cutlass.Int32(0), expand_num)
-                c = row - chunk_value_base
-                if (c >= 0) and (c < batch_num_chunks) and (num_blocks > 1):
-                    # ---- clamped-log2 sum over the chunk, one head per lane ----------
-                    oob = cutlass.Float32(0.0) if cutlass.const_expr(log_gate) else cutlass.Float32(1.0)
-                    acc = cutlass.Float32(0.0)
-                    for tt in cutlass.range(0, b_t, SCAN_TOKEN_STRIDE, unroll_full=True):
-                        pos = batch_start + c * cutlass.Int32(b_t) + cutlass.Int32(tt)
-                        inb = pos < batch_end
-                        pos_r = pos if inb else batch_start
-                        if cutlass.const_expr(expand_num > 1):
-                            row_r = pos_r // cutlass.Int32(expand_num)
-                            inb = inb and (pos_r - row_r * cutlass.Int32(expand_num) == 0)
-                            pos_r = row_r
-                        gv = (mGate.iterator + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0]) + h_r).load().to(cutlass.Float32)
-                        if cutlass.const_expr(safe_gate):
-                            contrib = a * softplus(gv + bias)
-                            acc = acc + (contrib if inb else cutlass.Float32(0.0))
-                        else:
-                            gv = gv if inb else oob
-                            acc = acc + clamped_log2(log_gate, gv)
-                    if h_ok:
-                        mChunkVals[chunk_value_base + c, h] = acc
-            blk = blk + cutlass.Int32(cute.arch.grid_dim()[0])
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
+        # ---- the plan kernel's table names this row's (sequence, chunk) and the sequence's block count ------------
+        row = cutlass.Int32(bidx[0])
+        batch_idx = read_table_word(mChunkVals, n_scan_ctas, n_heads_out, cutlass.Int32(2) * row)
+        c = read_table_word(mChunkVals, n_scan_ctas, n_heads_out, cutlass.Int32(2) * row + cutlass.Int32(1))
+        batch_c = batch_idx if batch_idx >= cutlass.Int32(0) else cutlass.Int32(0)
+        batch_start = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_c)
+        batch_end = expanded_cu_seqlen(expand_num, mCuSeqlens, batch_c + 1)
+        chunk_value_base = batch_start // cutlass.Int32(b_t) + batch_c
+        num_blocks = read_table_word(mChunkVals, n_scan_ctas, n_heads_out, cutlass.Int32(2) * n_scan_ctas + cutlass.Int32(2) * batch_c + cutlass.Int32(1))
+        if (batch_idx >= cutlass.Int32(0)) and (num_blocks > 1):
+            # ---- clamped-log2 partial over the warp's tokens, one head per lane ----------
+            oob = cutlass.Float32(0.0) if cutlass.const_expr(log_gate) else cutlass.Float32(1.0)
+            acc = cutlass.Float32(0.0)
+            tokens_per_warp = cutlass.const_expr(b_t // SCAN_WARPS)
+            for k in cutlass.range_constexpr(tokens_per_warp // SCAN_TOKEN_STRIDE):
+                pos = batch_start + c * cutlass.Int32(b_t) + widx * cutlass.Int32(tokens_per_warp) + cutlass.Int32(k * SCAN_TOKEN_STRIDE)
+                inb = pos < batch_end
+                pos_r = pos if inb else batch_start
+                if cutlass.const_expr(expand_num > 1):
+                    row_r = pos_r // cutlass.Int32(expand_num)
+                    inb = inb and (pos_r - row_r * cutlass.Int32(expand_num) == 0)
+                    pos_r = row_r
+                gv = (mGate.iterator + cutlass.Int64(pos_r) * cutlass.Int64(mGate.stride[0]) + h_r).load().to(cutlass.Float32)
+                if cutlass.const_expr(safe_gate):
+                    contrib = a * softplus(gv + bias)
+                    acc = acc + (contrib if inb else cutlass.Float32(0.0))
+                else:
+                    gv = gv if inb else oob
+                    acc = acc + clamped_log2(log_gate, gv)
+            sPartial[tidx] = acc
+            nvvm.barrier_cta_sync()
+            # ---- warp 0: the row sum in warp order ------------------------------------------
+            if widx == cutlass.Int32(0):
+                total = cutlass.Float32(0.0)
+                for w in cutlass.range_constexpr(SCAN_WARPS):
+                    total = total + sPartial[cutlass.Int32(w * WARP_SIZE) + lane_idx]
+                if h_ok:
+                    mChunkVals[chunk_value_base + c, h] = total
 
 
 @cute.kernel
@@ -619,6 +651,7 @@ def frost_split_k_walk(
     mChunkVals: cute.Tensor,
     mStaging: cute.Tensor,
     mCount: cute.Tensor,
+    n_scan_ctas: cutlass.Int32,
 ):
     """One CTA per (batch, head).  The CTA first sums the tile's chunk values: a tile that does not saturate even as a whole stays
     uncut, otherwise the mean decay gives the warmup every piece will
@@ -641,7 +674,7 @@ def frost_split_k_walk(
     sWarmup = cutlass.Array(cutlass.Int32, MAX_BLOCKS, space=cutlass.AddressSpace.smem, alignment=16)
     sPre = cutlass.Array(cutlass.Float32, WARPS * window_len, space=cutlass.AddressSpace.smem, alignment=16)
 
-    common = read_plan(mChunkVals)
+    common = read_plan(mChunkVals, n_scan_ctas)
 
     # ---- tile decode: chunk_value_base is the row base in the chunk scratch ----------
     batch_idx = tile // n_heads_out
@@ -653,15 +686,22 @@ def frost_split_k_walk(
     span = cutlass.Int32(0)
     num_blocks = cutlass.Int32(1)
     if common >= cutlass.Int32(0):
-        span, num_blocks = span_choice(overhead_chunks, num_sms, batch_num_chunks, n_tiles, ideal_chunks, common, zero, expand_num)
+        # ---- the plan kernel's table carries this sequence's span choice ---------------------
+        word = cutlass.Int32(2) * n_scan_ctas + cutlass.Int32(2) * batch_idx
+        span = read_table_word(mChunkVals, n_scan_ctas, n_heads_out, word)
+        num_blocks = read_table_word(mChunkVals, n_scan_ctas, n_heads_out, word + cutlass.Int32(1))
 
     if num_blocks > 1:
         # ---- whole-tile decay: no cut can saturate if the tile does not ---------------
         acc = cutlass.Float32(0.0)
         c = tidx
+        tile_ptr = mChunkVals.iterator.raw_ptr()
+        tile_off = cutlass.Int64(chunk_value_base + c) * cutlass.Int64(mChunkVals.stride[0]) + cutlass.Int64(head_idx)
+        tile_step = cutlass.Int64(THREADS_PER_BLOCK) * cutlass.Int64(mChunkVals.stride[0])
         while c < batch_num_chunks:
-            acc = acc + mChunkVals[chunk_value_base + c, head_idx]
+            acc = acc + (tile_ptr + tile_off).load()
             c = c + cutlass.Int32(THREADS_PER_BLOCK)
+            tile_off = tile_off + tile_step
         for off in [16, 8, 4, 2, 1]:
             acc = acc + cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, acc, off, 31, kind=nvvm.Shfl.BFLY))
         if lane_idx == 0:
@@ -793,8 +833,6 @@ def frost_split_k_walk(
                 batch_end,
                 batch_num_chunks,
             )
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1074,9 +1112,9 @@ def order_body(
 def launch(
     split: cutlass.Constexpr[bool],
     b_t: cutlass.Constexpr[int],
-    scan_rows: cutlass.Constexpr[int],
     log_gate: cutlass.Constexpr[bool],
     safe_gate: cutlass.Constexpr[bool],
+    a_is_log: cutlass.Constexpr[bool],
     overhead_chunks: cutlass.Constexpr[int],
     expand_num: cutlass.Constexpr[int],
     warmup_cap: cutlass.Constexpr[int],
@@ -1087,7 +1125,7 @@ def launch(
     batch_size: cutlass.Int32,
     log2_thresh: cutlass.Float32,
     mGate: cute.Tensor | None,
-    mALog: cute.Tensor | None,
+    mA: cute.Tensor | None,
     mDtBias: cute.Tensor | None,
     mCuSeqlens: cute.Tensor,
     mChunkVals: cute.Tensor | None,
@@ -1096,7 +1134,6 @@ def launch(
     mCount: cute.Tensor,
     mScheduler: cute.Tensor | None,
     n_scan_ctas: cutlass.Int32,
-    n_scan_blocks: cutlass.Int32,
     n_walk_ctas: cutlass.Int32,
     stream: cuda.CUstream,
 ) -> None:
@@ -1113,12 +1150,13 @@ def launch(
             mCuSeqlens,
             mChunkVals,
             mCount,
+            n_scan_ctas,
         ).launch(grid=(1, 1, 1), block=(PLAN_THREADS, 1, 1), stream=stream, use_pdl=USE_PDL)
         frost_split_k_scan_scalar(
             b_t,
-            scan_rows,
             log_gate,
             safe_gate,
+            a_is_log,
             overhead_chunks,
             expand_num,
             n_heads_out,
@@ -1126,13 +1164,13 @@ def launch(
             n_tiles,
             ideal_chunks,
             batch_size,
-            n_scan_blocks,
             mGate,
-            mALog,
+            mA,
             mDtBias,
             mCuSeqlens,
             mChunkVals,
             mCount,
+            n_scan_ctas,
         ).launch(
             grid=(n_scan_ctas, -(-n_heads_out // WARP_SIZE), 1),
             block=(SCAN_THREADS, 1, 1),
@@ -1153,6 +1191,7 @@ def launch(
             mChunkVals,
             mStaging,
             mCount,
+            n_scan_ctas,
         ).launch(
             grid=(n_walk_ctas, 1, 1),
             block=(THREADS_PER_BLOCK, 1, 1),
@@ -1170,7 +1209,6 @@ class SplitTableFacts(NamedTuple):
 
     split: bool
     b_t: int
-    scan_rows: int
     log_gate: bool
     safe_gate: bool
     overhead_chunks: int
@@ -1183,7 +1221,6 @@ class SplitTableFacts(NamedTuple):
     batch_size: int
     log2_threshold: float
     n_scan_ctas: int
-    n_scan_blocks: int
     n_walk_ctas: int
     gate_elem_bytes: int
 
@@ -1193,18 +1230,10 @@ def split_table_facts(gate, cu_seqlens, *, split, n_tiles, ideal_chunks, num_sms
         log2_threshold = DEFAULT_LOG2_THRESHOLD
     n_heads_out = gate.shape[1]
     batch_size = cu_seqlens.shape[0] - 1
-    need_rows = chunk_scratch_rows(gate.shape[0] * int(expand_num), batch_size, b_t)
-    grid_y = -(-n_heads_out // WARP_SIZE)
-    scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms)
-    n_scan_blocks = -(-need_rows // (SCAN_WARPS * scan_rows))
-    n_scan_ctas = min(
-        n_scan_blocks,
-        max(max(1, SCAN_CTA_CAP * num_sms // grid_y), -(-n_scan_blocks // SCAN_BLOCK_LOOP_MAX)),
-    )
+    n_scan_ctas = chunk_scratch_rows(gate.shape[0] * int(expand_num), batch_size, b_t)
     return SplitTableFacts(
         bool(split),
         int(b_t),
-        int(scan_rows),
         bool(log_gate),
         bool(safe_gate),
         max(1, OVERHEAD_TOKENS // b_t),
@@ -1217,7 +1246,6 @@ def split_table_facts(gate, cu_seqlens, *, split, n_tiles, ideal_chunks, num_sms
         int(batch_size),
         float(log2_threshold),
         int(n_scan_ctas),
-        int(n_scan_blocks),
         int(batch_size * n_heads_out),
         get_dtype(gate.dtype).width // 8,
     )
@@ -1238,7 +1266,6 @@ class TableRecipe(NamedTuple):
     batch_size: int
     log2_threshold: float
     n_scan_ctas: int
-    n_scan_blocks: int
     n_walk_ctas: int
     expand_num: int
 
@@ -1263,7 +1290,6 @@ def run_table(r, gate, a_log, dt_bias, cu_seqlens, chunk_scratch, item_scratch, 
         work_count,
         scheduler_counter,
         r.n_scan_ctas,
-        r.n_scan_blocks,
         r.n_walk_ctas,
         cuda.CUstream(int(stream)),
     )
@@ -1285,6 +1311,7 @@ def build_split_table(
     log_gate=False,
     safe_gate=False,
     a_log=None,
+    a_is_log=True,
     dt_bias=None,
     scheduler_counter,
     split=True,
@@ -1298,14 +1325,15 @@ def build_split_table(
     ``safe_gate`` the gate holds RAW logits and the scan applies
     ``-exp(a_log[h]) * softplus(g + dt_bias[h])`` so cuts land on true decay;
     ``a_log`` / ``dt_bias`` may each be None under ``safe_gate`` (unit
-    amplitude / zero bias).
+    amplitude / zero bias); ``a_log`` holds ``log(-A)`` under ``a_is_log`` and
+    ``A`` itself otherwise.
 
     With ``split=False`` nothing launches; each main kernel's prologue
     synthesizes the no-cuts table itself (``order_gen``).
 
     ``work_items`` and ``item_scratch`` are ``(max_items, WORK_ITEM_FIELDS)``
     int32 with ``max_items >= max_work_items(...)``; ``work_count`` is
-    ``(1,)`` int32; ``chunk_scratch`` is ``(>= chunk_scratch_rows(...), HO)``
+    ``(1,)`` int32; ``chunk_scratch`` is ``(>= split_scratch_rows(...), HO)``
     fp32, whose LAST row carries the plan rather than a chunk value.
     ``scheduler_counter`` cells are zeroed by the order phase, the count by the
     plan.  ``expand_num`` scales every device-side ``cu_seqlens`` read onto
@@ -1329,19 +1357,19 @@ def build_split_table(
         safe_gate=safe_gate,
         expand_num=expand_num,
     )
-    scan_rows, n_heads_out, batch_size, gate_elem_bytes = f.scan_rows, f.n_heads_out, f.batch_size, f.gate_elem_bytes
+    n_heads_out, batch_size, gate_elem_bytes = f.n_heads_out, f.batch_size, f.gate_elem_bytes
     log2_threshold = f.log2_threshold
-    n_scan_ctas, n_scan_blocks, n_walk_ctas = f.n_scan_ctas, f.n_scan_blocks, f.n_walk_ctas
+    n_scan_ctas, n_walk_ctas = f.n_scan_ctas, f.n_walk_ctas
     overhead_chunks, warmup_cap = f.overhead_chunks, f.warmup_cap
     cu_stream = cuda.CUstream(int(stream))
 
     key = (
         bool(split),
         b_t,
-        scan_rows,
         num_sms,
         bool(log_gate),
         bool(safe_gate),
+        bool(a_is_log),
         str(cu_seqlens.dtype),
         str(gate.dtype),
         str(a_log.dtype) if a_log is not None else "none",
@@ -1371,9 +1399,9 @@ def build_split_table(
             launch,
             bool(split),
             b_t,
-            int(scan_rows),
             bool(log_gate),
             bool(safe_gate),
+            bool(a_is_log),
             overhead_chunks,
             int(expand_num),
             warmup_cap,
@@ -1393,7 +1421,6 @@ def build_split_table(
             work_count_c,
             from_dlpack(scheduler_counter, assumed_align=4).mark_layout_dynamic(),
             cutlass.Int32(n_scan_ctas),
-            cutlass.Int32(n_scan_blocks),
             cutlass.Int32(n_walk_ctas),
             cu_stream,
             options=f"--enable-tvm-ffi --opt-level {int(opt_level)}",
@@ -1414,7 +1441,6 @@ def build_split_table(
         work_count,
         scheduler_counter,
         n_scan_ctas,
-        n_scan_blocks,
         n_walk_ctas,
         cu_stream,
     )
@@ -1429,7 +1455,6 @@ def build_split_table(
         batch_size,
         float(log2_threshold),
         n_scan_ctas,
-        n_scan_blocks,
         n_walk_ctas,
         int(expand_num),
     )

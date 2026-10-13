@@ -32,6 +32,9 @@ navigation:
       - page: FFT Causal Conv1d
         path: ../../operations/FFTCausalConv1d.md
         slug: operations/FFTCausalConv1d
+      - page: Linear Attention
+        path: ../../operations/LinearAttention.md
+        slug: operations/LinearAttention
       - page: Matmul
         path: ../../operations/Matmul.md
         slug: operations/Matmul
