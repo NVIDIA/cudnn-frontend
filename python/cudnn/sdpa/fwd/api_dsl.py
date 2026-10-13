@@ -614,9 +614,14 @@ def _load_kernel_template(filename: str, params: Hashable, tag: str):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels", filename)
     # The sm107 config module's private sweep seams specialize a body WITHOUT touching the record: fold their state into the module
     # cache key and the source digest (None on every plan path = the key every caller has had).
+    from cudnn.sdpa.fwd.config_sm100 import sm100_sweep_seam_state
     from cudnn.sdpa.fwd.config_sm107 import sweep_seam_state
 
-    return load_template(path, params, tag=tag, extra_key=sweep_seam_state())
+    seams, seams_sm100 = sweep_seam_state(), sm100_sweep_seam_state()
+    # The SM100 small tiles' own seam (config_sm100._STAGES_KV_OVERRIDE_FOR_SWEEPS) joins the key ONLY when it is set, so every key a
+    # process without it builds is the key it always had (the sm107 seams' alone, or None).
+    extra_key = seams if seams_sm100 is None else (seams, seams_sm100)
+    return load_template(path, params, tag=tag, extra_key=extra_key)
 
 
 def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplateParams, fp8: bool = False, pertensor: bool = False, rubin: bool = False):

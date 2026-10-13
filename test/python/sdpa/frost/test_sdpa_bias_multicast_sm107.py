@@ -201,11 +201,17 @@ def test_cfg_is_appended_and_the_kernel_carries_the_multicast_ring_as_one_const_
     drain, the cluster fence, the launch's cluster and the padded chunk count, the 16-count bars."""
     from cudnn.sdpa.fwd import config_sm107 as c
 
-    fields = [f.name for f in dataclasses.fields(c._CfgSm107)]
-    # the tail of the appended fields: STAGES_BIAS (the ring depth), BIAS_MAX_FORM (the row-max form) and S_SLOTS (the double-buffered S),
-    # both appended by the base this arm was rebased onto, then this arm's BIAS_MCAST_CTAS -- each a later append, never an insertion
+    from cudnn.sdpa.fwd.config_d128_family import D128FamilySmallTileFields
+
+    # The small-tile field block is the shared mixin of config_d128_family (the lift onto the SM100 twin, 2026-10-13): _CfgSm107 inherits it,
+    # and the tail of the appended fields -- STAGES_BIAS (the ring depth), BIAS_MAX_FORM (the row-max form) and S_SLOTS (the double-buffered S),
+    # both appended by the base this arm was rebased onto, then this arm's BIAS_MCAST_CTAS, then Q_IN_TMEM -- keeps its order there (each a later
+    # append, never an insertion; a dataclass field's position reaches no cache key, every construction site is keyword-only).
+    fields = [f.name for f in dataclasses.fields(D128FamilySmallTileFields)]
     assert (
-        fields[-5:] == ["STAGES_BIAS", "BIAS_MAX_FORM", "S_SLOTS", "BIAS_MCAST_CTAS", "Q_IN_TMEM"] and c._CfgSm107.BIAS_MCAST_CTAS == 1
+        issubclass(c._CfgSm107, D128FamilySmallTileFields)
+        and fields[-5:] == ["STAGES_BIAS", "BIAS_MAX_FORM", "S_SLOTS", "BIAS_MCAST_CTAS", "Q_IN_TMEM"]
+        and c._CfgSm107.BIAS_MCAST_CTAS == 1
     ), "append-only; 1 renders every existing record byte-identically"
     src = _KERNEL.read_text()
     assert "_BIAS_STREAMED = CFG.BIAS_MODE in BIAS_STREAMED_MODES" in src and "_BIAS_MCAST = CFG.BIAS_MODE == BIAS_MODE_STREAMED_MULTICAST" in src

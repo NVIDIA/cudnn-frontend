@@ -42,6 +42,53 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_NATURAL,
 )
 
+# The arch-NEUTRAL half of the d128-file small-tile configuration (the field block, the TMEM map formula, the budgets and the
+# validators, each taking the arch BUDGET as a parameter) -- shared with config_sm107; this module adds the SM100 budget
+# (SM100_ARCH, below the d64 flavor) and the small-tile factory the f16/bf16 d128 file builds its 32- / 64-wide forms from.
+from cudnn.sdpa.fwd.config_d128_family import (
+    BIAS_MAX_FORMS,
+    BIAS_MAX_HW_UPPER_BOUND,
+    BIAS_MCAST_CTAS,
+    BIAS_MODE_NONE,
+    BIAS_MODE_RESIDENT,
+    BIAS_MODE_STREAMED,
+    BIAS_MODE_STREAMED_MULTICAST,
+    BIAS_MODES,
+    BIAS_RING_STAGES,
+    BIAS_STREAMED_MODES,
+    BIAS_SWZ_BYTES,
+    D128_CORRECTION_WARPS,
+    D128_OTHER_WARPS,
+    D128_REG_SPLIT,
+    D128_SOFTMAX_WG_WARPS,
+    D128FamilyArch,
+    D128FamilySmallTileFields,
+    DEAD_SUBTILE_QUIET_FORMS,
+    KV_MASK_ADDITIVE_16,
+    KV_MASK_ADDITIVE_F32,
+    KV_MASK_FORMS,
+    PADDED_TAIL_FORMS,
+    SMALL_D_Q_IN_TMEM,
+    SMALL_D_SOFTMAX_WGS,
+    SMALL_D_STAGES_KV,
+    bias_block_rows,
+    bias_resident_block_bytes,
+    bias_resident_tiles,
+    bias_ring_stages,
+    d128_read_tile_arrivers,
+    d128_total_warps,
+    validate_bias,
+    validate_head_dim_tile,
+    validate_q_in_tmem,
+    validate_regs,
+    validate_small_tile_masks,
+    validate_smem,
+    validate_softmax_wgs,
+    validate_swizzles,
+    validate_tile_n,
+    validate_warp_layout,
+)
+
 # Native half THD flavors whose worklist and Stats stores use packed heads.
 SM100_THD_PACK_GQA_SHAPES = frozenset({(128, 128)})
 
@@ -400,7 +447,7 @@ _EPILOGUE_GATE_FLAVORS = frozenset()
 # than -inf, so they carry weight exp(0 - M) != 0 through the log-sum-exp and
 # corrupt the result instead of dropping out.  Grow these sets as flavors land.
 _SPLIT_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
-_CTA_MMA_FLAVORS = frozenset({"d64", "d128", "d192"})
+_CTA_MMA_FLAVORS = frozenset({"d32", "d64", "d128", "d192"})
 
 
 def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_stats):
@@ -2023,7 +2070,10 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
 
 
 @dataclass(frozen=True)
-class CfgD128:
+class CfgD128(D128FamilySmallTileFields):
+    # The small-tile seams' field block (bias / kv_mask / pair / ring / max form / tail / quiet / S_SLOTS / BIAS_MCAST_CTAS / Q_IN_TMEM) is
+    # inherited from config_d128_family at its OFF defaults: the d128 / plain d64 bodies read none of them, so their renderings are
+    # byte-identical; the small-tile factory (_make_cfg_small_d_sm100) is the only path that sets one.
     TILE_M: int = 128
     TILE_N: int = 128
     TILE_K: int = 128
@@ -2564,6 +2614,11 @@ def _validate_cfg_d64(cfg: CfgD64) -> None:
 
 
 def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
+    if _small_tile_form_requested(params):
+        # A small-tile SEAM on the d64 record (a bias / kv_mask form, the pair item, a ring depth, a tail / quiet / max form, Q in TMEM, a
+        # second S slot, a third softmax warp group, the 64-wide KV tile): the shared small-tile factory at SM100_ARCH.  The plain d64
+        # record below is untouched -- its renderings (and the fp8 / mxfp8 d64 files') stay byte-identical.
+        return _make_cfg_small_d_sm100(params, tile_k=64)
     _validate_params("d64", params)
     if params.decode_tile:
         raise ValueError("d64: decode_tile selects the decode tile (make_cfg_d64_decode), not the prefill one")
@@ -2629,6 +2684,402 @@ def make_cfg_d64(params: TemplateParams) -> Tuple[CfgD64, TmaIters]:
     )
     _validate_cfg_d64(cfg)
     return cfg, _tma_iters(cfg)
+
+
+# ---------------------------------------------------------------------------
+# The f16/bf16 SMALL head-dim tiles of the d128 FILE on SM100 -- TILE_K = TILE_O = 32 / 64 WITH the small-tile seams
+# (the additive bias / kv_mask arms, the (n, n+1) pair item, the streamed ring, the row-max forms, the padded tail and dead-sub-tile
+# forms, the double-buffered S, Q in TMEM, the third softmax warp group): the Rubin body's seams on the sm100 twin, behind the SAME
+# Cfg fields (config_d128_family.D128FamilySmallTileFields).  The PLAIN d64 record keeps make_cfg_d64's own path below (byte-identical
+# renderings; the fp8 / mxfp8 d64 files too); d32 always builds here.
+# ---------------------------------------------------------------------------
+
+# The SM100 BUDGET the shared d128-family budgets / validators take (config_d128_family.D128FamilyArch): the 227 KiB opt-in carveout (no
+# oversized mode), the same 2 KiB fixed slack the Rubin validator spends (barriers + the scheduler ring + the TMEM pointer: 480 B measured
+# plus 16 B per bias barrier row), 512 TMEM columns allocated WITHOUT is_exclusive (the 4.7.0 floor rejects the kwarg; a 512-column
+# allocation must never trace it).  At this budget the D 64 @128 cga1 forms hold NO bias at STAGES_KV 4 (192 KiB of operands leave no
+# 32 KiB tile beside the slack) where Rubin holds 128 / 384 columns -- the arithmetic decides, never a Rubin threshold.
+SM100_ARCH = D128FamilyArch(name="SM100", smem_usable_bytes=_SM100_MAX_DYN_SMEM, smem_fixed_overhead=2 * 1024, tmem_total_cols=512, tmem_exclusive_alloc=False)
+# The small head-dim shapes of the SM100 f16/bf16 d128 file and the cga widths their bodies are validated at (the sm107 sets' twins; the
+# engine row's d_shapes / cgas_by_d_shape, the adapter's pool and the tests read these -- rule 8b').  cga1 is the default at both widths;
+# d64 also admits cga2 (its per-CTA V operand is the 32-byte MN-major atom the shipped sm100 d64 cga2 build runs); at TILE_O 32 a cga2 V
+# operand would be a 16-column atom no shipped kernel runs -- declined until measured.
+SM100_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
+SM100_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
+# The KV tile widths each small shape renders (TemplateParams.tile_n): 64 / 128, as on Rubin; 256 is refused by the TMEM predicate.
+SM100_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
+# The K / V ring depth of the SM100 small tiles: 4 = the shipped sm100 d64 flavor's depth (its ncu read long_scoreboard as the dominant
+# stall; a quarter / half of d128's slabs, so 4 stages are 96 / 192 KiB at cga1) -- the depth the body is validated at on both archs.
+SM100_SMALL_D_STAGES_KV_DEFAULT = 4
+# PRIVATE, process-local sweep seam (``monkeypatch.setattr`` in a test or a sweep driver that resets it to None; never a plan path, an
+# import or a config): pins the K / V ring depth of the SM100 32- / 64-wide f16/bf16 small-tile forms (2 / 3 / 4 = SMALL_D_STAGES_KV) -- the
+# A/B arm of the D 64 @128 budget decision (STAGES_KV 2: operands 128 KiB, a 3-tile resident block / a 3-stage ring; vs TILE_N 64; vs
+# TILE_M 64).  Read by the ONE helper the budgets and the factory call, so a pinned depth moves the bias budgets with it.  It moves Cfg
+# fields WITHOUT moving the TemplateParams record, so api_dsl folds :func:`sm100_sweep_seam_state` into the template-module cache key and
+# the source digest (two renderings that differ only by the depth never share a module or an artifact).  The PLAIN d64 record (no small-tile
+# field set) keeps make_cfg_d64's own depth whatever this seam says.
+_STAGES_KV_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm100_sweep_seam_state() -> Optional[tuple]:
+    """The SM100 small tiles' private sweep seam as ONE hashable, ``None`` when unset (every plan path): the sm100 twin of
+    ``config_sm107.sweep_seam_state``, folded into the template-module key by ``api_dsl._load_kernel_template``."""
+    if _STAGES_KV_OVERRIDE_FOR_SWEEPS is None:
+        return None
+    return ("sm100_sweep_seams", int(_STAGES_KV_OVERRIDE_FOR_SWEEPS))
+
+
+def sm100_small_d_stages_kv(tile_k: int, cta_mma: int) -> int:
+    """The K / V ring depth of an SM100 small-tile form: the seam when set (validated to SMALL_D_STAGES_KV), else
+    :data:`SM100_SMALL_D_STAGES_KV_DEFAULT`.  ONE helper for the budgets and the factory (rule 8b')."""
+    if tile_k > 64:
+        return CfgD128.STAGES_KV
+    if _STAGES_KV_OVERRIDE_FOR_SWEEPS is not None:
+        want = int(_STAGES_KV_OVERRIDE_FOR_SWEEPS)
+        if want not in SMALL_D_STAGES_KV:
+            raise ValueError(
+                f"_STAGES_KV_OVERRIDE_FOR_SWEEPS={want}: the SM100 32- / 64-wide tiles' K / V ring is validated at {sorted(SMALL_D_STAGES_KV)} stages "
+                f"(SMEM fit + the ring-wrap axis of the fresh-process census); a depth outside it is unvalidated, not merely slow"
+            )
+        return want
+    return SM100_SMALL_D_STAGES_KV_DEFAULT
+
+
+def sm100_bias_resident_tiles(
+    tile_k: int, cta_mma: int, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: Optional[int] = None, pair: bool = False
+) -> int:
+    """How many ``tile_n``-column bias tiles the SM100 carveout holds beside the d128 family's Q / O slabs and K / V rings at
+    ``tile_k = tile_o`` and the small tiles' ring depth (``config_d128_family.bias_resident_tiles`` at ``SM100_ARCH``; the Q / O slabs
+    are NOT aliased on the small-tile forms).  0 = no resident block fits.  Derived at 4 stages: 2 (one-batch-entry) / 4 (pair) at
+    the 32-wide tile, 5 / 10 at its 64-wide KV tile; **0 at the 64-wide tile's cga1 on either item**, 1 at its cga2 one-batch-entry
+    item, 3 / 6 at its 64-wide KV tile (cga1, one-batch-entry / pair).  Never a Rubin threshold."""
+    stages = sm100_small_d_stages_kv(tile_k, cta_mma)
+    tile_m = 128 if tile_m is None else int(tile_m)
+    return bias_resident_tiles(SM100_ARCH, tile_k, cta_mma, stages_kv=stages, tile_m=tile_m, bpe_val=bpe(dtype_qkv), tile_n=tile_n, tiles_q=tiles_q, pair=pair)
+
+
+def sm100_bias_resident_s_kv_max(d_flavor: int, cta_mma: int, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, pair: bool = False, tiles_q: int = 2) -> int:
+    """The largest S_kv (in whole tiles) whose bias row-block the resident form serves at this width and cga on SM100 (0 = none):
+    the engine row's mismatch, the adapter's check_support and the factory read ONE arithmetic (rule 8b')."""
+    return sm100_bias_resident_tiles(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair) * tile_n
+
+
+def sm100_bias_ring_stages(
+    tile_k: int, cta_mma: int, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, tiles_q: int = 2, tile_m: Optional[int] = None, pair: bool = False
+) -> int:
+    """The deepest STREAMED bias ring the SM100 carveout holds beside the operands at this width (``config_d128_family.bias_ring_stages``
+    at ``SM100_ARCH``): 3 / 2 stages, 0 when fewer than 2 fit.  Derived at 4 stages: 2 at the 32-wide tile's one-batch-entry item
+    (its 64 KiB stages), 3 on its pair item; 0 at the 64-wide tile's 128-wide forms at cga1; 3 at its 64-wide KV tile."""
+    stages = sm100_small_d_stages_kv(tile_k, cta_mma)
+    tile_m = 128 if tile_m is None else int(tile_m)
+    return bias_ring_stages(SM100_ARCH, tile_k, cta_mma, stages_kv=stages, tile_m=tile_m, bpe_val=bpe(dtype_qkv), tile_n=tile_n, tiles_q=tiles_q, pair=pair)
+
+
+def sm100_bias_mode_pick(
+    d_flavor: int, cta_mma: int, s_kv: int, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, pair: bool = False, request=None, tiles_q: int = 2
+) -> int:
+    """The ``TemplateParams.bias_mode`` of a BIAS plan on the SM100 small tiles at this width -- the BUDGET pick (``BIAS_MODE_RESIDENT`` when
+    the resident block holds ``s_kv``, else ``BIAS_MODE_STREAMED`` when a ring of >= 2 stages fits, else 0 = no form at this width, a typed
+    decline); ``request`` pins the form and returns 0 when THAT form does not fit here -- honoured or declined, never degraded.  The Rubin
+    pick's MEASURED preferences (the one-batch-entry item streaming at the 32-wide tile, the pair ring's multicast default) are Rubin
+    priors, NOT applied here: the SM100 column is the sweep's deliverable, and until it lands the budget decides."""
+    resident_ok = s_kv <= sm100_bias_resident_s_kv_max(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair, tiles_q=tiles_q)
+    ring_ok = sm100_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair) > 0
+    if request is not None:
+        want = int(request)
+        if want == BIAS_MODE_RESIDENT:
+            return BIAS_MODE_RESIDENT if resident_ok else BIAS_MODE_NONE
+        if want == BIAS_MODE_STREAMED:
+            return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
+        if want == BIAS_MODE_STREAMED_MULTICAST:
+            return BIAS_MODE_STREAMED_MULTICAST if (ring_ok and pair and int(cta_mma) == 1) else BIAS_MODE_NONE
+        return BIAS_MODE_NONE
+    if resident_ok:
+        return BIAS_MODE_RESIDENT
+    return BIAS_MODE_STREAMED if ring_ok else BIAS_MODE_NONE
+
+
+def sm100_bias_stages_pick(
+    d_flavor: int, cta_mma: int, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, pair: bool = False, request: int = 0, tiles_q: int = 2
+) -> int:
+    """The ``STAGES_BIAS`` of a STREAMED plan on the SM100 small tiles: the request when it is in ``BIAS_RING_STAGES`` and fits, else the
+    derived deepest ring (both item forms -- the Rubin one-batch-entry item's measured 2-stage preference is a prior the sweep decides);
+    0 = no ring fits (the factory raises, the row / adapter decline)."""
+    deepest = sm100_bias_ring_stages(d_flavor, cta_mma, dtype_qkv=dtype_qkv, tile_n=tile_n, tiles_q=tiles_q, pair=pair)
+    want = int(request) if request else 0
+    if want:
+        return want if (want in BIAS_RING_STAGES and want <= deepest) else 0
+    return deepest
+
+
+def sm100_bias_auto_cga(
+    d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, pair: bool = False, tiles_q: int = 2
+) -> Optional[int]:
+    """The NARROWEST cga in ``cgas`` whose resident block holds ``s_kv`` on SM100, else the narrowest whose ring fits, else None (the
+    sm107 pick's algorithm at the SM100 budget: a D 64 bias graph at TILE_N 128 lands on cga2 -- its cga1 holds no form at 4 stages)."""
+    for cga in sorted(cgas):
+        if sm100_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1, tiles_q=tiles_q) == BIAS_MODE_RESIDENT:
+            return cga
+    for cga in sorted(cgas):
+        if sm100_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1, tiles_q=tiles_q) != BIAS_MODE_NONE:
+            return cga
+    return None
+
+
+# The small shapes that serve the bias at SOME validated cga -- DERIVED from the SM100 resident budget exactly as SM107_BIAS_D_SHAPES is on
+# Rubin: (32, 32) through its cga1 blocks, (64, 64) through its cga2 one-batch-entry block (and its 64-wide KV tile); the d128 tile has no
+# spare on either arch.  The engine row's ``bias_d_shapes`` and the adapter read this set (rule 8b').
+SM100_BIAS_D_SHAPES = frozenset(
+    shape for shape in SM100_F16_SMALL_D_SHAPES if any(sm100_bias_resident_tiles(shape[0], cga) > 0 for cga in SM100_SMALL_D_CGAS[shape])
+)
+
+
+@dataclass(frozen=True)
+class CfgD32(CfgD128):
+    """d_qk = d_v = 32 on the d128 body: ``TILE_K = TILE_O = 32`` (BMM1 in 2 k-steps, a 32-wide O accumulator, a quarter of
+    the d128 SMEM; 64-byte Q/K/O swizzle atoms).  Serves every f16/bf16 head dim <= 32 with D % 8 == 0 by TMA zero fill.
+    At this width the MMA is a quarter of d128's per score element while the softmax's exp / FMA work per element is unchanged,
+    so the kernel's floor is the softmax issue rate (on cc 10.0 the MUFU.EX2 rate: 16 lanes/clk/SM), not the tensor core.
+    Built by :func:`_make_cfg_small_d_sm100` only (the small-tile factory; no plain-record path: the d32 flavor IS a small tile)."""
+
+    TILE_K: int = 32
+    TILE_O: int = 32
+
+
+_SMALL_TILE_RECORD_FIELDS = ("bias_mode", "kv_mask_form", "n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "q_in_tmem")
+
+
+def _small_tile_form_requested(params: TemplateParams) -> bool:
+    """Whether a d64 record asks for a small-tile SEAM (any of the appended small-tile fields off its default: a bias / kv_mask form, the pair
+    item, a ring depth, a tail / quiet form, the row-max form, Q in TMEM, a second S slot, a third softmax warp group, the 64-wide KV tile).
+    False = the plain d64 record every existing rendering is built from (``make_cfg_d64``'s own path, byte-identical)."""
+    return (
+        any(int(getattr(params, f, 0)) for f in _SMALL_TILE_RECORD_FIELDS)
+        or int(getattr(params, "s_slots", 1)) != 1
+        or int(getattr(params, "softmax_wgs", 2)) != 2
+        or int(getattr(params, "tile_n", 128)) != 128
+    )
+
+
+def _make_cfg_small_d_sm100(params: TemplateParams, *, tile_k: int) -> Tuple[CfgD128, TmaIters]:
+    """The f16/bf16 SMALL-tile factory of the SM100 d128 file (``TILE_K = TILE_O = tile_k`` in {32, 64}): the record's small-tile fields
+    (bias / kv_mask / pair / ring / max form / tail / quiet / S_SLOTS / Q_IN_TMEM / softmax WGs / TILE_N) resolved against the shared
+    validators at ``SM100_ARCH`` -- the sm107 factory's resolution with the SM100 budget, the SM100 ring depth, the 128-row tile and NO Q u O
+    alias (the resident block needs the separate ``sO``; the plain d64 cga1 record keeps its alias on ``make_cfg_d64``'s path).  Every
+    structural coupling raises here with the failure it would otherwise produce (frost-kernels.md s 5 / s 6); every rejection must also be
+    a Capabilities / check_support decline."""
+    flavor = f"d{tile_k}"
+    tag = f"sm100 {flavor}"
+    _validate_params(flavor, params)
+    if params.dtype_qkv <= 1:
+        raise ValueError(
+            f"{tag}: the 32- / 64-wide small-tile forms are wired on the f16/bf16 d128 file only (dtype_qkv={params.dtype_qkv}); the fp8 / mxfp8 d64 flavors keep their own records"
+        )
+    if params.decode_tile or params.decode_q_tile:
+        raise ValueError(f"{tag}: the decode tiles do not consume the small-tile record fields")
+    if params.thd_varlen or params.split_kv != 1 or params.pack_gqa or params.paged_kv or params.epilogue_gate or params.seq_q_lens_present:
+        raise ValueError(
+            f"{tag}: the small-tile forms serve dense, unsplit, unpaged, non-PackGQA, ungated graphs with global or per-batch KV lengths only (THD / paged / "
+            f"split-KV / PackGQA / per-batch Q lengths ride the d128 flavor zero-filled, where those legs are wired)"
+        )
+    cta_mma = params.cta_mma
+    if cta_mma not in SM100_SMALL_D_CGAS[(tile_k, tile_k)]:
+        raise ValueError(
+            f"{tag}: cta_mma={cta_mma} is outside the validated widths {sorted(SM100_SMALL_D_CGAS[(tile_k, tile_k)])} for TILE_O={tile_k}; "
+            f"at cga2 the per-CTA V operand is {tile_k // 2} columns = a {tile_k // 2 * 2}-byte MN-major swizzle atom"
+        )
+    dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
+    b, b_o = bpe(params.dtype_qkv), bpe(dtype_o)
+    tile_n = int(getattr(params, "tile_n", 128))
+    if tile_n not in dict(SM100_TILE_NS_BY_D_SHAPE)[(tile_k, tile_k)]:
+        raise ValueError(f"{tag}: TILE_N must be one of {sorted(dict(SM100_TILE_NS_BY_D_SHAPE)[(tile_k, tile_k)])} (got {tile_n})")
+    s_slots = int(getattr(params, "s_slots", 1))
+    q_in_tmem = int(getattr(params, "q_in_tmem", 0))
+    if q_in_tmem not in SMALL_D_Q_IN_TMEM:
+        raise ValueError(f"{tag}: q_in_tmem must be 0 (Q from SMEM) or 1 (Q resident in TMEM); got {q_in_tmem}")
+    bias_mode = int(getattr(params, "bias_mode", 0))
+    kv_mask_form = int(getattr(params, "kv_mask_form", 0))
+    if (bias_mode or kv_mask_form) and (bias_mode not in BIAS_MODES or kv_mask_form not in KV_MASK_FORMS):
+        raise ValueError(
+            f"{tag}: bias_mode must be 0 / 1 (resident row-block) / 2 (streamed ring) / 3 (streamed ring, cluster multicast) and kv_mask_form "
+            f"0 / 1 (bit word) / 2 / 3 (additive io-dtype / fp32 vector); got {bias_mode} / {kv_mask_form}"
+        )
+    n_chunk = int(getattr(params, "n_chunk", 0))
+    pair = n_chunk > 0
+    if pair and bias_mode == BIAS_MODE_NONE:
+        raise ValueError(f"{tag}: n_chunk={n_chunk} is the (n, n+1) pair item of the BIAS arm; it needs bias_mode=1 / 2 (got {bias_mode})")
+    bias_stages_req = int(getattr(params, "bias_stages", 0))
+    if bias_stages_req and bias_mode not in BIAS_STREAMED_MODES:
+        raise ValueError(f"{tag}: bias_stages={bias_stages_req} is the STREAMED ring's depth; it needs bias_mode=2 / 3 (got {bias_mode})")
+    bias_max_form = int(getattr(params, "bias_max_form", 0))
+    if bias_max_form not in BIAS_MAX_FORMS:
+        raise ValueError(f"{tag}: bias_max_form must be 0 (the software row max) or 1 (the hardware upper bound); got {bias_max_form}")
+    if bias_max_form == BIAS_MAX_HW_UPPER_BOUND:
+        if not (bias_mode or kv_mask_form):
+            raise ValueError(
+                f"{tag}: bias_max_form=1 is the row-max form of the bias / kv_mask body; this record has neither arm (bias_mode=0, kv_mask_form=0)"
+            )
+        if kv_mask_form in (KV_MASK_ADDITIVE_16, KV_MASK_ADDITIVE_F32):
+            raise ValueError(
+                f"{tag}: bias_max_form=1 (the hardware upper-bound row max) is served with the bit-word kv_mask or none; the additive kv_mask vector "
+                f"(kv_mask_form={kv_mask_form}) has no per-tile max to bound -- keep bias_max_form=0 with it"
+            )
+    softmax_wgs = int(getattr(params, "softmax_wgs", 2))
+    if softmax_wgs not in SMALL_D_SOFTMAX_WGS:
+        raise ValueError(f"{tag}: softmax_wgs must be one of {sorted(SMALL_D_SOFTMAX_WGS)}; got {softmax_wgs}")
+    if softmax_wgs == 3 and (tile_n != 64 or not pair or cta_mma != 1):
+        raise ValueError(
+            f"{tag}: softmax_wgs=3 serves the (n, n+1) pair item at TILE_N 64 and cga1 only (got tile_n={tile_n}, n_chunk={n_chunk}, cta_mma={cta_mma}): "
+            f"its 128-register softmax holds one 64-column chunk and the one-batch-entry paths hand-unroll two sub-tiles"
+        )
+    stages_kv = sm100_small_d_stages_kv(tile_k, cta_mma)
+    tile_m = 128
+    softmax_regs, correction_regs = D128_REG_SPLIT[2 if softmax_wgs == 2 else (softmax_wgs, tile_k)]
+    total_warps = d128_total_warps(softmax_wgs)
+    corr_warp_base = softmax_wgs * D128_SOFTMAX_WG_WARPS
+    mma_warp_id = corr_warp_base + D128_CORRECTION_WARPS
+    bias_tiles = 0
+    stages_bias = 0
+    if bias_mode == BIAS_MODE_RESIDENT:
+        bias_tiles = sm100_bias_resident_tiles(tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, tiles_q=softmax_wgs, pair=pair)
+        if bias_tiles == 0:
+            raise ValueError(
+                f"{tag}: no resident bias block fits beside the Q / O slabs and the {stages_kv}-deep K / V ring at TILE_K={tile_k}, TILE_N={tile_n}, cta_mma={cta_mma} "
+                f"({SM100_ARCH.smem_usable_bytes // 1024} KiB usable on SM100: the 64-wide tile's 128-wide forms hold no block at cga1 at 4 stages); the bias is "
+                f"served on the widths of SM100_BIAS_D_SHAPES={sorted(SM100_BIAS_D_SHAPES)} at the cga / KV width / ring depth whose budget holds a tile"
+            )
+    elif bias_mode in BIAS_STREAMED_MODES:
+        stages_bias = sm100_bias_stages_pick(
+            tile_k, cta_mma, dtype_qkv=params.dtype_qkv, tile_n=tile_n, pair=pair, request=bias_stages_req, tiles_q=softmax_wgs
+        )
+        if stages_bias == 0:
+            raise ValueError(
+                f"{tag}: no {sorted(BIAS_RING_STAGES)}-stage streamed bias ring of {bias_block_rows(softmax_wgs, tile_m, pair=pair)} x {tile_n} tiles "
+                f"{'(requested bias_stages=' + str(bias_stages_req) + ') ' if bias_stages_req else ''}fits beside the Q / O slabs and the {stages_kv}-deep "
+                f"K / V ring at TILE_K={tile_k}, cta_mma={cta_mma} ({SM100_ARCH.smem_usable_bytes // 1024} KiB usable on SM100)"
+            )
+    mask_flags = _mask_flags_from(params)
+    padded_tail_form = int(getattr(params, "padded_tail_form", 0))
+    if padded_tail_form not in PADDED_TAIL_FORMS:
+        raise ValueError(f"{tag}: padded_tail_form must be 0 (the legacy tail body) or 1 (the pre-masked tail); got {padded_tail_form}")
+    if padded_tail_form == 1 and (mask_flags != MASK_PADDED or bias_mode or kv_mask_form):
+        raise ValueError(
+            f"{tag}: padded_tail_form=1 (the pre-masked tail) is wired on the f16/bf16 32- / 64-wide tiles' PLAIN padded body only "
+            f"(MASK_FLAGS == MASK_PADDED alone, no bias / kv_mask); got MASK_FLAGS={mask_flags}, bias_mode={bias_mode}, kv_mask_form={kv_mask_form}"
+        )
+    dead_subtile_quiet = int(getattr(params, "dead_subtile_quiet", 0))
+    if dead_subtile_quiet not in DEAD_SUBTILE_QUIET_FORMS:
+        raise ValueError(f"{tag}: dead_subtile_quiet must be 0 (the full body on a dead sub-tile) or 1 (the quiet body); got {dead_subtile_quiet}")
+    if dead_subtile_quiet == 1 and (bias_mode or pair):
+        raise ValueError(
+            f"{tag}: dead_subtile_quiet=1 (the dead-sub-tile quiet body) is wired on the one-batch-entry item without a bias only; got bias_mode={bias_mode}, n_chunk={n_chunk}"
+        )
+    cls = CfgD64 if tile_k == 64 else CfgD32
+    cfg = cls(
+        TILE_M=tile_m,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        TILE_O=tile_k,
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE=b,
+        BPE_V=b,
+        PV_BF16=0,
+        EMIT_AMAX_O=int(params.emit_amax_o),
+        BPE_O=b_o,
+        O_BLOCK_SCALE=0,
+        O_PACK_DIV=1,
+        CGA_M=cta_mma,
+        CGA_N=1,
+        CTA_MMA=cta_mma,
+        # No Q u O alias on the small-tile forms: the resident block / the pair item's Q refill need the separate sO (the sm107 geometry every
+        # seam's barrier analysis assumed); the plain d64 cga1 record keeps its alias on make_cfg_d64's own path.
+        QO_ALIAS=0,
+        Q_SWZ_BYTES=q_swz_bytes(tile_k, b),
+        K_SWZ_BYTES=q_swz_bytes(tile_k, b),
+        V_SWZ_BYTES=v_swz_bytes(tile_k, cta_mma, b),
+        O_SWZ_BYTES=o_swz_bytes(tile_k, b_o, 1),
+        RESCALE_THRESHOLD=rescale_threshold(params.dtype_qkv),
+        TILE_K_HW_BMM1=tile_k_hw(params.dtype_qkv),
+        TILE_K_HW_BMM2=tile_k_hw(params.dtype_qkv),
+        TILES_Q=softmax_wgs,
+        SCHEDULER_STAGES=2,
+        STAGES_KV=stages_kv,
+        SOFTMAX_WARPGROUPS=softmax_wgs,
+        CORRECTION_WARPS=D128_CORRECTION_WARPS,
+        SOFTMAX_REGS=softmax_regs,
+        CORRECTION_REGS=correction_regs,
+        MASK_FLAGS=mask_flags,
+        WINDOW_LEFT=params.window_left or 0,
+        WINDOW_RIGHT=params.window_right or 0,
+        HAS_SINK=int(params.has_sink),
+        STATS_LOG2=int(params.stats_log2),
+        BOTTOM_RIGHT=int(params.bottom_right),
+        SCHEDULER_POLICY=params.sched_policy,
+        N_BMM2_CHUNKS=tile_n // 64,
+        BMM2_CHUNK_SIZE=64,
+        TOTAL_WARPS=total_warps,
+        THREADS_PER_CTA=total_warps * 32,
+        SOFTMAX_WG_WARPS=D128_SOFTMAX_WG_WARPS,
+        OTHER_WARPS=D128_OTHER_WARPS,
+        SOFTMAX_WG0_BASE=0,
+        SOFTMAX_WG1_BASE=D128_SOFTMAX_WG_WARPS,
+        CORR_WARP_BASE=corr_warp_base,
+        MMA_WARP_ID=mma_warp_id,
+        TMALDG_WARP_ID=mma_warp_id + 1,
+        TMASTG_WARP_ID=mma_warp_id + 2,
+        SCHED_WARP_ID=mma_warp_id + 3,
+        READ_TILE_ARRIVERS=d128_read_tile_arrivers(softmax_wgs),
+        SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
+        SEQ_Q_LENS_PRESENT=0,
+        THD_VARLEN=0,
+        SPLIT_KV=1,
+        PACK_GQA=0,
+        QH_PER_KH=int(params.qh_per_kh),
+        PACK_G=1,
+        PAGED_KV=0,
+        PAGE_SIZE=0,
+        PADDED_TAIL_FORM=padded_tail_form,
+        DEAD_SUBTILE_QUIET=dead_subtile_quiet,
+        BIAS_MODE=bias_mode,
+        BIAS_RESIDENT_TILES=bias_tiles,
+        BIAS_BLOCK_ROWS=bias_block_rows(softmax_wgs, tile_m, pair=pair) if bias_mode else 0,
+        BIAS_SWZ_BYTES=BIAS_SWZ_BYTES,
+        BIAS_BOXES_PER_TILE=(tile_n * b) // BIAS_SWZ_BYTES if bias_mode else 0,
+        BIAS_EMPTY_ARRIVERS=softmax_wgs * D128_SOFTMAX_WG_WARPS if (bias_mode or kv_mask_form) else 0,
+        KV_MASK_FORM=kv_mask_form,
+        N_CHUNK=n_chunk,
+        STAGES_BIAS=stages_bias,
+        BIAS_MAX_FORM=bias_max_form,
+        S_SLOTS=s_slots,
+        Q_IN_TMEM=q_in_tmem,
+        BIAS_MCAST_CTAS=BIAS_MCAST_CTAS if bias_mode == BIAS_MODE_STREAMED_MULTICAST else 1,
+    )
+    # The SM100 facts the shared validators do not know: the f16 k-step and the half-precision O.
+    if cfg.TILE_K_HW_BMM1 != 16 or cfg.TILE_K_HW_BMM2 != 16:
+        raise ValueError(
+            f"{tag}: the f16/bf16 small tiles run the 16-wide k-step (got {cfg.TILE_K_HW_BMM1} / {cfg.TILE_K_HW_BMM2}); the 2-chunk path is silently wrong on SM10x"
+        )
+    if cfg.DTYPE_O != cfg.DTYPE_QKV:
+        raise ValueError(f"{tag}: DTYPE_O must equal DTYPE_QKV for half input")
+    validate_regs(cfg, tag)
+    validate_warp_layout(cfg, tag, expect_total=d128_total_warps(softmax_wgs), expect_arrivers=d128_read_tile_arrivers(softmax_wgs))
+    validate_softmax_wgs(cfg, tag)
+    validate_swizzles(cfg, tag)
+    validate_head_dim_tile(cfg, tag, arch=SM100_ARCH)
+    validate_tile_n(cfg, tag, arch=SM100_ARCH)
+    validate_q_in_tmem(cfg, tag, arch=SM100_ARCH)
+    validate_small_tile_masks(cfg, tag)
+    validate_bias(cfg, tag, arch=SM100_ARCH)
+    validate_smem(cfg, tag, arch=SM100_ARCH, qo_alias=False, bias_bytes=bias_resident_block_bytes(cfg))
+    return cfg, _tma_iters(cfg)
+
+
+def make_cfg_d32(params: TemplateParams) -> Tuple[CfgD32, TmaIters]:
+    """The 32-wide head-dim tile of ``sm100/prefill_d128_f16.py`` (``TemplateParams.d_flavor=32``): every f16/bf16 head dim <= 32 with
+    D % 8 == 0 by TMA zero fill; cga1 (SM100_SMALL_D_CGAS); dense / causal / bottom-right / SWA / padded / sink / GQA like d128 plus the
+    small-tile seams; THD / split-KV / paged KV / PackGQA / the score side outputs ride the d128 flavor (the row's ``dense_only_d_shapes``)."""
+    return _make_cfg_small_d_sm100(params, tile_k=32)
 
 
 @dataclass(frozen=True)
@@ -3011,4 +3462,4 @@ def make_cfg_d192(params: TemplateParams) -> Tuple[CfgD192, TmaIters]:
     return cfg, _tma_iters(cfg)
 
 
-MAKE_CFG = {64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}
+MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128, 192: make_cfg_d192, 256: make_cfg_d256, 512: make_cfg_d512}
