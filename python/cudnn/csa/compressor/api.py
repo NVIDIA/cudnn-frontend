@@ -46,9 +46,11 @@ inputs whose fp32 intermediates stay finite those outputs additionally carry
 fp64-oracle parity (at least as close to an fp64 oracle as the eager reference). That
 is the approved deterministic tolerance contract (reduction reorders + fast-exp
 buckets).
-``dAPE`` uses one fp32 atomic per ``(k, dim)`` per CTA in both families and is not
-run-to-run deterministic (the backward APIs refuse to run under
-``torch.use_deterministic_algorithms(True)``).
+The default ``dAPE`` path uses one fp32 atomic per ``(k, dim)`` per CTA and is not
+run-to-run deterministic. ``deterministic=True`` replaces those atomics with
+CTA-local partial planes in caller-owned workspace plus a fixed-order second-stage
+reduction, making the complete backward bitwise run-to-run deterministic and valid
+under ``torch.use_deterministic_algorithms(True)``.
 """
 
 from __future__ import annotations
@@ -70,12 +72,14 @@ from .compressor_sm100 import (
     CU_ALIGN_BYTES,
     MINIMUM_COMPUTE_CAPABILITY_MAJOR,
     PTR_ALIGN_BYTES,
+    bwd_dape_workspace_bytes,
     precompile_bwd,
     precompile_fwd,
     run_bwd,
     run_fwd,
 )
 from .compressor_sm100_r128 import (
+    bwd_dape_workspace_bytes_r128,
     precompile_bwd_r128,
     precompile_fwd_r128,
     run_bwd_r128,
@@ -132,17 +136,17 @@ def _torch_stream_context(current_stream: Optional[cuda.CUstream], device: torch
         yield
 
 
-def _reject_deterministic_backward() -> None:
-    """The backward accumulates ``dAPE`` with fp32 atomics and is not deterministic.
+def _reject_deterministic_backward(deterministic: bool = False) -> None:
+    """Reject torch deterministic mode only when the atomic dAPE path is selected.
 
-    Mirrors torch's deterministic-mode semantics: strict mode raises, warn-only mode
-    warns and runs.
+    Mirrors torch's semantics: strict mode raises, warn-only mode warns and runs.
     """
-    if torch.are_deterministic_algorithms_enabled():
+    if not deterministic and torch.are_deterministic_algorithms_enabled():
         message = (
             "CSA compressor backward accumulates dAPE with fp32 atomics and is not "
-            "deterministic; torch.use_deterministic_algorithms(True) is set. Use a "
-            "deterministic (eager) implementation instead."
+            "deterministic; torch.use_deterministic_algorithms(True) is set. Construct "
+            "CSACompressorBackward with deterministic=True (and pass its reported "
+            "workspace) or call csa_compressor_backward_wrapper(..., deterministic=True)."
         )
         if torch.is_deterministic_algorithms_warn_only_enabled():
             warnings.warn(message, RuntimeWarning, stacklevel=2)
@@ -440,17 +444,97 @@ class CSACompressorBackward(_CSACompressorBase):
     separate zero-fill kernels. Exception: when ``total_comp == 0`` the kernel is not
     launched and the buffers are left untouched, so a caller that needs autograd-exact
     zeros in that case must zero them itself (the high-level wrapper does).
-    ``grad_ape`` must be zero-initialized by the caller before EVERY ``execute`` call
-    and before every CUDA-graph replay that reuses the buffer: the kernel only
-    ACCUMULATES into it (fp32 atomics, not bitwise run-to-run deterministic —
-    ``grad_kv``/``grad_score`` are) and never clears it, so a reused buffer otherwise
-    carries the previous invocation's sums. (The high-level wrapper allocates a fresh
-    zeroed buffer per call; because that zero-fill is captured together with the
-    kernel, wrapper graph replays re-zero automatically.)
-    ``execute`` raises under ``torch.use_deterministic_algorithms(True)``. Incoming
-    gradients on static-capacity padding rows (``[cu_seqlens_comp[-1], total_comp)``)
-    are ignored.
+    The default atomic path requires caller-zeroed ``grad_ape`` before every execute
+    or graph replay and raises under strict torch deterministic mode. With
+    ``deterministic=True``, ``scratch_workspace_bytes()`` reports the required
+    caller-owned contiguous uint8 scratch, ``execute(..., workspace=...)`` launches a
+    fixed-order second-stage reduction, and ``grad_ape`` is fully overwritten (so it
+    need not be initialized and graph replays do not accumulate). Incoming gradients
+    on static-capacity padding rows (``[cu_seqlens_comp[-1], total_comp)``) are ignored.
     """
+
+    def __init__(
+        self,
+        sample_kv: torch.Tensor,
+        sample_score: torch.Tensor,
+        sample_ape: torch.Tensor,
+        sample_cu_seqlens: torch.Tensor,
+        sample_cu_seqlens_comp: torch.Tensor,
+        sample_out: torch.Tensor,
+        ratio: int = 4,
+        coff: int = 2,
+        deterministic: bool = False,
+    ):
+        """Capture descriptors and choose atomic or deterministic dAPE reduction."""
+        self.deterministic = bool(deterministic)
+        self._scratch_bytes: Optional[int] = None
+        super().__init__(
+            sample_kv,
+            sample_score,
+            sample_ape,
+            sample_cu_seqlens,
+            sample_cu_seqlens_comp,
+            sample_out,
+            ratio,
+            coff,
+        )
+
+    def check_support(self) -> bool:
+        """Validate the common envelope plus deterministic workspace indexing."""
+        super().check_support()
+        self._is_supported = False
+        if self.deterministic:
+            if self.ratio == 128:
+                self._scratch_bytes = bwd_dape_workspace_bytes_r128(
+                    self.total_comp,
+                    self.ratio,
+                    self.head_dim,
+                    self.coff,
+                    self.target_device.index,
+                )
+            else:
+                self._scratch_bytes = bwd_dape_workspace_bytes(self.total_comp, self.ratio, self.head_dim, self.coff)
+            workspace_elems = self._scratch_bytes // 4
+            self._value_error_if(
+                workspace_elems >= _INT32_LIMIT,
+                f"deterministic dAPE workspace elements must be < 2**31 for int32 flat offsets, got {workspace_elems}",
+            )
+        else:
+            self._scratch_bytes = 0
+        self._is_supported = True
+        return True
+
+    def scratch_workspace_bytes(self) -> int:
+        """Required caller-owned uint8 scratch; zero for the default atomic path."""
+        if self._scratch_bytes is None:
+            raise RuntimeError("call check_support() before scratch_workspace_bytes()")
+        return self._scratch_bytes
+
+    def _validate_workspace(self, workspace: Optional[torch.Tensor], operands) -> None:
+        """Validate caller-owned deterministic scratch without creating tensor views."""
+        required = self.scratch_workspace_bytes()
+        if workspace is None:
+            raise ValueError(f"workspace is required: need {required} bytes of contiguous uint8 on {self.target_device}")
+        if (
+            not isinstance(workspace, torch.Tensor)
+            or workspace.dtype != torch.uint8
+            or not workspace.is_cuda
+            or workspace.device != self.target_device
+            or not workspace.is_contiguous()
+        ):
+            got = f"{workspace.dtype} on {workspace.device}" if isinstance(workspace, torch.Tensor) else type(workspace).__name__
+            raise ValueError(f"workspace must be contiguous uint8 on {self.target_device}, got {got}")
+        if workspace.numel() < required:
+            raise ValueError(f"workspace is {workspace.numel()} bytes, need {required}")
+        if workspace.data_ptr() % PTR_ALIGN_BYTES:
+            raise ValueError(f"workspace base pointer must be {PTR_ALIGN_BYTES}-byte aligned, got 0x{workspace.data_ptr():x}")
+        workspace_start = workspace.data_ptr()
+        workspace_end = workspace_start + required
+        for name, tensor in operands:
+            tensor_start = tensor.data_ptr()
+            tensor_end = tensor_start + tensor.numel() * tensor.element_size()
+            if workspace_start < tensor_end and tensor_start < workspace_end:
+                raise ValueError(f"workspace must not overlap {name}")
 
     def compile(self) -> None:
         """JIT-compile the backward kernel for this ``(ratio, head_dim, coff, device)`` (idempotent)."""
@@ -460,15 +544,15 @@ class CSACompressorBackward(_CSACompressorBase):
             return
         # Route by ratio, as in the forward.
         if self.ratio == 128:
-            precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device)
+            precompile_bwd_r128(self.ratio, self.head_dim, self.coff, self.target_device, deterministic=self.deterministic)
             run = run_bwd_r128
         else:
-            precompile_bwd(self.ratio, self.head_dim, self.coff, self.target_device)
+            precompile_bwd(self.ratio, self.head_dim, self.coff, self.target_device, deterministic=self.deterministic)
             run = run_bwd
 
-        ratio, head_dim, coff = self.ratio, self.head_dim, self.coff
+        ratio, head_dim, coff, deterministic = self.ratio, self.head_dim, self.coff, self.deterministic
 
-        def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, stream_handle):
+        def tensor_api(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, stream_handle):
             """Per-config closure: invoke the routed backward with the bound ``(ratio, head_dim, coff)``."""
             run(
                 kv,
@@ -485,6 +569,8 @@ class CSACompressorBackward(_CSACompressorBase):
                 head_dim,
                 coff,
                 stream_handle=stream_handle,
+                deterministic=deterministic,
+                workspace=workspace,
             )
 
         self._compiled_kernel = tensor_api
@@ -500,14 +586,15 @@ class CSACompressorBackward(_CSACompressorBase):
         grad_out: torch.Tensor,  # (total_comp, head_dim) BF16, contiguous
         grad_kv: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
         grad_score: torch.Tensor,  # (total_tokens, coff * head_dim) BF16 (may be uninitialized; fully written when total_comp > 0)
-        grad_ape: torch.Tensor,  # (ratio, coff * head_dim) FP32, zero-initialized before EVERY call/replay (kernel accumulates)
+        grad_ape: torch.Tensor,  # (ratio, coff * head_dim) FP32; caller-zeroed for atomic mode, fully overwritten for deterministic mode
         current_stream: Optional[cuda.CUstream] = None,
+        workspace: Optional[torch.Tensor] = None,
     ) -> None:
         """Run the compiled backward kernel into the gradient buffers (see class docs)."""
         self._logger.debug("Entering execute")
         if self._compiled_kernel is None:
             raise ValueError("CSACompressorBackward kernel not compiled")
-        _reject_deterministic_backward()
+        _reject_deterministic_backward(self.deterministic)
         device = self.target_device
         width = self.coff * self.head_dim
         self._validate_runtime_tensor(kv, "kv", (self.total_tokens, width), torch.bfloat16, device, PTR_ALIGN_BYTES)
@@ -521,12 +608,32 @@ class CSACompressorBackward(_CSACompressorBase):
         self._validate_runtime_tensor(grad_ape, "grad_ape", (self.ratio, width), torch.float32, device, PTR_ALIGN_BYTES)
         if grad_out.numel() == 0:
             return
-        self._compiled_kernel(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, _resolve_stream_handle(current_stream))
-        self._record_streams((kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape), current_stream, device)
+        if self.deterministic:
+            self._validate_workspace(
+                workspace,
+                (
+                    ("kv", kv),
+                    ("score", score),
+                    ("ape", ape),
+                    ("cu_seqlens", cu_seqlens),
+                    ("cu_seqlens_comp", cu_seqlens_comp),
+                    ("grad_out", grad_out),
+                    ("grad_kv", grad_kv),
+                    ("grad_score", grad_score),
+                    ("grad_ape", grad_ape),
+                ),
+            )
+        self._compiled_kernel(
+            kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, workspace, _resolve_stream_handle(current_stream)
+        )
+        tensors = (kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape)
+        if workspace is not None:
+            tensors = (*tensors, workspace)
+        self._record_streams(tensors, current_stream, device)
 
 
 # module-level bounded LRU cache of compiled API instances (thread-safe):
-#   (kind, ratio, head_dim, coff, total_tokens, total_comp, n_seg, device) -> api
+#   (kind, ratio, head_dim, coff, deterministic, total_tokens, total_comp, n_seg, device) -> api
 # The compiled kernel underneath is shared per (ratio, head_dim, coff, device) through
 # compressor_sm100's compile cache, so shape changes only rebuild the cheap wrapper
 # object, never the JIT.
@@ -536,9 +643,9 @@ _api_cache = _LruDict()
 _api_build_lock = threading.Lock()
 
 
-def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio, coff):
+def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio, coff, deterministic=False):
     """Build (or fetch) a compiled forward/backward API instance for these tensors."""
-    key = (kind, int(ratio), int(coff), out_shape[1], tuple(kv.shape), out_shape[0], cu_seqlens.shape[0], kv.device.index)
+    key = (kind, int(ratio), int(coff), bool(deterministic), out_shape[1], tuple(kv.shape), out_shape[0], cu_seqlens.shape[0], kv.device.index)
     api = _api_cache.get(key)
     if api is not None:
         return api
@@ -548,7 +655,7 @@ def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio
             return api
         sample_out = torch.empty(out_shape, dtype=torch.bfloat16, device="meta")
         cls = CSACompressorForward if kind == "fwd" else CSACompressorBackward
-        api = cls(
+        kwargs = dict(
             sample_kv=kv,
             sample_score=score,
             sample_ape=ape,
@@ -558,6 +665,9 @@ def _get_api(kind, kv, score, ape, cu_seqlens, cu_seqlens_comp, out_shape, ratio
             ratio=ratio,
             coff=coff,
         )
+        if kind == "bwd":
+            kwargs["deterministic"] = deterministic
+        api = cls(**kwargs)
         api.check_support()
         api.compile()
         _api_cache.put(key, api)
@@ -636,6 +746,7 @@ def csa_compressor_backward_wrapper(
     head_dim: Optional[int] = None,
     coff: int = 2,
     stream: Optional[cuda.CUstream] = None,
+    deterministic: bool = False,
 ) -> TupleDict:
     """High-level backward wrapper. Allocates the grad buffers and fills them.
 
@@ -643,12 +754,11 @@ def csa_compressor_backward_wrapper(
     forward wrapper's ``out``); gradients on static-capacity padding rows are ignored.
     ``grad_kv``/``grad_score`` are allocated UNINITIALIZED — the kernel writes every
     position, storing exact zeros to never-consumed positions itself, so no zero-fill
-    kernels run; ``grad_ape`` is allocated zeroed (fp32 atomic accumulation). When
-    ``total_comp == 0`` the kernel is not launched and all three grads are allocated as
-    zeros instead, preserving autograd's exact-zero semantics.
-    Raises ``RuntimeError`` under ``torch.use_deterministic_algorithms(True)`` because
-    ``grad_ape`` is accumulated with fp32 atomics (``grad_kv``/``grad_score`` are
-    deterministic and bitwise reproducible).
+    kernels run. By default ``grad_ape`` is zeroed for fp32 atomic accumulation. With
+    ``deterministic=True`` it is uninitialized and fully overwritten through a
+    caller-owned partial workspace plus fixed-order reduction; the complete backward
+    is then bitwise reproducible and accepted by strict torch deterministic mode.
+    When ``total_comp == 0`` no kernel is launched and all three grads are zeroed.
 
     Returns:
         ``{'grad_kv': (total_tokens, coff * head_dim) BF16,
@@ -658,7 +768,7 @@ def csa_compressor_backward_wrapper(
     head_dim = _infer_head_dim(kv, head_dim, coff)
     if grad_out.ndim != 2:
         raise ValueError(f"grad_out must be 2-D (total_comp, head_dim), got {tuple(grad_out.shape)}")
-    api = _get_api("bwd", kv, score, ape, cu_seqlens, cu_seqlens_comp, tuple(grad_out.shape), ratio, coff)
+    api = _get_api("bwd", kv, score, ape, cu_seqlens, cu_seqlens_comp, tuple(grad_out.shape), ratio, coff, deterministic)
     with torch.cuda.device(kv.device), _torch_stream_context(stream, kv.device):
         if grad_out.shape[0] == 0:
             # No kernel launch below -> the buffers must carry autograd's exact zeros.
@@ -667,7 +777,20 @@ def csa_compressor_backward_wrapper(
         else:
             grad_kv = torch.empty_like(kv)
             grad_score = torch.empty_like(score)
-        grad_ape = torch.zeros_like(ape, dtype=torch.float32)
+        grad_ape = torch.empty_like(ape, dtype=torch.float32) if deterministic and grad_out.shape[0] else torch.zeros_like(ape, dtype=torch.float32)
+        workspace = torch.empty(api.scratch_workspace_bytes(), dtype=torch.uint8, device=kv.device) if deterministic and grad_out.shape[0] else None
     with torch.cuda.nvtx.range("csa_compressor_bwd_kernel"):
-        api.execute(kv, score, ape, cu_seqlens, cu_seqlens_comp, grad_out, grad_kv, grad_score, grad_ape, current_stream=stream)
+        api.execute(
+            kv,
+            score,
+            ape,
+            cu_seqlens,
+            cu_seqlens_comp,
+            grad_out,
+            grad_kv,
+            grad_score,
+            grad_ape,
+            current_stream=stream,
+            workspace=workspace,
+        )
     return TupleDict(grad_kv=grad_kv, grad_score=grad_score, grad_ape=grad_ape)
