@@ -189,6 +189,15 @@ pytest gemm/cutedsl/                  # CuTe DSL kernel tests
 - **Unchanged device-function ASTs do not imply unchanged generated code.** Replacing static layout constants with runtime strides can change device address calculations; compare GPU time for the affected cases. A unit-stride fast path must also exercise nonunit strides through the same compiled host; `test_d256_paged_host_rebinds_table_column_stride` checks this contract.
 - **When you remove a fallback, invert its counter assertion — do not delete it.** Tests that asserted `calls["bwd_cpp"]` incremented had to become "`calls["bwd"]` increments **and** `bwd_cpp` does not", so a silent regression to the old path fails the suite instead of passing it.
 
+### Binding introspection
+
+Binding migrations can change introspection without changing the public API.
+Python Enum hides instance properties such as `name` and `value` from
+`dir(enum_class)`; the API-index scanner must inspect their descriptors without
+evaluating them (`api_index/test_api_index.py` covers Enum, IntEnum and aliases).
+Signature tests should accept both `object` and `object | None` for an argument
+defaulting to `None`, while retaining argument order and default checks.
+
 ### Confirm you are testing the code you edited
 
 Bind tensor views in the graph's declared axis order. A BSHD allocation and
