@@ -197,18 +197,18 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
             conv_type=conv_type,
             dtype=dtype,
             epilogue=epilogue,
-            accumulate_output=add,
+            accumulate_output=accumulate_output,
             intermediate_dtype=dtype,
-            materialize_intermediate=materialize,
-            min_device_capability=capability,
+            materialize_intermediate=materialize_intermediate,
+            min_device_capability=min_device_capability,
             rtol=5e-3,
             atol=5e-3,
             rng_seed=200 + dtype_index * 6 + topology_index,
         ),
         id=f"conv2d_{conv_fuzzer.conv_type_name(conv_type)}_{topology}_{dtype_name}",
     )
-    for dtype_index, (dtype, dtype_name, capability) in enumerate(((torch.float16, "f16", (7, 0)), (torch.float32, "f32", (8, 0))))
-    for topology_index, (conv_type, epilogue, add, materialize, topology) in enumerate(
+    for dtype_index, (dtype, dtype_name, min_device_capability) in enumerate(((torch.float16, "f16", (7, 0)), (torch.float32, "f32", (8, 0))))
+    for topology_index, (conv_type, epilogue, accumulate_output, materialize_intermediate, topology) in enumerate(
         (
             (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.NONE, False, False, "plain"),
             (conv_fuzzer.ConvType.FPROP, conv_fuzzer.EpilogueType.RELU, False, False, "relu"),
@@ -234,25 +234,25 @@ FIXED_CONV_EXPANSION_CASES_L1 = tuple(
             dtype=dtype,
             accumulate_output=True,
             intermediate_dtype=torch.float32,
-            materialize_intermediate=materialize,
-            min_device_capability=capability,
+            materialize_intermediate=materialize_intermediate,
+            min_device_capability=min_device_capability,
             rtol=rtol,
             atol=atol,
-            rng_seed=212 + shape_index * 6 + dtype_index * 2 + int(materialize),
+            rng_seed=212 + shape_index * 6 + dtype_index * 2 + int(materialize_intermediate),
         ),
-        id=f"conv2d_wgrad_residual_{'exposed' if materialize else 'virtual'}_{dtype_name}" + (f"_{shape_name}" if shape_name else ""),
+        id=f"conv2d_wgrad_residual_{'exposed' if materialize_intermediate else 'virtual'}_{dtype_name}" + (f"_{shape_name}" if shape_name else ""),
     )
     for shape_index, (shape_name, batch, in_channels, out_channels, input_spatial, filter_spatial, padding, stride, dilation) in enumerate(
         WGRAD_RESIDUAL_SHAPES
     )
-    for dtype_index, (dtype, dtype_name, capability, rtol, atol) in enumerate(
+    for dtype_index, (dtype, dtype_name, min_device_capability, rtol, atol) in enumerate(
         (
             (torch.float16, "f16", (7, 0), 5e-3, 5e-3),
             (torch.bfloat16, "bf16", (8, 0), 2.1e-2, 5e-2),
             (torch.float32, "f32", (8, 0), 5e-3, 5e-3),
         )
     )
-    for materialize in (False, True)
+    for materialize_intermediate in (False, True)
 )
 
 
@@ -286,7 +286,12 @@ def _run_fixed_conv_test(conv_case: FixedConvCase, cudnn_handle, num_diffs: int)
         X, W, Y, bias = conv_fuzzer.create_tensors(config, random.Random(config.rng_seed))
         prior_output = _create_prior_output(conv_case, X, W, Y)
         if conv_case.materialize_intermediate:
-            destination = Y if config.conv_type == conv_fuzzer.ConvType.FPROP else X if config.conv_type == conv_fuzzer.ConvType.DGRAD else W
+            if config.conv_type == conv_fuzzer.ConvType.FPROP:
+                destination = Y
+            elif config.conv_type == conv_fuzzer.ConvType.DGRAD:
+                destination = X
+            else:
+                destination = W
             intermediate_output = torch.empty_like(destination, dtype=conv_case.intermediate_dtype)
             conv_fuzzer.fill_with_garbage(intermediate_output)
 
@@ -405,14 +410,19 @@ def test_fixed_reference_intermediate(conv_type, intermediate_dtype, relu):
     W = torch.tensor([1.3]).reshape(1, 1, 1, 1)
     Y = torch.tensor([0.7003, -0.9002, 0.1, -0.2]).reshape(1, 1, 2, 2)
     config.x_shape, config.w_shape = tuple(X.shape), tuple(W.shape)
-    raw = X * W if conv_type == conv_fuzzer.ConvType.FPROP else Y * W if conv_type == conv_fuzzer.ConvType.DGRAD else (X * Y).sum().reshape_as(W)
-    prior = torch.full_like(raw, 0.00013)
-    expected_intermediate = raw.to(intermediate_dtype)
-    expected = expected_intermediate.float() + prior
+    if conv_type == conv_fuzzer.ConvType.FPROP:
+        raw_convolution = X * W
+    elif conv_type == conv_fuzzer.ConvType.DGRAD:
+        raw_convolution = Y * W
+    else:
+        raw_convolution = (X * Y).sum().reshape_as(W)
+    prior_output = torch.full_like(raw_convolution, 0.00013)
+    expected_intermediate = raw_convolution.to(intermediate_dtype)
+    expected = expected_intermediate.float() + prior_output
     if relu:
         expected = expected.relu()
     actual, intermediate = conv_fuzzer.compute_reference(
-        config, X, W, Y, None, prior_output=prior, intermediate_dtype=intermediate_dtype, return_intermediate=True
+        config, X, W, Y, None, prior_output=prior_output, intermediate_dtype=intermediate_dtype, return_intermediate=True
     )
     assert intermediate.dtype == intermediate_dtype
     torch.testing.assert_close(intermediate, expected_intermediate, rtol=0, atol=1e-6)
@@ -440,7 +450,12 @@ def test_fixed_reference_defaults(conv_type):
     W = torch.tensor([2.0]).reshape(1, 1, 1, 1)
     Y = torch.tensor([3.0, 4.0, 5.0, 6.0]).reshape(1, 1, 2, 2)
     config.x_shape, config.w_shape = tuple(X.shape), tuple(W.shape)
-    expected = X * W if conv_type == conv_fuzzer.ConvType.FPROP else Y * W if conv_type == conv_fuzzer.ConvType.DGRAD else (X * Y).sum().reshape_as(W)
+    if conv_type == conv_fuzzer.ConvType.FPROP:
+        expected = X * W
+    elif conv_type == conv_fuzzer.ConvType.DGRAD:
+        expected = Y * W
+    else:
+        expected = (X * Y).sum().reshape_as(W)
     actual = conv_fuzzer.compute_reference(config, X, W, Y, None)
     assert isinstance(actual, torch.Tensor)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

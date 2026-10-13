@@ -628,25 +628,23 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                       *, intermediate_dtype: torch.dtype = torch.float32,
                       return_intermediate: bool = False):
     """
-    Compute reference result using PyTorch.
+    Compute an independent PyTorch reference with FP32 accumulation.
 
     Convention:
-      FPROP: compute Y = conv(X, W) + bias + relu
+      FPROP: compute Y from X and W
       DGRAD: compute dX from dY(=Y) and W
       WGRAD: compute dW from X and dY(=Y)
 
-    If prior_output is provided, it is added before the FPROP epilogue or to the computed dX/dW.
-    intermediate_dtype controls the convolution-to-epilogue edge, not accumulation precision.
-    return_intermediate also returns that edge's reference before any epilogue.
+    intermediate_dtype controls rounding before optional residual addition,
+    FPROP bias, and ReLU (including backward convolution outputs).
+    It does not change accumulation precision.
 
-    Returns the tensor that should match the cuDNN output:
-      FPROP -> Y_ref (to compare with Y)
-      DGRAD -> dX_ref (to compare with X)
-      WGRAD -> dW_ref (to compare with W)
+    Return the final output, or (output, intermediate) when return_intermediate
+    is enabled. The intermediate precedes residual addition and all epilogues.
     """
     compute_dtype = torch.float32
 
-    def finish(result, output_dtype):
+    def finalize_reference(result, output_dtype):
         # A typed graph edge rounds before its consumer, even when virtual.
         intermediate = result.to(intermediate_dtype)
         result = intermediate.to(compute_dtype)
@@ -684,7 +682,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                         groups=config.groups
                     )
 
-                return finish(ref, config.y_dtype)
+                return finalize_reference(ref, config.y_dtype)
             finally:
                 del X_f, W_f
 
@@ -722,7 +720,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                 dummy_Y.backward(dY_f)
                 dX_ref = dummy_X.grad.clone()
 
-                return finish(dX_ref, config.x_dtype)
+                return finalize_reference(dX_ref, config.x_dtype)
             finally:
                 del dY_f, W_f, dummy_X
                 if dummy_Y is not None:
@@ -762,7 +760,7 @@ def compute_reference(config: ConvConfig, X: torch.Tensor, W: torch.Tensor,
                 dummy_Y.backward(dY_f)
                 dW_ref = dummy_W.grad.clone()
 
-                return finish(dW_ref, config.w_dtype)
+                return finalize_reference(dW_ref, config.w_dtype)
             finally:
                 del X_f, dY_f, dummy_W
                 if dummy_Y is not None:
