@@ -5,12 +5,14 @@
 
 import argparse
 import difflib
+from enum import Enum
 import importlib
 import importlib.abc
 import importlib.machinery
 import inspect
 from pathlib import Path
 import sys
+from types import DynamicClassAttribute
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -56,7 +58,13 @@ def scan(package_root, modules_file):
         names.add(api)
         if not inspect.isclass(value) or value in ancestors or value.__module__.split(".")[0] != "cudnn":
             return
-        for member in dir(value):
+        members = set(dir(value))
+        if issubclass(value, Enum):
+            # Enum hides instance properties such as name/value from dir(class).
+            # Inspect descriptors without invoking them or expanding int's API.
+            for base in value.__mro__:
+                members.update(name for name, descriptor in vars(base).items() if isinstance(descriptor, DynamicClassAttribute))
+        for member in sorted(members):
             if public(member):
                 record(f"{api}.{member}", inspect.getattr_static(value, member), ancestors | {value})
 

@@ -125,7 +125,7 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     passes check_support and compile, then fails every block-scaled draw at
     execute time with ``TypeError: unexpected keyword argument 'sf_o'`` -- the
     SM120 CI lane caught exactly that, invisible from an SM100 box."""
-    # SM100 also lowers sdpa_mxfp8 (block-scaled O on the MXFP8-input kernel); SM120 has no MXFP8 path.
+    # SM100 and SM120 also lower sdpa_mxfp8 with a block-scaled O.
     # Prepared per-tensor routes carry auxiliary buffers in their binding map;
     # only retained tensor lowerings have individual sf_o keyword arguments.
     fns = (api_cls.execute,)

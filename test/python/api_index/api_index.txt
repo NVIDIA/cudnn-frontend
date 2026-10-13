@@ -53,6 +53,10 @@ cudnn.NodeType.KDA_SUMMARY
 cudnn.NodeType.KDA_SUMMARY_BWD
 cudnn.NodeType.LAYERNORM
 cudnn.NodeType.LAYERNORM_BWD
+cudnn.NodeType.MAMBA2
+cudnn.NodeType.MAMBA2_BWD
+cudnn.NodeType.MAMBA2_SUMMARY
+cudnn.NodeType.MAMBA2_SUMMARY_BWD
 cudnn.NodeType.MATMUL
 cudnn.NodeType.MATMUL_FP8
 cudnn.NodeType.MOE_GROUPED_MATMUL
@@ -72,6 +76,8 @@ cudnn.NodeType.SDPA_MXFP8
 cudnn.NodeType.SDPA_MXFP8_BWD
 cudnn.NodeType.SLICE
 cudnn.NodeType.TRANSPOSE
+cudnn.NodeType.name
+cudnn.NodeType.value
 cudnn.Tensor
 cudnn.Tensor.alignment_value
 cudnn.Tensor.data_type
@@ -387,6 +393,8 @@ cudnn.gated_attention_block.ExtendEnvelope.writes_lse
 cudnn.gated_attention_block.Fp4Format
 cudnn.gated_attention_block.Fp4Format.MXFP4
 cudnn.gated_attention_block.Fp4Format.NVFP4
+cudnn.gated_attention_block.Fp4Format.name
+cudnn.gated_attention_block.Fp4Format.value
 cudnn.gated_attention_block.GatedAttentionBlockBwd
 cudnn.gated_attention_block.GatedAttentionBlockBwd.check_support
 cudnn.gated_attention_block.GatedAttentionBlockBwd.compile
@@ -453,9 +461,11 @@ cudnn.gated_attention_block.ProjBlock.denominator
 cudnn.gated_attention_block.ProjBlock.from_bytes
 cudnn.gated_attention_block.ProjBlock.imag
 cudnn.gated_attention_block.ProjBlock.is_integer
+cudnn.gated_attention_block.ProjBlock.name
 cudnn.gated_attention_block.ProjBlock.numerator
 cudnn.gated_attention_block.ProjBlock.real
 cudnn.gated_attention_block.ProjBlock.to_bytes
+cudnn.gated_attention_block.ProjBlock.value
 cudnn.gated_attention_block.QKVG_TILE_ALIGN
 cudnn.gated_attention_block.QsaSpec
 cudnn.gated_attention_block.QsaSpec.block_size
@@ -478,6 +488,8 @@ cudnn.gated_attention_block.RecomputePolicy
 cudnn.gated_attention_block.RecomputePolicy.RECOMPUTE_GATE
 cudnn.gated_attention_block.RecomputePolicy.RECOMPUTE_QK_PRE
 cudnn.gated_attention_block.RecomputePolicy.SAVE_ALL
+cudnn.gated_attention_block.RecomputePolicy.name
+cudnn.gated_attention_block.RecomputePolicy.value
 cudnn.gated_attention_block.SERVING_PAGE_SIZES
 cudnn.gated_attention_block.SERVING_POOL_LAYOUTS
 cudnn.gated_attention_block.SavedForBackward
@@ -786,6 +798,9 @@ cudnn.linear_attention.gated_delta_product_summary_bwd
 cudnn.linear_attention.kimi_delta_attention
 cudnn.linear_attention.kimi_delta_attention_summary
 cudnn.linear_attention.kimi_delta_attention_summary_bwd
+cudnn.linear_attention.mamba2
+cudnn.linear_attention.mamba2_summary
+cudnn.linear_attention.mamba2_summary_bwd
 cudnn.linear_attention.ops
 cudnn.linear_attention.ops.gated_delta_net
 cudnn.linear_attention.ops.gated_delta_net_summary
@@ -799,6 +814,9 @@ cudnn.linear_attention.ops.gated_delta_product_summary_bwd
 cudnn.linear_attention.ops.kimi_delta_attention
 cudnn.linear_attention.ops.kimi_delta_attention_summary
 cudnn.linear_attention.ops.kimi_delta_attention_summary_bwd
+cudnn.linear_attention.ops.mamba2
+cudnn.linear_attention.ops.mamba2_summary
+cudnn.linear_attention.ops.mamba2_summary_bwd
 cudnn.moe_ep
 cudnn.moe_ep.BlockScaledTensor
 cudnn.moe_ep.BlockScaledTensor.axis
@@ -888,6 +906,7 @@ cudnn.moe_ep.MoeEpFc1WeightLayout.ljust
 cudnn.moe_ep.MoeEpFc1WeightLayout.lower
 cudnn.moe_ep.MoeEpFc1WeightLayout.lstrip
 cudnn.moe_ep.MoeEpFc1WeightLayout.maketrans
+cudnn.moe_ep.MoeEpFc1WeightLayout.name
 cudnn.moe_ep.MoeEpFc1WeightLayout.partition
 cudnn.moe_ep.MoeEpFc1WeightLayout.removeprefix
 cudnn.moe_ep.MoeEpFc1WeightLayout.removesuffix
@@ -906,6 +925,7 @@ cudnn.moe_ep.MoeEpFc1WeightLayout.swapcase
 cudnn.moe_ep.MoeEpFc1WeightLayout.title
 cudnn.moe_ep.MoeEpFc1WeightLayout.translate
 cudnn.moe_ep.MoeEpFc1WeightLayout.upper
+cudnn.moe_ep.MoeEpFc1WeightLayout.value
 cudnn.moe_ep.MoeEpFc1WeightLayout.zfill
 cudnn.moe_ep.MoeEpForwardWeightStaging
 cudnn.moe_ep.MoeEpForwardWeights
@@ -953,6 +973,7 @@ cudnn.moe_ep.MoeEpNativeWeightLayout.ljust
 cudnn.moe_ep.MoeEpNativeWeightLayout.lower
 cudnn.moe_ep.MoeEpNativeWeightLayout.lstrip
 cudnn.moe_ep.MoeEpNativeWeightLayout.maketrans
+cudnn.moe_ep.MoeEpNativeWeightLayout.name
 cudnn.moe_ep.MoeEpNativeWeightLayout.partition
 cudnn.moe_ep.MoeEpNativeWeightLayout.removeprefix
 cudnn.moe_ep.MoeEpNativeWeightLayout.removesuffix
@@ -971,6 +992,7 @@ cudnn.moe_ep.MoeEpNativeWeightLayout.swapcase
 cudnn.moe_ep.MoeEpNativeWeightLayout.title
 cudnn.moe_ep.MoeEpNativeWeightLayout.translate
 cudnn.moe_ep.MoeEpNativeWeightLayout.upper
+cudnn.moe_ep.MoeEpNativeWeightLayout.value
 cudnn.moe_ep.MoeEpNativeWeightLayout.zfill
 cudnn.moe_ep.MoeEpNativeWeightStorageMode
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.CONTIGUOUS
@@ -1003,6 +1025,7 @@ cudnn.moe_ep.MoeEpNativeWeightStorageMode.ljust
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.lower
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.lstrip
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.maketrans
+cudnn.moe_ep.MoeEpNativeWeightStorageMode.name
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.partition
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.removeprefix
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.removesuffix
@@ -1021,6 +1044,7 @@ cudnn.moe_ep.MoeEpNativeWeightStorageMode.swapcase
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.title
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.translate
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.upper
+cudnn.moe_ep.MoeEpNativeWeightStorageMode.value
 cudnn.moe_ep.MoeEpNativeWeightStorageMode.zfill
 cudnn.moe_ep.MoeEpParallelConfig
 cudnn.moe_ep.MoeEpParallelConfig.drop_on_overflow
@@ -1084,6 +1108,7 @@ cudnn.moe_ep.MoeFormat.ljust
 cudnn.moe_ep.MoeFormat.lower
 cudnn.moe_ep.MoeFormat.lstrip
 cudnn.moe_ep.MoeFormat.maketrans
+cudnn.moe_ep.MoeFormat.name
 cudnn.moe_ep.MoeFormat.partition
 cudnn.moe_ep.MoeFormat.removeprefix
 cudnn.moe_ep.MoeFormat.removesuffix
@@ -1102,6 +1127,7 @@ cudnn.moe_ep.MoeFormat.swapcase
 cudnn.moe_ep.MoeFormat.title
 cudnn.moe_ep.MoeFormat.translate
 cudnn.moe_ep.MoeFormat.upper
+cudnn.moe_ep.MoeFormat.value
 cudnn.moe_ep.MoeFormat.zfill
 cudnn.moe_ep.MoeTensor
 cudnn.moe_ep.pack_backward_weights
@@ -1243,6 +1269,10 @@ cudnn.pygraph.log
 cudnn.pygraph.logical_and
 cudnn.pygraph.logical_not
 cudnn.pygraph.logical_or
+cudnn.pygraph.mamba2
+cudnn.pygraph.mamba2_bwd
+cudnn.pygraph.mamba2_summary
+cudnn.pygraph.mamba2_summary_bwd
 cudnn.pygraph.matmul
 cudnn.pygraph.max
 cudnn.pygraph.min

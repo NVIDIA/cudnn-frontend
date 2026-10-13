@@ -85,7 +85,7 @@ from cudnn.frost.buffers import probe
 from cudnn.frost.device import multiprocessor_count
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
-from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.barrier import MBarrier, Producer, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, opaque_f32_zero, sigmoid, softplus2
@@ -762,7 +762,6 @@ def frost_gdn_tinv_prologue(
     the caller's workspace (a CUDA-graph replay re-emits from the captured maps), then build the row table."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     widx = cutlass.Int32(tidx) // cutlass.Int32(32)
     lane_idx = cutlass.Int32(tidx) % cutlass.Int32(32)
@@ -1053,8 +1052,6 @@ def frost_gdn_tinv(
     nvvm.barrier_cta_sync()
     if warp_idx == 0:
         nvvm.tcgen05_dealloc(nvvm.make_tmem_ptr(tmem_col, cutlass.Int8), cutlass.Int32(cfg.tmem_columns), group=nvvm.CTAGroup.CTA_1)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @dataclass

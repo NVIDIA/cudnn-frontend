@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.26)
 
 Include(FetchContent)
 
@@ -39,33 +39,37 @@ else()
 endif()
 
 # Find python
-find_package(Python 3.8 COMPONENTS Interpreter Development.Module REQUIRED)
+option(CUDNN_FRONTEND_PYTHON_STABLE_ABI "Require the stable ABI for Python bindings." OFF)
+if(CUDNN_FRONTEND_PYTHON_STABLE_ABI)
+    find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
+else()
+    find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
+endif()
+set(binding_options)
+if(CUDNN_FRONTEND_PYTHON_STABLE_ABI)
+    set(binding_options STABLE_ABI)
+endif()
 
 # Find cudnn
 include(${PROJECT_SOURCE_DIR}/cmake/cuDNN.cmake)
 
 option(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE "Whether cmake build system should fetch pybinds." ON)
-set(PYBIND11_FINDPYTHON ON)
-
 
 if(CUDNN_FRONTEND_FETCH_PYBINDS_IN_CMAKE)
     FetchContent_Declare(
-        pybind11
-        GIT_REPOSITORY https://github.com/pybind/pybind11
-        GIT_TAG        v2.13.6
+        nanobind
+        GIT_REPOSITORY https://github.com/wjakob/nanobind.git
+        GIT_TAG        v3.0.1
     )
-    FetchContent_MakeAvailable(pybind11)
+    FetchContent_MakeAvailable(nanobind)
 else()
-    find_package(pybind11 CONFIG REQUIRED)
+    find_package(nanobind CONFIG REQUIRED)
 endif()
 
-
-# Add a library using FindPython's tooling (pybind11 also provides a helper like
-# this)
-python_add_library(
+nanobind_add_module(
     _compiled_module
-    
-    MODULE
+    ${binding_options}
+
     pycudnn.cpp
     gnn.cpp
     properties.cpp
@@ -81,18 +85,28 @@ python_add_library(
     pygraph/sdpa_sm80_binding.cpp
     pygraph/sdpa_sm80_thd_binding.cpp
 
-    WITH_SOABI
 )
-target_link_libraries(_compiled_module PRIVATE pybind11::headers)
+
+get_target_property(binding_libraries _compiled_module LINK_LIBRARIES)
+set(binding_runtime nanobind-static)
+if("nanobind-static-abi3" IN_LIST binding_libraries)
+    set(binding_runtime nanobind-static-abi3)
+elseif(CUDNN_FRONTEND_PYTHON_STABLE_ABI)
+    # nanobind may silently fall back, but ON requires an abi3 extension.
+    message(FATAL_ERROR "Stable ABI was requested, but nanobind did not enable it for this Python interpreter.")
+endif()
 
 target_compile_features(_compiled_module PRIVATE cxx_std_20)
 
-# pybind11's type registry is typeid-based, so this module requires RTTI even when
+# The bindings and nanobind runtime require RTTI even when
 # CUDNN_FRONTEND_ENABLE_RTTI is off for the rest of the build.
 if(MSVC)
     target_compile_options(_compiled_module PRIVATE /GR)
+    # Suppress shadowing warnings only for the nanobind runtime.
+    target_compile_options(${binding_runtime} PRIVATE /GR /wd4457 /wd4459)
 else()
     target_compile_options(_compiled_module PRIVATE -frtti)
+    target_compile_options(${binding_runtime} PRIVATE -frtti)
 endif()
 
 target_include_directories(
@@ -122,6 +136,8 @@ if(MSVC)
     target_compile_options(_compiled_module PRIVATE /wd4244)
     target_compile_options(_compiled_module PRIVATE /wd4458)
     target_compile_options(_compiled_module PRIVATE /wd4505)
+    # nanobind's cast wrappers may exceed MSVC's forceinline budget.
+    target_compile_options(_compiled_module PRIVATE /wd4714)
     target_compile_options(_compiled_module PRIVATE /bigobj)
 else()
     add_compile_options(-fvisibility=hidden)

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
 #include <cstdint>
 #include <span>
@@ -27,22 +27,22 @@ struct NativeOperandView {
 };
 
 std::vector<NativeOperandView>
-read_native_operand_views(pybind11::handle pack, const std::vector<int64_t> &indices);
+read_native_operand_views(nanobind::handle pack, const std::vector<int64_t> &indices);
 
 void
-init_sdpa_thd_binding(pybind11::module_ &);
+init_sdpa_thd_binding(nanobind::module_ &);
 
 void
-init_sdpa_dense_binding(pybind11::module_ &);
+init_sdpa_dense_binding(nanobind::module_ &);
 
 void
-init_sdpa_bwd_binding(pybind11::module_ &);
+init_sdpa_bwd_binding(nanobind::module_ &);
 
 void
-init_sdpa_sm80_binding(pybind11::module_ &);
+init_sdpa_sm80_binding(nanobind::module_ &);
 
 void
-init_sdpa_sm80_thd_binding(pybind11::module_ &);
+init_sdpa_sm80_thd_binding(nanobind::module_ &);
 
 // Call-local packs retain immutable geometry independently of the graph's
 // bounded cache. No runtime tensor addresses or Python owners live here.
@@ -59,23 +59,23 @@ struct NativeExecutionBindings {
 };
 
 NativeExecutionBindings
-read_native_execution_bindings(pybind11::handle pack);
+read_native_execution_bindings(nanobind::handle pack);
 
 // The same observation/validation used by Python ordered normalization. A
 // nonempty unread list or a None workspace extent asks Python to finish this
 // exact result before launch; errors propagate instead of choosing a new path.
-pybind11::tuple
-read_ordered_binding(pybind11::handle schema,
-                     pybind11::handle buffers,
-                     pybind11::handle tensor_uids,
-                     const pybind11::dict &auto_bindings,
-                     pybind11::handle workspace,
-                     pybind11::handle override_uids,
-                     pybind11::handle override_shapes,
-                     pybind11::handle override_strides);
+nanobind::tuple
+read_ordered_binding(nanobind::handle schema,
+                     nanobind::handle buffers,
+                     nanobind::handle tensor_uids,
+                     const nanobind::dict &auto_bindings,
+                     nanobind::handle workspace,
+                     nanobind::handle override_uids,
+                     nanobind::handle override_shapes,
+                     nanobind::handle override_strides);
 
 void
-init_variant_pack(pybind11::module_ &);
+init_variant_pack(nanobind::module_ &);
 
 }  // namespace python_bindings
 }  // namespace cudnn_frontend
