@@ -54,6 +54,7 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPI
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as _decode_d256_q_tile_sm107
 from cudnn.sdpa.fwd.config_sm100 import (
+    d256_mxfp8_pair_leg,
     supports_thd_split,
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
@@ -519,7 +520,9 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         # need a 32-byte swizzle the FP8 kernels' P.V descriptors do not model.
         return (1,) if fp8 else (1, 2)
     if fp8 and flavor == (256, 256):
-        return (1,)
+        # cc 10.7 MXFP8 admits both widths: the dense unsplit legs run the 2-CTA pair (config_sm100.d256_mxfp8_pair_leg,
+        # the width template_params derives); per-tensor FP8 d256 keeps cga1.
+        return (1, 2) if (device_cc == (10, 7) and not pertensor) else (1,)
     if device_cc != (10, 7) and fp8 and pertensor and flavor == (128, 128):
         # Per-tensor FP8 d128 builds at both widths: cga1 is one 256-row CTA
         # (no collective MMA, STAGES_KV=2, Q/O aliased), cga2 the 2-CTA pair.
@@ -1498,6 +1501,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
     def check_support(self) -> bool:
+        """Validate the call against the kernel contract on metadata alone (dtypes, shapes, strides, masks, knobs, the CGA
+        width) and record the outcome in ``_is_supported``; raises the typed decline for an unsupported combination."""
         self._logger.debug("Entering check_support")
 
         if self.pv_bf16:
@@ -1954,6 +1959,16 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         self._value_error_if(
             self.cga is not None and self.cga not in supported_cgas,
             f"SM100 DSL SDPA only supports cga in {supported_cgas}",
+        )
+        self._not_implemented_error_if(
+            self.cga == 2
+            and self._device_cc == (10, 7)
+            and self._fp8
+            and not self._pertensor
+            and self.flavor == (256, 256)
+            and not self.packed_thd_split
+            and not d256_mxfp8_pair_leg(device_cc=self._device_cc, pertensor=False, thd=self.thd, paged=self.paged, split_kv=self.split_kv),
+            "the d256 MXFP8 2-CTA pair serves dense unsplit queries on cc 10.7; THD, split-KV and paged graphs run cga1 (leave cga unset or pass cga=1)",
         )
         self._value_error_if(
             self.flavor == (192, 128) and self.split_kv > 1 and self.cga == 1 and not self.packed_thd_split,
@@ -2649,6 +2664,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 pertensor=self._pertensor,
                 s_q=self.s_q_max,
                 s_kv=self.s_k_max,
+                device_cc=self._device_cc,
+                paged=self.paged,
             )
             params = replace(
                 params,

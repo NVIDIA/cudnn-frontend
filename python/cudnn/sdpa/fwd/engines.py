@@ -37,6 +37,7 @@ from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURA
 from cudnn.frost.buffers import CUTEDSL_MIN_VERSION, cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
 from cudnn.sdpa import graph_analyzer as ga
 from cudnn.sdpa.fwd.config_sm100 import (
+    d256_mxfp8_pair_leg,
     SM100_THD_PACK_GQA_SHAPES,
     decode_d256_q_tile,
     pack_gqa_supported,
@@ -797,6 +798,11 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         # on cc 10.7, the pre-folded scale lives in the Rubin sibling only, and quantized facts never ride this row.
         # Narrow the DOMAIN so neither a proposal nor a pin reaches the tile.
         return frozenset({2})
+    if capabilities.sm_lo == 107 and capabilities.is_mxfp8 and selected == (256, 256):
+        # d256 MXFP8 on cc 10.7: the dense unsplit legs run the 2-CTA pair, everything else one CTA
+        # (config_sm100.d256_mxfp8_pair_leg; heuristics.select_d256_auto_knobs picks the same width).
+        pair = d256_mxfp8_pair_leg(device_cc=facts.device_cc, pertensor=False, thd=facts.thd, paged=facts.has_paged_kv, split_kv=split_kv or 1)
+        return frozenset({1, 2}) if pair else frozenset({1})
     domain = capabilities.cgas
     if selected is not None:
         for shape, shape_domain in capabilities.cgas_by_d_shape:
@@ -2169,9 +2175,10 @@ def _sm107_mxfp8_spec() -> EngineSpec:
             tile_ms=frozenset({128}),
             tile_ns=frozenset({128}),
             cgas=frozenset({2}),
-            # d256 MXFP8 runs cga1 (FROST rule: d256 quantized requires cta_mma=1;
-            # heuristics.py:492 enforces it, so the row cannot declare otherwise).
-            cgas_by_d_shape=((((256, 256), frozenset({1})),)),
+            # d256 MXFP8 serves both widths: the dense unsplit legs run the 2-CTA pair on cc 10.7
+            # (config_sm100.d256_mxfp8_pair_leg: -8..-13 % dense / -6..-7 % causal vs one CTA, O bitwise identical);
+            # effective_cgas narrows THD, split-KV and paged graphs to cga1.
+            cgas_by_d_shape=((((256, 256), frozenset({1, 2})),)),
             pack_gqas=frozenset({False}),
             # Fused epilogue gate: the d256 MXFP8 body carries the seams; ONE
             # constant with the f16 / FP8 rows and the adapter twin (rule 8b').
