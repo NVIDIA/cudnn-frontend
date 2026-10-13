@@ -1177,6 +1177,11 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
         _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec()))
     if cc == (10, 7):
         assert sparse.extend.reason == str(e.value)
+    # ... and the Rubin reading on ANY host (device_cc=): the EXTEND half says the sparse declaration's own row, the DECODE half the table's
+    # `sparse` row -- the pin the first node run exposed (the envelope read the `diagonal` row for a QsaSpec geometry on the THD-only form)
+    rubin = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7))
+    assert rubin.cutedsl_ok and rubin.forms == ()
+    assert rubin.extend.reason == str(e.value) and rubin.decode.reason == env.decode.declines["sparse"]
 
 
 def test_extend_argument_rows_are_typed():

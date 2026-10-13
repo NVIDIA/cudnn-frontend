@@ -4765,9 +4765,9 @@ def _is_paged(d: _ServingDecl) -> bool:
 
 
 # (name, exception class, predicate over the declaration facts, the message) -- the typed declines of the EXTEND form and of
-# the bounded token form, in the order a caller hears them.  A QsaSpec geometry is not a row: the sparse declaration's own rows run
-# first and refuse thd=True (:data:`_QSA_THD_DECLINE`), which the EXTEND form requires, so the envelope reads that decline for
-# it.  The constructor raises the FIRST row whose predicate holds
+# the bounded token form, in the order a caller hears them.  A QsaSpec geometry under the THD-only EXTEND form is not a row: the
+# sparse declaration's own rows run first and refuse thd=True (:data:`_QSA_THD_DECLINE`), so the envelope reads that decline for it;
+# the dense DECODE form reaches the table's ``sparse`` row.  The constructor raises the FIRST row whose predicate holds
 # (``_check_serving_declaration``); ``serving_envelope`` publishes every row's name and message (``ExtendEnvelope.declines``)
 # and evaluates the geometry rows for its ``served`` verdict -- one table, so no decline is reachable at declaration that the
 # envelope did not predict.  Rows the write-through attribute already declines for every ``kv_source`` (``quant``,
@@ -4864,7 +4864,8 @@ def _first_serving_decline(decl: _ServingDecl) -> Optional[Tuple[str, type, str]
 
 _QSA_THD_DECLINE = "QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up"
 """The sparse declaration's own THD decline (``_check_qsa_declaration``), the reason the envelope gives a QsaSpec geometry for the EXTEND
-form: the form is THD-only, so no row of :data:`_EXTEND_DECLINES` is ever reached on a sparse geometry."""
+form: the form is THD-only, so no row of :data:`_EXTEND_DECLINES` is reached on a sparse geometry there (the dense DECODE form reaches
+the table's ``sparse`` row)."""
 
 _DECODE_REQUIRES = (
     "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_ROWS (the claimed envelope S_q <= DECODE_MAX_S_Q), the batch uniform",
@@ -6006,6 +6007,9 @@ class GatedAttentionBlockFwd(APIBase):
         def probe(thd: bool, s_q: int):
             if common is not None:
                 return common
+            if thd and geometry.qsa is not None:
+                # the THD-only form meets the sparse declaration's own row before any row of the table (_check_qsa_declaration runs first)
+                return _QSA_THD_DECLINE
             hit = _first_serving_decline(
                 _ServingDecl(
                     kv_source=KV_SOURCE_PAGED,
