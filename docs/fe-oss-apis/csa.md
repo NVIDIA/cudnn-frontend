@@ -152,14 +152,14 @@ output and therefore needs no fill. JIT and allocations are outside the measurem
 
 | configuration | workspace | atomic kernel | deterministic kernel | operation slowdown (both construction orders) |
 |---|---:|---:|---:|---:|
-| r4, c2, d128, 1x8192 | 1 MiB | 28.0–29.3 us | 35.8–36.7 us | 1.09–1.15x |
-| r4, c2, d128, 3x8192 | 3 MiB | 38.3–38.9 us | 47.3–48.3 us | 1.10–1.13x |
-| r4, c2, d512, 1x8192 | 4 MiB | 36.8–37.4 us | 45.9–46.3 us | 1.10–1.15x |
-| r4, c2, d512, 3x8192 | 12 MiB | 86.1–86.6 us | 94.0–94.9 us | 1.09–1.10x |
-| r128, c1, d128, 1x8192 | 4 MiB | 25.1–26.9 us | 33.1–35.8 us | 1.11–1.14x |
-| r128, c2, d128, 3x8192 | 8 MiB | 42.6–44.9 us | 49.7–51.7 us | 1.03–1.07x |
-| r128, c1, d512, 1x8192 | 16 MiB | 35.7–37.3 us | 40.7–41.9 us | 0.97–1.03x |
-| r128, c2, d512, 3x8192 | 16 MiB | 107.5–108.7 us | 112.8–113.2 us | 1.00–1.02x |
+| r4, c2, d128, 1x8192 | 1 MiB | 28.1–30.8 us | 36.5–37.4 us | 1.10–1.15x |
+| r4, c2, d128, 3x8192 | 3 MiB | 36.4 us | 46.3–46.6 us | 1.16–1.17x |
+| r4, c2, d512, 1x8192 | 4 MiB | 36.1–40.0 us | 46.3–50.9 us | 1.10–1.16x |
+| r4, c2, d512, 3x8192 | 12 MiB | 87.0 us | 94.0–94.4 us | 1.09x |
+| r128, c1, d128, 1x8192 | 4 MiB | 24.4–25.0 us | 32.1–32.9 us | 1.14–1.15x |
+| r128, c2, d128, 3x8192 | 8 MiB | 45.9–46.7 us | 52.3–52.7 us | 1.17x |
+| r128, c1, d512, 1x8192 | 16 MiB | 35.4–35.5 us | 40.1–40.2 us | 1.03–1.04x |
+| r128, c2, d512, 3x8192 | 16 MiB | 108.1–108.4 us | 112.6–112.8 us | 1.01–1.02x |
 
 Reproduce with `benchmark/csa/bench_csa_dape_deterministic.py`; use
 `--construct-order deterministic-first` for the reversed build and `--atomic-only`

@@ -20,7 +20,6 @@ import json
 import statistics
 
 import torch
-
 from cudnn.csa import CSACompressorBackward
 
 SHAPES = (

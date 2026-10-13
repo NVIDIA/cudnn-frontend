@@ -75,22 +75,22 @@ CUDA graphs:
 """
 
 from __future__ import annotations
-from cudnn._cutlass_compat import SmemAllocator
 
 import ctypes
 import os
 import threading
 
-import torch
 import cuda.bindings.driver as cuda_driver
-
 import cutlass
 import cutlass.base_dsl.typing as _cutlass_typing
 import cutlass.cute as cute
 import cutlass.cute.arch as cute_arch
 import cutlass.cute.math as cute_math
+import torch
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.runtime import make_ptr
+
+from cudnn._cutlass_compat import SmemAllocator
 
 _ENV_FAST_LAUNCH = "CUDNNFE_CSA_COMPRESSOR_FAST_LAUNCH"
 

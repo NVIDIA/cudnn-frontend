@@ -84,24 +84,24 @@ This file intentionally does not touch the ratio=4 path; launch machinery mirror
 """
 
 from __future__ import annotations
-from cudnn._cutlass_compat import SmemAllocator
 
 import threading
 
-import torch
 import cuda.bindings.driver as cuda_driver
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.arch as cute_arch
 import cutlass.cute.math as cute_math
+import torch
+
+from cudnn._cutlass_compat import SmemAllocator
 
 from .compressor_sm100 import (
     _EXT,
-    _FastCache,
     _NEG_INF,
     _bf16_ptr,
     _f32_ptr,
+    _FastCache,
     _ffma_rn,
     _fmul_rn,
     _i32_ptr,

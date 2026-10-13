@@ -61,11 +61,10 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
+import cuda.bindings.driver as cuda
 import torch
 
 from cudnn._torch_stream import as_torch_stream, stream_context
-import cuda.bindings.driver as cuda
-
 from cudnn.api_base import APIBase, TupleDict
 
 from .compressor_sm100 import (
