@@ -75,8 +75,9 @@ MIN_N_RES = k3.MIN_N_RES_MN_MAJOR
 #: K1's tile order: the two projection passes of one row block adjacent in the schedule, so the second pass's ``x`` read is an L2 hit -- the
 #: "both passes share one x load" of the byte model (one ``x`` read per call).  With the pass-major order the second pass re-reads ``x`` from
 #: HBM once ``x`` outgrows the L2 (measured: K1 moved 1.33x its byte model at N = 1024, 2.0x on the reads).  Bitwise the same planes.  The
-#: heuristics module owns the value per geometry; this name is the API's pin of the c = 128 pick below N = 512 (the table picks ``"major"``
-#: at c = 256, where the K = 256 rendering is register-bound, and at c = 128 from N >= 512 together with the 1-deep ring).
+#: heuristics module owns the value per geometry; this name is the API's pin of the c = 128 pick below N = 256 (the table picks ``"major"``
+#: at c = 256, where the K = 256 rendering is register-bound, and at c = 128 from N >= 256 -- from 512 together with the 1-deep ring, from
+#: 256 with the LayerNorm-once work item, which needs the pass inside the row block's item).
 K1_PASS_ORDER = th.DEFAULT_K1_PASS_ORDER
 _RUBIN = (10, 7)
 _WS_ALIGN = 256

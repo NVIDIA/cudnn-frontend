@@ -82,7 +82,8 @@ CLC_STAGES_DOMAIN: Tuple[int, ...] = (1, 2, 4)
 K_BLOCK_DOMAIN: Tuple[int, ...] = tuple(1 << i for i in range(MIN_K_BLOCK_MN_MAJOR.bit_length() - 1, PAIR_TILE_ROWS.bit_length()))
 #: The batch sizes the table was measured at; :func:`batch_bucket` maps any B onto the nearest one below (B >= 4 -> 4, else 1).
 BATCH_BUCKETS: Tuple[int, ...] = (1, 4)
-#: The c = 128 geometry's knob values below N = 512 (the API's K1 tile-order pin reads the first); :func:`recommend` is the table that decides.
+#: The c = 128 geometry's knob values below N = 256 (the API's K1 tile-order pin reads the first; from N = 256 the c = 128 picks take the pass-major
+#: order with the LayerNorm-once item); :func:`recommend` is the table that decides.
 DEFAULT_K1_PASS_ORDER = "interleaved"
 DEFAULT_K3_PROLOGUE = "mn_major"
 DEFAULT_CLC_STAGES = 2
@@ -214,8 +215,12 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 #   c = 128: K1 only (the output stage's one-tile item is the substrate's typed decline there), on the buckets whose pick is the pass-MAJOR order:
 #            +43 / +44 / +53 / +53 % (bias off) and +45 / +45 / +49 / +53 % (bias on) at N 512 x 1 / 256 x 4 / 1024 x 4 / 768 x 1 (65 -> 45 us at 512 x 1
 #            off; 1000 x 3, CLEAN windows) -> ln_once="block" on the 512 / 768 / 1024 floors and on the (256, B >= 4) refinement (whose order is major);
-#            the buckets picking the INTERLEAVED order (256 x 1, 384) cannot take the lever as is (the pass must live inside the item: a typed decline) --
-#            the candidate there is ln_once="block" + the major order, measured against the interleaved pick before it enters this table.
+#            the buckets picking the INTERLEAVED order (256 x 1, 384) cannot take the lever as is (the pass must live inside the item: a typed decline);
+#            their candidate ln_once="block" + the major order, measured against the interleaved pick WITH the major order alone as the control: K1
+#            standalone +16.7 / +15.0 % at 256 x 1, +30.4 / +32.4 % at 384 x 1, +44.5 / +41.9 % at 384 x 4 (bias off / on) where the major order alone
+#            reads -0.3..-2.6 % (the lever carries it); the whole call +8.1 / +8.1 % at 256 x 128 x 1 and +12.5 / +13.4 % at 384 x 128 x 1 -> the 256
+#            and 384 floors take ("major", ln_once="block"); the 129 and 0 floors (N < 256: 0.6-1.2 tile-waves at B 1, the coarser item most exposed)
+#            stay as shipped until measured.
 def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str, ln_once: str = "") -> TriMulKnobs:
     """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`; the LayerNorm-once item ``ln_once`` is OFF
     unless a bucket's A/B/A set it)."""
@@ -245,8 +250,8 @@ _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
         (1024, _pick(k2.MULTICAST_A4_TILE_CONFIG, "major", "transpose", 1, "smem_rolled", "packed", ln_once="block")),
         (768, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold", ln_once="block")),
         (512, _pick(k2.MULTICAST_A2_TILE_CONFIG, "major", "transpose", 1, "registers", "packed_biasfold", ln_once="block")),
-        (384, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 1, "smem_rolled", "packed")),
-        (256, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 2, "smem_rolled", "packed")),
+        (384, _pick(k2.SMALL_N_TILE_CONFIG, "major", "transpose", 1, "smem_rolled", "packed", ln_once="block")),
+        (256, _pick(k2.DESIGN_TILE_CONFIG, "major", "transpose", 2, "smem_rolled", "packed", ln_once="block")),
         (129, _pick(k2.DESIGN_TILE_CONFIG, "interleaved", "transpose", 1, "registers", "packed")),
         (0, _pick(k2.SMALL_N_TILE_CONFIG, "interleaved", "transpose", 2, "registers", "packed")),
     ),
@@ -268,13 +273,11 @@ _PICKS: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
 # across rows only for different axes (pinned by the tests).  Margins: +X % = t_bucket_pick / t_refined - 1 (the pass that found it; as the base).
 #   c = 128, N <= 128, B = 1, incoming:       ring depth 1   +1.87 % (as base +1.75 %; the outgoing twin -0.34 %, B = 4 -0.5..-0.6 %)
 #   c = 128, 256 <= N < 384, B >= 4:          ring depth 1   +1.95 / +1.87 % (as base +1.97 / +2.01 %; B = 1 loses 1.5 %), and ON TOP of it
-#                                             pass-MAJOR K1  +1.26 / +1.33 % (the ring-depth interaction of the N >= 512 buckets: at depth 1 the
-#                                             adjacent-pass order loses what the shared x read gains; at depth 2 the two orders tied), and the
-#                                             REGISTER LN form: the rolled re-read form loses 1.8 / 1.7 % against the packed-only pick on
+#                                             the REGISTER LN form: the rolled re-read form loses 1.8 / 1.7 % against the packed-only pick on
 #                                             this cell (standalone K1, two passes; the same work as N = 512 B = 1, where it loses 1.8 / 1.4 %)
-#                                             while B = 1 gains 3.7 / 3.7 %
-#                                             and the LayerNorm-ONCE item (ln_once="block": +43.8 / +45.2 % standalone K1, bias off / on; the bucket's
-#                                             B = 1 pick is the interleaved order, which the lever declines)
+#                                             while B = 1 gains 3.7 / 3.7 %.  (The pass-MAJOR order this cell had as a refinement, +1.26 / +1.33 %
+#                                             over the bucket's interleaved pick, is the BUCKET's pick since the LayerNorm-once item landed:
+#                                             +43.8 / +45.2 % standalone K1 here, bias off / on, with the major order the item requires.)
 #   c = 128, 384 <= N < 512, B = 1:           ring depth 4   +1.02 / +1.04 % (as base +0.93 / +1.04 %; B = 4 loses 1.9 %)
 #   c = 128, 512 <= N < 768, B >= 4:          ROLLED LN form +0.7 / +0.7 % over the packed-only pick (standalone K1, two passes; B = 1 loses
 #                                             1.8 / 1.4 % -- the sign follows the amount of work: 512 x 4 computes the rows of 1024 x 1, where
@@ -291,9 +294,7 @@ _REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]
     128: (
         (0, 1, "incoming", TriMulKnobs(clc_stages=1)),
         (256, 4, None, TriMulKnobs(clc_stages=1)),
-        (256, 4, None, TriMulKnobs(k1_pass_order="major")),
         (256, 4, None, TriMulKnobs(ln_pass_form="registers")),
-        (256, 4, None, TriMulKnobs(ln_once="block")),
         (384, 1, None, TriMulKnobs(clc_stages=4)),
         (512, 4, None, TriMulKnobs(ln_pass_form="smem_rolled")),
         (256, 4, None, TriMulKnobs(epi_math="packed_biasfold")),

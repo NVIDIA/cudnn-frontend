@@ -705,8 +705,9 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
             for d in ("outgoing", "incoming"):
                 assert th.recommend(n, 256, b, d).ln_once == "block", (n, b, d)
     assert th.resolve(512, 256, 1, "outgoing", knobs=th.TriMulKnobs(ln_once="")).ln_once == ""  # a caller's "" over the pick = today's item
-    # c = 128: the pass-MAJOR buckets (N >= 512; 256 x B >= 4 by its refinement) run the block item (+43..+53 % standalone K1); the interleaved
-    # buckets (256 x 1, 384) keep today's item until their major-order candidate is measured against the interleaved pick
+    # c = 128: every bucket from N = 256 runs the block item with the pass-major order (+43..+53 % standalone K1 on the major buckets; +15..+45 % on
+    # the formerly interleaved 256 x 1 / 384 buckets against their interleaved pick, the major order alone -0.3..-2.6 %); the N < 256 buckets keep
+    # today's item and order until measured
     for n, b, want in (
         (512, 1, "block"),
         (768, 1, "block"),
@@ -714,9 +715,10 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         (2048, 1, "block"),
         (256, 4, "block"),
         (512, 4, "block"),
-        (256, 1, ""),
-        (384, 1, ""),
-        (384, 4, ""),
+        (256, 1, "block"),
+        (384, 1, "block"),
+        (384, 4, "block"),
+        (200, 1, ""),
         (128, 1, ""),
         (33, 1, ""),
     ):
@@ -745,7 +747,7 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
                 assert (floor, bb, d, axes[0]) not in seen, "two refinements override one axis of one cell"
                 seen.add((floor, bb, d, axes[0]))
     # the measured picks the table carries (the bucket rule and the per-cell refinements)
-    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.recommend(256, 128, 1).k1_pass_order
+    assert tapi.K1_PASS_ORDER == th.DEFAULT_K1_PASS_ORDER == th.recommend(200, 128, 1).k1_pass_order == th.recommend(128, 128, 1).k1_pass_order  # below N = 256
     assert th.recommend(512, 256, 1).k1_pass_order == "major"  # the measured per-width sign of the projection stage's tile order
     assert th.recommend(512, 128, 1).k1_pass_order == "major" and th.recommend(512, 128, 1).clc_stages == 1  # the ring-depth interaction (verification pass)
     assert th.recommend(128, 128, 1).k3_prologue == "transpose" and th.recommend(128, 256, 1).k3_prologue == "mn_major"
@@ -757,8 +759,10 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     )  # the pair tile stays at B = 1
     assert th.recommend(256, 128, 4).clc_stages == 1 and th.recommend(256, 128, 1, "incoming").clc_stages == 2  # the batch-keyed ring depth
     assert (
-        th.recommend(256, 128, 4).k1_pass_order == "major" and th.recommend(256, 128, 1).k1_pass_order == "interleaved"
-    )  # the K1 order follows the ring depth
+        th.recommend(256, 128, 4).k1_pass_order == "major"
+        and th.recommend(256, 128, 1).k1_pass_order == "major"
+        and th.recommend(200, 128, 1).k1_pass_order == "interleaved"
+    )  # the K1 order: major from N = 256 (the LayerNorm-once item needs it; measured against the interleaved pick), interleaved below
     assert th.recommend(384, 128, 1).clc_stages == 4 and th.recommend(384, 128, 4).clc_stages == 1
     assert th.recommend(128, 256, 4).clc_stages == 1 and th.recommend(128, 256, 1).clc_stages == 2
     # the row tile of the two LayerNorm-prologue stages: the substrate's rule unless a pick sets it (every member of the domain is bitwise the same)
@@ -910,7 +914,9 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     for epm in ("packed_hoist", "packed_biasfold"):
         assert th.register_split_hint("k1", 128, False, "registers", epm, "major") == 1, epm
         assert th.register_split_hint("k1", 128, False, "smem_rolled", epm, "major") == 1, epm
-        assert th.register_split_hint("k1", 128, True, "registers", epm, "major") == (1 if epm == "packed_biasfold" else 0), epm  # the bias-ON row names the fold form exactly
+        assert th.register_split_hint("k1", 128, True, "registers", epm, "major") == (
+            1 if epm == "packed_biasfold" else 0
+        ), epm  # the bias-ON row names the fold form exactly
         assert th.register_split_hint("k1", 128, False, "smem_rolled", epm, "interleaved") == 0, epm
     assert th.register_split_hint("k1", 128, False, "registers", "scalar", "major") == 0
     assert th.register_split_hint("k1", 128, False, "smem_rolled", "packed", "interleaved") == 0
@@ -928,7 +934,14 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
         0,
         0,
     )  # rolled K1, packed K3
-    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256), "outgoing", c_hidden=128, has_in_bias=False)._register_split_hints() == (0, 0)  # interleaved K1
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=200), "outgoing", c_hidden=128, has_in_bias=False)._register_split_hints() == (
+        0,
+        0,
+    )  # interleaved K1 (N < 256)
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256), "outgoing", c_hidden=128, has_in_bias=False)._register_split_hints() == (
+        1,
+        0,
+    )  # major from N = 256 (the LayerNorm-once item): the rolled form's row
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=512, cz=256), "outgoing", c_hidden=256, has_in_bias=False, has_out_bias=False
     )._register_split_hints() == (0, 0)
