@@ -974,17 +974,20 @@ def sm107_q_in_tmem_pick(
     (the keyword facts; a caller without them -- the sweep's bare call -- gets 0, the SMEM-Q form of every committed record):
 
     * **1 on the PLAIN body (no bias, no kv_mask) at TILE_N 128**, the one-batch-entry item: +3.1 / +4.3 / +3.3 / +3.5 % at d32 S 384 / 512 / 640 / 768
-      with S flattened rows (43.30 -> 42.02, 72.51 -> 69.50, 140.67 -> 136.22, 205.47 -> 198.54 us), +4.5 / +6.8 % at S 256 / 384 with 4 S rows; d64 +2.8 / +2.6 /
-      +3.1 / +2.8 % and +6.7 / +4.3 % on the same cells -- 14 of 14 cells a win.
+      with S flattened rows (43.30 -> 42.02, 72.51 -> 69.50, 140.67 -> 136.22, 205.47 -> 198.54 us), +6.8 / +4.5 % at S 256 / 384 with 4 S rows (48.00 ->
+      44.96, 144.70 -> 138.53 us); d64 +2.8 / +2.6 / +3.1 / +2.8 % and +6.7 / +4.3 % on the same cells -- 14 of 14 cells a win.
     * **1 on the BIAS body without a kv_mask at TILE_N 64** (the pair item's resident block or streamed ring: the per-row ``kv_lengths`` leg of the
       training crops, and the dense cells the width rule puts on the 64-wide tile): +1.5 / +2.4 / +1.9 / +2.0 % at d32 S 384 / 512 / 640 / 768 with
       kv_lengths = 0.75 S (57.28 -> 56.45, 102.21 -> 99.82, 198.72 -> 195.12, 299.87 -> 293.89 us) and +1.6 / +2.5 / +1.9 / +1.8 % at 0.5 S; d64 +2.4..+2.9 %
-      (0.75 S) and +1.7..+3.8 % (0.5 S), the dense d64 S 256 pair +3.8 % with 4 S rows -- 27 of 30 cells a win, two inside the control spread and one
-      -0.4 % (d32 S 256, 0.5 S, two of four kv tiles).  The same body at **TILE_N 128 LOSES**: -2.2 / -1.1 / -0.5 % at d32 S 384 / 512 / 256 (55.39 ->
-      56.64, 102.30 -> 103.39, 23.87 -> 24.00 us), -0.4 % at d64 S 384 / 512, the rest inside the spread -- it keeps Q in SMEM.
+      (0.75 S) and +1.7..+3.8 % (0.5 S), the dense d64 S 256 pair +3.8 % with 4 S rows -- 27 of 30 cells a win; the two NEUTRAL are d64 S 256 dense -0.2 %
+      (inside its 0.71 % control spread) and d32 S 256 at 0.75 S +0.4 % (above its 0.26 % spread but under the +1 % win threshold), the one LOSS -0.4 %
+      (d32 S 256, 0.5 S, two of four kv tiles).  The same body at **TILE_N 128 LOSES** (12 cells, geomean -0.45 %): -2.2 / -1.1 / -0.5 / -0.15 % at d32
+      S 384 / 512 / 256 / 768 (55.39 -> 56.64, 102.30 -> 103.39, 23.87 -> 24.00, 295.10 -> 295.55 us), -1.1 % at d32 S 384 with 4 S rows (179.26 ->
+      181.28 us), -0.4 % at d64 S 384 / 512; the other five are NEUTRAL (-0.05..+0.5 %: three inside their control spread, d64 S 640 / 768 +0.1 / +0.5 %
+      above it but under the +1 % threshold) -- it keeps Q in SMEM.
     * **1 on the BIAS + kv_mask body at TILE_N 64 of the 64-wide tile WITHOUT per-row lengths**: +1.8 / +1.3 % at d64 S 384 / 512 (76.72 -> 75.36,
       160.98 -> 158.96 us) and +7.1 / +3.2 % at S 256 / 384 with 4 S rows (98.14 -> 91.65, 263.23 -> 255.09), S 256 inside the spread; the same body
-      with ``kv_lengths`` is a wash (-1.4..+3.2 %, geomean 0) and at the 32-wide tile a wash (-0.6..+1.5 %, geomean +0.3 %) -- both keep Q in SMEM.
+      with ``kv_lengths`` is a wash (-1.4..+3.2 %, geomean +0.2 %) and at the 32-wide tile a wash (-0.6..+1.5 %, geomean +0.24 %) -- both keep Q in SMEM.
     * 0 on a kv_mask without a bias and on the plain TILE_N 64 body (unmeasured), and off the arm's validated domain (cga2, the 64-row tile, three
       softmax warp groups, a quantized dtype, THD / split-KV / PackGQA / the epilogue gate -- the factory would decline typed).
 
