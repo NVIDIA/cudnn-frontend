@@ -46,7 +46,16 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
-from cudnn.gemm.frost.ln_prologue import A0_PROLOGUES, EPI_MATHS, LN_PASS_FORMS, MIN_BLOCKS_PER_MP_DOMAIN, MIN_K_BLOCK_MN_MAJOR, PAIR_TILE_ROWS, PASS_ORDERS
+from cudnn.gemm.frost.ln_prologue import (
+    A0_PROLOGUES,
+    EPI_MATHS,
+    EPI_MATHS_PACKED,
+    LN_PASS_FORMS,
+    MIN_BLOCKS_PER_MP_DOMAIN,
+    MIN_K_BLOCK_MN_MAJOR,
+    PAIR_TILE_ROWS,
+    PASS_ORDERS,
+)
 from cudnn.gemm.frost.ln_prologue import default_k_block as _substrate_default_k_block
 
 from .kernels import contraction as k2
@@ -303,7 +312,10 @@ def register_split_hint(stage: str, channels: int, has_bias: bool, ln_pass_form:
     if stage not in ("k1", "k3"):
         raise ValueError(f"stage must be 'k1' or 'k3', got {stage!r}")
     order = (str(pass_order) if pass_order is not None else None) if stage == "k1" else None
-    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), str(epi_math), order), 0)
+    # the rows are keyed by RENDERING: the three packed epilogue forms differ only under `has_bias` and render ONE cubin without biases, so a
+    # bias-off lookup reads the family's row (`EPI_MATHS_PACKED`); a bias-on rendering is never hinted, whichever form it runs
+    epm = "packed" if (not has_bias and str(epi_math) in EPI_MATHS_PACKED) else str(epi_math)
+    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), epm, order), 0)
 
 
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:

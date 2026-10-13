@@ -162,6 +162,13 @@ EPILOGUE MATH (``LnDualGemmParams.epi_math``; performance only).  ``"scalar"`` (
 PAIRS on the packed fp32x2 ALU -- ``add.f32x2`` for the two bias adds, ``sigmoid2`` (``mul.f32x2`` by an opaque 0.5, two ``tanh.approx``, one
 ``fma.rn.f32x2``), ``mul.f32x2`` for ``gate * value`` and for ``* mask``, ``add.f32x2`` for the fused residual; the mask SELECT stays per element and
 AFTER the arithmetic (never a multiply by zero of a residue).  Each packed op is the IEEE fp32 op per lane in the scalar form's association.
+``"packed_hoist"``: the packed form with the subtile's 16 bias ``LDS.128`` issued BEFORE its two ``tcgen05.ld`` (the SMEM latency under the TMEM
+latency; the same words into the same ops: bitwise; nothing changes on a rendering without biases).  ``"packed_biasfold"``: the hoisted form with
+the GATE bias staged HALVED into ``sBias`` (``b_g / 2``, one exact fp32 multiply per entry at kernel start) and the tanh argument formed by ONE
+``fma.rn.f32x2`` (``g / 2 + b_g / 2``) in place of the bias ``add.f32x2`` + the halving ``mul.f32x2`` (``tile_dsl.pointwise.sigmoid2_biased_half``;
+OUTPUT-BITWISE: the fp32 grid is self-similar under a power-of-two scale, so ``RN(g / 2 + b_g / 2) == RN(g + b_g) / 2`` wherever the sum is normal
+and both arguments give exactly 0.5 below that) -- 16 FADD2 fewer per 32-channel subtile per lane on the renderings with biases, whose epilogue
+stream is ~282 instructions per subtile with the bias path 48 of them (16 LDS.128 + 32 FADD2 = the measured +16 % bias cost at c_out = 128).
 
 Parameters come from the FROST template loader as ``FROST_TEMPLATE_PARAMS`` (a
 :class:`cudnn.gemm.frost.ln_prologue.LnDualGemmParams`); a plain import gets the ``k = 128, c_out = 128, passes = 2``
@@ -177,7 +184,7 @@ from cutlass._mlir.dialects import arith
 
 import cutlass.experimental.primitives as nvvm
 from cudnn.frost.tile_dsl.barrier import arrive_on_leader_release
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, sigmoid, sigmoid2
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, sigmoid, sigmoid2, sigmoid2_biased_half
 from cudnn.frost.tile_dsl.tma import ld_global_v4, ld_shared_v4, st_global_v2, st_shared_v4
 from cudnn.gemm.frost.ln_prologue import PAIR_TILE_ROWS, LnDualGemmParams, validate_ln_dual_gemm_params
 from cudnn.gemm.frost.tile_helpers import (
@@ -327,7 +334,12 @@ _LN_ROLLED: bool = PARAMS.ln_pass_form == "smem_rolled"
 _LN_PF: bool = PARAMS.ln_pass_form in ("smem_rolled_pf", "smem_rolled_tree")
 _LN_TREE: bool = PARAMS.ln_pass_form == "smem_rolled_tree"
 # EPILOGUE MATH (module docstring): the gated pairing on packed fp32x2 pairs (the same fp32 operations per element, half the ALU issue).
-_EPI_PACKED: bool = PARAMS.epi_math == "packed"
+_EPI_PACKED: bool = PARAMS.epi_math in ("packed", "packed_hoist", "packed_biasfold")
+# The BIAS-PATH forms of the packed epilogue (module docstring): both are const_expr-dead on a rendering without biases (the three packed forms
+# render one cubin there).  `_EPI_BIAS_HOIST`: the subtile's bias words are loaded before its TMEM loads; `_EPI_BIASFOLD`: the gate bias is
+# staged halved and folded into the tanh argument's fma (`sigmoid2_biased_half`).
+_EPI_BIAS_HOIST: bool = PARAMS.epi_math in ("packed_hoist", "packed_biasfold")
+_EPI_BIASFOLD: bool = PARAMS.epi_math == "packed_biasfold"
 # REGISTER SPLIT (module docstring): the `.minnctapersm` hint of the launch -- 0 = no directive (the rendering as shipped: the six setmaxnreg
 # requests dropped by ptxas, one flat allocation per warp), 1 = the hint under which ptxas honours them (USETMAXREG 6; the cubin byte-identical
 # to a `.maxnreg 168` build).  Handed to the launch as the DSL's `min_blocks_per_mp`; at 0 the DSL emits no kernel attribute, so the default
@@ -790,6 +802,14 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                         _lo, _hi = f16x2_to_f32(_w, dtype=cutlass.BFloat16)
                         _f.append(_lo)
                         _f.append(_hi)
+                    if cutlass.const_expr(_EPI_BIASFOLD):
+                        # "packed_biasfold" (module docstring): the GATE entries -- chunks 16..31 of every 32-chunk [value 128 | gate 128] block
+                        # (8 entries per chunk; 128 % 8 == 0, so a chunk never straddles the boundary) -- are staged HALVED: `b_g / 2` is exact in
+                        # fp32 for every bf16 value (a bf16 subnormal's lowest set bit is fp32 mantissa bit 16), the value entries are scaled by 1.0.
+                        _gate_half = cutlass.Float32(
+                            arith.select(((_chunk % 32) >= 16).ir_value(), cutlass.Float32(0.5).ir_value(), cutlass.Float32(1.0).ir_value())
+                        )
+                        _f = [_x * _gate_half for _x in _f]
                     st_shared_v4(smem_bias.data_ptr(_chunk * 8), _f[0:4], cutlass.Float32)
                     st_shared_v4(smem_bias.data_ptr(_chunk * 8 + 4), _f[4:8], cutlass.Float32)
     nvvm.fence_mbarrier_init()
@@ -1485,6 +1505,16 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             for subtile_idx in cutlass.range_constexpr(_EPI_SUBTILES):
                 _col0 = subtile_idx * epi_n
                 _outs = []
+                _bp = []
+                _bg = []
+                if cutlass.const_expr(HAS_BIAS and _EPI_BIAS_HOIST and _DIAG != "no_epi_math"):
+                    # "packed_hoist" / "packed_biasfold" (module docstring): the subtile's bias words BEFORE the TMEM loads -- the same 16 broadcast
+                    # LDS.128 the shipped form issues after its tcgen05.wait; under the fold form the gate words are the halved `b_g / 2`.
+                    _bias_base = tile_l * _BIAS_PER_PASS + tile_n * (2 * _VALUE_BLOCK) + _col0
+                    for _q in cutlass.range_constexpr(epi_n // 4):
+                        _bp.extend(ld_shared_v4(smem_bias.data_ptr(_bias_base + _q * 4), cutlass.Float32))
+                    for _q in cutlass.range_constexpr(epi_n // 4):
+                        _bg.extend(ld_shared_v4(smem_bias.data_ptr(_bias_base + _VALUE_BLOCK + _q * 4), cutlass.Float32))
                 if cutlass.const_expr(_DIAG == "no_epi_math"):
                     for _i in cutlass.range_constexpr(epi_n):
                         _outs.append(cutlass.Float32(0.0) * m_val)  # DIAGNOSTIC: no TMEM read, no sigmoid; the store path stays
@@ -1494,9 +1524,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                     _v = nvvm.tcgen05_ld(shape, _tm_v, num=epi_n, offset=ld_half_off)
                     _g = nvvm.tcgen05_ld(shape, _tm_g, num=epi_n, offset=ld_half_off)
                     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                _bp = []
-                _bg = []
-                if cutlass.const_expr(HAS_BIAS and _DIAG != "no_epi_math"):
+                if cutlass.const_expr(HAS_BIAS and not _EPI_BIAS_HOIST and _DIAG != "no_epi_math"):
                     _bias_base = (
                         tile_l * _BIAS_PER_PASS + tile_n * (2 * _VALUE_BLOCK) + _col0
                     )  # the interleaved [value block | gate block] per 128 output channels
@@ -1520,9 +1548,14 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                     # (gate = sigmoid(g + b_g); o = (gate * (v + b_p)) * m [+ resid]); the mask SELECT stays per element, after the arithmetic.
                     for _h in cutlass.range_constexpr(epi_n // 2):
                         _i = 2 * _h
-                        _gl, _gh = fadd2(_g[_i], _g[_i + 1], _bg[_i], _bg[_i + 1]) if cutlass.const_expr(HAS_BIAS) else (_g[_i], _g[_i + 1])
-                        _vl, _vh = fadd2(_v[_i], _v[_i + 1], _bp[_i], _bp[_i + 1]) if cutlass.const_expr(HAS_BIAS) else (_v[_i], _v[_i + 1])
-                        _sl, _sh = sigmoid2(_gl, _gh)
+                        if cutlass.const_expr(HAS_BIAS and _EPI_BIASFOLD):
+                            # "packed_biasfold": the value add as shipped; the gate bias (staged halved) folded into the tanh argument's fma.
+                            _vl, _vh = fadd2(_v[_i], _v[_i + 1], _bp[_i], _bp[_i + 1])
+                            _sl, _sh = sigmoid2_biased_half(_g[_i], _g[_i + 1], _bg[_i], _bg[_i + 1])
+                        else:
+                            _gl, _gh = fadd2(_g[_i], _g[_i + 1], _bg[_i], _bg[_i + 1]) if cutlass.const_expr(HAS_BIAS) else (_g[_i], _g[_i + 1])
+                            _vl, _vh = fadd2(_v[_i], _v[_i + 1], _bp[_i], _bp[_i + 1]) if cutlass.const_expr(HAS_BIAS) else (_v[_i], _v[_i + 1])
+                            _sl, _sh = sigmoid2(_gl, _gh)
                         _pl, _ph = fmul2(_sl, _sh, _vl, _vh)
                         _ol, _oh = fmul2(_pl, _ph, m_val, m_val)
                         if cutlass.const_expr(_FUSE_RESIDUAL):

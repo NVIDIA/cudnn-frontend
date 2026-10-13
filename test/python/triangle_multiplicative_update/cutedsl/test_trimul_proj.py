@@ -374,8 +374,16 @@ _SASS_SPILL_PINS = {
     ("k1", 256, "smem_rolled_tree", "packed"): dict(STL=0, LDL=0),
     ("k3", 256, "smem_rolled_pf", "packed"): dict(STL=0, LDL=0),
     ("k3", 256, "smem_rolled_tree", "packed"): dict(STL=0, LDL=0),
+    # The BIAS-PATH forms of the packed epilogue (`packed_hoist`: the subtile's bias words loaded before its TMEM loads; `packed_biasfold`: + the
+    # gate bias staged halved and folded into the tanh argument's fma, -16 FADD2 per subtile per lane): no new live word (the halved words replace
+    # the gate words one for one, the hoist moves the same 64 words' live range earlier), 0 / 0 measured on every rendering with biases.
+    ("k1", 128, "registers", "packed_hoist"): dict(STL=0, LDL=0),
+    ("k1", 128, "registers", "packed_biasfold"): dict(STL=0, LDL=0),
+    ("k1", 256, "smem_rolled_pf", "packed_biasfold"): dict(STL=0, LDL=0),
+    ("k3", 128, "registers", "packed_biasfold"): dict(STL=0, LDL=0),
+    ("k3", 256, "smem_rolled_pf", "packed_biasfold"): dict(STL=0, LDL=0),
 }
-_SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",)}
+_SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",), "FADD2": (" FADD2",), "FFMA2": (" FFMA2",)}
 _SASS_PROBE_BODY = """
 from cudnn.gemm.frost import ln_prologue
 from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1
@@ -443,6 +451,33 @@ def test_sm107_register_split_hint_renderings_spill_pins(tmp_path, arm, k, ln_pa
     )
 
 
+@pytest.mark.parametrize(
+    "arm,k,ln_pass_form,order",
+    [
+        ("k1", 128, "registers", "major"),
+        ("k1", 256, "smem_rolled_pf", "major"),
+        ("k3", 128, "registers", "interleaved"),
+        ("k3", 256, "smem_rolled_pf", "interleaved"),
+    ],
+)
+def test_sm107_packed_bias_forms_render_one_cubin_without_biases(tmp_path, arm, k, ln_pass_form, order):
+    """The two bias-path forms of the packed epilogue (`packed_hoist`, `packed_biasfold`) differ from `packed` ONLY under `has_bias`: trace-compiled
+    for sm_107a WITHOUT biases (no GPU) the three forms are byte-identical cubins -- the bias-off production renderings cannot move when a bias-on
+    cell picks a new form, and the register-split rule may key them as one rendering (`heuristics.register_split_hint`)."""
+    md5 = {}
+    for epm in sub.EPI_MATHS_PACKED:
+        probe = sass_utils.run_sass_probe(
+            tmp_path,
+            probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
+            arch="sm_107a",
+            params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math=epm, has_bias=False, min_blocks_per_mp=0, pass_order=order),
+            tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_{epm}_bias0_{order}",
+        )
+        md5[epm] = probe.cubin_md5
+        print(f"{arm} K={k} {ln_pass_form} {epm} bias off: cubin {probe.cubin_md5} FADD2 {probe.stats.get('FADD2')}")
+    assert len(set(md5.values())) == 1 and all(md5.values()), f"{arm} K={k} {ln_pass_form}: the packed forms differ WITHOUT biases: {md5}"
+
+
 @pytest.mark.parametrize("arm,k,ln_pass_form,epi_math", sorted(_SASS_SPILL_PINS))
 def test_sm107_rendering_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math):
     """Trace-compile the rendering for sm_107a (no GPU needed), read STL / LDL / USETMAXREG off the SASS: the served widths' spill counts are
@@ -478,7 +513,17 @@ def test_ln_pass_form_and_epi_math_decline_typed(kw, axis):
 @requires_rubin
 @pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
 @pytest.mark.parametrize(
-    "ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed"), ("smem_rolled_pf", "packed")]
+    "ln_pass_form,epi_math",
+    [
+        ("smem", "scalar"),
+        ("smem_rolled", "scalar"),
+        ("registers", "packed"),
+        ("smem_rolled", "packed"),
+        ("smem_rolled_pf", "packed"),
+        ("registers", "packed_hoist"),
+        ("registers", "packed_biasfold"),
+        ("smem_rolled_pf", "packed_biasfold"),
+    ],
 )
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, c, mask_kind, ln_pass_form, epi_math):
     """The re-read LayerNorm forms sum the same bf16 words in the same order (a re-load of the unchanged stage replaces a register), and the packed

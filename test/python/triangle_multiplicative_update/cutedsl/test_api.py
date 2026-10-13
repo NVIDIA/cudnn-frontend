@@ -828,6 +828,14 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     # output stage at c 256 (its spill vanishes, its time does not move) are NOT rows
     assert th.register_split_hint("k1", 128, False, "registers", "packed", "major") == 1
     assert th.register_split_hint("k1", 128, False, "smem_rolled", "packed", "major") == 1
+    # the three packed epilogue forms are ONE rendering without biases (their differences sit under has_bias): the bias-off lookup reads the
+    # family's row; a bias-on rendering is never hinted whichever form it runs; "scalar" is not a member
+    for epm in ("packed_hoist", "packed_biasfold"):
+        assert th.register_split_hint("k1", 128, False, "registers", epm, "major") == 1, epm
+        assert th.register_split_hint("k1", 128, False, "smem_rolled", epm, "major") == 1, epm
+        assert th.register_split_hint("k1", 128, True, "registers", epm, "major") == 0, epm
+        assert th.register_split_hint("k1", 128, False, "smem_rolled", epm, "interleaved") == 0, epm
+    assert th.register_split_hint("k1", 128, False, "registers", "scalar", "major") == 0
     assert th.register_split_hint("k1", 128, False, "smem_rolled", "packed", "interleaved") == 0
     assert th.register_split_hint("k3", 256, False, "smem_rolled", "packed") == 0
     assert th.register_split_hint("k1", 128, True, "registers", "packed", "major") == 0
@@ -906,6 +914,8 @@ def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_declin
         tapi.TriMulKnobs(
             ln_pass_form="smem_rolled_pf"
         ),  # the pipelined rolled LayerNorm re-read: the same words, the same order (K1 here; K3 keeps the transpose form)
+        tapi.TriMulKnobs(epi_math="packed_hoist"),  # the bias words loaded before the TMEM loads: the same words, the same ops
+        tapi.TriMulKnobs(epi_math="packed_biasfold"),  # the gate bias staged halved, folded into the tanh argument's fma (output-bitwise, both stages)
     ):
         plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True, knobs=knobs)
         assert plan.check_support()

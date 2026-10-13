@@ -92,8 +92,16 @@ LN_PASS_FORMS = ("registers", "smem", "smem_rolled", "smem_rolled_pf", "smem_rol
 #: a bitwise pin excludes them, a heuristics default never names them without a decision on the measured oracle distance.
 LN_PASS_FORMS_REORDERED = ("smem_rolled_tree",)
 #: The gated epilogue's arithmetic form (performance only; the same fp32 operations per element): ``"scalar"`` = one element at a time;
-#: ``"packed"`` = channel PAIRS on the packed fp32x2 ALU (``add.f32x2`` / ``mul.f32x2`` / ``fma.rn.f32x2``: half the ALU issue per element).
-EPI_MATHS = ("scalar", "packed")
+#: ``"packed"`` = channel PAIRS on the packed fp32x2 ALU (``add.f32x2`` / ``mul.f32x2`` / ``fma.rn.f32x2``: half the ALU issue per element);
+#: ``"packed_hoist"`` = ``packed`` with a subtile's bias words loaded from SMEM BEFORE its TMEM loads (the same words, the same ops; a schedule
+#: change on the renderings WITH biases, nothing on the others); ``"packed_biasfold"`` = ``packed_hoist`` with the GATE bias staged halved
+#: (``b_g / 2``, exact) and folded into the tanh argument as one ``fma.rn.f32x2`` in place of the bias ``add.f32x2`` + the halving
+#: ``mul.f32x2`` (``tile_dsl.pointwise.sigmoid2_biased_half``: output-bitwise, -16 FADD2 per 32-channel subtile per lane).  Without biases
+#: the three packed forms render ONE cubin (:data:`EPI_MATHS_PACKED`): their differences sit under ``has_bias``.
+EPI_MATHS = ("scalar", "packed", "packed_hoist", "packed_biasfold")
+#: The packed family -- one rendering (byte-identical cubins) on an artifact WITHOUT biases; a per-rendering rule keyed by the epilogue form
+#: (the triangle multiplicative update's register-split hint) treats them as one member there.
+EPI_MATHS_PACKED = ("packed", "packed_hoist", "packed_biasfold")
 #: The ``.minnctapersm`` launch hint (performance only; bitwise the same output): 0 = no directive (the rendering as shipped: ptxas drops the
 #: body's ``setmaxnreg`` split and allocates one flat count per warp), 1 = the hint under which ptxas honours the split -- the kernel is one CTA
 #: per SM by its SMEM footprint either way (:class:`LnDualGemmParams`).  2 or more would cap the allocation at 80 registers: refused.

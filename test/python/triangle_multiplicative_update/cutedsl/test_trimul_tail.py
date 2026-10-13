@@ -460,7 +460,17 @@ def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batc
 @requires_rubin
 @pytest.mark.parametrize("n_res,batch,c_z", [(217, 2, 128), (128, 1, 256)])
 @pytest.mark.parametrize(
-    "ln_pass_form,epi_math", [("smem", "scalar"), ("smem_rolled", "scalar"), ("registers", "packed"), ("smem_rolled", "packed"), ("smem_rolled_pf", "packed")]
+    "ln_pass_form,epi_math",
+    [
+        ("smem", "scalar"),
+        ("smem_rolled", "scalar"),
+        ("registers", "packed"),
+        ("smem_rolled", "packed"),
+        ("smem_rolled_pf", "packed"),
+        ("registers", "packed_hoist"),
+        ("registers", "packed_biasfold"),
+        ("smem_rolled_pf", "packed_biasfold"),
+    ],
 )
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, ln_pass_form, epi_math):
     """On the accumulators arm (mn_major prologue): the re-read LayerNorm forms and the packed epilogue are BITWISE the default forms (output and
