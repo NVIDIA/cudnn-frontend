@@ -61,7 +61,9 @@ _GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="the cache-write
 _SMALL_D256 = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
 _FLASH_NEXT = dict(d_model=2560, h_q=24, h_kv=2, d_head=256, rope_dim=64)
 _BAND_BAR = dict(rtol=2.0**-7, atol=1e-3)  # the suite's bar for a slab band against the oracle (one bf16 rounding of the GEMM output)
-_NORM_BAR = dict(rtol=0.0, atol=8e-3)  # the norm suite's bar for the normed K against the oracle norm of the SAME bf16 input
+# The norm suite's absolute term for the normed K against the oracle norm of the SAME input, per dtype (test_qk_norm_rope.py `_check`:
+# a couple of ulps of fp32 op order) -- never the bf16 term on an f16 cell.
+_NORM_ATOL = {torch.bfloat16: 8e-3, torch.float16: 1e-3}
 _PAGES = (16, 32, 64, 128)  # the kernel block sizes the serving stacks allocate
 _LAYOUTS = ("hnd", "nhd", "unified")  # HND compact / NHD by strides / the unified [P, H, page, 2D] content row (K at +0, V at +D)
 # The packed form's sequences: a zero-length sequence in the MIDDLE (the general case), a tail tile on every live one, T = 512.
@@ -705,7 +707,8 @@ def _slab_rows(rec):
 def _check_pools_against(k_cache, v_cache, slot, page_size, k_rows, v_rows, ref_k, ref_v, label, *, k_oracle=True):
     """The live pool rows == the block's own K / V rows bitwise; == the oracle's post-RoPE K / V within the suite's bars
     (V at the band bar; K -- a normed band -- at the band bar's relative term composed with the norm suite's absolute
-    one, the two roundings the UNFUSED stages make: the GEMM's bf16 output, then the fp32 norm + RoPE rounded once);
+    term for the pool's dtype, the two roundings the UNFUSED stages make: the GEMM's output rounded to the dtype, then the
+    fp32 norm + RoPE rounded once);
     every unwritten slot still NaN.  ``k_oracle=False`` skips the K-vs-oracle bar: the fused norm + RoPE fork norms the
     fp32 ACCUMULATOR, a different rounding structure the caller checks against its own faithful oracle."""
     live = slot >= 0
@@ -725,7 +728,7 @@ def _check_pools_against(k_cache, v_cache, slot, page_size, k_rows, v_rows, ref_
     )
     torch.testing.assert_close(pv.float(), ref_v.float(), **_BAND_BAR)
     if k_oracle:
-        torch.testing.assert_close(pk.float(), ref_k.float(), rtol=_BAND_BAR["rtol"], atol=_NORM_BAR["atol"])
+        torch.testing.assert_close(pk.float(), ref_k.float(), rtol=_BAND_BAR["rtol"], atol=_NORM_ATOL[pk.dtype])
 
 
 @requires_rubin
@@ -791,7 +794,7 @@ def test_write_through_on_the_other_bf16_pipelines(pipeline):
         k_pre = _cols(proj, g.qkvg_offsets[2], g.h_kv, g.d_head).reshape(1, t, g.h_kv, g.d_head)
         want_k, _ = qk_norm_rope_reference(k_pre, inp["w_k_norm"], cos, sin, g.rope_dim, g.qk_norm_eps)
         pk = _rows_at(k_cache, slot, page_size)
-        torch.testing.assert_close(pk.float(), want_k.reshape(t, g.h_kv, g.d_head)[slot >= 0].float(), **_NORM_BAR)
+        torch.testing.assert_close(pk.float(), want_k.reshape(t, g.h_kv, g.d_head)[slot >= 0].float(), rtol=0.0, atol=_NORM_ATOL[pk.dtype])
     if pipeline.endswith("fuse_norm_rope"):
         # The fork-faithful oracle: norm + RoPE of the UNROUNDED fp32 projection, rounded once to bf16.
         o_k = g.qkvg_offsets[2]
