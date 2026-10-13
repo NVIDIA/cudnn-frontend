@@ -12,9 +12,11 @@ Combines backend-specific CuTe-DSL kernels:
 When the ``dIndexK`` output buffer is bf16, a trailing pure-torch cast
 (FP32 accumulator → bf16) finishes the pipeline (kernel 3); an fp32
 ``dIndexK`` buffer receives the accumulator directly, with no cast. The fp32
-accumulator behind a bf16 ``dIndexK`` (and the sm100_v2 ticket counter) is
-carved from the caller's workspace (``scratch_workspace_bytes()`` /
-``execute(..., workspace=)``); the plans own no device memory (Rule 8, R2).
+ordinary accumulator behind a bf16 ``dIndexK`` (and the ordinary sm100_v2
+ticket counter) is carved from the caller's workspace; deterministic execution
+uses 128 FP32 dK shards instead. ``scratch_workspace_bytes()`` reports the
+selected policy's exact size for ``execute(..., workspace=)``; the plans own no
+device memory (Rule 8, R2).
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 
 from .dense_indexer_backward_sm100 import dense_indexer_backward_sm100
 from .dense_indexer_backward_sm90 import dense_indexer_backward_sm90
+from .deterministic_dk_sm100 import deterministic_dk_workspace_bytes
 from .indexer_backward_v2_sm100 import indexer_backward_v2_sm100
 from .indexer_backward_sm100 import indexer_backward_sm100
 from .indexer_backward_sm90 import indexer_backward_sm90
@@ -206,7 +209,7 @@ class IndexerBackward(APIBase):
        avoid a fail-dirty.
     2. Kernel 1 — in-place score-grad precompute (overwrites ``attn_score``
        with ``grad_signal`` and reads ``index_score`` without modifying it).
-    3. fp32 dK accumulator zero-init — the dK epilogue atomic-adds, so its
+    3. fp32 dK accumulator zero-init — the ordinary dK epilogue atomic-adds, so its
        fp32 target starts zeroed on the launch stream. An fp32 ``d_index_k``
        buffer is that target and is zeroed in place (a promised stage, not a
        hidden op); a bf16 ``d_index_k`` buffer instead accumulates into a
@@ -222,6 +225,15 @@ class IndexerBackward(APIBase):
     weights, and stores are clipped to the caller's H32 tensors. No caller-side
     H32→H64 padding or output slicing is required.
 
+    ``deterministic=True`` is an SM100 request-or-fail policy for H=64,
+    D=128, block_I=128, and 128-multiple top-k in [128, 2048]. It gives each
+    of 128 persistent CTAs a private FP32 dK shard and fixed grid-stride query
+    rows, then folds groups of eight shards and the 16 group totals in two
+    fixed-order kernels. dQ/dW remain single-writer. The deterministic scratch
+    is ``128 * B * S_k * D * 4`` bytes (aligned, for either backend),
+    independent of output dtype. A warmed plan with caller-owned outputs and
+    scratch is CUDA Graph compatible.
+
     ``backend="sm100_v2"`` (SM100 only, request-or-fail: ``check_support``
     raises outside the envelope, there is no silent fallback) selects an
     alternative GEMM stage that upcasts the weights to fp32 in-register and
@@ -232,7 +244,8 @@ class IndexerBackward(APIBase):
     of the 24 fp32 significand bits — measured ~675x lower gradient-matrix
     representation error than the default single-bf16 rounding);
     ``d_weights`` is additionally reduced deterministically (bitwise
-    run-to-run, as is ``d_index_q``). Same wrapper contract: ``attn_score`` is
+    run-to-run, as is ``d_index_q``). With ``deterministic=True``, dK is also
+    bitwise reproducible. Same wrapper contract: ``attn_score`` is
     the in-place score scratch and ``index_score`` remains read-only. Output
     dtype selects output precision: ``d_weights``
     and ``d_index_k`` accept fp32 buffers, which receive the fp32
@@ -240,10 +253,11 @@ class IndexerBackward(APIBase):
     output buffers**; bf16 output buffers round the result and keep only the
     bf16-representation floor. Requires H == 64, D == 128,
     topk % 128 == 0 with 128 <= topk <= 2048, block_I == 128, sm_scale > 0,
-    contiguous same-device tensors. Its dynamic-ticket counter is 8 bytes of
-    the caller's ``workspace`` (the first ``ws_align(8)`` bytes, ahead of the
-    bf16 dK accumulator), zeroed on the launch stream at every ``execute``,
-    so the plan owns nothing and is bound to no device; executions that
+    contiguous same-device tensors. Ordinarily, its dynamic-ticket counter is
+    8 bytes of the caller's ``workspace`` (the first ``ws_align(8)`` bytes,
+    ahead of the bf16 dK accumulator), zeroed on the launch stream at every
+    ``execute``. Deterministic execution replaces both regions with its dK
+    shards. The plan owns nothing and is bound to no device; executions that
     share one workspace buffer must not overlap on the device
     (``indexer_backward_wrapper`` allocates a fresh one per call). The
     workspace must live on ``index_q.device``. ``backend`` must be one of
@@ -265,6 +279,7 @@ class IndexerBackward(APIBase):
         block_I: int = 128,
         topk_indices_global: bool = False,
         backend: str = "default",
+        deterministic: bool = False,
     ):
         super().__init__()
         self.iq_desc = self._make_tensor_desc(sample_index_q, name="sample_index_q")
@@ -305,6 +320,7 @@ class IndexerBackward(APIBase):
         self.topk_indices_global = bool(topk_indices_global)
         _validate_indexer_backward_backend(backend)
         self.backend = backend
+        self.deterministic = bool(deterministic)
         # Derived gate kept so the internal dispatch/validation sites read a
         # single boolean; ``backend`` remains the public, cache-keyed selector.
         self.use_v2 = backend == "sm100_v2"
@@ -379,7 +395,7 @@ class IndexerBackward(APIBase):
         # default path keeps the pre-existing current-device query, so it stays
         # self-consistent with the sm90/sm100 factories, which check the
         # current device themselves.
-        major, _ = torch.cuda.get_device_capability(self.iq_desc.device if self.use_v2 else None)
+        major, _ = torch.cuda.get_device_capability(self.iq_desc.device if self.use_v2 or self.deterministic else None)
         self._runtime_error_if(
             major != 9 and major < 10,
             f"IndexerBackward requires SM90 or SM100+, found SM{major}",
@@ -453,6 +469,40 @@ class IndexerBackward(APIBase):
                     desc.device != self.iq_desc.device,
                     f"backend='sm100_v2' requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                 )
+        self._value_error_if(
+            self.deterministic and major != 10,
+            f"deterministic IndexerBackward requires SM100, found SM{major}",
+        )
+        if self.deterministic:
+            if not self.use_v2:
+                deterministic_descs = (
+                    ("index_q", self.iq_desc),
+                    ("weights", self.w_desc),
+                    ("index_k", self.ik_desc),
+                    ("d_index_q", self.diq_desc),
+                    ("d_weights", self.dw_desc),
+                    ("d_index_k", self.dik_desc),
+                    ("attn_score", self.attn_desc),
+                    ("index_score", self.idx_score_desc),
+                    ("topk_indices", self.topk_desc),
+                )
+                for name, desc in deterministic_descs:
+                    self._value_error_if(
+                        desc.device != self.iq_desc.device,
+                        f"deterministic IndexerBackward requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
+                    )
+            self._value_error_if(
+                self.heads != 64 or self.head_dim != 128,
+                f"deterministic IndexerBackward requires H=64, D=128, got H={self.heads}, D={self.head_dim}",
+            )
+            self._value_error_if(
+                self.block_I != 128,
+                f"deterministic IndexerBackward requires block_I=128, got block_I={self.block_I}",
+            )
+            self._value_error_if(
+                self.topk % 128 != 0 or not (128 <= self.topk <= 2048),
+                "deterministic IndexerBackward requires topk % 128 == 0 with " f"128 <= topk <= 2048, got topk={self.topk}",
+            )
         self._check_dtype(self.iq_desc, torch.bfloat16, name="index_q")
         self._check_dtype(self.w_desc, torch.bfloat16, name="weights")
         self._check_dtype(self.ik_desc, torch.bfloat16, name="index_k")
@@ -522,10 +572,26 @@ class IndexerBackward(APIBase):
                     block_I=self.block_I,
                     topk_indices_global=self.topk_indices_global,
                     dw_out_dtype=self.dw_desc.dtype,
+                    deterministic=self.deterministic,
                 )
             return
-        # Default path: capability from the current device, unchanged from
-        # the pre-v2 code (the v2 branch above never reaches here).
+        if self.deterministic:
+            with torch.cuda.device(self.iq_desc.device):
+                self._compiled_kernel = indexer_backward_sm100(
+                    self.batch,
+                    self.seqlen,
+                    self.seqlen_k,
+                    self.heads,
+                    self.head_dim,
+                    self.topk,
+                    sm_scale=self.sm_scale,
+                    block_I=self.block_I,
+                    topk_indices_global=self.topk_indices_global,
+                    deterministic=True,
+                )
+            return
+        # Ordinary default path: capability from the current device, unchanged
+        # from the pre-deterministic code (the specialized branches returned).
         major, _ = torch.cuda.get_device_capability()
         kernel_factory = indexer_backward_sm90 if major == 9 else indexer_backward_sm100
         self._compiled_kernel = kernel_factory(
@@ -541,11 +607,18 @@ class IndexerBackward(APIBase):
         )
 
     def scratch_workspace_bytes(self) -> int:
-        """Bytes of caller scratch ``execute`` carves (R2): the sm100_v2
-        ticket counter first, then the fp32 dK accumulator a bf16
-        ``d_index_k`` needs. Zero for fp32 ``d_index_k`` on the default backend."""
-        counter = ws_align(8) if self.use_v2 else 0
-        accumulator = 0 if self.dik_desc.dtype == torch.float32 else ws_align(self.batch * self.seqlen_k * self.head_dim * 4)
+        """Return caller-owned scratch bytes for the selected dK policy.
+
+        The ordinary sm100_v2 counter region comes first. Deterministic
+        execution instead uses 128 dense FP32 shards regardless of output
+        dtype; ordinary execution needs one dense accumulator only for a bf16
+        ``d_index_k``.
+        """
+        counter = ws_align(8) if self.use_v2 and not self.deterministic else 0
+        if self.deterministic:
+            accumulator = ws_align(deterministic_dk_workspace_bytes(self.batch, self.seqlen_k, self.head_dim))
+        else:
+            accumulator = 0 if self.dik_desc.dtype == torch.float32 else ws_align(self.batch * self.seqlen_k * self.head_dim * 4)
         return counter + accumulator
 
     def _check_execute_signature(self, *entries) -> None:
@@ -864,6 +937,7 @@ def indexer_backward_wrapper(
     *,
     backend: str = "default",
     workspace: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'d_index_q', 'd_weights', 'd_index_k'}``.
 
@@ -920,18 +994,27 @@ def indexer_backward_wrapper(
             gains)**; the default wrapper-allocated buffers keep the input
             dtypes (bf16), which rounds the extra accuracy back to the bf16
             representation floor. fp32 ``d_index_k`` is zeroed internally.
-            The backend's dynamic-ticket counter is 8 bytes of the per-call
-            ``workspace`` below, zeroed on the launch stream at every call,
-            so the plan owns no device memory. The wrapper additionally keys
-            its plan cache on the **resolved** stream (``stream`` when given,
-            otherwise ``torch.cuda.current_stream()`` at call time), so one
-            cached plan's executes are stream-ordered.
+            Ordinarily, the backend's dynamic-ticket counter is 8 bytes of the
+            per-call ``workspace`` below, zeroed on the launch stream at every
+            call; ``deterministic=True`` replaces it with the dK shards. The
+            plan owns no device memory. The wrapper additionally keys its plan
+            cache on the **resolved** stream (``stream`` when given, otherwise
+            ``torch.cuda.current_stream()`` at call time), so one cached plan's
+            executes are stream-ordered.
         workspace: keyword-only, optional reusable uint8 buffer of at least
             ``IndexerBackward.scratch_workspace_bytes()`` bytes on
-            ``index_q.device`` (the fp32 dK accumulator behind a bf16
-            ``d_index_k``, plus the sm100_v2 ticket counter). When omitted the
-            wrapper allocates it per call on the launch stream. Calls sharing
-            one buffer must not overlap on the device.
+            ``index_q.device`` (the ordinary fp32 dK accumulator behind a
+            bf16 ``d_index_k``, plus the ordinary sm100_v2 ticket counter, or
+            the deterministic dK shards). When omitted the wrapper allocates
+            it per call on the launch stream. Calls sharing one buffer must not
+            overlap on the device.
+        deterministic: keyword-only opt-in for bitwise-reproducible gradients
+            on SM100. The dK GEMM accumulates into 128 CTA-private FP32 shards
+            and a fixed-order two-level reduction writes ``d_index_k``. The
+            caller-owned workspace is correspondingly 128 times the dense
+            FP32 dK size for either backend. No global semaphore or
+            cooperative launch is used, so a warmed plan with preallocated
+            outputs and workspace remains CUDA Graph compatible.
     """
     _validate_indexer_backward_backend(backend)
     # Validate ranks explicitly before any allocation or the dimension
@@ -1004,6 +1087,7 @@ def indexer_backward_wrapper(
         bool(topk_indices_global),
         backend,
         stream_key,
+        bool(deterministic),
     )
     obj = _cache_of_IndexerBackwardObjects.get(key)
     if obj is None:
@@ -1021,6 +1105,7 @@ def indexer_backward_wrapper(
             block_I=block_I,
             topk_indices_global=topk_indices_global,
             backend=backend,
+            deterministic=deterministic,
         )
         assert obj.check_support()
         obj.compile()

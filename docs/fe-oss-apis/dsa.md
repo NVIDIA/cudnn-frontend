@@ -621,6 +621,11 @@ indexer tower:
 3. Pure-torch dtype cast (kernel 3) converts `dIndexK_f32` to the output
    dtype.
 
+With `deterministic=True` on SM100, kernel 2 instead accumulates dK into 128
+CTA-private FP32 shards. Two fixed-order CuTe DSL reduction kernels fold groups
+of eight shards and then the 16 group totals, converting only once to the
+requested `d_index_k` dtype. The dQ and dW stores remain single-writer.
+
 The plan owns no device memory. An fp32 `d_index_k` is the accumulator itself
 (zeroed on the launch stream inside `execute`); a BF16 `d_index_k` accumulates
 into a `B * S_k * D` fp32 view carved from the caller's workspace:
@@ -631,6 +636,22 @@ uint8 buffer on `index_q.device`, and a missing or undersized buffer raises
 allocates it per call on the launch stream and accepts the same optional
 `workspace=` keyword for reuse; executions that share one buffer must not
 overlap on the device.
+
+`deterministic=True` is request-or-fail and supports SM100, `H == 64`,
+`D == 128`, `block_I == 128`, and `topk % 128 == 0` for
+`128 <= topk <= 2048`, on either compute backend. Each producer CTA owns one
+shard and processes the fixed row stripe `cta`, `cta + 128`, ...; the v2
+backend disables its ordinary dynamic ticket assignment for this path. The
+main GEMM therefore retains its existing Tensor Core math while dK has a fixed
+association order across launches. Scratch is exactly
+`ws_align(128 * B * S_k * D * sizeof(float))` for either backend. It is
+cleared on the launch stream at every execute, then reduced in two fixed
+levels. A warmed plan with caller-provided outputs
+and workspace is CUDA Graph compatible. To capture the convenience wrapper,
+warm it first and pass every output plus `workspace=` explicitly; omitted
+buffers are allocated per call. As with the existing deterministic
+sparse-attention backward, valid IDs in a semantic top-k row are expected to
+be distinct.
 
 **The TileLang fallback present in the upstream repo is dropped here
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises
@@ -706,9 +727,12 @@ the complete wrapper on the target shape when those properties are required.
   conversion is non-saturating, so a magnitude at or above BF16's
   round-to-nearest overflow threshold (`2^128 - 2^119` ~= 3.3962e38, itself
   above BF16's 3.3895e38 maximum) becomes an infinity in `hi` and the opposite
-  infinity in `lo`, which sum to NaN rather than being clamped. `d_weights` is reduced deterministically — `d_weights` and
-  `d_index_q` are bitwise run-to-run stable; `d_index_k` stays in the same
-  fp32-atomic summation-order class as the default backend.
+  infinity in `lo`, which sum to NaN rather than being clamped. `d_weights` is
+  reduced deterministically — `d_weights` and `d_index_q` are bitwise
+  run-to-run stable. Ordinarily, `d_index_k` stays in the same fp32-atomic
+  summation-order class as the default backend; `deterministic=True` routes
+  those atomics into fixed-owner shards and folds them in a fixed order,
+  making all three gradients bitwise reproducible.
 - **Output dtype selects output precision** — `d_weights` and `d_index_k`
   accept FP32 buffers, which receive the fp32 accumulators directly; **the
   headline accuracy gains require caller-supplied FP32 buffers.** The default
@@ -742,9 +766,13 @@ the complete wrapper on the target shape when those properties are required.
   fine. The wrapper allocates the workspace per call on the launch stream
   unless you pass `workspace=`, and still allocates any output buffer you do
   not pass in.
+  With `deterministic=True`, the dense accumulator and counter region are
+  replaced by 128 FP32 shards regardless of the output dtype; deterministic
+  row ownership does not draw tickets.
 - **Concurrency** — executions that share one workspace buffer must not
-  overlap on the device (two in-flight launches drawing tickets from one
-  counter would interleave); a plan is bound to no device and no stream, and
+  overlap on the device (ordinary launches would interleave ticket draws;
+  deterministic launches would race on the same dK shards); a plan is bound
+  to no device and no stream, and
   the workspace must live on `index_q.device` (rejected before `attn_score`
   is overwritten otherwise). The wrapper's per-call workspace makes its calls
   independent; it additionally keys its plan cache on the CUDA device and on
