@@ -146,9 +146,12 @@ constructor's `k2_tile=` (one axis) or `knobs=` (a `TriMulKnobs` whose set axes 
 override it, `check_support` validates the vocabulary and probes the contraction tile's eligibility for the geometry without compiling. Every
 value of every domain computes the same function (bitwise; the tests pin it). One axis is not a geometry pick: `min_blocks_per_mp`, the two
 LayerNorm-prologue stages' `.minnctapersm` launch hint (0 = the rendering as shipped, whose register split ptxas drops; 1 = the hint under
-which ptxas honours it), is resolved per RENDERING by `heuristics.register_split_hint(stage, c, has_bias, ln_pass_form, epi_math)` from the
-measured rows -- whether a rendering spills at the flat allocation depends on its bias arm and forms, not on N or B -- and a `knobs=` value
-overrides it for both stages.  The epilogue arithmetic form has a bias-path member, `epi_math="packed_biasfold"` (the gate bias staged
+which ptxas honours it), is resolved per RENDERING by `heuristics.register_split_hint(stage, c, has_bias, ln_pass_form, epi_math, pass_order,
+ln_once)` from the measured rows -- whether a rendering spills at the flat allocation depends on its bias arm, its forms, the projection stage's
+tile order and the LayerNorm-once work item, not on N or B.  Every measured row names the per-tile item (`ln_once=""`); under the `"block"`
+item the table ships from N = 256 at c = 128 the hinted renderings spill and the hint measured a loss of 0.7..1.3 % on the whole call without
+the biases (neutral with them, on the 212-SM Rubin class), so those plans run unhinted -- and a `knobs=` value overrides it for both stages.
+The epilogue arithmetic form has a bias-path member, `epi_math="packed_biasfold"` (the gate bias staged
 halved and folded into the tanh argument's fused multiply-add: 16 fewer packed adds per 32-channel subtile per lane; output-bitwise the
 `packed` form, and byte-identical to it when the stage has no biases), which the table picks where the projection stage runs the register
 LayerNorm form at N >= 256 (+1.0..+1.7 % on the whole call with the biases on the 212-SM Rubin class; a rolled-form projection stage loses

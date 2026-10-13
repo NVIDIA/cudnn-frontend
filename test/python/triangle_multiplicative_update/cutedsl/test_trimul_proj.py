@@ -508,6 +508,9 @@ def test_sm107_ln_once_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, has
 # (arm, K, ln_pass_form, epi_math, has_bias, min_blocks_per_mp, order, ln_once); the spill counts are BOUNDS, USETMAXREG is exact.
 _SASS_LN_ONCE_HINT_PINS = {
     ("k1", 128, "registers", "packed", False, 1, "major", "block"): dict(STL=4, LDL=13, USETMAXREG=6),
+    # the PRODUCTION bias-ON fold rendering of the block item (the 512 / 768 B 1 and 256 B 4 cells with the biases, unhinted since the rule keys on the
+    # item): 0 / 0 at the flat allocation -- the cubin the five cells run; measured a tie with the packed twin on 512 B 1 / 256 B 4 and +0.7..+0.9 % on 768
+    ("k1", 128, "registers", "packed_biasfold", True, 0, "major", "block"): dict(STL=0, LDL=0, USETMAXREG=0),
     ("k1", 128, "registers", "packed_biasfold", True, 1, "major", "block"): dict(STL=4, LDL=13, USETMAXREG=6),
     ("k1", 128, "smem_rolled", "packed", False, 1, "major", "block"): dict(STL=9, LDL=15, USETMAXREG=6),
     ("k1", 128, "smem_rolled", "packed", True, 1, "major", "block"): dict(STL=9, LDL=16, USETMAXREG=6),

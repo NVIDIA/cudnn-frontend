@@ -374,6 +374,9 @@ def default_k_block(n_res: int) -> int:
 _REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str], str], int] = {
     ("k1", 128, False, "registers", "packed", "major", ""): 1,
     ("k1", 128, False, "smem_rolled", "packed", "major", ""): 1,
+    # under the block item this rendering runs unhinted (above); there the fold still beats `packed` +0.73 / +0.93 % on 768:128:1 / 768:128:4 and ties on
+    # 512:128:1 outgoing / incoming / 256:128:4 (+0.14 / +0.43 / -0.17 %; both arms unhinted, 212-SM Rubin class) -- the pick stands; `packed` + a
+    # block-keyed hint 1 read +0.68 / +0.79 / +0.51 % on 512:128:1 outgoing / incoming / 768:128:1 over it (two passes, not yet reproduced as the base)
     ("k1", 128, True, "registers", "packed_biasfold", "major", ""): 1,
 }
 
