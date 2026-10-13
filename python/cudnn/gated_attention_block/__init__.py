@@ -2,7 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .api import (
+    KV_SOURCE_PAGED,
+    KV_SOURCE_SELF,
     QKVG_TILE_ALIGN,
+    SERVING_PAGE_SIZES,
+    SERVING_POOL_LAYOUTS,
+    ExtendEnvelope,
     Fp4Format,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
@@ -11,10 +16,12 @@ from .api import (
     QsaSpec,
     QuantSpec,
     SavedForBackward,
+    ServingEnvelope,
     build_fused_qkvg_weight,
     gated_attention_block_forward,
     index_k_raw_view,
     qkvg_from_hf,
+    qkvg_from_vllm,
     saved_slab_views,
 )
 from .api_bwd import (
@@ -24,7 +31,12 @@ from .api_bwd import (
 )
 
 __all__ = [
+    "KV_SOURCE_PAGED",
+    "KV_SOURCE_SELF",
     "QKVG_TILE_ALIGN",
+    "SERVING_PAGE_SIZES",
+    "SERVING_POOL_LAYOUTS",
+    "ExtendEnvelope",
     "Fp4Format",
     "GatedAttentionBlockBwd",
     "GatedAttentionBlockFwd",
@@ -35,10 +47,12 @@ __all__ = [
     "QuantSpec",
     "RecomputePolicy",
     "SavedForBackward",
+    "ServingEnvelope",
     "build_fused_qkvg_weight",
     "gated_attention_block_backward",
     "gated_attention_block_forward",
     "index_k_raw_view",
     "qkvg_from_hf",
+    "qkvg_from_vllm",
     "saved_slab_views",
 ]

@@ -349,6 +349,12 @@ DSL satisfies your kernel.**
   they do not fail. CI runs the `oss:` lanes across the supported DSL versions
   (`ci/stages/oss_tests/jobs.yml` in internal CI); a lane below your floor
   must show skips, not errors.
+- Keep declaration and execute-preflight metadata validators outside modules
+  that import newer DSL kernel APIs. A correctly gated stage cannot protect
+  an earlier constructor import of its validator. Exercise the public
+  constructor and preflight in a fresh process on the real dependency-floor
+  wheel; `test_gated_block_declaration_and_execute_preflight_do_not_import_cache_kernel`
+  is the detector for the gated block's paged-cache validation.
 - **MLIR argument widths are part of a DSL API migration.**
   `FastDivmodDivisorV2` carries two MLIR values (encoded divisor and scalar),
   while its predecessor carried one. Custom `__new_from_mlir_values__` methods
