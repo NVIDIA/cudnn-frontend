@@ -2455,6 +2455,44 @@ def test_sdpa_mxfp8_fwd_paged_pinned_frost_L0(env_info, case_id, batches, h_q, h
     _run_mxfp8_paged(test, (request.node.name, len(MXFP8_PAGED_PINNED_CASES)), request, cudnn_handle)
 
 
+@pytest.mark.L0
+def test_sdpa_mxfp8_fwd_narrow_band_phantom_frost_L0(env_info, request, cudnn_handle):
+    """A narrow top-left band peels a head phantom KV step whose tile is also the whole unmasked band (#1604: GPU hang)."""
+    _require_frost_sm100(FROST_MXFP8_ENGINE)
+    test = SDPATestConfig(**env_info, implementation=cudnn.attention_implementation.AUTO)
+    test.cfg = ExecConfig(
+        data_type=torch.float8_e4m3fn,
+        output_type=torch.float16,
+        rng_data_seed=1058998424,
+        rng_geom_seed=1604,
+        is_alibi=False,
+        is_infer=True,
+        is_paged=False,
+        is_mxfp8=True,
+        o_block_scale=32,
+        is_bias=False,
+        is_block_mask=False,
+        is_padding=False,
+        is_ragged=False,
+        is_dropout=False,
+        is_determin=False,
+        batches=4,
+        d_qk=128,
+        d_v=128,
+        s_q=157,
+        s_kv=545,
+        h_q=4,
+        h_k=4,
+        h_v=4,
+        diag_align=cudnn.diagonal_alignment.TOP_LEFT,
+        left_bound=1,
+        right_bound=29,
+        rescale_threshold=2.0,
+    )
+    test.cfg.fill_derived_fields()
+    _run_mxfp8_paged(test, (request.node.name, 1), request, cudnn_handle)
+
+
 # # ==================================
 # # L0 MXFP8 bprop tests
 # # ==================================
