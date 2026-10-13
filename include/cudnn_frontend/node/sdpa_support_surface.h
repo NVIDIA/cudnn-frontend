@@ -1131,9 +1131,9 @@ SDPA_backward_attributes::verify_sdpa_backward_support_surface_for_implementatio
             // Deterministic dQ, via the engine's STAGES knob pinned by the node: kv-ordered workspace reduction on
             // SM90, split dK/dV and dQ kernels on SM10x, and the dS workspace with a post-kernel dQ matmul on SM8x /
             // SM12x (the SM80 variant).
-            if (is_deterministic_algorithm && effective_cudnn_ver < 92800) {
+            if (is_deterministic_algorithm && effective_cudnn_ver < 92900) {
                 return {error_code_t::GRAPH_NOT_SUPPORTED,
-                        "Unified SDPA backward node supports the deterministic algorithm from cuDNN 9.28"};
+                        "Unified SDPA backward node supports the deterministic algorithm from cuDNN 9.29"};
             }
             // d = 256 on SM10x is served by the unified backward only through the 2-CTA split kernels (three stages),
             // which the backend does not have yet; keep it on the composite path until then.
