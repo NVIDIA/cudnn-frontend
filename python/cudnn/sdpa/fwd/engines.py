@@ -670,14 +670,14 @@ def _prepared_decline_reason(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     if facts.o_block_scale and (facts.thd or facts.has_paged_kv or (split_kv or 1) > 1 or facts.shape_overrides or facts.has_epilogue_gate):
         return "prepared block-scaled outputs require fixed dense unsplit plans"
     if facts.is_mxfp8 and (
-        capabilities.sm_lo not in (100, 107)
+        capabilities.sm_lo not in (100, 107, 120)
         or (capabilities.sm_lo == 107 and (split_kv or 1) > 1)
         or not capabilities.is_mxfp8
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
         or (facts.has_epilogue_gate and capabilities.sm_lo != 107)
         or (facts.shape_overrides and not facts.thd)
     ):
-        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, and SM107 fixed dense or bounded THD scalar outputs"
+        return "prepared MXFP8 serves SM100 fixed dense or bounded THD, SM107 fixed dense or bounded THD scalar outputs, and SM120 fixed dense or THD plans"
     if facts.is_fp8 and (
         capabilities.sm_lo not in (100, 107, 120)
         or facts.dtype_o not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2, cudnn.data_type.FP4_E2M1)
@@ -2818,6 +2818,49 @@ def _sm120_fp8_spec() -> EngineSpec:
     )
 
 
+def _sm120_mxfp8_spec() -> EngineSpec:
+    """SM120 block-scaled MXFP8 engine (E4M3/E5M2 + per-32-block E8M0 SF, FP16/BF16/FP8 out)."""
+    from cudnn.sdpa.fwd.config_sm120 import FP8_GENERAL_HEAD_TILES
+
+    return EngineSpec(
+        name="sdpa_fwd_prefill_sm120_mxfp8",
+        capabilities=Capabilities(
+            sm_lo=_BLACKWELL_GEFORCE[0],
+            sm_hi=_BLACKWELL_GEFORCE[1],
+            phase="prefill",
+            d_shapes=frozenset((tq, tv) for tq in FP8_GENERAL_HEAD_TILES for tv in FP8_GENERAL_HEAD_TILES),
+            # No floors: the d512 flavor is per-tensor only, and the smallest
+            # covering general tile pads at most 16 columns per side.
+            d_envelope_floors=(),
+            d_pad_multiple=16,  # TMA 16-byte global-stride rule at 1 byte/elem
+            dtypes=frozenset({cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            out_dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2}),
+            o_block_scales=frozenset({0, 32}),
+            is_mxfp8=True,
+            causal=True,
+            bottom_right=True,
+            swa=True,
+            right_band_widening=True,
+            padded=True,
+            sink=True,
+            stats=True,
+            stats_log2=True,
+            lse_optional=True,
+            padded_stats=True,
+            thd=True,
+            skv_tile=0,
+            layouts=frozenset({"bshd", "dense_flex"}),
+            sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            split_kv_supported=True,
+            tile_ms=frozenset({64, 128}),
+            tile_ns=frozenset({64, 128}),
+            cgas=frozenset({1}),
+            pack_gqas=frozenset({False, True}),
+        ),
+        lower=partial(lower_dsl_prefill, api_type=_SM120),
+    )
+
+
 def _sm90_spec() -> EngineSpec:
     """D512 tile with TMA padding; the adapter declines unserved native declarations at build."""
     from cudnn.sdpa.fwd.config_sm90 import D_ALIGN, D_TILE, TILE_M, TILE_N
@@ -2875,6 +2918,7 @@ ENGINE_SPECS = (
     _sm107_mxfp8_spec(),
     _sm120_spec(),
     _sm120_fp8_spec(),
+    _sm120_mxfp8_spec(),
     _sm80_spec(),
     _sm90_spec(),
 )

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Pointer host shared by SM120 half and per-tensor FP8 templates."""
+"""Pointer host shared by SM120 half and per-tensor FP8 templates; the MXFP8 host
+(``prepared_mxfp8_host.py``) binds its Q/K/V/O/LSE operands through ``_operands``."""
 
 from typing import Optional, Tuple
 

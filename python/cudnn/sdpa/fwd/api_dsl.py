@@ -274,6 +274,7 @@ _SM120_KERNEL_FILES = {
     None: "sm120/prefill_f16.py",
 }
 _SM120_FP8_KERNEL_FILES = {_SM120_D512_FLAVOR: "sm120/prefill_d512_fp8.py", None: "sm120/prefill_fp8.py"}
+_SM120_MXFP8_KERNEL_FILES = {None: "sm120/prefill_mxfp8.py"}
 
 
 _SM120_DTYPE_QKV_CODE = {
@@ -644,11 +645,12 @@ def _load_sm100_kernel_module(flavor: tuple[int, int], params: Sm100TemplatePara
     return _load_kernel_template(filename, params, tag)
 
 
-def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False):
-    tag = "sdpa_fwd_sm120_fp8" if fp8 else "sdpa_fwd_sm120"
+def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120TemplateParams, fp8: bool = False, pertensor: bool = True):
+    files = (_SM120_FP8_KERNEL_FILES if pertensor else _SM120_MXFP8_KERNEL_FILES) if fp8 else _SM120_KERNEL_FILES
+    tag = f"sdpa_fwd_sm120_{'fp8' if pertensor else 'mxfp8'}" if fp8 else "sdpa_fwd_sm120"
     if flavor is not None:
         tag = f"{tag}_{_flavor_tag(flavor)}"
-    return _load_kernel_template((_SM120_FP8_KERNEL_FILES if fp8 else _SM120_KERNEL_FILES)[flavor], params, tag=tag)
+    return _load_kernel_template(files[flavor], params, tag=tag)
 
 
 # SM100/SM107/SM120 fold attn_scale into exp2 after an unscaled, -inf-masked running max: 0 * -inf (#1435).
@@ -1768,7 +1770,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             self._fp8 and (int(d_qk), int(d_v)) not in fp8_shapes and not _fp8_envelope_ok,
             f"{'FP8' if self._pertensor else 'MXFP8'} (E4M3/E5M2 inputs) requires a native shape in {sorted(fp8_shapes)}"
             + (
-                f" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16; " f"floors {sorted(_SM100_FP8_ENVELOPE_FLOORS.items())})"
+                f" — or, dense only, its envelope (head dims <= a flavor shape, multiples of 16; floors {sorted(_SM100_FP8_ENVELOPE_FLOORS.items())})"
                 if self._pertensor
                 else " (no envelope padding)"
             )
@@ -2171,7 +2173,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         _thd_fp8_shapes = set(_SM100_FP8_KERNEL_FILES if self._pertensor else _SM100_MXFP8_KERNEL_FILES) - {(64, 64)}
         self._not_implemented_error_if(
             self.thd and self._fp8 and (int(d_qk), int(d_v)) not in _thd_fp8_shapes,
-            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; " f"got (D_QK={d_qk}, D_V={d_v})",
+            f"THD/varlen on this quantized path supports {sorted(_thd_fp8_shapes)}; got (D_QK={d_qk}, D_V={d_v})",
         )
         # THD on the Rubin line: the per-tensor FP8 kernels at every ported
         # shape (SM107_FP8_THD_SHAPES: d128, d192xd128, d256, d512), the
@@ -4143,6 +4145,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     knobs remain compile-time constants. Half dense split-KV also uses this
     entry, retaining batch/Q size; FP8 split and block-scaled O remain tensor entries.
 
+    FP8 Q/K/V constructed without ``pertensor_fp8`` select block-scaled MXFP8
+    (the ``sdpa_mxfp8`` op): ``execute()`` takes ``sf_q`` / ``sf_k`` / ``sf_v``
+    E8M0 scale factors in the F8_128x4 order instead of per-tensor descales,
+    on the MXFP8 template ``sm120/prefill_mxfp8.py`` (both head dims up to
+    256, multiples of 16).
+    Native layouts bind through the prepared MXFP8 entry and conversion layouts
+    through the staged forward (the scale tensors bind unchanged). A
+    block-scaled MXFP8 O (E4M3 + UE8M0 per 32, ``sample_sf_o``, with an
+    optional global ``sample_scale_o``) is served as on the per-tensor path;
+    the d512 flavor and the FP4 (NVFP4) O are per-tensor only.
+
     ``scale_softmax`` is a runtime parameter. Dtype, head geometry, tile sizes,
     masks and length-tensor / sink / THD presence specialize every path. Legacy
     tensor entries additionally specialize dense batch and sequence extents.
@@ -4278,11 +4291,13 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._fp8 = self.dtype in _SM100_FP8_DTYPES
         # Kernel flavor (config_sm120.F16_FLAVORS / FP8_FLAVORS); None = the general template.
         self.flavor = _sm120_pick_flavor(int(d_q), int(d_v), self._fp8)
-        # Block-scaled O (sf_o): per-tensor FP8, d_v = 128, dense/unsplit/unpacked.
+        # Block-scaled O (sf_o): FP8 inputs, d_v = 128, dense/unsplit/unpacked; the
+        # FP4 (NVFP4) O is per-tensor FP8 only.
         self._dtype_o_code = _SM120_DTYPE_QKV_CODE.get(self.o_desc.dtype)
         if self.sf_o_desc is not None or self.o_desc.dtype == _torch_fp4():
-            self._not_implemented_error_if(not (self._fp8 and self._pertensor), "a block-scaled O (sf_o / FP4 O) is served by the per-tensor FP8 path only")
+            self._not_implemented_error_if(not self._fp8, "a block-scaled O (sf_o / FP4 O) is served by the quantized paths (per-tensor FP8, MXFP8) only")
             if self.o_desc.dtype == _torch_fp4():
+                self._not_implemented_error_if(not self._pertensor, "an FP4 (NVFP4) O is served by the per-tensor FP8 path only")
                 self._value_error_if(self.sf_o_desc is None, "an FP4 (float4_e2m1fn_x2) O requires sample_sf_o (E4M3 scale factors, one per 16 d elements)")
                 self._check_dtype(self.sf_o_desc, torch.float8_e4m3fn, name="sf_o")
                 self.o_block_scale, self._dtype_o_code = 16, DTYPE_O_NVFP4
@@ -4349,12 +4364,17 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             )
         if self._fp8:
             self._value_error_if(
-                not self._pertensor,
-                "SM120 fp8 serves the per-tensor SDPA_FP8 op only (no MXFP8 cell)",
-            )
-            self._value_error_if(
                 d_q % 16 != 0 or d_v % 16 != 0,
                 f"SM120 fp8 requires D_QK/D_V multiples of 16, got ({d_q}, {d_v})",
+            )
+        if self._fp8 and not self._pertensor:
+            self._not_implemented_error_if(
+                self.flavor is not None,
+                f"SM120 MXFP8 serves head dimensions up to {_SM120_FP8_GENERAL_HEAD_TILE_MAX}; got ({d_q}, {d_v})",
+            )
+            self._value_error_if(
+                self.has_scale_o and not self.o_block_scale,
+                "the MXFP8 scale_o is accepted only together with sf_o (block-scaled O)",
             )
 
         self._value_error_if(
@@ -4412,8 +4432,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         d_vp = -(-d_v // granule) * granule
 
         def _smem_bytes(kv_tile: int) -> int:
-            # FP8 stages a byte per KV element but still writes O in half.
-            return _sm120_smem_bytes(d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize)
+            # FP8 stages a byte per KV element but still writes O in half; MXFP8
+            # adds the K/V scale tiles.
+            return _sm120_smem_bytes(
+                d_qp, d_vp, self.q_tile, kv_tile, self.dtype.itemsize, 2 if self._fp8 else self.dtype.itemsize, mxfp8=self._fp8 and not self._pertensor
+            )
 
         if self.tile_n is None:
             # Pick the largest KV tile in the kernel table that fits this device.
@@ -4490,7 +4513,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if not self._can_prepare_layout():
             from .prepared_staged_forward import compile_plan
 
-            self._prepared_fp8 = False
+            self._prepared_fp8 = self._prepared_mxfp8 = False
             self._staged_spec = compile_plan(self)
             self._compiled_kernel = self._staged_spec.core.owner
             self._logger.debug("compile completed")
@@ -4536,11 +4559,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             split_kv=self.split_kv,
             negate_scores=self._score_negated,
         )
-        self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8)
+        self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8, pertensor=self._pertensor)
         self._dense_spec = self._thd_spec = None
         direct_layout = self._can_prepare_layout()
         self._prepared_fp8 = self._can_prepare_fp8()
-        if not ((not self._fp8 or self._prepared_fp8) and direct_layout):
+        self._prepared_mxfp8 = self._can_prepare_mxfp8()
+        if not ((not self._fp8 or self._prepared_fp8 or self._prepared_mxfp8) and direct_layout):
             raise NotImplementedError("SM120 forward requires a supported prepared pointer specialization")
         from cudnn.sdpa.fwd.prepared import build_dense_spec, build_thd_spec
 
@@ -4564,8 +4588,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                     "has_amax": self.has_amax_o,
                     "scale_o_in_combine": self._split_scale_o(),
                     **({"sfo_geometry": self._sfo_geometry} if self.o_block_scale else {}),
+                    # MXFP8 input: the block-scaled O's optional global scale.
+                    **({"has_scale_o": bool(self.o_block_scale and self.has_scale_o)} if self._prepared_mxfp8 else {}),
                 }
-                if self._prepared_fp8
+                if (self._prepared_fp8 or self._prepared_mxfp8)
                 else {}
             ),
             persistent_ctas=self._persistent_ctas(self.q_desc.device) if self.flavor == _SM120_D512_FLAVOR else 0,
@@ -4605,9 +4631,11 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
     ) -> None:
         """Execute tensors matching the compiled specialization.
 
-        ``sf_o``: the block-scaled O scale-factor buffer (per-tensor FP8 with
+        ``sf_o``: the block-scaled O scale-factor buffer (FP8 or MXFP8 with
         ``sample_sf_o``); its bytes are laid out per the declared geometry.
-        Prepared FP8, half THD, split-KV and dense layout conversions require caller-owned ``workspace``
+        On MXFP8, ``scale_o`` is that O's optional global scale (bound exactly
+        when constructed with ``sample_scale_o``).
+        Prepared FP8 / MXFP8, half THD, split-KV and dense layout conversions require caller-owned ``workspace``
         of at least ``scratch_workspace_bytes()`` bytes, contiguous, 16-byte
         aligned and on the Q device. Graph callers use ``get_workspace_size()``.
         """
@@ -4643,18 +4671,34 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         self._value_error_if(scale_val == 0, _ZERO_SCALE_UNSUPPORTED)
         self._value_error_if((scale_val < 0) != self._score_negated, "attn_scale sign must match the compiled plan's (#1435)")
         scale_val = abs(scale_val)
+        mxfp8 = self._fp8 and not self._pertensor
+        self._value_error_if(
+            mxfp8 and any(t is not None for t in (descale_q, descale_k, descale_v)),
+            "SM120 MXFP8 takes block scale factors (sf_q / sf_k / sf_v), not per-tensor descales",
+        )
+        self._value_error_if(
+            mxfp8 and (scale_o is not None) != bool(self.o_block_scale and self.has_scale_o),
+            "the SM120 MXFP8 scale_o is the block-scaled O's global scale: pass it exactly when constructed with sample_sf_o and sample_scale_o",
+        )
+        if mxfp8:
+            quant = dict(sf_q=sf_q, sf_k=sf_k, sf_v=sf_v, amax_o=amax_o, sf_o=sf_o, scale_o=scale_o)
+        elif self._fp8:
+            quant = dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o)
+        else:
+            quant = {}
         if getattr(self, "_staged_spec", None) is not None:
             from .prepared_staged_forward import execute as execute_staged
 
-            self._value_error_if(any(t is not None for t in (sf_q, sf_k, sf_v)), "SM120 staged forward does not accept MXFP8 input scales")
+            self._value_error_if(
+                not mxfp8 and any(t is not None for t in (sf_q, sf_k, sf_v)),
+                "SM120 staged forward takes MXFP8 input scales on MXFP8 plans only",
+            )
             tensors = dict(q=q_tensor, k=k_tensor, v=v_tensor, o=o_tensor, lse=lse_tensor, sinks=sinks, seq_q_lens=seq_q_lens, seq_kv_lens=seq_kv_lens)
-            if self._fp8:
-                tensors.update(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o)
-            execute_staged(self, tensors, workspace, current_stream, scale_val)
+            execute_staged(self, {**tensors, **quant}, workspace, current_stream, scale_val)
             return
         if self._fp8:
             self._value_error_if(
-                any(t is not None for t in (sf_q, sf_k, sf_v)),
+                not mxfp8 and any(t is not None for t in (sf_q, sf_k, sf_v)),
                 "SM120 fp8 is per-tensor (scalar descales); block-scale SF tensors are MXFP8-only",
             )
             self._execute_fp8_prepared(
@@ -4666,12 +4710,12 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
                 sinks,
                 seq_q_lens,
                 seq_kv_lens,
-                dict(descale_q=descale_q, descale_k=descale_k, descale_v=descale_v, scale_o=scale_o, amax_o=amax_o, sf_o=sf_o),
+                quant,
                 scale_val,
                 workspace,
                 current_stream,
             )
-            self._logger.debug("execute (SM120 FP8 per-tensor) completed")
+            self._logger.debug("execute (SM120 MXFP8) completed" if mxfp8 else "execute (SM120 FP8 per-tensor) completed")
             return
         scale_softmax_log2 = scale_val * math.log2(math.e)
         if self._dense_spec is not None:
@@ -4781,7 +4825,10 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         return self.thd or all(self._prepared_operand_layout(desc) is not None for desc in operands)
 
     def _can_prepare_fp8(self):
-        return self._fp8 and (not self.o_block_scale or self._can_prepare_block_output()) and self._can_prepare_layout()
+        return self._fp8 and self._pertensor and (not self.o_block_scale or self._can_prepare_block_output()) and self._can_prepare_layout()
+
+    def _can_prepare_mxfp8(self):
+        return self._fp8 and not self._pertensor and (not self.o_block_scale or self._can_prepare_block_output()) and self._can_prepare_layout()
 
     def _prepared_quant_offset(self):
         if self.split_kv > 1:
@@ -4799,7 +4846,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             from .prepared_staged_forward import workspace_bytes
 
             return workspace_bytes(self)
-        if self._prepared_fp8 if compiled else self._can_prepare_fp8():
+        if (self._prepared_fp8 or self._prepared_mxfp8) if compiled else (self._can_prepare_fp8() or self._can_prepare_mxfp8()):
             return self._prepared_quant_offset() + ws_align(8)
         if self.thd:
             # [meta(seq_kv, cu_q, cu_k)].
@@ -5152,7 +5199,7 @@ class SdpaFwdDslSm80(SdpaFwdDsl):
 
         self._not_implemented_error_if(
             self.thd or self.cu_seq_q_lens or self.cu_seq_kv_lens,
-            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; " "sdpa_fwd_wrapper_sm80's varlen path launches them directly",
+            "SdpaFwdDslSm80 does not serve packed THD / cu_seq_len graphs; sdpa_fwd_wrapper_sm80's varlen path launches them directly",
         )
         self._not_implemented_error_if(
             self.window_size_right is not None and not self.is_causal,
