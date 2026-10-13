@@ -138,6 +138,14 @@ class _T:
         return True
 
 
+@pytest.fixture
+def sm107_host_target(monkeypatch):
+    """Model the compiler target for host contracts; native execution and target-decline tests use their own gates."""
+    import cudnn.frost.buffers as buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 def _operands(B=1, S=8, H=24, KH=2, SKV=None, dtype="torch.bfloat16", top_k=512):
     SKV = S if SKV is None else SKV
     q = _T((B, S, H, D), (S * H * D, H * D, D, 1), dtype)
@@ -153,7 +161,7 @@ def _pool_strides(KH, P, hnd):
 
 @pytest.mark.parametrize("operand", ["k", "v"])
 @pytest.mark.parametrize("KH,head_stride", [(2, 2**32 + D), (3, 2**30 + D)])
-def test_gather_column_range_checks_each_operand(operand, KH, head_stride):
+def test_gather_column_range_checks_each_operand(operand, KH, head_stride, sm107_host_target):
     """Both the stride itself and the head-index product must fit the gather descriptor's Int32 column coordinate."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
@@ -165,7 +173,7 @@ def test_gather_column_range_checks_each_operand(operand, KH, head_stride):
 
 @pytest.mark.parametrize("kind", ["expanded", "strided", "overlapping"])
 @pytest.mark.parametrize("thd", [False, True])
-def test_workspace_requires_contiguous_backing_storage(kind, thd):
+def test_workspace_requires_contiguous_backing_storage(kind, thd, sm107_host_target):
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     args = _operands(B=1, S=1, H=2, KH=1, top_k=64)
@@ -227,7 +235,7 @@ def _device_validation_plan(operand):
 
 @pytest.mark.parametrize("operand", ["q", "k", "v", "o", "lse", "block_ids", "block_lens", "seq_kv_lens", "block_table", "seq_q_lens", "gate", "workspace"])
 @pytest.mark.parametrize("binding", ["declared", "rebound"])
-def test_execute_rejects_cpu_storage_before_pointer_lowering(operand, binding, monkeypatch):
+def test_execute_rejects_cpu_storage_before_pointer_lowering(operand, binding, monkeypatch, sm107_host_target):
     import cutlass.cute.runtime as runtime
 
     plan = _device_validation_plan(operand)
@@ -250,7 +258,7 @@ def test_execute_rejects_cpu_storage_before_pointer_lowering(operand, binding, m
 
 @pytest.mark.parametrize("operand", ["q", "k", "v", "o", "lse", "block_ids", "block_lens", "seq_kv_lens", "block_table", "seq_q_lens", "gate", "workspace"])
 @pytest.mark.parametrize("device", ["cpu", "cuda:1"])
-def test_declarations_reject_non_cuda_or_mixed_devices(operand, device):
+def test_declarations_reject_non_cuda_or_mixed_devices(operand, device, sm107_host_target):
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
 
     plan = _device_validation_plan(operand)
@@ -263,7 +271,7 @@ def test_declarations_reject_non_cuda_or_mixed_devices(operand, device):
 
 
 @pytest.mark.parametrize("declared_device", [None, "cuda:1"])
-def test_compilation_and_launch_preserve_the_declared_or_resolved_device(declared_device, monkeypatch):
+def test_compilation_and_launch_preserve_the_declared_or_resolved_device(declared_device, monkeypatch, sm107_host_target):
     """Intercept context changes/compilation: no second GPU or invalid launch is needed to prove context ownership."""
     from contextlib import contextmanager
     from types import SimpleNamespace
@@ -312,7 +320,7 @@ def test_compilation_and_launch_preserve_the_declared_or_resolved_device(declare
     assert current[0] == 1 - expected
 
 
-def test_compilation_bypasses_argument_only_caches_across_devices(monkeypatch):
+def test_compilation_bypasses_argument_only_caches_across_devices(monkeypatch, sm107_host_target):
     from contextlib import contextmanager
     from functools import lru_cache
     from types import SimpleNamespace
@@ -374,7 +382,7 @@ def _paged_operands(B=1, S=64, H=24, KH=2, P=16, dtype="torch.bfloat16", top_k=5
     return o
 
 
-def test_adapter_accepts_the_record_and_builds_the_params():
+def test_adapter_accepts_the_record_and_builds_the_params(sm107_host_target):
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     a = SparseGqaFwdDslSm107(**_operands())
@@ -386,7 +394,7 @@ def test_adapter_accepts_the_record_and_builds_the_params():
 
 @pytest.mark.parametrize("P", [16, 64, 48])
 @pytest.mark.parametrize("hnd", [True, False], ids=["HND", "NHD"])
-def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd):
+def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd, sm107_host_target):
     """``paged_kv=True`` with pools, a table and lengths is served (the record claims it); the template is the paged
     specialization with the lengths present; the per-operand row terms the kernel takes come from the strides: an HND pool
     folds the head into the row (``rows_per_head = P``, column head stride 0), an NHD pool keeps it in the column
@@ -427,7 +435,7 @@ def _decode_operands(B=1, S=1, H=24, KH=2, SKV=8192, dtype="torch.bfloat16", top
 
 @pytest.mark.parametrize("split_kv", [1, 2, 17])
 @pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged16"])
-def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged):
+def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged, sm107_host_target):
     """The decode form (``list_per_sequence=True, bottom_right=True[, split_kv=S]``): accepted at ``S_q`` 1..4 over a dense tensor
     or paged pools, the three arms in the template record, a split's gate routed to the COMBINE (``epilogue_gate`` False in the
     record while the gate operand is kept), the workspace = the two fp32 partial slabs (+ the final-LSE scratch without an LSE),
@@ -470,7 +478,7 @@ def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged):
     assert (b.template_params().bottom_right, b.template_params().qsa_list_per_sequence) == (True, False)
 
 
-def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
+def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed(sm107_host_target):
     """A negative attn_scale is SERVED by the sparse core, not declined: the adapter keeps the sign (``scale`` is what the kernel
     multiplies every raw score by before its column max) and never raises the dense line's ``TemplateParams.negate_scores``
     (BMM1 negating Q at |scale|), which the sparse body does not consume -- so neither path drops the sign.  The Rubin cell
@@ -591,7 +599,7 @@ def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
         (lambda o: o.update(q=_T((1, 8, 24, D), (8 * (24 * D + 4), 24 * D + 4, D, 1), "torch.bfloat16")), ValueError, "multiples of 8 elements"),
     ],
 )
-def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word):
+def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word, sm107_host_target):
     """Every field of the record has a typed decline naming the feature (NotImplementedError = an unserved feature,
     ValueError = a malformed operand); nothing falls through to the kernel."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
@@ -664,7 +672,7 @@ def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word):
         (lambda o: o.update(k=_T((6, 2, 16, D), _pool_strides(2, 16, True), "torch.float16")), ValueError, "dtype"),
     ],
 )
-def test_adapter_paged_form_checks(mutate, exc, word):
+def test_adapter_paged_form_checks(mutate, exc, word, sm107_host_target):
     """Every malformed paged request is refused by name before any kernel import: the page size (the one unserved FORM, a
     NotImplementedError), a missing table or length, a malformed table, and every pool stride the 2-D gather map cannot
     express (the page axis, the KV head count, the token / page / head strides, the head dim, the dtype)."""
@@ -676,7 +684,7 @@ def test_adapter_paged_form_checks(mutate, exc, word):
         SparseGqaFwdDslSm107(**o).check_support()
 
 
-def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration():
+def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration(sm107_host_target):
     """The mirror image: ``block_table`` / ``page_size`` belong to the paged read; a dense declaration refuses them rather than
     ignoring them, and a dense declaration refuses a table at execute (never a silent re-specialization)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
@@ -695,7 +703,7 @@ def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration():
         a._bind("block_table", _T((1, 2), (2, 1), "torch.int32"), a.block_table, required=False)
 
 
-def test_adapter_accepts_a_packed_thd_request_and_sizes_its_workspace():
+def test_adapter_accepts_a_packed_thd_request_and_sizes_its_workspace(sm107_host_target):
     """``thd=True`` on packed operands (batch extent 1) with the two length tensors -- per-sequence ``[B]`` or cumulative
     ``[B + 1]`` per flag -- is served: the params carry ``thd_varlen`` (and the per-batch KV lengths the arm forces), the
     workspace is the THD metadata (``4 B + 4`` int32 words, 16-byte rounded), and the dense request keeps ``thd_varlen`` off."""
@@ -721,7 +729,7 @@ def test_adapter_accepts_a_packed_thd_request_and_sizes_its_workspace():
     assert a.check_support() and a.scratch_workspace_bytes() == 0 and not a.template_params().thd_varlen
 
 
-def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1():
+def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1(sm107_host_target):
     """The gather map is 2-D (tokens of every batch as rows): a batch stride other than S_kv x the token stride has no row
     coordinate -- declined at B >= 2, irrelevant at B == 1."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
@@ -2201,7 +2209,7 @@ def test_thd_block_lens_absent_uses_the_derived_count():
 
 
 # ============================================================================ host: the fused epilogue gate's claims and pins
-def test_adapter_accepts_the_gate_operand_and_selects_the_gated_specialization():
+def test_adapter_accepts_the_gate_operand_and_selects_the_gated_specialization(sm107_host_target):
     """The record claims ``epilogue_gate``: a request WITH the gate operand (O-shaped in Q's dtype at its own strides -- here
     the slab's GATE columns at a padded token stride) is served and compiles the gated specialization
     (``TemplateParams.epilogue_gate``); a request without it compiles the ungated one.  The gate's dtype must be Q's."""
