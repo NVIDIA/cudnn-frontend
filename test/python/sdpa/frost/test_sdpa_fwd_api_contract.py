@@ -82,11 +82,24 @@ def test_mxfp8_omitted_scale_o_is_compiled_out_not_a_cached_dummy(monkeypatch):
     assert arguments["scale_o_ptr"] is None
     # Append-only public signature: sample_scale_o closes the block-scale tail; the
     # ragged-Q decode leg's plan-time facts (defaulted) follow it, then the score side
-    # outputs (sample_score_max / sample_score_sum_exp) -- the newest tail.
+    # outputs (sample_score_max / sample_score_sum_exp), then the Rubin small tiles'
+    # resident-block operands and their knobs in landing order -- the newest tail.
     params = list(inspect.signature(SdpaFwdDsl.__init__).parameters)
     i = params.index("sample_scale_o")
     assert params[i : i + 3] == ["sample_scale_o", "ragged_divisors", "ragged_offsets_int64"], params[i : i + 4]
-    assert params[-2:] == ["sample_score_max", "sample_score_sum_exp"], params[-3:]
+    j = params.index("sample_score_max")
+    assert params[j - 1] == "ragged_offsets_int64" and params[j : j + 2] == ["sample_score_max", "sample_score_sum_exp"], params[j - 1 : j + 2]
+    assert params[j + 2 :] == [
+        "sample_bias",
+        "sample_kv_mask",
+        "n_chunk",
+        "bias_mode",
+        "bias_stages",
+        "padded_tail_form",
+        "dead_subtile_quiet",
+        "bias_max_form",
+        "softmax_wgs",
+    ], params[j + 2 :]
 
 
 def _prepared_mxfp8_compile_arguments(monkeypatch, *, pv_bf16=False):
@@ -140,8 +153,11 @@ def test_block_scaled_o_keyword_reaches_every_lowering_that_advertises_it(api_cl
     # decode leg's offset operands (defaulted None) follow it.
     exec_params = list(inspect.signature(api_cls.execute).parameters)
     tail = exec_params[exec_params.index("sf_o") :]
-    # SM100 carries the leg and, appended after it, the score side outputs; SM120 does not.
-    assert tail in (["sf_o"], ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor"]), tail
+    # SM100 carries the leg and, appended after it, the score side outputs and the resident-block operands (bias / kv_mask); SM120 does not.
+    assert tail in (
+        ["sf_o"],
+        ["sf_o", "ragged_q", "ragged_o", "ragged_lse", "score_max_tensor", "score_sum_exp_tensor", "bias_tensor", "kv_mask_tensor"],
+    ), tail
 
 
 @pytest.mark.L0

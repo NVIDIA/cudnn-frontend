@@ -1570,9 +1570,18 @@ def test_thd_stats_padded_is_appended_to_the_public_signature():
         # ... then the score side outputs (score_max / score_sum_exp) ...
         "sample_score_max",
         "sample_score_sum_exp",
-        # ... then the resident-block operands of the Rubin small tiles (the additive bias, the per-key mask), the newest tail.
+        # ... then the resident-block operands of the Rubin small tiles (the additive bias, the per-key mask) ...
         "sample_bias",
         "sample_kv_mask",
+        # ... and their knobs in landing order (the pair chunk, the bias form and ring depth, the padded-tail form, the quiet
+        # body, the row-max form, the softmax warp-group count), the newest tail.
+        "n_chunk",
+        "bias_mode",
+        "bias_stages",
+        "padded_tail_form",
+        "dead_subtile_quiet",
+        "bias_max_form",
+        "softmax_wgs",
     ], params[extension_start:]
     assert inspect.signature(SdpaFwdDsl.__init__).parameters["stats_log2"].default is False
     assert params.index("thd") + 1 == params.index("max_total_seq_len_q")
