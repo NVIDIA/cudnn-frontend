@@ -9,7 +9,7 @@ Directory-specific guides: [include/cudnn_frontend/AGENTS.md](include/cudnn_fron
 | Path | Purpose |
 |---|---|
 | `include/` | The header-only C++ library (CMake INTERFACE target `cudnn_frontend`). C++17. |
-| `python/` | pybind11 bindings (`python/*.cpp`, `python/pygraph/`) + pure-Python `python/cudnn/` package |
+| `python/` | nanobind bindings (`python/*.cpp`, `python/pygraph/`) + pure-Python `python/cudnn/` package |
 | `python/cudnn/<op>/` | Frontend-only OSS CuTeDSL kernels (GEMM fusions, grouped GEMM, BSA/DSA/NSA, SDPA) |
 | `samples/` | C++ samples (Catch2 binaries `samples`, `legacy_samples`) and Python notebooks |
 | `test/` | `test/cpp` (Catch2 binary `tests`) and `test/python` (pytest) |
@@ -22,7 +22,7 @@ Directory-specific guides: [include/cudnn_frontend/AGENTS.md](include/cudnn_fron
 ## Environment requirements
 
 - NVIDIA GPU required for essentially all tests and samples (SDPA/OSS kernels need Hopper SM90 or Blackwell SM100+).
-- CUDA toolkit (`nvcc`), cuDNN **9.x** backend (headers + libs), CMake ≥ 3.23, a C++17 compiler.
+- CUDA toolkit (`nvcc`), cuDNN **9.x** backend (headers + libs), CMake ≥ 3.26, a C++17 compiler.
 - If cuDNN or CUDA are not in default system locations, set `CUDNN_PATH` and `CUDAToolkit_ROOT` (both honored by CMake and `setup.py`).
 - Python ≥ 3.10. `cudnn.backend_version()` gates many features at runtime (integer, e.g. 9.12.0 → `91200`); tests skip on older backends.
 
@@ -40,7 +40,7 @@ CMake options (defaults): `CUDNN_FRONTEND_BUILD_SAMPLES=ON`, `CUDNN_FRONTEND_BUI
 
 The C++ build uses `-Werror` (`/WX` on MSVC) with `-Wall -Wextra -Wpedantic` — new warnings break the build.
 
-Python (editable; compiles the pybind11 extension via CMake):
+Python (editable; compiles the nanobind extension via CMake):
 
 ```bash
 pip install -e .              # graph API + the OSS CuTeDSL kernels (nvidia-cutlass-dsl, cuda-python, tvm-ffi; framework-neutral)
