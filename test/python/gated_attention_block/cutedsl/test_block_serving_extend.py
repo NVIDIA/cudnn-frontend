@@ -30,6 +30,7 @@ the indexer band's raw-key pool.
 """
 
 import contextlib
+import inspect
 import os
 import sys
 
@@ -51,6 +52,7 @@ from cudnn.gated_attention_block import (
     index_k_raw_view,
 )
 from cudnn.gated_attention_block.api import _EXTEND_DECLINES, PAGED_KV_PAGE_ALIGN, _align_up, _CacheWrite, _cols, _Projection, _Sdpa, _SparseSdpa, _view
+from cudnn.gated_attention_block.kernels.proj_gemm import build_proj_gemm
 
 # Below FROST's CuTe DSL floor the block's stages cannot import their kernels: the module skips as a whole there (the sibling
 # block modules' convention); the typed decline itself is pinned by ``test_the_stage_declines_a_dsl_below_the_floor_by_version``.
@@ -61,6 +63,14 @@ if requirement_error:
 pytestmark = pytest.mark.L0
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
+# The capture cell (g) needs the projection GEMM driver's capture-safe route (``build_proj_gemm(capture_safe=True)``: the forced-tile JIT
+# route, no cuDNN handle at the first execute).  Where the driver has no such route, a fresh declaration's first execute inside a capture
+# is the graph route's handle creation, so the cell is skipped there instead of asserting what that tree cannot deliver; the serving
+# declaration still marks both dense projection stages capture-safe (pinned below), which the route consumes once it is in the tree.
+requires_capture_safe_gemm_route = pytest.mark.skipif(
+    "capture_safe" not in inspect.signature(build_proj_gemm).parameters,
+    reason="the projection GEMM driver has no capture_safe route on this tree (a fresh plan's first execute inside a capture takes the graph route)",
+)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -1776,6 +1786,7 @@ def test_extend_two_launches_are_bitwise():
 
 
 @requires_rubin
+@requires_capture_safe_gemm_route
 def test_extend_capture_of_the_first_execute_replays_with_new_lengths_tables_and_slots():
     """(g) vLLM's defaults: a FRESH EXTEND declaration whose FIRST execute is captured inside ``torch.cuda.graph`` on a NEW stream
     with no eager warm-up, under ``set_sync_debug_mode("error")`` (no host sync in the capture); the capture launches nothing (the

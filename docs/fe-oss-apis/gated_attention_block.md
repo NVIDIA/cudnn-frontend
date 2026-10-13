@@ -583,7 +583,8 @@ Validated on Rubin (cc 10.7) at pages 16 / 32 / 64 / 128 on all three pool layou
 entries (`kv_len = 0`, the NULL block `0`, slot `-1`), prefixes ending mid-page, tail tiles, one / three / four / eight KV tiles, pads at the
 end and in the middle of the packing, a row-sliced block table, the 2-chunk extend and the prefix-hit step against the single-shot oracle
 within the dense suite's budget (`cos >= 0.999` on `out`, `atol 2e-2` on the gated O), live rows bitwise between a bounded and a tight
-declaration, and a CUDA-graph capture of the first execute replayed over new lengths / tables / slots -- the rows of the support-matrix
+declaration, and -- with the projection GEMM driver's capture-safe route in the tree -- a CUDA-graph capture of the first execute replayed
+over new lengths / tables / slots -- the rows of the support-matrix
 tracker's `Rubin d256 gated attention block -- serving forms` section; the standalone adapter's own paged-prefill contract applies to the
 pools (`docs/operations/Attention.md`, "Paged attention").
 

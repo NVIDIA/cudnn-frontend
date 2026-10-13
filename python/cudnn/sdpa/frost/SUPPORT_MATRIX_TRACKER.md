@@ -2603,7 +2603,8 @@ NULL block); kv_len = 128 x n_kv for n_kv in {1, 2, 3, 4, 8} and the tail twin 1
 page 64; a `[:, :max_pages]` row slice of a wider block table (row stride 50) bitwise the compact table; a finite stale tail inside the last
 live page (777 vs 0) bitwise on `out`; the bounded token contract -- live rows BITWISE the tight declaration, pad rows of a sentinel-filled
 `out` EXACTLY 0 over a once-zeroed workspace (the `o` slot aliased by no other stage's scratch, pinned on the carve), a shorter second step
-leaving the previously live rows finite and the pad rows 0; two launches bitwise; the FIRST execute of a fresh declaration captured into a
+leaving the previously live rows finite and the pad rows 0; two launches bitwise; with the projection GEMM driver's capture-safe route in
+the tree (`build_proj_gemm(capture_safe=True)`; the cell skips without it), the FIRST execute of a fresh declaration captured into a
 CUDA graph on a new stream with no warm-up under `set_sync_debug_mode("error")`, replayed bitwise an eager run and then replayed over the
 next chunk's lengths / tables / slots written through the captured tensors; 16 fresh processes (one launch each, under `timeout`: n_kv in {1, 2, 4, 8} x 3 seeds at kv_len = 128 x n_kv, plus the tail twins 128 x n_kv - 37 at n_kv in {1, 3, 4, 8}; B_max 2, L2, page 64) exit 0 / 124 / other = 16 / 0 / 0. `serving_envelope(geometry, dtype, device)`
 publishes the form's declines (every row reachable at declaration with the published message, pinned on the CPU) and its served verdict.

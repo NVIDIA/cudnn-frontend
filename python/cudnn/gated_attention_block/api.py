@@ -5274,11 +5274,14 @@ class GatedAttentionBlockFwd(APIBase):
                 self._quant_o = self._quant_q
             self._out_proj = _out_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
         # The SERVING declaration (kv_source="paged") is captured by a serving stack with vLLM's defaults -- the FIRST execute
-        # of a fresh declaration inside a CUDA-graph capture on a new stream, no eager warm-up -- so both dense projections
-        # take the GEMM driver's capture-safe route (build_proj_gemm(capture_safe=True): the forced-tile JIT route by
-        # construction, never a ranked list, no cuDNN handle at the first execute; a shape without a forced tile is a typed
-        # NotImplementedError at compile()).  Read by `_Projection.compile` alone (the fused norm + RoPE projection builds no
-        # build_proj_gemm plan), so the flag is set on the two dense projection stages only.
+        # of a fresh declaration inside a CUDA-graph capture on a new stream, no eager warm-up -- so both dense projection
+        # stages are declared capture-safe here.  The flag is consumed by the projection GEMM driver's capture-safe route
+        # (build_proj_gemm(capture_safe=True): the forced-tile JIT route by construction, never a ranked list, no cuDNN handle
+        # at the first execute; a shape without a forced tile is a typed NotImplementedError at compile()), which
+        # `_Projection.compile` forwards it to when the driver takes the kwarg (the CUDA-graph capture-refusal change of
+        # kernels/proj_gemm.py); on a tree without that route the flag is recorded on the stage and the projections take the
+        # driver's existing route (the serving suite's capture cell skips there).  The fused norm + RoPE projection builds no
+        # build_proj_gemm plan, so the flag is set on the two dense projection stages only.
         if self.kv_source == KV_SOURCE_PAGED:
             for st in (self._proj, self._out_proj):
                 if isinstance(st, _Projection):
