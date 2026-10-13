@@ -26,6 +26,8 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
+from ..backend_utils import row_major_layout
+from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
 
 __all__ = ["GroupedGemmBf16API"]
@@ -180,8 +182,8 @@ def _validate_output(
     tensor: torch.Tensor,
     *,
     name: str,
-    shape: Tuple[int, int, int],
-    stride: Tuple[int, int, int],
+    shape: Tuple[int, ...],
+    stride: Tuple[int, ...],
     dtype: torch.dtype,
     device: torch.device,
 ) -> None:
@@ -209,6 +211,7 @@ def _normalize_call(
     cd_major: str,
     m_aligned: int,
     framework: str,
+    b_major: str = "k",
 ) -> tuple[bool, int, int, int]:
     is_dense = b_tensor is not None
     is_discrete = b_ptrs is not None
@@ -225,8 +228,9 @@ def _normalize_call(
 
     if _convert_to_cutlass_data_type(a_tensor.dtype) is not cutlass.BFloat16:
         raise ValueError(f"a_tensor must have dtype torch.bfloat16, got {a_tensor.dtype}")
-    if len(get_shape(a_tensor)) != 3 or get_shape(a_tensor)[2] != 1:
-        raise ValueError(f"a_tensor must have shape (m, k, 1), got {get_shape(a_tensor)}")
+    a_shape = get_shape(a_tensor)
+    if len(a_shape) not in (2, 3) or (len(a_shape) == 3 and a_shape[2] != 1):
+        raise ValueError(f"a_tensor must have shape (m, k) or (m, k, 1), got {a_shape}")
     if prob_tensor is None:
         raise ValueError("prob_tensor is required")
     if cd_major != "n":
@@ -244,11 +248,15 @@ def _normalize_call(
     if compute_capability < 100:
         raise RuntimeError(f"GroupedGemmSm100 requires SM100+, found SM{compute_capability}")
 
-    tensor_m, k, _ = get_shape(a_tensor)
+    tensor_m, k = a_shape[:2]
     if tensor_m % 256 != 0:
         raise ValueError(f"a_tensor M dimension must be 256-aligned, got {tensor_m}")
-    if get_shape(prob_tensor) != (tensor_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(tensor_m, 1, 1)}, got " f"{get_shape(prob_tensor)}")
+    if get_shape(prob_tensor) not in ((tensor_m,), (tensor_m, 1, 1)):
+        raise ValueError(f"prob_tensor must have shape {(tensor_m,)} or {(tensor_m, 1, 1)}, got " f"{get_shape(prob_tensor)}")
+    if framework == "torch":
+        check_canonical_contiguous(a_tensor, b_tensor, prob_tensor)
+    elif len(a_shape) == 2:
+        raise ValueError("Canonical BF16 layouts require torch tensors")
     if _convert_to_cutlass_data_type(prob_tensor.dtype) is not cutlass.Float32:
         raise ValueError(f"prob_tensor must have dtype torch.float32, got {prob_tensor.dtype}")
     if is_dense:
@@ -260,7 +268,7 @@ def _normalize_call(
             raise ValueError(f"b_tensor must have dtype torch.bfloat16, got {b_tensor.dtype}")
         if len(get_shape(b_tensor)) != 3:
             raise ValueError(f"b_tensor must have shape (n, k, experts), got {get_shape(b_tensor)}")
-        n, b_k, experts = get_shape(b_tensor)
+        n, b_k, experts = b_nkl(b_tensor, b_major)
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
     else:
@@ -383,9 +391,9 @@ def grouped_gemm_wrapper_sm100(
         cd_major,
         m_aligned,
         framework,
+        b_major,
     )
-    expected_shape = (tensor_m, n_out, 1)
-    expected_stride = (n_out, 1, tensor_m * n_out)
+    expected_shape, expected_stride = row_major_layout(tensor_m, n_out, len(get_shape(a_tensor)) == 2)
 
     def _allocate(dtype):
         return _allocate_output(framework, expected_shape, expected_stride, dtype, a_tensor.device)
@@ -498,6 +506,8 @@ def grouped_gemm_wrapper_sm100(
         c_tensor=internal_c if generate_c else None,
     )
 
+
+grouped_gemm_wrapper_sm100.supports_canonical_layouts = True
 
 __all__ = [
     "GroupedGemmSm100",

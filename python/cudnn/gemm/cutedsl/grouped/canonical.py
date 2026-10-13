@@ -76,6 +76,14 @@ def normalize_prob(tensor):
     return False, tensor
 
 
+def live_kernel_view(tensor, normalize, canonical: bool, name: str):
+    """Kernel-facing view of an execute operand, which must use the layout the kernel was compiled for."""
+    is_canonical, view = normalize(tensor)
+    if is_canonical != canonical:
+        raise ValueError(f"{name} layout mismatch: the kernel was compiled for the {'canonical' if canonical else 'legacy'} layout")
+    return view
+
+
 def is_flat_sf(tensor) -> bool:
     """True when a scale-factor tensor is a dense C-contiguous buffer (canonical form).
 

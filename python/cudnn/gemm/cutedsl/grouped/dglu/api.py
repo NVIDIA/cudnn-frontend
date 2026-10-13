@@ -1075,8 +1075,10 @@ def _normalize_dglu_call(
             raise ValueError("round_dgrad_to_input_dtype is supported only by the BF16 kernel")
         return normalized, backend
 
-    if len(a_shape) == 2 or (is_dense and is_canonical_b(call.b_tensor)):
-        raise ValueError("Canonical layouts require the block-scaled dGLU backend")
+    if detect_framework(call.a_tensor) == "torch":
+        check_canonical_contiguous(call.a_tensor, call.b_tensor, call.prob_tensor)
+    elif len(a_shape) == 2:
+        raise ValueError("Canonical BF16 layouts require torch tensors")
     if call.activation_tensor is not None:
         if detect_framework(call.a_tensor) != "torch":
             raise ValueError("activation output currently requires torch tensors")
@@ -1101,12 +1103,11 @@ def _normalize_dglu_call(
     if n_weight <= 0 or n_weight % 32 != 0:
         raise ValueError(f"N must be positive and divisible by 32, got {n_weight}")
     two_n = 2 * n_weight
-    if get_shape(call.c_tensor) != (valid_m, two_n, 1):
-        raise ValueError(f"c_tensor must have shape {(valid_m, two_n, 1)}, got {get_shape(call.c_tensor)}")
-    if get_shape(call.prob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)}, got {get_shape(call.prob_tensor)}")
-    if get_shape(call.dprob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"dprob_tensor must have shape {(valid_m, 1, 1)}, got {get_shape(call.dprob_tensor)}")
+    if get_shape(call.c_tensor) not in ((valid_m, two_n), (valid_m, two_n, 1)):
+        raise ValueError(f"c_tensor must have shape {(valid_m, two_n)} or {(valid_m, two_n, 1)}, got {get_shape(call.c_tensor)}")
+    for name, tensor in (("prob_tensor", call.prob_tensor), ("dprob_tensor", call.dprob_tensor)):
+        if get_shape(tensor) not in ((valid_m,), (valid_m, 1, 1)):
+            raise ValueError(f"{name} must have shape {(valid_m,)} or {(valid_m, 1, 1)}, got {get_shape(tensor)}")
     if _convert_to_cutlass_data_type(call.dprob_tensor.dtype) is not cutlass.Float32:
         raise ValueError(f"dprob_tensor must have dtype torch.float32, got {call.dprob_tensor.dtype}")
     offsets_shape = get_shape(call.padded_offsets)
@@ -1164,8 +1165,7 @@ def _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, n
         # _torch_stream_context is torch-only; other frameworks never enter it.
         with _torch_stream_context(current_stream, a_tensor.device):
             d_row_tensor = torch.empty_strided(
-                (valid_m, two_n, 1),
-                (two_n, 1, valid_m * two_n),
+                *row_major_layout(valid_m, two_n, a_tensor.ndim == 2),
                 dtype=framework_dtype(d_dtype, "torch"),
                 device=a_tensor.device,
             )
@@ -1194,7 +1194,7 @@ _dglu_wrapper_memo: dict = {}
 def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = None) -> TupleDict:
     framework = detect_framework(call.a_tensor)
     valid_m = get_shape(call.a_tensor)[0]
-    n_weight = get_shape(call.b_tensor)[0] if call.b_tensor is not None else call.n
+    n_weight = b_nkl(call.b_tensor, call.b_major)[0] if call.b_tensor is not None else call.n
     two_n = 2 * n_weight
     d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
         framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, call.a_tensor, call.current_stream
@@ -1570,3 +1570,4 @@ def grouped_gemm_dglu_wrapper_sm100(
 
 
 grouped_gemm_dglu_wrapper_sm100.supports_canonical_layouts = True
+grouped_gemm_dglu_wrapper_sm100.supports_canonical_bf16 = True

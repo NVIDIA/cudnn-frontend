@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import weakref
 from typing import Literal, Optional, Tuple, Union
 
 import cutlass
@@ -17,7 +16,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _pointer_values, _validate_pointer_tensor
+from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
     canonicalize_unit_dim_strides,
@@ -30,12 +29,11 @@ from cudnn.tensor_adapter import (
     get_device,
     get_shape,
     get_strides,
-    get_version,
     is_torch_tensor,
     to_host_list,
 )
 
-from ..backend_utils import _torch_stream_context
+from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug_validate_pointer_values
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
 
@@ -120,11 +118,7 @@ class GroupedGemmWgradBf16API(APIBase):
         self._compile_wgrad_ptrs: Optional[torch.Tensor] = None
         self._single_expert_placeholder: Optional[torch.Tensor] = None
         self._live_wgrad_ptrs = None
-        self._validated_offsets: dict[int, tuple] = {}
-        self._validated_pointer_values: dict[int, tuple] = {}
         self._sample_offset_values = self._copy_values_to_host(sample_offsets)
-        self._sample_offsets_ref = weakref.ref(sample_offsets)
-        self._sample_offsets_version = get_version(sample_offsets)
         self._sample_data_ptrs = {
             name: get_data_ptr(tensor)
             for name, tensor in (
@@ -145,20 +139,6 @@ class GroupedGemmWgradBf16API(APIBase):
         return tuple(int(value) for value in to_host_list(tensor))
 
     @staticmethod
-    def _is_validation_cached(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> bool:
-        cached = cache.get(id(tensor))
-        return bool(cached and cached[0]() is tensor and cached[1] == get_version(tensor) and cached[2] == extra)
-
-    @staticmethod
-    def _remember_validation(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> None:
-        key = id(tensor)
-
-        def discard(_reference, *, cache=cache, key=key):
-            cache.pop(key, None)
-
-        cache[key] = (weakref.ref(tensor, discard), get_version(tensor), extra)
-
-    @staticmethod
     def _validate_offset_sequence(values: Tuple[int, ...], *, expert_cnt: int, tokens_sum: int) -> Tuple[int, ...]:
         if len(values) != expert_cnt:
             raise ValueError(f"sample_offsets length mismatch: expected {expert_cnt}, got {len(values)}")
@@ -175,22 +155,6 @@ class GroupedGemmWgradBf16API(APIBase):
         if not values or values[-1] != tokens_sum:
             raise ValueError(f"sample_offsets last value must equal total tokens {tokens_sum}, " f"got {values[-1] if values else None}")
         return tuple(groups)
-
-    def _validate_offsets_once(self, offsets: torch.Tensor, *, tokens_sum: int) -> None:
-        extra = (self.expert_cnt, tokens_sum)
-        if self._is_validation_cached(self._validated_offsets, offsets, extra):
-            return
-        values = self._copy_values_to_host(offsets)
-        self._validate_offset_sequence(values, expert_cnt=self.expert_cnt, tokens_sum=tokens_sum)
-        self._remember_validation(self._validated_offsets, offsets, extra)
-
-    def _validate_pointer_values_once(self, pointers: torch.Tensor) -> None:
-        if self._is_validation_cached(self._validated_pointer_values, pointers, self.expert_cnt):
-            return
-        values = _pointer_values(pointers)
-        if any(value == 0 or value % 16 != 0 for value in values):
-            raise ValueError("wgrad_ptrs entries must be non-null and 16-byte aligned")
-        self._remember_validation(self._validated_pointer_values, pointers, self.expert_cnt)
 
     @staticmethod
     def _validate_pointer_array_alignment(tensor: torch.Tensor) -> None:
@@ -302,15 +266,6 @@ class GroupedGemmWgradBf16API(APIBase):
             expert_cnt=self.expert_cnt,
             tokens_sum=tokens_sum,
         )
-        sample_offsets = self._sample_offsets_ref()
-        if sample_offsets is not None and get_version(sample_offsets) == self._sample_offsets_version:
-            self._remember_validation(
-                self._validated_offsets,
-                sample_offsets,
-                (self.expert_cnt, tokens_sum),
-            )
-        elif sample_offsets is not None:
-            self._validate_offsets_once(sample_offsets, tokens_sum=tokens_sum)
 
         if not self._kernel.can_implement(
             cutlass.BFloat16,
@@ -549,7 +504,7 @@ class GroupedGemmWgradBf16API(APIBase):
             raise ValueError("offsets_tensor must be a contiguous rank-1 int32 tensor with one entry per expert")
         if offsets_desc.device != self.a_desc.device:
             raise ValueError(f"offsets_tensor device mismatch: expected {self.a_desc.device}, got {offsets_desc.device}")
-        self._validate_offsets_once(offsets_tensor, tokens_sum=tokens_sum)
+        debug_validate_offsets(offsets_tensor, expert_cnt=self.expert_cnt, limit=tokens_sum, mode="wgrad", stream=current_stream, name="offsets_tensor")
         self._validate_data_alignment(a_tensor, "a_tensor")
         self._validate_data_alignment(b_tensor, "b_tensor")
         self._validate_data_alignment(offsets_tensor, "offsets_tensor", 4)
@@ -574,7 +529,7 @@ class GroupedGemmWgradBf16API(APIBase):
                 raise ValueError(f"wgrad_ptrs must be on {self.a_desc.device}, got {get_device(wgrad_ptrs)}")
             self._validate_pointer_array_alignment(wgrad_ptrs)
             if not generated_wgrad_ptrs:
-                self._validate_pointer_values_once(wgrad_ptrs)
+                debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
             self._record_pointer_stream(wgrad_ptrs, current_stream)
             output = wgrad_ptrs
         self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream)

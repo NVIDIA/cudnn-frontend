@@ -70,6 +70,11 @@ For padded rows `M`, reduction dimension `K`, compact gradient width `N`, and
 - `D_row`: `(M, 2N, 1)`, stride `(2N, 1, 2M*N)`, BF16/FP16/FP32;
 - caller-zeroed optional `dbias`: `(L, 2N, 1)`, stride `(2N, 1, 1)`, BF16.
 
+Torch callers may instead pass the canonical layouts: contiguous `A` `(M, K)`,
+`C` `(M, 2N)`, `prob` and `dprob` `(M,)`, and dense `B` `(L, N, K)`, or the N-major
+`(L, K, N)` buffer with `b_major="n"`. With 2-D `A`, the wrapper returns `D_row`
+`(M, 2N)`. The wrapper advertises `supports_canonical_bf16`.
+
 `padded_offsets` values and `b_ptrs` entries are a **device-data contract**: the kernel
 reads them on device, and neither `check_support()` nor `execute()` copies them to
 the host (a blocking read would serialize the launch stream and is illegal under
