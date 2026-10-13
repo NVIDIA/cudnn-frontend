@@ -265,12 +265,69 @@ def test_jax_wgrad_rejects_invalid_sf():
         jax.jit(cudnn.grouped_gemm_wgrad_jax_sm100)(**inputs)
 
 
+@pytest.mark.parametrize("b_major,fp8_output,with_prob", [("k", False, True), ("n", False, True), ("k", True, False), ("n", True, True)])
+@pytest.mark.parametrize("experts", [1, 4])
+@pytest.mark.parametrize("shared_wrapper", [False, True], ids=["jax_entry", "wrapper"])
+def test_canonical_jax_quant_parity(b_major, fp8_output, with_prob, experts, shared_wrapper):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = problem(False, experts, True, False, n=512)
+    if b_major == "n":
+        arrays["b_tensor"] = np.ascontiguousarray(arrays["b_tensor"].transpose(0, 2, 1))
+    if not with_prob:
+        del arrays["prob_tensor"]
+    if not fp8_output:
+        del arrays["norm_const_tensor"]
+    options = dict(b_major=b_major, discrete_col_sfd=fp8_output)
+    eager = partial(cudnn.grouped_gemm_quant_wrapper_sm100, sf_vec_size=32, generate_amax=False, **options)
+    reference = partial(eager, d_dtype=torch.float8_e4m3fn if fp8_output else torch.bfloat16)
+    bridge = eager if shared_wrapper else partial(cudnn.grouped_gemm_quant_jax_forward, **options)
+    bridge = partial(bridge, d_dtype=ml_dtypes.float8_e4m3fn if fp8_output else ml_dtypes.bfloat16)
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    assert_outputs(bridge(**inputs), reference(**torch_inputs(arrays)))
+    compiled = jax.jit(bridge, compiler_options={"xla_gpu_enable_command_buffer": "FUSION,CUSTOM_CALL"})
+    assert_outputs(compiled(**inputs), reference(**torch_inputs(arrays)))
+    arrays["alpha_tensor"] *= 0.5
+    inputs["alpha_tensor"] = jnp.asarray(arrays["alpha_tensor"])
+    assert_outputs(compiled(**inputs), reference(**torch_inputs(arrays)))
+
+
+@pytest.mark.parametrize(
+    "shared_wrapper,option,value",
+    [
+        (True, "sf_vec_size", 16),
+        (True, "generate_amax", True),
+        (True, "use_dynamic_sched", True),
+        (True, "row_scale_tensor", 1),
+        (True, "d_tensor", 1),
+        (True, "bias_tensor", 1),
+        (False, "b_major", "m"),
+        (False, "norm_const_tensor", None),
+    ],
+)
+def test_jax_quant_rejects_unsupported_options(shared_wrapper, option, value):
+    skip_unless_sm100()
+    import cudnn
+
+    arrays = problem(False, 1, True, False)
+    del arrays["norm_const_tensor"]
+    inputs = {name: jnp.asarray(array) for name, array in arrays.items()}
+    options = dict(sf_vec_size=32, generate_amax=False) if shared_wrapper else {}
+    # FP8 output requires norm_const.
+    options.update({"d_dtype": ml_dtypes.float8_e4m3fn} if option == "norm_const_tensor" else {}, **{option: value})
+    fn = cudnn.grouped_gemm_quant_wrapper_sm100 if shared_wrapper else cudnn.grouped_gemm_quant_jax_forward
+    with pytest.raises(ValueError, match=option):
+        fn(**inputs, **options)
+
+
 @pytest.mark.parametrize(
     "operation,rubin,blackwell",
     [
-        ("glu", "BlockScaledMoEGroupedGemmGluKernel", "BlockScaledMoEGroupedGemmGluBiasKernel"),
-        ("dglu", "BlockScaledMoEGroupedGemmDgluKernel", "BlockScaledMoEGroupedGemmDgluDbiasKernel"),
-        ("wgrad", "BlockScaledMoEGroupedGemmWgradRubinKernel", "BlockScaledMoEGroupedGemmWgradKernel"),
+        ("glu", "moe_blockscaled_grouped_gemm_glu_rubin", "moe_blockscaled_grouped_gemm_glu_bias"),
+        ("dglu", "moe_blockscaled_grouped_gemm_dglu_rubin", "moe_blockscaled_grouped_gemm_dglu_dbias"),
+        ("wgrad", "moe_blockscaled_grouped_gemm_wgrad_rubin", "moe_blockscaled_grouped_gemm_wgrad"),
+        ("quant", "moe_blockscaled_grouped_gemm_quant_rubin", "grouped_gemm_quant"),
     ],
 )
 def test_jax_kernel_dispatch(operation, rubin, blackwell, monkeypatch):
@@ -281,7 +338,7 @@ def test_jax_kernel_dispatch(operation, rubin, blackwell, monkeypatch):
     families = [("blackwell", blackwell)] + ([] if cutedsl_arch_requirement_error((10, 7)) else [("rubin", rubin)])
     for family, name in families:
         monkeypatch.setattr(api, "get_device_type", lambda: family)
-        assert getattr(api, f"{operation}_kernel_type")().__name__ == name
+        assert getattr(api, f"{operation}_kernel_type")().__module__.rsplit(".", 1)[1] == name
 
 
 def test_jax_wgrad_plan_caches_kernel_per_architecture(monkeypatch):
@@ -308,7 +365,7 @@ def test_jax_wgrad_plan_caches_kernel_per_architecture(monkeypatch):
     assert kernels[0] is kernels[2]
 
 
-def test_canonical_jax_dglu_wgrad_without_torch():
+def test_canonical_jax_dglu_wgrad_quant_without_torch():
     skip_unless_sm100()
     import os
     import subprocess
@@ -323,7 +380,7 @@ def test_canonical_jax_dglu_wgrad_without_torch():
         import ml_dtypes
         import numpy as np
         from functools import partial
-        from cudnn import grouped_gemm_dglu_wrapper_sm100, grouped_gemm_wgrad_wrapper_sm100
+        from cudnn import grouped_gemm_dglu_wrapper_sm100, grouped_gemm_quant_wrapper_sm100, grouped_gemm_wgrad_wrapper_sm100
         fp8 = ml_dtypes.float8_e4m3fn
         a = jnp.ones((256, 256), fp8)
         b = jnp.ones((1, 256, 256), fp8)
@@ -339,6 +396,9 @@ def test_canonical_jax_dglu_wgrad_without_torch():
         sf_t = jnp.full((256, 8), 127, jnp.uint8)
         out = jax.jit(wgrad)(a, a, sf_t, sf_t, offsets)
         np.testing.assert_array_equal(np.asarray(out['wgrad_tensor']).astype(np.float32), 256)
+        quant = partial(grouped_gemm_quant_wrapper_sm100, sf_vec_size=32, generate_amax=False)
+        out = jax.jit(quant)(a, sf, offsets, ones, b_tensor=b, sfb_tensor=sf)
+        np.testing.assert_array_equal(np.asarray(out['d_tensor']).astype(np.float32), 256)
         assert sys.modules['torch'] is None
     """)
     result = subprocess.run(

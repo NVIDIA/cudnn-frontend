@@ -2,6 +2,10 @@
 
 **This is an experimental API and subject to change.**
 
+## JAX support
+
+**Canonical MXFP8 (dense weights):** the `jax.jit`-compatible entry point `cudnn.grouped_gemm_quant_jax_forward` takes A `(m, k)`, B `(experts, n, k)` or column-wise `(experts, k, n)` with `b_major="n"` (the dFC1 layout), already MMA-packed E8M0 `sfa_tensor`/`sfb_tensor` bytes (physical or flat; uint8 accepted), int32 `padded_offsets`, fp32 alpha, and an optional prob `(m,)` fp32/bf16. With a BF16/FP16 `d_dtype` (default BF16) it produces D `(m, n)` only. With an FP8 `d_dtype` it requires `norm_const_tensor` `(1,)` and also produces D_col and the physical 6-D SFD buffers; `discrete_col_sfd=True` packs column scales by expert. It returns a `TupleDict` with the eager wrapper's keys; `amax_tensor` is always None. Outputs are not initialized, so rows at or past `padded_offsets[-1]` are unspecified, as in the Torch path. It runs the Rubin quant kernel on SM107 and the SM100 kernel otherwise. `grouped_gemm_quant_wrapper_sm100` dispatches JAX inputs with a dense `b_tensor` to it; set `sf_vec_size=32`, and `generate_amax=False` for a BF16/FP16 output. Bias, row scale, a caller-provided `d_tensor`, dynamic scheduling, FP4, and `sf_fp8_dtype_override` raise `ValueError`. Discrete (`b_ptrs`) weights and the `GroupedGemmQuantSm100` class stay torch-only.
+
 ## Overview
 
 **Unified Grouped GEMM + Quant fusion**: A block-scaled grouped GEMM with output quantization and per-row gating on NVIDIA Blackwell GPUs (SM100+), designed for MoE (Mixture of Experts) workloads. Implemented with CUTLASS/CUTE.

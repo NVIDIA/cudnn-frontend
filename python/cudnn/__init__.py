@@ -569,6 +569,10 @@ _LAZY_OPTIONAL_IMPORTS = {
         ".gemm.cutedsl.grouped",
         "grouped_gemm_wgrad_jax_sm100",
     ),
+    "grouped_gemm_quant_jax_forward": (
+        ".gemm.cutedsl.grouped",
+        "grouped_gemm_quant_jax_forward",
+    ),
     "discrete_grouped_gemm_swiglu_jax_sm100": (
         ".gemm.cutedsl.discrete_grouped",
         "discrete_grouped_gemm_swiglu_jax_sm100",

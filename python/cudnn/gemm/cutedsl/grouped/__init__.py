@@ -90,6 +90,7 @@ __all__ = [
     "grouped_gemm_dglu_jax_sm100",
     "grouped_gemm_dsrelu_jax_sm100",
     "grouped_gemm_wgrad_jax_sm100",
+    "grouped_gemm_quant_jax_forward",
 ]
 
 # Lazy: the jax entry points import jax/cutlass.jax, which must not be pulled in
@@ -100,6 +101,7 @@ _JAX_LAZY_EXPORTS = {
     "grouped_gemm_dglu_jax_sm100": ".dglu",
     "grouped_gemm_dsrelu_jax_sm100": ".dsrelu",
     "grouped_gemm_wgrad_jax_sm100": ".wgrad",
+    "grouped_gemm_quant_jax_forward": ".quant",
 }
 
 
