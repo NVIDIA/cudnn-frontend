@@ -4548,6 +4548,7 @@ class _ServingDecl:
     save_for_backward: bool
     return_lse: bool
     geometry: GatedAttentionBlockGeometry
+    fuse_gate: bool = False
 
 
 def _is_paged(d: _ServingDecl) -> bool:
@@ -4599,6 +4600,13 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         NotImplementedError,
         lambda d: _is_paged(d) and d.geometry.d_head != 256,
         "kv_source='paged' is validated at d_head == 256 only (the Rubin d256 paged THD leg); other head dims are a follow-up",
+    ),
+    (
+        "fuse_gate",
+        NotImplementedError,
+        lambda d: _is_paged(d) and d.fuse_gate,
+        "kv_source='paged' with fuse_gate=True: the paged THD body stage (4) binds carries no epilogue-gate seam (the packed block's gate rides "
+        "the dense THD prefill's epilogue only); the EXTEND form runs stage (5) as its own launch -- declare fuse_gate=False",
     ),
     (
         "return_lse",
@@ -4694,7 +4702,8 @@ class GatedAttentionBlockFwd(APIBase):
     the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
     (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite).  Typed declines, in
     :data:`_EXTEND_DECLINES`'s order: a dense declaration (the DECODE form, not landed), a missing bottom-right diagonal, a
-    window, another head dim, an LSE; ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse
+    window, another head dim, a fused gate (the paged body carries no gate seam; the packed block's gate rides the dense THD
+    prefill only), an LSE; ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse
     declaration's (``QsaSpec`` refuses ``thd=True``).
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
@@ -5584,6 +5593,7 @@ class GatedAttentionBlockFwd(APIBase):
             save_for_backward=self.save_for_backward,
             return_lse=self.return_lse,
             geometry=self.geom,
+            fuse_gate=self.fuse_gate,
         )
         hit = _first_serving_decline(decl)
         if hit is not None:
@@ -5639,7 +5649,8 @@ class GatedAttentionBlockFwd(APIBase):
         reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
         the device fact (Rubin, cc 10.7, the one arch every stage binds), the CuTe DSL facts (the version floor and the Rubin
         target, exactly as the stages' ``check_support`` gates them), the dtype (bf16 / f16 activations), and the EXTEND form's
-        geometry rows of :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``head_dim``; a QsaSpec geometry reads
+        geometry rows of :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``head_dim``; the knob rows -- ``return_lse``,
+        ``fuse_gate`` -- are the declaration's, listed in ``declines``; a QsaSpec geometry reads
         :data:`_QSA_THD_DECLINE`, the sparse declaration's own row the THD-only form always meets first) evaluated on
         ``geometry`` -- so ``extend.served`` is True iff a block declared as ``extend.requires`` spells it passes its
         declaration and ``check_support`` here, and ``extend.declines`` lists every typed decline the form raises at

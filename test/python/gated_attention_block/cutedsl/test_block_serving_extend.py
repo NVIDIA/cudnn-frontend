@@ -1123,6 +1123,7 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
+        "fuse_gate": lambda: _declare_extend(2, 128, max_kv_len=128, fuse_gate=True),
         "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
         "token_capacity_dense": lambda: _make_block(_SMALL_D256, 1, 64, token_capacity=64),
         "token_capacity_training": lambda: _make_packed_block(
