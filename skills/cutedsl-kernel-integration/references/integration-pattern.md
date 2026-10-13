@@ -61,7 +61,8 @@ Follow the closest template instead of inventing a new lifecycle.
   - Compile the CuTeDSL kernel once per configuration and reuse it; follow the existing template's cache strategy when applicable.
   - Accept preallocated runtime inputs/outputs and an explicit stream.
   - Allocate output tensors for common use.
-  - Return a `TupleDict` so callers can use both key access and tuple unpacking.
+  - Return a `TupleDict` from PyTorch functions so callers can use both key access and tuple unpacking.
+  - Return a plain tuple or dict from JAX functions; `jax.jit` rejects `TupleDict`, which is not a registered pytree.
   - Include auxiliary outputs in `TupleDict` with stable names and tuple order. Validate coupled optional tensors as a set, for example `bias`/`dbias`, `d_col`, `dprob`, `amax`, `sfd_row`, `sfd_col`, `linear_offset`, and workspace-backed outputs.
   - For SDPA backward wrappers, return gradients with stable keys such as `dq_tensor`, `dk_tensor`, and `dv_tensor`; make wrapper-owned workspace allocation, zeroing, and reuse explicit.
   - For paired forward/backward kernels, expose sibling APIs with shared internal helpers instead of merging incompatible public contracts.
