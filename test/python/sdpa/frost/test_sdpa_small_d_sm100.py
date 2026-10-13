@@ -11,9 +11,12 @@ Rubin threshold.
 """
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
+import torch
 
+from frost_test_utils import _SM
 from cudnn.sdpa.fwd import config_d128_family as fam
 from cudnn.sdpa.fwd import config_sm100 as c0
 from cudnn.sdpa.fwd import config_sm107 as c7
@@ -285,3 +288,143 @@ def test_the_rubin_wrappers_are_the_shared_arithmetic_at_the_rubin_budget():
         "BIAS_SWZ_BYTES",
     ):
         assert getattr(c7, name) is getattr(fam, name), name
+
+
+# --------------------------------------------------------------------------- the row and the adapter route the 32-wide tile on its dense leg only
+
+_SM100_ROW = "sdpa_fwd_prefill_sm100"
+
+
+def _sm100_spec():
+    from cudnn.sdpa.fwd import engines
+
+    return next(sp for sp in engines.ENGINE_SPECS if sp.name == _SM100_ROW)
+
+
+def _sm100_facts(d, *, s=256, b=2, h=4, **kw):
+    import cudnn
+    from cudnn.sdpa.graph_analyzer import SdpaGraphFacts
+
+    bf16 = cudnn.data_type.BFLOAT16
+    base = dict(b=b, h_q=h, h_kv=h, s_q=s, s_kv=s, d_qk=d, d_v=d, dtype=bf16, dtype_o=bf16, device_cc=(10, 0), device_sm_count=148)
+    base.update(kw)
+    return SdpaGraphFacts(**base)
+
+
+def test_the_sm100_row_serves_the_32_wide_tile_on_the_dense_leg_and_walks_past_it_otherwise():
+    """The row's claim (Rule S2: the tracker's SM100 d32 column): D <= 32 on the dense leg selects (32, 32) at cga1; THD / paged / the score
+    outputs / split-KV / PackGQA / a cga2 request walk past it onto the native d64 flavor -- the route a d <= 32 graph took before the tile."""
+    from cudnn.sdpa.fwd import engines
+    from cudnn.sdpa.fwd.api_dsl import supported_cgas_for
+    from cudnn.sdpa.fwd.engines import SdpaFwdKnobs
+
+    caps = _sm100_spec().capabilities
+    assert (32, 32) in caps.d_shapes and caps.dense_only_d_shapes == frozenset({(32, 32)}) == c0.SM100_DENSE_ONLY_D_SHAPES
+    assert dict(caps.cgas_by_d_shape)[(32, 32)] == frozenset({1}) == c0.SM100_SMALL_D_CGAS[(32, 32)]
+    for d in (8, 16, 24, 32):
+        assert engines._selected_d_shape(caps, _sm100_facts(d)) == (32, 32), d
+    assert engines._selected_d_shape(caps, _sm100_facts(40)) == (64, 64) and engines._selected_d_shape(caps, _sm100_facts(64)) == (64, 64)
+    assert engines._selected_d_shape(caps, _sm100_facts(24, thd=True)) == (64, 64)
+    assert engines._selected_d_shape(caps, _sm100_facts(24, has_score_max=True)) == (64, 64)
+    assert engines._selected_d_shape(caps, _sm100_facts(24), SdpaFwdKnobs(cga=2)) == (64, 64)
+    assert engines._selected_d_shape(caps, _sm100_facts(24), SdpaFwdKnobs(split_kv=2)) == (64, 64)
+    assert engines._selected_d_shape(caps, _sm100_facts(24), SdpaFwdKnobs(cga=1)) == (32, 32)
+    # the adapter's cga domain is the row's
+    assert supported_cgas_for((32, 32), device_cc=(10, 0), fp8=False, pertensor=False) == (1,)
+    assert supported_cgas_for((64, 64), device_cc=(10, 0), fp8=False, pertensor=False) == (1, 2)
+
+
+def _desc(shape, dtype, name):
+    from cudnn.api_base import TensorDesc
+
+    b, h, s, d = shape
+    stride = (s * h * d, d, h * d, 1)
+    return TensorDesc(
+        dtype=dtype, shape=tuple(shape), stride=stride, stride_order=TensorDesc._compute_stride_order(tuple(shape), stride), device="cuda", name=name
+    )
+
+
+def _api(d, *, s=256, h=4, dtype=torch.bfloat16, score=False, **kw):
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    q, o = (_desc((1, h, s, d), dtype, n) for n in ("q", "o"))
+    k, v = (_desc((1, h, s, d), dtype, n) for n in ("k", "v"))
+    if score:  # the two score side outputs, declared like Stats (b, h, s, 1) fp32
+        kw["sample_score_max"] = _desc((1, h, s, 1), torch.float32, "score_max")
+        kw["sample_score_sum_exp"] = _desc((1, h, s, 1), torch.float32, "score_sum_exp")
+    return SdpaFwdDslSm100(q, k, v, o, None, **kw)
+
+
+def test_the_adapter_pool_is_the_rows_twin_on_sm100(monkeypatch):
+    """The standalone adapter on a cc 10.0 device: D 8 / 24 / 32 dense land on the 32-wide tile with the record's d_flavor 32 and cga1; a
+    cga2 request, split-KV and the score side outputs land on the native d64 flavor (its own legs, unlike the Rubin d64 tile's); D 40 / 64
+    keep the native d64 flavor; the pre-tile declines (D % 8 != 0) are unchanged."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    for d in (8, 24, 32):
+        api = _api(d)
+        assert api.check_support(), d
+        assert api.flavor == (32, 32), (d, api.flavor)
+        params = api.template_params()
+        assert params.d_flavor == 32 and params.cta_mma == 1, (d, params.d_flavor, params.cta_mma)
+    for d in (40, 64):
+        api = _api(d)
+        assert api.check_support() and api.flavor == (64, 64) and api.template_params().d_flavor == 64, d
+    api = _api(24, cga=2)
+    assert api.check_support() and api.flavor == (64, 64) and api.template_params().cta_mma == 2 and api.template_params().d_flavor == 64
+    api = _api(24, split_kv=2)
+    assert api.check_support() and api.flavor == (64, 64) and api.template_params().d_flavor == 64
+    # the score side outputs walk past the tile onto the native d64 flavor, which carries no score store on this arch line
+    # (config_sm100.SM100_SCORE_STATS_SHAPES): the pre-tile typed decline, unchanged
+    with pytest.raises(NotImplementedError, match=r"score_max .* select \(64, 64\)"):
+        _api(24, score=True).check_support()
+    with pytest.raises((ValueError, NotImplementedError)):
+        _api(20).check_support()
+
+
+# --------------------------------------------------------------------------- the GPU tier (an SM100 / SM103 device; the dev box is SHARED, never a number)
+
+requires_sm100_line = pytest.mark.skipif(_SM not in (100, 103), reason="needs a cc 10.0 / 10.3 device, have " + ("none" if _SM is None else f"sm_{_SM}"))
+
+_DTYPES = [torch.float16, torch.bfloat16]
+_DTYPE_IDS = ["fp16", "bf16"]
+
+
+def _cases():
+    from small_tile_cells import CASES
+
+    return list(CASES)
+
+
+@requires_sm100_line
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("d", [8, 24, 32])
+@pytest.mark.parametrize("case", _cases())
+def test_the_32_wide_tile_matches_the_fp64_oracle_on_sm100(case, d, dtype):
+    """Every head dim the 32-wide tile serves (8 / 24 / 32 on the SM100 file's third geometry) over the degenerate-input matrix, both dtypes:
+    the plan is the row's cga1 unsplit plan, keyless rows exactly 0 / -inf, two launches bitwise, live rows against the fp64 oracle."""
+    from small_tile_cells import case_inputs, check, check_degenerate_rows, run_graph
+
+    q, k, v, kw, oracle = case_inputs(case, d, dtype)
+    out = run_graph(q, k, v, row=_SM100_ROW, **kw)
+    assert out["knobs"].cga == 1 and out["knobs"].split_kv == 1, out["knobs"]
+    check(out, oracle)
+    check_degenerate_rows(out, case)
+
+
+@requires_sm100_line
+@pytest.mark.parametrize("dtype", _DTYPES, ids=_DTYPE_IDS)
+@pytest.mark.parametrize("d", [24, 8])
+def test_padded_head_dim_is_bitwise_the_zero_padded_32_wide_tile_on_sm100(d, dtype):
+    """D = 24 / 8 on the 32-wide tile is BITWISE the explicitly zero-padded D = 32 run (the TMA zero fill IS the padding)."""
+    from small_tile_cells import case_inputs, run_graph
+
+    q, k, v, kw, _ = case_inputs("dense_nkv2", d, dtype)
+    out = run_graph(q, k, v, row=_SM100_ROW, **kw)
+
+    def pad(t):  # (b, h, s, d) view of a (b, s, h, d) buffer -> the same with d zero-padded to 32, same layout
+        bshd = torch.nn.functional.pad(t.transpose(1, 2).contiguous(), (0, 32 - d))
+        return bshd.transpose(1, 2)
+
+    out_w = run_graph(pad(q), pad(k), pad(v), row=_SM100_ROW, **kw)
+    assert torch.equal(out["o"], out_w["o"][..., :d]) and torch.equal(out["stats"], out_w["stats"])

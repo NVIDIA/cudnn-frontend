@@ -84,6 +84,7 @@ from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_it
 from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
 from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as _decode_d256_q_tile_sm107
+from cudnn.sdpa.fwd.config_sm100 import SM100_DENSE_ONLY_D_SHAPES as _SM100_DENSE_ONLY_D_SHAPES, SM100_SMALL_D_CGAS as _SM100_SMALL_D_CGAS
 from cudnn.sdpa.fwd.config_sm100 import (
     d256_mxfp8_pair_leg,
     supports_thd_split,
@@ -163,6 +164,9 @@ _SM100_KERNEL_FILES = {
     # by TemplateParams.d_flavor. d<=64 graphs used to ride the d128 envelope
     # and pay a zero-filled 128-wide MMA tile for it.
     (64, 64): "sm100/prefill_d128_f16.py",
+    # The 32-wide small tile of the same file (TemplateParams.d_flavor = 32; config_sm100.make_cfg_d32): the SM100 twin of the Rubin
+    # small tile.  A kernel-file entry only until the engine row and the flavor walk (_SM100_FLAVORS) serve it.
+    (32, 32): "sm100/prefill_d128_f16.py",
 }
 # The d512 f16/bf16 forward on the 2x2 DATAPATH (TemplateParams.mma_2x2 -> the sibling file below):
 # one pipeline per CTA on the cta_group::2 M=128 atom instead of the cga4x1 role split.  Selected by
@@ -558,6 +562,10 @@ def supported_cgas_for(flavor: tuple[int, int], *, fp8: bool, device_cc: tuple[i
         # The Rubin small head-dim tiles (the d128 file at TILE_K = TILE_O = 32 / 64): ONE constant with the config factory
         # (which refuses any other width) and the engine row's cgas_by_d_shape (rule 8b') -- cga1 for both, cga2 also at d64.
         return tuple(sorted(_SM107_SMALL_D_CGAS[flavor]))
+    if device_cc != (10, 7) and not fp8 and flavor in _SM100_DENSE_ONLY_D_SHAPES:
+        # The SM100 32-wide small tile: ONE constant with the config factory (which refuses any other width) and the engine row's
+        # cgas_by_d_shape (rule 8b') -- cga1 (at TILE_O 32 a cga2 V operand would be a 32-byte MN-major atom no kernel runs).
+        return tuple(sorted(_SM100_SMALL_D_CGAS[flavor]))
     # d64: cga1 is the tuned width (halved slabs clear the SMEM cap without the
     # Q/O alias, and a 2-CTA cluster only widens the Q rows a cluster must cover
     # under a narrow band). cga2 still builds, so both are offered.
@@ -2270,7 +2278,21 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 and (f not in _SM107_F16_SMALL_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM107_SMALL_D_CGAS[f])))
             )
         else:
-            _flavor_pool = None
+            # The SM100 f16/bf16 pool: the 32-wide small tile (the sm100 d128 file at d_flavor 32, config_sm100.SM100_DENSE_ONLY_D_SHAPES) only for a
+            # graph on its DENSE leg at a cga in its domain (SM100_SMALL_D_CGAS); every other graph walks past it onto the native d64 / d128 flavors,
+            # which carry those legs on this arch line.  The twin of the engine row's dense_only_d_shapes walk in engines._selected_d_shape (rule 8b').
+            _leg = _sm107_small_tile_leg(
+                thd=self.thd,
+                paged=self.paged,
+                split_kv=self.split_kv,
+                pack_gqa=self.pack_gqa,
+                score_stats=self.score_max_desc is not None or self.score_sum_exp_desc is not None,
+            )
+            _flavor_pool = tuple(
+                f
+                for f in tuple(sorted(_SM100_DENSE_ONLY_D_SHAPES)) + _SM100_FLAVORS
+                if f not in _SM100_DENSE_ONLY_D_SHAPES or (_leg is None and (self.cga is None or self.cga in _SM100_SMALL_D_CGAS[f]))
+            )
         self.flavor = _pick_flavor(d_qk, d_v, _flavor_pool)
         self._not_implemented_error_if(
             self.pack_gqa and self._fp8 and not self._pertensor and self.flavor != (128, 128),
@@ -3271,7 +3293,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     (
                         1
                         if (self._fp8 and self.flavor == (256, 256))
-                        or self.flavor == (64, 64)
+                        or self.flavor in ((32, 32), (64, 64))
                         or (self._device_cc == (10, 7) and self.flavor in _SM107_F16_SMALL_D_SHAPES)
                         else 2
                     )

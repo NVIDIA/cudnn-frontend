@@ -110,18 +110,20 @@ import cuda.bindings.driver as _cuda_driver  # noqa: F401  (cute.compile pulls c
 
 from dataclasses import dataclass
 
-from cudnn.sdpa.fwd.config_sm100 import TemplateParams, make_cfg_d64, make_cfg_d128
+from cudnn.sdpa.fwd.config_d128_family import d128_family_tmem_layout
+from cudnn.sdpa.fwd.config_sm100 import SM100_ARCH, TemplateParams, make_cfg_d32, make_cfg_d64, make_cfg_d128
 
 # The template loader (api_dsl._load_kernel_module) injects FROST_TEMPLATE_PARAMS
 # as a module global before this body executes; a plain import falls back to
 # the default TemplateParams so the file stays importable on its own.
 PARAMS: TemplateParams = globals().get("FROST_TEMPLATE_PARAMS", TemplateParams())
-# One pipeline, two head-dim geometries: d128 (llama) and d64 (gpt-oss class).
-# Every extent below is read off CFG, so the flavor only has to pick the Cfg --
-# see config_sm100.CfgD64 for why d64 also flips to cga1 / STAGES_KV=4.
-_MAKE_CFG = {64: make_cfg_d64, 128: make_cfg_d128}
+# One pipeline, three head-dim geometries: d128 (llama), d64 (gpt-oss class) and the 32-wide small tile (config_sm100.CfgD32; the
+# f16/bf16 small-tile forms -- the bias / kv_mask arms and their siblings -- build through config_sm100's small-tile factory at either
+# small width).  Every extent below is read off CFG, so the flavor only has to pick the Cfg -- see config_sm100.CfgD64 for why d64 also
+# flips to cga1 / STAGES_KV=4.
+_MAKE_CFG = {32: make_cfg_d32, 64: make_cfg_d64, 128: make_cfg_d128}
 if PARAMS.d_flavor not in _MAKE_CFG:
-    raise ValueError(f"prefill_d128_f16: d_flavor must be 64 or 128; got {PARAMS.d_flavor}")
+    raise ValueError(f"prefill_d128_f16: d_flavor must be 32, 64 or 128; got {PARAMS.d_flavor}")
 CFG, _TMA = _MAKE_CFG[PARAMS.d_flavor](PARAMS)
 Cfg = type(CFG)
 TMA_QK_ITERS = _TMA.QK_ITERS
@@ -393,12 +395,31 @@ V_BOXES = CFG.TILE_N // V_BOX_ROWS
 _P0_OFF = 0 if IS_TF32 else 64
 _P1_OFF = 128 if IS_TF32 else 192
 
+# TWO TMEM maps, ONE set of body sites.  The d128 flavor and the plain d64 flavor at the classic geometry (TILE_N 128, one S slot per
+# sub-tile, two sub-tiles, Q in SMEM) keep the HARD-CODED map below (S 0 / 128, P in each slot's tail, O 256 / 384, STATS in the HEAD of
+# each S slot: 512 is FULL at d128) -- their renderings are byte-identical to the committed records.  Every rendering whose geometry that
+# map cannot hold -- the 32-wide tile (a 32-column O), the 64-wide KV tile, the double-buffered S, a third sub-tile, Q in TMEM -- takes
+# the DERIVED map (config_d128_family.d128_family_tmem_layout at the SM100 512-column allocation: S[qs] = qs x S_SLOTS x TILE_N, P in
+# each slot's tail, O after the last S slot at TILE_O per sub-tile, STATS at the TOP of the allocation (480, 8 columns per sub-tile),
+# the TS arm's Q slots after the last O slot) -- the Rubin body's map, the one every small-tile seam's barrier analysis assumed, and the
+# one the config validators pin the fit of (O end <= STATS_OFF).  Both maps read through the same fields: ``stats_off = STATS_OFF + qs *
+# STATS_STRIDE`` (stride 128 = the S slot pitch on the hard-coded map, 8 = the stats slot pitch on the derived one).
+_TMEM_DERIVED = CFG.TILE_K == 32 or CFG.TILE_N != 128 or CFG.S_SLOTS != 1 or CFG.TILES_Q != 2 or CFG.Q_IN_TMEM == 1
+_TMEM = d128_family_tmem_layout(CFG, total_cols=SM100_ARCH.tmem_total_cols) if _TMEM_DERIVED else None
+if _TMEM_DERIVED and (_TMEM.O_OFF[-1] + CFG.TILE_O > _TMEM.STATS_OFF or (CFG.Q_IN_TMEM and _TMEM.Q_OFF[-1] + _TMEM.Q_COLS > _TMEM.STATS_OFF)):
+    # config_sm100's small-tile factory pins the same fit at config-build time; this is the kernel's own backstop.
+    raise ValueError(
+        f"prefill_d128_f16: the derived TMEM map S {_TMEM.S_OFF} | P {_TMEM.P_OFF} | O {_TMEM.O_OFF} (+{CFG.TILE_O}) | Q {_TMEM.Q_OFF} (+{_TMEM.Q_COLS}) must end before STATS ({_TMEM.STATS_OFF} of {_TMEM.TOTAL_COLS})"
+    )
+if _TMEM_DERIVED and IS_TF32:
+    raise ValueError("prefill_d128_f16: a 4-byte P would alias the full S slot; the derived map serves the 16-bit dtypes only")
+
 
 @dataclass(frozen=True)
 class KernelTmemLayout:
     """Column offsets for the classic 2-sub-tile SDPA pipeline.
 
-    SM100 512-col TMEM cap.  S_acc[0]=0..127,
+    SM100 512-col TMEM cap.  On the d128 flavor S_acc[0]=0..127,
     S_acc[1]=128..255, O=256..511 fill all 512 cols, so stats cannot live
     at a dedicated col 544 (off the Blackwell cap).  Instead each sub-tile's
     stats ride the FREE HEAD of its own S_acc slot (col 0 / 128) — P only
@@ -407,24 +428,38 @@ class KernelTmemLayout:
     (tmem_Stats = base + softmax_gid*128).  Safe under the existing
     mb_stat_full / mb_stat_empty handshake: correction reads that iter's
     alpha before releasing MMA to overwrite the S_acc head next iter.
+    The small-tile geometries take the DERIVED map (``_TMEM_DERIVED`` above): STATS at the top, 8 columns per sub-tile.
     """
 
-    # Blackwell SM10.0 TMEM column cap.
-    TOTAL_COLS: int = 512
+    # Blackwell SM10.0 TMEM column cap.  Alloc and dealloc pass this SAME constant.
+    TOTAL_COLS: int = SM100_ARCH.tmem_total_cols
 
-    S0_OFF: int = 0
-    S1_OFF: int = 128
+    S0_OFF: int = _TMEM.S_OFF[0] if _TMEM_DERIVED else 0
+    S1_OFF: int = _TMEM.S_OFF[1] if _TMEM_DERIVED else 128
 
-    O0_OFF: int = 256
-    O1_OFF: int = 384
+    O0_OFF: int = _TMEM.O_OFF[0] if _TMEM_DERIVED else 256
+    O1_OFF: int = _TMEM.O_OFF[1] if _TMEM_DERIVED else 384
 
-    P0_OFF: int = _P0_OFF
-    P1_OFF: int = _P1_OFF
+    P0_OFF: int = _TMEM.P_OFF[0] if _TMEM_DERIVED else _P0_OFF
+    P1_OFF: int = _TMEM.P_OFF[1] if _TMEM_DERIVED else _P1_OFF
 
-    # SM100: stats ride the head of sub-tile qs's S_acc slot (== S{qs}_OFF):
-    # sub-tile 0 → col 0, sub-tile 1 → col 128.  Use STATS_OFF + qs*STATS_STRIDE.
-    STATS_OFF: int = 0
-    STATS_STRIDE: int = 128
+    # Hard-coded map: stats ride the head of sub-tile qs's S_acc slot (== S{qs}_OFF): sub-tile 0 → col 0, sub-tile 1 → col 128.
+    # Derived map: STATS_OFF = 480, 8 columns per sub-tile.  Both: STATS_OFF + qs*STATS_STRIDE.
+    STATS_OFF: int = _TMEM.STATS_OFF if _TMEM_DERIVED else 0
+    STATS_STRIDE: int = _TMEM.STATS_COLS_PER_SUBTILE if _TMEM_DERIVED else 128
+
+    # The per-sub-tile tuples the small-tile seams index by their trace-time ``qs`` (two sub-tiles, or three with the third softmax warp
+    # group); the scalar fields above are the first two entries, kept for the two-sub-tile sites.
+    S_OFF: Tuple[int, ...] = _TMEM.S_OFF if _TMEM_DERIVED else (0, 128)
+    P_OFF: Tuple[int, ...] = _TMEM.P_OFF if _TMEM_DERIVED else (_P0_OFF, _P1_OFF)
+    O_OFF: Tuple[int, ...] = _TMEM.O_OFF if _TMEM_DERIVED else (256, 384)
+    # The S / P slot axis (CFG.S_SLOTS; 1 on every rendering but the small tiles' double-buffered S at TILE_N 64): slot p of
+    # sub-tile qs sits at S{qs}_OFF + p * S_SLOT_STRIDE, its P at P{qs}_OFF + p * S_SLOT_STRIDE (0 at one slot).
+    S_SLOTS: int = _TMEM.S_SLOTS if _TMEM_DERIVED else 1
+    S_SLOT_STRIDE: int = _TMEM.S_SLOT_STRIDE if _TMEM_DERIVED else 0
+    # The TS arm's Q slots (CFG.Q_IN_TMEM): Q_COLS = TILE_K x BPE / 4 columns per sub-tile after the last O slot; unused on the SMEM-Q renderings.
+    Q_OFF: Tuple[int, ...] = _TMEM.Q_OFF if _TMEM_DERIVED else ()
+    Q_COLS: int = _TMEM.Q_COLS if _TMEM_DERIVED else 0
 
 
 LAYOUT = KernelTmemLayout()

@@ -48,6 +48,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
 )
+from cudnn.sdpa.fwd.config_sm100 import SM100_DENSE_ONLY_D_SHAPES, SM100_SMALL_D_CGAS
 from cudnn.sdpa.fwd import config_sm107 as _config_sm107
 from cudnn.sdpa.fwd.config_sm107 import (
     KV_MASK_ADDITIVE_GRANULE_ELEMS,
@@ -1825,8 +1826,13 @@ def _sm100_spec() -> EngineSpec:
             phase="prefill",
             # (64, 64) is a NATIVE flavor, not an envelope: it compiles the d128
             # file at TILE_K = TILE_O = 64 (TemplateParams.d_flavor) instead of
-            # zero-filling a 128-wide tile for gpt-oss-class head dims.
-            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}),
+            # zero-filling a 128-wide tile for gpt-oss-class head dims.  (32, 32)
+            # is the same file's 32-wide small tile (d_flavor = 32; config_sm100.make_cfg_d32), the
+            # SM100 twin of the Rubin small tile: it carries the row's DENSE leg only
+            # (dense_only_d_shapes below) -- THD / paged / split-KV / PackGQA / the score
+            # side outputs walk past it onto the native d64 flavor, exactly the route
+            # a d <= 32 graph took before the tile existed.
+            d_shapes=frozenset({(64, 64), (128, 128), (192, 128), (256, 256), (512, 512)}) | SM100_DENSE_ONLY_D_SHAPES,
             dtypes=frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16}),
             causal=True,
             bottom_right=True,
@@ -1884,8 +1890,18 @@ def _sm100_spec() -> EngineSpec:
             # decode and MTP.
             # A split rides either width (no split_cgas entry).
             # (64, 64): the native d64 prefill flavor builds at both widths.
-            cgas_by_d_shape=(((128, 128), frozenset({1, 2})), ((192, 128), frozenset({1, 2})), ((64, 64), frozenset({1, 2}))),
+            # (32, 32): the 32-wide small tile at its validated width (config_sm100.SM100_SMALL_D_CGAS: cga1).
+            cgas_by_d_shape=(
+                ((128, 128), frozenset({1, 2})),
+                ((192, 128), frozenset({1, 2})),
+                ((64, 64), frozenset({1, 2})),
+                ((32, 32), SM100_SMALL_D_CGAS[(32, 32)]),
+            ),
             split_cgas_by_d_shape=(((192, 128), frozenset({2})),),
+            # The 32-wide small tile carries the dense leg only: every other leg (and a cga outside its
+            # domain) is routed past it to the native d64 flavor -- see the field's doc.  ONE constant
+            # with the adapter's pool (config_sm100, rule 8b').
+            dense_only_d_shapes=SM100_DENSE_ONLY_D_SHAPES,
             # Every f16 flavor kernel wires SplitHelpers, and the adapter carves
             # the partial slabs + launches sm100/split_combine when split_kv > 1
             # (dense f16 only; see mismatch's facts x knobs gate). d64 included:
