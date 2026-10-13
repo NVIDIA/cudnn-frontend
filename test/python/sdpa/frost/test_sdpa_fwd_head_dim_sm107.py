@@ -147,7 +147,9 @@ def test_row_serves_the_dense_leg_on_the_small_tiles():
     f64 = _facts(d_qk=64, d_v=64)
     assert engines.mismatch(caps, f64, SdpaFwdKnobs(cga=1)) is None and engines.mismatch(caps, f64, SdpaFwdKnobs(cga=2)) is None
     assert engines.effective_cgas(caps, _facts()) == frozenset({1}) and engines.effective_cgas(caps, f64) == frozenset({1, 2})
-    assert engines.effective_cgas(caps, _facts(d_qk=128, d_v=128)) == frozenset({2}), "the d128 tile keeps its cga2-only domain"
+    # The d128 flavor carries two tiles behind TILE_CGA_M on cc 10.7: cga2 = the Rubin prefill pipeline, cga1 = the shared SM100
+    # decode tile compiled for cc 10.7 (issue #1472); the small tiles do not change that domain.
+    assert engines.effective_cgas(caps, _facts(d_qk=128, d_v=128)) == frozenset({1, 2}), "the d128 flavor keeps its two-tile cga domain"
     for f in (_facts(), f64):
         assert heuristics._auto_sched_cga(spec, f, split_kv=1, sched_policy=0) == (0, 1), "the small tiles default to cga1"
 
@@ -168,7 +170,8 @@ _LEGS = (
         {8: 128, 24: 128, 32: 128, 48: 128, 64: 128, 128: 128},
     ),
     (None, dict(), dict(cga=2), dict(cga=2), {8: 64, 24: 64, 32: 64, 48: 64, 64: 64, 128: 128}),
-    (None, dict(), dict(cga=1), dict(cga=1), {8: 32, 24: 32, 32: 32, 48: 64, 64: 64, 128: None}),
+    # a cga1 request at D = 128 is SERVED on the d128 flavor since the shared SM100 decode tile was compiled for cc 10.7 (issue #1472)
+    (None, dict(), dict(cga=1), dict(cga=1), {8: 32, 24: 32, 32: 32, 48: 64, 64: 64, 128: 128}),
     ("THD", dict(thd=True, padded=True), None, dict(thd=True), {8: None, 24: None, 32: None, 48: None, 64: None, 128: 128}),
     ("THD", dict(has_paged_kv=True, padded=True, page_size=128, thd=True), None, None, {8: None, 24: None, 32: None, 48: None, 64: None, 128: 128}),
     ("PackGQA", dict(h_kv=2), dict(pack_gqa=True), dict(h_kv=2, pack_gqa=True), {8: None, 24: None, 32: None, 48: None, 64: None, 128: None}),
@@ -425,7 +428,13 @@ def test_adapter_check_support_twins_and_record():
 _PROBE_BODY = """
 d = params_kw.pop("__d")
 params = TemplateParams(**params_kw)
-mod = _load_sm100_kernel_module((d, d), params, rubin=True)
+if d == 128 and params.cta_mma == 1:
+    # The like-for-like base of the cga1 tiles is the d128 FILE's own cga1 rendering; through the loader, dense d128 at
+    # TILE_CGA_M=1 on cc 10.7 is the shared SM100 decode tile (issue #1472), another body -- load the file directly.
+    from cudnn.sdpa.fwd.api_dsl import _SM107_KERNEL_FILES, _load_kernel_template
+    mod = _load_kernel_template(_SM107_KERNEL_FILES[(d, d)], params, "sdpa_fwd_sm107_f16_d128_cga1_probe")
+else:
+    mod = _load_sm100_kernel_module((d, d), params, rubin=True)
 print("TILE_K", mod.CFG.TILE_K)
 print("O1_OFF", mod.LAYOUT.O1_OFF)
 mod.compile(d_qk=d, d_v=d, has_lse=True)
@@ -662,8 +671,10 @@ def _case_inputs(case, d, dtype, *, seed=0):
 
 
 def _assert_small_tile_plan(out, d):
-    """The route evidence: the plan's TILE_CGA_M knob is 1 on the small tiles (D <= 64; the d128 tile is cga2-only)."""
-    assert out["knobs"].cga == (1 if d <= 64 else 2) and out["knobs"].split_kv == 1, (d, out["knobs"])
+    """The route evidence: the plan's TILE_CGA_M knob is 1 on the small tiles (D <= 64); the d128 flavor runs either of its two tiles
+    (cga2 = the Rubin prefill pipeline, cga1 = the shared decode tile compiled for cc 10.7, the heuristics' pick per shape)."""
+    assert out["knobs"].cga == 1 if d <= 64 else out["knobs"].cga in (1, 2), (d, out["knobs"])
+    assert out["knobs"].split_kv == 1, (d, out["knobs"])
 
 
 @requires_rubin
