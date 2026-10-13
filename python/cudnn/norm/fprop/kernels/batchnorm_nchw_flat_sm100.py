@@ -534,7 +534,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
     # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
     # change epsilon without rebuilding the graph (it is a pass-by-value operand),
     # and a key without it silently replays the kernel compiled for the old value.
-    key = (params.io_dtype, C, S, VPT, CPB, pparts, has_beta, update_running, float(eps))
+    key = (params.io_dtype,) + ce
 
     pbuf = torch.empty(pparts * mparts * 2 * CPB, dtype=torch.float32, device=x3d.device)
     ret = torch.zeros(2, dtype=torch.int32, device=x3d.device)

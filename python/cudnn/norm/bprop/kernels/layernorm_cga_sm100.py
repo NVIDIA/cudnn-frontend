@@ -399,7 +399,7 @@ def backward(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, knobs=None
         cutlass.Int32(nclusters),
     )
     ce = (C, CS, CGA, _BT, V, VPT, KS, it_ty, et, float(C), bool(spec.has_mean), has_beta, nclusters * CGA, FB, fgrid, nchunk, CHUNK, smem_bytes)
-    key = (params.io_dtype, C, R, CGA, KS, bool(spec.has_mean), has_beta, nclusters, nchunk, CHUNK)
+    key = (params.io_dtype, nclusters) + ce
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_ln_bwd_cga_host, *args, *ce)

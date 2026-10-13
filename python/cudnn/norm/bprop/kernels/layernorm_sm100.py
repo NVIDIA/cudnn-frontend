@@ -837,7 +837,7 @@ def _backward_pipe(spec, dy2d, x2d, gamma, mean, rstd, *, has_beta, params, wcfg
 
     args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(mean), dyn(rstd), dyn(dgp), dyn(dbp), dyn(dgamma), dyn(dbeta), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, cache_xd, spec.has_mean, has_beta, FB, fgrid, nchunk, CHUNK, smem_bytes)
-    key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, cache_xd, spec.has_mean, has_beta, nchunk, CHUNK)
+    key = ("pipe", params.io_dtype) + ce
     fn = _KPIPE.get(key)
     if fn is None:
         fn = cute.compile(_ln_bwd_pipe_host, *args, *ce)
@@ -882,7 +882,7 @@ def _backward_tiled(spec, dy2d, x2d, gamma, rstd, *, params, wcfg):
 
     args = (dyn(dy2d), dyn(x2d), dyn(dx), dyn(gamma), dyn(rstd), dyn(dgp), dyn(dgamma), cutlass.Int32(R), cutlass.Int32(ctas))
     ce = (C, V, tpr, ldgs, RPT, et, it_ty, eb, STAGES, FB, fgrid, nchunk, CHUNK, smem_bytes)
-    key = ("tiled", params.io_dtype, C, V, tpr, ldgs, RPT, nchunk, CHUNK)
+    key = ("tiled", params.io_dtype) + ce
     fn = _KTILED.get(key)
     if fn is None:
         fn = cute.compile(_ln_bwd_tiled_host, *args, *ce)

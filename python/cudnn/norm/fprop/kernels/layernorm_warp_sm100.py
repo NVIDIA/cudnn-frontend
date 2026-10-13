@@ -605,7 +605,7 @@ def forward(spec, x2d, gamma, beta, *, eps, wcfg, params):
 
     args = (dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd), cutlass.Int32(R), cutlass.Int32(ctas), cutlass.Float32(eps))
     ce = (C, V, tpr, wn, intra, ldgs, rpc, block_threads, et, it_ty, nsteps, full_warp, spec.has_mean, has_beta, _MBPM)
-    key = (params.io_dtype, C, tpr, wn, intra, ldgs, rpc, block_threads, spec.has_mean, has_beta, _MBPM)
+    key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_warp_fwd_host, *args, *ce)
@@ -638,7 +638,7 @@ def _forward_pipe(spec, x2d, gamma, beta, *, eps, wcfg, params, has_beta):
 
     args = (dyn(x2d), dyn(y), dyn(gamma), dyn(beta), dyn(mean), dyn(rstd), cutlass.Int32(R), cutlass.Int32(ctas), cutlass.Float32(eps))
     ce = (C, V, tpr, wn, ldgs, block_threads, et, it_ty, eb, STAGES, spec.has_mean, has_beta, smem_bytes)
-    key = ("pipe", params.io_dtype, C, tpr, wn, ldgs, block_threads, STAGES, spec.has_mean, has_beta)
+    key = ("pipe", params.io_dtype) + ce
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_warp_fwd_pipe_host, *args, *ce)

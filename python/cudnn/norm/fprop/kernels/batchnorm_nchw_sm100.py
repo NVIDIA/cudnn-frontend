@@ -831,7 +831,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
         rv = running_var if running_var is not None else torch.ones(C, dtype=torch.float32, device=x3d.device)
         nblk = max(1, min(_nsm() * 4 // max(1, cparts), N))
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, cparts, nblk, it_ty, et, float(eps), has_beta)
-        key = ("infer", params.io_dtype, C, S, VS, UF, CPW, nblk, has_beta)
+        key = ("infer", params.io_dtype) + ce
         args = (dyn(xf), dyn(yf), dyn(gamma), dyn(beta), dyn(rm), dyn(rv), cutlass.Int32(N))
         fn = _KCACHE.get(key)
         if fn is None:
@@ -873,7 +873,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
             # limiter and the per-CTA TMEM budget is actually enforceable.
             smem_bytes = max(smem_bytes, smem_per_sm() // (occ + 1) + 1)
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, KTR, LPT, TCOLS, cparts, it_ty, et, count, float(eps), has_beta, update_running, smem_bytes, mbpm)
-        key = (params.io_dtype, C, S, VS, UF, CPW, KSR, KTR, LPT, TCOLS, has_beta, update_running, mbpm)
+        key = (params.io_dtype,) + ce
         pbuf = torch.empty(cparts * 2 * mparts * CT, dtype=torch.float32, device=x3d.device)
         ret = torch.zeros(cparts, dtype=torch.int32, device=x3d.device)
         args = (

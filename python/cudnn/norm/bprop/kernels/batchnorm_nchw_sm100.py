@@ -486,7 +486,7 @@ def backward(spec, dy3d, x3d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
         smem_bytes = 2 * (2 * CT) * 4 + 2 * WPB * CPW * KSR * S * eb + 128
         mbpm = 2 if occ == 2 else 0
         ce = (C, S, VS, UF, WPB, CPW, CT, BT, KSR, cparts, it_ty, et, count, has_beta, smem_bytes, mbpm)
-        key = (params.io_dtype, C, S, VS, UF, CPW, KSR, has_beta, mbpm)
+        key = (params.io_dtype,) + ce
         pbuf = torch.empty(cparts * 2 * mparts * CT, dtype=torch.float32, device=x3d.device)
         ret = torch.zeros(cparts, dtype=torch.int32, device=x3d.device)
         args = (

@@ -130,7 +130,10 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             "inv_var": facts.inv_var_t,
             "run_mean": facts.run_mean_t,
             "run_var": facts.run_var_t,
+            "prev_run_mean": facts.prev_run_mean_t,
+            "prev_run_var": facts.prev_run_var_t,
             "epsilon": facts.eps_t,
+            "momentum": facts.momentum_t,
         }
     )
 
@@ -139,9 +142,10 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
         x = resolved[id(facts.x_t)]
         gamma = resolved.get(id(facts.scale_t)) if facts.scale_t is not None else None
         beta = resolved.get(id(facts.bias_t)) if facts.bias_t is not None else None
-        rm = resolved.get(id(facts.run_mean_t)) if facts.run_mean_t is not None else None
-        rv = resolved.get(id(facts.run_var_t)) if facts.run_var_t is not None else None
-        eps = _eps_value(resolved.get(id(facts.eps_t)) if facts.eps_t is not None else None, facts.eps)
+        rm = _running_pair(resolved, facts.run_mean_t, facts.prev_run_mean_t)
+        rv = _running_pair(resolved, facts.run_var_t, facts.prev_run_var_t)
+        eps = _host_scalar(resolved.get(id(facts.eps_t)) if facts.eps_t is not None else None, facts.eps)
+        momentum = _host_scalar(resolved.get(id(facts.momentum_t)) if facts.momentum_t is not None else None, facts.momentum)
         y, mean, rstd = norm_fprop(
             facts.variant,
             x,
@@ -150,7 +154,7 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
             eps=eps,
             normalized_shape=facts.normalized_shape,
             num_groups=facts.num_groups,
-            momentum=facts.momentum,
+            momentum=momentum,
             training=facts.training,
             running_mean=rm,
             running_var=rv,
@@ -165,11 +169,31 @@ def lower_norm_fprop(spec: EngineSpec, facts: "ga.NormGraphFacts", requested: Op
     return _execute
 
 
-def _eps_value(buf, fallback):
-    """The graph's epsilon, read from its bound buffer.
+def _running_pair(resolved, next_t, prev_t):
+    """The buffer the running statistic should be updated THROUGH.
 
-    cuDNN takes epsilon as a host scalar, so this is a host read of host memory and
-    not the device read Rule 3 bans. A device-resident epsilon would need that read,
+    cuDNN exposes the previous state and the next state as separate ports, and
+    they are separate buffers. Treating the OUTPUT as the input -- which is what
+    binding only ``next_running_mean`` amounts to -- makes the update read
+    whatever the caller left in the output: initialising it to 0 vs 100 moved the
+    next mean by exactly ``(1 - momentum) * 100``, with the previous-state input
+    ignored. Seeding ``next`` from ``prev`` keeps the in-place kernel update
+    correct and leaves the caller's previous-state tensor untouched.
+    """
+    nxt = resolved.get(id(next_t)) if next_t is not None else None
+    prev = resolved.get(id(prev_t)) if prev_t is not None else None
+    if nxt is None:
+        return prev  # graph declared a single in-place port
+    if prev is not None and nxt.data_ptr() != prev.data_ptr():
+        nxt.copy_(prev.reshape(nxt.shape))
+    return nxt
+
+
+def _host_scalar(buf, fallback):
+    """A graph scalar (epsilon, momentum) read from its bound buffer.
+
+    cuDNN takes these as host scalars, so this is a host read of host memory and
+    not the device read Rule 3 bans. A device-resident one would need that read,
     so it is refused at check time instead (see the engine's decline) rather than
     silently normalised with the wrong value.
     """

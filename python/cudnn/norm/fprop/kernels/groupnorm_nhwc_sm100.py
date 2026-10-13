@@ -401,7 +401,7 @@ def forward(spec, x3, gamma, beta, *, eps, cfg, params, knobs=None):
         # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
         # change epsilon without rebuilding the graph (it is a pass-by-value operand),
         # and a key without it silently replays the kernel compiled for the old value.
-        key = (params.io_dtype, C, HW, N, CPG, V, CPC, KC, has_beta, mparts, COOP, float(eps))
+        key = (params.io_dtype,) + ce
         fn = _KCACHE.get(key)
         if fn is None:
             fn = cute.compile(_gn_fwd_nhwc_host, *args, *ce)

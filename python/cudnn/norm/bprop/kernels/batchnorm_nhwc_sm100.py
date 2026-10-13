@@ -388,7 +388,7 @@ def backward(spec, dy2d, x2d, gamma, saved_mean, saved_rstd, *, has_beta, cfg, p
     smem_bytes = _smem_bytes(BT, V, CPC, KS, eb)
 
     ce = (C, V, TPP, PPL, BT, KC, KS, CPC, cblks, it_ty, et, float(M), has_beta, smem_bytes, mbpm)
-    key = (params.io_dtype, C, KC, KS, CPC, has_beta, mbpm)
+    key = (params.io_dtype,) + ce
     okey = key + (M,)
     occ0 = _OCC.get(okey, 2 if mbpm != 1 else 1)
     can2 = smem_bytes * 2 <= smem_budget(224 * 1024)

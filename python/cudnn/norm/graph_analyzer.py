@@ -98,6 +98,7 @@ class NormGraphFacts:
     eps: float = 1e-5
     eps_t: Any = None
     momentum: float = 0.1
+    momentum_t: Any = None
     wants_running_stats: bool = False
 
     device_cc: Optional[tuple] = None
@@ -109,8 +110,10 @@ class NormGraphFacts:
     y_t: Any = None
     mean_t: Any = None
     inv_var_t: Any = None
-    run_mean_t: Any = None
-    run_var_t: Any = None
+    run_mean_t: Any = None  # next_running_mean OUTPUT
+    run_var_t: Any = None  # next_running_var OUTPUT
+    prev_run_mean_t: Any = None  # in_running_mean INPUT -- a DIFFERENT buffer
+    prev_run_var_t: Any = None
     # backward
     dy_t: Any = None
     dx_t: Any = None
@@ -219,6 +222,10 @@ def _extract_facts(node: Any) -> NormGraphFacts:
     eps_t = _port(inputs, "epsilon", "EPSILON", "eps")
     eps = params.get("epsilon")
     eps = float(eps) if eps is not None else 1e-5
+    # momentum is an input TENSOR too, and reading it from params alone pins every
+    # graph to the 0.1 default -- the running statistics then track at the wrong
+    # rate with nothing to show for it. Same treatment as epsilon above.
+    momentum_t = _port(inputs, "momentum", "MOMENTUM", "exp_avg_factor")
     momentum = params.get("momentum")
     momentum = float(momentum) if momentum is not None else 0.1
 
@@ -269,6 +276,7 @@ def _extract_facts(node: Any) -> NormGraphFacts:
         eps=eps,
         eps_t=eps_t,
         momentum=momentum,
+        momentum_t=momentum_t,
         wants_running_stats=(run_mean is not None and run_var is not None),
         device_cc=_device_cc(),
         x_t=x,
@@ -279,6 +287,8 @@ def _extract_facts(node: Any) -> NormGraphFacts:
         inv_var_t=inv_var_t,
         run_mean_t=_port(outputs, "next_running_mean", "running_mean"),
         run_var_t=_port(outputs, "next_running_var", "running_var"),
+        prev_run_mean_t=run_mean,
+        prev_run_var_t=run_var,
         dy_t=dy,
         dx_t=_port(outputs, "DX", "dx", "grad_input"),
         dscale_t=_port(outputs, "DScale", "Dscale", "dscale", "dgamma"),

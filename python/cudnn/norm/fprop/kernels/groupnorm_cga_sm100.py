@@ -329,7 +329,7 @@ def forward(spec, x2d, gamma, beta, *, eps, params, knobs=None):
     # eps is baked in as a constexpr, so it MUST be part of the key: a caller may
     # change epsilon without rebuilding the graph (it is a pass-by-value operand),
     # and a key without it silently replays the kernel compiled for the old value.
-    key = (params.io_dtype, M, R, CGA, KC, bool(spec.has_mean), has_beta, float(eps))
+    key = (params.io_dtype,) + ce
     fn = _KCACHE.get(key)
     if fn is None:
         fn = cute.compile(_gn_fwd_cga_host, *args, *ce)

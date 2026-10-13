@@ -558,7 +558,7 @@ def backward(spec, dy3, x3, gamma, mean, rstd, *, has_beta, cfg, params, knobs=N
             fr,
             fsmem,
         )
-        key = (params.io_dtype, C, HW, N, CPG, G, V, CPC, KC, has_beta, mparts, COOP)
+        key = (params.io_dtype,) + ce
         fn = _KCACHE.get(key)
         if fn is None:
             fn = cute.compile(_gn_bwd_nhwc_host, *args, *ce)
