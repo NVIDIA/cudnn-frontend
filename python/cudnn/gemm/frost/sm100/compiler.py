@@ -97,6 +97,7 @@ from ..recipe import (
     check_shapes,
     contiguous_modulus,
     expected_shape,
+    moe_weight_sf_reject,
 )
 from ..graph_analyzer import (
     GemmBinding,
@@ -5187,7 +5188,8 @@ class CompiledMoeBlockScaleGemm:
       * ``weight`` — (E, N, Kp) packed FP4/FP8 (B, per-expert).
       * ``sfa``    — token SF, F8_128x4-reordered + padded to 128 rows PER GROUP,
         then concatenated (Σ ceil(group_m/128) blocks).
-      * ``sfb``    — weight SF, F8_128x4-reordered, per-expert.
+      * ``sfb``    — weight SF, F8_128x4-reordered dense byte planes with E
+        outermost; the runtime expert stride is 16-byte aligned and may include padding.
       * ``first_token_offset`` — (num_groups+1,) int32/int64; group g spans token
         rows ``[fto[g], fto[g+1])``. Group sizes arbitrary (NOT
         128-aligned); the scheduler tracks each group's start SF-block.
@@ -5298,8 +5300,8 @@ class CompiledMoeBlockScaleGemm:
         if scale_blob_reason is not None:
             raise ValueError(scale_blob_reason)
         _initialize_reduction_outputs(self.chain, outputs, stream)
-        # Permute to inner-plane layouts (batch last). The host rebuilds SF
-        # descriptors from .iterator, so the SF permute just preserves the base ptr.
+        # Permute to inner-plane layouts (batch last). SF descriptors rebuild
+        # blocked row/K geometry and retain the validated weight expert stride.
         a_perm = token.permute(1, 2, 0)
         b_perm = weight.permute(1, 2, 0)
         c_perms = [t.permute(1, 2, 0) for t in outputs]
@@ -5381,9 +5383,8 @@ class CompiledMoeBlockScaleGemm:
                 token_sf = []  # Linear inputs do not use segmented F8_128x4 capacity.
             _sf_k4 = ((_K // self.chain.block_scale.block_size) + 3) // 4
             _segmented_sfa_rows = segmented_row_scale_capacity_rows(int(_S), _moe_num_groups(fto, int(weights[0].shape[0])))
-            _r_sf = _sf_blob_reject(
-                [(f"SFA[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(token_sf or [])]
-                + [(f"SFB[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128) * int(weights[j].shape[0])) for j, x in enumerate(weight_sf or [])]
+            _r_sf = _sf_blob_reject([(f"token SF[{i}]", x, 4 * _sf_k4 * _segmented_sfa_rows) for i, x in enumerate(token_sf or [])]) or moe_weight_sf_reject(
+                [(f"weight SF[{j}]", x, 512 * _sf_k4 * ((_N + 127) // 128), int(weights[j].shape[0])) for j, x in enumerate(weight_sf or [])]
             )
             if _r_sf is not None:
                 raise ValueError(_r_sf)

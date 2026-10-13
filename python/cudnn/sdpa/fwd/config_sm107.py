@@ -116,6 +116,12 @@ __all__ = [
     "TCGEN05_V0_ADDR_LIMIT",
     "d256_mxfp8_sf_smem_bytes",
     "d256_mxfp8_last_sf_tile_start",
+    "CfgD256Sparse",
+    "make_cfg_d256_sparse",
+    "d256_sparse_smem_layout",
+    "sparse_entry_regs",
+    "SPARSE_D256_WIRED_ARMS",
+    "SMEM_STANDARD_CARVEOUT_BYTES",
 ]
 
 
@@ -185,9 +191,11 @@ _F16_THD_FLAVORS = frozenset({"sm107 d128", "sm107 d192xd128", "sm107 d256", "sm
 # same two shapes; half paged graphs never load an sm107 file (api_dsl._load_sm100_kernel_module routes them to the
 # SM100 bodies).  _validate_params declines every other flavor, and each unwired MXFP8 kernel file refuses paged_kv at
 # module scope as well.  A page holds whole 128-row F8_128x4 SF atom sets, so page_size is a multiple of the KV tile.
-# One cc 10.7 HALF kernel reads pools natively and validates its OWN record (it never passes through _validate_params,
-# so this set does not name it): sm107/decode_d256_f16.py (make_cfg_d256_decode -- the decode-shaped dense-Q d256
-# route, the SM100 decode record re-validated for Rubin).
+# Two cc 10.7 HALF kernels read pools natively and validate their OWN records (neither passes through _validate_params,
+# so this set does not name them): sm107/decode_d256_f16.py (make_cfg_d256_decode -- the decode-shaped dense-Q d256
+# route, the SM100 decode record re-validated for Rubin) and sm107/sparse_d256_f16.py (make_cfg_d256_sparse -- the
+# index-list core's gather warps read K / V from the pools through the (B, max_pages) table; page_size a multiple of
+# the 4-token block).
 _PAGED_KV_FLAVORS_SM107 = frozenset({"sm107 d128 mxfp8", "sm107 d256 mxfp8"})
 
 # Head-dim shapes whose Rubin f16/bf16 kernel carries the THD/varlen leg -- the
@@ -510,6 +518,14 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     # descriptor, a KV split would gate the partials the combine then
     # re-normalizes, paged KV and PackGQA are simply not wired through the gate
     # TMA coordinates.
+    if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
+        # An index-list record (qsa_block_topk != 0, or its softmax-split knob) belongs to sm107/sparse_d256_f16.py (make_cfg_d256_sparse); a dense
+        # template would read K/V densely and silently ignore the block list.  The selection is the FUNCTION -- a decline,
+        # never a knob fallback (the sm100 twin's _validate_params / make_cfg_d256_decode decline the same way).
+        raise ValueError(
+            f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} / qsa_softmax_groups={k.qsa_softmax_groups} "
+            f"select the index-list sparse kernel; the dense templates do not consume them"
+        )
     if k.epilogue_gate:
         if flavor not in _EPILOGUE_GATE_FLAVORS:
             raise ValueError(f"{flavor}: epilogue_gate is wired on {sorted(_EPILOGUE_GATE_FLAVORS)} only")
@@ -1091,6 +1107,8 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 
 
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
+    """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
+    checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
     _validate_params(flavor, params)
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
@@ -1256,18 +1274,9 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         last_sf = d256_mxfp8_last_sf_tile_start(cfg)
         _check(
             [
-                (
-                    # The gated MXFP8 module was traced and launched at CTA_MMA=1 ONLY
-                    # (the row pins cga1 for the quantized d256 flavors and so does the
-                    # adapter, supported_cgas_for((256, 256), fp8=True) == (1,)).  A
-                    # cga2 gated MXFP8 module (K/V rings halved, SF slabs full-size,
-                    # gate per CTA) fits the tallies below but was never validated;
-                    # a future widening of the row surfaces HERE, as a config raise,
-                    # not as an inherited unvalidated arm.
-                    not (cfg.EPILOGUE_GATE and cfg.CTA_MMA == 2),
-                    f"{flavor}: the epilogue gate is validated at CTA_MMA=1 only (got CTA_MMA={cfg.CTA_MMA}); a cga2 gated "
-                    f"MXFP8 module has never been traced or launched -- validate on Rubin before widening the row (engine-contract rule 9)",
-                ),
+                # The gated MXFP8 module runs at both widths: the dense unsplit legs take the 2-CTA pair since
+                # d256_mxfp8_pair_leg (K/V rings halved, SF slabs full-size, one gate tile per CTA -- the tallies
+                # below bound that layout too), validated by the MXFP8 gate tests at the pair's default width.
                 (
                     last_sf < TCGEN05_V0_ADDR_LIMIT,
                     f"{flavor}: the last scale-factor slab starts at {last_sf} B, at or past the {TCGEN05_V0_ADDR_LIMIT} B version-0 tcgen05 "
@@ -1544,6 +1553,730 @@ def make_cfg_d512_2x2(params: TemplateParams, *, cga_m: int = 4) -> Tuple[CfgD51
     # DESC_VERSION is DERIVED from the layout the fields above describe, never set by hand.
     cfg = dataclasses_replace(base, DESC_VERSION=_d512_2x2_desc_version_for(base))
     _validate_cfg_d512_2x2_sm107(cfg, flavor)
+    return cfg, _tma_iters(cfg)
+
+
+# ---------------------------------------------------------------------------
+# d256 index-list SPARSE prefill -- swap-AB tile over gathered K/V (sm107/sparse_d256_f16.py)
+# ---------------------------------------------------------------------------
+#
+# The kernel this config describes (its header carries the full tables): one CTA per SM, cga1, persistent; a work item is
+# (query token, KV head) -- the G query heads of the token on the MMA N axis (N_Q = 16), 128-key tiles of 32 four-token blocks
+# on the M axis, gathered by GATHER_WARPS warps with tma_gather4 from the token's block list.  Warp map of the ONE-column-group
+# record (16 warps; the DEFAULT record adds a second 4-warp softmax group = 20 warps -- the kernel header's table is the authority),
+# every warpgroup role-homogeneous because setmaxnreg is warpgroup-collective:
+#
+#     WG0  warps 0-3    softmax + epilogue (128 lanes = 128 key lanes of S^T / P^T = 128 d lanes of O^T)
+#     WG1-2 warps 4-11  gather issuers (blocks 4w..4w+3 of every K and V tile; one arrive_expect_tx per operand stage)
+#     WG3  warps 12-15  MMA / TMA-LDG / scheduler / spare, ONE register count
+#
+# Every arrival count below is derived from the warp counts, and every one is a mbarrier init the body cannot reach if the
+# config disagrees (an unreachable init is a HANG at every shape, a stale ring slot a SILENT wrong answer):
+#     KV_FULL_ARRIVERS   = GATHER_WARPS                       (one expect_tx per gather warp per stage; bytes sum to the stage)
+#     IDS_EMPTY_ARRIVERS = GATHER_WARPS + SOFTMAX_WARPS        (one elected lane per warp that reads the staged list)
+#     READ_TILE_ARRIVERS = SOFTMAX_WARPS + 1 (MMA) + 1 (TMA) + GATHER_WARPS   (the scheduler warp and the spare never credit)
+#
+# Registers: a 640-thread launch is capped at 65536 / 640 -> 96 per thread FLAT, a 512-thread one at 128 (the DSL emits .reqntid, no .maxnreg, so every
+# setmaxnreg is dropped); the declared split for when .maxnreg lands must balance the ENTRY pool, SUM(role regs x warps) ==
+# entry x warps, or the last INCREASE warp parks forever.  Host trace-compile of the swap-AB decode body under a forced
+# 512-thread rendering (sm_107a): REG 104, STL 0, LDL 0.  The DEFAULT record is the two-column-group body (20 warps at 8 gather
+# warps, 96 entry registers, 0 spills on the host renderings but one register pair in the gated 16-head-group prologue); the
+# one-group body is 16 warps / 128; gather_warps=4 is the named fallback (12 warps / 168 at one group, 16 / 128 at two).
+
+_SPARSE_FLAVOR = "sm107 d256 sparse"
+# The standard per-CTA carveout (L1 keeps its 100 KiB); past it the launcher needs ALLOW_OVERSIZED_SHARED_MEMORY and the
+# budget becomes SMEM_USABLE_BYTES (320 KiB, never the 327 KiB capacity).
+SMEM_STANDARD_CARVEOUT_BYTES = 227 * 1024
+_SPARSE_N_Q = 16  # one softmax column group (4 warps x 16 columns); 32 would be two groups
+_SPARSE_BLOCK_SIZE = 4  # tokens per block = the four rows of ONE tma_gather4
+_SPARSE_SOFTMAX_WARPS = 4  # at ONE column group (the default body)
+_SPARSE_SOFTMAX_WARPS_PER_GROUP = 4  # 128 lanes = the 128 key rows of a tile, per column group
+_SPARSE_SOFTMAX_GROUPS = (1, 2)  # the softmax SPLIT (TemplateParams.qsa_softmax_groups): 4 x 16 columns, or 2 x (4 x 8)
+_SPARSE_AUX_WARPS = 4  # MMA, TMA-LDG, scheduler, spare: one complete warpgroup at one register count
+_SPARSE_TOPK_MIN, _SPARSE_TOPK_MAX = 4, 512
+_SPARSE_IDS_SLOT_PAD_BYTES = 64  # 16 reserved words per staged list (unread in v1; keeps the slot a 16-B multiple at every top_k)
+_SPARSE_SMEM_MISC_BYTES = 512  # tmem_ptr 16 B + 15 mbarrier arrays (29 stages, 16-B padded) 272 B + the 2-slot payload ring 64 B = 352 B (+ the two 1-stage gate arrays, 32 B, on the EPILOGUE_GATE rendering), reserved as 512
+# The S^T / P^T ring depth: the S^T TMEM slots (S_ACC_OFF), the sP buffers and the s_full / s_empty / p_full / bmm2_done rings are all
+# STAGES_S deep, and the column-max exchange scratch holds one slot per ring parity + the epilogue's lane sum.  The kernel reads the
+# depth ONCE (`STAGES_S = CFG.STAGES_S`) and spells it at every ring site -- never a literal 2 (frost-kernels.md section 6: a depth
+# changed at some sites and not others is a stale S^T slot read from the first reuse, a silent wrong answer).
+_SPARSE_STAGES_S = 2
+_SPARSE_RED_SLOTS = _SPARSE_STAGES_S + 1  # the column-max exchange scratch: one slot per S ring parity + the epilogue's lane sum
+_GATHER4_ROWS = 4  # rows per gather4 issue
+_GATHER4_BOX_BYTES = 128  # one SW128 span per row per issue
+_REG_FILE_PER_CTA = 65536
+# Arms of the kernel whose BODY carries them.  A record that asks for an arm outside this set is declined at config build (the
+# same backstop every other Rubin flavor applies to THD / the gate / split_kv); each arm's landing commit adds its name here and
+# flips the adapter's claims record in the same commit.  Names: "epilogue_gate", "thd_varlen", "paged_kv", "split_kv",
+# "list_per_sequence", "bottom_right", "pure_list" (qsa_include_open_block=False), "seq_q_lens".
+# "paged_kv": the gather warps read K / V from page pools through a (B, max_pages) block table -- one table lookup per
+# 4-token block (PAGE_SIZE % 4 == 0, so a block never straddles a page); the visible range comes from the per-batch KV
+# lengths, which the paged form therefore REQUIRES (SEQ_KV_LENS_PRESENT is forced to 1 below).
+# "thd_varlen": packed sequences through the persistent claim-counter scheduler, the shared THD metadata layout (seq_kv_lens |
+# cu_q | cu_k | remap | live | ctr) in a caller workspace, sequence-relative block ids (the gather row carries cu_k[b]).
+# "epilogue_gate": the item's gate tile (O's shape, the token's G heads) aliased into its freed Q^T slot after the item's last
+# BMM1 (GATE_TX_BYTES = the box), O gated in place after the dead-row SELECT, the LSE untouched; it touches the Q^T slot ring
+# and the epilogue only, so it composes with either of the two arms above (the gate is O-shaped on every arm).
+# The THD and paged arms are wired ONE AT A TIME: a record asking for both is refused by the validator below (the packed
+# sequence's K / V row offset cu_k[b] composes with a dense [1, T_kv, H_kv, D] tensor only, never with a page pool) until a
+# serving stack asks for the combination -- it then lands with its own accept cells.
+# "bottom_right": the row's key-space position is tok + (eff_seqlen_kv_b - eff_seqlen_q_b) (the dense tiles' bottom-right
+# diagonal); the Q / O / LSE coordinate stays the row index; pos < 0 is a dead row.  Dense BSHD only (not under THD).
+# "list_per_sequence": the decode / MTP form -- block_ids [B, BLOCK_TOPK] and block_lens [B], ONE list per sequence read by every
+# item of the sequence (every KV head, split and token), the count and the appended tail anchored at the STEP-0 position
+# pos_0 = eff_seqlen_kv_b - eff_seqlen_q_b (0, 1 or 2 tail ids at S_q <= 4: every token from the step-0 tail start to the row's
+# own position).  Requires BOTTOM_RIGHT (a top-left per-sequence list has no serving meaning); the S_q <= 4 cap is the adapter's
+# shape decline.  Not under THD.
+# "split_kv": SPLIT_KV > 1 cuts every item's tiles into SPLIT_KV contiguous chunks, each its own work item (grid x = tok + S_q x
+# split) writing fp32 O / natural-log LSE partials into the split-major (b + s x B) workspace sm100/split_combine.py reduces; an
+# empty chunk is a dead item (one clamped tile, O = 0 / LSE = -inf = the combine's identity).  SPLIT_KV <= MAX_TILES_PER_ITEM (a
+# larger split has an empty chunk on EVERY item); never with the kernel's own EPILOGUE_GATE (the gate rides the combine) and never
+# under THD (the persistent claim-counter form has no split axis).
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate", "split_kv", "list_per_sequence", "bottom_right"})
+
+
+def sparse_entry_regs(total_warps: int) -> int:
+    """ptxas's per-thread ENTRY register count for a ``total_warps``-warp launch: the register file over the launch, rounded
+    DOWN to the 8-register allocation granule (128 at 16 warps, 168 at 12, 255 at <= 8).  ``entry x total_warps`` is the pool a
+    ``setmaxnreg`` split redistributes -- never 65536 / 32."""
+    return min(255, (_REG_FILE_PER_CTA // (32 * total_warps)) // 8 * 8)
+
+
+def _align16(nbytes: int) -> int:
+    return -(-nbytes // 16) * 16
+
+
+@dataclass(frozen=True)
+class CfgD256Sparse:
+    """d_qk = d_v = 256 index-list sparse prefill: the swap-AB tile (keys on the MMA M axis, the token's query heads on N) over
+    K/V tiles gathered block by block.  Every field is set by ``make_cfg_d256_sparse``; the defaults are the ONE-column-group
+    16-warp record at the 24/2 geometry and top_k = 512 (the factory's default renders the two-group 20-warp record) so the
+    dataclass is constructible in a doc / test context, not a fallback."""
+
+    # --- tile geometry: TILE_N keys per tile (the MMA M axis = the 128-lane TMEM layout), TILE_K / TILE_O the head dims,
+    # N_Q the MMA N axis (the token's query heads, zero-padded to 16)
+    TILE_N: int = 128
+    TILE_K: int = 256
+    TILE_O: int = 256
+    N_Q: int = _SPARSE_N_Q
+    BLOCK_SIZE: int = _SPARSE_BLOCK_SIZE
+    BLOCKS_PER_TILE: int = 32
+    BLOCK_TOPK: int = 512  # TemplateParams.qsa_block_topk: the list width; every ids byte count is BLOCK_TOPK x 4
+    MAX_TILES_PER_ITEM: int = 17  # ceil((BLOCK_TOPK + 1 open block) / BLOCKS_PER_TILE)
+
+    # --- dtypes (half only; the output inherits)
+    DTYPE_QKV: int = _DTYPE_BF16
+    DTYPE_O: int = _DTYPE_BF16
+    BPE: int = 2
+    BPE_O: int = 2
+    GATE_BPE: int = 2
+
+    # --- swizzles / MMA k-step
+    Q_SWZ_BYTES: int = 128
+    K_SWZ_BYTES: int = 128
+    V_SWZ_BYTES: int = 128
+    P_SWZ_BYTES: int = 32  # P^T rows are N_Q half values = 32 B: the 32-B swizzle atom
+    TILE_K_HW: int = 16
+
+    # --- rings
+    STAGES_KV: int = 3  # K(t), V(t), K(t+1) resident: 3 x 64 KiB
+    STAGES_S: int = _SPARSE_STAGES_S  # S^T slots in TMEM (len(S_ACC_OFF)) = sP buffers = the s_full / s_empty / p_full / bmm2_done ring depth
+    STAGES_Q: int = 2  # Q^T of item i and i+1 (the gate of item i aliases its freed slot)
+    STAGES_IDS: int = 2  # the list of item i and i+1 (the one-item-ahead prefetch)
+    STAGES_GATE: int = 1
+    SCHEDULER_STAGES: int = 2
+
+    # --- warp population
+    SOFTMAX_WARPS: int = _SPARSE_SOFTMAX_WARPS
+    GATHER_WARPS: int = 8
+    AUX_WARPS: int = _SPARSE_AUX_WARPS
+    TOTAL_WARPS: int = 16
+    THREADS_PER_CTA: int = 16 * 32
+    SOFTMAX_WARP_BASE: int = 0
+    GATHER_WARP_BASE: int = 4
+    MMA_WARP_ID: int = 12
+    TMALDG_WARP_ID: int = 13
+    SCHED_WARP_ID: int = 14
+    SPARE_WARP_ID: int = 15
+
+    # --- mbarrier arrival counts (every one the EXACT per-phase sum of the body's arrive sites)
+    ONE_LANE: int = 1
+    SOFTMAX_LANES: int = 128
+    KV_FULL_ARRIVERS: int = 8
+    IDS_EMPTY_ARRIVERS: int = 12
+    READ_TILE_ARRIVERS: int = 14
+    BAR_TMEM_THREADS: int = 160  # named barrier 1: the MMA warp + the softmax warps
+    BAR_SOFTMAX_THREADS: int = 128  # named barrier 2: the softmax warps
+
+    # --- gather geometry (per operand stage)
+    BLOCKS_PER_WARP: int = 4
+    GATHER_BOXES: int = 4  # 128-B column boxes per 256-wide row
+    GATHER_BOX_ELEMS: int = 64
+    GATHER_ISSUE_BYTES: int = 512  # 4 rows x 128 B
+    GATHERS_PER_WARP_PER_STAGE: int = 16
+    KV_TX_BYTES_PER_WARP: int = 8192  # the per-warp expect_tx
+    KV_STAGE_BYTES: int = 65536
+
+    # --- the Q^T / gate box (one token per item: Q_BOX_ROWS = the token's query heads)
+    Q_BOX_TOKENS: int = 1
+    Q_BOX_ROWS: int = 12
+    Q_SLOT_BYTES: int = 8192  # N_Q x TILE_K x BPE
+    Q_TX_BYTES: int = 6144  # Q_BOX_ROWS x TILE_K x BPE = the BOX bytes, never the slot
+    GATE_TX_BYTES: int = 6144  # Q_BOX_ROWS x TILE_O x GATE_BPE
+
+    # --- the staged block list
+    IDS_TX_BYTES: int = 2048  # BLOCK_TOPK x 4 = the bulk-copy length = the expect_tx
+    IDS_SLOT_BYTES: int = 2112  # IDS_TX_BYTES + the 64-B reserve
+
+    # --- TMEM (64 columns: two S^T slots, two O^T d-blocks)
+    TMEM_COLS: int = 64
+    S_ACC_OFF: Tuple[int, int] = (0, 16)
+    O_OFF: Tuple[int, int] = (32, 48)
+
+    # --- registers (the entry count is what the launch gives every warp; the split is for when .maxnreg lands)
+    ENTRY_REGS: int = 128
+    SOFTMAX_REGS: int = 240
+    GATHER_REGS: int = 96
+    AUX_REGS: int = 80
+    REG_SPLIT_DECLARED: int = 1
+
+    # --- SMEM (derived by d256_sparse_smem_layout; pinned here so the body can read them)
+    SMEM_TOTAL_BYTES: int = 226688
+    SMEM_CARVEOUT_BYTES: int = SMEM_STANDARD_CARVEOUT_BYTES
+    DESC_VERSION: int = 0
+
+    # --- graph-derived features / arms
+    INCLUDE_OPEN_BLOCK: int = 1
+    EPILOGUE_GATE: int = 0
+    PAGED_KV: int = 0
+    PAGE_SIZE: int = 0
+    THD_VARLEN: int = 0
+    BOTTOM_RIGHT: int = 0
+    SPLIT_KV: int = 1
+    LIST_PER_SEQUENCE: int = 0
+    PACK_GQA: int = 1
+    QH_PER_KH: int = 12
+    SEQ_KV_LENS_PRESENT: int = 0
+    SEQ_Q_LENS_PRESENT: int = 0
+    STATS_LOG2: int = 0
+    SCHEDULER_POLICY: int = SCHED_NATURAL
+    MASK_FLAGS: int = MASK_NONE  # the selection IS the mask: no band bits ever
+    HAS_SINK: int = 0
+    CTA_MMA: int = 1
+    CGA_M: int = 1
+    CGA_N: int = 1
+
+    # --- the softmax role's column groups (APPENDED; the softmax split of the body tuning): SOFTMAX_GROUPS groups of
+    # SOFTMAX_WARPS_PER_GROUP warps, each owning COLS_PER_GROUP = N_Q / SOFTMAX_GROUPS columns of S^T / P^T / O^T over all 128 lanes;
+    # SOFTMAX_WARPS = SOFTMAX_WARPS_PER_GROUP x SOFTMAX_GROUPS and every softmax-fired barrier init (SOFTMAX_LANES, the named
+    # TMEM barrier, IDS_EMPTY_ARRIVERS, READ_TILE_ARRIVERS) follows it; the exchange barrier counts ONE group's lanes.
+    SOFTMAX_GROUPS: int = 1
+    SOFTMAX_WARPS_PER_GROUP: int = _SPARSE_SOFTMAX_WARPS_PER_GROUP
+    COLS_PER_GROUP: int = _SPARSE_N_Q
+
+
+def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
+    """The sparse kernel's SMEM byte table as the allocator lays it out: declaration order = address order, the descriptor-read
+    operands FIRST (``sQ`` | ``sP`` | ``sKV``, each a 1024-B-aligned ``cutlass.Array``) so every MMA operand starts below the 256 KiB
+    version-0 descriptor window, then the register-addressed buffers (``sIds`` | ``red`` | misc, 16-B aligned) so no alignment padding is spent.
+    Returns every start, the start of the LAST K/V stage (what the descriptor version is derived from), the total and the carveout
+    the total needs."""
+    starts = {}
+    off = 0
+    starts["sQ"] = off
+    off = _align_slab(off + cfg.STAGES_Q * cfg.N_Q * cfg.TILE_K * cfg.BPE)
+    starts["sP"] = off
+    off = _align_slab(off + cfg.STAGES_S * cfg.TILE_N * cfg.N_Q * cfg.BPE)
+    starts["sKV"] = off
+    kv_stage = cfg.TILE_N * cfg.TILE_K * cfg.BPE
+    starts["sKV_last"] = off + (cfg.STAGES_KV - 1) * kv_stage
+    off = _align_slab(off + cfg.STAGES_KV * kv_stage)
+    starts["sIds"] = off
+    off = _align16(off + cfg.STAGES_IDS * cfg.IDS_SLOT_BYTES)
+    starts["red"] = off
+    off = _align16(
+        off + (cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.COLS_PER_GROUP * 4
+    )  # [slot][warp][column]: one slot per S ring parity + the epilogue's lane sum = 768 B at either group count
+    starts["misc"] = off
+    off += _SPARSE_SMEM_MISC_BYTES
+    total = off
+    if total <= SMEM_STANDARD_CARVEOUT_BYTES:
+        carveout = SMEM_STANDARD_CARVEOUT_BYTES
+    else:
+        carveout = SMEM_USABLE_BYTES  # the oversized mode (ALLOW_OVERSIZED_SHARED_MEMORY); may still not fit -- the validator says
+    return {"starts": starts, "total": total, "carveout": carveout, "desc_version": 1 if starts["sKV_last"] >= TCGEN05_V0_ADDR_LIMIT else 0}
+
+
+def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) -> None:
+    """Every geometry claim of the kernel header's tables, as a raising predicate naming what the failure looks like."""
+    lay = d256_sparse_smem_layout(cfg)
+    st = lay["starts"]
+    _check(
+        [
+            (cfg.DTYPE_QKV in (_DTYPE_BF16, _DTYPE_FP16), f"{flavor}: f16/bf16 inputs only (got DTYPE_QKV={cfg.DTYPE_QKV}); the gathered tile has no FP8 arm"),
+            (cfg.DTYPE_O == cfg.DTYPE_QKV, f"{flavor}: half input requires DTYPE_O == DTYPE_QKV (got {cfg.DTYPE_O} vs {cfg.DTYPE_QKV})"),
+            (cfg.BPE == 2 and cfg.BPE_O == 2 and cfg.GATE_BPE == 2, f"{flavor}: BPE / BPE_O / GATE_BPE are 2 on the half kernel"),
+            (
+                cfg.TILE_N == 128 and cfg.TILE_N == cfg.BLOCKS_PER_TILE * cfg.BLOCK_SIZE,
+                f"{flavor}: the KV tile is the 128-lane TMEM layout = BLOCKS_PER_TILE x BLOCK_SIZE (got {cfg.TILE_N})",
+            ),
+            (
+                cfg.BLOCK_SIZE == _SPARSE_BLOCK_SIZE and cfg.BLOCKS_PER_TILE == 32,
+                f"{flavor}: a block is the four rows of one gather4 and a tile holds 32 of them",
+            ),
+            (cfg.TILE_K == 256 and cfg.TILE_O == 256, f"{flavor}: d_qk = d_v = 256 only (the gather box count and the 4-subtile Q box are derived for 256)"),
+            (cfg.N_Q == _SPARSE_N_Q, f"{flavor}: N_Q must be 16 (one softmax column group); got {cfg.N_Q}"),
+            # warp population: role-homogeneous warpgroups
+            (
+                cfg.SOFTMAX_GROUPS in _SPARSE_SOFTMAX_GROUPS
+                and cfg.SOFTMAX_WARPS_PER_GROUP == _SPARSE_SOFTMAX_WARPS_PER_GROUP
+                and cfg.SOFTMAX_WARPS == cfg.SOFTMAX_WARPS_PER_GROUP * cfg.SOFTMAX_GROUPS
+                and cfg.AUX_WARPS == _SPARSE_AUX_WARPS,
+                f"{flavor}: 4 softmax warps per column group x SOFTMAX_GROUPS in {{1, 2}} (got SOFTMAX_WARPS={cfg.SOFTMAX_WARPS}, "
+                f"SOFTMAX_GROUPS={cfg.SOFTMAX_GROUPS}, SOFTMAX_WARPS_PER_GROUP={cfg.SOFTMAX_WARPS_PER_GROUP}) and the 4-warp MMA / TMA / scheduler / spare group",
+            ),
+            (
+                cfg.N_Q % cfg.SOFTMAX_GROUPS == 0
+                and cfg.COLS_PER_GROUP == cfg.N_Q // cfg.SOFTMAX_GROUPS
+                and cfg.COLS_PER_GROUP % 2 == 0
+                and cfg.COLS_PER_GROUP * cfg.BPE >= 16,
+                f"{flavor}: COLS_PER_GROUP must be N_Q / SOFTMAX_GROUPS, even, and at least one 16-B P^T chunk per lane row (got {cfg.COLS_PER_GROUP} at "
+                f"SOFTMAX_GROUPS={cfg.SOFTMAX_GROUPS}); a narrower group would store a partial swizzled chunk",
+            ),
+            (
+                cfg.GATHER_WARPS >= 1 and 32 % cfg.GATHER_WARPS == 0,
+                f"{flavor}: 32 blocks per tile must divide across the gather warps (got {cfg.GATHER_WARPS})",
+            ),
+            (
+                cfg.GATHER_WARPS % 4 == 0,
+                f"{flavor}: the gather warps must fill whole warpgroups (setmaxnreg is warpgroup-collective); got {cfg.GATHER_WARPS} -- a partial warpgroup would carry two roles at one register count",
+            ),
+            (
+                cfg.TOTAL_WARPS == cfg.SOFTMAX_WARPS + cfg.GATHER_WARPS + cfg.AUX_WARPS and cfg.TOTAL_WARPS % 4 == 0,
+                f"{flavor}: TOTAL_WARPS must be SOFTMAX_WARPS + GATHER_WARPS + 4 (= {cfg.SOFTMAX_WARPS} + {cfg.GATHER_WARPS} + 4) and a multiple of 4 (got {cfg.TOTAL_WARPS})",
+            ),
+            (cfg.THREADS_PER_CTA == 32 * cfg.TOTAL_WARPS, f"{flavor}: THREADS_PER_CTA must be 32 x TOTAL_WARPS"),
+            (cfg.SOFTMAX_WARP_BASE == 0 and cfg.GATHER_WARP_BASE == cfg.SOFTMAX_WARPS, f"{flavor}: the gather warps follow the softmax warpgroup(s)"),
+            (
+                cfg.MMA_WARP_ID == cfg.GATHER_WARP_BASE + cfg.GATHER_WARPS
+                and cfg.TMALDG_WARP_ID == cfg.MMA_WARP_ID + 1
+                and cfg.SCHED_WARP_ID == cfg.MMA_WARP_ID + 2
+                and cfg.SPARE_WARP_ID == cfg.MMA_WARP_ID + 3 == cfg.TOTAL_WARPS - 1,
+                f"{flavor}: the last warpgroup is MMA / TMA-LDG / scheduler / spare in that order (a wrong warp takes a role)",
+            ),
+            # arrival counts == the body's arrive sites
+            (cfg.ONE_LANE == 1 and cfg.SOFTMAX_LANES == 32 * cfg.SOFTMAX_WARPS, f"{flavor}: ONE_LANE is 1 and SOFTMAX_LANES is 32 x SOFTMAX_WARPS"),
+            (
+                cfg.KV_FULL_ARRIVERS == cfg.GATHER_WARPS,
+                f"{flavor}: mb_kv_full's init is one expect_tx per gather warp (got {cfg.KV_FULL_ARRIVERS} vs {cfg.GATHER_WARPS}); a mismatch is a stage that never fills or over-arrives",
+            ),
+            (
+                cfg.IDS_EMPTY_ARRIVERS == cfg.GATHER_WARPS + cfg.SOFTMAX_WARPS,
+                f"{flavor}: mb_ids_empty's init is one elected lane per list-reading warp = GATHER_WARPS + SOFTMAX_WARPS (got {cfg.IDS_EMPTY_ARRIVERS})",
+            ),
+            (
+                cfg.READ_TILE_ARRIVERS == cfg.SOFTMAX_WARPS + 1 + 1 + cfg.GATHER_WARPS,
+                f"{flavor}: READ_TILE_ARRIVERS must be softmax + MMA + TMA + gather = {cfg.SOFTMAX_WARPS + 2 + cfg.GATHER_WARPS} (got {cfg.READ_TILE_ARRIVERS}); "
+                f"a wrong count is an unreachable scheduler mbarrier, i.e. a hang at EVERY shape",
+            ),
+            (
+                cfg.BAR_TMEM_THREADS == 32 * (cfg.SOFTMAX_WARPS + 1) and cfg.BAR_SOFTMAX_THREADS == 32 * cfg.SOFTMAX_WARPS_PER_GROUP,
+                f"{flavor}: the named barriers count the MMA warp + EVERY softmax warp (160 at one column group, 288 at two) and ONE column group's "
+                f"four warps (128) -- got {cfg.BAR_TMEM_THREADS} / {cfg.BAR_SOFTMAX_THREADS}",
+            ),
+            # gather bytes: the per-warp expect_tx x warps == the stage
+            (cfg.BLOCKS_PER_WARP == cfg.BLOCKS_PER_TILE // cfg.GATHER_WARPS, f"{flavor}: BLOCKS_PER_WARP must be 32 / GATHER_WARPS"),
+            (
+                cfg.GATHER_BOXES == (cfg.TILE_K * cfg.BPE) // _GATHER4_BOX_BYTES and cfg.GATHER_BOX_ELEMS == _GATHER4_BOX_BYTES // cfg.BPE,
+                f"{flavor}: a 256-wide bf16 row is 4 boxes of 64 elements",
+            ),
+            (cfg.GATHER_ISSUE_BYTES == _GATHER4_ROWS * _GATHER4_BOX_BYTES, f"{flavor}: one gather4 moves 4 rows x 128 B = 512 B"),
+            (
+                cfg.GATHERS_PER_WARP_PER_STAGE == cfg.BLOCKS_PER_WARP * cfg.GATHER_BOXES,
+                f"{flavor}: gathers per warp per stage = blocks per warp x boxes per row",
+            ),
+            (
+                cfg.KV_TX_BYTES_PER_WARP == cfg.GATHERS_PER_WARP_PER_STAGE * cfg.GATHER_ISSUE_BYTES,
+                f"{flavor}: the per-warp expect_tx must equal its gather4 bytes (got {cfg.KV_TX_BYTES_PER_WARP}); a consumer waiting on bytes that never come is a hang",
+            ),
+            (
+                cfg.KV_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == cfg.KV_STAGE_BYTES == cfg.TILE_N * cfg.TILE_K * cfg.BPE,
+                f"{flavor}: the gather warps' expect_tx must sum to the 64 KiB stage ({cfg.KV_TX_BYTES_PER_WARP} x {cfg.GATHER_WARPS} vs {cfg.KV_STAGE_BYTES})",
+            ),
+            # the Q^T / gate box: one token per item
+            (cfg.PACK_GQA == 1, f"{flavor}: the work item IS the token's packed query-head group (PACK_GQA must be 1)"),
+            (
+                cfg.Q_BOX_TOKENS == 1,
+                f"{flavor}: one query token per work item (Q_BOX_TOKENS must be 1; got {cfg.Q_BOX_TOKENS}) -- a multi-token item is a different kernel form",
+            ),
+            (
+                1 <= cfg.QH_PER_KH <= cfg.N_Q,
+                f"{flavor}: the token's query heads must fit the N_Q = {cfg.N_Q} tile (got qh_per_kh={cfg.QH_PER_KH}); above it the adapter declines",
+            ),
+            (cfg.Q_BOX_ROWS == cfg.Q_BOX_TOKENS * cfg.QH_PER_KH, f"{flavor}: Q_BOX_ROWS must be Q_BOX_TOKENS x QH_PER_KH (got {cfg.Q_BOX_ROWS})"),
+            (cfg.Q_SLOT_BYTES == cfg.N_Q * cfg.TILE_K * cfg.BPE, f"{flavor}: a Q^T slot is N_Q x TILE_K x BPE = 8 KiB"),
+            (
+                cfg.Q_TX_BYTES == cfg.Q_BOX_ROWS * cfg.TILE_K * cfg.BPE,
+                f"{flavor}: Q_TX_BYTES must be the Q BOX's bytes (Q_BOX_ROWS x TILE_K x BPE = {cfg.Q_BOX_ROWS * cfg.TILE_K * cfg.BPE}, got {cfg.Q_TX_BYTES}); "
+                f"an expect_tx of the 8 KiB slot against a {cfg.Q_BOX_ROWS}-row delivery never completes -- a hang at every shape",
+            ),
+            (
+                cfg.GATE_TX_BYTES == cfg.Q_BOX_ROWS * cfg.TILE_O * cfg.GATE_BPE,
+                f"{flavor}: GATE_TX_BYTES must be the gate BOX's bytes (Q_BOX_ROWS x TILE_O x GATE_BPE = {cfg.Q_BOX_ROWS * cfg.TILE_O * cfg.GATE_BPE}, got {cfg.GATE_TX_BYTES})",
+            ),
+            (cfg.Q_TX_BYTES <= cfg.Q_SLOT_BYTES and cfg.GATE_TX_BYTES <= cfg.Q_SLOT_BYTES, f"{flavor}: the Q / gate box must fit the aliased slot"),
+            # swizzles and the k-step
+            (cfg.Q_SWZ_BYTES == cfg.K_SWZ_BYTES == cfg.V_SWZ_BYTES == 128, f"{flavor}: Q / K / V operands are SW128 (the gather box is one 128-B span)"),
+            (
+                cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE and cfg.P_SWZ_BYTES in (32, 64),
+                f"{flavor}: P^T row bytes must be the 32 B or 64 B swizzle atom (N_Q x BPE); got {cfg.P_SWZ_BYTES}",
+            ),
+            (cfg.TILE_K_HW == 16, f"{flavor}: TILE_K_HW must be 16 (1-chunk f16 on SM10x; 2-chunk is silently wrong)"),
+            # the staged list
+            (
+                _SPARSE_TOPK_MIN <= cfg.BLOCK_TOPK <= _SPARSE_TOPK_MAX and cfg.BLOCK_TOPK % 4 == 0,
+                f"{flavor}: BLOCK_TOPK must be a multiple of 4 in [{_SPARSE_TOPK_MIN}, {_SPARSE_TOPK_MAX}] (got {cfg.BLOCK_TOPK}); the ids row stride is a bulk-copy length (16-B multiples)",
+            ),
+            (cfg.IDS_TX_BYTES == cfg.BLOCK_TOPK * 4 and cfg.IDS_TX_BYTES % 16 == 0, f"{flavor}: IDS_TX_BYTES must be BLOCK_TOPK x 4 (got {cfg.IDS_TX_BYTES})"),
+            (
+                cfg.IDS_SLOT_BYTES == cfg.IDS_TX_BYTES + _SPARSE_IDS_SLOT_PAD_BYTES and cfg.IDS_SLOT_BYTES % 16 == 0,
+                f"{flavor}: IDS_SLOT_BYTES must be IDS_TX_BYTES + the 64-B reserve",
+            ),
+            (cfg.MAX_TILES_PER_ITEM == -(-(cfg.BLOCK_TOPK + 1) // cfg.BLOCKS_PER_TILE), f"{flavor}: MAX_TILES_PER_ITEM is ceil((BLOCK_TOPK + 1) / 32)"),
+            (cfg.STAGES_KV >= 2, f"{flavor}: the K/V ring needs at least K(t) and V(t) resident (got {cfg.STAGES_KV})"),
+            (
+                cfg.STAGES_Q == 2 and cfg.STAGES_IDS == 2 and cfg.STAGES_GATE == 1 and cfg.SCHEDULER_STAGES == 2,
+                f"{flavor}: Q / ids rings are 2-deep (the one-item-ahead prefetch), the gate single-slot, the scheduler 2-deep",
+            ),
+            (
+                cfg.STAGES_S == len(cfg.S_ACC_OFF) == 2,
+                f"{flavor}: STAGES_S (got {cfg.STAGES_S}) must be the number of S^T TMEM slots (len(S_ACC_OFF) = {len(cfg.S_ACC_OFF)}) = 2: the s_full / "
+                f"s_empty / p_full / bmm2_done rings, the sP buffers and the column-max scratch's parity slots are all that deep -- a depth the TMEM "
+                f"map does not hold is a stale S^T slot read from the first reuse (a silent wrong answer, no crash)",
+            ),
+            # SMEM: the byte table with alignment modelled, against the carveout the config claims
+            (
+                st["sQ"] % 1024 == 0 and st["sP"] % 1024 == 0 and st["sKV"] % 1024 == 0,
+                f"{flavor}: every descriptor-read / SW128 buffer must start 1024-B aligned (sQ {st['sQ']}, sP {st['sP']}, sKV {st['sKV']})",
+            ),
+            (st["sIds"] % 16 == 0, f"{flavor}: the bulk-copy destination sIds must start 16-B aligned (got {st['sIds']})"),
+            (cfg.SMEM_TOTAL_BYTES == lay["total"], f"{flavor}: SMEM_TOTAL_BYTES ({cfg.SMEM_TOTAL_BYTES}) disagrees with the layout ({lay['total']})"),
+            (
+                cfg.SMEM_CARVEOUT_BYTES in (SMEM_STANDARD_CARVEOUT_BYTES, SMEM_USABLE_BYTES),
+                f"{flavor}: SMEM_CARVEOUT_BYTES is the 227 KiB standard carveout or the 320 KiB usable oversized one",
+            ),
+            (
+                lay["total"] <= SMEM_USABLE_BYTES,
+                f"{flavor}: SMEM {lay['total']} B (sQ {cfg.STAGES_Q} x {cfg.N_Q * cfg.TILE_K * cfg.BPE} + sP {cfg.STAGES_S} x {cfg.TILE_N * cfg.N_Q * cfg.BPE} + sKV {cfg.STAGES_KV} x "
+                f"{cfg.TILE_N * cfg.TILE_K * cfg.BPE} + sIds {cfg.STAGES_IDS} x {cfg.IDS_SLOT_BYTES} + red {(cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.COLS_PER_GROUP * 4} + misc {_SPARSE_SMEM_MISC_BYTES}, "
+                f"1024-B aligned) exceeds the {SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout; overflowing it does NOT fail the launch, it clobbers the last buffer",
+            ),
+            (
+                cfg.SMEM_CARVEOUT_BYTES == lay["carveout"],
+                f"{flavor}: SMEM {lay['total']} B needs the {lay['carveout'] // 1024} KiB carveout (standard 227 KiB = L1 intact; oversized = L1 to 8 kB), the config claims {cfg.SMEM_CARVEOUT_BYTES // 1024} KiB",
+            ),
+            (
+                cfg.DESC_VERSION == lay["desc_version"],
+                f"{flavor}: the last K/V stage starts at {st['sKV_last']} B, so the tcgen05 descriptor version must be {lay['desc_version']} (got {cfg.DESC_VERSION}); "
+                f"a version-0 descriptor at or past {TCGEN05_V0_ADDR_LIMIT} wraps to offset 0 and the MMA multiplies the bottom of SMEM",
+            ),
+            # TMEM
+            (
+                cfg.TMEM_COLS == 64 and cfg.TMEM_COLS >= (cfg.STAGES_S + len(cfg.O_OFF)) * cfg.N_Q and (cfg.TMEM_COLS & (cfg.TMEM_COLS - 1)) == 0,
+                f"{flavor}: TMEM is (STAGES_S + 2 O^T d-blocks) x N_Q = 4 x N_Q fp32 columns rounded to a power of two = 64",
+            ),
+            (
+                cfg.S_ACC_OFF == (0, cfg.N_Q) and cfg.O_OFF == (2 * cfg.N_Q, 3 * cfg.N_Q),
+                f"{flavor}: TMEM map is S^T slots at [0, N_Q), [N_Q, 2 N_Q) and O^T d-blocks at [2 N_Q, 3 N_Q), [3 N_Q, 4 N_Q)",
+            ),
+            # registers
+            (
+                cfg.ENTRY_REGS == sparse_entry_regs(cfg.TOTAL_WARPS),
+                f"{flavor}: ENTRY_REGS must be the launch's per-thread count for {cfg.TOTAL_WARPS} warps = {sparse_entry_regs(cfg.TOTAL_WARPS)} (got {cfg.ENTRY_REGS})",
+            ),
+            (
+                all(r % 8 == 0 and 24 <= r <= 256 for r in (cfg.SOFTMAX_REGS, cfg.GATHER_REGS, cfg.AUX_REGS, cfg.ENTRY_REGS)),
+                f"{flavor}: every per-role register count must be a multiple of 8 in 24..256",
+            ),
+            (
+                (not cfg.REG_SPLIT_DECLARED)
+                or cfg.SOFTMAX_WARPS * cfg.SOFTMAX_REGS + cfg.GATHER_WARPS * cfg.GATHER_REGS + cfg.AUX_WARPS * cfg.AUX_REGS == cfg.ENTRY_REGS * cfg.TOTAL_WARPS,
+                f"{flavor}: the register split must balance the ENTRY pool: {cfg.SOFTMAX_WARPS} x {cfg.SOFTMAX_REGS} + {cfg.GATHER_WARPS} x {cfg.GATHER_REGS} + {cfg.AUX_WARPS} x {cfg.AUX_REGS} = "
+                f"{cfg.SOFTMAX_WARPS * cfg.SOFTMAX_REGS + cfg.GATHER_WARPS * cfg.GATHER_REGS + cfg.AUX_WARPS * cfg.AUX_REGS} != {cfg.ENTRY_REGS} x {cfg.TOTAL_WARPS} = {cfg.ENTRY_REGS * cfg.TOTAL_WARPS}; "
+                f"a sum above the pool parks the last INCREASE warp forever (a hang at 100 % SM utilisation at every shape)",
+            ),
+            # features
+            (
+                cfg.MASK_FLAGS == MASK_NONE,
+                f"{flavor}: the selection IS the mask -- no band / padded mask bits (got MASK_FLAGS={cfg.MASK_FLAGS}); per-batch lengths ride SEQ_KV_LENS_PRESENT",
+            ),
+            (cfg.HAS_SINK == 0, f"{flavor}: no sink"),
+            (cfg.CTA_MMA == 1 and cfg.CGA_M == 1 and cfg.CGA_N == 1, f"{flavor}: one cga1 CTA per SM"),
+            (
+                not cfg.PAGED_KV or (cfg.PAGE_SIZE > 0 and cfg.PAGE_SIZE % cfg.BLOCK_SIZE == 0),
+                f"{flavor}: page_size must be a positive multiple of BLOCK_SIZE = {cfg.BLOCK_SIZE} (got {cfg.PAGE_SIZE}) or a block straddles two pages",
+            ),
+            (
+                not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1,
+                f"{flavor}: the paged form must force SEQ_KV_LENS_PRESENT=1 -- a page pool has no dense extent, so the visible range (and the "
+                f"gather rows past it, which read as -1) can only come from the per-batch KV lengths",
+            ),
+            (
+                cfg.PAGED_KV == 1 or cfg.PAGE_SIZE == 0,
+                f"{flavor}: PAGE_SIZE is 0 exactly when the kernel is not paged (the body divides by it only under PAGED_KV)",
+            ),
+            (cfg.SPLIT_KV >= 1, f"{flavor}: split_kv must be >= 1"),
+            (
+                cfg.SPLIT_KV <= cfg.MAX_TILES_PER_ITEM,
+                f"{flavor}: split_kv ({cfg.SPLIT_KV}) must not exceed MAX_TILES_PER_ITEM ({cfg.MAX_TILES_PER_ITEM}) -- a larger split has an EMPTY chunk on "
+                f"every item (a dead work item that gathers 128 KiB of -1 rows and writes an identity partial)",
+            ),
+            (
+                not (cfg.SPLIT_KV > 1 and cfg.EPILOGUE_GATE),
+                f"{flavor}: split_kv > 1 with EPILOGUE_GATE is not served -- a split's partials are gate-free and the combine applies sigmoid(G) to the "
+                f"fp32 merged value (the adapter compiles the ungated kernel and the gated combine)",
+            ),
+            (
+                not (cfg.SPLIT_KV > 1 and cfg.THD_VARLEN),
+                f"{flavor}: split_kv > 1 under THD is not served -- the persistent claim-counter scheduler hands out (token, KV head) units with no split axis",
+            ),
+            (
+                not (cfg.LIST_PER_SEQUENCE and cfg.THD_VARLEN),
+                f"{flavor}: list_per_sequence under THD is not served -- the packed form's block_ids are one row per packed token",
+            ),
+            (
+                not cfg.LIST_PER_SEQUENCE or cfg.BOTTOM_RIGHT == 1,
+                f"{flavor}: list_per_sequence requires BOTTOM_RIGHT -- the shared list is anchored at the step-0 position kv_len - S_q (the decode / MTP "
+                f"form); a top-left per-sequence list has no serving meaning",
+            ),
+            (
+                not (cfg.BOTTOM_RIGHT and cfg.THD_VARLEN),
+                f"{flavor}: bottom_right under THD is not served -- the packed form's position is the token's offset in its sequence (top-left)",
+            ),
+            (
+                not cfg.THD_VARLEN or cfg.SEQ_KV_LENS_PRESENT == 1,
+                f"{flavor}: THD/varlen must force SEQ_KV_LENS_PRESENT=1, or every sequence attends the whole pack",
+            ),
+            (
+                not (cfg.THD_VARLEN and cfg.PAGED_KV),
+                f"{flavor}: THD x paged is not served -- the packed sequence's K / V row offset (cu_k[b]) composes with a dense [1, T_kv, H_kv, D] "
+                f"tensor only, never with a page pool; one of THD_VARLEN / PAGED_KV per record (the adapter declines the combination by name)",
+            ),
+            (not cfg.SEQ_Q_LENS_PRESENT or cfg.SEQ_KV_LENS_PRESENT == 1, f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
+            (cfg.SCHEDULER_POLICY == SCHED_NATURAL, f"{flavor}: the item scheduler is NATURAL in v1 (LPT needs per-item costs)"),
+        ]
+    )
+
+
+def _sparse_arms_requested(params: TemplateParams) -> Tuple[str, ...]:
+    arms = []
+    if params.epilogue_gate:
+        arms.append("epilogue_gate")
+    if params.thd_varlen:
+        arms.append("thd_varlen")
+    if params.paged_kv:
+        arms.append("paged_kv")
+    if (params.split_kv or 1) > 1:
+        arms.append("split_kv")
+    if params.qsa_list_per_sequence:
+        arms.append("list_per_sequence")
+    if params.bottom_right:
+        arms.append("bottom_right")
+    if not params.qsa_include_open_block:
+        arms.append("pure_list")
+    if params.seq_q_lens_present:
+        arms.append("seq_q_lens")
+    return tuple(arms)
+
+
+def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softmax_groups: int = 0) -> Tuple[CfgD256Sparse, TmaIters]:
+    """Config for sm107/sparse_d256_f16.py from the adapter's TemplateParams (``qsa_block_topk`` = the list width, ``qh_per_kh`` =
+    the token's query heads on the N axis).  ``gather_warps`` selects the gather population: 8 (the default) or 4 (the named
+    fallback; -25 % gather issue rate).  The warp total is 4 x groups softmax + gather + 4 auxiliary warps, the entry register count
+    the register file over it rounded down to the 8-register granule: 20 warps / 96 at the default (8 gather, two groups), 16 / 128
+    at one group with 8 gather warps or two groups with 4, 12 / 168 at one group with 4.
+    ``softmax_groups`` (appended) selects the softmax SPLIT: 0 = the record's ``qsa_softmax_groups`` (itself 0 = the flavor default,
+    TWO 4-warp groups of 8 columns: 20 warps at 8 gather warps, 96 entry registers flat; 16 warps / 128 at the 4-gather-warp fallback),
+    1 = ONE 4-warp column group of 16 columns (the pre-split body, 16 warps) -- a performance knob: the same function, bitwise, at either value.
+
+    Backstop only: every rejection here must also be a decline of the adapter's claims record (reaching a ValueError from a
+    served record is a claims bug, not a user error).  Returns ``(cfg, TmaIters)`` like every sibling factory."""
+    flavor = _SPARSE_FLAVOR
+    if not params.qsa_block_topk:
+        raise ValueError(f"{flavor}: not an index-list record (qsa_block_topk=0); the dense templates serve it")
+    if params.qsa_block_size != _SPARSE_BLOCK_SIZE:
+        raise ValueError(f"{flavor}: qsa_block_size must be {_SPARSE_BLOCK_SIZE} (one tma_gather4 = four rows); got {params.qsa_block_size}")
+    if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
+        raise ValueError(f"{flavor}: f16/bf16 inputs only (got dtype_qkv={params.dtype_qkv}); the gathered tile has no FP8 arm")
+    dtype_o = resolve_dtype_o(params)
+    if dtype_o != params.dtype_qkv:
+        raise ValueError(f"{flavor}: half input requires dtype_o == dtype_qkv; got dtype_o={dtype_o}")
+    if params.cta_mma != 1:
+        raise ValueError(f"{flavor}: one cga1 CTA per SM (cta_mma must be 1; got {params.cta_mma})")
+    if not params.pack_gqa:
+        raise ValueError(f"{flavor}: the work item is the token's packed query-head group (pack_gqa must be True)")
+    if not 1 <= params.qh_per_kh <= _SPARSE_N_Q:
+        raise ValueError(f"{flavor}: qh_per_kh must be in 1..{_SPARSE_N_Q} (the token's query heads form the N axis); got {params.qh_per_kh}")
+    if params.window_left is not None or params.window_right is not None:
+        raise ValueError(f"{flavor}: the selection IS the mask; a diagonal band (window_left / window_right) is not part of this kernel")
+    if params.has_sink:
+        raise ValueError(f"{flavor}: no sink")
+    if (
+        params.decode_q_tile
+        or params.decode_tile
+        or params.ragged_q
+        or params.mma_2x2
+        or params.pv_bf16
+        or params.softmax_f16
+        or params.softmax_scale_prefolded
+        or params.exp2_fma_split
+        # the dense line's own compile-time options: the sparse body has no field for any of them, so a record that sets one would
+        # render a kernel that silently ignores it (negate_scores: the signed scale is applied in-kernel instead)
+        or params.negate_scores
+        or params.kv_tail_mask
+        or params.thd_batch_one
+        or params.lpt_head_group != 1
+        or params.lpt_q_tiles
+        or params.lpt_l2_size_mib
+    ):
+        raise ValueError(
+            f"{flavor}: decode_q_tile / decode_tile / ragged_q / mma_2x2 / pv_bf16 / softmax_f16 / softmax_scale_prefolded / exp2_fma_split / "
+            f"negate_scores / kv_tail_mask / thd_batch_one / lpt_head_group / lpt_q_tiles / lpt_l2_size_mib are other kernels' specializations"
+        )
+    if params.sched_policy not in (None, SCHED_NATURAL):
+        raise ValueError(f"{flavor}: sched_policy must be NATURAL or None in v1 (got {params.sched_policy})")
+    if params.paged_kv and (params.page_size <= 0 or params.page_size % _SPARSE_BLOCK_SIZE != 0):
+        raise ValueError(f"{flavor}: page_size must be a positive multiple of {_SPARSE_BLOCK_SIZE} (got {params.page_size}) or a block straddles two pages")
+    if params.seq_q_lens_present and not params.seq_kv_lens_present:
+        raise ValueError(f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT")
+    missing = [a for a in _sparse_arms_requested(params) if a not in SPARSE_D256_WIRED_ARMS]
+    if missing:
+        raise ValueError(
+            f"{flavor}: the kernel body does not carry the {', '.join(missing)} arm(s) yet (wired: {sorted(SPARSE_D256_WIRED_ARMS) or 'none'}); the adapter declines them"
+        )
+    if gather_warps not in (4, 8):
+        raise ValueError(f"{flavor}: gather_warps must be 8 (the default) or 4 (the named fallback); got {gather_warps}")
+    # 0 = the record's value, itself 0 = the flavor default: TWO column groups since the A/B/A on a 212-SM Rubin GPU (the split +20..+29 %
+    # over the one-group body, bitwise); softmax_groups=1 renders the one-group body (the measured base, 16 warps).
+    groups = int(softmax_groups) or int(getattr(params, "qsa_softmax_groups", 0) or 0) or 2
+    if groups not in _SPARSE_SOFTMAX_GROUPS:
+        raise ValueError(
+            f"{flavor}: softmax_groups must be 1 (one 4-warp column group of 16 columns) or 2 (two 4-warp groups of 8 columns, the softmax split); got {groups}"
+        )
+
+    b = bpe(params.dtype_qkv)
+    tile_n, tile_k, tile_o, n_q = 128, 256, 256, _SPARSE_N_Q
+    softmax_warps, aux_warps = _SPARSE_SOFTMAX_WARPS_PER_GROUP * groups, _SPARSE_AUX_WARPS
+    total_warps = softmax_warps + gather_warps + aux_warps
+    blocks_per_tile = tile_n // _SPARSE_BLOCK_SIZE
+    blocks_per_warp = blocks_per_tile // gather_warps
+    gather_boxes = (tile_k * b) // _GATHER4_BOX_BYTES
+    gathers_per_warp = blocks_per_warp * gather_boxes
+    issue_bytes = _GATHER4_ROWS * _GATHER4_BOX_BYTES
+    q_box_tokens = 1
+    q_box_rows = q_box_tokens * params.qh_per_kh
+    ids_tx = params.qsa_block_topk * 4
+    entry = sparse_entry_regs(total_warps)
+    # The split for when .maxnreg lands: softmax 240 and gather 96 on both one-group populations; at two column groups (half the
+    # per-warp softmax state) 136 / 72 on the 20-warp pool (96 x 20 = 1920) and 160 / 96 on the 16-warp fallback (128 x 16 = 2048);
+    # the aux group takes the remainder of the ENTRY pool so SUM(role regs x warps) == entry x warps by construction
+    # (80 at 16 warps, 168 at 12; 64 at 20; 96 on the two-group 16-warp fallback).
+    softmax_regs, gather_regs = (240, 96) if groups == 1 else ((136, 72) if gather_warps == 8 else (160, 96))
+    aux_regs = (entry * total_warps - softmax_warps * softmax_regs - gather_warps * gather_regs) // aux_warps
+    probe = CfgD256Sparse(
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        TILE_O=tile_o,
+        N_Q=n_q,
+        BLOCK_SIZE=_SPARSE_BLOCK_SIZE,
+        BLOCKS_PER_TILE=blocks_per_tile,
+        BLOCK_TOPK=params.qsa_block_topk,
+        MAX_TILES_PER_ITEM=-(-(params.qsa_block_topk + 1) // blocks_per_tile),
+        DTYPE_QKV=params.dtype_qkv,
+        DTYPE_O=dtype_o,
+        BPE=b,
+        BPE_O=bpe(dtype_o),
+        GATE_BPE=2,
+        Q_SWZ_BYTES=q_swz_bytes(tile_k, b),
+        K_SWZ_BYTES=q_swz_bytes(tile_k, b),
+        V_SWZ_BYTES=v_swz_bytes(tile_o, 1, b),
+        P_SWZ_BYTES=n_q * b,
+        TILE_K_HW=tile_k_hw(params.dtype_qkv),
+        STAGES_KV=3,
+        STAGES_S=_SPARSE_STAGES_S,
+        STAGES_Q=2,
+        STAGES_IDS=2,
+        STAGES_GATE=1,
+        SCHEDULER_STAGES=2,
+        SOFTMAX_WARPS=softmax_warps,
+        GATHER_WARPS=gather_warps,
+        AUX_WARPS=aux_warps,
+        TOTAL_WARPS=total_warps,
+        THREADS_PER_CTA=32 * total_warps,
+        SOFTMAX_WARP_BASE=0,
+        GATHER_WARP_BASE=softmax_warps,
+        MMA_WARP_ID=softmax_warps + gather_warps,
+        TMALDG_WARP_ID=softmax_warps + gather_warps + 1,
+        SCHED_WARP_ID=softmax_warps + gather_warps + 2,
+        SPARE_WARP_ID=softmax_warps + gather_warps + 3,
+        ONE_LANE=1,
+        SOFTMAX_LANES=32 * softmax_warps,
+        KV_FULL_ARRIVERS=gather_warps,
+        IDS_EMPTY_ARRIVERS=gather_warps + softmax_warps,
+        READ_TILE_ARRIVERS=softmax_warps + 1 + 1 + gather_warps,
+        BAR_TMEM_THREADS=32 * (softmax_warps + 1),
+        BAR_SOFTMAX_THREADS=32 * _SPARSE_SOFTMAX_WARPS_PER_GROUP,  # ONE column group's four warps
+        BLOCKS_PER_WARP=blocks_per_warp,
+        GATHER_BOXES=gather_boxes,
+        GATHER_BOX_ELEMS=_GATHER4_BOX_BYTES // b,
+        GATHER_ISSUE_BYTES=issue_bytes,
+        GATHERS_PER_WARP_PER_STAGE=gathers_per_warp,
+        KV_TX_BYTES_PER_WARP=gathers_per_warp * issue_bytes,
+        KV_STAGE_BYTES=tile_n * tile_k * b,
+        Q_BOX_TOKENS=q_box_tokens,
+        Q_BOX_ROWS=q_box_rows,
+        Q_SLOT_BYTES=n_q * tile_k * b,
+        Q_TX_BYTES=q_box_rows * tile_k * b,
+        GATE_TX_BYTES=q_box_rows * tile_o * 2,
+        IDS_TX_BYTES=ids_tx,
+        IDS_SLOT_BYTES=ids_tx + _SPARSE_IDS_SLOT_PAD_BYTES,
+        TMEM_COLS=64,
+        S_ACC_OFF=tuple(i * n_q for i in range(_SPARSE_STAGES_S)),  # one N_Q-column S^T slot per ring parity
+        O_OFF=tuple((_SPARSE_STAGES_S + i) * n_q for i in range(2)),  # the two O^T d-blocks after them
+        ENTRY_REGS=entry,
+        SOFTMAX_REGS=softmax_regs,
+        GATHER_REGS=gather_regs,
+        AUX_REGS=aux_regs,
+        REG_SPLIT_DECLARED=1,
+        SMEM_TOTAL_BYTES=0,  # filled from the layout below
+        SMEM_CARVEOUT_BYTES=SMEM_STANDARD_CARVEOUT_BYTES,
+        DESC_VERSION=0,
+        INCLUDE_OPEN_BLOCK=int(params.qsa_include_open_block),
+        EPILOGUE_GATE=int(params.epilogue_gate),
+        PAGED_KV=int(params.paged_kv),
+        PAGE_SIZE=int(params.page_size) if params.paged_kv else 0,
+        THD_VARLEN=int(params.thd_varlen),
+        BOTTOM_RIGHT=int(params.bottom_right),
+        SPLIT_KV=int(params.split_kv or 1),
+        LIST_PER_SEQUENCE=int(params.qsa_list_per_sequence),
+        SOFTMAX_GROUPS=groups,
+        SOFTMAX_WARPS_PER_GROUP=_SPARSE_SOFTMAX_WARPS_PER_GROUP,
+        COLS_PER_GROUP=n_q // groups,
+        PACK_GQA=1,
+        QH_PER_KH=int(params.qh_per_kh),
+        SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.paged_kv) else int(params.seq_kv_lens_present),
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
+        STATS_LOG2=int(params.stats_log2),
+        SCHEDULER_POLICY=SCHED_NATURAL,
+        MASK_FLAGS=MASK_NONE,
+        HAS_SINK=0,
+        CTA_MMA=1,
+        CGA_M=1,
+        CGA_N=1,
+    )
+    lay = d256_sparse_smem_layout(probe)
+    cfg = dataclasses_replace(probe, SMEM_TOTAL_BYTES=lay["total"], SMEM_CARVEOUT_BYTES=lay["carveout"], DESC_VERSION=lay["desc_version"])
+    _validate_cfg_d256_sparse(cfg, flavor)
     return cfg, _tma_iters(cfg)
 
 

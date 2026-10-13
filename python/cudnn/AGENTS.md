@@ -58,6 +58,13 @@ Numbered so reviews can cite them; the list grows — append, never renumber.
   inputs against their observed span as well as their effective shape, and check
   pointer alignment for the element type. The host-only detector is
   `test_dense_metadata_rejects_short_observed_storage_and_misalignment`.
+- **A runtime SF expert stride needs a per-plane contract.** FROST MoE weight
+  scales in `F8_128x4` require E outermost, dense byte storage within each expert
+  plane, sufficient blocked capacity per plane, and a non-overlapping 16-byte
+  aligned expert pitch. Whole-blob density does not establish this: an
+  interleaved expert view can pass it and silently select the wrong scales.
+  Detector: `gemm/frost/test_moe_grouped_block_scale_matmul_fwd.py`'s
+  `test_moe_weight_sf_plane_binding` and `test_moe_weight_sf_runtime_stride`.
 - **Native geometry caches retain no storage observations.** A geometry hit must
   still check the current dtype, device, address alignment and observed byte span.
   Mark an uninitialized cache entry explicitly: an empty shape is an input to
@@ -202,6 +209,16 @@ not become a compile key.
   hit (`stats()["memo_hits"]` grows, `hits` does not) and a key compiled by
   an earlier test in the same process would turn the first build into a memo
   hit too, leaving nothing on disk to reload.
+- **Compiled CuTe launchables belong to their CUDA context.** Pin a plan's device
+  when compiling storage-free declarations; compile and execute under that device,
+  and reject differently placed bindings before lowering pointers. An outer
+  argument-only `functools.lru_cache` can bypass `compiled_cache`'s device/context
+  key and return another GPU's launchable: delegate reuse to the device-aware
+  cache. Detector: intercept device contexts and compilation, build identical
+  plans for two device ordinals, and verify each reaches compilation in its own
+  context; no invalid cross-device GPU launch is needed. See the sparse SDPA
+  tests `test_compilation_and_launch_preserve_the_declared_or_resolved_device`
+  and `test_compilation_bypasses_argument_only_caches_across_devices`.
 - **Issue #604 is closed**: SM80 THD compiles use symbolic packed extents.
   The prepared backward host takes Int64 capacities and launch bounds at
   runtime, including the compact Stats head pitch and deterministic-counter

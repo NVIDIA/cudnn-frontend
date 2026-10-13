@@ -1336,6 +1336,8 @@ def test_sm107_mxfp8_tmem_map_fills_the_rubin_allocation_exactly():
     assert supported_cgas_for((192, 128), fp8=False, device_cc=(10, 7)) == (1, 2)
     assert supported_cgas_for((128, 128), fp8=True, device_cc=(10, 7)) == (2,)
     assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7)) == (1,)
+    # ...while d256 MXFP8 admits the pair too (test_sm107_d256_mxfp8_dense_legs_run_the_two_cta_pair pins where it is used)
+    assert supported_cgas_for((256, 256), fp8=True, device_cc=(10, 7), pertensor=False) == (1, 2)
 
 
 # --- LPT on Rubin, advertised PER D-SHAPE -----------------------------------
@@ -3299,10 +3301,10 @@ _SM107_SASS_PROBE = textwrap.dedent("""
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps no cubin
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
-    # The PRODUCTION CTA geometry, from the adapter itself: cga2 for d128 / d512, cga1 for d256 (review on #1129: a d256 fp8 row
-    # compiled at cga2 was a configuration the adapter never builds).  One width per Rubin quantized flavor today; if that ever
-    # widens, the unpack fails here and the row has to say which geometry it pins.
-    (cta_mma,) = supported_cgas_for((d, d), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    # The PRODUCTION dense geometry, from the adapter itself: the widest width the row serves the flavor at -- the cga2 pair for
+    # d128 / d512 and for d256 MXFP8 (config_sm100.d256_mxfp8_pair_leg), cga1 for d256 per-tensor FP8 (review on #1129: a d256
+    # fp8 row compiled at cga2 was a configuration the adapter never builds).
+    cta_mma = max(supported_cgas_for((d, d), fp8=True, device_cc=(10, 7), pertensor=(quant == "fp8")))
     params = TemplateParams(dtype_qkv=0, dtype_o=dtype_o, cta_mma=cta_mma, **MASKS[mask])  # E4M3 in; the row picks the O dtype
     mod = _load_sm100_kernel_module((d, d), params, fp8=True, pertensor=(quant == "fp8"), rubin=True)
     # By keyword: the MXFP8 kernels' compile() carries total_{q,kv}_sf_tiles between skv and d_qk.  Dense, B=1 H=128 S=8192,
@@ -3475,7 +3477,7 @@ _SM107_O_STORE_PROBE = textwrap.dedent("""
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
     fp8 = quant not in ("f16", "f16_2x2")
-    (cta_mma,) = supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 7), pertensor=(quant == "fp8"))
+    cta_mma = max(supported_cgas_for((d, d), fp8=fp8, device_cc=(10, 7), pertensor=(quant == "fp8")))  # the production dense width (the pair where the row serves it)
     # E4M3 in on the quantized rows, BF16 in on the f16 rows; the row picks the O dtype.  "f16_2x2" is the d512
     # 2x2-datapath sibling (TemplateParams.mma_2x2); the role-split rows pass the field's default.
     params = TemplateParams(dtype_qkv=(0 if fp8 else 2), dtype_o=dtype_o, cta_mma=cta_mma, mma_2x2=(quant == "f16_2x2"))
