@@ -35,8 +35,9 @@ measurements and numerics in https://github.com/NVIDIA/Megatron-LM/issues/5968).
     fast-exp, two-phase and vec=1 buckets included — against the contract;
   - CUDA graph capture: warmup -> capture fwd+bwd -> replay (including replay with new
     data and a smaller device-side true row count, checked on all four outputs and
-    bitwise against a direct call), and the loud error when the first call for a
-    configuration would JIT under capture;
+    bitwise against a direct call), deterministic-wrapper scratch lifetime after GC,
+    allocation/synchronization-free deterministic class execution, and the loud error
+    when the first call for a configuration would JIT under capture;
   - ``check_support`` boundaries (validated envelope: compute-capability major >= 10;
     ratio {2, 4} with coff
     {1, 2}, ratio 128 with coff {1, 2} x head_dim {128, 512}; BF16 kv/score, FP32 ape,
@@ -51,6 +52,8 @@ selects the numerics: "upstream" reproduces the eager code exactly
 (softmax weights rounded to bf16, bf16 multiply); "fp32" keeps all intermediates fp32
 with a single final bf16 rounding (the fused kernels' numerics); "fp64" is an oracle.
 """
+
+import gc
 
 import pytest
 import torch
@@ -999,7 +1002,7 @@ def test_backward_deterministic_workspace_contract(ratio, coff):
 
 @pytest.mark.L0
 @pytest.mark.filterwarnings("ignore::UserWarning")
-@pytest.mark.parametrize("ratio", [4, 128])
+@pytest.mark.parametrize("ratio", [2, 4, 128])
 def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
     """Class-API graph replays overwrite dAPE; no external zero-fill is required."""
     _require_sm100()
@@ -1041,6 +1044,107 @@ def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(grad_ape, reference)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.L0
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_backward_deterministic_execute_allocates_nothing_and_never_synchronizes():
+    """Warm class execution uses only caller buffers and never blocks the host."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, ratio, coff = 128, 4, 2
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+    bwd = compressor.CSACompressorBackward(
+        sample_kv=kv2,
+        sample_score=score2,
+        sample_ape=ape,
+        sample_cu_seqlens=cu,
+        sample_cu_seqlens_comp=cuc,
+        sample_out=torch.empty(total_comp, d, dtype=torch.bfloat16, device="meta"),
+        ratio=ratio,
+        coff=coff,
+        deterministic=True,
+    )
+    assert bwd.check_support()
+    bwd.compile()
+    workspace = torch.empty(bwd.scratch_workspace_bytes(), dtype=torch.uint8, device="cuda")
+    grad_kv = torch.empty_like(kv2)
+    grad_score = torch.empty_like(score2)
+    grad_ape = torch.empty_like(ape)
+
+    def execute():
+        bwd.execute(kv2, score2, ape, cu, cuc, go2, grad_kv, grad_score, grad_ape, workspace=workspace)
+
+    execute()  # populate the cached CuTe-DSL launchers before accounting
+    torch.cuda.synchronize()
+    allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+    sync_debug_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            execute()
+    finally:
+        torch.cuda.set_sync_debug_mode(sync_debug_mode)
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+    assert torch.isfinite(grad_ape).all()
+
+
+@pytest.mark.L0
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_backward_deterministic_wrapper_cuda_graph_retains_internal_workspace():
+    """Captured wrapper scratch survives local-reference release, GC, and allocator churn."""
+    _require_sm100()
+    compressor = _import_compressor()
+    d, ratio, coff = 128, 4, 2
+    kv, score, ape, cu, cuc, total_comp, go = _make_inputs([1023, 509], d, ratio, coff)
+    total = kv.shape[0]
+    kv2, score2, go2 = kv.view(total, -1), score.view(total, -1), go.view(total_comp, d)
+
+    def execute():
+        return compressor.csa_compressor_backward_wrapper(
+            kv2,
+            score2,
+            ape,
+            cu,
+            cuc,
+            go2,
+            ratio=ratio,
+            head_dim=d,
+            coff=coff,
+            deterministic=True,
+        )
+
+    expected = execute()  # compile and populate both cached launchers before capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = execute()
+
+        # The wrapper's workspace is intentionally not returned. Prove that dropping
+        # its local owner cannot make the captured raw pointer available for reuse.
+        gc.collect()
+        junk = [torch.full((256 * 1024,), 0xA5, dtype=torch.uint8, device="cuda") for _ in range(8)]
+        graph.replay()
+        graph.replay()
+        torch.cuda.synchronize()
+        for name in ("grad_kv", "grad_score", "grad_ape"):
+            assert torch.equal(captured[name], expected[name])
+
+        # Replays must read current input storage, not values retained at capture.
+        go2.copy_(torch.randn_like(go2))
+        graph.replay()
+        torch.cuda.synchronize()
+        expected_changed = execute()
+        torch.cuda.synchronize()
+        for name in ("grad_kv", "grad_score", "grad_ape"):
+            assert torch.equal(captured[name], expected_changed[name])
+        assert junk  # retain churn allocations until every replay has completed
     finally:
         graph.reset()
 
