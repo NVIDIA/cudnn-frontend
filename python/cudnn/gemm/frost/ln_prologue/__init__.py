@@ -61,7 +61,7 @@ PAIR_TILE_ROWS = 256
 K_PAD_MULTIPLE = 8
 MIN_K_BLOCK = 8
 
-DIAG_ARMS = ("", "one_pass_stats", "no_ln_norm", "no_ln", "no_epi_math")
+DIAG_ARMS = ("", "one_pass_stats", "no_ln_norm", "no_ln", "no_epi_math", "ln_first_tile_only")
 #: Tile order (performance only; the same function, bitwise): ``"major"`` = the pass is the grid's z axis (every row block of
 #: pass 0 before pass 1); ``"interleaved"`` = the pass folded into the scheduler's M axis so the two tiles reading one row block's
 #: z rows are adjacent (the second pass's z load is an L2 hit -- the HBM-side saving of a shared z load without resident weights).
@@ -145,7 +145,8 @@ class LnDualGemmParams:
     clc_stages: int = 2
     #: DIAGNOSTIC arms for relief measurements (never a production setting; the oracle tests pass only with ""):
     #: "one_pass_stats" (sum / sum-of-squares in one pass), "no_ln_norm" (statistics, no normalise write-back), "no_ln" (the LN
-    #: warps only forward the stages), "no_epi_math" (the epilogue stores zeros without reading TMEM).
+    #: warps only forward the stages), "no_epi_math" (the epilogue stores zeros without reading TMEM), "ln_first_tile_only" (the LN warps
+    #: normalise a row block's FIRST (pass, N tile) tile only and forward the others -- the upper bound of the LayerNorm-once-per-row-block lever).
     diag: str = ""
     #: Tile order (:data:`PASS_ORDERS`): "major" = the rendering's z-axis pass; "interleaved" = the pass folded into the
     #: scheduler's M axis (passes must be a power of two) -- the shared-z-load form; the output is bitwise the same.  The default stays
