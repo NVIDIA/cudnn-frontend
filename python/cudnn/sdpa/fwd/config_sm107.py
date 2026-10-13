@@ -1091,6 +1091,8 @@ def _d256_read_tile_arrivers(cta_mma: int) -> int:
 
 
 def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
+    """The cc 10.7 d256 config (per-tensor FP8 or MXFP8): tile geometry, ring depths, warp layout and the SMEM / descriptor-window
+    checks for the one-CTA and the 2-CTA-pair builds (``params.cta_mma``); raises with the failing tally on an impossible layout."""
     _validate_params(flavor, params)
     cta_mma = params.cta_mma
     dtype_o = resolve_dtype_o(params)
@@ -1256,18 +1258,9 @@ def _make_cfg_d256_family(params: TemplateParams, *, flavor: str, mxfp8: bool):
         last_sf = d256_mxfp8_last_sf_tile_start(cfg)
         _check(
             [
-                (
-                    # The gated MXFP8 module was traced and launched at CTA_MMA=1 ONLY
-                    # (the row pins cga1 for the quantized d256 flavors and so does the
-                    # adapter, supported_cgas_for((256, 256), fp8=True) == (1,)).  A
-                    # cga2 gated MXFP8 module (K/V rings halved, SF slabs full-size,
-                    # gate per CTA) fits the tallies below but was never validated;
-                    # a future widening of the row surfaces HERE, as a config raise,
-                    # not as an inherited unvalidated arm.
-                    not (cfg.EPILOGUE_GATE and cfg.CTA_MMA == 2),
-                    f"{flavor}: the epilogue gate is validated at CTA_MMA=1 only (got CTA_MMA={cfg.CTA_MMA}); a cga2 gated "
-                    f"MXFP8 module has never been traced or launched -- validate on Rubin before widening the row (engine-contract rule 9)",
-                ),
+                # The gated MXFP8 module runs at both widths: the dense unsplit legs take the 2-CTA pair since
+                # d256_mxfp8_pair_leg (K/V rings halved, SF slabs full-size, one gate tile per CTA -- the tallies
+                # below bound that layout too), validated by the MXFP8 gate tests at the pair's default width.
                 (
                     last_sf < TCGEN05_V0_ADDR_LIMIT,
                     f"{flavor}: the last scale-factor slab starts at {last_sf} B, at or past the {TCGEN05_V0_ADDR_LIMIT} B version-0 tcgen05 "
