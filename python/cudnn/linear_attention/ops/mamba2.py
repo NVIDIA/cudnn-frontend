@@ -748,8 +748,10 @@ def mamba2_bwd_op(
     check_dtype("dy", dy, x.dtype)
     if d_final_state is not None and 0 in d_final_state.stride():
         d_final_state = d_final_state.contiguous()
-    if z is not None and y_pre is None:
-        raise ValueError("mamba2: the backward of the z gate needs the forward's pre-gate output")
+    if z is not None:
+        if y_pre is None or y_pre.shape != x.shape:
+            raise ValueError("mamba2: the backward of the z gate needs the forward's pre-gate output, shaped like x")
+        check_dtype("y_pre", y_pre, x.dtype)
     if state_checkpoints is not None:
         check_dtype("state_checkpoints", state_checkpoints, x.dtype)
     dstate_dtype = initial_state.dtype if initial_state is not None else torch.float32

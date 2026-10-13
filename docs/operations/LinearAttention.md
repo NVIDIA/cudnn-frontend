@@ -17,8 +17,9 @@ are `<op>_summary` and `<op>_summary_bwd`. The same node types are available on 
 
 ## Support Matrix
 
-Requires an SM100 / SM103 / SM107 GPU (Blackwell data center) and the `cutedsl` extra (`nvidia-cutlass-dsl`). One
-linear-attention node per graph.
+Requires an SM100 / SM103 / SM107 GPU (Blackwell data center) and the CuTe DSL runtime the package depends on
+(`nvidia-cutlass-dsl`, a required dependency rather than an extra; these kernels need 4.7.0 or newer and the engines
+decline with an error that names the installed version otherwise). One linear-attention node per graph.
 
 | | GDN | KDA | GDN-2 | GDP | Mamba-2 |
 |---|---|---|---|---|---|
