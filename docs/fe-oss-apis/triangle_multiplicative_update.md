@@ -71,7 +71,7 @@ unrounded fp64 formula below 2e-2.
 | layout | contiguous `x` (and `out`) | `ValueError` (never a hidden copy) |
 | tensor extent | `B*N*N*c_z` and `2*c*B*N*n_pad` below 2^31 (32-bit element offsets in the kernels) | `NotImplementedError` |
 | device | every `execute` tensor on the device the plan was declared on | `ValueError` |
-| performance knobs | `k2_tile` / `knobs=TriMulKnobs(...)` within the measured domains of `cudnn.triangle_multiplicative_update.heuristics` (contraction tile, projection tile order, output-stage prologue form, scheduler ring depth) -- every value computes the same function | `ValueError` on an unknown name; `NotImplementedError` when the contraction tile cannot serve the geometry on this device |
+| performance knobs | `k2_tile` / `knobs=TriMulKnobs(...)` within the measured domains of `cudnn.triangle_multiplicative_update.heuristics` (contraction tile, projection tile order, output-stage prologue form, scheduler ring depth, row tile, LayerNorm pass form, epilogue arithmetic form, the two stages' `.minnctapersm` register-split hint) -- every value computes the same function | `ValueError` on an unknown name; `NotImplementedError` when the contraction tile cannot serve the geometry on this device |
 | autograd | not registered yet (forward only); under `torch.no_grad()` or on detached tensors the call is served | `NotImplementedError` when grad mode is on and an input or parameter `requires_grad` (a tensor without `grad_fn` would silently drop the gradient) |
 
 The `c != c_z` geometries (Protenix-v2 style), `c_z` outside the two widths, N below 33 and the incoming direction at `N % 8 != 0`
@@ -144,7 +144,11 @@ the first bucket at or below it. Every pick is the best of a three-pass measured
 B = 1 and 4, a control pair per cell; the second and third passes re-measured every alternative against the table they shipped). The
 constructor's `k2_tile=` (one axis) or `knobs=` (a `TriMulKnobs` whose set axes override the pick; an axis left `None` keeps the table's value)
 override it, `check_support` validates the vocabulary and probes the contraction tile's eligibility for the geometry without compiling. Every
-value of every domain computes the same function (bitwise; the tests pin it).
+value of every domain computes the same function (bitwise; the tests pin it). One axis is not a geometry pick: `min_blocks_per_mp`, the two
+LayerNorm-prologue stages' `.minnctapersm` launch hint (0 = the rendering as shipped, whose register split ptxas drops; 1 = the hint under
+which ptxas honours it), is resolved per RENDERING by `heuristics.register_split_hint(stage, c, has_bias, ln_pass_form, epi_math)` from the
+measured rows -- whether a rendering spills at the flat allocation depends on its bias arm and forms, not on N or B -- and a `knobs=` value
+overrides it for both stages.
 
 ## Traffic model and measured performance
 

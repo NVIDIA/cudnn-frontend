@@ -85,6 +85,10 @@ LN_PASS_FORMS = ("registers", "smem", "smem_rolled")
 #: The gated epilogue's arithmetic form (performance only; the same fp32 operations per element): ``"scalar"`` = one element at a time;
 #: ``"packed"`` = channel PAIRS on the packed fp32x2 ALU (``add.f32x2`` / ``mul.f32x2`` / ``fma.rn.f32x2``: half the ALU issue per element).
 EPI_MATHS = ("scalar", "packed")
+#: The ``.minnctapersm`` launch hint (performance only; bitwise the same output): 0 = no directive (the rendering as shipped: ptxas drops the
+#: body's ``setmaxnreg`` split and allocates one flat count per warp), 1 = the hint under which ptxas honours the split -- the kernel is one CTA
+#: per SM by its SMEM footprint either way (:class:`LnDualGemmParams`).  2 or more would cap the allocation at 80 registers: refused.
+MIN_BLOCKS_PER_MP_DOMAIN = (0, 1)
 #: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
 BODIES = {"sm107": "sm107_dual_gemm.py"}
 
@@ -158,6 +162,17 @@ class LnDualGemmParams:
     ln_pass_form: str = "registers"
     #: :data:`EPI_MATHS` -- the gated epilogue's arithmetic form (performance only).
     epi_math: str = "scalar"
+    #: The ``.minnctapersm`` hint handed to the kernel launch (the DSL's ``launch(..., min_blocks_per_mp=)``; performance only, bitwise the same
+    #: output).  0 = no directive = the rendering as shipped: ptxas DROPS the body's six ``setmaxnreg`` requests (neither ``.maxnreg`` nor
+    #: ``.minnctapersm`` -> C7508) and every warp runs at one flat allocation, which its occupancy heuristic may set at 80 = 65536 / (2 x 384)
+    #: -- two CTAs per SM -- with a few spills when the body's demand sits near it (the bias-OFF accumulators-arm c_out 256 rolled rendering:
+    #: REG 80, STACK 24, 5 / 7 spills reloaded per tile on the epilogue's hot path, +7-8 % on the kernel; its bias-ON twin is allocated 112
+    #: with no spill).  1 = the hint that lifts C7508: ptxas honours the split (USETMAXREG 6 -- epilogue + LN warps 232, producers 24; the
+    #: cubin is byte-identical to a ``.maxnreg 168`` build).  The ~309 KiB SMEM footprint makes the kernel one CTA per SM either way, so 1
+    #: states a fact; 2 or more would cap the allocation at 80 with the split impossible (refused).  A consumer sets it per RENDERING where
+    #: measured (the triangle multiplicative update's ``heuristics.register_split_hint``), never library-wide: the default keeps every
+    #: production cubin byte-identical.
+    min_blocks_per_mp: int = 0
 
     @property
     def dual(self) -> bool:
@@ -207,6 +222,12 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
         raise ValueError(f"ln_pass_form must be one of {LN_PASS_FORMS}, got {p.ln_pass_form!r}")
     if p.epi_math not in EPI_MATHS:
         raise ValueError(f"epi_math must be one of {EPI_MATHS}, got {p.epi_math!r}")
+    if isinstance(p.min_blocks_per_mp, bool) or p.min_blocks_per_mp not in MIN_BLOCKS_PER_MP_DOMAIN:
+        raise ValueError(
+            f"min_blocks_per_mp must be 0 (no .minnctapersm directive: the rendering as shipped, the register split dropped by ptxas) or 1 (the hint "
+            f"under which ptxas honours the body's setmaxnreg split); 2 or more would cap the allocation at 65536 / (2 x 384) = 80 registers with the "
+            f"split impossible -- got {p.min_blocks_per_mp!r}"
+        )
     if p.dual:
         if p.has_mask or p.skip_masked_tiles:
             raise ValueError("pairing='accumulators' has no output mask: has_mask and skip_masked_tiles must be False")

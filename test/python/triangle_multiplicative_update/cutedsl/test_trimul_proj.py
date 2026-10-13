@@ -373,14 +373,58 @@ from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1
 from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
 arm, kk = params_kw["arm"], int(params_kw["k"])
 lnf, epm = params_kw.get("ln_pass_form", "registers"), params_kw.get("epi_math", "scalar")
+has_bias, hint = bool(params_kw.get("has_bias", True)), int(params_kw.get("min_blocks_per_mp", 0))
 # the API's parameter sets (api.py compile(): biases on, the mask bound, no statistics, the heuristics' default knobs) at the pinned LN / epilogue forms
 if arm == "k1":
-    p = k1.proj_params(kk, kk, has_bias=True, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2, ln_pass_form=lnf, epi_math=epm)
+    p = k1.proj_params(kk, kk, has_bias=has_bias, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
 else:
-    p = k3.tail_params(kk, kk, has_bias=True, want_stats=False, ln_pass_form=lnf, epi_math=epm)
+    p = k3.tail_params(kk, kk, has_bias=has_bias, want_stats=False, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
 plan = ln_prologue.build_ln_dual_gemm(p)
 print("EXPECT_K", kk)
 """
+
+# The `.minnctapersm` hint (`min_blocks_per_mp`; `heuristics.register_split_hint`) on the renderings the hint exists for -- the bias-OFF forms, where
+# ptxas's two-CTAs-per-SM target (65536 / (2 x 384) = 80 registers) is reached with spills; the bias-ON twin of each as the identity reference.
+# Keyed (arm, K, ln_pass_form, epi_math, has_bias, min_blocks_per_mp); the values are BOUNDS measured on the branch's toolchain like the table above:
+#   hint 0 (the rendering as shipped): the bias-off K3 K = 256 rolled rendering at REG 80 / STACK 24 spills 5 / 7 on the EPILOGUE's hot path (three
+#     swizzled staging-store addresses + two row-decode constants reloaded per tile ahead of the TMEM loads: +7-8 % on the kernel vs the bias-on
+#     twin, 69.8 k local requests in ncu); the bias-off K1 K = 128 rolled rendering 1 / 1 at STACK 8; USETMAXREG 0 (the split dropped, C7508).
+#   hint 1 (.minnctapersm 1 -- the SAME cubin as a .maxnreg 168 build): ptxas honours the six setmaxnreg requests, USETMAXREG 6 (2 TRY_ALLOC 232 +
+#     4 DEALLOC 24), REG = the 168 entry count, and ONE per-launch spill remains (the scheduler's tile count stored at kernel ENTRY and reloaded once
+#     in four role prologues: STL 1 / LDL 4 per thread per launch, never per tile) -- on the bias-on rendering too (the identity: no new spill).
+_SASS_SPLIT_HINT_PINS = {
+    ("k3", 256, "smem_rolled", "packed", False, 0): dict(STL=5, LDL=7, USETMAXREG=0),
+    ("k3", 256, "smem_rolled", "packed", False, 1): dict(STL=1, LDL=4, USETMAXREG=6),
+    ("k3", 256, "smem_rolled", "packed", True, 1): dict(STL=1, LDL=4, USETMAXREG=6),
+    ("k1", 128, "smem_rolled", "packed", False, 0): dict(STL=1, LDL=1, USETMAXREG=0),
+    # the K1 K = 128 rolled bias-off rendering under the hint: the split honoured (USETMAXREG 6) but 4 / 13 spills at the 24-register producer
+    # roles (MEASURED on the branch's toolchain; the flat form's 1 / 1 at STACK 8 sat in a role that now holds 168) -- a per-rendering sign the
+    # A/B/A decides, which is why the hint is a rendering RULE (`heuristics.register_split_hint`) and not a library-wide default
+    ("k1", 128, "smem_rolled", "packed", False, 1): dict(STL=4, LDL=13, USETMAXREG=6),
+}
+
+
+@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint", sorted(_SASS_SPLIT_HINT_PINS))
+def test_sm107_register_split_hint_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint):
+    """Trace-compile the bias-off renderings (and the bias-on identity twin) with and without the `.minnctapersm` hint for sm_107a (no GPU): the
+    spill counts are bounds like the table above; USETMAXREG is EXACT -- 0 without the hint (the dropped split), 6 with it (the honoured split)."""
+    probe = sass_utils.run_sass_probe(
+        tmp_path,
+        probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
+        arch="sm_107a",
+        params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math=epi_math, has_bias=has_bias, min_blocks_per_mp=hint),
+        tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_{epi_math}_bias{int(has_bias)}_hint{hint}",
+    )
+    st = probe.stats
+    pins = _SASS_SPLIT_HINT_PINS[(arm, k, ln_pass_form, epi_math, has_bias, hint)]
+    print(
+        f"{arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} lines {st['LINES']} cubin {probe.cubin_md5}"
+    )
+    sass_utils.assert_no_new_spills(st, pins, tag=f"{arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint}: ")
+    assert st["USETMAXREG"] == pins["USETMAXREG"], (
+        f"{arm} K={k} bias {has_bias} hint {hint}: USETMAXREG {st['USETMAXREG']} != {pins['USETMAXREG']} -- the register split is "
+        f"{'honoured' if st['USETMAXREG'] else 'dropped'} where the hint says {'honoured' if pins['USETMAXREG'] else 'dropped'}; re-measure the roles and the pins"
+    )
 
 
 @pytest.mark.parametrize("arm,k,ln_pass_form,epi_math", sorted(_SASS_SPILL_PINS))

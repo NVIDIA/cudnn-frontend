@@ -19,6 +19,11 @@ function and stay op attributes the API never sets.
                      ``"smem"`` / ``"smem_rolled"`` = the row re-read from the SMEM stage in every pass, unrolled / rolled chunk loops -- the
                      rolled form has no K = 256 spills; bitwise the same output).
   ``epi_math``       the two stages' gated-epilogue arithmetic form (:data:`EPI_MATHS`: ``"scalar"`` / ``"packed"`` fp32x2 pairs; bitwise).
+  ``min_blocks_per_mp``  the two stages' ``.minnctapersm`` launch hint (:data:`MIN_BLOCKS_PER_MP_DOMAIN`: 0 = the rendering as shipped, its
+                     register split dropped by ptxas; 1 = the hint under which ptxas honours the split -- bitwise the same output).  An OVERRIDE
+                     axis only: ``None`` (the table never sets it) means the per-RENDERING rule :func:`register_split_hint`, applied at compile
+                     time with each stage's bias flag, because the fact it answers -- does this rendering spill at the flat allocation? -- is a
+                     property of (kernel, width, bias arm, LayerNorm / epilogue form), not of N or B.
 
 :func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class, keyed by hidden width ``c``,
 N bucket, batch bucket and direction: a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
@@ -38,7 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
-from cudnn.gemm.frost.ln_prologue import A0_PROLOGUES, EPI_MATHS, LN_PASS_FORMS, MIN_K_BLOCK_MN_MAJOR, PAIR_TILE_ROWS, PASS_ORDERS
+from cudnn.gemm.frost.ln_prologue import A0_PROLOGUES, EPI_MATHS, LN_PASS_FORMS, MIN_BLOCKS_PER_MP_DOMAIN, MIN_K_BLOCK_MN_MAJOR, PAIR_TILE_ROWS, PASS_ORDERS
 from cudnn.gemm.frost.ln_prologue import default_k_block as _substrate_default_k_block
 
 from .kernels import contraction as k2
@@ -78,6 +83,9 @@ class TriMulKnobs:
     #: appended axes (the two LayerNorm-prologue stages share them): the LayerNorm pass form and the epilogue arithmetic form
     ln_pass_form: Optional[str] = None
     epi_math: Optional[str] = None
+    #: appended (2026-10-13): the two stages' ``.minnctapersm`` launch hint -- an OVERRIDE axis the table never sets: ``None`` = the per-rendering
+    #: rule :func:`register_split_hint` (keyed by each stage's bias flag at compile time), so it is not one of the geometry axes ``is_complete`` names
+    min_blocks_per_mp: Optional[int] = None
 
     def is_complete(self) -> bool:
         return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages, self.k_block, self.ln_pass_form, self.epi_math)
@@ -92,6 +100,7 @@ class TriMulKnobs:
             k_block=self.k_block if self.k_block is not None else base.k_block,
             ln_pass_form=self.ln_pass_form if self.ln_pass_form is not None else base.ln_pass_form,
             epi_math=self.epi_math if self.epi_math is not None else base.epi_math,
+            min_blocks_per_mp=self.min_blocks_per_mp if self.min_blocks_per_mp is not None else base.min_blocks_per_mp,
         )
 
 
@@ -114,6 +123,11 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
         raise ValueError(f"ln_pass_form must be one of {LN_PASS_FORMS}, got {knobs.ln_pass_form!r}")
     if knobs.epi_math is not None and knobs.epi_math not in EPI_MATHS:
         raise ValueError(f"epi_math must be one of {EPI_MATHS}, got {knobs.epi_math!r}")
+    if knobs.min_blocks_per_mp is not None and (isinstance(knobs.min_blocks_per_mp, bool) or knobs.min_blocks_per_mp not in MIN_BLOCKS_PER_MP_DOMAIN):
+        raise ValueError(
+            f"min_blocks_per_mp must be one of {MIN_BLOCKS_PER_MP_DOMAIN} (the two LayerNorm-prologue stages' .minnctapersm launch hint: 0 = the rendering "
+            f"as shipped, 1 = ptxas honours the body's register split), got {knobs.min_blocks_per_mp!r}"
+        )
 
 
 # THE TABLE, part 1 -- the BUCKET picks.  Per hidden width ``c``: descending N floors, each with the COMPLETE knob set measured best over the bucket's
@@ -243,6 +257,29 @@ def default_k_block(n_res: int) -> int:
     return kb
 
 
+# THE RENDERING RULE -- the `.minnctapersm` launch hint per (stage, width, bias arm, LayerNorm form, epilogue form).  Not a geometry axis: the fact it
+# answers is whether THIS rendering spills at the flat register allocation ptxas picks when the body's setmaxnreg split is dropped (no `.maxnreg`,
+# no `.minnctapersm`: C7508).  The host SASS of every production rendering (sm_107a trace-compile, nvdisasm) says where: every bias-OFF rendering
+# is allocated EXACTLY 80 registers (= 65536 / (2 x 384 threads): ptxas's two-CTAs-per-SM target, reached with a few spills when the body's demand
+# sits near it) while every bias-ON one is allocated its demand (97-114) -- and the one rendering whose spills reach the hot path is the output
+# stage at c = 256 with the rolled LayerNorm form and no output biases: REG 80 / STACK 24, 5 STL / 7 LDL = three swizzled staging-store addresses
+# and two row-decode constants reloaded per tile ahead of the epilogue's TMEM loads (69.8 k local requests in ncu), +7.0..+8.0 % on the kernel
+# against its bias-ON twin on all nine c = 256 cells of the matrix, +3.0..+4.0 % on the whole call.  The hint lifts C7508 (the split honoured:
+# USETMAXREG 6, the epilogue + LayerNorm warps at 232, the producers at 24; the cubin byte-identical to a `.maxnreg 168` build); a row enters this
+# table only with its A/B/A on the 212-SM Rubin perf-node class (the same protocol as the geometry table), and the default 0 keeps every other
+# production rendering's cubin byte-identical to the one measured before the axis existed.
+_REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str], int] = {}
+
+
+def register_split_hint(stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str) -> int:
+    """The ``.minnctapersm`` hint a bare declaration hands the ``stage`` (``"k1"`` = the projection, ``"k3"`` = the output stage) rendering at this
+    hidden width, bias arm and LayerNorm / epilogue form: the MEASURED rows of :data:`_REGISTER_SPLIT_HINTS`, else 0 (the rendering as shipped).
+    A caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages."""
+    if stage not in ("k1", "k3"):
+        raise ValueError(f"stage must be 'k1' or 'k3', got {stage!r}")
+    return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), str(epi_math)), 0)
+
+
 def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:
     """The measured default knob set for this geometry: the (width, N bucket) pick with the (batch bucket, direction) refinements applied, the
     row tile from :func:`default_k_block` unless a pick or refinement sets it -- complete (every axis set)."""
@@ -282,11 +319,13 @@ __all__ = [
     "DEFAULT_K3_PROLOGUE",
     "K2_TILE_DOMAIN",
     "K_BLOCK_DOMAIN",
+    "MIN_BLOCKS_PER_MP_DOMAIN",
     "TriMulKnobs",
     "batch_bucket",
     "default_k_block",
     "k2_tile_for",
     "recommend",
+    "register_split_hint",
     "resolve",
     "validate_knobs",
 ]

@@ -433,6 +433,15 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         # Compile and load on the PLAN's device: the declaration may name a device other than torch's current one (a multi-GPU host with
         # ``x`` on ``cuda:1``).  A compiled launchable is bound to the context it was loaded in, so K1 / K3 and K2 are cached per
         # (parameter set, device) -- :func:`_substrate_plan_on`, :func:`_compile_contraction`.
+        # the re-read LayerNorm forms re-read the MN-major operand in every pass, which the transpose prologue's K-major writes would overwrite
+        # (a typed decline of the substrate): under `transpose` the output stage keeps the register form and the knob's value serves the
+        # projection stage alone
+        k3_ln_pass_form = self.knobs.ln_pass_form if self.knobs.k3_prologue == "mn_major" else "registers"
+        # the `.minnctapersm` launch hint: the caller's override for both stages, else the per-RENDERING rule with each stage's own bias flag
+        # (heuristics.register_split_hint: the fact is a property of the rendering, not of the geometry)
+        hint = self.knobs.min_blocks_per_mp
+        k1_hint = hint if hint is not None else th.register_split_hint("k1", self.c_z, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math)
+        k3_hint = hint if hint is not None else th.register_split_hint("k3", self.c_z, self.has_out_bias, k3_ln_pass_form, self.knobs.epi_math)
         with torch.cuda.device(self.device_index):
             self._plan_k1 = _substrate_plan_on(
                 k1.build_trimul_proj,
@@ -447,6 +456,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                     clc_stages=self.knobs.clc_stages,
                     ln_pass_form=self.knobs.ln_pass_form,
                     epi_math=self.knobs.epi_math,
+                    min_blocks_per_mp=k1_hint,
                 ),
                 self.device_index,
             )
@@ -460,11 +470,9 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                     eps=self.eps,
                     a0_prologue=self.knobs.k3_prologue,
                     clc_stages=self.knobs.clc_stages,
-                    # the re-read LayerNorm forms re-read the MN-major operand in every pass, which the transpose prologue's K-major writes
-                    # would overwrite (a typed decline of the substrate): under `transpose` the output stage keeps the register form and the
-                    # knob's value serves the projection stage alone
-                    ln_pass_form=(self.knobs.ln_pass_form if self.knobs.k3_prologue == "mn_major" else "registers"),
+                    ln_pass_form=k3_ln_pass_form,
                     epi_math=self.knobs.epi_math,
+                    min_blocks_per_mp=k3_hint,
                 ),
                 self.device_index,
             )

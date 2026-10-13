@@ -688,7 +688,9 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         for floor, bb, direction, override in rows:
             assert floor in floors and bb in th.BATCH_BUCKETS and direction in (None, "outgoing", "incoming")
             axes = [
-                a for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "k_block", "ln_pass_form", "epi_math") if getattr(override, a) is not None
+                a
+                for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "k_block", "ln_pass_form", "epi_math", "min_blocks_per_mp")
+                if getattr(override, a) is not None
             ]
             assert len(axes) == 1, (width, floor, bb, direction, axes)
             for d in (("outgoing", "incoming") if direction is None else (direction,)):
@@ -765,12 +767,54 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
         (dict(k_block=True), "k_block"),
         (dict(ln_pass_form="rows"), "ln_pass_form"),
         (dict(epi_math="vector"), "epi_math"),
+        (dict(min_blocks_per_mp=2), "min_blocks_per_mp"),  # two CTAs per SM would cap the allocation at 80 registers with the split impossible
+        (dict(min_blocks_per_mp=True), "min_blocks_per_mp"),
     ):
         with pytest.raises(ValueError, match=axis):
             th.validate_knobs(th.TriMulKnobs(**bad))
     th.validate_knobs(th.TriMulKnobs())  # every axis unset = "the table decides": a valid partial record
+    th.validate_knobs(th.TriMulKnobs(min_blocks_per_mp=1))
     with pytest.raises(TypeError):
         th.validate_knobs("CONFIG_bogus")
+
+
+def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
+    """The `.minnctapersm` hint is resolved per RENDERING (stage, width, bias arm, LayerNorm form, epilogue form), not per geometry: the table never
+    sets the axis (`recommend` leaves it None, `is_complete` does not name it), `register_split_hint` returns a domain member for every rendering the
+    API can build (0 = as shipped unless a measured row says 1), the bias-ON renderings are never hinted, and a caller's `knobs=` value overrides
+    the rule for both stages at compile time (pinned on the params the API hands the substrate, GPU-free)."""
+    from cudnn.gemm.frost.ln_prologue import LN_PASS_FORMS, EPI_MATHS, MIN_BLOCKS_PER_MP_DOMAIN
+    from cudnn.triangle_multiplicative_update import heuristics as th
+
+    assert th.MIN_BLOCKS_PER_MP_DOMAIN == MIN_BLOCKS_PER_MP_DOMAIN == (0, 1)
+    for c in (128, 256):
+        for n in (33, 256, 512, 1024):
+            for b in (1, 4):
+                kn = th.recommend(n, c, b, "outgoing")
+                assert kn.min_blocks_per_mp is None and kn.is_complete()
+    for stage in ("k1", "k3"):
+        for c in (128, 256):
+            for lnf in LN_PASS_FORMS:
+                for epm in EPI_MATHS:
+                    assert th.register_split_hint(stage, c, True, lnf, epm) == 0, "a bias-ON rendering is never hinted (no measured row)"
+                    assert th.register_split_hint(stage, c, False, lnf, epm) in MIN_BLOCKS_PER_MP_DOMAIN
+    for (stage, c, has_bias, lnf, epm), hint in th._REGISTER_SPLIT_HINTS.items():
+        assert stage in ("k1", "k3") and c in (128, 256) and has_bias is False and lnf in LN_PASS_FORMS and epm in EPI_MATHS and hint == 1, (
+            stage,
+            c,
+            has_bias,
+            lnf,
+            epm,
+            hint,
+        )
+    with pytest.raises(ValueError, match="stage"):
+        th.register_split_hint("k2", 128, False, "smem_rolled", "packed")
+    # the override reaches both stages' params; None hands each stage the rule with ITS bias flag
+    assert th.resolve(512, 256, 1, "outgoing", knobs=th.TriMulKnobs(min_blocks_per_mp=1)).min_blocks_per_mp == 1
+    assert th.resolve(512, 256, 1, "outgoing").min_blocks_per_mp is None
+    assert k3.tail_params(256, 256, has_bias=False, min_blocks_per_mp=1).min_blocks_per_mp == 1
+    assert k1.proj_params(256, 256, has_bias=False, has_mask=True, min_blocks_per_mp=1).min_blocks_per_mp == 1
+    assert k3.tail_params(256, 256, has_bias=False).min_blocks_per_mp == 0 and k1.proj_params(128, 128, has_bias=True, has_mask=True).min_blocks_per_mp == 0
 
 
 def test_k2_tile_knob_vocabulary_is_a_typed_decline_before_any_device_work():
@@ -823,6 +867,7 @@ def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_declin
         tapi.TriMulKnobs(k2_tile=k2.SMALL_N_MULTICAST_B2_TILE_CONFIG, clc_stages=4),
         tapi.TriMulKnobs(k_block=64),  # the row tile: 4 bi x 64 k per pair tile instead of the rule's 2 x 128 at N = 128
         tapi.TriMulKnobs(k_block=256),  # 1 bi x 256 k: the second half of every pair tile is padding at N = 128 (legal, wasteful)
+        tapi.TriMulKnobs(min_blocks_per_mp=1),  # the .minnctapersm hint: ptxas honours the two stages' register split (a launch attribute, the same body)
     ):
         plan = tapi.TriangleMultiplicativeUpdateFwd(x, "outgoing", c_hidden=c, has_mask=True, has_in_bias=True, has_out_bias=True, knobs=knobs)
         assert plan.check_support()

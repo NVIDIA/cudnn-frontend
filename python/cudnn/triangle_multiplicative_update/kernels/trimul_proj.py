@@ -57,9 +57,11 @@ def proj_params(
     pass_order: Optional[str] = None,
     ln_pass_form: Optional[str] = None,
     epi_math: Optional[str] = None,
+    min_blocks_per_mp: Optional[int] = None,
 ) -> LnDualGemmParams:
     """The substrate's compile-time parameters for the ``(c_z, c)`` geometry (K = ``c_z``, ``c`` output channels per pass);
-    ``clc_stages``, ``pass_order``, ``ln_pass_form`` and ``epi_math`` (performance only, bitwise the same planes) default to the substrate's."""
+    ``clc_stages``, ``pass_order``, ``ln_pass_form``, ``epi_math`` and ``min_blocks_per_mp`` (performance only, bitwise the same planes; the
+    last one is the launch's ``.minnctapersm`` hint under which ptxas honours the body's register split) default to the substrate's."""
     kw = {} if clc_stages is None else {"clc_stages": int(clc_stages)}
     if diag:
         kw["diag"] = str(diag)
@@ -69,6 +71,10 @@ def proj_params(
         kw["ln_pass_form"] = str(ln_pass_form)
     if epi_math is not None:
         kw["epi_math"] = str(epi_math)
+    if min_blocks_per_mp is not None:
+        kw["min_blocks_per_mp"] = (
+            min_blocks_per_mp if isinstance(min_blocks_per_mp, bool) else int(min_blocks_per_mp)
+        )  # a bool reaches the typed decline as itself
     return LnDualGemmParams(
         k=int(c_z),
         c_out=int(c),

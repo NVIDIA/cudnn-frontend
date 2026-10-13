@@ -63,10 +63,12 @@ def tail_params(
     diag: str = "",
     ln_pass_form: Optional[str] = None,
     epi_math: Optional[str] = None,
+    min_blocks_per_mp: Optional[int] = None,
 ) -> LnDualGemmParams:
     """The substrate's compile-time parameters of K3 for the ``(c_z, c)`` geometry.  Both GEMMs share one K (the ring stage is one k-tile of
     every operand), so ``c == c_z`` for now -- the Protenix-v2 ``c_z = 256, c = 128`` geometry is a typed decline until the per-GEMM k-tile
-    count lands.  ``ln_pass_form`` / ``epi_math`` (performance only, bitwise the same output) default to the substrate's."""
+    count lands.  ``ln_pass_form`` / ``epi_math`` / ``min_blocks_per_mp`` (performance only, bitwise the same output; the last one is the
+    launch's ``.minnctapersm`` hint under which ptxas honours the body's register split) default to the substrate's."""
     if int(c) != int(c_z):
         raise ValueError(f"K3 on the substrate needs c == c_z (one K for the value GEMM over y and the gate GEMM over z), got c={c}, c_z={c_z}")
     kw = {} if clc_stages is None else {"clc_stages": int(clc_stages)}
@@ -76,6 +78,10 @@ def tail_params(
         kw["ln_pass_form"] = str(ln_pass_form)
     if epi_math is not None:
         kw["epi_math"] = str(epi_math)
+    if min_blocks_per_mp is not None:
+        kw["min_blocks_per_mp"] = (
+            min_blocks_per_mp if isinstance(min_blocks_per_mp, bool) else int(min_blocks_per_mp)
+        )  # a bool reaches the typed decline as itself
     return LnDualGemmParams(
         k=int(c),
         c_out=int(c_z),

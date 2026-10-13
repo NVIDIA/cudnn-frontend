@@ -477,6 +477,45 @@ def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res,
     assert torch.equal(outs[0][1], outs[1][1]), f"{ln_pass_form}/{epi_math} changed the statistics"
 
 
+def test_register_split_hint_vocabulary_is_a_typed_decline():
+    """`min_blocks_per_mp` admits 0 (the rendering as shipped) and 1 (ptxas honours the body's setmaxnreg split); 2 would cap the allocation at
+    80 registers with the split impossible, a bool is not an int -- both a ValueError naming the axis, from the validator, before any build."""
+    for bad in (2, -1, True):
+        with pytest.raises(ValueError, match="min_blocks_per_mp"):
+            sub.validate_ln_dual_gemm_params(k3.tail_params(256, 256, has_bias=False, ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=bad))
+    for ok in (0, 1):
+        p = k3.tail_params(256, 256, has_bias=False, ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=ok)
+        sub.validate_ln_dual_gemm_params(p)
+        assert p.min_blocks_per_mp == ok
+    assert k3.tail_params(256, 256, has_bias=False).min_blocks_per_mp == 0  # None = the substrate's default: no directive
+
+
+@requires_rubin
+@pytest.mark.parametrize("n_res,batch,c_z,with_bias", [(217, 2, 128, False), (128, 1, 256, False), (33, 1, 256, True), (384, 1, 256, False)])
+def test_register_split_hint_is_bitwise_the_default_rendering(n_res, batch, c_z, with_bias):
+    """The `.minnctapersm` hint (`min_blocks_per_mp=1`: ptxas honours the register split instead of allocating the flat count) is a launch
+    attribute -- the SAME body, the same arithmetic: output and statistics BITWISE the hint-0 plan's, with and without the output biases, on the
+    rolled + packed forms the heuristics ship at c = 256 (the rendering whose bias-off form spills without the hint)."""
+    inp = _inputs(n_res, batch, c_z, c_z, with_bias, seed=23)
+    outs = []
+    for hint in (0, 1):
+        plan = k3.build_trimul_tail(
+            k3.tail_params(
+                c_z, c_z, has_bias=with_bias, want_stats=True, a0_prologue="mn_major", ln_pass_form="smem_rolled", epi_math="packed", min_blocks_per_mp=hint
+            )
+        )
+        assert plan.params.min_blocks_per_mp == hint
+        out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, out, stats, torch.cuda.current_stream().cuda_stream)
+        torch.cuda.synchronize()
+        assert not (out.float() == _SENTINEL).any(), f"hint {hint}: a never-written cell"
+        assert torch.isfinite(out.float()).all(), f"hint {hint}: a non-finite cell"
+        outs.append((out, stats))
+    assert torch.equal(outs[0][0], outs[1][0]), "the register-split hint changed the output"
+    assert torch.equal(outs[0][1], outs[1][1]), "the register-split hint changed the statistics"
+
+
 @requires_rubin
 def test_affine_fold_matches_its_folded_reference_and_its_distance_to_the_unfolded_function_is_measured():
     """``affine_fold = True``: the kernel computes the FOLDED function exactly as well as the unfolded kernel computes the unfolded one

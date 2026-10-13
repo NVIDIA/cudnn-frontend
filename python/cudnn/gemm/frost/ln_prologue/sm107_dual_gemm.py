@@ -37,6 +37,17 @@ WARP LAYOUT (12 warps x 32 = 384 threads per CTA; the register pool is the ENTRY
   trace-time cubin; the K1 test module's SASS pins hold the K = 128 / 256 counts): K1 K = 128 1 / 1, K1 K = 256 240 / 241 (664 B stack),
   K3 K = 128 1 / 1, K3 K = 256 499 / 504 (872 B), K = 384 K1 740 / 743 and K3 1375 / 1381 (1.7 KB, REG 80) -- K = 384 is NOT served by the
   triangle multiplicative update until a rendering without the register residency exists.
+  THE SECOND DIRECTIVE THAT LIFTS C7508: ``.minnctapersm 1`` = the public DSL's ``launch(..., min_blocks_per_mp=1)``
+  (``LnDualGemmParams.min_blocks_per_mp``, 0 by default).  With it ptxas HONOURS the six requests above -- USETMAXREG 6, epilogue + LN warps at
+  232, the producers at 24: 4 x 232 + 4 x 24 + 4 x 232 = 1952 <= 2016, the DECREASE warps release 4 x (168 - 24) = 576 >= the 8 x (232 - 168)
+  = 512 the INCREASE warps take, so no warp parks on the pool -- and the cubin is BYTE-IDENTICAL to a ``.maxnreg 168`` build (one per-launch
+  spill stays: the scheduler's tile count stored at kernel entry, STL 1 / LDL 4 per thread per LAUNCH).  WITHOUT either directive the flat
+  allocation is ptxas's occupancy heuristic's, which may set it at 80 = 65536 / (2 x 384 threads) -- two CTAs per SM -- and spill a few values
+  to reach it when the body's demand sits near 80: the bias-OFF accumulators-arm c_out 256 rolled rendering (REG 80 / STACK 24: 5 STL / 7 LDL =
+  three swizzled sD staging addresses + the two row-decode constants, reloaded per tile on the epilogue's hot path, +7-8 % on the kernel)
+  while its bias-ON twin -- 32 more live bias words -- is allocated 112 with no spill.  The kernel is one CTA per SM by its SMEM footprint
+  either way, so the hint states a fact; it is a per-rendering choice a consumer sets where measured (the triangle multiplicative update's
+  ``heuristics.register_split_hint``), never library-wide -- the default keeps every rendering's cubin as shipped.
 
 ROW-BLOCK TILING.  A 256-row pair tile is ``r_i`` consecutive ``bi`` x ``kb`` consecutive ``k`` (``r_i * kb == 256``, ``kb`` a power
 of two, host-chosen: ``cudnn.gemm.frost.ln_prologue.row_block_geometry``).  The scheduler's tile index ``tile_m`` decodes
@@ -303,6 +314,11 @@ _LN_SMEM: bool = PARAMS.ln_pass_form != "registers"
 _LN_ROLLED: bool = PARAMS.ln_pass_form == "smem_rolled"
 # EPILOGUE MATH (module docstring): the gated pairing on packed fp32x2 pairs (the same fp32 operations per element, half the ALU issue).
 _EPI_PACKED: bool = PARAMS.epi_math == "packed"
+# REGISTER SPLIT (module docstring): the `.minnctapersm` hint of the launch -- 0 = no directive (the rendering as shipped: the six setmaxnreg
+# requests dropped by ptxas, one flat allocation per warp), 1 = the hint under which ptxas honours them (USETMAXREG 6; the cubin byte-identical
+# to a `.maxnreg 168` build).  Handed to the launch as the DSL's `min_blocks_per_mp`; at 0 the DSL emits no kernel attribute, so the default
+# rendering's IR -- and its cubin -- is exactly today's.
+_MIN_BLOCKS_PER_MP: int = PARAMS.min_blocks_per_mp
 if _DUAL:
     mma_inst_shape_mnk = (256, 128, 16)  # two GEMMs of N = 128 per pair tile
     cgrp_tile_mnk = (256, 128, 64)
@@ -2141,6 +2157,7 @@ def _host(
         block=(threads_per_cta, 1, 1),
         cluster=cluster_shape_mnk,
         use_pdl=USE_PDL,
+        min_blocks_per_mp=_MIN_BLOCKS_PER_MP,  # the `.minnctapersm` hint (REGISTER SPLIT, module docstring); 0 = no attribute = today's IR
         stream=stream,
     )
 
