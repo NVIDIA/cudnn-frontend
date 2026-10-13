@@ -545,6 +545,34 @@ def test_slot_mapping_form_checks():
 
 
 @_GPU
+@pytest.mark.gpu_exclusive
+def test_cache_write_binds_int64_pool_strides():
+    """A real allocation beyond the 32-bit element offset must bind and preserve low-address canaries."""
+    from cudnn.gated_attention_block.kernels.cache_write import compile_cache_write, run_cache_write
+
+    page_size, d = 16, 256
+    page_stride = (1 << 32) + page_size * d
+    elements = page_stride + page_size * d
+    free, _ = torch.cuda.mem_get_info()
+    if free < elements * 2 + (1 << 30):
+        pytest.skip("the wide-stride regression requires an 8 GiB allocation plus 1 GiB headroom")
+    storage = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+    pool = torch.as_strided(storage, (2, 1, page_size, d), (page_stride, page_size * d, d, 1))
+    pool.fill_(-7)
+    wrapped = storage[page_size * d : page_size * d + d]
+    wrapped.fill_(-9)
+    src = torch.arange(2 * d, dtype=torch.float32, device="cuda").to(torch.bfloat16).view(2, 1, d)
+    slots = torch.tensor([0, page_size], dtype=torch.int32, device="cuda")
+    recipe = compile_cache_write(dtype=torch.bfloat16, h=1, d=d, page_size=page_size, two_operands=False)
+    run_cache_write(recipe, src, None, pool, None, slots, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    assert torch.equal(pool[0, 0, 0], src[0, 0])
+    assert torch.equal(pool[1, 0, 0], src[1, 0])
+    assert bool((pool[:, :, 1:] == -7).all())
+    assert bool((wrapped == -9).all())
+
+
+@_GPU
 @pytest.mark.parametrize("layout", _LAYOUTS)
 @pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64], ids=["i32", "i64"])
 @pytest.mark.parametrize(

@@ -5438,7 +5438,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``block_table`` / ``kv_lens`` are the EXTEND form's inputs (``kv_source="paged"``): REQUIRED there -- and the pools
         must then match the declared samples' shape and strides exactly (their layout is compiled in) -- and refused on a
         block declared ``kv_source="self"`` (the write-through alone attends over the block's own K / V)."""
-        from .kernels.cache_write import check_pool, check_slot_mapping
+        from .cache_write_contract import check_pool, check_slot_mapping
 
         given = [nm for nm, x in (("k_cache", k_cache), ("v_cache", v_cache), ("slot_mapping", slot_mapping), ("index_k_raw", index_k_raw)) if x is not None]
         read_mode = [nm for nm, x in (("block_table", block_table), ("kv_lens", kv_lens)) if x is not None]
@@ -5564,7 +5564,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``[num_sequences, max_pages >= 1]`` tensor with a contiguous page axis).  Device-free: a test pins every row anywhere.
         Returns ``(kv_source, token_capacity)`` normalised.  Runs AFTER the write-through's own validator, so ``quant`` /
         ``save_for_backward`` with the attribute are heard from there."""
-        from .kernels.cache_write import check_pool
+        from .cache_write_contract import check_pool
 
         if not isinstance(kv_source, str) or kv_source not in _KV_SOURCES:
             raise ValueError(
