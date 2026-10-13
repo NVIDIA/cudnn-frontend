@@ -226,6 +226,19 @@ def test_grid_past_65535_rides_the_flat_lpt_grid(b, h):
 
 
 @pytest.mark.L0
+def test_packed_thd_split_keeps_batch_off_the_grid():
+    """#1573: the packed THD combine launches ((t_q+3)//4, heads, 1), so only heads meet the 65535 cap."""
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    split = engines.SdpaFwdKnobs(sched_policy=SCHED_LPT, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+    thd = dict(s_q=8, s_kv=2048, causal=False, thd=True, max_total_seq_len_q=8)
+    facts = _facts(b=65536, h_q=1, h_kv=1, **thd)
+    assert engines.packed_thd_split(caps, facts, split)
+    assert engines.launch_grid_mismatch(caps, facts, split) is None
+    heads = _facts(b=1, h_q=65536, h_kv=65536, **thd)
+    assert "packed split-KV combine" in engines.launch_grid_mismatch(caps, heads, split)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "engine_name,dtype,is_fp8",
     [
