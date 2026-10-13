@@ -1079,7 +1079,7 @@ red (2026-09-08).
 | Attention sink (at `S_q == 1`: f16/bf16 ✅ — dense / padded / ragged via test_sdpa_sq1_cc107_half_L0's sink draw on the native bodies, paged THD via test_mhas_v2.py's P2 block on the shared bodies ᵖˢ; per-tensor FP8 ❔ — see SM100 ˢ; MXFP8 ✅ — `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` draws `s_q == 1` with an e4m3 sink on every exact flavor against the MXFP8 reference incl. `Amax_O`, cuDNN 9.26.0.51 on the cc 10.7 board and 9.28 on the Rubin CI lane, 2026-10-08) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |  —  |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
-| **Decode tile** (f16/bf16, dense Q, `S_q · G` packed rows within the Rubin route: ≤ 16 on the 16-column tile, (16, 32] on the 32-column tile, a packed MTP step of up to two token units of itᵐᵗᵖ; dense or paged) | ✅ dense Q (the shared `sm100/decode_d128_f16.py` compiled for sm_107a, `S_q × packed group ≤ 128`, issue #1472 -- the d128 decode tile row below; THD keeps the prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | ✅ᵈʳ **native** (`sm107/decode_d256_f16.py`, swap-AB; whole-group PackGQA + dense / paged split-KV; the 32-column tile in token units for MTP `S_q ≤ 4`ᵐᵗᵖ) | ❌ (prefill tile) | — |  —  |
+| **Decode tile** (f16/bf16, dense Q, `S_q · G` packed rows within the Rubin route: ≤ 16 on the 16-column tile, (16, 32] on the 32-column tile, a packed MTP step of up to two token units of itᵐᵗᵖ; dense or paged) | ✅ dense Q (the shared `sm100/decode_d128_f16.py` compiled for sm_107a, `S_q × packed group ≤ 128`, issue #1472 -- the d128 decode tile row below; THD keeps the prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | ✅ᵈʳ **native** (`sm107/decode_d256_f16.py`, swap-AB; whole-group PackGQA + dense / paged split-KV; the 32-column tile in token units for MTP `S_q ≤ 4`ᵐᵗᵖ; **default placement since cudnn-frontend 1.32.0**: a PAGED dense-Q decode graph at `S_q = 1` -- groups 4 / 6 / 8 / 12 / 16, ≥ 4 units (`b · h_kv`) and ≥ 2¹⁶ KV tokens in flight, declared KV 1k-128k, an HND pool at page 16 / 32 / 64, no mask / sink / Stats / gate -- LEADs the backend by default (`placement._sm107_paged_d256_decode_tile_leads`; the measured band in the default-placement paragraph of the SM107 section); the MTP rows and group 32 are held, see the gaps table) | ❌ (prefill tile) | — |  —  |
 | PackGQA | fp8 only | fp8; half dense GQA (shared SM100 d128 bodies, group divides 128, not with the pre-folded scale); half paged THD / nonpaged split THD | ❌ | half paged unsplit THD (CGA2); and the d256 decode tile (`pack_gqa_d_shapes` ∋ (256, 256) for both routes: on the tile the WHOLE group within the Rubin route -- `S_q · G ≤ 16` on the 16-column tile (24/2 packs 12 live rows + 4 zero tail rows), (16, 32] and a packed MTP step of up to two token units on the 32-column tile (24/2 at `S_q = 4`: two units of 2 tokens × 12 heads)ᵐᵗᵖ -- dense or paged, whatever `tile_m`; the dense d256 prefill kernel runs unpacked and a packed dense graph past the route is a typed decline)ᵈʳ | ❌ | — |  —  |
 | Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2; the decode tile's dense (unpadded) / paged split, packed or not (fp32 partials + the shared combine, `choose_decode_tile_split_kv`)ᵈʳ | ❌ᵛⁱⁱ | — |  —  |
 | d128 decode tile (`TILE_CGA_M=1`, dense; the shared `sm100/decode_d128_f16.py` compiled for sm_107a; `S_q × packed group ≤ 128` proposes it first; past one tile the dense SM100 and cc 10.7 rows list both widths and lead with the decode tile while its waves stay within 1.6x the cga2 cluster's below a 16k cache, issue #1518; THD and the pre-folded scale keep the prefill tile) | envelope (d64 via d128) | ✅ (issue #1472) | ❌ (prefill) | ❌ (prefill) | ❌ (prefill) | — | — |
@@ -1162,6 +1162,28 @@ binder knows no gate on a split and calls the combine with a fixed frame), captu
 under the D2H detector. Past the route (ᵐᵗᵖ: a third token unit, an unpacked step above 32
 tokens, a group wider than the tile), THD queries and the quantized families stay on the prefill
 tiles.
+**Default placement (cudnn-frontend 1.32.0; `placement._place_sm107_f16` ->
+`_sm107_paged_d256_decode_tile_leads`).** FlashInfer's cuDNN decode graph shape -- a PAGED dense-Q
+d256 graph at `S_q = 1` with the padding mask, an HND pool, no causal mask / window / sink / Stats --
+LEADs the backend's default plan by default inside the measured band: GQA groups 4 / 6 / 8 / 12 / 16
+(16/4, 24/4, 8/1, 24/2 + 12/1, 32/2 + 16/1), `4 <= b · h_kv <= 512` units, declared KV 1k-128k with
+`units × KV >= 2¹⁶` tokens in flight, page 16 / 32 / 64, f16 and bf16. Measured 2026-10-13 on an
+EXCLUSIVE GPU of the 212-SM cc 10.7 perf class (lock 2376 MHz, sampled busy median 2364; cuDNN 9.27.0
+build 9.27.0.21; CUDA-graph replay AND eager; the backend's default plan and the first FROST plan pinned
+by name on the SAME graph; 3 × 100 iterations with the arm order shuffled, control pair within 1 %): the
+tile ran 0.43-0.90 (eager) / 0.43-0.81 (replay) of the backend on EVERY quotable cell of the band
+(289 (cell, regime) pairs per regime; 0.59-0.90 / 0.67-0.81 on the frontier cells 64 × 1k, 32 × 2k,
+16 × 4k, 8 × 8k; 0.53-0.63 at 512 units; page 32 / 64 0.43-0.85; the f16 twins 0.46-0.57); one step
+below (2¹⁵ tokens in flight) the cells are mixed, 0.78-1.79, twelve of them launch-bound and
+unverifiable; fewer than 4 units lose up to 1.79× below the 128k endpoint. HELD backend-first although
+measured faster than the backend: the MTP rows (`S_q` 2-4 on 24/2 and 32/2, the 32-column tile: 0.01-0.31
+of the backend's plan, which costs 6.8-142 ms per launch at KV 128k, but 6 % (q 2) / 21-22 % (q 3-4)
+behind FlashInfer's fa2 kernel at the medians) and group 32 (64/2: 0.27-1.00 of the backend, 7-9 %
+behind fa2) -- the 32-column tile's issue-rate gap at 24-64 packed rows; both reopen with the kernel
+(the gaps table). Not measured, backend-first: Stats, a sink, a mask or window at `S_q = 1`, NHD pools,
+page 128, a dense (unpaged) d256 cache at `S_q = 1` (measured against the prefill body only), THD
+queries, the fused gate. Pinned by `test_sdpa_fwd_placement.py::test_sm107_paged_d256_decode_tile_*`
+(the frontier cells per geometry in both regimes, RED on the pre-arm tree).
 
 ᵐᵗᵖ **The MTP form on the Rubin decode tile: the 32-column tile in TOKEN UNITS
 (`config_sm107.decode_d256_q_tile`, `D256_DECODE_ROUTED_MAX_Q_ROWS = 32`,
@@ -2113,6 +2135,7 @@ envelope and fused bias/sinks remain unavailable to THD.
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ) |
 | THD forward outside native-flavor dims or compact packed Q/K/V/O | SM80 — the graph path serves only the four native head-dim pairs and copy-free packed BSHD buffers |
 | **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV, the MTP step in token units of the 32-column tile ᵐᵗᵖ) is the only Rubin decode tile today |
+| **Paged d256 decode-tile default placement outside its measured band** | **SM107** — held backend-first by default although the tile is measured FASTER than the backend: the MTP rows (`S_q` 2-4 on 24/2 and 32/2, the 32-column tile in up to two token units ᵐᵗᵖ: 0.01-0.31 of the backend's default plan, which costs 6.8-142 ms per launch at KV 128k, but 6 % (q 2) / 21-22 % (q 3-4) behind FlashInfer's fa2 decode kernel at the medians) and group 32 (64/2, the 32-column tile in one unit: 0.27-1.00 of the backend, 7-9 % behind fa2) -- the 32-column tile's per-CTA issue-rate gap at 24-64 packed rows (212-SM cc 10.7 perf class, cuDNN 9.27.0, 2026-10-13). Not measured, so backend-first: Stats, sinks, a mask or window at `S_q = 1`, NHD pools, page 128, fewer than 4 units (1-2 units led only at the 128k endpoint), above 512 units or past 128k declared KV, a dense (unpaged) d256 cache at `S_q = 1` (measured against the prefill body only), THD queries, the fused gate. Follow-up: the kernel fix of the 32-column tile reopens both holds (a placement constant each); the Stats / NHD / page-128 twins are one measured chunk each (`placement._sm107_paged_d256_decode_tile_leads`) |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM107 — dense d128 f16/bf16 rides the shared decode tile since issue #1472, and decode-shaped dense-Q d256 f16/bf16 (dense or paged cache) rides the Rubin d256 decode tile (ᵈʳ); d192×128 / d512 and every quantized flavor run their prefill kernels, d256 graphs past the tile's route run the d256 prefill kernel, THD keeps the prefill tile (the ragged-Q leg is SM100-line only), dense paged queries outside the d256 decode tile are not wired. SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. Unsplit THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); exact D128 split THD can use the single-CTA path; d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile; on cc 10.7 the MXFP8 pools likewise run the d128 (`TILE_CGA_M=2`) / d256 (cga1) prefill tiles at `S_q <= 8` (the paged-vs-dense measurement is the R15 note of the SM107 paged MXFP8 pools section below: paged within 2 % of dense at the qwen35 decode shape; a decode tile for the quantized flavors is a P3-class follow-up) |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
@@ -2429,6 +2452,30 @@ default / 752 us best (was 1236 us), B128 64/4 Q4 KV2052 58 us against 798 / 748
 d64 + SWA envelope cell (0.45-0.68 of the backend default on two cells) and GQA 2 / 32, MHA, partial groups, caches
 past 16k and fewer units keep the backend first until measured.  Sink-free dense d128 decode on cc 10.7 (no sink, so
 not in the shard): the split decode tile matches the backend's decode engine within 2-6 % (b 1 / 4 x KV 16k / 32k).
+
+**Default placement, paged d256 decode (FlashInfer's cuDNN decode graph shape; `placement._sm107_paged_d256_decode_tile_leads`,
+cudnn-frontend 1.32.0).** Measured 2026-10-13 on an EXCLUSIVE GPU of the 212-SM cc 10.7 perf class (SM clock locked at 2376 MHz and
+SAMPLED, busy median 2364; cuDNN 9.27.0 build 9.27.0.21, the pre-release build the harness loads; CuTeDSL 4.8.0; FlashInfer's
+`bench_gpu_time`, CUPTI kernel time with the L2 flushed per iteration; the backend's default plan and the first FROST plan each pinned
+by name on the SAME FE graph; 3 rounds × 100 iterations per regime, the arm order shuffled, a second backend arm as the control pair
+within 1 % or the cell is not quoted; CUDA-graph replay AND eager): seven geometries (24/2, 32/2, 16/4, 24/4, 8/1, 12/1, 16/1) × b
+1-128 × declared KV 1k / 2k / 4k / 8k / 32k / 128k at page 16 bf16, page 32 / 64 at 24/2, one f16 twin per geometry. The Rubin d256
+decode tile (whole-group PackGQA, one 16-row Q tile per (batch, KV head) unit) runs 0.43-0.90 (eager) / 0.43-0.81 (replay) of the
+backend's default plan on EVERY quotable cell with `units = b · h_kv >= 4` and `units × KV >= 2¹⁶` tokens in flight -- 289 (cell,
+regime) pairs per regime, 0.59-0.90 / 0.67-0.81 on the frontier cells (64 × 1k, 32 × 2k, 16 × 4k, 8 × 8k), 0.53-0.63 at the 512-unit
+edge, page 32 / 64 0.43-0.85, the f16 twins 0.46-0.57 -- so that band LEADs by default (`SM107_PAGED_D256_DECODE_*`); one step below
+(2¹⁵ tokens in flight: 32 × 1k, 16 × 2k, 8 × 4k, 4 × 8k, 1 × 32k) the cells are mixed, 0.78-1.79, and twelve are launch-bound and
+unverifiable, so the band starts at 2¹⁶ (replay alone also led at 16 × 2k, 0.82-0.85, and 8 × 4k, 0.89-0.95: not admitted); fewer
+than 4 units lose up to 1.79× below the 128k endpoint (1-2 units led 0.75-0.83 in that one column: not admitted); above 512 units
+and past 128k declared KV unmeasured. HELD backend-first by decision although measured faster than the backend: group 32 (64/2: the
+tile 0.27-1.00 of the backend, the 8 × 8k eager cell at parity; 7-9 % behind FlashInfer's fa2 kernel at the medians) and the MTP rows
+(`S_q` 2-4 on 24/2 and 32/2 = the 32-column tile in up to two token units: 0.01-0.31 of the backend's plan on all 576 (cell, regime)
+pairs -- the backend's plan costs 6.8-142 ms per launch at KV 128k -- but 6 % (q 2) / 21-22 % (q 3-4) behind fa2) -- the 32-column
+tile's issue-rate gap at 24-64 packed rows, the gaps table's row; both holds reopen with the kernel. Not measured, backend-first:
+Stats, a sink, a mask or window at `S_q = 1`, NHD pools, page 128, a dense (unpaged) d256 cache at `S_q = 1` (the dense table above
+measured it against the prefill body), THD queries, the fused gate. Contract tests
+`test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells` (the frontier cells per geometry, both regimes; RED on the
+pre-arm tree) and `test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape`.
 
 **Plan ordering from the measured tables (the same board and method).** Dense d128 half GQA under a diagonal band at
 prefill depth packs first on the shared body (`heuristics._sm100_banded_gqa_packs` covers the cc 10.7 shared dense d128
