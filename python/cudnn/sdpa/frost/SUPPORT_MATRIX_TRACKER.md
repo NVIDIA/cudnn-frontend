@@ -508,9 +508,9 @@ stay declined. The FP8 graph is `sdpa_fp8`
 with scalar `descale_q/k/v` and `scale_o` (`scale_s`/`descale_s` accepted and ignored),
 O in FP16/BF16/E4M3/E5M2, `Amax_O` out. **The graph must not declare
 `Amax_S`**: every FROST FP8 row declines a graph that requests that output (the kernels
-do not produce it), so a generic fp8 graph that binds `Amax_S` — the spelling a
-FlashInfer-style wrapper produces today — stays on the backend engine; the paged FP8
-capability is reachable only by omitting it. Masks validated over FP8 pools: a causal
+do not produce it), so a graph that binds `Amax_S` as a non-virtual output stays on
+the backend engine, and the paged FP8 capability is reachable only by leaving it
+virtual (FlashInfer's `sdpa_fp8` prefill graph already does: `set_output(False)`). Masks validated over FP8 pools: a causal
 upper bound top-left or bottom-right (MTP `S_q <= 8`, each batch's diagonal anchored
 at its own KV length, rows left without a key write O := 0 / LSE := -inf) and a left
 sliding window (`test_sdpa_fwd_paged_sm100.py` fp8 causal / sliding-window tests, pinned
