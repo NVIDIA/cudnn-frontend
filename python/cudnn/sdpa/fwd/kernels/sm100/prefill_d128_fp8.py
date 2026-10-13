@@ -1338,6 +1338,15 @@ def _tmastg_warp_group(
 
             bars.mb_o_empty[qs].arrive()
 
+        if cutlass.const_expr(DUAL_KV):
+            # Two KV streams: sub-tile 1 is a KV stream, not Q rows, so no O tile is staged or
+            # stored through slot 1 and the loop above never reaches it -- but softmax warpgroup 1
+            # still waits ITS OWN slot once per tile (_softmax_warp_group, the parity rule of
+            # GitHub #1532).  Release that slot here, once per tile, so the wait's parity stays in
+            # lockstep; without it a persistent CTA hangs on its second tile (more units than one
+            # wave of CTAs).
+            bars.mb_o_empty[1].arrive()
+
         o_full_phase = o_full_phase ^ 1
 
         wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)

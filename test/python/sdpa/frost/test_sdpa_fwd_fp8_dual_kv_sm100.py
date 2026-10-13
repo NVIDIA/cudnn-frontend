@@ -196,6 +196,13 @@ _DENSE_CASES = [
     ("causal-q16-128rows", 1, 64, 8, 16, 2048, 0, True, torch.bfloat16),
     ("unpacked-q64", 1, 8, 8, 64, 2048, 0, False, torch.bfloat16),
     ("fp8-o-odd", 2, 64, 8, 1, 4224, 0, False, F8),
+    # 512 units (b x kv heads, one packed tile each) exceed any Blackwell SM count: every persistent
+    # CTA takes several tiles, so the store warp's per-tile release of the second O slot is exercised.
+    ("persistent-second-tile", 64, 64, 8, 1, 1024, 0, False, torch.bfloat16),
+    # Multi-wave with an ODD tile count (stream 1's phantom step on every tile) and with EMPTY units
+    # (two tiles over four splits: half the (unit, split) pairs walk no KV at all).
+    ("persistent-odd-tiles", 64, 64, 8, 1, 1152, 0, False, torch.bfloat16),
+    ("persistent-empty-splits", 32, 64, 8, 1, 256, 4, False, torch.bfloat16),
 ]
 
 
@@ -276,6 +283,8 @@ _PAGED_CASES = [
     ("page128-odd-tiles", 2, 1, 128, 9, [1152, 1000], False),
     ("page16-causal-q4", 2, 4, 16, 64, [1024, 530], True),
     ("page16-one-tile", 2, 1, 16, 8, [128, 40], False),
+    # 320 units: persistent CTAs take several paged tiles each (the second-O-slot release).
+    ("page16-second-tile", 40, 1, 16, 8, [128] * 20 + [100] * 20, False),
 ]
 
 
