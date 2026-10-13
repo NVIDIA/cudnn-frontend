@@ -184,7 +184,7 @@ graph = op.make_cuda_graph(q, k, v, bias, kv_lengths, o, lse, ws)               
 
 op_p = TriangleAttentionFwd(sample_q, sample_k, sample_v, sample_bias, mask=True, mask_is_prefix=True)   # the prefix-mask form
 op_p.check_support(); op_p.compile()
-ws_p = torch.empty(op_p.get_workspace_size(), dtype=torch.uint8, device=q.device)                 # + the derived lengths + the mask staging
+ws_p = torch.empty(op_p.get_workspace_size(), dtype=torch.uint8, device=q.device)                 # + the derived KV lengths
 op_p.execute(q, k, v, bias, None, o, None, None, ws_p, stream, mask=mask)                         # lengths derived on the device, no sync
 op_p.execute(q, k, v, bias, None, o, None, None, ws_p, stream, mask=mask, check_prefix_mask=True)  # + the debug check (one sync, typed error)
 ```
@@ -231,7 +231,7 @@ where the two torch kernels it replaced -- the mask's cast and the row count -- 
 +8.1 / +8.5 / +9.0 / +9.6 us (-25.8 / -12.9 / -8.0 / -3.0 %).  Against the in-kernel dense mask fed the SAME mask the prefix form wins at every
 crop: +7.8 / +16.7 / +33.0 / +24.2 % at 75 % live keys (27.5 / 70.3 / 141.4 / 387.3 us: the dense route visits every kv tile, the padded route
 the live ones) and +77.8 / +73.5 % at 50 % (S = 512 / 768).  Host floor of the class API's `execute` (CPU-pinned, 500 calls, min / median):
-`kv_lengths` 19-20 / 20-23 us, the prefix form 26-27 / 27-28 us (the two-kernel form read 43-45 / 45-48 us), the dense mask 11-12 / 12 us;
+`kv_lengths` 19-20 / 20-23 us, the prefix form 26 / 27 us (the two-kernel form read 43-45 / 45-48 us), the dense mask 11-12 / 12 us;
 the derivation alone 3.8-4.1 / 3.9-5.9 us (the two torch kernels 8.5-8.9 / 8.8-9.4 us); the drop-in function adds ~9 us to each (the output
 and workspace allocations).  So: a caller who holds lengths passes `kv_lengths`; one who holds a prefix mask uses `mask_is_prefix=True` --
 within one launch (~3 us) of the lengths route and ahead of the dense mask at every training crop; `mask_to_kv_lengths` remains for a caller
