@@ -89,7 +89,6 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
     PipelineState,
     advance,
-    launch_dependent_grids,
     wait_on_dependent_grids,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
@@ -668,8 +667,6 @@ def tmaldg_warp(
     for _ in range(cfg.smem_v_stages):
         bars.mb_v_done[v_index.idx].wait(v_index.phase)
         v_index = advance(v_index, cfg.smem_v_stages)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -1045,7 +1042,6 @@ def frost_gdn_summary_prologue(
     (:func:`order_body`); block 1 builds the per-batch K and V TMA-descriptor arrays (:func:`build_descs_body`)."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)

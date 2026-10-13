@@ -201,7 +201,7 @@ other-arch lowerings are smoke-compiled from whatever GPU you have.**
 - The DSL traces the kernel in Python before any arch-specific codegen, so a
   lowering for an arch you do not have still fails or passes its trace here:
   `_load_sm120_kernel_module(None, TemplateParams(dtype_qkv=0, dtype_o=5),
-  fp8=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
+  fp8=True, pertensor=True).compile(compute_capability=(12, 0), b=1, qh=2, kh=2, sq=256,
   skv=256, d_qk=128, d_v=128)` on an SM100 box reproduced the SM120 lane's
   `'NoneType' object has no attribute 'iterator'` exactly. Run it for every
   template variant you touched before pushing.
@@ -797,3 +797,12 @@ partials, both runtime reduction branches, and changed sink contents/pointers
 under retained captures. `test_packed_sink_combine_counts_virtual_key_once`
 and the sink cells of `test_paged_thd_split_capture_lengths_and_stats` are the
 detectors; a sink in each partial silently counts it once per partition.
+
+SM80 THD graph compilation explicitly targets `sm_80` for both metadata and
+attention artifacts. Making an A100 current does not suffice when a different
+architecture is visible first; `test_graph_thd_targets_nonzero_ordinal_a100`
+checks both compile options and numerical replay on that configuration.
+After compiling `score_sign`, launch with `config_sm80.kernel_scale` of the
+logical scale and reject a runtime sign change. Zero is a logical zero scale,
+not a request to reuse the plan's scale. `test_graph_thd_nonpositive_scale_and_replay`
+checks zero/negative scales, keyless rows and changed-V replay.

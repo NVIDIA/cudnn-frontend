@@ -137,7 +137,6 @@ from cudnn.frost.tile_dsl.barrier import (
     Producer,
     PipelineState,
     advance,
-    launch_dependent_grids,
     wait_on_dependent_grids,
 )
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, tma_slice_runtime_desc
@@ -1741,8 +1740,6 @@ def tmaldg_warp(
     for _ in range(cfg.smem_do_stages):
         bars.mb_do_mma_done[do_index.idx].wait(do_index.phase)
         do_index = advance(do_index, cfg.smem_do_stages)
-    if cutlass.const_expr(USE_PDL):
-        launch_dependent_grids()
 
 
 @cute.jit
@@ -3394,7 +3391,6 @@ def frost_gdp_bprop_v64_prologue(
     per array."""
     if cutlass.const_expr(USE_PDL):
         wait_on_dependent_grids()
-        launch_dependent_grids()
     tidx, _, _ = cute.arch.thread_idx()
     tidx = cutlass.Int32(tidx)
     widx = tidx // cutlass.Int32(32)
@@ -3451,12 +3447,9 @@ def frost_gdp_bprop_v64_prologue(
 
 
 @cute.jit
-def prologue(
+def base_descriptors(
     io_dtype: cutlass.Constexpr,
     b_t: cutlass.Constexpr[int],
-    run_order: cutlass.Constexpr[bool],
-    order_gen: cutlass.Constexpr[bool],
-    expand_num: cutlass.Constexpr[int],
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -3465,22 +3458,11 @@ def prologue(
     dk: cute.Tensor,
     dv: cute.Tensor,
     state_checkpoints: cute.Tensor,
-    cu_seqlens: cute.Tensor,
-    work_item_staging: Optional[cute.Tensor],
-    work_count: cute.Tensor,
-    work_items: cute.Tensor,
-    scheduler_all: Optional[cute.Tensor],
-    tensormap_workspace: cute.Tensor,
-    stream: cuda.CUstream,
 ):
-    """One-launch prologue: LPT-order the work items (with ``run_order``, when
-    this kernel is the backward pair's first table consumer) and build the
-    per-(b,h) TMA-descriptor arrays (Q, K, V, dO, checkpoint loads; dQ, dK, dV
-    stores) into ``tensormap_workspace``."""
+    """The whole-tensor TMA descriptors (Q, K, V, dO, checkpoints, dQ, dK, dV) the prologue's per-batch arrays are built from."""
     h_q = q.shape[1]
     h_k = k.shape[1]
     h_v = v.shape[1]
-    batch_size = cu_seqlens.shape[0] - 1
     heads_out = h_q if h_q >= h_v else h_v
     d_v = v.shape[2]
     d_v_state = state_checkpoints.shape[2]
@@ -3521,6 +3503,40 @@ def prologue(
         checkpoint_view, box_dims=(64, d_v_state, 1, 1), stride_order=(0, 1, 2, 3), swizzle=swizzle_128b
     )
 
+    return base_desc_q, base_desc_k, base_desc_v, base_desc_do, base_desc_checkpoint, base_desc_dq, base_desc_dk, base_desc_dv
+
+
+@cute.jit
+def prologue(
+    io_dtype: cutlass.Constexpr,
+    b_t: cutlass.Constexpr[int],
+    run_order: cutlass.Constexpr[bool],
+    order_gen: cutlass.Constexpr[bool],
+    expand_num: cutlass.Constexpr[int],
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    do_: cute.Tensor,
+    dq: cute.Tensor,
+    dk: cute.Tensor,
+    dv: cute.Tensor,
+    state_checkpoints: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    work_item_staging: Optional[cute.Tensor],
+    work_count: cute.Tensor,
+    work_items: cute.Tensor,
+    scheduler_all: Optional[cute.Tensor],
+    tensormap_workspace: cute.Tensor,
+    stream: cuda.CUstream,
+):
+    """One-launch prologue: LPT-order the work items (with ``run_order``, when
+    this kernel is the backward pair's first table consumer) and build the
+    per-(b,h) TMA-descriptor arrays (Q, K, V, dO, checkpoint loads; dQ, dK, dV
+    stores) into ``tensormap_workspace``."""
+    batch_size = cu_seqlens.shape[0] - 1
+    base_desc_q, base_desc_k, base_desc_v, base_desc_do, base_desc_checkpoint, base_desc_dq, base_desc_dk, base_desc_dv = base_descriptors(
+        io_dtype, b_t, q, k, v, do_, dq, dk, dv, state_checkpoints
+    )
     frost_gdp_bprop_v64_prologue(
         run_order,
         order_gen,

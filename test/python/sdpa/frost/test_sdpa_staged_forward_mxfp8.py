@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100, SdpaFwdDslSm120
 from frost_test_utils import requires_blackwell, requires_dsl
 from sdpa.frost.test_sdpa_prepared_mxfp8 import _case as _native_case, _change_scales, _check
 
@@ -15,8 +15,8 @@ _FLAVORS = [(128, 128), (192, 128), (256, 256), (512, 512)]
 
 def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=True):
     cc = torch.cuda.get_device_capability()
-    if cc[0] != 10:
-        pytest.skip("SM100/SM103/SM107 MXFP8 conversion path")
+    if cc[0] not in (10, 12):
+        pytest.skip("SM100/SM103/SM107/SM120 MXFP8 conversion path")
     if cc == (10, 7) and split > 1:
         pytest.skip("SM107 MXFP8 does not serve split KV")
     _, _, _, buffers, _ = _native_case(
@@ -27,7 +27,7 @@ def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=
         split_kv=split,
         stats=stats,
         amax=amax,
-        arch="sm107" if cc == (10, 7) else "sm100",
+        arch="sm120" if cc[0] == 12 else "sm107" if cc == (10, 7) else "sm100",
         explicit_plan=True,
     )
     storage = {}
@@ -39,7 +39,7 @@ def _case(d, dv, *, b=2, output_dtype=torch.bfloat16, split=1, stats=True, amax=
         if role != "o":
             view.copy_(t)
         storage[role], buffers[role] = raw, view
-    api = SdpaFwdDslSm100(
+    api = (SdpaFwdDslSm120 if cc[0] == 12 else SdpaFwdDslSm100)(
         **{"sample_" + role: buffers.get(role) for role in ("q", "k", "v", "o", "lse")},
         sample_amax_o=buffers.get("amax_o"),
         has_amax_o=amax,

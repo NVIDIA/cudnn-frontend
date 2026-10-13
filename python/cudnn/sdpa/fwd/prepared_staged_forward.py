@@ -249,7 +249,7 @@ def execute(api, tensors, workspace, stream, scale):
                 spec.combine.fn(*combine)
             if spec.quant is not None:
                 if label.startswith("SM12"):
-                    api._logger.debug("execute (SM120 FP8 per-tensor) completed")
+                    api._logger.debug("execute (SM120 FP8 per-tensor) completed" if api._pertensor else "execute (SM120 MXFP8) completed")
                 elif api._pertensor:
                     api._logger.debug("execute (FP8 per-tensor) completed")
                 else:

@@ -71,10 +71,27 @@ EXACTLY ZERO, with no crash (``mma-tma-matrix.md`` § 6). That is why
 non-zero explicitly rather than only a cosine, which would be NaN against a zero
 tensor.
 
-**The FROST GEMM engine is opt-in**: ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``
-must be set BEFORE ``import cudnn`` or the graph silently runs a cuDNN backend
-plan instead. :func:`build_proj_gemm` checks for the plan by name and raises
-rather than letting that happen quietly.
+**The FROST GEMM engine is opt-in**: without ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``
+in the environment the backend's ranked list has no ``frost_gemm`` plan.  The flag is
+read LIVE, when the ranked list is built (``engines/manifest.py``: ``opt_in_engines_enabled``),
+not once at ``import cudnn`` -- so it has to be set before :func:`build_proj_gemm` runs,
+and a host module must NEVER set it for the process: it flips every opt-in engine into
+every FE graph the process builds.  :func:`build_proj_gemm` checks for the plan by name
+and raises rather than letting an unpinned graph run a cuDNN backend plan quietly; a
+dense bf16 / f16 projection whose N the forced 256-wide tile divides needs no flag at
+all -- it takes the forced-tile JIT-only route (``plan.route == "jit-only"``, no backend
+plan, no cuDNN handle at execute), which is what a serving stack compiles under.
+
+**CUDA-graph capture** (``cudnn.frost.capture``): :func:`build_proj_gemm` is refused
+under capture (it builds a cuDNN graph -- a handle in the ``pygraph`` constructor -- and
+JIT-compiles a kernel), and so is the GRAPH route's lazy cuDNN handle creation
+(:func:`handle_for_stream`, the first execute per (device, stream)); both are typed
+``RuntimeError``s naming the route and the remedy.  ``build_proj_gemm(capture_safe=True)``
+is the serving declaration: the plan never enters the ranked list (the graph is built only
+to be analyzed -- no heuristics query, no backend plan, no FROST-engine compile, whatever
+the opt-in flag says), so it ends on the forced-tile JIT route by construction, and a
+refused forced compile is a typed ``NotImplementedError`` at compile time, never the
+warning + graph-heuristic fallback the plain declaration takes.
 
 **The BACKWARD's four projection GEMMs -- transposed operands as VIEWS.** The
 ``nn.Linear`` orientation (``api_bwd.py``: ``dW = dY^T @ X``, ``dX = dY @ W``) needs
@@ -819,7 +836,11 @@ def _why_no_frost_plan() -> str:
                 + f", and this device is sm_{arch} -- so FROST cannot serve this graph here at all"
             )
     if os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0").strip().lower() not in ("1", "true", "yes", "on"):
-        reasons.append("CUDNN_FRONTEND_ENABLE_FROST_ENGINES is not set -- it is an opt-in engine and the flag must be set BEFORE 'import cudnn'")
+        reasons.append(
+            "CUDNN_FRONTEND_ENABLE_FROST_ENGINES is not set -- frost_gemm is an opt-in engine; the flag is read live when the ranked list is "
+            "built, so it must be in the environment before compile() (a dense bf16 / f16 plan whose N the forced 256-wide tile divides needs "
+            "no flag: it takes the forced-tile JIT-only route)"
+        )
     if not reasons:
         reasons.append("the engine declined this shape/dtype; run with CUDNN_FRONTEND_LOG_INFO=1 CUDNN_FRONTEND_LOG_FILE=stderr for its reason")
     return (
@@ -1033,6 +1054,20 @@ def handle_for_stream(device, stream) -> Any:
     key = (idx, int(stream))
     h = _GRAPH_HANDLES.get(key)
     if h is None:
+        # The FIRST execute of a graph-route plan on a stream creates its handle HERE (cudnnCreate: host and device
+        # resources) -- illegal inside a CUDA-graph capture, and a serving stack captures the first execute on a fresh
+        # stream with no eager warm-up.  Refused typed, naming the route and the remedy, before the driver sees it.
+        from cudnn.frost.capture import check_not_capturing
+
+        check_not_capturing(
+            int(stream),
+            f"frost gemm graph route (cuDNN handle creation for device {idx}, stream {int(stream):#x})",
+            remedy=(
+                "run one eager execute of the block on the capture stream before capturing (it creates the handle this route binds), "
+                "or declare the block's GEMMs capture-safe (build_proj_gemm(capture_safe=True)) so they take the forced-tile JIT route, "
+                "which needs no handle"
+            ),
+        )
         # create_handle() binds to the CURRENT device -- pin it so a tensor on
         # cuda:1 never gets a handle created against cuda:0.
         with torch.cuda.device(idx):
@@ -1040,6 +1075,22 @@ def handle_for_stream(device, stream) -> Any:
         cudnn.set_stream(handle=h, stream=int(stream))
         _GRAPH_HANDLES[key] = h
     return h
+
+
+def _refuse_compile_under_capture(label: str) -> None:
+    """``build_proj_gemm`` under a CUDA-graph capture is refused typed: it builds a cuDNN graph (a cuDNN handle in the
+    handle-less ``cudnn.pygraph`` constructor) and JIT-compiles a kernel -- neither can happen inside a capture, and a serving
+    stack that compiles lazily at its first (captured) execute would otherwise see the driver's error from the middle of it.
+    The stream asked is torch's current one on the current device: the stream a ``torch.cuda.graph`` capture makes current."""
+    if not torch.cuda.is_available():
+        return  # nothing can be capturing without a device; the host-only probes build plans here too
+    from cudnn.frost.capture import check_not_capturing
+
+    check_not_capturing(
+        torch.cuda.current_stream().cuda_stream,
+        f"{label}: FROST GEMM compile (build_proj_gemm builds the cuDNN graph and JIT-compiles the kernel)",
+        remedy="compile() at warm-up, before the capture begins; a capture holds launches only",
+    )
 
 
 @dataclass
@@ -1071,10 +1122,13 @@ class ProjGemmPlan:
     #                resolved tile config is what `run_proj_gemm` launches;
     #   "jit-only"   the backend declined the graph (a typed cudnnGraphNotSupportedError,
     #                or no `frost_gemm` in its ranked list -- `_NoFrostPlan`); the JIT
-    #                never touches the backend, so the kernel still runs.  Any OTHER
-    #                backend error propagates (it is a bug: e.g. the unpadded F8_128x4
-    #                declaration this driver used to make, which read as "declined" until
-    #                the catch was narrowed);
+    #                never touches the backend, so the kernel still runs.  Taken by the
+    #                block-scale plans, and by a DENSE bf16 / f16 plan with a forced (or
+    #                explicitly named) tile -- the route a serving stack compiles under with
+    #                CUDNN_FRONTEND_ENABLE_FROST_ENGINES unset (no backend plan, no cuDNN
+    #                handle at execute).  Any OTHER backend error propagates (it is a bug:
+    #                e.g. the unpadded F8_128x4 declaration this driver used to make, which
+    #                read as "declined" until the catch was narrowed);
     #   "graph"      dense, no forced tile: the graph engine's own plan runs.
     block_scale: bool = False
     sfa: Any = None
@@ -1098,6 +1152,10 @@ class ProjGemmPlan:
     a_major: str = "k"
     b_major: str = "k"
     split_k: int = 0
+    # Serving-declaration addition (append-only): True = the plan was built `capture_safe` -- it never entered the ranked list
+    # (no backend plan, no FROST-engine compile, whatever the opt-in flag said) and ends on the forced-tile JIT route by
+    # construction (never the graph route, which creates a cuDNN handle at the first execute per (device, stream)).
+    capture_safe: bool = False
     # The forced-tile JIT route's pack resolution (`_resolved_pack`): `(jit, {id(graph tensor key): id(bound tensor)})`, taken
     # once BY ROLE (the graph tensors the plan declares, never the buffers of a call) and OWNED BY THE PLAN, so it lives exactly
     # as long as the JIT it describes.  A cache slot, not a plan fact: no constructor argument (init=False), outside eq / repr.
@@ -1185,6 +1243,7 @@ def build_proj_gemm(
     a_major: str = "k",
     b_major: str = "k",
     split_k: int = 0,
+    capture_safe: bool = False,
 ) -> ProjGemmPlan:
     """Compile one projection GEMM and pin the FROST plan.
 
@@ -1310,6 +1369,39 @@ def build_proj_gemm(
     why ``split_k >= 1`` needs ``pin_frost=True``: with the FROST engine deselected there
     is no JIT to pin, and the combination is a ``ValueError`` (a knob is honoured or
     refused, never silently dropped).
+
+    **The dense bf16 / f16 JIT-only route (no opt-in flag).** ``frost_gemm`` is an
+    opt-in engine: without ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` the backend's ranked
+    list has no FROST plan and the pin raises ``_NoFrostPlan``.  A dense bf16 / f16 plan
+    whose tile is forced (``tile_config="auto"`` with ``N % 256 == 0``) or named
+    explicitly then takes the SAME ``jit-only`` route the block-scale plans take: the
+    graph is built only to be analyzed, ``jit_from_cudnn_graph`` never asks the backend,
+    and ``run_proj_gemm`` launches the JIT before any handle exists -- so the block
+    compiles with the flag UNSET (a host module must never set it: the flag is read live
+    and flips every opt-in engine into every FE graph of the process).  Without a forced
+    tile the graph route IS the plan, so that decline stays; the per-tensor fp8 dense
+    plans keep it too (their alpha epilogue is validated on the pinned ``graph+jit``
+    route).  When the flag IS set nothing changes for a PLAIN declaration: the backend
+    admits the graph, the plan is pinned by name (``graph+jit``) and the same JIT runs.
+
+    **CUDA-graph capture.** ``build_proj_gemm`` is refused under capture (a typed
+    ``RuntimeError`` naming the route and the remedy, before the ``cudnn.pygraph``
+    constructor creates its handle), and so is the GRAPH route's first execute on a
+    stream (:func:`handle_for_stream`: no cuDNN handle is created inside a capture).
+    ``capture_safe=True`` is the serving declaration (appended, default off): the plan
+    NEVER ENTERS THE RANKED LIST -- the graph is validated and built only to be analyzed;
+    ``create_execution_plans`` (the heuristics query that reads the flag), ``check_support``
+    and ``build_plans`` are never called, so there is no backend plan and no FROST-engine
+    compile whatever the flag says, and the plan is ``jit-only`` by construction.  A shape
+    the forced tile does not divide, or ``pin_frost=False``, is a typed decline at compile
+    time, and a forced compile the compiler refuses is a typed ``NotImplementedError``
+    naming the tile and the reason, NEVER the warning + graph-heuristic fallback the plain
+    declaration takes (a fallback would turn a capture-safe plan into one that creates a
+    handle inside the capture).  The pin is skipped on purpose: with the flag set, a plain
+    declaration's ``build_plans`` compiles the same ``jit_from_cudnn_graph`` inside the
+    FROST GEMM engine, and a refusal there is neither typed for the tile nor caught by the
+    fallback arm -- the driver's forced-tile compile has to be the ONLY compile for the
+    refusal to be the typed one on every host, under either flag state.
     """
     import cudnn
 
@@ -1328,6 +1420,19 @@ def build_proj_gemm(
             f"{label}: split_k={split_k} pins a FROST JIT config and cannot be combined with pin_frost=False (the deselected-FROST graph route "
             "has no JIT to pin, so the knob would be silently dropped)"
         )
+    _refuse_compile_under_capture(label)
+    if capture_safe and not pin_frost:
+        raise ValueError(
+            f"{label}: capture_safe=True needs the forced-tile JIT route, and pin_frost=False is the graph route by request (its first execute "
+            "per stream creates a cuDNN handle, which cannot happen inside a CUDA-graph capture); drop one of the two"
+        )
+    # The tile the JIT route runs: the forced 256-wide config when it divides N, an explicit name as given, else None (the
+    # graph heuristic's own tile -- no JIT unless a split or an MMA K width is pinned below).
+    name = _forced_tile_config(n) if tile_config == "auto" else tile_config
+    if capture_safe and name is None and not (block_scale or split_k >= 1 or mma_tile_k_bytes is not None):
+        # No JIT would be built: the plan would run the GRAPH route, whose first execute per (device, stream) creates a cuDNN
+        # handle -- inside the capture a serving stack records with no warm-up.  Typed, before any graph or backend call.
+        raise NotImplementedError(_capture_safe_graph_route_message(label, m, k, n, tile_config, "the graph heuristic's tile"))
     if mma_tile_k_bytes is not None:
         # The MMA K width's contract, checked ONCE and up front for the block-scale and the dense path alike, so an invalid
         # value is always named as such whatever else the call combines it with.  (1) 32 or 64, the tcgen05 MMA K widths.
@@ -1548,19 +1653,55 @@ def build_proj_gemm(
         g.check_support()
         g.build_plans()
 
-    if block_scale and pin_frost:
+    # A DENSE bf16 / f16 plan with a forced (or named) tile may run with no backend plan at all: the JIT never asks the
+    # backend, `run_proj_gemm` launches it before any handle, so an unset CUDNN_FRONTEND_ENABLE_FROST_ENGINES (frost_gemm is
+    # opt-in; a host module never sets the flag) is not a decline here.  Without a forced tile the graph route IS the plan,
+    # so the decline stays; the per-tensor fp8 plans keep it too (their alpha epilogue is validated on the pinned route).
+    dense_jit_only_ok = pin_frost and not block_scale and name is not None and dtype in (torch.bfloat16, torch.float16)
+    backend_decline: Optional[BaseException] = None
+    if capture_safe:
+        # The SERVING declaration never enters the ranked list.  The graph is validated and built only to be ANALYZED (the
+        # analyzer reads the tensor metadata the build fills in); `create_execution_plans` -- the heuristics query that reads
+        # the opt-in flag and would put `frost_gemm` on the list -- `check_support` and `build_plans` are never called, so
+        # there is no backend plan and no FROST-engine compile WHATEVER the flag says.  With the flag set, a plain
+        # declaration's `build_plans` compiles the SAME `jit_from_cudnn_graph` inside the FROST GEMM engine, and a refusal
+        # there reaches the caller as the engine's own error (or a bare one): neither typed for the tile nor caught by the
+        # fallback arm below.  Skipping the pin makes the driver's forced-tile compile below the ONLY compile, so its refusal
+        # is the one typed decline, on every host, under either flag state.  `workspace_bytes` reads the JIT's own number on
+        # this route (there is no backend plan to ask).
+        g.validate()
+        g.build_operation_graph()
+        plan.route = "jit-only"
+        _LOG.info(
+            "%s: capture_safe declaration -- no ranked list, no backend plan, no engine-side compile; the forced-tile JIT-only route at %s",
+            label,
+            name if name else "the engine's auto-picked config",
+        )
+    elif pin_frost and (block_scale or dense_jit_only_ok):
         # A backend that does not admit the e4m3 + E8M0 two-dequant graph is a typed decline
         # (cudnnGraphNotSupportedError), and "no frost_gemm in the list" is the `_NoFrostPlan`
         # above; both leave the JIT-only route, which never asks the backend.  Anything else --
         # a backend failure inside check_support / build_plans, a bare RuntimeError -- is a
         # bug and PROPAGATES (engine contract rule 2); the catch is deliberately this narrow.
-        # WARNING, not INFO: on this route the plan-name pin is absent and `workspace_bytes`
-        # is the JIT artifact's, which a caller reading the perf table should see without -v.
+        # WARNING, not INFO, on the block-scale route: there the plan-name pin is absent and `workspace_bytes`
+        # is the JIT artifact's, which a caller reading the perf table should see without -v.  INFO on the
+        # dense route: compiling without the opt-in flag is the serving stack's intended path, not a surprise.
         try:
             _backend_pin()
         except (cudnn.cudnnGraphNotSupportedError, _NoFrostPlan) as exc:
             plan.route = "jit-only"
-            _LOG.warning("%s: backend declined the block-scale graph (%s: %s); taking the JIT-only route", label, type(exc).__name__, str(exc)[:200])
+            backend_decline = exc
+            if block_scale:
+                _LOG.warning("%s: backend declined the block-scale graph (%s: %s); taking the JIT-only route", label, type(exc).__name__, str(exc)[:200])
+            else:
+                _LOG.info(
+                    "%s: no backend plan for the dense %s graph (%s: %s); taking the forced-tile JIT-only route at %s (no backend plan, no cuDNN handle at execute)",
+                    label,
+                    _dtype_word(dtype),
+                    type(exc).__name__,
+                    str(exc)[:200],
+                    name,
+                )
     else:
         _backend_pin()
 
@@ -1573,7 +1714,6 @@ def build_proj_gemm(
     # binding path (`bd.sfa_operands` / `bd.sfb_operands`) serves every shape.  So does
     # an explicit `mma_tile_k_bytes`: the width lives on a JIT config, and a dense shape
     # outside the forced tile's N would otherwise drop the knob on the graph route.
-    name = _forced_tile_config(n) if tile_config == "auto" else tile_config
     pinned_split = split_k >= 1  # split_k=1 pins ONE slice (and refuses the fallback); S >= 2 splits
     if pin_frost and (name or block_scale or pinned_split or mma_tile_k_bytes is not None):
         from cudnn.gemm.frost.compiler import jit_from_cudnn_graph
@@ -1612,6 +1752,15 @@ def build_proj_gemm(
         try:
             compiled = jit_from_cudnn_graph(g, config=cfg)
         except Exception as exc:
+            if capture_safe:
+                # The serving declaration: the graph-heuristic fallback would create a cuDNN handle at the first execute per
+                # stream -- inside the capture a serving stack records with no warm-up -- so a refused forced compile is a
+                # typed decline naming the tile and the compiler's reason, never a warning and a silent route change.
+                raise NotImplementedError(
+                    f"{label}: capture_safe=True pins the forced-tile JIT route at {cfg.name!r}, and that compile was refused "
+                    f"({type(exc).__name__}: {str(exc)[:300]}); the graph-heuristic fallback is refused too -- its first execute on a stream "
+                    "creates a cuDNN handle, which cannot happen inside a CUDA-graph capture"
+                ) from exc
             if tile_config != "auto" or block_scale or mma_tile_k_bytes is not None:
                 raise  # explicit requests (and the block-scale path, which has no graph fallback) surface their reason
             if pinned_split:
@@ -1630,6 +1779,13 @@ def build_proj_gemm(
                     "the graph heuristic's tile is not validated for e4m3 MN-major operands, so the fallback the bf16 / f16 and K-major fp8 plans "
                     "take is refused too"
                 ) from exc
+            if plan.route == "jit-only":
+                # The dense jit-only route has NO backend plan to fall back onto (the pin above raised): today's typed decline
+                # stands, with the compiler's refusal chained -- nothing can serve this plan without the opt-in flag.
+                raise _NoFrostPlan(
+                    f"{label}: {backend_decline}; and the forced-tile JIT compile at {cfg.name!r} was refused too "
+                    f"({type(exc).__name__}: {str(exc)[:300]}) -- no route can serve this plan"
+                ) from exc
             compiled = None
             # WARNING, not DEBUG (like the block-scale twin above): the fallback changes the tile config, the
             # route and possibly the slice count (`_auto_split_k`), under a different plan name -- a perf table
@@ -1647,7 +1803,20 @@ def build_proj_gemm(
             plan.mma_tile_k_bytes = getattr(compiled.config, "mma_tile_k_bytes", None)
             if plan.route == "graph":
                 plan.route = "graph+jit"
+    plan.capture_safe = bool(capture_safe)
+    if capture_safe and plan.jit is None:
+        # Unreachable by the checks above (the graph route was declined up front, a refused compile raised typed); kept so the
+        # invariant the serving stack relies on -- a capture_safe plan HAS a JIT -- is asserted where the plan is finished.
+        raise NotImplementedError(_capture_safe_graph_route_message(label, m, k, n, tile_config, str(plan.tile_config_name)))
     return plan
+
+
+def _capture_safe_graph_route_message(label: str, m: int, k: int, n: int, tile_config, resolved: str) -> str:
+    return (
+        f"{label}: capture_safe=True needs the forced-tile JIT route, but this plan resolves to the graph route ({resolved}; m={m}, k={k}, "
+        f"n={n}, tile_config={tile_config!r}): the graph route creates a cuDNN handle at the first execute per stream, which cannot happen "
+        f"inside a CUDA-graph capture -- use an N that 256 divides (the forced tile {_FORCED_TILE_NAME!r}), or name a tile_config explicitly"
+    )
 
 
 def _auto_tile_config(g):
@@ -1798,8 +1967,14 @@ def run_proj_gemm(
         return
     if plan.route == "jit-only":
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
+    if plan.capture_safe:
+        raise RuntimeError(
+            f"{plan.label}: a capture_safe plan reached the graph route (route={plan.route!r}, no JIT) -- build_proj_gemm refuses that at "
+            "compile time, so this plan was altered after it was built"
+        )
     # The graph route names its stream through the handle: the plan's engine
     # reads `ExecutionContext.stream` off it (`_pygraph.execute` -> `cudnn.get_stream`).
+    # Creating that handle inside a CUDA-graph capture is refused typed in `handle_for_stream`.
     if handle is None:
         handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)

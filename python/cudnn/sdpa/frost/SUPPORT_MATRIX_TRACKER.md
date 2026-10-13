@@ -84,6 +84,9 @@ across its general and D512 head envelopes, with device scales, all four scalar
 output dtypes and native KV-tail masking. THD retains per-batch length inputs;
 CU-prefix-sum graph inputs remain unsupported on this FP8 row.
 SM100/SM103 MXFP8 uses prepared launches for scalar outputs with fixed dense or bounded THD geometry.
+SM120/SM121 MXFP8 uses prepared launches for scalar outputs with fixed dense (unsplit and split) or THD geometry,
+and for the block-scaled MXFP8 O on fixed dense unsplit plans;
+dense conversion layouts use staged copies around a prepared compact plan, with the scale tensors bound unchanged.
 SM107 MXFP8 at exact device cc 10.7 uses prepared launches for its four existing dense, unsplit native
 head shapes and for bounded THD at d256 (`config_sm107.SM107_MXFP8_THD_SHAPES`); THD at the other
 three shapes, split-KV and PackGQA remain unsupported. Dense MXFP8 runtime
@@ -325,7 +328,7 @@ MMA as d=512.
 | FP8 E4M3 / E5M2 (per-tensor descale) | ✅ (native d64, cga1)⁷ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | MXFP8 (E4M3/E5M2 + per-32 E8M0 SF) | ✅ (native d64, cga1, dense / unsplit / unpaged)⁷ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (E4M3 only, d=256) |  ✅ᵍ (E4M3 only)  |
 | O dtype ≠ QKV dtype — **quantized graphs only**¹ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵍ (fp16/bf16 gradients) |  ✅ᵍ · —ᵇ²  |
-| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — per-tensor FP8 and block-scale MXFP8 graphs, dense/unsplit/unpacked only; `scale_o` doubles as the FP4 global scale (a python-only input on `sdpa_mxfp8`) | ❌ | ✅ (FP8: SM100 / SM107 / SM120; MXFP8: SM100 / SM107) | ❌ | ❌ | ❌ | ❌ |  ❌  |
+| Block-scaled O (`sdpa_fp8` / `sdpa_mxfp8` + `sf_o`): FP4_E2M1 O + E4M3 scale per 16 d, or E4M3 O + UE8M0 scale per 32 d — per-tensor FP8 and block-scale MXFP8 graphs, dense/unsplit/unpacked only; `scale_o` doubles as the FP4 global scale (a python-only input on `sdpa_mxfp8`) | ❌ | ✅ (FP8: SM100 / SM107 / SM120; MXFP8: SM100 / SM107, and SM120 for the E4M3 + UE8M0/32 O) | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Head-dim envelope (zero-padded below native) | f16 ×8 · fp8 ×16 up to 64 (**native 64**: the d128 kernel files at `d_flavor=64`)⁷ · mxfp8 exact | f16 ×8 · fp8 ×16 · mxfp8 exact | f16 ×8 · **fp8 exact (192, 128) only**¹⁰ · mxfp8 exact | f16 ×8 · **fp8 exact 256 only**¹⁰ · mxfp8 exact | f16 ×8 · fp8 ×16, floor 256² · mxfp8 exact | f16 (256, 512] ×8ᵇ · mxfp8 exact 256ᵍ |  none — exact (256, 256)ᵇ² ᵍ  |
 | **Layout** | | | | | | |  |
 | BSHD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ᵇ ᵍ |  ✅ᵇ² ᵍ  |
@@ -1845,7 +1848,7 @@ Rubin config factories. Target-SM107 numerical validation is still required.
 ## SM120 / SM121 (Blackwell GeForce, cc 12.0–12.9)
 
 Engines: `sdpa_fwd_prefill_sm120`, `sdpa_fwd_prefill_sm120_fp8`,
-`sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
+`sdpa_fwd_prefill_sm120_mxfp8`, `sdpa_bwd_sm120`. Head dims are a **continuum**, not per-model flavors: the
 kernel picks Q/K and V head tiles independently (f16/bf16 head dims it would
 tile at 256 on both sides run a dedicated template, `sm120/prefill_d256_f16.py`
 with the same support).
@@ -1857,15 +1860,19 @@ zero-padding, with the same MMA and on-chip storage cost.
 FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
 **multiples of 16** and a **64 x 64 CTA**. BPROP remains limited to 256.
 
-| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8<br>both ≤256 or both ∈ (256, 512], any ×16 | BPROP<br>d ≤ 256, any ×8 |
+MXFP8 FPROP (`sm120/prefill_mxfp8.py`) runs the FP8 pipeline on the block-scaled
+`m16n8k32` MMA, with the same independent head band up to 256 in **multiples of
+16**; the d512 band is not served.
+
+| Feature | FPROP<br>d ≤ 256, any ×8;<br>both dims ∈ (256, 512], any ×8 | FPROP FP8 / MXFP8<br>both ≤256 or (FP8 only) both ∈ (256, 512], any ×16 | BPROP<br>d ≤ 256, any ×8 |
 |---|:--:|:--:|:--:|
 | **Data types** | | | |
 | FP16 / BF16 | ✅ | — | ✅ |
 | FP8 E4M3 / E5M2 (per-tensor) | — | ✅ | ❌ |
-| MXFP8 | ❌ | ❌ | ❌ |
+| MXFP8 | — | ✅ (both ≤ 256) | ❌ |
 | O dtype ≠ QKV — **FP8 graphs only** (fp16/bf16/fp8 out) | ❌ | ✅ | — |
 | Rectangular head dims (D_QK ≠ D_V) | ✅ (independent within each served band) | ✅ (independent) | ✅ (D_QK ≥ D_V) |
-| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, both ≤ 256ᵃ; or both ∈ (256, 512] | ×8, ≤ 256 |
+| Head-dim alignment (actual `D_QK`/`D_V`) | ×8, both ≤ 256ᵃ; or both ∈ (256, 512] | ×16, both ≤ 256ᵃ; or (FP8 only) both ∈ (256, 512] | ×8, ≤ 256 |
 | **Layout** | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | THD / ragged | ✅ | ✅ | ❌ |
@@ -1885,9 +1892,11 @@ FP8 FPROP (`sm120/prefill_d512_fp8.py`) adds the same independent band with
 | Ragged `S_kv` (no tile rule) | ✅ | ✅ | ✅ |
 | Decode-shaped (`S_q == 1`) | ✅ | ✅ | ✅ |
 
-Base-2 stats are wired into all three f16 templates and the FP8 template,
-including the final Split-KV combine. Target-SM120 numerical validation remains
-required; local SM80/SM100 results do not validate these kernels.
+Base-2 stats are wired into all three f16 templates and the FP8 and MXFP8
+templates, including the final Split-KV combine. `sdpa_mxfp8` graphs take no
+`stats_use_log2` input, so only the direct adapter reaches the MXFP8 wiring.
+Target-SM120 numerical validation remains required; local SM80/SM100 results do
+not validate these kernels.
 
 ᵃ **Head TILE granule and head-DIM alignment are different numbers — the column
 headers quote the head-dim rule.** `GENERAL_HEAD_TILES` steps by 16 (f16), and
@@ -1904,7 +1913,14 @@ on the 80-wide tile.
 
 Engines: `sdpa_fwd_prefill_sm80`, `sdpa_bwd_sm80`. Both use `mma.sync` (no
 tcgen05) and assume the A100's 164 KiB opt-in SMEM — sm86/sm89 are declined.
-The backward serves packed THD graphs (ᵏ); the forward does not yet.
+The backward serves packed THD graphs (ᵏ); the forward serves native-flavor packed THD graphs
+with per-batch or cumulative Q/KV lengths, compact BSHD Q/K/V/O, and packed
+head-major or token-major Stats.
+The packed caller contract still applies: every sequence length is within its
+declared `S_max`, the Q/KV length sums fit the respective bound packed buffers
+and any `max_total_seq_len_*`, and ragged offsets describe the same adjacent
+sequences. Runtime lengths stay on device; the adapter cannot host-validate
+these values without breaking graph capture.
 
 Dense forward uses a prepared pointer host when V matches its flavor width,
 Q/K head dimensions are multiples of eight, and every stepped Q/K/V/O outer
@@ -1932,9 +1948,9 @@ the former tensor compilers and their fake-operand construction are removed.
 | FP8 / MXFP8 | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ | ❌ / ❌ |
 | **Layout** | | | | |
 | BSHD / `dense_flex` | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
-| THD / ragged | ❌ / ✅ᵏ | ❌ / ✅ᵏ | ❌ / ✅ᵏ | ❌ / ✅ᵏ |
-| `cu_seq_len_q/kv` | ❌ / ❌ʲ | ❌ / ❌ʲ | ❌ / ❌ʲ | ❌ / ❌ʲ |
-| Strided / permuted Stats | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
+| THD / ragged | ✅ / ✅ᵏ | ✅ / ✅ᵏ | ✅ / ✅ᵏ | ✅ / ✅ᵏ |
+| `cu_seq_len_q/kv` (THD forward only) | ✅ / ❌ʲ | ✅ / ❌ʲ | ✅ / ❌ʲ | ✅ / ❌ʲ |
+| Strided / permuted Stats (dense; packed THD uses the two layouts above) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | **Masks / features** | | | | |
 | Causal (top-left) | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Causal bottom-right | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
@@ -1984,7 +2000,11 @@ All SM80 forward tensor-fake construction is removed. Dense conversion copies,
 including standalone RoPE, share prepared gather/scatter plans with native GQA
 and natural-unit sinks. RoPE preserves its angle-table values through the shared prepared host;
 its obsolete tensor-staging executor and dedicated host compiler are removed.
-The forward graph row still declines THD and RoPE, so graph eligibility is unchanged.
+Native-flavor THD forward graphs reuse this pointer host, with optional head-major
+or token-major Stats and device-side length normalization in caller workspace.
+Plan construction and execution allocate no device memory. Graph admission requires
+compact packed Q/K/V/O, natural scheduling, and no bias, sink, or RoPE fusion.
+The graph path does not run the standalone wrapper's output-capacity initialization.
 
 Standalone packed forward/backward wrappers share prepared bitwise data copies
 for their existing head-width padding, backward compaction and output trimming.
@@ -2039,8 +2059,9 @@ write the caller's head dim, so nothing past the packed total is ever written in
 the caller's gradients (the ragged sweeps assert this with a NaN-filled tail). Served under THD: the causal family, GQA/MQA, sinks/dSink,
 deterministic dQ, head-dim envelope padding (carved staging at the packed
 capacities), zero-length and one-sided-empty sequences. Bias/dBias is dense-only (a packed graph has no `[B, H, S_q, S_kv]` bias); RoPE is a
-wrapper-only fusion no engine row admits. The forward row
-still declines THD (the wrapper's `cu_seqlen` path serves it).
+wrapper-only fusion no engine row admits. The SM80 forward row now serves
+native-flavor, compact packed THD with Q/KV lengths; its dense head-dim
+envelope and fused bias/sinks remain unavailable to THD.
 
 ---
 
@@ -2059,11 +2080,11 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | f16/bf16 forward split-KV | SM90, SM80; SM107 D512 and dense D256; THD outside D128/D256 and nonpaged D192 |
 | f16/bf16 forward PackGQA | SM107 outside dense D128 GQA (shared bodies, not with the pre-folded scale), D128 paged THD / nonpaged D128 split THD and exact D256 paged unsplit THD with CGA2 |
 | d192×d128 quantized PackGQA / split-KV, and d192 MXFP8 THD | SM107 — the shape is served in FP8 and MXFP8 as of 2026-09-09, and per-tensor FP8 **THD** with it; PackGQA and split-KV stay wired in the d128 flavor only (`pack_gqa_d_shapes` / `split_d_shapes`), and the MXFP8 line declines THD outside d256 (`SM107_MXFP8_THD_SHAPES`, ᶻ) |
-| MXFP8 forward | SM90, SM120, SM80 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open) |
+| MXFP8 forward | SM90, SM80, and SM120 above d = 256 (SM107 is served — see the SM107 table; d512 is ⚠️ⁱᵛ, correct but with no test module -- covered through the graph API by `test_mhas_v2.py::test_sdpa_mxfp8_fwd_default_walk_cc107_L0` and `::test_sdpa_mxfp8_fwd_cc107_L0`, d512 being one of the four exact flavors drawn; a dedicated module is still open; SM120 serves both dims ≤ 256 — see the SM120 table) |
 | Per-tensor FP8 backward | every arch except SM107 d = 256 E4M3 (`sdpa_bwd_sm107_fp8`, ᵇ) |
 | MXFP8 backward outside SM100/SM103 d = 256 and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ) |
-| THD forward | SM80 |
+| THD forward outside native-flavor dims or compact packed Q/K/V/O | SM80 — the graph path serves only the four native head-dim pairs and copy-free packed BSHD buffers |
 | **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV, the MTP step in token units of the 32-column tile ᵐᵗᵖ) is the only Rubin decode tile today |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM107 — dense d128 f16/bf16 rides the shared decode tile since issue #1472, and decode-shaped dense-Q d256 f16/bf16 (dense or paged cache) rides the Rubin d256 decode tile (ᵈʳ); d192×128 / d512 and every quantized flavor run their prefill kernels, d256 graphs past the tile's route run the d256 prefill kernel, THD keeps the prefill tile (the ragged-Q leg is SM100-line only), dense paged queries outside the d256 decode tile are not wired. SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. Unsplit THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); exact D128 split THD can use the single-CTA path; d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile; on cc 10.7 the MXFP8 pools likewise run the d128 (`TILE_CGA_M=2`) / d256 (cga1) prefill tiles at `S_q <= 8` (the paged-vs-dense measurement is the R15 note of the SM107 paged MXFP8 pools section below: paged within 2 % of dense at the qwen35 decode shape; a decode tile for the quantized flavors is a P3-class follow-up) |
@@ -2129,8 +2150,9 @@ prepared calls require the declared caller workspace, like graph execution.
 
 Existing dense D128 NVFP4 and MXFP8 outputs use prepared pointer launches on
 SM100/SM103, SM107 and SM120/SM121 per-tensor FP8, and on SM100/SM103 and SM107
-MXFP8 input paths. The declared SF_O atom geometry stays fixed; each call binds
-current O, SF_O, optional Amax and device scales with observed storage checks.
+MXFP8 input paths; SM120/SM121 MXFP8 inputs serve the MXFP8 output. The declared
+SF_O atom geometry stays fixed; each call binds current O, SF_O, optional Amax
+and device scales with observed storage checks.
 FP4 O uses packed byte geometry, while V keeps its full logical head dimension.
 SF_O offsets and prepared copy strides preserve Int64 addressing.
 THD, paged, split-KV, PackGQA, gated output and shape-override combinations keep
