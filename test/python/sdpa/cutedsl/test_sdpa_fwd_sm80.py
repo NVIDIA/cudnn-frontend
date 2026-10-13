@@ -361,8 +361,8 @@ def test_sdpa_fwd_sm80_thd_off_flavor_head_dim():
 def test_sm80_thd_compile_key_plan_time_only():
     """Issue #604 regression: the packed THD token totals are RUNTIME values,
     so two varlen calls with different totals must re-bind ONE compiled
-    artifact (the prepared host's metadata-only LRU sees a single miss) —
-    never mint a compile per step, which is the continuous-batching
+    artifact (the prepared launch cache hits and the host compile is not
+    repeated) — never mint a compile per step, which is the continuous-batching
     pathology no correctness test catches."""
     from cudnn.frost import template_loader
     from cudnn.sdpa.fwd import sdpa_fwd_wrapper_sm80
@@ -389,21 +389,23 @@ def test_sm80_thd_compile_key_plan_time_only():
 
     def cache_totals():
         from cudnn.sdpa.fwd.kernels.sm80.prepared_host import compile_thd_host
+        from cudnn.sdpa.fwd.prepared_sm80_thd import build_launch
 
-        info = compile_thd_host.cache_info()
-        return info.misses, info.hits
+        # build_launch caches the prepared launch in front of compile_thd_host,
+        # so a re-call hits there and never reaches the compile cache.
+        return compile_thd_host.cache_info().misses, build_launch.cache_info().hits
 
-    varlen([96, 160])  # first call: one compile
+    varlen([96, 160])  # first call: one compile (256 tokens)
     n_modules_before = len(template_loader._MODULES)
     misses_0, hits_0 = cache_totals()
     varlen([128, 64, 320])  # different totals AND batch count... same artifact?
     # Different logical batch counts legitimately re-specialize (the cu fake
     # length is plan-time); different TOKEN TOTALS at the same batch count
     # must not.
-    varlen([64, 192])  # same n_seqs as call 1, different totals
+    varlen([64, 224])  # same n_seqs as call 1, different total (288 tokens)
     assert len(template_loader._MODULES) == n_modules_before, "a new template specialization was minted by runtime data"
     misses_1, hits_1 = cache_totals()
     # Call 2 (n_seqs=3) may legitimately re-specialize once; call 3 shares
-    # call 1's key (n_seqs=2, different token totals) and MUST cache-hit.
+    # call 1's key (n_seqs=2, different token totals) and MUST reuse its launch.
     assert misses_1 - misses_0 <= 1, f"THD compile key leaked runtime data: {misses_1 - misses_0} new misses"
-    assert hits_1 - hits_0 >= 1, "expected a cache hit on the same-batch-count re-call"
+    assert hits_1 - hits_0 >= 1, "expected the same-batch-count re-call to reuse the prepared launch"
