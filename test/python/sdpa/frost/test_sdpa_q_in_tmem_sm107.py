@@ -63,7 +63,7 @@ def _pins(monkeypatch):
 # --------------------------------------------------------------------------- tier 1: CPU contract
 
 
-def test_the_field_is_appended_the_seam_is_private_and_the_pick_is_zero_until_measured():
+def test_the_field_is_appended_the_seam_is_private_and_the_pick_without_the_geometry_is_zero():
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
@@ -75,7 +75,7 @@ def test_the_field_is_appended_the_seam_is_private_and_the_pick_is_zero_until_me
     assert c._CfgSm107.Q_IN_TMEM == 0
     for d in (32, 64):
         for dt in (2, 3):
-            assert c.sm107_q_in_tmem_pick(d, dtype_qkv=dt) == 0, "unmeasured: the A/B writes the rule"
+            assert c.sm107_q_in_tmem_pick(d, dtype_qkv=dt) == 0, "a caller without the record's geometry (the sweep's bare call) gets the SMEM-Q form"
     assert c.sm107_q_in_tmem_pick(32, request=1) == 1 and c.sm107_q_in_tmem_pick(32, request=0) == 0
     # the seam is NOT part of the module-cache key tuple: its value lands IN the record
     assert c.sweep_seam_state() is None
@@ -90,6 +90,118 @@ def test_the_seam_lands_in_the_record_verbatim(_pins):
     ), "verbatim -- the factory declines off the domain"
     _pins(q_in_tmem=None)
     assert c.sm107_q_in_tmem_pick(32) == 0
+
+
+def _rule(d, *, tile_n, bias, mask, wgs=2, cga=1, tile_m=128, lens=False, dense=True, dtype=2):
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    return c.sm107_q_in_tmem_pick(
+        d,
+        dtype_qkv=dtype,
+        tile_n=tile_n,
+        has_bias=bias,
+        has_kv_mask=mask,
+        softmax_wgs=wgs,
+        cta_mma=cga,
+        tile_m=tile_m,
+        seq_kv_lens_present=lens,
+        dense_unsplit=dense,
+    )
+
+
+def test_the_measured_rule_keys_on_the_records_geometry():
+    """The A/B's verdict per cell class, as the rule (one node, 100 x 3 graph replay, both forms in one process, speed-up = t(SMEM-Q) / t(TMEM-Q) - 1):
+    the plain 128-wide body WINS (14 / 14, +2.6..+6.8 %), the bias-only 64-wide body WINS (27 / 30, +1.2..+3.8 %), the bias + kv_mask 64-wide
+    body at D 64 without per-row lengths WINS (4 / 5, +1.3..+7.1 %); the bias 128-wide body LOSES (-2.2..+0.5 %), the kv_mask bodies at D 32 and
+    the padded kv_mask bodies at D 64 are a wash, a kv_mask alone and the plain 64-wide body are unmeasured -- all of those keep Q in SMEM; off the
+    arm's domain the rule is 0 (never a typed factory decline from a knob-less plan)."""
+    for d in (32, 64):
+        for dt in (2, 3):
+            assert _rule(d, tile_n=128, bias=False, mask=False, dtype=dt) == 1, "the plain 128-wide body"
+            assert _rule(d, tile_n=64, bias=False, mask=False, dtype=dt) == 0, "the plain 64-wide body: unmeasured"
+            assert _rule(d, tile_n=64, bias=True, mask=False, dtype=dt) == 1, "the bias-only 64-wide body (dense)"
+            assert _rule(d, tile_n=64, bias=True, mask=False, lens=True, dtype=dt) == 1, "the bias-only 64-wide body (the per-row lengths leg)"
+            assert _rule(d, tile_n=128, bias=True, mask=False, dtype=dt) == 0, "the bias 128-wide body LOSES"
+            assert _rule(d, tile_n=128, bias=True, mask=False, lens=True, dtype=dt) == 0
+            assert _rule(d, tile_n=64, bias=False, mask=True, dtype=dt) == 0, "a kv_mask alone: unmeasured"
+            assert _rule(d, tile_n=64, bias=True, mask=True, lens=True, dtype=dt) == 0, "the padded kv_mask body: a wash"
+    assert _rule(64, tile_n=64, bias=True, mask=True) == 1, "the bias + kv_mask 64-wide body at D 64 without per-row lengths"
+    assert _rule(32, tile_n=64, bias=True, mask=True) == 0, "the same body at D 32: a wash"
+    # off the domain: 0 (the validator would decline typed)
+    assert _rule(32, tile_n=128, bias=False, mask=False, cga=2) == 0
+    assert _rule(32, tile_n=128, bias=False, mask=False, tile_m=64) == 0
+    assert _rule(32, tile_n=64, bias=True, mask=False, wgs=3) == 0
+    assert _rule(32, tile_n=128, bias=False, mask=False, dense=False) == 0
+    assert _rule(32, tile_n=128, bias=False, mask=False, dtype=0) == 0 and _rule(32, tile_n=128, bias=False, mask=False, dtype=1) == 0
+    assert _rule(128, tile_n=128, bias=False, mask=False) == 0
+    # the request and the seam stay verbatim above the rule
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    assert (
+        c.sm107_q_in_tmem_pick(
+            32, request=0, tile_n=128, has_bias=False, has_kv_mask=False, softmax_wgs=2, cta_mma=1, tile_m=128, seq_kv_lens_present=False, dense_unsplit=True
+        )
+        == 0
+    )
+
+
+@pytest.fixture
+def _rubin_adapter(monkeypatch):
+    """The standalone adapter reads the device capability at construction: model a Rubin device on any host (the bias module's fixture)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+
+
+def _rule_of(p):
+    """The rule re-derived from a RECORD's own fields -- what the adapter must have handed it."""
+    return _rule(
+        p.d_flavor,
+        tile_n=p.tile_n,
+        bias=p.bias_mode != 0,
+        mask=p.kv_mask_form != 0,
+        wgs=p.softmax_wgs,
+        cga=p.cta_mma,
+        lens=p.seq_kv_lens_present,
+        dtype=p.dtype_qkv,
+    )
+
+
+@pytest.mark.parametrize(
+    "d, kw, want",
+    [
+        (32, dict(s_q=384, s_kv=384), 1),  # the plain one-batch-entry body at TILE_N 128
+        (64, dict(s_q=384, s_kv=384), 1),
+        (32, dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384)), 0),  # the resident pair block at TILE_N 128: loses, keeps Q in SMEM
+        (32, dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), seq_kv_lens_present=True), 1),  # the per-row lengths leg: the 64-wide pair body
+        (64, dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), seq_kv_lens_present=True), 1),
+        (32, dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), kv_mask=(1, 1, 1, 384)), 0),  # bias + kv_mask at D 32: a wash
+        (64, dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), kv_mask=(1, 1, 1, 384)), 1),  # bias + kv_mask at D 64, dense: wins
+        (64, dict(s_q=384, s_kv=384, bias=(1, 4, 384, 384), kv_mask=(1, 1, 1, 384), seq_kv_lens_present=True), 0),
+        (32, dict(s_q=384, s_kv=384, kv_mask=(1, 1, 1, 384)), 0),  # a kv_mask alone: unmeasured
+        (64, dict(s_q=640, s_kv=640, bias=(1, 4, 640, 640), kv_mask=(1, 1, 1, 640)), 0),  # the three-warp-group pick: off the domain, never a decline
+    ],
+    ids=[
+        "plain_d32",
+        "plain_d64",
+        "bias_t128_d32",
+        "bias_padded_d32",
+        "bias_padded_d64",
+        "both_d32",
+        "both_d64",
+        "both_padded_d64",
+        "mask_only_d32",
+        "both_d64_S640",
+    ],
+)
+def test_the_adapter_hands_the_rule_the_plans_geometry(_rubin_adapter, d, kw, want):
+    """The knob-less plan's record carries the rule's pick, derived from the SAME facts the record itself names (re-derived here from the record).
+    The batch is triangle attention's: B_flat = S flattened rows (the pair item needs >= 2 rows; a one-row batch lowers the one-batch-entry ring)."""
+    api = _s13._api(d, b=kw["s_q"], h=4, **kw)
+    api.check_support()
+    p = api.template_params()
+    geometry = (p.tile_n, p.bias_mode, p.kv_mask_form, p.softmax_wgs, p.cta_mma, p.seq_kv_lens_present, p.n_chunk)
+    assert p.q_in_tmem == want == _rule_of(p), (p.q_in_tmem, want, geometry)
 
 
 @pytest.mark.parametrize("d", [32, 64])
@@ -365,6 +477,75 @@ def test_q_in_tmem_on_the_plain_tile_n_64_body(case, _pins):
     _s13._check(on, ref)
     off = _run(q, k, v, kw, c, _pins, q_in_tmem=0, tile_n=64, s_slots=2)
     assert torch.equal(on["o"], off["o"]) and torch.equal(on["stats"], off["stats"]), f"{case}: Q_IN_TMEM 1 differs from 0"
+
+
+# The plain body at TILE_N 128 -- the rule's first class (the one-batch-entry item): dense, causal, per-batch lengths with a zero-length row, d64.
+_PLAIN_T128_CASES = {
+    "plain_t128_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),
+    "plain_t128_512_causal": dict(b=2, h=2, h_kv=2, s_q=512, s_kv=512, causal=True),
+    "plain_t128_384_padded": dict(b=3, h=2, h_kv=2, s_q=384, s_kv=384, kv_lens=[384, 0, 200]),
+    "d64_plain_t128_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384, d=64),
+}
+
+
+@requires_rubin
+@pytest.mark.parametrize("case", list(_PLAIN_T128_CASES))
+def test_q_in_tmem_on_the_plain_tile_n_128_body(case, _pins):
+    """The plain one-batch-entry body at TILE_N 128 (the rule's pick) incl. the causal and per-batch-length arms: the oracle at q_in_tmem 1,
+    bitwise the SMEM-Q kernel."""
+    c = _PLAIN_T128_CASES[case]
+    q, k, v, kw, _ = _s13._case_inputs(case, torch.bfloat16, table=_PLAIN_T128_CASES)
+    ref = _s13._ref_of(c, q, k, v, {**kw, "bias": torch.zeros_like(kw["bias"])})
+    kw = {**kw, "bias": None}
+    on = _run(q, k, v, kw, c, _pins, q_in_tmem=1, tile_n=128)
+    _s13._check(on, ref)
+    off = _run(q, k, v, kw, c, _pins, q_in_tmem=0, tile_n=128)
+    assert torch.equal(on["o"], off["o"]) and torch.equal(on["stats"], off["stats"]), f"{case}: Q_IN_TMEM 1 differs from 0"
+
+
+# The knob-less padded bias cell: per-batch lengths with a zero-length row, the chunk length from the pick (no request), the 64-wide pair body.
+_PICK_CASES = {"pair_bias_padded_t64_384": dict(b=4, h=2, h_kv=2, s_q=384, s_kv=384, kv_lens=[384, 0, 200, 384])}
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "case, kw_extra, picked",
+    [
+        ("plain_t128_384", dict(bias=None), 1),
+        ("pair_bias_t128_nkv3_384", dict(kv_mask=None), 0),
+        ("pair_bias_padded_t64_384", dict(kv_mask=None), 1),
+    ],
+    ids=["plain_picks_tmem_q", "bias_t128_keeps_smem_q", "bias_padded_t64_picks_tmem_q"],
+)
+def test_the_knob_less_plan_takes_the_rules_pick_and_is_bitwise_its_smem_q_twin(case, kw_extra, picked, _pins):
+    """The knob-less plan (no seam, the heuristics' picks everywhere) renders the form the rule names and is bitwise the explicitly pinned SMEM-Q
+    form on O and Stats; the record it was loaded with names the pick."""
+    table = {**_PLAIN_T128_CASES, **_T128_CASES, **_PICK_CASES}
+    c = dict(table[case])
+    tile_n = 64 if picked and c.get("kv_lens") is not None else 128  # the per-row-lengths leg runs the 64-wide pair body (the width rule)
+    q, k, v, kw, ref = _s13._case_inputs(case, torch.bfloat16, table=table)
+    if kw_extra.get("bias", 1) is None:
+        ref = _s13._ref_of(c, q, k, v, {**kw, "bias": torch.zeros_like(kw["bias"])})
+    kw = {**kw, **kw_extra}
+    knob_less = _run(q, k, v, kw, c, _pins, q_in_tmem=None, tile_n=tile_n)
+    _s13._check(knob_less, ref)
+    pinned = _run(q, k, v, kw, c, _pins, q_in_tmem=0, tile_n=tile_n)
+    assert torch.equal(knob_less["o"], pinned["o"]) and torch.equal(knob_less["stats"], pinned["stats"]), f"{case}: the knob-less plan differs from SMEM-Q"
+    _pins()  # the seams back to the picks: the pinned twin above left the Q form at 0, and the standalone adapter below must read the RULE
+    d = c.get("d", 32)
+    api = _s13._api(
+        d,
+        b=c["b"],
+        h=c["h"],
+        s_q=c["s_q"],
+        s_kv=c["s_kv"],
+        bias=None if kw.get("bias") is None else (1, c["h"], c["s_q"], c["s_kv"]),
+        seq_kv_lens_present=c.get("kv_lens") is not None,
+        n_chunk=c.get("n_chunk"),
+    )
+    api.check_support()
+    p = api.template_params()
+    assert p.q_in_tmem == picked == _rule_of(p) and p.tile_n == tile_n, (p.q_in_tmem, picked, p.tile_n, p.bias_mode, p.kv_mask_form, p.softmax_wgs, p.cta_mma)
 
 
 @requires_rubin

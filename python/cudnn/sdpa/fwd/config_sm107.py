@@ -945,7 +945,7 @@ def sm107_s_slots_pick(
 # ``_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS`` (the ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` rules: ``monkeypatch.setattr`` in a test or a sweep driver that resets
 # it to None; never a plan path, an import or a config) pins ``TemplateParams.q_in_tmem`` of a knob-less plan on the f16/bf16 32- / 64-wide
 # tiles: 1 = Q resident in TMEM (the MMA warp copies each sub-tile's Q SMEM -> TMEM once per n-step and runs BMM1 as an A-from-TMEM MMA; the
-# copy's commit releases the Q slab at the start of the step), None = the derived value (:func:`sm107_q_in_tmem_pick`: 0 until measured).
+# copy's commit releases the Q slab at the start of the step), None = the derived value (:func:`sm107_q_in_tmem_pick`: the measured rule).
 # Read by :func:`sm107_q_in_tmem_pick`, which the adapter calls when it builds the record -- the value lands IN the TemplateParams, so the
 # template-module cache (keyed on the record alone) and the compiled-plan cache both see two kernels for the two forms; a pinned value is
 # returned VERBATIM, so a plan outside the arm's domain (d128, a quantized dtype, cga2, the 64-row tile, three warp groups) is a typed
@@ -955,15 +955,70 @@ _Q_IN_TMEM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 SMALL_D_Q_IN_TMEM = frozenset({0, 1})
 
 
-def sm107_q_in_tmem_pick(d_flavor: int, *, dtype_qkv: int = _DTYPE_BF16, request: Optional[int] = None) -> int:
+def sm107_q_in_tmem_pick(
+    d_flavor: int,
+    *,
+    dtype_qkv: int = _DTYPE_BF16,
+    request: Optional[int] = None,
+    tile_n: Optional[int] = None,
+    has_bias: Optional[bool] = None,
+    has_kv_mask: Optional[bool] = None,
+    softmax_wgs: Optional[int] = None,
+    cta_mma: Optional[int] = None,
+    tile_m: Optional[int] = None,
+    seq_kv_lens_present: Optional[bool] = None,
+    dense_unsplit: Optional[bool] = None,
+) -> int:
     """The ``TemplateParams.q_in_tmem`` a knob-less plan gets: ``request`` when the caller made one (returned verbatim; the factory validates
-    it), else the sweep seam ``_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS`` (verbatim, see its note), else **0 everywhere** -- the arm is UNMEASURED; its
-    A/B (Q from SMEM vs Q in TMEM on the f16/bf16 32- / 64-wide tiles' bias / kv_mask forms at S 256..768) decides whether a rule exists.
-    ``d_flavor`` / ``dtype_qkv`` are the adapter's facts (the rule, once measured, keys on them like :func:`sm107_s_slots_pick`)."""
+    it), else the sweep seam ``_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS`` (verbatim, see its note), else the MEASURED rule on the record's own geometry
+    (the keyword facts; a caller without them -- the sweep's bare call -- gets 0, the SMEM-Q form of every committed record):
+
+    * **1 on the PLAIN body (no bias, no kv_mask) at TILE_N 128**, the one-batch-entry item: +3.1 / +4.3 / +3.3 / +3.5 % at d32 S 384 / 512 / 640 / 768
+      with S flattened rows (43.30 -> 42.02, 72.51 -> 69.50, 140.67 -> 136.22, 205.47 -> 198.54 us), +4.5 / +6.8 % at S 256 / 384 with 4 S rows; d64 +2.8 / +2.6 /
+      +3.1 / +2.8 % and +6.7 / +4.3 % on the same cells -- 14 of 14 cells a win.
+    * **1 on the BIAS body without a kv_mask at TILE_N 64** (the pair item's resident block or streamed ring: the per-row ``kv_lengths`` leg of the
+      training crops, and the dense cells the width rule puts on the 64-wide tile): +1.5 / +2.4 / +1.9 / +2.0 % at d32 S 384 / 512 / 640 / 768 with
+      kv_lengths = 0.75 S (57.28 -> 56.45, 102.21 -> 99.82, 198.72 -> 195.12, 299.87 -> 293.89 us) and +1.6 / +2.5 / +1.9 / +1.8 % at 0.5 S; d64 +2.4..+2.9 %
+      (0.75 S) and +1.7..+3.8 % (0.5 S), the dense d64 S 256 pair +3.8 % with 4 S rows -- 27 of 30 cells a win, two inside the control spread and one
+      -0.4 % (d32 S 256, 0.5 S, two of four kv tiles).  The same body at **TILE_N 128 LOSES**: -2.2 / -1.1 / -0.5 % at d32 S 384 / 512 / 256 (55.39 ->
+      56.64, 102.30 -> 103.39, 23.87 -> 24.00 us), -0.4 % at d64 S 384 / 512, the rest inside the spread -- it keeps Q in SMEM.
+    * **1 on the BIAS + kv_mask body at TILE_N 64 of the 64-wide tile WITHOUT per-row lengths**: +1.8 / +1.3 % at d64 S 384 / 512 (76.72 -> 75.36,
+      160.98 -> 158.96 us) and +7.1 / +3.2 % at S 256 / 384 with 4 S rows (98.14 -> 91.65, 263.23 -> 255.09), S 256 inside the spread; the same body
+      with ``kv_lengths`` is a wash (-1.4..+3.2 %, geomean 0) and at the 32-wide tile a wash (-0.6..+1.5 %, geomean +0.3 %) -- both keep Q in SMEM.
+    * 0 on a kv_mask without a bias and on the plain TILE_N 64 body (unmeasured), and off the arm's validated domain (cga2, the 64-row tile, three
+      softmax warp groups, a quantized dtype, THD / split-KV / PackGQA / the epilogue gate -- the factory would decline typed).
+
+    Measured bf16, H 4, a 212-SM cc 10.7 node at the 2376 MHz lock (sampled 2328..2364 MHz, the power-cap counter unmoved), 100 x 3 CUDA-graph
+    replay rounds, both forms in ONE process (two template modules) with a control twin (spreads 0.00..0.71 %), the kernel-only CUPTI time agreeing
+    in sign on every cell above 20 us; speed-up = t(Q in SMEM) / t(Q in TMEM) - 1.  The gain is the TMA-LDG warp's earlier Q / K / V prefetch
+    (the Q slab is released by the copy's commit at the start of the step, not after the step's last BMM1), so it grows where steps are short
+    (few kv tiles per step: the 64-wide tile, the padded crops, four batch rows) and vanishes where the 128-wide biased softmax body is the long
+    stage.  O and Stats are BITWISE between the two forms (the same MMAs over the same operands in the same k-step order).  The facts are the
+    adapter's (``api_dsl``'s ``_q_in_tmem``): the record's TILE_N, the graph's bias / kv_mask, the softmax warp-group count, the cluster width,
+    the Q tile height, the per-row-lengths flag and the dense / unsplit / non-PackGQA / ungated gates -- the same facts ``_validate_q_in_tmem`` pins."""
     if request is not None:
         return int(request)
     if _Q_IN_TMEM_OVERRIDE_FOR_SWEEPS is not None:
         return int(_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS)
+    facts = (tile_n, has_bias, has_kv_mask, softmax_wgs, cta_mma, tile_m, seq_kv_lens_present, dense_unsplit)
+    if any(f is None for f in facts):
+        return 0
+    in_domain = (
+        int(d_flavor) in (32, 64)
+        and int(dtype_qkv) > _DTYPE_E5M2
+        and int(cta_mma) == 1
+        and int(tile_m) == 128
+        and int(softmax_wgs) == 2
+        and bool(dense_unsplit)
+    )
+    if not in_domain:
+        return 0
+    if not has_bias and not has_kv_mask:
+        return 1 if int(tile_n) == SM107_SMALL_TILE_N_DEFAULT else 0
+    if has_bias and not has_kv_mask:
+        return 1 if int(tile_n) == SM107_SMALL_TILE_N_NARROW else 0
+    if has_bias and has_kv_mask:
+        return 1 if (int(tile_n) == SM107_SMALL_TILE_N_NARROW and int(d_flavor) == 64 and not seq_kv_lens_present) else 0
     return 0
 
 

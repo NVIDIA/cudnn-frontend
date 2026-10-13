@@ -1740,10 +1740,24 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
 
     def _q_in_tmem(self) -> int:
         """The ``TemplateParams.q_in_tmem`` of this plan: 0 everywhere but the Rubin 32- / 64-wide f16/bf16 tiles, where
-        ``config_sm107.sm107_q_in_tmem_pick`` decides (0 until the arm is measured; the sweep seam's value verbatim, which the factory validates
-        against the arm's domain: cga1, the 128-row tile, two sub-tiles, the TMEM fit)."""
+        ``config_sm107.sm107_q_in_tmem_pick`` decides from the record's own geometry (the measured rule: the plain 128-wide body, the bias-only
+        64-wide body and the bias + kv_mask 64-wide body of the 64-wide tile without per-row lengths take Q in TMEM; the sweep seam's value
+        verbatim, which the factory validates against the arm's domain: cga1, the 128-row tile, two sub-tiles, the TMEM fit)."""
         if self.flavor in _SM107_F16_SMALL_D_SHAPES and self._device_cc == (10, 7) and not self._fp8:
-            return _sm107_q_in_tmem_pick(self.flavor[0])
+            return _sm107_q_in_tmem_pick(
+                self.flavor[0],
+                dtype_qkv=_SM100_DTYPE_QKV_CODE[self.dtype],
+                tile_n=self._effective_tile_n(),
+                has_bias=self.bias_desc is not None,
+                has_kv_mask=self._kv_mask_form() != 0,
+                softmax_wgs=self._resident_arm_softmax_wgs(),
+                # the cta_mma arm of template_params(): a bias plan takes the heuristics' width, a plan without one its request or the tiles' cga1
+                cta_mma=self._resident_arm_cga() if self.bias_desc is not None else (int(self.cga) if self.cga is not None else 1),
+                # the Q tile height the factory renders (128, or 64 under the TILE_M sweep seam): the same resolver the budgets read
+                tile_m=_sm107_tile_m_d128(self.flavor[0]),
+                seq_kv_lens_present=bool(self.seq_kv_lens_present),
+                dense_unsplit=not (self.thd or int(self.split_kv) > 1 or self.pack_gqa or self.gate_desc is not None),
+            )
         return 0
 
     def _resident_arm_bias_stages(self) -> int:
@@ -3237,8 +3251,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # config_sm107.sm107_s_slots_pick -- the measured rule (2 on the plain TILE_N 64 body, else 1), or the sweep seam's value verbatim
             # (a typed factory raise off its domain).
             s_slots=self._s_slots(),
-            # Q resident in TMEM (0 on every record so far; 1 = the MMA warp's once-per-step SMEM -> TMEM copy of Q and the A-from-TMEM BMM1 on the
-            # Rubin small tiles): config_sm107.sm107_q_in_tmem_pick -- 0 until measured, or the sweep seam's value verbatim (a typed factory raise off its domain).
+            # Q resident in TMEM (1 = the MMA warp's once-per-step SMEM -> TMEM copy of Q and the A-from-TMEM BMM1 on the Rubin small tiles):
+            # config_sm107.sm107_q_in_tmem_pick -- the measured rule on the record's geometry (the plain 128-wide body, the bias-only 64-wide body,
+            # the bias + kv_mask 64-wide body at D 64 without per-row lengths), or the sweep seam's value verbatim (a typed factory raise off its domain).
             q_in_tmem=self._q_in_tmem(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
