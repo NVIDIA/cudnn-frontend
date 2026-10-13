@@ -40,7 +40,7 @@ class Cfg:
 
     # --- register split ---
     NUM_REGS_COMPUTE_GROUP_1: int = 256
-    NUM_REGS_OTHER: int = 24
+    NUM_REGS_OTHER: int = 40
 
     THREADS_PER_WARP: int = 32
 

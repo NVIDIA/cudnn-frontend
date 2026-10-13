@@ -34,7 +34,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import cudnn
 
-from .common import get_handle, graph_workspace, select_plan, torch_dtype_to_cudnn
+from .common import execute_graph, make_execution_resources, select_plan, torch_dtype_to_cudnn
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -417,7 +417,8 @@ def run_mamba2_fwd(
     if want_pre:
         y_pre = torch.empty(total, H, V, dtype=x.dtype, device=device)
         variant_pack[t["O_pre"]] = y_pre
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return y, final_state, state_checkpoints, y_pre
 
 
@@ -857,7 +858,8 @@ def mamba2_bwd_op(
         variant_pack[t["O_pre"]] = y_pre
         dz = torch.empty(total, H, V, dtype=z.dtype, device=device)
         variant_pack[t["dZ"]] = dz
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return dx, ddt, dA, dB, dC, dD, ddt_bias, dz, dstate0
 
 
@@ -1368,7 +1370,8 @@ def mamba2_summary_op(
     if output_transition:
         transition = torch.empty(N, H, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return final_state, transition
 
 
@@ -1481,7 +1484,8 @@ def mamba2_summary_bwd_op(
     if output_transition:
         transition = torch.empty(N, H, dtype=torch.float32, device=device)
         variant_pack[t["transition"]] = transition
-    graph.execute(variant_pack, workspace=graph_workspace(graph, device), handle=get_handle(device))
+    workspace, handle = make_execution_resources(graph, device)
+    execute_graph(graph, variant_pack, workspace, handle)
     return d_initial_state, transition
 
 

@@ -2571,12 +2571,12 @@ def test_determinism_two_streams(backend, variant):
 
 @pytest.mark.parametrize("backend", ["frost"], indirect=True)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-def test_kda_bwd_same_graph_two_streams(backend, dtype, monkeypatch):
-    """Two KDA backwards use distinct caller-owned scratch and stay bitwise stable."""
-    from cudnn.linear_attention.ops import kda as kda_module
-
-    case_a = make_case("kda", dtype, T=512, seed=SEED)
-    case_b = make_case("kda", dtype, T=512, seed=SEED + 1)
+@pytest.mark.parametrize("variant", ["kda", "mamba2"])
+def test_bwd_same_graph_two_streams(backend, variant, dtype, monkeypatch):
+    """Two backwards of one variant use distinct caller-owned scratch and stay bitwise stable."""
+    module = importlib.import_module(f"cudnn.linear_attention.ops.{variant}")
+    case_a = make_case(variant, dtype, T=512, seed=SEED)
+    case_b = make_case(variant, dtype, T=512, seed=SEED + 1)
     leaves_a = [tensor.requires_grad_(True) for tensor in thd_tensors(case_a)]
     leaves_b = [tensor.requires_grad_(True) for tensor in thd_tensors(case_b)]
     set_seed(SEED + 2)
@@ -2585,14 +2585,14 @@ def test_kda_bwd_same_graph_two_streams(backend, dtype, monkeypatch):
     s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
     torch.cuda.synchronize()
 
-    with waive_unsupported(backend, "kda"):
+    with waive_unsupported(backend, variant):
         # Build the shared forward/backward artifacts serially. CuTe DSL cold
         # initialization is intentionally outside the concurrency assertion.
         with torch.cuda.stream(s1):
-            o_a, _ = pinned_op(backend, "kda")(*leaves_a, *op_tail(case_a))
+            o_a, _ = pinned_op(backend, variant)(*leaves_a, *op_tail(case_a))
         torch.cuda.synchronize()
         with torch.cuda.stream(s2):
-            o_b, _ = pinned_op(backend, "kda")(*leaves_b, *op_tail(case_b))
+            o_b, _ = pinned_op(backend, variant)(*leaves_b, *op_tail(case_b))
         torch.cuda.synchronize()
 
         def backward(output, leaves, dO):
@@ -2606,9 +2606,9 @@ def test_kda_bwd_same_graph_two_streams(backend, dtype, monkeypatch):
             baseline_b = backward(o_b, leaves_b, dO_b)
         torch.cuda.synchronize()
 
-        assert len(kda_module.bprop_cache) == 1, "the two launches must exercise one cached backward graph"
-        graph = next(iter(kda_module.bprop_cache.values()))[0]
-        execute_graph = kda_module.execute_graph
+        assert len(module.bprop_cache) == 1, "the two launches must exercise one cached backward graph"
+        graph = next(iter(module.bprop_cache.values()))[0]
+        execute_graph = module.execute_graph
         workspace_records = []
 
         def record_workspace(graph_arg, variant_pack, workspace, handle):
@@ -2619,7 +2619,7 @@ def test_kda_bwd_same_graph_two_streams(backend, dtype, monkeypatch):
                 workspace_records.append((int(torch.cuda.current_stream().cuda_stream), workspace))
             return execute_graph(graph_arg, variant_pack, workspace, handle)
 
-        monkeypatch.setattr(kda_module, "execute_graph", record_workspace)
+        monkeypatch.setattr(module, "execute_graph", record_workspace)
 
         for repeat in range(4):
             workspace_records.clear()
@@ -2633,7 +2633,7 @@ def test_kda_bwd_same_graph_two_streams(backend, dtype, monkeypatch):
             assert set(workspace_by_stream) == {int(s1.cuda_stream), int(s2.cuda_stream)}
             assert workspace_by_stream[int(s1.cuda_stream)].data_ptr() != workspace_by_stream[int(s2.cuda_stream)].data_ptr()
             for label, baseline, grads in (("A", baseline_a, grads_a), ("B", baseline_b, grads_b)):
-                for name, want, got in zip(LEAF_NAMES["kda"], baseline, grads):
+                for name, want, got in zip(LEAF_NAMES[variant], baseline, grads):
                     assert_bitwise(f"stream {label} d{name} repeat {repeat}", got, want)
 
 
