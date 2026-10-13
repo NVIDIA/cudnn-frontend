@@ -170,6 +170,37 @@ OUTPUT-BITWISE: the fp32 grid is self-similar under a power-of-two scale, so ``R
 and both arguments give exactly 0.5 below that) -- 16 FADD2 fewer per 32-channel subtile per lane on the renderings with biases, whose epilogue
 stream is ~282 instructions per subtile with the bias path 48 of them (16 LDS.128 + 32 FADD2 = the measured +16 % bias cost at c_out = 128).
 
+LN ONCE PER ROW BLOCK (``LnDualGemmParams.ln_once``; performance only, bitwise by construction: the SAME normalised bf16 words feed every GEMM
+tile of the work item, where the shipped item recomputes them from the same input).  OFF (``""``): the work item is one GEMM tile and a 256-row
+block's A rows are re-streamed and re-LayerNormed per (pass, N tile) -- 4x at K1 c_out 256, 2x at K1 c_out 128 and K3 c_out 256.  ON (``"block"``:
+the item = the whole row block, every pass x every N tile; ``"passes"``: the item = (row block, one N tile) across the passes), the shipped A/B
+ring is SPLIT: the **A REGION** = ``_A_SLOTS`` slots x ``_NK`` stages (region stage ``r * _NK + s``; a whole item's A operand(s), loaded by TMA and
+LayerNormed ONCE per item, read by the MMA on every tile of the item, released by one commit after the item's last tile) and the **B RING** =
+``_B_STAGES`` = the shipped ``ab_stages`` stages of one k-tile of B, streamed per k-step per tile exactly as before.  Grid ``(row blocks x cluster_m,
+N tiles / _NTI, 1)``; every consumer role keeps its per-tile loop and consumes the CLC ring once per ITEM (``sub`` = the item's sub-tile; ``tile_n =
+item_n * _NTI + (sub & (_NTI - 1))``, ``pass = sub >> log2(_NTI)``); the LN warps run once per item.  TMEM, the accumulator ring, the epilogue and
+``acc_*`` are per tile as before.  The barrier rows that change (SUM(issuing lanes) == init written out; the others are the table above):
+  a_full[r * _NK + s]    TMA_LOAD   init 1   this CTA's TMA warp, ONE elected lane, arrive.expect_tx(num_a_operands x sA_bytes) once per ITEM per
+                    stage at the item's first sub-tile; the CTA-local A loads of stage s deliver.  Waited by the 4 LN warps (all lanes); phase =
+                    the LN warps' item counter modulo _A_SLOTS (one phase per slot: a slot's _NK stages are filled and released together).
+  a_norm_full[r * _NK + s]  LEADER_RELEASE  init 8 = 4 leader + 4 follower LN warps, one elected lane each, once per ITEM per stage (the same
+                    fence -> warp sync -> release arrive as the per-tile form).  Waited by the leader MMA warp on the item's FIRST sub-tile only
+                    (the region is immutable until a_empty[r] and the same thread observed the release); phase = its item counter modulo _A_SLOTS.
+  a_empty[r]  NEW   MMA_COMMIT init (cluster_m // cta_group) + cluster_n - 1 = 1 per CTA   one elected lane of the leader MMA warp commits with
+                    the pair multicast mask after the LAST k-step's MMAs of the item's LAST sub-tile -> 1 arrive on each CTA (a commit fires after
+                    the MMAs drained; an empty commit on a fully masked item completes at once).  Waited by each CTA's TMA warp before refilling
+                    slot r (phase pre-armed: the first _A_SLOTS fills wait nothing); drained over _A_SLOTS after the persistent loop on BOTH CTAs.
+  ab_full[b] / ab_empty[b]  the B RING's rows, unchanged in producer, count and cadence (per k-step per tile); _B_STAGES deep.
+  clc_full / clc_empty      unchanged counts; one response per ITEM (the scheduler issues one query per item, every consumer arrives once per item).
+  sFlag[r * _NK]            the item's pair-level vote (the leader LN warp 0's elected lane writes it before its release arrive; the leader MMA warp
+                    reads it after its a_norm_full wait on the item's first sub-tile and keeps tile_skip for the whole item).
+  SMEM: sA = the region (num_a_operands x _A_SLOTS x _NK x 16 KiB: K1 c_out 128 64 KiB, K1 c_out 256 128 KiB, K3 c_out 256 128 KiB at ONE slot),
+                    SWIZZLE_128B for the two jobs exactly as the ring's sA; sB = the ring (unchanged); a_full / a_norm_full / sFlag sized
+                    _A_SLOTS x _NK; a_empty[_A_SLOTS] appended (ON only -- the OFF arm's layout is byte-for-byte the shipped one).  _A_SLOTS = 2
+                    where the two-slot region plus the B ring fit in the shipped ring's bytes (K1 both widths: the next item's load + LayerNorm
+                    overlap this item's tiles), else 1 (K3 c_out 256: ``cudnn.gemm.frost.ln_prologue.ln_once_a_slots``, one source for the host,
+                    the validator and the tests).
+
 Parameters come from the FROST template loader as ``FROST_TEMPLATE_PARAMS`` (a
 :class:`cudnn.gemm.frost.ln_prologue.LnDualGemmParams`); a plain import gets the ``k = 128, c_out = 128, passes = 2``
 geometry so the file runs standalone.
@@ -186,7 +217,15 @@ import cutlass.experimental.primitives as nvvm
 from cudnn.frost.tile_dsl.barrier import arrive_on_leader_release
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, sigmoid, sigmoid2, sigmoid2_biased_half
 from cudnn.frost.tile_dsl.tma import ld_global_v4, ld_shared_v4, st_global_v2, st_shared_v4
-from cudnn.gemm.frost.ln_prologue import PAIR_TILE_ROWS, LnDualGemmParams, validate_ln_dual_gemm_params
+from cudnn.gemm.frost.ln_prologue import (
+    PAIR_TILE_ROWS,
+    RING_STAGES,
+    LnDualGemmParams,
+    ln_once_a_slots,
+    ln_once_n_tiles_per_item,
+    ln_once_tiles_per_item,
+    validate_ln_dual_gemm_params,
+)
 from cudnn.gemm.frost.tile_helpers import (
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
@@ -365,6 +404,28 @@ _A_LBO: tuple = tuple(8192 if mj else a_smem_desc_leading_byte_offset for mj in 
 _A_SBO: tuple = tuple(a_smem_desc_stride_byte_offset for _ in _A_MMA_MAJOR)
 _A_KSTEP: tuple = tuple(2048 if mj else a_smem_k_step_bytes for mj in _A_MMA_MAJOR)
 _MN_GROUP: int = 64  # the 64-element (128-B) MN group of the SWIZZLE_128B atom; one TMA box per group
+# LN ONCE PER ROW BLOCK (module docstring): the work item becomes the row block [x the N-tile group]; the A operand(s) of its 256 pair rows are
+# loaded and LayerNormed ONCE into a resident region of _A_SLOTS slots x _NK stages (region stage r * _NK + s -- every LayerNorm pass addresses it
+# exactly as it addressed the ring; only the slot list changes) while the B half-slab streams per k-step per tile through a ring of _B_STAGES = the
+# shipped ab_stages.  Every constant is derived from PARAMS through the host module's ONE source (never a literal); the OFF arm resolves to the
+# shipped sizes, so its cubin is byte-identical.
+_LN_ONCE: bool = PARAMS.ln_once != ""
+_N_TILES: int = PARAMS.n_tiles  # GEMM N tiles per row block (c_out / 128 in both arms)
+_NTI: int = ln_once_n_tiles_per_item(PARAMS)  # N tiles per work item (every one under "block", one under "passes"; 1 when off)
+_LOG2_NTI: int = _NTI.bit_length() - 1
+_TPI: int = ln_once_tiles_per_item(PARAMS)  # GEMM tiles per work item (passes x _NTI; 1 when off)
+_A_SLOTS: int = ln_once_a_slots(PARAMS)  # resident A region slots (2 = the next item's load + LayerNorm overlap this item's tiles; 1 at K3 c_out 256; 0 off)
+_A_REGION_STAGES: int = _A_SLOTS * _NK if _LN_ONCE else ab_stages  # the A buffers' stage count: the region's, or the shipped ring's
+_B_STAGES: int = ab_stages  # the B ring's depth (both arms)
+if _LN_ONCE:
+    if RING_STAGES[PARAMS.pairing] != ab_stages:
+        raise ValueError(
+            f"{__name__}: the host module's RING_STAGES[{PARAMS.pairing!r}] = {RING_STAGES[PARAMS.pairing]} but this body's ring is {ab_stages} deep -- the resident region was sized against a ring the body does not have"
+        )
+    if b_mcast_slices != 1 or multicast_b or b_is_n_major or matmul_a_batch != 1 or split_k_slices != 1 or fallback_cluster_shape_mnk is not None:
+        raise ValueError(
+            f"{__name__}: the LayerNorm-once arm is written for the rendering's live operand path (one B slice per CTA, no B multicast, K-major B, one A batch, no split-K, one cluster shape)"
+        )
 
 # Rank decomposition below uses shifts and masks instead of runtime integer
 # division.  The catalog satisfies this; keep synthesized configs from silently
@@ -485,6 +546,27 @@ def _decode_pass(tile_m, tile_l):
     row_tile = (tile_m >> _LOG2_PASSES) if cutlass.const_expr(_PASS_IN_M) else tile_m
     pass_idx = (tile_m & (_PASSES - 1)) if cutlass.const_expr(_PASS_IN_M) else tile_l
     return row_tile, pass_idx
+
+
+@cute.jit
+def _item_tile(item_n, sub):
+    """LN ONCE (module docstring): the work item's sub-tile ``sub`` (0 .. _TPI - 1) -> ``(tile_n, pass)``: the item's N tiles are the low log2(_NTI)
+    bits of ``sub``, the pass the rest (both powers of two by the validator; ``_NTI = 1`` under "passes" -> ``tile_n = item_n``, ``pass = sub``)."""
+    tile_n = item_n * _NTI + (sub & (_NTI - 1))
+    pass_idx = sub >> _LOG2_NTI
+    return tile_n, pass_idx
+
+
+@cute.jit
+def _item_decode(m_idx, n_idx, gridx, gridy, swizzle_w):
+    """LN ONCE: a CLC response -> ``(row block, N-tile group)`` = the shipped per-tile decode (the cluster-rank shift, the L2 tile swizzle) without
+    the pass fold (the pass lives inside the item; the validator pins ``pass_order = "major"``)."""
+    raw_m = m_idx >> _preferred_cluster_m_shift
+    raw_n = n_idx >> _preferred_cluster_n_shift
+    nt_m = gridx >> _preferred_cluster_m_shift
+    nt_n = gridy >> _preferred_cluster_n_shift
+    tile_m, item_n = _l2_swizzle_tile(raw_m, raw_n, nt_m, nt_n, swizzle_w, identity=tile_swizzle_n == 1)
+    return tile_m, item_n
 
 
 @cute.jit
@@ -671,8 +753,8 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
 
     _smem_sys_reserved = cutlass.Array(cutlass.Int8, 1024, space=cutlass.AddressSpace.smem, alignment=1)
 
-    ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
-    ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
+    ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, _B_STAGES, space=cutlass.AddressSpace.smem)
+    ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, _B_STAGES, space=cutlass.AddressSpace.smem)
     acc_empty_mbar_ptr = cutlass.Array(cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem)
     acc_full_mbar_ptr = cutlass.Array(cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem)
     if cutlass.const_expr(cta_group == 2):
@@ -699,7 +781,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     smem_a_list = [
         cutlass.Array(
             ab_dtype,
-            sA_elems * ab_stages,
+            sA_elems * _A_REGION_STAGES,  # LN ONCE: the resident A region (_A_SLOTS x _NK stages); the shipped ring when off
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
@@ -708,7 +790,7 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
     smem_b_list = [
         cutlass.Array(
             ab_dtype,
-            sB_elems * ab_stages,
+            sB_elems * _B_STAGES,
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
@@ -726,12 +808,16 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         alignment=1024,
     )
     # ---- LN-PROLOGUE DUAL GEMM: the two new rings and the small parameter / vote buffers (SMEM table in the module docstring) ----
-    a_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
-    a_norm_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
+    a_full_mbar_ptr = cutlass.Array(cutlass.Int64, _A_REGION_STAGES, space=cutlass.AddressSpace.smem)
+    a_norm_full_mbar_ptr = cutlass.Array(cutlass.Int64, _A_REGION_STAGES, space=cutlass.AddressSpace.smem)
     smem_ln_params = cutlass.Array(cutlass.Float32, 2 * _K * num_a_operands, space=cutlass.AddressSpace.smem, alignment=16)  # per operand: gamma | beta, fp32
     smem_bias = cutlass.Array(cutlass.Float32, _PASSES * _BIAS_PER_PASS if HAS_BIAS else 4, space=cutlass.AddressSpace.smem, alignment=16)
-    smem_flags = cutlass.Array(cutlass.Int32, ab_stages, space=cutlass.AddressSpace.smem, alignment=16)
+    smem_flags = cutlass.Array(cutlass.Int32, _A_REGION_STAGES, space=cutlass.AddressSpace.smem, alignment=16)
     smem_vote = cutlass.Array(cutlass.Int32, 8, space=cutlass.AddressSpace.smem, alignment=16)
+    if cutlass.const_expr(_LN_ONCE):
+        # LN ONCE: the A region slots' release (the leader MMA warp's pair-multicast commit after the item's last tile; waited by each CTA's TMA
+        # warp before the refill) -- declared under the knob only, so the OFF arm's SMEM layout is byte-for-byte the shipped one
+        a_empty_mbar_ptr = cutlass.Array(cutlass.Int64, _A_SLOTS, space=cutlass.AddressSpace.smem)
     ln_norm_arrivers = num_ln_warps * cta_group  # 4 leader LN warps + 4 follower LN warps, one elected lane each
 
     acc_empty_count = num_epilogue_warps * cta_group
@@ -751,15 +837,31 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         if cutlass.const_expr(cta_group == 2):
             if elect_one:
                 nvvm.mbarrier_init(tmem_dealloc_mbar_ptr, 32)
-        for i in range(ab_stages):
-            if elect_one:
-                nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
-            if elect_one:
-                nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
-            if elect_one:
-                nvvm.mbarrier_init(a_full_mbar_ptr.subview(i), 1)
-            if elect_one:
-                nvvm.mbarrier_init(a_norm_full_mbar_ptr.subview(i), ln_norm_arrivers)
+        if cutlass.const_expr(_LN_ONCE):
+            # LN ONCE: the B ring's rows, then the A region's (a_full / a_norm_full per region stage), then the slots' release barrier
+            for i in range(_B_STAGES):
+                if elect_one:
+                    nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+                if elect_one:
+                    nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
+            for i in range(_A_REGION_STAGES):
+                if elect_one:
+                    nvvm.mbarrier_init(a_full_mbar_ptr.subview(i), 1)
+                if elect_one:
+                    nvvm.mbarrier_init(a_norm_full_mbar_ptr.subview(i), ln_norm_arrivers)
+            for i in range(_A_SLOTS):
+                if elect_one:
+                    nvvm.mbarrier_init(a_empty_mbar_ptr.subview(i), ab_empty_count)
+        else:
+            for i in range(ab_stages):
+                if elect_one:
+                    nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+                if elect_one:
+                    nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
+                if elect_one:
+                    nvvm.mbarrier_init(a_full_mbar_ptr.subview(i), 1)
+                if elect_one:
+                    nvvm.mbarrier_init(a_norm_full_mbar_ptr.subview(i), ln_norm_arrivers)
         for i in range(acc_stages):
             if elect_one:
                 nvvm.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
@@ -948,132 +1050,288 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
-        ab_empty_phase_bit = cutlass.Int32(1)
-        ab_iter = cutlass.Int32(0)
-        tile_m = init_tile_m
-        tile_n = init_tile_n
-        tile_l = init_tile_l
-        tile_iter = cutlass.Int32(0)
-        is_valid = cutlass.Int32(1)
-        clc_full_phase_tma = cutlass.Int32(0)
-        while is_valid != 0:
-            coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
-            # LN-PROLOGUE DUAL GEMM: this CTA's 128 rows of the pair tile as a (k, bi) box origin (module docstring, ROW-BLOCK TILING)
-            a_coord_k, a_coord_bi = _cta_box_origin(tile_m, n_kb, lkb, pair_member)
-            # K3 ARM: an MN-major operand lands as two 64-row boxes -- the (k, bi) of pair rows 128 pm + 0 and 128 pm + 64 (one bi each)
-            a_mn_k = []
-            a_mn_bi = []
-            for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
-                _mk, _mbi = _row_coords(tile_m, n_kb, lkb, pair_member * cta_tile_mnk[0] + _mg * _MN_GROUP)
-                a_mn_k.append(_mk)
-                a_mn_bi.append(_mbi)
-            if cutlass.const_expr(_PREFETCH_A_L2):
-                # the idle-TMA-warp L2 prefetch: every A box of this tile BEFORE the first ring-slot wait (the loads below then hit L2)
+        if cutlass.const_expr(_LN_ONCE):
+            # LN ONCE PER ROW BLOCK (module docstring): the work item is the row block [x the N-tile group].  At the item's first sub-tile the A
+            # operand(s) of all _NK k-stages are loaded ONCE into region slot r (after the slot's a_empty: the leader MMA warp's release of the item
+            # that used it -- pre-armed, so the first _A_SLOTS fills wait nothing); per TILE of the item the B ring streams one k-tile per k-step
+            # exactly as the shipped loop in the else arm; the CLC response is consumed once per ITEM.  The ONLY arrive site added to the barrier
+            # table is the a_empty commit (the MMA warp's); a_full / a_norm_full keep their producers and counts at the per-item cadence.
+            ab_empty_phase_bit = cutlass.Int32(1)
+            ab_iter = cutlass.Int32(0)
+            a_empty_phase_tma = cutlass.Int32(1)  # pre-armed (P5): parity 1 on a fresh barrier returns at once
+            a_item_iter_tma = cutlass.Int32(0)
+            a_slot_tma = cutlass.Int32(0)
+            tile_m = init_tile_m
+            item_n = init_tile_n
+            sub = cutlass.Int32(0)
+            item_iter = cutlass.Int32(0)
+            is_valid = cutlass.Int32(1)
+            clc_full_phase_tma = cutlass.Int32(0)
+            while is_valid != 0:
+                if sub == 0:
+                    a_slot_tma = a_item_iter_tma % _A_SLOTS
+                    if a_slot_tma == 0 and a_item_iter_tma != 0:
+                        a_empty_phase_tma = a_empty_phase_tma ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(a_empty_mbar_ptr.subview(a_slot_tma), a_empty_phase_tma, time_limit=10_000_000):
+                        pass
+                    # this CTA's 128 rows of the pair tile as a (k, bi) box origin (module docstring, ROW-BLOCK TILING); an MN-major operand lands as
+                    # two 64-row boxes -- the (k, bi) of pair rows 128 pm + 0 and 128 pm + 64 (one bi each)
+                    a_coord_k, a_coord_bi = _cta_box_origin(tile_m, n_kb, lkb, pair_member)
+                    a_mn_k = []
+                    a_mn_bi = []
+                    for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
+                        _mk, _mbi = _row_coords(tile_m, n_kb, lkb, pair_member * cta_tile_mnk[0] + _mg * _MN_GROUP)
+                        a_mn_k.append(_mk)
+                        a_mn_bi.append(_mbi)
+                    for _kt in cutlass.range_constexpr(_NK):
+                        a_reg = a_slot_tma * _NK + _kt
+                        if elect_one:
+                            nvvm.mbarrier_arrive_expect_tx(a_full_mbar_ptr.subview(a_reg), num_a_operands * sA_bytes)
+                        for _ai in cutlass.range_constexpr(num_a_operands):
+                            sA_stage = smem_a_list[_ai].subview(sA_elems * a_reg)
+                            if cutlass.const_expr(_A_LANDS_MN[_ai]):
+                                for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                            sA_stage.subview(_mg * _MN_GROUP * cta_tile_mnk[2]),
+                                            tma_a_descs[_ai].get_ptr(),
+                                            (a_mn_k[_mg], a_mn_bi[_mg], _kt * cta_tile_mnk[2]),
+                                            a_full_mbar_ptr.subview(a_reg),
+                                        )
+                            else:
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                        sA_stage,
+                                        tma_a_descs[_ai].get_ptr(),
+                                        (_kt * cta_tile_mnk[2], a_coord_k, a_coord_bi),
+                                        a_full_mbar_ptr.subview(a_reg),
+                                    )
+                    a_item_iter_tma += 1
+                tile_n, tile_l = _item_tile(item_n, sub)
+                coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
+                if cutlass.const_expr(matmul_b_batch == 1):
+                    tile_l_b = cutlass.Int32(0)
+                else:
+                    tile_l_b = tile_l
                 for _kt in cutlass.range_constexpr(_NK):
+                    stage = ab_iter % _B_STAGES
+                    if stage == 0 and ab_iter != 0:
+                        ab_empty_phase_bit = ab_empty_phase_bit ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(stage), ab_empty_phase_bit, time_limit=10_000_000):
+                        pass
+                    if is_pair_leader:
+                        if elect_one:
+                            nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
+                    for _bj in cutlass.range_constexpr(num_b_operands):
+                        if elect_one:
+                            nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                smem_b_list[_bj].subview(sB_elems * stage),
+                                tma_b_descs[_bj].get_ptr(),
+                                (_kt * cta_tile_mnk[2], coord_n_per_cta, tile_l_b),
+                                ab_full_mbar_ptr.subview(stage),
+                                [],
+                                multicast_mask=tma_mcast_mask_b,
+                                group=_CTA_GROUP,
+                            )
+                    ab_iter += 1
+                if sub == _TPI - 1:
+                    # the item's last sub-tile: the per-ITEM CLC consume (the shipped per-tile block, once per item)
+                    sub = cutlass.Int32(0)
+                    consumer_stage = item_iter % CLC_SCHED_STAGES
+                    if consumer_stage == 0 and item_iter != 0:
+                        clc_full_phase_tma = clc_full_phase_tma ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(clc_full_mbar_ptr.subview(consumer_stage), clc_full_phase_tma, time_limit=10_000_000):
+                        pass
+                    m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    is_valid = vld
+                    tile_m, item_n = _item_decode(m_idx, n_idx, gridx, gridy, swizzle_w)
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
+                    if elect_one:
+                        empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
+                        nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                    item_iter += 1
+                else:
+                    sub += 1
+            # P15 drains, both CTAs: the B ring's cross-CTA empty commits (the shipped tail), then the A region slots' (the a_empty commit is multicast
+            # to the pair; a slot never filled returns at once on its pre-armed parity)
+            tail_stage = ab_iter % _B_STAGES
+            tail_phase = ab_empty_phase_bit
+            if tail_stage == 0 and ab_iter != 0:
+                tail_phase = tail_phase ^ 1
+            for _ in range(_B_STAGES):
+                while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                    pass
+                tail_stage = tail_stage + 1
+                if tail_stage == _B_STAGES:
+                    tail_stage = cutlass.Int32(0)
+                    tail_phase = tail_phase ^ 1
+            a_tail_slot = a_item_iter_tma % _A_SLOTS
+            a_tail_phase = a_empty_phase_tma
+            if a_tail_slot == 0 and a_item_iter_tma != 0:
+                a_tail_phase = a_tail_phase ^ 1
+            for _ in range(_A_SLOTS):
+                while not nvvm.mbarrier_try_wait_parity(a_empty_mbar_ptr.subview(a_tail_slot), a_tail_phase, time_limit=10_000_000):
+                    pass
+                a_tail_slot = a_tail_slot + 1
+                if a_tail_slot == _A_SLOTS:
+                    a_tail_slot = cutlass.Int32(0)
+                    a_tail_phase = a_tail_phase ^ 1
+        else:
+            ab_empty_phase_bit = cutlass.Int32(1)
+            ab_iter = cutlass.Int32(0)
+            tile_m = init_tile_m
+            tile_n = init_tile_n
+            tile_l = init_tile_l
+            tile_iter = cutlass.Int32(0)
+            is_valid = cutlass.Int32(1)
+            clc_full_phase_tma = cutlass.Int32(0)
+            while is_valid != 0:
+                coord_m_per_cta = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+                # LN-PROLOGUE DUAL GEMM: this CTA's 128 rows of the pair tile as a (k, bi) box origin (module docstring, ROW-BLOCK TILING)
+                a_coord_k, a_coord_bi = _cta_box_origin(tile_m, n_kb, lkb, pair_member)
+                # K3 ARM: an MN-major operand lands as two 64-row boxes -- the (k, bi) of pair rows 128 pm + 0 and 128 pm + 64 (one bi each)
+                a_mn_k = []
+                a_mn_bi = []
+                for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
+                    _mk, _mbi = _row_coords(tile_m, n_kb, lkb, pair_member * cta_tile_mnk[0] + _mg * _MN_GROUP)
+                    a_mn_k.append(_mk)
+                    a_mn_bi.append(_mbi)
+                if cutlass.const_expr(_PREFETCH_A_L2):
+                    # the idle-TMA-warp L2 prefetch: every A box of this tile BEFORE the first ring-slot wait (the loads below then hit L2)
+                    for _kt in cutlass.range_constexpr(_NK):
+                        for _ai in cutlass.range_constexpr(num_a_operands):
+                            if cutlass.const_expr(_A_LANDS_MN[_ai]):
+                                for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_prefetch(tma_a_descs[_ai].get_ptr(), (a_mn_k[_mg], a_mn_bi[_mg], _kt * cta_tile_mnk[2]), [])
+                            else:
+                                if elect_one:
+                                    nvvm.cp_async_bulk_tensor_prefetch(tma_a_descs[_ai].get_ptr(), (_kt * cta_tile_mnk[2], a_coord_k, a_coord_bi), [])
+                if cutlass.const_expr(cta_group == 1):
+                    coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
+                else:
+                    coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
+                # Split-K: grid z carries batch*S
+                if cutlass.const_expr(split_k_slices > 1):
+                    batch_tile_l = tile_l // split_k_slices
+                    split_idx = cutlass.Int64(tile_l % split_k_slices)
+                    k_tiles_per_split = num_k_tiles // split_k_slices
+                    k_tiles_remainder = num_k_tiles % split_k_slices
+                    k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
+                    k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
+                else:
+                    batch_tile_l = tile_l
+                    k_begin = cutlass.Int64(0)
+                    k_end = num_k_tiles
+                if cutlass.const_expr(matmul_a_batch == 1):
+                    tile_l_a = cutlass.Int32(0)
+                else:
+                    tile_l_a = batch_tile_l
+                if cutlass.const_expr(matmul_b_batch == 1):
+                    tile_l_b = cutlass.Int32(0)
+                else:
+                    tile_l_b = batch_tile_l
+
+                for k_tile_idx in range(k_begin, k_end):
+                    stage = ab_iter % ab_stages
+                    if stage == 0 and ab_iter != 0:
+                        ab_empty_phase_bit = ab_empty_phase_bit ^ 1
+
+                    while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(stage), ab_empty_phase_bit, time_limit=10_000_000):
+                        pass
+
+                    coord_k = k_tile_idx * cta_tile_mnk[2]
+                    if is_pair_leader:
+                        if elect_one:
+                            nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
+                    # LN-PROLOGUE DUAL GEMM: the A stage is THIS CTA's 128 pair rows x 64 channels per operand, on the CTA-LOCAL a_full (no
+                    # .cta_group: complete_tx lands here, where the LN warps wait).  K-major: ONE 3-D box (channel, k, bi) at the tile's (k, bi)
+                    # origin; MN-major (K3 operand 0): TWO (64 j, 1 bi, 64 c) boxes, one per 64-row group, at SMEM offsets of 8 KiB.
+                    if elect_one:
+                        nvvm.mbarrier_arrive_expect_tx(a_full_mbar_ptr.subview(stage), num_a_operands * sA_bytes)
                     for _ai in cutlass.range_constexpr(num_a_operands):
+                        sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
                         if cutlass.const_expr(_A_LANDS_MN[_ai]):
                             for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
                                 if elect_one:
-                                    nvvm.cp_async_bulk_tensor_prefetch(tma_a_descs[_ai].get_ptr(), (a_mn_k[_mg], a_mn_bi[_mg], _kt * cta_tile_mnk[2]), [])
+                                    nvvm.cp_async_bulk_tensor_shared_cta_global(
+                                        sA_stage.subview(_mg * _MN_GROUP * cta_tile_mnk[2]),
+                                        tma_a_descs[_ai].get_ptr(),
+                                        (a_mn_k[_mg], a_mn_bi[_mg], coord_k),
+                                        a_full_mbar_ptr.subview(stage),
+                                    )
                         else:
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_prefetch(tma_a_descs[_ai].get_ptr(), (_kt * cta_tile_mnk[2], a_coord_k, a_coord_bi), [])
-            if cutlass.const_expr(cta_group == 1):
-                coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * cta_tile_mnk[1]
-            else:
-                coord_n_per_cta = tile_n * cgrp_tile_n_cur + n_rank * logical_cta_tile_n + pair_member * cta_tile_mnk[1]
-            # Split-K: grid z carries batch*S
-            if cutlass.const_expr(split_k_slices > 1):
-                batch_tile_l = tile_l // split_k_slices
-                split_idx = cutlass.Int64(tile_l % split_k_slices)
-                k_tiles_per_split = num_k_tiles // split_k_slices
-                k_tiles_remainder = num_k_tiles % split_k_slices
-                k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
-                k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
-            else:
-                batch_tile_l = tile_l
-                k_begin = cutlass.Int64(0)
-                k_end = num_k_tiles
-            if cutlass.const_expr(matmul_a_batch == 1):
-                tile_l_a = cutlass.Int32(0)
-            else:
-                tile_l_a = batch_tile_l
-            if cutlass.const_expr(matmul_b_batch == 1):
-                tile_l_b = cutlass.Int32(0)
-            else:
-                tile_l_b = batch_tile_l
-
-            for k_tile_idx in range(k_begin, k_end):
-                stage = ab_iter % ab_stages
-                if stage == 0 and ab_iter != 0:
-                    ab_empty_phase_bit = ab_empty_phase_bit ^ 1
-
-                while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(stage), ab_empty_phase_bit, time_limit=10_000_000):
-                    pass
-
-                coord_k = k_tile_idx * cta_tile_mnk[2]
-                if is_pair_leader:
-                    if elect_one:
-                        nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
-                # LN-PROLOGUE DUAL GEMM: the A stage is THIS CTA's 128 pair rows x 64 channels per operand, on the CTA-LOCAL a_full (no
-                # .cta_group: complete_tx lands here, where the LN warps wait).  K-major: ONE 3-D box (channel, k, bi) at the tile's (k, bi)
-                # origin; MN-major (K3 operand 0): TWO (64 j, 1 bi, 64 c) boxes, one per 64-row group, at SMEM offsets of 8 KiB.
-                if elect_one:
-                    nvvm.mbarrier_arrive_expect_tx(a_full_mbar_ptr.subview(stage), num_a_operands * sA_bytes)
-                for _ai in cutlass.range_constexpr(num_a_operands):
-                    sA_stage = smem_a_list[_ai].subview(sA_elems * stage)
-                    if cutlass.const_expr(_A_LANDS_MN[_ai]):
-                        for _mg in cutlass.range_constexpr(cta_tile_mnk[0] // _MN_GROUP):
                             if elect_one:
                                 nvvm.cp_async_bulk_tensor_shared_cta_global(
-                                    sA_stage.subview(_mg * _MN_GROUP * cta_tile_mnk[2]),
+                                    sA_stage,
                                     tma_a_descs[_ai].get_ptr(),
-                                    (a_mn_k[_mg], a_mn_bi[_mg], coord_k),
+                                    (coord_k, a_coord_k, a_coord_bi),
                                     a_full_mbar_ptr.subview(stage),
                                 )
-                    else:
-                        if elect_one:
-                            nvvm.cp_async_bulk_tensor_shared_cta_global(
-                                sA_stage,
-                                tma_a_descs[_ai].get_ptr(),
-                                (coord_k, a_coord_k, a_coord_bi),
-                                a_full_mbar_ptr.subview(stage),
-                            )
 
-                for _bj in cutlass.range_constexpr(num_b_operands):
-                    sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
-                    tma_b_desc = tma_b_descs[_bj]
-                    if cutlass.const_expr(b_mcast_slices > 1):
-                        _b_rows = cta_tile_mnk[1] // b_mcast_slices
-                        if cutlass.const_expr(fallback_cluster_shape_mnk is None):
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sB_stage.subview(pair_m_idx * _b_rows * cta_tile_mnk[2]),
-                                    tma_b_desc.get_ptr(),
-                                    (coord_k, coord_n_per_cta + pair_m_idx * _b_rows, tile_l_b),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_b,
-                                    group=_CTA_GROUP,
-                                )
-                        else:
-                            _b_per_cta = b_mcast_slices >> (_preferred_cluster_m_shift - _cta_group_shift)
-                            if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-                                _b_per_cta = b_mcast_slices >> (_fallback_cluster_m_shift - _cta_group_shift)
-                            for _bsl in cutlass.range(_b_per_cta):
-                                _b_idx = pair_m_idx * _b_per_cta + _bsl
+                    for _bj in cutlass.range_constexpr(num_b_operands):
+                        sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
+                        tma_b_desc = tma_b_descs[_bj]
+                        if cutlass.const_expr(b_mcast_slices > 1):
+                            _b_rows = cta_tile_mnk[1] // b_mcast_slices
+                            if cutlass.const_expr(fallback_cluster_shape_mnk is None):
                                 if elect_one:
                                     nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sB_stage.subview(_b_idx * _b_rows * cta_tile_mnk[2]),
+                                        sB_stage.subview(pair_m_idx * _b_rows * cta_tile_mnk[2]),
                                         tma_b_desc.get_ptr(),
-                                        (coord_k, coord_n_per_cta + _b_idx * _b_rows, tile_l_b),
+                                        (coord_k, coord_n_per_cta + pair_m_idx * _b_rows, tile_l_b),
                                         ab_full_mbar_ptr.subview(stage),
                                         [],
                                         multicast_mask=tma_mcast_mask_b,
                                         group=_CTA_GROUP,
                                     )
-                    elif cutlass.const_expr(multicast_b):
-                        if pair_m_idx == 0:
+                            else:
+                                _b_per_cta = b_mcast_slices >> (_preferred_cluster_m_shift - _cta_group_shift)
+                                if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                                    _b_per_cta = b_mcast_slices >> (_fallback_cluster_m_shift - _cta_group_shift)
+                                for _bsl in cutlass.range(_b_per_cta):
+                                    _b_idx = pair_m_idx * _b_per_cta + _bsl
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sB_stage.subview(_b_idx * _b_rows * cta_tile_mnk[2]),
+                                            tma_b_desc.get_ptr(),
+                                            (coord_k, coord_n_per_cta + _b_idx * _b_rows, tile_l_b),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_b,
+                                            group=_CTA_GROUP,
+                                        )
+                        elif cutlass.const_expr(multicast_b):
+                            if pair_m_idx == 0:
+                                if cutlass.const_expr(b_is_n_major):
+                                    for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
+                                        if elect_one:
+                                            nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                                sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
+                                                tma_b_desc.get_ptr(),
+                                                (
+                                                    coord_n_per_cta + n_group * b_tma_group_elems,
+                                                    coord_k,
+                                                    tile_l_b,
+                                                ),
+                                                ab_full_mbar_ptr.subview(stage),
+                                                [],
+                                                multicast_mask=tma_mcast_mask_b,
+                                                group=_CTA_GROUP,
+                                            )
+                                else:
+                                    if elect_one:
+                                        nvvm.cp_async_bulk_tensor_shared_cluster_global(
+                                            sB_stage,
+                                            tma_b_desc.get_ptr(),
+                                            (coord_k, coord_n_per_cta, tile_l_b),
+                                            ab_full_mbar_ptr.subview(stage),
+                                            [],
+                                            multicast_mask=tma_mcast_mask_b,
+                                            group=_CTA_GROUP,
+                                        )
+                        else:
                             if cutlass.const_expr(b_is_n_major):
                                 for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
                                     if elect_one:
@@ -1101,87 +1359,59 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                                         multicast_mask=tma_mcast_mask_b,
                                         group=_CTA_GROUP,
                                     )
-                    else:
-                        if cutlass.const_expr(b_is_n_major):
-                            for n_group in cutlass.range_constexpr(cta_tile_mnk[1] // b_tma_group_elems):
-                                if elect_one:
-                                    nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                        sB_stage.subview(n_group * b_tma_group_elems * cta_tile_mnk[2]),
-                                        tma_b_desc.get_ptr(),
-                                        (
-                                            coord_n_per_cta + n_group * b_tma_group_elems,
-                                            coord_k,
-                                            tile_l_b,
-                                        ),
-                                        ab_full_mbar_ptr.subview(stage),
-                                        [],
-                                        multicast_mask=tma_mcast_mask_b,
-                                        group=_CTA_GROUP,
-                                    )
-                        else:
-                            if elect_one:
-                                nvvm.cp_async_bulk_tensor_shared_cluster_global(
-                                    sB_stage,
-                                    tma_b_desc.get_ptr(),
-                                    (coord_k, coord_n_per_cta, tile_l_b),
-                                    ab_full_mbar_ptr.subview(stage),
-                                    [],
-                                    multicast_mask=tma_mcast_mask_b,
-                                    group=_CTA_GROUP,
-                                )
 
-                ab_iter += 1
+                    ab_iter += 1
 
-            consumer_stage = tile_iter % CLC_SCHED_STAGES
-            if consumer_stage == 0 and tile_iter != 0:
-                clc_full_phase_tma = clc_full_phase_tma ^ 1
-            while not nvvm.mbarrier_try_wait_parity(
-                clc_full_mbar_ptr.subview(consumer_stage),
-                clc_full_phase_tma,
-                time_limit=10_000_000,
-            ):
-                pass
-            m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
-            cute.arch.fence_proxy("async.shared", space="cta")
-            is_valid = vld
-            tma_raw_m = m_idx >> _preferred_cluster_m_shift
-            tma_raw_n = n_idx >> _preferred_cluster_n_shift
-            tma_nt_m = gridx >> _preferred_cluster_m_shift
-            tma_nt_n = gridy >> _preferred_cluster_n_shift
-            if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
-                if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-                    tma_raw_m = m_idx >> _fallback_cluster_m_shift
-                    tma_raw_n = n_idx >> _fallback_cluster_n_shift
-                    tma_nt_m = gridx >> _fallback_cluster_m_shift
-                    tma_nt_n = gridy >> _fallback_cluster_n_shift
-            tile_m, tile_n = _l2_swizzle_tile(
-                tma_raw_m,
-                tma_raw_n,
-                tma_nt_m,
-                tma_nt_n,
-                swizzle_w,
-                identity=tile_swizzle_n == 1,
-            )
-            tile_l = l_idx
-            tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
-            nvvm.bar_warp_sync(0xFFFFFFFF)
-            if elect_one:
-                empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
-                nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
-            tile_iter += 1
-
-        tail_stage = ab_iter % ab_stages
-        tail_phase = ab_empty_phase_bit
-        if tail_stage == 0 and ab_iter != 0:
-            tail_phase = tail_phase ^ 1
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
-            for _ in range(ab_stages):
-                while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                consumer_stage = tile_iter % CLC_SCHED_STAGES
+                if consumer_stage == 0 and tile_iter != 0:
+                    clc_full_phase_tma = clc_full_phase_tma ^ 1
+                while not nvvm.mbarrier_try_wait_parity(
+                    clc_full_mbar_ptr.subview(consumer_stage),
+                    clc_full_phase_tma,
+                    time_limit=10_000_000,
+                ):
                     pass
-                tail_stage = tail_stage + 1
-                if tail_stage == ab_stages:
-                    tail_stage = cutlass.Int32(0)
-                    tail_phase = tail_phase ^ 1
+                m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                cute.arch.fence_proxy("async.shared", space="cta")
+                is_valid = vld
+                tma_raw_m = m_idx >> _preferred_cluster_m_shift
+                tma_raw_n = n_idx >> _preferred_cluster_n_shift
+                tma_nt_m = gridx >> _preferred_cluster_m_shift
+                tma_nt_n = gridy >> _preferred_cluster_n_shift
+                if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+                    if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                        tma_raw_m = m_idx >> _fallback_cluster_m_shift
+                        tma_raw_n = n_idx >> _fallback_cluster_n_shift
+                        tma_nt_m = gridx >> _fallback_cluster_m_shift
+                        tma_nt_n = gridy >> _fallback_cluster_n_shift
+                tile_m, tile_n = _l2_swizzle_tile(
+                    tma_raw_m,
+                    tma_raw_n,
+                    tma_nt_m,
+                    tma_nt_n,
+                    swizzle_w,
+                    identity=tile_swizzle_n == 1,
+                )
+                tile_l = l_idx
+                tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
+                nvvm.bar_warp_sync(0xFFFFFFFF)
+                if elect_one:
+                    empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
+                    nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                tile_iter += 1
+
+            tail_stage = ab_iter % ab_stages
+            tail_phase = ab_empty_phase_bit
+            if tail_stage == 0 and ab_iter != 0:
+                tail_phase = tail_phase ^ 1
+            if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+                for _ in range(ab_stages):
+                    while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                        pass
+                    tail_stage = tail_stage + 1
+                    if tail_stage == ab_stages:
+                        tail_stage = cutlass.Int32(0)
+                        tail_phase = tail_phase ^ 1
 
     if cutlass.const_expr(fallback_cluster_shape_mnk is None):
         b_arrive_pattern = (1 << cluster_m) - 1
@@ -1216,160 +1446,297 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             peer_cta_rank = cta_rank_in_cluster ^ 1
 
         if is_pair_leader:
-            ab_full_phase_bit = cutlass.Int32(0)
-            ab_iter = cutlass.Int32(0)
-            acc_empty_phase_bit = cutlass.Int32(1)
-            tile_iter = cutlass.Int32(0)
-            is_valid = cutlass.Int32(1)
-            clc_full_phase_mma = cutlass.Int32(0)
-            acc_stage = cutlass.Int32(0)
-            if cutlass.const_expr(split_k_slices > 1):
-                tile_l = bidz  # this tile's z coord
-            # Descriptor metadata and the SMEM allocation base are invariant
-            # across persistent tiles.  Only the encoded start address advances.
-            # K3 ARM: per-operand descriptor constants (an MN-major operand: LBO 8192 / SBO 1024, the FROST GEMM compiler's values)
-            desc_a_roots = [
-                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                    start_address=smem_a_list[i],
-                    leading_byte_offset=_A_LBO[i],
-                    stride_byte_offset=_A_SBO[i],
-                    version=DESC_VERSION,
-                    layout=ab_smem_swizzle,
-                )
-                for i in range(num_a_operands)
-            ]
-            desc_b_roots = [
-                cutlass.experimental.primitives.Tcgen05SmemDesc.build(
-                    start_address=smem_b_list[j],
-                    leading_byte_offset=b_smem_desc_leading_byte_offset,
-                    stride_byte_offset=b_smem_desc_stride_byte_offset,
-                    version=DESC_VERSION,
-                    layout=ab_smem_swizzle,
-                )
-                for j in range(num_b_operands)
-            ]
-            while is_valid != 0:
-                acc_stage = tile_iter % acc_stages
-                if acc_stage == 0 and tile_iter != 0:
-                    acc_empty_phase_bit = acc_empty_phase_bit ^ 1
-
-                while not nvvm.mbarrier_try_wait_parity(
-                    acc_empty_mbar_ptr.subview(acc_stage),
-                    acc_empty_phase_bit,
-                    time_limit=10_000_000,
-                ):
-                    pass
-
-                acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                # One accumulator per (gemm, M block). Column arithmetic stays on
-                # the encoded (row << 16) | col integer.
-                tmem_addr_mmas = [
-                    [
-                        cutlass.inttoptr(
-                            (base_row_id << 16) | (acc_base_col + g * cols_per_acc_stage + mi * epi_cols_per_mma_m),
-                            6,
-                            cutlass.Int32,
-                        )
-                        for mi in range(mma_size_m)
-                    ]
-                    for g in range(num_gemms)
-                ]
-
-                if cutlass.const_expr(split_k_slices > 1):
-                    split_idx = cutlass.Int64(tile_l % split_k_slices)
-                    k_tiles_per_split = num_k_tiles // split_k_slices
-                    k_tiles_remainder = num_k_tiles % split_k_slices
-                    k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
-                    k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
-                else:
-                    k_begin = cutlass.Int64(0)
-                    k_end = num_k_tiles
-                scale_d = cutlass.Boolean(False)
+            if cutlass.const_expr(_LN_ONCE):
+                # LN ONCE PER ROW BLOCK (module docstring): per TILE the accumulator stage and the B ring exactly as the shipped loop in the else arm;
+                # the A operand(s) come from the item's resident region slot r -- waited (a_norm_full, the LN warps' 8 release arrives per region
+                # stage) on the item's FIRST sub-tile only, the vote flag read with it and kept for the item, and RELEASED to both TMA warps by ONE
+                # pair-multicast commit after the item's LAST sub-tile's MMAs (a_empty[r]: a commit fires after the MMAs drained, P13; on a fully
+                # masked item no MMA was issued and the empty commit completes at once, P5); the CLC response is consumed once per ITEM.
+                ab_full_phase_bit = cutlass.Int32(0)
+                ab_iter = cutlass.Int32(0)
+                acc_empty_phase_bit = cutlass.Int32(1)
+                acc_iter = cutlass.Int32(0)
+                a_item_iter_mma = cutlass.Int32(0)
+                a_slot_mma = cutlass.Int32(0)
+                a_norm_phase_mma = cutlass.Int32(0)
+                sub = cutlass.Int32(0)
                 tile_skip = cutlass.Int32(0)
-                for k_tile_idx in range(k_begin, k_end):
-                    stage = ab_iter % ab_stages
-                    if stage == 0 and ab_iter != 0:
-                        ab_full_phase_bit = ab_full_phase_bit ^ 1
+                item_iter = cutlass.Int32(0)
+                is_valid = cutlass.Int32(1)
+                clc_full_phase_mma = cutlass.Int32(0)
+                acc_stage = cutlass.Int32(0)
+                desc_a_roots = [
+                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                        start_address=smem_a_list[i],
+                        leading_byte_offset=_A_LBO[i],
+                        stride_byte_offset=_A_SBO[i],
+                        version=DESC_VERSION,
+                        layout=ab_smem_swizzle,
+                    )
+                    for i in range(num_a_operands)
+                ]
+                desc_b_roots = [
+                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                        start_address=smem_b_list[j],
+                        leading_byte_offset=b_smem_desc_leading_byte_offset,
+                        stride_byte_offset=b_smem_desc_stride_byte_offset,
+                        version=DESC_VERSION,
+                        layout=ab_smem_swizzle,
+                    )
+                    for j in range(num_b_operands)
+                ]
+                while is_valid != 0:
+                    acc_stage = acc_iter % acc_stages
+                    if acc_stage == 0 and acc_iter != 0:
+                        acc_empty_phase_bit = acc_empty_phase_bit ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(acc_empty_mbar_ptr.subview(acc_stage), acc_empty_phase_bit, time_limit=10_000_000):
+                        pass
+                    acc_base_col = base_col_id_root + acc_stage * acc_region_cols
+                    tmem_addr_mmas = [
+                        [
+                            cutlass.inttoptr(
+                                (base_row_id << 16) | (acc_base_col + g * cols_per_acc_stage + mi * epi_cols_per_mma_m),
+                                6,
+                                cutlass.Int32,
+                            )
+                            for mi in range(mma_size_m)
+                        ]
+                        for g in range(num_gemms)
+                    ]
+                    if sub == 0:
+                        a_slot_mma = a_item_iter_mma % _A_SLOTS
+                        if a_slot_mma == 0 and a_item_iter_mma != 0:
+                            a_norm_phase_mma = a_norm_phase_mma ^ 1
+                    scale_d = cutlass.Boolean(False)
+                    for _kt in cutlass.range_constexpr(_NK):
+                        stage = ab_iter % _B_STAGES
+                        if stage == 0 and ab_iter != 0:
+                            ab_full_phase_bit = ab_full_phase_bit ^ 1
+                        while not nvvm.mbarrier_try_wait_parity(ab_full_mbar_ptr.subview(stage), ab_full_phase_bit, time_limit=10_000_000):
+                            pass
+                        a_reg = a_slot_mma * _NK + _kt
+                        if sub == 0:
+                            # the item's first sub-tile: both CTAs' A rows of this k-stage normalised in place (8 release arrives on the region stage)
+                            while not nvvm.mbarrier_try_wait_parity(a_norm_full_mbar_ptr.subview(a_reg), a_norm_phase_mma, time_limit=10_000_000):
+                                pass
+                            if cutlass.const_expr(SKIP_MASKED_TILES and _kt == 0):
+                                # the item's pair-level vote (the leader LN warps wrote the first region stage's flag before their release arrive);
+                                # a fully masked item issues no MMA on any of its tiles -- every commit below still fires
+                                tile_skip = smem_flags.data_ptr(a_reg).load()
+                        issue_mma = elect_one & (tile_skip == 0)
+                        for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                            for g in cutlass.range_constexpr(num_gemms):
+                                desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * a_reg + _A_KSTEP[gemm_a_idx[g]] * k_block_idx)
+                                desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
+                                for mi in cutlass.range_constexpr(mma_size_m):
+                                    desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
+                                    if issue_mma:
+                                        _tcgen05_mma(
+                                            mma_kind,
+                                            _CTA_GROUP,
+                                            tmem_addr_mmas[g][mi],
+                                            desc_a,
+                                            desc_b,
+                                            idescs[g],
+                                            scale_d,
+                                            collector_op=_a_collector_op(g),
+                                            b_collector_op=_b_collector_op(mi),
+                                        )
+                            scale_d = cutlass.Boolean(True)
+                        if elect_one:
+                            nvvm.tcgen05_commit(
+                                ab_empty_mbar_ptr.subview(stage),
+                                multicast_mask=ab_empty_arrive_mask,
+                                group=_CTA_GROUP,
+                            )
+                        ab_iter += 1
+                    if elect_one:
+                        nvvm.tcgen05_commit(
+                            acc_full_mbar_ptr.subview(acc_stage),
+                            multicast_mask=acc_full_mcast,
+                            group=_CTA_GROUP,
+                        )
+                    acc_iter += 1
+                    if sub == _TPI - 1:
+                        # the item's last sub-tile: release the region slot to BOTH TMA warps (one pair-multicast commit = 1 arrive per CTA = a_empty's init)
+                        if elect_one:
+                            nvvm.tcgen05_commit(
+                                a_empty_mbar_ptr.subview(a_slot_mma),
+                                multicast_mask=ab_empty_arrive_mask,
+                                group=_CTA_GROUP,
+                            )
+                        a_item_iter_mma += 1
+                        sub = cutlass.Int32(0)
+                        consumer_stage = item_iter % CLC_SCHED_STAGES
+                        if consumer_stage == 0 and item_iter != 0:
+                            clc_full_phase_mma = clc_full_phase_mma ^ 1
+                        while not nvvm.mbarrier_try_wait_parity(clc_full_mbar_ptr.subview(consumer_stage), clc_full_phase_mma, time_limit=10_000_000):
+                            pass
+                        _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        is_valid = vld
+                        nvvm.bar_warp_sync(0xFFFFFFFF)
+                        if elect_one:
+                            empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
+                            nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                        item_iter += 1
+                    else:
+                        sub += 1
+            else:
+                ab_full_phase_bit = cutlass.Int32(0)
+                ab_iter = cutlass.Int32(0)
+                acc_empty_phase_bit = cutlass.Int32(1)
+                tile_iter = cutlass.Int32(0)
+                is_valid = cutlass.Int32(1)
+                clc_full_phase_mma = cutlass.Int32(0)
+                acc_stage = cutlass.Int32(0)
+                if cutlass.const_expr(split_k_slices > 1):
+                    tile_l = bidz  # this tile's z coord
+                # Descriptor metadata and the SMEM allocation base are invariant
+                # across persistent tiles.  Only the encoded start address advances.
+                # K3 ARM: per-operand descriptor constants (an MN-major operand: LBO 8192 / SBO 1024, the FROST GEMM compiler's values)
+                desc_a_roots = [
+                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                        start_address=smem_a_list[i],
+                        leading_byte_offset=_A_LBO[i],
+                        stride_byte_offset=_A_SBO[i],
+                        version=DESC_VERSION,
+                        layout=ab_smem_swizzle,
+                    )
+                    for i in range(num_a_operands)
+                ]
+                desc_b_roots = [
+                    cutlass.experimental.primitives.Tcgen05SmemDesc.build(
+                        start_address=smem_b_list[j],
+                        leading_byte_offset=b_smem_desc_leading_byte_offset,
+                        stride_byte_offset=b_smem_desc_stride_byte_offset,
+                        version=DESC_VERSION,
+                        layout=ab_smem_swizzle,
+                    )
+                    for j in range(num_b_operands)
+                ]
+                while is_valid != 0:
+                    acc_stage = tile_iter % acc_stages
+                    if acc_stage == 0 and tile_iter != 0:
+                        acc_empty_phase_bit = acc_empty_phase_bit ^ 1
 
                     while not nvvm.mbarrier_try_wait_parity(
-                        ab_full_mbar_ptr.subview(stage),
-                        ab_full_phase_bit,
+                        acc_empty_mbar_ptr.subview(acc_stage),
+                        acc_empty_phase_bit,
                         time_limit=10_000_000,
                     ):
                         pass
-                    # LN-PROLOGUE DUAL GEMM: both CTAs' A rows normalised in place (8 release arrives, same slot / phase as ab_full)
-                    while not nvvm.mbarrier_try_wait_parity(
-                        a_norm_full_mbar_ptr.subview(stage),
-                        ab_full_phase_bit,
-                        time_limit=10_000_000,
-                    ):
-                        pass
-                    if cutlass.const_expr(SKIP_MASKED_TILES):
-                        # The leader LN warps' pair-level vote for this tile sits in the FIRST stage's slot, written before their
-                        # release arrive.  A fully masked tile issues no MMA; its commits still fire (empty commits complete).
-                        if k_tile_idx == k_begin:
-                            tile_skip = smem_flags.data_ptr(stage).load()
-                    issue_mma = elect_one & (tile_skip == 0)
 
-                    for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
-                        for g in cutlass.range_constexpr(num_gemms):
-                            desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + _A_KSTEP[gemm_a_idx[g]] * k_block_idx)
-                            desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
-                            for mi in cutlass.range_constexpr(mma_size_m):
-                                # The M sub-block offset is a whole SMEM swizzle atom
-                                # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
-                                # swizzle phase is preserved. B is shared by every M block.
-                                desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
-                                if issue_mma:
-                                    _tcgen05_mma(
-                                        mma_kind,
-                                        _CTA_GROUP,
-                                        tmem_addr_mmas[g][mi],
-                                        desc_a,
-                                        desc_b,
-                                        idescs[g],
-                                        scale_d,
-                                        collector_op=_a_collector_op(g),
-                                        b_collector_op=_b_collector_op(mi),
-                                    )
-                        # Every accumulator sees scale_d=False on exactly the first
-                        # k_block of the tile, so the flip stays outside mi.
-                        scale_d = cutlass.Boolean(True)
+                    acc_base_col = base_col_id_root + acc_stage * acc_region_cols
+                    # One accumulator per (gemm, M block). Column arithmetic stays on
+                    # the encoded (row << 16) | col integer.
+                    tmem_addr_mmas = [
+                        [
+                            cutlass.inttoptr(
+                                (base_row_id << 16) | (acc_base_col + g * cols_per_acc_stage + mi * epi_cols_per_mma_m),
+                                6,
+                                cutlass.Int32,
+                            )
+                            for mi in range(mma_size_m)
+                        ]
+                        for g in range(num_gemms)
+                    ]
+
+                    if cutlass.const_expr(split_k_slices > 1):
+                        split_idx = cutlass.Int64(tile_l % split_k_slices)
+                        k_tiles_per_split = num_k_tiles // split_k_slices
+                        k_tiles_remainder = num_k_tiles % split_k_slices
+                        k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
+                        k_end = (split_idx + 1) * k_tiles_per_split + cutlass.min(split_idx + 1, k_tiles_remainder)
+                    else:
+                        k_begin = cutlass.Int64(0)
+                        k_end = num_k_tiles
+                    scale_d = cutlass.Boolean(False)
+                    tile_skip = cutlass.Int32(0)
+                    for k_tile_idx in range(k_begin, k_end):
+                        stage = ab_iter % ab_stages
+                        if stage == 0 and ab_iter != 0:
+                            ab_full_phase_bit = ab_full_phase_bit ^ 1
+
+                        while not nvvm.mbarrier_try_wait_parity(
+                            ab_full_mbar_ptr.subview(stage),
+                            ab_full_phase_bit,
+                            time_limit=10_000_000,
+                        ):
+                            pass
+                        # LN-PROLOGUE DUAL GEMM: both CTAs' A rows normalised in place (8 release arrives, same slot / phase as ab_full)
+                        while not nvvm.mbarrier_try_wait_parity(
+                            a_norm_full_mbar_ptr.subview(stage),
+                            ab_full_phase_bit,
+                            time_limit=10_000_000,
+                        ):
+                            pass
+                        if cutlass.const_expr(SKIP_MASKED_TILES):
+                            # The leader LN warps' pair-level vote for this tile sits in the FIRST stage's slot, written before their
+                            # release arrive.  A fully masked tile issues no MMA; its commits still fire (empty commits complete).
+                            if k_tile_idx == k_begin:
+                                tile_skip = smem_flags.data_ptr(stage).load()
+                        issue_mma = elect_one & (tile_skip == 0)
+
+                        for k_block_idx in cutlass.range(num_k_blocks, unroll_full=True):
+                            for g in cutlass.range_constexpr(num_gemms):
+                                desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + _A_KSTEP[gemm_a_idx[g]] * k_block_idx)
+                                desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
+                                for mi in cutlass.range_constexpr(mma_size_m):
+                                    # The M sub-block offset is a whole SMEM swizzle atom
+                                    # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
+                                    # swizzle phase is preserved. B is shared by every M block.
+                                    desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
+                                    if issue_mma:
+                                        _tcgen05_mma(
+                                            mma_kind,
+                                            _CTA_GROUP,
+                                            tmem_addr_mmas[g][mi],
+                                            desc_a,
+                                            desc_b,
+                                            idescs[g],
+                                            scale_d,
+                                            collector_op=_a_collector_op(g),
+                                            b_collector_op=_b_collector_op(mi),
+                                        )
+                            # Every accumulator sees scale_d=False on exactly the first
+                            # k_block of the tile, so the flip stays outside mi.
+                            scale_d = cutlass.Boolean(True)
+
+                        if elect_one:
+                            nvvm.tcgen05_commit(
+                                ab_empty_mbar_ptr.subview(stage),
+                                multicast_mask=ab_empty_arrive_mask,
+                                group=_CTA_GROUP,
+                            )
+                        ab_iter += 1
 
                     if elect_one:
                         nvvm.tcgen05_commit(
-                            ab_empty_mbar_ptr.subview(stage),
-                            multicast_mask=ab_empty_arrive_mask,
+                            acc_full_mbar_ptr.subview(acc_stage),
+                            multicast_mask=acc_full_mcast,
                             group=_CTA_GROUP,
                         )
-                    ab_iter += 1
 
-                if elect_one:
-                    nvvm.tcgen05_commit(
-                        acc_full_mbar_ptr.subview(acc_stage),
-                        multicast_mask=acc_full_mcast,
-                        group=_CTA_GROUP,
-                    )
-
-                consumer_stage = tile_iter % CLC_SCHED_STAGES
-                if consumer_stage == 0 and tile_iter != 0:
-                    clc_full_phase_mma = clc_full_phase_mma ^ 1
-                while not nvvm.mbarrier_try_wait_parity(
-                    clc_full_mbar_ptr.subview(consumer_stage),
-                    clc_full_phase_mma,
-                    time_limit=10_000_000,
-                ):
-                    pass
-                _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
-                cute.arch.fence_proxy("async.shared", space="cta")
-                is_valid = vld
-                if cutlass.const_expr(split_k_slices > 1):
-                    tile_l = _l_idx
-                nvvm.bar_warp_sync(0xFFFFFFFF)
-                if elect_one:
-                    empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
-                    nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
-                tile_iter += 1
+                    consumer_stage = tile_iter % CLC_SCHED_STAGES
+                    if consumer_stage == 0 and tile_iter != 0:
+                        clc_full_phase_mma = clc_full_phase_mma ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(
+                        clc_full_mbar_ptr.subview(consumer_stage),
+                        clc_full_phase_mma,
+                        time_limit=10_000_000,
+                    ):
+                        pass
+                    _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    is_valid = vld
+                    if cutlass.const_expr(split_k_slices > 1):
+                        tile_l = _l_idx
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
+                    if elect_one:
+                        empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
+                        nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                    tile_iter += 1
 
             # Dense only: an early-launched reducer would pile its many small CTAs
             # onto the few idle SMs, so split-K leaves the trigger to grid exit.
@@ -1458,6 +1825,12 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
         tile_l = init_tile_l
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
+        if cutlass.const_expr(_LN_ONCE):
+            # LN ONCE (module docstring): the item's N-tile group and sub-tile counter; the acc ring stays per tile (tile_iter), the CLC per item
+            item_n = init_tile_n
+            sub = cutlass.Int32(0)
+            item_iter = cutlass.Int32(0)
+            tile_n, tile_l = _item_tile(item_n, sub)
 
         # @@EPILOGUE_SETUP:BEGIN@@
         if cutlass.const_expr(epi_packed_lanes):
@@ -1624,44 +1997,67 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
                 nvvm.barrier_cta_sync(barrier_id=EPI_SYNC_BAR_ID, thread_count=num_epilogue_warps * 32)
             # ==== LN-PROLOGUE DUAL GEMM epilogue: END ====
             # @@EPILOGUE_DRAIN:END@@
-            consumer_stage = tile_iter % CLC_SCHED_STAGES
-            if consumer_stage == 0 and tile_iter != 0:
-                clc_full_phase_epi = clc_full_phase_epi ^ 1
-            while not nvvm.mbarrier_try_wait_parity(
-                clc_full_mbar_ptr.subview(consumer_stage),
-                clc_full_phase_epi,
-                time_limit=10_000_000,
-            ):
-                pass
-            m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
-            cute.arch.fence_proxy("async.shared", space="cta")
-            is_valid = vld
-            epi_raw_m = m_idx >> _preferred_cluster_m_shift
-            epi_raw_n = n_idx >> _preferred_cluster_n_shift
-            epi_nt_m = gridx >> _preferred_cluster_m_shift
-            epi_nt_n = gridy >> _preferred_cluster_n_shift
-            if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
-                if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
-                    epi_raw_m = m_idx >> _fallback_cluster_m_shift
-                    epi_raw_n = n_idx >> _fallback_cluster_n_shift
-                    epi_nt_m = gridx >> _fallback_cluster_m_shift
-                    epi_nt_n = gridy >> _fallback_cluster_n_shift
-            tile_m, tile_n = _l2_swizzle_tile(
-                epi_raw_m,
-                epi_raw_n,
-                epi_nt_m,
-                epi_nt_n,
-                swizzle_w,
-                identity=tile_swizzle_n == 1,
-            )
-            tile_l = l_idx
-            tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
-            nvvm.bar_warp_sync(0xFFFFFFFF)
-            if elect_one:
-                empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
-                nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+            if cutlass.const_expr(_LN_ONCE):
+                # LN ONCE: the next sub-tile of the item, or -- after its last -- the per-ITEM CLC consume (the shipped block in the else arm, once per item)
+                if sub == _TPI - 1:
+                    sub = cutlass.Int32(0)
+                    consumer_stage = item_iter % CLC_SCHED_STAGES
+                    if consumer_stage == 0 and item_iter != 0:
+                        clc_full_phase_epi = clc_full_phase_epi ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(clc_full_mbar_ptr.subview(consumer_stage), clc_full_phase_epi, time_limit=10_000_000):
+                        pass
+                    m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    is_valid = vld
+                    tile_m, item_n = _item_decode(m_idx, n_idx, gridx, gridy, swizzle_w)
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
+                    if elect_one:
+                        empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
+                        nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
+                    item_iter += 1
+                else:
+                    sub += 1
+                tile_n, tile_l = _item_tile(item_n, sub)
+                tile_iter += 1
+            else:
+                consumer_stage = tile_iter % CLC_SCHED_STAGES
+                if consumer_stage == 0 and tile_iter != 0:
+                    clc_full_phase_epi = clc_full_phase_epi ^ 1
+                while not nvvm.mbarrier_try_wait_parity(
+                    clc_full_mbar_ptr.subview(consumer_stage),
+                    clc_full_phase_epi,
+                    time_limit=10_000_000,
+                ):
+                    pass
+                m_idx, n_idx, l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
+                cute.arch.fence_proxy("async.shared", space="cta")
+                is_valid = vld
+                epi_raw_m = m_idx >> _preferred_cluster_m_shift
+                epi_raw_n = n_idx >> _preferred_cluster_n_shift
+                epi_nt_m = gridx >> _preferred_cluster_m_shift
+                epi_nt_n = gridy >> _preferred_cluster_n_shift
+                if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
+                    if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
+                        epi_raw_m = m_idx >> _fallback_cluster_m_shift
+                        epi_raw_n = n_idx >> _fallback_cluster_n_shift
+                        epi_nt_m = gridx >> _fallback_cluster_m_shift
+                        epi_nt_n = gridy >> _fallback_cluster_n_shift
+                tile_m, tile_n = _l2_swizzle_tile(
+                    epi_raw_m,
+                    epi_raw_n,
+                    epi_nt_m,
+                    epi_nt_n,
+                    swizzle_w,
+                    identity=tile_swizzle_n == 1,
+                )
+                tile_l = l_idx
+                tile_m, tile_l = _decode_pass(tile_m, tile_l)  # TILE ORDER (module docstring)
+                nvvm.bar_warp_sync(0xFFFFFFFF)
+                if elect_one:
+                    empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
+                    nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
 
-            tile_iter += 1
+                tile_iter += 1
 
         if warp_idx == 0:
             nvvm.cp_async_bulk_wait_group(0, read=True)
@@ -1713,13 +2109,24 @@ def frost_ln_dual_gemm_128x256x128_cluster2x1_2ctamma(
             # (1) the ring slots / phases of this tile's _NK stages (the TMA warp's stepping), then wait for all of them
             _sts = []
             _phs = []
-            for _j in cutlass.range_constexpr(_NK):
-                _st = ab_iter % ab_stages
-                if _st == 0 and ab_iter != 0:
+            if cutlass.const_expr(_LN_ONCE):
+                # LN ONCE (module docstring): the item's resident region slot and its phase -- one per slot, the slot's _NK stages are filled and
+                # released together; the item counter is tile_iter (one CLC consume per iteration = per item).  Everything below addresses the
+                # region stages through _sts exactly as it addressed the ring slots.
+                a_slot_ln = tile_iter % _A_SLOTS
+                if a_slot_ln == 0 and tile_iter != 0:
                     a_full_phase_ln = a_full_phase_ln ^ 1
-                _sts.append(_st)
-                _phs.append(a_full_phase_ln)
-                ab_iter += 1
+                for _j in cutlass.range_constexpr(_NK):
+                    _sts.append(a_slot_ln * _NK + _j)
+                    _phs.append(a_full_phase_ln)
+            else:
+                for _j in cutlass.range_constexpr(_NK):
+                    _st = ab_iter % ab_stages
+                    if _st == 0 and ab_iter != 0:
+                        a_full_phase_ln = a_full_phase_ln ^ 1
+                    _sts.append(_st)
+                    _phs.append(a_full_phase_ln)
+                    ab_iter += 1
             for _j in cutlass.range_constexpr(_NK):
                 while not nvvm.mbarrier_try_wait_parity(a_full_mbar_ptr.subview(_sts[_j]), _phs[_j], time_limit=10_000_000):
                     pass
@@ -2328,7 +2735,7 @@ def _host(
     batch = geom[3]  # passes
     # TILE ORDER (module docstring): "interleaved" folds the pass into the scheduler's M axis (passes tiles per row block, grid z = 1)
     m = (m_rows * _PASSES) if cutlass.const_expr(_PASS_IN_M) else m_rows
-    grid_z = 1 if cutlass.const_expr(_PASS_IN_M) else batch
+    grid_z = 1 if cutlass.const_expr(_PASS_IN_M or _LN_ONCE) else batch  # LN ONCE: the pass lives inside the work item
     n_res = cutlass.Int32(geom[4])
     bn = cutlass.Int32(geom[5])
     n_pad = cutlass.Int32(geom[6])
@@ -2422,6 +2829,8 @@ def _host(
     cgrp_tile_n = cgrp_tile_mnk[1]
     num_tile_m_host = (m + cgrp_tile_m - 1) // cgrp_tile_m
     num_tile_n_host = (n + cgrp_tile_n - 1) // cgrp_tile_n
+    if cutlass.const_expr(_LN_ONCE):
+        num_tile_n_host = num_tile_n_host // _NTI  # LN ONCE: one scheduler item per (row block, N-tile group)
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, grid_z)
