@@ -422,6 +422,25 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         )
 
     # -- compile ------------------------------------------------------------------------------------------------------------------
+    def _k3_ln_pass_form(self) -> str:
+        # the re-read LayerNorm forms re-read the MN-major operand in every pass, which the transpose prologue's K-major writes would overwrite
+        # (a typed decline of the substrate): under `transpose` the output stage keeps the register form and the knob's value serves the
+        # projection stage alone
+        return self.knobs.ln_pass_form if self.knobs.k3_prologue == "mn_major" else "registers"
+
+    def _register_split_hints(self) -> Tuple[int, int]:
+        """The `.minnctapersm` launch hint of (K1, K3): the caller's `min_blocks_per_mp` override for both stages, else the per-RENDERING rule with
+        each stage's own bias flag, LayerNorm form and (K1) tile order (`heuristics.register_split_hint`: whether a rendering spills at the flat
+        allocation is a property of the rendering, not of the geometry); the width is the heuristics' (`c`, = `c_z` on every served plan).  GPU-free
+        (pinned by the API tests)."""
+        hint = self.knobs.min_blocks_per_mp
+        if hint is not None:
+            return int(hint), int(hint)
+        return (
+            th.register_split_hint("k1", self.c, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math, self.knobs.k1_pass_order),
+            th.register_split_hint("k3", self.c, self.has_out_bias, self._k3_ln_pass_form(), self.knobs.epi_math),
+        )
+
     def compile(self) -> None:
         """Build the three plans: K1 (the columns arm of the substrate), K2 (the FROST GEMM engine's dense template for the per-N tile over the
         folded ``c * B`` batch), K3 (the accumulators arm).  Each is cached on its parameter set; a second instance of the same declaration
@@ -433,19 +452,8 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         # Compile and load on the PLAN's device: the declaration may name a device other than torch's current one (a multi-GPU host with
         # ``x`` on ``cuda:1``).  A compiled launchable is bound to the context it was loaded in, so K1 / K3 and K2 are cached per
         # (parameter set, device) -- :func:`_substrate_plan_on`, :func:`_compile_contraction`.
-        # the re-read LayerNorm forms re-read the MN-major operand in every pass, which the transpose prologue's K-major writes would overwrite
-        # (a typed decline of the substrate): under `transpose` the output stage keeps the register form and the knob's value serves the
-        # projection stage alone
-        k3_ln_pass_form = self.knobs.ln_pass_form if self.knobs.k3_prologue == "mn_major" else "registers"
-        # the `.minnctapersm` launch hint: the caller's override for both stages, else the per-RENDERING rule with each stage's own bias flag
-        # (heuristics.register_split_hint: the fact is a property of the rendering, not of the geometry)
-        hint = self.knobs.min_blocks_per_mp
-        k1_hint = (
-            hint
-            if hint is not None
-            else th.register_split_hint("k1", self.c_z, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math, self.knobs.k1_pass_order)
-        )
-        k3_hint = hint if hint is not None else th.register_split_hint("k3", self.c_z, self.has_out_bias, k3_ln_pass_form, self.knobs.epi_math)
+        k3_ln_pass_form = self._k3_ln_pass_form()
+        k1_hint, k3_hint = self._register_split_hints()
         with torch.cuda.device(self.device_index):
             self._plan_k1 = _substrate_plan_on(
                 k1.build_trimul_proj,

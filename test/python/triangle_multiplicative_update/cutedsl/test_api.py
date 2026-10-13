@@ -814,6 +814,25 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
         # a K1 row names its tile order (the interleaved renderings spill 4 / 13 under the hint where the major ones carry none); a K3 row has none
         assert (order in PASS_ORDERS) if stage == "k1" else (order is None), (stage, order)
         assert th.register_split_hint(stage, c, False, lnf, epm, order) == 1
+    # the measured rows (the A/B/A on the 212-SM Rubin perf-node class): the projection stage at c 128, bias off, pass-major tile order -- the
+    # register form (+1.5..+1.8 % on the call) and the rolled form (+1.1..+1.2 %); the interleaved rolled renderings (-0.1..-0.7 %) and the
+    # output stage at c 256 (its spill vanishes, its time does not move) are NOT rows
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major") == 1
+    assert th.register_split_hint("k1", 128, False, "smem_rolled", "packed", "major") == 1
+    assert th.register_split_hint("k1", 128, False, "smem_rolled", "packed", "interleaved") == 0
+    assert th.register_split_hint("k3", 256, False, "smem_rolled", "packed") == 0
+    assert th.register_split_hint("k1", 128, True, "registers", "packed", "major") == 0
+    # the API's wiring, GPU-free: a bare declaration hands the two stages the rule with THEIR bias flags (K1 its tile order), the knob overrides both
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=False)._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=1024), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=True)._register_split_hints() == (1, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=False)._register_split_hints() == (0, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256), "outgoing", c_hidden=128, has_in_bias=False)._register_split_hints() == (0, 0)  # interleaved K1
+    assert tapi.TriangleMultiplicativeUpdateFwd(
+        _desc(N=512, cz=256), "outgoing", c_hidden=256, has_in_bias=False, has_out_bias=False
+    )._register_split_hints() == (0, 0)
+    assert tapi.TriangleMultiplicativeUpdateFwd(
+        _desc(N=512, cz=256), "outgoing", c_hidden=256, knobs=tapi.TriMulKnobs(min_blocks_per_mp=1)
+    )._register_split_hints() == (1, 1)
     with pytest.raises(ValueError, match="stage"):
         th.register_split_hint("k2", 128, False, "smem_rolled", "packed")
     # the override reaches both stages' params; None hands each stage the rule with ITS bias flag

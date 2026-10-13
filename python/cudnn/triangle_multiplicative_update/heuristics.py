@@ -270,7 +270,13 @@ def default_k_block(n_res: int) -> int:
 # production rendering's cubin byte-identical to the one measured before the axis existed.
 # Keyed (stage, width, has_bias, ln_pass_form, epi_math, pass_order) -- the projection stage's tile ORDER is part of the rendering (the `interleaved` K1
 # renderings carry 4 STL / 13 LDL of role-prologue values UNDER the hint where the `major` ones carry none); the output stage has no order (None).
-_REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str]], int] = {}
+# MEASURED ROWS (the A/B/A of the rule as it lands, bias OFF only -- the bias-ON renderings are allocated their demand and never hinted):
+# the projection stage at c 128 with the pass-MAJOR tile order (the heuristics' pick from N = 512 and at 256 B 4): whole-call A/B/A on one exclusive GPU of the 212-SM Rubin perf-node class (lock 2376), in-process arm + control twins, 100-400 x 3 graph replay, two passes with the same sign -- the register form +1.6 / +1.5 / +1.7 / +1.8 % at 512:128:1 / 256:128:4 / 768:128:1 / 768:128:4 (its 1 / 1 STACK-8 spill gone; K1 itself +3.8 %), the rolled form +1.1..+1.2 % at 1024:128:1 / 512:128:4 / 1024:128:4 (REG 80 flat -> the 232 / 24 split, no spill either way; K1 +2.5 %);
+# NOT a row: the INTERLEAVED rolled projection renderings (N 256 B 1, 384) -0.1..-0.7 % (4 / 13 role-prologue spills under the hint), the output stage at c 256 bias off -0.1 / -0.1 / +0.0 % (its 5 / 7 epilogue spills vanish, the kernel time does not move: 298 vs 297 us -- the bias-off deficit against the bias-on body is elsewhere), every bias-ON rendering (never hinted; the identity controls +0.0 %).
+_REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str]], int] = {
+    ("k1", 128, False, "registers", "packed", "major"): 1,
+    ("k1", 128, False, "smem_rolled", "packed", "major"): 1,
+}
 
 
 def register_split_hint(stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str, pass_order: Optional[str] = None) -> int:

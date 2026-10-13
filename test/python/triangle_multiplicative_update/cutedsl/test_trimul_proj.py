@@ -374,9 +374,10 @@ from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
 arm, kk = params_kw["arm"], int(params_kw["k"])
 lnf, epm = params_kw.get("ln_pass_form", "registers"), params_kw.get("epi_math", "scalar")
 has_bias, hint = bool(params_kw.get("has_bias", True)), int(params_kw.get("min_blocks_per_mp", 0))
+order = params_kw.get("pass_order", "interleaved")  # the K1 tile order of the rendering (the heuristics ship "major" from N = 512 at c = 128)
 # the API's parameter sets (api.py compile(): biases on, the mask bound, no statistics, the heuristics' default knobs) at the pinned LN / epilogue forms
 if arm == "k1":
-    p = k1.proj_params(kk, kk, has_bias=has_bias, has_mask=True, want_stats=False, pass_order="interleaved", clc_stages=2, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
+    p = k1.proj_params(kk, kk, has_bias=has_bias, has_mask=True, want_stats=False, pass_order=order, clc_stages=2, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
 else:
     p = k3.tail_params(kk, kk, has_bias=has_bias, want_stats=False, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
 plan = ln_prologue.build_ln_dual_gemm(p)
@@ -394,30 +395,35 @@ print("EXPECT_K", kk)
 #     INTERLEAVED rolled renderings carry 4 STL / 13 LDL of role-prologue values under the hint (stored at kernel entry / at the INCREASE warps'
 #     entry, reloaded once per role prologue) -- the per-rendering sign the rule keys on the tile order for.
 _SASS_SPLIT_HINT_PINS = {
-    ("k3", 256, "smem_rolled", "packed", False, 0): dict(STL=5, LDL=7, USETMAXREG=0),
-    ("k3", 256, "smem_rolled", "packed", False, 1): dict(STL=0, LDL=0, USETMAXREG=6),
-    ("k3", 256, "smem_rolled", "packed", True, 1): dict(STL=0, LDL=0, USETMAXREG=6),
-    ("k1", 128, "smem_rolled", "packed", False, 0): dict(STL=1, LDL=1, USETMAXREG=0),
-    # the K1 K = 128 rolled bias-off rendering under the hint: the split honoured (USETMAXREG 6) but 4 / 13 spills at the 24-register producer
-    # roles (MEASURED on the branch's toolchain; the flat form's 1 / 1 at STACK 8 sat in a role that now holds 168) -- a per-rendering sign the
-    # A/B/A decides, which is why the hint is a rendering RULE (`heuristics.register_split_hint`) and not a library-wide default
-    ("k1", 128, "smem_rolled", "packed", False, 1): dict(STL=4, LDL=13, USETMAXREG=6),
+    ("k3", 256, "smem_rolled", "packed", False, 0, "interleaved"): dict(STL=5, LDL=7, USETMAXREG=0),
+    ("k3", 256, "smem_rolled", "packed", False, 1, "interleaved"): dict(STL=0, LDL=0, USETMAXREG=6),
+    ("k3", 256, "smem_rolled", "packed", True, 1, "interleaved"): dict(STL=0, LDL=0, USETMAXREG=6),
+    ("k1", 128, "smem_rolled", "packed", False, 0, "interleaved"): dict(STL=1, LDL=1, USETMAXREG=0),
+    # the K1 K = 128 INTERLEAVED rolled rendering under the hint: the split honoured (USETMAXREG 6) but 4 / 13 role-prologue spills (STACK 16; the
+    # interleaved pass decode + the scheduler's tile count stored at entry and reloaded once per role prologue) -- MEASURED on the branch's toolchain
+    ("k1", 128, "smem_rolled", "packed", False, 1, "interleaved"): dict(STL=4, LDL=13, USETMAXREG=6),
+    # the production renderings the rule hints (heuristics._REGISTER_SPLIT_HINTS; the `major` order the heuristics ship from N = 512 at c = 128):
+    # the register form's 1 / 1 at STACK 8 and the rolled form's flat REG 80 both go to 0 / 0 at the honoured split
+    ("k1", 128, "registers", "packed", False, 0, "major"): dict(STL=1, LDL=1, USETMAXREG=0),
+    ("k1", 128, "registers", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
+    ("k1", 128, "smem_rolled", "packed", False, 0, "major"): dict(STL=0, LDL=0, USETMAXREG=0),
+    ("k1", 128, "smem_rolled", "packed", False, 1, "major"): dict(STL=0, LDL=0, USETMAXREG=6),
 }
 
 
-@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint", sorted(_SASS_SPLIT_HINT_PINS))
-def test_sm107_register_split_hint_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint):
+@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,hint,order", sorted(_SASS_SPLIT_HINT_PINS))
+def test_sm107_register_split_hint_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, hint, order):
     """Trace-compile the bias-off renderings (and the bias-on identity twin) with and without the `.minnctapersm` hint for sm_107a (no GPU): the
     spill counts are bounds like the table above; USETMAXREG is EXACT -- 0 without the hint (the dropped split), 6 with it (the honoured split)."""
     probe = sass_utils.run_sass_probe(
         tmp_path,
         probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
         arch="sm_107a",
-        params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math=epi_math, has_bias=has_bias, min_blocks_per_mp=hint),
-        tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_{epi_math}_bias{int(has_bias)}_hint{hint}",
+        params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math=epi_math, has_bias=has_bias, min_blocks_per_mp=hint, pass_order=order),
+        tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_{epi_math}_bias{int(has_bias)}_hint{hint}_{order}",
     )
     st = probe.stats
-    pins = _SASS_SPLIT_HINT_PINS[(arm, k, ln_pass_form, epi_math, has_bias, hint)]
+    pins = _SASS_SPLIT_HINT_PINS[(arm, k, ln_pass_form, epi_math, has_bias, hint, order)]
     print(
         f"{arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} hint {hint}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} lines {st['LINES']} cubin {probe.cubin_md5}"
     )
