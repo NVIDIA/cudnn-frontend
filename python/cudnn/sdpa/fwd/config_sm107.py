@@ -448,12 +448,28 @@ SM107_NARROW_TILE_S_KV_MAX = 256
 # body; two chunks ahead is -1.0 % (64 words live across the wait).  Read by the kernel module at render time (one arithmetic, rule
 # 8b'); the domain {0, 1, 2} is the kernel's.
 SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N = {SM107_SMALL_TILE_N_DEFAULT: 0, SM107_SMALL_TILE_N_NARROW: 1}
+# The kernel's domain of the constant (``prefill_d128_f16_sm107`` raises outside it): 0 / 1 / 2 chunks ahead of the ``bmm1_done`` wait.
+BIAS_PRELOAD_CHUNKS_DOMAIN = frozenset({0, 1, 2})
+# PRIVATE, process-local sweep seam (the ``_N_CHUNK_OVERRIDE_FOR_SWEEPS`` rules: ``monkeypatch.setattr`` in a test or a sweep driver that
+# resets it to None; never a plan path, an import or a config): pins the constant every rendering of the process gets -- the per-FORM
+# A/B arm of the table above (0 / 1 / 2 against the width's value, same process, slots interleaved).  It moves a MODULE constant
+# without moving the TemplateParams record, so it is part of :func:`sweep_seam_state` (the template-module cache key + the
+# compiled-plan digest): two renderings that differ only by the pre-load never share a module or an artifact.
+_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
 
 def sm107_bias_preload_chunks(tile_n: int) -> int:
     """The kernel's ``BIAS_PRELOAD_CHUNKS`` for a rendering at KV tile width ``tile_n`` (:data:`SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N`);
     a width outside the small tiles' domain (the d128 / d192 / d256 / d512 renderings, which carry no bias arm) keeps the one-chunk
-    default so an unrelated rendering's instruction stream is unchanged."""
+    default so an unrelated rendering's instruction stream is unchanged.  The sweep seam ``_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS``
+    (validated to the kernel's domain) wins over the table."""
+    if _BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS is not None:
+        want = int(_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS)
+        if want not in BIAS_PRELOAD_CHUNKS_DOMAIN:
+            raise ValueError(
+                f"_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS={want}: the kernel's BIAS_PRELOAD_CHUNKS domain is {sorted(BIAS_PRELOAD_CHUNKS_DOMAIN)}"
+            )
+        return want
     return SM107_BIAS_PRELOAD_CHUNKS_BY_TILE_N.get(int(tile_n), 1)
 
 
@@ -699,17 +715,19 @@ SMALL_D_TILE_MS = frozenset({64, 128})
 def sweep_seam_state() -> Optional[tuple]:
     """The private sweep seams' values as ONE hashable, ``None`` when every seam is unset (every plan path).  ``api_dsl`` folds it into
     the template-module cache key and the source digest (``template_loader.load_template(extra_key=)``): the module cache keys on the
-    TemplateParams record, and a seam moves ``Cfg`` fields (the ring depth, the Q tile height) WITHOUT touching the record -- so two
-    renderings that differ only by a seam would otherwise share one module in a process (the second request silently running the
-    first rendering) and one compiled-plan artifact on disk.  ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` is NOT in the tuple on purpose: its
-    pick lands IN the record (``TemplateParams.s_slots``, ``sm107_s_slots_pick``), so the record alone already keys the two
-    renderings -- a seam belongs here only when it moves ``Cfg`` without moving the record."""
+    TemplateParams record, and a seam moves ``Cfg`` fields (the ring depth, the Q tile height) or a module constant (the bias pre-load
+    count) WITHOUT touching the record -- so two renderings that differ only by a seam would otherwise share one module in a process
+    (the second request silently running the first rendering) and one compiled-plan artifact on disk.  ``_S_SLOTS_OVERRIDE_FOR_SWEEPS``
+    is NOT in the tuple on purpose: its pick lands IN the record (``TemplateParams.s_slots``, ``sm107_s_slots_pick``), so the record
+    alone already keys the two renderings -- a seam belongs here only when it moves ``Cfg`` (or a module constant) without moving the
+    record."""
     state = (
         _N_CHUNK_OVERRIDE_FOR_SWEEPS,
         _BIAS_MODE_OVERRIDE_FOR_SWEEPS,
         _BIAS_STAGES_OVERRIDE_FOR_SWEEPS,
         _STAGES_KV_OVERRIDE_FOR_SWEEPS,
         _TILE_M_OVERRIDE_FOR_SWEEPS,
+        _BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS,
     )
     return None if all(v is None for v in state) else ("sm107_sweep_seams",) + tuple(None if v is None else int(v) for v in state)
 

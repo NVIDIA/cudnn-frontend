@@ -91,7 +91,7 @@ def test_the_seam_moves_the_height_the_slabs_the_block_rows_and_the_budgets_toge
     assert base.TILE_M == 128 and base.BIAS_BLOCK_ROWS == 128
     assert (c.sm107_bias_resident_s_kv_max(d, 1, pair=True), c.sm107_bias_resident_s_kv_max(d, 1, pair=False)) == ((768, 384) if d == 32 else (384, 128))
     _pins(tile_m=64)
-    assert c.sweep_seam_state() == ("sm107_sweep_seams", None, None, None, None, 64)
+    assert c.sweep_seam_state() == ("sm107_sweep_seams", None, None, None, None, 64, None), "the five Cfg seams, then the bias pre-load seam"
     cfg, _ = make(TemplateParams(cta_mma=1, dtype_qkv=2, d_flavor=d, bias_mode=1, n_chunk=4))
     assert cfg.TILE_M == 64 and cfg.BIAS_BLOCK_ROWS == 64 and cfg.TILE_K == cfg.TILE_O == d
     assert (
