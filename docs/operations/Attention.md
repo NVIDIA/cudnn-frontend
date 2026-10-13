@@ -1087,7 +1087,7 @@ Where:
 
 ##### Amax S
 
-`Amax_S` is the maximum of $S = \text{softmax}(P)$ over the whole tensor, before `scale_s`. Without dropout, every entry of $S$ is at most 1, so deriving `scale_s` from the E4M3 maximum and an amax of 1 (`448.f`) never saturates $S$, whatever the previous step's value was. With dropout probability $p$, the graph scales kept entries by $1/(1-p)$ before `scale_s`, so the same bound needs `scale_s` = $448(1-p)$. If, in addition, there is no `sink_token` and every row has at least one unmasked key, every row of $S$ sums to 1 and the value is at least $1/S_{kv}$; for example, row 0 of a top-left causal mask (one key) gives exactly 1.
+`Amax_S` is the maximum of $S = \text{softmax}(P)$ over the whole tensor, before `scale_s`. Without dropout, every entry of $S$ is at most 1, so deriving `scale_s` from the E4M3 maximum and an amax of 1 (`448.f`) never saturates $S$, whatever the previous step's value was. With dropout probability $p$, the graph scales kept entries by $1/(1-p)$ before `scale_s`, so `scale_s` = $448(1-p)$ is a conservative choice that keeps the same guarantee. If, in addition, there is no `sink_token` and every row has at least one unmasked key, every row of $S$ sums to 1 and the value is at least $1/S_{kv}$; for example, row 0 of a top-left causal mask (one key) gives exactly 1.
 
 - `Amax_S` is optional: leave the output virtual (do not call `set_output(True)` on it) if you do not consume it.
 - The FROST engines do not produce `Amax_S`. A graph that declares it as an output is declined by every FROST FP8 row, so it runs only if a cuDNN backend engine supports it; otherwise the graph has no supported plan (for example the FP8 decode cases in [#1415](https://github.com/NVIDIA/cudnn-frontend/issues/1415)).
