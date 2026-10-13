@@ -174,7 +174,9 @@ _LEGS = (
     (None, dict(), dict(cga=1), dict(cga=1), {8: 32, 24: 32, 32: 32, 48: 64, 64: 64, 128: 128}),
     ("THD", dict(thd=True, padded=True), None, dict(thd=True), {8: None, 24: None, 32: None, 48: None, 64: None, 128: 128}),
     ("THD", dict(has_paged_kv=True, padded=True, page_size=128, thd=True), None, None, {8: None, 24: None, 32: None, 48: None, 64: None, 128: 128}),
-    ("PackGQA", dict(h_kv=2), dict(pack_gqa=True), dict(h_kv=2, pack_gqa=True), {8: None, 24: None, 32: None, 48: None, 64: None, 128: None}),
+    # PackGQA walks past the small tiles onto the d128 flavor and is SERVED there since the dense d128 half row packs GQA on the
+    # shared SM100 prefill body compiled for cc 10.7 (issue #1472; a group that divides the 128-row tile)
+    ("PackGQA", dict(h_kv=2), dict(pack_gqa=True), dict(h_kv=2, pack_gqa=True), {8: 128, 24: 128, 32: 128, 48: 128, 64: 128, 128: 128}),
 )
 _DECLINE_WORDS = {"THD": "THD", "PackGQA": "PackGQA", None: "cga"}
 
@@ -182,8 +184,8 @@ _DECLINE_WORDS = {"THD": "THD", "PackGQA": "PackGQA", None: "cga"}
 def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     """The small tiles carry the dense leg ONLY (``Capabilities.dense_only_d_shapes``): split-KV and the score side outputs at
     D <= 64 select the d128 flavor (the pre-tile route, where ``split_d_shapes`` / ``score_stats_d_shapes`` name it) and are
-    SERVED, a cga2 request at D <= 32 selects the 64-wide tile, cga1 the small tile; THD / paged KV / PackGQA keep their pre-tile
-    typed declines.  The three pick implementations agree on every cell (rule 8b'): the row's walk (``_selected_d_shape`` with
+    SERVED, a cga2 request at D <= 32 selects the 64-wide tile, cga1 the small tile; THD / paged KV keep their pre-tile typed
+    declines and PackGQA rides the d128 flavor's shared body (issue #1472).  The three pick implementations agree on every cell (rule 8b'): the row's walk (``_selected_d_shape`` with
     the knobs), ``sm107_f16_tile_width(leg=, cga=)`` and the adapter's flavor; ``effective_cgas`` with the requested cga is the
     domain of the flavor the request lands on (the knob record `{TILE_CGA_M: 2}` at D <= 32 keeps working)."""
     from cudnn.sdpa.fwd import engines, heuristics
@@ -238,7 +240,8 @@ def test_row_routes_every_leg_beyond_dense_past_the_small_tiles():
     f24 = _facts(d_qk=24, d_v=24)
     assert engines.effective_cgas(caps, f24) == frozenset({1}), "the auto domain at D <= 32 is the 32-wide tile's"
     assert engines.effective_cgas(caps, f24, None, 2) == frozenset({1, 2}), "a cga2 request lands on the 64-wide tile"
-    assert engines.effective_cgas(caps, f24, 2) == frozenset({2}), "a split graph lands on the d128 flavor"
+    # a split graph lands on the d128 flavor, whose two tiles both split on cc 10.7 (the shared decode tile at cga1 too)
+    assert engines.effective_cgas(caps, f24, 2) == frozenset({1, 2}), "a split graph lands on the d128 flavor"
     assert heuristics._auto_sched_cga(spec, f24, split_kv=2, sched_policy=0) == (0, 2)
     assert heuristics._auto_sched_cga(spec, _facts(d_qk=24, d_v=24, has_score_max=True, has_score_sum_exp=True), split_kv=1, sched_policy=0) == (0, 2)
     # a cga nobody serves is still a typed decline naming the domain of the flavor it would land on

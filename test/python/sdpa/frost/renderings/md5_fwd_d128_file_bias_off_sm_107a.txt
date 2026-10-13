@@ -2,9 +2,9 @@
 # BEFORE the resident bias block landed (host trace-compile of the tree at 24f9c6e3; the probe body is test_sdpa_bias_sm107.py's).
 # Lines: dsl=<distribution> <version>; fwd_d128_file sm_107a <arm> rc=0 cubin_md5=<md5>.  A record stays valid for the DSL build it names.
 dsl=nvidia-cutlass-dsl 4.8.0
-fwd_d128_file sm_107a d32_dense_bf16 rc=0 cubin_md5=8a0f25bc6b03ca47160db0d01b76a7ba
-fwd_d128_file sm_107a d32_causal_f16 rc=0 cubin_md5=ee986a7bacc1605b7d61ba92b411cdd8
-fwd_d128_file sm_107a d32_padded_bf16 rc=0 cubin_md5=a7448161375883cdbe9377e35c8f8f31
-fwd_d128_file sm_107a d64_dense_bf16 rc=0 cubin_md5=f9fd71d9e635191850df09ba9a73360e
-fwd_d128_file sm_107a d64_causal_f16 rc=0 cubin_md5=57cae3aa3aa917f9d3882414a09dbc44
-fwd_d128_file sm_107a d64_padded_bf16_cga2 rc=0 cubin_md5=e2fa220e2738fd8ec7d769d37adb62f9
+fwd_d128_file sm_107a d32_dense_bf16 rc=0 cubin_md5=25212318e478e248659e1ae2898c58dd
+fwd_d128_file sm_107a d32_causal_f16 rc=0 cubin_md5=a155f641ad616c175ab8a9fe8962b709
+fwd_d128_file sm_107a d32_padded_bf16 rc=0 cubin_md5=41d71d4f9774985edafba20ace4f0a3a
+fwd_d128_file sm_107a d64_dense_bf16 rc=0 cubin_md5=ebe27d3d5451d639977c6598b3242585
+fwd_d128_file sm_107a d64_causal_f16 rc=0 cubin_md5=cf9b3861e440810f34fb9693200b333f
+fwd_d128_file sm_107a d64_padded_bf16_cga2 rc=0 cubin_md5=da4bed8d84047f7a5253869e67e66c86
