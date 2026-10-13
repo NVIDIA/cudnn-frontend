@@ -33,7 +33,7 @@ def grouped_gemm_swiglu(
     6-D SF buffers. ``discrete_col_sfd=True`` packs column scales by expert.
     Rows at or past padded_offsets[-1] are unspecified, as in the torch path.
     Only FP8 A/B and FP8 D are supported. No automatic differentiation rule;
-    use cudnn.jax.grouped_gemm_dswiglu for the fused backward operation.
+    use cudnn.grouped_gemm_dglu_jax_sm100 for the fused backward operation.
     Alias of grouped_gemm_glu_jax_sm100's MXFP8 mode with act_func="swiglu"
     and generate_c=True.
     """

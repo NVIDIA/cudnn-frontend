@@ -36,8 +36,6 @@ __all__ = [
     "sf_atom_spec",
     "zeros_init",
     "neg_inf_init",
-    "grouped_gemm_swiglu",
-    "grouped_gemm_dswiglu",
     "kimi_delta_attention",
     "kimi_delta_attention_fwd",
     "kimi_delta_attention_bwd",
@@ -47,17 +45,6 @@ __all__ = [
 def __getattr__(name):
     if name in _BSA_EXPORTS:
         value = getattr(import_module("cudnn.block_sparse_attention.jax_api"), name)
-        globals()[name] = value
-        return value
-    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
-        from cudnn.frost.buffers import cutedsl_requirement_error
-
-        requirement = cutedsl_requirement_error(name)
-        if requirement:
-            raise ImportError(requirement)
-        operation = name.removeprefix("grouped_gemm_")
-        module = import_module(f"cudnn.gemm.cutedsl.grouped.{operation}.jax_api")
-        value = getattr(module, name)
         globals()[name] = value
         return value
     if name in ("kimi_delta_attention", "kimi_delta_attention_fwd", "kimi_delta_attention_bwd"):

@@ -540,9 +540,11 @@ def test_bsa_attention_forward_sm90_blk64_large_logits_max_rises(dtype, q_value,
 @pytest.mark.L0
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @torch_fork_set_rng(seed=5)
-def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype):
+def test_bsa_attention_forward_sm90_blk64_large_logits_mixed_warp(dtype, monkeypatch):
     """Even query rows see equal ~1e10 logits on every key (O = mean V); odd rows are ordinary attention. Every warp
     holds both kinds, so centering the large rows must leave the ordinary rows as accurate as before."""
+    # A TF32 reference is off by ~7e4 on the even-row LSE (~5.7e8), past the 1e3 bound; the kernel is within ~10.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     if not torch.cuda.is_available():
         pytest.skip("block sparse attention tests require CUDA")
     major, _ = torch.cuda.get_device_capability()
