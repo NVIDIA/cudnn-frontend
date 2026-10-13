@@ -160,6 +160,9 @@ def _run(splits, B, H, KH, SQ, SKV, dtype, causal, cta_mma=2, pack_gqa=False, si
         0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(splits, o_p),
         stream=stream,
+        # The compiled callable's generic signature hides the pointer arguments from launch_f16's
+        # inspection on the released DSL (4.7.x); the host entry carries the real one.
+        host=mod._host,
     )
     if splits == 1:
         torch.cuda.synchronize()
@@ -889,6 +892,9 @@ def test_combine_lse_matches_reference(splits, stats_log2):
         0,  # seq_q_lens_addr: no per-batch Q lengths
         **_partial_kwargs(splits, o_p),
         stream=stream,
+        # The compiled callable's generic signature hides the pointer arguments from launch_f16's
+        # inspection on the released DSL (4.7.x); the host entry carries the real one.
+        host=mod._host,
     )
 
     # Reference LSE = logsumexp of the scaled scores, in natural log.
