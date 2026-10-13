@@ -614,7 +614,7 @@ treatment at the caller boundary.**
 ```
 python/cudnn/<operation>/            # or sdpa/<direction>/, gemm/cutedsl/<layout>/<fusion>/
 ├── __init__.py                      # exports the public functions via __all__
-├── api.py                           # <op>_<direction>() / <op>_jax_<direction>() functions
+├── api.py                           # <op>_<direction>() / <op>_<direction>_jax() functions
 └── <kernel_module>.py               # CuTeDSL kernel implementation(s); some families use csrc/ per-arch trees
 ```
 
@@ -701,7 +701,7 @@ not by itself justify another compile-cache specialization.
 
 ## The public function contract
 
-Public functions (`<op>_<direction>(...)` / `<op>_jax_<direction>(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
+Public functions (`<op>_<direction>(...)` / `<op>_<direction>_jax(...)`, see `docs/fe-oss-apis/api_conventions.md`) allocate outputs and return them in a stable, documented order. PyTorch functions return a **`TupleDict`** (dict that also unpacks as a tuple). JAX functions return a plain tuple or dict: `jax.jit` rejects `TupleDict`, which is not a registered pytree.
 
 ## Adding a new frontend-only API — required checklist
 
