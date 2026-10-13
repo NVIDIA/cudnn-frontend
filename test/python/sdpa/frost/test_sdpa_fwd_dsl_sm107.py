@@ -111,9 +111,10 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         with open(f, encoding="utf-8") as fh:
             code = _code_lines(fh.read())
         name = os.path.basename(f)
-        if "row_max_for_exp2(" in code:
-            assert "running_max_step_finite_sentinel" not in code, f"{name}: both running-max forms in one body"
-            continue
+        if "row_max_for_exp2(" in code and "running_max_step_finite_sentinel(" not in code:
+            continue  # the -inf-masked twin alone (the 2x2 bodies)
+        # sm107/prefill_d128_f16.py carries BOTH forms: its plain softmax body takes the finite-sentinel helper while its
+        # bias / kv_mask body masks with a true -inf (row_max_for_exp2's family) -- checked below as a shared-helper file.
         calls = shared_call.findall(code)
         assert (
             calls
@@ -127,7 +128,7 @@ def test_sm107_every_prefill_kernel_takes_a_guarded_running_max_step():
         seen_shared += 1
     assert (
         seen_shared == 12
-    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8) take the helper; saw {seen_shared}"
+    ), f"the twelve finite-sentinel prefill bodies (d128 / d192x128 / d256 / d512 x f16 / fp8 / mxfp8; the sm107 d128 f16 file counts through its plain body) take the helper; saw {seen_shared}"
 
 
 @pytest.mark.parametrize("kind,load_kw", _DTYPE_FAMILIES, ids=[k for k, _ in _DTYPE_FAMILIES])

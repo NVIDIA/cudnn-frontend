@@ -81,6 +81,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
 # descriptor window -- see make_cfg_d256_decode at the end of this module.
 from cudnn.sdpa.fwd.config_sm100 import CfgD256Decode, make_cfg_d256_decode as _make_cfg_d256_decode_record
 from cudnn.sdpa.fwd.config_sm100 import D256_DECODE_MAX_Q_ROWS, decode_d256_q_tile as _decode_d256_q_tile_rule
+
 # The per-CTA register POOL a `setmaxnreg` split redistributes (the launch's entry count x the warps, NOT the 2048-register file): the
 # backward config's helper, the ONE arithmetic behind the d128-file predicate `SUM(role regs x warps) <= pool` (frost-kernels.md s2: a
 # split over the pool parks the last INCREASE warp forever -- a hang at 100 % SM utilization at every shape, no fault).

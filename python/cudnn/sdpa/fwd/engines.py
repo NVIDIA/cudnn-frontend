@@ -681,18 +681,22 @@ def _thd_decode_leg_divisors(facts: "ga.SdpaGraphFacts") -> tuple:
     )
 
 
-def rubin_dense_d128_shared_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
+def rubin_dense_d128_shared_leg(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Optional[SdpaFwdKnobs] = None) -> bool:
     """cc 10.7 half, DENSE (not THD, not paged) graph on the (128, 128) flavor (the d64 envelope included) without the
     pre-folded scale: the legs that lower onto the shared SM100 d128 bodies compiled for cc 10.7
     (api_dsl._load_sm100_kernel_module -- the decode tile at TILE_CGA_M=1, the prefill body under PackGQA at cga2;
     issue #1472).  The Rubin sibling carries no PACK_GQA arm and is the only d128 body with the pre-folded-scale arm, so
-    pre-folded graphs stay on it.  Twin of SdpaFwdDslSm100._rubin_shared_dense_leg; keep in lockstep."""
+    pre-folded graphs stay on it.  Twin of SdpaFwdDslSm100._rubin_shared_dense_leg; keep in lockstep.
+
+    ``knobs``: the request being validated, when there is one -- on the d64 envelope the flavor depends on it (the row's
+    native 64-wide tile carries the dense leg only, so a PackGQA or split request walks past it onto (128, 128) and the
+    shared bodies; a knob-less d64 graph selects the native tile and is not a shared leg)."""
     return (
         capabilities.sm_lo == 107
         and not (facts.is_fp8 or facts.is_mxfp8)
         and not facts.thd
         and not facts.has_paged_kv
-        and _selected_d_shape(capabilities, facts) == (128, 128)
+        and _selected_d_shape(capabilities, facts, knobs) == (128, 128)
         and not facts.attn_scale_prefolded
     )
 
@@ -896,7 +900,8 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
     cga1-only 32-wide one), so the domain returned is that flavor's.  Without
     it (the heuristics' auto pick) the domain is the dense selection's."""
 
-    selected = _selected_d_shape(capabilities, facts, SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None)
+    _knobs = SdpaFwdKnobs(split_kv=split_kv, cga=cga) if (split_kv is not None or cga is not None) else None
+    selected = _selected_d_shape(capabilities, facts, _knobs)
     if capabilities.sm_lo == 107 and supports_paged_prefill_cga1(
         (facts.d_qk, facts.d_v),
         device_cc=facts.device_cc,
@@ -915,7 +920,7 @@ def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split
         capabilities.sm_lo == 107
         and selected == (128, 128)
         and not (capabilities.is_fp8 or capabilities.is_mxfp8)
-        and not rubin_dense_d128_shared_leg(capabilities, facts)
+        and not rubin_dense_d128_shared_leg(capabilities, facts, _knobs)
     ):
         # cc 10.7 half row: the (128, 128) cga1 entry of cgas_by_d_shape names the shared SM100 DECODE tile compiled for
         # cc 10.7 (issue #1472), a DENSE half leg (rubin_dense_d128_shared_leg): a ragged graph outside the single-CTA
@@ -1184,7 +1189,7 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
             and not facts.has_paged_kv
             and not packed_split
             and not decode_tile
-            and not rubin_dense_d128_shared_leg(capabilities, facts)
+            and not rubin_dense_d128_shared_leg(capabilities, facts, knobs)
         ):
             return "Rubin half PackGQA requires paged KV, the D128 packed split, a dense D128 GQA graph without the pre-folded scale (the shared SM100 body), or the d256 decode tile (a decode-shaped graph: S_q x G packed rows within its routed envelope)"
         if (
