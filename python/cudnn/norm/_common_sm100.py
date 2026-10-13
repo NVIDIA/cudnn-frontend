@@ -116,6 +116,33 @@ def block_reduce_sum2(v1, v2, tid, red, block_threads: cutlass.Constexpr):
     return s1, s2
 
 
+@cute.jit
+def shifted_stats(s1, s2, kshift, Nf, eps, centered: cutlass.Constexpr):
+    """Mean and rstd from *shifted* partials ``s1 = sum(x-K)``, ``s2 = sum((x-K)^2)``.
+
+    The textbook one-pass form ``var = E[x^2] - E[x]^2`` is catastrophically
+    unstable: both terms scale as ``|x|^2`` while their difference is the
+    variance, so for data with a large common offset the subtraction cancels
+    every significant bit. fp32 LayerNorm over values alternating 8191/8193 --
+    an ordinary, finite, supported input -- returned +/-316 instead of +/-1.
+
+    Subtracting a sample ``K`` drawn from the reduction *before* squaring fixes
+    this at the cost of one broadcast load and one subtract per element: the
+    residuals ``x-K`` are O(spread), so the cancellation here is proportional
+    to the spread rather than to the magnitude, and
+    ``mean = K + s1/N``, ``var = s2/N - (s1/N)^2`` are both accurate.
+    ``K`` cancels algebraically, so any K is unbiased; a value from the data
+    keeps the residuals small, which is the whole point.
+
+    ``centered=False`` is the RMSNorm route, which reduces ``E[x^2]`` directly
+    and has no cancellation to protect against; callers pass ``kshift=0`` there.
+    """
+    if cutlass.const_expr(centered):
+        m = s1 / Nf
+        return kshift + m, cute.math.rsqrt(s2 / Nf - m * m + eps)
+    return cutlass.Float32(0.0), cute.math.rsqrt(s2 / Nf + eps)
+
+
 def red_scratch_len(block_threads: int) -> int:
     """Length of the fp32 reduction scratch for :func:`block_reduce_sum2`."""
     return 2 * (block_threads // 32)

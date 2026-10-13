@@ -133,7 +133,8 @@ def _bn_flat(
     warp = tid // 32
 
     smem = SmemAllocator()
-    stat = smem.allocate_tensor(cutlass.Float32, cute.make_layout(2 * CPB), byte_alignment=16)
+    # [0,CPB) mean | [CPB,2CPB) rstd | [2CPB,3CPB) per-channel variance shift
+    stat = smem.allocate_tensor(cutlass.Float32, cute.make_layout(3 * CPB), byte_alignment=16)
     slc = smem.allocate_tensor(cutlass.Int32, cute.make_layout(BT * VPT), byte_alignment=16)
     sv = smem.allocate_tensor(cutlass.Float32, cute.make_layout(4 * BT * VPT), byte_alignment=16)
     sc = smem.allocate_tensor(it_ty, cute.make_layout(BT * VPT * KSR * VS), byte_alignment=16) if cutlass.const_expr(KSR > 0) else None
@@ -169,6 +170,29 @@ def _bn_flat(
         ksp.append(((ev // S) + 1) * S - ev)  # elements of this vector in channel c0
         okq.append(ok)
 
+    # Per-channel shift x[0, c, 0] for the variance reduction. Keyed on the
+    # GLOBAL channel, so partials from CTAs with different ``cwbase`` stay
+    # combinable. See shifted_stats() in _common_sm100.
+    if tid < CPB:
+        cc_ = cwbase + tid
+        if cc_ > (C - 1):
+            cc_ = C - 1
+        stat[2 * CPB + tid] = mX[cutlass.Int64(cc_) * S].to(cutlass.Float32)
+    nvvm.barrier_cta_sync_aligned(0)
+    klo = []
+    khi = []
+    for q in cutlass.range_constexpr(VPT):
+        l_ = lc0[q]
+        if l_ < 0:
+            l_ = 0
+        if l_ > (CPB - 1):
+            l_ = CPB - 1
+        klo.append(stat[2 * CPB + l_])
+        h_ = l_ + 1
+        if h_ > (CPB - 1):
+            h_ = CPB - 1
+        khi.append(stat[2 * CPB + h_])
+
     acc = [cutlass.Float32(0.0)] * (2 * VPT)  # [lo, hi] per q
     asq = [cutlass.Float32(0.0)] * (2 * VPT)
 
@@ -186,14 +210,17 @@ def _bn_flat(
                     x = raws[i][e].to(cutlass.Float32)
                     if cutlass.const_expr(STRADDLE):
                         if e < ksp[q]:
-                            acc[2 * q] = acc[2 * q] + x
-                            asq[2 * q] = asq[2 * q] + x * x
+                            dl = x - klo[q]
+                            acc[2 * q] = acc[2 * q] + dl
+                            asq[2 * q] = asq[2 * q] + dl * dl
                         else:
-                            acc[2 * q + 1] = acc[2 * q + 1] + x
-                            asq[2 * q + 1] = asq[2 * q + 1] + x * x
+                            dh = x - khi[q]
+                            acc[2 * q + 1] = acc[2 * q + 1] + dh
+                            asq[2 * q + 1] = asq[2 * q + 1] + dh * dh
                     else:
-                        acc[2 * q] = acc[2 * q] + x
-                        asq[2 * q] = asq[2 * q] + x * x
+                        dl = x - klo[q]
+                        acc[2 * q] = acc[2 * q] + dl
+                        asq[2 * q] = asq[2 * q] + dl * dl
                 i = i + 1
         nb = nb + UN
     while nb < n1:
@@ -203,14 +230,17 @@ def _bn_flat(
                 x = xv[e].to(cutlass.Float32)
                 if cutlass.const_expr(STRADDLE):
                     if e < ksp[q]:
-                        acc[2 * q] = acc[2 * q] + x
-                        asq[2 * q] = asq[2 * q] + x * x
+                        dl = x - klo[q]
+                        acc[2 * q] = acc[2 * q] + dl
+                        asq[2 * q] = asq[2 * q] + dl * dl
                     else:
-                        acc[2 * q + 1] = acc[2 * q + 1] + x
-                        asq[2 * q + 1] = asq[2 * q + 1] + x * x
+                        dh = x - khi[q]
+                        acc[2 * q + 1] = acc[2 * q + 1] + dh
+                        asq[2 * q + 1] = asq[2 * q + 1] + dh * dh
                 else:
-                    acc[2 * q] = acc[2 * q] + x
-                    asq[2 * q] = asq[2 * q] + x * x
+                    dl = x - klo[q]
+                    acc[2 * q] = acc[2 * q] + dl
+                    asq[2 * q] = asq[2 * q] + dl * dl
         nb = nb + 1
 
     # ---- CTA reduce by channel. Threads publish (channel, sums); CPB threads scan.
@@ -277,8 +307,9 @@ def _bn_flat(
                             gq = gq + mP[b2 + CPB + j2]
                             m = m + 1
                 pxx = pxx + 1
-            mn = gs / Mf
-            var = gq / Mf - mn * mn
+            m_ = gs / Mf
+            mn = stat[2 * CPB + tid] + m_
+            var = gq / Mf - m_ * m_
             rs = cute.math.rsqrt(var + eps)
             stat[tid] = mn
             stat[CPB + tid] = rs
@@ -294,8 +325,11 @@ def _bn_flat(
 
     # ---- pass2: affine is fixed per thread (one per channel it straddles) ----
     NHc: cutlass.Constexpr = 2 if STRADDLE else 1
+    # Centered affine, NOT the fused ``x*sl + sh``: the fused form recreates the
+    # cancellation the shifted reduction removes -- see batchnorm_nchw_sm100.
     sl = [cutlass.Float32(0.0)] * (VPT * NHc)
     sh = [cutlass.Float32(0.0)] * (VPT * NHc)
+    sm = [cutlass.Float32(0.0)] * (VPT * NHc)
     for q in cutlass.range_constexpr(VPT):
         for h in cutlass.range_constexpr(NHc):
             li = lc0[q] + h
@@ -305,11 +339,12 @@ def _bn_flat(
             if cc > (C - 1):
                 cc = C - 1
             f = stat[CPB + li] * mG[cc].to(cutlass.Float32)
-            b_ = -stat[li] * f
+            b_ = cutlass.Float32(0.0)
             if cutlass.const_expr(has_beta):
-                b_ = b_ + mB[cc].to(cutlass.Float32)
+                b_ = mB[cc].to(cutlass.Float32)
             sl[q * NHc + h] = f
             sh[q * NHc + h] = b_
+            sm[q * NHc + h] = stat[li]
 
     NH: cutlass.Constexpr = 2 if STRADDLE else 1
     nb = n0
@@ -325,11 +360,11 @@ def _bn_flat(
                 for e in cutlass.range_constexpr(VS):
                     x = raws[i][e].to(cutlass.Float32)
                     if cutlass.const_expr(STRADDLE):
-                        y = x * sl[q * NH] + sh[q * NH]
+                        y = (x - sm[q * NH]) * sl[q * NH] + sh[q * NH]
                         if e >= ksp[q]:
-                            y = x * sl[q * NH + 1] + sh[q * NH + 1]
+                            y = (x - sm[q * NH + 1]) * sl[q * NH + 1] + sh[q * NH + 1]
                     else:
-                        y = x * sl[q * NH] + sh[q * NH]
+                        y = (x - sm[q * NH]) * sl[q * NH] + sh[q * NH]
                     ys.append(y.to(et))
                 if okq[q]:
                     nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (cutlass.Int64(nb + u) * P + e0[q]))
@@ -342,11 +377,11 @@ def _bn_flat(
             for e in cutlass.range_constexpr(VS):
                 x = xv[e].to(cutlass.Float32)
                 if cutlass.const_expr(STRADDLE):
-                    y = x * sl[q * NH] + sh[q * NH]
+                    y = (x - sm[q * NH]) * sl[q * NH] + sh[q * NH]
                     if e >= ksp[q]:
-                        y = x * sl[q * NH + 1] + sh[q * NH + 1]
+                        y = (x - sm[q * NH + 1]) * sl[q * NH + 1] + sh[q * NH + 1]
                 else:
-                    y = x * sl[q * NH] + sh[q * NH]
+                    y = (x - sm[q * NH]) * sl[q * NH] + sh[q * NH]
                 ys.append(y.to(et))
             if okq[q]:
                 nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (cutlass.Int64(nb) * P + e0[q]))
@@ -470,7 +505,7 @@ def forward(spec, x3d, gamma, beta, *, eps, momentum, training, running_mean, ru
     VS, VPT, BT, CPB = g["VS"], g["VPT"], g["BT"], g["CPB"]
     pparts, mparts, CHUNK = g["pparts"], g["mparts"], g["chunk"]
     KSR = KTR = 0
-    smem_bytes = 2 * CPB * 4 + BT * VPT * 4 + 4 * BT * VPT * 4 + 256
+    smem_bytes = 3 * CPB * 4 + BT * VPT * 4 + 4 * BT * VPT * 4 + 256
     ce = (
         C,
         S,

@@ -88,6 +88,11 @@ def _in_fwd_nhwc_kernel(
     tp = tid // TPP
     c0 = cx * (TPP * V) + lane * V
     img = cutlass.Int64(nz) * HW
+    # Per-(image, channel) shift for the variance reduction: x[nz, 0, c]. Shared
+    # by every CTA that reduces this instance, so the partials stay combinable.
+    # See shifted_stats() in _common_sm100 -- E[x^2]-E[x]^2 is not usable.
+    _k0 = nvvm.load_ext(mXi.iterator + (img * C + c0), dtype=it_ty, count=V).bitcast(et)
+    ks = [_k0[e].to(cutlass.Float32) for e in range(V)]
     per = (HW + mparts - 1) // mparts
     r0 = my * per
     r1 = r0 + per
@@ -104,16 +109,18 @@ def _in_fwd_nhwc_kernel(
             xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                s[e] = s[e] + x
-                sq[e] = sq[e] + x * x
+                dz = x - ks[e]
+                s[e] = s[e] + dz
+                sq[e] = sq[e] + dz * dz
                 xc[kk * V + e] = x
     p = r0 + tp + KC * PPL
     while p < r1:
         xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
         for e in cutlass.range_constexpr(V):
             x = xv[e].to(cutlass.Float32)
-            s[e] = s[e] + x
-            sq[e] = sq[e] + x * x
+            dz = x - ks[e]
+            s[e] = s[e] + dz
+            sq[e] = sq[e] + dz * dz
         p = p + PPL
 
     def _reduce2(va, vb):
@@ -173,8 +180,9 @@ def _in_fwd_nhwc_kernel(
 
     if tp == 0:
         for e in cutlass.range_constexpr(V):
-            mnv = s[e] / Mf
-            rsv = cute.math.rsqrt(sq[e] / Mf - mnv * mnv + eps)
+            mz = s[e] / Mf
+            mnv = ks[e] + mz
+            rsv = cute.math.rsqrt(sq[e] / Mf - mz * mz + eps)
             stat[lane * V + e] = mnv
             stat[CPC + lane * V + e] = rsv
             if my == 0:
@@ -182,14 +190,21 @@ def _in_fwd_nhwc_kernel(
                 mRstd[cutlass.Int32(nz) * C + c0 + e] = rsv
     nvvm.barrier_cta_sync_aligned(0)
 
+    # Centered affine, NOT the fused ``x*scale + shift``. The fused form
+    # recreates the cancellation the shifted reduction just removed: for
+    # offset data x*scale and shift are both O(|x|*rstd) and their sum is
+    # O(1), so the result loses ulp(|x|*rstd). ``x - mean`` is exact here
+    # (Sterbenz), which keeps the output accurate to one rounding.
     sc = []
     sh = []
+    ctr = []
     for e in cutlass.range_constexpr(V):
         f = stat[CPC + lane * V + e] * mG[c0 + e].to(cutlass.Float32)
         sc.append(f)
-        o = -stat[lane * V + e] * f
+        ctr.append(stat[lane * V + e])
+        o = cutlass.Float32(0.0)
         if cutlass.const_expr(has_beta):
-            o = o + mB[c0 + e].to(cutlass.Float32)
+            o = mB[c0 + e].to(cutlass.Float32)
         sh.append(o)
 
     for kk in cutlass.range_constexpr(KC):
@@ -197,14 +212,14 @@ def _in_fwd_nhwc_kernel(
         if p < r1:
             ys = []
             for e in cutlass.range_constexpr(V):
-                ys.append((xc[kk * V + e] * sc[e] + sh[e]).to(et))
+                ys.append(((xc[kk * V + e] - ctr[e]) * sc[e] + sh[e]).to(et))
             nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + ((img + p) * C + c0))
     p = r0 + tp + KC * PPL
     while p < r1:
         xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
         ys = []
         for e in cutlass.range_constexpr(V):
-            ys.append((xv[e].to(cutlass.Float32) * sc[e] + sh[e]).to(et))
+            ys.append(((xv[e].to(cutlass.Float32) - ctr[e]) * sc[e] + sh[e]).to(et))
         nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + ((img + p) * C + c0))
         p = p + PPL
 

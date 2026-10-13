@@ -38,6 +38,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
+from cudnn.norm._common_sm100 import shifted_stats
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.utils import dyn, sm_count
 
@@ -156,22 +157,31 @@ def _gn_fwd_cga_kernel(
     s2 = cutlass.Float32(0.0)
     xc = [cutlass.Float32(0.0)] * (KC * V)
 
+    # Common shift for every CTA reducing this row -- its first element. The
+    # cluster partials cancel exactly as a single CTA's would without it; see
+    # shifted_stats() in _common_sm100. xc keeps the RAW x because pass 2
+    # re-loads the tail from global and must see a true mean.
+    kshift = cutlass.Float32(0.0)
+    if cutlass.const_expr(has_mean):
+        kshift = nvvm.load_ext(mXi.iterator + rbase, dtype=it_ty, count=V).bitcast(et)[0].to(cutlass.Float32)
+
     for k in cutlass.range_constexpr(KC):
         iv = v0 + tid + k * BT
         if iv < v1:
             xv = nvvm.load_ext(mXi.iterator + (rbase + iv * V), dtype=it_ty, count=V).bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                s1 = s1 + x
-                s2 = s2 + x * x
+                d = x - kshift
+                s1 = s1 + d
+                s2 = s2 + d * d
                 xc[k * V + e] = x
     iv = v0 + tid + KC * BT
     while iv < v1:
         xv = nvvm.load_ext(mXi.iterator + (rbase + iv * V), dtype=it_ty, count=V).bitcast(et)
         for e in cutlass.range_constexpr(V):
-            x = xv[e].to(cutlass.Float32)
-            s1 = s1 + x
-            s2 = s2 + x * x
+            d = xv[e].to(cutlass.Float32) - kshift
+            s1 = s1 + d
+            s2 = s2 + d * d
         iv = iv + BT
 
     s1, s2 = _block_sum2(s1, s2, tid, red, BT)
@@ -192,12 +202,7 @@ def _gn_fwd_cga_kernel(
     nvvm.barrier_cluster_arrive_aligned()
     nvvm.barrier_cluster_wait_aligned()
 
-    if cutlass.const_expr(has_mean):
-        mean = t1 / Mf
-        rstd = cute.math.rsqrt(t2 / Mf - mean * mean + eps)
-    else:
-        mean = cutlass.Float32(0.0)
-        rstd = cute.math.rsqrt(t2 / Mf + eps)
+    mean, rstd = shifted_stats(t1, t2, kshift, Mf, eps, has_mean)
     if rank == 0 and tid == 0:
         if cutlass.const_expr(has_mean):
             mMean[row] = mean

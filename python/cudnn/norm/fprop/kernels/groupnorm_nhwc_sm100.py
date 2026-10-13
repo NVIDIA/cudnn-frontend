@@ -146,22 +146,40 @@ def _gn_fwd_nhwc_kernel(
     a2 = [cutlass.Float32(0.0)] * GPL
     xc = [cutlass.Float32(0.0)] * (KC * V)
 
+    # Per-(image, group) shift for the variance reduction: the first channel of
+    # the group at pixel 0, i.e. global channel ``(gx*GPT + gb + sub) * CPG``.
+    # Every lane and every CTA reducing that group lands on the same value, so
+    # the partials stay combinable; see shifted_stats() in _common_sm100 for why
+    # E[x^2]-E[x]^2 cannot be used. _geom guarantees either V | CPG or CPG | V:
+    #  * GPL > 1  (CPG | V): the group starts inside this lane's own V-vector,
+    #    at element ``sub * CPG``.
+    #  * GPL == 1 (V | CPG): LPG lanes share the group, and its first channel is
+    #    V-aligned, so every one of them can load it directly.
+    if cutlass.const_expr(GPL > 1):
+        _k0 = nvvm.load_ext(mXi.iterator + (img * C + c0), dtype=it_ty, count=V).bitcast(et)
+        ks = [_k0[sub * CPG].to(cutlass.Float32) for sub in range(GPL)]
+    else:
+        _gs = cutlass.Int64(gx * GPT + gb) * CPG
+        ks = [nvvm.load_ext(mXi.iterator + (img * C + _gs), dtype=it_ty, count=V).bitcast(et)[0].to(cutlass.Float32)]
+
     for kk in cutlass.range_constexpr(KC):
         p = p0 + tp + kk * PPL
         if p < p1:
             xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                a1[e // CPG] = a1[e // CPG] + x
-                a2[e // CPG] = a2[e // CPG] + x * x
+                dz = x - ks[e // CPG]
+                a1[e // CPG] = a1[e // CPG] + dz
+                a2[e // CPG] = a2[e // CPG] + dz * dz
                 xc[kk * V + e] = x
     p = p0 + tp + KC * PPL
     while p < p1:
         xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
         for e in cutlass.range_constexpr(V):
             x = xv[e].to(cutlass.Float32)
-            a1[e // CPG] = a1[e // CPG] + x
-            a2[e // CPG] = a2[e // CPG] + x * x
+            dz = x - ks[e // CPG]
+            a1[e // CPG] = a1[e // CPG] + dz
+            a2[e // CPG] = a2[e // CPG] + dz * dz
         p = p + PPL
 
     for sub in cutlass.range_constexpr(GPL):
@@ -213,21 +231,28 @@ def _gn_fwd_nhwc_kernel(
     rs = []
     for sub in cutlass.range_constexpr(GPL):
         m_ = seg[(gb + sub) * SEGLEN] / Mf
-        mn.append(m_)
+        mn.append(ks[sub] + m_)
         rs.append(cute.math.rsqrt(seg[NS + (gb + sub) * SEGLEN] / Mf - m_ * m_ + eps))
     if pos == 0 and my == 0:
         for sub in cutlass.range_constexpr(GPL):
             mMean[cutlass.Int32(nz) * G + gx * GPT + gb + sub] = mn[sub]
             mRstd[cutlass.Int32(nz) * G + gx * GPT + gb + sub] = rs[sub]
 
+        # Centered affine, NOT the fused ``x*scale + shift``. The fused form
+        # recreates the cancellation the shifted reduction just removed: for
+        # offset data x*scale and shift are both O(|x|*rstd) and their sum is
+        # O(1), so the result loses ulp(|x|*rstd). ``x - mean`` is exact here
+        # (Sterbenz), which keeps the output accurate to one rounding.
     sc = []
     sh = []
+    ctr = []
     for e in cutlass.range_constexpr(V):
         f = rs[e // CPG] * mG[c0 + e].to(cutlass.Float32)
         sc.append(f)
-        o = -mn[e // CPG] * f
+        ctr.append(mn[e // CPG])
+        o = cutlass.Float32(0.0)
         if cutlass.const_expr(has_beta):
-            o = o + mB[c0 + e].to(cutlass.Float32)
+            o = mB[c0 + e].to(cutlass.Float32)
         sh.append(o)
 
     for kk in cutlass.range_constexpr(KC):
@@ -235,14 +260,14 @@ def _gn_fwd_nhwc_kernel(
         if p < p1:
             ys = []
             for e in cutlass.range_constexpr(V):
-                ys.append((xc[kk * V + e] * sc[e] + sh[e]).to(et))
+                ys.append(((xc[kk * V + e] - ctr[e]) * sc[e] + sh[e]).to(et))
             nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + ((img + p) * C + c0))
     p = p0 + tp + KC * PPL
     while p < p1:
         xv = nvvm.load_ext(mXi.iterator + ((img + p) * C + c0), dtype=it_ty, count=V).bitcast(et)
         ys = []
         for e in cutlass.range_constexpr(V):
-            ys.append((xv[e].to(cutlass.Float32) * sc[e] + sh[e]).to(et))
+            ys.append(((xv[e].to(cutlass.Float32) - ctr[e]) * sc[e] + sh[e]).to(et))
         nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + ((img + p) * C + c0))
         p = p + PPL
 

@@ -191,6 +191,11 @@ def _bn_nchw_kernel(
         nvvm.barrier_cta_sync_aligned(0)
 
     c0 = cx * CT
+    # Per-channel shift for the variance reduction: x[0, c, 0]. Every CTA that
+    # contributes a partial for channel c must subtract the SAME value, and this
+    # one is reachable by all of them with a single broadcast scalar load. See
+    # shifted_stats() in _common_sm100 for why E[x^2]-E[x]^2 is not usable.
+    ks = [mX[cutlass.Int64(c0 + cw * WPB + w) * S].to(cutlass.Float32) for cw in range(CPW)]
     per = (N + mparts - 1) // mparts
     n0 = my * per
     n1 = n0 + per
@@ -231,8 +236,9 @@ def _bn_nchw_kernel(
                         fs = [tin[e].to(cutlass.Float32) for e in range(VS)]
                     if kv < NV:
                         for e in cutlass.range_constexpr(VS):
-                            acc[cw] = acc[cw] + fs[e]
-                            accsq[cw] = accsq[cw] + fs[e] * fs[e]
+                            dz = fs[e] - ks[cw]
+                            acc[cw] = acc[cw] + dz
+                            accsq[cw] = accsq[cw] + dz * dz
                     col = wcol + (((r * CPW + cw) * LPT) + j) * VS
                     tpj = nvvm.make_tmem_ptr_from_warp_row_col(tptr[0], warpg % 4, col, cutlass.Float32)
                     nvvm.tcgen05_st(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tpj, cutlass.Vector.from_elements(tuple(fs), cutlass.Float32))
@@ -268,15 +274,17 @@ def _bn_nchw_kernel(
                         if cutlass.const_expr(VS == 1):
                             sc[cbs[cw] + o] = raws[i]
                             x = raws[i].to(cutlass.Float32)
-                            acc[cw] = acc[cw] + x
-                            accsq[cw] = accsq[cw] + x * x
+                            dz = x - ks[cw]
+                            acc[cw] = acc[cw] + dz
+                            accsq[cw] = accsq[cw] + dz * dz
                         else:
                             nvvm.store_ext(raws[i], sc.iterator + (cbs[cw] + o * VS), shared_space=_CTA_SS)
                             xv = raws[i].bitcast(et)
                             for e in cutlass.range_constexpr(VS):
                                 x = xv[e].to(cutlass.Float32)
-                                acc[cw] = acc[cw] + x
-                                accsq[cw] = accsq[cw] + x * x
+                                dz = x - ks[cw]
+                                acc[cw] = acc[cw] + dz
+                                accsq[cw] = accsq[cw] + dz * dz
                         i = i + 1
                 kb = kb + STEP
             kv = kb + lane
@@ -286,16 +294,18 @@ def _bn_nchw_kernel(
                         raw = mX[bs[cw] + kv]
                         sc[cbs[cw] + kv] = raw
                         x = raw.to(cutlass.Float32)
-                        acc[cw] = acc[cw] + x
-                        accsq[cw] = accsq[cw] + x * x
+                        dz = x - ks[cw]
+                        acc[cw] = acc[cw] + dz
+                        accsq[cw] = accsq[cw] + dz * dz
                     else:
                         raw = nvvm.load_ext(mXi.iterator + (bs[cw] + kv * VS), dtype=it_ty, count=VS)
                         nvvm.store_ext(raw, sc.iterator + (cbs[cw] + kv * VS), shared_space=_CTA_SS)
                         xv = raw.bitcast(et)
                         for e in cutlass.range_constexpr(VS):
                             x = xv[e].to(cutlass.Float32)
-                            acc[cw] = acc[cw] + x
-                            accsq[cw] = accsq[cw] + x * x
+                            dz = x - ks[cw]
+                            acc[cw] = acc[cw] + dz
+                            accsq[cw] = accsq[cw] + dz * dz
                 kv = kv + 32
             n = n + 1
             r = r + 1
@@ -318,13 +328,15 @@ def _bn_nchw_kernel(
             for j in cutlass.range_constexpr(UF):
                 for cw in cutlass.range_constexpr(CPW):
                     if cutlass.const_expr(VS == 1):
-                        acc[cw] = acc[cw] + raws[i]
-                        accsq[cw] = accsq[cw] + raws[i] * raws[i]
+                        dz = raws[i] - ks[cw]
+                        acc[cw] = acc[cw] + dz
+                        accsq[cw] = accsq[cw] + dz * dz
                     else:
                         for e in cutlass.range_constexpr(VS):
                             x = raws[i][e].to(cutlass.Float32)
-                            acc[cw] = acc[cw] + x
-                            accsq[cw] = accsq[cw] + x * x
+                            dz = x - ks[cw]
+                            acc[cw] = acc[cw] + dz
+                            accsq[cw] = accsq[cw] + dz * dz
                     i = i + 1
             kb = kb + STEP
         kv = kb + lane
@@ -332,14 +344,16 @@ def _bn_nchw_kernel(
             for cw in cutlass.range_constexpr(CPW):
                 if cutlass.const_expr(VS == 1):
                     x = mX[bs[cw] + kv].to(cutlass.Float32)
-                    acc[cw] = acc[cw] + x
-                    accsq[cw] = accsq[cw] + x * x
+                    dz = x - ks[cw]
+                    acc[cw] = acc[cw] + dz
+                    accsq[cw] = accsq[cw] + dz * dz
                 else:
                     xv = nvvm.load_ext(mXi.iterator + (bs[cw] + kv * VS), dtype=it_ty, count=VS).bitcast(et)
                     for e in cutlass.range_constexpr(VS):
                         x = xv[e].to(cutlass.Float32)
-                        acc[cw] = acc[cw] + x
-                        accsq[cw] = accsq[cw] + x * x
+                        dz = x - ks[cw]
+                        acc[cw] = acc[cw] + dz
+                        accsq[cw] = accsq[cw] + dz * dz
             kv = kv + 32
         n = n + 1
 
@@ -377,8 +391,9 @@ def _bn_nchw_kernel(
             ssum = ssum + mP[cx * (2 * mparts * CT) + p * CT + tid]
             ssq = ssq + mP[cx * (2 * mparts * CT) + mparts * CT + p * CT + tid]
             p = p + 1
-        mn = ssum / Mf
-        var = ssq / Mf - mn * mn
+        m = ssum / Mf
+        mn = mX[cutlass.Int64(c0 + tid) * S].to(cutlass.Float32) + m
+        var = ssq / Mf - m * m
         rs = cute.math.rsqrt(var + eps)
         stat[tid] = mn
         stat[CT + tid] = rs
@@ -393,15 +408,21 @@ def _bn_nchw_kernel(
     nvvm.barrier_cta_sync_aligned(0)
 
     # ---- pass2: one channel per row -> scalar affine staged in registers ----
+    # Centered affine, NOT the fused ``x*scale + shift``: the fused form recreates
+    # the cancellation the shifted reduction just removed. For offset data both
+    # terms are O(|x|*rstd) and their sum is O(1), so the result loses
+    # ulp(|x|*rstd) -- 2.2e-02 on an fp32 case that should be exact. ``x - mean``
+    # is exact (Sterbenz), leaving the output accurate to a single rounding.
     scale = [cutlass.Float32(0.0)] * CPW
     shift = [cutlass.Float32(0.0)] * CPW
+    ctr = [cutlass.Float32(0.0)] * CPW
     for cw in cutlass.range_constexpr(CPW):
         ci = cw * WPB + w
-        sfac = stat[CT + ci] * mG[c0 + ci].to(cutlass.Float32)
-        scale[cw] = sfac
-        sh = -stat[ci] * sfac
+        scale[cw] = stat[CT + ci] * mG[c0 + ci].to(cutlass.Float32)
+        ctr[cw] = stat[ci]
+        sh = cutlass.Float32(0.0)
         if cutlass.const_expr(has_beta):
-            sh = sh + mB[c0 + ci].to(cutlass.Float32)
+            sh = mB[c0 + ci].to(cutlass.Float32)
         shift[cw] = sh
 
     # Cached rows and re-read rows are separate loops: selecting the source inside a
@@ -421,11 +442,11 @@ def _bn_nchw_kernel(
                     tout = nvvm.tcgen05_ld(nvvm.Tcgen05LdStShape.SHAPE_32X32B, tpj, num=VS)
                     if kv < NV:
                         if cutlass.const_expr(VS == 1):
-                            mY[bs[cw] + kv] = (tout[0] * scale[cw] + shift[cw]).to(et)
+                            mY[bs[cw] + kv] = ((tout[0] - ctr[cw]) * scale[cw] + shift[cw]).to(et)
                         else:
                             ys = []
                             for e in cutlass.range_constexpr(VS):
-                                ys.append((tout[e] * scale[cw] + shift[cw]).to(et))
+                                ys.append(((tout[e] - ctr[cw]) * scale[cw] + shift[cw]).to(et))
                             nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
             n = n + 1
             r = r + 1
@@ -443,26 +464,26 @@ def _bn_nchw_kernel(
                     for cw in cutlass.range_constexpr(CPW):
                         o = kb + j * 32 + lane
                         if cutlass.const_expr(VS == 1):
-                            y = sc[cbs[cw] + o].to(cutlass.Float32) * scale[cw] + shift[cw]
+                            y = (sc[cbs[cw] + o].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]
                             mY[bs[cw] + o] = y.to(et)
                         else:
                             xv = nvvm.load_ext(sc.iterator + (cbs[cw] + o * VS), dtype=it_ty, count=VS, shared_space=_CTA_SS).bitcast(et)
                             ys = []
                             for e in cutlass.range_constexpr(VS):
-                                ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
+                                ys.append(((xv[e].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]).to(et))
                             nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + o * VS))
                 kb = kb + STEP
             kv = kb + lane
             while kv < NV:
                 for cw in cutlass.range_constexpr(CPW):
                     if cutlass.const_expr(VS == 1):
-                        y = sc[cbs[cw] + kv].to(cutlass.Float32) * scale[cw] + shift[cw]
+                        y = (sc[cbs[cw] + kv].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]
                         mY[bs[cw] + kv] = y.to(et)
                     else:
                         xv = nvvm.load_ext(sc.iterator + (cbs[cw] + kv * VS), dtype=it_ty, count=VS, shared_space=_CTA_SS).bitcast(et)
                         ys = []
                         for e in cutlass.range_constexpr(VS):
-                            ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
+                            ys.append(((xv[e].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]).to(et))
                         nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
                 kv = kv + 32
             n = n + 1
@@ -486,11 +507,11 @@ def _bn_nchw_kernel(
                 for cw in cutlass.range_constexpr(CPW):
                     o = kb + j * 32 + lane
                     if cutlass.const_expr(VS == 1):
-                        mY[bs[cw] + o] = (raws[i] * scale[cw] + shift[cw]).to(et)
+                        mY[bs[cw] + o] = ((raws[i] - ctr[cw]) * scale[cw] + shift[cw]).to(et)
                     else:
                         ys = []
                         for e in cutlass.range_constexpr(VS):
-                            ys.append((raws[i][e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
+                            ys.append(((raws[i][e].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]).to(et))
                         nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + o * VS))
                     i = i + 1
             kb = kb + STEP
@@ -498,13 +519,13 @@ def _bn_nchw_kernel(
         while kv < NV:
             for cw in cutlass.range_constexpr(CPW):
                 if cutlass.const_expr(VS == 1):
-                    y = mX[bs[cw] + kv].to(cutlass.Float32) * scale[cw] + shift[cw]
+                    y = (mX[bs[cw] + kv].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]
                     mY[bs[cw] + kv] = y.to(et)
                 else:
                     xv = nvvm.load_ext(mXi.iterator + (bs[cw] + kv * VS), dtype=it_ty, count=VS).bitcast(et)
                     ys = []
                     for e in cutlass.range_constexpr(VS):
-                        ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
+                        ys.append(((xv[e].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]).to(et))
                     nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
             kv = kv + 32
         n = n + 1
@@ -631,16 +652,19 @@ def _bn_nchw_infer_kernel(
     NV: cutlass.Constexpr = S // VS
     STEP: cutlass.Constexpr = UF * 32
     c0 = cx * CT
+    # Centered affine -- same reasoning as the training kernel above; a running
+    # mean with a large offset cancels just as badly as a batch mean.
     scale = [cutlass.Float32(0.0)] * CPW
     shift = [cutlass.Float32(0.0)] * CPW
+    ctr = [cutlass.Float32(0.0)] * CPW
     for cw in cutlass.range_constexpr(CPW):
         ci = cw * WPB + w
         rs = cute.math.rsqrt(mRunVar[c0 + ci].to(cutlass.Float32) + eps)
-        sfac = rs * mG[c0 + ci].to(cutlass.Float32)
-        scale[cw] = sfac
-        sh = -mRunMean[c0 + ci].to(cutlass.Float32) * sfac
+        scale[cw] = rs * mG[c0 + ci].to(cutlass.Float32)
+        ctr[cw] = mRunMean[c0 + ci].to(cutlass.Float32)
+        sh = cutlass.Float32(0.0)
         if cutlass.const_expr(has_beta):
-            sh = sh + mB[c0 + ci].to(cutlass.Float32)
+            sh = mB[c0 + ci].to(cutlass.Float32)
         shift[cw] = sh
     n = my
     while n < N:
@@ -660,11 +684,11 @@ def _bn_nchw_infer_kernel(
                 for cw in cutlass.range_constexpr(CPW):
                     o = kb + j * 32 + lane
                     if cutlass.const_expr(VS == 1):
-                        mY[bs[cw] + o] = (raws[i] * scale[cw] + shift[cw]).to(et)
+                        mY[bs[cw] + o] = ((raws[i] - ctr[cw]) * scale[cw] + shift[cw]).to(et)
                     else:
                         ys = []
                         for e in cutlass.range_constexpr(VS):
-                            ys.append((raws[i][e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
+                            ys.append(((raws[i][e].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]).to(et))
                         nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + o * VS))
                     i = i + 1
             kb = kb + STEP
@@ -672,13 +696,13 @@ def _bn_nchw_infer_kernel(
         while kv < NV:
             for cw in cutlass.range_constexpr(CPW):
                 if cutlass.const_expr(VS == 1):
-                    y = mX[bs[cw] + kv].to(cutlass.Float32) * scale[cw] + shift[cw]
+                    y = (mX[bs[cw] + kv].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]
                     mY[bs[cw] + kv] = y.to(et)
                 else:
                     xv = nvvm.load_ext(mXi.iterator + (bs[cw] + kv * VS), dtype=it_ty, count=VS).bitcast(et)
                     ys = []
                     for e in cutlass.range_constexpr(VS):
-                        ys.append((xv[e].to(cutlass.Float32) * scale[cw] + shift[cw]).to(et))
+                        ys.append(((xv[e].to(cutlass.Float32) - ctr[cw]) * scale[cw] + shift[cw]).to(et))
                     nvvm.store_ext(cutlass.Vector.from_elements(tuple(ys), et).bitcast(it_ty), mYi.iterator + (bs[cw] + kv * VS))
             kv = kv + 32
         n = n + nblk

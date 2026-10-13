@@ -30,6 +30,7 @@ from cudnn.norm._common_sm100 import (
     STAGE_NONE,
     block_reduce_sum2,
     red_scratch_len,
+    shifted_stats,
     stage_row,
     stage_row_bulk,
 )
@@ -72,13 +73,18 @@ def _ln_fwd_kernel(
 
     Mf = cutlass.Float32(M)
 
-    # --- pass 1: reduce sum(x), sum(x^2) ---
+    # --- pass 1: reduce sum(x-K), sum((x-K)^2) ---
+    # K is one element of the row, broadcast-loaded by every thread. See
+    # shifted_stats(): without it, fp32 variance of offset data cancels away.
+    kshift = cutlass.Float32(0.0)
+    if cutlass.const_expr(has_mean):
+        kshift = mX[r, 0].to(cutlass.Float32)
     s1 = cutlass.Float32(0.0)
     s2 = cutlass.Float32(0.0)
     if cutlass.const_expr(staged):
         j = tid
         while j < M:
-            x = sX[j].to(cutlass.Float32)
+            x = sX[j].to(cutlass.Float32) - kshift
             s1 = s1 + x
             s2 = s2 + x * x
             j = j + bt
@@ -89,26 +95,20 @@ def _ln_fwd_kernel(
             xf = cute.make_fragment_like(xv[None, vi])
             cute.autovec_copy(xv[None, vi], xf)
             for e in cutlass.range_constexpr(V):
-                x = xf[e].to(cutlass.Float32)
+                x = xf[e].to(cutlass.Float32) - kshift
                 s1 = s1 + x
                 s2 = s2 + x * x
             vi = vi + bt
     else:
         j = tid
         while j < M:
-            x = mX[r, j].to(cutlass.Float32)
+            x = mX[r, j].to(cutlass.Float32) - kshift
             s1 = s1 + x
             s2 = s2 + x * x
             j = j + bt
     s1, s2 = block_reduce_sum2(s1, s2, tid, red, bt)
 
-    mean = cutlass.Float32(0.0)
-    if cutlass.const_expr(has_mean):
-        mean = s1 / Mf
-        var = s2 / Mf - mean * mean
-    else:
-        var = s2 / Mf
-    rstd = cute.math.rsqrt(var + eps)
+    mean, rstd = shifted_stats(s1, s2, kshift, Mf, eps, has_mean)
     if tid == 0:
         if cutlass.const_expr(has_mean):
             mMean[r] = mean

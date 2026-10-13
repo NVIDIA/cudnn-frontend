@@ -37,6 +37,7 @@ import cutlass.cute as cute
 import cutlass.primitives as nvvm
 from cutlass.memory import SmemAllocator
 
+from cudnn.norm._common_sm100 import shifted_stats
 from cudnn.norm.dtypes import DTYPE_BYTES, DTYPE_TO_CUTLASS
 from cudnn.norm.utils import dyn
 
@@ -182,21 +183,32 @@ def _ln_fwd_cga_kernel(
     s2 = cutlass.Float32(0.0)
     xc = [cutlass.Float32(0.0)] * (KC * V)
 
+    # Shift every partial by one element of the row before squaring. Each CTA of
+    # the cluster reduces a different slice, so the shift has to be common to all
+    # of them -- the row's first element is, and the broadcast load is L2-cheap.
+    # Without it the cluster partials cancel exactly as the single-CTA ones do.
+    kshift = cutlass.Float32(0.0)
+    if cutlass.const_expr(has_mean):
+        kshift = nvvm.load_ext(mXi.iterator + (cutlass.Int64(row) * C), dtype=it_ty, count=V).bitcast(et)[0].to(cutlass.Float32)
+
     # ---- pass 1: this CTA's slice, first KC vectors kept in registers ----
+    # xc keeps the RAW x: pass 2 re-loads the tail from global and so must see a
+    # true mean, not a shifted one.
     for k in cutlass.range_constexpr(KC):
         if cutlass.const_expr(k < VPT):
             xv = nvvm.load_ext(mXi.iterator + (base + (tid + k * BT) * V), dtype=it_ty, count=V).bitcast(et)
             for e in cutlass.range_constexpr(V):
                 x = xv[e].to(cutlass.Float32)
-                s1 = s1 + x
-                s2 = s2 + x * x
+                d = x - kshift
+                s1 = s1 + d
+                s2 = s2 + d * d
                 xc[k * V + e] = x
     for k in cutlass.range_constexpr(VPT - KC if VPT > KC else 0):
         xv = nvvm.load_ext(mXi.iterator + (base + (tid + (KC + k) * BT) * V), dtype=it_ty, count=V).bitcast(et)
         for e in cutlass.range_constexpr(V):
-            x = xv[e].to(cutlass.Float32)
-            s1 = s1 + x
-            s2 = s2 + x * x
+            d = xv[e].to(cutlass.Float32) - kshift
+            s1 = s1 + d
+            s2 = s2 + d * d
 
     s1, s2 = _block_sum2(s1, s2, tid, red, BT)
     if tid == 0:
@@ -218,12 +230,7 @@ def _ln_fwd_cga_kernel(
     nvvm.barrier_cluster_arrive_aligned()
     nvvm.barrier_cluster_wait_aligned()
 
-    if cutlass.const_expr(has_mean):
-        mean = t1 / Cf
-        rstd = cute.math.rsqrt(t2 / Cf - mean * mean + eps)
-    else:
-        mean = cutlass.Float32(0.0)
-        rstd = cute.math.rsqrt(t2 / Cf + eps)
+    mean, rstd = shifted_stats(t1, t2, kshift, Cf, eps, has_mean)
     if rank == 0 and tid == 0:
         if cutlass.const_expr(has_mean):
             mMean[row] = mean

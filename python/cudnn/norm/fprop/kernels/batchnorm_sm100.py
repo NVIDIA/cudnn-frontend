@@ -53,19 +53,23 @@ def _bn_fwd_kernel(
     mean = cutlass.Float32(0.0)
     rstd = cutlass.Float32(0.0)
     if cutlass.const_expr(training):
+        # Shift by x[0, c, 0] before squaring; see shifted_stats() in
+        # _common_sm100 for why E[x^2]-E[x]^2 cannot be used.
+        kshift = mX[0, c, 0].to(cutlass.Float32)
         s1 = cutlass.Float32(0.0)
         s2 = cutlass.Float32(0.0)
         i = tid
         while i < count:
             n = i // S
             s = i % S
-            x = mX[n, c, s].to(cutlass.Float32)
-            s1 = s1 + x
-            s2 = s2 + x * x
+            d = mX[n, c, s].to(cutlass.Float32) - kshift
+            s1 = s1 + d
+            s2 = s2 + d * d
             i = i + bt
         s1, s2 = block_reduce_sum2(s1, s2, tid, red, bt)
-        mean = s1 / countf
-        var = s2 / countf - mean * mean
+        m = s1 / countf
+        mean = kshift + m
+        var = s2 / countf - m * m
         rstd = cute.math.rsqrt(var + eps)
         if tid == 0:
             mSavedMean[c] = mean

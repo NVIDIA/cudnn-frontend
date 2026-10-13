@@ -31,6 +31,27 @@ from cudnn.norm.utils import dyn, smem_capacity
 _INT_TY = {2: cutlass.Int16, 4: cutlass.Int32}
 
 
+@cute.jit
+def _row_reduce1(v, full_warp: cutlass.Constexpr, intra: cutlass.Constexpr, nsteps: cutlass.Constexpr):
+    """Butterfly-reduce one fp32 partial across the row's (possibly sub-) warp.
+
+    Extracted so the centered route can reduce twice -- once for sum(x), then
+    once for sum((x-mean)^2). The full-warp branch keeps literal offsets and
+    clamp so they fold to compile-time constants: ``intra`` is a Constexpr
+    *param* that arrives as a runtime Int32, so ``intra >> k`` would NOT fold,
+    and the live intra/clamp/offset registers tip ldgs=5 over the 8-CTA/SM
+    occupancy cliff (-19% BW).
+    """
+    if cutlass.const_expr(full_warp):
+        for k in cutlass.range_constexpr(5):
+            v = v + nvvm.shfl_sync(0xFFFFFFFF, v, 32 >> (k + 1), 0x1F, nvvm.Shfl.BFLY)
+    else:
+        clamp: cutlass.Constexpr = 0x1F | ((32 - intra) << 8)  # sub-warp (tiny C)
+        for k in cutlass.range_constexpr(nsteps):
+            v = v + nvvm.shfl_sync(0xFFFFFFFF, v, intra >> (k + 1), clamp, nvvm.Shfl.BFLY)
+    return v
+
+
 @cute.kernel
 def _warp_fwd_kernel(
     mXi: cute.Tensor,
@@ -89,8 +110,11 @@ def _warp_fwd_kernel(
         base = cutlass.Int64(row) * C
 
         # --- pass 1: load X to registers (vectorized), fused reduce ---
-        # mean/s1/neg are const_expr-guarded so the RMS path carries zero extra
-        # live registers (a dead ``neg``/``s1`` tips ldgs=5 into a spill: -23% BW).
+        # mean/s1 are const_expr-guarded so the RMS path carries zero extra live
+        # registers (a dead ``mean``/``s1`` tips ldgs=5 into a spill: -23% BW).
+        # Pass 2 centers explicitly -- ``rstd*x + (-rstd*mean)`` would cancel for
+        # offset data exactly as the one-pass variance did (8.7 absolute at
+        # offset 1e6), and ``x - mean`` is exact by Sterbenz.
         xs = [cutlass.Float32(0.0)] * (ldgs * V)
         s2 = cutlass.Float32(0.0)
         if cutlass.const_expr(has_mean):
@@ -103,48 +127,43 @@ def _warp_fwd_kernel(
                 xs[it * V + e] = x
                 if cutlass.const_expr(has_mean):
                     s1 = s1 + x
-                s2 = s2 + x * x
-        if cutlass.const_expr(full_warp):
-            # wn>1 / full-warp: literal offsets & clamp fold to compile-time constants.
-            # (``intra`` is a Constexpr *param* that arrives as a runtime Int32, so
-            # ``intra >> k`` would NOT fold — the live intra/clamp/offset registers tip
-            # ldgs=5 over the 8-CTA/SM occupancy cliff: -19% BW. Literals avoid that.)
-            for k in cutlass.range_constexpr(5):
-                off = 32 >> (k + 1)
-                if cutlass.const_expr(has_mean):
-                    s1 = s1 + nvvm.shfl_sync(0xFFFFFFFF, s1, off, 0x1F, nvvm.Shfl.BFLY)
-                s2 = s2 + nvvm.shfl_sync(0xFFFFFFFF, s2, off, 0x1F, nvvm.Shfl.BFLY)
-        else:
-            clamp: cutlass.Constexpr = 0x1F | ((32 - intra) << 8)  # sub-warp (tiny C)
-            for k in cutlass.range_constexpr(nsteps):
-                o = intra >> (k + 1)
-                if cutlass.const_expr(has_mean):
-                    s1 = s1 + nvvm.shfl_sync(0xFFFFFFFF, s1, o, clamp, nvvm.Shfl.BFLY)
-                s2 = s2 + nvvm.shfl_sync(0xFFFFFFFF, s2, o, clamp, nvvm.Shfl.BFLY)
-
-        if cutlass.const_expr(wn > 1):  # combine the wn warp-partials via smem
+                else:
+                    s2 = s2 + x * x
+        mean = cutlass.Float32(0.0)
+        if cutlass.const_expr(has_mean):
+            s1 = _row_reduce1(s1, full_warp, intra, nsteps)
+            if cutlass.const_expr(wn > 1):  # combine the wn warp-partials via smem
+                if lane == 0:
+                    red[rpc * wn + rit * wn + warp_in_row] = s1
+                cute.arch.sync_threads()
+                s1 = cutlass.Float32(0.0)
+                for j in cutlass.range_constexpr(wn):
+                    s1 = s1 + red[rpc * wn + rit * wn + j]
+            # Second pass over the registers we already hold. The one-pass
+            # E[x^2]-E[x]^2 form cancels catastrophically once the data carries a
+            # large common offset -- fp32 LayerNorm over 8191/8193 returned +/-316
+            # instead of +/-1. Centering first costs no extra memory traffic here,
+            # only a second shuffle-reduce; see shifted_stats in _common_sm100.
+            mean = s1 * rn
+            for it in cutlass.range_constexpr(ldgs):
+                for e in cutlass.range_constexpr(V):
+                    d = xs[it * V + e] - mean
+                    s2 = s2 + d * d
+        s2 = _row_reduce1(s2, full_warp, intra, nsteps)
+        if cutlass.const_expr(wn > 1):
             if lane == 0:
                 red[rit * wn + warp_in_row] = s2
-                if cutlass.const_expr(has_mean):
-                    red[rpc * wn + rit * wn + warp_in_row] = s1
             cute.arch.sync_threads()
             s2 = cutlass.Float32(0.0)
             for j in cutlass.range_constexpr(wn):
                 s2 = s2 + red[rit * wn + j]
-            if cutlass.const_expr(has_mean):
-                s1 = cutlass.Float32(0.0)
-                for j in cutlass.range_constexpr(wn):
-                    s1 = s1 + red[rpc * wn + rit * wn + j]
 
+        rstd = cute.math.rsqrt(s2 * rn + eps)
         if cutlass.const_expr(has_mean):
-            mean = s1 * rn
-            rstd = cute.math.rsqrt(s2 * rn - mean * mean + eps)
-            neg = -rstd * mean
             if tir == 0:
                 mMean[row] = mean
                 mRstd[row] = rstd
         else:
-            rstd = cute.math.rsqrt(s2 * rn + eps)
             if tir == 0:
                 mRstd[row] = rstd
 
@@ -154,7 +173,7 @@ def _warp_fwd_kernel(
             ys = []
             for e in cutlass.range_constexpr(V):
                 if cutlass.const_expr(has_mean):
-                    y = rstd * xs[it * V + e] + neg
+                    y = rstd * (xs[it * V + e] - mean)
                 else:
                     y = rstd * xs[it * V + e]
                 y = sG[col0 + e].to(cutlass.Float32) * y
@@ -339,35 +358,41 @@ def _warp_fwd_pipe_kernel(
                     xs[it * V + e] = x
                     if cutlass.const_expr(has_mean):
                         s1 = s1 + x
-                    s2 = s2 + x * x
-            for k in cutlass.range_constexpr(5):
-                off = 32 >> (k + 1)
-                if cutlass.const_expr(has_mean):
-                    s1 = s1 + nvvm.shfl_sync(0xFFFFFFFF, s1, off, 0x1F, nvvm.Shfl.BFLY)
-                s2 = s2 + nvvm.shfl_sync(0xFFFFFFFF, s2, off, 0x1F, nvvm.Shfl.BFLY)
-            if cutlass.const_expr(wn > 1):
-                if lane == 0:
-                    red[warp] = s2
-                    if cutlass.const_expr(has_mean):
+                    else:
+                        s2 = s2 + x * x
+            mean = cutlass.Float32(0.0)
+            if cutlass.const_expr(has_mean):
+                s1 = _row_reduce1(s1, True, 32, 5)
+                if cutlass.const_expr(wn > 1):
+                    if lane == 0:
                         red[wn + warp] = s1
-                nvvm.barrier_cta_sync(1, thread_count=tpr)  # compute warps only (excl. DMA)
-                s2 = cutlass.Float32(0.0)
-                for j in cutlass.range_constexpr(wn):
-                    s2 = s2 + red[j]
-                if cutlass.const_expr(has_mean):
+                    nvvm.barrier_cta_sync(1, thread_count=tpr)  # compute warps only (excl. DMA)
                     s1 = cutlass.Float32(0.0)
                     for j in cutlass.range_constexpr(wn):
                         s1 = s1 + red[wn + j]
-
-            if cutlass.const_expr(has_mean):
+                # Centered second pass over the registers we already hold -- see the
+                # note in the non-pipelined kernel above. E[x^2]-E[x]^2 loses the
+                # variance of offset data entirely; xs stays un-centered for pass 2.
                 mean = s1 * rn
-                rstd = cute.math.rsqrt(s2 * rn - mean * mean + eps)
-                neg = -rstd * mean
+                for it in cutlass.range_constexpr(ldgs):
+                    for e in cutlass.range_constexpr(V):
+                        d = xs[it * V + e] - mean
+                        s2 = s2 + d * d
+            s2 = _row_reduce1(s2, True, 32, 5)
+            if cutlass.const_expr(wn > 1):
+                if lane == 0:
+                    red[warp] = s2
+                nvvm.barrier_cta_sync(1, thread_count=tpr)
+                s2 = cutlass.Float32(0.0)
+                for j in cutlass.range_constexpr(wn):
+                    s2 = s2 + red[j]
+
+            rstd = cute.math.rsqrt(s2 * rn + eps)
+            if cutlass.const_expr(has_mean):
                 if tid == 0:
                     mMean[row] = mean
                     mRstd[row] = rstd
             else:
-                rstd = cute.math.rsqrt(s2 * rn + eps)
                 if tid == 0:
                     mRstd[row] = rstd
             if tid == 0:  # buffer fully read -> free it for the DMA warp
@@ -383,7 +408,7 @@ def _warp_fwd_pipe_kernel(
                 ys = []
                 for e in cutlass.range_constexpr(V):
                     if cutlass.const_expr(has_mean):
-                        y = rstd * xs[it * V + e] + neg
+                        y = rstd * (xs[it * V + e] - mean)
                     else:
                         y = rstd * xs[it * V + e]
                     y = gv[e].to(cutlass.Float32) * y
