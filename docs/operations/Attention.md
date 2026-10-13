@@ -1017,7 +1017,7 @@ Deprecated Args:
 Returns:
     o (cudnn_tensor): The output data.
     stats (Optional[cudnn_tensor]): The softmax statistics, if generate_stats is true.
-    amax_s (cudnn_tensor): The absolute maximum of S tensor.
+    amax_s (cudnn_tensor): The maximum of the softmax probabilities S, which lies in [1/S_kv, 1]. Optional; see "Amax S" below.
     amax_o (cudnn_tensor): The absolute maximum of output tensor.
 ```
 
@@ -1084,6 +1084,14 @@ Where:
 - $S_{kv}$ is the sequence length of the key and value
 - $D_{qk}$ is the embedding dimension per head of query and key
 - $D_{v}$ is the embedding dimension per head of value
+
+##### Amax S
+
+`Amax_S` is the maximum of $S = \text{softmax}(P)$ over the whole tensor, before `scale_s`. Every row of $S$ sums to 1, so the value lies in $[1/S_{kv}, 1]$, and a causal row 0 (one key) gives exactly 1. Deriving `scale_s` from the E4M3 maximum and an amax of 1 (`448.f`) therefore never saturates $S$, whatever the previous step's value was.
+
+- `Amax_S` is optional: leave the output virtual (do not call `set_output(True)` on it) if you do not consume it.
+- The FROST engines do not produce `Amax_S`. A graph that declares it as an output is declined by every FROST FP8 row and runs on a cuDNN backend engine.
+- On SM100, the backend currently reports a value below the true maximum when $S_{q}$ is short ([#1613](https://github.com/NVIDIA/cudnn-frontend/issues/1613)).
 
 #### Samples and tests
 - C++ sample: [samples/cpp/sdpa](https://github.com/NVIDIA/cudnn-frontend/tree/main/samples/cpp/sdpa)
