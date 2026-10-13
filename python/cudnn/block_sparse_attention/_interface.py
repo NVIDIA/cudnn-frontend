@@ -396,8 +396,14 @@ def _sm100_blk64_auto_kv_splits(
     q2k_block_index: torch.Tensor,
     fixed_block_sparse_num: int,
     max_kv_splits: int = 16,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
 ) -> int:
-    """Choose KV splits for the SM100 blk64 KV-bucketed target cases."""
+    """Choose splits assuming approximately uniform, independent KV indices across Q blocks.
+
+    This metadata-only policy cannot detect shared or local KV neighborhoods.
+    Such high-reuse masks should use explicitly benchmarked split counts.
+    """
     if not q.is_cuda:
         return 1
 
@@ -407,15 +413,40 @@ def _sm100_blk64_auto_kv_splits(
     if kv_blocks <= 1:
         return 1
 
-    # Long fixed-count rows can benefit from splitting even with a full Q grid:
-    # GB200 video workloads prefer 4/8 splits at 450/900 active KV blocks.
-    # Below that range, partial-output traffic and combine outweigh the gain.
-    # For variable counts, capacity is only an upper bound, not row work: a
-    # packed production mask can reserve thousands of slots for short rows.
     batch, heads, seqlen_q, _ = q.shape
     total_q_tiles = batch * heads * _ceil_div_int(seqlen_q, 64)
-    if total_q_tiles >= 512 and (fixed_block_sparse_num <= 0 or kv_blocks < 450):
-        return 1
+    if total_q_tiles >= 512:
+        # The large-Q region was measured on BF16 MHA D128 with random indices.
+        # Capacity is not row work for variable counts. Small Q extents, dense
+        # masks and cache-sized per-head K/V regressed despite long KV rows.
+        if (
+            fixed_block_sparse_num <= 0
+            or kv_blocks < 512
+            or seqlen_q < 262144
+            or q.dtype != torch.bfloat16
+            or q.shape[-1] != 128
+            or k is None
+            or v is None
+            or k.shape[1] != heads
+            or v.shape[1] != heads
+            or k.shape[-1] != 128
+            or v.shape[-1] != 128
+            or kv_blocks * 8 > _ceil_div_int(k.shape[2], 64)
+        ):
+            return 1
+        # Device properties are host metadata; never inspect device indices or
+        # counts to estimate reuse. Unknown cache size keeps the conservative path.
+        l2_bytes = getattr(torch.cuda.get_device_properties(q.device), "L2_cache_size", 0)
+        kv_bytes_per_head = k.shape[2] * k.shape[-1] * k.element_size() + v.shape[2] * v.shape[-1] * v.element_size()
+        if l2_bytes <= 0:
+            return 1
+        if kv_blocks >= 900 and kv_bytes_per_head > 2 * l2_bytes and (heads >= 4 or (heads == 1 and kv_blocks >= 1024)):
+            splits = 8
+        elif heads >= 4 and kv_bytes_per_head > l2_bytes:
+            splits = 4
+        else:
+            return 1
+        return max(1, min(splits, int(max_kv_splits), kv_blocks))
 
     if kv_blocks >= 900:
         splits = 8
@@ -1519,6 +1550,8 @@ def bsa_attn_fwd_blk64_cutedsl(
                 q_bhsd,
                 q2k_block_index,
                 uniform_block_sparse_num,
+                k=k_bhsd,
+                v=v_bhsd,
             )
     kv_splits_i = _resolve_blk64_split_workspace(
         q_bhsd,
