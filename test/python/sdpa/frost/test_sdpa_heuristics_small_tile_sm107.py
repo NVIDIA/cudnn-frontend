@@ -496,11 +496,13 @@ def test_cluster_axis_keeps_cga1_on_the_small_tiles():
 # step pads its sequences to), B 1 and B 4 at S 256 / 384; the padded cells at live fractions 0.75 and 0.5 of S on every row.  MEASURED on a
 # 212-SM cc 10.7 node at the 2376 MHz lock (same-process arm-vs-arm, CUDA-graph replay 100 x 3, a control twin per process at 0.00-0.53 %,
 # the SW Power Capping counter unmoved): every chunk arm against the pick -- the clamp-2 pick at S 256 B 1 (D 32 / 64, f 1.0 / 0.75 / 0.5:
-# n4 -3..-9 %, n8 -17..-30 %), the cap at 8 at 1024 / 1536 rows (n16 -6..-16 % on every form at every f; n4 -0.3..-2.5 % on the
-# padded and 128-wide bias cells, +1.3..+1.6 % on three dense 64-wide cells at D 64 B 4 -- under the two-of-three-f rule a default
-# keeps), the one-batch-entry guard at TILE_N 128 (the pair n8 -4.4 % at S 512 D 32), the ring's n8 within 1 % of n4 at D 64 S 640 / 768.
-# The one single-f exception: the pair n2 beats the n4 pick on the padded S 384 B 1 cells at f 0.75 (+3.0 % D 32, +1.7 % D 64) and not at
-# f 0.5 (+1.0 / -0.7 %) -- recorded, not a rule (the pick sees S_kv, never the lengths).
+# n4 -3..-10 %, n8 -17..-30 %), the cap at 8 at 1024 / 1536 rows (n16 -8.6..-16.3 % at 1024 rows on every form at every f, -5.8..-8.7 %
+# on the 64-wide forms at 1536 rows and -0.7 / -1.6 % (D 32 / 64) on the 128-wide bias pair there -- n8 still ahead, the D 32 margin
+# under the 1 % floor; n4 -0.3..-2.5 % on every other B 4 cell except -8.7 % against the one-batch-entry pick at D 32 S 256 and
+# +1.3..+1.6 % on three dense 64-wide cells at D 64 B 4 -- under the two-of-three-f rule a default keeps), the one-batch-entry guard
+# at TILE_N 128 (the pair n8 -4.4 % at S 512 D 32), the ring's n8 within 1 % of n4 at D 64 S 640 / 768.  The one single-f exception:
+# the pair n2 beats the n4 pick on the padded S 384 B 1 cells at f 0.75 (+3.0 / +3.2 % D 32, +1.7 / +1.5 % D 64) and not at f 0.5
+# (+1.0 / +1.0 % D 32, -0.7 / +0.2 % D 64) -- recorded, not a rule (the pick sees S_kv, never the lengths).
 _TRAINING_CROPS = {
     (32, 256, 1): ((128, 0), (64, 2)),
     (32, 256, 4): ((128, 0), (64, 8)),
@@ -535,8 +537,8 @@ def test_training_crop_picks_are_the_measured_ones(cell):
 def test_training_crop_preload_is_the_width_table_on_every_form():
     """`BIAS_PRELOAD_CHUNKS` per FORM on the training crops (0 / 1 / 2 against the width's value, same process, the seam
     `_BIAS_PRELOAD_CHUNKS_OVERRIDE_FOR_SWEEPS`): the 128-wide forms LOSE with one chunk ahead of the wait (the pair resident -0.9..-1.7 %,
-    the one-batch-entry ring -0.5..-1.0 %, two chunks -1.7..-5.9 %), the 64-wide bias + kv_mask resident body loses WITHOUT it
-    (-2.2..-3.3 % at S 256 / 384 / 512, two chunks -0.1..-0.6 %), the 64-wide bias RING at D 64 S 768 loses without it too (-1.8 % at
+    the one-batch-entry ring -0.5..-1.0 %, two chunks -0.8..-5.9 %), the 64-wide bias + kv_mask resident body loses WITHOUT it
+    (-1.5..-3.3 % at S 256 / 384 / 512, two chunks -0.6..+0.5 %), the 64-wide bias RING at D 64 S 768 loses without it too (-1.8 % at
     f 0.75, -0.9 % at f 0.5 -- the per-form split the width table left open closes on the table's side), the padded 64-wide resident body
     is neutral either way (-0.7..+0.9 %), the 64-wide bias-only resident pair is neutral on its pick cells (-0.4 / +0.1 % without the
     chunk at D 64 S 256 with 256 / 1024 rows) and the three-warp-group body derives its effective pre-load 0 whatever the constant: the

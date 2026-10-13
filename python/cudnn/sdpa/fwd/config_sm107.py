@@ -449,8 +449,8 @@ SM107_NARROW_TILE_S_KV_MAX = 256
 # 8b'); the domain {0, 1, 2} is the kernel's.  RE-MEASURED per FORM on the training crops (S 256 / 384 / 512 / 768, B 1 / 4, live fractions
 # 1.0 / 0.75 / 0.5; the three values of one form interleaved in ONE process through the sweep seam below, a 212-SM cc 10.7 node at the 2376
 # lock, control twins 0.00-0.53 %): every 128-wide form loses with a chunk ahead of the wait (the pair resident -0.9..-1.7 %, the
-# one-batch-entry ring -0.5..-1.0 %, two chunks -1.1..-5.9 %; the 128-wide pair RING +0.1 % with one chunk, -1.7 % with two), the 64-wide
-# bias + kv_mask resident body loses WITHOUT its chunk (-2.2..-3.3 %; two chunks -0.6..+0.5 %), the 64-wide bias RING (D 64 S 768, the
+# one-batch-entry ring -0.5..-1.0 %, two chunks -0.8..-5.9 %; the 128-wide pair RING +0.1 % with one chunk, -1.7 % with two), the 64-wide
+# bias + kv_mask resident body loses WITHOUT its chunk (-1.5..-3.3 %; two chunks -0.6..+0.5 %), the 64-wide bias RING (D 64 S 768, the
 # per-form split the first table left open) loses without it too (-1.8 % at 0.75 of the keys live, -0.9 % at 0.5), the padded 64-wide
 # resident body is within noise either way (-0.6..+0.8 %), the three-warp-group body derives its effective pre-load 0 whatever the
 # constant, and the 64-wide bias-only RESIDENT pair reads +1.1 / +0.5 / -0.6 % without the chunk where it is NOT the pick (D 32 S 256 /
@@ -1095,11 +1095,14 @@ SM107_PAIR_N_CHUNK_MAX = 8
 # widths) while at 512 rows (4.8 waves of 2-row items) n2 wins back by +8 % on the 64-wide tile.  The floor applies while the 2-row
 # items number at most this many waves.  CONFIRMED on the training crops (same node class, same protocol, same-process arm vs pick): at
 # S 256 with 256 rows the clamp-2 pick wins at every live fraction (1.0 / 0.75 / 0.5 of the keys -- the 0.5 crop is ONE live 128-wide
-# tile, where the floor does not reach because the 2-row items fill 4.8 waves: n4 -3..-9 %, n8 -17..-30 %, both D), the cap at 8 wins
-# at 1024 / 1536 rows (n16 -6..-16 % on every form at every fraction; n4 -0.3..-2.5 % on the padded and the 128-wide bias cells and
-# +1.3..+1.6 % on three DENSE 64-wide cells at D 64 B 4 -- a single-fraction reading, not a default), the D 64 pair ring's n8 is within
-# 1 % of n4 at S 640 / 768.  The one reproducible exception: on the padded S 384 cells with 384 rows the pair n2 beats the n4 pick at
-# 0.75 of the keys live (+3.0 / +3.2 % D 32, +1.7 / +1.5 % D 64; +2.7..+3.9 % with a kv_mask on top) and not at 0.5 (+1.0 / +0.2 %) or
+# tile, where the floor does not reach because the 2-row items fill 4.8 waves: n4 -3..-10 %, n8 -17..-30 %, both D), the cap at 8 wins
+# at 1024 / 1536 rows (n16 -8.6..-16.3 % at 1024 rows on every form at every fraction; at 1536 rows -5.8..-8.7 % on the 64-wide forms
+# and -0.7 / -1.6 % (D 32 / D 64) on the 128-wide bias pair, where the +3.1 / +3.7 % of the record above did not reproduce -- n8 still
+# ahead, the D 32 margin under the 1 % floor; n4 -0.3..-2.5 % on every other B 4 cell except -8.7 % against the one-batch-entry pick
+# at D 32 S 256 with 1024 rows and +1.3..+1.6 % on three DENSE 64-wide cells at D 64 B 4 -- a single-fraction reading, not a default),
+# the D 64 pair ring's n8 is within 1 % of n4 at S 640 / 768.  The one reproducible exception: on the padded S 384 cells with 384 rows
+# the pair n2 beats the n4 pick at 0.75 of the keys live (+3.0 / +3.2 % D 32, +1.7 / +1.5 % D 64; +2.7..+3.9 % with a kv_mask on top)
+# and not at 0.5 (+1.0 / +1.0 % D 32, -0.7 / +0.2 % D 64) or
 # at the full length (-0.9 / -1.6 %) -- the pick sees S_kv, never the lengths, and a single-fraction win is recorded, not folded.
 SM107_ONE_TILE_N_CHUNK_FLOOR, SM107_ONE_TILE_FLOOR_MAX_WAVES = 4, 2
 
