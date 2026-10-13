@@ -344,7 +344,7 @@ def test_template_params_cfg_and_bars_are_appended():
 
     fields = [f.name for f in dataclasses.fields(TemplateParams)]
     assert (
-        fields[-7:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots"]
+        fields[-8:] == ["n_chunk", "bias_stages", "padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots", "q_in_tmem"]
         and TemplateParams().bias_stages == 0
     ), "append-only; 0 renders every existing record byte-identically"
     assert c._CfgSm107.STAGES_BIAS == 0

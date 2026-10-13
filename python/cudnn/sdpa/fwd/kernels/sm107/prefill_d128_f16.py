@@ -238,7 +238,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     exp2_mixed,
 )
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
-from cudnn.frost.tile_dsl.mma import mma_ss, mma_ts_step
+from cudnn.frost.tile_dsl.mma import desc_opaque, mma_ss, mma_ts, mma_ts_step
 from cudnn.frost.tile_dsl.tma import tma_load_tile, tma_store_tile, tma_store_commit, tma_store_wait, tma_tensormap_acquire
 from cudnn.frost.tile_dsl.handles import MmaDesc, SmemTile, GmemTileTma, tma_slice_runtime_desc
 from cudnn.frost.tile_dsl.tmem import tmem_alloc, tmem_dealloc
@@ -733,6 +733,10 @@ class KernelTmemLayout:
     # sub-tile qs sits at S{qs}_OFF + p * S_SLOT_STRIDE, its P at P{qs}_OFF + p * S_SLOT_STRIDE (0 at one slot).
     S_SLOTS: int = _TMEM.S_SLOTS
     S_SLOT_STRIDE: int = _TMEM.S_SLOT_STRIDE
+    # The TS arm's Q slots (CFG.Q_IN_TMEM): Q_COLS = TILE_K x BPE / 4 columns per sub-tile after the last O slot (320 / 336 at D 32, 384 / 416 at
+    # D 64); unused (never traced) on the SMEM-Q renderings.
+    Q_OFF: Tuple[int, ...] = _TMEM.Q_OFF
+    Q_COLS: int = _TMEM.Q_COLS
 
 
 LAYOUT = KernelTmemLayout()
@@ -783,6 +787,65 @@ if _S2 and CFG.SOFTMAX_WARPGROUPS != 2:
     # BMM2(k - 1) x 2) and the slot cursors' barrier audit is the two-group one; the third softmax warp group keeps one slot per sub-tile.
     raise ValueError(f"prefill_d128_f16_sm107: the double-buffered S is served with two softmax warp groups only (SOFTMAX_WARPGROUPS={CFG.SOFTMAX_WARPGROUPS})")
 
+
+# === Q resident in TMEM (CFG.Q_IN_TMEM == 1; TemplateParams.q_in_tmem; the f16/bf16 32- / 64-wide tiles at cga1, TILE_M 128, two sub-tiles) ===
+#
+# Per n-step per sub-tile the MMA warp, right after its `mb_q_full[qs]` wait, copies the sub-tile's Q tile SMEM -> TMEM in ONE elect block
+# (`_q_to_tmem`: a RUNTIME loop of _Q_UTCCP_N_CALLS trips of `tcgen05.cp 128x128b` over ONE loop-carried descriptor -- the SAME tcgen05 SMEM
+# descriptor the SS MMA read, stepped 16 B per trip along the Q row's one swizzle atom; 16 B per lane per trip = 4 fp32 columns -- then ONE
+# `tcgen05.commit` onto `mb_q_empty[qs]`; the static instruction count is ONE UTCCP per sub-tile, the per-step trip count _Q_UTCCP_N_CALLS),
+# and issues every BMM1 of the step as an A-from-TMEM MMA (`mma_ts(bmm1_desc, tmem_Q[qs], desc_K, S)`; `tmem_advance_A` = 8 columns per
+# 16-wide k-step).  The copy and
+# the MMAs are issued by the same elected lane and enter the tensor-core issue queue in order, so the MMA warp waits nothing between them (the
+# d512 f16 kernel's Q-in-TMEM pattern); the UTCCP's commit is the step's `mb_q_empty[qs]` release -- the slab is free the moment the copy
+# lands, so the TMA-LDG warp (which issues Q[qs] BEFORE K[qs] in program order) prefetches the NEXT step's Q / K / V during this step's kv
+# loop instead of after its last BMM1.  The same MMAs over the same operands in the same k-step order: O and Stats are BITWISE the SMEM-Q
+# kernel's.
+#
+# BARRIER TABLE: no new barrier object; ONE arrive SITE moves.  mb_q_empty[qs] (MMA_COMMIT / LOCAL / TILES_Q, init ONE_LANE) is committed by the
+#   elected lane inside `_q_to_tmem`'s elect block (the step's prologue, after `mb_q_full[qs].wait`) instead of by the step-epilogue block
+#   (after the mainloop's last BMM1; folded OUT under the arm) -- 1 lane x 1 warp = 1 == init per phase on both forms, once per NON-EMPTY step
+#   per sub-tile on both forms (an empty step issues no Q load and no commit on either form), the same consumer (the TMA-LDG warp's
+#   `mb_q_reload[qs].wait` before every Q load, pre-armed at 1), the same phase count per step (P14).  Ordering: `tcgen05.commit` tracks every
+#   prior async tcgen05 op of the issuing thread, so the arrive lands after the copy's SMEM reads (the LDG's next TMA write cannot race them).
+#   Every other row is untouched (the same `make_classic_bars` arguments; `mb_bmm1_done` is still committed after each BMM1).  P15: cga1 only.
+#   WAR on the TMEM Q slot itself (no barrier row of its own -- it holds through the step's existing waits): step j+1's copy overwrites
+#   tmem_Q[qs] while step j's LAST BMM1 (an async tcgen05.mma reading the slot) could still be executing.  Every MMA body ends step j by
+#   waiting `mb_bmm2_ready` of the LAST kv tile for BOTH sub-tiles before its epilogue BMM2 (the one-batch-entry and pair step epilogues,
+#   `_mma_bmm2_s2` in both double-buffered forms), and the softmax warps arm that barrier only after consuming S(last), i.e. after
+#   `mb_bmm1_done` of the last BMM1 fired -- so no BMM1 read of the slot is in flight when the next step's copy is issued.  A body that ever
+#   skipped that epilogue wait (an empty-P fast path, a 3-WG form) would need an explicit `mb_bmm1_done` wait before the copy.
+# SMEM: unchanged bytes; sQ's READER is the UTCCP (through the same descriptor: the TMA atom's swizzle, 64 B at D 32 / 128 B at D 64 -- the
+#   de-swizzle is the descriptor's layout field, a wrong one is scrambled Q = cos ~ 0.006 on the first cell).  The slab is NOT given to the bias
+#   budget: Q[n+2] re-fills it mid-item (the point of the early release), so it cannot double as a bias tile.
+# TMEM: LAYOUT.Q_OFF / Q_COLS (config_sm107.d128_family_tmem_layout; the fit under STATS is _validate_q_in_tmem's predicate).
+# REGISTERS: the split is unchanged (8 x 192 + 4 x 88 + 4 x 40 = 2048); the MMA warp gains _Q_UTCCP_N_CALLS uniform descriptor / TMEM adds.
+# Every seam folds on cutlass.const_expr(_Q_TS) or a Python ternary on it: the SMEM-Q renderings trace byte-identically (the committed md5 records).
+_Q_TS: bool = CFG.Q_IN_TMEM == 1
+_Q_UTCCP_BYTES_PER_CALL = 16  # tcgen05.cp 128x128b: 128 lanes x 128 bits
+_Q_UTCCP_COLS_PER_CALL = _Q_UTCCP_BYTES_PER_CALL // 4  # 4 fp32 TMEM columns per call
+_Q_UTCCP_PER_SUBTILE = CFG.Q_SWZ_BYTES // _Q_UTCCP_BYTES_PER_CALL  # 16-B steps across one swizzle atom of the Q row
+_Q_UTCCP_SUBTILE_DESC_STRIDE = (CFG.TILE_M * CFG.Q_SWZ_BYTES) // _Q_UTCCP_BYTES_PER_CALL  # 16-B units between the row's swizzle atoms
+_Q_UTCCP_N_CALLS = LAYOUT.Q_COLS // _Q_UTCCP_COLS_PER_CALL  # derived from the column map, never a literal: 4 at D 32, 8 at D 64
+if CFG.Q_IN_TMEM not in (0, 1):
+    raise ValueError(f"prefill_d128_f16_sm107: CFG.Q_IN_TMEM must be 0 (Q from SMEM) or 1 (Q resident in TMEM); got {CFG.Q_IN_TMEM}")
+if _Q_TS and (IS_TF32 or CFG.TILE_K > 64 or CFG.TILE_M != 128 or CFG.CTA_MMA != 1 or CFG.TILES_Q != 2 or IS_QO_ALIAS or CFG.THD_VARLEN or SPLIT_KV > 1):
+    # config_sm107._validate_q_in_tmem pins the same couplings at config-build time; this is the kernel's own backstop.
+    raise ValueError(
+        "prefill_d128_f16_sm107: Q in TMEM (CFG.Q_IN_TMEM == 1) is the f16/bf16 32- / 64-wide tiles' cga1, 128-row, two-sub-tile, dense, unsplit arm "
+        "(the 128x128b UTCCP shape copies 128 rows; the Q u O alias gates the reload elsewhere)"
+    )
+if _Q_TS and _Q_UTCCP_PER_SUBTILE != _Q_UTCCP_N_CALLS:
+    # The copy loop steps the descriptor 16 B per call along ONE swizzle atom; a Q row of several atoms (TILE_K x BPE > Q_SWZ_BYTES: the
+    # d128 geometry) would need the subtile-major jump (TILE_M x Q_SWZ_BYTES / 16 units) between atoms -- declined with TILE_K > 64 above.
+    raise ValueError(f"prefill_d128_f16_sm107: the Q row must be ONE swizzle atom (TILE_K x BPE = {CFG.TILE_K * CFG.BPE} B vs Q_SWZ_BYTES {CFG.Q_SWZ_BYTES})")
+if _Q_TS and _Q_UTCCP_N_CALLS * _Q_UTCCP_BYTES_PER_CALL * 128 != CFG.TILE_M * CFG.TILE_K * CFG.BPE:
+    raise ValueError(
+        f"prefill_d128_f16_sm107: {_Q_UTCCP_N_CALLS} x 128x128b UTCCP calls move {_Q_UTCCP_N_CALLS * _Q_UTCCP_BYTES_PER_CALL * 128} B, not the "
+        f"{CFG.TILE_M * CFG.TILE_K * CFG.BPE}-B Q tile (LAYOUT.Q_COLS={LAYOUT.Q_COLS})"
+    )
+if _Q_TS and (LAYOUT.Q_OFF[-1] + LAYOUT.Q_COLS > LAYOUT.STATS_OFF or any(off % 8 for off in LAYOUT.Q_OFF)):
+    raise ValueError(f"prefill_d128_f16_sm107: the Q slots {LAYOUT.Q_OFF} (+{LAYOUT.Q_COLS}) must end before STATS ({LAYOUT.STATS_OFF}) at 8-column bases")
 
 # === TILE_M = 64 form 0: the warp-lane -> (row, live) map of a softmax / correction warp group (shared by both roles so they cannot drift) ===
 
@@ -2188,6 +2251,32 @@ NUM_KPHASES_PV_PER_CHUNK = NUM_KPHASES_PV // CFG.N_BMM2_CHUNKS
 
 
 @cute.jit
+def _q_to_tmem(tmem_q_i32, desc_q, bars, qs: cutlass.Constexpr[int], mcast_mask, anchor):
+    """MMA warp, once per n-step per sub-tile (CFG.Q_IN_TMEM == 1), right after ``mb_q_full[qs].wait``: copy the sub-tile's Q tile SMEM -> TMEM
+    (``_Q_UTCCP_N_CALLS`` x ``tcgen05.cp 128x128b`` through the SS MMA's own tcgen05 SMEM descriptor -- 16 B per lane per call = 4 fp32
+    columns; the descriptor steps 16 B per call along the Q row's ONE swizzle atom at the served widths, the d512 f16 kernel's subtile-major
+    convention collapsed to one atom) and commit ``mb_q_empty[qs]`` (the Q slab is free once the copy lands).  Loop and commit in ONE elect
+    block: the one elected lane issues every copy and the one commit (1 arrive per phase == init ONE_LANE); the BMM1s that follow are issued by
+    the same lane and enter the tensor-core queue after the copy, so no wait.  No ``fence_proxy``: the source is TMA-written (async -> async).
+    The calls are a RUNTIME loop over ONE loop-carried descriptor (``tmem_q_i32`` is the slot's TMEM column address, the destination is built
+    per call): an unrolled ``base + off_i`` form had ptxas compute all ``_Q_UTCCP_N_CALLS`` 64-bit descriptors ahead of the copies (an opaque
+    serial chain lowered to the same cubin), and the 40-register MMA warp of the one-batch-entry body spilled five of them per block at D 64
+    (STL / LDL 3 / 3 -> 13 / 13, host sm_107a, 2026-10-13); ``anchor`` (the step's ``q_full_phase``, loop-variant) keeps the base's opaque mov
+    inside the step (``tile_dsl.mma.desc_opaque``)."""
+    if nvvm.elect_sync():
+        dq = cutlass.Int64(desc_opaque(desc_q, anchor))
+        for i in cutlass.range(cutlass.Int32(0), cutlass.Int32(_Q_UTCCP_N_CALLS), 1, unroll=1):
+            nvvm.tcgen05_cp(
+                nvvm.Tcgen05CpShape.SHAPE_128X128B,
+                nvvm.make_tmem_ptr(tmem_q_i32 + i * cutlass.Int32(_Q_UTCCP_COLS_PER_CALL), cutlass.Int8),
+                dq,
+                group=CTA_GROUP_KIND,
+            )
+            dq = dq + cutlass.Int64(1)
+        bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
+
+
+@cute.jit
 def _mma_warp_quiet(tmem_ptr_i32, bars):
     """Minimal quiet body for the non-leader CTA's MMA-warp slot under cga2.
 
@@ -2289,6 +2378,10 @@ def _mma_warp_group(
     desc_Q = [desc_Q0, desc_Q1]
     if cutlass.const_expr(CFG.TILES_Q == 3):
         desc_Q.append(sQ[2].desc())
+    # The TS arm's per-sub-tile Q slots in TMEM (CFG.Q_IN_TMEM): the UTCCP destination and BMM1's A operand; None off the arm (never traced).
+    tmem_Q = [tmem_raw.subview(LAYOUT.Q_OFF[qs]) for qs in range(CFG.TILES_Q)] if _Q_TS else None
+    # ... and the slots' TMEM column addresses (the UTCCP loop builds its destination per call from them).
+    tmem_Q_i32 = [tmem_ptr_i32.load() + cutlass.Int32(LAYOUT.Q_OFF[qs]) for qs in range(CFG.TILES_Q)] if _Q_TS else None
 
     if cutlass.const_expr(CFG.MASK_FLAGS == 0 and SPLIT_KV == 1 and not _PAIR_ARM):
         kv_left = cutlass.Int32(0)
@@ -2352,6 +2445,8 @@ def _mma_warp_group(
                     q_full_phase,
                     bmm2_ready_phase,
                     empty_mainloop_phase,
+                    tmem_Q=tmem_Q,
+                    tmem_Q_i32=tmem_Q_i32,
                 )
             else:
                 # The double-buffered S: both BMM1(k) into slot s_prod ahead of both BMM2(k - 1) from slot s_cons, the cursors threaded through.
@@ -2378,6 +2473,8 @@ def _mma_warp_group(
                     s_prod,
                     s_cons,
                     empty_mainloop_phase,
+                    tmem_Q=tmem_Q,
+                    tmem_Q_i32=tmem_Q_i32,
                 )
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
             wait(sched.mb_scheduler.subview(sched_state.idx), sched_state.phase)
@@ -2412,14 +2509,24 @@ def _mma_warp_group(
                 else:
                     # Prologue: BMM1[sub0], BMM1[sub1] for kv=kv_left
                     bars.mb_q_full[0].wait(q_full_phase, spin=SPIN_RING_WAITS)
+                    if cutlass.const_expr(_Q_TS):
+                        _q_to_tmem(tmem_Q_i32[0], desc_Q0, bars, 0, mcast_mask, q_full_phase)
                     bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                     desc_K = sK[kv_state.idx].desc()
-                    mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                    if cutlass.const_expr(_Q_TS):
+                        mma_ts(bmm1_desc, tmem_Q[0], desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                    else:
+                        mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
                     elect_p = nvvm.elect_sync()
                     bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
                     bars.mb_q_full[1].wait(q_full_phase, spin=SPIN_RING_WAITS)
-                    mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                    if cutlass.const_expr(_Q_TS):
+                        _q_to_tmem(tmem_Q_i32[1], desc_Q1, bars, 1, mcast_mask, q_full_phase)
+                    if cutlass.const_expr(_Q_TS):
+                        mma_ts(bmm1_desc, tmem_Q[1], desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                    else:
+                        mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
                     elect_p = nvvm.elect_sync()
                     bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                     bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2459,7 +2566,10 @@ def _mma_warp_group(
                         # BMM1 sub 0 for next kv
                         bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
                         desc_K = sK[kv_state.idx].desc()
-                        mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                        if cutlass.const_expr(_Q_TS):
+                            mma_ts(bmm1_desc, tmem_Q[0], desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
+                        else:
+                            mma_ss(bmm1_desc, desc_Q0, desc_K, (tmem_raw.subview(LAYOUT.S0_OFF)))
                         elect_p = nvvm.elect_sync()
                         bars.mb_bmm1_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
@@ -2485,7 +2595,10 @@ def _mma_warp_group(
                         bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
 
                         # BMM1 sub 1 for next kv
-                        mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                        if cutlass.const_expr(_Q_TS):
+                            mma_ts(bmm1_desc, tmem_Q[1], desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
+                        else:
+                            mma_ss(bmm1_desc, desc_Q1, desc_K, (tmem_raw.subview(LAYOUT.S1_OFF)))
                         elect_p = nvvm.elect_sync()
                         bars.mb_bmm1_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                         bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2495,7 +2608,7 @@ def _mma_warp_group(
                     # Epilogue: BMM2 for last kv (always runs — n_kv >= 1).
                     # Under QO_ALIAS the TMA-LDG Q-reload gate is mb_q_o_alias (fired by
                     # TMA-STG after O drains), so MMA does NOT fire mb_q_empty.
-                    if cutlass.const_expr(not IS_QO_ALIAS):
+                    if cutlass.const_expr(not IS_QO_ALIAS and not _Q_TS):
                         elect_p = nvvm.elect_sync()
                         for qs in cutlass.range_constexpr(CFG.TILES_Q):
                             bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2565,6 +2678,8 @@ def _mma_warp_group(
                     s_prod,
                     s_cons,
                     empty_mainloop_phase,
+                    tmem_Q=tmem_Q,
+                    tmem_Q_i32=tmem_Q_i32,
                 )
 
             nvvm.bar_warp_sync(cute.arch.FULL_MASK)
@@ -2620,6 +2735,8 @@ def _mma_item_pair(
     q_full_phase,
     bmm2_ready_phase,
     empty_mainloop_phase,
+    tmem_Q=None,
+    tmem_Q_i32=None,
 ):
     """One (n, n+1) pair work item of the MMA warp (CFG.N_CHUNK > 0; cga1): per step the one-batch-entry pipeline with TILES_Q ring
     stages per kv tile -- stage `states[qs]` holds K[rows[qs]] / V[rows[qs]] (sub-tile qs = row rows[qs]; two sub-tiles on the pair item,
@@ -2649,9 +2766,14 @@ def _mma_item_pair(
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 st = states[qs]
                 bars.mb_q_full[qs].wait(q_full_phase, spin=SPIN_RING_WAITS)
+                if cutlass.const_expr(_Q_TS):
+                    _q_to_tmem(tmem_Q_i32[qs], desc_Q[qs], bars, qs, mcast_mask, q_full_phase)
                 bars.mb_k_full[st.idx].wait(st.phase, spin=SPIN_RING_WAITS)
                 desc_K = sK[st.idx].desc()
-                mma_ss(bmm1_desc, desc_Q[qs], desc_K, (tmem_raw.subview(LAYOUT.S_OFF[qs])))
+                if cutlass.const_expr(_Q_TS):
+                    mma_ts(bmm1_desc, tmem_Q[qs], desc_K, (tmem_raw.subview(LAYOUT.S_OFF[qs])))
+                else:
+                    mma_ss(bmm1_desc, desc_Q[qs], desc_K, (tmem_raw.subview(LAYOUT.S_OFF[qs])))
                 elect_p = nvvm.elect_sync()
                 bars.mb_bmm1_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_k_empty[st.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2697,7 +2819,10 @@ def _mma_item_pair(
                     # BMM1 sub-tile qs for the next kv tile on K[rows[qs]] (stage states[qs])
                     bars.mb_k_full[st.idx].wait(st.phase, spin=SPIN_RING_WAITS)
                     desc_K = sK[st.idx].desc()
-                    mma_ss(bmm1_desc, desc_Q[qs], desc_K, (tmem_raw.subview(LAYOUT.S_OFF[qs])))
+                    if cutlass.const_expr(_Q_TS):
+                        mma_ts(bmm1_desc, tmem_Q[qs], desc_K, (tmem_raw.subview(LAYOUT.S_OFF[qs])))
+                    else:
+                        mma_ss(bmm1_desc, desc_Q[qs], desc_K, (tmem_raw.subview(LAYOUT.S_OFF[qs])))
                     elect_p = nvvm.elect_sync()
                     bars.mb_bmm1_done[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                     bars.mb_k_empty[st.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2705,7 +2830,7 @@ def _mma_item_pair(
                 bmm2_ready_phase = bmm2_ready_phase ^ 1
 
             # Epilogue: BMM2 of the last kv tile for every sub-tile (always runs -- n_kv >= 1); the Q slots are free.
-            if cutlass.const_expr(not IS_QO_ALIAS):
+            if cutlass.const_expr(not IS_QO_ALIAS and not _Q_TS):
                 elect_p = nvvm.elect_sync()
                 for qs in cutlass.range_constexpr(CFG.TILES_Q):
                     bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2826,11 +2951,14 @@ def _s2_tmem(tmem_base_i32, col_off: cutlass.Constexpr[int], s_idx):
 
 
 @cute.jit
-def _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q, desc_K, bars, qs: cutlass.Constexpr[int], s_prod, mcast_mask):
+def _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q, desc_K, bars, qs: cutlass.Constexpr[int], s_prod, mcast_mask, tmem_q=None):
     """BMM1 of sub-tile ``qs`` into S slot ``s_prod.idx`` and the elected ``mb_bmm1_done[qs * S_SLOTS + slot]`` commit (1 lane == init
     ONE_LANE).  The K-stage release is the caller's (one stage may serve both sub-tiles); the elect predicate is returned for it."""
     s_col = LAYOUT.S_OFF[qs]  # the sub-tile's slot-0 S column (the head's per-sub-tile tuple; qs is a trace-time int)
-    mma_ss(bmm1_desc, desc_Q, desc_K, _s2_tmem(tmem_base_i32, s_col, s_prod.idx))
+    if cutlass.const_expr(_Q_TS):
+        mma_ts(bmm1_desc, tmem_q, desc_K, _s2_tmem(tmem_base_i32, s_col, s_prod.idx))
+    else:
+        mma_ss(bmm1_desc, desc_Q, desc_K, _s2_tmem(tmem_base_i32, s_col, s_prod.idx))
     elect_p = nvvm.elect_sync()
     bars.mb_bmm1_done[qs * CFG.S_SLOTS + s_prod.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
     return elect_p
@@ -2879,6 +3007,8 @@ def _mma_tile_s2(
     s_prod,
     s_cons,
     empty_mainloop_phase,
+    tmem_Q=None,
+    tmem_Q_i32=None,
 ):
     """One work item of the MMA warp on the one-batch-entry item with the double-buffered S (CFG.S_SLOTS == 2; one K / V ring stage
     per kv tile serves both sub-tiles): the prologue issues BMM1(kv_left) of both sub-tiles into slot ``s_prod``; per kv tile k of the
@@ -2896,11 +3026,15 @@ def _mma_tile_s2(
     else:
         # Prologue: BMM1 of both sub-tiles for kv = kv_left into slot s_prod.
         bars.mb_q_full[0].wait(q_full_phase, spin=SPIN_RING_WAITS)
+        if cutlass.const_expr(_Q_TS):
+            _q_to_tmem(tmem_Q_i32[0], desc_Q0, bars, 0, mcast_mask, q_full_phase)
         bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
         desc_K = sK[kv_state.idx].desc()
-        _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask)
+        _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask, tmem_q=(tmem_Q[0] if _Q_TS else None))
         bars.mb_q_full[1].wait(q_full_phase, spin=SPIN_RING_WAITS)
-        elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask)
+        if cutlass.const_expr(_Q_TS):
+            _q_to_tmem(tmem_Q_i32[1], desc_Q1, bars, 1, mcast_mask, q_full_phase)
+        elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask, tmem_q=(tmem_Q[1] if _Q_TS else None))
         bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
         s_prod = advance(s_prod, CFG.S_SLOTS)
         q_full_phase = q_full_phase ^ 1
@@ -2913,8 +3047,8 @@ def _mma_tile_s2(
             # BMM1 of both sub-tiles for THIS kv tile into the free slot -- ahead of the previous tile's BMM2, so it overlaps softmax(k - 1).
             bars.mb_k_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
             desc_K = sK[kv_state.idx].desc()
-            _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask)
-            elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask)
+            _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask, tmem_q=(tmem_Q[0] if _Q_TS else None))
+            elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask, tmem_q=(tmem_Q[1] if _Q_TS else None))
             bars.mb_k_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
             s_prod = advance(s_prod, CFG.S_SLOTS)
 
@@ -2928,7 +3062,7 @@ def _mma_tile_s2(
             s_cons = advance(s_cons, CFG.S_SLOTS)
 
         # Epilogue: BMM2 for the last kv tile (always runs -- n_kv >= 1); the Q slots are free.
-        if cutlass.const_expr(not IS_QO_ALIAS):
+        if cutlass.const_expr(not IS_QO_ALIAS and not _Q_TS):
             elect_p = nvvm.elect_sync()
             for qs in cutlass.range_constexpr(CFG.TILES_Q):
                 bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
@@ -2966,6 +3100,8 @@ def _mma_item_pair_s2(
     s_prod,
     s_cons,
     empty_mainloop_phase,
+    tmem_Q=None,
+    tmem_Q_i32=None,
 ):
     """One (n, n+1) pair work item of the MMA warp with the double-buffered S (CFG.S_SLOTS == 2; CFG.N_CHUNK > 0; cga1): `_mma_item_pair`'s
     two ring stages per kv tile (stage a = K / V of row rows[0] = sub-tile 0, stage b = row rows[1] = sub-tile 1, each released right after the
@@ -2991,14 +3127,18 @@ def _mma_item_pair_s2(
 
             # Prologue: BMM1[sub0] on K[nb0] (stage a), BMM1[sub1] on K[nb1] (stage b) for kv = kv_left, both into slot s_prod.
             bars.mb_q_full[0].wait(q_full_phase, spin=SPIN_RING_WAITS)
+            if cutlass.const_expr(_Q_TS):
+                _q_to_tmem(tmem_Q_i32[0], desc_Q0, bars, 0, mcast_mask, q_full_phase)
             bars.mb_k_full[state_a.idx].wait(state_a.phase, spin=SPIN_RING_WAITS)
             desc_K = sK[state_a.idx].desc()
-            elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask)
+            elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask, tmem_q=(tmem_Q[0] if _Q_TS else None))
             bars.mb_k_empty[state_a.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
             bars.mb_q_full[1].wait(q_full_phase, spin=SPIN_RING_WAITS)
+            if cutlass.const_expr(_Q_TS):
+                _q_to_tmem(tmem_Q_i32[1], desc_Q1, bars, 1, mcast_mask, q_full_phase)
             bars.mb_k_full[state_b.idx].wait(state_b.phase, spin=SPIN_RING_WAITS)
             desc_K = sK[state_b.idx].desc()
-            elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask)
+            elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask, tmem_q=(tmem_Q[1] if _Q_TS else None))
             bars.mb_k_empty[state_b.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
             s_prod = advance(s_prod, CFG.S_SLOTS)
             q_full_phase = q_full_phase ^ 1
@@ -3014,11 +3154,11 @@ def _mma_item_pair_s2(
                 # BMM1 of both sub-tiles for THIS kv tile into the free slot (K[nb0] stage a, K[nb1] stage b), ahead of the previous tile's BMM2.
                 bars.mb_k_full[state_a.idx].wait(state_a.phase, spin=SPIN_RING_WAITS)
                 desc_K = sK[state_a.idx].desc()
-                elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask)
+                elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q0, desc_K, bars, 0, s_prod, mcast_mask, tmem_q=(tmem_Q[0] if _Q_TS else None))
                 bars.mb_k_empty[state_a.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 bars.mb_k_full[state_b.idx].wait(state_b.phase, spin=SPIN_RING_WAITS)
                 desc_K = sK[state_b.idx].desc()
-                elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask)
+                elect_p = _mma_bmm1_s2(bmm1_desc, tmem_base_i32, desc_Q1, desc_K, bars, 1, s_prod, mcast_mask, tmem_q=(tmem_Q[1] if _Q_TS else None))
                 bars.mb_k_empty[state_b.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)
                 s_prod = advance(s_prod, CFG.S_SLOTS)
 
@@ -3034,7 +3174,7 @@ def _mma_item_pair_s2(
                 s_cons = advance(s_cons, CFG.S_SLOTS)
 
             # Epilogue: BMM2 of the last kv tile for both sub-tiles (always runs -- n_kv >= 1); the Q slots are free.
-            if cutlass.const_expr(not IS_QO_ALIAS):
+            if cutlass.const_expr(not IS_QO_ALIAS and not _Q_TS):
                 elect_p = nvvm.elect_sync()
                 for qs in cutlass.range_constexpr(CFG.TILES_Q):
                     bars.mb_q_empty[qs].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA, pred=elect_p)

@@ -133,6 +133,8 @@ __all__ = [
     "sm107_softmax_wgs_pick",
     "SMALL_D_S_SLOTS",
     "sm107_s_slots_pick",
+    "SMALL_D_Q_IN_TMEM",
+    "sm107_q_in_tmem_pick",
     "sm107_f16_tile_width",
     "sm107_small_tile_leg",
     "D128FamilyTmemLayout",
@@ -938,6 +940,31 @@ def sm107_s_slots_pick(
     if int(tile_n) == SM107_SMALL_TILE_N_NARROW and int(d_flavor) in (32, 64) and int(dtype_qkv) > _DTYPE_E5M2 and not has_bias and not has_kv_mask:
         return 2
     return 1
+
+
+# ``_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS`` (the ``_S_SLOTS_OVERRIDE_FOR_SWEEPS`` rules: ``monkeypatch.setattr`` in a test or a sweep driver that resets
+# it to None; never a plan path, an import or a config) pins ``TemplateParams.q_in_tmem`` of a knob-less plan on the f16/bf16 32- / 64-wide
+# tiles: 1 = Q resident in TMEM (the MMA warp copies each sub-tile's Q SMEM -> TMEM once per n-step and runs BMM1 as an A-from-TMEM MMA; the
+# copy's commit releases the Q slab at the start of the step), None = the derived value (:func:`sm107_q_in_tmem_pick`: 0 until measured).
+# Read by :func:`sm107_q_in_tmem_pick`, which the adapter calls when it builds the record -- the value lands IN the TemplateParams, so the
+# template-module cache (keyed on the record alone) and the compiled-plan cache both see two kernels for the two forms; a pinned value is
+# returned VERBATIM, so a plan outside the arm's domain (d128, a quantized dtype, cga2, the 64-row tile, three warp groups) is a typed
+# factory raise, never a silent SMEM-Q rendering under a TMEM-Q label.  NOT in :func:`sweep_seam_state` (it moves a record field).
+_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+# The Q-operand forms the small-tile body is validated at: 0 (Q from SMEM, every committed record) and 1 (Q in TMEM).
+SMALL_D_Q_IN_TMEM = frozenset({0, 1})
+
+
+def sm107_q_in_tmem_pick(d_flavor: int, *, dtype_qkv: int = _DTYPE_BF16, request: Optional[int] = None) -> int:
+    """The ``TemplateParams.q_in_tmem`` a knob-less plan gets: ``request`` when the caller made one (returned verbatim; the factory validates
+    it), else the sweep seam ``_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS`` (verbatim, see its note), else **0 everywhere** -- the arm is UNMEASURED; its
+    A/B (Q from SMEM vs Q in TMEM on the f16/bf16 32- / 64-wide tiles' bias / kv_mask forms at S 256..768) decides whether a rule exists.
+    ``d_flavor`` / ``dtype_qkv`` are the adapter's facts (the rule, once measured, keys on them like :func:`sm107_s_slots_pick`)."""
+    if request is not None:
+        return int(request)
+    if _Q_IN_TMEM_OVERRIDE_FOR_SWEEPS is not None:
+        return int(_Q_IN_TMEM_OVERRIDE_FOR_SWEEPS)
+    return 0
 
 
 # The ONE-BATCH-ENTRY item at the 32-wide tile's cga1 STREAMS its bias wherever its ring fits, resident budget or not: the 256-row
@@ -1754,6 +1781,13 @@ class _CfgSm107:
     # softmax warps).  1 on every other BIAS_MODE (cluster (CTA_MMA, 1, 1), the collective geometry).  The kernel's CGA_SIZE (the
     # scheduler credit fan-out and the mb_read_tile_id count) multiplies by it; CGA_M / CGA_N / CTA_MMA stay 1 on this form.
     BIAS_MCAST_CTAS: int = 1
+    # Q resident in TMEM (TemplateParams.q_in_tmem; the f16/bf16 32- / 64-wide d128-file tiles at cga1 / TILE_M 128 / two sub-tiles): 0 = BMM1
+    # reads Q from SMEM through its descriptor on every kv tile (every seam folds on cutlass.const_expr(CFG.Q_IN_TMEM == 1), so 0 traces the
+    # committed instruction stream byte-for-byte), 1 = the MMA warp copies each sub-tile's Q tile SMEM -> TMEM once per n-step (tcgen05.cp
+    # 128x128b, Q_COLS / 4 calls through the same descriptor, one elect block) whose commit releases the Q slab (mb_q_empty) at the START of
+    # the step, and issues every BMM1 as an A-from-TMEM MMA.  The TMEM map gains Q_COLS = TILE_K x BPE / 4 columns per sub-tile after the
+    # last O slot (d128_family_tmem_layout.Q_OFF); no barrier object, no SMEM byte and no init count moves (_validate_q_in_tmem).
+    Q_IN_TMEM: int = 0
 
 
 @dataclass(frozen=True)
@@ -1832,6 +1866,11 @@ class D128FamilyTmemLayout:
     # S_OFF[qs] + p * S_SLOT_STRIDE (its P at P_OFF[qs] + p * S_SLOT_STRIDE); S_OFF / P_OFF name slot 0.
     S_SLOTS: int = 1
     S_SLOT_STRIDE: int = 0
+    # The A-from-TMEM Q slot of the TS arm (Cfg.Q_IN_TMEM): Q_COLS = TILE_K x BPE / 4 fp32 columns per sub-tile (two 16-bit elements per
+    # column: 16 / 32 at TILE_K 32 / 64), Q_OFF[qs] after the LAST O slot; computed on every record, read by the body and validated for the
+    # fit (Q end <= STATS_OFF) under the arm only -- STATS_OFF does not move, so every record without the arm keeps its map.
+    Q_OFF: Tuple[int, ...] = ()
+    Q_COLS: int = 0
 
 
 def d128_family_tmem_layout(cfg, *, stats_cols_per_subtile: int = 8) -> D128FamilyTmemLayout:
@@ -1860,6 +1899,11 @@ def d128_family_tmem_layout(cfg, *, stats_cols_per_subtile: int = 8) -> D128Fami
     p_off = tuple(s + cfg.TILE_N - p_width for s in s_off)
     o_base = cfg.TILES_Q * n_slots * cfg.TILE_N
     o_off = tuple(o_base + qs * cfg.TILE_O for qs in range(cfg.TILES_Q))
+    # The TS arm's Q slots (Cfg.Q_IN_TMEM; read through getattr so the quantized siblings' Cfg classes keep their map): TILE_K x BPE / 4
+    # columns per sub-tile after the last O slot -- the d512 f16 kernel's Q_TMEM_COLS == TILE_K / 2 at BPE 2.
+    q_cols = (cfg.TILE_K * cfg.BPE) // 4
+    q_base = o_off[-1] + cfg.TILE_O
+    q_off = tuple(q_base + qs * q_cols for qs in range(cfg.TILES_Q))
     return D128FamilyTmemLayout(
         TOTAL_COLS=TMEM_TOTAL_COLS,
         S_OFF=s_off,
@@ -1869,6 +1913,8 @@ def d128_family_tmem_layout(cfg, *, stats_cols_per_subtile: int = 8) -> D128Fami
         STATS_COLS_PER_SUBTILE=stats_cols_per_subtile,
         S_SLOTS=n_slots,
         S_SLOT_STRIDE=cfg.TILE_N if n_slots > 1 else 0,
+        Q_OFF=q_off,
+        Q_COLS=q_cols,
     )
 
 
@@ -2459,6 +2505,70 @@ def _validate_bias(cfg, flavor: str) -> None:
     _check(preds)
 
 
+def _validate_q_in_tmem(cfg, flavor: str) -> None:
+    """Q resident in TMEM (Cfg.Q_IN_TMEM) and everything the d128-file body couples to it (frost-kernels.md s 3 / s 6, sdpa-invariants s 6): the
+    Q slots' place in the TMEM map, the ``tcgen05.cp 128x128b`` geometry the MMA warp issues (``Q_COLS / 4`` calls of 16 B per lane, each a
+    4-column destination), the dtype the column count assumes, and the one body geometry the arm was audited on -- cga1, the 128-row tile,
+    two sub-tiles.  Every message names the failure the predicate prevents."""
+    q = int(getattr(cfg, "Q_IN_TMEM", 0))
+    lay = d128_family_tmem_layout(cfg)
+    preds = [
+        (q in SMALL_D_Q_IN_TMEM, f"{flavor}: Q_IN_TMEM must be 0 (Q from SMEM, every committed record) or 1 (Q resident in TMEM); got {q}"),
+    ]
+    if q:
+        preds += [
+            (
+                cfg.DTYPE_QKV in (_DTYPE_BF16, _DTYPE_FP16),
+                f"{flavor}: Q in TMEM packs two 16-bit elements per fp32 column (Q_COLS = TILE_K x BPE / 4 = {lay.Q_COLS}); a 4-byte Q is a different column "
+                f"count and a different A-operand k-step advance (DTYPE_QKV={cfg.DTYPE_QKV}); Rubin has no TF32 prefill kernel",
+            ),
+            (
+                cfg.TILE_K <= 64,
+                f"{flavor}: Q in TMEM is wired on the f16/bf16 32- / 64-wide tiles only (TILE_K={cfg.TILE_K}): at TILE_K 128 the Q slots end at column "
+                f"{lay.Q_OFF[-1] + lay.Q_COLS}, past the STATS region at {lay.STATS_OFF} (the committed d128 rendering keeps its record)",
+            ),
+            (
+                cfg.TILE_M == 128,
+                f"{flavor}: the tcgen05.cp 128x128b shape copies 128 rows per call; the {cfg.TILE_M}-row Q tile needs the 64x128b shape, which no lane has "
+                f"pinned -- Q in TMEM is declined on the 64-row tile until it is",
+            ),
+            (
+                cfg.CTA_MMA == 1,
+                f"{flavor}: a tcgen05.cp.cta_group::2 is the cluster SELF-FILL form (both CTAs' MMA warps issue it, each copies its own SMEM); the arm was "
+                f"audited at cga1 only (CTA_MMA={cfg.CTA_MMA})",
+            ),
+            (
+                cfg.TILES_Q == 2 and cfg.SOFTMAX_WARPGROUPS == 2,
+                f"{flavor}: Q in TMEM serves the two-sub-tile body (TILES_Q={cfg.TILES_Q}, SOFTMAX_WARPGROUPS={cfg.SOFTMAX_WARPGROUPS}): the third softmax "
+                f"warp group's third Q slot and third UTCCP block are outside the arm's census",
+            ),
+            (
+                int(getattr(cfg, "QO_ALIAS", 0)) == 0,
+                f"{flavor}: under the Q u O alias the TMA-STG warp gates the Q reload (mb_q_o_alias), not the MMA commit the early release moves; the alias "
+                f"is not served with Q in TMEM",
+            ),
+            (
+                not (cfg.THD_VARLEN or cfg.SPLIT_KV > 1 or cfg.PACK_GQA or cfg.EPILOGUE_GATE),
+                f"{flavor}: Q in TMEM serves dense, unsplit, non-PackGQA, ungated graphs only (the small-tile rows' own gates)",
+            ),
+            (
+                (cfg.TILE_K * cfg.BPE) % 16 == 0 and lay.Q_COLS % 4 == 0 and (cfg.TILE_M * cfg.TILE_K * cfg.BPE) % (128 * 16) == 0,
+                f"{flavor}: the Q tile must be whole 128x128b UTCCP calls (16 B per lane x 128 lanes = 4 fp32 columns each): TILE_K x BPE = {cfg.TILE_K * cfg.BPE} B "
+                f"per row, Q_COLS={lay.Q_COLS}",
+            ),
+            (
+                lay.Q_OFF[-1] + lay.Q_COLS <= lay.STATS_OFF,
+                f"{flavor}: the Q slots {lay.Q_OFF} (+{lay.Q_COLS}) must end at or before the STATS region (column {lay.STATS_OFF} of {lay.TOTAL_COLS}): a Q slot under "
+                f"the softmax stats is the alpha / (max, sum) store of a sub-tile overwriting BMM1's own operand",
+            ),
+            (
+                all(off % 8 == 0 for off in lay.Q_OFF),
+                f"{flavor}: the A-from-TMEM operand advances 8 columns per 16-wide k-step, so every Q slot base must be 8-column aligned (got {lay.Q_OFF})",
+            ),
+        ]
+    _check(preds)
+
+
 def _validate_softmax_wgs(cfg, flavor: str) -> None:
     """The softmax warp-group count and everything the d128-file body couples to it (frost-kernels.md s2 / s4, sdpa-invariants s6): one
     group per Q sub-tile, the warp table, the scheduler credit count, the register split against the launch's entry pool, and the
@@ -2550,6 +2660,16 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     if s_slots != 1 and (params.dtype_qkv <= _DTYPE_E5M2 or mxfp8 or tile_k > 64):
         raise ValueError(
             f"{flavor}: s_slots = {s_slots} (the double-buffered S) is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep 1)"
+        )
+    # Q resident in TMEM (TemplateParams.q_in_tmem, appended; getattr so a record without the field renders Q from SMEM): the f16/bf16
+    # small tiles at cga1 / TILE_M 128 / two sub-tiles -- _validate_q_in_tmem pins every coupling (the TMEM fit, the UTCCP geometry, the dtype).
+    q_in_tmem = int(getattr(params, "q_in_tmem", 0))
+    if q_in_tmem not in SMALL_D_Q_IN_TMEM:
+        raise ValueError(f"{flavor}: q_in_tmem must be 0 (Q from SMEM) or 1 (Q resident in TMEM); got {q_in_tmem}")
+    if q_in_tmem and (params.dtype_qkv <= _DTYPE_E5M2 or mxfp8 or tile_k > 64):
+        raise ValueError(
+            f"{flavor}: q_in_tmem=1 (Q resident in TMEM) is wired on the f16/bf16 32- / 64-wide tiles only (the quantized and d128 renderings keep Q in SMEM: "
+            f"at TILE_K 128 the Q slots would end at column {2 * 128 + 2 * 128 + 2 * 64} of the 576, past the STATS region)"
         )
     bias_mode = int(getattr(params, "bias_mode", 0))
     kv_mask_form = int(getattr(params, "kv_mask_form", 0))
@@ -2740,6 +2860,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
         STAGES_BIAS=stages_bias,
         BIAS_MAX_FORM=bias_max_form,
         S_SLOTS=s_slots,
+        Q_IN_TMEM=q_in_tmem,
         # The multicast ring's cluster extent along the chunk axis (its fan-out); 1 everywhere else -- _validate_bias pins the coupling.
         BIAS_MCAST_CTAS=BIAS_MCAST_CTAS if bias_mode == BIAS_MODE_STREAMED_MULTICAST else 1,
     )
@@ -2751,6 +2872,7 @@ def _make_cfg_d128_family(params: TemplateParams, *, flavor: str, tile_k: int, t
     _validate_swizzles(cfg, flavor)
     _validate_head_dim_tile(cfg, flavor)
     _validate_tile_n(cfg, flavor)
+    _validate_q_in_tmem(cfg, flavor)
     _validate_masks(cfg, flavor)
     _validate_bias(cfg, flavor)
     _validate_smem(cfg, flavor, qo_alias=bool(cfg.QO_ALIAS), bias_bytes=bias_resident_block_bytes(cfg))

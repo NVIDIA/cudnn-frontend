@@ -63,9 +63,10 @@ def test_the_field_is_appended_the_seam_is_private_and_the_record_default_is_one
     from cudnn.sdpa.fwd import config_sm107 as c
     from cudnn.sdpa.fwd.config_sm100 import TemplateParams
 
-    assert [f.name for f in dataclasses.fields(TemplateParams)][
-        -1
-    ] == "s_slots" and TemplateParams().s_slots == 1, "append-only; 1 renders every record byte-identically"
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-2:] == [
+        "s_slots",
+        "q_in_tmem",
+    ] and TemplateParams().s_slots == 1, "append-only; 1 renders every record byte-identically"
     assert c._S_SLOTS_OVERRIDE_FOR_SWEEPS is None, "the seam is a per-test / per-sweep pin, never a module default"
     assert c.SMALL_D_S_SLOTS == frozenset({1, 2}) and "SMALL_D_S_SLOTS" in c.__all__ and "sm107_s_slots_pick" in c.__all__
     assert c._CfgSm107.S_SLOTS == 1

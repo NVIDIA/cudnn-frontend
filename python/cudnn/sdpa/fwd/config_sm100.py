@@ -342,6 +342,15 @@ class TemplateParams:
     # cache keys on this record alone, so a process that builds both forms must see two records.  Picked by
     # config_sm107.sm107_s_slots_pick; validated by the factory (TILE_N 64, the small f16/bf16 tiles, the TMEM fit).
     s_slots: int = 1
+    # Q resident in TMEM (the Rubin f16/bf16 32- / 64-wide d128-file tiles; every other template ignores it): 0 = BMM1 reads Q from
+    # SMEM through its descriptor on every kv tile (every record so far renders byte-identically), 1 = the MMA warp copies each
+    # sub-tile's Q tile SMEM -> TMEM once per n-step (``tcgen05.cp 128x128b`` through the same descriptor, one elect block) and issues
+    # every BMM1 of the step as an A-from-TMEM ``tcgen05.mma``; the UTCCP's commit releases the Q SMEM slab (``mb_q_empty``) at the START of
+    # the step instead of after its last BMM1, so the TMA-LDG warp prefetches the next step's Q / K / V during the current kv loop.  The
+    # same MMAs over the same operands in the same k-step order: O and Stats are BITWISE the SMEM-Q kernel's.  A template-key field (the
+    # TMEM map gains the Q slots, the MMA form and the commit site move): the template-module cache keys on this record alone.  Picked by
+    # config_sm107.sm107_q_in_tmem_pick (0 until measured; the sweep seam pins 1); validated by the factory (config_sm107._validate_q_in_tmem).
+    q_in_tmem: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any

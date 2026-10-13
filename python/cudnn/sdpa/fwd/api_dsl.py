@@ -79,6 +79,7 @@ from cudnn.sdpa.fwd.config_sm107 import sm107_bias_max_form_pick as _sm107_bias_
 from cudnn.sdpa.fwd.config_sm107 import sm107_softmax_wgs_pick as _sm107_softmax_wgs_pick
 from cudnn.sdpa.fwd.config_sm107 import SMALL_D_SOFTMAX_WGS as _SMALL_D_SOFTMAX_WGS
 from cudnn.sdpa.fwd.config_sm107 import sm107_s_slots_pick as _sm107_s_slots_pick
+from cudnn.sdpa.fwd.config_sm107 import sm107_q_in_tmem_pick as _sm107_q_in_tmem_pick
 from cudnn.sdpa.fwd.config_sm107 import sm107_pair_item_active as _sm107_pair_item_active
 from cudnn.sdpa.fwd.config_sm107 import sm107_tile_n_pick as _sm107_tile_n_pick
 from cudnn.sdpa.fwd.config_sm107 import epilogue_gate_layout_declarable as _epilogue_gate_layout_declarable
@@ -1737,6 +1738,14 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             return _sm107_s_slots_pick(self.flavor[0], self._effective_tile_n(), has_bias=self.bias_desc is not None, has_kv_mask=self.kv_mask_desc is not None)
         return 1
 
+    def _q_in_tmem(self) -> int:
+        """The ``TemplateParams.q_in_tmem`` of this plan: 0 everywhere but the Rubin 32- / 64-wide f16/bf16 tiles, where
+        ``config_sm107.sm107_q_in_tmem_pick`` decides (0 until the arm is measured; the sweep seam's value verbatim, which the factory validates
+        against the arm's domain: cga1, the 128-row tile, two sub-tiles, the TMEM fit)."""
+        if self.flavor in _SM107_F16_SMALL_D_SHAPES and self._device_cc == (10, 7) and not self._fp8:
+            return _sm107_q_in_tmem_pick(self.flavor[0])
+        return 0
+
     def _resident_arm_bias_stages(self) -> int:
         """The ``TemplateParams.bias_stages`` of this plan: 0 off the streamed ring; else the request (``bias_stages=``, validated by
         ``check_support``) or the derived deepest ring (``config_sm107.sm107_bias_stages_pick``)."""
@@ -3228,6 +3237,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # config_sm107.sm107_s_slots_pick -- the measured rule (2 on the plain TILE_N 64 body, else 1), or the sweep seam's value verbatim
             # (a typed factory raise off its domain).
             s_slots=self._s_slots(),
+            # Q resident in TMEM (0 on every record so far; 1 = the MMA warp's once-per-step SMEM -> TMEM copy of Q and the A-from-TMEM BMM1 on the
+            # Rubin small tiles): config_sm107.sm107_q_in_tmem_pick -- 0 until measured, or the sweep seam's value verbatim (a typed factory raise off its domain).
+            q_in_tmem=self._q_in_tmem(),
             fused_ldtm_stat=fused_ldtm_stat,
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,

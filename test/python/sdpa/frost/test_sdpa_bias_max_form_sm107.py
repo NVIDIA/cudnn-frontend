@@ -75,7 +75,7 @@ def test_template_params_and_cfg_are_appended():
 
     names = [f.name for f in dataclasses.fields(TemplateParams)]
     # appended after the two tail / quiet forms; the third softmax warp group's count (softmax_wgs, test_sdpa_softmax_wgs_sm107.py) after it
-    assert names[-5:] == ["padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots"], names[-7:]
+    assert names[-6:] == ["padded_tail_form", "dead_subtile_quiet", "bias_max_form", "softmax_wgs", "s_slots", "q_in_tmem"], names[-8:]
     assert TemplateParams().bias_max_form == 0
     assert c.BIAS_MAX_SOFTWARE == 0 and c.BIAS_MAX_HW_UPPER_BOUND == 1 and c.BIAS_MAX_FORMS == frozenset({0, 1})
     # the record field defaults to 0 whatever the arm: a record without the field renders the software tree byte-identically

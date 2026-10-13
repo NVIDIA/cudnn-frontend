@@ -434,7 +434,7 @@ def test_template_params_and_capabilities_are_appended():
 
     p = TemplateParams()
     assert (p.bias_mode, p.kv_mask_form, p.tile_n) == (0, 0, 128)
-    assert [f.name for f in dataclasses.fields(TemplateParams)][-10:] == [
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-11:] == [
         "bias_mode",
         "kv_mask_form",
         "tile_n",
@@ -445,6 +445,7 @@ def test_template_params_and_capabilities_are_appended():
         "bias_max_form",  # the row-max form of the bias / kv_mask body (test_sdpa_bias_max_form_sm107.py)
         "softmax_wgs",  # the third softmax warp group of the TILE_N-64 pair item, default 2
         "s_slots",  # the double-buffered S of the small tiles at TILE_N 64 (default 1)
+        "q_in_tmem",  # Q resident in TMEM on the small tiles (default 0; test_sdpa_q_in_tmem_sm107.py)
     ]  # appended in that order
     assert (p.padded_tail_form, p.dead_subtile_quiet, p.softmax_wgs, p.s_slots) == (
         0,
