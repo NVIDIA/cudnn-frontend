@@ -426,7 +426,9 @@ def make_classic_bars(
         raise ValueError(f"make_classic_bars: bias_ring_stages must be >= 0 (got {bias_ring_stages})")
     if bias_ring_empty_arrivers is not None and (not bias_ring_stages or int(bias_ring_empty_arrivers) < 1):
         raise ValueError(f"make_classic_bars: bias_ring_empty_arrivers={bias_ring_empty_arrivers} needs a ring (bias_ring_stages={bias_ring_stages}) and >= 1")
-    ring_empty_count = CFG.BIAS_EMPTY_ARRIVERS if bias_ring_empty_arrivers is None else int(bias_ring_empty_arrivers)
+    # Read CFG.BIAS_EMPTY_ARRIVERS only when a bias form asks for it: the shared SM100 bodies (the d128 decode tile, the
+    # SM100 prefill files) build their bars through this factory with Cfg records that carry no bias fields.
+    ring_empty_count = int(bias_ring_empty_arrivers) if bias_ring_empty_arrivers is not None else (CFG.BIAS_EMPTY_ARRIVERS if bias_ring_stages else 0)
     # ``epilogue_gate``: same two LOCAL gate barriers as make_d256_bars (table
     # there); no classic (d128/d192) kernel passes True yet, so today every
     # caller gets None and traces unchanged.  The init counts (ONE_LANE /
