@@ -127,13 +127,67 @@ def test_stack_projection_weights_follows_the_cueq_row_convention():
 
 @pytest.mark.parametrize(
     "kw",
-    [dict(k=100), dict(k=0), dict(c_out=64), dict(c_out=0), dict(passes=0), dict(eps=0.0), dict(pass_order="zigzag"), dict(pass_order="interleaved", passes=3)],
+    [
+        dict(k=100),
+        dict(k=0),
+        dict(c_out=64),
+        dict(c_out=0),
+        dict(passes=0),
+        dict(eps=0.0),
+        dict(pass_order="zigzag"),
+        dict(pass_order="interleaved", passes=3),
+        # the LayerNorm-once work item (T27): its vocabulary, and the forms it cannot combine with (stated in the substrate's validator)
+        dict(ln_once="tile"),
+        dict(ln_once="block", pass_order="interleaved"),
+        dict(ln_once="block", prefetch_a_l2=True),
+        dict(ln_once="block", diag="ln_first_tile_only"),
+        dict(ln_once="passes", passes=3),
+    ],
 )
 def test_params_validation_declines_typed(kw):
     with pytest.raises(ValueError):
         sub.validate_ln_dual_gemm_params(sub.LnDualGemmParams(**kw))
     with pytest.raises(TypeError):
         sub.validate_ln_dual_gemm_params(object())
+
+
+def test_ln_once_item_and_region_slots_are_the_substrate_rule_and_agree_with_the_body():
+    """The LayerNorm-once lever's derived geometry (one source, `ln_prologue`): the tiles per work item = passes x N tiles ("block") or passes
+    ("passes"), a one-tile item a typed decline; the resident A region is double-buffered where two slots plus the shipped B ring fit in the shipped
+    A/B ring's bytes (K1 at both widths), single-buffered where they do not (K3 at c 256: 2 operands x 4 stages x 2 slots would leave one B stage);
+    and the ring depth / stage bytes the predicate reads are the BODY's constants (a drift here would size the region against a ring the body no
+    longer has).  Host-only (the body module is executed, not compiled)."""
+    from cudnn.frost.template_loader import load_template
+    from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
+
+    p128 = k1.proj_params(128, 128, has_bias=True, has_mask=True, ln_once="block")
+    p256 = k1.proj_params(256, 256, has_bias=True, has_mask=True, ln_once="block")
+    p256p = k1.proj_params(256, 256, has_bias=True, has_mask=True, ln_once="passes")
+    t256 = k3.tail_params(256, 256, has_bias=True, ln_once="block")
+    for p in (p128, p256, p256p, t256):
+        sub.validate_ln_dual_gemm_params(p)
+    assert (sub.ln_once_tiles_per_item(p128), sub.ln_once_tiles_per_item(p256), sub.ln_once_tiles_per_item(p256p), sub.ln_once_tiles_per_item(t256)) == (
+        2,
+        4,
+        2,
+        2,
+    )
+    assert (sub.ln_once_a_slots(p128), sub.ln_once_a_slots(p256), sub.ln_once_a_slots(p256p), sub.ln_once_a_slots(t256)) == (2, 2, 2, 1)
+    off = k1.proj_params(256, 256, has_bias=True, has_mask=True)
+    assert sub.ln_once_tiles_per_item(off) == 1 and sub.ln_once_a_slots(off) == 0 and off.ln_once == "" and sub.LnDualGemmParams().ln_once == ""
+    with pytest.raises(ValueError, match="ONE GEMM tile"):
+        sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, ln_once="block"))  # one N tile x one pass
+    with pytest.raises(ValueError, match="ONE GEMM tile"):
+        sub.validate_ln_dual_gemm_params(k3.tail_params(256, 256, has_bias=True, ln_once="passes"))  # one pass
+    # the body's ring depth and per-stage operand bytes, per arm, are what the SMEM predicate reads
+    for p, pairing in ((k1.proj_params(128, 128, has_bias=True, has_mask=True), "columns"), (k3.tail_params(256, 256, has_bias=True), "accumulators")):
+        mod = load_template(sub.body_path("sm107"), p, tag="t27_ring_pin")
+        assert mod.ab_stages == sub.RING_STAGES[pairing], (pairing, mod.ab_stages)
+        assert (
+            mod.cta_tile_mnk[0] * mod.cta_tile_mnk[2] * 2 == sub.A_STAGE_BYTES and mod.cta_tile_mnk[1] * mod.cta_tile_mnk[2] * 2 == sub.B_STAGE_BYTES[pairing]
+        )
+        assert (mod.num_a_operands, mod.num_b_operands) == (p.num_a_operands, p.num_b_operands)
+        assert mod.ab_stages * (mod.num_a_operands * sub.A_STAGE_BYTES + mod.num_b_operands * sub.B_STAGE_BYTES[pairing]) == 288 * 1024
 
 
 def test_body_path_names_one_rendered_body_per_arch():

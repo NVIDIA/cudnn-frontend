@@ -52,6 +52,7 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+from cudnn.gemm.frost.ln_prologue import ln_once_tiles_per_item as _ln_once_tiles_per_item
 
 from . import heuristics as th
 from .heuristics import TriMulKnobs  # noqa: F401  -- re-exported: the knob record a caller hands to the constructor
@@ -428,6 +429,16 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         # projection stage alone
         return self.knobs.ln_pass_form if self.knobs.k3_prologue == "mn_major" else "registers"
 
+    def _k3_ln_once(self) -> str:
+        """The output stage's LayerNorm-once work item: the knob's value where the item spans at least two GEMM tiles there (one pass, so
+        ``"block"`` at two N tiles = c = 256), else today's per-tile item -- the substrate declines a one-tile item (K3 at c = 128; ``"passes"``
+        under one pass), so the knob's value serves the projection stage alone on those plans.  GPU-free (pinned by the API tests)."""
+        form = self.knobs.ln_once or ""
+        if not form:
+            return ""
+        trial = k3.tail_params(self.c_z, self.c, has_bias=self.has_out_bias, want_stats=False, a0_prologue=self.knobs.k3_prologue, ln_once=form)
+        return form if _ln_once_tiles_per_item(trial) >= 2 else ""
+
     def _register_split_hints(self) -> Tuple[int, int]:
         """The `.minnctapersm` launch hint of (K1, K3): the caller's `min_blocks_per_mp` override for both stages, else the per-RENDERING rule with
         each stage's own bias flag, LayerNorm form and (K1) tile order (`heuristics.register_split_hint`: whether a rendering spills at the flat
@@ -454,6 +465,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         # (parameter set, device) -- :func:`_substrate_plan_on`, :func:`_compile_contraction`.
         k3_ln_pass_form = self._k3_ln_pass_form()
         k1_hint, k3_hint = self._register_split_hints()
+        k1_ln_once, k3_ln_once = self.knobs.ln_once or "", self._k3_ln_once()
         with torch.cuda.device(self.device_index):
             self._plan_k1 = _substrate_plan_on(
                 k1.build_trimul_proj,
@@ -469,6 +481,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                     ln_pass_form=self.knobs.ln_pass_form,
                     epi_math=self.knobs.epi_math,
                     min_blocks_per_mp=k1_hint,
+                    ln_once=k1_ln_once,
                 ),
                 self.device_index,
             )
@@ -485,6 +498,7 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
                     ln_pass_form=k3_ln_pass_form,
                     epi_math=self.knobs.epi_math,
                     min_blocks_per_mp=k3_hint,
+                    ln_once=k3_ln_once,
                 ),
                 self.device_index,
             )

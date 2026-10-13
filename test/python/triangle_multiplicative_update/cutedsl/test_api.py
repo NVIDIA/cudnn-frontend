@@ -688,6 +688,22 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     for form in LN_PASS_FORMS:
         th.validate_knobs(th.TriMulKnobs(ln_pass_form=form).merged_over(th.recommend(512, 256, 1)))
     assert "smem_rolled_pf" in LN_PASS_FORMS and set(LN_PASS_FORMS_REORDERED) == {"smem_rolled_tree"} <= set(LN_PASS_FORMS)
+    # the LayerNorm-once work item (wave 2, T27): a geometry axis every pick carries (OFF until its A/B/A lands a bucket default); the vocabulary is
+    # the substrate's and typed; the output stage takes "block" at two N tiles only (c = 256) and keeps today's item elsewhere -- the API's builder
+    from cudnn.gemm.frost.ln_prologue import LN_ONCE_FORMS
+
+    assert LN_ONCE_FORMS == ("", "block", "passes")
+    for form in LN_ONCE_FORMS:
+        th.validate_knobs(th.TriMulKnobs(ln_once=form).merged_over(th.recommend(512, 256, 1)))
+    with pytest.raises(ValueError, match="ln_once"):
+        th.validate_knobs(th.TriMulKnobs(ln_once="tile"))
+    assert th.resolve(512, 256, 1, "outgoing", knobs=th.TriMulKnobs(ln_once="block")).ln_once == "block"
+    assert (
+        tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512, cz=256), "outgoing", c_hidden=256, knobs=tapi.TriMulKnobs(ln_once="block"))._k3_ln_once() == "block"
+    )
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512, cz=256), "outgoing", c_hidden=256, knobs=tapi.TriMulKnobs(ln_once="passes"))._k3_ln_once() == ""
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128, knobs=tapi.TriMulKnobs(ln_once="block"))._k3_ln_once() == ""
+    assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=512), "outgoing", c_hidden=128)._k3_ln_once() == ""
     # the refinement table: one axis per row, the keys disjoint on that axis, every (floor, batch bucket) a real bucket of the width
     for width, rows in th._REFINEMENTS.items():
         floors = {f for f, _ in th._PICKS[width]}
@@ -696,7 +712,7 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
             assert floor in floors and bb in th.BATCH_BUCKETS and direction in (None, "outgoing", "incoming")
             axes = [
                 a
-                for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "k_block", "ln_pass_form", "epi_math", "min_blocks_per_mp")
+                for a in ("k2_tile", "k1_pass_order", "k3_prologue", "clc_stages", "k_block", "ln_pass_form", "epi_math", "min_blocks_per_mp", "ln_once")
                 if getattr(override, a) is not None
             ]
             assert len(axes) == 1, (width, floor, bb, direction, axes)
@@ -779,12 +795,20 @@ def test_heuristics_table_is_total_in_domain_and_resolvable():
     assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs()) == base  # an empty record changes nothing
     assert th.resolve(512, 128, 1, "outgoing") == base
     full = th.TriMulKnobs(
-        k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4, k_block=128, ln_pass_form="smem", epi_math="scalar"
+        k2_tile=k2.SMALL_N_TILE_CONFIG,
+        k1_pass_order="major",
+        k3_prologue="mn_major",
+        clc_stages=4,
+        k_block=128,
+        ln_pass_form="smem",
+        epi_math="scalar",
+        ln_once="",
     )
     assert full.is_complete() and th.resolve(512, 128, 1, "outgoing", knobs=full) == full  # a complete record replaces every axis
+    assert not replace(full, ln_once=None).is_complete()  # the LayerNorm-once item is a geometry axis of the record (T27)
     four = th.TriMulKnobs(k2_tile=k2.SMALL_N_TILE_CONFIG, k1_pass_order="major", k3_prologue="mn_major", clc_stages=4)
     assert not four.is_complete() and th.resolve(512, 128, 1, "outgoing", knobs=four) == replace(
-        four, k_block=256, ln_pass_form=base.ln_pass_form, epi_math=base.epi_math
+        four, k_block=256, ln_pass_form=base.ln_pass_form, epi_math=base.epi_math, ln_once=base.ln_once
     )  # the row tile from the rule, the two forms from the table
     assert th.resolve(512, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4), k2_tile=k2.SMALL_N_TILE_CONFIG) == replace(
         base, clc_stages=4, k2_tile=k2.SMALL_N_TILE_CONFIG

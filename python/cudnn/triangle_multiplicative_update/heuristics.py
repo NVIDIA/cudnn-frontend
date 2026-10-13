@@ -27,6 +27,12 @@ function and stay op attributes the API never sets.
                      axis only: ``None`` (the table never sets it) means the per-RENDERING rule :func:`register_split_hint`, applied at compile
                      time with each stage's bias flag, because the fact it answers -- does this rendering spill at the flat allocation? -- is a
                      property of (kernel, width, bias arm, LayerNorm / epilogue form), not of N or B.
+  ``ln_once``        the two LayerNorm-prologue stages' work item (:data:`LN_ONCE_FORMS`: ``""`` = one GEMM tile, the row block's A rows re-streamed
+                     and re-normalised per (pass, N tile); ``"block"`` = the whole row block held resident in SMEM and LayerNormed ONCE across its
+                     passes x N tiles; ``"passes"`` = (row block, one N tile) across the passes -- the finer persistent tail for small N; bitwise the
+                     same output).  The output stage runs one pass, so it takes ``"block"`` at c = 256 only (two N tiles) and keeps today's item
+                     elsewhere (the substrate's typed decline of a one-tile item, resolved in the API's stage-parameter builder, stated); a geometry
+                     axis of the table (the persistent tail is a function of N and B), OFF in every pick until its A/B/A lands a per-bucket default.
 
 :func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class, keyed by hidden width ``c``,
 N bucket, batch bucket and direction: a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
@@ -50,6 +56,7 @@ from cudnn.gemm.frost.ln_prologue import (
     A0_PROLOGUES,
     EPI_MATHS,
     EPI_MATHS_PACKED,
+    LN_ONCE_FORMS,
     LN_PASS_FORMS,
     MIN_BLOCKS_PER_MP_DOMAIN,
     MIN_K_BLOCK_MN_MAJOR,
@@ -98,9 +105,12 @@ class TriMulKnobs:
     #: appended (2026-10-13): the two stages' ``.minnctapersm`` launch hint -- an OVERRIDE axis the table never sets: ``None`` = the per-rendering
     #: rule :func:`register_split_hint` (keyed by each stage's bias flag at compile time), so it is not one of the geometry axes ``is_complete`` names
     min_blocks_per_mp: Optional[int] = None
+    #: appended (2026-10-13, wave 2): the two stages' LayerNorm-once-per-row-block work item (:data:`LN_ONCE_FORMS`; "" = today's per-tile item) -- a
+    #: GEOMETRY axis (the persistent tail it coarsens is a function of N and B), so ``is_complete`` names it and every pick carries a value
+    ln_once: Optional[str] = None
 
     def is_complete(self) -> bool:
-        return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages, self.k_block, self.ln_pass_form, self.epi_math)
+        return None not in (self.k2_tile, self.k1_pass_order, self.k3_prologue, self.clc_stages, self.k_block, self.ln_pass_form, self.epi_math, self.ln_once)
 
     def merged_over(self, base: "TriMulKnobs") -> "TriMulKnobs":
         """This record's SET axes over ``base`` (the unset ones keep the base's values)."""
@@ -113,6 +123,7 @@ class TriMulKnobs:
             ln_pass_form=self.ln_pass_form if self.ln_pass_form is not None else base.ln_pass_form,
             epi_math=self.epi_math if self.epi_math is not None else base.epi_math,
             min_blocks_per_mp=self.min_blocks_per_mp if self.min_blocks_per_mp is not None else base.min_blocks_per_mp,
+            ln_once=self.ln_once if self.ln_once is not None else base.ln_once,
         )
 
 
@@ -139,6 +150,11 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
         raise ValueError(
             f"min_blocks_per_mp must be one of {MIN_BLOCKS_PER_MP_DOMAIN} (the two LayerNorm-prologue stages' .minnctapersm launch hint: 0 = the rendering "
             f"as shipped, 1 = ptxas honours the body's register split), got {knobs.min_blocks_per_mp!r}"
+        )
+    if knobs.ln_once is not None and knobs.ln_once not in LN_ONCE_FORMS:
+        raise ValueError(
+            f"ln_once must be one of {LN_ONCE_FORMS} (the two LayerNorm-prologue stages' work item: '' = one GEMM tile, 'block' = the row block "
+            f"LayerNormed once across its passes x N tiles, 'passes' = across its passes at one N tile), got {knobs.ln_once!r}"
         )
 
 
@@ -186,10 +202,17 @@ def validate_knobs(knobs: TriMulKnobs) -> None:
 # The tree form (`"smem_rolled_tree"`: the pipelined form with four partial sums per statistics pass -- a different fp32 ORDER, LN_PASS_FORMS_REORDERED)
 # adds +0.2..+3.5 % on top (K3 c 256 +25.0..+25.3 % vs the pick with the biases, +32.5..+36.0 % without; K1 c 256 +5.3..+6.1 %) and is NEVER a pick of
 # this table: a caller's knob, reported with its oracle distance.
-def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str) -> TriMulKnobs:
-    """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`)."""
+def _pick(k2_tile: str, k1_pass_order: str, k3_prologue: str, clc_stages: int, ln_pass_form: str, epi_math: str, ln_once: str = "") -> TriMulKnobs:
+    """One COMPLETE bucket pick in axis order (the row tile ``k_block`` is left to :func:`default_k_block`; the LayerNorm-once item ``ln_once`` is OFF
+    unless a bucket's A/B/A set it)."""
     return TriMulKnobs(
-        k2_tile=k2_tile, k1_pass_order=k1_pass_order, k3_prologue=k3_prologue, clc_stages=clc_stages, ln_pass_form=ln_pass_form, epi_math=epi_math
+        k2_tile=k2_tile,
+        k1_pass_order=k1_pass_order,
+        k3_prologue=k3_prologue,
+        clc_stages=clc_stages,
+        ln_pass_form=ln_pass_form,
+        epi_math=epi_math,
+        ln_once=ln_once,
     )
 
 

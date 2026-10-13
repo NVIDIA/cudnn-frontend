@@ -63,6 +63,9 @@ requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the LN-prologue du
         dict(pairing="columns", affine_fold=True),
         dict(pairing="columns", fuse_residual=True),
         dict(a0_prologue="ldmatrix"),
+        # the LayerNorm-once work item (T27) under the accumulators arm: one pass, so "passes" is a one-tile item, and so is "block" at c_out 128
+        dict(pairing="accumulators", a0_major="mn", has_mask=False, skip_masked_tiles=False, passes=1, c_out=256, k=256, ln_once="passes"),
+        dict(pairing="accumulators", a0_major="mn", has_mask=False, skip_masked_tiles=False, passes=1, c_out=128, k=128, ln_once="block"),
     ],
 )
 def test_accumulators_arm_declines_typed(kw):

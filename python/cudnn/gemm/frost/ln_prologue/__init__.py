@@ -106,6 +106,22 @@ EPI_MATHS_PACKED = ("packed", "packed_hoist", "packed_biasfold")
 #: body's ``setmaxnreg`` split and allocates one flat count per warp), 1 = the hint under which ptxas honours the split -- the kernel is one CTA
 #: per SM by its SMEM footprint either way (:class:`LnDualGemmParams`).  2 or more would cap the allocation at 80 registers: refused.
 MIN_BLOCKS_PER_MP_DOMAIN = (0, 1)
+#: The LayerNorm-ONCE-per-row-block lever (performance only; bitwise by construction: the same normalised bf16 words feed every GEMM tile of the
+#: work item, where today each tile recomputes them from the same input).  ``""`` = today's work item, one GEMM tile (the A rows re-streamed and
+#: re-normalised once per (pass, N tile): 4x at K1 c_out 256, 2x at K1 c_out 128 and K3 c_out 256); ``"block"`` = the work item is the whole row
+#: block -- every pass x every N tile -- with the A operand(s) resident in SMEM across them and LayerNormed once; ``"passes"`` = the item is (row
+#: block, ONE N tile) across the passes (a finer persistent tail for small N; the LayerNorm multiplicity halves instead of vanishing).  An item of
+#: ONE tile (K3 at c_out 128; ``"passes"`` under the accumulators arm) is a typed decline: the resident region would be dead weight.
+LN_ONCE_FORMS = ("", "block", "passes")
+#: The sm_107a body's operand ring depth per pairing -- 9 x (16 + 16) KiB (columns) / 6 x (2 x 16 + 2 x 8) KiB (accumulators) = 288 KiB either
+#: way -- and its per-stage operand bytes: the lever's SMEM predicate (:func:`ln_once_a_slots`) reads them HERE, the body re-derives them from
+#: the same arm, and the K1 test module pins the agreement (a drift would size the resident region against a ring the body no longer has).
+RING_STAGES = {"columns": 9, "accumulators": 6}
+A_STAGE_BYTES = (PAIR_TILE_ROWS // 2) * K_STAGE * 2  #: one 128-row x 64-channel bf16 A stage per operand (16 KiB)
+B_STAGE_BYTES = {
+    "columns": (PAIR_TILE_ROWS // 2) * K_STAGE * 2,
+    "accumulators": (PAIR_TILE_ROWS // 4) * K_STAGE * 2,
+}  #: each CTA's half of the N tile per B operand
 #: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
 BODIES = {"sm107": "sm107_dual_gemm.py"}
 
@@ -192,6 +208,13 @@ class LnDualGemmParams:
     #: measured (the triangle multiplicative update's ``heuristics.register_split_hint``), never library-wide: the default keeps every
     #: production cubin byte-identical.
     min_blocks_per_mp: int = 0
+    #: :data:`LN_ONCE_FORMS` -- the LayerNorm-once-per-row-block lever (performance only; bitwise by construction).  ``"block"`` / ``"passes"`` make
+    #: the row block [x the N-tile group] the scheduler's work item: the A operand(s) of a 256-row block are loaded and LayerNormed ONCE into a
+    #: resident SMEM region (``ln_once_a_slots`` slots of ``k_stages`` stages; double-buffered where the shipped layout's bytes allow it) and the
+    #: CTA pair runs the item's ``passes x n_tiles`` GEMM tiles from it while the B half-slab keeps streaming per tile; TMEM, the epilogue and the
+    #: accumulator protocol are per tile as today.  Requires ``pass_order = "major"`` (the pass lives inside the item), no ``prefetch_a_l2``, an item of
+    #: at least two tiles.  The default stays OFF: a consumer picks it per geometry (the triangle multiplicative update's heuristics) once measured.
+    ln_once: str = ""
 
     @property
     def dual(self) -> bool:
@@ -207,8 +230,42 @@ class LnDualGemmParams:
         return 2 if self.dual else 1
 
     @property
+    def num_b_operands(self) -> int:
+        return 2 if self.dual else 1
+
+    @property
     def k_stages(self) -> int:
         return self.k // K_STAGE
+
+    @property
+    def n_tiles(self) -> int:
+        """GEMM N tiles per row block: ``c_out / 128`` in BOTH arms (the columns arm's 256-wide tile holds one value block + one gate block; the
+        accumulators arm's two GEMMs each run a 128-wide tile)."""
+        return self.c_out // CHANNEL_BLOCK
+
+
+def ln_once_n_tiles_per_item(p: LnDualGemmParams) -> int:
+    """N tiles one work item spans under the lever: every one (``"block"``), one (``"passes"``); 1 when the lever is off."""
+    return p.n_tiles if p.ln_once == "block" else 1
+
+
+def ln_once_tiles_per_item(p: LnDualGemmParams) -> int:
+    """GEMM tiles per work item: ``passes x n_tiles_per_item`` under the lever (the LayerNorm multiplicity it removes), 1 when off."""
+    return p.passes * ln_once_n_tiles_per_item(p) if p.ln_once else 1
+
+
+def ln_once_a_slots(p: LnDualGemmParams) -> int:
+    """The resident A region's slot count under the lever: 2 (the next item's load + LayerNorm overlap this item's tiles) where the two-slot region
+    plus the shipped B ring fit in the bytes of the shipped A/B ring (the layout the rendering already launches at -- a self-referential predicate,
+    no carveout constant), else 1 (K3 at c_out 256: 2 operands x 4 stages x 2 slots = 256 KiB would leave one B stage).  0 when the lever is off.
+    One source for the body, the validator and the tests."""
+    if not p.ln_once:
+        return 0
+    ring = RING_STAGES[p.pairing]
+    off_bytes = ring * (p.num_a_operands * A_STAGE_BYTES + p.num_b_operands * B_STAGE_BYTES[p.pairing])
+    b_ring_bytes = ring * p.num_b_operands * B_STAGE_BYTES[p.pairing]
+    region_bytes = p.num_a_operands * p.k_stages * A_STAGE_BYTES
+    return 2 if 2 * region_bytes + b_ring_bytes <= off_bytes else 1
 
 
 def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
@@ -247,6 +304,32 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
             f"under which ptxas honours the body's setmaxnreg split); 2 or more would cap the allocation at 65536 / (2 x 384) = 80 registers with the "
             f"split impossible -- got {p.min_blocks_per_mp!r}"
         )
+    if p.ln_once not in LN_ONCE_FORMS:
+        raise ValueError(f"ln_once must be one of {LN_ONCE_FORMS}, got {p.ln_once!r}")
+    if p.ln_once:
+        if ln_once_tiles_per_item(p) < 2:
+            raise ValueError(
+                f"ln_once={p.ln_once!r} makes a work item of ONE GEMM tile here (passes {p.passes} x {ln_once_n_tiles_per_item(p)} N tile(s) at c_out {p.c_out}, "
+                f"pairing {p.pairing!r}): the LayerNorm already runs once per row block and the resident A region would be dead weight -- leave the lever off"
+            )
+        if p.pass_order != "major":
+            raise ValueError(
+                f"ln_once={p.ln_once!r} folds the pass into the work item's sub-tile loop; pass_order={p.pass_order!r} would fold it a second time into "
+                "the scheduler's M axis and every tile of pass 1 would read pass 0's rows -- use pass_order='major'"
+            )
+        if p.prefetch_a_l2:
+            raise ValueError(
+                f"ln_once={p.ln_once!r} loads a row block's A operand(s) once per item; the per-tile L2 prefetch (prefetch_a_l2) has no tile to prefetch for"
+            )
+        if (p.passes & (p.passes - 1)) or (p.n_tiles & (p.n_tiles - 1)):
+            raise ValueError(
+                f"ln_once={p.ln_once!r} decodes the item's sub-tile with a shift and a mask: passes ({p.passes}) and the N tiles per row block "
+                f"({p.n_tiles} = c_out / {CHANNEL_BLOCK}) must be powers of two"
+            )
+        if p.diag == "ln_first_tile_only":
+            raise ValueError(
+                "diag='ln_first_tile_only' bounds the LayerNorm-once lever from the per-tile body; under ln_once the LayerNorm already runs once per item -- nothing to relieve"
+            )
     if p.dual:
         if p.has_mask or p.skip_masked_tiles:
             raise ValueError("pairing='accumulators' has no output mask: has_mask and skip_masked_tiles must be False")

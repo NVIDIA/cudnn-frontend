@@ -58,6 +58,7 @@ def proj_params(
     ln_pass_form: Optional[str] = None,
     epi_math: Optional[str] = None,
     min_blocks_per_mp: Optional[int] = None,
+    ln_once: Optional[str] = None,
 ) -> LnDualGemmParams:
     """The substrate's compile-time parameters for the ``(c_z, c)`` geometry (K = ``c_z``, ``c`` output channels per pass);
     ``clc_stages``, ``pass_order``, ``ln_pass_form``, ``epi_math`` and ``min_blocks_per_mp`` (performance only, bitwise the same planes; the
@@ -75,6 +76,8 @@ def proj_params(
         kw["min_blocks_per_mp"] = (
             min_blocks_per_mp if isinstance(min_blocks_per_mp, bool) else int(min_blocks_per_mp)
         )  # a bool reaches the typed decline as itself
+    if ln_once is not None:
+        kw["ln_once"] = str(ln_once)  # the LayerNorm-once-per-row-block lever (performance only, bitwise; the substrate's typed vocabulary)
     return LnDualGemmParams(
         k=int(c_z),
         c_out=int(c),
