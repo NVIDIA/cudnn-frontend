@@ -618,7 +618,7 @@ heuristics' decode split model says so (`decode_split_kv=None`: an under-full la
 saturate HBM; `decode_split_kv=<int>` pins it) -- fp32 partials in the block's workspace (`get_workspace_size()` holds
 them) and ONE combine launch -- and `fuse_gate=True` then rides the split COMBINE: the tile has no gate seams, the combine
 multiplies the merged fp32 value by `sigmoid(G)` before the single cast (FROST's one-rounding convention; the split is
-floored at 2 under the gate). On the prefill-tile arm and on an unsplit tile the gate is its own launch, stage (5):
+floored at 2 under the gate). On an unsplit decode tile the gate is its own launch, stage (5):
 `blk.gate_fused` says which runs; `fuse_gate` stays what was declared.
 
 | input | shape / dtype | contract |
@@ -633,9 +633,12 @@ floored at 2 under the gate). On the prefill-tile arm and on an unsplit tile the
 | `k_cache`, `v_cache`, `slot_mapping` (execute) | as under "Serving: write-through" (`slot_mapping` is `[B * S_q]`) | REQUIRED (the write-through is part of the form) |
 
 `GatedAttentionBlockFwd.serving_envelope(geometry, dtype, device) -> ServingEnvelope` is the STATIC record a serving stack
-reads at construction instead of catching exceptions: the forms served with the decline each would raise (`dense`, `extend`,
-`decode`), `page_sizes` (16 / 32 / 64 / 128), `pool_layouts` (the three stride patterns), the decode route per `(group, S_q)`
-(`decode_routes`, `route(s_q)`), the pool dtypes, the e4m3-pool state, the part and the CuTe DSL facts -- derived from the same
+reads at construction instead of catching exceptions: the forms served (`forms`, drawn from `extend` / `decode`) and one record
+per form (`extend`: `ExtendEnvelope`, `decode`: `DecodeEnvelope` -- `served`, the `reason` it would decline with, every typed
+decline of the form in `declines`), `page_sizes` (16 / 32 / 64 / 128), `pool_layouts` (the three stride patterns), the decode
+route per `(group, S_q)` (`decode.routes` for `S_q` 1 .. 8, `decode.route(s_q)` for any step, `decode.max_s_q` /
+`decode.max_rows`), the pool dtypes (`dtypes`: bf16 / f16 -- an e4m3 pool is not served), the part and the CuTe DSL facts
+(`device_cc`, `cutedsl_ok` / `cutedsl_reason`) -- derived from the same
 helpers the declaration and `check_support` run, so no decline is reachable at `execute` that the record did not predict (the
 execute-time refusals are the caller's malformed tensors, form-checked by name). It never raises for a device the block does
 not serve. Typed declines of the form, at declaration: `kv_source="paged"` without `paged_kv_page_size`, a packed (`thd=True`)

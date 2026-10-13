@@ -2651,7 +2651,7 @@ same values BITWISE on `out`, each within the oracle's budget; `kv_lens` 200 / 0
 Also validated: the block's form BITWISE the standalone `SdpaFwdDslSm100` on the same slab Q views / pools / table / gate at the
 same split and packing; paged == dense BITWISE (O and LSE) at the unsplit plan on the block's own operands (the padded dense
 adapter has no split); split == unsplit within the combine's derived two-term budget on the pre-gate O (max |diff| / budget
-QS06_SPLIT_RATIO at 32 / 2 and 8 / 1; the fp32 LSEs to 1e-5); the gate in the combine vs the separate gate launch at the same split
+0.26 at 32 / 2 and 0.16 at 8 / 1; the fp32 LSEs to 1e-5); the gate in the combine vs the separate gate launch at the same split
 within the stated one-rounding budget (max |diff| on O 9.766e-04 bf16 / 1.221e-04 f16 at split 2, 0.73 / 0.83 of the budget; `out` cos > 0.9999 between them);
 a block table that is a row SLICE of a wider table (row stride 37) bitwise the compact table (R-KV4); `kv_lens` 128 / 384 / 512 /
 1024 (one tile, the ring depth, four, eight) and an entry whose whole content is the step (`kv_lens == S_q`); the FIRST execute

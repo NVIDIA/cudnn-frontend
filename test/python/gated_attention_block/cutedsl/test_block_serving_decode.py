@@ -4,8 +4,8 @@
 """The gated attention block's DECODE (serving) form: a dense ``[B, S_q <= 4]`` declaration with ``kv_source="paged"`` over a
 paged KV cache -- the step's tokens written through, then stage (4) over the first ``kv_lens[b]`` keys of every sequence's
 ``block_table`` row on the Rubin d256 decode tile (PackGQA over the whole group, the decode split model's split-KV with fp32
-partials in the workspace, the sigmoid gate in the split COMBINE under ``fuse_gate``), the paged d256 prefill body past the
-tile's route.
+partials in the workspace, the sigmoid gate in the split COMBINE under ``fuse_gate``), the same tile UNPACKED (one Q head per
+CTA) past the packed route up to 32 rows, and a typed decline beyond (no wider dense step has a kernel over the pools).
 
 Host cells (any device, the declaration cells even on the CPU): the constants and the route table per ``(group, S_q)`` at the
 four served groups (16 = 32 / 2, 12 = 24 / 2, 8 = 8 / 1, 6 = 24 / 4) against the design's table; the static
@@ -19,7 +19,7 @@ Rubin cells (one compiled block per cell, cached): every served group x ``S_q`` 
 (the block run on the FULL sequence, its last ``S_q`` rows; the prefix K / V of the pools ARE the oracle's bf16 rows), with
 ``kv_lens > S_q`` on every live row, a tail tile, one KV tile, ring depth 3 and 4, a padded entry (``kv_lens = 0`` + block 0 +
 slot -1 -> ``out`` rows exactly 0, block 0 untouched -- the serving stacks' padded full-graph entry), ``S_q = 5`` on the
-prefill tile at groups 16 / 12 and still on the tile at 8 / 6 (two token units), the route pinned against the compiled
+UNPACKED decode tile at groups 16 / 12 and on the packed two-token-unit tile at 8 / 6, the route pinned against the compiled
 module; paged == dense on the same tokens (the standalone adapter over a padded dense cache gathered from the pools: BITWISE);
 the block's form vs the standalone adapter on the SAME Q views / pools / table / gate: BITWISE; split == unsplit within the
 combine's derived two-term budget (the pre-gate O of the block's own stage; LSE to fp32 rounding); the gate in the combine vs
