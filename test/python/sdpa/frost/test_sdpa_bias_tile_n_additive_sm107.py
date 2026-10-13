@@ -201,7 +201,14 @@ _ADAPTER_CELLS = [
     # the 64-wide block holds 7 tiles = 448 columns (a factory fact pinned above), but the row AND the adapter ask the budget at the
     # default TILE_N 128 -- conservative, never wrong -- so S_kv 448 with the TILE_N 64 knob is a typed decline on both (the sweep that
     # would make the plan's width the budget's is the knob sweep's)
-    ("tile_n 64 bias at S_kv 448 (the 64-wide block's 7 tiles; both gates ask at 128)", dict(s_q=448, s_kv=448, tile_n=64, bias=(1, 4, 448, 448)), False, None),
+    # a dense S_kv off the 128-wide KV tile is served through the padded mask compiled against the scalar S_kv (no lengths buffer),
+    # so the TILE_N 64 bias plan at S_kv 448 is admitted: the resident block at the 64-wide tile holds its 7 tiles
+    (
+        "tile_n 64 bias at S_kv 448 (the 64-wide block's 7 tiles; served through the scalar tail mask)",
+        dict(s_q=448, s_kv=448, tile_n=64, bias=(1, 4, 448, 448)),
+        True,
+        (64, 0, 1),
+    ),
     ("additive bf16 vector", dict(kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.bfloat16), True, (128, 2, 1)),
     ("additive fp32 vector", dict(kv_mask=(2, 1, 1, 256), kv_mask_dtype=torch.float32), True, (128, 3, 1)),
     (
