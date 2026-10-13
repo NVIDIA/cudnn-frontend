@@ -22,7 +22,6 @@ On torch < 2.13 (no registry), ``cudnn.torch.install()`` applies the
 ``F.scaled_dot_product_attention`` overrides directly.
 """
 
-import warnings
 from importlib import import_module
 
 from cudnn.torch.sdpa_provider import calls, install, served_plan_names  # noqa: F401
@@ -35,18 +34,7 @@ def __getattr__(name):
         value = getattr(import_module("cudnn.block_sparse_attention"), name)
         globals()[name] = value
         return value
-    if name in ("grouped_gemm_swiglu", "grouped_gemm_dswiglu"):
-        import cudnn
-
-        unified = name.replace("swiglu", "glu")
-        operation = name.removeprefix("grouped_gemm_")
-        warnings.warn(
-            f'cudnn.torch.{name} is deprecated and will be removed; use cudnn.{unified}_wrapper_sm100 with act_func="{operation}"',
-            FutureWarning,
-            stacklevel=2,
-        )
-        return getattr(cudnn, f"{name}_wrapper_sm100")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = [*_BSA_EXPORTS, "calls", "install", "served_plan_names", "grouped_gemm_swiglu", "grouped_gemm_dswiglu"]
+__all__ = [*_BSA_EXPORTS, "calls", "install", "served_plan_names"]
