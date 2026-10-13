@@ -547,6 +547,7 @@ def test_slot_mapping_form_checks():
 
 @_GPU
 @pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
 def test_cache_write_binds_int64_pool_strides():
     """A real allocation beyond the 32-bit element offset must bind and preserve low-address canaries."""
     from cudnn.gated_attention_block.kernels.cache_write import compile_cache_write, run_cache_write
@@ -557,7 +558,10 @@ def test_cache_write_binds_int64_pool_strides():
     free, _ = torch.cuda.mem_get_info()
     if free < elements * 2 + (1 << 30):
         pytest.skip("the wide-stride regression requires an 8 GiB allocation plus 1 GiB headroom")
-    storage = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+    try:
+        storage = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+    except torch.OutOfMemoryError:
+        pytest.skip("the wide-stride backing allocation no longer fits in available GPU memory")
     pool = torch.as_strided(storage, (2, 1, page_size, d), (page_stride, page_size * d, d, 1))
     pool.fill_(-7)
     wrapped = storage[page_size * d : page_size * d + d]
