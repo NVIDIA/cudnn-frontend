@@ -250,7 +250,11 @@ def test_the_split_choice_is_the_decode_split_model_floored_at_two_under_the_gat
     assert decode_split_choice(r, batch=4, h_kv=2, max_kv_len=1000, sm_count=0, gated=True) == 1  # no device: declined later anyway
 
 
-def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_route():
+def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_route(monkeypatch):
+    from cudnn.frost import buffers
+
+    # This is a hypothetical supported Rubin declaration, including its DSL target.
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     geom, _ = _geom(12)
     env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=_SM107)
     assert isinstance(env, ServingEnvelope) and isinstance(env.decode, DecodeEnvelope) and env.cutedsl_ok and env.device_cc == _SM107
@@ -266,6 +270,25 @@ def test_the_envelope_on_a_rubin_reading_serves_the_decode_form_and_names_every_
     assert f16.decode.served and f16.extend.served
 
 
+@pytest.mark.parametrize("version, has_target", [("4.7.0", False), ("4.8.0", False), ("4.8.0", True)])
+def test_the_envelope_requires_the_rubin_dsl_target(monkeypatch, version, has_target):
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "cutedsl_state", lambda: (True, ("nvidia-cutlass-dsl", version)))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: has_target)
+    geom, _ = _geom(16)
+    env = GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, "cpu", device_cc=_SM107)
+    assert env.cutedsl_ok is has_target
+    assert env.extend.served is has_target and env.decode.served is has_target
+    assert env.forms == (("extend", "decode") if has_target else ())
+    assert env.decode.route(1).served  # Geometry remains inspectable without a runnable target.
+    if has_target:
+        assert env.cutedsl_reason is None and env.extend.reason is None and env.decode.reason is None
+    else:
+        assert version in env.cutedsl_reason and "sm_107a" in env.cutedsl_reason
+        assert env.extend.reason == env.decode.reason == env.cutedsl_reason
+
+
 @pytest.mark.parametrize(
     ("cc", "match"),
     [((8, 0), "found SM80"), ((10, 0), "found SM100"), ((10, 3), "found SM103"), (None, "no CUDA device")],
@@ -278,9 +301,12 @@ def test_the_envelope_declines_every_other_part_without_raising(cc, match):
     assert env.decode.routes  # the routes are geometry facts, listed either way
 
 
-def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_envelope():
+def test_every_static_decline_of_the_decode_declaration_is_predicted_by_the_envelope(monkeypatch):
     """The contract a serving stack relies on: no decline the DECODE declaration raises for a (geometry, dtype) that the
     envelope did not predict.  Each row: the envelope on a Rubin reading names the reason AND the declaration raises it."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     geom16, _ = _geom(16)
     d128 = GatedAttentionBlockGeometry(d_model=_D_MODEL, h_q=8, h_kv=2, d_head=128, rope_dim=_ROPE, causal_bottom_right=True)
     # (top-left causal: a QsaSpec with the bottom-right diagonal is the sparse declaration's own earlier decline)
@@ -392,7 +418,7 @@ def test_declaration_rows_are_typed_and_name_the_feature():
 
 
 def test_the_thd_product_bound_names_the_decode_form():
-    """KC-F8: the ``S = 1`` wording of the packed envelope's product bound names the DECODE form (``S_q = 1`` with
+    """The ``S = 1`` wording of the packed envelope's product bound names the DECODE form (``S_q = 1`` with
     ``kv_source='paged'``), not a bare 'decode is out of scope'."""
     geom, _ = _geom(16)
     mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
@@ -462,7 +488,7 @@ def test_a_self_block_keeps_its_contract_and_refuses_the_paged_read_inputs():
 
 def test_execute_refusals_on_an_uncompiled_block_are_typed_and_sync_free():
     """The declaration-vs-argument contract at execute, pinned on an UNCOMPILED block (the paged-read checks run before the
-    plan check): ``seq_lens`` (a Q-side length) REFUSED under ``kv_source="paged"`` -- the KC-F5 REJECT cell; ``block_table`` +
+    plan check): ``seq_lens`` (a Q-side length) REFUSED under ``kv_source="paged"``; ``block_table`` +
     ``kv_lens`` REQUIRED; the forms by name; the well-formed call reaches the plan check."""
     blk, c = _make_block(16, 4, 2)
     mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
@@ -829,10 +855,13 @@ _SHARDS = {"q35_397b_tp2_16_1": (16, 1, 16), "q35_397b_tp4_8_1": (8, 1, 32), "q3
 _D_MODEL_397B = 4096
 
 
-def test_the_397b_shards_ride_their_groups_routes_and_the_envelope_serves_both_forms():
+def test_the_397b_shards_ride_their_groups_routes_and_the_envelope_serves_both_forms(monkeypatch):
     """A shard's decode route is its GROUP's (the rule reads ``h_q // h_kv`` and ``d_head`` only, never ``d_model`` or the KV head
     count): 16 / 1 = the 32 / 2 rows, 8 / 1 = group 8's, 4 / 1 = group 4's (packed to ``S_q = 16`` in two token units, unpacked to
     32, a typed decline past that); the envelope on a Rubin reading serves the EXTEND and the DECODE form at every shard."""
+    from cudnn.frost import buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     for name, (h_q, h_kv, _page) in _SHARDS.items():
         group = h_q // h_kv
         geom, _ = _geom(group, heads=(h_q, h_kv), d_model=_D_MODEL_397B)

@@ -1125,10 +1125,11 @@ def _declare_dense_sparse_paged():
     )
 
 
-def test_extend_typed_declines_match_the_envelope_row_by_row():
+def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     """Every row of the EXTEND declines table is reachable at declaration with exactly the message the envelope publishes for it --
     the CPU proof that no declaration-time decline escapes ``serving_envelope``."""
     import re
+    from cudnn.frost import buffers
 
     env = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
     assert isinstance(env, ServingEnvelope) and isinstance(env.extend, ExtendEnvelope) and isinstance(env.decode, DecodeEnvelope)
@@ -1161,6 +1162,11 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
     cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
     assert env.device_cc == cc
     if cc == (10, 7):
+        if not env.cutedsl_ok:
+            assert not env.extend.served and env.forms == () and env.extend.reason == env.cutedsl_reason
+        # The remaining assertions inspect geometry on a hypothetical supported target.
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+        env = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
         assert env.extend.served and env.forms == ("extend", "decode") and env.extend.reason is None and env.cutedsl_ok
         fp32 = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.float32, _DEV)
         assert not fp32.extend.served and "bf16 / f16" in fp32.extend.reason
@@ -1179,6 +1185,7 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
         assert sparse.extend.reason == str(e.value)
     # ... and the Rubin reading on ANY host (device_cc=): the EXTEND half says the sparse declaration's own row, the DECODE half the table's
     # `sparse` row -- the pin the first node run exposed (the envelope read the `diagonal` row for a QsaSpec geometry on the THD-only form)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     rubin = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7))
     assert rubin.cutedsl_ok and rubin.forms == ()
     assert rubin.extend.reason == str(e.value) and rubin.decode.reason == env.decode.declines["sparse"]
