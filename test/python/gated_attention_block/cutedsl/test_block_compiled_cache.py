@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """The block's forward kernels through the persistent compiled-plan cache.
 
-Every compile site of ``kernels/elementwise.py``, ``kernels/qk_norm_rope_tma.py`` and the three forks of the rendered GEMM
-template (``kernels/proj_gemm_norm_rope.py`` + ``_fp8`` / ``_mxfp8``) goes through ``cudnn.frost.compiled_cache.compile_cached``:
+Every compile site of ``kernels/elementwise.py``, ``kernels/qk_norm_rope_tma.py``, ``kernels/cache_write.py`` (the serving
+write-through) and the three forks of the rendered GEMM template (``kernels/proj_gemm_norm_rope.py`` + ``_fp8`` / ``_mxfp8``) goes
+through ``cudnn.frost.compiled_cache.compile_cached``:
 the module dict each site already kept stays the in-process memo, and behind it the on-disk cache hands the next process the
 exported object instead of re-tracing and re-running ptxas.  Keys follow ``compiled_cache.template_key``: the module's source
-digest (the template loader's file + params digest for the forks, a file digest for the two plainly imported modules) joined with
+digest (the template loader's file + params digest for the forks, a file digest for the three plainly imported modules) joined with
 the function tag and the dict key's plain values (``None`` -- not cacheable -- for a tensor / device / stream, so the keys stay the
 Constexpr tuples the dicts use).
 
@@ -32,6 +33,7 @@ if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
 from cudnn.frost import compiled_cache as cc  # noqa: E402
+from cudnn.gated_attention_block.kernels import cache_write as kern_cw  # noqa: E402
 from cudnn.gated_attention_block.kernels import elementwise as kern_ew  # noqa: E402
 from cudnn.gated_attention_block.kernels import proj_gemm as kern_pg  # noqa: E402
 from cudnn.gated_attention_block.kernels import qk_norm_rope_tma as kern_tma  # noqa: E402
@@ -44,13 +46,26 @@ _KERNELS = Path(kern_ew.__file__).parent
 _SITES = {
     "elementwise.py": ("compile_elementwise_gate", "cudnn_block_elementwise_gate"),
     "qk_norm_rope_tma.py": ("compile_qk_norm_rope_tma", "cudnn_block_qk_norm_rope_tma"),
+    "cache_write.py": ("compile_cache_write", "cudnn_block_cache_write"),
     "proj_gemm_norm_rope.py": ("compile", "frost_gemm_norm_rope"),
     "proj_gemm_norm_rope_fp8.py": ("compile", "frost_gemm_norm_rope_fp8"),
     "proj_gemm_norm_rope_mxfp8.py": ("compile", "frost_gemm_norm_rope_mxfp8"),
 }
 _CHILD = str(Path(__file__).with_name("block_compiled_cache_child.py"))
-# every arm the child runs; the elementwise and TMA arms share their module's symbol, each is its own compiled object
-_CHILD_SITES = ("elementwise_gate", "elementwise_copy", "qk_tma_norm", "qk_tma_rope_only", "qk_tma_fp8", "qk_tma_mx", "fork_bf16", "fork_fp8", "fork_mxfp8")
+# every arm the child runs; the elementwise, TMA and cache-write arms share their module's symbol, each is its own compiled object
+_CHILD_SITES = (
+    "elementwise_gate",
+    "elementwise_copy",
+    "qk_tma_norm",
+    "qk_tma_rope_only",
+    "qk_tma_fp8",
+    "qk_tma_mx",
+    "fork_bf16",
+    "fork_fp8",
+    "fork_mxfp8",
+    "cache_write_kv",
+    "cache_write_index",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -85,12 +100,12 @@ def _stub_cute_compile(monkeypatch, calls):
 
 
 def test_every_block_compile_site_goes_through_the_compiled_plan_cache():
-    """No bare ``cute.compile(`` is left in the five kernel files; each passes ``compile_cached`` its key and symbol."""
+    """No bare ``cute.compile(`` is left in the six kernel files; each passes ``compile_cached`` its key and symbol."""
     for name, (tag, symbol) in _SITES.items():
         src = (_KERNELS / name).read_text()
         assert "cute.compile(" not in src, f"{name}: a bare cute.compile( site bypasses the compiled-plan cache"
         assert "compile_cached(" in src and f'symbol="{symbol}"' in src and f'"{tag}")' in src, f"{name}: the site must pass cache_key= and symbol={symbol!r}"
-    for mod in (kern_ew, kern_tma):
+    for mod in (kern_ew, kern_tma, kern_cw):
         # imported normally, so each names its own source identity (the loader stamps the forks')
         assert mod.FROST_SOURCE_DIGEST == hashlib.sha256(Path(mod.__file__).read_bytes()).hexdigest()[:16]
 
@@ -128,6 +143,30 @@ def test_the_plain_modules_key_on_their_file_digest_and_the_memo_dict_key(monkey
     assert calls[0]["cache_key"].startswith(f"{kern_tma.FROST_SOURCE_DIGEST}|compile_qk_norm_rope_tma|[('key', ('torch.bfloat16', 8, 2, 256, 64, 8, ")
     assert (calls[0]["symbol"], calls[0]["options"]) == ("cudnn_block_qk_norm_rope_tma", "--enable-tvm-ffi")
     assert r.compiled is kern_tma.compiled_cache[key]
+
+
+def test_the_cache_write_site_keys_on_its_file_digest_and_the_memo_dict_key(monkeypatch):
+    """``cache_write`` (the serving write-through) hands ``compile_cached`` ``template_key(globals(), {"key": <the dict key>},
+    "compile_cache_write")`` -- the file digest, the tag, and exactly the Constexpr tuple the dict memoises under (the slot dtype and
+    the operand count included: one artifact per value, never a shared one) -- with the site's symbol and options."""
+    calls = []
+    monkeypatch.setattr(kern_cw, "compile_cached", _recorder(calls))
+    monkeypatch.setattr(kern_cw, "compiled_cache", {})
+    monkeypatch.setattr(kern_cw, "current_device", lambda: 0)
+    kv = dict(dtype=torch.bfloat16, h=2, d=256, page_size=16, slot_dtype=torch.int64)
+    r = kern_cw.compile_cache_write(**kv)
+    (key,) = kern_cw.compiled_cache.keys()
+    assert key == ("torch.bfloat16", 2, 256, 16, "torch.int64", True, 128, 2, True, False, 0)
+    assert all(isinstance(v, (str, int, bool)) for v in key)
+    assert calls[0]["cache_key"] == f"{kern_cw.FROST_SOURCE_DIGEST}|compile_cache_write|{[('key', key)]!r}"
+    assert calls[0]["cache_key"] == cc.template_key(vars(kern_cw), {"key": key}, "compile_cache_write")
+    assert (calls[0]["symbol"], calls[0]["options"]) == ("cudnn_block_cache_write", "--enable-tvm-ffi")
+    assert r.compiled is kern_cw.compiled_cache[key]
+    assert kern_cw.compile_cache_write(**kv).compiled is r.compiled
+    assert len(calls) == 1, "a repeat request is served by the module dict, not by another compile_cached call"
+    kern_cw.compile_cache_write(**{**kv, "slot_dtype": torch.int32})
+    kern_cw.compile_cache_write(dtype=torch.bfloat16, h=1, d=128, page_size=16, slot_dtype=torch.int64, two_operands=False)
+    assert len(calls) == 3 and len({c["cache_key"] for c in calls}) == 3 and len(kern_cw.compiled_cache) == 3
 
 
 @pytest.mark.parametrize(

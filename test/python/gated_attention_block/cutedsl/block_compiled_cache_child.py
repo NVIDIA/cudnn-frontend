@@ -194,6 +194,33 @@ def fork_mxfp8():
     return (q8, k8, v8, gate16, sf_q, sf_k, sf_v)
 
 
+def cache_write(arm: str):
+    """The serving write-through, shaped like the block's two artifacts: ``kv`` = the K / V launch (two operands, the KV heads,
+    int32 slots), ``index`` = the indexer band's raw-key launch (one operand, one 128-wide head, int64 slots).  Padded (-1) tokens
+    leave their rows at the NaN sentinel; the pools are the output (the sentinel bit pattern is fixed, so the digest is too)."""
+    from cudnn.gated_attention_block.kernels.cache_write import compile_cache_write, run_cache_write
+
+    if arm == "kv":
+        h, d, two, slot_dtype = 2, 256, True, torch.int32
+    elif arm == "index":
+        h, d, two, slot_dtype = 1, 128, False, torch.int64
+    else:
+        raise ValueError(arm)
+    t, page_size, n_pages = 100, 16, 12
+    g = _gen(6)
+    src_a = _randn(g, t, h, d)
+    src_b = _randn(g, t, h, d) if two else None
+    # an injective slot mapping drawn on the CPU (deterministic for the seed on any device), every seventh token padded
+    slot = torch.randperm(n_pages * page_size, generator=torch.Generator().manual_seed(6))[:t].to(slot_dtype)
+    slot[::7] = -1
+    slot = slot.cuda()
+    pool = lambda: torch.full((n_pages, h, page_size, d), float("nan"), device="cuda", dtype=torch.bfloat16)  # noqa: E731
+    pool_a, pool_b = pool(), (pool() if two else None)
+    r = compile_cache_write(dtype=torch.bfloat16, h=h, d=d, page_size=page_size, slot_dtype=slot_dtype, two_operands=two)
+    run_cache_write(r, src_a, src_b, pool_a, pool_b, slot, stream=_stream())
+    return (pool_a, pool_b) if two else (pool_a,)
+
+
 SITES = {
     "elementwise_gate": lambda: elementwise(True),
     "elementwise_copy": lambda: elementwise(False),
@@ -204,6 +231,8 @@ SITES = {
     "fork_bf16": fork_bf16,
     "fork_fp8": fork_fp8,
     "fork_mxfp8": fork_mxfp8,
+    "cache_write_kv": lambda: cache_write("kv"),
+    "cache_write_index": lambda: cache_write("index"),
 }
 
 
