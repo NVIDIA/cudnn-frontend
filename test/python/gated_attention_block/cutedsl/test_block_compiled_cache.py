@@ -17,6 +17,7 @@ every site in a second process and asserts it reloads every kernel and writes th
 
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -42,11 +43,10 @@ requires_rubin = pytest.mark.requires_rubin  # the suite conftest's registered m
 
 # The serving cache-write kernel (``kernels/cache_write.py``, the paged-KV serving form's write-through) is a separate change: its
 # site is pinned here exactly where the module is in the tree and skipped BY NAME where it is not -- the pins turn on the day the
-# kernel lands and never leave this suite red on a tree without it.  The probe is the import itself, not a version or a flag.
-try:
-    from cudnn.gated_attention_block.kernels import cache_write as kern_cw  # noqa: E402
-except ImportError:  # the serving form's kernel is not in this tree
-    kern_cw = None
+# kernel lands and never leave this suite red on a tree without it.  The probe is the module's PRESENCE (``find_spec``), never a
+# swallowed ImportError: a tree that carries the kernel but cannot import it fails here loudly instead of skipping.
+_CACHE_WRITE_MODULE = "cudnn.gated_attention_block.kernels.cache_write"
+kern_cw = importlib.import_module(_CACHE_WRITE_MODULE) if importlib.util.find_spec(_CACHE_WRITE_MODULE) is not None else None
 requires_cache_write_kernel = pytest.mark.skipif(kern_cw is None, reason="kernels/cache_write.py (the serving cache-write kernel) is not in this tree")
 
 _KERNELS = Path(kern_ew.__file__).parent
