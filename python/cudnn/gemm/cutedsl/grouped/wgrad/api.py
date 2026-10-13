@@ -489,3 +489,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
         current_stream=current_stream,
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)
+
+
+# BF16 torch calls accept canonical operands -- A/C/D (m, x), prob (m,), dense B
+# (experts, n, k) -- with no host reads of device offsets/pointers; integrations
+# feature-detect this before passing them.
+grouped_gemm_wgrad_wrapper_sm100.supports_bf16_canonical_layouts = True

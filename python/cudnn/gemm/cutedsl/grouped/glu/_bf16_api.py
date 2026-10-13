@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import weakref
 from typing import Optional, Tuple
 
 import cutlass
@@ -18,7 +17,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
-from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _pointer_values, _validate_pointer_tensor
+from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
     canonicalize_unit_dim_strides,
@@ -29,14 +28,26 @@ from cudnn.tensor_adapter import (
     get_data_ptr,
     get_device,
     get_shape,
-    get_strides,
-    get_version,
     is_torch_tensor,
-    to_host_list,
 )
 
+from ..backend_utils import debug_validate_offsets, debug_validate_pointer_values
+from ..canonical import (
+    canonical_b_fake,
+    canonical_mx_fake,
+    canonical_prob_fake,
+    normalize_b,
+    normalize_mx,
+    normalize_prob,
+    normalize_torch_operand as _normalize_torch,
+    operand_signature,
+)
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
+
+
+# Bound on the memoized execute-validation signatures (one per distinct routed M in practice).
+_VALIDATED_LIVE_LIMIT = 1024
 
 
 def _output_dtypes():
@@ -84,9 +95,18 @@ class GroupedGemmGluBf16API(APIBase):
         else:
             raise ValueError("Provide sample_b for dense mode or (num_experts, b_shape, b_dtype) " "for discrete mode, but not both")
 
-        # A canonical TensorDesc is rebuilt and re-checked for every operand on every
-        # launch, which is the largest single cost in execute(). See _validate_live_tensor.
-        self._live_desc_cache: dict = {}
+        # Canonical (natural row-major) torch operands -- A/C/D (m, x), prob (m,), dense B
+        # (l, n, k) -- compile at their own rank and bind with no per-call view; the kernel
+        # normalizes them at trace time (see ..canonical). Descriptors and every check below
+        # use the kernel-facing views, so both layouts share one validation contract.
+        self.canonical_a, sample_a = _normalize_torch(normalize_mx, sample_a)
+        self.canonical_b, sample_b = _normalize_torch(normalize_b, sample_b)
+        self.canonical_c, sample_c = _normalize_torch(normalize_mx, sample_c)
+        self.canonical_d, sample_d = _normalize_torch(normalize_mx, sample_d)
+        self.canonical_prob, sample_prob = _normalize_torch(normalize_prob, sample_prob)
+
+        # execute() validates operand metadata once per distinct signature; see _validate_live.
+        self._validated_live: dict = {}
         self._launch_stream_cache: dict = {}
         self.a_desc = self._make_tensor_desc(sample_a, name="sample_a", canonical=True)
         self.c_desc = self._make_tensor_desc(sample_c, name="sample_c", canonical=True)
@@ -97,9 +117,6 @@ class GroupedGemmGluBf16API(APIBase):
         self.bias_desc = self._make_tensor_desc(sample_bias, name="sample_bias", canonical=True)
         self.prob_desc = self._make_tensor_desc(sample_prob, name="sample_prob", canonical=True)
 
-        self._sample_offset_values = self._copy_values_to_host(sample_padded_offsets)
-        self._sample_offsets_ref = weakref.ref(sample_padded_offsets)
-        self._sample_offsets_version = get_version(sample_padded_offsets)
         self._sample_data_ptrs = {
             name: get_data_ptr(tensor)
             for name, tensor in (
@@ -133,8 +150,6 @@ class GroupedGemmGluBf16API(APIBase):
         self._workspace: Optional[torch.Tensor] = None
         self._live_b_ptrs = None
         self._compile_b_ptrs = None
-        self._validated_offsets: dict[int, tuple] = {}
-        self._validated_pointer_values: dict[int, tuple] = {}
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
 
     @staticmethod
@@ -151,54 +166,6 @@ class GroupedGemmGluBf16API(APIBase):
     def _expect_device(desc: TensorDesc, device: torch.device, name: str) -> None:
         if desc.device != device:
             raise ValueError(f"{name} must be on {device}, got {desc.device}")
-
-    @staticmethod
-    def _copy_values_to_host(tensor: torch.Tensor) -> Tuple[int, ...]:
-        return tuple(int(value) for value in to_host_list(tensor))
-
-    @staticmethod
-    def _is_validation_cached(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> bool:
-        cached = cache.get(id(tensor))
-        return bool(cached and cached[0]() is tensor and cached[1] == get_version(tensor) and cached[2] == extra)
-
-    @staticmethod
-    def _remember_validation(cache: dict[int, tuple], tensor: torch.Tensor, extra) -> None:
-        key = id(tensor)
-
-        def discard(_reference, *, cache=cache, key=key):
-            cache.pop(key, None)
-
-        cache[key] = (weakref.ref(tensor, discard), get_version(tensor), extra)
-
-    @staticmethod
-    def _validate_offset_sequence(values: Tuple[int, ...], *, expert_cnt: int, tensor_m: int) -> None:
-        if len(values) != expert_cnt:
-            raise ValueError(f"padded_offsets length mismatch: expected {expert_cnt}, got {len(values)}")
-        previous = 0
-        for index, value in enumerate(values):
-            if value < previous:
-                raise ValueError("padded_offsets must be a non-decreasing cumulative sum; " f"index {index} is {value} after {previous}")
-            if value % MoEGroupedGemmGluBiasBf16Kernel.FIX_PAD_SIZE != 0:
-                raise ValueError(f"padded_offsets[{index}] must be 256-aligned, got {value}")
-            previous = value
-        if not values or values[-1] <= 0 or values[-1] > tensor_m:
-            raise ValueError(f"padded_offsets last value must be in [1, {tensor_m}], got " f"{values[-1] if values else None}")
-
-    def _validate_offsets_once(self, offsets: torch.Tensor, *, tensor_m: int) -> None:
-        extra = (self.expert_cnt, tensor_m)
-        if self._is_validation_cached(self._validated_offsets, offsets, extra):
-            return
-        values = self._copy_values_to_host(offsets)
-        self._validate_offset_sequence(values, expert_cnt=self.expert_cnt, tensor_m=tensor_m)
-        self._remember_validation(self._validated_offsets, offsets, extra)
-
-    def _validate_pointer_values_once(self, b_ptrs: torch.Tensor) -> None:
-        if self._is_validation_cached(self._validated_pointer_values, b_ptrs, self.expert_cnt):
-            return
-        pointer_values = _pointer_values(b_ptrs)
-        if any(value == 0 or value % 16 != 0 for value in pointer_values):
-            raise ValueError("b_ptrs entries must be non-null and 16-byte aligned")
-        self._remember_validation(self._validated_pointer_values, b_ptrs, self.expert_cnt)
 
     @staticmethod
     def _validate_data_alignment(tensor: torch.Tensor, name: str) -> None:
@@ -317,21 +284,6 @@ class GroupedGemmGluBf16API(APIBase):
         if tensor_m % 256 != 0:
             raise ValueError(f"sample_a M dimension must be 256-aligned, got {tensor_m}")
 
-        self._validate_offset_sequence(
-            self._sample_offset_values,
-            expert_cnt=self.expert_cnt,
-            tensor_m=tensor_m,
-        )
-        sample_offsets = self._sample_offsets_ref()
-        if sample_offsets is not None and get_version(sample_offsets) == self._sample_offsets_version:
-            self._remember_validation(
-                self._validated_offsets,
-                sample_offsets,
-                (self.expert_cnt, tensor_m),
-            )
-        elif sample_offsets is not None:
-            self._validate_offsets_once(sample_offsets, tensor_m=tensor_m)
-
         if not self._kernel.can_implement(
             cutlass.BFloat16,
             _convert_to_cutlass_data_type(self.c_desc.dtype),
@@ -441,18 +393,18 @@ class GroupedGemmGluBf16API(APIBase):
 
         raw_compiled = cute.compile(
             kernel,
-            a=a_fake,
-            b=b_fake,
+            a=canonical_mx_fake(a_fake, self.canonical_a),
+            b=canonical_b_fake(b_fake, self.canonical_b) if self.weight_mode == MoEWeightMode.DENSE else b_fake,
             n=n_value,
             k=k_value,
             b_stride_size=b_stride,
             b_major_mode=b_major_mode,
             workspace_ptr=workspace_ptr,
-            c=c_fake,
-            d=d_fake,
+            c=canonical_mx_fake(c_fake, self.canonical_c),
+            d=canonical_mx_fake(d_fake, self.canonical_d),
             padded_offsets=self._make_fake_cute_tensor_from_desc(self.padded_offsets_desc),
             alpha=self._make_fake_cute_tensor_from_desc(self.alpha_desc),
-            prob=prob_fake,
+            prob=canonical_prob_fake(prob_fake, self.canonical_prob),
             bias=self._make_fake_cute_tensor_from_desc(self.bias_desc),
             max_active_clusters=max_active_clusters,
             stream=fake_stream,
@@ -504,29 +456,75 @@ class GroupedGemmGluBf16API(APIBase):
         name: str,
         *,
         dynamic_m: bool = False,
+        canonical: bool = False,
+        normalize=None,
     ) -> TensorDesc:
-        # The outcome of this check is decided entirely by (shape, stride, dtype, device),
-        # so memoize on exactly that. An operand differing in any of them takes a different
-        # key, misses, and is checked in full; nothing is skipped on the strength of a
-        # tensor's identity. Data-pointer alignment is checked by the caller, not here.
-        key = (name, dynamic_m, get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
-        hit = self._live_desc_cache.get(key)
-        if hit is not None:
-            return hit
+        """Check one operand's metadata against its compile-time (kernel-facing) descriptor.
+
+        An operand compiled canonical must arrive canonical and is checked through its
+        kernel-facing view; one compiled kernel-facing must arrive kernel-facing (the rank
+        check below rejects a canonical tensor there). Data pointers are not checked here.
+        """
+        if canonical:
+            is_canonical, tensor = normalize(tensor)
+            if not is_canonical:
+                raise ValueError(f"{name} must use the canonical layout it was compiled with, got shape {get_shape(tensor)}")
         desc = self._make_tensor_desc(tensor, name=name, canonical=True)
         if desc.dtype != sample.dtype:
             raise ValueError(f"{name} dtype mismatch: expected {sample.dtype}, got {desc.dtype}")
         if desc.device != sample.device:
             raise ValueError(f"{name} device mismatch: expected {sample.device}, got {desc.device}")
         if dynamic_m:
-            if desc.shape[1:] != sample.shape[1:]:
+            if desc.ndim != sample.ndim or desc.shape[1:] != sample.shape[1:]:
                 raise ValueError(f"{name} shape suffix mismatch: expected {sample.shape[1:]}, " f"got {desc.shape[1:]}")
             if desc.stride_order != sample.stride_order:
                 raise ValueError(f"{name} layout mismatch: expected stride order " f"{sample.stride_order}, got {desc.stride_order}")
         elif desc.shape != sample.shape or desc.stride != sample.stride:
             raise ValueError(f"{name} descriptor mismatch: expected shape/stride " f"{sample.shape}/{sample.stride}, got {desc.shape}/{desc.stride}")
-        self._live_desc_cache[key] = desc
         return desc
+
+    def _validate_live(self, a_tensor, c_tensor, d_tensor, padded_offsets, alpha_tensor, b_tensor, b_ptrs, bias_tensor, prob_tensor) -> None:
+        """Every metadata-only execute check. Its outcome is a pure function of the operands'
+        (shape, stride, dtype, device) and presence, so execute() memoizes it on exactly that."""
+        a_desc = self._validate_live_tensor(a_tensor, self.a_desc, "a_tensor", dynamic_m=True, canonical=self.canonical_a, normalize=normalize_mx)
+        c_desc = self._validate_live_tensor(c_tensor, self.c_desc, "c_tensor", dynamic_m=True, canonical=self.canonical_c, normalize=normalize_mx)
+        d_desc = self._validate_live_tensor(d_tensor, self.d_desc, "d_tensor", dynamic_m=True, canonical=self.canonical_d, normalize=normalize_mx)
+        self._validate_live_tensor(padded_offsets, self.padded_offsets_desc, "padded_offsets")
+        self._validate_live_tensor(alpha_tensor, self.alpha_desc, "alpha_tensor")
+        prob_desc = self._validate_live_tensor(
+            prob_tensor, self.prob_desc, "prob_tensor", dynamic_m=True, canonical=self.canonical_prob, normalize=normalize_prob
+        )
+
+        tensor_m, k, _ = a_desc.shape
+        n = c_desc.shape[1]
+        n_out = n // 2
+        if tensor_m % 256 != 0:
+            raise ValueError(f"a_tensor M dimension must be 256-aligned, got {tensor_m}")
+        self._expect_shape(c_desc, (tensor_m, n, 1), "c_tensor")
+        self._expect_shape(d_desc, (tensor_m, n_out, 1), "d_tensor")
+        self._expect_shape(prob_desc, (tensor_m, 1, 1), "prob_tensor")
+        self._expect_stride(a_desc, (k, 1, tensor_m * k), "a_tensor")
+        self._expect_stride(c_desc, (n, 1, tensor_m * n), "c_tensor")
+        self._expect_stride(d_desc, (n_out, 1, tensor_m * n_out), "d_tensor")
+        self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
+
+        if self._has_bias:
+            if bias_tensor is None:
+                raise ValueError("bias_tensor is required because the API was compiled " "with sample_bias")
+            self._validate_live_tensor(bias_tensor, self.bias_desc, "bias_tensor")
+        elif bias_tensor is not None:
+            raise ValueError("bias_tensor must be omitted because the API was compiled " "without sample_bias")
+
+        if self.weight_mode == MoEWeightMode.DENSE:
+            if b_tensor is None or b_ptrs is not None:
+                raise ValueError("Dense execution requires b_tensor and forbids b_ptrs")
+            self._validate_live_tensor(b_tensor, self.b_desc, "b_tensor", canonical=self.canonical_b, normalize=normalize_b)
+        else:
+            if b_tensor is not None or b_ptrs is None:
+                raise ValueError("Discrete execution requires b_ptrs and forbids b_tensor")
+            _validate_pointer_tensor(b_ptrs, "b_ptrs", self.expert_cnt)
+            if get_device(b_ptrs) != self.a_desc.device:
+                raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({self.a_desc.device}), got {get_device(b_ptrs)}")
 
     def execute(
         self,
@@ -551,27 +549,15 @@ class GroupedGemmGluBf16API(APIBase):
         if prob_tensor is None:
             raise ValueError("prob_tensor is required")
 
-        a_desc = self._validate_live_tensor(a_tensor, self.a_desc, "a_tensor", dynamic_m=True)
-        c_desc = self._validate_live_tensor(c_tensor, self.c_desc, "c_tensor", dynamic_m=True)
-        d_desc = self._validate_live_tensor(d_tensor, self.d_desc, "d_tensor", dynamic_m=True)
-        self._validate_live_tensor(padded_offsets, self.padded_offsets_desc, "padded_offsets")
-        self._validate_live_tensor(alpha_tensor, self.alpha_desc, "alpha_tensor")
-        prob_desc = self._validate_live_tensor(prob_tensor, self.prob_desc, "prob_tensor", dynamic_m=True)
+        operands = (a_tensor, c_tensor, d_tensor, padded_offsets, alpha_tensor, b_tensor, b_ptrs, bias_tensor, prob_tensor)
+        signature = tuple(operand_signature(tensor) for tensor in operands)
+        if signature not in self._validated_live:
+            self._validate_live(*operands)
+            if len(self._validated_live) >= _VALIDATED_LIVE_LIMIT:
+                self._validated_live.clear()
+            self._validated_live[signature] = True
 
-        tensor_m, k, _ = a_desc.shape
-        n = c_desc.shape[1]
-        n_out = n // 2
-        if tensor_m % 256 != 0:
-            raise ValueError(f"a_tensor M dimension must be 256-aligned, got {tensor_m}")
-        self._expect_shape(c_desc, (tensor_m, n, 1), "c_tensor")
-        self._expect_shape(d_desc, (tensor_m, n_out, 1), "d_tensor")
-        self._expect_shape(prob_desc, (tensor_m, 1, 1), "prob_tensor")
-        self._expect_stride(a_desc, (k, 1, tensor_m * k), "a_tensor")
-        self._expect_stride(c_desc, (n, 1, tensor_m * n), "c_tensor")
-        self._expect_stride(d_desc, (n_out, 1, tensor_m * n_out), "d_tensor")
-        self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
-        self._validate_offsets_once(padded_offsets, tensor_m=tensor_m)
-
+        # Per-call checks: data pointers change every call even when the metadata does not.
         for tensor, name in (
             (a_tensor, "a_tensor"),
             (c_tensor, "c_tensor"),
@@ -579,31 +565,16 @@ class GroupedGemmGluBf16API(APIBase):
             (padded_offsets, "padded_offsets"),
             (alpha_tensor, "alpha_tensor"),
             (prob_tensor, "prob_tensor"),
+            (bias_tensor, "bias_tensor"),
+            (b_tensor, "b_tensor"),
         ):
-            self._validate_data_alignment(tensor, name)
-
-        if self._has_bias:
-            if bias_tensor is None:
-                raise ValueError("bias_tensor is required because the API was compiled " "with sample_bias")
-            self._validate_live_tensor(bias_tensor, self.bias_desc, "bias_tensor")
-            self._validate_data_alignment(bias_tensor, "bias_tensor")
-        elif bias_tensor is not None:
-            raise ValueError("bias_tensor must be omitted because the API was compiled " "without sample_bias")
-
-        if self.weight_mode == MoEWeightMode.DENSE:
-            if b_tensor is None or b_ptrs is not None:
-                raise ValueError("Dense execution requires b_tensor and forbids b_ptrs")
-            self._validate_live_tensor(b_tensor, self.b_desc, "b_tensor")
-            self._validate_data_alignment(b_tensor, "b_tensor")
-        else:
-            if b_tensor is not None or b_ptrs is None:
-                raise ValueError("Discrete execution requires b_ptrs and forbids b_tensor")
-            _validate_pointer_tensor(b_ptrs, "b_ptrs", self.expert_cnt)
-            if get_device(b_ptrs) != self.a_desc.device:
-                raise ValueError(f"b_ptrs must be on the same device as a_tensor " f"({self.a_desc.device}), got {get_device(b_ptrs)}")
+            if tensor is not None:
+                self._validate_data_alignment(tensor, name)
+        debug_validate_offsets(padded_offsets, expert_cnt=self.expert_cnt, limit=get_shape(a_tensor)[0], mode="padded", stream=current_stream)
+        if b_ptrs is not None:
             if get_data_ptr(b_ptrs) % 8 != 0:
                 raise ValueError("b_ptrs data pointer must be 8-byte aligned")
-            self._validate_pointer_values_once(b_ptrs)
+            debug_validate_pointer_values(b_ptrs, "b_ptrs", stream=current_stream)
             self._record_pointer_stream(b_ptrs, current_stream)
 
         self._compiled_kernel(

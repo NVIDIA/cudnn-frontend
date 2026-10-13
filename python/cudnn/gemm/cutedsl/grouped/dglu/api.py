@@ -28,10 +28,12 @@ from ..backend_utils import (
     allocate_wrapper_workspace,
     backend_cache_key,
     block_scaled_sfd_tensors,
+    row_major_layout,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
     wrapper_workspace,
 )
+from ..canonical import check_canonical_contiguous, is_canonical_b
 from ..moe_utils import MoEWeightMode
 from cuda.bindings import driver as cuda
 import logging
@@ -983,15 +985,18 @@ def _normalize_dglu_call(
     if not is_dense and not is_discrete:
         raise ValueError("Must provide either (b_tensor, sfb_tensor) or (b_ptrs, sfb_ptrs)")
     a_shape = get_shape(call.a_tensor)
-    if len(a_shape) != 3 or a_shape[2] != 1:
-        raise ValueError(f"a_tensor must have shape (m, k, 1), got {a_shape}")
+    if len(a_shape) not in (2, 3) or (len(a_shape) == 3 and a_shape[2] != 1):
+        raise ValueError(f"a_tensor must have shape (m, k) or (m, k, 1), got {a_shape}")
 
-    valid_m, k, _ = a_shape
+    valid_m, k = a_shape[:2]
     if is_dense:
         b_full_shape = get_shape(call.b_tensor)
         if len(b_full_shape) != 3:
-            raise ValueError(f"b_tensor must have shape (n, k, experts), got {b_full_shape}")
-        n_weight, b_k, num_experts = b_full_shape
+            raise ValueError(f"b_tensor must have shape (n, k, experts) or canonical (experts, n, k), got {b_full_shape}")
+        if is_canonical_b(call.b_tensor):
+            num_experts, n_weight, b_k = b_full_shape
+        else:
+            n_weight, b_k, num_experts = b_full_shape
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
         defining_b_dtype = call.b_tensor.dtype
@@ -1047,6 +1052,16 @@ def _normalize_dglu_call(
             raise ValueError("round_dgrad_to_input_dtype is supported only by the BF16 kernel")
         return normalized, backend
 
+    canonical_operands = (
+        len(a_shape) == 2
+        or (is_dense and is_canonical_b(call.b_tensor))
+        or any(t is not None and len(get_shape(t)) == 1 for t in (call.prob_tensor, call.dprob_tensor))
+        or len(get_shape(call.c_tensor)) == 2
+    )
+    if canonical_operands:
+        if detect_framework(call.a_tensor) != "torch":
+            raise ValueError("Canonical BF16 dGLU layouts are supported for torch tensors only")
+        check_canonical_contiguous(call.a_tensor, call.b_tensor, call.prob_tensor)
     if call.activation_tensor is not None:
         if detect_framework(call.a_tensor) != "torch":
             raise ValueError("activation output currently requires torch tensors")
@@ -1071,12 +1086,12 @@ def _normalize_dglu_call(
     if n_weight <= 0 or n_weight % 32 != 0:
         raise ValueError(f"N must be positive and divisible by 32, got {n_weight}")
     two_n = 2 * n_weight
-    if get_shape(call.c_tensor) != (valid_m, two_n, 1):
-        raise ValueError(f"c_tensor must have shape {(valid_m, two_n, 1)}, got {get_shape(call.c_tensor)}")
-    if get_shape(call.prob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)}, got {get_shape(call.prob_tensor)}")
-    if get_shape(call.dprob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"dprob_tensor must have shape {(valid_m, 1, 1)}, got {get_shape(call.dprob_tensor)}")
+    if get_shape(call.c_tensor) not in ((valid_m, two_n, 1), (valid_m, two_n)):
+        raise ValueError(f"c_tensor must have shape {(valid_m, two_n, 1)} or canonical {(valid_m, two_n)}, got {get_shape(call.c_tensor)}")
+    if get_shape(call.prob_tensor) not in ((valid_m, 1, 1), (valid_m,)):
+        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)} or canonical {(valid_m,)}, got {get_shape(call.prob_tensor)}")
+    if get_shape(call.dprob_tensor) not in ((valid_m, 1, 1), (valid_m,)):
+        raise ValueError(f"dprob_tensor must have shape {(valid_m, 1, 1)} or canonical {(valid_m,)}, got {get_shape(call.dprob_tensor)}")
     if _convert_to_cutlass_data_type(call.dprob_tensor.dtype) is not cutlass.Float32:
         raise ValueError(f"dprob_tensor must have dtype torch.float32, got {call.dprob_tensor.dtype}")
     offsets_shape = get_shape(call.padded_offsets)
@@ -1125,17 +1140,17 @@ def _dglu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = 
     )
 
 
-def _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, num_experts, a_tensor, current_stream):
+def _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, num_experts, a_tensor, current_stream, canonical=False):
     """Outputs for the BF16 dGLU path. dbias is zeroed because the kernel accumulates
-    into it with atomic adds; d_row is written in full and only needs allocating."""
+    into it with atomic adds; d_row is written in full and only needs allocating.
+    ``canonical`` (a 2-D A) selects a canonical (m, 2n) d_row."""
     if framework == "torch":
         import torch
 
         # _torch_stream_context is torch-only; other frameworks never enter it.
         with _torch_stream_context(current_stream, a_tensor.device):
             d_row_tensor = torch.empty_strided(
-                (valid_m, two_n, 1),
-                (two_n, 1, valid_m * two_n),
+                *row_major_layout(valid_m, two_n, canonical),
                 dtype=framework_dtype(d_dtype, "torch"),
                 device=a_tensor.device,
             )
@@ -1164,10 +1179,14 @@ _dglu_wrapper_memo: dict = {}
 def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = None) -> TupleDict:
     framework = detect_framework(call.a_tensor)
     valid_m = get_shape(call.a_tensor)[0]
-    n_weight = get_shape(call.b_tensor)[0] if call.b_tensor is not None else call.n
+    canonical_outputs = len(get_shape(call.a_tensor)) == 2
+    if call.b_tensor is not None:
+        n_weight = get_shape(call.b_tensor)[1] if is_canonical_b(call.b_tensor) else get_shape(call.b_tensor)[0]
+    else:
+        n_weight = call.n
     two_n = 2 * n_weight
     d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
-        framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, call.a_tensor, call.current_stream
+        framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, call.a_tensor, call.current_stream, canonical_outputs
     )
 
     overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
@@ -1255,7 +1274,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         _cache_of_GroupedGemmDgluSm100Objects[cache_key] = api
 
     if memo_key is not None:
-        _dglu_wrapper_memo[memo_key] = (api, framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts)
+        _dglu_wrapper_memo[memo_key] = (api, framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, canonical_outputs)
 
     launch_stream = call.current_stream if call.current_stream is not None or framework == "torch" else default_stream(framework)
     with wrapper_workspace(framework, api.scratch_workspace_bytes(), call.a_tensor.device, launch_stream) as workspace:
@@ -1389,12 +1408,12 @@ def grouped_gemm_dglu_wrapper_sm100(
     )
     memo = _dglu_wrapper_memo.get(memo_key)
     if memo is not None and memo[0].backend is GroupedGemmBackend.BF16:
-        api, memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts = memo
+        api, memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, memo_canonical = memo
         # The full path resolves this during normalization; the memo bypasses that, so
         # apply the same default here rather than handing None to the kernel.
         resolved_linear_offset = linear_offset if linear_offset is not None else (1.0 if act_func == "dgeglu" else 0.0)
         d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
-            memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, a_tensor, current_stream
+            memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, a_tensor, current_stream, memo_canonical
         )
         launch_stream = current_stream if current_stream is not None or memo_framework == "torch" else default_stream(memo_framework)
         with wrapper_workspace(memo_framework, api.scratch_workspace_bytes(), a_tensor.device, launch_stream) as workspace:
@@ -1485,3 +1504,9 @@ def grouped_gemm_dglu_wrapper_sm100(
     if framework == "jax":
         raise ValueError(_JAX_BLOCK_SCALED_ERROR)
     return _grouped_gemm_dglu_block_scaled_call(normalized, memo_key)
+
+
+# BF16 torch calls accept canonical operands -- A/C/D (m, x), prob (m,), dense B
+# (experts, n, k) -- with no host reads of device offsets/pointers; integrations
+# feature-detect this before passing them.
+grouped_gemm_dglu_wrapper_sm100.supports_bf16_canonical_layouts = True

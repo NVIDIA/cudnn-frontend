@@ -26,6 +26,8 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
+from ..backend_utils import row_major_layout
+from ..canonical import check_canonical_contiguous, is_canonical_b
 from ..moe_utils import MoEWeightMode
 
 __all__ = ["GroupedGemmBf16API"]
@@ -225,8 +227,14 @@ def _normalize_call(
 
     if _convert_to_cutlass_data_type(a_tensor.dtype) is not cutlass.BFloat16:
         raise ValueError(f"a_tensor must have dtype torch.bfloat16, got {a_tensor.dtype}")
-    if len(get_shape(a_tensor)) != 3 or get_shape(a_tensor)[2] != 1:
-        raise ValueError(f"a_tensor must have shape (m, k, 1), got {get_shape(a_tensor)}")
+    a_shape = get_shape(a_tensor)
+    if len(a_shape) not in (2, 3) or (len(a_shape) == 3 and a_shape[2] != 1):
+        raise ValueError(f"a_tensor must have shape (m, k) or (m, k, 1), got {a_shape}")
+    canonical_operands = len(a_shape) == 2 or (is_dense and is_canonical_b(b_tensor)) or (prob_tensor is not None and len(get_shape(prob_tensor)) == 1)
+    if canonical_operands:
+        if framework != "torch":
+            raise ValueError("Canonical layouts (2-D A, (experts, n, k) B, 1-D prob) are supported for torch tensors only")
+        check_canonical_contiguous(a_tensor, b_tensor if is_dense else None, prob_tensor)
     if prob_tensor is None:
         raise ValueError("prob_tensor is required")
     if cd_major != "n":
@@ -244,11 +252,11 @@ def _normalize_call(
     if compute_capability < 100:
         raise RuntimeError(f"GroupedGemmSm100 requires SM100+, found SM{compute_capability}")
 
-    tensor_m, k, _ = get_shape(a_tensor)
+    tensor_m, k = a_shape[:2]
     if tensor_m % 256 != 0:
         raise ValueError(f"a_tensor M dimension must be 256-aligned, got {tensor_m}")
-    if get_shape(prob_tensor) != (tensor_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(tensor_m, 1, 1)}, got " f"{get_shape(prob_tensor)}")
+    if get_shape(prob_tensor) not in ((tensor_m, 1, 1), (tensor_m,)):
+        raise ValueError(f"prob_tensor must have shape {(tensor_m, 1, 1)} or canonical {(tensor_m,)}, got " f"{get_shape(prob_tensor)}")
     if _convert_to_cutlass_data_type(prob_tensor.dtype) is not cutlass.Float32:
         raise ValueError(f"prob_tensor must have dtype torch.float32, got {prob_tensor.dtype}")
     if is_dense:
@@ -259,8 +267,11 @@ def _normalize_call(
         if _convert_to_cutlass_data_type(b_tensor.dtype) is not cutlass.BFloat16:
             raise ValueError(f"b_tensor must have dtype torch.bfloat16, got {b_tensor.dtype}")
         if len(get_shape(b_tensor)) != 3:
-            raise ValueError(f"b_tensor must have shape (n, k, experts), got {get_shape(b_tensor)}")
-        n, b_k, experts = get_shape(b_tensor)
+            raise ValueError(f"b_tensor must have shape (n, k, experts) or canonical (experts, n, k), got {get_shape(b_tensor)}")
+        if is_canonical_b(b_tensor):
+            experts, n, b_k = get_shape(b_tensor)
+        else:
+            n, b_k, experts = get_shape(b_tensor)
         if b_k != k:
             raise ValueError(f"b_tensor K dimension ({b_k}) must match a_tensor ({k})")
     else:
@@ -312,12 +323,14 @@ def grouped_gemm_wrapper_sm100(
     # pure function of the operands' metadata plus the scalar config, both of which are
     # in the key below. So a hit skips the derivation and reuses its result. It does not
     # skip any check: op.execute() still validates every operand, including the data
-    # pointers the key deliberately omits. Only the allocate-the-outputs case is memoized;
-    # caller-supplied c/d need _validate_output and fall through.
+    # pointers the key deliberately omits. A caller-supplied d_tensor is memoized too: its
+    # metadata is in the key, and _validate_output is a pure function of that metadata.
+    # A caller-supplied c_tensor falls through.
     _memo_key = None
-    if c_tensor is None and d_tensor is None:
+    if c_tensor is None:
         _memo_key = (
             type(a_tensor),
+            _operand_meta(d_tensor),
             _operand_meta(a_tensor),
             _operand_meta(padded_offsets),
             _operand_meta(alpha_tensor),
@@ -344,7 +357,7 @@ def grouped_gemm_wrapper_sm100(
         if memo is not None:
             op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
             internal_c = _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
-            d_out = _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
+            d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
             op.execute(
                 a_tensor=a_tensor,
                 c_tensor=internal_c,
@@ -384,8 +397,8 @@ def grouped_gemm_wrapper_sm100(
         m_aligned,
         framework,
     )
-    expected_shape = (tensor_m, n_out, 1)
-    expected_stride = (n_out, 1, tensor_m * n_out)
+    # A canonical (m, k) A selects canonical (m, n) C/D, as on the block-scaled GLU path.
+    expected_shape, expected_stride = row_major_layout(tensor_m, n_out, len(get_shape(a_tensor)) == 2)
 
     def _allocate(dtype):
         return _allocate_output(framework, expected_shape, expected_stride, dtype, a_tensor.device)
@@ -463,7 +476,7 @@ def grouped_gemm_wrapper_sm100(
             sample_bias=bias_tensor,
             sample_prob=prob_tensor,
             num_experts=None if is_dense else expert_cnt,
-            b_shape=None if is_dense else (n_out, a_tensor.shape[1]),
+            b_shape=None if is_dense else (n_out, get_shape(a_tensor)[1]),
             b_dtype=None if is_dense else b_dtype,
             acc_dtype=acc_dtype,
             mma_tiler_mn=mma_tiler_mn,
@@ -503,3 +516,9 @@ __all__ = [
     "GroupedGemmSm100",
     "grouped_gemm_wrapper_sm100",
 ]
+
+
+# BF16 torch calls accept canonical operands -- A/C/D (m, x), prob (m,), dense B
+# (experts, n, k) -- with no host reads of device offsets/pointers; integrations
+# feature-detect this before passing them.
+grouped_gemm_wrapper_sm100.supports_bf16_canonical_layouts = True

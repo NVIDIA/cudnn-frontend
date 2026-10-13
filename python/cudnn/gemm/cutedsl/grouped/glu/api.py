@@ -1032,8 +1032,11 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
     if backend is GroupedGemmBackend.BLOCK_SCALED:
         return normalized, backend
 
-    if len(a_shape) == 2 or is_canonical_b(call.b_tensor):
-        raise ValueError("Canonical layouts require the block-scaled GLU backend")
+    canonical_operands = len(a_shape) == 2 or is_canonical_b(call.b_tensor) or (call.prob_tensor is not None and len(get_shape(call.prob_tensor)) == 1)
+    if canonical_operands and detect_framework(call.a_tensor) != "torch":
+        raise ValueError("Canonical BF16 GLU layouts are supported for torch tensors only")
+    if canonical_operands:
+        check_canonical_contiguous(call.a_tensor, call.b_tensor, call.prob_tensor)
     if call.use_single_group_runtime_offsets:
         raise ValueError("use_single_group_runtime_offsets is supported only by the block-scaled kernel")
     if call.prob_tensor is None:
@@ -1052,8 +1055,8 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         raise ValueError(f"a_tensor M dimension must be 256-aligned, got {valid_m}")
     if n_full <= 0 or n_full % 64 != 0:
         raise ValueError(f"N must be positive and divisible by 64, got {n_full}")
-    if get_shape(call.prob_tensor) != (valid_m, 1, 1):
-        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)}, got " f"{get_shape(call.prob_tensor)}")
+    if get_shape(call.prob_tensor) not in ((valid_m, 1, 1), (valid_m,)):
+        raise ValueError(f"prob_tensor must have shape {(valid_m, 1, 1)} or canonical {(valid_m,)}, got " f"{get_shape(call.prob_tensor)}")
     if call.bias_tensor is not None and get_shape(call.bias_tensor) != (
         n_full,
         num_experts,
@@ -1119,18 +1122,24 @@ def _glu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = F
 
 def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None) -> TupleDict:
     framework = detect_framework(call.a_tensor)
-    valid_m, k, _ = get_shape(call.a_tensor)
+    a_shape = get_shape(call.a_tensor)
+    valid_m = a_shape[0]
     if call.weight_mode == MoEWeightMode.DENSE:
-        n_full = get_shape(call.b_tensor)[0]
+        b_shape = get_shape(call.b_tensor)
+        n_full = b_shape[1] if is_canonical_b(call.b_tensor) else b_shape[0]
     else:
         n_full = call.n
     n_out = n_full // 2
+    # A canonical (m, k) A selects canonical (m, n) C/D outputs, as on the block-scaled path.
+    canonical_outputs = len(a_shape) == 2
+    c_layout = row_major_layout(valid_m, n_full, canonical_outputs)
+    d_layout = row_major_layout(valid_m, n_out, canonical_outputs)
 
-    def _allocate_output(shape, stride, dtype):
-        return _glu_allocate_output(framework, shape, stride, dtype, call.a_tensor.device)
+    def _allocate_output(layout, dtype):
+        return _glu_allocate_output(framework, *layout, dtype, call.a_tensor.device)
 
-    c_tensor = _allocate_output((valid_m, n_full, 1), (n_full, 1, valid_m * n_full), call.c_dtype)
-    d_tensor = _allocate_output((valid_m, n_out, 1), (n_out, 1, valid_m * n_out), call.d_dtype)
+    c_tensor = _allocate_output(c_layout, call.c_dtype)
+    d_tensor = _allocate_output(d_layout, call.d_dtype)
 
     overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
     workspace_bytes = (128 * call.num_experts if call.weight_mode == MoEWeightMode.DISCRETE else 0) + (4 if call.use_dynamic_sched else 0)
@@ -1204,7 +1213,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
         _cache_of_GroupedGemmGluSm100Objects[cache_key] = api
 
     if memo_key is not None:
-        _glu_wrapper_memo[memo_key] = (api, framework, valid_m, n_full, n_out, call.c_dtype, call.d_dtype)
+        _glu_wrapper_memo[memo_key] = (api, framework, c_layout, d_layout, call.c_dtype, call.d_dtype)
 
     api.execute(
         a_tensor=call.a_tensor,
@@ -1285,7 +1294,8 @@ def grouped_gemm_glu_wrapper_sm100(
     Block-scaled inputs also accept row-major A (m, k), B (experts, n, k),
     prob (m,), and contiguous SFA/SFB buffers containing already MMA-packed bytes.
     A 2-D A selects 2-D C/D/D_col and physical contiguous 6-D SFD outputs.
-    BF16 inputs retain the legacy layout contract.
+    BF16 torch inputs accept the same canonical A/B/prob forms (no scale factors) and
+    return 2-D C/D for a 2-D A.
     scheduler_counter_tensor optionally supplies a caller-owned CUDA int32 counter
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
@@ -1339,9 +1349,9 @@ def grouped_gemm_glu_wrapper_sm100(
     )
     memo = _glu_wrapper_memo.get(memo_key)
     if memo is not None and memo[0].backend is GroupedGemmBackend.BF16:
-        api, framework, valid_m, n_full, n_out, memo_c_dtype, memo_d_dtype = memo
-        c_out = _glu_allocate_output(framework, (valid_m, n_full, 1), (n_full, 1, valid_m * n_full), memo_c_dtype, a_tensor.device)
-        d_out = _glu_allocate_output(framework, (valid_m, n_out, 1), (n_out, 1, valid_m * n_out), memo_d_dtype, a_tensor.device)
+        api, framework, c_layout, d_layout, memo_c_dtype, memo_d_dtype = memo
+        c_out = _glu_allocate_output(framework, *c_layout, memo_c_dtype, a_tensor.device)
+        d_out = _glu_allocate_output(framework, *d_layout, memo_d_dtype, a_tensor.device)
         api.execute(
             a_tensor=a_tensor,
             c_tensor=c_out,
@@ -1465,3 +1475,9 @@ grouped_gemm_glu_wrapper_sm100.supports_canonical_layouts = True
 __all__ = ["GluCall", "GroupedGemmGluSm100", "grouped_gemm_glu_wrapper_sm100"]
 
 grouped_gemm_glu_wrapper_sm100.supports_external_scheduler_counter = True
+
+
+# BF16 torch calls accept canonical operands -- A/C/D (m, x), prob (m,), dense B
+# (experts, n, k) -- with no host reads of device offsets/pointers; integrations
+# feature-detect this before passing them.
+grouped_gemm_glu_wrapper_sm100.supports_bf16_canonical_layouts = True

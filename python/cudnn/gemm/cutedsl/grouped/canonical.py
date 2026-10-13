@@ -64,6 +64,35 @@ def normalize_prob(tensor):
     return False, tensor
 
 
+def normalize_torch_operand(normalize, tensor):
+    """``normalize(tensor)`` for torch tensors; any other framework keeps its legacy layout.
+
+    The helpers above use torch view ops. APIs that also serve JAX (the BF16 grouped
+    GEMMs) route through here so a JAX array is never treated as canonical.
+    """
+    from cudnn.tensor_adapter import is_torch_tensor
+
+    if tensor is None or not is_torch_tensor(tensor):
+        return False, tensor
+    return normalize(tensor)
+
+
+def operand_signature(tensor):
+    """Hashable (shape, stride, dtype, device) of an execute operand, or None.
+
+    Everything a metadata-only validation reads, and nothing else: data pointers vary
+    per call and are checked separately. Torch tensors take the direct attribute path,
+    which is what keeps a memoized validation cheap on the hot path.
+    """
+    if tensor is None:
+        return None
+    from cudnn.tensor_adapter import get_device, get_shape, get_strides, is_torch_tensor
+
+    if is_torch_tensor(tensor):
+        return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
+
+
 def is_flat_sf(tensor) -> bool:
     """True when a scale-factor tensor is a dense C-contiguous buffer (canonical form).
 
