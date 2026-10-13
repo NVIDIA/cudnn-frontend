@@ -154,8 +154,31 @@ split count. The SM100/SM103 blk64 path also accepts `kv_splits="auto"`; CLC is
 compatible with split execution. Pass `use_clc=True` to use persistent CLC
 scheduling with `kv_splits>1`, or `use_clc=False` to use one tile per CTA. The
 default `use_clc=None` keeps CLC disabled for split execution because the
-automatic scheduler policy has not been tuned for that combination. Automatic
-split selection uses metadata capacity rather than per-row count values. It
+automatic scheduler policy has not been tuned for that combination.
+
+The BF16 automatic policy is tuned assuming approximately uniform random KV
+indices with little overlap between the neighborhoods of different Q blocks.
+It uses host-visible tensor metadata and device properties, without reading
+indices or counts back to the host. Highly overlapping, shared or local-window
+indices can favor a different split count even at the same shape and density;
+benchmark explicit `kv_splits` values for those masks. This assumption affects
+performance only, not attention semantics or supported mask patterns.
+
+For fewer than 512 total Q tiles (`B * H * ceil(S_q / 64)`), the existing policy
+uses the fixed active block count, or index capacity for variable counts:
+256--449 blocks select two splits, 450--899 select four, and 900 or more select
+eight. Larger Q grids keep one split except in the measured long-Q region:
+BF16 MHA with Q/K/V head dimensions 128, `S_q >= 262144`, a fixed count of at
+least 512 active KV blocks, and density at most 1/8 (active blocks divided by
+`ceil(S_k / 64)`). In that region, K+V bytes **per batch and KV head** above twice
+the device L2 size select eight splits for at least 900 active blocks and four
+or more heads; a single head requires at least 1024 active blocks. Otherwise,
+four or more heads select four splits when per-head K+V bytes exceed L2.
+All other cases, including an unavailable L2 size, keep one split. Variable
+per-row counts also keep one split on larger Q grids because index capacity
+does not describe actual row work. The Sage FP8 policy is separate.
+
+Automatic selection
 falls back to a smaller split count when the estimated live workspace does not
 fit the available CUDA allocator budget; an explicit split count that exceeds
 that budget raises `RuntimeError`.
