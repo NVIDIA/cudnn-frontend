@@ -75,6 +75,7 @@ CUDA graphs:
 """
 
 from __future__ import annotations
+from cudnn._cutlass_compat import SmemAllocator
 
 import ctypes
 import os
@@ -653,7 +654,7 @@ def _compressor_bwd_kernel(
 
         # Default: one fp32 atomic per (k, dim) per CTA. Deterministic: every CTA
         # writes a disjoint partial plane; the fixed-order reduction kernel consumes
-        # planes in ascending bidx order and overwrites dAPE.
+        # those planes through its ratio-specific fixed tree and overwrites dAPE.
         if cutlass.const_expr(deterministic):
             for k in cutlass.range_constexpr(win):
                 if cutlass.const_expr(coff == 2 and k < ratio):
@@ -672,13 +673,13 @@ def _compressor_bwd_kernel(
 
 
 @cute.kernel
-def _dape_reduce_kernel(
+def _dape_reduce_serial_kernel(
     mDAPEPartial: cute.Tensor,  # [npartials, nelems] fp32
     mGAPE: cute.Tensor,  # [nelems] fp32, fully overwritten
     npartials: cutlass.Int32,
     nelems: cutlass.Int32,
 ):
-    """Reduce CTA partial planes in a fixed order, one thread per dAPE element."""
+    """Reduce CTA partial planes serially, one thread per dAPE element."""
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     idx = bidx * 256 + tidx
@@ -687,6 +688,69 @@ def _dape_reduce_kernel(
         for p in cutlass.range(npartials):
             acc = acc + cutlass.Float32(mDAPEPartial[p * nelems + idx])
         mGAPE[idx] = acc
+
+
+_DAPE_REDUCTION_OUTPUTS = 32
+_DAPE_REDUCTION_SPLITS = 32
+
+
+@cute.kernel
+def _dape_reduce_split_kernel(
+    mDAPEPartial: cute.Tensor,  # [npartials, nelems] fp32
+    mGAPE: cute.Tensor,  # [nelems] fp32, fully overwritten
+    npartials: cutlass.Int32,
+    nelems: cutlass.Int32,
+):
+    """Reduce ratio-4 dAPE with a fixed 32-way contiguous-partial tree.
+
+    One CTA owns 32 adjacent output elements. Its 32 warps each sum one contiguous
+    CTA-partial interval in ascending order, so every global load is coalesced across
+    the warp. Warp 0 then merges the 32 interval sums in ascending interval order
+    through shared memory. Both partition boundaries and merge order depend only on
+    ``npartials`` and are therefore run-to-run bitwise deterministic.
+
+    All threads reach the CTA barrier, including lanes in the final partial output
+    tile. Out-of-range lanes publish a zero split sum and never touch global memory.
+    """
+    output_lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    split_lane = cutlass.Int32(cute.arch.thread_idx()[1])
+    idx = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(_DAPE_REDUCTION_OUTPUTS) + output_lane
+
+    # Contiguous quotient/remainder partition. Earlier splits receive one extra
+    # partial, keeping interval boundaries monotonic for arbitrary ``npartials``.
+    interval = npartials // cutlass.Int32(_DAPE_REDUCTION_SPLITS)
+    remainder = npartials % cutlass.Int32(_DAPE_REDUCTION_SPLITS)
+    begin = split_lane * interval
+    count = interval
+    if split_lane < remainder:
+        begin = begin + split_lane
+        count = count + cutlass.Int32(1)
+    else:
+        begin = begin + remainder
+
+    acc = cutlass.Float32(0.0)
+    if idx < nelems:
+        for offset in cutlass.range(count, unroll=1):
+            partial = begin + offset
+            acc = acc + cutlass.Float32(mDAPEPartial[partial * nelems + idx])
+
+    smem = SmemAllocator()
+    split_partials = smem.allocate_tensor(
+        cutlass.Float32,
+        cute.make_layout(
+            (_DAPE_REDUCTION_SPLITS, _DAPE_REDUCTION_OUTPUTS),
+            stride=(_DAPE_REDUCTION_OUTPUTS, 1),
+        ),
+        byte_alignment=16,
+    )
+    split_partials[(split_lane, output_lane)] = acc
+    cute.arch.barrier()
+
+    if split_lane == 0 and idx < nelems:
+        result = cutlass.Float32(0.0)
+        for split in cutlass.range_constexpr(_DAPE_REDUCTION_SPLITS):
+            result = result + cutlass.Float32(split_partials[(split, output_lane)])
+        mGAPE[idx] = result
 
 
 _EXT = (1 << 31) - 1  # flat extent placeholder (int32 offsets, no bounds checks)
@@ -803,12 +867,20 @@ def _dape_reduce_launch(
     npartials: cutlass.Int32,
     nelems: cutlass.Int32,
     stream: cuda_driver.CUstream,
+    split: cutlass.Constexpr,
 ):
     """JIT entry point for the deterministic fixed-order dAPE reduction."""
     lay = cute.make_layout(_EXT)
     mDAPEPartial = cute.make_tensor(dape_partial_ptr, lay)
     mGAPE = cute.make_tensor(gape_ptr, lay)
-    _dape_reduce_kernel(mDAPEPartial, mGAPE, npartials, nelems).launch(grid=((nelems + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream)
+    if cutlass.const_expr(split):
+        _dape_reduce_split_kernel(mDAPEPartial, mGAPE, npartials, nelems).launch(
+            grid=((nelems + _DAPE_REDUCTION_OUTPUTS - 1) // _DAPE_REDUCTION_OUTPUTS, 1, 1),
+            block=(_DAPE_REDUCTION_OUTPUTS, _DAPE_REDUCTION_SPLITS, 1),
+            stream=stream,
+        )
+    else:
+        _dape_reduce_serial_kernel(mDAPEPartial, mGAPE, npartials, nelems).launch(grid=((nelems + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream)
 
 
 _COMPILED = {}
@@ -892,7 +964,7 @@ def _compile_bwd(key, args, ratio, d, coff, deterministic=False):
     return fn
 
 
-def _compile_dape_reduce(key, args):
+def _compile_dape_reduce(key, args, split=False):
     """JIT-compile the shared fixed-order dAPE reduction (capture-guarded)."""
     with _COMPILE_LOCK:
         fn = _COMPILED.get(key)
@@ -901,14 +973,14 @@ def _compile_dape_reduce(key, args):
                 raise RuntimeError(
                     "CSA compressor: first deterministic dAPE reduction call happened " "under CUDA graph capture; compile() or run one eager step first."
                 )
-            fn = cute.compile(_dape_reduce_launch, *args)
+            fn = cute.compile(_dape_reduce_launch, *args, split)
             _COMPILED[key] = fn
     return fn
 
 
-def precompile_dape_reduce(device):
+def precompile_dape_reduce(device, split=False):
     """Ensure the shared deterministic dAPE reduction is JIT-compiled."""
-    key = ("dape_reduce", device.index)
+    key = ("dape_reduce", bool(split), device.index)
     if key in _COMPILED:
         return
     with torch.cuda.device(device):
@@ -921,7 +993,7 @@ def precompile_dape_reduce(device):
             cutlass.Int32(1),
             stream,
         )
-        _compile_dape_reduce(key, args)
+        _compile_dape_reduce(key, args, split)
 
 
 def precompile_fwd(ratio, d, coff, device):
@@ -955,7 +1027,7 @@ def precompile_fwd(ratio, d, coff, device):
 def precompile_bwd(ratio, d, coff, device, deterministic=False):
     """Ensure the backward kernel for ``(ratio, d, coff, device)`` is JIT-compiled."""
     key = ("bwd", ratio, d, coff, bool(deterministic), device.index)
-    reduce_key = ("dape_reduce", device.index)
+    reduce_key = ("dape_reduce", ratio == 4, device.index)
     if key in _COMPILED and (not deterministic or reduce_key in _COMPILED):
         return
     with torch.cuda.device(device):
@@ -980,7 +1052,7 @@ def precompile_bwd(ratio, d, coff, device, deterministic=False):
         )
         _compile_bwd(key, args, ratio, d, coff, deterministic)
         if deterministic:
-            precompile_dape_reduce(device)
+            precompile_dape_reduce(device, split=ratio == 4)
 
 
 def run_fwd(kv, score, ape, cu_i, cuc_i, out, nb_total, ratio, d, coff, stream_handle=None):
@@ -1039,10 +1111,10 @@ def bwd_dape_workspace_bytes(nb_total, ratio, d, coff):
     return npartials * ratio * coff * d * 4
 
 
-def _run_dape_reduce(workspace, gape, npartials, nelems, stream_handle):
+def _run_dape_reduce(workspace, gape, npartials, nelems, stream_handle, split=False):
     """Launch the shared fixed-order reduction on the caller's stream."""
     dev = gape.device.index
-    key = ("dape_reduce", dev)
+    key = ("dape_reduce", bool(split), dev)
     launcher = _FAST.get(key)
     if launcher is not None:
         slots = launcher.slots
@@ -1063,7 +1135,7 @@ def _run_dape_reduce(workspace, gape, npartials, nelems, stream_handle):
     )
     fn = _COMPILED.get(key)
     if fn is None:
-        fn = _compile_dape_reduce(key, args)
+        fn = _compile_dape_reduce(key, args, split)
     fn(*args)
     _FAST.put(key, fn, args)
 
@@ -1139,4 +1211,4 @@ def run_bwd(
             fn(*args)
             _FAST.put(key, fn, args)
         if deterministic:
-            _run_dape_reduce(workspace, gape, partials, ratio * coff * d, stream_handle)
+            _run_dape_reduce(workspace, gape, partials, ratio * coff * d, stream_handle, split=ratio == 4)

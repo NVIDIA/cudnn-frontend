@@ -999,11 +999,12 @@ def test_backward_deterministic_workspace_contract(ratio, coff):
 
 @pytest.mark.L0
 @pytest.mark.filterwarnings("ignore::UserWarning")
-def test_backward_deterministic_cuda_graph_replay_overwrites_dape():
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_backward_deterministic_cuda_graph_replay_overwrites_dape(ratio):
     """Class-API graph replays overwrite dAPE; no external zero-fill is required."""
     _require_sm100()
     compressor = _import_compressor()
-    ratio, d, coff = 128, 128, 2
+    d, coff = 128, 2
     kv, score, ape, cu, cuc, total_true, go = _make_inputs([1023, 509], d, ratio, coff)
     total_comp = total_true + 8
     go_capacity = torch.zeros(total_comp, 1, d, dtype=torch.bfloat16, device="cuda")

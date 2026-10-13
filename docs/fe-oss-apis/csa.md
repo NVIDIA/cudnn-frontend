@@ -130,9 +130,12 @@ policies:
   This fastest path is not bitwise deterministic and raises under strict
   `torch.use_deterministic_algorithms(True)` (warn-only mode warns and runs).
 - `deterministic=True` writes each CTA's register-local dAPE sums to caller-owned
-  fp32 partial planes and launches a second kernel that reduces planes in fixed
-  ascending CTA order. It contains no dAPE atomics, fully overwrites `grad_ape`, is
-  bitwise replay-deterministic, and is accepted by strict torch deterministic mode.
+  fp32 partial planes and launches a second fixed-order reduction kernel. Ratio 4
+  partitions the CTA planes into 32 contiguous ranges: 32 warps sum those ranges in
+  ascending CTA order, then warp 0 merges the range sums in ascending range order.
+  Ratio 2 and ratio 128 use a serial ascending-CTA fold. Both forms contain no dAPE
+  atomics, fully overwrite `grad_ape`, are bitwise replay-deterministic, and are
+  accepted by strict torch deterministic mode.
   The class API exposes `scratch_workspace_bytes()` and requires a contiguous uint8
   `workspace` of at least that size at `execute`; the high-level wrapper allocates it.
   Both launches use the caller stream and are CUDA-graph capture/replay safe after
@@ -149,14 +152,14 @@ output and therefore needs no fill. JIT and allocations are outside the measurem
 
 | configuration | workspace | atomic kernel | deterministic kernel | operation slowdown (both construction orders) |
 |---|---:|---:|---:|---:|
-| r4, c2, d128, 1x8192 | 1 MiB | 27.7–28.7 us | 40.0–40.8 us | 1.26–1.30x |
-| r4, c2, d128, 3x8192 | 3 MiB | 36.9–37.9 us | 59.6–60.3 us | 1.47–1.49x |
-| r4, c2, d512, 1x8192 | 4 MiB | 36.5–37.1 us | 50.4–51.4 us | 1.27x |
-| r4, c2, d512, 3x8192 | 12 MiB | 84.8–85.2 us | 116.1–117.1 us | 1.36–1.37x |
-| r128, c1, d128, 1x8192 | 4 MiB | 24.3–25.7 us | 34.1–35.3 us | 1.21x |
-| r128, c2, d128, 3x8192 | 8 MiB | 42.6–46.9 us | 51.2–55.9 us | 1.09–1.11x |
-| r128, c1, d512, 1x8192 | 16 MiB | 35.3–36.5 us | 41.4–41.9 us | 1.04–1.08x |
-| r128, c2, d512, 3x8192 | 16 MiB | 106.7–107.7 us | 113.4–114.6 us | 1.03x |
+| r4, c2, d128, 1x8192 | 1 MiB | 28.0–29.3 us | 35.8–36.7 us | 1.09–1.15x |
+| r4, c2, d128, 3x8192 | 3 MiB | 38.3–38.9 us | 47.3–48.3 us | 1.10–1.13x |
+| r4, c2, d512, 1x8192 | 4 MiB | 36.8–37.4 us | 45.9–46.3 us | 1.10–1.15x |
+| r4, c2, d512, 3x8192 | 12 MiB | 86.1–86.6 us | 94.0–94.9 us | 1.09–1.10x |
+| r128, c1, d128, 1x8192 | 4 MiB | 25.1–26.9 us | 33.1–35.8 us | 1.11–1.14x |
+| r128, c2, d128, 3x8192 | 8 MiB | 42.6–44.9 us | 49.7–51.7 us | 1.03–1.07x |
+| r128, c1, d512, 1x8192 | 16 MiB | 35.7–37.3 us | 40.7–41.9 us | 0.97–1.03x |
+| r128, c2, d512, 3x8192 | 16 MiB | 107.5–108.7 us | 112.8–113.2 us | 1.00–1.02x |
 
 Reproduce with `benchmark/csa/bench_csa_dape_deterministic.py`; use
 `--construct-order deterministic-first` for the reversed build and `--atomic-only`
