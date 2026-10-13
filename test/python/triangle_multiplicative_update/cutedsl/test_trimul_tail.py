@@ -461,6 +461,35 @@ def test_transpose_prologue_matches_the_oracle_and_the_mn_major_form(n_res, batc
 
 
 @requires_rubin
+@pytest.mark.parametrize("n_res,batch,c_z,clc_stages", [(217, 2, 256, 1), (33, 1, 256, 2), (128, 1, 256, 1), (384, 1, 256, 1)])
+def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, clc_stages):
+    """The LayerNorm-once work item of the output stage (c = 256: the row block's two A operands resident across its two N tiles, both LayerNorms once;
+    T27) computes the SAME update and statistics as the per-tile item, BITWISE; two ON launches bitwise equal; the ON output within the oracle's bound.
+    (At c = 128 the item is one tile and the knob is a typed decline -- `test_accumulators_arm_declines_typed`.)"""
+    from cudnn.triangle_multiplicative_update import heuristics as th
+
+    inp = _inputs(n_res, batch, c_z, c_z, True, seed=11)
+    kn = th.recommend(n_res, c_z, batch, "outgoing")
+    common = dict(has_bias=True, want_stats=True, a0_prologue="mn_major", clc_stages=clc_stages, ln_pass_form="smem_rolled_pf", epi_math="packed")
+    plan_off = k3.build_trimul_tail(k3.tail_params(c_z, c_z, **common))
+    plan_on = k3.build_trimul_tail(k3.tail_params(c_z, c_z, ln_once="block", **common))
+    stream = torch.cuda.current_stream().cuda_stream
+    biases = _stacked_biases(inp)
+    outs = []
+    for plan in (plan_off, plan_on, plan_on):
+        out = torch.full((batch, n_res, n_res, c_z), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, out, stats, stream, biases=biases, k_block=kn.k_block)
+        torch.cuda.synchronize()
+        outs.append((out, stats))
+    assert torch.equal(outs[1][0], outs[0][0]) and torch.equal(outs[1][1], outs[0][1]), "the LayerNorm-once item must be bitwise the per-tile item"
+    assert torch.equal(outs[2][0], outs[1][0]) and torch.equal(outs[2][1], outs[1][1]), "two launches of the LayerNorm-once item differ (a first-launch race)"
+    assert not (outs[1][0].float() == _SENTINEL).any(), "a never-written cell survived"
+    ref, _, _ = _reference(inp, 1e-5)
+    _check_oracle(outs[1][0], ref, f"ln_once K3 {n_res}:{batch}:{c_z}")
+
+
+@requires_rubin
 @pytest.mark.parametrize("n_res,batch,c_z", [(217, 2, 128), (128, 1, 256)])
 @pytest.mark.parametrize(
     "ln_pass_form,epi_math",

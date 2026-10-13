@@ -437,7 +437,7 @@ _SASS_SPILL_PINS = {
     ("k3", 128, "registers", "packed_biasfold"): dict(STL=0, LDL=0),
     ("k3", 256, "smem_rolled_pf", "packed_biasfold"): dict(STL=0, LDL=0),
 }
-_SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",), "FADD2": (" FADD2",), "FFMA2": (" FFMA2",)}
+_SASS_COUNTS = {**sass_utils.SASS_OPCODE_COUNTS, "USETMAXREG": ("USETMAXREG",), "FADD2": (" FADD2",), "FFMA2": (" FFMA2",), "CGAERRBAR": ("CGAERRBAR",)}
 _SASS_PROBE_BODY = """
 from cudnn.gemm.frost import ln_prologue
 from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1
@@ -446,14 +446,55 @@ arm, kk = params_kw["arm"], int(params_kw["k"])
 lnf, epm = params_kw.get("ln_pass_form", "registers"), params_kw.get("epi_math", "scalar")
 has_bias, hint = bool(params_kw.get("has_bias", True)), int(params_kw.get("min_blocks_per_mp", 0))
 order = params_kw.get("pass_order", "interleaved")  # the K1 tile order of the rendering (the heuristics ship "major" from N = 512 at c = 128)
+ln_once = params_kw.get("ln_once", "")  # the LayerNorm-once work item ("" = the per-tile item every production rendering ships)
 # the API's parameter sets (api.py compile(): biases on, the mask bound, no statistics, the heuristics' default knobs) at the pinned LN / epilogue forms
 if arm == "k1":
-    p = k1.proj_params(kk, kk, has_bias=has_bias, has_mask=True, want_stats=False, pass_order=order, clc_stages=2, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
+    p = k1.proj_params(kk, kk, has_bias=has_bias, has_mask=True, want_stats=False, pass_order=order, clc_stages=2, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint, ln_once=ln_once)
 else:
-    p = k3.tail_params(kk, kk, has_bias=has_bias, want_stats=False, a0_prologue=(order if order in ("mn_major", "transpose") else "mn_major"), ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint)
+    p = k3.tail_params(kk, kk, has_bias=has_bias, want_stats=False, a0_prologue=(order if order in ("mn_major", "transpose") else "mn_major"), ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint, ln_once=ln_once)
 plan = ln_prologue.build_ln_dual_gemm(p)
 print("EXPECT_K", kk)
 """
+
+# The LayerNorm-ONCE renderings (`ln_once` = "block" / "passes"; T27): the per-item A region + the per-tile B ring, every production form's twin at the
+# shipped knobs (the pass-major order the lever requires).  Keyed (arm, K, ln_pass_form, has_bias, ln_once); the values are BOUNDS measured on the
+# branch's toolchain (nvdisasm of the trace-time cubin) like the tables above: the bias-off c_out 256 renderings sit at ptxas's flat 80-register
+# allocation (the two-CTAs-per-SM target) and spill a few words -- K1 2 / 2 (STACK 8; its production twin 0 / 0), K3 5 / 6 (STACK 24; the twin 0 / 0 at
+# REG 106) -- the register-split hint lifts that allocation where measured worth it; the bias-on twins and the c 128 renderings spill nothing (the K1 c 128
+# register-form twin's 1 / 1 at STACK 8 is GONE under the lever).  USETMAXREG 0 (the split dropped, as the twins), CGAERRBAR 0 (no non-relaxed cluster
+# arrive: the new a_empty commit is a tcgen05.commit, the release arrives the helpers').
+_SASS_LN_ONCE_PINS = {
+    ("k1", 128, "registers", False, "block"): dict(STL=0, LDL=0),
+    ("k1", 128, "registers", True, "block"): dict(STL=0, LDL=0),
+    ("k1", 256, "smem_rolled_pf", False, "block"): dict(STL=2, LDL=2),
+    ("k1", 256, "smem_rolled_pf", True, "block"): dict(STL=0, LDL=0),
+    ("k1", 256, "smem_rolled_pf", False, "passes"): dict(STL=1, LDL=1),
+    ("k3", 256, "smem_rolled_pf", False, "block"): dict(STL=5, LDL=6),
+    ("k3", 256, "smem_rolled_pf", True, "block"): dict(STL=0, LDL=0),
+}
+
+
+@pytest.mark.parametrize("arm,k,ln_pass_form,has_bias,ln_once", sorted(_SASS_LN_ONCE_PINS))
+def test_sm107_ln_once_renderings_spill_pins(tmp_path, arm, k, ln_pass_form, has_bias, ln_once):
+    """Trace-compile the LayerNorm-once renderings for sm_107a (no GPU): STL / LDL within the measured bounds, USETMAXREG 0 (the dropped split, as the
+    production twins), CGAERRBAR 0 (every cluster-scope arrive of the arm is a commit or a helper's release / relaxed arrive)."""
+    probe = sass_utils.run_sass_probe(
+        tmp_path,
+        probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
+        arch="sm_107a",
+        params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math="packed", has_bias=has_bias, pass_order="major", ln_once=ln_once),
+        tag=f"ln_dual_gemm_{arm}_k{k}_{ln_pass_form}_bias{int(has_bias)}_ln_once_{ln_once}",
+    )
+    st = probe.stats
+    print(
+        f"{arm} K={k} {ln_pass_form} bias {has_bias} ln_once={ln_once}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} CGAERRBAR {st['CGAERRBAR']} lines {st['LINES']} cubin {probe.cubin_md5}"
+    )
+    sass_utils.assert_no_new_spills(
+        st, _SASS_LN_ONCE_PINS[(arm, k, ln_pass_form, has_bias, ln_once)], tag=f"{arm} K={k} {ln_pass_form} bias {has_bias} ln_once={ln_once}: "
+    )
+    assert st["USETMAXREG"] == 0, f"{arm} K={k} ln_once={ln_once}: a REAL register split (USETMAXREG {st['USETMAXREG']}) -- re-measure the roles and the pins"
+    assert st["CGAERRBAR"] == 0, f"{arm} K={k} ln_once={ln_once}: a non-relaxed cluster arrive (CGAERRBAR {st['CGAERRBAR']}) -- a GPU-scope drain per arrive"
+
 
 # The `.minnctapersm` hint (`min_blocks_per_mp`; `heuristics.register_split_hint`) on the renderings the hint exists for -- the bias-OFF forms, where
 # ptxas's two-CTAs-per-SM target (65536 / (2 x 384) = 80 registers) is reached with spills; the bias-ON twin of each as the identity reference.
@@ -566,6 +607,49 @@ def test_ln_pass_form_and_epi_math_decline_typed(kw, axis):
     """The two substrate forms are a closed vocabulary (performance only); a value outside it is a typed ValueError naming the axis."""
     with pytest.raises(ValueError, match=axis):
         sub.validate_ln_dual_gemm_params(k1.proj_params(128, 128, has_bias=True, has_mask=True, **kw))
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "n_res,batch,c_z,c,mask_kind,ln_once,clc_stages",
+    [
+        (217, 2, 128, 128, "random", "block", 2),
+        (33, 1, 128, 128, "all", "block", 1),
+        (128, 1, 256, 256, "padded", "block", 1),
+        (384, 1, 256, 256, "random", "passes", 1),
+    ],
+)
+def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, c, mask_kind, ln_once, clc_stages):
+    """The LayerNorm-once work item (the row block's A operand resident in SMEM across its passes x N tiles; T27) computes the SAME planes and
+    statistics as the per-tile item of the same knob set, BITWISE: the same normalised bf16 words feed every tile of the item.  N 33 = one partial
+    row block of 64-row k blocks; 217 = a padded tail; 384 = two 128-row k blocks per 256 rows; the "passes" item at c 256 = two N-tile items per
+    block.  Two ON launches bitwise equal (the two-launch trick); the ON output within the fp64 oracle's derived bound."""
+    inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=11)
+    kn = th_recommend(n_res, c_z, batch)
+    common = dict(has_bias=True, has_mask=True, want_stats=True, pass_order="major", clc_stages=clc_stages, ln_pass_form=kn.ln_pass_form, epi_math="packed")
+    plan_off = k1.build_trimul_proj(k1.proj_params(c_z, c, **common))
+    plan_on = k1.build_trimul_proj(k1.proj_params(c_z, c, ln_once=ln_once, **common))
+    stream = torch.cuda.current_stream().cuda_stream
+    outs = []
+    for plan in (plan_off, plan_on, plan_on):
+        planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
+        stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
+        _launch(plan, inp, c, planes, stats, stream, k_block=kn.k_block)
+        torch.cuda.synchronize()
+        outs.append((planes, stats))
+    assert torch.equal(outs[1][0], outs[0][0]) and torch.equal(outs[1][1], outs[0][1]), "the LayerNorm-once item must be bitwise the per-tile item"
+    assert torch.equal(outs[2][0], outs[1][0]) and torch.equal(outs[2][1], outs[1][1]), "two launches of the LayerNorm-once item differ (a first-launch race)"
+    valid = outs[1][0][:, :, :, :n_res].float()
+    assert not (valid == _SENTINEL).any(), "a never-written cell survived"
+    ref, _, _ = _reference(inp, c, 1e-5)
+    diff = (valid.double() - ref).abs()
+    assert int((diff > 4e-3 + ref.abs() / 128.0).sum()) == 0, f"max |diff| {diff.max().item():.4g}"
+
+
+def th_recommend(n_res, c_z, batch):
+    from cudnn.triangle_multiplicative_update import heuristics as th
+
+    return th.recommend(n_res, c_z, batch, "outgoing")
 
 
 @requires_rubin
