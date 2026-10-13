@@ -209,7 +209,7 @@ def test_constants():
 
 
 @pytest.mark.parametrize("group", sorted(_GROUPS))
-def test_the_route_table_per_group_and_s_q_is_the_designs(group):
+def test_the_route_table_per_group_and_s_q_is_the_adapters_rule(group):
     """The decode route at every served group against the adapter's rule: the 16-column tile for <= 16 packed rows, the
     32-column tile in ``ceil(S_q / (32 // G))`` token units up to two, then the UNPACKED arm (one head per CTA) up to 32
     rows, NOT SERVED past that (the reason names the EXTEND form); the CLAIMED envelope is ``S_q <= 4`` everywhere, the
@@ -772,7 +772,7 @@ def _std_case(group, s_q, **kw):
 @pytest.mark.parametrize("group", sorted(_GROUPS))
 @pytest.mark.parametrize("s_q", [1, 2, 3, 4, 5])
 def test_decode_matches_the_oracle_at_every_group_and_s_q(group, s_q):
-    """PLAN 2.7's DECODE rows: every served group x S_q 1 .. 4 (the claimed envelope) and S_q = 5 (past the packed route at 16 /
+    """The DECODE cells of the served-group matrix: every served group x S_q 1 .. 4 (the claimed envelope) and S_q = 5 (past the packed route at 16 /
     12: the adapter's UNPACKED tile, one head per CTA; the packed tile's second token unit at 8 / 6 -- correct and DECLARED),
     against the per-sequence fp32 oracle under the dense
     suite's budget (cos > 0.999 on ``out``), the padded entry EXACTLY 0 with block 0 untouched, the route pinned against the
