@@ -404,3 +404,176 @@ def test_dense_d128_one_decode_tile_wave_leads(monkeypatch, arch, cc, sms, sink)
     monkeypatch.undo()
     if not sink:
         assert placement.place(spec, _facts(**dict(values, s_q=8, s_kv=32768, b=64))) == placement.LEAD  # decode-shaped: every unit count
+
+
+def _hnd_pool(h_kv, page_size, d=256):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        get_stride=lambda: (h_kv * page_size * d, page_size * d, d, 1)
+    )  # [pages, H_kv, page, D] head-major: each head's page contiguous (vLLM's cache; measured on the 24/2 chunk)
+
+
+def _nhd_pool(h_kv, page_size, d=256):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(get_stride=lambda: (page_size * h_kv * d, d, h_kv * d, 1))  # [pages, H_kv, page, D] token-major in the page: the band's pool
+
+
+def _sm107_paged_d256_decode_facts(**over):
+    """FlashInfer's cuDNN decode graph shape on cc 10.7: a dense Q over a page pool with the padding mask (per-request KV lengths), no
+    mask / sink / Stats (the pool strided as FlashInfer's benchmark strides it: token-major in the page -- the band's pool; the head-major
+    pool is the measured twin: the 24/2 chunk)."""
+    values = dict(
+        b=4,
+        h_q=24,
+        h_kv=2,
+        s_q=1,
+        s_kv=8192,
+        d_qk=256,
+        d_v=256,
+        dtype=cudnn.data_type.BFLOAT16,
+        causal=False,
+        bottom_right=False,
+        has_paged_kv=True,
+        padded=True,
+        page_size=16,
+        device_cc=(10, 7),
+        device_sm_count=212,
+    )
+    values.update(over)
+    values.setdefault("k_t", _nhd_pool(values["h_kv"], values["page_size"]))
+    return _facts(**values)
+
+
+_SM107_PAGED_D256_DECODE_CORNERS = [
+    # (heads, b, declared KV, verdict): the measured frontier of the Rubin paged d256 decode-tile band -- units = b * h_kv,
+    # LEAD from 4 units and 2**16 KV tokens in flight (64 x 1k, 32 x 2k, 16 x 4k, 8 x 8k, 4 x 32k), TRAIL one step below
+    # (2**15 tokens in flight), below 4 units even at the 128k endpoint, past the measured 512 units / 128k declared KV, below 1k.
+    ("24/2", 4, 8192, placement.LEAD),
+    ("24/2", 4, 4096, placement.TRAIL),
+    ("24/2", 32, 1024, placement.LEAD),
+    ("24/2", 16, 1024, placement.TRAIL),
+    ("24/2", 16, 2048, placement.LEAD),
+    ("24/2", 8, 2048, placement.TRAIL),
+    ("24/2", 8, 4096, placement.LEAD),
+    ("24/2", 2, 32768, placement.LEAD),
+    ("24/2", 2, 8192, placement.TRAIL),
+    ("24/2", 1, 131072, placement.TRAIL),
+    ("24/2", 128, 131072, placement.LEAD),
+    ("24/2", 32, 262144, placement.TRAIL),
+    ("24/2", 64, 512, placement.TRAIL),
+    ("32/2", 2, 32768, placement.LEAD),
+    ("32/2", 2, 8192, placement.TRAIL),
+    ("16/4", 128, 131072, placement.LEAD),
+    ("16/4", 256, 131072, placement.TRAIL),
+    ("16/4", 1, 32768, placement.LEAD),
+    ("16/4", 1, 8192, placement.TRAIL),
+    ("24/4", 2, 8192, placement.LEAD),
+    ("24/4", 2, 4096, placement.TRAIL),
+    ("8/1", 8, 8192, placement.LEAD),
+    ("8/1", 8, 4096, placement.TRAIL),
+    ("8/1", 4, 8192, placement.TRAIL),
+    ("12/1", 16, 4096, placement.LEAD),
+    ("12/1", 16, 2048, placement.TRAIL),
+    ("16/1", 64, 1024, placement.LEAD),
+    ("16/1", 32, 1024, placement.TRAIL),
+    ("64/2", 32, 8192, placement.TRAIL),  # group 32 (the 32-column tile) is held backend-first
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("replay", [False, True], ids=["eager", "replay"])
+@pytest.mark.parametrize(
+    "heads, b, s_kv, verdict", _SM107_PAGED_D256_DECODE_CORNERS, ids=[f"{h}-b{b}-kv{kv}" for h, b, kv, _ in _SM107_PAGED_D256_DECODE_CORNERS]
+)
+def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, b, s_kv, verdict, replay):
+    """The paged dense-Q d256 decode-tile shard of ``_place_sm107_f16`` (cudnn-frontend 1.32.0, the release this default ships in --
+    FlashInfer's ``(10, 7)`` cuDNN decode admission keys on it): the REAL constants pin each verdict (``placement.LEAD`` or ``placement.TRAIL``) at the measured
+    frontier cells of the band (module docstring, "PAGED dense-Q d256 half decode"; 212-SM cc 10.7 perf class, cuDNN 9.27.0, CUDA-graph
+    replay and eager), the same verdict in both regimes -- the frontier the two regimes share.  Before this arm every one of these graphs
+    kept the backend first (the RED half of this test on the pre-arm tree)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    assert tuple(int(x) for x in cudnn.__version__.split(".")[:3]) >= (1, 32, 0)
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    h_q, h_kv = (int(x) for x in heads.split("/"))
+    facts = _sm107_paged_d256_decode_facts(h_q=h_q, h_kv=h_kv, b=b, s_kv=s_kv, cuda_graph_replay=replay)
+    assert placement.place(spec, facts) == verdict
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "outside",
+    [
+        None,
+        dict(device_cc=(10, 0)),
+        dict(has_paged_kv=False, page_size=0, padded=False),  # a dense d256 cache at s_q == 1 was measured against the prefill body only
+        dict(padded=False),  # a paged decode WITHOUT per-request KV lengths: every band cell carried the padding mask -> unmeasured
+        dict(s_q=2, causal=True, bottom_right=True),  # the MTP rows (the 32-column tile) are held
+        dict(h_q=64),  # group 32 is held
+        dict(h_q=4),  # group 2: not measured
+        dict(h_q=2),  # MHA: not measured
+        dict(h_q=36, h_kv=8),  # a partial group
+        dict(d_qk=128, d_v=128),  # the d128 flavor has no paged decode tile on cc 10.7
+        dict(d_qk=192, d_v=128),
+        dict(dtype=cudnn.data_type.FLOAT),
+        dict(wants_stats=True),
+        dict(has_sink=True),
+        dict(causal=True, bottom_right=True),
+        dict(window_left=128, causal=True, bottom_right=True),
+        dict(right_band_widening=True, right_bound=8),
+        dict(attn_scale_prefolded=True),
+        dict(has_epilogue_gate=True),
+        dict(page_size=128),
+        dict(thd=True),  # ragged queries never ride the dense-Q decode tile
+    ],
+    ids=[
+        "inside",
+        "sm100",
+        "dense",
+        "unpadded",
+        "mtp_q2",
+        "g32",
+        "g2",
+        "mha",
+        "partial_group",
+        "d128",
+        "d192",
+        "fp32",
+        "stats",
+        "sink",
+        "causal",
+        "swa",
+        "right_band",
+        "prefolded",
+        "gate",
+        "page128",
+        "thd",
+    ],
+)
+def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outside):
+    """Inside the band the shard's SHAPE is FlashInfer's decode graph on the Rubin d256 decode tile (``engines.d256_decode_tile_selected``
+    with the whole group packed; a page pool of a measured page size; no mask / window / sink / Stats / gate); every variant outside it
+    keeps the backend first.  The leading cell (24/2, b 32, declared KV 8k = 64 units x 8k) holds for f16, pages 32 / 64, the CUDA-graph
+    replay hint, execute-time shape overrides and both in-page pool layouts alike -- the token-major one the band measured (FlashInfer's
+    benchmark pool) and the head-major one (each head's page contiguous, vLLM's cache) measured on the 24/2 chunk: the tile faster on every
+    in-band cell in both regimes -- so the arm reads no pool stride at all (a pool without readable strides is placed like any other)."""
+    from cudnn.sdpa.fwd.engines import ENGINE_SPECS
+
+    spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
+    values = dict(b=32)
+    values.update(outside or {})
+    assert placement.place(spec, _sm107_paged_d256_decode_facts(**values)) == (placement.TRAIL if outside else placement.LEAD)
+    if outside is None:
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, dtype=cudnn.data_type.HALF)) == placement.LEAD
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, page_size=32)) == placement.LEAD
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, page_size=64)) == placement.LEAD
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, cuda_graph_replay=True)) == placement.LEAD
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, shape_overrides=True)) == placement.LEAD
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, k_t=_hnd_pool(2, 16))) == placement.LEAD  # the head-major pool: the 24/2 chunk
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, k_t=None)) == placement.LEAD  # no pool strides to read: the layout is not a key
+        assert (
+            placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_hnd_pool(1, 16))) == placement.LEAD
+        )  # one KV head: one in-page order
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_nhd_pool(1, 16))) == placement.LEAD
