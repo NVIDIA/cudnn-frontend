@@ -409,7 +409,9 @@ def test_dense_d128_one_decode_tile_wave_leads(monkeypatch, arch, cc, sms, sink)
 def _hnd_pool(h_kv, page_size, d=256):
     from types import SimpleNamespace
 
-    return SimpleNamespace(get_stride=lambda: (h_kv * page_size * d, page_size * d, d, 1))  # [pages, H_kv, page, D] head-major: each head's page contiguous
+    return SimpleNamespace(
+        get_stride=lambda: (h_kv * page_size * d, page_size * d, d, 1)
+    )  # [pages, H_kv, page, D] head-major: each head's page contiguous (vLLM's cache)
 
 
 def _nhd_pool(h_kv, page_size, d=256):
@@ -420,7 +422,8 @@ def _nhd_pool(h_kv, page_size, d=256):
 
 def _sm107_paged_d256_decode_facts(**over):
     """FlashInfer's cuDNN decode graph shape on cc 10.7: a dense Q over a page pool with the padding mask (per-request KV lengths), no
-    mask / sink / Stats (the pool strided as FlashInfer's benchmark strides it: token-major in the page; the head-major pool is the admitted twin)."""
+    mask / sink / Stats (the pool strided as FlashInfer's benchmark strides it: token-major in the page -- the band's pool; the head-major
+    pool keeps the backend first until its chunk is measured)."""
     values = dict(
         b=4,
         h_q=24,
@@ -524,6 +527,8 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
         dict(has_epilogue_gate=True),
         dict(page_size=128),
         dict(thd=True),  # ragged queries never ride the dense-Q decode tile
+        dict(k_t=_hnd_pool(2, 16)),  # the head-major in-page pool layout (each head's page contiguous) is unmeasured with more than one KV head
+        dict(k_t=None),  # no pool strides to read -> the layout is unknown -> the backend stays first
     ],
     ids=[
         "inside",
@@ -547,14 +552,17 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
         "gate",
         "page128",
         "thd",
+        "hnd_pool",
+        "no_pool_strides",
     ],
 )
 def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outside):
     """Inside the band the shard's SHAPE is FlashInfer's decode graph on the Rubin d256 decode tile (``engines.d256_decode_tile_selected``
     with the whole group packed; a page pool of a measured page size; no mask / window / sink / Stats / gate); every variant outside it
     keeps the backend first.  The leading cell (24/2, b 32, declared KV 8k = 64 units x 8k) holds for f16, pages 32 / 64, the CUDA-graph
-    replay hint, execute-time shape overrides and both in-page pool layouts alike (the token-major one FlashInfer's benchmark strides --
-    the band's pool -- and the head-major contiguous one, admitted on its structure)."""
+    replay hint and execute-time shape overrides alike, on the token-major in-page pool layout the band measured (FlashInfer's benchmark
+    pool); the head-major pool (each head's page contiguous, vLLM's cache) keeps the backend first until its chunk is measured -- except
+    with ONE KV head, where the two layouts are the same bytes in the same order and the band's 8/1, 12/1 and 16/1 geometries cover it."""
     from cudnn.sdpa.fwd.engines import ENGINE_SPECS
 
     spec = next(spec for spec in ENGINE_SPECS if spec.name == "sdpa_fwd_prefill_sm107")
@@ -567,4 +575,5 @@ def test_sm107_paged_d256_decode_tile_shard_stays_inside_its_measured_shape(outs
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, page_size=64)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, cuda_graph_replay=True)) == placement.LEAD
         assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, shape_overrides=True)) == placement.LEAD
-        assert placement.place(spec, _sm107_paged_d256_decode_facts(b=32, k_t=_hnd_pool(2, 16))) == placement.LEAD
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_hnd_pool(1, 16))) == placement.LEAD  # one KV head: layout-free
+        assert placement.place(spec, _sm107_paged_d256_decode_facts(h_q=8, h_kv=1, b=64, k_t=_nhd_pool(1, 16))) == placement.LEAD
