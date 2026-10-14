@@ -2882,10 +2882,10 @@ def _make_cfg_small_d_sm100(params: TemplateParams, *, tile_k: int) -> Tuple[Cfg
         )
     if params.decode_tile or params.decode_q_tile:
         raise ValueError(f"{tag}: the decode tiles do not consume the small-tile record fields")
-    if params.thd_varlen or params.split_kv != 1 or params.pack_gqa or params.paged_kv or params.epilogue_gate or params.seq_q_lens_present:
+    if params.thd_varlen or params.split_kv != 1 or params.pack_gqa or params.paged_kv or params.epilogue_gate:
         raise ValueError(
-            f"{tag}: the small-tile forms serve dense, unsplit, unpaged, non-PackGQA, ungated graphs with global or per-batch KV lengths only (THD / paged / "
-            f"split-KV / PackGQA / per-batch Q lengths ride the d128 flavor zero-filled, where those legs are wired)"
+            f"{tag}: the small-tile forms serve dense, unsplit, unpaged, non-PackGQA, ungated graphs (global or per-batch Q / KV lengths, the sm107 "
+            f"factory's envelope) only -- THD / paged / split-KV / PackGQA ride the native d64 / d128 flavors, where those legs are wired"
         )
     cta_mma = params.cta_mma
     if cta_mma not in SM100_SMALL_D_CGAS[(tile_k, tile_k)]:
@@ -3036,7 +3036,11 @@ def _make_cfg_small_d_sm100(params: TemplateParams, *, tile_k: int) -> Tuple[Cfg
         SCHED_WARP_ID=mma_warp_id + 3,
         READ_TILE_ARRIVERS=d128_read_tile_arrivers(softmax_wgs),
         SEQ_KV_LENS_PRESENT=int(params.seq_kv_lens_present),
-        SEQ_Q_LENS_PRESENT=0,
+        # The per-batch Q-length trim (the graph's seq_len_q under the padding mask) is the d128 body's own leg on every flavor of this file
+        # (`SEQ_Q_LENS_PRESENT` folds the OOB-row store guard + the Q trim); a padded graph always binds it (engines: a dense padded graph
+        # with seq_q_t compiles the trim specialization), so the small tiles take it like the sm107 factory does -- a refusal here was a
+        # whole-row decline of every padded graph at D <= 32 (12 / 117 cells of the dev-box tier, 2026-10-13).
+        SEQ_Q_LENS_PRESENT=int(params.seq_q_lens_present),
         THD_VARLEN=0,
         SPLIT_KV=1,
         PACK_GQA=0,
