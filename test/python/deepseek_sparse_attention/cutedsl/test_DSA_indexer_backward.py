@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import inspect
 import threading
 
-from test_utils import torch_fork_set_rng
+from test_utils import assert_bitwise_runs, torch_fork_set_rng
 
 from cudnn.api_base import ws_align
 from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100
@@ -1527,33 +1527,51 @@ def test_DSA_indexer_backward_deterministic_cuda_graph(backend, s_q):
 
 @pytest.mark.L1
 @pytest.mark.parametrize("backend", ["default", "sm100_v2"])
+@pytest.mark.parametrize("s_q,topk", [(2, 2048), (193, 896), (193, 2048)], ids=["short-k2048", "persistent-k896", "persistent-k2048"])
 @torch_fork_set_rng(seed=1705)
-def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend):
-    """The largest supported top-k uses the bounded serial-persistent route."""
+def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend, s_q, topk):
+    """Large TopK and repeated producer-row handoffs preserve every output bit."""
     try:
         from cudnn import DSA
+        from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import deterministic_dk_workspace_bytes
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
     _require_exact_sm100()
 
-    cfg = dict(b=1, s_q=2, s_kv=2048, head_dim=128, qhead_per_kv_head=64, topk=2048)
+    # With 96 planes, 193 rows makes a producer consume three different rows.
+    cfg = dict(b=1, s_q=s_q, s_kv=2048, head_dim=128, qhead_per_kv_head=64, topk=topk)
     index_q, weights, index_k, attn_source, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
     attn = attn_source.clone()
-    result = DSA.indexer_backward_wrapper(
-        index_q,
-        weights,
-        index_k,
-        attn,
-        index_score,
-        topk_indices,
-        grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
-        loss_coeff=float(cfg["s_q"]),
-        d_weights=torch.empty_like(weights, dtype=torch.float32 if backend == "sm100_v2" else torch.bfloat16),
-        d_index_k=torch.empty_like(index_k, dtype=torch.float32),
-        backend=backend,
-        deterministic=True,
-    )
-    torch.cuda.synchronize()
+    grad_loss = torch.ones((), dtype=torch.float32, device="cuda")
+    d_index_q = torch.empty_like(index_q)
+    d_weights = torch.empty_like(weights, dtype=torch.float32 if backend == "sm100_v2" else torch.bfloat16)
+    d_index_k = torch.empty_like(index_k, dtype=torch.float32)
+    workspace = torch.empty(deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"]), dtype=torch.uint8, device="cuda")
+
+    def run():
+        attn.copy_(attn_source)
+        workspace.fill_(0xA5)
+        for output in (d_index_q, d_weights, d_index_k):
+            output.fill_(float("nan"))
+        DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn,
+            index_score,
+            topk_indices,
+            grad_loss=grad_loss,
+            loss_coeff=float(cfg["s_q"]),
+            d_index_q=d_index_q,
+            d_weights=d_weights,
+            d_index_k=d_index_k,
+            workspace=workspace,
+            backend=backend,
+            deterministic=True,
+        )
+        return tuple(t.clone() for t in (d_index_q, d_weights, d_index_k, attn))
+
+    assert_bitwise_runs(run, label=f"{backend} s_q={s_q} topk={topk}")
     check_ref_indexer_backward(
         index_q,
         weights,
@@ -1561,9 +1579,9 @@ def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend):
         attn_source,
         index_score,
         topk_indices,
-        result["d_index_q"],
-        result["d_weights"],
-        result["d_index_k"],
+        d_index_q,
+        d_weights,
+        d_index_k,
         sm_scale=1.0,
         grad_scale=1.0,
     )

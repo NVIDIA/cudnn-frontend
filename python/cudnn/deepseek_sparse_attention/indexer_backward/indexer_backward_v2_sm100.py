@@ -550,7 +550,12 @@ class IndexerBackwardV2Sm100:
         """Execute dynamic-ticket or fixed-owner row processing on device."""
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        seq_k = cute.size(mK.shape[0])
+        # Preserve the ordinary specialization's original extent source. The
+        # deterministic output initially spans all planes, so use K there.
+        if const_expr(self.deterministic):
+            seq_k = cute.size(mK.shape[0])
+        else:
+            seq_k = cute.size(mdK.shape[0])
         seq_len = cute.size(mIdx.shape[0])
         if const_expr(self.deterministic):
             plane_offset = cutlass.Int64(cute.arch.block_idx()[0]) * cutlass.Int64(seq_k) * cutlass.Int64(self.head_dim)
