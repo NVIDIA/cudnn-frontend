@@ -1121,7 +1121,8 @@ def _resident_arm_tile_n(spec: EngineSpec, facts, default: Optional[int]) -> Opt
         return default
     if caps.sm_lo == 100:
         # The SM100 small tiles: the same question through config_sm100.sm100_tile_n_pick (128 unless the fp32 vector WITH a bias, which the
-        # 128-wide rendering does not serve); the row's _bias_arm_decline and the adapter read the same arithmetic (rule 8b').
+        # 128-wide rendering does not serve, the bias body on the PADDING leg inside the 64-wide resident budget (measured on GB200), or the
+        # BUDGET rule); the row's _bias_arm_decline and the adapter read the same arithmetic (rule 8b').
         pick = sm100_tile_n_pick(
             selected[0],
             facts.s_kv,

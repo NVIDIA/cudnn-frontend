@@ -1709,8 +1709,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 domain=dict(_SM107_TILE_NS_BY_D_SHAPE)[self.flavor],
             )
         if self.flavor in dict(_SM100_TILE_NS_BY_D_SHAPE) and self._device_cc in _SM100_BIAS_CCS and not self._fp8:
-            # The SM100 small tiles: config_sm100.sm100_tile_n_pick (128 unless the fp32 vector WITH a bias, which only the 64-wide tile serves;
-            # the row's _bias_arm_decline and the heuristics read the same arithmetic, rule 8b').
+            # The SM100 small tiles: config_sm100.sm100_tile_n_pick (128 unless the fp32 vector WITH a bias, which only the 64-wide tile serves, the
+            # bias body on the PADDING leg inside the 64-wide resident budget (measured on GB200), or the BUDGET rule; the row's _bias_arm_decline
+            # and the heuristics read the same arithmetic, rule 8b').
             return _sm100_tile_n_pick(
                 self.flavor[0],
                 int(self.k_desc.shape[2]),

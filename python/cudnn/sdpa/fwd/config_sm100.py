@@ -2843,18 +2843,32 @@ def sm100_bias_stages_pick(
 # The fp32 ADDITIVE kv_mask vector TOGETHER WITH a bias is served at the 64-wide KV tile only on this line too: the 128-wide rendering spills on
 # the softmax role (STL / LDL 53 / 64 on the sm_100a rendering, 2026-10-14; the Rubin finding, config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N).
 SM100_FP32_VECTOR_WITH_BIAS_TILE_N = 64
+# The bias body on the PADDING leg (per-row kv_lengths) takes the 64-wide KV tile on SM100 WHILE the 64-wide resident block holds S_kv -- MEASURED on
+# GB200 2026-10-14 (the 128-wide form pays a half-empty tail tile whenever the live length is off the 128 multiple: +21.8 % at D 32 S 256 f 0.75;
+# the 64-wide RING above that budget loses -2.3 % at S 384), a bounded form of the Rubin width table's padding rule; the dense bias body keeps the
+# 128-wide tile (the 64-wide one measured +1.2 / -3.3 % there).
+SM100_PADDED_BIAS_TILE_N = 64
 
 
 def sm100_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: bool, kv_mask_fp32: bool = False, padded: bool = False, domain=None) -> int:
     """The KV tile width of a plan on the SM100 small tiles when the TILE_N knob is unset -- ONE arithmetic for the engine row
     (``engines._bias_arm_decline``), the heuristics (``_resident_arm_tile_n``) and the adapter (``_effective_tile_n``), rule 8b'.
-    The 128-wide tile everywhere (the SM100 default: the Rubin measured width table -- 64 for a bias with a kv_mask, for a bias at one or
-    two kv tiles, on the padding leg -- is a Rubin PRIOR the GB200 sweep decides, NOT applied here), except the one form the 128-wide
-    rendering does not serve: the fp32 additive vector WITH a bias lands on :data:`SM100_FP32_VECTOR_WITH_BIAS_TILE_N`; and the BUDGET
-    rule -- 64 when no bias form holds ``s_kv`` at the 128-wide tile at any validated cga while one does at the 64-wide tile.  A width outside
-    ``domain`` (the row's ``tile_ns_by_d_shape`` entry) falls back to the domain's minimum; a shape without a domain keeps 128."""
+    The 128-wide tile by default (the Rubin measured width table's other rules -- 64 for a bias with a kv_mask, for a bias at one or two kv
+    tiles -- are Rubin PRIORS, NOT applied here), except: the one form the 128-wide rendering does not serve, the fp32 additive vector WITH
+    a bias, lands on :data:`SM100_FP32_VECTOR_WITH_BIAS_TILE_N`; the bias body on the PADDING leg lands on :data:`SM100_PADDED_BIAS_TILE_N`
+    while that tile's resident block holds ``s_kv`` (MEASURED on GB200 2026-10-14: the 128-wide form pays a half-empty tail tile off the 128
+    multiple; the 64-wide ring above the resident budget loses); and the BUDGET rule -- 64 when no bias
+    form holds ``s_kv`` at the 128-wide tile at any validated cga while one does at the 64-wide tile.  A width outside ``domain`` (the row's
+    ``tile_ns_by_d_shape`` entry) falls back to the domain's minimum; a shape without a domain keeps 128."""
     dom = frozenset(domain) if domain is not None else frozenset({128})
     pick = SM100_FP32_VECTOR_WITH_BIAS_TILE_N if (has_bias and has_kv_mask and kv_mask_fp32) else 128
+    if has_bias and padded and SM100_PADDED_BIAS_TILE_N in dom and int(d_flavor) == 32:  # the measured flavor; at D 64 the 64-wide tile is the budget default above S_kv 128 already
+        # MEASURED (GB200, 152 SMs @ 1830 MHz, cc 10.0, 2026-10-14; both widths in one process, A/B/A x 3 x 100 with a control twin): the bias body on
+        # the PADDING leg (per-row kv_lengths) runs faster at the 64-wide KV tile WHILE ITS RESIDENT BLOCK HOLDS S_kv -- the 128-wide form pays a
+        # half-empty tail tile off the 128 multiple (D 32, S 256, kv_len 192: 49.15 -> 40.34 us = +21.8 %); above the 64-wide resident budget the
+        # 64-wide RING loses to the 128-wide one (D 32, S 384, kv_len 288: -2.3 %; S 512, kv_len 384: -15.5 %), so the ring forms keep the 128-wide tile.
+        if any(sm100_bias_resident_s_kv_max(int(d_flavor), cga, tile_n=SM100_PADDED_BIAS_TILE_N) >= int(s_kv) for cga in SM100_SMALL_D_CGAS[(int(d_flavor), int(d_flavor))]):
+            pick = SM100_PADDED_BIAS_TILE_N
     if has_bias and pick == 128 and 64 in dom and (int(d_flavor), int(d_flavor)) in SM100_SMALL_D_CGAS:
         # The BUDGET rule (the only non-default pick without a measurement): when no bias form -- the resident block or a >= 2-stage ring --
         # holds s_kv at the 128-wide tile at ANY validated cga of the flavor, while one does at the 64-wide tile, the plan takes the 64-wide

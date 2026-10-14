@@ -60,6 +60,13 @@ def test_row_claims_the_resident_bias_on_the_derived_shapes_and_budgets():
     assert c0.sm100_tile_n_pick(64, 1024, has_bias=True, has_kv_mask=False, domain=dom) == 64  # the 3-stage ring at the 64-wide tile
     assert c0.sm100_tile_n_pick(64, 192, has_bias=False, has_kv_mask=True, domain=dom) == 128  # the mask alone has no budget
     assert c0.sm100_tile_n_pick(32, 256, has_bias=True, has_kv_mask=True, kv_mask_fp32=True, domain=dom) == 64
+    # the PADDING leg (per-row kv_lengths) with a bias on the 32-wide tile: the 64-wide KV tile while its resident block holds S_kv (<= 320 at cga1;
+    # MEASURED on GB200 2026-10-14: +21.8 % at S 256 f 0.75), the 128-wide tile above it (the 64-wide ring lost there); D 64 keeps the budget rule
+    assert c0.sm100_tile_n_pick(32, 256, has_bias=True, has_kv_mask=False, padded=True, domain=dom) == c0.SM100_PADDED_BIAS_TILE_N == 64
+    assert c0.sm100_tile_n_pick(32, 320, has_bias=True, has_kv_mask=True, padded=True, domain=dom) == 64
+    assert c0.sm100_tile_n_pick(32, 384, has_bias=True, has_kv_mask=False, padded=True, domain=dom) == 128
+    assert c0.sm100_tile_n_pick(32, 256, has_bias=False, has_kv_mask=False, padded=True, domain=dom) == 128  # the plain padded body: unmeasured, keeps 128
+    assert c0.sm100_tile_n_pick(64, 128, has_bias=True, has_kv_mask=False, padded=True, domain=dom) == 128  # D 64 at S_kv 128: cga2's one 128-wide tile
     # the heuristics' width pick = the row's: the narrowest width whose block holds S_kv
     assert c0.sm100_bias_auto_cga(32, 256, frozenset({1})) == 1
     assert c0.sm100_bias_auto_cga(64, 128, frozenset({1, 2})) == 2
@@ -360,7 +367,11 @@ def test_bias_matches_the_fp64_oracle_on_sm100(case, dtype):
     q, k, v, kw, ref = _t7._case_inputs(case, dtype)
     kw.pop("cga", None)  # the heuristics' width on this line (the Rubin cells' cga requests are the Rubin budget's)
     out = _run(q, k, v, **kw)
-    assert out["knobs"].cga == _expected_cga(case) and out["knobs"].tile_n == 128, (case, out["knobs"])
+    # the knob-less width: 128, except the plain PADDING leg with a bias on the 32-wide tile inside the 64-wide resident budget (per-row kv_lengths:
+    # padded_kv_zero_batch at S_kv 256 -> the 64-wide tile at cga1; MEASURED on GB200 2026-10-14).  The GQA 8 / 4 + sink + padded-Q-trim composition
+    # (causal_sink_padded_q_trim) keeps the 128-wide tile on the graph path (recorded on the cc 10.0 dev box the same day); its width is not claimed by the rule.
+    want_tn = {"padded_kv_zero_batch": 64}.get(case, 128)
+    assert out["knobs"].cga == _expected_cga(case) and out["knobs"].tile_n == want_tn, (case, out["knobs"], want_tn)
     _t7._check(out, ref)
     c = _t7._CASES[case]
     if "kv_lens" in c and 0 in c["kv_lens"]:
