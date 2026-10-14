@@ -214,6 +214,12 @@ class TemplateParams:
     head_tile: int = 512
     # Dense queries with native TMA loads from independently mapped K/V pages.
     page_size: int = 0
+    # Step 7 speed switch of the D128 template (sm90/prefill_d128_f16.py), appended so every earlier specialization
+    # keeps its defaults: False renders the v1 loop. intra_wg_overlap issues QK(t) and PV(t-1) as two WGMMA groups in
+    # flight together inside each compute warpgroup, and computes the same O and Stats bit for bit, up to the sign of a
+    # zero O element. SdpaFwdDslSm90 sets the shipped value (api_dsl.D128_INTRA_WG_OVERLAP) for the D128 flavor only;
+    # D512 refuses it.
+    intra_wg_overlap: bool = False
 
 
 # The ports of ``TemplateParams.thd_origins``, in order.
@@ -250,7 +256,8 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
     """Validate the immutable specialization before constructing a kernel.
 
     ``flavor`` names the template asking. D512 (the default) runs the checks below
-    unchanged, messages included. D128 first refuses its ``NOT_SERVED`` features (the
+    unchanged, messages included, and refuses the D128 template's intra-warpgroup
+    overlap switch. D128 first refuses its ``NOT_SERVED`` features (the
     declarations pick_flavor keeps on D512, so the adapter never reaches this refusal),
     then runs the same checks under its own name.
     """
@@ -270,6 +277,8 @@ def validate_params(params: TemplateParams, flavor: tuple[int, int] = D512_FLAVO
                 raise ValueError(f"SM90 D128 does not serve {label}; the D512 body (tile 64) serves such declarations")
     elif flavor != D512_FLAVOR:
         raise ValueError(f"SM90 has no {flavor} template; flavors: {sorted(FLAVORS)}")
+    if flavor == D512_FLAVOR and params.intra_wg_overlap:
+        raise ValueError("SM90 D512 has no intra-warpgroup overlap switch; it is a D128 template field")
     name = f"SM90 D{flavor[0]}"
     tile_m = FLAVOR_TILES[flavor][0]
     if type(params.page_size) is not int or params.page_size < 0:

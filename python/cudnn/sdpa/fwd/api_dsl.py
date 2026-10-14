@@ -245,6 +245,12 @@ _SM100_KERNEL_FILES = {
 _SM100_D512_2X2_KERNEL_FILE = "sm100/prefill_d512_f16_2x2.py"
 _SM107_D512_2X2_KERNEL_FILE = "sm107/prefill_d512_f16_2x2.py"
 D512_2X2: bool = True
+# The SM90 D128 template's step 7 speed switch (config_sm90.TemplateParams.intra_wg_overlap). A CALL-TIME module
+# constant that SdpaFwdDslSm90.check_support writes into a D128 plan's record (the D512_2X2 precedent above: a module
+# constant, not configuration, never per plan); a D512 plan never carries it. Either value computes the same function
+# bit for bit, up to the sign of a zero O element (test_sdpa_fwd_d128_sm90.py::test_d128_variant_is_bitwise_v1), so
+# this is a speed choice. False until the step 7 A/B; the commit that changes it records the measured table here.
+D128_INTRA_WG_OVERLAP: bool = False
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
@@ -5833,6 +5839,8 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             seq_q_lens_present=self.seq_q_lens_present,
             seq_kv_lens_present=self.seq_kv_lens_present,
             page_size=self.paged_page_size,
+            # D128 only: the step 7 switch, read at call time (module constant above).
+            intra_wg_overlap=self.flavor == _SM90_D128_FLAVOR and D128_INTRA_WG_OVERLAP,
         )
         self._native_d64 = False
         if (d_qk, d_v) == (64, 64) and not self.paged:

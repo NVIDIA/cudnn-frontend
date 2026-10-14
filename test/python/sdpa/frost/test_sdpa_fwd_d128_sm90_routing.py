@@ -486,3 +486,49 @@ def test_d128_template_fits_the_shared_sm90_prepared_host():
     reads = {n.attr for n in ast.walk(host) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "kernel"}
     assert reads and reads <= set_attrs(d512), sorted(reads - set_attrs(d512))
     assert reads <= set_attrs(d128), f"the prepared host reads kernel.{sorted(reads - set_attrs(d128))}, which the D128 template never sets"
+
+
+# --- Step 7 switch (TemplateParams.intra_wg_overlap) -------
+
+
+def test_step7_switch_fields_are_appended_last():
+    """The switch is appended after thd_origins, defaulting to False: every earlier specialization keeps its
+    defaults (the append-only rule the kit's hygiene check also enforces). The segment is pinned from its own first
+    field, so a field appended after it later still passes."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    fields = dataclasses.fields(c.TemplateParams)
+    names = [f.name for f in fields]
+    start = names.index("intra_wg_overlap")
+    assert start > names.index("thd_origins"), names
+    expected = [("intra_wg_overlap", False, bool)]
+    assert [(f.name, f.default, type(f.default)) for f in fields[start : start + len(expected)]] == expected
+
+
+@pytest.mark.parametrize("over", [dict(intra_wg_overlap=True)], ids=["overlap"])
+def test_d512_refuses_the_step7_switches(over):
+    """The switch is a D128 template field: D512 refuses it, D128 takes it."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+
+    params = dataclasses.replace(c.TemplateParams(), **over)
+    with pytest.raises(ValueError, match="SM90 D512 has no intra-warpgroup overlap switch"):
+        c.validate_params(params)
+    c.validate_params(params, flavor=c.D128_FLAVOR)
+
+
+def test_each_switch_combination_is_its_own_module_and_digest():
+    """The loader keys modules on (path, record) and folds repr(record) into the digest, so the two switch
+    values are two modules with two digests (two compile keys) in one process, with no hand-set digest
+    (python/cudnn/sdpa/AGENTS.md); the default record and a spelled-out False are one module."""
+    from cudnn.sdpa.fwd import config_sm90 as c
+    from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
+
+    mods = {}
+    for overlap in (False, True):
+        params = dataclasses.replace(c.TemplateParams(), intra_wg_overlap=overlap)
+        mod = _load_kernel_template("sm90/prefill_d128_f16.py", params, tag="switch_probe_sm90_d128")
+        assert mod.INTRA_WG_OVERLAP == overlap
+        mods[overlap] = mod
+    assert len({id(m) for m in mods.values()}) == 2
+    assert len({m.FROST_SOURCE_DIGEST for m in mods.values()}) == 2
+    assert _load_kernel_template("sm90/prefill_d128_f16.py", c.TemplateParams(), tag="switch_probe_sm90_d128") is mods[False]

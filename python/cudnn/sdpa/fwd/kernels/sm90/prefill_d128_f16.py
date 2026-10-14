@@ -26,6 +26,10 @@ The kernel implements:
 - A reverse KV walk: boundary tiles mask elements, interior tiles do not.
 - Causal masks (top-left or bottom-right), MHA, GQA and MQA (unpacked), and per-row LSE
   (Stats) in natural log or, under ``stats_log2``, base 2.
+- A compile-time speed switch, ``TemplateParams.intra_wg_overlap`` (the adapter sets the
+  shipped value). Overlap issues QK(t) and PV(t-1) as two WGMMA groups in flight together
+  and runs tile t's softmax while PV(t-1) is still on the tensor cores. Either value
+  computes the same O and Stats bit for bit, up to the sign of a zero O element.
 
 Storage: Q and each K and V ring stage are 128 x 128 tiles of two 128-row SW128 slabs; a
 compute warpgroup's QK reads rows 64*w .. 64*w+63 of the Q slabs. O stages through its own
@@ -97,6 +101,11 @@ PREPARED_FIXED_SHAPE = True
 PREPARED_KV_TAIL_NATIVE = True
 
 STORAGE_DTYPE = {DTYPE_FP16: cutlass.Float16, DTYPE_BF16: cutlass.BFloat16}[PARAMS.dtype_qkv]
+
+# Step 7 speed switch (design 3.12), from the record: each value is its own module, digest and compile key
+# (python/cudnn/sdpa/AGENTS.md, the hand-set digest lesson). Tests and benchmarks read it to assert that the arm they
+# asked for is the one that compiled. False is the v1 loop.
+INTRA_WG_OVERLAP: bool = PARAMS.intra_wg_overlap
 
 
 @dsl_user_op
@@ -181,6 +190,7 @@ class SM90FusedMultiHeadAttentionForward:
         qh_per_kh: int = 1,
         scale_mode: int = SCALE_POSITIVE,
         stats_log2: bool = False,
+        intra_wg_overlap: bool = False,
     ):
         """Initialize the SM90 D128 FMHA prefill kernel configuration.
 
@@ -201,6 +211,8 @@ class SM90FusedMultiHeadAttentionForward:
             must carry this sign.
         :param stats_log2: Store Stats in base 2: the store multiplies each natural-log row
             LSE by ``log2(e)``; ``-inf`` stays ``-inf``, and ``lse`` None removes it.
+        :param intra_wg_overlap: Issue QK(t) and PV(t-1) as two WGMMA groups in flight together and run
+            tile t's softmax under PV(t-1) (design 3.12, FA3's ``IntraWGOverlap``).
         """
 
         _, h_q, h_kv, _, _ = shape
@@ -224,6 +236,7 @@ class SM90FusedMultiHeadAttentionForward:
         # identity.
         self.anchor_sentinel = -cutlass.Float32.inf if scale_mode >= SCALE_ZERO else cutlass.Float32.inf
         self.stats_log2 = stats_log2
+        self.intra_wg_overlap = intra_wg_overlap
         # Read by prepared_host.host; a D128 specialization never declares them (no THD, sink,
         # paged pool or KV split: validate_params refuses each).
         self.thd_varlen = False
@@ -363,8 +376,14 @@ class SM90FusedMultiHeadAttentionForward:
         kv_seq_idx: cutlass.Int32,
         active_masks: cutlass.Constexpr,
         is_first_kv_tile: cutlass.Constexpr,
+        pack_p: cutlass.Constexpr = True,
     ):
-        """Update this lane's two rows and pack P into consumed score slots.
+        """Update this lane's two rows and leave P in the consumed score slots.
+
+        ``pack_p=True`` (v1) packs each P pair into one RS word in the slot of its first score.
+        ``pack_p=False`` (INTRA_WG_OVERLAP) leaves FP32 P, masked slots zeroed, in all 64 score slots;
+        ``pack_probability_words`` packs them after the PV group that still reads the previous P has
+        completed, because writing that group's operand words now would serialize every WGMMA.
 
         The D512 template's ``online_softmax`` at 32 keys per lane and row: ``basic_params``
         supplies the fixed work/lane references and the warpgroup's first query row;
@@ -381,7 +400,7 @@ class SM90FusedMultiHeadAttentionForward:
         anchors and alpha agree and their complementary sums merge only at finalization.
         ``MASK_NONE`` requires every score in the tile to be valid.
 
-        :return: ``s_regs``, with this tile's P packed into the consumed score slots.
+        :return: ``s_regs``, with this tile's P in the consumed score slots (packed or FP32, per ``pack_p``).
         """
         work, local_tid = basic_params.work, basic_params.local_tid
         row_anchor, row_sum, alpha = softmax_params.anchor, softmax_params.partial_sum, softmax_params.alpha
@@ -509,10 +528,14 @@ class SM90FusedMultiHeadAttentionForward:
                 if not valid1:
                     p1 = p_zero
                 total = total + p0 + p1
-                # One packed RS word, in the consumed score slot of p0.
-                p_pack = fp32_to_fp16(p0, p1, dtype=self.storage_dtype).bitcast(cutlass.Float32)
                 p_pack_off = k_frag * 4 + row_half * 2
-                s_regs[p_pack_off] = p_pack
+                if cutlass.const_expr(pack_p):
+                    # One packed RS word, in the consumed score slot of p0.
+                    s_regs[p_pack_off] = fp32_to_fp16(p0, p1, dtype=self.storage_dtype).bitcast(cutlass.Float32)
+                else:
+                    # FP32 P back into its own two score slots; pack_probability_words packs them after wait_group(0).
+                    s_regs[p_pack_off] = p0
+                    s_regs[p_pack_off + 1] = p1
             row_sum[row_half] = total
 
         return s_regs
@@ -584,6 +607,131 @@ class SM90FusedMultiHeadAttentionForward:
         return advance(kv_full_state, self.KV_STAGES)
 
     @cute.jit
+    def pack_probability_words(self, s_regs: cutlass.Array, p_words: cutlass.Array):
+        """Pack the FP32 P that ``online_softmax(pack_p=False)`` left in ``s_regs`` into the 32 RS words.
+
+        Word ``2*k_frag + row_half`` packs score slots ``4*k_frag + 2*row_half + {0, 1}``: the order
+        ``compute_one_kv_tile`` gathers from the in-place pack, so the words are v1's bit for bit. The caller
+        runs this only after ``wait_group(0)``: until then ``p_words`` is the A operand of the PV group in flight.
+        """
+        for k_frag in cutlass.range_constexpr(self.qk_row_slots // 2):
+            for row_half in cutlass.range_constexpr(2):
+                slot = k_frag * 4 + row_half * 2
+                p_words[2 * k_frag + row_half] = fp32_to_fp16(s_regs[slot], s_regs[slot + 1], dtype=self.storage_dtype).bitcast(cutlass.Float32)
+
+    @cute.jit
+    def overlap_first_tile(self, basic_params, mma_params, softmax_params, s_regs, p_words, k_state):
+        """INTRA_WG_OVERLAP prologue, KV tile 0: QK(0) waited, its softmax, P(0) packed; no PV yet.
+
+        Tile 0 is masked (MASK_PADDED plus the graph's mask) and has no history, as in v1; its softmax sets
+        alpha to 1, which the first step (or the drain) applies to the zero O. PV(0) then accumulates onto
+        that +0 where v1 overwrites O on its first k-step: the same O, except that a -0 sum becomes +0
+        (``torch.equal`` counts the two as equal).
+
+        :return: ``k_state`` advanced to tile 1; tile 0's state stays the caller's ``v_state``.
+        """
+        bars, work = basic_params.bars, basic_params.work
+        stage = k_state.idx
+        kv_seq_idx = (work.kv_right - 1) * self.KV_TILE
+        qk_tile = SimpleNamespace(q_desc=mma_params.q_desc, k_desc=mma_params.k_desc + stage * self.kv_stage_units)
+        bars.mb_tma_k_full[stage].wait(k_state.phase)
+        mma_qk(
+            qk_tile,
+            s_regs,
+            ab_dtype=self.storage_dtype,
+            c_slots=self.qk_row_slots * 2,
+            k_steps=self.HEAD_TILE // 16,
+            q_slab_rows=self.Q_TILE,
+            k_slab_rows=self.KV_TILE,
+        )
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        if prims.elect_sync():
+            bars.mb_tma_k_empty[stage].arrive()
+        self.online_softmax(basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=self.mask_flags | MASK_PADDED, is_first_kv_tile=True, pack_p=False)
+        self.pack_probability_words(s_regs, p_words)
+        return advance(k_state, self.KV_STAGES)
+
+    @cute.jit
+    def overlap_kv_step(
+        self,
+        basic_params: SimpleNamespace,
+        mma_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        s_regs: cutlass.Array,
+        p_words: cutlass.Array,
+        kv_step: cutlass.Int32,
+        k_state,
+        v_state,
+        active_masks: cutlass.Constexpr,
+    ):
+        """INTRA_WG_OVERLAP step t = ``kv_step`` >= 1: QK(t) and PV(t-1) in flight together (design 3.12).
+
+        Issue QK(t) into ``s_regs``, correct O by alpha(t-1) while it runs, and issue PV(t-1) from
+        ``p_words`` (P(t-1)); ``wait_group(1)`` retires QK(t), so K(t) is released while PV(t-1) still
+        runs; tile t's softmax writes only ``s_regs`` and the row state; ``wait_group(0)`` retires PV(t-1),
+        V(t-1) is released and P(t) is packed over P(t-1)'s words for the next step (or the drain).
+        ``active_masks`` is tile t's: a step runs in the phase of the tile whose softmax it runs.
+
+        In flight, nothing may touch: ``s_regs`` from the QK issue to ``wait_group(1)``; ``output`` and
+        ``p_words`` from the PV issue to ``wait_group(0)`` (a write there serializes every WGMMA, ptxas C7513).
+
+        :return: ``(k_state, v_state)`` for step t + 1: tile t + 1's state, then tile t's.
+        """
+        output = mma_params.o_regs
+        bars, work = basic_params.bars, basic_params.work
+        k_stage, v_stage = k_state.idx, v_state.idx
+        kv_seq_idx = (work.kv_right - 1 - kv_step) * self.KV_TILE
+        qk_tile = SimpleNamespace(q_desc=mma_params.q_desc, k_desc=mma_params.k_desc + k_stage * self.kv_stage_units)
+        pv_tile = SimpleNamespace(v_desc=mma_params.v_desc + v_stage * self.kv_stage_units, o_regs=output)
+        # P(t-1) in RS word order (word 2*k_frag+row_half), read before anything is issued.
+        probability_words = p_words.load(0, self.qk_row_slots).bitcast(cutlass.Uint32)
+        bars.mb_tma_k_full[k_stage].wait(k_state.phase)
+        mma_qk(
+            qk_tile,
+            s_regs,
+            ab_dtype=self.storage_dtype,
+            c_slots=self.qk_row_slots * 2,
+            k_steps=self.HEAD_TILE // 16,
+            q_slab_rows=self.Q_TILE,
+            k_slab_rows=self.KV_TILE,
+            wg_wait=-1,
+        )
+        # O *= alpha(t-1) while QK(t) runs. O is not in flight here (PV(t-2) retired at the previous
+        # step's wait_group(0)), and mma_pv's fence orders these writes before PV(t-1) reads them.
+        rescale_output(output, softmax_params.alpha.load(0, 2))
+        # V(t-1) was issued before K(t), so this wait almost always passes at once.
+        bars.mb_tma_v_full[v_stage].wait(v_state.phase)
+        # Every PV accumulates: O starts at zero (compute_warp_group), so PV(0) needs no first form.
+        mma_pv(pv_tile, probability_words, False, ab_dtype=self.storage_dtype, k_steps=self.KV_TILE // 16, wg_wait=-1)
+        # QK(t) has retired (groups complete in commit order); PV(t-1) may still run.
+        prims.wgmma_wait_group_sync_aligned(1)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        if prims.elect_sync():
+            bars.mb_tma_k_empty[k_stage].arrive()
+        self.online_softmax(basic_params, softmax_params, s_regs, kv_seq_idx, active_masks=active_masks, is_first_kv_tile=False, pack_p=False)
+        # PV(t-1) has retired: O, P(t-1) and V(t-1) are free.
+        prims.wgmma_wait_group_sync_aligned(0)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        if prims.elect_sync():
+            bars.mb_tma_v_empty[v_stage].arrive()
+        self.pack_probability_words(s_regs, p_words)
+        return advance(k_state, self.KV_STAGES), k_state
+
+    @cute.jit
+    def overlap_drain(self, basic_params, mma_params, softmax_params, p_words, v_state):
+        """INTRA_WG_OVERLAP drain: O *= alpha(last), then PV(last) from P(last), waited, and V(last) released."""
+        bars = basic_params.bars
+        stage = v_state.idx
+        pv_tile = SimpleNamespace(v_desc=mma_params.v_desc + stage * self.kv_stage_units, o_regs=mma_params.o_regs)
+        probability_words = p_words.load(0, self.qk_row_slots).bitcast(cutlass.Uint32)
+        rescale_output(pv_tile.o_regs, softmax_params.alpha.load(0, 2))
+        bars.mb_tma_v_full[stage].wait(v_state.phase)
+        mma_pv(pv_tile, probability_words, False, ab_dtype=self.storage_dtype, k_steps=self.KV_TILE // 16)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+        if prims.elect_sync():
+            bars.mb_tma_v_empty[stage].arrive()
+
+    @cute.jit
     def epilogue(self, bars, work, tma_o_desc, sO, output, row_sum_inv, local_tid, w, row_base):
         """Normalize, stage and store compute warpgroup ``w``'s 64 O rows.
 
@@ -633,6 +781,9 @@ class SM90FusedMultiHeadAttentionForward:
             qk = cutlass.Array(cutlass.Float32, 2 * self.qk_row_slots, alignment=16)
             output = cutlass.Array(cutlass.Float32, self.o_fragment_slots, alignment=16)
             output.store((0.0,) * self.o_fragment_slots)
+            # INTRA_WG_OVERLAP: P(t-1)'s 32 RS words, live while QK(t) overwrites the score slots. An unused
+            # Array traces no code, so the v1 loop renders as before.
+            p_words = cutlass.Array(cutlass.Float32, self.qk_row_slots, alignment=16)
             # This warpgroup's 64 rows start 64*w rows into each 128-row Q slab, a whole number
             # of 8-row SW128 atoms.
             q_desc = wgmma_descriptor(sQ.base.subview(w * self.WG_ROWS * self.swizzle_chunk_elems))
@@ -647,8 +798,9 @@ class SM90FusedMultiHeadAttentionForward:
             anchor.store((sentinel, sentinel))
             partial_sum = cutlass.Array(cutlass.Float32, 2, alignment=16)
             partial_sum.store((0.0, 0.0))
-            # This tile's two O-correction factors. Every scale path writes both halves
-            # before compute_one_kv_tile reads them, so alpha needs no initial store.
+            # The latest softmax's two O-correction factors: v1 reads them in the same tile
+            # (compute_one_kv_tile), overlap one tile later (overlap_kv_step, overlap_drain). The
+            # first tile writes both halves, so alpha needs no initial store.
             alpha = cutlass.Array(cutlass.Float32, 2, alignment=8)
             scale_log2 = scale * cutlass.Float32(LOG2_E)
             scale_log2_wide = cutlass.Float64(scale) * cutlass.Float64(LOG2_E)
@@ -690,17 +842,22 @@ class SM90FusedMultiHeadAttentionForward:
                 kv_full_state = PipelineState.start(phase=0)
                 # Q FULL completes once per CTA (one work tile), so its one wait reads phase 0.
                 bars.mb_tma_q_full.wait(cutlass.Int32(0))
-                # Phase 1: the first tile and the right boundary, both possibly masked.
-                kv_full_state = self.compute_one_kv_tile(
-                    basic_params,
-                    mma_params,
-                    softmax_params,
-                    qk,
-                    cutlass.Int32(0),
-                    kv_full_state,
-                    active_masks=self.mask_flags | MASK_PADDED,
-                    is_first_kv_tile=True,
-                )
+                # Overlap: V trails K by one tile (PV(t-1) runs with QK(t)); v_state is tile 0's here.
+                v_state = kv_full_state
+                if cutlass.const_expr(self.intra_wg_overlap):
+                    kv_full_state = self.overlap_first_tile(basic_params, mma_params, softmax_params, qk, p_words, kv_full_state)
+                else:
+                    # Phase 1: the first tile and the right boundary, both possibly masked.
+                    kv_full_state = self.compute_one_kv_tile(
+                        basic_params,
+                        mma_params,
+                        softmax_params,
+                        qk,
+                        cutlass.Int32(0),
+                        kv_full_state,
+                        active_masks=self.mask_flags | MASK_PADDED,
+                        is_first_kv_tile=True,
+                    )
                 # Reverse-step endpoints: boundary, fully valid interior, boundary. An
                 # interior tile needs every score in it valid for all 128 rows of the CTA, so
                 # an incomplete Q tile keeps every element predicate.
@@ -719,21 +876,54 @@ class SM90FusedMultiHeadAttentionForward:
                         lo = hi
                 masked_end = cute.math.min(work.iterations, cute.math.max(cutlass.Int32(1), right - hi))
                 unmasked_end = cute.math.min(work.iterations, cute.math.max(masked_end, right - lo))
-                for kv_step in cutlass.range(1, masked_end, unroll=1):
-                    kv_full_state = self.compute_one_kv_tile(
-                        basic_params, mma_params, softmax_params, qk, kv_step, kv_full_state, active_masks=self.mask_flags | MASK_PADDED, is_first_kv_tile=False
-                    )
-                # Phase 2: remaining fully unmasked iterations.
-                for kv_step in cutlass.range(masked_end, unmasked_end, unroll=1):
-                    kv_full_state = self.compute_one_kv_tile(
-                        basic_params, mma_params, softmax_params, qk, kv_step, kv_full_state, active_masks=MASK_NONE, is_first_kv_tile=False
-                    )
-                # Phase 3: the left boundary, or every remaining tile when the Q tile is
-                # incomplete.
-                for kv_step in cutlass.range(unmasked_end, work.iterations, unroll=1):
-                    kv_full_state = self.compute_one_kv_tile(
-                        basic_params, mma_params, softmax_params, qk, kv_step, kv_full_state, active_masks=self.mask_flags | MASK_PADDED, is_first_kv_tile=False
-                    )
+                if cutlass.const_expr(self.intra_wg_overlap):
+                    # Step t issues QK(t) with PV(t-1) and runs tile t's softmax, so the three phases keep
+                    # v1's bounds over t; the drain issues the last PV.
+                    for kv_step in cutlass.range(1, masked_end, unroll=1):
+                        kv_full_state, v_state = self.overlap_kv_step(
+                            basic_params, mma_params, softmax_params, qk, p_words, kv_step, kv_full_state, v_state, active_masks=self.mask_flags | MASK_PADDED
+                        )
+                    # Phase 2: remaining fully unmasked iterations.
+                    for kv_step in cutlass.range(masked_end, unmasked_end, unroll=1):
+                        kv_full_state, v_state = self.overlap_kv_step(
+                            basic_params, mma_params, softmax_params, qk, p_words, kv_step, kv_full_state, v_state, active_masks=MASK_NONE
+                        )
+                    # Phase 3: the left boundary, or every remaining tile when the Q tile is incomplete.
+                    for kv_step in cutlass.range(unmasked_end, work.iterations, unroll=1):
+                        kv_full_state, v_state = self.overlap_kv_step(
+                            basic_params, mma_params, softmax_params, qk, p_words, kv_step, kv_full_state, v_state, active_masks=self.mask_flags | MASK_PADDED
+                        )
+                    self.overlap_drain(basic_params, mma_params, softmax_params, p_words, v_state)
+                else:
+                    for kv_step in cutlass.range(1, masked_end, unroll=1):
+                        kv_full_state = self.compute_one_kv_tile(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            qk,
+                            kv_step,
+                            kv_full_state,
+                            active_masks=self.mask_flags | MASK_PADDED,
+                            is_first_kv_tile=False,
+                        )
+                    # Phase 2: remaining fully unmasked iterations.
+                    for kv_step in cutlass.range(masked_end, unmasked_end, unroll=1):
+                        kv_full_state = self.compute_one_kv_tile(
+                            basic_params, mma_params, softmax_params, qk, kv_step, kv_full_state, active_masks=MASK_NONE, is_first_kv_tile=False
+                        )
+                    # Phase 3: the left boundary, or every remaining tile when the Q tile is
+                    # incomplete.
+                    for kv_step in cutlass.range(unmasked_end, work.iterations, unroll=1):
+                        kv_full_state = self.compute_one_kv_tile(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            qk,
+                            kv_step,
+                            kv_full_state,
+                            active_masks=self.mask_flags | MASK_PADDED,
+                            is_first_kv_tile=False,
+                        )
                 # Finalization with KV work: normalize both rows. Keep it in the live-KV arm,
                 # as the D512 template does.
                 for row_half in cutlass.range_constexpr(2):
@@ -1062,6 +1252,7 @@ def _compile(b, h_q, h_kv, s_q, s_kv, q_stride, k_stride, v_stride, o_stride, ls
         qh_per_kh=PARAMS.qh_per_kh,
         scale_mode=PARAMS.scale_mode,
         stats_log2=PARAMS.stats_log2,
+        intra_wg_overlap=PARAMS.intra_wg_overlap,
     )
 
     # Axis order is plan metadata, shared by descriptor construction and kernel

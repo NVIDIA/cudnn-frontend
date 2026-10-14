@@ -15,6 +15,8 @@ SM90 suite's own (O 5e-2 / 3e-2, Stats 2e-2 / 2e-2 against the fp32 reference; t
 runners keep theirs) except where the arithmetic is the same and the comparison is ``torch.equal``.
 """
 
+import dataclasses
+import json
 import math
 import os
 import subprocess
@@ -66,8 +68,17 @@ def _inputs(b, h_q, h_kv, s_q, s_kv, dtype):
     return _bhsd(b, h_q, s_q, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype), _bhsd(b, h_kv, s_kv, _D, dtype)
 
 
-def _plan(q, k, v, *, stats=False, **kw):
-    """One compiled D128 plan over NaN-filled O (and Stats); asserts the adapter chose D128."""
+# TemplateParams.intra_wg_overlap per step 7 switch value.
+_VARIANTS = {"v1": False, "ov": True}
+
+
+def _plan(q, k, v, *, stats=False, variant=None, **kw):
+    """One compiled D128 plan over NaN-filled O (and Stats); asserts the adapter chose D128.
+
+    ``variant`` names a step 7 switch value (``_VARIANTS``), set on the plan's record between
+    ``check_support`` and ``compile``; the compiled module must carry it, so a cache-key slip that hands
+    back the other value's kernel fails here. None is the adapter's shipped value.
+    """
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     b, h_q, s_q, d = q.shape
@@ -75,13 +86,17 @@ def _plan(q, k, v, *, stats=False, **kw):
     lse = torch.full((b, h_q, s_q), float("nan"), dtype=torch.float32, device="cuda") if stats else None
     api = SdpaFwdDslSm90(q, k, v, o, sample_lse=lse, **kw)
     assert api.check_support() and api.flavor == (128, 128), api.flavor
+    if variant is not None:
+        api.params = dataclasses.replace(api.params, intra_wg_overlap=_VARIANTS[variant])
     api.compile()
+    if variant is not None:
+        assert api._k_mod.INTRA_WG_OVERLAP == _VARIANTS[variant], variant
     return api, o, lse
 
 
-def _run(q, k, v, *, stats=False, **kw):
+def _run(q, k, v, *, stats=False, variant=None, **kw):
     """Plan, execute once, and return (O, Stats or None)."""
-    api, o, lse = _plan(q, k, v, stats=stats, **kw)
+    api, o, lse = _plan(q, k, v, stats=stats, variant=variant, **kw)
     api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
     torch.cuda.synchronize()
     return o, lse
@@ -516,11 +531,13 @@ def test_d128_schedulers_are_bitwise_equal():
     _check(*runs[0], q, k, v, is_causal=True)
 
 
+@pytest.mark.parametrize("variant", list(_VARIANTS))
 @torch_fork_set_rng(seed=0)
-def test_d128_repeat_launches_are_bitwise_equal():
-    """Two launches of one plan over the same inputs agree bit for bit (no race, no stale stage)."""
+def test_d128_repeat_launches_are_bitwise_equal(variant):
+    """Two launches of one plan over the same inputs agree bit for bit (no race, no stale stage), for every
+    step 7 switch value."""
     q, k, v = _inputs(2, 8, 2, 700, 900, torch.float16)
-    api, o, lse = _plan(q, k, v, stats=True, is_causal=True)
+    api, o, lse = _plan(q, k, v, stats=True, is_causal=True, variant=variant)
     outs = []
     for _ in range(2):
         o.fill_(float("nan"))
@@ -553,6 +570,188 @@ def test_d128_layouts_are_bitwise_equal(layout):
     base = _run(*(_laid_out(t, _LAYOUTS["bhsd"]) for t in (q, k, v)), stats=True, is_causal=True)
     other = _run(*(_laid_out(t, _LAYOUTS[layout]) for t in (q, k, v)), stats=True, is_causal=True)
     assert torch.equal(base[0], other[0]) and torch.equal(base[1], other[1])
+
+
+# --- Step 7: every switch value computes one function -------
+#
+# Overlap reorders issues and waits around the same multiplies, P words, V stages and k-step chains (plan
+# step7-overlap-pingpong.md 3.2), so it equals v1 bit for bit. Each case is an edge of the overlap protocol.
+
+# K and the even Q rows take this constant: those rows take the FP64 exponents (the large-scores test's max-1.2e12 case),
+# while the odd rows (random Q, raw scores about 1e6, under the about 1.3e8 row limit) stay on FP32.
+_WIDE = 1.5 * 2.0**16
+_CROSS = {  # id: (b, h_q, h_kv, s_q, s_kv, dtype, adapter keywords)
+    "ring-wrap": (1, 2, 2, 256, 384, torch.float16, {}),  # 3 KV tiles on the 2-stage rings
+    "one-kv-tile": (1, 2, 2, 64, 128, torch.float16, {}),  # prologue and drain only
+    "wg2-dead": (2, 2, 2, 17, 300, torch.bfloat16, {}),  # WG2 has no valid row, yet takes every step and releases
+    "folded-mask": (2, 2, 2, 70, 100, torch.float16, {}),  # the libNVVM opaque-zero case, now through pack_probability_words
+    "partial-q-8kv": (1, 2, 2, 129, 1000, torch.bfloat16, {}),  # 8 KV tiles, all masked (incomplete Q tile: phase 3)
+    "causal-br": (2, 4, 4, 130, 700, torch.bfloat16, dict(is_causal=True, causal_bottom_right=True)),
+    "gqa-causal": (2, 8, 2, 200, 333, torch.bfloat16, dict(is_causal=True)),
+    "neg-scale": (2, 4, 2, 130, 200, torch.float16, dict(is_causal=True, scale_softmax=-0.25)),  # FP64 path on every tile
+    "wide-fp64": (1, 2, 2, 128, 256, torch.bfloat16, {}),  # even rows FP64, odd rows FP32: lanes diverge inside the PV window
+    "multi-wave": (4, 16, 4, 1024, 1024, torch.bfloat16, dict(is_causal=True, sched_policy=SCHED_LPT_L2)),
+}
+
+
+def _reference_mask(kw, s_q, s_kv):
+    """(is_causal, bottom_right) for _check: the adapter spells top-left on a dense square as bottom-right."""
+    causal = kw.get("is_causal", False)
+    return causal, causal and (kw.get("causal_bottom_right", False) or s_q == s_kv)
+
+
+@pytest.mark.parametrize("case", list(_CROSS))
+@pytest.mark.parametrize("variant", ["ov"])
+@torch_fork_set_rng(seed=0)
+def test_d128_variant_is_bitwise_v1(variant, case):
+    """Every step 7 switch value computes v1's O and Stats bit for bit; v1 itself is checked against the
+    reference. A difference that repeats launch after launch is arithmetic (compare the softmax block's
+    FFMA/FMUL/FADD counts in SASS); one that moves between launches is a race."""
+    b, h_q, h_kv, s_q, s_kv, dtype, kw = _CROSS[case]
+    q, k, v = _inputs(b, h_q, h_kv, s_q, s_kv, dtype)
+    if case == "wide-fp64":
+        # A row's four lanes share its path, and a warp holds rows of both parities, so its lanes split.
+        q[:, :, 0::2].fill_(_WIDE)
+        k.fill_(_WIDE)
+    base = _run(q, k, v, stats=True, variant="v1", **kw)
+    if case != "wide-fp64":  # its FP64 check is test_d128_large_scores_keep_rows_finite_and_nonzero's
+        is_causal, bottom_right = _reference_mask(kw, s_q, s_kv)
+        _check(*base, q, k, v, scale=kw.get("scale_softmax", _SCALE), is_causal=is_causal, bottom_right=bottom_right)
+    o, lse = _run(q, k, v, stats=True, variant=variant, **kw)
+    if not (torch.equal(o, base[0]) and torch.equal(lse, base[1])):
+        d_o = (o.float() - base[0].float()).abs()
+        rows = torch.nonzero(d_o.amax(dim=-1) > 0)[:8].tolist()
+        pytest.fail(
+            f"{variant} is not v1 on {case}: max |dO| {d_o.max().item():.3e}, Stats equal {torch.equal(lse, base[1])}, "
+            f"first differing (batch, head, row) {rows}; rerun test_d128_repeat_launches_are_bitwise_equal[{variant}]: "
+            "stable launches mean arithmetic (compare the softmax FFMA/FMUL/FADD counts), moving ones a race"
+        )
+
+
+@pytest.mark.parametrize("variant", list(_VARIANTS))
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_replay_is_bitwise_eager(variant):
+    """CUDA-graph replay of one plan equals its eager launch bit for bit, before and after the inputs change
+    in place at the captured pointers (design T9), for every step 7 switch value."""
+    q, k, v = _inputs(2, 4, 2, 300, 700, torch.bfloat16)
+    api, o, lse = _plan(q, k, v, stats=True, is_causal=True, causal_bottom_right=True, variant=variant)
+
+    def run():
+        api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, lse_tensor=lse)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    try:
+        # Warm up on the capture stream, as test_sdpa_native_sm90_binding.py's capture does.
+        with torch.cuda.stream(stream):
+            run()
+            with torch.cuda.graph(graph, stream=stream):
+                run()
+        stream.synchronize()
+        for step in range(2):
+            if step:
+                k.mul_(0.5)
+                v.add_(1.0)
+            run()
+            torch.cuda.synchronize()
+            eager = (o.clone(), lse.clone())
+            o.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(o, eager[0]) and torch.equal(lse, eager[1]), (variant, "changed inputs" if step else "same inputs")
+    finally:
+        graph.reset()
+
+
+# Compiles four plans, then runs each three times under a faulthandler deadline: a ring that never completes makes
+# the child exit instead of hanging the worker (test/AGENTS.md, crash isolation), and the parent reports HANG.
+# Self-contained, so it needs nothing from pytest's path setup.
+_TURNS_CHILD = textwrap.dedent(r"""
+    import dataclasses, faulthandler, sys, time
+    import torch
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+    overlap, run_budget_s = sys.argv[1] == "1", int(sys.argv[2])
+    # (b, h_q, h_kv, s_q, s_kv, causal): ring wrap; one KV tile (the prologue meets the drain); WG2 without a row
+    # over three tiles of an incomplete Q tile (phase 3); bottom-right causal with masked and unmasked phases.
+    CASES = [(1, 2, 2, 256, 384, False), (1, 2, 2, 64, 128, False), (2, 2, 2, 17, 300, False), (2, 4, 2, 130, 700, True)]
+    plans = []
+    for b, h_q, h_kv, s_q, s_kv, causal in CASES:
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(b, s, h, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2) for s, h in ((s_q, h_q), (s_kv, h_kv), (s_kv, h_kv)))
+        o = torch.full((b, s_q, h_q, 128), float("nan"), device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+        api = SdpaFwdDslSm90(q, k, v, o, **(dict(is_causal=True, causal_bottom_right=True) if causal else {}))
+        assert api.check_support() and api.flavor == (128, 128), api.flavor
+        api.params = dataclasses.replace(api.params, intra_wg_overlap=overlap)
+        api.compile()
+        assert api._k_mod.INTRA_WG_OVERLAP == overlap
+        plans.append((api, q, k, v, o, (b, h_q, h_kv, s_q, s_kv, causal)))
+    print("COMPILED", len(plans), flush=True)
+    faulthandler.dump_traceback_later(run_budget_s, exit=True)
+    for api, q, k, v, o, case in plans:
+        # Per-launch seconds: a starved launch (slow, then done) reads differently from a wedged one (never done).
+        times = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o)
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+        assert torch.isfinite(o).all(), case
+        print("RAN", case, "launch s", " ".join(f"{t:.4f}" for t in times), flush=True)
+    faulthandler.cancel_dump_traceback_later()
+    print("TURNS OK", flush=True)
+    """)
+# Run ahead of the child's first import (test/AGENTS.md, timed subprocess tests): a stall while importing or
+# compiling dumps the child's stack and exits inside the parent's deadline; the run phase re-arms the dump with its
+# own budget. The compile budget is the child's last argument, so the child's own arguments keep their positions.
+_TURNS_PREAMBLE = "import faulthandler, sys\nfaulthandler.dump_traceback_later(int(sys.argv[-1]), exit=True)\n"
+# The child's whole budget stays inside the conftest's per-test deadline (CUDNN_TEST_TIMEOUT, 0 = none), so a stall
+# reaches the HANG report below and the child is killed with it, instead of the worker dying with the child still running.
+_TURNS_RUN_BUDGET_S = 120
+_TEST_DEADLINE_S = float(os.environ.get("CUDNN_TEST_TIMEOUT", "1500"))
+_TURNS_COMPILE_BUDGET_S = 900 if _TEST_DEADLINE_S <= 0 else max(60, min(900, int(_TEST_DEADLINE_S) - _TURNS_RUN_BUDGET_S - 60))
+
+
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("variant", list(_VARIANTS))
+def test_d128_turns_and_rings_complete_in_a_watchdogged_child(variant):
+    """Every launch of every switch value finishes: no K or V ring slot waits for an arrival that never comes,
+    including one KV tile, a warpgroup without rows and an incomplete Q tile. A hang is a child that misses its
+    run deadline, reported as HANG with its last lines; a child that stalls before every plan has compiled is
+    reported as STALL, with its stack (the child arms its own deadline before its first import)."""
+    argv = [sys.executable, "-c", _TURNS_PREAMBLE + _TURNS_CHILD, str(int(_VARIANTS[variant])), str(_TURNS_RUN_BUDGET_S), str(_TURNS_COMPILE_BUDGET_S)]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=_TURNS_COMPILE_BUDGET_S + _TURNS_RUN_BUDGET_S)
+    except subprocess.TimeoutExpired as exc:
+        # TimeoutExpired carries bytes even with text=True. Keep both streams: a child-side stack dump is on stderr.
+        out, err = (s.decode(errors="replace") if isinstance(s, bytes) else (s or "") for s in (exc.stdout, exc.stderr))
+        stage = "HANG" if "COMPILED" in out else "STALL before COMPILED"
+        budget = _TURNS_COMPILE_BUDGET_S + _TURNS_RUN_BUDGET_S
+        pytest.fail(f"{stage} ({variant}): no exit in {budget} s; last lines {out.strip().splitlines()[-3:]}\n--- child stderr ---\n{err[-3000:]}")
+    # A child-side dump after COMPILED is a launch that never finished; one before it is an import or compile stall.
+    hung = "COMPILED" in proc.stdout and "Timeout" in proc.stderr
+    stage = "HANG" if hung else "STALL before COMPILED" if "Timeout" in proc.stderr else "FAILED"
+    assert proc.returncode == 0 and "TURNS OK" in proc.stdout, f"{stage} ({variant}), exit {proc.returncode}:\n{proc.stdout[-2000:]}\n{proc.stderr[-3000:]}"
+
+
+@pytest.mark.L0
+def test_d128_adapter_applies_the_shipped_switches(monkeypatch):
+    """check_support writes api_dsl's D128 switch constant into a D128 plan's record at call time, and a
+    D512 plan (tile 64/64 pinned) never carries it."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    q, k, v = _inputs(1, 2, 2, 64, 128, torch.float16)
+    o = torch.empty_like(q)
+    for overlap in _VARIANTS.values():
+        monkeypatch.setattr(api_dsl, "D128_INTRA_WG_OVERLAP", overlap)
+        api = api_dsl.SdpaFwdDslSm90(q, k, v, o)
+        assert api.check_support() and api.flavor == (128, 128), api.flavor
+        assert api.params.intra_wg_overlap == overlap
+        d512 = api_dsl.SdpaFwdDslSm90(q, k, v, o, tile_m=64, tile_n=64)
+        assert d512.check_support() and d512.flavor == (512, 512), d512.flavor
+        assert d512.params.intra_wg_overlap is False
 
 
 # --- Tight numerics against FP64 -------
@@ -633,8 +832,8 @@ def test_d128_large_scores_keep_rows_finite_and_nonzero(a):
 # --- Code generation: the register split, spills and WGMMA serialization -------
 
 _SASS_PROBE = textwrap.dedent(r"""
-    import glob, os, subprocess, sys
-    dump, ptxas, cands = sys.argv[1], sys.argv[2], sys.argv[3:]
+    import dataclasses, glob, json, os, re, subprocess, sys
+    dump, fields, ptxas, cands = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3], sys.argv[4:]
     os.environ["CUTE_DSL_DUMP_DIR"] = dump
     os.environ["CUTE_DSL_KEEP"] = "ptx,cubin"
     os.environ["CUTE_DSL_ARCH"] = "sm_90a"  # unconditional: an inherited value would pin another target
@@ -642,9 +841,10 @@ _SASS_PROBE = textwrap.dedent(r"""
     from cudnn.frost.tile_dsl.constants import DTYPE_BF16
     from cudnn.sdpa.fwd.api_dsl import _load_kernel_template
     from cudnn.sdpa.fwd.config_sm90 import TemplateParams
-    # The heaviest D128 body: causal (three masked phases), GQA and Stats.
-    params = TemplateParams(dtype_qkv=DTYPE_BF16, causal=True, has_lse=True, qh_per_kh=4)
+    # The heaviest D128 body: causal (three masked phases), GQA and Stats; ``fields`` adds the step 7 switch.
+    params = dataclasses.replace(TemplateParams(dtype_qkv=DTYPE_BF16, causal=True, has_lse=True, qh_per_kh=4), **fields)
     mod = _load_kernel_template("sm90/prefill_d128_f16.py", params, tag="sass_sm90_d128")
+    print("SWITCHES", int(mod.INTRA_WG_OVERLAP))
     b, h_q, h_kv, s = 2, 8, 2, 1024
     q, kv = (s * h_q * 128, 128, h_q * 128, 1), (s * h_kv * 128, 128, h_kv * 128, 1)
     mod.compile(b, h_q, h_kv, s, s, q, kv, kv, q, (h_q * s, s, 1))
@@ -664,12 +864,29 @@ _SASS_PROBE = textwrap.dedent(r"""
     if nvd is None:
         print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
     sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
-    for key in ("USETMAXREG", "STL", "LDL", "HGMMA"):
-        print("SASS", key, sum(1 for ln in sass if key in ln))
+    text = [ln for ln in sass if re.match(r"\s+/\*[0-9a-f]{4,}\*/", ln)]
+    keys = {"USETMAXREG": "USETMAXREG", "STL": "STL", "LDL": "LDL", "HGMMA": "HGMMA", "DEPBAR": "WARPGROUP.DEPBAR",
+            "DEPBAR_1": "DEPBAR.LE gsb0, 0x1", "BAR_SYNC": "BAR.SYNC", "BAR_ARV": "BAR.ARV"}
+    for name, key in keys.items():
+        print("SASS", name, sum(1 for ln in sass if key in ln))
+    print("SASS MAXREG", max((int(r) for ln in text for r in re.findall(r"\bR(\d+)\b", ln)), default=-1))
+    # Overlap's reach: MUFU.EX2 between a wait_group(1) and the next wait_group(0), the fewest over the steps (34 of
+    # 66 in the kernel mapper's ov build, plan O1). Printed for the A/B record, not pinned.
+    under = []
+    for a, ln in enumerate(text):
+        if "DEPBAR.LE gsb0, 0x1" in ln:
+            z = next((j for j in range(a + 1, len(text)) if "DEPBAR.LE gsb0, 0x0" in text[j]), len(text))
+            under.append(sum("MUFU.EX2" in t for t in text[a:z]))
+    print("SASS EX2_UNDER_PV", min(under) if under else -1)
     alloc = [int(ln.split(",")[-1].strip(" ;"), 16) for ln in sass if "USETMAXREG.TRY_ALLOC" in ln]
     dealloc = [int(ln.split()[-2], 16) for ln in sass if "USETMAXREG.DEALLOC" in ln]
     print("SASS USETMAXREG_ALLOC", alloc[0] if alloc else -1)
     print("SASS USETMAXREG_DEALLOC", dealloc[0] if dealloc else -1)
+    ptx = open(ptxs[-1], encoding="utf-8", errors="replace").read()
+    pred = r"^\s*(?:@!?%p\d+\s+)?"
+    aligned = re.findall(pred + r"(?:bar(?:\.cta)?\.(?:sync|arrive)\b|barrier(?:\.cta)?\.(?:sync|arrive)\.aligned\b)", ptx, re.M)
+    print("PTX LEGACY_BAR", len(aligned))
+    print("PTX BARRIER_ARRIVE", len(re.findall(pred + r"barrier(?:\.cta)?\.arrive\b", ptx, re.M)))
     if ptxas == "-":
         print("PTXAS none"); sys.exit(0)
     asm = subprocess.run([ptxas, "-arch=sm_90a", "-v", "-o", os.path.join(dump, "probe.cubin"), ptxs[-1]], capture_output=True, text=True, timeout=900)
@@ -678,6 +895,8 @@ _SASS_PROBE = textwrap.dedent(r"""
         print("PTXAS too_old"); sys.exit(0)
     print("PTXAS rc", asm.returncode)
     print("PTXAS serialized", sum(1 for ln in log.splitlines() if "wgmma.mma_async instructions are serialized" in ln))
+    used = re.search(r"used (\d+) barriers", log)
+    print("PTXAS barriers", used.group(1) if used else -1)
     for ln in log.splitlines():
         if "Used" in ln or "spill" in ln or "C75" in ln:
             print("PTXAS_LINE", ln.strip())
@@ -685,6 +904,14 @@ _SASS_PROBE = textwrap.dedent(r"""
 # A target, not yet a measurement: the plan expects no spills at the 240-register budget (design
 # 3.5 estimates about 200). Replace it with the STL/LDL counts of the first sm_90a compile (S2).
 _SPILL_PIN = {"STL": 0, "LDL": 0}
+# Per-value structure of the probe body (causal, GQA 4, Stats, bf16), measured on the offline sm_90a kit (ptxas 13.4
+# V13.4.92, CuTe DSL 4.8.0, compile_d128.sh --preset probe): v1 = 3 step instances x (8 SS + 8 RS); ov = prologue QK 8
+# + 2 step instances x 16 + drain PV 8, one wait_group(1) per step instance. Body counts are a toolchain fact
+# (python/cudnn/sdpa/AGENTS.md, the LDTM lesson): re-measure on a new toolchain and record it next to the numbers.
+_CODEGEN_PINS = {
+    "v1": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=0, BAR_ARV=0),
+    "ov": dict(HGMMA=48, DEPBAR=6, DEPBAR_1=2, BAR_ARV=0),
+}
 
 
 def _ptxas():
@@ -696,26 +923,35 @@ def _ptxas():
     return next((c for c in cands if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
 
 
-def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path):
+@pytest.mark.parametrize("variant", list(_VARIANTS))
+def test_d128_register_split_no_spills_and_no_wgmma_serialization(tmp_path, variant):
     """The (24, 240, 240) setmaxnreg split survives into SASS (min_blocks_per_mp=1 on the launch;
-    python/cudnn/AGENTS.md: ptxas otherwise drops it silently), the compute body does not spill,
-    and ptxas keeps the QK and PV WGMMA groups pipelined (no C7511 serialization advisory)."""
+    python/cudnn/AGENTS.md: ptxas otherwise drops it silently), the compute body does not spill and stays
+    under the 240-register budget, and ptxas keeps the QK and PV WGMMA groups pipelined (no C7511/C7513
+    serialization advisory), for every step 7 switch value. The switch must really compile: a
+    wait_group(1) appears exactly under overlap."""
     cands = nvdisasm_candidates()
     if not cands:
         pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
     dump = tmp_path / "dump"
     dump.mkdir()
-    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
-    assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    overlap = _VARIANTS[variant]
+    fields = json.dumps(dict(intra_wg_overlap=overlap))
+    proc = subprocess.run([sys.executable, "-c", _SASS_PROBE, str(dump), fields, _ptxas() or "-", *cands], capture_output=True, text=True, timeout=1800)
+    assert proc.returncode == 0, f"sm_90a trace-compile of the D128 template ({variant}) failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
     out = proc.stdout.splitlines()
     if any(ln.startswith("SKIP") for ln in out):
         pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
-    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ")}
-    print("\nD128 SASS:", stats, [ln for ln in out if ln.startswith("PTXAS")])
+    assert f"SWITCHES {int(overlap)}" in out, [ln for ln in out if ln.startswith("SWITCHES")]
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith(("SASS ", "PTX "))}
+    print(f"\nD128 SASS {variant}:", stats, [ln for ln in out if ln.startswith("PTXAS")])
     assert stats["USETMAXREG"] > 0, "no USETMAXREG: ptxas dropped the register split (C7508)"
     assert (stats["USETMAXREG_ALLOC"], stats["USETMAXREG_DEALLOC"]) == (240, 24), stats
     assert stats["HGMMA"] > 0, stats
-    assert_no_new_spills(stats, _SPILL_PIN, tag="D128 sm_90a: ")
+    assert_no_new_spills(stats, _SPILL_PIN, tag=f"D128 sm_90a {variant}: ")
+    assert stats["MAXREG"] < 240, f"{variant}: register R{stats['MAXREG']} is past the 240-register budget"
+    assert (stats["DEPBAR_1"] > 0) == overlap, f"{variant}: wait_group(1) count {stats['DEPBAR_1']}"
+    assert {key: stats[key] for key in _CODEGEN_PINS[variant]} == _CODEGEN_PINS[variant], (variant, stats)
     ptxas = {ln.split()[1]: ln.split()[2] for ln in out if ln.startswith("PTXAS ") and len(ln.split()) == 3}
     if "serialized" in ptxas:
         assert ptxas["rc"] == "0" and ptxas["serialized"] == "0", [ln for ln in out if ln.startswith("PTXAS")]
