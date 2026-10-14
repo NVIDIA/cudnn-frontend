@@ -59,6 +59,7 @@ from cudnn.frost.tile_dsl.constants import (
     SCHED_NATURAL,
 )
 from cudnn.sdpa.fwd.config_sm100 import (
+    d256_mxfp8_pair_leg,
     TemplateParams as Sm100TemplateParams,
     cga_tile_m,
     cga_ctas,
@@ -86,6 +87,7 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
     rubin_dense_d128_shared_leg,
@@ -858,18 +860,22 @@ def select_d256_auto_knobs(
     pertensor: bool,
     s_q: int,
     s_kv: int,
+    device_cc: Optional[tuple[int, int]] = None,
+    paged: bool = False,
 ) -> tuple[int, int]:
-    """Select the measured D256 scheduler and fixed FP8 CTA1 geometry."""
+    """Select the measured D256 scheduler and CTA geometry: the 2-CTA pair for f16 and for the cc 10.7 MXFP8 dense
+    unsplit legs (config_sm100.d256_mxfp8_pair_leg), one CTA for the other quantized legs."""
 
     fp8 = params.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
     if not fp8:
         return params.sched_policy, 2
     if params.split_kv > 1 or params.thd_varlen:
         return SCHED_NATURAL, 1
+    cga = 2 if d256_mxfp8_pair_leg(device_cc=device_cc, pertensor=pertensor, thd=params.thd_varlen, paged=paged, split_kv=params.split_kv) else 1
 
     no_mask = params.window_left is None and params.window_right is None and not params.seq_kv_lens_present
     if no_mask:
-        return SCHED_NATURAL, 1
+        return SCHED_NATURAL, cga
 
     top_left = not params.bottom_right or d256_square_br_as_tl(params, s_q=s_q, s_kv=s_kv)
     pt_lpt_l2 = (
@@ -881,8 +887,8 @@ def select_d256_auto_knobs(
         and _ceil_div(s_q, 256) >= 16
     )
     if pt_lpt_l2:
-        return params.sched_policy, 1
-    return SCHED_LPT, 1
+        return params.sched_policy, cga
+    return SCHED_LPT, cga
 
 
 def select_d512_auto_knobs(params: Sm100TemplateParams) -> tuple[int, int]:
@@ -1188,7 +1194,9 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
         return sched_policy, (1 if _d128_decode_tile_fits(caps, facts, pack_gqa) or _d128_dense_cga1_waves_win(caps, facts, pack_gqa) else 2)
     if selected_shape == (256, 256) and any(shape == selected_shape for shape, _ in caps.cgas_by_d_shape):
         params = _sm100_params_from_facts(facts, split_kv=split_kv, sched_policy=sched_policy)
-        selected_sched, selected_cga = select_d256_auto_knobs(params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv)
+        selected_sched, selected_cga = select_d256_auto_knobs(
+            params, pertensor=facts.is_fp8, s_q=facts.s_q, s_kv=facts.s_kv, device_cc=facts.device_cc, paged=facts.has_paged_kv
+        )
         if selected_cga not in domain:
             raise ValueError(f"D256 heuristic selected cga={selected_cga} outside the declared domain {sorted(domain)}")
         return _in_flavor_sched_domain(caps, facts, selected_sched, sched_policy), selected_cga
@@ -2160,7 +2168,12 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
         caps = spec.capabilities
         sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(spec, facts)]
         for knobs in sets:
-            if mismatch(caps, facts, knobs) is None:
+            if mismatch(caps, facts, knobs) is not None:
+                if knobs.split_kv != 1 or launch_grid_mismatch(caps, facts, knobs) is None:
+                    continue
+                # Past 65535 heads or batch the NATURAL grid cannot launch; the flat LPT grid serves the same set (#1573).
+                knobs = next((lpt for lpt in (replace(knobs, sched_policy=p) for p in (SCHED_LPT, SCHED_LPT_L2)) if mismatch(caps, facts, lpt) is None), None)
+            if knobs is not None and PlanConfig(engine_id, knobs) not in out:
                 out.append(PlanConfig(engine_id, knobs))
     return out
 

@@ -40,7 +40,9 @@ cu_sf[B]), and every SF load adds the per-sequence SF-tile prefix base
 of a (head, tile) are plane-ADJACENT under THD (build_columnwise_sf_desc
 thd_varlen=True).  THD is served at cga1 (the row's cgas_by_d_shape; the
 cga1 BMM2 N-block split walks V_SF_PLANES_PER_PEER = 2 planes per box); the
-cga2 THD arm traces but is UNTESTED.  Dense path (THD_VARLEN=0) folds to
+cga2 THD arm traces but is UNTESTED.  Dense unsplit queries run the cga2 pair
+by default on cc 10.7 (config_sm100.d256_mxfp8_pair_leg: -8..-13 % dense, -6..-7 %
+causal vs one CTA, O bitwise identical); THD, split-KV and paged graphs stay at cga1.  Dense path (THD_VARLEN=0) folds to
 identity (cu_sf=0, tma_batch=batch_idx) -- byte-identical cubin, pinned.
 
 Epilogue gate (``CFG.EPILOGUE_GATE``, from ``TemplateParams.epilogue_gate``):

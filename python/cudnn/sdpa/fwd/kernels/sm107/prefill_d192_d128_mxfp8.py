@@ -1359,6 +1359,34 @@ def _tmastg_warp_group(
 
 
 @cute.jit
+def _rowsum_chunk(c: cutlass.Constexpr[int], desc, tmem_a_base, desc_b_base, tmem_c, accumulate_first):
+    """The ones-MMA row-sum K-phases that read BMM2 chunk ``c`` of P (keys c*64 .. c*64+63 of the tile), issued right
+    after that chunk's PV phases instead of once after the whole tile: the k-loop of ``tile_dsl.mma.mma_ts`` restricted
+    to the chunk's k range with the same A / B advance arithmetic, so the instruction stream and the accumulation
+    order are exactly those of the single call it replaces (the denominators are bitwise identical).  Chunk 0's half
+    goes out before the MMA warp blocks on chunk 1's ``bmm2_ready``, so the tensor pipe has work queued across that
+    wait.  ``accumulate_first`` is the kv tile's init_d flag for chunk 0's first phase; every later phase accumulates."""
+    if cutlass.const_expr(desc.cta_group == 1):
+        cta_group_kind = nvvm.CTAGroup.CTA_1
+    else:
+        cta_group_kind = nvvm.CTAGroup.CTA_2
+    steps = desc.num_k_steps // CFG.N_BMM2_CHUNKS
+    intra_b = desc.smem_advance_B_intra
+    subtile_b = desc.smem_subtile_B
+    sps_b = desc.sps_B
+    for local_k in cutlass.range_constexpr(steps):
+        k = c * steps + local_k
+        dp = tmem_a_base.subview(k * desc.tmem_advance_A)
+        inc_b = (intra_b * (k % sps_b) + subtile_b * (k // sps_b)) >> 4
+        db = desc_b_base + inc_b
+        if nvvm.elect_sync():
+            if cutlass.const_expr(c == 0 and local_k == 0):
+                nvvm.tcgen05_mma(desc.kind, cta_group_kind, tmem_c, dp, db, desc.idesc, accumulate_first)
+            else:
+                nvvm.tcgen05_mma(desc.kind, cta_group_kind, tmem_c, dp, db, desc.idesc, cutlass.Boolean(True))
+
+
+@cute.jit
 def _mma_warp_quiet(
     tmem_ptr_i32,
     bars,
@@ -1678,6 +1706,9 @@ def _mma_warp_group(
                         tmem_sf_b=tmem_SF_V,
                     )
                     accum_b2 = cutlass.Boolean(True)
+                # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
+                # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
+                _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), is_not_first_bmm2)
                 bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
@@ -1691,13 +1722,13 @@ def _mma_warp_group(
                         tmem_sf_b=tmem_SF_V,
                     )
                 # Row-sum in MMA: an N=16 ones-BMM over the SAME quantized P
-                # TMEM tile BMM2 just consumed (both 64-col chunks), accumulating
+                # TMEM tile BMM2 just consumed, chunk 1's K-phases here (chunk 0's went out before the chunk-1 wait), accumulating
                 # the softmax denominator into _SUM0_OFF.  accumulate mirrors BMM2's
                 # own init_d.  Issued BEFORE the mb_bmm2_done[0] commit so that
                 # commit (which fires only after the MMA pipeline drains) also
                 # orders the row-sum for correction's read -- no extra barrier.
                 # Plain kind::f8f6f4, not block-scale (see sum_desc).
-                mma_ts(sum_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_ones, (tmem_raw.subview(_SUM0_OFF)), accumulate=is_not_first_bmm2)
+                _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), cutlass.Boolean(True))
                 if nvvm.elect_sync():
                     bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
@@ -1731,6 +1762,9 @@ def _mma_warp_group(
                         tmem_sf_b=tmem_SF_V,
                     )
                     accum_b2 = cutlass.Boolean(True)
+                # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
+                # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
+                _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), is_not_first_bmm2)
                 bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
                 for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                     mma_ts_step(
@@ -1744,13 +1778,13 @@ def _mma_warp_group(
                         tmem_sf_b=tmem_SF_V,
                     )
                 # Row-sum in MMA: an N=16 ones-BMM over the SAME quantized P
-                # TMEM tile BMM2 just consumed (both 64-col chunks), accumulating
+                # TMEM tile BMM2 just consumed, chunk 1's K-phases here (chunk 0's went out before the chunk-1 wait), accumulating
                 # the softmax denominator into _SUM1_OFF.  accumulate mirrors BMM2's
                 # own init_d.  Issued BEFORE the mb_bmm2_done[1] commit so that
                 # commit (which fires only after the MMA pipeline drains) also
                 # orders the row-sum for correction's read -- no extra barrier.
                 # Plain kind::f8f6f4, not block-scale (see sum_desc).
-                mma_ts(sum_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_ones, (tmem_raw.subview(_SUM1_OFF)), accumulate=is_not_first_bmm2)
+                _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), cutlass.Boolean(True))
                 if nvvm.elect_sync():
                     bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                     bars.mb_v_empty[old_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
@@ -1795,6 +1829,9 @@ def _mma_warp_group(
                     tmem_sf_b=tmem_SF_V,
                 )
                 accum_b2 = cutlass.Boolean(True)
+            # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
+            # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
+            _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), is_not_first_bmm2_epi)
             bars.mb_bmm2_ready[0 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                 mma_ts_step(
@@ -1813,7 +1850,7 @@ def _mma_warp_group(
             # the mb_bmm2_done[0] commit so that commit (which fires only after
             # the MMA pipeline drains) also orders the row-sum for correction's
             # read -- no extra barrier.  Plain kind::f8f6f4 (see sum_desc).
-            mma_ts(sum_desc, (tmem_raw.subview(LAYOUT.P0_OFF)), desc_ones, (tmem_raw.subview(_SUM0_OFF)), accumulate=is_not_first_bmm2_epi)
+            _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P0_OFF), desc_ones, tmem_raw.subview(_SUM0_OFF), cutlass.Boolean(True))
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[0].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
 
@@ -1831,6 +1868,9 @@ def _mma_warp_group(
                     tmem_sf_b=tmem_SF_V,
                 )
                 accum_b2 = cutlass.Boolean(True)
+            # Row sum, chunk 0's K-phases: queued behind chunk 0's PV so the tensor pipe stays busy across the
+            # wait for chunk 1 (same instructions and order as the former whole-tile call, see _rowsum_chunk).
+            _rowsum_chunk(0, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), is_not_first_bmm2_epi)
             bars.mb_bmm2_ready[1 * CFG.N_BMM2_CHUNKS + 1].wait(bmm2_ready_phase, spin=SPIN_RING_WAITS)
             for local_k in cutlass.range_constexpr(NUM_KPHASES_PV_PER_CHUNK):
                 mma_ts_step(
@@ -1849,7 +1889,7 @@ def _mma_warp_group(
             # the mb_bmm2_done[1] commit so that commit (which fires only after
             # the MMA pipeline drains) also orders the row-sum for correction's
             # read -- no extra barrier.  Plain kind::f8f6f4 (see sum_desc).
-            mma_ts(sum_desc, (tmem_raw.subview(LAYOUT.P1_OFF)), desc_ones, (tmem_raw.subview(_SUM1_OFF)), accumulate=is_not_first_bmm2_epi)
+            _rowsum_chunk(1, sum_desc, tmem_raw.subview(LAYOUT.P1_OFF), desc_ones, tmem_raw.subview(_SUM1_OFF), cutlass.Boolean(True))
             if nvvm.elect_sync():
                 bars.mb_bmm2_done[1].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)
                 bars.mb_v_empty[kv_state.idx].arrive(mcast_mask=mcast_mask, cta_group=CFG.CTA_MMA)

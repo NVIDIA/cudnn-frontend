@@ -765,6 +765,91 @@ def test_bsa_attention_forward_sm100_blk64():
     assert split_result_bshd["o_tensor"].stride() == result_bshd["o_tensor"].stride()
 
 
+@pytest.mark.L1
+@pytest.mark.parametrize("use_clc", (False, True))
+@pytest.mark.parametrize("layout", ("bhsd", "bshd"))
+@pytest.mark.parametrize("variable_counts", (False, True), ids=("fixed", "variable_with_empty"))
+@pytest.mark.parametrize("with_block_sizes", (False, True), ids=("full_blocks", "partial_blocks"))
+@torch_fork_set_rng(seed=4593)
+def test_bsa_attention_forward_sm100_blk64_persistent_query_replay(use_clc, layout, variable_counts, with_block_sizes, monkeypatch):
+    """Multiple persistent waves exercise KV-ring rotation, empty queries and changed-input replay.
+
+    Repeat distinct query tiles to bound the independent dense reference while
+    forcing each SM to process several tiles. Counts cross the 8-block padding
+    boundary and different ring phases. Q always has a partial final tile;
+    partial KV blocks use explicit block_sizes, as required by the API.
+    """
+    if torch.cuda.get_device_capability()[0] not in {10, 11}:
+        pytest.skip("persistent blk64 forward requires SM100/SM110")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    BSA = _import_bsa()
+    batch, heads, pattern_tiles, capacity = 2, 4, 9, 32
+    copies = max(2, math.ceil(4 * torch.cuda.get_device_properties(0).multi_processor_count / (batch * heads * pattern_tiles)))
+    length_q = pattern_tiles * 64 * copies - 17
+    length_k = capacity * 64 - (17 if with_block_sizes else 0)
+    q_base = torch.randn((batch, heads, pattern_tiles * 64, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((batch, heads, length_k, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    # The final KV block occurs in every active list, with no duplicates.
+    other_indices = torch.rand((batch, heads, pattern_tiles, capacity - 1), device="cuda").argsort(-1).to(torch.int32)
+    indices_base = torch.cat((torch.full_like(other_indices[..., :1], capacity - 1), other_indices), -1)
+    counts_base = torch.tensor([0, 1, 3, 7, 8, 9, 16, 17, 32], device="cuda", dtype=torch.int32).expand(batch, heads, -1).clone()
+    if not variable_counts:
+        counts_base.fill_(8)
+    indices = indices_base.repeat(1, 1, copies, 1)
+    counts = counts_base.repeat(1, 1, copies)
+    q = q_base.repeat(1, 1, copies, 1)[..., :length_q, :].contiguous()
+    reference_sizes = torch.full((capacity,), 64, device="cuda", dtype=torch.int32)
+    if with_block_sizes:
+        reference_sizes[1::2] = 23
+        reference_sizes[2] = 0
+        reference_sizes[-1] = 47
+    inputs = [q, k, v] if layout == "bhsd" else [t.transpose(1, 2).contiguous() for t in (q, k, v)]
+
+    def invoke():
+        return BSA.block_sparse_attention_forward(
+            *inputs,
+            indices,
+            block_sparse_num=capacity if variable_counts else 8,
+            block_sizes=reference_sizes if with_block_sizes else None,
+            q2k_block_nums=counts if variable_counts else None,
+            sparse_block_size=64,
+            layout=layout,
+            use_clc=use_clc,
+            kv_splits=1,
+            allow_empty_block_nums=variable_counts,
+        )
+
+    invoke()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            result = invoke()
+        for replay in range(2):
+            if replay:
+                q_base.mul_(0.75)
+                inputs[0].mul_(0.75)
+                inputs[2].neg_()
+                counts_base = counts_base.flip(-1)
+            counts.copy_(counts_base.repeat(1, 1, copies))
+            indices.copy_(indices_base.repeat(1, 1, copies, 1))
+            indices.masked_fill_(torch.arange(capacity, device="cuda") >= counts[..., None], torch.iinfo(torch.int32).max)
+            result["o_tensor"].fill_(float("nan"))
+            result["lse_tensor"].fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            mask = block_sparse_mask(indices_base, capacity, reference_sizes, pattern_tiles * 64, length_k, 64, counts_base)
+            k_ref, v_ref = inputs[1:] if layout == "bhsd" else [t.transpose(1, 2) for t in inputs[1:]]
+            o_ref, lse_ref = attention_reference(q_base, k_ref, v_ref, mask)
+            expected_o = o_ref.repeat(1, 1, copies, 1)[..., :length_q, :]
+            actual_o = result["o_tensor"] if layout == "bhsd" else result["o_tensor"].transpose(1, 2)
+            torch.testing.assert_close(actual_o.float(), expected_o, atol=3e-2, rtol=3e-2)
+            torch.testing.assert_close(result["lse_tensor"], lse_ref.repeat(1, 1, copies)[..., :length_q], atol=2e-3, rtol=2e-3)
+    finally:
+        graph.reset()
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize(("seqlen_k", "expected"), [(4 * 64, False), (4 * 64 - 1, True)])
 def test_bsa_attention_forward_sm100_blk64_detects_partial_kv_tail(seqlen_k, expected):

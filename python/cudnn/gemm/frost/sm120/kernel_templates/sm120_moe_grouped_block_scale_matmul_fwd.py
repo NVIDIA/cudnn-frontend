@@ -1571,7 +1571,7 @@ def _host(
                     1,
                     256,
                     cute.assume(256 * rest_k, 8),
-                    cute.assume(256 * rest_k * rest_n, 8),
+                    cute.assume(_sfb_op.stride[2] // 2, 8),
                 ),
             ),
         )
@@ -1660,9 +1660,9 @@ def compile() -> Callable:
             assumed_align=16,
         )
 
-    # F8_128x4 SF uses a base pointer; GATHER token SF also uses row shape/stride.
-    # For the blocked inputs, the host rebuilds the
-    # F8_128x4 view from problem_size, so no SF mode carries a layout contract.
+    # The host rebuilds blocked row/K geometry from problem_size. Keep SF
+    # layouts dynamic so SFB's runtime expert stride and GATHER token SF's
+    # row shape/stride remain available without specializing the artifact.
     def _make_fake_sfa():
         return make_fake_tensor(
             sf_cutlass_dtype,

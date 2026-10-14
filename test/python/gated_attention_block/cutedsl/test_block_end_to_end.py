@@ -871,3 +871,35 @@ def test_qwen38_flash_next_fully_fused_matches_the_fp32_oracle(seq_len):
     out, blk, ref_same, ref_hf = _run_hf_block(_FLASH_NEXT_KW, 2, seq_len, fuse_norm_rope=True, fuse_gate=True)
     assert blk.fuse_norm_rope and blk.fuse_gate and blk._norm_rope is None and blk._gate is None and len(blk._stages) == 3
     _check_against_both_oracles(f"24/2 fully fused B=2 S={seq_len}", out, ref_same, ref_hf)
+
+
+# ---------------------------------------------------------------------------
+# The Qwen3.5-397B tensor-parallel shards (d_model 4096, d_head 256, rope_dim 64): the query heads divided across the ranks,
+# the two KV heads divided at TP 2 and replicated from TP 4 on.  The layout contract (test_layout_contract.py) pins their
+# N-axis maps and fitted norm tiles; these are the dense end-to-end cells, one per shard, on HF-form weights.
+# ---------------------------------------------------------------------------
+
+_Q35_TP2_KW = dict(d_model=4096, h_q=16, h_kv=1, d_head=256, rope_dim=64)  # TP 2
+_Q35_TP4_KW = dict(d_model=4096, h_q=8, h_kv=1, d_head=256, rope_dim=64)  # TP 4: the serving deployment's shard
+_Q35_TP8_KW = dict(d_model=4096, h_q=4, h_kv=1, d_head=256, rope_dim=64)  # TP 8
+
+# (geometry, batch, the norm kernel the stage must resolve to, its fitted tile_rows): every shard fits a TMA tile (16 / 8 / 4 rows)
+_QWEN35_SHARDS = [
+    pytest.param(_Q35_TP2_KW, 1, "tma", 16, id="q35_397b_tp2_16_1"),
+    pytest.param(_Q35_TP4_KW, 1, "tma", 8, id="q35_397b_tp4_8_1"),
+    pytest.param(_Q35_TP8_KW, 1, "tma", 4, id="q35_397b_tp8_4_1"),
+]
+_QWEN35_SEQ_LEN = 512  # four KV tiles at the dense prefill tile; the serving forms' cells for the same shards sit in the serving modules
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw,batch,norm_impl,tile_rows", _QWEN35_SHARDS)
+def test_qwen35_shards_match_the_fp32_oracle(geom_kw, batch, norm_impl, tile_rows):
+    """The unfused bf16 pipeline at each 397B shard (16 / 1, 8 / 1, 4 / 1 over d_model 4096) against BOTH fp32 oracles under the
+    dense suite's budget, and the norm stage on the TMA kernel at the fitted tile the layout contract names for it (16 / 8 / 4
+    rows -- the 4-row tile is one row per warp, a tiling no other pinned geometry reaches)."""
+    out, blk, ref_same, ref_hf = _run_hf_block(geom_kw, batch, _QWEN35_SEQ_LEN)
+    _check_against_both_oracles(f"{geom_kw['h_q']}/{geom_kw['h_kv']} d_model={geom_kw['d_model']} B={batch} S={_QWEN35_SEQ_LEN}", out, ref_same, ref_hf)
+    assert blk._norm_rope._impl == norm_impl, f"the norm stage ran {blk._norm_rope._impl!r}, the geometry's kernel is {norm_impl!r}"
+    assert blk._norm_rope.resolve_tile_rows() == tile_rows
+    assert blk._norm_rope._recipe.apply_norm is True

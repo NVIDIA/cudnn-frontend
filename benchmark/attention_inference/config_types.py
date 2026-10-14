@@ -119,6 +119,12 @@ class InferenceBenchmarkConfig:
     num_iterations: int = 20
     num_warmup_iterations: int = 5
     output_dir: str = "results"
+    # Generation-phase page-size axis for the PAGED-KV backends (flashinfer / flash_mla / b12x): one case per page in this
+    # list -- the kernel block sizes the serving stacks allocate -- with ``None`` meaning ``[page_size]``. The cudnn graph
+    # paths attend over dense K / V and run each case once at ``page_size`` whatever this says (a page they do not read
+    # would only repeat the row). Backend layout constraints are applied before deduplication; the effective page size
+    # lands in the CSV's ``page_size`` column. Appended, defaulted.
+    page_sizes: Optional[List[int]] = None
 
 
 @dataclass

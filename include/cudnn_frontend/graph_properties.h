@@ -2080,7 +2080,7 @@ class SDPA_attributes : public Attributes<SDPA_attributes> {
         std::shared_ptr<Tensor_attributes> Sum_exp;   ///< Sum_exp output tensor
         std::shared_ptr<Tensor_attributes> RNG_DUMP;  ///< Random number generator dump for dropout
                                                       ///< check why we don't return RNG_DUMP this way
-        std::shared_ptr<Tensor_attributes> Amax_S;    ///< FP8 absolute maximum for attention scores
+        std::shared_ptr<Tensor_attributes> Amax_S;    ///< FP8: max of softmax probabilities; see Attention.md "Amax S"
         std::shared_ptr<Tensor_attributes> Amax_O;    ///< FP8 absolute maximum for output tensor
     };
 
