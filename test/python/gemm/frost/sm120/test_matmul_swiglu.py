@@ -14,26 +14,28 @@ import cudnn.gemm.frost  # noqa: F401  (installs hook)
 import pytest
 import torch
 
-from gemm_test_utils import requires_sm100, Plan as _plan, vp_mg as _vp_mg, block_quant_ref as _block_quant_ref
+from gemm_test_utils import requires_sm120, Plan as _plan, vp_mg as _vp_mg, block_quant_ref as _block_quant_ref
 
-from cudnn.gemm.frost.tile_config import CATALOG
+from cudnn.gemm.frost.tile_config import by_name
 
-pytestmark = [pytest.mark.L0, requires_sm100]
+pytestmark = [pytest.mark.L0, requires_sm120]
 
 
 _CUDNN_DT = {"bf16": cudnn.data_type.BFLOAT16, "fp16": cudnn.data_type.HALF}
 _TORCH_DT = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
-# N=128 cta_group=1 geometry — small enough that dual-GEMM (2 acc) and triple fit.
-_CFG_N128 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 128 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 1 and c.cga_size_n == 1)
-_CFG_N256 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 1 and c.cga_size_n == 1)
-# cluster2x1 N=256 geometry for the 2-CTA-MMA templates.
-_CFG_N256_C2 = next(c for c in CATALOG if c.cta_tile_m == 128 and c.cta_tile_n == 256 and c.cta_tile_k_bytes == 128 and c.cga_size_m == 2 and c.cga_size_n == 1)
+# SM120 runs one fixed 16x16x32 warp-MMA pair with no cluster and no CTA pair:
+# the parent's 1-CTA geometries map to the 4x2 compute-warp grid, its 2-CTA one to
+# 2x4 (cta_group is always 1). A 128x256 dual-GEMM stage (A + two B tiles) fills
+# the SMEM beside the epilogue staging on its own -- one AB stage, slow but legal.
+_CFG_N128 = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+_CFG_N256 = by_name("CONFIG_sm120_128x256x128_16x16x32_cluster1x1_warps4x2")
+_CFG_N256_C2 = by_name("CONFIG_sm120_128x256x128_16x16x32_cluster1x1_warps2x4")
 
 # Every multi-GEMM-capable plain-matmul strategy: (label, cta_group, config).
 _STRATEGIES = [
-    ("1ctamma", 1, _CFG_N256),
-    ("2ctamma", 2, _CFG_N256_C2),
+    ("warps4x2", 1, _CFG_N256),
+    ("warps2x4", 1, _CFG_N256_C2),
 ]
 
 
@@ -114,7 +116,7 @@ def _nonpacked_inputs(B, M, N, K, in_dt, out_dt, mode):
 
 @pytest.mark.parametrize("label,cta_group,cfg", _STRATEGIES, ids=[s[0] for s in _STRATEGIES])
 def test_swiglu_all_templates(label, cta_group, cfg) -> None:
-    """SwiGLU on every multi-GEMM template: 1ctamma / 2ctamma."""
+    """SwiGLU on the sm120 dense template's warp grids (the parent's 1ctamma / 2ctamma)."""
     out, ref = _run(
         512,
         256,
@@ -156,10 +158,10 @@ def test_swiglu_batched() -> None:
 @pytest.mark.parametrize(
     "label,cta_group,cfg,mode",
     [
-        ("1ctamma-padded", 1, _CFG_N256, "padded"),
-        ("2ctamma-padded", 2, _CFG_N256_C2, "padded"),
-        ("1ctamma-zero", 1, _CFG_N256, "zero_stride"),
-        ("2ctamma-zero", 2, _CFG_N256_C2, "zero_stride"),
+        ("warps4x2-padded", 1, _CFG_N256, "padded"),
+        ("warps2x4-padded", 1, _CFG_N256_C2, "padded"),
+        ("warps4x2-zero", 1, _CFG_N256, "zero_stride"),
+        ("warps2x4-zero", 1, _CFG_N256_C2, "zero_stride"),
     ],
 )
 def test_swiglu_nonpacked_tensors(label, cta_group, cfg, mode) -> None:

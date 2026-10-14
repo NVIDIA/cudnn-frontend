@@ -892,3 +892,76 @@ def test_per_group_per_col_aux_group_stride_need_not_divide_the_chunk() -> None:
     src = inspect.getsource(compiler._output_store_mode)
     for probe in ("grouped_by_moe", "bcast_mode", "aux_tensors"):
         assert probe not in src, f"{probe}: an aux load's alignment is a pointwise concern, not a store rule"
+
+
+def test_strided_aux_offsets_are_formed_in_int64() -> None:
+    """Host-only. The epilogue's coordinates are Int32 and M/N are symbolic in
+    the kernel, so every strided aux term is formed in Int64: an Int32
+    ``row * N`` wraps once the aux holds 2^31 elements and reads another row's
+    -- or unmapped -- memory."""
+    import re
+
+    g, c, _ = _graph()
+    resid = g.tensor(name="resid", dim=[1, _S, _N], stride=[_S * _N, _N, 1], data_type=cudnn.data_type.BFLOAT16)
+    bias = g.tensor(name="bias", dim=[_G, 1, _N], stride=[_N, _N, 1], data_type=cudnn.data_type.FLOAT)
+    g.add(a=g.add(a=c, b=resid, name="r"), b=bias, name="b").set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    epilogue = generate(analyze(g), tma_slots=frozenset()).epilogue
+    assert f"cutlass.Int64(row) * {_N}" in epilogue
+    assert f"cutlass.Int64(group_idx) * {_N}" in epilogue
+    assert not re.search(r"\b(row|group_idx|tile_l) \* \d", epilogue), "an aux offset term is formed in Int32"
+
+
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.gpu_exclusive
+def test_single_moe_per_elem_aux_past_int32_offsets() -> None:
+    """A per-element [S, N] aux with S * N >= 2^31 (rows >= 65536 at N = 32768,
+    here inside the second group): the rows past the Int32 offset read their own
+    aux row, outputs NaN-prefilled inside guard regions are written exactly."""
+    E, K, N, sizes = 2, 64, 32768, (40000, 25600)
+    S = sum(sizes)
+    guard = 1 << 16
+    # Return the allocator's cached blocks from earlier tests: only memory in use should skip.
+    torch.cuda.empty_cache()
+    need = (2 * S * N + 2 * guard) * 2 + (2 << 30)
+    if torch.cuda.mem_get_info()[0] < need:
+        pytest.skip(f"needs {need / 2**30:.1f} GiB of free GPU memory for two [{S}, {N}] bf16 tensors")
+    boundary = 2**31 // N
+    assert S * N >= 2**31 and sizes[0] < boundary < S
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    w = g.tensor(name="weight", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16)
+    fto = g.tensor(name="fto", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    c = g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name="moe0")
+    resid = g.tensor(name="resid", dim=[1, S, N], stride=[S * N, N, 1], data_type=cudnn.data_type.BFLOAT16)
+    g.add(a=c, b=resid, name="y").set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    compiled = jit_from_cudnn_graph(g, by_name(_GEOMETRIES[0][0]))
+
+    torch.manual_seed(41)
+    token = torch.randn(1, S, K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    try:
+        aux = torch.empty(1, S, N, device="cuda", dtype=torch.bfloat16)
+        buf = torch.empty(S * N + 2 * guard, device="cuda", dtype=torch.bfloat16)
+    except torch.OutOfMemoryError:
+        pytest.skip("storage for two [S, N] bf16 tensors past 2^31 elements is unavailable")
+    for r0 in range(0, S, 4096):
+        aux[0, r0 : r0 + 4096] = torch.randn(min(S, r0 + 4096) - r0, N, device="cuda", dtype=torch.bfloat16)
+    offs = torch.tensor([0, sizes[0], S], dtype=torch.int32, device="cuda")
+    try:
+        buf[:guard] = -31337.0
+        buf[-guard:] = -31337.0
+        buf[guard:-guard] = float("nan")
+        out = buf[guard:-guard].view(1, S, N)
+        bd = compiled.binding
+        compiled({bd.a_operands[0]: token, bd.b_operands[0]: weight, bd.first_token_offset: offs, bd.aux[0]: aux, bd.outputs[0]: out})
+        torch.cuda.synchronize()
+        assert torch.all(buf[:guard] == -31337.0) and torch.all(buf[-guard:] == -31337.0), "wrote outside the output"
+        assert not torch.isnan(out).any(), "left output elements unwritten"
+        for row in (0, sizes[0] - 1, sizes[0], boundary - 1, boundary, boundary + 1, boundary + 31, S - 1):
+            expert = 0 if row < sizes[0] else 1
+            ref = token[0, row].double() @ weight[expert].double().T + aux[0, row].double()
+            bad = int(((out[0, row].double() - ref).abs() > ref.abs() * 2.0**-8 + 1e-3 * ref.abs().max()).sum())
+            assert bad == 0, f"row {row} ({'past' if row >= boundary else 'before'} the 2^31 offset): {bad} of {N} elements wrong"
+    finally:
+        del buf, aux
+        torch.cuda.empty_cache()

@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from gemm_test_utils import kw, requires_sm100, to_blocked
+from gemm_test_utils import kw, requires_sm100, requires_sm120, to_blocked
 
 import cudnn
 import cudnn.gemm.frost  # noqa: F401 — installs the cudnn.pygraph recorder hook
@@ -35,7 +35,7 @@ from cudnn.engines import is_python_engine
 from cudnn.gemm.frost.compiler import jit_from_cudnn_graph, probe_supported
 from cudnn.gemm.frost.graph_analyzer import resolve_variant_pack
 from cudnn.gemm.frost.recipe import _output_rule, expected_shape
-from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG
+from cudnn.gemm.frost.tile_config import DEFAULT_CONFIG, by_name
 
 pytestmark = pytest.mark.L0
 
@@ -191,9 +191,11 @@ _FLAVORS = (
     (_multi_gemm_reduction_only_graph, 2, 1, 0),
 )
 _FLAVOR_IDS = ("plain", "epilogue", "aux", "two_outputs", "reduction", "multi_gemm", "multi_gemm_tap_only")
+# The parent's 1-CTA geometry on the sm120 warp-MMA family (4x2 compute-warp grid).
+_FLAVOR_CFG = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
 def test_which_flavors_lower(build, n_b, n_out, n_aux):
     """Every flavor lowers, because what differs between them is a table entry.
@@ -204,7 +206,7 @@ def test_which_flavors_lower(build, n_b, n_out, n_aux):
     same loop reads -- so the list below is a list of table shapes, not of code
     paths, and adding to it is data.
     """
-    compiled = jit_from_cudnn_graph(build())
+    compiled = jit_from_cudnn_graph(build(), config=_FLAVOR_CFG)
     assert compiled.lowered is not None
     r = compiled.recipe
     assert (len(r.inputs) - 1, len(r.outputs), len(r.aux)) == (n_b, n_out, n_aux)
@@ -212,7 +214,7 @@ def test_which_flavors_lower(build, n_b, n_out, n_aux):
     assert len(r.arg_plan) == len(r.inputs) + len(r.outputs) + len(r.aux) + len(r.sf)
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
 def test_a_legal_call_of_every_flavor_is_refused_for_nothing(build, n_b, n_out, n_aux):
     """The invariant, per flavor: refusing a legal call is a bug, not a detour.
@@ -222,7 +224,7 @@ def test_a_legal_call_of_every_flavor_is_refused_for_nothing(build, n_b, n_out, 
     is what that assertion looks like: every reason the launch path can refuse
     is counted, and a legal call of every flavor must trigger none of them.
     """
-    compiled = jit_from_cudnn_graph(build())
+    compiled = jit_from_cudnn_graph(build(), config=_FLAVOR_CFG)
     if compiled.lowered is None:
         pytest.skip(f"this build does not lower: {compiled.declined}")
     operands = _buffers_for(compiled)
@@ -284,7 +286,7 @@ def test_a_deferral_is_counted_under_the_rule_that_caused_it():
     assert dict(compiled.deferrals) == {"input layout": 1}
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize("build,n_b,n_out,n_aux", _FLAVORS, ids=_FLAVOR_IDS)
 def test_an_operand_in_the_graph_s_axis_order_stays_on_the_fast_path(build, n_b, n_out, n_aux):
     """A bare device address wears the graph's layout, and that is legal.
@@ -296,7 +298,7 @@ def test_an_operand_in_the_graph_s_axis_order_stays_on_the_fast_path(build, n_b,
     so it is not a reason to leave the fast path; it used to be, and a legal
     call paid a whole interpreted pass for it.
     """
-    compiled = jit_from_cudnn_graph(build())
+    compiled = jit_from_cudnn_graph(build(), config=_FLAVOR_CFG)
     if compiled.lowered is None:
         pytest.skip(f"this build does not lower: {compiled.declined}")
     operands = _buffers_for(compiled)

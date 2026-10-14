@@ -1005,7 +1005,7 @@ def test_partial_n_chunk_store_matches_stg(config_name: str, shape: tuple[int, i
 
 def test_dense_block_scale_quant_epilogue() -> None:
     """Plain dense GEMM can use terminal block_scale_quantize epilogue."""
-    config_name = "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+    config_name = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"
     cfg = _resolve(config_name)
     M = N = K = 128
     block_size = 32
@@ -1034,7 +1034,7 @@ def test_dense_block_scale_quant_epilogue() -> None:
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize("mode", ["mmajor", "swap_ab"])
 @pytest.mark.parametrize("reordered", [False, True])
 @pytest.mark.parametrize("stg", [False, True])
@@ -1060,11 +1060,12 @@ def test_quantized_output_uses_normal_mmajor_store(mode, reordered, stg) -> None
     if reordered:
         SF.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
 
-    cfg = replace(_resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"), swap_ab=mode == "swap_ab")
+    cfg = replace(_resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=mode == "swap_ab")
     with force_stg_epi(stg):
         compiled = jit_from_cudnn_graph(g, config=cfg)
     assert compiled.chain.out_major == "m"
-    assert bool(compiled.tma_slots) == (not stg)
+    # sm120 has no TMA-store arm: every output stores STG, forced or not.
+    assert not compiled.tma_slots and set(compiled.store_modes) == {"stg"}
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q = torch.empty((1, N, M) if mode == "mmajor" else (1, M, N), dtype=torch.float8_e4m3fn, device="cuda")
@@ -1132,10 +1133,10 @@ def _f8_row_scale_addr(M: int, N: int, block_size: int) -> torch.Tensor:
 @pytest.mark.parametrize(
     "config_name",
     [
-        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
-        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
     ],
-    ids=["1ctamma", "2ctamma"],
+    ids=["warps4x2", "warps2x4"],
 )
 def test_dense_col_block_scale_quant(config_name) -> None:
     """M-axis (col) quant: warp-redux amax, compact (B, M/32, N) scale."""
@@ -1172,13 +1173,15 @@ def test_dense_col_block_scale_quant(config_name) -> None:
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
-@requires_sm107
+@pytest.mark.skip(
+    reason="N/A on sm120: E5M3 scales are an SM 10.7-10.9 format -- sm_120 has no ue5m3 scale converter (cvt .ue5m3x2), so the dtype gate declines E5M3"
+)
 @pytest.mark.parametrize("block_size", [16, 32])
 def test_dense_col_quant_e5m3_scale(block_size) -> None:
     """COL block quantize with an E5M3 scale. This path keeps the scale in a
     per-lane register (`_scale_mine_*`) before storing, so it exercises the
     zero-init + assignment + store of the byte carrier that row quant does not."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
     A = g.tensor(name="A", dim=[1, M, K], stride=_a_stride_batched(M, K, "k"))
@@ -1209,7 +1212,7 @@ def test_dense_col_quant_e5m3_scale(block_size) -> None:
 def test_dense_row_col_dual_quant_f8_reorder() -> None:
     """The cutedsl dual-output pattern: one producer -> row quant + col quant,
     both with F8_128x4 scale reordering."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K = 256, 128, 128
     bs = 32
     g = cudnn.pygraph(
@@ -1237,10 +1240,9 @@ def test_dense_row_col_dual_quant_f8_reorder() -> None:
     compiled = _plan(g, config=cfg)
     chain = compiled.chain
     assert len(chain.quants) == 2 and chain.quants[0].axis in (-1, 2) and chain.quants[1].axis == 1
-    from cudnn.gemm.frost.epilogue_codegen import generate
-
-    dual_epi = generate(chain, vec_bytes_epi=64, output_elem_bytes=1, tma_slots=frozenset({0, 1})).epilogue
-    assert dual_epi.index("_q1_lane") < dual_epi.index("_q0_frg"), "retire the register-heavy col quant before row quant"
+    # The parent checks the TMA arm's retire order; sm120 has no TMA-store arm --
+    # both quants drain row-per-lane and store STG.
+    assert set(compiled._compiled.store_modes) == {"stg"}
 
     a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
     q_row = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
@@ -1328,10 +1330,11 @@ def _fp4_dual_graph(M, N, K, fp4_axis, fp4_bs, fp4_scale_dt):
     return g
 
 
+@pytest.mark.skip(reason="not supported on sm120: packed fp4 output is declined")
 @pytest.mark.parametrize("fp4_axis", [-1, 1], ids=["row", "col"])
 def test_dense_mxfp4_quant_output(fp4_axis) -> None:
     """mxfp4 (fp4 data + e8m0 SF, block32) quant tap beside an fp8 row quant."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K = 256, 128, 128
     g = _fp4_dual_graph(M, N, K, fp4_axis, 32, cudnn.data_type.FP8_E8M0)
     compiled = _plan(g, config=cfg)
@@ -1357,11 +1360,12 @@ def test_dense_mxfp4_quant_output(fp4_axis) -> None:
     torch.testing.assert_close(q8.float(), q8_ref.float(), atol=0, rtol=0)
 
 
+@pytest.mark.skip(reason="not supported on sm120: packed fp4 output is declined")
 def test_dense_nvfp4_quant_output() -> None:
     """nvfp4 (fp4 data + e4m3 SF, block16) quant tap; slot0 = bf16 pre-quant tap
     (vsize 16). Dequantized-value tolerance (rcp_approx of a non-pow2 e4m3
     scale is inexact vs the torch reference)."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K = 256, 128, 128
     bs = 16
     g = cudnn.pygraph(
@@ -1398,10 +1402,11 @@ def test_dense_nvfp4_quant_output() -> None:
     assert (err <= tol).float().mean().item() > 0.999
 
 
+@pytest.mark.skip(reason="not supported on sm120: packed fp4 output is declined")
 @pytest.mark.parametrize("fp4_axis,bs,scale_dt", [(-1, 16, "e4m3"), (-1, 32, "e8m0"), (1, 32, "e8m0")], ids=["nvfp4-row", "mxfp4-row", "mxfp4-col"])
 def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
     """fp4 quant data as the ONLY output (slot 0): Phase C codegen-emitted store."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1449,15 +1454,16 @@ def test_dense_sole_fp4_quant_output(fp4_axis, bs, scale_dt) -> None:
 @pytest.mark.parametrize(
     "config_name",
     [
-        "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
-        "CONFIG_sm100_64x128x128_64x128x32_cluster1x1_1ctamma",
-        "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps4x2",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
     ],
-    ids=["m128-1cta", "m64-1cta", "m128-2cta"],
+    ids=["m128-warps4x2", "m64-warps4x2", "m128-warps2x4"],
 )
 def test_dense_col_block16_quant(config_name) -> None:
-    """block16 col quant: half-warp redux; the cta_tile_m=64 1-CTA packed
-    layout (16 active rows per warp = exactly one block) is supported."""
+    """block16 col quant: half-warp redux; a 16-row warp tile (64-row CTA,
+    warps4x2: lanes 0..15 own the slab's 16 rows = exactly one block) is
+    supported, as the parent's packed 64-row layout is."""
     cfg = _resolve(config_name)
     M, N, K, bs = 256, 128, 128, 16
     g = cudnn.pygraph(
@@ -1490,7 +1496,7 @@ def test_dense_col_block16_quant(config_name) -> None:
 
 def test_dense_block16_fp8_quant() -> None:
     """block_size=16 row quant with fp8 data (vsize pinned to the block)."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K, bs = 256, 128, 128, 16
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1520,11 +1526,12 @@ def test_dense_block16_fp8_quant() -> None:
     torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
 
 
+@pytest.mark.skip(reason="not supported on sm120: packed fp4 output is declined")
 def test_dense_mixed_block_quants() -> None:
     """Two quants with DIFFERENT block sizes in one graph: nvfp4 row block16 +
     fp8 row block32 (vsize = max block; the small block quantizes per
     sub-chunk), plus a col16 alongside a row32 variant."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K = 256, 128, 128
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1597,7 +1604,7 @@ def test_dense_col_quant_rejections() -> None:
         QS.set_output(True).set_data_type(cudnn.data_type.FP8_E8M0)
         return g
 
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     _skip_unless_active(cfg)  # the rules below sit behind the family's arch gate
     with pytest.raises(ValueError, match="divisible by block_size"):
         _plan(_col_graph(160 + 8, 128, 128, 32), config=cfg)
@@ -1607,7 +1614,7 @@ def test_dense_col_quant_rejections() -> None:
 
 def test_dense_block_scale_quant_with_dense_tap() -> None:
     """Quant data rides slot 0 while the pre-quant producer is also tapped."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1650,7 +1657,7 @@ def test_dense_block_scale_quant_with_dense_tap() -> None:
 def test_dense_block_scale_quant_with_fp32_dense_tap() -> None:
     """The chunk stays pinned to the quant block even when the widest dense
     output is 4 bytes: 32 elements x 4 B = 128 B, split into four 32 B stores."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -1688,7 +1695,7 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
     32-lane block group: a narrower one has the upper lanes store a scale they
     never computed, to columns past the chunk (and past the scale tensor on the
     last chunk of a row block)."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M, N, K, bs = 256, 128, 128, 32
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
@@ -1729,7 +1736,7 @@ def test_dense_col_block_scale_quant_with_dense_tap() -> None:
 
 def test_dense_dual_block_scale_quant() -> None:
     """Two quant nodes fan out from one producer (e4m3 + e5m2 data)."""
-    cfg = _resolve("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
+    cfg = _resolve("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     M = N = K = 128
     block_size = 32
     g = cudnn.pygraph(
@@ -3284,8 +3291,8 @@ def test_sm120_registry_wiring() -> None:
     (tmpl,) = [t for t in TEMPLATES if t.pipeline == "sm120" and t.graph_type is GraphType.MATMUL]
     assert tmpl.file == "sm120_matmul.py"
     assert isinstance(tmpl, Sm120KernelTemplate)
-    # Warp-scoped MMA: 1-CTA only, no multi-GEMM (no per-GEMM operand indexing).
-    assert not tmpl.supports_multi_gemm
+    # Warp-scoped MMA: 1-CTA only; multi-GEMM keeps one register accumulator per GEMM.
+    assert tmpl.supports_multi_gemm
     assert tmpl.graph_type is GraphType.MATMUL and not tmpl.supports_mainloop_fusion
 
     # dtype support mirrors the sm100 matmul pipeline (incl. int8 and fp8 mixes)
@@ -3676,8 +3683,6 @@ def test_splitk_n_not_multiple_of_4(N):
     # splitk_reduce_elems clamps to divide N (2 for 250, 1 for 255), so reducer
     # groups never cross a workspace row. The output store may narrow further
     # to a byte or halfword according to its own dtype and layout alignment.
-    if N % 2 and _current_arch() == 120:
-        pytest.skip("the sm120 template stores whole (n, n+1) accumulator pairs; odd N is rejected")
     g, A, Bt, C = _splitk_graph(1, 256, N, 4096, out_dt=cudnn.data_type.FLOAT)
     compiled = _jit_splitk(g, 8)
     a, b, c, ref = _splitk_data(1, 256, N, 4096, torch_out=torch.float32)
@@ -3917,3 +3922,1142 @@ def test_sm120_auto_split_k_keeps_additive_scalar_reductions_unsplit(mode, unspl
     cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
     slices = C._auto_split_k(analyze(_sm120_avg_graph(768, 640, 16384, (1, 1, 1), mode)[0]), cfg, sm_count=188).split_k_slices
     assert (slices == 1) == unsplit
+
+
+_SPLIT_R = cudnn.reduction_mode
+
+
+@pytest.mark.parametrize("mode", [_SPLIT_R.MUL, _SPLIT_R.MUL_NO_ZEROS], ids=["mul", "mul_no_zeros"])
+@pytest.mark.parametrize("axis", ["row", "col"])
+def test_sm120_auto_split_k_never_splits_a_mul_fold(mode, axis):
+    """The split-K reducer folds a MUL through a CAS loop per vector (per row) or
+    per element (per column), which no split recovers; the unsplit kernel folds
+    it in registers first. So the automatic pick never splits a GEMM with an M- or
+    N-reduced MUL -- here one it does split once the reduction is an AMAX (an
+    explicit split-K config is still honored)."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    M, N, K = 64, 1024, 16384
+    cfg = by_name("CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4")
+    dims = (1, M, 1) if axis == "row" else (1, 1, N)
+    control = C._auto_split_k(analyze(_sm120_avg_graph(M, N, K, dims, _SPLIT_R.AMAX)[0]), cfg, sm_count=188)
+    assert control.split_k_slices > 1, "the control GEMM is not split at all"
+    assert C._auto_split_k(analyze(_sm120_avg_graph(M, N, K, dims, mode)[0]), cfg, sm_count=188).split_k_slices == 1
+
+
+@pytest.mark.parametrize("mode", [_SPLIT_R.ADD, _SPLIT_R.AVG, _SPLIT_R.NORM1, _SPLIT_R.AMAX, _SPLIT_R.MIN], ids=lambda m: str(m).split(".")[-1])
+@pytest.mark.parametrize("axis", ["row", "col"])
+def test_sm120_auto_split_k_keeps_the_reducer_within_its_atomic_bounds(mode, axis):
+    """Whatever split the automatic pick makes, it never hands the split-K reducer
+    an N-reduced fp32 sum with more than ``_SPLITK_ROW_SUM_MAX_ATOMICS``
+    same-address atomics a row (one per 4-element vector), nor a per-column
+    reduction (one atomic per output) past ``_SPLITK_COL_FOLD_MAX_OUTPUTS_PER_K_BYTE``
+    outputs per byte of K. The bounds are tuning constants, measured offline
+    (split vs the same tile unsplit, CUPTI, RTX PRO 6000); the test reads them,
+    so a retune moves both sides. Non-vacuous: some shape of the sweep splits."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    cfg = by_name("CONFIG_sm120_64x128x128_16x16x32_cluster1x1_warps2x4")
+    split_any = False
+    for M, N, K in ((64, 512, 16384), (64, 1024, 16384), (64, 2048, 16384), (64, 4096, 8192), (128, 4096, 4096), (64, 8192, 2048), (128, 7168, 1024)):
+        dims = (1, M, 1) if axis == "row" else (1, 1, N)
+        chain = analyze(_sm120_avg_graph(M, N, K, dims, mode)[0])
+        slices = C._auto_split_k(chain, cfg, sm_count=188).split_k_slices
+        if slices == 1:
+            continue
+        split_any = True
+        if axis == "col":
+            assert M * N <= C._SPLITK_COL_FOLD_MAX_OUTPUTS_PER_K_BYTE * K * 2, (M, N, K, slices)
+        elif mode != _SPLIT_R.AMAX and mode != _SPLIT_R.MIN:
+            assert N // C._splitk_reduce_elems(chain) <= C._SPLITK_ROW_SUM_MAX_ATOMICS, (M, N, K, slices)
+    assert split_any, "no shape of the sweep is split: the invariant is vacuous"
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: block-16/32 quantize on the plain dense template -- its
+# row-per-lane drain, the drain's gates, runtime extents, the packed-fp4 decline
+# and the quant-aware automatic config.
+# --------------------------------------------------------------------------- #
+
+_Q_E4M3, _Q_E5M2 = cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2
+_Q_TORCH = {_Q_E4M3: torch.float8_e4m3fn, _Q_E5M2: torch.float8_e5m2, cudnn.data_type.FP8_E8M0: torch.float8_e8m0fnu}
+_Q_MAX = {_Q_E4M3: 448.0, _Q_E5M2: 57344.0}
+_Q_GUARD = 256  # canary bytes before and after every output buffer
+
+# name -> (quants as (axis, block, data dtype, scale dtype, F8_128x4), pre-quant op, bf16 tap, M-major data)
+_E8M0, _E4M3SF = cudnn.data_type.FP8_E8M0, cudnn.data_type.FP8_E4M3
+_SM120_DENSE_QUANT_CASES = {
+    "row32": ([(-1, 32, _Q_E4M3, _E8M0, False)], None, False, False),
+    "row16_e4m3_scale": ([(-1, 16, _Q_E4M3, _E4M3SF, False)], None, False, False),
+    "col32": ([(1, 32, _Q_E4M3, _E8M0, False)], "swish", False, False),
+    "col16": ([(1, 16, _Q_E4M3, _E8M0, False)], None, False, False),
+    "dual32_f8_128x4": ([(-1, 32, _Q_E4M3, _E8M0, True), (1, 32, _Q_E4M3, _E8M0, True)], "swish", False, False),
+    "mixed_blocks": ([(-1, 16, _Q_E4M3, _E4M3SF, False), (-1, 32, _Q_E5M2, _E8M0, False), (1, 16, _Q_E4M3, _E8M0, False)], "swish", False, False),
+    "global_scale_row16": ([(-1, 16, _Q_E4M3, _E4M3SF, False)], "gscale", False, False),
+    "col_bias_col32": ([(1, 32, _Q_E4M3, _E8M0, False)], "bias", False, False),
+    "row_bias_col16": ([(1, 16, _Q_E4M3, _E8M0, False)], "rowbias", False, False),
+    "bf16_tap_row32": ([(-1, 32, _Q_E4M3, _E8M0, False)], "swish", True, False),
+    "mmajor_row32": ([(-1, 32, _Q_E4M3, _E8M0, False)], None, False, True),
+}
+
+
+def _sm120_q_scale_dims(M, N, q):
+    axis, bs, _d, _s, reorder = q
+    if reorder:
+        return (1, ((N + 127) // 128) * 128, ((M // bs + 3) // 4) * 4) if axis == 1 else (1, ((M + 127) // 128) * 128, ((N // bs + 3) // 4) * 4)
+    return (1, M // bs, N) if axis == 1 else (1, M, N // bs)
+
+
+def _sm120_dense_quant_graph(M, N, K, quants, pre=None, tap=False, mmajor=False):
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    src = g.matmul(A=A, B=B, name="mm")
+    aux = {}
+    if pre == "swish":
+        src = g.swish(input=src, name="sw")
+    elif pre == "gscale":
+        aux["gscale"] = g.tensor(name="gscale", dim=[1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.FLOAT)
+        src = g.mul(a=src, b=aux["gscale"], name="gs")
+    elif pre == "bias":
+        aux["bias"] = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.FLOAT)
+        src = g.add(a=src, b=aux["bias"], name="cb")
+    elif pre == "rowbias":
+        aux["rowbias"] = g.tensor(name="rowbias", dim=[1, M, 1], stride=[M, 1, 1], data_type=cudnn.data_type.FLOAT)
+        src = g.add(a=src, b=aux["rowbias"], name="rb")
+    if tap:
+        src.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    outs = []
+    for i, q in enumerate(quants):
+        axis, bs, ddt, sdt, reorder = q
+        Q, S = g.block_scale_quantize(input=src, block_size=bs, axis=axis, name=f"q{i}")
+        Q.set_output(True).set_data_type(ddt)
+        if mmajor:
+            Q.set_dim([1, M, N]).set_stride([M * N, 1, M])
+        d = _sm120_q_scale_dims(M, N, q)
+        S.set_dim(list(d)).set_stride([d[1] * d[2], d[2], 1])
+        if reorder:
+            S.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+        S.set_output(True).set_data_type(sdt)
+        outs.append((Q, S))
+    return g, A, B, (src if tap else None), aux, outs
+
+
+def _sm120_guarded(shape, dtype, mmajor=False):
+    """A tensor view inside a canary-filled byte buffer (fill 0x7F inside)."""
+    n = 1
+    for s in shape:
+        n *= s
+    nbytes = n * torch.empty((), dtype=dtype).element_size()
+    raw = torch.full((nbytes + 2 * _Q_GUARD,), 0xA5, dtype=torch.uint8, device="cuda")
+    body = raw[_Q_GUARD : _Q_GUARD + nbytes]
+    body.fill_(0x7F)
+    if mmajor:
+        b, m, nn = shape
+        return raw, body.view(dtype).view(b, nn, m).transpose(1, 2)
+    return raw, body.view(dtype).view(*shape)
+
+
+def _sm120_guards_intact(raw):
+    return bool((raw[:_Q_GUARD] == 0xA5).all()) and bool((raw[-_Q_GUARD:] == 0xA5).all())
+
+
+def _sm120_quant_ref(x, q):
+    """Torch reference of one block quantize of the fp32 tensor ``x``."""
+    axis, bs, ddt, sdt, _ = q
+    B, M, N = x.shape
+    qmax = _Q_MAX[ddt]
+    blocks = x.view(B, M // bs, bs, N) if axis == 1 else x.view(B, M, N // bs, bs)
+    sf = blocks.abs().amax(dim=2 if axis == 1 else -1) / qmax
+    if sdt == _E8M0:
+        safe = torch.where(sf > 0, sf, 1.0)
+        sf = torch.where(sf > 0, torch.pow(2.0, torch.ceil(torch.log2(safe))), 0.0)
+        scale = sf.to(torch.float8_e8m0fnu)
+    else:
+        scale = sf.to(torch.float8_e4m3fn)
+    inv = torch.where(scale.float() > 0, scale.float().reciprocal(), 0.0)
+    inv = inv.unsqueeze(2) if axis == 1 else inv.unsqueeze(-1)
+    return (blocks * inv).clamp(-qmax, qmax).to(_Q_TORCH[ddt]).view(B, M, N), scale
+
+
+def _sm120_scale_bytes(raw_view, M, N, q):
+    """The logical (B, M|M/bs, N/bs|N) scale bytes out of a compact or F8_128x4 buffer."""
+    axis, bs, _d, _s, reorder = q
+    u8 = raw_view.view(torch.uint8)
+    if not reorder:
+        return u8
+    if axis == 1:
+        return u8.reshape(-1)[_f8_col_scale_addr(M, N, bs)].permute(1, 0).unsqueeze(0)
+    return u8.reshape(-1)[_f8_row_scale_addr(M, N, bs)].unsqueeze(0)
+
+
+@requires_sm120
+@pytest.mark.parametrize("case", list(_SM120_DENSE_QUANT_CASES))
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",  # 32x64 warp tile: two 16-row sub-passes per 32-row slab
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",  # 64x32: two slabs per warp
+        "CONFIG_sm120_64x64x128_16x16x32_cluster1x1_warps4x2",  # 16x32: a 16-row slab on lanes 0..15
+        "CONFIG_sm120_128x96x128_16x16x32_cluster1x1_warps4x2",  # 32x48: a 16-column tail group
+        "CONFIG_sm120_256x128x64_16x16x32_cluster1x1_warps8x1",  # 32x128, 64-byte K tile
+    ],
+    ids=lambda n: n.removeprefix("CONFIG_sm120_").replace("_16x16x32_cluster1x1", ""),
+)
+def test_sm120_dense_quant_row_per_lane_drain(config_name, case):
+    """block_scale_quantize at block 16/32 on sm120_matmul.py: the row-per-lane
+    drain (lane l = row l of a 32-row slab) runs the row (thread-local amax) and
+    col ((half-)warp integer-umax redux) emitters. Bit-exact against a torch
+    reference on integer data, at an M and N that both end in a partial tile,
+    with canary bytes around every output. A geometry the drain cannot walk is
+    declined with its own reason, never mis-stored."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    quants, pre, tap, mmajor = _SM120_DENSE_QUANT_CASES[case]
+    cfg = by_name(config_name)
+    M, N, K = 320, 352, 256
+    g, A, B, tap_t, aux, outs = _sm120_dense_quant_graph(M, N, K, quants, pre, tap, mmajor)
+    vsize = max(q[1] for q in quants)
+    warp_m, warp_n = cfg.warp_tile_m, cfg.warp_tile_n
+    if warp_n % vsize:
+        with pytest.raises(NotImplementedError, match="warp_tile_n % chunk"):
+            C.jit_from_cudnn_graph(g, config=cfg)
+        return
+    if any(q[0] == 1 and q[1] == 32 for q in quants) and warp_m % 32:
+        with pytest.raises(NotImplementedError, match="warp_tile_m % 32"):
+            C.jit_from_cudnn_graph(g, config=cfg)
+        return
+    compiled = C.jit_from_cudnn_graph(g, config=cfg)
+    assert set(compiled.store_modes) == {"stg"} and not compiled.tma_slots
+
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    vp = {A: a, B: b}
+    torch.manual_seed(5)
+    auxv = {
+        "gscale": torch.full((1, 1, 1), 0.375, device="cuda"),
+        "bias": torch.randint(-8, 8, (1, 1, N), device="cuda").float() * 0.25,
+        "rowbias": torch.randint(-8, 8, (1, M, 1), device="cuda").float() * 0.25,
+    }
+    for name, t in aux.items():
+        vp[t] = auxv[name]
+    raws = []
+    if tap_t is not None:
+        raw, tap_buf = _sm120_guarded((1, M, N), torch.bfloat16)
+        vp[tap_t] = tap_buf
+        raws.append(raw)
+    bufs = []
+    for (Q, S), q in zip(outs, quants):
+        qraw, qbuf = _sm120_guarded((1, M, N), _Q_TORCH[q[2]], mmajor=mmajor)
+        sraw, sbuf = _sm120_guarded(_sm120_q_scale_dims(M, N, q), _Q_TORCH[q[3]] if q[3] == _E8M0 else torch.float8_e4m3fn)
+        vp[Q], vp[S] = qbuf, sbuf
+        raws += [qraw, sraw]
+        bufs.append((qbuf, sbuf))
+    compiled(vp)
+    torch.cuda.synchronize()
+    assert not compiled.deferrals
+
+    x = torch.einsum("bmk,bnk->bmn", a.double(), b.double()).float()
+    if pre == "swish":
+        x = x * torch.sigmoid(x)
+    elif pre == "gscale":
+        x = x * 0.375
+    elif pre in ("bias", "rowbias"):
+        x = x + auxv[pre]
+    if tap:
+        # The tap's declared bf16 dtype rounds the producer before every consumer.
+        x = x.to(torch.bfloat16).float()
+        torch.testing.assert_close(tap_buf.float(), x, atol=0, rtol=0)
+    for (qbuf, sbuf), q in zip(bufs, quants):
+        q_ref, s_ref = _sm120_quant_ref(x, q)
+        torch.testing.assert_close(_sm120_scale_bytes(sbuf, M, N, q), s_ref.view(torch.uint8), atol=0, rtol=0)
+        torch.testing.assert_close(qbuf.float(), q_ref.float(), atol=0, rtol=0)
+    assert all(_sm120_guards_intact(r) for r in raws), "an output store ran past its buffer"
+
+
+@requires_sm120
+def test_sm120_dense_quant_runtime_extents_are_refused():
+    """A quant scale output keeps the shape the build declared, while the kernel
+    writes the scales of every runtime row: a call whose extents need another
+    scale geometry -- or split a column block -- is refused (counted, nothing
+    written), and the build's own extents run."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    K = 128
+
+    def plan(quants, M, N):
+        g, A, B, _t, _aux, outs = _sm120_dense_quant_graph(M, N, K, quants)
+        return C.jit_from_cudnn_graph(g, config=cfg), A, B, outs
+
+    def call(compiled, A, B, outs, q, build_mn, run_mn):
+        (Q, S), (M0, N0), (M, N) = outs[0], build_mn, run_mn
+        a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+        qraw, qbuf = _sm120_guarded((1, M, N), torch.float8_e4m3fn)
+        sraw, sbuf = _sm120_guarded(_sm120_q_scale_dims(M0, N0, q), torch.float8_e8m0fnu)
+        compiled({A: a, B: b, Q: qbuf, S: sbuf})
+        torch.cuda.synchronize()
+        return a, b, qbuf, sbuf, qraw, sraw
+
+    row = (-1, 32, _Q_E4M3, _E8M0, False)
+    compiled, A, B, outs = plan([row], 256, 256)
+    for run_mn in ((512, 256), (256, 128)):
+        with pytest.raises(ValueError, match="scale_dim"):
+            call(compiled, A, B, outs, row, (256, 256), run_mn)
+    assert compiled.deferrals["quant extents"] == 2
+    a, b, qbuf, sbuf, qraw, sraw = call(compiled, A, B, outs, row, (256, 256), (256, 256))
+    q_ref, s_ref = _sm120_quant_ref(torch.einsum("bmk,bnk->bmn", a.double(), b.double()).float(), row)
+    torch.testing.assert_close(sbuf.view(torch.uint8), s_ref.view(torch.uint8), atol=0, rtol=0)
+    torch.testing.assert_close(qbuf.float(), q_ref.float(), atol=0, rtol=0)
+    assert _sm120_guards_intact(qraw) and _sm120_guards_intact(sraw)
+
+    # F8_128x4 col scales keep their padded geometry at M 240, but 240 rows split a
+    # 32-row column block: refused rather than reduced across a partial block.
+    col = (1, 32, _Q_E4M3, _E8M0, True)
+    compiled, A, B, outs = plan([col], 256, 256)
+    with pytest.raises(ValueError, match="M % block_size"):
+        call(compiled, A, B, outs, col, (256, 256), (240, 256))
+
+
+@requires_sm120
+@pytest.mark.parametrize("axis", [-1, 1], ids=["row", "col"])
+def test_sm120_dense_swap_ab_quant_refusal_names_the_graph_frame(axis):
+    """A swap-AB quant plan refuses a call whose extents break the compact scale
+    geometry with the scale dims of the GRAPH's frame -- the same words as the
+    plan without swap-AB -- not the transposed kernel frame it runs in (it said
+    "requires scale_dim=(1, 4, 512); got (1, 4, 256)" for a (1, 256, 4) scale)."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    q = (axis, 32, _Q_E4M3, _E8M0, False)
+    M0, N0, K = 256, 128, 128
+    messages = []
+    for swap in (False, True):
+        g, A, B, _t, _aux, outs = _sm120_dense_quant_graph(M0, N0, K, [q])
+        compiled = C.jit_from_cudnn_graph(g, config=replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap))
+        Q, S = outs[0]
+        M, N = 2 * M0, N0
+        a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+        qraw, qbuf = _sm120_guarded((1, M, N), torch.float8_e4m3fn)
+        sraw, sbuf = _sm120_guarded(_sm120_q_scale_dims(M0, N0, q), torch.float8_e8m0fnu)
+        with pytest.raises(ValueError, match="scale_dim") as err:
+            compiled({A: a, B: b, Q: qbuf, S: sbuf})
+        torch.cuda.synchronize()
+        assert _sm120_guards_intact(qraw) and _sm120_guards_intact(sraw)
+        messages.append(str(err.value))
+    want = f"scale_dim={_sm120_q_scale_dims(2 * M0, N0, q)}; got {_sm120_q_scale_dims(M0, N0, q)}"
+    assert all(want in m for m in messages), messages
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "quants,tap",
+    [
+        ([(-1, 16, cudnn.data_type.FP4_E2M1, _E4M3SF, False)], False),
+        ([(-1, 16, cudnn.data_type.FP4_E2M1, _E4M3SF, False)], True),
+        ([(-1, 32, _Q_E4M3, _E8M0, False), (-1, 32, cudnn.data_type.FP4_E2M1, _E8M0, False)], False),
+        ([(1, 32, cudnn.data_type.FP4_E2M1, _E8M0, False), (-1, 32, _Q_E4M3, _E8M0, False)], False),
+    ],
+    ids=["sole_nvfp4", "nvfp4_beside_bf16_tap", "mxfp4_second", "mxfp4_col_first"],
+)
+def test_sm120_dense_fp4_quant_output_is_declined(quants, tap):
+    """A packed fp4 data output stays declined on the plain dense template, in
+    any output slot (a bf16 tap or an fp8 quant in slot 0 must not hide it), at
+    probe, build and in the registry funnel alike."""
+    from cudnn.gemm.frost.kernel_registry import candidates
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    g, *_ = _sm120_dense_quant_graph(256, 256, 128, quants, "swish" if tap else None, tap)
+    chain = analyze(g)
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    with pytest.raises(NotImplementedError, match="sm120_matmul.py does not support fp4 output"):
+        C.probe_chain(chain, cfg)
+    with pytest.raises(NotImplementedError, match="sm120_matmul.py does not support fp4 output"):
+        C.jit_from_cudnn_graph(g, config=cfg)
+    assert not [c for t, c in candidates(chain) if t.pipeline == "sm120"]
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "case,shape",
+    [
+        ("row32", (4096, 4096, 4096)),
+        ("row32", (1024, 4096, 4096)),
+        ("row32", (32, 14336, 4096)),
+        ("row32", (128, 4096, 4096)),
+        ("col32", (512, 4096, 4096)),
+        ("col32", (1024, 4096, 4096)),
+        ("dual32_f8_128x4", (2048, 14336, 4096)),
+        ("row16_e4m3_scale", (768, 4096, 4096)),
+        ("col16", (96, 96, 512)),
+        ("mixed_blocks", (320, 352, 256)),
+    ],
+)
+def test_sm120_dense_quant_auto_config(monkeypatch, case, shape):
+    """The automatic config of a block-quantized dense graph is one the full probe
+    accepts (the row-per-lane drain's gates) within the quant accumulator budget,
+    unsplit. Which tile wins is a tuning result, measured offline (round-robin
+    CUPTI on the RTX PRO 6000; the bf16-scored select_config pick re-cut ran up to
+    1.95x slower) -- not pinned here."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    monkeypatch.setattr(C, "_sm_count", lambda: 188)
+    quants, pre, tap, mmajor = _SM120_DENSE_QUANT_CASES[case]
+    M, N, K = shape
+    chain = analyze(_sm120_dense_quant_graph(M, N, K, quants, pre, tap, mmajor)[0])
+    cfg = C.plan_config(chain)
+    C.probe_chain(chain, cfg)
+    assert cfg.split_k_slices == 1
+    assert chain.num_gemms * cfg.warp_tile_m * cfg.warp_tile_n <= 32 * C._ROW_PER_LANE_QUANT_ACC_REGS
+
+
+@requires_sm120
+@pytest.mark.parametrize("case", ["row32", "col32", "dual32_f8_128x4"])
+def test_sm120_dense_quant_renders_the_row_per_lane_drain(case):
+    """The dense template carries both drains as one const_expr if/else: a quant
+    chain renders row_per_lane_drain = True (a col quant with its unconditional
+    row guard, rpl_bounded_rows), any other chain the lane-run drain."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+    from cudnn.gemm.frost.sm120.epilogue_codegen import generate
+
+    cfg = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    quants, pre, tap, mmajor = _SM120_DENSE_QUANT_CASES[case]
+    try:
+        for chain, quant in (
+            (analyze(_sm120_dense_quant_graph(256, 256, 128, quants, pre, tap, mmajor)[0]), True),
+            (analyze(_build_graph(256, 256, 128, "bf16", "bf16")), False),
+        ):
+            vec = C._epi_vec_bytes(chain, cfg)
+            bounded = C._row_per_lane_bounded_rows(chain, cfg)
+            snippets = generate(chain, vec_bytes_epi=vec, output_elem_bytes=C.DTYPE_BYTES[chain.output_dtype], drain_hooks=True, bounded_rows=bounded)
+            src = C._render_template(chain, snippets, cfg)
+            assert "@@" not in src
+            ast.parse(src)
+            assert f"row_per_lane_drain = {quant}" in src
+            assert f"rpl_bounded_rows = {quant and any(q[0] == 1 for q in quants)}" in src
+            assert vec == (max(q[1] for q in quants) if quant else 8) * C.DTYPE_BYTES[chain.output_dtype]
+    except NotImplementedError as e:
+        pytest.fail(f"the sm120 dense template must render here: {e}")
+
+
+@requires_sm120
+@pytest.mark.parametrize("q", [(-1, 32, _Q_E4M3, _E8M0, False), (1, 16, _Q_E4M3, _E8M0, True)], ids=["row32_compact", "col16_f8_128x4"])
+def test_sm120_dense_quant_batched(q):
+    """A batched dense GEMM (batch 3, partial M and N tiles): each batch's
+    data and scales land in its own slice (``tile_l`` scale strides)."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    Bt, M, N, K = 3, 192, 160, 128
+    axis, bs, ddt, sdt, reorder = q
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[Bt, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[Bt, K, N], stride=[K * N, 1, K])
+    Q, S = g.block_scale_quantize(input=g.matmul(A=A, B=B, name="mm"), block_size=bs, axis=axis, name="q")
+    Q.set_output(True).set_data_type(ddt)
+    d = (Bt,) + _sm120_q_scale_dims(M, N, q)[1:]
+    S.set_dim(list(d)).set_stride([d[1] * d[2], d[2], 1])
+    if reorder:
+        S.set_reordering_type(cudnn.tensor_reordering.F8_128x4)
+    S.set_output(True).set_data_type(sdt)
+    compiled = C.jit_from_cudnn_graph(g, config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))
+    a, b, _ = _mkbatched_data(Bt, M, N, K, "bf16", "bf16")
+    qraw, qbuf = _sm120_guarded((Bt, M, N), torch.float8_e4m3fn)
+    sraw, sbuf = _sm120_guarded(d, torch.float8_e8m0fnu)
+    compiled({A: a, B: b, Q: qbuf, S: sbuf})
+    torch.cuda.synchronize()
+    x = torch.einsum("bmk,bnk->bmn", a.double(), b.double()).float()
+    for i in range(Bt):
+        q_ref, s_ref = _sm120_quant_ref(x[i : i + 1], q)
+        torch.testing.assert_close(_sm120_scale_bytes(sbuf[i : i + 1], M, N, q), s_ref.view(torch.uint8), atol=0, rtol=0)
+        torch.testing.assert_close(qbuf[i : i + 1].float(), q_ref.float(), atol=0, rtol=0)
+    assert _sm120_guards_intact(qraw) and _sm120_guards_intact(sraw)
+
+
+@requires_sm120
+def test_sm120_dense_col_quant_beside_reductions():
+    """A col quant and three reductions of the same producer (scalar AMAX, per-row
+    ADD, per-col MAX) on the row-per-lane drain: the bounded row guard keeps
+    every lane on the col redux while the reductions skip rows past M."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    M, N, K = 320, 352, 256
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+    R = g.relu(input=g.matmul(A=A, B=B, name="mm"), name="r")
+    Q, S = g.block_scale_quantize(input=R, block_size=32, axis=1, name="q")
+    Q.set_output(True).set_data_type(_Q_E4M3)
+    S.set_dim([1, M // 32, N]).set_stride([M // 32 * N, N, 1]).set_output(True).set_data_type(_E8M0)
+    reds = []
+    for mode, dims, name in (
+        (cudnn.reduction_mode.AMAX, (1, 1, 1), "am"),
+        (cudnn.reduction_mode.ADD, (1, M, 1), "rs"),
+        (cudnn.reduction_mode.MAX, (1, 1, N), "cm"),
+    ):
+        r = g.reduction(input=R, mode=mode, name=name)
+        r.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        reds.append((r, dims))
+    compiled = C.jit_from_cudnn_graph(g, config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))
+    a, b, _ = _mkdata(M, N, K, "bf16", "bf16")
+    q = torch.empty(1, M, N, dtype=torch.float8_e4m3fn, device="cuda")
+    s = torch.empty(1, M // 32, N, dtype=torch.float8_e8m0fnu, device="cuda")
+    outs = [torch.empty(*dims, device="cuda") for _r, dims in reds]
+    compiled({A: a, B: b, Q: q, S: s, **{r: o for (r, _d), o in zip(reds, outs)}})
+    torch.cuda.synchronize()
+    x = torch.relu(torch.einsum("bmk,bnk->bmn", a.double(), b.double())).float()
+    q_ref, s_ref = _sm120_quant_ref(x, (1, 32, _Q_E4M3, _E8M0, False))
+    torch.testing.assert_close(s.view(torch.uint8), s_ref.view(torch.uint8), atol=0, rtol=0)
+    torch.testing.assert_close(q.float(), q_ref.float(), atol=0, rtol=0)
+    torch.testing.assert_close(outs[0].flatten(), x.abs().amax().reshape(1), atol=0, rtol=0)
+    torch.testing.assert_close(outs[1], x.sum(-1, keepdim=True), atol=0, rtol=0)
+    torch.testing.assert_close(outs[2], x.amax(1, keepdim=True), atol=0, rtol=0)
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: N-major outputs whose layout admits only ONE-element
+# epilogue chunks (odd N, odd row stride) on the plain dense template -- the
+# lane-run drain stores _STG_V = 1 element per guarded store -- and the funnel /
+# probe agreement on them. Every output sits in a canary buffer with per-row
+# padding (ld > N) where the layout allows it, so a store one element past a row
+# lands on a canary.
+# --------------------------------------------------------------------------- #
+
+_ODD_GUARD = 256
+_ODD_TORCH = {**_TORCH_DTYPE, "fp32": torch.float32}
+_ODD_CUDNN = {**_CUDNN_DTYPE, "fp32": cudnn.data_type.FLOAT}
+
+
+def _sm120_odd_graph(M, N, K, out_dt, *, ld=None, batch=1, tap_dt=None, bias=False, relu=False, red=None, out_major="n"):
+    """matmul [tap] [+ per-col bias] [relu] -> output at ``out_dt`` with row stride
+    ``ld`` (column stride for an M-major output) [-> an fp32 reduction of it]."""
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    A = g.tensor(name="A", dim=[batch, M, K], stride=[M * K, K, 1])
+    B = g.tensor(name="B", dim=[batch, K, N], stride=[K * N, 1, K])
+    value = g.matmul(A=A, B=B, name="mm")
+    t = {"A": A, "B": B}
+    if tap_dt is not None:
+        value.set_output(True).set_data_type(_ODD_CUDNN[tap_dt])
+        t["tap"] = value
+    if bias:
+        t["bias"] = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.FLOAT)
+        value = g.add(a=value, b=t["bias"], name="badd")
+    if relu:
+        value = g.relu(input=value, name="relu")
+    value.set_output(True).set_data_type(_ODD_CUDNN[out_dt])
+    if out_major == "m":
+        value.set_dim([batch, M, N]).set_stride([N * (ld or M), 1, ld or M])
+    else:
+        value.set_dim([batch, M, N]).set_stride([M * (ld or N), ld or N, 1])
+    t["out"] = value
+    if red is not None:
+        mode, dims = red
+        r = g.reduction(input=value, mode=mode, name="red")
+        r.set_dim(list(dims)).set_stride([dims[1] * dims[2], dims[2], 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        t["red"] = r
+    return g, t
+
+
+def _sm120_odd_buffer(batch, rows, cols, dtype, ld=None, out_major="n"):
+    """(raw, padded body, logical view): the view's rows are ``ld`` apart (columns
+    for M-major); everything outside the view -- the per-row padding and
+    _ODD_GUARD bytes on each side -- holds the 0xA5 canary."""
+    inner, outer = (cols, rows) if out_major == "n" else (rows, cols)
+    ld = ld or inner
+    nbytes = batch * outer * ld * torch.empty((), dtype=dtype).element_size()
+    raw = torch.full((nbytes + 2 * _ODD_GUARD,), 0xA5, dtype=torch.uint8, device="cuda")
+    body = raw[_ODD_GUARD : _ODD_GUARD + nbytes].view(dtype).view(batch, outer, ld)
+    view = body[:, :, :inner]
+    return raw, body, (view if out_major == "n" else view.transpose(1, 2)), inner
+
+
+def _sm120_odd_canaries_intact(raw, body, inner):
+    ok = bool((raw[:_ODD_GUARD] == 0xA5).all()) and bool((raw[-_ODD_GUARD:] == 0xA5).all())
+    if body.shape[-1] > inner:
+        ok = ok and bool((body[:, :, inner:].contiguous().view(torch.uint8) == 0xA5).all())
+    return ok
+
+
+def _sm120_run_odd(config, M, N, K, out_dt, *, ld=None, batch=1, tap_dt=None, bias=False, relu=False, red=None, out_major="n", split_k=1):
+    """Build + run one odd-layout graph; assert bit-exact outputs (small-integer
+    data: the fp32 accumulation is exact, the only rounding is the store's), intact
+    canaries, and return the compiled plan."""
+    from dataclasses import replace
+
+    from cudnn.frost.workspace import Workspace
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    g, t = _sm120_odd_graph(M, N, K, out_dt, ld=ld, batch=batch, tap_dt=tap_dt, bias=bias, relu=relu, red=red, out_major=out_major)
+    compiled = C.jit_from_cudnn_graph(g, config=replace(config, split_k_slices=split_k))
+    torch.manual_seed(5)
+    a = torch.randint(-2, 3, (batch, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (batch, N, K), device="cuda").to(torch.bfloat16)
+    x = torch.einsum("bmk,bnk->bmn", a.double(), b.double())
+    vp = {t["A"]: a, t["B"]: b}
+    checks = []
+    if tap_dt is not None:
+        traw, tbody, tview, tinner = _sm120_odd_buffer(batch, M, N, _ODD_TORCH[tap_dt])
+        vp[t["tap"]] = tview
+        checks.append(("tap", traw, tbody, tview, tinner, x.to(_ODD_TORCH[tap_dt])))
+        x = x.to(_ODD_TORCH[tap_dt]).double()  # a tapped GEMM output is a real tensor: consumers read its rounded value
+    if bias:
+        bias_buf = torch.randint(-4, 5, (1, 1, N), device="cuda").float()
+        vp[t["bias"]] = bias_buf
+        x = x + bias_buf.double()
+    if relu:
+        x = x.relu()
+    raw, body, view, inner = _sm120_odd_buffer(batch, M, N, _ODD_TORCH[out_dt], ld=ld, out_major=out_major)
+    vp[t["out"]] = view
+    checks.append(("out", raw, body, view, inner, x.to(_ODD_TORCH[out_dt])))
+    if red is not None:
+        red_buf = torch.full(tuple(red[1]), float("nan"), device="cuda")
+        vp[t["red"]] = red_buf
+    ws = None
+    if compiled.workspace_bytes:
+        ws = Workspace(torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda"), compiled.workspace_bytes, "odd_n")
+    compiled(vp, workspace=ws)
+    torch.cuda.synchronize()
+    for name, raw_, body_, view_, inner_, ref in checks:
+        torch.testing.assert_close(view_.float(), ref.float(), atol=0, rtol=0, msg=lambda m, n=name: f"{n}: {m}")
+        assert _sm120_odd_canaries_intact(raw_, body_, inner_), f"{name}: a store left the output (row padding or guard bytes changed)"
+    if red is not None:
+        stored = view.double()
+        mode, dims = red
+        axes = tuple(i for i, d in enumerate(dims) if d == 1 and stored.shape[i] != 1)
+        want = {
+            cudnn.reduction_mode.AMAX: lambda v: v.abs().amax(dim=axes, keepdim=True),
+            cudnn.reduction_mode.ADD: lambda v: v.sum(dim=axes, keepdim=True),
+            cudnn.reduction_mode.MAX: lambda v: v.amax(dim=axes, keepdim=True),
+            cudnn.reduction_mode.MIN: lambda v: v.amin(dim=axes, keepdim=True),
+        }[mode](stored)
+        torch.testing.assert_close(red_buf.double(), want, atol=0, rtol=0)
+    return compiled
+
+
+_SM120_ODD_CFG = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"
+
+# id -> (M, N, K, output dtype, kwargs): the layouts whose widest legal store is ONE element.
+_SM120_ODD_CASES = {
+    "bf16_N127": (256, 127, 256, "bf16", {}),
+    "bf16_N129_Mtail": (200, 129, 256, "bf16", {}),
+    "bf16_N127_ld129": (256, 127, 256, "bf16", {"ld": 129}),
+    "bf16_N256_ld257": (256, 256, 256, "bf16", {"ld": 257}),
+    "fp32_N255": (136, 255, 256, "fp32", {}),
+    "fp32_N255_ld259": (136, 255, 256, "fp32", {"ld": 259}),
+    "e4m3_N129": (256, 129, 32, "fp8_e4m3", {}),
+    "e4m3_N129_ld133": (256, 129, 32, "fp8_e4m3", {"ld": 133}),
+    "fp16_N131_batch3": (256, 131, 64, "fp16", {"batch": 3}),
+    "bias_fp32tap_relu_N255": (200, 255, 256, "bf16", {"tap_dt": "fp32", "bias": True, "relu": True}),
+    "bias_e4m3tap_N255_ld257": (200, 255, 256, "bf16", {"tap_dt": "fp8_e4m3", "bias": True, "ld": 257}),
+    # N == 1 (GEMV): the (M, 1) output's unit stride is also its M axis, which its
+    # layout alignment measured instead -- 2-element chunks, every call refused.
+    "bf16_N1_gemv": (130, 1, 64, "bf16", {}),
+    "e4m3_N1_gemv": (130, 1, 64, "fp8_e4m3", {}),
+    "fp32_N1_gemv_batch2": (4096, 1, 256, "fp32", {"batch": 2}),
+}
+
+
+@requires_sm120
+@pytest.mark.parametrize("case", list(_SM120_ODD_CASES))
+def test_sm120_odd_n_output_layouts(case):
+    """An N-major output with odd N or an odd row stride stores one element per
+    chunk (vec_bytes_epi is one element of the output dtype) -- bit-exact, with
+    nothing written outside the output (the parent serves the same layouts by
+    narrowing its chunk to the output's own alignment)."""
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+
+    M, N, K, out_dt, kw = _SM120_ODD_CASES[case]
+    compiled = _sm120_run_odd(by_name(_SM120_ODD_CFG), M, N, K, out_dt, **kw)
+    assert compiled.vec_bytes_epi == DTYPE_BYTES[compiled.chain.output_dtype], compiled.vec_bytes_epi  # one element per chunk
+    assert compiled.store_modes == ("stg",) * len(compiled.store_modes)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps2x4",
+        "CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps8x1",
+        "CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps1x8",
+        "CONFIG_sm120_64x32x128_16x16x32_cluster1x1_warps4x2",  # 16-column warp tile: a short lane group
+        "CONFIG_sm120_128x48x128_16x16x32_cluster1x1_warps8x1",  # 6 n-fragments: a full and a 2-fragment group
+        "CONFIG_sm120_256x96x128_16x16x32_cluster1x1_warps4x2",
+    ],
+    ids=lambda n: n.removeprefix("CONFIG_sm120_").replace("_16x16x32_cluster1x1", ""),
+)
+@pytest.mark.parametrize("case", ["bf16_N129_Mtail", "e4m3_N129_ld133"])
+def test_sm120_odd_n_warp_grids(config_name, case):
+    """Every warp grid and N-tile shape drains one-element chunks: full and short
+    32-column lane groups, partial M and N tiles."""
+    M, N, K, out_dt, kw = _SM120_ODD_CASES[case]
+    _sm120_run_odd(by_name(config_name), M, N, K, out_dt, **kw)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "out_dt,ld,S,bias_relu",
+    [("bf16", None, 3, False), ("bf16", 257, 4, True), ("fp32", 259, 8, False)],
+    ids=["bf16_S3", "bf16_ld257_S4_bias_relu", "fp32_ld259_S8"],
+)
+def test_sm120_odd_n_split_k(out_dt, ld, S, bias_relu):
+    """Split-K with odd N: the reducer's groups clamp to 1 element (N % 4 != 0)
+    and the fused epilogue stores one element per chunk."""
+    _sm120_run_odd(by_name(_SM120_SPLITK_CFG), 256, 255, 4096, out_dt, ld=ld, bias=bias_relu, relu=bias_relu, split_k=S)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "mode,dims",
+    [(cudnn.reduction_mode.AMAX, (1, 1, 1)), (cudnn.reduction_mode.ADD, (1, 200, 1)), (cudnn.reduction_mode.MAX, (1, 1, 255))],
+    ids=["scalar_amax", "per_row_add", "per_col_max"],
+)
+def test_sm120_odd_n_reductions(mode, dims):
+    """Reductions of an odd-N output fold one-element chunks (exact: small-integer data)."""
+    _sm120_run_odd(by_name(_SM120_ODD_CFG), 200, 255, 256, "fp32", red=(mode, dims))
+
+
+@requires_sm120
+def test_sm120_odd_m_major_output_under_swap_ab():
+    """An M-major output with odd M is N-major in the swap-AB kernel frame, with
+    one-element chunks (the plain frame scatters it per element)."""
+    from dataclasses import replace
+
+    compiled = _sm120_run_odd(replace(by_name(_SM120_ODD_CFG), swap_ab=True), 255, 200, 256, "bf16", out_major="m", ld=257)
+    assert compiled.vec_bytes_epi == 2 and compiled.chain.out_major == "n"
+
+
+@requires_sm120
+@pytest.mark.parametrize("N,ld,out_dt", [(127, None, "bf16"), (256, 257, "bf16"), (255, None, "fp32"), (129, 131, "fp8_e4m3"), (1, None, "bf16")])
+def test_sm120_odd_n_funnel_agrees_with_probe(N, ld, out_dt):
+    """kernel_registry.accepts() / candidates() and probe_chain agree on every
+    sm120 catalog point (both orientations) for a one-element-chunk output, and
+    the funnel lists sm120 plans for it (it declined all of them while the
+    (n, n+1) pair rule stood)."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    chain = analyze(_sm120_odd_graph(256, N, 256, out_dt, ld=ld)[0])
+    sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
+    assert any(cfg.pipeline == "sm120" for _t, cfg in R.candidates(chain))
+    disagree = []
+    for cfg in sm120 + [replace(c, swap_ab=True) for c in sm120]:
+        lowered = swap_ab(chain) if cfg.swap_ab else chain
+        funnel = R.select_template(lowered, cfg).accepts(lowered, cfg)
+        try:
+            C.probe_chain(chain, cfg)
+            probe = None
+        except (NotImplementedError, ValueError) as e:
+            probe = str(e)
+        if (funnel is None) != (probe is None):
+            disagree.append((cfg.name, cfg.swap_ab, funnel, probe))
+    assert not disagree, disagree[:3]
+
+
+@requires_sm120
+def test_sm120_odd_n_public_graph_runs_the_frost_plan():
+    """Through the public graph API (check_support -> build_plans -> execute) an
+    odd-N graph lists and runs a FROST plan (the funnel and the probe agree)."""
+    from cudnn.engines import is_python_engine
+
+    M, N, K = 384, 255, 256
+    g, t = _sm120_odd_graph(M, N, K, "bf16")
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, plan in enumerate(g.plans) if is_python_engine(plan.engine_id)]
+    assert frost, "no FROST plan listed for an odd-N output"
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+    torch.manual_seed(3)
+    a = torch.randint(-2, 3, (1, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (1, N, K), device="cuda").to(torch.bfloat16)
+    raw, body, out, inner = _sm120_odd_buffer(1, M, N, torch.bfloat16)
+    ws = torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda")
+    g.execute({t["A"]: a, t["B"]: b, t["out"]: out}, ws)
+    torch.cuda.synchronize()
+    ref = torch.einsum("bmk,bnk->bmn", a.double(), b.double()).to(torch.bfloat16)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+    assert _sm120_odd_canaries_intact(raw, body, inner)
+
+
+@requires_sm120
+def test_sm120_gemv_public_graph_runs_the_frost_plan():
+    """Through the public graph API a GEMV-shaped matmul (N == 1) lists a FROST
+    plan and runs it: the plan was listed first and every execute refused the
+    call ("problem_size[1] ... expected to be divisible by 2")."""
+    from cudnn.engines import is_python_engine
+
+    M, N, K = 4096, 1, 4096
+    g, t = _sm120_odd_graph(M, N, K, "bf16")
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, plan in enumerate(g.plans) if is_python_engine(plan.engine_id)]
+    assert frost, "no FROST plan listed for a GEMV"
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+    torch.manual_seed(29)
+    a = torch.randint(-2, 3, (1, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-2, 3, (1, N, K), device="cuda").to(torch.bfloat16)
+    raw, body, out, inner = _sm120_odd_buffer(1, M, N, torch.bfloat16)
+    g.execute({t["A"]: a, t["B"]: b, t["out"]: out}, torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.einsum("bmk,bnk->bmn", a.double(), b.double()).to(torch.bfloat16), atol=0, rtol=0)
+    assert _sm120_odd_canaries_intact(raw, body, inner)
+
+
+@requires_sm120
+@pytest.mark.parametrize("case", ["row32", "col32", "dual32_f8_128x4", "mixed_blocks", "col16"])
+def test_sm120_dense_quant_probe_and_funnel_agree(case):
+    """kernel_registry.accepts() / candidates() and probe_chain agree on every sm120
+    catalog point (both orientations) for a block-quantized dense chain: the
+    funnel asks the same drain gates (Sm120KernelTemplate.block_quant_reject)
+    the precheck runs -- it used to list 268 of 450 sm120 plans the probe
+    declined (warp_tile_n % chunk, the block dividing the chunk, a 32-row warp
+    tile for a 32-row col block)."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    quants, pre, _tap, _mmajor = _SM120_DENSE_QUANT_CASES[case]
+    chain = analyze(_sm120_dense_quant_graph(256, 256, 128, quants, pre)[0])
+    sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
+    disagree = []
+    for cfg in sm120 + [replace(c, swap_ab=True) for c in sm120]:
+        lowered = swap_ab(chain) if cfg.swap_ab else chain
+        funnel = R.select_template(lowered, cfg).accepts(lowered, cfg)
+        try:
+            C.probe_chain(chain, cfg)
+            probe = None
+        except (NotImplementedError, ValueError) as e:
+            probe = str(e)
+        if (funnel is None) != (probe is None):
+            disagree.append((cfg.name, cfg.swap_ab, funnel, probe))
+    assert not disagree, disagree[:3]
+    listed = [c for _t, c in R.candidates(chain, sweep_swap_ab=True) if c.pipeline == "sm120"]
+    assert listed, "the funnel lists no sm120 plan for a servable quant chain"
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: per-row / per-col reductions on the dense lane-run drain
+# fold in registers and flush one atomic per row / column per warp per tile.
+# --------------------------------------------------------------------------- #
+
+_FOLD_MODES = {
+    "add": cudnn.reduction_mode.ADD,
+    "avg": cudnn.reduction_mode.AVG,
+    "norm1": cudnn.reduction_mode.NORM1,
+    "amax": cudnn.reduction_mode.AMAX,
+    "max": cudnn.reduction_mode.MAX,
+    "min": cudnn.reduction_mode.MIN,
+    "mul": cudnn.reduction_mode.MUL,
+    "mul_no_zeros": cudnn.reduction_mode.MUL_NO_ZEROS,
+}
+_FOLD_CFG = "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"  # 32x64 warp tile: 2 m-fragments, 2 column groups
+_FOLD_GEOMETRIES = (
+    "CONFIG_sm120_128x48x128_16x16x32_cluster1x1_warps8x1",  # 16x48: a full and a short (2-fragment) column group
+    "CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps1x8",  # 128x16: 8 m-fragments, one short group
+    "CONFIG_sm120_64x32x128_16x16x32_cluster1x1_warps4x2",  # 16x16: one m-fragment, one short group
+    "CONFIG_sm120_128x80x128_16x16x32_cluster1x1_warps8x1",  # 16x80: groups of 4, 4 and 2 fragments
+)
+_FOLD_CANARY = 0xA5
+
+
+def _sm120_fold_graph(M, N, K, mode, dims, *, batch=1, int8=False, store_out=True, red_stride=None):
+    io = cudnn.data_type.INT8 if int8 else cudnn.data_type.BFLOAT16
+    g = cudnn.pygraph(
+        io_data_type=io,
+        intermediate_data_type=cudnn.data_type.FLOAT,
+        compute_data_type=cudnn.data_type.INT32 if int8 else cudnn.data_type.FLOAT,
+    )
+    A = g.tensor(name="A", dim=[batch, M, K], stride=[M * K, K, 1], data_type=io)
+    B = g.tensor(name="B", dim=[batch, K, N], stride=[K * N, 1, K], data_type=io)
+    Cc = g.matmul(A=A, B=B, name="mm")
+    Cc.set_data_type(cudnn.data_type.INT32 if int8 else cudnn.data_type.BFLOAT16)
+    if store_out:
+        Cc.set_output(True).set_dim([batch, M, N]).set_stride([M * N, N, 1])
+    red_dt = cudnn.data_type.INT32 if int8 else cudnn.data_type.FLOAT
+    R = g.reduction(input=Cc, mode=_FOLD_MODES[mode], name="red", compute_data_type=red_dt)
+    R.set_dim(list(dims)).set_stride(list(red_stride) if red_stride else [dims[1] * dims[2], dims[2], 1])
+    R.set_output(True).set_data_type(red_dt)
+    return g, A, B, (Cc if store_out else None), R
+
+
+def _sm120_fold_sides(rows, cols, batch, mode, dims, K, gen):
+    """(a, b) fp64 operands: small integers, or for MUL a rank-1 product
+    x[b, m, n] = s[b, m] * t[b, n] of powers of two (every partial product is
+    exact) whose factor along the reduced axis is a sign, so the product stays
+    finite."""
+    if mode not in ("mul", "mul_no_zeros"):
+        return (torch.randint(-2, 3, (batch, rows, K), generator=gen).double(), torch.randint(-2, 3, (batch, cols, K), generator=gen).double())
+    pow2 = torch.tensor([1.0, -1.0, 1.0, -1.0, 2.0, 0.5, -2.0, -0.5, 0.0], dtype=torch.float64)
+    sign = torch.tensor([1.0, -1.0, 0.0], dtype=torch.float64)
+    by_rows = dims[1] == 1  # the product runs over M: the column factor must be a sign
+    s_set, t_set = (pow2, sign[:2]) if by_rows else (sign, pow2)
+    s = s_set[torch.randint(0, len(s_set), (batch, rows), generator=gen)]
+    t = t_set[torch.randint(0, len(t_set), (batch, cols), generator=gen)]
+    a = torch.zeros(batch, rows, K, dtype=torch.float64)
+    b = torch.zeros(batch, cols, K, dtype=torch.float64)
+    a[:, :, 0], b[:, :, 0] = s, t
+    return a, b
+
+
+def _sm120_fold_ref(val, mode, dims):
+    axes = [i for i, d in enumerate(dims) if d == 1 and val.shape[i] != 1]
+    if mode in ("mul", "mul_no_zeros"):
+        v = torch.where(val == 0, torch.ones_like(val), val) if mode == "mul_no_zeros" else val
+        for a in axes:
+            v = v.prod(dim=a, keepdim=True)
+        return v
+    if not axes:
+        return val.clone()
+    count = 1
+    for a in axes:
+        count *= val.shape[a]
+    op = {
+        "add": lambda v: v.sum(dim=axes, keepdim=True),
+        "avg": lambda v: v.sum(dim=axes, keepdim=True) / count,
+        "norm1": lambda v: v.abs().sum(dim=axes, keepdim=True),
+        "amax": lambda v: v.abs().amax(dim=axes, keepdim=True),
+        "max": lambda v: v.amax(dim=axes, keepdim=True),
+        "min": lambda v: v.amin(dim=axes, keepdim=True),
+    }[mode]
+    return op(val)
+
+
+def _sm120_fold_red_buffer(dims, stride, dtype):
+    """The reduction output carved out of a canary-filled byte buffer with guard
+    bytes on both sides (and between elements, when strided)."""
+    elem = torch.empty((), dtype=dtype).element_size()
+    span = 1 + sum((d - 1) * s for d, s in zip(dims, stride))
+    raw = torch.full((span * elem + 2 * _Q_GUARD,), _FOLD_CANARY, dtype=torch.uint8, device="cuda")
+    view = raw[_Q_GUARD : _Q_GUARD + span * elem].view(dtype).as_strided(tuple(dims), tuple(stride))
+    marker = torch.zeros_like(raw)
+    marker[_Q_GUARD : _Q_GUARD + span * elem].view(torch.int32 if elem == 4 else torch.int8).as_strided(tuple(dims), tuple(stride)).fill_(-1)
+    return raw, view, marker
+
+
+def _sm120_run_fold(cfg_name, M, N, K, mode, dims, *, batch=1, int8=False, store_out=True, red_stride=None):
+    """Build, run and check one folded reduction; returns the compiled plan."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    g, A, B, Cc, R = _sm120_fold_graph(M, N, K, mode, dims, batch=batch, int8=int8, store_out=store_out, red_stride=red_stride)
+    compiled = C.jit_from_cudnn_graph(g, config=by_name(cfg_name))
+    a, b = _sm120_fold_sides(M, N, batch, mode, dims, K, torch.Generator().manual_seed(41))
+    x = torch.einsum("bmk,bnk->bmn", a, b)
+    io = torch.int8 if int8 else torch.bfloat16
+    vp = {A: a.to(io).cuda(), B: b.to(io).cuda()}
+    stored = x.to(torch.int32 if int8 else torch.bfloat16).double()
+    out = None
+    if store_out:
+        out = torch.full((batch, M, N), -7, dtype=torch.int32 if int8 else torch.bfloat16, device="cuda")
+        vp[Cc] = out
+    red_dt = torch.int32 if int8 else torch.float32
+    stride = red_stride or (dims[1] * dims[2], dims[2], 1)
+    raw, red, marker = _sm120_fold_red_buffer(dims, stride, red_dt)
+    vp[R] = red
+    compiled(vp)
+    torch.cuda.synchronize()
+    if out is not None:
+        torch.testing.assert_close(out.double().cpu(), stored, atol=0, rtol=0)
+    want = _sm120_fold_ref(stored, mode, dims)
+    tol = 1e-6 * max(1.0, float(want.abs().max())) if mode == "avg" else 0.0
+    torch.testing.assert_close(red.double().cpu(), want, atol=tol, rtol=0)
+    assert bool((raw[marker == 0] == _FOLD_CANARY).all()), "a reduction atomic landed outside the reduction output"
+    return compiled
+
+
+def _sm120_reduction_atomics_outside_the_flush(compiled) -> list[str]:
+    """Lines of the generated kernel that issue an atomic on a reduction output
+    (a ``gC_tap_<i>_ptr`` of the chain's reductions) outside ``red_part_flush_tile``."""
+    src = compiled.generated_path.read_text()
+    specs = len(compiled.chain.output_specs)
+    taps = [f"gC_tap_{specs + i}_ptr" for i in range(len(compiled.chain.reductions))]
+    flush = src.index("def red_part_flush_tile(")
+    flush_end = src.index("def red_part_flush_cta(", flush)
+    outside = src[:flush] + src[flush_end:]
+    return [ln.strip() for ln in outside.splitlines() if "atomic" in ln and any(t in ln for t in taps)]
+
+
+@requires_sm120
+@pytest.mark.parametrize("axis", ["row", "col"])
+@pytest.mark.parametrize("mode", list(_FOLD_MODES))
+def test_sm120_lane_run_reduction_folds(mode, axis):
+    """Every fold mode, per row and per column, on an M / N tail (200x136): exact
+    against an fp64 reference of the stored output (AVG within 1e-6 of the result's
+    magnitude: the count is applied once, after the fold), no atomic outside the
+    reduction output, and every reduction atomic issued from the per-tile flush --
+    unfolded, a per-col reduction issued one atomic per ELEMENT (an nvfp4 4096^3
+    GEMM + per-col ADD ran 7.2x, MUL 33x, the native plan's time)."""
+    M, N = 200, 136
+    compiled = _sm120_run_fold(_FOLD_CFG, M, N, 160, mode, (1, M, 1) if axis == "row" else (1, 1, N))
+    assert not _sm120_reduction_atomics_outside_the_flush(compiled)
+
+
+@requires_sm120
+@pytest.mark.parametrize("axis", ["row", "col"])
+@pytest.mark.parametrize("mode", ["add", "mul"])
+@pytest.mark.parametrize("cfg_name", _FOLD_GEOMETRIES, ids=lambda n: n.removeprefix("CONFIG_sm120_").removesuffix("_cluster1x1"))
+def test_sm120_lane_run_reduction_fold_geometries(cfg_name, mode, axis):
+    """The fold's slot map and reduce-scatter across warp tiles of 1 and 8
+    m-fragments and of full, several and short 32-column groups (a short group's
+    absent fragments must issue nothing)."""
+    M, N = 200, 136
+    compiled = _sm120_run_fold(cfg_name, M, N, 128, mode, (1, M, 1) if axis == "row" else (1, 1, N))
+    assert not _sm120_reduction_atomics_outside_the_flush(compiled)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "case",
+    [
+        "odd_n_col_add",
+        "odd_n_row_mul_no_zeros",
+        "batch_col_add",
+        "batch_collapsed_row_max",
+        "int8_col_add",
+        "int8_row_min",
+        "reduction_only_col_mul",
+        "strided_col_add",
+        "three_rows_col_max",
+    ],
+)
+def test_sm120_lane_run_reduction_fold_layouts(case):
+    """Folds under 1-element chunks (odd N), batch (per-batch and batch-collapsed
+    outputs), int32 reductions of an int8 GEMM, a reduction-only graph, a strided
+    reduction output (the gaps are canaries) and a 3-row problem."""
+    kw = {
+        "odd_n_col_add": dict(cfg_name=_FOLD_CFG, M=77, N=127, K=64, mode="add", dims=(1, 1, 127)),
+        "odd_n_row_mul_no_zeros": dict(cfg_name=_FOLD_CFG, M=77, N=127, K=64, mode="mul_no_zeros", dims=(1, 77, 1)),
+        "batch_col_add": dict(cfg_name=_FOLD_CFG, M=96, N=144, K=64, mode="add", dims=(3, 1, 144), batch=3),
+        "batch_collapsed_row_max": dict(cfg_name=_FOLD_CFG, M=96, N=144, K=64, mode="max", dims=(1, 96, 1), batch=3),
+        "int8_col_add": dict(cfg_name=_FOLD_CFG, M=160, N=200, K=128, mode="add", dims=(1, 1, 200), int8=True),
+        "int8_row_min": dict(cfg_name=_FOLD_CFG, M=160, N=200, K=128, mode="min", dims=(1, 160, 1), int8=True),
+        "reduction_only_col_mul": dict(cfg_name=_FOLD_CFG, M=200, N=136, K=128, mode="mul", dims=(1, 1, 136), store_out=False),
+        "strided_col_add": dict(cfg_name=_FOLD_CFG, M=200, N=136, K=128, mode="add", dims=(1, 1, 136), red_stride=(272, 272, 2)),
+        "three_rows_col_max": dict(cfg_name="CONFIG_sm120_128x128x64_16x16x32_cluster1x1_warps8x1", M=3, N=256, K=96, mode="max", dims=(1, 1, 256)),
+    }[case]
+    compiled = _sm120_run_fold(**kw)
+    assert not _sm120_reduction_atomics_outside_the_flush(compiled)
+
+
+def test_sm120_lane_run_fold_contract():
+    """The folds are rendered only for a template whose lane-run drain carries the
+    lines they rely on (compiler._LANE_RUN_FOLD_CONTRACT): both dense sm120
+    templates must, so an edit to either drain that breaks the contract fails here
+    instead of silently restoring the per-element atomics. No fold for the MoE
+    templates, the row-per-lane quant drain or a split-K plan (the shared reducer
+    takes the reductions there)."""
+    from dataclasses import replace
+
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    assert C._LANE_RUN_FOLD_TEMPLATES == {"sm120_matmul.py", "sm120_block_scale_matmul.py"}
+    for name in C._LANE_RUN_FOLD_TEMPLATES:
+        assert C._template_honours_lane_run_folds(R.template_path(name)), name
+    cfg = by_name(_FOLD_CFG)
+    chain = analyze(_sm120_fold_graph(256, 256, 128, "add", (1, 1, 256))[0])
+    assert C._lane_run_tile(chain, cfg, R.select_template(chain, cfg)) == (cfg.warp_tile_m, cfg.warp_tile_n)
+    assert C._lane_run_tile(chain, replace(cfg, split_k_slices=2), R.select_template(chain, cfg)) is None
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: the plain dense auto pick keeps the warp-MMA kernel's
+# accumulator budget (select_config's 128-accumulator 128x256 / 64x256 warps2x4
+# tiles ran 1.3-1.5x slower: the fp8-output odd-N plans G38 listed first trailed
+# the native plan by 1.21-1.37x), and a block-quantized chain no geometry can
+# serve is declined without a candidate search.
+# --------------------------------------------------------------------------- #
+
+
+@requires_sm120
+@pytest.mark.parametrize("out_dt", ["bf16", "fp8_e4m3", "fp32"])
+@pytest.mark.parametrize(
+    "shape",
+    [(4096, 4096, 4096), (4096, 4095, 4096), (2048, 2047, 2048), (512, 32001, 4096), (1, 4096, 4096), (4096, 1, 4096), (4096, 16, 4096), (1024, 1, 1024)],
+    ids=lambda s: "x".join(map(str, s)),
+)
+def test_sm120_plain_dense_auto_pick_fits_the_tile_to_the_problem(monkeypatch, shape, out_dt):
+    """The automatic config of a plain dense GEMM is probe-accepted, its warp tile
+    holds at most ``_ROW_PER_LANE_QUANT_ACC_REGS`` accumulators per thread, and its
+    CTA tile carries no N columns the problem does not need (at most max(32, N
+    rounded up to a power of two)). Which tile within those bounds wins is a tuning
+    result measured offline (round-robin CUPTI, RTX PRO 6000: the select_config
+    pick it replaces -- 128x256 / 64x256 warps2x4 -- ran 1.3-1.5x the model pick's
+    time, e.g. 4096^3 505.5 vs 382.8 us, 4096x4095x4096 e4m3 out 575.5 vs 427.3;
+    a 32x64 tile on a GEMV with N = 1 ran 5x the 128x32 split-K plan)."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    monkeypatch.setattr(C, "_sm_count", lambda: 188)
+    N = shape[1]
+    chain = analyze(_sm120_odd_graph(*shape, out_dt)[0])
+    cfg = C._baseline_config(chain)
+    C.probe_chain(chain, cfg)
+    assert cfg.warp_tile_m * cfg.warp_tile_n // 32 <= C._ROW_PER_LANE_QUANT_ACC_REGS, cfg.name
+    assert cfg.cta_tile_n <= max(32, 1 << max(0, N - 1).bit_length()), cfg.name
+
+
+@requires_sm120
+def test_sm120_odd_n_fp8_output_public_graph_runs_the_frost_plan():
+    """An odd-N GEMM with an e4m3 output lists the FROST plan first (G38) and runs
+    it exactly through the public graph API with the automatic config."""
+    from cudnn.engines import is_python_engine
+
+    M, N, K = 1024, 1023, 128
+    g, t = _sm120_odd_graph(M, N, K, "fp8_e4m3")
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, plan in enumerate(g.plans) if is_python_engine(plan.engine_id)]
+    assert frost, "no FROST plan listed for an odd-N e4m3 output"
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+    torch.manual_seed(13)
+    a = torch.randint(-1, 2, (1, M, K), device="cuda").to(torch.bfloat16)
+    b = torch.randint(-1, 2, (1, N, K), device="cuda").to(torch.bfloat16)
+    raw, body, out, inner = _sm120_odd_buffer(1, M, N, torch.float8_e4m3fn)
+    g.execute({t["A"]: a, t["B"]: b, t["out"]: out}, torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    ref = torch.einsum("bmk,bnk->bmn", a.double(), b.double()).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(out.float(), ref.float(), atol=0, rtol=0)
+    assert _sm120_odd_canaries_intact(raw, body, inner)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "case,reason",
+    [("fp4_data", "does not support fp4 output"), ("e5m3_scale", "fp8_e5m3")],
+)
+def test_sm120_quant_auto_pick_declines_without_a_search(monkeypatch, case, reason):
+    """A block-quantized chain no tile geometry can serve -- a packed fp4 data
+    output (the template's output-dtype scope), an E5M3 scale (the dtype x arch
+    gate) -- keeps the automatic pick without probing a single candidate: the pick
+    used to walk ~400 configs (~85 ms per plan request, twice per public plan
+    listing) to return the same reason, which the probe still gives."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    quants = {
+        "fp4_data": [(-1, 16, cudnn.data_type.FP4_E2M1, _E4M3SF, False)],
+        "e5m3_scale": [(1, 32, _Q_E4M3, cudnn.data_type.FP8_E5M3, False)],
+    }[case]
+    chain = analyze(_sm120_dense_quant_graph(1024, 1024, 1024, quants)[0])
+    probed = []
+    real = C.probe_chain
+
+    def spy(ch, cfg):
+        probed.append(cfg.name)
+        return real(ch, cfg)
+
+    monkeypatch.setattr(C, "probe_chain", spy)
+    cfg = C._baseline_config(chain)
+    assert not probed, probed[:3]
+    with pytest.raises(NotImplementedError, match=reason):
+        real(chain, cfg)

@@ -783,3 +783,56 @@ def test_triple_moe_block_scale_auto_pick(combo) -> None:
         a, ex = tok_s[b:e], gi % E
         ref[b:e] = torch.nn.functional.silu(a @ w_s[0][ex].T) * (a @ w_s[1][ex].T) * 0.5 + a @ w_s[2][ex].T
     torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_dual_moe_block_scale_launch_resets_its_scheduler_counter_sm120(swap_ab) -> None:
+    """The block-scale twin of the dense dual-MoE counter test: the compiled host
+    zeroes the tile-scheduler counter itself, stream-ordered (the counter-init kernel
+    in front of the PDL main kernel), on the multi-GEMM launch path as on the single
+    one. A reused workspace whose counter slot holds a stale claim (every byte 0x7f)
+    would otherwise end every CTA's first claim past the tile space and leave the
+    output unwritten."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    E, N, K, combo = 8, 256, 128, "nvfp4"
+    group_sizes = [64, 0, 200, 128, 100, 12, 196, 68]
+    S = sum(group_sizes)
+    offsets_list = [sum(group_sizes[:g]) for g in range(E + 1)]
+    block_size = _COMBOS[combo][0]
+    sf_k = K // block_size
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device=dev)
+    tok_rt, tok_deq = _mk_operand(combo, 1, S, K, dev, lut)
+    tok_deq = tok_deq.view(S, K)
+    (w0_rt, w0_deq), (w1_rt, w1_deq) = _mk_operand(combo, E, N, K, dev, lut), _mk_operand(combo, E, N, K, dev, lut)
+    sfa_log, sfb0_log, sfb1_log = _mk_sf(combo, (S, sf_k), dev), _mk_sf(combo, (E, N, sf_k), dev), _mk_sf(combo, (E, N, sf_k), dev)
+    scale = torch.tensor([[[0.5]]], dtype=torch.float32, device=dev)
+    try:
+        compiled = _plan(
+            _build_graph(E, S, N, K, E, combo), config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), cta_group=1, swap_ab=swap_ab
+        )
+    except NotImplementedError as exc:  # the frost conftest would report an arch-tree decline as a skip
+        pytest.fail(f"the sm120 tree declined a dual block-scale MoE plan it serves: {exc}")
+    sfa_parts = [_to_blocked(sfa_log[offsets_list[gi] : offsets_list[gi + 1]]).view(torch.uint8) for gi in range(E)]
+    sfa_blk = _with_static_segmented_capacity(torch.cat(sfa_parts).view(sfa_log.dtype), S, E, sf_k)
+    sfb0_blk = torch.cat([_to_blocked(sfb0_log[e]) for e in range(E)]).view(E, sf_k, N)
+    sfb1_blk = torch.cat([_to_blocked(sfb1_log[e]) for e in range(E)]).view(E, sf_k, N)
+    offsets = torch.tensor(offsets_list, dtype=torch.int32, device=dev)
+    output = torch.empty(1, S, N, dtype=torch.bfloat16, device=dev)
+    vp = _vp_moe_bs_mg(compiled, [((tok_rt, sfa_blk), (w0_rt, sfb0_blk)), ((tok_rt, sfa_blk), (w1_rt, sfb1_blk))], offsets, output, scale)
+    tok_s = tok_deq * sfa_log.float().repeat_interleave(block_size, 1)
+    w0_s = w0_deq * sfb0_log.float().repeat_interleave(block_size, 2)
+    w1_s = w1_deq * sfb1_log.float().repeat_interleave(block_size, 2)
+    ref = torch.zeros((S, N), dtype=torch.float32, device=dev)
+    for gi in range(E):
+        b, e = offsets_list[gi], offsets_list[gi + 1]
+        if b < e:
+            ref[b:e] = torch.nn.functional.silu(tok_s[b:e] @ w0_s[gi].T) * (tok_s[b:e] @ w1_s[gi].T) * 0.5
+    # Every byte 0x7f: the counter reads as a claim far beyond the tile space.
+    workspace = torch.full((compiled.workspace_bytes,), 0x7F, dtype=torch.uint8, device=dev)
+    for _ in range(2):  # the second launch finds the first one's final count
+        output.fill_(float("nan"))
+        compiled(vp, workspace=workspace)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output[0], ref.to(torch.bfloat16), atol=5e-2, rtol=5e-2)

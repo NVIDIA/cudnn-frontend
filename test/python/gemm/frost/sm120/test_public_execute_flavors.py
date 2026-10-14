@@ -27,6 +27,10 @@ _GPU = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
     reason="the FROST gemm engine claims SM100",
 )
+_SM120_GPU = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="the FROST gemm engine's sm120 tree claims SM 12.x",
+)
 
 BF16 = cudnn.data_type.BFLOAT16
 F32 = cudnn.data_type.FLOAT
@@ -194,7 +198,7 @@ def test_two_dense_outputs():
     torch.testing.assert_close(y, torch.relu(ref).to(torch.bfloat16), atol=1e-1, rtol=1e-2)
 
 
-@_GPU
+@_SM120_GPU
 def test_multi_gemm():
     """Two matmuls sharing A and an epilogue: the operands the kernel takes are
     the DISTINCT ones, which is what the pack binds."""

@@ -19,6 +19,11 @@ so the GATHER rows pin a bound, not an exact count: STL + LDL in the whole cubin
 set between today's count and the one-lane producer's (in parentheses below). The
 block-scale GATHER kernels keep a few benign spills from their fully unrolled
 scale-factor repack -- a rolled, spill-free repack measured 2.4% slower.
+
+The MoE COMBINE cases also pin the store itself: where one lane's chunk is adjacent
+features of one token row (token-by-weight, N-major output), the weighted top-k
+scatter-add must reach the SASS as 16-byte vector reductions (REDG.E.ADD.BF16x8 /
+F32x4) -- a refactor that falls back to per-element adds stays numerically green.
 """
 
 from __future__ import annotations
@@ -52,6 +57,18 @@ _CASES = {
     "moe_nvfp4_gather_dual": ("moe", "nvfp4", "gather", True, "128x128_4x2", False, 120),  # 81 (163)
     "moe_nvfp4_gather_256": ("moe", "nvfp4", "gather", False, "256x128_2x4", False, 200),  # 108 (322)
     "moe_nvfp4_gather_swap": ("moe", "nvfp4", "gather", False, "128x64_4x2", True, 8),  # 0 (30)
+    "moe_bf16_combine": ("moe", "bf16", "combine", False, "128x128_4x2", False, None),
+    "moe_bf16_combine_f32": ("moe", "bf16", "combine_f32", False, "128x128_4x2", False, None),
+    "moe_bf16_combine_swap": ("moe", "bf16", "combine", False, "128x64_4x2", True, None),
+    "moe_nvfp4_combine": ("moe", "nvfp4", "combine", False, "128x128_4x2", False, None),
+    "moe_nvfp4_combine_swap": ("moe", "nvfp4", "combine", False, "128x64_4x2", True, None),
+}
+
+# COMBINE case -> the 16-byte vector reduction its N-major token-by-weight store must emit.
+_COMBINE_VECTOR_REDUCTION = {
+    "moe_bf16_combine": "REDG.E.ADD.BF16x8",
+    "moe_bf16_combine_f32": "REDG.E.ADD.F32x4",
+    "moe_nvfp4_combine": "REDG.E.ADD.BF16x8",
 }
 
 
@@ -88,6 +105,11 @@ def _graph(kind, combo, mode, dual):
     if mode == "gather":
         idx = g.tensor(name="token_index", dim=[1, R, 1], stride=[R, 1, 1], data_type=dt.INT32)
         routing = {"token_index": idx, "mode": cudnn.moe_grouped_matmul_mode.GATHER}
+    elif mode.startswith("combine"):
+        idx = g.tensor(name="token_index", dim=[1, R, 1], stride=[R, 1, 1], data_type=dt.INT32)
+        ks = g.tensor(name="token_ks", dim=[1, R, 1], stride=[R, 1, 1], data_type=dt.INT32)
+        scores = g.tensor(name="top_k_scores", dim=[1, T, R // T], stride=[R, R // T, 1], data_type=dt.FLOAT)
+        routing = {"token_index": idx, "token_ks": ks, "top_k_scores": scores, "top_k": R // T, "mode": cudnn.moe_grouped_matmul_mode.COMBINE}
     mms = []
     for i in range(2 if dual else 1):
         w = g.tensor(name=f"w{i}", dim=[E, K, N], stride=[K * N, 1, K], data_type=a_dt)
@@ -96,7 +118,7 @@ def _graph(kind, combo, mode, dual):
             w = g.block_scale_dequantize(input=w, descale=sfb, block_size=[bsz, 1])
         mms.append(g.moe_grouped_matmul(tok, w, fto, compute_data_type=dt.FLOAT, **routing))
     y = g.mul(a=g.swish(input=mms[0]), b=mms[1]) if dual else mms[0]
-    y.set_output(True).set_data_type(dt.BFLOAT16)
+    y.set_output(True).set_data_type(dt.FLOAT if mode == "combine_f32" else dt.BFLOAT16)
     return g
 
 
@@ -138,7 +160,8 @@ _PROBE = textwrap.dedent(r"""
     alloc = [int(ln.split(",")[-1].strip(" ;"), 16) for ln in sass if "USETMAXREG.TRY_ALLOC" in ln]
     stl = sum(1 for ln in sass if re.search(r"\bSTL(\.[0-9A-Z]+)*\s", ln))
     ldl = sum(1 for ln in sass if re.search(r"\bLDL(\.[0-9A-Z]+)*\s", ln))
-    print("RESULT " + json.dumps(dict(generated=str(compiled.generated_path), dealloc=dealloc, alloc=alloc, stl=stl, ldl=ldl, cubins=len(cubins))))
+    red = sorted({m for ln in sass for m in re.findall(r"\bREDG\.E\.ADD\.[0-9A-Za-z]+", ln)})
+    print("RESULT " + json.dumps(dict(generated=str(compiled.generated_path), dealloc=dealloc, alloc=alloc, stl=stl, ldl=ldl, red=red, cubins=len(cubins))))
     """)
 
 
@@ -184,3 +207,6 @@ def test_sm120_register_split_reaches_the_sass(tmp_path, case):
             f"{case}: {res['stl']} STL + {res['ldl']} LDL > {bound}: the GATHER producer spills at {prod} registers "
             f"(keep its per-lane state small -- each TMA-warp lane reads its own rows and issues its own GATHER4s)"
         )
+    if case in _COMBINE_VECTOR_REDUCTION:
+        want = _COMBINE_VECTOR_REDUCTION[case]
+        assert want in res["red"], f"{case}: the COMBINE store lost its 16-byte vector reduction {want}; SASS has {res['red']}"

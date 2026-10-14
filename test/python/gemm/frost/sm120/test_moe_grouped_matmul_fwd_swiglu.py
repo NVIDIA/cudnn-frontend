@@ -961,3 +961,86 @@ def test_dual_moe_grouped_matmul_fwd_swiglu_auto_pick_keeps_two_ab_stages() -> N
     compiled(_vp_mg(compiled, [(token, w0), (token, w1)], out, scale, fto=offsets))
     torch.cuda.synchronize()
     torch.testing.assert_close(out[0], _ref(token, w0, w1, offsets, scale, S, N, E, num_groups), atol=5e-2, rtol=5e-2)
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: a MoE multi-GEMM with five or more operand rings gets a ring
+# depth whose real (1024-B aligned) SMEM layout fits the device, and a MoE GEMM's
+# own result tapped beside the fused epilogue is declined rather than left
+# unwritten.
+# --------------------------------------------------------------------------- #
+
+
+def _sm120_many_weight_moe_graph(num_weights, E=2, S=256, N=256, K=256):
+    """token @ weight_i (i < num_weights), NONE mode, summed into one fp32 output."""
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    tok = g.tensor(name="token", dim=[1, S, K], stride=[S * K, K, 1], data_type=cudnn.data_type.BFLOAT16)
+    ws = [g.tensor(name=f"weight{i}", dim=[E, K, N], stride=[K * N, 1, K], data_type=cudnn.data_type.BFLOAT16) for i in range(num_weights)]
+    fto = g.tensor(name="first_token_offset", dim=[E + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    mms = [
+        g.moe_grouped_matmul(tok, w, fto, mode=cudnn.moe_grouped_matmul_mode.NONE, compute_data_type=cudnn.data_type.FLOAT, name=f"moe{i}")
+        for i, w in enumerate(ws)
+    ]
+    y = mms[0]
+    for i in range(1, num_weights):
+        y = g.add(a=y, b=mms[i], name=f"s{i}")
+    y.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "num_weights,cfg_name",
+    [(5, "CONFIG_sm120_128x144x32_16x16x32_cluster1x1_warps8x1"), (8, "CONFIG_sm120_128x48x32_16x16x32_cluster1x1_warps8x1")],
+    ids=["5_weights_128x144x32", "8_weights_128x48x32"],
+)
+def test_sm120_many_weight_moe_fits_the_smem_it_allocates(num_weights, cfg_name) -> None:
+    """Five or more operand rings on the MoE kernel: the ring depth comes off the
+    template's real layout (each ring 1024-B aligned), not the linear per-stage
+    count that admitted 3 / 5 stages here -- a 101888 / 103936-B layout the device
+    refused at launch (opt-in 101376 B). Probe and funnel admit the plan, the
+    layout fits, and it launches and computes exactly."""
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import select_template
+    from cudnn.gemm.frost.tile_config import _sm_smem_budget_bytes
+
+    E, S, N, K = 2, 256, 256, 256
+    graph = _sm120_many_weight_moe_graph(num_weights, E, S, N, K)
+    chain = analyze(graph)
+    cfg = by_name(cfg_name)
+    tmpl = select_template(chain, cfg)
+    assert tmpl.accepts(chain, cfg) is None
+    C.probe_chain(chain, cfg)
+    stages = tmpl.multi_gemm_ab_stages(chain, cfg)[0]
+    assert stages >= 1 and tmpl.multi_gemm_smem_bytes(chain, cfg, stages) <= _sm_smem_budget_bytes()
+    compiled = _plan(graph, config=cfg)
+    torch.manual_seed(23)
+    token = torch.randint(-2, 3, (1, S, K), device="cuda").to(torch.bfloat16)
+    weights = [torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16) for _ in range(num_weights)]
+    offsets = torch.tensor([0, 100, S], dtype=torch.int32, device="cuda")
+    out = torch.full((1, S, N), float("nan"), device="cuda")
+    compiled(_vp_mg(compiled, [(token, w) for w in weights], out, fto=offsets))
+    torch.cuda.synchronize()
+    ref = torch.zeros(S, N, dtype=torch.float64, device="cuda")
+    for gi, (b, e) in enumerate(((0, 100), (100, S))):
+        for w in weights:
+            ref[b:e] += token[0, b:e].double() @ w[gi % E].double().T
+    torch.testing.assert_close(out[0].double(), ref, atol=0, rtol=0)
+
+
+@requires_sm120
+def test_sm120_dual_moe_raw_output_tapped_beside_the_epilogue_is_declined() -> None:
+    """A dual MoE SwiGLU whose first GEMM's own result is also a graph output: the
+    analyzer lowers no per-GEMM output beside the fused epilogue and dropped it
+    without a word, so the plan ran and left that output unwritten. check_support
+    and the build both decline it now."""
+    from cudnn.gemm.frost import compiler as C
+
+    E, S, N, K = 4, 256, 128, 128
+    graph = _build_graph(E, S, N, K, E)
+    moe0 = next(node for node in graph.nodes if node.name == "moe0").outputs["OUT_0"]
+    moe0.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    with pytest.raises(NotImplementedError, match="GEMM 'moe0'"):
+        C.probe_supported(graph)
+    with pytest.raises(NotImplementedError, match="GEMM 'moe0'"):
+        C.jit_from_cudnn_graph(graph, config=by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))

@@ -633,7 +633,7 @@ def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
     return a_rt, b_rt, sfa_log, sfb_log, ref, bs, sf_dt, a_dt
 
 
-@requires_sm100
+@requires_sm120
 @pytest.mark.parametrize(
     "combo,a_dtype,b_dtype,out_dtype",
     [
@@ -645,21 +645,18 @@ def _make_block_scale_inputs(combo, M, N, K, dev="cuda"):
         ("mxfp8", "fp8_e5m2", "fp8_e4m3", "bf16"),
     ],
 )
-@pytest.mark.parametrize("profile_device", ["b200", "rubin"])
-def test_block_scale_eight_public_plans_replay(monkeypatch, profile_device, combo, a_dtype, b_dtype, out_dtype):
-    from gemm_test_utils import skip_unless_pipeline_active
+def test_block_scale_eight_public_plans_replay(monkeypatch, combo, a_dtype, b_dtype, out_dtype):
     from cudnn.engines import is_python_engine
     from cudnn.gemm.frost import planning, tile_config
     from cudnn.gemm.frost.dtypes import CUDNN_FROM_DTYPE
     from cudnn.gemm.frost.knobs import GemmKnobs
 
-    skip_unless_pipeline_active(by_name(_SPLITK_BS_CFG))
-    if profile_device == "b200":
-        monkeypatch.setattr(planning, "current_device_properties", lambda: planning.DeviceProperties(100, "NVIDIA B200", 148, 132644864))
-        monkeypatch.setattr(tile_config, "_sm_count", lambda: 148)
-        monkeypatch.setattr(C, "_sm_count", lambda: 148)
-    elif torch.cuda.get_device_capability() != (10, 7):
-        pytest.skip("Rubin profile requires an SM107 GPU")
+    # The calibrated SKU (the profiles match the device name exactly): pin its facts so every
+    # SM12x part plans -- and therefore replays -- the same eight configs.
+    device = planning.DeviceProperties(120, "NVIDIA RTX PRO 6000 Blackwell Server Edition", 188, 134217728)
+    monkeypatch.setattr(planning, "current_device_properties", lambda: device)
+    monkeypatch.setattr(tile_config, "_sm_count", lambda: 188)
+    monkeypatch.setattr(C, "_sm_count", lambda: 188)
     m, n, k = 192, 160, 4160
     torch.manual_seed(919)
     a, b, sfa, sfb, reference, bs, sf_dt, _ = _make_block_scale_inputs(combo, m, n, k)
@@ -682,13 +679,17 @@ def test_block_scale_eight_public_plans_replay(monkeypatch, profile_device, comb
         return g, binding
 
     g, _ = graph()
+    chain = analyze(g)
+    expected = "rtx_pro_6000_block_f8" if combo == "mxfp8" else "rtx_pro_6000_block_f4"
+    assert planning.profile_for(chain, C._baseline_config(chain), device).name == expected
     g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
     records = [g.get_engine_and_knobs_at_index(i) for i in range(g.get_execution_plan_count())]
     records = [(engine, knobs) for engine, knobs in records if is_python_engine(engine)]
     assert len(records) == 8
-    assert len({GemmKnobs.from_public(knobs).to_config() for _, knobs in records}) == 8
-    if profile_device == "rubin":
-        assert all(GemmKnobs.from_public(knobs).to_config().mma_tile_k_bytes == 64 for _, knobs in records)
+    configs = [GemmKnobs.from_public(knobs).to_config() for _, knobs in records]
+    assert len(set(configs)) == 8
+    # sm120 facts in place of the parent's MMA-K check: warp-MMA configs with the block-scale K tile.
+    assert all(cfg.pipeline == "sm120" and cfg.cta_tile_k_bytes == 128 for cfg in configs)
     for engine, knobs in records:
         replay, binding = graph()
         replay.create_execution_plan(engine, knobs)
@@ -703,6 +704,130 @@ def test_block_scale_eight_public_plans_replay(monkeypatch, profile_device, comb
         replay.execute_plan_at_index(pack, workspace, index=index)
         torch.cuda.synchronize()
         torch.testing.assert_close(y[0], reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("b_major", ["k", "n"], ids=["b_kmajor", "b_nmajor"])
+@pytest.mark.parametrize(
+    "a_dt,b_dt",
+    [
+        (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E4M3),
+        (cudnn.data_type.FP8_E5M2, cudnn.data_type.FP8_E5M2),
+        (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2),
+        (cudnn.data_type.FP8_E5M2, cudnn.data_type.FP8_E4M3),
+    ],
+    ids=["e4m3xe4m3", "e5m2xe5m2", "e4m3xe5m2", "e5m2xe4m3"],
+)
+def test_rtx_pro_6000_block_f8_profile_governs_mxfp8(a_dt, b_dt, b_major):
+    """Host-only. The calibrated SKU's MXFP8 profile governs every fp8 pairing at E8M0 / 32
+    (and an N-major B, the relaxation the SKU's profiles opt into), proposes eight distinct
+    block-scale-legal warp-MMA strategies, and stays behind the exact device-name gate: another
+    SM12x part keeps the rule-based single plan. NVFP4 and dense fp8 keep their own rows."""
+    from cudnn.gemm.frost import planning
+
+    server = planning.DeviceProperties(120, "NVIDIA RTX PRO 6000 Blackwell Server Edition", 188, 134217728)
+    baseline = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    chain = analyze(_build_nvfp4_graph(192, 160, 4160, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=a_dt, b_dt=b_dt, b_major=b_major))
+    profile = planning.profile_for(chain, baseline, server)
+    assert profile is not None and profile.name == "rtx_pro_6000_block_f8"
+    for other in (
+        dataclasses.replace(server, name="NVIDIA RTX PRO 6000 Blackwell Workstation Edition"),
+        dataclasses.replace(server, name="NVIDIA GeForce RTX 5090", sm_count=170),
+        dataclasses.replace(server, arch=121),
+    ):
+        assert planning.profile_for(chain, baseline, other) is None
+        assert planning.select_strategies(chain, baseline, probe=lambda c, cfg: None, device=other) == [baseline]
+    configs = planning.candidate_configs(chain, baseline, server, profile)
+    for cfg in configs:
+        assert cfg.pipeline == "sm120" and cfg.cta_tile_k_bytes == 128
+        validate_block_scale_config_sm120(cfg, 32, cfg.cta_tile_k_bytes)
+    # A K-major pair is planned in both orientations (swap-AB is one of the ranked alternatives).
+    # An N-major B pins no orientation: every candidate is block-scale legal (checked above).
+    if b_major == "k":
+        assert {cfg.swap_ab for cfg in configs} == {False, True}
+    plans = planning.select_strategies(chain, baseline, probe=lambda c, cfg: None, device=server)
+    assert len(plans) == len(set(plans)) == 8 and set(plans) <= set(configs)
+    nvfp4 = analyze(_build_nvfp4_graph(192, 160, 4160, block_size=16))
+    assert planning.profile_for(nvfp4, baseline, server).name == "rtx_pro_6000_block_f4"
+    dense = dataclasses.replace(chain, block_scale=None)
+    assert planning.profile_for(dense, baseline, server) is not profile
+
+
+@requires_sm120
+@pytest.mark.parametrize("M,N,K", [(256, 1000, 2048), (1000, 3000, 5024)])
+def test_rtx_pro_6000_block_f8_profile_keeps_an_unservable_graphs_decline(monkeypatch, M, N, K):
+    """A governed MXFP8 graph that no FROST config serves -- an N-major fp8 B whose N is not a
+    multiple of 16 breaks the 16-byte TMA rule for every geometry -- keeps the decline it gets
+    without the profile: the rule-based baseline's own reason, type and message, through every
+    entry point (plan_config / plan_configs, the engine's eligibility probe, build_gemm_plan),
+    not the planner's generic "no supported joint strategy candidate"."""
+    import cudnn.gemm.frost as frost
+    from cudnn.gemm.frost import planning, tile_config
+
+    device = planning.DeviceProperties(120, "NVIDIA RTX PRO 6000 Blackwell Server Edition", 188, 134217728)
+    monkeypatch.setattr(planning, "current_device_properties", lambda: device)
+    monkeypatch.setattr(tile_config, "_sm_count", lambda: 188)
+    monkeypatch.setattr(C, "_sm_count", lambda: 188)
+
+    def graph():
+        return _build_nvfp4_graph(M, N, K, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3, b_major="n")
+
+    chain = analyze(graph())
+    baseline = C._baseline_config(chain)
+    profile = planning.profile_for(chain, baseline, device)
+    assert profile is not None and profile.name == "rtx_pro_6000_block_f8"
+    # Without the profile: the baseline and its own decline (what every entry point raised before).
+    with monkeypatch.context() as m:
+        m.delitem(planning._PROFILES, (120, "sm120", "fp32", 8, 8, 16, True))
+        assert C.plan_config(chain) == baseline
+        with pytest.raises(ValueError, match="16-byte aligned") as unprofiled:
+            C.probe_chain(chain, baseline)
+    expected = str(unprofiled.value)
+    for plan in (C.plan_config, C.plan_configs):
+        with pytest.raises(ValueError) as governed:
+            plan(chain)
+        assert str(governed.value) == expected
+    assert frost.probe_gemm_plan(graph()) is False
+    with pytest.raises(ValueError) as built:
+        frost.build_gemm_plan(graph())
+    assert str(built.value) == expected
+
+
+def test_sm120_planner_surfaces_the_baseline_decline_when_no_candidate_serves():
+    """Host-only planner rule for a family baseline: when the probe declines every candidate the
+    profile proposes, the baseline's own decline propagates (type and message) -- whatever the
+    other candidates declined with; a probe bug still propagates untouched, and one served
+    candidate is still chosen."""
+    from cudnn.gemm.frost import planning
+
+    server = planning.DeviceProperties(120, "NVIDIA RTX PRO 6000 Blackwell Server Edition", 188, 134217728)
+    baseline = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    chain = analyze(_build_nvfp4_graph(192, 160, 4160, block_size=32, sf_dt=cudnn.data_type.FP8_E8M0, a_dt=cudnn.data_type.FP8_E4M3))
+    assert planning.profile_for(chain, baseline, server).name == "rtx_pro_6000_block_f8"
+
+    class BaselineDecline(ValueError):
+        pass
+
+    def probe(_chain, cfg):
+        if cfg == baseline:
+            raise BaselineDecline(f"the baseline's own reason ({cfg.name})")
+        raise NotImplementedError(f"another candidate's reason ({cfg.name})")
+
+    for select in (planning.select_strategies, planning.select_strategy):
+        with pytest.raises(BaselineDecline, match=re.escape(f"the baseline's own reason ({baseline.name})")):
+            select(chain, baseline, probe=probe, device=server)
+
+    def buggy(_chain, cfg):
+        raise RuntimeError("probe bug")
+
+    with pytest.raises(RuntimeError, match="probe bug"):
+        planning.select_strategies(chain, baseline, probe=buggy, device=server)
+    served = next(cfg for cfg in planning.candidate_configs(chain, baseline, server, planning.profile_for(chain, baseline, server)) if cfg != baseline)
+
+    def one_served(_chain, cfg):
+        if cfg != served:
+            raise NotImplementedError("declined")
+
+    assert planning.select_strategies(chain, baseline, probe=one_served, device=server) == [served]
 
 
 def _splitk_workspace(compiled):
@@ -1357,7 +1482,7 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
     _assert_block_scale_reduction_close(c_red, red_ref, mode)
 
 
-@_GPU
+@requires_sm120
 @pytest.mark.parametrize(
     "mode",
     [
@@ -1373,21 +1498,21 @@ def _run_bs_reduction_numeric(combo, config_name, M, N, K, mode, red_dims, red_s
     [
         (
             "nvfp4",
-            "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma",
+            "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
             128,
             128,
             256,
         ),
         (
             "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+            "CONFIG_sm120_128x256x128_16x16x32_cluster1x1_warps2x4",
             256,
             256,
             512,
         ),
         (
             "nvfp4",
-            "CONFIG_sm100_128x256x128_128x256x32_cluster4x2_2ctamma",
+            "CONFIG_sm120_128x256x128_16x16x32_cluster1x1_warps8x1",
             512,
             512,
             512,
@@ -1408,15 +1533,24 @@ def test_block_scale_matmul_reduction_scalar(mode, combo, config_name, M, N, K):
     )
 
 
-@_GPU
+@requires_sm120
 def test_block_scale_matmul_splitk_reduction():
     """The reduction atomics run in the reducer, once per output element."""
     _run_bs_reduction_numeric(
-        "nvfp4", _SPLITK_BS_CFG, 256, 256, 4096, cudnn.reduction_mode.AMAX, red_dims=[1, 1, 1], red_stride=None, ref_dims=(0, 1, 2), split_k=4
+        "nvfp4",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2",
+        256,
+        256,
+        4096,
+        cudnn.reduction_mode.AMAX,
+        red_dims=[1, 1, 1],
+        red_stride=None,
+        ref_dims=(0, 1, 2),
+        split_k=4,
     )
 
 
-@_GPU
+@requires_sm120
 @pytest.mark.parametrize(
     "mode,red_dims,red_stride,ref_dims",
     [
@@ -1428,7 +1562,7 @@ def test_block_scale_matmul_splitk_reduction():
 def test_block_scale_matmul_reduction_strided_output(mode, red_dims, red_stride, ref_dims):
     _run_bs_reduction_numeric(
         "nvfp4",
-        "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma",
+        "CONFIG_sm120_128x256x128_16x16x32_cluster1x1_warps2x4",
         256,
         256,
         512,
@@ -1450,7 +1584,7 @@ def test_block_scale_matmul_reduction_rejects_int32():
         red_compute_dtype=cudnn.data_type.INT32,
     )
     with pytest.raises(NotImplementedError, match="fp32 compute/output"):
-        jit_from_cudnn_graph(g, **_kw("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"))
+        jit_from_cudnn_graph(g, **_kw("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))
 
 
 @_GPU
@@ -2543,12 +2677,14 @@ def test_sm107_block_scale_matmul_quant_epilogue(config_name):
     )
 
 
-@requires_sm107
+@requires_sm120
 @pytest.mark.parametrize("mode", [cudnn.reduction_mode.ADD, cudnn.reduction_mode.AMAX], ids=("add", "amax"))
-def test_sm107_block_scale_matmul_reduction_scalar(mode):
+def test_sm120_block_scale_matmul_reduction_scalar(mode):
+    # The parent's 64-byte-K MMA row; sm120 has only the 32-byte-K warp MMA, so
+    # here it is one more warp grid.
     _run_bs_reduction_numeric(
         "nvfp4",
-        _SM107_128 + "_1ctamma",
+        "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps1x8",
         128,
         128,
         256,
@@ -2715,15 +2851,18 @@ def test_gpu_gated_cases_are_narrowed_everywhere():
     rejection. The registry cannot derive this, so it is pinned here."""
     from cudnn.gemm.frost.kernel_registry import GraphType as _GT, MMA_GPU_ARCH_SPECIAL_CASES, MMA_TYPE_SUPPORT, _bs_key
 
+    # sm120 serves fp4 + e4m3 at block 32 on every SM 12.x part (its 4X ue4m3 warp MMA reads each
+    # scale twice), pinned to [120, 130) like all of its block-scale rows.
+    support = {pipeline: by_type for pipeline, by_type in MMA_TYPE_SUPPORT.items() if pipeline != "sm120"}
     gated = [
         (pipeline, _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk))
-        for pipeline, by_type in MMA_TYPE_SUPPORT.items()
+        for pipeline, by_type in support.items()
         for sf, blk in _GPU_GATED_FP4_CASES
         if _bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk) in by_type.get(_GT.BLOCK_SCALE_MATMUL, ())
     ]
     carriers = [
         pipeline
-        for pipeline, by_type in MMA_TYPE_SUPPORT.items()
+        for pipeline, by_type in support.items()
         if any(_bs_key("fp4_e2m1", sf, "fp4_e2m1", sf, blk) in by_type.get(_GT.BLOCK_SCALE_MATMUL, ()) for sf, blk in _GPU_GATED_FP4_CASES)
     ]
     assert carriers, "no pipeline carries the GPU-gated fp4 cases — the invariant lost its subject"
@@ -2908,9 +3047,10 @@ def test_sm120_block_scale_registry_wiring():
     assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 16) in cases  # nvfp4
     assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 32) in cases  # mxfp4
     assert _bs_key("fp8_e4m3", "fp8_e8m0", "fp8_e5m2", "fp8_e8m0", 32) in cases  # mxfp8 mix
-    # No warp-MMA kind: fp4 + e8m0 at block 16, fp4 + e4m3 at block 32, e5m3 scales.
-    assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16) not in cases
-    assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32) not in cases
+    # fp4 + e8m0 at block 16 (4X ue8m0) and fp4 + e4m3 at block 32 (4X ue4m3, each scale read twice)
+    # are rows too -- the MoE block-scale templates issue them; no warp-MMA kind for e5m3 scales.
+    assert _bs_key("fp4_e2m1", "fp8_e8m0", "fp4_e2m1", "fp8_e8m0", 16) in cases
+    assert _bs_key("fp4_e2m1", "fp8_e4m3", "fp4_e2m1", "fp8_e4m3", 32) in cases
     assert not any(k[1] == "fp8_e5m3" for k in cases)
     # The renderer's instruction table mirrors the support table exactly.
     assert set(C120._SM120_BLOCK_SCALE_MMA) == {(k[0] == "fp4_e2m1", k[2][1], k[1]) for k in cases}
@@ -2940,7 +3080,7 @@ def test_sm120_block_scale_registry_wiring():
     # block-scale MMA special case (100 <= sm < 120) -- never the wiring itself.
     assert reason is None or "runs only on" in reason or "exists only on 120 <= SM < 130" in reason, reason
 
-    # fp4 + e8m0 at block 16 is refused by the MMA-type table ...
+    # fp4 + e8m0 at block 16 is refused for this template (Sm120KernelTemplate.block_scale_form_reject) ...
     chain16 = analyze(_build_nvfp4_graph(256, 256, 512, block_size=16, sf_dt=cudnn.data_type.FP8_E8M0))
     assert "does not support" in mma_arch_reject(chain16, GraphType.BLOCK_SCALE_MATMUL, "sm120")
     # ... MN-major fp4 by the template class (a 4-bit operand has no transposed ldmatrix) ...
@@ -3130,3 +3270,522 @@ def test_sm120_fp4_rejects_non_k_major():
         g = _build_nvfp4_graph(256, 256, 256, a_major=a_major, b_major=b_major)
         with pytest.raises((ValueError, NotImplementedError), match="must be K-major"):
             jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions for the dense block-scale template: fp32 reduction
+# epilogues (every mode the emitters carry, scalar / per-row / per-col, strided,
+# tails, split-K, reduction-only), one-element N-major epilogue chunks (odd N /
+# odd row stride), and the precheck running the registry's whole funnel.
+# --------------------------------------------------------------------------- #
+
+_BS_GUARD = 256
+_BS_OUT = {"bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16), "fp16": (cudnn.data_type.HALF, torch.float16), "fp32": (cudnn.data_type.FLOAT, torch.float32)}
+
+
+def _sm120_bs_graph(M, N, K, combo, out_dt="fp32", *, ld=None, bias=False, relu=False, red=None, dense_output=True):
+    """A [1, M, K] x [1, K, N] block-scaled matmul [+ per-col bias] [relu] stored
+    at ``out_dt`` with row stride ``ld`` [-> an fp32 reduction ``red`` =
+    (mode, dims, stride or None)]; ``dense_output=False`` keeps only the reduction."""
+    bs = 16 if combo == "nvfp4" else 32
+    data_dt = cudnn.data_type.FP8_E4M3 if combo == "mxfp8" else cudnn.data_type.FP4_E2M1
+    sf_dt = cudnn.data_type.FP8_E4M3 if combo == "nvfp4" else cudnn.data_type.FP8_E8M0
+    sf_k = _ceil_div(K // bs, 4) * 4
+    sf_m, sf_n = _ceil_div(M, 128) * 128, _ceil_div(N, 128) * 128
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    t = {
+        "A": g.tensor(name="A", dim=[1, M, K], stride=[M * K, K, 1], data_type=data_dt),
+        "B": g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K], data_type=data_dt),
+        "SFA": g.tensor(name="SFA", dim=[1, sf_m, sf_k], stride=[sf_m * sf_k, sf_k, 1], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4),
+        "SFB": g.tensor(name="SFB", dim=[1, sf_k, sf_n], stride=[sf_k * sf_n, 1, sf_k], data_type=sf_dt, reordering_type=cudnn.tensor_reordering.F8_128x4),
+    }
+    a = g.block_scale_dequantize(input=t["A"], descale=t["SFA"], block_size=[1, bs])
+    b = g.block_scale_dequantize(input=t["B"], descale=t["SFB"], block_size=[bs, 1])
+    value = g.matmul(A=a, B=b, name="mm")
+    if bias:
+        t["bias"] = g.tensor(name="bias", dim=[1, 1, N], stride=[N, N, 1], data_type=cudnn.data_type.FLOAT)
+        value = g.add(a=value, b=t["bias"], name="badd")
+    if relu:
+        value = g.relu(input=value, name="relu")
+    value.set_data_type(_BS_OUT[out_dt][0])
+    if dense_output:
+        value.set_output(True).set_dim([1, M, N]).set_stride([M * (ld or N), ld or N, 1])
+        t["out"] = value
+    if red is not None:
+        mode, dims, stride = red
+        r = g.reduction(input=value, mode=mode, name="red")
+        r.set_dim(list(dims)).set_stride(list(stride or (dims[1] * dims[2], dims[2], 1))).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+        t["red"] = r
+    return g, t
+
+
+def _sm120_bs_operand(combo, rows, K):
+    """(runtime data, exact fp64 scaled values, logical SF): exactly representable
+    data and scales, so the fp32 accumulation of small products is exact."""
+    bs = 16 if combo == "nvfp4" else 32
+    if combo == "mxfp8":
+        data = torch.randint(-3, 4, (1, rows, K), device="cuda").to(torch.float8_e4m3fn)
+        values = data[0].double()
+    else:
+        u8 = torch.randint(0, 256, (1, rows, K // 2), dtype=torch.uint8, device="cuda")
+        data = u8.view(torch.float4_e2m1fn_x2)
+        values = _unpack_fp4(u8[0], torch.tensor(_E2M1, dtype=torch.float32, device="cuda")).view(rows, K).double()
+    sf = torch.randint(1, 4, (rows, K // bs), device="cuda").to(torch.float8_e4m3fn) if combo == "nvfp4" else _rand_e8m0((rows, K // bs), "cuda")
+    return data, values * sf.double().repeat_interleave(bs, 1), sf
+
+
+def _sm120_bs_run(config_name, M, N, K, combo, out_dt="fp32", *, ld=None, bias=False, relu=False, red=None, dense_output=True, split_k=1):
+    """Build + run; the dense output must be bit-exact with every canary intact
+    (row padding, guard bytes). Returns (compiled, stored dense value in fp64 or
+    the fp64 reference when there is none, reduction buffer)."""
+    g, t = _sm120_bs_graph(M, N, K, combo, out_dt, ld=ld, bias=bias, relu=relu, red=red, dense_output=dense_output)
+    compiled = _plan(g, config=dataclasses.replace(by_name(config_name), split_k_slices=split_k))
+    torch.manual_seed(29)
+    a, a_s, sfa = _sm120_bs_operand(combo, M, K)
+    b, b_s, sfb = _sm120_bs_operand(combo, N, K)
+    x = (a_s @ b_s.t()).unsqueeze(0)
+    vp = {
+        t["A"]: a,
+        t["B"]: b,
+        t["SFA"]: _to_blocked(sfa).view(1, _ceil_div(M, 128) * 128, -1),
+        t["SFB"]: _to_blocked(sfb).view(1, _ceil_div(N, 128) * 128, -1),
+    }
+    if bias:
+        bias_buf = torch.randint(-4, 5, (1, 1, N), device="cuda").float()
+        vp[t["bias"]] = bias_buf
+        x = x + bias_buf.double()
+    if relu:
+        x = x.relu()
+    tdt = _BS_OUT[out_dt][1]
+    if dense_output:
+        pitch = ld or N
+        nbytes = M * pitch * torch.empty((), dtype=tdt).element_size()
+        raw = torch.full((nbytes + 2 * _BS_GUARD,), 0xA5, dtype=torch.uint8, device="cuda")
+        body = raw[_BS_GUARD : _BS_GUARD + nbytes].view(tdt).view(1, M, pitch)
+        vp[t["out"]] = body[:, :, :N]
+    red_buf = None
+    if red is not None:
+        mode, dims, stride = red
+        red_buf = (torch.empty(tuple(dims), device="cuda") if stride is None else torch.empty_strided(tuple(dims), tuple(stride), device="cuda")).fill_(
+            float("nan")
+        )
+        vp[t["red"]] = red_buf
+    ws, _ws_buf = _splitk_workspace(compiled)
+    compiled(vp, workspace=ws)
+    torch.cuda.synchronize()
+    if not dense_output:
+        return compiled, x.to(tdt).double(), red_buf
+    out = body[:, :, :N]
+    torch.testing.assert_close(out.double(), x.to(tdt).double(), atol=0, rtol=0)
+    assert bool((raw[:_BS_GUARD] == 0xA5).all()) and bool((raw[-_BS_GUARD:] == 0xA5).all()), "a store ran past the output"
+    if pitch > N:
+        assert bool((body[:, :, N:].contiguous().view(torch.uint8) == 0xA5).all()), "a store wrote into the row padding"
+    return compiled, out.double(), red_buf
+
+
+def _sm120_bs_red_ref(value, mode, dims):
+    axes = tuple(i for i, d in enumerate(dims) if d == 1 and value.shape[i] != 1)
+    count = 1
+    for ax in axes:
+        count *= value.shape[ax]
+    return {
+        cudnn.reduction_mode.ADD: lambda v: v.sum(dim=axes, keepdim=True),
+        cudnn.reduction_mode.AMAX: lambda v: v.abs().amax(dim=axes, keepdim=True),
+        cudnn.reduction_mode.MAX: lambda v: v.amax(dim=axes, keepdim=True),
+        cudnn.reduction_mode.MIN: lambda v: v.amin(dim=axes, keepdim=True),
+        cudnn.reduction_mode.AVG: lambda v: v.sum(dim=axes, keepdim=True) / count,
+        cudnn.reduction_mode.NORM1: lambda v: v.abs().sum(dim=axes, keepdim=True),
+    }[mode](value)
+
+
+_R = cudnn.reduction_mode
+# id -> (config, M, N, K, mode, dims, stride, split_k, extras); every case runs for nvfp4, mxfp4 and mxfp8.
+_SM120_BS_RED_CASES = {
+    "scalar_avg": (_SM120_BS_128, 256, 256, 512, _R.AVG, [1, 1, 1], None, 1, {}),
+    "scalar_norm1": (_SM120_BS_128, 256, 256, 512, _R.NORM1, [1, 1, 1], None, 1, {}),
+    "per_row_add": (_SM120_BS_64x128, 320, 256, 512, _R.ADD, [1, 320, 1], None, 1, {}),
+    "per_col_max": (_SM120_BS_128_W24, 256, 256, 512, _R.MAX, [1, 1, 256], None, 1, {}),
+    "per_col_min_strided": (_SM120_BS_128, 256, 256, 512, _R.MIN, [1, 1, 256], [0, 0, 2], 1, {}),
+    "tails_scalar_amax": (_SM120_BS_128, 200, 136, 1088, _R.AMAX, [1, 1, 1], None, 1, {}),
+    "tails_per_row_add": (_SM120_BS_128, 200, 136, 1088, _R.ADD, [1, 200, 1], None, 1, {}),
+    "odd_n_per_col_min": (_SM120_BS_128x64, 256, 255, 512, _R.MIN, [1, 1, 255], None, 1, {}),
+    "odd_n_per_row_avg": (_SM120_BS_128, 256, 255, 512, _R.AVG, [1, 256, 1], None, 1, {}),
+    "bias_relu_scalar_amax": (_SM120_BS_128, 256, 256, 512, _R.AMAX, [1, 1, 1], None, 1, {"bias": True, "relu": True}),
+    "splitk3_per_row_add": (_SM120_BS_128_W24, 512, 384, 2048, _R.ADD, [1, 512, 1], None, 3, {}),
+    "splitk4_odd_n_per_col_max": (_SM120_BS_128, 256, 255, 2048, _R.MAX, [1, 1, 255], None, 4, {}),
+    "reduction_only_scalar_amax": (_SM120_BS_128, 256, 200, 512, _R.AMAX, [1, 1, 1], None, 1, {"dense_output": False}),
+}
+
+
+@requires_sm120
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("case", list(_SM120_BS_RED_CASES))
+def test_sm120_block_scale_reduction_epilogues(case, combo):
+    """fp32 reductions fused into the dense block-scale GEMM, against the stored
+    output: the max-like modes are exact; ADD / AVG / NORM1 sum fp32 atomics in
+    another order than the fp64 reference, so they get 1e-5 of the result's
+    magnitude (measured: <= 5e-7)."""
+    config_name, M, N, K, mode, dims, stride, split_k, extras = _SM120_BS_RED_CASES[case]
+    compiled, value, red = _sm120_bs_run(config_name, M, N, K, combo, red=(mode, dims, stride), split_k=split_k, **extras)
+    assert compiled.chain.reductions and compiled.block_scale
+    want = _sm120_bs_red_ref(value, mode, dims)
+    atol = 1e-5 * max(1.0, float(want.abs().max())) if mode in (_R.ADD, _R.AVG, _R.NORM1) else 0
+    torch.testing.assert_close(red.double(), want, atol=atol, rtol=0)
+
+
+@requires_sm120
+def test_sm120_block_scale_quant_epilogue_is_declined():
+    """block_scale_quantize stays declined on the dense block-scale template --
+    with the sm120 reason, at the probe, the build and in the registry funnel
+    alike (kernel_registry.candidates() lists none of its plans) -- and only for
+    this template's own configs: another family's config keeps the reason that
+    family's gates give it (here the active GPU's SM range)."""
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.tile_config import CATALOG
+
+    reason = "block-scale quant epilogue is not supported on the sm120 dense block-scale template.*row-per-lane drain"
+    g = _build_block_scale_quant_graph(256, 256, 512, dequant_block_size=32)
+    chain = analyze(g)
+    for call in (lambda: C.probe_chain(chain, by_name(_SM120_BS_128)), lambda: jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))):
+        with pytest.raises(NotImplementedError, match=reason):
+            call()
+    funnel = select_template(chain, by_name(_SM120_BS_128)).accepts(chain, by_name(_SM120_BS_128))
+    assert funnel is not None and re.search(reason, funnel), funnel
+    assert not [c for _t, c in R.candidates(chain, sweep_swap_ab=True) if c.pipeline == "sm120"]
+    foreign = []
+    for cfg in (c for c in CATALOG if c.pipeline != "sm120"):
+        try:
+            C.probe_chain(chain, cfg)
+        except (NotImplementedError, ValueError) as e:
+            foreign.append(str(e))
+        if len(foreign) == 8:
+            break
+    assert foreign and not any("sm120 dense block-scale template" in r for r in foreign), foreign[:2]
+    assert any("runs only on" in r for r in foreign), foreign[:2]
+
+
+_SM120_BS_ODD_CASES = {
+    # id -> (config, M, N, K, output dtype, row stride, split_k, extras)
+    "bf16_N255": (_SM120_BS_128, 256, 255, 512, "bf16", None, 1, {}),
+    "bf16_N129_ld131": (_SM120_BS_128_W24, 200, 129, 512, "bf16", 131, 1, {}),
+    "fp32_N255_128x64": (_SM120_BS_128x64, 200, 255, 512, "fp32", None, 1, {}),
+    "fp16_N129_bias_relu": (_SM120_BS_128, 256, 129, 512, "fp16", None, 1, {"bias": True, "relu": True}),
+    "fp32_N255_splitk4": (_SM120_BS_128, 256, 255, 2048, "fp32", None, 4, {}),
+    "bf16_N255_ld257_splitk3": (_SM120_BS_128_W24, 256, 255, 2048, "bf16", 257, 3, {}),
+}
+
+
+@requires_sm120
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+@pytest.mark.parametrize("case", list(_SM120_BS_ODD_CASES))
+def test_sm120_block_scale_one_element_epilogue_chunks(case, combo):
+    """An N-major output with odd N or an odd row stride drains one element per
+    chunk, bit-exact with nothing written outside the output, and the funnel
+    accepts the plan the precheck builds."""
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+
+    config_name, M, N, K, out_dt, ld, split_k, extras = _SM120_BS_ODD_CASES[case]
+    compiled, _value, _red = _sm120_bs_run(config_name, M, N, K, combo, out_dt, ld=ld, split_k=split_k, **extras)
+    if split_k == 1:
+        assert compiled._compiled.vec_bytes_epi == DTYPE_BYTES[compiled.chain.output_dtype]  # one element per chunk
+    cfg = compiled._compiled.config
+    assert select_template(compiled.chain, cfg).accepts(compiled.chain, cfg) is None
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "case",
+    ["odd_n_bf16", "odd_ld_bf16", "scalar_amax", "per_col_add_strided"],
+)
+def test_sm120_block_scale_probe_and_funnel_agree(case):
+    """probe_chain (check_support / heuristics / build) and kernel_registry.accepts()
+    (candidates) agree on every sm120 catalog point: the precheck ends in the
+    registry's whole funnel. They used to disagree both ways -- the funnel
+    declined odd-N plans the probe listed, and accepted reduction plans the probe
+    declined."""
+    from cudnn.gemm.frost import kernel_registry as R
+
+    graph = {
+        "odd_n_bf16": lambda: _sm120_bs_graph(256, 255, 512, "nvfp4", "bf16"),
+        "odd_ld_bf16": lambda: _sm120_bs_graph(256, 128, 512, "mxfp8", "bf16", ld=129),
+        "scalar_amax": lambda: _sm120_bs_graph(256, 256, 512, "nvfp4", red=(_R.AMAX, [1, 1, 1], None)),
+        "per_col_add_strided": lambda: _sm120_bs_graph(256, 256, 512, "mxfp4", red=(_R.ADD, [1, 1, 256], [0, 0, 2])),
+    }[case]()[0]
+    chain = analyze(graph)
+    sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
+    assert any(c.pipeline == "sm120" for _t, c in R.candidates(chain))
+    disagree = []
+    for cfg in sm120:
+        funnel = select_template(chain, cfg).accepts(chain, cfg)
+        try:
+            C.probe_chain(chain, cfg)
+            probe = None
+        except (NotImplementedError, ValueError) as e:
+            probe = str(e)
+        if (funnel is None) != (probe is None):
+            disagree.append((cfg.name, funnel, probe))
+    assert not disagree, disagree[:3]
+
+
+@requires_sm120
+def test_sm120_block_scale_fp4_output_is_declined_at_probe():
+    """A plain packed-fp4 output: the funnel declined it while the probe listed
+    the plan, whose build then failed with a TypeError (no fallback to another
+    engine). The precheck now runs the funnel, so probe, check_support and build
+    all decline it with the template's reason."""
+    g, t = _sm120_bs_graph(256, 256, 512, "nvfp4", "bf16")
+    t["out"].set_data_type(cudnn.data_type.FP4_E2M1)
+    cfg = by_name(_SM120_BS_128)
+    for call in (lambda: C.probe_chain(analyze(g), cfg), lambda: C.probe_supported(g, cfg), lambda: jit_from_cudnn_graph(g, config=cfg)):
+        with pytest.raises(NotImplementedError, match="sm120_block_scale_matmul.py does not support fp4 output"):
+            call()
+
+
+@requires_sm120
+def test_sm120_block_scale_precheck_consults_the_template_scope(monkeypatch):
+    """A rule in Sm120KernelTemplate._extra_reject gates the dense block-scale
+    probe and build, not only the registry funnel."""
+    from cudnn.gemm.frost import kernel_registry as R
+
+    monkeypatch.setattr(R.Sm120KernelTemplate, "_extra_reject", lambda self, chain, config: "sentinel template-scope rule" if chain.has_block_scale else None)
+    g, _t = _sm120_bs_graph(256, 256, 512, "nvfp4", "bf16")
+    with pytest.raises(NotImplementedError, match="sentinel template-scope rule"):
+        C.probe_chain(analyze(g), by_name(_SM120_BS_128))
+    with pytest.raises(NotImplementedError, match="sentinel template-scope rule"):
+        jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+
+
+@requires_sm120
+def test_sm120_block_scale_per_batch_reduction():
+    """A batched block-scale GEMM with a per-batch AMAX (dims (B, 1, 1)): exact."""
+    B, M, N, K, bs = 2, 256, 256, 512, 16
+    sf_k = K // bs
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    fp4, e4m3 = cudnn.data_type.FP4_E2M1, cudnn.data_type.FP8_E4M3
+    reorder = cudnn.tensor_reordering.F8_128x4
+    A = g.tensor(name="A", dim=[B, M, K], stride=[M * K, K, 1], data_type=fp4)
+    Bt = g.tensor(name="B", dim=[B, K, N], stride=[K * N, 1, K], data_type=fp4)
+    SFA = g.tensor(name="SFA", dim=[B, M, sf_k], stride=[M * sf_k, sf_k, 1], data_type=e4m3, reordering_type=reorder)
+    SFB = g.tensor(name="SFB", dim=[B, sf_k, N], stride=[sf_k * N, 1, sf_k], data_type=e4m3, reordering_type=reorder)
+    a_d = g.block_scale_dequantize(input=A, descale=SFA, block_size=[1, bs])
+    b_d = g.block_scale_dequantize(input=Bt, descale=SFB, block_size=[bs, 1])
+    D = g.matmul(A=a_d, B=b_d, name="mm")
+    D.set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    R = g.reduction(input=D, mode=cudnn.reduction_mode.AMAX, name="red")
+    R.set_dim([B, 1, 1]).set_stride([1, 1, 1]).set_output(True).set_data_type(cudnn.data_type.FLOAT)
+    compiled = jit_from_cudnn_graph(g, **_kw(_SM120_BS_128))
+    torch.manual_seed(37)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device="cuda")
+    a_u8 = torch.randint(0, 256, (B, M, K // 2), dtype=torch.uint8, device="cuda")
+    b_u8 = torch.randint(0, 256, (B, N, K // 2), dtype=torch.uint8, device="cuda")
+    sfa = torch.randint(1, 4, (B, M, sf_k), device="cuda").to(torch.float8_e4m3fn)
+    sfb = torch.randint(1, 4, (B, N, sf_k), device="cuda").to(torch.float8_e4m3fn)
+    out = torch.full((B, M, N), float("nan"), device="cuda")
+    red = torch.full((B, 1, 1), float("nan"), device="cuda")
+    compiled(
+        {
+            A: a_u8.view(torch.float4_e2m1fn_x2),
+            Bt: b_u8.view(torch.float4_e2m1fn_x2),
+            SFA: torch.stack([_to_blocked(sfa[i]) for i in range(B)]).view(B, M, -1),
+            SFB: torch.stack([_to_blocked(sfb[i]) for i in range(B)]).view(B, N, -1),
+            D: out,
+            R: red,
+        }
+    )
+    torch.cuda.synchronize()
+    a_s = _unpack_fp4(a_u8, lut).view(B, M, K).double() * sfa.double().repeat_interleave(bs, -1)
+    b_s = _unpack_fp4(b_u8, lut).view(B, N, K).double() * sfb.double().repeat_interleave(bs, -1)
+    x = torch.einsum("bmk,bnk->bmn", a_s, b_s)
+    torch.testing.assert_close(out.double(), x, atol=0, rtol=0)
+    torch.testing.assert_close(red.double(), x.abs().amax(dim=(1, 2), keepdim=True), atol=0, rtol=0)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "combo,mode,dims",
+    [("nvfp4", _R.AMAX, [1, 1, 1]), ("mxfp8", _R.ADD, [1, 256, 1]), ("mxfp4", _R.MAX, [1, 1, 384])],
+    ids=["nvfp4_scalar_amax", "mxfp8_per_row_add", "mxfp4_per_col_max"],
+)
+def test_sm120_block_scale_reduction_public_graph_runs_the_frost_plan(combo, mode, dims):
+    """Through the public graph API (create_execution_plans -> check_support ->
+    build_plans -> execute) a block-scale GEMM with a fused fp32 reduction lists
+    and runs a FROST plan."""
+    from cudnn.engines import is_python_engine
+
+    M, N, K = 256, 384, 512
+    g, t = _sm120_bs_graph(M, N, K, combo, red=(mode, dims, None))
+    g.validate()
+    g.build_operation_graph()
+    g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    frost = [i for i, plan in enumerate(g.plans) if is_python_engine(plan.engine_id)]
+    assert frost, "no FROST plan listed for a block-scale GEMM with a reduction epilogue"
+    g.select_plan(frost[0])
+    g.check_support()
+    g.build_plans()
+    torch.manual_seed(41)
+    a, a_s, sfa = _sm120_bs_operand(combo, M, K)
+    b, b_s, sfb = _sm120_bs_operand(combo, N, K)
+    out = torch.full((1, M, N), float("nan"), device="cuda")
+    red = torch.full(tuple(dims), float("nan"), device="cuda")
+    vp = {t["A"]: a, t["B"]: b, t["SFA"]: _to_blocked(sfa).view(1, M, -1), t["SFB"]: _to_blocked(sfb).view(1, N, -1), t["out"]: out, t["red"]: red}
+    g.execute(vp, torch.empty(max(g.get_workspace_size(), 1), dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    x = (a_s @ b_s.t()).unsqueeze(0)
+    torch.testing.assert_close(out.double(), x, atol=0, rtol=0)
+    want = _sm120_bs_red_ref(out.double(), mode, dims)
+    atol = 1e-5 * max(1.0, float(want.abs().max())) if mode == _R.ADD else 0
+    torch.testing.assert_close(red.double(), want, atol=atol, rtol=0)
+
+
+@requires_sm120
+@pytest.mark.parametrize("combo,M,N,K", [("nvfp4", 64, 8192, 4096), ("mxfp8", 128, 7168, 2048), ("nvfp4", 128, 4096, 7168), ("mxfp8", 256, 2048, 8192)])
+def test_sm120_block_scale_auto_pick_keeps_the_split_k_reducer_within_its_bounds(monkeypatch, combo, M, N, K):
+    """The automatic plan of a small-M block-scale GEMM with an fp32 reduction is
+    probe-accepted and never hands the split-K reducer what it serializes on: an
+    M- or N-reduced MUL (a CAS loop per vector / element), a per-row sum past
+    ``_SPLITK_ROW_SUM_MAX_ATOMICS`` same-address atomics a row, or a per-col
+    reduction past ``_SPLITK_COL_FOLD_MAX_OUTPUTS_PER_K_BYTE`` outputs per byte of
+    K (one atomic each) -- the unsplit kernel folds all of them in registers. The
+    bounds are tuning constants measured offline; the test reads them. Non-vacuous:
+    the same GEMM with a per-row AMAX is split."""
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    monkeypatch.setattr(C, "_sm_count", lambda: 188)
+    k_bytes = K // 2 if combo in ("nvfp4", "mxfp4") else K
+
+    def plan(mode, axis):
+        dims = [1, M, 1] if axis == "row" else [1, 1, N]
+        chain = analyze(_sm120_bs_graph(M, N, K, combo, out_dt="bf16", red=(mode, dims, None))[0])
+        cfg = C.plan_config(chain)
+        C.probe_chain(chain, cfg)
+        return chain, cfg
+
+    assert plan(_R.AMAX, "row")[1].split_k_slices > 1, "the control GEMM is not split at all"
+    for mode in (_R.ADD, _R.AVG, _R.NORM1, _R.AMAX, _R.MAX, _R.MIN, _R.MUL, _R.MUL_NO_ZEROS):
+        for axis in ("row", "col"):
+            chain, cfg = plan(mode, axis)
+            if cfg.split_k_slices == 1:
+                continue
+            assert mode not in (_R.MUL, _R.MUL_NO_ZEROS), (mode, axis, cfg.name)
+            if axis == "col":
+                assert M * N <= C._SPLITK_COL_FOLD_MAX_OUTPUTS_PER_K_BYTE * k_bytes, (mode, cfg.name)
+            elif mode in (_R.ADD, _R.AVG, _R.NORM1):
+                assert N // C._splitk_reduce_elems(chain) <= C._SPLITK_ROW_SUM_MAX_ATOMICS, (mode, cfg.name)
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: per-row / per-col reductions on the dense block-scale
+# template fold in registers and flush one atomic per row / column per warp per
+# tile (they issued one atomic per element / per 8-column run).
+# --------------------------------------------------------------------------- #
+
+_SM120_BS_FOLD_MODES = {
+    "add": _R.ADD,
+    "avg": _R.AVG,
+    "norm1": _R.NORM1,
+    "amax": _R.AMAX,
+    "max": _R.MAX,
+    "min": _R.MIN,
+    "mul": _R.MUL,
+    "mul_no_zeros": _R.MUL_NO_ZEROS,
+}
+_SM120_BS_E2M1_CODE = {0.0: 0, 0.5: 1, 1.0: 2, 2.0: 4, -0.5: 9, -1.0: 10, -2.0: 12}
+
+
+def _sm120_bs_fold_operand(combo, values, K):
+    """(runtime data, logical SF) of a [rows, K] operand whose only nonzero is
+    column 0 = ``values`` (powers of two or 0), under unit block scales."""
+    rows = values.numel()
+    bs = 16 if combo == "nvfp4" else 32
+    if combo == "mxfp8":
+        dense = torch.zeros(1, rows, K, dtype=torch.float64)
+        dense[0, :, 0] = values
+        data = dense.to(torch.float8_e4m3fn).cuda()
+    else:
+        u8 = torch.zeros(1, rows, K // 2, dtype=torch.uint8)
+        u8[0, :, 0] = torch.tensor([_SM120_BS_E2M1_CODE[float(v)] for v in values], dtype=torch.uint8)
+        data = u8.cuda().view(torch.float4_e2m1fn_x2)
+    if combo == "nvfp4":
+        sf = torch.ones(rows, K // bs, device="cuda").to(torch.float8_e4m3fn)
+    else:
+        sf = torch.full((rows, K // bs), 127, dtype=torch.uint8, device="cuda").view(torch.float8_e8m0fnu)
+    return data, sf
+
+
+def _sm120_bs_fold_ref(value, mode, dims):
+    if mode in ("mul", "mul_no_zeros"):
+        v = torch.where(value == 0, torch.ones_like(value), value) if mode == "mul_no_zeros" else value
+        for ax in (i for i, d in enumerate(dims) if d == 1 and value.shape[i] != 1):
+            v = v.prod(dim=ax, keepdim=True)
+        return v
+    return _sm120_bs_red_ref(value, _SM120_BS_FOLD_MODES[mode], dims)
+
+
+def _sm120_bs_run_fold(config_name, M, N, K, combo, mode, dims):
+    """Run one folded reduction (bf16 output stored beside it): exact against the
+    stored output (AVG within 1e-6 of the result's magnitude); MUL operands are a
+    rank-1 product of powers of two whose factor along the reduced axis is a sign,
+    so every partial product is exact and finite."""
+    g, t = _sm120_bs_graph(M, N, K, combo, "bf16", red=(_SM120_BS_FOLD_MODES[mode], list(dims), None))
+    compiled = _plan(g, config=by_name(config_name))
+    gen = torch.Generator().manual_seed(43)
+    if mode in ("mul", "mul_no_zeros"):
+        pow2 = torch.tensor([1.0, -1.0, 1.0, -1.0, 2.0, 0.5, -2.0, -0.5, 0.0], dtype=torch.float64)
+        sign = torch.tensor([1.0, -1.0, 0.0], dtype=torch.float64)
+        by_rows = dims[1] == 1
+        s_set, t_set = (pow2, sign[:2]) if by_rows else (sign, pow2)
+        s = s_set[torch.randint(0, len(s_set), (M,), generator=gen)]
+        tt = t_set[torch.randint(0, len(t_set), (N,), generator=gen)]
+        a, sfa = _sm120_bs_fold_operand(combo, s, K)
+        b, sfb = _sm120_bs_fold_operand(combo, tt, K)
+        x = (s[:, None] * tt[None, :]).unsqueeze(0)
+    else:
+        torch.manual_seed(43)
+        a, a_s, sfa = _sm120_bs_operand(combo, M, K)
+        b, b_s, sfb = _sm120_bs_operand(combo, N, K)
+        x = (a_s @ b_s.t()).unsqueeze(0).cpu()
+    out = torch.full((1, M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    red = torch.full(tuple(dims), float("nan"), device="cuda")
+    vp = {
+        t["A"]: a,
+        t["B"]: b,
+        t["SFA"]: _to_blocked(sfa).view(1, _ceil_div(M, 128) * 128, -1),
+        t["SFB"]: _to_blocked(sfb).view(1, _ceil_div(N, 128) * 128, -1),
+        t["out"]: out,
+        t["red"]: red,
+    }
+    compiled(vp)
+    torch.cuda.synchronize()
+    stored = x.to(torch.bfloat16).double()
+    torch.testing.assert_close(out.double().cpu(), stored, atol=0, rtol=0)
+    want = _sm120_bs_fold_ref(stored, mode, dims)
+    tol = 1e-6 * max(1.0, float(want.abs().max())) if mode == "avg" else 0.0
+    torch.testing.assert_close(red.double().cpu(), want, atol=tol, rtol=0)
+    src = compiled.generated_path.read_text()
+    flush, flush_end = src.index("def red_part_flush_tile("), src.index("def red_part_flush_cta(")
+    tap = f"gC_tap_{len(compiled.chain.output_specs)}_ptr"
+    stray = [ln.strip() for ln in (src[:flush] + src[flush_end:]).splitlines() if "atomic" in ln and tap in ln]
+    assert not stray, f"reduction atomics issued from the drain, not the per-tile flush: {stray[:2]}"
+
+
+@requires_sm120
+@pytest.mark.parametrize("axis", ["row", "col"])
+@pytest.mark.parametrize("mode", list(_SM120_BS_FOLD_MODES))
+@pytest.mark.parametrize("combo", ["nvfp4", "mxfp4", "mxfp8"])
+def test_sm120_block_scale_lane_run_reduction_folds(combo, mode, axis):
+    """Every fold mode per row and per column on an M / N tail (200x136): the
+    folded reduction is exact and issued from the per-tile flush only. Unfolded,
+    an nvfp4 4096^3 GEMM + per-col ADD ran 7.2x and per-col MUL 33x the first
+    native plan's time (FROST is plan 0 for these graphs since G30)."""
+    M, N = 200, 136
+    _sm120_bs_run_fold(_SM120_BS_128, M, N, 256, combo, mode, (1, M, 1) if axis == "row" else (1, 1, N))
+
+
+@requires_sm120
+@pytest.mark.parametrize("axis", ["row", "col"])
+@pytest.mark.parametrize("mode", ["add", "mul"])
+@pytest.mark.parametrize("config_name", [_SM120_BS_128_W24, _SM120_BS_128x64, _SM120_BS_256x128], ids=["128x128_w2x4", "128x64_w4x2", "256x128_w8x1"])
+def test_sm120_block_scale_lane_run_reduction_fold_geometries(config_name, mode, axis):
+    """The fold across warp tiles of 4 / 2 m-fragments and of 1 / 4 column groups."""
+    M, N = 264, 200
+    _sm120_bs_run_fold(config_name, M, N, 512, "nvfp4", mode, (1, M, 1) if axis == "row" else (1, 1, N))

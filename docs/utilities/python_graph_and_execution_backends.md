@@ -1041,7 +1041,7 @@ the wrong arch — a green sweep on one box says nothing about the others:
 |---|---|
 | any GPU (CPU-only logic) | `test_dispatch.py`, `test_graph_native.py`, `test_import_boundaries.py`, `sdpa/frost/test_flashinfer_consumed_surface.py` — the ranking contract, one-shot planning, the at-index APIs, manifest classification, the surface FlashInfer consumes |
 | SM100 | every FROST SDPA-forward cell except sm120; the FROST GEMM family; `linear_attention` (GDN / KDA / GDN-2), which is where the cuTile-vs-FROST pin lives |
-| SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies |
+| SM120 | `sdpa_fwd_prefill_sm120` and its tile rule; `test_mhas_v2` routing tallies; the FROST GEMM family's sm120 tree (warp-level `mma.sync`; dense, block-scale and MoE grouped matmul with fused epilogues): `gemm/frost/sm120/` — the parent suites' sm120 copies, where a case still pinned to an sm100 config skips — plus the parents' own sm120 cases |
 
 Enumerate the device with `torch.cuda.get_device_properties(i).major` and pin
 it with `CUDA_VISIBLE_DEVICES` — CUDA's device order is not `nvidia-smi`'s, and

@@ -393,6 +393,710 @@ def _build_scatter_graph(*, rows=387, n=96, k=96, top_k=3, m_major=False, activa
     return g, x, w, offsets, indices, ks, y
 
 
+def _build_combine_graph(*, m_major=False, output_dt=cudnn.data_type.BFLOAT16, rows=387, tokens=129, n=96):
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    x = g.tensor(name="tokens", dim=[1, rows, 96], stride=[rows * 96, 96, 1])
+    w = g.tensor(name="weights", dim=[3, 96, n], stride=[96 * n, 1, 96])
+    offsets = g.tensor(name="offsets", dim=[7, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    indices = g.tensor(name="indices", dim=[1, rows, 1], stride=[rows, 1, 1], data_type=cudnn.data_type.INT32)
+    ks = g.tensor(name="ks", dim=[1, rows, 1], stride=[rows, 1, 1], data_type=cudnn.data_type.INT32)
+    scores = g.tensor(name="scores", dim=[1, tokens, 3], stride=[tokens * 3, 3, 1], data_type=cudnn.data_type.FLOAT)
+    y = g.moe_grouped_matmul(x, w, offsets, token_index=indices, token_ks=ks, top_k_scores=scores, top_k=3, mode=cudnn.moe_grouped_matmul_mode.COMBINE)
+    y.set_output(True).set_data_type(output_dt)
+    y.set_stride([n * (tokens + 5), 1, tokens + 5] if m_major else [tokens * (n + 16), n + 16, 1])
+    return g, x, w, offsets, indices, ks, scores, y
+
+
+def _jit_combine(compiler, graph, cfg):
+    """A positive COMBINE build: any decline is a failure here (the frost conftest
+    would otherwise report an arch-tree decline message as a skip)."""
+    try:
+        return compiler.jit_from_cudnn_graph(graph, config=cfg)
+    except NotImplementedError as exc:
+        pytest.fail(f"the sm120 tree declined a COMBINE plan it serves: {exc}")
+
+
+def test_combine_shape_binding_and_support():
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    g, x, w, offsets, indices, ks, scores, y = _build_combine_graph()
+    # Build through the public keyword API as well as analyze the graph.
+    z = g.moe_grouped_matmul(x, w, offsets, token_index=indices, token_ks=ks, top_k_scores=scores, top_k=3, mode=cudnn.moe_grouped_matmul_mode.COMBINE)
+    assert z.get_dim() == [1, 129, 96]
+    with pytest.raises(NotImplementedError, match="COMBINE"):
+        analyze(g)  # Two GEMMs cannot share the combined output yet.
+    g, *_, scores, y = _build_combine_graph()
+    g.validate()
+    chain, binding = analyze_with_binding(g)
+    assert chain.moe.mode == "combine" and chain.moe.top_k == 3
+    assert chain.matmul.M == 387 and chain.matmul.out_dtype == "fp32"
+    assert binding.top_k_scores is scores and scores in binding.bound_tensors()
+    assert y.get_dim() == [1, 129, 96]
+    # The parent asserts both arch trees' executable gates; this copy checks the
+    # sm120 one, which admits COMBINE (one GEMM, one fp32/fp16/bf16 output, fp32 acc).
+    C._check_executable(chain)
+    # The frontend can represent the enum; native operation construction declines.
+    cpp = _build_combine_graph()[0]._lower_to_cpp()
+    cpp.validate()
+    assert '"COMBINE"' in repr(cpp)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="COMBINE"):
+        cpp.build_operation_graph()
+    from cudnn._gemm_validate import validate_graph
+
+    scores.set_dim([1, 129, 2])
+    with pytest.raises(ValueError, match="top_k_scores"):
+        validate_graph(g)
+    scores.set_dim([1, 129, 3])
+    y.set_output(False)
+    g.swish(input=y).set_output(True)
+    with pytest.raises(NotImplementedError, match="COMBINE"):
+        analyze(g)
+
+
+@pytest.mark.parametrize("fault", ["missing", "dtype", "shape", "stride", "output", "other_mode"])
+def test_combine_metadata_rejected(fault):
+    g, *_, scores, y = _build_combine_graph()
+    if fault == "missing":
+        g.nodes[0].inputs.pop("top_k_scores")
+    elif fault == "dtype":
+        scores.set_data_type(cudnn.data_type.BFLOAT16)
+    elif fault == "shape":
+        scores.set_dim([1, 129, 2])
+    elif fault == "stride":
+        scores.set_stride([774, 6, 2])
+    elif fault == "output":
+        y.set_dim([1, 387, 96])
+    else:
+        g.nodes[0].params["mode"] = cudnn.moe_grouped_matmul_mode.SCATTER
+    with pytest.raises((ValueError, NotImplementedError), match="top_k_scores|COMBINE"):
+        analyze(g)
+
+
+@requires_sm120
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize("m_major,output_dt", [(False, torch.bfloat16), (False, torch.float16), (True, torch.float16), (False, torch.float32)])
+def test_combine_numerics(swap_ab, m_major, output_dt, monkeypatch):
+    from cuda.bindings import runtime
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.engines.manifest import MANIFEST
+    from cudnn.gemm.frost.knobs import GemmKnobs
+
+    dtype = {torch.bfloat16: cudnn.data_type.BFLOAT16, torch.float16: cudnn.data_type.HALF, torch.float32: cudnn.data_type.FLOAT}[output_dt]
+    g, x, w, offsets, indices, ks, scores, y = _build_combine_graph(m_major=m_major, output_dt=dtype)
+    cfg = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap_ab)
+    compiled = _jit_combine(C, g, cfg)
+    assert compiled.store_modes == ("stg",)
+    # SM120 stores COMBINE through the STG drain with global reductions: packed
+    # vector adds only where one lane's chunk is one token row's adjacent features.
+    src = compiled.generated_path.read_text()
+    assert "moe_combine_add(" in src or "moe_combine_add_vector(" in src
+    assert ("moe_combine_add_vector(_combine_ptr" in src) == (not swap_ab and not m_major)
+    torch.manual_seed(734)
+    tokens = torch.randn(1, 387, 96, dtype=torch.bfloat16, device="cuda")
+    weights = torch.randn(3, 96, 96, dtype=torch.bfloat16, device="cuda") * 0.1
+    starts = [0, 3, 3, 134, 257, 258, 383]  # Unused capacity at the end.
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int32).view(7, 1, 1)
+    destination = torch.randperm(387, device="cuda", dtype=torch.int32)
+    index = (destination // 3).view(1, 387, 1)
+    slots = (destination % 3).view(1, 387, 1)
+    index[0, 10, 0], index[0, 11, 0] = -1, 129
+    slots[0, 12, 0], slots[0, 13, 0] = -1, 3
+    routing = torch.rand(1, 129, 3, device="cuda")
+    routing[0, 0] = 0
+    backing = torch.full((96, 134) if m_major else (134, 112), 123, device="cuda", dtype=output_dt)
+    out = (backing[:, :129].T if m_major else backing[:129, :96]).unsqueeze(0)
+    vp = {x: tokens, w: weights, offsets: fto, indices: index, ks: slots, scores: routing, y: out}
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    memset_calls = []
+    memset, memset2d = runtime.cudaMemsetAsync, runtime.cudaMemset2DAsync
+
+    def record_memset(ptr, value, nbytes, stream):
+        memset_calls.append(("1d", int(ptr), int(nbytes), int(stream)))
+        assert value == 0
+        return memset(ptr, value, nbytes, stream)
+
+    def record_memset2d(ptr, pitch, value, width, height, stream):
+        memset_calls.append(("2d", int(ptr), int(pitch), int(width), int(height), int(stream)))
+        assert value == 0
+        return memset2d(ptr, pitch, value, width, height, stream)
+
+    monkeypatch.setattr(runtime, "cudaMemsetAsync", record_memset)
+    monkeypatch.setattr(runtime, "cudaMemset2DAsync", record_memset2d)
+
+    def check_memset(stream=0):
+        elem = out.element_size()
+        if not m_major and out.stride(1) == 96:
+            expected = ("1d", out.data_ptr(), out.numel() * elem, stream)
+        else:
+            pitch, width, height = (out.stride(2), 129, 96) if m_major else (out.stride(1), 96, 129)
+            expected = ("2d", out.data_ptr(), pitch * elem, width * elem, height, stream)
+        assert memset_calls == [expected]
+        memset_calls.clear()
+
+    def check():
+        ref = torch.zeros(129, 96, device="cuda")
+        for group, (begin, end) in enumerate(zip(starts, starts[1:])):
+            result = tokens[0, begin:end].float() @ weights[group % 3].float().T
+            ids, k = index.flatten()[begin:end].long(), slots.flatten()[begin:end].long()
+            valid = (ids >= 0) & (ids < 129) & (k >= 0) & (k < 3)
+            weighted = result[valid] * routing[0, ids[valid], k[valid], None]
+            ref.index_add_(0, ids[valid], weighted.to(output_dt).float())
+        tolerance = {torch.bfloat16: 0.025, torch.float16: 0.003, torch.float32: 2e-5}[output_dt]
+        torch.testing.assert_close(out[0].float(), ref, atol=tolerance, rtol=tolerance)
+        if m_major:
+            assert torch.all(backing[:, 129:] == 123)
+        else:
+            assert torch.all(backing[129:] == 123) and torch.all(backing[:, 96:] == 123)
+
+    compiled(vp, workspace=workspace)
+    check_memset()
+    check()
+    if not swap_ab and not m_major:
+        # Reuse the same plan with 16/8/4/2-byte destination alignment. Routing
+        # changes row alignment for odd pitches; padding must never be added to.
+        for shift, pitch in ((0, 96), (0, 100), (0, 98), (0, 97), (1, 112), (2, 112), (4, 112)):
+            storage = torch.full((shift + 134 * pitch + 8,), 123, device="cuda", dtype=output_dt)
+            backing = storage[shift:-8].view(134, pitch)
+            out = backing[:129, :96].unsqueeze(0)
+            vp[y] = out
+            compiled(vp, workspace=workspace)
+            check_memset()
+            check()
+            assert torch.all(storage[:shift] == 123) and torch.all(storage[-8:] == 123)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            compiled(vp, workspace=workspace, stream=torch.cuda.current_stream().cuda_stream)
+        index.copy_(128 - index)
+        slots.copy_(2 - slots)
+        routing.mul_(0.5)
+        starts[:] = [0, 0, 17, 129, 129, 380, 381]
+        fto.copy_(torch.tensor(starts, device="cuda", dtype=torch.int32).view(7, 1, 1))
+        out.fill_(99)
+        graph.replay()
+        check()
+        index.fill_(-1)
+        graph.replay()
+        assert torch.count_nonzero(out) == 0
+    finally:
+        graph.reset()
+    memset_calls.clear()
+    out.fill_(77)
+    for bad_scores in (routing.to(torch.float16), routing[:, :, :2], torch.empty(1, 129, 6, device="cuda")[:, :, ::2]):
+        with pytest.raises(ValueError, match="top_k_scores"):
+            compiled({**vp, scores: bad_scores}, workspace=workspace)
+    with pytest.raises(ValueError, match="output"):
+        compiled({**vp, y: out[:, :-1]}, workspace=workspace)
+    with pytest.raises(ValueError, match="workspace"):
+        compiled(vp)
+    assert not memset_calls
+    assert torch.all(out == 77)
+    # Public engine lifecycle and exact knob replay must keep COMBINE in FROST.
+    g.validate()
+    g.build_operation_graph()
+    engine_id = next(row.engine_id for row in MANIFEST if row.name == "frost_gemm")
+    g.create_execution_plan(engine_id, GemmKnobs.from_config(cfg).to_public())
+    g.check_support()
+    g.build_plans()
+    assert g.selected_engine.name == "frost_gemm"
+    ws = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
+    index.copy_((destination // 3).view_as(index))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    handle = cudnn.create_handle()
+    try:
+        cudnn.set_stream(handle, side.cuda_stream)
+        memset_calls.clear()
+        g.execute(vp, ws, handle=handle)
+        check_memset(side.cuda_stream)
+        torch.cuda.current_stream().wait_stream(side)
+        check()
+    finally:
+        cudnn.destroy_handle(handle)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize(
+    "count,n,geometry",
+    [
+        (1, 96, "64x128x128_16x16x32_cluster1x1_warps4x2"),
+        (5, 96, "128x128x128_16x16x32_cluster1x1_warps2x4"),
+        (3, 96, "256x128x128_16x16x32_cluster1x1_warps8x1"),  # parent: 512-row tile
+        (2, 40, "128x128x128_16x16x32_cluster1x1_warps4x2"),
+    ],
+)
+def test_combine_small_tokens_and_runtime_shape(swap_ab, count, n, geometry):
+    from cudnn.gemm.frost import compiler as C
+
+    rows = count * 3 + 2
+    g, x, w, offsets, indices, ks, scores, y = _build_combine_graph(rows=rows, tokens=count, n=n, output_dt=cudnn.data_type.FLOAT)
+    cfg = replace(by_name("CONFIG_sm120_" + geometry), swap_ab=swap_ab)
+    compiled = _jit_combine(C, g, cfg)
+    if count == 1 and not swap_ab:
+        g.validate()
+        g.build_operation_graph()
+        g.create_execution_plans([cudnn.heur_mode.A])
+        g.check_support()
+        g.build_plans()
+        assert g.selected_engine.name == "frost_gemm"
+    token = torch.ones(1, rows, 96, device="cuda", dtype=torch.bfloat16)
+    weight = torch.arange(1, 4, device="cuda", dtype=torch.bfloat16).view(3, 1, 1).expand(3, n, 96).contiguous()
+    starts = [0, 1, 1, 2, count * 3 - 1, count * 3, count * 3]
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int64).to(torch.int32)
+    destination = torch.arange(rows, device="cuda", dtype=torch.int32)
+    index = (destination // 3).view(1, rows, 1)
+    slots = (destination % 3).view(1, rows, 1)
+    workspace = torch.empty(compiled.workspace_bytes, device="cuda", dtype=torch.uint8)
+    # T is runtime geometry, independent of routed capacity S. No recompilation.
+    for t in (count, count + 2):
+        routing = torch.rand(1, t, 3, device="cuda")
+        out = torch.full((1, t, n), 99.0, device="cuda")
+        vp = {x: token, w: weight, offsets: fto, indices: index, ks: slots, scores: routing, y: out}
+        compiled(vp, workspace=workspace)
+        if count == 1 and not swap_ab:
+            public_workspace = torch.empty(g.get_workspace_size(), device="cuda", dtype=torch.uint8)
+            g.execute(vp, public_workspace)
+        ref = torch.zeros(t, n, device="cuda")
+        for group, (begin, end) in enumerate(zip(starts, starts[1:])):
+            for r in range(begin, end):
+                ref[r // 3] += 96 * (group % 3 + 1) * routing[0, r // 3, r % 3]
+        torch.testing.assert_close(out[0], ref, atol=1e-4, rtol=1e-5)
+
+
+# COMBINE coverage beyond the parent's: every output dtype x major x orientation
+# with exact arithmetic (bit-exact against an fp64 reference), guard bytes around
+# the output, CUDA-graph replay into a dirty output, input/layout variants, and
+# heavy atomic contention.
+
+_COMBINE_TORCH_DT = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+_COMBINE_CUDNN_DT = {"bf16": cudnn.data_type.BFLOAT16, "fp16": cudnn.data_type.HALF, "fp32": cudnn.data_type.FLOAT}
+
+
+def _build_combine_graph_ex(*, rows, tokens, n, k, experts, groups, top_k, output_dt, m_major, input_dt=cudnn.data_type.BFLOAT16, weight_n_major=False, pad=8):
+    """`_build_combine_graph` with every extent free, plus input dtype / weight major."""
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    x = g.tensor(name="tokens", dim=[1, rows, k], stride=[rows * k, k, 1], data_type=input_dt)
+    w = g.tensor(name="weights", dim=[experts, k, n], stride=[k * n, n, 1] if weight_n_major else [k * n, 1, k], data_type=input_dt)
+    offsets = g.tensor(name="offsets", dim=[groups + 1, 1, 1], stride=[1, 1, 1], data_type=cudnn.data_type.INT32)
+    indices = g.tensor(name="indices", dim=[1, rows, 1], stride=[rows, 1, 1], data_type=cudnn.data_type.INT32)
+    ks = g.tensor(name="ks", dim=[1, rows, 1], stride=[rows, 1, 1], data_type=cudnn.data_type.INT32)
+    scores = g.tensor(name="scores", dim=[1, tokens, top_k], stride=[tokens * top_k, top_k, 1], data_type=cudnn.data_type.FLOAT)
+    y = g.moe_grouped_matmul(x, w, offsets, token_index=indices, token_ks=ks, top_k_scores=scores, top_k=top_k, mode=cudnn.moe_grouped_matmul_mode.COMBINE)
+    y.set_output(True).set_data_type(output_dt)
+    y.set_stride([n * (tokens + pad), 1, tokens + pad] if m_major else [tokens * (n + pad), n + pad, 1])
+    return g, x, w, offsets, indices, ks, scores, y
+
+
+def _combine_guarded_output(tokens, n, m_major, dtype, *, pad=8, sentinel=-7.0, shift=0):
+    """The output view inside a sentinel-filled allocation: `pad` columns (or rows,
+    M-major) past the logical extent, two spare rows, and a head of `shift` plus a
+    32-element tail. Returns (storage, view, inside) -- `inside` marks the view."""
+    rows_, pitch = (n + 2, tokens + pad) if m_major else (tokens + 2, n + pad)
+    storage = torch.full((shift + rows_ * pitch + 32,), sentinel, device="cuda", dtype=dtype)
+    backing = storage[shift : shift + rows_ * pitch].view(rows_, pitch)
+    view = (backing[:n, :tokens].T if m_major else backing[:tokens, :n]).unsqueeze(0)
+    inside = torch.zeros_like(storage, dtype=torch.bool)
+    inside_backing = inside[shift : shift + rows_ * pitch].view(rows_, pitch)
+    (inside_backing[:n, :tokens] if m_major else inside_backing[:tokens, :n]).fill_(True)
+    return storage, view, inside
+
+
+def _combine_exact_data(rows, tokens, n, k, experts, top_k, starts, *, seed, input_dtype=torch.bfloat16, invalid=True):
+    """Integer-valued data whose every contribution and partial sum is exactly
+    representable in bf16 (so in every output dtype, in any atomic order):
+    tokens carry two +-1 entries per row, weights are integers in [-2, 2], so an
+    FC2 value is an integer in [-4, 4]; scores are 1/4, 1/2 or 1; each token
+    receives ceil(rows / tokens) contributions. The bf16 partial sums are then
+    multiples of 1/4 below 4 * ceil(rows / tokens) in magnitude -- exact while that
+    stays <= 64 (8 significant bits)."""
+    assert -(-rows // tokens) * 4 <= 64
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    token = torch.zeros(1, rows, k, device="cuda")
+    for _ in range(2):
+        pos = torch.randint(0, k, (rows,), device="cuda", generator=gen)
+        sign = torch.randint(0, 2, (rows,), device="cuda", generator=gen).float() * 2 - 1
+        token[0, torch.arange(rows, device="cuda"), pos] = sign
+    weight = torch.randint(-2, 3, (experts, n, k), device="cuda", generator=gen).float()
+    perm = torch.randperm(rows, device="cuda", generator=gen)
+    index = (perm % tokens).to(torch.int32).view(1, rows, 1)
+    slots = torch.randint(0, top_k, (1, rows, 1), device="cuda", generator=gen, dtype=torch.int32)
+    if invalid:
+        index[0, 1, 0], index[0, 2, 0] = -1, tokens
+        slots[0, 3, 0], slots[0, 4, 0] = -1, top_k
+    scores = torch.tensor([0.25, 0.5, 1.0], device="cuda")[torch.randint(0, 3, (1, tokens, top_k), device="cuda", generator=gen)]
+    return token.to(input_dtype), weight.to(input_dtype), index, slots, scores.contiguous()
+
+
+def _combine_reference(token, weight, index, slots, scores, starts, n):
+    """fp64 COMBINE: every in-group routed row with an in-range token and slot adds
+    score * (token @ weight[group % E].T) into its token row."""
+    tokens, top_k = scores.shape[1], scores.shape[2]
+    ref = torch.zeros(tokens, n, device="cuda", dtype=torch.float64)
+    experts = weight.shape[0]
+    for group, (begin, end) in enumerate(zip(starts, starts[1:])):
+        if end <= begin:
+            continue
+        result = token[0, begin:end].double() @ weight[group % experts].double().T
+        ids, k = index.flatten()[begin:end].long(), slots.flatten()[begin:end].long()
+        valid = (ids >= 0) & (ids < tokens) & (k >= 0) & (k < top_k)
+        ref.index_add_(0, ids[valid], result[valid] * scores[0, ids[valid], k[valid], None].double())
+    return ref
+
+
+def _run_combine_exact(
+    cfg, *, swap_ab, m_major, out, input_dt="bf16", weight_n_major=False, offset_alignment=None, int64_offsets=False, top_k=3, honor_alignment=True, pad=8
+):
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.kernel_registry import select_template
+
+    rows, tokens, n, k, experts = 304, 101, 200, 160, 4
+    # Empty groups, a one-row group, groups spanning several M tiles, a group per
+    # expert twice over (G = 2E), and unused routed capacity past the last group.
+    # A promised alignment is honored unless the case breaks it on purpose: the
+    # drain still re-checks every element against its routed group's end.
+    sizes = [0, 40, 136, 8, 0, 64, 40, 8] if offset_alignment and honor_alignment else [0, 37, 129, 1, 0, 64, 40, 21]
+    starts = [sum(sizes[:i]) for i in range(len(sizes) + 1)]
+    in_dt = {
+        "bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16),
+        "fp16": (cudnn.data_type.HALF, torch.float16),
+        "fp8": (cudnn.data_type.FP8_E4M3, torch.float8_e4m3fn),
+    }
+    g, x, w, offsets, indices, ks, scores, y = _build_combine_graph_ex(
+        rows=rows,
+        tokens=tokens,
+        n=n,
+        k=k,
+        experts=experts,
+        groups=len(sizes),
+        top_k=top_k,
+        output_dt=_COMBINE_CUDNN_DT[out],
+        m_major=m_major,
+        input_dt=in_dt[input_dt][0],
+        weight_n_major=weight_n_major,
+        pad=pad,
+    )
+    if offset_alignment:
+        offsets.set_alignment_value(offset_alignment)
+    if int64_offsets:
+        offsets.set_data_type(cudnn.data_type.INT64)
+    compiled = _jit_combine(C, g, replace(cfg, swap_ab=swap_ab))
+    assert compiled.store_modes == ("stg",)
+    # The registry funnel (candidate listing) admits what the build accepted.
+    assert select_template(compiled.chain, compiled.config).accepts(compiled.chain, compiled.config) is None
+    vsize = compiled.vec_bytes_epi // torch.empty((), dtype=_COMBINE_TORCH_DT[out]).element_size()
+    if swap_ab and offset_alignment:
+        # The promised group alignment lets the swap-AB drain hand out multi-element
+        # chunks; every element still re-checks its routed group's end.
+        assert vsize > 1
+    token, weight, index, slots, routing = _combine_exact_data(rows, tokens, n, k, experts, top_k, starts, seed=4242, input_dtype=in_dt[input_dt][1])
+    if weight_n_major:
+        weight = weight.transpose(1, 2).contiguous().transpose(1, 2)
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int64 if int64_offsets else torch.int32).view(-1, 1, 1)
+    storage, out_view, inside = _combine_guarded_output(tokens, n, m_major, _COMBINE_TORCH_DT[out], pad=pad)
+    vp = {x: token, w: weight.transpose(1, 2), offsets: fto, indices: index, ks: slots, scores: routing, y: out_view}
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+
+    def check():
+        ref = _combine_reference(token, weight, index, slots, routing, starts, n)
+        torch.testing.assert_close(out_view[0].double(), ref, atol=0, rtol=0)
+        assert torch.all(storage[~inside] == -7.0), "COMBINE wrote outside the output view"
+
+    out_view.fill_(55.0)  # the plan zero-fills the view itself
+    compiled(vp, workspace=workspace)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            compiled(vp, workspace=workspace, stream=torch.cuda.current_stream().cuda_stream)
+        new = _combine_exact_data(rows, tokens, n, k, experts, top_k, starts, seed=99, input_dtype=in_dt[input_dt][1])
+        token.copy_(new[0])
+        index.copy_(new[2])
+        slots.copy_(new[3])
+        routing.copy_(new[4])
+        out_view.fill_(-3.0)
+        graph.replay()
+        check()
+        graph.replay()  # replays from the dirty result of the previous one
+        check()
+    finally:
+        graph.reset()
+
+
+@requires_sm120
+@pytest.mark.parametrize("out", ["bf16", "fp16", "fp32"])
+@pytest.mark.parametrize("m_major", [False, True], ids=["n_major", "m_major"])
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_combine_exact_every_layout(swap_ab, m_major, out):
+    _run_combine_exact(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap_ab, m_major=m_major, out=out)
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "fp8_inputs",
+        "fp16_inputs",
+        "n_major_weight",
+        "aligned_int64_offsets",
+        "broken_alignment_promise",
+        "odd_output_pitch",
+        "top_k_1",
+        "geometry_64x256",
+        "geometry_256x64",
+    ],
+)
+def test_combine_exact_variants(case, swap_ab):
+    geometry = {
+        "geometry_64x256": "CONFIG_sm120_64x256x128_16x16x32_cluster1x1_warps2x4",
+        "geometry_256x64": "CONFIG_sm120_256x64x128_16x16x32_cluster1x1_warps8x1",
+    }.get(case, "CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    _run_combine_exact(
+        by_name(geometry),
+        swap_ab=swap_ab,
+        m_major=case == "n_major_weight",
+        out="bf16",
+        input_dt={"fp8_inputs": "fp8", "fp16_inputs": "fp16"}.get(case, "bf16"),
+        weight_n_major=case == "n_major_weight",
+        offset_alignment=8 if case in ("aligned_int64_offsets", "broken_alignment_promise") else None,
+        int64_offsets=case == "aligned_int64_offsets",
+        top_k=1 if case == "top_k_1" else 3,
+        honor_alignment=case != "broken_alignment_promise",
+        # A declared pitch of N + 1 admits one-element chunks only: the reductions
+        # take their width from the address at run time, so COMBINE still serves it.
+        pad=1 if case == "odd_output_pitch" else 8,
+    )
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+@pytest.mark.parametrize("out,tokens", [("fp32", 1), ("fp16", 4), ("bf16", 16)])
+def test_combine_heavy_contention(swap_ab, out, tokens):
+    """4096 routed rows onto 1 / 4 / 16 tokens: every output element takes 4096 /
+    1024 / 256 concurrent reductions (vector adds on the token-by-weight kernel,
+    per-element adds after swap-AB). Each FC2 value is exactly 1 or 2 (the token is
+    1/64 over K=64, the expert weight row constant), and the scores are 1, so every
+    partial sum is an integer the output dtype holds exactly -- the result is
+    order-independent and compared bit for bit."""
+    from cudnn.gemm.frost import compiler as C
+
+    rows, n, k, experts = 4096, 256, 64, 4
+    starts = [0, 1000, 1001, 3000, 4096]
+    g, x, w, offsets, indices, ks, scores, y = _build_combine_graph_ex(
+        rows=rows, tokens=tokens, n=n, k=k, experts=experts, groups=4, top_k=experts, output_dt=_COMBINE_CUDNN_DT[out], m_major=False
+    )
+    compiled = _jit_combine(C, g, replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap_ab))
+    token = torch.full((1, rows, k), 1.0 / 64, device="cuda", dtype=torch.bfloat16)
+    # bf16 sums stay <= 256 with unit contributions; fp16 <= 2048 and fp32 hold 1s and 2s.
+    per_feature = torch.ones(experts, n, device="cuda") if out == "bf16" else (torch.arange(n, device="cuda") % 2 + 1).float().expand(experts, n)
+    weight = per_feature[:, :, None].expand(experts, n, k).to(torch.bfloat16).contiguous()
+    perm = torch.randperm(rows, device="cuda")
+    index = (perm % tokens).to(torch.int32).view(1, rows, 1)
+    slots = (perm % experts).to(torch.int32).view(1, rows, 1)
+    routing = torch.ones(1, tokens, experts, device="cuda")
+    storage, out_view, inside = _combine_guarded_output(tokens, n, False, _COMBINE_TORCH_DT[out])
+    vp = {
+        x: token,
+        w: weight.transpose(1, 2),
+        offsets: torch.tensor(starts, device="cuda", dtype=torch.int32),
+        indices: index,
+        ks: slots,
+        scores: routing,
+        y: out_view,
+    }
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    ref = _combine_reference(token, weight, index, slots, routing, starts, n)
+    assert ref.abs().max() <= {"fp32": 2**24, "fp16": 2048, "bf16": 256}[out]
+    for _ in range(3):
+        compiled(vp, workspace=workspace)
+        torch.testing.assert_close(out_view[0].double(), ref, atol=0, rtol=0)
+        assert torch.all(storage[~inside] == -7.0)
+
+
+@requires_sm120
+@pytest.mark.no_workspace_shim
+def test_combine_runtime_contract_precedes_the_memset(monkeypatch):
+    """Every runtime rejection lands before the zero-fill: an N the compiled chunk
+    does not divide, a wrong output dtype, an overlapping output and an output of
+    the other major leave the caller's buffer untouched and issue no memset."""
+    from cuda.bindings import runtime
+    from cudnn.gemm.frost import compiler as C
+
+    g, x, w, offsets, indices, ks, scores, y = _build_combine_graph()
+    compiled = _jit_combine(C, g, by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"))
+    vsize = compiled.vec_bytes_epi // 2
+    assert vsize > 1
+    calls = []
+    monkeypatch.setattr(runtime, "cudaMemsetAsync", lambda *a: calls.append(a))
+    monkeypatch.setattr(runtime, "cudaMemset2DAsync", lambda *a: calls.append(a))
+    rows, tokens = 387, 129
+    token = torch.randn(1, rows, 96, device="cuda", dtype=torch.bfloat16)
+    fto = torch.tensor([0, 3, 3, 134, 257, 258, 383], device="cuda", dtype=torch.int32).view(7, 1, 1)
+    index = torch.randint(0, tokens, (1, rows, 1), device="cuda", dtype=torch.int32)
+    slots = torch.randint(0, 3, (1, rows, 1), device="cuda", dtype=torch.int32)
+    routing = torch.rand(1, tokens, 3, device="cuda")
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    n_bad = 96 + vsize // 2
+    bad_n = {
+        x: token,
+        # (E, N, K): a buffer that differs from the declaration is taken in kernel order.
+        w: torch.randn(3, n_bad, 96, device="cuda", dtype=torch.bfloat16),
+        offsets: fto,
+        indices: index,
+        ks: slots,
+        scores: routing,
+        y: torch.full((1, tokens, n_bad), 77, device="cuda", dtype=torch.bfloat16),
+    }
+    with pytest.raises(ValueError, match="divisible"):
+        compiled(bad_n, workspace=workspace)
+    assert torch.all(bad_n[y] == 77)
+    good_w = torch.randn(3, 96, 96, device="cuda", dtype=torch.bfloat16)
+    for bad_out, match in (
+        (torch.full((1, tokens, 96), 77, device="cuda", dtype=torch.float16), "bf16"),
+        (torch.full((1, 1, 96), 77, device="cuda", dtype=torch.bfloat16).expand(1, tokens, 96), "non-overlapping"),
+        (torch.full((1, 96, tokens), 77, device="cuda", dtype=torch.bfloat16).transpose(1, 2), "N-major"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            compiled({**bad_n, w: good_w, y: bad_out}, workspace=workspace)
+        assert torch.all(bad_out == 77)
+    assert not calls
+
+
+@requires_sm120
+@pytest.mark.no_workspace_shim
+@pytest.mark.parametrize("swap_ab", [False, True], ids=["token_by_weight", "weight_by_token"])
+def test_combine_operand_checks_precede_the_memset(swap_ab, monkeypatch):
+    """COMBINE zero-fills the output before the launch, and the launch binding is
+    what would check some operand facts: a token, weight or offsets buffer of
+    another dtype, a weight whose K is not the token's, a token row pitch that is
+    not a 16-byte multiple, rank-2 offsets, and a routing / output buffer off the
+    GPU (or, the workspace included, on another GPU than the rest) each raise
+    before the zero-fill (no memset, output untouched), by the binding's own rules
+    -- offsets of the declared width but unsigned, and a token whose row pitch is
+    padded to another 16-byte multiple, still run exactly."""
+    from cuda.bindings import runtime
+    from cudnn.gemm.frost import compiler as C
+
+    rows, tokens, n, k, experts = 304, 101, 200, 160, 4
+    sizes = [0, 37, 129, 1, 0, 64, 40, 21]
+    starts = [sum(sizes[:i]) for i in range(len(sizes) + 1)]
+    g, x, w, offsets, indices, ks, scores, y = _build_combine_graph_ex(
+        rows=rows, tokens=tokens, n=n, k=k, experts=experts, groups=len(sizes), top_k=3, output_dt=cudnn.data_type.BFLOAT16, m_major=False
+    )
+    compiled = _jit_combine(C, g, replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap_ab))
+    token, weight, index, slots, routing = _combine_exact_data(rows, tokens, n, k, experts, 3, starts, seed=31)
+    fto = torch.tensor(starts, device="cuda", dtype=torch.int32).view(-1, 1, 1)
+    storage, out_view, inside = _combine_guarded_output(tokens, n, False, torch.bfloat16)
+    vp = {x: token, w: weight.transpose(1, 2), offsets: fto, indices: index, ks: slots, scores: routing, y: out_view}
+    workspace = torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda")
+    calls = []
+    memset, memset2d = runtime.cudaMemsetAsync, runtime.cudaMemset2DAsync
+    monkeypatch.setattr(runtime, "cudaMemsetAsync", lambda *a: calls.append(a) or memset(*a))
+    monkeypatch.setattr(runtime, "cudaMemset2DAsync", lambda *a: calls.append(a) or memset2d(*a))
+    out_view.fill_(77)
+
+    def padded_token(pad):
+        rows_pitched = torch.zeros(1, rows, k + pad, device="cuda", dtype=token.dtype)
+        rows_pitched[..., :k] = token
+        return rows_pitched[..., :k]
+
+    for override, match in (
+        ({x: token.view(torch.float16)}, "token must be bfloat16"),
+        ({w: weight.transpose(1, 2).view(torch.float16)}, "weight must be bfloat16"),
+        ({offsets: fto.to(torch.int64)}, "first_token_offset must be int32"),
+        # (E, N, K'): a buffer that differs from the declaration is taken in kernel order.
+        ({w: torch.zeros(experts, n, k - 32, device="cuda", dtype=torch.bfloat16)}, "must share"),
+        ({x: padded_token(4)}, "token strides must be multiples of 16 bytes"),
+        ({offsets: fto.view(-1, 1)}, "first_token_offset must be rank-1"),
+        ({scores: routing.cpu()}, "top_k_scores must be a CUDA buffer"),
+        ({indices: index.cpu()}, "token_index must be a CUDA buffer"),
+        ({y: out_view.cpu()}, "output must be a CUDA buffer"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            compiled({**vp, **override}, workspace=workspace)
+    assert not calls
+    assert torch.all(out_view == 77)
+
+    # The binding gives every tensor argument -- the carved workspace included -- one
+    # device index. This process sees one GPU, so a stand-in reports the other one.
+    class OnAnotherGpu:
+        def __dlpack_device__(self):
+            return (2, 1)  # (kDLCUDA, 1)
+
+    operands = ([weight], [token]) if swap_ab else ([token], [weight])
+    good_routing = (index.view(-1), slots.view(-1), routing.view(tokens, 3))
+    for routing_bufs, ws, match in (
+        ((*good_routing[:2], OnAnotherGpu()), workspace, r"top_k_scores must be a CUDA buffer on the same device .*; got cuda:1 \(the \w+ is on cuda:0\)"),
+        (good_routing, OnAnotherGpu(), r"workspace must be a CUDA buffer on the same device .*; got cuda:1"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            C._check_moe_combine_operands(compiled.chain, *operands, fto.view(-1), [], [], routing_bufs, [out_view], k, ws)
+    C._check_moe_combine_operands(compiled.chain, *operands, fto.view(-1), [], [], good_routing, [out_view], k, workspace)
+    ref = _combine_reference(token, weight, index, slots, routing, starts, n)
+    for override in ({offsets: fto.view(torch.uint32)}, {x: padded_token(8)}):
+        out_view.fill_(77)
+        compiled({**vp, **override}, workspace=workspace)
+        assert len(calls) == 1  # the zero-fill
+        calls.clear()
+        torch.testing.assert_close(out_view[0].double(), ref, atol=0, rtol=0)
+        assert torch.all(storage[~inside] == -7.0)
+
+
+def test_combine_has_no_gather_form():
+    """COMBINE's token input stays grouped (as SCATTER's); the routing mode is one
+    enum, so a GATHER node carrying routing scores is a malformed graph, not a
+    GATHER + COMBINE fusion an engine could admit."""
+    g, x, w, offsets, indices, y = _build_gather_graph()
+    node = g.nodes[0]
+    node.inputs["top_k_scores"] = g.tensor(name="scores", dim=[1, 129, 3], stride=[387, 3, 1], data_type=cudnn.data_type.FLOAT)
+    with pytest.raises(ValueError, match="top_k_scores"):
+        analyze(g)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "case,in_dt,acc_dt,out_dt",
+    [
+        ("int32_accumulation", "INT8", "INT32", "FLOAT"),
+        ("fp8_output", "FP8_E4M3", "FLOAT", "FP8_E4M3"),
+        ("admitted", "BFLOAT16", "FLOAT", "BFLOAT16"),
+    ],
+)
+def test_combine_admitted_set_in_the_build_and_the_funnel(case, in_dt, acc_dt, out_dt):
+    """The admitted set is the parent's: int8 inputs accumulate in int32 and an fp8
+    output takes no reduction, so COMBINE (an fp32 score multiply into an
+    fp32/fp16/bf16 output) declines both -- in the build AND in the registry funnel,
+    which lists no sm120 candidate for a graph the build declines, and lists the
+    admitted control."""
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    dt = cudnn.data_type
+    g = cudnn.pygraph(io_data_type=getattr(dt, in_dt), intermediate_data_type=dt.FLOAT, compute_data_type=getattr(dt, acc_dt))
+    x = g.tensor(name="tokens", dim=[1, 387, 96], stride=[387 * 96, 96, 1], data_type=getattr(dt, in_dt))
+    w = g.tensor(name="weights", dim=[3, 96, 96], stride=[96 * 96, 1, 96], data_type=getattr(dt, in_dt))
+    offsets = g.tensor(name="offsets", dim=[7, 1, 1], stride=[1, 1, 1], data_type=dt.INT32)
+    indices = g.tensor(name="indices", dim=[1, 387, 1], stride=[387, 1, 1], data_type=dt.INT32)
+    ks = g.tensor(name="ks", dim=[1, 387, 1], stride=[387, 1, 1], data_type=dt.INT32)
+    scores = g.tensor(name="scores", dim=[1, 129, 3], stride=[387, 3, 1], data_type=dt.FLOAT)
+    mode = cudnn.moe_grouped_matmul_mode.COMBINE
+    y = g.moe_grouped_matmul(x, w, offsets, token_index=indices, token_ks=ks, top_k_scores=scores, top_k=3, mode=mode, compute_data_type=getattr(dt, acc_dt))
+    y.set_output(True).set_data_type(getattr(dt, out_dt))
+    chain = analyze(g)
+    listed = [cfg.name for tmpl, cfg in R.candidates(chain, sweep_swap_ab=True) if tmpl.pipeline == "sm120"]
+    if case == "admitted":
+        C._check_executable(chain)
+        assert listed, "the funnel lists no sm120 candidate for an admitted COMBINE graph"
+        return
+    assert (chain.matmul.accum_dtype, chain.output_dtype) == {"int32_accumulation": ("int32", "fp32"), "fp8_output": ("fp32", "fp8_e4m3")}[case]
+    with pytest.raises(NotImplementedError, match="FP32 MMA accumulation"):
+        C._check_executable(chain)
+    assert listed == []
+    assert "FP32 MMA accumulation" in R.Sm120KernelTemplate.moe_combine_reject(chain)
+
+
 def test_scatter_shape_and_binding():
     g, _, _, _, indices, ks, y = _build_scatter_graph()
     chain, binding = analyze_with_binding(g)
@@ -2805,3 +3509,201 @@ def test_moe_block_scale_quant_epilogue(combo, swap):
         quant=True,
         swap_ab=swap,
     )
+
+
+# --------------------------------------------------------------------------- #
+# sm120 regressions: the MoE prechecks run the registry's whole funnel (C102),
+# and N-major outputs whose layout admits only one-element epilogue chunks (odd
+# N, odd row stride; an M-major token-contiguous output without an alignment
+# promise under swap-AB) are served by both dense MoE templates (G38).
+# --------------------------------------------------------------------------- #
+
+_MOE_ODD_GUARD = 256
+_MOE_ODD_DT = {
+    "bf16": (cudnn.data_type.BFLOAT16, torch.bfloat16),
+    "fp32": (cudnn.data_type.FLOAT, torch.float32),
+    "e4m3": (cudnn.data_type.FP8_E4M3, torch.float8_e4m3fn),
+}
+_MOE_ODD_BOUNDS = [0, 3, 3, 35, 129, 263, 263]  # uneven + empty groups, S = 263
+
+
+def _moe_odd_graph(N, out_dt, *, ld=None, major="n", align=None, E=2, K=136, bounds=_MOE_ODD_BOUNDS):
+    S = bounds[-1]
+    g = _build_graph(E, S, N, K, num_groups=len(bounds) - 1, output_dt=_MOE_ODD_DT[out_dt][0])
+    _, binding = analyze_with_binding(g)
+    if align is not None:
+        binding.first_token_offset.set_alignment_value(align)
+    if major == "m":
+        binding.outputs[0].set_dim([1, S, N]).set_stride([N * (ld or S), 1, ld or S])
+    elif ld is not None:
+        binding.outputs[0].set_dim([1, S, N]).set_stride([S * ld, ld, 1])
+    return g
+
+
+def _moe_odd_buffer(S, N, dtype, ld=None, major="n"):
+    """(raw, body, view): rows ``ld`` apart (columns for M-major) inside a 0xA5 canary."""
+    inner, outer = (N, S) if major == "n" else (S, N)
+    ld = ld or inner
+    nbytes = outer * ld * torch.empty((), dtype=dtype).element_size()
+    raw = torch.full((nbytes + 2 * _MOE_ODD_GUARD,), 0xA5, dtype=torch.uint8, device="cuda")
+    body = raw[_MOE_ODD_GUARD : _MOE_ODD_GUARD + nbytes].view(dtype).view(1, outer, ld)
+    view = body[:, :, :inner]
+    return raw, body, (view if major == "n" else view.transpose(1, 2)), inner
+
+
+_MOE_ODD_CASES = {
+    # id -> (N, output dtype, ld, major, align, swap-AB)
+    "N127": (127, "bf16", None, "n", None, False),
+    "N255_fp32": (255, "fp32", None, "n", None, False),
+    "N256_ld257": (256, "bf16", 257, "n", None, False),
+    "N129_ld131_e4m3": (129, "e4m3", 131, "n", None, False),
+    "swapab_N255": (255, "bf16", None, "n", 1, True),
+    "swapab_Mmajor_align1": (272, "bf16", 264, "m", 1, True),
+    "swapab_Mmajor_align1_ld263_fp32": (272, "fp32", 263, "m", 1, True),
+}
+
+
+@requires_sm120
+@pytest.mark.parametrize("cfg_name", ["CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2", "CONFIG_sm120_128x48x128_16x16x32_cluster1x1_warps8x1"])
+@pytest.mark.parametrize("case", list(_MOE_ODD_CASES))
+def test_sm120_moe_one_element_epilogue_chunks(case, cfg_name):
+    """Both dense MoE templates drain one-element N-major chunks bit-exactly with
+    every canary (row padding, guard bytes) intact; the plan passes the registry
+    funnel too, which the MoE prechecks now run."""
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    N, out_dt, ld, major, align, swap = _MOE_ODD_CASES[case]
+    S, E, K = _MOE_ODD_BOUNDS[-1], 2, 136
+    cfg = replace(by_name(cfg_name), swap_ab=swap)
+    g = _moe_odd_graph(N, out_dt, ld=ld, major=major, align=align)
+    compiled = C.jit_from_cudnn_graph(g, config=cfg)
+    assert compiled.vec_bytes_epi == DTYPE_BYTES[compiled.chain.output_dtype], compiled.vec_bytes_epi  # one element
+    # The kernel frame: a token-contiguous (M-major) output is N-major after the
+    # swap -- the layout the pair rule declined; an N-major one scatters there.
+    assert compiled.chain.out_major == ("m" if swap and major == "n" else "n")
+    assert R.select_template(compiled.chain, cfg).accepts(compiled.chain, cfg) is None
+    torch.manual_seed(31)
+    token = torch.randint(-2, 3, (1, S, K), device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (E, N, K), device="cuda").to(torch.bfloat16)
+    offsets = torch.tensor(_MOE_ODD_BOUNDS, dtype=torch.int32, device="cuda")
+    tdt = _MOE_ODD_DT[out_dt][1]
+    raw, body, out, inner = _moe_odd_buffer(S, N, tdt, ld=ld, major=major)
+    compiled(_vp_moe(compiled, token, weight, offsets, out), workspace=torch.empty(compiled.workspace_bytes, dtype=torch.uint8, device="cuda"))
+    torch.cuda.synchronize()
+    ref = _ref_f32(token, weight, offsets, S, N, E).to(tdt)
+    torch.testing.assert_close(out[0].float(), ref.float(), atol=0, rtol=0)
+    assert bool((raw[:_MOE_ODD_GUARD] == 0xA5).all()) and bool((raw[-_MOE_ODD_GUARD:] == 0xA5).all()), "a store ran past the output"
+    if body.shape[-1] > inner:
+        assert bool((body[:, :, inner:].contiguous().view(torch.uint8) == 0xA5).all()), "a store wrote into the row padding"
+
+
+@requires_sm120
+@pytest.mark.parametrize("case", ["N127", "N129_ld131_e4m3", "swapab_Mmajor_align1"])
+def test_sm120_moe_probe_and_funnel_agree(case):
+    """probe_chain (check_support / heuristics / build) and kernel_registry.accepts()
+    (candidates) agree on every sm120 catalog point of both orientations: the
+    MoE prechecks end in the registry's whole funnel, as the parent's MoE
+    prechecks run accepts() (they used to skip the template's own scope, so the
+    funnel declined odd-N plans the probe listed)."""
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.sm120 import compiler as C
+    from cudnn.gemm.frost.tile_config import CATALOG
+
+    N, out_dt, ld, major, align, _swap = _MOE_ODD_CASES[case]
+    chain = analyze(_moe_odd_graph(N, out_dt, ld=ld, major=major, align=align))
+    sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
+    listed = R.candidates(chain, sweep_swap_ab=True)
+    assert {c.swap_ab for _t, c in listed if c.pipeline == "sm120"} == {False, True}
+    disagree = []
+    for cfg in sm120 + [replace(c, swap_ab=True) for c in sm120]:
+        lowered = swap_ab(chain) if cfg.swap_ab else chain
+        funnel = R.select_template(lowered, cfg).accepts(lowered, cfg)
+        try:
+            C.probe_chain(chain, cfg)
+            probe = None
+        except (NotImplementedError, ValueError) as e:
+            probe = str(e)
+        if (funnel is None) != (probe is None):
+            disagree.append((cfg.name, cfg.swap_ab, funnel, probe))
+    assert not disagree, disagree[:3]
+
+
+@requires_sm120
+@pytest.mark.parametrize("swap", [False, True])
+def test_sm120_moe_precheck_consults_the_template_scope(swap, monkeypatch):
+    """A rule in Sm120KernelTemplate._extra_reject (the template's own scope) gates
+    the MoE probe and build, not only the registry funnel: both run it."""
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.sm120 import compiler as C
+
+    def scoped(self, chain, config):
+        return "sentinel template-scope rule" if chain.has_moe else None
+
+    monkeypatch.setattr(R.Sm120KernelTemplate, "_extra_reject", scoped)
+    g = _moe_odd_graph(256, "bf16")
+    cfg = replace(by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2"), swap_ab=swap)
+    with pytest.raises(NotImplementedError, match="sentinel template-scope rule"):
+        C.probe_chain(analyze(g), cfg)
+    with pytest.raises(NotImplementedError, match="sentinel template-scope rule"):
+        C.jit_from_cudnn_graph(g, config=cfg)
+
+
+def _moe_quant_parity_graph(case):
+    """A block-quantized MoE graph: fp8 row quant (``fp8_row32``) or an fp4 quant
+    behind a bf16 side output, the fp4 data in slot 1 (``fp4_behind_bf16``)."""
+    E, S, N, K = 4, 256, 256, 128
+    if case == "fp8_row32":
+        return _build_graph(E, S, N, K, num_groups=E, quant=True, quant_scale_dim=(1, S, N // 32))
+    g = _build_graph(E, S, N, K, num_groups=E, output_dt=cudnn.data_type.FLOAT)
+    _, binding = analyze_with_binding(g)
+    base = binding.outputs[0]
+    base.set_output(False)
+    side = g.identity(input=base, name="side")
+    side.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    source = g.identity(input=base, name="quant_source").set_data_type(cudnn.data_type.FLOAT)
+    q, sf = g.block_scale_quantize(input=source, block_size=16, name="q4")
+    q.set_data_type(cudnn.data_type.FP4_E2M1).set_dim([1, S, N]).set_stride([S * N, N, 1]).set_output(True)
+    sf.set_dim([1, S, N // 16]).set_stride([S * (N // 16), N // 16, 1]).set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
+    return g
+
+
+@requires_sm120
+@pytest.mark.parametrize("case", ["fp8_row32", "fp4_behind_bf16"])
+def test_sm120_moe_quant_probe_and_funnel_agree(case):
+    """probe_chain and kernel_registry.accepts() / candidates() agree on every sm120
+    catalog point (both orientations) for block-quantized MoE chains: the funnel
+    asks the drain gates the MoE precheck runs, and declines a packed fp4 output
+    in ANY slot, as _check_moe_output_dtypes does (it used to look at slot 0
+    only, so a bf16 side output in slot 0 got 225 sm120 plans listed that the
+    probe declined)."""
+    from cudnn.gemm.frost import kernel_registry as R
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+    from cudnn.gemm.frost.sm120 import compiler as C
+    from cudnn.gemm.frost.tile_config import CATALOG
+
+    chain = analyze(_moe_quant_parity_graph(case))
+    sm120 = [c for c in CATALOG if c.pipeline == "sm120"]
+    disagree, probed = [], 0
+    for cfg in sm120 + [replace(c, swap_ab=True) for c in sm120]:
+        try:
+            lowered = swap_ab(chain) if cfg.swap_ab else chain
+            funnel = R.select_template(lowered, cfg).accepts(lowered, cfg)
+        except (NotImplementedError, ValueError) as e:  # no swap-AB lowering (candidates() skips it too)
+            funnel = f"swap-AB lowering: {e}"
+        try:
+            C.probe_chain(chain, cfg)
+            probe = None
+            probed += 1
+        except (NotImplementedError, ValueError) as e:
+            probe = str(e)
+        if (funnel is None) != (probe is None):
+            disagree.append((cfg.name, cfg.swap_ab, funnel, probe))
+    assert not disagree, disagree[:3]
+    listed = [c for _t, c in R.candidates(chain, sweep_swap_ab=True) if c.pipeline == "sm120"]
+    if case == "fp4_behind_bf16":
+        assert probed == 0 and not listed
+    else:
+        assert probed > 0 and listed

@@ -61,11 +61,16 @@ def calibrated_device(request):
     return _strategy_device()
 
 
+def _rtx_pro_6000_device():
+    """The SKU the sm120 profiles are calibrated on (they match its exact name)."""
+    return replace(_strategy_device(120, "NVIDIA RTX PRO 6000 Blackwell Server Edition", 188), l2_bytes=134217728)
+
+
 @pytest.mark.L0
 @pytest.mark.parametrize("dtype,block_size,sf_dtype", [("fp4_e2m1", 16, "fp8_e4m3"), ("fp4_e2m1", 32, "fp8_e8m0"), ("fp8_e4m3", 32, "fp8_e8m0")])
-def test_block_scale_joint_profile_and_legal_geometry(calibrated_device, dtype, block_size, sf_dtype):
+def test_block_scale_joint_profile_and_legal_geometry(dtype, block_size, sf_dtype):
     from cudnn.gemm.frost import planning
-    from cudnn.gemm.frost.tile_config import as_mma_tile_k
+    from cudnn.gemm.frost.tile_config import validate_block_scale_config_sm120
 
     chain = _block_scaled_chain(M=128, N=256, K=4096, quantized=False)
     chain = replace(
@@ -81,14 +86,19 @@ def test_block_scale_joint_profile_and_legal_geometry(calibrated_device, dtype, 
             sf_dtype_b=sf_dtype,
         ),
     )
-    device = calibrated_device
-    baseline = select_config(128, 256, 1, K=4096, block_scale=True, sm_count=device.sm_count)
-    baseline = as_mma_tile_k(baseline, 64 if device.arch == 107 else 32)
+    device = _rtx_pro_6000_device()
+    baseline = select_config(128, 256, 1, K=4096, block_scale=True, sm_count=device.sm_count, _pipeline="sm120")
+    assert baseline.pipeline == "sm120"
     profile = planning.profile_for(chain, baseline, device)
-    assert profile is not None
+    assert profile is not None and profile.name == ("rtx_pro_6000_block_f4" if dtype == "fp4_e2m1" else "rtx_pro_6000_block_f8")
     configs = planning.candidate_configs(chain, baseline, device, profile)
     assert {cfg.swap_ab for cfg in configs} == {False, True}
-    assert all(cfg.mma_tile_m % 128 == cfg.mma_tile_n % 128 == 0 for cfg in configs)
+    # sm120 facts in place of the parent's 128-multiple MMA tiles: warp-MMA configs whose CTA tile the
+    # sm120 block-scale template takes (a multiple or a divisor of the 128-row SF block, 128-byte K).
+    k_elems = 128 * 8 // (4 if dtype == "fp4_e2m1" else 8)
+    for cfg in configs:
+        assert cfg.pipeline == "sm120", cfg.name
+        validate_block_scale_config_sm120(cfg, block_size, k_elems)
     assert all(cfg.mma_tile_k_bytes == baseline.mma_tile_k_bytes for cfg in configs)
     assert any(cfg.split_k_slices == 3 for cfg in configs)
     assert len(planning.select_strategies(chain, baseline, device=device, probe=lambda chain, config: None)) == 8
@@ -99,9 +109,11 @@ def test_block_scale_cost_accounts_for_padded_scale_storage_and_staging():
     from cudnn.gemm.frost.planning import cost_features, split_candidates
 
     chain = _block_scaled_chain(M=160, N=192, K=1088, quantized=False)
-    config = by_name("CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma")
-    nv = cost_features(chain, config, _strategy_device())
-    mx = cost_features(replace(chain, block_scale=replace(chain.block_scale, block_size_a=(1, 32), block_size_b=(32, 1))), config, _strategy_device())
+    # An sm120 block-scale geometry on the SKU the sm120 profiles are calibrated on.
+    config = by_name("CONFIG_sm120_128x128x128_16x16x32_cluster1x1_warps4x2")
+    device = _rtx_pro_6000_device()
+    nv = cost_features(chain, config, device)
+    mx = cost_features(replace(chain, block_scale=replace(chain.block_scale, block_size_a=(1, 32), block_size_b=(32, 1))), config, device)
     assert nv.scale_input_mb == 2 * 256 * 68 / 1e6
     assert mx.scale_input_mb == 2 * 256 * 36 / 1e6
     assert nv.scale_stage_kb == 2 * mx.scale_stage_kb
@@ -114,7 +126,7 @@ def test_block_scale_cost_accounts_for_padded_scale_storage_and_staging():
     "a_dtype,b_dtype", [("fp4_e2m1", "fp4_e2m1"), ("fp8_e4m3", "fp8_e4m3"), ("fp8_e5m2", "fp8_e5m2"), ("fp8_e4m3", "fp8_e5m2"), ("fp8_e5m2", "fp8_e4m3")]
 )
 @pytest.mark.parametrize("out_dtype", ["bf16", "fp16"])
-def test_block_scale_profiles_share_widths_and_preserve_unmeasured_paths(calibrated_device, a_dtype, b_dtype, out_dtype):
+def test_block_scale_profiles_share_widths_and_preserve_unmeasured_paths(a_dtype, b_dtype, out_dtype):
     from cudnn.gemm.frost import planning
 
     reference = _block_scaled_chain(M=128, N=256, K=4096, quantized=False)
@@ -129,10 +141,10 @@ def test_block_scale_profiles_share_widths_and_preserve_unmeasured_paths(calibra
         block_scale=replace(bs, a_dtype=a_dtype, b_dtype=b_dtype, sf_dtype_a="fp8_e8m0", sf_dtype_b="fp8_e8m0", block_size_a=(1, 32), block_size_b=(32, 1)),
         output_specs=[replace(reference.output_specs[0], dtype=out_dtype)],
     )
-    baseline = select_config(128, 256, 1, K=4096, block_scale=True, sm_count=148)
-    device = calibrated_device
+    device = _rtx_pro_6000_device()
+    baseline = select_config(128, 256, 1, K=4096, block_scale=True, sm_count=device.sm_count, _pipeline="sm120")
     profile = planning.profile_for(reference, baseline, device)
-    assert profile is not None
+    assert profile is not None and profile.name == ("rtx_pro_6000_block_f4" if fp4 else "rtx_pro_6000_block_f8")
     assert planning.profile_for(chain, baseline, device) is profile
     if not fp4:
         assert planning.profile_for(replace(chain, block_scale=None), baseline, device) is not profile
@@ -147,7 +159,61 @@ def test_block_scale_profiles_share_widths_and_preserve_unmeasured_paths(calibra
         ),
     ]
     assert all(planning.select_strategies(view, baseline, device=device, probe=lambda chain, config: None) == [baseline] for view in outside)
-    assert all(planning.profile_for(chain, baseline, _strategy_device(arch=arch)) is None for arch in (103, 110, 120))
+    # The profiles match the calibrated SKU's exact name: other SM12x parts keep the rule-based baseline.
+    others = (
+        (120, "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 188),
+        (120, "NVIDIA GeForce RTX 5090", 170),
+        (121, "NVIDIA GB10", 48),
+    )
+    assert all(planning.profile_for(chain, baseline, _strategy_device(arch, name, sms)) is None for arch, name, sms in others)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["mxfp8", "fp8"])
+def test_sm120_swapped_candidate_is_the_family_pick(kind):
+    """The swapped orientation's auto candidate of an sm120 baseline is the
+    family's own pick for the swapped problem (``_pipeline="sm120"``: its warp
+    grid, K-tile width and block-scale N cap) -- not the other family's pick
+    crossed onto this one. Compared against an independent ``select_config``
+    call, so a retuned family pick moves the expectation with it."""
+    from cudnn.gemm.frost import planning
+    from cudnn.gemm.frost.dtypes import DTYPE_BITS
+    from cudnn.gemm.frost.fusion_ir import swap_ab
+
+    M = N = 4096
+    K = 16384
+    device = _rtx_pro_6000_device()
+    if kind == "mxfp8":
+        chain = _block_scaled_chain(M=M, N=N, K=K, quantized=False)
+        bs = replace(
+            chain.block_scale, a_dtype="fp8_e4m3", b_dtype="fp8_e4m3", block_size_a=(1, 32), block_size_b=(32, 1), sf_dtype_a="fp8_e8m0", sf_dtype_b="fp8_e8m0"
+        )
+        chain = replace(chain, matmul=replace(chain.matmul, a_dtype="fp8_e4m3", b_dtype="fp8_e4m3"), block_scale=bs)
+    else:
+        chain = _plain_strategy_chain(M=M, N=N, K=K)
+        chain = replace(chain, matmul=replace(chain.matmul, a_dtype="fp8_e4m3", b_dtype="fp8_e4m3"))
+    mm = chain.matmul
+    block_scale = kind == "mxfp8"
+    baseline = select_config(M, N, 1, K=K, block_scale=block_scale, b_elem_bytes=DTYPE_BITS[mm.b_dtype] // 8, sm_count=device.sm_count, _pipeline="sm120")
+    profile = planning.profile_for(chain, baseline, device)
+    assert profile is not None and profile.name == ("rtx_pro_6000_block_f8" if block_scale else "rtx_pro_6000_f8")
+    view = swap_ab(chain).matmul
+    family_pick = select_config(
+        view.M,
+        view.N,
+        1,
+        K=view.K,
+        block_scale=block_scale,
+        b_n_major=view.b_major == "n",
+        b_elem_bytes=DTYPE_BITS[view.b_dtype] // 8,
+        sm_count=device.sm_count,
+        _pipeline="sm120",
+        _batch=view.batch,
+    )
+    assert family_pick.pipeline == "sm120"
+    swapped = {replace(cfg, split_k_slices=1, swap_ab=False) for cfg in planning.candidate_configs(chain, baseline, device, profile) if cfg.swap_ab}
+    extras = {by_name(name) for name in profile.extra_geometries}
+    assert swapped == {family_pick} | extras, sorted(cfg.name for cfg in swapped)
 
 
 @pytest.mark.L0
