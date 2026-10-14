@@ -64,6 +64,20 @@ G = GEOMETRY_QSA_SMALL
 BS = 4
 
 
+@pytest.fixture(autouse=True)
+def _fp32_not_tf32():
+    """The oracle is an fp32 reference and its rows are checked against fp64 at fp32 budgets; an fp32 matmul is a TF32 one wherever
+    ``allow_tf32`` reads True (the default of some PyTorch builds), so the pin is set and printed like the sibling modules' -- the
+    oracle pins itself too (``ieee_fp32_matmul``); this fixture also covers the module's own fp32 helpers."""
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    print(f"\nallow_tf32={torch.backends.cuda.matmul.allow_tf32}")
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
+
 def _vis(block_ids, p, *, L=None, S_kv=None, block_lens=None, top_k=None, pos0=None, bs=BS):
     """``qsa_visible_mask`` on a python list of rows -> list of visible-token lists."""
     ids = torch.as_tensor(block_ids, device=DEV, dtype=torch.int32)
