@@ -293,10 +293,8 @@ def test_kv_mask_matches_the_fp64_oracle_on_sm100(case, with_bias):
         kw["bias"] = None
         ref = _t7._ref_of(_t7._CASES[case], q, k, v, kw)
     out = _run(q, k, v, **kw)
-    assert out["knobs"].cga == (_expected_cga(case) if with_bias else (2 if _t7._CASES[case].get("d", 32) == 64 and False else out["knobs"].cga)), (
-        case,
-        out["knobs"],
-    )
+    # a bias plan takes the budget's width; the kv_mask alone stages no block and keeps the tiles' own cga1 default on this line
+    assert out["knobs"].cga == (_expected_cga(case) if with_bias else 1), (case, out["knobs"])
     _t7._check(out, ref)
 
 
