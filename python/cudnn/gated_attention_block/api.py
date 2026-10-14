@@ -143,7 +143,7 @@ declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
   blobs (``sf_q`` / ``sf_k`` / ``sf_v``, one 1 KiB tile per ``(b, h, 128-row
   tile)``; V's is D-PLANE-MAJOR, ``mma-tma-matrix.md`` § 7); the production
   ``sm107/prefill_d256_mxfp8.py`` (``SdpaFwdDslSm100(pertensor_fp8=False)``,
-  NATURAL at (256, 256), cga1) writes bf16 O; the bf16 gate; a PER-TENSOR
+  NATURAL at (256, 256), the 2-CTA pair on dense legs) writes bf16 O; the bf16 gate; a PER-TENSOR
   ``quantize_o`` (``MxQuantSpec.scale_o``; D1 -- never the rowwise recipe) and
   the per-tensor FP8 ``out_proj`` with ``alpha_o = descale_w_o / scale_o``.
 * **FULLY FUSED** (``fuse_norm_rope=True, fuse_gate=True``, 3 launches): the
@@ -3784,7 +3784,8 @@ class _Sdpa(_Stage):
     D8).  ``sched_policy`` is read off the MXFP8 row
     (``engine_name(arch, mxfp8=True)``: NATURAL at (256, 256) -- the per-tensor
     row's LPT claim does NOT transfer, D5) and ``cta_mma`` is left to the
-    adapter (1 for the quantized d256 flavor).  ``has_amax_o=False`` as under FP8.
+    adapter (2 on a dense unsplit leg, 1 under THD / paged / split-KV;
+    ``config_sm100.d256_mxfp8_pair_leg``).  ``has_amax_o=False`` as under FP8.
     Under ``thd=True`` the three blobs are the row's PACKED per-sequence-tile-padded
     layout at the block's slot CAPACITY (``_sf_slot_bytes_packed``: ``n_cap`` tiles
     per head, K and V equal) -- the adapter's binder derives the tile extent from
@@ -4983,7 +4984,7 @@ class GatedAttentionBlockFwd(APIBase):
         (1)  proj          h8+sf_h, W8+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM (E8M0 dequant in-MMA, no alpha)
         (2+3) norm+rope    in place (out of place into compact bf16 Q/K under save_for_backward)   this block's kernel
         (3q) quantize x3   PROJ[Q]/[K] rowwise, PROJ[V] columnwise -> q8/k8/v8 + sf_q/sf_k/sf_v   kernels/quantize_mxfp8.py
-        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, cga1)
+        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, pair on dense legs)
         (5)  gate          O, PROJ[G] -> O in place                this block's kernel
         (5q) quantize_o    O -> o8 (PER-TENSOR scale_o, D1)        kernels/quantize.py
         (6)  out_proj      o8 -> out (alpha_o = descale_w_o / scale_o)   per-tensor FP8 FROST GEMM
