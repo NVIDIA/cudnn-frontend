@@ -5958,9 +5958,10 @@ class GatedAttentionBlockFwd(APIBase):
             )
 
     def _check_qsa_execute_args(self, block_ids, block_lens, h: torch.Tensor) -> None:
-        """The index tensors against the declaration -- FORM only (dtype / rank / shape / contiguity / device), never a
-        value and never a sync (Rule 3): a QsaSpec block with caller lists needs ``block_ids``; a dense block refuses
-        them rather than ignoring a list it cannot consume."""
+        """The index tensors against the declaration -- FORM only (dtype / rank / shape / contiguity / device, and the
+        16-byte base alignment of ``block_ids``), never a value and never a sync (Rule 3): a QsaSpec block with caller
+        lists needs ``block_ids``; a dense block refuses them rather than ignoring a list it cannot consume.  Every refusal
+        here comes BEFORE the first stage runs, so a refused call leaves the workspace and a declared paged cache untouched."""
         if self.qsa is None:
             if block_ids is not None or block_lens is not None:
                 raise ValueError(
@@ -5983,6 +5984,15 @@ class GatedAttentionBlockFwd(APIBase):
             h.device,
             hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form, which this block does not declare)",
         )
+        # The sparse core binds block_ids as a TMA / bulk-copy base (assumed_align=16): the adapter refuses a view that starts off a
+        # 16-byte boundary (a storage offset of a few ids) -- but at stage (4), after the projection, norm + RoPE and a declared
+        # write-through have already run.  The same rule here, before any stage, so the refusal modifies nothing.
+        ptr = int(block_ids.data_ptr())
+        if ptr % 16:
+            raise ValueError(
+                "block_ids must start at a 16-byte aligned address (the sparse core binds it as a TMA / bulk-copy base; a storage-offset view "
+                f"is refused before any stage runs); got data_ptr=0x{ptr:x}"
+            )
         if block_lens is not None:
             _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
 

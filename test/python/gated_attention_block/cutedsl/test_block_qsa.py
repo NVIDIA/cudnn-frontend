@@ -749,7 +749,11 @@ def test_execute_form_checks_on_the_index_tensors():
         "rank": (i32(t), r"must be \[16, 512\]"),
         "strided": (i32(top_k, t).t(), "contiguous"),
         "not_a_tensor": ([[0] * top_k] * t, "torch.Tensor"),
+        # a storage-offset view 4 bytes off a 16-byte boundary: contiguous, int32, the right shape -- and refused by the block HERE, before
+        # the first stage runs (the sparse core binds block_ids as a TMA / bulk-copy base; the adapter refuses it too, but at stage (4))
+        "misaligned": (i32(t * top_k + 1)[1:].view(t, top_k), "16-byte"),
     }
+    good_offset16 = i32(t * top_k + 4)[4:].view(t, top_k)  # the control: a 16-byte storage offset is aligned and well-formed
     if torch.cuda.is_available():
         bad["device"] = (torch.zeros(t, top_k, dtype=torch.int32), "device")
     ws = torch.zeros(16, dtype=torch.uint8, device=_DEV)
@@ -793,7 +797,7 @@ def test_execute_form_checks_on_the_index_tensors():
             with pytest.raises(ValueError, match=match):
                 blk.execute(*args, block_ids=good, block_lens=lens_bad)
         # Well-formed lists pass every form check: the next refusal is the plan's (this block compiles only once the core lands).
-        for ids, ln in ((good, None), (good_dense, None), (good, lens), (good_dense, i32(b, s))):
+        for ids, ln in ((good, None), (good_dense, None), (good, lens), (good_dense, i32(b, s)), (good_offset16, None)):
             with pytest.raises(RuntimeError, match="call compile"):
                 blk.execute(*args, block_ids=ids, block_lens=ln)
 
