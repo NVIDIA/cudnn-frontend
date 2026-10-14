@@ -247,9 +247,7 @@ def _div_up(a, b):
 def swa_kv_lo_tile(anchor_row, window_left: int, tile_n: int):
     """First KV tile a left window of ``window_left`` keeps for ``anchor_row``
     (the q row plus the bottom-right diagonal); 0 while the window still
-    reaches kv 0.  The forward's KV-loop lower bound, and the backward's
-    deterministic dQ relay -- a kv-tile's turn on a q-tile is its rank among
-    that q-tile's visitors, which start here.
+    reaches kv 0.  The forward's KV-loop lower bound.
     """
     cond = anchor_row > cutlass.Int32(window_left)
     delta = anchor_row - cutlass.Int32(window_left)
@@ -384,6 +382,39 @@ def compute_q_loop_bounds(
         hi = cute.math.min(_div_up(q_hi_abs, tile_q), n_q_tiles)
 
     return QLoopBounds(lo=lo, hi=hi)
+
+
+@cute.jit
+def q_tile_kv_hi(
+    q_tile: cutlass.Int32,
+    seqlen_q: cutlass.Int32,
+    seq_kv_len: cutlass.Int32,
+    kv_last: cutlass.Int32,
+    mask_flags: cutlass.Constexpr[int],
+    tile_q: cutlass.Constexpr[int],
+    tile_kv: cutlass.Constexpr[int],
+    bottom_right: cutlass.Constexpr[bool],
+    window_right: cutlass.Int32,
+) -> cutlass.Int32:
+    """Highest kv tile whose compute_q_loop_bounds range contains ``q_tile``,
+    capped at ``kv_last`` (the last kv tile that runs).
+
+    Inverts the causal lower bound: kv tile k visits q tile j iff
+    ``(k * tile_kv - diag - window_right) // tile_q <= j``.  The window only
+    removes LOW kv tiles, so it does not move this bound.  The backward's
+    deterministic dQ relay counts turns down from it.  Meaningless for a q tile
+    no kv tile visits (nobody relays on it).  ``@cute.jit`` because the relay
+    calls it inside the kernel's dynamic q loop.
+    """
+    hi = kv_last
+    if cutlass.const_expr(mask_flags & MASK_CAUSAL):
+        if cutlass.const_expr(bottom_right):
+            causal_diag = seq_kv_len - seqlen_q
+        else:
+            causal_diag = cutlass.Int32(0)
+        q_end = (q_tile + cutlass.Int32(1)) * cutlass.Int32(tile_q)
+        hi = cute.math.min(hi, (q_end + causal_diag + window_right - cutlass.Int32(1)) // cutlass.Int32(tile_kv))
+    return hi
 
 
 # ---------------------------------------------------------------------------
