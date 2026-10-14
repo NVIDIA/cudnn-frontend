@@ -64,6 +64,7 @@ from cudnn.sdpa.fwd.config_sm100 import sm100_bias_stages_pick as _sm100_bias_st
 from cudnn.sdpa.fwd.config_sm100 import SM100_TILE_NS_BY_D_SHAPE as _SM100_TILE_NS_BY_D_SHAPE, sm100_tile_n_pick as _sm100_tile_n_pick
 from cudnn.sdpa.fwd.config_sm100 import SM100_FP32_VECTOR_WITH_BIAS_TILE_N as _SM100_FP32_VECTOR_WITH_BIAS_TILE_N
 from cudnn.sdpa.fwd.config_sm100 import sm100_padded_tail_form_pick as _sm100_padded_tail_form_pick
+from cudnn.sdpa.fwd.config_sm100 import sm100_dead_subtile_quiet_pick as _sm100_dead_subtile_quiet_pick
 
 # The SM100 line's device capabilities that serve the small tiles' bias / kv_mask arms (the sm100 row's sm 100..106 band: cc 10.0 and
 # 10.3); cc 10.7 is the Rubin row's.
@@ -1926,9 +1927,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
 
     def _dead_subtile_quiet_eligible(self) -> bool:
-        """Whether this plan runs the one-batch-entry item of the Rubin small tiles without a bias (``TemplateParams.dead_subtile_quiet``):
-        the only rendering whose dead softmax sub-tile (no live row) can take the quiet body -- the bias arms also wait and release the
-        bias barriers per item, which the quiet body does not replicate."""
+        """Whether this plan runs a rendering whose dead softmax sub-tile (no live row) can take the quiet body (``TemplateParams.dead_subtile_quiet``):
+        on the Rubin small tiles the one-batch-entry item without a bias (the quiet body there replicates the plain row mapping's barrier sequence,
+        none of the bias barriers); on the SM100 small tiles the -inf body (a bias or a kv_mask; the quiet body there carries the ring handshake),
+        off the d64 decode tile."""
+        if self._device_cc in _SM100_BIAS_CCS:
+            return (
+                not self._fp8
+                and self.flavor in _SM100_BIAS_D_SHAPES
+                and not self.thd
+                and not self.pack_gqa
+                and self.gate_desc is None
+                and (self.bias_desc is not None or self.kv_mask_desc is not None)
+                and not self._d64_decode_tile()
+            )
         return (
             self._device_cc == (10, 7)
             and not self._fp8
@@ -1944,6 +1956,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         validated by ``check_support``) or the pick (``config_sm107.sm107_dead_subtile_quiet_pick``: the default constant or the sweep seam)."""
         if not self._dead_subtile_quiet_eligible():
             return 0
+        if self._device_cc != (10, 7):
+            return _sm100_dead_subtile_quiet_pick(
+                self.flavor[0],
+                has_bias=self.bias_desc is not None,
+                has_kv_mask=self.kv_mask_desc is not None,
+                request=self.dead_subtile_quiet,
+                s_q=int(self.q_desc.shape[2]),
+                cga=int(self.cga) if self.cga is not None else 1,
+            )
         return _sm107_dead_subtile_quiet_pick(
             self.flavor[0],
             has_bias=False,
@@ -2603,9 +2624,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         self._not_implemented_error_if(
             self.dead_subtile_quiet is not None and not self._dead_subtile_quiet_eligible(),
-            f"dead_subtile_quiet={self.dead_subtile_quiet} selects the dead-sub-tile body of the Rubin f16/bf16 32- / 64-wide tiles' one-batch-entry "
-            f"item (no bias, no PackGQA / THD / gated epilogue); head dims ({d_qk}, {d_v}) select {self.flavor} on cc {self._device_cc}, "
-            f"bias={self.bias_desc is not None}, pack_gqa={self.pack_gqa}, thd={self.thd}, gate={self.gate_desc is not None}",
+            f"dead_subtile_quiet={self.dead_subtile_quiet} selects the dead-sub-tile body of the f16/bf16 32- / 64-wide tiles' one-batch-entry item "
+            f"(on cc 10.7 the plain body: no bias; on cc 10.0 / 10.3 the -inf body: a bias or a kv_mask, off the d64 decode tile; never PackGQA / THD / "
+            f"the gated epilogue); head dims ({d_qk}, {d_v}) select {self.flavor} on cc {self._device_cc}, bias={self.bias_desc is not None}, "
+            f"kv_mask={self.kv_mask_desc is not None}, pack_gqa={self.pack_gqa}, thd={self.thd}, gate={self.gate_desc is not None}",
         )
         if self.bias_desc is not None or self.kv_mask_desc is not None:
             # The resident-block arms bind through the PREPARED launch only: the staging-copy executor (a layout TMA cannot bind

@@ -219,7 +219,7 @@ def test_the_small_tile_forms_build_with_the_sm100_geometry():
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, n_chunk=4), "needs bias_mode=1"),
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, bias_mode=1, kv_mask_form=3, bias_max_form=1), "additive kv_mask vector"),
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, padded_tail_form=1), "MASK_FLAGS == MASK_PADDED alone"),  # a DENSE record: the pre-masked tail needs the padding arm (the plain or the bias body)
-        (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, bias_mode=1, dead_subtile_quiet=1), "one-batch-entry item without a bias"),
+        (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, dead_subtile_quiet=1), "-inf body"),  # the PLAIN body's quiet form is not wired on this file (the -inf body's is)
         (dict(d_flavor=32, cta_mma=1, dtype_qkv=2, q_in_tmem=1, cta_mma_=None), None),
     ],
     ids=[
@@ -235,7 +235,7 @@ def test_the_small_tile_forms_build_with_the_sm100_geometry():
         "pair_item_needs_a_bias",
         "hw_max_with_an_additive_vector",
         "premasked_tail_needs_a_padded_body",
-        "quiet_body_needs_no_bias",
+        "quiet_body_needs_the_inf_body",
         "q_in_tmem_builds",
     ],
 )

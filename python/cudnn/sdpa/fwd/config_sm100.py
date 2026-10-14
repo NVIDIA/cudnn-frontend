@@ -2920,6 +2920,38 @@ SM100_PADDED_TAIL_FORM_DEFAULT = 0
 SM100_BIAS_PADDED_TAIL_FORM_BY_TILE_N = {128: 0, 64: 0}
 _PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS: Optional[int] = None
 
+# The DEAD-SUB-TILE QUIET body on the SM100 small tiles' -inf body (TemplateParams.dead_subtile_quiet; a bias or a kv_mask, the one-batch-entry
+# item): a softmax sub-tile with no live row (the batch entry's S_q ends inside the 256-row item: S_q % (256 x cga) in 1..128 -- S 384 / 640 of the
+# triangle grid) runs the full -inf body on rows nobody stores (0, the legacy form) or the quiet body (1: the live body's barrier sequence, no load,
+# no math).  SERVED behind a request or the sweep seam; the knob-less default is 0 until the GB200 A/B lands a rule (the constant below is that
+# rule's landing place).  The PLAIN body's quiet form is not wired on this line (the kernel refuses it); the Rubin pick (`sm107_dead_subtile_quiet_pick`)
+# serves the OTHER half -- its plain body -- so the two picks are disjoint by construction.
+SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT = 0
+_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS: Optional[int] = None
+
+
+def sm100_dead_subtile_quiet_pick(
+    d_flavor: int, *, has_bias: bool, has_kv_mask: bool, request: Optional[int] = None, s_q: Optional[int] = None, cga: int = 1, tile_m: int = 128
+) -> int:
+    """The ``TemplateParams.dead_subtile_quiet`` of a plan on the SM100 small tiles: 0 off the eligible set (the plain body -- its quiet form is
+    not wired on this line -- the d128 flavor); on the -inf body (``has_bias`` or ``has_kv_mask``) ``request`` when the caller made one (the
+    adapter's ``dead_subtile_quiet=``, validated there: honoured or declined, never degraded), else 0 when the plan's S_q (``s_q`` with its cluster
+    width ``cga`` and Q tile height ``tile_m``) leaves NO dead sub-tile (the one-batch-entry item's cluster tile is 2 x tile_m x cga rows; a dead
+    sub-tile exists iff ``s_q % rows`` is in 1..(rows - tile_m); without one the quiet rendering only costs its code), else the sweep seam, else
+    :data:`SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT`."""
+    if not (has_bias or has_kv_mask) or int(d_flavor) not in (32, 64):
+        return 0
+    if request is not None:
+        return int(request)
+    if s_q is not None:
+        rows = 2 * int(tile_m) * max(int(cga), 1)
+        rem = int(s_q) % rows
+        if rem == 0 or rem > rows - int(tile_m):
+            return 0  # every softmax sub-tile of every item holds a live row: nothing to keep quiet
+    if _DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS is not None:
+        return int(_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS)
+    return SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT
+
 
 def sm100_padded_tail_form_pick(
     d_flavor: int, *, padded: bool, has_bias: bool, has_kv_mask: bool, causal: bool = False, swa: bool = False, request: Optional[int] = None, tile_n: int = 128
@@ -3112,9 +3144,10 @@ def _make_cfg_small_d_sm100(params: TemplateParams, *, tile_k: int) -> Tuple[Cfg
     dead_subtile_quiet = int(getattr(params, "dead_subtile_quiet", 0))
     if dead_subtile_quiet not in DEAD_SUBTILE_QUIET_FORMS:
         raise ValueError(f"{tag}: dead_subtile_quiet must be 0 (the full body on a dead sub-tile) or 1 (the quiet body); got {dead_subtile_quiet}")
-    if dead_subtile_quiet == 1 and (bias_mode or pair):
+    if dead_subtile_quiet == 1 and (pair or not (bias_mode or kv_mask_form)):
         raise ValueError(
-            f"{tag}: dead_subtile_quiet=1 (the dead-sub-tile quiet body) is wired on the one-batch-entry item without a bias only; got bias_mode={bias_mode}, n_chunk={n_chunk}"
+            f"{tag}: dead_subtile_quiet=1 (the dead-sub-tile quiet body) is wired on the -inf body (a bias or a kv_mask) of the one-batch-entry item only "
+            f"on this line; got bias_mode={bias_mode}, kv_mask_form={kv_mask_form}, n_chunk={n_chunk}"
         )
     cls = CfgD64 if tile_k == 64 else CfgD32
     cfg = cls(

@@ -114,6 +114,12 @@ def test_kernel_module_constants_and_the_not_yet_wired_backstops():
         _mod(seq_kv_lens_present=True, padded_tail_form=1, bias_mode=2, bias_stages=2, kv_mask_form=1)
     # the small tiles' ring-wait form: the shipped sleeping form (the d64 flavor's constant), never a literal
     assert plain.SPIN_RING_WAITS is False and res.SPIN_RING_WAITS is False and btail.SPIN_RING_WAITS is False
+    # the dead-sub-tile quiet body: wired on the -inf arms (a bias / a kv_mask), refused on the plain body of this file (the factory's admission)
+    quiet = _mod(bias_mode=2, bias_stages=2, dead_subtile_quiet=1)
+    assert quiet._DEAD_SUBTILE_QUIET and quiet._BIAS_STREAMED and not res._DEAD_SUBTILE_QUIET
+    assert _mod(kv_mask_form=1, dead_subtile_quiet=1)._DEAD_SUBTILE_QUIET
+    with pytest.raises(ValueError, match="-inf body"):
+        _mod(dead_subtile_quiet=1)
     with pytest.raises(ValueError, match="pair item"):
         _mod(bias_mode=1, n_chunk=2)
     t64 = _mod(bias_mode=1, tile_n=64)
@@ -262,6 +268,39 @@ def test_padded_tail_form_pick_and_request_on_sm100(_sm100_device_for_the_adapte
         _api(s_q=256, s_kv=256, seq_kv_lens_present=True, bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256), padded_tail_form=1).check_support()
     with pytest.raises((NotImplementedError, ValueError)):
         _api(d=64, s_q=128, s_kv=128, seq_kv_lens_present=True, padded_tail_form=1).check_support()  # the d64 decode tile's plan
+
+
+def test_dead_subtile_quiet_pick_and_request_on_the_inf_body_on_sm100(_sm100_device_for_the_adapter, monkeypatch):
+    """The dead-sub-tile quiet body is served on the SM100 small tiles' -inf body (a bias or a kv_mask) by request or by the sweep seam when the
+    plan's S_q leaves a dead sub-tile; the knob-less default is 0 until measured; the plain body (its quiet form is not wired here) and a plan
+    without a dead sub-tile are 0 (a request on the plain body is a typed decline)."""
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384) == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384, request=1) == 1
+    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=False, has_kv_mask=True, s_q=640, request=1) == 1
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=False, has_kv_mask=False, s_q=384, request=1) == 0  # the plain body: not wired here
+    assert c0.sm100_dead_subtile_quiet_pick(128, has_bias=True, has_kv_mask=False, s_q=384, request=1) == 0
+    monkeypatch.setattr(c0, "_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS", 1)
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=384) == 1
+    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=640) == 1
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=256) == 0, "no dead sub-tile at a 256 multiple"
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=200) == 0, "S_q % 256 = 200 > 128: sub-tile 1 (rows 128..255) holds live rows"
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=100) == 1, "rows 128..255 of the only item are dead"
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=True, has_kv_mask=False, s_q=400) == 0, "S_q % 256 = 144 > 128: both sub-tiles live"
+    assert c0.sm100_dead_subtile_quiet_pick(64, has_bias=True, has_kv_mask=False, s_q=300, cga=2) == 1, "cga2: the cluster's 512 rows, 300 leaves dead sub-tiles"
+    assert c0.sm100_dead_subtile_quiet_pick(32, has_bias=False, has_kv_mask=False, s_q=384) == 0, "the seam never reaches the plain body"
+    api = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384))
+    assert api.check_support() is True and api.template_params().dead_subtile_quiet == 1 and api.template_params().bias_mode != 0
+    monkeypatch.setattr(c0, "_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS", None)
+    api0 = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384))
+    assert api0.check_support() is True and api0.template_params().dead_subtile_quiet == c0.SM100_INF_BODY_DEAD_SUBTILE_QUIET_DEFAULT
+    apir = _api(s_q=384, s_kv=384, bias=(1, 4, 384, 384), dead_subtile_quiet=1)
+    assert apir.check_support() is True and apir.template_params().dead_subtile_quiet == 1
+    apim = _api(s_q=640, s_kv=640, kv_mask=(2, 1, 1, 640), dead_subtile_quiet=1)
+    assert apim.check_support() is True and apim.template_params().dead_subtile_quiet == 1 and apim.template_params().kv_mask_form != 0
+    with pytest.raises((NotImplementedError, ValueError)):
+        _api(s_q=384, s_kv=384, dead_subtile_quiet=1).check_support()  # the plain body: a typed decline on this line
 
 
 # --------------------------------------------------------------------------- tier 3: the GPU cells (a cc 10.0 / 10.3 device)
@@ -607,6 +646,44 @@ def test_pre_masked_tail_on_the_bias_body_matches_the_oracle_and_the_word_body_b
     assert word["knobs"].tile_n == pre["knobs"].tile_n == tile_n, (case, word["knobs"], pre["knobs"])
     _t7._check(pre, ref)
     assert torch.equal(pre["o"], word["o"]) and torch.equal(pre["stats"], word["stats"]), (case, tile_n)
+
+
+# The dead-sub-tile QUIET body on the -inf arms (the sweep seam in-process): a dead sub-tile 1 (S_q % 256 in 1..128) on the resident block, the
+# streamed rings at both widths, the D 64 cga-1 ring at the losing cell's shape, with the kv_mask word and with the pre-masked padded tail --
+# against the oracle and BITWISE against the full body (the dead rows are never stored; every live row's O / Stats come from the same body).
+_QUIET_CASES = {
+    "quiet_bias_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=384),  # sub-tile 1 of the 2nd item dead: the 2-stage ring at 128 / the 3-stage ring at 64
+    "quiet_bias_100_res": dict(b=2, h=2, h_kv=2, s_q=100, s_kv=200),  # one item, sub-tile 1 (rows 128..255) dead from S_q 100: the resident block
+    "quiet_bias_640_d64": dict(b=1, h=2, h_kv=2, s_q=640, s_kv=640, d=64),  # the losing cell's shape: the 3rd item's sub-tile 1 dead on the 64-wide cga-1 ring
+    "quiet_bias_pad_384": dict(b=2, h=2, h_kv=2, s_q=384, s_kv=392, kv_lens=[392, 200]),  # sub-tile 1 of the 2nd item dead, with the pre-masked padded tail (both arms on)
+}
+_QUIET_PAIRS = [
+    ("quiet_bias_384", 128, False),
+    ("quiet_bias_384", 64, True),
+    ("quiet_bias_100_res", 128, False),
+    ("quiet_bias_640_d64", 64, False),
+    ("quiet_bias_pad_384", 128, False),
+]
+
+
+@requires_sm100_line
+@pytest.mark.parametrize("case,tile_n,with_mask", _QUIET_PAIRS, ids=[f"{c}-t{t}{'-mask' if m else ''}" for c, t, m in _QUIET_PAIRS])
+def test_quiet_dead_sub_tile_on_the_inf_body_matches_the_oracle_and_the_full_body_bitwise_on_sm100(case, tile_n, with_mask, monkeypatch):
+    from cudnn.sdpa.fwd import config_sm100 as c0
+
+    q, k, v, kw, _ = _t7._case_inputs(case, torch.bfloat16, table=_QUIET_CASES, kv_mask_p=(0.3 if with_mask else None))
+    kw.pop("cga", None)
+    assert kw["bias"] is not None
+    ref = _t7._ref_of(_QUIET_CASES[case], q, k, v, kw)
+    if "kv_lens" in _QUIET_CASES[case]:
+        monkeypatch.setattr(c0, "_PADDED_TAIL_FORM_OVERRIDE_FOR_SWEEPS", 1)
+    monkeypatch.setattr(c0, "_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS", 0)
+    full = _run(q, k, v, tile_n=tile_n, **kw)
+    monkeypatch.setattr(c0, "_DEAD_SUBTILE_QUIET_OVERRIDE_FOR_SWEEPS", 1)
+    quiet = _run(q, k, v, tile_n=tile_n, **kw)
+    assert full["knobs"].tile_n == quiet["knobs"].tile_n == tile_n, (case, full["knobs"], quiet["knobs"])
+    _t7._check(quiet, ref)
+    assert torch.equal(quiet["o"], full["o"]) and torch.equal(quiet["stats"], full["stats"]), (case, tile_n, with_mask)
 
 
 @requires_sm100_line

@@ -162,6 +162,7 @@ from cudnn.frost.tile_dsl.pointwise import (
     # row_max_reduction (see _softmax_kv_body).  cc 10.3+ (FUSED_LDTM_STAT) fuses
     # the load and the row-max into tmem_load_max_reduction_x64 on unmasked tiles.
     exp2_mixed,
+    opaque_f32_zero,
     row_reduction_pair,
     row_max_reduction,
     tmem_load_max_reduction_x64,
@@ -601,9 +602,19 @@ if _PADDED_TAIL_PREMASK and (CFG.MASK_FLAGS != MASK_PADDED or _KV_MASK_ARM):
     )
 # The -inf body's mask flags: MASK_NONE (an identity `apply_mask_chunk`) when the padded tail is pre-masked in TMEM, else the config's.
 _INF_BODY_MASK_FLAGS = MASK_NONE if _PADDED_TAIL_PREMASK else CFG.MASK_FLAGS
-if CFG.DEAD_SUBTILE_QUIET:
+# The DEAD-SUB-TILE QUIET body on the -inf arms (CFG.DEAD_SUBTILE_QUIET == 1 with CFG.BIAS_MODE or CFG.KV_MASK_FORM; TemplateParams.dead_subtile_quiet):
+# a softmax sub-tile whose FIRST row is at or past its batch entry's S_q has no live row -- sub-tile 1 of the last 256-row item when S_q % 256 is
+# in 1..128 (S 384: a quarter of the item's softmax work; S 640: a sixth), and under cga2 the non-leader CTA's sub-tiles past S_q.  0 = the legacy
+# form: that warp group runs the full -inf body on rows nobody stores (the bias / kv_mask loads, the FFMAs, exp2 / max / sum on values the TMA
+# store clips past S_q); 1 = the QUIET body (`_softmax_kv_body_inf_quiet`): the live -inf body's barrier sequence -- the ring stage wait /
+# release, the bmm1_done wait, the ping-pong, alpha = 1 + stat_full, the bmm2_ready arrives, the stat_empty wait -- and no load, no math (the
+# Rubin twin's `_softmax_kv_body_quiet` on its plain body; the -inf form adds the S1 / S2 ring handshake, the resident R1 / R2 stay item-level in
+# the caller).  The PLAIN body's quiet form is not wired on this file (the plain small-tile forms keep the full body on a dead sub-tile).
+_DEAD_SUBTILE_QUIET = CFG.DEAD_SUBTILE_QUIET == 1
+if _DEAD_SUBTILE_QUIET and not _INF_MASK_ARM:
     raise ValueError(
-        f"prefill_d128_f16_sm100: PADDED_TAIL_FORM={CFG.PADDED_TAIL_FORM} / DEAD_SUBTILE_QUIET={CFG.DEAD_SUBTILE_QUIET} are not wired on the SM100 file yet"
+        f"prefill_d128_f16_sm100: DEAD_SUBTILE_QUIET=1 (the dead-sub-tile quiet body) is wired on the -inf body (a bias or a kv_mask) only on this file; "
+        f"got BIAS_MODE={CFG.BIAS_MODE}, KV_MASK_FORM={CFG.KV_MASK_FORM}"
     )
 if CFG.N_BMM2_CHUNKS not in (1, 2):
     # The softmax body unrolls its P chunks by hand for one or two 64-column chunks (TILE_N 64 / 128); TILE_N 256 is a validator decline at
@@ -2565,6 +2576,47 @@ def _softmax_kv_body_inf(
 
 
 @cute.jit
+def _softmax_kv_body_inf_quiet(sub_tile_id: int, tmem_ptr_i32, bars, bmm1_phase, stat_empty_phase, leader_cta_id, bias_ring_state=None):
+    """The QUIET per-iter kv body of a DEAD softmax sub-tile on the -inf arms (CFG.DEAD_SUBTILE_QUIET == 1 with CFG.BIAS_MODE or CFG.KV_MASK_FORM; no
+    live row in this warp group's 128 rows: the batch entry's S_q ends inside the item): the live -inf body's BARRIER SEQUENCE in the live body's order
+    -- the streamed ring's stage wait (S1, ahead of where the live body pre-loads) and release (S2, one elected lane per warp), the mb_bmm1_done wait,
+    the top ping-pong sync (sub-tile 1), alpha = 1 stored to the stats slot + the mb_stat_full arrive (the correction's all_alpha_one ballot then skips
+    the rescale), one mb_bmm2_ready arrive per chunk (the MMA's BMM2 reads the TMEM residue P: its O rows are this sub-tile's, which the TMA store clips
+    past S_q), the bottom ping-pong sync (sub-tile 0), the mb_stat_empty wait -- and NO bias / kv_mask / TMEM load, FFMA, exp2, max or sum.
+    SUM(issuing lanes) per site is the live body's (1 elected lane x 8 warps on the ring release == init 8; 128 THREAD lanes on stat_full and on each
+    bmm2_ready slot; the 256-thread named barrier 8), so every init count holds; the resident block's item-level wait / release stay the caller's and
+    the ring state advances once per kv tile in the caller, as after the live body.  The sub-tile's running (max, sum) stay at their item-start
+    values (-inf, 0): the end-of-item publish then reads a row whose every key is masked, the state the full body reaches on a dead row's padding.
+    Returns (bmm1_phase, stat_empty_phase)."""
+    stats_off = LAYOUT.STATS_OFF + sub_tile_id * LAYOUT.STATS_STRIDE
+    N_CHUNKS = CFG.N_BMM2_CHUNKS
+    if cutlass.const_expr(_BIAS_STREAMED):
+        bars.mb_bias_ring_full[bias_ring_state.idx].wait(bias_ring_state.phase, spin=SPIN_RING_WAITS)
+    bars.mb_bmm1_done[sub_tile_id].wait(bmm1_phase, spin=SPIN_RING_WAITS)
+    bmm1_phase = bmm1_phase ^ 1
+    stats_addr = tmem_ptr_i32.load() + cutlass.Int32(stats_off)
+    if cutlass.const_expr(_BIAS_STREAMED):
+        # The stage is released unread (S2): one elected lane per warp, 8 == init, exactly as after the live body's last word.
+        if nvvm.elect_sync():
+            bars.mb_bias_ring_empty[bias_ring_state.idx].arrive()
+    if sub_tile_id == 1:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+    # alpha = 1 exactly (an opaque 0 + 1: no constant reaches the store), so the correction's all_alpha_one ballot passes.
+    alpha_one = opaque_f32_zero() + cutlass.Float32(1.0)
+    alpha_vec = cutlass.Vector.from_elements((alpha_one,), cutlass.Float32)
+    nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(stats_addr, cutlass.Float32), alpha_vec)
+    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
+    bars.mb_stat_full[sub_tile_id].arrive()
+    for c in cutlass.range_constexpr(N_CHUNKS):
+        bars.mb_bmm2_ready[sub_tile_id * N_CHUNKS + c].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
+    if sub_tile_id == 0:
+        nvvm.barrier_cta_sync(barrier_id=8, thread_count=256)
+    bars.mb_stat_empty[sub_tile_id].wait(stat_empty_phase, spin=SPIN_RING_WAITS)
+    stat_empty_phase = stat_empty_phase ^ 1
+    return bmm1_phase, stat_empty_phase
+
+
+@cute.jit
 def _softmax_warp_group(
     sub_tile_id: int,
     seqlen_q,
@@ -2695,7 +2747,22 @@ def _softmax_warp_group(
                 if item_live:
                     bars.mb_bias_full.wait(bias_full_phase)
                     bias_full_phase = bias_full_phase ^ cutlass.Int32(1)
-            for kv_loop in cutlass.range(bounds.left, bounds.right, 1, unroll=1):
+            # The live loop's lower bound: the item's left tile, or -- under the dead-sub-tile quiet body -- the item's right tile on a DEAD
+            # sub-tile, whose kv range the quiet loop walks instead (off the arm the name aliases `bounds.left`: no IR).
+            live_lo = bounds.left
+            if cutlass.const_expr(_DEAD_SUBTILE_QUIET):
+                # DEAD = this warp group's first row is at or past the batch entry's S_q (warp-group uniform: the tile decode and the resolved
+                # length are uniform; the -inf arms never pack GQA, so q_row_coord is a row).  The quiet loop walks the whole kv range with the
+                # live body's barrier sequence and no math; the live loop then sees [right, right) -- zero iterations -- on this sub-tile.
+                sub_dead = (q_row_coord + cutlass.Int32(sub_tile_id * CFG.TILE_M)) >= eff_seqlen_q
+                quiet_hi = cutlass.Int32(arith.select(sub_dead.ir_value(), bounds.right.ir_value(), bounds.left.ir_value()))
+                for kv_loop in cutlass.range(bounds.left, quiet_hi, 1, unroll=1):
+                    bmm1_phase, stat_empty_phase = _softmax_kv_body_inf_quiet(sub_tile_id, tmem_ptr_i32, bars, bmm1_phase, stat_empty_phase, leader_cta_id, bias_ring_state)
+                    if cutlass.const_expr(_BIAS_STREAMED):
+                        # One ring stage consumed per kv tile (the quiet body waited and released it): advance in lockstep with the fill.
+                        bias_ring_state = advance(bias_ring_state, CFG.STAGES_BIAS)
+                live_lo = quiet_hi
+            for kv_loop in cutlass.range(live_lo, bounds.right, 1, unroll=1):
                 total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase = _softmax_kv_body_inf(
                     sub_tile_id,
                     kv_loop,
