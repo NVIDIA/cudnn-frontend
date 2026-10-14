@@ -148,7 +148,9 @@ is the identity and causal attention over the visible tokens IS the QSA layer. S
 tokens -- every sequence of up to 2051 tokens -- the dense block computes Flash-Next's attention layer exactly: the same
 function (a sparse evaluation sums the same terms in another order, so the identity holds within the suite's budget, not
 bitwise). Beyond 2051 visible tokens QSA drops the blocks its indexer did not select while this block attends densely -- a
-different function; the indexer and the sparse core are not part of the block today.
+different function: declare the geometry with `qsa=QsaSpec(...)` and hand the selection in as `execute(block_ids=)`
+("Sparse attention (QSA)" below) and the block runs the sparse core as its attention stage; the in-block indexer is a
+follow-up.
 
 ### Weights and tables
 
