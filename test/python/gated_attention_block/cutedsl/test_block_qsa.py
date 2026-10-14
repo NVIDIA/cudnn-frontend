@@ -459,7 +459,8 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_re
     """The block CONSTRUCTS with the sparse stage in stage (4)'s slot (the five-band geometry accepted by every stage ahead
     of it), with no host sync; ``check_support`` then asks the sparse ADAPTER, whose record names the arch range -- so off
     Rubin the decline is the adapter's typed one naming the found cc (the block keeps no ``(10, 7)`` literal of its own for
-    the sparse path), and on Rubin the block is supported (the end-to-end module runs it)."""
+    the sparse path; below cc 10 the gather4 part floor's decline answers first), and on Rubin the block is supported (the
+    end-to-end module runs it)."""
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=True))
     kw = _samples(geom)
     with _no_host_sync():
@@ -474,7 +475,10 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_re
                 pytest.skip(str(_CUTEDSL_REQUIREMENT))  # the stages ahead import their CuTe DSL kernels to answer check_support()
             cc = tuple(torch.cuda.get_device_capability())
             if cc != (10, 7):
-                with pytest.raises(NotImplementedError, match=rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}"):
+                # a cc 10.x part other than Rubin hears the record's Rubin-line decline; below cc 10 the gather4 part floor
+                # (tile_dsl.requirements, cc 10.0+) answers one gate EARLIER, naming the instruction's floor, not the record
+                pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] >= 10 else r"requires a cc 10\.0\+ part"
+                with pytest.raises(NotImplementedError, match=pattern):
                     blk.check_support()
                 assert not blk._is_supported
                 assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None  # declined before any kernel module was loaded
