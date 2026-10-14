@@ -242,6 +242,10 @@ def test_heuristics_sm100_column_is_the_measured_gb200_table():
     # the refinements: (width, N floor, batch bucket, direction or None) -> the ONE axis overridden
     refinements = [
         (128, 0, 1, "incoming", {"clc_stages": 1}),
+        (128, 129, 1, "outgoing", {"ln_once": "block", "k1_pass_order": "major"}),
+        (128, 129, 4, None, {"ln_once": "block", "k1_pass_order": "major"}),
+        (128, 0, 4, None, {"ln_once": "block", "k1_pass_order": "major"}),
+
         (128, 256, 1, "incoming", {"ln_pass_form": "smem_rolled_pf"}),
         (128, 256, 4, None, {"ln_pass_form": "registers"}),
         (128, 384, 4, None, {"ln_pass_form": "registers"}),

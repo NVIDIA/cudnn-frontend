@@ -384,9 +384,18 @@ _PICKS_SM100: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]] = {
         (0, _pick(k2.SMALL_N_TILE_CONFIG, "major", "mn_major", 2, "smem_rolled_pf", "packed", ln_once="block", ln_once_b_stages=4)),
     ),
 }
+# THE 129 AND 0 FLOORS (N 129..255 and N < 129 at c 128), measured 2026-10-14 at N 217 and N 128 on the same node class (the picks the column had carried from Rubin unmeasured; one process per
+# bucket, the hand-picked arms beside the pick, its control twin and cuEq, low duty, every arm bitwise the pick and inside the API oracle): the LayerNorm-once
+# BLOCK item with the pass-MAJOR order over the carried per-tile interleaved pick -- +17.7 % at 217 x 4 outgoing, +7.2 / +10.2 % at 128 x 4 incoming / outgoing, +10.8 % at 217 x 1 outgoing (decisive, bars 0.5-4.3 %).  The N 128 cells at B 1 are inside their (wide, 34-us-kernel)
+# control bars (+1.9 / +2.3 %), so the B 1 row is the OUTGOING-direction refinement the 217 cell decides (incoming at N 217 is the typed N % 8 decline); the
+# B >= 4 refinements (the 129 floor by N 217 x 4 outgoing, the 0 floor by N 128 x 4 both directions) cover both directions.  The register form stays (the pipelined rolled form under the item read 5-6 % behind the item alone).
 _REFINEMENTS_SM100: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]] = {
     128: (
         (0, 1, "incoming", TriMulKnobs(clc_stages=1)),
+        (129, 1, "outgoing", TriMulKnobs(ln_once="block", k1_pass_order="major")),
+        (129, 4, None, TriMulKnobs(ln_once="block", k1_pass_order="major")),
+        (0, 4, None, TriMulKnobs(ln_once="block", k1_pass_order="major")),
+
         (256, 1, "incoming", TriMulKnobs(ln_pass_form="smem_rolled_pf")),
         (256, 4, None, TriMulKnobs(ln_pass_form="registers")),
         (384, 4, None, TriMulKnobs(ln_pass_form="registers")),
