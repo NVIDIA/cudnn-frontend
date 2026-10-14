@@ -206,6 +206,39 @@ def test_recommend_every_set_is_admissible():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("b,h", [(65536, 1), (1, 65536)], ids=["batch", "heads"])
+def test_grid_past_65535_rides_the_flat_lpt_grid(b, h):
+    """#1573: NATURAL launches heads and batch on gridDim.y/z, capped at 65535 by CUDA."""
+    facts = _facts(b=b, h_q=h, h_kv=h, s_q=128, s_kv=64, d_qk=64, d_v=64, causal=False)
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    natural = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    assert "gridDim.y/z" in engines.mismatch(caps, facts, natural)
+    # The split-KV combine launches heads and batch on y/z whatever the scheduler.
+    split_lpt = engines.SdpaFwdKnobs(sched_policy=SCHED_LPT, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+    assert "split-KV combine" in engines.launch_grid_mismatch(caps, facts, split_lpt)
+    for kind in ("A", "FALLBACK"):
+        plans = [p for p in recommend(kind, facts, _OFFERED) if p.engine_id == 20500]
+        assert plans, kind
+        assert all(p.knobs.sched_policy in (SCHED_LPT, SCHED_LPT_L2) and (p.knobs.split_kv or 1) == 1 for p in plans), [p.knobs for p in plans]
+    control = _facts(b=65535, h_q=1, h_kv=1, s_q=128, s_kv=64, d_qk=64, d_v=64, causal=False)
+    assert engines.mismatch(caps, control, natural) is None
+    assert recommend("A", control, _OFFERED)[0].knobs.sched_policy == SCHED_NATURAL
+
+
+@pytest.mark.L0
+def test_packed_thd_split_keeps_batch_off_the_grid():
+    """#1573: the packed THD combine launches ((t_q+3)//4, heads, 1), so only heads meet the 65535 cap."""
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    split = engines.SdpaFwdKnobs(sched_policy=SCHED_LPT, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+    thd = dict(s_q=8, s_kv=2048, causal=False, thd=True, max_total_seq_len_q=8)
+    facts = _facts(b=65536, h_q=1, h_kv=1, **thd)
+    assert engines.packed_thd_split(caps, facts, split)
+    assert engines.launch_grid_mismatch(caps, facts, split) is None
+    heads = _facts(b=1, h_q=65536, h_kv=65536, **thd)
+    assert "packed split-KV combine" in engines.launch_grid_mismatch(caps, heads, split)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "engine_name,dtype,is_fp8",
     [

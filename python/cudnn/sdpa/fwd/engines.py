@@ -768,6 +768,53 @@ def effective_sched_policies(capabilities: Capabilities, facts: "ga.SdpaGraphFac
     return capabilities.sched_policies
 
 
+def packed_thd_split(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: SdpaFwdKnobs) -> bool:
+    """Whether these knobs split a THD graph through the prepared packed split host (``_thd_split_host``)."""
+    split_cga = knobs.cga if knobs.cga is not None else (1 if (facts.d_qk, facts.d_v) == (64, 64) else 2)
+    return split_cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
+
+
+# CUDA caps gridDim.y and gridDim.z at 65535 (#1573).
+_GRID_YZ_MAX = 65535
+
+
+def launch_grid_mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: SdpaFwdKnobs) -> Optional[str]:
+    """Why these knobs' launch grid puts more than 65535 on gridDim.y or .z, else ``None``.
+
+    The NATURAL scheduler launches heads and batch x split_kv on y/z; the LPT
+    policies and the SM100+/SM120 ragged grids are flat. The d256 decode tile
+    keeps batch on y, the SM80/SM90 ragged grids keep heads and batch on y/z, and
+    the split-KV combine keeps heads and batch on y/z, under every policy; the
+    packed THD split combine keeps only heads on y. Packed
+    GQA launches fewer head rows; ``h_q`` bounds them from above because the
+    packing factor is per kernel flavor.
+    """
+    batch, heads = facts.b * (knobs.split_kv or 1), facts.h_q
+    if max(batch, heads) <= _GRID_YZ_MAX:
+        return None
+    if packed_thd_split(capabilities, facts, knobs):
+        # The packed combine launches ((t_q+3)//4, heads, 1) and the split attention a flat grid.
+        if heads <= _GRID_YZ_MAX:
+            return None
+        return f"the packed split-KV combine launches heads={heads} on gridDim.y, past the CUDA limit of {_GRID_YZ_MAX}"
+    if (knobs.split_kv or 1) > 1 and max(facts.b, heads) > _GRID_YZ_MAX:
+        return f"the split-KV combine launches heads={heads} and batch={facts.b} on gridDim.y/z, past the CUDA limit of {_GRID_YZ_MAX}"
+    if d256_decode_tile_selected(capabilities, facts, _decode_tile_pack_g(facts, knobs), _decode_tile_split_kv(knobs)):
+        if facts.b <= _GRID_YZ_MAX:
+            return None
+        return f"the d256 decode tile launches batch={facts.b} on gridDim.y, past the CUDA limit of {_GRID_YZ_MAX}"
+    if facts.thd:
+        if capabilities.sm_lo not in (80, 90):
+            return None
+        return f"the ragged grid launches heads={heads} and batch={facts.b} on gridDim.y/z, past the CUDA limit of {_GRID_YZ_MAX}"
+    if knobs.sched_policy not in (None, SCHED_NATURAL):
+        return None
+    return (
+        f"SCHED_POLICY=NATURAL launches heads={heads} and batch x split_kv={batch} on gridDim.y/z, "
+        f"past the CUDA limit of {_GRID_YZ_MAX}; the LPT policies launch a flat grid"
+    )
+
+
 def effective_cgas(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", split_kv: Optional[int] = None) -> frozenset[int]:
     """CGA domain of the native flavor and split leg selected by the graph."""
 
@@ -862,13 +909,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
         ):
             if value is not None and value not in domain:
                 return f"requested {label}={value} is outside this engine's domain {sorted(domain, key=int)}"
+        grid_reason = launch_grid_mismatch(capabilities, facts, knobs)
+        if grid_reason is not None:
+            return grid_reason
         # D128 half cga1 uses the decode tile for ragged Q=1 and the split
         # host, or the two-slab prefill body for unsplit SM100 paged Q>1.
         # Other ragged graphs keep the cga2 prefill tile.
         # api_dsl.check_support mirrors these lines (keep them in lockstep).
         ragged_decode = knobs.cga == 1 and facts.thd and _thd_decode_leg(capabilities, facts)
-        split_cga = knobs.cga if knobs.cga is not None else (1 if (facts.d_qk, facts.d_v) == (64, 64) else 2)
-        packed_split = split_cga == (2 if (facts.d_qk, facts.d_v) == (256, 256) else 1) and (knobs.split_kv or 1) > 1 and thd_split_domain(capabilities, facts)
+        packed_split = packed_thd_split(capabilities, facts, knobs)
         # The d256 DECODE tile (sm107/decode_d256_f16.py) packs the WHOLE group into its 16-row Q tile
         # over a dense or paged cache (HEADS_PER_TILE = QH_PER_KH) and writes the SM100 tile's fp32 split
         # partials for sm100/split_combine, so a decode-shaped half d256 graph packs and splits whatever

@@ -87,6 +87,7 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
     rubin_dense_d128_shared_leg,
@@ -2167,7 +2168,12 @@ def recommend(kind: str, facts, offered: Dict[str, int]) -> List[PlanConfig]:
         caps = spec.capabilities
         sets = _knob_sets(spec, facts) if kind == "A" else [_fallback_knobs(spec, facts)]
         for knobs in sets:
-            if mismatch(caps, facts, knobs) is None:
+            if mismatch(caps, facts, knobs) is not None:
+                if knobs.split_kv != 1 or launch_grid_mismatch(caps, facts, knobs) is None:
+                    continue
+                # Past 65535 heads or batch the NATURAL grid cannot launch; the flat LPT grid serves the same set (#1573).
+                knobs = next((lpt for lpt in (replace(knobs, sched_policy=p) for p in (SCHED_LPT, SCHED_LPT_L2)) if mismatch(caps, facts, lpt) is None), None)
+            if knobs is not None and PlanConfig(engine_id, knobs) not in out:
                 out.append(PlanConfig(engine_id, knobs))
     return out
 
