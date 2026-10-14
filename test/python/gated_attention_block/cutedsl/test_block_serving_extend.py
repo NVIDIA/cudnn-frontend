@@ -2424,6 +2424,34 @@ def test_extend_num_tokens_live_launches_the_live_rows_and_leaves_the_rows_past_
 
 @pytest.mark.L1
 @requires_rubin
+def test_extend_num_tokens_live_with_the_write_through_folded_takes_the_capacity_slot_map():
+    """``num_tokens_live`` on the pipeline whose paged write-through is FOLDED into the fused projection's epilogue (``fuse_norm_rope=True``,
+    the auto fold): the token tensors handed at the declared ``T_max`` rows -- the slot map at its CAPACITY length, which the live-count
+    contract admits -- with the live count 412 of 512.  The fused projection runs over the live rows, so it takes the live-row view of
+    the slot map exactly as the separate cache-write stage does: the live rows of ``out`` and the pools BITWISE the capacity launch (the
+    same step without the count), rows [412, 512) of a sentinel-filled ``out`` untouched.  (Handed the capacity-length slot map raw, the
+    fused arm's own row-count check refused it.)"""
+    hz = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=31, fuse_norm_rope=True)  # the LIVE-count arm
+    tw = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=31, fuse_norm_rope=True)  # the capacity arm (the same weights)
+    assert hz.blk.cache_write_fused and tw.blk.cache_write_fused, "the folded write-through is the arm under test"
+    sentinel = _OUT_SENTINEL[hz.dtype]
+    m = _MATRIX_PACKING
+    rec = hz.prepare(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    assert int(hz.slot.numel()) == 512, "the capacity-length slot map is what goes through the fused arm here"
+    hz.execute(num_tokens_live=412)
+    torch.cuda.synchronize()
+    rec["out"] = hz.out.clone()
+    hz.check(rec, label="(live, folded write-through) T_live 412 of 512, inputs at T_max rows")
+    tw.adopt(hz)
+    rec_t = tw.step(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    tw.check(rec_t, label="(live, folded write-through) the capacity arm")
+    assert torch.equal(rec["out"][:412], rec_t["out"][:412]), "the live rows differ from the capacity launch"
+    assert bool((rec["out"][412:] == sentinel).all()), f"rows past T_live were touched: {int((rec['out'][412:] != sentinel).any(-1).sum())}"
+    assert torch.equal(_bits(hz.k_cache), _bits(tw.k_cache)) and torch.equal(_bits(hz.v_cache), _bits(tw.v_cache)), "the pools differ"
+
+
+@pytest.mark.L1
+@requires_rubin
 @requires_capture_safe_gemm_route
 def test_extend_num_tokens_live_capture_replays_at_the_captured_count():
     """The capture pin under ``num_tokens_live``: the FIRST execute of a fresh declaration captured at T_live 412 (vLLM's defaults -- a new

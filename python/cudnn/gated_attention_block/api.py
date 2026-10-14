@@ -7392,8 +7392,11 @@ class GatedAttentionBlockFwd(APIBase):
                 stream=stream,
                 # (4w) folded in (cache_write_fused): the post-RoPE K / V rows go to the pools from the epilogue's registers -- the same
                 # bytes the slab gets, so the pool row is bitwise the row stage (4) consumes; stream order still orders this launch
-                # before the paged read (nothing on the chain launches as a programmatic dependent launch).
-                **({"k_cache": k_cache, "v_cache": v_cache, "slot_mapping": slot_mapping} if self.cache_write_fused else {}),
+                # before the paged read (nothing on the chain launches as a programmatic dependent launch).  The slot map is the
+                # LIVE-ROW view (`slot_live`, as the separate cache-write stage takes it): the fused projection runs over `rows` rows and
+                # its runner checks the slot map against that count, so under num_tokens_live a capacity-length slot map is sliced
+                # to the live rows here, not rejected there.
+                **({"k_cache": k_cache, "v_cache": v_cache, "slot_mapping": slot_live} if self.cache_write_fused else {}),
             )
         else:
             if mxfp8:
