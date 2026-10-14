@@ -452,21 +452,39 @@ with variable per-row effective length.
   consumed, so no values output buffer is allocated or written.
 - **Tie policy** — `tie_break=0` (default) permits arbitrary cutoff ties;
   `1` prefers smaller source-column indices and `2` prefers larger indices.
-  The selected set follows this policy, but output order remains unspecified.
+  The selected set follows this policy. When `deterministic=False`, output
+  order remains unspecified.
   Ties use equal radix keys: `+0` ranks before `-0`, as in the existing kernel;
-  NaN ordering is unspecified. The policy matches FlashInfer/CCCL unsorted
-  Top-K selection and applies only to this standalone API.
+  NaN ordering is unspecified. The policy applies only to this standalone API.
+- **Deterministic mode** — `deterministic=True` makes the selected set and
+  output slots repeatable. With the default `tie_break=0`, smaller source
+  indices win a cutoff tie. The returned local indices are canonicalized in
+  ascending order, carrying values with them. Selection and canonicalization
+  are fused into this CuTe DSL kernel rather than launching a separate finalize
+  kernel.
 - **Cost** — nonzero tie policies scan source columns inside the selection
   kernel only when equal cutoff keys compete for the remaining slots. The
-  scan stops once enough ties are found; no extra kernel, device allocation,
-  or host synchronization is introduced. The default specialization retains
-  the existing selection path.
-- **Constraints** — SM90+, `0 < top_k ≤ 2048`
+  scan stops once enough ties are found. Deterministic mode additionally sorts
+  the selected indices in CTA shared memory. The compiled specialization
+  chooses between an index-bitmap scan and an in-place bitonic sort according
+  to the target architecture and shape; on SM100, `top_k < 256` uses bitonic
+  ordering directly. Neither path adds a kernel, device allocation, or host
+  synchronization; the default specialization retains the existing selection
+  path.
+- **Constraints** — SM90+, `0 < top_k ≤ 2048`, nonzero row/column/batch
+  extents, and `next_n > 0`. `seq_lens` is contiguous INT32 on the input CUDA
+  device, and every entry must be in `[0, num_cols]`; the device-resident
+  values are not copied to the host for validation. On SM120,
+  `deterministic=True` supports at most 16,384 columns for FP32 and 32,768
+  columns for FP16/BF16 because of the 99 KiB per-block shared-memory limit;
+  `check_support()` rejects larger deterministic shapes before compilation.
 
 ```python
 result = DSA.indexer_top_k_wrapper(
     scores.reshape(-1, scores.shape[-1]),
-    seq_lens, top_k=512, tie_break=2,  # prefer later columns on ties
+    seq_lens,
+    top_k=512,
+    deterministic=True,
 )
 indices, values = result["indices"], result["values"]
 ```
@@ -480,10 +498,15 @@ device. `out_values` is required when the object was built with
 `workspace`, a CUDA `uint8` tensor of at least `scratch_workspace_bytes()` bytes
 (`n_rows * (2 for FP32, else 1) * num_cols * 4`, rounded up to 128) that is
 32-byte aligned; an absent or undersized workspace raises before launch.
+The writable `out_indices`, optional `out_values`, and carved scratch byte
+ranges must not overlap one another or the read-only inputs. Disjoint views of
+the same backing allocation are valid. The class API also requires a 32-byte
+aligned input base; the eager wrapper copies a contiguous storage-offset view
+when needed to satisfy this alignment.
 `compile()` builds the kernel from fake tensors and allocates nothing.
 `indexer_top_k_wrapper` allocates the outputs and the workspace per call on the
-launch stream. Rows the `next_n` stagger leaves empty receive no writes, so
-`out_indices` keeps whatever the caller stored there.
+launch stream. Rows the `next_n` stagger leaves empty are canonicalized to
+`-1` indices and `-inf` values.
 
 #### Compact vs. non-compact sparse indices
 
