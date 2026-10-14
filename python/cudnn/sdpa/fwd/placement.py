@@ -156,11 +156,9 @@ Rubin row remains opt-in.
   packed into one 16-row Q tile per (batch, KV head) unit, ``engines.d256_decode_tile_selected``) -- FlashInfer's cuDNN decode graph
   shape: a 4-D dense Q, a page pool with the padding mask (per-request KV lengths), no causal mask / window / sink / Stats, the KV
   declared as ``paged_attention_max_seq_len_kv``; the pool as FlashInfer's benchmark strides it -- ``[pages, H_kv, page, D]`` dims
-  with the token-major in-page layout (head stride ``D``, token stride ``H_kv x D``). The head-major pool (each head's page
-  contiguous, vLLM's ``[blocks, 2, H_kv, block, D]``) reads the same bytes per page in a friendlier order but was not measured, so
-  with more than one KV head it keeps the backend first until its chunk runs (``_sm107_paged_pool_token_major``; the gaps table of
-  SUPPORT_MATRIX_TRACKER.md); with ONE KV head the two layouts are the same bytes in the same order, which the 8/1, 12/1 and 16/1
-  geometries measured. Measured 2026-10-13 on an EXCLUSIVE GPU of the 212-SM cc 10.7 perf class (SM clock
+  with the token-major in-page layout (head stride ``D``, token stride ``H_kv x D``); the head-major pool (each head's page
+  contiguous, vLLM's ``[blocks, 2, H_kv, block, D]``, the same bytes per page in a friendlier order) measured 2026-10-14 on the 24/2 core geometry with the same protocol on an EXCLUSIVE GPU of the same 212-SM cc 10.7 class (lock 2376 sampled: busy median 2364; cuDNN 9.27.0 build 9.27.0.21; b 1-128 x declared KV 1k-128k at page 16 bf16, 48 cells x 2 regimes): the tile 0.36-0.92 of the backend on EVERY in-band cell in both regimes (32 cells per regime, all quotable; medians 0.45 replay / 0.45 eager), the out-of-band cells mixed 0.73-2.00 as in the token-major band -- so both in-page layouts
+  are admitted and the arm reads no pool stride. Measured 2026-10-13 on an EXCLUSIVE GPU of the 212-SM cc 10.7 perf class (SM clock
   locked at 2376 MHz and SAMPLED: busy median 2364), cudnn-frontend 1.32.0 (the develop tree carrying #1543's tile and route, plus
   the serving integration commits), cuDNN 9.27.0 build 9.27.0.21 (the pre-release build the harness loads),
   CuTeDSL 4.8.0, FlashInfer's ``bench_gpu_time`` (CUPTI kernel time, L2 flushed per iteration), the backend's default plan and the
@@ -354,26 +352,12 @@ def _d128_one_decode_tile_wave(caps: Capabilities, facts) -> bool:
     return waves is not None and waves[0] == 1
 
 
-def _sm107_paged_pool_token_major(facts) -> bool:
-    """Whether the page pool carries the in-page layout the paged d256 decode band measured: FlashInfer's benchmark pool,
-    token-major in the page (the ``[pages, H_kv, page, D]`` pool's head stride ``D`` below its token stride ``H_kv x D``).  A pool
-    with ONE KV head has a single in-page order whatever head stride it declares, so it counts as measured; the head-major pool
-    (each head's page contiguous -- the token stride below the head stride, the paged packed-GQA prefill shard's gate) with more
-    than one KV head is unmeasured, and so is a pool whose strides cannot be read."""
-    if facts.h_kv == 1:
-        return True
-    if facts.k_t is None:
-        return False
-    stride = tuple(facts.k_t.get_stride())
-    return len(stride) == 4 and stride[2] > stride[1]
-
-
 def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     """Paged dense-Q d256 decode (``s_q == 1``) on the Rubin d256 decode tile inside its measured band (module docstring, "PAGED
     dense-Q d256 half decode"): a measured GQA group packed whole onto the tile (``engines.d256_decode_tile_selected`` -- half
-    inputs, dense queries, the (256, 256) flavor, no pre-folded scale), a page pool of a measured page size in the in-page layout the
-    band measured (``_sm107_paged_pool_token_major``: token-major in the page, or one KV head), per-request KV lengths (the padding
-    mask every band cell carried), no mask / window / sink / Stats / gate,
+    inputs, dense queries, the (256, 256) flavor, no pre-folded scale), a page pool of a measured page size in either in-page layout
+    (both measured: the token-major band and the head-major 24/2 chunk), per-request KV lengths (the padding mask every band cell
+    carried), no mask / window / sink / Stats / gate,
     ``SM107_PAGED_D256_DECODE_MIN_UNITS <= b * h_kv <= SM107_PAGED_D256_DECODE_MAX_UNITS`` units, the declared KV inside
     ``SM107_PAGED_D256_DECODE_KV_TOKENS`` and ``units * KV >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT`` tokens in flight --
     the frontier both regimes (CUDA-graph replay and eager) share.  The MTP rows (``s_q >= 2``) and group 32 are held (module
@@ -384,8 +368,6 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     if group not in SM107_PAGED_D256_DECODE_GROUPS or not d256_decode_tile_selected(caps, facts, group):
         return False
     if facts.dtype not in (cudnn.data_type.HALF, cudnn.data_type.BFLOAT16) or facts.page_size not in SM107_PAGED_D256_DECODE_PAGE_SIZES:
-        return False
-    if not _sm107_paged_pool_token_major(facts):
         return False
     if facts.causal or facts.window_left is not None or facts.right_band_widening or facts.has_sink or facts.wants_stats or facts.has_epilogue_gate:
         return False
