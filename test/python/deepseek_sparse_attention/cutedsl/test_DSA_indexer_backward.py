@@ -22,16 +22,16 @@ from deepseek_sparse_attention.cutedsl.dsa_reference import (
 
 
 def _require_exact_sm100():
-    """Skip unless the current device is exactly SM100 (capability ``(10, 0)``).
+    """Keep hardware-validation cases on the available SM100 runner.
 
     ``dsa_init(min_compute_capability=100)`` means "SM100 **or newer**" — it
     compares ``major * 10 + minor`` — so an SM103/SM107/SM120 runner falls
-    straight through it. ``backend="sm100_v2"`` is exact-``(10, 0)`` by
-    construction (``check_support`` raises otherwise), so the v2 tests need
-    the exact gate on top of ``dsa_init``'s floor.
+    straight through it. The public gate also accepts SM103, covered by a
+    capability unit test; end-to-end SM103 execution is intentionally not
+    required by this suite yet.
     """
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("backend='sm100_v2' requires an SM100 (10, 0) GPU")
+        pytest.skip("this hardware-validation case requires an SM100 (10, 0) GPU")
 
 
 def _allocate(cfg, sm_scale: float):
@@ -1034,12 +1034,11 @@ _V2_TOPK_PARAMS = [
 @torch_fork_set_rng(seed=1701)
 def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats, topk_indices_global):
     """The opt-in path owns/reset its exact scratch and reproduces every
-    output bitwise across the 128-CTA producer-grid boundary."""
+    output bitwise across the fixed producer-grid boundary."""
     try:
         from cudnn import DSA
         from cudnn.deepseek_sparse_attention.indexer_backward.deterministic_dk_sm100 import (
             NUM_DK_PRODUCER_CTAS,
-            NUM_DK_RELAY_COUNTERS,
             NUM_DK_PLANES,
             deterministic_dk_workspace_bytes,
         )
@@ -1077,7 +1076,7 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
     assert plan.check_support()
     plan.compile()
     expected = deterministic_dk_workspace_bytes(cfg["b"], cfg["s_kv"], cfg["head_dim"])
-    assert expected == ws_align(NUM_DK_PLANES * cfg["b"] * cfg["s_kv"] * cfg["head_dim"] * 4) + ws_align(NUM_DK_RELAY_COUNTERS * 4)
+    assert expected == ws_align(NUM_DK_PLANES * cfg["b"] * cfg["s_kv"] * cfg["head_dim"] * 4)
     assert plan.scratch_workspace_bytes() == expected
     workspace = torch.empty(expected, dtype=torch.uint8, device="cuda")
 
@@ -1146,7 +1145,7 @@ def test_DSA_indexer_backward_deterministic_contract(backend, dk_dtype, repeats,
 
 @pytest.mark.L1
 @pytest.mark.parametrize("backend", ["default", "sm100_v2"])
-@pytest.mark.parametrize("s_q", [7, 17], ids=["short-cluster1", "uneven-cluster8"])
+@pytest.mark.parametrize("s_q", [7, 17], ids=["short-grid", "uneven-grid"])
 @torch_fork_set_rng(seed=1703)
 def test_DSA_indexer_backward_deterministic_cuda_graph(backend, s_q):
     """Short and uneven warmed plans with fixed scratch are replay-safe."""
@@ -1268,9 +1267,10 @@ def test_DSA_indexer_backward_deterministic_topk2048_boundary(backend):
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("capability,supported", [((9, 0), False), ((10, 3), True), ((10, 7), False)])
 @torch_fork_set_rng(seed=1707)
-def test_DSA_indexer_backward_deterministic_requires_sm100(monkeypatch):
-    """A deterministic request is fail-closed instead of falling back."""
+def test_DSA_indexer_backward_deterministic_capability_gate(monkeypatch, capability, supported):
+    """The deterministic path accepts SM100/SM103 and fails closed elsewhere."""
     try:
         from cudnn import DSA
     except ImportError:
@@ -1290,12 +1290,43 @@ def test_DSA_indexer_backward_deterministic_requires_sm100(monkeypatch):
         sample_topk_indices=topk_indices,
         deterministic=True,
     )
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
 
     attn_before = attn_score.clone()
-    with pytest.raises(ValueError, match="deterministic IndexerBackward requires SM100"):
-        plan.check_support()
+    if supported:
+        assert plan.check_support()
+    else:
+        with pytest.raises(ValueError, match="deterministic IndexerBackward requires capability"):
+            plan.check_support()
     assert torch.equal(attn_score, attn_before)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=1708)
+def test_DSA_indexer_backward_v2_accepts_sm103_capability(monkeypatch):
+    """The v2 plan gate shares the deterministic SM100/SM103 capability set."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    cfg = dict(b=1, s_q=2, s_kv=128, head_dim=128, qhead_per_kv_head=64, topk=128)
+    index_q, weights, index_k, attn_score, index_score, topk_indices = _allocate(cfg, sm_scale=1.0)
+    plan = DSA.IndexerBackward(
+        sample_index_q=index_q,
+        sample_weights=weights,
+        sample_index_k=index_k,
+        sample_d_index_q=torch.empty_like(index_q),
+        sample_d_weights=torch.empty_like(weights),
+        sample_d_index_k=torch.empty_like(index_k),
+        sample_attn_score=attn_score,
+        sample_index_score=index_score,
+        sample_topk_indices=topk_indices,
+        backend="sm100_v2",
+        deterministic=True,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (10, 3))
+    assert plan.check_support()
 
 
 @torch_fork_set_rng(seed=0)

@@ -621,10 +621,11 @@ indexer tower:
 3. Pure-torch dtype cast (kernel 3) converts `dIndexK_f32` to the output
    dtype.
 
-With `deterministic=True` on SM100, kernel 2 instead accumulates dK into 128
-CTA-private FP32 shards. Two fixed-order CuTe DSL reduction kernels fold groups
-of eight shards and then the 16 group totals, converting only once to the
-requested `d_index_k` dtype. The dQ and dW stores remain single-writer.
+With `deterministic=True` on SM100 or SM103, kernel 2 launches up to 96 fixed
+producer CTAs and accumulates dK into a 96-plane CTA-private FP32 workspace.
+One CuTe DSL reduction kernel folds the planes in fixed CTA order, converting
+only once to the requested `d_index_k` dtype. The dQ and dW stores remain
+single-writer.
 
 The plan owns no device memory. An fp32 `d_index_k` is the accumulator itself
 (zeroed on the launch stream inside `execute`); a BF16 `d_index_k` accumulates
@@ -637,21 +638,20 @@ allocates it per call on the launch stream and accepts the same optional
 `workspace=` keyword for reuse; executions that share one buffer must not
 overlap on the device.
 
-`deterministic=True` is request-or-fail and supports SM100, `H == 64`,
+`deterministic=True` is request-or-fail and supports SM100/SM103, `H == 64`,
 `D == 128`, `block_I == 128`, and `topk % 128 == 0` for
 `128 <= topk <= 2048`, on either compute backend. Each producer CTA owns one
-shard and processes the fixed row stripe `cta`, `cta + 128`, ...; the v2
+plane and processes the fixed row stripe `cta`, `cta + num_ctas`, ...; the v2
 backend disables its ordinary dynamic ticket assignment for this path. The
 main GEMM therefore retains its existing Tensor Core math while dK has a fixed
 association order across launches. Scratch is exactly
-`ws_align(128 * B * S_k * D * sizeof(float))` for either backend. It is
-cleared on the launch stream at every execute, then reduced in two fixed
-levels. A warmed plan with caller-provided outputs
-and workspace is CUDA Graph compatible. To capture the convenience wrapper,
-warm it first and pass every output plus `workspace=` explicitly; omitted
-buffers are allocated per call. As with the existing deterministic
-sparse-attention backward, valid IDs in a semantic top-k row are expected to
-be distinct.
+`ws_align(96 * B * S_k * D * sizeof(float))` for either backend. It is
+cleared on the launch stream at every execute, then reduced once in fixed
+plane order. A warmed plan with caller-provided outputs and workspace is CUDA
+Graph compatible. To capture the convenience wrapper, warm it first and pass
+every output plus `workspace=` explicitly; omitted buffers are allocated per
+call. As with the existing deterministic sparse-attention backward, valid IDs
+in a semantic top-k row are expected to be distinct.
 
 **The TileLang fallback present in the upstream repo is dropped here
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises
@@ -699,15 +699,15 @@ On SM90, also prefer preserving the producer's id convention. The performance
 difference between local and global ids is generally small, so a separate
 conversion solely for Indexer Backward is unlikely to help.
 
-#### SM100 sparse backward v2 (opt-in)
+#### SM100-family sparse backward v2 (opt-in)
 
 `backend="sm100_v2"` on `IndexerBackward` / `indexer_backward_wrapper`
 selects an alternative kernel-2 (GEMM stage) implementation. `backend` is a
 string enum, one of `{"default", "sm100_v2"}` (default `"default"`; an
 unknown value raises `ValueError`). The semantics are
 **request-or-fail**: outside the envelope below the wrapper raises
-`ValueError` (or `RuntimeError` off SM100) and never silently falls back to
-the default backend.
+`ValueError` (or `RuntimeError` outside SM100/SM103) and never silently falls
+back to the default backend.
 
 Start with the default backend when throughput is the goal. Select `sm100_v2` for
 its two-term gradient representation, deterministic `d_weights`, or FP32
@@ -731,7 +731,7 @@ the complete wrapper on the target shape when those properties are required.
   reduced deterministically — `d_weights` and `d_index_q` are bitwise
   run-to-run stable. Ordinarily, `d_index_k` stays in the same fp32-atomic
   summation-order class as the default backend; `deterministic=True` routes
-  those atomics into fixed-owner shards and folds them in a fixed order,
+  those atomics into fixed-owner planes and folds them in a fixed order,
   making all three gradients bitwise reproducible.
 - **Output dtype selects output precision** — `d_weights` and `d_index_k`
   accept FP32 buffers, which receive the fp32 accumulators directly; **the
@@ -743,7 +743,7 @@ the complete wrapper on the target shape when those properties are required.
 - **Envelope** (validated by `check_support` when a plan is created, and
   re-validated against the real tensors on every execute -- cache hits
   included -- before any buffer is mutated) —
-  SM100 (10, 0) only; `H == 64`, `D == 128`, `block_I == 128`;
+  SM100 (10, 0) or SM103 (10, 3); `H == 64`, `D == 128`, `block_I == 128`;
   `topk % 128 == 0` with `128 <= topk <= 2048`; `sm_scale > 0`; contiguous
   same-device tensors; `attn_score`/`index_score`/`topk_indices` shaped
   `(B, S_q, topk)`. `sm_scale` folds into the gradient in kernel 2 while the
@@ -767,11 +767,11 @@ the complete wrapper on the target shape when those properties are required.
   unless you pass `workspace=`, and still allocates any output buffer you do
   not pass in.
   With `deterministic=True`, the dense accumulator and counter region are
-  replaced by 128 FP32 shards regardless of the output dtype; deterministic
+  replaced by 96 FP32 planes regardless of the output dtype; deterministic
   row ownership does not draw tickets.
 - **Concurrency** — executions that share one workspace buffer must not
   overlap on the device (ordinary launches would interleave ticket draws;
-  deterministic launches would race on the same dK shards); a plan is bound
+  deterministic launches would race on the same dK planes); a plan is bound
   to no device and no stream, and
   the workspace must live on `index_q.device` (rejected before `attn_score`
   is overwritten otherwise). The wrapper's per-call workspace makes its calls

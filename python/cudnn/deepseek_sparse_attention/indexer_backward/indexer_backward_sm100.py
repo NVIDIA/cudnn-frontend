@@ -18,11 +18,10 @@ to overlap independent prologue work while preserving their data dependencies:
   Kernel 3 (PyTorch):  dk_convert — cast dK from float32 to output dtype
       (same as dQ, dW).
 
-The deterministic specialization keeps kernel 2 but maps its persistent CTAs
-to fixed query stripes. Each co-resident 8-CTA cluster relays dK updates in
-fixed rank order into one private FP32 plane; one trailing CuTe DSL kernel
-folds the 16 planes in fixed cluster order and stores the requested output
-dtype. The ordinary path above is unchanged.
+The deterministic specialization keeps kernel 2 but maps up to 96 persistent
+CTAs to fixed query stripes and gives each CTA one private FP32 dK plane. One
+trailing CuTe DSL kernel folds the planes in fixed CTA order and stores the
+requested output dtype. The ordinary path above is unchanged.
 
 Kernel 2 — Warp specialization (16 warps, 512 threads):
   Warp 0:      Load (Q via TMA, weights, grad_signal)
@@ -77,7 +76,7 @@ initialization.  The short-row variants select it only when the grid has more
 rows than SMs.  Stage phases are derived from the number of 128-wide blocks per
 row so the same schedule is valid for one through four blocks.
 Ordinary TopK=1024/2048 retain the one-query-per-CTA 2-D grid; deterministic
-execution uses the fixed 128-CTA serial-persistent grid at every TopK.
+execution uses the fixed-owner serial-persistent grid at every TopK.
 """
 
 from __future__ import annotations
@@ -125,16 +124,11 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 from cudnn.frost.buffers import memset_zero_async
 
 from .deterministic_dk_sm100 import (
-    DK_RELAY_CLUSTER_SIZE,
     NUM_DK_PLANES,
-    advance_dk_relay_turn,
-    deterministic_dk_cluster_size,
     deterministic_dk_producer_ctas,
-    deterministic_dk_relay_bytes,
     deterministic_dk_planes_bytes,
     deterministic_dk_workspace_bytes,
     reduce_deterministic_dk,
-    wait_dk_relay_turn,
 )
 
 _HAS_TMA_GATHER4 = all(
@@ -468,7 +462,6 @@ class IndexerBackwardSm100:
         # stream-predecessor semantics.
         self.enable_score_pdl = enable_score_pdl
         self.deterministic = bool(deterministic)
-        self.dk_relay_cluster_size = deterministic_dk_cluster_size(total_rows) if self.deterministic else 1
         # When True (default, matches the public fwd convention), mTopkIdx
         # carries global KV ids (``b * seqlen_k + local``); the kernel uses
         # them as flat ids into the (B*S_k, D) K/dK view directly. When
@@ -556,7 +549,7 @@ class IndexerBackwardSm100:
             barrier_id=4,
             num_threads=self.WARP_SIZE + 2 * self.WARPGROUP_SIZE,
         )
-        self.dk_relay_barrier = pipeline.NamedBarrier(
+        self.dk_row_barrier = pipeline.NamedBarrier(
             barrier_id=5,
             num_threads=self.WARPGROUP_SIZE,
         )
@@ -570,7 +563,6 @@ class IndexerBackwardSm100:
         mdQ: cute.Tensor,
         mdW: cute.Tensor,
         mdK_f32: cute.Tensor,
-        mDkRelay: cute.Tensor,
         mGradSignal: cute.Tensor,
         mTopkIdx: cute.Tensor,
         sm_scale: Float32 | float,
@@ -740,7 +732,6 @@ class IndexerBackwardSm100:
             mdQ_tma,
             mdW,
             mdK_f32,
-            mDkRelay,
             mGradSignal,
             mTopkIdx,
             sm_scale,
@@ -763,7 +754,7 @@ class IndexerBackwardSm100:
         ).launch(
             grid=launch_grid,
             block=[self.THREADS_PER_CTA, 1, 1],
-            cluster=[self.dk_relay_cluster_size, 1, 1],
+            cluster=[1, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=self.enable_score_pdl,
@@ -778,7 +769,6 @@ class IndexerBackwardSm100:
         mdQ,
         mdW,
         mdK_f32,
-        mDkRelay,
         mGradSignal,
         mTopkIdx,
         sm_scale: Float32 | float,
@@ -819,14 +809,9 @@ class IndexerBackwardSm100:
         seqlen_k = cute.size(mK.shape[0])
         total_rows = seqlen * batch_size
         if const_expr(self.deterministic):
-            # A full hardware cluster relays one private dense plane in fixed
-            # rank order. The host chooses a grid no larger than total_rows,
-            # so every launched CTA owns at least one row. Problems with fewer
-            # than eight rows use cluster-1 and still fit the 16-plane scratch.
-            relay_rank = Int32(cute.arch.block_idx_in_cluster())
-            relay_cluster_idx = Int32(cute.arch.block_idx()[0] // self.dk_relay_cluster_size)
-            relay_active_ctas = Int32(self.dk_relay_cluster_size)
-            plane_offset = cutlass.Int64(relay_cluster_idx) * cutlass.Int64(seqlen_k) * cutlass.Int64(self.head_dim)
+            # Each launched CTA owns one dense plane and at least one fixed-
+            # stripe row, so dK has no cross-CTA write races.
+            plane_offset = cutlass.Int64(cute.arch.block_idx()[0]) * cutlass.Int64(seqlen_k) * cutlass.Int64(self.head_dim)
             mdK_f32 = cute.make_tensor(
                 mdK_f32.iterator + plane_offset,
                 cute.make_layout(
@@ -926,7 +911,6 @@ class IndexerBackwardSm100:
                 mdQ,
                 mdW,
                 mdK_f32,
-                mDkRelay,
                 mGradSignal,
                 mTopkIdx,
                 sm_scale,
@@ -959,9 +943,6 @@ class IndexerBackwardSm100:
                 flat_row_idx,
                 tidx,
                 warp_idx,
-                relay_cluster_idx if const_expr(self.deterministic) else Int32(0),
-                relay_rank if const_expr(self.deterministic) else Int32(0),
-                relay_active_ctas if const_expr(self.deterministic) else Int32(1),
             )
             return
 
@@ -1246,7 +1227,6 @@ class IndexerBackwardSm100:
             )
             self._reduce_warpgroup(
                 mdK_f32,
-                mDkRelay,
                 sTopkIdxs,
                 sdKStage,
                 dk_acc_shape,
@@ -1257,8 +1237,6 @@ class IndexerBackwardSm100:
                 tidx,
                 mbar,
                 Int32(0),
-                relay_cluster_idx if const_expr(self.deterministic) else Int32(0),
-                relay_rank if const_expr(self.deterministic) else Int32(0),
             )
 
         else:
@@ -1283,7 +1261,6 @@ class IndexerBackwardSm100:
                     mdQ,
                     mdW,
                     mdK_f32,
-                    mDkRelay,
                     mGradSignal,
                     mTopkIdx,
                     sm_scale,
@@ -1321,8 +1298,6 @@ class IndexerBackwardSm100:
                     next_batch_idx,
                     tidx,
                     warp_idx,
-                    relay_cluster_idx if const_expr(self.deterministic) else Int32(0),
-                    Int32(((next_flat_row - flat_row_idx) // row_stride) * relay_active_ctas + relay_rank) if const_expr(self.deterministic) else Int32(0),
                 )
                 cute.arch.sync_threads()
             if const_expr(self.use_persistent):
@@ -1374,7 +1349,6 @@ class IndexerBackwardSm100:
         mdQ,
         mdW,
         mdK_f32,
-        mDkRelay,
         mGradSignal,
         mTopkIdx,
         sm_scale,
@@ -1407,9 +1381,6 @@ class IndexerBackwardSm100:
         first_flat_row,
         tidx,
         warp_idx,
-        relay_cluster_idx,
-        relay_rank,
-        relay_active_ctas,
     ):
         """Persistent CTA with dominance-safe role-local row loops.
 
@@ -1854,7 +1825,6 @@ class IndexerBackwardSm100:
                 )
                 self._reduce_warpgroup(
                     mdK_f32,
-                    mDkRelay,
                     sTopk_row,
                     sdKStage,
                     dk_acc_shape,
@@ -1865,8 +1835,6 @@ class IndexerBackwardSm100:
                     tidx,
                     mbar,
                     Int32(it & 1),
-                    relay_cluster_idx,
-                    Int32(it * relay_active_ctas + relay_rank),
                 )
                 cute.arch.mbarrier_arrive(
                     mbar + MBAR_ROW_FREE_0 + parity,
@@ -1887,7 +1855,6 @@ class IndexerBackwardSm100:
         mdQ,
         mdW,
         mdK_f32,
-        mDkRelay,
         mGradSignal,
         mTopkIdx,
         sm_scale,
@@ -1925,8 +1892,6 @@ class IndexerBackwardSm100:
         batch_idx,
         tidx,
         warp_idx,
-        relay_cluster_idx,
-        relay_turn,
     ):
         """Run one fully drained row in a persistent CTA."""
         Q_pipeline = pipeline.PipelineTmaUmma.create(
@@ -2145,7 +2110,6 @@ class IndexerBackwardSm100:
             )
             self._reduce_warpgroup(
                 mdK_f32,
-                mDkRelay,
                 sTopkIdxs,
                 sdKStage,
                 dk_acc_shape,
@@ -2156,8 +2120,6 @@ class IndexerBackwardSm100:
                 tidx,
                 mbar,
                 Int32(0),
-                relay_cluster_idx,
-                relay_turn,
             )
         else:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
@@ -3159,7 +3121,6 @@ class IndexerBackwardSm100:
     def _reduce_warpgroup(
         self,
         mdK_f32,
-        mDkRelay,
         sTopkIdxs,
         sdKStage,
         dk_acc_shape,
@@ -3170,17 +3131,11 @@ class IndexerBackwardSm100:
         tidx,
         mbar,
         persistent_row_phase,
-        relay_cluster_idx,
-        relay_turn,
     ):
         """Reduce dK through padded SMEM and bulk FP32 global additions."""
         wg_tidx = tidx % self.WARPGROUP_SIZE
         lane_id = wg_tidx % self.WARP_SIZE
         warp_in_wg = wg_tidx // self.WARP_SIZE
-
-        if const_expr(self.deterministic):
-            wait_dk_relay_turn(mDkRelay.iterator, wg_tidx, relay_cluster_idx, relay_turn)
-            self.dk_relay_barrier.arrive_and_wait()
 
         tmem_load_atom_dk = cute.make_copy_atom(
             tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(16)),
@@ -3277,8 +3232,10 @@ class IndexerBackwardSm100:
             # it once after the loop; serial rows drain here as before.
             cute.arch.cp_async_bulk_wait_group(0)
         if const_expr(self.deterministic):
-            self.dk_relay_barrier.arrive_and_wait()
-            advance_dk_relay_turn(mDkRelay.iterator, wg_tidx, relay_cluster_idx)
+            # Every dK lane has completed its asynchronous reduction before
+            # any warp begins the CTA's next fixed row. Cross-row collisions
+            # can map to different warps even though the plane is CTA-private.
+            self.dk_row_barrier.arrive_and_wait()
 
     # =========================================================================
     # Warps 8-11: K loading warpgroup (3-stage sK)
@@ -3962,12 +3919,12 @@ def _build_cute_dsl_kernel(
         deterministic,
     )
 
-    def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, dKRelay, AttnScore, TopkIndices, enable_score_pdl: bool, current_stream=None):
+    def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, enable_score_pdl: bool, current_stream=None):
         """Lazy-compile the GEMM kernel (kernel 2)."""
         compile_key = (*compile_key_base, enable_score_pdl)
         if compile_key not in _compile_cache:
             s = _resolve_stream(current_stream)
-            cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, dKRelay, AttnScore, TopkIndices]]
+            cute_args = [to_cute_tensor(t) for t in [IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices]]
             _compile_cache[compile_key] = cute.compile(
                 kernel_objects[enable_score_pdl],
                 *cute_args,
@@ -3983,7 +3940,6 @@ def _build_cute_dsl_kernel(
         dIndexQ,
         dWeights,
         dIndexK_f32,
-        dKRelay,
         GradSignal,
         TopkIndices,
         enable_score_pdl: bool,
@@ -3991,9 +3947,7 @@ def _build_cute_dsl_kernel(
     ):
         s = _resolve_stream(current_stream)
         compile_key = (*compile_key_base, enable_score_pdl)
-        _ensure_compiled(
-            IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, dKRelay, GradSignal, TopkIndices, enable_score_pdl, current_stream=current_stream
-        )
+        _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, GradSignal, TopkIndices, enable_score_pdl, current_stream=current_stream)
         with torch.cuda.nvtx.range("indexer_backward_dsl_gemm"):
             _compile_cache[compile_key](
                 IndexQ,
@@ -4002,7 +3956,6 @@ def _build_cute_dsl_kernel(
                 dIndexQ,
                 dWeights,
                 dIndexK_f32,
-                dKRelay,
                 GradSignal,
                 TopkIndices,
                 cutlass.Float32(sm_scale),
@@ -4019,13 +3972,8 @@ def _build_cute_dsl_kernel(
         GradSignal,
         TopkIndices,
         current_stream=None,
-        dKRelay=None,
     ):
         """Run kernel 2 after arbitrary stream work (PDL overlap disabled)."""
-        if deterministic and dKRelay is None:
-            raise ValueError("deterministic gemm_only requires its zeroed int32 dK relay-counter tensor")
-        if dKRelay is None:
-            dKRelay = dIndexK_f32
         _run_gemm(
             IndexQ,
             Weights,
@@ -4033,7 +3981,6 @@ def _build_cute_dsl_kernel(
             dIndexQ,
             dWeights,
             dIndexK_f32,
-            dKRelay,
             GradSignal,
             TopkIndices,
             False,
@@ -4050,11 +3997,8 @@ def _build_cute_dsl_kernel(
         GradSignal,
         TopkIndices,
         current_stream=None,
-        dKRelay=None,
     ):
         """Run kernel 2 as ScoreGrad's PDL-dependent consumer."""
-        if dKRelay is None:
-            dKRelay = dIndexK_f32
         _run_gemm(
             IndexQ,
             Weights,
@@ -4062,7 +4006,6 @@ def _build_cute_dsl_kernel(
             dIndexQ,
             dWeights,
             dIndexK_f32,
-            dKRelay,
             GradSignal,
             TopkIndices,
             True,
@@ -4081,9 +4024,7 @@ def _build_cute_dsl_kernel(
             planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim)
             carver = WorkspaceCarver(workspace, deterministic_dk_workspace_bytes(batch, seqlen_k, dim), "IndexerBackward deterministic (sm100)")
             dIndexK_planes = carver.take(planes_bytes // 4, torch.float32).view(NUM_DK_PLANES, batch * seqlen_k, dim)
-            dKRelay = carver.take(deterministic_dk_relay_bytes() // 4, torch.int32)
             memset_zero_async(dIndexK_planes.data_ptr(), planes_bytes, _resolve_stream(current_stream))
-            memset_zero_async(dKRelay.data_ptr(), deterministic_dk_relay_bytes(), _resolve_stream(current_stream))
             score_grad(
                 AttnScore,
                 IndexScore,
@@ -4101,7 +4042,6 @@ def _build_cute_dsl_kernel(
                 AttnScore,
                 TopkIndices,
                 current_stream=current_stream,
-                dKRelay=dKRelay,
             )
             reduce_deterministic_dk(dIndexK_planes, dIndexK, current_stream)
             return

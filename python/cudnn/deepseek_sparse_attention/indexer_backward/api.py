@@ -14,7 +14,7 @@ When the ``dIndexK`` output buffer is bf16, a trailing pure-torch cast
 ``dIndexK`` buffer receives the accumulator directly, with no cast. The fp32
 ordinary accumulator behind a bf16 ``dIndexK`` (and the ordinary sm100_v2
 ticket counter) is carved from the caller's workspace; deterministic execution
-uses 16 cluster-private FP32 dK planes plus 16 relay counters instead.
+uses 96 CTA-private FP32 dK planes instead.
 ``scratch_workspace_bytes()`` reports the selected policy's exact size for
 ``execute(..., workspace=)``; the plans own no device memory (Rule 8, R2).
 """
@@ -41,17 +41,17 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 
 from .dense_indexer_backward_sm100 import dense_indexer_backward_sm100
 from .dense_indexer_backward_sm90 import dense_indexer_backward_sm90
-from .deterministic_dk_sm100 import deterministic_dk_workspace_bytes
+from .deterministic_dk_sm100 import INDEXER_BACKWARD_SM100_CAPABILITIES, deterministic_dk_workspace_bytes
 from .indexer_backward_v2_sm100 import indexer_backward_v2_sm100
 from .indexer_backward_sm100 import indexer_backward_sm100
 from .indexer_backward_sm90 import indexer_backward_sm90
 
 # Compute-backend selector for the sparse indexer backward. ``"default"`` is
 # the architecture-generic path (SM90 or SM100); ``"sm100_v2"`` is the
-# SM100-only v2 backend (two-term bf16-expansion GEMM, deterministic
+# SM100/SM103 v2 backend (two-term bf16-expansion GEMM, deterministic
 # d_weights). The value is architecture-explicit on purpose: it names the arch
 # it targets so it is self-evidently capability-gated (``check_support`` is
-# request-or-fail on non-SM100) and the enum can grow new backends without
+# request-or-fail outside its explicit capability set) and the enum can grow new backends without
 # overloading a boolean. It is part of the wrapper plan-cache key.
 INDEXER_BACKWARD_BACKENDS = ("default", "sm100_v2")
 
@@ -225,19 +225,19 @@ class IndexerBackward(APIBase):
     weights, and stores are clipped to the caller's H32 tensors. No caller-side
     H32→H64 padding or output slicing is required.
 
-    ``deterministic=True`` is an SM100 request-or-fail policy for H=64,
-    D=128, block_I=128, and 128-multiple top-k in [128, 2048]. It gives each
-    up to 128 persistent CTAs fixed grid-stride query rows, groups them into
-    co-resident 8-CTA clusters, and relays each cluster's dK updates in fixed
-    rank order into one FP32 plane. A final fixed-order kernel folds the 16
-    cluster planes. dQ/dW remain single-writer. The deterministic scratch is
-    ``16 * B * S_k * D * 4`` bytes plus an aligned 16-counter region,
+    ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=64,
+    D=128, block_I=128, and 128-multiple top-k in [128, 2048]. It launches up
+    to 96 persistent CTAs over fixed grid-stride query rows and allocates one
+    CTA-private FP32 dK plane for each possible producer. A final kernel folds
+    the 96 planes in CTA order.
+    dQ/dW remain single-writer. The deterministic scratch is
+    ``96 * B * S_k * D * 4`` bytes,
     independent of output dtype. As with a top-k result, valid indices within
     each query row must be unique; duplicate scatter targets inside one row
     are outside the deterministic contract. A warmed plan with caller-owned
     outputs and scratch is CUDA Graph compatible.
 
-    ``backend="sm100_v2"`` (SM100 only, request-or-fail: ``check_support``
+    ``backend="sm100_v2"`` (SM100/SM103, request-or-fail: ``check_support``
     raises outside the envelope, there is no silent fallback) selects an
     alternative GEMM stage that upcasts the weights to fp32 in-register and
     splits the per-slot fp32 gradient matrix into a two-term bf16 expansion
@@ -260,7 +260,7 @@ class IndexerBackward(APIBase):
     8 bytes of the caller's ``workspace`` (the first ``ws_align(8)`` bytes,
     ahead of the bf16 dK accumulator), zeroed on the launch stream at every
     ``execute``. Deterministic execution replaces both regions with its dK
-    planes and relay counters. The plan owns nothing and is bound to no device;
+    planes. The plan owns nothing and is bound to no device;
     executions that share one workspace buffer must not overlap on the device
     (``indexer_backward_wrapper`` allocates a fresh one per call). The
     workspace must live on ``index_q.device``. ``backend`` must be one of
@@ -398,7 +398,8 @@ class IndexerBackward(APIBase):
         # default path keeps the pre-existing current-device query, so it stays
         # self-consistent with the sm90/sm100 factories, which check the
         # current device themselves.
-        major, _ = torch.cuda.get_device_capability(self.iq_desc.device if self.use_v2 or self.deterministic else None)
+        capability = torch.cuda.get_device_capability(self.iq_desc.device if self.use_v2 or self.deterministic else None)
+        major, _ = capability
         self._runtime_error_if(
             major != 9 and major < 10,
             f"IndexerBackward requires SM90 or SM100+, found SM{major}",
@@ -412,10 +413,10 @@ class IndexerBackward(APIBase):
             b, s_q, s_k = self.batch, self.seqlen, self.seqlen_k
             h, d, topk = self.heads, self.head_dim, self.topk
             self._runtime_error_if(
-                torch.cuda.get_device_capability(self.iq_desc.device) != (10, 0),
-                f"backend='sm100_v2' requires an SM100 device (capability (10, 0)); the plan device "
-                f"{self.iq_desc.device} reports {torch.cuda.get_device_capability(self.iq_desc.device)} "
-                f"(use backend='default' on non-SM100)",
+                capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+                f"backend='sm100_v2' requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}; the plan device "
+                f"{self.iq_desc.device} reports {capability} "
+                f"(use backend='default' elsewhere)",
             )
             self._value_error_if(
                 h != 64 or d != 128,
@@ -473,8 +474,8 @@ class IndexerBackward(APIBase):
                     f"backend='sm100_v2' requires all tensors on one device: {name} is on {desc.device}, index_q on {self.iq_desc.device}",
                 )
         self._value_error_if(
-            self.deterministic and major != 10,
-            f"deterministic IndexerBackward requires SM100, found SM{major}",
+            self.deterministic and capability not in INDEXER_BACKWARD_SM100_CAPABILITIES,
+            f"deterministic IndexerBackward requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}, " f"found {capability}",
         )
         if self.deterministic:
             if not self.use_v2:
@@ -556,7 +557,7 @@ class IndexerBackward(APIBase):
         # part of the cache key, and it's been removed from the factory
         # signature on both backends.
         if self.use_v2:
-            # SM100-only v2 backend (check_support gated). The
+            # SM100/SM103 v2 backend (check_support gated). The
             # d_weights output dtype is a compile-time kernel variant (the
             # deterministic accumulator is stored directly in the output
             # dtype); d_index_k dtype is handled at execute time. Build
@@ -613,8 +614,8 @@ class IndexerBackward(APIBase):
         """Return caller-owned scratch bytes for the selected dK policy.
 
         The ordinary sm100_v2 counter region comes first. Deterministic
-        execution instead uses 16 dense FP32 cluster planes plus 16 int32
-        relay counters regardless of output dtype; ordinary execution needs
+        execution instead uses 96 dense FP32 CTA planes regardless of output
+        dtype; ordinary execution needs
         one dense accumulator only for a bf16 ``d_index_k``.
         """
         counter = ws_align(8) if self.use_v2 and not self.deterministic else 0
@@ -979,9 +980,9 @@ def indexer_backward_wrapper(
             Its SM100 specialization accepts compact H32 tensors and pads only
             the internal TCGEN05 tile to M64; callers do not pad inputs or
             slice outputs.
-            ``"sm100_v2"`` is the SM100-only opt-in v2 backend,
+            ``"sm100_v2"`` is the SM100/SM103 opt-in v2 backend,
             **request-or-fail**: it raises (``ValueError``/``RuntimeError``)
-            outside its envelope — SM100, H == 64, D == 128, block_I == 128,
+            outside its envelope — SM100/SM103, H == 64, D == 128, block_I == 128,
             topk % 128 == 0 with 128 <= topk <= 2048, sm_scale > 0, contiguous
             same-device tensors — and never silently falls back to the default
             backend. It keeps the wrapper contract (same inputs and outputs:
@@ -999,24 +1000,23 @@ def indexer_backward_wrapper(
             representation floor. fp32 ``d_index_k`` is zeroed internally.
             Ordinarily, the backend's dynamic-ticket counter is 8 bytes of the
             per-call ``workspace`` below, zeroed on the launch stream at every
-            call; ``deterministic=True`` replaces it with the cluster dK
-            planes and relay counters. The plan owns no device memory. The wrapper additionally keys its plan
-            cache on the **resolved** stream (``stream`` when given, otherwise
-            ``torch.cuda.current_stream()`` at call time), so one cached plan's
-            executes are stream-ordered.
+            call; ``deterministic=True`` replaces it with CTA-private dK
+            planes. The plan owns no device memory. The wrapper additionally
+            keys its plan cache on the **resolved** stream (``stream`` when
+            given, otherwise ``torch.cuda.current_stream()`` at call time),
+            so one cached plan's executes are stream-ordered.
         workspace: keyword-only, optional reusable uint8 buffer of at least
             ``IndexerBackward.scratch_workspace_bytes()`` bytes on
             ``index_q.device`` (the ordinary fp32 dK accumulator behind a
             bf16 ``d_index_k``, plus the ordinary sm100_v2 ticket counter, or
-            the deterministic cluster planes and relay counters). When omitted
+            the deterministic CTA planes). When omitted
             the wrapper allocates it per call on the launch stream. Calls
             sharing one buffer must not overlap on the device.
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
-            on SM100. Eight co-resident producer CTAs relay their dK updates
-            in fixed rank order into each of 16 cluster-private FP32 planes;
-            a fixed-order reduction writes ``d_index_k``. The caller-owned
-            workspace is correspondingly 16 times the dense FP32 dK size plus
-            16 int32 relay counters for either backend. A warmed plan with
+            on SM100/SM103. Up to 96 fixed-owner producer CTAs accumulate into
+            CTA-private FP32 planes; a fixed CTA-order reduction writes
+            ``d_index_k``. The caller-owned workspace is correspondingly 96
+            times the dense FP32 dK size for either backend. A warmed plan with
             preallocated outputs and workspace remains CUDA Graph compatible.
             Valid top-k indices within each query row must be unique.
     """
