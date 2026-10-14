@@ -419,8 +419,8 @@ def _nhd_pool(h_kv, page_size, d=256):
 
 
 def _sm107_paged_d256_decode_facts(**over):
-    """FlashInfer's cuDNN decode graph shape on cc 10.7: a dense Q over a page pool with the padding mask, no mask / sink / Stats (the pool
-    strided as FlashInfer's benchmark strides it: token-major in the page; the head-major pool is the admitted twin)."""
+    """FlashInfer's cuDNN decode graph shape on cc 10.7: a dense Q over a page pool with the padding mask (per-request KV lengths), no
+    mask / sink / Stats (the pool strided as FlashInfer's benchmark strides it: token-major in the page; the head-major pool is the admitted twin)."""
     values = dict(
         b=4,
         h_q=24,
@@ -506,6 +506,7 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
         None,
         dict(device_cc=(10, 0)),
         dict(has_paged_kv=False, page_size=0, padded=False),  # a dense d256 cache at s_q == 1 was measured against the prefill body only
+        dict(padded=False),  # a paged decode WITHOUT per-request KV lengths: every band cell carried the padding mask -> unmeasured
         dict(s_q=2, causal=True, bottom_right=True),  # the MTP rows (the 32-column tile) are held
         dict(h_q=64),  # group 32 is held
         dict(h_q=4),  # group 2: not measured
@@ -528,6 +529,7 @@ def test_sm107_paged_d256_decode_tile_leads_on_its_measured_corner_cells(heads, 
         "inside",
         "sm100",
         "dense",
+        "unpadded",
         "mtp_q2",
         "g32",
         "g2",

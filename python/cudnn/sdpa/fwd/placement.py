@@ -179,8 +179,8 @@ Rubin row remains opt-in.
   in up to two token units) are held the same way: the tile ran 0.01-0.31 of the backend's plan (which costs 6.8-142 ms per launch
   at KV 128k) on all 576 (cell, regime) pairs but trails fa2 by 6 % (q = 2) and 21-22 % (q = 3 / 4) at the medians -- the kernel gap
   in SUPPORT_MATRIX_TRACKER.md's gaps table; both holds reopen with the kernel. Stats, a sink, a causal mask or window at ``s_q ==
-  1``, page 128, a dense (unpaged) d256 cache (measured against the prefill body only, above), THD queries and the fused gate were
-  not measured -> TRAIL.
+  1``, page 128, a dense (unpaged) d256 cache (measured against the prefill body only, above), THD queries, the fused gate and a
+  paged decode WITHOUT per-request KV lengths (no padding mask: every band cell carried one) were not measured -> TRAIL.
 
 SM107 MXFP8 row (``sdpa_fwd_prefill_sm107_mxfp8``, offered by default since 2026-10): LEAD on exact
 cc 10.7 for every graph the row admits -- dense BSHD, exact d128 / d192x128 / d256 / d512, E4M3 / E5M2
@@ -356,12 +356,13 @@ def _sm107_paged_d256_decode_tile_leads(caps: Capabilities, facts) -> bool:
     """Paged dense-Q d256 decode (``s_q == 1``) on the Rubin d256 decode tile inside its measured band (module docstring, "PAGED
     dense-Q d256 half decode"): a measured GQA group packed whole onto the tile (``engines.d256_decode_tile_selected`` -- half
     inputs, dense queries, the (256, 256) flavor, no pre-folded scale), a page pool of a measured page size in either in-page layout
-    (the token-major one the band measured, the head-major one admitted on its structure), no mask / window / sink / Stats / gate,
+    (the token-major one the band measured, the head-major one admitted on its structure), per-request KV lengths (the padding mask
+    every band cell carried), no mask / window / sink / Stats / gate,
     ``SM107_PAGED_D256_DECODE_MIN_UNITS <= b * h_kv <= SM107_PAGED_D256_DECODE_MAX_UNITS`` units, the declared KV inside
     ``SM107_PAGED_D256_DECODE_KV_TOKENS`` and ``units * KV >= SM107_PAGED_D256_DECODE_MIN_KV_TOKENS_IN_FLIGHT`` tokens in flight --
     the frontier both regimes (CUDA-graph replay and eager) share.  The MTP rows (``s_q >= 2``) and group 32 are held (module
     docstring)."""
-    if not (facts.has_paged_kv and facts.s_q == 1 and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0):
+    if not (facts.has_paged_kv and facts.padded and facts.s_q == 1 and facts.h_kv > 0 and facts.h_q % facts.h_kv == 0):
         return False
     group = facts.h_q // facts.h_kv
     if group not in SM107_PAGED_D256_DECODE_GROUPS or not d256_decode_tile_selected(caps, facts, group):
