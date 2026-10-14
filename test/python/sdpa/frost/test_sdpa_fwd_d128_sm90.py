@@ -1,17 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The SM90 native D128 forward template (issue #378), through the direct adapter.
+"""The SM90 native D128 forward template (issue #378), through the direct adapter and the graph.
 
 ``SdpaFwdDslSm90`` runs ``sm90/prefill_d128_f16.py`` for an exact (128, 128) dense declaration
-it serves (``config_sm90.pick_flavor``). The engine row does not offer (128, 128) graphs yet, so
-every case here builds the adapter directly and asserts the D128 flavor before it trusts a number.
-O and Stats start as NaN, so a row the kernel never writes cannot pass. Tolerances are the SM90
-suite's own (O 5e-2 / 3e-2, Stats 2e-2 / 2e-2 against the fp32 reference) except where the
-arithmetic is the same and the comparison is ``torch.equal``.
+it serves (``config_sm90.pick_flavor``). The direct-route cases build the adapter and assert the
+D128 flavor before they trust a number; O and Stats start as NaN, so a row the kernel never writes
+cannot pass. The graph-route cases (the engine row proposes the 128 x 128 tile, the D128 template,
+first on the exact (128, 128) graphs it serves) reuse the SM100 suite's runners through the SM90
+suite's ``sm100`` fixture, which pins the SM90 row strictly, and check that every such graph
+compiles the D128 template, never D512; the tile's declines at (128, 128) are checked on the
+ranked graph, each beside a (512, 512) control. Tolerances are the
+SM90 suite's own (O 5e-2 / 3e-2, Stats 2e-2 / 2e-2 against the fp32 reference; the reused SM100
+runners keep theirs) except where the arithmetic is the same and the comparison is ``torch.equal``.
 """
 
 import math
+import os
 import subprocess
 import sys
 import textwrap
@@ -21,8 +26,10 @@ import torch
 
 from test_utils import torch_fork_set_rng
 
+import cudnn
 from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
-from frost_test_utils import _SM, assert_no_new_spills, nvdisasm_candidates, requires_dsl
+from frost_test_utils import _SM, assert_no_new_spills, nvdisasm_candidates, offers_engine, requires_dsl, select_engine
+from test_sdpa_fwd_dsl_sm90 import sm100  # noqa: F401 (the strict SM90 graph-route fixture)
 from test_sdpa_fwd_dsl_sm100 import _bhsd, _ref_sdpa_full
 
 pytestmark = [
@@ -49,6 +56,7 @@ def _level(l0):
 
 _D = 128
 _SCALE = 1.0 / math.sqrt(_D)
+_ROW = "sdpa_fwd_prefill_sm90"
 _D128_FILE = "sm90/prefill_d128_f16.py"
 _DTYPES = (torch.float16, torch.bfloat16)
 
@@ -107,6 +115,233 @@ def test_d128_compiles_its_own_template(monkeypatch):
     o, lse = _run(q, k, v)
     assert loaded == [(_D128_FILE, "sdpa_fwd_sm90_d128")], loaded
     _check(o, lse, q, k, v)
+
+
+# --- The graph route: the engine row offers exact (128, 128) graphs -------
+#
+# The SM100 suite's runners, pinned to the SM90 row by the ``sm100`` fixture. ``graph_d128`` adds the silent-D512
+# detector (#378): a (128, 128) graph whose first plan is the 64 x 64 tile runs on the D512 body without any error,
+# so a graph the heuristics stopped proposing on the 128 x 128 tile would pass on D512. Each graph_d128 case must
+# load a template, and only D128's.
+
+
+@pytest.fixture
+def graph_d128(sm100, monkeypatch):
+    """``sm100``, plus a record of every template the case loads, checked when the case ends: D128's file only."""
+    from cudnn.sdpa.fwd import api_dsl
+
+    loaded, load = [], api_dsl._load_kernel_template
+    monkeypatch.setattr(api_dsl, "_load_kernel_template", lambda filename, *a, **kw: loaded.append(filename) or load(filename, *a, **kw))
+    yield sm100
+    assert loaded and set(loaded) == {_D128_FILE}, f"a (128, 128) graph loaded {loaded}, not only {_D128_FILE}"
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_compiles_the_d128_template(graph_d128, monkeypatch):
+    """A (128, 128) graph the row admits builds a plan whose executor names its template (``kernel_template``, which
+    the SM90 adapter records as the SM100 one does) and keeps its module: SM100 ships a prefill_d128_f16.py too, so the
+    sm90 directory is the evidence. The fixture checks every load."""
+    graphs, pin = [], graph_d128._select_engine
+    monkeypatch.setattr(graph_d128, "_select_engine", lambda graph, name, **kw: graphs.append(graph) or pin(graph, name, **kw))
+    q, k, v = (_bhsd(2, 4, 96, _D, torch.float16) for _ in range(3))
+    o = graph_d128._run_dsl_graph(q, k, v, scale=_SCALE, dtype=torch.float16, sdpa_kwargs=dict(use_causal_mask=True))
+    torch.testing.assert_close(o, _ref_sdpa_full(q, k, v, scale=_SCALE, is_causal=True), atol=5e-2, rtol=3e-2)
+    (graph,) = graphs
+    executor = graph._compiled_plans[graph._plan_index]._compiled
+    assert executor.kernel_template == "prefill_d128_f16", executor.kernel_template
+    assert executor.kernel_module.__file__.endswith(os.path.join("sm90", "prefill_d128_f16.py")), executor.kernel_module.__file__
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("dtype", _DTYPES, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("causal", [False, True], ids=["dense", "causal"])
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_api(graph_d128, dtype, causal):
+    """The canonical smoke case, repinned: no length tensor and no Stats, so the LSE store compiles out and the runner
+    asserts a zero workspace."""
+    graph_d128.test_sdpa_fwd_dsl_sm100_graph_api(dtype, causal, _D)
+
+
+_GRAPH_MASKS = ("none", "causal", "causal_br")  # the D128 subset of the SM100 suite's dense mask families
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("heads", [(8, 8), (8, 2)], ids=["mha", "gqa4"])
+@pytest.mark.parametrize("i, mask", list(enumerate(_GRAPH_MASKS)), ids=list(_GRAPH_MASKS))
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_mask_families(graph_d128, i, mask, heads):
+    """Each mask D128 serves, MHA and GQA; the dtype rotates with the mask (causal_br runs S_q 128 below S_kv 256)."""
+    graph_d128._combo_dense(_D, _DTYPES[i % 2], *heads, _SCALE, None, mask)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("stats_log2", [False, True], ids=["ln", "log2"])
+@torch_fork_set_rng(seed=59)
+def test_d128_graph_strided_stats(graph_d128, stats_log2):
+    """Dense multi-row Stats in permuted, gapped storage: the store reads all three declared strides, so the strided
+    Stats equal the contiguous ones bit for bit, in either base."""
+    graph_d128._check_dsl_sm100_strided_stats(_D, _D, stats_use_log2=stats_log2)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("scale", [-0.25, 0.0], ids=["negative", "zero"])
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "unmasked"])
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_scale_signs(graph_d128, scale, causal):
+    """The graph's attn_scale sign reaches the D128 specialization, masked and unmasked (the SM90 suite's
+    test_dsl_sm90_scale_sign runs causal at D512 only)."""
+    q, k, v = (_bhsd(2, 4, 100, _D, torch.float16) for _ in range(3))
+    sdpa_kwargs = dict(use_causal_mask=True) if causal else {}
+    o, lse = graph_d128._run_dsl_graph(q, k, v, scale=scale, dtype=torch.float16, sdpa_kwargs=sdpa_kwargs, return_stats=True)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=scale, is_causal=causal, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_omitted_scale_is_no_scaling(graph_d128):
+    """An omitted attn_scale is 1.0 on the graph, as the backend lowers it, never the adapter's 1/sqrt(d) default."""
+    graph_d128.test_dsl_sm100_omitted_attn_scale_is_no_scaling(_D)
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_softmax_precision_float_is_the_default_arithmetic(graph_d128):
+    """sdpa(softmax_precision=FLOAT) names the arithmetic D128 always runs, so O and Stats equal the unset graph's bit
+    for bit. A set precision makes the node backend-unlowerable: only FROST can serve this graph."""
+    q, k, v = (_bhsd(2, 4, 100, _D, torch.bfloat16) for _ in range(3))
+
+    def run(**kw):
+        sdpa_kwargs = dict(use_causal_mask=True, **kw)
+        return graph_d128._run_dsl_graph(q, k, v, scale=_SCALE, dtype=torch.bfloat16, sdpa_kwargs=sdpa_kwargs, return_stats=True)
+
+    o, lse = run()
+    o_float, lse_float = run(softmax_precision=cudnn.data_type.FLOAT)
+    assert torch.equal(o, o_float) and torch.equal(lse, lse_float)
+    o_ref, lse_ref = _ref_sdpa_full(q, k, v, scale=_SCALE, is_causal=True, return_stats=True)
+    torch.testing.assert_close(o, o_ref, atol=5e-2, rtol=3e-2)
+    torch.testing.assert_close(lse.squeeze(-1), lse_ref, atol=2e-2, rtol=2e-2)
+
+
+# --- The graph route: what the 128 x 128 tile declines at (128, 128) -------
+#
+# Each case is a whole SM100 runner whose strict pin is swapped for a probe: the graph is built and ranked as for a
+# launch, then the probe reads whether the SM90 row offers it and the row's reason to decline the 128 x 128 tile (the
+# D128 template), and stops before any build. Each graph keeps the 64 x 64 plans (the D512 body); the (512, 512)
+# control shows the same graph is the row's there too.
+
+
+class _Ranked(Exception):
+    """Raised by the probe once the runner's graph is ranked: nothing is built or launched."""
+
+
+def _ranking(sm100, monkeypatch, check):
+    """Swap the runners' pin for ``check(graph)``, then stop; return a function that runs one runner and gives back the
+    check's value. A graph no engine at all can plan raises before the pin, with every python engine's reason in its
+    message, so that message stands for the row's reason."""
+    seen = []
+
+    def probe(graph, name, **_):
+        assert name == _ROW, name
+        seen.append(check(graph))
+        raise _Ranked
+
+    monkeypatch.setattr(sm100, "_select_engine", probe)
+
+    def rank(run):
+        try:
+            run()
+        except _Ranked:
+            return seen.pop()
+        except cudnn.cudnnGraphNotSupportedError as exc:
+            return False, str(exc)
+        raise AssertionError("the runner never reached its pin")
+
+    return rank
+
+
+def _row_verdict(graph):
+    """(offered, the row's reason to decline the 128 x 128 tile or None) for a ranked graph."""
+    from cudnn.sdpa.fwd import engines
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _ROW)
+    facts = engines.analyze_for(spec, graph)[0]
+    return offers_engine(graph, _ROW), engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128))
+
+
+def _sink(h_q):
+    return torch.randn(1, h_q, 1, 1, dtype=torch.float32, device="cuda")
+
+
+def _decode(m, d):
+    q = m._bhsd(2, 8, 1, d, torch.float16)
+    k, v = (m._bhsd(2, 2, 300, d, torch.float16) for _ in range(2))
+    return m._run_dsl_graph(q, k, v, scale=d**-0.5, dtype=torch.float16, sdpa_kwargs={})
+
+
+def _d128_declines(label):
+    return f"SM90's 128 x 128 tile (the D128 template) does not serve {label}"
+
+
+# The 128 x 128 tile's reason for each feature: config_sm90.d128_decline's label.
+_DECLINED_AT_D128 = [
+    pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, _sink(8), "causal"), _d128_declines("attention sinks"), id="sink"),
+    pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, None, "swa"), _d128_declines("a sliding window"), id="sliding-window"),
+    pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, None, "band"), _d128_declines("a widened right band"), id="right-band"),
+    pytest.param(lambda m, d: m._combo_dense(d, torch.float16, 8, 8, d**-0.5, None, "padded"), _d128_declines("per-batch lengths"), id="padding-lengths"),
+    pytest.param(lambda m, d: m._combo_thd(d, torch.float16, 8, 8, d**-0.5, None, "none"), _d128_declines("THD (ragged) layouts"), id="thd"),
+    # A scope decline, not a kernel limit: D128 runs S_q == 1 on the direct route (the b1h2-sq1-skv1 tile case and
+    # bottom_right-one_row below); the row keeps the 128 x 128 tile off it because decode is outside the slice #378
+    # accepted.
+    pytest.param(_decode, "s_q == 1 (decode) is outside the SM90 D128 template's scope", id="s_q-1-scope"),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("run, why", _DECLINED_AT_D128)
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_declines_what_d128_does_not_serve(sm100, monkeypatch, run, why):
+    """At (128, 128) the row offers the graph on the 64 x 64 tile (the D512 body) and declines the 128 x 128 tile with
+    the D128 template's reason, so no D128 plan is ranked for a declaration the template does not serve; at (512, 512)
+    the same graph is offered."""
+    rank = _ranking(sm100, monkeypatch, _row_verdict)
+    offered, reason = rank(lambda: run(sm100, 128))
+    assert offered and why in (reason or ""), reason
+    assert rank(lambda: run(sm100, 512))[0] is True
+
+
+@pytest.mark.L0
+@torch_fork_set_rng(seed=0)
+def test_d128_graph_pinned_pack_gqa_runs_on_the_64_tile(sm100, monkeypatch):
+    """The 128 x 128 tile is offered unpacked only: on its MQA graph a strict pin to a packed plan finds the 64 x 64
+    one (the D512 body packs), and mismatch() declines PackGQA on the 128 x 128 tile with the D128 template's reason;
+    at (512, 512) the same graph has a packed plan."""
+    from cudnn.sdpa.fwd import engines
+
+    spec = next(s for s in engines.ENGINE_SPECS if s.name == _ROW)
+
+    def packed(graph):
+        try:
+            select_engine(graph, _ROW, pack_gqa=True)
+            pinned = None
+        except AssertionError as exc:
+            pinned = str(exc)
+        facts = engines.analyze_for(spec, graph)[0]
+        return offers_engine(graph, _ROW), pinned, engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128, pack_gqa=True))
+
+    rank = _ranking(sm100, monkeypatch, packed)
+
+    def run(d):
+        q = sm100._bhsd(1, 8, 96, d, torch.float16)
+        k, v = (sm100._bhsd(1, 1, 96, d, torch.float16) for _ in range(2))
+        return lambda: sm100._run_dsl_graph(q, k, v, scale=d**-0.5, dtype=torch.float16, sdpa_kwargs={}, pack_gqa=True)
+
+    offered, pinned, why = rank(run(128))
+    assert offered and pinned is None, pinned
+    assert why == _d128_declines("PackGQA"), why
+    assert rank(run(512))[:2] == (True, None)
 
 
 # --- Tiles: whole, partial and single, Q and KV -------
@@ -210,15 +445,61 @@ def test_d128_stats_log2_is_the_natural_log_times_log2e():
     torch.testing.assert_close(lse2, lse * math.log2(math.e), atol=1e-5, rtol=1e-6)
 
 
-@pytest.mark.parametrize("scale", [-0.25, 0.0, 1.0], ids=["negative", "zero", "unit"])
+_SCALES = {"negative": -0.25, "zero": 0.0, "unit": 1.0}
+
+
+# The causal ids are the original ones (kept stable); the unmasked cells are new.
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "scale, causal",
+    [pytest.param(scale, True, id=name) for name, scale in _SCALES.items()]
+    + [pytest.param(scale, False, id=f"unmasked-{name}") for name, scale in _SCALES.items()],
+)
 @torch_fork_set_rng(seed=0)
-def test_d128_scale_signs(scale):
+def test_d128_scale_signs(scale, causal):
     """Each sign compiles its own probability path: a negative scale anchors each row at its
     minimum and always takes the FP64 exponents, a zero scale weighs every visible key equally,
-    and a unit scale makes the softmax sharp. Causal with Stats, so masked rows are covered."""
+    and a unit scale makes the softmax sharp. With Stats, causal (masked rows) and unmasked: the
+    row's zero_scale claim needs both (test_sdpa_graph_analyzer.py::test_zero_attn_scale_claims)."""
     q, k, v = _inputs(2, 4, 2, 130, 200, torch.float16)
-    o, lse = _run(q, k, v, stats=True, is_causal=True, scale_softmax=scale)
-    _check(o, lse, q, k, v, scale=scale, is_causal=True)
+    o, lse = _run(q, k, v, stats=True, is_causal=causal, scale_softmax=scale)
+    _check(o, lse, q, k, v, scale=scale, is_causal=causal)
+
+
+@pytest.mark.L0
+def test_d128_execute_rejects_operands_that_contradict_the_compiled_plan():
+    """The SM90 suite's execute contract on a D128 plan (no sink, which D128 never compiles): no
+    launch before compile, Stats presence must match the plan both ways, and the scale's compiled
+    sign must match, since a flipped sign is a wrong answer rather than an error."""
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
+
+    q, k, v = _inputs(2, 4, 4, 64, 64, torch.float16)
+    o = torch.empty_like(q)
+    lse = torch.empty(2, 4, 64, dtype=torch.float32, device="cuda")
+    run = lambda api, **kw: api.execute(q_tensor=q, k_tensor=k, v_tensor=v, o_tensor=o, **kw)  # noqa: E731
+
+    full = SdpaFwdDslSm90(q, k, v, o, sample_lse=lse)
+    assert full.check_support() and full.flavor == (128, 128), full.flavor
+    # The refusal under test: execute before compile must raise (the one deliberate execute before compile() here).
+    with pytest.raises(RuntimeError, match="requires a compiled plan"):
+        run(full, lse_tensor=lse)
+    full.compile()
+    with pytest.raises(ValueError, match="lse_tensor is required"):
+        run(full)
+    for wrong in (-1.0, 0.0):
+        with pytest.raises(ValueError, match="does not match its compile-time sign mode"):
+            run(full, lse_tensor=lse, scale_softmax=wrong)
+
+    plain = SdpaFwdDslSm90(q, k, v, o)
+    assert plain.check_support() and plain.flavor == (128, 128), plain.flavor
+    plain.compile()
+    for kw, why in (
+        (dict(lse_tensor=lse), "without an LSE output"),
+        (dict(sinks=torch.zeros(1, 4, 1, 1, dtype=torch.float32, device="cuda")), "without sink support"),
+        (dict(seq_kv_lens=torch.full((2,), 64, dtype=torch.int32, device="cuda")), "without per-batch KV lengths"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            run(plain, **kw)
 
 
 # --- Invariance: schedulers, repeats, layouts -------

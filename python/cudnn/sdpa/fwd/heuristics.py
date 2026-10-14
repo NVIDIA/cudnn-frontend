@@ -121,6 +121,7 @@ from cudnn.sdpa.fwd.engines import (
     decode_d256_q_tile_for_row,
     effective_cgas,
     effective_sched_policies,
+    effective_tile_ms,
     launch_grid_mismatch,
     mismatch,
     pack_gqa_partial,
@@ -3236,6 +3237,20 @@ def nonpaged_thd_split_choice(caps: Capabilities, facts) -> Tuple[int, bool]:
     return splits, pack
 
 
+def _sm90_d128_knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
+    """The SM90 row's 128 x 128 sets: the dedicated D128 template (#378). Its tile names the template, and mismatch()
+    admits it only on an exact (128, 128) graph the template serves (engines._sm90_d128_tile_mismatch), so these sets
+    exist there alone and lead the D512 body's 64 x 64 sets (:func:`_knob_sets`). One CTA, unsplit, unpacked: the
+    scheduler order first, then the other orders as runners. Empty on every other row and graph."""
+    caps = spec.capabilities
+    lead = SdpaFwdKnobs(tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    if caps.sm_lo != 90 or 128 not in effective_tile_ms(caps, facts, lead) or mismatch(caps, facts, lead) is not None:
+        return []
+    scheds = _sched_points(caps, facts)
+    first, _ = _auto_sched_cga(spec, facts, split_kv=1, sched_policy=scheds[0], pack_gqa=False)
+    return [replace(lead, sched_policy=policy) for policy in [first] + [policy for policy in scheds if policy != first]]
+
+
 def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
     """The cell's ordered COMPLETE knob assignments.
 
@@ -3416,7 +3431,10 @@ def _knob_sets(spec: EngineSpec, facts) -> List[SdpaFwdKnobs]:
         unique.insert(
             0, replace(base, cga=1, pack_gqa=nonpaged_packed, split_kv=nonpaged_splits, sched_policy=SCHED_NATURAL if caps.sm_lo == 107 else SCHED_LPT)
         )
-    return unique[:_MAX_SETS_PER_ENGINE]
+    # SM90 at exact (128, 128): the dedicated D128 template's 128 x 128 sets first, where it serves the graph, then the
+    # D512 body's 64 x 64 sets above.
+    lead = _sm90_d128_knob_sets(spec, facts)
+    return (lead + [knobs for knobs in unique if knobs not in lead])[:_MAX_SETS_PER_ENGINE]
 
 
 def _fallback_knobs(spec: EngineSpec, facts) -> SdpaFwdKnobs:

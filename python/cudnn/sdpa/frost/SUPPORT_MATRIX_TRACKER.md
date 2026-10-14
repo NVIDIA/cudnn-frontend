@@ -379,7 +379,8 @@ all use FP16 or all BF16. The shared body has native **D128, D256 and D512**
 contraction/storage specializations. QK uses 8/16/32 k16 WGMMA steps and the
 PV warpgroups each own 64/128/256 columns, respectively. Smaller head pairs
 inside each admitted envelope pay that envelope's cost, with TMA zero-fill
-and clipped output stores:
+and clipped output stores. At exact (128, 128) a 128 x 128 tile also selects
+a dedicated D128 template (#378), described after the D64 specialization below:
 
 | Native tile | Graph envelope (both D_QK and D_V independently, multiple of 8) |
 |---|---|
@@ -437,6 +438,25 @@ execution and prepared-body controls are recorded in the 2026-11-10 dense-split
 qualification in `test/python/determinism_goldens/README.md`; the earlier D512
 hardware results below do not independently qualify D64.
 
+**The 128 x 128 tile at exact (128, 128) (#378).** The (128, 128) d-shape's
+tile domains are {64, 128} (`tile_ms_by_d_shape` / `tile_ns_by_d_shape`): a
+64 x 64 knob compiles the shared D128 body above, a 128 x 128 knob the
+dedicated D128 template (`sm90/prefill_d128_f16.py`, ʰ¹²⁸). The tile names the
+template, so the row's eligibility is unchanged: every (128, 128) graph it
+admits keeps the 64 x 64 plans, and the 128 x 128 tile is admitted only for
+exact (128, 128) dense graphs the template serves (the table's last column;
+`engines._sm90_d128_tile_mismatch` with `config_sm90.d128_decline`). It is
+declined for THD, paged KV, split-KV, sinks, sliding windows, widened right
+bands, per-batch lengths, PackGQA, `S_q == 1` (a scope decline: the template
+runs it on the direct route, but decode is outside the slice #378 accepted) and
+the pending unpadded bottom-right `S_q > S_kv`. Where the tile serves a graph,
+the heuristics propose its 128 x 128 plans first and the 64 x 64 plans after
+them; the fallback plan stays 64 x 64. The direct adapter takes the template a
+pinned tile names, refusing a 128 x 128 pin the template does not serve, and
+with no tile pinned runs the dedicated template on the exact (128, 128) dense
+declarations it serves. Placement is the row's: the template's plans trail the
+backend with the other non-D512 shapes.
+
 H200 validation (2026-09-20, on `b100e342`; DSL 4.8.0.dev0, cuDNN 9.24.0,
 torch 2.14.0+cu130). The SM90 L0/L1 conformance suites — 21 files, not yet in
 this tree, run from the development checkout against this package — gave 1115
@@ -472,35 +492,35 @@ GH200 validation (2026-10-26, on `4cd4e613`; DSL 4.8.1, cuDNN 9.27.0, torch
 in: 271 passed, 0 skipped, 0 failed. The 21 conformance files above are not in
 this tree and were not run.
 
-| Feature | Shared native D128/D256/D512 bodies, within the graph envelopes above |
-|---|:--:|
-| FP16 / BF16 Q/K/V/O | ✅ / ⚠️ |
-| Dense layouts within `dense_flex`, with native TMA stride alignment | ✅ / ⚠️ |
-| Packed token-major THD Q/K/V/O | ✅ / ⚠️ |
-| Gapped THD (TE's `cu_seqlens_padded`, per side or per port): every port's INT32/INT64 ragged offsets and multiplier read on device | ✅ / ⚠️ |
-| Optional FP32 Stats, natural-log or base-2 (`stats_use_log2`); strided / permuted dense Stats within `dense_flex`; packed THD token-major / head-major Stats | ✅ / ⚠️ |
-| Unmasked / top-left causal / bottom-right causal | ✅ / ⚠️ |
-| Left/right diagonal bands; bottom-right requires a right bound | ✅ / ⚠️ |
-| Bottom-right or left-window `S_q > S_kv` with padding or THD | ✅ / ⚠️ |
-| Dense padding with INT32 per-batch Q/KV lengths and Stats | ✅ / ⚠️ |
-| THD INT32 sequence or cumulative Q/KV lengths | ✅ / ⚠️ |
-| Ragged `S_kv` (no tile rule; masked natively, no synthesized lengths) | ✅ / ⚠️ |
-| GQA / MQA; dense PackGQA when the head ratio divides 64 | ✅ / ⚠️ |
-| Dense split-KV, including supported PackGQA, lengths, bands, sinks and optional/base-two Stats | ✅ / ⚠️ |
-| Decode-shaped (`S_q == 1`) | ✅ / ⚠️ |
-| Per-head FP32 sink at any `S_q`, decode (`S_q == 1`, declared explicitly by the row) included: a keyless row is O = 0 / LSE = sink, a `seq_len_q`-trimmed row stays O = 0 / LSE = −inf | ✅ / ⚠️ |
-| Host scale, including literal zero and negative values (the sign is a compile-time specialization) | ✅ / ⚠️ |
-| Softmax precision unset / FLOAT | ✅ / ⚠️ |
-| Dense-Q paged KV, independent K/V pools and tables, with device lengths | ✅ / ⚠️ |
-| FP8/MXFP8, Amax_O output, mixed output dtype, bias, THD paged KV, fused epilogue gate, backward | ❌ |
-| Dense-padded THD Stats; dense cumulative lengths or Q-only trim | ❌ |
-| Head pairs outside the bounded graph envelopes (standalone retains the wider ×8 domain) | ❌ |
+| Feature | Shared native D128/D256/D512 bodies, within the graph envelopes above | 128 x 128 tile at exact (128, 128) (the dedicated D128 template)ʰ¹²⁸ |
+|---|:--:|:--:|
+| FP16 / BF16 Q/K/V/O | ✅ / ⚠️ | ✅ |
+| Dense layouts within `dense_flex`, with native TMA stride alignment | ✅ / ⚠️ | ✅ |
+| Packed token-major THD Q/K/V/O | ✅ / ⚠️ | ❌ |
+| Gapped THD (TE's `cu_seqlens_padded`, per side or per port): every port's INT32/INT64 ragged offsets and multiplier read on device | ✅ / ⚠️ | ❌ |
+| Optional FP32 Stats, natural-log or base-2 (`stats_use_log2`); strided / permuted dense Stats within `dense_flex`; packed THD token-major / head-major Stats | ✅ / ⚠️ | ✅ dense; THD ❌ |
+| Unmasked / top-left causal / bottom-right causal | ✅ / ⚠️ | ✅ |
+| Left/right diagonal bands; bottom-right requires a right bound | ✅ / ⚠️ | ❌ |
+| Bottom-right or left-window `S_q > S_kv` with padding or THD | ✅ / ⚠️ | ❌ |
+| Dense padding with INT32 per-batch Q/KV lengths and Stats | ✅ / ⚠️ | ❌ |
+| THD INT32 sequence or cumulative Q/KV lengths | ✅ / ⚠️ | ❌ |
+| Ragged `S_kv` (no tile rule; masked natively, no synthesized lengths) | ✅ / ⚠️ | ✅ |
+| GQA / MQA; dense PackGQA when the head ratio divides 64 | ✅ / ⚠️ | ✅ GQA / MQA, unpacked; PackGQA ❌ |
+| Dense split-KV, including supported PackGQA, lengths, bands, sinks and optional/base-two Stats | ✅ / ⚠️ | ❌ |
+| Decode-shaped (`S_q == 1`) | ✅ / ⚠️ | ❌ (scope, ʰ¹²⁸) |
+| Per-head FP32 sink at any `S_q`, decode (`S_q == 1`, declared explicitly by the row) included: a keyless row is O = 0 / LSE = sink, a `seq_len_q`-trimmed row stays O = 0 / LSE = −inf | ✅ / ⚠️ | ❌ |
+| Host scale, including literal zero and negative values (the sign is a compile-time specialization) | ✅ / ⚠️ | ✅ |
+| Softmax precision unset / FLOAT | ✅ / ⚠️ | ✅ |
+| Dense-Q paged KV, independent K/V pools and tables, with device lengths | ✅ / ⚠️ | ❌ |
+| FP8/MXFP8, Amax_O output, mixed output dtype, bias, THD paged KV, fused epilogue gate, backward | ❌ | ❌ |
+| Dense-padded THD Stats; dense cumulative lengths or Q-only trim | ❌ | ❌ |
+| Head pairs outside the bounded graph envelopes (standalone retains the wider ×8 domain) | ❌ | ❌ |
 
 The following are **declined, pending**:
 
 | Case | Current enforcement |
 |---|---|
-| Unpadded bottom-right `S_q > S_kv` | Shared validator; native declaration for direct callers |
+| Unpadded bottom-right `S_q > S_kv` | Shared validator; native declaration for direct callers; the row's 128 x 128 tile at (128, 128) |
 | Unpadded left-window `S_q > S_kv`, including vacuous raw bounds | Shared validator; native declaration |
 | Bottom-right band with only a left bound | Shared eligibility; contradictory direct constructor arguments |
 | Tight-tail dense layouts outside `dense_flex` | Shared eligibility; native declaration |
@@ -514,7 +534,9 @@ declarations take LPT_L2 while one KV head's K+V (`S_kv·(D_QK+D_V)·2` bytes)
 fits 50 MiB and LPT above it, the shared SM100/SM120 rule; others take NATURAL. Heuristics use the shared
 ordering (for example, 8/2 GQA packs first at `S_q=32`, unpacked first at `S_q=1024`), and
 THD offers NATURAL/unpacked only. Requested values remain unchanged; public
-float and string knob keys follow shared integer coercion. Tiles are 64/64,
+float and string knob keys follow shared integer coercion. Tiles are 64/64, plus
+128/128 at exact (128, 128) (the dedicated D128 template, offered unpacked and
+unsplit and proposed first where it serves the graph),
 CGA is 1; dense split-KV accepts 1..65535 (subject to launch limits), while THD stays unsplit. Schedulers are NATURAL, plain
 LPT, and LPT_L2 blocks of a power of two of whole KV groups within 50 MiBʷ.
 
@@ -554,14 +576,22 @@ sibling adapters (Rule S1). Accessed padded V rows must be finite. O, Stats and
 workspace must not overlap other operands (caller contract, unchecked as on the
 sibling adapters), and storage must outlive the stream.
 
-SM90 is an ordinary `ENGINE_SPECS` row using the unchanged shared validator,
-matcher, heuristics, lowering and binding. Native refusals are owned by
+SM90 is an ordinary `ENGINE_SPECS` row using the shared validator, matcher,
+heuristics, lowering and binding. Native refusals are owned by
 `SdpaFwdDslSm90.check_support`, as in the sibling adapters; the adapter shares
 `api_dsl.py` with SM80 and SM120 and is exported lazily from `cudnn.sdpa.fwd`.
-The row is additive: `mismatch`, `recommend`, the validator, the lowering and
-the binding are unchanged by it, so the nine other rows' eligibility and
-ordering are what they were. That is a statement about the host code, not
-numerical validation on those architectures.
+Its (128, 128) d-shape's two tiles use the per-d-shape tile domains
+(`tile_ms_by_d_shape` / `tile_ns_by_d_shape`), which `mismatch` and the
+heuristics read on the d-shape a graph selects, and `mismatch` judges a 128
+knob on this row alone (`engines._sm90_d128_tile_mismatch`). Every other row
+leaves the tile domains at their default `()`, which `effective_tile_ms` /
+`effective_tile_ns` read as the row-wide domain, so the ten other rows'
+eligibility and ordering are what they were. The spelled-out test checks the
+verdicts on the four other half rows: spelling the defaults out changes no
+verdict and no message there
+(`test_sdpa_fwd_d128_sm90_routing.py::test_every_flavor_spelled_out_equals_the_defaults_on_every_shipped_row`);
+no quantized row sets these fields. That is a statement about the host code,
+not numerical validation on those architectures.
 
 ʷ **The kernel (`sm90/prefill_d512_f16.py`).** Three warpgroups (384 threads),
 `setmaxnreg` (24, 240, 240). WG0 issues the TMA loads, WG1 runs QK (m64n64k512,
@@ -593,6 +623,24 @@ TFLOPS against 55–57, 18.8–20.3 % SOL. Gemma4 full attention (b=1, 32/4 head
 causal), same lengths: 5.46 / 5.72 / 5.78 / 5.72x, 491–577 TFLOPS against
 90–100, 45.8–53.9 % SOL. The windowed shape's lower SOL is per-CTA fixed cost
 over its three KV tiles.
+
+ʰ¹²⁸ **The D128 kernel (`sm90/prefill_d128_f16.py`, #378).** Three warpgroups
+(384 threads), `setmaxnreg` (24, 240, 240). WG0 issues the TMA loads; WG1 and
+WG2 each own 64 of the CTA's 128 query rows and every head column, and each runs
+its own QK (m64n128k16, SS), online softmax and PV (m64n128k16, RS) with no
+handoff between them, so a 64-row FP32 O accumulator costs 64 registers per
+thread. The CTA tile is 128 x 128 (Q rows by keys). K and V ride two-stage
+rings, so the producer loads KV tile j+1 while tile j is in use: 196,704 B of
+SMEM, one CTA per SM. The online softmax, the sign-aware row anchor, the FP64
+path for extreme scales and the reverse KV walk are D512's arithmetic
+(shared helpers in `sm90/_common_hopper.py`). Dense only: a direct caller's
+declarations naming a `config_sm90.D128_NOT_SERVED` feature run on the D512
+body, or are refused under a pinned 128 x 128 tile; the row declines the 128 x
+128 tile for them. `S_q == 1` is a scope decline at the row, not a kernel
+limit: the kernel runs it on the direct route, and the row keeps the 128 x 128
+tile off it on the graph route because decode is outside the slice #378
+accepted. Placement keeps it behind the backend with the row's other non-D512
+shapes.
 
 ---
 

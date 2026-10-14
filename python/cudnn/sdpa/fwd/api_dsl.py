@@ -5569,7 +5569,7 @@ def sdpa_fwd_wrapper_dsl_sm100(
 
 
 # ---------------------------------------------------------------------------
-# SM90: adapter over the Hopper D512 prefill kernel template
+# SM90: adapter over the Hopper D512 body and dedicated D128 prefill kernel templates
 # ---------------------------------------------------------------------------
 
 
@@ -5875,6 +5875,10 @@ class SdpaFwdDslSm90(SdpaFwdDsl):
             self.params = replace(self.params, thd_origins=tuple((spec[3], spec[1]) if spec is not None else None for spec in origin_specs))
             _sm90_validate_params(self.params, self.flavor)
         self._k_mod = template = _load_sm90_kernel_module(self.flavor, self.params, native_d64=self._native_d64)
+        # Which template serves this plan ("prefill_d128_f16", "prefill_d512_f16" or "prefill_d64_f16"), as the SM100
+        # adapter records it: the engine's executor exposes it, so a test or the routing tally names the template without
+        # inferring it from the source.
+        self.kernel_template = os.path.splitext(os.path.basename(template.__file__))[0]
         strides, lse_stride = self._strides, self._lse_stride
         if self.split_kv > 1:
             # The producer TMA maps describe split-major partials; final layouts

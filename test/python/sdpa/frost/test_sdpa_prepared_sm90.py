@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""SM90's late-added D512 row must use the prepared pointer launch everywhere."""
+"""Both SM90 templates, the D512 body and the dedicated D128, must use the prepared pointer launch everywhere."""
 
 import pytest
 import torch
@@ -13,19 +13,25 @@ from test_sdpa_fwd_dsl_sm100 import _bhsd, _ref_sdpa_full
 pytestmark = [pytest.mark.L0, pytest.mark.skipif(_SM != 90, reason="requires SM90"), requires_dsl]
 
 
-@pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
-def test_graph_never_enters_tensor_adapter(sm100, monkeypatch, thd):
-    """Prove both graph layouts use the prepared executor instead of the tensor adapter."""
+@pytest.mark.parametrize("thd, d", [pytest.param(False, 512, id="dense"), pytest.param(True, 512, id="thd"), pytest.param(False, 128, id="dense-d128")])
+def test_graph_never_enters_tensor_adapter(sm100, monkeypatch, thd, d):
+    """Prove both graph layouts use the prepared executor instead of the tensor adapter, on D512 and on the D128
+    template the row proposes first at exact (128, 128) (dense only: THD there keeps the 64 x 64 tile, the D512
+    body). Each case loads its own template, and only that one."""
+    from cudnn.sdpa.fwd import api_dsl
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
     def forbidden(*args, **kwargs):
         raise AssertionError("graph execution returned to the tensor adapter")
 
     monkeypatch.setattr(SdpaFwdDslSm90, "execute", forbidden)
+    loaded, load = [], api_dsl._load_kernel_template
+    monkeypatch.setattr(api_dsl, "_load_kernel_template", lambda filename, *a, **kw: loaded.append(filename) or load(filename, *a, **kw))
     if thd:
-        sm100._run_thd_stats_case(seq_lens_q=[130, 0, 64, 7], seq_lens_kv=[130, 5, 200, 7], d=512, H_q=4, H_kv=2, mask="causal_br", cu_lens=True)
+        sm100._run_thd_stats_case(seq_lens_q=[130, 0, 64, 7], seq_lens_kv=[130, 5, 200, 7], d=d, H_q=4, H_kv=2, mask="causal_br", cu_lens=True)
     else:
-        sm100.test_sdpa_fwd_dsl_sm100_graph_api(torch.float16, True, 512)
+        sm100.test_sdpa_fwd_dsl_sm100_graph_api(torch.float16, True, d)
+    assert loaded and set(loaded) == {f"sm90/prefill_d{d}_f16.py"}, loaded
 
 
 # THD at D=128 runs the D512 template (config_sm90.NOT_SERVED), so only the dense arm adds D128.

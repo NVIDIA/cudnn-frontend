@@ -4,11 +4,14 @@
 """End-to-end tests for the FROST SM90 DSL SDPA-forward engine against a torch reference.
 
 SM90 serves native D64/D128/D256/D512 f16/bf16 prefill; this file retains the D512
-forward suite. The end-to-end half runs through test_sdpa_fwd_dsl_sm100.py: its runners, fp32
-references and tolerances are arch-neutral apart from a module-level ``_ARCH`` fed to
+forward suite. At exact (128, 128) a 128 x 128 tile names the dedicated D128 template (#378),
+whose numerics and graph route are test_sdpa_fwd_d128_sm90.py's. The end-to-end half runs
+through test_sdpa_fwd_dsl_sm100.py: its runners, fp32 references and tolerances are
+arch-neutral apart from a module-level ``_ARCH`` fed to
 ``engine_name(arch=...)``, so the ``sm100`` fixture repins that one string and SM90 runs the same
-graphs and assertions at its own head dim (test/AGENTS.md). The rest is what only SM90 has -- the
-row's envelope floor, the options its adapter declines, and its own template, THD arm and wrapper.
+graphs and assertions at its own head dim (test/AGENTS.md). The rest is what only SM90 has: the
+row's envelope floors, the options its adapter declines, the adapter's flavor pick, and its own
+templates, THD arm and wrapper.
 """
 
 import math
@@ -50,11 +53,11 @@ def sm100(monkeypatch):
     return _sm100
 
 
-def _api(s_kv=_SHAPE[2], dtype=torch.float16, **kw):
-    """A dense SM90 adapter; the decline tests below stop at check_support."""
+def _api(s_kv=_SHAPE[2], dtype=torch.float16, d=_D, **kw):
+    """A dense SM90 adapter at head dim ``d``; the decline tests below stop at check_support."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
 
-    b, h, s_q, d = _SHAPE
+    b, h, s_q, _ = _SHAPE
     q, k, v, o = (_bhsd(b, h, s, d, dtype) for s in (s_q, s_kv, s_kv, s_q))
     return SdpaFwdDslSm90(q, k, v, o, **kw)
 
@@ -405,7 +408,8 @@ def test_sm90_thd_execute_does_not_sync():
 
 @torch_fork_set_rng(seed=0)
 def test_sm90_graph_loads_its_own_template(sm100, monkeypatch):
-    """The suite's one routing proof: SM120 ships a prefill_d512_f16.py too, so the directory is the evidence."""
+    """The D512 graph's routing proof (D128's is test_sdpa_fwd_d128_sm90.py's): SM120 ships a prefill_d512_f16.py
+    too, so the directory is the evidence."""
     from cudnn.sdpa.fwd import api_dsl
 
     loaded, load = [], api_dsl._load_kernel_template
@@ -668,6 +672,23 @@ def test_sm90_declines_what_it_cannot_lower(declared, why):
         _api(**declared).check_support()
 
 
+@pytest.mark.parametrize(
+    ("declared", "why", "flavor"),
+    [
+        pytest.param(dict(tile_m=128, tile_n=128, split_kv=2), "does not serve split-KV", (512, 512), id="split-kv"),
+        pytest.param(dict(cga=2), "CGA other than 1", (128, 128), id="cga"),
+    ],
+)
+def test_sm90_d128_declines_the_knobs_it_cannot_honor(declared, why, flavor):
+    """The knob half of the declines above at (128, 128): a split pinned on the 128 x 128 tile is refused with the D128
+    template's reason (with no tile pinned the D512 body serves the split), and a CGA pin is refused on the flavor
+    chosen first, D128 here, so neither is quietly dropped."""
+    api = _api(d=128, **declared)
+    with pytest.raises(NotImplementedError, match=why):
+        api.check_support()
+    assert api.flavor == flavor, api.flavor
+
+
 def test_sm90_binds_only_the_layouts_it_can_address():
     """Rule 2: the declared strides ARE the kernel's tensor maps -- no BSHD gather stands between
     them -- so a layout the maps cannot express is refused, never silently copied or mis-addressed.
@@ -706,16 +727,30 @@ def test_sm90_declines_a_too_old_dsl(monkeypatch):
 
 @pytest.mark.parametrize("declared", [dict(causal_bottom_right=True), dict(window_size_left=16)], ids=["bottom-right", "sliding-window"])
 def test_sm90_pending_s_q_above_s_kv_is_ranked_by_the_row_and_declined_at_build(declared):
-    """A known row/adapter disagreement, pinned on BOTH sides: ``mismatch`` has no unpadded
-    S_q > S_kv rule, so the row ranks the graph and the adapter declines it at build. This goes
-    RED when the row learns the rule or the feature lands -- convert it to a one-sided assertion
-    (or a positive case) then."""
+    """A known row/adapter disagreement on D512, pinned on BOTH sides: ``mismatch`` has no unpadded
+    S_q > S_kv rule there, so the row ranks the graph and the adapter declines it at build. This goes
+    RED when the row learns the rule or the feature lands; convert it to a one-sided assertion (or a
+    positive case) then. At (128, 128) the row declines the bottom-right case on the 128 x 128 tile
+    (the next test)."""
     from cudnn.sdpa.fwd import engines
 
     facts = _facts(s_q=_SHAPE[2], s_kv=32, causal=True, bottom_right="causal_bottom_right" in declared, window_left=declared.get("window_size_left"))
     assert engines.mismatch(_caps(_ROW), facts) is None
     with pytest.raises(NotImplementedError, match="is not yet supported on SM90"):
         _api(s_kv=32, is_causal=True, **declared).check_support()
+
+
+def test_sm90_d128_pending_s_q_above_s_kv_is_declined_by_the_row_and_at_build():
+    """At (128, 128) the row declines unpadded bottom-right S_q > S_kv on the 128 x 128 tile with the adapter's own
+    message, and the adapter declines it at build on D128, so neither side ranks or builds that plan. (A sliding window
+    keeps the 64 x 64 tile: the 128 x 128 tile declines it.)"""
+    from cudnn.sdpa.fwd import engines
+
+    why = "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
+    facts = _facts(d_qk=128, d_v=128, s_q=_SHAPE[2], s_kv=32, causal=True, bottom_right=True)
+    assert engines.mismatch(_caps(_ROW), facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128)) == why
+    with pytest.raises(NotImplementedError, match=why):
+        _api(s_kv=32, d=128, is_causal=True, causal_bottom_right=True).check_support()
 
 
 # --- Registration and the plans offered for the row -------
@@ -737,27 +772,38 @@ def test_sm90_is_a_default_row_at_its_shipped_id(monkeypatch):
 
 def test_sm90_every_candidate_is_valid():
     """Every knob set the heuristics offer for the SM90 row is admissible on that row, deduplicated,
-    bounded, and carries its fixed geometry. THD narrows to NATURAL / unpacked: the adapter declines
-    THD under LPT or PackGQA, so offering either would rank a plan that cannot build."""
+    bounded, and carries a tile its template runs: 64 x 64 everywhere and, on an exact (128, 128)
+    graph the dedicated D128 template serves, its 128 x 128 sets first, unsplit and unpacked. THD
+    narrows to NATURAL / unpacked: the adapter declines THD under LPT or PackGQA, so offering either
+    would rank a plan that cannot build."""
     from cudnn.sdpa.fwd import engines
     from cudnn.sdpa.fwd.heuristics import _MAX_SETS_PER_ENGINE, recommend
 
     shape = dict(h_kv=2, s_q=1024, s_kv=8192, device_sm_count=132)
     dense, thd = _facts(causal=True, **shape), _facts(thd=True, padded=True, **shape)
-    for facts, policies, packs in ((dense, {SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}, {False, True}), (thd, {SCHED_NATURAL}, {False})):
+    d128 = _facts(d_qk=128, d_v=128, causal=True, **shape)
+    all_policies = {SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}
+    for facts, tiles, policies, packs in (
+        (dense, {(64, 64)}, all_policies, {False, True}),
+        (thd, {(64, 64)}, {SCHED_NATURAL}, {False}),
+        (d128, {(128, 128), (64, 64)}, all_policies, {False, True}),
+    ):
         plans = recommend("A", facts, {_ROW: _offered_id()})
         assert plans and len(plans) <= _MAX_SETS_PER_ENGINE and len({p.knobs for p in plans}) == len(plans), plans
+        assert ((plans[0].knobs.tile_m, plans[0].knobs.tile_n) == (128, 128)) is ((128, 128) in tiles), plans[0]
         for knobs in (p.knobs for p in plans):
             assert engines.mismatch(_caps(_ROW), facts, knobs) is None, knobs
-            assert (knobs.tile_m, knobs.tile_n, knobs.cga) == (64, 64, 1), knobs
+            assert (knobs.tile_m, knobs.tile_n) in tiles and knobs.cga == 1, knobs
             assert 1 <= knobs.split_kv <= 65535 and (not facts.thd or knobs.split_kv == 1), knobs
+            if (knobs.tile_m, knobs.tile_n) == (128, 128):
+                assert knobs.split_kv == 1 and knobs.pack_gqa is False, knobs
             assert knobs.sched_policy in policies and knobs.pack_gqa in packs, knobs
 
 
 def test_sm90_pack_gqa_uses_its_64_row_cta():
-    """An SM90 grid tile is one 64-row CTA whatever the head dims. Through the SM100 cluster chain
-    the row answered 128 -- 256 at d192x128 -- so S_q = 96 led packed. Order only: both legs stay
-    listed either way."""
+    """An SM90 grid tile is one 64-row CTA whatever the head dims (the D128 template's 128 x 128
+    tile is never offered packed). Through the SM100 cluster chain the row answered 128 -- 256 at
+    d192x128 -- so S_q = 96 led packed. Order only: both legs stay listed either way."""
     from cudnn.sdpa.fwd.heuristics import _pack_gqa_tile_q, recommend
 
     caps = _caps(_ROW)
@@ -767,6 +813,7 @@ def test_sm90_pack_gqa_uses_its_64_row_cta():
 
     for d_qk, d_v in ((512, 512), (264, 504), (192, 128)):
         assert _pack_gqa_tile_q(caps, sm90(d_qk=d_qk, d_v=d_v), 64, 1) == 64, (d_qk, d_v)
+    assert {p.knobs.pack_gqa for p in recommend("A", sm90(d_qk=128, d_v=128), {_ROW: _offered_id()}) if p.knobs.tile_m == 128} == {False}
 
     def leads_packed(s_q):
         plans = recommend("A", sm90(s_q=s_q), {_ROW: _offered_id()})

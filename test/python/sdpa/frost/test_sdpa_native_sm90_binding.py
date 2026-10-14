@@ -133,8 +133,10 @@ def test_missing_actual_host_slot_rejects(thd, slot):
 @requires_dsl
 @pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
 @pytest.mark.parametrize("scale", [0.0, -0.125, 0.125])
-@pytest.mark.parametrize("dq,dv", [(96, 128), (512, 512)])
+@pytest.mark.parametrize("dq,dv", [(96, 128), (512, 512), (128, 128)])
 def test_standalone_native_route_fresh_storage_scale_and_replay(thd, scale, dq, dv, monkeypatch):
+    """(128, 128) dense runs the D128 template (unmasked, at all three scale signs); THD at 128 and the other pairs
+    run D512."""
     from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm90
     from test_sdpa_fwd_dsl_sm100 import _bhsd, _ref_sdpa_full
 
@@ -143,6 +145,7 @@ def test_standalone_native_route_fresh_storage_scale_and_replay(thd, scale, dq, 
     stats = torch.empty((b, sq, h), device="cuda").transpose(1, 2)
     api = SdpaFwdDslSm90(q, k, v, o, sample_lse=stats, thd=thd, scale_softmax=scale)
     api.compile()
+    assert api.flavor == ((128, 128) if (dq, dv) == (128, 128) and not thd else (512, 512)), api.flavor
     spec = api._thd_spec if thd else api._dense_spec
     assert spec.native is not None
     kwargs = {}
@@ -187,9 +190,12 @@ def test_standalone_native_route_fresh_storage_scale_and_replay(thd, scale, dq, 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")
 @requires_dsl
-@pytest.mark.parametrize("thd", [False, True], ids=["dense", "thd"])
-def test_graph_native_route_without_python_facts(monkeypatch, thd):
+@pytest.mark.parametrize("thd, d", [pytest.param(False, 512, id="dense"), pytest.param(True, 512, id="thd"), pytest.param(False, 128, id="dense-d128")])
+def test_graph_native_route_without_python_facts(monkeypatch, thd, d):
+    """The native binder serves the graph route without Python facts, on D512 and on the D128 template (dense only:
+    THD at (128, 128) keeps the 64 x 64 tile, the D512 body). Each case loads its own template, and only that one."""
     import test_sdpa_fwd_dsl_sm100 as graph_tests
+    from cudnn.sdpa.fwd import api_dsl
 
     def forbidden(*args, **kwargs):
         raise AssertionError("native graph launch reconstructed Python facts or bindings")
@@ -198,10 +204,13 @@ def test_graph_native_route_without_python_facts(monkeypatch, thd):
     monkeypatch.setattr(prep, "bind_dense", forbidden, raising=False)
     monkeypatch.setattr(prep, "_bind_thd_python", forbidden, raising=False)
     monkeypatch.setattr(graph_tests, "_ARCH", "sm90")
+    loaded, load = [], api_dsl._load_kernel_template
+    monkeypatch.setattr(api_dsl, "_load_kernel_template", lambda filename, *a, **kw: loaded.append(filename) or load(filename, *a, **kw))
     if thd:
-        graph_tests._run_thd_stats_case(seq_lens_q=[33, 0, 7], seq_lens_kv=[65, 5, 7], d=512, H_q=4, H_kv=2, mask="causal_br", cu_lens=True)
+        graph_tests._run_thd_stats_case(seq_lens_q=[33, 0, 7], seq_lens_kv=[65, 5, 7], d=d, H_q=4, H_kv=2, mask="causal_br", cu_lens=True)
     else:
-        graph_tests.test_sdpa_fwd_dsl_sm100_graph_api(torch.bfloat16, True, 512)
+        graph_tests.test_sdpa_fwd_dsl_sm100_graph_api(torch.bfloat16, True, d)
+    assert loaded and set(loaded) == {f"sm90/prefill_d{d}_f16.py"}, loaded
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="requires SM90")

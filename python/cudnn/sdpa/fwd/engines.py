@@ -626,14 +626,55 @@ class Capabilities:
     swap_abs: frozenset[int] = frozenset()
 
     # Per-d-shape Q tile-height domain, the tile_m twin of tile_ns_by_d_shape above, for a
-    # row whose Q tile differs by head dims (planned: the SM90 row, whose exact (128, 128)
-    # graphs also take a 128 x 128 tile, the dedicated D128 template, beside the 64 x 64
-    # tile of the D512 body).  The sched_policies_by_d_shape idiom: an entry OVERRIDES
-    # tile_ms for the d-shape the lowering SELECTS (effective_tile_ms, as effective_tile_ns
-    # reads tile_ns_by_d_shape).  () = the row-wide tile_ms holds for every d-shape (every
-    # row today).  APPENDED after warp_spec_cfgs (append-only contract above; the same test
-    # pins it).
+    # row whose Q tile differs by head dims (the SM90 row, whose exact (128, 128) graphs also
+    # take a 128 x 128 tile, the dedicated D128 template, beside the 64 x 64 tile of the
+    # D512 body).  The sched_policies_by_d_shape idiom: an entry OVERRIDES tile_ms for the
+    # d-shape the lowering SELECTS (effective_tile_ms, as effective_tile_ns reads
+    # tile_ns_by_d_shape).  () = the row-wide tile_ms holds for every d-shape (every row but
+    # SM90).  APPENDED after warp_spec_cfgs (append-only contract above; the same test pins
+    # it).
     tile_ms_by_d_shape: tuple[tuple[tuple[int, int], frozenset[int]], ...] = ()
+
+
+def _sm90_d128_tile_mismatch(facts: "ga.SdpaGraphFacts", knobs: "SdpaFwdKnobs") -> Optional[str]:
+    """Why the SM90 row's 128 x 128 tile, the dedicated D128 template (#378), cannot run this graph and knob set, or None.
+
+    A tile of 128 on either axis names that template, so the other axis must be 128 or unset; then the adapter's own
+    refusal (config_sm90.d128_decline: exact (128, 128) head dims and nothing in config_sm90.D128_NOT_SERVED, with the
+    knobs' split and packing among the declared features). Two declines are the row's alone: S_q == 1 (decode is
+    outside the scope #378 accepted; the D512 body keeps it, while the direct adapter serves it on D128), and the
+    adapter's pending unpadded bottom-right S_q > S_kv, declined here as native_d64_mismatch declines it for D64 so the
+    row ranks no D128 plan that cannot build."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_FLAVOR, FLAVOR_TILES, d128_decline, declared_features
+
+    tile_m, tile_n = FLAVOR_TILES[D128_FLAVOR]
+    if knobs.tile_m not in (None, tile_m) or knobs.tile_n not in (None, tile_n):
+        return f"SM90's D128 template runs a {tile_m} x {tile_n} tile; requested tile_m={knobs.tile_m}/tile_n={knobs.tile_n}"
+    declared = declared_features(
+        thd=facts.thd,
+        sink=facts.has_sink,
+        window_left=facts.window_left,
+        window_right=(facts.right_bound or 1) if facts.right_band_widening else None,
+        lengths=bool(
+            facts.seq_q_trim
+            or facts.padded
+            or facts.seq_q_t is not None
+            or facts.cu_seq_q_t is not None
+            or facts.seq_kv_t is not None
+            or facts.cu_seq_kv_t is not None
+        ),
+        pack_gqa=knobs.pack_gqa is True,
+        paged=facts.has_paged_kv,
+        split_kv=knobs.split_kv or 1,
+    )
+    why = d128_decline(facts.d_qk, facts.d_v, declared)
+    if why is not None:
+        return why
+    if facts.s_q == 1:
+        return "s_q == 1 (decode) is outside the SM90 D128 template's scope; the 64 x 64 tile serves it"
+    if facts.causal and facts.bottom_right and facts.s_q > facts.s_kv:
+        return "unpadded bottom-right S_q > S_kv is not yet supported on SM90"
+    return None
 
 
 def _mixed_fp8_kv(capabilities: Capabilities, facts: "ga.SdpaGraphFacts") -> bool:
@@ -1752,6 +1793,15 @@ def mismatch(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", knobs: Opti
     if capabilities.sm_lo == 90 and facts.has_paged_kv:
         if facts.thd:
             return "SM90 paged KV currently requires dense Q"
+    if (
+        capabilities.sm_lo == 90
+        and isinstance(knobs, SdpaFwdKnobs)
+        and 128 in (knobs.tile_m, knobs.tile_n)
+        and 128 in effective_tile_ms(capabilities, facts, knobs)
+    ):
+        why = _sm90_d128_tile_mismatch(facts, knobs)
+        if why is not None:
+            return why
     if facts.softmax_precision is not None and facts.softmax_precision not in capabilities.softmax_precisions:
         # The op attribute sdpa(softmax_precision=HALF): numerics-changing, so
         # honored only by a row whose lowering carries that arm — never degraded.
@@ -4537,9 +4587,13 @@ def _sm120_mxfp8_spec() -> EngineSpec:
 
 
 def _sm90_spec() -> EngineSpec:
-    """Native D64/D128/D256/D512 with bounded TMA padding."""
-    from cudnn.sdpa.fwd.config_sm90 import D_ALIGN, D_TILE, TILE_M, TILE_N
+    """Native D64/D128/D256/D512 with bounded TMA padding. At (128, 128) the tile knob also offers 128 x 128, the dedicated
+    D128 template (#378), beside the D512 body's 64 x 64: mismatch() declines that tile for what the template does not
+    serve (_sm90_d128_tile_mismatch, config_sm90.d128_decline), so those graphs keep the D512 body. The D128 tile comes
+    from the config_sm90 constants the adapter reads (rule 8b')."""
+    from cudnn.sdpa.fwd.config_sm90 import D128_FLAVOR, D_ALIGN, D_TILE, FLAVOR_TILES, TILE_M, TILE_N
 
+    d128_tile_m, d128_tile_n = FLAVOR_TILES[D128_FLAVOR]
     return EngineSpec(
         name="sdpa_fwd_prefill_sm90",
         capabilities=Capabilities(
@@ -4574,8 +4628,12 @@ def _sm90_spec() -> EngineSpec:
             skv_tile=0,
             layouts=frozenset({"bshd", "dense_flex"}),
             sched_policies=frozenset({SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2}),
+            # The row-wide tile is the D512 body's 64 x 64. At (128, 128) the 128 x 128 tile names the D128 template
+            # instead; a knob of 128 on either axis is judged by _sm90_d128_tile_mismatch.
             tile_ms=frozenset({TILE_M}),
             tile_ns=frozenset({TILE_N}),
+            tile_ms_by_d_shape=((D128_FLAVOR, frozenset({TILE_M, d128_tile_m})),),
+            tile_ns_by_d_shape=((D128_FLAVOR, frozenset({TILE_N, d128_tile_n})),),
             cgas=frozenset({1}),
             pack_gqas=frozenset({False, True}),
             pack_gqa_partial_d_shapes=frozenset({(128, 128), (256, 256), (D_TILE, D_TILE)}),

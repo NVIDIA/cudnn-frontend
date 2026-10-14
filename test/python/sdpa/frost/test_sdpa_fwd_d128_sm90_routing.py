@@ -3,14 +3,15 @@
 
 """Host-only checks of the SM90 per-flavor plumbing (issue #378): no SM90 device needed.
 
-The SM90 row is to lower two templates for exact (128, 128) graphs, chosen by the tile knob: the
-D512 body (#2426) on its 64 x 64 tile, and a dedicated D128 template on a 128 x 128 tile that
-serves a dense subset. The row's and config_sm90's per-flavor seams are checked here on a
-SYNTHETIC row (the shipped row plus the tile domains #378 will set on it), and on every FROST
-lane: no CI lane runs Hopper. The adapter's seams (its flavor pick, that flavor's tile, the
-template it loads) ask the real device and are pinned in the cc 9.0 suite,
-test_sdpa_fwd_dsl_sm90.py; the D128 kernel's numerics are test_sdpa_fwd_d128_sm90.py's. The
-shipped row does not offer the 128 x 128 tile yet; its behavior is the SM90 suite's to pin.
+The SM90 row lowers two templates for exact (128, 128) graphs, chosen by the tile knob: the D512
+body (#2426) on its 64 x 64 tile, and the dedicated D128 template on a 128 x 128 tile that serves
+a dense subset. The row's, the heuristics' and config_sm90's seams are checked here, on every FROST
+lane: no CI lane runs Hopper. Most tests read the row spelled out field by field
+(``_two_flavor_row``); ``test_the_two_flavor_row_is_the_shipped_row`` pins it equal to the shipped
+row, so each of them is a test of the shipped row, and the tests that name ``_caps()`` read the
+shipped row directly. The adapter's seams (its flavor pick, that flavor's tile, the template it
+loads) ask the real device and are pinned in the cc 9.0 suite, test_sdpa_fwd_dsl_sm90.py; the D128
+kernel's numerics and graph route are test_sdpa_fwd_d128_sm90.py's.
 """
 
 import dataclasses
@@ -33,8 +34,9 @@ def _caps(name=_ROW):
 
 
 def _two_flavor_row(**over):
-    """The shipped SM90 row plus the D128 template's 128 x 128 tile, spelled as #378 will spell it:
-    the (128, 128) d-shape's Q and KV tile domains hold 64 (the D512 body) and 128 (D128)."""
+    """The SM90 row with the D128 template's 128 x 128 tile spelled out, as #378 spells it: the
+    (128, 128) d-shape's Q and KV tile domains hold 64 (the D512 body) and 128 (D128). Equal to the
+    shipped row (test_the_two_flavor_row_is_the_shipped_row); ``over`` varies one field."""
     row = dataclasses.replace(
         _caps(),
         tile_ms_by_d_shape=((_D128, frozenset({64, 128})),),
@@ -55,6 +57,69 @@ def _facts(d=128, **kw):
     return ga.SdpaGraphFacts(**base)
 
 
+def test_the_two_flavor_row_is_the_shipped_row():
+    """The spelled-out row is the shipped one, so every test below that reads ``_two_flavor_row()``
+    tests what ``engines._sm90_spec`` ships. A tile entry spelled in ``_two_flavor_row`` that the row
+    drops or changes fails here first (the tile overrides are tuples: their order counts). Row-wide
+    fields are copied from the shipped row, so this pin cannot see them;
+    test_the_shipped_row_proposes_each_flavors_own_geometry and the cc 9.0 suite's
+    test_sm90_every_candidate_is_valid read them on the shipped row."""
+    assert _two_flavor_row() == _caps()
+
+
+# --- The row against config_sm90 (rule 8b': row and adapter read the same constants) -------
+
+# Each D128_NOT_SERVED key as an exact (128, 128) graph declares it (facts) or a knob set asks for it (knobs).
+_NOT_SERVED_GRAPHS = {
+    "thd": (dict(thd=True, padded=True), {}),
+    "paged": (dict(has_paged_kv=True, page_size=64, padded=True), {}),
+    "split_kv": ({}, dict(split_kv=2)),
+    "sink": (dict(has_sink=True), {}),
+    "window_left": (dict(causal=True, window_left=16), {}),
+    "window_right": (dict(right_band_widening=True, right_bound=4), {}),
+    "lengths": (dict(padded=True), {}),
+    "pack_gqa": (dict(h_kv=2), dict(pack_gqa=True)),
+}
+
+
+def test_the_row_mirrors_config_sm90_feature_by_feature():
+    """Lockstep with the adapter's table: every D128_NOT_SERVED key, declared on an exact (128, 128)
+    graph, is declined on the 128 x 128 tile with config_sm90.d128_decline's label and served on the
+    64 x 64 tile (the D512 body), so the row offers the dedicated template exactly what the adapter
+    compiles on it; a key added to the table without a case here fails. S_q == 1 is a ROW-ONLY
+    decline of the tile: config_sm90 has no decode key, since the D128 kernel runs S_q == 1 on the
+    direct route, but decode is outside the slice #378 accepted."""
+    from cudnn.sdpa.fwd import config_sm90 as c, engines
+
+    row = _caps()
+    assert set(_NOT_SERVED_GRAPHS) == set(c.D128_NOT_SERVED), "a NOT_SERVED key without a case (or the reverse)"
+    for key, (declared, asked) in _NOT_SERVED_GRAPHS.items():
+        facts = _facts(128, **declared)
+        assert engines.mismatch(row, facts, engines.SdpaFwdKnobs(tile_m=64, tile_n=64, **asked)) is None, key
+        reason = engines.mismatch(row, facts, engines.SdpaFwdKnobs(tile_m=128, tile_n=128, **asked))
+        assert reason == f"SM90's 128 x 128 tile (the D128 template) does not serve {c.D128_NOT_SERVED[key]}", (key, reason)
+    assert "decode" not in c.D128_NOT_SERVED
+    decode = _facts(128, s_q=1)
+    assert engines.mismatch(row, decode, engines.SdpaFwdKnobs(tile_m=64, tile_n=64)) is None
+    assert (engines.mismatch(row, decode, engines.SdpaFwdKnobs(tile_m=128, tile_n=128)) or "").startswith("s_q == 1 (decode) is outside")
+    assert engines.effective_tile_ms(row, _facts(128)) == engines.effective_tile_ns(row, _facts(128)) == {c.TILE_M, *c.FLAVOR_TILES[c.D128_FLAVOR]}
+
+
+def test_row_and_picker_offer_the_128_tile_at_the_same_head_dims():
+    """Lockstep: the row admits the 128 x 128 tile on a dense graph exactly where the adapter's picker
+    takes D128 with nothing declared (pick_flavor over the full pool: exact (128, 128), FLAVOR_FLOORS),
+    and every head pair the row admits keeps its 64 x 64 plan. Drift would rank a D128 plan the adapter
+    compiles on the D512 body, or the reverse."""
+    from cudnn.sdpa.fwd import config_sm90 as c, engines
+
+    row, d128, d512 = _caps(), engines.SdpaFwdKnobs(tile_m=128, tile_n=128), engines.SdpaFwdKnobs(tile_m=64, tile_n=64)
+    for d_qk, d_v in itertools.product(range(8, 513, 8), repeat=2):
+        facts = _facts((d_qk, d_v))
+        if engines.mismatch(row, facts) is None:
+            assert engines.mismatch(row, facts, d512) is None, (d_qk, d_v)
+        assert (engines.mismatch(row, facts, d128) is None) == (c.pick_flavor(d_qk, d_v, c.FLAVORS) == c.D128_FLAVOR), (d_qk, d_v)
+
+
 # --- Tile domains per flavor (tile_ms_by_d_shape / tile_ns_by_d_shape) -------
 
 
@@ -65,11 +130,12 @@ def test_effective_tiles_read_the_selected_flavor():
     from cudnn.sdpa.fwd import engines
 
     row, shipped = _two_flavor_row(), _caps()
-    assert shipped.tile_ms_by_d_shape == () and shipped.tile_ns_by_d_shape == ()
+    bare = dataclasses.replace(shipped, tile_ms_by_d_shape=(), tile_ns_by_d_shape=())
     for read in (engines.effective_tile_ms, engines.effective_tile_ns):
         assert read(row, _facts(128)) == read(row, _facts((120, 72))) == frozenset({64, 128})
         assert read(row, _facts(512)) == read(row, _facts((264, 504))) == read(row, _facts(256)) == read(row, _facts(64)) == frozenset({64})
-        assert read(shipped, _facts(512)) == read(shipped, _facts(128)) == frozenset({64})
+        assert read(shipped, _facts(128)) == frozenset({64, 128}), "the shipped row offers 128 at (128, 128)"
+        assert read(bare, _facts(512)) == read(bare, _facts(128)) == frozenset({64}), "() reads the row-wide domain"
 
 
 @pytest.mark.parametrize(
@@ -77,29 +143,63 @@ def test_effective_tiles_read_the_selected_flavor():
     [
         (128, (128, 128), None),
         (128, (64, 64), None),
+        (128, (128, 64), "SM90's D128 template runs a 128 x 128 tile; requested tile_m=128/tile_n=64"),
+        ((120, 72), (128, 128), "SM90's 128 x 128 tile (the D128 template) serves exact (128, 128) head dims; graph has D_QK=120/D_V=72"),
         (512, (64, 64), None),
         (512, (128, 128), "requested tile_m=128 is outside this engine's domain [64]"),
         (256, (128, 128), "requested tile_m=128 is outside this engine's domain [64]"),
         ((264, 504), (128, 128), "requested tile_m=128 is outside this engine's domain [64]"),
     ],
-    ids=["d128-128", "d128-64", "d512-own", "d512-pins-128", "d256-pins-128", "envelope-pins-128"],
+    ids=["d128-128", "d128-64", "d128-mixed", "d120x72-128", "d512-own", "d512-pins-128", "d256-pins-128", "envelope-pins-128"],
 )
 def test_tile_knobs_are_judged_per_flavor(d, tile, why):
     """mismatch() judges a pinned tile against the SELECTED d-shape's domain: (128, 128) admits both
     tiles (each names its template), every other d-shape only the D512 body's 64, so no plan is
-    ranked at a tile its kernel would refuse at build."""
+    ranked at a tile its kernel would refuse at build. Inside (128, 128) the 128 tile names the D128
+    template: both axes must ask for it, and only exact (128, 128) head dims ride it."""
     from cudnn.sdpa.fwd import engines
 
     reason = engines.mismatch(_two_flavor_row(), _facts(d), engines.SdpaFwdKnobs(tile_m=tile[0], tile_n=tile[1]))
     assert reason == why, reason
 
 
+@pytest.mark.parametrize(
+    ("d", "s_q", "s_kv", "declared", "why"),
+    [
+        pytest.param(128, 512, 256, {}, "unpadded bottom-right S_q > S_kv is not yet supported on SM90", id="d128"),
+        pytest.param(128, 256, 512, {}, None, id="d128-s_q-below-s_kv"),
+        pytest.param(128, 512, 512, {}, None, id="d128-square"),
+        pytest.param(128, 512, 256, dict(padded=True), "SM90's 128 x 128 tile (the D128 template) does not serve per-batch lengths", id="d128-padded"),
+        pytest.param(512, 512, 256, {}, None, id="d512"),
+        pytest.param((264, 504), 512, 256, {}, None, id="envelope"),
+    ],
+)
+def test_unpadded_bottom_right_above_s_kv_is_declined_at_d128(d, s_q, s_kv, declared, why):
+    """The SM90 adapter declines unpadded bottom-right causal with S_q > S_kv at build on every flavor (its pending case;
+    the cc 9.0 suite pins that side). On the 128 x 128 tile the shipped row declines it too, with the adapter's message, so
+    no D128 plan is ranked that cannot build; a padded graph meets the lengths decline first. The 64 x 64 tile, at D512,
+    its envelope and (128, 128) alike, still ranks it and leaves the decline to the adapter, and on the 128 x 128 tile
+    bottom-right with S_q <= S_kv and top-left causal at S_q > S_kv are served."""
+    from cudnn.sdpa.fwd import engines
+
+    knobs = engines.SdpaFwdKnobs(tile_m=128, tile_n=128) if d == 128 else None
+    reason = engines.mismatch(_caps(), _facts(d, s_q=s_q, s_kv=s_kv, causal=True, bottom_right=True, **declared), knobs)
+    assert reason is None if why is None else reason is not None and reason.startswith(why), reason
+    top_left = engines.mismatch(_caps(), _facts(d, s_q=s_q, s_kv=s_kv, causal=True, **declared), knobs)
+    assert top_left is None if not declared else top_left == reason, top_left
+    if d == 128:
+        small = engines.SdpaFwdKnobs(tile_m=64, tile_n=64)
+        assert engines.mismatch(_caps(), _facts(d, s_q=s_q, s_kv=s_kv, causal=True, bottom_right=True, **declared), small) is None
+
+
 def test_every_flavor_spelled_out_equals_the_defaults_on_every_shipped_row(monkeypatch):
-    """() means "the row-wide domain at every d-shape". Spelling that out (each tile override
-    restating the row-wide domain for every d-shape the row has no entry for; the SM100 and SM107
-    rows' own tile_ns_by_d_shape entries stay) changes no verdict and no message on any shipped half
-    row: a reader that matched raw dims instead of the selected d-shape would decline the envelope
-    graphs below, and one that skipped the override would differ at a pinned tile."""
+    """() means "the row-wide domain at every d-shape". Spelling that out (a tile override
+    restating the row-wide domain for each d-shape that has none) changes no verdict and no message
+    on any shipped half row: a reader that matched raw dims instead of the selected d-shape would
+    decline the envelope graphs below, and one that skipped the override would differ at a pinned
+    tile. Entries a row sets (the SM90 row's, and the SM100 and SM107 rows' tile_ns_by_d_shape) keep
+    their values, so each row is checked on its default-valued entries alone and the bound still
+    counts five rows."""
     from cudnn.frost import buffers
     from cudnn.sdpa.fwd import engines
 
@@ -146,6 +246,35 @@ def test_every_flavor_spelled_out_equals_the_defaults_on_every_shipped_row(monke
             assert verdict(spelled, facts, knobs) == verdict(caps, facts, knobs), (spec.name, decl, d, knobs)
             checked += 1
     assert checked >= 5 * len(declared) * len(dims) * len(knob_sets), checked
+
+
+# --- Proposals (heuristics) -------
+
+
+@pytest.mark.parametrize("kind", ["A", "FALLBACK"])
+def test_the_shipped_row_proposes_each_flavors_own_geometry(kind):
+    """recommend() through the real ENGINE_SPECS, no stand-in row: the every-lane copy of the cc 9.0
+    suite's test_sm90_every_candidate_is_valid. Every set is admissible, deduplicated, bounded and
+    carries a tile its template runs; on an exact (128, 128) graph the D128 template serves, its
+    128 x 128 sets lead (unsplit and unpacked) and the D512 body's 64 x 64 sets follow; the fallback
+    is the 64 x 64 plan everywhere. Validity and the tile order only: no winner or set count."""
+    from cudnn.frost.tile_dsl.constants import SCHED_LPT, SCHED_LPT_L2, SCHED_NATURAL
+    from cudnn.sdpa.fwd import engines, heuristics
+
+    row = _caps()
+    for d, tiles in ((128, {(128, 128), (64, 64)}), (512, {(64, 64)}), ((264, 504), {(64, 64)})):
+        facts = _facts(d, h_kv=2, s_q=1024, s_kv=8192, causal=True)
+        offered = heuristics.recommend(kind, facts, {_ROW: 20517})
+        assert offered and len({p.knobs for p in offered}) == len(offered) <= heuristics._MAX_SETS_PER_ENGINE, (d, offered)
+        assert {p.engine_id for p in offered} == {20517}, offered
+        lead = (offered[0].knobs.tile_m, offered[0].knobs.tile_n)
+        assert lead == ((128, 128) if kind == "A" and (128, 128) in tiles else (64, 64)), (d, kind, lead)
+        for knobs in (p.knobs for p in offered):
+            assert engines.mismatch(row, facts, knobs) is None, (d, knobs)
+            assert (knobs.tile_m, knobs.tile_n) in tiles and knobs.cga == 1, (d, knobs)
+            if (knobs.tile_m, knobs.tile_n) == (128, 128):
+                assert knobs.split_kv == 1 and knobs.pack_gqa is False, (d, knobs)
+            assert knobs.sched_policy in {SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2} and knobs.pack_gqa in {False, True}, (d, knobs)
 
 
 # --- config_sm90: flavors, tiles and the template backstop -------
