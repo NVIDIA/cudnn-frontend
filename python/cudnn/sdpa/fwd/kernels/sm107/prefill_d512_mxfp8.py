@@ -1259,6 +1259,9 @@ _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 # This kernel uses common CLC for both dense and THD work.
 from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader as read_tile_id_arrive
 
+# The causal-window specialization uses the leader-only lane branch.
+PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != (MASK_CAUSAL | MASK_SWA)
+
 
 @cute.jit
 def _sg0_softmax_kv_iter(
@@ -1637,7 +1640,7 @@ def _compute_warp_group(
     # correction (apply alpha) + BMM2 N-block gating + epilogue.  Port of C++
     # prefill_sdpa_d512_mxfp8.cu lines 432-1024.
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
         if is_sg0:
             # ============================================================
@@ -2397,7 +2400,7 @@ def _mma_warp_group(
     V_NBLOCK_ADVANCE_ELEMS = BMM2_V_NBLOCK_ADVANCE // CFG.BPE
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         elect_p = nvvm.elect_sync()  # K3: once per work item (the warp stays converged through the kv loops)
 
         if is_sg0:
@@ -2643,7 +2646,7 @@ def _mma_warp_non_leader(
         nlmma_state = PipelineState.start(phase=0)
 
         while is_valid_tile > cutlass.Int32(0):
-            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
             elect_p = nvvm.elect_sync()  # K3: once per work item (the warp stays converged through the kv loop)
 
             if cutlass.const_expr(CFG.MASK_FLAGS != 0) and (kv_right <= kv_left):
@@ -2818,7 +2821,7 @@ def _tmaldg_warp_group(
     n_kh = n_qh // qh_per_kh
 
     while is_valid_tile > cutlass.Int32(0):
-        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+        read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
         lead_elect = is_leader & nvvm.elect_sync()  # K3: once per work item (tma_load_tile keeps its own internal elect)
 
         # n_kv > 0 gate at MASK_NONE collapses to "always" since kv_right > 0.
@@ -3013,7 +3016,7 @@ def _tmastg_warp_group(
     while is_valid_tile > cutlass.Int32(0):
         # Only sg1 consumes scheduler responses and returns their read credit.
         if is_sg1:
-            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
+            read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE, predicated=PREDICATED_CREDIT_ARRIVE)
 
             # Both sg1 peers issue the O TMA store with their own q_row_coord —
             # cga2 splits C along M, so leader writes rows [0:128] and peer

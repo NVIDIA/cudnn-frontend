@@ -264,6 +264,14 @@ def test_scheduler_and_credit_target_select_the_same_layouts():
         if not (aliases or clc):
             continue
         parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        if not aliases:
+            # A literal single-CTA caller has no peers: both helpers elect
+            # one local arrival. It may also use the persistent THD scheduler.
+            credits = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "read_tile_id_arrive"]
+            assert credits and all(len(n.args) >= 2 and isinstance(n.args[1], ast.Constant) and n.args[1].value == 1 for n in credits), str(path)
+            assert all(len(n.args) >= 4 and isinstance(n.args[3], ast.Constant) and n.args[3].value == 1 for n in clc), str(path)
+            scanned.append(path)
+            continue
         assert len(aliases) == len(clc) == 1, str(path)
         assert layouts(aliases[0], parents) == layouts(clc[0], parents), f"{path}: scheduler/credit layout mismatch"
         # The default import must still supply broadcasts on the other arm.

@@ -294,7 +294,8 @@ Peer credit barriers then receive zero arrives and have no waiters. Credit
 helpers require converged warps; retain their per-specialization lowering
 choice when changing the target. Check scheduler and credit-helper selection
 together at each caller; THD does not imply persistent scheduling in every
-kernel family.
+kernel family. Detector:
+`test_sdpa_fwd_o_empty_backedge.py::test_scheduler_and_credit_target_select_the_same_layouts`.
 
 Match barrier completion cadence to the consumer's loop. SM100 D512 MXFP8
 SWA=128 drains two Dv slices per tile, so a once-per-tile softmax wait must use

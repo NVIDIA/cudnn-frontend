@@ -2731,43 +2731,21 @@ def test_sm103_d128_mxfp8_exp2_split_is_folded_out_sass_pins(tmp_path):
     assert_no_new_spills(stats, _SM103_D128_MXFP8_SASS_PINS)
 
 
-# ============================================================================ sm100 MXFP8: the scheduler credit arrive's lowering is a PER-SPECIALIZATION constant (PREDICATED_CREDIT_ARRIVE = CFG.MASK_FLAGS != 0)
-# PR #1169 turned `tile_dsl.scheduler.read_tile_id_arrive` into ONE predicated arrive per warp.  On B200 that re-lowering is a
-# kernel-wide ptxas reschedule whose sign is per kernel AND per mask specialization (A/B/A x3, CUPTI medians, O / Stats / Amax_O
-# bit-identical): +3.1 % on per-tensor fp8 d128, +1.3 % on bf16 d192x128, neutral on bf16 d128 and fp8 d192x128; on the two MXFP8
-# prefill kernels the BRANCH form wins the UNMASKED specialization (stacked on this branch's exp2 split: d128 +8.14 % at B=1
-# H=24/8 S=16K dense, d192x128 +6.84 % at H=128 S=8K dense) and LOSES the d128 kernel's causal one (-5.13 % at the same shape,
-# top_left, under the LPT plan the heuristics propose; -0.84 % with NATURAL pinned).  So those two spell
-# `PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0` once -- the same compile-time bits that select the dense vs the masked
-# softmax arms -- and pass it at EVERY `read_tile_id_arrive` site: the branch form on the dense specialization (its sm_100a cubin
-# is the pre-#1169 one), develop's predicated form wherever a mask arm (causal / SWA / padded) is compiled in (that cubin is
-# develop's).  No other sm100 kernel passes the kwarg.  Three tripwires: the source scan (this exact expression, defined once,
-# every site passes it, no literal, no leak into a sibling); the module VALUE under a dense, a causal and a padded
-# TemplateParams; and the sm_100a SASS of BOTH d128 specializations -- the branch form costs one BSSY reconverge and `cga_size`
-# (= 2) per-lane SYNCS.ARRIVE per site against the predicated form's 0 and 1, so the 7 sites read BSSY 15 on the dense cubin
-# (8 with the predicated form) and BSSY 8 on the causal one (15 with the branch form), MEASURED 2026-09-22 on the
-# trace-compiled cubins: one site taking the other form moves both counts by one.  SYNCS.ARRIVE is a WHOLE-KERNEL total, so
-# the pipeline's own arrives sit under it: the streamed O store and the phantom-step handshakes (gap-2pct branch) moved it from
-# 55 / 56 to 62 / 75 (dense / causal, re-pinned 2026-10-12) with BSSY unchanged -- the branch-vs-predicated check lives in BSSY
-# plus the 7-per-form SYNCS.ARRIVE delta, not in the absolute count.  Exact pins, like the sm107 wait-form pins: deterministic
-# for a given DSL + ptxas, re-pinned deliberately on a toolchain or protocol move.
-# PR #1547 routes common CLC credits only to CTA 0. With one branch target,
-# ptxas if-converts the dense lane-compare arm: measured BSSY 8 / SYNCS.ARRIVE
-# 55 with DSL 4.7.0 + CUDA 13.5, rather than the broadcast form's 15 / 62.
-# The per-specialization choice is still consumed (the lane/primitive test in
-# test_sdpa_fwd_o_empty_backedge.py checks it); these counts describe codegen,
-# not a claim that the previous B200 tuning benefit survives the protocol change.
+# Credit lowering is a per-specialization compile-time choice. The leader-only
+# protocol changes the dense codegen tradeoff from the historical broadcast
+# measurements. Check that each site consumes its module's choice, separately
+# from the whole-kernel SASS checks below. Do not pin a performance winner in
+# this source contract: the choice may be retuned without changing semantics.
 _CREDIT_ARRIVE_SITES = {
     (128, 128): 6,
     (192, 128): 7,
 }  # read_tile_id_arrive call sites per sm100 MXFP8 kernel: 5 warp roles + the softmax (d128: one site at the loop top for every mask arm; d192x128: one per mask arm)
 _SM100_MXFP8_OPTED_OUT = ("prefill_d128_mxfp8.py", "prefill_d192_d128_mxfp8.py")  # the ONLY sm100 kernels that pass predicated=
-_PREDICATED_CREDIT_ARRIVE_DEF = "PREDICATED_CREDIT_ARRIVE: bool = CFG.MASK_FLAGS != 0"  # the one spelling both kernels carry: derived, never a literal
-# The module value each mask specialization must resolve to, keyed by the TemplateParams fields that select it.
-_CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": ({}, False), "causal": ({"window_right": 0}, True), "padded": ({"seq_kv_lens_present": True}, True)}
+# Representative graph masks for exercising the module constant and bindings.
+_CREDIT_ARRIVE_SPECIALIZATIONS = {"dense": {}, "causal": {"window_right": 0}, "padded": {"seq_kv_lens_present": True}}
 # d128 sm_100a pins per specialization: (TemplateParams fields on top of _CC100_D128_MXFP8_PARAMS, the exact opcode counts).
 _SM100_D128_MXFP8_CREDIT_ARRIVE_SASS_PINS = {
-    "dense": ({}, {"BSSY": 8, "SYNCS_ARRIVE": 55}),  # the leader-only branch is if-converted by ptxas
+    "dense": ({}, {"BSSY": 8, "SYNCS_ARRIVE": 55}),  # one predicated arrival per credit site
     "causal": ({"window_right": 0}, {"BSSY": 8, "SYNCS_ARRIVE": 75}),  # the predicated form; other pipeline arrivals are unchanged
 }
 
@@ -2801,13 +2779,11 @@ def _sm100_kernel_dir():
 @pytest.mark.L0
 @pytest.mark.parametrize("flavor", sorted(_CREDIT_ARRIVE_SITES), ids=lambda f: f"d{f[0]}" if f[0] == f[1] else f"d{f[0]}x{f[1]}")
 def test_sm100_mxfp8_credit_arrive_takes_the_module_constant(flavor):
-    """The kernel's ``PREDICATED_CREDIT_ARRIVE`` is the mask-derived expression ``CFG.MASK_FLAGS != 0`` (the module's own value,
-    checked under a dense, a causal and a padded TemplateParams: False on the unmasked specialization, True wherever a mask arm
-    is compiled in), defined exactly once and never as a literal, no call site carries a ``predicated=True`` / ``False``
-    literal, and EVERY ``read_tile_id_arrive`` site -- the pinned count -- passes ``predicated=PREDICATED_CREDIT_ARRIVE``.  One
-    site dropping the kwarg silently discards a per-specialization tuning choice. The historical broadcast measurements
-    motivated that choice; leader-only codegen and performance need separate qualification. Check the actual imported
-    helper as well as the constant and call sites; the helper's lane/primitive test covers consumption of the argument."""
+    """Each credit site consumes the module's compile-time lowering choice.
+
+    Inspect the actual imported helper as well as the constant and call sites;
+    the helper's lane/primitive test separately checks argument consumption.
+    """
     from cudnn.frost.tile_dsl.constants import MASK_NONE
     from cudnn.frost.tile_dsl.scheduler import read_tile_id_arrive_on_leader
     from cudnn.sdpa.fwd.api_dsl import _load_sm100_kernel_module, supported_cgas_for
@@ -2815,23 +2791,19 @@ def test_sm100_mxfp8_credit_arrive_takes_the_module_constant(flavor):
 
     cta_mma = max(supported_cgas_for(flavor, fp8=True, device_cc=(10, 0), pertensor=False))
     mods = {}
-    for name, (extra, want) in _CREDIT_ARRIVE_SPECIALIZATIONS.items():
+    for name, extra in _CREDIT_ARRIVE_SPECIALIZATIONS.items():
         mod = _load_sm100_kernel_module(flavor, TemplateParams(dtype_qkv=0, dtype_o=2, cta_mma=cta_mma, **extra), fp8=True, pertensor=False, rubin=False)
         assert (mod.CFG.MASK_FLAGS == MASK_NONE) == (
             name == "dense"
         ), f"{mod.__name__} [{name}]: MASK_FLAGS={mod.CFG.MASK_FLAGS}, the probe params select the wrong specialization"
-        assert (
-            isinstance(mod.PREDICATED_CREDIT_ARRIVE, bool) and mod.PREDICATED_CREDIT_ARRIVE is want
-        ), f"{mod.__name__} [{name}, MASK_FLAGS={mod.CFG.MASK_FLAGS}]: PREDICATED_CREDIT_ARRIVE={mod.PREDICATED_CREDIT_ARRIVE!r}, want {want}"
+        assert isinstance(mod.PREDICATED_CREDIT_ARRIVE, bool), f"{mod.__name__} [{name}]: credit lowering must be a compile-time bool"
         assert mod.read_tile_id_arrive is read_tile_id_arrive_on_leader, "dense CLC must use the leader credit helper"
         mods[name] = mod
     assert len({m.__file__ for m in mods.values()}) == 1, "the three specializations must come from one kernel file"
     with open(mods["dense"].__file__, encoding="utf-8") as fh:
         code = _code_lines(fh.read())
     defs = re.findall(r"^PREDICATED_CREDIT_ARRIVE\b.*$", code, re.M)
-    assert defs == [
-        _PREDICATED_CREDIT_ARRIVE_DEF
-    ], f"{mods['dense'].__name__}: PREDICATED_CREDIT_ARRIVE must be defined exactly once as `{_PREDICATED_CREDIT_ARRIVE_DEF}`, found {defs}"
+    assert len(defs) == 1, f"{mods['dense'].__name__}: credit lowering must be defined once, found {defs}"
     assert not re.search(
         r"predicated=(?:True|False)\b", code
     ), f"{mods['dense'].__name__}: a predicated= literal at a call site bypasses PREDICATED_CREDIT_ARRIVE"
@@ -2869,7 +2841,7 @@ def test_sm100_only_the_mxfp8_kernels_opt_out_of_the_predicated_credit_arrive():
 def test_sm100_d128_mxfp8_credit_arrive_sass_pins(tmp_path, specialization):
     """Pin the leader-only credit protocol's measured instruction counts.
 
-    The one-target dense branch is if-converted by ptxas. The source/primitive
+    Each credit site emits one leader arrival. The source/primitive
     tests separately check that each specialization's lowering choice is used;
     this cubin check also retains the independent exp2 split invariant.
     """
