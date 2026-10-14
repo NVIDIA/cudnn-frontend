@@ -3227,6 +3227,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         """
         if self._fp8 or self.flavor != (64, 64) or self._device_cc == (10, 7):
             return False
+        if self.bias_desc is not None or self.kv_mask_desc is not None:
+            # The decode tile carries no additive-bias / kv_mask arm (compile() refuses the operands): a d64 plan with either
+            # stays on the prefill tile at its width -- the kv_mask alone at cga1 (nothing staged in SMEM), the bias at the
+            # width whose resident block holds S_kv (cga2 on this line).  Found by the cc 10.0 tier: a kv_mask-only d64 graph
+            # at S_q 128 lowered onto the decode tile and failed at build instead of running the prefill tile.
+            return False
         if self.cga not in (None, 1):
             # An explicit cga2 is the prefill pipeline (the f16 row admits both
             # widths at d64): the decode tile is cga1-only (make_cfg_d64_decode),
