@@ -21,8 +21,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import torch
-
 # (compute_capability) → cute DSL --gpu-arch flag value.
 # H100, B200/B300, and sm_100f require architecture-specific variants because
 # the kernels use TMA / tcgen05 instructions that are only guaranteed to lower
@@ -44,6 +42,8 @@ def gpu_arch_flag() -> str:
     Cached because torch.cuda.get_device_capability() is cheap but the
     function gets called inside every cute.compile site.
     """
+    import torch  # lazy: the JAX bindings import the kernel modules without torch installed
+
     if not torch.cuda.is_available():
         raise RuntimeError("cute.compile requires CUDA; no GPU available")
     cap = torch.cuda.get_device_capability()
