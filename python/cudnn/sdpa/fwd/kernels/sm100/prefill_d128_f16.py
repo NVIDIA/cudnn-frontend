@@ -518,7 +518,7 @@ LAYOUT = KernelTmemLayout()
 #   barrier row and no SMEM buffer (4 byte loads + 4 ballots per 128-column tile per warp; the additive vector is a warp-uniform GMEM
 #   granule load); BIAS_MAX_FORM is a pure instruction-stream axis.
 # SMEM BUFFER ROW (frost-kernels s 5): sBias = BIAS_RESIDENT_TILES x BIAS_BLOCK_ROWS x TILE_N of the io dtype, declared LAST (after sV:
-# the descriptor-fed operands first, the lane-read block last), written by TMA under the 128-byte swizzle atom (job D) and read by the
+# the descriptor-fed operands first, the block the softmax threads read directly last), written by TMA under the 128-byte swizzle atom (job D) and read by the
 # softmax lanes one 128-byte row slice per 64-column box each (job L: a per-lane stride of 128 B is the bank cycle -- the 16-byte
 # chunk index XOR (row % 8) of cutlass.Swizzle(3, 4, 3) spreads eight rows over eight bank groups, 4 wavefronts per warp-wide load).
 # The SM100 budget (227 KiB usable, the derived carveout of config_d128_family.bias_resident_tiles at SM100_ARCH) sizes the block:
@@ -2247,7 +2247,7 @@ def _softmax_kv_body_inf(
        plain body's manual tree on cc 10.0 (no LDTM.STAT there), the bias row max in the packed 16-bit domain ahead of the wait; the
        software tree over the masked scores folds out.  Any m >= the true max is valid; the slack is the row's raw range in the tile.
 
-    ``kv_tile_rel`` = ``kv_loop - bounds.left``, the tile's index inside the resident block; ``block_row`` = the lane's row inside the
+    ``kv_tile_rel`` = ``kv_loop - bounds.left``, the tile's index inside the resident block; ``block_row`` = the calling thread's row inside the
     256-row block (``sub_tile_id * TILE_M + tid_in_wg``).  Returns (total_max, total_max_safe, total_sum, bmm1_phase, stat_empty_phase).
     """
     tmem_S_off = LAYOUT.S0_OFF if sub_tile_id == 0 else LAYOUT.S1_OFF

@@ -48,7 +48,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_scalar_kv_tail_split,
     supports_paged_split_sink,
 )
-from cudnn.sdpa.fwd.config_sm100 import SM100_DENSE_ONLY_D_SHAPES, SM100_SMALL_D_CGAS
+from cudnn.sdpa.fwd.config_sm100 import SM100_BIAS_D_SHAPES, SM100_DENSE_ONLY_D_SHAPES, SM100_SMALL_D_CGAS, sm100_bias_resident_s_kv_max
 from cudnn.sdpa.fwd import config_sm107 as _config_sm107
 from cudnn.sdpa.fwd.config_sm107 import (
     KV_MASK_ADDITIVE_GRANULE_ELEMS,
@@ -1071,6 +1071,13 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
             elem = ga._ELEM_BYTES.get(facts.kv_mask_dtype, 2)
             if len(facts.kv_mask_stride) == 4 and len(facts.kv_mask_dim) == 4 and facts.kv_mask_dim[0] > 1 and (facts.kv_mask_stride[0] * elem) % 16:
                 return f"an additive kv_mask vector's batch stride must be a 16-byte multiple; got strides {facts.kv_mask_stride}"
+            if facts.has_bias and facts.kv_mask_dtype == cudnn.data_type.FLOAT and capabilities.sm_lo == 100:
+                # The SM100 line renders the 128-wide KV tile only so far, and the fp32 vector WITH a bias spills on it there too (STL / LDL
+                # 53 / 64 on the sm_100a rendering): a typed decline until the 64-wide tile lands on the SM100 file (never a degraded plan).
+                return (
+                    f"an fp32 additive kv_mask together with a bias is served at the 64-wide KV tile only, which is not on the SM100 file yet (the 128-wide "
+                    f"rendering spills on the softmax role): bind the mask in the Q/K/V dtype ({facts.dtype}) or as a boolean"
+                )
             if facts.has_bias and facts.kv_mask_dtype == cudnn.data_type.FLOAT:
                 # The fp32 vector WITH a bias is served at TILE_N 64 only (config_sm107.SM107_FP32_VECTOR_WITH_BIAS_TILE_N: the 128-wide
                 # rendering spills on the softmax role -- the measured counts sit on the constant).  The heuristics propose 64 for this
@@ -1084,6 +1091,28 @@ def _bias_arm_decline(capabilities: Capabilities, facts: "ga.SdpaGraphFacts", kn
                         f"the TILE_N knob) or as a vector in the Q/K/V dtype ({facts.dtype}; cast the fp32 mask on the host): the 128-wide rendering "
                         f"spills on the softmax role; got TILE_N {_tile_n}"
                     )
+    if capabilities.sm_lo == 100:
+        # The SM100 line (cc 10.0 / 10.3): the RESIDENT block of the one-batch-entry item at TILE_N 128 -- the first body seam of the
+        # port; the streamed ring, the (n, n+1) pair item and the 64-wide KV tile are not on the SM100 file yet, so a graph the resident
+        # block does not hold at ANY width of the flavor's domain is a typed decline here (the adapter's check_support is the twin, rule
+        # 8b), through config_sm100.sm100_bias_resident_s_kv_max -- the budget arithmetic the heuristics' width pick reads too (rule 8b').
+        if knobs is not None and knobs.tile_n not in (None, 128):
+            return f"the {what} is served at TILE_N 128 on this arch line (the 64-wide KV tile is not on the SM100 file yet); got TILE_N {knobs.tile_n}"
+        if not facts.has_bias:
+            # The kv_mask ALONE stages nothing in SMEM: no block, no S_kv budget (the same statement as the Rubin branch below).
+            return None
+        if knobs is not None and knobs.cga is not None:
+            widths = (knobs.cga,)
+        else:
+            widths = tuple(sorted(effective_cgas(capabilities, facts, knobs.split_kv if knobs is not None else None))) or (1,)
+        s_kv_max = {cga: sm100_bias_resident_s_kv_max(selected[0], cga) for cga in widths}
+        if not any(facts.s_kv <= m for m in s_kv_max.values()):
+            held = ", ".join(f"cga {cga}: S_kv <= {m}" for cga, m in s_kv_max.items())
+            return (
+                f"no resident bias block holds S_kv {facts.s_kv} at head-dim tile {selected[0]} on this arch line ({held}); "
+                f"the streamed bias ring is not on the SM100 file yet"
+            )
+        return None
     if capabilities.sm_lo != 107 or not facts.has_bias:
         # The kv_mask ALONE stages nothing in SMEM (4 byte loads + 4 warp ballots per kv tile, folded into the bit-word mask):
         # no resident block, hence no S_kv budget -- any S_kv is served and the flavor's own width rule applies (validated on
@@ -1902,6 +1931,15 @@ def _sm100_spec() -> EngineSpec:
             # domain) is routed past it to the native d64 flavor -- see the field's doc.  ONE constant
             # with the adapter's pool (config_sm100, rule 8b').
             dense_only_d_shapes=SM100_DENSE_ONLY_D_SHAPES,
+            # The additive bias / per-key kv_mask arms of the small tiles on this arch line (the port's first body seam): the RESIDENT
+            # block of the 32-wide tile at cga1 (S_kv <= 256) and of the 64-wide tile at cga2 (S_kv <= 128), the kv_mask in every form at
+            # any S_kv, TILE_N 128, the one-batch-entry item.  The streamed ring, the pair item and the 64-wide KV tile are typed declines
+            # until they land (_bias_arm_decline's SM100 branch; config_sm100.SM100_BIAS_D_SHAPES / sm100_bias_resident_s_kv_max, rule 8b').
+            bias=True,
+            bias_d_shapes=SM100_BIAS_D_SHAPES,
+            bias_io_dtype_only=True,
+            kv_mask=True,
+            kv_mask_dtypes=frozenset({cudnn.data_type.BOOLEAN, cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT}),
             # Every f16 flavor kernel wires SplitHelpers, and the adapter carves
             # the partial slabs + launches sm100/split_combine when split_kv > 1
             # (dense f16 only; see mismatch's facts x knobs gate). d64 included:

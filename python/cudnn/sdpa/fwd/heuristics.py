@@ -73,6 +73,7 @@ from cudnn.sdpa.fwd.config_sm100 import (
     supports_paged_prefill_cga1,
 )
 from cudnn.sdpa.fwd.config_sm107 import SM107_FP32_VECTOR_WITH_BIAS_TILE_N, sm107_bias_auto_cga, sm107_pair_item_active, sm107_tile_n_pick
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga
 from cudnn.sdpa.fwd.config_sm120 import D512_FLAVOR, FP8_HEAD_TILE_GRANULE, HEAD_TILE_GRANULE, SMEM_CAPACITY_BYTES, pick_flavor, smem_bytes, tile_domain
 from cudnn.sdpa.fwd.engines import (
     ENGINE_SPECS,
@@ -1151,6 +1152,14 @@ def _auto_sched_cga(spec: EngineSpec, facts, *, split_kv: int, sched_policy: int
             _bias_b, facts.b, facts.h_q, facts.s_q, facts.device_sm_count or 0, 1, s_kv=facts.s_kv, d_flavor=selected_shape[0], tile_n=_tile_n
         )
         bias_cga = sm107_bias_auto_cga(selected_shape[0], facts.s_kv, domain, pair=_pair) if selected_shape in bias_shapes else None
+        if bias_cga is not None:
+            return sched_policy, bias_cga
+    if caps.sm_lo == 100 and selected_shape is not None and facts.has_bias and caps.bias_d_shapes is not None and selected_shape in caps.bias_d_shapes:
+        # The SM100 twin of the rule above at the SM100 budget (config_sm100.sm100_bias_auto_cga -- the arithmetic the row's
+        # _bias_arm_decline and the adapter's _resident_arm_cga read, rule 8b'): the NARROWEST width whose resident block holds S_kv --
+        # a D 64 bias graph lands on cga2 (its cga1 holds no block at 227 KiB), the 32-wide tile on its cga1.  No width holding it
+        # falls through: mismatch() declined every plan of such a graph already (the ring is not on the SM100 file yet).
+        bias_cga = sm100_bias_auto_cga(selected_shape[0], facts.s_kv, domain)
         if bias_cga is not None:
             return sched_policy, bias_cga
     if selected_shape == (64, 64) and domain == frozenset({1, 2}) and not (facts.is_fp8 or facts.is_mxfp8):

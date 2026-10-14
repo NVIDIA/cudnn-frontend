@@ -56,6 +56,14 @@ from cudnn.sdpa.fwd.config_sm107 import SM107_MXFP8_THD_SHAPES as _SM107_MXFP8_T
 from cudnn.sdpa.fwd.config_sm107 import SM107_EPILOGUE_GATE_SHAPES as _SM107_EPILOGUE_GATE_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_SCORE_STATS_SHAPES as _SM107_SCORE_STATS_SHAPES
 from cudnn.sdpa.fwd.config_sm107 import SM107_BIAS_D_SHAPES as _SM107_BIAS_D_SHAPES
+from cudnn.sdpa.fwd.config_sm100 import SM100_BIAS_D_SHAPES as _SM100_BIAS_D_SHAPES
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_auto_cga as _sm100_bias_auto_cga
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_mode_pick as _sm100_bias_mode_pick
+from cudnn.sdpa.fwd.config_sm100 import sm100_bias_resident_s_kv_max as _sm100_bias_resident_s_kv_max
+
+# The SM100 line's device capabilities that serve the small tiles' bias / kv_mask arms (the sm100 row's sm 100..106 band: cc 10.0 and
+# 10.3); cc 10.7 is the Rubin row's.
+_SM100_BIAS_CCS = ((10, 0), (10, 3))
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_resident_s_kv_max as _sm107_bias_resident_s_kv_max
 from cudnn.sdpa.fwd.config_sm107 import sm107_bias_auto_cga as _sm107_bias_auto_cga
 from cudnn.sdpa.fwd.config_sm107 import SM107_TILE_NS_BY_D_SHAPE as _SM107_TILE_NS_BY_D_SHAPE
@@ -1631,6 +1639,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         flattened rows (``config_sm107.sm107_bias_pair_form``, the engine row's and the heuristics' predicate)."""
         if self.bias_desc is None or self.n_chunk == 0:  # an explicit n_chunk=0 keeps the one-batch-entry item (and ITS budget)
             return False
+        if self._device_cc != (10, 7):
+            # The (n, n+1) pair item is not on the SM100 file yet: every bias plan there runs the one-batch-entry item (an explicit
+            # n_chunk >= 1 is declined typed in check_support, never degraded).
+            return False
         b, h_qo, s_qo, _ = (int(x) for x in self.q_desc.shape)
         # the form predicate AND a chunk length >= 1 (the request, else the rule / the sweep seam): the budget of the item that RUNS
         return _sm107_pair_item_active(
@@ -1702,6 +1714,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         The pair item's 128-row block is evaluated at cga1 when the plan qualifies for it (``_resident_arm_pair_eligible``)."""
         if self.cga is not None:
             return int(self.cga)
+        if self._device_cc != (10, 7):
+            # The SM100 line: the narrowest width whose RESIDENT block holds S_kv at the SM100 budget (config_sm100.sm100_bias_auto_cga, the
+            # heuristics' and the row's arithmetic); 1 when none holds it, which check_support then declines typed.
+            if self.flavor not in _SM100_BIAS_D_SHAPES:
+                return 1
+            return _sm100_bias_auto_cga(self.flavor[0], int(self.k_desc.shape[2]), _SM100_SMALL_D_CGAS[self.flavor]) or 1
         if self.flavor not in _SM107_BIAS_D_SHAPES:
             return 1
         return (
@@ -1746,6 +1764,12 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         if self.bias_desc is None:
             return _BIAS_MODE_NONE
         _cga = self._resident_arm_cga()
+        if self._device_cc != (10, 7):
+            # The SM100 line: the RESIDENT block only (the streamed / multicast ring is not on the SM100 file yet) -- the budget pick at this
+            # width (config_sm100.sm100_bias_mode_pick) when it is the resident block, else 0 (check_support declines typed; a ring REQUEST
+            # is declined by name there).
+            _mode = _sm100_bias_mode_pick(self.flavor[0], _cga, int(self.k_desc.shape[2]), request=self.bias_mode)
+            return _mode if _mode == _BIAS_MODE_RESIDENT else _BIAS_MODE_NONE
         return _sm107_bias_mode_pick(
             self.flavor[0],
             _cga,
@@ -2541,9 +2565,30 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # kv_mask alone stages nothing in SMEM: no block, no S_kv budget).
             _what = "additive bias" if self.bias_desc is not None else "per-key kv_mask"
             self._not_implemented_error_if(
-                self._device_cc != (10, 7) or self._fp8,
-                f"the {_what} is served by the Rubin f16/bf16 engine's 32- / 64-wide tiles only",
+                (self._device_cc != (10, 7) and self._device_cc not in _SM100_BIAS_CCS) or self._fp8,
+                f"the {_what} is served by the Rubin and SM100 f16/bf16 engines' 32- / 64-wide tiles only",
             )
+            if self._device_cc != (10, 7):
+                # The SM100 line serves the RESIDENT block of the one-batch-entry item at TILE_N 128 so far (the port's first body seam):
+                # the streamed / multicast ring, the (n, n+1) pair item, the 64-wide KV tile and the fp32 additive vector WITH a bias (served
+                # at that tile only) are typed declines until they land -- the engine row's _bias_arm_decline is the twin (rule 8b).
+                self._not_implemented_error_if(
+                    self.bias_mode is not None and self.bias_mode != _BIAS_MODE_RESIDENT,
+                    f"bias_mode={self.bias_mode} (the streamed bias ring) is not on the SM100 file yet; the resident block (bias_mode=1) is",
+                )
+                self._not_implemented_error_if(
+                    self.n_chunk is not None and self.n_chunk >= 1,
+                    f"n_chunk={self.n_chunk} (the (n, n+1) pair work item) is not on the SM100 file yet; every bias plan runs the one-batch-entry item there",
+                )
+                self._not_implemented_error_if(
+                    self.tile_n is not None and int(self.tile_n) != 128,
+                    f"tile_n={self.tile_n}: the 64-wide KV tile is not on the SM100 file yet (TILE_N 128 only)",
+                )
+                self._not_implemented_error_if(
+                    self.bias_desc is not None and self.kv_mask_desc is not None and self.kv_mask_desc.dtype == torch.float32,
+                    "an fp32 additive kv_mask together with a bias is served at the 64-wide KV tile only, which is not on the SM100 file yet (the 128-wide "
+                    "rendering spills on the softmax role): bind the mask in the Q/K/V dtype or as a boolean",
+                )
             self._not_implemented_error_if(
                 self.thd or self.paged or self.split_kv > 1 or bool(self.pack_gqa) or self.gate_desc is not None,
                 f"the {_what} is served on dense, unsplit, unpaged, non-PackGQA, ungated plans only",
@@ -2552,15 +2597,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.score_max_desc is not None or self.score_sum_exp_desc is not None,
                 f"the {_what} and the score side outputs are not wired together (the -inf masked softmax arm publishes no true max)",
             )
+            _bias_shapes = _SM107_BIAS_D_SHAPES if self._device_cc == (10, 7) else _SM100_BIAS_D_SHAPES
             self._not_implemented_error_if(
-                self.flavor not in _SM107_BIAS_D_SHAPES,
-                f"the {_what} is wired on the {sorted(_SM107_BIAS_D_SHAPES)} kernel flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
+                self.flavor not in _bias_shapes,
+                f"the {_what} is wired on the {sorted(_bias_shapes)} kernel flavors only; head dims ({d_qk}, {d_v}) select {self.flavor}",
             )
             if self.bias_desc is not None:
                 _bias_cga = self._resident_arm_cga()
                 _pair = self._resident_arm_pair_eligible() and _bias_cga == 1  # the item that RUNS (its block's budget)
                 _wgs = self._resident_arm_softmax_wgs()
-                _s_kv_max = _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga, pair=_pair, tiles_q=_wgs)
+                _s_kv_max = (
+                    _sm107_bias_resident_s_kv_max(self.flavor[0], _bias_cga, pair=_pair, tiles_q=_wgs)
+                    if self._device_cc == (10, 7)
+                    else _sm100_bias_resident_s_kv_max(self.flavor[0], _bias_cga)
+                )
                 _item = "the (n, n+1) pair item" if _pair else "the one-batch-entry item"
                 # The third softmax warp group (softmax_wgs=3): the pair item at tile_n 64 / cga 1 only -- the one form whose roles loop over the
                 # sub-tiles (the one-batch-entry paths hand-unroll two) and the one width its 128-register softmax holds; declined typed, never
@@ -2581,6 +2631,11 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     f"at cga 1 (this plan runs {_item} at cga {_bias_cga})",
                 )
                 _mode = self._resident_arm_bias_mode()
+                self._not_implemented_error_if(
+                    self._device_cc != (10, 7) and _mode == _BIAS_MODE_NONE,
+                    f"no resident bias block holds S_kv {s_kv} at head-dim tile {self.flavor[0]} / cga {_bias_cga} on this arch line (the block holds "
+                    f"S_kv <= {_s_kv_max}); the streamed bias ring is not on the SM100 file yet",
+                )
                 if _mode == _BIAS_MODE_STREAMED_MULTICAST:
                     # The multicast ring (a request, or the test seam): the PAIR item's ring at cga1 run as a cluster of two independent CTAs
                     # along the chunk axis that read ONE bias tile sequence -- a form, never a degraded plan: typed declines for what breaks
