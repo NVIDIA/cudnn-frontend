@@ -70,6 +70,9 @@ def test_row_claims_the_resident_bias_on_the_derived_shapes_and_budgets():
     # the heuristics' width pick = the row's: the narrowest width whose block holds S_kv
     assert c0.sm100_bias_auto_cga(32, 256, frozenset({1})) == 1
     assert c0.sm100_bias_auto_cga(64, 128, frozenset({1, 2})) == 2
+    # the D 64 flavor at ITS width (the 64-wide tile): cga1 -- the block up to 192, the 3-stage ring above it (measured over the cga-2 block, GB200 2026-10-14)
+    assert c0.sm100_bias_auto_cga(64, 192, frozenset({1, 2}), tile_n=64) == 1 and c0.sm100_bias_auto_cga(64, 256, frozenset({1, 2}), tile_n=64) == 1
+    assert c0.sm100_bias_mode_pick(64, 1, 256, tile_n=64) == 2 and c0.sm100_bias_stages_pick(64, 1, tile_n=64) == 3
     # the kernel's preload constant: the Rubin table as the prior (0 at the 128-wide tile)
     assert c0.sm100_bias_preload_chunks(128) == 0 and c0.sm100_bias_preload_chunks(64) == 1
 
@@ -142,13 +145,13 @@ _ADAPTER_CELLS = [
     ("bias_mode=2 request at S256 (honoured)", dict(bias=(1, 4, 256, 256), bias_mode=2), True, (32, 32), 2, 0, 1),
     ("bias d64 S128 -> cga2 block", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 2),
     (
-        "bias d64 S256 -> the 64-wide tile by the budget rule: the RESIDENT block at cga2 (4 tiles)",
+        "bias d64 S256 -> the 64-wide tile by the budget rule: the cga-1 3-stage STREAMED RING (measured +77.5 % over the cga-2 block, GB200 2026-10-14)",
         dict(d=64, s_q=256, s_kv=256, bias=(1, 4, 256, 256)),
         True,
         (64, 64),
-        1,
-        0,
         2,
+        0,
+        1,
     ),
     ("bias d64 S128 at a requested cga1 (holds no block)", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128), cga=1), False, None, None, None, None),
     ("kv_mask alone d32 S1024 (no budget)", dict(s_q=1024, s_kv=1024, kv_mask=(2, 1, 1, 1024)), True, (32, 32), 0, 1, 1),
@@ -269,6 +272,8 @@ _RING_CASES = {
     # S_kv 904 (not 900): a COMPACT bias needs S_kv % 8 == 0 for its TMA row stride (the row declines 900 typed; the Rubin module runs 900 on the mask-only arm)
     "ring_padded_nkv8_tail_904_zero_batch": dict(b=3, h=2, h_kv=2, s_q=904, s_kv=904, kv_lens=[904, 0, 500]),
     "ring_dense_nkv8_1024_head_broadcast": dict(b=2, h=2, h_kv=2, s_q=1024, s_kv=1024, bias="1"),
+    # the D 64 flavor's knob-less default above its cga-1 resident budget: the 64-wide tile's 3-stage ring at cga1 (the measured preference over the cga-2 block)
+    "ring_d64_nkv4_256_t64": dict(b=2, h=2, h_kv=2, s_q=256, s_kv=256, d=64),
 }
 # No form at any width of the flavor's domain: the 64-wide tile's cga2 holds one tile and no ring; cga1 none -- a typed decline on real graphs.
 _ABOVE_BUDGET = ["d64_dense_256_cga2"]
@@ -456,7 +461,8 @@ def test_streamed_ring_matches_the_fp64_oracle_on_sm100(case, with_mask):
     q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16, kv_mask_p=0.3 if with_mask else None, table=_RING_CASES)
     kw.pop("cga", None)
     out = _run(q, k, v, **kw)
-    assert out["knobs"].cga == 1 and out["knobs"].tile_n == 128, (case, out["knobs"])
+    # the 32-wide tile rings at the 128-wide KV tile; the D 64 flavor's ring is the 64-wide tile's (its budget width), cga1 on both
+    assert out["knobs"].cga == 1 and out["knobs"].tile_n == (64 if _RING_CASES[case].get("d", 32) == 64 else 128), (case, out["knobs"])
     _t7._check(out, ref)
 
 
@@ -468,7 +474,7 @@ _T64_CASES = {
     "t64_ring_dense_640": dict(b=2, h=2, h_kv=2, s_q=640, s_kv=640),
     "t64_ring_padded_1024_zero_batch": dict(b=3, h=2, h_kv=2, s_q=1024, s_kv=1024, kv_lens=[1024, 0, 700]),
     "t64_d64_dense_192_cga1": dict(b=2, h=2, h_kv=2, s_q=192, s_kv=192, d=64),  # 3 resident tiles at cga1
-    "t64_d64_causal_tail_200": dict(b=2, h=2, h_kv=2, s_q=200, s_kv=200, d=64, causal=True),  # 4 tiles: the resident block at cga2
+    "t64_d64_causal_tail_200": dict(b=2, h=2, h_kv=2, s_q=200, s_kv=200, d=64, causal=True),  # 4 tiles: the cga-1 ring (the measured preference over the cga-2 block)
 }
 
 
@@ -482,13 +488,14 @@ def test_tile_n_64_matches_the_fp64_oracle_on_sm100(case, with_mask):
     kw.pop("cga", None)
     out = _run(q, k, v, tile_n=64, **kw)
     # the width at the 64-wide tile = the budget pick's own answer (the row's, the heuristics' and the adapter's one arithmetic): cga1 while the
-    # resident block holds S_kv there (D 32 always; D 64 up to 3 tiles = 192), else the resident block at cga2 (D 64 S 200: 4 tiles) before any ring
+    # resident block holds S_kv there (D 32 always; D 64 up to 3 tiles = 192) and, at D 64, the cga-1 ring above it (D 64 S 200: measured faster than
+    # the cga-2 4-tile block on GB200, 2026-10-14) -- cga 1 on every case of this table
     from cudnn.sdpa.fwd import config_sm100 as c0
 
     c = _T64_CASES[case]
     d = c.get("d", 32)
     want_cga = c0.sm100_bias_auto_cga(d, c["s_kv"], c0.SM100_SMALL_D_CGAS[(d, d)], tile_n=64)
-    assert want_cga == {"t64_d64_dense_192_cga1": 1, "t64_d64_causal_tail_200": 2}.get(case, 1), (case, want_cga)
+    assert want_cga == 1, (case, want_cga)
     assert out["knobs"].tile_n == 64 and out["knobs"].cga == want_cga, (case, out["knobs"])
     _t7._check(out, ref)
 
@@ -538,13 +545,13 @@ def test_pre_masked_tail_matches_the_oracle_and_the_legacy_body_bitwise_on_sm100
 @pytest.mark.parametrize("case", _ABOVE_BUDGET)
 def test_d64_bias_above_128_lands_on_the_64_wide_tile_by_the_budget_rule(case):
     """A D 64 bias graph above S_kv 128 fits no form at the 128-wide tile (cga1 holds no block, cga2 one tile and no ring): the knob-less plan
-    takes the 64-wide KV tile by the budget rule -- tile_n 64, the resident block at cga2 (four 64-wide tiles) -- and matches the oracle (the Rubin cell ran
-    the same graph at the 128-wide tile's cga2 on its 320 KiB budget)."""
+    takes the 64-wide KV tile by the budget rule -- tile_n 64 -- at cga1 on its 3-stage STREAMED RING (the measured preference over the cga-2 resident
+    block: +77.5 % on GB200, 2026-10-14) and matches the oracle (the Rubin cell ran the same graph at the 128-wide tile's cga2 on its 320 KiB budget)."""
     q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16)
     kw.pop("cga", None)  # the Rubin cell's cga2 request is the Rubin budget's; the knob-less pick is the point here
     out = _run(q, k, v, **kw)
-    # the budget pick prefers the resident block at cga2 (4 x 64 = 256 kv columns) over the cga1 ring (the budget table's row for the 64-wide tile)
-    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 2, (case, out["knobs"])
+    # the pick at the 64-wide tile: cga1 whenever a form fits there (S_kv 256 = the 3-stage ring; the cga-2 four-tile block measured 1.8x slower)
+    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 1, (case, out["knobs"])
     _t7._check(out, ref)
 
 

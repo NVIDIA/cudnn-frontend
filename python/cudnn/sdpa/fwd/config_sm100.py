@@ -2906,11 +2906,25 @@ def sm100_padded_tail_form_pick(
     return SM100_PADDED_TAIL_FORM_DEFAULT
 
 
+# MEASURED on GB200 (152 SMs @ 1830 MHz, cc 10.0, 2026-10-14; in-process A/B, 3 x 100, a control twin): at the D 64 flavor's 64-wide KV tile the
+# one-batch-entry item on the cga-1 3-stage STREAMED RING beats the cga-2 RESIDENT block by +77.5 % at S 256 B 1 (83.87 -> 47.26 us; the padded
+# leg 73.89 -> 43.10 us = +71 %) -- the 2-CTA pair halves each CTA's rows on a 4-tile cell whose fixed cost dominates.  The cga pick therefore
+# prefers cga 1 whenever a form fits there at this width (S_kv > 192 = the ring; <= 192 = the block, the narrowest-resident pick already).
+SM100_D64_T64_PREFER_CGA1_RING = True
+
+
 def sm100_bias_auto_cga(
     d_flavor: int, s_kv: int, cgas, *, dtype_qkv: int = DTYPE_BF16, tile_n: int = 128, pair: bool = False, tiles_q: int = 2
 ) -> Optional[int]:
     """The NARROWEST cga in ``cgas`` whose resident block holds ``s_kv`` on SM100, else the narrowest whose ring fits, else None (the
-    sm107 pick's algorithm at the SM100 budget: a D 64 bias graph at TILE_N 128 lands on cga2 -- its cga1 holds no form at 4 stages)."""
+    sm107 pick's algorithm at the SM100 budget: a D 64 bias graph at TILE_N 128 lands on cga2 -- its cga1 holds no form at 4 stages),
+    with ONE measured exception: at the D 64 flavor's 64-wide KV tile the cga-1 STREAMED RING is preferred over the cga-2 RESIDENT block
+    (:data:`SM100_D64_T64_PREFER_CGA1_RING`; GB200 2026-10-14, S 256: the cga-2 block 83.87 us, the cga-1 ring 47.26 us = +77.5 %, which
+    turns that cell from -35 % to +16 % against cuEq 0.12.0) -- the pair of CTAs shares K / V but halves each CTA's rows, and the item's
+    fixed cost dominates a 4-tile cell; where cga 1 holds the block itself (S_kv <= 192) it is the narrowest-resident pick already."""
+    if SM100_D64_T64_PREFER_CGA1_RING and int(d_flavor) == 64 and int(tile_n) == 64 and 1 in cgas:
+        if sm100_bias_mode_pick(d_flavor, 1, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair, tiles_q=tiles_q) != BIAS_MODE_NONE:
+            return 1
     for cga in sorted(cgas):
         if sm100_bias_mode_pick(d_flavor, cga, s_kv, dtype_qkv=dtype_qkv, tile_n=tile_n, pair=pair and cga == 1, tiles_q=tiles_q) == BIAS_MODE_RESIDENT:
             return cga
