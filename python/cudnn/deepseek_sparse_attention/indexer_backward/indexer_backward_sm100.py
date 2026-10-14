@@ -46,6 +46,12 @@ SMEM (kernel 2): full-row grad_signal/top-k staging plus a four-warp padded
   FP32 ping-pong buffer for bulk dK reduction.
 TMEM: S0/dK0 @0, dQ @128, S1/dK1 @256 (384/512 cols).
 
+H32 tensors stay compact at the public/global-memory boundary. Because
+TCGEN05 does not accept M32, GEMM1/GEMM3 use an internal M64 tile whose upper
+half is zero-filled by TMA and zero weights; the dQ tensor map clips stores to
+H32 and dW stores predicate the upper half. This avoids caller-side H64 padding
+while retaining the proven Gather4 schedule and its numerical order.
+
 Barriers for kernel 2:
   mbar[0-1]:  S_full_0/1     (MMA commits after GEMM1  → Compute waits)
   mbar[2-3]:  dS_ready_0/1   (Compute arrives after dS  → MMA waits)
@@ -372,6 +378,13 @@ def _tma_gather4_k_rows(
 
 
 class IndexerBackwardSm100:
+    """Warp-specialized SM100 GEMM stage for sparse indexer backward.
+
+    Compact H32 tensors use the same internal M64 TCGEN05 schedule as H64:
+    out-of-range Q rows and weights are zero-filled, while dQ/dW stores are
+    clipped to the logical head count.
+    """
+
     arch = 100
     WARP_SIZE = 32
     WARPGROUP_SIZE = 128
@@ -405,6 +418,19 @@ class IndexerBackwardSm100:
         topk_indices_global: bool = True,
         enable_score_pdl: bool = False,
     ):
+        """Configure tiling, persistence, sparse-index convention, and PDL.
+
+        Args:
+            head_dim: Logical Q/K head dimension.
+            heads: Logical query-head count; H32 and H64-or-larger are valid.
+            block_I: Sparse top-k block width; ``topk`` must be divisible by it.
+            topk: Number of selected KV rows per query row.
+            total_seqlen_k: Runtime KV capacity metadata retained by the factory.
+            total_rows: Total query rows, used only to select launch policy.
+            persistent_grid_size: CTA count available to a persistent launch.
+            topk_indices_global: Whether indices are already flattened across batches.
+            enable_score_pdl: Allow dependency overlap with the preceding score grid.
+        """
         self.head_dim = head_dim
         self.heads = heads
         self.block_I = block_I
@@ -425,13 +451,16 @@ class IndexerBackwardSm100:
         # False, mTopkIdx carries local-per-batch ids and the kernel adds
         # ``batch_idx * S_k_per_batch`` to convert. Const_expr-branched.
         self.topk_indices_global = topk_indices_global
-        assert heads >= 64
+        assert heads == 32 or heads >= 64, "supported head counts are H=32 and H>=64"
         assert topk > 0
         assert topk % block_I == 0
         self.num_topk_blocks = topk // block_I
 
         self.head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-        self.heads_padded = int(math.ceil(heads / 8) * 8)
+        # TCGEN05 requires M >= 64. H32 keeps the public tensors compact and
+        # zero-fills only the upper half of the internal Q/dS tiles; no H64
+        # global tensors or caller-side padding traffic is needed.
+        self.heads_padded = 64 if heads == 32 else int(math.ceil(heads / 8) * 8)
         # Half-dS publication is specialized for the production TopK=512,
         # H64 x I128 fragment map. Larger TopK values retain the full-dS drain
         # order because the additional barrier traffic regresses them.
@@ -733,6 +762,7 @@ class IndexerBackwardSm100:
         seqlen: Int32,
         batch_size: Int32,
     ):
+        """Run the warp-specialized GEMMs in serial-row or persistent-row mode."""
         # ScoreGrad launches this grid programmatically.  Serial rows wait at
         # entry; the cross-row persistent path delays the wait until its load
         # warp has issued the independent first-row Q TMA, allowing the Q/K
@@ -768,7 +798,7 @@ class IndexerBackwardSm100:
         _row_operand_stages = 2 if self.use_cross_row_persistent else 1
         _sQ_storage_size = int(sQ_size) * _row_operand_stages
         _grad_storage_size = self.topk * _row_operand_stages
-        _weight_storage_size = self.heads * _row_operand_stages
+        _weight_storage_size = self.heads_padded * _row_operand_stages
         _dq_epi_storage_size = int(sdQ_epi_size) if self.use_cross_row_persistent else 1
 
         # Cross-row persistence double-buffers top-k IDs; all other paths need
@@ -824,7 +854,7 @@ class IndexerBackwardSm100:
 
         sGradSignal = storage.sGradSignal.get_tensor(cute.make_layout((self.topk,), stride=(1,)))
         sTopkIdxs = storage.sTopkIdxs.get_tensor(cute.make_layout((smem_topk_capacity,), stride=(1,)))
-        sW = storage.sW.get_tensor(cute.make_layout((self.heads,), stride=(1,)))
+        sW = storage.sW.get_tensor(cute.make_layout((self.heads_padded,), stride=(1,)))
         sdKStage = storage.sdKStage.get_tensor(cute.make_layout((_dk_stage_elements,), stride=(1,)))
 
         if const_expr(self.use_cross_row_persistent):
@@ -1023,6 +1053,15 @@ class IndexerBackwardSm100:
                 tmma3.__extract_mlir_values__(),
             )
 
+        # Rendezvous all TMEM consumers at one static named-barrier
+        # instruction before the role-specific control flow.  Keeping the
+        # same barrier ID at multiple program counters prevents reliable
+        # synchronization validation and makes participant drift easy to miss.
+        if warp_idx == self.compute_warp_id[0]:
+            tmem.allocate(self.tmem_alloc_cols)
+        if warp_idx == self.mma_warp_id or warp_idx in self.compute_warp_id or warp_idx in self.reduce_warp_id:
+            tmem.wait_for_alloc()
+
         # =============================================================
         # Warp dispatch — setmaxnreg rebalances registers across WGs.
         # =============================================================
@@ -1045,7 +1084,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1080,9 +1118,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx in self.compute_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
-            if warp_idx == self.compute_warp_id[0]:
-                tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1145,7 +1180,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1362,10 +1396,6 @@ class IndexerBackwardSm100:
             cute.arch.mbarrier_init(mbar + MBAR_W_LOADED, self.WARP_SIZE)
             cute.arch.mbarrier_init(mbar + MBAR_DQ_DONE, 1)
             cute.arch.mbarrier_init(
-                mbar + MBAR_REDUCE_DONE,
-                self.WARPGROUP_SIZE,
-            )
-            cute.arch.mbarrier_init(
                 mbar + MBAR_DS_HALF_0,
                 self.WARPGROUP_SIZE,
             )
@@ -1407,6 +1437,13 @@ class IndexerBackwardSm100:
             ),
             sQ_layout.outer,
         )
+
+        # Keep the 288 TMEM-consuming threads on one static BAR.SYNC before
+        # the role-specific loops diverge.
+        if warp_idx == self.compute_warp_id[0]:
+            tmem.allocate(self.tmem_alloc_cols)
+        if warp_idx == self.mma_warp_id or warp_idx in self.compute_warp_id or warp_idx in self.reduce_warp_id:
+            tmem.wait_for_alloc()
 
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
@@ -1474,8 +1511,8 @@ class IndexerBackwardSm100:
                     cute.make_layout((self.topk,), stride=(1,)),
                 )
                 sW_row = cute.make_tensor(
-                    sW_storage_ptr + parity * self.heads,
-                    cute.make_layout((self.heads,), stride=(1,)),
+                    sW_storage_ptr + parity * self.heads_padded,
+                    cute.make_layout((self.heads_padded,), stride=(1,)),
                 )
                 seqlen_k_per_batch = seqlen_k // batch_size
                 batch_offset_l2g = Int32(0) if const_expr(self.topk_indices_global) else batch_idx * seqlen_k_per_batch
@@ -1495,11 +1532,10 @@ class IndexerBackwardSm100:
                             batch_idx,
                         ]
                 for step in cutlass.range_constexpr(
-                    (self.heads + self.WARP_SIZE - 1) // self.WARP_SIZE,
+                    (self.heads_padded + self.WARP_SIZE - 1) // self.WARP_SIZE,
                 ):
                     h = step * self.WARP_SIZE + lane_id
-                    if h < self.heads:
-                        sW_row[h] = mW[seq_idx, h, batch_idx]
+                    sW_row[h] = mW[seq_idx, h, batch_idx] if h < self.heads else self.q_dtype(0.0)
                 cute.arch.fence_view_async_shared()
                 # Every load-warp lane publishes its own SMEM writes.
                 cute.arch.mbarrier_arrive(
@@ -1507,7 +1543,6 @@ class IndexerBackwardSm100:
                 )
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq_0, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1593,9 +1628,6 @@ class IndexerBackwardSm100:
                     )
         elif warp_idx in self.compute_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
-            if warp_idx == self.compute_warp_id[0]:
-                tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq_0, _, _ = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1630,8 +1662,8 @@ class IndexerBackwardSm100:
                     cute.make_layout((self.topk,), stride=(1,)),
                 )
                 sW_row = cute.make_tensor(
-                    sW_storage_ptr + parity * self.heads,
-                    cute.make_layout((self.heads,), stride=(1,)),
+                    sW_storage_ptr + parity * self.heads_padded,
+                    cute.make_layout((self.heads_padded,), stride=(1,)),
                 )
                 gdQ = cute.local_tile(
                     mdQ,
@@ -1733,7 +1765,6 @@ class IndexerBackwardSm100:
 
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             _, _, _, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1940,7 +1971,6 @@ class IndexerBackwardSm100:
             )
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_wg0)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -1974,10 +2004,6 @@ class IndexerBackwardSm100:
             )
         elif warp_idx in self.compute_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
-            if warp_idx == self.compute_warp_id[0]:
-                if const_expr(not self.use_persistent):
-                    tmem.allocate(self.tmem_alloc_cols)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             tStS_0, tStS_1, tDqDq, _, _ = self.get_tmem_tensor(
                 s_acc_layout,
@@ -2037,7 +2063,6 @@ class IndexerBackwardSm100:
             )
         elif warp_idx in self.reduce_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-            tmem.wait_for_alloc()
             tmem_ptr_base = tmem.retrieve_ptr(self.acc_dtype)
             _, _, _, tDkDk_0, tDkDk_1 = self.get_tmem_tensor(
                 s_acc_layout,
@@ -2091,11 +2116,10 @@ class IndexerBackwardSm100:
                 sGradSignal[pos] = mGradSignal[seq_idx, pos, batch_idx]
 
         # Load W[heads] to sW
-        W_PER_THREAD = const_expr((self.heads + self.WARP_SIZE - 1) // self.WARP_SIZE)
+        W_PER_THREAD = const_expr((self.heads_padded + self.WARP_SIZE - 1) // self.WARP_SIZE)
         for wi in cutlass.range_constexpr(W_PER_THREAD):
             idx = wi * self.WARP_SIZE + lane_id
-            if idx < self.heads:
-                sW[idx] = mW[seq_idx, idx, batch_idx]
+            sW[idx] = mW[seq_idx, idx, batch_idx] if idx < self.heads else self.q_dtype(0.0)
 
         cute.arch.fence_view_async_shared()
         # Signal W + grad_signal loaded for compute warpgroup.
@@ -3031,8 +3055,10 @@ class IndexerBackwardSm100:
             )
             if lane_id % 4 == 0:
                 h0 = warp_id_in_wg * 16 + lane_id // 4
-                mdW[seq_idx, h0, batch_idx] = self.q_dtype(sum_low)
-                mdW[seq_idx, h0 + 8, batch_idx] = self.q_dtype(sum_high)
+                if h0 < self.heads:
+                    mdW[seq_idx, h0, batch_idx] = self.q_dtype(sum_low)
+                if h0 + 8 < self.heads:
+                    mdW[seq_idx, h0 + 8, batch_idx] = self.q_dtype(sum_high)
         else:
             HEADS_PER_WARP = const_expr(self.heads_padded // 4)
             warp_base_h = warp_id_in_wg * Int32(HEADS_PER_WARP)
@@ -3047,7 +3073,7 @@ class IndexerBackwardSm100:
                     if elem_h == h:
                         my_partial = my_partial + dw_accum[ei]
                 total = cute.arch.warp_reduction_sum(my_partial)
-                if lane_id == 0:
+                if lane_id == 0 and h < self.heads:
                     mdW[seq_idx, h, batch_idx] = self.q_dtype(total)
 
     # =========================================================================
@@ -3103,8 +3129,12 @@ class IndexerBackwardSm100:
                 cute.copy(tiled_tmem_load_dk_0, tDkDk_t2r_0, tDKrDK)
                 cute.arch.fence_view_async_tmem_load()
                 _tcgen05_fence_before_thread_sync()
-                if bi == self.num_topk_blocks - 1:
-                    cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
+                if const_expr(not self.use_cross_row_persistent):
+                    if bi == self.num_topk_blocks - 1:
+                        # Serial rows use REDUCE_DONE to guard TMEM teardown.
+                        # Cross-row rows publish the same completion through
+                        # ROW_FREE after this helper returns.
+                        cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
                 cute.arch.mbarrier_arrive(mbar + MBAR_DK_EMPTY_0)
             else:
                 cute.arch.mbarrier_wait(mbar + MBAR_DK_FULL_1, dk_full_1_phase)
@@ -3113,8 +3143,9 @@ class IndexerBackwardSm100:
                 cute.copy(tiled_tmem_load_dk_1, tDkDk_t2r_1, tDKrDK)
                 cute.arch.fence_view_async_tmem_load()
                 _tcgen05_fence_before_thread_sync()
-                if bi == self.num_topk_blocks - 1:
-                    cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
+                if const_expr(not self.use_cross_row_persistent):
+                    if bi == self.num_topk_blocks - 1:
+                        cute.arch.mbarrier_arrive(mbar + MBAR_REDUCE_DONE)
                 cute.arch.mbarrier_arrive(mbar + MBAR_DK_EMPTY_1)
 
             # The 16dp256b16x map materializes eight rows per warp into one

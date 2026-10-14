@@ -216,6 +216,12 @@ class IndexerBackward(APIBase):
        non-zero and no workspace is passed, before ``attn_score`` is touched.
     4. Kernel 2 — warp-specialized backward GEMM producing the gradients.
 
+    On SM100 the default backend accepts compact H32 inputs and outputs.
+    TCGEN05 still executes its minimum legal M64 tile internally: TMA
+    zero-fills the out-of-bounds Q rows, the kernel zero-fills the matching
+    weights, and stores are clipped to the caller's H32 tensors. No caller-side
+    H32→H64 padding or output slicing is required.
+
     ``backend="sm100_v2"`` (SM100 only, request-or-fail: ``check_support``
     raises outside the envelope, there is no silent fallback) selects an
     alternative GEMM stage that upcasts the weights to fp32 in-register and
@@ -365,6 +371,7 @@ class IndexerBackward(APIBase):
         self._plan_layout_validated = True
 
     def check_support(self) -> bool:
+        """Validate the common tensor contract and selected backend envelope."""
         # The generic gate reads the plan's own device for backend="sm100_v2"
         # (its kernel is compiled under that device, and a param-less query
         # would reject a valid plan whenever an unrelated pre-SM90 device
@@ -377,6 +384,11 @@ class IndexerBackward(APIBase):
             major != 9 and major < 10,
             f"IndexerBackward requires SM90 or SM100+, found SM{major}",
         )
+        if not self.use_v2 and major >= 10:
+            self._value_error_if(
+                self.heads != 32 and self.heads < 64,
+                f"the default SM100 IndexerBackward requires H=32 or H>=64, got H={self.heads}",
+            )
         if self.use_v2:
             b, s_q, s_k = self.batch, self.seqlen, self.seqlen_k
             h, d, topk = self.heads, self.head_dim, self.topk
@@ -887,6 +899,9 @@ def indexer_backward_wrapper(
             argument order (``d_index_q``/``d_weights``/``d_index_k``/
             ``stream``) is preserved for legacy callers.
             ``"default"`` is the architecture-generic path (SM90 or SM100).
+            Its SM100 specialization accepts compact H32 tensors and pads only
+            the internal TCGEN05 tile to M64; callers do not pad inputs or
+            slice outputs.
             ``"sm100_v2"`` is the SM100-only opt-in v2 backend,
             **request-or-fail**: it raises (``ValueError``/``RuntimeError``)
             outside its envelope — SM100, H == 64, D == 128, block_I == 128,
