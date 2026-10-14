@@ -1186,8 +1186,8 @@ def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
 
 
 def _declare_dense_sparse_paged():
-    """A DENSE paged declaration on a QsaSpec geometry: the serving table's `sparse` row (the packed form meets the sparse declaration's
-    own thd=True refusal first, so the dense form is the one that reaches the row)."""
+    """A DENSE paged declaration on a QsaSpec geometry: the serving table's `sparse` row (the packed form reaches the same row -- the
+    block serves the packed sparse stage, so both paged forms meet the table's `sparse` row)."""
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
     mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
     return GatedAttentionBlockFwd(
@@ -1257,20 +1257,22 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
             assert not bad.extend.served and bad.extend.reason == env.extend.declines[row] and bad.forms == (), row
     else:
         assert not env.extend.served and env.forms == () and "targets Rubin" in env.extend.reason
-    # a sparse geometry: the THD-only form meets the sparse declaration's own `thd=True` row first -- the envelope says so wherever the
+    # a sparse geometry: the block serves the packed sparse stage (the sparse declaration's THD row is record-driven and the record claims
+    # the arm), so the THD-only form reaches the table like the dense one and meets its `sparse` row -- the envelope says so wherever the
     # device / dtype facts let it speak (on Rubin: the very message the block raises for that declaration)
     sparse = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV)
     assert not sparse.extend.served
-    with pytest.raises(NotImplementedError, match="QsaSpec with thd=True") as e:
+    with pytest.raises(NotImplementedError, match="kv_source='paged' with geometry.qsa") as e:
         _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec()))
+    assert str(e.value) == env.extend.declines["sparse"]
     if cc == (10, 7):
         assert sparse.extend.reason == str(e.value)
-    # ... and the Rubin reading on ANY host (device_cc=): the EXTEND half says the sparse declaration's own row, the DECODE half the table's
-    # `sparse` row -- the pin the first node run exposed (the envelope read the `diagonal` row for a QsaSpec geometry on the THD-only form)
+    # ... and the Rubin reading on ANY host (device_cc=): BOTH halves say the table's `sparse` row -- the pin the first node run exposed
+    # (the envelope read the `diagonal` row for a QsaSpec geometry on the THD-only form)
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
     rubin = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7))
     assert rubin.cutedsl_ok and rubin.forms == ()
-    assert rubin.extend.reason == str(e.value) and rubin.decode.reason == env.decode.declines["sparse"]
+    assert rubin.extend.reason == str(e.value) == rubin.decode.reason == env.decode.declines["sparse"]
 
 
 @pytest.mark.L0
