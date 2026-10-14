@@ -2008,6 +2008,32 @@ def test_num_tokens_live_is_the_last_execute_parameter_with_default_none():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("width", [64, 0], ids=["rope_dim_64", "rope_dim_0"])
+def test_token_rows_flatten_every_admitted_form_including_a_zero_width_rope_table(width):
+    """The row-view helper behind ``execute``'s token matrices: ``[T, w]`` / ``[1, T, w]`` / ``[B, S, w]`` flatten to ``[T, w]`` (the first
+    ``T_live`` rows under a live count), exactly ``[T_live, w]`` / ``[1, T_live, w]`` pass through, any other row count is a typed
+    ``ValueError`` naming the admitted counts -- and all of it for a width-0 table, the RMSNorm-only geometry's ``rope_dim=0`` ``cos`` /
+    ``sin`` (``[T, 0]``), whose row count a ``-1`` view cannot infer (the regression a review found on the first shape of this feature)."""
+    from cudnn.gated_attention_block.api import _token_rows
+
+    t, t_live = 8, 5
+    flat, packed, dense = torch.zeros(t, width), torch.zeros(1, t, width), torch.zeros(2, 4, width)
+    for x in (flat, packed, dense):
+        assert tuple(_token_rows(x, "cos", width, t).shape) == (t, width)
+        assert tuple(_token_rows(x, "cos", width, t, t_live).shape) == (t_live, width)
+    for x in (torch.zeros(t_live, width), torch.zeros(1, t_live, width)):
+        assert tuple(_token_rows(x, "h", width, t, t_live).shape) == (t_live, width)
+        with pytest.raises(ValueError, match=f"h must carry {t} token rows of width {width}"):
+            _token_rows(x, "h", width, t)
+    with pytest.raises(ValueError, match=r"8 \(the declared capacity\) or 5 \(num_tokens_live\) token rows"):
+        _token_rows(torch.zeros(6, width), "out", width, t, t_live)
+    with pytest.raises(ValueError, match="token matrix"):
+        _token_rows(torch.zeros(2, 2, 2, width), "h", width, t)
+    # a VIEW, never a copy (Rule 1): the flattened rows alias the caller's storage
+    assert _token_rows(dense, "cos", width, t).data_ptr() == dense.data_ptr()
+
+
+@pytest.mark.L0
 def test_num_tokens_live_is_refused_on_a_block_declared_without_token_capacity():
     """A DENSE block and a TIGHT packed block (lengths sum to T exactly) refuse ``num_tokens_live`` BY NAME, host-side, before the plan
     check and under ``set_sync_debug_mode("error")``: the live count belongs to the bounded form -- silently ignoring it would launch T

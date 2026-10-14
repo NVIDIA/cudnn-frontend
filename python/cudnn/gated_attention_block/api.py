@@ -3676,8 +3676,8 @@ class _QkNormRope(_Stage):
             _flat(k if k_out is None else k_out, g.h_kv),
             w_q_norm,
             w_k_norm,
-            cos.view(-1, g.rope_dim),
-            sin.view(-1, g.rope_dim),
+            cos.view(t, g.rope_dim),  # t rows explicitly (a rope_dim 0 table is [T, 0]: -1 could not infer it)
+            sin.view(t, g.rope_dim),
             None if rstd_q is None else rstd_q.view(t, g.h_q),
             None if rstd_k is None else rstd_k.view(t, g.h_kv),
             stream=stream,
@@ -4752,6 +4752,30 @@ class _CacheWrite(_Stage):
         if idx is not None:
             # The 3-D indexer pool as the kernel's 4-D [P, 1, page_size, D] view (one raw key head; its head stride is never scaled).
             run_cache_write(idx, index_src, None, index_cache.unsqueeze(1), None, slot_mapping, stream=stream)
+
+
+def _token_rows(x: torch.Tensor, name: str, width: int, t: int, t_live: Optional[int] = None) -> torch.Tensor:
+    """The caller's token matrix as its ``[rows, width]`` view -- ``.view`` only (a copy would be a silent extra kernel, Rule 1), the row
+    count read from the LEADING shape (never inferred with ``-1``: a RoPE table of ``rope_dim`` 0, the RMSNorm-only geometry, is a
+    ``[T, 0]`` tensor whose row count ``-1`` cannot infer).  Admitted forms: ``[T, width]`` / ``[1, T, width]`` / a dense ``[B, S, width]``
+    with ``B x S == T`` (the first ``t_live`` rows when a live count is given), or -- under ``num_tokens_live`` -- exactly ``[T_live, width]``
+    / ``[1, T_live, width]`` (a serving stack's ``hidden_states[rows]`` / ``output[rows]`` with no staging copy).  Any other row count is a
+    typed ``ValueError`` naming the admitted counts.  ``rows`` = ``t`` without a live count, else ``t_live``."""
+    if x.ndim == 2:
+        n = int(x.shape[0])
+    elif x.ndim == 3 and int(x.shape[0]) == 1:
+        n = int(x.shape[1])
+    elif x.ndim == 3:
+        n = int(x.shape[0]) * int(x.shape[1])
+    else:
+        raise ValueError(f"{name} must be a [T, {width}] / [1, T, {width}] / [B, S, {width}] token matrix, got shape {tuple(x.shape)}")
+    if n == t:
+        x2 = x.view(t, width)
+        return x2 if t_live is None else x2[:t_live]
+    if t_live is not None and n == t_live:
+        return x.view(t_live, width)
+    admitted = f"{t}" if t_live is None else f"{t} (the declared capacity) or {t_live} (num_tokens_live)"
+    raise ValueError(f"{name} must carry {admitted} token rows of width {width}, got {tuple(x.shape)}")
 
 
 @dataclass(frozen=True)
@@ -6855,17 +6879,9 @@ class GatedAttentionBlockFwd(APIBase):
         rows = t if t_live is None else t_live
 
         def tok(x: torch.Tensor, name: str, width: int) -> torch.Tensor:
-            """The caller's token matrix as its ``[rows, width]`` view (``.view`` only -- a copy would be a silent extra kernel, Rule 1):
-            ``[T_max, width]`` / ``[1, T_max, width]`` (the first ``rows`` rows) or, under ``num_tokens_live``, exactly ``[T_live, width]``
-            / ``[1, T_live, width]`` -- a serving stack's ``hidden_states[rows]`` / ``output[rows]`` with no staging copy."""
-            x2 = x.view(-1, width)
-            n = int(x2.shape[0])
-            if n == t:
-                return x2 if rows == t else x2[:rows]
-            if t_live is not None and n == t_live:
-                return x2
-            admitted = f"{t}" if t_live is None else f"{t} (the declared capacity) or {t_live} (num_tokens_live)"
-            raise ValueError(f"{name} must carry {admitted} token rows of width {width}, got {tuple(x.shape)}")
+            """The caller's token matrix as its ``[rows, width]`` view (:func:`_token_rows`: the row count from the leading shape, so a
+            ``rope_dim`` 0 table of width 0 flattens too; the first ``rows`` rows of a ``T_max``-row tensor, or exactly ``T_live`` rows)."""
+            return _token_rows(x, name, width, t, t_live)
 
         # THE launch stream (Rule 5): the caller's ``current_stream``, else torch's
         # current stream on h's device -- resolved once, here, and handed to EVERY
