@@ -514,10 +514,14 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     # message below).  Only the flavors whose BODIES carry the gate seams may
     # load with it -- an unlisted flavor would trace an ungated epilogue and
     # silently return O instead of O * sigmoid(G).  The feature interactions
-    # are declined here as well as in the rows/adapter twin: THD has no gate
-    # descriptor, a KV split would gate the partials the combine then
-    # re-normalizes, paged KV and PackGQA are simply not wired through the gate
-    # TMA coordinates.
+    # are declined here as well as in the rows/adapter twin: a KV split would
+    # gate the partials the combine then re-normalizes, paged KV and PackGQA
+    # are simply not wired through the gate TMA coordinates.  THD (packed
+    # sequences) x gate is wired on the f16/bf16 "sm107 d256" body ONLY: its
+    # host maps G in the packed [1, T, H, D] form Q / O take and its TMA-LDG
+    # warp's gate load already runs on the THD coordinates; the quantized
+    # bodies (per-tensor FP8 on the same flavor string, MXFP8) build the dense
+    # gate map and their prepared THD launch carries no gate.
     if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
         # An index-list record (qsa_block_topk != 0, or its softmax-split knob) belongs to sm107/sparse_d256_f16.py (make_cfg_d256_sparse); a dense
         # template would read K/V densely and silently ignore the block list.  The selection is the FUNCTION -- a decline,
@@ -529,8 +533,13 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     if k.epilogue_gate:
         if flavor not in _EPILOGUE_GATE_FLAVORS:
             raise ValueError(f"{flavor}: epilogue_gate is wired on {sorted(_EPILOGUE_GATE_FLAVORS)} only")
-        if k.thd_varlen or (k.split_kv or 1) > 1 or k.pack_gqa or k.paged_kv:
-            raise ValueError(f"{flavor}: epilogue_gate is dense, unsplit, unpaged, non-PackGQA only")
+        if (k.split_kv or 1) > 1 or k.pack_gqa or k.paged_kv:
+            raise ValueError(f"{flavor}: epilogue_gate is unsplit, unpaged, non-PackGQA only")
+        if k.thd_varlen and not (flavor == "sm107 d256" and k.dtype_qkv in (_DTYPE_BF16, _DTYPE_FP16)):
+            raise ValueError(
+                f"{flavor}: epilogue_gate under THD (packed sequences) is wired on the f16/bf16 'sm107 d256' body only "
+                f"(the quantized bodies build a dense gate map); got dtype_qkv={k.dtype_qkv}"
+            )
     # Paged KV: the two MXFP8 flavors whose TMA-LDG warp walks the block tables (_PAGED_KV_FLAVORS_SM107); every
     # other Rubin flavor refuses here, before its module body could trace dense K/V descriptors over a page pool.
     # Dense queries only (THD queries over pools are the stage-2 port: the quantized THD setup clamps the K/V

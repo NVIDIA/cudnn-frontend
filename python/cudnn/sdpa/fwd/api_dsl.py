@@ -660,6 +660,16 @@ def _load_sm120_kernel_module(flavor: Optional[tuple[int, int]], params: Sm120Te
 _ZERO_SCALE_UNSUPPORTED = "attn_scale = 0 is not supported on this kernel (#1435)"
 
 
+def _thd_binder_serves_the_gate() -> bool:
+    """Whether this build's native THD binder (``_pybind_module._SdpaThdBinder``) binds the epilogue gate as a
+    per-call slot.  The role arrived with the THD gate descriptor of the f16/bf16 d256 prefill; an older pybind
+    extension has no such role, and a gated THD plan is declined typed instead of reaching a launch whose gate
+    pointer is the template's None."""
+    from cudnn import _pybind_module
+
+    return bool(getattr(_pybind_module._SdpaThdBinder, "supports_epilogue_gate", False))
+
+
 class SdpaFwdDsl(APIBase):
     """Implementation-agnostic interface for FROST DSL SDPA-forward kernels."""
 
@@ -975,8 +985,9 @@ class SdpaFwdDsl(APIBase):
         multiples. The strides must also COVER the tensor (head >= d,
         token >= h*head): an overlapping declaration would alias distinct O
         rows onto the same storage (a write race) and is outside the
-        kernels' addressing contract."""
-        for desc in self._thd_descs():
+        kernels' addressing contract.  The epilogue gate (when declared) is
+        addressed through the same packed map as Q / O and takes the same rule."""
+        for desc in self._thd_descs() + ((self.gate_desc,) if self.gate_desc is not None else ()):
             (ts, hs, es), _ = self._thd_declared(desc)
             h, d = desc.shape[1], desc.shape[3]
             # The 16-byte TMA rule in this tensor's OWN element units: 8 at
@@ -1519,9 +1530,10 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 f"{d.name} must be rank-4 (B, H, S, D); got {d.ndim}",
             )
             _shape, _stride = d.shape, d.stride
-            # Paged pools are dense tensors even under THD (only Q/O are packed);
-            # the epilogue gate is dense-only (THD x gate is declined below).
-            if self.thd and not (self.paged and desc_name in ("k_desc", "v_desc")) and desc_name != "gate_desc":
+            # Paged pools are dense tensors even under THD; Q / O are packed, and so is the
+            # epilogue gate G (O-shaped, TMA'd through the same packed [1, T, H, D] map on the
+            # f16/bf16 d256 THD prefill -- the gate x THD interaction is settled below).
+            if self.thd and not (self.paged and desc_name in ("k_desc", "v_desc")):
                 self._value_error_if(
                     not packed_layout_ok(tuple(_shape), tuple(_stride)),
                     f"{d.name} must have d, h, s stride order (head dim innermost, then heads, then tokens) for THD; got stride {tuple(_stride)} shape {tuple(_shape)}",
@@ -2252,7 +2264,25 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # Amax_O (when requested) follows the FP8 path's contract: the amax of
             # the UNGATED normalised O -- the sdpa node's output, independent of G
             # -- in the O's own units here (there is no scale_o to divide by).
-            self._not_implemented_error_if(self.thd, "epilogue gate fusion is dense-only (no THD gate descriptor)")
+            #
+            # THD (packed sequences) x gate: SERVED on the f16/bf16 d256 prefill, the one THD body with
+            # the gate seams -- its host maps G in the packed [1, T, H, D] form Q / O take (the kernel
+            # body is the dense gated body) and the prepared THD binder binds G per call.  The quantized
+            # THD bodies (per-tensor FP8 / MXFP8) build the dense gate map and their prepared launch
+            # carries no gate: declined by name.  The GRAPH path keeps its "dense-only" decline on the
+            # rows (engines.mismatch: the graph's THD lowering binds no gate operand) -- the standalone
+            # adapter is wider than the row here, by design, never the reverse (rule 8b: a row must not
+            # admit what the adapter declines).
+            self._not_implemented_error_if(
+                self.thd and self._fp8,
+                "epilogue gate fusion under THD (packed sequences) is served by the f16/bf16 d256 prefill only: "
+                "the quantized (FP8 / MXFP8) THD bodies have no THD gate descriptor",
+            )
+            self._not_implemented_error_if(
+                self.thd and not _thd_binder_serves_the_gate(),
+                "epilogue gate fusion under THD needs the prepared THD binder's gate role; this build's pybind extension "
+                "predates it (rebuild the extension, or run the gate as its own stage)",
+            )
             # The three kernel-side interactions below vanish when the gate rides the split
             # COMBINE (the d256 decode tile, split_kv > 1: the tile writes un-gated fp32
             # partials and sm100/split_combine applies sigmoid(G) to the merged value, so
@@ -3315,6 +3345,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 current_stream=current_stream,
                 block_table=block_table,
                 block_table_v=block_table_v,
+                gate=gate,
             )
             return
 
@@ -3483,6 +3514,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         current_stream=None,
         block_table=None,
         block_table_v=None,
+        gate=None,
     ):
         """THD / varlen execute (f16 kernels): shared packing + launch.
 
@@ -3496,7 +3528,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         the plan-time envelope (dead units exit by kernel contract) — the
         execute is fully async and CUDA-graph capturable. No compile is keyed
         on runtime data: the kernels compile with DYNAMIC token extents, so a
-        new packed total re-binds the same artifact."""
+        new packed total re-binds the same artifact.  ``gate`` (appended): the
+        epilogue gate G of a gated plan -- a packed ``(T, H_q, D_v)`` buffer (or the
+        graph's ``(B, H_q, S, D_v)`` view) the binder validates like Q / O."""
         from cudnn.sdpa.fwd.prepared import execute_native_thd_tensors
 
         spec = self._thd_spec
@@ -3520,6 +3554,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             ws_ptr,
             current_stream,
             scale_softmax_log2,
+            gate=gate,
         )
         if not launched:
             self._logger.debug("execute (THD): no addressable Q token, nothing to do")

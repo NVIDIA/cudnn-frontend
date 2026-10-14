@@ -735,7 +735,10 @@ def test_sm107_mxfp8_thd_check_support_declines_typed(monkeypatch):
         _mxfp8_api(thd=True, split_kv=2).check_support()
     with pytest.raises(NotImplementedError, match="PackGQA"):
         _mxfp8_api(thd=True, h_kv=2, pack_gqa=True).check_support()
-    with pytest.raises(NotImplementedError, match="dense-only"):
+    # THD x gate: served on the f16/bf16 d256 prefill (its host maps G in the packed form Q / O take); the MXFP8 THD
+    # body has no THD gate descriptor and is declined BY NAME -- the former "dense-only" decline is inverted, not
+    # deleted, and the cell pins the same token the fwd suite's inverted THD x gate cell pins.
+    with pytest.raises(NotImplementedError, match="quantized .* THD bodies"):
         _mxfp8_api(thd=True, gate=True).check_support()
     assert _mxfp8_api().check_support()
     assert _mxfp8_api(gate=True).check_support()
