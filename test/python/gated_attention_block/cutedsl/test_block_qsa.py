@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.frost.tile_dsl.requirements import tma_gather4_requirement_error
 from cudnn.gated_attention_block import (
     GatedAttentionBlockBwd,
     GatedAttentionBlockFwd,
@@ -58,6 +59,12 @@ _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 # the test, or a ``pytest.skip`` ahead of the one such arm.
 _CUTEDSL_REQUIREMENT = cutedsl_requirement_error("the gated attention block's stages")  # None at or above the floor
 _needs_dsl_floor = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
+# The adapter's TARGET half of the same gate: a DSL at or above the floor may still lack the Rubin target (the public 4.7 wheels do), and the
+# sparse adapter then declines a modeled cc 10.7 request by name.  The host ACCEPTANCE test models that part and asserts acceptance, so it
+# skips exactly where the adapter would decline -- through the adapter's own requirement (the floor, then the ``sm_107a`` target); the
+# dedicated decline test below keeps running on any DSL at the floor (it substitutes the target state itself).
+_SM107_TARGET_REQUIREMENT = tma_gather4_requirement_error((10, 7))  # None when the installed DSL renders the Rubin target
+_needs_sm107_target = pytest.mark.skipif(_SM107_TARGET_REQUIREMENT is not None, reason=str(_SM107_TARGET_REQUIREMENT))
 
 # The 24-query-head / 2-KV-head d256 geometry of the block-sparse model at TP 1 (d_model 2560, rope 64), with the
 # indexer band: (4 + 1) x 128 = 640 columns below V -> N = 13312 + 640 = 13952.
@@ -609,15 +616,15 @@ def _adapter_request(**over):
     return SparseGqaFwdDslSm107(**kw)
 
 
-@_needs_dsl_floor
+@_needs_sm107_target
 def test_adapter_accept_decline_set_equals_the_record():
     """The record-driven consistency check (Form A): for EVERY arm field of the record, a WELL-FORMED request that asks for
     the arm is accepted by the adapter's ``check_support`` iff the record claims it (a claimed arm's request carries the
     arm's own operands -- the paged read's pools, table and lengths; THD's two length descriptors of a one-sequence packing on
     the batch-extent-1 operands, in the ``[B]`` and, for ``cu_seq_len``, the ``[B + 1]`` form; an unclaimed arm's request is a
     typed decline naming the arm); the served baseline (dense BSHD
-    bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host with the public ``sm_107a`` DSL (the cc is handed
-    in, nothing is launched)."""
+    bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host whose DSL renders ``sm_107a`` (the cc is handed
+    in, nothing is launched); where the DSL lacks the target the module skips this test by the adapter's own requirement."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
 
     rec = _record()
