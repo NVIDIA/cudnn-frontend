@@ -14,7 +14,7 @@ When the ``dIndexK`` output buffer is bf16, a trailing pure-torch cast
 ``dIndexK`` buffer receives the accumulator directly, with no cast. The fp32
 ordinary accumulator behind a bf16 ``dIndexK`` (and the ordinary sm100_v2
 ticket counter) is carved from the caller's workspace; deterministic execution
-uses 96 CTA-private FP32 dK planes instead.
+uses a compile-time-selected set of CTA-private FP32 dK planes instead.
 ``scratch_workspace_bytes()`` reports the selected policy's exact size for
 ``execute(..., workspace=)``; the plans own no device memory (Rule 8, R2).
 """
@@ -41,7 +41,12 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 
 from .dense_indexer_backward_sm100 import dense_indexer_backward_sm100
 from .dense_indexer_backward_sm90 import dense_indexer_backward_sm90
-from .deterministic_dk_sm100 import INDEXER_BACKWARD_SM100_CAPABILITIES, deterministic_dk_workspace_bytes
+from .deterministic_dk_sm100 import (
+    DEFAULT_DK_PLANES,
+    INDEXER_BACKWARD_SM100_CAPABILITIES,
+    deterministic_dk_workspace_bytes,
+    validate_deterministic_dk_plane_policy,
+)
 from .indexer_backward_v2_sm100 import indexer_backward_v2_sm100
 from .indexer_backward_sm100 import indexer_backward_sm100
 from .indexer_backward_sm90 import indexer_backward_sm90
@@ -227,11 +232,13 @@ class IndexerBackward(APIBase):
 
     ``deterministic=True`` is an SM100/SM103 request-or-fail policy for H=64,
     D=128, block_I=128, and 128-multiple top-k in [128, 2048]. It launches up
-    to 96 persistent CTAs over fixed grid-stride query rows and allocates one
-    CTA-private FP32 dK plane for each possible producer. A final kernel folds
-    the 96 planes in CTA order.
+    to ``deterministic_dk_planes`` persistent CTAs over fixed grid-stride query
+    rows and allocates one CTA-private FP32 dK plane for each possible producer.
+    The plane count is a compile-time specialization selected from
+    ``{96, 128, 148}`` (default 96). A final kernel folds the planes in CTA
+    order.
     dQ/dW remain single-writer. The deterministic scratch is
-    ``96 * B * S_k * D * 4`` bytes,
+    ``deterministic_dk_planes * B * S_k * D * 4`` bytes,
     independent of output dtype. As with a top-k result, valid indices within
     each query row must be unique; duplicate scatter targets inside one row
     are outside the deterministic contract. A warmed plan with caller-owned
@@ -283,6 +290,7 @@ class IndexerBackward(APIBase):
         topk_indices_global: bool = False,
         backend: str = "default",
         deterministic: bool = False,
+        deterministic_dk_planes: int = DEFAULT_DK_PLANES,
     ):
         """Capture a shape-specialized plan and its execution policy."""
         super().__init__()
@@ -325,6 +333,7 @@ class IndexerBackward(APIBase):
         _validate_indexer_backward_backend(backend)
         self.backend = backend
         self.deterministic = bool(deterministic)
+        self.deterministic_dk_planes = validate_deterministic_dk_plane_policy(self.deterministic, deterministic_dk_planes)
         # Derived gate kept so the internal dispatch/validation sites read a
         # single boolean; ``backend`` remains the public, cache-keyed selector.
         self.use_v2 = backend == "sm100_v2"
@@ -579,6 +588,7 @@ class IndexerBackward(APIBase):
                     topk_indices_global=self.topk_indices_global,
                     dw_out_dtype=self.dw_desc.dtype,
                     deterministic=self.deterministic,
+                    deterministic_dk_planes=self.deterministic_dk_planes,
                 )
             return
         if self.deterministic:
@@ -594,6 +604,7 @@ class IndexerBackward(APIBase):
                     block_I=self.block_I,
                     topk_indices_global=self.topk_indices_global,
                     deterministic=True,
+                    deterministic_dk_planes=self.deterministic_dk_planes,
                 )
             return
         # Ordinary default path: capability from the current device, unchanged
@@ -616,13 +627,13 @@ class IndexerBackward(APIBase):
         """Return caller-owned scratch bytes for the selected dK policy.
 
         The ordinary sm100_v2 counter region comes first. Deterministic
-        execution instead uses 96 dense FP32 CTA planes regardless of output
-        dtype; ordinary execution needs one dense accumulator only for a bf16
-        ``d_index_k``.
+        execution instead uses ``deterministic_dk_planes`` dense FP32 CTA
+        planes regardless of output dtype; ordinary execution needs one dense
+        accumulator only for a bf16 ``d_index_k``.
         """
         counter = ws_align(8) if self.use_v2 and not self.deterministic else 0
         if self.deterministic:
-            accumulator = deterministic_dk_workspace_bytes(self.batch, self.seqlen_k, self.head_dim)
+            accumulator = deterministic_dk_workspace_bytes(self.batch, self.seqlen_k, self.head_dim, self.deterministic_dk_planes)
         else:
             accumulator = 0 if self.dik_desc.dtype == torch.float32 else ws_align(self.batch * self.seqlen_k * self.head_dim * 4)
         return counter + accumulator
@@ -944,6 +955,7 @@ def indexer_backward_wrapper(
     backend: str = "default",
     workspace: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ) -> TupleDict:
     """High-level wrapper. Returns ``{'d_index_q', 'd_weights', 'd_index_k'}``.
 
@@ -1015,14 +1027,18 @@ def indexer_backward_wrapper(
             the wrapper allocates it per call on the launch stream. Calls
             sharing one buffer must not overlap on the device.
         deterministic: keyword-only opt-in for bitwise-reproducible gradients
-            on SM100/SM103. Up to 96 fixed-owner producer CTAs accumulate into
+            on SM100/SM103. Fixed-owner producer CTAs accumulate into
             CTA-private FP32 planes; a fixed CTA-order reduction writes
-            ``d_index_k``. The caller-owned workspace is correspondingly 96
-            times the dense FP32 dK size for either backend. A warmed plan with
-            preallocated outputs and workspace remains CUDA Graph compatible.
-            Valid top-k indices within each query row must be unique.
+            ``d_index_k``. A warmed plan with preallocated outputs and
+            workspace remains CUDA Graph compatible. Valid top-k indices
+            within each query row must be unique.
+        deterministic_dk_planes: compile-time deterministic producer-grid and
+            FP32-plane specialization, one of ``{96, 128, 148}`` (default
+            ``96``). The caller-owned workspace is this many times the dense
+            FP32 dK size. Values other than 96 require ``deterministic=True``.
     """
     _validate_indexer_backward_backend(backend)
+    deterministic_dk_planes = validate_deterministic_dk_plane_policy(deterministic, deterministic_dk_planes)
     # Validate ranks explicitly before any allocation or the dimension
     # derivation below, so a wrong-rank tensor surfaces as a clean ValueError
     # instead of a cryptic tuple-unpack/indexing error (or a mis-shaped
@@ -1094,6 +1110,7 @@ def indexer_backward_wrapper(
         backend,
         stream_key,
         bool(deterministic),
+        deterministic_dk_planes,
     )
     obj = _cache_of_IndexerBackwardObjects.get(key)
     if obj is None:
@@ -1112,6 +1129,7 @@ def indexer_backward_wrapper(
             topk_indices_global=topk_indices_global,
             backend=backend,
             deterministic=deterministic,
+            deterministic_dk_planes=deterministic_dk_planes,
         )
         assert obj.check_support()
         obj.compile()

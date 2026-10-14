@@ -41,7 +41,7 @@ a **two-term bf16-expansion** formulation:
 * Ordinarily, ``d_index_k`` is accumulated with vectorized fp32 atomics
   (four-element ``cute.arch.atomic_add``), the same numerics class as the
   default backend. The deterministic specialization assigns fixed query
-  stripes to up to 96 persistent CTAs. Each CTA owns one private FP32 plane,
+  stripes to the selected persistent-CTA count. Each CTA owns one private FP32 plane,
   then a fixed-order reduction folds the planes in CTA order.
 
 Semantics (H = indexer heads, D = head dim; per query row ``s`` and top-k
@@ -146,8 +146,8 @@ Requires SM100/SM103, H == 64, D == 128, and topk % 128 == 0 with
 Workspace / concurrency contract (Rule 8, R2): the plan owns no device
 memory. Ordinarily, the dynamic-ticket counter is the first ``ws_align(8)``
 bytes of the caller's ``workspace`` and the fp32 dK accumulator a bf16
-``d_index_k`` needs follows it. Deterministic execution uses 96 CTA-private
-FP32 dK planes; ``IndexerBackward.scratch_workspace_bytes()``
+``d_index_k`` needs follows it. Deterministic execution uses compile-time-selected
+CTA-private FP32 dK planes; ``IndexerBackward.scratch_workspace_bytes()``
 is the size, and the buffer must live on ``index_q.device``. Every ordinary
 execute zeroes the counter on the launch stream with one async memset;
 deterministic execution zeroes its planes. A buffer
@@ -194,12 +194,13 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
 
 from .deterministic_dk_sm100 import (
+    DEFAULT_DK_PLANES,
     INDEXER_BACKWARD_SM100_CAPABILITIES,
-    NUM_DK_PLANES,
     deterministic_dk_planes_bytes,
     deterministic_dk_producer_ctas,
     deterministic_dk_workspace_bytes,
     reduce_deterministic_dk,
+    validate_deterministic_dk_plane_policy,
 )
 from .indexer_backward_sm100 import _score_grad_inplace
 
@@ -1634,6 +1635,7 @@ def indexer_backward_v2_sm100(
     topk_indices_global: bool = True,
     dw_out_dtype: torch.dtype = torch.float32,
     deterministic: bool = False,
+    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
     """SM100 indexer backward v2 factory.
 
@@ -1658,7 +1660,7 @@ def indexer_backward_v2_sm100(
     The returned callable allocates nothing. Ordinarily, its ticket counter
     (8 B) and, for a bf16 ``d_index_k``, the ``B * S_k * D`` fp32 accumulator
     are carved from the ``workspace`` argument (counter first). Deterministic
-    execution carves 96 CTA-private FP32 dK planes
+    execution carves ``deterministic_dk_planes`` CTA-private FP32 dK planes
     instead. Scratch is sized by
     ``IndexerBackward.scratch_workspace_bytes()`` and zeroed on the launch
     stream at every call. A missing or undersized workspace raises
@@ -1672,6 +1674,7 @@ def indexer_backward_v2_sm100(
     at the gate itself). ``batch``/``seqlen``/``seqlen_k``
     fix the plan's shape; execute re-validates the real tensors against it.
     """
+    deterministic_dk_planes = validate_deterministic_dk_plane_policy(deterministic, deterministic_dk_planes)
     if torch.cuda.get_device_capability() not in INDEXER_BACKWARD_SM100_CAPABILITIES:
         raise RuntimeError(f"indexer_backward_v2_sm100 requires capability in {INDEXER_BACKWARD_SM100_CAPABILITIES}; " "use backend='default' elsewhere")
     if heads != 64 or dim != 128:
@@ -1760,17 +1763,17 @@ def indexer_backward_v2_sm100(
         # then the fp32 dK accumulator a bf16 output needs; deterministic
         # execution carves its planes. Validate/carve before
         # kernel 1 so a missing workspace cannot leave AttnScore overwritten.
-        planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim) if deterministic else 0
+        planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim, deterministic_dk_planes) if deterministic else 0
         required = (
-            deterministic_dk_workspace_bytes(batch, seqlen_k, dim)
+            deterministic_dk_workspace_bytes(batch, seqlen_k, dim, deterministic_dk_planes)
             if deterministic
             else ws_align(8) + (0 if dIndexK.dtype == torch.float32 else ws_align(seq_k_total * d * 4))
         )
         carver = WorkspaceCarver(workspace, required, "IndexerBackward (sm100_v2)")
         _check(workspace.device == IndexQ.device, f"workspace must be on {IndexQ.device} (got {workspace.device})")
         if deterministic:
-            dIndexK_planes = carver.take(planes_bytes // 4, torch.float32).view(NUM_DK_PLANES, seq_k_total, d)
-            dk_f32_flat = dIndexK_planes.view(NUM_DK_PLANES * seq_k_total, d)
+            dIndexK_planes = carver.take(planes_bytes // 4, torch.float32).view(deterministic_dk_planes, seq_k_total, d)
+            dk_f32_flat = dIndexK_planes.view(deterministic_dk_planes * seq_k_total, d)
             cnt = dIndexK_planes.view(torch.int32).reshape(-1)[:1]
         else:
             cnt = carver.take(2, torch.int32)
@@ -1794,7 +1797,11 @@ def indexer_backward_v2_sm100(
         dq_flat = dIndexQ.view(rows, h, d)
         dw_flat = dWeights.view(rows, h)
 
-        num_ctas = deterministic_dk_producer_ctas(rows) if deterministic else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
+        num_ctas = (
+            deterministic_dk_producer_ctas(rows, deterministic_dk_planes)
+            if deterministic
+            else torch.cuda.get_device_properties(IndexQ.device).multi_processor_count
+        )
         # per-CTA ring-slot trip count; the +8 surplus slots are the
         # work-stealing headroom (they come back as -1 tickets)
         if deterministic:
@@ -1804,7 +1811,7 @@ def indexer_backward_v2_sm100(
             ticket_slots = (rows + num_ctas - 1) // num_ctas + 8
             ring_depth = 4
 
-        compile_key = (heads, dim, topk, num_ctas, ticket_slots, ring_depth, dw_out_dtype, idx_local, deterministic)
+        compile_key = (heads, dim, topk, num_ctas, ticket_slots, ring_depth, dw_out_dtype, idx_local, deterministic, deterministic_dk_planes)
         fn = _compile_cache.get(compile_key)
         if fn is None:
             kernel_obj = IndexerBackwardV2Sm100(
@@ -1856,7 +1863,7 @@ def indexer_backward_v2_sm100(
             )
 
         if deterministic:
-            reduce_deterministic_dk(dIndexK_planes, dIndexK, current_stream)
+            reduce_deterministic_dk(dIndexK_planes, dIndexK, deterministic_dk_planes, current_stream)
         # Trailing cast only for ordinary bf16 d_index_k buffers (fp32 atomic
         # accumulator -> output dtype); fp32 buffers were written directly.
         elif dIndexK.dtype != torch.float32:

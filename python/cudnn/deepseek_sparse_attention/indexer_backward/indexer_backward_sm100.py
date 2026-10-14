@@ -18,8 +18,8 @@ to overlap independent prologue work while preserving their data dependencies:
   Kernel 3 (PyTorch):  dk_convert — cast dK from float32 to output dtype
       (same as dQ, dW).
 
-The deterministic specialization keeps kernel 2 but maps up to 96 persistent
-CTAs to fixed query stripes and gives each CTA one private FP32 dK plane. One
+The deterministic specialization keeps kernel 2 but maps a selected persistent
+CTA count to fixed query stripes and gives each CTA one private FP32 dK plane. One
 trailing CuTe DSL kernel folds the planes in fixed CTA order and stores the
 requested output dtype. The ordinary path above is unchanged.
 
@@ -124,11 +124,12 @@ from cudnn.deepseek_sparse_attention.utils.runtime import (
 from cudnn.frost.buffers import memset_zero_async
 
 from .deterministic_dk_sm100 import (
-    NUM_DK_PLANES,
+    DEFAULT_DK_PLANES,
     deterministic_dk_producer_ctas,
     deterministic_dk_planes_bytes,
     deterministic_dk_workspace_bytes,
     reduce_deterministic_dk,
+    validate_deterministic_dk_plane_policy,
 )
 
 _HAS_TMA_GATHER4 = all(
@@ -3506,12 +3507,14 @@ def indexer_backward_sm100(
     block_I=128,
     topk_indices_global: bool = True,
     deterministic: bool = False,
+    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
     """Build the default SM100 backward pipeline for one plan signature.
 
     ``deterministic=True`` replaces the cross-CTA dK atomic target with
     fixed-owner CTA-private planes and a trailing fixed-order reduction.
     """
+    deterministic_dk_planes = validate_deterministic_dk_plane_policy(deterministic, deterministic_dk_planes)
     # ``batch``/``seqlen``/``seqlen_k`` are runtime extents (packed training
     # changes them every step, GitHub #1188). They only select the persistent
     # launch policy, and that policy -- not the shape -- is in the compile key.
@@ -3540,6 +3543,7 @@ def indexer_backward_sm100(
         block_I,
         topk_indices_global=topk_indices_global,
         deterministic=deterministic,
+        deterministic_dk_planes=deterministic_dk_planes,
     )
 
 
@@ -3888,6 +3892,7 @@ def _build_cute_dsl_kernel(
     block_I,
     topk_indices_global: bool = True,
     deterministic: bool = False,
+    deterministic_dk_planes: int = DEFAULT_DK_PLANES,
 ):
     """Create lazily compiled score/GEMM runners for one launch policy."""
     from cudnn.deepseek_sparse_attention.utils.tensor_conversion import to_cute_tensor
@@ -3895,7 +3900,9 @@ def _build_cute_dsl_kernel(
     if torch.cuda.get_device_capability()[0] < 10:
         raise RuntimeError("Requires SM100+")
     persistent_grid_size = (
-        deterministic_dk_producer_ctas(batch * seqlen) if deterministic else torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        deterministic_dk_producer_ctas(batch * seqlen, deterministic_dk_planes)
+        if deterministic
+        else torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     )
 
     def _make_kernel(enable_score_pdl: bool):
@@ -3926,6 +3933,7 @@ def _build_cute_dsl_kernel(
         kernel_objects[False].use_persistent,
         persistent_grid_size,
         deterministic,
+        deterministic_dk_planes,
     )
 
     def _ensure_compiled(IndexQ, Weights, IndexK, dIndexQ, dWeights, dIndexK_f32, AttnScore, TopkIndices, enable_score_pdl: bool, current_stream=None):
@@ -4031,9 +4039,13 @@ def _build_cute_dsl_kernel(
         score_grad = partial(_score_grad_inplace, block_I=block_I)
 
         if deterministic:
-            planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim)
-            carver = WorkspaceCarver(workspace, deterministic_dk_workspace_bytes(batch, seqlen_k, dim), "IndexerBackward deterministic (sm100)")
-            dIndexK_planes = carver.take(planes_bytes // 4, torch.float32).view(NUM_DK_PLANES, batch * seqlen_k, dim)
+            planes_bytes = deterministic_dk_planes_bytes(batch, seqlen_k, dim, deterministic_dk_planes)
+            carver = WorkspaceCarver(
+                workspace,
+                deterministic_dk_workspace_bytes(batch, seqlen_k, dim, deterministic_dk_planes),
+                "IndexerBackward deterministic (sm100)",
+            )
+            dIndexK_planes = carver.take(planes_bytes // 4, torch.float32).view(deterministic_dk_planes, batch * seqlen_k, dim)
             memset_zero_async(dIndexK_planes.data_ptr(), planes_bytes, _resolve_stream(current_stream))
             score_grad(
                 AttnScore,
@@ -4053,7 +4065,7 @@ def _build_cute_dsl_kernel(
                 TopkIndices,
                 current_stream=current_stream,
             )
-            reduce_deterministic_dk(dIndexK_planes, dIndexK, current_stream)
+            reduce_deterministic_dk(dIndexK_planes, dIndexK, deterministic_dk_planes, current_stream)
             return
 
         if dIndexK.dtype == torch.float32:

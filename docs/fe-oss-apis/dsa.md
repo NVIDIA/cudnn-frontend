@@ -621,11 +621,12 @@ indexer tower:
 3. Pure-torch dtype cast (kernel 3) converts `dIndexK_f32` to the output
    dtype.
 
-With `deterministic=True` on SM100 or SM103, kernel 2 launches up to 96 fixed
-producer CTAs and accumulates dK into a 96-plane CTA-private FP32 workspace.
-One CuTe DSL reduction kernel folds the planes in fixed CTA order, converting
-only once to the requested `d_index_k` dtype. The dQ and dW stores remain
-single-writer.
+With `deterministic=True` on SM100 or SM103, kernel 2 launches a fixed producer
+grid and accumulates dK into a CTA-private FP32 workspace. The compile-time
+`deterministic_dk_planes` specialization selects 96, 128, or 148 producer
+planes (default 96). One CuTe DSL reduction kernel folds the planes in fixed
+CTA order, converting only once to the requested `d_index_k` dtype. The dQ
+and dW stores remain single-writer.
 
 The plan owns no device memory. An fp32 `d_index_k` is the accumulator itself
 (zeroed on the launch stream inside `execute`); a BF16 `d_index_k` accumulates
@@ -645,13 +646,17 @@ plane and processes the fixed row stripe `cta`, `cta + num_ctas`, ...; the v2
 backend disables its ordinary dynamic ticket assignment for this path. The
 main GEMM therefore retains its existing Tensor Core math while dK has a fixed
 association order across launches. Scratch is exactly
-`ws_align(96 * B * S_k * D * sizeof(float))` for either backend. It is
+`ws_align(deterministic_dk_planes * B * S_k * D * sizeof(float))` for either
+backend. It is
 cleared on the launch stream at every execute, then reduced once in fixed
 plane order. A warmed plan with caller-provided outputs and workspace is CUDA
 Graph compatible. To capture the convenience wrapper, warm it first and pass
 every output plus `workspace=` explicitly; omitted buffers are allocated per
-call. As with the existing deterministic sparse-attention backward, valid IDs
-in a semantic top-k row are expected to be distinct.
+call. A fixed plane count is bitwise reproducible across runs; changing the
+plane count changes the FP32 accumulation grouping, so results from two plane
+counts are not required to be bitwise identical. As with the existing
+deterministic sparse-attention backward, valid IDs in a semantic top-k row are
+expected to be distinct.
 
 **The TileLang fallback present in the upstream repo is dropped here
 (CuTe-DSL only).** If the CuTe-DSL path fails the wrapper raises
@@ -663,6 +668,7 @@ result = DSA.indexer_backward_wrapper(
     index_q, weights, index_k,
     attn_score, index_score, topk_indices,
     grad_loss=grad_loss, sm_scale=1.0, loss_coeff=1.0, block_I=128,
+    deterministic=True, deterministic_dk_planes=128,
 )
 d_index_q, d_weights, d_index_k = (
     result["d_index_q"], result["d_weights"], result["d_index_k"],
@@ -767,8 +773,9 @@ the complete wrapper on the target shape when those properties are required.
   unless you pass `workspace=`, and still allocates any output buffer you do
   not pass in.
   With `deterministic=True`, the dense accumulator and counter region are
-  replaced by 96 FP32 planes regardless of the output dtype; deterministic
-  row ownership does not draw tickets.
+  replaced by `deterministic_dk_planes` FP32 planes regardless of the output
+  dtype; the accepted compile-time values are 96, 128, and 148, and
+  deterministic row ownership does not draw tickets.
 - **Concurrency** — executions that share one workspace buffer must not
   overlap on the device (ordinary launches would interleave ticket draws;
   deterministic launches would race on the same dK planes); a plan is bound
