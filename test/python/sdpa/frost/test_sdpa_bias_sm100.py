@@ -52,6 +52,14 @@ def test_row_claims_the_resident_bias_on_the_derived_shapes_and_budgets():
     # the streamed ring (the one-batch-entry item): 2 stages at the 32-wide tile's cga1, none at the 64-wide tile (cga1 holds no form, cga2 one tile)
     assert c0.sm100_bias_ring_stages(32, 1) == 2 and c0.sm100_bias_ring_stages(64, 1) == 0 and c0.sm100_bias_ring_stages(64, 2) == 0
     assert c0.sm100_bias_mode_pick(32, 1, 384) == 2 and c0.sm100_bias_mode_pick(32, 1, 256) == 1 and c0.sm100_bias_mode_pick(64, 2, 256) == 0
+    # the width pick: 128 by default; 64 for the fp32 vector WITH a bias, and by the BUDGET rule where only the 64-wide tile holds a form (D 64 above S_kv 128)
+    dom = frozenset({64, 128})
+    assert c0.sm100_tile_n_pick(32, 256, has_bias=True, has_kv_mask=False, domain=dom) == 128
+    assert c0.sm100_tile_n_pick(64, 128, has_bias=True, has_kv_mask=False, domain=dom) == 128  # cga2 holds one 128-wide tile
+    assert c0.sm100_tile_n_pick(64, 192, has_bias=True, has_kv_mask=False, domain=dom) == 64  # 3 resident 64-wide tiles at cga1
+    assert c0.sm100_tile_n_pick(64, 1024, has_bias=True, has_kv_mask=False, domain=dom) == 64  # the 3-stage ring at the 64-wide tile
+    assert c0.sm100_tile_n_pick(64, 192, has_bias=False, has_kv_mask=True, domain=dom) == 128  # the mask alone has no budget
+    assert c0.sm100_tile_n_pick(32, 256, has_bias=True, has_kv_mask=True, kv_mask_fp32=True, domain=dom) == 64
     # the heuristics' width pick = the row's: the narrowest width whose block holds S_kv
     assert c0.sm100_bias_auto_cga(32, 256, frozenset({1})) == 1
     assert c0.sm100_bias_auto_cga(64, 128, frozenset({1, 2})) == 2
@@ -126,7 +134,15 @@ _ADAPTER_CELLS = [
     ("bias d32 S1024 -> the streamed ring", dict(s_q=1024, s_kv=1024, bias=(1, 4, 1024, 1024)), True, (32, 32), 2, 0, 1),
     ("bias_mode=2 request at S256 (honoured)", dict(bias=(1, 4, 256, 256), bias_mode=2), True, (32, 32), 2, 0, 1),
     ("bias d64 S128 -> cga2 block", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128)), True, (64, 64), 1, 0, 2),
-    ("bias d64 S256 (no form on this line yet)", dict(d=64, s_q=256, s_kv=256, bias=(1, 4, 256, 256)), False, None, None, None, None),
+    (
+        "bias d64 S256 -> the 64-wide tile by the budget rule (4 resident tiles... the ring: 4 > 3)",
+        dict(d=64, s_q=256, s_kv=256, bias=(1, 4, 256, 256)),
+        True,
+        (64, 64),
+        2,
+        0,
+        1,
+    ),
     ("bias d64 S128 at a requested cga1 (holds no block)", dict(d=64, s_q=128, s_kv=128, bias=(1, 4, 128, 128), cga=1), False, None, None, None, None),
     ("kv_mask alone d32 S1024 (no budget)", dict(s_q=1024, s_kv=1024, kv_mask=(2, 1, 1, 1024)), True, (32, 32), 0, 1, 1),
     ("bias + bool kv_mask d32 S256", dict(bias=(1, 4, 256, 256), kv_mask=(2, 1, 1, 256)), True, (32, 32), 1, 1, 1),
@@ -183,7 +199,9 @@ def test_adapter_check_support_is_the_rows_twin(_sm100_device_for_the_adapter, n
     assert api.flavor == flavor, (name, api.flavor)
     params = api.template_params()
     assert (params.bias_mode, params.kv_mask_form) == (bias_mode, kv_mask_form), (name, params)
-    _want_tile_n = kw.get("tile_n", 64 if (kw.get("kv_mask_dtype") == torch.float32 and kw.get("bias") is not None) else 128)
+    _fp32_bias = kw.get("kv_mask_dtype") == torch.float32 and kw.get("bias") is not None
+    _budget_64 = kw.get("d", 32) == 64 and kw.get("bias") is not None and kw.get("s_kv", 256) > 128
+    _want_tile_n = kw.get("tile_n", 64 if (_fp32_bias or _budget_64) else 128)
     assert params.d_flavor == flavor[0] and params.cta_mma == cta_mma and params.n_chunk == 0 and params.tile_n == _want_tile_n, (name, params)
     _want_stages = 0 if bias_mode != 2 else (3 if _want_tile_n == 64 else 2)  # the derived deepest ring: 3 stages at the 64-wide KV tile, 2 at the 128-wide
     assert params.bias_stages == _want_stages and params.s_slots == 1 and params.q_in_tmem == 0 and params.softmax_wgs == 2, (name, params)
@@ -499,12 +517,15 @@ def test_pre_masked_tail_matches_the_oracle_and_the_legacy_body_bitwise_on_sm100
 
 @requires_sm100_line
 @pytest.mark.parametrize("case", _ABOVE_BUDGET)
-def test_declines_above_the_resident_budget_on_real_graphs(case):
-    """A bias graph no form holds at any width of the flavor's domain (the 64-wide tile at S_kv 256: cga2's block holds 128 and no ring fits)
-    proposes NO plan of the row -- a typed decline on the real graph, never a plan that fails at build."""
-    q, k, v, kw, _ = _t7._case_inputs(case, torch.bfloat16)
-    names = _frost_plan_names(q, k, v, kw)
-    assert not any(n == _ROW or n.startswith(_ROW + "[") for n in names), (case, names)
+def test_d64_bias_above_128_lands_on_the_64_wide_tile_by_the_budget_rule(case):
+    """A D 64 bias graph above S_kv 128 fits no form at the 128-wide tile (cga1 holds no block, cga2 one tile and no ring): the knob-less plan
+    takes the 64-wide KV tile by the budget rule -- tile_n 64, cga1, the 3-stage ring at S_kv 256 -- and matches the oracle (the Rubin cell ran
+    the same graph at the 128-wide tile's cga2 on its 320 KiB budget)."""
+    q, k, v, kw, ref = _t7._case_inputs(case, torch.bfloat16)
+    kw.pop("cga", None)  # the Rubin cell's cga2 request is the Rubin budget's; the knob-less pick is the point here
+    out = _run(q, k, v, **kw)
+    assert out["knobs"].tile_n == 64 and out["knobs"].cga == 1, (case, out["knobs"])
+    _t7._check(out, ref)
 
 
 @requires_sm100_line

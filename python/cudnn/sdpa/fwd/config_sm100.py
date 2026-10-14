@@ -2850,10 +2850,21 @@ def sm100_tile_n_pick(d_flavor: int, s_kv: int, *, has_bias: bool, has_kv_mask: 
     (``engines._bias_arm_decline``), the heuristics (``_resident_arm_tile_n``) and the adapter (``_effective_tile_n``), rule 8b'.
     The 128-wide tile everywhere (the SM100 default: the Rubin measured width table -- 64 for a bias with a kv_mask, for a bias at one or
     two kv tiles, on the padding leg -- is a Rubin PRIOR the GB200 sweep decides, NOT applied here), except the one form the 128-wide
-    rendering does not serve: the fp32 additive vector WITH a bias lands on :data:`SM100_FP32_VECTOR_WITH_BIAS_TILE_N`.  A width outside
+    rendering does not serve: the fp32 additive vector WITH a bias lands on :data:`SM100_FP32_VECTOR_WITH_BIAS_TILE_N`; and the BUDGET
+    rule -- 64 when no bias form holds ``s_kv`` at the 128-wide tile at any validated cga while one does at the 64-wide tile.  A width outside
     ``domain`` (the row's ``tile_ns_by_d_shape`` entry) falls back to the domain's minimum; a shape without a domain keeps 128."""
     dom = frozenset(domain) if domain is not None else frozenset({128})
     pick = SM100_FP32_VECTOR_WITH_BIAS_TILE_N if (has_bias and has_kv_mask and kv_mask_fp32) else 128
+    if has_bias and pick == 128 and 64 in dom and (int(d_flavor), int(d_flavor)) in SM100_SMALL_D_CGAS:
+        # The BUDGET rule (the only non-default pick without a measurement): when no bias form -- the resident block or a >= 2-stage ring --
+        # holds s_kv at the 128-wide tile at ANY validated cga of the flavor, while one does at the 64-wide tile, the plan takes the 64-wide
+        # tile (a D 64 bias graph above S_kv 128 fits only there on this line: cga1 holds no 128-wide block, cga2 one tile and no ring).
+        cgas = SM100_SMALL_D_CGAS[(int(d_flavor), int(d_flavor))]
+        if (
+            sm100_bias_auto_cga(int(d_flavor), int(s_kv), cgas, tile_n=128) is None
+            and sm100_bias_auto_cga(int(d_flavor), int(s_kv), cgas, tile_n=64) is not None
+        ):
+            pick = 64
     return pick if pick in dom else min(dom)
 
 
