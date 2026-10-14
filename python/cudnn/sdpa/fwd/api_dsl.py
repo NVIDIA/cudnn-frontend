@@ -670,6 +670,18 @@ def _thd_binder_serves_the_gate() -> bool:
     return bool(getattr(_pybind_module._SdpaThdBinder, "supports_epilogue_gate", False))
 
 
+def _binders_serve_the_paged_gate() -> bool:
+    """Whether this build's native binders bind the epilogue gate on a PAGED plan: the shared SM100 d256 half body compiled for
+    cc 10.7 carries the gate seams on its paged / THD / PackGQA arms (the serving EXTEND form), and both the THD binder (packed
+    queries) and the dense binder (dense queries past the decode tile) gained the role with it.  An older extension's constructors
+    refuse a gated paged plan, so the adapter declines typed instead of reaching that refusal at plan build."""
+    from cudnn import _pybind_module
+
+    return bool(getattr(_pybind_module._SdpaThdBinder, "supports_paged_epilogue_gate", False)) and bool(
+        getattr(_pybind_module._SdpaDenseBinder, "supports_paged_epilogue_gate", False)
+    )
+
+
 class SdpaFwdDsl(APIBase):
     """Implementation-agnostic interface for FROST DSL SDPA-forward kernels."""
 
@@ -2290,18 +2302,40 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # irrelevant); engines.mismatch lifts the same three through
             # d256_decode_tile_selected(..., split_kv) -- keep them in lockstep.
             _gate_in_combine = self._gate_in_combine_for(int(s_qo), int(h_qo), int(h_kv))
-            self._not_implemented_error_if(
-                self.paged and not _gate_in_combine,
-                "epilogue gate fusion with paged KV is not wired (the d256 decode tile's split applies the gate in its combine)",
+            # The gate on the PAGED d256 half PREFILL body: a Rubin paged half (256, 256) plan that is not a decode-shaped one
+            # loads the SHARED SM100 body (_load_sm100_kernel_module's paged arm: sm100/prefill_d256_f16.py compiled for sm_107a),
+            # whose paged / THD / PackGQA arms carry the gate seams -- the serving EXTEND form's SDPA (packed queries over the
+            # pools, PackGQA on or off) and dense paged queries past the decode tile alike; unsplit only (the split's partials
+            # bypass the gated epilogue).  The GRAPH rows keep their narrower claim (the graph's THD lowering binds no gate):
+            # a standalone adapter wider than the row is the admitted direction (rule 8b), never the reverse.
+            _gate_on_paged_prefill = (
+                self._device_cc == (10, 7)
+                and not self._fp8
+                and self.paged
+                and (int(d_qk), int(d_v)) == (256, 256)
+                and self.split_kv <= 1
+                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
             )
+            self._not_implemented_error_if(
+                _gate_on_paged_prefill and not _binders_serve_the_paged_gate(),
+                "epilogue gate fusion over paged KV needs the prepared binders' paged-gate role; this build's pybind extension "
+                "predates it (rebuild the extension, or run the gate as its own stage)",
+            )
+            # The split FIRST, so a split plan hears the feature it asked for (a paged split's decline would otherwise read "paged").
             self._not_implemented_error_if(
                 self.split_kv > 1 and not _gate_in_combine,
                 "epilogue gate fusion with split_kv > 1 is not supported: the combine would write the un-gated O "
                 "(the d256 decode tile's split applies the gate in its combine)",
             )
             self._not_implemented_error_if(
-                self.pack_gqa and not _gate_in_combine,
-                "epilogue gate fusion with PackGQA is not wired (the d256 decode tile's split applies the gate in its combine)",
+                self.paged and not _gate_in_combine and not _gate_on_paged_prefill,
+                "epilogue gate fusion with paged KV is served on the Rubin d256 half prefill body (unsplit, packed or dense queries "
+                "past the decode tile) and by the d256 decode tile's split combine; this plan is neither",
+            )
+            self._not_implemented_error_if(
+                self.pack_gqa and not _gate_in_combine and not _gate_on_paged_prefill,
+                "epilogue gate fusion with PackGQA is served on the Rubin d256 half PAGED prefill body (unsplit, packed queries) and by "
+                "the d256 decode tile's split combine; the dense d256 prefill kernel runs unpacked",
             )
             if _gate_in_combine:
                 # The gated combine is reached through the prepared dense launch only

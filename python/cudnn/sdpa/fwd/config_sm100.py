@@ -279,11 +279,15 @@ class TemplateParams:
 # ``paged_d_shapes`` and the adapter's check_support name the same set.
 _PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
 
-# The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature: no
-# SM100 kernel body reads CFG.EPILOGUE_GATE, so a module loaded with the flag on
-# this line would silently produce the UN-gated O. Empty on purpose; the Rubin
-# flavors that serve it are config_sm107._EPILOGUE_GATE_FLAVORS.
-_EPILOGUE_GATE_FLAVORS = frozenset()
+# The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature.  ONE body of this line reads
+# CFG.EPILOGUE_GATE: the SHARED f16/bf16 d256 prefill (sm100/prefill_d256_f16.py), whose paged / THD / PackGQA
+# arms the Rubin paged half (256, 256) route loads for sm_107a -- its gate seams (sGate, mb_gate_full / mb_gate_empty,
+# the TMA-LDG issue after the KV loop, the packed tanh epilogue) are the sm107 d256 body's, through the shared hook in
+# _common_blackwell; the gated rendering needs ~258 KiB of SMEM, so it exists on the 327 KiB Rubin carveout only (the
+# adapter admits the gate at cc 10.7 and nowhere else).  The quantized d256 bodies and every other flavor of this line
+# do NOT read the flag, so a module loaded with it there would silently produce the UN-gated O: _validate_params
+# refuses them by name.  The Rubin siblings that serve the gate are config_sm107._EPILOGUE_GATE_FLAVORS.
+_EPILOGUE_GATE_FLAVORS = frozenset({"d256"})
 
 # split_kv / cta_mma live on the TemplateParams shared by every SM100 flavor, but
 # a flavor only honours them once its make_cfg_* threads them into a Cfg AND its
@@ -496,8 +500,18 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
             raise ValueError(f"{flavor}: page_size must divide the 128-row KV tile or be a multiple of it; got {p}")
     elif k.page_size:
         raise ValueError(f"{flavor}: page_size requires paged_kv=True")
-    if k.epilogue_gate and flavor not in _EPILOGUE_GATE_FLAVORS:
-        raise ValueError(f"{flavor}: epilogue_gate is not wired on the SM100 line (served by the SM107 d256 kernels only)")
+    if k.epilogue_gate:
+        # Only the HALF d256 body of this line carries the gate seams (_EPILOGUE_GATE_FLAVORS above); the quantized d256
+        # bodies and every other flavor would trace an ungated epilogue and silently return O instead of O * sigmoid(G).
+        if flavor not in _EPILOGUE_GATE_FLAVORS or fp8:
+            raise ValueError(
+                f"{flavor}: epilogue_gate is wired on the f16/bf16 d256 body of this line only (the paged / THD / PackGQA prefill compiled "
+                f"for cc 10.7); the quantized d256 bodies and the other flavors are served by the SM107 d256 kernels (config_sm107)"
+            )
+        if k.split_kv > 1:
+            # A split's fp32 partials bypass the gated epilogue and the combine would write the un-gated O (the d256 decode
+            # tile's split applies the gate in ITS combine; this prefill body has no such arm).
+            raise ValueError(f"{flavor}: epilogue_gate with split_kv > 1 is not served on this body (the split partials bypass the gated epilogue)")
     if getattr(k, "mma_2x2", False):
         # The 2x2-datapath kernel exists for the half d512 flavor only (sm100/prefill_d512_f16_2x2.py).
         if flavor != "d512":
@@ -877,6 +891,32 @@ class CfgD256:
     PAGED_KV: int = 0
     PAGE_SIZE: int = 0
 
+    # Fused epilogue gate (O := O * sigmoid(G), TemplateParams.epilogue_gate), read by the SHARED f16/bf16 d256 body only
+    # (sm100/prefill_d256_f16.py; every seam folds on cutlass.const_expr(CFG.EPILOGUE_GATE), so 0 traces the pre-gate
+    # instruction stream byte for byte -- the render gate of the paged gate).  Appended: every existing record
+    # keeps its value.  GATE_BPE: bytes per gate element -- the gate is Q-dtype on the half body (2 B); every gate
+    # constant in the kernel (TMA box, swizzle, subtile walk) derives from THIS, never from BPE_O (config_sm107 has the
+    # e4m3-O lesson).
+    EPILOGUE_GATE: int = 0
+    GATE_BPE: int = 2
+
+
+def d256_gate_smem_bytes(cfg: CfgD256) -> int:
+    """The SMEM the GATED d256 half rendering allocates, from the SAME constants its arrays are declared with:
+    sQO (Q u O alias) + the K ring + the V ring + the 64 KiB gate staging tile + the fixed overhead (barriers, the
+    scheduler ring, the TMEM pointer, the 1024-B alignment pad of the first array; 2 KiB, config_sm107's figure)."""
+    operands = (
+        cfg.TILE_M * cfg.TILE_K + cfg.STAGES_KV * (cfg.TILE_N * cfg.TILE_K // cfg.CTA_MMA) + cfg.STAGES_KV * (cfg.TILE_O * cfg.TILE_N // cfg.CTA_MMA)
+    ) * cfg.BPE
+    gate = cfg.TILES_Q * cfg.TILE_M * cfg.TILE_O * cfg.GATE_BPE if cfg.EPILOGUE_GATE else 0
+    return operands + gate + 2 * 1024
+
+
+# The usable Rubin carveout the gated d256 rendering is checked against (config_sm107.SMEM_USABLE_BYTES: 320 KiB of the
+# 327 KiB capacity, never the capacity -- the d192 f16 50 %-zeros lesson).  The gated rendering (~258 KiB at STAGES_KV=2)
+# is past the 227 KiB SM100 cap, so it is a cc 10.7 rendering by construction; the adapter routes it there only.
+_D256_GATE_SMEM_USABLE_BYTES = 320 * 1024
+
 
 def _validate_cfg_d256(cfg: CfgD256) -> None:
     """Consistency checks on the (mostly hardcoded) d256 geometry."""
@@ -897,6 +937,15 @@ def _validate_cfg_d256(cfg: CfgD256) -> None:
         (cfg.CGA_M == cfg.CTA_MMA, "d256 flavor pairs CGA_M with CTA_MMA"),
         (cfg.CTA_MMA == (1 if fp8 else 2), "d256 SM100: FP8 requires CTA1; BF16/FP16 requires CTA2"),
         (cfg.STAGES_KV == 2, "d256 SM100 uses two full/half-width KV stages"),
+        (
+            not cfg.EPILOGUE_GATE or (not fp8 and cfg.SPLIT_KV == 1 and cfg.GATE_BPE == cfg.BPE == 2 and cfg.TILES_Q == 1),
+            "d256: the epilogue gate is the half body's unsplit arm (GATE_BPE == BPE == 2, TILES_Q == 1: one gate tile per Q tile)",
+        ),
+        (
+            not cfg.EPILOGUE_GATE or d256_gate_smem_bytes(cfg) <= _D256_GATE_SMEM_USABLE_BYTES,
+            f"d256: the gated rendering's SMEM ({d256_gate_smem_bytes(cfg) // 1024} KiB: Q/K/V/O + the 64 KiB gate tile + 2 KiB fixed) exceeds the "
+            f"{_D256_GATE_SMEM_USABLE_BYTES // 1024} KiB usable Rubin carveout",
+        ),
         (cfg.Q_SWZ_BYTES in (64, 128) and cfg.K_SWZ_BYTES in (64, 128), "d256: Q/K swizzle must be 64/128B"),
         (cfg.V_SWZ_BYTES in (32, 64, 128) and cfg.O_SWZ_BYTES in (64, 128), "d256: V/O swizzle out of range"),
         (cfg.TILES_Q == 1, "d256 pipeline mandates TILES_Q == 1"),
@@ -1086,6 +1135,9 @@ def _make_cfg_d256(params: TemplateParams, *, mxfp8: bool) -> Tuple[CfgD256, Tma
         PACK_G=_pack_g(params, CfgD256.TILE_M, partial=not fp8),
         PAGED_KV=int(params.paged_kv),
         PAGE_SIZE=int(params.page_size),
+        # The fused epilogue gate (the half body reads it; _validate_params refused it on the quantized bodies above).
+        EPILOGUE_GATE=int(params.epilogue_gate),
+        GATE_BPE=2,
     )
     _validate_cfg_d256(cfg)
     return cfg, _tma_iters(cfg)

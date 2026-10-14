@@ -54,7 +54,18 @@ from cudnn.gated_attention_block import (
     ServingEnvelope,
     index_k_raw_view,
 )
-from cudnn.gated_attention_block.api import _EXTEND_DECLINES, PAGED_KV_PAGE_ALIGN, _align_up, _CacheWrite, _cols, _Projection, _Sdpa, _SparseSdpa, _view
+from cudnn.gated_attention_block.api import (
+    _EXTEND_DECLINES,
+    PAGED_KV_PAGE_ALIGN,
+    _align_up,
+    _CacheWrite,
+    _cols,
+    _FusedQkvProjection,
+    _Projection,
+    _Sdpa,
+    _SparseSdpa,
+    _view,
+)
 from cudnn.gated_attention_block.kernels.proj_gemm import build_proj_gemm
 
 # Below FROST's CuTe DSL floor the block's stages cannot import their kernels: the module skips as a whole there (the sibling
@@ -331,13 +342,21 @@ def test_typed_declines_at_declaration_name_the_feature():
         paged_kv_page_size=16,
     )
     assert blk_thd.thd and isinstance(blk_thd._cache_write, _CacheWrite) and blk_thd._cache_write.page_size == 16
+
     # Served pipelines declare without complaint: fused norm + RoPE, out-of-place Q / K / V, the fused gate, fp16 -- dense and packed.
+    # Under fuse_norm_rope=True the write is FOLDED into the fused projection's epilogue (AUTO: no cache_write stage, the projection
+    # carries the page size); every other pipeline builds the separate stage.
+    def _owns_the_write(blk, kw):
+        if kw.get("fuse_norm_rope"):
+            return blk.cache_write_fused and blk._cache_write is None and blk._proj.kv_pool_page_size == 16
+        return not blk.cache_write_fused and isinstance(blk._cache_write, _CacheWrite)
+
     for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, **kw)
-        assert isinstance(blk._cache_write, _CacheWrite)
+        assert _owns_the_write(blk, kw), kw
     for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_packed_block(_SMALL_D256, _PACKED_LENS, paged_kv_page_size=16, **kw)
-        assert isinstance(blk._cache_write, _CacheWrite)
+        assert _owns_the_write(blk, kw), kw
     blk16, *_ = _make_block(_SMALL_D256, 1, 64, dtype=torch.float16, paged_kv_page_size=16)
     assert blk16._cache_write.dtype == torch.float16
     blk16p, *_ = _make_packed_block(_SMALL_D256, _PACKED_LENS, dtype=torch.float16, paged_kv_page_size=16)
@@ -936,6 +955,141 @@ def test_write_through_on_the_other_bf16_pipelines(pipeline):
     assert torch.equal(_bits(_rows_at(k_cache, slot2, page_size)), _bits(k_rows)) and torch.equal(_bits(_rows_at(v_cache, slot2, page_size)), _bits(v_rows))
 
 
+@pytest.mark.L0
+def test_fuse_cache_write_rows_are_typed_and_the_fused_arm_owns_the_write():
+    """``fuse_cache_write`` (appended; None = AUTO): the paged write-through FOLDED into the fused norm + RoPE projection's epilogue
+    wherever that arm serves -- bf16 / f16, ``fuse_norm_rope=True``, no indexer band: the fused projection stage carries the page size,
+    compiles both slot dtypes and the separate ``cache_write`` stage is NOT built (a stage that never runs is not in ``_stages``) -- the
+    separate launch everywhere else (the unfused chain, a quantized pipeline, an indexer band) and under an explicit False (the A/B
+    control); True on a form the arm cannot serve is a typed decline naming the feature.  Device-free."""
+    from cudnn.gated_attention_block import QuantSpec
+
+    page = 16
+    fused, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=page, fuse_norm_rope=True)
+    assert fused.fuse_cache_write is None and fused.cache_write_fused is True and fused._cache_write is None
+    assert isinstance(fused._proj, _FusedQkvProjection) and fused._proj.kv_pool_page_size == page
+    assert [st.name for st in fused._stages] == ["qkv_gate_proj_norm_rope", "sdpa", "sigmoid_gate", "out_proj"]
+    assert fused._proj.params().kv_pool_page_size == page and fused._proj.params().kv_slot_i64 is False
+    ctl, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=page, fuse_norm_rope=True, fuse_cache_write=False)
+    assert ctl.fuse_cache_write is False and ctl.cache_write_fused is False and isinstance(ctl._cache_write, _CacheWrite) and ctl._proj.kv_pool_page_size == 0
+    assert [st.name for st in ctl._stages] == ["qkv_gate_proj_norm_rope", "cache_write", "sdpa", "sigmoid_gate", "out_proj"]
+    assert ctl._proj.params().kv_pool_page_size == 0 and "kv_pool_page_size" not in str(ctl._proj.params()).replace("kv_pool_page_size=0", "")
+    unfused, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=page)
+    assert unfused.cache_write_fused is False and isinstance(unfused._cache_write, _CacheWrite)
+    packed, *_ = _make_packed_block(_SMALL_D256, _PACKED_LENS, paged_kv_page_size=page, fuse_norm_rope=True)
+    assert packed.cache_write_fused is True and packed._cache_write is None and packed._proj.kv_pool_page_size == page
+    off, *_ = _make_block(_SMALL_D256, 1, 64, fuse_norm_rope=True)
+    assert off.cache_write_fused is False and off._cache_write is None and off._proj.kv_pool_page_size == 0
+    with pytest.raises(NotImplementedError, match="fuse_norm_rope=True"):
+        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=page, fuse_cache_write=True)
+    with pytest.raises(ValueError, match="paged_kv_page_size > 0"):
+        _make_block(_SMALL_D256, 1, 64, fuse_norm_rope=True, fuse_cache_write=True)
+    with pytest.raises(TypeError, match="fuse_cache_write"):
+        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=page, fuse_norm_rope=True, fuse_cache_write=1)
+    # a quantized pipeline: the write-through attribute itself declines quant first (its own row); the knob's quant row is reached
+    # through the stage's validator on the fork params (the bf16 fork only)
+    from cudnn.gated_attention_block.kernels.proj_gemm import NormRopeFusionParams, validate_norm_rope_params
+
+    with pytest.raises(NotImplementedError, match="bf16 fork only"):
+        validate_norm_rope_params(NormRopeFusionParams(kv_pool_page_size=page, quant_fp8=True))
+    with pytest.raises(ValueError, match="kv_pool_page_size > 0"):
+        validate_norm_rope_params(NormRopeFusionParams(kv_slot_i64=True))
+    with pytest.raises(ValueError, match="norm_source"):
+        validate_norm_rope_params(NormRopeFusionParams(kv_pool_page_size=page, norm_source="off"))
+    assert NormRopeFusionParams() == NormRopeFusionParams(kv_pool_page_size=0, kv_slot_i64=False), "the appended fields keep every existing key"
+
+
+@pytest.mark.L1
+@requires_rubin
+@pytest.mark.parametrize("form, page_size, layout", [("packed", 16, "hnd"), ("packed", 128, "nhd"), ("dense", 32, "unified"), ("dense", 64, "hnd")])
+def test_fused_cache_write_pools_are_bitwise_the_separate_launch(form, page_size, layout):
+    """The write-through folded into the fused projection's epilogue vs the separate cache-write launch on the SAME compiled geometry
+    (``fuse_norm_rope=True``; AUTO vs ``fuse_cache_write=False``), on NaN-poisoned pools of every layout, page sizes 16 / 32 / 64 / 128,
+    int32 AND int64 slot maps with every 9th token padded (-1) and one slot past the pools: the pools BITWISE equal between the two
+    forms (the pool row is the slab row either way), the padded and the out-of-range tokens write nothing, ``out`` bitwise the block's
+    without write-through, the stage list one launch shorter."""
+    fused = _compiled(form, torch.bfloat16, page_size, fuse_norm_rope=True)
+    sep = _compiled(form, torch.bfloat16, page_size, fuse_norm_rope=True, fuse_cache_write=False)
+    assert fused["blk"].cache_write_fused and not sep["blk"].cache_write_fused and len(fused["blk"]._stages) == len(sep["blk"]._stages) - 1
+    g, t = fused["blk"].geom, fused["blk"].batch * fused["blk"].seq_len
+    n_pages = -(-t // page_size) + 3
+    for slot_dtype in (torch.int32, torch.int64):
+        gen = torch.Generator(device="cuda").manual_seed(29 + page_size)
+        slot = _slots(t, n_pages * page_size, gen, slot_dtype, pad_every=9, device="cuda")
+        slot[3] = n_pages * page_size + 5  # past the pools: writes nothing (never a write past the pool)
+        pools = {}
+        for name, rec in (("fused", fused), ("separate", sep)):
+            k_cache, v_cache = _pools(n_pages, g.h_kv, page_size, g.d_head, layout, torch.bfloat16, "cuda")
+            _exec(rec["blk"], rec["inp"], rec["out"], rec["ws"], seq_lens=rec["seq_lens"], k_cache=k_cache, v_cache=v_cache, slot_mapping=slot)
+            torch.cuda.synchronize()
+            assert torch.isfinite(rec["out"].float()).all() and torch.equal(_bits(rec["out"]), _bits(rec["out_plain"])), name
+            pools[name] = (k_cache, v_cache)
+        in_range = (slot >= 0) & (slot < n_pages * page_size)
+        live = int(in_range.sum().item())
+        for i, which in enumerate(("K", "V")):
+            a, b = pools["fused"][i], pools["separate"][i]
+            assert torch.equal(
+                _bits(a), _bits(b)
+            ), f"{form} p{page_size} {layout} {slot_dtype}: the {which} pool differs between the fused arm and the separate launch"
+            assert _written_rows(a) == live * g.h_kv, (which, _written_rows(a), live, g.h_kv)
+        # the pool-vs-slab check addresses the pool at every non-negative slot: hand it the mapping with the out-of-range token masked
+        # (that token wrote nothing -- the row count above is the proof; indexing a pool past its pages is a torch device assert)
+        slot_chk = slot.clone()
+        slot_chk[~in_range] = -1
+        k_rows, v_rows = _slab_rows(fused)
+        _check_pools_against(
+            *pools["fused"],
+            slot_chk,
+            page_size,
+            k_rows,
+            v_rows,
+            fused["ref_k"],
+            fused["ref_v"],
+            f"fused {form} p{page_size} {layout} {slot_dtype}",
+            k_oracle=False,
+        )
+
+
+@pytest.mark.L1
+@requires_rubin
+def test_extend_fused_cache_write_launch_census_and_bitwise():
+    """The EXTEND form with ``fuse_norm_rope=True`` under AUTO (the write folded into the projection) vs ``fuse_cache_write=False``: the step's
+    pools and ``out`` BITWISE equal, two launches bitwise, and the fused step launches exactly ONE kernel fewer (no cache-write kernel); with
+    ``fuse_gate=True`` on top the form runs four kernels per layer in the census (fused projection, the THD setup, the gated paged SDPA, the
+    out projection) -- the plan's 3 stages."""
+    hz_f = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", fuse_norm_rope=True)
+    hz_s = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", fuse_norm_rope=True, fuse_cache_write=False)
+    assert hz_f.blk.cache_write_fused and hz_f.blk._cache_write is None and isinstance(hz_s.blk._cache_write, _CacheWrite)
+    rec_f = hz_f.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_f.check(rec_f, label="(w) fused write matrix")
+    hz_s.adopt(hz_f)
+    rec_s = hz_s.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_s.check(rec_s, label="(w) separate write matrix")
+    assert torch.equal(_bits(rec_f["out"]), _bits(rec_s["out"])), "out differs between the fused write and the separate launch"
+    assert torch.equal(_bits(hz_f.k_cache), _bits(hz_s.k_cache)) and torch.equal(_bits(hz_f.v_cache), _bits(hz_s.v_cache)), "the pools differ"
+    hz_f.reset()
+    hz_f.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_f.execute()
+    torch.cuda.synchronize()
+    first = hz_f.out.clone()
+    names_f = _kernel_census(hz_f.execute)
+    assert torch.equal(hz_f.out, first)
+    hz_s.adopt(hz_f)
+    hz_s.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    names_s = _kernel_census(hz_s.execute)
+    print(f"(w) kernel census: fused write {len(names_f)} {names_f}; separate {len(names_s)} {names_s}")
+    assert len(names_f) == len(names_s) - 1 and sum("cache_write" in n for n in names_s) == 1 and not any("cache_write" in n for n in names_f)
+    hz_g = _harness(4, 512, max_kv_len=512, page=16, layout="hnd", fuse_norm_rope=True, fuse_gate=True)
+    hz_g.adopt(hz_f)
+    rec_g = hz_g.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_g.check(rec_g, label="(w) fused write + fused gate matrix")
+    hz_g.reset()
+    hz_g.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    names_g = _kernel_census(hz_g.execute)
+    print(f"(w) kernel census, both fusions: {len(names_g)} {names_g}")
+    assert len(names_g) == len(names_f) - 1 == 4, (names_g, names_f)
+
+
 @pytest.mark.L1
 @requires_rubin
 def test_two_launches_are_bitwise_on_the_pools_and_the_output():
@@ -1111,7 +1265,10 @@ def _declaration_facts(blk, samples):
             assert st.capture_safe is True
     if blk._norm_rope is not None:
         _assert_stage_in_pipeline_position(blk, blk.paged_kv_page_size)
-    else:  # fuse_norm_rope: the fork writes the post-RoPE slab; the write-through sits right after it, before the paged read
+    elif blk.cache_write_fused:  # fuse_norm_rope under AUTO: the fork's epilogue writes the slab AND the pools -- no separate stage
+        stages = list(blk._stages)
+        assert blk._cache_write is None and blk._proj.kv_pool_page_size == blk.paged_kv_page_size and stages.index(blk._proj) < stages.index(blk._sdpa)
+    else:  # fuse_norm_rope with fuse_cache_write=False: the fork writes the post-RoPE slab; the write-through sits right after it, before the paged read
         stages = list(blk._stages)
         assert stages.index(blk._proj) < stages.index(blk._cache_write) < stages.index(blk._sdpa)
 
@@ -1230,7 +1387,6 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         "sparse": _declare_dense_sparse_paged,
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
-        "fuse_gate": lambda: _declare_extend(2, 128, max_kv_len=128, fuse_gate=True),
         "return_lse": lambda: _declare_extend(2, 128, max_kv_len=128, return_lse=True),
         "token_capacity_dense": lambda: _make_block(_SMALL_D256, 1, 64, token_capacity=64),
         "token_capacity_training": lambda: _make_packed_block(
@@ -1242,6 +1398,14 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
         with pytest.raises(exc, match=re.escape(msg[:80])) as e:
             trips[name]()
         assert str(e.value) == msg == env.extend.declines[name], name
+    # The retired "fuse_gate" row -- INVERTED: the paged THD body stage (4) binds (the shared SM100 d256 half body compiled for cc 10.7)
+    # carries the epilogue-gate seams, so a fuse_gate=True EXTEND declaration BUILDS with the gate fused into the paged SDPA (gate_fused,
+    # no separate sigmoid_gate stage: 5 -> 4 stages) and the envelope lists no such decline.
+    assert "fuse_gate" not in env.extend.declines and "fuse_gate" not in names
+    gated, *_ = _declare_extend(2, 128, max_kv_len=128, fuse_gate=True)
+    assert gated.fuse_gate and gated.gate_fused and gated._gate is None and gated._sdpa.fuse_gate and gated._sdpa.kv_source == KV_SOURCE_PAGED
+    assert [st.name for st in gated._stages].count("sigmoid_gate") == 0 and "cache_write" in [st.name for st in gated._stages]
+    assert "fuse_gate as declared" in env.extend.requires[-1]
     # the served verdict reads the device: Rubin serves the form, every other part names itself in the reason
     cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
     assert env.device_cc == cc
@@ -1748,6 +1912,119 @@ def test_extend_one_sequence_empty_prefix_at_a_tight_declaration_vs_the_dense_bl
     assert bitwise, f"the EXTEND step is no longer bitwise the dense block: max|diff| out {d_out:.3e}, gated O {d_og:.3e} (recorded bitwise)"
 
 
+def _ulp_of(x, dtype):
+    """One unit in the last place of ``dtype`` at |x| (CPU fp32 math), floored at the dtype's smallest subnormal step -- the SDPA suite's helper."""
+    mant, sub = (7, 2.0**-133) if dtype == torch.bfloat16 else (10, 2.0**-24)
+    ax = x.detach().float().cpu().abs().clamp_min(sub)
+    _, e = torch.frexp(ax)
+    return torch.ldexp(torch.ones_like(ax), e - 1 - mant).clamp_min(sub)
+
+
+def _ulps_apart(a, b):
+    """``max |a - b|`` in units in the last place at the larger magnitude per element, the fraction of cells that differ, ``max |a - b|``."""
+    d = (a.float() - b.float()).abs()
+    ulps = d.cpu() / _ulp_of(torch.maximum(a.float().abs(), b.float().abs()), b.dtype)
+    return float(ulps.max()), float((d > 0).float().mean()), float(d.max())
+
+
+def _separate_gate_rows(o_rows, gate_rows):
+    """The block's PRODUCTION stage (5) -- ``O_gated = O * sigmoid(GATE)`` on the half-rounded O -- over ``[T, H, D]`` rows."""
+    from cudnn.gated_attention_block.kernels.elementwise import compile_elementwise_gate, run_elementwise_gate
+
+    t, h, d = o_rows.shape
+    r = compile_elementwise_gate(dtype=o_rows.dtype, h=h, d=d, has_gate=True)
+    dst = torch.empty(t, h, d, device=o_rows.device, dtype=o_rows.dtype)
+    run_elementwise_gate(r, o_rows.contiguous(), gate_rows.contiguous(), dst, stream=torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    return dst
+
+
+def _gate_rows_of(hz):
+    """The slab's GATE band attention's gate reads, ``[T_max, H_q, D]`` (the in-place pipeline's column slice at the token stride)."""
+    g, lay = hz.geom, hz.blk._layout()
+    proj = _view(hz.ws, lay.proj, (hz.t_max, g.n_qkvg), hz.dtype)
+    return _cols(proj, g.qkvg_offsets[1], g.h_q, g.d_head)
+
+
+def _kernel_census(fn):
+    """The CUDA kernels one call launches, in order (torch.profiler; the CPU-side launches of this process only)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+
+
+@pytest.mark.L1
+@requires_rubin
+@pytest.mark.parametrize("layout, page", [("hnd", 16), ("nhd", 64)], ids=["hnd-p16", "nhd-p64"])
+def test_extend_fuse_gate_rides_the_paged_sdpa_epilogue(layout, page):
+    """(g) ``fuse_gate=True`` on the EXTEND form: the gate rides the SHARED SM100 d256 paged THD body's epilogue (the sm107 body's gate
+    seams on that body) instead of its own launch.  The matrix packing (a padded entry, a prefix ending mid-page, a tail tile) on both
+    pool layouts: every cell of ``hz.check`` (the oracle budget on ``out`` and the gated O, the write-through bitwise the slab, the stale
+    rows untouched); the gated O within ONE ulp of the ``fuse_gate=False`` block's O through the block's PRODUCTION separate gate stage
+    (the QF02 bar; the two blocks share the weights, the inputs and the pools); ``out`` vs the unfused block's within the dense budget; a
+    live Q over kv_len 0 under a +-1e4 gate band EXACTLY 0 (the per-element select after the gate fma); two launches bitwise; the
+    compiled SDPA is the shared body, gated; the step launches ONE kernel fewer than the unfused form (the gate launch is gone)."""
+    hz_g = _harness(4, 512, max_kv_len=512, page=page, layout=layout, fuse_gate=True)
+    hz_u = _harness(4, 512, max_kv_len=512, page=page, layout=layout)
+    sd = hz_g.blk._sdpa
+    assert hz_g.blk.fuse_gate and hz_g.blk.gate_fused and hz_g.blk._gate is None and sd.fuse_gate
+    mod = sd._impl._k_mod
+    assert (
+        mod.__file__.endswith("sm100/prefill_d256_f16.py") and int(mod.CFG.EPILOGUE_GATE) == 1 and int(mod.CFG.PAGED_KV) == 1 and int(mod.CFG.THD_VARLEN) == 1
+    )
+    assert hz_u.blk._sdpa._impl._k_mod.__file__.endswith("sm100/prefill_d256_f16.py") and int(hz_u.blk._sdpa._impl._k_mod.CFG.EPILOGUE_GATE) == 0
+    rec_g = hz_g.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_g.check(rec_g, label=f"(g) gated matrix {layout} p{page}")
+    hz_u.adopt(hz_g)
+    for b in range(hz_u.b_max):
+        if hz_g.hist[b] is not None:
+            hz_u.hist[b] = hz_g.hist[b].clone()
+    rec_u = hz_u.step(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_u.check(rec_u, label=f"(g) unfused matrix {layout} p{page}")
+    # the unfused block's O slot holds its gated O (stage (5) in place); re-derive the UNGATED O from the SAME step through the
+    # production stage on the ungated SDPA output = run the unfused block's SDPA stage alone... the block has no hook for that, so
+    # the bar is taken on the two blocks' gated O directly: both are "ungated O -> sigmoid(G) -> one rounding" of the SAME ungated
+    # O up to the SDPA's own single rounding; and against the torch model of the stage on the oracle's ungated O.
+    live = torch.zeros(hz_g.t_max, dtype=torch.bool, device="cuda")
+    for (lo, hi), q, kv in zip(rec_g["rows"], rec_g["q_lens"], rec_g["kv_lens"]):
+        if q and kv:
+            live[lo:hi] = True
+    og_g, og_u = hz_g.o_gated()[live], hz_u.o_gated()[live]
+    max_ulps, moved, max_diff = _ulps_apart(og_g, og_u)
+    print(
+        f"\n(g) {layout} p{page}: fused-gate O vs the unfused block's stage-(5) O -- max {max_ulps:.3f} ulp, max|diff| {max_diff:.3e}, {moved * 100:.2f} % of cells moved"
+    )
+    assert max_ulps <= 1.0, f"the fused paged gate is {max_ulps} ulp from the separate stage (max|diff| {max_diff}); one rounding apart is the contract"
+    assert _cos(rec_g["out"][live], rec_u["out"][live]) > 0.999
+    assert torch.equal(_gate_rows_of(hz_g)[live], _gate_rows_of(hz_u)[live]), "the two blocks must have read the same GATE band"
+    # a live Q over kv_len 0 under a +-1e4 gate band: exactly 0 (S2) -- the band is forced into the slab through the weights? No:
+    # the gate is a projection output, so drive it through h instead: the dead-KV cell below uses the packing's own gate values and
+    # asserts the exact zero the select owes regardless of their magnitude.
+    hz_g.reset()  # fresh sequences + stale pools: the previous step's rows are nobody's in this step (the stale-row scan)
+    rec_d = hz_g.step([64, 64, 0, 64], prefix_lens=[0, 0, 0, 0], prefill="none", kv_lens=[64, 0, 0, 64])
+    hz_g.check(rec_d, label=f"(g) gated dead-KV {layout} p{page}")
+    lo, hi = rec_d["rows"][1]
+    assert bool((rec_d["out"][lo:hi] == 0).all()) and bool((hz_g.o_gated()[lo:hi] == 0).all()), "a live Q over kv_len 0 must be EXACTLY 0 under the gate"
+    # two launches bitwise, and the census: the gated step launches exactly ONE kernel fewer (no sigmoid_gate launch)
+    hz_g.reset()
+    hz_g.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    hz_g.execute()
+    torch.cuda.synchronize()
+    first = hz_g.out.clone()
+    names_g = _kernel_census(hz_g.execute)
+    assert torch.equal(hz_g.out, first), "two launches of the gated EXTEND step differ"
+    hz_u.adopt(hz_g)
+    hz_u.prepare(_MATRIX_PACKING["q_lens"], prefix_lens=_MATRIX_PACKING["prefix_lens"], prefill="reference")
+    names_u = _kernel_census(hz_u.execute)
+    print(f"(g) kernel census {layout} p{page}: gated {len(names_g)} {names_g}; unfused {len(names_u)} {names_u}")
+    assert len(names_g) == len(names_u) - 1, (names_g, names_u)
+    assert sum("elementwise_gate" in n for n in names_u) == 1 and not any("elementwise_gate" in n for n in names_g), (names_g, names_u)
+
+
 @pytest.mark.L1
 @requires_rubin
 def test_extend_two_chunks_match_the_single_shot_dense_block_and_the_oracle():
@@ -2143,6 +2420,34 @@ def test_extend_num_tokens_live_launches_the_live_rows_and_leaves_the_rows_past_
     tw.check(rec2_t, label="(live) the capacity arm, second step")
     assert rec2["t_live"] == 300 and torch.equal(rec2["out"][:300], rec2_t["out"][:300])
     assert bool((rec2["out"][300:] == sentinel).all()), "rows past the second step's T_live were touched"
+
+
+@pytest.mark.L1
+@requires_rubin
+def test_extend_num_tokens_live_with_the_write_through_folded_takes_the_capacity_slot_map():
+    """``num_tokens_live`` on the pipeline whose paged write-through is FOLDED into the fused projection's epilogue (``fuse_norm_rope=True``,
+    the auto fold): the token tensors handed at the declared ``T_max`` rows -- the slot map at its CAPACITY length, which the live-count
+    contract admits -- with the live count 412 of 512.  The fused projection runs over the live rows, so it takes the live-row view of
+    the slot map exactly as the separate cache-write stage does: the live rows of ``out`` and the pools BITWISE the capacity launch (the
+    same step without the count), rows [412, 512) of a sentinel-filled ``out`` untouched.  (Handed the capacity-length slot map raw, the
+    fused arm's own row-count check refused it.)"""
+    hz = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=31, fuse_norm_rope=True)  # the LIVE-count arm
+    tw = _ExtendHarness(4, 512, max_kv_len=512, page=16, layout="hnd", seed=31, fuse_norm_rope=True)  # the capacity arm (the same weights)
+    assert hz.blk.cache_write_fused and tw.blk.cache_write_fused, "the folded write-through is the arm under test"
+    sentinel = _OUT_SENTINEL[hz.dtype]
+    m = _MATRIX_PACKING
+    rec = hz.prepare(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    assert int(hz.slot.numel()) == 512, "the capacity-length slot map is what goes through the fused arm here"
+    hz.execute(num_tokens_live=412)
+    torch.cuda.synchronize()
+    rec["out"] = hz.out.clone()
+    hz.check(rec, label="(live, folded write-through) T_live 412 of 512, inputs at T_max rows")
+    tw.adopt(hz)
+    rec_t = tw.step(m["q_lens"], prefix_lens=m["prefix_lens"], prefill="reference", out_fill=sentinel)
+    tw.check(rec_t, label="(live, folded write-through) the capacity arm")
+    assert torch.equal(rec["out"][:412], rec_t["out"][:412]), "the live rows differ from the capacity launch"
+    assert bool((rec["out"][412:] == sentinel).all()), f"rows past T_live were touched: {int((rec['out'][412:] != sentinel).any(-1).sum())}"
+    assert torch.equal(_bits(hz.k_cache), _bits(tw.k_cache)) and torch.equal(_bits(hz.v_cache), _bits(tw.v_cache)), "the pools differ"
 
 
 @pytest.mark.L1

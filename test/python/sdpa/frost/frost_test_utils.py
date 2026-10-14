@@ -291,6 +291,11 @@ def launch_f16(
         # hosts that do not carry them.
         ragged_q_addr=0,
         ragged_q_div=1,
+        # The d256 half bodies' epilogue-gate slots (a pointer + a runtime stride triple, required by their host ABI): the gate is a
+        # module specialization no direct test enables, so this is the no-gate pair the binders fill; filtered out for hosts that
+        # do not carry them.
+        gate_ptr=None,
+        gate_strides=(0, 0, 0),
     )
     params = set(inspect.signature(host if host is not None else fn).parameters)
     fn(**{name: value for name, value in kw.items() if name in params}, stream=stream)

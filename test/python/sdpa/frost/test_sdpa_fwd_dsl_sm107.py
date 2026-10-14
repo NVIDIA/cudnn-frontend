@@ -2125,7 +2125,11 @@ def test_sm107_gate_template_loads_for_d256_only():
     """The config backstop behind the rows: a gated (256, 256) module loads on
     BOTH dtype families with ``CFG.EPILOGUE_GATE == 1``; every other flavor
     raises at config build (a body without the seams would trace an ungated
-    epilogue and silently return O instead of O * sigmoid(G))."""
+    epilogue and silently return O instead of O * sigmoid(G)).  The SM100
+    line's HALF d256 body -- the shared paged / THD / PackGQA prefill the Rubin
+    paged route loads -- carries the seams too (the paged gate), so
+    it loads gated under ``config_sm100`` while its quantized siblings and the
+    other SM100 flavors keep the refusal."""
     f16, fp8 = _gate_kernel_modules()
     assert f16.CFG.EPILOGUE_GATE == 1 and fp8.CFG.EPILOGUE_GATE == 1
     assert f16.CFG.GATE_BPE == 2 and fp8.CFG.GATE_BPE == 2, "the gate is 2 B/elem on both kernels (Q dtype / bf16)"
@@ -2143,20 +2147,38 @@ def test_sm107_gate_template_loads_for_d256_only():
     for flavor in ((128, 128), (192, 128), (512, 512)):
         with pytest.raises(ValueError, match="epilogue_gate"):
             _load(flavor, rubin=True, epilogue_gate=True, **_MXFP8_LOAD_KW)
-    # The SM100 line has no gated body at all.
-    with pytest.raises(ValueError, match="epilogue_gate"):
-        _load(_D256, rubin=False, epilogue_gate=True)
+    # The SM100 line's gated body: the HALF d256 prefill ONLY (config_sm100._EPILOGUE_GATE_FLAVORS = {"d256"} for half
+    # inputs); the quantized d256 bodies and every other flavor of that line refuse by name.  The gated rendering needs
+    # ~258 KiB of SMEM (the 64 KiB gate tile after the 192 KiB of operands), so it is a cc 10.7 rendering -- the adapter
+    # routes it there only -- but the CONFIG admits the record on either line (one config, one body).
+    sm100_gate = _load(_D256, rubin=False, epilogue_gate=True)
+    assert sm100_gate.CFG.EPILOGUE_GATE == 1 and sm100_gate.CFG.GATE_BPE == 2 and sm100_gate.__file__.endswith("sm100/prefill_d256_f16.py")
+    for quant_kw in (_FP8_LOAD_KW, _MXFP8_LOAD_KW):
+        with pytest.raises(ValueError, match="epilogue_gate"):
+            _load(_D256, rubin=False, epilogue_gate=True, **quant_kw)
+    for flavor in ((128, 128), (192, 128), (512, 512)):
+        with pytest.raises(ValueError, match="epilogue_gate"):
+            _load(flavor, rubin=False, epilogue_gate=True)
     # The feature interactions are refused by the config too (backstop of the rows / adapter twin).
-    for bad in (
-        dict(split_kv=2),
-        dict(pack_gqa=True, qh_per_kh=4),
-        dict(paged_kv=True, page_size=128, seq_kv_lens_present=True),
-    ):
+    for bad in (dict(split_kv=2), dict(pack_gqa=True, qh_per_kh=4)):
         # split_kv > 1 is refused by the (earlier) SplitHelpers guard on this flavor; the rest by the gate rule.
         with pytest.raises(ValueError, match="epilogue_gate|split_kv > 1 is not wired"):
             _load(_D256, rubin=True, epilogue_gate=True, **bad)
         with pytest.raises(ValueError, match="epilogue_gate|split_kv > 1 is not wired"):
             _load(_D256, rubin=True, epilogue_gate=True, **{**_MXFP8_LOAD_KW, **bad})
+    # Paged x gate -- INVERTED on the half route (the paged gate): a Rubin paged half d256 record loads the SHARED SM100 body with the
+    # gate ON (packed or dense queries, PackGQA on or off: the body's own arms); the MXFP8 pools keep config_sm107's refusal,
+    # and the split on the paged body is refused by config_sm100 (its fp32 partials bypass the gated epilogue).
+    paged = dict(paged_kv=True, page_size=128, seq_kv_lens_present=True)
+    for extra in ({}, dict(thd_varlen=True), dict(thd_varlen=True, pack_gqa=True, qh_per_kh=4)):
+        pg = _load(_D256, rubin=True, epilogue_gate=True, **paged, **extra)
+        # the module TAG is the Rubin route's (sdpa_fwd_sm107_<tag>_paged); the BODY is the shared SM100 file
+        assert pg.CFG.EPILOGUE_GATE == 1 and pg.CFG.PAGED_KV == 1 and pg.__file__.endswith("sm100/prefill_d256_f16.py"), (extra, pg.__file__)
+        assert pg.CFG.PACK_GQA == int(bool(extra.get("pack_gqa"))) and pg.CFG.THD_VARLEN == int(bool(extra.get("thd_varlen")))
+    with pytest.raises(ValueError, match="epilogue_gate"):
+        _load(_D256, rubin=True, epilogue_gate=True, **{**_MXFP8_LOAD_KW, **paged})
+    with pytest.raises(ValueError, match="epilogue_gate"):
+        _load(_D256, rubin=True, epilogue_gate=True, split_kv=2, thd_varlen=True, **paged)
     # THD x gate -- INVERTED for the f16/bf16 body (the THD gate descriptor: the gated THD module LOADS, the dense gated
     # body under the packed gate map), still refused by name on the quantized bodies (they build a dense gate map).
     thd_gate = _load(_D256, rubin=True, epilogue_gate=True, thd_varlen=True)
@@ -3253,6 +3275,439 @@ def test_sm107_thd_gate_keyless_sequence_is_exactly_zero_and_a_zero_length_seque
         ref_o, ref_lse = _gate_reference(_bhsd(q[lo:hi]), _bhsd(k[klo:khi]), _bhsd(v[klo:khi]), _bhsd(gate[lo:hi]), causal=True, scale=d**-0.5)
         torch.testing.assert_close(_bhsd(out[lo:hi]).float(), ref_o, **_GATE_O_TOL)
         torch.testing.assert_close(lse[lo:hi].t().unsqueeze(0), ref_lse, **_GATE_LSE_TOL)
+
+
+# ============================================================================
+# Fused epilogue gate on the SHARED SM100 d256 half body compiled for sm_107a -- the PAGED / THD / PackGQA prefill
+# (the gated attention block's EXTEND form: packed queries over paged pools).
+#
+# The gate seams of the sm107 d256 body (the shared hook in _common_blackwell) on the body the Rubin paged half (256, 256)
+# route loads: two LOCAL barriers (mb_gate_full TMA_LOAD init 1 / mb_gate_empty THREAD init 128), the 64 KiB gate
+# staging tile after the V ring (every MMA operand root stays under the version-0 window), the gate load issued after
+# the kv loop on BOTH arms of the TMA-LDG tile loop, the packed tanh epilogue with the dead-row SELECT after the fma.
+# The gate tile's TMA box is the Q / O box's PACKED-ROW convention, so PackGQA rows read their own gate rows.  The
+# ungated renderings are byte-identical on sm_100a AND sm_107a (the md5 record below); the gated ones compile only on
+# the 327 KiB Rubin carveout (~258 KiB of SMEM).  Cells: the host pins (the config, the adapter twin, the binder role,
+# the render gate) and the Rubin cells (the oracle, the ONE-ulp bar against the separate gate stage, PackGQA, B = 1 vs
+# the dense gated sm107 rendering, keyless rows exactly 0).
+# ============================================================================
+
+# md5 of the cubins of the SHARED SM100 d256 half body, trace-compiled for BOTH archs, recorded BEFORE the gate seams
+# were added (the ungated renderings must not move on either line: every seam folds on const_expr, every new kernel
+# argument is Optional[...] = None) plus the two gated sm_107a renderings recorded WITH the seams (the next change to
+# them is seen).  Keyed by the DSL that produced them; another toolchain re-records (the probe prints the md5 it saw).
+_PAGED_GATE_CUBIN_RECORD = {
+    "nvidia-cutlass-dsl": "4.8.0",
+    "sm_100a_dense": "dc698e8b8a4f86996a7090ab24c4d452",
+    "sm_100a_thd": "71f32b147b7c86af413a227f1c2408a5",
+    "sm_100a_paged_thd": "5f2ccc374d24b90239ab99a8a1d529ff",
+    "sm_100a_paged_thd_pack": "ee82153f5d070035d98e32582d9e30e2",
+    "sm_107a_dense": "b4af8e7d23a52179c0c299bb03cd9c3d",
+    "sm_107a_thd": "b07ad1515c7755c604986b8cd352d768",
+    "sm_107a_paged_thd": "a1651799d5f6116d5726df3667e0a39a",
+    "sm_107a_paged_thd_pack": "9d83e9ff26a04c5c3d0840f85c876c3a",
+    "sm_107a_gated_paged_thd": "71c7923b876901019935a596d15a8e25",
+    "sm_107a_gated_paged_thd_pack": "b076ab4545fe42942a91b5bf0d6ea4d1",
+}
+_PAGED_GATE_BASE = dict(dtype_qkv=2, dtype_o=2, window_right=0, qh_per_kh=4, cta_mma=2)
+_PAGED_GATE_PAGED = dict(_PAGED_GATE_BASE, bottom_right=True, thd_varlen=True, seq_kv_lens_present=True, paged_kv=True, page_size=16)
+_PAGED_GATE_RENDERINGS = {
+    # tag -> (TemplateParams fields, compile kwargs); the body is loaded DIRECTLY (the Rubin paged route's file) on either arch
+    "dense": (_PAGED_GATE_BASE, dict(has_lse=True, lse_kind="dense")),
+    "thd": (dict(_PAGED_GATE_BASE, thd_varlen=True, seq_kv_lens_present=True), dict(has_lse=True, lse_kind="head")),
+    "paged_thd": (_PAGED_GATE_PAGED, dict(has_lse=False, lse_kind="token", paged_hnd=True)),
+    "paged_thd_pack": (dict(_PAGED_GATE_PAGED, pack_gqa=True), dict(has_lse=False, lse_kind="token", paged_hnd=True)),
+    "gated_paged_thd": (dict(_PAGED_GATE_PAGED, epilogue_gate=True), dict(has_lse=False, lse_kind="token", paged_hnd=True)),
+    "gated_paged_thd_pack": (dict(_PAGED_GATE_PAGED, pack_gqa=True, epilogue_gate=True), dict(has_lse=False, lse_kind="token", paged_hnd=True)),
+}
+_PAGED_GATE_CUBIN_PROBE = """
+import glob, hashlib, json, os, sys
+dump, arch, params_json, compile_json = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump
+os.environ["CUTE_DSL_KEEP"] = "cubin"
+os.environ["CUTE_DSL_ARCH"] = arch
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+from cudnn.sdpa.fwd.api_dsl import _load_kernel_template, _SM100_KERNEL_FILES
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+mod = _load_kernel_template(_SM100_KERNEL_FILES[(256, 256)], TemplateParams(**json.loads(params_json)), "sdpa_fwd_render_gate_probe")
+print("MODULE", mod.__file__, int(mod.CFG.THD_VARLEN), int(mod.CFG.PAGED_KV), int(mod.CFG.PACK_GQA), int(mod.CFG.EPILOGUE_GATE))
+mod.compile(d_qk=256, d_v=256, **json.loads(compile_json))
+cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+if not cubins:
+    print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+print("CUBIN_MD5", hashlib.md5(open(cubins[-1], "rb").read()).hexdigest())
+"""
+
+
+def _paged_gate_cubin_md5s(tmp_path, keys):
+    """The cubin md5 of each ``<arch>_<tag>`` rendering, every one trace-compiled in ITS OWN fresh interpreter, all of them in
+    parallel (the dump dir and the arch are read at the first cutlass import); -> {key: md5}."""
+    import hashlib
+    import json
+
+    procs = {}
+    for key in keys:
+        arch, tag = key.split("_", 2)[0] + "_" + key.split("_", 2)[1], key.split("_", 2)[2]
+        params, compile_kw = _PAGED_GATE_RENDERINGS[tag]
+        dump = tmp_path / f"{key}_{hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()[:8]}"
+        dump.mkdir()
+        procs[key] = subprocess.Popen(
+            [sys.executable, "-c", _PAGED_GATE_CUBIN_PROBE, str(dump), arch, json.dumps(params), json.dumps(compile_kw)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    out = {}
+    for key, proc in procs.items():
+        stdout, stderr = proc.communicate(timeout=1500)
+        assert proc.returncode == 0, f"trace-compile of {key} failed:\n{stdout[-4000:]}\n{stderr[-4000:]}"
+        out[key] = next((ln.split()[1] for ln in stdout.splitlines() if ln.startswith("CUBIN_MD5 ")), "")
+        print(f"\n{key}: cubin md5 {out[key]}")
+    return out
+
+
+@pytest.mark.L1
+def test_shared_d256_body_gate_seams_leave_every_ungated_rendering_byte_identical_on_both_archs(tmp_path):
+    """The render gate of the paged gate: the SHARED SM100 d256 half body's UNGATED renderings -- dense / THD / paged THD /
+    paged THD PackGQA, on sm_100a (the Blackwell class must not move) AND on sm_107a -- trace-compile to the cubins recorded
+    BEFORE the gate seams, and the two GATED sm_107a renderings to the ones recorded with them.  Another DSL re-records (skip,
+    naming it); a changed md5 under the recorded DSL is a body change."""
+    import importlib.metadata as im
+
+    from frost_test_utils import arch_known_to_the_dsl
+
+    for arch in ("sm_100a", "sm_107a"):
+        if not arch_known_to_the_dsl(arch):
+            pytest.skip(f"this cutlass-dsl has no {arch}")
+    dsl = im.version("nvidia-cutlass-dsl")
+    if dsl != _PAGED_GATE_CUBIN_RECORD["nvidia-cutlass-dsl"]:
+        pytest.skip(f"the cubin record was taken under nvidia-cutlass-dsl {_PAGED_GATE_CUBIN_RECORD['nvidia-cutlass-dsl']}; this is {dsl} -- re-record")
+    keys = [k for k in _PAGED_GATE_CUBIN_RECORD if k != "nvidia-cutlass-dsl"]
+    got = _paged_gate_cubin_md5s(tmp_path, keys)
+    bad = {k: (got[k], _PAGED_GATE_CUBIN_RECORD[k]) for k in keys if got[k] != _PAGED_GATE_CUBIN_RECORD[k]}
+    assert not bad, f"renderings moved (got, recorded): {bad}"
+
+
+def test_shared_d256_body_gate_is_wired_through_every_layer():
+    """Every layer names the SAME fact: config_sm100 admits ``epilogue_gate`` on the half d256 record (paged / THD / PackGQA; the
+    quantized d256 bodies refuse by name, the split is refused), the body derives its gate geometry from the shared hook and
+    declares the staging tile AFTER the V ring, the kernel argument is appended Optional and the two host slots are appended,
+    required (the render gate's precondition: nothing ahead of them moves), the adapter admits paged x gate / PackGQA x gate on
+    the route and keeps the split decline, and both native binders publish the paged-gate role the adapter's tripwire reads."""
+    import inspect
+
+    from cudnn import _pybind_module
+    from cudnn.sdpa.fwd import api_dsl, config_sm100
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams as Sm100Params
+    from cudnn.sdpa.fwd.config_sm100 import d256_gate_smem_bytes, make_cfg_d256
+
+    assert config_sm100._EPILOGUE_GATE_FLAVORS == frozenset({"d256"})
+    paged = dict(paged_kv=True, page_size=16, seq_kv_lens_present=True, bottom_right=True, window_right=0, thd_varlen=True)
+    cfg, _ = make_cfg_d256(Sm100Params(epilogue_gate=True, **paged))
+    assert cfg.EPILOGUE_GATE == 1 and cfg.GATE_BPE == 2 and cfg.PAGED_KV == 1 and cfg.THD_VARLEN == 1
+    cfg_pack, _ = make_cfg_d256(Sm100Params(epilogue_gate=True, pack_gqa=True, qh_per_kh=4, **paged))
+    assert cfg_pack.EPILOGUE_GATE == 1 and cfg_pack.PACK_GQA == 1 and cfg_pack.PACK_G == 4
+    # the SMEM tally the config checks: 192 KiB of operands + the 64 KiB gate tile + 2 KiB fixed = 258 KiB, inside the 320 KiB usable
+    # Rubin carveout and past the 227 KiB Blackwell cap (a cc 10.7 rendering by construction)
+    assert d256_gate_smem_bytes(cfg) == (128 * 256 + 2 * (128 * 256 // 2) + 2 * (256 * 128 // 2)) * 2 + 128 * 256 * 2 + 2048 == 258 * 1024
+    assert 227 * 1024 < d256_gate_smem_bytes(cfg) <= config_sm100._D256_GATE_SMEM_USABLE_BYTES
+    off, _ = make_cfg_d256(Sm100Params(**paged))
+    assert off.EPILOGUE_GATE == 0 and d256_gate_smem_bytes(off) == 194 * 1024
+    with pytest.raises(ValueError, match="epilogue_gate"):
+        make_cfg_d256(Sm100Params(epilogue_gate=True, split_kv=2, **paged))
+    with pytest.raises(ValueError, match="epilogue_gate"):
+        make_cfg_d256(Sm100Params(epilogue_gate=True, dtype_qkv=_E4M3, dtype_o=_BF16_OUT, cta_mma=1, **paged))
+    # the body: the gate geometry from the shared hook, the staging tile after the V ring, the appended Optional arguments
+    mod = _load(_D256, rubin=True, epilogue_gate=True, **paged)
+    src = inspect.getsource(mod._kernel)
+    assert mod.__file__.endswith("sm100/prefill_d256_f16.py") and mod.EPILOGUE_GATE and mod.gateTmaTransactionBytes == 64 * 1024
+    assert src.index("sV_raw = cutlass.Array") < src.index("sGate_raw = (") < src.index("bars = make_d256_bars(")
+    assert "epilogue_gate=EPILOGUE_GATE" in src and src.count("issue_gate_load(") == 0  # the issue sites live in the TMA-LDG group
+    assert inspect.getsource(mod._tmaldg_warp_group).count("issue_gate_load(sGate, tma_gate, bars.mb_gate_full") == 2, "both arms of the tile loop"
+    kparams = inspect.signature(mod._kernel).parameters
+    assert list(kparams)[-1] == "tma_gate_desc" and kparams["tma_gate_desc"].default is None
+    hparams = list(inspect.signature(mod._host).parameters)
+    assert hparams[-3:] == ["gate_ptr", "gate_strides", "stream"]
+    # Both slots are REQUIRED (the sm107 d256 body's convention): gate_strides is a runtime tuple slot on every rendering (the binders
+    # fill zeros), and a Python default cannot stand in -- None reaches the compiled tuple slot as a type mismatch, a non-None default
+    # is one the compiled-plan cache cannot carry (the cc 10.0 direct launches saw both).
+    assert all(inspect.signature(mod._host).parameters[n].default is inspect.Parameter.empty for n in ("gate_ptr", "gate_strides"))
+    assert "thd=bool(CFG.THD_VARLEN)" in inspect.getsource(mod._host) and "HEADS_PER_TILE, _GG.tma_granu_elems)" in inspect.getsource(mod._host)
+    # the binders' role and the adapter's tripwire
+    assert getattr(_pybind_module._SdpaThdBinder, "supports_paged_epilogue_gate", False) is True
+    assert getattr(_pybind_module._SdpaDenseBinder, "supports_paged_epilogue_gate", False) is True
+    assert api_dsl._binders_serve_the_paged_gate() is True
+
+
+def _paged_gate_api(*, pack_gqa=False, with_gate=True, split_kv=None, fp8=False, dtype=None, b=3, h=8, h_kv=2, s_max=512, page=16):
+    """A paged THD d256 plan (the EXTEND form's SDPA) built from descriptors only: HND pools, a row-major block table."""
+    import torch
+
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    dt = dtype or torch.bfloat16
+    qkv_dt = torch.float8_e4m3fn if fp8 else dt
+    pool = _desc((64, h_kv, page, 256), qkv_dt, "k", stride=(h_kv * page * 256, page * 256, 256, 1))
+    kw = {}
+    if with_gate:
+        kw["sample_gate"] = _desc((b, h, s_max, 256), dt, "gate")
+    if pack_gqa:
+        kw["pack_gqa"] = True
+    if split_kv is not None:
+        kw["split_kv"] = split_kv
+    if fp8:
+        kw.update(pertensor_fp8=True, dtype_o=torch.bfloat16)
+    return SdpaFwdDslSm100(
+        _desc((b, h, s_max, 256), qkv_dt, "q"),
+        pool,
+        dataclasses.replace(pool, name="v"),
+        _desc((b, h, s_max, 256), dt, "o"),
+        None,
+        is_causal=True,
+        causal_bottom_right=True,
+        thd=True,
+        max_total_seq_len_q=b * s_max,
+        seq_kv_lens_present=True,
+        paged_page_size=page,
+        paged_max_seq_len_kv=s_max,
+        **kw,
+    )
+
+
+def test_paged_gate_check_support_admits_the_route_and_declines_the_rest(monkeypatch):
+    """The adapter twin of the paged gate (rule 8b): on cc 10.7 a paged THD half d256 plan ADMITS the gate (PackGQA on or off,
+    the template record carries epilogue_gate + paged_kv + thd_varlen), the split keeps its typed decline, a quantized paged
+    plan is not served at all (its own decline), and a build whose binders lack the paged-gate role declines typed."""
+    import torch
+
+    from cudnn.sdpa.fwd import api_dsl as _api_dsl
+
+    _fake_cc(monkeypatch, (10, 7))
+    for dt in (torch.bfloat16, torch.float16):
+        for pack in (False, True):
+            api = _paged_gate_api(pack_gqa=pack, dtype=dt)
+            assert api.check_support(), (dt, pack)
+            tp = api.template_params()
+            assert tp.epilogue_gate and tp.paged_kv and tp.thd_varlen and tp.pack_gqa == pack and tp.split_kv == 1 and tp.page_size == 16
+    assert _paged_gate_api(with_gate=False).template_params().epilogue_gate is False
+    with pytest.raises(NotImplementedError, match="split_kv"):
+        _paged_gate_api(split_kv=2).check_support()
+    with pytest.raises(NotImplementedError):
+        _paged_gate_api(fp8=True).check_support()
+    _serves = _api_dsl._binders_serve_the_paged_gate
+    monkeypatch.setattr(_api_dsl, "_binders_serve_the_paged_gate", lambda: False)
+    with pytest.raises(NotImplementedError, match="paged-gate role"):
+        _paged_gate_api().check_support()
+    monkeypatch.setattr(_api_dsl, "_binders_serve_the_paged_gate", _serves)
+    assert _paged_gate_api().check_support()
+    # off the Rubin line the gate's first decline names the arch, as before
+    _fake_cc(monkeypatch, (10, 0))
+    with pytest.raises(NotImplementedError, match="SM107"):
+        _paged_gate_api().check_support()
+
+
+def _paged_thd_gate_problem(lens_q, lens_kv, h, h_kv, d, dtype, *, page, slab_pad=512, seed=0):
+    """Packed Q / K / V rows (K / V over each sequence's FULL kv length, Q over its new tokens), a gate G sliced out of a wider
+    slab, HND pools filled with the sequences' K / V rows at shuffled pages (the NULL page 0 never used), the block table and
+    the slot bookkeeping; -> dict."""
+    import torch
+
+    torch.manual_seed(seed)
+    tq, tk = sum(lens_q), sum(lens_kv)
+    q = (torch.randn(tq, h, d, device="cuda") * 0.5).to(dtype)
+    k = (torch.randn(tk, h_kv, d, device="cuda") * 0.5).to(dtype)
+    v = (torch.randn(tk, h_kv, d, device="cuda") * 0.5).to(dtype)
+    slab = (torch.randn(tq, h * d + slab_pad, device="cuda") * 2.0).to(dtype)
+    gate = slab[:, : h * d].view(tq, h, d)
+    max_pages = max(-(-l // page) for l in lens_kv)
+    n_pages = 1 + sum(-(-l // page) for l in lens_kv) + 3
+    free = torch.randperm(n_pages - 1, generator=torch.Generator(device="cpu").manual_seed(7)).add(1).tolist()
+    k_cache = torch.full((n_pages, h_kv, page, d), 777.0, device="cuda", dtype=dtype)
+    v_cache = torch.full((n_pages, h_kv, page, d), 777.0, device="cuda", dtype=dtype)
+    k_cache[0].zero_()
+    v_cache[0].zero_()
+    table = torch.zeros(len(lens_q), max_pages, device="cuda", dtype=torch.int32)
+    cu_k = [0] + [sum(lens_kv[: i + 1]) for i in range(len(lens_kv))]
+    for b, l in enumerate(lens_kv):
+        pages = [free.pop() for _ in range(-(-l // page))]
+        if pages:
+            table[b, : len(pages)] = torch.tensor(pages, device="cuda", dtype=torch.int32)
+        for j in range(l):
+            pg, off = pages[j // page], j % page
+            k_cache[pg, :, off, :] = k[cu_k[b] + j]
+            v_cache[pg, :, off, :] = v[cu_k[b] + j]
+    return dict(q=q, k=k, v=v, gate=gate, k_cache=k_cache, v_cache=v_cache, table=table, max_pages=max_pages)
+
+
+def _run_paged_thd_gated(pr, lens_q, lens_kv, *, page, gate_on=True, pack_gqa=False, s_max=None):
+    """Declare the paged THD d256 plan (the EXTEND form's SDPA: the (B, H, S_max, D) envelope at the packed operands' strides, the
+    pools as K / V, the block table, no LSE), compile, launch TWICE from a sentinel-filled O (the sentinel / two-launch checks of the
+    dense runner over the packed total); return ``(api, O (T_q, H, D))``."""
+    import torch
+
+    from cudnn.api_base import TensorDesc
+    from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
+
+    q, gate = pr["q"], pr["gate"]
+    dt = q.dtype
+    b, tq, h, d = len(lens_q), q.shape[0], q.shape[1], q.shape[2]
+    s_max = max(max(lens_q), 1) if s_max is None else s_max
+    max_kv = int(pr["table"].shape[1]) * page
+
+    def decl(x, name):
+        shape, stride = (b, x.shape[1], s_max, d), (s_max * x.stride(0), x.stride(1), x.stride(0), 1)
+        return TensorDesc(dtype=x.dtype, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device="cuda", name=name)
+
+    def pool_desc(t, name):
+        shape, stride = tuple(t.shape), tuple(t.stride())
+        return TensorDesc(dtype=t.dtype, shape=shape, stride=stride, stride_order=TensorDesc._compute_stride_order(shape, stride), device="cuda", name=name)
+
+    out = torch.full((tq, h, d), 1.5e30, device="cuda", dtype=torch.float32).to(dt)
+    sentinel = out[0, 0, 0].item()
+    kw = {}
+    if gate_on:
+        kw["sample_gate"] = decl(gate, "gate")
+    if pack_gqa:
+        kw["pack_gqa"] = True
+    api = SdpaFwdDslSm100(
+        decl(q, "q"),
+        pool_desc(pr["k_cache"], "k"),
+        pool_desc(pr["v_cache"], "v"),
+        decl(out, "o"),
+        None,
+        is_causal=True,
+        causal_bottom_right=True,
+        scale_softmax=d**-0.5,
+        thd=True,
+        max_total_seq_len_q=tq,
+        seq_kv_lens_present=True,
+        paged_page_size=page,
+        paged_max_seq_len_kv=max_kv,
+        **kw,
+    )
+    assert api.check_support()
+    api.compile()
+    cfg = api._k_mod.CFG
+    assert api._k_mod.__file__.endswith("sm100/prefill_d256_f16.py") and cfg.THD_VARLEN == 1 and cfg.PAGED_KV == 1
+    assert int(cfg.EPILOGUE_GATE) == int(gate_on) and int(cfg.PACK_GQA) == int(pack_gqa)
+    ws = torch.empty(max(api.scratch_workspace_bytes(), 1), dtype=torch.uint8, device="cuda")
+    run_kw = dict(
+        seq_q_lens=torch.tensor(lens_q, dtype=torch.int32, device="cuda"),
+        seq_kv_lens=torch.tensor(lens_kv, dtype=torch.int32, device="cuda"),
+        block_table=pr["table"],
+        workspace=ws,
+    )
+    if gate_on:
+        run_kw["gate"] = gate
+    api.execute(q, pr["k_cache"], pr["v_cache"], out, **run_kw)
+    torch.cuda.synchronize()
+    first = out.clone()
+    api.execute(q, pr["k_cache"], pr["v_cache"], out, **run_kw)
+    torch.cuda.synchronize()
+    live = sum(lq for lq, lk in zip(lens_q, lens_kv) if lk > 0)
+    assert torch.isfinite(out.float()).all(), "non-finite O cells"
+    assert not (out == sentinel).any(), "unwritten (sentinel) O cells inside the packed total"
+    assert torch.equal(out, first), "two-launch delta on O: a first-launch race (missing fence_proxy?)"
+    assert live >= 0
+    return api, out
+
+
+def _paged_reference_rows(pr, lens_q, lens_kv, *, causal=True):
+    """Per sequence: the fp32 oracle over its FULL kv range on the bottom-right diagonal, gated and ungated; -> [(lo, hi, o_gated, o)]."""
+    cu_q = [0] + [sum(lens_q[: i + 1]) for i in range(len(lens_q))]
+    cu_k = [0] + [sum(lens_kv[: i + 1]) for i in range(len(lens_kv))]
+    out = []
+    for i, (lq, lk) in enumerate(zip(lens_q, lens_kv)):
+        lo, hi, klo, khi = cu_q[i], cu_q[i + 1], cu_k[i], cu_k[i + 1]
+        if lq == 0:
+            continue
+        if lk == 0:
+            out.append((lo, hi, None, None))
+            continue
+        d = pr["q"].shape[2]
+        og, _ = _gate_reference(_bhsd(pr["q"][lo:hi]), _bhsd(pr["k"][klo:khi]), _bhsd(pr["v"][klo:khi]), _bhsd(pr["gate"][lo:hi]), causal=causal, scale=d**-0.5)
+        o, _ = _gate_reference(_bhsd(pr["q"][lo:hi]), _bhsd(pr["k"][klo:khi]), _bhsd(pr["v"][klo:khi]), None, causal=causal, scale=d**-0.5)
+        out.append((lo, hi, og, o))
+    return out
+
+
+@pytest.mark.parametrize("dtype, pack", [("bf16", False), ("fp16", False), ("bf16", True)], ids=["bf16", "fp16", "bf16-packgqa"])
+def test_paged_thd_gate_matches_the_oracle_and_the_separate_gate_within_one_ulp(dtype, pack):
+    """Rubin: the gate on the SHARED SM100 d256 body's paged THD arm -- B = 3 packed sequences (300, 128, 200) with prefixes
+    (kv 420, 128, 300: a tail tile and a mid-page prefix end on every sequence) over HND pools at page 16, G a column slice
+    of a wider slab; PackGQA on the third cell (8 / 2: a 4-head packed group reads its own gate rows through the packed-row
+    TMA box).  Per sequence O == softmax(QK^T)V * sigmoid(G) on the bottom-right diagonal against the fp32 oracle at the gate
+    suite's bounds, and the fused O within ONE unit in the last place of the ungated paged run followed by the block's
+    PRODUCTION separate gate stage (the QF02 bar); the exact max diff and the fraction of cells that moved are printed."""
+    import torch
+
+    _rubin_only()
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    lens_q, lens_kv, h, h_kv, d, page = [300, 128, 200], [420, 128, 300], 8, 2, 256, 16
+    pr = _paged_thd_gate_problem(lens_q, lens_kv, h, h_kv, d, dt, page=page)
+    _, out = _run_paged_thd_gated(pr, lens_q, lens_kv, page=page, pack_gqa=pack)
+    _, out_u = _run_paged_thd_gated(pr, lens_q, lens_kv, page=page, pack_gqa=pack, gate_on=False)
+    for lo, hi, og, o in _paged_reference_rows(pr, lens_q, lens_kv):
+        torch.testing.assert_close(_bhsd(out[lo:hi]).float(), og, **_GATE_O_TOL)
+        torch.testing.assert_close(_bhsd(out_u[lo:hi]).float(), o, **_GATE_O_TOL)
+    separate = _separate_gate_stage(out_u, pr["gate"])
+    max_ulps, moved, max_diff = _ulps_apart(out, separate)
+    model = (out_u.float() * torch.sigmoid(pr["gate"].float())).to(dt)
+    print(
+        f"\npaged THD x gate [{dtype}, pack={pack}]: fused vs ungated + the separate gate stage -- max {max_ulps:.3f} ulp, max|diff| {max_diff:.3e}, "
+        f"{moved * 100:.2f} % of cells moved; vs the torch model of the stage max {_ulps_apart(out, model)[0]:.3f} ulp"
+    )
+    assert max_ulps <= 1.0, f"the fused paged gate is {max_ulps} ulp from the separate stage (max|diff| {max_diff}); one rounding apart is the contract"
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+def test_paged_thd_gate_b1_vs_the_dense_gated_sm107_rendering_is_recorded(dtype):
+    """Rubin: ONE packed sequence of 512 tokens over the pools (prefix 0) against the dense gated plan over the SAME bytes --
+    the SHARED SM100 body's paged arm vs the Rubin sibling's dense gated body: two bodies, one epilogue hook.  Recorded in
+    ulps at the element's magnitude (the bodies' running-max and chunk orders are their own, so bitwise is not the claim);
+    asserted within the gate suite's bounds of each other and both on the oracle."""
+    import torch
+
+    _rubin_only()
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    t, h, h_kv, d, page = 512, 8, 2, 256, 16
+    pr = _paged_thd_gate_problem([t], [t], h, h_kv, d, dt, page=page)
+    _, out_p = _run_paged_thd_gated(pr, [t], [t], page=page)
+    as_bhsd = lambda x: x.view(1, t, x.shape[1], d).transpose(1, 2)  # noqa: E731
+    _, out_d, _ = _run_gated(as_bhsd(pr["q"]), as_bhsd(pr["k"]), as_bhsd(pr["v"]), as_bhsd(pr["gate"]), causal=True)
+    out_d_rows = out_d.transpose(1, 2).reshape(t, h, d)
+    max_ulps, moved, max_diff = _ulps_apart(out_p, out_d_rows)
+    print(f"\npaged B=1 [{dtype}] vs the dense gated sm107 rendering: max {max_ulps:.3f} ulp, max|diff| {max_diff:.3e}, {moved * 100:.2f} % of cells moved")
+    og, _ = _gate_reference(as_bhsd(pr["q"]), as_bhsd(pr["k"]), as_bhsd(pr["v"]), as_bhsd(pr["gate"]), causal=True, scale=d**-0.5)
+    torch.testing.assert_close(_bhsd(out_p).float(), og, **_GATE_O_TOL)
+    torch.testing.assert_close(out_p.float(), out_d_rows.float(), **_GATE_O_TOL)
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+def test_paged_thd_gate_keyless_sequence_is_exactly_zero_and_a_padded_entry_owns_no_rows(dtype):
+    """Rubin, sdpa-invariants S1 / S2 on the paged gated plan: a sequence with 128 new tokens and kv_len 0 (the serving stacks'
+    padded entry: block table row = the NULL page, every row keyless) must SELECT zero AFTER the gate fma -- a +-1e4 gate on those
+    rows cannot leak through: O exactly 0; a zero-length sequence in the packing owns no rows; the live sequences stay on the
+    oracle and within one ulp of the separate gate stage."""
+    import torch
+
+    _rubin_only()
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16}[dtype]
+    lens_q, lens_kv, h, h_kv, d, page = [300, 128, 200, 0], [300, 0, 277, 0], 8, 2, 256, 16
+    pr = _paged_thd_gate_problem(lens_q, lens_kv, h, h_kv, d, dt, page=page)
+    sign = torch.where(torch.arange(128 * h * d, device="cuda") % 2 == 0, 1.0, -1.0).view(128, h, d)
+    pr["gate"][300:428] = (sign * 1e4).to(dt)
+    _, out = _run_paged_thd_gated(pr, lens_q, lens_kv, page=page, s_max=300)
+    _, out_u = _run_paged_thd_gated(pr, lens_q, lens_kv, page=page, s_max=300, gate_on=False)
+    assert (out[300:428] == 0).all(), "the keyless sequence must be EXACTLY zero (select, not residue * 0; the gate fma sits before the select)"
+    assert (out_u[300:428] == 0).all()
+    for lo, hi, og, o in _paged_reference_rows(pr, lens_q, lens_kv):
+        if og is None:
+            continue
+        torch.testing.assert_close(_bhsd(out[lo:hi]).float(), og, **_GATE_O_TOL)
+    separate = _separate_gate_stage(out_u, pr["gate"])
+    max_ulps, _, max_diff = _ulps_apart(out, separate)
+    assert max_ulps <= 1.0, (max_ulps, max_diff)
 
 
 # ============================================================================
