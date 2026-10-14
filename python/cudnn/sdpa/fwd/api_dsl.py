@@ -249,8 +249,13 @@ D512_2X2: bool = True
 # constant that SdpaFwdDslSm90.check_support writes into a D128 plan's record (the D512_2X2 precedent above: a module
 # constant, not configuration, never per plan); a D512 plan never carries it. Either value computes the same function
 # bit for bit, up to the sign of a zero O element (test_sdpa_fwd_d128_sm90.py::test_d128_variant_is_bitwise_v1), so
-# this is a speed choice. False until the step 7 A/B; the commit that changes it records the measured table here.
-D128_INTRA_WG_OVERLAP: bool = False
+# this is a speed choice. Measured on an H200 SXM (bf16, b2 32/8 and 32/32 heads at s 2k-16k, b8 16/4 at s 1k, dense
+# and causal; 7 interleaved rounds, after the per-row FP64 check left the narrow path): overlap ran 1.07-1.28x the v1
+# loop (geometric mean 1.21x over 12 shapes) and 0.91-1.13x cuDNN 9.27 in the same rounds; Nsight Compute at s16384
+# dense, base clock: 14.6 ms against 18.6 ms (v1) and 15.6 ms (cuDNN), tensor pipe 82.9% against 65.0% and 77.6%.
+# A ping-pong turn between the two compute warpgroups measured 1.11x alone and no further gain on top of overlap, so the
+# kernel has none: each warpgroup issues its own WGMMA groups and the hardware interleaves them.
+D128_INTRA_WG_OVERLAP: bool = True
 # The d128 f16/bf16 DECODE tile (TILES_Q=1, cga1, one softmax warpgroup, three
 # KV stages -- config_sm100.CfgD128Decode): what a (128, 128) plan with
 # TILE_CGA_M=1 lowers to on dense graphs.  cga1 on this flavor IS the decode
