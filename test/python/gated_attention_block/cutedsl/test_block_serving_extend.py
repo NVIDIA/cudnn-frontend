@@ -43,6 +43,7 @@ from cudnn.gated_attention_block import (
     KV_SOURCE_SELF,
     SERVING_PAGE_SIZES,
     SERVING_POOL_LAYOUTS,
+    DecodeEnvelope,
     ExtendEnvelope,
     GatedAttentionBlockFwd,
     GatedAttentionBlockGeometry,
@@ -1184,14 +1185,35 @@ def test_extend_o_slot_is_aliased_by_no_other_stage_scratch():
         assert lay.engine_scratch >= o_hi
 
 
+def _declare_dense_sparse_paged():
+    """A DENSE paged declaration on a QsaSpec geometry: the serving table's `sparse` row (the packed form meets the sparse declaration's
+    own thd=True refusal first, so the dense form is the one that reaches the row)."""
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
+    mk = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    return GatedAttentionBlockFwd(
+        mk(1, 16, geom.d_model),  # S <= 32: the decode_rows row sits before the sparse row
+        mk(geom.n_qkvg, geom.d_model),
+        mk(geom.d_head),
+        mk(geom.d_head),
+        mk(1, 16, geom.rope_dim),
+        mk(1, 16, geom.rope_dim),
+        mk(geom.d_model, geom.h_q * geom.d_head),
+        mk(1, 16, geom.d_model),  # S <= 32: the decode_rows row sits before the sparse row
+        geom,
+        paged_kv_page_size=16,
+        kv_source=KV_SOURCE_PAGED,
+    )
+
+
 @pytest.mark.L0
-def test_extend_typed_declines_match_the_envelope_row_by_row():
+def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     """Every row of the EXTEND declines table is reachable at declaration with exactly the message the envelope publishes for it --
     the CPU proof that no declaration-time decline escapes ``serving_envelope``."""
     import re
+    from cudnn.frost import buffers
 
     env = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
-    assert isinstance(env, ServingEnvelope) and isinstance(env.extend, ExtendEnvelope) and env.decode is None
+    assert isinstance(env, ServingEnvelope) and isinstance(env.extend, ExtendEnvelope) and isinstance(env.decode, DecodeEnvelope)
     names = [name for name, *_ in _EXTEND_DECLINES]
     assert set(env.extend.declines) == set(names) and len(names) == len(set(names))
     assert env.extend.requires and env.extend.page_sizes == SERVING_PAGE_SIZES == (16, 32, 64, 128) and env.extend.pool_layouts == SERVING_POOL_LAYOUTS
@@ -1200,8 +1222,10 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
     d128 = dict(_EXTEND_GEOM, d_head=128, d_model=256)
     trips = {
         "write_through": lambda: _declare_extend_with(2, 128, good, page=0),
-        "dense_declaration": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
+        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py); past the decode tile's 32 rows it is this row
+        "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
+        "sparse": _declare_dense_sparse_paged,
         "window": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_EXTEND_GEOM, window_left=64)),
         "head_dim": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=d128),
         "fuse_gate": lambda: _declare_extend(2, 128, max_kv_len=128, fuse_gate=True),
@@ -1220,7 +1244,12 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
     cc = tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
     assert env.device_cc == cc
     if cc == (10, 7):
-        assert env.extend.served and env.forms == ("extend",) and env.extend.reason is None and env.cutedsl_ok
+        if not env.cutedsl_ok:
+            assert not env.extend.served and env.forms == () and env.extend.reason == env.cutedsl_reason
+        # The remaining assertions inspect geometry on a hypothetical supported target.
+        monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+        env = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
+        assert env.extend.served and env.forms == ("extend", "decode") and env.extend.reason is None and env.cutedsl_ok
         fp32 = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.float32, _DEV)
         assert not fp32.extend.served and "bf16 / f16" in fp32.extend.reason
         for geom_kw, row in ((dict(_EXTEND_GEOM, window_left=64), "window"), (_SMALL_D256, "diagonal"), (d128, "head_dim")):
@@ -1236,6 +1265,12 @@ def test_extend_typed_declines_match_the_envelope_row_by_row():
         _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec()))
     if cc == (10, 7):
         assert sparse.extend.reason == str(e.value)
+    # ... and the Rubin reading on ANY host (device_cc=): the EXTEND half says the sparse declaration's own row, the DECODE half the table's
+    # `sparse` row -- the pin the first node run exposed (the envelope read the `diagonal` row for a QsaSpec geometry on the THD-only form)
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    rubin = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.bfloat16, _DEV, device_cc=(10, 7))
+    assert rubin.cutedsl_ok and rubin.forms == ()
+    assert rubin.extend.reason == str(e.value) and rubin.decode.reason == env.decode.declines["sparse"]
 
 
 @pytest.mark.L0
@@ -1407,7 +1442,8 @@ class _ExtendHarness:
             b_max, t_max, max_kv_len=max_kv_len, page=page, layout=layout, dtype=dtype, cu=cu, row_stride=row_stride, seed=seed, **blk_kw
         )
         self.b_max, self.t_max, self.page, self.layout, self.dtype, self.cu = b_max, t_max, page, layout, dtype, cu
-        self.geom, self.ref_geom = self.blk.geom, RefGeometry(**_SMALL_D256)
+        geom_kw = blk_kw.get("geom_kw", _EXTEND_GEOM)  # the oracle's mirror follows the DECLARED geometry (a shard's, or the matrix's 8 / 2)
+        self.geom, self.ref_geom = self.blk.geom, RefGeometry(**{k: v for k, v in geom_kw.items() if k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")})
         self.k_cache, self.v_cache, self.table = self.samples["sample_k_cache"], self.samples["sample_v_cache"], self.samples["sample_block_table"]
         self.n_pages, self.max_pages = int(self.k_cache.shape[0]), int(self.table.shape[1])
         self.slot = torch.full((t_max,), -1, device="cuda", dtype=slot_dtype)
@@ -1638,7 +1674,8 @@ _HARNESS = {}  # the declaration key -> _ExtendHarness: ONE compiled block per d
 
 
 def _harness(b_max, t_max, *, max_kv_len, page=16, layout="hnd", dtype=torch.bfloat16, cu=True, row_stride=None, slot_dtype=torch.int32, seed=0, **blk_kw):
-    key = (dtype, page, layout, cu, b_max, t_max, max_kv_len, row_stride, slot_dtype, seed, tuple(sorted(blk_kw.items())))
+    frozen = tuple(sorted((k, tuple(sorted(v.items())) if isinstance(v, dict) else v) for k, v in blk_kw.items()))  # geom_kw is a dict
+    key = (dtype, page, layout, cu, b_max, t_max, max_kv_len, row_stride, slot_dtype, seed, frozen)
     if key not in _HARNESS:
         _HARNESS[key] = _ExtendHarness(
             b_max, t_max, max_kv_len=max_kv_len, page=page, layout=layout, dtype=dtype, cu=cu, row_stride=row_stride, slot_dtype=slot_dtype, seed=seed, **blk_kw
@@ -2006,3 +2043,37 @@ def test_extend_admitted_spellings_execute_within_the_budget(spelling):
             worst_cos = min(worst_cos, _cos(rec["out"][lo:hi], ref.out[0, p : p + q]))
             worst_err = max(worst_err, (og[lo:hi].float() - ref.o_gated[0, p : p + q].float()).abs().max().item())
     print(f"(admitted) {spelling}: t_live {rec['t_live']} kv_lens {rec['kv_lens']} worst out cos {worst_cos:.6f} gated-O max|err| {worst_err:.3e}")
+
+
+# The 397B shards at their real width (d_model 4096; the layout contract pins n_qkvg 8704 / 4608 / 2560): the query heads divided across
+# the ranks, the ONE replicated KV head from TP 4 on -- each on the kernel block size its deployment allocates (16 / 32 / 64), so the
+# three cells also walk the pages.  (geometry, page)
+_SHARD_GEOMS = {
+    "q35_397b_tp2_16_1": (dict(d_model=4096, h_q=16, h_kv=1, d_head=256, rope_dim=64, causal_bottom_right=True), 16),
+    "q35_397b_tp4_8_1": (dict(d_model=4096, h_q=8, h_kv=1, d_head=256, rope_dim=64, causal_bottom_right=True), 32),
+    "q35_397b_tp8_4_1": (dict(d_model=4096, h_q=4, h_kv=1, d_head=256, rope_dim=64, causal_bottom_right=True), 64),
+}
+
+
+@pytest.mark.L1
+@requires_rubin
+@pytest.mark.parametrize("name", list(_SHARD_GEOMS), ids=list(_SHARD_GEOMS))
+def test_extend_qwen35_shards_execute_within_the_budget(name):
+    """One EXTEND step per 397B shard (16 / 1 at page 16, 8 / 1 at page 32, 4 / 1 at page 64; two sequences at ``T_max`` 256 = a tight
+    packing): a 100-token step over a 60-row prefix (kv_len 160: a tail tile; the prefix ends mid-page at pages 32 / 64) and a
+    156-token step over a 100-row prefix (kv_len 256: two KV tiles exactly, the table row FULL at every page), the prefix rows written
+    by the torch reference, through the suite's own harness and ``check`` (the dense suite's budget on every live sequence, the new
+    tokens' pool rows bitwise the slab rows attention consumed, the stale rows untouched -- nothing widened)."""
+    geom_kw, page = _SHARD_GEOMS[name]
+    hz = _harness(2, 256, max_kv_len=256, page=page, geom_kw=geom_kw, seed=31)
+    assert hz.geom.d_model == 4096 and hz.geom.h_kv == 1 and hz.k_cache.shape[1] == 1 and hz.geom.n_qkvg % 256 == 0 and hz.max_pages * page == 256
+    rec = hz.step([100, 156], prefix_lens=[60, 100], prefill="reference")
+    hz.check(rec, label=f"(shard) {name} p{page}")
+    assert rec["kv_lens"] == [160, 256] and rec["t_live"] == 256 == hz.t_max
+    og = hz.o_gated()
+    worst_cos, worst_err = 1.0, 0.0
+    for b, ((lo, hi), ref) in enumerate(zip(rec["rows"], rec["refs"])):
+        q, p = rec["q_lens"][b], rec["prefix_lens"][b]
+        worst_cos = min(worst_cos, _cos(rec["out"][lo:hi], ref.out[0, p : p + q]))
+        worst_err = max(worst_err, (og[lo:hi].float() - ref.o_gated[0, p : p + q].float()).abs().max().item())
+    print(f"(shard) {name} p{page}: t_live {rec['t_live']} kv_lens {rec['kv_lens']} worst out cos {worst_cos:.6f} gated-O max|err| {worst_err:.3e}")

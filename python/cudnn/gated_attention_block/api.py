@@ -531,6 +531,135 @@ SERVING_POOL_LAYOUTS = ("hnd", "nhd", "unified")
 """The three pool stride patterns the serving forms are validated on: HND compact ``(H*P*D, P*D, D, 1)``, NHD by strides
 ``(P*H*D, D, H*D, 1)``, and a unified ``[num_pages, H_kv, P, 2D]`` content row (K at ``+0``, V at ``+D``) bound as its two halves."""
 
+DECODE_MAX_S_Q = 4
+"""The CLAIMED decode envelope: ``1 <= S_q <= 4`` (one new token plus up to three speculative ones) rides the Rubin d256 decode
+tile PACKED (the whole GQA group in one tile) at every served group.  Above it the route still applies (:func:`decode_route`,
+the adapter's own rule): a group may ride the packed tile further (8 / 1 to ``S_q = 8``, 24 / 4 to ``S_q = 10``); past the
+packed route the adapter's UNPACKED arm still rides the tile -- one head per CTA, up to ``DECODE_MAX_ROWS`` rows.  Every arm is
+declared (``DecodeRoute.tile`` / ``pack_gqa``) and unmeasured until its perf cell; beyond ``DECODE_MAX_ROWS`` the form is a
+typed decline (the paged d256 prefill body serves PACKED queries -- the EXTEND form -- never a dense step over the pools)."""
+
+DECODE_MAX_ROWS = 32
+"""The widest step the DECODE form serves: the 32-column decode tile unpacked (one head per CTA).  A dense step with more new tokens
+per sequence has no kernel over the pools on this part (the adapter's own decline) -- it is the EXTEND form's (packed) business."""
+
+DECODE_TILE = "decode_d256_f16"
+"""``kernel_template`` of the Rubin d256 decode tile (``sdpa/fwd/kernels/sm107/decode_d256_f16.py``: the swap-AB tile)."""
+
+
+@dataclass(frozen=True)
+class DecodeRoute:
+    """Which SDPA kernel serves a DECODE step of ``s_q`` tokens at a geometry -- derived from the Rubin route the SDPA
+    adapter itself applies (``cudnn.sdpa.fwd.config_sm107.decode_d256_q_tile``: the 32-column swap-AB decode tile, up to
+    two TOKEN UNITS of ``n_q // group`` consecutive tokens for a packed GQA group; the adapter's ``_decode_q_tile_for`` is
+    the same rule on its own shapes, and ``_Sdpa.compile`` pins the compiled ``kernel_template`` against this record)."""
+
+    s_q: int
+    group: int  # h_q // h_kv: the heads the decode tile packs per token (1 = MHA, unpacked)
+    tile: Optional[str]  # DECODE_TILE (the ``kernel_template`` the adapter compiles), or None: the step is not served over the pools
+    n_q: int  # the decode tile's N extent (the packed Q rows of ONE token unit: 16 or 32); 0 when not served
+    token_units: int  # CTAs per (KV-head group, batch, split): ceil(s_q / (n_q // group)); 0 when not served
+    pack_gqa: bool  # the whole group packed into the tile (the packed route); False = MHA or the unpacked arm past the packed route
+    claimed: bool  # inside the CLAIMED envelope (the PACKED decode tile at s_q <= DECODE_MAX_S_Q); False = routed, declared, unmeasured
+    reason: str = ""  # why the step is not served (``tile`` None); empty when served
+
+    @property
+    def decode_tile(self) -> bool:
+        return self.n_q > 0
+
+    @property
+    def served(self) -> bool:
+        return self.n_q > 0
+
+
+def decode_route(geometry: "GatedAttentionBlockGeometry", s_q: int) -> DecodeRoute:
+    """The DECODE route of ``s_q`` tokens at ``geometry``: the adapter's own rule, read here so the block, the envelope and the
+    tests name the kernel BEFORE anything compiles.  MHA (``h_q == h_kv``) stays unpacked (the bit-exact unpacked fold); past
+    the packed route a group rides the adapter's UNPACKED arm (one head per CTA) up to ``DECODE_MAX_ROWS`` rows; beyond that
+    the step is NOT served over the pools (``tile`` None, ``reason`` set: the adapter serves dense half queries over paged K / V
+    on the decode tile only -- a longer dense step is the EXTEND form's packed business); a head dim other than 256 has no
+    decode tile (the paged read is the d256 flavor's)."""
+    from cudnn.sdpa.fwd.config_sm100 import decode_d256_q_units
+    from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile
+
+    g = int(geometry.h_q) // int(geometry.h_kv)
+    s_q = int(s_q)
+    d256 = int(geometry.d_head) == 256 and s_q >= 1 and g >= 1
+    # the PACKED route first (the whole group in one tile, up to two token units); past it the adapter's UNPACKED arm (pack_g = 1:
+    # one head per CTA, one unit, S_q <= 32 rows), exactly as SdpaFwdDslSm100._decode_q_tile_for reads pack_gqa; 0 = not served
+    n_q = decode_d256_q_tile(s_q, g) if (d256 and g > 1) else 0
+    packed = bool(n_q)
+    if d256 and not n_q:
+        n_q = decode_d256_q_tile(s_q, 1)
+    units = decode_d256_q_units(s_q, g if packed else 1, n_q) if n_q else 0
+    reason = ""
+    if not n_q:
+        reason = (
+            f"a dense step of S_q={s_q} tokens at group {g} has no kernel over the pools: the Rubin SDPA adapter serves dense half d256 queries "
+            f"over paged K / V on the decode tile only (the packed route, then one head per CTA up to {DECODE_MAX_ROWS} rows); the paged d256 "
+            "prefill body serves PACKED (thd=True) queries -- the EXTEND form"
+            if d256
+            else f"the paged read rides the Rubin d256 SDPA flavor; got d_head={geometry.d_head}"
+        )
+    return DecodeRoute(
+        s_q=s_q,
+        group=g,
+        tile=DECODE_TILE if n_q else None,
+        n_q=int(n_q),
+        token_units=int(units),
+        pack_gqa=packed,
+        claimed=packed and s_q <= DECODE_MAX_S_Q,
+        reason=reason,
+    )
+
+
+def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len: int, sm_count: int, gated: bool, h_q: Optional[int] = None) -> int:
+    """The split-KV the DECODE form lowers with when the declaration leaves ``decode_split_kv=None``: the SDPA heuristics' decode
+    split model (``cudnn.sdpa.fwd.heuristics.choose_decode_tile_split_kv`` -- an under-full launch splits until its K / V streams
+    saturate HBM, a launch past that never splits, the eager caller's second launch counted against the saving) over
+    ``batch x KV-head groups x token units`` CTAs (``batch x Q heads x token units`` on the unpacked arm: one head per CTA)
+    and the declared ``max_kv_len`` in 128-key tiles at this part's SM count; floored at 2 under ``gated`` (the gate rides the
+    split COMBINE -- the tile has no gate seams); 1 for a route that is not served (declined at declaration) and when
+    ``sm_count`` is 0 (a non-CUDA declaration, declined at ``check_support`` anyway)."""
+    if not route.decode_tile or int(sm_count) <= 0:
+        return 1
+    from cudnn.sdpa.fwd.heuristics import choose_decode_tile_split_kv
+
+    heads = int(h_kv) if (route.pack_gqa or h_q is None) else int(h_q)
+    units = int(batch) * heads * int(route.token_units)
+    kv_tiles = -(-int(max_kv_len) // 128)
+    split = int(choose_decode_tile_split_kv(units=units, kv_tiles=kv_tiles, sm_count=int(sm_count), q_tile=route.n_q))
+    return max(split, 2) if gated else split
+
+
+@dataclass(frozen=True)
+class DecodeEnvelope:
+    """What :meth:`GatedAttentionBlockFwd.serving_envelope` says about the DECODE form (``kv_source="paged"`` on a dense
+    ``[B, S_q]`` declaration) for one ``(geometry, dtype, device)`` -- the shape of :class:`ExtendEnvelope`, plus the route per
+    ``S_q`` (:func:`decode_route`: the kernel, its packing and token units, whether the cell is inside the CLAIMED envelope
+    ``S_q <= max_s_q``) and the widest dense step served over the pools (``max_rows``; beyond it a typed decline).  ``declines``
+    maps every typed decline the form raises AT DECLARATION to its message -- the rows of the ONE table the constructor reads
+    (:data:`_EXTEND_DECLINES`) that a dense declaration can hit."""
+
+    served: bool
+    reason: Optional[str]
+    requires: Tuple[str, ...]
+    dtypes: Tuple[torch.dtype, ...]
+    page_sizes: Tuple[int, ...]
+    pool_layouts: Tuple[str, ...]
+    declines: Dict[str, str]
+    max_s_q: int
+    max_rows: int
+    routes: Tuple[DecodeRoute, ...]  # S_q = 1 .. 2 * max_s_q at this geometry's group
+    inference_only: bool = True
+    writes_lse: bool = False
+
+    def route(self, s_q: int) -> DecodeRoute:
+        """The route of an ``s_q``-token step at this geometry (any ``s_q >= 1``; ``routes`` holds 1 .. 2 x ``max_s_q``)."""
+        return decode_route(self._geometry, s_q)
+
+    _geometry: Optional["GatedAttentionBlockGeometry"] = None
+
 
 @dataclass(frozen=True)
 class ExtendEnvelope:
@@ -560,15 +689,15 @@ class ExtendEnvelope:
 class ServingEnvelope:
     """The static serving envelope of the block for one ``(geometry, dtype, device)``: the device / DSL facts and one record per
     serving form.  Read by a serving stack's INIT-time dispatch predicate instead of catching the block's exceptions; derived from
-    the same code ``check_support`` runs.  ``forms`` lists the forms this record serves; ``extend`` is the EXTEND form's record;
-    ``decode`` is ``None`` until the DECODE form lands (appended then, with its own record type)."""
+    the same code ``check_support`` runs.  ``forms`` lists the forms this record serves; ``extend`` is the EXTEND form's record,
+    ``decode`` the DECODE form's (:class:`DecodeEnvelope`: the route per ``S_q`` included)."""
 
     device_cc: Optional[Tuple[int, int]]
     cutedsl_ok: bool
     cutedsl_reason: Optional[str]
     forms: Tuple[str, ...]
     extend: ExtendEnvelope
-    decode: Optional[object] = None
+    decode: Optional[DecodeEnvelope] = None
 
 
 @dataclass(frozen=True)
@@ -3741,6 +3870,10 @@ class _Sdpa(_Stage):
         k_cache_desc: Optional[TensorDesc] = None,  # kv_source="paged": the K pool's [num_pages, H_kv, P, D] descriptor (shape + strides)
         v_cache_desc: Optional[TensorDesc] = None,  # kv_source="paged": the V pool's descriptor
         block_table_desc: Optional[TensorDesc] = None,  # kv_source="paged": the [num_sequences, max_pages] int32 block table's descriptor (row stride free)
+        # APPENDED (the DECODE form = kv_source="paged" on a DENSE declaration): the logical KV bound (0 = max_pages x page_size)
+        # and the split-KV the form lowers with (>= 2 on the decode tile routes fuse_gate into the split combine).
+        max_kv_len: int = 0,
+        decode_split_kv: int = 1,
     ) -> None:
         # token_stride != 0 => Q/K/V are column slices of the fused projection
         # and are read in place at that stride (the adapter compiles its TMA
@@ -3798,19 +3931,48 @@ class _Sdpa(_Stage):
         self.kv_source = kv_source
         self.paged_page_size = int(paged_page_size)
         self.k_cache_desc, self.v_cache_desc, self.block_table_desc = k_cache_desc, v_cache_desc, block_table_desc
+        # The DECODE form (kv_source="paged" on a DENSE declaration): the adapter declared PAGED with dense Q [B, S_q, H_q, D] (a
+        # view of the slab at the token stride, as on the dense arm), the pools at the CALLER'S strides, the table's strides, the
+        # logical KV bound, PackGQA over the whole group and the split the form lowers with; the route (which kernel serves S_q at
+        # this group) is the adapter's own rule read up front (decode_route) and pinned against the compiled module.  The LENGTH
+        # BINDING is one fact on the KV side only: execute hands kv_lens as seq_kv_lens and NOTHING as seq_q_lens (uniform S_q:
+        # every Q row of every sequence is live; a padded entry is a live row with ZERO keys -> the tile's empty-range SELECT ->
+        # O = 0 / LSE = -inf) -- never the dense block's self-attention binding, which would read a KV length as a Q length.
+        # fuse_gate rides the tile's split COMBINE (the tile has no gate seams): with split_kv >= 2 the adapter compiles the tile
+        # UNGATED and the shared combine multiplies the merged fp32 value by sigmoid(G) before the single cast; an unsplit tile
+        # gates in its own launch, which the block decides (GatedAttentionBlockFwd.gate_fused) -- fuse_gate=True here = the combine.
+        self.max_kv_len = int(max_kv_len)
+        self.decode_split_kv = int(decode_split_kv)
+        self.decode_route: Optional[DecodeRoute] = None
+        self.paged_dense = self.kv_source == KV_SOURCE_PAGED and not self.thd
         if self.kv_source == KV_SOURCE_PAGED:
-            if not self.thd:
-                raise NotImplementedError(f"{self.name}: kv_source='paged' binds the adapter's paged THD leg; a dense (thd=False) paged read is not bound here")
             if self.paged_page_size <= 0 or k_cache_desc is None or v_cache_desc is None or block_table_desc is None:
                 raise ValueError(f"{self.name}: kv_source='paged' needs paged_page_size > 0 and the k_cache / v_cache / block_table descriptors")
-            if self.fuse_gate:
-                raise NotImplementedError(f"{self.name}: kv_source='paged' has no gate arm (the paged THD body carries no epilogue-gate seam)")
             if self.want_lse:
-                raise NotImplementedError(f"{self.name}: kv_source='paged' writes no LSE (the EXTEND form is an inference form)")
+                raise NotImplementedError(f"{self.name}: kv_source='paged' writes no LSE (the serving forms over the pools are inference forms)")
             if self.fp8:
-                raise NotImplementedError(f"{self.name}: kv_source='paged' serves bf16 / f16 operands and pools only (no quantized paged THD leg)")
-        elif self.paged_page_size or k_cache_desc is not None or v_cache_desc is not None or block_table_desc is not None:
-            raise ValueError(f"{self.name}: paged_page_size / k_cache_desc / v_cache_desc / block_table_desc belong to kv_source='paged'")
+                raise NotImplementedError(f"{self.name}: kv_source='paged' serves bf16 / f16 operands and pools only (no quantized paged leg)")
+            if self.thd:
+                if self.fuse_gate:
+                    raise NotImplementedError(
+                        f"{self.name}: kv_source='paged' has no gate arm on the packed form (the paged THD body carries no epilogue-gate seam)"
+                    )
+            else:
+                if self.decode_split_kv < 1:
+                    raise ValueError(f"{self.name}: decode_split_kv must be >= 1, got {decode_split_kv}")
+                self.seq_lens_present = True  # the per-sequence KV lengths are mandatory over pools (the adapter's paged contract)
+                self.decode_route = decode_route(geometry, self.seq_len)
+                if not self.decode_route.served:
+                    raise NotImplementedError(f"{self.name}: {self.decode_route.reason}")
+                if self.fuse_gate and not (self.decode_route.decode_tile and self.decode_split_kv >= 2):
+                    raise NotImplementedError(
+                        f"{self.name}: fuse_gate=True over the pools rides the decode tile's split combine only (split_kv >= 2; got split_kv="
+                        f"{self.decode_split_kv}); the block gates in its own launch when the tile runs unsplit"
+                    )
+        elif self.paged_page_size or k_cache_desc is not None or v_cache_desc is not None or block_table_desc is not None or max_kv_len or decode_split_kv != 1:
+            raise ValueError(
+                f"{self.name}: paged_page_size / k_cache_desc / v_cache_desc / block_table_desc / max_kv_len / decode_split_kv belong to kv_source='paged'"
+            )
         self._impl = None
 
     def _build_impl(self):
@@ -3881,6 +4043,25 @@ class _Sdpa(_Stage):
             b_env, s_env = b, s
             lse = _lse_desc(b, g.h_q, s, self.device) if self.want_lse else None
             sched = self._sched_policy()
+        if self.paged_dense:
+            # The DECODE form: the pools AS DECLARED (the caller's strides -> the TMA descriptors), ONE table for both pools (its
+            # strides declared for K and V, or the adapter's row-major default refuses a row-sliced table at execute), the logical
+            # KV bound, the whole group packed on the decode tile (MHA unpacked), the form's split.  seq_kv_lens_present is True.
+            bt = self.block_table_desc
+            table_stride = tuple(int(x) for x in bt.stride)
+            k_desc = dataclasses.replace(self.k_cache_desc, name="k")
+            v_desc = dataclasses.replace(self.v_cache_desc, name="v")
+            kw.update(
+                paged_page_size=self.paged_page_size,
+                paged_max_seq_len_kv=self.max_kv_len or int(bt.shape[1]) * self.paged_page_size,
+                paged_table_stride=table_stride,
+                paged_table_v_stride=table_stride,
+                split_kv=self.decode_split_kv,
+                pack_gqa=True if self.decode_route.pack_gqa else None,
+            )
+        else:
+            k_desc = _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "k", token_stride=ts)
+            v_desc = _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "v", token_stride=ts)
         if self.fuse_gate:
             # The gate descriptor selects the epilogue_gate specialization
             # (template_params().epilogue_gate); its stride is compiled in like
@@ -3890,8 +4071,8 @@ class _Sdpa(_Stage):
             kw["sample_gate"] = _bhsd_desc(b_env, g.h_q, s_env, d, self.gate_dtype or self.dtype, self.device, "gate", token_stride=self.gate_token_stride)
         return SdpaFwdDslSm100(
             _bhsd_desc(b_env, g.h_q, s_env, d, self.dtype, self.device, "q", token_stride=ts),
-            _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "k", token_stride=ts),
-            _bhsd_desc(b_env, g.h_kv, s_env, d, self.dtype, self.device, "v", token_stride=ts),
+            k_desc,
+            v_desc,
             _bhsd_desc(b_env, g.h_q, s_env, d, self.o_dtype, self.device, "o"),
             lse,
             is_causal=g.is_causal,
@@ -4050,6 +4231,17 @@ class _Sdpa(_Stage):
         if self._impl is None:
             raise RuntimeError("call check_support() before compile()")
         self._impl.compile()
+        if self.paged_dense:
+            # The route this stage DECLARED (decode_route: the adapter's rule on the block's shapes) against the module the
+            # adapter COMPILED -- two readings of one rule; a drift is the "config and body must agree" class, so it raises
+            # rather than letting an envelope name a tile the plan does not run.
+            got = getattr(self._impl, "kernel_template", None)
+            if got != self.decode_route.tile:
+                raise RuntimeError(
+                    f"{self.name}: the DECODE route named {self.decode_route.tile} for S_q={self.seq_len} at group {self.decode_route.group} "
+                    f"(split_kv={self.decode_split_kv}, pack_gqa={self.decode_route.pack_gqa}) but the adapter compiled {got!r}: decode_route and "
+                    "SdpaFwdDslSm100._decode_q_tile disagree -- fix the drift, neither reading is the truth alone"
+                )
 
     def scratch_workspace_bytes(self) -> int:
         """Per-execute scratch the SDPA carves from the block's workspace.
@@ -4144,6 +4336,28 @@ class _Sdpa(_Stage):
         if self.kv_source == KV_SOURCE_PAGED:
             if any(x is None for x in paged_args):
                 raise ValueError(f"{self.name}: kv_source='paged' requires block_table, kv_lens, k_cache and v_cache at execute")
+            if self.paged_dense:
+                # The DECODE form: the pools as K / V, kv_lens as seq_kv_lens and NOTHING as seq_q_lens (one fact, the KV side only:
+                # uniform S_q, every Q row live); seq_lens (the dense block's self-attention length, a Q-side length) is REFUSED.
+                if seq_lens is not None:
+                    raise ValueError(
+                        f"{self.name}: seq_lens is the dense block's self-attention length (a Q-side length); over the pools the per-sequence KV "
+                        "length is kv_lens, bound to the KV side only (every Q row is live) -- refused rather than read as a Q length"
+                    )
+                self._impl.execute(
+                    q.transpose(1, 2),
+                    k_cache,
+                    v_cache,
+                    o.transpose(1, 2),
+                    lse_tensor=lse,
+                    seq_q_lens=None,
+                    seq_kv_lens=kv_lens,
+                    block_table=block_table,
+                    workspace=workspace,
+                    current_stream=current_stream,
+                    **({"gate": gate.transpose(1, 2)} if self.fuse_gate else {}),
+                )
+                return
             if seq_lens is None:
                 raise ValueError(f"{self.name}: kv_source='paged' requires seq_lens at execute (the packed per-sequence Q lengths)")
             # The adapter's paged THD leg: the packed (T, H, D) Q / O views as on the THD arm, the POOLS as K / V (the adapter
@@ -4550,6 +4764,7 @@ class _ServingDecl:
     save_for_backward: bool
     return_lse: bool
     geometry: GatedAttentionBlockGeometry
+    s_q: int = 0  # the DENSE declaration's S (the DECODE form's step width); 0 under thd
     fuse_gate: bool = False
 
 
@@ -4558,9 +4773,9 @@ def _is_paged(d: _ServingDecl) -> bool:
 
 
 # (name, exception class, predicate over the declaration facts, the message) -- the typed declines of the EXTEND form and of
-# the bounded token form, in the order a caller hears them.  A QsaSpec geometry is not a row: the sparse declaration's own rows run
-# first and refuse thd=True (:data:`_QSA_THD_DECLINE`), which the EXTEND form requires, so the envelope reads that decline for
-# it.  The constructor raises the FIRST row whose predicate holds
+# the bounded token form, in the order a caller hears them.  A QsaSpec geometry under the THD-only EXTEND form is not a row: the
+# sparse declaration's own rows run first and refuse thd=True (:data:`_QSA_THD_DECLINE`), so the envelope reads that decline for it;
+# the dense DECODE form reaches the table's ``sparse`` row.  The constructor raises the FIRST row whose predicate holds
 # (``_check_serving_declaration``); ``serving_envelope`` publishes every row's name and message (``ExtendEnvelope.declines``)
 # and evaluates the geometry rows for its ``served`` verdict -- one table, so no decline is reachable at declaration that the
 # envelope did not predict.  Rows the write-through attribute already declines for every ``kv_source`` (``quant``,
@@ -4575,12 +4790,20 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         "attends over the pools, so the write-through attribute is part of its declaration",
     ),
     (
-        "dense_declaration",
+        "decode_rows",
         NotImplementedError,
-        lambda d: _is_paged(d) and not d.thd,
-        "kv_source='paged' on a dense [B, S, d_model] declaration is the DECODE form (uniform S_q <= 4 per sequence over the pools), which "
-        "has not landed; the EXTEND form is the packed declaration -- thd=True, num_sequences=B_max, max_seq_len=token_capacity, "
-        "token_capacity=T_max, paged_kv_page_size=P, kv_source='paged', geometry.causal_bottom_right=True",
+        lambda d: _is_paged(d) and not d.thd and d.s_q > DECODE_MAX_ROWS,
+        f"kv_source='paged' on a dense [B, S_q] declaration (the DECODE form) serves S_q <= {DECODE_MAX_ROWS}: the Rubin SDPA adapter serves "
+        "dense half d256 queries over paged K / V on the decode tile only (the packed route, then one head per CTA up to 32 rows); a longer "
+        "dense step has no kernel over the pools -- the paged d256 prefill body serves PACKED (thd=True) queries, the EXTEND form",
+    ),
+    (
+        "sparse",
+        NotImplementedError,
+        lambda d: _is_paged(d) and not d.thd and d.geometry.qsa is not None,
+        "kv_source='paged' with geometry.qsa on a dense declaration: the block-sparse forms' attention over the pools (the sparse decode mode) is "
+        "its own binding; the DECODE form serves dense attention over the pools (the packed form meets the sparse declaration's own thd=True "
+        "refusal first)",
     ),
     (
         "diagonal",
@@ -4606,7 +4829,7 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
     (
         "fuse_gate",
         NotImplementedError,
-        lambda d: _is_paged(d) and d.fuse_gate,
+        lambda d: _is_paged(d) and d.thd and d.fuse_gate,
         "kv_source='paged' with fuse_gate=True: the paged THD body stage (4) binds carries no epilogue-gate seam (the packed block's gate rides "
         "the dense THD prefill's epilogue only); the EXTEND form runs stage (5) as its own launch -- declare fuse_gate=False",
     ),
@@ -4633,6 +4856,19 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
 )
 
 
+def _device_cc_of(device) -> Optional[Tuple[int, int]]:
+    """``(major, minor)`` of a CUDA device (a ``torch.device`` / string / index), None for a non-CUDA device or no CUDA."""
+    if device is None:
+        return None
+    try:
+        dev = torch.device(device)
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return None
+    return tuple(int(x) for x in torch.cuda.get_device_capability(dev))
+
+
 def _first_serving_decline(decl: _ServingDecl) -> Optional[Tuple[str, type, str]]:
     """The first row of :data:`_EXTEND_DECLINES` whose predicate holds for ``decl`` -- ``(name, exception class, message)`` -- or None."""
     for name, exc, pred, msg in _EXTEND_DECLINES:
@@ -4643,7 +4879,19 @@ def _first_serving_decline(decl: _ServingDecl) -> Optional[Tuple[str, type, str]
 
 _QSA_THD_DECLINE = "QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up"
 """The sparse declaration's own THD decline (``_check_qsa_declaration``), the reason the envelope gives a QsaSpec geometry for the EXTEND
-form: the form is THD-only, so no row of :data:`_EXTEND_DECLINES` is ever reached on a sparse geometry."""
+form: the form is THD-only, so no row of :data:`_EXTEND_DECLINES` is reached on a sparse geometry there (the dense DECODE form reaches
+the table's ``sparse`` row)."""
+
+_DECODE_REQUIRES = (
+    "a DENSE declaration: sample_h [B, S_q, d_model] with 1 <= S_q <= DECODE_MAX_ROWS (the claimed envelope S_q <= DECODE_MAX_S_Q), the batch uniform",
+    "paged_kv_page_size=P (a positive multiple of 16; validated at page_sizes)",
+    "kv_source='paged'",
+    "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
+    "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B, max_pages] int32, any row stride)",
+    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False, token_capacity=None; fuse_gate rides the decode tile's split combine",
+    "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=) with seq_lens=None (kv_lens binds the KV side only)",
+)
+_DECODE_DECLINE_NAMES = ("write_through", "decode_rows", "diagonal", "window", "sparse", "head_dim", "return_lse", "token_capacity_dense")
 
 _EXTEND_REQUIRES = (
     "thd=True (the packed declaration: h / cos / sin / out as [T_max, .] token matrices)",
@@ -4703,10 +4951,31 @@ class GatedAttentionBlockFwd(APIBase):
     SAMPLES (their layout and row stride are compiled in; ``serving_envelope`` lists the rest).  ``token_capacity`` makes
     the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
     (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite).  Typed declines, in
-    :data:`_EXTEND_DECLINES`'s order: a dense declaration (the DECODE form, not landed), a missing bottom-right diagonal, a
-    window, another head dim, a fused gate (the paged body carries no gate seam; the packed block's gate rides the dense THD
-    prefill only), an LSE; ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse
-    declaration's (``QsaSpec`` refuses ``thd=True``).
+    :data:`_EXTEND_DECLINES`'s order: a missing bottom-right diagonal, a window, another head dim, a fused gate
+    (the paged THD body carries no gate seam; the packed block's gate rides the dense THD prefill only), an LSE;
+    ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the sparse declaration's
+    (``QsaSpec`` refuses ``thd=True``).  Dense declarations use the DECODE form described below.
+
+    **The DECODE form (``kv_source="paged"`` on a DENSE ``[B, S_q, d_model]`` declaration, ``1 <= S_q`` -- the claimed
+    envelope ``S_q <= 4``: one new token plus up to three speculative ones -- over ``paged_kv_page_size > 0``; bf16 / f16
+    inference, the batch UNIFORM)**: the step's tokens are written through (4w) and stage (4) attends over the first
+    ``kv_lens[b]`` keys of every sequence's ``block_table`` row -- the Rubin d256 DECODE tile (PackGQA over the whole group,
+    a split-KV plan with fp32 partials in the workspace and one combine launch when the decode split model splits) inside
+    its packed route, the same tile UNPACKED (one head per CTA) up to ``DECODE_MAX_ROWS`` rows past it (:func:`decode_route`
+    names the kernel per ``(group, S_q)``; a wider dense step is a typed decline -- the EXTEND form's packed business) -- so
+    the pipeline is ``(1)+(2)+(3) -> (4w) -> (4) [+ combine] -> (5) -> (6)``, five launches with ``fuse_norm_rope``.
+    ``fuse_gate`` then rides the split COMBINE on the decode tile (``gate_fused``; the tile has no gate seams, the combine
+    multiplies the merged fp32 value by ``sigmoid(G)`` before the single cast) and is its own launch on an unsplit tile.
+    The pools' and the table's strides are the same declaration samples as the EXTEND form's (a row-sliced table at any row
+    stride); ``execute`` REQUIRES ``block_table`` + ``kv_lens`` and REFUSES ``seq_lens``: the per-sequence KV length is ONE
+    fact bound to the KV side only (``seq_kv_lens = kv_lens``, ``seq_q_lens = None`` -- every Q row live; a serving stack's
+    padded entry, ``kv_lens = 0`` + block ``0`` + slot ``-1``, is a live row with zero keys and yields ``out = 0`` through the
+    tile's empty-range SELECT, nothing written to block ``0``).  The tail tile READS the pool rows past ``kv_lens[b]`` (the
+    stale rows of the last page, and block ``0`` for the pages a short row does not list) and masks them to ``P = 0``: they
+    contribute nothing as long as they are FINITE, as a zero-initialized cache's are (a NaN there is ``0 x NaN``).  The
+    typed declines are the same table's rows (:data:`_EXTEND_DECLINES`) a dense declaration can hit -- the diagonal, a
+    window, a sparse geometry, another head dim, an LSE, a step wider than ``DECODE_MAX_ROWS`` -- and :meth:`serving_envelope`
+    publishes them with the route per ``S_q`` (``decode``).
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -4851,6 +5120,12 @@ class GatedAttentionBlockFwd(APIBase):
         sample_k_cache: Optional[torch.Tensor] = None,  # kv_source="paged": the K pool [num_pages, H_kv, P, D] (shape / dtype / strides only)
         sample_v_cache: Optional[torch.Tensor] = None,  # kv_source="paged": the V pool (same contract; the same HND / NHD kind as K)
         sample_block_table: Optional[torch.Tensor] = None,  # kv_source="paged": the [num_sequences, max_pages] int32 block table (row stride free)
+        # APPENDED (the DECODE form = kv_source="paged" on a DENSE [B, S_q] declaration; refused on the packed form and under "self"):
+        # the logical KV bound (kv_lens[b] <= max_kv_len: the masks' clamp and the split model's extent; None = max_pages x P) and
+        # the split-KV the form lowers with (None = the SDPA heuristics' decode split model; the one performance knob of the form:
+        # fp32 partials in the workspace + one combine launch, the same function under every value).
+        max_kv_len: Optional[int] = None,
+        decode_split_kv: Optional[int] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -5056,7 +5331,8 @@ class GatedAttentionBlockFwd(APIBase):
                 # units past the plan envelope never run, their O / LSE rows stay unwritten -- with no message anywhere.
                 raise ValueError(
                     f"thd=True: need num_sequences >= 1, 2 <= max_seq_len <= T and num_sequences * max_seq_len >= T (every length is <= "
-                    "max_seq_len and the lengths sum to T; S = 1 is decode, out of the prefill bodies' scope; a smaller product would cap the "
+                    "max_seq_len and the lengths sum to T; S_q = 1 is the DECODE form -- a dense [B, S_q <= 4] declaration with kv_source='paged' -- out "
+                    "of the prefill bodies' scope; a smaller product would cap the "
                     f"SDPA backward's packed capacity below T); got num_sequences={self.num_sequences}, max_seq_len={self.max_seq_len}, T={_t}"
                 )
         # BLOCK-SPARSE ATTENTION (geometry.qsa): the sparse path's declaration-time declines, typed, in one place --
@@ -5070,9 +5346,18 @@ class GatedAttentionBlockFwd(APIBase):
         self.paged_kv_page_size = self._check_cache_write_declaration(paged_kv_page_size, quant)
         # THE EXTEND FORM (kv_source) and the BOUNDED token form (token_capacity): the typed declines of the table every caller's
         # dispatch predicate can read back (serving_envelope), then the three samples' contract -- device-free, before any descriptor.
-        self.kv_source, self.token_capacity = self._check_serving_declaration(
-            kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, sample_h.device
+        self.kv_source, self.token_capacity, self.decode_route, self.max_kv_len, self.decode_split_kv = self._check_serving_declaration(
+            kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, sample_h.device, max_kv_len, decode_split_kv
         )
+        if self.kv_source == KV_SOURCE_PAGED and not self.thd:
+            # The DECODE form: over the pools the per-sequence KV length (kv_lens) is mandatory, so the declaration reads
+            # seq_lens_present=True whatever was passed (the dense padding mask it names IS the per-sequence KV length -- bound to
+            # the KV side only here).
+            self.seq_lens_present = True
+        # Where the sigmoid gate runs: the SDPA epilogue (fuse_gate on the prefill forms), the split COMBINE of the decode tile
+        # (fuse_gate on the DECODE form with split >= 2: the tile has no gate seams), or its own launch, stage (5), everywhere
+        # else (an unsplit decode tile).  `fuse_gate` stays what was declared; `gate_fused` is what runs.
+        self.gate_fused = self.fuse_gate and (self.decode_route is None or (self.decode_route.decode_tile and self.decode_split_kv >= 2))
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -5215,7 +5500,7 @@ class GatedAttentionBlockFwd(APIBase):
                 want_lse=self.return_lse,
                 seq_lens_present=self.seq_lens_present,
                 token_stride=sdpa_token_stride,
-                fuse_gate=self.fuse_gate,
+                fuse_gate=self.gate_fused,  # the SDPA gates (epilogue, or the decode tile's split combine over the pools); else stage (5)
                 gate_token_stride=sdpa_gate_token_stride,
                 o_dtype=sdpa_o_dtype,
                 gate_dtype=act,  # gate16 / the slab's GATE columns are the activation dtype (bf16 under FP8 / MXFP8)
@@ -5231,10 +5516,14 @@ class GatedAttentionBlockFwd(APIBase):
                 k_cache_desc=self._descs["k_cache"],
                 v_cache_desc=self._descs["v_cache"],
                 block_table_desc=self._descs["block_table"],
+                # The DECODE form: the KV bound and the split the form lowers with (the defaults otherwise).
+                max_kv_len=self.max_kv_len if self.decode_route is not None else 0,
+                decode_split_kv=self.decode_split_kv if self.decode_route is not None else 1,
             )
         # Stage (5) lives in the SDPA kernel's gate epilogue under fuse_gate --
         # not built rather than built and skipped (it would still compile).
-        self._gate = None if self.fuse_gate else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
+        # gate_fused, not fuse_gate: on the DECODE form a declared fuse_gate runs as this launch when the tile runs unsplit.
+        self._gate = None if self.gate_fused else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
         # (4w) SERVING write-through of the post-RoPE K / V (+ the raw indexer key) into paged pools -- built only when
         # the declaration carries a page size; not built rather than built and skipped (it would still compile).
         self._cache_write = (
@@ -5441,7 +5730,7 @@ class GatedAttentionBlockFwd(APIBase):
             )
         return page_size
 
-    def _check_cache_write_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw) -> None:
+    def _check_cache_write_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw, seq_lens=None) -> None:
         """The serving inputs against the declaration -- FORM only (dtype / rank / shape / strides / alignment / device),
         never a value and never a sync (Rule 3).  A block declared with ``paged_kv_page_size`` REQUIRES ``k_cache`` /
         ``v_cache`` / ``slot_mapping`` (and ``index_k_raw`` iff its geometry declares the indexer band); a block declared
@@ -5491,7 +5780,7 @@ class GatedAttentionBlockFwd(APIBase):
         check_pool(v_cache, "v_cache", h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=h.device)
         check_slot_mapping(slot_mapping, "slot_mapping", t=t, device=h.device)
         if paged:
-            self._check_extend_args(h, k_cache, v_cache, block_table, kv_lens)
+            self._check_extend_args(h, k_cache, v_cache, block_table, kv_lens, seq_lens=seq_lens)
         if g.index_band:
             if index_k_raw is None:
                 raise ValueError(
@@ -5512,13 +5801,21 @@ class GatedAttentionBlockFwd(APIBase):
                 "geometry has no band, so there is no raw key to write -- refused rather than silently ignored"
             )
 
-    def _check_extend_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens) -> None:
-        """The EXTEND form's execute inputs against the declaration, FORM only (Rule 3): the pools match the declared samples'
-        shape and strides EXACTLY (the SDPA stage compiled the paged THD leg against them -- a pool of another page count or
-        layout is a different plan, never a view the adapter would silently re-bind); ``block_table`` is a 2-D int32 CUDA tensor
-        ``[num_sequences, >= max_pages]`` whose page axis is contiguous and whose row stride is the declared one (a row slice of
-        a wider table binds as a view; the SDPA reads page ids on device); ``kv_lens`` a contiguous 1-D int32 CUDA tensor of
-        exactly ``num_sequences`` entries (values -- the logical lengths -- are device data, never read here)."""
+    def _check_extend_args(self, h: torch.Tensor, k_cache, v_cache, block_table, kv_lens, seq_lens=None) -> None:
+        """The paged forms' execute inputs against the declaration, FORM only (Rule 3): the pools match the declared samples'
+        shape and strides EXACTLY (the SDPA stage compiled the paged leg against them -- a pool of another page count or layout
+        is a different plan, never a view the adapter would silently re-bind); ``block_table`` is a 2-D int32 CUDA tensor
+        ``[rows, >= max_pages]`` (``rows`` = ``num_sequences`` on the packed EXTEND form, ``B`` on the dense DECODE form) whose page
+        axis is contiguous and whose row stride is the declared one (a row slice of a wider table binds as a view; the SDPA reads
+        page ids on device); ``kv_lens`` a contiguous 1-D int32 CUDA tensor of exactly ``rows`` entries (values -- the logical
+        lengths -- are device data, never read here).  On the DECODE form ``seq_lens`` is REFUSED: the dense block's self-attention
+        length is a Q-side length, and over the pools the per-sequence KV length is ``kv_lens``, bound to the KV side only."""
+        if not self.thd and seq_lens is not None:
+            raise ValueError(
+                "seq_lens with kv_source='paged' on a dense declaration (the DECODE form): the per-sequence KV length over the pools is kv_lens "
+                "(bound to the KV side only; every Q row of the step is live), and seq_lens is the dense block's self-attention length -- a "
+                "Q-side length -- refused rather than read as one"
+            )
         for nm, x in (("k_cache", k_cache), ("v_cache", v_cache)):
             d = self._descs[nm]
             if tuple(int(s) for s in x.shape) != tuple(d.shape) or tuple(int(s) for s in x.stride()) != tuple(d.stride):
@@ -5527,14 +5824,15 @@ class GatedAttentionBlockFwd(APIBase):
                     f"compiled into the paged read); got shape {tuple(x.shape)} / strides {tuple(x.stride())}. Declare a block per pool geometry"
                 )
         bt = self._descs["block_table"]
-        b, max_pages, row_stride = self.num_sequences, int(bt.shape[1]), int(bt.stride[0])
+        b, max_pages, row_stride = (self.num_sequences if self.thd else self.batch), int(bt.shape[1]), int(bt.stride[0])
+        label = "num_sequences" if self.thd else "B"
         dev = torch.device(h.device)
         if not isinstance(block_table, torch.Tensor) or block_table.dtype != torch.int32 or block_table.dim() != 2:
             got = f"{block_table.dtype} {tuple(block_table.shape)}" if isinstance(block_table, torch.Tensor) else type(block_table).__name__
-            raise ValueError(f"block_table must be a 2-D int32 tensor [num_sequences={b}, >= max_pages={max_pages}], got {got}")
+            raise ValueError(f"block_table must be a 2-D int32 tensor [{label}={b}, >= max_pages={max_pages}], got {got}")
         if int(block_table.shape[0]) != b or int(block_table.shape[1]) < max_pages:
             raise ValueError(
-                f"block_table must be [num_sequences={b}, >= max_pages={max_pages}] (the declared sample_block_table's page axis bounds the logical "
+                f"block_table must be [{label}={b}, >= max_pages={max_pages}] (the declared sample_block_table's page axis bounds the logical "
                 f"S_kv = {max_pages * self.paged_kv_page_size}); got {tuple(block_table.shape)}"
             )
         if int(block_table.stride(1)) != 1 or (b > 1 and int(block_table.stride(0)) != row_stride):
@@ -5566,20 +5864,26 @@ class GatedAttentionBlockFwd(APIBase):
 
     # -- the serving forms: the declaration table and the envelope ------------
 
-    def _check_serving_declaration(self, kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, device):
+    def _check_serving_declaration(
+        self, kv_source, token_capacity, quant, sample_k_cache, sample_v_cache, sample_block_table, device, max_kv_len=None, decode_split_kv=None
+    ):
         """``kv_source`` / ``token_capacity`` at declaration -- the argument contract first (``kv_source`` one of
         :data:`_KV_SOURCES`; ``token_capacity`` None or a positive int equal to the samples' packed row count), then the
-        typed declines of :data:`_EXTEND_DECLINES` in order (the table :meth:`serving_envelope` publishes), then the three
-        samples' contract under ``kv_source="paged"`` (REQUIRED there, REFUSED otherwise; each pool as :func:`check_pool`
-        spells it, in the activation dtype, on ``device``, K and V of the SAME HND / NHD kind; the block table a 2-D int32
-        ``[num_sequences, max_pages >= 1]`` tensor with a contiguous page axis).  Device-free: a test pins every row anywhere.
-        Returns ``(kv_source, token_capacity)`` normalised.  Runs AFTER the write-through's own validator, so ``quant`` /
-        ``save_for_backward`` with the attribute are heard from there."""
+        typed declines of :data:`_EXTEND_DECLINES` in order (the ONE table :meth:`serving_envelope` publishes for both paged
+        forms), then the three samples' contract under ``kv_source="paged"`` (REQUIRED there, REFUSED otherwise; each pool as
+        :func:`check_pool` spells it, in the activation dtype, on ``device``, K and V of the SAME HND / NHD kind; the block table a
+        2-D int32 ``[rows, max_pages >= 1]`` tensor with a contiguous page axis, ``rows`` = ``num_sequences`` on the packed EXTEND
+        form and ``B`` on the dense DECODE form), then the DECODE form's own facts (``max_kv_len``: default ``max_pages * P``, never
+        past the table's reach; ``decode_split_kv``: None = the decode split model at THIS device's SM count -- 1 on a non-CUDA
+        device, which ``check_support`` declines anyway -- or an int >= 1; the route from :func:`decode_route`), both REFUSED on the
+        packed form and under ``"self"``.  Device-free: a test pins every row anywhere.  Returns ``(kv_source, token_capacity,
+        route, max_kv_len, split)`` -- the last three None off the DECODE form.  Runs AFTER the write-through's own validator, so
+        ``quant`` / ``save_for_backward`` with the attribute are heard from there."""
         from .cache_write_contract import check_pool
 
         if not isinstance(kv_source, str) or kv_source not in _KV_SOURCES:
             raise ValueError(
-                f"kv_source must be one of {_KV_SOURCES} ('self' = the block's own K / V, 'paged' = the EXTEND form over the pools), got {kv_source!r}"
+                f"kv_source must be one of {_KV_SOURCES} ('self' = the block's own K / V, 'paged' = the EXTEND / DECODE forms over the pools), got {kv_source!r}"
             )
         t = self.batch * self.seq_len
         if token_capacity is not None:
@@ -5595,6 +5899,7 @@ class GatedAttentionBlockFwd(APIBase):
             save_for_backward=self.save_for_backward,
             return_lse=self.return_lse,
             geometry=self.geom,
+            s_q=0 if self.thd else self.seq_len,
             fuse_gate=self.fuse_gate,
         )
         hit = _first_serving_decline(decl)
@@ -5606,25 +5911,37 @@ class GatedAttentionBlockFwd(APIBase):
                 f"token_capacity={token_capacity} must equal the samples' packed token rows T={t}: the samples ARE the capacity (declare sample_h / "
                 "sample_cos / sample_sin / sample_out with T_max rows); a step then hands lengths summing to T_live <= T_max"
             )
+        decode_extras = [nm for nm, x in (("max_kv_len", max_kv_len), ("decode_split_kv", decode_split_kv)) if x is not None]
         samples = (("sample_k_cache", sample_k_cache), ("sample_v_cache", sample_v_cache), ("sample_block_table", sample_block_table))
         if kv_source != KV_SOURCE_PAGED:
-            given = [nm for nm, x in samples if x is not None]
+            given = [nm for nm, x in samples if x is not None] + decode_extras
             if given:
                 raise ValueError(
-                    f"{', '.join(given)}: the pool / block-table samples belong to the EXTEND form (kv_source='paged'); this block was declared "
-                    f"kv_source={kv_source!r} and never reads the pools -- refused rather than silently ignored"
+                    f"{', '.join(given)}: the pool / block-table samples and the DECODE form's facts belong to the EXTEND form or the DECODE form "
+                    f"(kv_source='paged'); this block was declared kv_source={kv_source!r} and never reads the pools -- refused rather than silently ignored"
                 )
-            return kv_source, token_capacity
+            return kv_source, token_capacity, None, None, None
+        if self.thd and decode_extras:
+            raise ValueError(
+                f"{', '.join(decode_extras)}: the DECODE form's facts (a dense [B, S_q] declaration over the pools); the packed EXTEND form addresses "
+                "max_pages x P keys per sequence and runs the paged THD body unsplit -- refused rather than silently ignored"
+            )
         g, ps = self.geom, self.paged_kv_page_size
+        rows = self.num_sequences if self.thd else self.batch
+        label = "num_sequences" if self.thd else "B"
         missing = [nm for nm, x in samples if x is None]
         if missing:
             raise ValueError(
                 f"kv_source='paged' needs {', '.join(missing)} at declaration: sample_k_cache / sample_v_cache [num_pages, {g.h_kv}, {ps}, {g.d_head}] "
                 f"{self.act_dtype} (the pools' shape / dtype / strides -- HND compact, NHD by strides, or the two halves of a unified row; the "
-                f"layout is compiled in) and sample_block_table [{self.num_sequences}, max_pages] int32 (its row stride is compiled in too)"
+                f"layout is compiled in) and sample_block_table [{label}={rows}, max_pages] int32 (its row stride is compiled in too)"
             )
         for nm, x in samples[:2]:
             check_pool(x, nm, h=g.h_kv, page_size=ps, d=g.d_head, dtype=self.act_dtype, device=device)
+        if tuple(sample_k_cache.shape) != tuple(sample_v_cache.shape):
+            raise ValueError(
+                f"sample_k_cache {tuple(sample_k_cache.shape)} and sample_v_cache {tuple(sample_v_cache.shape)} must have the same [num_pages, H_kv, P, D] shape"
+            )
         if (sample_k_cache.stride(2) < sample_k_cache.stride(1)) != (sample_v_cache.stride(2) < sample_v_cache.stride(1)):
             raise ValueError(
                 "sample_k_cache and sample_v_cache must share one layout kind (both HND -- the page-row stride below the head stride -- or both "
@@ -5633,77 +5950,127 @@ class GatedAttentionBlockFwd(APIBase):
         bt = sample_block_table
         if not isinstance(bt, torch.Tensor) or bt.dtype != torch.int32 or bt.dim() != 2:
             got = f"{bt.dtype} {tuple(bt.shape)}" if isinstance(bt, torch.Tensor) else type(bt).__name__
-            raise ValueError(f"sample_block_table must be a 2-D int32 tensor [num_sequences={self.num_sequences}, max_pages >= 1], got {got}")
-        if int(bt.shape[0]) != self.num_sequences or int(bt.shape[1]) < 1:
+            raise ValueError(f"sample_block_table must be a 2-D int32 tensor [{label}={rows}, max_pages >= 1], got {got}")
+        if int(bt.shape[0]) != rows or int(bt.shape[1]) < 1:
             raise ValueError(
-                f"sample_block_table must be [num_sequences={self.num_sequences}, max_pages >= 1] (num_sequences = the packed declaration's B_max; "
+                f"sample_block_table must be [{label}={rows}, max_pages >= 1] ({label} = one row per sequence of the declaration; "
                 f"max_pages x {ps} = the logical S_kv the block tables may address), got {tuple(bt.shape)}"
             )
         if int(bt.stride(1)) != 1:
             raise ValueError(f"sample_block_table's page axis must be contiguous (stride 1; the row stride is free), got strides {tuple(bt.stride())}")
         if bt.device != torch.device(device):
             raise ValueError(f"sample_block_table must live on sample_h's device {device}, got {bt.device}")
-        return kv_source, token_capacity
+        if self.thd:
+            return kv_source, token_capacity, None, None, None
+        # The DECODE form: the KV bound, the route (served or declined -- the decode_rows row above already raised past DECODE_MAX_ROWS;
+        # this is the record the stage pins its compiled module against), the split.
+        capacity = int(bt.shape[1]) * ps
+        if max_kv_len is None:
+            max_kv_len = capacity
+        if isinstance(max_kv_len, bool) or not isinstance(max_kv_len, int) or max_kv_len < 1:
+            raise ValueError(f"max_kv_len must be a positive int (the logical KV bound kv_lens[b] <= max_kv_len), got {max_kv_len!r}")
+        if max_kv_len > capacity:
+            raise ValueError(
+                f"max_kv_len={max_kv_len} exceeds the block table's reach max_pages * P = {capacity}: a sequence longer than its table row addresses cannot be read"
+            )
+        if decode_split_kv is not None and (isinstance(decode_split_kv, bool) or not isinstance(decode_split_kv, int) or decode_split_kv < 1):
+            raise ValueError(f"decode_split_kv must be None (the decode split model) or an int >= 1, got {decode_split_kv!r}")
+        route = decode_route(g, self.seq_len)
+        if not route.served:
+            raise NotImplementedError(f"kv_source='paged': {route.reason}")
+        if decode_split_kv is None:
+            dev = torch.device(device)
+            sm = torch.cuda.get_device_properties(dev).multi_processor_count if (dev.type == "cuda" and torch.cuda.is_available()) else 0
+            split = decode_split_choice(route, batch=self.batch, h_kv=g.h_kv, max_kv_len=max_kv_len, sm_count=sm, gated=self.fuse_gate, h_q=g.h_q)
+        else:
+            split = int(decode_split_kv)
+        return kv_source, token_capacity, route, int(max_kv_len), split
 
     @classmethod
-    def serving_envelope(cls, geometry: GatedAttentionBlockGeometry, dtype: torch.dtype, device) -> ServingEnvelope:
+    def serving_envelope(
+        cls, geometry: GatedAttentionBlockGeometry, dtype: torch.dtype, device, *, device_cc: Optional[Tuple[int, int]] = None
+    ) -> ServingEnvelope:
         """The static serving envelope for ``(geometry, dtype, device)`` -- what a serving stack's INIT-time dispatch predicate
         reads instead of catching the block's exceptions.  Derived from the SAME code the constructor and ``check_support`` run:
         the device fact (Rubin, cc 10.7, the one arch every stage binds), the CuTe DSL facts (the version floor and the Rubin
-        target, exactly as the stages' ``check_support`` gates them), the dtype (bf16 / f16 activations), and the EXTEND form's
-        geometry rows of :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``head_dim``; the knob rows -- ``return_lse``,
-        ``fuse_gate`` -- are the declaration's, listed in ``declines``; a QsaSpec geometry reads
-        :data:`_QSA_THD_DECLINE`, the sparse declaration's own row the THD-only form always meets first) evaluated on
-        ``geometry`` -- so ``extend.served`` is True iff a block declared as ``extend.requires`` spells it passes its
-        declaration and ``check_support`` here, and ``extend.declines`` lists every typed decline the form raises at
-        declaration with its message.  ``forms`` holds ``"extend"`` when it is served; ``decode`` is ``None`` until the DECODE
-        form lands.  No allocation, no launch; safe to call on any device (``extend.served`` is simply False off Rubin)."""
+        target, exactly as the stages' ``check_support`` gates them), the dtype (bf16 / f16 activations), and the geometry rows of
+        :data:`_EXTEND_DECLINES` (``diagonal``, ``window``, ``sparse``, ``head_dim``) evaluated on ``geometry`` for EACH paged form.
+        The declaration rows (including ``return_lse`` and the EXTEND-only ``fuse_gate`` refusal) are listed in each form's
+        ``declines``; a THD QsaSpec geometry meets :data:`_QSA_THD_DECLINE` first.  Thus
+        ``extend.served`` / ``decode.served`` are True iff a block declared as ``requires`` spells it passes its declaration and
+        ``check_support`` here, and each form's ``declines`` lists every typed decline it raises at declaration with its message;
+        ``decode.routes`` names the kernel per ``S_q`` (:func:`decode_route`).  ``forms`` holds the served forms.  No allocation, no
+        launch; safe to call on any device (``served`` is simply False off Rubin; a non-CUDA ``device`` reads as no CUDA device).
+        ``device_cc`` (appended) overrides the device's compute capability for a host-side reading of another part's envelope."""
         from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
-        cc = tuple(torch.cuda.get_device_capability(device)) if torch.cuda.is_available() else None
+        cc = tuple(int(x) for x in device_cc) if device_cc is not None else _device_cc_of(device)
         dsl_reason = cutedsl_requirement_error("the gated attention block's serving forms")
         if dsl_reason is None and cc == _SM107_CC:
             dsl_reason = cutedsl_arch_requirement_error(cc)
-        reason = None
+        common = None
         if cc != _SM107_CC:
-            reason = (
+            common = (
                 f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only; found {'no CUDA device' if cc is None else f'SM{cc[0]}{cc[1]}'}"
             )
         elif dsl_reason is not None:
-            reason = dsl_reason
+            common = dsl_reason
         elif dtype not in (torch.bfloat16, torch.float16):
-            reason = f"the EXTEND form serves bf16 / f16 activations and pools only (quant=None), got {dtype}"
-        elif geometry.qsa is not None:
-            reason = _QSA_THD_DECLINE
-        else:
-            probe = _ServingDecl(
-                kv_source=KV_SOURCE_PAGED,
-                thd=True,
-                paged_kv_page_size=SERVING_PAGE_SIZES[0],
-                token_capacity=None,
-                save_for_backward=False,
-                return_lse=False,
-                geometry=geometry,
+            common = f"the serving forms over the pools serve bf16 / f16 activations and pools only (quant=None), got {dtype}"
+
+        def probe(thd: bool, s_q: int):
+            if common is not None:
+                return common
+            if thd and geometry.qsa is not None:
+                # the THD-only form meets the sparse declaration's own row before any row of the table (_check_qsa_declaration runs first)
+                return _QSA_THD_DECLINE
+            hit = _first_serving_decline(
+                _ServingDecl(
+                    kv_source=KV_SOURCE_PAGED,
+                    thd=thd,
+                    paged_kv_page_size=SERVING_PAGE_SIZES[0],
+                    token_capacity=None,
+                    save_for_backward=False,
+                    return_lse=False,
+                    geometry=geometry,
+                    s_q=s_q,
+                )
             )
-            hit = _first_serving_decline(probe)
-            if hit is not None:
-                reason = hit[2]
+            return None if hit is None else hit[2]
+
+        extend_reason = probe(True, 0)
         extend = ExtendEnvelope(
-            served=reason is None,
-            reason=reason,
+            served=extend_reason is None,
+            reason=extend_reason,
             requires=_EXTEND_REQUIRES,
             dtypes=(torch.bfloat16, torch.float16),
             page_sizes=SERVING_PAGE_SIZES,
             pool_layouts=SERVING_POOL_LAYOUTS,
-            declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES},
+            declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES},  # the whole table: every row a declaration can hit
         )
+        decode_reason = probe(False, 1)
+        has_group = int(geometry.h_kv) >= 1 and int(geometry.h_q) % int(geometry.h_kv) == 0
+        decode = DecodeEnvelope(
+            served=decode_reason is None,
+            reason=decode_reason,
+            requires=_DECODE_REQUIRES,
+            dtypes=(torch.bfloat16, torch.float16),
+            page_sizes=SERVING_PAGE_SIZES,
+            pool_layouts=SERVING_POOL_LAYOUTS,
+            declines={name: msg for name, _exc, _pred, msg in _EXTEND_DECLINES if name in _DECODE_DECLINE_NAMES},
+            max_s_q=DECODE_MAX_S_Q,
+            max_rows=DECODE_MAX_ROWS,
+            routes=tuple(decode_route(geometry, s) for s in range(1, 2 * DECODE_MAX_S_Q + 1)) if has_group else (),
+            _geometry=geometry,
+        )
+        forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
             device_cc=cc,
             cutedsl_ok=dsl_reason is None,
             cutedsl_reason=dsl_reason,
-            forms=("extend",) if extend.served else (),
+            forms=forms,
             extend=extend,
-            decode=None,
+            decode=decode,
         )
 
     def index_k_raw(self, workspace: torch.Tensor) -> torch.Tensor:
@@ -6346,7 +6713,7 @@ class GatedAttentionBlockFwd(APIBase):
         # checked first and the refusal reads the same on every device (Rule 3: form only, never a value, never a sync).
         self._check_qsa_execute_args(block_ids, block_lens, h)
         # The paged-cache inputs: the same kind of contract (declared with paged_kv_page_size -> required; without -> refused).
-        self._check_cache_write_args(h, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw)
+        self._check_cache_write_args(h, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw, seq_lens=seq_lens)
         if self._ws is None:
             raise RuntimeError("call compile() before execute()")
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
@@ -6605,7 +6972,7 @@ class GatedAttentionBlockFwd(APIBase):
             seq_lens=seq_lens,
             workspace=engine_ws,
             current_stream=cuda.CUstream(stream),
-            gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.fuse_gate else None,
+            gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.gate_fused else None,
             # per-tensor FP8: scalar descales; MXFP8: the three SF blobs (and NO scalars -- _Sdpa refuses them)
             descale_q=qd["descale_q"] if (fp8 and not mxfp8) else None,
             descale_k=qd["descale_k"] if (fp8 and not mxfp8) else None,
@@ -6618,7 +6985,7 @@ class GatedAttentionBlockFwd(APIBase):
             k_cache=k_cache if paged else None,
             v_cache=v_cache if paged else None,
         )
-        if not self.fuse_gate:
+        if not self.gate_fused:
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected
             # O := 0 on dead rows, so no residue reaches the sigmoid.  In place
             # under inference (`o_gated is o`); OUT of place under training, where

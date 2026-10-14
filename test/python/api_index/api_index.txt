@@ -387,6 +387,16 @@ cudnn.flex_attention.flex_attn_func
 cudnn.frost
 cudnn.frost.cutedsl_runtime_available
 cudnn.gated_attention_block
+cudnn.gated_attention_block.DECODE_MAX_ROWS
+cudnn.gated_attention_block.DECODE_MAX_S_Q
+cudnn.gated_attention_block.DecodeEnvelope
+cudnn.gated_attention_block.DecodeEnvelope.inference_only
+cudnn.gated_attention_block.DecodeEnvelope.route
+cudnn.gated_attention_block.DecodeEnvelope.writes_lse
+cudnn.gated_attention_block.DecodeRoute
+cudnn.gated_attention_block.DecodeRoute.decode_tile
+cudnn.gated_attention_block.DecodeRoute.reason
+cudnn.gated_attention_block.DecodeRoute.served
 cudnn.gated_attention_block.ExtendEnvelope
 cudnn.gated_attention_block.ExtendEnvelope.inference_only
 cudnn.gated_attention_block.ExtendEnvelope.writes_lse
@@ -501,6 +511,7 @@ cudnn.gated_attention_block.SavedForBackward.seq_lens_form
 cudnn.gated_attention_block.ServingEnvelope
 cudnn.gated_attention_block.ServingEnvelope.decode
 cudnn.gated_attention_block.build_fused_qkvg_weight
+cudnn.gated_attention_block.decode_route
 cudnn.gated_attention_block.gated_attention_block_backward
 cudnn.gated_attention_block.gated_attention_block_forward
 cudnn.gated_attention_block.index_k_raw_view
