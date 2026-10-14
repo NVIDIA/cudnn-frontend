@@ -6344,20 +6344,19 @@ class GatedAttentionBlockFwd(APIBase):
                 hint=f" (the decode mode's SHARED list: one row per sequence selected at the step-0 position kv_lens[b] - {self.seq_len}; a per-token "
                 f"[{t}, {top_k}] / [{b}, {self.seq_len}, {top_k}] list is the form of a declaration with S_q > 4)",
             )
-            if block_lens is not None:
-                _check_index_tensor(block_lens, "block_lens", (b,), (b,), h.device, hint=" (one count per sequence under the shared list)")
-            return
-        _check_index_tensor(
-            block_ids,
-            "block_ids",
-            (t, top_k),
-            (self.batch, self.seq_len, top_k),
-            h.device,
-            hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form: a dense declaration with S_q <= 4 over the pools, kv_source='paged')",
-        )
+        else:
+            _check_index_tensor(
+                block_ids,
+                "block_ids",
+                (t, top_k),
+                (self.batch, self.seq_len, top_k),
+                h.device,
+                hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form: a dense declaration with S_q <= 4 over the pools, kv_source='paged')",
+            )
         # The sparse core binds block_ids as a TMA / bulk-copy base (assumed_align=16): the adapter refuses a view that starts off a
         # 16-byte boundary (a storage offset of a few ids) -- but at stage (4), after the projection, norm + RoPE and a declared
-        # write-through have already run.  The same rule here, before any stage, so the refusal modifies nothing.
+        # write-through have already run.  The same rule here, before any stage and on BOTH list forms (a review found the shared form
+        # returning above it), so the refusal modifies nothing.
         ptr = int(block_ids.data_ptr())
         if ptr % 16:
             raise ValueError(
@@ -6365,7 +6364,10 @@ class GatedAttentionBlockFwd(APIBase):
                 f"is refused before any stage runs); got data_ptr=0x{ptr:x}"
             )
         if block_lens is not None:
-            _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
+            if self.qsa_shared_list:
+                _check_index_tensor(block_lens, "block_lens", (self.batch,), (self.batch,), h.device, hint=" (one count per sequence under the shared list)")
+            else:
+                _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
 
     # -- paged-cache write-through (serving) ---------------------------------
 

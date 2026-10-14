@@ -341,7 +341,8 @@ def test_execute_form_checks_of_the_sparse_decode_mode():
     """On an UNCOMPILED block (the index tensors and the paged inputs are a declaration-vs-argument contract: checked first, no
     plan, no sync): the shared-list form takes ``block_ids [B, top_k]`` / ``block_lens [B]`` and refuses the per-token spelling
     by name, the per-token form the reverse; ``seq_lens`` is refused over the pools; the table is the WHOLE declared
-    ``(B, max_pages)`` table; ``kv_lens`` is required; an int64 list is refused, never converted."""
+    ``(B, max_pages)`` table; ``kv_lens`` is required; an int64 list is refused, never converted; a ``block_ids`` view off the 16-byte
+    base alignment is refused on the shared form as on the per-row form (the aligned storage-offset control passes)."""
     with _no_host_sync():
         blk, aux = _declare(GEOM_SMALL, 2, 2, n_pages=4)
         per_tok, aux8 = _declare(GEOM_SMALL, 2, 8, n_pages=4)
@@ -390,6 +391,14 @@ def test_execute_form_checks_of_the_sparse_decode_mode():
             run(blk, s_q=2, ids=i32(2, 512), table=i32(2, 6))  # wider than the declared table: the sparse core binds exactly (B, max_pages)
         with pytest.raises(ValueError, match="block_table"):
             run(blk, s_q=2, ids=i32(2, 512), table=i32(2, 8)[:, :4])
+        # The 16-byte base alignment of block_ids (the sparse core binds it as a TMA / bulk-copy base) is refused BEFORE any stage on the
+        # SHARED form too -- a storage-offset view one id (4 bytes) in; the control four ids (16 bytes) in passes every form check and stops at
+        # the uncompiled block's own gate, as does the plain list.  (A review found the shared form returning before this check.)
+        base = i32(4 + 2 * 512)
+        with pytest.raises(ValueError, match="16-byte aligned"):
+            run(blk, s_q=2, ids=base[1 : 1 + 2 * 512].view(2, 512))
+        with pytest.raises(RuntimeError, match="compile"):
+            run(blk, s_q=2, ids=base[4 : 4 + 2 * 512].view(2, 512))
         with pytest.raises(RuntimeError, match="compile"):
             run(blk, s_q=2, ids=i32(2, 512))  # every form check passed: the uncompiled block stops at its own gate
 
