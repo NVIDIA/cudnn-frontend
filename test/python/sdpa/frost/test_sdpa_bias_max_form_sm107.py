@@ -20,7 +20,9 @@ module's degenerate-input sweep, the three bias ranges of the numerics protocol 
 with the worst-case slack |m_upper - m_true| documented per cell, the kv_mask fully masked row exactly 0 / -inf, the ring-wrap axis on
 the kv_mask arm; the MEASURED per-form default (``config_sm107.sm107_bias_max_form_default``: the hardware bound on the kv_mask-only form,
 the software tree with a bias) evidenced on the executed plan's record, and the default kv_mask-only plan's identity property (a mask of
-all True is bitwise the plain kernel).
+all True is bitwise the plain kernel); and the DOCUMENTED LIMIT of the hardware bound WITH a bit-word kv_mask -- the bound ignores the
+mask, so a row whose masked-out columns carry a bias more than the fp32 exp2 range above its kept columns underflows every kept P and
+ends with O = 0 / Stats = -inf (finite, silent, wrong) -- pinned as the reason the measured default keeps the software tree with a bias.
 """
 
 import dataclasses
@@ -519,3 +521,83 @@ def test_hw_form_kv_mask_fully_masked_row_is_exactly_zero_and_minus_inf(_hw_form
     assert (out["o"][1] == 0).all() and torch.isneginf(out["stats"][1]).all()
     ref = _s13._ref(q, k, v, scale=1.0 / math.sqrt(d), kv_mask=kv_mask)
     _s13._check(out, ref)
+
+
+def _run_forms_on_the_pair_item(q, k, v, kw, monkeypatch, forms=(0, 1)):
+    """The software and the hardware form on the SAME inputs, the EXECUTED form read from the loaded record, on the RESIDENT PAIR item pinned
+    through the mode / chunk seams (n_chunk 2, the resident block) so the cell renders the same item on every device (the heuristics' chunk pick
+    reads the SM count, and at a tiny flattened batch on a long sequence they pick the one-batch-entry ring)."""
+    from cudnn.sdpa.fwd import config_sm107 as c
+
+    seen = _spy_loaded_forms(monkeypatch)
+    monkeypatch.setattr(c, "_N_CHUNK_OVERRIDE_FOR_SWEEPS", 2)
+    monkeypatch.setattr(c, "_BIAS_MODE_OVERRIDE_FOR_SWEEPS", 1)
+    outs = {}
+    for form in forms:
+        monkeypatch.setattr(c, "_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS", form)
+        del seen[:]
+        out = _s13._run(q, k, v, **kw)
+        outs[form] = (out, set(seen))
+    monkeypatch.setattr(c, "_BIAS_MAX_FORM_OVERRIDE_FOR_SWEEPS", None)
+    monkeypatch.setattr(c, "_N_CHUNK_OVERRIDE_FOR_SWEEPS", None)
+    monkeypatch.setattr(c, "_BIAS_MODE_OVERRIDE_FOR_SWEEPS", None)
+    return outs
+
+
+@requires_rubin
+@pytest.mark.parametrize("tile_n", [128, 64], ids=["t128", "t64"])
+def test_hw_form_underflows_a_row_whose_masked_columns_carry_a_bias_far_above_its_kept_columns(tile_n, monkeypatch):
+    """The DOCUMENTED LIMIT of the hardware upper bound WITH a bit-word kv_mask (the software form 0 has none of it): the bound ignores the
+    mask, so when the masked-out columns of a row's kv tile carry a bias ABOVE the kept columns' by more than the fp32 exp2 range (~126 log2
+    units = ~87 natural units, less the row's raw-score slack), every kept P of that tile underflows to 0; a row whose EVERY tile does so ends
+    with total_sum == 0 and the epilogue's empty-row SELECT reads O = 0 / Stats = -inf -- finite, silent, wrong.  No trained model's additive
+    bias has that structure (a masked-fold bias puts the LOW values on the masked columns, so the kept columns define the max), but the
+    numerics protocol's 10 000-scale random bias with an independent random kv_mask does, and the protocol's 1e4 case ran WITHOUT a mask.
+    Pinned here so the limit is visible: form 0 passes the oracle; the rows form 1 kills are EXACTLY the rows the host model of the bound
+    predicts (every tile's bound more than 126 log2 units above the kept columns' true max; the band the running max's lag leaves
+    ambiguous is not asserted), the killed rows read O = 0, and every surviving row stays within the oracle.  A DEFAULT must not route a
+    bias + kv_mask plan onto the hardware bound without a mask-aware bound -- ``sm107_bias_max_form_default`` keeps the software tree with a
+    bias (pinned above) -- and the kv_mask-only default is unaffected (its slack is the raw-score range, the 60-log2-unit assertion above)."""
+    torch.manual_seed(5)
+    b, h, s, d = 2, 2, 256, 32
+    dtype = torch.bfloat16
+    q, k, v = (_s13._bhsd(b, h, s, d, dtype) for _ in range(3))
+    bias = (torch.randn(1, h, s, s, device="cuda") * 1e4).to(dtype)
+    kv_mask = torch.rand(b, 1, 1, s, device="cuda") > 0.3
+    scale = 1.0 / math.sqrt(d)
+    kw = dict(scale=scale, bias=bias, kv_mask=kv_mask, sdpa_kwargs={}, seq_len_kv=None, seq_len_q=None, sink=None, cga=None, tile_n=tile_n)
+    ref = _s13._ref(q, k, v, scale=scale, bias=bias, kv_mask=kv_mask)
+    outs = _run_forms_on_the_pair_item(q, k, v, kw, monkeypatch)
+    (sw, seen0), (hw, seen1) = outs[0], outs[1]
+    assert seen0 == {0} and seen1 == {1}, (seen0, seen1)
+    _s13._check(sw, ref)  # the software tree: the true row max, no cliff
+    live = ~ref["empty"]
+    # The host model of the bound, per ROW: gap = (the largest per-tile bound of the row) - (the row's true kept max), in log2 units.  The
+    # kernel's online softmax flushes a P below 2^-126 (ex2.approx.ftz) and rescales a partial sum by exp2(m_t - m_final), so a row whose
+    # every kept column sits more than 126 log2 units under the final running max ends with total_sum == 0.  The running max may lag the
+    # largest bound by up to RESCALE_THRESHOLD (an update only beyond the threshold), which can only HELP a row survive -> the two
+    # unambiguous bands: gap > 126 + threshold is CERTAINLY killed, gap < 126 - 1 CERTAINLY survives; rows in between are not asserted.
+    from cudnn.sdpa.fwd.config_sm107 import rescale_threshold as _rescale_threshold
+
+    thr = float(_rescale_threshold(2))  # the bf16 record's threshold (dtype_qkv 2)
+    s_raw = torch.matmul(q.double(), k.double().transpose(-1, -2))
+    b_ = bias.double().expand_as(s_raw)
+    keep = kv_mask.view(b, 1, 1, s).expand_as(s_raw)
+    log2e = math.log2(math.e)
+    m_bound = torch.full((b, h, s), float("-inf"), dtype=torch.float64, device="cuda")
+    true_kept = torch.full((b, h, s), float("-inf"), dtype=torch.float64, device="cuda")
+    for t0 in range(0, s, tile_n):
+        sr, br, kp = s_raw[..., t0 : t0 + tile_n], b_[..., t0 : t0 + tile_n], keep[..., t0 : t0 + tile_n]
+        m_bound = torch.maximum(m_bound, (sr.max(-1).values * scale + br.max(-1).values) * log2e)
+        true_kept = torch.maximum(true_kept, (sr * scale + br).masked_fill(~kp, float("-inf")).max(-1).values * log2e)
+    gap = m_bound - true_kept
+    killed = (hw["stats"].squeeze(-1) == float("-inf")) & live
+    assert killed.any(), "the stress case is meant to trip the limit; it did not -- re-derive the magnitudes"
+    assert bool((gap[killed] > 126.0 - 1.0).all()), "a row the hardware bound killed had its kept max within the exp2 range of the bound"
+    assert bool(killed[live & (gap > 126.0 + thr)].all()), "a row whose kept max is beyond the exp2 range of every bound must end with total_sum == 0"
+    assert bool((~killed[live & (gap < 126.0 - 1.0)]).all()), "a row whose kept max is inside the exp2 range of the bound must survive"
+    assert (hw["o"][killed] == 0).all()
+    # ... and on the surviving rows the hardware form is within the oracle (the bound is a valid upper bound wherever it does not underflow)
+    alive = live & ~killed
+    torch.testing.assert_close(hw["o"][alive].double(), ref["o"][alive].double(), **_s13._TOL_O)
+    torch.testing.assert_close(hw["stats"].squeeze(-1)[alive].double(), ref["lse"][alive], **_s13._TOL_LSE)
