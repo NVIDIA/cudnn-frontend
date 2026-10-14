@@ -251,13 +251,23 @@ def _frost_plan_names(q, k, v, kw):
         seq_len_q=kw["seq_len_q"],
         sink=kw["sink"],
     )
-    g.create_execution_plans([cudnn.heur_mode.A])
+    try:
+        g.create_execution_plans([cudnn.heur_mode.A])
+    except Exception as exc:  # noqa: BLE001 -- the typed graph-level decline
+        if type(exc).__name__ == "cudnnGraphNotSupportedError":
+            # no engine at all proposed a plan (a kv_mask graph has no backend lowering): the row's decline IS the whole answer
+            return []
+        raise
     return [g.get_plan_name_at_index(i) for i in range(len(g.plans))]
 
 
+# (case, dtype) pairs: every in-budget case in bf16; fp16 on every case but the -1e9 key fold (not representable in fp16 -- the models'
+# fp16 fold is a smaller finite value; the Rubin module runs that case in bf16 only too).
+_BIAS_CELLS = [(c, torch.bfloat16) for c in _IN_BUDGET] + [(c, torch.float16) for c in _IN_BUDGET if c != "bias_neg1e9_key_fold"]
+
+
 @requires_sm100_line
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("case", _IN_BUDGET)
+@pytest.mark.parametrize("case,dtype", _BIAS_CELLS, ids=[f"{c}-{'bf16' if d == torch.bfloat16 else 'fp16'}" for c, d in _BIAS_CELLS])
 def test_bias_matches_the_fp64_oracle_on_sm100(case, dtype):
     """The additive bias over the degenerate-input matrix inside the SM100 resident budget, both dtypes: the plan is the row's unsplit plan
     at the budget's width (cga1 on the 32-wide tile, cga2 on the 64-wide one), O and Stats against the fp64 oracle, keyless rows exactly
@@ -331,7 +341,8 @@ def test_additive_kv_mask_vector_matches_the_fp64_oracle_on_sm100(dtype):
         q, k, v, kw, _ = _t7._case_inputs("dense_nkv2", dtype, kv_mask_p=0.3)
         kw.pop("cga", None)
         keep = kw["kv_mask"]
-        kw["kv_mask"] = torch.where(keep, torch.zeros((), device="cuda", dtype=vec_dtype), torch.full((), -1e9, device="cuda", dtype=vec_dtype)).to(vec_dtype)
+        fold = -1e9 if vec_dtype != torch.float16 else -6.0e4  # the models' finite fold; fp16 holds no -1e9
+        kw["kv_mask"] = torch.where(keep, torch.zeros((), device="cuda", dtype=vec_dtype), torch.full((), fold, device="cuda", dtype=vec_dtype)).to(vec_dtype)
         if not with_bias:
             kw["bias"] = None
         ref_kw = dict(kw, kv_mask=keep)
