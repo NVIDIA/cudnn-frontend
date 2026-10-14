@@ -748,8 +748,9 @@ class TestMemory:
         if DEV != "cuda":
             pytest.skip("the 32K cell needs a GPU")
         free, total = torch.cuda.mem_get_info()
-        if total < 24 * 2**30:
-            pytest.skip(f"the 32K cell needs a >= 24 GiB device, this one has {total / 2**30:.1f} GiB")
+        if free < 24 * 2**30:
+            # FREE memory, not the device's total: a host whose memory is in use skips instead of failing on an allocation
+            pytest.skip(f"the 32K cell needs >= 24 GiB of free device memory, this device has {free / 2**30:.1f} GiB free of {total / 2**30:.1f}")
         g = GEOMETRY_FLASH_NEXT
         S = 32768
         torch.cuda.synchronize()
