@@ -1,5 +1,7 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Portions adapted from prefill_d512_f16.py (the SM90 D512 template) retain its MIT terms; the rest of this
+# file is licensed under Apache-2.0. See LICENSING.md and THIRD_PARTY_LICENSES.txt.
 
 """
 A fused multi-head attention (FMHA) FP16/BF16 prefill kernel for D=128 heads on NVIDIA
