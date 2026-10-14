@@ -17,15 +17,21 @@ every N tile is ``[value block | gate block]`` and the epilogue pairs local colu
 output).  Several ``passes`` (the triangle multiplicative update's ``a`` and ``b`` projections) share one activation and take
 their own weight / bias / output plane; the per-row ``(mean, rstd)`` of the LayerNorm go to GMEM once (pass 0) for a backward.
 
-The kernel BODY is the rendered sm_107a FROST GEMM template (``gemm/frost/sm100/kernel_templates/sm100_matmul.py``,
+The kernel BODY is the rendered FROST GEMM template (``gemm/frost/sm100/kernel_templates/sm100_matmul.py``,
 ``CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma``: a cta_group::2 pair computing 256 pair rows x 256 columns, K
 streamed in 64-wide stages, persistent CLC scheduler) plus two arms -- a LayerNorm PROLOGUE on the A stages in SMEM (4 extra
-warps, one pair row per lane) and the gated-pairing EPILOGUE with a channel-major (transposed) TMA store.  The body is
-``sm107_dual_gemm.py`` in THIS package (:func:`body_path`; one rendered body per arch, named ``sm<NNN>_dual_gemm.py`` like the
-arch trees' templates -- the sm_100a body of a later step goes beside it, and the host picks by arch); its module docstring carries
-the barrier table with the per-warp arrival ledger, the SMEM table with swizzle + why, and the row-block tiling below.  A rendering
-for one arch is not a registry template, which is why it does not sit in a ``kernel_templates/`` directory (the template inventory
-sweeps and the arch-family resolver define those files).  Consumers: the triangle multiplicative update's K1
+warps, one pair row per lane) and the gated-pairing EPILOGUE with a channel-major (transposed) TMA store.  ONE rendered body per
+arch family lives in THIS package, named ``sm<NNN>_dual_gemm.py`` like the arch trees' templates (:data:`BODIES`, :func:`body_path`;
+:func:`body_arch_for_cc` picks it from the device's compute capability): ``sm107_dual_gemm.py`` for Rubin (cc 10.7: the 327 KiB
+carveout, 576 TMEM columns, a 9-deep operand ring) and ``sm100_dual_gemm.py`` for Blackwell (cc 10.0 / 10.3: the 227 KiB opt-in
+carveout, 512 TMEM columns, a 6-deep ring).  The two files differ ONLY in the arch constants the renderer itself moves between the
+two targets (the ring depth, the TMEM column count and allocation mode, the compile target, the L2 rasterization budget, the
+B-collector flag) and in the docstring paragraph that states them -- every kernel line, barrier and ``const_expr`` arm is the same
+text (``diff`` them: the K1 test module pins it), so a fix lands in the Rubin body and is carried to the other by that diff.  Each
+module docstring carries the barrier table with the per-warp arrival ledger, the SMEM table with swizzle + why, and the row-block
+tiling below.  A rendering for one arch is not a registry template, which is why it does not sit in a ``kernel_templates/``
+directory (the template inventory sweeps and the arch-family resolver define those files).  The per-arch GEOMETRY the host reads
+(:data:`RING_STAGES_BY_ARCH`, :data:`SMEM_BUDGET_BYTES_BY_ARCH`) is what sizes the LayerNorm-once resident region and bounds K.  Consumers: the triangle multiplicative update's K1
 (``cudnn.triangle_multiplicative_update.kernels.trimul_proj``, ``pairing = "columns"``) and its K3
 (``kernels.trimul_tail``, ``pairing = "accumulators"``: two GEMMs of N = c_out each, the value from a LayerNormed MN-major operand,
 the gate from a LayerNormed K-major one, the pairing ACROSS the two accumulators, a pair-major output -- :func:`run_ln_dual_gemm_tail`);
@@ -113,21 +119,61 @@ MIN_BLOCKS_PER_MP_DOMAIN = (0, 1)
 #: block, ONE N tile) across the passes (a finer persistent tail for small N; the LayerNorm multiplicity halves instead of vanishing).  An item of
 #: ONE tile (K3 at c_out 128; ``"passes"`` under the accumulators arm) is a typed decline: the resident region would be dead weight.
 LN_ONCE_FORMS = ("", "block", "passes")
-#: The sm_107a body's operand ring depth per pairing -- 9 x (16 + 16) KiB (columns) / 6 x (2 x 16 + 2 x 8) KiB (accumulators) = 288 KiB either
-#: way -- and its per-stage operand bytes: the lever's SMEM predicate (:func:`ln_once_a_slots`) reads them HERE, the body re-derives them from
-#: the same arm, and the K1 test module pins the agreement (a drift would size the resident region against a ring the body no longer has).
-RING_STAGES = {"columns": 9, "accumulators": 6}
+#: Each body's operand ring depth per pairing, PER ARCH FAMILY -- the renderer's own arithmetic for this tile at the part's per-CTA SMEM
+#: (floor((budget - 2048 reserve - 16400 staging) / 32 KiB) for the columns arm; the accumulators arm re-cuts the SAME bytes into 48 KiB stages):
+#: sm107 (327 KiB carveout) 9 x (16 + 16) KiB / 6 x (2 x 16 + 2 x 8) KiB = 288 KiB either way; sm100 (227 KiB opt-in) 6 x 32 KiB / 4 x 48 KiB
+#: = 192 KiB.  The lever's SMEM predicate (:func:`ln_once_a_slots`) reads them HERE, each body re-derives them from the same arm and checks the
+#: agreement at load, and the K1 test module pins it per arch (a drift would size the resident region against a ring the body no longer has).
+RING_STAGES_BY_ARCH = {
+    "sm107": {"columns": 9, "accumulators": 6},
+    "sm100": {"columns": 6, "accumulators": 4},
+}
+#: The sm107 body's ring depths (the historical name; :func:`ring_stages` is the per-arch accessor).
+RING_STAGES = RING_STAGES_BY_ARCH["sm107"]
+#: The per-CTA dynamic SMEM each arch family's part gives a CTA, what the bodies' load-time budget check reads: Rubin's 320 KiB oversized
+#: carveout (the body's ~309 KiB fits), Blackwell's 227 KiB opt-in limit (the ~220 KiB sm100 body fits; the overflow of either would not fail
+#: the launch visibly -- sdpa-invariants S 6).
+SMEM_BUDGET_BYTES_BY_ARCH = {"sm107": 320 * 1024, "sm100": 227 * 1024}
 A_STAGE_BYTES = (PAIR_TILE_ROWS // 2) * K_STAGE * 2  #: one 128-row x 64-channel bf16 A stage per operand (16 KiB)
 B_STAGE_BYTES = {
     "columns": (PAIR_TILE_ROWS // 2) * K_STAGE * 2,
     "accumulators": (PAIR_TILE_ROWS // 4) * K_STAGE * 2,
 }  #: each CTA's half of the N tile per B operand
 #: The rendered kernel bodies, one per arch family (``sm<NNN>_dual_gemm.py`` beside this file); ``build_ln_dual_gemm`` picks by name.
-BODIES = {"sm107": "sm107_dual_gemm.py"}
+BODIES = {"sm107": "sm107_dual_gemm.py", "sm100": "sm100_dual_gemm.py"}
+#: The compute capabilities each body serves (SM103 runs the sm100 body: the same 227 KiB / 512-column part geometry) and, per body, the cc the
+#: CuTe-DSL target gate is asked about (``cutedsl_arch_requirement_error``: the sm_107a target exists only on DSL builds that know Rubin).
+ARCHS_BY_CC = {(10, 0): "sm100", (10, 3): "sm100", (10, 7): "sm107"}
+ARCH_GATE_CC = {"sm100": (10, 0), "sm107": (10, 7)}
+
+
+def body_arch_for_cc(cc) -> str:
+    """The body (``"sm100"`` / ``"sm107"``) for a device's compute capability; a typed decline (``NotImplementedError``) for a part neither body
+    was rendered for -- never a silent fallback to another arch's budget."""
+    key = tuple(int(x) for x in cc)
+    if key not in ARCHS_BY_CC:
+        served = ", ".join(f"{a}.{b}" for a, b in sorted(ARCHS_BY_CC))
+        raise NotImplementedError(f"the LayerNorm-prologue dual GEMM is rendered for compute capabilities {served} only today; found {key[0]}.{key[1]}")
+    return ARCHS_BY_CC[key]
+
+
+def ring_stages(arch: str, pairing: str) -> int:
+    """The ``arch`` body's operand ring depth for ``pairing`` (:data:`RING_STAGES_BY_ARCH`; a typed decline for an unknown arch or pairing)."""
+    if arch not in RING_STAGES_BY_ARCH:
+        raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(RING_STAGES_BY_ARCH)} only, not {arch!r}")
+    if pairing not in PAIRINGS:
+        raise ValueError(f"pairing must be one of {PAIRINGS}, got {pairing!r}")
+    return RING_STAGES_BY_ARCH[arch][pairing]
+
+
+def max_k(arch: str, pairing: str) -> int:
+    """The largest LayerNorm width the ``arch`` body serves for ``pairing``: every K stage of a tile stays resident in the ring, so
+    ``K <= 64 x ring_stages`` -- sm107 576 (columns) / 384 (accumulators), sm100 384 / 256."""
+    return K_STAGE * ring_stages(arch, pairing)
 
 
 def body_path(arch: str = "sm107") -> str:
-    """The rendered body for ``arch`` (a typed decline for an arch without one -- the sm_100a body is a later step)."""
+    """The rendered body for ``arch`` (a typed decline for an arch family without one -- never a silent fallback to another arch's body)."""
     if arch not in BODIES:
         raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(BODIES)} only, not {arch!r}")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), BODIES[arch])
@@ -138,7 +184,7 @@ class LnDualGemmParams:
     """Compile-time shape of one LayerNorm-prologue gated dual GEMM artifact (the template's ``FROST_TEMPLATE_PARAMS``).
 
     ``k``: the LayerNorm width = GEMM K (a multiple of 64; the kernel keeps every K stage of a tile resident, so at most
-    ``ab_stages * 64`` -- 576 on the sm_107a rendering).  ``c_out``: output channels per pass (a multiple of 128; the GEMM's
+    ``ab_stages * 64`` -- :func:`max_k` per arch body and pairing: 576 / 384 on the sm_107a rendering, 384 / 256 on the sm_100a one).  ``c_out``: output channels per pass (a multiple of 128; the GEMM's
     N is ``2 * c_out``).  ``passes``: weight / bias / output planes sharing one activation.  ``has_bias``: the projection
     biases are present (else folded out at the ABI).  ``want_stats``: write ``(mean, rstd)`` per row.  ``has_mask``: a per-row
     mask tensor is bound (else every valid row has mask 1).  ``skip_masked_tiles``: the warp-vote skip of fully masked tiles
@@ -254,24 +300,47 @@ def ln_once_tiles_per_item(p: LnDualGemmParams) -> int:
     return p.passes * ln_once_n_tiles_per_item(p) if p.ln_once else 1
 
 
-def ln_once_a_slots(p: LnDualGemmParams) -> int:
-    """The resident A region's slot count under the lever: 2 (the next item's load + LayerNorm overlap this item's tiles) where the two-slot region
-    plus the shipped B ring fit in the bytes of the shipped A/B ring (the layout the rendering already launches at -- a self-referential predicate,
-    no carveout constant), else 1 (K3 at c_out 256: 2 operands x 4 stages x 2 slots = 256 KiB would leave one B stage).  0 when the lever is off.
-    One source for the body, the validator and the tests."""
+def ln_once_a_slots(p: LnDualGemmParams, arch: str = "sm107") -> int:
+    """The resident A region's slot count under the lever on the ``arch`` body: 2 (the next item's load + LayerNorm overlap this item's tiles)
+    where the two-slot region plus the shipped B ring fit in the bytes of that body's shipped A/B ring (the layout the rendering already launches
+    at -- a self-referential predicate per arch, no carveout constant), else 1.  sm107: 1 at K3 c_out 256 only (2 operands x 4 stages x 2 slots =
+    256 KiB would leave one B stage); sm100 (the 6-deep ring): 1 at K3 c_out 256 AND at K1 K = 256 (2 x 64 KiB + the 96 KiB B ring > 192 KiB) --
+    there the next item's LayerNorm no longer overlaps the current item's tiles.  0 when the lever is off.  One source for the body, the validator
+    and the tests."""
     if not p.ln_once:
         return 0
-    ring = RING_STAGES[p.pairing]
+    ring = ring_stages(arch, p.pairing)
     off_bytes = ring * (p.num_a_operands * A_STAGE_BYTES + p.num_b_operands * B_STAGE_BYTES[p.pairing])
     b_ring_bytes = ring * p.num_b_operands * B_STAGE_BYTES[p.pairing]
     region_bytes = p.num_a_operands * p.k_stages * A_STAGE_BYTES
     return 2 if 2 * region_bytes + b_ring_bytes <= off_bytes else 1
 
 
-def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
-    """Typed declines for every value a caller can trip (never a module-level assert -- engine contract S 7)."""
+#: The sm100 body's one rendering class ptxas cannot allocate (measured by host trace-compile for sm_100a, 2026-10-13: the whole K = 256 map of
+#: both arms x stats on / off x both MN-major prologues; the sm107 body renders every member, spilling 469-1124 words): the register-form LayerNorm
+#: (the row held in registers between the passes) with a PACKED epilogue at K >= 256 -- every accumulators-arm member (stats on or off), and the
+#: columns arm's bias-path members (`packed_hoist` / `packed_biasfold`) WITH the statistics write (the plain `packed` columns rendering and the
+#: no-statistics bias-path ones allocate).  No production pick is in the class (the heuristics choose a re-read form at c 256 on both
+#: architectures); a caller's knob that lands in it is a typed decline, never a `cute.compile` error.
+_SM100_UNALLOCATABLE_MIN_K = 4 * K_STAGE
+
+
+def sm100_register_form_unallocatable(p: LnDualGemmParams, arch: str) -> bool:
+    """Whether ``p`` is in the sm100 body's C7600 class (module comment above); always False for the sm107 body."""
+    if arch != "sm100" or p.ln_pass_form != "registers" or p.epi_math == "scalar" or p.k < _SM100_UNALLOCATABLE_MIN_K:
+        return False
+    if p.dual:
+        return True
+    return bool(p.want_stats) and p.epi_math in ("packed_hoist", "packed_biasfold")
+
+
+def validate_ln_dual_gemm_params(p: LnDualGemmParams, arch: str = "sm107") -> None:
+    """Typed declines for every value a caller can trip (never a module-level assert -- engine contract S 7); ``arch`` names the body whose
+    ring bounds K (:func:`max_k`): the same record can be valid for the Rubin body and a decline for the Blackwell one."""
     if not isinstance(p, LnDualGemmParams):
         raise TypeError(f"expected LnDualGemmParams, got {type(p).__name__}")
+    if arch not in BODIES:
+        raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(BODIES)} only, not {arch!r}")
     if p.k <= 0 or p.k % K_STAGE != 0:
         raise ValueError(f"the LayerNorm width K must be a positive multiple of {K_STAGE} (one TMA / MMA stage), got {p.k}")
     if p.c_out <= 0 or p.c_out % CHANNEL_BLOCK != 0:
@@ -306,6 +375,19 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
         )
     if p.ln_once not in LN_ONCE_FORMS:
         raise ValueError(f"ln_once must be one of {LN_ONCE_FORMS}, got {p.ln_once!r}")
+    if p.pairing in PAIRINGS and p.k > max_k(arch, p.pairing):
+        raise ValueError(
+            f"the {arch} body keeps every K stage of a tile resident in its {ring_stages(arch, p.pairing)}-deep operand ring (pairing {p.pairing!r}): "
+            f"K must be <= {max_k(arch, p.pairing)}, got {p.k}"
+        )
+    if sm100_register_form_unallocatable(p, arch):
+        raise ValueError(
+            f"the sm100 body cannot render K={p.k} with ln_pass_form='registers' and epi_math={p.epi_math!r}"
+            f"{' (want_stats=True)' if not p.dual else ''} for pairing {p.pairing!r}: ptxas fails to allocate the LayerNorm row held in registers plus the "
+            "packed epilogue at the flat 168-register entry count (C7600 'Register allocation failed with register count of 168' on sm_100a; the sm107 body "
+            "renders the same record with hundreds of spilled words).  Use a re-read LayerNorm form (ln_pass_form='smem_rolled' / 'smem_rolled_pf': the "
+            "measured picks at this width on both architectures) or the scalar epilogue"
+        )
     if p.ln_once:
         if ln_once_tiles_per_item(p) < 2:
             raise ValueError(
@@ -337,8 +419,6 @@ def validate_ln_dual_gemm_params(p: LnDualGemmParams) -> None:
             raise ValueError(f"pairing='accumulators' has one output: passes must be 1, got {p.passes}")
         if p.a0_major != "mn":
             raise ValueError("pairing='accumulators' is written for an MN-major operand 0 (the channel-major y rows); a0_major must be 'mn'")
-        if p.k > 6 * K_STAGE:
-            raise ValueError(f"pairing='accumulators' keeps every K stage of a tile resident in a 6-deep ring: K must be <= {6 * K_STAGE}, got {p.k}")
         if p.ln_pass_form != "registers" and p.a0_prologue != "mn_major":
             raise ValueError(
                 f"ln_pass_form={p.ln_pass_form!r} re-reads operand 0's MN-major stage in every LayerNorm pass; a0_prologue='transpose' overwrites the "
@@ -453,19 +533,23 @@ class LnDualGemmPlan:
 
 @lru_cache(maxsize=None)
 def build_ln_dual_gemm(params: LnDualGemmParams, arch: str = "sm107") -> LnDualGemmPlan:
-    """Load the ``arch`` body specialized for ``params`` and cute-compile it.  Shapes (rows, bn, n_res) are runtime.
+    """Load the ``arch`` body (:data:`BODIES`; :func:`body_arch_for_cc` names it from the device) specialized for ``params`` and cute-compile it.
+    Shapes (rows, bn, n_res) are runtime.
 
     The CuTe-DSL gates run HERE, not only in the API layer above (the substrate is a public module: the kernel test modules and the
-    triangle-attention projection build on it): below the DSL floor, or on a DSL without the sm_107a target, the failure is a typed
-    ``NotImplementedError`` naming the version -- never the DSL's own ``KeyError: 'sm_107a'`` out of ``cute.compile``.  The target
-    check is unconditional while the only rendered body is the sm_107a one."""
+    triangle-attention projection build on it): below the DSL floor, or -- for the sm107 body -- on a DSL without the sm_107a target, the
+    failure is a typed ``NotImplementedError`` naming the version -- never the DSL's own ``KeyError: 'sm_107a'`` out of ``cute.compile``.
+    The target gate is asked about the BODY's arch (:data:`ARCH_GATE_CC`), not the device's: the sm100 body compiles on every DSL above the
+    floor."""
     from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
     from cudnn.frost.template_loader import load_template
 
-    msg = cutedsl_requirement_error("the LayerNorm-prologue dual GEMM") or cutedsl_arch_requirement_error((10, 7))
+    if arch not in BODIES:
+        raise ValueError(f"the LayerNorm-prologue dual GEMM has a rendered body for {sorted(BODIES)} only, not {arch!r}")
+    msg = cutedsl_requirement_error("the LayerNorm-prologue dual GEMM") or cutedsl_arch_requirement_error(ARCH_GATE_CC[arch])
     if msg:
         raise NotImplementedError(msg)
-    validate_ln_dual_gemm_params(params)
+    validate_ln_dual_gemm_params(params, arch)
     mod = load_template(body_path(arch), params, tag="ln_prologue_dual_gemm")
     return LnDualGemmPlan(params=params, module=mod, launch=mod.compile())
 

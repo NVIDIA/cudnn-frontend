@@ -35,7 +35,10 @@ function and stay op attributes the API never sets.
                      axis of the table (the persistent tail is a function of N and B), OFF in every pick until its A/B/A lands a per-bucket default.
 
 :func:`recommend` is the table -- the best MEASURED configuration per geometry on the 212-SM Rubin perf-node class, keyed by hidden width ``c``,
-N bucket, batch bucket and direction: a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
+N bucket, batch bucket and direction (and, appended, the device's compute capability ``cc``: the SM100 COLUMN below is the Rubin table with the
+contraction tile per N replaced by the winners recorded on a 152-SM GB200 perf node -- the two LayerNorm-prologue stages' axes are carried from
+Rubin UNMEASURED on SM100 until the GB200 sweep lands its own picks, and the register-split hint rows are Rubin-only, so a cc 10.0 plan runs
+the renderings as shipped): a bucket table (width, N) carries the complete knob set, and a short refinement table overrides ONE axis
 where a cell of the measured grid (B in {1, 4}, both directions) beat the bucket's pick decisively in every pass that measured it.  A geometry
 nobody timed takes the nearest measured bucket's pick (N: the first floor at or below it; B: 4 from B >= 4, else 1), never a guess outside the
 domain.  :func:`resolve` merges a caller's ``k2_tile`` / ``knobs`` over it -- a :class:`TriMulKnobs` is a PARTIAL record: an axis left ``None``
@@ -304,6 +307,39 @@ _REFINEMENTS: Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]
 }
 
 
+# THE SM100 COLUMN (compute capability 10.0 / 10.3; the 227 KiB / 512-column part): the SAME bucket picks and refinements as the Rubin table
+# with the CONTRACTION TILE per N bucket replaced by the tile measured fastest on a 152-SM GB200 perf node (lock 1830 MHz; 100 x 3 graph replay,
+# control pair 0.02-0.92 %; bf16, c = 128, B = 1, both directions; every pick a win over the pair tile `DESIGN_TILE_CONFIG` by > 2x its N's control-pair floor): N 256
+# the pair tile, 384 the 1-CTA tile, 512 the A-multicast x2 pair tile, 768 the pair tile, 1024 the A-multicast x2 pair tile (the x4 one within
+# 0.0 % of it at 1024 and 0.2 % at 2048: the x2 is the recorded winner in both directions at 2048), 2048 the x2 again -- so the ONE axis that
+# differs from the Rubin column is the 1024 floor (x2 here, x4 there).  Everything else -- the K1 tile order, the K3 prologue form, the ring depth,
+# the LayerNorm pass form, the epilogue form, the LayerNorm-once item and the per-cell refinements -- is CARRIED from the Rubin table UNMEASURED
+# on SM100 (stated here so a reader never takes it for a GB200 measurement); the GB200 sweep replaces this seed per bucket as its cells land.
+_K2_TILE_SM100_BY_FLOOR: Dict[int, str] = {1024: k2.MULTICAST_A2_TILE_CONFIG}
+
+
+def _sm100_picks(rubin: Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]]) -> Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]]:
+    return {
+        width: tuple((floor, replace(knobs, k2_tile=_K2_TILE_SM100_BY_FLOOR.get(floor, knobs.k2_tile))) for floor, knobs in table)
+        for width, table in rubin.items()
+    }
+
+
+_PICKS_BY_ARCH: Dict[str, Dict[int, Tuple[Tuple[int, TriMulKnobs], ...]]] = {"sm107": _PICKS, "sm100": _sm100_picks(_PICKS)}
+_REFINEMENTS_BY_ARCH: Dict[str, Dict[int, Tuple[Tuple[int, int, Optional[str], TriMulKnobs], ...]]] = {"sm107": _REFINEMENTS, "sm100": _REFINEMENTS}
+#: The arch column a compute capability reads: Blackwell (10.0 / 10.3) the SM100 column, everything else -- Rubin, an unknown part, or ``None``
+#: (no device at hand: a CPU declaration, whose ``check_support`` declines before any launch) -- the Rubin table.  The heuristics never
+#: decline a part; the API's ``check_support`` does.
+_SM100_CCS = ((10, 0), (10, 3))
+
+
+def arch_column_for_cc(cc) -> str:
+    """``"sm100"`` for compute capability 10.0 / 10.3, ``"sm107"`` otherwise (including ``None``)."""
+    if cc is None:
+        return "sm107"
+    return "sm100" if tuple(int(x) for x in cc) in _SM100_CCS else "sm107"
+
+
 def _nearest_width(c: int) -> int:
     widths = sorted(_PICKS)
     return min(widths, key=lambda w: (abs(w - int(c)), w))
@@ -322,9 +358,9 @@ def _bucket_floor(n_res: int, table: Tuple[Tuple[int, TriMulKnobs], ...]) -> Tup
     return table[-1]
 
 
-def k2_tile_for(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> str:
-    """The contraction's tile config for ``(N, c, B, direction)`` from the measured table."""
-    return recommend(n_res, channels, batch, direction).k2_tile
+def k2_tile_for(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing", cc=None) -> str:
+    """The contraction's tile config for ``(N, c, B, direction)`` from the measured table (``cc`` appended: the SM100 column on 10.0 / 10.3)."""
+    return recommend(n_res, channels, batch, direction, cc=cc).k2_tile
 
 
 def default_k_block(n_res: int) -> int:
@@ -382,15 +418,18 @@ _REGISTER_SPLIT_HINTS: Dict[Tuple[str, int, bool, str, str, Optional[str], str],
 
 
 def register_split_hint(
-    stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str, pass_order: Optional[str] = None, ln_once: str = ""
+    stage: str, channels: int, has_bias: bool, ln_pass_form: str, epi_math: str, pass_order: Optional[str] = None, ln_once: str = "", cc=None
 ) -> int:
     """The ``.minnctapersm`` hint a bare declaration hands the ``stage`` (``"k1"`` = the projection, ``"k3"`` = the output stage) rendering at this
     hidden width, bias arm, LayerNorm / epilogue form, (K1) tile order and LayerNorm work item (``ln_once``; the stage's OWN item -- the output stage's
     is ``""`` where the substrate declines a one-tile item): the MEASURED rows of :data:`_REGISTER_SPLIT_HINTS`, else 0 (the rendering as shipped;
     every row names the per-tile item -- under the LayerNorm-once item the honoured split spills and the whole call runs faster unhinted).  A
-    caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages."""
+    caller's ``TriMulKnobs(min_blocks_per_mp=...)`` overrides it for both stages.  ``cc`` (appended): every row was measured on the Rubin class, so
+    a Blackwell plan (10.0 / 10.3) reads 0 = the rendering as shipped until a GB200 A/B/A lands a row of its own."""
     if stage not in ("k1", "k3"):
         raise ValueError(f"stage must be 'k1' or 'k3', got {stage!r}")
+    if arch_column_for_cc(cc) != "sm107":
+        return 0
     order = (str(pass_order) if pass_order is not None else None) if stage == "k1" else None
     # the rows are keyed by RENDERING: the three packed epilogue forms differ only under `has_bias` and render ONE cubin without biases, so a
     # bias-off lookup reads the family's row (`EPI_MATHS_PACKED`); a bias-on rendering is hinted only by a row naming its EXACT form
@@ -398,16 +437,18 @@ def register_split_hint(
     return _REGISTER_SPLIT_HINTS.get((stage, _nearest_width(channels), bool(has_bias), str(ln_pass_form), epm, order, str(ln_once or "")), 0)
 
 
-def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing") -> TriMulKnobs:
+def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = "outgoing", cc=None) -> TriMulKnobs:
     """The measured default knob set for this geometry: the (width, N bucket) pick with the (batch bucket, direction) refinements applied, the
-    row tile from :func:`default_k_block` unless a pick or refinement sets it -- complete (every axis set)."""
+    row tile from :func:`default_k_block` unless a pick or refinement sets it -- complete (every axis set).  ``cc`` (appended) selects the arch
+    column (:func:`arch_column_for_cc`: the SM100 column on compute capability 10.0 / 10.3, the Rubin table otherwise and for ``None``)."""
     if direction not in k2.DIRECTIONS:
         raise ValueError(f"direction must be one of {k2.DIRECTIONS}, got {direction!r}")
     n_res = int(n_res)
     width = _nearest_width(channels)
-    floor, knobs = _bucket_floor(n_res, _PICKS[width])
+    column = arch_column_for_cc(cc)
+    floor, knobs = _bucket_floor(n_res, _PICKS_BY_ARCH[column][width])
     bb = batch_bucket(batch)
-    for r_floor, r_batch, r_direction, override in _REFINEMENTS.get(width, ()):
+    for r_floor, r_batch, r_direction, override in _REFINEMENTS_BY_ARCH[column].get(width, ()):
         if r_floor == floor and r_batch == bb and (r_direction is None or r_direction == direction):
             knobs = override.merged_over(knobs)
     if knobs.k_block is None:
@@ -415,11 +456,13 @@ def recommend(n_res: int, channels: int = 128, batch: int = 1, direction: str = 
     return knobs
 
 
-def resolve(n_res: int, channels: int, batch: int, direction: str, *, k2_tile: Optional[str] = None, knobs: Optional[TriMulKnobs] = None) -> TriMulKnobs:
-    """The knob set a plan runs: :func:`recommend` for the geometry, then the caller's ``knobs`` (its SET axes) and ``k2_tile`` (one axis) over
-    it -- always a complete record.  No validation here: ``check_support`` runs :func:`validate_knobs` so an out-of-vocabulary name is a typed
-    decline at the usual place (a ``knobs`` of the wrong type raises there too)."""
-    out = recommend(n_res, channels, batch, direction)
+def resolve(
+    n_res: int, channels: int, batch: int, direction: str, *, k2_tile: Optional[str] = None, knobs: Optional[TriMulKnobs] = None, cc=None
+) -> TriMulKnobs:
+    """The knob set a plan runs: :func:`recommend` for the geometry (and the device's ``cc``, appended), then the caller's ``knobs`` (its SET axes)
+    and ``k2_tile`` (one axis) over it -- always a complete record.  No validation here: ``check_support`` runs :func:`validate_knobs` so an
+    out-of-vocabulary name is a typed decline at the usual place (a ``knobs`` of the wrong type raises there too)."""
+    out = recommend(n_res, channels, batch, direction, cc=cc)
     if knobs is not None and isinstance(knobs, TriMulKnobs):
         out = knobs.merged_over(out)
     elif knobs is not None:
@@ -431,6 +474,7 @@ def resolve(n_res: int, channels: int, batch: int, direction: str, *, k2_tile: O
 
 __all__ = [
     "BATCH_BUCKETS",
+    "arch_column_for_cc",
     "CLC_STAGES_DOMAIN",
     "DEFAULT_CLC_STAGES",
     "DEFAULT_K1_PASS_ORDER",

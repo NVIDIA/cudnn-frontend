@@ -125,11 +125,12 @@ def fold_tail_affine(p_out_weight, p_out_bias, norm_out_weight, norm_out_bias):
     return fold_output_affine(p_out_weight, p_out_bias, norm_out_weight, norm_out_bias)
 
 
-def build_trimul_tail(params: LnDualGemmParams) -> LnDualGemmPlan:
-    """Compile (cached per params) -- shapes are runtime."""
+def build_trimul_tail(params: LnDualGemmParams, arch: str = "sm107") -> LnDualGemmPlan:
+    """Compile (cached per (params, arch)) -- shapes are runtime.  ``arch`` names the substrate's rendered body (``"sm107"`` Rubin, ``"sm100"``
+    Blackwell; ``cudnn.gemm.frost.ln_prologue.body_arch_for_cc`` picks it from the device's compute capability)."""
     if not params.dual:
         raise ValueError("the triangle multiplicative update's K3 is the accumulators arm of the substrate; build it from tail_params(...)")
-    return build_ln_dual_gemm(params)
+    return build_ln_dual_gemm(params, arch)
 
 
 def run_trimul_tail(

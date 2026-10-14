@@ -25,8 +25,13 @@ LayerNorm-prologue dual-GEMM body (`cudnn.gemm.frost.ln_prologue`), K2 is the sh
 contraction's tile (chosen per N from a measured prototype). The intermediate planes and `y` live in one workspace the
 caller provides (class API) or the function allocates (drop-in).
 
-**Target: NVIDIA Rubin (SM107, compute capability 10.7) only.** Every other architecture is declined with a typed error
-(`NotImplementedError`), never served slowly.
+**Target: NVIDIA Rubin (SM107, compute capability 10.7) and NVIDIA Blackwell (SM100 / SM103, compute capability 10.0 / 10.3).**
+The three kernels are the same code on both: the LayerNorm-prologue dual-GEMM body is rendered once per architecture family at the
+part's geometry (Rubin: a 9-deep operand ring in the 327 KiB carveout, 576 TMEM columns; Blackwell: a 6-deep ring -- 4 in the output
+stage -- in the 227 KiB opt-in carveout, 512 TMEM columns, so `c_z = 256` fills the output stage's ring exactly), and the contraction's
+FROST GEMM template sizes its pipeline from the live device. Every other architecture is declined with a typed error
+(`NotImplementedError`), never served slowly. The measured performance below is Rubin's; the Blackwell column of the heuristics carries
+the contraction tile per N measured on a GB200 and the Rubin picks for every other knob until its own sweep lands.
 
 ## Mathematics and numerics
 
@@ -60,7 +65,7 @@ unrounded fp64 formula below 2e-2.
 
 | what | served | otherwise |
 |---|---|---|
-| architecture | compute capability 10.7 (Rubin) | `NotImplementedError` |
+| architecture | compute capability 10.7 (Rubin), 10.0 / 10.3 (Blackwell SM100 / SM103) | `NotImplementedError` |
 | dtype | bf16 pair representation, bf16 parameters (`precision='bfloat16'` casts wider inputs once per call, as cuEquivariance does) | `NotImplementedError` |
 | pair width `c_z` / hidden width `c` | `c_z == c` in `{128, 256}` (`c_z % 32 != 0` is a `ValueError`: cuEquivariance's own rule); 384 is withdrawn until its renderings stop spilling and carry an oracle cell. 256 is served correctly but not yet competitively (13-44 % behind cuEquivariance's generic route at N >= 217: the measured-performance section) | `NotImplementedError` |
 | N | `N >= 33`, any N for the outgoing direction; the incoming direction needs `N % 8 == 0` | `NotImplementedError` |

@@ -11,7 +11,7 @@ fp32-vs-fp64 LayerNorm statistics flipping the bf16 rounding of a few operands b
 Together: ``|diff| <= 4e-3 + |ref| / 128`` (two bf16 half-ulps relative plus an absolute floor for (ii) and (iv)); the test also
 reports the measured maximum.  Masked and padded rows must be EXACTLY +0.0 (a select in the kernel, sdpa-invariants.md S 2).
 
-The kernel targets Rubin (cc 10.7); the accept tests skip elsewhere with the reason stated.  Every launch is a single process
+The kernel is rendered for Rubin (cc 10.7, the sm107 body) and Blackwell SM100 / SM103 (cc 10.0 / 10.3, the sm100 body); the accept tests build the live device's body and skip elsewhere with the reason stated.  Every launch is a single process
 under the harness's ``timeout`` (exit 124 = hang).
 """
 
@@ -36,13 +36,22 @@ from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1  # no
 from sdpa.frost import frost_test_utils as sass_utils  # noqa: E402  -- the SASS probe (trace-compile + nvdisasm opcode counts) and the spill-pin bound
 
 _SM107 = (10, 7)
+#: the compute capabilities the substrate has a rendered body for: Rubin (sm107) and Blackwell SM100 / SM103 (sm100)
+_SERVED = tuple(sorted(sub.ARCHS_BY_CC))
 
 
 def _cc():
     return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
 
 
-requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the LN-prologue dual GEMM is rendered for SM107 (Rubin) only; found {_cc()}")
+def _arch() -> str:
+    """The substrate body the live device runs (``"sm107"`` off a served part: the host-only tests then exercise the Rubin body's text)."""
+    return sub.body_arch_for_cc(_cc()) if _cc() in sub.ARCHS_BY_CC else "sm107"
+
+
+requires_served_arch = pytest.mark.skipif(
+    _cc() not in _SERVED, reason=f"the LN-prologue dual GEMM is rendered for compute capabilities {_SERVED} only; found {_cc()}"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -179,23 +188,161 @@ def test_ln_once_item_and_region_slots_are_the_substrate_rule_and_agree_with_the
         sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, ln_once="block"))  # one N tile x one pass
     with pytest.raises(ValueError, match="ONE GEMM tile"):
         sub.validate_ln_dual_gemm_params(k3.tail_params(256, 256, has_bias=True, ln_once="passes"))  # one pass
-    # the body's ring depth and per-stage operand bytes, per arm, are what the SMEM predicate reads
-    for p, pairing in ((k1.proj_params(128, 128, has_bias=True, has_mask=True), "columns"), (k3.tail_params(256, 256, has_bias=True), "accumulators")):
-        mod = load_template(sub.body_path("sm107"), p, tag="t27_ring_pin")
-        assert mod.ab_stages == sub.RING_STAGES[pairing], (pairing, mod.ab_stages)
-        assert (
-            mod.cta_tile_mnk[0] * mod.cta_tile_mnk[2] * 2 == sub.A_STAGE_BYTES and mod.cta_tile_mnk[1] * mod.cta_tile_mnk[2] * 2 == sub.B_STAGE_BYTES[pairing]
-        )
-        assert (mod.num_a_operands, mod.num_b_operands) == (p.num_a_operands, p.num_b_operands)
-        assert mod.ab_stages * (mod.num_a_operands * sub.A_STAGE_BYTES + mod.num_b_operands * sub.B_STAGE_BYTES[pairing]) == 288 * 1024
+    # the sm100 body's 6-deep ring holds ONE resident slot at K1 K = 256 (2 x 64 KiB + the 96 KiB B ring > 192 KiB) where the sm107 body's holds two
+    assert (
+        sub.ln_once_a_slots(p128, "sm100"),
+        sub.ln_once_a_slots(p256, "sm100"),
+        sub.ln_once_a_slots(p256p, "sm100"),
+        sub.ln_once_a_slots(t256, "sm100"),
+    ) == (
+        2,
+        1,
+        1,
+        1,
+    )
+    assert sub.RING_STAGES == sub.RING_STAGES_BY_ARCH["sm107"]  # the historical name is the Rubin column
+    # each body's ring depth and per-stage operand bytes, per arm, are what the SMEM predicate reads: the same bytes re-cut per arm (9 x 32 = 6 x 48 KiB
+    # on the 327 KiB part, 6 x 32 = 4 x 48 KiB on the 227 KiB one), the arch constants the renderer moves, BODY_ARCH the key the body reads them through
+    ring_bytes = {"sm107": 288 * 1024, "sm100": 192 * 1024}
+    for arch in ("sm107", "sm100"):
+        for p, pairing in ((k1.proj_params(128, 128, has_bias=True, has_mask=True), "columns"), (k3.tail_params(256, 256, has_bias=True), "accumulators")):
+            mod = load_template(sub.body_path(arch), p, tag=f"t27_ring_pin_{arch}")
+            assert mod.BODY_ARCH == arch
+            assert mod.ab_stages == sub.ring_stages(arch, pairing) == sub.RING_STAGES_BY_ARCH[arch][pairing], (arch, pairing, mod.ab_stages)
+            assert (
+                mod.cta_tile_mnk[0] * mod.cta_tile_mnk[2] * 2 == sub.A_STAGE_BYTES
+                and mod.cta_tile_mnk[1] * mod.cta_tile_mnk[2] * 2 == sub.B_STAGE_BYTES[pairing]
+            )
+            assert (mod.num_a_operands, mod.num_b_operands) == (p.num_a_operands, p.num_b_operands)
+            assert mod.ab_stages * (mod.num_a_operands * sub.A_STAGE_BYTES + mod.num_b_operands * sub.B_STAGE_BYTES[pairing]) == ring_bytes[arch]
+            assert mod._B_STAGES == mod.ab_stages and 64 * mod.ab_stages == sub.max_k(arch, pairing)
+            assert (mod.num_tmem_alloc_cols, mod.tmem_alloc_exclusive) == ((576, True) if arch == "sm107" else (512, False))
+            assert mod.acc_stages * 256 <= mod.num_tmem_alloc_cols  # the accumulator ring fills the 512-column part exactly
+            assert f"--gpu-arch {'sm_107a' if arch == 'sm107' else 'sm_100a'}" in mod.frost_compile_options
+            assert mod._SMEM_ESTIMATE_BYTES <= sub.SMEM_BUDGET_BYTES_BY_ARCH[arch]
 
 
 def test_body_path_names_one_rendered_body_per_arch():
     import os
 
     assert os.path.isfile(sub.body_path()) and os.path.basename(sub.body_path("sm107")) == "sm107_dual_gemm.py"
+    assert os.path.isfile(sub.body_path("sm100")) and os.path.basename(sub.body_path("sm100")) == "sm100_dual_gemm.py"
     with pytest.raises(ValueError, match="rendered body"):
-        sub.body_path("sm100")  # a later step's body: a typed decline until it exists, never a silent fallback to the sm107 one
+        sub.body_path("sm120")  # a part without a body: a typed decline, never a silent fallback to another arch's body
+    assert (sub.body_arch_for_cc((10, 0)), sub.body_arch_for_cc((10, 3)), sub.body_arch_for_cc((10, 7))) == ("sm100", "sm100", "sm107")
+    assert sub.ARCH_GATE_CC == {"sm100": (10, 0), "sm107": (10, 7)}
+    for cc in ((9, 0), (8, 0), (12, 0), (11, 0)):
+        with pytest.raises(NotImplementedError, match="10.0, 10.3, 10.7"):
+            sub.body_arch_for_cc(cc)
+    with pytest.raises(ValueError, match="rendered body"):
+        sub.validate_ln_dual_gemm_params(k1.proj_params(128, 128, has_bias=True, has_mask=True), "sm120")
+
+
+def test_the_k_cap_follows_the_arch_body():
+    """``K <= 64 x ring``: 576 / 384 on the sm107 body, 384 / 256 on the sm100 one -- the same record is valid for one body and a typed decline for
+    the other (c_z = 256 fills the sm100 accumulators arm's 4-stage ring exactly; 384 is out there)."""
+    from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
+
+    assert (sub.max_k("sm107", "columns"), sub.max_k("sm107", "accumulators"), sub.max_k("sm100", "columns"), sub.max_k("sm100", "accumulators")) == (
+        576,
+        384,
+        384,
+        256,
+    )
+    sub.validate_ln_dual_gemm_params(k3.tail_params(384, 384, has_bias=True), "sm107")
+    sub.validate_ln_dual_gemm_params(k3.tail_params(256, 256, has_bias=True), "sm100")
+    sub.validate_ln_dual_gemm_params(k1.proj_params(384, 128, has_bias=True, has_mask=True), "sm100")
+    with pytest.raises(ValueError, match="4-deep.*K must be <= 256"):
+        sub.validate_ln_dual_gemm_params(k3.tail_params(384, 384, has_bias=True), "sm100")
+    with pytest.raises(ValueError, match="6-deep.*K must be <= 384"):
+        sub.validate_ln_dual_gemm_params(k1.proj_params(448, 128, has_bias=True, has_mask=True), "sm100")
+    with pytest.raises(ValueError, match="9-deep.*K must be <= 576"):
+        sub.validate_ln_dual_gemm_params(k1.proj_params(640, 128, has_bias=True, has_mask=True), "sm107")
+    with pytest.raises(ValueError, match="6-deep.*K must be <= 384"):
+        sub.validate_ln_dual_gemm_params(k3.tail_params(512, 512, has_bias=True), "sm107")  # K 512 = 8 stages: past the sm107 accumulators ring too
+
+
+def test_sm100_declines_the_k256_register_form_with_a_packed_epilogue_typed():
+    """The sm100 body's one unallocatable rendering class (ptxas C7600 at the flat 168-register entry count; the sm107 body renders every member): the
+    K >= 256 register-form LayerNorm with a packed epilogue -- every accumulators-arm member (stats on or off, both prologues), the columns arm's
+    bias-path members WITH the statistics write.  The validator declines exactly the measured set and nothing beside it (the plain packed columns
+    rendering, the no-statistics bias-path ones, every re-read form, every K = 128 record, every sm107 record validate)."""
+    from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3
+
+    declined, served = [], []
+    for stats in (True, False):
+        for epm in ("packed", "packed_hoist", "packed_biasfold", "scalar"):
+            for prologue in ("mn_major", "transpose"):
+                declined.append(k3.tail_params(256, 256, has_bias=True, want_stats=stats, a0_prologue=prologue, ln_pass_form="registers", epi_math=epm))
+            declined.append(k1.proj_params(256, 256, has_bias=True, has_mask=True, want_stats=stats, ln_pass_form="registers", epi_math=epm))
+    served = [p for p in declined if p.epi_math == "scalar" or (not p.dual and (not p.want_stats or p.epi_math == "packed"))]
+    declined = [p for p in declined if p not in served]
+    assert len(declined) == 14 and len(served) == 10
+    for p in declined:
+        assert sub.sm100_register_form_unallocatable(p, "sm100") and not sub.sm100_register_form_unallocatable(p, "sm107")
+        with pytest.raises(ValueError, match="C7600"):
+            sub.validate_ln_dual_gemm_params(p, "sm100")
+        sub.validate_ln_dual_gemm_params(p, "sm107")  # the sm107 body renders it (spilling)
+    for p in served:
+        assert not sub.sm100_register_form_unallocatable(p, "sm100")
+        sub.validate_ln_dual_gemm_params(p, "sm100")
+    for form in ("smem_rolled", "smem_rolled_pf"):
+        sub.validate_ln_dual_gemm_params(k3.tail_params(256, 256, has_bias=True, want_stats=True, ln_pass_form=form, epi_math="packed_biasfold"), "sm100")
+        sub.validate_ln_dual_gemm_params(
+            k1.proj_params(256, 256, has_bias=True, has_mask=True, want_stats=True, ln_pass_form=form, epi_math="packed_biasfold"), "sm100"
+        )
+    for epm in ("packed", "packed_hoist", "packed_biasfold"):
+        sub.validate_ln_dual_gemm_params(k3.tail_params(128, 128, has_bias=True, want_stats=True, ln_pass_form="registers", epi_math=epm), "sm100")
+        sub.validate_ln_dual_gemm_params(
+            k1.proj_params(128, 128, has_bias=True, has_mask=True, want_stats=True, ln_pass_form="registers", epi_math=epm), "sm100"
+        )
+
+
+def _sm100_c7600_cell(params) -> bool:
+    """Whether a kernel-test rendering is in the sm100 body's typed-declined class on the LIVE device (the bitwise cells expect the decline there)."""
+    return sub.sm100_register_form_unallocatable(params, _arch())
+
+
+_ARCH_DELTA_CONSTANTS = (
+    "ab_stages",
+    "b_collector_ok",
+    "swizzle_l2_budget_bytes",
+    "num_tmem_alloc_cols",
+    "tmem_alloc_exclusive",
+    "frost_compile_options",
+    "BODY_ARCH",
+)
+
+
+def test_the_two_bodies_differ_only_in_the_arch_delta():
+    """The sm100 body is the sm107 body with the arch constants the renderer moves (and the docstring / comment lines that state them): every
+    CODE line outside those constants is byte-identical, so a kernel fix that lands in one file and not the other fails here."""
+    import difflib
+
+    a = open(sub.body_path("sm107")).read().splitlines()
+    b = open(sub.body_path("sm100")).read().splitlines()
+
+    def docstring_end(lines):
+        return next(i for i, ln in enumerate(lines) if ln.startswith("from __future__"))
+
+    spans = (docstring_end(a), docstring_end(b))
+    assert spans[0] > 50 and spans[1] > 50
+    changed = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "equal":
+            continue
+        changed += [(0, i, a[i]) for i in range(i1, i2)] + [(1, j, b[j]) for j in range(j1, j2)]
+    assert changed, "the two bodies are identical -- the sm100 body lost its arch constants"
+    offenders = []
+    for side, idx, ln in changed:
+        in_docstring = idx < spans[side]
+        is_comment = ln.lstrip().startswith("#")
+        is_constant = any(ln.startswith(f"{name} = ") or ln.startswith(f"{name}: ") for name in _ARCH_DELTA_CONSTANTS)
+        if not (in_docstring or is_comment or is_constant):
+            offenders.append((side, idx + 1, ln))
+    assert not offenders, f"code lines outside the arch delta differ between the two bodies: {offenders[:10]}"
+    moved = {ln.split(" = ")[0].split(":")[0] for side, idx, ln in changed if any(ln.startswith(n) for n in _ARCH_DELTA_CONSTANTS)}
+    assert moved == set(_ARCH_DELTA_CONSTANTS), moved
 
 
 def test_planes_shape_and_strides_are_the_k2_contract():
@@ -334,6 +481,11 @@ def _reference(inp, c, eps):
     return torch.stack(outs), mean, rstd
 
 
+def _build_k1(params):
+    """The K1 plan on the live device's body (:func:`_arch`): a cell's cubin is the arch's, never the Rubin body's on a Blackwell part."""
+    return k1.build_trimul_proj(params, _arch())
+
+
 def _launch(plan, inp, c, planes, stats, stream, *, w_stack=None, b_stack=None, k_block=None):
     """``w_stack`` / ``b_stack`` = the interleaved weight / bias stacks (``torch.cat`` copies, GPU kernels of their own): a timed callable
     builds them ONCE and passes them in; per call they ride inside every CUDA-graph replay as extra kernels."""
@@ -349,7 +501,7 @@ def _launch(plan, inp, c, planes, stats, stream, *, w_stack=None, b_stack=None, 
 _SENTINEL = 1.5e30
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.parametrize(
     "n_res,batch,c_z,c,mask_kind,with_bias",
     [
@@ -366,7 +518,7 @@ _SENTINEL = 1.5e30
 def test_k1_matches_the_fp64_oracle(n_res, batch, c_z, c, mask_kind, with_bias):
     eps = 1e-5
     params = k1.proj_params(c_z, c, has_bias=with_bias, has_mask=True, want_stats=True, eps=eps)
-    plan = k1.build_trimul_proj(params)
+    plan = _build_k1(params)
     inp = _inputs(n_res, batch, c_z, c, mask_kind, with_bias)
     planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
     stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda", dtype=torch.float32)
@@ -447,13 +599,16 @@ lnf, epm = params_kw.get("ln_pass_form", "registers"), params_kw.get("epi_math",
 has_bias, hint = bool(params_kw.get("has_bias", True)), int(params_kw.get("min_blocks_per_mp", 0))
 order = params_kw.get("pass_order", "interleaved")  # the K1 tile order of the rendering (the heuristics ship "major" from N = 512 at c = 128)
 ln_once = params_kw.get("ln_once", "")  # the LayerNorm-once work item ("" = the per-tile item every production rendering ships)
+body_arch = params_kw.get("body_arch", "sm107")  # the substrate body: the sm_107a pins read the Rubin body, the sm_100a pins the Blackwell one
 # the API's parameter sets (api.py compile(): biases on, the mask bound, no statistics, the heuristics' default knobs) at the pinned LN / epilogue forms
 if arm == "k1":
     p = k1.proj_params(kk, kk, has_bias=has_bias, has_mask=True, want_stats=False, pass_order=order, clc_stages=2, ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint, ln_once=ln_once)
 else:
     p = k3.tail_params(kk, kk, has_bias=has_bias, want_stats=False, a0_prologue=(order if order in ("mn_major", "transpose") else "mn_major"), ln_pass_form=lnf, epi_math=epm, min_blocks_per_mp=hint, ln_once=ln_once)
-plan = ln_prologue.build_ln_dual_gemm(p)
+plan = ln_prologue.build_ln_dual_gemm(p, body_arch)
 print("EXPECT_K", kk)
+print("EXPECT_AB_STAGES", plan.module.ab_stages)
+print("EXPECT_TMEM_COLS", plan.module.num_tmem_alloc_cols)
 """
 
 # The LayerNorm-ONCE renderings (`ln_once` = "block" / "passes"; T27): the per-item A region + the per-tile B ring, every production form's twin at the
@@ -646,6 +801,55 @@ def test_sm107_rendering_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math):
     ), f"{arm} K={k}: the rendering now carries a REAL register split (USETMAXREG {st['USETMAXREG']}) -- re-measure the roles and the spill pins"
 
 
+# The sm_100a renderings the triangle multiplicative update ships on Blackwell (cc 10.0 / 10.3): the SAME parameter sets as the heuristics'
+# picks (the register / rolled / pipelined LayerNorm forms, the packed epilogue, the LayerNorm-once block item where the pick carries it, bias on
+# and off) rendered by the sm100 body -- a 6-deep ring (4 in the output stage), 512 non-exclusive TMEM columns, `--gpu-arch sm_100a`.  The same
+# register file as Rubin, so the flat entry allocation under the dropped split (USETMAXREG 0) is the same and the spill counts are near the
+# sm_107a ones; the values are BOUNDS measured on the branch's toolchain (nvdisasm of the trace-time cubin), CGAERRBAR 0 (every cluster-scope
+# arrive a commit or a relaxed / release helper).  Keyed (arm, K, ln_pass_form, epi_math, has_bias, order, ln_once).
+_SASS_SM100_PINS = {
+    ("k1", 128, "registers", "packed", True, "interleaved", ""): dict(STL=0, LDL=0),
+    ("k1", 128, "registers", "packed", False, "interleaved", ""): dict(STL=0, LDL=0),
+    ("k1", 128, "registers", "packed_biasfold", True, "major", "block"): dict(STL=0, LDL=0),
+    ("k1", 128, "registers", "packed", False, "major", "block"): dict(STL=0, LDL=0),
+    ("k1", 128, "smem_rolled", "packed", True, "major", "block"): dict(STL=0, LDL=0),
+    ("k1", 128, "smem_rolled", "packed", False, "major", "block"): dict(STL=3, LDL=3),
+    ("k1", 256, "smem_rolled_pf", "packed", True, "major", "block"): dict(STL=0, LDL=0),
+    ("k1", 256, "smem_rolled_pf", "packed", False, "major", "block"): dict(STL=1, LDL=1),
+    ("k3", 128, "registers", "packed", True, "transpose", ""): dict(STL=0, LDL=0),
+    ("k3", 128, "registers", "packed", False, "transpose", ""): dict(STL=0, LDL=0),
+    ("k3", 256, "smem_rolled_pf", "packed", True, "mn_major", "block"): dict(STL=0, LDL=0),
+    # the bias-off output-stage c 256 rendering sits at ptxas's flat 80-register allocation (the two-CTAs-per-SM target) and spills a few epilogue
+    # words there, as its sm_107a twin does (5 / 6 under the block item): 6 / 7 measured at the 2-deep scheduler ring this probe renders
+    ("k3", 256, "smem_rolled_pf", "packed", False, "mn_major", "block"): dict(STL=6, LDL=7),
+}
+
+
+@pytest.mark.parametrize("arm,k,ln_pass_form,epi_math,has_bias,order,ln_once", sorted(_SASS_SM100_PINS))
+def test_sm100_rendering_spill_pins(tmp_path, arm, k, ln_pass_form, epi_math, has_bias, order, ln_once):
+    """Trace-compile the sm100 body's production renderings for sm_100a (no GPU): the ring depth and TMEM columns the body resolved (6 / 4
+    stages, 512 columns), STL / LDL within the measured bounds, USETMAXREG 0 (the dropped split, as on Rubin), CGAERRBAR 0."""
+    probe = sass_utils.run_sass_probe(
+        tmp_path,
+        probe_src=sass_utils.sass_probe_source(_SASS_PROBE_BODY, _SASS_COUNTS),
+        arch="sm_100a",
+        params=dict(arm=arm, k=k, ln_pass_form=ln_pass_form, epi_math=epi_math, has_bias=has_bias, pass_order=order, ln_once=ln_once, body_arch="sm100"),
+        tag=f"ln_dual_gemm_sm100_{arm}_k{k}_{ln_pass_form}_{epi_math}_bias{int(has_bias)}_{order}_{ln_once or 'tile'}",
+    )
+    st = probe.stats
+    print(
+        f"sm100 {arm} K={k} {ln_pass_form} {epi_math} bias {has_bias} {order} ln_once={ln_once}: STL {st['STL']} LDL {st['LDL']} USETMAXREG {st['USETMAXREG']} "
+        f"CGAERRBAR {st['CGAERRBAR']} lines {st['LINES']} cubin {probe.cubin_md5} module {probe.expect}"
+    )
+    assert probe.expect["EXPECT_AB_STAGES"] == sub.ring_stages("sm100", "accumulators" if arm == "k3" else "columns") == (4 if arm == "k3" else 6)
+    assert probe.expect["EXPECT_TMEM_COLS"] == 512
+    sass_utils.assert_no_new_spills(
+        st, _SASS_SM100_PINS[(arm, k, ln_pass_form, epi_math, has_bias, order, ln_once)], tag=f"sm100 {arm} K={k} {ln_pass_form} {epi_math} bias {has_bias}: "
+    )
+    assert st["USETMAXREG"] == 0, f"sm100 {arm} K={k}: a REAL register split (USETMAXREG {st['USETMAXREG']}) -- re-measure the roles and the pins"
+    assert st["CGAERRBAR"] == 0, f"sm100 {arm} K={k}: a non-relaxed cluster arrive (CGAERRBAR {st['CGAERRBAR']}) -- a GPU-scope drain per arrive"
+
+
 @pytest.mark.parametrize(
     "kw,axis",
     [
@@ -659,7 +863,7 @@ def test_ln_pass_form_and_epi_math_decline_typed(kw, axis):
         sub.validate_ln_dual_gemm_params(k1.proj_params(128, 128, has_bias=True, has_mask=True, **kw))
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.parametrize(
     "n_res,batch,c_z,c,mask_kind,ln_once,clc_stages",
     [
@@ -677,8 +881,8 @@ def test_ln_once_item_is_bitwise_the_per_tile_item(n_res, batch, c_z, c, mask_ki
     inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=11)
     kn = th_recommend(n_res, c_z, batch)
     common = dict(has_bias=True, has_mask=True, want_stats=True, pass_order="major", clc_stages=clc_stages, ln_pass_form=kn.ln_pass_form, epi_math="packed")
-    plan_off = k1.build_trimul_proj(k1.proj_params(c_z, c, **common))
-    plan_on = k1.build_trimul_proj(k1.proj_params(c_z, c, ln_once=ln_once, **common))
+    plan_off = _build_k1(k1.proj_params(c_z, c, **common))
+    plan_on = _build_k1(k1.proj_params(c_z, c, ln_once=ln_once, **common))
     stream = torch.cuda.current_stream().cuda_stream
     outs = []
     for plan in (plan_off, plan_on, plan_on):
@@ -702,7 +906,7 @@ def th_recommend(n_res, c_z, batch):
     return th.recommend(n_res, c_z, batch, "outgoing")
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
 @pytest.mark.parametrize(
     "ln_pass_form,epi_math",
@@ -720,10 +924,16 @@ def th_recommend(n_res, c_z, batch):
 def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res, batch, c_z, c, mask_kind, ln_pass_form, epi_math):
     """The re-read LayerNorm forms sum the same bf16 words in the same order (a re-load of the unchanged stage replaces a register), and the packed
     epilogue runs the scalar form's fp32 operations in its association on fp32x2 pairs: planes AND statistics BITWISE equal to the default forms."""
+    probe = k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, ln_pass_form=ln_pass_form, epi_math=epi_math)
+    if _sm100_c7600_cell(probe):
+        # the sm100 body's typed decline (ptxas C7600 at K = 256 for the register form with a bias-path packed epilogue and the statistics write)
+        with pytest.raises(ValueError, match="C7600"):
+            _build_k1(probe)
+        return
     inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=13)
     outs = []
     for lnf, epm in (("registers", "scalar"), (ln_pass_form, epi_math)):
-        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, ln_pass_form=lnf, epi_math=epm))
+        plan = _build_k1(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, ln_pass_form=lnf, epi_math=epm))
         planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
         _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
@@ -734,7 +944,7 @@ def test_ln_pass_form_and_epi_math_are_bitwise_equal_to_the_default_forms(n_res,
     assert torch.equal(outs[0][1], outs[1][1]), f"{ln_pass_form}/{epi_math} changed the statistics"
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
 def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form_is_measured(n_res, batch, c_z, c, mask_kind):
     """`ln_pass_form="smem_rolled_tree"` sums each statistics pass in FOUR partials (a different fp32 ORDER, :data:`LN_PASS_FORMS_REORDERED`).  A
@@ -748,7 +958,7 @@ def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form
     ref, mean64, rstd64 = _reference(inp, c, eps)
     outs = {}
     for lnf in ("smem_rolled", "smem_rolled_tree"):
-        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, eps=eps, ln_pass_form=lnf, epi_math="packed"))
+        plan = _build_k1(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, eps=eps, ln_pass_form=lnf, epi_math="packed"))
         planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
         _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
@@ -776,7 +986,7 @@ def test_tree_ln_form_meets_the_oracle_bound_and_its_distance_to_the_rolled_form
     assert sub.LN_PASS_FORMS_REORDERED == ("smem_rolled_tree",)  # the one form outside the bitwise pins, by name
 
 
-@requires_rubin
+@requires_served_arch
 def test_skip_vote_is_bitwise_equal_to_the_unskipped_arm():
     """A padded protein masks whole 256-row tiles (every pair row with i >= L): the skipped-MMA arm and the control arm that
     computes everything must agree BITWISE on the planes and the statistics."""
@@ -784,7 +994,7 @@ def test_skip_vote_is_bitwise_equal_to_the_unskipped_arm():
     inp = _inputs(n_res, batch, c_z, c, "padded", True, seed=3)
     outs = []
     for skip in (True, False):
-        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, skip_masked_tiles=skip))
+        plan = _build_k1(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, skip_masked_tiles=skip))
         planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
         _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
@@ -796,7 +1006,7 @@ def test_skip_vote_is_bitwise_equal_to_the_unskipped_arm():
     assert (m == 0).sum() > 0 and (outs[0][0][:, :, :, :n_res].reshape(2, c, -1)[:, :, m == 0].view(torch.int16) == 0).all()
 
 
-@requires_rubin
+@requires_served_arch
 def test_mask_multiplies_in_fp32_before_the_bf16_rounding():
     """The pin that separates the kernel's mask semantics (``bf16(sigmoid(g) * v * m)``, one rounding) from cuEquivariance's
     after-rounding form (``bf16(bf16(sigmoid(g) * v) * m)``, two roundings): with FRACTIONAL mask weights the two fp64 models
@@ -805,7 +1015,7 @@ def test_mask_multiplies_in_fp32_before_the_bf16_rounding():
     n_res, batch, c_z, c = 128, 1, 128, 128
     eps = 1e-5
     inp = _inputs(n_res, batch, c_z, c, "fractional", True, seed=11)
-    plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=False, eps=eps))
+    plan = _build_k1(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=False, eps=eps))
     planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
     _launch(plan, inp, c, planes, None, torch.cuda.current_stream().cuda_stream)
     torch.cuda.synchronize()
@@ -828,7 +1038,7 @@ def test_mask_multiplies_in_fp32_before_the_bf16_rounding():
     assert match_pre > 0.9 and match_post < 0.1, msg
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.parametrize("n_res,batch,c_z,c,mask_kind", [(217, 2, 128, 128, "random"), (128, 1, 256, 256, "padded")])
 def test_interleaved_pass_order_is_bitwise_equal_to_pass_major(n_res, batch, c_z, c, mask_kind):
     """``pass_order="interleaved"`` (the pass folded into the scheduler's M axis so both passes of a row block are adjacent -- the
@@ -836,7 +1046,7 @@ def test_interleaved_pass_order_is_bitwise_equal_to_pass_major(n_res, batch, c_z
     inp = _inputs(n_res, batch, c_z, c, mask_kind, True, seed=7)
     outs = []
     for order in ("major", "interleaved"):
-        plan = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, pass_order=order))
+        plan = _build_k1(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, pass_order=order))
         planes = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
         stats = torch.full((batch * n_res * n_res, 2), -1.0, device="cuda")
         _launch(plan, inp, c, planes, stats, torch.cuda.current_stream().cuda_stream)
@@ -847,14 +1057,14 @@ def test_interleaved_pass_order_is_bitwise_equal_to_pass_major(n_res, batch, c_z
     assert torch.equal(outs[0][1], outs[1][1]), "the interleaved tile order changed the statistics"
 
 
-@requires_rubin
+@requires_served_arch
 def test_no_mask_artifact_matches_the_all_valid_mask():
     """``has_mask=False`` (no mask tensor at the ABI) equals the all-valid mask run, cell for cell."""
     n_res, batch, c_z, c = 128, 1, 128, 128
     inp = _inputs(n_res, batch, c_z, c, "all", True, seed=5)
     stream = torch.cuda.current_stream().cuda_stream
-    plan_m = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=False))
-    plan_n = k1.build_trimul_proj(k1.proj_params(c_z, c, has_bias=True, has_mask=False, want_stats=False))
+    plan_m = _build_k1(k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=False))
+    plan_n = _build_k1(k1.proj_params(c_z, c, has_bias=True, has_mask=False, want_stats=False))
     out_m = torch.full(k1.planes_shape(c, batch, n_res), _SENTINEL, device="cuda", dtype=torch.bfloat16)
     out_n = torch.empty_like(out_m)
     w_stack = k1.stack_projection_weights(inp["p_in"], inp["g_in"])
@@ -865,9 +1075,9 @@ def test_no_mask_artifact_matches_the_all_valid_mask():
     assert torch.equal(out_m, out_n)
 
 
-@requires_rubin
+@requires_served_arch
 def test_runner_declines_a_plan_for_another_k_and_a_misshaped_mask():
-    plan = k1.build_trimul_proj(k1.proj_params(128, 128, has_bias=False, has_mask=True, want_stats=False))
+    plan = _build_k1(k1.proj_params(128, 128, has_bias=False, has_mask=True, want_stats=False))
     z = torch.zeros(1, 16, 16, 256, device="cuda", dtype=torch.bfloat16)
     w = torch.zeros(2, 256, 256, device="cuda", dtype=torch.bfloat16)
     planes = torch.zeros(k1.planes_shape(128, 1, 16), device="cuda", dtype=torch.bfloat16)
@@ -896,7 +1106,7 @@ def test_runner_declines_a_plan_for_another_k_and_a_misshaped_mask():
         )
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.parametrize("n_res,batch,k_block", [(384, 2, 128), (384, 1, 64), (217, 1, 32), (128, 2, 256)])
 def test_k1_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
     """The row tile (k's per 256-row pair tile) is a RUNTIME operand of the compiled kernel: the same plan launched with ``k_block`` computes the
@@ -904,7 +1114,7 @@ def test_k1_row_tile_knob_is_bitwise_the_rule(n_res, batch, k_block):
     the rule pads 25 % of every pair tile (kb = 256 over 384 k); kb = 128 / 64 pad none (fewer scheduler tiles, the same per-CTA TMA box at 128)."""
     c_z = c = 128
     params = k1.proj_params(c_z, c, has_bias=True, has_mask=True, want_stats=True, eps=1e-5)
-    plan = k1.build_trimul_proj(params)
+    plan = _build_k1(params)
     inp = _inputs(n_res, batch, c_z, c, "random", True, seed=31)
     stream = torch.cuda.current_stream().cuda_stream
     outs = []

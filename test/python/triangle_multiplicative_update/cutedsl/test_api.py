@@ -20,7 +20,7 @@ a cap ``2e-2 + |ref| / 64`` on EVERY cell, and the relative RMS below 3e-3 (meas
 the measured figures.  The stage-level tolerances (``|ref| / 128``, zero cells beyond) live in the K1 / K3 modules, whose references consume
 the kernels' own operands.
 
-The kernels target Rubin (cc 10.7); the accept tests skip elsewhere with the reason stated.  Every launch is a single process under the
+The kernels are rendered for Rubin (cc 10.7) and Blackwell SM100 / SM103 (cc 10.0 / 10.3); the accept tests skip elsewhere with the reason stated.  Every launch is a single process under the
 harness's ``timeout`` (exit 124 = hang).
 """
 
@@ -52,13 +52,23 @@ from cudnn.triangle_multiplicative_update.kernels import trimul_proj as k1  # no
 from cudnn.triangle_multiplicative_update.kernels import trimul_tail as k3  # noqa: E402
 
 _SM107 = (10, 7)
+#: the compute capabilities the API serves: the substrate's rendered bodies (Rubin 10.7, Blackwell 10.0 / 10.3)
+_SERVED = tapi._SERVED_CCS
 
 
 def _cc():
     return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
 
 
-requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"triangle_multiplicative_update is rendered for SM107 (Rubin) only; found {_cc()}")
+def _arch() -> str:
+    from cudnn.gemm.frost import ln_prologue as _sub
+
+    return _sub.body_arch_for_cc(_cc()) if _cc() in _sub.ARCHS_BY_CC else "sm107"
+
+
+requires_served_arch = pytest.mark.skipif(
+    _cc() not in _SERVED, reason=f"triangle_multiplicative_update is rendered for compute capabilities {_SERVED} only; found {_cc()}"
+)
 
 CUEQ_PARAMS = [
     "x",
@@ -161,11 +171,77 @@ def test_check_support_declines_typed(kw, exc):
 
 def test_check_support_declines_a_foreign_arch_typed():
     plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(), "outgoing", c_hidden=128)
-    if _cc() == _SM107:
+    assert _SERVED == ((10, 0), (10, 3), (10, 7))
+    if _cc() in _SERVED:
+        assert plan.check_support()
+        assert plan.arch == _arch() and plan.cc == _cc()
+    else:
+        with pytest.raises(NotImplementedError, match="10.0, 10.3, 10.7"):
+            plan.check_support()
+        assert plan.arch is None  # never resolved on a part without a body
+
+
+def test_check_support_declines_a_knob_set_the_arch_body_cannot_render_typed():
+    """A caller's knobs that land the output stage in the sm100 body's unallocatable class (K = 256 register-form LayerNorm + a packed epilogue) are a
+    typed NotImplementedError of check_support on a Blackwell device -- never a ptxas error inside compile(); the same declaration passes on Rubin
+    (the body renders it, spilling) and is declined on neither for the heuristics' own pick."""
+    knobs = tapi.TriMulKnobs(ln_pass_form="registers", epi_math="packed")
+    plan = tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256, cz=256), "outgoing", c_hidden=256, knobs=knobs)
+    assert [p.ln_pass_form for p in plan._stage_params()] == ["registers", "registers"]
+    if _cc() in _SERVED and _arch() == "sm100":
+        with pytest.raises(NotImplementedError, match="C7600"):
+            plan.check_support()
+        assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256, cz=256), "outgoing", c_hidden=256).check_support()  # the pick: a re-read form
+    elif _cc() in _SERVED:
         assert plan.check_support()
     else:
-        with pytest.raises(NotImplementedError, match="10.7"):
+        with pytest.raises(NotImplementedError, match="10.0, 10.3, 10.7"):
             plan.check_support()
+
+
+def test_heuristics_sm100_column_is_the_rubin_table_with_the_recorded_contraction_tiles():
+    """The SM100 column: every axis of the Rubin picks and refinements carried (unmeasured there, stated), the contraction tile per N bucket the
+    recorded GB200 winner -- the one axis that differs is the 1024 floor (the A-multicast x2 pair tile; x4 on Rubin); the register-split hint rows
+    are Rubin-only (0 = the rendering as shipped on cc 10.0); ``None`` and any other part read the Rubin table."""
+    from dataclasses import replace
+
+    from cudnn.triangle_multiplicative_update import heuristics as th
+
+    assert (
+        th.arch_column_for_cc(None),
+        th.arch_column_for_cc((10, 0)),
+        th.arch_column_for_cc((10, 3)),
+        th.arch_column_for_cc((10, 7)),
+        th.arch_column_for_cc((8, 0)),
+    ) == (
+        "sm107",
+        "sm100",
+        "sm100",
+        "sm107",
+        "sm107",
+    )
+    for c in (128, 256):
+        for n in (33, 128, 217, 256, 384, 512, 768, 1024, 2048):
+            for b in (1, 4):
+                for d in k2.DIRECTIONS:
+                    rubin, sm100 = th.recommend(n, c, b, d), th.recommend(n, c, b, d, cc=(10, 0))
+                    assert sm100.is_complete() and th.recommend(n, c, b, d, cc=(10, 7)) == rubin and th.recommend(n, c, b, d, cc=None) == rubin
+                    assert replace(sm100, k2_tile=rubin.k2_tile) == rubin, (n, c, b, d)
+                    assert sm100.k2_tile == (k2.MULTICAST_A2_TILE_CONFIG if n >= 1024 else rubin.k2_tile), (n, c, b, d)
+    assert th.recommend(1024, 128, 1, cc=(10, 0)).k2_tile == th.recommend(2048, 128, 1, cc=(10, 3)).k2_tile == k2.MULTICAST_A2_TILE_CONFIG
+    assert th.recommend(1024, 128, 1).k2_tile == k2.MULTICAST_A4_TILE_CONFIG
+    assert (
+        th.k2_tile_for(1024, 128, 1, "outgoing", cc=(10, 0)) == k2.MULTICAST_A2_TILE_CONFIG
+        and th.k2_tile_for(1024, 128, 1, "outgoing") == k2.MULTICAST_A4_TILE_CONFIG
+    )
+    # the caller's overrides merge over the SM100 column exactly as over the Rubin one
+    r = th.resolve(1024, 128, 1, "outgoing", knobs=th.TriMulKnobs(clc_stages=4), cc=(10, 0))
+    assert r.clc_stages == 4 and r.k2_tile == k2.MULTICAST_A2_TILE_CONFIG and r.is_complete()
+    assert th.resolve(1024, 128, 1, "outgoing", k2_tile=k2.DESIGN_TILE_CONFIG, cc=(10, 0)).k2_tile == k2.DESIGN_TILE_CONFIG
+    # the hint rows are Rubin measurements
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "") == 1
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "", cc=(10, 0)) == 0
+    assert th.register_split_hint("k1", 128, False, "registers", "packed", "major", "", cc=(10, 7)) == 1
 
 
 def test_autograd_is_a_typed_decline_not_a_silent_constant():
@@ -413,7 +489,7 @@ def _check_oracle(out, ref, label):
     return st["max_abs_diff"], st["rel_rms"]
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.parametrize(
     "n_res,batch,direction,mask_kind,with_in_bias,with_out_bias,c_z",
     [
@@ -447,7 +523,7 @@ def test_api_matches_the_fp64_reference(n_res, batch, direction, mask_kind, with
     assert torch.equal(out2, out)
 
 
-@requires_rubin
+@requires_served_arch
 def test_api_equals_the_hand_chained_kernels_bitwise():
     """The API adds nothing but glue: K1 -> K2 (the engine's instance over the padded planes) -> K3 by hand, same buffers' contents, bitwise."""
     import cudnn.gemm.frost  # noqa: F401
@@ -464,7 +540,7 @@ def test_api_equals_the_hand_chained_kernels_bitwise():
     flat = torch.full((math.prod(pshape) + k2.k2_slack_bytes(n_res) // 2,), _SENTINEL, device="cuda", dtype=torch.bfloat16)  # planes + the over-read slack
     planes = flat[: math.prod(pshape)].view(*pshape)
     k1.run_trimul_proj(
-        k1.build_trimul_proj(k1.proj_params(c, c, has_bias=True, has_mask=True, want_stats=False)),
+        k1.build_trimul_proj(k1.proj_params(c, c, has_bias=True, has_mask=True, want_stats=False), _arch()),
         x,
         w.w_in,
         planes,
@@ -482,7 +558,7 @@ def test_api_equals_the_hand_chained_kernels_bitwise():
     compiled({bd.a_operands[0]: a_v, bd.b_operands[0]: b_v, bd.outputs[0]: y_v}, stream=stream)
     out = torch.empty_like(x)
     k3.run_trimul_tail(
-        k3.build_trimul_tail(k3.tail_params(c, c, has_bias=True, want_stats=False)),
+        k3.build_trimul_tail(k3.tail_params(c, c, has_bias=True, want_stats=False), _arch()),
         y,
         x,
         w.p_out_weight,
@@ -516,7 +592,7 @@ def test_api_equals_the_hand_chained_kernels_bitwise():
         assert frac_equal == 1.0
 
 
-@requires_rubin
+@requires_served_arch
 def test_wrapper_equals_the_class_api_and_caches_the_plan():
     n_res, batch, c = 128, 2, 128
     x, mask, p = _inputs(n_res, batch, c, c, "padded", False, True, seed=7)
@@ -555,7 +631,7 @@ def test_wrapper_equals_the_class_api_and_caches_the_plan():
     assert torch.equal(_call(x2, "incoming", None, p2), _call(x2, "incoming", mask_all, p2))
 
 
-@requires_rubin
+@requires_served_arch
 def test_execute_allocates_nothing_and_never_synchronizes():
     n_res, batch, c = 256, 1, 128
     x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=9)
@@ -577,7 +653,7 @@ def test_execute_allocates_nothing_and_never_synchronizes():
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before, "execute() allocated"
 
 
-@requires_rubin
+@requires_served_arch
 def test_cuda_graph_capture_replays_bitwise_and_follows_new_data():
     """The wrapper (warm) and the class API capture into a CUDA graph; a replay equals the eager result on the same data and follows a
     change of the input's CONTENTS (not its address)."""
@@ -619,7 +695,7 @@ def test_cuda_graph_capture_replays_bitwise_and_follows_new_data():
     assert torch.equal(out2, eager_new)
 
 
-@requires_rubin
+@requires_served_arch
 def test_masks_of_other_dtypes_and_batchless_inputs_follow_cueq():
     n_res, batch, c = 128, 1, 128
     x, mask, p = _inputs(n_res, batch, c, c, "random", True, True, seed=13)
@@ -636,7 +712,7 @@ def test_masks_of_other_dtypes_and_batchless_inputs_follow_cueq():
         tapi.triangle_multiplicative_update(x.float(), "outgoing", mask, *[p[n] for n in CUEQ_PARAMS[3:15]])
 
 
-@requires_rubin
+@requires_served_arch
 def test_rejects_on_a_live_device_are_typed():
     n_res, batch, c = 128, 1, 128
     x, mask, p = _inputs(n_res, batch, c, c, "all", True, True, seed=15)
@@ -874,6 +950,9 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     _BIAS_ON_ROWS = {("k1", 128, "registers", "packed_biasfold", "major")}
     from cudnn.triangle_multiplicative_update import heuristics as th
 
+    # the rows are Rubin measurements: a plan declared on a Blackwell device (cc 10.0 / 10.3) reads 0 = the rendering as shipped for every row
+    _k1_row = 1 if th.arch_column_for_cc(_cc()) == "sm107" else 0
+
     assert th.MIN_BLOCKS_PER_MP_DOMAIN == MIN_BLOCKS_PER_MP_DOMAIN == (0, 1)
     for c in (128, 256):
         for n in (33, 256, 512, 1024):
@@ -943,16 +1022,16 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
     per_tile = tapi.TriMulKnobs(ln_once="")
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=512), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=False, knobs=per_tile
-    )._register_split_hints() == (1, 0)
+    )._register_split_hints() == (_k1_row, 0)
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=1024), "outgoing", c_hidden=128, has_in_bias=False, has_out_bias=True, knobs=per_tile
-    )._register_split_hints() == (1, 0)
+    )._register_split_hints() == (_k1_row, 0)
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=False, knobs=per_tile
-    )._register_split_hints() == (1, 0)
+    )._register_split_hints() == (_k1_row, 0)
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=512), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True, knobs=per_tile
-    )._register_split_hints() == (1, 0)
+    )._register_split_hints() == (_k1_row, 0)
     assert tapi.TriangleMultiplicativeUpdateFwd(
         _desc(N=1024), "outgoing", c_hidden=128, has_in_bias=True, has_out_bias=True, knobs=per_tile
     )._register_split_hints() == (
@@ -964,7 +1043,7 @@ def test_register_split_hint_is_a_rendering_rule_the_knob_overrides():
         0,
     )  # interleaved K1 (N < 256; the per-tile item): no row for the interleaved order
     assert tapi.TriangleMultiplicativeUpdateFwd(_desc(N=256), "outgoing", c_hidden=128, has_in_bias=False, knobs=per_tile)._register_split_hints() == (
-        1,
+        _k1_row,
         0,
     )  # major from N = 256 with the per-tile item: the rolled form's row
     assert tapi.TriangleMultiplicativeUpdateFwd(
@@ -1018,7 +1097,7 @@ def test_execute_declines_tensors_on_another_device_than_the_plan():
     plan0._check_execute_args(x, mask, w, out, ws)  # the same tensors on the plan's device pass every host check
 
 
-@requires_rubin
+@requires_served_arch
 def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_decline():
     """Review-grade accept + reject for the knob surface: a non-default contraction tile, the pass-major projection order, the transpose
     prologue and a 1-deep ring compute the SAME bits as the default plan (performance only); a catalog config of another arch family is a
@@ -1064,7 +1143,7 @@ def test_knobs_are_performance_only_bitwise_and_the_unfit_tile_is_a_typed_declin
         plan._probe_contraction_tile()
 
 
-@requires_rubin
+@requires_served_arch
 def test_tree_ln_form_knob_is_admitted_meets_the_oracle_and_its_distance_to_the_default_plan_is_measured():
     """`TriMulKnobs(ln_pass_form="smem_rolled_tree")` (the LayerNorm statistics in four partial sums -- a different fp32 ORDER) is a caller's knob the
     API admits: the output meets the SAME three-part oracle as the default plan (nothing widened) and its distance to the default plan's output is
@@ -1094,7 +1173,7 @@ def test_tree_ln_form_knob_is_admitted_meets_the_oracle_and_its_distance_to_the_
     print(f"tree vs default plan: {n_diff} cells differ (of {d.numel()}); max |diff| {d.max().item():.4g}")
 
 
-@requires_rubin
+@requires_served_arch
 def test_stock_caller_invocation_shape_hits_the_caches_and_matches_the_class_api():
     """Provider parity on the code path a stock caller takes: `from cudnn import triangle_multiplicative_update` (the lazy export), the
     call spelled with cuEquivariance's KEYWORDS (as the model code does: `triangle_multiplicative_update(x, direction=..., mask=...,
@@ -1123,7 +1202,7 @@ def test_stock_caller_invocation_shape_hits_the_caches_and_matches_the_class_api
     assert out1.grad_fn is None and not out1.requires_grad
 
 
-@requires_rubin
+@requires_served_arch
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two visible GPUs")
 def test_plan_declared_on_a_non_current_device_compiles_and_runs_there():
     """The declaration names cuda:1 while torch's current device is cuda:0: compile loads the plans on the DECLARED device (the K2 cache is

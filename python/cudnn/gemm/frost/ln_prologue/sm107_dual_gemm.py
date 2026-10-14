@@ -18,8 +18,10 @@ the full 256 accumulator columns per CTA, K in 64-wide stages, a 9-deep A/B ring
 scheduler) plus the two arms below.  KEEP IN SYNC with that template: any mainloop / scheduler / TMEM-pipeline fix applies to both
 (diff a fresh rendering against this file; the generator that produced it keeps every edit as an anchored block replacement).
 It is a RENDERING for ONE arch (sm_107a: ~309 KiB SMEM, 576 TMEM columns), not a registry template, so it lives beside its host
-module in ``gemm/frost/ln_prologue/`` under the arch trees' ``sm<NNN>_`` naming; the sm_100a body goes beside it as
-``sm100_dual_gemm.py`` (the host picks the body by arch).
+module in ``gemm/frost/ln_prologue/`` under the arch trees' ``sm<NNN>_`` naming; the sm_100a body ``sm100_dual_gemm.py`` sits beside it
+(the host picks the body by arch) and differs from this file ONLY in the renderer's arch constants (``frost_compile_options``,
+``num_tmem_alloc_cols`` / ``tmem_alloc_exclusive``, ``ab_stages``, ``b_collector_ok``, ``swizzle_l2_budget_bytes``), ``BODY_ARCH`` and
+the docstring lines that state them -- a fix lands HERE and is carried there by that diff (the K1 test module pins it).
 
 WARP LAYOUT (12 warps x 32 = 384 threads per CTA; the register pool is the ENTRY count x warps = 168 x 12 = 2016 per lane slot)
   warps 0-3  : epilogue (warp 0 also allocates TMEM)                                   requests setmaxnreg.inc 232
@@ -218,12 +220,15 @@ from cudnn.frost.tile_dsl.barrier import arrive_on_leader_release
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fadd2, fmul2, fp32_to_fp16, sigmoid, sigmoid2, sigmoid2_biased_half
 from cudnn.frost.tile_dsl.tma import ld_global_v4, ld_shared_v4, st_global_v2, st_shared_v4
 from cudnn.gemm.frost.ln_prologue import (
+    A_STAGE_BYTES,
+    B_STAGE_BYTES,
     PAIR_TILE_ROWS,
-    RING_STAGES,
+    SMEM_BUDGET_BYTES_BY_ARCH,
     LnDualGemmParams,
     ln_once_a_slots,
     ln_once_n_tiles_per_item,
     ln_once_tiles_per_item,
+    ring_stages,
     validate_ln_dual_gemm_params,
 )
 from cudnn.gemm.frost.tile_helpers import (
@@ -319,8 +324,11 @@ mixed_b_pattern_fb = 1
 # ---------------------------------------------------------------------------
 # LN-PROLOGUE DUAL GEMM: geometry + knobs (compile-time; every use is const_expr)
 # ---------------------------------------------------------------------------
+# The arch FAMILY this body is rendered for -- the key into the host module's per-arch tables (the ring depth the LayerNorm-once region is
+# sized against, the SMEM budget checked below).  The sibling body differs in this constant and in the renderer's arch constants above only.
+BODY_ARCH: str = "sm107"
 PARAMS: LnDualGemmParams = globals().get("FROST_TEMPLATE_PARAMS", LnDualGemmParams())
-validate_ln_dual_gemm_params(PARAMS)
+validate_ln_dual_gemm_params(PARAMS, BODY_ARCH)
 _K: int = PARAMS.k  # the LayerNorm width = GEMM K
 _NK: int = PARAMS.k_stages  # K stages per tile (64 wide); the LN warps hold a whole row = all of them at once
 # The tcgen05 SMEM-descriptor VERSION, declared ONCE and passed at EVERY ``Tcgen05SmemDesc.build`` below -- never a literal, never the
@@ -393,7 +401,10 @@ if _DUAL:
     num_b_operands = 2
     gemm_a_idx = (0, 1)
     gemm_b_idx = (0, 1)
-    ab_stages = 6  # 48 KiB per stage (A0 + A1 + B0 + B1) -- the same 288 KiB ring footprint as the single-GEMM rendering's 9 x 32 KiB
+    # 48 KiB per stage (A0 + A1 + B0 + B1): the SAME ring BYTES as the single-GEMM rendering's ab_stages x 32 KiB, re-cut into 48 KiB stages --
+    # 9 x 32 / 48 = 6 on the 327 KiB part, 6 x 32 / 48 = 4 on the 227 KiB one (derived, never a literal; the host module's RING_STAGES_BY_ARCH names
+    # the same numbers and the agreement is checked below)
+    ab_stages = (ab_stages * (A_STAGE_BYTES + B_STAGE_BYTES["columns"])) // (2 * A_STAGE_BYTES + 2 * B_STAGE_BYTES["accumulators"])
     if _K % cta_tile_mnk[2] != 0 or _NK > ab_stages:
         raise ValueError(f"{__name__}: the K3 arm keeps every K stage of a tile resident: K={_K} must be a multiple of 64 and at most {64 * ab_stages}")
 # Per A operand: how it LANDS (MN-major = two 64-row boxes per stage) and how the MMA READS it (the descriptor constants of the FROST GEMM
@@ -414,14 +425,14 @@ _N_TILES: int = PARAMS.n_tiles  # GEMM N tiles per row block (c_out / 128 in bot
 _NTI: int = ln_once_n_tiles_per_item(PARAMS)  # N tiles per work item (every one under "block", one under "passes"; 1 when off)
 _LOG2_NTI: int = _NTI.bit_length() - 1
 _TPI: int = ln_once_tiles_per_item(PARAMS)  # GEMM tiles per work item (passes x _NTI; 1 when off)
-_A_SLOTS: int = ln_once_a_slots(PARAMS)  # resident A region slots (2 = the next item's load + LayerNorm overlap this item's tiles; 1 at K3 c_out 256; 0 off)
+_A_SLOTS: int = ln_once_a_slots(PARAMS, BODY_ARCH)  # resident A region slots: 2 where the arch's ring bytes hold two, else 1 (host module); 0 off
 _A_REGION_STAGES: int = _A_SLOTS * _NK if _LN_ONCE else ab_stages  # the A buffers' stage count: the region's, or the shipped ring's
 _B_STAGES: int = ab_stages  # the B ring's depth (both arms)
+if ring_stages(BODY_ARCH, PARAMS.pairing) != ab_stages:
+    raise ValueError(
+        f"{__name__}: the host module's RING_STAGES_BY_ARCH[{BODY_ARCH!r}][{PARAMS.pairing!r}] = {ring_stages(BODY_ARCH, PARAMS.pairing)} but this body's ring is {ab_stages} deep -- the resident region and the K cap were sized against a ring the body does not have"
+    )
 if _LN_ONCE:
-    if RING_STAGES[PARAMS.pairing] != ab_stages:
-        raise ValueError(
-            f"{__name__}: the host module's RING_STAGES[{PARAMS.pairing!r}] = {RING_STAGES[PARAMS.pairing]} but this body's ring is {ab_stages} deep -- the resident region was sized against a ring the body does not have"
-        )
     if b_mcast_slices != 1 or multicast_b or b_is_n_major or matmul_a_batch != 1 or split_k_slices != 1 or fallback_cluster_shape_mnk is not None:
         raise ValueError(
             f"{__name__}: the LayerNorm-once arm is written for the rendering's live operand path (one B slice per CTA, no B multicast, K-major B, one A batch, no split-K, one cluster shape)"
@@ -460,6 +471,30 @@ EPI_SYNC_BAR_ID = 1
 
 # Named barrier id for the TMEM-alloc hand-over.
 TMEM_ALLOC_BARRIER_ID = 2
+
+
+def _smem_estimate_bytes() -> int:
+    """The dynamic SMEM this rendering declares (the DSL sizes the launch from the arrays below; nothing else sees the total): the operand
+    rings / the resident A region, the TMA-store staging, the LayerNorm parameter and bias buffers, the flags and votes, every mbarrier and
+    the CLC response, plus the 1024-byte alignment slack of each aligned array.  A conservative upper bound, checked against the part's
+    carveout at load: an overflow would not fail visibly (sdpa-invariants S 6) -- the launch dies with an invalid-argument error, or a later
+    buffer lands on an earlier one."""
+    bpe = ab_dtype.width // 8
+    rings = (num_a_operands * cta_tile_mnk[0] * _A_REGION_STAGES + num_b_operands * cta_tile_mnk[1] * _B_STAGES) * cta_tile_mnk[2] * bpe
+    staging = epi_stage_rows * epi_row_elems * epi_slot_widen * EPI_SMEM_STAGES * (epi_store_dtype.width // 8)
+    small = 4 * (2 * _K * num_a_operands + (_PASSES * _BIAS_PER_PASS if HAS_BIAS else 4) + _A_REGION_STAGES + 8)
+    mbars = 8 * (2 * _B_STAGES + 2 * _A_REGION_STAGES + 2 * acc_stages + 2 * CLC_SCHED_STAGES + 1 + (_A_SLOTS if _LN_ONCE else 0)) + 16 * CLC_SCHED_STAGES + 16
+    aligned = 1024 * (num_a_operands + num_b_operands + 1)
+    return rings + staging + small + mbars + aligned
+
+
+_SMEM_ESTIMATE_BYTES: int = _smem_estimate_bytes()
+if _SMEM_ESTIMATE_BYTES > SMEM_BUDGET_BYTES_BY_ARCH[BODY_ARCH]:
+    raise ValueError(
+        f"{__name__}: this rendering declares ~{_SMEM_ESTIMATE_BYTES} B of dynamic SMEM but the {BODY_ARCH} part gives a CTA "
+        f"{SMEM_BUDGET_BYTES_BY_ARCH[BODY_ARCH]} B -- a ring depth ({_B_STAGES}) or a resident A region ({_A_REGION_STAGES} stages) sized past the carveout; "
+        "the launch would fail with an invalid-argument error (or a later buffer would overlap an earlier one), never a typed decline"
+    )
 
 
 @cute.jit

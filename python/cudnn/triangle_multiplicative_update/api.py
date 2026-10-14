@@ -22,7 +22,9 @@ Two surfaces:
 * :func:`triangle_multiplicative_update` -- the drop-in function with cuEquivariance's parameter names, order and defaults: it caches one
   compiled plan per shape and one prepared weight set per parameter identity, allocates the output and the workspace, and launches.
 
-Served today: Rubin (SM107, compute capability 10.7), bf16, ``c_z == c in {128, 256}``, ``N >= 33``, both directions (the incoming
+Served today: Rubin (SM107, compute capability 10.7) and Blackwell (SM100 / SM103, compute capability 10.0 / 10.3 -- the same substrate
+body rendered at that part's 227 KiB / 512-TMEM-column geometry, a 6-deep operand ring in the projection stage and 4 in the output stage, so
+``c_z = 256`` fills the output stage's ring exactly), bf16, ``c_z == c in {128, 256}``, ``N >= 33``, both directions (the incoming
 direction needs ``N % 8 == 0``), the forward only.  ``c_z = 384`` is withdrawn: its sm_107a renderings spill through a 1.7 KB stack per
 thread (the LayerNorm row held in registers) and no oracle cell covers them -- it returns with a rendering free of that residency and an
 accept test per direction.  Performance knobs (the contraction tile, the projection stage's tile order, the output stage's prologue form,
@@ -52,6 +54,8 @@ from cuda.bindings import driver as cuda
 
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+from cudnn.gemm.frost.ln_prologue import ARCHS_BY_CC as _ARCHS_BY_CC
+from cudnn.gemm.frost.ln_prologue import body_arch_for_cc as _body_arch_for_cc
 from cudnn.gemm.frost.ln_prologue import ln_once_tiles_per_item as _ln_once_tiles_per_item
 
 from . import heuristics as th
@@ -79,7 +83,9 @@ MIN_N_RES = k3.MIN_N_RES_MN_MAJOR
 #: at c = 256, where the K = 256 rendering is register-bound, and at c = 128 from N >= 256 -- from 512 together with the 1-deep ring, from
 #: 256 with the LayerNorm-once work item, which needs the pass inside the row block's item).
 K1_PASS_ORDER = th.DEFAULT_K1_PASS_ORDER
-_RUBIN = (10, 7)
+#: The compute capabilities served -- the substrate's rendered bodies (Blackwell 10.0 / 10.3 -> the sm100 body, Rubin 10.7 -> the sm107 one);
+#: every other part is a typed decline in ``check_support``, never a slow path.
+_SERVED_CCS = tuple(sorted(_ARCHS_BY_CC))
 _WS_ALIGN = 256
 _INT32_MAX = 2**31
 
@@ -296,13 +302,27 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         # the performance knobs: the measured defaults for this geometry (heuristics.recommend: width, N bucket, batch bucket, direction), the
         # caller's knobs (its set axes) / k2_tile over them -- always a complete record; the vocabulary is checked in check_support (ValueError),
         # the contraction tile's eligibility probed there (NotImplementedError)
-        self.knobs = th.resolve(self.n_res, self.c, self.batch, direction, k2_tile=k2_tile, knobs=knobs)
+        # the device's compute capability, read here so the heuristics' arch column follows the part the plan is declared on (None when no
+        # CUDA device can be asked: the Rubin table; check_support then declines the device before any launch); the substrate body is
+        # resolved in check_support (``self.arch``)
+        self.cc = self._device_cc()
+        self.arch: Optional[str] = None
+        self.knobs = th.resolve(self.n_res, self.c, self.batch, direction, k2_tile=k2_tile, knobs=knobs, cc=self.cc)
         self.k2_tile = self.knobs.k2_tile
         self.n_pad = k2.n_pad(self.n_res)
         self._plan_k1 = None
         self._plan_k3 = None
         self._k2 = None
         self._k2_binding = None
+
+    def _device_cc(self) -> Optional[Tuple[int, int]]:
+        """The declaration device's compute capability, or None when it cannot be read here (a non-CUDA declaration, no CUDA runtime)."""
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        try:
+            return tuple(int(x) for x in torch.cuda.get_device_capability(self.device_index))
+        except Exception:  # noqa: BLE001 -- an unreadable device is check_support's typed decline, not the constructor's
+            return None
 
     # -- declaration checks -------------------------------------------------------------------------------------------------------
     def check_support(self) -> bool:
@@ -342,9 +362,26 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
         if self.device.type != "cuda":
             raise ValueError(f"x must be a CUDA tensor, got device {self.device}")
         index = self.device_index
-        cc = tuple(torch.cuda.get_device_capability(index))
-        if cc != _RUBIN:
-            raise NotImplementedError(f"triangle_multiplicative_update is rendered for compute capability 10.7 (Rubin) only today; found {cc[0]}.{cc[1]}")
+        cc = tuple(int(x) for x in torch.cuda.get_device_capability(index))
+        if cc not in _ARCHS_BY_CC:
+            served = ", ".join(f"{a}.{b}" for a, b in _SERVED_CCS)
+            raise NotImplementedError(
+                f"triangle_multiplicative_update is rendered for compute capabilities {served} (Blackwell SM100 / SM103, Rubin SM107) only today; found {cc[0]}.{cc[1]}"
+            )
+        self.cc = cc
+        self.arch = _body_arch_for_cc(cc)
+        # the two LayerNorm-prologue stages' records, validated against the BODY this device runs (the substrate's typed declines -- the per-arch K
+        # cap, the sm100 register-form class ptxas cannot allocate -- fire HERE, never inside compile()): a knob set the arch cannot serve is a
+        # NotImplementedError of this declaration, a malformed one stays the substrate's ValueError
+        from cudnn.gemm.frost.ln_prologue import validate_ln_dual_gemm_params as _validate_substrate
+
+        for stage_params in self._stage_params():
+            try:
+                _validate_substrate(stage_params, self.arch)
+            except ValueError as error:
+                raise NotImplementedError(
+                    f"triangle_multiplicative_update cannot serve this knob set on compute capability {cc[0]}.{cc[1]}: {error}"
+                ) from error
         msg = cutedsl_requirement_error("triangle_multiplicative_update")
         if msg:
             raise NotImplementedError(msg)
@@ -451,9 +488,45 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
             return int(hint), int(hint)
         return (
             th.register_split_hint(
-                "k1", self.c, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math, self.knobs.k1_pass_order, self.knobs.ln_once or ""
+                "k1", self.c, self.has_in_bias, self.knobs.ln_pass_form, self.knobs.epi_math, self.knobs.k1_pass_order, self.knobs.ln_once or "", cc=self.cc
             ),
-            th.register_split_hint("k3", self.c, self.has_out_bias, self._k3_ln_pass_form(), self.knobs.epi_math, None, self._k3_ln_once()),
+            th.register_split_hint("k3", self.c, self.has_out_bias, self._k3_ln_pass_form(), self.knobs.epi_math, None, self._k3_ln_once(), cc=self.cc),
+        )
+
+    def _stage_params(self):
+        """The (K1, K3) substrate records this declaration compiles -- ONE builder for ``check_support`` (validated against the arch body) and
+        ``compile`` (built), so a decline and a build can never disagree on the record.  GPU-free."""
+        k3_ln_pass_form = self._k3_ln_pass_form()
+        k1_hint, k3_hint = self._register_split_hints()
+        k1_ln_once, k3_ln_once = self.knobs.ln_once or "", self._k3_ln_once()
+        return (
+            k1.proj_params(
+                self.c_z,
+                self.c,
+                has_bias=self.has_in_bias,
+                has_mask=self.has_mask,
+                want_stats=False,
+                eps=self.eps,
+                pass_order=self.knobs.k1_pass_order,
+                clc_stages=self.knobs.clc_stages,
+                ln_pass_form=self.knobs.ln_pass_form,
+                epi_math=self.knobs.epi_math,
+                min_blocks_per_mp=k1_hint,
+                ln_once=k1_ln_once,
+            ),
+            k3.tail_params(
+                self.c_z,
+                self.c,
+                has_bias=self.has_out_bias,
+                want_stats=False,
+                eps=self.eps,
+                a0_prologue=self.knobs.k3_prologue,
+                clc_stages=self.knobs.clc_stages,
+                ln_pass_form=k3_ln_pass_form,
+                epi_math=self.knobs.epi_math,
+                min_blocks_per_mp=k3_hint,
+                ln_once=k3_ln_once,
+            ),
         )
 
     def compile(self) -> None:
@@ -466,46 +539,12 @@ class TriangleMultiplicativeUpdateFwd(APIBase):
 
         # Compile and load on the PLAN's device: the declaration may name a device other than torch's current one (a multi-GPU host with
         # ``x`` on ``cuda:1``).  A compiled launchable is bound to the context it was loaded in, so K1 / K3 and K2 are cached per
-        # (parameter set, device) -- :func:`_substrate_plan_on`, :func:`_compile_contraction`.
-        k3_ln_pass_form = self._k3_ln_pass_form()
-        k1_hint, k3_hint = self._register_split_hints()
-        k1_ln_once, k3_ln_once = self.knobs.ln_once or "", self._k3_ln_once()
+        # (parameter set, arch body, device) -- :func:`_substrate_plan_on`, :func:`_compile_contraction`.
+        k1_params, k3_params = self._stage_params()
+        arch = self.arch if self.arch is not None else _body_arch_for_cc(self.cc)
         with torch.cuda.device(self.device_index):
-            self._plan_k1 = _substrate_plan_on(
-                k1.build_trimul_proj,
-                k1.proj_params(
-                    self.c_z,
-                    self.c,
-                    has_bias=self.has_in_bias,
-                    has_mask=self.has_mask,
-                    want_stats=False,
-                    eps=self.eps,
-                    pass_order=self.knobs.k1_pass_order,
-                    clc_stages=self.knobs.clc_stages,
-                    ln_pass_form=self.knobs.ln_pass_form,
-                    epi_math=self.knobs.epi_math,
-                    min_blocks_per_mp=k1_hint,
-                    ln_once=k1_ln_once,
-                ),
-                self.device_index,
-            )
-            self._plan_k3 = _substrate_plan_on(
-                k3.build_trimul_tail,
-                k3.tail_params(
-                    self.c_z,
-                    self.c,
-                    has_bias=self.has_out_bias,
-                    want_stats=False,
-                    eps=self.eps,
-                    a0_prologue=self.knobs.k3_prologue,
-                    clc_stages=self.knobs.clc_stages,
-                    ln_pass_form=k3_ln_pass_form,
-                    epi_math=self.knobs.epi_math,
-                    min_blocks_per_mp=k3_hint,
-                    ln_once=k3_ln_once,
-                ),
-                self.device_index,
-            )
+            self._plan_k1 = _substrate_plan_on(k1.build_trimul_proj, k1_params, self.device_index, arch)
+            self._plan_k3 = _substrate_plan_on(k3.build_trimul_tail, k3_params, self.device_index, arch)
             self._k2 = _compile_contraction(cudnn, self.c, self.batch, self.n_res, self.direction, self.k2_tile, self.device_index)
         self._k2_binding = self._k2.binding
         self._compiled_kernel = (self._plan_k1, self._k2, self._plan_k3)
@@ -648,8 +687,8 @@ _SUBSTRATE_LOCK = threading.Lock()
 _SUBSTRATE_PLANS: Dict[Tuple[Any, int], Any] = {}
 
 
-def _substrate_plan_on(build, params, device_index: int):
-    """One cute-compiled launchable of the K1 / K3 substrate per (parameter set, device).  A CuTe-DSL launchable is bound to the CUDA
+def _substrate_plan_on(build, params, device_index: int, arch: str = "sm107"):
+    """One cute-compiled launchable of the K1 / K3 substrate per (parameter set, arch body, device).  A CuTe-DSL launchable is bound to the CUDA
     context it was first loaded in -- a K1 launchable built on ``cuda:0`` fails on ``cuda:1`` with ``cudaErrorInvalidValue`` at launch, and
     vice versa (measured on a two-GPU host) -- while the substrate's ``build_*`` cache is per parameter set only.  Under the plan's device:
     when the substrate's cache fills NOW its launchable is bound here and is reused (the single-device case pays nothing extra); when it was
@@ -657,14 +696,14 @@ def _substrate_plan_on(build, params, device_index: int):
     for this device, cached per (params, device)."""
     from cudnn.gemm.frost import ln_prologue
 
-    key = (params, int(device_index))
+    key = (params, str(arch), int(device_index))
     with _SUBSTRATE_LOCK:
         hit = _SUBSTRATE_PLANS.get(key)
     if hit is not None:
         return hit
     with torch.cuda.device(device_index), _SUBSTRATE_LOCK:
         before = ln_prologue.build_ln_dual_gemm.cache_info().currsize
-        base = build(params)
+        base = build(params, arch)
         built_here = ln_prologue.build_ln_dual_gemm.cache_info().currsize > before
         plan = base if built_here else ln_prologue.LnDualGemmPlan(params=base.params, module=base.module, launch=base.module.compile.__wrapped__())
         return _SUBSTRATE_PLANS.setdefault(key, plan)

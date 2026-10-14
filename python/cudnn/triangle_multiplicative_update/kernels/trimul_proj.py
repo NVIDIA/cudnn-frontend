@@ -131,11 +131,12 @@ def stack_projection_biases(p_in_bias, g_in_bias):
     return torch.stack([interleave_value_gate_bias(p_in_bias[:c], g_in_bias[:c]), interleave_value_gate_bias(p_in_bias[c:], g_in_bias[c:])], dim=0).contiguous()
 
 
-def build_trimul_proj(params: LnDualGemmParams) -> LnDualGemmPlan:
-    """Compile (cached per params) -- shapes are runtime."""
+def build_trimul_proj(params: LnDualGemmParams, arch: str = "sm107") -> LnDualGemmPlan:
+    """Compile (cached per (params, arch)) -- shapes are runtime.  ``arch`` names the substrate's rendered body (``"sm107"`` Rubin, ``"sm100"``
+    Blackwell; ``cudnn.gemm.frost.ln_prologue.body_arch_for_cc`` picks it from the device's compute capability)."""
     if params.passes != PASSES:
         raise ValueError(f"the triangle multiplicative update's K1 has exactly {PASSES} passes (a, b), got params.passes={params.passes}")
-    return build_ln_dual_gemm(params)
+    return build_ln_dual_gemm(params, arch)
 
 
 def run_trimul_proj(
